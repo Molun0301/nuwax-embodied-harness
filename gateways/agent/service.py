@@ -6,25 +6,20 @@ import asyncio
 import json
 import logging
 import math
-import os
 import threading
 import time
 import uuid
 from collections import OrderedDict
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict
 from urllib.parse import quote
 
-from jsonschema.exceptions import SchemaError, ValidationError
-from jsonschema.validators import validator_for
 from starlette.concurrency import run_in_threadpool
 
 import gateways.agent.feedback as agent_feedback
 import gateways.feedback as public_feedback
 from core.agent_call_store import AgentCallStore
 from core.errors import GatewayError, as_gateway_error
-from core.task_manager import TaskReceiptUnavailableError
 from gateways.agent.feedback import (
     INPUT_MAX_BYTES,
     TERMINAL_STATES,
@@ -103,39 +98,8 @@ def validate_request_id(value: Any) -> str:
     return value
 
 
-@lru_cache(maxsize=128)
-def _prepared_argument_validator(schema_json: str):
-    """按完整结构内容复用验证器，注册替换和原地更新自然产生新版本。"""
-    schema = json.loads(schema_json)
-    stack = [schema]
-    while stack:
-        item = stack.pop()
-        if isinstance(item, dict):
-            for key in ("$ref", "$dynamicRef", "$recursiveRef"):
-                ref = item.get(key)
-                if isinstance(ref, str) and not ref.startswith("#"):
-                    raise GatewayError("工具参数结构含不允许的远端引用。",
-                                       error_code="agent_schema_unsupported", http_status=500)
-            stack.extend(item.values())
-        elif isinstance(item, list):
-            stack.extend(item)
-    validator = validator_for(schema)
-    validator.check_schema(schema)
-    return validator(schema)
 
 
-def validate_arguments(arguments: Dict[str, Any], schema: Dict[str, Any]) -> None:
-    """每次只验证实际参数；结构版本改变才检查定义与引用。"""
-    try:
-        schema_json = json.dumps(schema, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        # 限制缓存保留的单项大小；超大结构仍按原完整校验执行。
-        prepare = _prepared_argument_validator if len(schema_json) <= 64 * 1024 else _prepared_argument_validator.__wrapped__
-        prepare(schema_json).validate(arguments)
-    except ValidationError as exc:
-        raise GatewayError("参数不符合工具声明的输入结构。", error_code="invalid_params", http_status=422,
-                           details={"path": list(exc.absolute_path), "validator": exc.validator}) from exc
-    except (SchemaError, TypeError, ValueError) as exc:
-        raise GatewayError("工具参数结构无效。", error_code="agent_schema_invalid", http_status=500) from exc
 
 
 class AgentToolService:
@@ -147,19 +111,17 @@ class AgentToolService:
         self.gateway_instance_id = uuid.uuid4().hex
         manifest = runtime.robot.manifest
         self.robot_model = str(manifest.robot_model)
-        parameters = getattr(getattr(runtime.robot, "defaults", None), "parameters", {})
+        parameters = runtime.robot.defaults.parameters
         self.robot_identity = {
             "robot_model": self.robot_model,
-            "robot_name": str(getattr(manifest, "robot_name", "")),
-            "entrypoint": str(getattr(manifest, "entrypoint", "")),
+            "robot_name": str(manifest.robot_name),
+            "entrypoint": str(manifest.entrypoint),
             "robot_id": str(parameters.get("robot_id", "")),
         }
         artifact_dir = Path(runtime.config.gateway.artifact_dir).expanduser().resolve()
         self.store = AgentCallStore(
             artifact_dir.parent / "agent_calls.sqlite3", robot_identity=self.robot_identity,
-            artifact_dir=artifact_dir, gateway_instance_id=self.gateway_instance_id,
-            # 未知旧启动器可能需要回滚到合库读取器；只影响独占新建，既有布局始终优先。
-            fresh_layout="split" if os.environ.get("NUWAX_AGENT_TERMINAL_FRESH_LAYOUT") == "split" else "combined")
+            artifact_dir=artifact_dir, gateway_instance_id=self.gateway_instance_id)
         self._uncertain_calls = set()
         self._uncertain_lock = threading.Lock()
         self._waiters_lock = threading.Lock()
@@ -169,7 +131,7 @@ class AgentToolService:
         self._terminal_projection_cache = OrderedDict()
         self._terminal_projection_bytes = 0
         self._terminal_owner = TerminalReceiptPersistence(
-            getattr(runtime, "task_manager", None), self.store, self._task_snapshot, self._receipt_eligible, autostart=False)
+            runtime.task_manager, self.store, self._task_snapshot, self._receipt_eligible, autostart=False)
         self._subscription_id = runtime.event_bus.subscribe(
             self._on_task_terminal, categories=("task",), async_dispatch=False)
         try:
@@ -251,7 +213,6 @@ class AgentToolService:
             raise GatewayError("工具未向智能体公开。", error_code="access_denied", http_status=403)
         capability = self.runtime.capability_registry.get_descriptor(descriptor.capability_name)
         self.access_manager.authorize_capability(capability)
-        validate_arguments(arguments, capability.input_schema)
         record, owner = self.store.begin(request_id, tool_name, descriptor.capability_name, arguments)
         if not owner:
             return self._call_receipt(record)
@@ -418,10 +379,6 @@ class AgentToolService:
                                      separators=(",", ":")).encode("utf-8")
                 self._cache_terminal_projection((task_id, capture.source_id, capture.revision, projection_context), encoded)
             return _VersionedTaskSnapshot(public, source_id=capture.source_id, revision=capture.revision)
-        except TaskReceiptUnavailableError as exc:
-            raise GatewayError(str(exc), error_code="task_receipt_unsupported", http_status=500,
-                               details={"status_source": "live_task", "receipt_capture": "unsupported",
-                                        "task_outcome_unchanged": True, "action_replay_allowed": False}) from exc
         except KeyError as exc:
             raise GatewayError("当前网关实例没有此任务；旧调用记录不代表当前机器人状态。",
                                error_code="not_found", http_status=404,
@@ -462,10 +419,6 @@ class AgentToolService:
             header = manager.task_receipt_header(task_id)
             self.access_manager.authorize_capability(
                 self.runtime.capability_registry.get_descriptor(header["capability_name"]))
-            if not header["ownership_supported"]:
-                # 已知所有权失败在 capture 入口就抛出，不扫描/复制事件历史。
-                snapshot = self._task_snapshot(task_id)
-                return snapshot["status"], snapshot
             status = manager.get_task_status(task_id)
         except KeyError as exc:
             raise GatewayError("当前网关实例没有此任务；旧调用记录不代表当前机器人状态。",

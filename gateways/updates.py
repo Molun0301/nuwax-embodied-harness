@@ -154,9 +154,7 @@ class UpdateService:
             robot = robot.model_dump(mode="json")
         # 无真实设备的基础网关允许更新；已接入设备必须确认电机停用。
         if not robot:
-            assembly = getattr(self.runtime, "robot", None)
-            actuator_check = getattr(assembly, "has_motion_actuator", None)
-            if callable(actuator_check) and actuator_check() is False:
+            if self.runtime.robot.has_motion_actuator() is False:
                 return
             raise RuntimeError("缺少机器人状态，无法确认安全停机")
         if not isinstance(robot, dict):
@@ -199,10 +197,8 @@ class UpdateService:
                 if not self.drain.wait_for(lambda: self.mutators == 0, timeout=30):
                     raise RuntimeError("仍有请求执行中，请稍后重试")
                 self.require_idle()
-                gateway = getattr(getattr(self.runtime, "config", None), "gateway", None)
-                probe_url = updater.listener_url(
-                    getattr(gateway, "host", "127.0.0.1"), getattr(gateway, "port", 8766)
-                )
+                gateway = self.runtime.config.gateway
+                probe_url = updater.listener_url(gateway.host, gateway.port)
                 status = updater.queue(self.root, expected, probe_url=probe_url)
                 updater.dispatch(self.root, status)
                 self.freezing = False  # 排队完成后由持久事务状态决定维护模式

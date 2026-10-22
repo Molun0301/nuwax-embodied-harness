@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -34,16 +33,10 @@ _SCHEMA = """
                     scope TEXT PRIMARY KEY, owner_scope TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS agent_scope_bindings_owner ON agent_scope_bindings(owner_scope);
-                CREATE TABLE IF NOT EXISTS agent_task_terminals (
-                    task_id TEXT PRIMARY KEY, scope TEXT NOT NULL,
-                    gateway_instance_id TEXT NOT NULL, snapshot_json TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
                 CREATE TABLE IF NOT EXISTS agent_terminal_layout (
                     singleton INTEGER PRIMARY KEY CHECK(singleton=1), ledger_id TEXT NOT NULL,
                     origin TEXT NOT NULL, layout_state TEXT NOT NULL,
-                    terminal_path TEXT NOT NULL, pair_id TEXT
+                    terminal_path TEXT NOT NULL, pair_id TEXT, import_version INTEGER NOT NULL DEFAULT 0
                 );
 """
 
@@ -65,66 +58,77 @@ class AgentCallStore:
     """以请求标识原子占位，同键重试永不重复提交设备动作。"""
 
     def __init__(self, path: Path, *, gateway_instance_id: str,
-                 robot_identity: Dict[str, Any], artifact_dir: Path,
-                 fresh_layout: str = "split") -> None:
-        if fresh_layout not in ("combined", "split"):
-            raise ValueError("新账本布局只允许 combined 或 split。")
+                 robot_identity: Dict[str, Any], artifact_dir: Path) -> None:
         scope_identity = self._identity_json(robot_identity, artifact_dir)
         self.path = Path(path).expanduser().resolve()
         self.gateway_instance_id = gateway_instance_id
         self._terminal_preparation_token = object()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        try:
-            fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
-            fresh = True
-        except FileExistsError:
-            fd = os.open(str(self.path), os.O_RDWR)
-            fresh = False
+        fd = os.open(str(self.path), os.O_CREAT | os.O_RDWR, 0o600)
         os.close(fd)
         self.path.chmod(0o600)
-        if not fresh:
-            # 不把并发初始化中的空文件或未知现有文件猜作全新账本。
-            deadline = time.monotonic() + 5.0
-            while True:
-                with self._read_connection() as db:
-                    known = db.execute("SELECT name FROM sqlite_master WHERE name IN "
-                                       "('agent_calls','agent_task_terminals','agent_terminal_layout')").fetchone()
-                if known:
-                    break
-                if time.monotonic() >= deadline:
-                    raise GatewayError("调用账本尚未完成初始化；请核对原文件，不能猜测其身份。",
-                                       error_code="agent_terminal_cutover_required", http_status=409)
-                time.sleep(0.025)
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if tables and not tables.intersection({'agent_calls', 'agent_task_terminals', 'agent_terminal_layout'}):
+                    raise pair_conflict()
                 for statement in _SCHEMA.split(";"):
                     if statement.strip():
                         connection.execute(statement)
-                columns = {row["name"] for row in connection.execute("PRAGMA table_info(agent_task_terminals)")}
-                for name, sql_type in (("receipt_source_id", "TEXT"), ("receipt_revision", "INTEGER")):
-                    if name not in columns:
-                        connection.execute(f"ALTER TABLE agent_task_terminals ADD COLUMN {name} {sql_type}")
+                if 'agent_task_terminals' in tables:
+                    columns = {row["name"] for row in connection.execute("PRAGMA table_info(agent_task_terminals)")}
+                    for name, sql_type in (("receipt_source_id", "TEXT"), ("receipt_revision", "INTEGER")):
+                        if name not in columns:
+                            connection.execute(f"ALTER TABLE agent_task_terminals ADD COLUMN {name} {sql_type}")
+                columns = {row["name"] for row in connection.execute("PRAGMA table_info(agent_terminal_layout)")}
+                if "import_version" not in columns:
+                    connection.execute("ALTER TABLE agent_terminal_layout ADD COLUMN import_version INTEGER NOT NULL DEFAULT 0")
                 layout = connection.execute("SELECT * FROM agent_terminal_layout WHERE singleton=1").fetchone()
                 if layout is None:
-                    ledger_id = uuid4().hex
-                    split_new = fresh and fresh_layout == "split"
-                    target = str(self.path.with_name(self.path.stem + ".terminals.sqlite3")) if split_new else str(self.path)
                     connection.execute("INSERT INTO agent_terminal_layout "
-                                       "(singleton,ledger_id,origin,layout_state,terminal_path,pair_id) VALUES (1,?,?,?,?,?)",
-                                       (ledger_id, "fresh" if fresh else "legacy", "pending" if split_new else "combined",
-                                        target, uuid4().hex if split_new else None))
+                        "(singleton,ledger_id,origin,layout_state,terminal_path,pair_id) VALUES (1,?,?,?,?,?)",
+                        (uuid4().hex, "legacy" if tables else "fresh", "split",
+                         str(self.path.with_name(self.path.stem + ".terminals.sqlite3")), uuid4().hex))
+                elif layout["layout_state"] == "combined" and Path(layout["terminal_path"]).resolve() == self.path:
+                    # 旧布局只在本次向前导入边界解释，运行期没有合库后端。
+                    connection.execute("UPDATE agent_terminal_layout SET terminal_path=?,pair_id=? WHERE singleton=1",
+                        (str(self.path.with_name(self.path.stem + ".terminals.sqlite3")), uuid4().hex))
                 self.scope = self._resolve_owner(connection, scope_identity)
                 connection.commit()
             except BaseException:
                 connection.rollback()
                 raise
-        if fresh:
-            sync_directory(self.path.parent)
-        layout = self.terminal_storage_status(self.path)
-        if layout["origin"] == "fresh" and layout["layout_state"] == "pending":
-            self.activate_terminal_split(self.path, expected_ledger_id=layout["ledger_id"],
-                                         terminal_path=Path(layout["terminal_path"]), writers_quiesced=True)
+        sync_directory(self.path.parent)
+        self._prepare_terminal_storage()
+
+    def _prepare_terminal_storage(self):
+        """在接收动作前完成一次导入；目标提交后才记录完成，重启可原样重试。"""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                layout = dict(connection.execute("SELECT * FROM agent_terminal_layout WHERE singleton=1").fetchone())
+                target = Path(layout["terminal_path"]).resolve()
+                if (target == self.path or (target.exists() and os.path.samefile(target, self.path))
+                        or not layout["pair_id"] or layout["layout_state"] not in {'split', 'combined', 'pending', 'active'}
+                        or layout["import_version"] not in (0, 1)):
+                    raise pair_conflict()
+                self._terminal_store = AgentTerminalStore(self, layout)
+                if layout["import_version"] == 1 or layout["layout_state"] == "active":
+                    # 已服务的分库丢失必须报错，不能用旧表造一个空替代库。
+                    with self._terminal_store._connection() as target_connection:
+                        target_connection.execute("SELECT task_id FROM agent_task_terminals LIMIT 0")
+                else:
+                    initialize_terminal_file(target, layout["ledger_id"], layout["pair_id"])
+                if layout["import_version"] == 0:
+                    self._terminal_store.import_legacy_rows(connection)
+                    for operation in ("insert", "update", "delete"):
+                        connection.execute("DROP TRIGGER IF EXISTS agent_terminal_legacy_seal_" + operation)
+                    connection.execute("UPDATE agent_terminal_layout SET layout_state='split',import_version=1 WHERE singleton=1")
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
 
     @contextmanager
     def _read_connection(self):
@@ -135,116 +139,25 @@ class AgentCallStore:
         finally:
             connection.close()
 
-    @staticmethod
-    def _seal_sql(operation):
-        name = "agent_terminal_legacy_seal_" + operation.lower()
-        return name, ("CREATE TRIGGER " + name + " BEFORE " + operation + " ON agent_task_terminals "
-                      "BEGIN SELECT RAISE(ABORT,'legacy terminal store sealed'); END")
 
     @classmethod
     def terminal_storage_status(cls, path):
-        """只读布局状态；不创建账本、绑定身份、修复或迁移。"""
+        """只读配对及导入版本，不创建文件或执行迁移。"""
         db = sqlite3.connect(Path(path).expanduser().resolve().as_uri() + "?mode=ro", uri=True,
                              timeout=5.0, isolation_level=None)
         db.row_factory = sqlite3.Row
         try:
-            exists = db.execute("SELECT name FROM sqlite_master WHERE name='agent_terminal_layout'").fetchone()
-            row = db.execute("SELECT * FROM agent_terminal_layout WHERE singleton=1").fetchone() if exists else None
+            row = db.execute("SELECT * FROM agent_terminal_layout WHERE singleton=1").fetchone()
             if row is None:
-                raise GatewayError("旧账本尚未由当前版本初始化布局标识；请由维护方核对原文件。",
-                                   error_code="agent_terminal_cutover_required", http_status=409)
+                raise pair_conflict()
             result = dict(row)
             result.pop("singleton", None)
-            expected = dict(cls._seal_sql(operation) for operation in ("INSERT", "UPDATE", "DELETE"))
-            seals = {item["name"]: item["sql"] for item in db.execute(
-                "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name IN (?,?,?)", tuple(expected))}
-            result["legacy_sealed"] = seals == expected
             return result
         finally:
             db.close()
 
-    @classmethod
-    def activate_terminal_split(cls, path, *, expected_ledger_id, terminal_path, writers_quiesced):
-        """可信维护入口。调用方必须获授权并确认所有旧写入者已排空；不会停止机器人。"""
-        if writers_quiesced is not True:
-            raise GatewayError("必须由获授权维护方确认旧账本写入者及在途调用已排空。",
-                               error_code="agent_terminal_cutover_required", http_status=409)
-        path, target = Path(path).expanduser().resolve(), Path(terminal_path).expanduser().resolve()
-        if path == target or (target.exists() and os.path.samefile(path, target)):
-            raise pair_conflict()
-        # 仅既有意图库；不调用构造器、不分配作用域、更不借迁移认领旧任务。
-        db = sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=5.0, isolation_level=None)
-        db.row_factory = sqlite3.Row
-        try:
-            db.execute("PRAGMA synchronous=FULL")
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM agent_terminal_layout WHERE singleton=1").fetchone()
-            if row is None or row["ledger_id"] != expected_ledger_id:
-                raise pair_conflict()
-            if row["layout_state"] == "combined":
-                pair_id = uuid4().hex
-                db.execute("UPDATE agent_terminal_layout SET layout_state='pending',terminal_path=?,pair_id=? "
-                           "WHERE singleton=1", (str(target), pair_id))
-            elif row["layout_state"] in {"pending", "active"} and row["terminal_path"] == str(target):
-                pair_id = row["pair_id"]
-            else:
-                raise pair_conflict()
-            db.commit()
-        except BaseException:
-            db.rollback()
-            raise
-        finally:
-            db.close()
-        sync_directory(path.parent)
-        if row["layout_state"] == "active":
-            # 已激活文件丢失不能通过再次调用维护入口创建空替代库。
-            with AgentTerminalStore(None, dict(row))._connection():
-                pass
-        else:
-            initialize_terminal_file(target, expected_ledger_id, pair_id)
-        if os.path.samefile(path, target):
-            raise pair_conflict()
-        db = sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=5.0, isolation_level=None)
-        db.row_factory = sqlite3.Row
-        try:
-            db.execute("PRAGMA synchronous=FULL")
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM agent_terminal_layout WHERE singleton=1").fetchone()
-            if row is None or (row["ledger_id"], row["pair_id"], row["terminal_path"]) != (
-                    expected_ledger_id, pair_id, str(target)) or row["layout_state"] not in {"pending", "active"}:
-                raise pair_conflict()
-            for operation in ("INSERT", "UPDATE", "DELETE"):
-                name, sql = cls._seal_sql(operation)
-                previous = db.execute("SELECT sql FROM sqlite_master WHERE name=?", (name,)).fetchone()
-                if previous is None:
-                    if row["layout_state"] == "active":
-                        raise pair_conflict()
-                    db.execute(sql)
-                elif previous["sql"] != sql:
-                    raise pair_conflict()
-            db.execute("UPDATE agent_terminal_layout SET layout_state='active' WHERE singleton=1")
-            db.commit()
-        except BaseException:
-            db.rollback()
-            raise
-        finally:
-            db.close()
-        return cls.terminal_storage_status(path)
 
-    def _terminal_backend(self):
-        layout = self.terminal_storage_status(self.path)
-        if layout["layout_state"] in {"combined", "pending"}:
-            return None
-        if layout["layout_state"] != "active" or not layout["legacy_sealed"] or not layout["pair_id"]:
-            raise pair_conflict()
-        return AgentTerminalStore(self, layout)
 
-    def _legacy_terminal_rows(self, ids, *, full):
-        fields = "*" if full else "task_id,scope,receipt_source_id,receipt_revision"
-        with self._read_connection() as db:
-            return {row["task_id"]: dict(row) for row in db.execute(
-                "SELECT " + fields + " FROM agent_task_terminals WHERE task_id IN ("
-                + ",".join("?" for _ in ids) + ")", ids)}
 
     @staticmethod
     def _terminal_unavailable():
@@ -259,10 +172,10 @@ class AgentCallStore:
 
     @classmethod
     def for_identity(cls, path: Path, *, robot_identity: Dict[str, Any], artifact_dir: Path,
-                     gateway_instance_id: str, fresh_layout: str = "split"):
+                     gateway_instance_id: str):
         """按精确机器人身份选择已持久分配的作用域。"""
         return cls(path, gateway_instance_id=gateway_instance_id,
-                   robot_identity=robot_identity, artifact_dir=artifact_dir, fresh_layout=fresh_layout)
+                   robot_identity=robot_identity, artifact_dir=artifact_dir)
 
     @staticmethod
     def _resolve_owner(connection, identity_json: str) -> str:
@@ -270,14 +183,17 @@ class AgentCallStore:
                                  (identity_json,)).fetchone()
         if row is not None:
             return row["scope_id"]
+        has_legacy_terminals = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='agent_task_terminals' AND type='table'").fetchone() is not None
         for _ in range(8):
             scope = "scope_" + uuid4().hex
             occupied = connection.execute(
                 "SELECT scope_id FROM agent_scope_owners WHERE scope_id=? UNION ALL "
                 "SELECT scope FROM agent_scope_bindings WHERE scope=? UNION ALL "
-                "SELECT scope FROM agent_calls WHERE scope=? UNION ALL "
-                "SELECT scope FROM agent_task_terminals WHERE scope=? LIMIT 1",
-                (scope, scope, scope, scope)).fetchone()
+                "SELECT scope FROM agent_calls WHERE scope=? LIMIT 1",
+                (scope, scope, scope)).fetchone()
+            if occupied is None and has_legacy_terminals:
+                occupied = connection.execute("SELECT scope FROM agent_task_terminals WHERE scope=? LIMIT 1", (scope,)).fetchone()
             if occupied is not None:
                 continue
             connection.execute("INSERT INTO agent_scope_owners(scope_id,identity_json) VALUES (?,?)",
@@ -398,26 +314,7 @@ class AgentCallStore:
             raise ValueError("回执版本查询每批最多 64 个任务。")
         if not ids:
             return {}
-        backend = self._terminal_backend()
-        if backend is not None:
-            return backend.versions(ids)
-        with self._connection() as connection:
-            rows = connection.execute(
-                "SELECT task_id,scope,receipt_source_id,receipt_revision FROM agent_task_terminals "
-                "WHERE task_id IN (" + ",".join("?" for _ in ids) + ")", ids).fetchall()
-            versions = {}
-            for row in rows:
-                error_code = None
-                try:
-                    self._assert_scope(connection, row["scope"], error_code="agent_terminal_scope_conflict",
-                                       message="任务历史回执属于另一作用域。")
-                except GatewayError as error:
-                    error_code = error.error_code
-                if error_code is None and (row["receipt_source_id"] is None or row["receipt_revision"] is None):
-                    error_code = "agent_terminal_legacy_conflict"
-                versions[row["task_id"]] = {"source_id": row["receipt_source_id"],
-                                            "revision": row["receipt_revision"], "error_code": error_code}
-            return versions
+        return self._terminal_store.versions(ids)
 
     def prepare_terminal(self, task_id: str, snapshot: Dict[str, Any], *,
                       source_id: Optional[str] = None, revision: Optional[int] = None) -> PreparedTerminalReceipt:
@@ -447,22 +344,7 @@ class AgentCallStore:
         if type(prepared) is not PreparedTerminalReceipt or prepared._owner_token is not self._terminal_preparation_token:
             raise GatewayError("回执准备结果不属于此存储拥有者。",
                                error_code="agent_terminal_identity_conflict", http_status=409)
-        backend = self._terminal_backend()
-        if backend is not None:
-            return backend.save(prepared)
-        with self._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                row = connection.execute("SELECT * FROM agent_task_terminals WHERE task_id=?", (prepared.task_id,)).fetchone()
-                if row is not None:
-                    self._assert_scope(connection, row["scope"], error_code="agent_terminal_scope_conflict",
-                                       message="任务历史回执属于另一作用域。")
-                result = self._write_terminal_row(connection, row, prepared)
-                connection.commit()
-                return result
-            except BaseException:
-                connection.rollback()
-                raise
+        return self._terminal_store.save(prepared)
 
     def _write_terminal_row(self, connection, row, prepared):
         # 调用方已授权；此方法不打开其他库、不复制/投影/编码源内容。
@@ -499,15 +381,7 @@ class AgentCallStore:
 
     def get_terminal(self, task_id: str) -> Dict[str, Any]:
         try:
-            backend = self._terminal_backend()
-            if backend is not None:
-                row = backend.read(task_id)
-            else:
-                with self._connection() as connection:
-                    row = connection.execute("SELECT * FROM agent_task_terminals WHERE task_id=?", (task_id,)).fetchone()
-                    if row is not None:
-                        self._assert_scope(connection, row["scope"], error_code="not_found",
-                                           message="当前机器人没有该任务终态记录。")
+            row = self._terminal_store.read(task_id)
         except (sqlite3.Error, OSError) as error:
             raise self._terminal_unavailable() from error
         if row is None:

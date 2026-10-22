@@ -43,27 +43,25 @@ try:
     print('PASS recall, lexical, live-only, stale suppression')
 finally:c.doCleanups()
 
-# Separately injected caches may retain old payload metadata across a proven
-# same-input source update. Filtering must use the authoritative current source.
+# 同库元数据更新不重做向量；筛选继续使用已提交的当前源。
 import tempfile
 from pathlib import Path
 from contracts.memory import MemoryPayloadFilter
-from services.memory.vector_store import SQLiteNamedVectorStore
 with tempfile.TemporaryDirectory() as d:
-    store=SQLiteNamedVectorStore(str(Path(d)/'cache.db'))
-    s=c.fixture(path=str(Path(d)/'source.db'),store=store,embedder=SemanticFake())
+    s=c.fixture(path=str(Path(d)/'source.db'),embedder=SemanticFake())
+    store=s._vector_store
     try:
         record,receipt=c.accept(s,c.memory(title='Semantic destination',summary='Meaningful item',map_name='old-map'))
         s._run_durable_vectorization(c.claim(s))
         s._repository.upsert_semantic_memory(record.model_copy(update={'map_name':'new-map'}))
         assert s._durable_index.outbox.current(receipt.version.key)==receipt
-        assert store.get_point(record.memory_id).payload['map_name']=='old-map'
+        assert store.get_point(record.memory_id).payload['map_name']=='new-map'
         result=s._query_records('needle',allowed_record_kinds=(MemoryRecordKind.SCENE,),similarity_threshold=.4,limit=5,payload_filter=MemoryPayloadFilter(map_name='new-map'))
         assert [m.record_id for m in result.matches]==[record.memory_id],'derived cache old metadata hid current filter match'
         result=s._query_records('needle',allowed_record_kinds=(MemoryRecordKind.SCENE,),similarity_threshold=.4,limit=5,payload_filter=MemoryPayloadFilter(map_name='old-map'))
         assert not result.matches,'stale cache payload passed old filter'
-        print('PASS separate-cache current metadata filtering')
-    finally:c.doCleanups();store.close()
+        print('PASS shared-cache current metadata filtering')
+    finally:c.doCleanups()
 
 # A committed source must remain searchable while its after-commit cache callback
 # is delayed. Candidate narrowing cannot rely solely on the older live renderer.

@@ -50,13 +50,6 @@ def _cfg_csv(name: str, default: Tuple[str, ...] = ()) -> Tuple[str, ...]:
     return config_value(name, default, "csv", _FILE_VALUES)
 
 
-def _prefer_platform_str(platform_value: str, legacy_name: str, default: str) -> str:
-    value = str(platform_value or "").strip()
-    if value:
-        return value
-    return _cfg_str(legacy_name, default)
-
-
 @dataclass
 class Go2VideoStreamConfig:
     """Go2 端侧 WebRTC 持续视频推流配置。"""
@@ -121,17 +114,13 @@ def load_go2_data_plane_config(
     return Go2DataPlaneConfig(
         enabled=_cfg_bool("GO2_DATA_PLANE_ENABLED", False),
         sdk_path=_cfg_str("GO2_SDK_PATH", ""),
-        dds_iface=_prefer_platform_str(
-            getattr(platform_geometry, "dds_iface", "") if platform_geometry is not None else "",
-            "GO2_DATA_PLANE_DDS_IFACE",
-            _cfg_str("GO2_DDS_IFACE", ""),
-        ),
+        dds_iface=_cfg_str("GO2_DATA_PLANE_DDS_IFACE", _cfg_str("GO2_DDS_IFACE", "")),
         expected_odom_frame=str(
             platform_geometry.frames.odom_frame if platform_geometry is not None else ""
         ).strip(),
         expected_imu_frame=GO2_DEFAULT_FRAME_IDS["imu"],
         lio_backend=str(
-            getattr(platform_geometry, "lio_backend", "device") if platform_geometry is not None
+            platform_geometry.lio_backend if platform_geometry is not None
             else os.environ.get("NUWAX_GEOMETRY_LIO_BACKEND", "device")
         ).strip(),
         lio_body_from_sensor=_cfg_str("NUWAX_GEOMETRY_LIO_BODY_FROM_SENSOR", ""),

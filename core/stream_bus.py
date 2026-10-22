@@ -227,12 +227,9 @@ class StreamBus:
         if frame.status == "cleared" or frame.payload is None:
             return None
         payload = frame.payload
-        try:
-            key = tuple(payload.get(name) if isinstance(payload, dict) else getattr(payload, name, None)
-                        for name in ("map_name", "source_name", "source_epoch", "frame_id"))
-            key = (*key[:3], key[3] or frame.frame_id)
-        except Exception:
-            return None
+        key = tuple(payload.get(name) if isinstance(payload, dict) else getattr(payload, name, None)
+                    for name in ("map_name", "source_name", "source_epoch", "frame_id"))
+        key = (*key[:3], key[3] or frame.frame_id)
         return key if all(isinstance(value, str) and value for value in key) else None
 
     def _enqueue_async_locked(self, subscription: StreamSubscription, frame: StreamFrame) -> None:

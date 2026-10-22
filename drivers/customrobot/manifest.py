@@ -12,10 +12,10 @@ if TYPE_CHECKING:
 def build_customrobot_defaults(config: Optional["NuwaxRobotBridgeConfig"] = None) -> RobotDefaults:
     """构造标准输入默认命名；物理标定仍须由接入方提供。"""
 
-    frames = getattr(getattr(config, "geometry", None), "frames", None)
+    frames = config.geometry.frames if config is not None else None
     return RobotDefaults(
         frame_ids={
-            "base": getattr(frames, "base_frame", "base_link"),
+            "base": frames.base_frame if frames is not None else "base_link",
             "camera_front": "world/customrobot/camera_front",
             "imu": "world/customrobot/imu",
             "lidar": "world/customrobot/lidar",

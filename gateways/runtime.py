@@ -9,7 +9,6 @@ from datetime import datetime, timezone
 from enum import IntEnum
 from functools import partial
 import fcntl
-import hashlib
 import json
 import logging
 import math
@@ -141,6 +140,7 @@ from skills.handlers import audio_skills
 from skills.handlers import perception_skills
 from core.logging_utils import LogRateLimiter, format_log_preview, is_low_value_runtime_event, set_correlation_context, clear_correlation_context, StreamBusLogHandler, DropPatternLogFilter
 from core.settings import NuwaxRobotBridgeConfig
+from gateways.arguments import validate_arguments
 from gateways.runtime_event_log import RuntimeEventLog
 
 
@@ -157,8 +157,9 @@ class _ShmVideoFrameSource:
         self._reader = None
         self._last_frame = None
         self._connected = False
-        # 平台侧零 import driver：经鸭子类型持有提供 get_camera_info() 的 provider
-        # （通常是 robot.providers）。用于给 SHM 帧注入真实内参与分辨率，消除硬编码旁路。
+        self._last_error = None
+        self._log_limiter = LogRateLimiter()
+        # 组合根只绑定相机提供器，给共享内存帧附加真实相机参数。
         self._camera_info_provider = camera_info_provider
         # 内参不可用时的 frame_id 回退：由实例化点从 robot.defaults.frame_ids 注入，
         # 平台侧不再硬编码任何具体机器人的坐标系命名。
@@ -170,13 +171,9 @@ class _ShmVideoFrameSource:
         """取一次相机内参并缓存（内参为静态物理参数，无需每帧重取）。"""
         if self._camera_info_cache is not None:
             return self._camera_info_cache
-        getter = getattr(self._camera_info_provider, "get_camera_info", None)
-        if not callable(getter):
+        if self._camera_info_provider is None:
             return None
-        try:
-            info = getter(camera_id) if camera_id else getter()
-        except Exception:
-            return None
+        info = self._camera_info_provider.get_camera_info(camera_id)
         self._camera_info_cache = info
         return info
 
@@ -189,8 +186,12 @@ class _ShmVideoFrameSource:
             self._connected = reader.open()
             if self._connected:
                 self._reader = reader
-        except Exception:
+        except Exception as exc:
             self._connected = False
+            self._last_error = str(exc)
+            self._log_limiter.log(RUNTIME_LOGGER, logging.WARNING,
+                "视频共享内存连接失败 path=%s", self._shm_path,
+                key="open", interval_sec=5.0, exc_info=True)
         return self._connected
 
     def get_latest_image(self, camera_id=None):
@@ -202,8 +203,12 @@ class _ShmVideoFrameSource:
             return None
         try:
             result = self._reader.read_latest()
-        except Exception:
+        except Exception as exc:
             self._connected = False
+            self._last_error = str(exc)
+            self._log_limiter.log(RUNTIME_LOGGER, logging.WARNING,
+                "视频共享内存读取失败 path=%s", self._shm_path,
+                key="read", interval_sec=5.0, exc_info=True)
             self._reader.close()
             self._reader = None
             return None
@@ -216,14 +221,9 @@ class _ShmVideoFrameSource:
             from io import BytesIO
             from PIL import Image
             from contracts.image import ImageFrame, ImageEncoding
-            try:
-                # 只读压缩头取得实际尺寸，不展开图像像素。
-                with Image.open(BytesIO(frame_bytes)) as image:
-                    width_px, height_px = image.size
-            except Exception:
-                if camera_info is None:
-                    return None
-                width_px, height_px = int(camera_info.width_px), int(camera_info.height_px)
+            # 只读压缩头取得实际尺寸，不展开图像像素。
+            with Image.open(BytesIO(frame_bytes)) as image:
+                width_px, height_px = image.size
             frame_id = str(camera_info.frame_id) if camera_info is not None else self._fallback_frame_id
             source_ns = int(ts_ns)
             timestamp = datetime.fromtimestamp(max(0, source_ns) // 1_000_000_000, tz=timezone.utc).replace(
@@ -244,7 +244,7 @@ class _ShmVideoFrameSource:
                 metadata["camera_info"] = camera_info
             else:
                 metadata["camera_info_missing"] = "no_camera_info_provider"
-            return ImageFrame(
+            frame = ImageFrame(
                 camera_id=resolved_camera_id,
                 frame_id=frame_id,
                 timestamp=timestamp,
@@ -254,7 +254,13 @@ class _ShmVideoFrameSource:
                 data=frame_bytes,
                 metadata=metadata,
             )
-        except Exception:
+            self._last_error = None
+            return frame
+        except Exception as exc:
+            self._last_error = str(exc)
+            self._log_limiter.log(RUNTIME_LOGGER, logging.WARNING,
+                "视频共享内存帧解码失败 path=%s sequence=%s", self._shm_path, sequence,
+                key="decode", interval_sec=5.0, exc_info=True)
             return None
 
     def status_snapshot(self):
@@ -263,7 +269,8 @@ class _ShmVideoFrameSource:
         return {
             "available": ok,
             "connected": ok,
-            "reason": "ok" if ok else "shm_not_available",
+            "reason": self._last_error or ("ok" if ok else "shm_not_available"),
+            "last_error": self._last_error,
             "shm_path": self._shm_path,
             "camera_id": str(getattr(info, "camera_id", None) or "front_camera"),
             "frame_timestamp_source": "video_relay.write_time",
@@ -369,7 +376,6 @@ _VIDEO_STREAM_REFRESH_INTERVAL_SEC = 1.0 / 3.0
 _DEFAULT_ASYNC_TASK_TIMEOUT_SEC = 15 * 60
 _EXPLORATION_STOP_BARRIER_TIMEOUT_SEC = 10.0
 _EXPLORATION_STOP_TRANSACTION_CAPACITY = 32
-_EXPLORATION_STOP_TRANSACTION_INIT_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -546,7 +552,6 @@ _SYNC_GEOMETRY_CAPABILITY_NAMES = frozenset(
         # 它们的重型阻塞段在后台 task runner 内 ensure 几何运行时，不再走此同步门禁，
         # 避免 _ensure_geometry_runtime_for_invoke 在异步分派前同步等待。
         "finalize_active_map",
-        "start_mapping",
         *_GUARD_ONLY_CAPABILITY_NAMES,
         *_PERSON_FOLLOW_CAPABILITY_NAMES,
     }
@@ -1095,7 +1100,7 @@ class GatewayRuntime:
             spatial_context_provider=lambda: self.memory_service.capture_observation_spatial_context(),
             provider_owner=robot,
             localization_provider_owner=self.platform_geometry_runtime,
-            live_pose_provider=getattr(self.platform_geometry_runtime, "providers", None),
+            live_pose_provider=self.platform_geometry_runtime.providers,
             artifact_service=self.artifact_service,
             state_store=self.state_store,
             detector_pipeline=perception_components["detector_pipeline"],
@@ -1105,11 +1110,11 @@ class GatewayRuntime:
             event_bus=self.event_bus,
             stream_bus=self.stream_bus,
             video_frame_sink=None,
-            video_frame_source=getattr(robot, "providers", None)
-            if isinstance(getattr(robot, "providers", None), VideoFrameSource)
+            video_frame_source=robot.providers
+            if isinstance(robot.providers, VideoFrameSource)
             else _ShmVideoFrameSource(
                 runtime_value("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm"),
-                camera_info_provider=getattr(robot, "providers", None),
+                camera_info_provider=robot.providers if isinstance(robot.providers, ImageProvider) else None,
                 fallback_frame_id=robot.defaults.frame_ids.get(
                     "camera_front", f"world/{robot.manifest.robot_name}/camera_front"
                 ),
@@ -1121,7 +1126,7 @@ class GatewayRuntime:
             perception_service=self.perception_service,
             state_store=self.state_store,
             localization_service=self.localization_service,
-            live_pose_provider=getattr(self.platform_geometry_runtime, "providers", None),
+            live_pose_provider=self.platform_geometry_runtime.providers,
             mapping_service=self.mapping_service,
             event_bus=self.event_bus,
             enabled=config.perception.stream_runtime.enabled,
@@ -1151,7 +1156,7 @@ class GatewayRuntime:
             mapping_service=self.mapping_service,
             observation_service=self.observation_service,
             perception_service=self.perception_service,
-            live_pose_provider=getattr(self.platform_geometry_runtime, "providers", None),
+            live_pose_provider=self.platform_geometry_runtime.providers,
             state_store=self.state_store,
             event_bus=self.event_bus,
             artifact_store=self.artifact_store,
@@ -1167,11 +1172,10 @@ class GatewayRuntime:
             deferred_projection_config=config.perception.deferred_projection,
             accumulated_cloud_provider=self._provide_accumulated_pointcloud_xyz,
         )
-        from core.settings import SceneMappingConfig
         from services.memory.scene_mapping import SceneMappingService
         self.scene_mapping_service = SceneMappingService(
             memory_service=self.memory_service,
-            config=getattr(config, "scene_mapping", SceneMappingConfig()),
+            config=config.scene_mapping,
             stream_bus=self.stream_bus,
         )
         self.perception_video_runtime.bind_memory_service(self.memory_service)
@@ -1235,6 +1239,10 @@ class GatewayRuntime:
         )
         # 启停等待组件退出时不占用数据锁，避免与点云读取回调形成锁反转。
         self._lifecycle_lock = threading.RLock()
+        self.manipulation_service = None
+        self._runtime_activation_context = None
+        self._memory_shutdown_complete = False
+        self._recording_notification_gaps = {}
         self._building_catalog_repository = None
         self._building_navigation_service = None
         self._building_exploration_service = None
@@ -1343,11 +1351,8 @@ class GatewayRuntime:
         """
 
         geometry_runtime = self.platform_geometry_runtime
-        geometry_config = getattr(geometry_runtime, "config", None)
-        mapping_config = getattr(geometry_config, "mapping", None)
-        if not bool(getattr(geometry_config, "enabled", False)) or not bool(
-            getattr(mapping_config, "profile_enabled", False)
-        ):
+        geometry_config = geometry_runtime.config
+        if not geometry_config.enabled or not geometry_config.mapping.profile_enabled:
             RUNTIME_LOGGER.info(
                 "平台几何运行时未启用，跳过 Gateway 启动期 gRPC 挂接。"
             )
@@ -1363,13 +1368,7 @@ class GatewayRuntime:
                     runtime_status.get("message"),
                 )
                 return False
-            probe = getattr(geometry_runtime, "probe_geometry_runtime_health", None)
-            if not callable(probe):
-                RUNTIME_LOGGER.warning(
-                    "Gateway 启动期 GeometryRuntimeProvider 缺少 live GetStatus 探测接口。"
-                )
-                return False
-            probe_ok, probe_message = probe()
+            probe_ok, probe_message = geometry_runtime.probe_geometry_runtime_health()
             if not probe_ok:
                 RUNTIME_LOGGER.warning(
                     "Gateway 启动期 GeometryRuntimeProvider live GetStatus 探测失败: %s",
@@ -1534,10 +1533,10 @@ class GatewayRuntime:
         relocalization_pending: Dict[str, object] = {}
         with self._lifecycle_lock:
             if not self._started:
-                recorder = getattr(self, "mapping_recorder", None)
+                recorder = self.mapping_recorder
                 recording_pending = recorder is not None and not recorder.status()["closed"]
                 dispatch_complete = True
-                if not self._closed or recording_pending or not getattr(self, "_dispatch_shutdown_complete", False):
+                if not self._closed or recording_pending or not self._dispatch_shutdown_complete:
                     # stop 是终止意图；清理未完成也不能重新启动半关闭的拥有者。
                     self._closed = True
                     self.task_manager.shutdown(wait=True)
@@ -1553,7 +1552,7 @@ class GatewayRuntime:
                 # 曾建立连接后故障仍须停车，不能仅用当前 started 判断。
                 stop_result = (
                     self.safety_guard.stop_all_motion("宿主机网关关闭。")
-                    if getattr(self.motion_guard, "has_connected", True)
+                    if self.motion_guard.has_connected
                     else None
                 )
                 if (
@@ -1639,7 +1638,7 @@ class GatewayRuntime:
             owner_settled = relocalization_stop_error is None
             event_payload: Dict[str, object] = {
                 "success": stop_error is None and owner_settled,
-                "memory_shutdown_complete": getattr(self, "_memory_shutdown_complete", False),
+                "memory_shutdown_complete": self._memory_shutdown_complete,
                 "relocalization_owner_settled": owner_settled,
                 "stop_error_code": (
                     relocalization_stop_error.error_code
@@ -1675,8 +1674,7 @@ class GatewayRuntime:
         if not self._close_artifact_dependencies():
             self._memory_shutdown_complete = False
             raise RuntimeError("Artifact shutdown incomplete: active publisher or maintenance callback; memory retained")
-        memory = getattr(self, "memory_service", None)
-        complete = memory is None or memory.close()
+        complete = self.memory_service.close()
         self._memory_shutdown_complete = complete is not False
         if not self._memory_shutdown_complete:
             raise RuntimeError("Memory shutdown incomplete: provider still running; storage retained")
@@ -1686,10 +1684,13 @@ class GatewayRuntime:
         deadline = time.monotonic() + max(0.0, timeout_sec)
         complete = True
         pending = []
-        for name in ("artifact_service", "perception_video_runtime", "observation_service", "perception_service"):
-            component = getattr(self, name, None)
-            close = getattr(component, "close", None)
-            if close is not None and close(timeout=max(0.0, deadline - time.monotonic())) is False:
+        for name, component in (
+            ("artifact_service", self.artifact_service),
+            ("perception_video_runtime", self.perception_video_runtime),
+            ("observation_service", self.observation_service),
+            ("perception_service", self.perception_service),
+        ):
+            if component.close(timeout=max(0.0, deadline - time.monotonic())) is False:
                 complete = False
                 pending.append(name)
         self._artifact_shutdown_complete = complete
@@ -1698,44 +1699,39 @@ class GatewayRuntime:
 
     def _begin_artifact_shutdown(self) -> None:
         """生产者开始拆除前先禁止晚删除；后续关闭阶段负责有界等待及报告。"""
-        service = getattr(self, "artifact_service", None)
-        if service is not None:
-            self._artifact_shutdown_complete = service.close(timeout=0.0)
+        self._artifact_shutdown_complete = self.artifact_service.close(timeout=0.0)
 
     def _close_mapping_recording(self, timeout_sec: float = 2.0) -> bool:
         """Retain the recorder until all accepted map notification attempts finish."""
         deadline = time.monotonic() + max(0.0, timeout_sec)
-        mapping = getattr(self, "mapping_service", None)
-        if mapping is not None and not mapping.close_notifications(timeout_sec):
+        mapping = self.mapping_service
+        if not mapping.close_notifications(timeout_sec):
             return False
-        recorder = getattr(self, "mapping_recorder", None)
-        if recorder is not None:
-            if mapping is not None:
-                status = mapping.notification_status()
-                reported = getattr(self, "_recording_notification_gaps", {})
-                for reason in ("map_frame_admission_gaps", "map_frame_interrupted_attempts", "map_frame_cancelled_attempts"):
-                    count = status[reason]
-                    recorder.record_notification_gap(reason, max(0, count - reported.get(reason, 0)))
-                    reported[reason] = count
-                self._recording_notification_gaps = reported
-            subscription = getattr(self, "_recording_subscription_id", None)
-            if subscription is not None:
-                self.stream_bus.unsubscribe(subscription)
-                self._recording_subscription_id = None
-            recorder.close(timeout=max(0.0, deadline - time.monotonic()))
+        recorder = self.mapping_recorder
+        status = mapping.notification_status()
+        reported = self._recording_notification_gaps
+        for reason in ("map_frame_admission_gaps", "map_frame_interrupted_attempts", "map_frame_cancelled_attempts"):
+            count = status[reason]
+            recorder.record_notification_gap(reason, max(0, count - reported.get(reason, 0)))
+            reported[reason] = count
+        subscription = self._recording_subscription_id
+        if subscription is not None:
+            self.stream_bus.unsubscribe(subscription)
+            self._recording_subscription_id = None
+        recorder.close(timeout=max(0.0, deadline - time.monotonic()))
         return True
 
     def _close_runtime_event_bridge(self, timeout_sec: float) -> bool:
         """撤销注册并等待已认领回调；共享事件总线仍由调用方拥有。"""
-        subscription = getattr(self, "_event_log_subscription_id", None)
+        subscription = self._event_log_subscription_id
         if subscription is not None:
             self._closing_event_log_subscription_id = subscription
             self.event_bus.unsubscribe(subscription)
             self._event_log_subscription_id = None
-        pending = getattr(self, "_closing_event_log_subscription_id", None)
+        pending = self._closing_event_log_subscription_id
         if pending is None:
             return True
-        if getattr(getattr(self, "_event_bridge_context", None), "active", False):
+        if getattr(self._event_bridge_context, "active", False):
             return False
         deadline = time.monotonic() + max(0.0, timeout_sec)
         wake = threading.Event()
@@ -1754,7 +1750,7 @@ class GatewayRuntime:
         """释放构造期资源；未调用 start 的实例也需要关闭自己的后台线程。"""
 
         # stop已先取消并等待TaskManager；仍有设备HTTP使用者时保留客户端供收尾重试。
-        manipulation = getattr(self, "manipulation_service", None)
+        manipulation = self.manipulation_service
         if manipulation is not None and manipulation.close(timeout=timeout_sec) is False:
             self._dispatch_shutdown_complete = False
             self._dispatch_shutdown_blocker = "manipulation_in_flight"
@@ -1765,12 +1761,8 @@ class GatewayRuntime:
             self._dispatch_shutdown_blocker = "artifact_owner_in_flight"
             return False
 
-        scene_mapping = getattr(self, "scene_mapping_service", None)
-        if scene_mapping is not None:
-            scene_mapping.close()
-        dense_cache = getattr(self, "_saved_dense_cloud_cache", None)
-        if dense_cache is not None:
-            dense_cache.close()
+        self.scene_mapping_service.close()
+        self._saved_dense_cloud_cache.close()
         deadline = time.monotonic() + max(0.0, timeout_sec)
         try:
             mapping_closed = self._close_mapping_recording(max(0.0, deadline - time.monotonic()))
@@ -1782,7 +1774,7 @@ class GatewayRuntime:
             self._dispatch_shutdown_complete = False
             self._dispatch_shutdown_blocker = "mapping_notifications_in_flight"
             return False
-        building_service = getattr(self, "_building_navigation_service", None)
+        building_service = self._building_navigation_service
         if building_service is not None:
             for provider in building_service.providers.values():
                 provider.close()
@@ -1791,25 +1783,22 @@ class GatewayRuntime:
             self._dispatch_shutdown_complete = False
             self._dispatch_shutdown_blocker = "event_bridge_in_flight"
             return False
-        event_log = getattr(self, "_runtime_event_log", None)
-        if event_log is not None and not event_log.close(max(0.0, deadline - time.monotonic())):
+        if not self._runtime_event_log.close(max(0.0, deadline - time.monotonic())):
             self._dispatch_shutdown_complete = False
             self._dispatch_shutdown_blocker = "event_log_in_flight"
             return False
-        if (getattr(self, "_owns_event_bus", False)
+        if (self._owns_event_bus
                 and self.event_bus.shutdown(max(0.0, deadline - time.monotonic())) is False):
             self._dispatch_shutdown_complete = False
             self._dispatch_shutdown_blocker = "event_bus_in_flight"
             return False
-        if (getattr(self, "_owns_stream_bus", False)
+        if (self._owns_stream_bus
                 and self.stream_bus.shutdown(max(0.0, deadline - time.monotonic())) is False):
             self._dispatch_shutdown_complete = False
             self._dispatch_shutdown_blocker = "stream_bus_in_flight"
             return False
-        log_handler = getattr(self, "_log_stream_handler", None)
-        if log_handler is not None:
-            logging.getLogger().removeHandler(log_handler)
-            log_handler.close()
+        logging.getLogger().removeHandler(self._log_stream_handler)
+        self._log_stream_handler.close()
         self._dispatch_shutdown_complete = True
         self._dispatch_shutdown_blocker = None
         return True
@@ -1830,22 +1819,22 @@ class GatewayRuntime:
 
     def get_event_log_status(self) -> Dict[str, object]:
         """只读有界计数与缺口，不读取载荷、不等待日志处理器。"""
-        event_log = getattr(self, "_runtime_event_log", None)
+        event_log = self._runtime_event_log
         if event_log is None:
             return {"state": "not_started", "accepting": False, "closed": False}
         status = event_log.status()
-        complete = getattr(self, "_dispatch_shutdown_complete", False)
-        closing = (getattr(self, "_closed", False) or not status["accepting"]
-                   or getattr(self, "_closing_event_log_subscription_id", None) is not None)
+        complete = self._dispatch_shutdown_complete
+        closing = (self._closed or not status["accepting"]
+                   or self._closing_event_log_subscription_id is not None)
         return {**status,
                 "dispatch_state": "stopped" if complete else "stopping" if closing else "accepting",
-                "bridge_close_pending": getattr(self, "_closing_event_log_subscription_id", None) is not None,
-                "dispatch_pending_reason": getattr(self, "_dispatch_shutdown_blocker", None),
+                "bridge_close_pending": self._closing_event_log_subscription_id is not None,
+                "dispatch_pending_reason": self._dispatch_shutdown_blocker,
                 "dispatch_shutdown_complete": complete}
 
     def _log_runtime_event(self, event) -> None:
         """先同步提交任务展示状态，再将有界日志副本交给独立输出拥有者。"""
-        context = getattr(self, "_event_bridge_context", None)
+        context = self._event_bridge_context
         if context is None:
             context = self._event_bridge_context = threading.local()
         context.active = True
@@ -1965,7 +1954,7 @@ class GatewayRuntime:
             return format_log_preview(value)
 
     def _start_data_frame_stream_sources(self) -> None:
-        providers = getattr(self.robot, "providers", None)
+        providers = self.robot.providers
 
         self.memory_service.start_instance_stream()
         if self.scene_mapping_service.config.enabled and self.scene_mapping_service.config.auto_start:
@@ -1980,7 +1969,7 @@ class GatewayRuntime:
             self._start_system_telemetry_stream()
         except Exception:
             RUNTIME_LOGGER.debug("启动性能监控采集线程失败。", exc_info=True)
-        if getattr(self.config.geometry, "pipeline", "lio_3d") != "slam_2d" and self._pointcloud_map_stream_subscription_id is None:
+        if self.config.geometry.pipeline != "slam_2d" and self._pointcloud_map_stream_subscription_id is None:
             self._pointcloud_map_stream_subscription_id = self.stream_bus.subscribe(
                 self._handle_map_frame_for_pointcloud_map_stream,
                 topics=("map.frame",),
@@ -1990,10 +1979,7 @@ class GatewayRuntime:
         if callable(robot_state_subscriber) and self._robot_state_stream_subscription_id is None:
             self._robot_state_stream_subscription_id = robot_state_subscriber(self._publish_robot_state_stream_frame)
 
-        localization_stream_owned_by_service = False
-        has_provider_stream = getattr(self.localization_service, "has_provider_stream_subscription", None)
-        if callable(has_provider_stream):
-            localization_stream_owned_by_service = bool(has_provider_stream())
+        localization_stream_owned_by_service = self.localization_service.has_provider_stream_subscription()
         if not localization_stream_owned_by_service:
             localization_subscriber = getattr(providers, "subscribe_localization", None)
             localization_unsubscriber = getattr(providers, "unsubscribe_localization", None)
@@ -2002,7 +1988,7 @@ class GatewayRuntime:
                 self._localization_stream_unsubscriber = localization_unsubscriber if callable(localization_unsubscriber) else None
 
         point_cloud_subscriber = getattr(providers, "subscribe_point_cloud", None)
-        if getattr(self.config.geometry, "pipeline", "lio_3d") != "slam_2d" and callable(point_cloud_subscriber) and self._point_cloud_stream_subscription_id is None:
+        if self.config.geometry.pipeline != "slam_2d" and callable(point_cloud_subscriber) and self._point_cloud_stream_subscription_id is None:
             self._point_cloud_stream_subscription_id = point_cloud_subscriber(self._publish_point_cloud_stream_frame)
 
     def _publish_navigation_bootstrap_stream_frames(self) -> None:
@@ -2254,7 +2240,7 @@ class GatewayRuntime:
         return PointCloudMapSourceSwitch(live_source, saved_source)
 
     def _start_pointcloud_map_stream(self) -> None:
-        if getattr(self.config.geometry, "pipeline", "lio_3d") == "slam_2d":
+        if self.config.geometry.pipeline == "slam_2d":
             return
         with self._lock:
             thread = self._pointcloud_map_stream_thread
@@ -2600,7 +2586,7 @@ class GatewayRuntime:
         if self._pointcloud_map_stream_subscription_id is not None:
             self.stream_bus.unsubscribe(self._pointcloud_map_stream_subscription_id)
             self._pointcloud_map_stream_subscription_id = None
-        providers = getattr(self.robot, "providers", None)
+        providers = self.robot.providers
         if providers is None:
             return
         if self._robot_state_stream_subscription_id is not None:
@@ -2609,7 +2595,7 @@ class GatewayRuntime:
                 unsubscriber(self._robot_state_stream_subscription_id)
             self._robot_state_stream_subscription_id = None
         if self._localization_stream_subscription_id is not None:
-            unsubscriber = getattr(self, "_localization_stream_unsubscriber", None) or getattr(providers, "unsubscribe_localization", None)
+            unsubscriber = self._localization_stream_unsubscriber or getattr(providers, "unsubscribe_localization", None)
             if callable(unsubscriber):
                 unsubscriber(self._localization_stream_subscription_id)
             self._localization_stream_subscription_id = None
@@ -3856,7 +3842,7 @@ class GatewayRuntime:
                 update={
                     "tags": list(("robot_private", active_robot_name, *spec.tags)),
                 },
-                deep=True,
+                deep=False,
             )
             for spec in private_specs
         )
@@ -4457,7 +4443,7 @@ class GatewayRuntime:
                 "exposed_to_agent": exposed_to_agent,
                 "tags": tags,
             },
-            deep=True,
+            deep=False,
         )
 
     def _decorate_gateway_skill(
@@ -4482,7 +4468,7 @@ class GatewayRuntime:
                     "capability_layer": layer,
                 },
             },
-            deep=True,
+            deep=False,
         )
 
     def _resolve_gateway_capability_owner(
@@ -4510,10 +4496,10 @@ class GatewayRuntime:
         return "platform"
 
     def _resolve_active_robot_namespace(self) -> str:
-        configured_robot_name = str(getattr(getattr(self.config, "robot", None), "active_robot", "") or "").strip().lower()
+        configured_robot_name = str(self.config.robot.active_robot or "").strip().lower()
         if configured_robot_name:
             return configured_robot_name
-        return str(getattr(self.robot.manifest, "robot_name", "") or "").strip().lower()
+        return str(self.robot.manifest.robot_name or "").strip().lower()
 
     def _resolve_private_skill_category(
         self,
@@ -4594,6 +4580,9 @@ class GatewayRuntime:
 
         registration = self.capability_registry.get_registration(capability_name)
         descriptor = registration.descriptor
+        payload = {} if arguments is None else arguments
+        validate_arguments(payload, descriptor.input_schema)
+        payload = dict(payload)
         self._refresh_dynamic_capability_matrix(capability_names=(capability_name,))
         self.capability_registry.assert_supported(
             capability_name,
@@ -4605,7 +4594,6 @@ class GatewayRuntime:
             capability_name=descriptor.name,
             requested_by=requested_by,
         )
-        payload = dict(arguments or {})
         correlation_tokens = set_correlation_context(
             request_id=context.get("request_id", ""),
             capability_name=descriptor.name,
@@ -4896,13 +4884,13 @@ class GatewayRuntime:
             geometry_runtime_status=self.platform_geometry_runtime.get_runtime_status(),
         )
         robot_state = getattr(robot_snapshot, "robot_state", robot_snapshot)
-        input_bridge = getattr(self, "_input_bridge", None)
+        input_bridge = self._input_bridge
         return {
             "runtime_started": self._started,
             "runtime_input_bridge": input_bridge.get_status() if input_bridge is not None else {
                 "started": False, "ready": False,
             },
-            "mapping_recording": self.mapping_recorder.status() if getattr(self, "mapping_recorder", None) is not None else None,
+            "mapping_recording": self.mapping_recorder.status() if self.mapping_recorder is not None else None,
             "robot_name": self.robot.manifest.robot_name,
             "robot_model": self.robot.manifest.robot_model,
             "assembly_status": self._serialize(self.robot.get_status()),
@@ -5325,39 +5313,21 @@ class GatewayRuntime:
         stream_status = self.stream_bus.status()
         geometry_runtime_status = dict(geometry_runtime_status or {})
         geometry_asset = dict(geometry_asset or {})
-        geometry_provider = None
-        provider_getter = getattr(
-            self.platform_geometry_runtime,
-            "get_geometry_runtime_provider",
-            None,
-        )
-        if callable(provider_getter):
-            try:
-                geometry_provider = provider_getter()
-            except Exception:
-                RUNTIME_LOGGER.debug(
-                    "读取 GeometryRuntimeProvider 健康证据失败。",
-                    exc_info=True,
-                )
+        geometry_provider = self.platform_geometry_runtime.get_geometry_runtime_provider()
         geometry_provider_connected = geometry_provider is not None
         geometry_provider_probe_ok = False
         geometry_provider_probe_message = "GeometryRuntimeProvider 未连接"
         if geometry_provider_connected:
-            live_probe = getattr(
-                self.platform_geometry_runtime,
-                "probe_geometry_runtime_health",
-                None,
-            )
-            if callable(live_probe):
-                try:
-                    (
-                        geometry_provider_probe_ok,
-                        geometry_provider_probe_message,
-                    ) = live_probe()
-                except Exception as exc:
-                    geometry_provider_probe_message = "GetStatus 探测异常：%s" % exc
-            else:
-                geometry_provider_probe_message = "缺少 live GetStatus 探测接口"
+            try:
+                (
+                    geometry_provider_probe_ok,
+                    geometry_provider_probe_message,
+                ) = self.platform_geometry_runtime.probe_geometry_runtime_health()
+            except Exception as exc:
+                geometry_provider_probe_message = "GetStatus 探测异常：%s" % exc
+                self._runtime_event_log_limiter.log(RUNTIME_LOGGER, logging.WARNING,
+                    "几何健康查询失败：%s", exc, key="geometry_health_probe",
+                    interval_sec=5.0, exc_info=True)
         geometry_runtime_phase = str(
             geometry_runtime_status.get("phase")
             or geometry_runtime_status.get("state")
@@ -5574,8 +5544,7 @@ class GatewayRuntime:
 
         artifact_count = getattr(artifact_summary, "artifact_count", None)
         total_size = getattr(artifact_summary, "total_size_bytes", None)
-        artifact_service = getattr(self, "artifact_service", None)
-        artifact_status = artifact_service.get_maintenance_status() if artifact_service is not None else {}
+        artifact_status = self.artifact_service.get_maintenance_status()
         artifact_worker = artifact_status.get("worker") or {}
         artifact_debt = any(artifact_status.get(key, 0) for key in
                             ("pending_count", "pending_bytes", "pending_expired", "unserviced_saves"))
@@ -5605,7 +5574,7 @@ class GatewayRuntime:
         geometry_config = self.platform_geometry_runtime.config
         geometry_enabled = bool(
             geometry_config.enabled
-            and getattr(getattr(geometry_config, "mapping", None), "profile_enabled", False)
+            and geometry_config.mapping.profile_enabled
         )
         geometry_started = bool(geometry_runtime_status.get("started") or geometry_runtime_status.get("running"))
         geometry_asset_available = bool(geometry_asset.get("available"))
@@ -5651,30 +5620,29 @@ class GatewayRuntime:
             )
         )
 
+        robot_status = {}
+        adapter_count = None
+        robot_data_error = None
         try:
             robot_status = self._serialize(self.robot.get_status())
-        except Exception:
-            robot_status = {}
-        try:
             adapter_count = len(self.robot.get_adapter_health_statuses())
-        except Exception:
-            adapter_count = None
+        except Exception as exc:
+            robot_data_error = str(exc)
+            self._runtime_event_log_limiter.log(RUNTIME_LOGGER, logging.WARNING,
+                "机器人健康查询失败：%s", exc, key="robot_health_probe",
+                interval_sec=5.0, exc_info=True)
         # 装配可查询不代表状态输入已启动或收到首帧；健康查询只读取现有证据。
         robot_data_status = {}
-        robot_data_error = None
         data_status_getter = getattr(getattr(self.robot, "data_plane", None), "get_status", None)
         if callable(data_status_getter):
             try:
                 robot_data_status = dict(data_status_getter() or {})
             except Exception as exc:
                 robot_data_error = str(exc)
-        robot_snapshot = None
-        snapshot_getter = getattr(getattr(self, "robot_state_service", None), "get_latest_snapshot", None)
-        if callable(snapshot_getter):
-            try:
-                robot_snapshot = snapshot_getter()
-            except Exception as exc:
-                robot_data_error = str(exc)
+                self._runtime_event_log_limiter.log(RUNTIME_LOGGER, logging.WARNING,
+                    "机器人数据面状态读取失败：%s", exc, key="robot_data_status",
+                    interval_sec=5.0, exc_info=True)
+        robot_snapshot = self.robot_state_service.get_latest_snapshot()
         robot_state_timestamp = (
             getattr(getattr(robot_snapshot, "robot_state", None), "timestamp", None)
             or getattr(robot_snapshot, "timestamp", None)
@@ -5832,8 +5800,8 @@ class GatewayRuntime:
     def _iso_from_sampled_at(value: Any) -> Optional[str]:
         """把 telemetry 采样时刻安全转为 ISO 8601 字符串。
 
-        SystemMetricsSnapshot.sampled_at 是 float（Unix 秒时间戳）；
-        但为兼容历史/异常输入，同时接受 datetime 与可解析字符串，无法识别时返回 None。
+        SystemMetricsSnapshot.sampled_at 是 Unix 秒时间戳；
+        已有 datetime 直接格式化，缺少或不可表示的时间返回 None。
         """
 
         if value is None:
@@ -5844,12 +5812,6 @@ class GatewayRuntime:
             try:
                 return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
             except (OverflowError, OSError, ValueError):
-                return None
-        isoformat = getattr(value, "isoformat", None)
-        if callable(isoformat):
-            try:
-                return isoformat()
-            except Exception:
                 return None
         return None
 
@@ -5864,23 +5826,11 @@ class GatewayRuntime:
 
     def get_task_snapshot(self, task_id: str, *, captured_task=None) -> Dict[str, Any]:
         """读取独立快照；投影与回调均在任务协调锁外运行。"""
-        from core.task_manager import TaskReceiptCapture, TaskReceiptUnavailableError
         from gateways.feedback_messages import build_task_feedback
 
-        try:
-            capture = captured_task or self.task_manager.capture_task_receipt(task_id)
-            if (not isinstance(capture, TaskReceiptCapture) or capture.task_id != task_id
-                    or capture.source_id != self.task_manager.receipt_source_id):
-                raise ValueError("任务回执封套不属于当前管理器与请求任务。")
-            snapshot = capture.snapshot()
-        except TaskReceiptUnavailableError as error:
-            raise GatewayError(str(error), error_code="task_receipt_unsupported", http_status=500,
-                               details={"status_source": "live_task", "receipt_capture": "unsupported",
-                                        "task_outcome_unchanged": True, "action_replay_allowed": False}) from error
+        capture = captured_task or self.task_manager.capture_task_receipt(task_id)
+        snapshot = capture.snapshot()
         spec = snapshot["task"]
-        if (snapshot.get("task_id") != task_id or spec.task_id != task_id
-                or snapshot["status"].task_id != task_id):
-            raise ValueError("任务回执内容身份与封套不一致。")
         events = snapshot["events"]
         snapshot["feedback"] = capture.feedback(
             lambda: build_task_feedback(self, events[-1]) if events else None)
@@ -5901,21 +5851,13 @@ class GatewayRuntime:
         return dict(guidance) if isinstance(guidance, dict) else None
 
     def _attach_async_task_polling_advisory(self, task_id: str, snapshot: Dict[str, Any]) -> Dict[str, Any]:
-        spec = snapshot.get("task")
-        if spec is None:
-            return snapshot
-        capability_name = spec.get("capability_name") if isinstance(spec, dict) else spec.capability_name
+        spec = snapshot["task"]
+        capability_name = spec.capability_name
         guidance = self._async_task_polling_guidance(capability_name)
         if guidance is None:
             return snapshot
 
-        status_obj = snapshot.get("status")
-        if hasattr(status_obj, "model_dump"):
-            status_data = status_obj.model_dump(mode="json")
-        elif isinstance(status_obj, dict):
-            status_data = dict(status_obj)
-        else:
-            status_data = {}
+        status_data = snapshot["status"].model_dump(mode="json")
         state = str(status_data.get("state") or "").lower()
         terminal_states = {"succeeded", "failed", "cancelled", "timeout"}
         if state in terminal_states:
@@ -6436,7 +6378,7 @@ class GatewayRuntime:
     def _start_yolo_prewarm(self) -> None:
         """显式启动感知时创建推理进程，再异步等待预热完成。"""
         with self._prewarm_lock:
-            thread = getattr(self, "_prewarm_thread", None)
+            thread = self._prewarm_thread
             if thread is not None and thread.is_alive():
                 return
             from services.perception.prewarm import start_yolo_world_worker
@@ -6463,7 +6405,7 @@ class GatewayRuntime:
         只调一次（_prewarm_done 标志）；失败静默降级，绝不打断网关启动。
         预热结果写入 perception_video_runtime，get_perception_runtime_status 透传。
         """
-        if getattr(self, "_prewarm_done", False):
+        if self._prewarm_done:
             return
         self._prewarm_done = True
         try:
@@ -6485,7 +6427,7 @@ class GatewayRuntime:
     def _manual_perception_start(self) -> Dict[str, Any]:
         """用户显式启动感知：解除探索耦合后启动。capability + HTTP 均走此入口。"""
         # 预热尚未完成时只补发异步任务，不能阻塞 MCP（模型上下文协议）调用线程。
-        if not getattr(self, "_prewarm_done", False):
+        if not self._prewarm_done:
             self._start_yolo_prewarm()
         self._perception_exploration_coupled = False
         return self.perception_video_runtime.start()
@@ -6523,8 +6465,7 @@ class GatewayRuntime:
         if not self.perception_video_runtime.is_enabled():
             return
         # 定位模式门控：双源判定（外部几何进程 + last_activation_result.backend_mode）。
-        providers = getattr(self.platform_geometry_runtime, "providers", None)
-        localization_active = bool(getattr(providers, "is_localization_active", lambda: False)())
+        localization_active = self.platform_geometry_runtime.providers.is_localization_active()
         if localization_active:
             RUNTIME_LOGGER.info(
                 "定位模式下跳过探索联动启动持续感知线程（地图/定位已就绪，"
@@ -6588,14 +6529,7 @@ class GatewayRuntime:
                 )
 
     def _geometry_stack_summary(self) -> Dict[str, Any]:
-        reader = getattr(self.platform_geometry_runtime, "get_geometry_stack_status", None)
-        if not callable(reader):
-            return {}
-        try:
-            return dict(reader())
-        except Exception:
-            RUNTIME_LOGGER.debug("读取 geometry_stack 状态失败。", exc_info=True)
-            return {}
+        return dict(self.platform_geometry_runtime.get_geometry_stack_status())
 
     def _handle_start_mapping(
         self,
@@ -6726,21 +6660,14 @@ class GatewayRuntime:
             "explore_area_v2",
             "explore_and_find_target",
         }
-        quarantined_reader = getattr(
-            self.task_manager,
-            "list_quarantined_tasks",
-            None,
-        )
-        quarantined_tasks = (
-            quarantined_reader() if callable(quarantined_reader) else ()
-        )
+        quarantined_tasks = self.task_manager.list_quarantined_tasks()
         for task_status in quarantined_tasks:
             task_id = str(getattr(task_status, "task_id", "") or "")
             if not task_id:
                 continue
             try:
                 task_spec = self.task_manager.get_task_spec(task_id)
-            except Exception:
+            except KeyError:
                 continue
             if str(getattr(task_spec, "capability_name", "")) not in parent_capabilities:
                 continue
@@ -6753,16 +6680,9 @@ class GatewayRuntime:
                 or ""
             ).strip()
             if capability_name == "explore_and_find_target":
-                error_reader = getattr(
-                    self.task_manager,
-                    "get_task_error_payload",
-                    None,
-                )
-                if not callable(error_reader):
-                    continue
                 try:
-                    error_payload = dict(error_reader(task_id) or {})
-                except Exception:
+                    error_payload = dict(self.task_manager.get_task_error_payload(task_id) or {})
+                except KeyError:
                     continue
                 error_details = dict(error_payload.get("details") or {})
                 quarantine_correlation = dict(
@@ -6791,7 +6711,7 @@ class GatewayRuntime:
                 continue
             try:
                 task_spec = self.task_manager.get_task_spec(task_id)
-            except Exception:
+            except KeyError:
                 continue
             if str(getattr(task_spec, "capability_name", "")) not in parent_capabilities:
                 continue
@@ -6845,7 +6765,7 @@ class GatewayRuntime:
 
     def _pending_floor_execution(self):
         from services.navigation.building_execution import BuildingExecutionJournal
-        root=getattr(self.config.runtime_data,"map_catalog_root",None)
+        root=self.config.runtime_data.map_catalog_root
         if not root or not (Path(root)/"building_execution.json").exists():
             return None
         state=BuildingExecutionJournal(self._get_building_catalog()).load()
@@ -6872,7 +6792,7 @@ class GatewayRuntime:
             return self._building_exploration_service
 
     def _pending_building_exploration(self):
-        root=getattr(self.config.runtime_data,"map_catalog_root",None)
+        root=self.config.runtime_data.map_catalog_root
         if not root or not (Path(root)/"building_exploration.json").exists():return None
         state=self._get_building_exploration_service().load()
         return state if state is not None and not state.terminal else None
@@ -6892,7 +6812,7 @@ class GatewayRuntime:
             raise GatewayError("检查点与当前二维/三维链路不一致。")
         admission = self._require_motion_admission(arguments, "resume_exploration")
         request = saved.request.model_copy(update={"request_id": self._build_runtime_request_id("explore_resume"),
-            "resume_progress_json": saved.geometry_progress_json}, deep=True)
+            "resume_progress_json": saved.geometry_progress_json}, deep=False)
         return self._submit_exploration_task(request=request, motion_admission=admission, poll_interval_sec=0.2,
             timeout_sec=self._resolve_async_timeout("resume_exploration", arguments, minimum_sec=0.1), requested_by=requested_by,
             request_context=request_context, task_metadata={"resumed_checkpoint_id": saved.checkpoint_id}, capability_name="explore_area_v2")
@@ -7028,13 +6948,13 @@ class GatewayRuntime:
                 if workspace is not None and workspace.active_localization_session is not None else None
             )
 
-            prepared_goal = goal.model_copy(update={"map_name": map_name}, deep=True)
+            prepared_goal = goal.model_copy(update={"map_name": map_name}, deep=False)
             return self._resolve_navigation_goal_height(prepared_goal, workspace=workspace)
 
         current_localization_session_id = None
         pose = self._build_pose_from_arguments(arguments)
         goal_metadata = {"requested_by": requested_by or "unknown"}
-        if "z" not in arguments and getattr(self.config.geometry, "pipeline", "lio_3d") == "lio_3d":
+        if "z" not in arguments and self.config.geometry.pipeline == "lio_3d":
             # Pose 的通用默认值仅用于暂存 XY；此标记清除前严禁派发。
             goal_metadata["navigation_height_pending"] = True
         # 导航强制执行只使用 `force_runtime_goal` 单一 key。
@@ -7101,7 +7021,7 @@ class GatewayRuntime:
             # 旧式 0 只是输入兼容值，不证明当前地图拥有方的机体高度。
             metadata = dict(goal.metadata)
             metadata.pop("navigation_height_pending")
-            return goal.model_copy(update={"metadata": metadata}, deep=True)
+            return goal.model_copy(update={"metadata": metadata}, deep=False)
         # 该接口核对原生终态、激活、会话和提供器身份；网关只补充选点高度的
         # 坐标系与时间准入。此处不持有状态锁，保留 RPC 样本的原始源时间。
         # 准备后的资产无法分类时明确失败；目录中途降级也不得回落到旧式位姿。
@@ -7135,7 +7055,7 @@ class GatewayRuntime:
         pose = goal.target_pose.model_copy(update={"position": position})
         metadata = dict(goal.metadata)
         metadata.pop("navigation_height_pending")
-        return goal.model_copy(update={"target_pose": pose, "metadata": metadata}, deep=True)
+        return goal.model_copy(update={"target_pose": pose, "metadata": metadata}, deep=False)
 
     def _handle_navigate_to_place(
         self,
@@ -7504,7 +7424,7 @@ class GatewayRuntime:
                     "requested_by": requested_by or "unknown",
                 },
             },
-            deep=True,
+            deep=False,
         )
         poll_interval_sec = self._float(arguments, "poll_interval_sec", 0.1)
         timeout_sec = self._resolve_async_timeout("navigate_to_named_location", arguments, minimum_sec=0.1)
@@ -8269,7 +8189,7 @@ class GatewayRuntime:
                         resume_round += 1
                         active_request = active_request.model_copy(
                             update={"request_id": f"{request.request_id}_resume_{resume_round}"},
-                            deep=True,
+                            deep=False,
                         )
                         self._ensure_motion_runtime_for_backend_call(
                             "explore_and_find_target",
@@ -8659,7 +8579,7 @@ class GatewayRuntime:
             )
         def runner(context) -> Dict[str, Any]:
             session_id = "follow:%s" % uuid.uuid4().hex
-            bridge = getattr(self, "person_follow_bridge", None)
+            bridge = self.person_follow_bridge
             session = None
             bound = False
             last_target = None
@@ -8945,12 +8865,9 @@ class GatewayRuntime:
         )
 
     def _relative_move_limits(self) -> Optional[MotionCommandLimits]:
-        """目录与调用共用设备声明；未实现接口表示未知，损坏声明明确失败。"""
-        getter = getattr(getattr(self, "robot", None), "get_motion_command_limits", None)
-        if not callable(getter):
-            return None
+        """目录与调用共用设备声明；空声明表示未知，损坏声明明确失败。"""
         try:
-            limits = getter()
+            limits = self.robot.get_motion_command_limits()
             if limits is not None and not isinstance(limits, MotionCommandLimits):
                 raise TypeError("设备速度策略必须返回 MotionCommandLimits 或 None。")
             return limits
@@ -9145,14 +9062,11 @@ class GatewayRuntime:
         active_workspace = self.map_workspace_service.get_active_workspace(
             refresh_localization=refresh_localization,
         )
-        try:
-            if active_workspace is not None:
-                self.map_workspace_service.sync_active_localization_session(
-                    refresh=False,
-                    metadata={"source": "refresh_workspace_snapshots"},
-                )
-        except Exception:
-            pass
+        if active_workspace is not None:
+            self.map_workspace_service.sync_active_localization_session(
+                refresh=False,
+                metadata={"source": "refresh_workspace_snapshots"},
+            )
 
     def _ensure_workspace_memory_library_ready(self, *, map_name: str) -> None:
         active_library_name = self.memory_service.get_active_library_name()
@@ -9588,7 +9502,7 @@ class GatewayRuntime:
         return False
 
     def _target_navigation_map_frame_ids(self, workspace: Any = None) -> Set[str]:
-        configured_map_frame = str(getattr(getattr(self.config.geometry, "frames", None), "map_frame", "") or "").strip()
+        configured_map_frame = str(self.config.geometry.frames.map_frame or "").strip()
         accepted_frames = {DEFAULT_MAP_FRAME}
         if configured_map_frame and not self._target_navigation_frame_is_disallowed(configured_map_frame):
             accepted_frames.add(configured_map_frame)
@@ -9663,17 +9577,8 @@ class GatewayRuntime:
         return evidence
 
     def _report_platform_exploration_hit_stop(self, reason: str):
-        geometry_runtime = getattr(self, "platform_geometry_runtime", None)
-        reporter = getattr(geometry_runtime, "report_platform_exploration_hit_stop", None)
-        if callable(reporter):
-            reporter(reason)
-            return self.navigation_service.refresh_exploration()
-        raise GatewayError(
-            "native geometry hit-stop reporter 不可用，拒绝非关联停止。",
-            error_code="exploration_stop_unavailable",
-            http_status=503,
-            jsonrpc_code=-32010,
-        )
+        self.platform_geometry_runtime.report_platform_exploration_hit_stop(reason)
+        return self.navigation_service.refresh_exploration()
 
     def _build_target_search_state_for_task(self, task_context, *, poll_interval_sec, **arguments):
         """同图增量重读沿任务期限等待；取消仍由外层原停车屏障处理。"""
@@ -9755,7 +9660,7 @@ class GatewayRuntime:
                         "target_detection_evidence": current_scene_detection_evidence,
                     },
                 },
-                deep=True,
+                deep=False,
             )
         resolved_memory_candidates = [
             candidate
@@ -10335,7 +10240,7 @@ class GatewayRuntime:
                         "target_detection_evidence": detection_evidence,
                     },
                 },
-                deep=True,
+                deep=False,
             )
         writeback_result = self._force_observation_writeback_after_arrival(
             query=query,
@@ -10905,9 +10810,9 @@ class GatewayRuntime:
 
         if capability_name not in _LIVE_GEOMETRY_INPUT_CAPABILITY_NAMES:
             return False
-        if getattr(getattr(getattr(self, "config", None), "geometry", None), "pipeline", "lio_3d") == "slam_2d":
+        if self.config.geometry.pipeline == "slam_2d":
             return True
-        providers = getattr(getattr(self, "robot", None), "providers", None)
+        providers = self.robot.providers
         return isinstance(providers, (
             StreamingSensorSampleProvider,
             StreamingLocalizationProvider,
@@ -10920,8 +10825,8 @@ class GatewayRuntime:
     ) -> bool:
         """仅当前提供器对应且完整启动成功的输入桥可供能力复用。"""
 
-        bridge = getattr(self, "_input_bridge", None)
-        if bridge is None or not getattr(self, "_input_bridge_started", False):
+        bridge = self._input_bridge
+        if bridge is None or not self._input_bridge_started:
             return False
         control = {}
         if deadline_monotonic is not None:
@@ -10938,7 +10843,7 @@ class GatewayRuntime:
     def _start_runtime_input_bridge(self) -> bool:
         """由共享启动事件拥有者补齐当前提供器的桥，旧桥排空后才替换。"""
 
-        if getattr(self, "_closed", False):
+        if self._closed:
             return False
         remote_provider = self.platform_geometry_runtime.get_geometry_runtime_provider()
         if remote_provider is None:
@@ -10950,7 +10855,7 @@ class GatewayRuntime:
             return True
         if self._input_bridge is not None and not self._stop_runtime_input_bridge():
             return False
-        providers = getattr(self.robot, "providers", None)
+        providers = self.robot.providers
         localization_provider = providers if providers is not None and isinstance(
             providers, StreamingLocalizationProvider
         ) else None
@@ -10959,9 +10864,9 @@ class GatewayRuntime:
         ) else None
         sensor_sample_provider = providers if isinstance(providers, StreamingSensorSampleProvider) else None
         source_owner = None
-        geometry_config = getattr(getattr(self, "config", None), "geometry", None)
-        device_config = getattr(geometry_config, "slam2d_device", "").strip()
-        if getattr(geometry_config, "pipeline", "lio_3d") == "slam_2d" and device_config:
+        geometry_config = self.config.geometry
+        device_config = geometry_config.slam2d_device.strip()
+        if geometry_config.pipeline == "slam_2d" and device_config:
             from drivers.entry import create_planar_sensor_source
             live = remote_provider.get_geometry_pipeline()
             if live.get("geometry_pipeline") != "slam_2d":
@@ -10975,25 +10880,24 @@ class GatewayRuntime:
             sensor_sample_provider=sensor_sample_provider,
             **({"sensor_source_owner": source_owner} if source_owner is not None else {}),
         )
-        recorder = getattr(self, "mapping_recorder", None)
-        if recorder is not None:
-            # 在订阅设备之前开始记录，包含原生算法预热；网页连接不参与其生命周期。
-            recorder.start({
-                "geometry": self.config.geometry.build_metadata(),
-                "robot_name": self.robot.manifest.robot_name,
-                "body_from_sensor": runtime_value("NUWAX_GEOMETRY_LIO_BODY_FROM_SENSOR", ""),
-                "body_from_imu": runtime_value("NUWAX_GEOMETRY_LIO_BODY_FROM_IMU", ""),
-                "native_lio_settings": {key: runtime_value(key, "") for key in (
-                    "NUWAX_GEOMETRY_LIO_SCAN_VOXEL_SIZE_M", "NUWAX_GEOMETRY_LIO_MAP_VOXEL_SIZE_M",
-                    "NUWAX_GEOMETRY_LIO_INITIAL_MAP_FRAMES", "NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE",
-                    "NUWAX_GEOMETRY_NATIVE_LIO_PAIR_MAX_SKEW_MS", "NUWAX_GEOMETRY_POINTLIO_OPTIONS",
-                )},
-            })
-            bridge.recording_sink = recorder
-            recorder.record_event("input_bridge.starting", {
-                "pipeline": getattr(geometry_config, "pipeline", "lio_3d"),
-                "provider": getattr(remote_provider, "provider_name", "geometry_runtime"),
-            })
+        recorder = self.mapping_recorder
+        # 在订阅设备之前开始记录，包含原生算法预热；网页连接不参与其生命周期。
+        recorder.start({
+            "geometry": self.config.geometry.build_metadata(),
+            "robot_name": self.robot.manifest.robot_name,
+            "body_from_sensor": runtime_value("NUWAX_GEOMETRY_LIO_BODY_FROM_SENSOR", ""),
+            "body_from_imu": runtime_value("NUWAX_GEOMETRY_LIO_BODY_FROM_IMU", ""),
+            "native_lio_settings": {key: runtime_value(key, "") for key in (
+                "NUWAX_GEOMETRY_LIO_SCAN_VOXEL_SIZE_M", "NUWAX_GEOMETRY_LIO_MAP_VOXEL_SIZE_M",
+                "NUWAX_GEOMETRY_LIO_INITIAL_MAP_FRAMES", "NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE",
+                "NUWAX_GEOMETRY_NATIVE_LIO_PAIR_MAX_SKEW_MS", "NUWAX_GEOMETRY_POINTLIO_OPTIONS",
+            )},
+        })
+        bridge.recording_sink = recorder
+        recorder.record_event("input_bridge.starting", {
+            "pipeline": geometry_config.pipeline,
+            "provider": getattr(remote_provider, "provider_name", "geometry_runtime"),
+        })
         # 先接管资源引用，完整启动后才提交可复用状态；回滚失败仍保留清理拥有权。
         self._input_bridge = bridge
         self._input_bridge_started = False
@@ -11008,11 +10912,10 @@ class GatewayRuntime:
             if self.platform_geometry_runtime.get_geometry_runtime_provider() is not remote_provider:
                 RUNTIME_LOGGER.warning("RuntimeInputBridge 启动期间 Geometry 提供器已更换，回收旧绑定。")
                 return False
-            if recorder is not None:
-                recorder.record_event("input_bridge.started", {
-                    "pipeline": getattr(geometry_config, "pipeline", "lio_3d"),
-                    "provider": getattr(remote_provider, "provider_name", "geometry_runtime"),
-                })
+            recorder.record_event("input_bridge.started", {
+                "pipeline": geometry_config.pipeline,
+                "provider": getattr(remote_provider, "provider_name", "geometry_runtime"),
+            })
             RUNTIME_LOGGER.info(
                 "RuntimeInputBridge 已接入 gateway lifecycle "
                 "(localization=%s, pointcloud=%s)。",
@@ -11041,22 +10944,9 @@ class GatewayRuntime:
         return True
 
     def _mark_geometry_cmd_vel_sink_unavailable(self) -> None:
-        """Keep Rust navigation readiness false: Gateway owns no LCM actuator sink."""
+        """报告网关不持有运动输出，由实际守卫拥有方发布其就绪状态。"""
 
-        runtime = getattr(self, "platform_geometry_runtime", None)
-        if runtime is not None:
-            notifier = getattr(runtime, "notify_cmd_vel_sink_ready", None)
-            if callable(notifier):
-                try:
-                    notifier(False)
-                except Exception:  # noqa: BLE001
-                    RUNTIME_LOGGER.exception(
-                        "platform_geometry_runtime.notify_cmd_vel_sink_ready 异常。",
-                    )
-                return
-        RUNTIME_LOGGER.info(
-            "Gateway has no LCM actuator sink; Rust cmd_vel_sink_ready remains false."
-        )
+        self.platform_geometry_runtime.notify_cmd_vel_sink_ready(False)
 
     @staticmethod
     def _motion_guard_gateway_error(
@@ -11095,11 +10985,7 @@ class GatewayRuntime:
         )
 
     def _runtime_activation_state_lock(self):
-        lock = getattr(self, "_geometry_runtime_lock", None)
-        if lock is None:
-            lock = threading.RLock()
-            self._geometry_runtime_lock = lock
-        return lock
+        return self._geometry_runtime_lock
 
     @staticmethod
     def _runtime_activation_marker_paths(
@@ -11182,7 +11068,7 @@ class GatewayRuntime:
     ) -> None:
         lock = self._runtime_activation_state_lock()
         with lock:
-            current = getattr(self, "_runtime_activation_context", None)
+            current = self._runtime_activation_context
             expected_generation = context.get("motion_stop_generation")
             current_generation = self.safety_guard.motion_stop_generation
             invalidated = (
@@ -11217,7 +11103,7 @@ class GatewayRuntime:
     ) -> None:
         lock = self._runtime_activation_state_lock()
         with lock:
-            current = getattr(self, "_runtime_activation_context", None)
+            current = self._runtime_activation_context
             expected_generation = context.get("motion_stop_generation")
             current_generation = self.safety_guard.motion_stop_generation
             invalidated = (
@@ -11829,38 +11715,23 @@ class GatewayRuntime:
     def _exploration_stop_transaction_state(
         self,
     ) -> Tuple[threading.RLock, "OrderedDict[str, _ExplorationStopTransaction]"]:
-        lock = getattr(self, "_exploration_stop_transaction_lock", None)
-        ledger = getattr(self, "_exploration_stop_transactions", None)
-        if lock is None or ledger is None:
-            with _EXPLORATION_STOP_TRANSACTION_INIT_LOCK:
-                lock = getattr(self, "_exploration_stop_transaction_lock", None)
-                ledger = getattr(self, "_exploration_stop_transactions", None)
-                if lock is None:
-                    lock = threading.RLock()
-                    self._exploration_stop_transaction_lock = lock
-                if ledger is None:
-                    ledger = OrderedDict()
-                    self._exploration_stop_transactions = ledger
-        return lock, ledger
+        return self._exploration_stop_transaction_lock, self._exploration_stop_transactions
 
     def _reconcile_navigation_quarantine(self) -> MetadataDict:
         """只依据原目标的真实停车证明释放隔离资源，供停车重试和新目标准入共用。"""
-        reader = getattr(self.task_manager, "list_quarantined_tasks", None)
         candidates = []
-        for status in reader() if callable(reader) else ():
+        for status in self.task_manager.list_quarantined_tasks():
             error = self.task_manager.get_task_error_payload(status.task_id) or {}
             correlation = dict((error.get("details") or {}).get("resource_quarantine_correlation") or {})
             if correlation.get("ownership_domain") == "navigation" and correlation.get("goal_id"):
                 candidates.append((status.task_id, correlation))
         if not candidates:
             return {"attempted": False, "pending": False, "released_task_ids": []}
-        getter = getattr(self.navigation_service, "get_latest_navigation_context", None)
-        context = getter() if callable(getter) else None
+        context = self.navigation_service.get_latest_navigation_context()
         allowed = {NavigationStatus.SUCCEEDED.value, NavigationStatus.FAILED.value, NavigationStatus.CANCELLED.value}
         if not all(self._navigation_terminal_proof(context, goal_id=str(item["goal_id"]), allowed_statuses=allowed)
                    for _, item in candidates):
-            reader = getattr(self.navigation_service, "get_navigation_control_context",
-                self.navigation_service.refresh_navigation)
+            reader = self.navigation_service.get_navigation_control_context
             context = reader(deadline_monotonic=time.monotonic() + _EXPLORATION_STOP_BARRIER_TIMEOUT_SEC)
         released, pending = [], []
         for task_id, correlation in candidates:
@@ -11891,7 +11762,7 @@ class GatewayRuntime:
                 except GatewayMotionGuardUnavailable:
                     # 已连接的停车走原紧急通道；仅冷启动缺少守卫时沿既有
                     # 服务激活入口启动守卫，不等待导航/定位，也不要求运动准入。
-                    if getattr(self, "_closed", False) or not os.environ.get(
+                    if self._closed or not os.environ.get(
                         "NUWAX_RUNTIME_ACTIVATION_REQUEST", ""
                     ).strip():
                         raise
@@ -11949,11 +11820,7 @@ class GatewayRuntime:
                     )
                     activation_lock = self._runtime_activation_state_lock()
                     with activation_lock:
-                        activation_context = getattr(
-                            self,
-                            "_runtime_activation_context",
-                            None,
-                        )
+                        activation_context = self._runtime_activation_context
                         if (
                             activation_context is not None
                             and activation_context.get("motion_stop_generation")
@@ -12035,8 +11902,8 @@ class GatewayRuntime:
         check_active: Optional[Callable[[], None]] = None,
     ) -> MotionAdmission:
         # 在启动导航进程前报告缺失标定，避免服务反复退出后才返回启动超时。
-        geometry = getattr(getattr(self, "config", None), "geometry", None)
-        if _runtime_activation_level(capability_name) == "motion" and getattr(geometry, "pipeline", None) == "lio_3d":
+        geometry = self.config.geometry
+        if _runtime_activation_level(capability_name) == "motion" and geometry.pipeline == "lio_3d":
             from contracts.navigation_pipeline import navigation_support_distance
             try:
                 navigation_support_distance(runtime_value("NUWAX_NAV_BODY_TO_SUPPORT_Z_M", ""))
@@ -12142,7 +12009,7 @@ class GatewayRuntime:
                     "motion_admission": admission.as_metadata(),
                 }
             },
-            deep=True,
+            deep=False,
         )
 
     @staticmethod
@@ -12157,7 +12024,7 @@ class GatewayRuntime:
                     "motion_admission": admission.as_metadata(),
                 }
             },
-            deep=True,
+            deep=False,
         )
 
     def _ensure_motion_runtime_for_backend_call(
@@ -12171,8 +12038,6 @@ class GatewayRuntime:
         """按需激活运动栈，仅校验请求级 stop generation。"""
 
         self._run_with_motion_admission(admission, lambda: None)
-        if getattr(self, "config", None) is None:
-            return
         self._ensure_geometry_runtime_for_capability(
             capability_name,
             deadline_monotonic=deadline_monotonic,
@@ -12180,7 +12045,7 @@ class GatewayRuntime:
         )
 
     def _get_provider(self, provider_type: type, provider_label: str):
-        providers = getattr(self.robot, "providers", None)
+        providers = self.robot.providers
         if providers is None or not isinstance(providers, provider_type):
             raise GatewayError(f"当前机器人入口未提供{provider_label}。")
         if not providers.is_available():
@@ -12188,25 +12053,16 @@ class GatewayRuntime:
         return providers
 
     def _geometry_provider_task_generation(self) -> int:
-        lock = getattr(self, "_geometry_runtime_lock", None)
-        if lock is None:
-            lock = threading.RLock()
-            self._geometry_runtime_lock = lock
-        geometry_runtime = getattr(self, "platform_geometry_runtime", None)
-        getter = getattr(
-            geometry_runtime,
-            "get_geometry_runtime_provider",
-            None,
-        )
-        provider = getter() if callable(getter) else None
+        lock = self._geometry_runtime_lock
+        provider = self.platform_geometry_runtime.get_geometry_runtime_provider()
         with lock:
             initialized = bool(
-                getattr(self, "_geometry_provider_identity_initialized", False)
+                self._geometry_provider_identity_initialized
             )
-            previous = getattr(self, "_geometry_provider_identity", None)
+            previous = self._geometry_provider_identity
             if not initialized or provider is not previous:
                 self._geometry_provider_generation = int(
-                    getattr(self, "_geometry_provider_generation", 0)
+                    self._geometry_provider_generation
                 ) + 1
                 self._geometry_provider_identity = provider
                 self._geometry_provider_identity_initialized = True
@@ -12240,22 +12096,11 @@ class GatewayRuntime:
         deadline_monotonic: Optional[float] = None,
     ) -> MetadataDict:
         if navigation_context is None:
-            refresh_navigation = getattr(
-                self.navigation_service,
-                "refresh_navigation",
-                None,
+            # 任务读取当前后端，不复用展示层保留的上一子目标终态。
+            navigation_context = self.navigation_service.get_navigation_control_context(
+                deadline_monotonic=deadline_monotonic,
+                include_readiness=True,
             )
-            if callable(refresh_navigation):
-                if deadline_monotonic is not None:
-                    # 任务读取当前后端，不复用展示层保留的上一子目标终态。
-                    navigation_context = refresh_navigation(
-                        deadline_monotonic=deadline_monotonic,
-                    )
-                else:
-                    try:
-                        navigation_context = refresh_navigation()
-                    except Exception:
-                        navigation_context = None
         return {
             "motion_guard_generation": (
                 motion_admission.generation
@@ -12462,8 +12307,7 @@ class GatewayRuntime:
                                 context.ensure_active()
                             time.sleep(min(.5, max(.01, remaining)) if remaining is not None else .5)
 
-                region_resolver = getattr(getattr(self, "memory_service", None), "resolve_navigation_region", None)
-                fallback_region = region_resolver(goal) if callable(region_resolver) else None
+                fallback_region = self.memory_service.resolve_navigation_region(goal)
                 last_context, generation_snapshot = wait_and_submit()
                 self._record_task_generation_snapshot(context, generation_snapshot)
                 finalized = False
@@ -12949,10 +12793,7 @@ class GatewayRuntime:
             payload={"goal_id": exact_goal_id},
         )
         def cached_terminal():
-            getter = getattr(self.navigation_service, "get_navigation_control_context", None)
-            if not callable(getter):
-                getter = getattr(self.navigation_service, "get_latest_navigation_context", None)
-            cached = getter() if callable(getter) else None
+            cached = self.navigation_service.get_latest_navigation_context()
             proof = self._navigation_terminal_proof(cached, goal_id=goal_id,
                 allowed_statuses={NavigationStatus.SUCCEEDED.value, NavigationStatus.FAILED.value,
                     NavigationStatus.CANCELLED.value})
@@ -12963,8 +12804,7 @@ class GatewayRuntime:
             if cached is not None:
                 return cached
             try:
-                reader = getattr(self.navigation_service, "get_navigation_control_context",
-                    self.navigation_service.refresh_navigation)
+                reader = self.navigation_service.get_navigation_control_context
                 return reader(deadline_monotonic=deadline)
             except Exception:
                 # 远程读取超时与推送回执到达可并发，先消费已经核验的证据。
@@ -12974,7 +12814,8 @@ class GatewayRuntime:
                 raise
 
         try:
-            last_context = read_stop_context()
+            # 状态RPC断开不能阻止向已知目标发出取消；这里只消费本地停车证明。
+            last_context = self.navigation_service.get_latest_navigation_context()
             proof = self._navigation_terminal_proof(last_context, goal_id=goal_id,
                 allowed_statuses={NavigationStatus.SUCCEEDED.value,
                     NavigationStatus.FAILED.value, NavigationStatus.CANCELLED.value})
@@ -13990,19 +13831,18 @@ class GatewayRuntime:
                             "探索任务结束后刷新地图工作区失败 map_name=%s",
                             request.map_name,
                         )
-                if backend_started and not interrupted:
-                    # 探索自然结束时只同步 controller 终态；mapping 会话保持运行。
-                    try:
+                try:
+                    if backend_started and not interrupted:
+                        # 终态同步失败向任务报告，感知清理仍在原拥有方执行。
                         self.navigation_service.sync_exploration_after_task()
-                    except Exception:
-                        pass
-                if perception_attached:
-                    self._detach_perception_from_exploration(
-                        context=context,
-                        deadline_monotonic=(
-                            time.monotonic() + 0.05 if interrupted else None
-                        ),
-                    )
+                finally:
+                    if perception_attached:
+                        self._detach_perception_from_exploration(
+                            context=context,
+                            deadline_monotonic=(
+                                time.monotonic() + 0.05 if interrupted else None
+                            ),
+                        )
 
         return self._run_with_motion_admission(
             motion_admission,
@@ -14162,7 +14002,7 @@ class GatewayRuntime:
                     continue
                 if registration.descriptor.input_schema != schema:
                     self.capability_registry.register(
-                        registration.descriptor.model_copy(update={"input_schema": schema}, deep=True),
+                        registration.descriptor.model_copy(update={"input_schema": schema}, deep=False),
                         registration.handler, owner=registration.owner,
                         metadata=registration.metadata, overwrite=True,
                     )
@@ -14199,31 +14039,13 @@ class GatewayRuntime:
     def _ensure_geometry_runtime_for_invoke(self, capability_name: str) -> None:
         """同步能力等待运行时启动，异步能力由任务执行器按需启动。
 
-        - 不在白名单：直接放行。
-        - SYNC 类几何 capability（白名单子集）：必须等就绪；若已有线程在 start 则等同一事件。
-        - ASYNC 类几何 capability：仅做禁用 / blocked 检查；启动留给 runner 内的 ensure 调用。
+        配置支持由能力目录判断；同步能力等待同一启动事件，异步能力由任务按需启动。
         """
 
         if capability_name not in _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES:
             return
-        activation_level = _runtime_activation_level(capability_name)
-        if activation_level != "guard":
-            geometry_config = self.config.geometry
-            if not bool(getattr(geometry_config, "enabled", False)) or not bool(
-                getattr(getattr(geometry_config, "mapping", None), "profile_enabled", False)
-            ):
-                raise GatewayError(
-                    "平台几何运行时已禁用，无法执行 %s。" % capability_name,
-                    error_code="geometry_runtime_disabled",
-                    http_status=409,
-                    jsonrpc_code=-32000,
-                    details={"capability_name": capability_name},
-                )
         if capability_name in _SYNC_GEOMETRY_CAPABILITY_NAMES:
             self._ensure_geometry_runtime_started(capability_name)
-            return
-        # ASYNC 类由 runner 内的 ensure 负责按需激活。上一次激活失败不能在
-        # 分派前永久封死后续重试；禁用配置已在上方单独处理。
 
     def _geometry_runtime_provider_ready(
         self,
@@ -14231,29 +14053,17 @@ class GatewayRuntime:
         deadline_monotonic: Optional[float] = None,
         check_active: Optional[Callable[[], None]] = None,
     ) -> Tuple[bool, str]:
-        getter = getattr(
-            self.platform_geometry_runtime,
-            "get_geometry_runtime_provider",
-            None,
-        )
         control = {}
         if deadline_monotonic is not None:
             control["deadline_monotonic"] = deadline_monotonic
         if check_active is not None:
             control["check_active"] = check_active
             check_active()
-        provider = getter(**control) if callable(getter) else None
+        provider = self.platform_geometry_runtime.get_geometry_runtime_provider(**control)
         if provider is None:
             return False, "GeometryRuntimeProvider 未连接"
-        probe = getattr(
-            self.platform_geometry_runtime,
-            "probe_geometry_runtime_health",
-            None,
-        )
-        if not callable(probe):
-            return False, "GeometryRuntimeProvider 缺少 live GetStatus 探测"
         try:
-            ok, message = probe(**control)
+            ok, message = self.platform_geometry_runtime.probe_geometry_runtime_health(**control)
         except TypeError:
             # 注入接口不支持预算参数是合同错误，不能伪装成设备不可用后重试激活。
             raise
@@ -14293,7 +14103,7 @@ class GatewayRuntime:
             expected_generation = context.get("motion_stop_generation")
             if expected_generation is not None and expected_generation != self.safety_guard.motion_stop_generation:
                 raise self._runtime_activation_cancelled_error(context)
-            if getattr(self, "_closed", False):
+            if self._closed:
                 raise GatewayError(
                     "网关运行时已关闭，不能提交组件激活请求。",
                     error_code="gateway_runtime_closed",
@@ -14407,7 +14217,7 @@ class GatewayRuntime:
                 expected_generation = context["motion_stop_generation"]
                 if expected_generation is not None and expected_generation != self.safety_guard.motion_stop_generation:
                     raise self._runtime_activation_cancelled_error(context)
-                if getattr(self, "_closed", False):
+                if self._closed:
                     raise GatewayError(
                         "网关运行时已关闭，不能提交组件激活请求。",
                         error_code="gateway_runtime_closed",
@@ -14441,7 +14251,7 @@ class GatewayRuntime:
                 _wake_runtime_activation_request(request_path, request_id)
         except GatewayError:
             with state_lock:
-                current = getattr(self, "_runtime_activation_context", None)
+                current = self._runtime_activation_context
                 if current is not None and current.get("request_id") == request_id:
                     self._runtime_activation_context = None
             raise
@@ -14451,7 +14261,7 @@ class GatewayRuntime:
                     context, reason=str(exc), error_code="activation_cancelled"
                 )
             with state_lock:
-                current = getattr(self, "_runtime_activation_context", None)
+                current = self._runtime_activation_context
                 if current is not None and current.get("request_id") == request_id:
                     self._runtime_activation_context = None
             raise GatewayError(
@@ -14567,11 +14377,7 @@ class GatewayRuntime:
         finally:
             if not committed:
                 with state_lock:
-                    current = getattr(
-                        self,
-                        "_runtime_activation_context",
-                        None,
-                    )
+                    current = self._runtime_activation_context
                     if (
                         current is not None
                         and current.get("request_id") == request_id
@@ -14643,7 +14449,7 @@ class GatewayRuntime:
                     grpc_code=grpc.StatusCode.DEADLINE_EXCEEDED,
                     grpc_details="parent task deadline exhausted during activation",
                 )
-            if getattr(self, "_closed", False):
+            if self._closed:
                 raise GatewayError(
                     "网关运行时已关闭，不能启动输入桥。",
                     error_code="gateway_runtime_closed",
@@ -14785,8 +14591,8 @@ class GatewayRuntime:
                             lifecycle_lock.release()
                     if requires_input_bridge:
                         ensure_activation_deadline()
-                        lifecycle_lock = getattr(self, "_lifecycle_lock", None)
-                        if lifecycle_lock is not None and not lifecycle_lock.acquire(blocking=False):
+                        lifecycle_lock = self._lifecycle_lock
+                        if not lifecycle_lock.acquire(blocking=False):
                             raise GatewayError(
                                 "网关正在启停，当前不能补齐传感器输入桥。",
                                 error_code="geometry_input_bridge_unavailable",
@@ -14797,8 +14603,7 @@ class GatewayRuntime:
                             ensure_activation_deadline()
                             self._start_runtime_input_bridge()
                         finally:
-                            if lifecycle_lock is not None:
-                                lifecycle_lock.release()
+                            lifecycle_lock.release()
                         ensure_activation_deadline()
                         if not input_bridge_ready():
                             raise GatewayError(
@@ -14880,19 +14685,6 @@ class GatewayRuntime:
 
         if capability_name not in _ON_DEMAND_GEOMETRY_CAPABILITY_NAMES:
             return
-        activation_level = _runtime_activation_level(capability_name)
-        if activation_level != "guard":
-            geometry_config = self.config.geometry
-            if not bool(getattr(geometry_config, "enabled", False)) or not bool(
-                getattr(getattr(geometry_config, "mapping", None), "profile_enabled", False)
-            ):
-                raise GatewayError(
-                    "平台几何运行时已禁用，无法执行 %s。" % capability_name,
-                    error_code="geometry_runtime_disabled",
-                    http_status=409,
-                    jsonrpc_code=-32000,
-                    details={"capability_name": capability_name},
-                )
         self._ensure_geometry_runtime_started(
             capability_name,
             deadline_monotonic=deadline_monotonic,
@@ -14906,9 +14698,7 @@ class GatewayRuntime:
             self.task_manager.update_task_metadata(task_id,{"map_asset_finalize":receipt})
 
     def _join_exploration_finalizers(self) -> None:
-        lock=getattr(self,"_exploration_finalize_lock",None)
-        if lock is None:
-            return
+        lock=self._exploration_finalize_lock
         with lock:
             self._exploration_finalize_closing=True
             self._exploration_finalize_wakeup.set()
@@ -15087,8 +14877,7 @@ class GatewayRuntime:
             return None
         map_asset = getattr(active_workspace, "map_asset", None)
         if bool(getattr(map_asset, "finalized", False)):
-            reader = getattr(getattr(self, "platform_geometry_runtime", None), "get_mapping_session_context", None)
-            context = reader() if callable(reader) else None
+            context = self.platform_geometry_runtime.get_mapping_session_context()
             if not isinstance(context, dict) or context.get("active") is not True or context.get("map_name") != map_name:
                 return None
             if self.config.geometry.pipeline == "slam_2d" and context.get("planar_mode") != "mapping":
@@ -15148,98 +14937,29 @@ class GatewayRuntime:
         supported = fallback.supported if fallback is not None else True
 
         geometry_config = self.config.geometry
-        geometry_config_enabled = bool(getattr(geometry_config, "enabled", False)) and bool(
-            getattr(getattr(geometry_config, "mapping", None), "profile_enabled", False)
-        )
+        geometry_config_enabled = geometry_config.enabled and geometry_config.mapping.profile_enabled
 
         DynamicCheck = Tuple[Callable[[], bool], Optional[str]]
         dynamic_support: Dict[str, DynamicCheck] = {
-            "explore_building": (lambda: geometry_config_enabled and getattr(geometry_config,"pipeline","lio_3d")=="slam_2d", "逐层探索要求二维完整执行链。"),
-            "resume_building_exploration": (lambda: geometry_config_enabled and getattr(geometry_config,"pipeline","lio_3d")=="slam_2d", "逐层探索恢复要求二维完整执行链。"),
-            "navigate_to_floor": (lambda: geometry_config_enabled and getattr(geometry_config,"pipeline","lio_3d")=="slam_2d" and str(getattr(getattr(geometry_config,"navigation",None),"facility_providers_json","{}")).strip() not in {"", "{}"}, "二维链或设施提供器尚未配置，跨层导航不可用。"),
-            "resume_floor_navigation": (lambda: geometry_config_enabled and getattr(geometry_config,"pipeline","lio_3d")=="slam_2d" and str(getattr(getattr(geometry_config,"navigation",None),"facility_providers_json","{}")).strip() not in {"", "{}"}, "二维链或设施提供器尚未配置，跨层恢复不可用。"),
+            "explore_building": (lambda: geometry_config_enabled and geometry_config.pipeline=="slam_2d", "逐层探索要求二维完整执行链。"),
+            "resume_building_exploration": (lambda: geometry_config_enabled and geometry_config.pipeline=="slam_2d", "逐层探索恢复要求二维完整执行链。"),
+            "navigate_to_floor": (lambda: geometry_config_enabled and geometry_config.pipeline=="slam_2d" and str(geometry_config.navigation.facility_providers_json).strip() not in {"", "{}"}, "二维链或设施提供器尚未配置，跨层导航不可用。"),
+            "resume_floor_navigation": (lambda: geometry_config_enabled and geometry_config.pipeline=="slam_2d" and str(geometry_config.navigation.facility_providers_json).strip() not in {"", "{}"}, "二维链或设施提供器尚未配置，跨层恢复不可用。"),
             "capture_image": (
                 lambda: self._has_provider(ImageProvider),
                 "当前机器人入口未提供图像采集提供器。",
-            ),
-            "get_latest_observation": (
-                # 已有缓存独立于设备图像源当前是否在线。
-                lambda: True,
-                None,
-            ),
-            "perceive_current_scene": (
-                # 感知消费平台接收源，由服务报告真实帧的就绪情况。
-                lambda: True,
-                None,
-            ),
-            "describe_current_scene": (
-                lambda: True,
-                None,
-            ),
-            "get_latest_perception": (
-                lambda: True,
-                None,
-            ),
-            "get_perception_runtime_status": (
-                lambda: True,
-                None,
             ),
             "start_perception_runtime": (
                 lambda: self.perception_video_runtime.is_enabled(),
                 "持续感知功能未启用。",
             ),
-            "stop_perception_runtime": (
-                # 输入失效或配置关闭时仍须允许清理正在运行的线程。
-                lambda: True,
-                None,
-            ),
-            "get_localization_snapshot": (
-                lambda: True,
-                None,
-            ),
-            "get_localization_session": (
-                lambda: True,
-                None,
-            ),
             "relocalize_active_map": (
                 lambda: self.platform_geometry_runtime.is_relocalization_available(),
                 "当前激活地图没有可用的重定位目标。",
             ),
-            "get_map_snapshot": (
-                lambda: True,
-                None,
-            ),
-            "get_navigation_snapshot": (
-                lambda: True,
-                None,
-            ),
-            "get_navigation_semantic_context": (
-                lambda: True,
-                None,
-            ),
-            "resolve_navigation_candidates": (
-                lambda: True,
-                None,
-            ),
-            "list_maps": (
-                lambda: True,
-                None,
-            ),
-            "create_map": (
-                lambda: True,
-                None,
-            ),
             "activate_map": (
-                lambda: True,
-                None,
-            ),
-            "delete_map": (
-                lambda: True,
-                None,
-            ),
-            "get_active_map": (
-                lambda: True,
-                None,
+                lambda: geometry_config_enabled,
+                "平台几何运行时已禁用。",
             ),
             "finalize_active_map": (
                 lambda: geometry_config_enabled,
@@ -15248,73 +14968,6 @@ class GatewayRuntime:
             "start_mapping": (
                 lambda: geometry_config_enabled,
                 "平台几何运行时已禁用。",
-            ),
-            "stop_mapping": (
-                # 关闭启动配置后仍须允许原拥有方停止遗留会话。
-                lambda: True,
-                None,
-            ),
-            "stop_exploration": (
-                lambda: True,
-                None,
-            ),
-            "list_memory_libraries": (
-                lambda: True,
-                None,
-            ),
-            "create_memory_library": (
-                lambda: True,
-                None,
-            ),
-            "enable_memory_library": (
-                lambda: True,
-                None,
-            ),
-            "disable_memory_library": (
-                lambda: True,
-                None,
-            ),
-            "delete_memory_library": (
-                lambda: True,
-                None,
-            ),
-            "tag_location": (
-                # 记忆服务同时支持定位快照和真实实时位姿，并负责缺失检查。
-                lambda: True,
-                None,
-            ),
-            "query_location": (
-                lambda: True,
-                None,
-            ),
-            "query_semantic_memory": (
-                lambda: True,
-                None,
-            ),
-            "list_scene_spaces": (
-                lambda: True,
-                None,
-            ),
-            "get_scene_space": (
-                lambda: True,
-                None,
-            ),
-            "query_scene_spaces": (
-                lambda: True,
-                None,
-            ),
-            "review_scene_space": (
-                lambda: True,
-                None,
-            ),
-            "remember_current_scene": (
-                # 保存已有观察，由记忆服务核对上下文与库范围。
-                lambda: True,
-                None,
-            ),
-            "list_semantic_instances": (
-                lambda: True,
-                None,
             ),
             "navigate_to_pose": (
                 lambda: geometry_config_enabled,
@@ -15325,9 +14978,8 @@ class GatewayRuntime:
                 "平台几何运行时已禁用。",
             ),
             "navigate_to_named_location": (
-                lambda: geometry_config_enabled
-                and (self.mapping_service.get_latest_snapshot() is not None or bool(self.memory_service.list_tagged_locations(limit=1))),
-                "平台几何运行时已禁用，或没有可用地点记忆或语义地图。",
+                lambda: geometry_config_enabled,
+                "平台几何运行时已禁用。",
             ),
             "find_target": (
                 lambda: geometry_config_enabled,
@@ -15345,29 +14997,9 @@ class GatewayRuntime:
                 lambda: geometry_config_enabled,
                 "平台几何运行时已禁用。",
             ),
-            "inspect_target": (
-                lambda: True,
-                None,
-            ),
             "follow_target": (
                 lambda: self._person_follow_readiness().enabled,
                 "Person-follow 已禁用。",
-            ),
-            "relative_move": (
-                lambda: True,
-                None,
-            ),
-            "execute_sport_command": (
-                lambda: True,
-                None,
-            ),
-            "set_body_pose": (
-                lambda: True,
-                None,
-            ),
-            "set_speed_level": (
-                lambda: True,
-                None,
             ),
             "get_joint_state": (
                 lambda: self._has_provider(StateProvider),
@@ -15385,18 +15017,6 @@ class GatewayRuntime:
                 lambda: self.audio_service.is_volume_available(),
                 "当前机器人入口未提供机器人音量控制，仅保留软件音量。",
             ),
-            "stop_all_motion": (
-                lambda: True,
-                None,
-            ),
-            "switch_control_mode": (
-                lambda: True,
-                None,
-            ),
-            "set_obstacle_avoidance": (
-                lambda: True,
-                None,
-            ),
             "get_robot_status": (
                 lambda: self._has_provider(StateProvider),
                 "当前机器人入口未提供状态提供器。",
@@ -15407,14 +15027,14 @@ class GatewayRuntime:
             checker, reason = dynamic_support[capability_name]
             try:
                 supported = bool(checker())
-            except Exception:
+            except Exception as exc:
+                RUNTIME_LOGGER.exception("能力可用性检查失败 capability=%s", capability_name)
                 supported = False
+                reason = f"{reason or '能力可用性检查失败'}：{exc}"
         activation_level = _runtime_activation_level(capability_name)
         if activation_level is not None:
             metadata["on_demand_activation"] = True
             metadata["runtime_activation_level"] = activation_level
-        metadata["runtime_gateway"] = "enabled"
-        metadata["dynamic_availability"] = capability_name in dynamic_support
         return CapabilityAvailability(
             name=capability_name,
             supported=supported,
@@ -15423,7 +15043,7 @@ class GatewayRuntime:
         )
 
     def _has_provider(self, provider_type: type) -> bool:
-        providers = getattr(self.robot, "providers", None)
+        providers = self.robot.providers
         if providers is None or not isinstance(providers, provider_type):
             return False
         # 组合提供器可以先接入状态、后接入图像；接口存在不代表该类数据已可用。
@@ -15432,11 +15052,7 @@ class GatewayRuntime:
             StateProvider: "is_state_available",
         }.get(provider_type)
         probe = getattr(providers, availability_method, None) if availability_method else None
-        try:
-            return bool(probe()) if callable(probe) else True
-        except Exception:
-            RUNTIME_LOGGER.debug("设备能力状态读取失败：%s", availability_method, exc_info=True)
-            return False
+        return bool(probe()) if callable(probe) else True
 
     def _build_pose_from_arguments(self, arguments: Dict[str, Any]) -> Pose:
         frame_id = str(self._require_str(arguments, "frame_id")).strip().lstrip("/") or "map"

@@ -14,7 +14,7 @@ import shutil
 import threading
 import time
 import uuid
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Mapping, Optional, Protocol, Tuple, TYPE_CHECKING, runtime_checkable
 
 import grpc
@@ -28,8 +28,6 @@ from contracts.map_relocalization import (
     AssignedRelocalizationQuery,
     AssignedRelocalizationRequest,
     AssignedRelocalizationTerminal,
-    current_assigned_relocalization_policy,
-    current_assigned_planar_relocalization_policy,
 )
 from contracts.map_workspace import (
     AssetIdentityV2,
@@ -67,9 +65,9 @@ from services.geometry.geometry_runtime_provider import (
     MappingBackendCheckpointExportBundle,
     _exploration_child_lease_address,
     _exploration_receipt_matches_child,
-    _LEGACY_ACTIVATION_IDENTITY_FIELDS,
     _assigned_mapping_predecessor,
     _AssignedNativeLocalizationSample,
+    _mapping_state_document,
 )
 from services.geometry.checkpoint_payload import payload_chunks
 from services.mapping.service import _committed_occupancy_identity, _receipt_source_epoch
@@ -219,8 +217,11 @@ class GeometryRuntimeRelocalizationRejected(RuntimeError):
 class _MapActivationSnapshot:
     bundle: Optional[MapAssetBundle]
     bundle_root: Optional[Path]
-    activation_result_json: str
+    activation_result: Mapping[str, object]
     generation: int
+
+    def __post_init__(self):
+        object.__setattr__(self, "activation_result", MappingProxyType(dict(self.activation_result)))
 
 
 @dataclass(frozen=True, init=False)
@@ -282,7 +283,7 @@ class _AssignedMapActivationTarget:
     @property
     def relocalization_policy(self) -> Dict[str, object]:
         # Return the actual projected native policy, detached from its owner.
-        return json.loads(self._snapshot.activation_result_json)["relocalization_policy_v2"]
+        return self._snapshot.activation_result["relocalization_policy_v2"]
 
 
 _ASSIGNED_QUERY_STATUS_NAMES = {
@@ -712,7 +713,7 @@ class PlatformGeometryRuntime:
         self._map_activation_snapshot = _MapActivationSnapshot(
             bundle=None,
             bundle_root=None,
-            activation_result_json="{}",
+            activation_result={},
             generation=0,
         )
         # 以下4个 Python provider 已由 Rust bridge (GeometryRuntimeProvider) 替代，保留 None 占位以兼容现有引用
@@ -1239,7 +1240,7 @@ class PlatformGeometryRuntime:
             return None
         with lock:
             context = getattr(self, "_mapping_session_context", None)
-            return self._clone_metadata(context) if isinstance(context, dict) else None
+            return _mapping_state_document(context) if isinstance(context, dict) else None
 
     def get_authoritative_mapping_session_state(self) -> Dict[str, object]:
         """Read mapping state from one pinned, still-current remote provider."""
@@ -1281,7 +1282,7 @@ class PlatformGeometryRuntime:
                 raise RuntimeError(
                     "GetMappingState 未返回权威 mapping session 字典，请重试。"
                 )
-            return self._clone_metadata(state)
+            return _mapping_state_document(state)
 
     def prepare_unfinalized_map_workspace(self, *, map_name: str) -> None:
         """切换未完成工作区前，收敛真实建图会话并停止旧来源。"""
@@ -2764,8 +2765,8 @@ class PlatformGeometryRuntime:
     def _activation_result_from_snapshot(
         self,
         snapshot: _MapActivationSnapshot,
-    ) -> Dict[str, object]:
-        return json.loads(snapshot.activation_result_json)
+    ) -> Mapping[str, object]:
+        return snapshot.activation_result
 
     def _map_activation_snapshot_locked(self) -> _MapActivationSnapshot:
         snapshot = getattr(self, "_map_activation_snapshot", None)
@@ -2773,7 +2774,7 @@ class PlatformGeometryRuntime:
             snapshot = _MapActivationSnapshot(
                 bundle=None,
                 bundle_root=None,
-                activation_result_json="{}",
+                activation_result={},
                 generation=0,
             )
             self._map_activation_snapshot = snapshot
@@ -2794,7 +2795,7 @@ class PlatformGeometryRuntime:
         return _MapActivationSnapshot(
             bundle=self._clone_contract(snapshot.bundle),
             bundle_root=snapshot.bundle_root,
-            activation_result_json=snapshot.activation_result_json,
+            activation_result=snapshot.activation_result,
             generation=snapshot.generation,
         )
 
@@ -2807,17 +2808,12 @@ class PlatformGeometryRuntime:
     ) -> _MapActivationSnapshot:
         previous = self._map_activation_snapshot_locked()
         installed_bundle = self._clone_contract(bundle)
-        installed_result = self._clone_metadata(activation_result or {})
-        installed_result_json = json.dumps(
-            installed_result,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        installed_result = dict(activation_result or {})
         generation = previous.generation + 1
         snapshot = _MapActivationSnapshot(
             bundle=installed_bundle,
             bundle_root=bundle_root,
-            activation_result_json=installed_result_json,
+            activation_result=installed_result,
             generation=generation,
         )
         self._map_activation_snapshot = snapshot
@@ -2839,62 +2835,22 @@ class PlatformGeometryRuntime:
     def capture_assigned_map_activation_target(
         self, *, map_name: str, asset_identity: AssetIdentityV2,
     ) -> _AssignedMapActivationTarget:
-        """Capture a sealed assigned owner without enabling native availability.
-
-        Partial/staged/retired diagnostics remain in the activation snapshot;
-        they cannot be promoted into a complete target by this consumer API.
-        """
-        if not isinstance(asset_identity, AssetIdentityV2):
-            raise ValueError("assigned target requires an exact AssetIdentityV2")
+        """捕获当前真实安装及其已有类型回执，不重新解码元数据。"""
         with self._runtime_state_lock:
             snapshot = self._map_activation_snapshot_locked()
             bundle = snapshot.bundle
             if (bundle is None or bundle.identity_schema_version != 2
                     or bundle.asset_state != "finalized"
-                    or bundle.manifest_sha256 is not None
-                    or bundle.asset_identity != asset_identity
-                    or bundle.map_name != map_name):
+                    or bundle.asset_identity != asset_identity or bundle.map_name != map_name):
                 raise ValueError("assigned target differs from the installed finalized asset")
-            activation = self._activation_result_from_snapshot(snapshot)
-            if (type(activation.get("activation_receipt_schema_version")) is not int
-                    or activation["activation_receipt_schema_version"] != 2
-                    or type(activation.get("activation_receipt_disposition")) is not int
-                    or activation["activation_receipt_disposition"] not in {2, 3}
-                    or type(activation.get("relocalization_target_available")) is not bool):
-                raise ValueError("assigned target requires a complete sealed activation")
-            planar = activation.get("mapping_backend_kind") == "slam_toolbox"
-            if any(name in activation for name in
-                   _LEGACY_ACTIVATION_IDENTITY_FIELDS + ("cloud_source_sha256",)
-                   if not (planar and name in {"planar_mode", "target_kind"})):
-                raise ValueError("assigned activation mixes legacy or planar identity")
-            receipt = AssignedActivationReceipt.admit(activation.get("activation_receipt_v2"))
-            if receipt.asset_identity != asset_identity or receipt.map_name != map_name:
-                raise ValueError("assigned receipt differs from the installed asset identity")
-            installed = receipt.to_dict()["activation"]
-            expected = {
-                "map_name": receipt.map_name, "session_id": receipt.session_id,
-                "activation_request_id": receipt.request_id,
-                "runtime_generation": receipt.runtime_generation,
-                "session_generation": installed["session_generation"],
-                "backend_generation": installed["backend_generation"],
-                "mapping_backend_kind": installed["backend_kind"],
-            }
-            if any(type(activation.get(name)) is not type(value)
-                   or activation[name] != value for name, value in expected.items()):
-                raise ValueError("assigned state and complete receipt ownership differ")
-            # Validate the actual projected policy, never fill a missing policy
-            # from Python's current parameters or from a legacy digest alias.
-            policy = activation.get("relocalization_policy_v2")
-            expected_policy = (current_assigned_planar_relocalization_policy() if planar
-                else current_assigned_relocalization_policy())
-            if (not isinstance(policy, dict) or set(policy) != set(expected_policy)
-                    or any(type(policy[name]) is not type(value) or policy[name] != value
-                           for name, value in expected_policy.items())):
-                raise ValueError("assigned target omitted or changed the actual native policy")
+            receipt = snapshot.activation_result.get("activation_receipt_v2")
+            if receipt is None:
+                raise ValueError("assigned target has no installed native activation receipt")
             target = object.__new__(_AssignedMapActivationTarget)
             object.__setattr__(target, "_snapshot", snapshot)
             object.__setattr__(target, "activation_receipt", receipt)
             return target
+
 
     def _require_assigned_map_activation_target_locked(
         self, expected_target: _AssignedMapActivationTarget,
@@ -2951,14 +2907,13 @@ class PlatformGeometryRuntime:
                 yield receipt
             else:
                 self._require_assigned_localization_sample_locked(
-                    localization_sample, expected_target=expected_target, expected_terminal=terminal)
+                    localization_sample, expected_target=expected_target)
                 with localization_sample._native._provider.assigned_localization_sample_guard(localization_sample._native):
                     yield receipt
 
-    def _require_assigned_localization_sample_locked(self, sample, *, expected_target, expected_terminal):
-        if (type(sample) is not _AssignedLocalizationSample or sample._owner is not self
-                or sample._target._snapshot is not expected_target._snapshot
-                or not sample.terminal.exact_replay_of(expected_terminal)):
+    def _require_assigned_localization_sample_locked(self, sample, *, expected_target):
+        if (sample._owner is not self
+                or sample._target._snapshot is not expected_target._snapshot):
             raise ValueError("assigned localization sample differs from the exact target or terminal")
         if (getattr(self, "_remote_provider", None) is not sample._native._provider
                 or getattr(self, "_provider_attach_epoch", 0) != sample._attach_epoch
@@ -2990,10 +2945,6 @@ class PlatformGeometryRuntime:
             attach_epoch = getattr(self, "_provider_attach_epoch", 0)
         native = provider.capture_assigned_localization_sample(
             assigned_request_v2=request, expected_terminal=terminal, expected_origin=origin)
-        if (type(native) is not _AssignedNativeLocalizationSample or native._provider is not provider
-                or native._origin[0] is not origin[0] or native._origin[1] != origin[1]
-                or not native.terminal.exact_replay_of(terminal)):
-            raise ValueError("assigned localization provider returned a foreign sample")
         sample = object.__new__(_AssignedLocalizationSample)
         for name, value in {"_owner": self, "_target": expected_target,
                             "_native": native, "_attach_epoch": attach_epoch}.items():
@@ -4831,93 +4782,34 @@ class PlatformGeometryRuntime:
             raise error from exc
         return result
 
-    def _admit_prepared_assigned_map_evidence(
-        self, prepared, *, activation_request, activation_evidence,
-    ):
-        """Validate bounded native metadata without installing runtime state."""
-        with self._runtime_state_lock:
-            self._require_prepared_assigned_origin_locked(prepared)
-        request = self._prepared_assigned_activation_request(prepared, activation_request)
-        if not isinstance(activation_evidence, Mapping):
-            raise ValueError("assigned installation requires current native metadata")
-        evidence = dict(activation_evidence)
-        planar = prepared.backend_kind == "slam_toolbox"
-        if any(name in evidence for name in _LEGACY_ACTIVATION_IDENTITY_FIELDS + ("cloud_source_sha256",)
-               if not (planar and name in {"planar_mode", "target_kind"})):
-            raise ValueError("assigned installation evidence mixes legacy metadata")
-        receipt = AssignedActivationReceipt.admit(evidence.get("activation_receipt_v2"))
-        document = receipt.to_dict()
-        installed = document["activation"]
-        from services.geometry.mapping_backend_checkpoint_store import _identity_document
-        checkpoint = prepared.stored_checkpoint.checkpoint
-        planar = checkpoint.backend_kind == "slam_toolbox"
-        source_key = "source_graph_member" if planar else "source_cloud_member"
-        source = _identity_document(checkpoint.graph_reference.member_identity if planar else checkpoint.cloud_identity)
-        if (document["request"] != request or document["target"][source_key] != source
-                or installed["backend_kind"] != prepared.backend_kind):
-            raise ValueError("assigned installation differs from request or checkpoint source")
-        exact = {
-            "success": True, "phase": "ACTIVE", "active": True,
-            "activation_receipt_schema_version": 2, "legacy_checkpoint_reconstructed": False,
-            "map_name": request["map_name"], "session_id": request["session_id"],
-            "activation_request_id": request["activation_request_id"],
-            "runtime_generation": installed["runtime_generation"],
-            "session_generation": installed["session_generation"],
-            "mapping_backend_kind": installed["backend_kind"],
-            "backend_generation": installed["backend_generation"],
-            "revision": document["target"]["occupancy_receipt"]["occupancy_revision"],
-        }
-        if planar:
-            exact.update(planar_mode="localization", target_kind="planar_graph")
-        if any(type(evidence.get(name)) is not type(value) or evidence[name] != value
-               for name, value in exact.items()):
-            raise ValueError("assigned installation requires exact current native state")
-        disposition = evidence.get("activation_receipt_disposition")
-        if (type(disposition) is not int or disposition not in {2, 3}
-                or type(evidence.get("relocalization_target_available")) is not bool
-                or evidence.get("idempotent_replay") is not (disposition == 3)):
-            raise ValueError("assigned installation requires sealed native evidence")
-        policy = evidence.get("relocalization_policy_v2")
-        if isinstance(policy, dict):
-            policy = dict(policy)
-        expected_policy = (current_assigned_planar_relocalization_policy() if planar
-                else current_assigned_relocalization_policy())
-        if (not isinstance(policy, dict) or set(policy) != set(expected_policy)
-                or any(type(policy[name]) is not type(value) or policy[name] != value
-                       for name, value in expected_policy.items())):
-            raise ValueError("assigned installation omitted or changed actual native policy")
-        result = {**exact, "activation_receipt_disposition": disposition,
-                  "idempotent_replay": evidence["idempotent_replay"],
-                  "activation_receipt_v2": document,
-                  "relocalization_target_available": evidence["relocalization_target_available"],
-                  "relocalization_policy_v2": policy}
-        if planar:
-            result["planar_default_seed"] = list(prepared._planar_default_seed)
-        with self._runtime_state_lock:
-            self._require_prepared_assigned_origin_locked(prepared)
-        return receipt, result, source
 
     def validate_prepared_assigned_map_evidence(
-        self, prepared, *, activation_request, activation_evidence,
+        self, prepared, *, activation_evidence,
     ) -> AssignedActivationReceipt:
-        """Admit current evidence before the caller's durable journal write."""
-        receipt, _, _ = self._admit_prepared_assigned_map_evidence(
-            prepared, activation_request=activation_request, activation_evidence=activation_evidence)
-        return receipt
+        """在原来源围栏内交付已解码回执，供持久写入使用。"""
+        with self._runtime_state_lock:
+            self._require_prepared_assigned_origin_locked(prepared)
+        return activation_evidence["activation_receipt_v2"]
+
 
     def install_prepared_assigned_map(
-        self, prepared, *, activation_request, activation_evidence,
+        self, prepared, *, activation_evidence,
     ) -> Tuple[_AssignedMapActivationTarget, MapSnapshot]:
         """Adopt current evidence under R CAS; source and installed receipts differ.
 
         Historical receipt-only journal metadata cannot establish installation.
         All views and serialized metadata are prepared before the short CAS.
         """
-        receipt, result, source = self._admit_prepared_assigned_map_evidence(
-            prepared, activation_request=activation_request, activation_evidence=activation_evidence)
+        with self._runtime_state_lock:
+            self._require_prepared_assigned_origin_locked(prepared)
+        receipt = activation_evidence["activation_receipt_v2"]
+        result = dict(activation_evidence)
+        if prepared.backend_kind == "slam_toolbox":
+            result["planar_default_seed"] = list(prepared._planar_default_seed)
         document = receipt.to_dict()
         request, policy = document["request"], result["relocalization_policy_v2"]
-        result_json = json.dumps(result, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        source_key = "source_graph_member" if prepared.backend_kind == "slam_toolbox" else "source_cloud_member"
+        source = document["target"][source_key]
         # Detached small views retain the sealed tuple/packed payload owners.
         snapshot = prepared.bundle.snapshot
         metadata = {**snapshot.metadata, "identity_schema_version": 2,
@@ -4928,7 +4820,7 @@ class PlatformGeometryRuntime:
                     "source_kind": "map_asset_bundle", "map_snapshot_kind": "offline_checkpoint",
                     "live_streaming_ready": False, "mapping_live_streaming_ready": False,
                     "backend_snapshot_correlated": False}
-        context = json.loads(result_json)
+        context = dict(result)
         self._ensure_mapping_lifecycle_fields()
         with self._mapping_lifecycle_lock:
             with self._runtime_state_lock:
@@ -4940,7 +4832,7 @@ class PlatformGeometryRuntime:
                         current.bundle is not None and current.bundle.identity_schema_version == 2
                         and current.bundle.asset_identity == prepared.asset_identity
                         and current.bundle.map_name == prepared.map_name
-                        and current_state.get("activation_receipt_v2") == document
+                        and current_state.get("activation_receipt_v2") == receipt
                         and current_state.get("relocalization_policy_v2") == policy)
                     same_installation = (same_receipt and
                         current_state.get("relocalization_target_available") is result["relocalization_target_available"])
@@ -4948,7 +4840,7 @@ class PlatformGeometryRuntime:
                         if not self._map_activation_snapshot_still_current_locked(prepared.prior_snapshot):
                             raise RuntimeError("assigned activation installation changed before adoption")
                         current = _MapActivationSnapshot(
-                            prepared.bundle, prepared.bundle_root, result_json, current.generation + 1)
+                            prepared.bundle, prepared.bundle_root, result, current.generation + 1)
                         self._map_activation_snapshot = current
                         self._workspace_map_name = prepared.map_name
                     # Current evidence can reconcile a connection without native
@@ -5566,7 +5458,7 @@ class PlatformGeometryRuntime:
             else activation_snapshot.bundle
         )
         activation_result = (
-            self._clone_metadata(_seed_activation_result)
+            dict(_seed_activation_result)
             if _seed_activation_result is not None
             else self._activation_result_from_snapshot(activation_snapshot)
         )
@@ -6041,7 +5933,7 @@ class PlatformGeometryRuntime:
             "geometry_diagnostics": self._clone_metadata(
                 geometry_asset.quality_metrics.get("diagnostics", []) if geometry_asset is not None else []
             ),
-            "geometry_activation": self._clone_metadata(
+            "geometry_activation": _mapping_state_document(
                 activation_result
                 if activation_result is not None
                 else self._activation_result_from_snapshot(
@@ -6675,11 +6567,7 @@ class PlatformGeometryRuntime:
         bundle: MappingBackendCheckpointExportBundle,
     ) -> Dict[str, object]:
         """Stream an admitted immutable cloud member without protobuf/array copies."""
-        from services.geometry.mapping_backend_checkpoint_store import MappingBackendCheckpointStore
-
-        checkpoint, _occupancy, descriptor = MappingBackendCheckpointStore.validate_checkpoint_bundle(
-            bundle.checkpoint, occupancy_asset=bundle.occupancy_asset, cloud_asset=bundle.cloud_asset,
-        )
+        checkpoint, descriptor = bundle.checkpoint, bundle.cloud_asset
         point_count = int(descriptor["point_count"])
         if point_count < self._pcd_min_points():
             raise RuntimeError(

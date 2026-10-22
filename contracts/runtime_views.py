@@ -461,7 +461,9 @@ def _validate_optional_map_asset_name(value: object) -> Optional[str]:
 
 
 class LocalizationSnapshot(TimestampedContract):
-    """定位服务快照。"""
+    """定位服务共享只读快照；修改内容时构造下一份快照。"""
+
+    model_config = ConfigDict(frozen=True)
 
     source_name: str = Field(description="定位来源名称。")
     current_pose: Optional[Pose] = Field(default=None, description="当前位姿。")

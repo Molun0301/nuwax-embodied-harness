@@ -57,7 +57,7 @@ _SENSITIVE_ASSIGNMENT_RE = re.compile(
 )
 _TERMINAL_TASK_STATES = frozenset({"succeeded", "failed", "cancelled", "timeout"})
 _RECEIPT_ERROR_CODES = frozenset({
-    "task_receipt_unsupported", "task_receipt_unavailable", "agent_call_result_unsupported",
+    "task_receipt_unavailable", "agent_call_result_unsupported",
     "agent_call_outcome_unknown",
     "agent_scope_binding_required", "agent_scope_binding_conflict", "agent_scope_identity_conflict",
     "agent_terminal_version_required", "agent_terminal_pair_conflict",
@@ -93,6 +93,7 @@ _NON_RETRYABLE_ERROR_CODES = frozenset(
         "unsupported_mcp_protocol_version",
         "mcp_result_unavailable",
         "mcp_response_too_large",
+        "memory_artifact_cleanup_incomplete",
     }
 )
 _INTERNAL_ERROR_CODES = frozenset(
@@ -212,18 +213,15 @@ def _public_text(value: Any, max_chars: int) -> str:
 
 
 def _json_bytes(value: Any) -> int:
-    try:
-        return len(
-            json.dumps(
-                value,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=False,
-                allow_nan=False,
-            ).encode("utf-8")
-        )
-    except Exception:
-        return 1 << 60
+    return len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    )
 
 
 @dataclass
@@ -261,26 +259,12 @@ def _shallow_mapping(value: Any) -> Optional[Mapping[Any, Any]]:
 def _mapping_items(mapping: Mapping[Any, Any]) -> Iterable[tuple[Any, Any]]:
     emitted: set[Any] = set()
     for key in _PROJECTION_PRIORITY_KEYS:
-        try:
-            present = key in mapping
-        except Exception:
-            present = False
-        if present:
+        if key in mapping:
             emitted.add(key)
-            try:
-                yield key, mapping[key]
-            except Exception:
-                continue
-    try:
-        iterator = mapping.items()
-    except Exception:
-        return
-    for key, value in iterator:
-        try:
-            if key in emitted:
-                continue
-        except TypeError:
-            pass
+            yield key, mapping[key]
+    for key, value in mapping.items():
+        if key in emitted:
+            continue
         if str(key).startswith("_"):
             continue
         yield key, value
@@ -542,6 +526,8 @@ def _public_error_message(error_code: str, error_category: str, message: Any) ->
 
 def _next_action_for_error(error_code: str, *, retryable: bool) -> str:
     code = str(error_code or "").strip().lower()
+    if code == "memory_artifact_cleanup_incomplete":
+        return "记忆记录已删除。请核对并只清理错误详情列出的剩余制品，不要重新执行整库删除。"
     if code in {"agent_scope_binding_required", "agent_scope_binding_conflict", "agent_scope_identity_conflict"}:
         return ("由已授权维护方核对原作用域与机器人身份，明确绑定后只读查询原 request_id/task_id。"
                 "不要更换请求标识重发动作，也不要取消原任务来修复记录。")
@@ -640,10 +626,7 @@ def _public_timestamp(value: Any) -> Any:
         return value
     isoformat = getattr(value, "isoformat", None)
     if callable(isoformat):
-        try:
-            return isoformat()
-        except Exception:
-            pass
+        return isoformat()
     return str(value)
 
 

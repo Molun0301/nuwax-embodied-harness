@@ -12,6 +12,7 @@ from contracts.geometry import Pose
 from contracts.runtime_views import PerceptionRuntimeStatus
 from core import EventBus, StateNamespace, StateStore
 from core.errors import GatewayError
+from core.logging_utils import LogRateLimiter
 from services.perception.keyframe import PerceptionKeyframeSelector
 from services.perception.service import PerceptionService
 
@@ -31,7 +32,7 @@ class PerceptionVideoRuntime:
         *,
         perception_service: PerceptionService,
         state_store: StateStore,
-        localization_service=None,
+        localization_service,
         live_pose_provider=None,
         mapping_service=None,
         memory_service=None,
@@ -113,6 +114,7 @@ class PerceptionVideoRuntime:
         self._memory_write_completed_count = 0
         self._memory_write_failed_count = 0
         self._last_memory_write_error = None
+        self._memory_write_log_limiter = LogRateLimiter()
         # 跳帧诊断限流：避免 0.5s 循环刷屏，同时让"视频不可用"等失败可见。
         self._skip_log_interval_sec = 10.0
         self._last_skip_log_at = 0.0
@@ -126,57 +128,17 @@ class PerceptionVideoRuntime:
         return self._enabled
 
     def should_auto_start(self) -> bool:
-        """返回是否应在宿主机运行时启动时自动拉起。"""
-
+        """按启用状态与定位模式决定是否自动启动。"""
         if not (self._enabled and self._auto_start):
             return False
-        # 定位模式门控：live_pose_provider 是 PlatformGeometryProviderBundle 鸭子类型代理，
-        # 它不直接暴露 _external_geometry_process_is_localization；改用上游 platform_geometry_runtime
-        # 经由 robot 装配层或外部 owner 引用读取——这里取一个不破坏封装的判定方法 is_localization_mode()。
         if self._skip_when_localization and self._is_localization_mode():
             return False
-        if self._memory_service is None:
-            return True
-        if hasattr(self._memory_service, "is_enabled"):
-            try:
-                return bool(self._memory_service.is_enabled())
-            except Exception:
-                return False
-        return True
+        return self._memory_service is None or self._memory_service.is_enabled()
 
     def _is_localization_mode(self) -> bool:
-        """判断平台几何运行时当前是否处于定位模式。
-
-        通过 live_pose_provider（=PlatformGeometryProviderBundle）暴露的
-        is_localization_available / _external_geometry_process_is_localization /
-        activation_backend_mode 三个口径来判定，任一为 True 即视为定位模式。
-        鸭子类型：live_pose_provider 为 None 时返回 False（系统尚未装配完）。
-        """
-
+        """读取平台几何提供器的定位模式。"""
         provider = self._live_pose_provider
-        if provider is None:
-            return False
-        checker = getattr(provider, "is_localization_active", None)
-        if callable(checker):
-            try:
-                return bool(checker())
-            except Exception:
-                pass
-        direct = getattr(provider, "_external_geometry_process_is_localization", None)
-        if callable(direct):
-            try:
-                if bool(direct()):
-                    return True
-            except Exception:
-                pass
-        mode_getter = getattr(provider, "get_active_backend_mode", None)
-        if callable(mode_getter):
-            try:
-                if str(mode_getter() or "") == "mapping_localization":
-                    return True
-            except Exception:
-                pass
-        return False
+        return provider is not None and bool(provider.is_localization_active())
 
     def apply_tuning(self, config) -> None:
         """在两帧之间更新采样和关键帧阈值，保留任务、模型与历史基准。"""
@@ -392,8 +354,8 @@ class PerceptionVideoRuntime:
             return None
 
         now = utc_now()
-        library_getter = getattr(self._memory_service, "get_active_library_name", None)
-        observation_library = library_getter() if callable(library_getter) else None
+        observation_library = (None if self._memory_service is None
+                               else self._memory_service.get_active_library_name())
         current_pose, map_snapshot, localization_snapshot = self._resolve_runtime_context()
         decision = self._keyframe_selector.decide(
             now=now,
@@ -469,8 +431,8 @@ class PerceptionVideoRuntime:
         effective_reason = decision.reason if (decision.should_process and not force_keyframe) else reason
         memory_written = False
         continuous_scheduled = False
-        memory_scope_valid = not callable(library_getter) or (
-            observation_library is not None and library_getter() == observation_library
+        memory_scope_valid = self._memory_service is None or (
+            observation_library is not None and self._memory_service.get_active_library_name() == observation_library
         )
         allow_memory_write = allow_memory_write and memory_scope_valid
         if write_memory:
@@ -571,32 +533,19 @@ class PerceptionVideoRuntime:
         memory_service = self._memory_service
         if memory_service is None or current_pose is None:
             return False
-        if hasattr(memory_service, "is_enabled") and not memory_service.is_enabled():
+        if not memory_service.is_enabled():
             return False
-        ingest = getattr(memory_service, "ingest_perception_observation", None)
-        if not callable(ingest):
-            return False
-        try:
-            # 与记忆库切换共享已有结构锁，避免识别过程中切库后回灌旧图观察。
-            with getattr(memory_service, "_instances_lock", nullcontext()):
-                library_getter = getattr(memory_service, "get_active_library_name", None)
-                if expected_library_name is not None and callable(library_getter) and library_getter() != expected_library_name:
-                    return False
-                ingest(
-                    perception_context=context,
-                    map_snapshot=map_snapshot,
-                    localization_snapshot=localization_snapshot,
-                    current_pose=current_pose,
-                    camera_id=self._camera_id,
-                    now=now,
-                    persist=False,
-                )
-            return True
-        except Exception:
-            PERCEPTION_RUNTIME_LOGGER.debug(
-                "连续感知摄入失败 camera=%s。", self._camera_id, exc_info=True
+        # 与记忆库切换共享结构锁，识别期间切库时拒绝旧观察写入。
+        with memory_service._instances_lock:
+            if expected_library_name is not None and memory_service.get_active_library_name() != expected_library_name:
+                return False
+            memory_service.ingest_perception_observation(
+                perception_context=context, map_snapshot=map_snapshot,
+                localization_snapshot=localization_snapshot, current_pose=current_pose,
+                camera_id=self._camera_id, now=now, persist=False,
             )
-            return False
+        return True
+
 
     def _schedule_memory_write(
         self,
@@ -642,14 +591,9 @@ class PerceptionVideoRuntime:
             return False
         if continuous and current_pose is None:
             return False
-        if hasattr(memory_service, "is_enabled"):
-            try:
-                if not memory_service.is_enabled():
-                    return False
-            except Exception:
-                return False
-        library_getter = getattr(memory_service, "get_active_library_name", None)
-        current_library = library_getter() if callable(library_getter) else None
+        if not memory_service.is_enabled():
+            return False
+        current_library = memory_service.get_active_library_name()
         if expected_library_name is not None and current_library != expected_library_name:
             return False
         # 空快速帧不访问制品服务；非空引用必须先取得独立队列拥有方。
@@ -657,9 +601,8 @@ class PerceptionVideoRuntime:
         hold = self._perception_service.acquire_context_artifacts(
             context, owner="perception.video_queue",
         ) if ids else None
-        input_getter = getattr(self._perception_service, "get_fast_observation_input", None)
         job = {
-            "geometry_input": input_getter(context) if callable(input_getter) else None,
+            "geometry_input": self._perception_service.get_fast_observation_input(context),
             "continuous": continuous,
             "artifact_hold": hold,
             "library_name": expected_library_name if expected_library_name is not None else current_library,
@@ -723,17 +666,15 @@ class PerceptionVideoRuntime:
                     continuous = parameters.pop("continuous", False)
                     expected_library = parameters.pop("library_name", None)
                     parameters["expected_library_name"] = expected_library
-                    library_getter = getattr(self._memory_service, "get_active_library_name", None)
                     if self._stop_event.is_set():
                         error = "memory_write_cancelled"
-                    elif expected_library is not None and callable(library_getter) and library_getter() != expected_library:
+                    elif expected_library is not None and self._memory_service.get_active_library_name() != expected_library:
                         error = "memory_library_changed"
                     else:
-                        completer = getattr(self._perception_service, "complete_observation_geometry", None)
-                        scope = completer(
+                        scope = self._perception_service.complete_observation_geometry(
                             parameters["context"], inputs, store_artifact=not continuous,
                             wait_sec=self._interval_sec, stop_event=self._stop_event
-                        ) if callable(completer) and inputs is not None else nullcontext(None)
+                        ) if inputs is not None else nullcontext(None)
                         # 新制品的发布拥有方一直保留到记忆事务返回，再沿原队列finally释放旧拥有方。
                         with scope as completed:
                             if completed is not None:
@@ -752,7 +693,9 @@ class PerceptionVideoRuntime:
                                 ok = self._remember_from_keyframe(**parameters)
                 except Exception as exc:
                     error = str(exc)
-                    PERCEPTION_RUNTIME_LOGGER.debug("记忆后台写入失败 camera=%s error=%s", self._camera_id, exc, exc_info=True)
+                    self._memory_write_log_limiter.log(PERCEPTION_RUNTIME_LOGGER, logging.ERROR,
+                        "记忆后台写入失败 camera=%s error=%s", self._camera_id, exc,
+                        key="memory_write", interval_sec=5.0, exc_info=True)
                 finally:
                     self._release_job(job)
                 with self._lock:
@@ -794,29 +737,15 @@ class PerceptionVideoRuntime:
             return None
 
     def _latest_full_stage_duration_ms_total(self) -> Optional[float]:
-        getter = getattr(self._perception_service, "get_latest_full_perception", None)
-        if not callable(getter):
-            return None
-        try:
-            context = getter(self._camera_id)
-        except Exception:
-            return None
+        context = self._perception_service.get_latest_full_perception(self._camera_id)
         if context is None:
             return None
-        stage_duration_ms = dict(getattr(context, "metadata", {}).get("stage_duration_ms") or {})
+        stage_duration_ms = dict(context.metadata.get("stage_duration_ms") or {})
         return self._coerce_optional_float(stage_duration_ms.get("total"))
 
     def _latest_stream_frame(self, topic: str):
-        stream_bus = getattr(self._perception_service, "_stream_bus", None)
-        if stream_bus is None:
-            return None
-        latest_frame = getattr(stream_bus, "latest_frame", None)
-        if not callable(latest_frame):
-            return None
-        try:
-            return latest_frame(topic)
-        except Exception:
-            return None
+        stream_bus = self._perception_service._stream_bus
+        return None if stream_bus is None else stream_bus.latest_frame(topic)
 
     def run_burst(
         self,
@@ -929,56 +858,14 @@ class PerceptionVideoRuntime:
         )
 
     def _resolve_runtime_context(self):
-        """返回 (current_pose, map_snapshot, localization_snapshot)。
-
-        生产网关使用定位订阅的实时快照；关键帧判定不另行查询远程坐标树。
-        未注入定位服务的独立调用者才使用其显式提供的位姿源。
-        """
-        current_pose = None
-        localization_snapshot = None
-        localization_service = self._localization_service
-        if localization_service is not None:
-            localization_snapshot = self._refresh_service_snapshot(localization_service)
-            if localization_snapshot is not None:
-                current_pose = localization_snapshot.current_pose
-        else:
-            current_pose = self._read_live_pose()
-        map_snapshot = None
-        mapping_service = self._mapping_service
-        if mapping_service is not None:
-            map_snapshot = self._refresh_service_snapshot(mapping_service)
+        """读取已发布的定位和建图快照，不在识别周期同步刷新几何。"""
+        localization_snapshot = self._localization_service.get_latest_snapshot()
+        current_pose = None if localization_snapshot is None else localization_snapshot.current_pose
+        map_snapshot = (None if self._mapping_service is None
+                        else self._mapping_service.get_latest_snapshot())
         return current_pose, map_snapshot, localization_snapshot
 
-    def _read_live_pose(self) -> Optional[Pose]:
-        """从实时位姿源（几何运行时 provider 门面）取当前位姿，鸭子类型，失败返回 None。
 
-        优先 get_exploration_pose()（探索建图时导航后端 map→base 实时 TF），
-        回退 get_current_pose()（定位会话后端，仅在重定位就绪后有值）。
-        """
-        provider = self._live_pose_provider
-        if provider is None:
-            return None
-        for getter_name in ("get_exploration_pose", "get_current_pose"):
-            getter = getattr(provider, getter_name, None)
-            if not callable(getter):
-                continue
-            try:
-                pose = getter()
-            except Exception:
-                PERCEPTION_RUNTIME_LOGGER.debug(
-                    "读取实时位姿失败 source=%s。", getter_name, exc_info=True
-                )
-                continue
-            if isinstance(pose, Pose):
-                return pose
-        return None
-
-    def _refresh_service_snapshot(self, service):
-        """消费定位/建图拥有方已发布的快照，识别周期不发起同步几何刷新。"""
-        getter = getattr(service, "get_latest_snapshot", None)
-        if callable(getter):
-            return getter()
-        return None
 
     def _remember_from_keyframe(
         self,
@@ -999,34 +886,25 @@ class PerceptionVideoRuntime:
             return False
         if not self._remember_keyframes and not force:
             return False
-        if hasattr(self._memory_service, "is_enabled") and not self._memory_service.is_enabled():
+        if not self._memory_service.is_enabled():
             return False
-        try:
-            self._memory_service.remember_current_scene(
-                perception_context=context,
-                observation_pose=current_pose,
-                map_snapshot=map_snapshot,
-                localization_snapshot=localization_snapshot,
-                expected_library_name=expected_library_name,
-                title="自动场景记忆：%s" % context.scene_summary.headline[:48],
-                camera_id=context.camera_id,
-                summary_override=context.scene_summary.headline,
-                tags=self._build_memory_tags(context),
-                metadata={
-                    "requested_by": "perception_video_runtime",
-                    "source": "perception_video_runtime",
-                    "capture_mode": "burst" if force else "keyframe",
-                    "keyframe_reason": reason,
-                },
-            )
-        except Exception as exc:
-            PERCEPTION_RUNTIME_LOGGER.warning(
-                "关键帧记忆写入失败，已跳过本次记忆 camera=%s reason=%s error=%s",
-                context.camera_id,
-                reason,
-                exc,
-            )
-            return False
+        self._memory_service.remember_current_scene(
+            perception_context=context,
+            observation_pose=current_pose,
+            map_snapshot=map_snapshot,
+            localization_snapshot=localization_snapshot,
+            expected_library_name=expected_library_name,
+            title="自动场景记忆：%s" % context.scene_summary.headline[:48],
+            camera_id=context.camera_id,
+            summary_override=context.scene_summary.headline,
+            tags=self._build_memory_tags(context),
+            metadata={
+                "requested_by": "perception_video_runtime",
+                "source": "perception_video_runtime",
+                "capture_mode": "burst" if force else "keyframe",
+                "keyframe_reason": reason,
+            },
+        )
         return True
 
     def _build_memory_tags(self, context) -> Tuple[str, ...]:

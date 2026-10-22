@@ -201,7 +201,8 @@ class AdmissionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="neh-update-admission-")
         self.root = Path(self.temporary.name)
-        self.runtime = SimpleNamespace()
+        self.runtime = SimpleNamespace(config=SimpleNamespace(
+            gateway=SimpleNamespace(host="127.0.0.1", port=8766)))
         self.service = UpdateService(self.runtime, self.root)
 
     def tearDown(self):

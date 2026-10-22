@@ -420,14 +420,6 @@ def check_prerequisites(request: InstallRequest, hardware, *, system_packages_ma
     return seed
 
 
-def _agent_terminal_storage_policy(current: Mapping) -> dict:
-    """新代际只根据已读安装记录选择布局，绝不继承进程/配置中的能力声明。"""
-    # read_current 仅在确实没有受管代际时返回空 dict；损坏指针/清单保持其原错误。
-    fresh = type(current) is dict and not current
-    capability = current.get("agent_terminal_storage") if isinstance(current, Mapping) else None
-    reader = capability.get("reader_version") if type(capability) is dict else None
-    compatible = type(reader) is int and reader == 1
-    return {"reader_version": 1, "fresh_layout": "split" if fresh or compatible else "combined"}
 
 
 def apply(request: InstallRequest, hardware) -> dict:
@@ -449,7 +441,6 @@ def apply(request: InstallRequest, hardware) -> dict:
             print("所选模块已经安装，无需重复处理。使用 --repair 可重新安装。")
             return current
         previous = Path(current["prefix"]) if current else None
-        terminal_policy = _agent_terminal_storage_policy(current)
         identifier = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
         prefix = request.home / "generations" / identifier
         prefix.mkdir(parents=True)
@@ -468,15 +459,13 @@ def apply(request: InstallRequest, hardware) -> dict:
             configuration = existing_config(request.root, current)
             if request.lio_backend:
                 configuration["NUWAX_GEOMETRY_LIO_BACKEND"] = request.lio_backend
-            write_runtime(request.root, prefix, request.modules, request.robot, configuration,
-                          fresh_layout=terminal_policy["fresh_layout"])
+            write_runtime(request.root, prefix, request.modules, request.robot, configuration)
             _prepare_models(request, prefix, run)
             _verify_prefix(prefix, request.modules)
             print("[5/5] 校验完成，切换当前安装", flush=True)
             state = {"schema": 1, "complete": True, "modules": list(request.modules),
                      "robot": request.robot, "source_root": str(request.root), "installation_inputs": inputs,
-                     "python": seed, "binaries": binaries, "installed_at": identifier,
-                     "agent_terminal_storage": terminal_policy}
+                     "python": seed, "binaries": binaries, "installed_at": identifier}
             # Preserve descriptor-free foreground installs for old pinned readers.
             # A real fresh install or explicit lifecycle migration assigns once.
             if not current or "deployment" in current or request.service_mode:

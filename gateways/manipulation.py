@@ -14,10 +14,9 @@ DESCRIPTION = ('设备已配置不代表后端当前可用；目录不探测远�
 
 
 def service(runtime):
-    existing = getattr(runtime, 'manipulation_service', None)
+    existing = runtime.manipulation_service
     if existing is None:
-        from core.settings import ManipulationConfig
-        existing = ManipulationService(getattr(runtime.config, 'manipulation', ManipulationConfig()))
+        existing = ManipulationService(runtime.config.manipulation)
         runtime.manipulation_service = existing
     return existing
 

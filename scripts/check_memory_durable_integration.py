@@ -38,13 +38,16 @@ class FakeEmbedder(ExplicitTextEmbedder):
         return super().embed_text(text)
 
 class IntegrationChecks(unittest.TestCase):
-    def fixture(self, *, path=':memory:', store=None, embedder=None):
+    def fixture(self, *, path=':memory:', embedder=None):
+        from core import StateStore
+        from services.mapping.service import MappingService
         model = embedder or FakeEmbedder()
         service = MemoryService(localization_service=SimpleNamespace(get_current_pose=lambda: None, get_active_session=lambda: None),
-            mapping_service=None, observation_service=None, perception_service=None,
+            mapping_service=MappingService(provider_owner=None, state_store=StateStore()),
+            observation_service=None, perception_service=None,
             state_store=SimpleNamespace(write=lambda *a, **kw: None),
             memory_db_path=path, text_embedder=model, text_embedding_model=model.model_name,
-            text_embedding_dimension=16, vector_store=store)
+            text_embedding_dimension=16)
         service._get_current_pose = lambda: None
         service._memory_enabled = True
         service._active_library_name = 'library'
@@ -106,16 +109,6 @@ class IntegrationChecks(unittest.TestCase):
         for name,_,_,record in records()[:5]:
             getattr(service._repository,'upsert_'+name)(record)
         self.assertEqual(service._durable_index.outbox.snapshot()['accepted'],5)
-    def test_separate_injected_store_and_borrowed_ownership(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store=SQLiteNamedVectorStore(str(Path(tmp)/'derived.db'))
-            self.addCleanup(store.close)
-            service=self.fixture(path=str(Path(tmp)/'source.db'),store=store)
-            record,receipt=self.accept(service)
-            service._run_durable_vectorization(self.claim(service))
-            self.assertTrue(self.query(service).matches)
-            self.assertTrue(service.close())
-            self.assertIsNotNone(store.get_point(record.memory_id))
     def test_legacy_positive_and_lexical_without_vectors(self):
         service=self.fixture()
         record=self.memory()
@@ -215,10 +208,9 @@ class IntegrationChecks(unittest.TestCase):
         self.assertEqual(retried.version,receipt.version)
         self.assertEqual(service._durable_index.query_snapshot([('memory',record)])[1]['validated_current'],1)
 
-    def test_separate_cache_rejected_aba_publication_stays_invisible(self):
+    def test_shared_transaction_rejects_stale_aba_publication(self):
         with tempfile.TemporaryDirectory() as tmp:
-            store=SQLiteNamedVectorStore(str(Path(tmp)/'vectors.db'));self.addCleanup(store.close)
-            service=self.fixture(path=str(Path(tmp)/'source.db'),store=store)
+            service=self.fixture(path=str(Path(tmp)/'source.db'))
             record,receipt=self.accept(service);claim=self.claim(service);index=service._durable_index
             index.activate('other');index.activate('library')
             named=NamedVector('text_dense',service._text_embedder.model_name,16,np.ones(16,dtype=np.float32))
@@ -226,7 +218,8 @@ class IntegrationChecks(unittest.TestCase):
             snapshots,counts=index.query_snapshot([('memory',record)])
             self.assertNotIn('text_dense',snapshots[0][2].vectors)
             self.assertEqual(counts['validated_current'],0)
-            self.assertEqual(counts['known_stale_or_incompatible'],1)
+            self.assertEqual(counts['missing'],1)
+            self.assertIsNone(service._vector_store.get_point(record.memory_id))
 
     def test_partial_publish_cannot_relabel_known_stale_legacy_other_modality(self):
         service=self.fixture();index=service._durable_index

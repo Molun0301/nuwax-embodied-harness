@@ -468,7 +468,7 @@ class BundleCompositeCaptureTests(OfflineCaptureCase):
                                     bundle=None, bundle_root=None,
                                     activation_result=runtime._activation_result_from_snapshot(original))
                             self.assertIsNot(installed, original)
-                            self.assertEqual(installed.activation_result_json, original.activation_result_json)
+                            self.assertEqual(installed.activation_result, original.activation_result)
                             self.assertEqual(installed.generation,
                                              original.generation + (0 if same_generation else 1))
 

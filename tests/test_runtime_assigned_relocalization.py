@@ -44,7 +44,7 @@ def activation_state(*, available=True):
     return {
         'activation_receipt_schema_version': 2, 'activation_receipt_disposition': 2,
         'activation_receipt_disposition_name': 'sealed',
-        'activation_receipt_v2': receipt.to_dict(),
+        'activation_receipt_v2': receipt,
         'relocalization_policy_v2': request_owner().to_dict()['assigned_cloud_v2']['policy'],
         'relocalization_target_available': available,
         'map_name': receipt.map_name, 'session_id': receipt.session_id,
@@ -176,7 +176,7 @@ class AssignedRuntimeConsumerTests(unittest.TestCase):
         first = install(self.owner)
         target = capture(self.owner)
         second = install(self.owner)
-        self.assertEqual(first.activation_result_json, second.activation_result_json)
+        self.assertEqual(first.activation_result, second.activation_result)
         self.assertEqual(second.generation, first.generation + 1)
         self.assertFalse(self.owner._map_activation_snapshot_still_current_locked(first))
         self.assertTrue(self.owner._map_activation_snapshot_still_current_locked(second))

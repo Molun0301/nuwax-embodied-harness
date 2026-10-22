@@ -649,6 +649,7 @@ class _ClientStreamQueue:
         self._lock = threading.RLock()
         self._notification_pending = False
         self._closed = False
+        self._nuwax_drop_state = None
 
     def _slot_key(self, frame: StreamFrame) -> Optional[Tuple[str, str]]:
         """返回可被后续同类帧覆盖的槽位键；None 表示该帧独占一个位置。
@@ -761,7 +762,7 @@ class _ClientStreamQueue:
                     return self.get_nowait()
                 if self._closed:
                     raise _ClientStreamClosed()
-                if getattr(self, "_nuwax_drop_state", None):
+                if self._nuwax_drop_state:
                     raise _ClientStreamGap()
                 waiter = asyncio.get_running_loop().create_future()
                 self._waiter = waiter

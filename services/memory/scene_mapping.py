@@ -186,7 +186,7 @@ class SceneMappingService:
                                 "primary_label": old.primary_label if keep_label else None,
                                 "candidate_labels": old.candidate_labels if unchanged else [],
                                 "review_status": old.review_status if keep_label and old.review_status != SceneSpaceReviewStatus.STALE else SceneSpaceReviewStatus.CANDIDATE})
-            prepared = region.model_copy(update=updates, deep=True)
+            prepared = region.model_copy(update=updates, deep=False)
             object.__setattr__(prepared, "_scene_graph_source_revision", getattr(old, "_scene_graph_source_revision", None) if old is not None else None)
             bound.append(prepared)
         return bound
@@ -375,7 +375,7 @@ class SceneMappingService:
                 metadata={"score_kind": result.score_kind, "calibrated": False}) for key, value in ranked],
             "metadata": {**space.metadata, "last_decision": raw, "decision_inputs_v2": evidence_key,
                          "category": winner},
-        }, deep=True)
+        }, deep=False)
 
     def _naming_policy_inputs(self, adopting):
         # 同一证据的采用开关/判定规则变化后，旧候选必须重新处理。

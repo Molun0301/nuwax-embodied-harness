@@ -19,6 +19,7 @@ from contracts.navigation import ExplorationStatus, ExploreAreaRequest, Navigati
 from contracts.runtime_views import ExplorationContext, NavigationContext
 from core import EventBus, StateNamespace, StateStore, StreamBus
 from core.errors import GatewayError
+from core.logging_utils import LogRateLimiter
 from providers import ExplorationProvider, NavigationProvider
 from services.localization import LocalizationService
 from services.mapping.service import MappingService
@@ -152,7 +153,7 @@ def _without_exploration_map_identity(
             "metadata": metadata,
             "stop_conditions": stop_conditions,
         },
-        deep=True,
+        deep=False,
     )
 
 
@@ -206,6 +207,7 @@ class NavigationService:
         self._state_machine: NavigationStateMachine = navigation_state_machine or create_navigation_state_machine()
         self._last_navigation_diagnostics: Optional[NavigationDiagnostics] = None
         self._lock = threading.RLock()
+        self._provider_update_log_limiter = LogRateLimiter()
         self._exploration_ownership_lock = threading.RLock()
         self._navigation_update_subscription_id: Optional[int] = None
         self._exploration_update_subscription_id: Optional[int] = None
@@ -286,7 +288,7 @@ class NavigationService:
         entry = next(iter(tombstones.maps.values()))
         with self._forbidden_zone_state_lock():
             if (
-                getattr(self, "_forbidden_zone_required_map_name", None)
+                self._forbidden_zone_required_map_name
                 == map_name
             ):
                 self._forbidden_zone_required_generation = None
@@ -321,10 +323,7 @@ class NavigationService:
 
         resolved_map_name = self._resolve_forbidden_zone_map_name(map_name)
         zone_snapshot = tuple(zones)
-        update_lock = getattr(self, "_forbidden_zone_update_lock", None)
-        if update_lock is None:
-            update_lock = threading.Lock()
-            self._forbidden_zone_update_lock = update_lock
+        update_lock = self._forbidden_zone_update_lock
         with update_lock:
             affects_active_map = self._forbidden_zone_update_affects_active_map(
                 resolved_map_name
@@ -417,7 +416,7 @@ class NavigationService:
 
         active_map_names = set()
         active_map_lookup_failed = False
-        localization_service = getattr(self, "_localization_service", None)
+        localization_service = self._localization_service
         if localization_service is not None:
             try:
                 active_session = localization_service.get_active_session()
@@ -430,7 +429,7 @@ class NavigationService:
             if active_map_name:
                 active_map_names.add(active_map_name)
 
-        mapping_service = getattr(self, "_mapping_service", None)
+        mapping_service = self._mapping_service
         if mapping_service is not None:
             try:
                 map_snapshot = mapping_service.get_latest_snapshot()
@@ -452,15 +451,15 @@ class NavigationService:
 
         with self._forbidden_zone_state_lock():
             metadata_sources = [
-                getattr(getattr(self, "_current_goal", None), "metadata", None),
+                getattr(self._current_goal, "metadata", None),
                 getattr(
-                    getattr(self, "_current_explore_request", None),
+                    self._current_explore_request,
                     "metadata",
                     None,
                 ),
                 getattr(
                     getattr(
-                        getattr(self, "_latest_navigation_context", None),
+                        self._latest_navigation_context,
                         "navigation_state",
                         None,
                     ),
@@ -469,7 +468,7 @@ class NavigationService:
                 ),
                 getattr(
                     getattr(
-                        getattr(self, "_latest_exploration_context", None),
+                        self._latest_exploration_context,
                         "exploration_state",
                         None,
                     ),
@@ -508,11 +507,11 @@ class NavigationService:
         state_lock = self._forbidden_zone_state_lock()
         with state_lock:
             pending_request_id = str(
-                getattr(self, "_pending_explore_request_id", "") or ""
+                self._pending_explore_request_id or ""
             ).strip()
             current_request_id = str(
                 getattr(
-                    getattr(self, "_current_explore_request", None),
+                    self._current_explore_request,
                     "request_id",
                     "",
                 )
@@ -617,19 +616,16 @@ class NavigationService:
                 self._forbidden_zone_update_active = False
 
     def _forbidden_zone_state_lock(self):
-        state_lock = getattr(self, "_lock", None)
-        if state_lock is None:
-            state_lock = threading.RLock()
-            self._lock = state_lock
+        state_lock = self._lock
         return state_lock
 
     def _active_navigation_goal_id_locked(self) -> Optional[str]:
         goal_id = str(
-            getattr(getattr(self, "_current_goal", None), "goal_id", "") or ""
+            getattr(self._current_goal, "goal_id", "") or ""
         ).strip()
         if goal_id:
             return goal_id
-        context = getattr(self, "_latest_navigation_context", None)
+        context = self._latest_navigation_context
         state = getattr(context, "navigation_state", None)
         if getattr(state, "status", None) not in {
             NavigationStatus.UNCONFIRMED,
@@ -641,7 +637,7 @@ class NavigationService:
         return str(getattr(state, "current_goal_id", "") or "").strip() or None
 
     def _active_exploration_request_id_locked(self) -> Optional[str]:
-        context = getattr(self, "_latest_exploration_context", None)
+        context = self._latest_exploration_context
         state = getattr(context, "exploration_state", None)
         if getattr(state, "status", None) not in {
             ExplorationStatus.ACCEPTED,
@@ -659,7 +655,7 @@ class NavigationService:
         self,
         fallback_request_id: Optional[str],
     ) -> Optional[str]:
-        owner = getattr(self, "_provider_owner", None)
+        owner = self._provider_owner
         provider = getattr(owner, "providers", None)
         state_reader = getattr(provider, "get_exploration_state", None)
         if not callable(state_reader):
@@ -844,21 +840,13 @@ class NavigationService:
         timeout_sec = max(
             0.0,
             float(
-                getattr(
-                    self,
-                    "_forbidden_zone_cancel_wait_timeout_sec",
-                    5.0,
-                )
+                self._forbidden_zone_cancel_wait_timeout_sec
             ),
         )
         poll_interval_sec = max(
             0.01,
             float(
-                getattr(
-                    self,
-                    "_forbidden_zone_cancel_poll_interval_sec",
-                    0.05,
-                )
+                self._forbidden_zone_cancel_poll_interval_sec
             ),
         )
         return timeout_sec, poll_interval_sec
@@ -940,7 +928,7 @@ class NavigationService:
             request_id=request_id,
         ):
             return
-        owner = getattr(self, "_provider_owner", None)
+        owner = self._provider_owner
         provider = getattr(owner, "providers", None)
         state_reader = getattr(provider, "get_exploration_state", None)
         if not callable(state_reader):
@@ -1006,7 +994,7 @@ class NavigationService:
             time.sleep(poll_interval_sec)
 
     def _forbidden_zone_navigation_provider(self):
-        owner = getattr(self, "_provider_owner", None)
+        owner = self._provider_owner
         provider = getattr(owner, "providers", None)
         if not callable(getattr(provider, "get_navigation_state", None)):
             return None
@@ -1017,7 +1005,7 @@ class NavigationService:
         *,
         deadline_monotonic: Optional[float] = None,
     ) -> Optional[_ForbiddenZoneRuntimeAck]:
-        owner = getattr(self, "_provider_owner", None)
+        owner = self._provider_owner
         provider = getattr(owner, "providers", None)
         readiness_reader = getattr(provider, "get_navigation_readiness", None)
         if not callable(readiness_reader):
@@ -1074,21 +1062,13 @@ class NavigationService:
         timeout_sec = max(
             0.0,
             float(
-                getattr(
-                    self,
-                    "_forbidden_zone_revision_wait_timeout_sec",
-                    2.0,
-                )
+                self._forbidden_zone_revision_wait_timeout_sec
             ),
         )
         poll_interval_sec = max(
             0.01,
             float(
-                getattr(
-                    self,
-                    "_forbidden_zone_revision_poll_interval_sec",
-                    0.05,
-                )
+                self._forbidden_zone_revision_poll_interval_sec
             ),
         )
         deadline = time.monotonic() + timeout_sec
@@ -1116,18 +1096,10 @@ class NavigationService:
             deadline_monotonic,
             "ForbiddenZoneMotionAdmission",
         ):
-            if getattr(self, "_forbidden_zone_update_active", False):
+            if self._forbidden_zone_update_active:
                 self._raise_forbidden_zone_motion_start_blocked_locked()
-            required_generation = getattr(
-                self,
-                "_forbidden_zone_required_generation",
-                None,
-            )
-            required_map_name = getattr(
-                self,
-                "_forbidden_zone_required_map_name",
-                None,
-            )
+            required_generation = self._forbidden_zone_required_generation
+            required_map_name = self._forbidden_zone_required_map_name
         if required_generation is None or not required_map_name:
             return
 
@@ -1139,23 +1111,11 @@ class NavigationService:
             deadline_monotonic,
             "ForbiddenZoneMotionAdmission",
         ):
-            if getattr(self, "_forbidden_zone_update_active", False):
+            if self._forbidden_zone_update_active:
                 self._raise_forbidden_zone_motion_start_blocked_locked()
-            current_required_generation = getattr(
-                self,
-                "_forbidden_zone_required_generation",
-                None,
-            )
-            current_required_map_name = getattr(
-                self,
-                "_forbidden_zone_required_map_name",
-                None,
-            )
-            current_required_signature = getattr(
-                self,
-                "_forbidden_zone_required_signature",
-                None,
-            )
+            current_required_generation = self._forbidden_zone_required_generation
+            current_required_map_name = self._forbidden_zone_required_map_name
+            current_required_signature = self._forbidden_zone_required_signature
             if current_required_generation is None:
                 return
             if (
@@ -1179,34 +1139,22 @@ class NavigationService:
         *,
         observed_ack: Optional[_ForbiddenZoneRuntimeAck] = None,
     ) -> None:
-        if getattr(self, "_forbidden_zone_update_active", False):
+        if self._forbidden_zone_update_active:
             raise GatewayError(
                 "活动地图禁行区正在更新，请稍后重试。",
                 error_code="forbidden_zone_update_in_progress",
                 http_status=409,
             )
-        required_generation = getattr(
-            self,
-            "_forbidden_zone_required_generation",
-            None,
-        )
+        required_generation = self._forbidden_zone_required_generation
         if required_generation is not None:
             raise GatewayError(
                 "planner 尚未消费最新禁行区 costmap，暂不允许启动运动任务。",
                 error_code="forbidden_zone_revision_pending",
                 http_status=503,
                 details={
-                    "map_name": getattr(
-                        self,
-                        "_forbidden_zone_required_map_name",
-                        None,
-                    ),
+                    "map_name": self._forbidden_zone_required_map_name,
                     "required_generation": required_generation,
-                    "required_signature": getattr(
-                        self,
-                        "_forbidden_zone_required_signature",
-                        None,
-                    ),
+                    "required_signature": self._forbidden_zone_required_signature,
                     "observed_map_name": (
                         observed_ack.map_name if observed_ack else None
                     ),
@@ -1256,8 +1204,8 @@ class NavigationService:
                 return resolved
 
         for context in (
-            getattr(self, "_current_goal", None),
-            getattr(self, "_current_explore_request", None),
+            self._current_goal,
+            self._current_explore_request,
         ):
             resolved = str(getattr(context, "map_name", "") or "").strip()
             if resolved:
@@ -1298,12 +1246,14 @@ class NavigationService:
             return bool(availability_checker())
         return True
 
-    def get_navigation_control_context(self, *, deadline_monotonic: Optional[float] = None) -> NavigationContext:
-        """停车只读取原提供器证明，不进入显示聚合锁和其它业务查询。"""
+    def get_navigation_control_context(self, *, deadline_monotonic: Optional[float] = None,
+                                       include_readiness: bool = False) -> NavigationContext:
+        """读取本次控制状态；任务捕获可同时取得规划器观测，不复用展示终态。"""
         provider = self._find_navigation_provider()
         if provider is None:
             raise GatewayError("当前平台几何运行时未提供导航后端。")
-        getter = getattr(provider, "get_navigation_control_state", provider.get_navigation_state)
+        getter = (provider.get_navigation_state if include_readiness
+                  else getattr(provider, "get_navigation_control_state", provider.get_navigation_state))
         state = getter() if deadline_monotonic is None else getter(deadline_monotonic=deadline_monotonic)
         return NavigationContext(navigation_state=state, backend_name=provider.provider_name,
             goal_reached=bool(state.goal_reached), metadata={"provider_version":provider.provider_version})
@@ -1343,6 +1293,10 @@ class NavigationService:
         try:
             self._ingest_navigation_state(provider, navigation_state)
         except Exception:
+            self._provider_update_log_limiter.log(
+                LOGGER, logging.ERROR, "导航提供器更新失败。",
+                key="_handle_provider_navigation_update", interval_sec=5.0, exc_info=True,
+            )
             return
 
     def _ingest_navigation_state(
@@ -1532,7 +1486,7 @@ class NavigationService:
                         **runtime_metadata,
                     }
                 },
-                deep=True,
+                deep=False,
             )
             context = NavigationContext(
                 current_goal=current_goal,
@@ -1579,7 +1533,7 @@ class NavigationService:
         receipt = receipt.model_copy(update={"metadata": {
             **dict(receipt.metadata), "authority_current": False,
             "ownership_retained": False, "command_receipt_only": True,
-        }}, deep=True)
+        }}, deep=False)
         context_metadata = {"provider_version": provider.provider_version,
                             "command_receipt_only": True}
         if not lightweight:
@@ -1600,7 +1554,7 @@ class NavigationService:
                                     navigation_state_machine=summary, map_name=goal.map_name)
             receipt = receipt.model_copy(update={"metadata": {
                 **dict(receipt.metadata), "navigation_state_machine": summary,
-            }}, deep=True)
+            }}, deep=False)
         return NavigationContext(
             timestamp=receipt.timestamp, current_goal=goal, navigation_state=receipt,
             backend_name=provider.provider_name, goal_reached=receipt.goal_reached,
@@ -1796,10 +1750,10 @@ class NavigationService:
                             "status": NavigationStatus.ACCEPTED,
                             "message": "导航目标已接受。",
                         },
-                        deep=True,
+                        deep=False,
                     )
                 },
-                deep=True,
+                deep=False,
             )
             self._latest_navigation_context = context
         if deadline_monotonic is None:
@@ -1930,10 +1884,10 @@ class NavigationService:
                             "status": NavigationStatus.CANCELLED,
                             "message": "导航目标已取消。",
                         },
-                        deep=True,
+                        deep=False,
                     )
                 },
-                deep=True,
+                deep=False,
             )
             self._latest_navigation_context = context
         if deadline_monotonic is None:
@@ -2089,6 +2043,10 @@ class NavigationService:
             )
             self._ingest_exploration_state(provider, exploration_state, lightweight=lightweight)
         except Exception:
+            self._provider_update_log_limiter.log(
+                LOGGER, logging.ERROR, "探索提供器更新失败。",
+                key="_handle_provider_exploration_update", interval_sec=5.0, exc_info=True,
+            )
             return
 
     def _ingest_exploration_state(
@@ -2170,7 +2128,7 @@ class NavigationService:
                 update={
                     "metadata": merged_metadata
                 },
-                deep=True,
+                deep=False,
             )
             context = ExplorationContext(
                 current_request=current_request,
@@ -2421,10 +2379,10 @@ class NavigationService:
                             "strategy": request.strategy,
                             "message": "探索任务已接受。",
                         },
-                        deep=True,
+                        deep=False,
                     )
                 },
-                deep=True,
+                deep=False,
             )
             self._latest_exploration_context = context
         return context
@@ -2518,14 +2476,14 @@ class NavigationService:
             if state_updates:
                 exploration_state = exploration_state.model_copy(
                     update=state_updates,
-                    deep=True,
+                    deep=False,
                 )
             context = context.model_copy(
                 update={
                     "current_request": previous_request,
                     "exploration_state": exploration_state,
                 },
-                deep=True,
+                deep=False,
             )
             self._latest_exploration_context = context
 
@@ -3170,8 +3128,9 @@ class NavigationService:
     def _navigation_provider_error_message(self, provider: NavigationProvider, *, default: str) -> str:
         try:
             state = provider.get_navigation_state()
-        except Exception:
-            return default
+        except Exception as exc:
+            LOGGER.exception("读取导航后端故障状态失败。")
+            return f"{default}（读取后端状态失败：{exc}）"
         message = str(getattr(state, "message", "") or "").strip()
         metadata = dict(getattr(state, "metadata", {}) or {})
         readiness = metadata.get("readiness") or metadata.get("navigation_readiness")
@@ -3195,10 +3154,7 @@ class NavigationService:
         subscriber = getattr(provider, "subscribe_navigation_updates", None)
         if not callable(subscriber):
             return
-        try:
-            subscription_id = subscriber(self._handle_provider_navigation_update)
-        except Exception:
-            return
+        subscription_id = subscriber(self._handle_provider_navigation_update)
         if subscription_id is not None:
             try:
                 self._navigation_update_subscription_id = int(subscription_id)
@@ -3212,10 +3168,7 @@ class NavigationService:
         subscriber = getattr(provider, "subscribe_exploration_updates", None)
         if not callable(subscriber):
             return
-        try:
-            subscription_id = subscriber(self._handle_provider_exploration_update)
-        except Exception:
-            return
+        subscription_id = subscriber(self._handle_provider_exploration_update)
         if subscription_id is not None:
             try:
                 self._exploration_update_subscription_id = int(subscription_id)
@@ -3245,7 +3198,7 @@ class NavigationService:
             return provider
 
         runtime_status: Dict[str, object] = {}
-        owner = getattr(self, "_provider_owner", None)
+        owner = self._provider_owner
         if owner is not None:
             getter = getattr(owner, "get_runtime_status", None)
             if callable(getter):

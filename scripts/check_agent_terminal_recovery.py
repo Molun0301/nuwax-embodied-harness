@@ -282,16 +282,17 @@ class RecoveryChecks(unittest.TestCase):
             self.assertFalse(self.manager._records[task.task_id].completion_committed)
         self.assertEqual(self.calls, [1, 1])
 
-    def test_close_with_unsupported_receipt_is_explicitly_incomplete(self):
-        def opaque():
-            pass
-        task_id = self.finish(opaque)
+    def test_close_with_unencodable_receipt_is_explicitly_incomplete(self):
+        class Opaque:
+            __slots__ = ("value",)
+            def __init__(self): self.value = object()
+        task_id = self.finish(Opaque())
         service = self.service()
         result = service.close(2, source_fenced=True)
         self.assertTrue(result["owner_closed"])
         self.assertFalse(result["complete"])
         self.assertEqual(result["blocked_count"], 1)
-        self.assertEqual(result["last_error_code"], "task_receipt_unsupported")
+        self.assertEqual(result["last_error_code"], "mcp_result_unavailable")
         self.assertEqual(self.manager.get_task_status(task_id).state, "succeeded")
         self.assertEqual(self.calls, [1])
 

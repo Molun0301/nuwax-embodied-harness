@@ -24,6 +24,7 @@ from core.event_bus import EventBus
 from core.task_manager import TaskManager, TaskReceiptCapture
 from gateways.agent.service import AgentToolService
 from gateways.runtime import GatewayRuntime
+from tests.conftest import create_isolated_gateway
 
 
 class WaitStatusChecks(unittest.IsolatedAsyncioTestCase):
@@ -45,11 +46,8 @@ class WaitStatusChecks(unittest.IsolatedAsyncioTestCase):
         self.stage = self.manager.get_task_status(self.task_id).stage
         for index in range(128):
             self.manager.publish_task_event(self.task_id, "task.audit", payload={"index": index})
-        runtime = GatewayRuntime.__new__(GatewayRuntime)
-        runtime.task_manager, runtime.event_bus = self.manager, self.bus
-        runtime.robot = NS(manifest=NS(robot_model="offline"))
-        runtime.config = NS(gateway=NS(artifact_dir=Path(self.temp.name) / "artifacts"))
-        runtime._task_status_last_polled_at = {}
+        runtime = create_isolated_gateway(Path(self.temp.name) / "runtime", task_manager=self.manager, event_bus=self.bus)
+        self.runtime = runtime
         runtime.capability_registry = NS(get_descriptor=lambda name: NS(display_name="offline"))
         self.allowed = True
         self.authorization_calls = 0
@@ -123,6 +121,7 @@ class WaitStatusChecks(unittest.IsolatedAsyncioTestCase):
             item.stop()
         self.assertEqual(self.actions, [1])
         self.assertEqual(self.service._async_waiters, {})
+        await run_in_threadpool(self.runtime.stop)
         self.temp.cleanup()
 
     def wait(self, *, sync=False, timeout=30):
@@ -273,26 +272,17 @@ class WaitStatusChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reply["status"]["stage"], "public_change")
         self.assertEqual(self.snapshots, 2)
 
-    async def test_permission_revocation_precedes_new_unsupported_ownership(self):
+    async def test_permission_revocation_precedes_metadata_update(self):
         waiter = self.wait()
         await self.idle(1)
         self.allowed = False
-        self.manager.update_task_metadata(self.task_id, {"opaque": lambda: None})
+        self.manager.update_task_metadata(self.task_id, {"note": "updated"})
         with self.assertRaises(GatewayError) as caught:
             await waiter
         self.assertEqual(caught.exception.error_code, "access_denied")
         self.assertEqual(self.snapshots, 1)
         self.assertEqual(self.copies, 1)
 
-    async def test_known_unsupported_ownership_fails_without_copying_history(self):
-        waiter = self.wait()
-        await self.idle(1)
-        self.manager.update_task_metadata(self.task_id, {"opaque": lambda: None})
-        with self.assertRaises(GatewayError) as caught:
-            await waiter
-        self.assertEqual(caught.exception.error_code, "task_receipt_unsupported")
-        self.assertEqual(self.copies, 1)
-        self.assertEqual(self.manager.get_task_status(self.task_id).state, "running")
 
     async def test_new_projection_only_error_defers_until_full_timeout_response(self):
         now = [0.0]

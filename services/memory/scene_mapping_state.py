@@ -44,7 +44,7 @@ class SceneMappingMemoryMixin:
     """由MemoryService持有锁、仓储与索引，本类不创建第二份记忆状态。"""
 
     def capture_scene_mapping_state(self, *, include_decision_inputs: bool = True) -> Dict[str, Any]:
-        snapshot = getattr(self._mapping_service, "get_semantic_snapshot", self._mapping_service.get_latest_snapshot)()
+        snapshot = self._mapping_service.get_semantic_snapshot()
         if snapshot is None or snapshot.occupancy_grid is None:
             raise GatewayError("当前没有可分割的规范占据地图。", error_code="scene_map_not_ready", http_status=409)
         binding = snapshot_binding(snapshot)
@@ -54,7 +54,7 @@ class SceneMappingMemoryMixin:
                 raise GatewayError("当前地图与记忆库名称不一致。", error_code="scene_map_library_mismatch", http_status=409)
             capture = {
                 "snapshot": snapshot, "binding": binding, "library_name": library,
-                "generation": getattr(self, "_scene_scope_generation", 0),
+                "generation": self._scene_scope_generation,
             }
             if include_decision_inputs:
                 visible = None if self._durable_index.load_history else tuple(self._semantic_entries_by_id)
@@ -79,14 +79,14 @@ class SceneMappingMemoryMixin:
 
     def capture_scene_graph_stamp(self) -> Dict[str, Any]:
         """Warm graph validation captures owner scalars, never source collections."""
-        snapshot = getattr(self._mapping_service, "get_semantic_snapshot", self._mapping_service.get_latest_snapshot)()
+        snapshot = self._mapping_service.get_semantic_snapshot()
         if snapshot is None or snapshot.occupancy_grid is None:
             raise GatewayError("当前没有可分割的规范占据地图。", error_code="scene_map_not_ready", http_status=409)
         with self._instances_lock:
             library = self._require_memory_enabled(initialize_embedders=False)
             if library != snapshot.map_name:
                 raise GatewayError("当前地图与记忆库名称不一致。", error_code="scene_map_library_mismatch", http_status=409)
-            generation = getattr(self, "_scene_scope_generation", 0)
+            generation = self._scene_scope_generation
             live_generation = self._scene_graph_live_generation
             geometry_visibility = self._scene_graph_geometry_visibility_generation
             transactional = self._repository.storage.in_transaction
@@ -166,9 +166,9 @@ class SceneMappingMemoryMixin:
 
     def _assert_scene_mapping_capture(self, capture: Dict[str, Any], *, require_content: bool = True) -> None:
         self._assert_observation_library(capture["library_name"])
-        if getattr(self, "_scene_scope_generation", 0) != capture["generation"]:
+        if self._scene_scope_generation != capture["generation"]:
             raise GatewayError("记忆库已重新激活，旧语义任务失效。", error_code="scene_scope_changed", http_status=409)
-        latest = getattr(self._mapping_service, "get_semantic_snapshot", self._mapping_service.get_latest_snapshot)()
+        latest = self._mapping_service.get_semantic_snapshot()
         if latest is None or latest.occupancy_grid is None:
             raise GatewayError("语义任务期间地图已退出。", error_code="scene_map_changed", http_status=409)
         binding = snapshot_binding(latest)
@@ -190,7 +190,7 @@ class SceneMappingMemoryMixin:
             "metadata": {**space.metadata, MANAGED_KEY: True, "scene_revision": revision + 1,
                          "memory_library_name": library},
             "semantic_updated_at": utc_now(),
-        }, deep=True)
+        }, deep=False)
         object.__setattr__(updated, "_scene_expected_source_revision", getattr(space, "_scene_graph_source_revision", None))
         if current is not None:
             object.__setattr__(updated, "_memory_business_token", getattr(current, "_memory_business_token", None))
@@ -226,7 +226,7 @@ class SceneMappingMemoryMixin:
                 if self._record_library_name(old) != capture["library_name"]:
                     continue
                 stale = old.model_copy(update={"review_status": SceneSpaceReviewStatus.STALE,
-                    "metadata": {**old.metadata, "stale_reason": "geometry_region_replaced"}}, deep=True)
+                    "metadata": {**old.metadata, "stale_reason": "geometry_region_replaced"}}, deep=False)
                 plans.append(self._prepare_managed_scene_space(stale,
                     expected_revision=int(old.metadata.get("scene_revision",0))))
         written = []
@@ -322,7 +322,7 @@ class SceneMappingMemoryMixin:
                 "request_id": request_id, "label": label, "requested_by": requested_by,
             })
             updates["human_aliases"] = list(dict.fromkeys([*space.human_aliases, label]))
-        updated = space.model_copy(update=updates, deep=True)
+        updated = space.model_copy(update=updates, deep=False)
         try:
             written = self.commit_scene_mapping_spaces(capture, [updated], expected_revisions={space.scene_space_id: expected_revision})[0]
         except GatewayError as exc:

@@ -38,7 +38,7 @@ def save_after_stop(runtime, context, request):
         return
     payload = runtime.platform_geometry_runtime.get_exploration_progress(request.request_id)
     before = json.loads(payload)
-    frozen = request.model_copy(update={"metadata": {k: v for k, v in request.metadata.items() if k != "motion_admission"}, "resume_progress_json": None}, deep=True)
+    frozen = request.model_copy(update={"metadata": {k: v for k, v in request.metadata.items() if k != "motion_admission"}, "resume_progress_json": None}, deep=False)
     catalog = store(runtime)
     try:
         retained = catalog.load(checkpoint_id, validate_asset=False)

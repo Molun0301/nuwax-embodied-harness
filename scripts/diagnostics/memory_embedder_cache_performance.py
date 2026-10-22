@@ -69,44 +69,44 @@ class CountingExplicitEmbedder(TextEmbedder):
 
 def fixture():
     embedder = CountingExplicitEmbedder()
-    memory = object.__new__(MemoryService)
-    memory._instances_lock = threading.RLock()
-    memory._text_embedder_init_lock = threading.Lock()
-    memory._image_embedder_init_lock = threading.Lock()
+    from core import StateStore
+    memory = MemoryService(localization_service=None, mapping_service=None,
+        observation_service=None, perception_service=None, state_store=StateStore(),
+        text_embedder=embedder, text_embedding_model=embedder.model_name,
+        text_embedding_dimension=embedder.dimension, image_embedding_model="disabled")
     memory._memory_enabled = True
     memory._active_library_name = "synthetic-cache-benchmark"
-    memory._text_embedder_ready = True
-    memory._image_embedder_ready = True
-    memory._text_embedder = embedder
-    memory._image_embedder = None
-    memory._instance_association_service = InstanceAssociationService(text_embedder=embedder)
+    memory._durable_index.activate(memory._active_library_name, load_history=False)
     return memory, embedder
 
 
 def run_workload(operations):
     memory, embedder = fixture()
-    latencies_us = []
-    scores = []
-    started = time.perf_counter_ns()
-    for index in range(operations):
-        before = time.perf_counter_ns()
-        memory._require_memory_enabled()
-        with memory._instances_lock:
-            scores.append(memory._instance_association_service._label_similarity(*PAIRS[index % len(PAIRS)]))
-        latencies_us.append((time.perf_counter_ns() - before) / 1000)
-    elapsed_ms = (time.perf_counter_ns() - started) / 1e6
-    association = memory._instance_association_service
-    return {
-        "elapsed_ms": elapsed_ms,
-        "operation_p50_us": float(np.percentile(latencies_us, 50)),
-        "operation_p95_us": float(np.percentile(latencies_us, 95)),
-        "operation_p99_us": float(np.percentile(latencies_us, 99)),
-        "embedding_calls": embedder.calls,
-        "cosine_calls": embedder.cosine_calls,
-        "embedding_cache_entries": len(association._embedding_cache),
-        "similarity_cache_entries": len(association._label_similarity_cache),
-        "scores": scores,
-    }
+    try:
+        latencies_us = []
+        scores = []
+        started = time.perf_counter_ns()
+        for index in range(operations):
+            before = time.perf_counter_ns()
+            memory._require_memory_enabled()
+            with memory._instances_lock:
+                scores.append(memory._instance_association_service._label_similarity(*PAIRS[index % len(PAIRS)]))
+            latencies_us.append((time.perf_counter_ns() - before) / 1000)
+        elapsed_ms = (time.perf_counter_ns() - started) / 1e6
+        association = memory._instance_association_service
+        return {
+            "elapsed_ms": elapsed_ms,
+            "operation_p50_us": float(np.percentile(latencies_us, 50)),
+            "operation_p95_us": float(np.percentile(latencies_us, 95)),
+            "operation_p99_us": float(np.percentile(latencies_us, 99)),
+            "embedding_calls": embedder.calls,
+            "cosine_calls": embedder.cosine_calls,
+            "embedding_cache_entries": len(association._embedding_cache),
+            "similarity_cache_entries": len(association._label_similarity_cache),
+            "scores": scores,
+        }
+    finally:
+        memory.close()
 
 
 def main():

@@ -80,16 +80,18 @@ class WarningProtection(unittest.TestCase):
 
         for severity in (RuntimeEventSeverity.WARNING, RuntimeEventSeverity.ERROR):
             with self.subTest(severity=severity.value):
-                runtime = object.__new__(GatewayRuntime)
-                runtime.event_bus = EventBus()
-                runtime.stream_bus = StreamBus()
-                runtime.capability_registry = CapabilityRegistry()
-                runtime._runtime_event_log_limiter = LogRateLimiter()
+                import tempfile
+                from tests.conftest import create_isolated_gateway
+                directory = tempfile.TemporaryDirectory(prefix="nuwax-enum-feedback-")
+                self.addCleanup(directory.cleanup)
+                runtime = create_isolated_gateway(Path(directory.name))
+                self.addCleanup(runtime.stop)
                 gaps = []
-                runtime._runtime_event_log = RuntimeEventLog(
-                    runtime._write_runtime_event_log, gap_writer=gaps.append,
-                    max_items=1, reserved_items=1)
-                runtime.event_bus.subscribe(runtime._log_runtime_event)
+                selected_log = RuntimeEventLog(runtime._write_runtime_event_log,
+                    gap_writer=gaps.append, max_items=1, reserved_items=1)
+                binding = patch.object(runtime, "_runtime_event_log", selected_log)
+                binding.start()
+                self.addCleanup(binding.stop)
                 logger = logging.Logger("check.runtime", logging.INFO)
                 feedback_logger = logging.Logger("check.feedback", logging.INFO)
                 runtime_sink, feedback_sink = Sink(), Sink()

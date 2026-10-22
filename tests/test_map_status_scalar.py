@@ -1,5 +1,6 @@
 """Legacy map status consumes library identity, not a full memory projection."""
 import json
+from pathlib import Path
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -33,16 +34,23 @@ class MapStatusScalarChecks(unittest.TestCase):
     def owner(self, memory):
         temporary = tempfile.TemporaryDirectory(prefix='neh-map-status-')
         self.addCleanup(temporary.cleanup)
-        owner = object.__new__(MapWorkspaceService)
-        owner._repository = MapCatalogRepository(temporary.name)
-        owner._memory_service = memory
-        owner._state_store = SimpleNamespace(write=lambda *a, **kw: None)
-        owner._geometry_runtime = SimpleNamespace()
-        owner._mapping_service = SimpleNamespace(is_available=lambda: False)
-        owner._localization_service = SimpleNamespace(get_latest_snapshot=lambda: None)
-        owner._navigation_service = SimpleNamespace(get_latest_navigation_context=lambda: None,
-                                                     get_latest_exploration_context=lambda: None)
-        owner._read_coherent_active_map_snapshot = lambda: None
+        from tests.conftest import create_isolated_gateway
+        from contextlib import ExitStack
+        from unittest.mock import patch
+        gateway = create_isolated_gateway(Path(temporary.name) / "gateway")
+        self.addCleanup(gateway.stop)
+        overrides = ExitStack()
+        self.addCleanup(overrides.close)
+        owner = gateway.map_workspace_service
+        overrides.enter_context(patch.object(owner, '_repository', MapCatalogRepository(temporary.name)))
+        overrides.enter_context(patch.object(owner, '_memory_service', memory))
+        overrides.enter_context(patch.object(owner, '_state_store', SimpleNamespace(write=lambda *a, **kw: None)))
+        overrides.enter_context(patch.object(owner, '_geometry_runtime', SimpleNamespace(get_live_mapping_diagnostics=lambda: {"mapping_readiness": {"map_ready": True, "localization_ready": True}}, get_geometry_stack_status=lambda: {})))
+        overrides.enter_context(patch.object(owner, '_mapping_service', SimpleNamespace(is_available=lambda: False)))
+        overrides.enter_context(patch.object(owner, '_localization_service', SimpleNamespace(get_latest_snapshot=lambda: None)))
+        overrides.enter_context(patch.object(owner, '_navigation_service', SimpleNamespace(get_latest_navigation_context=lambda: None,
+                                                     get_latest_exploration_context=lambda: None)))
+        overrides.enter_context(patch.object(owner, '_read_coherent_active_map_snapshot', lambda: None))
         return owner
 
     @staticmethod

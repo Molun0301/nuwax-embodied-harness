@@ -82,34 +82,26 @@ class MappingNotificationTests(unittest.TestCase):
             'metadata': {'update_sequence':revision, **metadata}})
 
     def gateway(self, *, recorder=None, started=False):
-        runtime=object.__new__(GatewayRuntime)
-        runtime.mapping_service, runtime.stream_bus, runtime.event_bus = self.mapping, self.stream, self.events
-        runtime.mapping_recorder=recorder
-        runtime._recording_subscription_id = (self.stream.subscribe(recorder.record_stream_frame,
-            topics=('map.frame','localization.pose','runtime.governance')) if recorder is not None else None)
-        runtime.logged=[]
-        runtime._event_log_subscription_id=self.events.subscribe(lambda event: runtime.logged.append(event.event_type))
-        runtime._closing_event_log_subscription_id=None
-        runtime._event_bridge_context=threading.local()
-        runtime._runtime_event_log=NS(close=lambda timeout: True)
-        runtime._owns_event_bus=runtime._owns_stream_bus=True
-        runtime._dispatch_shutdown_complete=False
-        runtime._dispatch_shutdown_blocker=None
-        runtime._close_artifact_dependencies=lambda timeout: True
-        runtime.scene_mapping_service=NS(close=lambda: None)
-        runtime._close_memory_service=lambda: None
-        runtime._lifecycle_lock=threading.RLock()
-        runtime._started, runtime._closed=started,False
-        runtime.task_manager=NS(shutdown=lambda **kwargs: None)
-        runtime._join_exploration_finalizers=lambda: None
-        runtime.motion_guard=NS(has_connected=False,close=lambda: None)
-        runtime._settle_relocalization_owner_before_geometry_stop=lambda **kw: {}
-        runtime._stop_runtime_input_bridge=lambda: True
-        runtime.platform_geometry_runtime=runtime.audio_service=runtime.robot=NS(stop=lambda: None)
-        runtime._stop_data_frame_stream_sources=lambda: None
-        runtime._begin_artifact_shutdown=lambda: None
-        runtime.perception_video_runtime=NS(stop=lambda: None)
-        runtime.person_follow_bridge=NS(close=lambda: None)
+        from tests.conftest import create_isolated_gateway
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        runtime = create_isolated_gateway(Path(temp.name))
+        self.addCleanup(runtime.stop)
+        recorder = recorder or runtime.mapping_recorder
+        runtime.logged = []
+        recording_subscription = self.stream.subscribe(recorder.record_stream_frame,
+            topics=('map.frame', 'localization.pose', 'runtime.governance'))
+        event_subscription = self.events.subscribe(lambda event: runtime.logged.append(event.event_type))
+        bindings = patch.multiple(runtime, mapping_service=self.mapping,
+            stream_bus=self.stream, event_bus=self.events, mapping_recorder=recorder,
+            _recording_subscription_id=recording_subscription,
+            _event_log_subscription_id=event_subscription,
+            _closing_event_log_subscription_id=None,
+            _owns_event_bus=True, _owns_stream_bus=True,
+            _dispatch_shutdown_complete=False, _dispatch_shutdown_blocker=None,
+            _started=started, _closed=False, _recording_notification_gaps={})
+        bindings.start()
+        self.addCleanup(bindings.stop)
         return runtime
 
     def recorder(self):

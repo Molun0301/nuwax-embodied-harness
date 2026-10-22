@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import time
 from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 
@@ -10,6 +11,7 @@ from contracts.image import CameraInfo, ImageEncoding, ImageFrame
 from contracts.pointcloud import PointCloudFrame
 from contracts.robot_state import IMUState, JointState, RobotControlMode, RobotState, SafetyState
 from contracts.sensors import SensorSample
+from core.logging_utils import LogRateLimiter
 from drivers.go2.defaults import GO2_DEFAULT_CAMERA_INFO, GO2_DEFAULT_SENSOR_TOPOLOGY
 from providers.calibration import CalibrationProvider
 from providers.image import ImageProvider
@@ -23,6 +25,8 @@ if TYPE_CHECKING:
 
 
 _ROBOT_STATE_SAMPLE_INTERVAL_SEC = 0.05
+_LOGGER = logging.getLogger(__name__)
+_VOLUME_LOG_LIMITER = LogRateLimiter()
 
 
 def _to_control_mode(mode: str) -> RobotControlMode:
@@ -72,8 +76,11 @@ class Go2ProviderBundle(
         }
         try:
             metadata["robot_volume"] = self.assembly.get_vui_volume_info()
-        except Exception:
+        except Exception as exc:
+            _VOLUME_LOG_LIMITER.log(_LOGGER, logging.ERROR, "读取机器人音量失败", key="robot-volume",
+                                    interval_sec=30.0, exc_info=True)
             metadata["robot_volume"] = None
+            metadata["robot_volume_error"] = str(exc)
         metadata["volume_state"] = metadata["robot_volume"]
         if self.assembly.data_plane is not None:
             data_plane_status = self.assembly.data_plane.get_status()

@@ -49,20 +49,12 @@ class TerminalReceiptPersistence:
         self._close_requested = self._source_fenced = self._owner_closed = False
         self._restarts = 0
         self._thread = None
-        self._supported = all(callable(getattr(source, name, None)) for name in (
-            "task_receipt_header", "receipt_source_status", "begin_terminal_receipt_scan", "page_terminal_receipts"))
-        self._supported = self._supported and all(callable(getattr(store, name, None)) for name in (
-            "terminal_versions", "prepare_terminal", "save_prepared_terminal"))
-        if self._supported:
-            if autostart:
-                self._start_locked()
-        else:
-            self._owner_closed = True
-            self._last_error = "receipt_source_api_unavailable"
+        if autostart:
+            self._start_locked()
 
     def start(self):
         with self._cv:
-            if self._supported and self._thread is None and not self._close_requested:
+            if self._thread is None and not self._close_requested:
                 self._start_locked()
 
     def _start_locked(self):
@@ -139,8 +131,6 @@ class TerminalReceiptPersistence:
                 return "done"
             if not self._eligible(header["capability_name"]):
                 return "excluded"
-            if not header["ownership_supported"]:
-                return self._blocked_result(task_id, "task_receipt_unsupported")
             prepared = self._prepared
             if prepared is not None and (prepared.task_id, prepared.source_id, prepared.revision) != (
                     task_id, header["source_id"], header["revision"]):
@@ -317,13 +307,10 @@ class TerminalReceiptPersistence:
                 self._cv.wait(min(0.25, max(0.001, self._next_scan - now)))
 
     def status(self):
-        try:
-            _, generation, retained = self.source.receipt_source_status() if self._supported else (None, None, None)
-        except Exception:  # noqa: BLE001 - 健康读取不因源丢失抛错或猜测完整。
-            generation, retained = None, None
+        _, generation, retained = self.source.receipt_source_status()
         with self._cv:
             pending = len(self._mailbox) + bool(self._in_flight or self._retry_task) + len(self._page)
-            coverage = (self._supported and generation == self._covered_generation and not self._scan_required
+            coverage = (generation == self._covered_generation and not self._scan_required
                         and not pending and not self._source_gap and not self._retry_at)
             persisted = coverage and self._blocked == 0
             prepared = self._prepared
@@ -357,7 +344,7 @@ class TerminalReceiptPersistence:
         with self._cv:
             self._source_fenced = self._source_fenced or source_fenced
             satisfied = before["owner_closed"] and before["persistence_complete_at_observed_fence"]
-            if self._supported and not satisfied:
+            if not satisfied:
                 self._close_requested = True
                 if not self._owner_closed or self._restarts < 1:
                     self._scan_required = True

@@ -64,7 +64,8 @@ def categorize_gateway_error(error_code: str, http_status: int) -> str:
         return "authorization"
     if normalized in {"invalid_params", "validation_error", "not_found", "artifact_not_found"} or http_status == 422:
         return "validation"
-    if normalized in {"capability_not_registered", "capability_not_supported", "resource_conflict", "execution_failed"}:
+    if normalized in {"capability_not_registered", "capability_not_supported", "resource_conflict", "execution_failed",
+                      "memory_artifact_cleanup_incomplete"}:
         return "capability"
     if normalized == "timeout":
         return "timeout"

@@ -29,8 +29,6 @@ TOKEN = '_memory_business_token'
 INDEX_META = '_memory_index'
 
 
-class DerivedCacheCapabilityError(RuntimeError):
-    """A legacy cache cannot promise transactional original-row preservation."""
 
 
 
@@ -53,7 +51,7 @@ class PreparedSource:
 
 
 class DurableMemoryIndex:
-    """One source owner; derived stores may be shared or separately injected."""
+    """结构记录与派生向量共用同一存储事务。"""
 
     def __init__(self, service):
         self.service = service
@@ -102,13 +100,6 @@ class DurableMemoryIndex:
                                       ('binding_json', "TEXT NOT NULL DEFAULT '{}'")):
                 if name not in existing:
                     tx.execute('ALTER TABLE memory_index_publications ADD COLUMN ' + name + ' ' + declaration)
-            tx.execute('''CREATE TABLE IF NOT EXISTS memory_index_external_legacy_archive (
-                point_id TEXT NOT NULL, vector_name TEXT NOT NULL, payload_json TEXT NOT NULL,
-                model_name TEXT, dimension INTEGER, dtype TEXT, shape_json TEXT, vector_payload BLOB,
-                PRIMARY KEY(point_id,vector_name))''')
-            tx.execute('''CREATE TABLE IF NOT EXISTS memory_index_cache_cleanup (
-                point_id TEXT NOT NULL, record_incarnation TEXT NOT NULL, error_category TEXT,
-                PRIMARY KEY(point_id,record_incarnation))''')
             tx.execute('''CREATE TABLE IF NOT EXISTS memory_index_reconciliation (
                 library_name TEXT NOT NULL, source_kind TEXT NOT NULL, cursor TEXT NOT NULL,
                 completed INTEGER NOT NULL DEFAULT 0,
@@ -453,7 +444,6 @@ class DurableMemoryIndex:
                     tx.execute('DELETE FROM memory_index_publications WHERE internal_id=?', (row['internal_id'],))
                 tx.execute('DELETE FROM memory_index_dependencies WHERE source_kind=? AND external_id=?', (kind, point_id))
                 self._delete_derived(tx, point_id, row['record_incarnation'] if row else '')
-                tx.execute('DELETE FROM memory_index_external_legacy_archive WHERE point_id=?', (point_id,))
                 tx.after_commit(lambda point_id=point_id: self.service._remove_index_record(kind, point_id))
             yield tx
             for prepared in dependents:
@@ -463,14 +453,9 @@ class DurableMemoryIndex:
             tx.after_commit(self.wake.set)
 
     def _delete_derived(self, tx, point_id, incarnation):
-        store = self.service._vector_store
-        if getattr(store, 'storage', None) is self.storage:
-            store.delete_points([point_id])
-            if tx.execute("SELECT 1 FROM sqlite_master WHERE name='memory_index_legacy_archive'").fetchone():
-                tx.execute('DELETE FROM memory_index_legacy_archive WHERE point_id=?', (point_id,))
-        else:
-            tx.execute('INSERT OR IGNORE INTO memory_index_cache_cleanup VALUES (?,?,NULL)', (point_id, incarnation))
-            tx.after_commit(self.cleanup_cache_page)
+        self.service._vector_store.delete_points([point_id])
+        if tx.execute("SELECT 1 FROM sqlite_master WHERE name='memory_index_legacy_archive'").fetchone():
+            tx.execute('DELETE FROM memory_index_legacy_archive WHERE point_id=?', (point_id,))
 
     def ensure(self, kind, record):
         """Adopt/reconcile a source without rewriting it or advancing business CAS."""
@@ -600,24 +585,17 @@ class DurableMemoryIndex:
             tx.execute('INSERT OR IGNORE INTO memory_index_legacy_archive VALUES (?,?,?,?,?,?,?,?,?,?)',
                        (point_id, '', None, None, None, None, row['payload_json'], row['updated_at'], canonical(dict(row)), None))
 
-    def _write_modality(self, store, tx, row, projection, claim, named, provenance):
+    def _write_modality(self, tx, row, projection, claim, named, provenance):
         from services.memory.vector_store import _encode_vector
         # SQLite publication stays SQL-only and preserves other named modalities.
         point_id = row['external_id']
-        if tx is not None:
-            self._archive(tx, point_id)
-            stored = tx.execute('SELECT payload_json FROM memory_vector_points WHERE point_id=?', (point_id,)).fetchone()
-            old_payload = json.loads(stored[0]) if stored else {}
-        else:
-            existing = store.get_point(point_id)
-            old_payload = existing.payload if existing else {}
+        self._archive(tx, point_id)
+        stored = tx.execute('SELECT payload_json FROM memory_vector_points WHERE point_id=?', (point_id,)).fetchone()
+        old_payload = json.loads(stored[0]) if stored else {}
         metadata = dict(old_payload.get(INDEX_META, {}))
         old_vectors = dict(metadata.get('vectors', {}))
         legacy_inputs = dict(metadata.get('legacy_inputs', {}))
-        if tx is not None:
-            old_names = [r[0] for r in tx.execute('SELECT vector_name FROM memory_named_vectors WHERE point_id=?', (point_id,))]
-        else:
-            old_names = list(existing.vectors) if existing else []
+        old_names = [r[0] for r in tx.execute('SELECT vector_name FROM memory_named_vectors WHERE point_id=?', (point_id,))]
         for old_name in old_names:
             if old_name not in old_vectors and old_name not in legacy_inputs:
                 legacy_inputs[old_name] = {key: old_payload[key] for key in ('retrieval_text', 'artifact_ids', 'memory_library_name', 'map_name') if key in old_payload}
@@ -631,18 +609,6 @@ class DurableMemoryIndex:
                          'vectors': old_vectors, 'business_revision': row['business_revision']})
         payload = dict(projection['payload'])
         payload[INDEX_META] = metadata
-        if tx is None:
-            has_legacy = existing is not None and (INDEX_META not in existing.payload or any(
-                name not in existing.payload.get(INDEX_META, {}).get('vectors', {}) for name in existing.vectors))
-            archive_upsert = getattr(store, 'archive_and_upsert_point', None)
-            if has_legacy and not callable(archive_upsert):
-                raise DerivedCacheCapabilityError('legacy_archive_capability_required')
-            vectors = dict(existing.vectors) if existing else {}
-            vectors[named.vector_name] = named
-            writer = archive_upsert if has_legacy else store.upsert_point
-            writer(point_id=point_id, collection_name=projection['collection'],
-                   record_kind=projection['record_kind'], payload=payload, vectors=vectors)
-            return
         # Upsert the payload columns without full-replacement vector semantics.
         columns = ('point_id','collection_name','record_kind','map_name','localization_session_id','linked_location_id',
                    'camera_id','topo_node_id','semantic_region_id','anchor_id','instance_type','movability',
@@ -678,9 +644,6 @@ class DurableMemoryIndex:
         provenance = {**self.version_provenance(claim), **actual, 'publication_id': publication_id,
                       'vector_revision': publication_id, 'input_versions': versions,
                       'model_name': named.model_name, 'dimension': named.dimension}
-        store = self.service._vector_store
-        owner = getattr(store, 'storage', None)
-        revision_owned = owner is not None
         def attest(tx, guarded_claim):
             tx.execute('''INSERT INTO memory_index_publications
                 (internal_id,vector_name,publication_id,valid_generation,fingerprint,provenance_json,vector_revision,route,input_versions_json,binding_json)
@@ -689,33 +652,12 @@ class DurableMemoryIndex:
                 valid_generation=excluded.valid_generation,fingerprint='',provenance_json=excluded.provenance_json,
                 vector_revision=excluded.vector_revision,route=excluded.route,input_versions_json=excluded.input_versions_json,binding_json=excluded.binding_json''',
                 (claim.receipt.version.key.point_id, named.vector_name, publication_id, claim.receipt.version.revision,
-                 '', canonical(provenance), publication_id if revision_owned else None, route, canonical(versions), canonical(provenance['binding'])))
-        if owner is self.storage:
-            def write(tx, guarded_claim):
-                row = self._state(tx, claim.receipt.version.key.source_kind,
-                                  self.source_for_claim(guarded_claim)[0]['external_id'])
-                projection = json.loads(row['projection_json'])
-                self._write_modality(store, tx, row, projection, guarded_claim, named, provenance)
-                attest(tx, guarded_claim)
-            return self.outbox.publish_partial(claim, publish=write).published
-        # Two-phase adapter: cache commit first, authoritative CAS second. Reads
-        # validate source/input identity even in the interval between these steps.
-        snapshot = self.source_for_claim(claim)
-        if snapshot is None:
-            return False
-        row, projection = snapshot
-        if owner is not None:
-            with owner.transaction() as tx:
-                self._write_modality(store, tx, row, projection, claim, named, provenance)
-        else:
-            self._write_modality(store, None, row, projection, claim, named, provenance)
-        published = self.outbox.publish_partial(claim, publish=attest).published
-        if not published and self.source_for_claim(claim) is None:
-            with self.storage.transaction() as tx:
-                tx.execute('INSERT OR IGNORE INTO memory_index_cache_cleanup VALUES (?,?,NULL)',
-                           (row['external_id'], claim.receipt.version.record_incarnation))
-                tx.after_commit(self.cleanup_cache_page)
-        return published
+                 '', canonical(provenance), publication_id, route, canonical(versions), canonical(provenance['binding'])))
+        def write(tx, guarded_claim):
+            row, projection = self.source_for_claim(guarded_claim)
+            self._write_modality(tx, row, projection, guarded_claim, named, provenance)
+            attest(tx, guarded_claim)
+        return self.outbox.publish_partial(claim, publish=write).published
 
     @staticmethod
     def _service_point(point_row, vector_rows):
@@ -754,21 +696,6 @@ class DurableMemoryIndex:
         return VectorPoint(point_row['point_id'], point_row['collection_name'], point_row['record_kind'],
                            payload, vectors, point_row['updated_at'])
 
-    @staticmethod
-    def _owned_external_point(point):
-        if point is None:
-            return None
-        import copy
-        import numpy as np
-        from services.memory.vector_store import VectorPoint, NamedVector
-        vectors = {}
-        for name, named in point.vectors.items():
-            owned = np.array(named.vector, copy=True)
-            owned.setflags(write=False)
-            vectors[name] = NamedVector(name, named.model_name, named.dimension, owned,
-                                        getattr(named, 'storage_revision', None))
-        return VectorPoint(point.point_id, point.collection_name, point.record_kind,
-                           copy.deepcopy(point.payload), vectors, point.updated_at)
 
     @staticmethod
     def _native_rows(owner, point_ids):
@@ -789,14 +716,9 @@ class DurableMemoryIndex:
             return {}
         row, projection = snapshot
         binding = self.service._index_model_binding()
-        store = self.service._vector_store
-        owner = getattr(store, 'storage', None)
-        if owner is not None:
-            points, vectors = self._native_rows(owner, [row['external_id']])
-            raw = points.get(row['external_id'])
-            point = self._service_point(raw, vectors.get(row['external_id'], [])) if raw else None
-        else:
-            point = self._owned_external_point(store.get_point(row['external_id']))
+        points, vectors = self._native_rows(self.storage, [row['external_id']])
+        raw = points.get(row['external_id'])
+        point = self._service_point(raw, vectors.get(row['external_id'], [])) if raw else None
         if point is None:
             return {}
         metadata = point.payload.get(INDEX_META, {}).get('vectors', {})
@@ -820,7 +742,6 @@ class DurableMemoryIndex:
                 WHERE i.library_name=? GROUP BY s.status,s.error_category''', (self.active_library,)).fetchall()
             return {'work': [dict(row) for row in rows], 'activation_generation': self.activation_generation,
                     'active_library': self.active_library, 'durable': True,
-                    'cache_cleanup_pending': tx.execute('SELECT count(*) FROM memory_index_cache_cleanup').fetchone()[0],
                     'reconciliation_pending': tx.execute('SELECT count(*) FROM memory_index_reconciliation WHERE library_name=? AND completed=0',
                                                          (self.active_library,)).fetchone()[0]}
 
@@ -833,7 +754,6 @@ class DurableMemoryIndex:
         consumes; validation and aggregate readiness counts are always identical.
         """
         from services.memory.vector_store import VectorPoint
-        store = self.service._vector_store
         results = []
         counts = {'validated_current': 0, 'legacy_unverified': 0,
                   'known_stale_or_incompatible': 0, 'missing': 0, 'pending': 0, 'failed': 0, 'disabled': 0, 'not_applicable': 0, 'unavailable': 0}
@@ -844,7 +764,6 @@ class DurableMemoryIndex:
             grouped.setdefault(kind, {})[getattr(live, SOURCES[kind][1])] = live
         source_rows, acknowledgements = {}, {}
         point_ids = list({point_id for group in grouped.values() for point_id in group})
-        native_points = native_vectors = None
         with self.storage.read_snapshot() as tx:
             for kind, by_id in grouped.items():
                 table, column, _ = SOURCES[kind]
@@ -871,27 +790,7 @@ class DurableMemoryIndex:
                                   'FROM memory_index_publications WHERE internal_id IN (' + ','.join('?' for _ in batch) + ')', batch).fetchall()
                 for row in rows:
                     acknowledgements.setdefault(row['internal_id'], {})[row['vector_name']] = row
-            if getattr(store, 'storage', None) is self.storage:
-                native_points, native_vectors = self._native_rows(self.storage, point_ids)
-        points = None
-        cache_errors = {}
-        if native_points is None and getattr(store, 'storage', None) is not None:
-            native_points, native_vectors = self._native_rows(store.storage, point_ids)
-        if native_points is None:
-            # Separately injected I/O never holds the authoritative source lock.
-            points = {}
-            try:
-                if hasattr(store, 'get_points_batch'):
-                    points = store.get_points_batch(point_ids)
-                else:
-                    raise NotImplementedError()
-            except Exception:
-                for point_id in point_ids:
-                    try:
-                        points[point_id] = store.get_point(point_id)
-                    except Exception as exc:
-                        points[point_id] = None
-                        cache_errors[point_id] = type(exc).__name__
+            native_points, native_vectors = self._native_rows(self.storage, point_ids)
         binding = self.service._index_model_binding()
         repairs = []
         for kind, live in visible:
@@ -933,20 +832,14 @@ class DurableMemoryIndex:
                 inputs_current = state is not None
             if self.repository._resolve_record_library_name(source) != self.active_library or not projection['eligible']:
                 continue
-            if native_points is not None:
-                point_row = native_points.pop(point_id, None)
-                point = self._service_point(point_row, native_vectors.pop(point_id, [])) if point_row is not None else None
-            else:
-                point = self._owned_external_point(points.get(point_id))
+            point_row = native_points.pop(point_id, None)
+            point = self._service_point(point_row, native_vectors.pop(point_id, [])) if point_row is not None else None
             if record is None:
                 # Live-only observations have no authoritative persisted source;
                 # even compatible-looking old cache rows cannot supply scores.
                 point = None
             valid, evidence = {}, {}
             unverified = set()
-            if point_id in cache_errors:
-                counts['cache_read_failures'] = counts.get('cache_read_failures', 0) + 1
-                evidence['_cache'] = {'status': 'unavailable', 'reason': 'derived_cache_read_failed', 'error_category': cache_errors[point_id]}
             if point is not None:
                 stored_evidence = point.payload.get(INDEX_META, {}).get('vectors', {})
                 for name, named in point.vectors.items():
@@ -961,10 +854,20 @@ class DurableMemoryIndex:
                         route = proof.get('route')
                         route_current = inputs_current and (not live_projection or self.route_inputs_equal(persisted_projection, projection, route))
                         binding_status = self.route_binding_status(proof.get('binding', projection['binding']), binding, route)
-                        versioned = publication_current and self._ack_matches(proof, ack, current, named)
-                        if (not publication_current or not route_current or binding_status == 'incompatible'
-                                or (publication_current and not versioned and self._ack_conflicts(proof, ack, named))):
+                        complete_ack = (publication_current and proof.get('proof_version') == 2
+                            and bool(ack['vector_revision']) and bool(ack['route'])
+                            and ack['input_versions_json'] not in ('', '{}')
+                            and ack['binding_json'] not in ('', '{}'))
+                        # 只复用本次捕获行的判断；缺旧字段时仍检查已有的明确冲突。
+                        conflict = self._ack_conflicts(proof, ack, named) if complete_ack else None
+                        versioned = complete_ack and not conflict
+                        if not publication_current or not route_current or binding_status == 'incompatible':
                             reason = 'input_or_incarnation_changed'
+                        elif not versioned:
+                            if conflict is None:
+                                conflict = self._ack_conflicts(proof, ack, named)
+                            if conflict:
+                                reason = 'input_or_incarnation_changed'
                         if reason is None and binding_status == 'legacy':
                             reason = 'provider_version_unverified'
                         disposition = 'validated_current' if versioned and binding_status == 'current' else 'legacy_unverified'
@@ -1059,9 +962,6 @@ class DurableMemoryIndex:
         return True
 
     def _refresh_shared_payload(self, tx, prepared, revision):
-        store = self.service._vector_store
-        if getattr(store, 'storage', None) is not self.storage:
-            return
         row = tx.execute('SELECT payload_json FROM memory_vector_points WHERE point_id=?', (prepared.point_id,)).fetchone()
         if row is None:
             return
@@ -1161,35 +1061,6 @@ class DurableMemoryIndex:
             tx.execute('UPDATE memory_index_publications SET valid_generation=? WHERE internal_id=? AND vector_name=?',
                        (receipt.version.revision, internal_id, row['vector_name']))
 
-    def cleanup_cache_page(self, limit=16):
-        store = self.service._vector_store
-        if getattr(store, 'storage', None) is self.storage:
-            return
-        with self.storage.read_snapshot() as tx:
-            pending = tx.execute('SELECT point_id,record_incarnation FROM memory_index_cache_cleanup LIMIT ?', (limit,)).fetchall()
-        for point_id, incarnation in pending:
-            try:
-                owner = getattr(store, 'storage', None)
-                if owner is not None:
-                    with owner.transaction() as tx:
-                        row = tx.execute('SELECT payload_json FROM memory_vector_points WHERE point_id=?', (point_id,)).fetchone()
-                        payload = json.loads(row[0]) if row else {}
-                        proofs = payload.get(INDEX_META, {}).get('vectors', {})
-                        if not proofs or all(proof.get('record_incarnation') == incarnation for proof in proofs.values()):
-                            store.delete_points([point_id])
-                        if tx.execute("SELECT 1 FROM sqlite_master WHERE name='memory_index_legacy_archive'").fetchone():
-                            tx.execute('DELETE FROM memory_index_legacy_archive WHERE point_id=?', (point_id,))
-                else:
-                    point = store.get_point(point_id)
-                    proofs = point.payload.get(INDEX_META, {}).get('vectors', {}) if point else {}
-                    if not proofs or all(proof.get('record_incarnation') == incarnation for proof in proofs.values()):
-                        store.delete_points([point_id])
-                with self.storage.transaction() as tx:
-                    tx.execute('DELETE FROM memory_index_cache_cleanup WHERE point_id=? AND record_incarnation=?', (point_id, incarnation))
-            except Exception as exc:
-                with self.storage.transaction() as tx:
-                    tx.execute('UPDATE memory_index_cache_cleanup SET error_category=? WHERE point_id=? AND record_incarnation=?',
-                               (type(exc).__name__, point_id, incarnation))
 
     def retire_library(self, library):
         """Called in the source-deletion transaction; never reuses incarnation."""
@@ -1237,7 +1108,7 @@ class DurableMemoryIndex:
 
 
 class MemoryPayloadMatcher:
-    """Stateless filter semantics shared with SQLite, including injected stores."""
+    """复用向量存储的无状态筛选语义。"""
     from services.memory.vector_store import SQLiteNamedVectorStore as _Store
     matches = _Store._payload_matches
     _extract_timestamp = _Store._extract_timestamp

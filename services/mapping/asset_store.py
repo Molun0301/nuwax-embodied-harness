@@ -567,7 +567,7 @@ class MapAssetBundleRepository:
             repository_stat = os.fstat(tree.root.descriptor)
             validated_bundle = bundle.model_copy(
                 update={"manifest_sha256": manifest_sha256},
-                deep=True,
+                deep=False,
             )
             repository_fingerprint = _validated_snapshot_fingerprint(
                 tree,
@@ -583,27 +583,6 @@ class MapAssetBundleRepository:
             repository_fingerprint=repository_fingerprint,
             repository_observations=repository_observations,
         )
-
-    def validate_map_asset_bundle_snapshot_identity(
-        self,
-        map_name: str,
-        snapshot: ValidatedMapAssetBundleSnapshot,
-    ) -> None:
-        """从可信 current 命名项重建快照，并拒绝解析期间的任何变化。"""
-
-        assigned = snapshot.bundle.identity_schema_version == 2
-        refreshed = self.get_validated_map_asset_bundle_snapshot(map_name,
-            expected_manifest_sha256=None if assigned else str(snapshot.bundle.manifest_sha256 or ""),
-            expected_asset_identity=snapshot.bundle.asset_identity if assigned else None)
-        if assigned:
-            same = (refreshed is not None and refreshed.repository_device == snapshot.repository_device
-                and refreshed.repository_inode == snapshot.repository_inode
-                and refreshed.repository_observations == snapshot.repository_observations
-                and refreshed.georeference_bytes == snapshot.georeference_bytes)
-        else:
-            same = refreshed is not None and refreshed == snapshot
-        if not same:
-            raise MapAssetBundleValidationError("finalized 地图 repository snapshot 已被替换。")
 
     def map_asset_bundle_snapshot_is_current(self, map_name, snapshot) -> bool:
         """Check an admitted snapshot using only bounded inode metadata."""
@@ -665,7 +644,7 @@ class MapAssetBundleRepository:
                         os.fsync(candidate_tree.parent_descriptor)
                         committed_bundle = validated_bundle.model_copy(
                             update={"manifest_sha256": manifest_sha256},
-                            deep=True,
+                            deep=False,
                         )
                         self._inject_fault("after_rename")
             if resolve_existing:
@@ -1338,7 +1317,7 @@ class MapAssetBundleRepository:
                         self._inject_fault("before_planar_directory_fsync")
                         os.fsync(candidate_tree.parent_descriptor)
                         self._inject_fault("after_planar_exchange")
-                        committed = validated.model_copy(update={"manifest_sha256": manifest_sha}, deep=True)
+                        committed = validated.model_copy(update={"manifest_sha256": manifest_sha}, deep=False)
                     self._discard_owned_staging(map_name, staging, (old_stat.st_dev, old_stat.st_ino))
                     journal.unlink()
                     os.fsync(candidate_tree.parent_descriptor)
@@ -1400,7 +1379,7 @@ class MapAssetBundleRepository:
                         "geometry_asset_root": str(PurePosixPath(geometry_relative).parent),
                     }
                 },
-                deep=True,
+                deep=False,
             )
             _atomic_write_relative(
                 staging_dir,
@@ -1414,7 +1393,7 @@ class MapAssetBundleRepository:
                 "georeference": georeference,
                 "manifest_sha256": None,
             },
-            deep=True,
+            deep=False,
         )
         _atomic_write_relative(
             staging_dir,
@@ -1485,7 +1464,7 @@ class MapAssetBundleRepository:
         )
         if type(bundle) is _AssignedActivationRead or bundle.identity_schema_version == 2:
             return bundle
-        return bundle.model_copy(update={"manifest_sha256": manifest_sha256}, deep=True)
+        return bundle.model_copy(update={"manifest_sha256": manifest_sha256}, deep=False)
 
     def _validate_directory(
         self,
@@ -1613,7 +1592,7 @@ class MapAssetBundleRepository:
                 manifested_paths=set(expected_files),
                 require_bound_digest=True,
             )
-            bundle = bundle.model_copy(update={"georeference": georeference}, deep=True)
+            bundle = bundle.model_copy(update={"georeference": georeference}, deep=False)
             validated_paths.add(georeference.relative_path)
         elif any(path == "georeference" or path.startswith("georeference/") for path in expected_files):
             raise MapAssetBundleValidationError("无地理锚点的资产不得包含未绑定的地理参考文件。")
@@ -1659,7 +1638,7 @@ class MapAssetBundleRepository:
             raise MapAssetBundleValidationError("地理参考合同非法。") from exc
         if contract.model_dump(mode="json") != binding.contract.model_dump(mode="json"):
             raise MapAssetBundleValidationError("地理参考原文与资产包中的类型化合同不一致。")
-        return binding.model_copy(update={"raw_sha256": raw_sha256}, deep=True)
+        return binding.model_copy(update={"raw_sha256": raw_sha256}, deep=False)
 
     def _validate_geometry_assets(
         self,

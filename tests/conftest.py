@@ -14,6 +14,7 @@ import threading
 from copy import deepcopy
 
 import grpc
+import pytest
 
 from contracts.map_relocalization import current_assigned_relocalization_policy
 from services.geometry import geometry_runtime_provider as fixture_provider
@@ -241,7 +242,8 @@ def isolated_gateway_config(tmp_path):
     return config
 
 
-def create_isolated_gateway(directory, *, event_bus=None, task_manager=None, robot_id="offline-robot"):
+def create_isolated_gateway(directory, *, event_bus=None, task_manager=None, robot_id="offline-robot",
+                            register_default_capabilities=False):
     """真实构造隔离网关；调用方必须在finally或清理钩子中执行stop。"""
     from dataclasses import replace
     from drivers.customrobot import create_customrobot_assembly
@@ -251,17 +253,32 @@ def create_isolated_gateway(directory, *, event_bus=None, task_manager=None, rob
     robot = create_customrobot_assembly(config)
     robot.defaults = replace(robot.defaults, parameters={**robot.defaults.parameters, "robot_id": robot_id})
     return GatewayRuntime(config=config, robot=robot, event_bus=event_bus, task_manager=task_manager,
-                          register_default_capabilities=False)
+                          register_default_capabilities=register_default_capabilities)
 
 
-def identity_call_store(path, *, identity_name="scope", gateway_instance_id="owner", fresh_layout="split"):
+@pytest.fixture
+def gateway_runtime_factory(tmp_path, monkeypatch):
+    """先撤销外部边界替身，再由真实网关拥有方关闭其资源。"""
+    runtimes = []
+
+    def create(**kwargs):
+        runtime = create_isolated_gateway(tmp_path / f"gateway-{len(runtimes)}", **kwargs)
+        runtimes.append(runtime)
+        return runtime
+
+    yield create
+    monkeypatch.undo()
+    for runtime in reversed(runtimes):
+        runtime.stop()
+
+
+def identity_call_store(path, *, identity_name="scope", gateway_instance_id="owner"):
     """用真实机器人身份构造测试账本，identity_name不是原始数据库scope。"""
     from core.agent_call_store import AgentCallStore
 
     path = Path(path)
     return AgentCallStore(path, robot_identity={"robot_model": "offline", "robot_id": identity_name},
-                          artifact_dir=path.parent / "artifacts", gateway_instance_id=gateway_instance_id,
-                          fresh_layout=fresh_layout)
+                          artifact_dir=path.parent / "artifacts", gateway_instance_id=gateway_instance_id)
 
 
 def insert_historical_scope_binding(path, *, legacy_scope, owner_scope):
@@ -271,3 +288,17 @@ def insert_historical_scope_binding(path, *, legacy_scope, owner_scope):
     with sqlite3.connect(path) as connection:
         connection.execute("INSERT OR REPLACE INTO agent_scope_bindings(scope,owner_scope) VALUES (?,?)",
                            (legacy_scope, owner_scope))
+
+
+def create_navigation_service(directory):
+    """离线领域测试使用完整构造及隔离禁行区目录，不连接设备。"""
+    from core import StateStore
+    from services.localization.service import LocalizationService
+    from services.mapping.service import MappingService
+    from services.navigation.forbidden_zones import ForbiddenZoneStore
+    from services.navigation.service import NavigationService
+    state = StateStore()
+    return NavigationService(provider_owner=None,
+        localization_service=LocalizationService(provider_owner=None, state_store=state),
+        mapping_service=MappingService(provider_owner=None, state_store=state), state_store=state,
+        forbidden_zone_store=ForbiddenZoneStore(Path(directory) / "navigation-zones.json"))

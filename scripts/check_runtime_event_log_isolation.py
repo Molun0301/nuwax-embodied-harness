@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -22,6 +23,7 @@ from gateways import feedback_messages
 from gateways import runtime as runtime_module
 from gateways.runtime import GatewayRuntime
 from gateways.runtime_event_log import RuntimeEventLog
+from tests.conftest import create_isolated_gateway
 
 
 class GateHandler(logging.Handler):
@@ -42,6 +44,9 @@ class GateHandler(logging.Handler):
 class EventLogIsolation(unittest.TestCase):
     def setUp(self):
         self.owners, self.buses, self.streams, self.gates, self.workers = [], [], [], [], []
+        self.temp = tempfile.TemporaryDirectory(prefix="neh-event-log-")
+        self.addCleanup(self.temp.cleanup)
+        self.runtime_count = 0
 
     def tearDown(self):
         for gate in self.gates:
@@ -103,18 +108,15 @@ class EventLogIsolation(unittest.TestCase):
                             cursor=index, task_id=task_id, payload=payload or {"index": index})
 
     def runtime(self, **owner_options):
-        runtime = object.__new__(GatewayRuntime)
-        runtime.event_bus = self.bus()
-        runtime.stream_bus = StreamBus()
-        self.streams.append(runtime.stream_bus)
-        runtime.capability_registry = CapabilityRegistry()
-        runtime._runtime_event_log_limiter = LogRateLimiter()
+        runtime = create_isolated_gateway(Path(self.temp.name) / str(self.runtime_count),
+                                          event_bus=self.bus(), register_default_capabilities=True)
+        self.runtime_count += 1
+        self.addCleanup(runtime.stop)
+        self.assertTrue(runtime._runtime_event_log.close())
         runtime._runtime_event_log = self.owner(runtime._write_runtime_event_log,
                                               gap_writer=runtime._write_runtime_event_log_gap,
                                               **owner_options)
-        runtime._event_log_subscription_id = runtime.event_bus.subscribe(runtime._log_runtime_event)
-        runtime._owns_event_bus = runtime._owns_stream_bus = True
-        runtime._dispatch_shutdown_complete = False
+        runtime._owns_event_bus = True
         return runtime
 
     def blocked_owner(self, **kwargs):
@@ -333,9 +335,6 @@ class EventLogIsolation(unittest.TestCase):
         self.gates.append(sink.resume)
         logger = logging.Logger("test.feedback", logging.INFO)  # noqa: LOG001 - 独立测试日志。
         logger.addHandler(sink)
-        runtime._log_stream_handler = StreamBusLogHandler(runtime.stream_bus)
-        logging.getLogger().addHandler(runtime._log_stream_handler)
-        self.addCleanup(logging.getLogger().removeHandler, runtime._log_stream_handler)
         real_close = runtime._runtime_event_log.close
         with patch.object(runtime_module, "FEEDBACK_LOGGER", logger), \
                 patch.object(runtime_module, "RUNTIME_LOGGER", logging.Logger("quiet", logging.CRITICAL)):  # noqa: LOG001 - 独立测试日志。
@@ -406,7 +405,6 @@ class EventLogIsolation(unittest.TestCase):
 
     def test_status_exposes_log_gap_to_runtime_reader(self):
         runtime = self.runtime(max_item_bytes=1)
-        runtime.mapping_service = SimpleNamespace(notification_status=lambda: {})
         runtime.event_bus.publish(self.event())
         status = runtime.get_live_map_stream_status()["event_log"]
         self.assertTrue(status["degraded"])
@@ -419,11 +417,6 @@ class EventLogIsolation(unittest.TestCase):
                 owner.close(value)
         self.assertTrue(owner.status()["accepting"])
 
-    def test_uninitialized_status_does_not_invent_zero_success_counters(self):
-        runtime = object.__new__(GatewayRuntime)
-        self.assertEqual(runtime.get_event_log_status(),
-                         {"state": "not_started", "accepting": False, "closed": False})
-
     def test_closed_projection_failure_cannot_enqueue_unserviceable_gap(self):
         owner = self.owner(lambda e, f: None)
         self.assertTrue(owner.close())
@@ -432,22 +425,28 @@ class EventLogIsolation(unittest.TestCase):
         self.assertEqual(owner.status()["closed_rejected"], 1)
 
     def test_stop_retries_incomplete_dispatch_close_without_changing_memory_close(self):
-        runtime = object.__new__(GatewayRuntime)
+        runtime = self.runtime()
         runtime._lifecycle_lock = threading.RLock()
         runtime._started, runtime._closed = False, True
         runtime._dispatch_shutdown_complete = False
         runtime.mapping_recorder = None
         actions = []
-        runtime.task_manager = SimpleNamespace(shutdown=lambda **kw: actions.append("tasks"))
+        task_patch = patch.object(runtime.task_manager, "shutdown", side_effect=lambda **kw: actions.append("tasks"))
+        task_patch.start()
+        self.addCleanup(task_patch.stop)
         runtime._join_exploration_finalizers = lambda: actions.append("finalizers")
-        runtime.memory_service = SimpleNamespace(close=lambda: actions.append("memory") or True)
+        memory_patch = patch.object(runtime.memory_service, "close", side_effect=lambda: actions.append("memory") or True)
+        memory_patch.start()
+        self.addCleanup(memory_patch.stop)
         results = [False, True]
         def close_dispatch():
             actions.append("dispatch")
             result = results.pop(0)
             runtime._dispatch_shutdown_complete = result
             return result
-        runtime._close_dispatch_resources = close_dispatch
+        close_patch = patch.object(runtime, "_close_dispatch_resources", side_effect=close_dispatch)
+        close_patch.start()
+        self.addCleanup(close_patch.stop)
         with self.assertRaisesRegex(RuntimeError, "事件分发或日志输出尚未关闭"):
             runtime.stop()
         self.assertFalse(runtime._dispatch_shutdown_complete)

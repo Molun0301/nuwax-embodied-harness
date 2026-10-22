@@ -59,10 +59,7 @@ _RELOCALIZATION_SESSION_RESERVED_KEYS = (
 def _serialized_map_activation(method):
     @wraps(method)
     def wrapped(self, *args, **kwargs):
-        guard = getattr(self._repository, "map_activation_guard", None)
-        if not callable(guard):
-            return method(self, *args, **kwargs)
-        with guard():
+        with self._repository.map_activation_guard():
             return method(self, *args, **kwargs)
 
     return wrapped
@@ -71,14 +68,8 @@ def _serialized_map_activation(method):
 def _serialized_map_activation_execution(method):
     @wraps(method)
     def wrapped(self, *args, **kwargs):
-        guard = getattr(self._repository, "map_activation_executor_guard", None)
-        if not callable(guard):
-            return method(self, *args, **kwargs)
-        with guard():
-            state = getattr(self, "_map_activation_execution_state", None)
-            if state is None:
-                state = threading.local()
-                self._map_activation_execution_state = state
+        with self._repository.map_activation_executor_guard():
+            state = self._map_activation_execution_state
             depth = int(getattr(state, "depth", 0) or 0)
             state.depth = depth + 1
             try:
@@ -176,7 +167,6 @@ class MapWorkspaceService:
 
         resolved = FinalizedAssetAuthorityResolver(
             asset_repository=self._asset_repository,
-            catalog_repository=self._repository,
             runtime_authority_provider=provider.get_mapping_cloud_authority,
         ).resolve()
         return provider.submit_mapping_cloud_goal(
@@ -249,7 +239,7 @@ class MapWorkspaceService:
                         "memory_library_created": bool(library_result.get("created", False)),
                     }
                 },
-                deep=True,
+                deep=False,
             )
         self._save_asset(asset)
         self._publish_event(
@@ -301,9 +291,8 @@ class MapWorkspaceService:
             return None
         from skills.assigned_map_save import catalog_owner, reconcile_assigned_current
         captured = catalog_owner(self, asset)
-        runtime = getattr(self, "_geometry_runtime", None)
-        capture = getattr(runtime, "capture_assigned_fine_import_origin", None)
-        origin = capture() if callable(capture) else None
+        runtime = self._geometry_runtime
+        origin = runtime.capture_assigned_fine_import_origin()
         loaded = self._asset_repository.import_legacy_cloud_bundle(map_name,
             catalog_created_at=asset.created_at.isoformat(), map_directory_owner=captured[:2],
             allow_ar1_source=origin is not None)
@@ -655,20 +644,14 @@ class MapWorkspaceService:
                                     "activation_phase": "active",
                                 },
                             },
-                            deep=True,
+                            deep=False,
                         ),
                         is_active=True,
                         refresh_localization=False,
                         completing_activation=True,
                     )
                 self._save_asset(synced_asset)
-            clear_exploration_context = getattr(
-                self._navigation_service,
-                "clear_latest_exploration_context",
-                None,
-            )
-            if callable(clear_exploration_context):
-                clear_exploration_context(reason="activate_map")
+            self._navigation_service.clear_latest_exploration_context(reason="activate_map")
             with self._allow_internal_activation_coherent_read(
                 activation_identity
             ):
@@ -900,9 +883,8 @@ class MapWorkspaceService:
                 and self._memory_service.get_active_library_name() == resolved_name):
             # 同名实时导航只需复核已绑定来源；不要再加载记忆历史和重挂工作区。
             snapshot = self._mapping_service.get_latest_snapshot()
-            reader = getattr(self._geometry_runtime, "get_authoritative_mapping_session_state", None)
-            if snapshot is not None and snapshot.map_name == resolved_name and callable(reader):
-                observed = reader()
+            if snapshot is not None and snapshot.map_name == resolved_name:
+                observed = self._geometry_runtime.get_authoritative_mapping_session_state()
                 source = snapshot.metadata or {}
                 try:
                     generation = int(observed.get("session_generation") or 0)
@@ -1231,10 +1213,9 @@ class MapWorkspaceService:
         self,
         activation_identity: Optional[Dict[str, object]],
     ):
-        state = getattr(self, "_map_activation_execution_state", None)
+        state = self._map_activation_execution_state
         if (
             activation_identity is None
-            or state is None
             or int(getattr(state, "depth", 0) or 0) <= 0
         ):
             yield
@@ -1247,11 +1228,8 @@ class MapWorkspaceService:
             state.coherent_read_identity = previous_identity
 
     def _read_map_activation(self) -> Optional[Dict[str, object]]:
-        reader = getattr(self._repository, "get_map_activation", None)
-        if not callable(reader):
-            return None
         try:
-            pending = reader()
+            pending = self._repository.get_map_activation()
         except Exception as exc:
             raise GatewayError(
                 "地图激活恢复日志损坏：%s" % exc,
@@ -1260,7 +1238,7 @@ class MapWorkspaceService:
                 jsonrpc_code=-32000,
             ) from exc
         resolved = dict(pending) if isinstance(pending, dict) else None
-        arm_error = getattr(self, "_map_activation_fence_arm_error", None)
+        arm_error = self._map_activation_fence_arm_error
         if (
             resolved is not None
             and resolved.get("phase") != "prepared"
@@ -1317,7 +1295,7 @@ class MapWorkspaceService:
             self._repository.save_map_asset(
                 candidate.model_copy(
                     update={"active": should_be_active},
-                    deep=True,
+                    deep=False,
                 )
             )
 
@@ -1372,7 +1350,7 @@ class MapWorkspaceService:
                             "activation_target_manifest_sha256": bundle.manifest_sha256,
                         },
                     },
-                    deep=True,
+                    deep=False,
                 )
                 try:
                     self._save_asset(recovering_asset)
@@ -2295,21 +2273,7 @@ class MapWorkspaceService:
             if outcome.session is None or outcome.workspace is None:
                 raise RuntimeError("重定位恢复缺少最终 session/workspace。")
             return outcome.session, outcome.workspace
-        runtime_descriptor_reader = getattr(
-            self._geometry_runtime,
-            "describe_backend",
-            None,
-        )
-        try:
-            runtime_descriptor = (
-                runtime_descriptor_reader()
-                if callable(runtime_descriptor_reader)
-                else {}
-            )
-        except Exception:
-            runtime_descriptor = {}
-        if not isinstance(runtime_descriptor, dict):
-            runtime_descriptor = {}
+        runtime_descriptor = self._geometry_runtime.describe_backend()
         runtime_map_name = str(
             runtime_descriptor.get("active_map_name") or ""
         ).strip()
@@ -2555,7 +2519,7 @@ class MapWorkspaceService:
                 if asset.updated_at.tzinfo is not None
                 else datetime.utcnow(),
             },
-            deep=True,
+            deep=False,
         )
         self._save_asset(cleared_asset)
         self._state_store.write(
@@ -2844,7 +2808,7 @@ class MapWorkspaceService:
                 if asset.updated_at.tzinfo is not None
                 else datetime.utcnow(),
             },
-            deep=True,
+            deep=False,
         )
         if pending_activation is None or completing_activation:
             self._save_asset(updated_asset)
@@ -2859,15 +2823,7 @@ class MapWorkspaceService:
         activate_map before navigating on a finalized map.
         """
 
-        diagnostics_reader = getattr(self._geometry_runtime, "get_live_mapping_diagnostics", None)
-        if not callable(diagnostics_reader):
-            return {}
-        try:
-            diagnostics = diagnostics_reader()
-        except Exception:
-            return {}
-        if not isinstance(diagnostics, dict):
-            return {}
+        diagnostics = self._geometry_runtime.get_live_mapping_diagnostics()
         readiness = diagnostics.get("mapping_readiness")
         if not isinstance(readiness, dict):
             readiness = {}
@@ -2880,15 +2836,7 @@ class MapWorkspaceService:
             geometry_process = processes.get("nuwax_geometry_runtime") or processes.get("nuwax-geometry-runtime")
             if isinstance(geometry_process, dict):
                 process_running = bool(geometry_process.get("running"))
-        geometry_stack_status: Dict[str, object] = {}
-        stack_reader = getattr(self._geometry_runtime, "get_geometry_stack_status", None)
-        if callable(stack_reader):
-            try:
-                raw_stack = stack_reader()
-                if isinstance(raw_stack, dict):
-                    geometry_stack_status = raw_stack
-            except Exception:
-                geometry_stack_status = {}
+        geometry_stack_status = self._geometry_runtime.get_geometry_stack_status()
         geometry_stack_running = bool(geometry_stack_status.get("geometry_stack_running"))
         runtime_enabled = bool(
             geometry_stack_running
@@ -3400,12 +3348,8 @@ class MapWorkspaceService:
         """Read an active-map/snapshot pair that stayed coherent across capture."""
 
         pending_activation = self._read_map_activation()
-        execution_state = getattr(self, "_map_activation_execution_state", None)
-        internal_identity = (
-            getattr(execution_state, "coherent_read_identity", None)
-            if execution_state is not None
-            else None
-        )
+        execution_state = self._map_activation_execution_state
+        internal_identity = getattr(execution_state, "coherent_read_identity", None)
         internal_reconciliation_read = bool(
             pending_activation is not None
             and pending_activation.get("phase") == "reconciling"

@@ -207,7 +207,6 @@ class MemoryService(SceneMappingMemoryMixin):
         embedding_timeout_sec: float = 20.0,
         text_embedder: Optional[TextEmbedder] = None,
         vision_language_embedder: Optional[VisionLanguageEmbedder] = None,
-        vector_store: Optional[SQLiteNamedVectorStore] = None,
         evaluation_service: Optional[Any] = None,
         deferred_projection_config: Optional[Any] = None,
         accumulated_cloud_provider: Optional[Any] = None,
@@ -222,21 +221,14 @@ class MemoryService(SceneMappingMemoryMixin):
         self._event_bus = event_bus
         self._artifact_store = artifact_store
         memory_db_path = str(memory_db_path).strip() or ":memory:"
-        injected_storage = getattr(vector_store, "storage", None)
-        injected_path = getattr(vector_store, "db_path", None)
-        same_database = (injected_storage is not None and (
-            (memory_db_path == ":memory:" and injected_path == ":memory:") or
-            (memory_db_path != ":memory:" and injected_path != ":memory:" and injected_path is not None
-             and os.path.realpath(memory_db_path) == os.path.realpath(injected_path))))
-        if not same_database and injected_storage is not None and memory_db_path != ":memory:" and injected_path not in (None, ":memory:"):
-            try:
-                same_database = os.path.samefile(memory_db_path, injected_path)
-            except OSError:
-                pass
-        self._repository = MemoryRepository(memory_db_path, storage=injected_storage if same_database else None)
-        self._vector_store = vector_store if vector_store is not None else SQLiteNamedVectorStore(storage=self._repository.storage, preserve_legacy=True)
-        self._owns_vector_store = vector_store is None
+        self._repository = MemoryRepository(memory_db_path)
+        self._vector_store = SQLiteNamedVectorStore(storage=self._repository.storage, preserve_legacy=True)
         self._closed = False
+        self._storage_closed = False
+        self._memory_backends_closed = False
+        self._last_index_binding = None
+        self._scene_scope_generation = 0
+        self._navigation_candidate_confidence_decay = {}
         # Independent owners belong to served slots/history entries, never to
         # model fields (model_copy must not duplicate an ownership handle).
         self._artifact_cache_holds = {}
@@ -1037,13 +1029,11 @@ class MemoryService(SceneMappingMemoryMixin):
                     self._image_embedder_ready = True
             finally:
                 self._image_embedder_init_lock.release()
-        if hasattr(self, "_durable_index"):
-            binding = self._index_model_binding()
-            if getattr(self, "_last_index_binding", None) != binding:
-                self._last_index_binding = binding
-                if self._durable_index.active_library:
-                    self._durable_index.reset_reconciliation(self._durable_index.active_library)
-
+        binding = self._index_model_binding()
+        if self._last_index_binding != binding:
+            self._last_index_binding = binding
+            if self._durable_index.active_library:
+                self._durable_index.reset_reconciliation(self._durable_index.active_library)
 
     def _require_memory_enabled(self, *, initialize_embedders=True) -> str:
         if not self.is_enabled():
@@ -1059,7 +1049,7 @@ class MemoryService(SceneMappingMemoryMixin):
         return self._active_library_name
 
     def _clear_active_memory_state(self) -> None:
-        self._scene_scope_generation = getattr(self, "_scene_scope_generation", 0) + 1
+        self._scene_scope_generation = self._scene_scope_generation + 1
         self._scene_graph_live_generation += 1
         self._tagged_locations_by_id.clear()
         self._semantic_entries_by_id.clear()
@@ -1107,7 +1097,7 @@ class MemoryService(SceneMappingMemoryMixin):
         return merged
 
     def _observation_write_scope(self):
-        return getattr(getattr(self, "_observation_write_state", None), "scope", None)
+        return getattr(self._observation_write_state, "scope", None)
 
     def _assert_observation_library(self, expected_library_name: str, expected_generation=None) -> None:
         """调用方持有实例锁，在结构或向量提交前复核捕获的库身份。"""
@@ -1174,13 +1164,7 @@ class MemoryService(SceneMappingMemoryMixin):
             self._repository.delete_semantic_graph_relations([item.relation_id for item in graph_relations])
             self._repository.delete_semantic_summary_nodes([item.summary_id for item in summary_nodes])
             self._durable_index.retire_library(library_name)
-        if self._artifact_store is not None:
-            for artifact_id in sorted(artifact_ids):
-                try:
-                    self._artifact_store.delete_artifact(artifact_id)
-                except Exception:
-                    continue
-        return {
+        deleted_counts = {
             "tagged_location_count": len(tagged_locations),
             "semantic_memory_count": len(semantic_memories),
             "semantic_instance_count": len(semantic_instances),
@@ -1189,8 +1173,28 @@ class MemoryService(SceneMappingMemoryMixin):
             "navigation_trajectory_count": len(trajectory_events),
             "semantic_graph_relation_count": len(graph_relations),
             "semantic_summary_count": len(summary_nodes),
-            "artifact_count": len(artifact_ids),
+            "artifact_count": 0,
         }
+        failures = []
+        if self._artifact_store is not None:
+            from services.artifact_store import ArtifactNotFoundError
+            for artifact_id in sorted(artifact_ids):
+                try:
+                    self._artifact_store.delete_artifact(artifact_id)
+                    deleted_counts["artifact_count"] += 1
+                except ArtifactNotFoundError:
+                    # 已不存在的制品无需再次删除，也不计为本次删除。
+                    continue
+                except Exception as exc:
+                    LOGGER.exception("记忆库记录已删除，但制品清理失败 library=%s artifact_id=%s。", library_name, artifact_id)
+                    failures.append({"artifact_id": artifact_id, "reason": str(exc)})
+        if failures:
+            raise GatewayError("记忆库记录已删除，但部分制品尚未清理，请按错误详情核对剩余制品。",
+                error_code="memory_artifact_cleanup_incomplete", http_status=409,
+                details={"library_name": library_name, "records_deleted": True,
+                         "deleted_counts": deleted_counts, "artifact_cleanup_errors": failures})
+        return deleted_counts
+
 
     def _build_text_provider_metadata(
         self,
@@ -1491,7 +1495,7 @@ class MemoryService(SceneMappingMemoryMixin):
             )
             tagged_location = tagged_location.model_copy(
                 update={"memory_id": memory_entry.memory_id},
-                deep=True,
+                deep=False,
             )
 
         self._assert_observation_library(expected_library, expected_generation)
@@ -1554,7 +1558,7 @@ class MemoryService(SceneMappingMemoryMixin):
             )
             scene_space = self._upsert_scene_space(scene_space)
             scene_space_id = scene_space.scene_space_id
-            entry = entry.model_copy(update={"scene_space_id": scene_space.scene_space_id}, deep=True)
+            entry = entry.model_copy(update={"scene_space_id": scene_space.scene_space_id}, deep=False)
             self._repository.upsert_semantic_memory(entry)
             self._upsert_vector_point_for_memory(entry)
         return {
@@ -1640,17 +1644,13 @@ class MemoryService(SceneMappingMemoryMixin):
                 "localization_snapshot": localization, "map_snapshot": snapshot}
 
     def _latest_complete_perception(self, camera_id):
-        """照片记忆只消费完整观察，兼容未提供完整缓存接口的旧提供器。"""
-        getter = getattr(self._perception_service, "get_latest_full_perception", None)
-        if not callable(getter):
-            getter = self._perception_service.get_latest_perception
-        return getter(camera_id)
+        """照片记忆只消费完整观察。"""
+        return self._perception_service.get_latest_full_perception(camera_id)
 
     def _observation_spatial_capture(self, perception_context, expected_library, expected_generation):
         if perception_context is None:
             return None
-        getter = getattr(self._perception_service, "get_observation_spatial_context", None)
-        captured = getter(perception_context.observation.observation_id) if callable(getter) else None
+        captured = self._perception_service.get_observation_spatial_context(perception_context.observation.observation_id)
         if captured and (captured.get("library_name") != expected_library
                          or captured.get("activation_generation") != expected_generation):
             raise GatewayError("观察采集后记忆库已切换，请重新观察当前场景。",
@@ -1682,7 +1682,7 @@ class MemoryService(SceneMappingMemoryMixin):
             current = self._tagged_locations_by_id.get(location.location_id)
             if current is not location:
                 raise GatewayError("照片关联期间地点已变化。", error_code="memory_location_changed", http_status=409)
-            updated = current.model_copy(update={"memory_id": entry.memory_id}, deep=True)
+            updated = current.model_copy(update={"memory_id": entry.memory_id}, deep=False)
         previous_scope = self._observation_write_scope()
         self._observation_write_state.scope = {"library_name": expected_library,
                                               "activation_generation": expected_generation}
@@ -2084,7 +2084,7 @@ class MemoryService(SceneMappingMemoryMixin):
                     reason_codes = self._normalize_aliases([*reason_codes, reason_code])
             elif not verification.verified and str(metadata.get("arrival_reason_code") or "") in {"map_mismatch", "localization_session_mismatch"}:
                 penalty = max(penalty, 0.2)
-        decay_state = getattr(self, "_navigation_candidate_confidence_decay", None)
+        decay_state = self._navigation_candidate_confidence_decay
         decay_amount = 0.0
         if isinstance(decay_state, dict):
             decay_amount = max(
@@ -2126,10 +2126,7 @@ class MemoryService(SceneMappingMemoryMixin):
         amount = max(0.0, min(0.5, float(decay_amount or 0.0)))
         if amount <= 0.0:
             return 0.0
-        decay_state = getattr(self, "_navigation_candidate_confidence_decay", None)
-        if decay_state is None:
-            decay_state = {}
-            setattr(self, "_navigation_candidate_confidence_decay", decay_state)
+        decay_state = self._navigation_candidate_confidence_decay
         key = record_id_str or candidate_id_str
         previous = float(decay_state.get(key, 0.0))
         new_value = min(0.6, previous + amount)
@@ -2143,7 +2140,7 @@ class MemoryService(SceneMappingMemoryMixin):
                     merged_metadata["arrival_failure_decay"] = round(new_value, 6)
                     merged_metadata["arrival_failure_reason_code"] = reason_code
                     merged_metadata["arrival_failure_last_candidate_id"] = candidate_id_str
-                    updated = instance.model_copy(update={"metadata": merged_metadata}, deep=True)
+                    updated = instance.model_copy(update={"metadata": merged_metadata}, deep=False)
                 else:
                     updated = None
             if updated is not None:
@@ -2330,7 +2327,7 @@ class MemoryService(SceneMappingMemoryMixin):
             "llm_boundary": self._navigation_llm_boundary(),
             "coordinate_source": "platform_graph_candidate",
         }
-        return candidate.model_copy(update={"metadata": metadata}, deep=True)
+        return candidate.model_copy(update={"metadata": metadata}, deep=False)
 
     def _build_navigation_candidate_resolution(
         self,
@@ -2567,7 +2564,7 @@ class MemoryService(SceneMappingMemoryMixin):
             resolution_metadata=observability_metadata,
         )
         evaluation_trace = None
-        evaluator = getattr(self, "_evaluation_service", None)
+        evaluator = self._evaluation_service
         if evaluator is not None:
             try:
                 evaluation_trace = evaluator.record_retrieval(
@@ -2595,7 +2592,7 @@ class MemoryService(SceneMappingMemoryMixin):
                         "goal_id": resolved_goal_id or str(dict(candidate.metadata).get("goal_id") or ""),
                     }
                 },
-                deep=True,
+                deep=False,
             )
             for candidate in decorated_candidates
         )
@@ -3023,7 +3020,7 @@ class MemoryService(SceneMappingMemoryMixin):
             localization_session_id = active_session.session_id
             localization_ready = bool(active_session.pose_available)
         dynamic_anchors = self._build_dynamic_instance_anchors()
-        managed_spaces = self.current_managed_scene_spaces(map_snapshot)
+        managed_spaces = self.current_managed_scene_spaces(map_snapshot, copy_records=False)
         current_scene_spaces = [*map_context.scene_spaces, *managed_spaces]
         context = NavigationSemanticContext(
             map_name=resolved_map_name,
@@ -3539,7 +3536,7 @@ class MemoryService(SceneMappingMemoryMixin):
             updates["attributes"] = {**dict(current.attributes), **dict(attributes)}
         if current.metadata.get(MANAGED_KEY) and (primary_label is not None or human_aliases is not None):
             updates["metadata"].update({"label_locked": True, "label_source": "explicit_review"})
-        return self._upsert_scene_space(current.model_copy(update=updates, deep=True))
+        return self._upsert_scene_space(current.model_copy(update=updates, deep=False))
 
     def delete_scene_spaces(self, scene_space_ids: List[str]) -> int:
         """删除当前记忆库内的场景空间。"""
@@ -5257,14 +5254,13 @@ class MemoryService(SceneMappingMemoryMixin):
         return worker is None or not worker.is_alive()
 
     def close(self, *, timeout=2.0) -> bool:
-        """Terminal shutdown. False means a provider still owns retained storage.
+        """关闭服务；工作线程仍持有存储时返回 False，后续关闭可继续等待。
 
-        A later close retries quiescence. Borrowed stores always remain open.
-        Ordinary disable is reusable and only suspends/fences indexing.
+        普通禁用只暂停索引并更新代次，仍允许重新启用。
         """
-        if getattr(self, "_storage_closed", False):
+        if self._storage_closed:
             return True
-        if getattr(self, "_memory_backends_closed", False):
+        if self._memory_backends_closed:
             complete = self._artifact_references is None or self._artifact_references.close()
             self._storage_closed = complete
             return complete
@@ -5306,8 +5302,7 @@ class MemoryService(SceneMappingMemoryMixin):
             return False
         with self._instances_lock:
             self._clear_active_memory_state()
-        if self._owns_vector_store:
-            self._vector_store.close()
+        self._vector_store.close()
         # Owned connection closure settles even a failed-rollback completion
         # proof. Keep its source registration until that proof releases holds.
         self._repository.close()
@@ -5493,7 +5488,7 @@ class MemoryService(SceneMappingMemoryMixin):
             metadata["deferred_pc_status"] = (
                 "deferred_projection_exhausted" if retry_count > max_retry else "deferred_pointcloud_insufficient"
             )
-            updated = instance.model_copy(update={"metadata": metadata}, deep=True)
+            updated = instance.model_copy(update={"metadata": metadata}, deep=False)
             object.__setattr__(updated, "_memory_live_only", True)
             self._cache_artifact_record("instance", updated, append_history=False)
 
@@ -5558,7 +5553,7 @@ class MemoryService(SceneMappingMemoryMixin):
                 metadata["non_navigable_reason"] = "instance_not_active_or_static"
             updated = instance.model_copy(
                 update={"pose": pc_pose, "metadata": metadata, "lifecycle_state": lifecycle},
-                deep=True,
+                deep=False,
             )
         # 锁外做持久化（避免长时间持锁）。
         if self._is_long_term_static_instance(updated):
@@ -5591,7 +5586,6 @@ class MemoryService(SceneMappingMemoryMixin):
         try:
             while not stop.is_set():
                 index.wake.clear()
-                index.cleanup_cache_page()
                 if index.active_library is not None:
                     index.reconcile_page(page_size=8)
                     index.rebind_page(page_size=4)
@@ -5705,8 +5699,7 @@ class MemoryService(SceneMappingMemoryMixin):
                 except Exception as exc:
                     failures.append("image:" + type(exc).__name__)
         if failures:
-            index.outbox.fail(claim, category="legacy_archive_capability_required" if any("DerivedCacheCapabilityError" in item for item in failures) else "modality_unavailable", message=",".join(failures),
-                              permanent=any("DerivedCacheCapabilityError" in item for item in failures))
+            index.outbox.fail(claim, category="modality_unavailable", message=",".join(failures))
         else:
             index.outbox.complete(claim, publish=lambda tx, current: None)
 
@@ -6362,7 +6355,7 @@ class MemoryService(SceneMappingMemoryMixin):
         if not normalized_query:
             return 0.0, fallback_reason
         best_score = 0.0
-        state = getattr(self, "_query_score_state", None)
+        state = self._query_score_state
         cache = getattr(state, "cache", None)
         fuzzy_cache = getattr(state, "fuzzy_cache", None)
         lexical_query = getattr(state, "lexical_query", None)
@@ -6748,8 +6741,7 @@ class MemoryService(SceneMappingMemoryMixin):
     ) -> SemanticMapBuildResult:
         from services.memory.scene_identity import IdentityPlanChanged, IdentityScopeChanged
         from services.memory.scene_mapping_state import bound_to_semantic_reference, snapshot_binding
-        reference_getter = getattr(self._mapping_service, "get_semantic_snapshot", None)
-        reference = reference_getter() if reference_getter is not None else None
+        reference = self._mapping_service.get_semantic_snapshot()
         if map_snapshot is not None and reference is not None and bound_to_semantic_reference(map_snapshot, snapshot_binding(reference)):
             # 区域上下文消费封存资产；观察写入仍保留其原运行期快照和采集来源。
             map_snapshot = reference
@@ -6864,7 +6856,7 @@ class MemoryService(SceneMappingMemoryMixin):
                 "attributes": attributes,
                 "metadata": metadata,
             },
-            deep=True,
+            deep=False,
         )
         if same_binding and existing is not None:
             prepared = prepared.model_copy(
@@ -6884,7 +6876,7 @@ class MemoryService(SceneMappingMemoryMixin):
                     "metadata": {**existing.metadata, **prepared.metadata} if owned_identity else prepared.metadata,
                     "attributes": {**existing.attributes, **prepared.attributes} if owned_identity else prepared.attributes,
                 },
-                deep=True,
+                deep=False,
             )
         if same_binding and existing is not None and getattr(existing, TOKEN, None) is not None:
             object.__setattr__(prepared, TOKEN, getattr(existing, TOKEN))
@@ -6973,7 +6965,7 @@ class MemoryService(SceneMappingMemoryMixin):
                 "attributes": attributes,
                 "metadata": metadata,
             },
-            deep=True,
+            deep=False,
         )
 
     def _scene_space_understanding_provider_metadata(self, perception_context) -> Dict[str, object]:
@@ -7008,7 +7000,7 @@ class MemoryService(SceneMappingMemoryMixin):
                                     for sample in scene.observation_samples],
             "candidate_labels": [label.model_copy(update={"evidence_observation_sample_ids": ids(label.evidence_observation_sample_ids)})
                                  for label in scene.candidate_labels],
-            "model_summary": summary, "metadata": metadata}, deep=True)
+            "model_summary": summary, "metadata": metadata}, deep=False)
 
     def _publish_sampled_scene_context(self, records, plans, *, context, request, generation, library, snapshot_identity):
         with self._instances_lock:
@@ -7143,7 +7135,7 @@ class MemoryService(SceneMappingMemoryMixin):
         metadata = self._attach_library_metadata(dict(scene_space.metadata))
         if scene_space.localization_session_id and not metadata.get("localization_session_id"):
             metadata["localization_session_id"] = scene_space.localization_session_id
-        updated = scene_space.model_copy(update={"metadata": metadata}, deep=True)
+        updated = scene_space.model_copy(update={"metadata": metadata}, deep=False)
         self._repository.upsert_scene_space(updated)
         self._upsert_vector_point_for_scene_space(updated)
         self._record_scene_space_graph(updated)
@@ -7273,7 +7265,7 @@ class MemoryService(SceneMappingMemoryMixin):
                             }
                         )
                     },
-                    deep=True,
+                    deep=False,
                 )
                 if persist and (getattr(instance, TOKEN, None) is None or getattr(instance, "_memory_source_deleted", False)):
                     instance = instance.model_copy(deep=False)
@@ -7380,7 +7372,7 @@ class MemoryService(SceneMappingMemoryMixin):
                             [*current_instance.supporting_observation_event_ids, *new_event_ids]
                         ),
                     },
-                    deep=True,
+                    deep=False,
                 )
             if self._is_long_term_static_instance(updated_instance):
                 self._repository.upsert_semantic_instance(updated_instance)
@@ -7915,7 +7907,7 @@ class MemoryService(SceneMappingMemoryMixin):
 
     def _upsert_navigation_trajectory_event(self, event: NavigationTrajectoryEvent) -> NavigationTrajectoryEvent:
         metadata = self._attach_library_metadata(dict(event.metadata))
-        updated = event.model_copy(update={"metadata": metadata}, deep=True)
+        updated = event.model_copy(update={"metadata": metadata}, deep=False)
         generation = self._durable_index.activation_generation
         with self._repository.storage.transaction() as transaction:
             updated = self._repository.upsert_navigation_trajectory_event(updated)
@@ -7924,7 +7916,7 @@ class MemoryService(SceneMappingMemoryMixin):
 
     def _upsert_semantic_graph_relation(self, relation: SemanticGraphRelation) -> SemanticGraphRelation:
         metadata = self._attach_library_metadata(dict(relation.metadata))
-        updated = relation.model_copy(update={"metadata": metadata}, deep=True)
+        updated = relation.model_copy(update={"metadata": metadata}, deep=False)
         generation = self._durable_index.activation_generation
         with self._repository.storage.transaction() as transaction:
             identity = self._durable_index.library_identity(self._record_library_name(updated))
@@ -7934,7 +7926,7 @@ class MemoryService(SceneMappingMemoryMixin):
 
     def _upsert_semantic_summary_node(self, summary_node: SemanticSummaryNode) -> SemanticSummaryNode:
         metadata = self._attach_library_metadata(dict(summary_node.metadata))
-        updated = summary_node.model_copy(update={"metadata": metadata}, deep=True)
+        updated = summary_node.model_copy(update={"metadata": metadata}, deep=False)
         generation = self._durable_index.activation_generation
         with self._repository.storage.transaction() as transaction:
             identity = self._durable_index.library_identity(self._record_library_name(updated))
@@ -8035,7 +8027,7 @@ class MemoryService(SceneMappingMemoryMixin):
                     return
                 updated = instance.model_copy(
                     update={"graph_relation_ids": self._normalize_aliases([*instance.graph_relation_ids, relation_id])},
-                    deep=True,
+                    deep=False,
                 )
             if self._is_long_term_static_instance(updated):
                 self._repository.upsert_semantic_instance(updated)
@@ -8048,7 +8040,7 @@ class MemoryService(SceneMappingMemoryMixin):
                 return
             updated = event.model_copy(
                 update={"graph_relation_ids": self._normalize_aliases([*event.graph_relation_ids, relation_id])},
-                deep=True,
+                deep=False,
             )
             self._repository.upsert_observation_event(updated)
             return
@@ -8058,7 +8050,7 @@ class MemoryService(SceneMappingMemoryMixin):
                 return
             updated = scene_space.model_copy(
                 update={"graph_relation_ids": self._normalize_aliases([*scene_space.graph_relation_ids, relation_id])},
-                deep=True,
+                deep=False,
             )
             self._repository.upsert_scene_space(updated)
 
@@ -8291,7 +8283,7 @@ class MemoryService(SceneMappingMemoryMixin):
             current_scene = self._scene_spaces_by_id.get(scene_space.scene_space_id, scene_space)
             updated = current_scene.model_copy(
                 update={"summary_node_ids": self._normalize_aliases([*current_scene.summary_node_ids, *summary_ids])},
-                deep=True,
+                deep=False,
             )
             self._repository.upsert_scene_space(updated)
 
@@ -8342,7 +8334,7 @@ class MemoryService(SceneMappingMemoryMixin):
                 "reachable_from_pose_frame": stored_event.pose.frame_id if stored_event.pose is not None else "",
             }
         )
-        return candidate.model_copy(update={"metadata": metadata}, deep=True)
+        return candidate.model_copy(update={"metadata": metadata}, deep=False)
 
     def _record_arrival_trajectory_graph(self, result: MemoryArrivalVerification) -> None:
         metadata = dict(result.metadata or {})
@@ -8494,26 +8486,9 @@ class MemoryService(SceneMappingMemoryMixin):
         return None
 
     def _read_live_pose(self) -> Optional[Pose]:
-        """从实时位姿门面取探索期实时位姿（鸭子类型，与 PerceptionService._read_live_pose 同源）。
-
-        优先 get_exploration_pose()（探索建图时导航后端 map→base 实时 TF），回退
-        get_current_pose()（定位会话后端，仅重定位就绪后有值）。任一失败返回 None，禁兜底假位姿。
-        """
-
+        """读取提供器已解析的实时位姿；缺位姿时不补造数据。"""
         provider = self._live_pose_provider
-        if provider is None:
-            return None
-        for getter_name in ("get_exploration_pose", "get_current_pose"):
-            getter = getattr(provider, getter_name, None)
-            if not callable(getter):
-                continue
-            try:
-                candidate = getter()
-            except Exception:
-                continue
-            if isinstance(candidate, Pose):
-                return candidate
-        return None
+        return None if provider is None else provider.get_exploration_pose()
 
     def _get_or_refresh_localization(
         self,
@@ -8529,7 +8504,7 @@ class MemoryService(SceneMappingMemoryMixin):
             if live_pose is not None:
                 if snapshot is not None:
                     if snapshot.current_pose is None:
-                        return snapshot.model_copy(update={"current_pose": live_pose}, deep=True)
+                        return snapshot.model_copy(update={"current_pose": live_pose}, deep=False)
                     return snapshot
                 return LocalizationSnapshot(
                     source_name="memory_live_pose_provider",
@@ -8549,7 +8524,7 @@ class MemoryService(SceneMappingMemoryMixin):
         """当前查询重取同来源增量快照；显式历史证据仍走原精确修订围栏。"""
         from services.memory.scene_mapping_state import same_scope, snapshot_binding
         generation = self._durable_index.activation_generation
-        getter = getattr(self._mapping_service, "get_semantic_snapshot", self._mapping_service.get_latest_snapshot)
+        getter = self._mapping_service.get_semantic_snapshot
         snapshot = getter()
         for attempt in range(3):
             try:
@@ -8577,7 +8552,8 @@ class MemoryService(SceneMappingMemoryMixin):
         try:
             return self._artifact_store.read_bytes(artifact_id)
         except Exception:
-            return None
+            LOGGER.exception("读取记忆图像制品失败 artifact_id=%s。", artifact_id)
+            raise
 
     def _write_tagged_location_state(self, location: TaggedLocation) -> None:
         self._state_store.write(
@@ -8757,7 +8733,7 @@ class MemoryService(SceneMappingMemoryMixin):
                                     }
                                 ),
                             },
-                            deep=True,
+                            deep=False,
                         )
                     else:
                         updated_instance = None
@@ -8787,7 +8763,7 @@ class MemoryService(SceneMappingMemoryMixin):
                             }
                         ),
                     },
-                    deep=True,
+                    deep=False,
                 )
                 self._repository.upsert_scene_space(updated_space)
                 self._upsert_vector_point_for_scene_space(updated_space)

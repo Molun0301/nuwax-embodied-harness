@@ -4,7 +4,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-from contracts.map_activation import AssignedActivationReceipt, _request
+from contracts.map_activation import _request
 from contracts.map_workspace import MapAssetStatus, MapWorkspace
 from contracts.runtime_views import LocalizationSessionStatus
 from core import StateNamespace
@@ -54,7 +54,7 @@ def _target_request(state, prepared):
     if (state.get('activation_receipt_schema_version') != 2
             or state.get('activation_receipt_disposition') not in (2, 3)):
         return None
-    receipt = AssignedActivationReceipt.admit(state.get('activation_receipt_v2'))
+    receipt = state['activation_receipt_v2']
     if (receipt.asset_identity != prepared.asset_identity or receipt.map_name != prepared.map_name
             or receipt.checkpoint_id != prepared.checkpoint_id):
         return None
@@ -69,11 +69,7 @@ def _mapping_matches(snapshot, target):
             or metadata.get('asset_identity') != target.asset_identity.model_dump()
             or metadata.get('map_activation_generation') != target.installation_generation):
         return False
-    try:
-        receipt = AssignedActivationReceipt.admit(metadata.get('activation_receipt_v2'))
-    except (ValueError, TypeError):
-        return False
-    return receipt.exact_replay_of(target.activation_receipt)
+    return metadata.get('activation_receipt_v2') == target.activation_receipt.to_dict()
 
 
 def _session_matches(session, target):
@@ -303,7 +299,7 @@ def _activate(owner, bundle, load_memory_history, metadata, allow_dispatch, publ
         else:
             # 已完成的同一真实安装，不产生第二个安装/会话或重新导入地图。
             runtime.validate_prepared_assigned_map_evidence(prepared,
-                activation_request=request, activation_evidence=initial_state)
+                 activation_evidence=initial_state)
             # This probe consumes only the coherent session receipt. The caller
             # still builds the final workspace after the publication scope, where
             # the actual summary repairs and currentness checks remain unchanged.
@@ -325,7 +321,7 @@ def _activate(owner, bundle, load_memory_history, metadata, allow_dispatch, publ
         raise _problem('运行态已有不同的激活拥有方。', journal)
     evidence = _activation_evidence(owner, prepared, request, journal, initial_state, allow_dispatch)
     receipt = runtime.validate_prepared_assigned_map_evidence(prepared,
-        activation_request=request, activation_evidence=evidence)
+         activation_evidence=evidence)
     with _transaction(owner):
         journal = _require_journal(owner, prepared, request)
         journal = repository.record_assigned_map_activation_evidence(
@@ -336,7 +332,7 @@ def _activate(owner, bundle, load_memory_history, metadata, allow_dispatch, publ
             activation_receipt_disposition_name=evidence['activation_receipt_disposition_name'],
             expected_phases=('backend_dispatching', 'backend_applied', 'reconciling', 'recovering'))
     target, snapshot = runtime.install_prepared_assigned_map(prepared,
-        activation_request=request, activation_evidence=evidence)
+         activation_evidence=evidence)
     _advance(owner, prepared, request, 'reconciling', ('backend_applied', 'recovering'))
     current_map = owner._mapping_service.get_latest_snapshot()
     if not _mapping_matches(current_map, target):

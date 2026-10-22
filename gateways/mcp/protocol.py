@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
@@ -16,7 +15,7 @@ from fastapi.responses import JSONResponse
 from fastapi.responses import Response
 from fastapi.responses import StreamingResponse
 
-from gateways.arguments import validate_closed_schema as _validate_closed_schema
+from gateways.arguments import validate_arguments
 from gateways.auth import GatewayAccessManager
 from gateways.errors import GatewayError, as_gateway_error
 from gateways.feedback import (
@@ -312,14 +311,11 @@ def _build_collection_catalogs(
         if collection_name is None:
             continue
         if refresh_availability:
-            try:
-                registration = runtime.capability_registry.get_registration(descriptor.capability_name)
-                availability = runtime.capability_registry.get_availability(
-                    descriptor.capability_name,
-                    robot_model=runtime.robot.manifest.robot_model,
-                )
-            except Exception:
-                continue
+            registration = runtime.capability_registry.get_registration(descriptor.capability_name)
+            availability = runtime.capability_registry.get_availability(
+                descriptor.capability_name,
+                robot_model=runtime.robot.manifest.robot_model,
+            )
             if not registration.runnable or not availability.supported:
                 continue
         catalogs[collection_name][descriptor.name] = _tool_catalog_item(runtime, descriptor, layer)
@@ -341,14 +337,12 @@ def _build_collection_description(collection_name: str, catalog: Dict[str, Dict[
     return description
 
 
-def _build_collection_input_schema(catalog: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    function_names = sorted(catalog)
-    return {
+def _build_collection_input_schema(catalog: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
+    schema = {
         "type": "object",
         "properties": {
             "function": {
                 "type": "string",
-                "enum": function_names,
                 "description": "集合内具体功能名。",
             },
             "parameters": {
@@ -359,6 +353,10 @@ def _build_collection_input_schema(catalog: Dict[str, Dict[str, Any]]) -> Dict[s
         "required": ["function"],
         "additionalProperties": False,
     }
+    # 发现目录可描述当前函数；调用封套不提前绑定动态目录或空枚举。
+    if catalog:
+        schema["properties"]["function"]["enum"] = sorted(catalog)
+    return schema
 
 
 def _build_standalone_platform_tools(platform_catalog: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -410,14 +408,6 @@ def _resolve_tool_invocation(
     tool_name: str,
     arguments: Dict[str, Any],
 ) -> Tuple[str, Dict[str, Any]]:
-    if not isinstance(arguments, dict):
-        raise GatewayError(
-            "MCP tool arguments 必须是对象。",
-            error_code="invalid_params",
-            http_status=422,
-            jsonrpc_code=-32602,
-            details={"tool_name": tool_name},
-        )
     if tool_name in _MCP_COLLECTIONS:
         return _resolve_collection_call(runtime, tool_name, arguments)
 
@@ -425,24 +415,10 @@ def _resolve_tool_invocation(
     candidates = (tool_name,) if target_name is None else (tool_name, target_name)
     catalogs = _build_collection_catalogs(runtime, tool_names=candidates, refresh_availability=False)
     if target_name is not None and target_name in catalogs["platform"]:
-        item = catalogs["platform"][target_name]
-        schema = (
-            item.get("input_schema")
-            or _MCP_STANDALONE_TOOL_SCHEMAS.get(tool_name)
-            or {"type": "object", "properties": {}, "additionalProperties": False}
-        )
-        _validate_closed_schema(arguments, schema, path="arguments")
-        parameters = arguments
-        return target_name, parameters
+        return target_name, arguments
     for catalog in catalogs.values():
         if tool_name in catalog:
-            _validate_closed_schema(
-                arguments,
-                catalog[tool_name].get("input_schema") or {},
-                path="arguments",
-            )
-            parameters = arguments
-            return tool_name, parameters
+            return tool_name, arguments
 
     raise GatewayError(
         f"未知 MCP 工具: {tool_name}。",
@@ -508,43 +484,9 @@ def _format_sse(event_name: str, payload: Dict[str, Any]) -> str:
 
 
 def _resolve_collection_call(runtime: GatewayRuntime, collection_name: str, arguments: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-    if collection_name not in _MCP_COLLECTIONS:
-        raise GatewayError(
-            f"未知 MCP 集合工具: {collection_name}。",
-            error_code="invalid_params",
-            http_status=422,
-            jsonrpc_code=-32602,
-        )
-    if not isinstance(arguments, dict):
-        raise GatewayError(
-            "集合工具 arguments 必须是对象。",
-            error_code="invalid_params",
-            http_status=422,
-            jsonrpc_code=-32602,
-        )
-    _validate_closed_schema(
-        arguments,
-        _build_collection_input_schema({}),
-        path="arguments",
-    )
-    function_name = str(arguments.get("function", "")).strip()
-    if not function_name:
-        raise GatewayError(
-            "集合工具调用缺少 function。",
-            error_code="invalid_params",
-            http_status=422,
-            jsonrpc_code=-32602,
-        )
-    parameters = arguments.get("parameters", {})
-    if parameters is None:
-        parameters = {}
-    if not isinstance(parameters, dict):
-        raise GatewayError(
-            "集合工具 parameters 必须是对象。",
-            error_code="invalid_params",
-            http_status=422,
-            jsonrpc_code=-32602,
-        )
+    validate_arguments(arguments, _build_collection_input_schema())
+    function_name = arguments["function"]
+    parameters = arguments.get("parameters") or {}
     catalog = _build_collection_catalogs(runtime, tool_names=(function_name,), refresh_availability=False)[collection_name]
     if function_name not in catalog:
         # 错误诊断列出已公开注册的功能名，不触发执行准入或可用性刷新。
@@ -560,11 +502,6 @@ def _resolve_collection_call(runtime: GatewayRuntime, collection_name: str, argu
                 "available_functions": sorted(available_catalog),
             },
         )
-    _validate_closed_schema(
-        parameters,
-        catalog[function_name].get("input_schema") or {},
-        path="arguments.parameters",
-    )
     return function_name, parameters
 
 

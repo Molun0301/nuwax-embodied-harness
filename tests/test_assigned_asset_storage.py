@@ -378,16 +378,28 @@ class AssignedAssetStorageTests(unittest.TestCase):
         self.assertIs(copied.snapshot.occupancy_grid.data, bundle.snapshot.occupancy_grid.data)
         self.assertEqual(copied.asset_state, 'finalized')
 
-    def test_capture_and_validate_assigned_snapshot_without_fingerprint_hash(self):
+    def test_geographic_resolution_preserves_missing_asset_and_anchor_errors(self):
+        from tests.conftest import ack, fixture_pb, response_fixture
+        from services.geometry.geometry_runtime_provider import _assigned_activation_receipt_payload
+        from services.mapping.finalized_asset_authority import FinalizedAssetAuthorityResolver, FinalizedAssetAuthorityError
+        request = fixture_pb.ActivateMapRequest(activation_request_id="activate:geographic", session_id="loaded:geographic",
+            map_name=MAP_NAME, asset_identity=fixture_pb.AssetIdentityV2(asset_id=ASSET_ID.asset_id),
+            expected_runtime_generation=7,
+            mapping_backend_checkpoint=response_fixture())
+        owner = _assigned_activation_receipt_payload(ack(request).activation_receipt_v2)
+        authority = {"activation_receipt_v2": owner, "owner_epoch": 7,
+                     "committed_occupancy_revision": 10,
+                     "committed_occupancy_commit_id": {"boot_nonce": "5a" * 16, "sequence": 20},
+                     "committed_occupancy_source_timestamp_ns": 11}
+        resolver = FinalizedAssetAuthorityResolver(asset_repository=self.repository,
+                                                   runtime_authority_provider=lambda: authority)
+        with self.assertRaises(FinalizedAssetAuthorityError) as missing:
+            resolver.resolve()
+        self.assertEqual(missing.exception.code, "finalized_asset_missing")
         self.publish()
-        captured = self.repository.get_validated_map_asset_bundle_snapshot(MAP_NAME, expected_asset_identity=ASSET_ID)
-        self.assertEqual(captured.repository_fingerprint, '')
-        self.assertTrue(captured.repository_observations)
-        self.repository.validate_map_asset_bundle_snapshot_identity(MAP_NAME, captured)
-        image = self.repository.current_directory(MAP_NAME) / 'geometry/test/map.pgm'
-        image.write_bytes(b'P5\n2 1\n255\n\x01\x64')
-        with self.assertRaises(MapAssetBundleValidationError):
-            self.repository.validate_map_asset_bundle_snapshot_identity(MAP_NAME, captured)
+        with self.assertRaises(FinalizedAssetAuthorityError) as unanchored:
+            resolver.resolve()
+        self.assertEqual(unanchored.exception.code, "map_georeference_required")
 
     def test_assigned_previous_identity_requires_catalog_owner_and_legacy_writer_is_gated(self):
         stage = stage_fixture(self.repository)

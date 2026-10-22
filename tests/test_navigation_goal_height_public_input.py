@@ -5,8 +5,11 @@
 真实工作区、定位会话与 protobuf 准入，只模拟原生 RPC，不能替代原生实机验证。
 """
 import math
+import tempfile
+from pathlib import Path
 import unittest
 from contextlib import ExitStack
+from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -32,28 +35,6 @@ from services.navigation.motion_guard_client import MotionAdmissionProof
 from skills.handlers import motion_skills
 from skills.map_workspace import MapWorkspaceService
 from skills.registry import SkillRegistry
-
-
-class _RecordingTaskQueue:
-    """仅接收任务，保留真正的输入和闭包，不调度任何执行线程。"""
-
-    def __init__(self):
-        self.submissions = []
-
-    def submit(self, capability_name, runner, **kwargs):
-        spec = TaskSpec(
-            task_id=f"task_height_{len(self.submissions) + 1}",
-            capability_name=capability_name,
-            requested_by=kwargs.get("requested_by"),
-            input_payload=kwargs["input_payload"],
-            required_resources=kwargs["required_resources"],
-            metadata=kwargs["metadata"],
-        )
-        self.submissions.append((spec, runner))
-        return spec
-
-    def capture_task_status_event(self, task_id):
-        return TaskStatus(task_id=task_id, state=TaskState.ACCEPTED), None
 
 
 class _ObservedGatewayRuntime(GatewayRuntime):
@@ -94,28 +75,43 @@ class _RunnerContext:
 
 class NavigationGoalHeightPublicInputTests(unittest.TestCase):
     def gateway(self, pipeline="lio_3d"):
-        gateway = object.__new__(_ObservedGatewayRuntime)
-        gateway.config = SimpleNamespace(
-            robot=SimpleNamespace(active_robot=""),
-            geometry=SimpleNamespace(pipeline=pipeline),
-            runtime_data=SimpleNamespace(map_catalog_root=None),
-        )
-        gateway.robot = SimpleNamespace(
-            manifest=SimpleNamespace(robot_name="height_contract_fixture", robot_model=None)
-        )
-        gateway._skill_ctx = SimpleNamespace()
-        gateway.capability_registry = CapabilityRegistry()
-        gateway.skill_registry = SkillRegistry()
-        # 输入契约检查不依赖硬件在线；不改写注册出的 schema 或处理函数。
-        gateway._refresh_dynamic_capability_matrix = lambda **_kwargs: None
+        from tests.conftest import isolated_gateway_config
+        from drivers.customrobot import create_customrobot_assembly
+        from contracts.capabilities import CapabilityAvailability, CapabilityMatrix
+        temporary = tempfile.TemporaryDirectory(prefix="navigation-height-")
+        self.addCleanup(temporary.cleanup)
+        config = isolated_gateway_config(Path(temporary.name))
+        config.geometry.pipeline = pipeline
+        from core.task_manager import TaskManager
+        bus = EventBus()
+        manager = TaskManager(event_bus=bus)
+        gateway = _ObservedGatewayRuntime(config=config, robot=create_customrobot_assembly(config),
+                                           event_bus=bus, task_manager=manager, register_default_capabilities=False)
+        self.addCleanup(gateway.stop)
+        overrides = ExitStack()
+        self.addCleanup(overrides.close)
+        if not hasattr(self, "_gateway_overrides"):
+            self._gateway_overrides = {}
+        self._gateway_overrides[gateway] = overrides
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'forwarded_arguments', [], create=True))
+        # 输入契约测试明确提供就绪目录；真实参数解析和处理器继续执行。
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, '_refresh_dynamic_capability_matrix', lambda **_kwargs: None, create=True))
         gateway.register_default_capabilities()
         gateway.register_default_skills()
-        gateway.event_bus = EventBus()
-        self.addCleanup(gateway.event_bus.shutdown)
-        gateway.safety_guard = SafetyGuard()
-        gateway.task_manager = _RecordingTaskQueue()
-        gateway.map_workspace_service = SimpleNamespace(get_active_map_name=lambda: "height_contract_map")
-        gateway.forwarded_arguments = []
+        gateway.capability_registry.bind_robot_capability_matrix(CapabilityMatrix(
+            robot_model=gateway.robot.manifest.robot_model,
+            capabilities=[CapabilityAvailability(name=name, supported=True)
+                          for name in gateway.capability_registry.list_names()]))
+        manager = gateway.task_manager
+        manager.submissions = []
+        original_submit = manager.submit
+        def submit(capability, runner, **kwargs):
+            task = original_submit(capability, runner, **kwargs)
+            manager.submissions.append((task, runner))
+            return task
+        overrides.enter_context(patch.object(manager._executor, "submit", lambda *args, **kwargs: Future()))
+        overrides.enter_context(patch.object(manager, "submit", submit))
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'map_workspace_service', SimpleNamespace(get_active_map_name=lambda: "height_contract_map"), create=True))
         return gateway
 
     def client(self, gateway):
@@ -142,18 +138,18 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
         return parameters
 
     def configure_runner(self, gateway, *, body_z=7.25, schema_version=2):
-        gateway.height_events = []
-        gateway.dispatched = []
-        gateway.owned_pose = Pose(frame_id="map", position=Vector3(x=8, y=2, z=body_z))
-        gateway.height_workspace = SimpleNamespace(
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'height_events', [], create=True))
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'dispatched', [], create=True))
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'owned_pose', Pose(frame_id="map", position=Vector3(x=8, y=2, z=body_z)), create=True))
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'height_workspace', SimpleNamespace(
             map_asset=SimpleNamespace(identity_schema_version=schema_version),
-            active_localization_session=SimpleNamespace(session_id="height-session"))
+            active_localization_session=SimpleNamespace(session_id="height-session")), create=True))
         proof = MotionAdmissionProof(generation=1, boot_nonce=b"h" * 16)
-        gateway.height_admission = MotionAdmission(
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'height_admission', MotionAdmission(
             request_id="height-admission", capability_name="navigate_to_pose", generation=1,
             boot_nonce=b"h" * 16, motion_stop_generation=gateway.safety_guard.begin_motion_admission(),
             admitted_monotonic_ns=1, proof=proof,
-        )
+        ), create=True))
 
         def admit(*args, **kwargs):
             gateway.height_events.append("admit")
@@ -178,17 +174,17 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
             return navigation_context
 
         navigation_context = self.navigation_context()
-        gateway._admit_motion_request = admit
-        gateway._resolve_map_workspace_for_request = workspace
-        gateway._ensure_localization_for_navigation = localize
-        gateway.map_workspace_service.get_relocalized_pose = Mock(side_effect=owned_pose)
-        gateway.localization_service = SimpleNamespace(get_latest_snapshot=Mock(side_effect=AssertionError("generic pose cache")))
-        gateway._ensure_motion_runtime_for_backend_call = lambda *args, **kwargs: gateway.height_events.append("runtime_ready")
-        gateway._capture_task_generation_snapshot = lambda **kwargs: {}
-        gateway._record_task_generation_snapshot = lambda *args: None
-        gateway._navigation_terminal_proof = lambda *args, **kwargs: {"parking_confirmed": True}
-        gateway.navigation_service = SimpleNamespace(set_goal=Mock(side_effect=dispatch),
-            refresh_navigation=Mock(return_value=navigation_context))
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, '_admit_motion_request', admit, create=True))
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, '_resolve_map_workspace_for_request', workspace, create=True))
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, '_ensure_localization_for_navigation', localize, create=True))
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway.map_workspace_service, 'get_relocalized_pose', Mock(side_effect=owned_pose), create=True))
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'localization_service', SimpleNamespace(get_latest_snapshot=Mock(side_effect=AssertionError("generic pose cache"))), create=True))
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, '_ensure_motion_runtime_for_backend_call', lambda *args, **kwargs: gateway.height_events.append("runtime_ready"), create=True))
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, '_capture_task_generation_snapshot', lambda **kwargs: {}, create=True))
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, '_record_task_generation_snapshot', lambda *args: None, create=True))
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, '_navigation_terminal_proof', lambda *args, **kwargs: {"parking_confirmed": True}, create=True))
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway.navigation_service, "set_goal", Mock(side_effect=dispatch)))
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway.navigation_service, "refresh_navigation", Mock(return_value=navigation_context)))
         return gateway
 
     @staticmethod
@@ -288,7 +284,7 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
                     localize(**kwargs)
                     kwargs["workspace"].map_asset.identity_schema_version = after
 
-                gateway._ensure_localization_for_navigation = prepare
+                self._gateway_overrides[gateway].enter_context(patch.object(gateway, '_ensure_localization_for_navigation', prepare, create=True))
                 self.mcp_call(gateway, {"frame_id": "map", "x": 4.25, "y": -1.5})
                 self.assertEqual(gateway.height_workspace.map_asset.identity_schema_version, before)
                 getter = gateway.map_workspace_service.get_relocalized_pose
@@ -305,14 +301,14 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
             with self.subTest(missing=missing):
                 gateway = self.configure_runner(self.gateway())
                 if missing == "workspace":
-                    gateway.height_workspace = None
+                    self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'height_workspace', None, create=True))
                 elif missing == "asset_attribute":
                     del gateway.height_workspace.map_asset
                 else:
-                    gateway.height_workspace.map_asset = {
+                    self._gateway_overrides[gateway].enter_context(patch.object(gateway.height_workspace, 'map_asset', {
                         "asset": None, "schema": SimpleNamespace(),
                         "invalid_schema": SimpleNamespace(identity_schema_version=3),
-                    }[missing]
+                    }[missing], create=True))
                 self.mcp_call(gateway, {"frame_id": "map", "x": 4.25, "y": -1.5})
                 with self.assertRaises(GatewayError) as raised:
                     self.run_latest(gateway)
@@ -324,7 +320,7 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
     def test_mcp_preserves_explicit_body_height_including_zero_and_negative(self):
         for pipeline, schema_version in ((p, s) for p in ("lio_3d", "slam_2d") for s in (1, 2)):
             gateway = self.configure_runner(self.gateway(pipeline), schema_version=schema_version)
-            gateway.owned_pose = None
+            self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'owned_pose', None, create=True))
             for z in (2.75, 0.0, -1.25):
                 with self.subTest(pipeline=pipeline, schema_version=schema_version, z=z):
                     self.mcp_call(gateway, {"frame_id": "map", "x": 4.25, "y": -1.5, "z": z})
@@ -422,7 +418,7 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
     def test_real_http_preserves_explicit_height_for_both_shapes_and_pipelines(self):
         for pipeline, schema_version in ((p, s) for p in ("lio_3d", "slam_2d") for s in (1, 2)):
             gateway = self.configure_runner(self.gateway(pipeline), schema_version=schema_version)
-            gateway.owned_pose = None
+            self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'owned_pose', None, create=True))
             client = self.client(gateway)
             for nested in (False, True):
                 for z in (2.75, 0.0, -1.25):
@@ -439,7 +435,7 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
 
     def test_planar_xy_compatibility_remains_accepted_via_mcp_and_http(self):
         gateway = self.configure_runner(self.gateway("slam_2d"))
-        gateway.owned_pose = None
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'owned_pose', None, create=True))
         self.mcp_call(gateway, {"frame_id": "map", "x": 4.25, "y": -1.5})
         self.assert_queued_target(gateway, z=0.0)
         self.run_latest(gateway)
@@ -464,7 +460,7 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
         for sample in samples:
             with self.subTest(sample=sample):
                 gateway = self.configure_runner(self.gateway())
-                gateway.owned_pose = sample
+                self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'owned_pose', sample, create=True))
                 self.mcp_call(gateway, {"frame_id": "map", "x": 4.25, "y": -1.5})
                 with patch("gateways.runtime.utc_now", return_value=now), self.assertRaises(GatewayError) as raised:
                     self.run_latest(gateway)
@@ -480,8 +476,8 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
             with self.subTest(source_age=source_age, receipt_age=receipt_age):
                 gateway = self.configure_runner(self.gateway())
                 gateway.height_events.append("localize")
-                gateway.owned_pose = Pose(timestamp=now - timedelta(seconds=source_age),
-                    frame_id="map", position=Vector3(z=7.25))
+                self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'owned_pose', Pose(timestamp=now - timedelta(seconds=source_age),
+                    frame_id="map", position=Vector3(z=7.25)), create=True))
                 goal = NavigationGoal(goal_id="age-goal", map_name="height_contract_map",
                     target_pose=Pose(frame_id="map"), metadata={"navigation_height_pending": True})
                 with patch("gateways.runtime.utc_now", side_effect=[now - timedelta(seconds=receipt_age), now]):
@@ -494,14 +490,14 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
 
     def test_async_preparation_can_replace_old_pose_before_height_resolution(self):
         gateway = self.configure_runner(self.gateway())
-        gateway.owned_pose = Pose(timestamp=datetime.now(timezone.utc) - timedelta(hours=1), frame_id="map")
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'owned_pose', Pose(timestamp=datetime.now(timezone.utc) - timedelta(hours=1), frame_id="map"), create=True))
         localize = gateway._ensure_localization_for_navigation
 
         def prepare(**kwargs):
             localize(**kwargs)
-            gateway.owned_pose = Pose(frame_id="map", position=Vector3(z=3.5))
+            self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'owned_pose', Pose(frame_id="map", position=Vector3(z=3.5)), create=True))
 
-        gateway._ensure_localization_for_navigation = prepare
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, '_ensure_localization_for_navigation', prepare, create=True))
         self.mcp_call(gateway, {"frame_id": "map", "x": 4.25, "y": -1.5})
         gateway.map_workspace_service.get_relocalized_pose.assert_not_called()
         self.run_latest(gateway)
@@ -516,34 +512,35 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
         self.assertEqual(gateway.dispatched[0].target_pose.position.z, 7.25)
         gateway.map_workspace_service.get_relocalized_pose.assert_called_once()
 
-    def test_dispatch_retries_keep_first_resolved_height_when_body_moves(self):
+    def test_dispatch_retry_keeps_height_and_propagates_accepted_terminal_failure(self):
         gateway = self.configure_runner(self.gateway())
         attempts = []
 
         def dispatch(goal, **kwargs):
             attempts.append(goal.model_copy(deep=True))
-            gateway.owned_pose = Pose(frame_id="map", position=Vector3(z=99))
+            self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'owned_pose', Pose(frame_id="map", position=Vector3(z=99)), create=True))
             if len(attempts) == 1:
                 raise GatewayError("等待输入", error_code="navigation_goal_rejected",
                     details={"backend_code": "PLANNER_INPUT_STALE"})
             return self.navigation_context()
 
-        gateway.navigation_service.set_goal.side_effect = dispatch
-        gateway.navigation_service.refresh_navigation.side_effect = [
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway.navigation_service.set_goal, 'side_effect', dispatch, create=True))
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway.navigation_service.refresh_navigation, 'side_effect', [
             self.navigation_context(status=NavigationStatus.FAILED, message="SafetyFailed cause=StaleInput: fixture"),
             self.navigation_context(),
-        ]
+        ], create=True))
         self.mcp_call(gateway, {"frame_id": "map", "x": 4.25, "y": -1.5})
-        with patch("gateways.runtime.time.sleep"):
+        with patch("gateways.runtime.time.sleep"), self.assertRaises(GatewayError) as failure:
             self.run_latest(gateway)
-        self.assertEqual([goal.target_pose.position.z for goal in attempts], [7.25] * 3)
+        self.assertIn("SafetyFailed", str(failure.exception))
+        self.assertEqual([goal.target_pose.position.z for goal in attempts], [7.25] * 2)
         self.assertEqual([goal.model_dump(mode="json") for goal in attempts],
-            [attempts[0].model_dump(mode="json")] * 3)
+            [attempts[0].model_dump(mode="json")] * 2)
         gateway.map_workspace_service.get_relocalized_pose.assert_called_once()
 
     def test_unresolved_height_marker_is_blocked_at_dispatch_boundary(self):
         gateway = self.configure_runner(self.gateway())
-        gateway._resolve_navigation_goal_height = lambda goal, *, workspace: goal
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, '_resolve_navigation_goal_height', lambda goal, *, workspace: goal, create=True))
         self.mcp_call(gateway, {"frame_id": "map", "x": 4.25, "y": -1.5})
         with self.assertRaises(GatewayError) as raised:
             self.run_latest(gateway)
@@ -583,15 +580,13 @@ class NavigationGoalHeightOwnedSampleTests(unittest.TestCase):
         self.owner.relocalize()
         self.gateway_runtime = self.configure_runner(self.gateway())
         gateway = self.gateway_runtime
-        gateway.map_workspace_service = self.owner.service
-        gateway.localization_service = self.owner.localization
-        gateway._resolve_map_workspace_for_request = GatewayRuntime._resolve_map_workspace_for_request.__get__(gateway)
-        gateway._ensure_localization_for_navigation = GatewayRuntime._ensure_localization_for_navigation.__get__(gateway)
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'map_workspace_service', self.owner.service, create=True))
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'localization_service', self.owner.localization, create=True))
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, '_resolve_map_workspace_for_request', GatewayRuntime._resolve_map_workspace_for_request.__get__(gateway), create=True))
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, '_ensure_localization_for_navigation', GatewayRuntime._ensure_localization_for_navigation.__get__(gateway), create=True))
         guard = ExitStack()
         self.addCleanup(guard.close)
         guard.enter_context(self.owner.forbid_unpaired_pose())
-        guard.enter_context(patch.object(self.owner.runtime, "get_external_live_pose",
-            side_effect=AssertionError("GO2 调试位姿旁路")))
         self.owner.stub.sample_mutation = self.fresh_sample
 
     @staticmethod
@@ -641,18 +636,21 @@ class NavigationGoalHeightOwnedSampleTests(unittest.TestCase):
             mutate()
             return result
 
-        gateway._ensure_localization_for_navigation = wrapped
+        self._gateway_overrides[gateway].enter_context(patch.object(gateway, '_ensure_localization_for_navigation', wrapped, create=True))
         with self.assertRaises(GatewayError) as raised:
             self.invoke()
         self.assertEqual(raised.exception.error_code, "navigation_height_unavailable")
         self.assertEqual(raised.exception.details["reason"], "owned_pose_unavailable")
         gateway.navigation_service.set_goal.assert_not_called()
 
-    def test_mismatched_native_correction_owner_after_preparation_cannot_dispatch(self):
-        def mismatch(sample):
-            self.fresh_sample(sample)
-            sample.correction_owner.correction_lease_generation += 1
-        self.fail_after_preparation(lambda: setattr(self.owner.stub, "sample_mutation", mismatch))
+    def test_native_correction_replacement_after_preparation_cannot_dispatch(self):
+        import grpc
+        class CorrectionReplaced(grpc.RpcError):
+            def code(self): return grpc.StatusCode.FAILED_PRECONDITION
+            def details(self): return "ASSIGNED_SAMPLE_CORRECTION_REPLACED"
+        def reject(*args, **kwargs):
+            raise CorrectionReplaced()
+        self.fail_after_preparation(lambda: setattr(self.owner.stub, "GetAssignedLocalizationSample", reject))
 
     def test_missing_native_sample_geometry_after_preparation_cannot_dispatch(self):
         self.fail_after_preparation(lambda: setattr(self.owner.stub, "sample_mutation",

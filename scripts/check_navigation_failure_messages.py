@@ -2,6 +2,8 @@
 """Real task/receipt projections with isolated navigation endpoints, no motion."""
 import json
 import sys
+import tempfile
+from unittest.mock import patch
 import unittest
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -19,15 +21,15 @@ from gateways.feedback import build_mcp_tool_result  # noqa: E402
 
 class NavigationFailureMessageTests(unittest.TestCase):
     def setUp(self):
-        self.bus = EventBus()
-        self.manager = TaskManager(event_bus=self.bus, resource_lock_manager=ResourceLockManager())
-        self.addCleanup(self.bus.shutdown, 2)
-        self.addCleanup(self.manager.shutdown, wait=True)
-        self.runtime = GatewayRuntime.__new__(GatewayRuntime)
+        from tests.conftest import create_isolated_gateway
+        directory = tempfile.TemporaryDirectory(prefix="nuwax-navigation-message-")
+        self.addCleanup(directory.cleanup)
+        self.runtime = create_isolated_gateway(Path(directory.name), register_default_capabilities=True)
+        self.addCleanup(self.runtime.stop)
+        self.bus, self.manager = self.runtime.event_bus, self.runtime.task_manager
         runtime = self.runtime
         runtime.event_bus, runtime.task_manager = self.bus, self.manager
         runtime._task_status_last_polled_at = {}
-        runtime.capability_registry = NS(get_descriptor=lambda _: NS(required_resources=[], display_name='离线导航'))
         runtime._reconcile_navigation_quarantine = lambda: {'pending': False}
         runtime._goal_with_motion_admission = lambda goal, admission: goal
         runtime._run_with_motion_admission = lambda admission, operation: operation()
@@ -37,7 +39,7 @@ class NavigationFailureMessageTests(unittest.TestCase):
         runtime._task_generation_rollovers = lambda *args: {}
         runtime._estimate_navigation_progress = lambda context: 0.1
         runtime._build_task_request_metadata = lambda **kwargs: {}
-        runtime.memory_service = NS(resolve_navigation_region=lambda goal: None)
+        runtime.memory_service.resolve_navigation_region = lambda goal: None
         runtime._navigation_terminal_proof = lambda context, **kwargs: {
             'goal_id': kwargs['goal_id'], 'parking_confirmed': True}
         runtime._cancel_navigation_with_safety_barrier = lambda *a, **k: self.fail('unexpected motion/cancel path')
@@ -60,7 +62,8 @@ class NavigationFailureMessageTests(unittest.TestCase):
             self.set_calls.append(goal.goal_id)
             return self.current
 
-        self.runtime.navigation_service = NS(set_goal=set_goal, refresh_navigation=refresh)
+        self.runtime.navigation_service.set_goal = set_goal
+        self.runtime.navigation_service.refresh_navigation = refresh
         return self.runtime._submit_navigation_task(capability_name='navigate_to_pose',
             goal=NavigationGoal(goal_id='offline-goal', map_name='map', target_name='fixture'),
             motion_admission=object(), poll_interval_sec=0.02, timeout_sec=2,

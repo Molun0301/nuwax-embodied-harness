@@ -326,22 +326,13 @@ _PROTO_NAMES.update({
 
 
 def _project_proto(message: Any, kind: str) -> dict[str, Any]:
-    """Preserve presence, integer bits and bytes; reject mixed/unknown fields.
-
-    Unknown protobuf fields cannot disappear silently at the DTO boundary.
-    Existing legacy scalar fields may exist in the descriptor only at default.
-    """
+    """按已知协议模式保留字段存在性、整数位和字节，不重序列化未知字段。"""
     kind = _resolve_kind(message, kind)
     if message.DESCRIPTOR.full_name != 'nuwax.geometry.' + _PROTO_NAMES[kind]:
         raise ValueError('protobuf message type differs from assigned contract')
     known = {name for name, _, _ in _SCHEMA[kind]}
     if any(field.name not in known for field, _ in message.ListFields()):
         raise ValueError('protobuf mixes assigned and legacy/unsupported fields')
-    clean = type(message)()
-    clean.CopyFrom(message)
-    clean.DiscardUnknownFields()
-    if clean.SerializeToString(deterministic=True) != message.SerializeToString(deterministic=True):
-        raise ValueError('protobuf contains unknown fields')
     result = {}
     for name, number, field_kind in _SCHEMA[kind]:
         descriptor = message.DESCRIPTOR.fields_by_name.get(name)

@@ -34,15 +34,13 @@ LIBRARY = "synthetic-instance-library"
 
 
 def memory_fixture(count=500):
-    # Exercise actual MemoryService projection and source limit without starting
-    # any service, storage worker, embedding backend or device.
-    owner = MemoryService.__new__(MemoryService)
+    from core import StateStore
+    owner = MemoryService(localization_service=None, mapping_service=None,
+        observation_service=None, perception_service=None, state_store=StateStore(),
+        text_embedding_model="disabled", image_embedding_model="disabled")
     owner._memory_enabled = True
     owner._active_library_name = LIBRARY
-    owner._instances_lock = threading.RLock()
-    owner._instance_association_service = InstanceAssociationService(text_embedder=None)
-    owner._repository = SimpleNamespace(load_semantic_instances=lambda **kw: [])
-    owner._semantic_instances_by_id = {}
+    owner._durable_index.activate(LIBRARY, load_history=False)
     for index in range(count):
         instance = SemanticInstance(
             instance_id="ins_synthetic_20260101T000000Z_%08x" % index,
@@ -63,8 +61,11 @@ def memory_fixture(count=500):
 
 def snapshot_fixture(count=500, limit=500):
     owner = memory_fixture(count)
-    with patch("services.memory.service.utc_now", return_value=NOW):
-        payload = owner.get_semantic_instances_snapshot(limit=limit)
+    try:
+        with patch("services.memory.service.utc_now", return_value=NOW):
+            payload = owner.get_semantic_instances_snapshot(limit=limit)
+    finally:
+        owner.close()
     payload.pop("_next_update_at")  # SemanticInstancePublisher consumes this internal deadline.
     return payload
 
@@ -81,6 +82,7 @@ def sse_value(encoded):
 class InstanceStreamContractChecks(unittest.TestCase):
     def test_500_source_rows_keep_every_id_and_field_in_ws_and_sse(self):
         owner = memory_fixture()
+        self.addCleanup(owner.close)
         with patch("services.memory.service.utc_now", return_value=NOW):
             payload = owner.get_semantic_instances_snapshot()
             agent_rows = owner.list_semantic_instances(library_name=LIBRARY)

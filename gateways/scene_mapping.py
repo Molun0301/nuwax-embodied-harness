@@ -79,8 +79,6 @@ def _handle(runtime, operation, arguments: Dict[str, Any], *, requested_by=None,
 
         def runner(context):
             context.ensure_active()
-            with runtime.memory_service._instances_lock:
-                runtime.memory_service._assert_scene_mapping_capture(capture, require_content=False)
             context.update(stage="semantic_mapping", message="正在提取区域及核对观察证据。")
             result = service.run_once(apply_labels=arguments.get("apply_labels"), cancel_check=context.ensure_active, expected_capture=capture)
             context.ensure_active()

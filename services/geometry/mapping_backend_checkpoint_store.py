@@ -31,7 +31,6 @@ from typing import (
     Mapping,
     Optional,
     Sequence,
-    Set,
     Tuple,
     Union,
 )
@@ -154,7 +153,6 @@ class MappingBackendCheckpoint:
     backend_identity: Optional[CheckpointMemberIdentity] = None
     occupancy_identity: Optional[CheckpointMemberIdentity] = None
     graph_reference: Optional[CheckpointArtifactReference] = None
-    _admission: object = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self):
         object.__setattr__(self, "occupancy_receipt", _freeze(self.occupancy_receipt))
@@ -257,12 +255,6 @@ class MappingBackendCheckpointStore:
     ]:
         """Validate one in-memory export bundle without touching the filesystem."""
 
-        if checkpoint.schema_version == 2 and checkpoint._admission is not None:
-            old_occupancy, old_cloud = checkpoint._admission
-            payload_limit = (MAX_PLANAR_ARCHIVE_BYTES if checkpoint.backend_kind == "slam_toolbox"
-                and max_payload_bytes == MAX_MAPPING_BACKEND_CHECKPOINT_BYTES else max_payload_bytes)
-            if occupancy_asset == old_occupancy and cloud_asset == old_cloud and checkpoint.payload_size <= payload_limit:
-                return checkpoint, old_occupancy, old_cloud
         validator = cls(Path.cwd(), max_payload_bytes=max_payload_bytes)
         validated_checkpoint = validator._validate_checkpoint(checkpoint)
         validated_occupancy_asset = _validate_occupancy_asset(
@@ -279,7 +271,6 @@ class MappingBackendCheckpointStore:
             _validate_canonical_members(validated_checkpoint, validated_occupancy_asset, validated_cloud_asset)
             validated_occupancy_asset = _freeze(validated_occupancy_asset)
             validated_cloud_asset = _freeze(validated_cloud_asset)
-            object.__setattr__(validated_checkpoint, "_admission", (validated_occupancy_asset, validated_cloud_asset))
         return (
             validated_checkpoint,
             validated_occupancy_asset,
@@ -294,20 +285,12 @@ class MappingBackendCheckpointStore:
         cloud_asset: Optional[Mapping[str, object]],
         fault_injector: Optional[FaultInjector] = None,
     ) -> StoredMappingBackendCheckpoint:
-        """Validate and publish object, manifest, then stable selector."""
+        """发布已在读取或导出边界解码的包、清单和当前选择器。"""
 
         if checkpoint.schema_version == 2:
             return self._publish_v2(checkpoint, occupancy_asset, cloud_asset, fault_injector)
-        validated = self._validate_checkpoint(checkpoint, legacy_write=True)
-        validated_occupancy_asset = _validate_occupancy_asset(
-            occupancy_asset, sha256_encoding="bytes"
-        )
-        validated_cloud_asset = _validate_optional_cloud(cloud_asset, validated.backend_kind, sha256_encoding="bytes")
-        _validate_asset_bindings(
-            validated,
-            validated_occupancy_asset,
-            validated_cloud_asset,
-        )
+        validated = checkpoint
+        validated_occupancy_asset, validated_cloud_asset = occupancy_asset, cloud_asset
         access = self._ensure_layout(validated.backend_kind, exclusive=True)
         try:
             paths = access.paths
@@ -589,7 +572,7 @@ class MappingBackendCheckpointStore:
                 _unlink_at_if_same(access.objects_fd, name, identity)
 
     def _validate_checkpoint(
-        self, checkpoint: MappingBackendCheckpoint, *, legacy_write: bool = False
+        self, checkpoint: MappingBackendCheckpoint
     ) -> MappingBackendCheckpoint:
         if not isinstance(checkpoint, MappingBackendCheckpoint):
             raise MappingBackendCheckpointValidationError(
@@ -637,8 +620,6 @@ class MappingBackendCheckpointStore:
             if checkpoint.graph_reference is not None or checkpoint.checkpoint_id or checkpoint.cloud_identity is not None or checkpoint.backend_identity is not None or checkpoint.occupancy_identity is not None:
                 raise MappingBackendCheckpointValidationError("legacy checkpoint cannot carry assigned identity")
             content_sha256 = _require_sha256_bytes(checkpoint.content_sha256)
-            if legacy_write and payload_digest(payload) != content_sha256:
-                raise MappingBackendCheckpointValidationError("content_sha256 does not match checkpoint payload")
         occupancy_receipt = _validate_occupancy_receipt(
             checkpoint.occupancy_receipt,
             source_session_id=source_session_id,
@@ -1076,9 +1057,6 @@ class MappingBackendCheckpointStore:
         )
 
     def _publish_v2(self, checkpoint, occupancy_asset, cloud_asset, fault_injector):
-        checkpoint, occupancy_asset, cloud_asset = self.validate_checkpoint_bundle(
-            checkpoint, occupancy_asset=occupancy_asset, cloud_asset=cloud_asset,
-            max_payload_bytes=self._max_payload_bytes)
         access = _open_store_access(self._version_dir, checkpoint.backend_kind, 2,
             create=True, exclusive=True, lock_timeout_seconds=self._lock_timeout_seconds)
         try:

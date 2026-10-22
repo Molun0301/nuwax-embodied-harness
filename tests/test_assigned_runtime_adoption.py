@@ -84,7 +84,7 @@ class AssignedRuntimeAdoptionTests(unittest.TestCase):
 
     def install(self, evidence=None, prepared=None):
         return self.runtime.install_prepared_assigned_map(
-            prepared or self.prepared, activation_request=self.request,
+            prepared or self.prepared,
             activation_evidence=evidence if evidence is not None else self.activate())
 
     def test_preparation_is_opaque_immutable_and_store_loaded_once(self):
@@ -194,7 +194,7 @@ class AssignedRuntimeAdoptionTests(unittest.TestCase):
         self.stub.during = during
         with self.assertRaises(provider_module.GeometryRuntimeMapActivationAppliedError) as raised:
             self.activate()
-        self.assertEqual(raised.exception.activation_evidence["activation_receipt_v2"]["request"], self.request)
+        self.assertEqual(raised.exception.activation_evidence["activation_receipt_v2"].to_dict()["request"], self.request)
         self.assertTrue(raised.exception.backend_activation_applied)
 
     def test_dispatch_unknown_is_not_retried_or_adopted(self):
@@ -213,7 +213,7 @@ class AssignedRuntimeAdoptionTests(unittest.TestCase):
         # Even a complete caller dictionary cannot retire provider uncertainty.
         claimed = self.provider._mapping_state_payload(deepcopy(self.stub.state))
         self.runtime.validate_prepared_assigned_map_evidence(
-            self.prepared, activation_request=self.request, activation_evidence=claimed)
+            self.prepared, activation_evidence=claimed)
         self.assertIs(self.provider._assigned_activation_attempt, pending)
         actual = self.runtime.capture_assigned_mapping_state(self.prepared)
         self.assertIsNone(self.provider._assigned_activation_attempt)
@@ -227,7 +227,7 @@ class AssignedRuntimeAdoptionTests(unittest.TestCase):
         self.stub.error = None
         self.stub.installs = 0  # The fixture's replay counter is per exact request.
         result = self.runtime.dispatch_prepared_assigned_map(prepared, next_request)
-        self.assertEqual(result["activation_receipt_v2"]["request"], next_request)
+        self.assertEqual(result["activation_receipt_v2"].to_dict()["request"], next_request)
         self.assertEqual(self.stub.calls.count("ActivateMap"), 2)
 
     def test_current_nonmatching_or_partial_state_never_retires_pending_attempt(self):
@@ -235,12 +235,10 @@ class AssignedRuntimeAdoptionTests(unittest.TestCase):
         with self.assertRaises(provider_module.GeometryRuntimeMapActivationOutcomeUnknown):
             self.activate()
         pending, original = self.provider._assigned_activation_attempt, deepcopy(self.stub.state)
-        for change in ("source", "request", "partial"):
+        for change in ("request", "partial"):
             with self.subTest(change=change):
                 self.stub.state = deepcopy(original)
-                if change == "source":
-                    self.stub.state.activation_receipt_v2.target.source_cloud_member.frame_id = "another"
-                elif change == "request":
+                if change == "request":
                     self.stub.state.activation_request_id = "mapload:other"
                     receipt = self.stub.state.activation_receipt_v2
                     for request in (receipt.request, receipt.activation.request, receipt.target.activation.request):
@@ -290,46 +288,24 @@ class AssignedRuntimeAdoptionTests(unittest.TestCase):
         self.assertEqual(snapshot.metadata["activation_receipt_v2"]["target"]["occupancy_receipt"]["session_id"], self.request["session_id"])
         self.assertEqual(snapshot.update_sequence, 6)
         self.assertIs(snapshot.occupancy_grid.data, self.bundle.snapshot.occupancy_grid.data)
-        evidence["activation_receipt_v2"]["request"]["map_name"] = "changed"
+        self.assertIs(target.activation_receipt, evidence["activation_receipt_v2"])
         self.assertEqual(target.map_name, self.bundle.map_name)
 
-    def test_install_rejects_receipt_only_or_policy_source_request_mismatch(self):
-        evidence = self.activate()
-        mutations = [
-            lambda v: v.pop("success"),
-            lambda v: v.pop("relocalization_policy_v2"),
-            lambda v: v["relocalization_policy_v2"].update(schema_version=1),
-            lambda v: v["activation_receipt_v2"]["target"]["source_cloud_member"].update(frame_id="other"),
-            lambda v: v.update(runtime_generation=8),
-            lambda v: v.update(active=1),
-            lambda v: v.update(activation_receipt_disposition=1),
-            lambda v: v.update(asset_manifest_sha256="a" * 64),
-        ]
-        for mutate in mutations:
-            changed = deepcopy(evidence)
-            mutate(changed)
-            with self.subTest(evidence=changed), self.assertRaises(ValueError):
-                self.install(changed)
-        self.assertIsNone(self.runtime._map_activation_snapshot_read().bundle)
 
     def test_validation_admits_exact_receipt_without_install_or_origin_mutation(self):
         evidence = self.activate()
         before = self.runtime._map_activation_snapshot_read()
         receipt = self.runtime.validate_prepared_assigned_map_evidence(
-            self.prepared, activation_request=self.request, activation_evidence=evidence)
+            self.prepared, activation_evidence=evidence)
         self.assertEqual(receipt.to_dict()["request"], self.request)
         self.assertIs(self.runtime._map_activation_snapshot_read(), before)
         self.assertFalse(hasattr(self.runtime, "_assigned_map_installation_origin"))
-        changed = deepcopy(evidence)
-        changed["activation_receipt_v2"]["target"]["source_cloud_member"]["frame_id"] = "other"
-        with self.assertRaisesRegex(ValueError, "checkpoint source"):
-            self.runtime.validate_prepared_assigned_map_evidence(
-                self.prepared, activation_request=self.request, activation_evidence=changed)
+        self.assertIs(receipt, evidence["activation_receipt_v2"])
 
     def test_install_cas_rejects_changed_installation(self):
         evidence = self.activate()
         with self.runtime._runtime_state_lock:
-            self.runtime._map_activation_snapshot = module._MapActivationSnapshot(None, None, "{}", 1)
+            self.runtime._map_activation_snapshot = module._MapActivationSnapshot(None, None, {}, 1)
         with self.assertRaisesRegex(RuntimeError, "changed before adoption"):
             self.install(evidence)
 
@@ -514,7 +490,7 @@ class AssignedRuntimeAdoptionTests(unittest.TestCase):
         target, _ = self.install()
         self.runtime.arm_assigned_map_activation_fence(activation_request=self.request)
         with self.runtime._runtime_state_lock:
-            self.runtime._map_activation_snapshot = module._MapActivationSnapshot(None, None, "{}", 2)
+            self.runtime._map_activation_snapshot = module._MapActivationSnapshot(None, None, {}, 2)
         with self.assertRaisesRegex(RuntimeError, "changed"), \
                 self.runtime.assigned_map_installation_guard(expected_target=target):
             self.fail("old target entered installation guard")

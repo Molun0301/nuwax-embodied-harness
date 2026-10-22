@@ -64,7 +64,7 @@ def main():
     calls=[];events=[]
     def construct():
         memory=MemoryService(localization_service=SimpleNamespace(get_active_session=lambda:None,get_latest_snapshot=lambda:None),
-            mapping_service=SimpleNamespace(get_latest_snapshot=lambda:snapshot),observation_service=SimpleNamespace(),perception_service=SimpleNamespace(),
+            mapping_service=SimpleNamespace(get_latest_snapshot=lambda:snapshot,get_semantic_snapshot=lambda:snapshot),observation_service=SimpleNamespace(),perception_service=SimpleNamespace(),
             state_store=SimpleNamespace(write=lambda *a,**k:None),memory_db_path=str(output/'memory.db'),
             text_embedding_model="disabled",image_embedding_model="disabled",artifact_store=LocalArtifactStore(str(artifacts),'http://historical-replay.invalid'))
         memory.activate_memory_library(library_name=map_name)

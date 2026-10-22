@@ -6,7 +6,6 @@ import json
 import sys
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -15,7 +14,6 @@ from contracts.spatial_memory import InstanceDynamicState
 from scripts import check_memory_durable_integration as helpers
 from scripts.check_memory_storage_transactions import records
 from services.memory.durable_index import SOURCES
-from services.memory.vector_store import SQLiteNamedVectorStore
 
 
 class SnapshotPayloadOwnershipChecks(unittest.TestCase):
@@ -25,23 +23,9 @@ class SnapshotPayloadOwnershipChecks(unittest.TestCase):
     claim = helpers.IntegrationChecks.claim
     query = helpers.IntegrationChecks.query
 
-    def cache_fixture(self, mode):
-        backing = None
-        store = None
-        if mode != 'shared':
-            backing = SQLiteNamedVectorStore()
-            self.addCleanup(backing.close)
-            store = backing
-            if mode == 'external':
-                store = SimpleNamespace(
-                    backend_name='opaque-ownership-fixture',
-                    get_point=backing.get_point,
-                    get_points_batch=backing.get_points_batch,
-                    upsert_point=backing.upsert_point,
-                    delete_points=backing.delete_points,
-                )
-        service = self.fixture(store=store)
-        return service, backing or service._vector_store
+    def cache_fixture(self):
+        service = self.fixture()
+        return service, service._vector_store
 
     @staticmethod
     def stored_bytes(service, backing):
@@ -115,21 +99,19 @@ class SnapshotPayloadOwnershipChecks(unittest.TestCase):
         self.assertEqual(before, self.stored_bytes(service, backing))
 
     def test_outer_ownership_all_kinds_and_cache_boundaries(self):
-        for mode in ('shared', 'separate', 'external'):
-            for persisted in (False, True):
-                for readiness in (False, True):
-                    with self.subTest(mode=mode, persisted=persisted, readiness=readiness):
-                        service, backing = self.cache_fixture(mode)
-                        visible = self.populate(service, persisted)
-                        self.assert_owned(service, backing, visible, readiness)
+        for persisted in (False, True):
+            for readiness in (False, True):
+                with self.subTest(persisted=persisted, readiness=readiness):
+                    service, backing = self.cache_fixture()
+                    visible = self.populate(service, persisted)
+                    self.assert_owned(service, backing, visible, readiness)
 
     def test_unindexed_sources_own_fresh_payloads(self):
-        for mode in ('shared', 'separate', 'external'):
-            for readiness in (False, True):
-                with self.subTest(mode=mode, readiness=readiness):
-                    service, backing = self.cache_fixture(mode)
-                    visible = self.populate(service, True, indexed=False)
-                    self.assert_owned(service, backing, visible, readiness)
+        for readiness in (False, True):
+            with self.subTest(readiness=readiness):
+                service, backing = self.cache_fixture()
+                visible = self.populate(service, True, indexed=False)
+                self.assert_owned(service, backing, visible, readiness)
 
     def test_source_errors_precede_cached_point_decode(self):
         for raw in ('{', '[]', json.dumps({'observation_count': -1})):

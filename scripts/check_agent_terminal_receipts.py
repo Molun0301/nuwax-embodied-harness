@@ -107,7 +107,7 @@ class TerminalStoreChecks(unittest.TestCase):
 
 class PublicReceiptErrorChecks(unittest.TestCase):
     def test_new_receipt_errors_never_claim_action_failed_or_invite_replay(self):
-        codes = ("task_receipt_unsupported", "task_receipt_unavailable", "agent_call_result_unsupported",
+        codes = ("task_receipt_unavailable", "agent_call_result_unsupported",
                  "agent_terminal_version_required",
                  "agent_terminal_identity_conflict", "agent_terminal_scope_conflict", "agent_terminal_legacy_conflict",
                  "agent_terminal_source_conflict", "agent_terminal_revision_conflict")
@@ -224,7 +224,6 @@ class AgentReceiptChecks(unittest.TestCase):
         original = TaskSpec(task_id="task_offline_20261002t000000z_12345678", capability_name="offline", metadata={"values": [1]})
         task_id = self.finish(original)
         first = self.service.get_task_result(task_id)
-        original.metadata["values"].append(2)
         capture = self.manager.capture_task_receipt(task_id)
         capture.snapshot()["result"].metadata["values"].append(3)
         self.manager.get_task_result(task_id).metadata["values"].append(4)
@@ -330,41 +329,34 @@ class AgentReceiptChecks(unittest.TestCase):
             self.assertEqual(self.service._terminal_projection_bytes, 7)
 
     def test_capture_and_projection_failures_never_change_outcome_or_replay(self):
-        class Uncopyable:
-            def __deepcopy__(self, memo):
-                raise TypeError("不可复制")
         class Unserializable:
             __slots__ = ("value",)
             def __init__(self):
                 self.value = object()
-        for value in (Uncopyable(), Unserializable()):
+        for value in (Unserializable(),):
             task_id = self.finish(value)
             with self.assertRaises(GatewayError):
                 self.service.get_task_result(task_id)
             self.assertEqual(self.manager.get_task_status(task_id).state, "succeeded")
-        self.assertEqual(self.actions, [1, 1])
+        self.assertEqual(self.actions, [1])
 
-    def test_web_and_agent_capture_errors_have_same_receipt_truth(self):
-        class Uncopyable:
-            def __deepcopy__(self, memo):
-                raise TypeError("不可复制")
-        task_id = self.finish(Uncopyable())
-        errors = []
-        for operation in (self.runtime.get_task_snapshot, self.service.get_task_result):
+    def test_web_and_agent_projection_errors_preserve_task_outcome(self):
+        from gateways.feedback import build_mcp_tool_result
+        class Unserializable:
+            __slots__ = ("value",)
+            def __init__(self): self.value = object()
+        task_id = self.finish(Unserializable())
+        for operation in (lambda task: build_mcp_tool_result(self.runtime.get_task_snapshot(task)), self.service.get_task_result):
             with self.assertRaises(GatewayError) as caught:
                 operation(task_id)
-            errors.append(build_public_error_payload(caught.exception, task_id=task_id))
-        self.assertEqual(errors[0], errors[1])
-        self.assertEqual(errors[0]["code"], "task_receipt_unsupported")
-        self.assertEqual(errors[0]["error_category"], "receipt")
-        self.assertFalse(errors[0]["retryable"])
+            self.assertEqual(caught.exception.error_code, "mcp_result_unavailable")
         self.assertEqual(self.manager.get_task_status(task_id).state, "succeeded")
         self.assertEqual(self.actions, [1])
 
     def test_agent_invoke_preserves_known_acceptance_when_full_metadata_cannot_encode(self):
         class Opaque:
-            def __deepcopy__(self, memo):
-                raise TypeError("unused metadata")
+            __slots__ = ("value",)
+            def __init__(self): self.value = object()
         capability, tool_name = "offline_task", "offline_tool"
         from contracts.capabilities import CapabilityDescriptor, CapabilityRiskLevel
         from contracts.skills import SkillDescriptor, SkillCategory
@@ -401,29 +393,6 @@ class AgentReceiptChecks(unittest.TestCase):
         full = self.service.get_call_result("opaque-accepted")
         self.assertEqual(full["result"]["task_id"], first["task_id"])
         self.assertFalse(full["error"]["details"]["full_response_available"])
-
-    def test_cross_service_identity_preserving_results_are_explicitly_unsupported(self):
-        def callback():
-            pass
-        callback.value = 1
-        class SharedBox:
-            def __init__(self):
-                self.values = [1]
-            def __deepcopy__(self, memo):
-                result = SharedBox()
-                result.values = self.values
-                return result
-        other = AgentToolService(self.runtime, self.access)
-        self.services.append(other)
-        for result in (callback, {"callback": callback}, SharedBox()):
-            task_id = self.finish(result)
-            for service in (self.service, other):
-                with self.assertRaises(GatewayError) as caught:
-                    service.get_task_result(task_id)
-                self.assertEqual(caught.exception.error_code, "task_receipt_unsupported")
-            self.assertEqual(self.manager.get_task_status(task_id).state, "succeeded")
-            self.assertEqual(self.service.store.find_by_task(task_id), None)
-        self.assertEqual(self.actions, [1, 1, 1])
 
     def test_cancel_timeout_persist_returned_evidence_once(self):
         for timeout in (False, True):

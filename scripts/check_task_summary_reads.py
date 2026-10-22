@@ -57,9 +57,6 @@ class LastOnlyEvents(list):
         return super().__getitem__(key)
 
 
-class OpaqueLabel:
-    def __str__(self):
-        return "synthetic opaque correlation"
 
 
 class TaskSummaryReads(unittest.TestCase):
@@ -208,7 +205,7 @@ class TaskSummaryReads(unittest.TestCase):
         old = self.manager.get_task_events(task_id)[-1]
         entered, release, done = threading.Event(), threading.Event(), threading.Event()
         self.gates.append(release)
-        original, results, errors = task_module._copy_task_value, [], []
+        original, results, errors = task_module._snapshot, [], []
         def gated(value, *args, **kwargs):
             if threading.current_thread().name == "summary-reader" and value is self.manager._records[task_id].events[0]:
                 self.assertFalse(self.manager._lock._is_owned())
@@ -223,7 +220,7 @@ class TaskSummaryReads(unittest.TestCase):
             finally:
                 done.set()
         reader = threading.Thread(target=read, name="summary-reader")
-        with patch.object(task_module, "_copy_task_value", gated):
+        with patch.object(task_module, "_snapshot", gated):
             reader.start()
             try:
                 self.assertTrue(entered.wait(2))
@@ -238,16 +235,6 @@ class TaskSummaryReads(unittest.TestCase):
         self.assertEqual(results, [old])
         self.assertEqual(self.manager.get_latest_task_event(task_id), newer)
 
-    def test_opaque_context_keeps_http_event_visibility_and_acceptance_policy(self):
-        task = self.manager.submit("offline_task", lambda context: None,
-                                   metadata={"request_context": {"tool_name": OpaqueLabel()}})
-        self.manager.wait_for_task(task.task_id, timeout=2)
-        self.assertTrue(self.manager._records[task.task_id].opaque_event_context)
-        self.assertIsNone(self.manager.capture_task_status_event(task.task_id)[1])
-        expected = self.old_summary(self.manager.get_task_status(task.task_id))
-        self.assertIn("feedback", expected)
-        self.assertEqual(self.request(1)["history_tasks"], [expected])
-        self.assertIsNone(self.manager.capture_task_status_event(task.task_id)[1])
 
     def test_http_zero_and_negative_limit_keep_active_tasks(self):
         self.record()
@@ -308,7 +295,7 @@ class TaskSummaryReads(unittest.TestCase):
                 active_ids.append(task_id)
         expected = self.manager.list_active_tasks()
         with patch.object(task_module, "deepcopy", side_effect=AssertionError("scalar query copied statuses")):
-            with patch.object(task_module, "_copy_task_value", side_effect=AssertionError("scalar query copied payload")):
+            with patch.object(task_module, "_snapshot", side_effect=AssertionError("scalar query copied payload")):
                 self.assertEqual(self.manager.count_active_tasks(), len(expected))
                 self.assertTrue(self.manager.has_active_tasks())
         self.assertEqual([status.task_id for status in self.manager.list_active_tasks()], active_ids)

@@ -195,15 +195,19 @@ class AssignedExplorationCycleTests(unittest.TestCase):
         self.stub.owner = self.provider
         self.stub.during = self.assert_unlocked
         self.tasks = TaskEndpoint()
-        self.gateway = object.__new__(GatewayRuntime)
-        self.gateway.config = SimpleNamespace(geometry=SimpleNamespace(pipeline="lio_3d"),
-            runtime_data=SimpleNamespace(map_catalog_root=str(self.root)))
-        self.gateway.platform_geometry_runtime = self.runtime
-        self.gateway.map_workspace_service = self.service
-        self.gateway.task_manager = self.tasks
-        self.gateway._refresh_workspace_snapshots = lambda: None
-        self.gateway.event_bus = SimpleNamespace(build_event=lambda *args, **kwargs: kwargs,
-            publish=lambda value: None)
+        from tests.conftest import create_isolated_gateway
+        self.gateway = create_isolated_gateway(self.root / "gateway-owner")
+        self.addCleanup(self.gateway.stop)
+        self.gateway_overrides = ExitStack()
+        self.addCleanup(self.gateway_overrides.close)
+        self.gateway.config.geometry.pipeline = "lio_3d"
+        self.gateway.config.runtime_data.map_catalog_root = str(self.root)
+        self.gateway_overrides.enter_context(patch.object(self.gateway, "platform_geometry_runtime", self.runtime))
+        self.gateway_overrides.enter_context(patch.object(self.gateway, "map_workspace_service", self.service))
+        self.gateway_overrides.enter_context(patch.object(self.gateway, "task_manager", self.tasks))
+        self.gateway_overrides.enter_context(patch.object(self.gateway, "_refresh_workspace_snapshots", lambda: None))
+        self.gateway_overrides.enter_context(patch.object(self.gateway, "event_bus",
+            SimpleNamespace(build_event=lambda *args, **kwargs: kwargs, publish=lambda value: None)))
         self.request = ExploreAreaRequest(request_id="exploration:source", map_name=MAP_NAME,
             metadata={"motion_admission": {"old": True}, "purpose": "two-cycle acceptance"})
         self.context = self.add_task("task:first", self.request)
@@ -492,15 +496,17 @@ class AssignedExplorationCycleTests(unittest.TestCase):
             self.assertEqual(self.stub.exports, [2, 2])
 
     def test_stale_native_sample_cannot_complete_resume(self):
-        def stale(sample):
-            for value in (sample.pose, sample.map_from_odom, sample.odom_from_body):
-                value.timestamp_ns = 1
+        import grpc
+        from services.geometry.geometry_runtime_provider import GeometryRuntimeRpcError
+        class SampleStale(grpc.RpcError):
+            def code(self): return grpc.StatusCode.FAILED_PRECONDITION
+            def details(self): return "ASSIGNED_SAMPLE_POSE_OR_TF_STALE"
 
         with self.cloud_only():
             saved = self.pause()
-            self.stub.sample_mutation = stale
-            with self.assertRaises((ValueError, GatewayError)):
-                self.resume(saved)
+            with patch.object(self.stub, "GetAssignedLocalizationSample", side_effect=SampleStale()):
+                with self.assertRaises((GatewayError, GeometryRuntimeRpcError)):
+                    self.resume(saved)
         session = self.localization.get_active_session()
         self.assertNotEqual(session.status, LocalizationSessionStatus.READY)
         self.assertFalse(session.pose_available)

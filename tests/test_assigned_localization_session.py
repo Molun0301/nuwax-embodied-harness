@@ -356,7 +356,7 @@ class AssignedSessionServiceTests(unittest.TestCase):
             self.provider.backend['nested']['value'] = 99
         self.provider.block = block
         prepared = self.prepare(terminal=applied_terminal(), metadata=metadata, geometry_asset=geometry, refresh=True)
-        self.provider.pose.position.x = 99
+        self.provider.pose = self.provider.pose.model_copy(update={"position": self.provider.pose.position.model_copy(update={"x": 99})})
         with self.service.assigned_session_publication_scope() as scope:
             with patch.object(self.service, '_get_localization_provider', side_effect=AssertionError('provider inside commit')):
                 result = self.commit(prepared, scope)
@@ -365,7 +365,9 @@ class AssignedSessionServiceTests(unittest.TestCase):
         self.assertEqual(result.session.metadata['diagnostics']['metadata']['backend_state']['nested']['value'], 1)
         self.assertEqual(self.service.get_latest_snapshot().current_pose.position.x, 0)
         self.assertTrue({'available', 'name', 'backend_type', 'diagnostics', 'tree', 'pose'} <= set(self.provider.calls))
-        snapshot = self.service.get_latest_snapshot()
+        shared = self.service.get_latest_snapshot()
+        self.assertIs(self.service.get_latest_snapshot(), shared)
+        snapshot = shared.model_copy(deep=True)
         snapshot.metadata['asset_identity']['asset_id'] = 'b' * 32
         snapshot.current_pose.position.x = 8
         self.assertEqual(self.service.get_latest_snapshot().current_pose.position.x, 0)
@@ -414,7 +416,7 @@ class AssignedSessionServiceTests(unittest.TestCase):
         transform = Transform(parent_frame_id='map', child_frame_id='body', timestamp=STAMP)
         self.provider.tree = FrameTree(root_frame_id='map', transforms=[transform], timestamp=STAMP)
         prepared = self.prepare(refresh=True)
-        self.provider.pose.position.x = 99
+        self.provider.pose = self.provider.pose.model_copy(update={"position": self.provider.pose.position.model_copy(update={"x": 99})})
         self.provider.tree.transforms[0].translation.x = 99
         with self.service.assigned_session_publication_scope() as scope:
             result = self.commit(prepared, scope)

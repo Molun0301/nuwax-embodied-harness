@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timezone
 import logging
 from threading import RLock
@@ -78,15 +79,17 @@ class CustomRobotProviderBundle:
         with self._lock:
             if not self._started or self._robot_state is None:
                 raise RuntimeError("尚未收到机器人状态。")
-            return self._robot_state.model_copy(deep=True)
+            state = self._robot_state
+        return state.model_copy(deep=True)
 
     def get_joint_states(self) -> List[JointState]:
         with self._lock:
-            return [joint.model_copy(deep=True) for joint in self._robot_state.joints] if self._robot_state else []
+            joints = self._robot_state.joints if self._robot_state else []
+        return deepcopy(joints)
 
     def get_imu_state(self) -> Optional[IMUState]:
         with self._lock:
-            return self._imu.model_copy(deep=True) if self._imu is not None else None
+            return self._imu
 
     def get_safety_state(self) -> SafetyState:
         with self._lock:
@@ -107,7 +110,7 @@ class CustomRobotProviderBundle:
         with self._lock:
             if not self._started:
                 return False
-            self._robot_state = state.model_copy(deep=True)
+            self._robot_state = state
             if state.imu is not None:
                 self._imu = state.imu
         self._notify("state", state)
@@ -141,7 +144,7 @@ class CustomRobotProviderBundle:
                 return False
             self._images[frame.camera_id] = frame
             if camera_info is not None:
-                self._camera_infos[frame.camera_id] = camera_info.model_copy(deep=True)
+                self._camera_infos[frame.camera_id] = camera_info
         return True
 
     def capture_image(self, camera_id: Optional[str] = None) -> ImageFrame:
@@ -151,7 +154,8 @@ class CustomRobotProviderBundle:
             selected = camera_id or next(iter(self._images))
             if selected not in self._images:
                 raise ValueError("未接入相机：%s" % selected)
-            return self._images[selected].model_copy(deep=True)
+            frame = self._images[selected]
+        return frame.model_copy(deep=True)
 
     def get_latest_image(self, camera_id: Optional[str] = None) -> Optional[ImageFrame]:
         """只读访问已发布帧，不采集硬件，也不复制图像字节。"""
@@ -179,7 +183,7 @@ class CustomRobotProviderBundle:
         with self._lock:
             selected = camera_id or next(iter(self._images), None)
             info = self._camera_infos.get(selected)
-            return info.model_copy(deep=True) if info is not None else None
+        return info.model_copy(deep=True) if info is not None else None
 
     def publish_point_cloud(self, frame: Union[PointCloudFrame, CanonicalLidarFrame]) -> bool:
         if isinstance(frame, CanonicalLidarFrame):

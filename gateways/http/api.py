@@ -18,7 +18,6 @@ from pydantic import BaseModel, Field
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.forbidden_zones import ReplaceForbiddenZonesRequest
 from contracts.navigation import NavigationGoal
-from gateways.arguments import validate_closed_schema
 from gateways.auth import GatewayAccessManager
 from gateways.errors import GatewayError, as_gateway_error
 from gateways.feedback import build_task_summary, build_mcp_tool_result
@@ -707,7 +706,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
         # 只有固定的控制台专用只读路由才会关闭公开性检查，通用调用入口始终检查。
         if require_agent_exposure:
             access_manager.authorize_capability(descriptor)
-        validate_closed_schema(arguments, descriptor.input_schema, path="arguments")
         requested_by = "local"
         request_context = _build_capability_request_context(
             request,

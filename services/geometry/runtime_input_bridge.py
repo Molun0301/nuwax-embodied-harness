@@ -1122,33 +1122,33 @@ class RuntimeInputBridge:
 
         # canonical LiDAR 是 BODY registration，仅供 native LIO；非 native/device
         # 仍沿上游已注册的 odom 点云发布，不能让 BODY bytes 冒充 odom。
-        downsampled = False
-        original_count = int(getattr(point_cloud, "point_count", 0) or 0)
-        if isinstance(canonical_lidar, CanonicalLidarFrame):
-            payload_metadata = dict(getattr(point_cloud, "metadata", {}) or {})
-            payload_metadata.pop("canonical_lidar_frame", None)
-            payload = point_cloud.model_copy(
-                update={"metadata": payload_metadata},
-                deep=False,
-            )
-        else:
-            payload = point_cloud
-        if original_count > self.max_points_before_downsample:
-            payload = self._downsample_point_cloud(payload)
-            downsampled = True
-            self._increment_counter("downsampled_pointcloud_count")
-
-        point_step, fields = self._resolve_point_layout(payload)
-        bytes_payload = self._encode_point_cloud_bytes(payload)
-        if bytes_payload is None:
-            self._increment_counter("dropped_pointcloud_count")
-            self._record_error(
-                f"PointCloud 编码失败：frame={payload.frame_id} count={payload.point_count}"
-            )
-            return
-
-        start = time.monotonic()
         try:
+            downsampled = False
+            original_count = int(getattr(point_cloud, "point_count", 0) or 0)
+            if isinstance(canonical_lidar, CanonicalLidarFrame):
+                payload_metadata = dict(getattr(point_cloud, "metadata", {}) or {})
+                payload_metadata.pop("canonical_lidar_frame", None)
+                payload = point_cloud.model_copy(
+                    update={"metadata": payload_metadata},
+                    deep=False,
+                )
+            else:
+                payload = point_cloud
+            if original_count > self.max_points_before_downsample:
+                payload = self._downsample_point_cloud(payload)
+                downsampled = True
+                self._increment_counter("downsampled_pointcloud_count")
+
+            point_step, fields = self._resolve_point_layout(payload)
+            bytes_payload = self._encode_point_cloud_bytes(payload)
+            if bytes_payload is None:
+                self._increment_counter("dropped_pointcloud_count")
+                self._record_error(
+                    f"PointCloud 编码失败：frame={payload.frame_id} count={payload.point_count}"
+                )
+                return
+
+            start = time.monotonic()
             timestamp = getattr(payload, "timestamp", None)
             source_timestamp_ns = point_cloud_metadata.get("source_timestamp_ns")
             if source_timestamp_ns is not None:
@@ -1184,7 +1184,7 @@ class RuntimeInputBridge:
             result = publisher(bytes_payload, point_step, **metadata)
         except Exception as exc:
             self._increment_counter("dropped_pointcloud_count")
-            self._record_error(f"publish_point_cloud 抛异常：{exc}")
+            self._record_error(f"PointCloud 准备或发布失败：{exc}")
             return
         latency_ms = (time.monotonic() - start) * 1000.0
 
@@ -1626,85 +1626,60 @@ class RuntimeInputBridge:
 
     def _downsample_point_cloud(self, point_cloud: PointCloudFrame) -> PointCloudFrame:
         target = self.max_points_after_downsample
-        arr = getattr(point_cloud, "points_xyz_array", None)
-        if isinstance(arr, np.ndarray) and arr.ndim == 2 and arr.shape[0] > target:
-            stride = max(1, int(np.ceil(arr.shape[0] / float(target))))
-            downsampled = arr[::stride][:target]
-            try:
-                metadata = dict(getattr(point_cloud, "metadata", {}) or {})
-                for key in (
-                    "source_xyz_array",
-                    "intensity_array",
-                    "offset_ns_array",
-                ):
-                    values = metadata.get(key)
-                    if isinstance(values, np.ndarray) and values.shape[0] == arr.shape[0]:
-                        metadata[key] = np.ascontiguousarray(values[::stride][:target])
-                canonical_lidar = metadata.get("canonical_lidar_frame")
-                if isinstance(canonical_lidar, CanonicalLidarFrame):
-                    canonical_xyz = np.frombuffer(
-                        canonical_lidar.xyz_f32_le or b"", dtype="<f4"
-                    )
-                    canonical_xyz = canonical_xyz.reshape((-1, 3))
-                    canonical_intensity = np.frombuffer(
-                        canonical_lidar.intensity_f32_le or b"", dtype="<f4"
-                    )
-                    canonical_offsets = np.frombuffer(
-                        canonical_lidar.time_offset_ns_le or b"", dtype="<u8"
-                    )
-                    if (
-                        canonical_xyz.shape[0] == arr.shape[0]
-                        and canonical_intensity.shape == (arr.shape[0],)
-                        and canonical_offsets.shape == (arr.shape[0],)
-                    ):
-                        sampled_xyz = canonical_xyz[::stride][:target]
-                        sampled_intensity = canonical_intensity[::stride][:target]
-                        sampled_offsets = canonical_offsets[::stride][:target]
-                        metadata["canonical_lidar_frame"] = canonical_lidar.model_copy(
-                            update={
-                                "point_count": int(sampled_xyz.shape[0]),
-                                "xyz_f32_le": np.ascontiguousarray(sampled_xyz, dtype="<f4").tobytes(),
-                                "intensity_f32_le": np.ascontiguousarray(sampled_intensity, dtype="<f4").tobytes(),
-                                "time_offset_ns_le": np.ascontiguousarray(sampled_offsets, dtype="<u8").tobytes(),
-                            }
-                        )
-                metadata.update(
-                    {
-                        "downsampled": True,
-                        "downsample_target": int(target),
+        arr = point_cloud.points_xyz_array
+        stride = max(1, int(np.ceil(arr.shape[0] / float(target))))
+        downsampled = arr[::stride][:target]
+        metadata = dict(point_cloud.metadata)
+        for key in (
+            "source_xyz_array",
+            "intensity_array",
+            "offset_ns_array",
+        ):
+            values = metadata.get(key)
+            if isinstance(values, np.ndarray) and values.shape[0] == arr.shape[0]:
+                metadata[key] = np.ascontiguousarray(values[::stride][:target])
+        canonical_lidar = metadata.get("canonical_lidar_frame")
+        if isinstance(canonical_lidar, CanonicalLidarFrame):
+            canonical_xyz = np.frombuffer(
+                canonical_lidar.xyz_f32_le or b"", dtype="<f4"
+            )
+            canonical_xyz = canonical_xyz.reshape((-1, 3))
+            canonical_intensity = np.frombuffer(
+                canonical_lidar.intensity_f32_le or b"", dtype="<f4"
+            )
+            canonical_offsets = np.frombuffer(
+                canonical_lidar.time_offset_ns_le or b"", dtype="<u8"
+            )
+            if (
+                canonical_xyz.shape[0] == arr.shape[0]
+                and canonical_intensity.shape == (arr.shape[0],)
+                and canonical_offsets.shape == (arr.shape[0],)
+            ):
+                sampled_xyz = canonical_xyz[::stride][:target]
+                sampled_intensity = canonical_intensity[::stride][:target]
+                sampled_offsets = canonical_offsets[::stride][:target]
+                metadata["canonical_lidar_frame"] = canonical_lidar.model_copy(
+                    update={
+                        "point_count": int(sampled_xyz.shape[0]),
+                        "xyz_f32_le": np.ascontiguousarray(sampled_xyz, dtype="<f4").tobytes(),
+                        "intensity_f32_le": np.ascontiguousarray(sampled_intensity, dtype="<f4").tobytes(),
+                        "time_offset_ns_le": np.ascontiguousarray(sampled_offsets, dtype="<u8").tobytes(),
                     }
                 )
-                return point_cloud.model_copy(
-                    update={
-                        "point_count": int(downsampled.shape[0]),
-                        "points_xyz_array": downsampled,
-                        "metadata": metadata,
-                    },
-                    deep=False,
-                )
-            except Exception:
-                LOGGER.debug("PointCloud ndarray 降采样后 model_copy 失败，回退 list 路径。", exc_info=True)
-        # list fallback
-        points = list(getattr(point_cloud, "points", []) or [])
-        if not points:
-            return point_cloud
-        stride = max(1, int(np.ceil(len(points) / float(target))))
-        sampled = points[::stride][:target]
-        try:
-            return point_cloud.model_copy(
-                update={
-                    "point_count": len(sampled),
-                    "points": sampled,
-                    "metadata": {
-                        **dict(getattr(point_cloud, "metadata", {}) or {}),
-                        "downsampled": True,
-                        "downsample_target": int(target),
-                    },
-                },
-                deep=False,
-            )
-        except Exception:
-            return point_cloud
+        metadata.update(
+            {
+                "downsampled": True,
+                "downsample_target": int(target),
+            }
+        )
+        return point_cloud.model_copy(
+            update={
+                "point_count": int(downsampled.shape[0]),
+                "points_xyz_array": downsampled,
+                "metadata": metadata,
+            },
+            deep=False,
+        )
 
     @staticmethod
     def _resolve_point_step(point_cloud: PointCloudFrame) -> int:

@@ -115,9 +115,11 @@ class ProducerChecks(unittest.TestCase):
         return service
 
     def video(self, perception=None):
+        from services.localization.service import LocalizationService
         memory = Memory()
+        localization = LocalizationService(provider_owner=None, state_store=self.state)
         runtime = PerceptionVideoRuntime(perception_service=perception or self.perceive(), state_store=self.state,
-                                         memory_service=memory, enabled=True, auto_start=False, camera_id="front_camera",
+                                         memory_service=memory, localization_service=localization, enabled=True, auto_start=False, camera_id="front_camera",
                                          interval_sec=0.05, failure_backoff_sec=0.1)
         self.services.append(runtime)
         self.addCleanup(memory.resume.set)

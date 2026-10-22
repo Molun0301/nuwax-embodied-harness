@@ -46,6 +46,25 @@ class ServiceRegressionChecks(unittest.TestCase):
     claim=helpers.IntegrationChecks.claim
     query=helpers.IntegrationChecks.query
 
+    def test_artifact_cleanup_failure_reports_committed_record_deletion(self):
+        from core.errors import GatewayError
+        service = self.fixture()
+        artifact_id = "art_image_20261022T000000Z_deadbeef"
+        record, _ = self.accept(service, self.memory(artifact_ids=[artifact_id]))
+        def fail_delete(_artifact_id):
+            raise PermissionError("测试制品目录不可写")
+        with patch.object(service, "_artifact_store", SimpleNamespace(delete_artifact=fail_delete)):
+            with self.assertRaises(GatewayError) as caught:
+                service._delete_memory_library_records("library")
+        error = caught.exception
+        self.assertEqual(error.error_code, "memory_artifact_cleanup_incomplete")
+        self.assertTrue(error.details["records_deleted"])
+        self.assertEqual(error.details["deleted_counts"]["semantic_memory_count"], 1)
+        self.assertEqual(error.details["deleted_counts"]["artifact_count"], 0)
+        self.assertEqual(error.details["artifact_cleanup_errors"],
+                         [{"artifact_id": artifact_id, "reason": "测试制品目录不可写"}])
+        self.assertEqual(service._repository.load_semantic_memories(), [])
+
     def test_terminal_retry_budget_survives_restart_and_lazy_initialization(self):
         from services.memory.vectorization_outbox import RetryPolicy
         with tempfile.TemporaryDirectory() as tmp:
@@ -284,10 +303,10 @@ class ServiceRegressionChecks(unittest.TestCase):
             with self.assertRaises(RuntimeError):service._repository.upsert_semantic_memory(self.memory())
         self.assertEqual(index.outbox.snapshot()['accepted'],0)
 
-    def test_separate_cache_source_delete_removes_legacy_archive(self):
+    def test_shared_source_delete_removes_legacy_archive(self):
         with tempfile.TemporaryDirectory() as tmp:
-            store=SQLiteNamedVectorStore(str(Path(tmp)/'vectors.db'));self.addCleanup(store.close)
-            service=self.fixture(path=str(Path(tmp)/'source.db'),store=store)
+            service=self.fixture(path=str(Path(tmp)/'source.db'))
+            store=service._vector_store
             record=self.memory();payload=service._build_memory_payload(record)
             named=NamedVector('text_dense',service._text_embedder.model_name,16,np.ones(16,dtype=np.float32))
             store.upsert_point(point_id=record.memory_id,collection_name='episodic_observations',record_kind=record.kind.value,payload=payload,vectors={'text_dense':named})
@@ -297,21 +316,6 @@ class ServiceRegressionChecks(unittest.TestCase):
             with store.storage.read_snapshot() as tx:self.assertEqual(tx.execute('SELECT count(*) FROM memory_index_legacy_archive').fetchone()[0],0)
             self.assertIsNone(store.get_point(record.memory_id))
 
-    def test_generic_store_without_archive_capability_preserves_legacy(self):
-        underlying=SQLiteNamedVectorStore();self.addCleanup(underlying.close)
-        class Store:
-            backend_name='synthetic_opaque'
-            get_point=underlying.get_point
-            upsert_point=underlying.upsert_point
-            delete_points=underlying.delete_points
-        service=self.fixture(store=Store());record=self.memory();payload=service._build_memory_payload(record)
-        named=NamedVector('text_dense',service._text_embedder.model_name,16,np.ones(16,dtype=np.float32))
-        underlying.upsert_point(point_id=record.memory_id,collection_name='episodic_observations',record_kind=record.kind.value,payload=payload,vectors={'text_dense':named})
-        before=underlying.get_point(record.memory_id)
-        _,receipt=self.accept(service,record);service._run_durable_vectorization(self.claim(service))
-        self.assertEqual(underlying.get_point(record.memory_id).payload,before.payload)
-        self.assertEqual(service._durable_index.outbox.inspect(receipt.version.key)['status'],'failed_terminal')
-        self.assertTrue(self.query(service).metadata['includes_unverified_legacy_scores'])
 
     def test_crash_after_partial_commit_recovers_without_reencoding_text(self):
         service=self.fixture();service._image_embedder=service._text_embedder
@@ -389,29 +393,37 @@ class ServiceRegressionChecks(unittest.TestCase):
                 self.assertTrue(reopened.close())
             self.assertIsNotNone(index)
 
-    def runtime_stub(self,started,close_results):
-        from gateways.runtime import GatewayRuntime
-        runtime=GatewayRuntime.__new__(GatewayRuntime);order=[];events=[]
-        runtime._lifecycle_lock=threading.RLock();runtime._started=started;runtime._closed=False
-        runtime.mapping_recorder=None
-        def action(name):return lambda *a,**kw:order.append(name)
-        runtime.task_manager=SimpleNamespace(shutdown=action('tasks'))
-        runtime._join_exploration_finalizers=action('finalizers')
-        runtime._close_dispatch_resources=action('dispatch')
-        runtime._settle_relocalization_owner_before_geometry_stop=action('relocalization')
-        runtime._stop_runtime_input_bridge=action('inputs')
-        runtime._stop_data_frame_stream_sources=action('frames')
-        runtime._close_mapping_recording=action('recording')
-        for attr,method in (('platform_geometry_runtime','stop'),('audio_service','stop'),('perception_video_runtime','stop'),
-                            ('scene_mapping_service','close'),('robot','stop'),('person_follow_bridge','close')):
-            setattr(runtime,attr,SimpleNamespace(**{method:action(attr)}))
-        runtime.motion_guard=SimpleNamespace(has_connected=False,close=action('motion'))
-        def close():
-            order.append('memory')
-            return close_results.pop(0) if close_results else True
-        runtime.memory_service=SimpleNamespace(close=close)
-        runtime.event_bus=SimpleNamespace(build_event=lambda *a,**kw:kw,publish=events.append)
-        return runtime,order,events
+    def runtime_stub(self, started, close_results):
+        from contextlib import ExitStack
+        from tests.conftest import create_isolated_gateway
+        temporary = tempfile.TemporaryDirectory(prefix="memory-runtime-regression-")
+        self.addCleanup(temporary.cleanup)
+        runtime = create_isolated_gateway(Path(temporary.name))
+        self.addCleanup(runtime.stop)
+        overrides = ExitStack()
+        self.addCleanup(overrides.close)
+        order, events = [], []
+        runtime._started = started
+        for owner, method, name in ((runtime.task_manager, "shutdown", "tasks"),
+                                    (runtime.platform_geometry_runtime, "stop", "platform_geometry_runtime")):
+            original = getattr(owner, method)
+            def invoke(*args, _original=original, _name=name, **kwargs):
+                order.append(_name)
+                return _original(*args, **kwargs)
+            overrides.enter_context(patch.object(owner, method, invoke))
+        original_close = runtime.memory_service.close
+        def close(*args, **kwargs):
+            order.append("memory")
+            if close_results and not close_results.pop(0):
+                return False
+            return original_close(*args, **kwargs)
+        overrides.enter_context(patch.object(runtime.memory_service, "close", close))
+        original_publish = runtime.event_bus.publish
+        def publish(event, *args, **kwargs):
+            events.append(event.model_dump(mode="python"))
+            return original_publish(event, *args, **kwargs)
+        overrides.enter_context(patch.object(runtime.event_bus, "publish", publish))
+        return runtime, order, events
 
     def test_runtime_normal_and_never_started_stop_close_memory(self):
         for started in (False,True):
@@ -439,6 +451,7 @@ class ServiceRegressionChecks(unittest.TestCase):
         service._resolve_stable_map_name=lambda **kw:kw.get('map_name') or 'library'
         from contracts.runtime_views import MapSnapshot
         snapshot=MapSnapshot(map_name='library',source_name='synthetic',source_epoch='e',update_sequence=1,frame_id='map')
+        service._mapping_service._latest_snapshot = snapshot
         def build(*a,**kw):
             entered.set();assert release.wait(3)
             return SemanticMapBuildResult(map_name='library',frame_id='map',semantic_regions=(),anchors_by_id={},topology_nodes_by_id={})
@@ -446,7 +459,8 @@ class ServiceRegressionChecks(unittest.TestCase):
         def refresh():
             try:service._refresh_semantic_map_context(snapshot,map_name='library')
             except BaseException as exc:errors.append(exc)
-        thread=threading.Thread(target=refresh);thread.start();self.assertTrue(entered.wait(2))
+        thread=threading.Thread(target=refresh);thread.start();self.assertTrue(entered.wait(2), repr(errors))
+        service._mapping_service._latest_snapshot = snapshot.model_copy(update={'map_name':'other','source_epoch':'other'})
         with patch.object(service,'_start_vectorization_worker'),patch.object(service,'_start_deferred_refine_worker'):
             service.activate_memory_library(library_name='other',load_history=False)
         release.set();thread.join(2)
@@ -454,18 +468,24 @@ class ServiceRegressionChecks(unittest.TestCase):
         self.assertNotEqual(service._latest_semantic_map_context.map_name,'library')
         self.assertEqual(service._durable_index.outbox.snapshot()['accepted'],0)
 
-    def test_shared_in_memory_owner_cannot_steal_blocked_physical_worker(self):
-        store=SQLiteNamedVectorStore();self.addCleanup(store.close)
-        model=helpers.FakeEmbedder();model.release=threading.Event()
-        first=self.fixture(store=store,embedder=model);self.accept(first)
-        first._start_vectorization_worker();self.assertTrue(model.entered.wait(2))
-        second=self.fixture(store=store)
-        with self.assertRaises(OutboxConflict):second._start_vectorization_worker()
-        self.assertEqual(second._text_embedder.calls,0)
-        self.assertTrue(first._vectorization_worker.is_alive())
-        model.release.set()
-        self.assertTrue(first.close());self.assertTrue(second.close())
-        self.assertIsInstance(store.count_points(),int)
+    def test_same_database_owner_cannot_steal_blocked_physical_worker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = str(Path(temporary) / "memory.db")
+            model = helpers.FakeEmbedder()
+            model.release = threading.Event()
+            self.addCleanup(model.release.set)
+            first = self.fixture(path=path, embedder=model)
+            self.accept(first)
+            first._start_vectorization_worker()
+            self.assertTrue(model.entered.wait(2))
+            second = self.fixture(path=path)
+            with self.assertRaises(OutboxConflict):
+                second._start_vectorization_worker()
+            self.assertEqual(second._text_embedder.calls, 0)
+            self.assertTrue(first._vectorization_worker.is_alive())
+            model.release.set()
+            self.assertTrue(first.close())
+            self.assertTrue(second.close())
 
     def test_managed_scene_acceptance_does_not_initialize_models_under_lock(self):
         service=self.fixture();scene=records()[4][3].model_copy(update={'map_name':'library'})
@@ -550,17 +570,6 @@ class ServiceRegressionChecks(unittest.TestCase):
                     self.assertEqual(archived,broken)
                 self.assertEqual(self.query(service).matches[0].metadata['vector_provenance']['text_dense']['status'],'validated_current')
 
-    def test_opaque_cache_decode_error_remains_visible_lexically(self):
-        class BrokenStore:
-            backend_name='synthetic_broken'
-            def get_point(self,point_id):raise ValueError('synthetic corrupt cache')
-            def delete_points(self,ids):return len(ids)
-            def upsert_point(self,**kw):raise AssertionError('not needed')
-        service=self.fixture(store=BrokenStore());self.accept(service)
-        result=self.query(service)
-        self.assertTrue(result.matches)
-        self.assertEqual(result.metadata['vector_provenance_counts']['cache_read_failures'],1)
-        self.assertEqual(result.matches[0].metadata['vector_provenance']['_cache']['reason'],'derived_cache_read_failed')
 
     def test_deleted_dynamic_then_static_live_only_stays_lexical_and_can_repersist(self):
         service=self.fixture();static=self.instance();service._repository.upsert_semantic_instance(static)

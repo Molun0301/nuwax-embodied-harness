@@ -293,10 +293,7 @@ def _env_example_desc() -> Dict[str, str]:
     path = _DESCRIPTIONS_JSON
     if not path.exists():
         return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
     return {str(k): str(v) for k, v in data.items() if v}
 
 

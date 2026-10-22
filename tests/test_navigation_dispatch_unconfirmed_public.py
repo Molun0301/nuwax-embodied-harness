@@ -6,6 +6,8 @@ They do not prove native publish, actuator behavior, or cross-process recovery.
 """
 import json
 import unittest
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
@@ -22,6 +24,7 @@ from gateways.agent.feedback import build_receipt, checked_json
 from gateways.feedback import build_mcp_tool_result, build_public_error_payload, compact_public_data
 from gateways.http.api import _navigation_state_payload
 from gateways.runtime import GatewayRuntime
+from tests.conftest import create_isolated_gateway
 from scripts.check_navigation_map_snapshot_identity import OfflineProvider
 from services.geometry.geometry_runtime_provider import GeometryRuntimeProvider
 from services.geometry.proto_gen import geometry_runtime_pb2 as pb2
@@ -84,10 +87,13 @@ class CancelControlProvider(OfflineProvider):
 
 class PublicUnconfirmedTests(unittest.TestCase):
     def gateway(self):
-        runtime = GatewayRuntime.__new__(GatewayRuntime)
-        runtime._run_with_motion_admission = lambda admission, operation: operation()
-        runtime._require_motion_admission = lambda *args: NS(generation=2, boot_nonce=b"x" * 16,
-                                                            guard_motion_stop_generation=4)
+        directory = tempfile.TemporaryDirectory(prefix="neh-navigation-dispatch-")
+        self.addCleanup(directory.cleanup)
+        runtime = create_isolated_gateway(Path(directory.name))
+        self.addCleanup(runtime.stop)
+        self.enterContext(patch.object(runtime, "_run_with_motion_admission", lambda admission, operation: operation()))
+        self.enterContext(patch.object(runtime, "_require_motion_admission", lambda *args: NS(generation=2, boot_nonce=b"x" * 16,
+                                                            guard_motion_stop_generation=4)))
         return runtime
 
     def control_gateway(self):
@@ -120,14 +126,14 @@ class PublicUnconfirmedTests(unittest.TestCase):
             mapping_service=NS(get_latest_snapshot=Mock(side_effect=AssertionError("map aggregation"))),
             localization_service=NS(get_active_session=Mock(side_effect=AssertionError("localization aggregation"))),
             forbidden_zone_store=NS())
-        service._current_goal = requested
-        service.refresh_navigation = Mock(side_effect=AssertionError("full refresh before exact cancel"))
-        service._ingest_navigation_state = Mock(side_effect=AssertionError("display aggregation"))
-        service.get_navigation_control_context = Mock(wraps=service.get_navigation_control_context)
-        service.cancel_goal = Mock(wraps=service.cancel_goal)
+        self.enterContext(patch.object(service, "_current_goal", requested))
+        self.enterContext(patch.object(service, "refresh_navigation", Mock(side_effect=AssertionError("full refresh before exact cancel"))))
+        self.enterContext(patch.object(service, "_ingest_navigation_state", Mock(side_effect=AssertionError("display aggregation"))))
+        self.enterContext(patch.object(service, "get_navigation_control_context", Mock(wraps=service.get_navigation_control_context)))
+        self.enterContext(patch.object(service, "cancel_goal", Mock(wraps=service.cancel_goal)))
         backend.get_navigation_readiness = Mock(side_effect=AssertionError("readiness on control seam"))
         backend.get_current_pose = Mock(side_effect=AssertionError("pose on control seam"))
-        runtime.navigation_service = service
+        self.enterContext(patch.object(runtime, "navigation_service", service))
         return runtime, backend, view
 
     def assert_control_reads_only(self, runtime, backend, view):
@@ -145,25 +151,26 @@ class PublicUnconfirmedTests(unittest.TestCase):
         manager = TaskManager(event_bus=bus, resource_lock_manager=locks)
         self.addCleanup(bus.shutdown, 2)
         self.addCleanup(manager.shutdown, wait=True)
-        runtime.event_bus, runtime.task_manager = bus, manager
-        runtime.capability_registry = NS(get_descriptor=lambda _: NS(required_resources=["navigation"],
-                                                                     display_name="isolated"))
-        runtime._reconcile_navigation_quarantine = lambda: {"pending": False}
-        runtime._goal_with_motion_admission = lambda goal, admission: goal
-        runtime._ensure_motion_runtime_for_backend_call = lambda *args, **kwargs: None
-        runtime._capture_task_generation_snapshot = lambda **kwargs: {}
-        runtime._record_task_generation_snapshot = lambda *args: None
-        runtime._task_generation_rollovers = lambda *args: {}
-        runtime._estimate_navigation_progress = lambda context: .1
-        runtime._build_task_request_metadata = lambda **kwargs: {}
-        runtime.memory_service = NS(resolve_navigation_region=lambda goal: None)
+        self.enterContext(patch.object(runtime, "event_bus", bus))
+        self.enterContext(patch.object(runtime, "task_manager", manager))
+        self.enterContext(patch.object(runtime, "capability_registry", NS(get_descriptor=lambda _: NS(required_resources=["navigation"],
+                                                                     display_name="isolated"))))
+        self.enterContext(patch.object(runtime, "_reconcile_navigation_quarantine", lambda: {"pending": False}))
+        self.enterContext(patch.object(runtime, "_goal_with_motion_admission", lambda goal, admission: goal))
+        self.enterContext(patch.object(runtime, "_ensure_motion_runtime_for_backend_call", lambda *args, **kwargs: None))
+        self.enterContext(patch.object(runtime, "_capture_task_generation_snapshot", lambda **kwargs: {}))
+        self.enterContext(patch.object(runtime, "_record_task_generation_snapshot", lambda *args: None))
+        self.enterContext(patch.object(runtime, "_task_generation_rollovers", lambda *args: {}))
+        self.enterContext(patch.object(runtime, "_estimate_navigation_progress", lambda context: .1))
+        self.enterContext(patch.object(runtime, "_build_task_request_metadata", lambda **kwargs: {}))
+        self.enterContext(patch.object(runtime, "memory_service", NS(resolve_navigation_region=lambda goal: None)))
         unknown, terminal = navigation(), navigation(NavigationStatus.CANCELLED, proof=True)
         error = uncertain_error()
         service = NS(set_goal=Mock(side_effect=error if submitted is None else None,
                                   return_value=submitted),
                      refresh_navigation=Mock(return_value=unknown if submitted is None else submitted),
-                     cancel_goal=Mock(return_value=terminal if stopped else unknown))
-        runtime.navigation_service = service
+                     cancel_goal=Mock(return_value=terminal if stopped else unknown), get_latest_navigation_context=Mock(return_value=None), get_navigation_control_context=Mock(return_value=unknown if submitted is None else submitted))
+        self.enterContext(patch.object(runtime, "navigation_service", service))
         return runtime, manager, locks, error
 
     def submit(self, runtime):
@@ -228,8 +235,8 @@ class PublicUnconfirmedTests(unittest.TestCase):
     def test_unknown_is_cancel_intermediate_until_exact_zero(self):
         runtime = self.gateway()
         pending, terminal = navigation(), navigation(NavigationStatus.CANCELLED, proof=True)
-        runtime.navigation_service = NS(refresh_navigation=Mock(side_effect=[pending, terminal]),
-                                         cancel_goal=Mock(return_value=pending))
+        self.enterContext(patch.object(runtime, "navigation_service", NS(refresh_navigation=Mock(side_effect=[pending, terminal]),
+                                         cancel_goal=Mock(return_value=pending), get_latest_navigation_context=Mock(return_value=None), get_navigation_control_context=Mock(side_effect=[pending, terminal]))))
         task_context = NS(update=Mock(), acknowledge_interrupt_barrier=Mock())
         with patch("gateways.runtime.time.sleep", return_value=None):
             result = runtime._cancel_navigation_with_safety_barrier(task_context,
@@ -245,16 +252,16 @@ class PublicUnconfirmedTests(unittest.TestCase):
                 unproven = navigation(status)
                 unproven.navigation_state.metadata.pop("dispatch_obligation")
                 unproven.navigation_state.metadata["ownership_retained"] = False
-                runtime.navigation_service = NS(refresh_navigation=Mock(return_value=unproven),
-                                                 cancel_goal=Mock(return_value=unproven))
+                self.enterContext(patch.object(runtime, "navigation_service", NS(refresh_navigation=Mock(return_value=unproven),
+                                                 cancel_goal=Mock(return_value=unproven), get_latest_navigation_context=Mock(return_value=None), get_navigation_control_context=Mock(return_value=unproven))))
                 with self.assertRaises(TaskSafetyBarrierError):
                     runtime._cancel_navigation_with_safety_barrier(NS(update=Mock(), acknowledge_interrupt_barrier=Mock()),
                         goal_id=IDENTITY["goal_id"], poll_interval_sec=.02)
 
     def test_unknown_public_cancel_reports_pending_not_completed(self):
         runtime = self.gateway()
-        runtime.navigation_service = NS(refresh_navigation=Mock(return_value=navigation()),
-                                         cancel_goal=Mock(return_value=navigation()))
+        self.enterContext(patch.object(runtime, "navigation_service", NS(refresh_navigation=Mock(return_value=navigation()),
+                                         cancel_goal=Mock(return_value=navigation()), get_latest_navigation_context=Mock(return_value=None), get_navigation_control_context=Mock(return_value=navigation()))))
         result = runtime._handle_cancel_navigation({})
         self.assertTrue(result["cancellation_requested"])
         self.assertFalse(result["completed"])
@@ -264,8 +271,8 @@ class PublicUnconfirmedTests(unittest.TestCase):
         for args in ({}, {"request_id": IDENTITY["goal_id"]}):
             with self.subTest(args=args):
                 runtime = self.gateway()
-                runtime.navigation_service = NS(refresh_navigation=Mock(return_value=navigation(historical=True)),
-                    get_navigation_control_context=Mock(return_value=navigation(historical=True)), cancel_goal=Mock())
+                self.enterContext(patch.object(runtime, "navigation_service", NS(refresh_navigation=Mock(return_value=navigation(historical=True)),
+                    get_navigation_control_context=Mock(return_value=navigation(historical=True)), cancel_goal=Mock(), get_latest_navigation_context=Mock(return_value=None))))
                 with self.assertRaises(GatewayError) as raised:
                     runtime._handle_cancel_navigation(args)
                 self.assertEqual(raised.exception.error_code, "navigation_control_authority_unavailable")
@@ -371,9 +378,9 @@ class PublicUnconfirmedTests(unittest.TestCase):
                     runtime = self.gateway()
                     context = navigation() if active else NavigationContext(backend_name="isolated",
                         navigation_state=NavigationState(status=NavigationStatus.IDLE))
-                    runtime.navigation_service = NS(refresh_navigation=Mock(return_value=context),
+                    self.enterContext(patch.object(runtime, "navigation_service", NS(refresh_navigation=Mock(return_value=context),
                         get_navigation_control_context=Mock(side_effect=AssertionError("noarg control shortcut")),
-                        cancel_goal=Mock(return_value=context))
+                        cancel_goal=Mock(return_value=context), get_latest_navigation_context=Mock(return_value=None))))
                     result = runtime._handle_cancel_navigation(args)
                     runtime.navigation_service.refresh_navigation.assert_called_once_with()
                     runtime.navigation_service.get_navigation_control_context.assert_not_called()
@@ -386,23 +393,23 @@ class PublicUnconfirmedTests(unittest.TestCase):
 
     def candidates(self, *, semantic=False, ordinary=False):
         runtime = self.gateway()
-        runtime._ensure_workspace_memory_library_ready = lambda **kwargs: None
-        runtime._ensure_localization_ready = lambda **kwargs: None
-        runtime._ensure_motion_runtime_for_backend_call = lambda *args, **kwargs: None
-        runtime._goal_with_motion_admission = lambda goal, admission: goal
-        runtime._build_goal_from_navigation_candidate = lambda **kwargs: NavigationGoal(
+        self.enterContext(patch.object(runtime, "_ensure_workspace_memory_library_ready", lambda **kwargs: None))
+        self.enterContext(patch.object(runtime, "_ensure_localization_ready", lambda **kwargs: None))
+        self.enterContext(patch.object(runtime, "_ensure_motion_runtime_for_backend_call", lambda *args, **kwargs: None))
+        self.enterContext(patch.object(runtime, "_goal_with_motion_admission", lambda goal, admission: goal))
+        self.enterContext(patch.object(runtime, "_build_goal_from_navigation_candidate", lambda **kwargs: NavigationGoal(
             goal_id=IDENTITY["goal_id"] if kwargs["candidate"].record_id == "candidate-1" else "owned-goal-2",
-            target_name=kwargs["candidate"].record_id)
+            target_name=kwargs["candidate"].record_id)))
         candidates = [NS(record_id="candidate-1", record_kind=NS(value="object")),
                       NS(record_id="candidate-2", record_kind=NS(value="object"))]
         error = GatewayError("ordinary reject", error_code="navigation_goal_rejected") if ordinary else uncertain_error()
         terminal = navigation(NavigationStatus.SUCCEEDED, proof=True, goal_id="owned-goal-2")
-        runtime.navigation_service = NS(set_goal=Mock(side_effect=[error, terminal] if ordinary else error),
+        self.enterContext(patch.object(runtime, "navigation_service", NS(set_goal=Mock(side_effect=[error, terminal] if ordinary else error),
             refresh_navigation=Mock(side_effect=[navigation(NavigationStatus.FAILED, proof=True), terminal] if ordinary else None,
                                     return_value=navigation()),
-            cancel_goal=Mock(return_value=navigation(NavigationStatus.CANCELLED, proof=True)))
-        runtime._build_target_navigation_verification = Mock(return_value={"arrival_verification": NS(verified=True)})
-        runtime._estimate_navigation_progress = lambda context: .2
+            cancel_goal=Mock(return_value=navigation(NavigationStatus.CANCELLED, proof=True)), get_latest_navigation_context=Mock(return_value=None), get_navigation_control_context=Mock(side_effect=[navigation(NavigationStatus.FAILED, proof=True), terminal] if ordinary else None, return_value=navigation()))))
+        self.enterContext(patch.object(runtime, "_build_target_navigation_verification", Mock(return_value={"arrival_verification": NS(verified=True)})))
+        self.enterContext(patch.object(runtime, "_estimate_navigation_progress", lambda context: .2))
         search = dict(memory_candidates=[] if semantic else candidates,
             semantic_goal=NavigationGoal(goal_id=IDENTITY["goal_id"], target_name="semantic") if semantic else None,
             current_map_name="map", current_localization_session_id="session", workspace=object(),
@@ -490,7 +497,7 @@ class PublicUnconfirmedTests(unittest.TestCase):
         raw = dict(status=status, message="typed query result", query_request_id="query-1", navigation=nav,
                    accepted=status == "SUCCEEDED", ownership_retained=status == "ADMISSION_UNCONFIRMED",
                    authority_current=True)
-        runtime.map_workspace_service = NS(submit_mapping_cloud_goal=Mock(return_value=raw))
+        self.enterContext(patch.object(runtime, "map_workspace_service", NS(submit_mapping_cloud_goal=Mock(return_value=raw))))
         result = runtime._handle_navigate_to_place({"query_text": "fixture", "query_request_id": "query-1"})
         return raw, result
 
@@ -516,8 +523,8 @@ class PublicUnconfirmedTests(unittest.TestCase):
 
     def test_mapping_rejection_without_navigation_does_not_invent_installed_ownership(self):
         runtime = self.gateway()
-        runtime.map_workspace_service = NS(submit_mapping_cloud_goal=Mock(return_value={
-            "status": "ADMISSION_REJECTED", "query_request_id": "query-1", "navigation": None}))
+        self.enterContext(patch.object(runtime, "map_workspace_service", NS(submit_mapping_cloud_goal=Mock(return_value={
+            "status": "ADMISSION_REJECTED", "query_request_id": "query-1", "navigation": None}))))
         result = runtime._handle_navigate_to_place({"query_text": "fixture", "query_request_id": "query-1"})
         self.assertEqual(result["error_payload"]["code"], "navigation_goal_rejected")
         self.assertIsNone(result["error_payload"]["details"]["navigation"])
@@ -541,8 +548,8 @@ class PublicUnconfirmedTests(unittest.TestCase):
 
     def test_authority_unavailable_is_narrowly_nonretryable_across_public_wrappers(self):
         runtime = self.gateway()
-        runtime.navigation_service = NS(refresh_navigation=Mock(return_value=navigation(historical=True)),
-                                         cancel_goal=Mock())
+        self.enterContext(patch.object(runtime, "navigation_service", NS(refresh_navigation=Mock(return_value=navigation(historical=True)),
+                                         cancel_goal=Mock(), get_latest_navigation_context=Mock(return_value=None), get_navigation_control_context=Mock(return_value=navigation(historical=True)))))
         with self.assertRaises(GatewayError) as raised:
             runtime._handle_cancel_navigation({})
         error = raised.exception
@@ -580,9 +587,10 @@ class PublicUnconfirmedTests(unittest.TestCase):
         response = dict(status="ADMISSION_UNCONFIRMED", navigation=wire(), ownership_retained=True,
                         authority_current=True, reason_code="GOAL_PUBLISH_UNCONFIRMED", retryable=False)
         provider = NS(get_mapping_cloud_authority=Mock(), submit_mapping_cloud_goal=Mock(return_value=response))
-        service = MapWorkspaceService.__new__(MapWorkspaceService)
-        service._geometry_runtime = NS(get_geometry_runtime_provider=lambda: provider)
-        service._asset_repository, service._repository = object(), object()
+        service = self.gateway().map_workspace_service
+        self.enterContext(patch.object(service, "_geometry_runtime", NS(get_geometry_runtime_provider=lambda: provider)))
+        self.enterContext(patch.object(service, "_asset_repository", object()))
+        self.enterContext(patch.object(service, "_repository", object()))
         resolved = NS(authority=NS(to_dict=lambda: {"fixture": "authority"}), georeference_bytes=b"{}")
         with patch("services.mapping.finalized_asset_authority.FinalizedAssetAuthorityResolver") as resolver:
             resolver.return_value.resolve.return_value = resolved

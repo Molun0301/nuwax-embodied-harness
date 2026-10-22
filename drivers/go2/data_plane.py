@@ -37,7 +37,7 @@ from contracts.geometry import FrameTree, Pose, Quaternion, Vector3
 from contracts.pointcloud import PointCloudFrame, PointField
 from contracts.robot_state import IMUState
 from contracts.sensors import RegistrationState, SensorSample
-from core.logging_utils import SamplingLogFilter as _SamplingLogFilter
+from core.logging_utils import LogRateLimiter, SamplingLogFilter as _SamplingLogFilter
 
 if TYPE_CHECKING:
     from drivers.go2.settings import Go2DataPlaneConfig
@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.go2.data_plane")
 LOGGER.addFilter(_SamplingLogFilter(sample_rate=0.01))
+_DRIVER_ERROR_LIMITER = LogRateLimiter()
 
 
 _STATIONARY_YAW_RATE_FILTER_TAU_SEC = 0.5
@@ -198,7 +199,7 @@ class _HistoryChannelSubscriber:
                     try:
                         waitset.detach(condition)
                     except Exception:
-                        LOGGER.debug("分离 Go2 DDS 读取条件失败。", exc_info=True)
+                        _DRIVER_ERROR_LIMITER.log(LOGGER, logging.ERROR, '分离 Go2 DDS 读取条件失败。', key='分离 Go2 DDS 读取条件失败。', interval_sec=30.0, exc_info=True)
         # Python 绑定由拥有引用析构实体，不调用SDK私有成员或删除执行中的读取器。
         self._pending_samples.clear()
         self._waitset = None
@@ -351,7 +352,7 @@ def _point_cloud_source_time_key(message: object) -> int:
 
 
 def _prepare_go2_official_sdk_environment(config: "Go2DataPlaneConfig") -> None:
-    sdk_path = str(getattr(config, "sdk_path", "") or "").strip()
+    sdk_path = str(config.sdk_path or "").strip()
     if sdk_path:
         candidate = Path(sdk_path).expanduser()
         if candidate.exists() and str(candidate) not in sys.path:
@@ -468,6 +469,10 @@ class Go2DirectDdsBridge:
         self._point_cloud_bridge_last_error: Optional[str] = None
         self._point_cloud_bridge_last_error_at: Optional[float] = None
         self._point_cloud_bridge_topic: str = ""
+        self._native_state_sample_at = None
+        self._native_state_sample_key = None
+        self._pose_history: Deque[_TimedPoseSnapshot] = deque(maxlen=_POINT_CLOUD_POSE_HISTORY_SIZE)
+        self._reset_stationary_yaw_filter_locked()
 
     def start(self) -> None:
         with self._lifecycle_lock:
@@ -605,7 +610,7 @@ class Go2DirectDdsBridge:
             try:
                 callback(sample)
             except Exception:
-                LOGGER.debug("分发 Go2 规范传感器样本失败。", exc_info=True)
+                _DRIVER_ERROR_LIMITER.log(LOGGER, logging.ERROR, '分发 Go2 规范传感器样本失败。', key='分发 Go2 规范传感器样本失败。', interval_sec=30.0, exc_info=True)
 
     def unsubscribe_localization(self, callback_id: int) -> None:
         with self._lock:
@@ -703,7 +708,7 @@ class Go2DirectDdsBridge:
                 "lifecycle_generation": self._lifecycle_generation,
                 "active_generation": active_generation,
                 "input_timing": self._sensor_process_status.get("input_timing", {}) if self._sensor_process is not None else self._input_timing_snapshot_locked(),
-                "sensor_process_pid": getattr(self._sensor_process, "pid", None),
+                "sensor_process_pid": self._sensor_process.pid if self._sensor_process is not None else None,
                 "dds_pose_ready": pose_active,
                 "dds_imu_ready": imu_active,
                 "dds_cloud_ready": point_cloud_active,
@@ -720,13 +725,13 @@ class Go2DirectDdsBridge:
                 "point_cloud_bridge_last_error": self._point_cloud_bridge_last_error,
                 "point_cloud_bridge_last_error_at_monotonic": self._point_cloud_bridge_last_error_at,
                 "stationary_yaw_locked": bool(
-                    getattr(self, "_stationary_yaw_locked", False)
+                    self._stationary_yaw_locked
                 ),
                 "orientation_yaw_rate_rps": float(
-                    getattr(self, "_stationary_yaw_rate_rps", 0.0)
+                    self._stationary_yaw_rate_rps
                 ),
                 "yaw_stabilization_offset_rad": float(
-                    getattr(self, "_stationary_yaw_offset_rad", 0.0)
+                    self._stationary_yaw_offset_rad
                 ),
                 "point_cloud_yaw_stabilization_applied": bool(
                     point_cloud_active
@@ -783,13 +788,7 @@ class Go2DirectDdsBridge:
         self._stationary_yaw_output_rad: Optional[float] = None
         self._stationary_yaw_offset_rad = 0.0
         self._stationary_yaw_locked = False
-        pose_history = getattr(self, "_pose_history", None)
-        if pose_history is None:
-            self._pose_history: Deque[_TimedPoseSnapshot] = deque(
-                maxlen=_POINT_CLOUD_POSE_HISTORY_SIZE
-            )
-        else:
-            pose_history.clear()
+        self._pose_history.clear()
 
     def _nearest_pose_snapshot_locked(
         self,
@@ -797,7 +796,7 @@ class Go2DirectDdsBridge:
         generation: int,
         received_at_monotonic: float,
     ) -> Tuple[Optional[_TimedPoseSnapshot], Optional[float]]:
-        pose_history = getattr(self, "_pose_history", ())
+        pose_history = self._pose_history
         candidates = (
             snapshot
             for snapshot in pose_history
@@ -821,9 +820,9 @@ class Go2DirectDdsBridge:
     ) -> Quaternion:
         raw_yaw = _quaternion_yaw_radians(orientation)
         sample_at = time.monotonic()
-        last_raw_yaw = getattr(self, "_stationary_yaw_last_raw_rad", None)
-        last_sample_at = getattr(self, "_stationary_yaw_last_sample_at", None)
-        filtered_rate = float(getattr(self, "_stationary_yaw_rate_rps", 0.0))
+        last_raw_yaw = self._stationary_yaw_last_raw_rad
+        last_sample_at = self._stationary_yaw_last_sample_at
+        filtered_rate = float(self._stationary_yaw_rate_rps)
         contiguous_sample = last_raw_yaw is not None and last_sample_at is not None
         if contiguous_sample:
             elapsed = sample_at - last_sample_at
@@ -855,7 +854,7 @@ class Go2DirectDdsBridge:
             self._stationary_yaw_locked = False
             return orientation
 
-        output_yaw = getattr(self, "_stationary_yaw_output_rad", None)
+        output_yaw = self._stationary_yaw_output_rad
         if robot_idle and abs(filtered_rate) <= deadband_rps:
             if output_yaw is None:
                 output_yaw = raw_yaw
@@ -865,7 +864,7 @@ class Go2DirectDdsBridge:
             self._stationary_yaw_locked = True
         else:
             output_yaw = _normalize_angle_radians(
-                raw_yaw + float(getattr(self, "_stationary_yaw_offset_rad", 0.0))
+                raw_yaw + float(self._stationary_yaw_offset_rad)
             )
             self._stationary_yaw_locked = False
 
@@ -904,7 +903,7 @@ class Go2DirectDdsBridge:
         try:
             close()
         except Exception:
-            LOGGER.debug("关闭 Go2 官方 DDS %s 失败。", label, exc_info=True)
+            _DRIVER_ERROR_LIMITER.log(LOGGER, logging.ERROR, '关闭 Go2 官方 DDS %s 失败。', label, key='关闭 Go2 官方 DDS %s 失败。', interval_sec=30.0, exc_info=True)
 
     def _start_direct_dds_backend(self) -> None:
         with self._lock:
@@ -914,7 +913,7 @@ class Go2DirectDdsBridge:
             self._invalidate_observations_locked("Go2 DirectDDS 等待后端启动")
         if generation is None or stop_event is None or stop_event.is_set():
             raise RuntimeError("Go2 DirectDDS 启动代际无效")
-        if not getattr(self.config, "direct_dds", None) or not self.config.direct_dds.enabled:
+        if not self.config.direct_dds.enabled:
             self._record_point_cloud_bridge_error("Go2 DirectDDS 后端未启用")
             return
         if self._isolate_native_input and self.config.lio_backend in {"fastlio2", "pointlio"}:
@@ -1098,14 +1097,14 @@ class Go2DirectDdsBridge:
             try:
                 pose_subscriber.Close()
             except Exception:
-                LOGGER.debug("关闭 Go2 官方 DDS 订阅器失败。", exc_info=True)
+                _DRIVER_ERROR_LIMITER.log(LOGGER, logging.ERROR, '关闭 Go2 官方 DDS 订阅器失败。', key='关闭 Go2 官方 DDS 订阅器失败。', interval_sec=30.0, exc_info=True)
         if point_cloud_subscriber is not None and point_cloud_subscriber is not pose_subscriber:
             try:
                 point_cloud_subscriber.Close()
             except Exception:
-                LOGGER.debug("关闭 Go2 官方 DDS 点云订阅器失败。", exc_info=True)
+                _DRIVER_ERROR_LIMITER.log(LOGGER, logging.ERROR, '关闭 Go2 官方 DDS 点云订阅器失败。', key='关闭 Go2 官方 DDS 点云订阅器失败。', interval_sec=30.0, exc_info=True)
         current_thread = threading.current_thread()
-        join_timeout = max(1.0, float(getattr(self.config.direct_dds, "read_timeout_sec", 0.5)) + 0.5)
+        join_timeout = max(1.0, float(self.config.direct_dds.read_timeout_sec) + 0.5)
         for thread in threads:
             if thread is current_thread or not thread.is_alive():
                 continue
@@ -1162,7 +1161,7 @@ class Go2DirectDdsBridge:
                          {**snapshot.get("pose_metadata", {}), "source_topic": self._latest_pose_source,
                           "source_generation": generation, "dds_pose_ready": True, "dds_imu_ready": imu is not None})
             except Exception:
-                LOGGER.debug("Go2进程显示位姿回调失败", exc_info=True)
+                _DRIVER_ERROR_LIMITER.log(LOGGER, logging.ERROR, 'Go2进程显示位姿回调失败', key='Go2进程显示位姿回调失败', interval_sec=30.0, exc_info=True)
         for callback in cloud_callbacks:
             with self._lock:
                 if not self._is_generation_active_locked(generation):
@@ -1170,7 +1169,7 @@ class Go2DirectDdsBridge:
             try:
                 callback(cloud.model_copy(deep=False))
             except Exception:
-                LOGGER.debug("Go2进程显示点云回调失败", exc_info=True)
+                _DRIVER_ERROR_LIMITER.log(LOGGER, logging.ERROR, 'Go2进程显示点云回调失败', key='Go2进程显示点云回调失败', interval_sec=30.0, exc_info=True)
 
     def _direct_pose_reader_loop(
         self,
@@ -1178,7 +1177,7 @@ class Go2DirectDdsBridge:
         stop_event: Optional[threading.Event] = None,
         subscriber: object = None,
     ) -> None:
-        timeout_sec = float(getattr(self.config.direct_dds, "read_timeout_sec", 0.5))
+        timeout_sec = float(self.config.direct_dds.read_timeout_sec)
         source_topic = f"dds:{self.config.direct_dds.pose_topic}"
         with self._lock:
             generation = self._active_generation if generation is None else generation
@@ -1194,7 +1193,7 @@ class Go2DirectDdsBridge:
                 with self._lock:
                     if not self._is_generation_active_locked(generation, stop_event):
                         return
-                LOGGER.debug("读取 Go2 官方 DDS 位姿失败。", exc_info=True)
+                _DRIVER_ERROR_LIMITER.log(LOGGER, logging.ERROR, '读取 Go2 官方 DDS 位姿失败。', key='读取 Go2 官方 DDS 位姿失败。', interval_sec=30.0, exc_info=True)
                 stop_event.wait(0.1)
                 continue
             if sample is None:
@@ -1240,7 +1239,7 @@ class Go2DirectDdsBridge:
                     registration_state=RegistrationState.SENSOR,
                 )
             except ValueError:
-                LOGGER.debug("Go2 IMU canonical 映射失败。", exc_info=True)
+                _DRIVER_ERROR_LIMITER.log(LOGGER, logging.ERROR, 'Go2 IMU canonical 映射失败。', key='Go2 IMU canonical 映射失败。', interval_sec=30.0, exc_info=True)
             if canonical_imu_sample is not None:
                 self._publish_sensor_sample(canonical_imu_sample, generation)
             now = time.monotonic()
@@ -1248,11 +1247,11 @@ class Go2DirectDdsBridge:
             with self._lock:
                 if not self._is_generation_active_locked(generation):
                     return
-                previous_at = getattr(self, "_native_state_sample_at", None)
+                previous_at = self._native_state_sample_at
                 if (
                     previous_at is not None
                     and now - previous_at < _NATIVE_STATE_SAMPLE_INTERVAL_SEC
-                    and state_key == getattr(self, "_native_state_sample_key", None)
+                    and state_key == self._native_state_sample_key
                 ):
                     return
                 self._native_state_sample_at = now
@@ -1263,7 +1262,7 @@ class Go2DirectDdsBridge:
         except ValueError:
             if not native_input:
                 raise
-            LOGGER.debug("设备展示位姿不可用，原生惯性输入继续。", exc_info=True)
+            _DRIVER_ERROR_LIMITER.log(LOGGER, logging.ERROR, '设备展示位姿不可用，原生惯性输入继续。', key='设备展示位姿不可用，原生惯性输入继续。', interval_sec=30.0, exc_info=True)
             return
         _imu_timestamp, imu_source_timestamp_ns = _unitree_stamp_to_datetime_ns(
             getattr(message, "stamp", None), "Go2 SportModeState"
@@ -1296,7 +1295,7 @@ class Go2DirectDdsBridge:
                     ),
                 )
             except ValueError:
-                LOGGER.debug("Go2 IMU canonical 映射失败。", exc_info=True)
+                _DRIVER_ERROR_LIMITER.log(LOGGER, logging.ERROR, 'Go2 IMU canonical 映射失败。', key='Go2 IMU canonical 映射失败。', interval_sec=30.0, exc_info=True)
         frame_tree = FrameTree(root_frame_id=pose.frame_id)
         metadata = {
             "source_topic": str(source_topic or ""),
@@ -1324,11 +1323,7 @@ class Go2DirectDdsBridge:
                     update={"orientation": stabilized_orientation},
                     deep=False,
                 )
-                pose_history = getattr(self, "_pose_history", None)
-                if pose_history is None:
-                    pose_history = deque(maxlen=_POINT_CLOUD_POSE_HISTORY_SIZE)
-                    self._pose_history = pose_history
-                pose_history.append(
+                self._pose_history.append(
                     _TimedPoseSnapshot(
                         generation=generation,
                         received_at_monotonic=float(
@@ -1368,7 +1363,7 @@ class Go2DirectDdsBridge:
             try:
                 callback(pose.model_copy(deep=False), frame_tree.model_copy(deep=False), dict(metadata))
             except Exception:
-                LOGGER.debug("分发 Go2 DDS 定位帧失败。", exc_info=True)
+                _DRIVER_ERROR_LIMITER.log(LOGGER, logging.ERROR, '分发 Go2 DDS 定位帧失败。', key='分发 Go2 DDS 定位帧失败。', interval_sec=30.0, exc_info=True)
 
     def _build_pose_from_sport_mode_state(self, message: object) -> Pose:
         imu_state = getattr(message, "imu_state", None)
@@ -1379,7 +1374,7 @@ class Go2DirectDdsBridge:
         position = list(getattr(message, "position", [0.0, 0.0, 0.0]) or [0.0, 0.0, 0.0])
         while len(position) < 3:
             position.append(0.0)
-        expected_odom_frame = str(getattr(self.config, "expected_odom_frame", "") or "").strip()
+        expected_odom_frame = str(self.config.expected_odom_frame or "").strip()
         if not expected_odom_frame:
             raise ValueError(
                 "Go2DataPlaneConfig.expected_odom_frame 必须由 PlatformGeometryConfig.frames.odom_frame 注入；"
@@ -1420,7 +1415,7 @@ class Go2DirectDdsBridge:
             0.0 if abs(value) <= gyro_deadband_rps else value
             for value in angular_velocity
         ]
-        expected_imu_frame = str(getattr(self.config, "expected_imu_frame", "") or "").strip()
+        expected_imu_frame = str(self.config.expected_imu_frame or "").strip()
         if not expected_imu_frame:
             raise ValueError(
                 "Go2DataPlaneConfig.expected_imu_frame 必须由 assembly.defaults.frame_ids['imu'] 注入；"
@@ -1463,7 +1458,7 @@ class Go2DirectDdsBridge:
         Phase 5 硬要求：必须真正填充 ``_latest_local_point_cloud`` 与 ``_point_cloud_callbacks``。
         如果订阅器或消息类型不可用，``_start_direct_dds_backend`` 在启动时记录错误并跳过本线程。
         """
-        timeout_sec = float(getattr(self.config.direct_dds, "read_timeout_sec", 0.5))
+        timeout_sec = float(self.config.direct_dds.read_timeout_sec)
         source_topic = f"dds:{self.config.direct_dds.point_cloud_topic}"
         with self._lock:
             generation = self._active_generation if generation is None else generation
@@ -1480,7 +1475,7 @@ class Go2DirectDdsBridge:
                 with self._lock:
                     if not self._is_generation_active_locked(generation, stop_event):
                         return
-                LOGGER.debug("读取 Go2 官方 DDS 点云失败。", exc_info=True)
+                _DRIVER_ERROR_LIMITER.log(LOGGER, logging.ERROR, '读取 Go2 官方 DDS 点云失败。', key='读取 Go2 官方 DDS 点云失败。', interval_sec=30.0, exc_info=True)
                 self._record_point_cloud_bridge_error(
                     f"PointCloud2 Read 异常：{exc}",
                     generation=generation,
@@ -1500,7 +1495,7 @@ class Go2DirectDdsBridge:
                     generation=generation,
                 )
             except Exception as exc:
-                LOGGER.debug("分发 Go2 DDS 点云失败。", exc_info=True)
+                _DRIVER_ERROR_LIMITER.log(LOGGER, logging.ERROR, '分发 Go2 DDS 点云失败。', key='分发 Go2 DDS 点云失败。', interval_sec=30.0, exc_info=True)
                 self._record_point_cloud_bridge_error(
                     f"PointCloud2 callback 异常：{exc}",
                     generation=generation,
@@ -1536,11 +1531,7 @@ class Go2DirectDdsBridge:
             reject("PointCloud2 header.frame_id 为空")
             return
         upstream_registered_to_odom = bool(
-            getattr(
-                self.config.direct_dds,
-                "point_cloud_xyz_registered_to_odom",
-                False,
-            )
+            self.config.direct_dds.point_cloud_xyz_registered_to_odom
         )
         point_cloud_received_at = (
             time.monotonic()
@@ -1624,7 +1615,7 @@ class Go2DirectDdsBridge:
                 and pose_sample_skew_sec <= _MAX_POINT_CLOUD_POSE_SKEW_SEC
             ):
                 registered_frame = str(
-                    getattr(self.config, "expected_odom_frame", "") or ""
+                    self.config.expected_odom_frame or ""
                 ).strip()
                 if not registered_frame:
                     reject("点云 driver 注册需要 expected_odom_frame，但配置为空")
@@ -1655,7 +1646,7 @@ class Go2DirectDdsBridge:
                     float(pose_snapshot.pose.position.y),
                 ]
         elif source_frame != _GO2_UTLIDAR_FRAME and upstream_registered_to_odom:
-            registered_frame = str(getattr(self.config, "expected_odom_frame", "") or "").strip()
+            registered_frame = str(self.config.expected_odom_frame or "").strip()
             if not registered_frame:
                 reject("点云声明已注册到 odom，但 expected_odom_frame 为空")
                 return
@@ -1665,7 +1656,7 @@ class Go2DirectDdsBridge:
             with self._lock:
                 if not self._is_generation_active_locked(generation):
                     return
-                pose_history = getattr(self, "_pose_history", ())
+                pose_history = self._pose_history
                 pose_snapshot = next(
                     (
                         snapshot
@@ -1681,10 +1672,10 @@ class Go2DirectDdsBridge:
                     stationary_yaw_locked = pose_snapshot.stationary_yaw_locked
                 else:
                     yaw_stabilization_offset_rad = float(
-                        getattr(self, "_stationary_yaw_offset_rad", 0.0)
+                        self._stationary_yaw_offset_rad
                     )
                     stationary_yaw_locked = bool(
-                        getattr(self, "_stationary_yaw_locked", False)
+                        self._stationary_yaw_locked
                     )
             if abs(yaw_stabilization_offset_rad) > 1e-12:
                 if pose_snapshot is None:
@@ -1827,7 +1818,7 @@ class Go2DirectDdsBridge:
             try:
                 callback(point_cloud.model_copy(deep=False))
             except Exception:
-                LOGGER.debug("分发 Go2 DDS 点云回调失败。", exc_info=True)
+                _DRIVER_ERROR_LIMITER.log(LOGGER, logging.ERROR, '分发 Go2 DDS 点云回调失败。', key='分发 Go2 DDS 点云回调失败。', interval_sec=30.0, exc_info=True)
 
 
 class _RuntimeDeliveryGate:
@@ -1901,6 +1892,7 @@ class Go2DataPlaneRuntime:
         self._official_robot_state_ready = False
         self._official_generation: Optional[int] = None
         self._official_service_states: Dict[str, Dict[str, object]] = {}
+        self._official_service_states_error: Optional[str] = None
         self._startup_diagnostics: List[str] = []
 
     def start(self) -> None:
@@ -2119,6 +2111,7 @@ class Go2DataPlaneRuntime:
             )
             official_service_states = dict(self._official_service_states) if official_active else {}
             startup_diagnostics = list(self._startup_diagnostics)
+            service_states_error = self._official_service_states_error if official_active else None
         return {
             "started": active_generation is not None,
             "enabled": bool(self.config.enabled),
@@ -2127,6 +2120,7 @@ class Go2DataPlaneRuntime:
             "official_backend_enabled": self._uses_official_backend(),
             "official_robot_state_ready": official_active,
             "official_service_states": official_service_states,
+            "official_service_states_error": service_states_error,
             "startup_diagnostics": startup_diagnostics,
             "bridge": bridge_status,
         }
@@ -2137,6 +2131,7 @@ class Go2DataPlaneRuntime:
         self._official_robot_state_ready = False
         self._official_generation = None
         self._official_service_states = {}
+        self._official_service_states_error = None
         return client
 
     @staticmethod
@@ -2146,10 +2141,10 @@ class Go2DataPlaneRuntime:
             try:
                 close()
             except Exception:
-                LOGGER.debug("关闭 Go2 官方 robot_state 客户端失败。", exc_info=True)
+                _DRIVER_ERROR_LIMITER.log(LOGGER, logging.ERROR, '关闭 Go2 官方 robot_state 客户端失败。', key='关闭 Go2 官方 robot_state 客户端失败。', interval_sec=30.0, exc_info=True)
 
     def _uses_official_backend(self) -> bool:
-        return bool(getattr(self.config, "official", None) and self.config.official.enabled)
+        return self.config.official.enabled
 
     def _start_official_backend(self) -> None:
         if not self.config.enabled or not self._uses_official_backend():
@@ -2219,17 +2214,24 @@ class Go2DataPlaneRuntime:
             return
         try:
             code, items = client.ServiceList()
-        except Exception:
-            LOGGER.debug("读取 Go2 官方服务列表失败。", exc_info=True)
-            return
-        if code != 0 or not items:
-            return
-        service_states: Dict[str, Dict[str, object]] = {}
-        for item in items:
-            service_states[str(getattr(item, "name", ""))] = {
-                "status": int(getattr(item, "status", -1)),
-                "protect": bool(getattr(item, "protect", False)),
+            if code != 0:
+                raise RuntimeError(f"读取 Go2 官方服务列表失败: code={code}")
+            service_states = {
+                str(getattr(item, "name", "")): {
+                    "status": int(getattr(item, "status", -1)),
+                    "protect": bool(getattr(item, "protect", False)),
+                }
+                for item in items
             }
+        except Exception as exc:
+            _DRIVER_ERROR_LIMITER.log(LOGGER, logging.ERROR, "读取 Go2 官方服务列表失败",
+                                      key="official-service-list", interval_sec=30.0, exc_info=True)
+            with self._lock:
+                if (client is self._official_robot_state_client
+                        and generation == self._official_generation
+                        and generation == self._active_generation):
+                    self._official_service_states_error = str(exc)
+            return
         with self._lock:
             if (
                 client is self._official_robot_state_client
@@ -2237,6 +2239,7 @@ class Go2DataPlaneRuntime:
                 and generation == self._active_generation
             ):
                 self._official_service_states = service_states
+                self._official_service_states_error = None
 
 
 @dataclass
@@ -2247,7 +2250,7 @@ class Go2DeviceDataPlane:
 
     def get_sensor_input_executor(self):
         """仅返回当前代际已启动的采集进程。"""
-        return getattr(self.runtime.bridge, "_sensor_process", None)
+        return self.runtime.bridge._sensor_process
 
     def start(self) -> None:
         self.runtime.start()

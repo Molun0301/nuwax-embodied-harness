@@ -66,7 +66,7 @@ class ActivationControlChecks(unittest.TestCase):
         self.assertTrue(event.wait(1), "同步门闩未触发")
 
     def event_fixture(self, level="motion"):
-        fixture, event = Fixture(), ObservedEvent(level)
+        fixture, event = self.enterContext(Fixture()), ObservedEvent(level)
         fixture.runtime._geometry_runtime_start_event = event
         self.releases.append(event)
         return fixture, event
@@ -92,7 +92,7 @@ class ActivationControlChecks(unittest.TestCase):
                   publish_runtime_governance_stream_frame=lambda: None)
 
     def test_cancel_before_preparation_has_no_rpc_or_activation(self):
-        fixture, control = Fixture(), TaskControl()
+        fixture, control = self.enterContext(Fixture()), TaskControl()
         control.cancelled.set()
         with self.assertRaises(TaskCancelledError):
             fixture.runtime._ensure_geometry_runtime_started("navigate_to_pose", check_active=control.ensure_active)
@@ -101,7 +101,7 @@ class ActivationControlChecks(unittest.TestCase):
         self.assertIsNone(fixture.runtime._geometry_runtime_start_event)
 
     def test_cancel_immediately_before_ownership_has_no_activation(self):
-        fixture, control = Fixture(), TaskControl()
+        fixture, control = self.enterContext(Fixture()), TaskControl()
         fixture.stub.GetStatus = lambda *a, **k: (control.cancelled.set() or NS(phase="READY", message="", rss_kb=1))
         with self.assertRaises(TaskCancelledError):
             fixture.runtime._ensure_geometry_runtime_started("navigate_to_pose", check_active=control.ensure_active)
@@ -140,7 +140,7 @@ class ActivationControlChecks(unittest.TestCase):
         self.assertIsNone(event.error)
 
     def test_owner_cancellation_waits_for_shared_success_without_poisoning_follower(self):
-        fixture, control = Fixture(), TaskControl()
+        fixture, control = self.enterContext(Fixture()), TaskControl()
         entered, release = threading.Event(), self.gate()
         def activate(*args, **kwargs):
             fixture.activation_calls.append(args)
@@ -164,7 +164,7 @@ class ActivationControlChecks(unittest.TestCase):
         self.assertIsNone(fixture.runtime._geometry_runtime_start_event)
 
     def test_cancelled_map_owner_finishes_shared_activation_but_never_dispatches_map(self):
-        fixture, control, calls = Fixture(), TaskControl(), []
+        fixture, control, calls = self.enterContext(Fixture()), TaskControl(), []
         entered, release = threading.Event(), self.gate()
         original_status = fixture.stub.GetStatus
         first_probe = True
@@ -195,7 +195,7 @@ class ActivationControlChecks(unittest.TestCase):
         self.assertIsNone(event.error)
 
     def test_actual_failure_shared_and_later_retry_allowed(self):
-        fixture = Fixture()
+        fixture = self.enterContext(Fixture())
         failure = GeometryRuntimeRpcError(rpc_name="RuntimeActivation", grpc_code=grpc.StatusCode.UNAVAILABLE,
                                           grpc_details="离线共享失败")
         entered, release = threading.Event(), self.gate()
@@ -218,7 +218,7 @@ class ActivationControlChecks(unittest.TestCase):
         self.assertEqual(len(fixture.activation_calls), 1)
 
     def test_initial_provider_lock_honors_deadline_before_rpc(self):
-        fixture = Fixture()
+        fixture = self.enterContext(Fixture())
         with fixture.platform._runtime_state_lock:
             worker = self.worker(lambda: fixture.runtime._geometry_runtime_provider_ready(
                 deadline_monotonic=time.monotonic()+0.03))
@@ -227,7 +227,7 @@ class ActivationControlChecks(unittest.TestCase):
         self.assertEqual(fixture.stub.calls, [])
 
     def test_initial_provider_lock_honors_cancel_without_deadline(self):
-        fixture, control = Fixture(), TaskControl()
+        fixture, control = self.enterContext(Fixture()), TaskControl()
         with fixture.platform._runtime_state_lock:
             worker = self.worker(lambda: fixture.runtime._geometry_runtime_provider_ready(check_active=control.ensure_active))
             self.require(control.checked)
@@ -237,7 +237,7 @@ class ActivationControlChecks(unittest.TestCase):
         self.assertEqual(fixture.stub.calls, [])
 
     def test_geometry_coordination_lock_wait_is_cancellable(self):
-        fixture, control = Fixture(), TaskControl()
+        fixture, control = self.enterContext(Fixture()), TaskControl()
         with fixture.runtime._geometry_runtime_lock:
             worker = self.worker(lambda: fixture.runtime._ensure_geometry_runtime_started(
                 "navigate_to_pose", check_active=control.ensure_active))
@@ -248,7 +248,7 @@ class ActivationControlChecks(unittest.TestCase):
         self.assertIsNone(fixture.runtime._geometry_runtime_start_event)
 
     def test_task_checks_do_not_run_under_geometry_or_provider_lock(self):
-        fixture, control = Fixture(), TaskControl()
+        fixture, control = self.enterContext(Fixture()), TaskControl()
         def assert_unlocked():
             self.assertFalse(fixture.runtime._geometry_runtime_lock._is_owned())
             self.assertFalse(fixture.platform._runtime_state_lock._is_owned())
@@ -256,7 +256,7 @@ class ActivationControlChecks(unittest.TestCase):
         fixture.runtime._ensure_geometry_runtime_started("navigate_to_pose", check_active=control.ensure_active)
 
     def test_changed_provider_health_is_not_reused(self):
-        fixture = Fixture()
+        fixture = self.enterContext(Fixture())
         def swap(*args, **kwargs):
             fixture.platform._remote_provider = NS(is_connected=True)
             return NS(phase="READY", message="", rss_kb=1)
@@ -266,7 +266,7 @@ class ActivationControlChecks(unittest.TestCase):
         self.assertIn("更换", message)
 
     def test_legacy_no_keyword_health_callbacks_work_without_budget(self):
-        fixture = Fixture()
+        fixture = self.enterContext(Fixture())
         fixture.runtime.platform_geometry_runtime = NS(
             get_geometry_runtime_provider=lambda: fixture.provider,
             probe_geometry_runtime_health=lambda: (True, "legacy-read"),
@@ -274,7 +274,7 @@ class ActivationControlChecks(unittest.TestCase):
         self.assertEqual(fixture.runtime._geometry_runtime_provider_ready(), (True, "legacy-read"))
 
     def test_legacy_getter_cannot_silently_remove_requested_budget(self):
-        fixture = Fixture()
+        fixture = self.enterContext(Fixture())
         calls = []
         def old_getter():
             calls.append("unbounded-getter")
@@ -288,7 +288,7 @@ class ActivationControlChecks(unittest.TestCase):
         self.assertEqual(calls, [])
 
     def test_legacy_probe_keyword_error_is_not_unavailable(self):
-        fixture = Fixture()
+        fixture = self.enterContext(Fixture())
         fixture.runtime.platform_geometry_runtime = NS(
             get_geometry_runtime_provider=lambda **kwargs: fixture.provider,
             probe_geometry_runtime_health=lambda: (True, "legacy-read"),
@@ -297,7 +297,7 @@ class ActivationControlChecks(unittest.TestCase):
             fixture.runtime._geometry_runtime_provider_ready(deadline_monotonic=time.monotonic()+1)
 
     def test_rpc_error_codes_unchanged(self):
-        fixture = Fixture()
+        fixture = self.enterContext(Fixture())
         fixture.stub.error = grpc.StatusCode.DEADLINE_EXCEEDED
         with self.assertRaises(GeometryRuntimeRpcError) as caught:
             fixture.runtime._geometry_runtime_provider_ready(deadline_monotonic=time.monotonic()+1)
@@ -335,7 +335,7 @@ class ActivationControlChecks(unittest.TestCase):
         for handler, callback in ((handle_activate_map, "ensure_geometry_runtime_started"),
                                   (handle_relocalize_active_map, "ensure_geometry_runtime_for_capability")):
             with self.subTest(handler=handler.__name__):
-                fixture, calls, control = Fixture(), [], TaskControl()
+                fixture, calls, control = self.enterContext(Fixture()), [], TaskControl()
                 ctx = self.skill_context(fixture, calls)
                 setattr(ctx, callback, lambda *a, control=control, **k: control.cancelled.set())
                 with self.assertRaises(TaskCancelledError):
@@ -343,7 +343,7 @@ class ActivationControlChecks(unittest.TestCase):
                 self.assertEqual(calls, [])
 
     def test_direct_handlers_and_relocalization_logical_timeout_unchanged(self):
-        fixture, calls = Fixture(), []
+        fixture, calls = self.enterContext(Fixture()), []
         ctx = self.skill_context(fixture, calls)
         # 旧直接调用只提供单参数回调，仍须兼容。
         ctx.ensure_geometry_runtime_started = lambda capability: None
@@ -355,7 +355,7 @@ class ActivationControlChecks(unittest.TestCase):
         self.assertNotIn("execution_context", calls[1]["metadata"])
 
     def test_geometry_runner_preserves_known_receipt_after_late_cancel(self):
-        fixture = Fixture()
+        fixture = self.enterContext(Fixture())
         runtime, captured = fixture.runtime, {}
         context, record = self.context(time.monotonic()+5)
         def submit(capability, runner, **kwargs):
@@ -388,7 +388,7 @@ class ActivationControlChecks(unittest.TestCase):
         self.assertEqual(fixture.readiness_calls, [])
 
     def test_no_activation_dedup_or_guard_readiness_change_in_this_patch(self):
-        fixture = Fixture()
+        fixture = self.enterContext(Fixture())
         admission = fixture.runtime._admit_motion_request("navigate_to_pose", request_id="offline")
         fixture.runtime._ensure_motion_runtime_for_backend_call("navigate_to_pose", admission)
         self.assertEqual(len(fixture.activation_calls), 2)

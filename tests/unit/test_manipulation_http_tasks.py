@@ -56,15 +56,14 @@ def device():
 
 
 @pytest.fixture
-def runtime(device):
-    locks=ResourceLockManager();manager=TaskManager(resource_lock_manager=locks)
-    config=ManipulationConfig(enabled=True,base_url=device.url,http_timeout_sec=.2,stop_timeout_sec=.25,poll_interval_sec=.01)
-    runtime=SimpleNamespace(config=SimpleNamespace(manipulation=config),task_manager=manager,resource_lock_manager=locks,
-        capability_registry=CapabilityRegistry(),skill_registry=SkillRegistry(),
-        _build_task_request_metadata=lambda **kwargs:dict(kwargs))
-    register_capability(runtime);register_skill(runtime)
+def runtime(device, gateway_runtime_factory, monkeypatch):
+    runtime = gateway_runtime_factory()
+    config = ManipulationConfig(enabled=True, base_url=device.url, http_timeout_sec=.2,
+        stop_timeout_sec=.25, poll_interval_sec=.01)
+    monkeypatch.setattr(runtime.config, "manipulation", config)
+    register_capability(runtime)
+    register_skill(runtime)
     yield runtime
-    manager.shutdown(wait=True);runtime.manipulation_service.close()
 
 
 def submit(runtime,**kwargs):

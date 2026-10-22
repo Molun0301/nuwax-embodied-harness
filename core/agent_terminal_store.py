@@ -3,8 +3,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import time
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
 
 from core.errors import GatewayError
@@ -31,49 +30,41 @@ def sync_directory(path):
 
 
 def initialize_terminal_file(path, ledger_id, pair_id):
-    """仅初始化已明确指定的配对。现有不匹配文件不能被认领或清空。"""
+    """由调用库启动锁串行初始化配对；未提交的空文件可继续完成。"""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
-    except FileExistsError:
-        # 同一新账本的并发构造可能正在提交文件头；仅短暂等待，不猜测其身份。
-        deadline = time.monotonic() + 5.0
-        while True:
-            with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=rw", uri=True, timeout=5.0)) as db:
-                table = db.execute("SELECT name FROM sqlite_master WHERE name='terminal_store_identity'").fetchone()
-                if table:
-                    row = db.execute("SELECT ledger_id,pair_id FROM terminal_store_identity WHERE singleton=1").fetchone()
-                    if row != (ledger_id, pair_id):
-                        raise pair_conflict()
-                    sync_directory(path.parent)
-                    return
-                tables = db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchone()
-                if tables or time.monotonic() >= deadline:
-                    raise pair_conflict()
-            time.sleep(0.025)
-    else:
-        os.close(fd)
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
+    os.close(fd)
     db = sqlite3.connect(str(path), timeout=5.0, isolation_level=None)
     try:
         db.execute("PRAGMA synchronous=FULL")
         db.execute("BEGIN IMMEDIATE")
-        db.execute("CREATE TABLE terminal_store_identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1),"
-                   "ledger_id TEXT NOT NULL,pair_id TEXT NOT NULL)")
-        db.execute("INSERT INTO terminal_store_identity VALUES (1,?,?)", (ledger_id, pair_id))
-        db.execute(TERMINAL_SCHEMA)
-        db.execute("CREATE INDEX agent_terminals_scope ON agent_task_terminals(scope)")
+        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if tables:
+            if "terminal_store_identity" not in tables:
+                raise pair_conflict()
+            row = db.execute("SELECT ledger_id,pair_id FROM terminal_store_identity WHERE singleton=1").fetchone()
+            if row != (ledger_id, pair_id):
+                raise pair_conflict()
+            db.execute("SELECT task_id FROM agent_task_terminals LIMIT 0")
+        else:
+            db.execute("CREATE TABLE terminal_store_identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1),"
+                       "ledger_id TEXT NOT NULL,pair_id TEXT NOT NULL)")
+            db.execute("INSERT INTO terminal_store_identity VALUES (1,?,?)", (ledger_id, pair_id))
+            db.execute(TERMINAL_SCHEMA)
+            db.execute("CREATE INDEX agent_terminals_scope ON agent_task_terminals(scope)")
         db.commit()
     except BaseException:
         db.rollback()
         raise
     finally:
         db.close()
+    path.chmod(0o600)
     sync_directory(path.parent)
 
 
 class AgentTerminalStore:
-    """配对元数据和不可变旧表使首次播种/CAS不依赖跨库事务。"""
+    """唯一终态存储；作用域授权由调用库提供，版本写入在本库事务完成。"""
 
     def __init__(self, authority, layout):
         self.authority = authority
@@ -109,12 +100,7 @@ class AgentTerminalStore:
                 + ",".join("?" for _ in ids) + ")", ids)}
 
     def rows(self, ids, *, full=True):
-        rows = self._target_rows(ids, full=full)
-        missing = tuple(task_id for task_id in ids if task_id not in rows)
-        if missing:
-            # 旧表已封存；此连接在任何目标写事务前关闭。
-            rows.update(self.authority._legacy_terminal_rows(missing, full=full))
-        return rows
+        return self._target_rows(ids, full=full)
 
     def authorize(self, rows, *, error_code):
         with self.authority._read_connection() as db:
@@ -145,33 +131,43 @@ class AgentTerminalStore:
             self.authorize((row,), error_code="not_found")
         return row
 
-    def _seed(self, task_id):
-        # 目标存在即已通过所有入口的播种不变量，无需再次复制旧 JSON。
-        current = self._target_rows((task_id,), full=False).get(task_id)
-        if current is not None:
-            self.authorize((current,), error_code="agent_terminal_scope_conflict")
-            return current["scope"]
-        legacy = self.authority._legacy_terminal_rows((task_id,), full=True).get(task_id)
-        if legacy is not None:
-            self.authorize((legacy,), error_code="agent_terminal_scope_conflict")
-        # 授权读取已关闭；并发播种只允许第一次插入，绝不覆盖已有目标。
-        if legacy is not None:
-            with self._connection() as db:
-                db.execute("BEGIN IMMEDIATE")
-                try:
-                    row = db.execute("SELECT scope FROM agent_task_terminals WHERE task_id=?", (task_id,)).fetchone()
-                    if row is None:
-                        db.execute("INSERT INTO agent_task_terminals (" + ",".join(TERMINAL_FIELDS)
-                                   + ") VALUES (?,?,?,?,?,?,?)", tuple(legacy[key] for key in TERMINAL_FIELDS))
-                    db.commit()
-                except BaseException:
-                    db.rollback()
-                    raise
-            return legacy["scope"]
-        return self.authority.scope
+    def import_legacy_rows(self, source):
+        """启动时逐批搬运原列；已存在的较新目标保留，冲突保留原库并报错。"""
+        if source.execute("SELECT 1 FROM sqlite_master WHERE name='agent_task_terminals' AND type='table'").fetchone() is None:
+            return
+        cursor = source.execute("SELECT " + ",".join(TERMINAL_FIELDS) + " FROM agent_task_terminals ORDER BY task_id")
+        with self._connection() as target:
+            target.execute("BEGIN IMMEDIATE")
+            try:
+                while rows := cursor.fetchmany(64):
+                    for row in rows:
+                        current = target.execute("SELECT * FROM agent_task_terminals WHERE task_id=?", (row["task_id"],)).fetchone()
+                        if current is not None:
+                            if current["scope"] != row["scope"]:
+                                raise GatewayError("导入的历史回执作用域冲突。", error_code="agent_terminal_scope_conflict", http_status=409)
+                            if current["receipt_source_id"] != row["receipt_source_id"]:
+                                raise GatewayError("导入的历史回执源身份冲突。", error_code="agent_terminal_source_conflict", http_status=409)
+                            revision, previous = row["receipt_revision"], current["receipt_revision"]
+                            if (revision is None) != (previous is None):
+                                raise GatewayError("导入的历史回执版本冲突。", error_code="agent_terminal_legacy_conflict", http_status=409)
+                            if revision == previous:
+                                if current["snapshot_json"] != row["snapshot_json"]:
+                                    raise GatewayError("同一历史回执版本内容冲突。", error_code="agent_terminal_revision_conflict", http_status=409)
+                                continue
+                            if previous > revision:
+                                continue
+                        target.execute("INSERT OR REPLACE INTO agent_task_terminals (" + ",".join(TERMINAL_FIELDS)
+                                       + ") VALUES (?,?,?,?,?,?,?)", tuple(row[key] for key in TERMINAL_FIELDS))
+                target.commit()
+            except BaseException:
+                target.rollback()
+                raise
 
     def save(self, prepared):
-        allowed_scope = self._seed(prepared.task_id)
+        current = self._target_rows((prepared.task_id,), full=False).get(prepared.task_id)
+        if current is not None:
+            self.authorize((current,), error_code="agent_terminal_scope_conflict")
+        allowed_scope = current["scope"] if current is not None else self.authority.scope
         for _ in range(3):
             with self._connection() as db:
                 db.execute("BEGIN IMMEDIATE")

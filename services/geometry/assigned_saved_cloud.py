@@ -3,7 +3,6 @@
 Only the runtime installation owner mints handles. Metadata comparisons never
 compare the checkpoint, prepared activation, or immutable whole-map bodies.
 """
-import json
 from dataclasses import dataclass, field
 
 from services.geometry.checkpoint_payload import FrozenPayload
@@ -80,7 +79,7 @@ def _capture_assigned_saved_cloud_handle(owner, snapshot, prepared):
             or type(count) is not int or count <= 0 or len(payload) != count * 12
             or len(payload) != cloud["xyz_size"]):
         raise ValueError("assigned saved canonical cloud metadata is unavailable or inconsistent")
-    activation = json.loads(snapshot.activation_result_json)
+    activation = snapshot.activation_result
     session_id, session_generation = activation.get("session_id"), activation.get("session_generation")
     if not isinstance(session_id, str) or not session_id or type(session_generation) is not int or session_generation <= 0:
         raise ValueError("assigned saved cloud lacks installed mapping session metadata")

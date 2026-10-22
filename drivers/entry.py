@@ -6,7 +6,7 @@ from drivers.registry import RobotDriverRegistration, get_robot_driver_registrat
 
 
 def _resolve_configured_robot_name(config) -> str:
-    return str(getattr(getattr(config, "robot", None), "active_robot", "") or "").strip().lower()
+    return str(config.robot.active_robot or "").strip().lower()
 
 
 def get_active_robot_registration(config) -> RobotDriverRegistration:

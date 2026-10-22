@@ -55,7 +55,7 @@ class Backend:
 @pytest.fixture
 def setup(tmp_path):
     holder = {"map": make_snapshot(), "pose": Pose(frame_id="map", position=Vector3(x=2, y=2))}
-    mapping = SimpleNamespace(get_latest_snapshot=lambda: holder["map"])
+    mapping = SimpleNamespace(get_latest_snapshot=lambda: holder["map"], get_semantic_snapshot=lambda: holder["map"])
     localization = SimpleNamespace(get_active_session=lambda: SimpleNamespace(map_name="lab", pose_available=True,
              session_id="test-session", status=SimpleNamespace(value="ready")),
              get_latest_snapshot=lambda: LocalizationSnapshot(source_name="test", current_pose=holder["pose"]))

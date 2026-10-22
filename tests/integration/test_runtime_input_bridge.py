@@ -511,6 +511,40 @@ def test_pointcloud_publish_once_increments_counters() -> None:
     bridge.stop()
 
 
+@pytest.mark.parametrize("failure", ["slice", "allocation"])
+def test_downsample_failure_drops_once_without_publishing_original_frame(monkeypatch, failure):
+    """降采样准备失败由订阅边界收口，后续正常帧仍能继续发布。"""
+    monkeypatch.setenv("NUWAX_GEOMETRY_LIO_BACKEND", "device")
+    runtime = _FakeRuntimeProvider()
+    pc = _FakePointCloudProvider()
+    bridge = RuntimeInputBridge(runtime_provider=runtime, point_cloud_provider=pc,
+        max_points_before_downsample=4, max_points_after_downsample=2)
+    frame = _make_point_cloud(8)
+    class BrokenArray(np.ndarray):
+        def __getitem__(self, key):
+            raise ValueError("传感器数组切片失败")
+    try:
+        assert bridge.start()
+        with monkeypatch.context() as boundary:
+            if failure == "slice":
+                frame = frame.model_copy(update={"points_xyz_array": frame.points_xyz_array.view(BrokenArray)})
+            else:
+                frame.metadata["intensity_array"] = np.ones(8, dtype=np.float32)
+                boundary.setattr(np, "ascontiguousarray", lambda *_args, **_kwargs: (_ for _ in ()).throw(MemoryError("输出数组分配失败")))
+            pc.emit(frame)
+        assert bridge.counters.dropped_pointcloud_count == 1
+        assert bridge.counters.published_pointcloud_count == 0
+        assert bridge.counters.downsampled_pointcloud_count == 0
+        assert "PointCloud 准备或发布失败" in bridge.counters.last_error
+        assert runtime.publish_point_cloud_calls == []
+        pc.emit(_make_point_cloud(8))
+        assert bridge.counters.published_pointcloud_count == 1
+        assert bridge.counters.dropped_pointcloud_count == 1
+        assert runtime.publish_point_cloud_calls[0]["point_count"] == 2
+    finally:
+        bridge.stop()
+
+
 @pytest.mark.parametrize(
     (
         "include_intensity",
@@ -828,7 +862,7 @@ def _feed_ready_sensor_scan(callback, timestamp=1_000):
 
 
 @pytest.mark.parametrize("backend", ["fastlio2", "pointlio"])
-def test_gateway_repairs_ready_provider_input_bridge_and_reclaims_real_publisher(monkeypatch, backend):
+def test_gateway_repairs_ready_provider_input_bridge_and_reclaims_real_publisher(monkeypatch, backend, gateway_runtime_factory):
     """网关补桥后真实规范输入可发布，换提供器先回收旧线程与旧回调。"""
     from types import SimpleNamespace
     from gateways.runtime import GatewayRuntime
@@ -838,19 +872,11 @@ def test_gateway_repairs_ready_provider_input_bridge_and_reclaims_real_publisher
     source = _CanonicalSampleProvider()
     old_provider, new_provider = _FakeRuntimeProvider(), _FakeRuntimeProvider()
     current = [old_provider]
-    gateway = GatewayRuntime.__new__(GatewayRuntime)
-    gateway._geometry_runtime_lock = threading.RLock()
-    gateway._lifecycle_lock = threading.RLock()
-    gateway._geometry_runtime_start_event = None
-    gateway._closed = False
-    gateway._input_bridge = None
-    gateway._input_bridge_started = False
-    gateway.robot = SimpleNamespace(providers=source)
-    gateway.platform_geometry_runtime = SimpleNamespace(
-        get_geometry_runtime_provider=lambda: current[0],
-        probe_geometry_runtime_health=lambda **_kwargs: (True, "ready"),
-    )
-    gateway._request_geometry_runtime_activation = lambda *_args, **_kwargs: pytest.fail("就绪提供器补桥不应重新激活服务")
+    gateway = gateway_runtime_factory()
+    monkeypatch.setattr(gateway.robot, "providers", source)
+    monkeypatch.setattr(gateway.platform_geometry_runtime, "get_geometry_runtime_provider", lambda: current[0])
+    monkeypatch.setattr(gateway.platform_geometry_runtime, "probe_geometry_runtime_health", lambda **_kwargs: (True, "ready"))
+    monkeypatch.setattr(gateway, "_request_geometry_runtime_activation", lambda *_args, **_kwargs: pytest.fail("就绪提供器补桥不应重新激活服务"))
     try:
         gateway._ensure_geometry_runtime_started("start_mapping")
         old_bridge = gateway._input_bridge
@@ -1022,11 +1048,11 @@ def test_old_stop_does_not_wait_for_restarted_idle_publisher(monkeypatch):
     stop_done = threading.Event()
     original_wait = bridge._wait_for_stop_drain
 
-    def defer_old_stop(generation, publisher):
+    def defer_old_stop(generation, publisher, mapping_publisher):
         if threading.current_thread().name == "delayed-old-stop":
             old_stop_waiting.set()
             assert allow_old_stop.wait(timeout=5)
-        original_wait(generation, publisher)
+        original_wait(generation, publisher, mapping_publisher)
 
     monkeypatch.setattr(bridge, "_wait_for_stop_drain", defer_old_stop)
     stopper = threading.Thread(target=lambda: (bridge.stop(), stop_done.set()), name="delayed-old-stop")
@@ -1071,12 +1097,12 @@ def test_native_start_failure_reclaims_publisher(monkeypatch, failure):
     assert bridge._lio_publisher_thread is None
     assert not bridge._lio_publish_owner_active
     assert bridge._lio_reset_pending_generation is None
-    # 设备模式不新增线程，保持原来未订阅时显式stop的行为。
+    # 无可用输入源时，设备模式同样回滚启动状态。
     monkeypatch.setenv("NUWAX_GEOMETRY_LIO_BACKEND", "device")
     device = RuntimeInputBridge(runtime_provider=_FakeRuntimeProvider())
     try:
         assert not device.start()
-        assert device.is_started()
+        assert not device.is_started()
         assert device._lio_publisher_thread is None
     finally:
         device.stop()
@@ -1887,10 +1913,10 @@ class _NavigationCancelStub:
         self.status = status
 
     def CancelNavigation(self, request, timeout=None):
-        from types import SimpleNamespace
+        from services.geometry.proto_gen import geometry_runtime_pb2 as pb2
 
         del timeout
-        return SimpleNamespace(
+        return pb2.NavigationState(
             status=self.status,
             message="cancel response",
             goal_id=request.goal_id,
@@ -1932,7 +1958,7 @@ def test_pending_cancel_response_is_accepted_without_faking_terminal_state() -> 
     provider = _geometry_provider_with_cancel_status("PENDING")
 
     assert provider.cancel_goal("goal-1") is True
-    assert provider._last_nav_status == "pending"
+    assert provider._last_nav_status == "running"
     assert provider._nav_status_to_enum("PENDING") == NavigationStatus.ACCEPTED
 
 

@@ -185,33 +185,16 @@ class HashFreeIndexChecks(unittest.TestCase):
             self.assertEqual(points[0][1].title, 'Desk provisional')
         self.assertEqual(service._semantic_entries_by_id[record.memory_id].title, 'Desk provisional')
 
-    def test_separate_native_store_attests_its_own_revision(self):
+    def test_shared_store_attests_the_actual_vector_row_revision(self):
         with tempfile.TemporaryDirectory() as directory:
-            store = SQLiteNamedVectorStore(str(Path(directory) / 'cache.db')); self.addCleanup(store.close)
-            service = self.fixture(path=str(Path(directory) / 'source.db'), store=store)
+            service = self.fixture(path=str(Path(directory) / 'source.db'))
+            store = service._vector_store
             record, _ = self.accept(service)
             token = service._durable_index.outbox.start_worker(); self.drain(service, token)
             points, counts = service._durable_index.query_snapshot([('memory', record)])
             self.assertEqual(counts['validated_current'], 1)
             self.assertEqual(points[0][2].vectors['text_dense'].storage_revision,
                              store.get_point(record.memory_id).payload[INDEX_META]['vectors']['text_dense']['publication_id'])
-
-    def test_opaque_capability_flag_cannot_manufacture_current_evidence(self):
-        underlying = SQLiteNamedVectorStore(); self.addCleanup(underlying.close)
-        class Opaque:
-            backend_name = 'opaque-fixture'
-            supports_versioned_publications = True
-            get_point = underlying.get_point
-            upsert_point = underlying.upsert_point
-            delete_points = underlying.delete_points
-        service = self.fixture(store=Opaque())
-        record, _ = self.accept(service)
-        token = service._durable_index.outbox.start_worker(); self.drain(service, token)
-        points, counts = service._durable_index.query_snapshot([('memory', record)])
-        self.assertEqual(counts['validated_current'], 0)
-        self.assertEqual(counts['legacy_unverified'], 1)
-        self.assertTrue(self.query(service).matches)
-        self.assertFalse(points[0][2].vectors['text_dense'].vector.flags.writeable)
 
     def test_corrupt_cached_binding_preserves_lexical_results(self):
         for binding in (None, 'invalid', {}, {'text': None}, ['invalid']):
@@ -262,17 +245,13 @@ class HashFreeIndexChecks(unittest.TestCase):
         self.assertEqual(counts['validated_current'], 0)
 
     def test_missing_vector_attestation_does_not_hide_owned_binding_conflict(self):
-        underlying = SQLiteNamedVectorStore(); self.addCleanup(underlying.close)
-        class Opaque:
-            backend_name = 'opaque-fixture'
-            get_point = underlying.get_point
-            upsert_point = underlying.upsert_point
-            delete_points = underlying.delete_points
-        service = self.fixture(store=Opaque())
+        service = self.fixture()
+        underlying = service._vector_store
         record, _ = self.accept(service)
         box = service._durable_index.outbox; token = box.start_worker(); self.drain(service, token)
         service._text_embedder.model_revision = 'different-provider-revision'
         with underlying.storage.transaction() as tx:
+            tx.execute('UPDATE memory_index_publications SET vector_revision=NULL')
             row = tx.execute('SELECT payload_json FROM memory_vector_points WHERE point_id=?', (record.memory_id,)).fetchone()
             payload = json.loads(row[0]); payload[INDEX_META]['vectors']['text_dense']['binding'] = service._index_model_binding()
             tx.execute('UPDATE memory_vector_points SET payload_json=? WHERE point_id=?', (json.dumps(payload), record.memory_id))

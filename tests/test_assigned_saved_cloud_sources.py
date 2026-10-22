@@ -77,7 +77,7 @@ class AssignedSavedCloudTests(unittest.TestCase):
             'map_name': self.bundle.map_name, 'asset_identity': self.bundle.asset_identity.model_dump(),
             'checkpoint_id': self.prepared.checkpoint_id, 'expected_runtime_generation': 7}
         evidence = self.runtime.dispatch_prepared_assigned_map(self.prepared, request)
-        self.runtime.install_prepared_assigned_map(self.prepared, activation_request=request, activation_evidence=evidence)
+        self.runtime.install_prepared_assigned_map(self.prepared, activation_evidence=evidence)
         # Everything below the admission boundary must be metadata or views.
         for name in hashlib.algorithms_guaranteed | {'new', 'file_digest'}:
             if hasattr(hashlib, name):
@@ -179,9 +179,9 @@ class AssignedSavedCloudTests(unittest.TestCase):
 
     def test_capture_summary_and_dense_do_not_require_ready_or_connected_provider(self):
         current = self.runtime._map_activation_snapshot
-        metadata = json.loads(current.activation_result_json)
+        metadata = dict(current.activation_result)
         metadata['relocalization_target_available'] = False
-        current = replace(current, activation_result_json=json.dumps(metadata))
+        current = replace(current, activation_result=metadata)
         self.runtime._map_activation_snapshot = current
         self.runtime._assigned_map_installation_origin = (current, self.prepared)
         self.runtime._remote_provider = None

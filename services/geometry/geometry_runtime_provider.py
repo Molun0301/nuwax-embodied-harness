@@ -37,21 +37,14 @@ from contracts.maps import OccupancyGrid
 from contracts.navigation import NavigationGoal, NavigationState, NavigationStatus, navigation_reverse_wire_fields
 from contracts.map_activation import (
     AssignedActivationReceipt,
-    _commit as _admit_assigned_commit,
-    _integer as _admit_assigned_integer,
     _request as _admit_assigned_activation_request,
-    _activation as _admit_assigned_activation_identity,
 )
 from contracts.map_relocalization import (
     AssignedRelocalizationRequest,
     AssignedRelocalizationTerminal,
     AssignedRelocalizationQuery,
-    current_assigned_relocalization_policy,
-    current_assigned_planar_relocalization_policy,
     _project_proto as _project_assigned_proto,
     _provider_fields as _assigned_proto_fields,
-    _pose as _validate_assigned_pose_bits,
-    MAX_TERMINAL_BYTES,
 )
 from services.geometry.proto_gen import geometry_runtime_pb2 as pb2
 from services.geometry.proto_gen import geometry_runtime_pb2_grpc as pb2_grpc
@@ -267,9 +260,9 @@ class _AssignedActivationAttempt:
                 == struct.pack(">f", stored_checkpoint.cloud_asset["voxel_size"]))
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True)
 class _AssignedNativeLocalizationSample:
-    """Bounded native observation; never a generic GetCurrentPose result."""
+    """提供器解码一次的原生观察，位姿和坐标树按只读契约共享。"""
 
     _provider: object
     _origin: tuple
@@ -278,104 +271,43 @@ class _AssignedNativeLocalizationSample:
     source_timestamp_ns: int
     correction_revision: int
     map_frame_generation: int
-    _pose_json: str
-    _frame_tree_json: str
-
-    def __init__(self, *args, **kwargs):
-        raise TypeError("assigned samples must come from the native observation RPC")
-
-    @property
-    def current_pose(self) -> Pose:
-        return Pose.model_validate_json(self._pose_json)
-
-    @property
-    def frame_tree(self) -> FrameTree:
-        return FrameTree.model_validate_json(self._frame_tree_json)
+    current_pose: Pose
+    frame_tree: FrameTree
 
 
-def _admit_assigned_localization_sample(response, *, request, expected_terminal,
-                                        provider, origin, delivery_token):
-    """Validate only bounded wire metadata, preserving the native source clock.
 
-    The native RPC verifies current sealed target, canonical correction/source
-    lineage and pose/TF composition under its existing ownership boundaries.
-    Python does not recreate that native observation from historical evidence.
-    """
+def _admit_assigned_localization_sample(response, *, provider, origin, delivery_token):
+    """在协议边界构造一次样本，保留每条边和位姿的真实来源时间。"""
     if type(response) is not pb2.AssignedLocalizationSampleV2:
         raise ValueError("assigned localization sample has an unsupported protobuf type")
-    if response.ByteSize() > MAX_TERMINAL_BYTES + 4096:
-        raise ValueError("assigned localization sample exceeds its metadata budget")
-    clean = type(response)()
-    clean.CopyFrom(response)
-    clean.DiscardUnknownFields()
-    if clean.SerializeToString(deterministic=True) != response.SerializeToString(deterministic=True):
-        raise ValueError("assigned localization sample contains unknown fields")
     if response.schema_version != 2 or any(not response.HasField(name) for name in (
             "terminal", "pose", "map_from_odom", "odom_from_body", "correction_owner")):
         raise ValueError("assigned localization sample is missing its native owners or geometry")
     terminal = AssignedRelocalizationTerminal.from_proto(response.terminal)
-    if (not request.exact_replay_of(terminal.request)
-            or not expected_terminal.exact_replay_of(terminal)
-            or terminal.disposition not in _RELOCALIZE_SUCCESS_DISPOSITIONS):
-        raise ValueError("assigned localization sample differs from the retained applied terminal")
-    evidence = terminal.to_dict()[terminal.request.body_key]["evidence"]
-    owner = evidence["owner"]
-    if request.backend_kind == "slam_toolbox":
-        frame_generation = evidence["frame_generation"]
-        source_stamp = evidence["source_unix_ns"]
-    else:
-        source = evidence["source_frames"][-1]
-        frame_generation = source["map_frame_generation"]
-        source_stamp = source["correlated_odom_source_timestamp_ns"]
-    if (_project_assigned_proto(response.correction_owner, "owner") != owner
-            or response.correction_revision != terminal.correction_revision
-            or response.map_frame_generation != frame_generation):
-        raise ValueError("assigned localization sample correction owner or frame lineage differs")
-    pose, map_edge, odom_edge = response.pose, response.map_from_odom, response.odom_from_body
-    if (pose.frame_id != owner["map_frame_id"]
-            or (map_edge.parent_frame, map_edge.child_frame) != (owner["map_frame_id"], owner["odom_frame_id"])
-            or (odom_edge.parent_frame, odom_edge.child_frame) != (owner["odom_frame_id"], owner["body_frame_id"])):
-        raise ValueError("assigned localization sample frame IDs differ from the retained owner")
-    stamp = pose.timestamp_ns
-    if (not stamp or stamp != map_edge.timestamp_ns or stamp != odom_edge.timestamp_ns
-            or stamp < source_stamp):
-        raise ValueError("assigned localization sample source timestamp is stale or inconsistent")
-    for geometry, position, orientation in ((pose, "position", "orientation"),
-                                            (map_edge, "translation", "rotation"),
-                                            (odom_edge, "translation", "rotation")):
-        if not geometry.HasField(position) or not geometry.HasField(orientation):
-            raise ValueError("assigned localization sample geometry is incomplete")
-        vector, quaternion = getattr(geometry, position), getattr(geometry, orientation)
-        def bits(value):
-            return struct.unpack(">Q", struct.pack(">d", value))[0]
-
-        _validate_assigned_pose_bits({
-            "translation_m_bits": [bits(getattr(vector, axis)) for axis in "xyz"],
-            "rotation_xyzw_bits": [bits(getattr(quaternion, axis)) for axis in "xyzw"],
-        }, candidate=True)
-    current_pose = _build_pose(pose)
-    if current_pose is None:
+    for geometry, position, orientation in ((response.pose, "position", "orientation"),
+                                            (response.map_from_odom, "translation", "rotation"),
+                                            (response.odom_from_body, "translation", "rotation")):
+        _require_proto_message_field(geometry, position)
+        _require_proto_message_field(geometry, orientation)
+    pose = _build_pose(response.pose)
+    if pose is None:
         raise ValueError("assigned localization sample pose cannot be represented")
-    # This assigned sample shares one observed source time across both canonical
-    # edges and the detached tree; a generic tree may contain different edge times.
-    transforms = [Transform(
-        timestamp=current_pose.timestamp, parent_frame_id=edge.parent_frame,
-        child_frame_id=edge.child_frame,
-        translation=Vector3(x=edge.translation.x, y=edge.translation.y, z=edge.translation.z),
-        rotation=Quaternion(x=edge.rotation.x, y=edge.rotation.y, z=edge.rotation.z, w=edge.rotation.w),
-        authority="geometry_runtime_assigned",
-    ) for edge in (map_edge, odom_edge)]
-    tree = FrameTree(timestamp=current_pose.timestamp, root_frame_id=owner["map_frame_id"], transforms=transforms)
-    sample = object.__new__(_AssignedNativeLocalizationSample)
-    for name, value in {
-        "_provider": provider, "_origin": origin, "_delivery_token": delivery_token,
-        "terminal": terminal, "source_timestamp_ns": stamp,
-        "correction_revision": response.correction_revision,
-        "map_frame_generation": response.map_frame_generation,
-        "_pose_json": current_pose.model_dump_json(), "_frame_tree_json": tree.model_dump_json(),
-    }.items():
-        object.__setattr__(sample, name, value)
-    return sample
+    transforms = []
+    for edge in (response.map_from_odom, response.odom_from_body):
+        timestamp = datetime.fromtimestamp(edge.timestamp_ns // 1_000_000_000, tz=timezone.utc).replace(
+            microsecond=(edge.timestamp_ns % 1_000_000_000) // 1_000)
+        transforms.append(Transform(
+            timestamp=timestamp, parent_frame_id=edge.parent_frame, child_frame_id=edge.child_frame,
+            translation=Vector3(x=edge.translation.x, y=edge.translation.y, z=edge.translation.z),
+            rotation=Quaternion(x=edge.rotation.x, y=edge.rotation.y, z=edge.rotation.z, w=edge.rotation.w),
+            authority="geometry_runtime_assigned",
+        ))
+    tree = FrameTree(timestamp=pose.timestamp, root_frame_id=pose.frame_id, transforms=transforms)
+    return _AssignedNativeLocalizationSample(
+        provider, origin, delivery_token, terminal, response.pose.timestamp_ns,
+        response.correction_revision, response.map_frame_generation, pose, tree,
+    )
+
 
 
 class GeometryRuntimeMapActivationStaleRequest(RuntimeError):
@@ -474,6 +406,8 @@ def _planar_checkpoint_export_bundle_from_proto(response, payload):
     grid = _require_proto_message_field(response, "canonical_occupancy_checkpoint")
     meta = _require_proto_message_field(grid, "meta")
     data = bytes(grid.data)
+    if payload_digest(payload) != bytes(response.content_sha256):
+        raise ValueError("content_sha256 does not match checkpoint payload")
     checkpoint = MappingBackendCheckpoint(schema_version=response.schema_version, backend_kind=response.backend_kind,
         source_session_id=response.source_session_id, source_session_generation=response.source_session_generation,
         content_sha256=bytes(response.content_sha256), payload_size=response.payload_size, created_at_ns=response.created_at_ns,
@@ -502,8 +436,8 @@ def _require_proto_message_field(message, field_name: str):
 
 def _mapping_commit_identity_dict(message) -> Dict[str, object]:
     return {
-        "boot_nonce": bytes(getattr(message, "boot_nonce", b"") or b""),
-        "sequence": int(getattr(message, "sequence", 0) or 0),
+        "boot_nonce": bytes(message.boot_nonce),
+        "sequence": int(message.sequence),
     }
 
 
@@ -511,19 +445,19 @@ def _occupancy_receipt_dict(message) -> Dict[str, object]:
     commit_id = _require_proto_message_field(message, "commit_id")
     return {
         "commit_id": _mapping_commit_identity_dict(commit_id),
-        "session_id": str(getattr(message, "session_id", "") or ""),
+        "session_id": str(message.session_id),
         "session_generation": int(
-            getattr(message, "session_generation", 0) or 0
+            message.session_generation
         ),
         "occupancy_revision": int(
-            getattr(message, "occupancy_revision", 0) or 0
+            message.occupancy_revision
         ),
         "source_timestamp_ns": int(
-            getattr(message, "source_timestamp_ns", 0) or 0
+            message.source_timestamp_ns
         ),
-        "backend_kind": str(getattr(message, "backend_kind", "") or ""),
+        "backend_kind": str(message.backend_kind),
         "backend_generation": int(
-            getattr(message, "backend_generation", 0) or 0
+            message.backend_generation
         ),
     }
 
@@ -533,16 +467,16 @@ def _cloud_receipt_dict(message) -> Dict[str, object]:
     return {
         "commit_id": _mapping_commit_identity_dict(commit_id),
         "session_generation": int(
-            getattr(message, "session_generation", 0) or 0
+            message.session_generation
         ),
         "occupancy_revision": int(
-            getattr(message, "occupancy_revision", 0) or 0
+            message.occupancy_revision
         ),
-        "cloud_revision": int(getattr(message, "cloud_revision", 0) or 0),
+        "cloud_revision": int(message.cloud_revision),
         "source_timestamp_ns": int(
-            getattr(message, "source_timestamp_ns", 0) or 0
+            message.source_timestamp_ns
         ),
-        "point_count": int(getattr(message, "point_count", 0) or 0),
+        "point_count": int(message.point_count),
     }
 
 
@@ -585,7 +519,9 @@ def _checkpoint_export_bundle_from_proto(
         if fine_payload is not None or dense_payload is not None:
             raise ValueError("二维导出不能携带精细三维资产")
         return _planar_checkpoint_export_bundle_from_proto(response, payload)
-    has_fine = getattr(response, "fine_map_artifact", None) is not None and response.HasField("fine_map_artifact")
+    if payload_digest(response.payload) != bytes(response.content_sha256):
+        raise ValueError("content_sha256 does not match checkpoint payload")
+    has_fine = response.fine_map_artifact is not None and response.HasField("fine_map_artifact")
     if has_fine != (fine_payload is not None):
         raise ValueError("精细地图制品引用与下载载荷不一致")
     if has_fine and (len(fine_payload) != response.fine_map_artifact.size or payload_digest(fine_payload) != bytes(response.fine_map_artifact.sha256)):
@@ -606,12 +542,12 @@ def _checkpoint_export_bundle_from_proto(
         "canonical_cloud_checkpoint",
     )
     occupancy_meta = _require_proto_message_field(occupancy_checkpoint, "meta")
-    occupancy_data = bytes(getattr(occupancy_checkpoint, "data", b"") or b"")
+    occupancy_data = bytes(occupancy_checkpoint.data)
     if any(value > 100 and value != 255 for value in occupancy_data):
         raise ValueError(
             "canonical occupancy checkpoint contains values outside [-1, 100]"
         )
-    xyz_f32_le = bytes(getattr(cloud_checkpoint, "xyz_f32_le", b"") or b"")
+    xyz_f32_le = bytes(cloud_checkpoint.xyz_f32_le)
     if len(xyz_f32_le) % 12 != 0:
         raise ValueError(
             "canonical cloud checkpoint xyz_f32_le must contain packed XYZ float32"
@@ -624,26 +560,26 @@ def _checkpoint_export_bundle_from_proto(
         raise ValueError("canonical cloud checkpoint contains non-finite XYZ")
     actual_xyz_sha256 = hashlib.sha256(xyz_f32_le).hexdigest()
     declared_xyz_sha256 = str(
-        getattr(cloud_checkpoint, "xyz_sha256", "") or ""
+        cloud_checkpoint.xyz_sha256
     )
     if declared_xyz_sha256 != actual_xyz_sha256:
         raise ValueError("canonical cloud checkpoint xyz_sha256 mismatch")
 
     checkpoint = MappingBackendCheckpoint(
-        schema_version=int(getattr(response, "schema_version", 0) or 0),
-        backend_kind=str(getattr(response, "backend_kind", "") or ""),
+        schema_version=int(response.schema_version),
+        backend_kind=str(response.backend_kind),
         source_session_id=str(
-            getattr(response, "source_session_id", "") or ""
+            response.source_session_id
         ),
         source_session_generation=int(
-            getattr(response, "source_session_generation", 0) or 0
+            response.source_session_generation
         ),
         content_sha256=bytes(
-            getattr(response, "content_sha256", b"") or b""
+            response.content_sha256
         ),
-        payload_size=int(getattr(response, "payload_size", 0) or 0),
-        created_at_ns=int(getattr(response, "created_at_ns", 0) or 0),
-        payload=bytes(getattr(response, "payload", b"") or b""),
+        payload_size=int(response.payload_size),
+        created_at_ns=int(response.created_at_ns),
+        payload=bytes(response.payload),
         occupancy_receipt=_occupancy_receipt_dict(occupancy_receipt),
         cloud_receipt=_cloud_receipt_dict(cloud_receipt),
         fine_archive=fine_payload,
@@ -652,30 +588,30 @@ def _checkpoint_export_bundle_from_proto(
     occupancy_asset = {
         "raw_data_sha256": hashlib.sha256(occupancy_data).digest(),
         "raw_data_size": len(occupancy_data),
-        "width": int(getattr(occupancy_meta, "width", 0) or 0),
-        "height": int(getattr(occupancy_meta, "height", 0) or 0),
-        "resolution": float(getattr(occupancy_meta, "resolution", 0.0) or 0.0),
-        "origin_x": float(getattr(occupancy_meta, "origin_x", 0.0) or 0.0),
-        "origin_y": float(getattr(occupancy_meta, "origin_y", 0.0) or 0.0),
-        "frame_id": str(getattr(occupancy_meta, "frame_id", "") or ""),
+        "width": int(occupancy_meta.width),
+        "height": int(occupancy_meta.height),
+        "resolution": float(occupancy_meta.resolution),
+        "origin_x": float(occupancy_meta.origin_x),
+        "origin_y": float(occupancy_meta.origin_y),
+        "frame_id": str(occupancy_meta.frame_id),
         "source_occupancy_revision": int(
-            getattr(occupancy_meta, "revision", 0) or 0
+            occupancy_meta.revision
         ),
-        "timestamp_ns": int(getattr(occupancy_meta, "timestamp_ns", 0) or 0),
+        "timestamp_ns": int(occupancy_meta.timestamp_ns),
     }
     cloud_asset = {
         "xyz_sha256": bytes.fromhex(actual_xyz_sha256),
         "xyz_size": len(xyz_f32_le),
-        "frame_id": str(getattr(cloud_checkpoint, "frame_id", "") or ""),
+        "frame_id": str(cloud_checkpoint.frame_id),
         "source_cloud_revision": int(
-            getattr(cloud_checkpoint, "source_revision", 0) or 0
+            cloud_checkpoint.source_revision
         ),
-        "point_count": int(getattr(cloud_checkpoint, "point_count", 0) or 0),
+        "point_count": int(cloud_checkpoint.point_count),
         "voxel_size": float(
-            getattr(cloud_checkpoint, "voxel_size", 0.0) or 0.0
+            cloud_checkpoint.voxel_size
         ),
         "payload_schema_version": int(
-            getattr(cloud_checkpoint, "payload_schema_version", 0) or 0
+            cloud_checkpoint.payload_schema_version
         ),
     }
     validated_checkpoint, validated_occupancy, validated_cloud = (
@@ -685,24 +621,8 @@ def _checkpoint_export_bundle_from_proto(
             cloud_asset=cloud_asset,
         )
     )
-    frozen_checkpoint = MappingBackendCheckpoint(
-        schema_version=validated_checkpoint.schema_version,
-        backend_kind=validated_checkpoint.backend_kind,
-        source_session_id=validated_checkpoint.source_session_id,
-        source_session_generation=validated_checkpoint.source_session_generation,
-        content_sha256=validated_checkpoint.content_sha256,
-        payload_size=validated_checkpoint.payload_size,
-        created_at_ns=validated_checkpoint.created_at_ns,
-        payload=validated_checkpoint.payload,
-        occupancy_receipt=_freeze_checkpoint_value(
-            validated_checkpoint.occupancy_receipt
-        ),
-        cloud_receipt=_freeze_checkpoint_value(validated_checkpoint.cloud_receipt),
-        fine_archive=validated_checkpoint.fine_archive,
-        dense_archive=validated_checkpoint.dense_archive,
-    )
     return MappingBackendCheckpointExportBundle(
-        checkpoint=frozen_checkpoint,
+        checkpoint=validated_checkpoint,
         occupancy_asset=_freeze_checkpoint_value(validated_occupancy),
         cloud_asset=_freeze_checkpoint_value(validated_cloud),
         canonical_occupancy_checkpoint_bytes=occupancy_checkpoint.SerializeToString(
@@ -983,10 +903,8 @@ def _assigned_activation_request_proto(stored, *, asset_identity, session_id, ma
             or len(map_name.encode("utf-8")) > 256
             or any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in map_name)):
         raise ValueError("map_name must be canonical nonempty text within 256 bytes")
-    if stored.checkpoint.schema_version != 2 or stored.checkpoint._admission is None:
+    if stored.checkpoint.schema_version != 2:
         raise ValueError("activation requires admitted assigned checkpoint ownership")
-    MappingBackendCheckpointStore.validate_checkpoint_bundle(stored.checkpoint,
-        occupancy_asset=stored.occupancy_asset, cloud_asset=stored.cloud_asset)
     message = pb2.ActivateMapRequest(session_id=session_id, map_name=map_name,
         activation_request_id=activation_request_id, expected_runtime_generation=expected_runtime_generation,
         activation_contract_version=2, asset_identity=pb2.AssetIdentityV2(asset_id=asset_identity.asset_id))
@@ -994,35 +912,17 @@ def _assigned_activation_request_proto(stored, *, asset_identity, session_id, ma
     return message
 
 
-def _assigned_activation_ack(response, *, activation_request, stored_checkpoint):
-    """仅接纳原请求及原 checkpoint 成员的完整原生回执。"""
-    payload = GeometryRuntimeProvider._mapping_state_payload(response)
-    if (payload["activation_receipt_schema_version"] != 2
-            or payload["activation_receipt_disposition"] not in {2, 3}
-            or not payload["success"] or payload["phase"] != "ACTIVE"
-            or not payload["active"] or payload["revision"] <= 0
-            or payload["legacy_checkpoint_reconstructed"]):
+def _assigned_activation_ack(payload, *, activation_request):
+    """使用已解码回执确认本次请求的原生激活结果。"""
+    if not payload["success"] or payload["phase"] != "ACTIVE":
         raise ValueError("ActivateMap did not acknowledge a sealed assigned installation")
-    receipt = AssignedActivationReceipt.admit(payload["activation_receipt_v2"])
-    actual = receipt.to_dict()
-    checkpoint = stored_checkpoint.checkpoint
-    planar = checkpoint.backend_kind == "slam_toolbox"
-    source_key = "source_graph_member" if planar else "source_cloud_member"
-    source_identity = checkpoint.graph_reference.member_identity if planar else checkpoint.cloud_identity
-    if (actual["request"] != activation_request
-            or payload["revision"] != actual["target"]["occupancy_receipt"]["occupancy_revision"]
-            or actual["activation"]["backend_kind"] != checkpoint.backend_kind
-            or actual["target"][source_key] != _identity_document(source_identity)):
-        raise ValueError("ActivateMap receipt differs from the retained request/checkpoint owner")
-    if planar and (payload.get("planar_mode") != "localization" or payload.get("target_kind") != "planar_graph"):
-        raise ValueError("ActivateMap planar mode/target kind differs from its installed graph")
-    expected_policy = (current_assigned_planar_relocalization_policy() if planar
-        else current_assigned_relocalization_policy())
-    if payload["relocalization_policy_v2"] != expected_policy:
-        raise ValueError("ActivateMap assigned relocalization policy differs from its backend")
-    if payload["idempotent_replay"] != (payload["activation_receipt_disposition"] == 3):
-        raise ValueError("ActivateMap replay disposition differs from its acknowledgement")
+    receipt = payload["activation_receipt_v2"]
+    if not isinstance(receipt, AssignedActivationReceipt):
+        raise ValueError("ActivateMap omitted its complete assigned target receipt")
+    if receipt.to_dict()["request"] != activation_request:
+        raise ValueError("ActivateMap receipt differs from the retained request")
     return payload
+
 
 
 _ASSIGNED_PREDECESSOR_FIELDS = (
@@ -1065,14 +965,14 @@ def _require_digest_bytes(value: object, field_name: str) -> bytes:
 
 def _canonical_occupancy_sha256(checkpoint) -> bytes:
     meta = _require_proto_message_field(checkpoint, "meta")
-    data = bytes(getattr(checkpoint, "data", b"") or b"")
-    width = int(getattr(meta, "width", 0) or 0)
-    height = int(getattr(meta, "height", 0) or 0)
-    revision = int(getattr(meta, "revision", 0) or 0)
-    resolution = float(getattr(meta, "resolution", 0.0) or 0.0)
-    origin_x = float(getattr(meta, "origin_x", 0.0) or 0.0)
-    origin_y = float(getattr(meta, "origin_y", 0.0) or 0.0)
-    frame_id = str(getattr(meta, "frame_id", "") or "")
+    data = bytes(checkpoint.data)
+    width = int(meta.width)
+    height = int(meta.height)
+    revision = int(meta.revision)
+    resolution = float(meta.resolution)
+    origin_x = float(meta.origin_x)
+    origin_y = float(meta.origin_y)
+    frame_id = str(meta.frame_id)
     if width <= 0 or height <= 0 or revision <= 0 or len(data) != width * height:
         raise ValueError("canonical occupancy checkpoint dimensions are invalid")
     if not math.isfinite(resolution) or resolution <= 0.0:
@@ -1092,10 +992,10 @@ def _canonical_occupancy_sha256(checkpoint) -> bytes:
 
 
 def _canonical_cloud_sha256(checkpoint) -> bytes:
-    frame_id = str(getattr(checkpoint, "frame_id", "") or "")
-    xyz = bytes(getattr(checkpoint, "xyz_f32_le", b"") or b"")
+    frame_id = str(checkpoint.frame_id)
+    xyz = bytes(checkpoint.xyz_f32_le)
     xyz_sha256 = _require_digest_bytes(
-        str(getattr(checkpoint, "xyz_sha256", "") or "").strip(),
+        str(checkpoint.xyz_sha256).strip(),
         "cloud checkpoint xyz_sha256",
     )
     if not frame_id or hashlib.sha256(xyz).digest() != xyz_sha256:
@@ -1114,7 +1014,7 @@ def _canonical_cloud_sha256(checkpoint) -> bytes:
 def _canonical_commit_identity_bytes(identity, field_name: str) -> bytes:
     if identity is None:
         raise ValueError("%s is required" % field_name)
-    boot_nonce = bytes(getattr(identity, "boot_nonce", b"") or b"")
+    boot_nonce = bytes(identity.boot_nonce)
     if not boot_nonce:
         raise ValueError("%s.boot_nonce is required" % field_name)
     return boot_nonce + struct.pack(">Q", int(identity.sequence))
@@ -1176,7 +1076,7 @@ def _canonical_backend_sha256(checkpoint) -> bytes:
     preimage.extend(struct.pack(">I", int(cloud_receipt.point_count)))
     preimage.extend(_canonical_occupancy_sha256(occupancy_checkpoint))
     preimage.extend(_canonical_cloud_sha256(cloud_checkpoint))
-    if getattr(checkpoint, "fine_map_artifact", None) is not None and checkpoint.HasField("fine_map_artifact"):
+    if checkpoint.fine_map_artifact is not None and checkpoint.HasField("fine_map_artifact"):
         preimage.extend(b"nuwax.geometry.fine-map-archive.v1\0")
         preimage.extend(struct.pack(">Q", checkpoint.fine_map_artifact.size))
         preimage.extend(_require_digest_bytes(checkpoint.fine_map_artifact.sha256, "fine_map_artifact.sha256"))
@@ -1271,37 +1171,24 @@ def _planar_activation_target_payload(message):
     }
 
 
-def _assigned_activation_receipt_payload(message) -> Dict[str, Any]:
-    """按实际字段存在性投影；失败/退休回执不能补造成完整目标。"""
+def _assigned_activation_receipt_payload(message):
+    """解码完整回执一次；未完成状态只保留实际存在的字段。"""
     if message.DESCRIPTOR.full_name != "nuwax.geometry.ActivationReceiptV2":
         raise ValueError("assigned activation receipt protobuf type differs")
-    clean = type(message)()
-    clean.CopyFrom(message)
-    clean.DiscardUnknownFields()
-    if clean.SerializeToString(deterministic=True) != message.SerializeToString(deterministic=True):
-        raise ValueError("assigned activation receipt contains unknown fields")
-    if not message.HasField("request"):
-        raise ValueError("assigned activation receipt omitted its request")
-    request = _admit_assigned_activation_request(
-        _project_assigned_proto(message.request, "activation_request")
-    )
-    activation = None
-    if message.HasField("activation"):
-        activation = _admit_assigned_activation_identity(
-            _project_assigned_proto(message.activation, "activation")
-        )
-        if activation["request"] != request:
-            raise ValueError("assigned activation and request differ")
-    target = None
+    request = _project_assigned_proto(_require_proto_message_field(message, "request"), "activation_request")
+    activation = (_project_assigned_proto(message.activation, "activation")
+                  if message.HasField("activation") else None)
     if message.HasField("target"):
         if activation is None:
             raise ValueError("assigned target omitted its installed activation")
         target = (_planar_activation_target_payload(message.target)
-            if activation["backend_kind"] == "slam_toolbox" else _project_assigned_proto(message.target, "target"))
+                  if activation["backend_kind"] == "slam_toolbox"
+                  else _project_assigned_proto(message.target, "target"))
         return AssignedActivationReceipt.admit({
             "request": request, "activation": activation, "target": target,
-        }).to_dict()
-    return {"request": request, "activation": activation, "target": target}
+        })
+    return {"request": request, "activation": activation, "target": None}
+
 
 
 def _assigned_activation_receipt_proto(receipt: AssignedActivationReceipt):
@@ -1325,42 +1212,12 @@ def _assigned_activation_receipt_proto(receipt: AssignedActivationReceipt):
     )
 
 
-def _mapping_cloud_authority_receipt(authority: Mapping[str, Any]) -> AssignedActivationReceipt:
-    """Admit schema-3 metadata; current, installed and source commits stay distinct."""
-    if type(authority.get("schema_version")) is not int or authority["schema_version"] != 3:
-        raise ValueError("mapping-cloud authority requires schema 3")
-    receipt = AssignedActivationReceipt.admit(authority.get("activation_receipt_v2"))
-    payload = receipt.to_dict()
-    activation = payload["activation"]
-    source_key = "source_graph_member" if activation["backend_kind"] == "slam_toolbox" else "source_cloud_member"
-    expected = {
-        "map_name": receipt.map_name,
-        "map_frame_id": payload["target"][source_key]["frame_id"],
-        "runtime_generation": activation["runtime_generation"],
-        "lifecycle_epoch": activation["lifecycle_epoch"],
-        "mapping_session_id": receipt.session_id,
-        "mapping_session_generation": activation["session_generation"],
-        "backend_kind": activation["backend_kind"],
-        "backend_generation": activation["backend_generation"],
-    }
-    for name in ("runtime_generation", "lifecycle_epoch", "mapping_session_generation", "backend_generation",
-                 "committed_occupancy_revision", "committed_occupancy_source_timestamp_ns", "owner_epoch"):
-        _admit_assigned_integer(authority.get(name), name)
-    _admit_assigned_commit(authority.get("committed_occupancy_commit_id"))
-    if any(authority.get(name) != value for name, value in expected.items()):
-        raise ValueError("mapping-cloud authority differs from assigned activation receipt")
-    return receipt
 
 
 def _unactivated_mapping_state_payload(response, disposition: int, disposition_name: str) -> Dict[str, Any]:
     """No activation record is not an idle mapping session or an installed target."""
     if response.DESCRIPTOR.full_name != "nuwax.geometry.MappingSessionState":
         raise ValueError("unactivated mapping state protobuf type differs")
-    clean = type(response)()
-    clean.CopyFrom(response)
-    clean.DiscardUnknownFields()
-    if clean.SerializeToString(deterministic=True) != response.SerializeToString(deterministic=True):
-        raise ValueError("unactivated mapping state contains unknown fields")
     identity_fields = tuple(name for name in _LEGACY_ACTIVATION_IDENTITY_FIELDS if name != "planar_mode")
     if (disposition not in {pb2.ACTIVATION_RECEIPT_DISPOSITION_UNSPECIFIED, pb2.ACTIVATION_RECEIPT_DISPOSITION_RETIRED}
             or response.HasField("activation_receipt_v2")
@@ -1370,10 +1227,6 @@ def _unactivated_mapping_state_payload(response, disposition: int, disposition_n
     policy = None
     if response.HasField("relocalization_policy_v2"):
         policy = _project_assigned_proto(response.relocalization_policy_v2, "policy")
-        expected_policy = (current_assigned_planar_relocalization_policy()
-            if response.mapping_backend_kind == "slam_toolbox" else current_assigned_relocalization_policy())
-        if policy != expected_policy:
-            raise ValueError("unactivated mapping state policy parameters differ")
     fields = (
         "success", "phase", "message", "session_id", "map_name", "session_generation",
         "revision", "active", "idempotent_replay", "legacy_checkpoint_reconstructed",
@@ -1391,45 +1244,12 @@ def _unactivated_mapping_state_payload(response, disposition: int, disposition_n
 def _assigned_mapping_state_payload(response, disposition: int, disposition_name: str) -> Dict[str, Any]:
     if response.DESCRIPTOR.full_name != "nuwax.geometry.MappingSessionState":
         raise ValueError("assigned mapping state protobuf type differs")
-    clean = type(response)()
-    clean.CopyFrom(response)
-    clean.DiscardUnknownFields()
-    if clean.SerializeToString(deterministic=True) != response.SerializeToString(deterministic=True):
-        raise ValueError("assigned mapping state contains unknown fields")
-    if not response.HasField("activation_receipt_v2"):
-        raise ValueError("assigned mapping state omitted activation receipt")
-    if disposition not in {1, 2, 3, 5, 6, 7, 8, 9}:
-        raise ValueError("assigned activation disposition is unsupported")
-    planar = response.mapping_backend_kind == "slam_toolbox"
-    legacy_fields = (name for name in _LEGACY_ACTIVATION_IDENTITY_FIELDS if not (planar and name in {"planar_mode", "target_kind"}))
-    if any(getattr(response, name) for name in legacy_fields):
-        raise ValueError("assigned mapping state mixes legacy identity")
-    receipt = _assigned_activation_receipt_payload(response.activation_receipt_v2)
-    sealed = disposition in {2, 3}
-    if sealed and receipt["target"] is None:
+    receipt = _assigned_activation_receipt_payload(
+        _require_proto_message_field(response, "activation_receipt_v2"))
+    if disposition in {2, 3} and not isinstance(receipt, AssignedActivationReceipt):
         raise ValueError("sealed assigned activation omitted its complete target receipt")
-    if response.relocalization_target_available and (not sealed or receipt["target"] is None):
-        raise ValueError("partial/nonsealed assigned activation cannot expose an available target")
-    policy = None
-    if response.HasField("relocalization_policy_v2"):
-        policy = _project_assigned_proto(response.relocalization_policy_v2, "policy")
-        expected_policy = (current_assigned_planar_relocalization_policy() if planar
-            else current_assigned_relocalization_policy())
-        if policy != expected_policy:
-            raise ValueError("assigned mapping state policy parameters differ")
-    if sealed:
-        activation = receipt["activation"]
-        request = receipt["request"]
-        expected = {
-            "activation_request_id": request["activation_request_id"],
-            "session_id": request["session_id"], "map_name": request["map_name"],
-            "runtime_generation": activation["runtime_generation"],
-            "session_generation": activation["session_generation"],
-            "backend_generation": activation["backend_generation"],
-            "mapping_backend_kind": activation["backend_kind"],
-        }
-        if any(getattr(response, name) != value for name, value in expected.items()):
-            raise ValueError("sealed assigned mapping state and receipt ownership differ")
+    policy = (_project_assigned_proto(response.relocalization_policy_v2, "policy")
+              if response.HasField("relocalization_policy_v2") else None)
     fields = (
         "success", "phase", "message", "session_id", "map_name", "session_generation",
         "revision", "active", "idempotent_replay", "legacy_checkpoint_reconstructed",
@@ -1437,16 +1257,23 @@ def _assigned_mapping_state_payload(response, disposition: int, disposition_name
         "relocalization_target_available",
     )
     result = {name: getattr(response, name) for name in fields}
-    result.update(
-        activation_receipt_schema_version=2,
+    result.update(activation_receipt_schema_version=2,
         activation_receipt_disposition=disposition,
         activation_receipt_disposition_name=disposition_name,
-        activation_receipt_v2=receipt,
-        relocalization_policy_v2=policy,
-    )
-    if planar:
+        activation_receipt_v2=receipt, relocalization_policy_v2=policy)
+    if response.mapping_backend_kind == "slam_toolbox":
         result["planar_mode"] = response.planar_mode
         result["target_kind"] = response.target_kind
+    return result
+
+
+
+def _mapping_state_document(value: Mapping[str, object]) -> Dict[str, object]:
+    """在公开元数据或持久写入处投影一次普通字典。"""
+    result = dict(value)
+    receipt = result.get("activation_receipt_v2")
+    if isinstance(receipt, AssignedActivationReceipt):
+        result["activation_receipt_v2"] = receipt.to_dict()
     return result
 
 
@@ -1467,7 +1294,7 @@ def _assigned_request_for_rpc(
     elif query_only:
         raise ValueError("assigned terminal query requires the whole normalized durable request")
     else:
-        receipt = AssignedActivationReceipt.admit(activation_state.get("activation_receipt_v2"))
+        receipt = activation_state["activation_receipt_v2"]
         policy = activation_state.get("relocalization_policy_v2")
         if policy is None:
             raise ValueError("assigned activation omitted relocalization_policy_v2")
@@ -1497,16 +1324,14 @@ def _assigned_request_for_rpc(
             raise ValueError("assigned activation state mixes legacy/planar identity")
         if activation_state.get("activation_receipt_schema_version") != 2:
             raise ValueError("assigned request requires an assigned activation state")
-        receipt = AssignedActivationReceipt.admit(activation_state.get("activation_receipt_v2"))
+        receipt = activation_state["activation_receipt_v2"]
         if not request.activation_receipt.exact_replay_of(receipt):
             raise ValueError("assigned request target differs from activation receipt")
         policy = activation_state.get("relocalization_policy_v2")
         if policy is None:
             raise ValueError("assigned activation omitted relocalization_policy_v2")
         # 持久化身份可读不代表旧策略可重新执行；只比较已有策略元数据。
-        expected_policy = (current_assigned_planar_relocalization_policy() if planar
-            else current_assigned_relocalization_policy())
-        if (assigned_request_v2 is not None and policy != expected_policy) or policy != request.to_dict()[request.body_key]["policy"]:
+        if policy != request.to_dict()[request.body_key]["policy"]:
             raise ValueError("assigned request policy differs from activation state")
         if activation_state.get("activation_receipt_disposition") not in {2, 3}:
             raise ValueError("assigned relocalization requires a sealed activation")
@@ -1848,18 +1673,18 @@ def _coalesced_navigation_updates(call):
     failure = None
 
     def merge_key(update):
-        status = str(getattr(update, "status", "") or "").strip().lower()
+        status = str(update.status).strip().lower()
         return (
             _navigation_lease_from_message(update),
-            int(getattr(update, "planner_runtime_generation", 0)),
-            int(getattr(update, "runtime_generation", 0)),
-            int(getattr(update, "guard_generation", 0)),
+            int(update.planner_runtime_generation),
+            int(update.runtime_generation),
+            int(update.guard_generation),
             status if status in _NAV_TERMINAL_STATUS or status not in _NAV_STREAM_STATUS else "progress",
-            str(getattr(update, "cancel_phase", "")),
-            int(getattr(update, "cancel_generation", 0)),
-            bool(getattr(update, "actuator_zeroed", False)),
-            str(getattr(update, "zero_ack_id", "")),
-            int(getattr(update, "zero_applied_monotonic_ns", 0)),
+            str(update.cancel_phase),
+            int(update.cancel_generation),
+            bool(update.actuator_zeroed),
+            str(update.zero_ack_id),
+            int(update.zero_applied_monotonic_ns),
         )
 
     def receive():
@@ -2352,9 +2177,9 @@ def _navigation_status_is_ahead(current: str, incoming: str) -> bool:
 
 def _navigation_update_has_complete_zero_proof(update) -> bool:
     return bool(
-        getattr(update, "actuator_zeroed", False)
-        and str(getattr(update, "zero_ack_id", "") or "").strip()
-        and int(getattr(update, "zero_applied_monotonic_ns", 0) or 0) > 0
+        update.actuator_zeroed
+        and str(update.zero_ack_id).strip()
+        and int(update.zero_applied_monotonic_ns) > 0
     )
 
 
@@ -2390,11 +2215,11 @@ def _navigation_wire_document(update) -> Dict[str, Any]:
     metadata.pop("observed_goal_id", None)
     return {
         **metadata,
-        "status": str(getattr(update, "status", "") or ""),
-        "message": str(getattr(update, "message", "") or ""),
-        "goal_id": str(getattr(update, "goal_id", "") or ""),
-        "distance_remaining": float(getattr(update, "distance_remaining", 0) or 0),
-        "timestamp_ns": int(getattr(update, "timestamp_ns", 0) or 0),
+        "status": str(update.status),
+        "message": str(update.message),
+        "goal_id": str(update.goal_id),
+        "distance_remaining": float(update.distance_remaining),
+        "timestamp_ns": int(update.timestamp_ns),
     }
 
 
@@ -2403,26 +2228,26 @@ def _navigation_complete_proof_upgrade(previous_metadata, previous_timestamp_ns,
     if _navigation_update_is_unleased_rejection(update):
         return previous_timestamp_ns <= 0 or update.timestamp_ns >= previous_timestamp_ns
     return bool(
-        str(getattr(update, "status", "") or "").strip().lower() in _NAV_TERMINAL_STATUS
+        str(update.status).strip().lower() in _NAV_TERMINAL_STATUS
         and _navigation_update_is_resolved_terminal(update)
-        and int(getattr(update, "path_revision", 0) or 0)
+        and int(update.path_revision)
             == int(previous_metadata.get("path_revision") or 0)
-        and int(getattr(update, "planner_runtime_generation", 0) or 0)
+        and int(update.planner_runtime_generation)
             == int(previous_metadata.get("planner_runtime_generation") or 0)
         and (previous_timestamp_ns <= 0
-             or int(getattr(update, "timestamp_ns", 0) or 0) >= previous_timestamp_ns)
+             or int(update.timestamp_ns) >= previous_timestamp_ns)
     )
 
 
 def _navigation_precommit_proof_upgrade(previous, update) -> bool:
     return bool(
         _navigation_lease_from_message(previous) == _navigation_lease_from_message(update)
-        and str(getattr(previous, "status", "") or "").strip().lower() in _NAV_TERMINAL_STATUS
+        and str(previous.status).strip().lower() in _NAV_TERMINAL_STATUS
         and not _navigation_update_is_resolved_terminal(previous)
         and _navigation_complete_proof_upgrade(
-            {"path_revision": int(getattr(previous, "path_revision", 0) or 0),
-             "planner_runtime_generation": int(getattr(previous, "planner_runtime_generation", 0) or 0)},
-            int(getattr(previous, "timestamp_ns", 0) or 0), update,
+            {"path_revision": int(previous.path_revision),
+             "planner_runtime_generation": int(previous.planner_runtime_generation)},
+            int(previous.timestamp_ns), update,
         )
     )
 
@@ -2469,49 +2294,49 @@ def _navigation_state_typed_metadata(update) -> Dict[str, Any]:
 
     return {
         "local_path": [{"x": float(p.x), "y": float(p.y), "z": float(p.z)}
-                       for p in getattr(update, "local_path", ())],
+                       for p in update.local_path],
         "planned_path": [{"x": float(p.x), "y": float(p.y), "z": float(p.z)}
-                         for p in getattr(update, "planned_path", ())],
-        "path_revision": int(getattr(update, "path_revision", 0) or 0),
-        "raw_status": str(getattr(update, "status", "") or ""),
-        "source_timestamp_ns": int(getattr(update, "timestamp_ns", 0) or 0),
-        "observed_goal_id": str(getattr(update, "goal_id", "") or ""),
-        "owner_kind": int(getattr(update, "owner_kind", 0) or 0),
+                         for p in update.planned_path],
+        "path_revision": int(update.path_revision),
+        "raw_status": str(update.status),
+        "source_timestamp_ns": int(update.timestamp_ns),
+        "observed_goal_id": str(update.goal_id),
+        "owner_kind": int(update.owner_kind),
         "parent_request_id": str(
-            getattr(update, "parent_request_id", "") or ""
+            update.parent_request_id
         ),
         "goal_generation": int(
-            getattr(update, "goal_generation", 0) or 0
+            update.goal_generation
         ),
         "producer_runtime_generation": int(
-            getattr(update, "producer_runtime_generation", 0) or 0
+            update.producer_runtime_generation
         ),
         "planner_runtime_generation": int(
-            getattr(update, "planner_runtime_generation", 0) or 0
+            update.planner_runtime_generation
         ),
-        "cancel_phase": str(getattr(update, "cancel_phase", "") or ""),
-        "cancel_generation": int(getattr(update, "cancel_generation", 0) or 0),
-        "actuator_zeroed": bool(getattr(update, "actuator_zeroed", False)),
-        "reason_code": str(getattr(update, "reason_code", "") or ""),
-        "runtime_generation": int(getattr(update, "runtime_generation", 0) or 0),
-        "guard_generation": int(getattr(update, "guard_generation", 0) or 0),
-        "sink_ready": bool(getattr(update, "sink_ready", False)),
-        "planner_map_frame": str(getattr(update, "planner_map_frame", "") or ""),
-        "planner_pose_frame": str(getattr(update, "planner_pose_frame", "") or ""),
-        "zero_ack_id": str(getattr(update, "zero_ack_id", "") or ""),
+        "cancel_phase": str(update.cancel_phase),
+        "cancel_generation": int(update.cancel_generation),
+        "actuator_zeroed": bool(update.actuator_zeroed),
+        "reason_code": str(update.reason_code),
+        "runtime_generation": int(update.runtime_generation),
+        "guard_generation": int(update.guard_generation),
+        "sink_ready": bool(update.sink_ready),
+        "planner_map_frame": str(update.planner_map_frame),
+        "planner_pose_frame": str(update.planner_pose_frame),
+        "zero_ack_id": str(update.zero_ack_id),
         "zero_applied_monotonic_ns": int(
-            getattr(update, "zero_applied_monotonic_ns", 0) or 0
+            update.zero_applied_monotonic_ns
         ),
     }
 
 
 def _navigation_lease_from_message(update) -> _NavigationLease:
     return (
-        str(getattr(update, "goal_id", "") or "").strip(),
-        int(getattr(update, "owner_kind", 0) or 0),
-        str(getattr(update, "parent_request_id", "") or "").strip(),
-        int(getattr(update, "goal_generation", 0) or 0),
-        int(getattr(update, "producer_runtime_generation", 0) or 0),
+        str(update.goal_id).strip(),
+        int(update.owner_kind),
+        str(update.parent_request_id).strip(),
+        int(update.goal_generation),
+        int(update.producer_runtime_generation),
     )
 
 
@@ -2786,7 +2611,7 @@ def _exploration_state_to_dict(resp: Any) -> Dict[str, Any]:
                 receipt.child_lease_fingerprint or ""
             )
     return {
-        "mission_progress": json.loads(resp.mission_progress_json) if getattr(resp, "mission_progress_json", "") else None,
+        "mission_progress": json.loads(resp.mission_progress_json) if resp.mission_progress_json else None,
         "status": resp.status,
         "message": resp.message,
         "request_id": resp.request_id,
@@ -2795,7 +2620,7 @@ def _exploration_state_to_dict(resp: Any) -> Dict[str, Any]:
         "frontier_count": int(resp.frontier_count),
         "revision": int(resp.revision),
         "timestamp_ns": int(resp.timestamp_ns),
-        "child_task_id": str(getattr(resp, "child_task_id", "") or ""),
+        "child_task_id": str(resp.child_task_id),
         "exploration_generation": int(resp.exploration_generation),
         "child_lease": child_lease,
         "rollover_recovery_eligible": bool(resp.rollover_recovery_eligible),
@@ -2808,13 +2633,13 @@ def _exploration_state_to_dict(resp: Any) -> Dict[str, Any]:
 
 def _build_pose(proto_pose: Any) -> Optional[Pose]:
     """把 gRPC Pose 转成契约 Pose；frame_id 为空（无定位）时返回 None。"""
-    frame_id = _normalize_frame(getattr(proto_pose, "frame_id", ""))
+    frame_id = _normalize_frame(proto_pose.frame_id)
     if not frame_id:
         return None
     pos = proto_pose.position
     ori = proto_pose.orientation
     try:
-        source_timestamp_ns = int(getattr(proto_pose, "timestamp_ns", 0) or 0)
+        source_timestamp_ns = int(proto_pose.timestamp_ns)
         if source_timestamp_ns < 0:
             return None
         # 保留源采样时间；零值仍为未知时间哨兵，不能以处理时刻伪造新鲜度。
@@ -2843,7 +2668,7 @@ def _build_frame_tree(transforms: Any) -> Optional[FrameTree]:
         if not parent or not child:
             continue
         try:
-            source_timestamp_ns = int(getattr(t, "timestamp_ns", 0) or 0)
+            source_timestamp_ns = int(t.timestamp_ns)
             # 与 Pose 一致：保留每条边的源时间，零值表示未知，而非处理时刻。
             source_timestamp = datetime.fromtimestamp(
                 source_timestamp_ns // 1_000_000_000,
@@ -3187,7 +3012,7 @@ class GeometryRuntimeProvider:
         """
         lease = _navigation_lease_from_message(update)
         metadata = _navigation_state_typed_metadata(update)
-        raw_status = str(getattr(update, "status", "") or "").strip().lower()
+        raw_status = str(update.status).strip().lower()
         inherited = self._navigation_obligation_locked(lease)
         complete_terminal = (raw_status in _NAV_TERMINAL_STATUS
                              and _navigation_update_is_resolved_terminal(update))
@@ -3238,16 +3063,16 @@ class GeometryRuntimeProvider:
                 max(int(self._last_nav_timestamp_ns or 0), int(obligation.get("source_timestamp_floor_ns") or 0)),
                 update,
             )
-        path = int(getattr(update, "path_revision", 0) or 0)
+        path = int(update.path_revision)
         previous_path = int(self._last_nav_metadata.get("path_revision") or 0)
-        stamp = int(getattr(update, "timestamp_ns", 0) or 0)
+        stamp = int(update.timestamp_ns)
         if path < previous_path:
             return False
         if (self._last_nav_timestamp_ns > 0 and stamp > 0
                 and stamp < self._last_nav_timestamp_ns):
             return False
         if (path == previous_path > 0
-                and int(getattr(update, "planner_runtime_generation", 0) or 0)
+                and int(update.planner_runtime_generation)
                     != int(self._last_nav_metadata.get("planner_runtime_generation") or 0)):
             return False
         return True
@@ -3293,8 +3118,8 @@ class GeometryRuntimeProvider:
         if result is not None:
             return result
         rejected = _navigation_submission_result(
-            command_token[1][0], message=str(getattr(resp, "message", "") or ""),
-            reason_code=str(getattr(resp, "reason_code", "") or ""),
+            command_token[1][0], message=str(resp.message),
+            reason_code=str(resp.reason_code),
             navigation=_navigation_wire_document(resp),
         )
         self._nav_set_transaction_context.result = rejected
@@ -3315,8 +3140,8 @@ class GeometryRuntimeProvider:
                 lease = _navigation_lease_from_message(resp)
                 canonical = (_is_canonical_public_navigation_lease(lease)
                              and lease[:3] == command_token[1][:3])
-                raw_status = str(getattr(resp, "status", "") or "").strip().lower()
-                reason = str(getattr(resp, "reason_code", "") or "")
+                raw_status = str(resp.status).strip().lower()
+                reason = str(resp.reason_code)
                 # Freeze provenance before selecting a stronger real precommit body.
                 origin = reason if (canonical and reason in _NAV_DISPATCH_UNCONFIRMED_REASONS
                                     and raw_status in {"unconfirmed", "accepted", "pending", "planning", "running"}) else ""
@@ -3333,27 +3158,27 @@ class GeometryRuntimeProvider:
                     from_stream = False
                     terminal_observation_current = True
                     if staged is not None and not terminal_proof:
-                        staged_status = str(getattr(staged, "status", "") or "").strip().lower()
+                        staged_status = str(staged.status).strip().lower()
                         pending_terminal = origin == "GOAL_TERMINAL_PROOF_PENDING"
                         # A terminal observation is path-scoped. A newer real path
                         # outranks a stale projection; same-path planner identity is exact.
-                        projection_path = int(getattr(resp, "path_revision", 0) or 0)
-                        staged_path = int(getattr(staged, "path_revision", 0) or 0)
-                        projection_planner = int(getattr(resp, "planner_runtime_generation", 0) or 0)
-                        staged_planner = int(getattr(staged, "planner_runtime_generation", 0) or 0)
+                        projection_path = int(resp.path_revision)
+                        staged_path = int(staged.path_revision)
+                        projection_planner = int(resp.planner_runtime_generation)
+                        staged_planner = int(staged.planner_runtime_generation)
                         projection_is_stale = bool(pending_terminal and staged_path > projection_path)
                         proof_for_pending = _navigation_complete_proof_upgrade(
                             {"path_revision": projection_path,
                              "planner_runtime_generation": projection_planner},
-                            int(getattr(resp, "timestamp_ns", 0) or 0), staged,
+                            int(resp.timestamp_ns), staged,
                         )
                         same_terminal_path = bool(staged_status in _NAV_TERMINAL_STATUS
-                            and int(getattr(staged, "path_revision", 0) or 0) == int(getattr(resp, "path_revision", 0) or 0)
-                            and int(getattr(staged, "planner_runtime_generation", 0) or 0) == int(getattr(resp, "planner_runtime_generation", 0) or 0))
+                            and int(staged.path_revision) == int(resp.path_revision)
+                            and int(staged.planner_runtime_generation) == int(resp.planner_runtime_generation))
                         staged_complete = (staged_status in _NAV_TERMINAL_STATUS
                                            and _navigation_update_is_resolved_terminal(staged))
-                        projection_stamp = int(getattr(resp, "timestamp_ns", 0) or 0)
-                        staged_stamp = int(getattr(staged, "timestamp_ns", 0) or 0)
+                        projection_stamp = int(resp.timestamp_ns)
+                        staged_stamp = int(staged.timestamp_ns)
                         staged_source_path_current = bool(
                             (staged_path > projection_path
                              or (staged_path == projection_path and staged_planner == projection_planner))
@@ -3375,18 +3200,18 @@ class GeometryRuntimeProvider:
                             committed, from_stream = staged, True
                             terminal_observation_current = not projection_is_stale
                     without_source = bool(origin and not from_stream
-                                          and int(getattr(resp, "timestamp_ns", 0) or 0) == 0)
+                                          and int(resp.timestamp_ns) == 0)
                     status, metadata = self._navigation_project_update_locked(
                         committed, trusted_origin_reason=origin,
                         command_projection_without_source=without_source,
                         terminal_observation_current=terminal_observation_current,
                     )
                     if (without_source and origin == "GOAL_TERMINAL_PROOF_PENDING" and staged is not None
-                            and int(getattr(staged, "path_revision", 0) or 0) == int(getattr(resp, "path_revision", 0) or 0)
-                            and int(getattr(staged, "planner_runtime_generation", 0) or 0) == int(getattr(resp, "planner_runtime_generation", 0) or 0)):
+                            and int(staged.path_revision) == int(resp.path_revision)
+                            and int(staged.planner_runtime_generation) == int(resp.planner_runtime_generation)):
                         # Preserve a real precommit source lower bound without claiming
                         # that the source-less terminal diagnostic has its own timestamp.
-                        metadata["dispatch_obligation"]["source_timestamp_floor_ns"] = int(getattr(staged, "timestamp_ns", 0) or 0)
+                        metadata["dispatch_obligation"]["source_timestamp_floor_ns"] = int(staged.timestamp_ns)
                     # This matching public unary is authoritative over a stale display
                     # overlay; arbitrary later foreign streams cannot replace its duty.
                     self._nav_exploration_overlay = None
@@ -3397,10 +3222,10 @@ class GeometryRuntimeProvider:
                     self._last_nav_goal_generation = lease[3]
                     self._last_nav_producer_runtime_generation = lease[4]
                     self._last_nav_status = status
-                    self._last_nav_message = str(getattr(committed, "message", "") or "") or None
-                    self._last_nav_distance_remaining = float(getattr(committed, "distance_remaining", 0) or 0)
+                    self._last_nav_message = str(committed.message) or None
+                    self._last_nav_distance_remaining = float(committed.distance_remaining)
                     self._last_nav_current_pose = None
-                    self._last_nav_timestamp_ns = int(getattr(committed, "timestamp_ns", 0) or 0)
+                    self._last_nav_timestamp_ns = int(committed.timestamp_ns)
                     self._last_nav_metadata = metadata
                     resolved = status in _NAV_TERMINAL_STATUS and _navigation_update_is_resolved_terminal(committed)
                     # Preserve the old ordinary accepted-then-terminal contract. Only
@@ -3496,19 +3321,19 @@ class GeometryRuntimeProvider:
         if (previous is not None
                 and not _navigation_precommit_proof_upgrade(previous, update)
                 and not _navigation_status_can_follow(
-            getattr(previous, "status", ""),
-            getattr(update, "status", ""),
-            current_timestamp_ns=int(getattr(previous, "timestamp_ns", 0) or 0),
-            incoming_timestamp_ns=int(getattr(update, "timestamp_ns", 0) or 0),
-            current_path_revision=int(getattr(previous, "path_revision", 0) or 0),
-            incoming_path_revision=int(getattr(update, "path_revision", 0) or 0),
+            previous.status,
+            update.status,
+            current_timestamp_ns=int(previous.timestamp_ns),
+            incoming_timestamp_ns=int(update.timestamp_ns),
+            current_path_revision=int(previous.path_revision),
+            incoming_path_revision=int(update.path_revision),
         )):
             LOGGER.info(
                 "丢弃回退的 SetGoal precommit frame: goal_id=%s generation=%s status=%s->%s",
                 incoming_lease[0],
                 incoming_lease[3],
-                getattr(previous, "status", ""),
-                getattr(update, "status", ""),
+                previous.status,
+                update.status,
             )
             return True
         staged = pb2.NavigationState()
@@ -3952,7 +3777,7 @@ class GeometryRuntimeProvider:
                     self._stub = staged_stub
                     retired_attempt = self._invalidate_map_connection_locked()
                     self._assigned_fine_archive_versions = frozenset(
-                        getattr(resp, "supported_assigned_fine_archive_versions", ()))
+                        resp.supported_assigned_fine_archive_versions)
                 self._invalidate_map_delivery_tickets_locked()
             del retired_attempt
             self._wait_for_map_deliveries()
@@ -4115,7 +3940,7 @@ class GeometryRuntimeProvider:
     @staticmethod
     def _mapping_state_payload(response) -> Dict[str, Any]:
         activation_disposition = int(
-            getattr(response, "activation_receipt_disposition", 0) or 0
+            response.activation_receipt_disposition
         )
         try:
             activation_disposition_name = pb2.ActivationReceiptDisposition.Name(
@@ -4130,98 +3955,98 @@ class GeometryRuntimeProvider:
         except ValueError:
             activation_disposition_name = "unknown"
         _require_supported_activation_schema({"activation_receipt_schema_version":
-            int(getattr(response, "activation_receipt_schema_version", 0) or 0)})
-        if int(getattr(response, "activation_receipt_schema_version", 0) or 0) == 0:
+            int(response.activation_receipt_schema_version)})
+        if int(response.activation_receipt_schema_version) == 0:
             return _unactivated_mapping_state_payload(response, activation_disposition, activation_disposition_name)
-        if int(getattr(response, "activation_receipt_schema_version", 0) or 0) == 2:
+        if int(response.activation_receipt_schema_version) == 2:
             return _assigned_mapping_state_payload(response, activation_disposition, activation_disposition_name)
-        has_field = getattr(response, "HasField", lambda name: False)
+        has_field = response.HasField
         if has_field("activation_receipt_v2") or has_field("relocalization_policy_v2"):
             raise ValueError("legacy mapping state contains assigned metadata")
         return {
-            "planar_mode": str(getattr(response, "planar_mode", "") or ""),
-            "target_kind": str(getattr(response, "target_kind", "") or ""),
-            "target_graph_sha256": bytes(getattr(response, "target_graph_sha256", b"") or b"").hex(),
-            "success": bool(getattr(response, "success", False)),
-            "phase": str(getattr(response, "phase", "") or ""),
-            "message": str(getattr(response, "message", "") or ""),
-            "session_id": str(getattr(response, "session_id", "") or ""),
-            "map_name": str(getattr(response, "map_name", "") or ""),
+            "planar_mode": str(response.planar_mode),
+            "target_kind": str(response.target_kind),
+            "target_graph_sha256": bytes(response.target_graph_sha256).hex(),
+            "success": bool(response.success),
+            "phase": str(response.phase),
+            "message": str(response.message),
+            "session_id": str(response.session_id),
+            "map_name": str(response.map_name),
             "session_generation": int(
-                getattr(response, "session_generation", 0) or 0
+                response.session_generation
             ),
-            "revision": int(getattr(response, "revision", 0) or 0),
-            "active": bool(getattr(response, "active", False)),
+            "revision": int(response.revision),
+            "active": bool(response.active),
             "idempotent_replay": bool(
-                getattr(response, "idempotent_replay", False)
+                response.idempotent_replay
             ),
             "legacy_checkpoint_reconstructed": bool(
-                getattr(response, "legacy_checkpoint_reconstructed", False)
+                response.legacy_checkpoint_reconstructed
             ),
             "mapping_backend_kind": str(
-                getattr(response, "mapping_backend_kind", "") or ""
+                response.mapping_backend_kind
             ),
             "activation_receipt_schema_version": int(
-                getattr(response, "activation_receipt_schema_version", 0) or 0
+                response.activation_receipt_schema_version
             ),
             "activation_receipt_disposition": activation_disposition,
             "activation_receipt_disposition_name": activation_disposition_name,
             "runtime_generation": int(
-                getattr(response, "runtime_generation", 0) or 0
+                response.runtime_generation
             ),
             "backend_generation": int(
-                getattr(response, "backend_generation", 0) or 0
+                response.backend_generation
             ),
             "activation_request_id": str(
-                getattr(response, "activation_request_id", "") or ""
+                response.activation_request_id
             ),
             "activation_request_identity_sha256": bytes(
-                getattr(response, "activation_request_identity_sha256", b"") or b""
+                response.activation_request_identity_sha256
             ).hex(),
             "activation_identity_sha256": bytes(
-                getattr(response, "activation_identity_sha256", b"") or b""
+                response.activation_identity_sha256
             ).hex(),
             "target_receipt_sha256": bytes(
-                getattr(response, "target_receipt_sha256", b"") or b""
+                response.target_receipt_sha256
             ).hex(),
             "asset_manifest_sha256": bytes(
-                getattr(response, "asset_manifest_sha256", b"") or b""
+                response.asset_manifest_sha256
             ).hex(),
             "asset_bundle_sha256": bytes(
-                getattr(response, "asset_bundle_sha256", b"") or b""
+                response.asset_bundle_sha256
             ).hex(),
             "relocalization_target_available": bool(
-                getattr(response, "relocalization_target_available", False)
+                response.relocalization_target_available
             ),
             "source_policy_version": int(
-                getattr(response, "source_policy_version", 0) or 0
+                response.source_policy_version
             ),
             "source_policy_sha256": bytes(
-                getattr(response, "source_policy_sha256", b"") or b""
+                response.source_policy_sha256
             ).hex(),
             "deadline_policy_version": int(
-                getattr(response, "deadline_policy_version", 0) or 0
+                response.deadline_policy_version
             ),
             "deadline_policy_sha256": bytes(
-                getattr(response, "deadline_policy_sha256", b"") or b""
+                response.deadline_policy_sha256
             ).hex(),
             "algorithm_options_version": int(
-                getattr(response, "algorithm_options_version", 0) or 0
+                response.algorithm_options_version
             ),
             "algorithm_options_sha256": bytes(
-                getattr(response, "algorithm_options_sha256", b"") or b""
+                response.algorithm_options_sha256
             ).hex(),
         }
 
     @staticmethod
     def _relocalize_result_payload(response) -> Dict[str, Any]:
-        if int(getattr(response, "schema_version", 0) or 0) not in {1, 2}:
+        if int(response.schema_version) not in {1, 2}:
             raise ValueError("unsupported relocalization result schema")
-        if int(getattr(response, "schema_version", 0) or 0) == 2:
+        if int(response.schema_version) == 2:
             return _assigned_terminal_payload(AssignedRelocalizationTerminal.from_proto(response))
         if (response.HasField("assigned_cloud_v2") or response.HasField("assigned_planar_v2")):
             raise ValueError("legacy relocalization result contains assigned metadata")
-        disposition = int(getattr(response, "disposition", 0) or 0)
+        disposition = int(response.disposition)
         try:
             disposition_name = pb2.RelocalizeDisposition.Name(disposition)
             disposition_prefix = "RELOCALIZE_DISPOSITION_"
@@ -4234,85 +4059,85 @@ class GeometryRuntimeProvider:
             "target_kind": str(response.target_kind),
             "target_graph_sha256": bytes(response.target_graph_sha256).hex(),
             "success": disposition in _RELOCALIZE_SUCCESS_DISPOSITIONS,
-            "schema_version": int(getattr(response, "schema_version", 0) or 0),
-            "request_id": str(getattr(response, "request_id", "") or ""),
+            "schema_version": int(response.schema_version),
+            "request_id": str(response.request_id),
             "request_identity_sha256": bytes(
-                getattr(response, "request_identity_sha256", b"") or b""
+                response.request_identity_sha256
             ).hex(),
             "runtime_generation": int(
-                getattr(response, "runtime_generation", 0) or 0
+                response.runtime_generation
             ),
-            "session_id": str(getattr(response, "session_id", "") or ""),
-            "map_name": str(getattr(response, "map_name", "") or ""),
+            "session_id": str(response.session_id),
+            "map_name": str(response.map_name),
             "session_generation": int(
-                getattr(response, "session_generation", 0) or 0
+                response.session_generation
             ),
             "backend_generation": int(
-                getattr(response, "backend_generation", 0) or 0
+                response.backend_generation
             ),
             "activation_identity_sha256": bytes(
-                getattr(response, "activation_identity_sha256", b"") or b""
+                response.activation_identity_sha256
             ).hex(),
             "target_receipt_sha256": bytes(
-                getattr(response, "target_receipt_sha256", b"") or b""
+                response.target_receipt_sha256
             ).hex(),
             "target_cloud_revision": int(
-                getattr(response, "target_cloud_revision", 0) or 0
+                response.target_cloud_revision
             ),
             "target_cloud_sha256": bytes(
-                getattr(response, "target_cloud_sha256", b"") or b""
+                response.target_cloud_sha256
             ).hex(),
             "asset_manifest_sha256": bytes(
-                getattr(response, "asset_manifest_sha256", b"") or b""
+                response.asset_manifest_sha256
             ).hex(),
             "asset_bundle_sha256": bytes(
-                getattr(response, "asset_bundle_sha256", b"") or b""
+                response.asset_bundle_sha256
             ).hex(),
             "source_policy_version": int(
-                getattr(response, "source_policy_version", 0) or 0
+                response.source_policy_version
             ),
             "source_policy_sha256": bytes(
-                getattr(response, "source_policy_sha256", b"") or b""
+                response.source_policy_sha256
             ).hex(),
             "deadline_policy_version": int(
-                getattr(response, "deadline_policy_version", 0) or 0
+                response.deadline_policy_version
             ),
             "deadline_policy_sha256": bytes(
-                getattr(response, "deadline_policy_sha256", b"") or b""
+                response.deadline_policy_sha256
             ).hex(),
             "logical_timeout_ms": int(
-                getattr(response, "logical_timeout_ms", 0) or 0
+                response.logical_timeout_ms
             ),
             "algorithm_options_version": int(
-                getattr(response, "algorithm_options_version", 0) or 0
+                response.algorithm_options_version
             ),
             "algorithm_options_sha256": bytes(
-                getattr(response, "algorithm_options_sha256", b"") or b""
+                response.algorithm_options_sha256
             ).hex(),
             "disposition": disposition,
             "disposition_name": disposition_name,
             "candidate_sequence": int(
-                getattr(response, "candidate_sequence", 0) or 0
+                response.candidate_sequence
             ),
             "candidate_payload_sha256": bytes(
-                getattr(response, "candidate_payload_sha256", b"") or b""
+                response.candidate_payload_sha256
             ).hex(),
             "candidate_payload_preimage_v1": bytes(
-                getattr(response, "candidate_payload_preimage_v1", b"") or b""
+                response.candidate_payload_preimage_v1
             ).hex(),
             "evidence_sha256": bytes(
-                getattr(response, "evidence_sha256", b"") or b""
+                response.evidence_sha256
             ).hex(),
             "evidence_disclosure_v1": bytes(
-                getattr(response, "evidence_disclosure_v1", b"") or b""
+                response.evidence_disclosure_v1
             ).hex(),
             "correction_revision": int(
-                getattr(response, "correction_revision", 0) or 0
+                response.correction_revision
             ),
             "terminal_proof_sha256": bytes(
-                getattr(response, "terminal_proof_sha256", b"") or b""
+                response.terminal_proof_sha256
             ).hex(),
-            "detail": str(getattr(response, "detail", "") or ""),
+            "detail": str(response.detail),
         }
 
     @staticmethod
@@ -4649,7 +4474,7 @@ class GeometryRuntimeProvider:
             validate_artifact_reference(reference, checkpoint=checkpoint, maximum_bytes=MAX_DENSE_ARCHIVE_BYTES)
             if reference == checkpoint.graph_reference:
                 retained_payload = checkpoint.payload
-                if checkpoint._admission is None or not isinstance(payload, FrozenPayload) or payload is not retained_payload:
+                if not isinstance(payload, FrozenPayload) or payload is not retained_payload:
                     raise ValueError("planar upload requires its retained immutable payload owner")
             elif reference == checkpoint.fine_reference:
                 retained_payload = checkpoint.fine_archive
@@ -4910,7 +4735,9 @@ class GeometryRuntimeProvider:
                         raise RuntimeError("assigned activation requires an explicit predecessor stop")
                     if state["activation_receipt_schema_version"] != 2:
                         raise ValueError("active assigned replay requires its retained request owner")
-                    current = state["activation_receipt_v2"]
+                    current_receipt = state["activation_receipt_v2"]
+                    current = (current_receipt.to_dict() if isinstance(current_receipt, AssignedActivationReceipt)
+                               else current_receipt)
                     planar = checkpoint.backend_kind == "slam_toolbox"
                     source_key = "source_graph_member" if planar else "source_cloud_member"
                     source_identity = checkpoint.graph_reference.member_identity if planar else checkpoint.cloud_identity
@@ -4931,7 +4758,7 @@ class GeometryRuntimeProvider:
             dispatched = True
             response = stub.ActivateMap(request, timeout=_heavy_deadline_sec())
             acknowledged = _assigned_activation_ack(
-                response, activation_request=retained, stored_checkpoint=stored_checkpoint,
+                self._mapping_state_payload(response), activation_request=retained,
             )
             with self._map_state_lock:
                 if (self._stub is stub and self._map_connection_epoch == origin[1]
@@ -6042,8 +5869,7 @@ class GeometryRuntimeProvider:
             try:
                 # Only this actual pinned RPC response can settle the pending
                 # owner. Journal dictionaries and caller receipt claims cannot.
-                _assigned_activation_ack(response, activation_request=retained_request,
-                                         stored_checkpoint=pending.stored_checkpoint)
+                _assigned_activation_ack(payload, activation_request=retained_request)
                 settled = True
             except ValueError:
                 # Partial, nonmatching, or nonsealed state remains diagnostic;
@@ -6193,7 +6019,7 @@ class GeometryRuntimeProvider:
             resp = self._stub.HealthCheck(
                 pb2.HealthCheckRequest(), timeout=_pose_deadline_sec()
             )
-            return str(getattr(resp, "lcm_backend", "") or "<unknown>")
+            return str(resp.lcm_backend)
         except grpc.RpcError as e:
             _log_rpc_error("HealthCheck(get_lcm_backend_name)", e)
             return "<unknown>"
@@ -6233,8 +6059,8 @@ class GeometryRuntimeProvider:
             resp = self._stub.GetMappingReadiness(
                 pb2.Empty(), timeout=_read_deadline_sec()
             )
-            payload = _parse_readiness_message(getattr(resp, "message", "") or "{}")
-            payload["ready"] = bool(getattr(resp, "ready", False))
+            payload = _parse_readiness_message(resp.message)
+            payload["ready"] = bool(resp.ready)
             payload["error"] = None
             # fallback 字段名兼容旧调用方。
             payload.setdefault("has_occupancy_grid", payload.get("last_occupancy_revision", 0) > 0)
@@ -6247,7 +6073,7 @@ class GeometryRuntimeProvider:
                 health = self._stub.HealthCheck(
                     pb2.HealthCheckRequest(), timeout=_pose_deadline_sec()
                 )
-                lcm_backend = str(getattr(health, "lcm_backend", "") or "<unknown>")
+                lcm_backend = str(health.lcm_backend)
             except grpc.RpcError as e2:
                 _log_rpc_error("HealthCheck(get_mapping_diagnostics fallback)", e2)
                 return {
@@ -6304,7 +6130,7 @@ class GeometryRuntimeProvider:
             health = self._stub.HealthCheck(
                 pb2.HealthCheckRequest(), timeout=_pose_deadline_sec()
             )
-            lcm_backend = str(getattr(health, "lcm_backend", "") or "<unknown>")
+            lcm_backend = str(health.lcm_backend)
         except grpc.RpcError as e:
             _log_rpc_error("HealthCheck(get_navigation_diagnostics)", e)
             return {
@@ -6341,7 +6167,7 @@ class GeometryRuntimeProvider:
             readiness.get("cmd_vel_sink_ready") if isinstance(readiness, dict) else None
         )
         return {
-            "ready": bool(getattr(health, "healthy", False)) and bool(
+            "ready": bool(health.healthy) and bool(
                 isinstance(readiness, dict) and readiness.get("ready")
             ),
             "lcm_backend": lcm_backend,
@@ -6384,8 +6210,7 @@ class GeometryRuntimeProvider:
         except grpc.RpcError as exc:
             raise GeometryRuntimeRpcError.from_rpc_error("GetAssignedLocalizationSample", exc) from exc
         sample = _admit_assigned_localization_sample(
-            response, request=request, expected_terminal=expected_terminal,
-            provider=self, origin=expected_origin, delivery_token=token,
+            response, provider=self, origin=expected_origin, delivery_token=token,
         )
         with self.assigned_localization_sample_guard(sample):
             return sample
@@ -6936,6 +6761,8 @@ class GeometryRuntimeProvider:
             raise ValueError("unsupported MappingCloudAuthority schema_version")
         receipt = _assigned_activation_receipt_payload(
             _require_proto_message_field(response, "activation_receipt_v2"))
+        if not isinstance(receipt, AssignedActivationReceipt):
+            raise ValueError("MappingCloudAuthority requires a complete assigned receipt")
         commit = _mapping_commit_identity_dict(
             _require_proto_message_field(response, "committed_occupancy_commit_id"))
         authority = {
@@ -6954,7 +6781,6 @@ class GeometryRuntimeProvider:
             "committed_occupancy_source_timestamp_ns": int(response.committed_occupancy_source_timestamp_ns),
             "owner_epoch": int(response.owner_epoch),
         }
-        _mapping_cloud_authority_receipt(authority)
         return authority
 
     def submit_mapping_cloud_goal(
@@ -6973,7 +6799,7 @@ class GeometryRuntimeProvider:
         self._raise_if_stopping("submit_mapping_cloud_goal")
         if not self._connected or not self._stub:
             raise RuntimeError("Geometry runtime 未连接。")
-        receipt = _mapping_cloud_authority_receipt(authority)
+        receipt = authority["activation_receipt_v2"]
         commit = authority["committed_occupancy_commit_id"]
         request = pb2.MappingCloudGoalRequest(
             schema_version=3,
@@ -7150,35 +6976,35 @@ class GeometryRuntimeProvider:
             )
             readiness.update(
                 {
-                    "reason_code": str(getattr(resp, "reason_code", "") or ""),
+                    "reason_code": str(resp.reason_code),
                     "blockers": [
-                        str(item) for item in getattr(resp, "blockers", ())
+                        str(item) for item in resp.blockers
                     ],
-                    "tf_generation": int(getattr(resp, "tf_generation", 0) or 0),
+                    "tf_generation": int(resp.tf_generation),
                     "planner_generation": int(
-                        getattr(resp, "planner_generation", 0) or 0
+                        resp.planner_generation
                     ),
                     "motion_sink_generation": int(
-                        getattr(resp, "motion_sink_generation", 0) or 0
+                        resp.motion_sink_generation
                     ),
-                    "map_frame": str(getattr(resp, "map_frame", "") or ""),
-                    "pose_frame": str(getattr(resp, "pose_frame", "") or ""),
+                    "map_frame": str(resp.map_frame),
+                    "pose_frame": str(resp.pose_frame),
                     "forbidden_zone_map_name": str(
-                        getattr(resp, "forbidden_zone_map_name", "") or ""
+                        resp.forbidden_zone_map_name
                     ),
                     "forbidden_zone_generation": int(
-                        getattr(resp, "forbidden_zone_generation", 0) or 0
+                        resp.forbidden_zone_generation
                     ),
                     "forbidden_zone_signature": str(
-                        getattr(resp, "forbidden_zone_signature", "") or ""
+                        resp.forbidden_zone_signature
                     ),
                     "forbidden_zone_applied_revision": int(
-                        getattr(resp, "forbidden_zone_applied_revision", 0) or 0
+                        resp.forbidden_zone_applied_revision
                     ),
                 }
             )
             planner_costmap_revision = int(
-                getattr(resp, "planner_costmap_revision", 0) or 0
+                resp.planner_costmap_revision
             )
             if planner_costmap_revision > 0:
                 readiness["costmap_revision"] = planner_costmap_revision
@@ -7416,7 +7242,7 @@ class GeometryRuntimeProvider:
         stream_stub,
     ) -> bool:
         incoming_lease = _navigation_lease_from_message(update)
-        status = getattr(update, "status", "") or ""
+        status = update.status
         normalized_status = str(status).strip().lower()
         if normalized_status not in _NAV_STREAM_STATUS:
             LOGGER.warning(
@@ -7432,9 +7258,9 @@ class GeometryRuntimeProvider:
                 "丢弃缺少完整 ZERO proof 的 CANCELLED navigation stream frame"
             )
             return False
-        message = getattr(update, "message", "") or None
-        distance = getattr(update, "distance_remaining", None)
-        ts_ns = int(getattr(update, "timestamp_ns", 0) or 0)
+        message = update.message
+        distance = update.distance_remaining
+        ts_ns = int(update.timestamp_ns)
         with self._nav_command_lock:
             if not self._navigation_stream_is_current_locked(
                 stream_token,
@@ -7471,18 +7297,18 @@ class GeometryRuntimeProvider:
                         incoming_order = (incoming_lease[4], incoming_lease[3])
                         if incoming_lease == current_overlay_lease:
                             overlay_disconnected_placeholder = bool(
-                                getattr(current_overlay, "reason_code", "")
+                                current_overlay.reason_code
                                 == "NAVIGATION_STREAM_DISCONNECTED"
                             )
                             if (
                                 not overlay_disconnected_placeholder
                                 and not _navigation_status_can_follow(
-                                    getattr(current_overlay, "status", ""),
+                                    current_overlay.status,
                                     status,
-                                    current_timestamp_ns=int(getattr(current_overlay, "timestamp_ns", 0) or 0),
+                                    current_timestamp_ns=int(current_overlay.timestamp_ns),
                                     incoming_timestamp_ns=ts_ns,
-                                    current_path_revision=int(getattr(current_overlay, "path_revision", 0) or 0),
-                                    incoming_path_revision=int(getattr(update, "path_revision", 0) or 0),
+                                    current_path_revision=int(current_overlay.path_revision),
+                                    incoming_path_revision=int(update.path_revision),
                                 )
                             ):
                                 return False
@@ -7580,7 +7406,7 @@ class GeometryRuntimeProvider:
                         current_timestamp_ns=int(self._last_nav_timestamp_ns or 0),
                         incoming_timestamp_ns=ts_ns,
                         current_path_revision=int(self._last_nav_metadata.get("path_revision") or 0),
-                        incoming_path_revision=int(getattr(update, "path_revision", 0) or 0),
+                        incoming_path_revision=int(update.path_revision),
                     )
                 )
                 if (
@@ -7765,15 +7591,15 @@ class GeometryRuntimeProvider:
                 else None
             )
             if overlay is not None:
-                raw_status = str(getattr(overlay, "status", "") or "")
-                goal_id = str(getattr(overlay, "goal_id", "") or "") or None
-                message = str(getattr(overlay, "message", "") or "") or None
+                raw_status = str(overlay.status)
+                goal_id = str(overlay.goal_id) or None
+                message = str(overlay.message) or None
                 distance = float(
-                    getattr(overlay, "distance_remaining", 0.0) or 0.0
+                    overlay.distance_remaining
                 )
                 pose = None
                 timestamp_ns = int(
-                    getattr(overlay, "timestamp_ns", 0) or 0
+                    overlay.timestamp_ns
                 )
                 typed_metadata = _navigation_state_typed_metadata(overlay)
             else:
@@ -8185,7 +8011,7 @@ class GeometryRuntimeProvider:
                 req,
                 timeout=rpc_timeout,
             )
-            raw_status = getattr(resp, "status", "") or ""
+            raw_status = resp.status
             terminal = _status_means_cancelled(raw_status)
             success = bool(
                 (_status_means_cancel_success(raw_status)
@@ -8196,7 +8022,7 @@ class GeometryRuntimeProvider:
                     or _navigation_update_is_resolved_terminal(resp)
                 )
             )
-            cancel_message = getattr(resp, "message", "") or None
+            cancel_message = resp.message
             response_lease = _navigation_lease_from_message(resp)
             notification = None
             with self._nav_delivery_lock:
@@ -8274,8 +8100,8 @@ class GeometryRuntimeProvider:
                                 # progress. Keep the original source/path and responsibility.
                                 self._last_nav_metadata = {
                                     **copy.deepcopy(self._last_nav_metadata),
-                                    "cancel_phase": str(getattr(resp, "cancel_phase", "") or ""),
-                                    "cancel_generation": int(getattr(resp, "cancel_generation", 0) or 0),
+                                    "cancel_phase": str(resp.cancel_phase),
+                                    "cancel_generation": int(resp.cancel_generation),
                                     "cancel_message": cancel_message,
                                 }
                             elif (normalized_response in _NAV_TERMINAL_STATUS
@@ -8286,8 +8112,8 @@ class GeometryRuntimeProvider:
                                     status, metadata = self._navigation_project_update_locked(resp)
                                     self._last_nav_status = status
                                     self._last_nav_metadata = metadata
-                                    self._last_nav_timestamp_ns = int(getattr(resp, "timestamp_ns", 0) or 0)
-                                    self._last_nav_distance_remaining = float(getattr(resp, "distance_remaining", 0) or 0)
+                                    self._last_nav_timestamp_ns = int(resp.timestamp_ns)
+                                    self._last_nav_distance_remaining = float(resp.distance_remaining)
                                     if cancel_message:
                                         self._last_nav_message = cancel_message
                     if terminal_already_committed:
@@ -9096,8 +8922,8 @@ class GeometryRuntimeProvider:
             resp = self._stub.GetExplorationReadiness(
                 pb2.Empty(), timeout=_read_deadline_sec()
             )
-            payload = _parse_readiness_message(getattr(resp, "message", "") or "{}")
-            payload["ready"] = bool(getattr(resp, "ready", False))
+            payload = _parse_readiness_message(resp.message)
+            payload["ready"] = bool(resp.ready)
             # 兼容旧字段(snake_case → 已有 Python 调用方)
             payload.setdefault("backend_available", payload.get("backend_available"))
             payload.setdefault("controller_active", payload.get("controller_active"))
@@ -9236,7 +9062,7 @@ class GeometryRuntimeProvider:
                 ),
             )
             resp = self._stub.PublishOdom(msg, timeout=_read_deadline_sec())
-            return bool(getattr(resp, "success", False))
+            return bool(resp.success)
         except grpc.RpcError as e:
             _log_rpc_error("PublishOdom", e)
             return False
@@ -9341,9 +9167,9 @@ class GeometryRuntimeProvider:
                 request,
                 timeout=_heavy_deadline_sec(),
             )
-            if imu_samples and not bool(getattr(response, "success", False)):
-                raise RuntimeError("原生输入未确认：%s" % getattr(response, "message", "未知原因"))
-            return bool(getattr(response, "success", False))
+            if imu_samples and not bool(response.success):
+                raise RuntimeError("原生输入未确认：%s" % response.message)
+            return bool(response.success)
         except grpc.RpcError as e:
             _log_rpc_error("PublishPointCloud", e)
             if imu_samples:

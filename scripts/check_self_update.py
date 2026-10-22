@@ -149,7 +149,8 @@ class ServiceTests(unittest.TestCase):
         self.robot = None
         self.runtime = SimpleNamespace(
             task_manager=SimpleNamespace(has_active_tasks=lambda: False),
-            config=SimpleNamespace(robot=SimpleNamespace(active_robot="customrobot")),
+            config=SimpleNamespace(robot=SimpleNamespace(active_robot="customrobot"),
+                                   gateway=SimpleNamespace(host="127.0.0.1", port=8766)),
             robot=SimpleNamespace(has_motion_actuator=lambda: None),
             get_health_summary=lambda: {"latest_robot_snapshot": self.robot},
         )
@@ -216,10 +217,6 @@ class ServiceTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "缺少机器人状态"):
                     self.service.require_idle()
 
-    def test_missing_actuator_contract_fails_closed(self):
-        self.runtime.robot = SimpleNamespace()
-        with self.assertRaisesRegex(RuntimeError, "缺少机器人状态"):
-            self.service.require_idle()
 
     def test_no_actuator_does_not_ignore_armed_snapshot(self):
         self.runtime.robot.has_motion_actuator = lambda: False

@@ -19,6 +19,7 @@ from contracts.runtime_views import (LocalizationSession, LocalizationSessionSta
                                      _copy_assigned_session_descriptor)
 from core import EventBus, StateNamespace, StateStore, StreamBus
 from core.errors import GatewayError
+from core.logging_utils import LogRateLimiter
 from providers import LocalizationProvider
 from typing import Deque, Dict, Optional, Tuple
 
@@ -114,6 +115,7 @@ class LocalizationService:
         self._event_bus = event_bus
         self._stream_bus = stream_bus
         self._lock = threading.RLock()
+        self._provider_update_log_limiter = LogRateLimiter()
         self._session_publication_lock = threading.Lock()
         self._session_publication_queue = deque()
         self._session_publication_draining = False
@@ -520,30 +522,16 @@ class LocalizationService:
             self._localization_update_subscription_id = subscription(self._handle_provider_localization_update)
 
     def _subscribe_odom_publisher_failures(self) -> None:
-        """订阅 odom publisher 故障事件，故障即把状态机置 stale。"""
-
-        if self._event_bus is None:
-            return
-        try:
-            self._event_bus.subscribe(
-                self._on_odom_publisher_event,
-                event_types=("geometry.odom_publisher_failed",),
-            )
-        except Exception:
-            return
+        """订阅里程计发布故障；注册失败作为启动错误报告。"""
+        if self._event_bus is not None:
+            self._event_bus.subscribe(self._on_odom_publisher_event,
+                                      event_types=("geometry.odom_publisher_failed",))
 
     def _on_odom_publisher_event(self, event) -> None:
-        try:
-            event_type = str(getattr(event, "event_type", "") or "")
-            if event_type != "geometry.odom_publisher_failed":
-                return
-            self._odom_publisher_failure_message = str(getattr(event, "message", "") or "odom publisher failed")
-            # 故障即丢弃位姿可用性，让状态机进入 stale（状态机调用收敛锁内）
-            with self._lock:
-                self._state_machine.pose_received(pose_available=False, tracking_quality=0.0)
-                self._state_machine.check_timeouts()
-        except Exception:
-            pass
+        self._odom_publisher_failure_message = event.message or "odom publisher failed"
+        with self._lock:
+            self._state_machine.pose_received(pose_available=False, tracking_quality=0.0)
+            self._state_machine.check_timeouts()
 
     def has_provider_stream_subscription(self) -> bool:
         """返回定位服务是否已接入 provider 原生流。"""
@@ -570,6 +558,10 @@ class LocalizationService:
                 metadata=update_metadata,
             )
         except Exception:
+            self._provider_update_log_limiter.log(
+                LOGGER, logging.ERROR, "定位提供器更新失败 source=%s。", source_name,
+                key="provider_localization_update", interval_sec=5.0, exc_info=True,
+            )
             return None
 
     def ensure_active_session(
@@ -632,7 +624,7 @@ class LocalizationService:
                             "geometry_asset_summary": resolved_geometry_asset,
                         },
                     },
-                    deep=True,
+                    deep=False,
                 )
                 published_session = updated
             else:
@@ -843,7 +835,7 @@ class LocalizationService:
                         **dict(snapshot.metadata),
                     },
                 },
-                deep=True,
+                deep=False,
             )
             self._set_active_session_locked(updated)
             committed_epoch = self._session_mutation_epoch
@@ -962,7 +954,7 @@ class LocalizationService:
                             "geometry_asset_summary": resolved_geometry_asset,
                         },
                     },
-                    deep=True,
+                    deep=False,
                 )
             else:
                 session = LocalizationSession(
@@ -1152,7 +1144,7 @@ class LocalizationService:
                     **dict(snapshot.metadata),
                 },
             },
-            deep=True,
+            deep=False,
         )
         self._set_active_session_locked(updated)
         return (snapshot, usable_pose, snapshot_frame_tree, trajectory, history_size), updated
@@ -1620,27 +1612,11 @@ class LocalizationService:
     ) -> Dict[str, object]:
         """捕获建图后端或 Go2 SDK 定位状态。"""
 
-        # 尝试获取后端状态方法
         get_state = getattr(provider, "get_localization_state", None)
         if callable(get_state):
-            try:
-                state = get_state()
-                if isinstance(state, dict):
-                    return state
-            except Exception:
-                pass
-
-        # 尝试获取原始诊断信息
-        get_diagnostics = getattr(provider, "get_localization_diagnostics", None)
-        if callable(get_diagnostics):
-            try:
-                diag = get_diagnostics()
-                if hasattr(diag, "model_dump"):
-                    return diag.model_dump(mode="json")
-                if isinstance(diag, dict):
-                    return diag
-            except Exception:
-                pass
+            state = get_state()
+            if isinstance(state, dict):
+                return state
 
         # 返回默认状态
         return {
@@ -1810,10 +1786,6 @@ class LocalizationService:
     ) -> None:
         """在锁外发布定位快照到 StateStore/EventBus/StreamBus。"""
 
-        if snapshot.metadata.get("identity_schema_version") == 2:
-            snapshot = self._assigned_snapshot_view(snapshot)
-            current_pose, frame_tree = snapshot.current_pose, snapshot.frame_tree
-            trajectory_poses = [Pose.model_validate_json(pose.model_dump_json()) for pose in trajectory_poses]
         self._state_store.write(
             StateNamespace.LOCALIZATION,
             source_name,
@@ -1866,13 +1838,8 @@ class LocalizationService:
     def get_latest_snapshot(self) -> Optional[LocalizationSnapshot]:
         """返回最新定位快照。"""
 
-        return self._assigned_snapshot_view(self._latest_snapshot)
+        return self._latest_snapshot
 
-    @staticmethod
-    def _assigned_snapshot_view(snapshot):
-        if snapshot is not None and snapshot.metadata.get("identity_schema_version") == 2:
-            return LocalizationSnapshot.model_validate_json(snapshot.model_dump_json())
-        return snapshot
 
     def clear_latest_snapshot(self) -> None:
         """清空当前最新定位快照。"""
@@ -1893,7 +1860,7 @@ class LocalizationService:
         items = list(self._history)
         if limit is not None:
             items = items[-max(0, limit) :]
-        return tuple(self._assigned_snapshot_view(item) for item in items)
+        return tuple(items)
 
     def is_available(self) -> bool:
         """判断定位服务当前是否可用。"""

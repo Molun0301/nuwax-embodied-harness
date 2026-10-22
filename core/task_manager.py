@@ -8,20 +8,14 @@ from contextlib import contextmanager
 from contextvars import copy_context
 from copy import deepcopy
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
-from decimal import Decimal
-from enum import Enum
 from itertools import islice
-from pathlib import Path, PosixPath, PurePath, PurePosixPath, PureWindowsPath, WindowsPath
 from threading import Timer
 from time import monotonic
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from pydantic import BaseModel
-from pydantic_core import TzInfo
 
-import contracts
 from contracts.base import MetadataDict, utc_now
 from contracts.naming import build_event_id, build_task_id
 from contracts.tasks import TaskEvent, TaskSpec, TaskState, TaskStatus
@@ -70,20 +64,8 @@ _ERROR_CATEGORY_BY_CODE = {
 
 _TERMINAL_STATES = {TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED, TaskState.TIMEOUT}
 
-# 只信任仓库显式命名导出的模型/枚举精确类型；不把继承关系或模块名前缀当作证明。
-_RECEIPT_CONTRACT_TYPES = frozenset(
-    value for name in contracts.__all__
-    for value in (getattr(contracts, name),)
-    if isinstance(value, type) and issubclass(value, (BaseModel, Enum))
-)
-
-
 def _has_context_value(value: Any) -> bool:
     return value is not None and value != ""
-
-
-class TaskReceiptUnavailableError(RuntimeError):
-    """动作结果仍保留，但无法生成稳定可复制的回执。"""
 
 
 class TaskCancelledError(RuntimeError):
@@ -117,198 +99,9 @@ class TaskSafetyBarrierError(RuntimeError):
         }
 
 
-class _FrozenReceiptDict(dict):
-    """任务事件的内部只读容器；复制给调用方时恢复普通字典。"""
-
-    def _readonly(self, *args, **kwargs):
-        raise TypeError("任务事件载荷是只读快照。")
-
-    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = _readonly
-    __ior__ = _readonly
-
-    def __deepcopy__(self, memo):
-        copied = {}
-        memo[id(self)] = copied
-        copied.update({key: deepcopy(value, memo) for key, value in self.items()})
-        return copied
-
-
-class _FrozenReceiptList(list):
-    """内部只读列表；复制取出时保持原列表形状。"""
-
-    def _readonly(self, *args, **kwargs):
-        raise TypeError("任务事件载荷是只读快照。")
-
-    __setitem__ = __delitem__ = __iadd__ = __imul__ = append = clear = extend = insert = _readonly
-    pop = remove = reverse = sort = _readonly
-
-    def __deepcopy__(self, memo):
-        copied = []
-        memo[id(self)] = copied
-        copied.extend(deepcopy(value, memo) for value in self)
-        return copied
-
-
-def _receipt_issue(issues, reason):
-    if reason and issues is not None and not issues:
-        issues.append(reason)
-
-
-def _immutable_receipt_scalar(value):
-    # JSON契约还原使用Pydantic固定偏移时区；它与标准timezone一样不可变。
-    if type(value) is datetime:
-        return value.tzinfo is None or type(value.tzinfo) in (timezone, TzInfo)
-    return type(value) in (str, int, float, bool, bytes, type(None), date, Decimal,
-                           Path, PosixPath, WindowsPath, PurePath, PurePosixPath, PureWindowsPath, UUID)
-
-
-def _immutable_receipt_leaf(value):
-    if isinstance(value, Enum):
-        # 外部 Enum 可重写 value/字符串协议；只信任仓库声明的枚举投影。
-        if type(value) not in _RECEIPT_CONTRACT_TYPES:
-            return False
-        # Enum 成员本身会被 deepcopy 复用，只有不可变 value 才能共享。
-        def immutable_enum_value(item, seen):
-            if id(item) in seen:
-                return False
-            if isinstance(item, Enum):
-                seen.add(id(item))
-                return immutable_enum_value(item.value, seen)
-            if type(item) is tuple:
-                return all(immutable_enum_value(child, seen.copy()) for child in item)
-            return _immutable_receipt_scalar(item)
-        return immutable_enum_value(value.value, {id(value)})
-    if _immutable_receipt_scalar(value):
-        return True
-    # 契约明确拥有不可变 raw bytes，不为所有权判定展开整张栅格。
-    value_type = type(value)
-    if value_type.__module__ == "contracts.occupancy_cells" and value_type.__name__ == "PackedOccupancyCells":
-        from contracts.occupancy_cells import PackedOccupancyCells
-        return value_type is PackedOccupancyCells
-    return False
-
-
-def _copy_task_key(key, memo, issues):
-    # 公共 JSON 键会 str(key)，不能把安全数组投影推断为安全自定义字符串协议。
-    if type(key) not in (str, int, float, bool, type(None)):
-        _receipt_issue(issues, "opaque_receipt_key")
-    return _copy_task_value(key, memo, issues)
-
-
-def _copy_task_value(value, memo=None, issues=None):
-    """复制容器但兼容 Any 叶子；写入方可收集不透明所有权问题。"""
-    try:
-        return _copy_task_value_impl(value, memo, issues)
-    except Exception as error:  # noqa: BLE001 - 不透明值不得让已受理动作失败。
-        _receipt_issue(issues, type(error).__name__)
-        return value
-
-
-def _copy_task_value_impl(value, memo=None, issues=None):
-    if _immutable_receipt_leaf(value):
-        return value
-    memo = {} if memo is None else memo
-    if id(value) in memo:
-        return memo[id(value)]
-    if isinstance(value, BaseModel):
-        value_type = type(value)
-        # 只有仓库契约声明了稳定投影；外部模型可带任意序列化/属性协议。
-        if value_type not in _RECEIPT_CONTRACT_TYPES:
-            _receipt_issue(issues, "opaque_model_projection")
-        # 复制已验证的公开字段/extra，不调用用户 __copy__/model_copy 协议或再次验证。
-        copied = object.__new__(value_type)
-        memo[id(value)] = copied
-        object.__setattr__(copied, "__dict__", {
-            _copy_task_key(key, memo, issues): _copy_task_value(child, memo, issues)
-            for key, child in object.__getattribute__(value, "__dict__").items()})
-        object.__setattr__(copied, "__pydantic_fields_set__", set(value.__pydantic_fields_set__))
-        object.__setattr__(copied, "__pydantic_extra__", _copy_task_value(value.__pydantic_extra__, memo, issues))
-        # 默认公共序列化不读取 private；不要验证/展开未展示的缓存或锁。
-        private = value.__pydantic_private__
-        object.__setattr__(copied, "__pydantic_private__", dict(private) if isinstance(private, dict) else private)
-        return copied
-    if type(value) in (dict, _FrozenReceiptDict):
-        copied = {}
-        memo[id(value)] = copied
-        copied.update({_copy_task_key(key, memo, issues): _copy_task_value(child, memo, issues)
-                       for key, child in value.items()})
-        return copied
-    if type(value) in (list, _FrozenReceiptList):
-        copied = []
-        memo[id(value)] = copied
-        copied.extend(_copy_task_value(child, memo, issues) for child in value)
-        return copied
-    if type(value) is tuple:
-        # 即使某个叶子不可复制，也必须给其余事件/模型独立副本。
-        children = [_copy_task_value(child, memo, issues) for child in value]
-        if id(value) in memo:
-            return memo[id(value)]
-        copied = tuple(children)
-        memo[id(value)] = copied
-        return copied
-    # 任意 Python 对象的复制协议/动态投影不能证明源所有权；仅保留执行兼容性。
-    _receipt_issue(issues, "opaque_receipt_type")
-    return deepcopy(value, memo)
-
-
-def _own_task_payload(value):
-    """所有权结论独立于值的形状返回，不能随 dict/list 转换丢失。"""
-    issues = []
-    owned = _owned_event_value(value, issues=issues)
-    return owned, issues[0] if issues else None
-
-
-def _owned_event_value(value, memo=None, issues=None):
-    """锁外拥有新载荷；仅递归新内容，结论由调用边界显式携带。"""
-    try:
-        return _owned_event_value_impl(value, memo, issues)
-    except Exception as error:  # noqa: BLE001 - 元数据复制失败仅使回执降级。
-        _receipt_issue(issues, type(error).__name__)
-        return value
-
-
-def _owned_event_value_impl(value, memo=None, issues=None):
-    memo = {} if memo is None else memo
-    if id(value) in memo:
-        return memo[id(value)]
-    if type(value) in (dict, _FrozenReceiptDict):
-        copied = _FrozenReceiptDict()
-        memo[id(value)] = copied
-        dict.update(copied, {_copy_task_key(key, memo, issues): _owned_event_value(child, memo, issues)
-                             for key, child in value.items()})
-        return copied
-    if type(value) in (list, _FrozenReceiptList):
-        copied = _FrozenReceiptList()
-        memo[id(value)] = copied
-        list.extend(copied, (_owned_event_value(child, memo, issues) for child in value))
-        return copied
-    if type(value) is tuple:
-        children = [_owned_event_value(child, memo, issues) for child in value]
-        if id(value) in memo:
-            return memo[id(value)]
-        copied = tuple(children)
-        memo[id(value)] = copied
-        return copied
-    return _copy_task_value(value, memo, issues)
-
-
-def _opaque_event_context(metadata):
-    """预留游标路径只承诺冻结常规关联值；不透明关联仅降级回执。"""
-    visited = set()
-    def opaque(value):
-        if isinstance(value, (dict, list, tuple)):
-            if id(value) in visited:
-                return True
-            visited.add(id(value))
-            children = value.values() if isinstance(value, dict) else value
-            result = any(opaque(child) for child in children)
-            visited.remove(id(value))
-            return result
-        return not isinstance(value, (str, int, float, bool, bytes, type(None), date, datetime, Decimal, Enum, Path, UUID))
-    try:
-        return opaque({key: metadata[key] for key in ("request_context",) + _REQUEST_CONTEXT_KEYS if key in metadata})
-    except Exception:  # noqa: BLE001 - 关联检查失败只影响回执，不能影响任务准入。
-        return True
+def _snapshot(value: Any) -> Any:
+    """在公共读取边界复制一次；调用方须在持锁范围外调用。"""
+    return value.model_copy(deep=True) if isinstance(value, BaseModel) else deepcopy(value)
 
 
 @dataclass(frozen=True)
@@ -329,36 +122,28 @@ class TaskReceiptCapture:
             present = "value" in self.__feedback
             value = self.__feedback.get("value")
         if not present:
-            candidate = deepcopy(factory())
+            candidate = factory()
             with self.__feedback_lock:
                 value = self.__feedback.setdefault("value", candidate)
-        return deepcopy(value)
+        return _snapshot(value)
 
     def projection_failure(self, context):
         with self.__feedback_lock:
             value = self.__projection_error.get("value") if self.__projection_error.get("context") == context else None
-        return deepcopy(value)
+        return _snapshot(value)
 
     def remember_projection_failure(self, context, value):
         # 仅由投影边界传入固定码/短原因，不能保存原始异常或任意输出载荷。
-        owned = deepcopy(value)
         with self.__feedback_lock:
             self.__projection_error["context"] = context
-            self.__projection_error["value"] = owned
+            self.__projection_error["value"] = value
 
     def snapshot(self) -> Dict[str, Any]:
         # 序列化调用方持有自己的对象；昂贵复制不能放在管理器锁内。
-        try:
-            return _copy_task_value(self.__content)
-        except Exception as error:
-            raise TaskReceiptUnavailableError(
-                "任务回执不能安全复制；原任务状态与已知数据保持不变，不得自动重执行。") from error
+        return _snapshot(self.__content)
 
     def task_spec(self) -> TaskSpec:
-        try:
-            return _copy_task_value(self.__content["task"])
-        except Exception as error:
-            raise TaskReceiptUnavailableError("任务定义不能安全复制为回执；原任务不受影响。") from error
+        return _snapshot(self.__content["task"])
 
 
 @dataclass(frozen=True)
@@ -392,11 +177,6 @@ class TaskRecord:
     execution_started: bool = False
     result: Any = None
     runner_returned: bool = False
-    result_ownership_error: Optional[str] = None
-    receipt_ownership_error: Optional[str] = None
-    accepted_public_payload: Optional[MetadataDict] = None
-    started_public_payload: Optional[MetadataDict] = None
-    opaque_event_context: bool = False
     receipt_revision: int = 0
     receipt_capture: Optional[TaskReceiptCapture] = None
     error: Optional[str] = None
@@ -547,16 +327,12 @@ class TaskManager:
             requested_by=requested_by,
             metadata=metadata,
         )
-        metadata_payload, metadata_issue = _own_task_payload(metadata_payload)
-        if metadata is not None and type(metadata) is not dict:
-            metadata_issue = metadata_issue or "opaque_metadata_type"
         resources = list(required_resources or [])
-        owned_input, input_issue = _own_task_payload(input_payload or {})
         spec = TaskSpec(
             task_id=task_id,
             capability_name=capability_name,
             requested_by=requested_by,
-            input_payload=owned_input,
+            input_payload=input_payload or {},
             required_resources=resources,
             metadata=metadata_payload,
         )
@@ -570,10 +346,6 @@ class TaskManager:
         record = TaskRecord(
             spec=spec,
             status=status,
-            receipt_ownership_error=metadata_issue or input_issue,
-            accepted_public_payload=_copy_task_value(self._build_task_event_payload(spec, None)),
-            started_public_payload=_copy_task_value(self._build_task_event_payload(spec, None)),
-            opaque_event_context=_opaque_event_context(metadata_payload),
             timeout_deadline_monotonic=timeout_deadline_monotonic,
             deferred_interrupt=bool(deferred_interrupt),
         )
@@ -617,9 +389,7 @@ class TaskManager:
                         state=TaskState.RUNNING,
                         message="任务开始执行。",
                     )
-                    started_publication = self._prepare_task_event_dispatch(
-                        started_event, public_payload=current.started_public_payload)
-                    current.started_public_payload = None
+                    started_publication = self._prepare_task_event_dispatch(started_event)
             if timeout_due:
                 self._handle_timeout(task_id)
                 return None
@@ -677,9 +447,7 @@ class TaskManager:
                     state=TaskState.ACCEPTED,
                     message="任务已接受。",
                 )
-                accepted_publication = self._prepare_task_event_dispatch(
-                    accepted_event, public_payload=record.accepted_public_payload)
-                record.accepted_public_payload = None
+                accepted_publication = self._prepare_task_event_dispatch(accepted_event)
 
             if timeout_deadline_monotonic is not None:
                 remaining_sec = timeout_deadline_monotonic - monotonic()
@@ -698,8 +466,9 @@ class TaskManager:
                 publication=accepted_publication,
             )
 
+            response = _snapshot(spec)
             start_gate.set()
-            return _copy_task_value(spec)
+            return response
         except BaseException:
             if accepted_publication is not None and self._event_bus is not None:
                 self._event_bus.abandon_prepared(accepted_publication)
@@ -739,8 +508,7 @@ class TaskManager:
         record = self._records[task_id]
         return {"task_id": task_id, "source_id": self.receipt_source_id,
                 "revision": record.receipt_revision, "state": record.status.state,
-                "capability_name": record.spec.capability_name,
-                "ownership_supported": not (record.receipt_ownership_error or record.result_ownership_error)}
+                "capability_name": record.spec.capability_name}
 
     def task_receipt_header(self, task_id):
         with self._lock:
@@ -785,12 +553,6 @@ class TaskManager:
             record = self._records[task_id]
             if record.receipt_capture is not None:
                 return record.receipt_capture
-            if record.receipt_ownership_error is not None:
-                raise TaskReceiptUnavailableError(
-                    "元数据或事件含无法独立持有的值，稳定回执不受支持；原任务状态不变，不得自动重执行。")
-            if record.result_ownership_error is not None:
-                raise TaskReceiptUnavailableError(
-                    "任务运行器已返回，但结果不能安全复制；原任务状态和返回值仍保留，不得自动重执行。")
             revision = record.receipt_revision
             # 事件日志仅追加，保留列表引用与长度即可在线程锁外物化指定前缀。
             event_log, event_count = record.events, len(record.events)
@@ -812,44 +574,41 @@ class TaskManager:
         with self._lock:
             record = self._records[task_id]
             status = record.status
-            event = record.events[-1] if record.events and not record.opaque_event_context else None
-        return deepcopy(status), _copy_task_value(event)
+            event = record.events[-1] if record.events else None
+        return _snapshot((status, event))
 
     def get_task_status(self, task_id: str) -> TaskStatus:
         """获取独立任务状态，调用方修改不影响源版本。"""
         with self._lock:
             value = self._records[task_id].status
-        return deepcopy(value)
+        return _snapshot(value)
 
     def get_task_spec(self, task_id: str) -> TaskSpec:
         """获取独立任务定义。"""
         with self._lock:
             value = self._records[task_id].spec
-        return _copy_task_value(value)
+        return _snapshot(value)
 
     def get_task_events(self, task_id: str) -> Tuple[TaskEvent, ...]:
         """获取独立任务事件。"""
         with self._lock:
             event_log = self._records[task_id].events
             event_count = len(event_log)
-        return _copy_task_value(tuple(islice(event_log, event_count)))
+        return _snapshot(tuple(islice(event_log, event_count)))
 
     def get_latest_task_event(self, task_id: str) -> Optional[TaskEvent]:
         """只复制末事件，保持完整事件读取的可见性与复制策略。"""
         with self._lock:
             events = self._records[task_id].events
             event = events[-1] if events else None
-        return _copy_task_value(event)
+        return _snapshot(event)
 
     def get_task_result(self, task_id: str) -> Any:
         """获取独立任务结果。"""
         with self._lock:
             record = self._records[task_id]
             value = record.result
-            unsupported = record.result_ownership_error is not None
-        if unsupported:
-            raise TaskReceiptUnavailableError("任务返回值仍保留，但不能安全复制为回执；不得自动重执行。")
-        return _copy_task_value(value)
+        return _snapshot(value)
 
     def get_task_error(self, task_id: str) -> Optional[str]:
         with self._lock:
@@ -858,7 +617,7 @@ class TaskManager:
     def get_task_error_payload(self, task_id: str) -> Optional[MetadataDict]:
         with self._lock:
             payload = self._records[task_id].error_payload
-        return _copy_task_value(payload)
+        return _snapshot(payload)
 
     def update_task_metadata(
         self,
@@ -867,39 +626,18 @@ class TaskManager:
     ) -> TaskSpec:
         """合并任务元数据，并留下可审计事件。"""
 
-        metadata_updates, metadata_issue = _own_task_payload(updates or {})
-        opaque_context = _opaque_event_context(metadata_updates)
-        while True:
-            with self._lock:
-                record = self._records[task_id]
-                previous_spec = record.spec
-                prepare_public = record.status.state == TaskState.ACCEPTED
-            merged = dict(previous_spec.metadata)
+        metadata_updates = updates or {}
+        with self._lock:
+            record = self._records[task_id]
+            merged = dict(record.spec.metadata)
             merged.update(metadata_updates)
-            spec = previous_spec.model_copy(update={"metadata": merged}, deep=False)
-            # 为 accepted/started 预留路径先在锁外准备独立可变副本。
-            accepted_payload = started_payload = None
-            if prepare_public:
-                accepted_payload = _copy_task_value(self._build_task_event_payload(spec, None))
-                started_payload = _copy_task_value(self._build_task_event_payload(spec, None))
-            with self._lock:
-                record = self._records[task_id]
-                if record.spec is not previous_spec:
-                    continue
-                record.spec = spec
-                record.opaque_event_context = record.opaque_event_context or opaque_context
-                if record.status.state == TaskState.ACCEPTED:
-                    if record.accepted_public_payload is not None:
-                        record.accepted_public_payload = accepted_payload
-                    if record.started_public_payload is not None:
-                        record.started_public_payload = started_payload
-                event = self._record_task_event(
-                    task_id, "task.metadata_updated", state=record.status.state,
-                    message="任务元数据已更新。", payload={"metadata_updates": metadata_updates},
-                    receipt_ownership_error=metadata_issue)
-                break
+            spec = record.spec.model_copy(update={"metadata": merged}, deep=False)
+            record.spec = spec
+            event = self._record_task_event(
+                task_id, "task.metadata_updated", state=record.status.state,
+                message="任务元数据已更新。", payload={"metadata_updates": metadata_updates})
         self._dispatch_task_event(event)
-        return _copy_task_value(spec)
+        return _snapshot(spec)
 
     def acknowledge_interrupt_barrier(
         self,
@@ -908,7 +646,7 @@ class TaskManager:
     ) -> MetadataDict:
         """记录 deferred interrupt 的后端安全终态证明。"""
 
-        barrier_proof, proof_issue = _own_task_payload(proof or {})
+        barrier_proof = proof or {}
         if not barrier_proof:
             raise ValueError("interrupt barrier proof 不能为空。")
         with self._lock:
@@ -930,10 +668,9 @@ class TaskManager:
             )
             event = self._record_task_event(
                 task_id, "task.interrupt_barrier_acknowledged", state=record.status.state,
-                message="后端安全停止已确认。", payload={"interrupt_barrier_proof": barrier_proof},
-                receipt_ownership_error=proof_issue)
+                message="后端安全停止已确认。", payload={"interrupt_barrier_proof": barrier_proof})
         self._dispatch_task_event(event)
-        return _copy_task_value(barrier_proof)
+        return _snapshot(barrier_proof)
 
     def commit_task_success(
         self,
@@ -942,7 +679,7 @@ class TaskManager:
     ) -> bool:
         """原子封存成功证明，避免清理阶段被 timeout/cancel 覆盖。"""
 
-        completion_proof, proof_issue = _own_task_payload(proof or {})
+        completion_proof = proof or {}
         if not completion_proof:
             raise ValueError("completion proof 不能为空。")
         with self._lock:
@@ -962,7 +699,7 @@ class TaskManager:
             event = self._record_task_event(
                 task_id, "task.success_committed", state=record.status.state,
                 message="后端成功终态已确认，等待本地清理完成。",
-                payload={"completion_proof": completion_proof}, receipt_ownership_error=proof_issue)
+                payload={"completion_proof": completion_proof})
         if timer is not None:
             timer.cancel()
         self._dispatch_task_event(event)
@@ -985,7 +722,7 @@ class TaskManager:
 
         with self._lock:
             statuses = tuple(record.status for record in self._active_records.values())
-        return deepcopy(statuses)
+        return _snapshot(statuses)
 
     def capture_task_list(self, *, history_limit: int = 20, status_only: bool = False) -> Dict[str, Any]:
         """同一时刻捕获列表分类和摘要来源；不读取结果或完整事件历史。"""
@@ -1014,14 +751,14 @@ class TaskManager:
         # 状态、定义和事件由写入端替换/追加，捕获的引用可在锁外独立复制。
         captured = {"active_tasks": active, "history_tasks": history}
         # MCP 仅需要状态；不要复制定义、事件和元数据后再丢弃。
-        return deepcopy(captured) if status_only else _copy_task_value(captured)
+        return _snapshot(captured)
 
     def list_quarantined_tasks(self) -> Tuple[TaskStatus, ...]:
         """列出仍持有隔离资源的终态任务。"""
 
         with self._lock:
             statuses = tuple(record.status for record in self._records.values() if record.resource_quarantined)
-        return deepcopy(statuses)
+        return _snapshot(statuses)
 
     @contextmanager
     def motion_resource_quarantine_snapshot(self) -> Iterator[Tuple[str, ...]]:
@@ -1049,7 +786,7 @@ class TaskManager:
     ) -> bool:
         """在后续精确证明到达后释放终态任务的隔离资源。"""
 
-        release_proof, proof_issue = _own_task_payload(proof or {})
+        release_proof = proof or {}
         expected_correlation = dict(correlation or {})
         if not release_proof or not expected_correlation:
             raise ValueError("隔离资源释放必须提供 proof 与 correlation。")
@@ -1118,8 +855,7 @@ class TaskManager:
             record.resource_quarantine_release_proof = release_proof
             event = self._record_task_event(
                 task_id, "task.resource_quarantine_released", state=state,
-                message="后续精确停车证明已释放隔离资源。", payload={"release_proof": release_proof},
-                receipt_ownership_error=proof_issue)
+                message="后续精确停车证明已释放隔离资源。", payload={"release_proof": release_proof})
         self._dispatch_task_event(event)
         return True
 
@@ -1143,7 +879,7 @@ class TaskManager:
                 # 保留 None 的完整读取和直接负数调用原有的前缀排除语义。
                 if limit is not None:
                     history = history[-limit:]
-        return deepcopy(tuple(history))
+        return _snapshot(tuple(history))
 
     def is_cancel_requested(self, task_id: str) -> bool:
         """判断任务是否已请求取消。"""
@@ -1168,8 +904,7 @@ class TaskManager:
     ) -> TaskStatus:
         """更新任务进度。"""
 
-        owned_progress, progress_issue = _own_task_payload(payload or {})
-        progress_payload = dict(owned_progress)
+        progress_payload = dict(payload or {})
         with self._lock:
             record = self._records[task_id]
             if record.status.state in _TERMINAL_STATES:
@@ -1185,11 +920,10 @@ class TaskManager:
                 progress_payload.update({"progress": status.progress, "stage": status.stage,
                                          "message": status.message, "updated_at": status.updated_at.isoformat()})
                 event = self._record_task_event(task_id, "task.progress", state=status.state,
-                                               message=status.message, payload=progress_payload,
-                                               receipt_ownership_error=progress_issue)
+                                               message=status.message, payload=progress_payload)
         if event is not None:
             self._dispatch_task_event(event)
-        return deepcopy(status)
+        return _snapshot(status)
 
     def publish_task_event(
         self,
@@ -1280,9 +1014,10 @@ class TaskManager:
         if future is None:
             raise RuntimeError(f"任务 {task_id} 尚未启动。")
         try:
-            return future.result(timeout=timeout)
+            result = future.result(timeout=timeout)
         except FutureTimeoutError as exc:
             raise TimeoutError(f"等待任务 {task_id} 超时。") from exc
+        return _snapshot(result)
 
     @staticmethod
     def _history_record_reclaimable(record: TaskRecord) -> bool:
@@ -1415,7 +1150,7 @@ class TaskManager:
         request_context["task_id"] = spec.task_id
         request_context["capability_name"] = request_context.get("capability_name") or spec.capability_name
         request_context["requested_by"] = request_context.get("requested_by") or spec.requested_by or "unknown"
-        event_payload.setdefault("request_context", _FrozenReceiptDict(request_context))
+        event_payload.setdefault("request_context", request_context)
         for key in _REQUEST_CONTEXT_KEYS:
             value = request_context.get(key)
             if _has_context_value(value):
@@ -1472,23 +1207,16 @@ class TaskManager:
                     )
                     return result
                 raise
-            ownership_issues = []
-            owned_result = _copy_task_value(result, issues=ownership_issues)
-            ownership_error = ownership_issues[0] if ownership_issues else None
-            if ownership_error is not None:
-                # 原返回值仍由 Future/记录保留，不能将无法证明的复制当作独立回执。
-                owned_result = result
             with self._lock:
                 record = self._records[task_id]
-                record.result = owned_result
+                record.result = result
                 record.runner_returned = True
-                record.result_ownership_error = ownership_error
                 returned_event = None
                 if record.status.state in _TERMINAL_STATES:
                     returned_event = self._record_task_event(
                         task_id, "task.result_returned", state=record.status.state,
                         message="任务运行器已返回结果；返回值不代表提交证明，原有终态保持不变。",
-                        payload={"evidence_kind": "runner_returned", "receipt_copy_supported": ownership_error is None})
+                        payload={"evidence_kind": "runner_returned"})
                 else:
                     self._receipt_changed_locked(record)
                 terminal_state = record.status.state
@@ -1762,8 +1490,7 @@ class TaskManager:
         release_resources: bool = True,
         interrupt_record: Optional[TaskRecord] = None,
     ) -> None:
-        owned_error_payload, error_issue = _own_task_payload(error_payload or {})
-        terminal_error_payload = dict(owned_error_payload)
+        terminal_error_payload = dict(error_payload or {})
         error_code = self._terminal_error_code(state, terminal_error_payload)
         if error_code is not None:
             terminal_error_payload.setdefault("code", error_code)
@@ -1791,7 +1518,6 @@ class TaskManager:
                 record.result = result
             record.error = error
             record.error_payload = terminal_error_payload or None
-            record.receipt_ownership_error = record.receipt_ownership_error or error_issue
             if task_id not in self._history_order:
                 self._history_order.append(task_id)
             status = record.status
@@ -1806,7 +1532,7 @@ class TaskManager:
             if error is not None:
                 payload["error"] = error
             if terminal_error_payload:
-                payload["error_payload"] = _FrozenReceiptDict(terminal_error_payload)
+                payload["error_payload"] = terminal_error_payload
             if error_code is not None:
                 payload["error_code"] = error_code
             if error_category is not None:
@@ -1825,6 +1551,7 @@ class TaskManager:
             try:
                 payload = exporter()
             except Exception:
+                TASK_LOGGER.exception("任务异常投影失败，保留原始异常类型与消息")
                 payload = None
             if isinstance(payload, dict):
                 return dict(payload)
@@ -1842,12 +1569,10 @@ class TaskManager:
         message: Optional[str] = None,
         payload: Optional[MetadataDict] = None,
     ) -> TaskEvent:
-        owned_payload, payload_issue = _own_task_payload(payload or {})
         with self._lock:
-            event = self._record_task_event(task_id, event_type, state=state, message=message, payload=owned_payload,
-                                            receipt_ownership_error=payload_issue)
+            event = self._record_task_event(task_id, event_type, state=state, message=message, payload=payload)
         self._dispatch_task_event(event)
-        return _copy_task_value(event)
+        return _snapshot(event)
 
     def _record_task_event(
         self,
@@ -1857,13 +1582,11 @@ class TaskManager:
         state: Optional[TaskState] = None,
         message: Optional[str] = None,
         payload: Optional[MetadataDict] = None,
-        receipt_ownership_error: Optional[str] = None,
     ) -> TaskEvent:
-        """Record an event before a deadline-sensitive external dispatch."""
+        """先记录事件，再进行受截止时间约束的外部分发。"""
 
         with self._lock:
             record = self._records[task_id]
-            record.receipt_ownership_error = record.receipt_ownership_error or receipt_ownership_error
             event = TaskEvent(
                 event_id=build_event_id(event_type),
                 event_type=event_type,
@@ -1872,25 +1595,22 @@ class TaskManager:
                 message=message,
                 payload=self._build_task_event_payload(record.spec, payload),
             )
-            # 根容器也只读；总线只能得到根副本，嵌套容器不共享可变别名。
-            event.payload = _FrozenReceiptDict(event.payload)
             record.events.append(event)
             self._receipt_changed_locked(record)
             return event
 
-    def _prepare_task_event_dispatch(self, event: TaskEvent, *, public_payload=None):
+    def _prepare_task_event_dispatch(self, event: TaskEvent):
         if self._event_bus is None:
             return None
-        # 深层副本在进入此短预留临界区之前已准备，游标预留顺序不变。
-        public_event = event.model_copy(update={"payload": public_payload}) if public_payload is not None else event
-        return self._event_bus.prepare_task_event(public_event)
+        # 内部订阅者只读使用交接对象；持锁预留游标保证受理与开始的顺序。
+        return self._event_bus.prepare_task_event(event)
 
     def _dispatch_task_event(self, event: TaskEvent, *, publication=None) -> None:
         if self._event_bus is None:
             return
         if publication is None:
-            # 普通事件在锁外给总线独立副本；不透明不可复制值只令回执降级。
-            self._event_bus.publish_task_event(_copy_task_value(event))
+            # 内部事件只读交接；公共读取接口负责创建调用方副本。
+            self._event_bus.publish_task_event(event)
             return
         try:
             self._event_bus.dispatch_prepared(publication)

@@ -5,6 +5,7 @@ import json
 import os
 import struct
 import threading
+import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -30,18 +31,20 @@ class AssignedSavedDisplayGatewayTests(unittest.TestCase):
     DENSE_POINTS = 65539
 
     def setUp(self):
+        from tests.conftest import create_isolated_gateway
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.gateway = create_isolated_gateway(Path(directory.name))
+        self.addCleanup(self.gateway.stop)
         fixtures.AssignedSavedCloudTests.setUp(self)
         self.handle = self.runtime.capture_assigned_saved_cloud_source()
         self.source = AssignedSavedPointCloudMapSource(self.handle)
         self.addCleanup(self.source.close)
         self.snapshot = self.source.read()
-        self.gateway = object.__new__(GatewayRuntime)
-        self.gateway._lock = threading.RLock()
-        self.gateway._closed = False
-        self.gateway.platform_geometry_runtime = self.runtime
+        binding = patch.object(self.gateway, "platform_geometry_runtime", self.runtime)
+        binding.start()
+        self.addCleanup(binding.stop)
         self.gateway._pointcloud_map_current_snapshot = self.snapshot
-        self.gateway._saved_dense_cloud_cache = SavedDenseCloudCache()
-        self.addCleanup(self.gateway._saved_dense_cloud_cache.close)
 
     def replace_installation(self):
         with self.runtime._runtime_state_lock:
@@ -204,14 +207,18 @@ class AssignedSavedDisplayGatewayTests(unittest.TestCase):
                 self.addCleanup(source.close)
                 current = source.read()
                 topics = []
-                def publish(topic, *, topics=topics, change_on=change_on, **_kwargs):
+                def observe(frame, *, topics=topics, change_on=change_on):
                     self.assertFalse(self.gateway._lock._is_owned())
-                    topics.append(topic)
-                    if topic == change_on: self.replace_installation()
-                self.gateway._pointcloud_map_stream_stop = threading.Event()
-                self.gateway.stream_bus = SimpleNamespace(publish=publish)
-                with self.assertRaises(PointCloudMapSourceError):
-                    self.gateway._publish_pointcloud_map_snapshot(current, reason='test')
+                    topics.append(frame.topic)
+                    if frame.topic == change_on:
+                        self.replace_installation()
+                subscription = self.gateway.stream_bus.subscribe(observe,
+                    topics=('pointcloud_map.snapshot', 'pointcloud_map.meta', 'pointcloud_map.chunk'))
+                try:
+                    with self.assertRaises(PointCloudMapSourceError):
+                        self.gateway._publish_pointcloud_map_snapshot(current, reason='test')
+                finally:
+                    self.gateway.stream_bus.unsubscribe(subscription)
                 self.assertEqual(topics[-1], change_on)
                 self.assertNotIn('pointcloud_map.chunk', topics)
 
@@ -285,8 +292,6 @@ class AssignedSavedDisplayGatewayTests(unittest.TestCase):
                 if len(inner.packets) == 1: self.replace_installation()
             async def receive(self): return await self.incoming.get()
             async def close(self, **kwargs): pass
-        bus = SimpleNamespace(subscribe=lambda *a, **k: 'x', unsubscribe=lambda *a: None)
-        self.gateway.stream_bus = bus
         router, socket = Router(), Socket()
         pointcloud_stream.install_pointcloud_stream(router, self.gateway)
         old_encode = pointcloud_stream.PointCloudTransfer.next_packet

@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import fcntl
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -31,6 +32,8 @@ from contracts.map_relocalization import (
 )
 from contracts.naming import build_safe_dir_segment
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
+
+LOGGER = logging.getLogger("nuwax_robot_bridge.mapping.catalog")
 
 
 _ACTIVATION_JOURNAL_SCHEMA_VERSION = 2
@@ -258,7 +261,8 @@ class MapCatalogRepository:
             try:
                 existing_asset = self._load_map_asset(existing_metadata_path)
             except Exception:
-                existing_asset = None
+                LOGGER.exception("读取既有地图目录记录失败 path=%s。", existing_metadata_path)
+                raise
             if existing_asset is not None and existing_asset.map_name != asset.map_name:
                 raise MapNameCollisionError(
                     requested_name=asset.map_name,
@@ -289,7 +293,8 @@ class MapCatalogRepository:
         try:
             payload = json.loads(self._active_map_path.read_text(encoding="utf-8"))
         except Exception:
-            return None
+            LOGGER.exception("读取活动地图记录失败 path=%s。", self._active_map_path)
+            raise
         map_name = str(payload.get("map_name", "")).strip()
         return map_name or None
 
@@ -584,12 +589,12 @@ class MapCatalogRepository:
         if not isinstance(activation_receipt, AssignedActivationReceipt):
             raise ValueError("backend evidence requires an admitted assigned activation receipt owner")
         request = _admit_assigned_activation_request(activation_request)
-        evidence = self._validate_assigned_activation_evidence({
+        evidence = {
             "activation_receipt_schema_version": 2, "activation_receipt_v2": activation_receipt.to_dict(),
             "activation_receipt_disposition": activation_receipt_disposition,
             "activation_receipt_disposition_name": activation_receipt_disposition_name,
             "relocalization_target_available": relocalization_target_available,
-            "relocalization_policy_v2": relocalization_policy_v2}, request)
+            "relocalization_policy_v2": relocalization_policy_v2}
         allowed = set(expected_phases)
         if not allowed or not allowed.issubset(_ASSIGNED_ACTIVATION_JOURNAL_PHASES):
             raise ValueError("unsupported assigned activation expected phases")
@@ -712,8 +717,7 @@ class MapCatalogRepository:
                 # Preserve the original ACK disposition and policy across recovery.
                 candidate.update(evidence)
                 candidate["activation_request"] = request
-            receipt = self._validate_assigned_activation_receipt(candidate)
-            receipt.pop("trusted_identity")
+            receipt = candidate
             if existing is not None and existing.get("activation_request_id") == activation_request_id:
                 if self._assigned_activation_immutable_identity(existing) != self._assigned_activation_immutable_identity(receipt):
                     raise ValueError("same activation request has a conflicting durable receipt")
@@ -1176,14 +1180,13 @@ class MapCatalogRepository:
             try:
                 _fsync_directory(self._activation_journal_path.parent)
             except Exception:
-                pass
+                LOGGER.exception("恢复地图事务记录后的目录同步失败。")
             raise
         try:
             tombstone_path.unlink(missing_ok=True)
             _fsync_directory(self._activation_journal_path.parent)
         except Exception:
-            # The journal removal is already durable; a hidden tombstone is inert.
-            pass
+            LOGGER.exception("事务记录已删除，但清理遗留墓碑文件失败。")
 
     def complete_map_activation_durable(
         self,
@@ -2180,13 +2183,13 @@ class MapCatalogRepository:
                     tombstone.unlink()
                     _fsync_directory(self._relocalization_intent_path.parent)
             except BaseException:
-                pass
+                LOGGER.exception("恢复重定位事务记录失败。")
             raise
         try:
             tombstone.unlink(missing_ok=True)
             _fsync_directory(self._relocalization_intent_path.parent)
         except Exception:
-            pass
+            LOGGER.exception("事务记录已删除，但清理遗留墓碑文件失败。")
 
     @staticmethod
     def _relocalization_receipt_immutable_identity(

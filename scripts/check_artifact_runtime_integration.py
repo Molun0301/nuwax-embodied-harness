@@ -34,6 +34,7 @@ class RuntimeChecks(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="neh-artifact-runtime-")
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
+        self._runtime_index = 0
         self.store = LocalArtifactStore(str(root / "artifacts"), "http://diagnostic.invalid")
         self.repo = MemoryRepository(str(root / "memory.db"))
         self.addCleanup(self.repo.close)
@@ -50,31 +51,21 @@ class RuntimeChecks(unittest.TestCase):
     def save(self):
         return self.store.save_bytes(kind=ArtifactKind.IMAGE, mime_type="image/jpeg", data=b"synthetic-image")
 
+    def new_runtime(self):
+        from tests.conftest import create_isolated_gateway
+        self._runtime_index += 1
+        runtime = create_isolated_gateway(Path(self.temp.name) / f"gateway-{self._runtime_index}")
+        self.addCleanup(runtime.stop)
+        return runtime
+
+    def bind(self, runtime, **values):
+        binding = patch.multiple(runtime, **values)
+        binding.start()
+        self.addCleanup(binding.stop)
+
     def health_runtime(self):
-        runtime = object.__new__(GatewayRuntime)
-        runtime.artifact_service, runtime.artifact_store = self.service, self.store
-        runtime._started, runtime._closed = True, False
-        runtime.config = SimpleNamespace(gateway=SimpleNamespace(public_base_url="http://diagnostic.invalid"))
-        runtime.robot = SimpleNamespace(manifest=SimpleNamespace(robot_name="synthetic", robot_model="test"), get_status=dict)
-        runtime.robot_state_service = SimpleNamespace(get_latest_snapshot=lambda: None)
-        runtime.localization_service = SimpleNamespace(get_latest_snapshot=lambda: None, get_active_session=lambda: None)
-        runtime.mapping_service = SimpleNamespace(get_latest_snapshot=lambda: None)
-        runtime.navigation_service = SimpleNamespace(get_latest_navigation_context=lambda: None, get_latest_exploration_context=lambda: None)
-        runtime.perception_video_runtime = SimpleNamespace(get_status=lambda: None)
-        runtime.map_workspace_service = SimpleNamespace(get_active_workspace_identity=lambda: None, get_active_workspace=lambda: None)
-        runtime.platform_geometry_runtime = SimpleNamespace(get_runtime_status=dict, get_live_mapping_diagnostics=dict)
-        runtime.audio_service = SimpleNamespace(get_cached_volume_state=dict)
-        runtime.task_manager = SimpleNamespace(count_active_tasks=lambda: 0)
-        runtime.event_bus = SimpleNamespace(latest_cursor=lambda: 0)
-        runtime.stream_bus = SimpleNamespace(latest_cursor=lambda: 0, status=dict)
-        runtime.resource_lock_manager = SimpleNamespace(snapshot=tuple)
-        runtime.get_event_log_status = dict
-        runtime._runtime_geometry_asset_summary = lambda *a: {}
-        runtime._runtime_mapping_profile_summary = lambda *a: {}
-        runtime._runtime_last_relocalization_summary = lambda *a: {}
-        runtime._runtime_navigation_control_policy_summary = lambda *a: {}
-        runtime._runtime_localization_session_summary = lambda *a: {}
-        runtime._build_service_health_summary = lambda **kw: ServiceHealthSummary()
+        runtime = self.new_runtime()
+        self.bind(runtime, artifact_service=self.service, artifact_store=self.store)
         return runtime
 
     def test_blocked_scan_capture_commit_and_health_stay_responsive(self):
@@ -218,12 +209,12 @@ class RuntimeChecks(unittest.TestCase):
             entered.set()
             self.assertTrue(release.wait(5))
             return read_index()
-        runtime = object.__new__(GatewayRuntime)
-        runtime.artifact_service = self.service
+        runtime = self.new_runtime()
+        self.bind(runtime, artifact_service=self.service)
         calls = []
-        runtime.memory_service = SimpleNamespace(close=lambda: calls.append("memory") or True)
+        self.bind(runtime, memory_service=SimpleNamespace(close=lambda: calls.append('memory') or True))
         original_close = runtime._close_artifact_dependencies
-        runtime._close_artifact_dependencies = lambda: original_close(0.01)
+        self.bind(runtime, _close_artifact_dependencies=lambda: original_close(0.01))
         with patch.object(self.bridge, "_read_index", side_effect=blocked_provider):
             self.service._maintenance_worker.request()
             self.assertTrue(entered.wait(2))
@@ -241,24 +232,33 @@ class RuntimeChecks(unittest.TestCase):
         self.assertEqual(calls, ["memory"])
 
     def test_never_started_dispatch_closes_artifact_owners_before_dependencies(self):
-        runtime = object.__new__(GatewayRuntime)
+        runtime = self.new_runtime()
         order = []
-        runtime.artifact_service = SimpleNamespace(close=lambda **kw: order.append("maintenance") or True)
-        runtime.perception_video_runtime = SimpleNamespace(close=lambda **kw: order.append("video") or True)
-        runtime.observation_service = SimpleNamespace(close=lambda **kw: order.append("observation") or True)
-        runtime.perception_service = SimpleNamespace(close=lambda **kw: order.append("perception") or True)
-        runtime.scene_mapping_service = SimpleNamespace(close=lambda: order.append("mapping"))
-        runtime._close_mapping_recording = lambda _timeout: True
-        runtime._close_runtime_event_bridge = lambda _timeout: order.append("event_bridge") or True
+        self.bind(runtime, artifact_service=SimpleNamespace(close=lambda **kw: order.append('maintenance') or True))
+        self.bind(runtime, perception_video_runtime=SimpleNamespace(close=lambda **kw: order.append('video') or True))
+        self.bind(runtime, observation_service=SimpleNamespace(close=lambda **kw: order.append('observation') or True))
+        self.bind(runtime, perception_service=SimpleNamespace(close=lambda **kw: order.append('perception') or True))
+        self.bind(runtime, scene_mapping_service=SimpleNamespace(close=lambda: order.append('mapping')))
+        self.bind(runtime, _close_mapping_recording=lambda _timeout: True)
+        self.bind(runtime, _close_runtime_event_bridge=lambda _timeout: order.append('event_bridge') or True)
         self.assertTrue(runtime._close_dispatch_resources())
         self.assertEqual(order[:5], ["maintenance", "video", "observation", "perception", "mapping"])
 
     def test_started_stop_fences_maintenance_before_video_and_mapping_teardown(self):
         from scripts.check_memory_service_regressions import ServiceRegressionChecks
         fixture = ServiceRegressionChecks()
+        self.addCleanup(fixture.doCleanups)
         runtime, order, _events = fixture.runtime_stub(True, [True])
-        runtime.artifact_service = SimpleNamespace(close=lambda **kw: order.append("artifact_fence") or True)
-        runtime.stop()
+        def observed(owner, method, name):
+            original = getattr(owner, method)
+            def invoke(*args, **kwargs):
+                order.append(name)
+                return original(*args, **kwargs)
+            return patch.object(owner, method, invoke)
+        with observed(runtime.artifact_service, "close", "artifact_fence"), \
+                observed(runtime.perception_video_runtime, "stop", "perception_video_runtime"), \
+                observed(runtime.scene_mapping_service, "close", "scene_mapping_service"):
+            runtime.stop()
         self.assertLess(order.index("tasks"), order.index("platform_geometry_runtime"))
         self.assertLess(order.index("platform_geometry_runtime"), order.index("artifact_fence"))
         self.assertLess(order.index("artifact_fence"), order.index("perception_video_runtime"))
@@ -318,11 +318,11 @@ class RuntimeChecks(unittest.TestCase):
             self.assertTrue(self.service._maintenance_worker.wait_idle(3))
 
     def test_busy_producer_retains_memory_dependency(self):
-        runtime = object.__new__(GatewayRuntime)
-        runtime.artifact_service = self.service
-        runtime.perception_video_runtime = SimpleNamespace(close=lambda **kw: False)
+        runtime = self.new_runtime()
+        self.bind(runtime, artifact_service=self.service)
+        self.bind(runtime, perception_video_runtime=SimpleNamespace(close=lambda **kw: False))
         closed = []
-        runtime.memory_service = SimpleNamespace(close=lambda: closed.append(True) or True)
+        self.bind(runtime, memory_service=SimpleNamespace(close=lambda: closed.append(True) or True))
         with self.assertRaisesRegex(RuntimeError, "Artifact shutdown incomplete"):
             runtime._close_memory_service()
         self.assertFalse(closed)

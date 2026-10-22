@@ -34,7 +34,7 @@ class SettingsApplication:
         self.revision_owner = config_profiles.ProfileRevisionOwner()
         self._root = config_io._CORE_ENV.parent
         self.started_location = configuration_location(root=self._root)
-        self.started_robot = getattr(getattr(getattr(runtime, "config", None), "robot", None), "active_robot", "")
+        self.started_robot = runtime.config.robot.active_robot
         self._startup_files = configuration_values(root=self._root)
         self._startup_files.update({key: value for key, value in os.environ.items() if config_registry.get_field(key)})
 

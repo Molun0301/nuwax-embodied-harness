@@ -147,11 +147,8 @@ def write_runtime(
     modules: Sequence[str],
     robot: str,
     existing: Mapping[str, str],
-    *, fresh_layout: str = "combined",
 ) -> None:
     """写入永久安装代际；选中模块可调配置，未安装模块保持禁用。"""
-    if fresh_layout not in ("combined", "split"):
-        raise ValueError("Unknown terminal storage creation policy")
     root, prefix = root.resolve(), prefix.resolve()
     selected = set(modules)
     if selected - _MODULES:
@@ -169,7 +166,7 @@ def write_runtime(
         values.update(read_settings(root / "drivers/go2/data_plane.env.example"))
     values.update(read_settings(root / ".env.example"))
     values.update(existing)
-    # 该安装能力/回滚策略只来自 manager；旧配置或调用环境不能将 combined 升成 split。
+    # 丢弃退休布局开关，不再向运行时传播旧配置。
     values.pop("NUWAX_AGENT_TERMINAL_FRESH_LAYOUT", None)
     # 新安装先供本机接入；已配置的监听地址与制品访问地址继续沿用。
     if not existing.get("NUWAX_GATEWAY_HOST", "").strip():
@@ -204,7 +201,6 @@ def write_runtime(
     fixed.update({
         "NUWAX_ROBOT_PROFILE_MODE": "1",
         "NUWAX_INSTALL_HOME": str(prefix.parent.parent),
-        "NUWAX_AGENT_TERMINAL_FRESH_LAYOUT": fresh_layout,
         "NUWAX_SETTINGS_LAUNCHER": str(prefix / "start.sh"),
         "NUWAX_ACTIVE_ROBOT": robot,
         "NUWAX_GATEWAY_LOCK_FILE": str(root / "runtime_data/gateway/start_gateway.lock"),
@@ -302,16 +298,6 @@ def write_runtime(
         f"export VIRTUAL_ENV={shlex.quote(str(prefix / 'venv'))}",
         f'export PATH={shlex.quote(str(prefix / "venv/bin") + ":" + str(binary_dir))}:"${{PATH}}"',
         "export PYTHONNOUSERSITE=1",
-        "# 此固定策略不能因继承的文件来源标记而被活动方案重新覆盖。",
-        '_neh_policy_file_keys=""',
-        'IFS=":" read -ra _neh_policy_keys <<< "${_NUWAX_CONFIG_FILE_KEYS:-}"',
-        'for _neh_policy_key in "${_neh_policy_keys[@]}"; do',
-        '  if [[ -n "${_neh_policy_key}" && "${_neh_policy_key}" != "NUWAX_AGENT_TERMINAL_FRESH_LAYOUT" ]]; then',
-        '    _neh_policy_file_keys+="${_neh_policy_key}:"',
-        '  fi',
-        'done',
-        'export _NUWAX_CONFIG_FILE_KEYS="${_neh_policy_file_keys}"',
-        'unset _neh_policy_file_keys _neh_policy_keys _neh_policy_key',
     ]
     launcher.extend(f"export {key}={shlex.quote(value)}" for key, value in sorted(fixed.items()))
     launcher.extend([

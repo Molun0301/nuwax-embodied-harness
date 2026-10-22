@@ -32,7 +32,7 @@ class Go2ClientFactories:
 
 
 def _prepare_go2_sdk_path(config: "NuwaxRobotBridgeConfig") -> None:
-    sdk_path = str(getattr(getattr(config, "dds", None), "sdk_path", "") or "").strip()
+    sdk_path = str(config.dds.sdk_path or "").strip()
     if not sdk_path:
         return
     normalized = str(Path(sdk_path).expanduser())

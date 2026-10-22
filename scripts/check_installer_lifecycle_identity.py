@@ -96,7 +96,7 @@ class OfflineFixture(unittest.TestCase):
             self.counter += 1
             return uuid.UUID(hex=f"{self.counter:08x}" + "0" * 24)
 
-        def write_runtime(root, prefix, modules, robot, existing, *, fresh_layout):
+        def write_runtime(root, prefix, modules, robot, existing):
             (prefix / "settings.env").write_text("NUWAX_GATEWAY_HOST=127.0.0.7\nNUWAX_GATEWAY_PORT=9876\n")
             (prefix / "start.sh").write_text("#!/bin/sh\nexit 0\n")
 
@@ -322,7 +322,6 @@ class ApplyRegistrationTests(OfflineFixture):
         name = first["deployment"]["lifecycle"]["service_name"]
         self.assertEqual(name, "neh-install-00000002-0000-0000-0000-000000000000.service")
         self.assertEqual(self.uuid.call_count, 2)
-        self.assertEqual(patches["write_runtime"].call_args.kwargs["fresh_layout"], "split")
         second = self.apply(repair=True)
         self.assertEqual(second["deployment"]["lifecycle"]["service_name"], name)
         self.assertEqual(self.uuid.call_count, 3)
@@ -336,17 +335,14 @@ class ApplyRegistrationTests(OfflineFixture):
             state = self.apply(**kwargs)
             self.assertEqual(state["deployment"]["lifecycle"]["service_name"], LEGACY_NAME)
         self.assertEqual(self.uuid.call_count, 2)
-        self.assertEqual([call.kwargs["fresh_layout"] for call in patches["write_runtime"].call_args_list],
-                         ["combined", "split"])
 
-    def test_descriptor_free_upgrade_preserves_absence_and_old_layout(self):
+    def test_descriptor_free_upgrade_preserves_registration_absence(self):
         self.generation(deployment=False)
         patches = self.mock_apply()
         result = self.apply(repair=True)
         self.assertNotIn("deployment", result)
         self.assertIsNone(lifecycle.service_identifier(self.home))
         self.assertEqual(self.uuid.call_count, 1)
-        self.assertEqual(patches["write_runtime"].call_args.kwargs["fresh_layout"], "combined")
         self.apply()
         self.assertEqual(self.uuid.call_count, 1)
 

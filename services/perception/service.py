@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from copy import deepcopy
 import threading
 import time
@@ -30,6 +31,7 @@ from contracts.runtime_views import PerceptionContext, SceneObjectSummary, Scene
 from contracts.streams import StreamFrame
 from core import EventBus, StateNamespace, StateStore, StreamBus
 from core.errors import GatewayError
+from core.logging_utils import LogRateLimiter
 from core.event_bus import PreparedEventPublication
 from core.stream_bus import PreparedStreamPublication
 from providers import LocalizationProvider, PointCloudProvider
@@ -47,6 +49,9 @@ from services.perception.geometry import DetectionGeometryAugmentor
 from services.perception.observation_geometry import capture_geometry
 from services.perception.scene import SimpleSceneDescriptionBackend
 from services.perception.trackers import Basic2DTrackerBackend
+
+LOGGER = logging.getLogger("nuwax_robot_bridge.perception.service")
+_INPUT_LOG_LIMITER = LogRateLimiter()
 
 if TYPE_CHECKING:
     from contracts.image import ImageFrame
@@ -497,7 +502,7 @@ class PerceptionService:
         image_frame = self._read_latest_pushed_image(camera_id)
         if image_frame is None:
             ingest_status = self._video_frame_source_status()
-            required_source = self._resolve_required_source_id(camera_id)
+            required_source = "video_ingest_receiver"
             raise GatewayError(
                 "端侧视频推流尚未接入或尚未收到首帧，无法执行实时感知；平台不会主动采集图像帧。",
                 error_code="video_ingest_not_ready",
@@ -565,7 +570,7 @@ class PerceptionService:
         image_frame = self._read_latest_pushed_image(camera_id)
         if image_frame is None:
             ingest_status = self._video_frame_source_status()
-            required_source = self._resolve_required_source_id(camera_id)
+            required_source = "video_ingest_receiver"
             raise GatewayError(
                 "端侧视频推流尚未接入或尚未收到首帧，无法执行实时检测；平台不会主动采集图像帧。",
                 error_code="video_ingest_not_ready",
@@ -859,7 +864,9 @@ class PerceptionService:
         try:
             metadata = json.dumps(image_frame.metadata, sort_keys=True, default=lambda item: item.model_dump(mode="json"))
             calibration = camera_info.model_dump_json() if camera_info is not None else None
-        except Exception:
+        except (TypeError, ValueError, AttributeError):
+            _INPUT_LOG_LIMITER.log(LOGGER, logging.DEBUG, "帧元数据无法编码，跳过本帧缓存。",
+                                   key="fast_input_signature", interval_sec=5.0, exc_info=True)
             return None
         if len(metadata) > 8192 or not isinstance(image_frame.data, (bytes, type(None))):
             return None
@@ -917,18 +924,7 @@ class PerceptionService:
         video_frame_source = self._video_frame_source
         if video_frame_source is None:
             return None
-        getter = getattr(video_frame_source, "get_latest_image", None)
-        if not callable(getter):
-            return None
-        try:
-            image_frame = getter(camera_id)
-        except TypeError:
-            try:
-                image_frame = getter()
-            except Exception:
-                return None
-        except Exception:
-            return None
+        image_frame = video_frame_source.get_latest_image(camera_id)
         if image_frame is not None and not isinstance(image_frame, ImageFrame):
             raise TypeError("视频推流抽帧源必须返回标准 ImageFrame。")
         return image_frame
@@ -1573,40 +1569,14 @@ class PerceptionService:
         video_frame_source = self._video_frame_source
         if video_frame_source is None:
             return {"available": False, "connected": False, "reason": "video_frame_source_missing"}
-        snapshot = getattr(video_frame_source, "status_snapshot", None)
-        if not callable(snapshot):
-            return {"available": True, "connected": None, "reason": "status_snapshot_unavailable"}
         try:
-            status = snapshot()
+            status = video_frame_source.status_snapshot()
         except Exception as exc:
+            _INPUT_LOG_LIMITER.log(LOGGER, logging.ERROR, "读取视频源状态失败。",
+                                   key="video_source_status", interval_sec=5.0, exc_info=True)
             return {"available": False, "connected": False, "reason": "status_snapshot_failed", "error": str(exc)}
         return dict(status or {})
 
-    def _resolve_required_source_id(self, camera_id: Optional[str] = None) -> str:
-        """从当前 ImageProvider 拉取 `get_stream_source_id()`，作为 ingest 门禁期望的源标识。
-
-        若 platform 侧未挂 ImageProvider 或 provider 不实现该协议方法，降级返回
-        `video_ingest_receiver`（与 `image_frame.metadata.source_kind` 默认值一致），
-        保持向后兼容。cross-robot-generalization-foundations G5。
-        """
-
-        providers = getattr(self, "_image_providers", None) or {}
-        # 优先按 camera_id 命中；未命中时取第一个 provider。
-        provider = None
-        if camera_id is not None:
-            provider = providers.get(camera_id)
-        if provider is None and providers:
-            provider = next(iter(providers.values()))
-        if provider is not None:
-            get_id = getattr(provider, "get_stream_source_id", None)
-            if callable(get_id):
-                try:
-                    source_id = str(get_id() or "").strip()
-                except Exception:
-                    source_id = ""
-                if source_id:
-                    return source_id
-        return "video_ingest_receiver"
 
     def video_frame_source_status(self) -> Dict[str, Any]:
         """返回平台端侧推流接收状态，供持续感知运行时做实时性门禁。"""
@@ -1628,14 +1598,16 @@ class PerceptionService:
             try:
                 return CameraInfo(**camera_info_payload)
             except Exception:
-                return None
+                LOGGER.exception("读取或解析相机内参失败 camera=%s。", image_frame.camera_id)
+                raise
         # 标准提供器可以独立缓存内参，图像读取不必每次复制像素或元数据。
         getter = getattr(self._video_frame_source, "get_camera_info", None)
         if callable(getter):
             try:
                 camera_info = getter(image_frame.camera_id)
             except Exception:
-                return None
+                LOGGER.exception("读取或解析相机内参失败 camera=%s。", image_frame.camera_id)
+                raise
             if isinstance(camera_info, CameraInfo):
                 return camera_info
         return None
@@ -1649,39 +1621,11 @@ class PerceptionService:
         return providers
 
     def _read_live_pose_and_frame_tree(self):
-        """从实时位姿门面（几何运行时 providers）取探索期实时位姿与坐标树。
-
-        鸭子类型，与 PerceptionVideoRuntime._read_live_pose 同源：优先
-        get_exploration_pose()（探索建图时导航后端 map→base 实时 TF），回退
-        get_current_pose()（定位会话后端，仅重定位就绪后有值）；frame_tree 走
-        get_frame_tree()。任一失败返回 None，禁兜底假位姿。
-        """
-
-        from contracts.geometry import Pose
-
+        """读取提供器已解析的实时位姿和坐标树；无数据时保持空值。"""
         provider = self._live_pose_provider
         if provider is None:
             return None, None
-        pose = None
-        for getter_name in ("get_exploration_pose", "get_current_pose"):
-            getter = getattr(provider, getter_name, None)
-            if not callable(getter):
-                continue
-            try:
-                candidate = getter()
-            except Exception:
-                continue
-            if isinstance(candidate, Pose):
-                pose = candidate
-                break
-        frame_tree = None
-        frame_tree_getter = getattr(provider, "get_frame_tree", None)
-        if callable(frame_tree_getter):
-            try:
-                frame_tree = frame_tree_getter()
-            except Exception:
-                frame_tree = None
-        return pose, frame_tree
+        return provider.get_exploration_pose(), provider.get_frame_tree()
 
     def _get_point_cloud_provider_optional(self) -> Optional[PointCloudProvider]:
         providers = getattr(self._provider_owner, "providers", None)
@@ -1765,16 +1709,12 @@ class PerceptionService:
                 localization_provider = self._get_localization_provider_optional()
                 if localization_provider is not None:
                     if frame_tree is None:
-                        frame_tree_getter = getattr(localization_provider, "get_frame_tree", None)
-                        if callable(frame_tree_getter):
-                            frame_tree = frame_tree_getter()
+                        frame_tree = localization_provider.get_frame_tree()
                     if current_pose is None:
-                        pose_getter = getattr(localization_provider, "get_current_pose", None)
-                        if callable(pose_getter):
-                            current_pose = pose_getter()
+                        current_pose = localization_provider.get_current_pose()
             # P0-1：探索建图阶段定位会话尚未重定位就绪，上面流/会话源的 current_pose 恒 None，
             # 导致 map_frame_id=None、support_points_map 永不生成、下游丢失最高优先级
-            # map_point_samples 投影路径。与 PerceptionVideoRuntime._read_live_pose 同源回退到
+            # map_point_samples 投影路径。直接读取统一
             # 实时位姿门面（导航后端 map→base 实时 TF）。frame_tree 同源缺失时一并回退。
             if current_pose is None or frame_tree is None:
                 live_pose, live_frame_tree = self._read_live_pose_and_frame_tree()
@@ -1828,7 +1768,8 @@ class PerceptionService:
         try:
             return provider.get_latest_point_cloud()
         except Exception:
-            return None
+            LOGGER.exception("读取点云提供器失败。")
+            raise
 
     def _latest_stream_payload(self, topic: str):
         if self._stream_bus is None:

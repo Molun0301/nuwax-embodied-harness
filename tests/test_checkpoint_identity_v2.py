@@ -228,9 +228,6 @@ class IdentityV2Tests(unittest.TestCase):
             with patch.object(provider, "_protobuf_payload_bytes", side_effect=AssertionError("body read before metadata rejection")):
                 with self.assertRaises(ValueError):
                     provider._assigned_activation_request_proto(stored, **dict(valid, **{field: value}))
-        forged = replace(stored, checkpoint=replace(stored.checkpoint))
-        with self.assertRaisesRegex(ValueError, "admitted assigned"):
-            provider._assigned_activation_request_proto(forged, **valid)
 
     def test_same_id_retry_streams_and_reuses_input(self):
         bundle = self.bundle()
@@ -545,8 +542,10 @@ class IdentityV2Tests(unittest.TestCase):
         occupancy = dict(canonical.occupancy_asset, raw_data_sha256=b'O' * 32)
         cloud = dict(canonical.cloud_asset, xyz_sha256=b'C' * 32, payload_schema_version=1)
         backend = self.root / 'mapping_backend/voxel'
-        (backend / 'objects').mkdir(parents=True, exist_ok=True)
-        (backend / 'manifests').mkdir(exist_ok=True)
+        (backend / 'objects').mkdir(parents=True, exist_ok=True, mode=0o700)
+        (backend / 'manifests').mkdir(exist_ok=True, mode=0o700)
+        backend.chmod(0o700)
+        backend.parent.chmod(0o700)
         aliases = {'payload': '55' * 32, 'fine_archive': '66' * 32, 'dense_archive': '77' * 32}
         payloads = {'payload': bytes(self.response.payload), 'fine_archive': fine_bytes(legacy=True), 'dense_archive': dense_bytes()}
         references = {}
@@ -564,6 +563,9 @@ class IdentityV2Tests(unittest.TestCase):
         (backend / manifest_relative).write_bytes(store_module._encode_json(document))
         selector = dict(schema_version=1, backend_kind='voxel', manifest=dict(sha256=manifest_alias, path=manifest_relative))
         (backend / 'checkpoint-v1.json').write_bytes(store_module._encode_json(selector))
+        for path in backend.rglob('*'):
+            if path.is_file():
+                path.chmod(0o600)
         return backend, document
 
     def test_legacy_read_preserves_literal_aliases_and_missing_canonical_bytes(self):
@@ -636,8 +638,10 @@ class IdentityV2Tests(unittest.TestCase):
     def test_publish_does_not_overwrite_unknown_existing_artifact(self):
         bundle = self.bundle()
         backend = self.root / 'mapping_backend/voxel'
-        (backend / 'objects').mkdir(parents=True)
-        (backend / 'manifests').mkdir()
+        (backend / 'objects').mkdir(parents=True, mode=0o700)
+        (backend / 'manifests').mkdir(mode=0o700)
+        backend.chmod(0o700)
+        backend.parent.chmod(0o700)
         unknown = backend / 'objects' / ('id-' + 'b' * 32 + '.bin')
         unknown.write_bytes(fine_bytes())
         with self.assertRaisesRegex(ValueError, 'lacks its immutable descriptor'):
@@ -700,22 +704,26 @@ class IdentityV2Tests(unittest.TestCase):
                 self.assertEqual(loaded.checkpoint.checkpoint_id, 'a' * 32)
                 self.assertTrue(all(path.stat().st_nlink == 1 for path in loaded.member_paths.values()))
 
-    def test_canonical_role_budgets_fail_before_publication(self):
-        bundle = self.bundle()
+    def test_canonical_role_budgets_fail_at_native_export_boundary(self):
+        response = copy.deepcopy(self.response)
         size = 64 * 1024 * 1024 + 1
-        occupancy = dict(bundle.occupancy_asset, width=size, raw_data_size=size)
-        changed = replace(bundle.checkpoint, canonical_occupancy_data=bytes(size))
+        response.canonical_occupancy_checkpoint.meta.width = size
+        response.canonical_occupancy_checkpoint.meta.height = 1
+        response.canonical_occupancy_checkpoint.data = bytes(size)
         with self.assertRaisesRegex(ValueError, 'canonical occupancy bytes'):
-            MappingBackendCheckpointStore(self.root).publish(changed, occupancy_asset=occupancy, cloud_asset=bundle.cloud_asset)
+            self.bundle(response)
         self.assertFalse((self.root / 'mapping_backend').exists())
+        response = copy.deepcopy(self.response)
         cloud_size = (128 * 1024 * 1024 // 12 + 1) * 12
-        receipt = dict(bundle.checkpoint.cloud_receipt, point_count=cloud_size // 12)
-        changed = replace(bundle.checkpoint, canonical_cloud_xyz=bytes(cloud_size), cloud_receipt=receipt,
-            cloud_identity=replace(bundle.checkpoint.cloud_identity, cloud_receipt=receipt),
-            fine_archive=None, fine_reference=None, dense_archive=None, dense_reference=None)
-        cloud = dict(bundle.cloud_asset, xyz_size=cloud_size, point_count=cloud_size // 12)
+        response.canonical_cloud_checkpoint.xyz_f32_le = bytes(cloud_size)
+        response.canonical_cloud_checkpoint.point_count = cloud_size // 12
+        response.cloud_receipt.point_count = cloud_size // 12
+        for identity in (response.backend_identity, response.occupancy_identity,
+                         response.canonical_cloud_checkpoint.member_identity,
+                         response.fine_map_artifact.member_identity, response.dense_cloud_artifact.member_identity):
+            identity.cloud_receipt.point_count = cloud_size // 12
         with self.assertRaisesRegex(ValueError, 'canonical cloud bytes'):
-            MappingBackendCheckpointStore(self.root).publish(changed, occupancy_asset=bundle.occupancy_asset, cloud_asset=cloud)
+            self.bundle(response)
         self.assertFalse((self.root / 'mapping_backend').exists())
 
     def test_assigned_nil_ids_rejected_and_legacy_ids_stay_opaque(self):

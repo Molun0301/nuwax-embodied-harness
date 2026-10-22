@@ -52,17 +52,16 @@ class AckReuseChecks(unittest.TestCase):
         return points[0][2], counts, conflicts.call_count
 
     def test_current_legacy_missing_and_conflicting_evidence(self):
-        # Every fixture has a single current vector; expected calls include both
-        # _ack_matches and the outer conflict guard, where still required.
+        # 每个夹具仅有一个当前向量，同一捕获行的冲突判断最多执行一次。
         cases = [
             ('current', None, None, 'validated_current', True, 1),
             ('legacy-proof', 'proof_version', 1, 'legacy_unverified', True, 1),
             ('missing-proof-version', 'proof_version', None, 'legacy_unverified', True, 1),
             ('missing-publication', 'publication_id', None, 'known_stale_or_incompatible', False, 0),
-            ('revision-conflict', 'vector_revision', 'different', 'known_stale_or_incompatible', False, 2),
-            ('route-conflict', 'route', 'text_only_fallback', 'known_stale_or_incompatible', False, 2),
-            ('model-conflict', 'model_name', 'different', 'known_stale_or_incompatible', False, 2),
-            ('dimension-conflict', 'dimension', 999, 'known_stale_or_incompatible', False, 2),
+            ('revision-conflict', 'vector_revision', 'different', 'known_stale_or_incompatible', False, 1),
+            ('route-conflict', 'route', 'text_only_fallback', 'known_stale_or_incompatible', False, 1),
+            ('model-conflict', 'model_name', 'different', 'known_stale_or_incompatible', False, 1),
+            ('dimension-conflict', 'dimension', 999, 'known_stale_or_incompatible', False, 1),
         ]
         for label, field, value, status, available, calls in cases:
             with self.subTest(case=label):
@@ -85,8 +84,8 @@ class AckReuseChecks(unittest.TestCase):
             ('input_versions_json', '{}', 'legacy_unverified', True, 1),
             ('binding_json', '{}', 'legacy_unverified', True, 1),
             ('publication_id', 'different', 'known_stale_or_incompatible', False, 0),
-            ('input_versions_json', '{"changed":true}', 'known_stale_or_incompatible', False, 2),
-            ('binding_json', '{"changed":true}', 'known_stale_or_incompatible', False, 2),
+            ('input_versions_json', '{"changed":true}', 'known_stale_or_incompatible', False, 1),
+            ('binding_json', '{"changed":true}', 'known_stale_or_incompatible', False, 1),
         ]
         for field, value, status, available, calls in cases:
             with self.subTest(field=field, value=value):
@@ -159,7 +158,7 @@ class AckReuseChecks(unittest.TestCase):
         self.assertEqual(counts['validated_current'], 1)
         self.assertIn('text_dense', points[0][2].vectors)
         point, counts, calls = self.snapshot(service, record)
-        self.assertEqual(calls, 2)
+        self.assertEqual(calls, 1)
         self.assertEqual(counts['known_stale_or_incompatible'], 1)
         self.assertNotIn('text_dense', point.vectors)
 

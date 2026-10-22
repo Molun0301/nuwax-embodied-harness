@@ -1,9 +1,7 @@
-"""Offline composite sampling fences, not native-owner/atomic-snapshot proof.
+"""离线组合采样围栏，使用真实几何提供器和运行时构造。
 
-Real provider, runtime bundle and service methods run against in-memory state
-and recording protobuf stubs. Constructors, sockets, subprocesses and native
-runtime startup are outside this slice. Event barriers establish ordering;
-timeouts only bound failures and no test relies on sleeping to provoke a race.
+原生调用仅由内存消息替身提供；定位服务仍验证既有方法切片。
+不启动原生运行时、网络连接或设备。事件屏障确定顺序，超时只限制失败。
 """
 from contextlib import ExitStack
 from dataclasses import replace
@@ -12,7 +10,9 @@ import importlib.util
 from pathlib import Path
 import threading
 from types import SimpleNamespace
+import tempfile
 import unittest
+from tests.conftest import create_geometry_runtime
 from unittest.mock import patch
 
 from contracts.geometry import FrameTree, Pose, Transform, Vector3
@@ -88,7 +88,7 @@ class RecordingStub:
 
 
 def provider_fixture(*, barrier=None, error_stage=None):
-    provider = provider_module.GeometryRuntimeProvider.__new__(provider_module.GeometryRuntimeProvider)
+    provider = provider_module.GeometryRuntimeProvider(None)
     provider._map_state_lock = threading.Lock()
     provider._map_delivery_lock = threading.RLock()
     provider._map_delivery_condition = threading.Condition()
@@ -104,20 +104,20 @@ def provider_fixture(*, barrier=None, error_stage=None):
     return provider
 
 
-def runtime_fixture(backend):
-    runtime = runtime_module.PlatformGeometryRuntime.__new__(runtime_module.PlatformGeometryRuntime)
+def runtime_fixture(backend, catalog_root):
+    runtime = create_geometry_runtime(catalog_root)
     runtime._runtime_state_lock = threading.RLock()
     runtime._provider_attach_epoch = 5
     runtime._provider_attach_stopping = False
     runtime._map_asset_activation_fence = None
     runtime._remote_provider = backend
     runtime.robot = SimpleNamespace()
-    runtime.config = SimpleNamespace(enabled=True, mapping=SimpleNamespace(profile_enabled=True))
+    runtime.config.enabled = True
+    runtime.config.mapping.profile_enabled = True
     with runtime._runtime_state_lock:
         runtime._install_map_activation_snapshot_locked(
             bundle=None, bundle_root=None, activation_result={'map_name': 'room'})
-    bundle = runtime_module.PlatformGeometryProviderBundle.__new__(runtime_module.PlatformGeometryProviderBundle)
-    bundle.runtime = runtime
+    bundle = runtime_module.PlatformGeometryProviderBundle(runtime=runtime)
     return runtime, bundle
 
 
@@ -171,8 +171,8 @@ class OfflineCaptureCase(unittest.TestCase):
     def setUp(self):
         self.guard = ExitStack()
         self.addCleanup(self.guard.close)
-        for cls in (provider_module.GeometryRuntimeProvider,
-                    runtime_module.PlatformGeometryRuntime, LocalizationService):
+        self.catalog_root = self.guard.enter_context(tempfile.TemporaryDirectory(prefix='geometry-capture-'))
+        for cls in (LocalizationService,):
             self.guard.enter_context(patch.object(
                 cls, '__init__', side_effect=AssertionError('live constructor is outside this slice')))
         self.guard.enter_context(patch.object(
@@ -342,7 +342,7 @@ class ProviderCompositeCaptureTests(OfflineCaptureCase):
 class BundleCompositeCaptureTests(OfflineCaptureCase):
     def test_real_provider_composite_runs_outside_runtime_and_map_locks(self):
         provider = provider_fixture()
-        runtime, bundle = runtime_fixture(provider)
+        runtime, bundle = runtime_fixture(provider, self.catalog_root)
         provider._stub.locks.append(runtime._runtime_state_lock)
         pose, tree = bundle.capture_localization_sample()
         self.assertEqual(provider._stub.calls, ['tree', 'pose'])
@@ -351,7 +351,7 @@ class BundleCompositeCaptureTests(OfflineCaptureCase):
 
     def test_generic_backend_preserves_tree_then_pose_compatibility(self):
         backend = GenericBackend()
-        runtime, bundle = runtime_fixture(backend)
+        runtime, bundle = runtime_fixture(backend, self.catalog_root)
         backend.locks.append(runtime._runtime_state_lock)
         pose, tree = bundle.capture_localization_sample()
         self.assertIs(pose, backend.pose)
@@ -363,7 +363,7 @@ class BundleCompositeCaptureTests(OfflineCaptureCase):
             with self.subTest(raises=raises):
                 error = RuntimeError('composite rejected') if raises else None
                 backend = CompositeBackend(reject=not raises, error=error)
-                runtime, bundle = runtime_fixture(backend)
+                runtime, bundle = runtime_fixture(backend, self.catalog_root)
                 backend.locks.append(runtime._runtime_state_lock)
                 if raises:
                     with self.assertRaises(RuntimeError) as caught:
@@ -377,7 +377,7 @@ class BundleCompositeCaptureTests(OfflineCaptureCase):
         for state in ('pending', 'stopping', 'disabled', 'no_backend'):
             with self.subTest(state=state):
                 backend = CompositeBackend()
-                runtime, bundle = runtime_fixture(backend)
+                runtime, bundle = runtime_fixture(backend, self.catalog_root)
                 if state == 'pending':
                     runtime._map_asset_activation_fence = {'reason': 'pending'}
                 elif state == 'stopping':
@@ -394,7 +394,7 @@ class BundleCompositeCaptureTests(OfflineCaptureCase):
             with self.subTest(stage=stage):
                 barrier = Barrier(stage)
                 original, replacement = GenericBackend(barrier=barrier), GenericBackend()
-                runtime, bundle = runtime_fixture(original)
+                runtime, bundle = runtime_fixture(original, self.catalog_root)
                 original.locks.append(runtime._runtime_state_lock)
                 replacement.locks.append(runtime._runtime_state_lock)
 
@@ -411,7 +411,7 @@ class BundleCompositeCaptureTests(OfflineCaptureCase):
     def test_composite_backend_replacement_rejects_without_retrying_replacement(self):
         barrier = Barrier('composite')
         original, replacement = CompositeBackend(barrier=barrier), CompositeBackend()
-        runtime, bundle = runtime_fixture(original)
+        runtime, bundle = runtime_fixture(original, self.catalog_root)
         original.locks.append(runtime._runtime_state_lock)
 
         def replace_backend():
@@ -428,7 +428,7 @@ class BundleCompositeCaptureTests(OfflineCaptureCase):
                 with self.subTest(stage=stage, state=state):
                     barrier = Barrier(stage)
                     backend = (CompositeBackend if stage == 'composite' else GenericBackend)(barrier=barrier)
-                    runtime, bundle = runtime_fixture(backend)
+                    runtime, bundle = runtime_fixture(backend, self.catalog_root)
                     backend.locks.append(runtime._runtime_state_lock)
 
                     def invalidate():
@@ -454,7 +454,7 @@ class BundleCompositeCaptureTests(OfflineCaptureCase):
                 with self.subTest(stage=stage, same_generation=same_generation):
                     barrier = Barrier(stage)
                     backend = (CompositeBackend if stage == 'composite' else GenericBackend)(barrier=barrier)
-                    runtime, bundle = runtime_fixture(backend)
+                    runtime, bundle = runtime_fixture(backend, self.catalog_root)
                     backend.locks.append(runtime._runtime_state_lock)
                     original = runtime._map_activation_snapshot
 
@@ -518,7 +518,7 @@ class ServiceCompositeCaptureTests(OfflineCaptureCase):
     def test_actual_assigned_preparation_uses_composite_without_publication(self):
         fixture = assigned_service_fixture()
         provider = provider_fixture()
-        runtime, bundle = runtime_fixture(provider)
+        runtime, bundle = runtime_fixture(provider, self.catalog_root)
         provider._stub.locks.extend([runtime._runtime_state_lock, fixture.service._lock] + fixture.guards)
         calls = []
 
@@ -544,7 +544,7 @@ class ServiceCompositeCaptureTests(OfflineCaptureCase):
                 fixture = assigned_service_fixture()
                 barrier = Barrier(stage)
                 provider = provider_fixture(barrier=barrier)
-                runtime, bundle = runtime_fixture(provider)
+                runtime, bundle = runtime_fixture(provider, self.catalog_root)
                 provider._stub.locks.extend([runtime._runtime_state_lock, fixture.service._lock] + fixture.guards)
                 fixture.provider.capture_localization_sample = bundle.capture_localization_sample
 

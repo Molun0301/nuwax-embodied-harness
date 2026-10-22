@@ -298,7 +298,7 @@ class AssignedRuntimeAdoptionTests(unittest.TestCase):
             self.prepared, activation_evidence=evidence)
         self.assertEqual(receipt.to_dict()["request"], self.request)
         self.assertIs(self.runtime._map_activation_snapshot_read(), before)
-        self.assertFalse(hasattr(self.runtime, "_assigned_map_installation_origin"))
+        self.assertIsNone(self.runtime._assigned_map_installation_origin)
         self.assertIs(receipt, evidence["activation_receipt_v2"])
 
     def test_install_cas_rejects_changed_installation(self):

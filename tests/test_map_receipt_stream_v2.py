@@ -1,4 +1,5 @@
 """Offline live-map receipt admission; no RPC, hardware, or content hashes."""
+import hashlib
 import threading
 import unittest
 from unittest.mock import patch
@@ -19,7 +20,7 @@ def update(revision=1, sequence=None, data=b'\xff\x64', timestamp=11, nonce=b'N'
 
 
 def provider():
-    value = module.GeometryRuntimeProvider.__new__(module.GeometryRuntimeProvider)
+    value = module.GeometryRuntimeProvider(None)
     value._map_state_lock = threading.Lock()
     value._map_connection_epoch = 1
     value._mapping_transition_epoch = 1
@@ -32,7 +33,7 @@ def provider():
 class MapReceiptStreamTests(unittest.TestCase):
     def test_admission_without_hash_and_metadata_cached_atomically(self):
         p = provider()
-        with patch.object(module.hashlib, 'sha256', side_effect=AssertionError('application hash')):
+        with patch.object(hashlib, 'sha256', side_effect=AssertionError('application hash')):
             result = p._map_update_to_payload(update())
         grid = result['occupancy_grid']
         self.assertIsNot(grid, p._last_occupancy_grid)

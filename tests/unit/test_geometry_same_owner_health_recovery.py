@@ -1,4 +1,6 @@
 """瞬时探测失败只能复用同一Rust启动代际，不能切断既有传感器桥。"""
+from services.geometry.geometry_runtime_provider import GeometryRuntimeProvider
+from tests.conftest import geometry_runtime_factory, create_geometry_provider
 import threading
 from types import SimpleNamespace
 import pytest
@@ -25,7 +27,7 @@ def attached(monkeypatch):
     return client, source
 
 
-def test_transient_probe_reuses_provider_bound_to_existing_input_bridge(monkeypatch):
+def test_transient_probe_reuses_provider_bound_to_existing_input_bridge(geometry_runtime_factory, monkeypatch):
     client, source = attached(monkeypatch)
     class Provider:
         is_connected = True
@@ -37,7 +39,7 @@ def test_transient_probe_reuses_provider_bound_to_existing_input_bridge(monkeypa
             return True
     provider = Provider()
     bridge = RuntimeInputBridge(runtime_provider=provider)
-    runtime = object.__new__(PlatformGeometryRuntime)
+    runtime = geometry_runtime_factory()
     runtime._runtime_state_lock = threading.RLock()
     runtime._provider_attach_lock = threading.RLock()
     runtime._runtime_started = True

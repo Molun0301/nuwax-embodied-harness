@@ -1,5 +1,6 @@
 """Recovered offline checkpoint regressions. No historical test result applies to these bytes."""
 
+from tests.conftest import create_geometry_runtime
 from tests.conftest import (fine_bytes, dense_bytes, response_fixture, TransferStub, runtime)
 import copy
 import hashlib
@@ -261,7 +262,7 @@ class IdentityV2Tests(unittest.TestCase):
 
     def test_v2_pcd_materialization_streams_retained_cloud_member(self):
         from services.geometry.runtime import PlatformGeometryRuntime
-        instance = PlatformGeometryRuntime.__new__(PlatformGeometryRuntime)
+        instance = create_geometry_runtime(self.root)
         instance._pcd_min_points = lambda: 1
         instance._is_usable_pcd_file = lambda path: path.is_file()
         bundle = self.bundle()
@@ -280,7 +281,7 @@ class IdentityV2Tests(unittest.TestCase):
     def test_v2_native_database_uses_assigned_identity_column(self):
         import sqlite3
         from services.geometry.runtime import PlatformGeometryRuntime
-        instance = PlatformGeometryRuntime.__new__(PlatformGeometryRuntime)
+        instance = create_geometry_runtime(self.root)
         bundle = SimpleNamespace(map_name='map', frame_id='map', timestamp=datetime.now(timezone.utc),
             snapshot=SimpleNamespace(source_epoch='source:3', update_sequence=6, source_name='geometry', frame_id='map'))
         target = self.root / 'native.db'
@@ -304,7 +305,7 @@ class IdentityV2Tests(unittest.TestCase):
         from contracts.map_workspace import MapAssetBundle
         from contracts.runtime_views import MapSnapshot
         from services.geometry.runtime import PlatformGeometryRuntime
-        instance = PlatformGeometryRuntime.__new__(PlatformGeometryRuntime)
+        instance = create_geometry_runtime(self.root)
         instance.config = PlatformGeometryConfig()
         context = dict(active=True, session_id='source', session_generation=3, map_name='map',
                        mapping_backend_kind='voxel', revision=6)

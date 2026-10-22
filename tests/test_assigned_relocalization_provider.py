@@ -81,10 +81,9 @@ class FakeStub:
 
 
 def client(stub):
-    value = module.GeometryRuntimeProvider.__new__(module.GeometryRuntimeProvider)
+    value = module.GeometryRuntimeProvider(None)
     value._connected = True
     value._stub = stub
-    value._raise_if_stopping = lambda operation: None
     return value
 
 
@@ -337,10 +336,10 @@ class AssignedRelocalizationProviderTests(unittest.TestCase):
             value = client(stub)
             kwargs = dict(activation_state=state_payload(available=True), request_id='reloc:exact',
                           logical_timeout_ms=30000, assigned_request_v2=request_owner())
-            value._raise_if_stopping = lambda operation: (_ for _ in ()).throw(RuntimeError('stopping'))
-            with self.assertRaisesRegex(RuntimeError, 'stopping'):
+            value._stopping = True
+            with self.assertRaisesRegex(RuntimeError, 'shutting_down'):
                 getattr(value, name)(**kwargs)
-            value._raise_if_stopping = lambda operation: None
+            value._stopping = False
             value._connected = False
             with self.assertRaises(RuntimeError):
                 getattr(value, name)(**kwargs)

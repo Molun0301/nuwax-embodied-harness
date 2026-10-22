@@ -1,4 +1,6 @@
 """Source-only receipt propagation regressions; no native/runtime device needed."""
+from tests.conftest import create_geometry_runtime
+import tempfile
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,8 +43,10 @@ def metadata(receipt):
             'update_sequence': receipt['provenance']['occupancy_revision'], 'raw_representation': 2}
 
 
-def runtime():
-    value = object.__new__(PlatformGeometryRuntime)
+def runtime(test_case):
+    directory = tempfile.TemporaryDirectory(prefix="geometry-receipt-")
+    test_case.addCleanup(directory.cleanup)
+    value = create_geometry_runtime(directory.name)
     value.config = NS(stack='test', mapping=NS(occupancy_projection='test', timestamp_quality=NS(max_tf_age_sec=1)),
                       navigation=NS(costmap_source='test'), build_metadata=lambda: {})
     value._build_parameter_summary = lambda: {}
@@ -101,7 +105,7 @@ class RuntimeReceiptTests(unittest.TestCase):
             _live_map_layer_descriptor(grid(identity()), mapping_identity_override=('other', 'test-map', 3))
 
     def test_runtime_preserves_actual_revision_composite_source_time_and_bytes(self):
-        value = runtime()
+        value = runtime(self)
         cost = CostMap(map_id='test-map', frame_id='map', width=2, height=1, resolution_m=.1,
                        origin=Pose(frame_id='map'), data=[1., 2.])
         layer = grid(identity())
@@ -125,7 +129,7 @@ class RuntimeReceiptTests(unittest.TestCase):
                 live_status={}, seed_bundle=None, mapping_context={})
 
     def test_tracker_distinguishes_receipt_progress_from_physical_change(self):
-        value = runtime()
+        value = runtime(self)
         now = datetime.now(timezone.utc).isoformat()
         def observe(receipt, count, changed):
             value._update_stream_tracker({'occupancy_message_count': count, 'latest_occupancy_timestamp': now,
@@ -225,7 +229,7 @@ class MappingReceiptTests(unittest.TestCase):
 
     def test_provider_push_and_runtime_poll_share_the_same_identity(self):
         accepted = self.admit()
-        snapshot = live_snapshot(runtime())
+        snapshot = live_snapshot(runtime(self))
         snapshot._source_owner_id = id(self.owner)
         self.owner.get_map_snapshot = lambda: snapshot
         with patch.object(mapping, '_capture_map_layer', side_effect=AssertionError('trusted refresh copied')):

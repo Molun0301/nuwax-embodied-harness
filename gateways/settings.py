@@ -179,8 +179,6 @@ class SettingsApplication:
 
     def _apply_hot(self, values, keys):
         from core import settings
-        if not hasattr(self.runtime, "config"):
-            return []
         requested = set(keys) & (set(HOT_FIELDS) | HOT_LOG_KEYS)
         if not requested:
             return []

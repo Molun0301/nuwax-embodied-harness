@@ -112,13 +112,12 @@ class TransferStub:
 
 
 def runtime(stub):
-    instance = fixture_provider.GeometryRuntimeProvider.__new__(fixture_provider.GeometryRuntimeProvider)
+    instance = fixture_provider.GeometryRuntimeProvider(None)
     instance._connected = True
     instance._stub = stub
     instance._map_state_lock = threading.Lock()
     instance._stopping = False
     instance._map_connection_epoch = 1
-    instance._raise_if_stopping = lambda *args: None
     return instance
 
 
@@ -219,6 +218,42 @@ class LoaderStub(TransferStub):
         if request.action == 5 and self.cleanup_error:
             raise RuntimeError('release unavailable')
         return super().TransferGraphArtifact(request, timeout)
+
+
+def create_geometry_runtime(catalog_root, **attributes):
+    """真实构造几何拥有方，只替换被测边界的输入和外部读取。"""
+    from types import SimpleNamespace
+    from contracts.geometry_runtime import PlatformGeometryConfig
+    from services.geometry.runtime import PlatformGeometryRuntime
+
+    instance = PlatformGeometryRuntime(
+        config=PlatformGeometryConfig(), catalog_root=str(catalog_root),
+        robot=SimpleNamespace(providers=SimpleNamespace()),
+    )
+    for name, value in attributes.items():
+        setattr(instance, name, value)
+    return instance
+
+
+def create_geometry_provider(*, is_connected, connection_generation=0, **attributes):
+    """真实构造提供器，按用例设置连接状态和远程输入。"""
+    instance = fixture_provider.GeometryRuntimeProvider(None)
+    instance._connected = is_connected
+    instance._map_connection_epoch = connection_generation
+    for name, value in attributes.items():
+        setattr(instance, name, value)
+    return instance
+
+
+@pytest.fixture
+def geometry_runtime_factory(tmp_path):
+    from itertools import count
+    sequence = count()
+
+    def create(**attributes):
+        return create_geometry_runtime(tmp_path / f"geometry-{next(sequence)}", **attributes)
+
+    return create
 
 
 def isolated_gateway_config(tmp_path):

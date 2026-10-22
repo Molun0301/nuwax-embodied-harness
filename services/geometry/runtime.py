@@ -436,34 +436,19 @@ class _SubscriptionDeliveryTicket:
     active_threads: Dict[int, int] = field(default_factory=dict)
 
 
-def _remote_is_connected(remote: object) -> bool:
-    try:
-        connected = getattr(remote, "is_connected", False)
-        if callable(connected):
-            connected = connected()
-        return bool(connected)
-    except Exception:
-        return False
+def _remote_is_connected(remote: Optional[GeometryRuntimeProvider]) -> bool:
+    return remote is not None and remote.is_connected
 
 
-def _remote_connection_generation(remote: object) -> Optional[int]:
-    try:
-        generation = getattr(remote, "connection_generation", None)
-        if callable(generation):
-            generation = generation()
-        return int(generation) if generation is not None else None
-    except (TypeError, ValueError):
-        return None
+def _remote_connection_generation(remote: Optional[GeometryRuntimeProvider]) -> Optional[int]:
+    return remote.connection_generation if remote is not None else None
 
 
 def _cancel_remote_stream_handle(handle, *, stream_name: str) -> bool:
     if handle is None:
         return True
-    cancel = getattr(handle, "cancel", None)
-    if not callable(cancel):
-        return True
     try:
-        result = cancel()
+        result = handle.cancel()
         return result is not False
     except Exception:
         LOGGER.exception("取消远端 %s stream handle 失败。", stream_name)
@@ -474,9 +459,8 @@ def _capture_remote_operation_token_locked(
     runtime: object,
     remote: object,
 ) -> Optional[_RemoteOperationToken]:
-    if hasattr(runtime, "_remote_provider"):
-        if getattr(runtime, "_remote_provider", None) is not remote:
-            return None
+    if runtime._remote_provider is not remote:
+        return None
     if not _remote_is_connected(remote):
         return None
     return remote, _remote_connection_generation(remote)
@@ -489,9 +473,8 @@ def _remote_operation_token_is_current_locked(
     if token is None:
         return False
     remote, generation = token
-    if hasattr(runtime, "_remote_provider"):
-        if getattr(runtime, "_remote_provider", None) is not remote:
-            return False
+    if runtime._remote_provider is not remote:
+        return False
     return bool(
         _remote_is_connected(remote)
         and _remote_connection_generation(remote) == generation
@@ -529,37 +512,13 @@ def _is_complete_exploration_terminal(
     )
 
 
-def _restore_mapping_session_mode_locked(runtime: object) -> None:
-    mapping_context = None
-    context_known = hasattr(runtime, "_mapping_session_context")
-    reader = getattr(runtime, "get_mapping_session_context", None)
-    if callable(reader):
-        context_known = True
-        try:
-            mapping_context = reader()
-        except Exception:
-            LOGGER.exception(
-                "读取 mapping session context 失败；保留当前 session mode。"
-            )
-            return
-    elif context_known:
-        mapping_context = getattr(runtime, "_mapping_session_context", None)
-    if context_known:
-        setattr(
-            runtime,
-            "_external_geometry_session_mode",
-            "mapping"
-            if isinstance(mapping_context, dict) and mapping_context.get("active")
-            else None,
-        )
-
-
-def _remote_exploration_owner_lock(runtime: object):
-    return getattr(
-        runtime,
-        "_remote_exploration_ownership_lock",
-        getattr(runtime, "_exploration_loop_lock"),
+def _restore_mapping_session_mode_locked(runtime: "PlatformGeometryRuntime") -> None:
+    mapping_context = runtime.get_mapping_session_context()
+    runtime._external_geometry_session_mode = (
+        "mapping" if mapping_context is not None and mapping_context.get("active") else None
     )
+
+
 
 
 def _commit_remote_exploration_state_locked(
@@ -569,7 +528,7 @@ def _commit_remote_exploration_state_locked(
     request_id: str,
     request: Optional[ExploreAreaRequest] = None,
 ) -> bool:
-    with _remote_exploration_owner_lock(runtime):
+    with runtime._remote_exploration_ownership_lock:
         return _commit_remote_exploration_state_under_owner_lock(
             runtime,
             state,
@@ -602,7 +561,7 @@ def _commit_remote_exploration_state_under_owner_lock(
     if has_terminal_status and not terminal and not child_task_id:
         return False
 
-    current = getattr(runtime, "_external_exploration_request", None)
+    current = runtime._external_exploration_request
     current_id = str(getattr(current, "request_id", "") or "").strip()
     if request is None:
         if current_id != expected_id:
@@ -617,11 +576,7 @@ def _commit_remote_exploration_state_under_owner_lock(
         _restore_mapping_session_mode_locked(runtime)
     else:
         if request is not None:
-            active_request = (
-                request.model_copy(deep=True)
-                if hasattr(request, "model_copy")
-                else request
-            )
+            active_request = request.model_copy(deep=True)
             setattr(runtime, "_external_exploration_request", active_request)
         setattr(runtime, "_external_exploration_terminal_state", None)
         setattr(runtime, "_external_geometry_session_mode", "explore")
@@ -682,6 +637,9 @@ class PlatformGeometryRuntime:
         self._catalog_root.mkdir(parents=True, exist_ok=True)
         self._runtime_state_lock = threading.RLock()
         self._map_asset_activation_fence = None
+        self._workspace_map_name: Optional[str] = None
+        self._assigned_map_installation_origin = None
+        self._last_validated_live_map_cache: Optional[_ValidatedLiveMapCache] = None
         self._map_asset_activation_snapshot_read_state = threading.local()
         self._map_activation_snapshot = _MapActivationSnapshot(
             bundle=None,
@@ -745,29 +703,6 @@ class PlatformGeometryRuntime:
         self._external_geometry_session_mode: Optional[str] = None
         self.providers = PlatformGeometryProviderBundle(self)
 
-    def _ensure_subscription_delivery_state(self) -> threading.Condition:
-        """Lazily support tests and compatibility shims built via object.__new__."""
-
-        condition = getattr(self, "_subscription_delivery_condition", None)
-        if condition is not None:
-            return condition
-        bootstrap_lock = getattr(
-            self,
-            "_provider_attach_lock",
-            getattr(self, "_runtime_state_lock", threading.RLock()),
-        )
-        with bootstrap_lock:
-            condition = getattr(
-                self,
-                "_subscription_delivery_condition",
-                None,
-            )
-            if condition is None:
-                condition = threading.Condition()
-                self._subscription_delivery_condition = condition
-                self._subscription_delivery_tickets = {}
-                self._next_subscription_delivery_ticket_id = 1
-        return condition
 
     def _new_subscription_delivery_ticket(
         self,
@@ -778,7 +713,7 @@ class PlatformGeometryRuntime:
         provider: Optional[object],
         provider_generation: Optional[int] = None,
     ) -> _SubscriptionDeliveryTicket:
-        condition = self._ensure_subscription_delivery_state()
+        condition = self._subscription_delivery_condition
         with condition:
             ticket_id = int(self._next_subscription_delivery_ticket_id)
             self._next_subscription_delivery_ticket_id = ticket_id + 1
@@ -811,7 +746,7 @@ class PlatformGeometryRuntime:
         *,
         subscription_id: Optional[int] = None,
     ) -> bool:
-        condition = self._ensure_subscription_delivery_state()
+        condition = self._subscription_delivery_condition
         with condition:
             if (
                 ticket.invalidated
@@ -834,7 +769,7 @@ class PlatformGeometryRuntime:
     ) -> Tuple[_SubscriptionDeliveryTicket, ...]:
         """Invalidate matching tickets while the caller owns runtime locks."""
 
-        condition = self._ensure_subscription_delivery_state()
+        condition = self._subscription_delivery_condition
         invalidated = []
         with condition:
             for ticket_id, ticket in tuple(
@@ -860,11 +795,11 @@ class PlatformGeometryRuntime:
         self,
         ticket: _SubscriptionDeliveryTicket,
     ) -> bool:
-        if bool(getattr(self, "_provider_attach_stopping", False)):
+        if bool(self._provider_attach_stopping):
             return False
         if (
             ticket.provider is not None
-            and getattr(self, "_remote_provider", None) is not ticket.provider
+            and self._remote_provider is not ticket.provider
         ):
             return False
         if (
@@ -917,12 +852,8 @@ class PlatformGeometryRuntime:
         self,
         ticket: _SubscriptionDeliveryTicket,
     ) -> bool:
-        provider_attach_lock = getattr(
-            self,
-            "_provider_attach_lock",
-            self._runtime_state_lock,
-        )
-        condition = self._ensure_subscription_delivery_state()
+        provider_attach_lock = self._provider_attach_lock
+        condition = self._subscription_delivery_condition
         with provider_attach_lock:
             if not self._subscription_delivery_identity_is_current_locked(
                 ticket
@@ -949,7 +880,7 @@ class PlatformGeometryRuntime:
         self,
         ticket: _SubscriptionDeliveryTicket,
     ) -> None:
-        condition = self._ensure_subscription_delivery_state()
+        condition = self._subscription_delivery_condition
         thread_id = threading.get_ident()
         with condition:
             ticket.active_count = max(0, ticket.active_count - 1)
@@ -964,7 +895,7 @@ class PlatformGeometryRuntime:
         self,
         ticket: _SubscriptionDeliveryTicket,
     ) -> None:
-        condition = self._ensure_subscription_delivery_state()
+        condition = self._subscription_delivery_condition
         with condition:
             ticket.invalidated = True
             ticket.published = False
@@ -1005,7 +936,7 @@ class PlatformGeometryRuntime:
     ) -> None:
         if not tickets:
             return
-        condition = self._ensure_subscription_delivery_state()
+        condition = self._subscription_delivery_condition
         current_thread_id = threading.get_ident()
         with condition:
             while any(
@@ -1074,10 +1005,7 @@ class PlatformGeometryRuntime:
         _exploration_deadline_remaining(deadline_monotonic, "GetStatus")
         if provider is None:
             return None
-        connected = getattr(provider, "is_connected", None)
-        if callable(connected):
-            connected = connected()
-        if not bool(connected):
+        if not provider.is_connected:
             return None
         return provider
 
@@ -1146,11 +1074,7 @@ class PlatformGeometryRuntime:
     def stop(self) -> None:
         """停止平台几何运行时。"""
 
-        provider_attach_lock = getattr(
-            self,
-            "_provider_attach_lock",
-            self._runtime_state_lock,
-        )
+        provider_attach_lock = self._provider_attach_lock
         delivery_tickets = ()
         with provider_attach_lock:
             with self._runtime_state_lock:
@@ -1208,44 +1132,35 @@ class PlatformGeometryRuntime:
 
 
     def get_mapping_session_context(self) -> Optional[Dict[str, object]]:
-        lock = getattr(self, "_mapping_lifecycle_lock", None)
-        if lock is None:
-            return None
-        with lock:
-            context = getattr(self, "_mapping_session_context", None)
+        with self._mapping_lifecycle_lock:
+            context = self._mapping_session_context
             return _mapping_state_document(context) if isinstance(context, dict) else None
 
     def get_authoritative_mapping_session_state(self) -> Dict[str, object]:
         """Read mapping state from one pinned, still-current remote provider."""
 
-        self._ensure_mapping_lifecycle_fields()
         with self._mapping_lifecycle_lock:
-            provider = getattr(self, "_remote_provider", None)
-            attach_epoch = int(getattr(self, "_provider_attach_epoch", 0))
+            provider = self._remote_provider
+            attach_epoch = int(self._provider_attach_epoch)
             if (
                 provider is None
-                or bool(getattr(self, "_provider_attach_stopping", False))
+                or bool(self._provider_attach_stopping)
                 or not _remote_is_connected(provider)
             ):
                 raise RuntimeError(
                     "权威 mapping session 状态暂不可用；geometry provider 未连接，请重试。"
                 )
-            state_reader = getattr(provider, "get_mapping_state", None)
-            if not callable(state_reader):
-                raise RuntimeError(
-                    "权威 mapping session 状态暂不可用；provider 未实现 GetMappingState，请重试。"
-                )
             try:
-                state = state_reader()
+                state = provider.get_mapping_state()
             except Exception as exc:
                 raise RuntimeError(
                     "读取权威 mapping session 状态失败，请重试。"
                 ) from exc
             if (
-                provider is not getattr(self, "_remote_provider", None)
+                provider is not self._remote_provider
                 or attach_epoch
-                != int(getattr(self, "_provider_attach_epoch", 0))
-                or bool(getattr(self, "_provider_attach_stopping", False))
+                != int(self._provider_attach_epoch)
+                or bool(self._provider_attach_stopping)
                 or not _remote_is_connected(provider)
             ):
                 raise RuntimeError(
@@ -1263,13 +1178,12 @@ class PlatformGeometryRuntime:
         resolved_name = str(map_name or "").strip()
         if not resolved_name:
             raise ValueError("地图工作区名称不能为空。")
-        self._ensure_mapping_lifecycle_fields()
         with self._mapping_lifecycle_lock:
-            provider = getattr(self, "_remote_provider", None)
+            provider = self._remote_provider
             context = self._mapping_session_context
             if provider is not None and _remote_is_connected(provider):
                 context = self.get_authoritative_mapping_session_state()
-                attach_epoch = int(getattr(self, "_provider_attach_epoch", 0))
+                attach_epoch = int(self._provider_attach_epoch)
                 phase = str(context.get("phase") or "").upper()
                 if (
                     context.get("success") is not True
@@ -1329,8 +1243,8 @@ class PlatformGeometryRuntime:
                             raise RuntimeError("切换工作区未确认原建图会话的停止终态。")
                         context = stopped
                 if (
-                    provider is not getattr(self, "_remote_provider", None)
-                    or attach_epoch != int(getattr(self, "_provider_attach_epoch", 0))
+                    provider is not self._remote_provider
+                    or attach_epoch != int(self._provider_attach_epoch)
                     or not _remote_is_connected(provider)
                 ):
                     raise RuntimeError("切换地图期间提供器已更换，不能提交旧拥有方的状态。")
@@ -1350,13 +1264,13 @@ class PlatformGeometryRuntime:
         """失败后恢复实际目录选择；已停止的建图会话保持真实终态。"""
 
         with self._runtime_state_lock:
-            if getattr(self, "_workspace_map_name", None) == expected_map_name:
+            if self._workspace_map_name == expected_map_name:
                 self._workspace_map_name = str(map_name or "").strip() or None
 
     def is_map_snapshot_source_current(self, *, map_name: str, metadata) -> bool:
         """沿已有工作区、会话和代次验证来源，不重写外部快照身份。"""
 
-        selected_name = getattr(self, "_workspace_map_name", None)
+        selected_name = self._workspace_map_name
         source = metadata if isinstance(metadata, dict) else {}
         source_activation_generation = source.get("map_activation_generation")
         if not selected_name and source_activation_generation is None:
@@ -1371,7 +1285,7 @@ class PlatformGeometryRuntime:
             bundle = activation.bundle
             expected_name = bundle.map_name if bundle is not None else selected_name
             current_identity = _mapping_context_snapshot_token(
-                getattr(self, "_mapping_session_context", None)
+                self._mapping_session_context
             )[:3]
         if str(map_name or "").strip() != expected_name:
             return False
@@ -1404,7 +1318,7 @@ class PlatformGeometryRuntime:
 
         errors: List[str] = []
         runtime_binary = str(
-            getattr(self.config, "runtime_binary", "")
+            self.config.runtime_binary
             or getattr(self.config.external, "binary_path", "")
             or ""
         ).strip()
@@ -1483,11 +1397,7 @@ class PlatformGeometryRuntime:
         if self._geometry_runtime_subprocess is not None:
             self._geometry_runtime_subprocess.stop()
             self._geometry_runtime_subprocess = None
-        provider_attach_lock = getattr(
-            self,
-            "_provider_attach_lock",
-            self._runtime_state_lock,
-        )
+        provider_attach_lock = self._provider_attach_lock
         delivery_tickets = ()
         navigation_subscription_ids = ()
         exploration_subscription_id = None
@@ -1567,18 +1477,17 @@ class PlatformGeometryRuntime:
             # 一次短暂GetStatus失败可能只清除了attach探测状态。先复核同一Rust启动代际，
             # 保留输入桥正在使用的provider，避免关闭旧引用后仅重挂输出流造成永久断流。
             current_provider = self.get_geometry_runtime_provider()
-            recover = getattr(self._geometry_runtime_subprocess, "recover_same_runtime", None)
-            if (current_provider is not None and not getattr(current_provider, "_stopping", False)
-                    and not getattr(self, "_provider_attach_stopping", False) and callable(recover)):
-                if recover():
-                    with getattr(self, "_provider_attach_lock", self._runtime_state_lock):
+            if (current_provider is not None and not current_provider._stopping
+                    and not self._provider_attach_stopping):
+                if self._geometry_runtime_subprocess.recover_same_runtime():
+                    with self._provider_attach_lock:
                         if (self.get_geometry_runtime_provider() is current_provider
-                                and not getattr(current_provider, "_stopping", False)
-                                and not getattr(self, "_provider_attach_stopping", False)
-                                and getattr(self, "_runtime_started", True)):
+                                and not current_provider._stopping
+                                and not self._provider_attach_stopping
+                                and self._runtime_started):
                             LOGGER.info("Geometry同一启动代际健康恢复，保留现有provider与输入订阅")
                             return
-                        if getattr(self, "_provider_attach_stopping", False) or not getattr(self, "_runtime_started", True):
+                        if self._provider_attach_stopping or not self._runtime_started:
                             return
             LOGGER.warning("canonical geometry runtime 已失联，清理 Python attach handle")
             try:
@@ -1587,13 +1496,13 @@ class PlatformGeometryRuntime:
                 LOGGER.warning("zombie bridge.stop 失败（不影响主流程）: %s", exc)
             self._geometry_runtime_subprocess = None
         bridge = GeometryRuntimeSubprocess(
-            binary_path=str(getattr(self.config, "runtime_binary", "") or "") or None,
-            port=max(1, int(getattr(self.config, "runtime_port", 50051) or 50051)),
+            binary_path=str(self.config.runtime_binary or "") or None,
+            port=max(1, int(self.config.runtime_port or 50051)),
         )
         if not bridge.start():
             LOGGER.warning("canonical geometry runtime 挂接失败: %s", bridge.last_error)
             self._record_runtime_diagnostic("geometry_runtime_attach", bridge.last_error or "挂接失败")
-            if bridge.is_running is False and getattr(bridge, "_attached", False):
+            if bridge.is_running is False and bridge._attached:
                 LOGGER.warning("bridge.attach 残留状态异常，主动清空本地 handle")
                 try:
                     bridge.disconnect()
@@ -1607,17 +1516,16 @@ class PlatformGeometryRuntime:
     def _replay_active_mapping_session_after_attach(self) -> bool:
         """Restore an active Rust mapping session on the current provider."""
 
-        self._ensure_mapping_lifecycle_fields()
         try:
             with self._mapping_lifecycle_lock:
                 context = self._mapping_session_context
                 if not isinstance(context, dict) or not bool(context.get("active")):
                     return False
 
-                provider = getattr(self, "_remote_provider", None)
+                provider = self._remote_provider
                 if not _remote_is_connected(provider):
                     return False
-                attach_epoch = int(getattr(self, "_provider_attach_epoch", 0))
+                attach_epoch = int(self._provider_attach_epoch)
                 if (
                     self._mapping_session_provider_attach_epoch == attach_epoch
                 ):
@@ -1630,12 +1538,7 @@ class PlatformGeometryRuntime:
                         "ACTIVE mapping context 缺少 session_id/map_name，拒绝隐式创建会话。"
                     )
 
-                start_rpc = getattr(provider, "start_mapping", None)
-                if not callable(start_rpc):
-                    raise RuntimeError(
-                        "GeometryRuntimeProvider 未实现 StartMapping RPC。"
-                    )
-                response = start_rpc(
+                response = provider.start_mapping(
                     session_id=session_id,
                     map_name=map_name,
                 )
@@ -1650,10 +1553,10 @@ class PlatformGeometryRuntime:
                         "StartMapping 重放未确认匹配的 ACTIVE Rust 会话。"
                     )
                 if (
-                    provider is not getattr(self, "_remote_provider", None)
+                    provider is not self._remote_provider
                     or not _remote_is_connected(provider)
                     or attach_epoch
-                    != int(getattr(self, "_provider_attach_epoch", 0))
+                    != int(self._provider_attach_epoch)
                 ):
                     return False
 
@@ -1674,9 +1577,7 @@ class PlatformGeometryRuntime:
             )
             return True
         except Exception as exc:
-            recorder = getattr(self, "_record_runtime_diagnostic", None)
-            if callable(recorder):
-                recorder("mapping_session_replay", exc)
+            self._record_runtime_diagnostic("mapping_session_replay", exc)
             LOGGER.warning("geometry mapping session 自动恢复失败: %s", exc)
             return False
 
@@ -1690,11 +1591,7 @@ class PlatformGeometryRuntime:
     ) -> None:
         """Best-effort rollback for a prepared or partially committed provider."""
 
-        provider_attach_lock = getattr(
-            self,
-            "_provider_attach_lock",
-            self._runtime_state_lock,
-        )
+        provider_attach_lock = self._provider_attach_lock
         delivery_tickets = ()
         try:
             with provider_attach_lock:
@@ -1716,24 +1613,12 @@ class PlatformGeometryRuntime:
 
         if exploration_subscription_id is not None:
             try:
-                unsubscribe = getattr(
-                    provider,
-                    "unsubscribe_exploration_updates",
-                    None,
-                )
-                if callable(unsubscribe):
-                    unsubscribe(exploration_subscription_id)
+                provider.unsubscribe_exploration_updates(exploration_subscription_id)
             except Exception:
                 LOGGER.exception("回滚 geometry exploration subscription 失败。")
         for subscription_id in reversed(tuple(navigation_subscription_ids or ())):
             try:
-                unsubscribe = getattr(
-                    provider,
-                    "unsubscribe_navigation_updates",
-                    None,
-                )
-                if callable(unsubscribe):
-                    unsubscribe(subscription_id)
+                provider.unsubscribe_navigation_updates(subscription_id)
             except Exception:
                 LOGGER.exception(
                     "回滚 geometry navigation subscription=%s 失败。",
@@ -1752,7 +1637,7 @@ class PlatformGeometryRuntime:
         except Exception:
             LOGGER.exception("geometry provider disconnect 回滚失败，强制清理 channel。")
 
-        channel = getattr(provider, "_channel", None)
+        channel = provider._channel
         if channel is not None:
             try:
                 channel.close()
@@ -1775,23 +1660,18 @@ class PlatformGeometryRuntime:
     ) -> bool:
         """为已由 canonical owner 启动的 sidecar 建立 provider 与流订阅。"""
 
-        provider_attach_lock = getattr(
-            self,
-            "_provider_attach_lock",
-            self._runtime_state_lock,
-        )
+        provider_attach_lock = self._provider_attach_lock
         with provider_attach_lock:
             with self._runtime_state_lock:
                 if (
-                    bool(getattr(self, "_provider_attach_stopping", False))
+                    bool(self._provider_attach_stopping)
                     or (
-                        hasattr(self, "_runtime_started")
-                        and not self._runtime_started
+                        not self._runtime_started
                     )
                 ):
                     return False
                 attach_epoch = int(
-                    getattr(self, "_provider_attach_epoch", 0)
+                    self._provider_attach_epoch
                 ) + 1
                 self._provider_attach_epoch = attach_epoch
                 navigation_subscribers = tuple(
@@ -1801,17 +1681,9 @@ class PlatformGeometryRuntime:
                     self._remote_navigation_subscription_ids.values()
                 )
                 previous_stream_handles = tuple(
-                    getattr(
-                        self,
-                        "_remote_localization_subscription_handles",
-                        {},
-                    ).values()
+                    self._remote_localization_subscription_handles.values()
                 ) + tuple(
-                    getattr(
-                        self,
-                        "_remote_map_subscription_handles",
-                        {},
-                    ).values()
+                    self._remote_map_subscription_handles.values()
                 )
             with self._exploration_loop_lock:
                 previous_provider = self._remote_provider
@@ -1821,12 +1693,8 @@ class PlatformGeometryRuntime:
                 needs_exploration_subscription = bool(
                     self._exploration_update_subscribers
                 )
-            localization_registry = getattr(
-                self,
-                "_localization_update_subscribers",
-                {},
-            )
-            map_registry = getattr(self, "_map_update_subscribers", {})
+            localization_registry = self._localization_update_subscribers
+            map_registry = self._map_update_subscribers
             localization_subscribers = (
                 tuple(localization_registry.items())
                 if localization_registry
@@ -1855,14 +1723,13 @@ class PlatformGeometryRuntime:
         def attach_is_current() -> bool:
             with self._runtime_state_lock:
                 return bool(
-                    int(getattr(self, "_provider_attach_epoch", 0))
+                    int(self._provider_attach_epoch)
                     == attach_epoch
                     and not bool(
-                        getattr(self, "_provider_attach_stopping", False)
+                        self._provider_attach_stopping
                     )
                     and (
-                        not hasattr(self, "_runtime_started")
-                        or self._runtime_started
+                        self._runtime_started
                     )
                 )
 
@@ -2009,16 +1876,8 @@ class PlatformGeometryRuntime:
                     exploration_need_unchanged = bool(
                         self._exploration_update_subscribers
                     ) == needs_exploration_subscription
-                current_localization_registry = getattr(
-                    self,
-                    "_localization_update_subscribers",
-                    {},
-                )
-                current_map_registry = getattr(
-                    self,
-                    "_map_update_subscribers",
-                    {},
-                )
+                current_localization_registry = self._localization_update_subscribers
+                current_map_registry = self._map_update_subscribers
                 callbacks_unchanged = bool(
                     (
                         tuple(current_localization_registry.items())
@@ -2101,7 +1960,7 @@ class PlatformGeometryRuntime:
                                         self._remote_navigation_subscription_ids = {}
                     except Exception:
                         LOGGER.exception("强制清除半提交 geometry provider owner 失败。")
-                    channel = getattr(provider, "_channel", None)
+                    channel = provider._channel
                     if channel is not None:
                         try:
                             channel.close()
@@ -2177,15 +2036,15 @@ class PlatformGeometryRuntime:
 
     def _monitor_processes_once(self) -> None:
         if (
-            bool(getattr(self, "_runtime_started", False))
+            bool(self._runtime_started)
             and self._is_geometry_profile_enabled()
         ):
-            bridge = getattr(self, "_geometry_runtime_subprocess", None)
-            provider = getattr(self, "_remote_provider", None)
+            bridge = self._geometry_runtime_subprocess
+            provider = self._remote_provider
             bridge_alive = bool(bridge is not None and bridge.is_running)
             if not bridge_alive or not _remote_is_connected(provider):
                 self._start_geometry_runtime_subprocess()
-                provider = getattr(self, "_remote_provider", None)
+                provider = self._remote_provider
             if _remote_is_connected(provider):
                 self._replay_active_mapping_session_after_attach()
 
@@ -2542,7 +2401,7 @@ class PlatformGeometryRuntime:
 
     def _build_navigation_status(self) -> Dict[str, object]:
         """返回当前导航后端的诊断状态。"""
-        remote = getattr(self, "_remote_provider", None)
+        remote = self._remote_provider
         if remote is not None and _remote_is_connected(remote):
             try:
                 readiness = remote.get_navigation_readiness()
@@ -2713,8 +2572,8 @@ class PlatformGeometryRuntime:
                     mapping_diagnostics = None
             if isinstance(mapping_diagnostics, dict):
                 stub["mapping_diagnostics"] = dict(mapping_diagnostics)
-                stream_reader = getattr(self._remote_provider, "get_mapping_stream_status", None)
-                stream_status = stream_reader() if callable(stream_reader) else {}
+                remote_provider = self._remote_provider
+                stream_status = remote_provider.get_mapping_stream_status() if remote_provider is not None else {}
                 if stream_status and all(
                     stream_status.get(key) == mapping_diagnostics.get(key)
                     for key in ("mapping_session_id", "map_name", "session_generation")
@@ -2808,7 +2667,7 @@ class PlatformGeometryRuntime:
             raise TypeError("assigned operation requires a runtime-captured target")
         if self._map_activation_snapshot_locked() is not expected_target._snapshot:
             raise RuntimeError("assigned activation installation changed")
-        installed_origin = getattr(self, "_assigned_map_installation_origin", None)
+        installed_origin = self._assigned_map_installation_origin
         if installed_origin is not None and installed_origin[0] is expected_target._snapshot:
             self._require_prepared_assigned_origin_locked(installed_origin[1])
         activation = self._activation_result_from_snapshot(expected_target._snapshot)
@@ -2862,9 +2721,9 @@ class PlatformGeometryRuntime:
         if (sample._owner is not self
                 or sample._target._snapshot is not expected_target._snapshot):
             raise ValueError("assigned localization sample differs from the exact target or terminal")
-        if (getattr(self, "_remote_provider", None) is not sample._native._provider
-                or getattr(self, "_provider_attach_epoch", 0) != sample._attach_epoch
-                or getattr(self, "_provider_attach_stopping", False)):
+        if (self._remote_provider is not sample._native._provider
+                or self._provider_attach_epoch != sample._attach_epoch
+                or self._provider_attach_stopping):
             raise RuntimeError("assigned localization sample runtime provider ownership changed")
 
     def capture_assigned_localization_sample(
@@ -2885,11 +2744,11 @@ class PlatformGeometryRuntime:
         with self._runtime_state_lock:
             self._require_assigned_map_activation_target_locked(
                 expected_target, request, require_available=True, require_current_policy=False)
-            provider = getattr(self, "_remote_provider", None)
-            if provider is None or getattr(self, "_provider_attach_stopping", False):
+            provider = self._remote_provider
+            if provider is None or self._provider_attach_stopping:
                 raise RuntimeError("assigned localization provider is unavailable")
             origin = provider.capture_assigned_activation_origin()
-            attach_epoch = getattr(self, "_provider_attach_epoch", 0)
+            attach_epoch = self._provider_attach_epoch
         native = provider.capture_assigned_localization_sample(
             assigned_request_v2=request, expected_terminal=terminal, expected_origin=origin)
         sample = object.__new__(_AssignedLocalizationSample)
@@ -2913,13 +2772,12 @@ class PlatformGeometryRuntime:
         """
         request = _retained_assigned_request(assigned_request_v2)
         provider = self.get_geometry_runtime_provider()
-        dispatch = getattr(provider, "relocalize", None)
-        if not callable(dispatch):
-            raise RuntimeError("Geometry runtime does not support assigned relocalization")
+        if provider is None:
+            raise RuntimeError("Geometry runtime is disconnected during assigned relocalization")
         with self._runtime_state_lock:
             activation = self._require_assigned_map_activation_target_locked(
                 expected_target, request, require_available=True)
-        result = dispatch(
+        result = provider.relocalize(
             activation_state=activation, request_id=request.request_id,
             logical_timeout_ms=request.logical_timeout_ms, assigned_request_v2=request,
         )
@@ -2944,10 +2802,9 @@ class PlatformGeometryRuntime:
             "assigned_request_v2": request.to_dict(),
         })
         provider = self.get_geometry_runtime_provider()
-        retrieve = getattr(provider, "get_relocalization_terminal", None)
-        if not callable(retrieve):
-            raise RuntimeError("Geometry runtime does not support assigned terminal queries")
-        result = retrieve(
+        if provider is None:
+            raise RuntimeError("Geometry runtime is disconnected during assigned terminal query")
+        result = provider.get_relocalization_terminal(
             activation_state={}, request_id=request.request_id,
             logical_timeout_ms=request.logical_timeout_ms, assigned_request_v2=request,
         )
@@ -3298,11 +3155,7 @@ class PlatformGeometryRuntime:
                 },
             )
 
-        state_lock = getattr(self, "_runtime_state_lock", None)
-        if state_lock is None:
-            clear_bundle_context()
-            return
-        with state_lock:
+        with self._runtime_state_lock:
             clear_bundle_context()
 
 
@@ -3310,7 +3163,7 @@ class PlatformGeometryRuntime:
     def _map_asset_activation_delivery_tickets_snapshot(
         self,
     ) -> Tuple[_SubscriptionDeliveryTicket, ...]:
-        condition = self._ensure_subscription_delivery_state()
+        condition = self._subscription_delivery_condition
         with condition:
             return tuple(
                 ticket
@@ -3355,11 +3208,9 @@ class PlatformGeometryRuntime:
         fence = {"assigned_activation_request": request, "map_name": request["map_name"],
                  "activation_request_id": request["activation_request_id"], "reason": reason}
         identity = self._map_asset_activation_fence_identity(fence)
-        self._ensure_mapping_lifecycle_fields()
-        self._ensure_subscription_delivery_state()
         with self._mapping_lifecycle_lock:
             with self._runtime_state_lock:
-                existing = getattr(self, "_map_asset_activation_fence", None)
+                existing = self._map_asset_activation_fence
                 if existing is not None and self._map_asset_activation_fence_identity(existing) != identity:
                     return False
                 self._map_asset_activation_fence = fence
@@ -3374,7 +3225,7 @@ class PlatformGeometryRuntime:
             return False
 
         def complete_locked():
-            fence = getattr(self, "_map_asset_activation_fence", None)
+            fence = self._map_asset_activation_fence
             if fence is None:
                 return True
             if self._map_asset_activation_fence_identity(fence) != identity:
@@ -3389,24 +3240,7 @@ class PlatformGeometryRuntime:
 
     @contextmanager
     def _map_asset_activation_snapshot_read_guard(self) -> Iterator[None]:
-        state_lock = getattr(self, "_runtime_state_lock", None)
-
-        def get_or_create_state() -> threading.local:
-            state = getattr(
-                self,
-                "_map_asset_activation_snapshot_read_state",
-                None,
-            )
-            if state is None:
-                state = threading.local()
-                self._map_asset_activation_snapshot_read_state = state
-            return state
-
-        if state_lock is None:
-            read_state = get_or_create_state()
-        else:
-            with state_lock:
-                read_state = get_or_create_state()
+        read_state = self._map_asset_activation_snapshot_read_state
         depth = int(getattr(read_state, "depth", 0) or 0)
         read_state.depth = depth + 1
         try:
@@ -3417,11 +3251,7 @@ class PlatformGeometryRuntime:
     def _map_asset_activation_snapshot_read_blocked(self) -> bool:
         if not self.is_map_asset_activation_recovery_pending():
             return False
-        read_state = getattr(
-            self,
-            "_map_asset_activation_snapshot_read_state",
-            None,
-        )
+        read_state = self._map_asset_activation_snapshot_read_state
         return int(getattr(read_state, "depth", 0) or 0) <= 0
 
     @staticmethod
@@ -3632,17 +3462,17 @@ class PlatformGeometryRuntime:
         checkpoint_mapping_context: Optional[Dict[str, object]] = None
         if assigned_export:
             with self._runtime_state_lock:
-                export_provider = getattr(self, "_remote_provider", None)
-                if export_provider is None or getattr(self, "_provider_attach_stopping", False):
+                export_provider = self._remote_provider
+                if export_provider is None or self._provider_attach_stopping:
                     raise RuntimeError("assigned checkpoint provider is unavailable")
                 export_origin = export_provider.capture_assigned_activation_origin()
-                export_attach_epoch = getattr(self, "_provider_attach_epoch", 0)
+                export_attach_epoch = self._provider_attach_epoch
 
             def require_export_origin():
                 with self._runtime_state_lock:
-                    if (getattr(self, "_remote_provider", None) is not export_provider
-                            or getattr(self, "_provider_attach_epoch", 0) != export_attach_epoch
-                            or getattr(self, "_provider_attach_stopping", False)):
+                    if (self._remote_provider is not export_provider
+                            or self._provider_attach_epoch != export_attach_epoch
+                            or self._provider_attach_stopping):
                         raise RuntimeError("assigned checkpoint runtime provider ownership changed")
                     export_provider.require_assigned_activation_origin(export_origin)
 
@@ -4008,17 +3838,17 @@ class PlatformGeometryRuntime:
     def _require_prepared_assigned_origin_locked(self, prepared) -> None:
         if not isinstance(prepared, _PreparedAssignedMapActivation) or prepared._owner is not self:
             raise TypeError("assigned activation requires this runtime's preparation")
-        if (getattr(self, "_remote_provider", None) is not prepared._provider
-                or getattr(self, "_provider_attach_epoch", 0) != prepared._attach_epoch
-                or getattr(self, "_provider_attach_stopping", False)):
+        if (self._remote_provider is not prepared._provider
+                or self._provider_attach_epoch != prepared._attach_epoch
+                or self._provider_attach_stopping):
             raise RuntimeError("assigned activation runtime provider ownership changed")
         prepared._provider.require_assigned_activation_origin(prepared._provider_origin)
 
     def capture_assigned_fine_import_origin(self):
         """Use the existing connected provider's status capability, without RPC."""
         with self._runtime_state_lock:
-            provider = getattr(self, "_remote_provider", None)
-            if provider is None or getattr(self, "_provider_attach_stopping", False):
+            provider = self._remote_provider
+            if provider is None or self._provider_attach_stopping:
                 return None
             try:
                 origin = provider.capture_assigned_activation_origin()
@@ -4026,16 +3856,16 @@ class PlatformGeometryRuntime:
                 return None
             if not provider.supports_assigned_fine_archive_version(1, expected_origin=origin):
                 return None
-            return provider, getattr(self, "_provider_attach_epoch", 0), origin
+            return provider, self._provider_attach_epoch, origin
 
     @contextmanager
     def assigned_fine_import_origin_guard(self, captured):
         """Fence the small catalog commit; never hold across archive I/O or callbacks."""
         provider, attach_epoch, origin = captured
         with self._runtime_state_lock:
-            if (getattr(self, "_remote_provider", None) is not provider
-                    or getattr(self, "_provider_attach_epoch", 0) != attach_epoch
-                    or getattr(self, "_provider_attach_stopping", False)):
+            if (self._remote_provider is not provider
+                    or self._provider_attach_epoch != attach_epoch
+                    or self._provider_attach_stopping):
                 raise RuntimeError("assigned fine import provider ownership changed")
             if not provider.supports_assigned_fine_archive_version(1, expected_origin=origin):
                 raise RuntimeError("runtime does not support assigned AR1 source archives")
@@ -4074,11 +3904,11 @@ class PlatformGeometryRuntime:
             raise ValueError("assigned activation requires its schema-2 checkpoint")
         root = self._require_bundle_root(bundle_root)
         with self._runtime_state_lock:
-            provider = getattr(self, "_remote_provider", None)
-            if provider is None or getattr(self, "_provider_attach_stopping", False):
+            provider = self._remote_provider
+            if provider is None or self._provider_attach_stopping:
                 raise RuntimeError("assigned activation provider is unavailable")
             origin = provider.capture_assigned_activation_origin()
-            attach_epoch = getattr(self, "_provider_attach_epoch", 0)
+            attach_epoch = self._provider_attach_epoch
             prior = self._map_activation_snapshot_locked()
         from services.geometry.mapping_backend_checkpoint_store import MappingBackendCheckpointStore
         if stored is None:
@@ -4139,7 +3969,6 @@ class PlatformGeometryRuntime:
                     or _assigned_mapping_predecessor(state) != expected):
                 raise ValueError("assigned predecessor stop lacks exact STOPPED evidence")
             context = dict(state)
-            self._ensure_mapping_lifecycle_fields()
             with self._mapping_lifecycle_lock:
                 with self._runtime_state_lock:
                     self._require_prepared_assigned_origin_locked(prepared)
@@ -4223,7 +4052,6 @@ class PlatformGeometryRuntime:
                     "live_streaming_ready": False, "mapping_live_streaming_ready": False,
                     "backend_snapshot_correlated": False}
         context = dict(result)
-        self._ensure_mapping_lifecycle_fields()
         with self._mapping_lifecycle_lock:
             with self._runtime_state_lock:
                 self._require_prepared_assigned_origin_locked(prepared)
@@ -4266,7 +4094,7 @@ class PlatformGeometryRuntime:
         """
         with self._runtime_state_lock:
             self._require_assigned_map_activation_target_locked(expected_target)
-            installed_origin = getattr(self, "_assigned_map_installation_origin", None)
+            installed_origin = self._assigned_map_installation_origin
             if installed_origin is None or installed_origin[0] is not expected_target._snapshot:
                 yield expected_target.activation_receipt
             else:
@@ -4292,11 +4120,7 @@ class PlatformGeometryRuntime:
                 )
             return callback(sanitized_payload)
 
-        provider_attach_lock = getattr(
-            self,
-            "_provider_attach_lock",
-            self._runtime_state_lock,
-        )
+        provider_attach_lock = self._provider_attach_lock
         with provider_attach_lock:
             subscription_id = self._next_map_subscription_id
             self._next_map_subscription_id += 1
@@ -4304,7 +4128,7 @@ class PlatformGeometryRuntime:
             self._pending_map_callbacks.append(wrapped_callback)
             provider = self._remote_provider
             if provider is not None and bool(
-                getattr(provider, "is_connected", False)
+                provider.is_connected
             ):
                 ticket = self._new_subscription_delivery_ticket(
                     kind="map",
@@ -4362,11 +4186,7 @@ class PlatformGeometryRuntime:
 
         if not callable(callback):
             raise ValueError("navigation update callback must be callable")
-        provider_attach_lock = getattr(
-            self,
-            "_provider_attach_lock",
-            self._runtime_state_lock,
-        )
+        provider_attach_lock = self._provider_attach_lock
         with provider_attach_lock:
             with self._runtime_state_lock:
                 subscription_id = self._next_navigation_subscription_id
@@ -4374,7 +4194,7 @@ class PlatformGeometryRuntime:
                 self._navigation_update_subscribers[subscription_id] = callback
                 provider = self._remote_provider
             if provider is not None and bool(
-                getattr(provider, "is_connected", False)
+                provider.is_connected
             ):
                 ticket = self._new_subscription_delivery_ticket(
                     kind="navigation",
@@ -4422,11 +4242,7 @@ class PlatformGeometryRuntime:
             return subscription_id
 
     def unsubscribe_navigation_updates(self, subscription_id: int) -> bool:
-        provider_attach_lock = getattr(
-            self,
-            "_provider_attach_lock",
-            self._runtime_state_lock,
-        )
+        provider_attach_lock = self._provider_attach_lock
         delivery_tickets = ()
         with provider_attach_lock:
             with self._runtime_state_lock:
@@ -4448,7 +4264,7 @@ class PlatformGeometryRuntime:
         if (
             remote_subscription_id is not None
             and provider is not None
-            and bool(getattr(provider, "is_connected", False))
+            and bool(provider.is_connected)
         ):
             try:
                 provider.unsubscribe_navigation_updates(remote_subscription_id)
@@ -4461,11 +4277,7 @@ class PlatformGeometryRuntime:
         return removed is not None
 
     def unsubscribe_map_updates(self, subscription_id: int) -> bool:
-        provider_attach_lock = getattr(
-            self,
-            "_provider_attach_lock",
-            self._runtime_state_lock,
-        )
+        provider_attach_lock = self._provider_attach_lock
         handle = None
         delivery_tickets = ()
         with provider_attach_lock:
@@ -4556,11 +4368,11 @@ class PlatformGeometryRuntime:
             source_kind="platform_live_map_provider",
             activation_result=activation_result,
         ))
-        mapping_context = getattr(self, "_mapping_session_context", None)
+        mapping_context = self._mapping_session_context
         mapping_active = isinstance(mapping_context, dict) and bool(
             mapping_context.get("active")
         )
-        exploration_active = getattr(self, "_external_exploration_request", None) is not None
+        exploration_active = self._external_exploration_request is not None
         if exploration_active or mapping_active:
             pass  # 探索模式下不抑制 live map（新建地图从小到大增长是正常的）
         elif (
@@ -4638,7 +4450,7 @@ class PlatformGeometryRuntime:
     ) -> None:
         """把 live<seed 抑制语义通过 EventBus 暴露给消费方，避免静默卡图。"""
 
-        event_bus = getattr(self.robot, "event_bus", None) or getattr(self, "_event_bus", None)
+        event_bus = getattr(self.robot, "event_bus", None) or self._event_bus
         if event_bus is None:
             return
         try:
@@ -4835,12 +4647,8 @@ class PlatformGeometryRuntime:
                         mapping_context=mapping_context_after or {},
                         seed_bundle=bundle,
                     )
-                    cache_lock = getattr(self, "_runtime_state_lock", None)
-                    if cache_lock is None:
+                    with self._runtime_state_lock:
                         self._last_validated_live_map_cache = validated_cache
-                    else:
-                        with cache_lock:
-                            self._last_validated_live_map_cache = validated_cache
                 snapshot = snapshot.model_copy(update={"metadata": {**snapshot.metadata,
                     "map_activation_generation": activation_snapshot.generation}})
                 if self._map_asset_activation_snapshot_read_blocked() or not self.is_map_snapshot_source_current(
@@ -4858,16 +4666,8 @@ class PlatformGeometryRuntime:
             current_mapping_identity[4],
         )
         current_backend = self._resolve_mapping_backend()
-        cache_lock = getattr(self, "_runtime_state_lock", None)
-        if cache_lock is None:
-            validated_cache = getattr(
-                self, "_last_validated_live_map_cache", None
-            )
-        else:
-            with cache_lock:
-                validated_cache = getattr(
-                    self, "_last_validated_live_map_cache", None
-                )
+        with self._runtime_state_lock:
+            validated_cache = self._last_validated_live_map_cache
         if (
             isinstance(validated_cache, _ValidatedLiveMapCache)
             and validated_cache.activation_generation == activation_snapshot.generation
@@ -4934,17 +4734,14 @@ class PlatformGeometryRuntime:
         return snapshot
 
     def get_raw_occupancy_grid(self):
-        """返回未叠加虚拟禁行区的物理栅格（若远端支持）。"""
+        """返回已连接几何提供器的物理栅格，不叠加虚拟禁行区。"""
 
         if self._map_asset_activation_snapshot_read_blocked():
             return None
         remote = self._remote_provider
         if remote is None or not remote.is_connected:
             return None
-        reader = getattr(remote, "get_raw_occupancy_grid", None)
-        if not callable(reader):
-            return None
-        grid = reader()
+        grid = remote.get_raw_occupancy_grid()
         if self._map_asset_activation_snapshot_read_blocked():
             return None
         return self._clone_contract(grid) if grid is not None else None
@@ -5269,7 +5066,7 @@ class PlatformGeometryRuntime:
         """解析平台正式导航后端；不可用时返回 None。"""
         if not self._is_geometry_profile_enabled():
             return None
-        remote = getattr(self, "_remote_provider", None)
+        remote = self._remote_provider
         if remote is not None and _remote_is_connected(remote):
             return remote
         return None
@@ -5279,7 +5076,7 @@ class PlatformGeometryRuntime:
 
         if not self._is_geometry_profile_enabled():
             return None
-        remote = getattr(self, "_remote_provider", None)
+        remote = self._remote_provider
         if remote is not None and _remote_is_connected(remote):
             return remote
         return None
@@ -5892,7 +5689,7 @@ class PlatformGeometryRuntime:
         nav2_map_metadata = dict(nav2_map_metadata or {})
         database_present = bool(database_metadata.get("database_present", False))
         nav2_map_present = bool(nav2_map_metadata.get("present", False))
-        remote_provider = getattr(self, "_remote_provider", None)
+        remote_provider = self._remote_provider
         native_checkpoint_switch_supported = bool(remote_provider is not None and remote_provider.is_connected)
         native_checkpoint_ready = bool(
             native_checkpoint_switch_supported and nav2_map_present and (not planar_graph or database_present)
@@ -6072,7 +5869,7 @@ class PlatformGeometryRuntime:
 
         返回 False 时，`prepare_map_asset_bundle` 走通用导出路径。
         """
-        provider = getattr(self, "_remote_provider", None)
+        provider = self._remote_provider
         if provider is None:
             return False
         try:
@@ -6086,7 +5883,7 @@ class PlatformGeometryRuntime:
 
     def _mapping_lcm_backend_name(self) -> str:
         """Phase 3: 取 LCM backend canonical 名(给 nuwax_mapping asset metadata)。"""
-        provider = getattr(self, "_remote_provider", None)
+        provider = self._remote_provider
         if provider is None:
             return "<unknown>"
         try:
@@ -6132,9 +5929,9 @@ class PlatformGeometryRuntime:
             snapshot = self._map_activation_snapshot_locked()
             bundle = snapshot.bundle
             if (bundle is None or bundle.identity_schema_version != 2
-                    or isinstance(getattr(self, "_map_asset_activation_fence", None), dict)):
+                    or isinstance(self._map_asset_activation_fence, dict)):
                 return None
-            origin = getattr(self, "_assigned_map_installation_origin", None)
+            origin = self._assigned_map_installation_origin
             if origin is None or origin[0] is not snapshot:
                 return None
             prepared = origin[1]
@@ -6149,11 +5946,11 @@ class PlatformGeometryRuntime:
         if not isinstance(source, AssignedSavedCloudHandle) or source._owner is not self:
             raise TypeError("assigned saved source requires this runtime's captured handle")
         with self._runtime_state_lock:
-            origin = getattr(self, "_assigned_map_installation_origin", None)
+            origin = self._assigned_map_installation_origin
             if (self._map_activation_snapshot_locked() is not source._snapshot
                     or origin is None or origin[0] is not source._snapshot
                     or origin[1] is not source._prepared
-                    or isinstance(getattr(self, "_map_asset_activation_fence", None), dict)):
+                    or isinstance(self._map_asset_activation_fence, dict)):
                 raise RuntimeError("ASSIGNED_SAVED_CLOUD_SOURCE_CHANGED")
 
     def get_saved_dense_cloud_source(self):
@@ -6462,11 +6259,7 @@ class PlatformGeometryRuntime:
             return None
         if not callable(callback):
             raise ValueError("localization update callback must be callable")
-        provider_attach_lock = getattr(
-            self,
-            "_provider_attach_lock",
-            self._runtime_state_lock,
-        )
+        provider_attach_lock = self._provider_attach_lock
         with provider_attach_lock:
             subscription_id = self._next_localization_subscription_id
             self._next_localization_subscription_id += 1
@@ -6475,7 +6268,7 @@ class PlatformGeometryRuntime:
             # 当前提供器沿原订阅票据交付gRPC位姿流。
             provider = self._remote_provider
             if provider is not None and bool(
-                getattr(provider, "is_connected", False)
+                provider.is_connected
             ):
                 ticket = self._new_subscription_delivery_ticket(
                     kind="localization",
@@ -6536,11 +6329,7 @@ class PlatformGeometryRuntime:
     def unsubscribe_localization_updates(self, subscription_id: Optional[int]) -> None:
         if subscription_id is None:
             return
-        provider_attach_lock = getattr(
-            self,
-            "_provider_attach_lock",
-            self._runtime_state_lock,
-        )
+        provider_attach_lock = self._provider_attach_lock
         handle = None
         delivery_tickets = ()
         with provider_attach_lock:
@@ -6571,11 +6360,7 @@ class PlatformGeometryRuntime:
 
         if not callable(callback):
             raise ValueError("exploration update callback must be callable")
-        provider_attach_lock = getattr(
-            self,
-            "_provider_attach_lock",
-            self._runtime_state_lock,
-        )
+        provider_attach_lock = self._provider_attach_lock
         with provider_attach_lock:
             with self._exploration_loop_lock:
                 subscription_id = self._next_exploration_subscription_id
@@ -6586,7 +6371,7 @@ class PlatformGeometryRuntime:
                     self._remote_exploration_subscription_id
                 )
             if provider is not None and bool(
-                getattr(provider, "is_connected", False)
+                provider.is_connected
             ):
                 self._bind_remote_exploration_updates(
                     provider,
@@ -6599,11 +6384,7 @@ class PlatformGeometryRuntime:
             return subscription_id
 
     def unsubscribe_exploration_updates(self, subscription_id: int) -> bool:
-        provider_attach_lock = getattr(
-            self,
-            "_provider_attach_lock",
-            self._runtime_state_lock,
-        )
+        provider_attach_lock = self._provider_attach_lock
         with provider_attach_lock:
             with self._exploration_loop_lock:
                 removed = self._exploration_update_subscribers.pop(
@@ -6652,11 +6433,7 @@ class PlatformGeometryRuntime:
     ) -> bool:
         """把本地 fanout 绑定到 provider 的唯一后台状态源。"""
 
-        provider_attach_lock = getattr(
-            self,
-            "_provider_attach_lock",
-            self._runtime_state_lock,
-        )
+        provider_attach_lock = self._provider_attach_lock
         with provider_attach_lock:
             with self._exploration_loop_lock:
                 if (
@@ -6912,17 +6689,13 @@ class PlatformGeometryRuntime:
         if not self._is_geometry_profile_enabled():
             return None
         with self._exploration_loop_lock:
-            remote = getattr(self, "_remote_provider", None)
+            remote = self._remote_provider
             remote_token = (
                 _capture_remote_operation_token_locked(self, remote)
                 if remote is not None
                 else None
             )
-            current = getattr(
-                self,
-                "_external_exploration_request",
-                None,
-            )
+            current = self._external_exploration_request
         if remote_token is not None:
             request_id = str(
                 getattr(current, "request_id", "") or ""
@@ -6944,20 +6717,12 @@ class PlatformGeometryRuntime:
                     raise RuntimeError(
                         "hit-stop 返回期间 geometry remote 代际已切换。"
                     )
-                current = getattr(
-                    self,
-                    "_external_exploration_request",
-                    None,
-                )
+                current = self._external_exploration_request
                 current_id = str(
                     getattr(current, "request_id", "") or ""
                 ).strip()
                 if current_id != request_id:
-                    existing_terminal = getattr(
-                        self,
-                        "_external_exploration_terminal_state",
-                        None,
-                    )
+                    existing_terminal = self._external_exploration_terminal_state
                     if (
                         not current_id
                         and _is_complete_exploration_terminal(
@@ -6998,13 +6763,6 @@ class PlatformGeometryRuntime:
         )
 
 
-    def _ensure_mapping_lifecycle_fields(self) -> None:
-        if not hasattr(self, "_mapping_lifecycle_lock"):
-            self._mapping_lifecycle_lock = threading.RLock()
-        if not hasattr(self, "_mapping_session_context"):
-            self._mapping_session_context = None
-        if not hasattr(self, "_mapping_session_provider_attach_epoch"):
-            self._mapping_session_provider_attach_epoch = None
 
     def start_mapping(
         self,
@@ -7052,7 +6810,6 @@ class PlatformGeometryRuntime:
         if not resolved_map_name:
             raise RuntimeError("启动建图必须提供 map_name。")
 
-        self._ensure_mapping_lifecycle_fields()
         with _exploration_deadline_lock(
             self._mapping_lifecycle_lock,
             deadline_monotonic,
@@ -7063,7 +6820,7 @@ class PlatformGeometryRuntime:
                     "地图资产激活恢复尚未完成，拒绝启动新的 mapping session。"
                 )
             with self._runtime_state_lock:
-                selected_name = getattr(self, "_workspace_map_name", None)
+                selected_name = self._workspace_map_name
                 active_bundle = self._map_activation_snapshot_locked().bundle
                 expected_name = active_bundle.map_name if active_bundle is not None else selected_name
             if expected_name and resolved_map_name != expected_name:
@@ -7081,14 +6838,11 @@ class PlatformGeometryRuntime:
             else:
                 session_id = "mapping:%s" % uuid.uuid4().hex
 
-            start_rpc = getattr(provider, "start_mapping", None)
-            if not callable(start_rpc):
-                raise RuntimeError("GeometryRuntimeProvider 未实现 StartMapping RPC。")
             if self.is_map_asset_activation_recovery_pending():
                 raise RuntimeError(
                     "地图资产激活恢复尚未完成，拒绝启动新的 mapping session。"
                 )
-            response = start_rpc(
+            response = provider.start_mapping(
                 session_id=session_id,
                 map_name=resolved_map_name,
                 **(
@@ -7118,8 +6872,8 @@ class PlatformGeometryRuntime:
             # Local state is committed only after Rust confirms ACTIVE.
             self._mapping_session_context = context
             self._mapping_session_provider_attach_epoch = (
-                int(getattr(self, "_provider_attach_epoch", 0))
-                if provider is getattr(self, "_remote_provider", None)
+                int(self._provider_attach_epoch)
+                if provider is self._remote_provider
                 else None
             )
 
@@ -7134,12 +6888,7 @@ class PlatformGeometryRuntime:
                 self._external_exploration_request = None
         if new_session_started:
             self._map_stream_tracker = {}
-        diagnostics_reader = getattr(provider, "get_mapping_diagnostics", None)
-        diagnostics = (
-            diagnostics_reader()
-            if deadline_monotonic is None and callable(diagnostics_reader)
-            else None
-        )
+        diagnostics = provider.get_mapping_diagnostics() if deadline_monotonic is None else None
         return {
             "mapping_launch_mode": "nuwax_geometry_runtime",
             "mapping_transport": "grpc_lcm",
@@ -7234,27 +6983,20 @@ class PlatformGeometryRuntime:
         """Stop the exact native mapping session without stopping the sidecar."""
 
         provider = self._remote_provider
-        if provider is None or not bool(getattr(provider, "is_connected", False)):
+        if provider is None or not bool(provider.is_connected):
             raise RuntimeError("nuwax-geometry-runtime gRPC 未连接，无法停止建图。")
-        self._ensure_mapping_lifecycle_fields()
         with self._mapping_lifecycle_lock:
             fence = self._map_asset_activation_fence_snapshot()
             if isinstance(fence, dict) and "assigned_activation_request" in fence:
                 raise RuntimeError("assigned map activation is pending; ordinary StopMapping is fenced")
             context = self._mapping_session_context
             if not isinstance(context, dict) or not str(context.get("session_id") or ""):
-                state_reader = getattr(provider, "get_mapping_state", None)
-                context = state_reader() if callable(state_reader) else None
+                context = provider.get_mapping_state()
             if not isinstance(context, dict) or not str(context.get("session_id") or ""):
                 raise RuntimeError("当前没有可关联的 Rust mapping session。")
             session_id = str(context.get("session_id") or "")
 
-            exploration_reader = getattr(provider, "get_exploration_state", None)
-            if not callable(exploration_reader):
-                raise RuntimeError(
-                    "停止建图前无法读取 ExplorationState，拒绝让 child navigation 失去 costmap。"
-                )
-            exploration_state = exploration_reader()
+            exploration_state = provider.get_exploration_state()
             if not isinstance(exploration_state, dict):
                 raise RuntimeError(
                     "停止建图前未获得 ExplorationState，mapping adapter 保持 ACTIVE。"
@@ -7282,12 +7024,7 @@ class PlatformGeometryRuntime:
                     raise RuntimeError(
                         "active exploration 缺少 exact request_id，拒绝停止 mapping。"
                     )
-                exploration_stopper = getattr(provider, "stop_exploration", None)
-                if not callable(exploration_stopper):
-                    raise RuntimeError(
-                        "GeometryRuntimeProvider 未实现 correlated StopExploration。"
-                    )
-                parked_exploration = exploration_stopper(request_id=request_id)
+                parked_exploration = provider.stop_exploration(request_id=request_id)
                 if not isinstance(parked_exploration, dict):
                     raise RuntimeError(
                         "StopExploration 未返回 exact terminal，mapping adapter 保持 ACTIVE。"
@@ -7306,10 +7043,7 @@ class PlatformGeometryRuntime:
                         "StopExploration 未返回 exact terminal，mapping adapter 保持 ACTIVE。"
                     )
 
-            stop_rpc = getattr(provider, "stop_mapping", None)
-            if not callable(stop_rpc):
-                raise RuntimeError("GeometryRuntimeProvider 未实现 StopMapping RPC。")
-            response = stop_rpc(
+            response = provider.stop_mapping(
                 session_id=session_id,
                 reason=str(reason or "stop_mapping"),
             )
@@ -7359,10 +7093,7 @@ class PlatformGeometryRuntime:
         *,
         remote_token: _RemoteOperationToken,
     ) -> None:
-        context = getattr(self, "_exploration_delivery_context", None)
-        if context is None:
-            context = threading.local()
-            self._exploration_delivery_context = context
+        context = self._exploration_delivery_context
         missing = object()
         previous = getattr(context, "remote_token", missing)
         context.remote_token = remote_token
@@ -7378,13 +7109,9 @@ class PlatformGeometryRuntime:
                 context.remote_token = previous
 
     def _notify_exploration_update(self, state: ExplorationState) -> None:
-        context = getattr(self, "_exploration_delivery_context", None)
-        remote_token = (
-            getattr(context, "remote_token", None)
-            if context is not None
-            else None
-        )
-        if context is not None and remote_token is not None:
+        context = self._exploration_delivery_context
+        remote_token = getattr(context, "remote_token", None)
+        if remote_token is not None:
             try:
                 del context.remote_token
             except AttributeError:
@@ -7393,11 +7120,7 @@ class PlatformGeometryRuntime:
         delivery_generation = None
         if remote_token is not None:
             delivery_provider, delivery_generation = remote_token
-        provider_attach_lock = getattr(
-            self,
-            "_provider_attach_lock",
-            self._runtime_state_lock,
-        )
+        provider_attach_lock = self._provider_attach_lock
         with provider_attach_lock:
             with self._exploration_loop_lock:
                 deliveries = []
@@ -7435,33 +7158,17 @@ class PlatformGeometryRuntime:
         """
 
         def active_request_id() -> str:
-            lock = getattr(self, "_exploration_loop_lock", None)
-            if lock is None:
-                current = getattr(self, "_external_exploration_request", None)
-            else:
-                with _exploration_deadline_lock(
-                    lock,
-                    deadline_monotonic,
-                    "GetExplorationState",
-                ):
-                    current = getattr(self, "_external_exploration_request", None)
+            with _exploration_deadline_lock(
+                self._exploration_loop_lock, deadline_monotonic, "GetExplorationState",
+            ):
+                current = self._external_exploration_request
             return str(getattr(current, "request_id", "") or "").strip()
 
         def cached_complete_terminal() -> Optional[ExplorationState]:
-            lock = getattr(self, "_exploration_loop_lock", None)
-            if lock is None:
-                cached = getattr(self, "_external_exploration_terminal_state", None)
-            else:
-                with _exploration_deadline_lock(
-                    lock,
-                    deadline_monotonic,
-                    "GetExplorationState",
-                ):
-                    cached = getattr(
-                        self,
-                        "_external_exploration_terminal_state",
-                        None,
-                    )
+            with _exploration_deadline_lock(
+                self._exploration_loop_lock, deadline_monotonic, "GetExplorationState",
+            ):
+                cached = self._external_exploration_terminal_state
             cached_request_id = _exploration_state_request_id(cached)
             if not _is_complete_exploration_terminal(
                 cached,
@@ -7681,12 +7388,7 @@ class PlatformGeometryProviderBundle(
         return self.runtime._is_geometry_profile_enabled()
 
     def _map_asset_activation_recovery_pending(self) -> bool:
-        checker = getattr(
-            self.runtime,
-            "is_map_asset_activation_recovery_pending",
-            None,
-        )
-        return bool(checker()) if callable(checker) else False
+        return self.runtime.is_map_asset_activation_recovery_pending()
 
     def is_localization_available(self) -> bool:
         if (
@@ -7794,8 +7496,8 @@ class PlatformGeometryProviderBundle(
         if backend is None:
             return None, None
         with self.runtime._runtime_state_lock:
-            if (getattr(self.runtime, "_provider_attach_stopping", False)
-                    or getattr(self.runtime, "_map_asset_activation_fence", None) is not None):
+            if (self.runtime._provider_attach_stopping
+                    or self.runtime._map_asset_activation_fence is not None):
                 return None, None
             attach_epoch = self.runtime._provider_attach_epoch
             snapshot = self.runtime._map_activation_snapshot_locked()
@@ -7810,10 +7512,10 @@ class PlatformGeometryProviderBundle(
         enabled = self._is_geometry_profile_enabled()
         with self.runtime._runtime_state_lock:
             if (not enabled or current_backend is not backend
-                    or getattr(self.runtime, "_provider_attach_stopping", False)
+                    or self.runtime._provider_attach_stopping
                     or self.runtime._provider_attach_epoch != attach_epoch
                     or self.runtime._map_activation_snapshot_locked() is not snapshot
-                    or getattr(self.runtime, "_map_asset_activation_fence", None) is not None):
+                    or self.runtime._map_asset_activation_fence is not None):
                 return None, None
         return pose, frame_tree
 
@@ -8216,7 +7918,7 @@ class PlatformGeometryProviderBundle(
         `PlatformGeometryRuntime` 在 `_start_geometry_runtime_subprocess` 时挂 gRPC provider
         于 `_remote_provider`；该对象是探索控制与状态的唯一生产 provider。
         """
-        remote = getattr(self.runtime, "_remote_provider", None)
+        remote = self.runtime._remote_provider
         if remote is None:
             return None
         if not _remote_is_connected(remote):
@@ -8292,10 +7994,8 @@ class PlatformGeometryProviderBundle(
                 or request_metadata.get("blacklist_radius_m")
                 or 0.0
             )
-        lock = getattr(self.runtime, "_exploration_loop_lock", None)
-        if lock is None:
-            return False
-        owner_lock = _remote_exploration_owner_lock(self.runtime)
+        lock = self.runtime._exploration_loop_lock
+        owner_lock = self.runtime._remote_exploration_ownership_lock
         try:
             with _exploration_deadline_lock(
                 lock,
@@ -8306,11 +8006,7 @@ class PlatformGeometryProviderBundle(
                     self.runtime,
                     remote,
                 )
-                current = getattr(
-                    self.runtime,
-                    "_external_exploration_request",
-                    None,
-                )
+                current = self.runtime._external_exploration_request
                 current_id = str(
                     getattr(current, "request_id", "") or ""
                 ).strip()
@@ -8380,11 +8076,8 @@ class PlatformGeometryProviderBundle(
         precommit_snapshot = {}
 
         def restore_precommit_snapshot_locked() -> None:
-            for attribute, (present, value) in precommit_snapshot.items():
-                if present:
-                    setattr(self.runtime, attribute, value)
-                elif hasattr(self.runtime, attribute):
-                    delattr(self.runtime, attribute)
+            for attribute, value in precommit_snapshot.items():
+                setattr(self.runtime, attribute, value)
 
         try:
             with _exploration_deadline_lock(
@@ -8409,10 +8102,7 @@ class PlatformGeometryProviderBundle(
                         "_external_exploration_terminal_state",
                         "_external_geometry_session_mode",
                     ):
-                        precommit_snapshot[attribute] = (
-                            hasattr(self.runtime, attribute),
-                            getattr(self.runtime, attribute, None),
-                        )
+                        precommit_snapshot[attribute] = getattr(self.runtime, attribute)
                     if not _commit_remote_exploration_state_locked(
                         self.runtime,
                         uncertain_start_state(
@@ -8439,11 +8129,7 @@ class PlatformGeometryProviderBundle(
             )
             if self._map_asset_activation_recovery_pending():
                 with owner_lock:
-                    current = getattr(
-                        self.runtime,
-                        "_external_exploration_request",
-                        None,
-                    )
+                    current = self.runtime._external_exploration_request
                     current_id = str(
                         getattr(current, "request_id", "") or ""
                     ).strip()
@@ -8472,11 +8158,7 @@ class PlatformGeometryProviderBundle(
         except GeometryRuntimeRpcError as exc:
             if getattr(exc, "exploration_rpc_dispatched", True) is False:
                 with owner_lock:
-                    current = getattr(
-                        self.runtime,
-                        "_external_exploration_request",
-                        None,
-                    )
+                    current = self.runtime._external_exploration_request
                     current_id = str(
                         getattr(current, "request_id", "") or ""
                     ).strip()
@@ -8541,25 +8223,19 @@ class PlatformGeometryProviderBundle(
                             "StartExploration response"
                         ),
                     )
-                current = getattr(
-                    self.runtime,
-                    "_external_exploration_request",
-                    None,
-                )
+                current = self.runtime._external_exploration_request
                 current_id = str(
                     getattr(current, "request_id", "") or ""
                 ).strip()
                 if current_id == request_id:
                     restore_precommit_snapshot_locked()
             if deadline_monotonic is None:
-                notifier = getattr(self.runtime, "_notify_exploration_update", None)
-                if callable(notifier):
-                    try:
-                        notifier(state)
-                    except Exception:
-                        LOGGER.exception(
-                            "StartExploration 明确拒绝已回滚，但本地 fanout 失败。"
-                        )
+                try:
+                    self.runtime._notify_exploration_update(state)
+                except Exception:
+                    LOGGER.exception(
+                        "StartExploration 明确拒绝已回滚，但本地 fanout 失败。"
+                    )
             _exploration_deadline_remaining(
                 deadline_monotonic,
                 "StartExploration",
@@ -8625,18 +8301,12 @@ class PlatformGeometryProviderBundle(
                     return False
             notify_state = True
         if notify_state and deadline_monotonic is None:
-            notifier = getattr(
-                self.runtime,
-                "_notify_exploration_update",
-                None,
-            )
-            if callable(notifier):
-                try:
-                    notifier(state)
-                except Exception:
-                    LOGGER.exception(
-                        "StartExploration 状态已提交，但本地 fanout 失败。"
-                    )
+            try:
+                self.runtime._notify_exploration_update(state)
+            except Exception:
+                LOGGER.exception(
+                    "StartExploration 状态已提交，但本地 fanout 失败。"
+                )
         if deadline_exhausted:
             raise GeometryRuntimeRpcError(
                 rpc_name="StartExploration",
@@ -8699,30 +8369,20 @@ class PlatformGeometryProviderBundle(
         if not self._is_geometry_profile_enabled():
             return False
         requested_id = str(request_id or "").strip()
-        lock = getattr(self.runtime, "_exploration_loop_lock", None)
-        if lock is None:
-            return False
-        owner_lock = _remote_exploration_owner_lock(self.runtime)
+        lock = self.runtime._exploration_loop_lock
+        owner_lock = self.runtime._remote_exploration_ownership_lock
         committed = False
         with _exploration_deadline_lock(
             lock,
             deadline_monotonic,
             "StopExploration",
         ):
-            current = getattr(
-                self.runtime,
-                "_external_exploration_request",
-                None,
-            )
+            current = self.runtime._external_exploration_request
             expected_id = str(
                 getattr(current, "request_id", "") or ""
             ).strip()
             correlated_id = requested_id or expected_id
-            existing_terminal = getattr(
-                self.runtime,
-                "_external_exploration_terminal_state",
-                None,
-            )
+            existing_terminal = self.runtime._external_exploration_terminal_state
             if not correlated_id:
                 return False
             if not expected_id:
@@ -8796,20 +8456,12 @@ class PlatformGeometryProviderBundle(
                 return False
             if not accepted or _exploration_state_request_id(state) != correlated_id:
                 return False
-            current = getattr(
-                self.runtime,
-                "_external_exploration_request",
-                None,
-            )
+            current = self.runtime._external_exploration_request
             current_id = str(
                 getattr(current, "request_id", "") or ""
             ).strip()
             if current_id != expected_id:
-                existing_terminal = getattr(
-                    self.runtime,
-                    "_external_exploration_terminal_state",
-                    None,
-                )
+                existing_terminal = self.runtime._external_exploration_terminal_state
                 return bool(
                     not current_id
                     and _is_complete_exploration_terminal(
@@ -8840,25 +8492,15 @@ class PlatformGeometryProviderBundle(
     def sync_exploration_after_task(self) -> bool:
         if not self._is_geometry_profile_enabled():
             return False
-        lock = getattr(self.runtime, "_exploration_loop_lock", None)
-        if lock is None:
-            return False
+        lock = self.runtime._exploration_loop_lock
         committed = False
         terminal = False
         with lock:
-            current = getattr(
-                self.runtime,
-                "_external_exploration_request",
-                None,
-            )
+            current = self.runtime._external_exploration_request
             expected_id = str(
                 getattr(current, "request_id", "") or ""
             ).strip()
-            existing_terminal = getattr(
-                self.runtime,
-                "_external_exploration_terminal_state",
-                None,
-            )
+            existing_terminal = self.runtime._external_exploration_terminal_state
             if not expected_id and existing_terminal is not None:
                 return _is_complete_exploration_terminal(
                     existing_terminal,
@@ -8893,11 +8535,7 @@ class PlatformGeometryProviderBundle(
                 remote_token,
             ):
                 return False
-            current = getattr(
-                self.runtime,
-                "_external_exploration_request",
-                None,
-            )
+            current = self.runtime._external_exploration_request
             current_id = str(
                 getattr(current, "request_id", "") or ""
             ).strip()

@@ -2220,6 +2220,9 @@ class GeometryRuntimeProvider:
         self._map_delivery_tickets: Dict[int, _MapDeliveryTicket] = {}
         self._next_map_delivery_ticket_id = 1
         self._last_occupancy_grid: Optional[OccupancyGrid] = None
+        self._last_map_update_evidence = None
+        self._assigned_fine_archive_versions = frozenset()
+        self._native_input_failure_reason: Optional[str] = None
         self._last_occupancy_grid_identity: Optional[_MappingIdentity] = None
         self._last_occupancy_grid_revision = 0
         self._last_map_stream_observation = None
@@ -3344,7 +3347,7 @@ class GeometryRuntimeProvider:
 
     def _invalidate_map_connection_locked(self) -> Optional[_AssignedActivationAttempt]:
         # 调用方在两个锁外释放旧载荷；断连撤销重试资格，UNKNOWN 不因此变成未执行。
-        retired_attempt = getattr(self, "_assigned_activation_attempt", None)
+        retired_attempt = self._assigned_activation_attempt
         self._assigned_activation_attempt = None
         self._map_connection_epoch += 1
         self._assigned_fine_archive_versions = frozenset()
@@ -3979,7 +3982,7 @@ class GeometryRuntimeProvider:
     def supports_assigned_fine_archive_version(self, version, *, expected_origin):
         with self.assigned_activation_origin_guard(expected_origin):
             return version in (2, 3) or (version in (1, 4, 5)
-                and version in getattr(self, "_assigned_fine_archive_versions", ()))
+                and version in self._assigned_fine_archive_versions)
 
     def require_assigned_fine_archive_support(self, checkpoint, *, expected_origin):
         if checkpoint.fine_archive is not None and checkpoint.fine_archive[:8] in (b"NUWAXAR1", b"NUWAXAR4", b"NUWAXAR5"):
@@ -4574,10 +4577,10 @@ class GeometryRuntimeProvider:
                 return None
             request_identity = self._mapping_identity
             request_token = self._map_delivery_token_locked()
-            cached = getattr(self, "_last_occupancy_grid", None)
-            evidence = getattr(self, "_last_map_update_evidence", None)
+            cached = self._last_occupancy_grid
+            evidence = self._last_map_update_evidence
             bound = (cached is not None and evidence is not None and evidence[0] == request_token
-                     and getattr(self, "_last_occupancy_grid_identity", None) == request_identity)
+                     and self._last_occupancy_grid_identity == request_identity)
         if request_identity is None:
             return None
         if bound:
@@ -4776,7 +4779,7 @@ class GeometryRuntimeProvider:
                     raise ValueError("map update crossed provider connection/mapping transition")
                 if self._mapping_identity is not None and self._mapping_identity != identity:
                     raise ValueError("map update mapping identity mismatch")
-                observed = getattr(self, "_last_map_update_evidence", None)
+                observed = self._last_map_update_evidence
                 previous = observed if observed is not None and observed[0] == admission_token else None
             if previous is not None:
                 prior = previous[1]
@@ -4788,7 +4791,7 @@ class GeometryRuntimeProvider:
                     if receipt_key != prior or body != previous[2]:
                         raise ValueError("same map receipt has conflicting immutable content")
                     with self._map_state_lock:
-                        if getattr(self, "_last_map_update_evidence", None) is observed and self._map_delivery_token_locked() == admission_token:
+                        if self._last_map_update_evidence is observed and self._map_delivery_token_locked() == admission_token:
                             return None
                     continue
             break
@@ -4796,14 +4799,16 @@ class GeometryRuntimeProvider:
             resolution=meta.resolution, origin_x=meta.origin_x, origin_y=meta.origin_y,
             frame_id=meta.frame_id, timestamp_ns=timestamp, data=data)
         cells = np.frombuffer(data, dtype=np.int8)
-        known = int(np.count_nonzero(cells >= 0)); occupied = int(np.count_nonzero(cells >= 50))
+        known = int(np.count_nonzero(cells >= 0))
+        occupied = int(np.count_nonzero(cells >= 50))
         display_grid = grid
         if display_body is not None and representation == int(pb2.RAW_MAP_REPRESENTATION_SEPARATE_RAW):
             display_grid = self._occupancy_grid_from_components(map_name=map_name, width=meta.width, height=meta.height,
                 resolution=meta.resolution, origin_x=meta.origin_x, origin_y=meta.origin_y,
                 frame_id=meta.frame_id, timestamp_ns=timestamp, data=display_body)
             display_cells = np.frombuffer(display_body, dtype=np.int8)
-            display_known = int(np.count_nonzero(display_cells >= 0)); display_occupied = int(np.count_nonzero(display_cells >= 50))
+            display_known = int(np.count_nonzero(display_cells >= 0))
+            display_occupied = int(np.count_nonzero(display_cells >= 50))
         else:
             display_known, display_occupied = known, occupied
         content_identity = {"kind": "committed_occupancy", "representation": "effective", "provenance": provenance}
@@ -4814,7 +4819,7 @@ class GeometryRuntimeProvider:
             with self._map_state_lock:
                 if self._stopping or self._mapping_transition_inflight or self._map_delivery_token_locked() != admission_token:
                     raise ValueError("map update crossed provider connection/mapping transition")
-                observed = getattr(self, "_last_map_update_evidence", None)
+                observed = self._last_map_update_evidence
                 previous = observed if observed is not None and observed[0] == admission_token else None
             if previous is not None:
                 prior = previous[1]
@@ -4826,7 +4831,7 @@ class GeometryRuntimeProvider:
                     if receipt_key != prior or body != previous[2]:
                         raise ValueError("same map receipt has conflicting immutable content")
                     with self._map_state_lock:
-                        if getattr(self, "_last_map_update_evidence", None) is observed and self._map_delivery_token_locked() == admission_token:
+                        if self._last_map_update_evidence is observed and self._map_delivery_token_locked() == admission_token:
                             return None
                     continue
             content_changed = previous is None or previous[2][0] != layout or previous[2][2] != data
@@ -4859,7 +4864,7 @@ class GeometryRuntimeProvider:
             cached_grid = grid.model_copy(update={"origin": grid.origin.model_copy(deep=True),
                                                   "metadata": copy.deepcopy(grid.metadata)})
             with self._map_state_lock:
-                if getattr(self, "_last_map_update_evidence", None) is not observed:
+                if self._last_map_update_evidence is not observed:
                     continue
                 if self._stopping or self._mapping_transition_inflight or self._map_delivery_token_locked() != admission_token:
                     raise ValueError("map update crossed provider connection/mapping transition")
@@ -7063,7 +7068,7 @@ class GeometryRuntimeProvider:
         are rejected before any RPC instead of being repaired to a legacy frame.
         """
         self._raise_if_stopping("publish_point_cloud")
-        if imu_samples and getattr(self, "_native_input_failure_reason", None):
+        if imu_samples and self._native_input_failure_reason:
             raise RuntimeError("原生输入连续性已失败，需重启拥有方：%s" % self._native_input_failure_reason)
         raw_frame_id = str(frame_id or "")
         normalized_frame_id = raw_frame_id.strip()

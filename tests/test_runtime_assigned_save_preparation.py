@@ -10,6 +10,8 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from tests.conftest import create_geometry_runtime
+
 from tests.conftest import (
     TransferStub,
     dense_bytes,
@@ -47,7 +49,7 @@ class RuntimeAssignedSavePreparationTests(unittest.TestCase):
             self.exports.append(kwargs)
             return self.exported
         self.provider.export_mapping_backend_checkpoint = export
-        self.instance = PlatformGeometryRuntime.__new__(PlatformGeometryRuntime)
+        self.instance = create_geometry_runtime(self.root)
         self.instance.config = PlatformGeometryConfig()
         self.instance._runtime_state_lock = threading.RLock()
         self.instance._remote_provider = self.provider

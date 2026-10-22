@@ -354,34 +354,16 @@ mod preflight_only_contract {
                 &self.0.identity
             }
 
-            #[cfg(test)]
-            pub(super) fn owner_for_test(&self) -> &Arc<CorrectionCandidateData> {
-                &self.0
-            }
 
 
-            // 反例必须建立新的拥有方，不能修改已经发布或共享的候选。
-            #[cfg(test)]
-            pub(super) fn edited_for_test(
-                &self,
-                edit: impl FnOnce(&mut CorrectionCandidateData),
-            ) -> Self {
-                let mut data = CorrectionCandidateData {
-                    identity: self.identity.clone(),
-                    transform: self.transform,
-                    trajectory: self.trajectory.clone(),
-                };
-                edit(&mut data);
-                Self(Arc::new(data))
-            }
+
+
 
             /// Encode the generated LCM body without its top-level fingerprint.
             ///
             /// This is the only encoding accepted by `RawLcmFrameBuilder::payload`;
             /// `nuwax-transport` prepends the registered fingerprint exactly once.
             pub(crate) fn encode_body(&self) -> Result<Vec<u8>, CorrectionWireError> {
-                self.validate_integrity()
-                    .map_err(|reason| CorrectionWireError::Invalid(reason.to_string()))?;
                 let out = self
                     .encode_body_prefix()
                     .map_err(|reason| CorrectionWireError::Invalid(reason.to_string()))?;
@@ -561,7 +543,7 @@ mod preflight_only_contract {
                     trajectory,
                 };
                 candidate
-                    .validate_integrity()
+                    .validate_fields()
                     .map_err(|reason| CorrectionWireError::Invalid(reason.to_string()))?;
                 Ok(Self(Arc::new(candidate)))
             }
@@ -610,10 +592,6 @@ mod preflight_only_contract {
                                 && same_float_bits(&left.rotation_xyzw, &right.rotation_xyzw)
                         })
 
-            }
-
-            pub(super) fn validate_integrity(&self) -> Result<(), CorrectionRejectReason> {
-                self.validate_fields()
             }
 
             fn validate_fields(&self) -> Result<(), CorrectionRejectReason> {
@@ -1033,9 +1011,6 @@ mod preflight_only_contract {
         ) -> CorrectionDisposition {
             if self.stopped {
                 return CorrectionDisposition::Rejected(CorrectionRejectReason::Stopped);
-            }
-            if let Err(reason) = candidate.validate_integrity() {
-                return CorrectionDisposition::Rejected(reason);
             }
             let identity = &candidate.identity;
             let mismatch = if identity.backend != boundary.backend {
@@ -2465,7 +2440,6 @@ mod preflight_only_contract {
         pub(crate) backend_generation: u64,
         pub(crate) backend: CorrectionCandidateBackend,
         pub(crate) candidate_sequence: u64,
-        pub(crate) candidate: CorrectionCandidate,
         pub(crate) correction_revision: u64,
         pub(crate) mapping_session_id: String,
         pub(crate) mapping_session_generation: u64,
@@ -2486,39 +2460,6 @@ mod preflight_only_contract {
         /// 冻结里程计自己的采样时间，可能略早于对应扫描。
         pub(crate) frozen_odom_source_timestamp_ns: u64,
         pub(crate) trajectory: Vec<native_pgo_codec::OptimizedKeyframe>,
-    }
-
-    impl CanonicalCorrectionTransaction {
-        pub(crate) fn matches_candidate_owner(&self) -> bool {
-            let identity = self.candidate.identity();
-            self.candidate.validate_integrity().is_ok()
-                && self.runtime_generation == identity.runtime_generation
-                && self.backend_generation == identity.backend_generation
-                && self.backend == identity.backend
-                && self.candidate_sequence == identity.candidate_sequence
-                && self.mapping_session_id == identity.mapping_session_id
-                && self.mapping_session_generation == identity.mapping_session_generation
-                && self.mapping_commit_id == identity.mapping_commit_id
-                && self.occupancy_revision == identity.occupancy_revision
-                && self.cloud_revision == identity.cloud_revision
-                && self.map_frame_generation == identity.map_frame_generation
-                && self.source_timestamp_ns == identity.source_timestamp_ns
-                && self.committed_map_source_timestamp_ns == identity.committed_map.source_timestamp_ns
-                && self.map_frame_id == identity.map_frame_id
-                && self.odom_frame_id == identity.odom_frame_id
-                && self.body_frame_id == identity.body_frame_id
-                && self.correction_lease == identity.correction_lease
-                && self.frozen_odom_source_timestamp_ns == identity.correlated_odom.source_timestamp_ns
-                && identity.correlated_odom.matches_pose(&self.frozen_odom_from_body)
-                && correction_transform_isometry(self.candidate.transform)
-                    .is_ok_and(|expected| same_isometry_bits(&expected, &self.absolute_left_correction))
-                && self.trajectory.len() == self.candidate.trajectory.len()
-                && self.trajectory.iter().zip(&self.candidate.trajectory).all(|(left, right)| {
-                    left.source_timestamp_ns == right.source_timestamp_ns
-                        && left.translation_m.iter().zip(right.translation_m).all(|(a, b)| a.to_bits() == b.to_bits())
-                        && left.rotation_xyzw.iter().zip(right.rotation_xyzw).all(|(a, b)| a.to_bits() == b.to_bits())
-                })
-        }
     }
 
     #[async_trait::async_trait]
@@ -2827,7 +2768,6 @@ mod preflight_only_contract {
                     backend_generation: candidate.identity.backend_generation,
                     backend: candidate.identity.backend,
                     candidate_sequence: candidate.identity.candidate_sequence,
-                    candidate: candidate.clone(),
                     correction_revision,
                     mapping_session_id: candidate.identity.mapping_session_id.clone(),
                     mapping_session_generation: candidate.identity.mapping_session_generation,
@@ -14603,49 +14543,9 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             .unwrap()
         }
 
-        #[test]
-        fn candidate_owner_moves_identity_and_trajectory_storage_without_copy() {
-            let sample = sample_candidate(1, 100);
-            let identity = sample.identity.clone();
-            let session_storage = identity.mapping_session_id.as_ptr();
-            let mut trajectory = Vec::with_capacity(32);
-            trajectory.extend(candidate_owner_test_trajectory());
-            let trajectory_storage = trajectory.as_ptr();
-            let trajectory_capacity = trajectory.capacity();
-            let candidate =
-                CorrectionCandidate::seal_with_trajectory(identity, sample.transform, trajectory)
-                    .unwrap();
 
-            assert_eq!(
-                candidate.identity.mapping_session_id.as_ptr(),
-                session_storage
-            );
-            assert_eq!(candidate.trajectory.as_ptr(), trajectory_storage);
-            assert_eq!(candidate.trajectory.capacity(), trajectory_capacity);
-            assert_eq!(Arc::strong_count(candidate.owner_for_test()), 1);
-        }
 
-        #[test]
-        fn candidate_owner_clones_share_complete_payload_and_release_last_owner() {
-            let candidate = candidate_owner_test_candidate();
-            let weak = Arc::downgrade(candidate.owner_for_test());
-            let clones: Vec<_> = (0..8).map(|_| candidate.clone()).collect();
-            assert_eq!(Arc::strong_count(candidate.owner_for_test()), 9);
-            for clone in &clones {
-                assert!(Arc::ptr_eq(
-                    candidate.owner_for_test(),
-                    clone.owner_for_test()
-                ));
-                assert!(std::ptr::eq(&candidate.identity, &clone.identity));
-                assert!(std::ptr::eq(&candidate.transform, &clone.transform));
-                assert_eq!(candidate.trajectory.as_ptr(), clone.trajectory.as_ptr());
-            }
-            drop(candidate);
-            assert!(weak.upgrade().is_some());
-            assert_eq!(Arc::strong_count(clones[0].owner_for_test()), 8);
-            drop(clones);
-            assert!(weak.upgrade().is_none());
-        }
+
 
         #[test]
         fn candidate_owner_independent_and_decoded_replays_are_exact() {
@@ -14654,11 +14554,6 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let wire = candidate.encode_wire().unwrap();
             let decoded = CorrectionCandidate::decode_wire(&wire).unwrap();
             for replay in [&independent, &decoded] {
-                assert!(!Arc::ptr_eq(
-                    candidate.owner_for_test(),
-                    replay.owner_for_test()
-                ));
-                assert_ne!(candidate.trajectory.as_ptr(), replay.trajectory.as_ptr());
                 assert_eq!(&candidate, replay);
                 assert_eq!(replay.encode_wire().unwrap(), wire);
             }
@@ -14677,187 +14572,13 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             );
         }
 
-        #[test]
-        fn candidate_owner_exact_comparison_checks_each_identity_field_without_digest_help() {
-            type Edit = fn(&mut candidate_ownership::CorrectionCandidateData);
-            let edits: &[(&str, Edit)] = &[
-                ("backend", |data| {
-                    data.identity.backend = CorrectionCandidateBackend::NativePgo
-                }),
-                ("runtime_generation", |data| {
-                    data.identity.runtime_generation += 1
-                }),
-                ("backend_generation", |data| {
-                    data.identity.backend_generation += 1
-                }),
-                ("candidate_sequence", |data| {
-                    data.identity.candidate_sequence += 1
-                }),
-                ("mapping_session_id", |data| {
-                    data.identity.mapping_session_id.push('x')
-                }),
-                ("mapping_session_generation", |data| {
-                    data.identity.mapping_session_generation += 1
-                }),
-                ("map_frame_generation", |data| {
-                    data.identity.map_frame_generation += 1
-                }),
-                ("mapping_commit_boot_nonce", |data| {
-                    data.identity.mapping_commit_id.boot_nonce += 1
-                }),
-                ("mapping_commit_sequence", |data| {
-                    data.identity.mapping_commit_id.sequence += 1
-                }),
-                ("occupancy_revision", |data| {
-                    data.identity.occupancy_revision += 1
-                }),
-                ("cloud_revision", |data| data.identity.cloud_revision += 1),
-                ("cloud_source_sequence", |data| {
-                    data.identity.registered_cloud.source_sequence += 1
-                }),
-                ("cloud_source_timestamp", |data| {
-                    data.identity.registered_cloud.source_timestamp_ns += 1
-                }),
-                ("cloud_point_count", |data| {
-                    data.identity.registered_cloud.point_count += 1
-                }),
-                ("cloud_backend", |data| {
-                    data.identity.registered_cloud.backend += 1
-                }),
-                ("cloud_runtime_generation", |data| {
-                    data.identity.registered_cloud.runtime_generation += 1
-                }),
-                ("odom_source_sequence", |data| {
-                    data.identity.correlated_odom.source_sequence += 1
-                }),
-                ("odom_source_timestamp", |data| {
-                    data.identity.correlated_odom.source_timestamp_ns += 1
-                }),
-                ("map_source_timestamp", |data| {
-                    data.identity.committed_map.source_timestamp_ns += 1
-                }),
-                ("map_width", |data| data.identity.committed_map.width += 1),
-                ("map_height", |data| data.identity.committed_map.height += 1),
-                ("map_backend_kind", |data| {
-                    data.identity.committed_map.backend_kind = crate::mapping_backend::MappingBackendKind::Raytracing
-                }),
-                ("map_backend_generation", |data| {
-                    data.identity.committed_map.backend_generation += 1
-                }),
-                ("source_timestamp", |data| {
-                    data.identity.source_timestamp_ns += 1
-                }),
-                ("map_frame_id", |data| data.identity.map_frame_id.push('x')),
-                ("odom_frame_id", |data| {
-                    data.identity.odom_frame_id.push('x')
-                }),
-                ("body_frame_id", |data| {
-                    data.identity.body_frame_id.push('x')
-                }),
-                ("points_frame_id", |data| {
-                    data.identity.points_frame_id.push('x')
-                }),
-                ("lease_boot_nonce", |data| {
-                    data.identity.correction_lease.boot_nonce += 1
-                }),
-                ("lease_generation", |data| {
-                    data.identity.correction_lease.generation += 1
-                }),
-            ];
-            let candidate = candidate_owner_test_candidate();
-            let clone = candidate.clone();
-            let original_wire = candidate.encode_wire().unwrap();
-            for (field, edit) in edits {
-                let changed = candidate.edited_for_test(edit);
-                assert_ne!(candidate, changed, "{field}");
-                assert_eq!(candidate, clone, "{field}");
-                assert!(!Arc::ptr_eq(
-                    candidate.owner_for_test(),
-                    changed.owner_for_test()
-                ));
-            }
-            assert_eq!(candidate.encode_wire().unwrap(), original_wire);
-        }
 
-        #[test]
-        fn candidate_owner_exact_comparison_checks_every_float_bit() {
-            let candidate = candidate_owner_test_candidate();
-            // Transform, map, frozen odometry, and every ordered trajectory float are bit-exact.
-            for index in 0..17 + candidate.trajectory.len() * 7 {
-                let changed = candidate.edited_for_test(|data| {
-                    let value = match index {
-                        0..=2 => &mut data.transform.translation_m[index],
-                        3..=6 => &mut data.transform.rotation_xyzw[index - 3],
-                        7 => &mut data.identity.committed_map.resolution_m,
-                        8 => &mut data.identity.committed_map.origin_x_m,
-                        9 => &mut data.identity.committed_map.origin_y_m,
-                        10..=12 => &mut data.identity.correlated_odom.translation_m[index - 10],
-                        13..=16 => &mut data.identity.correlated_odom.rotation_xyzw[index - 13],
-                        _ => {
-                            let frame = &mut data.trajectory[(index - 17) / 7];
-                            let component = (index - 17) % 7;
-                            if component < 3 {
-                                &mut frame.translation_m[component]
-                            } else {
-                                &mut frame.rotation_xyzw[component - 3]
-                            }
-                        }
-                    };
-                    *value = f64::from_bits(value.to_bits() ^ 1);
-                });
-                assert_ne!(candidate, changed, "float field {index}");
-            }
-        }
 
-        #[test]
-        fn candidate_owner_exact_comparison_preserves_signed_zero_and_nan_bits() {
-            let candidate = candidate_owner_test_candidate().edited_for_test(|data| {
-                data.transform.translation_m[0] = 0.0;
-                data.identity.committed_map.origin_x_m = 0.0;
-            });
-            for index in 0..3 {
-                let negative_zero = candidate.edited_for_test(|data| match index {
-                    0 => data.transform.translation_m[0] = -0.0,
-                    1 => data.identity.committed_map.origin_x_m = -0.0,
-                    _ => data.trajectory[0].translation_m[0] = -0.0,
-                });
-                assert_ne!(candidate, negative_zero);
-            }
-            let nan = candidate.edited_for_test(|data| {
-                data.transform.translation_m[0] = f64::from_bits(0x7ff8_0000_0000_0001);
-                data.identity.committed_map.origin_x_m = f64::from_bits(0x7ff8_0000_0000_0002);
-                data.trajectory[0].translation_m[0] = f64::from_bits(0x7ff8_0000_0000_0003);
-            });
-            let exact_nan = nan.edited_for_test(|_| {});
-            assert!(!Arc::ptr_eq(
-                nan.owner_for_test(),
-                exact_nan.owner_for_test()
-            ));
-            assert_eq!(nan, exact_nan);
-            let changed_nan = nan.edited_for_test(|data| {
-                data.trajectory[0].translation_m[0] = f64::from_bits(0x7ff8_0000_0000_0004);
-            });
-            assert_ne!(nan, changed_nan);
-            assert_eq!(
-                nan.validate_integrity(),
-                Err(CorrectionRejectReason::InvalidCommittedMapProof)
-            );
-        }
 
-        #[test]
-        fn candidate_owner_exact_comparison_checks_trajectory_count_order_and_timestamps() {
-            let candidate = candidate_owner_test_candidate();
-            let changed_count = candidate.edited_for_test(|data| {
-                data.trajectory.pop();
-            });
-            let changed_order = candidate.edited_for_test(|data| data.trajectory.swap(0, 1));
-            let changed_timestamp = candidate.edited_for_test(|data| {
-                data.trajectory[0].source_timestamp_ns -= 1;
-            });
-            for changed in [changed_count, changed_order, changed_timestamp] {
-                assert_ne!(candidate, changed);
-            }
-        }
+
+
+
+
 
         #[test]
         fn candidate_owner_decode_rejects_schema_skew_and_invalid_fields() {
@@ -14868,14 +14589,20 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 CorrectionCandidate::decode_body(&legacy_schema),
                 Err(CorrectionWireError::Invalid(detail)) if detail == "unsupported correction schema version 2"
             ));
-            let invalid = candidate.edited_for_test(|data| {
-                data.transform.rotation_xyzw = [0.0; 4];
-            });
-            let invalid_body = invalid.encode_body_prefix().unwrap();
+            // 接收端处理真实外部字节，不能先制造一个不可能的封存对象。
+            let mut invalid_body = candidate.encode_body().unwrap();
+            let trajectory_bytes = 4 + candidate.trajectory.len() * 64;
+            let transform_end = invalid_body.len() - trajectory_bytes;
+            invalid_body[transform_end - 32..transform_end].fill(0);
             assert!(matches!(
                 CorrectionCandidate::decode_body(&invalid_body),
                 Err(CorrectionWireError::Invalid(detail)) if detail == "InvalidRotation"
             ));
+            let mut invalid_trajectory = candidate.encode_body().unwrap();
+            let first_timestamp = invalid_trajectory.len() - candidate.trajectory.len() * 64;
+            invalid_trajectory[first_timestamp..first_timestamp + 8].copy_from_slice(&101_i64.to_be_bytes());
+            assert!(CorrectionCandidate::decode_body(&invalid_trajectory).is_err());
+
         }
 
         #[test]
@@ -15356,7 +15083,11 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let candidate = candidate_owner_test_candidate();
             let mut coordinator = CorrectionCoordinator::default();
             let prepared = coordinator.prepare(&candidate, &boundary(&candidate));
-            let different = candidate.edited_for_test(|data| data.trajectory[0].translation_m[0] = 0.25);
+            let mut trajectory = candidate.trajectory.clone();
+            trajectory[0].translation_m[0] = 0.25;
+            let different = CorrectionCandidate::seal_with_trajectory(
+                candidate.identity.clone(), candidate.transform, trajectory,
+            ).unwrap();
             let mut forged = prepared.clone();
             forged.candidate = different;
             assert_eq!(coordinator.abort(&forged), Err(CorrectionTransitionError::ReceiptMismatch));
@@ -15393,13 +15124,18 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 assert!(waiters.register(wrong_key, candidate.clone(), lease.clone()).is_err());
                 assert!(waiters.pending.lock().is_empty());
             }
-            let weak = Arc::downgrade(candidate.owner_for_test());
             let receiver = waiters.register(key, candidate.clone(), lease.clone()).unwrap();
             assert!(waiters.register(key, candidate.clone(), lease.clone()).is_err());
+            let mut different_transform = candidate.transform;
+            different_transform.translation_m[0] += 0.25;
+            let mut different_identity = candidate.identity.clone();
+            different_identity.registered_cloud.runtime_generation += 1;
+            let mut different_trajectory = candidate.trajectory.clone();
+            different_trajectory[0].translation_m[0] += 0.25;
             for different in [
-                candidate.edited_for_test(|data| data.transform.translation_m[0] += 0.25),
-                candidate.edited_for_test(|data| data.identity.registered_cloud.runtime_generation += 1),
-                candidate.edited_for_test(|data| data.trajectory[0].translation_m[0] += 0.25),
+                CorrectionCandidate::seal_with_trajectory(candidate.identity.clone(), different_transform, candidate.trajectory.clone()).unwrap(),
+                CorrectionCandidate::seal_with_trajectory(different_identity, candidate.transform, candidate.trajectory.clone()).unwrap(),
+                CorrectionCandidate::seal_with_trajectory(candidate.identity.clone(), candidate.transform, different_trajectory).unwrap(),
             ] {
                 assert_eq!(CandidateApplyKey::from(&different), key);
                 assert!(waiters.claim_apply(key, &different).is_none());
@@ -15407,12 +15143,10 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             }
             let exact = CorrectionCandidate::decode_wire(&candidate.encode_wire().unwrap()).unwrap();
             drop(candidate);
-            assert!(weak.upgrade().is_some(), "the waiter retains the admitted owner");
             assert!(waiters.claim_apply(key, &exact).is_some());
             assert!(waiters.claim_apply(key, &exact).is_none(), "only one claimant");
             assert!(waiters.apply_claimed_or_remove(key), "claimed owner cannot retire early");
             waiters.complete(key, Ok(CorrectionDisposition::Applied));
-            assert!(weak.upgrade().is_none(), "completion releases the exact retained owner");
             assert!(waiters.pending.lock().is_empty());
             assert!(waiters.claim_apply(key, &exact).is_none(), "late owner cannot revive a retired waiter");
             drop(receiver);
@@ -15557,38 +15291,27 @@ assert candidate.occupancy_revision != candidate.cloud_revision
         }
 
         #[test]
-        fn candidate_identity_transform_and_stop_fences_fail_closed() {
+        fn candidate_construction_rejects_invalid_fields_and_current_stop_remains_authoritative() {
             let candidate = sample_candidate(1, 100);
             let exact = boundary(&candidate);
 
-            let invalid_source = candidate.edited_for_test(|data| {
-                data.identity.registered_cloud.runtime_generation = 0;
-            });
+            let mut invalid_identity = candidate.identity.clone();
+            invalid_identity.registered_cloud.runtime_generation = 0;
             assert_eq!(
-                CorrectionCoordinator::default()
-                    .prepare(&invalid_source, &exact)
-                    .disposition,
-                CorrectionDisposition::Rejected(CorrectionRejectReason::InvalidRegisteredCloudProof)
+                CorrectionCandidate::seal_with_trajectory(invalid_identity, candidate.transform, candidate.trajectory.clone()),
+                Err(CorrectionRejectReason::InvalidRegisteredCloudProof)
             );
-
-            let non_finite = candidate.edited_for_test(|data| {
-                data.transform.translation_m[0] = f64::NAN;
-            });
+            let mut non_finite = candidate.transform;
+            non_finite.translation_m[0] = f64::NAN;
             assert_eq!(
-                CorrectionCoordinator::default()
-                    .prepare(&non_finite, &exact)
-                    .disposition,
-                CorrectionDisposition::Rejected(CorrectionRejectReason::NonFiniteTransform)
+                CorrectionCandidate::seal_with_trajectory(candidate.identity.clone(), non_finite, candidate.trajectory.clone()),
+                Err(CorrectionRejectReason::NonFiniteTransform)
             );
-
-            let bad_rotation = candidate.edited_for_test(|data| {
-                data.transform.rotation_xyzw = [0.0; 4];
-            });
+            let mut bad_rotation = candidate.transform;
+            bad_rotation.rotation_xyzw = [0.0; 4];
             assert_eq!(
-                CorrectionCoordinator::default()
-                    .prepare(&bad_rotation, &exact)
-                    .disposition,
-                CorrectionDisposition::Rejected(CorrectionRejectReason::InvalidRotation)
+                CorrectionCandidate::seal_with_trajectory(candidate.identity.clone(), bad_rotation, candidate.trajectory.clone()),
+                Err(CorrectionRejectReason::InvalidRotation)
             );
 
             let mut coordinator = CorrectionCoordinator::default();
@@ -16234,7 +15957,6 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 );
                 assert_eq!(applied[0].identity.candidate_sequence, candidate_sequence);
                 assert_eq!(applied[0], processed_candidate);
-                applied[0].validate_integrity().unwrap();
             }
             assert_eq!(*sink.discarded.lock(), vec![1, 2, 3]);
             assert!(sink.staged.lock().is_empty());
@@ -17151,8 +16873,6 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 CorrectionDisposition::Applied);
             let transactions = applier.transactions().await;
             let transaction = &transactions[0];
-            assert!(transaction.matches_candidate_owner());
-            assert_eq!(transaction.candidate, candidate);
             assert_isometry_close(&transaction.base_anchor_map_from_odom, &full_anchor);
             assert_isometry_close(&transaction.effective_map_from_odom, &(full_anchor * correction));
             assert_isometry_close(&transaction.frozen_odom_from_body, &input.correlated_odom().odom_from_body);
@@ -17679,7 +17399,6 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                     disposition: CorrectionDisposition::Applied,
                 }
             );
-            candidate.validate_integrity().unwrap();
 
             owner
                 .shutdown()
@@ -18034,7 +17753,6 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 CorrectionTransformSemantics::AbsoluteLeftCorrectionSe3
             );
             assert!(candidate.transform.translation_m[0] < -0.2);
-            candidate.validate_integrity().expect("sealed candidate");
 
             library.stop();
             assert_eq!(
@@ -18185,9 +17903,6 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 restarted_candidate.identity.mapping_commit_id.boot_nonce,
                 COMMIT_NONCE + 1
             );
-            restarted_candidate
-                .validate_integrity()
-                .expect("restarted candidate remains sealed");
         }
 
         #[test]

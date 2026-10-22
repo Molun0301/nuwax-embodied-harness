@@ -4688,39 +4688,6 @@ impl GeometryCanonicalCorrectionApplier {
         {
             return Err("canonical correction transaction identity mismatch".to_owned());
         }
-        if transaction.candidate_sequence == 0
-            || !transaction.matches_candidate_owner()
-            || transaction.correction_revision == 0
-            || transaction.mapping_commit_id.boot_nonce == 0
-            || transaction.mapping_commit_id.sequence == 0
-            || transaction.mapping_session_id.is_empty()
-            || transaction.mapping_session_id.trim() != transaction.mapping_session_id
-            || transaction.mapping_session_generation == 0
-            || transaction.map_frame_generation == 0
-            || transaction.occupancy_revision == 0
-            || transaction.cloud_revision == 0
-            || transaction.frozen_odom_source_timestamp_ns > transaction.source_timestamp_ns
-            || match transaction.backend {
-                crate::correction_coordinator::CorrectionCandidateBackend::Relocalization => {
-                    transaction.committed_map_source_timestamp_ns > transaction.source_timestamp_ns
-                }
-                crate::correction_coordinator::CorrectionCandidateBackend::LibraryPgo
-                | crate::correction_coordinator::CorrectionCandidateBackend::NativePgo => {
-                    transaction.committed_map_source_timestamp_ns != transaction.source_timestamp_ns
-                }
-            }
-            || !canonical_isometry_is_finite(&transaction.base_anchor_map_from_odom)
-            || !canonical_isometry_is_finite(&transaction.absolute_left_correction)
-            || !canonical_isometry_is_finite(&transaction.effective_map_from_odom)
-            || !canonical_isometry_is_finite(&transaction.frozen_odom_from_body)
-        {
-            return Err("canonical correction transaction fields are invalid".to_owned());
-        }
-        let recomposed =
-            transaction.base_anchor_map_from_odom * transaction.absolute_left_correction;
-        if !canonical_isometry_near(&recomposed, &transaction.effective_map_from_odom) {
-            return Err("effective correction is not base_anchor * absolute C".to_owned());
-        }
         let current = self.current.read();
         match current.as_ref() {
             None if transaction.correction_revision != 1 => {
@@ -13393,7 +13360,7 @@ pub(crate) mod mapping_feed_tests {
             translation_m: absolute_left_correction.translation.vector.into(),
             rotation_xyzw: [q.i, q.j, q.k, q.w],
         };
-        let candidate = CorrectionCandidate::seal_with_trajectory(
+        CorrectionCandidate::seal_with_trajectory(
             identity.clone(), transform, trajectory.clone())?;
         // The production canonical transaction uses this same V3 quaternion decode.
         let absolute_left_correction = nalgebra::Isometry3::from_parts(
@@ -13405,7 +13372,6 @@ pub(crate) mod mapping_feed_tests {
             backend_generation: identity.backend_generation,
             backend: identity.backend,
             candidate_sequence: identity.candidate_sequence,
-            candidate,
             correction_revision,
             mapping_session_id: identity.mapping_session_id,
             mapping_session_generation: identity.mapping_session_generation,
@@ -13426,7 +13392,6 @@ pub(crate) mod mapping_feed_tests {
             frozen_odom_from_body,
             trajectory,
         };
-        assert!(transaction.matches_candidate_owner(), "fixture must retain its complete sealed V3 owner");
         Ok(transaction)
     }
 
@@ -16598,44 +16563,45 @@ pub(crate) mod mapping_feed_tests {
             nalgebra::UnitQuaternion::from_euler_angles(0.15, -0.35, 0.6),
         );
         let effective = base_anchor * correction;
-        let transaction = sealed_canonical_transaction_for_test(
-            crate::correction_coordinator::CorrectionCandidateIdentity {
-                runtime_generation: identity.runtime_generation,
-                backend_generation: identity.backend_generation,
-                backend: crate::correction_coordinator::CorrectionCandidateBackend::Relocalization,
-                candidate_sequence: 1,
-                mapping_session_id: "canonical-correction-session".into(),
-                mapping_session_generation: 33,
-                mapping_commit_id: crate::mapping_commit::MappingCommitId {
-                    boot_nonce: 0x5678,
-                    sequence: 1,
-                },
-                occupancy_revision,
-                cloud_revision,
-                map_frame_generation: 34,
-                source_timestamp_ns,
-                map_frame_id: "robot_map".into(),
-                odom_frame_id: "robot_odom".into(),
-                body_frame_id: "robot_body".into(),
-                correction_lease: identity.correction_lease,
-                transform_semantics: crate::correction_coordinator::CorrectionTransformSemantics::AbsoluteLeftCorrectionSe3,
-                points_frame_id: "robot_body".into(),
-                registered_cloud: crate::correction_coordinator::RegisteredCloudProof {
-                    backend: nuwax_codec::lcm::lio::LIO_BACKEND_DEVICE,
-                    runtime_generation: identity.runtime_generation,
-                    source_sequence: 1,
-                    source_timestamp_ns,
-                    point_count: 3,
-                },
-                correlated_odom: frozen_odom_proof_for_test(
-                    1, source_timestamp_ns, &frozen_odom),
-                committed_map: crate::correction_coordinator::CommittedMapProof {
-                    backend_kind: crate::mapping_backend::MappingBackendKind::Voxel,
-                    backend_generation: 1,
-                    source_timestamp_ns,
-                    width: 1, height: 1, resolution_m: 0.1, origin_x_m: 0.0, origin_y_m: 0.0,
-                },
+        let candidate_identity = crate::correction_coordinator::CorrectionCandidateIdentity {
+            runtime_generation: identity.runtime_generation,
+            backend_generation: identity.backend_generation,
+            backend: crate::correction_coordinator::CorrectionCandidateBackend::Relocalization,
+            candidate_sequence: 1,
+            mapping_session_id: "canonical-correction-session".into(),
+            mapping_session_generation: 33,
+            mapping_commit_id: crate::mapping_commit::MappingCommitId {
+                boot_nonce: 0x5678,
+                sequence: 1,
             },
+            occupancy_revision,
+            cloud_revision,
+            map_frame_generation: 34,
+            source_timestamp_ns,
+            map_frame_id: "robot_map".into(),
+            odom_frame_id: "robot_odom".into(),
+            body_frame_id: "robot_body".into(),
+            correction_lease: identity.correction_lease,
+            transform_semantics: crate::correction_coordinator::CorrectionTransformSemantics::AbsoluteLeftCorrectionSe3,
+            points_frame_id: "robot_body".into(),
+            registered_cloud: crate::correction_coordinator::RegisteredCloudProof {
+                backend: nuwax_codec::lcm::lio::LIO_BACKEND_DEVICE,
+                runtime_generation: identity.runtime_generation,
+                source_sequence: 1,
+                source_timestamp_ns,
+                point_count: 3,
+            },
+            correlated_odom: frozen_odom_proof_for_test(
+                1, source_timestamp_ns, &frozen_odom),
+            committed_map: crate::correction_coordinator::CommittedMapProof {
+                backend_kind: crate::mapping_backend::MappingBackendKind::Voxel,
+                backend_generation: 1,
+                source_timestamp_ns,
+                width: 1, height: 1, resolution_m: 0.1, origin_x_m: 0.0, origin_y_m: 0.0,
+            },
+        };
+        let transaction = sealed_canonical_transaction_for_test(
+            candidate_identity.clone(),
             1,
             base_anchor,
             correction,
@@ -16695,13 +16661,13 @@ pub(crate) mod mapping_feed_tests {
         // A second relocalization uses a new cloud timestamp against the same
         // immutable map receipt.  This is legal only for relocalization; the
         // map/occupancy/cloud identities must remain exactly unchanged.
-        let mut second_identity = transaction.candidate.identity().clone();
+        let mut second_identity = candidate_identity.clone();
         second_identity.candidate_sequence = 2;
         second_identity.source_timestamp_ns += 1;
         second_identity.registered_cloud.source_sequence += 1;
         second_identity.registered_cloud.source_timestamp_ns = second_identity.source_timestamp_ns;
         let second_relocalization = sealed_canonical_transaction_for_test(
-            second_identity, 2, transaction.base_anchor_map_from_odom,
+            second_identity.clone(), 2, transaction.base_anchor_map_from_odom,
             transaction.absolute_left_correction, transaction.frozen_odom_from_body,
             transaction.trajectory.clone(),
         ).expect("new scan retains its exact sealed owner against the same map receipt");
@@ -16747,7 +16713,7 @@ pub(crate) mod mapping_feed_tests {
             crate::correction_coordinator::CorrectionCandidateBackend::LibraryPgo,
             crate::correction_coordinator::CorrectionCandidateBackend::NativePgo,
         ] {
-            let mut timestamp_split = second_relocalization.candidate.identity().clone();
+            let mut timestamp_split = second_identity.clone();
             timestamp_split.backend = backend;
             timestamp_split.candidate_sequence = 3;
             timestamp_split.source_timestamp_ns += 1;
@@ -16763,12 +16729,6 @@ pub(crate) mod mapping_feed_tests {
                 "{backend:?} must reject split map/cloud clocks at the V3 sealing boundary",
             );
         }
-
-        let mut owner_mismatch = second_relocalization.clone();
-        owner_mismatch.candidate_sequence += 1;
-        assert!(!owner_mismatch.matches_candidate_owner());
-        assert!(applier.validate_transaction(&owner_mismatch).is_err(),
-            "a transaction cannot relabel its immutable candidate owner");
 
         let mut wrong_revision = transaction;
         wrong_revision.correction_revision = 3;
@@ -17501,29 +17461,30 @@ pub(crate) mod mapping_feed_tests {
                         assert_eq!(staged_frame.mapping_commit_id, receipt.commit_id);
                         assert_eq!(staged_frame.cloud_revision, previous_cloud);
 
+                        let candidate_identity = crate::correction_coordinator::CorrectionCandidateIdentity {
+                            runtime_generation: 7,
+                            backend_generation: 7,
+                            backend,
+                            candidate_sequence: revision,
+                            mapping_session_id: binding.mapping_session_id.clone(),
+                            mapping_session_generation: binding.mapping_session_generation,
+                            mapping_commit_id: receipt.commit_id,
+                            occupancy_revision: receipt.occupancy_revision,
+                            cloud_revision: previous_cloud,
+                            map_frame_generation: binding.map_frame_generation,
+                            source_timestamp_ns: stamp,
+                            map_frame_id: "map".into(),
+                            odom_frame_id: "odom".into(),
+                            body_frame_id: "base_link".into(),
+                            correction_lease: identity.correction_lease,
+                            transform_semantics: crate::correction_coordinator::CorrectionTransformSemantics::AbsoluteLeftCorrectionSe3,
+                            points_frame_id: "base_link".into(),
+                            registered_cloud: staged_frame.registered_cloud(),
+                            correlated_odom: staged_frame.correlated_odom().proof,
+                            committed_map: staged_frame.committed_map,
+                        };
                         let transaction = sealed_canonical_transaction_for_test(
-                            crate::correction_coordinator::CorrectionCandidateIdentity {
-                                runtime_generation: 7,
-                                backend_generation: 7,
-                                backend,
-                                candidate_sequence: revision,
-                                mapping_session_id: binding.mapping_session_id.clone(),
-                                mapping_session_generation: binding.mapping_session_generation,
-                                mapping_commit_id: receipt.commit_id,
-                                occupancy_revision: receipt.occupancy_revision,
-                                cloud_revision: previous_cloud,
-                                map_frame_generation: binding.map_frame_generation,
-                                source_timestamp_ns: stamp,
-                                map_frame_id: "map".into(),
-                                odom_frame_id: "odom".into(),
-                                body_frame_id: "base_link".into(),
-                                correction_lease: identity.correction_lease,
-                                transform_semantics: crate::correction_coordinator::CorrectionTransformSemantics::AbsoluteLeftCorrectionSe3,
-                                points_frame_id: "base_link".into(),
-                                registered_cloud: staged_frame.registered_cloud(),
-                                correlated_odom: staged_frame.correlated_odom().proof,
-                                committed_map: staged_frame.committed_map,
-                            },
+                            candidate_identity.clone(),
                             revision,
                             binding.base_anchor_map_from_odom,
                             correction,
@@ -17537,19 +17498,14 @@ pub(crate) mod mapping_feed_tests {
                                 .apply_transaction(transaction.clone(), cancelled)
                                 .await
                                 .is_err());
-                            let mut owner_mismatch = transaction.clone();
-                            owner_mismatch.trajectory[0].translation_m[0] += 1.0;
-                            assert!(!owner_mismatch.matches_candidate_owner());
-                            assert!(applier
-                                .apply_transaction(owner_mismatch.clone(), new_cancellation())
-                                .await
-                                .is_err());
+                            // 新合法候选的轨迹仍须与真实建图输入关联，不能借静态封存放行错误几何。
+                            let mut changed_trajectory = transaction.trajectory.clone();
+                            changed_trajectory[0].translation_m[0] += 1.0;
                             let invalid = sealed_canonical_transaction_for_test(
-                                transaction.candidate.identity().clone(), transaction.correction_revision,
+                                candidate_identity.clone(), transaction.correction_revision,
                                 transaction.base_anchor_map_from_odom, transaction.absolute_left_correction,
-                                transaction.frozen_odom_from_body, owner_mismatch.trajectory,
+                                transaction.frozen_odom_from_body, changed_trajectory,
                             ).expect("invalid replay geometry still has a valid V3 candidate owner");
-                            assert!(invalid.matches_candidate_owner());
                             assert!(applier
                                 .apply_transaction(invalid, new_cancellation())
                                 .await

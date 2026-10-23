@@ -32,15 +32,14 @@ class NavigationFailureMessageTests(unittest.TestCase):
         runtime._estimate_navigation_progress = lambda context: 0.1
         runtime._build_task_request_metadata = lambda **kwargs: {}
         runtime.memory_service.resolve_navigation_region = lambda goal: None
-        runtime._navigation_terminal_proof = lambda context, **kwargs: {
-            'goal_id': kwargs['goal_id'], 'parking_confirmed': True}
-        runtime._cancel_navigation_with_safety_barrier = lambda *a, **k: self.fail('unexpected motion/cancel path')
+        runtime._cancel_navigation_and_wait_terminal = lambda *a, **k: self.fail('unexpected motion/cancel path')
         self.set_calls = []
 
-    def state(self, message, status=NavigationStatus.FAILED, reached=False):
+    def state(self, message, status=NavigationStatus.FAILED, reached=False, metadata=None):
         return NavigationContext(backend_name='isolated', goal_reached=reached,
             navigation_state=NavigationState(current_goal_id='offline-goal', status=status,
-                message=message, goal_reached=reached))
+                message=message, goal_reached=reached,
+                metadata={'observed_goal_id': 'offline-goal', **(metadata or {})}))
 
     def submit(self, states):
         remaining = iter(states)
@@ -56,6 +55,7 @@ class NavigationFailureMessageTests(unittest.TestCase):
 
         self.runtime.navigation_service.set_goal = set_goal
         self.runtime.navigation_service.refresh_navigation = refresh
+        self.runtime.navigation_service.get_latest_navigation_context = lambda: self.current
         return self.runtime._submit_navigation_task(capability_name='navigate_to_pose',
             goal=NavigationGoal(goal_id='offline-goal', map_name='map', target_name='fixture'),
             motion_admission=object(), poll_interval_sec=0.02, timeout_sec=2,
@@ -85,11 +85,50 @@ class NavigationFailureMessageTests(unittest.TestCase):
                 self.assertEqual(public['structuredContent']['error_payload']['message'], cause)
                 self.assertIn(cause, public['structuredContent']['status']['message'])
 
-    def test_success_without_arrival_retains_specific_error(self):
-        task = self.submit([self.state('backend done without arrival', NavigationStatus.SUCCEEDED)])
+    def test_native_success_does_not_require_python_arrival_or_zero_proof(self):
+        receipt = {'actuator_zeroed': False, 'zero_ack_id': '', 'zero_applied_monotonic_ns': 0}
+        task = self.submit([self.state('原生已完成停车后到达复核', NavigationStatus.SUCCEEDED,
+                                      metadata=receipt)])
+        result = self.manager.wait_for_task(task.task_id, timeout=2)
+        self.assertEqual(self.manager.get_task_status(task.task_id).state.value, 'succeeded')
+        for key, value in receipt.items():
+            self.assertEqual(result['navigation_context'].navigation_state.metadata[key], value)
+
+    def test_ungranted_lease_keeps_original_failure_without_substitute_proof(self):
+        task = self.submit([self.state('LEASE_NOT_GRANTED: STALE_STOP_GENERATION',
+                                      metadata={'reason_code': 'LEASE_NOT_GRANTED'})])
         with self.assertRaises(GatewayError) as raised:
             self.manager.wait_for_task(task.task_id, timeout=2)
-        self.assertEqual(raised.exception.error_code, 'arrival_not_confirmed')
+        self.assertEqual(raised.exception.error_code, 'navigation_failed')
+        self.assertEqual(raised.exception.message, 'LEASE_NOT_GRANTED: STALE_STOP_GENERATION')
+
+    def test_native_cancel_without_zero_receipt_cancels_task(self):
+        task = self.submit([self.state('后端已取消', NavigationStatus.CANCELLED)])
+        self.manager.wait_for_task(task.task_id, timeout=2)
+        self.assertEqual(self.manager.get_task_status(task.task_id).state.value, 'cancelled')
+
+    def test_public_cancel_active_state_without_goal_id_delegates_to_backend(self):
+        active = NavigationContext(navigation_state=NavigationState(status=NavigationStatus.RUNNING))
+        calls = []
+        self.runtime.navigation_service.get_navigation_control_context = lambda: active
+        def cancel_goal(*, request_id):
+            calls.append(request_id)
+            return self.state('后端已取消当前目标', NavigationStatus.CANCELLED)
+        self.runtime.navigation_service.cancel_goal = cancel_goal
+        result = self.runtime._handle_cancel_navigation({})
+        self.assertEqual(calls, [None])
+        self.assertTrue(result['cancellation_requested'])
+        self.assertTrue(result['completed'])
+        self.assertEqual(result['navigation_state']['current_goal_id'], 'offline-goal')
+
+    def test_memory_candidate_navigation_consumes_native_success(self):
+        terminal = self.state('原生到达完成', NavigationStatus.SUCCEEDED)
+        self.runtime.navigation_service.set_goal = lambda *args, **kwargs: terminal
+        self.runtime.navigation_service.refresh_navigation = lambda **kwargs: terminal
+        result = self.runtime._navigate_until_complete_with_motion_admission(
+            NavigationGoal(goal_id='offline-goal', target_name='fixture'),
+            motion_admission=object(), timeout_sec=1)
+        self.assertIs(result, terminal)
 
     def test_stale_input_wait_keeps_the_same_task_and_goal(self):
         task = self.submit([self.state('位姿短时过期，保持零速等待', NavigationStatus.RUNNING),

@@ -5291,7 +5291,15 @@ impl GeometryRuntime for GeometryRuntimeService {
             input.clone(),
         )
         .await;
-        if let Some(update)=self.bridge.nav.terminal_receipt_for(&input).await {
+        // 空请求在原生拥有方内才绑定目标；按该实际租约找发布期间到达的终态。
+        let completed_input = if let Some(lease) = lease.as_ref() {
+            crate::nav_runtime::CancelGoalInput {
+                goal_id: lease.session_id.clone(), owner_kind: lease.owner_kind,
+                parent_request_id: lease.parent_request_id.clone(), goal_generation: lease.goal_generation,
+                producer_runtime_generation: lease.producer_runtime_generation,
+            }
+        } else { input };
+        if let Some(update)=self.bridge.nav.terminal_receipt_for(&completed_input).await {
             return Ok(Response::new(nav_state_to_proto(update)));
         }
         {
@@ -9861,7 +9869,7 @@ use nuwax_protocol::RawLcmFrame;
             .await
             .expect("real-lcm test handle");
         let sink = Arc::new(LifecycleExploreSink::default());
-        start_active_exploration(&handle, sink.clone(), "process-stop-cancel-timeout").await;
+        let (_, child_lease) = start_active_exploration(&handle, sink.clone(), "process-stop-cancel-timeout").await;
         sink.cancel_never_returns
             .store(true, std::sync::atomic::Ordering::Release);
         let (shutdown, mut listener) = crate::server::shutdown_channel();
@@ -9880,7 +9888,8 @@ use nuwax_protocol::RawLcmFrame;
         let retained = handle.explore.snapshot();
         assert_eq!(retained.status, STATUS_FAILED);
         assert!(retained.message.contains("dispatch timed out"));
-        assert!(!retained.child_task_id.is_empty());
+        assert!(retained.child_task_id.is_empty());
+        assert!(handle.explore.orphan_cancellation_registry().contains(&child_lease));
         assert!(handle.explore.blocks_mapping_mutation().await);
         assert_eq!(service.state.read().await.phase, "failed");
         assert!(handle.mapping_lifecycle_lock.try_lock().is_ok());

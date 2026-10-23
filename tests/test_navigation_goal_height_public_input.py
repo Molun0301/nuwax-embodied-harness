@@ -162,6 +162,7 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
         def dispatch(goal, **kwargs):
             gateway.height_events.append("dispatch")
             gateway.dispatched.append(goal.model_copy(deep=True))
+            navigation_context.navigation_state.current_goal_id = goal.goal_id
             return navigation_context
 
         navigation_context = self.navigation_context()
@@ -173,15 +174,14 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
         self._gateway_overrides[gateway].enter_context(patch.object(gateway, '_ensure_motion_runtime_for_backend_call', lambda *args, **kwargs: gateway.height_events.append("runtime_ready"), create=True))
         self._gateway_overrides[gateway].enter_context(patch.object(gateway, '_capture_task_generation_snapshot', lambda **kwargs: {}, create=True))
         self._gateway_overrides[gateway].enter_context(patch.object(gateway, '_record_task_generation_snapshot', lambda *args: None, create=True))
-        self._gateway_overrides[gateway].enter_context(patch.object(gateway, '_navigation_terminal_proof', lambda *args, **kwargs: {"parking_confirmed": True}, create=True))
         self._gateway_overrides[gateway].enter_context(patch.object(gateway.navigation_service, "set_goal", Mock(side_effect=dispatch)))
         self._gateway_overrides[gateway].enter_context(patch.object(gateway.navigation_service, "refresh_navigation", Mock(return_value=navigation_context)))
         return gateway
 
     @staticmethod
-    def navigation_context(*, status=NavigationStatus.SUCCEEDED, message=None):
+    def navigation_context(*, status=NavigationStatus.SUCCEEDED, message=None, goal_id=None):
         return SimpleNamespace(goal_reached=status == NavigationStatus.SUCCEEDED,
-            navigation_state=SimpleNamespace(status=status, message=message,
+            navigation_state=SimpleNamespace(current_goal_id=goal_id, status=status, message=message,
                 remaining_distance_m=0, goal_reached=status == NavigationStatus.SUCCEEDED, metadata={}))
 
     def run_latest(self, gateway):
@@ -506,6 +506,8 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
     def test_dispatch_retry_keeps_height_and_propagates_accepted_terminal_failure(self):
         gateway = self.configure_runner(self.gateway())
         attempts = []
+        terminal = self.navigation_context(status=NavigationStatus.FAILED, message="SafetyFailed cause=StaleInput: fixture")
+        later = self.navigation_context()
 
         def dispatch(goal, **kwargs):
             attempts.append(goal.model_copy(deep=True))
@@ -513,12 +515,13 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
             if len(attempts) == 1:
                 raise GatewayError("等待输入", error_code="navigation_goal_rejected",
                     details={"backend_code": "PLANNER_INPUT_STALE"})
-            return self.navigation_context()
+            terminal.navigation_state.current_goal_id = goal.goal_id
+            later.navigation_state.current_goal_id = goal.goal_id
+            return self.navigation_context(goal_id=goal.goal_id)
 
         self._gateway_overrides[gateway].enter_context(patch.object(gateway.navigation_service.set_goal, 'side_effect', dispatch, create=True))
         self._gateway_overrides[gateway].enter_context(patch.object(gateway.navigation_service.refresh_navigation, 'side_effect', [
-            self.navigation_context(status=NavigationStatus.FAILED, message="SafetyFailed cause=StaleInput: fixture"),
-            self.navigation_context(),
+            terminal, later,
         ], create=True))
         self.mcp_call(gateway, {"frame_id": "map", "x": 4.25, "y": -1.5})
         with patch("gateways.runtime.time.sleep"), self.assertRaises(GatewayError) as failure:

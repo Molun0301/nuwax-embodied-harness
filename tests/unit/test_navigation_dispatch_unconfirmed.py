@@ -239,84 +239,65 @@ def test_untrusted_or_noncanonical_unary_cannot_establish_ownership(mutation):
         update.message = ORIGIN
     backend = provider(update)
     accepted, result = submit(backend)
-    assert not accepted and result["disposition"] == "rejected"
+    assert not accepted and result["disposition"] == ("resolved" if mutation == "message_only" else "rejected")
     assert not result["ownership_retained"]
-    assert snapshot(backend).current_goal_id is None
+    assert snapshot(backend).current_goal_id == (GOAL if mutation == "message_only" else None)
 
 
-@pytest.mark.parametrize("terminal", ["failed", "succeeded"])
-def test_owned_unproved_terminal_projects_unknown_and_blocks_running(terminal):
+@pytest.mark.parametrize("terminal", ["failed", "succeeded", "cancelled"])
+def test_native_terminal_releases_dispatch_obligation_without_extra_zero_fields(terminal):
     backend = provider()
     submit(backend)
     assert stream(backend, wire("running", reason="RUNNING", timestamp=90))
     assert stream(backend, wire(terminal, reason="REAL_TERMINAL", timestamp=100))
     state = snapshot(backend)
-    assert state.status == NavigationStatus.UNCONFIRMED
-    assert state.metadata["observed_status"] == terminal
-    assert state.metadata["reason_code"] == PENDING
-    assert state.metadata["dispatch_obligation"]["terminal_observed"]
-    assert not stream(backend, wire("running", reason="LATE", timestamp=110))
-    assert stream(backend, wire(terminal, reason="ORIGINAL_RECEIPT", timestamp=101, proof=True))
-    state = snapshot(backend)
     assert state.status.value == terminal
+    assert state.metadata["reason_code"] == "REAL_TERMINAL"
     assert not state.metadata["ownership_retained"]
-    assert state.metadata["reason_code"] == "ORIGINAL_RECEIPT"
     assert "dispatch_obligation" not in state.metadata
+    assert not state.metadata["zero_ack_id"]
+    assert not stream(backend, wire("running", reason="LATE", timestamp=110))
 
 
-def test_terminal_gap_typed_marker_blocks_running_without_guessing_terminal_kind():
+
+def test_native_terminal_observation_stays_unknown_until_concrete_terminal():
     backend = provider(wire(reason=PENDING))
     submit(backend)
-    state = snapshot(backend)
-    assert state.metadata["dispatch_obligation"]["terminal_observed"]
-    assert "observed_status" not in state.metadata
-    assert not stream(backend, wire("running", reason="RUNNING", timestamp=20))
-    assert stream(backend, wire("failed", reason="RECEIPT", timestamp=25, proof=True))
+    assert snapshot(backend).status == NavigationStatus.UNCONFIRMED
+    assert stream(backend, wire("running", reason="RUNNING", timestamp=20))
+    assert snapshot(backend).status == NavigationStatus.UNCONFIRMED
+    assert snapshot(backend).metadata["dispatch_obligation"]["terminal_observed"]
+    assert stream(backend, wire("failed", reason="NATIVE_FAILED", timestamp=25))
+    assert snapshot(backend).status == NavigationStatus.FAILED
 
 
-@pytest.mark.parametrize("mutation", ["old_path", "wrong_planner", "old_source", "foreign_lease", "missing_zero"])
-def test_proof_upgrade_requires_exact_path_planner_source_and_zero(mutation):
+
+@pytest.mark.parametrize("field,value", [("goal_id", "other"), ("goal_generation", 9), ("producer_runtime_generation", 99)])
+def test_foreign_terminal_cannot_retire_current_dispatch_obligation(field, value):
     backend = provider()
     submit(backend)
-    assert stream(backend, wire("failed", reason="OBSERVED", timestamp=100))
+    terminal = wire("failed", reason="FOREIGN_TERMINAL", timestamp=100)
+    setattr(terminal, field, value)
     before = copy.deepcopy(backend._last_nav_metadata)
-    receipt = wire("failed", reason="RECEIPT", timestamp=101, proof=True)
-    if mutation == "old_path":
-        receipt.path_revision = 2
-    elif mutation == "wrong_planner":
-        receipt.planner_runtime_generation = 9
-    elif mutation == "old_source":
-        receipt.timestamp_ns = 99
-    elif mutation == "foreign_lease":
-        receipt.goal_generation = 1
-    else:
-        receipt.zero_ack_id = ""
-    assert not stream(backend, receipt)
+    assert not stream(backend, terminal)
     assert backend._last_nav_metadata == before
     assert snapshot(backend).metadata["ownership_retained"]
 
 
-def test_precommit_unproved_terminal_then_exact_proof_resolves_before_unary():
+
+def test_first_native_precommit_terminal_wins_over_later_zero_information():
     backend = provider()
     receipt = wire("failed", reason="COMPLETE_RECEIPT", timestamp=101, proof=True)
-    precommit(backend, wire("failed", reason="OBSERVED", timestamp=100), receipt)
+    first = wire("failed", reason="OBSERVED", timestamp=100)
+    precommit(backend, first, receipt)
     accepted, result = submit(backend)
     assert not accepted and result["disposition"] == "resolved"
-    for key, value in module._navigation_wire_document(receipt).items():
+    for key, value in module._navigation_wire_document(first).items():
         assert result["navigation"][key] == value
     assert not result["ownership_retained"]
 
 
-@pytest.mark.parametrize("change", ["path_revision", "planner_runtime_generation", "timestamp_ns"])
-def test_precommit_bad_proof_upgrade_does_not_escape_terminal_observation(change):
-    backend = provider()
-    bad = wire("failed", reason="BAD", timestamp=101, proof=True)
-    setattr(bad, change, {"path_revision": 2, "planner_runtime_generation": 9, "timestamp_ns": 99}[change])
-    precommit(backend, wire("failed", reason="OBSERVED", timestamp=100), bad)
-    accepted, result = submit(backend)
-    assert not accepted and result["disposition"] == "owned_unconfirmed"
-    assert result["navigation"]["observed_status"] == "failed"
-    assert result["navigation"]["zero_ack_id"] == ""
+
 
 
 def test_ordinary_failed_without_zero_keeps_terminal_contract():
@@ -346,15 +327,14 @@ def test_cancel_advances_command_but_retains_origin_until_exact_receipt():
     assert not snapshot(backend).metadata["ownership_retained"]
 
 
-def test_cancel_unproved_failure_retains_responsibility_and_terminal_observation():
+def test_cancel_native_failure_releases_responsibility():
     backend = provider()
     submit(backend)
     backend._stub.cancel_response = wire("failed", reason="CANCEL_TIMED_OUT", timestamp=100)
-    assert not backend.cancel_goal(GOAL)
+    assert backend.cancel_goal(GOAL)
     state = snapshot(backend)
-    assert state.status == NavigationStatus.UNCONFIRMED
-    assert state.metadata["observed_status"] == "failed"
-    assert state.metadata["ownership_retained"]
+    assert state.status == NavigationStatus.FAILED
+    assert not state.metadata["ownership_retained"]
     assert not stream(backend, wire("running", timestamp=101))
 
 
@@ -371,7 +351,7 @@ def test_same_epoch_disconnect_preserves_source_path_origin_and_recovery():
     for key in ("reason_code", "path_revision", "dispatch_obligation", "ownership_retained"):
         assert after.metadata[key] == before.metadata[key]
     assert stream(backend, wire("failed", reason="TERMINAL", timestamp=101))
-    assert snapshot(backend).status == NavigationStatus.UNCONFIRMED
+    assert snapshot(backend).status == NavigationStatus.FAILED
 
 
 def test_epoch_replacement_keeps_history_until_current_stream_rebinds():
@@ -545,44 +525,13 @@ def test_unknown_state_machine_is_nonterminal_and_not_running():
     assert map_nav2_status_to_platform("UNCONFIRMED") == NavigationStatus.UNCONFIRMED
 
 
-def test_terminal_gap_keeps_real_precommit_source_floor_without_resurrecting_running():
-    backend = provider(wire(reason=PENDING))
-    precommit(backend, wire("running", reason="REAL_RUNNING", timestamp=100))
-    accepted, result = submit(backend)
-    assert not accepted and result["disposition"] == "owned_unconfirmed"
-    assert result["navigation"]["status"] == "unconfirmed"
-    assert result["navigation"]["timestamp_ns"] == 0
-    assert result["navigation"]["dispatch_obligation"]["source_timestamp_floor_ns"] == 100
-    assert not stream(backend, wire("failed", reason="STALE_PROOF", timestamp=99, proof=True))
-    assert stream(backend, wire("failed", reason="REAL_RECEIPT", timestamp=101, proof=True))
 
 
-def test_terminal_gap_preserves_actual_unproved_precommit_terminal_kind():
-    backend = provider(wire(reason=PENDING))
-    precommit(backend, wire("failed", reason="REAL_FAILED", timestamp=100))
-    accepted, result = submit(backend)
-    assert not accepted
-    assert result["navigation"]["observed_status"] == "failed"
-    assert result["navigation"]["timestamp_ns"] == 100
-    assert not result["navigation"]["command_projection_without_source"]
 
 
-def test_service_new_typed_terminal_observation_can_advance_real_running(tmp_path):
-    backend = provider(wire("running"))
-    navigation, view = service(backend, tmp_path)
-    navigation.set_goal(goal())
-    assert stream(backend, wire("running", reason="REAL_RUNNING", timestamp=1_000_000_000))
-    real = navigation._ingest_navigation_state(view, snapshot(backend))
-    # A second isolated provider supplies the exact trusted unary projection body;
-    # this is service ordering only, not a new runtime submission or a retry Goal.
-    pending_backend = provider(wire(reason=PENDING))
-    submit(pending_backend)
-    pending = snapshot(pending_backend)
-    context = navigation._ingest_navigation_state(view, pending)
-    assert context is not real
-    assert context.navigation_state.status == NavigationStatus.UNCONFIRMED
-    assert context.navigation_state.metadata["dispatch_obligation"]["terminal_observed"]
-    assert navigation._ingest_navigation_state(view, real.navigation_state) is context
+
+
+
 
 
 def test_ordinary_zero_source_and_idle_do_not_get_command_projection_exception(tmp_path):
@@ -598,11 +547,11 @@ def test_ordinary_zero_source_and_idle_do_not_get_command_projection_exception(t
     assert not snapshot(idle_backend).metadata.get("command_projection_without_source")
 
 
-def test_ordinary_accepted_then_precommit_failed_keeps_old_acceptance_contract():
+def test_native_precommit_failed_resolves_accepted_unary():
     backend = provider(wire("accepted", reason="ACCEPTED", timestamp=50))
     precommit(backend, wire("failed", reason="ORDINARY_FAILED", timestamp=100))
     accepted, result = submit(backend)
-    assert accepted and result["disposition"] == "confirmed"
+    assert not accepted and result["disposition"] == "resolved"
     assert result["navigation"]["status"] == "failed"
     assert not result["ownership_retained"]
     assert snapshot(backend).status == NavigationStatus.FAILED
@@ -624,22 +573,7 @@ def test_current_stream_and_cloud_can_advance_after_historical_owner():
     assert snapshot(backend).metadata["producer_runtime_generation"] == 8
 
 
-@pytest.mark.parametrize("new_path,new_planner", [(4, 8), (4, 7), (4, 9)])
-def test_stale_terminal_gap_projection_cannot_cover_newer_precommit_path(new_path, new_planner):
-    backend = provider(wire(reason=PENDING, path=3, planner=8))
-    precommit(backend, wire("running", reason="NEW_PATH_RUNNING", timestamp=100,
-                           path=new_path, planner=new_planner))
-    accepted, result = submit(backend)
-    assert accepted and result["disposition"] == "confirmed"
-    state = snapshot(backend)
-    assert state.status == NavigationStatus.RUNNING
-    assert state.metadata["path_revision"] == new_path
-    assert state.metadata["planner_runtime_generation"] == new_planner
-    assert not state.metadata["dispatch_obligation"]["terminal_observed"]
-    assert state.metadata["ownership_retained"]
-    assert stream(backend, wire("failed", reason="NEW_PATH_TERMINAL", timestamp=101,
-                               path=new_path, planner=new_planner))
-    assert snapshot(backend).status == NavigationStatus.UNCONFIRMED
+
 
 
 @pytest.mark.parametrize("new_path,new_planner", [(4, 8), (3, 9)])
@@ -735,16 +669,16 @@ def test_exact_stream_receipt_during_cancel_wins_over_late_pending_ack():
     assert not state.metadata["ownership_retained"]
 
 
-def test_cancel_bad_path_proof_cannot_release_observed_terminal():
+def test_cancel_cannot_rewrite_already_sealed_native_failure():
     backend = provider()
     submit(backend)
     assert stream(backend, wire("failed", reason="OBSERVED", timestamp=100))
     backend._stub.cancel_response = wire("cancelled", reason="OLD_PATH", timestamp=101, path=2, proof=True)
     assert not backend.cancel_goal(GOAL)
     state = snapshot(backend)
-    assert state.status == NavigationStatus.UNCONFIRMED
+    assert state.status == NavigationStatus.FAILED
     assert state.metadata["path_revision"] == 3
-    assert state.metadata["ownership_retained"]
+    assert not state.metadata["ownership_retained"]
 
 
 def test_cloud_late_response_after_epoch_change_cannot_commit_navigation():
@@ -787,46 +721,32 @@ def test_service_source_time_exception_does_not_relax_path_planner_fence(tmp_pat
     assert navigation._ingest_navigation_state(view, older) is context
 
 
-def test_service_ordinary_rejection_still_clears_new_goal(tmp_path):
+def test_service_current_native_failure_is_returned_as_terminal(tmp_path):
     backend = provider(wire("failed", reason="ORDINARY_REJECTED", timestamp=100))
     navigation, view = service(backend, tmp_path)
-    with pytest.raises(GatewayError) as caught:
-        navigation.set_goal(goal())
-    assert caught.value.error_code == "navigation_goal_rejected"
+    context = navigation.set_goal(goal())
+    assert context.navigation_state.status == NavigationStatus.FAILED
+    assert context.navigation_state.metadata["reason_code"] == "ORDINARY_REJECTED"
     assert navigation._current_goal is None
     assert navigation._state_machine.current_status == NavigationStatus.FAILED
 
 
-def test_service_owned_unproved_terminal_does_not_clear_current_goal(tmp_path):
+
+def test_service_native_terminal_clears_current_goal_without_zero_fields(tmp_path):
     backend = provider(wire("running"))
     navigation, view = service(backend, tmp_path)
     requested = goal()
     navigation.set_goal(requested)
     assert stream(backend, wire("failed", reason="OBSERVED", timestamp=100))
-    pending = navigation._ingest_navigation_state(view, snapshot(backend))
-    assert pending.navigation_state.status == NavigationStatus.UNCONFIRMED
-    assert navigation._current_goal is requested
-    assert stream(backend, wire("failed", reason="COMPLETE", timestamp=101, proof=True))
     resolved = navigation._ingest_navigation_state(view, snapshot(backend))
     assert resolved.navigation_state.status == NavigationStatus.FAILED
     assert resolved.current_goal is requested
     assert navigation._current_goal is None
+    assert not stream(backend, wire("running", reason="LATE", timestamp=101))
 
 
-@pytest.mark.parametrize("unary_status,reason", [("UNCONFIRMED", PENDING), ("running", ORIGIN)])
-@pytest.mark.parametrize("bad_field,bad_value", [("path_revision", 1), ("planner_runtime_generation", 9), ("timestamp_ns", 99)])
-def test_complete_precommit_receipt_cannot_bypass_current_unary_path_planner_source(unary_status, reason, bad_field, bad_value):
-    backend = provider(wire(unary_status, reason=reason, path=2, planner=8, timestamp=100))
-    receipt = wire("failed", reason="STALE_FULL_RECEIPT", path=2, planner=8, timestamp=101, proof=True)
-    setattr(receipt, bad_field, bad_value)
-    precommit(backend, receipt)
-    accepted, result = submit(backend)
-    assert result["disposition"] != "resolved"
-    assert result["ownership_retained"]
-    assert result["navigation"]["zero_ack_id"] == ""
-    assert result["navigation"]["path_revision"] == 2
-    assert result["navigation"]["planner_runtime_generation"] == 8
-    assert accepted is (unary_status == "running")
+
+
 
 
 @pytest.mark.parametrize("unary_status,reason", [("UNCONFIRMED", PENDING), ("running", ORIGIN)])
@@ -866,7 +786,7 @@ def test_service_real_callback_after_commit_beats_old_owned_unconfirmed_result(t
         assert navigation._current_goal is None
 
 
-def test_service_unproved_terminal_after_commit_reports_selected_proof_pending(tmp_path):
+def test_service_native_terminal_after_commit_replaces_unconfirmed_submission(tmp_path):
     backend = provider()
     navigation, view = service(backend, tmp_path)
     take = view.take_goal_submission_result
@@ -876,13 +796,10 @@ def test_service_unproved_terminal_after_commit_reports_selected_proof_pending(t
         navigation._ingest_navigation_state(view, snapshot(backend))
         return result
     view.take_goal_submission_result = deliver_before_service_consumes
-    with pytest.raises(GatewayError) as caught:
-        navigation.set_goal(goal())
-    assert caught.value.error_code == "navigation_dispatch_unconfirmed"
-    assert caught.value.details["reason_code"] == PENDING
-    assert caught.value.details["navigation"]["observed_status"] == "failed"
-    assert navigation._current_goal is not None
-
+    context = navigation.set_goal(goal())
+    assert context.navigation_state.status == NavigationStatus.FAILED
+    assert context.navigation_state.metadata["reason_code"] == "REAL_FAILED"
+    assert navigation._current_goal is None
 
 def test_service_connection_change_after_commit_cannot_restore_current_authority(tmp_path):
     backend = provider()
@@ -934,16 +851,7 @@ def test_trusted_public_unary_clears_only_stale_display_overlay():
     assert backend._nav_exploration_overlay is None
 
 
-@pytest.mark.parametrize("staged_planner", [7, 9])
-def test_same_path_different_planner_precommit_cannot_replace_terminal_gap(staged_planner):
-    backend = provider(wire(reason=PENDING, path=3, planner=8))
-    precommit(backend, wire("running", reason="OTHER_PLANNER", path=3,
-                           planner=staged_planner, timestamp=100))
-    accepted, result = submit(backend)
-    assert not accepted and result["disposition"] == "owned_unconfirmed"
-    assert result["navigation"]["path_revision"] == 3
-    assert result["navigation"]["planner_runtime_generation"] == 8
-    assert result["navigation"]["dispatch_obligation"]["terminal_observed"]
+
 
 
 def test_service_newer_path_lower_numeric_planner_accepts_real_source(tmp_path):
@@ -1027,7 +935,7 @@ def _perf_submit(backend, transport):
     ("UNCONFIRMED", ORIGIN, False, "owned_unconfirmed"),
     ("UNCONFIRMED", PENDING, False, "owned_unconfirmed"),
     ("succeeded", "ORIGINAL_RECEIPT", True, "resolved"),
-    ("failed", "ORDINARY_REJECTION", False, "rejected"),
+    ("failed", "ORDINARY_REJECTION", False, "resolved"),
 ])
 def test_submission_materializes_only_cache_and_returned_paths(transport, status, reason, proof, disposition):
     body = wire(status, reason=reason, proof=proof, timestamp=100 if proof else 0)
@@ -1044,9 +952,9 @@ def test_submission_materializes_only_cache_and_returned_paths(transport, status
     assert result["navigation"]["local_path"] == [{"x": 2.0, "y": 3.0, "z": 0.0}]
     assert backend._nav_set_transaction_context.result is None
     if disposition == "resolved":
-        assert result["navigation"]["reason_code"] == "ORIGINAL_RECEIPT"
+        assert result["navigation"]["reason_code"] == reason
         assert result["navigation"]["zero_ack_id"] == body.zero_ack_id
-        assert result["navigation"]["timestamp_ns"] == 100
+        assert result["navigation"]["timestamp_ns"] == body.timestamp_ns
 
 
 @pytest.mark.parametrize("transport", ["set", "cloud"])
@@ -1070,7 +978,7 @@ def test_precommit_materializes_only_selected_cache_and_result(transport, resolv
     selected = (wire("failed", reason="EXACT_RECEIPT", timestamp=101, proof=True)
                 if resolved else wire("running", reason="REAL_RUNNING", timestamp=100))
     if resolved:
-        precommit(backend, wire("failed", reason="TERMINAL_SEEN", timestamp=100), selected)
+        precommit(backend, selected, wire("failed", reason="LATE_TERMINAL", timestamp=102))
     else:
         precommit(backend, selected)
     with patch.object(module, "_navigation_state_typed_metadata", wraps=module._navigation_state_typed_metadata) as materialize:
@@ -1085,23 +993,7 @@ def test_precommit_materializes_only_selected_cache_and_result(transport, resolv
     assert not backend._nav_set_precommit_candidates
 
 
-@pytest.mark.parametrize("change,expected", [
-    (None, True), ("path_revision", False), ("planner_runtime_generation", False),
-    ("timestamp_ns", False), ("zero_ack_id", False),
-])
-def test_precommit_proof_predicate_never_materializes_paths(change, expected):
-    observed = wire("failed", reason="TERMINAL_SEEN", timestamp=100)
-    receipt = wire("failed", reason="EXACT_RECEIPT", timestamp=101, proof=True)
-    if change is not None:
-        setattr(receipt, change, {
-            "path_revision": 2, "planner_runtime_generation": 9,
-            "timestamp_ns": 99, "zero_ack_id": "",
-        }[change])
-    with patch.object(module, "_navigation_state_typed_metadata", wraps=module._navigation_state_typed_metadata) as materialize:
-        result = module._navigation_precommit_proof_upgrade(observed, receipt)
-    print("PERF_NAV proof_predicate change=%s typed_metadata=%d" % (change, materialize.call_count))
-    assert result is expected
-    assert materialize.call_count == 0
+
 
 
 @pytest.mark.parametrize("transport", ["set", "cloud"])
@@ -1238,10 +1130,10 @@ def test_service_confirmed_uses_one_refresh_ingest_and_two_path_materializations
         assert context.navigation_state.metadata["dispatch_obligation"]["origin_reason_code"] == ORIGIN
         assert stream(backend, wire("failed", reason="TERMINAL_WITHOUT_ZERO", timestamp=100))
         pending = navigation._ingest_navigation_state(view, snapshot(backend), lightweight=lightweight)
-        assert pending.navigation_state.status == NavigationStatus.UNCONFIRMED
-        assert pending.navigation_state.metadata["ownership_retained"] is True
-        assert pending.navigation_state.metadata["dispatch_obligation"]["terminal_observed"] is True
-        assert navigation._current_goal.goal_id == GOAL
+        assert pending.navigation_state.status == NavigationStatus.FAILED
+        assert pending.navigation_state.metadata["ownership_retained"] is False
+        assert "dispatch_obligation" not in pending.navigation_state.metadata
+        assert navigation._current_goal is None
 
 
 @pytest.mark.parametrize("lightweight", [False, True])
@@ -1296,7 +1188,7 @@ def test_nested_cloud_active_guard_does_not_clear_outer_submission_slot(outer_tr
 @pytest.mark.parametrize("stale_epoch", [False, True])
 def test_rejected_wire_materializes_after_delivery_command_and_state_unlock(transport, stale_epoch):
     import threading
-    body = wire() if stale_epoch else wire("failed", reason="ORDINARY_REJECTION")
+    body = wire() if stale_epoch else wire("failed", reason="ORDINARY_REJECTION", generation=0)
     body.planned_path.extend(pb2.Vec3(x=index, y=index + 1, z=0) for index in range(2047))
     backend = provider(body)
     if stale_epoch:
@@ -1348,14 +1240,15 @@ def test_rejected_wire_materializes_after_delivery_command_and_state_unlock(tran
     observed = observations[0]
     assert observed["completed"] and not observed["observer_alive"] and not observed["errors"]
     assert observed["locks"] == {"delivery": True, "command": True, "state": True}
-    assert not result["ownership_retained"] and not result["authority_current"]
+    assert not result["ownership_retained"]
+    assert not result["authority_current"]
     assert not backend._nav_set_precommit_candidates
     assert backend._nav_inflight_command_token is None
     assert backend._nav_set_transaction_context.result is None
 
 
 @pytest.mark.parametrize("delivery", ["unary", "precommit", "stream"])
-def test_unleased_guard_rejection_releases_obligation_without_zero_proof(delivery):
+def test_native_guard_failure_releases_dispatch_obligation_without_derived_proof(delivery):
     rejection = wire("failed", reason="LEASE_NOT_GRANTED", timestamp=100, path=0, planner=0)
     rejection.message = "LEASE_NOT_GRANTED: STALE_STOP_GENERATION"
     backend = provider(rejection if delivery == "unary" else wire())
@@ -1371,7 +1264,7 @@ def test_unleased_guard_rejection_releases_obligation_without_zero_proof(deliver
     state = snapshot(backend)
     assert state.status == NavigationStatus.FAILED
     assert state.metadata["reason_code"] == "LEASE_NOT_GRANTED"
-    assert state.metadata["lease_not_granted"]
+    assert "lease_not_granted" not in state.metadata
     assert not state.metadata["ownership_retained"]
     assert not state.metadata["actuator_zeroed"]
     assert not state.metadata["zero_ack_id"]
@@ -1392,7 +1285,8 @@ def test_unleased_rejection_retires_only_the_matching_goal():
     generic = wire("failed", reason="GUARD_ERROR", timestamp=100)
     generic.message = "LEASE_NOT_GRANTED: 文本不能代替原生具名结果"
     assert stream(backend, generic)
-    assert snapshot(backend).metadata["ownership_retained"]
+    assert not snapshot(backend).metadata["ownership_retained"]
+    assert snapshot(backend).status == NavigationStatus.FAILED
 
 
 
@@ -1412,3 +1306,103 @@ def test_current_stream_replaces_historical_display_after_old_unary_is_rejected(
     assert current.navigation_state.status == NavigationStatus.RUNNING
     assert current.navigation_state.metadata["authority_current"] is True
     assert "dispatch_obligation" not in current.navigation_state.metadata
+
+
+@pytest.mark.parametrize("change", ["path_revision", "planner_runtime_generation", "timestamp_ns"])
+def test_precommit_first_native_terminal_is_not_replaced_by_later_zero_information(change):
+    backend = provider()
+    bad = wire("failed", reason="BAD", timestamp=101, proof=True)
+    setattr(bad, change, {"path_revision": 2, "planner_runtime_generation": 9, "timestamp_ns": 99}[change])
+    precommit(backend, wire("failed", reason="OBSERVED", timestamp=100), bad)
+    accepted, result = submit(backend)
+    assert not accepted and result["disposition"] == "resolved"
+    assert result["navigation"]["status"] == "failed"
+    assert result["navigation"]["reason_code"] == "OBSERVED"
+    assert result["navigation"]["zero_ack_id"] == ""
+
+
+def test_terminal_gap_keeps_real_precommit_source_floor_without_resurrecting_running():
+    backend = provider(wire(reason=PENDING))
+    precommit(backend, wire("running", reason="REAL_RUNNING", timestamp=100))
+    accepted, result = submit(backend)
+    assert not accepted and result["disposition"] == "owned_unconfirmed"
+    assert result["navigation"]["status"] == "unconfirmed"
+    assert result["navigation"]["timestamp_ns"] == 100
+    assert result["navigation"]["dispatch_obligation"]["terminal_observed"]
+    assert not stream(backend, wire("running", reason="STALE_RUNNING", timestamp=99))
+    assert stream(backend, wire("failed", reason="REAL_RECEIPT", timestamp=101, proof=True))
+
+
+def test_terminal_gap_accepts_concrete_native_precommit_terminal_without_zero_information():
+    backend = provider(wire(reason=PENDING))
+    precommit(backend, wire("failed", reason="REAL_FAILED", timestamp=100))
+    accepted, result = submit(backend)
+    assert not accepted
+    assert result["navigation"]["status"] == "failed"
+    assert result["disposition"] == "resolved"
+    assert result["navigation"]["timestamp_ns"] == 100
+    assert not result["navigation"]["command_projection_without_source"]
+
+
+def test_service_older_command_projection_cannot_replace_real_running(tmp_path):
+    backend = provider(wire("running"))
+    navigation, view = service(backend, tmp_path)
+    navigation.set_goal(goal())
+    assert stream(backend, wire("running", reason="REAL_RUNNING", timestamp=1_000_000_000))
+    real = navigation._ingest_navigation_state(view, snapshot(backend))
+    # A second isolated provider supplies the exact trusted unary projection body;
+    # this is service ordering only, not a new runtime submission or a retry Goal.
+    pending_backend = provider(wire(reason=PENDING))
+    submit(pending_backend)
+    pending = snapshot(pending_backend)
+    context = navigation._ingest_navigation_state(view, pending)
+    assert context is real
+    assert context.navigation_state.status == NavigationStatus.RUNNING
+    assert context.navigation_state.updated_at == real.navigation_state.updated_at
+
+
+@pytest.mark.parametrize("new_path,new_planner", [(4, 8), (4, 7), (4, 9)])
+def test_native_terminal_observation_keeps_newer_precommit_source_without_fabricating_running(new_path, new_planner):
+    backend = provider(wire(reason=PENDING, path=3, planner=8))
+    precommit(backend, wire("running", reason="NEW_PATH_RUNNING", timestamp=100,
+                           path=new_path, planner=new_planner))
+    accepted, result = submit(backend)
+    assert not accepted and result["disposition"] == "owned_unconfirmed"
+    state = snapshot(backend)
+    assert state.status == NavigationStatus.UNCONFIRMED
+    assert state.metadata["path_revision"] == new_path
+    assert state.metadata["planner_runtime_generation"] == new_planner
+    assert state.metadata["dispatch_obligation"]["terminal_observed"]
+    assert state.metadata["ownership_retained"]
+    assert stream(backend, wire("failed", reason="NEW_PATH_TERMINAL", timestamp=101,
+                               path=new_path, planner=new_planner))
+    assert snapshot(backend).status == NavigationStatus.FAILED
+
+
+@pytest.mark.parametrize("unary_status,reason", [("UNCONFIRMED", PENDING), ("running", ORIGIN)])
+@pytest.mark.parametrize("bad_field,bad_value", [("path_revision", 1), ("planner_runtime_generation", 9), ("timestamp_ns", 99)])
+def test_native_precommit_terminal_does_not_repeat_planner_path_or_zero_admission(unary_status, reason, bad_field, bad_value):
+    backend = provider(wire(unary_status, reason=reason, path=2, planner=8, timestamp=100))
+    receipt = wire("failed", reason="STALE_FULL_RECEIPT", path=2, planner=8, timestamp=101, proof=True)
+    setattr(receipt, bad_field, bad_value)
+    precommit(backend, receipt)
+    accepted, result = submit(backend)
+    assert not accepted and result["disposition"] == "resolved"
+    assert not result["ownership_retained"]
+    assert result["navigation"]["goal_id"] == GOAL
+    assert result["navigation"]["reason_code"] == receipt.reason_code
+    assert result["navigation"]["path_revision"] == receipt.path_revision
+    assert result["navigation"]["planner_runtime_generation"] == receipt.planner_runtime_generation
+    assert result["navigation"]["timestamp_ns"] == receipt.timestamp_ns
+
+
+@pytest.mark.parametrize("staged_planner", [7, 9])
+def test_terminal_observation_keeps_actual_precommit_planner_without_reporting_running(staged_planner):
+    backend = provider(wire(reason=PENDING, path=3, planner=8))
+    precommit(backend, wire("running", reason="OTHER_PLANNER", path=3,
+                           planner=staged_planner, timestamp=100))
+    accepted, result = submit(backend)
+    assert not accepted and result["disposition"] == "owned_unconfirmed"
+    assert result["navigation"]["path_revision"] == 3
+    assert result["navigation"]["planner_runtime_generation"] == staged_planner
+    assert result["navigation"]["dispatch_obligation"]["terminal_observed"]

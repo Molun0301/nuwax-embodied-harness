@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import logging
 import math
 import secrets
 import time
@@ -29,6 +30,9 @@ from .wire import (
     request_source_name,
     canonical_payload,
 )
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class ProtocolViolation(ValueError):
@@ -97,9 +101,6 @@ class MotionGuardCore:
         self._zero_retry_delay_ns = ZERO_RETRY_INITIAL_NS
         self._ordinary_records: Dict[Tuple[object, ...], OperationRecord] = {}
         self._priority_records: Dict[Tuple[object, ...], OperationRecord] = {}
-        # 原租约迟到收尾只读取其历史零回执，不停车后来者。
-        self._externally_fenced_leases: Dict[Tuple[int, str], bytes] = {}
-        self._pending_retired_lease: Optional[Tuple[int, str]] = None
         self._operation_index: Dict[str, List[OperationRecord]] = {}
 
     @property
@@ -169,7 +170,7 @@ class MotionGuardCore:
                     self._execution_feedback_failure = exc.code + ": " + exc.message
                     try:
                         zero_ack = self._zero()
-                        self._complete_lease_zero(zero_ack)
+                        self._complete_lease_zero()
                         self._reset_zero_retry()
                     except ActuatorError as zero_error:
                         self._mark_zero_unconfirmed(zero_error, now_ns=now)
@@ -177,7 +178,7 @@ class MotionGuardCore:
         self.lease_state = pb.LEASE_STATE_REVOKING
         try:
             zero_ack = self._zero()
-            self._complete_lease_zero(zero_ack)
+            self._complete_lease_zero()
             self._reset_zero_retry()
             return zero_ack
         except ActuatorError as exc:
@@ -206,7 +207,7 @@ class MotionGuardCore:
         except ActuatorError as exc:
             self._mark_zero_unconfirmed(exc)
             raise
-        self._complete_lease_zero(zero_ack)
+        self._complete_lease_zero()
         self._reset_zero_retry()
         return zero_ack
 
@@ -383,26 +384,8 @@ class MotionGuardCore:
         peer: PeerCredentials,
         source: str,
     ) -> pb.MotionGuardResponse:
-        cached = self._prepare_mutation(
-            request,
-            peer,
-            source,
-            namespace="lease",
-        )
-        if cached is not None:
-            return cached
-        envelope = request.revoke_and_zero.envelope
-        retired = self._externally_fenced_leases.get((envelope.tuple.lease_id, source))
-        if retired is not None:
-            response, outcome = self._response(request)
-            outcome.result.CopyFrom(self._result(pb.ACK_CODE_RESOURCE_FENCED))
-            outcome.result.lease = pb.LEASE_STATE_IDLE
-            outcome.zero_ack.ParseFromString(retired)
-            # 这里只交付旧租约的历史停车证明，不能归零或撤销后来者的运动。
-            self._remember(request, peer, source, response, priority=True)
-            return response
-        self._validate_active(envelope, peer, source)
         return self._revoke_response(request, peer, source)
+
 
     def _handle_revoke_zero_and_switch_mode(
         self,
@@ -427,7 +410,7 @@ class MotionGuardCore:
             zero_ack = self._zero(wait=True)
             self._stop_confirmation.note_motion()
             active_mode = self._actuator.switch_mode(body.command)
-            self._complete_lease_zero(zero_ack)
+            self._complete_lease_zero()
         except ActuatorError as exc:
             self._mark_zero_unconfirmed(exc)
             raise GuardFailure(exc.code, exc.message) from exc
@@ -439,29 +422,7 @@ class MotionGuardCore:
         return response
 
     def _handle_stop_all_motion(self, request, peer, source):
-        cached = self._prepare_global_stop(request, peer, source)
-        if cached is not None:
-            return cached
-        if not request.stop_all_motion.reason.strip():
-            raise GuardFailure("INVALID_ARGUMENT", "stop reason is required")
-        if self._motion_stop_generation == MAX_UINT64:
-            raise GuardFailure("RESOURCE_EXHAUSTED", "motion stop generation overflow")
-        self._motion_stop_generation += 1
-        lease_revoked = self.lease_state == pb.LEASE_STATE_ACTIVE
-        self.lease_state = pb.LEASE_STATE_REVOKING
-        try:
-            zero_ack = self._zero()
-            self._complete_lease_zero(zero_ack)
-        except ActuatorError as exc:
-            self._mark_zero_unconfirmed(exc)
-            raise GuardFailure(exc.code, exc.message) from exc
-        response, outcome = self._response(request)
-        outcome.result.CopyFrom(self._result(pb.ACK_CODE_RESOURCE_FENCED if lease_revoked else pb.ACK_CODE_ZEROED))
-        outcome.zero_ack.CopyFrom(zero_ack)
-        outcome.lease_revoked = lease_revoked
-        outcome.motion_stop_generation = self._motion_stop_generation
-        self._remember(request, peer, source, response, namespace="global_stop", priority=True)
-        return response
+        return self._revoke_response(request, peer, source, global_stop=True)
 
     def _handle_get_operation_result(
         self,
@@ -501,15 +462,18 @@ class MotionGuardCore:
             )
             outcome.resolved = False
             return response
+        saved = pb.MotionGuardResponse.FromString(record.response_bytes)
+        saved_outcome = getattr(saved, saved.WhichOneof("outcome"))
         outcome.result.CopyFrom(self._result(record.ack))
+        if saved_outcome.result.HasField("error"):
+            outcome.result.error.CopyFrom(saved_outcome.result.error)
         outcome.target_ack = record.ack
         outcome.resolved = True
         if record.zero_ack_id:
             if record.stationary_zero_ack_bytes:
                 outcome.zero_ack.ParseFromString(record.stationary_zero_ack_bytes)
             else:
-                saved = pb.MotionGuardResponse.FromString(record.response_bytes)
-                outcome.zero_ack.CopyFrom(getattr(saved, saved.WhichOneof("outcome")).zero_ack)
+                outcome.zero_ack.CopyFrom(saved_outcome.zero_ack)
         outcome.motion_stop_generation = record.motion_stop_generation
         return response
 
@@ -529,32 +493,6 @@ class MotionGuardCore:
         self._validate_boot_tuple(envelope, namespace=namespace)
         self._prune_operation_records()
         key = self._dedup_key(envelope, peer, source, namespace)
-        record = self._ordinary_records.get(key) or self._priority_records.get(key)
-        if record is not None:
-            if record.operation != request.WhichOneof("operation") or record.payload != canonical_payload(request):
-                return self._error_response(
-                    request,
-                    "REQUEST_ID_CONFLICT",
-                    "operation_id was reused with a different typed payload",
-                )
-            response = pb.MotionGuardResponse()
-            response.ParseFromString(record.response_bytes)
-            response.request_id = request.request_id
-            return response
-        self._validate_deadline(envelope)
-        return None
-
-    def _prepare_global_stop(
-        self,
-        request: pb.MotionGuardRequest,
-        peer: PeerCredentials,
-        source: str,
-    ) -> Optional[pb.MotionGuardResponse]:
-        envelope = request.stop_all_motion.envelope
-        if not envelope.operation_id:
-            raise GuardFailure("INVALID_ARGUMENT", "operation_id is required")
-        self._prune_operation_records()
-        key = self._dedup_key(envelope, peer, source, "global_stop")
         record = self._ordinary_records.get(key) or self._priority_records.get(key)
         if record is not None:
             if record.operation != request.WhichOneof("operation") or record.payload != canonical_payload(request):
@@ -617,18 +555,43 @@ class MotionGuardCore:
 
 
 
-    def _revoke_response(self, request, peer, source):
+    def _revoke_response(self, request, peer, source, *, global_stop=False):
+        # 显式停车优先隔离当前拥有方并发零；标识、截止和旧租约均不阻止这一步。
+        lease_revoked = self.lease_state == pb.LEASE_STATE_ACTIVE
+        self._clear_lease()
         self.lease_state = pb.LEASE_STATE_REVOKING
+        self._startup_zero_confirmed = False
+        failure = None
         try:
             zero_ack = self._zero()
-            self._complete_lease_zero(zero_ack)
+            self._complete_lease_zero()
+            self._reset_zero_retry()
         except ActuatorError as exc:
             self._mark_zero_unconfirmed(exc)
-            raise GuardFailure(exc.code, exc.message) from exc
+            failure = exc
+        finally:
+            if global_stop:
+                # 协议代次按uint64递增；即使归零失败，也不沿用停车前的准入。
+                self._motion_stop_generation = (self._motion_stop_generation + 1) & MAX_UINT64
         response, outcome = self._response(request)
-        outcome.result.CopyFrom(self._result(pb.ACK_CODE_RESOURCE_FENCED))
-        outcome.zero_ack.CopyFrom(zero_ack)
-        self._remember(request, peer, source, response, priority=True)
+        if failure is None:
+            ack = pb.ACK_CODE_RESOURCE_FENCED if lease_revoked or not global_stop else pb.ACK_CODE_ZEROED
+            outcome.result.CopyFrom(self._result(ack))
+            outcome.zero_ack.CopyFrom(zero_ack)
+        else:
+            outcome.result.CopyFrom(self._result(pb.ACK_CODE_UNSPECIFIED, code=failure.code, message=failure.message))
+        if global_stop:
+            outcome.lease_revoked = lease_revoked
+            outcome.motion_stop_generation = self._motion_stop_generation
+        body = getattr(request, request.WhichOneof("operation"))
+        reason = (body.reason.strip() or "全局停车") if global_stop else "撤销租约并归零"
+        completed_ns = zero_ack.applied_monotonic_ns if failure is None else self._monotonic_ns()
+        _LOGGER.info("停车请求 operation=%s operation_id=%s reason=%s expired=%s ack=%s error=%s",
+                     request.WhichOneof("operation"), body.envelope.operation_id, reason,
+                     completed_ns > body.envelope.deadline_monotonic_ns,
+                     outcome.result.ack, failure.code if failure is not None else "")
+        self._remember(request, peer, source, response,
+                       namespace="global_stop" if global_stop else "lease", priority=True)
         return response
 
     def _mark_zero_unconfirmed(self, error: ActuatorError, *, now_ns: Optional[int] = None) -> None:
@@ -641,7 +604,7 @@ class MotionGuardCore:
     def _retry_zero_fence(self, now_ns: int) -> Optional[pb.ZeroAck]:
         try:
             zero_ack = self._zero(retry=True)
-            self._complete_lease_zero(zero_ack)
+            self._complete_lease_zero()
         except ActuatorError as exc:
             self._mark_zero_unconfirmed(exc, now_ns=now_ns)
             return None
@@ -729,11 +692,6 @@ class MotionGuardCore:
             zero.feedback_source_timestamp_ns = current.feedback_source_timestamp_ns
             zero.stationary_deadline_monotonic_ns = current.stationary_deadline_monotonic_ns
             return zero.SerializeToString(deterministic=True)
-        for key, saved in self._externally_fenced_leases.items():
-            zero = pb.ZeroAck.FromString(saved)
-            if zero.zero_ack_id == current.zero_ack_id or zero.confirmation_kind in {
-                    "awaiting_feedback", "awaiting_braking_bound", "unconfirmed"}:
-                self._externally_fenced_leases[key] = supplement(zero)
         for priority, key, operation_id in self._pending_zero_records:
             target = self._priority_records if priority else self._ordinary_records
             record = target.get(key)
@@ -760,19 +718,12 @@ class MotionGuardCore:
             feedback_source_timestamp_ns=evidence.feedback_source_timestamp_ns,
         )
 
-    def _complete_lease_zero(self, zero_ack: pb.ZeroAck) -> None:
-        """撤销原租约并保留其零回执；异步停稳完成前仍关闭新运动。"""
+    def _complete_lease_zero(self) -> None:
+        """撤销租约，异步停稳完成前保持新运动未就绪。"""
         self._clear_lease()
         self._startup_zero_confirmed = self._pending_stop is None
-        if self._pending_retired_lease is not None:
-            self._externally_fenced_leases[self._pending_retired_lease] = zero_ack.SerializeToString()
-            self._pending_retired_lease = None
-            while len(self._externally_fenced_leases) > OPERATION_RECORD_CAPACITY:
-                del self._externally_fenced_leases[next(iter(self._externally_fenced_leases))]
 
     def _clear_lease(self) -> None:
-        if self._active_lease_id:
-            self._pending_retired_lease = (self._active_lease_id, self._active_source)
         self._active_lease_id = 0
         self._active_source = ""
         self._owner_deadline_ns = 0
@@ -847,8 +798,15 @@ class MotionGuardCore:
         }:
             return
         envelope = operation_envelope(request)
-        if envelope is None:
+        if envelope is None or not envelope.operation_id:
             return
+        if operation in {"stop_all_motion", "revoke_and_zero"}:
+            # 每次显式停车都实际执行；该查询标识只保留最新结果及其停稳关联。
+            for previous in tuple(self._operation_index.get(envelope.operation_id, ())):
+                if previous.source == source and previous.namespace == namespace:
+                    owner = (self._priority_records if self._priority_records.get(previous.key) is previous
+                             else self._ordinary_records)
+                    self._forget_operation_record(owner, previous.key, previous)
         key = self._dedup_key(envelope, peer, source, namespace)
         outcome_name = response.WhichOneof("outcome")
         outcome = getattr(response, outcome_name)
@@ -905,7 +863,10 @@ class MotionGuardCore:
 
     def _forget_operation_record(self, target, key, record: OperationRecord) -> None:
         del target[key]
-        retained = [item for item in self._operation_index[record.operation_id] if item.key != key]
+        retained = [item for item in self._operation_index[record.operation_id] if item is not record]
+        priority = target is self._priority_records
+        self._pending_zero_records = [entry for entry in self._pending_zero_records
+                                      if entry[:2] != (priority, key)]
         if retained:
             self._operation_index[record.operation_id] = retained
         else:

@@ -25216,7 +25216,7 @@ fn scheme_a_session_reasons_outrank_source_and_readiness() {
             None,
             Some(SetGoalRetryReason::MapRevisionAdvanced),
             Some(SetGoalRetryReason::NavigationNotReady(
-                NavigationReadinessCode::MotionSinkNotReady,
+                NavigationReadinessCode::StackStateUnobserved,
             )),
         ] {
             let message = "opaque session diagnostic".to_string();
@@ -25284,7 +25284,7 @@ fn scheme_a_unlisted_codes_and_text_do_not_create_retry_or_stage_proof() {
         assert!(matches!(
             classify_exploration_submit_rejection(
                 Some(SetGoalRetryReason::NavigationNotReady(
-                    NavigationReadinessCode::MotionSinkNotReady,
+                    NavigationReadinessCode::StackStateUnobserved,
                 )),
                 None,
                 "motion sink unavailable".to_string(),

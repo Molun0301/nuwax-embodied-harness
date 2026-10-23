@@ -823,8 +823,6 @@ impl NavRuntimeState {
         let active = slot.goal.as_ref()?;
         let lease = &active.lease;
         if lease.session_id != update.state.goal_id
-            || lease.owner_kind != update.feedback.owner_kind
-            || lease.parent_request_id != update.feedback.parent_request_id
             || lease.goal_generation != update.feedback.goal_generation
             || lease.producer_runtime_generation != update.feedback.producer_runtime_generation
             || matches!(slot.phase, NavPhase::Running | NavPhase::Succeeded)
@@ -832,8 +830,11 @@ impl NavRuntimeState {
             return None;
         }
         // 规划路径可能先于租约请求返回；明确无租约终态按目标关联，不借路径生成停车凭据。
-        let mut cancel = self.cancel.lock().ok()?;
-        let same_cancel = cancel.lease.as_ref().is_some_and(|cancelled| cancelled.identity_matches(lease));
+        let mut cancel = self.cancel.lock().expect("取消状态锁中毒，不能把损坏状态当作无取消事务");
+        let same_cancel = cancel.lease.as_ref().is_some_and(|cancelled|
+            cancelled.session_id == lease.session_id
+                && cancelled.goal_generation == lease.goal_generation
+                && cancelled.producer_runtime_generation == lease.producer_runtime_generation);
         if update.feedback.cancel_generation > 0
             && (!same_cancel || cancel.generation != update.feedback.cancel_generation)
         {
@@ -1117,10 +1118,10 @@ impl NavRuntimeState {
         let mut slot = self.inner.write().await;
         let exact_active = slot.goal.as_ref().is_some_and(|active| {
             let lease = &active.lease;
-            lease.session_id == input.goal_id && lease.owner_kind == input.owner_kind
+            input.targets_current() || (lease.session_id == input.goal_id && lease.owner_kind == input.owner_kind
                 && lease.parent_request_id == input.parent_request_id
                 && lease.goal_generation == input.goal_generation
-                && lease.producer_runtime_generation == input.producer_runtime_generation
+                && lease.producer_runtime_generation == input.producer_runtime_generation)
         });
         if !exact_active {
             return slot.terminal_receipts.iter().rev().find(|receipt| receipt.matches(input))
@@ -1832,7 +1833,7 @@ impl NavRuntimeState {
     pub async fn poll_cancel_timeout(&self) -> Option<CancelOutcome> {
         let _transaction_guard = self.transaction_gate.lock().await;
         let mut slot = self.inner.write().await;
-        let mut cancel = self.cancel.lock().ok()?;
+        let mut cancel = self.cancel.lock().expect("取消状态锁中毒，不能把损坏状态当作无取消事务");
         let lease = cancel.lease.clone()?;
         let publish_started_at =
             self.publish_started_at(PublishKind::Cancel, &lease, cancel.generation);
@@ -1875,11 +1876,12 @@ impl NavRuntimeState {
             };
         };
         let active_lease = &active.lease;
-        if input.goal_id.trim() != active_lease.session_id
+        // 全空身份由当前拥有方在原取消事务锁内绑定；部分身份仍必须精确匹配。
+        if !input.targets_current() && (input.goal_id.trim() != active_lease.session_id
             || input.owner_kind != active_lease.owner_kind
             || input.parent_request_id.trim() != active_lease.parent_request_id
             || input.goal_generation != active_lease.goal_generation
-            || input.producer_runtime_generation != active_lease.producer_runtime_generation
+            || input.producer_runtime_generation != active_lease.producer_runtime_generation)
         {
             return CancelStart::Rejected {
                 goal_id: input.goal_id.clone(),
@@ -2152,12 +2154,6 @@ pub enum NavigationReadinessCode {
     Ready,
     /// The real LCM backend is unavailable.
     LcmBackendUnavailable,
-    /// No guard-backed motion sink has reported health.
-    MotionSinkUnobserved,
-    /// Motion-sink health exceeded its freshness deadline.
-    MotionSinkStale,
-    /// The observed motion sink explicitly reported not ready.
-    MotionSinkNotReady,
     /// No real nav-stack state heartbeat has been observed.
     StackStateUnobserved,
     /// The nav-stack heartbeat exceeded its freshness deadline.
@@ -2191,9 +2187,6 @@ impl NavigationReadinessCode {
             Self::Unknown => "UNKNOWN",
             Self::Ready => "READY",
             Self::LcmBackendUnavailable => "LCM_BACKEND_UNAVAILABLE",
-            Self::MotionSinkUnobserved => "MOTION_SINK_UNOBSERVED",
-            Self::MotionSinkStale => "MOTION_SINK_STALE",
-            Self::MotionSinkNotReady => "MOTION_SINK_NOT_READY",
             Self::StackStateUnobserved => "STACK_STATE_UNOBSERVED",
             Self::StackStateStale => "STACK_STATE_STALE",
             Self::TfUnobserved => "TF_UNOBSERVED",
@@ -2515,15 +2508,6 @@ fn readiness_reason(code: NavigationReadinessCode) -> &'static str {
         NavigationReadinessCode::LcmBackendUnavailable => {
             "LCM_BACKEND_UNAVAILABLE: real LCM backend unavailable"
         }
-        NavigationReadinessCode::MotionSinkUnobserved => {
-            "MOTION_SINK_UNOBSERVED: guard client has not reported health"
-        }
-        NavigationReadinessCode::MotionSinkStale => {
-            "MOTION_SINK_STALE: guard client health expired"
-        }
-        NavigationReadinessCode::MotionSinkNotReady => {
-            "MOTION_SINK_NOT_READY: private UDS execution chain unavailable"
-        }
         NavigationReadinessCode::StackStateUnobserved => {
             "STACK_STATE_UNOBSERVED: nav-stack heartbeat missing"
         }
@@ -2737,7 +2721,7 @@ impl SetGoalOutcome {
     }
 }
 
-/// Complete CAS identity required to cancel one goal lease.
+/// 定向取消使用完整租约身份；全空身份由拥有方绑定当前目标。
 #[derive(Clone)]
 pub struct CancelGoalInput {
     /// Public business/session identifier.
@@ -2750,6 +2734,15 @@ pub struct CancelGoalInput {
     pub goal_generation: u64,
     /// Geometry producer incarnation that issued the goal lease.
     pub producer_runtime_generation: u64,
+}
+
+impl CancelGoalInput {
+    /// 空取消没有缓存身份，由目标拥有方在事务锁内选择当前目标。
+    fn targets_current(&self) -> bool {
+        self.goal_id.trim().is_empty() && self.owner_kind == 0
+            && self.parent_request_id.trim().is_empty() && self.goal_generation == 0
+            && self.producer_runtime_generation == 0
+    }
 }
 
 /// `cancel` 的输出:同 set_goal。
@@ -3833,7 +3826,7 @@ pub async fn cancel(
                         drop(map_goal_guard);
                         return cancel_outcome_with_phase(
                             NavPhase::CancelPending,
-                            input.goal_id,
+                            lease.session_id.clone(),
                             "CANCEL_PENDING_PUBLISH_IN_FLIGHT_JOIN".to_string(),
                             Some(lease),
                         );
@@ -3845,7 +3838,7 @@ pub async fn cancel(
                         drop(map_goal_guard);
                         return cancel_outcome_with_phase(
                             NavPhase::Failed,
-                            input.goal_id,
+                            lease.session_id.clone(),
                             format!("CANCEL_REJECTED[{reason}]"),
                             None,
                         );
@@ -7638,6 +7631,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_cancel_binds_current_native_goal_and_retries_the_same_publish() {
+        let (handle, backend, owner) = make_unit_blocking_handle([None]).await;
+        let state = NavRuntimeState::from_env();
+        let lease = test_lease("native-current", 1);
+        {
+            let mut slot = state.inner.write().await;
+            slot.phase = NavPhase::Running;
+            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
+        }
+        let empty_input = || CancelGoalInput { goal_id: String::new(), owner_kind: 0,
+            parent_request_id: String::new(), goal_generation: 0, producer_runtime_generation: 0 };
+        let first_handle = handle.clone();
+        let first_state = state.clone();
+        let input = empty_input();
+        let first = tokio::spawn(async move { cancel(&first_handle, &first_state, input).await });
+        backend.wait_for_publish_count(1).await;
+        let retry = cancel(&handle, &state, empty_input()).await;
+        assert_eq!(retry.state.status, "PENDING");
+        assert_eq!(retry.state.goal_id, lease.session_id);
+        assert_eq!(retry.lease.as_ref(), Some(&lease));
+        assert_eq!(backend.publish_count(), 1);
+        backend.publish_gate.add_permits(1);
+        let pending = first.await.unwrap();
+        assert_eq!(pending.state.status, "PENDING");
+        assert_eq!(pending.state.goal_id, lease.session_id);
+        assert_eq!(pending.lease.as_ref(), Some(&lease));
+        let frames = backend.frames.lock().unwrap();
+        let message = schema::decode_cancel_navigation_body(&frames[0].payload).unwrap();
+        assert_eq!(message.session_id, lease.session_id);
+        assert_eq!(message.goal_generation as u64, lease.goal_generation);
+        assert_eq!(message.producer_runtime_generation as u64, lease.producer_runtime_generation);
+        drop(frames);
+        drop(handle);
+        owner.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_cancel_rpc_recovers_real_terminal_received_during_publish() {
+        use crate::proto::geometry_runtime_server::GeometryRuntime;
+        let (handle, backend, owner) = make_unit_blocking_handle([None]).await;
+        let lease = test_lease("native-terminal-during-empty-cancel", 1);
+        handle.nav.replace_active_goal_for_test(test_active_goal_with_lease(lease.clone())).await;
+        let service = crate::server::GeometryRuntimeService::new(handle.clone());
+        let pending = tokio::spawn(async move {
+            GeometryRuntime::cancel_navigation(&service,
+                tonic::Request::new(crate::proto::CancelNavigationRequest::default())).await
+        });
+        backend.wait_for_publish_count(1).await;
+        let receipt = NavigationUpdate {
+            producer_runtime_generation: lease.producer_runtime_generation,
+            state: NavState { status: "CANCELLED".into(), goal_id: lease.session_id.clone(),
+                timestamp_ns: now_ns(), ..NavState::default() },
+            feedback: crate::lcm_runtime::NavigationFeedback {
+                actuator_zeroed: true, zero_ack_id: "actual-terminal".into(),
+                zero_applied_monotonic_ns: 37, cancel_generation: handle.nav.cancel_snapshot().generation,
+                owner_kind: lease.owner_kind, parent_request_id: lease.parent_request_id.clone(),
+                goal_generation: lease.goal_generation, producer_runtime_generation: lease.producer_runtime_generation,
+                path_revision: lease.path_revision, planner_runtime_generation: lease.planner_runtime_generation,
+                ..Default::default()
+            },
+        };
+        handle.nav.retain_terminal_receipt(&receipt).await;
+        backend.release_one();
+        let response = pending.await.unwrap().unwrap().into_inner();
+        assert_eq!(response.status, "CANCELLED");
+        assert_eq!(response.goal_id, lease.session_id);
+        assert_eq!(response.zero_ack_id, receipt.feedback.zero_ack_id);
+        assert_eq!(response.zero_applied_monotonic_ns, receipt.feedback.zero_applied_monotonic_ns);
+        drop(handle);
+        owner.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_cancel_rpc_with_global_stop_binds_current_and_preserves_successor() {
+        use crate::proto::geometry_runtime_server::GeometryRuntime;
+        let (handle, _, owner) = make_unit_blocking_handle([]).await;
+        let lease = test_lease("ordinary-current", 1);
+        handle.nav.replace_active_goal_for_test(test_active_goal_with_lease(lease.clone())).await;
+        let proof = crate::proto::OrdinaryGlobalStopConfirmation {
+            operation_id: "ordinary-current-stop".into(), zero_ack_id: "actual-zero-fixture".into(),
+            applied_monotonic_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
+            stationary_confirmed: true,
+        };
+        let service = crate::server::GeometryRuntimeService::new(handle.clone());
+        let request = crate::proto::CancelNavigationRequest {
+            global_stop_confirmation: Some(proof), ..Default::default()
+        };
+        let response = GeometryRuntime::cancel_navigation(&service, tonic::Request::new(request.clone()))
+            .await.unwrap().into_inner();
+        assert_eq!(response.status, "FAILED");
+        assert_eq!(response.goal_id, lease.session_id);
+        assert_eq!(response.reason_code, "GLOBAL_STOP_CONFIRMED");
+        let successor = test_lease("ordinary-successor", 2);
+        handle.nav.replace_active_goal_for_test(test_active_goal_with_lease(successor.clone())).await;
+        assert!(GeometryRuntime::cancel_navigation(&service, tonic::Request::new(request)).await.is_err());
+        assert_eq!(handle.nav.active_goal_lease().await, Some(successor));
+        drop(service);
+        drop(handle);
+        owner.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_cancel_without_active_goal_and_partial_identity_remain_rejected() {
+        let state = NavRuntimeState::from_env();
+        let mut input = CancelGoalInput { goal_id: String::new(), owner_kind: 0,
+            parent_request_id: String::new(), goal_generation: 0, producer_runtime_generation: 0 };
+        let CancelStart::Rejected { message, .. } = state.begin_cancel(&input).await else {
+            panic!("无活动目标必须保留原生拒绝");
+        };
+        assert!(message.contains("GOAL_LEASE_MISSING"));
+        let lease = test_lease("native-current", 1);
+        {
+            let mut slot = state.inner.write().await;
+            slot.phase = NavPhase::Running;
+            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
+        }
+        input.owner_kind = lease.owner_kind;
+        let CancelStart::Rejected { message, .. } = state.begin_cancel(&input).await else {
+            panic!("部分身份不能冒充取消当前目标");
+        };
+        assert!(message.contains("GOAL_LEASE_MISMATCH"));
+        assert_eq!(state.active_goal_lease().await, Some(lease));
+        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Idle);
+    }
+
+    #[tokio::test]
     async fn cancel_generation_rejects_int64_exhaustion_without_reuse() {
         let state = NavRuntimeState::from_env();
         let lease = test_lease("cancel-generation-int64", 1);
@@ -8496,7 +8615,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_goal_producers_emit_v8_from_original_body_and_boundary_owners_without_hash() {
+    async fn all_goal_producers_emit_v9_from_original_body_and_boundary_owners_without_hash() {
         let (mut handle, backend, owner) = make_unit_blocking_handle([None, None, None]).await;
         handle.body_reference_frame_id = Arc::from("robot/body_a");
         backend.publish_gate.add_permits(3);
@@ -8554,7 +8673,7 @@ mod tests {
         assert_eq!(frames.len(), 3);
         for (index, frame) in frames.iter().enumerate() {
             let goal = schema::decode_goal_envelope_body(&frame.payload).unwrap();
-            assert_eq!(goal.schema_version, 8);
+            assert_eq!(goal.schema_version, 9);
             assert_eq!(goal.body_reference_frame_id, "robot/body_a");
             assert_eq!(goal.producer_runtime_generation, 70 + index as i64);
             if goal.producer == "wavefront" {

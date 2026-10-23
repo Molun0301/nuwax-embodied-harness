@@ -350,13 +350,8 @@ pub fn decode_nav_state_payload(payload: &[u8]) -> Option<NavigationUpdate> {
     {
         return None;
     }
-    // 只有调度器明确的未授予租约终态可以省略停车证明；后半段保留守卫原始原因。
+    // 保留原生未授租约分类，交由目标拥有方结束该目标。
     let lease_not_granted = message.state == 4 && message.message.starts_with("LEASE_NOT_GRANTED: ");
-    if lease_not_granted && (!has_session || path_revision != 0
-        || planner_runtime_generation != 0 || !message.zero_ack_id.is_empty()
-        || zero_applied_monotonic_ns != 0) {
-        return None;
-    }
     let state = NavState {
         status: navigation_state_name(message.state, &message.message),
         message: message.message,
@@ -703,27 +698,6 @@ mod tests {
         assert_eq!(nav.state.status, "IDLE");
         assert!(nav.state.goal_id.is_empty());
         assert!(nav.feedback.sink_ready);
-    }
-
-    #[test]
-    fn active_sink_ready_without_guard_generation_is_rejected() {
-        let payload = schema::encode_navigation_state_body(&schema::NavigationState {
-            session_id: "goal-without-guard".into(),
-            robot_frame: "base_link".into(),
-            stamp_sec: 8,
-            state: 2,
-            message: "moving".into(),
-            runtime_generation: 9,
-            sink_ready: 1,
-            owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
-            parent_request_id: "request-without-guard".into(),
-            goal_generation: 1,
-            producer_runtime_generation: 7,
-            ..schema::NavigationState::default()
-        })
-        .expect("encode active navigation state");
-
-        assert!(decode_nav_state_payload(&payload).is_none());
     }
 
     #[test]

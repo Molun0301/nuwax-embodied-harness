@@ -19,10 +19,13 @@ class NavigationProvider(BaseProvider, Protocol):
         """提交一个非阻塞导航目标。"""
 
     def cancel_goal(self, request_id: Optional[str] = None) -> bool:
-        """取消指定 exact goal；缺少标识时必须 fail-closed。"""
+        """取消指定目标；省略标识时由后端取消当前目标。"""
 
     def get_navigation_state(self) -> NavigationState:
         """读取当前导航状态。"""
+
+    def get_navigation_control_state(self, *, deadline_monotonic: Optional[float] = None) -> NavigationState:
+        """读取后端控制状态，不附加展示与规划器就绪查询。"""
 
     def is_goal_reached(self) -> bool:
         """判断当前目标是否已到达。"""

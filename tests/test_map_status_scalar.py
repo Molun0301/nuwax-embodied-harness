@@ -140,7 +140,7 @@ class MapStatusScalarChecks(unittest.TestCase):
 
     def test_recovery_status_and_no_save(self):
         owner = self.owner(self.prepared(0))
-        pending = dict(phase='recovering', target_map_name='library', target_manifest_sha256='f' * 64)
+        pending = dict(phase='recovering', target_map_name='library', target_asset_identity={'asset_id': 'f' * 32})
         with patch.object(owner, '_read_map_activation', return_value=pending), patch.object(owner, '_save_asset') as save:
             result = owner._sync_asset(self.asset(), is_active=True)
             self.assertEqual(result.status, MapAssetStatus.ACTIVATING)

@@ -697,8 +697,6 @@ class GatewayPersonFollowBridge:
         self._prepared: Optional[_PreparedSession] = None
         self._binding: Optional[_SessionBinding] = None
         self._session_error: Optional[Tuple[str, PersonFollowBridgeError]] = None
-        self._discarded_commands = 0
-        self._discarded_targets = 0
 
     @property
     def started(self) -> bool:
@@ -1044,7 +1042,6 @@ class GatewayPersonFollowBridge:
         if source_stamp == binding.last_source_stamp and binding.allow_preflight_stamp_once:
             binding.allow_preflight_stamp_once = False
         elif source_stamp <= binding.last_source_stamp:
-            self._discarded_targets += 1
             return binding.current_target
         else:
             binding.allow_preflight_stamp_once = False
@@ -1067,7 +1064,6 @@ class GatewayPersonFollowBridge:
             raise PersonFollowBridgeError("LOST target has no matching guard session")
         source_stamp = (target.stamp_sec, target.stamp_nsec)
         if source_stamp <= binding.last_source_stamp:
-            self._discarded_targets += 1
             return binding.current_target
         correlated = replace(
             target,
@@ -1157,7 +1153,6 @@ class GatewayPersonFollowBridge:
             return
         target = binding.current_target
         if target is None:
-            self._discarded_commands += 1
             return
         try:
             if not self._validate_command(command, target, binding.last_command_seq, preflight=False):
@@ -1192,7 +1187,6 @@ class GatewayPersonFollowBridge:
     ) -> bool:
         if (command.session_id != target.session_id or command.target_seq < target.target_seq
                 or command.command_seq <= last_command_seq):
-            self._discarded_commands += 1
             return False
         if (
             command.target_seq != target.target_seq

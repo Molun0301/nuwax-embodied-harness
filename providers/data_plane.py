@@ -85,7 +85,7 @@ class NavigationDataPlane(Protocol):
         """提交导航目标。"""
 
     def cancel_goal(self, request_id: Optional[str] = None) -> bool:
-        """取消指定 exact goal；缺少标识时必须 fail-closed。"""
+        """取消指定目标；省略标识时由后端取消当前目标。"""
 
     def get_navigation_state(self) -> NavigationState:
         """返回导航状态。"""

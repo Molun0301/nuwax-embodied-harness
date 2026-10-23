@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from contracts.navigation import NavigationGoal, NavigationState, NavigationStatus
 from contracts.runtime_views import LocalizationSession, LocalizationSessionStatus, MapSnapshot
 from core import StateStore
+from core.errors import GatewayError
 from scripts.check_navigation_map_snapshot_identity import OfflineProvider
 from services.navigation.forbidden_zones import ForbiddenZoneStore
 from services.navigation.service import NavigationService
@@ -77,6 +78,52 @@ class NavigationServiceLifecycleChecks(unittest.TestCase):
         self.assertEqual(context.navigation_state.status, NavigationStatus.RUNNING)
         self.assertEqual(context.metadata["navigation_state_machine"]["goal_id"], "already-running")
 
+    def test_cancel_current_goal_preserves_idle_backend_response(self):
+        self.navigation.set_goal(self.goal("pending"))
+        calls = []
+        def cancel_goal(*, request_id):
+            calls.append(request_id)
+            self.provider.navigation_state = NavigationState(status=NavigationStatus.IDLE)
+            return True
+        self.provider.cancel_goal = cancel_goal
+        result = self.navigation.cancel_goal()
+        self.assertEqual(calls, [None])
+        self.assertEqual(result.navigation_state.status, NavigationStatus.IDLE)
+        self.assertIsNone(result.navigation_state.current_goal_id)
+
+    def _reject_candidate_while_previous_goal_exists(self, incoming_status=None):
+        first = self.goal("active-before-busy")
+        original = self.navigation.set_goal(first)
+        observed = [original]
+        def reject(goal, **kwargs):
+            if incoming_status is not None:
+                update = state(first.goal_id, incoming_status, self.provider.generation)
+                observed[0] = self.navigation._ingest_navigation_state(self.provider, update)
+            return False
+        self.provider.set_goal = reject
+        self.provider.take_goal_submission_result = lambda goal_id: {
+            "goal_id": goal_id, "accepted": False, "disposition": "rejected",
+            "message": "SET_GOAL_REJECTED[GOAL_LEASE_BUSY]: active=active-before-busy",
+            "reason_code": "",
+        }
+        with self.assertRaises(GatewayError) as raised:
+            self.navigation.set_goal(self.goal("rejected-candidate"))
+        self.assertEqual(raised.exception.error_code, "navigation_goal_rejected")
+        self.assertEqual(raised.exception.details["backend_code"], "GOAL_LEASE_BUSY")
+        self.assertIs(self.navigation.get_latest_navigation_context(), observed[0])
+        self.assertEqual(self.navigation._state_machine.current_goal_id, first.goal_id)
+        return first
+
+    def test_native_busy_rejection_preserves_previous_goal_ownership(self):
+        first = self._reject_candidate_while_previous_goal_exists()
+        self.assertIs(self.navigation._current_goal, first)
+        self.assertEqual(self.navigation._state_machine.current_status, NavigationStatus.ACCEPTED)
+
+    def test_native_busy_rejection_does_not_roll_back_concurrent_native_terminal(self):
+        self._reject_candidate_while_previous_goal_exists(NavigationStatus.CANCELLED)
+        self.assertIsNone(self.navigation._current_goal)
+        self.assertEqual(self.navigation._state_machine.current_status, NavigationStatus.CANCELLED)
+
     def test_lightweight_terminal_then_full_running_cannot_disagree(self):
         goal = self.goal("retry")
         self.navigation.set_goal(goal)
@@ -105,10 +152,9 @@ class NavigationServiceLifecycleChecks(unittest.TestCase):
         self.assertIs(result, previous)
         self.assertEqual(result.navigation_state.current_goal_id, "second")
 
-    def test_terminal_zero_proof_is_not_erased_by_same_generation_running(self):
+    def test_native_terminal_without_zero_receipt_is_not_erased_by_same_generation_running(self):
         self.navigation.set_goal(self.goal("goal"))
         terminal = state("goal", NavigationStatus.CANCELLED)
-        terminal.metadata.update(actuator_zeroed=True, zero_ack_id="offline-zero", zero_applied_monotonic_ns=1)
         self.navigation._ingest_navigation_state(self.provider, terminal)
         previous = self.navigation.get_latest_navigation_context()
         result = self.navigation._ingest_navigation_state(self.provider, state("goal", NavigationStatus.RUNNING))
@@ -123,10 +169,9 @@ class NavigationServiceLifecycleChecks(unittest.TestCase):
         old = state("goal", NavigationStatus.ACCEPTED, updated_at=running.updated_at-timedelta(seconds=1))
         self.assertIs(self.navigation._ingest_navigation_state(self.provider, old), previous)
 
-    def test_same_goal_new_generation_can_run_after_terminal_zero_proof(self):
+    def test_same_goal_new_generation_can_run_after_native_terminal(self):
         self.navigation.set_goal(self.goal("goal"))
         terminal = state("goal", NavigationStatus.FAILED)
-        terminal.metadata.update(actuator_zeroed=True, zero_ack_id="offline-zero", zero_applied_monotonic_ns=1)
         self.navigation._ingest_navigation_state(self.provider, terminal)
         result = self.navigation._ingest_navigation_state(self.provider, state("goal", NavigationStatus.RUNNING, 2))
         self.assertEqual(result.navigation_state.status, NavigationStatus.RUNNING)

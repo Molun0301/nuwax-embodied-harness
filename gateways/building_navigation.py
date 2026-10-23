@@ -104,8 +104,8 @@ class GatewayBuildingPorts:
             changes=self.runtime._task_generation_rollovers(generation,current)
             if changes:
                 self.runtime._handle_navigation_generation_rollover(self.context,goal_id=goal_id,expected=generation,current=current,rollovers=changes,deadline_monotonic=time.monotonic()+8.0)
-            proof=self.runtime._navigation_terminal_proof(navigation,goal_id=goal_id,allowed_statuses={NavigationStatus.SUCCEEDED.value})
-            if proof and navigation.goal_reached:
+            proof=self.runtime._navigation_terminal_result(navigation,goal_id=goal_id,allowed_statuses={NavigationStatus.SUCCEEDED.value})
+            if proof:
                 self.last_zero={"zeroed":True,**proof}
                 return {"reached":True,**self.last_zero}
             if navigation.navigation_state.status in {NavigationStatus.FAILED,NavigationStatus.CANCELLED}:
@@ -121,15 +121,15 @@ class GatewayBuildingPorts:
         if exact:
             try:
                 navigation=self.runtime.navigation_service.refresh_navigation(deadline_monotonic=time.monotonic()+8.0)
-                proof=self.runtime._navigation_terminal_proof(navigation,goal_id=exact,allowed_statuses={"succeeded","failed","cancelled"})
+                proof=self.runtime._navigation_terminal_result(navigation,goal_id=exact,allowed_statuses={"succeeded","failed","cancelled"})
                 if not proof:
-                    navigation=self.runtime._cancel_navigation_with_safety_barrier(self.context,goal_id=exact,poll_interval_sec=0.05,acknowledge_interrupt=False,parking_deadline_monotonic=time.monotonic()+8.0)
-                    proof=self.runtime._navigation_terminal_proof(navigation,goal_id=exact,allowed_statuses={"succeeded","failed","cancelled"})
+                    navigation=self.runtime._cancel_navigation_and_wait_terminal(self.context,goal_id=exact,poll_interval_sec=0.05,acknowledge_interrupt=False,parking_deadline_monotonic=time.monotonic()+8.0)
+                    proof=self.runtime._navigation_terminal_result(navigation,goal_id=exact,allowed_statuses={"succeeded","failed","cancelled"})
                 if proof:
                     self.last_zero={"zeroed":True,**proof}
                     return self.last_zero
             except Exception:
-                # 精确后端不能证明停车时，继续由同一运动守卫提供最终屏障。
+                # 未取得原目标终态时，继续由同一运动守卫执行停车。
                 pass
         stopped=self.runtime.motion_guard.stop_all_motion("跨层任务停车对账",operation_id=self.runtime._build_runtime_request_id("floor_stop"))
         proof={"zeroed":bool(stopped.zero.zero_ack_id and stopped.zero.applied_monotonic_ns>0),

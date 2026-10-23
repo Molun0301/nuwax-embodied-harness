@@ -979,11 +979,13 @@ class PlatformGeometryRuntime:
         except Exception as exc:
             self._record_runtime_diagnostic("geometry_start", exc)
             self._set_runtime_state("failed", "平台几何运行时启动失败：%s" % exc, blocked=True)
-            self._stop_managed_processes()
-            self._live_geometry_start_attempted = False
-            with self._runtime_state_lock:
-                self._runtime_started = False
-            # Phase 3 目标态：不再 raise，统一交给上层显式查询 /api/geometry/status。
+            try:
+                self._stop_managed_processes()
+            finally:
+                self._live_geometry_start_attempted = False
+                with self._runtime_state_lock:
+                    self._runtime_started = False
+            raise
 
 
     def get_geometry_runtime_provider(
@@ -1068,7 +1070,7 @@ class PlatformGeometryRuntime:
                 bool(ready),
                 generation=generation_value,
             )
-        except Exception as exc:  # noqa: BLE001
+        except GeometryRuntimeRpcError as exc:  # noqa: BLE001
             self._record_runtime_diagnostic("geometry_cmd_vel_sink_ready", exc)
 
     def stop(self) -> None:
@@ -1086,23 +1088,29 @@ class PlatformGeometryRuntime:
         self._set_runtime_state("stopping", "正在停止平台几何侧车进程。")
         self._runtime_stop_event.set()
         # Phase 3 目标态：cmd_vel 桥已下线，平台内建速度桥不再启动/停止
+        stop_error = None
         try:
             self.stop_platform_exploration()
-        except Exception:
+        except Exception as exc:
+            stop_error = exc
             LOGGER.exception("停止 native exploration 失败；继续关闭几何运行时。")
         thread = self._runtime_monitor_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=2.0)
-        self._stop_managed_processes()
-        self._wait_for_subscription_deliveries(delivery_tickets)
-        self._live_geometry_start_attempted = False
-        with self._runtime_state_lock:
-            self._runtime_started = False
-            self._runtime_monitor_thread = None
+        try:
+            self._stop_managed_processes()
+        finally:
+            self._wait_for_subscription_deliveries(delivery_tickets)
+            self._live_geometry_start_attempted = False
+            with self._runtime_state_lock:
+                self._runtime_started = False
+                self._runtime_monitor_thread = None
         if self._is_geometry_profile_enabled():
             self._set_runtime_state("disabled", "平台几何运行时已停止。")
         else:
             self._set_runtime_state("disabled", "平台几何运行时或几何 profile 已禁用。")
+        if stop_error is not None:
+            raise stop_error
 
     def _set_runtime_state(self, phase: str, message: str, *, blocked: bool = False) -> None:
         with self._runtime_state_lock:
@@ -1152,7 +1160,7 @@ class PlatformGeometryRuntime:
                 )
             try:
                 state = provider.get_mapping_state()
-            except Exception as exc:
+            except GeometryRuntimeRpcError as exc:
                 raise RuntimeError(
                     "读取权威 mapping session 状态失败，请重试。"
                 ) from exc
@@ -1394,6 +1402,7 @@ class PlatformGeometryRuntime:
 
 
     def _stop_managed_processes(self) -> None:
+        cleanup_errors = []
         if self._geometry_runtime_subprocess is not None:
             self._geometry_runtime_subprocess.stop()
             self._geometry_runtime_subprocess = None
@@ -1432,7 +1441,8 @@ class PlatformGeometryRuntime:
                     remote_provider.unsubscribe_exploration_updates(
                         exploration_subscription_id
                     )
-                except Exception:
+                except Exception as exc:
+                    cleanup_errors.append(exc)
                     LOGGER.exception(
                         "停止 geometry exploration subscription 失败。"
                     )
@@ -1441,7 +1451,8 @@ class PlatformGeometryRuntime:
                     remote_provider.unsubscribe_navigation_updates(
                         subscription_id
                     )
-                except Exception:
+                except Exception as exc:
+                    cleanup_errors.append(exc)
                     LOGGER.exception(
                         "停止 geometry navigation subscription=%s 失败。",
                         subscription_id,
@@ -1453,7 +1464,13 @@ class PlatformGeometryRuntime:
             )
         self._wait_for_subscription_deliveries(delivery_tickets)
         if remote_provider is not None:
-            remote_provider.disconnect()
+            try:
+                remote_provider.disconnect()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+                LOGGER.exception("停止 geometry provider 断连失败。")
+        if cleanup_errors:
+            raise cleanup_errors[0]
 
     def _start_geometry_runtime_subprocess(self) -> None:
         """挂接 canonical Rust geometry runtime 并建立 gRPC 连接。
@@ -1490,10 +1507,7 @@ class PlatformGeometryRuntime:
                         if self._provider_attach_stopping or not self._runtime_started:
                             return
             LOGGER.warning("canonical geometry runtime 已失联，清理 Python attach handle")
-            try:
-                self._geometry_runtime_subprocess.stop()
-            except Exception as exc:
-                LOGGER.warning("zombie bridge.stop 失败（不影响主流程）: %s", exc)
+            self._geometry_runtime_subprocess.stop()
             self._geometry_runtime_subprocess = None
         bridge = GeometryRuntimeSubprocess(
             binary_path=str(self.config.runtime_binary or "") or None,
@@ -1504,10 +1518,7 @@ class PlatformGeometryRuntime:
             self._record_runtime_diagnostic("geometry_runtime_attach", bridge.last_error or "挂接失败")
             if bridge.is_running is False and bridge._attached:
                 LOGGER.warning("bridge.attach 残留状态异常，主动清空本地 handle")
-                try:
-                    bridge.disconnect()
-                except Exception:  # pragma: no cover
-                    pass
+                bridge.disconnect()
             return
         self._geometry_runtime_subprocess = bridge
         if self._attach_geometry_runtime_provider(bridge):
@@ -1576,7 +1587,7 @@ class PlatformGeometryRuntime:
                 response.get("session_generation"),
             )
             return True
-        except Exception as exc:
+        except GeometryRuntimeRpcError as exc:
             self._record_runtime_diagnostic("mapping_session_replay", exc)
             LOGGER.warning("geometry mapping session 自动恢复失败: %s", exc)
             return False
@@ -1591,35 +1602,35 @@ class PlatformGeometryRuntime:
     ) -> None:
         """Best-effort rollback for a prepared or partially committed provider."""
 
+        cleanup_errors = []
         provider_attach_lock = self._provider_attach_lock
         delivery_tickets = ()
-        try:
-            with provider_attach_lock:
-                with self._exploration_loop_lock:
-                    delivery_tickets = (
-                        self._invalidate_subscription_delivery_tickets_locked(
-                            provider=provider,
-                        )
+        with provider_attach_lock:
+            with self._exploration_loop_lock:
+                delivery_tickets = (
+                    self._invalidate_subscription_delivery_tickets_locked(
+                        provider=provider,
                     )
-                    if self._remote_provider is provider:
-                        with self._runtime_state_lock:
-                            self._remote_provider = None
-                            self._remote_exploration_subscription_id = None
-                            self._remote_localization_subscription_handles = {}
-                            self._remote_map_subscription_handles = {}
-                            self._remote_navigation_subscription_ids = {}
-        except Exception:
-            LOGGER.exception("回滚 geometry provider owner 引用失败，继续强制断连。")
+                )
+                if self._remote_provider is provider:
+                    with self._runtime_state_lock:
+                        self._remote_provider = None
+                        self._remote_exploration_subscription_id = None
+                        self._remote_localization_subscription_handles = {}
+                        self._remote_map_subscription_handles = {}
+                        self._remote_navigation_subscription_ids = {}
 
         if exploration_subscription_id is not None:
             try:
                 provider.unsubscribe_exploration_updates(exploration_subscription_id)
-            except Exception:
+            except Exception as exc:
+                cleanup_errors.append(exc)
                 LOGGER.exception("回滚 geometry exploration subscription 失败。")
         for subscription_id in reversed(tuple(navigation_subscription_ids or ())):
             try:
                 provider.unsubscribe_navigation_updates(subscription_id)
-            except Exception:
+            except Exception as exc:
+                cleanup_errors.append(exc)
                 LOGGER.exception(
                     "回滚 geometry navigation subscription=%s 失败。",
                     subscription_id,
@@ -1633,15 +1644,16 @@ class PlatformGeometryRuntime:
 
         try:
             provider.disconnect()
-            return
-        except Exception:
+        except Exception as exc:
+            cleanup_errors.append(exc)
             LOGGER.exception("geometry provider disconnect 回滚失败，强制清理 channel。")
 
         channel = provider._channel
         if channel is not None:
             try:
                 channel.close()
-            except Exception:
+            except Exception as exc:
+                cleanup_errors.append(exc)
                 LOGGER.exception("强制关闭 geometry provider channel 失败。")
         for name, value in (
             ("_channel", None),
@@ -1649,10 +1661,9 @@ class PlatformGeometryRuntime:
             ("_connected", False),
             ("_stopping", True),
         ):
-            try:
-                setattr(provider, name, value)
-            except Exception:
-                LOGGER.exception("强制清理 geometry provider.%s 失败。", name)
+            setattr(provider, name, value)
+        if cleanup_errors:
+            raise cleanup_errors[0]
 
     def _attach_geometry_runtime_provider(
         self,
@@ -1932,49 +1943,19 @@ class PlatformGeometryRuntime:
                 )
             LOGGER.info("Rust ros-bridge gRPC 连接已建立")
             return True
-        except Exception:
-            LOGGER.exception("geometry provider attach prepare/commit 失败。")
+        except GeometryRuntimeRpcError:
+            LOGGER.exception("geometry provider attach RPC 失败。")
             return False
         finally:
             if provider is not None and not committed:
-                try:
-                    self._rollback_geometry_runtime_provider_attach(
-                        provider,
-                        navigation_subscription_ids=tuple(
-                            staged_navigation_ids.values()
-                        ),
-                        exploration_subscription_id=staged_exploration_id,
-                        stream_handles=tuple(staged_stream_handles),
-                    )
-                except Exception:
-                    LOGGER.exception("geometry provider attach rollback helper 异常。")
-                    try:
-                        with provider_attach_lock:
-                            with self._exploration_loop_lock:
-                                if self._remote_provider is provider:
-                                    with self._runtime_state_lock:
-                                        self._remote_provider = None
-                                        self._remote_exploration_subscription_id = None
-                                        self._remote_localization_subscription_handles = {}
-                                        self._remote_map_subscription_handles = {}
-                                        self._remote_navigation_subscription_ids = {}
-                    except Exception:
-                        LOGGER.exception("强制清除半提交 geometry provider owner 失败。")
-                    channel = provider._channel
-                    if channel is not None:
-                        try:
-                            channel.close()
-                        except Exception:
-                            pass
-                    for name, value in (
-                        ("_channel", None),
-                        ("_stub", None),
-                        ("_connected", False),
-                    ):
-                        try:
-                            setattr(provider, name, value)
-                        except Exception:
-                            pass
+                self._rollback_geometry_runtime_provider_attach(
+                    provider,
+                    navigation_subscription_ids=tuple(
+                        staged_navigation_ids.values()
+                    ),
+                    exploration_subscription_id=staged_exploration_id,
+                    stream_handles=tuple(staged_stream_handles),
+                )
 
     def _inject_static_extrinsics(self, provider: "GeometryRuntimeProvider") -> None:
         """装配期：从机器人 CalibrationProvider 取静态外参拓扑，缓存进 GeometryRuntimeProvider。
@@ -2014,7 +1995,7 @@ class PlatformGeometryRuntime:
                         authority="calibration_static",
                     )
                 )
-            except Exception as exc:  # pragma: no cover - 非法 frame_id 等
+            except (ValueError, TypeError, KeyError) as exc:  # pragma: no cover - 非法 frame_id 等
                 self._record_runtime_diagnostic("static_extrinsics_pair", exc)
                 continue
         if not edges:
@@ -2142,8 +2123,6 @@ class PlatformGeometryRuntime:
             if deadline_monotonic is not None:
                 raise
             return False, "GetStatus RPC 失败"
-        except Exception as exc:  # pragma: no cover - gRPC 健康探测容错
-            return False, "GetStatus RPC 失败：%s" % exc
         if not isinstance(status, dict):
             return False, "GetStatus 返回非 dict：%r" % (status,)
         raw_phase = str(status.get("phase") or "").strip()
@@ -2405,7 +2384,7 @@ class PlatformGeometryRuntime:
         if remote is not None and _remote_is_connected(remote):
             try:
                 readiness = remote.get_navigation_readiness()
-            except Exception as exc:  # pragma: no cover - 防御性兜底
+            except GeometryRuntimeRpcError as exc:  # pragma: no cover - 防御性兜底
                 readiness = {"ready": False, "message": "gRPC 调用失败：%s" % exc}
             status = {
                 "phase": "geometry_runtime",
@@ -2552,8 +2531,8 @@ class PlatformGeometryRuntime:
         if self._remote_provider is not None:
             try:
                 remote_status = self._remote_provider.get_status() or {}
-            except Exception:
-                remote_status = {}
+            except GeometryRuntimeRpcError as exc:
+                remote_status = {"status": "unavailable", "last_error": str(exc)}
         stub = {
             "provider": "geometry_runtime",
             "provider_key": provider_key,
@@ -2568,8 +2547,8 @@ class PlatformGeometryRuntime:
             if self._remote_provider is not None:
                 try:
                     mapping_diagnostics = self._remote_provider.get_mapping_diagnostics()
-                except Exception:
-                    mapping_diagnostics = None
+                except GeometryRuntimeRpcError as exc:
+                    stub["mapping_diagnostics_error"] = str(exc)
             if isinstance(mapping_diagnostics, dict):
                 stub["mapping_diagnostics"] = dict(mapping_diagnostics)
                 remote_provider = self._remote_provider
@@ -3069,10 +3048,7 @@ class PlatformGeometryRuntime:
         status_getter = getattr(runtime, "get_status", None) or getattr(data_plane, "get_status", None)
         raw_status: Dict[str, object] = {}
         if callable(status_getter):
-            try:
-                raw_status = self._clone_metadata(status_getter())
-            except Exception as exc:
-                raw_status = {"last_error": str(exc)}
+            raw_status = self._clone_metadata(status_getter())
         direct_dds = getattr(config, "direct_dds", None)
         bridge_status = raw_status.get("bridge") if isinstance(raw_status.get("bridge"), dict) else {}
         return {
@@ -3975,7 +3951,7 @@ class PlatformGeometryRuntime:
                     with prepared._provider.assigned_activation_origin_guard(prepared._provider_origin):
                         self._mapping_session_context = context
                         self._mapping_session_provider_attach_epoch = prepared._attach_epoch
-        except Exception as exc:
+        except (RuntimeError, ValueError) as exc:
             error = GeometryRuntimeMapActivationOutcomeUnknown(
                 "Assigned predecessor stop lost runtime ownership: %s" % exc)
             error.backend_activation_disposition = "unknown"
@@ -4004,7 +3980,7 @@ class PlatformGeometryRuntime:
         try:
             with self._runtime_state_lock:
                 self._require_prepared_assigned_origin_locked(prepared)
-        except Exception as exc:
+        except RuntimeError as exc:
             error = GeometryRuntimeMapActivationAppliedError(
                 "Assigned activation ACK outlived its runtime provider owner")
             error.activation_request = request
@@ -4261,19 +4237,22 @@ class PlatformGeometryRuntime:
                         subscription_id=int(subscription_id),
                     )
                 )
-        if (
-            remote_subscription_id is not None
-            and provider is not None
-            and bool(provider.is_connected)
-        ):
-            try:
-                provider.unsubscribe_navigation_updates(remote_subscription_id)
-            except Exception:
-                LOGGER.exception(
-                    "取消远端 navigation subscription=%s 失败。",
-                    remote_subscription_id,
-                )
-        self._wait_for_subscription_deliveries(delivery_tickets)
+        try:
+            if (
+                remote_subscription_id is not None
+                and provider is not None
+                and bool(provider.is_connected)
+            ):
+                try:
+                    provider.unsubscribe_navigation_updates(remote_subscription_id)
+                except Exception:
+                    LOGGER.exception(
+                        "取消远端 navigation subscription=%s 失败。",
+                        remote_subscription_id,
+                    )
+                    raise
+        finally:
+            self._wait_for_subscription_deliveries(delivery_tickets)
         return removed is not None
 
     def unsubscribe_map_updates(self, subscription_id: int) -> bool:
@@ -4453,29 +4432,22 @@ class PlatformGeometryRuntime:
         event_bus = getattr(self.robot, "event_bus", None) or self._event_bus
         if event_bus is None:
             return
-        try:
-            from contracts.events import RuntimeEventCategory
-            payload = {
-                "map_name": bundle.map_name,
-                "asset_identity": bundle.asset_identity.model_dump(),
-                "suppressed_live_map_reason": metadata.get("suppressed_live_map_reason"),
-                "live_known_cell_count": live_known_cells,
-                "seed_known_cell_count": seed_known_cells,
-                "source_topic": str(self.config.topics.occupancy_topic or ""),
-                "frame_id": metadata.get("frame_id"),
-                "update_sequence": metadata.get("update_sequence"),
-            }
-            event_bus.publish(
-                event_bus.build_event(
-                    "mapping.snapshot_suppressed",
-                    category=RuntimeEventCategory.ROBOT,
-                    source="platform_geometry_runtime",
-                    message="live_map known_cell_count 低于种子，已抑制本帧。",
-                    payload=payload,
-                )
-            )
-        except Exception:
-            LOGGER.debug("发布 mapping.snapshot_suppressed 失败。", exc_info=True)
+        from contracts.events import RuntimeEventCategory
+        payload = {
+            "map_name": bundle.map_name,
+            "asset_identity": bundle.asset_identity.model_dump(),
+            "suppressed_live_map_reason": metadata.get("suppressed_live_map_reason"),
+            "live_known_cell_count": live_known_cells,
+            "seed_known_cell_count": seed_known_cells,
+            "source_topic": str(self.config.topics.occupancy_topic or ""),
+            "frame_id": metadata.get("frame_id"),
+            "update_sequence": metadata.get("update_sequence"),
+        }
+        event_bus.publish(event_bus.build_event(
+            "mapping.snapshot_suppressed", category=RuntimeEventCategory.ROBOT,
+            source="platform_geometry_runtime",
+            message="live_map known_cell_count 低于种子，已抑制本帧。", payload=payload,
+        ))
 
     def _live_map_payload_under_covers_seed(
         self,
@@ -4552,28 +4524,16 @@ class PlatformGeometryRuntime:
                     None,
                 )
                 if callable(descriptor_reader):
-                    try:
-                        descriptor = descriptor_reader(live_occupancy)
-                        if descriptor is None:
-                            continue
-                        occupancy_mapping_identity = descriptor["mapping_identity"]
-                        occupancy_content_revision = descriptor.get("revision")
-                        occupancy_content_identity = descriptor.get("content_identity")
-                    except Exception:
-                        LOGGER.warning("读取栅格修订和会话失败，重新获取一致快照。", exc_info=True)
+                    descriptor = descriptor_reader(live_occupancy)
+                    if descriptor is None:
                         continue
+                    occupancy_mapping_identity = descriptor["mapping_identity"]
+                    occupancy_content_revision = descriptor.get("revision")
+                    occupancy_content_identity = descriptor.get("content_identity")
                 elif callable(occupancy_identity_reader):
-                    try:
-                        occupancy_mapping_identity = occupancy_identity_reader(
-                            live_occupancy
-                        )
-                    except Exception:
-                        occupancy_mapping_identity = None
-                        LOGGER.warning(
-                            "读取 live occupancy mapping identity 失败；"
-                            "本帧按 identityless 处理。",
-                            exc_info=True,
-                        )
+                    occupancy_mapping_identity = occupancy_identity_reader(
+                        live_occupancy
+                    )
             live_status = self._clone_metadata(
                 self._geometry_runtime_status_stub("live_map_provider")
             )
@@ -5479,15 +5439,17 @@ class PlatformGeometryRuntime:
             }
         source_before = self._file_metadata(resolved_source)
         backup_ok = False
+        import subprocess
         try:
-            import subprocess
             result = subprocess.run(
                 ["sqlite3", str(resolved_source), ".backup '%s'" % str(resolved_target)],
                 capture_output=True, timeout=30,
             )
             backup_ok = result.returncode == 0 and resolved_target.exists()
-        except Exception:
-            pass
+            if not backup_ok:
+                LOGGER.warning("sqlite3 backup 失败：%s", result.stderr.decode(errors="replace"))
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            LOGGER.warning("sqlite3 backup 无法完成：%s", exc)
         if not backup_ok:
             shutil.copy2(resolved_source, resolved_target)
         source_after = self._file_metadata(resolved_source)
@@ -5512,7 +5474,7 @@ class PlatformGeometryRuntime:
         return default_min_points()
 
     def _is_usable_pcd_file(self, path: Path) -> bool:
-        from services.geometry.pointcloud_map import read_pcd_point_count
+        from services.geometry.pointcloud_map import PointCloudMapError, read_pcd_point_count
 
         resolved = path.expanduser().resolve(strict=False)
         if not resolved.is_file():
@@ -5521,7 +5483,7 @@ class PlatformGeometryRuntime:
             if int(resolved.stat().st_size) < 1024:
                 return False
             return int(read_pcd_point_count(resolved)) >= self._pcd_min_points()
-        except Exception:
+        except (OSError, PointCloudMapError, ValueError):
             return False
 
 
@@ -5590,13 +5552,14 @@ class PlatformGeometryRuntime:
         if resolved_target.exists() and not self._is_usable_pcd_file(resolved_target):
             try:
                 resolved_target.unlink()
-            except Exception:
+            except OSError:
                 LOGGER.debug("删除无效资产包 PCD 失败：%s", resolved_target, exc_info=True)
 
         from services.geometry.pointcloud_map import (
             CloudMapMmapReader,
             write_pcd_binary_xyz,
         )
+        from services.geometry.pointcloud_map import PointCloudMapError
         import numpy as np
 
         source_path = Path(
@@ -5623,28 +5586,28 @@ class PlatformGeometryRuntime:
                     voxel_size = float(header[6])
                     break
             if stable is None:
-                raise RuntimeError("live cloud-map mmap 当前没有稳定 revision。")
+                raise PointCloudMapError("live cloud-map mmap 当前没有稳定 revision。")
             revision, point_count, xyz_bytes = stable
             if point_count < self._pcd_min_points():
-                raise RuntimeError(
+                raise PointCloudMapError(
                     "live cloud-map 点数不足：%d < %d"
                     % (point_count, self._pcd_min_points())
                 )
             if len(xyz_bytes) != point_count * 12:
-                raise RuntimeError(
+                raise PointCloudMapError(
                     "live cloud-map payload 大小不匹配：points=%d bytes=%d"
                     % (point_count, len(xyz_bytes))
                 )
             if voxel_size is None or not np.isfinite(voxel_size) or voxel_size <= 0.0:
-                raise RuntimeError("live cloud-map voxel_size 非法。")
+                raise PointCloudMapError("live cloud-map voxel_size 非法。")
             points_xyz = np.frombuffer(xyz_bytes, dtype="<f4").reshape(point_count, 3)
             if not bool(np.isfinite(points_xyz).all()):
-                raise RuntimeError("live cloud-map 包含非有限坐标。")
+                raise PointCloudMapError("live cloud-map 包含非有限坐标。")
 
             write_pcd_binary_xyz(temporary_path, points_xyz)
             os.replace(temporary_path, resolved_target)
             if not self._is_usable_pcd_file(resolved_target):
-                raise RuntimeError("导出的资产包 PCD 未通过点数或文件完整性校验。")
+                raise PointCloudMapError("导出的资产包 PCD 未通过点数或文件完整性校验。")
             target_metadata = self._file_metadata(resolved_target)
             xyz_sha256 = hashlib.sha256(xyz_bytes).hexdigest()
             pcd_sha256 = hashlib.sha256(resolved_target.read_bytes()).hexdigest()
@@ -5660,11 +5623,11 @@ class PlatformGeometryRuntime:
                 "xyz_sha256": xyz_sha256,
                 "pcd_sha256": pcd_sha256,
             }
-        except Exception as exc:
+        except (OSError, PointCloudMapError, ValueError) as exc:
             LOGGER.warning("导出 live cloud-map PCD 失败：%s", exc)
             try:
                 temporary_path.unlink(missing_ok=True)
-            except Exception:
+            except OSError:
                 LOGGER.debug("清理临时 PCD 失败：%s", temporary_path, exc_info=True)
             return {
                 "pcd_present": False,
@@ -5872,28 +5835,14 @@ class PlatformGeometryRuntime:
         provider = self._remote_provider
         if provider is None:
             return False
-        try:
-            return bool(provider.is_mapping_ready())
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.debug(
-                "_is_nuwax_mapping_active: provider.is_mapping_ready 失败,降级为 False: %s",
-                exc,
-            )
-            return False
+        return bool(provider.is_mapping_ready())
 
     def _mapping_lcm_backend_name(self) -> str:
         """Phase 3: 取 LCM backend canonical 名(给 nuwax_mapping asset metadata)。"""
         provider = self._remote_provider
         if provider is None:
             return "<unknown>"
-        try:
-            return str(provider.get_lcm_backend_name())
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.debug(
-                "_mapping_lcm_backend_name: provider.get_lcm_backend_name 失败,降级为 <unknown>: %s",
-                exc,
-            )
-            return "<unknown>"
+        return str(provider.get_lcm_backend_name())
 
     def _build_mapping_run_metadata(self) -> Dict[str, object]:
         db_path = self._locate_live_mapping_database()
@@ -6109,7 +6058,7 @@ class PlatformGeometryRuntime:
         if available:
             try:
                 summary["file"] = self._file_metadata(resolved)
-            except Exception as exc:
+            except OSError as exc:
                 summary["file"] = {"present": True, "path": str(resolved), "error": str(exc)}
             return summary
         summary["reason"] = "%s_missing" % source_kind
@@ -6414,15 +6363,18 @@ class PlatformGeometryRuntime:
                             provider=provider,
                         )
                     )
-        if remote_subscription_id is not None and provider is not None:
-            try:
-                provider.unsubscribe_exploration_updates(remote_subscription_id)
-            except Exception:
-                LOGGER.exception(
-                    "取消远端 exploration subscription=%s 失败。",
-                    remote_subscription_id,
-                )
-        self._wait_for_subscription_deliveries(delivery_tickets)
+        try:
+            if remote_subscription_id is not None and provider is not None:
+                try:
+                    provider.unsubscribe_exploration_updates(remote_subscription_id)
+                except Exception:
+                    LOGGER.exception(
+                        "取消远端 exploration subscription=%s 失败。",
+                        remote_subscription_id,
+                    )
+                    raise
+        finally:
+            self._wait_for_subscription_deliveries(delivery_tickets)
         return True
 
     def _bind_remote_exploration_updates(
@@ -6529,7 +6481,7 @@ class PlatformGeometryRuntime:
             return False
         try:
             state = PlatformGeometryProviderBundle._wrap_remote_exploration_state(payload)
-        except Exception:
+        except (ValueError, TypeError, KeyError):
             LOGGER.exception("geometry exploration 状态更新无法转换为平台契约。")
             return False
         request_id = str(payload.get("request_id") or "").strip()
@@ -6672,15 +6624,7 @@ class PlatformGeometryRuntime:
                 "transport": "geometry_runtime_grpc",
             },
         )
-        try:
-            return bool(backend.set_goal(navigation_goal))
-        except Exception:
-            LOGGER.warning(
-                "_dispatch_navigate backend.set_goal 异常 goal_id=%s",
-                goal_id,
-                exc_info=True,
-            )
-            return False
+        return bool(backend.set_goal(navigation_goal))
 
 
     def report_platform_exploration_hit_stop(self, reason: str):
@@ -7137,14 +7081,11 @@ class PlatformGeometryRuntime:
                     self._publish_subscription_delivery_ticket(ticket)
                     deliveries.append(ticket)
         for ticket in deliveries:
+            payload = state.model_copy(deep=True)
             try:
-                self._invoke_subscription_delivery(
-                    ticket,
-                    state.model_copy(deep=True),
-                    retire=True,
-                )
+                self._invoke_subscription_delivery(ticket, payload, retire=True)
             except Exception:
-                pass
+                LOGGER.exception("geometry exploration 订阅者回调失败：subscription=%s", ticket.subscription_id)
 
     def get_platform_exploration_state(
         self,
@@ -7267,16 +7208,6 @@ class PlatformGeometryRuntime:
                 "读取 native exploration 状态失败。",
                 "state_rpc_failed",
             )
-        except Exception as exc:
-            LOGGER.exception("读取 native exploration 状态失败。")
-            if active_request_id():
-                error = GeometryRuntimeRpcError(
-                    rpc_name="GetExplorationState",
-                    grpc_code=grpc.StatusCode.UNKNOWN,
-                    grpc_details=str(exc) or "unexpected exploration state failure",
-                )
-                raise error from exc
-            return unavailable("读取 native exploration 状态失败。", "state_rpc_failed")
         if not isinstance(payload, dict):
             return unavailable(
                 "native exploration runtime 未返回有效状态。",
@@ -7336,10 +7267,7 @@ class PlatformGeometryRuntime:
         localization_backend = self._resolve_localization_backend()
         if localization_backend is None:
             return None
-        try:
-            return localization_backend.get_current_pose()
-        except Exception:
-            return None
+        return localization_backend.get_current_pose()
 
 
     @staticmethod
@@ -7406,33 +7334,13 @@ class PlatformGeometryProviderBundle(
         return available and not self._map_asset_activation_recovery_pending()
 
     def is_localization_active(self) -> bool:
-        """对外暴露"是否处于定位模式"判定，供感知/记忆门控使用。
-
-        双源口径（与 runtime.py:1394~1395 / 2713~2714 的本地判定完全一致）：
-        1. 外部几何进程在跑且为定位模式
-        2. 最近一次 activate_* 报告的 backend_mode == "mapping_localization"
-        任一为 True 即视为定位模式。
-        """
-
-        if (
-            not self._is_geometry_profile_enabled()
-            or self._map_asset_activation_recovery_pending()
-        ):
+        """由当前地图激活快照报告是否处于定位模式。"""
+        if (not self._is_geometry_profile_enabled()
+                or self._map_asset_activation_recovery_pending()):
             return False
-        active = False
-        try:
-            active = bool(
-                self.runtime._external_geometry_process_is_localization()
-            )
-        except Exception:
-            pass
-        if not active:
-            snapshot = self.runtime._map_activation_snapshot_read()
-            activation = self.runtime._activation_result_from_snapshot(snapshot)
-            active = (
-                str(activation.get("backend_mode") or "")
-                == "mapping_localization"
-            )
+        snapshot = self.runtime._map_activation_snapshot_read()
+        activation = self.runtime._activation_result_from_snapshot(snapshot)
+        active = activation.get("backend_mode") == "mapping_localization"
         return active and not self._map_asset_activation_recovery_pending()
 
     def is_map_available(self) -> bool:
@@ -7598,21 +7506,18 @@ class PlatformGeometryProviderBundle(
             }
         get_state = getattr(backend, "get_localization_state", None)
         if callable(get_state):
-            try:
-                state = get_state()
-                if isinstance(state, dict):
-                    result = {
-                        **state,
-                        "backend_name": getattr(backend, "provider_name", None),
-                        "raw_odom_input": self.runtime._clone_metadata(self.runtime._geometry_runtime_status_stub("odometry_publisher")),
-                        "tf_localization_provider": self.runtime._clone_metadata(self.runtime._geometry_runtime_status_stub("tf_localization_provider")),
-                        "map_loaded": bool(state.get("map_loaded") or self.runtime._has_live_or_seed_map()),
-                    }
-                    if self._map_asset_activation_recovery_pending():
-                        return activation_pending_state
-                    return result
-            except Exception:
-                pass
+            state = get_state()
+            if isinstance(state, dict):
+                result = {
+                    **state,
+                    "backend_name": getattr(backend, "provider_name", None),
+                    "raw_odom_input": self.runtime._clone_metadata(self.runtime._geometry_runtime_status_stub("odometry_publisher")),
+                    "tf_localization_provider": self.runtime._clone_metadata(self.runtime._geometry_runtime_status_stub("tf_localization_provider")),
+                    "map_loaded": bool(state.get("map_loaded") or self.runtime._has_live_or_seed_map()),
+                }
+                if self._map_asset_activation_recovery_pending():
+                    return activation_pending_state
+                return result
         # 回退到基于位姿可用性的简单判断
         pose = backend.get_current_pose()
         result = {
@@ -7711,7 +7616,7 @@ class PlatformGeometryProviderBundle(
                 target_pose.frame_id,
             )
         if deadline_monotonic is None:
-            accepted = self._call_navigation_backend(backend, "set_goal", goal)
+            accepted = backend.set_goal(goal)
         else:
             setter = getattr(backend, "set_goal", None)
             if not callable(setter):
@@ -7735,12 +7640,9 @@ class PlatformGeometryProviderBundle(
         deadline_monotonic: Optional[float] = None,
         global_stop_confirmation: Optional[StopAllMotionConfirmation] = None,
     ) -> bool:
-        """按原目标直达后端；精确身份与停车证明由拥有方裁决。"""
+        """转交指定目标或空身份的当前目标取消请求。"""
         _exploration_deadline_remaining(deadline_monotonic, "CancelNavigation")
-        exact_goal_id = str(request_id or "").strip()
-        if not exact_goal_id:
-            LOGGER.warning("拒绝缺少 exact goal_id 的导航取消请求。")
-            return False
+        exact_goal_id = str(request_id or "").strip() or None
         if not self._is_geometry_profile_enabled():
             return False
         backend = self.runtime._resolve_navigation_backend()
@@ -7807,10 +7709,9 @@ class PlatformGeometryProviderBundle(
     def get_navigation_control_state(self, *, deadline_monotonic: Optional[float] = None):
         """沿原后端读取停车所需状态，避免显示附带查询阻塞归零证据。"""
         backend = self.runtime._resolve_navigation_backend()
-        getter = getattr(backend, "get_navigation_control_state", None)
-        if not callable(getter):
+        if backend is None:
             return self.get_navigation_state(deadline_monotonic=deadline_monotonic)
-        return getter(deadline_monotonic=deadline_monotonic)
+        return backend.get_navigation_control_state(deadline_monotonic=deadline_monotonic)
 
     def get_navigation_state(
         self,
@@ -7871,43 +7772,7 @@ class PlatformGeometryProviderBundle(
         backend = self.runtime._resolve_navigation_backend()
         if backend is None:
             return False
-        return self._call_navigation_backend(backend, "is_goal_reached")
-
-    def _call_navigation_backend(self, backend, method_name: str, *args, **kwargs):
-        """统一调用 backend 的协议方法。
-
-        当前正式 backend 是 GeometryRuntimeProvider（gRPC facade），
-        其方法集（set_navigation_goal/cancel_navigation/get_navigation_readiness）与
-        NavigationProvider 协议方法（set_goal/cancel_goal/get_navigation_state/is_goal_reached）
-        名字不一致。Python 侧这里做"方法存在即转发，不存在则返回失败占位"，
-        避免调用方收到 AttributeError 或被默默假装成功。
-        """
-
-        method = getattr(backend, method_name, None)
-        if not callable(method):
-            LOGGER.warning(
-                "导航 backend=%s 未实现 %s；返回失败占位（不假装成功）。",
-                getattr(backend, "provider_name", None) or backend.__class__.__name__,
-                method_name,
-            )
-            if method_name in {"set_goal", "cancel_goal", "is_goal_reached"}:
-                return False
-            if method_name in {"subscribe_navigation_updates"}:
-                return None
-            return None
-        try:
-            return method(*args, **kwargs)
-        except Exception:
-            LOGGER.exception(
-                "导航 backend=%s.%s 调用异常。",
-                getattr(backend, "provider_name", None) or backend.__class__.__name__,
-                method_name,
-            )
-            if method_name in {"set_goal", "cancel_goal", "is_goal_reached"}:
-                return False
-            if method_name in {"subscribe_navigation_updates"}:
-                return None
-            return None
+        return backend.is_goal_reached()
 
     # ------------------------------------------------------------------
     # 探索入口：唯一生产链路为 GeometryRuntimeProvider（gRPC facade）
@@ -8047,15 +7912,6 @@ class PlatformGeometryProviderBundle(
         except GeometryRuntimeRpcError as exc:
             exc.exploration_rpc_dispatched = False
             raise
-        except Exception as exc:
-            LOGGER.exception("Bundle.start_exploration 前置 mapping 准备失败。")
-            error = GeometryRuntimeRpcError(
-                rpc_name="StartExploration",
-                grpc_code=grpc.StatusCode.UNKNOWN,
-                grpc_details=str(exc) or "StartExploration preflight failed",
-            )
-            error.exploration_rpc_dispatched = False
-            raise error from exc
 
         def uncertain_start_state(message: str) -> ExplorationState:
             return ExplorationState(
@@ -8165,13 +8021,6 @@ class PlatformGeometryProviderBundle(
                     if current_id == request_id:
                         restore_precommit_snapshot_locked()
             raise
-        except Exception as exc:
-            LOGGER.exception("Bundle.start_exploration gRPC 结果不确定。")
-            raise GeometryRuntimeRpcError(
-                rpc_name="StartExploration",
-                grpc_code=grpc.StatusCode.UNKNOWN,
-                grpc_details=str(exc) or "unexpected StartExploration failure",
-            ) from exc
         if not isinstance(result, dict):
             raise GeometryRuntimeRpcError(
                 rpc_name="StartExploration",
@@ -8180,7 +8029,7 @@ class PlatformGeometryProviderBundle(
             )
         try:
             state = self._wrap_remote_exploration_state(result)
-        except Exception as exc:
+        except (ValueError, TypeError, KeyError) as exc:
             raise GeometryRuntimeRpcError(
                 rpc_name="StartExploration",
                 grpc_code=grpc.StatusCode.UNKNOWN,
@@ -8337,22 +8186,11 @@ class PlatformGeometryProviderBundle(
             return False
         if self._map_asset_activation_recovery_pending():
             return False
-        try:
-            return self._start_exploration_via_remote(
-                request,
-                remote,
-                deadline_monotonic=deadline_monotonic,
-            )
-        except GeometryRuntimeRpcError:
-            raise
-        except Exception as exc:
-            error = GeometryRuntimeRpcError(
-                rpc_name="StartExploration",
-                grpc_code=grpc.StatusCode.UNKNOWN,
-                grpc_details=str(exc) or "StartExploration translation failed",
-            )
-            error.exploration_rpc_dispatched = False
-            raise error from exc
+        return self._start_exploration_via_remote(
+            request,
+            remote,
+            deadline_monotonic=deadline_monotonic,
+        )
 
     def stop_exploration(
         self,
@@ -8430,11 +8268,6 @@ class PlatformGeometryProviderBundle(
                 "Bundle.stop_exploration gRPC 异常；correlated stop 结果不确定。"
             )
             raise
-        except Exception:
-            LOGGER.exception(
-                "Bundle.stop_exploration gRPC 异常；correlated stop 失败。"
-            )
-            return False
         if not isinstance(result, dict):
             return False
         state = self._wrap_remote_exploration_state(result)
@@ -8521,7 +8354,7 @@ class PlatformGeometryProviderBundle(
             return False
         try:
             remote_state = remote.get_exploration_state()
-        except Exception:
+        except GeometryRuntimeRpcError:
             LOGGER.exception(
                 "Bundle.sync_exploration_after_task gRPC 异常。"
             )

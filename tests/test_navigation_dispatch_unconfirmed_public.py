@@ -235,7 +235,7 @@ class PublicUnconfirmedTests(unittest.TestCase):
                                          cancel_goal=Mock(return_value=pending), get_latest_navigation_context=Mock(return_value=None), get_navigation_control_context=Mock(side_effect=[pending, terminal]))))
         task_context = NS(update=Mock(), acknowledge_interrupt_barrier=Mock())
         with patch("gateways.runtime.time.sleep", return_value=None):
-            result = runtime._cancel_navigation_with_safety_barrier(task_context,
+            result = runtime._cancel_navigation_and_wait_terminal(task_context,
                 goal_id=IDENTITY["goal_id"], poll_interval_sec=.02)
         self.assertIs(result, terminal)
         task_context.acknowledge_interrupt_barrier.assert_called_once()
@@ -250,9 +250,9 @@ class PublicUnconfirmedTests(unittest.TestCase):
                 unproven.navigation_state.metadata["ownership_retained"] = False
                 self.enterContext(patch.object(runtime, "navigation_service", NS(refresh_navigation=Mock(return_value=unproven),
                                                  cancel_goal=Mock(return_value=unproven), get_latest_navigation_context=Mock(return_value=None), get_navigation_control_context=Mock(return_value=unproven))))
-                with self.assertRaises(TaskSafetyBarrierError):
-                    runtime._cancel_navigation_with_safety_barrier(NS(update=Mock(), acknowledge_interrupt_barrier=Mock()),
-                        goal_id=IDENTITY["goal_id"], poll_interval_sec=.02)
+                result = runtime._cancel_navigation_and_wait_terminal(NS(update=Mock(), acknowledge_interrupt_barrier=Mock()),
+                    goal_id=IDENTITY["goal_id"], poll_interval_sec=.02)
+                self.assertIs(result, unproven)
 
     def test_unknown_public_cancel_reports_pending_not_completed(self):
         runtime = self.gateway()

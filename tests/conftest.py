@@ -397,3 +397,12 @@ def write_legacy_checkpoint(store, bundle):
     write_private_file(backend / "checkpoint-v1.json", _encode({"schema_version": 1,
         "backend_kind": checkpoint.backend_kind, "manifest": {"sha256": manifest_alias, "path": relative}}))
     return store.load(checkpoint.backend_kind, schema_version=1)
+
+
+def create_memory_mapping_service(snapshot=None, *, state_store=None):
+    """构造完整映射依赖；测试只提供其已发布的地图输入。"""
+    from core import StateStore
+    from services.mapping.service import MappingService
+    service = MappingService(provider_owner=None, state_store=state_store or StateStore())
+    service._latest_snapshot = snapshot
+    return service

@@ -1,3 +1,4 @@
+from tests.conftest import create_memory_mapping_service
 """标记当前位置与关联原照片保持独立空间语义，并沿同观察检索地点名称。"""
 from datetime import timedelta
 from types import SimpleNamespace
@@ -23,7 +24,7 @@ def _snapshot_memory_fixture():
         scene_summary=SceneSummary(headline="等候区域"), pipeline_name="test", detector_backend="test", tracker_backend="test")
     owner = SimpleNamespace(get_latest_snapshot=lambda: None, get_active_session=lambda: None,
                             refresh_current_session=lambda **kwargs: None, is_available=lambda: False)
-    memory = MemoryService(localization_service=owner, mapping_service=owner,
+    memory = MemoryService(localization_service=owner, mapping_service=create_memory_mapping_service(),
         observation_service=SimpleNamespace(get_latest_observation=lambda camera_id=None: None),
         perception_service=SimpleNamespace(get_latest_perception=lambda camera_id=None: full),
         state_store=StateStore(), text_embedding_model="disabled", image_embedding_model="disabled")
@@ -49,7 +50,7 @@ def scene():
     captured={'library_name':'unit_test_library','activation_generation':memory._durable_index.activation_generation,'observation_pose':captured_pose,'map_snapshot':snapshot,'localization_snapshot':localization}
     memory._get_or_refresh_localization=lambda **kwargs:current
     memory._get_map_snapshot=lambda:snapshot
-    memory._mapping_service = SimpleNamespace(get_latest_snapshot=lambda: snapshot)
+    memory._mapping_service = create_memory_mapping_service(snapshot)
     memory._perception_service=SimpleNamespace(get_latest_perception=lambda camera_id=None:fast,
         get_latest_full_perception=lambda camera_id=None:full,get_observation_spatial_context=lambda identifier:captured)
     memory._observation_service=SimpleNamespace(get_latest_observation=lambda camera_id=None:pytest.fail('有完整观察时不得混入另一次抓拍'))

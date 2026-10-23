@@ -37,6 +37,8 @@ from contracts.runtime_views import LocalizationSession, LocalizationSnapshot, M
 from contracts.spatial_memory import InstanceDynamicState, SemanticInstance
 from scripts.memory_test_vectors import ExplicitTextEmbedder
 from services.memory.service import MemoryService
+from services.mapping.service import MappingService
+from core import StateStore
 
 NOW = datetime(2026, 10, 14, 4, 0, tzinfo=timezone.utc)
 AXES = ('x', 'y', 'z')
@@ -82,10 +84,11 @@ class ObjectMemoryIntegration(unittest.TestCase):
 
     def service(self, *, library='house'):
         embedder = ExplicitTextEmbedder(dimension=16)
+        state = StateStore()
         service = MemoryService(localization_service=SimpleNamespace(
             get_current_pose=lambda: None, get_latest_snapshot=lambda: None, get_active_session=lambda: self.session),
-            mapping_service=None, observation_service=None, perception_service=None,
-            state_store=SimpleNamespace(write=lambda *a, **kw: None), memory_db_path=self.database,
+            mapping_service=MappingService(provider_owner=None, state_store=state), observation_service=None, perception_service=None,
+            state_store=state, memory_db_path=self.database,
             text_embedder=embedder, text_embedding_model=embedder.model_name, text_embedding_dimension=16)
         service._start_vectorization_worker = lambda: None
         service._start_deferred_refine_worker = lambda: None

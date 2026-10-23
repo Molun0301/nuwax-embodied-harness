@@ -30,7 +30,7 @@ import threading
 import time
 import uuid
 from types import MappingProxyType
-from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, Union
 
 import grpc
 
@@ -1578,23 +1578,10 @@ def _navigation_status_is_ahead(current: str, incoming: str) -> bool:
     )
 
 
-def _navigation_update_has_complete_zero_proof(update) -> bool:
-    return bool(
-        update.actuator_zeroed
-        and str(update.zero_ack_id).strip()
-        and int(update.zero_applied_monotonic_ns) > 0
-    )
-
-
-def _navigation_update_is_unleased_rejection(update) -> bool:
-    """原生接收边界已确认目标未取得租约，失败不需要停车证明。"""
-    return (update.reason_code == "LEASE_NOT_GRANTED"
-            and update.status.strip().lower() in {"failed", "cancelled"})
-
-
-def _navigation_update_is_resolved_terminal(update) -> bool:
-    return (_navigation_update_has_complete_zero_proof(update)
-            or _navigation_update_is_unleased_rejection(update))
+def _navigation_update_is_admission_rejection(update) -> bool:
+    """原生准入拒绝描述候选请求，不能把其候选租约当作已接纳的目标。"""
+    return (str(update.status).strip().lower() == "failed"
+            and str(update.message).startswith("SET_GOAL_REJECTED["))
 
 
 _NAV_DISPATCH_UNCONFIRMED_REASONS = frozenset({
@@ -1624,35 +1611,6 @@ def _navigation_wire_document(update) -> Dict[str, Any]:
         "distance_remaining": float(update.distance_remaining),
         "timestamp_ns": int(update.timestamp_ns),
     }
-
-
-def _navigation_complete_proof_upgrade(previous_metadata, previous_timestamp_ns, update) -> bool:
-    """停车证明核对原路径；明确无租约拒绝按已关联的目标和源时间结束。"""
-    if _navigation_update_is_unleased_rejection(update):
-        return previous_timestamp_ns <= 0 or update.timestamp_ns >= previous_timestamp_ns
-    return bool(
-        str(update.status).strip().lower() in _NAV_TERMINAL_STATUS
-        and _navigation_update_is_resolved_terminal(update)
-        and int(update.path_revision)
-            == int(previous_metadata.get("path_revision") or 0)
-        and int(update.planner_runtime_generation)
-            == int(previous_metadata.get("planner_runtime_generation") or 0)
-        and (previous_timestamp_ns <= 0
-             or int(update.timestamp_ns) >= previous_timestamp_ns)
-    )
-
-
-def _navigation_precommit_proof_upgrade(previous, update) -> bool:
-    return bool(
-        _navigation_lease_from_message(previous) == _navigation_lease_from_message(update)
-        and str(previous.status).strip().lower() in _NAV_TERMINAL_STATUS
-        and not _navigation_update_is_resolved_terminal(previous)
-        and _navigation_complete_proof_upgrade(
-            {"path_revision": int(previous.path_revision),
-             "planner_runtime_generation": int(previous.planner_runtime_generation)},
-            int(previous.timestamp_ns), update,
-        )
-    )
 
 
 def _navigation_submission_result(goal_id: str, *, accepted=False, message="",
@@ -2294,7 +2252,6 @@ class GeometryRuntimeProvider:
 
     def _navigation_project_update_locked(
         self, update, *, trusted_origin_reason="", command_projection_without_source=False,
-        terminal_observation_current=True,
     ):
         """Rebuild metadata, inheriting only this exact lease/epoch's obligation.
 
@@ -2305,13 +2262,10 @@ class GeometryRuntimeProvider:
         metadata = _navigation_state_typed_metadata(update)
         raw_status = str(update.status).strip().lower()
         inherited = self._navigation_obligation_locked(lease)
-        complete_terminal = (raw_status in _NAV_TERMINAL_STATUS
-                             and _navigation_update_is_resolved_terminal(update))
         metadata["authority_current"] = _is_canonical_public_navigation_lease(lease)
         metadata["ownership_retained"] = False
-        if complete_terminal:
-            if _navigation_update_is_unleased_rejection(update):
-                metadata["lease_not_granted"] = True
+        # 原生拥有方已裁决终态，停车字段只作为原始信息保留。
+        if raw_status in _NAV_TERMINAL_STATUS:
             return raw_status, metadata
         obligation = copy.deepcopy(inherited) if inherited is not None else None
         if trusted_origin_reason in _NAV_DISPATCH_UNCONFIRMED_REASONS:
@@ -2322,17 +2276,11 @@ class GeometryRuntimeProvider:
                     "identity": _navigation_identity_document(lease),
                     "terminal_observed": False,
                 }
-            if (trusted_origin_reason == "GOAL_TERMINAL_PROOF_PENDING"
-                    and terminal_observation_current):
+            if trusted_origin_reason == "GOAL_TERMINAL_PROOF_PENDING":
                 obligation["terminal_observed"] = True
         if obligation is not None:
-            if raw_status in _NAV_TERMINAL_STATUS:
-                obligation["terminal_observed"] = True
-                obligation["observed_status"] = raw_status
             if obligation.get("terminal_observed"):
                 # No invented FAILED/SUCCEEDED when the typed unary only says terminal seen.
-                if obligation.get("observed_status"):
-                    metadata["observed_status"] = obligation["observed_status"]
                 metadata["reason_code"] = "GOAL_TERMINAL_PROOF_PENDING"
                 raw_status = "unconfirmed"
             metadata["dispatch_obligation"] = obligation
@@ -2346,14 +2294,8 @@ class GeometryRuntimeProvider:
         obligation = self._navigation_obligation_locked()
         if obligation is None:
             return True
-        if _navigation_update_is_unleased_rejection(update):
-            return self._last_nav_timestamp_ns <= 0 or update.timestamp_ns >= self._last_nav_timestamp_ns
-        if obligation.get("terminal_observed"):
-            return _navigation_complete_proof_upgrade(
-                self._last_nav_metadata,
-                max(int(self._last_nav_timestamp_ns or 0), int(obligation.get("source_timestamp_floor_ns") or 0)),
-                update,
-            )
+        if str(update.status).strip().lower() in _NAV_TERMINAL_STATUS:
+            return True
         path = int(update.path_revision)
         previous_path = int(self._last_nav_metadata.get("path_revision") or 0)
         stamp = int(update.timestamp_ns)
@@ -2436,9 +2378,9 @@ class GeometryRuntimeProvider:
                 # Freeze provenance before selecting a stronger real precommit body.
                 origin = reason if (canonical and reason in _NAV_DISPATCH_UNCONFIRMED_REASONS
                                     and raw_status in {"unconfirmed", "accepted", "pending", "planning", "running"}) else ""
-                terminal_proof = (canonical and raw_status in _NAV_TERMINAL_STATUS
-                                  and _navigation_update_is_resolved_terminal(resp))
-                may_commit = canonical and (_status_means_accepted(raw_status) or bool(origin) or terminal_proof)
+                terminal = raw_status in _NAV_TERMINAL_STATUS
+                may_commit = (canonical and not _navigation_update_is_admission_rejection(resp)
+                              and (_status_means_accepted(raw_status) or bool(origin) or terminal))
                 staged = self._take_navigation_set_precommit_locked(command_token=command_token, ack_lease=lease)
                 self._nav_inflight_command_token = None
                 with self._nav_state_lock:
@@ -2447,62 +2389,18 @@ class GeometryRuntimeProvider:
                         return None
                     committed = resp
                     from_stream = False
-                    terminal_observation_current = True
-                    if staged is not None and not terminal_proof:
+                    if staged is not None and not terminal:
                         staged_status = str(staged.status).strip().lower()
-                        pending_terminal = origin == "GOAL_TERMINAL_PROOF_PENDING"
-                        # A terminal observation is path-scoped. A newer real path
-                        # outranks a stale projection; same-path planner identity is exact.
-                        projection_path = int(resp.path_revision)
-                        staged_path = int(staged.path_revision)
-                        projection_planner = int(resp.planner_runtime_generation)
-                        staged_planner = int(staged.planner_runtime_generation)
-                        projection_is_stale = bool(pending_terminal and staged_path > projection_path)
-                        proof_for_pending = _navigation_complete_proof_upgrade(
-                            {"path_revision": projection_path,
-                             "planner_runtime_generation": projection_planner},
-                            int(resp.timestamp_ns), staged,
-                        )
-                        same_terminal_path = bool(staged_status in _NAV_TERMINAL_STATUS
-                            and int(staged.path_revision) == int(resp.path_revision)
-                            and int(staged.planner_runtime_generation) == int(resp.planner_runtime_generation))
-                        staged_complete = (staged_status in _NAV_TERMINAL_STATUS
-                                           and _navigation_update_is_resolved_terminal(staged))
-                        projection_stamp = int(resp.timestamp_ns)
-                        staged_stamp = int(staged.timestamp_ns)
-                        staged_source_path_current = bool(
-                            (staged_path > projection_path
-                             or (staged_path == projection_path and staged_planner == projection_planner))
-                            and (projection_stamp <= 0 or staged_stamp >= projection_stamp))
-                        # Complete ZERO is not sufficient by itself: a same-owner old-path
-                        # receipt must not settle the newer unary path. Same-path terminal
-                        # bodies also need the exact planner generation.
-                        staged_body_current = bool((
-                            _navigation_update_is_unleased_rejection(staged)
-                            and (projection_stamp <= 0 or staged_stamp >= projection_stamp)
-                        ) or (staged_source_path_current and (
-                            staged_status not in _NAV_TERMINAL_STATUS
-                            or staged_path > projection_path or staged_planner == projection_planner)))
-                        if (staged_body_current and (projection_is_stale or staged_complete
-                                or (pending_terminal and (proof_for_pending or same_terminal_path))
-                                or (not pending_terminal and (
-                                    _navigation_status_is_ahead(raw_status, staged_status)
-                                    or (bool(origin) and staged_status == raw_status))))):
+                        if (staged_status in _NAV_TERMINAL_STATUS
+                                or _navigation_status_is_ahead(raw_status, staged_status)
+                                or (bool(origin) and staged_status == raw_status)):
                             committed, from_stream = staged, True
-                            terminal_observation_current = not projection_is_stale
                     without_source = bool(origin and not from_stream
                                           and int(resp.timestamp_ns) == 0)
                     status, metadata = self._navigation_project_update_locked(
                         committed, trusted_origin_reason=origin,
                         command_projection_without_source=without_source,
-                        terminal_observation_current=terminal_observation_current,
                     )
-                    if (without_source and origin == "GOAL_TERMINAL_PROOF_PENDING" and staged is not None
-                            and int(staged.path_revision) == int(resp.path_revision)
-                            and int(staged.planner_runtime_generation) == int(resp.planner_runtime_generation)):
-                        # Preserve a real precommit source lower bound without claiming
-                        # that the source-less terminal diagnostic has its own timestamp.
-                        metadata["dispatch_obligation"]["source_timestamp_floor_ns"] = int(staged.timestamp_ns)
                     # This matching public unary is authoritative over a stale display
                     # overlay; arbitrary later foreign streams cannot replace its duty.
                     self._nav_exploration_overlay = None
@@ -2518,12 +2416,8 @@ class GeometryRuntimeProvider:
                     self._last_nav_current_pose = None
                     self._last_nav_timestamp_ns = int(committed.timestamp_ns)
                     self._last_nav_metadata = metadata
-                    resolved = status in _NAV_TERMINAL_STATUS and _navigation_update_is_resolved_terminal(committed)
-                    # Preserve the old ordinary accepted-then-terminal contract. Only
-                    # a trusted unresolved lineage changes an unproved terminal to unknown.
-                    accepted = (_status_means_accepted(status) or (
-                        status in _NAV_TERMINAL_STATUS and not resolved
-                        and not metadata.get("ownership_retained") and _status_means_accepted(raw_status)))
+                    resolved = status in _NAV_TERMINAL_STATUS
+                    accepted = _status_means_accepted(status)
                     owned = metadata.get("ownership_retained") is True
                     navigation = _navigation_wire_document(committed)
                     # Full receipts preserve all original wire values. Extra diagnostic keys
@@ -2532,9 +2426,8 @@ class GeometryRuntimeProvider:
                         ownership_retained=owned, authority_current=True,
                         command_projection_without_source=bool(metadata.get("command_projection_without_source")),
                     )
-                    for key in ("dispatch_obligation", "observed_status"):
-                        if key in metadata:
-                            navigation[key] = copy.deepcopy(metadata[key])
+                    if "dispatch_obligation" in metadata:
+                        navigation["dispatch_obligation"] = copy.deepcopy(metadata["dispatch_obligation"])
                     if not resolved:
                         navigation["status"] = status
                         navigation["reason_code"] = metadata.get("reason_code", "")
@@ -2610,7 +2503,6 @@ class GeometryRuntimeProvider:
         )
         previous = self._nav_set_precommit_candidates.get(key)
         if (previous is not None
-                and not _navigation_precommit_proof_upgrade(previous, update)
                 and not _navigation_status_can_follow(
             previous.status,
             update.status,
@@ -3907,7 +3799,7 @@ class GeometryRuntimeProvider:
         request_id: Optional[str] = None,
         logical_timeout_ms: int = 10_000,
         planar_seed: Optional[Tuple[float, float, float]] = None,
-        assigned_request_v2: Optional[Mapping[str, object] | AssignedRelocalizationRequest] = None,
+        assigned_request_v2: Optional[Union[Mapping[str, object], AssignedRelocalizationRequest]] = None,
     ) -> Dict[str, Any]:
         self._raise_if_stopping("relocalize")
         if not self._connected or not self._stub:
@@ -3936,7 +3828,7 @@ class GeometryRuntimeProvider:
         request_id: str,
         logical_timeout_ms: int,
         planar_seed: Optional[Tuple[float, float, float]] = None,
-        assigned_request_v2: Optional[Mapping[str, object] | AssignedRelocalizationRequest] = None,
+        assigned_request_v2: Optional[Union[Mapping[str, object], AssignedRelocalizationRequest]] = None,
     ) -> Dict[str, Any]:
         """只读查询已存在 request 的权威终态，不创建或推进请求。"""
 
@@ -5406,13 +5298,7 @@ class GeometryRuntimeProvider:
                 status,
             )
             return False
-        if (
-            normalized_status == "cancelled"
-            and not _navigation_update_is_resolved_terminal(update)
-        ):
-            LOGGER.warning(
-                "丢弃缺少完整 ZERO proof 的 CANCELLED navigation stream frame"
-            )
+        if _navigation_update_is_admission_rejection(update):
             return False
         message = update.message
         distance = update.distance_remaining
@@ -5423,13 +5309,19 @@ class GeometryRuntimeProvider:
                 stream_stub,
             ) or self._nav_connection_transition_inflight:
                 return False
-            if self._stage_navigation_set_precommit_locked(
-                update,
-                incoming_lease=incoming_lease,
-                stream_token=stream_token,
-            ):
-                return False
+            staged = self._stage_navigation_set_precommit_locked(
+                update, incoming_lease=incoming_lease, stream_token=stream_token)
             with self._nav_state_lock:
+                # 后继请求尚未接纳时，原目标仍拥有自己的真实状态；拒绝回包不能回滚它。
+                inflight = self._nav_inflight_command_token
+                previous_goal_update = bool(
+                    inflight is not None and inflight[0] == "set"
+                    and inflight[2] == self._nav_command_generation
+                    and inflight[3] == self._nav_connection_epoch
+                    and incoming_lease == self._current_navigation_lease_locked()
+                    and _is_canonical_public_navigation_lease(incoming_lease))
+                if staged and not previous_goal_update:
+                    return False
                 if (self._navigation_obligation_locked() is not None
                         and incoming_lease != self._current_navigation_lease_locked()):
                     # Includes foreign exploration overlays and their empty-IDLE clear.
@@ -5546,20 +5438,15 @@ class GeometryRuntimeProvider:
                     and inflight_token[1] == incoming_lease
                     and inflight_token[2] == self._nav_command_generation
                     and inflight_token[3] == self._nav_connection_epoch
-                    # 同租约已停车的自然/外部终态也能结束在途取消；新目标仍由完整身份隔离。
+                    # 同一目标的原生终态结束在途取消；后继目标仍由事务身份隔离。
                     and incoming_status in terminal_statuses
-                    and _navigation_update_is_resolved_terminal(update)
                 )
                 command_generation_is_current = bool(
                     self._last_nav_goal_command_generation
                     == self._nav_command_generation
                 )
-                obligation = self._navigation_obligation_locked(current_lease)
-                proof_upgrade = bool(obligation and obligation.get("terminal_observed")
-                    and _navigation_complete_proof_upgrade(self._last_nav_metadata,
-                        int(self._last_nav_timestamp_ns or 0), update))
                 status_is_monotonic = bool(
-                    unbound_current_connection or proof_upgrade or stream_disconnected_placeholder
+                    unbound_current_connection or stream_disconnected_placeholder
                     or _navigation_status_can_follow(
                         self._last_nav_status,
                         status,
@@ -5575,6 +5462,7 @@ class GeometryRuntimeProvider:
                     or not (
                         command_generation_is_current
                         or inflight_cancel_terminal
+                        or previous_goal_update
                     )
                     or not status_is_monotonic
                     or (
@@ -6073,344 +5961,136 @@ class GeometryRuntimeProvider:
         deadline_monotonic: Optional[float] = None,
         global_stop_confirmation: Optional[StopAllMotionConfirmation] = None,
     ) -> bool:
-        """NavigationProvider 协议 shim：定向取消当前 exact goal。"""
+        """转交定向取消；空身份由原生拥有方绑定当时的当前目标。"""
         self._raise_if_stopping("cancel_goal")
         exact_goal_id = str(request_id or "").strip()
-        if not exact_goal_id:
-            LOGGER.warning("GeometryRuntimeProvider 拒绝缺少 exact goal_id 的取消请求。")
-            return False
-        if not self._stub:
-            LOGGER.warning("GeometryRuntimeProvider.cancel_goal stub 不可用，返回 False。")
-            return False
-        command_stub = None
-        command_token = None
-        command_generation = None
-        with _cooperative_deadline_lock(
-            self._nav_delivery_lock,
-            deadline_monotonic,
-            "CancelNavigation",
-        ):
-            with _cooperative_deadline_lock(
-                self._nav_command_lock,
-                deadline_monotonic,
-                "CancelNavigation",
-            ):
-                if (
-                    self._nav_connection_transition_inflight
-                    or not self._connected
-                    or self._stub is None
-                ):
+        with _cooperative_deadline_lock(self._nav_delivery_lock, deadline_monotonic, "CancelNavigation"):
+            with _cooperative_deadline_lock(self._nav_command_lock, deadline_monotonic, "CancelNavigation"):
+                if (self._nav_connection_transition_inflight or not self._connected or self._stub is None):
                     return False
-                inflight_token = self._nav_inflight_command_token
-                if (
-                    inflight_token is not None
-                    and inflight_token[0] == "set"
-                    and inflight_token[2] == self._nav_command_generation
-                    and inflight_token[3] == self._nav_connection_epoch
-                ):
-                    LOGGER.warning(
-                        "GeometryRuntimeProvider 拒绝在 SetGoal 事务中取消旧缓存目标：requested_goal_id=%s set_goal_id=%s",
-                        exact_goal_id,
-                        inflight_token[1][0] or None,
-                    )
+                inflight = self._nav_inflight_command_token
+                if (inflight is not None and inflight[0] == "set"
+                        and inflight[2] == self._nav_command_generation
+                        and inflight[3] == self._nav_connection_epoch):
                     return False
                 command_stub = self._stub
                 with self._nav_state_lock:
                     active_lease = self._current_navigation_lease_locked()
-                    active_goal_id = active_lease[0]
-                    active_status = self._nav_status_to_enum(
-                        self._last_nav_status
-                    )
-                if (
-                    active_goal_id != exact_goal_id
-                    or not _is_canonical_public_navigation_lease(active_lease)
-                    or (global_stop_confirmation is None and active_status
-                    in {
-                        NavigationStatus.IDLE,
-                        NavigationStatus.SUCCEEDED,
-                        NavigationStatus.FAILED,
-                        NavigationStatus.CANCELLED,
-                    })
-                ):
-                    LOGGER.warning(
-                        "GeometryRuntimeProvider 拒绝 stale 定向取消：requested_goal_id=%s active_goal_id=%s status=%s",
-                        exact_goal_id,
-                        active_goal_id or None,
-                        active_status.value,
-                    )
+                    active_status = self._nav_status_to_enum(self._last_nav_status)
+                if exact_goal_id and (
+                        active_lease[0] != exact_goal_id
+                        or not _is_canonical_public_navigation_lease(active_lease)
+                        or (global_stop_confirmation is None and active_status in {
+                            NavigationStatus.IDLE, NavigationStatus.SUCCEEDED,
+                            NavigationStatus.FAILED, NavigationStatus.CANCELLED})):
                     return False
                 self._clear_navigation_set_precommit_locked()
                 self._nav_command_generation += 1
-                command_generation = self._nav_command_generation
-                command_token = (
-                    "cancel",
-                    active_lease,
-                    command_generation,
-                    self._nav_connection_epoch,
-                )
+                command_token = ("cancel", active_lease, self._nav_command_generation, self._nav_connection_epoch)
                 self._nav_inflight_command_token = command_token
                 self._nav_completed_cancel_command_token = None
             self._cancel_pending_navigation_notifications_locked()
         try:
-            req = pb2.CancelNavigationRequest(
-                goal_id=active_lease[0],
-                owner_kind=active_lease[1],
-                parent_request_id=active_lease[2],
-                goal_generation=active_lease[3],
-                producer_runtime_generation=active_lease[4],
-            )
+            # 空请求不从显示缓存推导租约；原生在取消事务锁内选择当前目标。
+            req = pb2.CancelNavigationRequest()
+            if exact_goal_id:
+                req.goal_id, req.owner_kind, req.parent_request_id = active_lease[:3]
+                req.goal_generation, req.producer_runtime_generation = active_lease[3:]
             if global_stop_confirmation is not None:
                 req.global_stop_confirmation.CopyFrom(
                     _ordinary_global_stop_confirmation_proto(global_stop_confirmation))
-            rpc_timeout = _exploration_rpc_timeout(
-                deadline_monotonic,
-                "CancelNavigation",
-            )
             resp = command_stub.CancelNavigation(
-                req,
-                timeout=rpc_timeout,
-            )
-            raw_status = resp.status
-            terminal = _status_means_cancelled(raw_status)
-            success = bool(
-                (_status_means_cancel_success(raw_status)
-                 or (str(raw_status).strip().lower() in _NAV_TERMINAL_STATUS
-                     and _navigation_update_is_resolved_terminal(resp)))
-                and (
-                    not terminal
-                    or _navigation_update_is_resolved_terminal(resp)
-                )
-            )
-            cancel_message = resp.message
+                req, timeout=_exploration_rpc_timeout(deadline_monotonic, "CancelNavigation"))
+            raw_status = str(resp.status).strip().lower()
             response_lease = _navigation_lease_from_message(resp)
+            success = (_status_means_cancel_success(raw_status) or raw_status in _NAV_TERMINAL_STATUS)
             notification = None
             with self._nav_delivery_lock:
                 with self._nav_command_lock:
                     with self._nav_state_lock:
                         current_lease = self._current_navigation_lease_locked()
-                        current_goal_id = current_lease[0]
                         terminal_already_committed = bool(
-                            command_token is not None
-                            and command_token
-                            == self._nav_completed_cancel_command_token
-                            and command_token[2]
-                            == self._nav_command_generation
-                            and command_token[3]
-                            == self._nav_connection_epoch
+                            command_token == self._nav_completed_cancel_command_token
+                            and command_token[2] == self._nav_command_generation
+                            and command_token[3] == self._nav_connection_epoch
                             and current_lease == active_lease
-                            and self._nav_status_to_enum(
-                                self._last_nav_status
-                            )
-                            in {NavigationStatus.CANCELLED, NavigationStatus.FAILED, NavigationStatus.SUCCEEDED}
-                            and self._last_nav_metadata.get(
-                                "actuator_zeroed"
-                            )
-                            is True
-                            and bool(
-                                str(
-                                    self._last_nav_metadata.get(
-                                        "zero_ack_id",
-                                        "",
-                                    )
-                                    or ""
-                                ).strip()
-                            )
-                            and int(
-                                self._last_nav_metadata.get(
-                                    "zero_applied_monotonic_ns",
-                                    0,
-                                )
-                                or 0
-                            )
-                            > 0
-                        )
-                        command_is_current = bool(
-                            command_token is not None
-                            and command_token
-                            == self._nav_inflight_command_token
-                            and command_token[2]
-                            == self._nav_command_generation
-                            and command_token[3]
-                            == self._nav_connection_epoch
-                            and self._stub is command_stub
-                            and self._connected
-                            and not self._nav_connection_transition_inflight
-                        )
-                        response_is_current = bool(
-                            command_is_current
-                            and current_lease == active_lease
-                            and response_lease == active_lease
-                            and _is_canonical_public_navigation_lease(
-                                response_lease
-                            )
-                        )
+                            and str(self._last_nav_status).strip().lower() in _NAV_TERMINAL_STATUS)
+                        command_current = bool(
+                            command_token == self._nav_inflight_command_token
+                            and command_token[2] == self._nav_command_generation
+                            and command_token[3] == self._nav_connection_epoch
+                            and command_stub is self._stub and self._connected
+                            and not self._nav_connection_transition_inflight)
+                        response_current = bool(command_current and current_lease == active_lease
+                            and (not exact_goal_id or response_lease == active_lease)
+                            and (_is_canonical_public_navigation_lease(response_lease)
+                                 or (not exact_goal_id and _is_canonical_exploration_child_navigation_lease(response_lease))))
                         if terminal_already_committed:
                             self._nav_completed_cancel_command_token = None
-                        elif command_is_current:
-                            self._nav_inflight_command_token = None
-                            self._last_nav_goal_command_generation = (
-                                command_generation
-                            )
-                        if response_is_current:
-                            normalized_response = str(raw_status).strip().lower()
-                            obligation = self._navigation_obligation_locked(active_lease)
-                            if normalized_response == "pending" and success:
-                                # Pending Cancel is an acknowledgement, not new execution
-                                # progress. Keep the original source/path and responsibility.
-                                self._last_nav_metadata = {
-                                    **copy.deepcopy(self._last_nav_metadata),
-                                    "cancel_phase": str(resp.cancel_phase),
-                                    "cancel_generation": int(resp.cancel_generation),
-                                    "cancel_message": cancel_message,
-                                }
-                            elif (normalized_response in _NAV_TERMINAL_STATUS
-                                  and (success or obligation is not None)):
-                                if not self._navigation_owned_update_can_follow_locked(resp):
-                                    success = False
-                                else:
-                                    status, metadata = self._navigation_project_update_locked(resp)
-                                    self._last_nav_status = status
-                                    self._last_nav_metadata = metadata
-                                    self._last_nav_timestamp_ns = int(resp.timestamp_ns)
-                                    self._last_nav_distance_remaining = float(resp.distance_remaining)
-                                    if cancel_message:
-                                        self._last_nav_message = cancel_message
-                    if terminal_already_committed:
-                        return True
-                    if not response_is_current:
-                        LOGGER.info(
-                            "忽略 stale CancelNavigation 响应: goal_id=%s/%s generation=%s/%s command=%s/%s active_goal_id=%s/%s",
-                            exact_goal_id,
-                            response_lease[0] or None,
-                            active_lease[3],
-                            response_lease[3],
-                            command_generation,
-                            self._nav_command_generation,
-                            current_goal_id or None,
-                            current_lease[3],
-                        )
-                        return False
+                            return True
+                        if not response_current:
+                            return False
+                        self._nav_inflight_command_token = None
+                        self._last_nav_goal_command_generation = command_token[2]
+                        if _is_canonical_exploration_child_navigation_lease(response_lease):
+                            overlay = pb2.NavigationState()
+                            overlay.CopyFrom(resp)
+                            self._nav_exploration_overlay = overlay
+                            self._nav_exploration_overlay_terminal = raw_status in _NAV_TERMINAL_STATUS
+                        elif raw_status == "pending" and success and response_lease == active_lease:
+                            self._last_nav_metadata = {
+                                **self._last_nav_metadata,
+                                "cancel_phase": str(resp.cancel_phase),
+                                "cancel_generation": int(resp.cancel_generation),
+                                "cancel_message": resp.message,
+                            }
+                        elif success:
+                            status, metadata = self._navigation_project_update_locked(resp)
+                            self._last_nav_goal_id = response_lease[0]
+                            self._last_nav_owner_kind = response_lease[1]
+                            self._last_nav_parent_request_id = response_lease[2]
+                            self._last_nav_goal_generation = response_lease[3]
+                            self._last_nav_producer_runtime_generation = response_lease[4]
+                            self._last_nav_status = status
+                            self._last_nav_metadata = metadata
+                            self._last_nav_timestamp_ns = int(resp.timestamp_ns)
+                            self._last_nav_distance_remaining = float(resp.distance_remaining)
+                            self._last_nav_message = resp.message
                 if success:
                     state = self._build_navigation_state_snapshot(
-                        include_readiness=False,
-                        include_exploration_overlay=False,
-                    )
+                        include_readiness=False, include_exploration_overlay=False)
                     notification = self._begin_navigation_notification(state)
             if notification is not None:
                 self._notify_navigation_subscribers(notification)
             return success
         except grpc.RpcError as exc:
-            terminal_already_committed = False
             with self._nav_delivery_lock:
                 with self._nav_command_lock:
                     with self._nav_state_lock:
                         terminal_already_committed = bool(
-                            command_token is not None
-                            and command_token
-                            == self._nav_completed_cancel_command_token
-                            and command_token[2]
-                            == self._nav_command_generation
-                            and command_token[3]
-                            == self._nav_connection_epoch
-                            and self._current_navigation_lease_locked()
-                            == active_lease
-                            and self._nav_status_to_enum(
-                                self._last_nav_status
-                            )
-                            in {NavigationStatus.CANCELLED, NavigationStatus.FAILED, NavigationStatus.SUCCEEDED}
-                            and self._last_nav_metadata.get(
-                                "actuator_zeroed"
-                            )
-                            is True
-                            and bool(
-                                self._last_nav_metadata.get("zero_ack_id")
-                            )
-                            and int(
-                                self._last_nav_metadata.get(
-                                    "zero_applied_monotonic_ns",
-                                    0,
-                                )
-                                or 0
-                            )
-                            > 0
-                        )
+                            command_token == self._nav_completed_cancel_command_token
+                            and command_token[2] == self._nav_command_generation
+                            and command_token[3] == self._nav_connection_epoch
+                            and self._current_navigation_lease_locked() == active_lease
+                            and str(self._last_nav_status).strip().lower() in _NAV_TERMINAL_STATUS)
                         if terminal_already_committed:
                             self._nav_completed_cancel_command_token = None
-                        elif (
-                            command_token is not None
-                            and command_token
-                            == self._nav_inflight_command_token
-                            and command_token[2]
-                            == self._nav_command_generation
-                            and command_token[3]
-                            == self._nav_connection_epoch
-                            and self._stub is command_stub
-                        ):
-                            self._nav_inflight_command_token = None
-                            self._last_nav_goal_command_generation = (
-                                command_generation
-                            )
             _log_rpc_error("CancelNavigation", exc)
             if terminal_already_committed:
                 return True
             if deadline_monotonic is not None:
                 raise _exploration_rpc_error("CancelNavigation", exc) from exc
             return False
-        except Exception as exc:  # pragma: no cover
-            terminal_already_committed = False
+        finally:
             with self._nav_delivery_lock:
                 with self._nav_command_lock:
-                    with self._nav_state_lock:
-                        terminal_already_committed = bool(
-                            command_token is not None
-                            and command_token
-                            == self._nav_completed_cancel_command_token
-                            and command_token[2]
-                            == self._nav_command_generation
-                            and command_token[3]
-                            == self._nav_connection_epoch
-                            and self._current_navigation_lease_locked()
-                            == active_lease
-                            and self._nav_status_to_enum(
-                                self._last_nav_status
-                            )
-                            in {NavigationStatus.CANCELLED, NavigationStatus.FAILED, NavigationStatus.SUCCEEDED}
-                            and self._last_nav_metadata.get(
-                                "actuator_zeroed"
-                            )
-                            is True
-                            and bool(
-                                self._last_nav_metadata.get("zero_ack_id")
-                            )
-                            and int(
-                                self._last_nav_metadata.get(
-                                    "zero_applied_monotonic_ns",
-                                    0,
-                                )
-                                or 0
-                            )
-                            > 0
-                        )
-                        if terminal_already_committed:
-                            self._nav_completed_cancel_command_token = None
-                        elif (
-                            command_token is not None
-                            and command_token
-                            == self._nav_inflight_command_token
-                            and command_token[2]
-                            == self._nav_command_generation
-                            and command_token[3]
-                            == self._nav_connection_epoch
-                            and self._stub is command_stub
-                        ):
-                            self._nav_inflight_command_token = None
-                            self._last_nav_goal_command_generation = (
-                                command_generation
-                            )
-            LOGGER.exception("GeometryRuntimeProvider.cancel_goal 异常。")
-            if isinstance(exc, GeometryRuntimeRpcError):
-                raise
-            return terminal_already_committed
+                    if (command_token == self._nav_inflight_command_token
+                            and command_token[2] == self._nav_command_generation
+                            and command_token[3] == self._nav_connection_epoch
+                            and command_stub is self._stub):
+                        self._nav_inflight_command_token = None
+                        with self._nav_state_lock:
+                            self._last_nav_goal_command_generation = command_token[2]
 
     def is_goal_reached(self) -> bool:
         """NavigationProvider 协议 shim：当前目标是否已到达。

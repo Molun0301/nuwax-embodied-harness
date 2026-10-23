@@ -1,3 +1,4 @@
+from tests.conftest import create_memory_mapping_service
 """生产感知/制品/事件实现的定向测试；检测器为无模型单元夹具。"""
 import threading
 from types import SimpleNamespace
@@ -130,7 +131,7 @@ def test_real_capture_to_memory_preserves_artifact_and_original_pose(setup):
     localization = LocalizationSnapshot(source_name="unit", current_pose=pose)
     memory = MemoryService(
         localization_service=SimpleNamespace(get_latest_snapshot=lambda: localization, get_active_session=lambda: None),
-        mapping_service=SimpleNamespace(get_latest_snapshot=lambda: snapshot),
+        mapping_service=create_memory_mapping_service(snapshot),
         observation_service=SimpleNamespace(get_latest_observation=lambda camera_id=None: None),
         perception_service=service, state_store=StateStore(), artifact_store=store,
         text_embedding_model="disabled", image_embedding_model="disabled")

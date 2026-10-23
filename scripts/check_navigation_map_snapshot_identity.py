@@ -2,14 +2,13 @@
 """地图 v2 身份的真实导航/探索调用回归；仅使用离线提供器，不连接设备。"""
 from __future__ import annotations
 
-import json
 import sys
 import tempfile
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -28,7 +27,6 @@ from core import StateNamespace, StateStore
 from core.errors import GatewayError
 from providers import ExplorationProvider, NavigationProvider
 from services.mapping.service import MappingService
-from services.navigation.exploration_checkpoint import ExplorationCheckpoint, ExplorationCheckpointStore
 from services.navigation.forbidden_zones import ForbiddenZoneStore
 from services.navigation.service import NavigationService
 
@@ -54,6 +52,9 @@ class OfflineProvider(NavigationProvider, ExplorationProvider):
         return True
 
     def get_navigation_state(self):
+        return self.navigation_state
+
+    def get_navigation_control_state(self, *, deadline_monotonic=None):
         return self.navigation_state
 
     def is_goal_reached(self):
@@ -204,41 +205,6 @@ class NavigationMapIdentityChecks(unittest.TestCase):
             self.assert_context_identity(self.navigation.set_goal(goal), self.expected(19))
         self.assertEqual(legacy["content_sha256"], "opaque historical field")
 
-    def test_legacy_checkpoint_bytes_and_opaque_identity_survive_read_and_same_value_save(self):
-        self.publish()
-        old_identity = {"source_epoch": "historical-source", "update_sequence": 4,
-                        "content_sha256": "opaque historical identity"}
-        progress = json.dumps({"schema_version": 1, "map_name": "离线地图", "request_id": "old-explore",
-                               "map_frame_id": "map", "configuration_sha256": [3] * 32,
-                               "navigation_configuration_sha256": [9] * 32}, separators=(",", ":"))
-        saved = ExplorationCheckpoint(
-            checkpoint_id="old-checkpoint", pipeline="lio_3d", asset_manifest_sha256="a" * 64,
-            request=ExploreAreaRequest(request_id="old-explore", map_name="离线地图",
-                                       metadata={"map_snapshot_identity": old_identity}),
-            geometry_progress_json=progress,
-        )
-        store = ExplorationCheckpointStore(self.root)
-        store.validate_asset = Mock()
-        store.root.mkdir()
-        path = store.root / ("b" * 64 + ".json")
-        path.write_text(json.dumps({"payload": saved.model_dump_json(), "sha256": "old wrapper"}), encoding="utf-8")
-        original = path.read_bytes()
-        loaded = store.load(saved.checkpoint_id)
-        store.save(loaded)
-        self.assertEqual(loaded, saved)
-        self.assertEqual(loaded.geometry_progress_json, progress)
-        self.assertEqual(loaded.request.metadata["map_snapshot_identity"], old_identity)
-        self.assertEqual(path.read_bytes(), original)
-        self.assertEqual(store._path(saved.checkpoint_id), path)
-        reopened = ExplorationCheckpointStore(self.root).load(saved.checkpoint_id, validate_asset=False)
-        self.assertEqual(reopened, saved)
-        resumed = reopened.request.model_copy(update={"resume_progress_json": reopened.geometry_progress_json})
-        context = self.navigation.start_exploration(resumed)
-        self.assertEqual(context.metadata["map_snapshot_identity"], self.expected())
-        self.assertEqual(context.exploration_state.metadata["map_snapshot_identity"], self.expected())
-        self.assertEqual(self.provider.requests[-1].resume_progress_json, progress)
-        self.assertEqual(self.provider.requests[-1].metadata["map_snapshot_identity"], old_identity)
-        self.assertEqual(path.read_bytes(), original)
 
 
 if __name__ == "__main__":

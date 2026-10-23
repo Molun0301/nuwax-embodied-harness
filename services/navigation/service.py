@@ -1343,22 +1343,10 @@ class NavigationService:
                         if (incoming_path < old_path
                                 or (incoming_path == old_path and incoming_planner != old_planner)):
                             return previous_context
-                    incoming_terminal = navigation_state.status in {
-                        NavigationStatus.SUCCEEDED, NavigationStatus.FAILED, NavigationStatus.CANCELLED,
-                    }
-                    stronger_terminal_observation = bool(
-                        exact_identity and incoming_without_source
-                        and incoming_terminal
-                        and not previous_terminal
-                        and int(incoming_metadata.get("path_revision") or 0) >= int(metadata.get("path_revision") or 0)
-                        and (int(incoming_metadata.get("path_revision") or 0) > int(metadata.get("path_revision") or 0)
-                             or incoming_metadata.get("planner_runtime_generation") == metadata.get("planner_runtime_generation")))
-                    # 本目标的新终态可结束运行；其它无源回包不能回退已收到的执行状态。
-                    if (exact_identity and incoming_without_source and not old_without_source
-                            and not stronger_terminal_observation):
+                    # 命令回包的无源未确认投影不覆盖已经收到的执行状态。
+                    if exact_identity and incoming_without_source and not old_without_source:
                         return previous_context
                     if (navigation_state.updated_at < previous.updated_at
-                            and not stronger_terminal_observation
                             and not (exact_identity and old_without_source and not incoming_without_source)):
                         return previous_context
                 if previous_terminal and current_goal is None and navigation_state.status == NavigationStatus.IDLE:
@@ -1661,11 +1649,18 @@ class NavigationService:
             if submission and submission.get("goal_id") == goal.goal_id and not submission.get("accepted"):
                 message = submission.get("message") or message
                 details["backend_message"] = message
-                # 只解析本次事务回执中的机器代码，不从共享的最后状态猜测。
-                import re
-                match = re.search(r"SET_GOAL_REJECTED\[([A-Z0-9_]+)\]", message)
-                if match:
-                    details["backend_code"] = match.group(1)
+                # 原生类型码决定控制语义，说明文字只供展示。
+                reason_code = str(submission.get("reason_code") or "")
+                if reason_code:
+                    details["reason_code"] = reason_code
+                    readiness_prefix = "GOAL_RETRY_NAVIGATION_NOT_READY_"
+                    if reason_code.startswith(readiness_prefix):
+                        backend_code = reason_code[len(readiness_prefix):]
+                    elif reason_code == "GOAL_RETRY_MAP_REVISION_ADVANCED":
+                        backend_code = "MAP_REVISION_ADVANCED"
+                    else:
+                        backend_code = reason_code
+                    details["backend_code"] = backend_code
             with _exploration_deadline_lock(
                 self._lock, deadline_monotonic, "SetNavigationGoal",
             ):

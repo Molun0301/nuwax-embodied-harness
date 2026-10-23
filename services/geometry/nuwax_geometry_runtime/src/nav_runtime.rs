@@ -2618,13 +2618,57 @@ pub enum SetGoalRetryReason {
     NavigationNotReady(NavigationReadinessCode),
 }
 
-/// Machine-readable reason for a permanent navigation admission rejection.
+impl SetGoalRetryReason {
+    /// 准入重试使用独立机器码，不能与执行阶段的普通就绪诊断混淆。
+    pub fn reason_code(self) -> String {
+        match self {
+            Self::MapRevisionAdvanced => "GOAL_RETRY_MAP_REVISION_ADVANCED".into(),
+            Self::NavigationNotReady(code) => {
+                format!("GOAL_RETRY_NAVIGATION_NOT_READY_{}", code.as_str())
+            }
+        }
+    }
+}
+
+/// 本次导航准入已明确拒绝的原因，不表示目标永久不可达。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetGoalRejectReason {
     /// 原目标所属的地图域或坐标代际已经撤销。
     MapFrameChanged,
     /// The active map name no longer matches the name frozen by the caller.
     ActiveMapNameChanged,
+    GoalIntentInvalid,
+    GoalFrameMismatch,
+    GoalBoundaryInvalid,
+    GoalLeaseInvalid,
+    GoalEnvelopeRange,
+    GoalTimestampInvalid,
+    GoalLeaseBusy,
+    GoalGenerationStale,
+    CancelStateUnavailable,
+    CancelGenerationChanged,
+    GoalEnvelopeInvalid,
+}
+
+impl SetGoalRejectReason {
+    /// 安装目标之前的拒绝原因直接投影到协议，显示文本不参与分类。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MapFrameChanged => "GOAL_MAP_FRAME_CHANGED",
+            Self::ActiveMapNameChanged => "GOAL_ACTIVE_MAP_NAME_CHANGED",
+            Self::GoalIntentInvalid => "GOAL_INTENT_INVALID",
+            Self::GoalFrameMismatch => "GOAL_FRAME_MISMATCH",
+            Self::GoalBoundaryInvalid => "GOAL_BOUNDARY_INVALID",
+            Self::GoalLeaseInvalid => "GOAL_LEASE_INVALID",
+            Self::GoalEnvelopeRange => "GOAL_ENVELOPE_RANGE",
+            Self::GoalTimestampInvalid => "GOAL_TIMESTAMP_INVALID",
+            Self::GoalLeaseBusy => "GOAL_LEASE_BUSY",
+            Self::GoalGenerationStale => "GOAL_GENERATION_STALE",
+            Self::CancelStateUnavailable => "GOAL_CANCEL_STATE_UNAVAILABLE",
+            Self::CancelGenerationChanged => "GOAL_CANCEL_GENERATION_CHANGED",
+            Self::GoalEnvelopeInvalid => "GOAL_ENVELOPE_INVALID",
+        }
+    }
 }
 
 /// Source of the lease in THIS command result; Some alone never grants ownership.
@@ -2699,7 +2743,7 @@ pub struct SetGoalOutcome {
     pub lease: Option<GoalLease>,
     /// Retryable admission cause; unrelated dispatch uncertainty never creates a retry budget.
     pub retry_reason: Option<SetGoalRetryReason>,
-    /// Permanent admission rejection cause.
+    /// 本次准入的明确拒绝原因，不包含未知发布结果。
     pub reject_reason: Option<SetGoalRejectReason>,
     /// Trusted source of the lease in this result.
     pub lease_origin: GoalLeaseOrigin,
@@ -2791,7 +2835,7 @@ fn rejected_goal_intent(goal_id: String, reason: impl Into<String>) -> SetGoalOu
         },
         lease: None,
         retry_reason: None,
-        reject_reason: None,
+        reject_reason: Some(SetGoalRejectReason::GoalIntentInvalid),
         ..SetGoalOutcome::default()
     }
 }
@@ -2812,12 +2856,14 @@ fn goal_map_rejection(admission: &NavAdmissionContext, source: &schema::Committe
     frame_generation: i64, goal_id: &str, source_prevalidated: bool) -> Option<SetGoalOutcome> {
     if admission.mapping_adapter.as_ref().is_some_and(|a| a.lock().checkpoint_localization_required) {
         let mut outcome = rejected_goal_intent(goal_id.into(), "已激活地图正在等待真实定位提交");
+        outcome.reject_reason = None;
         outcome.retry_reason = Some(SetGoalRetryReason::NavigationNotReady(NavigationReadinessCode::PlannerNotReady));
         return Some(outcome);
     }
     let current = admission.committed_map_authority.lock().ok().and_then(|m| m.clone());
     let Some(current) = current else {
         let mut outcome = rejected_goal_intent(goal_id.into(), "authoritative committed map is unavailable");
+        outcome.reject_reason = None;
         outcome.retry_reason = Some(SetGoalRetryReason::MapRevisionAdvanced);
         return Some(outcome);
     };
@@ -2829,6 +2875,7 @@ fn goal_map_rejection(admission: &NavAdmissionContext, source: &schema::Committe
     if source.revision < current.revision {
         if source_prevalidated || (admission.allow_previous_map_revisions && admission.mapping_adapter.is_some()) { return None; }
         let mut outcome = rejected_goal_intent(goal_id.into(), "committed map revision advanced before admission");
+        outcome.reject_reason = None;
         outcome.retry_reason = Some(SetGoalRetryReason::MapRevisionAdvanced);
         return Some(outcome);
     }
@@ -2975,7 +3022,7 @@ pub async fn set_goal_with_boundary(
             },
             lease: None,
             retry_reason: None,
-            reject_reason: None,
+            reject_reason: Some(SetGoalRejectReason::GoalFrameMismatch),
             ..SetGoalOutcome::default()
         };
     }
@@ -3256,7 +3303,7 @@ async fn admit_goal_input(
             },
             lease: None,
             retry_reason: None,
-            reject_reason: None,
+            reject_reason: Some(SetGoalRejectReason::GoalBoundaryInvalid),
             ..SetGoalOutcome::default()
         };
     }
@@ -3282,7 +3329,7 @@ async fn admit_goal_input(
             },
             lease: None,
             retry_reason: None,
-            reject_reason: None,
+            reject_reason: Some(SetGoalRejectReason::GoalLeaseInvalid),
             ..SetGoalOutcome::default()
         };
     }
@@ -3313,7 +3360,7 @@ async fn admit_goal_input(
         };
     }
     if input.frame_id != detail.map_frame {
-        let rejection = NavigationReadinessCode::GoalFrameMismatch;
+        let rejection = SetGoalRejectReason::GoalFrameMismatch;
         return SetGoalOutcome {
             state: NavState {
                 status: NavPhase::Failed.as_str().to_string(),
@@ -3329,7 +3376,7 @@ async fn admit_goal_input(
             },
             lease: None,
             retry_reason: None,
-            reject_reason: None,
+            reject_reason: Some(rejection),
             ..SetGoalOutcome::default()
         };
     }
@@ -3363,7 +3410,7 @@ async fn admit_goal_input(
                 },
                 lease: None,
                 retry_reason: None,
-                reject_reason: None,
+                reject_reason: Some(SetGoalRejectReason::GoalEnvelopeRange),
                 ..SetGoalOutcome::default()
             };
         }
@@ -3383,7 +3430,7 @@ async fn admit_goal_input(
             },
             lease: None,
             retry_reason: None,
-            reject_reason: None,
+            reject_reason: Some(SetGoalRejectReason::GoalEnvelopeRange),
             ..SetGoalOutcome::default()
         };
     }
@@ -3400,7 +3447,7 @@ async fn admit_goal_input(
                 },
                 lease: None,
                 retry_reason: None,
-                reject_reason: None,
+                reject_reason: Some(SetGoalRejectReason::GoalTimestampInvalid),
                 ..SetGoalOutcome::default()
             };
         }
@@ -3414,6 +3461,7 @@ async fn admit_goal_input(
             state: NavState { status: NavPhase::Failed.as_str().to_string(),
                 message: "SET_GOAL_REJECTED[LCM_ENCODE]: motion_stop_generation cannot fit i64".into(),
                 goal_id: input.goal_id, distance_remaining: 0.0, timestamp_ns: now_ns() },
+            reject_reason: Some(SetGoalRejectReason::GoalEnvelopeRange),
             ..SetGoalOutcome::default()
         },
     };
@@ -3530,7 +3578,7 @@ async fn admit_goal_input(
                 lease: Some(lease),
                 lease_origin: GoalLeaseOrigin::Attempted,
                 retry_reason: None,
-                reject_reason: None,
+                reject_reason: Some(SetGoalRejectReason::GoalLeaseBusy),
                 ..SetGoalOutcome::default()
             };
         }
@@ -3549,7 +3597,7 @@ async fn admit_goal_input(
                 lease: Some(lease),
                 lease_origin: GoalLeaseOrigin::Attempted,
                 retry_reason: None,
-                reject_reason: None,
+                reject_reason: Some(SetGoalRejectReason::GoalGenerationStale),
                 ..SetGoalOutcome::default()
             };
         }
@@ -3565,7 +3613,7 @@ async fn admit_goal_input(
                 lease: Some(lease),
                 lease_origin: GoalLeaseOrigin::Attempted,
                 retry_reason: None,
-                reject_reason: None,
+                reject_reason: Some(SetGoalRejectReason::CancelStateUnavailable),
                 ..SetGoalOutcome::default()
             };
         };
@@ -3590,7 +3638,7 @@ async fn admit_goal_input(
                 lease: Some(lease),
                 lease_origin: GoalLeaseOrigin::Attempted,
                 retry_reason: None,
-                reject_reason: None,
+                reject_reason: Some(SetGoalRejectReason::CancelGenerationChanged),
                 ..SetGoalOutcome::default()
             };
         }
@@ -3607,7 +3655,7 @@ async fn admit_goal_input(
             },
             lease: None,
             retry_reason: None,
-            reject_reason: None,
+            reject_reason: Some(SetGoalRejectReason::GoalEnvelopeInvalid),
             ..SetGoalOutcome::default()
         };
     }

@@ -2732,17 +2732,16 @@ mod tests {
             .resolution
             .abort()
             .expect("abort staged generation");
-        for _ in 0..1_000 {
-            if matches!(
-                client.submit(token(2), input(2)),
-                Err(MappingBackendSubmitError::WorkerStopped)
-            ) {
-                worker.stop_and_join().expect("join retired worker");
-                return;
-            }
-            std::thread::yield_now();
+        // abort 只投递决策；等待后台实际退出，不用调度次数代替完成条件。
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !worker.join.as_ref().expect("worker join owner").is_finished() {
+            assert!(Instant::now() < deadline,
+                "aborted generation must stop before accepting another compute");
+            std::thread::sleep(Duration::from_millis(1));
         }
-        panic!("aborted generation must stop before accepting another compute");
+        assert!(matches!(client.submit(token(2), input(2)),
+            Err(MappingBackendSubmitError::WorkerStopped)));
+        worker.stop_and_join().expect("join retired worker");
     }
 
     #[test]

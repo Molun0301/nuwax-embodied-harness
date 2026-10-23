@@ -202,25 +202,32 @@ impl NavigationUpdate {
         if let Some(receipt) = outcome.resolved_receipt.as_ref() {
             return receipt.clone();
         }
-        if outcome.publication == crate::nav_runtime::GoalPublicationPolicy::Local {
-            return Self::from_local(outcome.state.clone(), nav, outcome.lease.clone()).await;
-        }
-        let lease = outcome.lease.as_ref();
-        Self {
-            state: outcome.state.clone(),
-            producer_runtime_generation: lease.map_or(0, |lease| lease.producer_runtime_generation),
-            feedback: NavigationFeedback {
-                reason_code: outcome.diagnostic.map_or_else(String::new, |reason| reason.as_str().to_string()),
-                owner_kind: lease.map_or(0, |lease| lease.owner_kind),
-                parent_request_id: lease.map_or_else(String::new, |lease| lease.parent_request_id.clone()),
-                goal_generation: lease.map_or(0, |lease| lease.goal_generation),
+        let mut update = if outcome.publication == crate::nav_runtime::GoalPublicationPolicy::Local {
+            Self::from_local(outcome.state.clone(), nav, outcome.lease.clone()).await
+        } else {
+            let lease = outcome.lease.as_ref();
+            Self {
+                state: outcome.state.clone(),
                 producer_runtime_generation: lease.map_or(0, |lease| lease.producer_runtime_generation),
-                path_revision: lease.map_or(0, |lease| lease.path_revision),
-                planner_runtime_generation: lease.map_or(0, |lease| lease.planner_runtime_generation),
-                // Neither a terminal phase nor current ZEROED tracker is a receipt.
-                ..NavigationFeedback::default()
-            },
+                feedback: NavigationFeedback {
+                    owner_kind: lease.map_or(0, |lease| lease.owner_kind),
+                    parent_request_id: lease.map_or_else(String::new, |lease| lease.parent_request_id.clone()),
+                    goal_generation: lease.map_or(0, |lease| lease.goal_generation),
+                    producer_runtime_generation: lease.map_or(0, |lease| lease.producer_runtime_generation),
+                    path_revision: lease.map_or(0, |lease| lease.path_revision),
+                    planner_runtime_generation: lease.map_or(0, |lease| lease.planner_runtime_generation),
+                    // Neither a terminal phase nor current ZEROED tracker is a receipt.
+                    ..NavigationFeedback::default()
+                },
+            }
+        };
+        // 原始回执已在入口原样返回；拥有责任诊断优先于拒绝，拒绝优先于重试。
+        if let Some(reason) = outcome.diagnostic.map(|reason| reason.as_str().to_string())
+            .or_else(|| outcome.reject_reason.map(|reason| reason.as_str().to_string()))
+            .or_else(|| outcome.retry_reason.map(|reason| reason.reason_code())) {
+            update.feedback.reason_code = reason;
         }
+        update
     }
 
     /// Preserve legacy local publication only when the command explicitly permits it.
@@ -23228,6 +23235,82 @@ async fn scheme_a_real_admission(
 }
 
 #[tokio::test]
+async fn set_goal_typed_reasons_survive_real_admission_and_local_publication() {
+    use crate::nav_runtime::{NavigationReadinessCode, PlannerInputObservation, SetGoalRejectReason};
+    let (bridge, backend, active) = start_goal("typed-rejection-active").await;
+    let request = scheme_a_child_request(&bridge, "typed-rejection-candidate");
+    let mut busy = scheme_a_real_admission(&bridge, &request).await;
+    assert_eq!(busy.reject_reason, Some(SetGoalRejectReason::GoalLeaseBusy));
+    busy.state.message = "任意本地化文本，不带机器前缀".into();
+    let (tx, mut rx) = broadcast::channel(4);
+    let projected = NavigationUpdate::publish_local_set_goal_outcome(
+        &busy, &bridge.nav, &bridge.state, &tx,
+    ).await;
+    assert_eq!(projected.feedback.reason_code, "GOAL_LEASE_BUSY");
+    assert_eq!(rx.recv().await.unwrap().feedback.reason_code, "GOAL_LEASE_BUSY");
+    assert_eq!(bridge.nav.active_goal_lease().await.as_ref(), Some(&active));
+    assert_eq!(scheme_a_goal_frame_count(&backend), 1);
+
+    let (bridge, _) = configured_bridge().await;
+    let request = scheme_a_child_request(&bridge, "typed-readiness-retry");
+    bridge.nav.observe_planner_input(PlannerInputObservation {
+        generation: 2, map_revision: 1, map_frame: "map".into(), pose_frame: "map".into(), ready: false,
+    }).unwrap();
+    let mut retry = scheme_a_real_admission(&bridge, &request).await;
+    assert_eq!(retry.retry_reason, Some(crate::nav_runtime::SetGoalRetryReason::NavigationNotReady(
+        NavigationReadinessCode::PlannerNotReady)));
+    assert_eq!(retry.reject_reason, None);
+    retry.state.message = "SET_GOAL_REJECTED[WRONG_TEXT_CODE]".into();
+    let projected = NavigationUpdate::from_set_goal_outcome(&retry, &bridge.nav).await;
+    assert_eq!(projected.feedback.reason_code, "GOAL_RETRY_NAVIGATION_NOT_READY_PLANNER_NOT_READY");
+    *bridge.committed_map_authority.lock().unwrap() = None;
+    let mut retry = scheme_a_real_admission(&bridge, &request).await;
+    retry.state.message = "再次读取地图".into();
+    assert_eq!(retry.reject_reason, None);
+    assert_eq!(NavigationUpdate::from_set_goal_outcome(&retry, &bridge.nav).await.feedback.reason_code,
+        "GOAL_RETRY_MAP_REVISION_ADVANCED");
+}
+
+#[tokio::test]
+async fn set_goal_projection_prioritizes_receipt_then_diagnostic_rejection_and_retry() {
+    use crate::nav_runtime::{GoalPublicationPolicy, GoalSubmissionDiagnostic, SetGoalRejectReason, SetGoalRetryReason};
+    let (bridge, _, _) = start_goal("typed-priority-active").await;
+    let request = scheme_a_child_request(&bridge, "typed-priority-candidate");
+    for publication in [GoalPublicationPolicy::Local, GoalPublicationPolicy::NoPublish] {
+        let mut outcome = scheme_a_real_admission(&bridge, &request).await;
+        outcome.publication = publication;
+        outcome.state.message = "SET_GOAL_REJECTED[TEXT_MUST_NOT_WIN]".into();
+        outcome.retry_reason = Some(SetGoalRetryReason::MapRevisionAdvanced);
+        outcome.reject_reason = Some(SetGoalRejectReason::GoalLeaseBusy);
+        outcome.diagnostic = Some(GoalSubmissionDiagnostic::PublishUnconfirmed);
+        assert_eq!(NavigationUpdate::from_set_goal_outcome(&outcome, &bridge.nav).await.feedback.reason_code,
+            "GOAL_PUBLISH_UNCONFIRMED");
+        outcome.diagnostic = None;
+        assert_eq!(NavigationUpdate::from_set_goal_outcome(&outcome, &bridge.nav).await.feedback.reason_code,
+            "GOAL_LEASE_BUSY");
+        outcome.reject_reason = None;
+        assert_eq!(NavigationUpdate::from_set_goal_outcome(&outcome, &bridge.nav).await.feedback.reason_code,
+            "GOAL_RETRY_MAP_REVISION_ADVANCED");
+        let mut receipt = NavigationUpdate::from_set_goal_outcome(&outcome, &bridge.nav).await;
+        receipt.state.status = "FAILED".into();
+        receipt.state.message = "原始终态".into();
+        receipt.state.timestamp_ns = 817;
+        receipt.feedback.reason_code = "NATIVE_FAILED_RECEIPT".into();
+        receipt.feedback.path_revision = 29;
+        receipt.feedback.planner_runtime_generation = 31;
+        outcome.diagnostic = Some(GoalSubmissionDiagnostic::TerminalProofPending);
+        outcome.reject_reason = Some(SetGoalRejectReason::GoalLeaseBusy);
+        outcome.resolved_receipt = Some(receipt.clone());
+        let projected = NavigationUpdate::from_set_goal_outcome(&outcome, &bridge.nav).await;
+        assert_eq!((projected.state.status, projected.state.message, projected.state.goal_id,
+            projected.state.distance_remaining, projected.state.timestamp_ns, projected.producer_runtime_generation),
+            (receipt.state.status, receipt.state.message, receipt.state.goal_id,
+            receipt.state.distance_remaining, receipt.state.timestamp_ns, receipt.producer_runtime_generation));
+        assert_eq!(format!("{:?}", projected.feedback), format!("{:?}", receipt.feedback));
+    }
+}
+
+#[tokio::test]
 async fn scheme_a_real_bridge_permanent_none_is_before_publish() {
     use crate::explore_runtime::{ChildNavigationSubmitError, ExploreNavigationSink};
 
@@ -23241,7 +23324,7 @@ async fn scheme_a_real_bridge_permanent_none_is_before_publish() {
     assert_eq!(raw.state.status, "FAILED");
     assert!(raw.lease.is_none());
     assert_eq!(raw.retry_reason, None);
-    assert_eq!(raw.reject_reason, None);
+    assert_eq!(raw.reject_reason, Some(crate::nav_runtime::SetGoalRejectReason::GoalIntentInvalid));
     assert!(bridge.nav.active_goal_lease().await.is_none());
     assert_eq!(scheme_a_goal_frame_count(&backend), 0);
 
@@ -23412,6 +23495,7 @@ async fn scheme_a_real_bridge_none_session_changes_keep_session_policy() {
             SetGoalRejectReason::ActiveMapNameChanged => {
                 request.expected_map_name = "a-different-map-name".to_string();
             }
+            _ => unreachable!("本用例仅覆盖地图会话撤销"),
         }
         let cancel_before = bridge.nav.cancel_snapshot();
         let raw = scheme_a_real_admission(&bridge, &request).await;
@@ -23478,7 +23562,7 @@ async fn scheme_a_assert_real_bridge_some_busy_keeps_generic_rejection(
     let raw = scheme_a_real_admission(bridge, &request).await;
     assert_eq!(raw.state.status, "FAILED");
     assert_eq!(raw.retry_reason, None);
-    assert_eq!(raw.reject_reason, None);
+    assert_eq!(raw.reject_reason, Some(crate::nav_runtime::SetGoalRejectReason::GoalLeaseBusy));
     let attempted = raw.lease.expect("actual busy CAS branch retains attempted Some lease");
     assert_eq!(attempted.session_id, request.request_id);
     assert_ne!(attempted, *active);
@@ -23512,7 +23596,7 @@ async fn scheme_a_assert_none_rejection_does_not_stop_another_owner(
     assert_eq!(raw.state.status, "FAILED");
     assert!(raw.lease.is_none());
     assert_eq!(raw.retry_reason, None);
-    assert_eq!(raw.reject_reason, None);
+    assert_eq!(raw.reject_reason, Some(crate::nav_runtime::SetGoalRejectReason::GoalIntentInvalid));
     assert_eq!(bridge.submit(request).await.expect_err("invalid attempt before CAS"),
         ChildNavigationSubmitError::RejectedBeforePublish(raw.state.message));
     assert_eq!(bridge.nav.active_goal_lease().await.as_ref(), Some(active));

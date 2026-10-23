@@ -104,7 +104,7 @@ class NavigationServiceLifecycleChecks(unittest.TestCase):
         self.provider.take_goal_submission_result = lambda goal_id: {
             "goal_id": goal_id, "accepted": False, "disposition": "rejected",
             "message": "SET_GOAL_REJECTED[GOAL_LEASE_BUSY]: active=active-before-busy",
-            "reason_code": "",
+            "reason_code": "GOAL_LEASE_BUSY",
         }
         with self.assertRaises(GatewayError) as raised:
             self.navigation.set_goal(self.goal("rejected-candidate"))

@@ -1578,10 +1578,38 @@ def _navigation_status_is_ahead(current: str, incoming: str) -> bool:
     )
 
 
-def _navigation_update_is_admission_rejection(update) -> bool:
-    """原生准入拒绝描述候选请求，不能把其候选租约当作已接纳的目标。"""
-    return (str(update.status).strip().lower() == "failed"
-            and str(update.message).startswith("SET_GOAL_REJECTED["))
+# 与原生 SetGoalRejectReason/SetGoalRetryReason 的协议投影对齐；消息只用于展示。
+_NAV_ADMISSION_REJECTION_REASONS = frozenset({
+    "GOAL_MAP_FRAME_CHANGED",
+    "GOAL_ACTIVE_MAP_NAME_CHANGED",
+    "GOAL_INTENT_INVALID",
+    "GOAL_FRAME_MISMATCH",
+    "GOAL_BOUNDARY_INVALID",
+    "GOAL_LEASE_INVALID",
+    "GOAL_ENVELOPE_RANGE",
+    "GOAL_TIMESTAMP_INVALID",
+    "GOAL_LEASE_BUSY",
+    "GOAL_GENERATION_STALE",
+    "GOAL_CANCEL_STATE_UNAVAILABLE",
+    "GOAL_CANCEL_GENERATION_CHANGED",
+    "GOAL_ENVELOPE_INVALID",
+    "GOAL_RETRY_MAP_REVISION_ADVANCED",
+    "GOAL_RETRY_NAVIGATION_NOT_READY_UNKNOWN",
+    "GOAL_RETRY_NAVIGATION_NOT_READY_READY",
+    "GOAL_RETRY_NAVIGATION_NOT_READY_LCM_BACKEND_UNAVAILABLE",
+    "GOAL_RETRY_NAVIGATION_NOT_READY_STACK_STATE_UNOBSERVED",
+    "GOAL_RETRY_NAVIGATION_NOT_READY_STACK_STATE_STALE",
+    "GOAL_RETRY_NAVIGATION_NOT_READY_TF_UNOBSERVED",
+    "GOAL_RETRY_NAVIGATION_NOT_READY_TF_STALE",
+    "GOAL_RETRY_NAVIGATION_NOT_READY_TF_INCOMPLETE",
+    "GOAL_RETRY_NAVIGATION_NOT_READY_PLANNER_INPUT_UNOBSERVED",
+    "GOAL_RETRY_NAVIGATION_NOT_READY_PLANNER_INPUT_STALE",
+    "GOAL_RETRY_NAVIGATION_NOT_READY_PLANNER_FRAME_MISMATCH",
+    "GOAL_RETRY_NAVIGATION_NOT_READY_COSTMAP_UNAVAILABLE",
+    "GOAL_RETRY_NAVIGATION_NOT_READY_PLANNER_NOT_READY",
+    "GOAL_RETRY_NAVIGATION_NOT_READY_PROFILE_UNSUPPORTED",
+    "GOAL_RETRY_NAVIGATION_NOT_READY_GOAL_FRAME_MISMATCH",
+})
 
 
 _NAV_DISPATCH_UNCONFIRMED_REASONS = frozenset({
@@ -2379,7 +2407,8 @@ class GeometryRuntimeProvider:
                 origin = reason if (canonical and reason in _NAV_DISPATCH_UNCONFIRMED_REASONS
                                     and raw_status in {"unconfirmed", "accepted", "pending", "planning", "running"}) else ""
                 terminal = raw_status in _NAV_TERMINAL_STATUS
-                may_commit = (canonical and not _navigation_update_is_admission_rejection(resp)
+                may_commit = (canonical and not (raw_status == "failed"
+                               and reason in _NAV_ADMISSION_REJECTION_REASONS)
                               and (_status_means_accepted(raw_status) or bool(origin) or terminal))
                 staged = self._take_navigation_set_precommit_locked(command_token=command_token, ack_lease=lease)
                 self._nav_inflight_command_token = None
@@ -5298,7 +5327,8 @@ class GeometryRuntimeProvider:
                 status,
             )
             return False
-        if _navigation_update_is_admission_rejection(update):
+        if (normalized_status == "failed"
+                and update.reason_code in _NAV_ADMISSION_REJECTION_REASONS):
             return False
         message = update.message
         distance = update.distance_remaining

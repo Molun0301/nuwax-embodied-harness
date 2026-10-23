@@ -72,8 +72,11 @@ def to_map_json_bytes(value: Any) -> bytes:
         if deferred is not None:
             payload = item.model_dump(mode="json", exclude=deferred)
             yield b"{"
-            # 保留正式模型字段顺序，避免接口字节形式因延后编码发生变化。
-            for index, name in enumerate(type(item).model_fields):
+            # 仅输出序列化器保留的键与延后字段，仍按正式模型的字段顺序编码。
+            fields = type(item).model_fields
+            names = [name for name in fields if name in payload or name in deferred]
+            names.extend(name for name in payload if name not in fields)
+            for index, name in enumerate(names):
                 if index:
                     yield b","
                 yield compact(name) + b":"

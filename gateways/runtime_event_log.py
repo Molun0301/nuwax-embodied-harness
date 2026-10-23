@@ -97,9 +97,8 @@ class RuntimeEventLog:
         headers["message"] = _project(event.message, byte_limit=4096, nodes=8, depth=1, chars=1800)
         headers["payload"] = _project(event.payload, byte_limit=8192)
         headers["metadata"] = _project(event.metadata, byte_limit=4096, nodes=96)
-        feedback_copy = None if feedback is None else _project(
-            feedback, byte_limit=8192, nodes=256, depth=6, chars=1800)
-        return json.dumps({"event": headers, "feedback": feedback_copy, "context": context},
+        # 反馈已在共同出口完成脱敏和容量投影；编码冻结原值，不再次改写正文或投影标记。
+        return json.dumps({"event": headers, "feedback": feedback, "context": context},
                           ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
 
     def submit(self, event, feedback=None) -> bool:

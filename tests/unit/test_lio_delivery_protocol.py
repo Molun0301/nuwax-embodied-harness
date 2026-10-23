@@ -1,13 +1,16 @@
-"""The delivery recorder must ship the transform protocol it imports."""
+"""交付记录器使用随代码提供的坐标变换协议。"""
 
 from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.mark.native_integration
 def test_lio_delivery_help_imports_shipped_protocols():
     result = subprocess.run(
         [sys.executable, str(ROOT / "scripts/diagnostics/capture_lio_delivery.py"), "--help"],

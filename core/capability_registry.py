@@ -36,6 +36,7 @@ PLATFORM_GEOMETRY_CAPABILITIES = frozenset(
         "delete_map",
         "get_active_map",
         "finalize_active_map",
+        "preview_map_cleanup", "get_map_cleanup", "cancel_map_cleanup", "apply_map_cleanup",
         "navigate_to_pose",
         "navigate_to_place",
         "list_forbidden_zones",

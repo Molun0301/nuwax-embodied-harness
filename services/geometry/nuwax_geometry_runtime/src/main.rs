@@ -55,6 +55,8 @@ mod persistent_occupancy;
 mod pgo_map;
 mod pointcloud;
 mod dynamic_scene;
+mod dynamic_tracks;
+mod completed_cleanup;
 mod dense_cloud;
 mod rpc_runtime;
 mod runtime_diagnostics;
@@ -1230,6 +1232,8 @@ fn print_requested_release_artifacts() -> Option<ExitCode> {
 }
 
 fn main() -> ExitCode {
+    if let Some(result)=completed_cleanup::run_requested(){return match result{Ok(())=>ExitCode::SUCCESS,Err(e)=>{eprintln!("{e}");ExitCode::FAILURE}};}
+
     nuwax_core::logging::init_component_logging(
         "nuwax-geometry-runtime",
         "nuwax_geometry_runtime=info,nuwax_core=info,nuwax_protocol=warn,nuwax_transport=warn,nuwax_codec=warn,nuwax_tf=warn",
@@ -4107,3 +4111,7 @@ root.chmod(0o755)
         assert!(!LauncherGuard::process_is_alive(runtime_identity));
     }
 }
+
+use nuwax_cloud_cleanup::human_point_labels;
+
+use nuwax_cloud_cleanup::offline_residual_cleanup;

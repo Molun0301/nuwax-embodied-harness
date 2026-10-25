@@ -1,23 +1,17 @@
-//! 多分辨率动态点证据：在粗网格累计保守自由空间，在原分辨率删除历史点。
-//!
-//! 参考 FreeDOM（https://arxiv.org/abs/2504.11073）与 Dynablox 的自由空间判据。
-//! 只使用真实回波，不推测无回波方向；没有运动证据时不按人体外形删除结构。
-
+//! Pointwise dynamic evidence from real measured rays. No shape-only deletion.
+use crate::human_point_labels::{FrameLabels, PointLabel, StaticReferences};
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use nalgebra::Point3;
-
+use std::collections::VecDeque;
 pub(crate) type Cell = (i32, i32, i32);
-pub(crate) const CELL_SIZE: f64 = 0.2;
-const RANGE: f64 = 30.0;
-const SURFACE_MARGIN: f64 = 0.3;
-const FREE_OBSERVATIONS: u8 = 3;
+pub(crate) const CELL_SIZE: f64 = 0.1;
+const RANGE: f64 = 30.;
+const SURFACE_MARGIN: f64 = 0.2;
+const FREE_OBSERVATIONS: u8 = 2;
 const EVIDENCE_GAP_NS: u64 = 2_000_000_000;
-const RETENTION_NS: u64 = 60_000_000_000;
 const RECOVERY_NS: u64 = 2_000_000_000;
 const RECOVERY_OBSERVATIONS: u16 = 20;
 const MAX_CELLS: usize = 500_000;
-const MAX_ENDPOINTS: usize = 65_536;
-
 #[derive(Clone, Default)]
 struct Evidence {
     free_count: u8,
@@ -26,27 +20,129 @@ struct Evidence {
     occupied_since: u64,
     last_occupied: u64,
     known_free: bool,
+    first_hit: u64,
+    total_hits: u16,
+    first_clear: u64,
+    last_hit_frame: u64,
+    void_since: u64,
 }
-
 #[derive(Clone)]
 pub(crate) struct DynamicScene {
+    pub(crate) offline: bool,
     minimum_range_m: f64,
     evidence: HashMap<Cell, Evidence>,
     last_timestamp_ns: u64,
     clear_cells: HashSet<Cell>,
     dynamic_cells: HashSet<Cell>,
+    frame: u64,
+    window: VecDeque<(u64, HashSet<Cell>, HashSet<Cell>)>,
+    references: StaticReferences,
+    labels: FrameLabels,
+    point_labels: HashMap<[u64; 3], PointLabel>,
+    tracks: crate::dynamic_tracks::Tracks,
 }
-
+/// One immutable decision for one admitted scan, in frozen odometry coordinates.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FrameDecision {
+    pub labels: FrameLabels,
+    clear_cells: HashSet<Cell>,
+    references: StaticReferences,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MappedFrameDecision {
+    pub decision: std::sync::Arc<FrameDecision>,
+    odom_from_map: nalgebra::Isometry3<f64>,
+    point_labels: HashMap<[u64; 3], PointLabel>,
+}
+impl MappedFrameDecision {
+    pub(crate) fn new(
+        decision: std::sync::Arc<FrameDecision>,
+        map_from_odom: nalgebra::Isometry3<f64>,
+        points: &[Point3<f64>],
+        first: usize,
+    ) -> Result<Self, String> {
+        let labels = decision
+            .labels
+            .labels
+            .get(first..first + points.len())
+            .ok_or("共享人体标签与原扫描点序不一致")?;
+        Ok(Self {
+            decision: decision.clone(),
+            odom_from_map: map_from_odom.inverse(),
+            point_labels: points
+                .iter()
+                .zip(labels)
+                .map(|(p, &l)| (bits([p.x, p.y, p.z]), l))
+                .collect(),
+        })
+    }
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, String> {
+        let pose: [f64; 16] = self
+            .odom_from_map
+            .to_homogeneous()
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let labels = self
+            .point_labels
+            .iter()
+            .map(|(&k, &v)| (k, v))
+            .collect::<Vec<_>>();
+        serde_json::to_vec(&(&*self.decision, pose, labels)).map_err(|e| e.to_string())
+    }
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, String> {
+        let (decision, m, labels): (FrameDecision, [f64; 16], Vec<([u64; 3], PointLabel)>) =
+            serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        let rotation = nalgebra::Matrix3::from_column_slice(&[
+            m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10],
+        ]);
+        Ok(Self {
+            decision: std::sync::Arc::new(decision),
+            odom_from_map: nalgebra::Isometry3::from_parts(
+                nalgebra::Translation3::new(m[12], m[13], m[14]),
+                nalgebra::UnitQuaternion::from_matrix(&rotation),
+            ),
+            point_labels: labels.into_iter().collect(),
+        })
+    }
+    pub(crate) fn map_from_odom(&self) -> nalgebra::Isometry3<f64> {
+        self.odom_from_map.inverse()
+    }
+    pub(crate) fn is_dynamic(&self, p: [f64; 3]) -> bool {
+        self.point_labels.get(&bits(p)).is_some_and(|l| l.dynamic())
+    }
+    pub(crate) fn label(&self, p: [f64; 3]) -> PointLabel {
+        self.point_labels
+            .get(&bits(p))
+            .copied()
+            .unwrap_or(PointLabel::PendingNew)
+    }
+    pub(crate) fn clears(&self, p: [f64; 3]) -> bool {
+        let p = self.odom_from_map * Point3::from(p);
+        let p = [p.x, p.y, p.z];
+        cell(p).is_some_and(|k| self.decision.clear_cells.contains(&k))
+            && self.decision.references.protect(p, None).is_none()
+    }
+}
 /// 与已选原生参数及已有观察标定取同一有效近距；设备未声明时保留原保守范围。
-fn observation_minimum_range(backend: &str, options: &str, observation_min: Option<f64>) -> Result<f64, String> {
-    use nuwax_lio_backends::{native::{NativeBackend, NativeLioConfig}, pointlio_options::PointLioOptions};
+fn observation_minimum_range(
+    backend: &str,
+    options: &str,
+    observation_min: Option<f64>,
+) -> Result<f64, String> {
+    use nuwax_lio_backends::{
+        native::{NativeBackend, NativeLioConfig},
+        pointlio_options::PointLioOptions,
+    };
     let native = match backend.trim() {
         "pointlio" => {
             let mut config = NativeLioConfig::for_backend(NativeBackend::PointLio);
             config.pointlio_options = PointLioOptions::from_json(options)?;
             Some(config.minimum_observation_range_m())
         }
-        "fastlio2" => Some(NativeLioConfig::for_backend(NativeBackend::FastLio2).minimum_observation_range_m()),
+        "fastlio2" => Some(
+            NativeLioConfig::for_backend(NativeBackend::FastLio2).minimum_observation_range_m(),
+        ),
         "" | "device" => None,
         _ => return Err("动态点云观察范围对应的LIO后端无效".into()),
     };
@@ -63,7 +159,8 @@ impl Default for DynamicScene {
             let capabilities = nuwax_nav_types_messages::NavigationCapabilities::from_env()?;
             observation_minimum_range(
                 &std::env::var("NUWAX_GEOMETRY_LIO_BACKEND").unwrap_or_default(),
-                &std::env::var(nuwax_lio_backends::pointlio_options::POINTLIO_OPTIONS_ENV).unwrap_or_default(),
+                &std::env::var(nuwax_lio_backends::pointlio_options::POINTLIO_OPTIONS_ENV)
+                    .unwrap_or_default(),
                 capabilities.and_then(|value| value.observation.map(|model| model.min_range_m)),
             )
         })();
@@ -73,183 +170,311 @@ impl Default for DynamicScene {
 }
 
 pub(crate) fn cell(point: [f64; 3]) -> Option<Cell> {
-    let values = point.map(|value| (value / CELL_SIZE).floor());
-    values
-        .iter()
-        .all(|v| v.is_finite() && *v > i32::MIN as f64 + 2.0 && *v < i32::MAX as f64 - 2.0)
-        .then(|| (values[0] as i32, values[1] as i32, values[2] as i32))
+    let v = point.map(|x| (x / CELL_SIZE).floor());
+    v.iter()
+        .all(|x| x.is_finite() && *x > i32::MIN as f64 + 2. && *x < i32::MAX as f64 - 2.)
+        .then(|| (v[0] as i32, v[1] as i32, v[2] as i32))
 }
-
-fn neighbors(key: Cell) -> impl Iterator<Item = Cell> {
+fn neighbors(k: Cell) -> impl Iterator<Item = Cell> {
     (-1..=1).flat_map(move |x| {
-        (-1..=1).flat_map(move |y| (-1..=1).map(move |z| (key.0 + x, key.1 + y, key.2 + z)))
+        (-1..=1).flat_map(move |y| (-1..=1).map(move |z| (k.0 + x, k.1 + y, k.2 + z)))
     })
 }
-
+fn bits(p: [f64; 3]) -> [u64; 3] {
+    p.map(f64::to_bits)
+}
 impl DynamicScene {
     pub(crate) fn with_minimum_range(minimum_range_m: f64) -> Self {
-        Self { minimum_range_m, evidence: HashMap::new(), last_timestamp_ns: 0,
-            clear_cells: HashSet::new(), dynamic_cells: HashSet::new() }
+        Self {
+            offline: false,
+            minimum_range_m,
+            evidence: HashMap::new(),
+            last_timestamp_ns: 0,
+            clear_cells: HashSet::new(),
+            dynamic_cells: HashSet::new(),
+            frame: 0,
+            window: VecDeque::new(),
+            references: StaticReferences::default(),
+            labels: FrameLabels {
+                source_timestamp_ns: 0,
+                labels: Vec::new(),
+            },
+            point_labels: HashMap::new(),
+            tracks: Default::default(),
+        }
     }
-
-    pub(crate) fn minimum_range_m(&self) -> f64 { self.minimum_range_m }
-
+    pub(crate) fn decision(&self) -> std::sync::Arc<FrameDecision> {
+        std::sync::Arc::new(FrameDecision {
+            labels: self.labels.clone(),
+            clear_cells: self.clear_cells.clone(),
+            references: self.references.near(self.clear_cells.iter().map(|k| {
+                [
+                    (k.0 as f64 + 0.5) * CELL_SIZE,
+                    (k.1 as f64 + 0.5) * CELL_SIZE,
+                    (k.2 as f64 + 0.5) * CELL_SIZE,
+                ]
+            })),
+        })
+    }
+    pub(crate) fn set_minimum_range_m(&mut self, value: f64) {
+        self.minimum_range_m = value;
+    }
+    pub(crate) fn minimum_range_m(&self) -> f64 {
+        self.minimum_range_m
+    }
     pub(crate) fn clear_frame(&mut self) {
         self.clear_cells.clear();
         self.dynamic_cells.clear();
+        self.labels.labels.clear();
+        self.point_labels.clear();
     }
-    /// 本帧只生成一次证据；缺原点、非法/倒序扫描不沿用上一帧删除结果。
-    pub(crate) fn observe(&mut self, points: &[Point3<f64>], origin: [f64; 3], timestamp_ns: u64) {
-        self.clear_cells.clear();
-        self.dynamic_cells.clear();
-        if timestamp_ns == 0
-            || timestamp_ns <= self.last_timestamp_ns
+    pub(crate) fn labels(&self) -> &FrameLabels {
+        &self.labels
+    }
+    pub(crate) fn known_void(&self, p: [f64; 3]) -> bool {
+        cell(p)
+            .and_then(|k| self.evidence.get(&k))
+            .is_some_and(|e| e.known_free)
+    }
+    pub(crate) fn observe(&mut self, points: &[Point3<f64>], origin: [f64; 3], stamp: u64) {
+        self.observe_with_ground(points, origin, stamp, &[]);
+    }
+    pub(crate) fn observe_with_ground(
+        &mut self,
+        points: &[Point3<f64>],
+        origin: [f64; 3],
+        stamp: u64,
+        ground: &[u32],
+    ) {
+        self.observe_with_known_ground(points, origin, stamp, ground, &[]);
+    }
+    pub(crate) fn observe_with_known_ground(
+        &mut self,
+        points: &[Point3<f64>],
+        origin: [f64; 3],
+        stamp: u64,
+        ground: &[u32],
+        known: &[u32],
+    ) {
+        self.clear_frame();
+        if stamp == 0
+            || stamp <= self.last_timestamp_ns
             || points.is_empty()
             || cell(origin).is_none()
+            || points.iter().any(|p| cell([p.x, p.y, p.z]).is_none())
         {
             return;
         }
-
-        let mut endpoints: HashMap<Cell, (Point3<f64>, f64)> = HashMap::new();
+        self.frame += 1;
         let mut hits = HashSet::new();
-        for point in points {
-            let Some(key) = cell([point.x, point.y, point.z]) else {
-                return;
-            };
-            hits.insert(key);
-            let range = (point.coords - nalgebra::Vector3::from(origin)).norm();
-            if range <= self.minimum_range_m + SURFACE_MARGIN {
-                continue;
+        let mut rays = Vec::new();
+        for p in points {
+            let xyz = [p.x, p.y, p.z];
+            hits.insert(cell(xyz).unwrap());
+            let range = (p.coords - nalgebra::Vector3::from(origin)).norm();
+            if range > self.minimum_range_m + SURFACE_MARGIN {
+                // Real hit extension towards the sensor, never isotropic dilation.
+                let direction = (p.coords - nalgebra::Vector3::from(origin)) / range;
+                for step in 0..=(SURFACE_MARGIN / CELL_SIZE * 2.).ceil() as usize {
+                    let d = SURFACE_MARGIN * step as f64 / (SURFACE_MARGIN / CELL_SIZE * 2.).ceil();
+                    let q = p.coords - direction * d;
+                    if let Some(k) = cell(q.into()) {
+                        hits.insert(k);
+                    }
+                }
+                rays.push((p, range));
             }
-            // 同一个回波格仅用最近的真实端点发射射线，全部命中格仍参与遮挡。
-            let endpoint = endpoints.entry(key).or_insert((*point, range));
-            if range < endpoint.1 {
-                *endpoint = (*point, range);
-            }
-        }
-        if endpoints.len() > MAX_ENDPOINTS {
-            return;
         }
         let mut free = HashSet::new();
-        for (point, range) in endpoints.values() {
-            trace(origin, point, *range, self.minimum_range_m, &hits, &mut free);
-            // 容量不足时整帧不提供新自由证据，不能让任意散列顺序决定删除区域。
-            if free.len() > MAX_CELLS {
-                return;
-            }
+        for (p, r) in rays {
+            trace(origin, p, r, self.minimum_range_m, &hits, &mut free);
         }
-        if free.len().saturating_add(hits.len()) > MAX_CELLS {
-            return;
-        }
-        self.last_timestamp_ns = timestamp_ns;
-        let origin_cell = cell(origin).unwrap();
-        let radius = (RANGE / CELL_SIZE) as i64 + 2;
-        self.evidence.retain(|key, evidence| {
-            timestamp_ns.saturating_sub(evidence.last_free.max(evidence.last_occupied))
-                <= RETENTION_NS
-                && (i64::from(key.0) - i64::from(origin_cell.0)).abs() <= radius
-                && (i64::from(key.1) - i64::from(origin_cell.1)).abs() <= radius
-                && (i64::from(key.2) - i64::from(origin_cell.2)).abs() <= radius
-        });
-        // 未知自由证据宁可重新积累，也不能无限增长或把淘汰误认为地图删除。
-        if self
-            .evidence
-            .len()
-            .saturating_add(free.len())
-            .saturating_add(hits.len())
-            > MAX_CELLS
+        self.last_timestamp_ns = stamp;
+        let observed: HashSet<_> = hits.iter().chain(free.iter()).copied().collect();
+        self.window.push_back((stamp, observed, hits.clone()));
+        while self.window.len() > 5
+            || self
+                .window
+                .front()
+                .is_some_and(|f| stamp.saturating_sub(f.0) > 500_000_000)
         {
-            let additions = free
-                .iter()
-                .chain(hits.iter())
-                .filter(|key| !self.evidence.contains_key(key))
-                .count();
-            if self.evidence.len().saturating_add(additions) > MAX_CELLS {
-                self.evidence.clear();
-            }
+            self.window.pop_front();
         }
+        let observed: HashSet<_> = self
+            .window
+            .iter()
+            .flat_map(|f| f.1.iter().copied())
+            .collect();
+        let occupied: HashSet<_> = self
+            .window
+            .iter()
+            .flat_map(|f| f.2.iter().copied())
+            .collect();
+        let raw: Vec<_> = points.iter().map(|p| [p.x, p.y, p.z]).collect();
+        let mut ground_set: HashSet<usize> = ground
+            .iter()
+            .map(|&i| i as usize)
+            .filter(|&i| i < points.len())
+            .collect();
+        // Reuse supplied ground; fallback only fills XYs without real ground.
+        let ground_xy: HashSet<_> = ground_set
+            .iter()
+            .map(|&i| {
+                let k = cell(raw[i]).unwrap();
+                (k.0, k.1)
+            })
+            .collect();
+        let known: HashSet<_> = known.iter().map(|&i| i as usize).collect();
+        ground_set.extend(
+            crate::offline_residual_cleanup::local_ground_indices(&raw)
+                .into_iter()
+                .filter(|&i| {
+                    let k = cell(raw[i]).unwrap();
+                    !known.contains(&i) && !ground_xy.contains(&(k.0, k.1))
+                }),
+        );
+        let eligible: HashSet<_> = raw
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &p)| (!ground_set.contains(&i)).then_some(i))
+            .collect();
+        let before = self.tracks.prepare(&raw, &eligible, origin, stamp);
+        let held: HashSet<_> = before.keys().filter_map(|&i| cell(raw[i])).collect();
         let mut recovered = Vec::new();
-        for key in &hits {
-            let e = self.evidence.entry(*key).or_default();
-            if e.occupied_count == 0
-                || timestamp_ns.saturating_sub(e.last_occupied) > EVIDENCE_GAP_NS
-            {
-                e.occupied_since = timestamp_ns;
+        for k in &hits {
+            let e = self.evidence.entry(*k).or_default();
+            if e.occupied_count == 0 || stamp.saturating_sub(e.last_occupied) > EVIDENCE_GAP_NS {
+                e.occupied_since = stamp;
                 e.occupied_count = 0;
             }
             e.occupied_count = e.occupied_count.saturating_add(1);
-            e.last_occupied = timestamp_ns;
+            e.last_occupied = stamp;
+            e.last_hit_frame = self.frame;
+            if e.total_hits == 0 {
+                e.first_hit = stamp;
+            }
+            e.total_hits = e.total_hits.saturating_add(1);
             e.free_count = 0;
+            e.first_clear = 0;
             if e.occupied_count >= RECOVERY_OBSERVATIONS
-                && timestamp_ns.saturating_sub(e.occupied_since) >= RECOVERY_NS
+                && stamp.saturating_sub(e.occupied_since) >= RECOVERY_NS
+                && !held.contains(k)
             {
-                recovered.push(*key);
+                recovered.push(*k);
             }
         }
-        // 持续静态命中能恢复自由判定，避免轻微位姿漂移永久挖空墙面。
-        for key in recovered {
-            for neighbor in neighbors(key) {
-                if let Some(e) = self.evidence.get_mut(&neighbor) {
+        for k in recovered {
+            for n in neighbors(k) {
+                if let Some(e) = self.evidence.get_mut(&n) {
                     e.known_free = false;
                 }
             }
         }
-        for key in &hits {
-            if self.evidence.get(key).is_some_and(|e| e.known_free) {
-                self.dynamic_cells.insert(*key);
-            }
-        }
-        for key in &free {
-            let e = self.evidence.entry(*key).or_default();
-            if timestamp_ns.saturating_sub(e.last_free) > EVIDENCE_GAP_NS {
+        for k in &free {
+            let e = self.evidence.entry(*k).or_default();
+            if e.free_count == 0 || stamp.saturating_sub(e.last_free) > EVIDENCE_GAP_NS {
                 e.free_count = 0;
+                e.first_clear = stamp;
             }
             e.free_count = e.free_count.saturating_add(1);
-            e.last_free = timestamp_ns;
+            e.last_free = stamp;
             e.occupied_count = 0;
             e.occupied_since = 0;
-        }
-        // 首次认定仍要求27邻格的三帧自由证据。已经明确为空闲的格，
-        // 动态物体离开后只需重新取得本格三帧穿越，不被旁边的墙面永久卡住。
-        // 当前回波格从来不在free中；持续静态占据仍按上方规则撤销known_free。
-        for key in &free {
-            let reconfirmed = self.evidence.get(key).is_some_and(|e|
-                e.known_free && e.free_count >= FREE_OBSERVATIONS);
-            if reconfirmed || neighbors(*key).all(|neighbor| {
-                free.contains(&neighbor)
-                    && self
-                        .evidence
-                        .get(&neighbor)
-                        .is_some_and(|e| e.free_count >= FREE_OBSERVATIONS)
-            }) {
-                self.clear_cells.insert(*key);
+            let static_confirmed =
+                e.total_hits >= 5 && e.last_occupied.saturating_sub(e.first_hit) >= 2_000_000_000;
+            let enough = if static_confirmed {
+                e.free_count >= 10 && stamp.saturating_sub(e.first_clear) >= 1_000_000_000
+            } else {
+                e.free_count >= FREE_OBSERVATIONS
+            };
+            if enough
+                && self.frame.saturating_sub(e.last_hit_frame) > 2
+                && (e.known_free
+                    || (!occupied.contains(k) && neighbors(*k).all(|n| observed.contains(&n))))
+            {
+                if !e.known_free {
+                    e.void_since = stamp;
+                }
+                e.known_free = true;
+                self.clear_cells.insert(*k);
             }
         }
-        for key in &self.clear_cells {
-            self.evidence.get_mut(key).unwrap().known_free = true;
+        let clears = &self.clear_cells;
+        self.references
+            .remove_where(|p| cell(p).is_some_and(|k| clears.contains(&k)));
+        let mut labels: Vec<_> = raw
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| {
+                if ground_set.contains(&i) {
+                    PointLabel::Ground
+                } else if let Some(label) = self.references.protect(p, before.get(&i).copied()) {
+                    label
+                } else if self.known_void(p) {
+                    PointLabel::Seed
+                } else {
+                    PointLabel::PendingNew
+                }
+            })
+            .collect();
+        crate::human_point_labels::grow(points, &mut labels);
+        let evidence = &self.evidence;
+        self.tracks.update(&raw, &mut labels, stamp, &|k| {
+            evidence
+                .get(&k)
+                .filter(|e| e.known_free)
+                .map(|e| e.void_since)
+        });
+        for (&p, &label) in raw.iter().zip(&labels) {
+            self.point_labels.insert(bits(p), label);
+            if label.dynamic() {
+                self.dynamic_cells.insert(cell(p).unwrap());
+            }
         }
-        // 动态区历史先撤销，调用者随后重新加入本帧真实障碍供导航使用。
-        self.clear_cells.extend(self.dynamic_cells.iter().copied());
+        self.references.observe(points, &labels, stamp);
+        self.labels = FrameLabels {
+            source_timestamp_ns: stamp,
+            labels,
+        };
+        // Capacity eviction forgets only evidence, never geometry. Retain near
+        // cells first rather than resetting the whole map when one frame is big.
+        if !self.offline && self.evidence.len() > MAX_CELLS {
+            let o = cell(origin).unwrap();
+            let mut keys: Vec<_> = self.evidence.keys().copied().collect();
+            keys.sort_unstable_by_key(|k| {
+                std::cmp::Reverse(
+                    (i64::from(k.0) - i64::from(o.0))
+                        .abs()
+                        .max((i64::from(k.1) - i64::from(o.1)).abs())
+                        .max((i64::from(k.2) - i64::from(o.2)).abs()),
+                )
+            });
+            for k in keys.into_iter().take(self.evidence.len() - MAX_CELLS) {
+                self.evidence.remove(&k);
+            }
+        }
     }
-
+    pub(crate) fn new_void_cells(&self) -> impl Iterator<Item = Cell> + '_ {
+        self.clear_cells.iter().copied()
+    }
     pub(crate) fn has_clears(&self) -> bool {
         !self.clear_cells.is_empty()
     }
 
-    /// 本帧被证实为空的格。
+    /// 本帧被证实为空的格。`clears` 只对落在这些格内的点返回真，内核据此在窗口内
+    /// 没有任何点落入这些格时跳过逐点筛除。
     pub(crate) fn clear_cells(&self) -> impl Iterator<Item = &Cell> {
         self.clear_cells.iter()
     }
 
-    pub(crate) fn clears(&self, point: [f64; 3]) -> bool {
-        cell(point).is_some_and(|key| self.clear_cells.contains(&key))
+    pub(crate) fn clears(&self, p: [f64; 3]) -> bool {
+        cell(p).is_some_and(|k| self.clear_cells.contains(&k))
+            && self.references.protect(p, None).is_none()
     }
-
-    pub(crate) fn is_dynamic(&self, point: [f64; 3]) -> bool {
-        cell(point).is_some_and(|key| self.dynamic_cells.contains(&key))
+    pub(crate) fn is_dynamic(&self, p: [f64; 3]) -> bool {
+        self.point_labels.get(&bits(p)).is_some_and(|l| l.dynamic())
     }
 }
-
 fn trace(
     origin: [f64; 3],
     point: &Point3<f64>,
@@ -262,49 +487,49 @@ fn trace(
     if end <= minimum_range_m {
         return;
     }
-    let direction = [
+    let d = [
         point.x - origin[0],
         point.y - origin[1],
         point.z - origin[2],
     ]
     .map(|v| v / range);
-    let start = cell(origin).unwrap();
-    let mut key = [start.0, start.1, start.2];
+    let s = cell(origin).unwrap();
+    let mut k = [s.0, s.1, s.2];
     let mut step = [0; 3];
     let mut next = [f64::INFINITY; 3];
     let mut interval = [f64::INFINITY; 3];
-    for axis in 0..3 {
-        if direction[axis] != 0.0 {
-            step[axis] = if direction[axis] > 0.0 { 1 } else { -1 };
-            let boundary = (key[axis] as f64 + if step[axis] > 0 { 1.0 } else { 0.0 }) * CELL_SIZE;
-            next[axis] = ((boundary - origin[axis]) / direction[axis]).max(0.0);
-            interval[axis] = CELL_SIZE / direction[axis].abs();
+    for a in 0..3 {
+        if d[a] != 0. {
+            step[a] = if d[a] > 0. { 1 } else { -1 };
+            let b = (k[a] as f64 + if step[a] > 0 { 1. } else { 0. }) * CELL_SIZE;
+            next[a] = ((b - origin[a]) / d[a]).max(0.);
+            interval[a] = CELL_SIZE / d[a].abs();
         }
     }
-    let mut distance = 0.0;
-    for _ in 0..800 {
-        let current = (key[0], key[1], key[2]);
-        if hits.contains(&current) {
+    let mut distance = 0.;
+    // DDA's finite range is the termination bound, not an arbitrary ray quota.
+    while distance < end {
+        let c = (k[0], k[1], k[2]);
+        if hits.contains(&c) {
             break;
         }
-        let axis = if next[0] <= next[1] && next[0] <= next[2] {
+        let a = if next[0] <= next[1] && next[0] <= next[2] {
             0
         } else if next[1] <= next[2] {
             1
         } else {
             2
         };
-        let exit = next[axis].min(end);
-        // 不记录只擦过角点的零长度格；近场与回波端点留保护带。
+        let exit = next[a].min(end);
         if distance >= minimum_range_m && exit - distance > CELL_SIZE * 0.05 {
-            free.insert(current);
+            free.insert(c);
         }
-        if next[axis] >= end {
+        if next[a] >= end {
             break;
         }
-        distance = next[axis];
-        key[axis] += step[axis];
-        next[axis] += interval[axis];
+        distance = next[a];
+        k[a] += step[a];
+        next[a] += interval[a];
     }
 }
 
@@ -316,25 +541,42 @@ pub(crate) mod tests {
 
     #[test]
     fn known_free_person_trail_retires_after_local_visibility_returns() {
-        let mut scene=DynamicScene::with_minimum_range(0.05);
-        let target=[2.7,0.03,0.65];
+        let mut scene = DynamicScene::with_minimum_range(0.05);
+        let target = [2.7, 0.03, 0.65];
         for frame in 1..=4 {
-            let (points,_)=corridor(None,(frame%3) as f64);
-            scene.observe(&points,ORIGIN,frame*100_000_000);
+            let (points, _) = corridor(None, (frame % 3) as f64);
+            scene.observe(&points, ORIGIN, frame * 100_000_000);
         }
-        assert!(scene.evidence.get(&cell(target).unwrap()).is_some_and(|e|e.known_free),
-            "空走廊完整观察必须先证明这个区域可用");
-        let (person,_)=corridor(Some(0.0),0.0);
-        scene.observe(&person,ORIGIN,500_000_000);
-        assert!(scene.is_dynamic(target), "人体进入原空闲区域仍作为当前动态障碍");
-        let visible=vec![Point3::new(8.0,0.03,0.65)];
-        for stamp in [600_000_000,600_000_000,700_000_000] {
-            scene.observe(&visible,ORIGIN,stamp);
+        assert!(
+            scene
+                .evidence
+                .get(&cell(target).unwrap())
+                .is_some_and(|e| e.known_free),
+            "空走廊完整观察必须先证明这个区域可用"
+        );
+        let (person, truth) = corridor(Some(0.0), 0.0);
+        let actual = person
+            .iter()
+            .zip(&truth)
+            .find(|(p, h)| **h && cell([p.x, p.y, p.z]) == cell(target))
+            .unwrap()
+            .0;
+        scene.observe(&person, ORIGIN, 500_000_000);
+        assert!(
+            scene.is_dynamic([actual.x, actual.y, actual.z]),
+            "人体进入原空闲区域仍作为当前动态障碍"
+        );
+        let visible = vec![Point3::new(8.0, 0.03, 0.65)];
+        for stamp in [600_000_000, 600_000_000, 700_000_000] {
+            scene.observe(&visible, ORIGIN, stamp);
             assert!(!scene.clears(target), "重复帧或不足三帧不能确认人体离开");
         }
-        scene.observe(&visible,ORIGIN,800_000_000);
-        assert!(scene.clears(target), "局部真实穿越恢复后不再要求整个27格同时可见");
-        let unseen=[2.7,0.63,0.65];
+        scene.observe(&visible, ORIGIN, 800_000_000);
+        assert!(
+            scene.clears(target),
+            "局部真实穿越恢复后不再要求整个27格同时可见"
+        );
+        let unseen = [2.7, 0.63, 0.65];
         assert!(!scene.clears(unseen), "未重新观察的旁格不能跟随清除");
     }
 
@@ -390,12 +632,30 @@ pub(crate) mod tests {
 
     #[test]
     fn calibrated_range_follows_selected_native_blind_and_observation_model() {
-        assert_eq!(observation_minimum_range("pointlio", r#"{"blind":0.05}"#, None).unwrap(),f64::from(0.05_f32));
-        assert_eq!(observation_minimum_range("pointlio", "{}", None).unwrap(),0.5);
-        assert_eq!(observation_minimum_range("fastlio2", "ignored", None).unwrap(),0.5);
-        assert_eq!(observation_minimum_range("pointlio", r#"{"blind":0.05}"#, Some(0.12)).unwrap(),0.12);
-        assert_eq!(observation_minimum_range("device", "ignored", Some(0.1)).unwrap(),0.1);
-        assert_eq!(observation_minimum_range("device", "ignored", None).unwrap(),0.5);
+        assert_eq!(
+            observation_minimum_range("pointlio", r#"{"blind":0.05}"#, None).unwrap(),
+            f64::from(0.05_f32)
+        );
+        assert_eq!(
+            observation_minimum_range("pointlio", "{}", None).unwrap(),
+            0.5
+        );
+        assert_eq!(
+            observation_minimum_range("fastlio2", "ignored", None).unwrap(),
+            0.5
+        );
+        assert_eq!(
+            observation_minimum_range("pointlio", r#"{"blind":0.05}"#, Some(0.12)).unwrap(),
+            0.12
+        );
+        assert_eq!(
+            observation_minimum_range("device", "ignored", Some(0.1)).unwrap(),
+            0.1
+        );
+        assert_eq!(
+            observation_minimum_range("device", "ignored", None).unwrap(),
+            0.5
+        );
         assert!(observation_minimum_range("pointlio", r#"{"blind":-1}"#, None).is_err());
     }
 

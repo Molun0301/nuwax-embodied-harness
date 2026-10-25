@@ -296,6 +296,7 @@ pub(crate) struct MappingBackendInput {
     pub(crate) received_at_ns: u64,
     pub(crate) registered_frame_id: String,
     pub(crate) sensor_origin_map: [f64; 3],
+    pub(crate) dynamic_frame: Option<crate::dynamic_scene::MappedFrameDecision>,
     pub(crate) registered_points_map: Vec<Point3<f64>>,
 }
 
@@ -1358,17 +1359,21 @@ impl VoxelKernel {
         self.current_window
             .extend(points[retained_start..].iter().copied());
     }
-    /// 逐点撤销落在本帧清除格内的历史点。清除格里没有窗口点时不会删除任何点，
-    /// 结果与逐点筛除相同，直接跳过遍历。
-    fn retain_uncleared(&mut self) {
-        if !self.dynamic_scene.has_clears()
-            || !self.dynamic_scene.clear_cells().any(|cell| self.window_cells.contains_key(cell))
+    /// 逐点撤销本帧判定为空的历史点。使用本进程动态场景时，`clears` 只对落在清除格内的点
+    /// 返回真，清除格里没有窗口点就不会删除任何点，直接跳过遍历，结果与逐点筛除相同。
+    /// 预计算帧决策先把点变换到里程计坐标系再查清除格，按地图坐标维护的窗口格计数
+    /// 不能用来预判，照原样逐点筛除。
+    fn retain_uncleared(&mut self, frame: Option<&crate::dynamic_scene::MappedFrameDecision>) {
+        if frame.is_none()
+            && (!self.dynamic_scene.has_clears()
+                || !self.dynamic_scene.clear_cells().any(|cell| self.window_cells.contains_key(cell)))
         {
             return;
         }
         let (scene, cells) = (&self.dynamic_scene, &mut self.window_cells);
         self.current_window.retain(|point| {
-            let cleared = scene.clears([point.x, point.y, point.z]);
+            let p = [point.x, point.y, point.z];
+            let cleared = frame.map_or_else(|| scene.clears(p), |frame| frame.clears(p));
             if cleared {
                 uncount_window_cell(cells, point);
             }
@@ -2086,10 +2091,13 @@ impl PointCloud2Like for BorrowedBackendCloud<'_> {
 fn build_occupancy(
     input: &MappingBackendInput,
     config: MappingBackendComputeConfig,
+    fallback: &crate::dynamic_scene::DynamicScene,
 ) -> Result<OccupancyGrid, String> {
     // 水平扫描必须与本帧雷达原点配对，不能从当前原点向历史点云发射射线。
+    let retained:Vec<_>=input.registered_points_map.iter().filter(|p|
+        !input.dynamic_frame.as_ref().map_or_else(||fallback.is_dynamic([p.x,p.y,p.z]),|f|f.is_dynamic([p.x,p.y,p.z]))).copied().collect();
     let cloud = BorrowedBackendCloud {
-        points: &input.registered_points_map,
+        points: &retained,
         sensor_origin: nalgebra::point![
             input.sensor_origin_map[0],
             input.sensor_origin_map[1],
@@ -2130,7 +2138,7 @@ pub(crate) fn flush_candidate(
                 voxel.dirty_since_candidate = false;
                 return Ok(None);
             }
-            let latest = build_occupancy(input, config)?;
+            let latest = build_occupancy(input, config, &voxel.dynamic_scene)?;
             voxel.last_candidate_received_at_ns = input.received_at_ns;
             voxel.last_candidate_point_count = voxel.current_window.len();
             voxel.dirty_since_candidate = false;
@@ -2140,7 +2148,7 @@ pub(crate) fn flush_candidate(
             if !ray.dirty_since_candidate {
                 return Ok(None);
             }
-            let live = build_occupancy(input, config)?;
+            let live = build_occupancy(input, config, &ray.dynamic_scene)?;
             ray.last_occupancy = Some(live.clone());
             ray.last_candidate_received_at_ns = input.received_at_ns;
             ray.last_candidate_point_count = ray.map.healthy_count();
@@ -2228,20 +2236,20 @@ fn compute_candidate_with_parallelism(
     let diagnostic = std::env::var_os("NEH_PGO_PHASE_DIAGNOSTIC").is_some();
     let backend_kind = match kernel {
         MappingKernel::Voxel(voxel) => {
-            voxel.dynamic_scene.observe(
-                &input.registered_points_map,
-                input.sensor_origin_map,
-                input.source_timestamp_ns,
-            );
-            voxel.retain_uncleared();
-            voxel.append_frame(&input.registered_points_map);
+            if input.dynamic_frame.is_none(){voxel.dynamic_scene.observe(&input.registered_points_map,input.sensor_origin_map,input.source_timestamp_ns);}
+            voxel.retain_uncleared(input.dynamic_frame.as_ref());
+            let retained=input.registered_points_map.iter().filter(|p|!input.dynamic_frame.as_ref().map_or_else(||voxel.dynamic_scene.is_dynamic([p.x,p.y,p.z]),|f|f.is_dynamic([p.x,p.y,p.z]))).copied().collect::<Vec<_>>();
+            voxel.append_frame(&retained);
             voxel.dirty_since_candidate = true;
             MappingBackendKind::Voxel
         }
         MappingKernel::Raytracing(ray) => {
             #[cfg(test)]
             let phase = Instant::now();
-            ray.prepare_map_frame(input.sensor_origin_map, &input.registered_points_map)?;
+            if input.dynamic_frame.is_none(){ray.dynamic_scene.observe(&input.registered_points_map,input.sensor_origin_map,input.source_timestamp_ns);}
+            let retained=input.registered_points_map.iter().filter(|p|!input.dynamic_frame.as_ref().map_or_else(||ray.dynamic_scene.is_dynamic([p.x,p.y,p.z]),|f|f.is_dynamic([p.x,p.y,p.z]))).copied().collect::<Vec<_>>();
+            // 本地 9e719718 已删除 validate_retained_state_bound（重复的保留体素上限校验），这里不再调用。
+            ray.prepare_map_frame(input.sensor_origin_map, &retained)?;
             #[cfg(test)]
             let prepare_us = phase.elapsed().as_micros();
             #[cfg(test)]
@@ -2251,12 +2259,7 @@ fn compute_candidate_with_parallelism(
             let update_us = phase.elapsed().as_micros();
             #[cfg(test)]
             let phase = Instant::now();
-            ray.dynamic_scene.observe(
-                &input.registered_points_map,
-                input.sensor_origin_map,
-                input.source_timestamp_ns,
-            );
-            if ray.dynamic_scene.has_clears() {
+            if input.dynamic_frame.is_some()||ray.dynamic_scene.has_clears() {
                 // 当前回波仍作为导航障碍，清理只撤销本帧未占据的历史体素。
                 let size = f64::from(ray.config.voxel_size);
                 // 命中键必须与射线库的单精度乘逆量化完全相同，边界点不可漏保护。
@@ -2274,11 +2277,8 @@ fn compute_candidate_with_parallelism(
                     .collect();
                 ray.map.voxels.retain(|key, _| {
                     hits.contains(key)
-                        || !ray.dynamic_scene.clears([
-                            (key.0 as f64 + 0.5) * size,
-                            (key.1 as f64 + 0.5) * size,
-                            (key.2 as f64 + 0.5) * size,
-                        ])
+                        || !{let p=[(key.0 as f64+0.5)*size,(key.1 as f64+0.5)*size,(key.2 as f64+0.5)*size];
+                            input.dynamic_frame.as_ref().map_or_else(||ray.dynamic_scene.clears(p),|f|f.clears(p))}
                 });
             }
             #[cfg(test)]
@@ -2308,7 +2308,7 @@ fn compute_candidate_with_parallelism(
             ) {
                 return Ok(None);
             }
-            let latest = build_occupancy(input, config)?;
+            let latest = build_occupancy(input, config, &voxel.dynamic_scene)?;
             let result = (latest.clone(), latest);
             voxel.last_candidate_received_at_ns = input.received_at_ns;
             voxel.last_candidate_point_count = point_count;
@@ -2324,7 +2324,7 @@ fn compute_candidate_with_parallelism(
             ) {
                 return Ok(None);
             }
-            let live = build_occupancy(input, config)?;
+            let live = build_occupancy(input, config, &ray.dynamic_scene)?;
             ray.last_occupancy = Some(live.clone());
             ray.last_candidate_received_at_ns = input.received_at_ns;
             ray.last_candidate_point_count = point_count;
@@ -2383,11 +2383,13 @@ mod tests {
                     received_at_ns: frame * 100_000_000,
                     registered_frame_id: "map".into(),
                     sensor_origin_map: ORIGIN,
+                    dynamic_frame: None,
                     registered_points_map: points,
                 };
                 if let Some(candidate) =
                     compute_candidate_in_place(&mut kernel, &input, config).unwrap()
                 {
+                    assert_eq!(candidate.accepted_points_map,input.registered_points_map,"realtime retains every raw return, including the person");
                     persistent = Some(
                         crate::persistent_occupancy::PersistentOccupancyGrid::stage_observation(
                             persistent.as_ref(),
@@ -2395,19 +2397,6 @@ mod tests {
                         )
                         .unwrap(),
                     );
-                }
-                if person.is_some() {
-                    match &kernel {
-                        MappingKernel::Voxel(voxel) => assert!(voxel
-                            .current_window
-                            .iter()
-                            .any(|p| p.x > 2.7 && p.x < 3.3 && p.z > 0.3)),
-                        // 射线后端本来就有多次命中健康门槛；本项核对当前回波没有被动态过滤吞掉。
-                        MappingKernel::Raytracing(ray) => assert!(ray
-                            .input
-                            .iter()
-                            .any(|p| p.0 > 2.7 && p.0 < 3.3 && p.2 > 0.3)),
-                    }
                 }
                 if let Some(persistent) = &persistent {
                     let grid = &persistent.grid;
@@ -2437,8 +2426,8 @@ mod tests {
             eprintln!("二维后端={} 人体输入={people_count} 剩余点={ghosts} 占据峰值={peak_obstacles} 末态占据={final_obstacles}", spec.kind().stable_name());
             assert!(ghosts * 5 < people_count);
             assert!(
-                peak_obstacles > 0 && final_obstacles * 2 < peak_obstacles,
-                "人员离开后正式二维占据图也应清理"
+                final_obstacles == 0,
+                "动态人体不再写入持久二维图；实时原始回波另行保留"
             );
             let checkpoint = export_mapping_kernel_checkpoint(&kernel).unwrap();
             let restored = restore_mapping_kernel_checkpoint(spec, config, &checkpoint).unwrap();
@@ -2547,6 +2536,7 @@ mod tests {
             received_at_ns: timestamp_ns,
             registered_frame_id: "map".to_owned(),
             sensor_origin_map: [0.0; 3],
+            dynamic_frame: None,
             registered_points_map: vec![Point3::new(1.0, 0.0, 1.0)],
         }
     }
@@ -3255,3 +3245,44 @@ mod tests {
 #[cfg(test)]
 #[path = "mapping_backend_ray_count_equivalence_tests.rs"]
 pub(crate) mod ray_count_equivalence_tests;
+
+/// Offline copy only: retain the original backend configuration and update its
+/// persisted members from the same exact fine-voxel removal set as the preview.
+pub(crate) fn cleanup_completed_checkpoint(payload:&[u8], q:f32,
+    removed:&ahash::AHashSet<[i32;3]>, retained:&[[i32;3]], occupancy:OccupancyGrid)->Result<Vec<u8>,String>{
+    use nuwax_cloud_cleanup::offline_residual_cleanup::asset_key;
+    if payload.len()<MAPPING_BACKEND_CHECKPOINT_HEADER_BYTES{return Err("建图后端存档不完整".into());}
+    let mut reader=MappingCheckpointReader::new(payload);
+    let spec=match payload[12]{0=>MappingBackendSpec::Voxel,1=>MappingBackendSpec::Raytracing(Default::default()),_=>return Err("该地图没有点云建图后端".into())};
+    decode_mapping_checkpoint_header(&mut reader,spec)?;
+    let kernel=match spec {
+        MappingBackendSpec::Voxel=>{
+            let capacity=reader.read_u64()? as usize;let count=reader.read_u64()? as usize;
+            let _old_count=reader.read_u64()?;let stamp=reader.read_u64()?;
+            let mut points=VecDeque::new();for _ in 0..count{
+                let p=Point3::new(reader.read_f64()?,reader.read_f64()?,reader.read_f64()?);
+                if !removed.contains(&asset_key([p.x,p.y,p.z],q)){points.push_back(p);}
+            }reader.finish()?;
+            // 窗口格计数与恢复检查点时相同，按清理后保留的窗口点重建。
+            let window_cells=window_cells(&points);
+            MappingKernel::Voxel(VoxelKernel{last_candidate_point_count:points.len(),window_cells,current_window:points,capacity,last_candidate_received_at_ns:stamp,dirty_since_candidate:false,dynamic_scene:Default::default()})
+        },
+        MappingBackendSpec::Raytracing(_)=>{
+            let c=decode_ray_config(&mut reader)?;
+            let config=Config{voxel_size:c.voxel_size,max_range:c.max_range,ray_subsample:c.ray_subsample,
+                shadow_depth:c.shadow_depth,grace_depth:c.grace_depth,min_health:c.min_health,max_health:c.max_health,
+                graze_cos:c.graze_cos,recency_window:c.recency_window,emit_every:c.emit_every,global_emit_every:c.global_emit_every,region_percentile:c.region_percentile};
+            let _old_count=reader.read_u64()?;let stamp=reader.read_u64()?;
+            let map_len=reader.read_u64()? as usize;let occ_len=reader.read_u64()? as usize;
+            let mut map=decode_voxel_map_checkpoint_for_config(reader.read_bytes(map_len)?,MAX_MAPPING_BACKEND_CHECKPOINT_BYTES/VOXEL_MAP_CHECKPOINT_ENTRY_BYTES,&config)?;
+            reader.read_bytes(occ_len)?;reader.finish()?;
+            let inv=1.0f32/config.voxel_size;
+            let ray_key=|k:&[i32;3]|{let p=k.map(|v|((v as f64+0.5)*f64::from(q)) as f32);((p[0]*inv).floor() as i32,(p[1]*inv).floor() as i32,(p[2]*inv).floor() as i32)};
+            let keep:ahash::AHashSet<_>=retained.iter().map(ray_key).collect();
+            let cut:ahash::AHashSet<_>=removed.iter().map(ray_key).filter(|k|!keep.contains(k)).collect();
+            map.voxels.retain(|k,_|!cut.contains(k));
+            MappingKernel::Raytracing(RaytracingKernel{last_candidate_point_count:map.healthy_count(),map,config,prepared_update:None,input:Vec::new(),last_occupancy:Some(occupancy),last_candidate_received_at_ns:stamp,dirty_since_candidate:false,dynamic_scene:Default::default()})
+        },_=>unreachable!()
+    };
+    export_mapping_kernel_checkpoint(&kernel)
+}

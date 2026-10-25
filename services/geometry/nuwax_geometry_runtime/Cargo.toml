@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 base64 = "0.22.1"
+nuwax-cloud-cleanup = { path = "../../nuwax-workspace/crates/nuwax-cloud-cleanup" }
 # 体素键只在进程内索引，使用工作区已有的带随机密钥快速散列。
 ahash = "0.8.12"
 # 地面捕获单帧按列并行；版本与工作区及 nuwax-mapping 已锁定的 rayon 相同。

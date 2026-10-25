@@ -11,7 +11,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Condvar, Mutex};
 
 const SIDECAR_ARG: &str = "--nuwax-mapping-raytracing-sidecar-v1";
-const SIDECAR_PROTOCOL_MAGIC: [u8; 8] = *b"NWRAYS01";
+const SIDECAR_PROTOCOL_MAGIC: [u8; 8] = *b"NWRAYS02";
 const SIDECAR_MAX_STRING_BYTES: usize = 4 * 1024;
 const SIDECAR_MAX_POINT_COUNT: usize = 2_000_000;
 const SIDECAR_MAX_OCCUPANCY_BYTES: usize = 64 * 1024 * 1024;
@@ -50,7 +50,7 @@ const WIRE_INPUT_MAX_BYTES: usize = WIRE_STRING_MAX_BYTES
     + 5 * size_of::<u64>()
     + WIRE_STRING_MAX_BYTES
     + 3 * size_of::<f64>()
-    + WIRE_POINTS_MAX_BYTES;
+    + WIRE_POINTS_MAX_BYTES + size_of::<u64>() + MAX_MAPPING_BACKEND_CHECKPOINT_BYTES;
 const WIRE_OCCUPANCY_MAX_BYTES: usize = 2 * size_of::<u32>()
     + size_of::<f64>()
     + 3 * size_of::<f64>()
@@ -77,7 +77,7 @@ const REQUEST_COMPUTE_MIN_FRAME_BYTES: usize = WIRE_PREFIX_BYTES
     + 5 * size_of::<u64>()
     + size_of::<u32>()
     + 3 * size_of::<f64>()
-    + size_of::<u64>();
+    + 2 * size_of::<u64>();
 const REQUEST_COMPUTE_MAX_FRAME_BYTES: usize =
     WIRE_PREFIX_BYTES + size_of::<u128>() + WIRE_TOKEN_MAX_BYTES + WIRE_INPUT_MAX_BYTES;
 const REQUEST_FLUSH_MIN_FRAME_BYTES: usize = WIRE_PREFIX_BYTES
@@ -1227,7 +1227,8 @@ fn encode_input(encoder: &mut WireEncoder, input: &MappingBackendInput) -> Resul
     for value in input.sensor_origin_map {
         encoder.f64(value);
     }
-    encoder.points(&input.registered_points_map)
+    encoder.points(&input.registered_points_map)?;
+    encoder.bytes(&input.dynamic_frame.as_ref().map(|frame|frame.encode()).transpose()?.unwrap_or_default())
 }
 
 fn decode_input(decoder: &mut WireDecoder<'_>) -> Result<MappingBackendInput, String> {
@@ -1240,7 +1241,11 @@ fn decode_input(decoder: &mut WireDecoder<'_>) -> Result<MappingBackendInput, St
     let registered_frame_id = decoder.string()?;
     let sensor_origin_map = [decoder.f64()?, decoder.f64()?, decoder.f64()?];
     let registered_points_map = decoder.points()?;
+    let decision_range=decoder.bytes_range()?;
+    let decision_bytes=&decoder.frame[decision_range];
+    let dynamic_frame=if decision_bytes.is_empty(){None}else{Some(crate::dynamic_scene::MappedFrameDecision::decode(&decision_bytes)?)};
     Ok(MappingBackendInput {
+        dynamic_frame,
         session_id,
         session_generation,
         backend_generation,
@@ -1883,6 +1888,7 @@ mod tests {
             received_at_ns: 10,
             registered_frame_id: "map".to_owned(),
             sensor_origin_map: [1.0, 2.0, 3.0],
+            dynamic_frame: None,
             registered_points_map: vec![Point3::new(4.0, 5.0, 6.0)],
         }
     }
@@ -2113,8 +2119,8 @@ mod tests {
             (
                 FrameExpectation::Request(RequestPhase::Active),
                 REQUEST_COMPUTE,
-                173,
-                48_012_461,
+                181,
+                115_121_333,
             ),
             (
                 FrameExpectation::Request(RequestPhase::Active),

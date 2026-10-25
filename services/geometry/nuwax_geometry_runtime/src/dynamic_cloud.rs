@@ -1,41 +1,35 @@
 //! 用后续实测射线的空闲证据清除三维地图残影；不按时间淘汰静态结构。
 
-use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use ahash::AHashSet as HashSet;
 
 use nalgebra::Point3;
 
-use super::voxel_index::{coarse_key, VoxelIndex};
+use super::voxel_index::VoxelIndex;
 use super::{voxel_center_f64, voxel_key, VoxelKey};
-
-const CLEAR_OBSERVATIONS: u8 = 3;
-const EVIDENCE_WINDOW_NS: u64 = 2_000_000_000;
-const MAX_RAYS: usize = 2048;
-const MAX_RANGE_M: f64 = 30.0;
-#[cfg(test)]
-const MIN_RANGE_M: f64 = 0.5;
-// 端点位置受源体素量化限制，保留两格距离；不把固定20厘米扩成近场残影保护圈。
-const SURFACE_MARGIN_VOXELS: f64 = 2.0;
-const MAX_RAY_STEPS: usize = 2048;
 
 #[derive(Default)]
 pub(super) struct DynamicCloudFilter {
     scene: crate::dynamic_scene::DynamicScene,
-    #[cfg(test)]
-    pub(super) legacy_only: bool,
-    misses: HashMap<VoxelKey, (u8, u64)>,
-    last_timestamp_ns: u64,
-    sampling_phase: usize,
+    shared: Option<crate::dynamic_scene::MappedFrameDecision>,
+    source_domain: Option<(String, u64)>,
+    raw_log: Option<nuwax_cloud_cleanup::scan_log::ScanLog>,
     removed_keys: Vec<VoxelKey>,
 }
 
 impl DynamicCloudFilter {
+    pub(crate) fn has_source_domain(&self) -> bool {
+        self.source_domain.is_some()
+    }
     pub(super) fn clear_frame(&mut self) {
         self.removed_keys.clear();
+        self.shared = None;
         self.scene.clear_frame();
     }
 
     pub(super) fn is_dynamic(&self, point: [f64; 3]) -> bool {
-        self.scene.is_dynamic(point)
+        self.shared
+            .as_ref()
+            .map_or_else(|| self.scene.is_dynamic(point), |f| f.is_dynamic(point))
     }
     /// 当前扫描实际移除的体素，供确定性快照同步撤销；下一次扫描清空。
     pub(super) fn removed_keys(&self) -> &[VoxelKey] {
@@ -66,572 +60,197 @@ impl DynamicCloudFilter {
         )
     }
 
-    /// 验证后的整帧命中集由累加器共享，射线仍按原始点序和采样相位推进。
+    pub(super) fn observe_with_ground(
+        &mut self,
+        voxels: &mut VoxelIndex,
+        size: f32,
+        origin: [f64; 3],
+        stamp: u64,
+        points: &[Point3<f64>],
+        ground: &[u32],
+    ) -> usize {
+        self.removed_keys.clear();
+        self.scene
+            .observe_with_ground(points, origin, stamp, ground);
+        if self.scene.has_clears() {
+            self.removed_keys = voxels
+                .iter()
+                .copied()
+                .filter(|key| self.clears(voxel_center_f64(*key, size)))
+                .collect();
+            for key in &self.removed_keys {
+                voxels.remove(key);
+            }
+        }
+        self.removed_keys.len()
+    }
     pub(super) fn clear_observed_free_space_with_hits(
         &mut self,
         voxels: &mut VoxelIndex,
-        voxel_size: f32,
+        size: f32,
         origin: [f64; 3],
-        timestamp_ns: u64,
+        stamp: u64,
         points: &[Point3<f64>],
-        hits: &HashSet<VoxelKey>,
+        _hits: &HashSet<VoxelKey>,
     ) -> usize {
+        self.observe_with_ground(voxels, size, origin, stamp, points, &[])
+    }
+    pub(super) fn labels(&self) -> &crate::human_point_labels::FrameLabels {
+        self.shared
+            .as_ref()
+            .map_or_else(|| self.scene.labels(), |f| &f.decision.labels)
+    }
+    pub(super) fn clears(&self, p: [f64; 3]) -> bool {
+        self.shared
+            .as_ref()
+            .map_or_else(|| self.scene.clears(p), |f| f.clears(p))
+    }
+    pub(super) fn adopt(
+        &mut self,
+        frame: crate::dynamic_scene::MappedFrameDecision,
+        voxels: &mut VoxelIndex,
+        size: f32,
+    ) {
         self.removed_keys.clear();
-        #[cfg(test)]
-        let enabled = !self.legacy_only;
-        #[cfg(not(test))]
-        let enabled = true;
-        if enabled { self.scene.observe(points, origin, timestamp_ns); }
-        if timestamp_ns == 0
-            || timestamp_ns <= self.last_timestamp_ns
-            || points.is_empty()
-            || voxel_key(origin, voxel_size).is_none()
-        {
-            return 0;
+        self.shared = Some(frame);
+        self.removed_keys = voxels
+            .iter()
+            .copied()
+            .filter(|key| self.clears(voxel_center_f64(*key, size)))
+            .collect();
+        for key in &self.removed_keys {
+            voxels.remove(key);
         }
-        self.last_timestamp_ns = timestamp_ns;
-        if self.scene.has_clears() {
-            let removed = voxels.iter().copied().filter(|key|
-                self.scene.clears(voxel_center_f64(*key, voxel_size))).collect::<Vec<_>>();
-            for key in removed {
-                voxels.remove(&key);
-                self.misses.remove(&key);
-                self.removed_keys.push(key);
-            }
+    }
+    pub(super) fn classify(
+        &mut self,
+        source: &crate::lio_ingress::AdmittedRegisteredScan,
+        ground: &[u32],
+        known: &[u32],
+    ) -> Result<std::sync::Arc<crate::dynamic_scene::FrameDecision>, String> {
+        if let Some(frame) = source.dynamic_frame() {
+            return Ok(frame);
         }
-        // 当前同格命中立即撤销反证。旁格回波不能证明本格仍被占据；
-        // 射线仍须穿过本格核心，并接受全帧遮挡及端点距离检查。
-        self.misses.retain(|key, (_, last)| {
-            timestamp_ns.saturating_sub(*last) <= EVIDENCE_WINDOW_NS
-                && !hits.contains(key)
-                && voxels.contains(key)
-        });
-        let stride = points.len().div_ceil(MAX_RAYS);
-        let phase = self.sampling_phase % stride;
-        self.sampling_phase = self.sampling_phase.wrapping_add(1);
-        // 全部历史体素都被当前回波重新命中时，不可能产生删除反证。
-        // 先证明这一条件，可省去整帧在空空间里的重复射线遍历；采样相位仍正常推进。
-        if voxels.iter().all(|key| hits.contains(key)) {
-            return self.removed_keys.len();
+        let binding = source.binding();
+        let domain = (
+            binding.mapping_session_id.clone(),
+            binding.mapping_session_generation,
+        );
+        if self.source_domain.as_ref() != Some(&domain) {
+            self.scene = Default::default();
+            self.source_domain = Some(domain);
+            self.raw_log = None;
         }
-        let coarse_hits = voxels.coarse_enabled().then(|| {
-            hits.iter()
-                .map(|key| coarse_key(*key))
-                .collect::<HashSet<_>>()
-        });
-        let mut free = HashSet::new();
-        for point in points.iter().skip(phase).step_by(stride) {
-            trace_free_voxels(
-                voxels,
-                hits,
-                voxel_size,
-                origin,
-                point,
-                coarse_hits.as_ref(),
-                &mut free,
-                self.scene.minimum_range_m(),
+        let points = source
+            .body_points()
+            .iter()
+            .map(|p| binding.frozen_odom_from_body * p)
+            .collect::<Vec<_>>();
+        let odom_from_map = binding.registration_map_from_odom.inverse();
+        let origin = binding
+            .sensor_origin_map
+            .map(|p| odom_from_map * Point3::from(p));
+        if let Some(origin) = origin {
+            self.scene.observe_with_known_ground(
+                &points,
+                origin.coords.into(),
+                source.source_timestamp_ns(),
+                ground,
+                known,
             );
-        }
-        let mut removed = self.removed_keys.len();
-        for key in free {
-            let evidence = self.misses.entry(key).or_insert((0, timestamp_ns));
-            evidence.0 = evidence.0.saturating_add(1);
-            evidence.1 = timestamp_ns;
-            if evidence.0 >= CLEAR_OBSERVATIONS {
-                if voxels.remove(&key) {
-                    removed += 1;
-                    self.removed_keys.push(key);
-                }
-                self.misses.remove(&key);
-            }
-        }
-        removed
-    }
-}
-
-fn trace_free_voxels(
-    voxels: &VoxelIndex,
-    hits: &HashSet<VoxelKey>,
-    voxel_size: f32,
-    origin: [f64; 3],
-    point: &Point3<f64>,
-    coarse_hits: Option<&HashSet<VoxelKey>>,
-    free: &mut HashSet<VoxelKey>,
-    minimum_range_m: f64,
-) {
-    let delta = [
-        point.x - origin[0],
-        point.y - origin[1],
-        point.z - origin[2],
-    ];
-    let range = delta[0].hypot(delta[1]).hypot(delta[2]);
-    let size = f64::from(voxel_size);
-    let surface_margin = size * SURFACE_MARGIN_VOXELS;
-    if !range.is_finite() || range <= minimum_range_m + surface_margin {
-        return;
-    }
-    let end = (range - surface_margin).min(MAX_RANGE_M);
-    if end <= minimum_range_m {
-        return;
-    }
-    let direction = delta.map(|value| value / range);
-    let Some(start) = voxel_key(origin, voxel_size) else {
-        return;
-    };
-    let mut key = [start.0, start.1, start.2];
-    let mut step = [0_i32; 3];
-    let mut next = [f64::INFINITY; 3];
-    let mut interval = [f64::INFINITY; 3];
-    for axis in 0..3 {
-        if direction[axis] != 0.0 {
-            step[axis] = if direction[axis] > 0.0 { 1 } else { -1 };
-            let boundary = (f64::from(key[axis]) + if step[axis] > 0 { 1.0 } else { 0.0 }) * size;
-            next[axis] = ((boundary - origin[axis]) / direction[axis]).max(0.0);
-            interval[axis] = size / direction[axis].abs();
-        }
-    }
-    let mut coarse_cache = None;
-    for _ in 0..MAX_RAY_STEPS {
-        let cell = (key[0], key[1], key[2]);
-        // 只跳过集合查询；原浮点步进、边界平局、距离和总步数完全保留。
-        let occupied_block = if let Some(coarse_hits) = coarse_hits {
-            let block = coarse_key(cell);
-            match coarse_cache {
-                Some((cached, occupied)) if cached == block => occupied,
-                _ => {
-                    let occupied = voxels.coarse_contains(&block) || coarse_hits.contains(&block);
-                    coarse_cache = Some((block, occupied));
-                    occupied
-                }
-            }
         } else {
-            true
+            self.scene.clear_frame();
+        }
+        let mut frame = (*self.scene.decision()).clone();
+        if frame.labels.labels.is_empty() {
+            frame.labels = crate::human_point_labels::FrameLabels {
+                source_timestamp_ns: source.source_timestamp_ns(),
+                labels: vec![crate::human_point_labels::PointLabel::PendingNew; points.len()],
+            };
+        }
+        let frame = std::sync::Arc::new(frame);
+        use nuwax_cloud_cleanup::scan_log::{ScanLog, ScanMetadata, Session};
+        if self.raw_log.is_none() {
+            let root = std::env::var_os("NUWAX_RAW_SCAN_DIRECTORY")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("runtime_data/scan_logs"));
+            self.raw_log = Some(ScanLog::open(
+                &root,
+                Session {
+                    session_id: binding.mapping_session_id.clone(),
+                    generation: binding.mapping_session_generation,
+                },
+            )?);
+        }
+        let body_from_map =
+            (binding.registration_map_from_odom * binding.frozen_odom_from_body).inverse();
+        let origin_body = binding
+            .sensor_origin_map
+            .map(|p| body_from_map * Point3::from(p));
+        let metadata = ScanMetadata {
+            source_timestamp_ns: source.source_timestamp_ns(),
+            source_sequence: source.source_identity().source_sequence as u64,
+            sensor: source.sensor_frame_id().into(),
+            source_generation: binding.runtime_generation as u64,
+            odom_from_body: binding
+                .frozen_odom_from_body
+                .to_homogeneous()
+                .as_slice()
+                .try_into()
+                .unwrap(),
+            map_from_odom: binding
+                .registration_map_from_odom
+                .to_homogeneous()
+                .as_slice()
+                .try_into()
+                .unwrap(),
+            observation_minimum_range_m: Some(self.scene.minimum_range_m()),
+            sensor_origin_body: origin_body.map(|p| p.coords.into()),
+            point_count: source.body_points().len(),
         };
-        if occupied_block {
-            // 整帧全部回波参与遮挡判断，不能把抽样遗漏的近回波当成空闲。
-            if hits.contains(&cell) {
-                break;
-            }
-            if voxels.contains(&cell) && !free.contains(&cell) {
-                let center = voxel_center_f64(cell, voxel_size);
-                let offset = std::array::from_fn::<_, 3, _>(|i| center[i] - origin[i]);
-                let along = (0..3).map(|i| offset[i] * direction[i]).sum::<f64>();
-                let perpendicular_sq = (0..3)
-                    .map(|i| (offset[i] - along * direction[i]).powi(2))
-                    .sum::<f64>();
-                // 仅穿过体素内接球的射线算反证，擦边和回波附近保留。
-                if along >= minimum_range_m
-                    && along + size <= end
-                    && perpendicular_sq <= (size * 0.45).powi(2)
-                    && !hits.contains(&cell)
-                {
-                    free.insert(cell);
-                }
-            }
-        }
-        let axis = if next[0] <= next[1] && next[0] <= next[2] {
-            0
-        } else if next[1] <= next[2] {
-            1
-        } else {
-            2
-        };
-        if next[axis] >= end {
-            break;
-        }
-        let Some(advanced) = key[axis].checked_add(step[axis]) else {
-            break;
-        };
-        key[axis] = advanced;
-        next[axis] += interval[axis];
-    }
-}
-
-#[cfg(test)]
-fn trace_free_voxels_reference(
-    voxels: &VoxelIndex,
-    hits: &HashSet<VoxelKey>,
-    voxel_size: f32,
-    origin: [f64; 3],
-    point: &Point3<f64>,
-    free: &mut HashSet<VoxelKey>,
-) {
-    let delta = [
-        point.x - origin[0],
-        point.y - origin[1],
-        point.z - origin[2],
-    ];
-    let range = delta[0].hypot(delta[1]).hypot(delta[2]);
-    let size = f64::from(voxel_size);
-    let surface_margin = size * SURFACE_MARGIN_VOXELS;
-    if !range.is_finite() || range <= MIN_RANGE_M + surface_margin {
-        return;
-    }
-    let end = (range - surface_margin).min(MAX_RANGE_M);
-    if end <= MIN_RANGE_M {
-        return;
-    }
-    let direction = delta.map(|value| value / range);
-    let Some(start) = voxel_key(origin, voxel_size) else {
-        return;
-    };
-    let mut key = [start.0, start.1, start.2];
-    let mut step = [0_i32; 3];
-    let mut next = [f64::INFINITY; 3];
-    let mut interval = [f64::INFINITY; 3];
-    for axis in 0..3 {
-        if direction[axis] != 0.0 {
-            step[axis] = if direction[axis] > 0.0 { 1 } else { -1 };
-            let boundary = (f64::from(key[axis]) + if step[axis] > 0 { 1.0 } else { 0.0 }) * size;
-            next[axis] = ((boundary - origin[axis]) / direction[axis]).max(0.0);
-            interval[axis] = size / direction[axis].abs();
-        }
-    }
-    for _ in 0..MAX_RAY_STEPS {
-        let cell = (key[0], key[1], key[2]);
-        // 整帧全部回波参与遮挡判断，不能把抽样遗漏的近回波当成空闲。
-        if hits.contains(&cell) {
-            break;
-        }
-        if voxels.contains(&cell) && !free.contains(&cell) {
-            let center = voxel_center_f64(cell, voxel_size);
-            let offset = std::array::from_fn::<_, 3, _>(|i| center[i] - origin[i]);
-            let along = (0..3).map(|i| offset[i] * direction[i]).sum::<f64>();
-            let perpendicular_sq = (0..3)
-                .map(|i| (offset[i] - along * direction[i]).powi(2))
-                .sum::<f64>();
-            // 仅穿过体素内接球的射线算反证，擦边和回波附近保留。
-            if along >= MIN_RANGE_M
-                && along + size <= end
-                && perpendicular_sq <= (size * 0.45).powi(2)
-                && !hits.contains(&cell)
-            {
-                free.insert(cell);
-            }
-        }
-        let axis = if next[0] <= next[1] && next[0] <= next[2] {
-            0
-        } else if next[1] <= next[2] {
-            1
-        } else {
-            2
-        };
-        if next[axis] >= end {
-            break;
-        }
-        let Some(advanced) = key[axis].checked_add(step[axis]) else {
-            break;
-        };
-        key[axis] = advanced;
-        next[axis] += interval[axis];
+        self.raw_log.as_mut().unwrap().append(
+            &metadata,
+            source.body_points().iter().map(|p| [p.x, p.y, p.z]),
+            &frame.labels.labels,
+        )?;
+        source.record_decision(frame.clone())?;
+        Ok(frame)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn free_rays_clear_residue_beside_live_thin_obstacle_without_erasing_it() {
-        let mut filter = DynamicCloudFilter { legacy_only: true,
-            scene: crate::dynamic_scene::DynamicScene::with_minimum_range(0.05), ..Default::default() };
-        // 旧人体残留紧邻持续被观测的细杆；另一旧点位于当前回波之后。
-        let residue=(10,0,0);let post=(10,1,0);let hidden=(20,2,0);
-        let mut map=VoxelIndex::from([residue,post,hidden]);
-        let points=vec![Point3::new(2.025,0.025,0.025),Point3::new(0.525,0.075,0.025)];
-        for timestamp in [1,1,2] {
-            filter.clear_observed_free_space(&mut map,0.05,[0.025;3],timestamp,&points);
-            assert!(map.contains(&residue), "重复时间或不足三帧不能提供完整穿越证据");
-            assert!(map.contains(&post) && map.contains(&hidden));
-        }
-        filter.clear_observed_free_space(&mut map,0.05,[0.025;3],3,&points);
-        assert!(!map.contains(&residue), "旁边的细杆不能让真实穿越证据永久失效");
-        assert!(map.contains(&post) && map.contains(&hidden), "真实细杆及其后方遮挡必须保留");
-        // 单个当前点即使曾积累反证，也不能被历史清理投票删除。
-        map.insert(residue);
-        let current=vec![Point3::new(0.525,0.025,0.025),Point3::new(2.025,0.025,0.025)];
-        for timestamp in 4..=8 {
-            filter.clear_observed_free_space(&mut map,0.05,[0.025;3],timestamp,&current);
-            assert!(map.contains(&residue));
-        }
-    }
-
-    #[test]
-    fn passing_person_trails_are_removed_more_completely_than_sampled_rays() {
-        use crate::dynamic_scene::tests::{corridor, ORIGIN};
-        let mut improved = DynamicCloudFilter::default();
-        let mut legacy = DynamicCloudFilter { legacy_only: true, ..Default::default() };
-        let mut new_map = VoxelIndex::new();
-        let mut old_map = VoxelIndex::new();
-        let mut people = HashSet::new();
-        let mut structures = HashSet::new();
-        for frame in 1..=28 {
-            let person = (7..=22).contains(&frame).then(|| -0.9 + (frame - 7) as f64 * 0.12);
-            let (points, labels) = corridor(person, (frame % 3) as f64);
-            let keys: HashSet<_> = points.iter().map(|p| voxel_key([p.x, p.y, p.z], 0.05).unwrap()).collect();
-            for (point, dynamic) in points.iter().zip(labels) {
-                let key = voxel_key([point.x, point.y, point.z], 0.05).unwrap();
-                if dynamic { people.insert(key); } else { structures.insert(key); }
-            }
-            improved.clear_observed_free_space_with_hits(&mut new_map, 0.05, ORIGIN, frame * 100_000_000, &points, &keys);
-            legacy.clear_observed_free_space_with_hits(&mut old_map, 0.05, ORIGIN, frame * 100_000_000, &points, &keys);
-            new_map.extend(keys.iter().copied());
-            old_map.extend(keys.iter().copied());
-        }
-        let old_residual = people.iter().filter(|key| old_map.contains(key)).count();
-        let new_residual = people.iter().filter(|key| new_map.contains(key)).count();
-        let old_static = structures.iter().filter(|key| old_map.contains(key)).count();
-        let new_static = structures.iter().filter(|key| new_map.contains(key)).count();
-        eprintln!("移动人体体素={} 旧残留={old_residual} 新残留={new_residual} 静态体素={} 旧保留={old_static} 新保留={new_static}", people.len(), structures.len());
-        assert!(new_residual * 2 < old_residual, "相同回波下残留至少减少一半");
-        assert!(new_static as f64 / structures.len() as f64 > 0.995, "静态结构保留率");
-    }
-
-    #[test]
-    fn coarse_empty_blocks_match_original_ray_walk_exactly() {
-        let mut seed = 7_u64;
-        let mut draw = || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-            ((seed >> 32) % 161) as i32 - 80
-        };
-        let mut total_free = 0;
-        for _ in 0..20 {
-            let keys: Vec<_> = (0..2000).map(|_| (draw(), draw(), draw())).collect();
-            let mut voxels: VoxelIndex = keys.iter().copied().collect();
-            voxels.extend((10..60).map(|x| (x, 0, 0)));
-            let mut hits: HashSet<_> = keys.iter().take(400).copied().collect();
-            hits.insert((80, 0, 0));
-            let coarse_hits: HashSet<_> = hits.iter().map(|key| coarse_key(*key)).collect();
-            let mut points: Vec<_> = keys
-                .iter()
-                .take(32)
-                .map(|key| Point3::from(voxel_center_f64(*key, 0.05)))
-                .collect();
-            points.extend([
-                Point3::new(4.025, 0.025, 0.025),
-                Point3::new(-50.0, -50.0, -50.0),
-            ]);
-            for origin in [[0.025; 3], [0.0; 3], [-0.125, 0.1, -0.2], [10.0, -8.0, 2.0]] {
-                for point in &points {
-                    let mut expected = HashSet::new();
-                    trace_free_voxels_reference(&voxels, &hits, 0.05, origin, point, &mut expected);
-                    let mut actual = HashSet::new();
-                    trace_free_voxels(
-                        &voxels,
-                        &hits,
-                        0.05,
-                        origin,
-                        point,
-                        Some(&coarse_hits),
-                        &mut actual,
-                        MIN_RANGE_M,
-                    );
-                    assert_eq!(actual, expected, "粗块跳过改变了原射线证据");
-                    let mut fallback = HashSet::new();
-                    trace_free_voxels(&voxels, &hits, 0.05, origin, point, None, &mut fallback, MIN_RANGE_M);
-                    assert_eq!(fallback, expected);
-                    total_free += actual.len();
-                }
-            }
-        }
-        assert!(total_free > 100, "夹具必须真实产生反证，不能只验证空集合");
-    }
-
-    #[test]
-    #[ignore = "需要显式提供本次同帧实录，不在普通回归中读取外部文件"]
-    fn recorded_near_field_cleanup_replays_production_rays() {
-        use std::io::Read;
-        fn bytes<const N: usize>(file: &mut std::fs::File) -> [u8; N] {
-            let mut value = [0; N]; file.read_exact(&mut value).unwrap(); value
-        }
-        let path = std::env::var("NUWAX_SELF_CLOUD_REPLAY").expect("实录路径");
-        let mut input = std::fs::File::open(&path).unwrap();
-        assert_eq!(&bytes::<8>(&mut input), b"NWSELF01");
-        let size = f32::from_le_bytes(bytes(&mut input));
-        let minimum = f64::from_le_bytes(bytes(&mut input));
-        let count = u32::from_le_bytes(bytes(&mut input));
-        let frames = u32::from_le_bytes(bytes(&mut input));
-        let mut initial = VoxelIndex::default();
-        for _ in 0..count {
-            initial.insert((i32::from_le_bytes(bytes(&mut input)),i32::from_le_bytes(bytes(&mut input)),i32::from_le_bytes(bytes(&mut input))));
-        }
-        let limit = std::env::var("NUWAX_SELF_REPLAY_MAX_FRAMES").ok().map(|s| s.parse::<u32>().unwrap()).unwrap_or(frames).min(frames);
-        let mut calibrated = DynamicCloudFilter { scene: crate::dynamic_scene::DynamicScene::with_minimum_range(minimum), ..Default::default() };
-        let mut previous = DynamicCloudFilter { scene: crate::dynamic_scene::DynamicScene::with_minimum_range(0.5), ..Default::default() };
-        let mut actual = initial.clone();
-        let mut baseline = initial.clone();
-        let mut last_stamp = 0;
-        for _ in 0..limit {
-            last_stamp = u64::from_le_bytes(bytes(&mut input));
-            let origin = std::array::from_fn(|_| f64::from_le_bytes(bytes(&mut input)));
-            let count = u32::from_le_bytes(bytes(&mut input));
-            let points = (0..count).map(|_| Point3::new(f64::from_le_bytes(bytes(&mut input)),f64::from_le_bytes(bytes(&mut input)),f64::from_le_bytes(bytes(&mut input)))).collect::<Vec<_>>();
-            let hits = points.iter().map(|p| voxel_key([p.x,p.y,p.z],size).unwrap()).collect::<HashSet<_>>();
-            calibrated.clear_observed_free_space_with_hits(&mut actual,size,origin,last_stamp,&points,&hits);
-            previous.clear_observed_free_space_with_hits(&mut baseline,size,origin,last_stamp,&points,&hits);
-            assert!(calibrated.removed_keys().iter().all(|key| !hits.contains(key)), "当前真实命中被误删");
-            for key in hits { actual.insert(key); baseline.insert(key); }
-        }
-        let focus = [(11,-3,-3),(12,-3,-3),(11,-2,-3),(12,-2,-3),(12,-1,-3),(11,-3,-2),(11,-2,-2),(12,-1,-2),(10,-3,-1),(11,-3,-1),(10,-2,-1),(11,-2,-1),(11,-1,-1),(12,-1,-1),(12,-3,0),(11,0,-3),(12,0,-3),(12,0,-2),(11,0,-1),(12,0,-1)];
-        if std::env::var_os("NUWAX_DYNAMIC_REPLAY_REPORT_ONLY").is_none() {
-            assert!(focus.iter().all(|key| initial.contains(key) && baseline.contains(key)));
-            assert!(focus.iter().all(|key| !actual.contains(key)), "有明确反证的前方旧点未全部清除");
-        }
-        let mut removed = initial.iter().filter(|key| !actual.contains(key)).copied().collect::<Vec<_>>();
-        removed.sort_unstable();
-        let mut newly_observed = actual.iter().filter(|key| !initial.contains(key)).copied().collect::<Vec<_>>();
-        newly_observed.sort_unstable();
-        let report = serde_json::json!({"frames":limit,"source_timestamp_ns":last_stamp,"minimum_range_m":minimum,
-            "initial_voxels":count,"baseline_voxels":baseline.len(),"calibrated_voxels":actual.len(),
-            "front_old_remaining":focus.iter().filter(|key| baseline.contains(key)).count(),
-            "front_new_remaining":focus.iter().filter(|key| actual.contains(key)).count(),
-            "side_column_old_remaining":baseline.contains(&(3,-6,-3)),"side_column_new_remaining":actual.contains(&(3,-6,-3)),
-            "removed_initial_keys":removed,"newly_observed_keys":newly_observed});
-        let output = std::path::Path::new(&path).with_extension("清理结果.json");
-        std::fs::write(&output,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
-        println!("真实扫描回放完成，结果：{}",output.display());
-    }
-
-    #[test]
-    fn calibrated_near_field_requires_three_rays_and_preserves_real_hits_and_occlusion() {
-        let mut near = DynamicCloudFilter { scene: crate::dynamic_scene::DynamicScene::with_minimum_range(0.05), ..Default::default() };
-        let mut old = DynamicCloudFilter { scene: crate::dynamic_scene::DynamicScene::with_minimum_range(0.5), ..Default::default() };
-        let initial = VoxelIndex::from([(5,0,0), (80,0,0), (5,4,0), (5,0,-8)]);
-        let mut actual = initial.clone();
-        let mut conservative = initial.clone();
-        let points = vec![Point3::new(1.025,0.025,0.025), Point3::new(0.275,0.225,0.025), Point3::new(0.275,0.025,-0.375)];
-        for stamp in [1,1,2] {
-            assert_eq!(near.clear_observed_free_space(&mut actual,0.05,[0.025;3],stamp,&points),0);
-            assert_eq!(old.clear_observed_free_space(&mut conservative,0.05,[0.025;3],stamp,&points),0);
-        }
-        assert_eq!(near.clear_observed_free_space(&mut actual,0.05,[0.025;3],3,&points),1);
-        assert_eq!(old.clear_observed_free_space(&mut conservative,0.05,[0.025;3],3,&points),0);
-        assert_eq!(actual,VoxelIndex::from([(80,0,0),(5,4,0),(5,0,-8)]));
-        assert_eq!(conservative,initial);
-    }
-
-    #[test]
-    fn dynamic_cloud_requires_distinct_observations_and_preserves_occlusion() {
+    fn an_isolated_ray_does_not_invent_observed_neighbours() {
         let mut filter = DynamicCloudFilter::default();
         let mut map = VoxelIndex::from([(40, 0, 0), (120, 0, 0), (40, 40, 0)]);
-        let origin = [0.025; 3];
-        let clear = vec![Point3::new(4.025, 0.025, 0.025); 20];
-        for stamp in [1, 1, 0, 2] {
-            assert_eq!(
-                filter.clear_observed_free_space(&mut map, 0.05, origin, stamp, &clear),
-                0
-            );
-        }
-        assert_eq!(
-            filter.clear_observed_free_space(&mut map, 0.05, origin, 3, &clear),
-            1
-        );
-        assert_eq!(map, VoxelIndex::from([(120, 0, 0), (40, 40, 0)]));
-    }
-
-    #[test]
-    fn dynamic_cloud_hit_resets_evidence_and_near_returns_block_far_rays() {
-        let mut filter = DynamicCloudFilter::default();
-        let mut map = VoxelIndex::from([(40, 0, 0)]);
-        let origin = [0.025; 3];
-        let clear = [Point3::new(4.025, 0.025, 0.025)];
-        filter.clear_observed_free_space(&mut map, 0.05, origin, 1, &clear);
-        filter.clear_observed_free_space(&mut map, 0.05, origin, 2, &clear);
-        let hit = [Point3::new(2.025, 0.025, 0.025)];
-        filter.clear_observed_free_space(&mut map, 0.05, origin, 3, &hit);
-        for stamp in 4..7 {
-            let occluded = [Point3::new(1.025, 0.025, 0.025), clear[0]];
-            filter.clear_observed_free_space(&mut map, 0.05, origin, stamp, &occluded);
-        }
-        for stamp in 7..9 {
-            assert_eq!(
-                filter.clear_observed_free_space(&mut map, 0.05, origin, stamp, &clear),
-                0
-            );
-        }
-        assert_eq!(
-            filter.clear_observed_free_space(&mut map, 0.05, origin, 9, &clear),
-            1
-        );
-    }
-
-    #[test]
-    fn dynamic_cloud_protects_grazing_surface_and_expired_evidence() {
-        let mut filter = DynamicCloudFilter::default();
-        let mut map = VoxelIndex::from([(40, 0, 0), (-40, 0, 0)]);
-        let clear = [Point3::new(4.025, 0.025, 0.025)];
-        filter.clear_observed_free_space(&mut map, 0.05, [0.025; 3], 1, &clear);
-        filter.clear_observed_free_space(&mut map, 0.05, [0.025; 3], 2, &clear);
-        filter.clear_observed_free_space(
-            &mut map,
-            0.05,
-            [0.025; 3],
-            EVIDENCE_WINDOW_NS + 3,
-            &clear,
-        );
-        assert_eq!(map.len(), 2);
-        for stamp in EVIDENCE_WINDOW_NS + 4..EVIDENCE_WINDOW_NS + 8 {
-            filter.clear_observed_free_space(
-                &mut map,
-                0.05,
-                [0.025, 0.0, 0.0],
-                stamp,
-                &[Point3::new(4.025, 0.0, 0.0)],
-            );
-        }
-        assert_eq!(map.len(), 2);
-    }
-
-    #[test]
-    fn dynamic_cloud_preserves_static_walls_floor_and_unobserved_regions() {
-        let origin = [0.025, 0.025, 1.025];
-        let mut points = Vec::new();
-        for i in -20..=20 {
-            for j in 0..=20 {
-                points.push(Point3::new(
-                    -4.025,
-                    i as f64 * 0.1 + 0.025,
-                    j as f64 * 0.1 + 0.025,
-                ));
-                points.push(Point3::new(
-                    j as f64 * 0.1 + 0.025,
-                    i as f64 * 0.1 + 0.025,
-                    0.025,
-                ));
-            }
-        }
-        let mut map = points
-            .iter()
-            .map(|p| voxel_key([p.x, p.y, p.z], 0.05).unwrap())
-            .collect::<VoxelIndex>();
         let original = map.clone();
+        let points = vec![Point3::new(4.025, 0.025, 0.025); 20];
+        for stamp in [1, 1, 0, 2, 3, 4, 5] {
+            filter.clear_observed_free_space(&mut map, 0.05, [0.025; 3], stamp, &points);
+        }
+        assert_eq!(
+            map, original,
+            "no 27-cell observed neighbourhood, no invented void"
+        );
+    }
+    #[test]
+    fn accumulated_static_room_keeps_actual_observed_geometry() {
+        use crate::dynamic_scene::tests::{corridor, ORIGIN};
         let mut filter = DynamicCloudFilter::default();
-        // 静态表面重复扫描且轻微噪声移动；未覆盖的旧结构也不得衰减。
-        for stamp in 1..=8 {
-            let scan = points
+        let mut map = VoxelIndex::new();
+        let mut truth = HashSet::new();
+        for frame in 1..=30 {
+            let (points, _) = corridor(None, (frame % 3) as f64);
+            filter.clear_observed_free_space(&mut map, 0.05, ORIGIN, frame * 100_000_000, &points);
+            let keys = points
                 .iter()
-                .enumerate()
-                .filter(|(i, _)| i % 2 == stamp as usize % 2)
-                .map(|(_, p)| Point3::new(p.x + 0.005, p.y + 0.005, p.z + 0.005))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                filter.clear_observed_free_space(&mut map, 0.05, origin, stamp, &scan),
-                0
-            );
+                .map(|p| voxel_key([p.x, p.y, p.z], 0.05).unwrap())
+                .collect::<HashSet<_>>();
+            truth.extend(keys.iter().copied());
+            map.extend(keys);
         }
-        assert_eq!(map, original);
-        // 负方向穿透同样能删除，超出清理范围的历史点保持。
-        map.extend([(-40, 0, 20), (-800, 0, 20)]);
-        for stamp in 9..=11 {
-            filter.clear_observed_free_space(
-                &mut map,
-                0.05,
-                origin,
-                stamp,
-                &[Point3::new(-50.025, 0.025, 1.025)],
-            );
-        }
-        assert!(!map.contains(&(-40, 0, 20)));
-        assert!(map.contains(&(-800, 0, 20)));
+        assert!(truth.iter().all(|k| map.contains(k)));
     }
 }

@@ -3784,6 +3784,10 @@ class PlatformGeometryRuntime:
                 "navigation_map_ready": nav2_map_metadata.get("present"),
             },
         }
+        if checkpoint_bundle is not None and not planar_graph:
+            from services.mapping.completed_cleanup import copy_raw_scan_history
+            bundle_changes["metadata"]["raw_scan_history"] = copy_raw_scan_history(
+                checkpoint_bundle.checkpoint, resolved_bundle_root)
         if assigned_export:
             prepared = type(bundle)(**{
                 **{name: getattr(bundle, name) for name in type(bundle).model_fields},

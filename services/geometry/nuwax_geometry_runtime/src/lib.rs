@@ -1,6 +1,7 @@
 //! Geometry 可复用库入口。
 
 mod dynamic_scene;
+mod dynamic_tracks;
 
 #[doc(hidden)]
 pub mod mapping_backend;
@@ -30,3 +31,7 @@ pub use offline_replay_owner::{
     OfflineCanonicalOccupancyReceiptV1, OfflineGeometrySnapshotV3,
     OfflineReplayProcessingReceiptV1, ReplayBarrierIdentityV1,
 };
+
+pub use nuwax_cloud_cleanup::offline_residual_cleanup;
+
+pub use nuwax_cloud_cleanup::human_point_labels;

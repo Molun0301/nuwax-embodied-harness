@@ -524,10 +524,18 @@ impl CloudMapShmWriter {
     pub(crate) fn last_stage_ms(&self) -> [f64; 3] { self.last_stage_ms }
     pub(crate) fn accumulate_mapping_replayed_scan(&mut self, session_generation: u64,
         points: &[Point3<f64>], sensor_origin_map: Option<[f64;3]>,
-        source: &crate::admitted_cloud::AdmittedCloudSource) -> bool {
+        source: &crate::admitted_cloud::AdmittedCloudSource,frame:Option<&crate::dynamic_scene::MappedFrameDecision>) -> bool {
         self.accumulate_mapping_scan_inner(session_generation, points, sensor_origin_map,
-            source.timestamp_ns(), Some(fine_cloud::FrameSource::Corrected(source)))
+            source.timestamp_ns(), Some(fine_cloud::FrameSource::Corrected(source,frame)))
     }
+    pub(crate) fn classify_admitted_scan(&mut self,source:&crate::lio_ingress::AcceptedRegisteredCloud)->Result<crate::dynamic_scene::MappedFrameDecision,String>{
+        let generation=source.scan().binding().mapping_session_generation;
+        if self.session_generation!=generation{self.reset_accumulator(generation);}
+        let (ground,known)=if let Some(fine)=self.fine_cloud.as_mut(){fine.measured_ground(source.map_points())?}else{(Vec::new(),Vec::new())};
+        let frame=self.dynamic_filter.classify(source.scan(),&ground,&known)?;
+        crate::dynamic_scene::MappedFrameDecision::new(frame,source.scan().binding().registration_map_from_odom,source.map_points(),0)
+    }
+
     fn accumulate_mapping_scan_inner(&mut self, session_generation: u64,
         points: &[Point3<f64>], sensor_origin_map: Option<[f64;3]>, source_timestamp_ns: u64,
         source: Option<fine_cloud::FrameSource<'_>>) -> bool {
@@ -580,8 +588,6 @@ impl CloudMapShmWriter {
                 let fine = self.fine_cloud.as_ref().unwrap();
                 if self.dense_cloud.is_none() { self.dense_cloud = Some(DenseCloud::with_voxel_size(fine.voxel_size())?); }
                 let dense = self.dense_cloud.as_mut().unwrap();
-                #[cfg(test)]
-                if self.dynamic_filter.legacy_only { return dense.append(points); }
                 dense.remove_voxels(fine.removed_keys(), fine.voxel_size())?;
                 let static_points = points.iter().filter(|point| !fine.is_dynamic(point)).copied().collect::<Vec<_>>();
                 dense.append(&static_points)
@@ -596,22 +602,12 @@ impl CloudMapShmWriter {
         { self.last_stage_ms[1] = phase_started.elapsed().as_secs_f64() * 1000.0; }
         #[cfg(test)]
         let phase_started = std::time::Instant::now();
-        if let Some(origin) = sensor_origin_map {
-            let removed = self.dynamic_filter.clear_observed_free_space_with_hits(
-                &mut self.voxels,
-                self.voxel_size,
-                origin,
-                source_timestamp_ns,
-                points,
-                &hits,
-            );
-            if removed > 0 {
-                for &key in self.dynamic_filter.removed_keys() {
-                    self.ordered_voxels.removed(key, self.max_points);
-                }
-                tracing::debug!(removed, source_timestamp_ns, "三维地图已清除动态残留体素");
-            }
-        }
+        // Fine, dense and visible maps use the same admitted frame decision.
+        // Raw realtime obstacle publication is separate and stays unfiltered.
+        let fine=self.fine_cloud.as_ref().unwrap();
+        let removed:Vec<_>=self.voxels.iter().copied().filter(|&k|fine.clears(voxel_center_f64(k,self.voxel_size))).collect();
+        for key in removed {self.voxels.remove(&key);self.ordered_voxels.removed(key,self.max_points);}
+        hits=points.iter().filter(|p|!fine.is_dynamic(p)).filter_map(|p|voxel_key([p.x,p.y,p.z],self.voxel_size)).collect();
         if self.voxel_size != key_voxel_size {
             // 切换自适应粗化会话时保留原接纳/过滤语义，常规扫描复用已经验证的键。
             return self.accumulate_mapping_frame(session_generation, points);
@@ -1051,7 +1047,9 @@ impl CloudMapShmWriter {
         self.session_generation = receipt.session_generation;
         self.voxel_size = prepared.voxel_size;
         self.voxels = prepared.voxels;
-        self.dynamic_filter = prepared.dynamic_filter;
+        // PGO changes map coordinates, not the frozen-odometry evidence owner.
+        // Keep its original scan log and temporal void history across installation.
+        if !self.dynamic_filter.has_source_domain() { self.dynamic_filter = prepared.dynamic_filter; }
         self.ordered_voxels = prepared.ordered_voxels;
         self.ordered_voxels.invalidate();
         self.replace_fine_cloud(prepared.fine_cloud);
@@ -1766,14 +1764,6 @@ fn cloud_map_duplicate_admitted_frame_preserves_dense_coarse_and_fine_state() {
         let origin: [f64; 3] = serde_json::from_str(&std::env::var("NUWAX_DYNAMIC_SENSOR_ORIGIN_BODY").expect("指定真实雷达机体原点")).unwrap();
         let mut file = std::io::BufReader::new(std::fs::File::open(path).unwrap());
         let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
-        let legacy = std::env::var_os("NUWAX_DYNAMIC_BENCHMARK_LEGACY").is_some();
-        if legacy {
-            writer.reset_accumulator(1);
-            writer.dynamic_filter.legacy_only = true;
-            let mut fine = FineCloud::fresh().unwrap();
-            fine.use_legacy_filter();
-            writer.fine_cloud = Some(fine);
-        }
         let mut durations = Vec::new();
         let mut stages = [0.0; 3];
         let mut count = 0;
@@ -1812,7 +1802,7 @@ fn cloud_map_duplicate_admitted_frame_preserves_dense_coarse_and_fine_state() {
     }
 
     #[test]
-    fn passing_person_is_live_obstacle_but_not_dense_history_and_survives_save_restore() {
+    fn persistent_cloud_filters_dynamic_points_and_survives_save_restore() {
         use crate::dynamic_scene::tests::{corridor, ORIGIN};
         let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
         let mut static_total = 0_u64;
@@ -1824,9 +1814,12 @@ fn cloud_map_duplicate_admitted_frame_preserves_dense_coarse_and_fine_state() {
             people_total += labels.iter().filter(|label| **label).count() as u64;
             static_total += labels.iter().filter(|label| !**label).count() as u64;
             assert!(writer.accumulate_mapping_scan(1, &points, Some(ORIGIN), frame * 100_000_000));
-            // 过滤后的导航源仍包含本帧所有人体回波，不能让静态显示需求抹除避障依据。
-            for point in points.iter().zip(&labels).filter(|(_, label)| **label).map(|(point, _)| point) {
-                assert!(writer.voxels.contains(&voxel_key([point.x, point.y, point.z], writer.voxel_size).unwrap()));
+            // Persistence excludes actual dynamic labels. Realtime raw-return
+            // preservation is exercised through accepted candidates in the
+            // cumulative saved-map test, not asserted on a persistent map.
+            let fine=writer.fine_cloud.as_ref().unwrap();
+            for point in points.iter().filter(|p|!fine.is_dynamic(p)) {
+                assert!(writer.voxels.contains(&voxel_key([point.x,point.y,point.z],writer.voxel_size).unwrap()));
             }
             let receipt = OccupancyCommitReceipt {
                 commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 80, sequence: frame },
@@ -1971,7 +1964,7 @@ fn cloud_map_duplicate_admitted_frame_preserves_dense_coarse_and_fine_state() {
     }
 
     #[test]
-    fn pgo_accumulator_install_preserves_pending_dynamic_evidence() {
+    fn pgo_install_does_not_invent_unobserved_neighbours() {
         let mut source = CloudMapShmWriter::new_for_test(&test_path("pgo-private-dynamic")).unwrap();
         let mut target = CloudMapShmWriter::new_for_test(&test_path("pgo-installed-dynamic")).unwrap();
         let origin = Some([0.025; 3]);
@@ -1997,11 +1990,29 @@ fn cloud_map_duplicate_admitted_frame_preserves_dense_coarse_and_fine_state() {
             .install_prepared_accumulator(&receipt, source.take_prepared_accumulator())
             .unwrap();
         assert!(target.voxels.contains(&(40, 0, 0)));
-        // 私有重建已有两次有效反证；安装后的第三次必须直接删除，不能重新计票。
+        // Three repeated isolated rays still cannot prove the surrounding
+        // neighbourhood observed. PGO installation must not invent that proof.
         assert!(target.accumulate_mapping_scan(2, &background, origin, 4));
-        assert!(!target.voxels.contains(&(40, 0, 0)));
+        assert!(target.voxels.contains(&(40, 0, 0)));
         source.cleanup_product_owned_file().unwrap();
         target.cleanup_product_owned_file().unwrap();
+    }
+
+    #[test]
+    fn pgo_install_preserves_real_observed_neighbourhood_evidence(){
+        use crate::dynamic_scene::tests::{corridor,ORIGIN};
+        let mut source=CloudMapShmWriter::new_private_for_test().unwrap();
+        let mut target=CloudMapShmWriter::new_private_for_test().unwrap();
+        let (person,truth)=corridor(Some(0.),1.);
+        let p=person.iter().zip(&truth).find(|(p,h)|**h && crate::dynamic_scene::cell([p.x,p.y,p.z])==crate::dynamic_scene::cell([2.7,0.03,0.65])).unwrap().0;
+        let key=voxel_key([p.x,p.y,p.z],VOXEL_SIZE).unwrap();
+        assert!(source.accumulate_mapping_scan(1,&person,Some(ORIGIN),100_000_000));
+        for frame in 2..=5{assert!(source.accumulate_mapping_scan(1,&corridor(None,(frame%3) as f64).0,Some(ORIGIN),frame*100_000_000));}
+        assert!(source.voxels.contains(&key));
+        let receipt=OccupancyCommitReceipt{commit_id:crate::mapping_commit::MappingCommitId{boot_nonce:1,sequence:1},session_id:"pgo-observed".into(),session_generation:2,occupancy_revision:1,source_timestamp_ns:500_000_000,backend_kind:crate::mapping_backend::MappingBackendKind::Voxel,backend_generation:1};
+        target.install_prepared_accumulator(&receipt,source.take_prepared_accumulator()).unwrap();
+        assert!(target.accumulate_mapping_scan(2,&corridor(None,0.).0,Some(ORIGIN),600_000_000));
+        assert!(!target.voxels.contains(&key),"the already accumulated observed neighbourhood survives installation");
     }
 
     #[test]
@@ -2460,3 +2471,7 @@ mod legacy_fine_baseline_tests;
 #[cfg(test)]
 #[path = "activation_decode_diagnostic_tests.rs"]
 mod activation_decode_diagnostic_tests;
+
+#[cfg(test)]
+#[path = "completed_cleanup_tests.rs"]
+mod completed_cleanup_tests;

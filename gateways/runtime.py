@@ -2994,6 +2994,30 @@ class GatewayRuntime:
                 output_schema=_schema_object({"map_asset_bundle": {"type": "object"}, "active_workspace": {"type": "object"}}),
             ),
             _descriptor(
+                'preview_map_cleanup', '预览完成地图清理', "建图完成后自动识别浮空；确认后仅另存新图，原图保留。",
+                execution_mode=CapabilityExecutionMode.SYNC, risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object({'map_name': {'type': 'string'}, 'strength_percent': {'type': 'integer', 'minimum': 0, 'maximum': 100, 'default': 50}}, required=('map_name',)),
+                output_schema={"type": "object"},
+            ),
+            _descriptor(
+                'get_map_cleanup', '读取清理预览', "建图完成后自动识别浮空；确认后仅另存新图，原图保留。",
+                execution_mode=CapabilityExecutionMode.SYNC, risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object({'preview_id': {'type': 'string'}}, required=('preview_id',)),
+                output_schema={"type": "object"},
+            ),
+            _descriptor(
+                'cancel_map_cleanup', '取消清理预览', "建图完成后自动识别浮空；确认后仅另存新图，原图保留。",
+                execution_mode=CapabilityExecutionMode.SYNC, risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object({'preview_id': {'type': 'string'}}, required=('preview_id',)),
+                output_schema={"type": "object"},
+            ),
+            _descriptor(
+                'apply_map_cleanup', '另存清理后新图', "建图完成后自动识别浮空；确认后仅另存新图，原图保留。",
+                execution_mode=CapabilityExecutionMode.SYNC, risk_level=CapabilityRiskLevel.LOW,
+                input_schema=_schema_object({'preview_id': {'type': 'string'}, 'new_map_name': {'type': 'string'}, 'confirmed': {'type': 'boolean'}}, required=('preview_id', 'new_map_name', 'confirmed')),
+                output_schema={"type": "object"},
+            ),
+            _descriptor(
                 "start_mapping",
                 "启动遥控建图",
                 "遥控/手动建图专用：启动 nuwax-geometry-runtime mapping 会话，"
@@ -3768,6 +3792,10 @@ class GatewayRuntime:
             "delete_map": partial(localization_skills.handle_delete_map, self._skill_ctx),
             "get_active_map": partial(localization_skills.handle_get_active_map, self._skill_ctx),
             "finalize_active_map": partial(localization_skills.handle_finalize_active_map, self._skill_ctx),
+            "preview_map_cleanup": partial(localization_skills.handle_preview_map_cleanup, self._skill_ctx),
+            "get_map_cleanup": partial(localization_skills.handle_get_map_cleanup, self._skill_ctx),
+            "cancel_map_cleanup": partial(localization_skills.handle_cancel_map_cleanup, self._skill_ctx),
+            "apply_map_cleanup": partial(localization_skills.handle_apply_map_cleanup, self._skill_ctx),
             # 建图能力尚未下放到 skills，保留 runtime 方法派发。
             "start_mapping": self._handle_start_mapping,
             "stop_mapping": self._handle_stop_mapping,
@@ -13321,6 +13349,10 @@ class GatewayRuntime:
                 lambda: geometry_config_enabled,
                 "平台几何运行时已禁用。",
             ),
+            "preview_map_cleanup": (lambda: True, None),
+            "get_map_cleanup": (lambda: True, None),
+            "cancel_map_cleanup": (lambda: True, None),
+            "apply_map_cleanup": (lambda: True, None),
             "start_mapping": (
                 lambda: geometry_config_enabled,
                 "平台几何运行时已禁用。",

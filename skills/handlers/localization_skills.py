@@ -361,3 +361,17 @@ def handle_finalize_active_map(
             "地图 current 资产包已原子发布；后续 activate_map 会直接加载该资产包。"
         ),
     }
+
+
+def handle_preview_map_cleanup(ctx, payload, *, requested_by=None):
+    return ctx.map_workspace_service.completed_cleanup().start(**payload)
+
+def handle_get_map_cleanup(ctx, payload, *, requested_by=None):
+    return ctx.map_workspace_service.completed_cleanup().status(payload["preview_id"])
+
+def handle_cancel_map_cleanup(ctx, payload, *, requested_by=None):
+    return ctx.map_workspace_service.completed_cleanup().cancel(payload["preview_id"])
+
+def handle_apply_map_cleanup(ctx, payload, *, requested_by=None):
+    return ctx.map_workspace_service.completed_cleanup().apply(payload["preview_id"],
+        new_map_name=payload["new_map_name"], confirmed=payload.get("confirmed", False))

@@ -77,6 +77,7 @@ fn frame(sequence: u64, timestamp_ns: u64) -> MappingBackendInput {
         session_id: "ray-count-five-cm".into(), session_generation: 1, backend_generation: 1,
         frame_sequence: sequence, source_timestamp_ns: timestamp_ns, received_at_ns: timestamp_ns,
         registered_frame_id: "map".into(), sensor_origin_map: [0.025, 0.025, 0.0],
+        dynamic_frame: None,
         registered_points_map: points,
     }
 }

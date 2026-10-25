@@ -33,7 +33,7 @@ fn replay_fixture() -> (Vec<ArchivedScan>, Vec<OptimizedKeyframe>) {
         let source = AdmittedRegisteredScan::from_map_points_for_test(stamp, binding, &world);
         ArchivedScan {
             source_timestamp_ns: stamp, received_at_ns: stamp,
-            odom_from_body: pose, sensor_origin_body: Point3::origin(),
+            odom_from_body: pose, sensor_origin_body: Some(Point3::origin()),
             body_points: source.body_points().clone(), source: ArchivedSource::Lidar(source),
         }
     }).collect::<Vec<_>>();

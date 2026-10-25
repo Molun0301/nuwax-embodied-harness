@@ -1,0 +1,15 @@
+[package]
+name = "nuwax-cloud-cleanup"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ahash = "0.8.12"
+nalgebra = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+petgraph = "=0.7.1"
+nuwax-map-chunks = { path = "../nuwax-map-chunks" }
+sha2 = "0.10"

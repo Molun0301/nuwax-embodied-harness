@@ -57,7 +57,7 @@ pub(crate) struct ArchivedScan {
     pub source_timestamp_ns: u64,
     pub received_at_ns: u64,
     pub odom_from_body: Isometry3<f64>,
-    pub sensor_origin_body: Point3<f64>,
+    pub sensor_origin_body: Option<Point3<f64>>,
     pub body_points: crate::correction_points::CorrectionPoints,
     source: ArchivedSource,
 }
@@ -125,21 +125,22 @@ impl ScanHistory {
         let body_from_map =
             (binding.registration_map_from_odom * binding.frozen_odom_from_body).inverse();
         let sensor_origin = binding.sensor_origin_map.map(|p| body_from_map * Point3::from(p));
-        self.dynamic_scene.clear_frame();
-        if let Some(origin) = sensor_origin {
-            // 用未受回环跳变影响的里程计坐标积累运动证据；每个已接纳扫描都参与。
-            let odom_points = body_points.iter().map(|point| binding.frozen_odom_from_body * point).collect::<Vec<_>>();
-            let odom_origin = binding.frozen_odom_from_body * origin;
-            self.dynamic_scene.observe(&odom_points, odom_origin.coords.into(), source_timestamp_ns);
-        }
-        let static_indices = body_points.iter().enumerate().filter_map(|(index, point)| {
-            let p = binding.frozen_odom_from_body * point;
-            (!self.dynamic_scene.is_dynamic([p.x, p.y, p.z])).then_some(index as u32)
-        }).collect::<Vec<_>>();
+        let static_indices = if let Some(labels)=source.point_labels(){
+            labels.labels.iter().enumerate().filter_map(|(i,label)|(!label.dynamic() && *label != crate::human_point_labels::PointLabel::PendingTrack).then_some(i as u32)).collect::<Vec<_>>()
+        } else {
+            self.dynamic_scene.clear_frame();
+            if let Some(origin)=sensor_origin {
+                let odom_points=body_points.iter().map(|p|binding.frozen_odom_from_body*p).collect::<Vec<_>>();
+                let odom_origin=binding.frozen_odom_from_body*origin;
+                self.dynamic_scene.observe(&odom_points,odom_origin.coords.into(),source_timestamp_ns);
+            }
+            body_points.iter().enumerate().filter_map(|(i,p)|{let p=binding.frozen_odom_from_body*p;
+                (!self.dynamic_scene.is_dynamic([p.x,p.y,p.z])).then_some(i as u32)}).collect()
+        };
         self.latest_static_scan = Some((source_timestamp_ns, body_points.len(), source.downgrade(), static_indices.into()));
         self.archive(ArchivedScan {
             source_timestamp_ns, received_at_ns, odom_from_body: binding.frozen_odom_from_body,
-            sensor_origin_body: sensor_origin.unwrap_or_else(Point3::origin),
+            sensor_origin_body: sensor_origin,
             body_points: body_points.clone(), source: ArchivedSource::Lidar(source.clone()),
         })
     }
@@ -149,7 +150,7 @@ impl ScanHistory {
     ) -> Result<(), String> {
         self.archive(ArchivedScan {
             source_timestamp_ns: source.timestamp_ns(), received_at_ns: source.received_at_ns(),
-            odom_from_body: source.odom_from_body(), sensor_origin_body: source.origin_body(),
+            odom_from_body: source.odom_from_body(), sensor_origin_body: Some(source.origin_body()),
             body_points: source.body_points().clone(), source: ArchivedSource::Auxiliary(source),
         })
     }
@@ -207,6 +208,7 @@ impl ScanHistory {
 
 pub(crate) struct RebuiltMap {
     pub persistent: PersistentOccupancyGrid,
+    pub final_poses:Vec<(u64,[f64;16])>,
     pub cloud: CommittedCloudMapSnapshot,
     pub backend_checkpoint: Vec<u8>,
     pub accumulator: crate::pointcloud::PreparedCloudAccumulator,
@@ -237,6 +239,7 @@ pub(crate) struct ReplayBuilder {
     last_input: Option<Arc<MappingBackendInput>>,
     last_archive_key: Option<ArchiveKey>,
     processed: usize,
+    final_poses:Vec<(u64,[f64;16])>,
     started: Instant,
     budget: Duration,
     background: bool,
@@ -315,6 +318,7 @@ impl ReplayBuilder {
             last_input: None,
             last_archive_key: None,
             processed: 0,
+            final_poses:Vec::new(),
             started,
             budget,
             background: false,
@@ -418,7 +422,9 @@ impl ReplayBuilder {
                 .iter()
                 .map(|point| map_from_body * point)
                 .collect();
-            let origin = map_from_body * scan.sensor_origin_body;
+            let origin = map_from_body * scan.sensor_origin_body.ok_or("PGO原始扫描缺少实测雷达原点，保留当前地图，不补造射线")?;
+            let dynamic_frame=scan.source.lidar().and_then(|scan|scan.dynamic_frame())
+                .map(|frame|crate::dynamic_scene::MappedFrameDecision::new(frame,map_from_body*scan.odom_from_body.inverse(),&points,0)).transpose()?;
             let input = Arc::new(MappingBackendInput {
                 session_id: "pgo-private-rebuild".into(),
                 session_generation: 1,
@@ -428,6 +434,7 @@ impl ReplayBuilder {
                 received_at_ns: scan.received_at_ns,
                 registered_frame_id: self.frame_id.clone(),
                 sensor_origin_map: origin.coords.into(),
+                dynamic_frame,
                 registered_points_map: points,
             });
             let ground_source = scan.source.clone();
@@ -459,6 +466,7 @@ impl ReplayBuilder {
                 append_cloud_stage(self.cloud.as_mut().expect("本地点云已保留"), &input, capture_source)?;
                 self.cloud_time += phase.elapsed();
             }
+            self.final_poses.push((scan.source_timestamp_ns,map_from_body.to_homogeneous().as_slice().try_into().unwrap()));
             self.processed += 1;
             self.last_input = Some(input);
             self.last_archive_key = Some(scan.key());
@@ -606,6 +614,7 @@ impl ReplayBuilder {
             return Err("PGO点云线程尚未在后台回收".into());
         }
         let result = RebuiltMap {
+            final_poses:std::mem::take(&mut self.final_poses),
             persistent: prepared.persistent,
             cloud: prepared.cloud,
             backend_checkpoint: prepared.backend_checkpoint,
@@ -762,7 +771,7 @@ fn append_cloud_stage(
     if ground_source.is_some_and(|s| s.timestamp_ns() != input.source_timestamp_ns) { return Err("PGO ground/source timestamp mismatch".into()); }
     let accepted = match ground_source {
         Some(source) => cloud.accumulate_mapping_replayed_scan(1, &input.registered_points_map,
-            Some(input.sensor_origin_map), source),
+            Some(input.sensor_origin_map), source,input.dynamic_frame.as_ref()),
         None => cloud.accumulate_mapping_scan(1, &input.registered_points_map,
             Some(input.sensor_origin_map), input.source_timestamp_ns),
     };
@@ -854,6 +863,7 @@ mod tests {
                 session_id:"planar-replay".into(),session_generation:1,backend_generation:1,
                 frame_sequence:1,source_timestamp_ns:1_000_000_000,received_at_ns:1_000_000_000,
                 registered_frame_id:"map".into(),sensor_origin_map:[0.025,0.025,0.0],
+                dynamic_frame: None,
                 registered_points_map:vec![Point3::new(2.025,0.025,0.0)],
             };
             append_kernel_stage(&mut kernel,&mut persistent,&input,config).unwrap();
@@ -887,6 +897,17 @@ mod tests {
             sensor_origin_map: Some([0.0; 3]),
             frame_capture_relocalization_epoch: None,
         }
+    }
+
+    #[test]
+    fn missing_origin_is_preserved_in_original_archive(){
+        let mut binding=test_binding();binding.sensor_origin_map=None;
+        let points=[Point3::new(1.,2.,3.)];
+        let source=AdmittedRegisteredScan::from_map_points_for_test(1,binding,&points);
+        let mut history=ScanHistory::default();history.record(&source,1).unwrap();
+        let snapshot=history.snapshot().unwrap();
+        assert!(snapshot[0].sensor_origin_body.is_none());
+        assert_eq!(snapshot[0].body_points.as_ref(),&points);
     }
 
     #[test]
@@ -1020,6 +1041,7 @@ mod tests {
                     received_at_ns: sequence,
                     registered_frame_id: "map".into(),
                     sensor_origin_map: [0.0; 3],
+                    dynamic_frame: None,
                     registered_points_map: vec![Point3::new(sequence as f64, 0.0, 0.0)],
                 }), None)
                 .unwrap();
@@ -1053,7 +1075,7 @@ mod tests {
                     source_timestamp_ns,
                     received_at_ns: 1 + i * 150_000_000,
                     odom_from_body: pose,
-                    sensor_origin_body: Point3::origin(),
+                    sensor_origin_body: Some(Point3::origin()),
                     body_points: source.body_points().clone(),
                     source: ArchivedSource::Lidar(source),
                 }

@@ -2287,6 +2287,7 @@ impl MappingAdapter {
             received_at_ns,
             registered_frame_id: self.map_frame_id.clone(),
             sensor_origin_map: self.last_sensor_origin,
+            dynamic_frame: None,
             registered_points_map: self.take_latest_accepted_map_points(),
         };
         self.in_flight_compute = Some(token.clone());

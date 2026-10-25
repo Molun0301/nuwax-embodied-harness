@@ -5213,6 +5213,10 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
                 context.mapping.lock().commit_pgo_install(prepared)?;
                 shared.map = next_map;
                 shared.cloud_map_revision = output_cloud_revision;
+                let scan_root=std::env::var_os("NUWAX_RAW_SCAN_DIRECTORY").map(std::path::PathBuf::from).unwrap_or_else(||std::path::PathBuf::from("runtime_data/scan_logs"));
+                nuwax_cloud_cleanup::scan_log::save_final_poses(&scan_root,&nuwax_cloud_cleanup::scan_log::FinalPoses{
+                    session:nuwax_cloud_cleanup::scan_log::Session{session_id:transaction.mapping_session_id.clone(),generation:transaction.mapping_session_generation},
+                    cloud_revision:output_cloud_revision,poses:map.final_poses})?;
                 Ok(())
             })();
             if let Err(error) = result {
@@ -9448,6 +9452,12 @@ async fn ingest_mapping_points_with_backend_owned(
     // 建图射线与三维清理必须使用该扫描冻结的真实传感器原点，不能读取更晚的机体位置。
     if let Some(origin) = sensor_origin_map {
         prepared.input.sensor_origin_map = origin;
+    }
+    if let Some(source)=accepted_cloud.as_ref().and_then(|s|s.lidar()) {
+        if let Some(writer)=cloud_map_writer.lock().as_mut(){
+            prepared.input.dynamic_frame=Some(writer.classify_admitted_scan(source).map_err(|reason|nuwax_mapping::SessionError::FrameTransformUnavailable{
+                source_frame_id:frame_id.into(),target_frame_id:frame_id.into(),reason})?);
+        }
     }
     let token = prepared.token.clone();
     let completion_rx = match prepared.worker.submit(prepared.token, prepared.input) {

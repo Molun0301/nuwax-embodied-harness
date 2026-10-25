@@ -283,6 +283,7 @@ struct AdmittedRegisteredScanData {
     source_point_count: i64,
     binding: RegistrationBinding,
     body_points: crate::correction_points::CorrectionPoints,
+    labels: OnceLock<Arc<crate::dynamic_scene::FrameDecision>>,
 }
 
 impl AdmittedRegisteredScan {
@@ -291,10 +292,17 @@ impl AdmittedRegisteredScan {
         let body_from_map = (binding.registration_map_from_odom * binding.frozen_odom_from_body).inverse();
         let body_points = map_points.iter().map(|point| body_from_map.transform_point(point)).collect::<Vec<_>>();
         Self(Arc::new(AdmittedRegisteredScanData {
-            source, frames, source_point_count, binding, body_points: body_points.into(),
+            source, frames, source_point_count, binding, body_points: body_points.into(), labels: OnceLock::new(),
         }))
     }
 
+    pub(crate) fn record_decision(&self,frame:Arc<crate::dynamic_scene::FrameDecision>)->Result<(),String>{
+        if frame.labels.source_timestamp_ns!=self.source_timestamp_ns()||frame.labels.labels.len()!=self.body_points().len(){return Err("人体点标签与原扫描来源不一致".into());}
+        if let Some(old)=self.0.labels.get(){return if old.labels==frame.labels{Ok(())}else{Err("同一原扫描标签冲突".into())};}
+        self.0.labels.set(frame).map_err(|_|"原扫描标签已写入".into())
+    }
+    pub(crate) fn dynamic_frame(&self)->Option<Arc<crate::dynamic_scene::FrameDecision>>{self.0.labels.get().cloned()}
+    pub(crate) fn point_labels(&self)->Option<&crate::human_point_labels::FrameLabels>{self.0.labels.get().map(|v|&v.labels)}
     pub(crate) fn source_identity(&self) -> SourceIdentity { self.0.source }
 
     pub(crate) fn downgrade(&self) -> WeakAdmittedRegisteredScan {
@@ -393,6 +401,7 @@ mod registered_scan_ownership_tests {
 
     fn owner(points: Vec<Point3<f64>>) -> AdmittedRegisteredScan {
         AdmittedRegisteredScan(Arc::new(AdmittedRegisteredScanData {
+            labels: OnceLock::new(),
             source: SourceIdentity { backend: LIO_BACKEND_DEVICE, runtime_generation: 7,
                 source_sequence: 3, source_timestamp_ns: 10 },
             frames: ["sensor".into(), "body".into(), "odom".into(), "map".into()],
@@ -402,6 +411,7 @@ mod registered_scan_ownership_tests {
 
     fn edited(source: &AdmittedRegisteredScan, edit: impl FnOnce(&mut AdmittedRegisteredScanData)) -> AdmittedRegisteredScan {
         let mut data = AdmittedRegisteredScanData {
+            labels: OnceLock::new(),
             source: source.0.source, frames: source.0.frames.clone(), source_point_count: source.0.source_point_count,
             binding: source.0.binding.clone(), body_points: source.0.body_points.clone(),
         };
@@ -8146,7 +8156,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dynamic_cloud_both_native_backends_clear_and_publish_registered_scans() {
+    async fn native_backends_preserve_unknown_neighbourhood_and_publish_scans() {
         for (backend_id, with_correction) in [LIO_BACKEND_FASTLIO2, LIO_BACKEND_POINTLIO]
             .into_iter()
             .flat_map(|id| [(id, false), (id, true)])
@@ -8324,12 +8334,12 @@ mod tests {
                 });
                 assert_eq!(
                     contains_person,
-                    sequence < 4,
-                    "后端={backend_id} 扫描={sequence}"
+                    true,
+                    "后端={backend_id} 扫描={sequence}：孤立射线不能补造已观测邻域"
                 );
                 assert_eq!(
                     snapshot.point_count,
-                    if sequence == 2 || sequence == 3 { 5 } else { 4 }
+                    if sequence == 1 { 4 } else { 5 }
                 );
                 let heights: Vec<_> = snapshot.xyz_f32_le.chunks_exact(12)
                     .map(|p| f32::from_le_bytes(p[8..12].try_into().unwrap())).collect();

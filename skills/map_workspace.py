@@ -160,6 +160,12 @@ class MapWorkspaceService:
                 )
         self._relocalization_startup_recovery = startup_recovery
 
+    def completed_cleanup(self):
+        from services.mapping.completed_cleanup import CompletedMapCleanup
+        if not hasattr(self, "_completed_cleanup"):
+            self._completed_cleanup = CompletedMapCleanup(self)
+        return self._completed_cleanup
+
     def submit_mapping_cloud_goal(
         self,
         *,

@@ -215,6 +215,7 @@ impl GeometryOfflineReplayOwner {
             received_at_ns: timestamp,
             registered_frame_id: validated.map_frame_id().to_owned(),
             sensor_origin_map: origin,
+            dynamic_frame: None,
             registered_points_map: points,
         };
         let receiver = match self

@@ -45,6 +45,7 @@
 <button id="semanticRegionPanelToggle" class="tool map-action-button" type="button" aria-label="区域" title="区域" aria-expanded="false" aria-controls="semanticRegionPanel"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/></svg><span>区域</span><span id="semanticRegionCount" class="map-action-count">—</span></button>
 <button id="sceneGraphToggle" class="tool map-action-button" type="button" aria-label="关系图" title="关系图" aria-expanded="false" aria-controls="sceneGraphPanel"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="8" r="3"/><circle cx="10" cy="19" r="3"/><path d="m9 6 6 1M7 9l2 7m7-5-4 5"/></svg><span>关系图</span></button>
 <button id="semanticMemoryToggle" class="tool map-action-button" type="button" aria-label="物品" title="物品" aria-expanded="false" aria-controls="semanticMemoryPanel"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 4v10l-8 4-8-4V7l8-4Zm0 9v9M4 7l8 5 8-5m-12-7 8 5"/></svg><span>物品</span><span id="semanticMemoryCount" class="map-action-count">—</span></button>
+<button id="mapCleanupToggle" class="tool map-action-button" type="button" aria-label="清理已完成地图" aria-controls="mapCleanupPanel" aria-expanded="false"><span>清理</span></button>
 <span class="map-actions-divider"></span>
 <button id="mapNavToggle" class="tool map-action-button" type="button" aria-label="导航" title="导航" aria-expanded="false" aria-controls="navigation-container"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 11 16-7-7 16-2-7-7-2Z"/></svg><span>导航</span></button>
 <button id="mapBoundaryToggle" class="tool map-action-button" type="button" aria-label="禁行区" title="禁行区" aria-expanded="false" aria-controls="boundary-draw-container"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="4"/><path d="m6 18 12-12"/></svg><span>禁行区</span></button></nav>
@@ -65,6 +66,22 @@
             <div class="canvas-wrap">
               <!-- 二级栏：紧贴工具栏、以磨砂浮层覆盖在地图顶部横向展开当前工具；不改变画布尺寸。同一时间只显示一个工具。 -->
               <div id="mapSubbar" class="map-subbar" aria-label="当前地图工具">
+                <section id="mapCleanupPanel" class="map-drawer map-subpanel" aria-label="清理已完成地图" hidden>
+                  <div class="msb-body">
+                    <div class="msb-row">
+                      <label class="msb-field">已完成地图<select id="mapCleanupSource" class="msb-input"></select></label>
+                      <label class="msb-field">清理力度 <output id="mapCleanupPercent">50%</output><input id="mapCleanupStrength" type="range" min="0" max="100" step="1" value="50" aria-label="清理力度：0% 保守，100% 激进"></label>
+                      <span class="msb-note">0% 保守 · 100% 激进，不是删除全图的比例</span>
+                      <button id="mapCleanupPreview" class="msb-btn primary" type="button">计算预览</button>
+                      <button id="mapCleanupCancel" class="msb-btn" type="button" disabled>取消预览</button>
+                    </div>
+                    <p id="mapCleanupStatus" class="msb-status" role="status">建图完成并停止后，自动识别缺乏支撑的点云；原图保留。</p>
+                    <canvas id="mapCleanupCanvas" width="640" height="240" style="width:100%;max-height:240px;touch-action:none;border-radius:8px" aria-label="实际保存地图与红色候选点云的三维预览" hidden></canvas>
+                    <p id="mapCleanupDetails" class="msb-note"></p>
+                    <div class="msb-row"><label class="msb-field">新地图名称<input id="mapCleanupNewName" class="msb-input" placeholder="原图名称-clean"></label><button id="mapCleanupApply" class="msb-btn primary" type="button" disabled>确认并另存新图</button><span class="msb-note">不覆盖原图，不自动切换当前地图</span></div>
+                  </div>
+                  <button class="msb-close" type="button" data-map-panel-close="mapCleanupPanel" aria-label="收起地图清理">×</button>
+                </section>
                 <section id="mapLayersPanel" class="map-drawer map-subpanel" aria-label="地图图层" hidden>
                   <div class="msb-body">
                     <div class="msb-row">
@@ -487,6 +504,7 @@
   <script src="/static/js/console-updates.js?v=20261001"></script>
   <script src="/static/js/console-settings.js?v=20261019-reload"></script>
   <script src="/static/js/map-workspace.js?v=20260923-map-subbar-overlay"></script>
+  <script src="/static/js/map-cleanup.js?v=20261025"></script>
   <script src="/static/js/console.js?v=20261019-redesign3"></script>
   <script src="/static/js/semantic-map.js?v=20261018-count-empty"></script>
   <script src="/static/js/scene-graph.js?v=20260924-semantic-asset-binding"></script>

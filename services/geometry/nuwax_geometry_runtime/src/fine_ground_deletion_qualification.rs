@@ -146,7 +146,7 @@ fn replay_native_ground(check: ReplayCheck) {
         let points: Vec<_> = frame.points.iter().copied().map(Point3::from).collect();
         let before = target_state(&mut fine, target);
         // 原生产顺序：动态射线删除 -> 写入当前占据 -> 同帧地面捕获。
-        fine.accumulate_inner(&points, Some(origin), frame.timestamp_ns).unwrap();
+        fine.accumulate_inner(&points, Some(origin), frame.timestamp_ns,None).unwrap();
         let mut removed: Vec<Key> = fine.removed_keys().iter().map(|key| [key.0, key.1, key.2]).collect();
         removed.sort_unstable();
         let after_accumulate = target_state(&mut fine, target);

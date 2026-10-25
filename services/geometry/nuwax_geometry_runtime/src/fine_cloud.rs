@@ -16,7 +16,7 @@ mod heightfield_capture;
 #[derive(Clone, Copy)]
 pub(super) enum FrameSource<'a> {
     Canonical(&'a crate::admitted_cloud::AcceptedMappingCloud),
-    Corrected(&'a crate::admitted_cloud::AdmittedCloudSource),
+    Corrected(&'a crate::admitted_cloud::AdmittedCloudSource, Option<&'a crate::dynamic_scene::MappedFrameDecision>),
 }
 
 pub(super) struct FineCloud {
@@ -46,9 +46,9 @@ impl FineCloud {
             dynamic: DynamicCloudFilter::default(), failure: None, readers: FineCloudReaders::default(), commits: 0, baseline: None, latest_unclassified_scan: None, latest_ground_source: None, latest_ground_indices: Arc::from([]) })
     }
     pub(super) fn fresh() -> Result<Self, String> { Self::new(VOXEL_SIZE) }
-    #[cfg(test)]
-    pub(super) fn use_legacy_filter(&mut self) { self.dynamic.legacy_only = true; }
     pub(super) fn removed_keys(&self) -> &[(i32, i32, i32)] { self.dynamic.removed_keys() }
+    pub(super) fn clears(&self, point:[f64;3])->bool {self.dynamic.clears(point)}
+    pub(super) fn labels(&self)->&crate::human_point_labels::FrameLabels {self.dynamic.labels()}
     pub(super) fn voxel_size(&self) -> f32 { self.writer.voxel_size_m() }
     pub(super) fn is_dynamic(&self, point: &Point3<f64>) -> bool {
         self.dynamic.is_dynamic([point.x, point.y, point.z])
@@ -74,9 +74,9 @@ impl FineCloud {
             let actual = if let Some(input) = input {
                 let source = match input {
                     FrameSource::Canonical(value) => value.source(),
-                    FrameSource::Corrected(value) => value.clone(),
+                    FrameSource::Corrected(value,_) => value.clone(),
                 };
-                if matches!(input, FrameSource::Corrected(_))
+                if matches!(input, FrameSource::Corrected(_,_))
                     && (timestamp_ns == 0 || points.len() != source.body_points().len()) {
                     return Err("invalid archived ground source".into());
                 }
@@ -94,14 +94,20 @@ impl FineCloud {
                                 &value.map_points()[first..]
                             } else { points }
                         },
-                        FrameSource::Corrected(_) => {
+                        FrameSource::Corrected(_,_) => {
                             capture = Some((source, namespace, sequence, 0));
                             points
                         },
                     }
                 } else { points }
             } else { points };
-            let keys = self.accumulate_inner(actual, origin, timestamp_ns)?;
+            let shared=match input {
+                Some(FrameSource::Canonical(value))=>value.lidar().and_then(|value|value.scan().dynamic_frame().map(|f|(f,value.scan().binding().registration_map_from_odom,value.map_points().len()-actual.len()))),
+                // Corrected replay uses stored labels, not a new online classification.
+                Some(FrameSource::Corrected(_,frame))=>frame.map(|f|(f.decision.clone(),f.map_from_odom(),0)),
+                None=>None,
+            }.map(|(frame,transform,first)|crate::dynamic_scene::MappedFrameDecision::new(frame,transform,actual,first)).transpose()?;
+            let keys = self.accumulate_inner(actual, origin, timestamp_ns,shared)?;
             if let Some((source, namespace, sequence, first)) = capture {
                 let returns: Vec<_> = actual.iter().zip(keys).enumerate().filter_map(|(index, (point, key))| {
                     let original_index = source.original_index(first + index)?;
@@ -125,12 +131,12 @@ impl FineCloud {
         else if result == Ok(true) {
             self.latest_unclassified_scan = input.and_then(|input| match input {
                 FrameSource::Canonical(value) => value.lidar().map(|value| value.scan().clone()),
-                FrameSource::Corrected(_) => None,
+                FrameSource::Corrected(_,_) => None,
             });
         }
         result
     }
-    fn accumulate_inner(&mut self, points: &[Point3<f64>], origin: Option<[f64; 3]>, timestamp_ns: u64) -> Result<Vec<nuwax_map_chunks::Key>, String> {
+    fn accumulate_inner(&mut self, points: &[Point3<f64>], origin: Option<[f64; 3]>, timestamp_ns: u64,shared:Option<crate::dynamic_scene::MappedFrameDecision>) -> Result<Vec<nuwax_map_chunks::Key>, String> {
         self.dynamic.clear_frame();
         let size = self.writer.voxel_size_m();
         let keys = points.iter().map(|p| voxel_key([p.x, p.y, p.z], size)
@@ -141,16 +147,47 @@ impl FineCloud {
             let low = voxel_key(origin.map(|v| v - 30.0 - f64::from(size)), size).ok_or("精细动态窗口越界")?;
             let high = voxel_key(origin.map(|v| v + 30.0 + f64::from(size)), size).ok_or("精细动态窗口越界")?;
             let local = self.writer.region([low.0, low.1, low.2], [high.0, high.1, high.2], 2_000_000)?;
+            let ground=self.measured_ground_indices(points)?;
             let mut voxels: VoxelIndex = local.into_iter().map(|(key, _)| (key[0], key[1], key[2])).collect();
-            self.dynamic.clear_observed_free_space_with_hits(&mut voxels, size, origin, timestamp_ns, points, &hits);
+            if let Some(shared)=shared {self.dynamic.adopt(shared,&mut voxels,size);}
+            else {self.dynamic.observe_with_ground(&mut voxels,size,origin,timestamp_ns,points,&ground);}
             self.writer.remove(self.dynamic.removed_keys().iter().map(|key| [key.0, key.1, key.2]))?;
         }
         if timestamp_ns == 0 {
             self.writer.seed_unknown(hits.into_iter().map(|key| [key.0, key.1, key.2]))?;
         } else {
-            self.writer.observe(hits.into_iter().map(|key| [key.0, key.1, key.2]), timestamp_ns)?;
+            let retained:AHashSet<_>=points.iter().zip(&keys).filter_map(|(p,&k)|(!self.dynamic.is_dynamic([p.x,p.y,p.z])).then_some(k)).collect();
+            self.writer.observe(retained, timestamp_ns)?;
         }
         Ok(keys)
+    }
+    pub(super) fn measured_ground_indices(&mut self,points:&[Point3<f64>])->Result<Vec<u32>,String>{
+        Ok(self.measured_ground(points)?.0)
+    }
+    pub(super) fn measured_ground(&mut self,points:&[Point3<f64>])->Result<(Vec<u32>,Vec<u32>),String>{
+        let size=self.writer.voxel_size_m();
+        let keys=points.iter().map(|p|voxel_key([p.x,p.y,p.z],size).ok_or("地面查询坐标无效")).collect::<Result<Vec<_>,_>>()?;
+        let old=self.writer.ground_columns(keys.iter().map(|k|[k.0,k.1]))?;
+        let mut samples=Vec::new(); let mut seen=AHashSet::new();
+        for column in old.values(){
+            for p in column.heightfields.iter().flat_map(|v|&v.samples).map(|v|v.point)
+                .chain(column.legacy.iter().filter(|(_,v)|v.normal[2]>=0.85).flat_map(|(_,v)|&v.samples).map(|v|v.point)){
+                if seen.insert(p.map(f64::to_bits)){samples.push(p);}
+            }
+        }
+        let mut qualified: ahash::AHashMap<[i32;2],Vec<f64>>=Default::default();
+        for i in crate::offline_residual_cleanup::local_ground_indices(&samples){
+            let p=samples[i];let k=voxel_key(p,size).unwrap();
+            qualified.entry([k.0,k.1]).or_default().push(p[2]);
+        }
+        let mut ground=Vec::new();let mut known=Vec::new();
+        for (i,(p,k)) in points.iter().zip(&keys).enumerate(){
+            if let Some(heights)=qualified.get(&[k.0,k.1]){
+                known.push(i as u32);
+                if heights.iter().any(|h|(p.z-h).abs()<=0.03){ground.push(i as u32);}
+            }
+        }
+        Ok((ground,known))
     }
     pub(super) fn publication_floor(&self, domain: &nuwax_map_chunks::Domain) -> u64 {
         self.baseline.as_ref().filter(|root| &root.domain == domain).map_or(0, |root| root.revision)
@@ -384,7 +421,7 @@ mod unclassified_scan_tests {
         let corrected = scan.body_points().iter().map(|point| transform * point).collect::<Vec<_>>();
         let original: AdmittedCloudSource = scan.clone().into();
         let mut fine = FineCloud::fresh().unwrap();
-        assert!(fine.accumulate_frame(&corrected, None, 10, Some(FrameSource::Corrected(&original))).unwrap());
+        assert!(fine.accumulate_frame(&corrected, None, 10, Some(FrameSource::Corrected(&original,None))).unwrap());
         let observed = records(&mut fine);
         assert!(samples(&observed).next().is_some());
         assert!(observed.values().all(|column| column.legacy.is_empty()));
@@ -400,7 +437,7 @@ mod unclassified_scan_tests {
                 assert_eq!(sample.point, expected);
             }
         }
-        assert!(!fine.accumulate_frame(&corrected, None, 10, Some(FrameSource::Corrected(&original))).unwrap());
+        assert!(!fine.accumulate_frame(&corrected, None, 10, Some(FrameSource::Corrected(&original,None))).unwrap());
         assert_eq!(records(&mut fine), observed);
     }
 
@@ -497,7 +534,7 @@ mod unclassified_scan_tests {
         let mut rebuilt = FineCloud::fresh().unwrap();
         assert_eq!(rebuilt.writer.source_watermark(&original.layer_source()), None,
             "a fresh PGO Writer must not inherit the previous accumulator's watermark");
-        assert!(rebuilt.accumulate_frame(&corrected, None, 10, Some(FrameSource::Corrected(&original))).unwrap());
+        assert!(rebuilt.accumulate_frame(&corrected, None, 10, Some(FrameSource::Corrected(&original,None))).unwrap());
         let before = snapshot(&mut rebuilt);
         let expected = point_keys(&corrected, rebuilt.voxel_size());
         assert!(expected.is_disjoint(&point_keys(admitted.map_points(), rebuilt.voxel_size())));
@@ -515,7 +552,7 @@ mod unclassified_scan_tests {
         assert!(rebuilt.latest_unclassified_scan().is_none(), "corrected rebuild must not publish a canonical recent raw scan");
         assert!(rebuilt.latest_ground_indices(original.lidar().unwrap()).is_none(), "corrected rebuild must not publish live recent indices");
         let sealed = rebuilt.seal(domain(), 1, 10).unwrap();
-        assert!(!rebuilt.accumulate_frame(&corrected, None, 10, Some(FrameSource::Corrected(&original))).unwrap());
+        assert!(!rebuilt.accumulate_frame(&corrected, None, 10, Some(FrameSource::Corrected(&original,None))).unwrap());
         assert_eq!(snapshot(&mut rebuilt), before);
         assert!(!rebuilt.writer.has_unpublished_changes());
         let after = rebuilt.seal(domain(), 2, 10).unwrap();
@@ -676,7 +713,7 @@ mod auxiliary_source_tests {
         let pose = Isometry3::translation(0.2, 0.0, 0.1);
         let corrected: Vec<_> = admitted.body_points().iter().map(|point| pose * point).collect();
         let mut fine = FineCloud::fresh().unwrap();
-        assert!(fine.accumulate_frame(&corrected, None, 10, Some(FrameSource::Corrected(&admitted))).unwrap());
+        assert!(fine.accumulate_frame(&corrected, None, 10, Some(FrameSource::Corrected(&admitted,None))).unwrap());
         let before = snapshot(&mut fine);
         assert!(samples(&before.1).next().is_some());
         for sample in samples(&before.1) {
@@ -692,7 +729,7 @@ mod auxiliary_source_tests {
         assert_eq!(admitted.body_points().as_ptr(), body_allocation);
         assert_eq!(&**admitted.body_points(), original_body.as_slice());
         assert!(fine.latest_unclassified_scan().is_none());
-        assert!(!fine.accumulate_frame(&corrected, None, 10, Some(FrameSource::Corrected(&admitted))).unwrap());
+        assert!(!fine.accumulate_frame(&corrected, None, 10, Some(FrameSource::Corrected(&admitted,None))).unwrap());
         assert_eq!(snapshot(&mut fine), before);
     }
 

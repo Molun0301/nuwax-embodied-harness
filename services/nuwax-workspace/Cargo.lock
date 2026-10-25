@@ -1556,6 +1556,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuwax-cloud-cleanup"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "nalgebra 0.33.3",
+ "nuwax-map-chunks",
+ "petgraph",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nuwax-codec"
 version = "0.1.0"
 dependencies = [

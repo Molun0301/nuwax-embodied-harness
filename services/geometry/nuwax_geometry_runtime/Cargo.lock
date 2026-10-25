@@ -1540,6 +1540,7 @@ dependencies = [
  "nuwax-tf",
  "nuwax-transport",
  "parking_lot",
+ "petgraph",
  "prost",
  "prost-types",
  "serde",

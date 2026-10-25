@@ -30,3 +30,7 @@ pub use offline_replay_owner::{
     OfflineCanonicalOccupancyReceiptV1, OfflineGeometrySnapshotV3,
     OfflineReplayProcessingReceiptV1, ReplayBarrierIdentityV1,
 };
+
+pub use nuwax_cloud_cleanup::offline_residual_cleanup;
+
+pub use nuwax_cloud_cleanup::human_point_labels;

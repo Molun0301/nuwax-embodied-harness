@@ -18,6 +18,7 @@ members = [
     # 建图、点云与激光惯性里程计
     "crates/nuwax-mapping",
     "crates/nuwax-map-chunks",
+    "crates/nuwax-cloud-cleanup",
     "crates/nuwax-gtsam",
     "crates/nuwax-mapping-cloud",
     "crates/nuwax-mapping-cli",

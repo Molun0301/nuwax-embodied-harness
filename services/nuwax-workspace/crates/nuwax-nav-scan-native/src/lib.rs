@@ -819,6 +819,35 @@ mod tests {
     }
 
     #[test]
+    fn author_zero_step_band_excludes_support_voxel_and_keeps_obstacle_above_it() {
+        // 未声明上下阶能力时阶高为零。实测地面位于0.1米格内0.02米处，格顶高出真实支撑0.08米；
+        // 这一格是支撑面本身，不能使整片地面成为机身障碍。高出支撑格的实体仍须阻挡。
+        let route = [[0.0, 0.0, 0.37], [3.0, 0.0, 0.37]];
+        let ground: Vec<_> = (-20..50)
+            .flat_map(|x| (-60..=60).map(move |y| [(x as f64 + 0.5) * 0.1, (y as f64 + 0.5) * 0.1, 0.02]))
+            .collect();
+        let mut req = request(&route, &[]);
+        req.start_position = route[0];
+        req.ground = &ground;
+        req.config.max_step_up = 0.0;
+        req.config.max_step_down = 0.0;
+        let (arrived, _) = drive(&mut fixture_planner(), &mut req, [3.0, 0.0])
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(arrived.is_some(), "平地支撑格被当成障碍，最终位置 {:?}", req.start_position);
+
+        // 横贯局部地图的矮坎落在支撑格上方一格，零越阶能力不能跨越。
+        let curb: Vec<_> = (-60..=60).map(|y| [1.55, (y as f64 + 0.5) * 0.1, 0.15]).collect();
+        let mut req = request(&route, &curb);
+        req.start_position = route[0];
+        req.ground = &ground;
+        req.config.max_step_up = 0.0;
+        req.config.max_step_down = 0.0;
+        let outcome = drive(&mut fixture_planner(), &mut req, [3.0, 0.0]);
+        assert!(!matches!(outcome, Ok((Some(_), _))), "零越阶机体越过了支撑格上方的矮坎");
+        assert!(req.start_position[0] + 0.35 < 1.5, "机身应停在矮坎前：{:?}", req.start_position);
+    }
+
+    #[test]
     fn author_terminal_yaw_honors_explicit_business_masks() {
         let mut req=request(&[],&[]);req.goal_yaw=Some(0.5);
         let free=fixture_planner().step(&req).unwrap();

@@ -1338,6 +1338,21 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
         format!("{runtime_dir}/geometry/nuwax_geometry_runtime.ready")
     });
 
+    // 精细点云写入器缓存预算：非法值启动即退出，错误写明变量名与合法范围。
+    let env_text = |name: &str| match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} 不是有效的 UTF-8 文本")),
+    };
+    let fine_cloud_cache = env_text(pointcloud::FINE_CLOUD_CACHE_MIB_VAR)
+        .and_then(|mode| Ok((mode, env_text(pointcloud::FINE_CLOUD_CACHE_AUTO_MAX_VAR)?)))
+        .and_then(|(mode, auto_max)| pointcloud::parse_fine_cloud_cache(mode.as_deref(), auto_max.as_deref()))
+        .and_then(pointcloud::configure_fine_cloud_cache);
+    if let Err(e) = fine_cloud_cache {
+        error!("精细点云写入器缓存配置无效: {e}");
+        return ExitCode::from(2);
+    }
+
     if let Err(e) = remove_ready_file(&ready_path) {
         error!("清理旧 ready file 失败: {:?}", e);
         return ExitCode::from(5);
@@ -4032,15 +4047,31 @@ root.chmod(0o755)
             .status()
             .expect("prepare fake release manifest");
         assert!(release_status.success(), "prepare fake release failed");
-        let launcher_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(std::path::Path::parent)
             .and_then(std::path::Path::parent)
-            .expect("repository root")
-            .join("scripts/systemd/start_geometry_runtime.sh");
+            .expect("repository root");
+        let launcher_path = repository_root.join("scripts/systemd/start_geometry_runtime.sh");
+        // 启动器用 NUWAX_PYTHON_BIN 解析机体外形，生产由安装器写入项目 Python。
+        // 测试显式给出仓库 Python，并把各配置文件指向空文件，不读开发者本机设置。
+        let project_python = repository_root.join(".venv_model_download/bin/python");
+        assert!(
+            project_python.is_file(),
+            "launcher test requires the project Python environment: {}",
+            project_python.display()
+        );
+        let empty_config = guard.test_dir.join("empty.env");
+        std::fs::write(&empty_config, b"").expect("empty launcher config");
         guard.launcher = Some(
             std::process::Command::new("bash")
                 .arg(launcher_path)
+                .env("NUWAX_PYTHON_BIN", &project_python)
+                .env("NUWAX_BOOTSTRAP_ENV_FILE", &empty_config)
+                .env("NUWAX_USER_CONFIG_ENV_FILE", &empty_config)
+                .env("NUWAX_GEOMETRY_WEB_CONFIG_ENV_FILE", &empty_config)
+                .env("NUWAX_GATEWAY_WEB_CONFIG_ENV_FILE", &empty_config)
+                .env("NUWAX_GEOMETRY_EXTRA_ENV_FILES", "")
                 .env("NUWAX_GEOMETRY_RUNTIME_BINARY", &binary)
                 .env("BASH_ENV", &binary)
                 .env("NUWAX_GEOMETRY_RELEASE_MANIFEST", &release_manifest)

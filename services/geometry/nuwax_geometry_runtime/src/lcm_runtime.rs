@@ -2281,12 +2281,15 @@ impl ProductionTopologyStartupFailureFixture {
     }
 }
 
+/// 生产拓扑按注册顺序列出的常驻任务槽。测试夹具使用生产默认的三维导航配置，
+/// 因此包含只在该配置下注册的 `canonical-navigation-map-revisions`。
 #[cfg(test)]
-const PRODUCTION_TOPOLOGY_PERSISTENT_SLOTS: [&str; 11] = [
+const PRODUCTION_TOPOLOGY_PERSISTENT_SLOTS: [&str; 12] = [
     "navigation-state-consumer",
     "path-envelope-consumer",
     "public-tf-observer",
     "legacy-global-map-demand",
+    "canonical-navigation-map-revisions",
     "cancel-timeout-maintenance",
     "frontier-fanout",
     "exploration-scheduler",
@@ -2653,6 +2656,35 @@ async fn start_topology_exploration_goal(
             &committed_map.frame_id,
             1,
         )));
+    // 生产默认 lio_3d 执行链只开放三维表面探索，且必须有机体到支撑面的实测标定；
+    // 夹具进程未提供标定，这里按已标定机器人显式装入探索拥有方，不读写进程环境。
+    let calibrated_surface = nuwax_nav_stack::surface_config::SurfaceNavigationConfig::new(
+        "map".into(),
+        0.4,
+        0.3,
+        0.6,
+        0.1,
+        0.15,
+        18.0,
+        0.2,
+    )
+    .map_err(|error| error.to_string());
+    let commit_boot_nonce = handle
+        .mapping_adapter
+        .as_ref()
+        .expect("production topology Mapping")
+        .lock()
+        .mapping_commit_boot_nonce()
+        .to_be_bytes();
+    handle
+        .explore
+        .configure_surface_source(
+            calibrated_surface,
+            handle.nav.producer_runtime_generation(),
+            commit_boot_nonce,
+        )
+        .await
+        .expect("production topology calibrated surface exploration");
     let mut grid = OccupancyGrid2D {
         resolution: 0.5,
         origin: Point2 { x: 0.0, y: 0.0 },
@@ -2676,13 +2708,15 @@ async fn start_topology_exploration_goal(
         )
         .await
         .expect("production topology committed costmap");
+    let started = handle
+        .explore
+        .start("production-topology-exploration", "prefer_wavefront")
+        .await;
     assert_eq!(
-        handle
-            .explore
-            .start("production-topology-exploration", "prefer_wavefront")
-            .await
-            .status,
-        crate::explore_runtime::STATUS_ACCEPTED
+        started.status,
+        crate::explore_runtime::STATUS_ACCEPTED,
+        "{}",
+        started.message
     );
     let producer_epoch_projection = handle.explore.producer_epoch_projection();
     let producer_epoch = producer_epoch_projection.load(std::sync::atomic::Ordering::Acquire);
@@ -8006,16 +8040,14 @@ fn register_surface_map_build(
 async fn run_owned_surface_map_consumer(
     mut subscription: nuwax_transport::OwnedLcmSubscription,
     explore: crate::explore_runtime::ExploreRuntimeHandle,
-    config: nuwax_nav_stack::surface_config::SurfaceNavigationConfig,
+    cache: nuwax_nav_stack::surface_map::SurfaceMapCache,
     control: GeometryRuntimeTaskControl,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), String> {
     use nuwax_nav_stack::surface_map::{SurfaceMapBuildError, SurfaceMapRetryDependency};
     let (computed_tx, mut computed_rx) = tokio::sync::mpsc::channel::<SurfaceMapComputation>(1);
     // 缓存只由原单在途阻塞任务访问，接收/清空/关闭不等待计算锁。
-    let cache = Arc::new(std::sync::Mutex::new(
-        nuwax_nav_stack::surface_map::SurfaceMapCache::configured(&config),
-    ));
+    let cache = Arc::new(std::sync::Mutex::new(cache));
     let mut computing = false;
     let mut latest_pending: Option<(
         schema::NavigationMap3D,
@@ -8673,7 +8705,7 @@ pub async fn spawn_geometry_runtime(
             run_owned_surface_map_consumer(
                 subscription,
                 explore_runtime.clone(),
-                config,
+                nuwax_nav_stack::surface_map::SurfaceMapCache::configured(&config),
                 task_control.clone(),
                 task_control.shutdown_request_receiver(),
             ),
@@ -14640,7 +14672,10 @@ pub(crate) mod mapping_feed_tests {
 
     #[tokio::test]
     async fn follower_demand_watcher_replays_static_map_once_and_stops_full_updates() {
-        let fixture = NavigationMap3DFixture::new();
+        // 监视器按句柄的导航运行时身份发布，首帧点云封存前先对齐实际拥有方。
+        let mut handle = build_handle_for_tests_without_cloud_writer().await.unwrap();
+        let mut fixture = NavigationMap3DFixture::new();
+        fixture.context.producer_runtime_generation = handle.nav.producer_runtime_generation();
         let invalidation = canonical_cloud_publication_invalidation(&fixture.writer);
         invalidation.set_legacy_full_demand(None);
         let backend = MappingFeedRecordingBackend::new(LcmTopic::new("/unused/follower-demand").unwrap());
@@ -14656,12 +14691,12 @@ pub(crate) mod mapping_feed_tests {
         let config = follower_demand_test_config(&root);
         let marker = config.person_follow_ready_file.clone();
         write_follower_test_identity(&config, 123);
-        let mut handle = build_handle_for_tests_without_cloud_writer().await.unwrap();
         handle.cloud_map_writer = fixture.writer.clone();
         handle.mapping_adapter = Some(fixture.context.mapping.clone());
         handle.state = fixture.state.clone();
         handle.cloud_map_tx = fixture.cloud_tx.clone();
         handle.transport = transport.clone();
+        handle.committed_map_authority = fixture.context.committed_map_authority.clone();
         let (shutdown, shutdown_rx) = watch::channel(false);
         let watcher = tokio::spawn(run_persistent_future_until_stop(shutdown_rx,
             legacy_global_map_demand_future(handle, config)));
@@ -14748,12 +14783,13 @@ pub(crate) mod mapping_feed_tests {
         let fixture =
             NavigationMap3DFixture::with_mapping(Arc::new(parking_lot::Mutex::new(mapping)));
         let mut points = Vec::new();
+        // PCT按0.05米精细体素逐格连通实测地面；两层地面各自铺满每个精细格。
         for z in [0.0, 3.0] {
-            for x in -30..30 {
-                for y in -30..30 {
+            for x in -60..60 {
+                for y in -20..20 {
                     points.push(Point3::new(
-                        (f64::from(x) + 0.5) * 0.1,
-                        (f64::from(y) + 0.5) * 0.1,
+                        (f64::from(x) + 0.5) * 0.05,
+                        (f64::from(y) + 0.5) * 0.05,
                         z,
                     ));
                 }
@@ -15954,6 +15990,18 @@ pub(crate) mod mapping_feed_tests {
             )
             .expect("checkpoint source commit")
         };
+        // 夹具绕过生产私有准备，封存前按生产提交路径绑定写入方的实际拥有方：
+        // 首个位姿建立的新坐标系代次与导航运行时生产者代次。
+        handle
+            .cloud_map_writer
+            .lock()
+            .as_mut()
+            .expect("direct global-map checkpoint writer")
+            .bind_fine_map_owner(
+                mapping.lock().global_frame_generation(),
+                handle.nav.producer_runtime_generation(),
+            )
+            .expect("navigation runtime owns a positive producer generation");
         let committed = update_mapping_cloud_map_if_current(
             &outcome,
             &mapping.lock().snapshot(),
@@ -17769,6 +17817,9 @@ pub(crate) mod mapping_feed_tests {
                     .lock()
                     .start_session("pgo-restarted", "pgo-restarted-map")
                     .unwrap();
+                // 与生产 StartMapping 相同，新会话先登记点云会话；上一会话的占据回执随之清空，
+                // 首次里程计建立坐标系时不再拿旧回执核对新会话。
+                register_test_cloud_session(&handle).await;
                 handoff_lio_odometry_with_correction(
                     &handle,
                     &pose_state_from_isometry(&origin, "odom", 9_000_000_000),
@@ -17972,10 +18023,17 @@ pub(crate) mod mapping_feed_tests {
             owner.shutdown().await.unwrap();
             runs.push(samples);
         }
+        // 规范点云按体素插入顺序分页增量更新，两次运行的字节顺序可以不同；
+        // 内容一致只要求点集合相同。
+        let sorted_points = |xyz: &[u8]| {
+            let mut points = xyz.chunks_exact(12).map(<[u8]>::to_vec).collect::<Vec<_>>();
+            points.sort_unstable();
+            points
+        };
         for (index, (baseline, corrected)) in runs[0].iter().zip(&runs[1]).enumerate() {
             assert_eq!(
-                baseline.2,
-                corrected.2,
+                sorted_points(&baseline.2),
+                sorted_points(&corrected.2),
                 "相同输入的规范点云应相同，帧{}",
                 index + 1
             );
@@ -25404,7 +25462,8 @@ fn scheme_a_unlisted_codes_and_text_do_not_create_retry_or_stage_proof() {
         const PARENT_REQUEST: &str = "smoke-explore";
 
         let provider = test_lcm_url();
-        assert!(provider.starts_with("udpm://239.255.76.67:"));
+        // 测试端点使用独立组播组，不能落到生产总线 239.255.76.67。
+        assert!(provider.starts_with("udpm://239.254.76.67:"));
         assert!(provider.ends_with("?ttl=0"));
         let publisher = LcmTransport::new_real(&provider)
             .expect("real LCM publisher context; install liblcm-dev to run this smoke");

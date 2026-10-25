@@ -220,6 +220,11 @@ impl crate::explore_runtime::ExploreNavigationSink for FailClosedNavSink {
         Ok(crate::explore_runtime::ChildNavigationDispatchObserver::inline(operation))
     }
 
+    /// 与生产桥接相同，报告已提交地图的名称；选择器只在名称可用时领取目标。
+    fn current_map_name(&self) -> Result<String, String> {
+        Ok("exploration-test-map".to_string())
+    }
+
     async fn submit(
         &self,
         request: crate::explore_runtime::ChildNavigationRequest,
@@ -1617,6 +1622,7 @@ async fn fail_pre_path_gate(
 
 fn spawn_path_ledger(
     mut stream: nuwax_transport::LcmFrameStream,
+    nav: crate::nav_runtime::NavRuntimeState,
     started_at: std::time::Instant,
 ) -> (
     tokio::sync::mpsc::Receiver<PathLedgerEntry>,
@@ -1629,6 +1635,11 @@ fn spawn_path_ledger(
             let frame = frame.expect("V2 PathEnvelope ledger transport error");
             let path = schema::decode_path_envelope_body(&frame.payload)
                 .expect("decode V2 PathEnvelope ledger frame");
+            // 与生产路径消费者相同，每个路径信封都交给导航运行时登记候选；
+            // 终态退休租约时按候选核对路径修订与规划器代次。
+            if let Err(error) = nav.observe_path_envelope(&path).await {
+                eprintln!("V2 PATH_LEASE_REJECTED session={} error={error}", path.session_id);
+            }
             ordinal += 1;
             let elapsed_ns = started_at.elapsed().as_nanos();
             let first = path.path.poses.first().map(|pose| pose.pose.position);
@@ -2324,8 +2335,51 @@ async fn ordinary_stop_real_python_guard_rust_client_preserves_deadline_and_succ
     guard.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn vertical_v2_mapping_exploration_simple_planner_canary() {
+/// 二维规划拥有方从进程环境读取机体外形，生产由启动器写入；没有外形时，
+/// 它算出的路径全部被路线复核拒绝，导航一直等不到路径。金丝雀在独立子进程里
+/// 按生产方式提供外形，不改写并行用例共享的测试进程环境。
+const SIMPLE_PLANNER_CANARY_CHILD: &str = "NUWAX_V2_SIMPLE_PLANNER_CANARY_CHILD";
+const SIMPLE_PLANNER_CANARY_BODY: &str = r#"{"footprint_xy_m":[[-0.15,-0.15],[0.15,-0.15],[0.15,0.15],[-0.15,0.15]],"z_min_m":-0.35,"z_max_m":0.2,"source":"V2 canary simulated 0.3 m body"}"#;
+
+#[test]
+fn vertical_v2_mapping_exploration_simple_planner_canary() {
+    if std::env::var_os(SIMPLE_PLANNER_CANARY_CHILD).is_some() {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("V2 canary runtime")
+            .block_on(simple_planner_canary_in_child());
+        return;
+    }
+    let mut command = Command::new(std::env::current_exe().expect("test executable"));
+    // 子进程只带本用例给出的设置，不继承开发者本机的导航配置。
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("NUWAX_") {
+            command.env_remove(key);
+        }
+    }
+    let output = command
+        .args([
+            "--exact",
+            "lcm_runtime::vertical_v2_canary::vertical_v2_mapping_exploration_simple_planner_canary",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(SIMPLE_PLANNER_CANARY_CHILD, "1")
+        .env("NUWAX_ROBOT_GEOMETRY_JSON", SIMPLE_PLANNER_CANARY_BODY)
+        .output()
+        .expect("spawn V2 simple planner canary child");
+    eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+    eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "V2 simple planner canary child failed: {}",
+        output.status
+    );
+}
+
+async fn simple_planner_canary_in_child() {
     let _env_lock = ENV_LOCK.lock().await;
     let nonce = encode_canary_nonce(std::process::id(), crate::explore_runtime::now_unix_nanos());
     let provider = test_lcm_url();
@@ -2392,7 +2446,8 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
     let _live_input_receipt_dump = LiveInputReceiptDumpGuard(live_input_receipt_shaper.clone());
     let (ack_wake_tx, mut ack_wake_rx) = tokio::sync::mpsc::channel(LIVE_INPUT_ACK_WAKE_CAPACITY);
     let nav = crate::nav_runtime::NavRuntimeState::from_env();
-    let (mut path_ledger_rx, path_ledger_task) = spawn_path_ledger(path_frames, ledger_started_at);
+    let (mut path_ledger_rx, path_ledger_task) =
+        spawn_path_ledger(path_frames, nav.clone(), ledger_started_at);
     let (mut nav_state_ledger_rx, nav_state_ledger_task) = spawn_nav_state_ledger(
         nav_state_frames,
         nav.clone(),
@@ -2626,7 +2681,8 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
     let (frontiers_tx, _) = broadcast::channel(4);
     let bridge = Arc::new(ExploreNavigationBridge {
         body_reference_frame_id: Arc::from("base_link"),
-        mapping_adapter: None,
+        // 与生产相同，导航受理和地图分发读取同一建图拥有方的坐标系代次。
+        mapping_adapter: Some(mapping.clone()),
         state: state.clone(),
         expected_map_frame: Arc::from("map"),
         cloud_map_tx,
@@ -3113,11 +3169,19 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
         assert_eq!(readiness.release_count, 1);
         assert_eq!(readiness.dispatches, InitialReadinessDispatchLedger::default());
 
-        let boundary = ExplorationBoundary::from_vertices(vec![
-        Point2 { x: -2.0, y: -2.0 },
-        Point2 { x: 2.0, y: -2.0 },
-        Point2 { x: 2.0, y: 2.0 },
-        Point2 { x: -2.0, y: 2.0 },
+    // 探索边界在候选搜索前施加，范围外按障碍处理。夹具地图按观测自动定界，
+    // 固定的 [-2,2] 边界比实际发布栅格小一圈，排除后不再有可达前沿；
+    // 边界取实际发布栅格的范围，与上方前沿检测使用同一候选区域。
+    let grid_min = published_costmap.grid.origin;
+    let grid_max = Point2 {
+        x: grid_min.x + f64::from(published_costmap.grid.width) * published_costmap.grid.resolution,
+        y: grid_min.y + f64::from(published_costmap.grid.height) * published_costmap.grid.resolution,
+    };
+    let boundary = ExplorationBoundary::from_vertices(vec![
+        Point2 { x: grid_min.x, y: grid_min.y },
+        Point2 { x: grid_max.x, y: grid_min.y },
+        Point2 { x: grid_max.x, y: grid_max.y },
+        Point2 { x: grid_min.x, y: grid_max.y },
     ])
     .expect("V2 canary boundary");
     let started = explore
@@ -3720,22 +3784,13 @@ async fn vertical_v2_mapping_exploration_simple_planner_canary() {
     assert!(actuator_events.lines().any(|line| line == "ZERO"));
 
     let first_child_id = active.child_task_id.clone();
-    let first_nav_lease = nav
-        .active_goal_lease()
-        .await
-        .expect("active terminal lease");
-    let terminal_update = NavigationUpdate::from_local(
-        NavState {
-            status: "SUCCEEDED".to_string(),
-            message: "V2 canary reached".to_string(),
-            goal_id: first_child_id.clone(),
-            timestamp_ns: crate::explore_runtime::now_unix_nanos(),
-            ..NavState::default()
-        },
-        &nav,
-        Some(first_nav_lease),
+    assert!(nav.active_goal_lease().await.is_some(), "active terminal lease");
+    // 与生产导航状态消费者相同，按线上编码解出真实终态（含执行端归零证明）再应用；
+    // 只有带完整归零证明与精确路径身份的终态才退休当前租约。
+    let terminal_update = crate::typed_codec::decode_nav_state_payload(
+        &schema::encode_navigation_state_body(&terminal_state).expect("encode terminal state"),
     )
-    .await;
+    .expect("decode terminal state");
     let applied_terminal = apply_typed_navigation_feedback(&nav, terminal_update)
         .await
         .expect("apply correlated terminal feedback");
@@ -4098,11 +4153,20 @@ fn accepted_path_candidate_rejects_identity_planner_and_revision_conflicts() {
         AcceptedPathCandidateMatch::Conflict
     ));
 
-    let mut wrong_revision = acceptance_test_state(&revision_two.path, &goal);
-    wrong_revision.path_revision += 1;
+    // 同一规划器已发布更新修订时，较旧修订的受理状态无法再对应候选路径。
+    let mut stale_revision = acceptance_test_state(&revision_two.path, &goal);
+    stale_revision.path_revision -= 1;
     assert!(matches!(
-        match_accepted_path_candidate(&wrong_revision, &goal, &candidates),
+        match_accepted_path_candidate(&stale_revision, &goal, &candidates),
         AcceptedPathCandidateMatch::Conflict
+    ));
+
+    // 受理状态领先于路径属于两条话题的到达顺序差，继续等待该修订的路径。
+    let mut ahead_revision = acceptance_test_state(&revision_two.path, &goal);
+    ahead_revision.path_revision += 1;
+    assert!(matches!(
+        match_accepted_path_candidate(&ahead_revision, &goal, &candidates),
+        AcceptedPathCandidateMatch::Pending
     ));
 }
 
@@ -6081,18 +6145,42 @@ async fn vertical_v2_rejects_wrong_frame_and_out_of_boundary_goal() {
             grid.set(x, y, OccupancyCell::Free);
         }
     }
+    // 机器人位于左半已知自由区中部，机体轮廓完整落在已观测范围内。
+    let robot = Point2 { x: 2.5, y: 5.0 };
+    // 同一栅格不加边界时存在前沿目标，下面的无目标结果来自边界。
+    let unbounded = nuwax_explore_wavefront::selector::WavefrontGoalSelector::new(
+        nuwax_explore_wavefront::WavefrontConfig::default(),
+    )
+    .select_goal_at(
+        robot,
+        &grid,
+        &mut nuwax_explore_wavefront::session::ExplorationSession::new(),
+        nuwax_nav_types_messages::geometry::Timestamp::default(),
+        &mut nuwax_exploration::wavefront_adapter::CountingIdSource::default(),
+    )
+    .expect("unbounded frontier selection");
+    assert!(
+        matches!(unbounded, nuwax_explore_wavefront::GoalSelection::Goal(_)),
+        "{unbounded:?}"
+    );
+    // 探索只在已提交地图上领取目标；不带提交身份时选择器根本不会运行，
+    // 边界也就得不到检验。
     explore
-        .ingest_costmap_snapshot(crate::explore_runtime::ExploreCostmapSnapshot {
-            grid,
-            frame_id: "map".to_string(),
-        })
+        .ingest_committed_costmap_snapshot(
+            crate::explore_runtime::ExploreCostmapSnapshot {
+                grid,
+                frame_id: "map".to_string(),
+            },
+            super::test_committed_map_identity(1),
+        )
         .await
-        .expect("map-frame costmap");
+        .expect("committed map-frame costmap");
+    // 边界包含机器人但不含 x=5m 处的已知/未知交界，前沿目标全部落在边界外。
     let boundary = ExplorationBoundary::from_vertices(vec![
-        Point2 { x: 0.0, y: 0.0 },
-        Point2 { x: 0.25, y: 0.0 },
-        Point2 { x: 0.25, y: 0.25 },
-        Point2 { x: 0.0, y: 0.25 },
+        Point2 { x: 1.0, y: 3.0 },
+        Point2 { x: 4.0, y: 3.0 },
+        Point2 { x: 4.0, y: 7.0 },
+        Point2 { x: 1.0, y: 7.0 },
     ])
     .expect("small valid boundary");
     let accepted = explore
@@ -6107,16 +6195,20 @@ async fn vertical_v2_rejects_wrong_frame_and_out_of_boundary_goal() {
         .await;
     assert_eq!(accepted.status, "ACCEPTED");
 
-    let pending = explore.tick((0.0, 0.0)).await;
+    let pending = explore.tick((robot.x, robot.y)).await;
     assert_eq!(pending.status, "PENDING", "{}", pending.message);
+    // 边界在候选搜索前施加：边界外的已知自由区与未知区都不形成前沿，
+    // 因此不会先选出越界目标再拒绝，导航侧也收不到任何提交。
+    assert_eq!(pending.message, "no frontier available yet");
     assert!(pending.child_task_id.is_empty());
     assert!(pending.child_lease.is_none());
     assert!(sink.submissions.lock().expect("submissions").is_empty());
     let diagnostics = explore.diagnostics().await;
+    assert_eq!(diagnostics.frontier_count, 0);
     assert!(diagnostics
         .sources
         .iter()
-        .any(|source| { source.last_error.contains("outside exploration boundary") }));
+        .all(|source| source.last_goal_id.is_empty() && source.last_error.is_empty()));
 
     let stopped = explore.stop("v2-boundary-reject").await;
     assert_eq!(stopped.status, "CANCELLED");

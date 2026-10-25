@@ -8,7 +8,7 @@ use std::sync::Arc;
 mod repository;
 pub use repository::{ObjectRangeRead, Repository, RegionReader};
 mod writer;
-pub use writer::Writer;
+pub use writer::{CachePolicy, Writer};
 /// Observation moments reused by the capture owner and bounded layer records.
 pub mod surface_statistics;
 /// Column-local height statistics; capture/storage integration is a separate step.

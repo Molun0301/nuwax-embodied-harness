@@ -1235,6 +1235,7 @@ impl MappingBackendSpec {
             Self::SlamToolbox => unreachable!("二维进程不能进入点云内核"),
             Self::Voxel => MappingKernel::Voxel(VoxelKernel {
                 current_window: VecDeque::new(),
+                window_cells: Default::default(),
                 capacity: window_capacity,
                 last_candidate_point_count: 0,
                 last_candidate_received_at_ns: 0,
@@ -1332,6 +1333,8 @@ impl MappingKernel {
 #[derive(Clone)]
 pub(crate) struct VoxelKernel {
     current_window: VecDeque<Point3<f64>>,
+    // 窗口内各动态清除格的点数，与 current_window 同步维护；落不进格的点不会被清除，不计入。
+    window_cells: ahash::AHashMap<crate::dynamic_scene::Cell, u32>,
     capacity: usize,
     last_candidate_point_count: usize,
     last_candidate_received_at_ns: u64,
@@ -1346,10 +1349,54 @@ impl VoxelKernel {
         let retained_start = points.len().saturating_sub(accepted);
         let existing_budget = retention_capacity.saturating_sub(accepted);
         let evicted = self.current_window.len().saturating_sub(existing_budget);
-        self.current_window.drain(..evicted);
+        for point in self.current_window.drain(..evicted) {
+            uncount_window_cell(&mut self.window_cells, &point);
+        }
+        for point in &points[retained_start..] {
+            count_window_cell(&mut self.window_cells, point);
+        }
         self.current_window
             .extend(points[retained_start..].iter().copied());
     }
+    /// 逐点撤销落在本帧清除格内的历史点。清除格里没有窗口点时不会删除任何点，
+    /// 结果与逐点筛除相同，直接跳过遍历。
+    fn retain_uncleared(&mut self) {
+        if !self.dynamic_scene.has_clears()
+            || !self.dynamic_scene.clear_cells().any(|cell| self.window_cells.contains_key(cell))
+        {
+            return;
+        }
+        let (scene, cells) = (&self.dynamic_scene, &mut self.window_cells);
+        self.current_window.retain(|point| {
+            let cleared = scene.clears([point.x, point.y, point.z]);
+            if cleared {
+                uncount_window_cell(cells, point);
+            }
+            !cleared
+        });
+    }
+}
+fn count_window_cell(cells: &mut ahash::AHashMap<crate::dynamic_scene::Cell, u32>, point: &Point3<f64>) {
+    if let Some(cell) = crate::dynamic_scene::cell([point.x, point.y, point.z]) {
+        *cells.entry(cell).or_default() += 1;
+    }
+}
+fn uncount_window_cell(cells: &mut ahash::AHashMap<crate::dynamic_scene::Cell, u32>, point: &Point3<f64>) {
+    if let Some(cell) = crate::dynamic_scene::cell([point.x, point.y, point.z]) {
+        if let std::collections::hash_map::Entry::Occupied(mut entry) = cells.entry(cell) {
+            *entry.get_mut() -= 1;
+            if *entry.get() == 0 {
+                entry.remove();
+            }
+        }
+    }
+}
+fn window_cells(window: &VecDeque<Point3<f64>>) -> ahash::AHashMap<crate::dynamic_scene::Cell, u32> {
+    let mut cells = ahash::AHashMap::new();
+    for point in window {
+        count_window_cell(&mut cells, point);
+    }
+    cells
 }
 
 #[derive(Clone)]
@@ -1892,6 +1939,7 @@ fn restore_mapping_kernel_checkpoint(
             }
             reader.finish()?;
             Ok(MappingKernel::Voxel(VoxelKernel {
+                window_cells: window_cells(&current_window),
                 current_window,
                 capacity,
                 last_candidate_point_count,
@@ -2185,11 +2233,7 @@ fn compute_candidate_with_parallelism(
                 input.sensor_origin_map,
                 input.source_timestamp_ns,
             );
-            if voxel.dynamic_scene.has_clears() {
-                voxel
-                    .current_window
-                    .retain(|point| !voxel.dynamic_scene.clears([point.x, point.y, point.z]));
-            }
+            voxel.retain_uncleared();
             voxel.append_frame(&input.registered_points_map);
             voxel.dirty_since_candidate = true;
             MappingBackendKind::Voxel
@@ -3002,6 +3046,7 @@ mod tests {
 
         let one_point = MappingKernel::Voxel(VoxelKernel {
             current_window: [Point3::new(1.0, 2.0, 3.0)].into_iter().collect(),
+            window_cells: window_cells(&[Point3::new(1.0, 2.0, 3.0)].into_iter().collect()),
             capacity: config.window_capacity,
             last_candidate_point_count: 1,
             last_candidate_received_at_ns: 7,

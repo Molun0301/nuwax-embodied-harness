@@ -8443,6 +8443,27 @@ mod guarded_tests {
             })
         }
 
+        fn submit_twist_bounded<'life0, 'life1, 'async_trait>(
+            &'life0 mut self,
+            operation_id: &'life1 str,
+            twist: Twist2,
+            bound: Option<nuwax_nav_runtime::CommandDispatchBound>,
+        ) -> Pin<Box<dyn Future<Output = Result<nuwax_nav_runtime::BoundedTwistOutcome,
+            nuwax_nav_runtime::MotionPortError>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                // 夹具实现真实接口语义，过期命令不得进入记录端或获得已执行回执。
+                if bound.is_some_and(nuwax_nav_runtime::CommandDispatchBound::expired_now) {
+                    return Ok(nuwax_nav_runtime::BoundedTwistOutcome::ExpiredNotApplied);
+                }
+                self.submit_twist(operation_id, twist).await.map(nuwax_nav_runtime::BoundedTwistOutcome::Applied)
+            })
+        }
+
         fn revoke_and_zero<'life0, 'life1, 'async_trait>(
             &'life0 mut self,
             operation_id: &'life1 str,

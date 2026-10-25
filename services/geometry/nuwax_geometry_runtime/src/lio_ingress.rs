@@ -3252,6 +3252,27 @@ mod tests {
         adapter
     }
 
+    /// 测试替换了建图适配器后，让句柄里的规范点云写入方按生产顺序跟随：
+    /// 先绑定精细地图拥有方（当前坐标系代次与导航运行时生产者代次），
+    /// 再随该建图会话开始清空。
+    fn bind_cloud_writer_to_mapping_session(
+        handle: &crate::lcm_runtime::GeometryRuntimeHandle,
+        mapping: &Mutex<MappingAdapter>,
+    ) {
+        let adapter = mapping.lock();
+        let mut writer = handle.cloud_map_writer.lock();
+        let writer = writer.as_mut().expect("canonical cloud-map writer");
+        writer
+            .bind_fine_map_owner(
+                adapter.global_frame_generation(),
+                handle.nav.producer_runtime_generation(),
+            )
+            .expect("navigation runtime owns a positive producer generation");
+        writer
+            .begin_session(adapter.snapshot().session_generation)
+            .expect("new Mapping session publishes a canonical clear");
+    }
+
     fn adapter_registration_state(
         adapter: &MappingAdapter,
     ) -> (MappingSessionSnapshot, u64, u64, u64, u64, usize) {
@@ -3411,6 +3432,7 @@ mod tests {
         handle.transport = LcmTransport::new(Arc::new(backend.clone()));
         let mapping = Arc::new(Mutex::new(active_adapter("map")));
         handle.mapping_adapter = Some(mapping.clone());
+        bind_cloud_writer_to_mapping_session(&handle, &mapping);
         let ingress = runtime_bound_ingress(spec(), handle.clone());
         ingress
             .accept_odometry_for_test(identity(1, 0), 10, valid_odometry())
@@ -3900,6 +3922,7 @@ mod tests {
             crate::pointcloud::CloudMapShmWriter::new(&cloud_path)
                 .expect("canonical cloud-map writer"),
         );
+        bind_cloud_writer_to_mapping_session(&handle, &mapping);
 
         // Give the active relocalization branch a real, current receipt. With
         // the former handler-side overwrite, this turns into a false success.
@@ -5148,8 +5171,7 @@ mod tests {
                 std::env::temp_dir().join(format!("nuwax-dynamic-{}.mmap", uuid::Uuid::new_v4()));
             *handle.cloud_map_writer.lock() =
                 Some(crate::pointcloud::CloudMapShmWriter::new(&path).unwrap());
-            handle.cloud_map_writer.lock().as_mut().unwrap()
-                .begin_session(mapping.lock().snapshot().session_generation).unwrap();
+            bind_cloud_writer_to_mapping_session(&handle, &mapping);
             let native_spec = DeviceLioIngressSpec::new_for_backend(
                 backend_id,
                 7,

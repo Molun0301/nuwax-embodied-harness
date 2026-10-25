@@ -57,6 +57,8 @@ namespace scan_planner
 
     void updateTrajInfo(const UniformBspline &position_traj, const ros::Time time_now);
     bool checkDynamicFeasibility(UniformBspline position_traj);
+    bool trajectoryCollisionFree(UniformBspline& trajectory);
+    double strictDynamicScale(UniformBspline& trajectory);
 
     void reparamBspline(UniformBspline &bspline, vector<Eigen::Vector3d> &start_end_derivative, double ratio, Eigen::MatrixXd &ctrl_pts, double &dt,
                         double &time_inc);

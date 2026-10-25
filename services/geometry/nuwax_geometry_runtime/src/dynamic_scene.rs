@@ -236,6 +236,11 @@ impl DynamicScene {
         !self.clear_cells.is_empty()
     }
 
+    /// 本帧被证实为空的格。
+    pub(crate) fn clear_cells(&self) -> impl Iterator<Item = &Cell> {
+        self.clear_cells.iter()
+    }
+
     pub(crate) fn clears(&self, point: [f64; 3]) -> bool {
         cell(point).is_some_and(|key| self.clear_cells.contains(&key))
     }

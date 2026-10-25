@@ -17,7 +17,26 @@ const MAX_HEADER_BYTES: usize = 65_536;
 const PAGE_POINTS: usize = 4096;
 const INDEX_BLOCK_M: f64 = 1.6;
 const MAX_INDEX_ENTRIES: usize = 1_000_000;
+/// 每页可见点体素键的布隆过滤器：32768 位、7 个哈希位置（一页约 3500 个不同体素时单键
+/// 假阳性约 1%）。只为前 16384 页建，约 6700 万点，每页 4 KiB，共 64 MiB；之后的页照常逐页扫描。
+const FILTER_WORDS: usize = 512;
+const FILTER_HASHES: u32 = 7;
+const MAX_FILTER_PAGES: usize = 16_384;
 type Key = (i32, i32, i32);
+
+/// 布隆过滤器的各个位置；同一键总得到相同位置。
+fn filter_bits(key: Key) -> impl Iterator<Item = usize> {
+    let mut h = u64::from(key.0 as u32) | u64::from(key.1 as u32) << 32;
+    h ^= u64::from(key.2 as u32).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^= h >> 31;
+    let (a, b) = (h as u32, (h >> 32) as u32 | 1);
+    (0..FILTER_HASHES).map(move |i| a.wrapping_add(i.wrapping_mul(b)) as usize % (FILTER_WORDS * 64))
+}
+fn filter_may_contain(filter: &[u64; FILTER_WORDS], key: Key) -> bool {
+    filter_bits(key).all(|bit| filter[bit / 64] & (1 << (bit % 64)) != 0)
+}
 
 #[derive(Clone)]
 struct Page {
@@ -60,6 +79,9 @@ pub(crate) struct DenseCloud {
     block_pages: Option<HashMap<Key, HashSet<usize>>>,
     block_entries: usize,
     live_keys: Option<HashSet<Key>>,
+    // 前 MAX_FILTER_PAGES 页中可见点的体素键（追加时登记，删除改动后重建）；
+    // 只供删除时跳过必不含可见删除键的页。
+    filters: Vec<Box<[u64; FILTER_WORDS]>>,
     readers: DenseCloudReaders,
     bounds_min: [f32; 3],
     bounds_max: [f32; 3],
@@ -130,6 +152,7 @@ impl DenseCloud {
             block_pages: Some(HashMap::new()),
             block_entries: 0,
             live_keys: Some(HashSet::new()),
+            filters: Vec::new(),
             readers: Default::default(),
             bounds_min: [f32::INFINITY; 3],
             bounds_max: [f32::NEG_INFINITY; 3],
@@ -181,6 +204,9 @@ impl DenseCloud {
             let page_index = position / PAGE_POINTS;
             if page_index == pages.len() {
                 pages.push(Arc::new(Page::default()));
+                if page_index < MAX_FILTER_PAGES {
+                    self.filters.push(Box::new([0; FILTER_WORDS]));
+                }
             }
             let page = Arc::make_mut(&mut pages[page_index]);
             let end = points.len().min(index + PAGE_POINTS - position % PAGE_POINTS);
@@ -203,14 +229,18 @@ impl DenseCloud {
                     // 达到预算后回退逐页检查，不丢点，也不无限扩大派生索引。
                     if self.block_entries > MAX_INDEX_ENTRIES { self.block_pages = None; }
                 }
+                // 复用降精度前已验证并写入的键，不重复计算或从单精度坐标推导。
+                let offset = index * 12;
+                let key: [i32; 3] = std::array::from_fn(|axis| {
+                    let offset = offset + axis * 4;
+                    i32::from_le_bytes(keys[offset..offset + 4].try_into().unwrap())
+                });
+                let key = (key[0], key[1], key[2]);
+                if let Some(filter) = self.filters.get_mut(page_index) {
+                    for bit in filter_bits(key) { filter[bit / 64] |= 1 << (bit % 64); }
+                }
                 if let Some(live) = &mut self.live_keys {
-                    // 复用降精度前已验证并写入的键，不重复计算或从单精度坐标推导。
-                    let offset = index * 12;
-                    let key: [i32; 3] = std::array::from_fn(|axis| {
-                        let offset = offset + axis * 4;
-                        i32::from_le_bytes(keys[offset..offset + 4].try_into().unwrap())
-                    });
-                    live.insert((key[0], key[1], key[2]));
+                    live.insert(key);
                     if live.len() > MAX_INDEX_ENTRIES { self.live_keys = None; }
                 }
             }
@@ -263,23 +293,40 @@ impl DenseCloud {
             if old.count == 0 {
                 continue;
             }
+            // 过滤器全部否定的页必不含任何删除键（无假阴性），原本也不会改动，不必读键扫描。
+            if self.filters.get(index).is_some_and(|filter| !removed.iter().any(|&key| filter_may_contain(filter, key))) {
+                continue;
+            }
             let mut keys = vec![0; old.length * 12];
             self.keys_file
                 .read_exact_at(&mut keys, (index * PAGE_POINTS * 12) as u64)
                 .map_err(|e| e.to_string())?;
             let mut page = (**old).clone();
-            for local in 0..old.length {
-                if page.visible[local / 64] & (1 << (local % 64)) == 0 { continue; }
+            let key_at = |local: usize| -> Key {
                 let key: [i32; 3] = std::array::from_fn(|axis| {
                     let offset = local * 12 + axis * 4;
                     i32::from_le_bytes(keys[offset..offset + 4].try_into().unwrap())
                 });
-                if removed.contains(&(key[0], key[1], key[2])) {
+                (key[0], key[1], key[2])
+            };
+            for local in 0..old.length {
+                if page.visible[local / 64] & (1 << (local % 64)) == 0 { continue; }
+                if removed.contains(&key_at(local)) {
                     page.visible[local / 64] &= !(1 << (local % 64));
                     page.count -= 1;
                 }
             }
             if page.count == old.count { continue; }
+            // 改动页的过滤器按仍可见的点重建，已删除的键不再让后续删除读这一页。
+            let filter = (index < self.filters.len()).then(|| {
+                let mut filter = Box::new([0_u64; FILTER_WORDS]);
+                for local in 0..old.length {
+                    if page.visible[local / 64] & (1 << (local % 64)) != 0 {
+                        for bit in filter_bits(key_at(local)) { filter[bit / 64] |= 1 << (bit % 64); }
+                    }
+                }
+                filter
+            });
             // 仅实际修改的页需要读取坐标并重算边界。
             page.low = [f32::INFINITY; 3];
             page.high = [f32::NEG_INFINITY; 3];
@@ -297,15 +344,16 @@ impl DenseCloud {
                 }
             }
             count += (old.count - page.count) as usize;
-            changes.push((index, Arc::new(page)));
+            changes.push((index, Arc::new(page), filter));
         }
         if let Some(live) = &mut self.live_keys {
             for key in &removed { live.remove(key); }
         }
         if count > 0 {
             let pages = Arc::make_mut(&mut self.pages);
-            for (index, page) in changes {
+            for (index, page, filter) in changes {
                 pages[index] = page;
+                if let Some(filter) = filter { self.filters[index] = filter; }
             }
             self.point_count -= count as u64;
             self.bounds_min = [f32::INFINITY; 3];

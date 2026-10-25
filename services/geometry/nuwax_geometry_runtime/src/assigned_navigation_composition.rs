@@ -31,6 +31,11 @@ const CAPABILITIES: &str = r#"{
  "max_observation_age_sec":1.0,"stairs_supported":false}}
 "#;
 
+// 模拟雷达装在机体原点上方0.1米。生产三维导航由原生LIO按此类标定得到注册扫描的
+// 传感原点；SCAN局部地图只接受带该原点的注册帧，旧设备入口没有标定故不能代替。
+const SENSOR_CALIBRATION: &str =
+    r#"{"translation_m":[0.0,0.0,0.1],"rotation_row_major":[1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0]}"#;
+
 const GUARD_PROCESS: &str = r#"
 import json, os, signal, sys, threading, time, uuid
 from pathlib import Path
@@ -80,7 +85,10 @@ impl GuardProcess {
         let root = root.join("guard");
         std::fs::create_dir(&root).unwrap();
         let repository = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(3).unwrap();
-        let python = std::env::var_os("NUWAX_TEST_GUARD_PYTHON").unwrap_or_else(|| "python3".into());
+        // 守卫需要项目依赖；未显式指定时用仓库 Python，与启动器、金丝雀用例一致。
+        let python = std::env::var_os("NUWAX_TEST_GUARD_PYTHON").map(PathBuf::from)
+            .unwrap_or_else(|| repository.join(".venv_model_download/bin/python"));
+        assert!(python.is_file(), "guard composition requires the project Python environment: {}", python.display());
         let stderr = std::fs::File::create(root.join("stderr.log")).unwrap();
         let child = Command::new(python).args(["-u", "-c", GUARD_PROCESS]).arg(&root)
             .current_dir(repository).stdin(Stdio::null()).stdout(Stdio::null()).stderr(stderr)
@@ -233,7 +241,7 @@ struct LiveSensor {
     cloud_task: Option<tokio::task::JoinHandle<()>>,
 }
 impl LiveSensor {
-    fn start(handle: GeometryRuntimeHandle, common: Arc<crate::lio_ingress::CommonLioIngress>,
+    fn start(handle: GeometryRuntimeHandle, lio: Arc<crate::lio_ingress::NativeLioIngress>,
         correction: crate::correction_coordinator::CorrectionFrameIngress,
         applier: Arc<crate::lcm_runtime::GeometryCanonicalCorrectionApplier>,
         actuator_path: PathBuf, world: Vec<Point3<f64>>, sequence_start: u64) -> Self {
@@ -267,7 +275,7 @@ impl LiveSensor {
                     integrated.pose_at(monotonic_ns())
                 };
                 sequence += 1;
-                if let Some(accepted)=prepare_sensor_frame(&handle, &common, &applier, &world,
+                if let Some(accepted)=prepare_sensor_frame(&handle, lio.common_for_test(), &applier, &world,
                     pose,sequence,clouds.load(Ordering::Acquire)).await {
                     cloud_tx.send_replace(Some(accepted));
                 }
@@ -368,13 +376,12 @@ async fn guard_query(socket: &Path, operation: nuwax_motion_safety_guard::wire::
 async fn assert_applied(socket: &Path, event: &Actuation) {
     use nuwax_motion_safety_guard::wire as guard;
     assert!(event.lease_id > 0 && !event.operation_id.is_empty());
-    let outcome = guard_query(socket,guard::motion_guard_request::Operation::GetOperationResult(
-        guard::GetOperationResultRequest {source:guard::GuardSource::Nav as i32,
-            operation_namespace:guard::OperationNamespace::Lease as i32,operation_id:event.operation_id.clone()})).await;
-    let guard::motion_guard_response::Outcome::GetOperationResult(result) = outcome else {panic!("wrong query outcome")};
-    assert!(result.resolved,"actual actuator twist has no settled guard result: {result:?}");
-    assert_eq!(result.target_operation_id,event.operation_id);
-    assert_eq!(result.target_ack,guard::AckCode::Applied as i32);
+    // 守卫只保留停车与租约类操作的查询记录，普通速度指令没有GetOperationResult结果。
+    // 执行器台账由守卫准入后写入；这里再核对该指令所属租约就是守卫当前持有的导航租约。
+    let outcome = guard_query(socket,guard::motion_guard_request::Operation::GetGuardState(
+        guard::GetGuardStateRequest {source:guard::GuardSource::Nav as i32})).await;
+    let guard::motion_guard_response::Outcome::GetGuardState(state) = outcome else {panic!("wrong guard state outcome")};
+    assert_eq!(state.active_lease_id,event.lease_id,"actual actuator twist must belong to the guard's active lease: {state:?}");
 }
 async fn assert_exact_zero(socket: &Path, state: &schema::NavigationState) {
     use nuwax_motion_safety_guard::wire as guard;
@@ -526,10 +533,14 @@ async fn run_composition(root:&Path) {
         }).await.unwrap().into_inner();
         assert!(activated.success && activated.relocalization_target_available,"{activated:?}");
         assert!(handle.mapping_adapter.as_ref().unwrap().lock().checkpoint_localization_required);
-        let common=Arc::new(crate::lio_ingress::CommonLioIngress::new(
-            crate::lio_ingress::DeviceLioIngressSpec::new(1,"sensor","base_link","odom","map").unwrap()));
-        common.bind_relocalization_mode_fence(owner.ingress().relocalization_mode_fence()).unwrap();
-        sensor_frame(&handle,&common,&owner.ingress(),&applier,&world,[0.0;3],1,false).await;
+        let lio=Arc::new(crate::lio_ingress::NativeLioIngress::without_runtime(
+            crate::lio_ingress::DeviceLioIngressSpec::new_for_backend(nuwax_codec::lcm::lio::LIO_BACKEND_FASTLIO2,
+                1,"sensor","base_link","odom","map").unwrap(),
+            crate::native_lio_owner::BodyFromSensorTransform::from_json(SENSOR_CALIBRATION).unwrap(),
+            Duration::from_millis(100)).unwrap());
+        lio.bind_relocalization_mode_fence(owner.ingress().relocalization_mode_fence()).unwrap();
+        let common=lio.common_for_test();
+        sensor_frame(&handle,common,&owner.ingress(),&applier,&world,[0.0;3],1,false).await;
         let request=RelocalizeRequest {schema_version:2,request_id:"composition-relocalize".into(),
             assigned_target:Some(relocalize_request::AssignedTarget::AssignedCloudV2(AssignedCloudRelocalizeRequestV2 {
                 target:activated.activation_receipt_v2.as_ref().unwrap().target.clone(),
@@ -540,7 +551,7 @@ async fn run_composition(root:&Path) {
             while !owner.ingress().relocalization_mode_snapshot().active {tokio::task::yield_now().await;}
         }).await.expect("real Relocalize command admitted");
         let registration_scan=world.iter().cycle().take(50_000).copied().collect::<Vec<_>>();
-        sensor_frame(&handle,&common,&owner.ingress(),&applier,&registration_scan,[0.0;3],2,true).await;
+        sensor_frame(&handle,common,&owner.ingress(),&applier,&registration_scan,[0.0;3],2,true).await;
         let terminal=tokio::time::timeout(Duration::from_secs(30),pending).await.unwrap().unwrap().unwrap().into_inner();
         eprintln!("ASSIGNED_COMPOSITION relocalization terminal: {terminal:?}");
         assert_eq!(terminal.assigned_cloud_v2.as_ref().unwrap().disposition,RelocalizeDisposition::Applied as i32,"{terminal:?}");
@@ -551,7 +562,7 @@ async fn run_composition(root:&Path) {
         assert!(sample.map_from_odom.is_some() && sample.odom_from_body.is_some());
         let pose=sample.pose.unwrap().position.unwrap();
         assert!(pose.x.abs()<0.05 && pose.y.abs()<0.05 && pose.z.abs()<0.05,"known scene relocalization: {pose:?}");
-        sensor=Some(LiveSensor::start(handle.clone(),common,owner.ingress(),applier.clone(),guard.root.join("actuator.jsonl"),world,2));
+        sensor=Some(LiveSensor::start(handle.clone(),lio.clone(),owner.ingress(),applier.clone(),guard.root.join("actuator.jsonl"),world,2));
         let live=sensor.as_ref().unwrap();
         wait_ready(&mut client).await;
         // Two fresh sensor observations of each footprint cell are mandatory;
@@ -568,8 +579,8 @@ async fn run_composition(root:&Path) {
         let arrived=loop {
             if let Some(state)=readers.ledger.lock().unwrap().states.iter().rev()
                 .find(|s|goal_state_matches(s,&goal)&&s.state==3).cloned() {break state;}
-            let failed=readers.ledger.lock().unwrap().states.iter().any(|s|goal_state_matches(s,&goal)&&s.state==4);
-            assert!(!failed,"production navigation failed: {}",diagnostic(&readers.ledger,live));
+            let failed=readers.ledger.lock().unwrap().states.iter().find(|s|goal_state_matches(s,&goal)&&s.state==4).cloned();
+            assert!(failed.is_none(),"production navigation failed: {failed:?}; {}",diagnostic(&readers.ledger,live));
             assert!(tokio::time::Instant::now()<deadline,"metre-scale arrival timeout: {}",diagnostic(&readers.ledger,live));
             runner.ensure_healthy().unwrap();
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -600,10 +611,11 @@ async fn run_composition(root:&Path) {
         let (path_count,map_count)={let ledger=readers.ledger.lock().unwrap();(ledger.paths.len(),ledger.maps.len())};
         eprintln!("ASSIGNED_COMPOSITION arrival local_planning=true simulated_pose={actual:?} zero_ack={} paths={path_count} maps={map_count}",arrived.zero_ack_id);
 
-        // 独立移动目标证明来源自然到期会进入真实安全围栏。
+        // 独立移动目标证明来源自然到期会使执行实际归零并暂停。a51326fd起近期障碍源到期不终止目标：
+        // 调度保持租约、下发零速并等待新鲜输入，原30秒路径等待期限内不建围栏，也没有精确停车回执。
         wait_ready(&mut client).await;
         let baseline=read_records::<Actuation>(&guard.root.join("actuator.jsonl")).len();
-        let _admitted=submit_goal(&mut client,&guard.socket(),"restored-expiry",2.4,0.35).await;
+        let expiry_admitted=submit_goal(&mut client,&guard.socket(),"restored-expiry",2.4,0.35).await;
         let expiry_goal=observed_goal(&readers.ledger,"restored-expiry").await;
         moving_evidence(&readers.ledger,live,&guard,&expiry_goal,baseline).await;
         let cut_time=now_ns();
@@ -611,14 +623,11 @@ async fn run_composition(root:&Path) {
         live.cloud_enabled.store(false,Ordering::Release);
         let cut=read_records::<Actuation>(&guard.root.join("actuator.jsonl")).len();
         let deadline=tokio::time::Instant::now()+Duration::from_secs_f64(OBSERVATION_TTL+5.0);
-        // 近期来源到期沿生产SafetyFailed围栏终止目标，执行器通过zero()归零。
-        // 不能要求它伪造一条非空操作身份的普通零速命令。
-        let (expired,zero_event,last_source,maturity)=loop {
+        let (paused,zero_event,last_source,maturity)=loop {
             let events:Vec<Actuation>=read_records(&guard.root.join("actuator.jsonl"));
             let (last_source,maturity,state)={
                 let ledger=readers.ledger.lock().unwrap();
-                // Re-read the actual publication ledger each time: a final
-                // sensor frame already in flight at cutoff may publish later.
+                // 每次重读实际发布台账：断开时已在途的最后一帧可能稍后才发布。
                 let last_source=ledger.maps.iter().filter(|map|!map.cleared
                     && map.committed_map.session_id=="composition-restored" && map.source_timestamp_ns>0)
                     .map(|map|map.source_timestamp_ns as u64).max().expect("restored-map source evidence");
@@ -626,38 +635,34 @@ async fn run_composition(root:&Path) {
                 let state=ledger.states.iter().rev().find(|state| {
                     let stamp=state.stamp_sec as u64*1_000_000_000+state.stamp_nsec as u64;
                     goal_state_matches(state,&expiry_goal) && stamp>=cut_time && stamp>=maturity
-                        && state.state==4
-                        && state.message=="SafetyFailed cause=StaleInput: recent obstacle source deadline elapsed"
-                        && !state.zero_ack_id.is_empty() && state.zero_applied_monotonic_ns>0
+                        && state.state==2
+                        && state.message=="等待新鲜导航输入: recent obstacle source deadline elapsed"
                 }).cloned();
                 (last_source,maturity,state)
             };
             let mature_monotonic=cut_monotonic.saturating_add(maturity.saturating_sub(cut_time));
-            let zero=events.iter().skip(cut).rev().find(|event|event.twist==[0.0;3]
+            let zero=events.iter().skip(cut).find(|event|event.twist==[0.0;3]
                 && event.at>=mature_monotonic).cloned();
             if now_ns()>=maturity {
-                if let (Some(state),Some(zero))=(state,zero) {
-                    assert!(state.zero_applied_monotonic_ns as u64>=zero.at,
-                        "精确停车回执不能早于实际执行器归零");
-                    break (state,zero,last_source,maturity);
-                }
+                if let (Some(state),Some(zero))=(state,zero) {break (state,zero,last_source,maturity);}
             }
-            assert!(tokio::time::Instant::now()<deadline,"来源到期必须完成真实安全围栏和精确归零: {}",diagnostic(&readers.ledger,live));
+            assert!(tokio::time::Instant::now()<deadline,"来源到期必须暂停执行并实际归零: {}",diagnostic(&readers.ledger,live));
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
-        assert_exact_zero(&guard.socket(),&expired).await;
         tokio::time::sleep(Duration::from_millis(150)).await;
         live.integrated.lock().unwrap().consume(&guard.root.join("actuator.jsonl"));
         assert_eq!(live.integrated.lock().unwrap().command,[0.0;3],"expiry holds zero before cancel");
         let quiet_events:Vec<Actuation>=read_records(&guard.root.join("actuator.jsonl"));
         assert!(quiet_events.iter().filter(|event|event.at>=zero_event.at)
             .all(|event|event.twist==[0.0;3]),"no nonzero burst is allowed after expiry hold and before cancellation");
+        assert!(!readers.ledger.lock().unwrap().states.iter().any(|state|goal_state_matches(state,&expiry_goal)
+            && (matches!(state.state,3|4) || state.message.starts_with("CANCELLED:"))),
+            "来源到期只暂停，目标不能终止: {}",diagnostic(&readers.ledger,live));
         assert!((live.pose()[0]-2.4).abs()>POSITION_TOLERANCE,"expiry goal must not be mistaken for arrival");
-        eprintln!("ASSIGNED_COMPOSITION observation_expiry_fence source_ns={last_source} deadline_ns={maturity} terminal_ns={} actual_zero_monotonic_ns={} exact_zero_monotonic_ns={} reason={:?} exact_zero={}",
-            expired.stamp_sec as u64*1_000_000_000+expired.stamp_nsec as u64,zero_event.at,
-            expired.zero_applied_monotonic_ns,expired.message,expired.zero_ack_id);
+        eprintln!("ASSIGNED_COMPOSITION observation_expiry_pause source_ns={last_source} deadline_ns={maturity} paused_ns={} actual_zero_monotonic_ns={} reason={:?}",
+            paused.stamp_sec as u64*1_000_000_000+paused.stamp_nsec as u64,zero_event.at,paused.message);
 
-        // 真实新云恢复后另发活动目标，独立验证取消，不能取消已终止的到期目标冒充成功。
+        // 真实新云恢复后取消这个仍未终止的到期目标；取消须取得自己围栏的精确停车回执。
         live.cloud_enabled.store(true,Ordering::Release);
         tokio::time::timeout(Duration::from_secs(5),async {
             loop {
@@ -667,29 +672,24 @@ async fn run_composition(root:&Path) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.expect("恢复后的真实点云必须完成新来源发布");
-        wait_ready(&mut client).await;
-        let baseline=read_records::<Actuation>(&guard.root.join("actuator.jsonl")).len();
-        let admitted=submit_goal(&mut client,&guard.socket(),"restored-cancel",2.4,0.35).await;
-        let cancel_goal=observed_goal(&readers.ledger,"restored-cancel").await;
-        moving_evidence(&readers.ledger,live,&guard,&cancel_goal,baseline).await;
         let cancel=CancelNavigationRequest {
 global_stop_confirmation: None,
-goal_id:admitted.goal_id,
-            owner_kind:admitted.owner_kind,parent_request_id:admitted.parent_request_id,
-            goal_generation:admitted.goal_generation,producer_runtime_generation:admitted.producer_runtime_generation};
+goal_id:expiry_admitted.goal_id,
+            owner_kind:expiry_admitted.owner_kind,parent_request_id:expiry_admitted.parent_request_id,
+            goal_generation:expiry_admitted.goal_generation,producer_runtime_generation:expiry_admitted.producer_runtime_generation};
         let pending=client.cancel_navigation(cancel.clone()).await.unwrap().into_inner();
         assert!(pending.cancel_generation>0,"actual held goal must enter cancellation: {pending:?}");
         let deadline=tokio::time::Instant::now()+Duration::from_secs(5);
         let terminal=loop {
             if let Some(state)=readers.ledger.lock().unwrap().states.iter().rev().find(|state|
-                goal_state_matches(state,&cancel_goal) && state.state==0 && state.message.starts_with("CANCELLED:")
+                goal_state_matches(state,&expiry_goal) && state.state==0 && state.message.starts_with("CANCELLED:")
                 && state.cancel_generation==pending.cancel_generation as i64
                 && !state.zero_ack_id.is_empty() && state.zero_applied_monotonic_ns>0).cloned() {break state;}
             assert!(tokio::time::Instant::now()<deadline,"cancel must produce exact terminal fence after prior zero hold: {}",diagnostic(&readers.ledger,live));
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
         assert_exact_zero(&guard.socket(),&terminal).await;
-        assert_ne!(terminal.zero_ack_id,expired.zero_ack_id,"取消必须取得其独立围栏的精确停车回执");
+        assert_ne!(terminal.zero_ack_id,arrived.zero_ack_id,"取消必须取得其独立围栏的精确停车回执");
         let cancelled=client.cancel_navigation(cancel).await.unwrap().into_inner();
         assert!(cancelled.actuator_zeroed,"cancel replay resolves only with actual zero: {cancelled:?}");
         assert_eq!(cancelled.zero_ack_id,terminal.zero_ack_id,"cancel replays exact terminal fence");
@@ -757,12 +757,16 @@ fn isolated_case(name:&str) {
             || key.to_string_lossy().starts_with("_NUWAX_NAV_ACTUATOR_") {command.env_remove(key);}
     }
     let full=format!("server::lifecycle_tests::assigned_navigation_composition::{name}");
-    let result=command.args(["--exact",&full,"--nocapture"]).env(CHILD_MODE,name).output().unwrap();
+    // 子进程必须实际执行同一用例；用例在调试构建下标为忽略，不能让子进程把它跳过后空报成功。
+    let result=command.args(["--exact",&full,"--include-ignored","--nocapture"]).env(CHILD_MODE,name).output().unwrap();
     eprintln!("{}",String::from_utf8_lossy(&result.stdout));
     eprintln!("{}",String::from_utf8_lossy(&result.stderr));
     assert!(result.status.success(),"restored production composition subprocess failed: {}",result.status);
 }
 #[test]
+// 实时端到端组合：位姿采样时效为 1 秒，调试构建下在线地面捕获每帧约 2 秒，必然超时。
+// 用发布构建运行：cargo test --release --bin nuwax-geometry-runtime -- --exact <本用例> --test-threads=1
+#[cfg_attr(debug_assertions, ignore = "实时端到端组合依赖发布构建性能，调试构建在线地面捕获超过位姿时效")]
 fn assigned_v2_restored_production_navigation_scan_arrives_and_expiry_stops() {
     isolated_case("assigned_v2_restored_production_navigation_scan_arrives_and_expiry_stops");
 }

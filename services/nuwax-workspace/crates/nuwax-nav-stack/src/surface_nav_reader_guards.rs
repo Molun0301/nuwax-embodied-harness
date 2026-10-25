@@ -513,18 +513,22 @@ async fn complete_successor(queued_while_inflight: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需外部设置NUWAX_LCM_URL=memq://以验证真实缺块通信；见任务E反馈中的独立命令"]
 async fn real_reader_same_missing_watermark_after_failure_keeps_original_deadline() {
     same_missing_watermarks(false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需外部设置NUWAX_LCM_URL=memq://以验证真实缺块通信；见任务E反馈中的独立命令"]
 async fn real_reader_same_missing_watermark_pending_inflight_keeps_original_deadline() {
     same_missing_watermarks(true).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需外部设置NUWAX_LCM_URL=memq://以验证真实缺块通信；见任务E反馈中的独立命令"]
 async fn real_reader_complete_successor_after_failure_starts_before_original_deadline() {
     complete_successor(false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需外部设置NUWAX_LCM_URL=memq://以验证真实缺块通信；见任务E反馈中的独立命令"]
 async fn real_reader_complete_successor_pending_inflight_starts_before_original_deadline() {
     complete_successor(true).await;
 }

@@ -278,41 +278,41 @@ async fn baseline_rejection_precedence_and_atomic_state() {
         .unwrap();
     reject_unchanged(&mut state, &accepted, &authority, &handle, "replay").await;
 
-    let mut p = packet(&[[0.5, 0.5, 0.55]], 2, false, false);
-    p.cloud.as_mut().unwrap().cloud.fields[0].datatype = 5;
-    p.cloud.as_mut().unwrap().cloud.fields[2].name = "not_z".into();
-    reject_unchanged(
-        &mut state,
-        &recent_cloud::encode_body(&p).unwrap(),
-        &authority,
-        &handle,
-        "missing z",
-    )
-    .await;
-    p.cloud.as_mut().unwrap().cloud.fields[2].name = "z".into();
-    reject_unchanged(
-        &mut state,
-        &recent_cloud::encode_body(&p).unwrap(),
-        &authority,
-        &handle,
-        "unsupported datatype 5",
-    )
-    .await;
+    // 当前发送边界也验证XYZ，因此先编码合法包，再模拟线上相同长度载荷损坏。
+    fn corrupt_cloud(packet: &recent_cloud::RecentCloud3D, change: impl FnOnce(&mut schema::PointCloud2)) -> Vec<u8> {
+        let mut wire = recent_cloud::encode_body(packet).unwrap();
+        let mut cloud = packet.cloud.as_ref().unwrap().cloud.clone();
+        let old = schema::encode_point_cloud2_body(&cloud).unwrap();
+        assert!(wire.ends_with(&old));
+        change(&mut cloud);
+        let altered = schema::encode_point_cloud2_body(&cloud).unwrap();
+        assert_eq!(altered.len(), old.len(), "仅替换载荷，保留完整包长度");
+        let offset = wire.len() - old.len();
+        wire[offset..].copy_from_slice(&altered);
+        wire
+    }
+    let p = packet(&[[0.5, 0.5, 0.55]], 2, false, false);
+    let invalid_type_and_axis = corrupt_cloud(&p, |cloud| {
+        cloud.fields[0].datatype = 5;
+        cloud.fields[2].name = "q".into();
+    });
+    reject_unchanged(&mut state, &invalid_type_and_axis, &authority, &handle,
+        "XYZ fields must be unique scalar floats").await;
+    let missing_axis = corrupt_cloud(&p, |cloud| cloud.fields[2].name = "q".into());
+    reject_unchanged(&mut state, &missing_axis, &authority, &handle,
+        "must declare XYZ coordinates").await;
 
     for points in [
         vec![[1e12, 0.5, 0.55], [0.5, f64::NAN, 0.55]],
         vec![[0.5, 0.5, f64::INFINITY]],
         vec![[f64::NAN, 0.5, 0.55]],
     ] {
-        let p = packet(&points, 3, true, false);
-        reject_unchanged(
-            &mut state,
-            &recent_cloud::encode_body(&p).unwrap(),
-            &authority,
-            &handle,
-            "invalid admitted points",
-        )
-        .await;
+        let damaged = packet(&points, 3, true, false);
+        let finite: Vec<_> = points.iter().map(|p| p.map(|v| if v.is_finite() { v } else { 0. })).collect();
+        let valid = packet(&finite, 3, true, false);
+        let wire = corrupt_cloud(&valid, |cloud| cloud.data = damaged.cloud.as_ref().unwrap().cloud.data.clone());
+        reject_unchanged(&mut state, &wire, &authority, &handle,
+            "world coordinates must be finite").await;
     }
     let p = packet(&[[1e12, 0.5, 0.55]], 4, true, false);
     reject_unchanged(

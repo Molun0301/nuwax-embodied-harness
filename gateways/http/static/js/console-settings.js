@@ -28,6 +28,8 @@ const CONFIG_SINGLE_COLOR_KEYS = new Set([
   "NUWAX_GATEWAY_POINTCLOUD3D_OBJECT_COLOR",
 ]);
 const CONFIG_HEIGHT_COLORS_KEY = "NUWAX_GATEWAY_POINTCLOUD3D_HEIGHT_COLORS";
+const FINE_CLOUD_CACHE_KEY = "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_MIB";
+const FINE_CLOUD_CACHE_MAX_KEY = "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_AUTO_MAX_MIB";
 const CONFIG_HEX_COLOR_PATTERN = /^#[0-9a-fA-F]{6}$/;
 function configEscape(text) {
   return String(text == null ? "" : text).replace(/[&<>"']/g, (c) => (
@@ -331,6 +333,8 @@ function renderConfigSchema(schema) {
   let sectionIndex = 0;
   for (const section of schema.sections || []) {
     const fields = (section.fields || []).filter(match);
+    // 模式放在预算上限之前，其余设置继续沿用目录顺序。
+    fields.sort((a, b) => Number(b.key === FINE_CLOUD_CACHE_KEY) - Number(a.key === FINE_CLOUD_CACHE_KEY));
     if (!fields.length) continue;
     const normal = fields.filter((f) => !f.advanced);
     const advanced = fields.filter((f) => f.advanced);
@@ -390,7 +394,7 @@ function syncGeometryPipelineFields() {
   for (const row of document.querySelectorAll("#configSections [data-key]")) {
     const key = row.dataset.key;
     const spatial = ["NUWAX_GEOMETRY_LIO_BACKEND", "NUWAX_GEOMETRY_MAPPING_BACKEND",
-      "NUWAX_GEOMETRY_CORRECTION_BACKEND", "NUWAX_GEOMETRY_PGO_OPTIONS", "NUWAX_NAV_BODY_TO_SUPPORT_Z_M",
+      "NUWAX_GEOMETRY_CORRECTION_BACKEND", "NUWAX_GEOMETRY_PGO_OPTIONS", FINE_CLOUD_CACHE_KEY, FINE_CLOUD_CACHE_MAX_KEY, "NUWAX_NAV_BODY_TO_SUPPORT_Z_M",
       "NUWAX_NAV_ROBOT_HEIGHT_M", "NUWAX_NAV_SURFACE_VOXEL_SIZE_M",
       "NUWAX_NAV_MIN_STAIR_TREAD_M", "NUWAX_GEOMETRY_TRAVERSABILITY_MAX_STEP_HEIGHT_M",
       "NUWAX_GEOMETRY_TRAVERSABILITY_MAX_SLOPE_DEG"].includes(key)
@@ -400,6 +404,52 @@ function syncGeometryPipelineFields() {
     row.style.opacity = disabled ? "0.5" : "";
     if (spatial) row.title = disabled ? "该设置仅用于三维执行链" : "";
   }
+  syncFineCloudCacheFields();
+}
+function syncFineCloudCacheFields() {
+  const field = configState.lastSchema?.sections.flatMap(section => section.fields || [])
+    .find(item => item.key === FINE_CLOUD_CACHE_KEY);
+  const budget = String(configState.dirty.get(FINE_CLOUD_CACHE_KEY)
+    ?? configState.acknowledgedValues.get(FINE_CLOUD_CACHE_KEY) ?? field?.value ?? 'auto').trim();
+  const row = document.querySelector('#configSections [data-key="' + FINE_CLOUD_CACHE_MAX_KEY + '"]');
+  if (row) row.hidden = Boolean(budget && budget !== 'auto' && !configState.errors.has(FINE_CLOUD_CACHE_MAX_KEY));
+}
+function buildFineCloudCacheEditor(field, rawInput, onInput) {
+  const host = document.createElement('div');
+  const mode = document.createElement('select');
+  mode.id = 'cfgmode__' + field.key;
+  mode.className = 'field';
+  mode.setAttribute('aria-label', '精细点云缓存模式');
+  mode.replaceChildren(...[['auto', '自动'], ['fixed', '固定']].map(([value, textContent]) =>
+    Object.assign(document.createElement('option'), { value, textContent })));
+  const fixedLabel = document.createElement('label');
+  fixedLabel.textContent = '固定预算（MiB，二进制兆字节）';
+  const fixed = document.createElement('input');
+  fixed.className = 'field';
+  // 保留原始输入供保存边界校验，避免数字控件把非法文本转换为空值后意外恢复自动。
+  fixed.type = 'text'; fixed.inputMode = 'numeric'; fixed.pattern = '[0-9]*';
+  fixed.placeholder = '16～4096；留空恢复自动';
+  fixed.setAttribute('aria-label', '精细点云固定缓存预算（MiB）');
+  const initial = rawInput.value.trim();
+  mode.value = !initial || initial === 'auto' ? 'auto' : 'fixed';
+  fixed.value = mode.value === 'fixed' ? initial : '32';
+  fixedLabel.hidden = mode.value !== 'fixed';
+  fixedLabel.appendChild(fixed);
+  rawInput.type = 'hidden';
+  for (const control of [mode, fixed]) {
+    if (field.readonly) { control.disabled = true; control.dataset.readonly = 'true'; }
+  }
+  mode.addEventListener('change', () => {
+    fixedLabel.hidden = mode.value !== 'fixed';
+    rawInput.value = mode.value === 'auto' ? 'auto' : fixed.value;
+    onInput(); syncFineCloudCacheFields();
+  });
+  fixed.addEventListener('input', () => {
+    rawInput.value = fixed.value;
+    onInput(); syncFineCloudCacheFields();
+  });
+  host.append(mode, fixedLabel);
+  return host;
 }
 function setupConfigScrollSpy(host, navLinks) {
   if (host._spy) host.removeEventListener("scroll", host._spy);
@@ -528,6 +578,13 @@ function buildConfigRow(f, applying = false) {
   };
   input.addEventListener("input", handleTextInput);
   input.addEventListener("change", handleTextInput);
+  if (f.key === FINE_CLOUD_CACHE_KEY) {
+    cell.appendChild(buildFineCloudCacheEditor(f, input, handleTextInput));
+    label.htmlFor = 'cfgmode__' + f.key;
+  } else if (f.key === FINE_CLOUD_CACHE_MAX_KEY) {
+    input.type = 'text'; input.inputMode = 'numeric'; input.pattern = '[0-9]*';
+    input.placeholder = '32～4096；留空使用 256';
+  }
   if (f.options_schema) {
     row.classList.add('config-options-row');
     const editor = buildOptionsEditor(f, input, handleTextInput);

@@ -2,18 +2,21 @@
 #define _GRID_MAP_H
 
 // Ported from wuyi2121/SCAN-Planner@348e8a590a50a5a6bbab8d8c6dcfd171f009be26.
-// LiDAR-only transport adaptation; occupancy, raycasting, sliding and query math remain A.
+// 保留作者A的占据概率、射线及滑动缓存；真实机体查询和静态夹具由宿主适配。
 #include <author_host.h>
 #include <Eigen/Eigen>
 #include <Eigen/StdVector>
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <functional>
 #include <utility>
 #include <memory>
 #include <queue>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <tuple>
 #include <plan_env/raycast.h>
@@ -49,6 +52,7 @@ struct MappingParameters {
   double resolution_, resolution_inv_;
   double obstacles_inflation_z_up, obstacles_inflation_z_down;
   double double_cylinder_radius_, double_cylinder_offset_;
+  double body_length_, body_width_;
   Eigen::Vector3d body_center_offset_; // Host physical reference -> body center, not A tuning.
   bool map_sliding_en_;
   double map_sliding_thresh_;
@@ -93,6 +97,9 @@ struct MappingData {
   std::vector<double> occupancy_buffer_;
   std::vector<char> occupancy_buffer_inflate_;
   std::vector<int> occupancy_buffer_inflate_cnt_;
+  // 原概率占据阈值的派生位图，布局按XY列分组，和原环形缓冲一同更新与清除。
+  std::vector<std::uint64_t> occupancy_bits_;
+  int occupancy_words_per_column_;
   vector<Eigen::Vector3i> inflate_offsets_;
 
   // raycast origin and sensor pose data
@@ -158,7 +165,7 @@ public:
   inline int getOccupancy(Eigen::Vector3d pos);
   inline int getOccupancy(Eigen::Vector3i id);
   inline int getInflateOccupancy(Eigen::Vector3d pos, double yaw);
-  // Original A query, with its unchanged front/rear ordering and -1 outside result.
+  // 双圆柱候选查询保留前后顺序及图外-1；真实外包由getInflateOccupancy复核。
   inline int getAuthorInflateOccupancy(Eigen::Vector3d pos, double yaw);
 
   inline void boundIndex(Eigen::Vector3i& id);
@@ -225,6 +232,9 @@ public:
 private:
   MappingParameters mp_;
   MappingData md_;
+  // 仅静态夹具记录上次完整占据集合；生产原帧不使用此集合。
+  std::set<std::array<int, 3>> static_cells_;
+
 
   // main update process
   void raycastProcess();
@@ -243,6 +253,7 @@ private:
   void resetCellByAddressForSliding(int addr, const std::vector<char>& clear_mask);
   void hashIdToGlobalIndex(int addr, Eigen::Vector3i& id_g) const;
   void applyOccupancyUpdate(const Eigen::Vector3i& id, double new_log_odds);
+  void updateOccupiedBit(int address, bool occupied);
   void rebuildInflationOffsets();
   void updateInflation(const Eigen::Vector3i& id, int delta, const std::vector<char>* ignore_mask = nullptr);
   void updateInflationLayer(const Eigen::Vector3i& id, int delta,
@@ -365,7 +376,65 @@ inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos, double yaw) {
   pos.x() += c * mp_.body_center_offset_.x() - s * mp_.body_center_offset_.y();
   pos.y() += s * mp_.body_center_offset_.x() + c * mp_.body_center_offset_.y();
   pos.z() += mp_.body_center_offset_.z();
-  return getAuthorInflateOccupancy(pos, yaw);
+  // 原膨胀缓冲已经覆盖候选；竖向精查统一在下方矩形中执行，避免重复扫描偏移体积。
+  const Eigen::Vector3d heading(c, s, 0.);
+  const auto candidate = [&](const Eigen::Vector3d& point) {
+    if (!isInMap(point)) return -1;
+    Eigen::Vector3i id;
+    posToIndex(point, id);
+    return static_cast<int>(md_.occupancy_buffer_inflate_[toAddress(id)]);
+  };
+  const int front = candidate(pos + mp_.double_cylinder_offset_ * heading);
+  const int rear = candidate(pos - mp_.double_cylinder_offset_ * heading);
+  if (front < 0 || rear < 0) return -1;
+  if (front == 0 && rear == 0) return 0;
+
+  // 双圆柱只提供保守候选；按真实矩形与原占据体素的四条分离轴复核。
+  // 机体和格子闭边接触仍是碰撞，竖向沿原台阶碰撞带使用正体积相交。
+  const double hx = mp_.body_length_ / 2., hy = mp_.body_width_ / 2.;
+  const double r = mp_.resolution_, half_cell = r / 2.;
+  const double ac = std::abs(c), as = std::abs(s);
+  const double extent_x = ac * hx + as * hy, extent_y = as * hx + ac * hy;
+  const double low = pos.z() - mp_.obstacles_inflation_z_up;
+  const double high = pos.z() + mp_.obstacles_inflation_z_down;
+  const int x0 = static_cast<int>(std::floor((pos.x() - extent_x) / r)) - 1;
+  const int x1 = static_cast<int>(std::floor((pos.x() + extent_x) / r));
+  const int y0 = static_cast<int>(std::floor((pos.y() - extent_y) / r)) - 1;
+  const int y1 = static_cast<int>(std::floor((pos.y() + extent_y) / r));
+  int z0 = std::max(static_cast<int>(std::floor(low / r)), mp_.map_bound_min_idx_.z());
+  int z1 = std::min(static_cast<int>(std::ceil(high / r)) - 1, mp_.map_bound_max_idx_.z());
+  while (z0 <= z1 && (z0 + 1.) * r <= low) ++z0;
+  while (z0 <= z1 && z1 * r >= high) --z1;
+  if (z0 > z1) return 0;
+  const int nz = mp_.map_voxel_num_.z(), local_z = getLocalIndex(z0, 2);
+  const int first_count = std::min(z1 - z0 + 1, nz - local_z);
+  const int second_count = z1 - z0 + 1 - first_count;
+  for (int x = std::max(x0, mp_.map_bound_min_idx_.x()); x <= std::min(x1, mp_.map_bound_max_idx_.x()); ++x)
+    for (int y = std::max(y0, mp_.map_bound_min_idx_.y()); y <= std::min(y1, mp_.map_bound_max_idx_.y()); ++y)
+    {
+      const double dx = (x + .5) * r - pos.x(), dy = (y + .5) * r - pos.y();
+      if (std::abs(dx) > extent_x + half_cell || std::abs(dy) > extent_y + half_cell
+          || std::abs(c * dx + s * dy) > hx + half_cell * (ac + as)
+          || std::abs(-s * dx + c * dy) > hy + half_cell * (ac + as))
+        continue;
+      // 位图与原概率阈值完全对应；环形Z范围仍按相同两段查询。
+      const std::size_t column = getLocalIndex(x, 0) * mp_.map_voxel_num_.y() + getLocalIndex(y, 1);
+      const auto* bits = md_.occupancy_bits_.data() + column * md_.occupancy_words_per_column_;
+      const auto occupied = [&](int begin, int count) {
+        if (count == 0) return false;
+        const int first_word = begin / 64, last_word = (begin + count - 1) / 64;
+        for (int word = first_word; word <= last_word; ++word) {
+          std::uint64_t mask = ~std::uint64_t{0};
+          if (word == first_word) mask &= ~std::uint64_t{0} << (begin % 64);
+          if (word == last_word && (begin + count) % 64 != 0)
+            mask &= (std::uint64_t{1} << ((begin + count) % 64)) - 1;
+          if (bits[word] & mask) return true;
+        }
+        return false;
+      };
+      if (occupied(local_z, first_count) || occupied(0, second_count)) return 1;
+    }
+  return 0;
 }
 
 inline int GridMap::getAuthorInflateOccupancy(Eigen::Vector3d pos, double yaw) {
@@ -389,7 +458,7 @@ inline int GridMap::getInflateOccupancyFromBuffer(Eigen::Vector3d pos, const std
 
   // The original ceil-based dilation is a conservative candidate index. Its
   // query-cell phase must not enlarge the calibrated vertical collision band.
-  // Preserve the original XY stencil and probability threshold, but resolve
+  // Preserve the conservative XY candidate index and probability threshold, but resolve
   // each candidate against its original occupied half-open voxel volume.
   // Positive-volume intersection is required; no epsilon or shifted surface.
   const double low = pos.z() - mp_.obstacles_inflation_z_up;

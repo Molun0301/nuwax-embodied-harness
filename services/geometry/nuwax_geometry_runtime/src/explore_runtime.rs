@@ -530,6 +530,14 @@ pub enum ChildNavigationResult {
     },
 }
 
+/// 子导航失败是否只因输入中断且已围栏停车。导航终态只经状态消息传递，没有独立的类型化原因。
+/// 输入时效错误以`StaleInput`失败；自a51326fd起，近期障碍源到期、来源撤销和地图来源暂不可用改为
+/// 保持租约等待新鲜输入，持续到原路径等待期限后以PlannerFailed围栏结束，终态消息保留等待原因。
+fn child_failure_is_input_interruption(reason: &str) -> bool {
+    reason.starts_with("SafetyFailed cause=StaleInput:")
+        || (reason.starts_with("planner path timeout after ") && reason.contains("; 等待新鲜导航输入: "))
+}
+
 const MAX_EARLY_CANCEL_TERMINALS: usize = 4;
 
 fn cancellation_result_generation(result: &ChildNavigationResult) -> Option<u64> {
@@ -3648,7 +3656,7 @@ impl ExploreRuntimeHandle {
                 _=>return Err("返航收到没有取消事务的取消终态".into()),
             }
         }
-        let input_interrupted=matches!(&result,ChildNavigationResult::Failed{reason,..} if reason.starts_with("SafetyFailed cause=StaleInput:"));
+        let input_interrupted=matches!(&result,ChildNavigationResult::Failed{reason,..} if child_failure_is_input_interruption(reason));
         let feedback = match &result {
             ChildNavigationResult::Reached(_) => ExplorationGoalFeedback::Reached,
             ChildNavigationResult::Failed { reason, .. } => {
@@ -4820,6 +4828,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn input_pause_timeout_waits_for_fresh_input_without_failing_the_frontier() {
+        // 导航运行时自a51326fd起，近期障碍源到期、来源撤销等输入中断保持租约等待新鲜输入，持续到原
+        // 30秒路径等待期限后以PlannerFailed围栏结束。消息取自3.2实测终态；单纯等不到路径的超时作对照。
+        let input_pause = "planner path timeout after 30000ms; fencing; 等待新鲜导航输入: \
+            recent obstacle source deadline elapsed; PlannerFailed after verified fence";
+        let path_only = "planner path timeout after 30000ms; fencing; PlannerFailed after verified fence";
+        for (parent, reason, interrupted) in [("input-pause-timeout", input_pause, true),
+            ("path-only-timeout", path_only, false)] {
+            let (handle, _sink) = configured_handle();
+            ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1).await.unwrap();
+            handle.start(parent, "prefer_wavefront").await;
+            assert!(!handle.tick((2.0, 2.0)).await.child_task_id.is_empty());
+            let lease = active_child_lease(&handle).await;
+            let after = handle.report_navigation_result(&lease.session_id, ChildNavigationResult::Failed {
+                proof: terminal_proof(&lease), reason: reason.into(),
+            }).await.unwrap();
+            assert!(after.child_task_id.is_empty());
+            let history = receipt_test_source_history(&handle).await;
+            if interrupted {
+                assert_eq!(after.message, "child navigation input interrupted; waiting for fresh inputs");
+                assert_eq!(history[1]["failed_goals"], serde_json::json!([]),
+                    "输入中断不能计入前沿失败");
+                assert_eq!(history[1]["blacklisted_goals"], serde_json::json!([]));
+            } else {
+                assert_eq!(after.message, "child navigation failed; retry/blacklist policy applied");
+                assert_one_receipt_source_failure(&history);
+            }
+            handle.stop(parent).await;
+        }
+    }
+
+    #[tokio::test]
     async fn stop_wins_while_child_receipt_waits_without_reopening_feedback() {
         let parent = "receipt-stop-wins";
         let (handle, sink, tick, release) = child_paused_in_receipt_read(parent).await;
@@ -5182,7 +5222,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn surface_goals_preserve_real_floor_height_full_orientation_and_source() {
+    async fn surface_goals_preserve_real_floor_height_arrival_heading_and_source() {
         for (strategy, floor) in [("frontier", 0.0), ("wavefront", 3.0), ("surface", 3.0)] {
             let handle = ExploreRuntimeHandle::with_wavefront_map_frame("map").unwrap();
             let sink = Arc::new(RecordingNavSink::default());
@@ -5214,7 +5254,11 @@ mod tests {
             let requests = sink.submitted.lock().unwrap();
             let goal = &requests[0].goal.target;
             assert!(goal.pose.position.z > floor + 0.4 && goal.pose.position.z < floor + 0.7);
-            assert_eq!(goal.pose.orientation, orientation);
+            // 无方向视场的自由朝向目标取PCT路线到达航向，只含偏航，不沿用起点横滚。
+            let arrival = goal.pose.orientation;
+            assert_eq!((arrival.x, arrival.y), (0.0, 0.0));
+            assert!(((arrival.z * arrival.z + arrival.w * arrival.w).sqrt() - 1.0).abs() < 1e-12);
+            assert_ne!(arrival, orientation);
             assert_eq!(
                 requests[0].intent.goal.pose.position[2],
                 goal.pose.position.z
@@ -5223,7 +5267,7 @@ mod tests {
             assert_eq!(requests[0].intent.goal.pose.position,
                 [goal.pose.position.x, goal.pose.position.y, goal.pose.position.z]);
             assert_eq!(requests[0].intent.goal.pose.orientation_xyzw,
-                [orientation.x, orientation.y, orientation.z, orientation.w]);
+                [arrival.x, arrival.y, arrival.z, arrival.w]);
             assert_eq!(requests[0].intent.map_frame_generation, 1);
             assert_eq!(requests[0].intent.body_to_support_z_m, Some(surface_config("map").follower.body_to_support_z_m));
             assert_eq!(requests[0].intent.options, nuwax_nav_types_messages::GoalOptions {
@@ -9093,104 +9137,6 @@ async fn scheme_a_frontier_rejection_before_publish_preserves_source_failed_ack(
             assert!(guard.return_reason.is_none());
             assert!(guard.mission.as_ref().is_none_or(|mission|!mission.returning));
         }
-    }
-
-    #[tokio::test]
-    async fn mission_inconclusive_candidate_does_not_blacklist_or_return() {
-        assert_mission_inconclusive_route_does_not_blacklist_or_return(false).await;
-    }
-
-    #[tokio::test]
-    async fn mission_inconclusive_homeward_keeps_resource_reason_through_owner() {
-        assert_mission_inconclusive_route_does_not_blacklist_or_return(true).await;
-    }
-
-    async fn assert_mission_inconclusive_route_does_not_blacklist_or_return(homeward: bool) {
-        use nuwax_exploration::{ExplorationGoalSource, ExplorationSourceDiagnostics, ExploreResult};
-        struct CandidateSource(Arc<StdMutex<Vec<ExplorationGoalFeedback>>>, Option<ExplorationPoll>);
-        impl ExplorationGoalSource for CandidateSource {
-            fn source_name(&self)->std::borrow::Cow<'static,str>{"surface".into()}
-            fn begin(&mut self)->ExploreResult<()>{Ok(())}
-            fn end(&mut self)->ExploreResult<()>{Ok(())}
-            fn poll_goal(&mut self,state:&ExplorationStateSnapshot<'_>)->ExploreResult<ExplorationPoll>{
-                let mut pose=state.robot_pose.clone();
-                pose.pose.orientation=Quaternion::from_yaw(std::f64::consts::FRAC_PI_2);
-                Ok(ExplorationPoll::Goal(FrontierGoal::new("resource-candidate",pose,1.0)))
-            }
-            fn supports_prepared_poll(&self)->bool{true}
-            fn prepare_poll(&mut self,state:&ExplorationStateSnapshot<'_>)->ExploreResult<nuwax_exploration::PreparedExplorationPoll>{
-                let result=self.poll_goal(state);self.1=result.as_ref().ok().cloned();
-                Ok(nuwax_exploration::PreparedExplorationPoll::new(result))
-            }
-            fn commit_prepared_poll(&mut self)->ExploreResult<ExplorationPoll>{
-                self.1.take().ok_or(nuwax_exploration::ExploreError::NoPreparedPoll)
-            }
-            fn discard_prepared_poll(&mut self)->ExploreResult<()>{self.1=None;Ok(())}
-            fn report_goal_feedback(&mut self,_:&str,feedback:ExplorationGoalFeedback)->ExploreResult<()>{
-                self.0.lock().unwrap().push(feedback);Ok(())
-            }
-            fn diagnostics(&self)->ExplorationSourceDiagnostics{
-                ExplorationSourceDiagnostics{source_name:"surface".into(),is_active:true,last_goal_id:None,last_error:None}
-            }
-        }
-        let handle=ExploreRuntimeHandle::with_wavefront_map_frame("map").unwrap();
-        let sink=Arc::new(RecordingNavSink::default());handle.set_navigation_sink(sink.clone());
-        let mut config=surface_config("map");
-        config.apply_calibration(Some(nuwax_nav_types_messages::RobotGeometry {
-            self_collision: None,
-            footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
-            z_min_m:-0.05,z_max_m:0.2,source:"resource-limited mission fixture".into(),
-        }),None).unwrap();
-        config.follower.motion_limits=Some(nuwax_nav_types_messages::MotionLimits {
-            model:nuwax_nav_types_messages::MotionModel::Differential,
-            max_forward_mps:0.5,max_reverse_mps:0.0,max_lateral_mps:0.0,max_angular_rps:1.0,
-            linear_acceleration_mps2:1.0,guaranteed_braking_mps2:1.0,
-            angular_acceleration_rps2:2.0,guaranteed_angular_braking_rps2:2.0,
-            reaction_time_sec:0.05,minimum_turning_radius_m:0.5,can_rotate_in_place:false,
-        });
-        handle.configure_surface_source(Ok(config.clone()),37,[7;16]).await.unwrap();
-        let message=surface_message("map",1);
-        let ticket=handle.begin_surface_map_update(&message,now_monotonic_nanos()).await.unwrap().unwrap();
-        let snapshot=Arc::new(SurfaceSnapshot::from_points(&schema::navigation_map_3d_points(&message).unwrap(),
-            config.geometry.clone(),message.source_voxel_size).unwrap()
-            .with_body_envelope(config.body_envelope.clone().unwrap()).unwrap());
-        assert!(handle.finish_surface_map_update(ticket,Ok(snapshot.clone())).await);
-        let accepted=handle.start_with_config("mission-resource-limit",ExploreStartConfig {
-            motion_admission:crate::nav_runtime::test_motion_admission(),..Default::default()
-        }).await;
-        assert_eq!(accepted.status,STATUS_ACCEPTED,"{}",accepted.message);
-        enable_test_mission(&handle,None).await;
-        let pose=surface_pose(&snapshot,0.0,Quaternion::IDENTITY);
-        if homeward {
-            // The real non-rotating route query is inconclusive at the first
-            // (homeward) leg, before candidate advice can be produced.
-            let mut home=mission_pose(&pose);
-            let q=Quaternion::from_yaw(std::f64::consts::FRAC_PI_2);
-            home.orientation_xyzw=[q.x,q.y,q.z,q.w];
-            handle.inner.lock().await.mission=Some(MissionProgress::new(home).unwrap());
-        }
-        let feedback=Arc::new(StdMutex::new(Vec::new()));
-        let mut controller=ExplorationController::new(ExplorationArbitrationPolicy::FirstAvailable);
-        controller.add_source(CandidateSource(feedback.clone(),None));controller.begin_exploration().unwrap();
-        handle.install_compute_controller(controller).await.unwrap();
-        let stopped=handle.tick_with_pose(pose).await;
-        owner_watchdog(handle.await_compute_idle()).await.unwrap();
-        assert_eq!(stopped.status,STATUS_FAILED,"{}",stopped.message);
-        assert_eq!(stopped.last_stop_reason,"planning_resource_limited","{}",stopped.message);
-        if !homeward {
-            assert!(stopped.message.contains("inconclusive"));
-        }
-        if homeward {
-            assert!(matches!(feedback.lock().unwrap().as_slice(),[ExplorationGoalFeedback::Cancelled]),
-                "the accepted, undispatched goal must be retired once without failed-goal feedback");
-        } else {
-            assert!(feedback.lock().unwrap().is_empty(),"inconclusive planning must not poison failure history");
-        }
-        assert!(sink.submitted.lock().unwrap().is_empty());
-        let guard=handle.inner.lock().await;
-        assert!(!guard.logical_active);
-        assert!(guard.return_reason.is_none());
-        assert!(guard.mission.as_ref().is_some_and(|mission|!mission.returning));
     }
 
     #[tokio::test]

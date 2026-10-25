@@ -1,4 +1,5 @@
 #include "path_searching/dyn_a_star.h"
+#include <author_diagnostics.h>
 #include <algorithm>
 #include <cmath>
 #include <chrono>
@@ -7,41 +8,28 @@
 using namespace std;
 using namespace Eigen;
 
-AStar::~AStar()
-{
-    for (int i = 0; i < POOL_SIZE_(0); i++)
-    {
-        for (int j = 0; j < POOL_SIZE_(1); j++)
-        {
-            for (int k = 0; k < POOL_SIZE_(2); k++)
-                delete GridNodeMap_[i][j][k];
-            delete[] GridNodeMap_[i][j];
-        }
-        delete[] GridNodeMap_[i];
-    }
-    delete[] GridNodeMap_;
-}
+AStar::~AStar() = default;
 
 void AStar::initGridMap(GridMap::Ptr occ_map, const Eigen::Vector3i pool_size)
 {
-    POOL_SIZE_ = pool_size;
     CENTER_IDX_ = pool_size / 2;
-
-    GridNodeMap_ = new GridNodePtr **[POOL_SIZE_(0)];
-    for (int i = 0; i < POOL_SIZE_(0); i++)
-    {
-        GridNodeMap_[i] = new GridNodePtr *[POOL_SIZE_(1)];
-        for (int j = 0; j < POOL_SIZE_(1); j++)
-        {
-            GridNodeMap_[i][j] = new GridNodePtr[POOL_SIZE_(2)];
-            for (int k = 0; k < POOL_SIZE_(2); k++)
-            {
-                GridNodeMap_[i][j][k] = new GridNode;
-            }
-        }
-    }
-
+    node_capacity_ = static_cast<std::size_t>(pool_size.x()) * pool_size.y() * pool_size.z();
+    openSet_ = decltype(openSet_){};
+    gridPath_.clear();
+    nodes_.clear();
+    nodes_.reserve(static_cast<std::size_t>(pool_size.x()) * pool_size.y());
     grid_map_ = occ_map;
+}
+
+GridNodePtr AStar::nodeFor(const Eigen::Vector3i& index)
+{
+    const std::array<int, 3> key{index.x(), index.y(), index.z()};
+    auto found = nodes_.find(key);
+    if (found != nodes_.end()) return &found->second;
+    if (nodes_.size() >= node_capacity_) return nullptr;
+    auto inserted = nodes_.try_emplace(key);
+    inserted.first->second.index = index;
+    return &inserted.first->second;
 }
 
 double AStar::getDiagHeu(GridNodePtr node1, GridNodePtr node2)
@@ -99,28 +87,26 @@ vector<GridNodePtr> AStar::retrievePath(GridNodePtr current)
     return path;
 }
 
-bool AStar::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt, Vector3d end_pt, Vector3i &start_idx, Vector3i &end_idx)
+bool AStar::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt, Vector3d end_pt, Vector3i &start_idx, Vector3i &end_idx, double start_yaw, double end_yaw)
 {
-    if (!Coord2Index(start_pt, start_idx) || !Coord2Index(end_pt, end_idx))
-        return false;
+    start_idx = Coord2Index(start_pt);
+    end_idx = Coord2Index(end_pt);
 
     Eigen::Vector3d start_to_end = end_pt - start_pt;
     if (start_to_end.norm() < 1e-6)
         return false;
-    const double path_yaw = std::atan2(start_to_end(1), start_to_end(0));
     start_to_end.normalize();
 
-    int occ = checkOccupancy(Index2Coord(start_idx), path_yaw);
+    int occ = checkOccupancy(Index2Coord(start_idx), start_yaw);
     if (occ)
     {
         //ROS_WARN("Start point is insdide an obstacle.");
         do
         {
             start_pt -= start_to_end * step_size_;
-            if (!Coord2Index(start_pt, start_idx))
-                return false;
+            start_idx = Coord2Index(start_pt);
 
-            occ = checkOccupancy(Index2Coord(start_idx), path_yaw);
+            occ = checkOccupancy(Index2Coord(start_idx), start_yaw);
             if (occ == -1)
             {
                 ROS_WARN("[Astar] Start point outside the map region.");
@@ -129,17 +115,16 @@ bool AStar::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt, Vector3d en
         } while (occ);
     }
 
-    occ = checkOccupancy(Index2Coord(end_idx), path_yaw);
+    occ = checkOccupancy(Index2Coord(end_idx), end_yaw);
     if (occ)
     {
         //ROS_WARN("End point is insdide an obstacle.");
         do
         {
             end_pt += start_to_end * step_size_;
-            if (!Coord2Index(end_pt, end_idx))
-                return false;
+            end_idx = Coord2Index(end_pt);
 
-            occ = checkOccupancy(Index2Coord(end_idx), path_yaw);
+            occ = checkOccupancy(Index2Coord(end_idx), end_yaw);
             if (occ == -1)
             {
                 ROS_WARN("[Astar] End point outside the map region.");
@@ -151,18 +136,44 @@ bool AStar::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt, Vector3d en
     return true;
 }
 
-ASTAR_RET AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d end_pt)
+ASTAR_RET AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d end_pt, double start_yaw, double end_yaw)
 {
     const auto time_1 = std::chrono::steady_clock::now();
     ++rounds_;
+    // 仅本轮节点可被当前格原点解释，旧路径指针先随原队列退休。
+    openSet_ = decltype(openSet_){};
+    gridPath_.clear();
+    nodes_.clear();
 
     step_size_ = step_size;
     inv_step_size_ = 1 / step_size;
     center_ = (start_pt + end_pt) / 2;
 
+    // 仅显式诊断时记录原失败原因；不改变搜索、时间或节点预算。
+    const auto trace_failure = [&](const char* reason, int iterations) {
+        if (!scan_planner::authorTraceEnabled()) return;
+        auto out = scan_planner::authorTraceStream();
+        out << "{\"event\":\"astar_failure\",\"reason\":\"" << reason
+            << "\",\"iterations\":" << iterations << ",\"step\":" << step_size_
+            << ",\"start_yaw\":" << start_yaw << ",\"end_yaw\":" << end_yaw
+            << ",\"detail\":" << std::quoted(scan_native_diagnostic)
+            << ",\"start\":";
+        scan_planner::traceMatrix(out, start_pt);
+        out << ",\"end\":"; scan_planner::traceMatrix(out, end_pt);
+        const auto snapped = [&](const Vector3d& point) -> Vector3d {
+            return ((((point - center_) * inv_step_size_).array() + .5).floor() * step_size_).matrix() + center_;
+        };
+        out << ",\"start_occupancy\":" << checkOccupancy(start_pt, start_yaw)
+            << ",\"end_occupancy\":" << checkOccupancy(end_pt, end_yaw)
+            << ",\"snapped_start_occupancy\":" << checkOccupancy(snapped(start_pt), start_yaw)
+            << ",\"snapped_end_occupancy\":" << checkOccupancy(snapped(end_pt), end_yaw);
+        out << "}\n";
+    };
+
     Vector3i start_idx, end_idx;
-    if (!ConvertToIndexAndAdjustStartEndPoints(start_pt, end_pt, start_idx, end_idx))
+    if (!ConvertToIndexAndAdjustStartEndPoints(start_pt, end_pt, start_idx, end_idx, start_yaw, end_yaw))
     {
+        trace_failure("endpoints", 0);
         ROS_ERROR("Unable to handle the initial or end point, force return!");
         return ASTAR_RET::INIT_ERR;
     }
@@ -190,17 +201,19 @@ ASTAR_RET AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d
               +(1.-ratio)*(search_start.z()-route_height_query_(0.))
               +ratio*(search_end.z()-route_height_query_(1.));
         }
-        return static_cast<int>((z - center_(2)) * inv_step_size_ + 0.5) + CENTER_IDX_(2);
+        return static_cast<int>(std::floor((z - center_(2)) * inv_step_size_ + 0.5)) + CENTER_IDX_(2);
     };
 
     // if ( start_pt(0) > -1 && start_pt(0) < 0 )
     //     std::cerr << "start_pt=" << start_pt.transpose() << " end_pt=" << end_pt.transpose() << endl;
 
-    GridNodePtr startPtr = GridNodeMap_[start_idx(0)][start_idx(1)][start_idx(2)];
-    GridNodePtr endPtr = GridNodeMap_[end_idx(0)][end_idx(1)][end_idx(2)];
-
-    std::priority_queue<GridNodePtr, std::vector<GridNodePtr>, NodeComparator> empty;
-    openSet_.swap(empty);
+    GridNodePtr startPtr = nodeFor(start_idx);
+    GridNodePtr endPtr = nodeFor(end_idx);
+    if (!startPtr || !endPtr) {
+        ROS_WARN("A star node budget exhausted.");
+        trace_failure("node_budget", 0);
+        return ASTAR_RET::SEARCH_ERR;
+    }
 
     GridNodePtr neighborPtr = NULL;
     GridNodePtr current = NULL;
@@ -249,12 +262,12 @@ ASTAR_RET AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d
                 neighborIdx(1) = (current->index)(1) + dy;
                 neighborIdx(2) = interpolateZIndexOnSearchPlane(neighborIdx(0), neighborIdx(1));
 
-                if (neighborIdx(0) < 1 || neighborIdx(0) >= POOL_SIZE_(0) - 1 || neighborIdx(1) < 1 || neighborIdx(1) >= POOL_SIZE_(1) - 1 || neighborIdx(2) < 1 || neighborIdx(2) >= POOL_SIZE_(2) - 1)
-                {
-                    continue;
+                neighborPtr = nodeFor(neighborIdx);
+                if (!neighborPtr) {
+                    ROS_WARN("A star node budget exhausted.");
+                    trace_failure("node_budget", num_iter);
+                    return ASTAR_RET::SEARCH_ERR;
                 }
-
-                neighborPtr = GridNodeMap_[neighborIdx(0)][neighborIdx(1)][neighborIdx(2)];
                 neighborPtr->index = neighborIdx;
 
                 bool flag_explored = neighborPtr->rounds == rounds_;
@@ -264,13 +277,13 @@ ASTAR_RET AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d
                     continue; //in closed set.
                 }
 
-                neighborPtr->rounds = rounds_;
-
                 const double neighbor_yaw = std::atan2(static_cast<double>(dy), static_cast<double>(dx));
                 if (checkOccupancy(Index2Coord(neighborPtr->index), neighbor_yaw))
                 {
                     continue;
                 }
+                // 一个方向碰撞不能把该位置标为已发现；其它合法入边仍必须可以入队。
+                neighborPtr->rounds = rounds_;
 
                 const int dz = neighborIdx(2) - current->index(2);
                 double static_cost = sqrt(dx * dx + dy * dy + dz * dz);
@@ -296,6 +309,7 @@ ASTAR_RET AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d
         if (std::chrono::duration<double>(time_2 - time_1).count() > 0.2)
         {
             ROS_WARN("Failed in A star path searching !!! 0.2 seconds time limit exceeded.");
+            trace_failure("budget", num_iter);
             return ASTAR_RET::SEARCH_ERR;
         }
     }
@@ -305,6 +319,7 @@ ASTAR_RET AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d
     if (std::chrono::duration<double>(time_2 - time_1).count() > 0.1)
         ROS_WARN("Time consume in A star path finding is %.3fs, iter=%d", std::chrono::duration<double>(time_2 - time_1).count(), num_iter);
 
+    trace_failure("exhausted", num_iter);
     return ASTAR_RET::SEARCH_ERR;
 }
 

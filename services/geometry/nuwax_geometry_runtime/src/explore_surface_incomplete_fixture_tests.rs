@@ -16,14 +16,10 @@ impl F1RealEntryFixture {
     pub(crate) async fn start(
         explore: crate::explore_runtime::ExploreRuntimeHandle,
     ) -> Result<Self, String> {
-        // Set this externally on the single selected test process, never mutate
-        // process-wide env in a test racing other tests. The cache captures it.
-        if std::env::var("NUWAX_LCM_URL").ok().as_deref() != Some("memq://") {
-            return Err("run the selected test with NUWAX_LCM_URL=memq://".into());
-        }
         let fixture = NavigationMap3DFixture::new();
-        let points: Vec<_> = (0..50).flat_map(|x| (0..30).map(move |y|
-            Point3::new((x as f64 + 0.5) * 0.1, (y as f64 + 0.5) * 0.1, 0.0)))
+        // PCT按0.05米精细体素逐格搜索实测地面，缺测格不连通；地面点须铺满每个精细格。
+        let points: Vec<_> = (0..60).flat_map(|x| (0..60).map(move |y|
+            Point3::new((x as f64 + 0.5) * 0.05, (y as f64 + 0.5) * 0.05, 0.0)))
             .collect();
         let stamp = crate::explore_runtime::now_unix_nanos();
         fixture.commit_points(stamp, &points);
@@ -41,6 +37,7 @@ impl F1RealEntryFixture {
         let transport = LcmTransport::new_real("memq://").map_err(|e| e.to_string())?;
         // Same transport/context for map publish and owned subscribe. The
         // FineMapReader RPC has another isolated memq context and NO provider.
+        // 补取地址直接交给消费者缓存，不读也不改进程环境变量。
         let subscription = transport.subscribe_owned(
             LcmTopic::new("/nav/map3d").map_err(|e| e.to_string())?,
             Some(LcmMessageType::new("nuwax_msgs.NavigationMap3D").map_err(|e| e.to_string())?),
@@ -50,7 +47,9 @@ impl F1RealEntryFixture {
         let (control, registrations) = GeometryRuntimeTaskControl::channel_with_topology_control(Some(probe.clone()));
         let mut owner = GeometryRuntimeTaskOwner::start(control.clone(), registrations);
         if let Err(error) = control.register_persistent("surface-map-consumer", run_owned_surface_map_consumer(
-            subscription, explore, config, control.clone(), control.shutdown_request_receiver())) {
+            subscription, explore,
+            nuwax_nav_stack::surface_map::SurfaceMapCache::configured_with_lcm_url(&config, "memq://"),
+            control.clone(), control.shutdown_request_receiver())) {
             let _ = owner.shutdown().await;
             return Err(error);
         }

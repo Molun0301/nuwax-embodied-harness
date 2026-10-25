@@ -142,6 +142,8 @@ namespace scan_planner
     bool check_collision_and_rebound(void);
     double estimateSegmentYaw(const Eigen::Vector3d &from, const Eigen::Vector3d &to) const;
     double estimateControlPointYaw(const Eigen::MatrixXd &q, int id) const;
+    bool resolvePoseGuide(const std::vector<Eigen::Vector3d>& path, const Eigen::Vector3d& point,
+                          double yaw, bool has_intersection, Eigen::Vector3d& intersection) const;
 
     static int earlyExit(void *func_data, const double *x, const double *g, const double fx, const double xnorm, const double gnorm, const double step, int n, int k, int ls);
     static double costFunctionRebound(void *func_data, const double *x, double *grad, const int n);

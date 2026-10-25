@@ -25,12 +25,16 @@ inline ros::NodeHandle authorParameters(const ScanConfig& c) {
  // Original two-cylinder covering approximation with unchanged actual dimensions.
  n.setParam("grid_map/double_cylinder_offset",c.body_length/4.0);
  n.setParam("grid_map/double_cylinder_radius",std::hypot(c.body_width/2.0,c.body_length/4.0));
+ n.setParam("grid_map/body_length",c.body_length);
+ n.setParam("grid_map/body_width",c.body_width);
  n.setParam("grid_map/body_center_offset_x",c.body_center_x);
  n.setParam("grid_map/body_center_offset_y",c.body_center_y);
  // Author A IV-B uses a step-aware collision band, not a solid block down
  // through contacting feet. Keep the full standing envelope unchanged for the
  // independent physical judge; retain every observed support/ceiling point.
- const double collision_low=c.max_step_up-c.body_to_ground;
+ // 支撑面位于其占据格内，格顶最多高出真实支撑一个分辨率。越阶能力为零或不足一格时，
+ // 碰撞带下沿取到支撑格格顶，支撑面自身的格不算机身障碍；更高的占据格仍按原规则判碰撞。
+ const double collision_low=std::max(c.max_step_up,c.resolution)-c.body_to_ground;
  const double collision_high=c.body_z_max;
  n.setParam("grid_map/body_center_offset_z",(collision_low+collision_high)/2.0);
  n.setParam("grid_map/obstacles_inflation_z_up",(collision_high-collision_low)/2.0);

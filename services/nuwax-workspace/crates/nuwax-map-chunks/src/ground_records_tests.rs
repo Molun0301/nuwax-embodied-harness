@@ -819,3 +819,36 @@ fn classified_empty_column_rejects_conflicts_and_unknown_tags_at_boundary() {
     let error=w.snapshot(domain(),2,20).unwrap_err();assert!(error.contains("conflicts"),"{error}");
     eprintln!("EMPTY_COLUMN intrinsic_invalid=4 cross_shard_conflict=REJECT hot_changed_legacy=REJECT writer_seal=REJECT");
 }
+
+// 脏块记录表引用唯一时也只在全部校验通过后原地改：整块校验拒绝的一批替换，
+// 不能留下同批中已暂存的合法列，也不能改字节统计、待封存状态或封存版本。
+#[test]
+fn rejected_batch_on_unique_dirty_block_changes_no_record_byte_or_version() {
+    let build = || {
+        let mut w = writer();
+        for x in 0..3 { install(&mut w, &column(surface([x, 0], &[0, 1])), 20); }
+        w
+    };
+    let (mut failing, mut control) = (build(), build());
+    let before: Vec<_> = (0..3).map(|x| failing.ground_column([x, 0]).unwrap()).collect();
+    let resident = failing.resident_bytes();
+    let (first, second) = (column(surface([0, 0], &[0])), column(surface([1, 0], &[1])));
+    // 诊断样本时间晚于成员的占据证据，暂存阶段不检查，只在整块校验时失败。
+    let mut late = surface([2, 0], &[0]);
+    late.samples = vec![LayerSample { source: Arc::new(LayerSource::Lidar { backend: 1, runtime_generation: 1,
+        sensor_frame_id: "sensor".into() }), point: [0.125, 0.025, 0.01], source_sequence: 1,
+        source_timestamp_ns: 99, point_index: 0 }];
+    let late = column(late);
+    let error = failing.replace_ground_columns([([0, 0], &first), ([1, 0], &second), ([2, 0], &late)]).unwrap_err();
+    assert_eq!(error, "heightfield sample exceeds occupancy evidence");
+    for x in 0..3 { assert_eq!(failing.ground_column([x, 0]).unwrap(), before[x as usize]); }
+    assert_eq!(failing.resident_bytes(), resident);
+    let (a, b) = (failing.seal(domain(), 1, 20).unwrap().root, control.seal(domain(), 1, 20).unwrap().root);
+    assert_eq!((a.version, a.revision, a.geometry_revision), (b.version, b.revision, b.geometry_revision));
+    let shape = |root: &Manifest| root.blocks.iter().map(|r| (r.key, r.block_revision, r.geometry_revision, r.points)).collect::<Vec<_>>();
+    assert_eq!(shape(&a), shape(&b));
+    // 同一批合法替换随后照常生效。
+    failing.replace_ground_columns([([0, 0], &first), ([1, 0], &second)]).unwrap();
+    assert_eq!(failing.ground_column([0, 0]).unwrap(), first);
+    assert_eq!(failing.ground_column([1, 0]).unwrap(), second);
+}

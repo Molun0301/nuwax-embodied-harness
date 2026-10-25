@@ -45,6 +45,26 @@ namespace scan_planner
     return estimateSegmentYaw(q.col(prev_id), q.col(next_id));
   }
 
+  bool BsplineOptimizer::resolvePoseGuide(const std::vector<Eigen::Vector3d>& path,
+      const Eigen::Vector3d& point, double yaw, bool has_intersection,
+      Eigen::Vector3d& intersection) const
+  {
+    if (has_intersection && grid_map_->getInflateOccupancy(intersection, yaw) == 0)
+      return true;
+    // 搜索边的朝向不是控制点切线，只有同一机体姿态下的空闲点才能支撑反弹方向。
+    bool found = false;
+    double closest = std::numeric_limits<double>::infinity();
+    for (const auto& candidate : path) {
+      const double distance = (candidate - point).squaredNorm();
+      if (distance < closest && grid_map_->getInflateOccupancy(candidate, yaw) == 0) {
+        closest = distance;
+        intersection = candidate;
+        found = true;
+      }
+    }
+    return found;
+  }
+
   void BsplineOptimizer::setControlPoints(const Eigen::MatrixXd &points)
   {
     cps_.points = points;
@@ -125,6 +145,24 @@ namespace scan_planner
       }
     }
 
+    // 线段检测时的朝向可能不同于控制点切线，搜索边界须在实际控制点姿态下仍空闲。
+    // 只扩大碰撞段的索引范围，不改原控制点、真实位姿或目标。
+    vector<std::pair<int, int>> pose_segments;
+    for (auto segment : segment_ids)
+    {
+      while (segment.first > 0 && grid_map_->getInflateOccupancy(
+          init_points.col(segment.first), estimateControlPointYaw(init_points, segment.first)))
+        --segment.first;
+      while (segment.second + 1 < init_points.cols() && grid_map_->getInflateOccupancy(
+          init_points.col(segment.second), estimateControlPointYaw(init_points, segment.second)))
+        ++segment.second;
+      if (!pose_segments.empty() && segment.first <= pose_segments.back().second)
+        pose_segments.back().second = std::max(pose_segments.back().second, segment.second);
+      else
+        pose_segments.push_back(segment);
+    }
+    segment_ids = std::move(pose_segments);
+
     /*** a star search ***/
     vector<vector<Eigen::Vector3d>> a_star_paths;
     for (size_t i = 0; i < segment_ids.size(); ++i)
@@ -132,7 +170,9 @@ namespace scan_planner
       //std::cerr << "in=" << in.transpose() << " out=" << out.transpose() << endl;
       Eigen::Vector3d in(init_points.col(segment_ids[i].first)), out(init_points.col(segment_ids[i].second));
       if(bind_route_segment_)bind_route_segment_(segment_ids[i].first,segment_ids[i].second);
-      ASTAR_RET ret = a_star_->AstarSearch(grid_map_->getResolution(), in, out);
+      ASTAR_RET ret = a_star_->AstarSearch(grid_map_->getResolution(), in, out,
+          estimateControlPointYaw(init_points, segment_ids[i].first),
+          estimateControlPointYaw(init_points, segment_ids[i].second));
       if (ret == ASTAR_RET::SUCCESS)
       {
         vector<Eigen::Vector3d> path = a_star_->getPath();
@@ -232,6 +272,7 @@ namespace scan_planner
       for (int j = segment_ids[i].first + 1; j < segment_ids[i].second; ++j)
       {
         Eigen::Vector3d ctrl_pts_law(cps_.points.col(j + 1) - cps_.points.col(j - 1)), intersection_point;
+        bool has_intersection = false;
         int Astar_id = a_star_paths[i].size() / 2, last_Astar_id; // Let "Astar_id = id_of_the_most_far_away_Astar_point" will be better, but it needs more computation
         double val = (a_star_paths[i][Astar_id] - cps_.points.col(j)).dot(ctrl_pts_law), last_val = val;
         while (Astar_id >= 0 && Astar_id < (int)a_star_paths[i].size())
@@ -262,14 +303,15 @@ namespace scan_planner
 
             //std::cerr << "i=" << i << " j=" << j << " Astar_id=" << Astar_id << " last_Astar_id=" << last_Astar_id << " intersection_point = " << intersection_point.transpose() << endl;
 
-            got_intersection_id = j;
+            has_intersection = true;
             break;
           }
         }
 
-        if (got_intersection_id >= 0)
+        has_intersection = resolvePoseGuide(a_star_paths[i], cps_.points.col(j),
+            estimateControlPointYaw(cps_.points, j), has_intersection, intersection_point);
+        if (has_intersection)
         {
-          cps_.flag_temp[j] = true;
           double length = (intersection_point - cps_.points.col(j)).norm();
           if (length > 1e-5)
           {
@@ -285,6 +327,9 @@ namespace scan_planner
                   a += grid_map_->getResolution();
                 cps_.base_point[j].push_back((a / length) * intersection_point + (1 - a / length) * cps_.points.col(j));
                 cps_.direction[j].push_back((intersection_point - cps_.points.col(j)).normalized());
+                // 只有已写入的非零方向可向邻点传播；交点重合不能留下空种子。
+                cps_.flag_temp[j] = true;
+                got_intersection_id = j;
                 break;
               }
             }
@@ -325,7 +370,9 @@ namespace scan_planner
                  (ctrl_pts_law.dot(middle_point - a_star_paths[i][Astar_id]) / denom) // = t
                 );
 
-            if ((intersection_point - middle_point).norm() > 0.01) // 1cm.
+            if (resolvePoseGuide(a_star_paths[i], middle_point,
+                estimateControlPointYaw(cps_.points, segment_ids[i].first), true, intersection_point)
+                && (intersection_point - middle_point).norm() > 0.01) // 1cm.
             {
               cps_.flag_temp[segment_ids[i].first] = true;
               cps_.base_point[segment_ids[i].first].push_back(cps_.points.col(segment_ids[i].first));
@@ -792,7 +839,9 @@ namespace scan_planner
         /*** a star search ***/
         Eigen::Vector3d in(cps_.points.col(segment_ids[i].first)), out(cps_.points.col(segment_ids[i].second));
         if(bind_route_segment_)bind_route_segment_(segment_ids[i].first,segment_ids[i].second);
-      ASTAR_RET ret = a_star_->AstarSearch(grid_map_->getResolution(), in, out);
+      ASTAR_RET ret = a_star_->AstarSearch(grid_map_->getResolution(), in, out,
+          estimateControlPointYaw(cps_.points, segment_ids[i].first),
+          estimateControlPointYaw(cps_.points, segment_ids[i].second));
         if (ret == ASTAR_RET::SUCCESS)
         {
           vector<Eigen::Vector3d> path = a_star_->getPath();
@@ -838,6 +887,7 @@ namespace scan_planner
         for (int j = segment_ids[i].first + 1; j < segment_ids[i].second; ++j)
         {
           Eigen::Vector3d ctrl_pts_law(cps_.points.col(j + 1) - cps_.points.col(j - 1)), intersection_point;
+          bool has_intersection = false;
           int Astar_id = a_star_paths[i].size() / 2, last_Astar_id; // Let "Astar_id = id_of_the_most_far_away_Astar_point" will be better, but it needs more computation
           double val = (a_star_paths[i][Astar_id] - cps_.points.col(j)).dot(ctrl_pts_law), last_val = val;
           while (Astar_id >= 0 && Astar_id < (int)a_star_paths[i].size())
@@ -868,14 +918,15 @@ namespace scan_planner
                    (ctrl_pts_law.dot(cps_.points.col(j) - a_star_paths[i][Astar_id]) / denom) // = t
                   );
 
-              got_intersection_id = j;
+              has_intersection = true;
               break;
             }
           }
 
-          if (got_intersection_id >= 0)
+          has_intersection = resolvePoseGuide(a_star_paths[i], cps_.points.col(j),
+              estimateControlPointYaw(cps_.points, j), has_intersection, intersection_point);
+          if (has_intersection)
           {
-            cps_.flag_temp[j] = true;
             double length = (intersection_point - cps_.points.col(j)).norm();
             if (length > 1e-5)
             {
@@ -891,13 +942,12 @@ namespace scan_planner
                     a += grid_map_->getResolution();
                   cps_.base_point[j].push_back((a / length) * intersection_point + (1 - a / length) * cps_.points.col(j));
                   cps_.direction[j].push_back((intersection_point - cps_.points.col(j)).normalized());
+                  // 与初始化一致，邻点只能继承本轮已经写入的方向。
+                  cps_.flag_temp[j] = true;
+                  got_intersection_id = j;
                   break;
                 }
               }
-            }
-            else
-            {
-              got_intersection_id = -1;
             }
           }
         }

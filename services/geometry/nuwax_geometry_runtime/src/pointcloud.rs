@@ -23,6 +23,8 @@ use dynamic_cloud::DynamicCloudFilter;
 #[path = "fine_cloud.rs"]
 mod fine_cloud;
 use fine_cloud::FineCloud;
+pub(crate) use fine_cloud::{configure_fine_cloud_cache, parse_fine_cloud_cache, FineCloudCache,
+    FINE_CLOUD_CACHE_AUTO_MAX_VAR, FINE_CLOUD_CACHE_MIB_VAR};
 
 #[path = "paged_voxel_snapshot.rs"]
 mod paged_voxel_snapshot;
@@ -517,6 +519,9 @@ impl CloudMapShmWriter {
         self.accumulate_mapping_scan_inner(session_generation, points, sensor_origin_map,
             source_timestamp_ns, source.map(fine_cloud::FrameSource::Canonical))
     }
+    /// 最近一帧三个阶段的耗时：精细点云（含地面捕获）、完整点云、动态清除与体素累加。
+    #[cfg(test)]
+    pub(crate) fn last_stage_ms(&self) -> [f64; 3] { self.last_stage_ms }
     pub(crate) fn accumulate_mapping_replayed_scan(&mut self, session_generation: u64,
         points: &[Point3<f64>], sensor_origin_map: Option<[f64;3]>,
         source: &crate::admitted_cloud::AdmittedCloudSource) -> bool {

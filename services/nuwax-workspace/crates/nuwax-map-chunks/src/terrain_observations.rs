@@ -375,12 +375,15 @@ fn validate_layers_with_time_bound(layers: &LayerObservations, block: &Block, bo
 /// sample count a terrain support gate. Their absence cannot erase a distribution.
 pub(crate) fn validate_diagnostic_samples(samples: &[LayerSample]) -> Result<(), String> {
     if samples.len() > MAX_LAYER_SAMPLES { return Err("ground diagnostics exceed sample budget".into()); }
-    let mut identities = BTreeSet::new();
-    for sample in samples {
+    for (index, sample) in samples.iter().enumerate() {
         sample.source.validate_sample(sample.source_timestamp_ns, sample.source_sequence)?;
-        if !sample.point.iter().all(|v| v.is_finite())
-            || !identities.insert((sample.source.as_ref(), sample.source_sequence,
-                sample.source_timestamp_ns, sample.point_index)) {
+        // 至多 32 个样本：与此前样本逐个比较身份是否相同，结果与有序集合插入判重一致，
+        // 同一来源对象直接视为相同，不再比较来源内容。
+        let duplicate = samples[..index].iter().any(|earlier| earlier.point_index == sample.point_index
+            && earlier.source_timestamp_ns == sample.source_timestamp_ns
+            && earlier.source_sequence == sample.source_sequence
+            && (Arc::ptr_eq(&earlier.source, &sample.source) || earlier.source == sample.source));
+        if !sample.point.iter().all(|v| v.is_finite()) || duplicate {
             return Err("invalid or duplicate ground diagnostic sample".into());
         }
     }

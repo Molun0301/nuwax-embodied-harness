@@ -1104,6 +1104,171 @@ mod tests {
         }
     }
 
+    /// 本进程累计处理器时间（用户态加内核态，毫秒），用于和墙钟对照。
+    fn process_cpu_ms() -> f64 {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0);
+        let ms = |t: libc::timeval| t.tv_sec as f64 * 1e3 + t.tv_usec as f64 / 1e3;
+        ms(usage.ru_utime) + ms(usage.ru_stime)
+    }
+
+    /// 读取实录“原生配对扫描”：每帧68字节头（源时间、里程计位姿xyz+四元数xyzw、点数）后接机体系f32点。
+    fn recorded_input(path: &str, frames: usize, origin_body: [f64; 3]) -> (Vec<ArchivedScan>, Vec<OptimizedKeyframe>) {
+        use std::io::Read;
+        let mut file = std::io::BufReader::new(std::fs::File::open(path).unwrap());
+        let mut scans = Vec::new();
+        while scans.len() < frames {
+            let mut header = [0; 68];
+            match file.read_exact(&mut header) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(error) => panic!("读取实录扫描失败：{error}"),
+            }
+            let stamp = u64::from_le_bytes(header[..8].try_into().unwrap());
+            let pose: [f64; 7] = std::array::from_fn(|i| f64::from_le_bytes(header[8 + i * 8..16 + i * 8].try_into().unwrap()));
+            let size = u32::from_le_bytes(header[64..68].try_into().unwrap()) as usize;
+            let mut bytes = vec![0; size * 12];
+            file.read_exact(&mut bytes).unwrap();
+            let odom_from_body = Isometry3::from_parts(Translation3::new(pose[0], pose[1], pose[2]),
+                UnitQuaternion::new_normalize(nalgebra::Quaternion::new(pose[6], pose[3], pose[4], pose[5])));
+            let map_points: Vec<_> = bytes.chunks_exact(12).map(|b| odom_from_body * Point3::new(
+                f32::from_le_bytes(b[..4].try_into().unwrap()) as f64,
+                f32::from_le_bytes(b[4..8].try_into().unwrap()) as f64,
+                f32::from_le_bytes(b[8..12].try_into().unwrap()) as f64)).collect();
+            let mut binding = test_binding();
+            binding.cloud_source_sequence = scans.len() as i64 + 1;
+            binding.frozen_odom_from_body = odom_from_body;
+            binding.sensor_origin_map = Some((odom_from_body * Point3::from(origin_body)).coords.into());
+            let source = AdmittedRegisteredScan::from_map_points_for_test(stamp, binding, &map_points);
+            scans.push(ArchivedScan {
+                source_timestamp_ns: stamp,
+                received_at_ns: stamp,
+                odom_from_body,
+                sensor_origin_body: Point3::from(origin_body),
+                body_points: source.body_points().clone(),
+                source: ArchivedSource::Lidar(source),
+            });
+        }
+        // 首节点固定；中段和尾部各加一个小的回环校正，覆盖校正插值与尾部复用。
+        let keyframe = |scan: &ArchivedScan, offset: [f64; 3]| {
+            let pose = scan.odom_from_body;
+            let q = pose.rotation.coords;
+            OptimizedKeyframe {
+                source_timestamp_ns: scan.source_timestamp_ns as i64,
+                translation_m: (pose.translation.vector + nalgebra::Vector3::from(offset)).into(),
+                rotation_xyzw: [q.x, q.y, q.z, q.w],
+            }
+        };
+        let trajectory = vec![
+            keyframe(&scans[0], [0.0; 3]),
+            keyframe(&scans[scans.len() / 2], [-0.04, 0.03, 0.0]),
+            keyframe(scans.last().unwrap(), [-0.08, 0.05, 0.01]),
+        ];
+        (scans, trajectory)
+    }
+
+    /// 真实规模基准：NUWAX_PGO_RECORDED_SCANS 指向实录配对扫描，NUWAX_PGO_RECORDED_FRAMES 为帧数，
+    /// NUWAX_PGO_SENSOR_ORIGIN_BODY 为雷达在机体系的原点（JSON数组）。分别测开启与关闭地面捕获。
+    #[test]
+    #[ignore = "需要显式提供实录配对扫描，release构建独立执行"]
+    fn pgo_recorded_real_scale_rebuild() {
+        let path = std::env::var("NUWAX_PGO_RECORDED_SCANS").expect("指定实录配对扫描文件");
+        let frames = std::env::var("NUWAX_PGO_RECORDED_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
+        let origin: [f64; 3] = serde_json::from_str(&std::env::var("NUWAX_PGO_SENSOR_ORIGIN_BODY")
+            .expect("指定雷达机体原点")).unwrap();
+        let captures: Vec<bool> = std::env::var("NUWAX_PGO_CAPTURE_MODES").ok()
+            .map(|v| v.split(',').map(|m| m == "on").collect()).unwrap_or_else(|| vec![true, false]);
+        let (scans, trajectory) = recorded_input(&path, frames, origin);
+        let points: usize = scans.iter().map(|scan| scan.body_points.len()).sum();
+        let config = MappingBackendComputeConfig { resolution: 0.05, initial_safe_radius_meters: 0.0,
+            window_capacity: nuwax_mapping::mapping_session::DEFAULT_BOUNDED_CAPACITY };
+        // NUWAX_PGO_BACKENDS 为 voxel、raytracing 的逗号列表，缺省只测 voxel。
+        let backends: Vec<MappingBackendSpec> = std::env::var("NUWAX_PGO_BACKENDS").unwrap_or_else(|_| "voxel".into())
+            .split(',').map(|name| match name {
+                "voxel" => MappingBackendSpec::Voxel,
+                "raytracing" => MappingBackendSpec::raytracing_defaults(),
+                other => panic!("未知后端 {other}"),
+            }).collect();
+        for spec in backends {
+            let backend = if matches!(spec, MappingBackendSpec::Voxel) { "voxel" } else { "raytracing" };
+            for &capture in &captures {
+                let cpu = process_cpu_ms();
+                let mut builder = ReplayBuilder::new(&scans, trajectory.clone(), Isometry3::identity(),
+                    spec, config, "map".into(), Duration::MAX, &|| false).unwrap();
+                builder.skip_ground_capture_for_cost_comparison = !capture;
+                // 每 100 帧输出一段内核与点云的每帧平均，观察是否随地图增长。
+                let mut result = Ok(());
+                for chunk in scans.chunks(100) {
+                    let (kernel, cloud) = (builder.kernel_time, builder.cloud_time);
+                    result = builder.append(chunk, &|| false);
+                    if result.is_err() { break; }
+                    let count = chunk.len() as f64;
+                    eprintln!("REAL_SEGMENT backend={backend} capture={capture} frames={} kernel_ms={:.2} cloud_ms={:.2}", builder.processed,
+                        (builder.kernel_time - kernel).as_secs_f64() * 1e3 / count, (builder.cloud_time - cloud).as_secs_f64() * 1e3 / count);
+                }
+                let result = result.and_then(|()| builder.prepare(&|| false));
+                eprintln!("REAL_SCALE backend={backend} capture={capture} frames={} points={points} processed={} kernel_ms={} cloud_ms={} wall_ms={} cpu_ms={:.0} cloud_points={:?} result={:?}",
+                    scans.len(), builder.processed, builder.kernel_time.as_millis(), builder.cloud_time.as_millis(),
+                    builder.started.elapsed().as_millis(), process_cpu_ms() - cpu, result.as_ref().ok().map(|p| p.cloud.point_count), result.as_ref().err());
+                if let Some(cloud) = builder.cloud.as_mut() { cloud.cleanup_product_owned_file().unwrap(); }
+            }
+        }
+    }
+
+    /// 在线逐帧交接基准：实录按原顺序走在线建图点云入口（规范来源，含地面捕获），
+    /// 每 100 帧输出平均与最大耗时，观察是否随累积地图增长。环境变量同实录重建基准，
+    /// NUWAX_PGO_RECORDED_FRAMES 为帧数。
+    #[test]
+    #[ignore = "需要显式提供实录配对扫描，release构建独立执行"]
+    fn online_recorded_frame_handoff_cost() {
+        use crate::admitted_cloud::AcceptedMappingCloud;
+        use crate::lio_ingress::AcceptedRegisteredCloud;
+        let path = std::env::var("NUWAX_PGO_RECORDED_SCANS").expect("指定实录配对扫描文件");
+        let frames = std::env::var("NUWAX_PGO_RECORDED_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(1500);
+        let origin: [f64; 3] = serde_json::from_str(&std::env::var("NUWAX_PGO_SENSOR_ORIGIN_BODY")
+            .expect("指定雷达机体原点")).unwrap();
+        let captures: Vec<bool> = std::env::var("NUWAX_PGO_CAPTURE_MODES").ok()
+            .map(|v| v.split(',').map(|m| m == "on").collect()).unwrap_or_else(|| vec![true]);
+        let (scans, _) = recorded_input(&path, frames, origin);
+        for capture in captures {
+            let mut cloud = CloudMapShmWriter::new_private().unwrap();
+            let (mut segment, mut worst, mut total) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+            let mut stages = [0.0; 3];
+            let mut segment_cpu = process_cpu_ms();
+            for (index, scan) in scans.iter().enumerate() {
+                let map_points: Vec<_> = scan.body_points.iter().map(|p| scan.odom_from_body * p).collect();
+                let sensor_origin = (scan.odom_from_body * scan.sensor_origin_body).coords.into();
+                let mut binding = test_binding();
+                binding.cloud_source_sequence = index as i64 + 1;
+                binding.frozen_odom_from_body = scan.odom_from_body;
+                binding.sensor_origin_map = Some(sensor_origin);
+                let accepted = AcceptedMappingCloud::from(AcceptedRegisteredCloud::from_map_points_for_test(
+                    map_points.clone(), scan.source_timestamp_ns, scan.source_timestamp_ns, "map", "body", binding));
+                let started = Instant::now();
+                assert!(cloud.accumulate_mapping_scan_with_source(1, &map_points, Some(sensor_origin),
+                    scan.source_timestamp_ns, capture.then_some(&accepted)));
+                let elapsed = started.elapsed();
+                for (sum, stage) in stages.iter_mut().zip(cloud.last_stage_ms()) { *sum += stage; }
+                segment += elapsed;
+                total += elapsed;
+                worst = worst.max(elapsed);
+                if (index + 1) % 100 == 0 || index + 1 == scans.len() {
+                    let count = (index % 100 + 1) as f64;
+                    let cpu = process_cpu_ms();
+                    eprintln!("ONLINE capture={capture} frames={} segment_mean_ms={:.2} segment_cpu_ms={:.2} segment_max_ms={:.2} total_mean_ms={:.2} fine/dense/voxel_ms={:.2}/{:.2}/{:.2}",
+                        index + 1, segment.as_secs_f64() * 1e3 / count, (cpu - segment_cpu) / count, worst.as_secs_f64() * 1e3,
+                        total.as_secs_f64() * 1e3 / (index + 1) as f64,
+                        stages[0] / count, stages[1] / count, stages[2] / count);
+                    segment_cpu = cpu;
+                    stages = [0.0; 3];
+                    segment = Duration::ZERO;
+                    worst = Duration::ZERO;
+                }
+            }
+            cloud.cleanup_product_owned_file().unwrap();
+        }
+    }
+
     #[test]
     fn background_catchup_preserves_replay_cadence_maps_and_checkpoint() {
         let (scans, mut trajectory) = scale_input(31);
@@ -1126,6 +1291,8 @@ mod tests {
             window_capacity: 10_000,
         };
         let anchor = Isometry3::translation(0.73, -1.15, 0.04);
+        // 本用例只证明分批追赶与一次重建结果相同，预算不是被测性质；预算超限与
+        // 中途取消由 pgo_rebuild_distinguishes_budget_and_mid_replay_cancellation 覆盖。
         for spec in [
             MappingBackendSpec::Voxel,
             MappingBackendSpec::raytracing_defaults(),
@@ -1137,7 +1304,7 @@ mod tests {
                 spec,
                 config,
                 "map".into(),
-                Duration::from_secs(10),
+                Duration::MAX,
                 || false,
             )
             .unwrap();
@@ -1148,7 +1315,7 @@ mod tests {
                 spec,
                 config,
                 "map".into(),
-                Duration::from_secs(10),
+                Duration::MAX,
                 &|| false,
             )
             .unwrap();

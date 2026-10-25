@@ -673,6 +673,15 @@ def _validate(key: str, value: str, typ: str) -> Optional[str]:
     """返回规范化后的值；非法返回 None（由调用方记入 rejected）。"""
 
     v = value.strip()
+    if key in {"NUWAX_GEOMETRY_FINE_CLOUD_CACHE_MIB", "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_AUTO_MAX_MIB"}:
+        # 两项空值均恢复目录默认；固定预算仅接受十进制整数，避免浮点或布尔值混入。
+        if not v:
+            return str(R.runtime_catalog()[key]["default"])
+        if key == "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_MIB" and v == "auto":
+            return v
+        if not v.isascii() or not v.isdecimal() or not R.catalog_number_in_range(key, v):
+            return None
+        return str(int(v))
     if key in {"NUWAX_NAV_MAX_STEP_UP_M", "NUWAX_NAV_MAX_STEP_DOWN_M"}:
         # 留空继承已有能力；显式零表示该方向不允许离散台阶。
         if not v:
@@ -909,6 +918,10 @@ def _save_values(updates: Dict[str, str], *, profile_snapshot=None) -> SaveResul
         normalized = _validate(key, raw, field.type)
         if normalized is None:
             rejected[key] = f"值不符合类型 {field.type}"
+            if key == "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_MIB":
+                rejected[key] = "请选择自动（auto），或填写 16～4096 的整数（MiB）；留空恢复自动"
+            elif key == "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_AUTO_MAX_MIB":
+                rejected[key] = "自动上限须为 32～4096 的整数（MiB）；留空使用 256"
             if key == "NUWAX_GEOMETRY_PGO_OPTIONS":
                 try:
                     from contracts.pgo_options import normalize_pgo_options

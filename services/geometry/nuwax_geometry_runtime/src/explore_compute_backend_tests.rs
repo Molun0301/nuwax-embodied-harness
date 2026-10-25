@@ -624,8 +624,8 @@ fn concrete_owner_later_prepare_and_rollback_discard_failure_permanently_faults(
     drop(owner);
 }
 
-fn surface_fixture(offset: f32) -> Arc<SurfaceSnapshot> {
-    let config = nuwax_nav_mls_planner::mls_planner::Config {
+fn surface_fixture_config() -> nuwax_nav_mls_planner::mls_planner::Config {
+    nuwax_nav_mls_planner::mls_planner::Config {
         world_frame: "map".into(),
         voxel_size: 0.1,
         robot_height: 0.45,
@@ -640,20 +640,29 @@ fn surface_fixture(offset: f32) -> Arc<SurfaceSnapshot> {
         step_penalty_weight: 1.0,
         goal_tolerance: 0.1,
         viz_publish_hz: 0.0,
-    };
+    }
+}
+
+/// 两层2米见方的实测地面，可整体水平平移`dx`、竖直平移`dz`。
+fn surface_fixture_points(dx: f32, dz: f32) -> Vec<(f32, f32, f32)> {
     let mut points = Vec::new();
     for level in [0.0_f32, 3.0] {
         for x in 0..20 {
             for y in 0..20 {
                 points.push((
-                    (x as f32 + 0.5) * 0.1,
+                    (x as f32 + 0.5) * 0.1 + dx,
                     (y as f32 + 0.5) * 0.1,
-                    level + offset + 0.05,
+                    level + dz + 0.05,
                 ));
             }
         }
     }
-    Arc::new(SurfaceSnapshot::from_points(&points, config, 0.1).unwrap())
+    points
+}
+
+fn surface_fixture(offset: f32) -> Arc<SurfaceSnapshot> {
+    Arc::new(SurfaceSnapshot::from_points(&surface_fixture_points(0.0, offset),
+        surface_fixture_config(), 0.1).unwrap())
 }
 
 fn surface_controller(receiver: SurfaceInputReceiver) -> ExplorationController {
@@ -689,8 +698,9 @@ fn actual_surface_backend_uses_original_input_and_pins_it_until_resolution() {
     };
     assert!(matches!(expected, ExplorationPoll::Goal(_)));
     let mut backend = ExploreComputeBackend::new(surface_controller(receiver.clone()));
-    // Replacement has no surface near the sampled body; a live read would differ.
-    receiver.observe(surface_fixture(10.0)).unwrap();
+    // 替换地面平移到约9米外；PCT只把端点绑定到10格半径内的实测地面层，实时读取找不到可达目标。
+    receiver.observe(Arc::new(SurfaceSnapshot::from_points(&surface_fixture_points(10.0, 0.0),
+        surface_fixture_config(), 0.1).unwrap())).unwrap();
     assert!(!matches!(
         surface_controller(receiver.clone())
             .poll_next_goal_with_deferred_stop(&sampled, false)
@@ -967,13 +977,14 @@ fn single_surface_query_observes_same_flag_after_backend_prechecks() {
             false
         });
         assert_eq!(checks.get(), last_check);
+        // PCT在搜索中观察到同一取消标志，返回类型化的未定结果而非失败。
         if returning_selection {
             let result = selection(projection);
-            assert_eq!(result.mission, Some(Err("三维规划已取消".into())));
+            assert_eq!(result.mission, Some(Err(MissionRouteError::Inconclusive("PCT规划已取消".into()))));
             assert!(!result.cancelled, "the real query error retains its existing nesting");
         } else {
-            assert!(matches!(projection, ComputeProjection::HomewardBudget(Err(ref error))
-                if error.to_string() == "三维规划已取消"));
+            assert!(matches!(projection, ComputeProjection::HomewardBudget(Err(MissionRouteError::Inconclusive(ref error)))
+                if error == "PCT规划已取消"));
         }
         assert!(!backend.prepared.as_ref().unwrap().controller_prepared);
         assert!(matches!(backend.resolve(Decision::Discard), Settlement::Discarded));
@@ -984,26 +995,12 @@ fn single_surface_query_observes_same_flag_after_backend_prechecks() {
 }
 
 #[test]
-fn surface_motion_limits_error_precedes_cancel_without_changing_route_nesting() {
-    use nuwax_nav_types_messages::{MotionLimits, MotionModel};
-    let mut context = cancellable_surface_context();
-    let limits = MotionLimits {
-        model: MotionModel::Differential,
-        max_forward_mps: 0.5, max_reverse_mps: 0.3, max_lateral_mps: 0.0,
-        max_angular_rps: 0.7, linear_acceleration_mps2: 1.0,
-        guaranteed_braking_mps2: 0.0, // Not part of MotionKinematics validation.
-        angular_acceleration_rps2: 2.0, guaranteed_angular_braking_rps2: 2.0,
-        reaction_time_sec: 0.1, minimum_turning_radius_m: 0.0, can_rotate_in_place: true,
-    };
-    let expected = limits.validate().unwrap_err();
-    assert!(limits.kinematics().validate().is_ok());
-    let ComputeInput::Surface { config, .. } = &mut context.input else { unreachable!() };
-    config.follower.motion_limits = Some(limits);
+fn surface_route_input_error_precedes_cancel_without_changing_route_nesting() {
+    // PCT全局路线不消费运动能力，能力标定在导航配置装载时已校验；
+    // 查询内仍先于规划执行的真实错误是端点位姿校验。
+    let context = cancellable_surface_context();
     let planning = context.input.fork_for_planning();
-    let invalid = context.routes(planning.as_ref()).unwrap();
-    let valid_context = cancellable_surface_context();
-    let valid_planning = valid_context.input.fork_for_planning();
-    let valid = valid_context.routes(valid_planning.as_ref()).unwrap();
+    let routes = context.routes(planning.as_ref()).unwrap();
     let start = mission_pose_from_stamped(&context.robot_pose);
     let progress = MissionProgress::new(start.clone()).unwrap();
     for failing_query in 1..=3 {
@@ -1014,19 +1011,22 @@ fn surface_motion_limits_error_precedes_cancel_without_changing_route_nesting() 
                 calls += 1;
                 if calls == failing_query {
                     flag.store(true, Ordering::Release);
-                    invalid.query(from, to, options, Some(&flag))
+                    let mut invalid = to.clone();
+                    invalid.orientation_xyzw = [0.0; 4];
+                    routes.query(from, &invalid, options, Some(&flag))
                 } else {
-                    valid.query(from, to, options, Some(&flag))
+                    routes.query(from, to, options, Some(&flag))
                 }
             }, &|| flag.load(Ordering::Acquire));
         assert_eq!(calls, failing_query);
         let RouteComputation::Complete(result) = result else {
             panic!("a real validation error must not be replaced by cancellation")
         };
+        let expected = MissionRouteError::Failed("探索进度位姿无效".into());
         if failing_query == 1 {
-            assert_eq!(result, Err(expected.clone().into()));
+            assert_eq!(result, Err(expected));
         } else {
-            assert_eq!(result.unwrap().can_visit, Err(expected.clone().into()));
+            assert_eq!(result.unwrap().can_visit, Err(expected));
         }
     }
 }
@@ -1126,13 +1126,31 @@ fn mission_surface_route_carries_real_projected_endpoint_into_home_query() {
 
 #[test]
 fn mission_zero_length_surface_query_still_requires_complete_body_model() {
-    let routes = MissionRoutes::Surface {
-        map: surface_fixture(0.0),
-        config: SurfaceNavigationConfig::new("map".into(), 0.3, 0.2, 0.45, 0.1, 0.2, 25.0, 0.3).unwrap(),
-        boundary: Vec::new(),
-    };
+    // 零距离查询仍执行PCT真实机体碰撞：起点前方0.3米的立柱只与完整机体外形相交，
+    // 缺少机体包络时只按配置净空圆检查，同一查询会放行。
+    let mut points = surface_fixture_points(0.0, 0.0);
+    points.extend((2..=10).map(|z| (1.35, 1.05, z as f32 * 0.05)));
+    let map = SurfaceSnapshot::from_points(&points, surface_fixture_config(), 0.1).unwrap();
+    let config = SurfaceNavigationConfig::new("map".into(), 0.3, 0.2, 0.45, 0.1, 0.2, 25.0, 0.3).unwrap();
     let start = MissionPose { position: [1.05, 1.05, 0.4], orientation_xyzw: [0.0, 0.0, 0.0, 1.0] };
-    assert!(routes.query(&start, &start, home_goal_options(), None).is_err());
+    let footprint_only = MissionRoutes::Surface {
+        map: Arc::new(map.clone()), config: config.clone(), boundary: Vec::new(),
+    };
+    assert!(footprint_only.query(&start, &start, home_goal_options(), None).is_ok());
+    let complete = MissionRoutes::Surface {
+        map: Arc::new(map.with_body_envelope(nuwax_nav_mls_planner::SurfaceBodyEnvelope {
+            fixed_collision: None,
+            footprint_xy_m: vec![[-0.4, -0.1], [0.4, -0.1], [0.4, 0.1], [-0.4, 0.1]],
+            z_bounds_m: [-0.05, 0.2],
+            body_to_support_z_m: 0.3,
+            max_step_up_m: 0.2,
+            max_step_down_m: 0.2,
+            max_cross_slope_deg: 15.0,
+            support_uncertainty_m: 0.0,
+        }).unwrap()),
+        config, boundary: Vec::new(),
+    };
+    assert!(complete.query(&start, &start, home_goal_options(), None).is_err());
 }
 
 #[test]
@@ -1141,7 +1159,8 @@ fn mission_surface_unknown_query_keeps_requested_home_yaw_and_real_endpoint() {
     let planning = context.input.fork_for_planning();
     let routes = context.routes(planning.as_ref()).unwrap();
     let mut start = mission_pose_from_stamped(&context.robot_pose);
-    start.position[0] = -10.0; start.position[1] = -10.0;
+    // 起点机体下方无实测地面；PCT在10格半径内把端点绑定到最近的实测地面层。
+    start.position[0] = -0.3; start.position[1] = 1.05;
     let mut goal = start.clone(); goal.position[0] += 0.5;
     let q = Quaternion::from_yaw(std::f64::consts::FRAC_PI_2);
     goal.orientation_xyzw = [q.x,q.y,q.z,q.w];
@@ -1178,21 +1197,14 @@ fn mission_resource_error_keeps_typed_homeward_and_candidate_nesting() {
         assert!(error.is_inconclusive());
         assert_eq!(calls,fail_at);
     }
-    let mut context = cancellable_surface_context();
-    let ComputeInput::Surface {config,..} = &mut context.input else { unreachable!() };
-    config.follower.motion_limits = Some(nuwax_nav_types_messages::MotionLimits {
-        model:nuwax_nav_types_messages::MotionModel::Differential,
-        max_forward_mps:0.5,max_reverse_mps:0.0,max_lateral_mps:0.0,max_angular_rps:1.0,
-        linear_acceleration_mps2:1.0,guaranteed_braking_mps2:1.0,
-        angular_acceleration_rps2:2.0,guaranteed_angular_braking_rps2:2.0,
-        reaction_time_sec:0.05,minimum_turning_radius_m:0.5,can_rotate_in_place:false,
-    });
+    // PCT的真实查询只在观察到取消时给出未定结果，且保持类型化的未定错误。
     let planning = context.input.fork_for_planning();
     let routes = context.routes(planning.as_ref()).unwrap();
     let mut goal = start.clone();
-    let q = Quaternion::from_yaw(std::f64::consts::FRAC_PI_2);
-    goal.orientation_xyzw = [q.x,q.y,q.z,q.w];
-    assert!(routes.query(&start,&goal,home_goal_options(),None).err().unwrap().is_inconclusive());
+    goal.position[0] += 0.5;
+    let cancelled = std::sync::atomic::AtomicBool::new(true);
+    let error = routes.query(&start,&goal,home_goal_options(),Some(&cancelled)).err().unwrap();
+    assert_eq!(error, MissionRouteError::Inconclusive("PCT规划已取消".into()));
 }
 
 

@@ -1821,10 +1821,11 @@ mod tests {
             surface,
         ).unwrap();
         let mut follower = nuwax_nav_runtime::RouteFollower::new(configured.follower).unwrap();
+        follower.enable_author_static_map_fixture(true);
         follower
             .update_execution_map(nuwax_nav_runtime::ExecutionMap::SurfaceUpdate(prepared))
             .unwrap();
-        follower.update_odometry(start);
+        follower.update_odometry(start.clone());
         follower
             .replace_execution_path(
                 nuwax_nav_runtime::ExecutionPath::Surface(path.clone()),
@@ -1832,11 +1833,23 @@ mod tests {
                 pose_from_schema(&goal.goal).unwrap(),
             )
             .unwrap();
-        let step = follower.step(0.3);
-        assert!(
-            matches!(step,nuwax_nav_runtime::PlannerStep::Command(twist) if twist!=Twist2::ZERO),
-            "真实生成路径必须能启动运动: step={step:?} path={path:?}"
-        );
+        for pair in path.poses.windows(2) {
+            let a = pair[0].pose.position;
+            let b = pair[1].pose.position;
+            assert!(a.x != b.x || a.y != b.y || a.z == b.z,
+                "量化重复点不能构成纯竖向运动段");
+        }
+        let mut moving = false;
+        for _ in 0..20 {
+            start.stamp.nanos += 50_000_000;
+            follower.update_odometry(start.clone());
+            let step = follower.step(0.3);
+            let nuwax_nav_runtime::PlannerStep::Command(twist) = step else {
+                panic!("真实生成路径必须能启动运动: step={step:?} path={path:?}");
+            };
+            if twist != Twist2::ZERO { moving = true; break; }
+        }
+        assert!(moving, "作者A初始化后真实生成路径必须启动运动");
     }
 
     fn observe_map(order: &mut SurfaceMapOrder, message: &schema::NavigationMap3D) -> MapIngress {
@@ -2233,7 +2246,8 @@ mod tests {
                         configured.follower.body_to_support_z_m,
                         configured.follower.max_observation_age_sec.map(Duration::from_secs_f64),
                         async move {
-                            let local = nuwax_nav_runtime::qualification_surface_backend(configured.follower)?;
+                            // 此夹具发布完整静态地图，注册原帧接线由专门的流测试验证。
+                            let local = nuwax_nav_runtime::qualification_static_surface_backend(configured.follower)?;
                             let pair=nuwax_nav_runtime::spawn_scheduler(nuwax_nav_runtime::NavScheduler::new(
                                 RecordingMotion(motion_calls),local,scheduler_config)?);
                             sender.send(pair.0.clone()).unwrap();

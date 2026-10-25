@@ -13,7 +13,8 @@ class RouteHeightReference {
   std::vector<Eigen::Vector3d> points;
   std::vector<double> arcs, waypoint_arcs, times, timed_arcs;
   double begin_arc=0., end_arc=0.;
-  void clear(){points.clear();arcs.clear();waypoint_arcs.clear();times.clear();timed_arcs.clear();begin_arc=end_arc=0.;}
+  double begin_time=0., end_time=0.;
+  void clear(){points.clear();arcs.clear();waypoint_arcs.clear();times.clear();timed_arcs.clear();begin_arc=end_arc=begin_time=end_time=0.;}
   void set(const std::vector<Eigen::Vector3d>& route) {
     clear();points=route;arcs.resize(points.size(),0.);
     for(size_t i=1;i<points.size();++i)arcs[i]=arcs[i-1]+(points[i]-points[i-1]).norm();
@@ -29,7 +30,7 @@ class RouteHeightReference {
     }
     return timed_arcs.back();
   }
-  void window(double from,double to){begin_arc=arcAtTime(from);end_arc=arcAtTime(to);if(end_arc<begin_arc)std::swap(begin_arc,end_arc);}
+  void window(double from,double to){begin_time=std::min(from,to);end_time=std::max(from,to);begin_arc=arcAtTime(begin_time);end_arc=arcAtTime(end_time);}
   bool ready()const{return points.size()>1&&!times.empty();}
   // The ordered parameter, not nearest XY, disambiguates repeated coordinates
   // and remains continuous at corners and vertical route segments.

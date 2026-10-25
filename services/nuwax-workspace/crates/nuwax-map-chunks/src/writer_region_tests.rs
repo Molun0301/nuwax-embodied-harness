@@ -254,7 +254,7 @@ fn region_borrowed_dirty_keeps_budget_and_persisted_error_order() {
     }
     // Dirty still shadows that broken persisted reference, even when empty.
     writer.dirty.insert([1, 0, 0], Dirty {
-        block: Arc::new(Block::new()), layers: GroundRecords::empty(), changed: true,
+        block: Arc::new(Block::new()), layers: GroundRecords::empty(), layer_bytes: 0, changed: true,
     });
     assert_eq!(same_as_full_scan(&mut writer, [0; 3], [32, 0, 0], 2).unwrap().len(), 2);
 }

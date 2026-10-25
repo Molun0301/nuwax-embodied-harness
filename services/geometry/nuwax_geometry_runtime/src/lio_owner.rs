@@ -2984,6 +2984,17 @@ mod tests {
         ));
         *handle.cloud_map_writer.lock() =
             Some(CloudMapShmWriter::new(&cloud_path).expect("test cloud-map writer"));
+        // 与生产创建写入方时相同，先绑定精细地图拥有方。
+        handle
+            .cloud_map_writer
+            .lock()
+            .as_mut()
+            .expect("test cloud-map writer")
+            .bind_fine_map_owner(
+                mapping.lock().global_frame_generation(),
+                handle.nav.producer_runtime_generation(),
+            )
+            .expect("navigation runtime owns a positive producer generation");
 
         let mut public_odometry_frames = publisher
             .subscribe(
@@ -3007,6 +3018,17 @@ mod tests {
                 Some(global_map_binding.1.clone()),
             )
             .await;
+        // 与生产开始建图相同，经点云会话登记清空规范点云；清空帧先于首帧点云发布。
+        assert!(matches!(
+            handle.begin_cloud_map_session(session_generation).await,
+            crate::lcm_runtime::CloudMapSessionAdmission::Registered(_)
+        ));
+        let cleared_frame = next_real_frame(&mut global_map_frames).await;
+        let mut encoded_clear = schema::POINT_CLOUD2_FINGERPRINT.to_vec();
+        encoded_clear.extend_from_slice(&cleared_frame.payload);
+        let cleared = schema::decode_point_cloud2(&encoded_clear).expect("typed session clear");
+        assert_eq!(cleared.header.frame_id, "map");
+        assert!(cleared.data.is_empty(), "new Mapping session must publish an empty clear");
         let mut map_revisions = handle.map_revision_tx.subscribe();
         let mut cloud_updates = handle.cloud_map_tx.subscribe();
 

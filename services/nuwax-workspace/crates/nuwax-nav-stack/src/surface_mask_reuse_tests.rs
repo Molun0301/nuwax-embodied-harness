@@ -404,9 +404,6 @@ async fn incomplete_fine_retains_present_mask_only_for_same_contents_and_domain(
     use crate::surface_map::SurfaceMapBuildError;
     use nuwax_map_chunks::Manifest;
 
-    // Cache construction captures the URL. Set it on this exact test process,
-    // never mutate shared process environment from a concurrently running test.
-    assert_eq!(std::env::var("NUWAX_LCM_URL").ok().as_deref(), Some("memq://"));
     for variant in ["same_mask_new_receipt", "cell", "layout", "domain"] {
         let mut fixture = FineFixture::new();
         let cells = fine_ground();
@@ -466,7 +463,7 @@ async fn incomplete_fine_retains_present_mask_only_for_same_contents_and_domain(
         // object really reaches no-provider memq timeout, never an injected Err.
         tokio::task::spawn_blocking(move || {
             let configured = calibrated_config();
-            let mut cache = SurfaceGeometryCache::configured(&configured);
+            let mut cache = SurfaceGeometryCache::configured_with_lcm_url(&configured, "memq://");
             let old = cache.build_typed(&first).unwrap();
             let physical = cache.physical_snapshot().unwrap();
             let error = match cache.build_typed(&candidate) {

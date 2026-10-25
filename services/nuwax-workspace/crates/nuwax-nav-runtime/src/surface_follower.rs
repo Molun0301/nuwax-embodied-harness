@@ -295,6 +295,18 @@ impl SurfaceFollower {
         if self.reference.is_empty() {
             return Err("等待全局参考路线".into());
         }
+        if !self.position_reached()
+            && (self.reference.len() == 1
+                || nuwax_nav_types_messages::same_finite_position(
+                    Self::position(pose), *self.reference.last().unwrap()))
+        {
+            // 参考已无后续位移但原三维目标尚未到达；不能把零速等待当作到达。
+            // 与作者正常周期结束一致，这不是可缓存的几何拒绝证据。
+            self.execution_cycle_complete = true;
+            self.local_path.clear();
+            self.local_body_path = None;
+            return Err("全局参考已结束，原业务目标未到，等待后续路线".into());
+        }
         let mut config = self.config.scan;
         config.body_width = robot_width_m;
         config.body_length = robot_width_m;
@@ -773,6 +785,21 @@ mod native_execution_tests {
         follower.update_odometry(current.clone());
         current
     }
+    // 作者A按真实采样推进初始化；等待限于一秒，不能只重复同一采样让时钟前进。
+    fn advance_to_motion(follower: &mut SurfaceFollower) -> Twist2 {
+        for _ in 0..20 {
+            next_sample(follower);
+            let step = follower.step(0.3);
+            let PlannerStep::Command(command) = step else {
+                panic!("原生初始化后应交付运动：{step:?}");
+            };
+            if command != Twist2::ZERO {
+                return command;
+            }
+        }
+        panic!("一秒新采样内未生成可执行运动");
+    }
+
     #[test]
     fn production_static_surface_does_not_impersonate_a_registered_scan() {
         let mut follower=follower(pose(0.5,1.,0.),test_snapshot(0.,false));
@@ -916,7 +943,8 @@ mod native_execution_tests {
     fn missing_ground_advances_without_creating_odometry_or_progress() {
         let mut follower = follower(pose(0.5, 1., 0.), unknown());
         assert!(matches!(follower.step(0.3), PlannerStep::Command(_)));
-        let current = next_sample(&mut follower);
+        assert!(advance_to_motion(&mut follower).linear.x > 0.);
+        let current = follower.odometry.as_ref().unwrap().clone();
         let plans = follower.local_plans();
         let mut previous = None;
         for _ in 0..3 {
@@ -974,7 +1002,7 @@ mod native_execution_tests {
         assert_eq!(follower.motion_boundary.as_ref().unwrap().velocity,Some([0.1,0.,0.]));
     }
     #[test]
-    fn measured_loop_progress_keeps_the_next_native_window_on_the_remaining_route() {
+    fn measured_loop_progress_preserves_author_full_reference() {
         let mut follower = follower(pose(0., 0., 0.), unknown());
         follower.config.scan.planning_horizon = 0.6;
         let goal = pose(1., -1., 0.);
@@ -997,15 +1025,12 @@ mod native_execution_tests {
             follower.update_odometry(actual);
         }
         let progress = follower.progress_m();
+        let reference = follower.reference.clone();
+        assert_eq!(progress, 4., "重叠路口的实测进度不能退回首段");
         assert!(matches!(follower.step(0.3), PlannerStep::Command(_)));
         next_sample(&mut follower);
-        let PlannerStep::Command(command) = follower.step(0.3) else {
-            panic!("实际已消费回环后应接续末段");
-        };
-        assert!(
-            command.angular_z < 0.,
-            "交叉点应朝剩余右下路径转向，不回到最初向右段：{command:?}"
-        );
+        assert!(matches!(follower.step(0.3), PlannerStep::Command(_)));
+        assert_eq!(follower.reference, reference, "实测进度不得切尾重建作者A的完整时间参考");
         assert_eq!(
             follower.progress_m(),
             progress,
@@ -1038,8 +1063,7 @@ mod native_execution_tests {
         );
         let mut follower = follower(pose(0.5, 1., 0.), map);
         assert!(matches!(follower.step(0.3), PlannerStep::Command(_)));
-        next_sample(&mut follower);
-        assert!(matches!(follower.step(0.3),PlannerStep::Command(command) if command.linear.x>0.));
+        assert!(advance_to_motion(&mut follower).linear.x > 0.);
         let mut actual = pose(12.05, 1.05, 0.);
         actual.stamp.nanos += 30_000_000_000;
         follower.update_odometry(actual);
@@ -1069,10 +1093,7 @@ mod native_execution_tests {
     fn initial_turn_uses_native_checked_command_and_never_moves_progress_by_time() {
         let mut follower = follower(pose(0.5, 1., std::f64::consts::FRAC_PI_2), unknown());
         assert!(matches!(follower.step(0.3), PlannerStep::Command(_)));
-        next_sample(&mut follower);
-        let PlannerStep::Command(command) = follower.step(0.3) else {
-            panic!("转向应由原生首拍检查交付");
-        };
+        let command = advance_to_motion(&mut follower);
         assert!(command.angular_z < 0.);
         assert!(command.linear.x >= 0.);
         assert_eq!(command.linear.y, 0.);

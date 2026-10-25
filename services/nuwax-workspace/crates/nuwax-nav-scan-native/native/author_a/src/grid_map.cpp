@@ -2,8 +2,8 @@
 #include <cmath>
 #include <limits>
 #include <string>
-// ROS/PCL/depth transport and visualization omitted. Author A algorithms below
-// remain unchanged; paired vector ingestion and static fixture entrypoints follow.
+// 删除ROS/PCL/深度传输与显示依赖，保留原概率射线与滑动缓存。
+// 宿主适配同帧输入、完整静态快照及真实机体碰撞候选。
 #include <stdexcept>
 
 void GridMap::initMap(ros::NodeHandle &nh)
@@ -24,6 +24,8 @@ void GridMap::initMap(ros::NodeHandle &nh)
   node_.param("grid_map/obstacles_inflation_z_down", mp_.obstacles_inflation_z_down, -1.0);
   node_.param("grid_map/double_cylinder_radius", mp_.double_cylinder_radius_, -1.0);
   node_.param("grid_map/double_cylinder_offset", mp_.double_cylinder_offset_, 0.0);
+  node_.param("grid_map/body_length", mp_.body_length_, -1.0);
+  node_.param("grid_map/body_width", mp_.body_width_, -1.0);
   node_.param("grid_map/body_center_offset_x", mp_.body_center_offset_.x(), 0.0);
   node_.param("grid_map/body_center_offset_y", mp_.body_center_offset_.y(), 0.0);
   node_.param("grid_map/body_center_offset_z", mp_.body_center_offset_.z(), 0.0);
@@ -64,6 +66,8 @@ void GridMap::initMap(ros::NodeHandle &nh)
       !mp_.local_update_range_.allFinite() || (mp_.local_update_range_.array() <= 0).any() ||
       !std::isfinite(mp_.double_cylinder_radius_) || mp_.double_cylinder_radius_ <= 0 ||
       !std::isfinite(mp_.double_cylinder_offset_) || mp_.double_cylinder_offset_ < 0 ||
+      !std::isfinite(mp_.body_length_) || mp_.body_length_ <= 0 ||
+      !std::isfinite(mp_.body_width_) || mp_.body_width_ <= 0 ||
       !std::isfinite(mp_.obstacles_inflation_z_up) || mp_.obstacles_inflation_z_up < 0 ||
       !std::isfinite(mp_.obstacles_inflation_z_down) || mp_.obstacles_inflation_z_down < 0 ||
       !std::isfinite(mp_.map_sliding_thresh_) || mp_.map_sliding_thresh_ <= 0 ||
@@ -111,6 +115,9 @@ void GridMap::initMap(ros::NodeHandle &nh)
   md_.occupancy_buffer_ = vector<double>(buffer_size, mp_.clamp_min_log_ - mp_.unknown_flag_);
   md_.occupancy_buffer_inflate_ = vector<char>(buffer_size, 0);
   md_.occupancy_buffer_inflate_cnt_ = vector<int>(buffer_size, 0);
+  md_.occupancy_words_per_column_ = (mp_.map_voxel_num_.z() + 63) / 64;
+  md_.occupancy_bits_.assign(static_cast<std::size_t>(mp_.map_voxel_num_.x())
+      * mp_.map_voxel_num_.y() * md_.occupancy_words_per_column_, 0);
   rebuildInflationOffsets();
 
   md_.count_hit_and_miss_ = vector<short>(buffer_size, 0);
@@ -159,7 +166,9 @@ void GridMap::updateMapBoundaryFromIndex()
 void GridMap::rebuildInflationOffsets()
 {
   const double double_radius = std::max(0.0, mp_.double_cylinder_radius_);
-  const int inf_step_xy = ceil(double_radius / mp_.resolution_);
+  // 查询点和占据体素各有格内偏移，粗查必须覆盖二者；最终按真实矩形复核。
+  const double candidate_radius = double_radius + std::sqrt(2.) * mp_.resolution_;
+  const int inf_step_xy = ceil(candidate_radius / mp_.resolution_);
   const int inf_step_z_up = ceil(mp_.obstacles_inflation_z_up / mp_.resolution_);
   const int inf_step_z_down = ceil(mp_.obstacles_inflation_z_down / mp_.resolution_);
 
@@ -168,7 +177,7 @@ void GridMap::rebuildInflationOffsets()
     for (int y = -inf_step_xy; y <= inf_step_xy; ++y)
     {
       Eigen::Vector2d offset_xy(x * mp_.resolution_, y * mp_.resolution_);
-      if (offset_xy.norm() >= double_radius)
+      if (offset_xy.norm() > candidate_radius)
         continue;
 
       for (int z = -inf_step_z_down; z <= inf_step_z_up; ++z)
@@ -181,6 +190,7 @@ void GridMap::resetAllMapData()
   std::fill(md_.occupancy_buffer_.begin(), md_.occupancy_buffer_.end(), mp_.clamp_min_log_ - mp_.unknown_flag_);
   std::fill(md_.occupancy_buffer_inflate_.begin(), md_.occupancy_buffer_inflate_.end(), 0);
   std::fill(md_.occupancy_buffer_inflate_cnt_.begin(), md_.occupancy_buffer_inflate_cnt_.end(), 0);
+  std::fill(md_.occupancy_bits_.begin(), md_.occupancy_bits_.end(), 0);
   std::fill(md_.count_hit_and_miss_.begin(), md_.count_hit_and_miss_.end(), 0);
   std::fill(md_.count_hit_.begin(), md_.count_hit_.end(), 0);
   std::fill(md_.flag_rayend_.begin(), md_.flag_rayend_.end(), -1);
@@ -236,6 +246,16 @@ void GridMap::updateInflation(const Eigen::Vector3i& id, int delta, const std::v
                        md_.occupancy_buffer_inflate_, ignore_mask);
 }
 
+void GridMap::updateOccupiedBit(int address, bool occupied)
+{
+  const int nz = mp_.map_voxel_num_.z(), z = address % nz;
+  auto& word = md_.occupancy_bits_[static_cast<std::size_t>(address / nz)
+      * md_.occupancy_words_per_column_ + z / 64];
+  const auto mask = std::uint64_t{1} << (z % 64);
+  if (occupied) word |= mask;
+  else word &= ~mask;
+}
+
 void GridMap::applyOccupancyUpdate(const Eigen::Vector3i& id, double new_log_odds)
 {
   if (!isInMap(id))
@@ -246,16 +266,20 @@ void GridMap::applyOccupancyUpdate(const Eigen::Vector3i& id, double new_log_odd
   const bool now_occ = new_log_odds > mp_.min_occupancy_log_;
 
   md_.occupancy_buffer_[addr] = new_log_odds;
-  if (was_occ != now_occ)
+  if (was_occ != now_occ) {
+    updateOccupiedBit(addr, now_occ);
     updateInflation(id, now_occ ? 1 : -1);
+  }
 }
 
 void GridMap::resetCellByAddress(int addr)
 {
   Eigen::Vector3i id_g;
   hashIdToGlobalIndex(addr, id_g);
-  if (md_.occupancy_buffer_[addr] > mp_.min_occupancy_log_)
+  if (md_.occupancy_buffer_[addr] > mp_.min_occupancy_log_) {
+    updateOccupiedBit(addr, false);
     updateInflation(id_g, -1);
+  }
 
   md_.occupancy_buffer_[addr] = mp_.clamp_min_log_ - mp_.unknown_flag_;
   md_.count_hit_[addr] = 0;
@@ -268,8 +292,10 @@ void GridMap::resetCellByAddressForSliding(int addr, const std::vector<char>& cl
 {
   Eigen::Vector3i id_g;
   hashIdToGlobalIndex(addr, id_g);
-  if (md_.occupancy_buffer_[addr] > mp_.min_occupancy_log_)
+  if (md_.occupancy_buffer_[addr] > mp_.min_occupancy_log_) {
+    updateOccupiedBit(addr, false);
     updateInflation(id_g, -1, &clear_mask);
+  }
 }
 
 void GridMap::updateSlidingMap(const Eigen::Vector3d& center)
@@ -729,9 +755,15 @@ void GridMap::importStaticOccupied(const std::vector<Eigen::Vector3d>& points,
   md_.has_ray_pose_ = false;
   md_.has_cloud_ = false;
   md_.sliding_map_frame_pos_ = current_body_pos;
+  static_cells_.clear();
   for (const auto& point : points)
-    if (point.allFinite())
+    if (point.allFinite() && isInMap(point))
+    {
+      Eigen::Vector3i id;
+      posToIndex(point, id);
+      static_cells_.insert({id.x(), id.y(), id.z()});
       setOccupied(point);
+    }
 }
 
 void GridMap::repopulateStaticOccupied(const std::vector<Eigen::Vector3d>& points,
@@ -743,9 +775,21 @@ void GridMap::repopulateStaticOccupied(const std::vector<Eigen::Vector3d>& point
     throw std::logic_error("Cannot mix pending LiDAR observation and static fixture truth");
   md_.sliding_map_frame_pos_ = current_body_pos;
   updateSlidingMap(current_body_pos);
+  std::set<std::array<int, 3>> current;
   for (const auto& point : points)
-    if (point.allFinite())
-      setOccupied(point);
+    if (point.allFinite() && isInMap(point))
+    {
+      Eigen::Vector3i id;
+      posToIndex(point, id);
+      current.insert({id.x(), id.y(), id.z()});
+    }
+  // 输入是当前完整静态真值，撤走的实体必须沿同一占据/膨胀计数更新退出。
+  for (const auto& cell : static_cells_)
+    if (current.count(cell) == 0)
+      applyOccupancyUpdate(Eigen::Vector3i(cell[0], cell[1], cell[2]), mp_.clamp_min_log_);
+  for (const auto& cell : current)
+    applyOccupancyUpdate(Eigen::Vector3i(cell[0], cell[1], cell[2]), mp_.clamp_max_log_);
+  static_cells_ = std::move(current);
 }
 
 bool GridMap::odomValid() { return md_.has_ray_pose_; }

@@ -225,6 +225,16 @@ impl SurfaceMapCache {
         cache
     }
 
+    /// 同`configured`，精细地图缺块补取改用调用方给定的LCM地址，不读进程环境变量。
+    pub fn configured_with_lcm_url(
+        config: &crate::surface_config::SurfaceNavigationConfig,
+        lcm_url: impl Into<String>,
+    ) -> Self {
+        let mut cache = Self::configured(config);
+        cache.lcm_url = lcm_url.into();
+        cache
+    }
+
     /// Opt-in integration seam for a receiver populated through its original
     /// bounded transfer / missing-object fetch path. Build still revalidates the
     /// publication and runs the original Reader, observations and surface builder.

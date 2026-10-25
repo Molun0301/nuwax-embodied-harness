@@ -8,11 +8,12 @@ const Q: f32 = 0.05;
 fn dilation_bits_match_geometric_neighborhood_at_coordinate_limits() {
     for c in [[0, 0], [i32::MIN, i32::MAX], [i32::MAX - 2, i32::MIN + 3]] {
         let columns: Vec<_> = window(c).collect();
-        for phase in 0..32 {
+        // 前32组为混合子集，其后逐个单列：单列膨胀最容易暴露移位跨行或越出81位。
+        for phase in 0..32 + columns.len() {
             let input: BTreeSet<_> = columns
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| (i * 17 + phase * 11) % 31 < phase)
+                .filter(|(i, _)| if phase < 32 { (i * 17 + phase * 11) % 31 < phase } else { *i == phase - 32 })
                 .map(|(_, &xy)| xy)
                 .collect();
             let expected: BTreeSet<_> = columns
@@ -25,7 +26,10 @@ fn dilation_bits_match_geometric_neighborhood_at_coordinate_limits() {
                     })
                 })
                 .collect();
-            let actual = dilate(c, &input);
+            let actual = dilate(
+                window_bits(c),
+                input.iter().fold(0, |bits, &xy| bits | 1 << bit_of(c, xy)),
+            );
             assert_eq!(actual.count_ones() as usize, expected.len());
             for xy in &columns {
                 let bit = (i64::from(xy[0]) - i64::from(c[0]) + 4) * 9 + i64::from(xy[1])

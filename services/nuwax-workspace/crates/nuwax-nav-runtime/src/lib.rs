@@ -2642,6 +2642,16 @@ pub fn qualification_surface_backend(
     production_surface_backend(config)
 }
 
+/// 静态地图资格测试仍使用真实异步执行器，显式声明其输入并非注册扫描原帧。
+#[cfg(feature = "surface-recovery-qualification")]
+pub fn qualification_static_surface_backend(
+    config: SurfaceFollowerConfig,
+) -> Result<impl NavPlanner, RuntimeError> {
+    let mut follower = SurfaceFollower::new(config)?;
+    follower.enable_author_static_map_fixture(true);
+    planner_worker::PlannerWorker::new(follower)
+}
+
 struct DeferredControl {
     publication: watch::Receiver<()>,
     deadline: Instant,
@@ -4737,11 +4747,20 @@ mod tests {
         let command=scheduler.status.last_applied_twist.expect("应交付新目标首拍");
         assert!(command.linear.x>=0.&&command.linear.x<=0.5*0.05+1e-9,
             "已确认停车后不能沿用上一目标0.2m/s命令边界：{command:?}");
-        let mut next=start;next.stamp.nanos+=50_000_000;
-        scheduler.observe_odometry(&status,next,None).unwrap();
-        scheduler.control_tick(&status).await.unwrap();
-        let following=scheduler.status.last_applied_twist.unwrap();
-        assert!(following.linear.x>0.&&following.linear.x<=command.linear.x+0.5*0.05+1e-9);
+        let mut next = start;
+        let mut previous = command;
+        let mut moving = false;
+        for _ in 0..20 {
+            next.stamp.nanos += 50_000_000;
+            scheduler.observe_odometry(&status, next.clone(), None).unwrap();
+            scheduler.control_tick(&status).await.unwrap();
+            let following = scheduler.status.last_applied_twist.unwrap();
+            assert!(following.linear.x >= 0. && following.linear.x <= previous.linear.x + 0.5 * 0.05 + 1e-9,
+                "新目标每拍都必须遵守从已确认零速起步的加速度限制：{following:?}");
+            if following.linear.x > 0. { moving = true; break; }
+            previous = following;
+        }
+        assert!(moving, "作者A完成初始化后必须恢复实际运动");
     }
 
     #[tokio::test]

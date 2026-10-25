@@ -2507,5 +2507,39 @@
     ],
     "apply_scope": "重启运动守卫后生效",
     "description": "未填写导航能力标定时，停车后等待实测反馈确认停稳的最长时间（秒，0～30），超时按停车失败处理；填写标定后改用标定的制动时间。"
+  },
+  "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_MIB": {
+    "section_id": "geometry_quality",
+    "target_file": "core_env",
+    "advanced": false,
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/main.rs",
+      "services/geometry/nuwax_geometry_runtime/src/fine_cloud.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效，无需重新构建",
+    "effective_value_scope": "external_process",
+    "maximum": 4096,
+    "zh_name": "精细点云缓存模式与预算",
+    "type": "str",
+    "default": "auto",
+    "minimum": 16,
+    "description": "选择自动或固定预算，单位 MiB（二进制兆字节）。自动从 32 MiB 开始，需要整体写出缓存时先尝试扩容，到自动上限后按固定预算处理并警告一次；固定预算填 16～4096 的整数。留空恢复自动。在线建图与 PGO（位姿图优化）重放写入器各自独立使用该预算，只影响速度与内存，地图输出相同。"
+  },
+  "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_AUTO_MAX_MIB": {
+    "section_id": "geometry_quality",
+    "target_file": "core_env",
+    "advanced": false,
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/main.rs",
+      "services/geometry/nuwax_geometry_runtime/src/fine_cloud.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效，无需重新构建",
+    "effective_value_scope": "external_process",
+    "maximum": 4096,
+    "zh_name": "精细点云自动缓存上限（MiB）",
+    "type": "int",
+    "default": 256,
+    "minimum": 32,
+    "description": "自动模式下每个写入器的增长上限，单位 MiB（二进制兆字节），填 32～4096 的整数；留空使用 256。在线建图与 PGO（位姿图优化）重放各自独立遵守上限，二者同时存在时不能把此值当作合计内存上限。固定模式忽略此项。"
   }
 }

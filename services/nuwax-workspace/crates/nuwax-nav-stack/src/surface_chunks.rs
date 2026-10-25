@@ -753,11 +753,6 @@ mod tests {
                 // 未对准门中线时，先证明完整前向参照，再验直接全局请求。
                 let point=|x,y|([x,y,0.4],[0.0,0.0,0.0,1.0]);
                 let reference=[point(-0.65,0.30),point(-0.35,y),point(0.39,y),point(0.65,0.30)];
-                let motion=MotionLimits {model:MotionModel::Omnidirectional,max_forward_mps:0.3,
-                    max_reverse_mps:0.3,max_lateral_mps:0.3,max_angular_rps:0.8,
-                    linear_acceleration_mps2:1.0,guaranteed_braking_mps2:1.0,
-                    angular_acceleration_rps2:2.0,guaranteed_angular_braking_rps2:2.0,
-                    reaction_time_sec:0.05,minimum_turning_radius_m:0.0,can_rotate_in_place:true};
                 let options=GoalOptions {allow_reverse:true,position_tolerance_m:0.003,yaw_tolerance_rad:0.01};
                 for pair in reference.windows(2) {
                     let segment=crate::surface_oriented::plan(&map,pair[0],pair[1],options,0.4,&[])
@@ -767,7 +762,7 @@ mod tests {
                 let route=crate::surface_oriented::plan(&map,reference[0],reference[3],options,0.4,&[])
                     .expect("未预先对准的真实可过窄门须找到完整路线");
                 assert!(route.len()>=2);
-                for (heading,aligned) in [(0.0_f64,true),(5.0_f64.to_radians(),true),(0.0,false)] {
+                for (heading,aligned) in [(0.0_f64,true),(5.0_f64.to_radians(),true),(0.0_f64,false)] {
                     let body=|x:f64|([x,if aligned {y+(x-2.0*fine)*heading.tan()} else {0.30},0.4],[0.0,0.0,(heading/2.0).sin(),(heading/2.0).cos()]);
                     let stamped=|body:([f64;3],[f64;4]),time:i64|PoseStamped {frame_id:NavFrameId::Map,
                         stamp:Timestamp::from_unix(time/1_000_000_000,(time%1_000_000_000) as u32),
@@ -784,7 +779,7 @@ mod tests {
                     let route=crate::surface_oriented::plan(&map,current,goal,options,0.4,&[]).unwrap();
                     let mut config=SurfaceFollowerConfig::new(0.4);config.controller.speed=0.3;
                     config.controller.control_frequency=20.0;config.controller.simulation=true;
-                    config.motion_limits=Some(motion);config.max_angular_speed_rps=0.8;
+                    config.motion_limits=Some(motion.clone());config.max_angular_speed_rps=0.8;
                     let mut follower=SurfaceFollower::new(config).unwrap();
                     follower.enable_author_static_map_fixture(true); // Explicit static test input, never a production fallback.
                     follower.configure_goal(&stamped(goal,time),options).unwrap();
@@ -792,14 +787,32 @@ mod tests {
                     follower.update_odometry(stamped(current,time));
                     follower.replace_execution_path(ExecutionPath::Surface(Path3D {
                         poses:route.iter().copied().map(|p|stamped(p,time)).collect()}),None,stamped(goal,time)).unwrap();
-                    let mut applied=Twist2::ZERO;let mut reached=false;
+                    let mut applied=Twist2::ZERO;let mut reached=false;let mut passed_opening=false;
                     let mut inputs=Vec::new();
                     for tick in 0..240 {
+                        // 速度来自下方独立运动响应积分器，命令回执不充当测速。
+                        follower.observe_measured_motion(Some(nuwax_nav_runtime::MeasuredMotion {
+                            source_id:"doorway:integrated-body".into(),source_timestamp_ns:time as u64,
+                            received_monotonic_ns:nuwax_nav_runtime::motion_feedback::monotonic_ns(),
+                            valid_until_monotonic_ns:u64::MAX,frame_id:"base_link".into(),
+                            body_linear_xyz:[applied.linear.x,applied.linear.y,0.],
+                            body_angular_xyz:[0.,0.,applied.angular_z],
+                            orientation_wxyz:Some([current.1[3],current.1[0],current.1[1],current.1[2]]),
+                        }));
                         if capture.is_some() {inputs.push((current,[applied.linear.x,applied.linear.y,applied.angular_z],time));}
                         let mut arriving=false;
                         let command=match follower.step(0.32) {
                             PlannerStep::Command(command)=>command,
                             PlannerStep::Succeeded=>{arriving=true;Twist2::ZERO},
+                            PlannerStep::ReplanRequired(_) if follower.execution_cycle_complete()=>{
+                                // 原作者周期结束沿生产语义重新请求原目标，仍计入同一240拍预算。
+                                let route=crate::surface_oriented::plan(&map,current,goal,options,0.4,&[])
+                                    .expect("本周期结束后应从实际位置接续原目标");
+                                follower.replace_execution_path(ExecutionPath::Surface(Path3D {
+                                    poses:route.into_iter().map(|p|stamped(p,time)).collect(),
+                                }),None,stamped(goal,time)).unwrap();
+                                Twist2::ZERO
+                            },
                             other=>{
                                 if let Some(destination)=&capture {
                                     let envelope=map.body_envelope().unwrap();
@@ -854,30 +867,40 @@ mod tests {
                                 panic!("真实窄门闭环不能卡住：角度{heading} aligned={aligned} tick={tick} {other:?} {current:?}");
                             },
                         };
-                        assert!(command.linear.x>=0.0 && command.linear.y==0.0,"窄门也不能横走倒退");
-                        let next_applied=Twist2 {linear:Point2::new(applied.linear.x+(command.linear.x-applied.linear.x).clamp(-0.05,0.05),0.0),
+                        // 当前作者A保留原声明的全向通道，独立响应模型也须完整执行这些通道。
+                        assert!(command.linear.x >= -motion.max_reverse_mps && command.linear.x <= motion.max_forward_mps
+                            && command.linear.y.abs() <= motion.max_lateral_mps && command.angular_z.abs() <= motion.max_angular_rps,
+                            "命令必须满足原声明的各轴能力：tick={tick} command={command:?}");
+                        let delta=Point2::new(command.linear.x-applied.linear.x,command.linear.y-applied.linear.y);
+                        let scale=(0.05/delta.x.hypot(delta.y).max(f64::MIN_POSITIVE)).min(1.);
+                        let next_applied=Twist2 {linear:Point2::new(applied.linear.x+delta.x*scale,applied.linear.y+delta.y*scale),
                             angular_z:applied.angular_z+(command.angular_z-applied.angular_z).clamp(-0.1,0.1)};
-                        let mean=Twist2 {linear:Point2::new((applied.linear.x+next_applied.linear.x)*0.5,0.0),
+                        let mean=Twist2 {linear:Point2::new((applied.linear.x+next_applied.linear.x)*0.5,(applied.linear.y+next_applied.linear.y)*0.5),
                             angular_z:(applied.angular_z+next_applied.angular_z)*0.5};
                         let yaw=2.0*current.1[2].atan2(current.1[3]);
                         let next=nuwax_nav_control::integrate(nuwax_nav_control::PlanarPose{x:current.0[0],y:current.0[1],yaw},mean,0.05);
                         let actual=([next.x,next.y,0.4],[0.0,0.0,(next.yaw/2.0).sin(),(next.yaw/2.0).cos()]);
-                        let sweep=(mean.linear.x.abs()+mean.angular_z.abs()*0.3_f64.hypot(width*0.5))*0.05;
+                        let sweep=(mean.linear.x.hypot(mean.linear.y)+mean.angular_z.abs()*0.3_f64.hypot(width*0.5))*0.05;
                         let divisions=(sweep/(fine/3.)).ceil().max(1.) as usize;
                         for sample in 0..=divisions {
                             let p=nuwax_nav_control::integrate(nuwax_nav_control::PlanarPose{x:current.0[0],y:current.0[1],yaw},mean,0.05*sample as f64/divisions as f64);
                             let body=([p.x,p.y,0.4],[0.,0.,(p.yaw*0.5).sin(),(p.yaw*0.5).cos()]);
+                            if p.x>=0. && p.x<=4.*fine {
+                                assert!(p.y>0. && p.y<gap as f64*fine,"必须穿过原门洞：{body:?}");
+                                passed_opening=true;
+                            }
                             assert!(!body_intersects_wall(body,width,gap as f64*fine,fine),"实际积分机身撞门框：tick={tick} body={body:?} command={command:?}");
                         }
                         current=actual;applied=next_applied;time+=50_000_000;
                         follower.observe_applied_command(applied);follower.update_odometry(stamped(current,time));
                         // 跟随器只报告规划到达，模拟执行器仍真实制动到停稳后确认。
-                        if arriving && applied.linear.x.abs()<0.005 && applied.angular_z.abs()<0.01
+                        if arriving && applied.linear.x.hypot(applied.linear.y)<0.005 && applied.angular_z.abs()<0.01
                             && (current.0[0]-goal.0[0]).hypot(current.0[1]-goal.0[1])<options.position_tolerance_m {
+                            eprintln!("窄门闭环通过 heading={heading} aligned={aligned} tick={tick} pose={current:?} actual={applied:?}");
                             reached=true;break;
                         }
                     }
-                    assert!(reached && current.0[0]>0.46 && applied.linear.x.abs()<0.01,
+                    assert!(reached && passed_opening && current.0[0]>0.46 && applied.linear.x.hypot(applied.linear.y)<0.01,
                         "完整机体须通过门框并停稳：角度{heading}，到达{reached}，位姿{current:?}，速度{applied:?}");
                 }
             }

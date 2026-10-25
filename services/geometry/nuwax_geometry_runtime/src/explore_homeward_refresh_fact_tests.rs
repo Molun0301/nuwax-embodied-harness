@@ -8,9 +8,11 @@ use crate::explore_runtime::tests::{
 
 // Reuse the exact strict nonzero unknown-space route from
 // mission_surface_unknown_query_keeps_requested_home_yaw_and_real_endpoint.
-// This is truthful unknown-space, not evidence of known-ground traversal.
-fn homeward_fact_unknown_context(mut context: ComputeContext) -> ComputeContext {
-    context.robot_pose.pose.position = Point3::new(-10.0, -10.0, 0.4);
+// 机体下方没有实测地面；PCT不在盲区补造地面，只在10格半径内把起点绑定到
+// 地图边缘最近的实测层，因此起点放在地面边缘外0.3米。
+// `body_z`取该夹具实测地面高度加支撑偏移，路线末点与返航目标在同一机体高度。
+fn homeward_fact_unknown_context(mut context: ComputeContext, body_z: f64) -> ComputeContext {
+    context.robot_pose.pose.position = Point3::new(-0.3, 1.05, body_z);
     context
 }
 
@@ -133,7 +135,7 @@ fn homeward_fact_prepare(
 fn surface_homeward_same_context_reuses_actual_tomogram() {
     // Construct once. Rebuilding surface_reuse_context per round would allocate
     // another navigation PctPlanner and manufacture an unrelated cache miss.
-    let mut context = homeward_fact_unknown_context(cancellable_surface_context());
+    let mut context = homeward_fact_unknown_context(cancellable_surface_context(), 0.35);
     Arc::make_mut(&mut context.config).return_policy.maximum_distance_m = Some(100.0);
     let ComputeInput::Surface { original, config } = &context.input else { unreachable!() };
     let original = original.clone();
@@ -176,7 +178,7 @@ fn surface_homeward_between_selections_preserves_original_source_progress() {
     receiver.observe(snapshot.clone()).unwrap();
     let mut backend = ExploreComputeBackend::new(surface_controller(receiver.clone()));
     // Only the Homeward query pose differs; source, Explore config and navigation PCT are shared.
-    let homeward_context = homeward_fact_unknown_context(context.clone());
+    let homeward_context = homeward_fact_unknown_context(context.clone(), 0.35);
     let progress = homeward_fact_progress(&homeward_context);
     let (first, _, _, first_maps, first_cells) = capture_surface_owner_work(||
         backend.prepare_request(None, selection_request(&context), || false));
@@ -256,7 +258,7 @@ fn surface_homeward_real_writer_metadata_reuses_and_scatter_invalidates() {
     let receiver = SurfaceInputReceiver::new();
     receiver.observe(first.clone()).unwrap();
     let initial = receiver.freeze().unwrap();
-    let mut context = homeward_fact_unknown_context(context());
+    let mut context = homeward_fact_unknown_context(context(), 0.55);
     context.input = ComputeInput::Surface { original: initial.clone(), config: config.clone() };
     Arc::make_mut(&mut context.config).return_policy.maximum_distance_m = Some(100.0);
     let explore_config = context.config.clone();
@@ -336,7 +338,7 @@ fn surface_homeward_real_writer_metadata_reuses_and_scatter_invalidates() {
 
 #[test]
 fn surface_homeward_warm_route_cancellation_keeps_cache_and_nesting() {
-    let mut context = homeward_fact_unknown_context(cancellable_surface_context());
+    let mut context = homeward_fact_unknown_context(cancellable_surface_context(), 0.35);
     Arc::make_mut(&mut context.config).return_policy.maximum_distance_m = Some(100.0);
     let ComputeInput::Surface { original, .. } = &context.input else { unreachable!() };
     let receiver = SurfaceInputReceiver::new();

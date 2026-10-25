@@ -114,15 +114,7 @@ impl GroundRecords {
         }
     }
     pub(crate) fn bytes(&self) -> usize {
-        self.iter().map(|(_, r)| match r {
-            GroundRecordRef::LegacyPlane(v) => terrain_observations::layer_bytes(v),
-            GroundRecordRef::ClassifiedEmptyColumn => 128,
-            GroundRecordRef::HeightfieldV1(v) => {
-                let mut sources = BTreeSet::new();
-                128 + v.members.len() * (8 * 8 + 2) + v.samples.len() * 64
-                    + v.samples.iter().filter(|s| sources.insert(Arc::as_ptr(&s.source))).map(|s| s.source.resident_bytes()).sum::<usize>()
-            }
-        }).sum()
+        self.iter().map(|(_, r)| record_bytes(r)).sum()
     }
     pub(crate) fn geometry_eq(&self, other: &Self) -> bool {
         let mut a = self.iter(); let mut b = other.iter();
@@ -273,19 +265,73 @@ mod sample_encoding {
     }
 }
 
+/// 单条记录的常驻字节；整块字节是各条之和。
+pub(crate) fn record_bytes(record: GroundRecordRef<'_>) -> usize {
+    match record {
+        GroundRecordRef::LegacyPlane(v) => terrain_observations::layer_bytes(v),
+        GroundRecordRef::ClassifiedEmptyColumn => 128,
+        GroundRecordRef::HeightfieldV1(v) => {
+            // 来源对象按指针去重：只计每个来源第一次出现的样本，与集合去重结果相同。
+            128 + v.members.len() * (8 * 8 + 2) + v.samples.len() * 64
+                + v.samples.iter().enumerate()
+                    .filter(|(i, s)| !v.samples[..*i].iter().any(|earlier| Arc::ptr_eq(&earlier.source, &s.source)))
+                    .map(|(_, s)| s.source.resident_bytes()).sum::<usize>()
+        }
+    }
+}
+impl GroundRecord {
+    pub(crate) fn as_ref(&self) -> GroundRecordRef<'_> {
+        match self {
+            GroundRecord::LegacyPlane(v) => GroundRecordRef::LegacyPlane(v),
+            GroundRecord::HeightfieldV1(v) => GroundRecordRef::HeightfieldV1(v),
+            GroundRecord::ClassifiedEmptyColumn {} => GroundRecordRef::ClassifiedEmptyColumn,
+        }
+    }
+}
+/// 原记录叠加暂存增量后的版本化视图，按键升序；增量中的 `None` 表示删除该键。
+pub(crate) fn overlay<'a>(base: &'a GroundRecords, delta: &'a BTreeMap<u16, Option<GroundRecord>>)
+    -> Vec<(u16, GroundRecordRef<'a>)> {
+    let mut view = Vec::new();
+    let mut changes = delta.iter().peekable();
+    for (key, record) in base.iter() {
+        while let Some((&k, change)) = changes.next_if(|(k, _)| **k < key) {
+            if let Some(value) = change { view.push((k, value.as_ref())); }
+        }
+        match changes.next_if(|(k, _)| **k == key) {
+            Some((_, Some(value))) => view.push((key, value.as_ref())),
+            Some((_, None)) => {}
+            None => view.push((key, record)),
+        }
+    }
+    view.extend(changes.filter_map(|(&k, change)| change.as_ref().map(|value| (k, value.as_ref()))));
+    view
+}
+
 pub(crate) fn validate_records(records: &GroundRecords, block: &Block) -> Result<(), String> {
     if let GroundRecords::Legacy(v) = records { return terrain_observations::validate_layers(v, block); }
-    if records.iter().count() > MAX_LAYERS_PER_BLOCK { return Err("ground record count exceeds block budget".into()); }
+    validate_versioned_records(records.iter().count(), records.iter(), block)
+}
+/// 版本化记录的整块校验：先查记录数，再按键升序逐条校验，返回第一个错误。
+pub(crate) fn validate_versioned_records<'a>(count: usize,
+    records: impl Iterator<Item = (u16, GroundRecordRef<'a>)>, block: &Block) -> Result<(), String> {
+    if count > MAX_LAYERS_PER_BLOCK { return Err("ground record count exceeds block budget".into()); }
     let mut latest = None;
-    let mut claimed = BTreeSet::new();
+    // 块内成员编号是 u16，用 65536 位的位表记录已认领成员，`claim` 与集合插入的返回值相同。
+    let mut claimed = vec![0_u64; 1024];
+    let mut claim = |member: u16| {
+        let (word, bit) = (usize::from(member / 64), member % 64);
+        let fresh = claimed[word] & (1 << bit) == 0;
+        claimed[word] |= 1 << bit;
+        fresh
+    };
     let mut empty_columns = BTreeSet::new();
     let mut ground_columns = BTreeSet::new();
-    for (key, record) in records.iter() {
+    for (key, record) in records {
         match record {
             GroundRecordRef::LegacyPlane(v) => {
                 ground_columns.insert(key % 1024);
                 terrain_observations::validate_versioned_legacy(&BTreeMap::from([(key, v.clone())]), block, *latest.get_or_insert_with(|| block.values().map(|v| v.observed_ns).max().unwrap_or(0)))?;
-                if v.members.iter().any(|m| !claimed.insert(*m)) { return Err("overlapping ground record members".into()); }
+                if v.members.iter().any(|m| !claim(*m)) { return Err("overlapping ground record members".into()); }
             }
             GroundRecordRef::HeightfieldV1(v) => {
                 ground_columns.insert(key % 1024);
@@ -294,7 +340,7 @@ pub(crate) fn validate_records(records: &GroundRecords, block: &Block) -> Result
                     || !v.height_m.is_finite() || !v.occupied_bounds.iter().all(|n| n.is_finite())
                     || v.occupied_bounds[0] >= v.occupied_bounds[1]
                     || v.members.iter().any(|(m, mass)| *m >= 32768 || *m % 1024 != key % 1024
-                        || !block.contains_key(m) || !claimed.insert(*m)
+                        || !block.contains_key(m) || !claim(*m)
                         || mass.iter().any(|n| !n.is_finite() || *n < 0.0)) {
                     return Err("invalid heightfield fragment members or geometry".into());
                 }
@@ -323,9 +369,14 @@ pub(crate) fn validate_records(records: &GroundRecords, block: &Block) -> Result
 /// diagnostic must be backed by its own actual occupied voxel in this block.
 pub(crate) fn validate_legacy_sample_occupancy(records: &GroundRecords, block: &Block, key: Key, q: f32) -> Result<(), String> {
     let GroundRecords::Versioned(records) = records else { return Ok(()); };
+    validate_versioned_legacy_samples(records.values().map(GroundRecord::as_ref), block, key, q)
+}
+/// 版本化记录中旧平面诊断样本的占据核对，按键升序返回第一个错误。
+pub(crate) fn validate_versioned_legacy_samples<'a>(records: impl Iterator<Item = GroundRecordRef<'a>>,
+    block: &Block, key: Key, q: f32) -> Result<(), String> {
     let reciprocal = 1.0 / f64::from(q);
-    for record in records.values() {
-        let GroundRecord::LegacyPlane(layer) = record else { continue; };
+    for record in records {
+        let GroundRecordRef::LegacyPlane(layer) = record else { continue; };
         let member_time = layer.members.iter().map(|k| block[k].observed_ns).max().unwrap_or(0);
         for sample in layer.samples.iter().filter(|s| s.source_timestamp_ns > member_time) {
             let cells = sample.point.map(|v| (v * reciprocal).floor());
@@ -346,25 +397,31 @@ pub(crate) fn validate_legacy_sample_occupancy(records: &GroundRecords, block: &
 pub(crate) fn assemble_column(
     xy: [i32; 2], q: f32, blocks: &[(Key, GroundRecords)],
 ) -> Result<ColumnGroundRecords, String> {
+    let local_xy = local_key([xy[0], xy[1], 0]) % 1024;
+    let block_xy = [xy[0].div_euclid(32), xy[1].div_euclid(32)];
+    assemble_column_records(xy, q, blocks.iter().filter(|(block, _)| block[..2] == block_xy)
+        .flat_map(|(block, records)| (0..32_u16)
+            .filter_map(move |z| records.get(local_xy + 1024 * z).map(|record| (*block, record)))), true)
+}
+/// 由同一列的全部原始记录组装完整列。记录须按块顺序、块内高度升序给出，
+/// 与逐块逐层查找的顺序相同，因此结果和首个错误也相同。`samples` 为假时不复制
+/// 高度场的诊断样本（样本不参与组装校验），其余内容不变。
+pub(crate) fn assemble_column_records<'a>(
+    xy: [i32; 2], q: f32, records: impl IntoIterator<Item = (Key, GroundRecordRef<'a>)>, samples: bool,
+) -> Result<ColumnGroundRecords, String> {
     let mut legacy = Vec::new();
     let mut classified_empty = false;
     let mut groups: BTreeMap<Key, Vec<(Key, &HeightfieldFragment)>> = BTreeMap::new();
-    let local_xy = local_key([xy[0], xy[1], 0]) % 1024;
-    for (block, records) in blocks {
-        if block[..2] != [xy[0].div_euclid(32), xy[1].div_euclid(32)] { continue; }
-        for z in 0..32_u16 {
-            let key = local_xy + 1024 * z;
-            match records.get(key) {
-                Some(GroundRecordRef::LegacyPlane(v)) => legacy.push((*block, v.clone())),
-                Some(GroundRecordRef::HeightfieldV1(v)) => {
-                    if v.anchor[..2] != xy { return Err("heightfield anchor changes XY".into()); }
-                    groups.entry(v.anchor).or_default().push((*block, v));
-                }
-                Some(GroundRecordRef::ClassifiedEmptyColumn) => {
-                    if classified_empty { return Err("duplicate classified empty column".into()); }
-                    classified_empty = true;
-                }
-                None => {},
+    for (block, record) in records {
+        match record {
+            GroundRecordRef::LegacyPlane(v) => legacy.push((block, v.clone())),
+            GroundRecordRef::HeightfieldV1(v) => {
+                if v.anchor[..2] != xy { return Err("heightfield anchor changes XY".into()); }
+                groups.entry(v.anchor).or_default().push((block, v));
+            }
+            GroundRecordRef::ClassifiedEmptyColumn => {
+                if classified_empty { return Err("duplicate classified empty column".into()); }
+                classified_empty = true;
             }
         }
     }
@@ -374,6 +431,7 @@ pub(crate) fn assemble_column(
     let mut heightfields = Vec::new();
     for (anchor, fragments) in groups {
         let first = fragments[0].1;
+        let keep_samples = samples;
         let mut mass = BTreeMap::new(); let mut samples = Vec::new();
         for (block, fragment) in fragments {
             if fragment.height_m != first.height_m || fragment.occupied_bounds != first.occupied_bounds {
@@ -383,7 +441,7 @@ pub(crate) fn assemble_column(
                 let key = global_key(block, *local)?;
                 if key[..2] != xy || mass.insert(key[2], *bins).is_some() { return Err("overlapping heightfield fragments".into()); }
             }
-            samples.extend(fragment.samples.iter().cloned());
+            if keep_samples { samples.extend(fragment.samples.iter().cloned()); }
         }
         let column = HeightfieldColumn::from_normalized_members(xy, q, mass)?;
         if [xy[0], xy[1], column.members().next().unwrap().0] != anchor

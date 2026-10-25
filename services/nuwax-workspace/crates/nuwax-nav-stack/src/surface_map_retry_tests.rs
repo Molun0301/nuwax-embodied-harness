@@ -489,13 +489,15 @@ async fn incomplete_refresh_keeps_pose_and_recent_source_deadlines_independent()
         } else {
             harness.feed.lock().unwrap().frozen_pose_stamp = Some(now);
         }
-        wait(|| {
-            let status = harness.scheduler.status();
-            !status.planner_inputs_fresh
-                && status.last_applied_twist == Some(Twist2::ZERO)
-                && status.last_terminal.is_none()
-        })
-        .await;
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let status = harness.scheduler.status();
+                if !status.planner_inputs_fresh
+                    && status.last_applied_twist == Some(Twist2::ZERO)
+                    && status.last_terminal.is_none() { break; }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.unwrap_or_else(|_| panic!("独立输入期限未保持 recent={recent}: {:?}", harness.scheduler.status()));
         wait(|| probe.count(next.cloud_revision) >= 2).await;
         assert_eq!(
             harness.scheduler.status().costmap_source_timestamp_ns,

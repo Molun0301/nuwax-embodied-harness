@@ -351,13 +351,17 @@ async fn arrival_surface_worker_replays_current_map_and_goal_after_stopping_drif
     }).await.unwrap();
     let mut outside = nuwax_nav_astar::helpers::make_pose_stamped("map", 4.35, 1.55, 0.0);
     outside.pose.position.z = 0.5; outside.stamp = Timestamp::from_unix(2, 0);
-    handle.update_odometry(outside).await.unwrap();
+    handle.update_odometry(outside.clone()).await.unwrap();
+    let observation_clock = Instant::now();
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let status = stopped.borrow().clone();
             assert!(status.last_terminal.is_none());
             if status.last_applied_twist.is_some_and(|command| command.linear.x > 0.0) { break; }
-            stopped.changed().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // 停车漂移后设备仍持续采样；同一旧位姿不能推进作者A状态机。
+            outside.stamp.nanos = 2_000_000_000 + observation_clock.elapsed().as_nanos() as i64;
+            handle.update_odometry(outside.clone()).await.unwrap();
         }
     }).await.expect("实际表面工作线程在重新取租约后应继续原目标");
     assert_eq!(handle.status().path_revision, 1);

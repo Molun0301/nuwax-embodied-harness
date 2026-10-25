@@ -10,3 +10,7 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 getrandom = "0.3"
 libc = "0.2"
 tempfile = "3"
+# 组装、暂存与整块校验按列（块）并行，结果按原顺序合并。
+rayon = { workspace = true }
+# 自动缓存预算到上限时记一次警告。
+tracing = { workspace = true }

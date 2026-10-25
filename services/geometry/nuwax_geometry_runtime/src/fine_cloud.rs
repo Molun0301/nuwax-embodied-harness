@@ -2,14 +2,52 @@
 use super::{dynamic_cloud::DynamicCloudFilter, voxel_index::VoxelIndex, voxel_key, VOXEL_SIZE};
 use ahash::AHashSet;
 use nalgebra::Point3;
-use nuwax_map_chunks::{Repository, SealedMap, Writer};
+use nuwax_map_chunks::{CachePolicy, Repository, SealedMap, Writer};
 use std::collections::VecDeque;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 #[cfg(test)]
 #[path = "ground_observations.rs"]
 mod ground_observations;
 #[path = "heightfield_capture.rs"]
 mod heightfield_capture;
+
+pub(crate) const FINE_CLOUD_CACHE_MIB_VAR: &str = "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_MIB";
+pub(crate) const FINE_CLOUD_CACHE_AUTO_MAX_VAR: &str = "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_AUTO_MAX_MIB";
+const MIB: usize = 1024 * 1024;
+/// 自动模式的起步预算。
+const AUTO_START_MIB: usize = 32;
+const DEFAULT_CACHE: FineCloudCache = FineCloudCache::Auto { max_mib: 256 };
+static CONFIGURED_CACHE: OnceLock<FineCloudCache> = OnceLock::new();
+
+/// 精细点云写入器缓存配置：固定预算，或从 32 MiB 起按需增长到上限的自动模式。
+/// 在线建图与 PGO 私有重放的写入器各自独立按此创建；两种模式写入的地图相同。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FineCloudCache {
+    Fixed { mib: usize },
+    Auto { max_mib: usize },
+}
+
+/// 解析两个配置值（`None` 为未设置），与配置保存时的规范化一致：去掉首尾空白，空白或
+/// 未设置按缺省（自动模式、上限 256 MiB）；数值只接受十进制数字。上限只在自动模式下
+/// 生效，固定模式忽略它。其它非法值返回带变量名和合法范围的错误。
+pub(crate) fn parse_fine_cloud_cache(mode: Option<&str>, auto_max: Option<&str>) -> Result<FineCloudCache, String> {
+    let integer = |value: &str, low: usize, high: usize| value.bytes().all(|b| b.is_ascii_digit())
+        .then(|| value.parse::<usize>().ok()).flatten().filter(|v| (low..=high).contains(v));
+    match mode.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("auto") => match auto_max.map(str::trim).filter(|value| !value.is_empty()) {
+            None => Ok(DEFAULT_CACHE),
+            Some(value) => integer(value, 32, 4096).map(|max_mib| FineCloudCache::Auto { max_mib }).ok_or_else(||
+                format!("{FINE_CLOUD_CACHE_AUTO_MAX_VAR} 取值非法：{value:?}，应为 32～4096 的整数（MiB）")),
+        },
+        Some(value) => integer(value, 16, 4096).map(|mib| FineCloudCache::Fixed { mib }).ok_or_else(||
+            format!("{FINE_CLOUD_CACHE_MIB_VAR} 取值非法：{value:?}，应为 auto 或 16～4096 的整数（MiB）")),
+    }
+}
+
+/// 启动时按配置设定一次；未设定时（例如单元测试）按缺省自动模式。
+pub(crate) fn configure_fine_cloud_cache(cache: FineCloudCache) -> Result<(), String> {
+    CONFIGURED_CACHE.set(cache).map_err(|_| "fine-cloud writer cache is already configured".into())
+}
 
 /// The existing source identity, with either canonical admitted coordinates or
 /// the current rebuild's corrected coordinates. No second source ledger.
@@ -42,7 +80,13 @@ impl FineCloud {
         Ok((cloud, root))
     }
     pub(super) fn new(size: f32) -> Result<Self, String> {
-        Ok(Self { writer: Writer::new(Repository::temporary()?, size, 32 * 1024 * 1024)?,
+        let (initial_mib, policy) = match CONFIGURED_CACHE.get().copied().unwrap_or(DEFAULT_CACHE) {
+            FineCloudCache::Fixed { mib } => (mib, CachePolicy::Fixed),
+            FineCloudCache::Auto { max_mib } => (AUTO_START_MIB, CachePolicy::Auto { max_bytes: max_mib * MIB }),
+        };
+        let mut writer = Writer::new(Repository::temporary()?, size, initial_mib * MIB)?;
+        writer.set_cache_policy(policy)?;
+        Ok(Self { writer,
             dynamic: DynamicCloudFilter::default(), failure: None, readers: FineCloudReaders::default(), commits: 0, baseline: None, latest_unclassified_scan: None, latest_ground_source: None, latest_ground_indices: Arc::from([]) })
     }
     pub(super) fn fresh() -> Result<Self, String> { Self::new(VOXEL_SIZE) }
@@ -747,6 +791,35 @@ mod auxiliary_source_tests {
                 .all(|field| field.samples.len() <= nuwax_map_chunks::MAX_LAYER_SAMPLES));
             assert!(samples(&retained).any(|sample| sample.source == source.source().layer_source()),
                 "the current admitted producer must retain evidence when producer count exceeds capacity");
+        }
+    }
+}
+
+#[cfg(test)]
+mod cache_config_tests {
+    use super::*;
+
+    #[test]
+    fn fine_cloud_cache_config_parses_bounds_defaults_and_rejects_others() {
+        let parse = |mode: Option<&str>, max: Option<&str>| parse_fine_cloud_cache(mode, max);
+        // 未设置与空值按缺省：自动模式、上限 256 MiB。
+        for (mode, max) in [(None, None), (Some(""), None), (None, Some("")), (Some(" "), Some("\t")), (Some("auto"), None)] {
+            assert_eq!(parse(mode, max), Ok(FineCloudCache::Auto { max_mib: 256 }));
+        }
+        assert_eq!(parse(Some("16"), None), Ok(FineCloudCache::Fixed { mib: 16 }));
+        assert_eq!(parse(Some("4096"), None), Ok(FineCloudCache::Fixed { mib: 4096 }));
+        assert_eq!(parse(Some(" 064 "), None), Ok(FineCloudCache::Fixed { mib: 64 }));
+        assert_eq!(parse(Some("auto"), Some("32")), Ok(FineCloudCache::Auto { max_mib: 32 }));
+        assert_eq!(parse(None, Some("4096")), Ok(FineCloudCache::Auto { max_mib: 4096 }));
+        // 固定模式忽略自动上限。
+        assert_eq!(parse(Some("64"), Some("not-a-number")), Ok(FineCloudCache::Fixed { mib: 64 }));
+        for mode in ["15", "4097", "0", "-32", "+64", "abc", "AUTO", "1.5", "99999999999999999999999"] {
+            let error = parse(Some(mode), None).unwrap_err();
+            assert!(error.contains(FINE_CLOUD_CACHE_MIB_VAR) && error.contains("16～4096"), "{mode}: {error}");
+        }
+        for max in ["31", "4097", "auto", "x"] {
+            let error = parse(Some("auto"), Some(max)).unwrap_err();
+            assert!(error.contains(FINE_CLOUD_CACHE_AUTO_MAX_VAR) && error.contains("32～4096"), "{max}: {error}");
         }
     }
 }

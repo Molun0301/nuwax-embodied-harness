@@ -2,7 +2,7 @@
 
 The original finalized bundle is only read. The native worker uses complete raw
 scans and the committed final poses when available; older maps remain supported
-for floating-geometry cleanup without claiming full human-replay coverage.
+for radius-outlier cleanup without claiming complete offline coverage.
 """
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from dataclasses import replace
 from functools import wraps
 from datetime import datetime, timezone
 import hashlib
+import io
 import json
 import logging
 import os
@@ -71,13 +72,49 @@ def _scan_record(stream):
     return size + data, json.loads(data)
 
 
+def _scan_v2_record(stream):
+    """校验完整记录；截断由保存调用方明确报告为不完整，不能复制半帧。"""
+    size = stream.read(4)
+    if not size:
+        return None
+    if len(size) != 4:
+        raise ValueError("原始扫描 v2 记录头不完整")
+    length = struct.unpack("<I", size)[0]
+    if not 4 <= length <= 2_000_000 * 16 + 65540:
+        raise ValueError("原始扫描 v2 记录长度无效")
+    payload = stream.read(length)
+    checksum = stream.read(32)
+    if len(payload) != length or len(checksum) != 32:
+        raise ValueError("原始扫描 v2 记录不完整")
+    # 摘要只校验记录内容，不参与拥有方文件命名。
+    if hashlib.sha256(payload).digest() != checksum:
+        raise ValueError("原始扫描 v2 记录校验失败")
+    cursor = io.BytesIO(payload)
+    _, header = _scan_record(cursor)
+    remaining = length - cursor.tell()
+    if header.get("kind") == "scan":
+        count = header["metadata"]["point_count"]
+        if type(count) is not int or not 0 <= count <= 2_000_000:
+            raise ValueError("原始扫描点数无效")
+        if type(header.get("intensity")) is not bool or remaining != count * (16 if header["intensity"] else 12):
+            raise ValueError("原始扫描点数与记录大小不一致")
+    elif header.get("kind") != "progress" or remaining or type(header.get("dropped_frames")) is not int or header["dropped_frames"] < 0:
+        raise ValueError("原始扫描进度记录无效")
+    return size + payload + checksum, header
+
+
 def _find_session_scan(root, session):
     """文件名由原生记录拥有方决定，Python只消费文件头中的既有会话身份。"""
     invalid = False
+    legacy = False
     for path in root.glob("*.scan"):
         try:
             with path.open("rb") as stream:
-                if stream.read(8) != b"NEHSCAN1":
+                magic = stream.read(8)
+                if magic == b"NEHSCAN1":
+                    legacy = True
+                    raise ValueError("原始扫描日志 v1 已退役，请重新建图生成 v2 日志")
+                if magic != b"NEHSCAN2":
                     raise ValueError("原始扫描日志格式无效")
                 entry = _scan_record(stream)
                 if entry is None:
@@ -86,6 +123,8 @@ def _find_session_scan(root, session):
                     return path
         except (OSError, ValueError, TypeError, struct.error):
             invalid = True
+    if legacy:
+        raise ValueError("原始扫描日志 v1 已退役，请重新建图生成 v2 日志")
     if invalid:
         raise ValueError("原始扫描记录头损坏，无法确认保存会话")
     return None
@@ -97,50 +136,58 @@ def _copy_raw_scan_history(checkpoint, destination):
     session = {"session_id": checkpoint.source_session_id, "generation": checkpoint.source_session_generation}
     source = _find_session_scan(root, session)
     if source is None:
-        return {"complete": False, "note": "原始扫描日志缺失，不能完成全量人体离线重判"}
+        return {"complete": False, "note": "原始扫描日志缺失，不能完成完整离线判定"}
     stem = source.stem
     session_file = source.name
     if source.with_suffix(".incomplete").exists():
-        return {"complete": False, "note": "原始扫描记录此前已中断，不能完成全量人体离线重判"}
+        return {"complete": False, "note": "原始扫描记录此前已中断，不能完成完整离线判定"}
     timestamp = checkpoint.cloud_receipt["source_timestamp_ns"]
     target = Path(destination) / "raw-scans.scan"
     frames = 0
     last = 0
+    observed = 0
+    dropped = 0
     with source.open("rb") as inp, target.open("xb") as out:
         magic = inp.read(8)
-        if magic != b"NEHSCAN1":
-            raise ValueError("原始扫描日志格式无效")
+        if magic != b"NEHSCAN2":
+            raise ValueError("需要原始扫描日志 v2；旧 v1 日志已退役")
         header, identity = _scan_record(inp)
         if identity != session:
             raise ValueError("原始扫描日志不属于保存会话")
         out.write(magic + header)
-        while last < timestamp:
-            entry = _scan_record(inp)
-            if entry is None:
+        while observed < timestamp:
+            record = _scan_v2_record(inp)
+            if record is None:
                 break
-            header, frame = entry
-            stamp = frame["source_timestamp_ns"]
-            if type(stamp) is not int or stamp <= last:
-                raise ValueError("原始扫描时间戳未严格前进")
-            if stamp > timestamp:
-                break
-            count = frame["point_count"]
-            if type(count) is not int or not 0 <= count <= 2_000_000:
-                raise ValueError("原始扫描点数无效")
-            remaining = count * 25
-            out.write(header)
-            while remaining:
-                data = inp.read(min(remaining, 1024 * 1024))
-                if not data:
-                    raise ValueError("保存快照以内的原始扫描不完整")
-                out.write(data)
-                remaining -= len(data)
-            frames += 1
-            last = frame["source_timestamp_ns"]
+            raw, frame = record
+            if frame.get("kind") == "progress":
+                stamp = frame["source_timestamp_ns"]
+                if type(stamp) is not int or stamp < observed:
+                    raise ValueError("原始扫描进度无效")
+                if stamp > timestamp:
+                    break
+                observed = stamp
+                dropped = max(dropped, frame["dropped_frames"])
+            elif frame.get("kind") == "scan":
+                metadata = frame["metadata"]
+                stamp = metadata["source_timestamp_ns"]
+                if type(stamp) is not int or stamp <= last:
+                    raise ValueError("原始扫描时间戳未严格前进")
+                if stamp > timestamp:
+                    break
+                frames += 1
+                last = stamp
+            else:
+                raise ValueError("原始扫描记录类型无效")
+            out.write(raw)
         out.flush()
         os.fsync(out.fileno())
-    result = {"path": target.name, "frames": frames, "last_timestamp_ns": last, "complete": last == timestamp,
+    complete = observed == timestamp and frames > 0 and dropped == 0 and not source.with_suffix(".incomplete").exists()
+    result = {"path": target.name, "format_version": 2, "frames": frames, "last_timestamp_ns": last,
+              "observed_until_ns": observed, "dropped_frames": dropped, "complete": complete,
               "bytes": target.stat().st_size, "session": session, "session_file": session_file}
+    if not complete:
+        result["note"] = "原始扫描后台进度未覆盖快照或存在丢帧，离线判定不完整"
     revisions = []
     for path in root.glob(stem + "-poses-*.json"):
         try:
@@ -169,7 +216,7 @@ def _copy_raw_scan_history(checkpoint, destination):
         shutil.copyfile(source, Path(destination) / "final-poses.json")
         result["final_poses"] = "final-poses.json"
     elif frame_generation:
-        result.update(complete=False, note="保存地图缺少相同坐标代际的最终位姿，不能完成全量人体离线重判")
+        result.update(complete=False, note="保存地图缺少相同坐标代际的最终位姿，不能完成完整离线判定")
     return result
 
 
@@ -260,7 +307,7 @@ class CompletedMapCleanup:
             raise _error("请先完成并保存地图，再预览清理")
         context = self.owner._geometry_runtime.get_mapping_session_context()
         if isinstance(context, dict) and context.get("active") and context.get("map_name") == map_name:
-            raise _error("请先停止建图。浮空清理只处理已经完成的保存地图")
+            raise _error("请先停止建图。离线清理只处理已经完成的保存地图")
         reference = source.geometry_asset.metadata.get("mapping_backend_checkpoint") or {}
         if reference.get("backend_kind") not in {"voxel", "raytracing"}:
             raise _error("当前地图不包含三维点云")

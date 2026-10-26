@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import shlex
+import shutil
 
 import pytest
 
@@ -99,10 +100,31 @@ def test_actual_startup_exports_generic_declared_motion():
 
 
 _TERRAIN_SOURCE = "NUWAX_NAV_PCT_TERRAIN_SOURCE"
+# 启动链实际读取的文件。复制到临时仓库根运行，避免开发机 runtime_data/settings/active.env
+# 指向的已选机器人方案接管显式配置文件，使测试结果依赖本机状态。
+_LAUNCHER_FILES = (
+    "scripts/systemd/start_nav_stack.sh", "scripts/systemd/process_identity.sh",
+    "services/geometry/source_runtime_env.sh", "scripts/lib/config_env.sh",
+    "scripts/resolve_navigation_pipeline.py", "scripts/resolve_robot_geometry.py",
+    "contracts/navigation_pipeline.py", "core/config_values.py", "core/config_catalog.json",
+    "core/robot_geometry.py", ".env.example",
+)
+
+
+def _isolated_launcher_root(tmp_path):
+    root = tmp_path / "仓库根"
+    for relative in _LAUNCHER_FILES:
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, target)
+    # 空包入口：只加载启动链需要的纯配置模块，不初始化完整 core 包。
+    (root / "core/__init__.py").write_text("", encoding="utf-8")
+    return root
 
 
 def _terrain_startup(tmp_path, file_value=None):
-    """运行真实导航启动器，以取值后退出的子进程核对环境和参数。"""
+    """在隔离仓库根运行真实导航启动器，以取值后退出的子进程核对环境和参数。"""
+    root = _isolated_launcher_root(tmp_path)
     settings = tmp_path / "settings.env"
     settings.write_text("" if file_value is None else f"{_TERRAIN_SOURCE}={file_value}\n")
     output = tmp_path / "导航子进程.json"
@@ -130,12 +152,12 @@ def _terrain_startup(tmp_path, file_value=None):
         "NUWAX_GATEWAY_WEB_CONFIG_ENV_FILE": str(settings),
         "NUWAX_GEOMETRY_EXTRA_ENV_FILES": "",
     })
-    return env, settings, output
+    return env, settings, output, root
 
 
-def _run_terrain_launcher(env, output, command=None):
-    result = subprocess.run(command or ["bash", str(ROOT / "scripts/systemd/start_nav_stack.sh")],
-                            cwd=ROOT, env=env, capture_output=True, text=True, timeout=10)
+def _run_terrain_launcher(env, output, root, command=None):
+    result = subprocess.run(command or ["bash", str(root / "scripts/systemd/start_nav_stack.sh")],
+                            cwd=root, env=env, capture_output=True, text=True, timeout=10)
     # 子进程取值完成后按约定退出；启动器必须保留此失败，不能伪造就绪。
     assert result.returncode != 0
     assert "runtime exited during ownership/health warmup with status 23" in result.stderr
@@ -154,17 +176,17 @@ def _run_terrain_launcher(env, output, command=None):
     ("invalid", None, "invalid"),
 ])
 def test_navigation_child_receives_pct_terrain_source(tmp_path, file_value, environment_value, expected):
-    env, _settings, output = _terrain_startup(tmp_path, file_value)
+    env, _settings, output, root = _terrain_startup(tmp_path, file_value)
     if environment_value is not None:
         env[_TERRAIN_SOURCE] = environment_value
-    assert _run_terrain_launcher(env, output) == expected
+    assert _run_terrain_launcher(env, output, root) == expected
 
 
 def test_inherited_pct_terrain_default_does_not_hide_later_saved_value(tmp_path):
-    env, settings, output = _terrain_startup(tmp_path)
+    env, settings, output, root = _terrain_startup(tmp_path)
     # 父启动器先补默认，文件随后修改；子启动器必须重读新值。
     command = ["bash", "-c",
                "source services/geometry/source_runtime_env.sh && "
                f"printf '%s\\n' '{_TERRAIN_SOURCE}=mls' > {shlex.quote(str(settings))} && "
                "exec bash scripts/systemd/start_nav_stack.sh"]
-    assert _run_terrain_launcher(env, output, command) == "mls"
+    assert _run_terrain_launcher(env, output, root, command) == "mls"

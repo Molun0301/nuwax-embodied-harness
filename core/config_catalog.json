@@ -2595,9 +2595,73 @@
     "effective_value_scope": "external_process",
     "zh_name": "原始扫描暂存目录上限（MiB）",
     "type": "int",
-    "default": 8192,
+    "default": 1024,
     "minimum": 64,
     "maximum": 1048576,
-    "description": "原始扫描和最终位姿共用的磁盘预算，单位 MiB（二进制兆字节），默认8192，允许64～1048576。达到上限或写入失败后，本会话停止辅助扫描记录并明确标记离线重判不完整，在线建图继续。未固化的现场扫描保留；已有资产包副本由地图管理负责。"
+    "description": "原始扫描和最终位姿共用的磁盘预算，单位 MiB（二进制兆字节），默认1024，允许64～1048576。达到上限或写入失败后，本会话停止辅助扫描记录并明确标记离线重判不完整，在线建图继续。未固化的现场扫描保留；已有资产包副本由地图管理负责。"
+  },
+  "NUWAX_RAW_SCAN_TRANSLATION_M": {
+    "section_id": "geometry_quality",
+    "target_file": "core_env",
+    "advanced": true,
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-cloud-cleanup/src/scan_log/async_writer.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "effective_value_scope": "external_process",
+    "zh_name": "原始扫描保存位移阈值（米）",
+    "type": "float",
+    "default": 0.1,
+    "minimum": 0,
+    "maximum": 100,
+    "description": "相对上一保存帧的三维位移；默认0.1米。位移、旋转、间隔满足任一条件即保存，0表示每帧保存。"
+  },
+  "NUWAX_RAW_SCAN_ROTATION_DEG": {
+    "section_id": "geometry_quality",
+    "target_file": "core_env",
+    "advanced": true,
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-cloud-cleanup/src/scan_log/async_writer.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "effective_value_scope": "external_process",
+    "zh_name": "原始扫描保存旋转阈值（度）",
+    "type": "float",
+    "default": 3,
+    "minimum": 0,
+    "maximum": 180,
+    "description": "相对上一保存帧的三维旋转角；默认3度，0表示每帧保存。"
+  },
+  "NUWAX_RAW_SCAN_INTERVAL_S": {
+    "section_id": "geometry_quality",
+    "target_file": "core_env",
+    "advanced": true,
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-cloud-cleanup/src/scan_log/async_writer.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "effective_value_scope": "external_process",
+    "zh_name": "原始扫描保存间隔阈值（秒）",
+    "type": "float",
+    "default": 1,
+    "minimum": 0,
+    "maximum": 3600,
+    "description": "相对上一保存帧的源时间间隔；默认1秒，0表示每帧保存。"
+  },
+  "NUWAX_RAW_SCAN_QUEUE_FRAMES": {
+    "section_id": "geometry_quality",
+    "target_file": "core_env",
+    "advanced": true,
+    "consumers": [
+      "services/nuwax-workspace/crates/nuwax-cloud-cleanup/src/scan_log/async_writer.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "effective_value_scope": "external_process",
+    "zh_name": "原始扫描后台队列容量（帧）",
+    "type": "int",
+    "default": 16,
+    "minimum": 1,
+    "maximum": 256,
+    "description": "有界后台队列默认16条记录，满时丢弃新交接并计数，标记离线判定不完整；在线建图继续。"
   }
 }

@@ -1442,6 +1442,7 @@ dependencies = [
  "ahash",
  "libc",
  "nalgebra 0.33.3",
+ "nuwax-dufomap-native",
  "nuwax-map-chunks",
  "petgraph",
  "serde",
@@ -1474,6 +1475,13 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "nuwax-dufomap-native"
+version = "0.1.0"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -1532,6 +1540,7 @@ dependencies = [
  "nuwax-cloud-cleanup",
  "nuwax-codec",
  "nuwax-core",
+ "nuwax-dufomap-native",
  "nuwax-exploration",
  "nuwax-explore-wavefront",
  "nuwax-lcm",

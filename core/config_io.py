@@ -673,7 +673,7 @@ def _validate(key: str, value: str, typ: str) -> Optional[str]:
     """返回规范化后的值；非法返回 None（由调用方记入 rejected）。"""
 
     v = value.strip()
-    if key in {"NUWAX_GEOMETRY_FINE_CLOUD_CACHE_MIB", "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_AUTO_MAX_MIB", "NUWAX_RAW_SCAN_MAX_MIB"}:
+    if key in {"NUWAX_GEOMETRY_FINE_CLOUD_CACHE_MIB", "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_AUTO_MAX_MIB", "NUWAX_RAW_SCAN_MAX_MIB", "NUWAX_RAW_SCAN_QUEUE_FRAMES"}:
         # 存储预算空值恢复目录默认；仅接受十进制整数，避免浮点或布尔值混入。
         if not v:
             return str(R.runtime_catalog()[key]["default"])
@@ -682,6 +682,14 @@ def _validate(key: str, value: str, typ: str) -> Optional[str]:
         if not v.isascii() or not v.isdecimal() or not R.catalog_number_in_range(key, v):
             return None
         return str(int(v))
+    if key in {"NUWAX_RAW_SCAN_TRANSLATION_M", "NUWAX_RAW_SCAN_ROTATION_DEG", "NUWAX_RAW_SCAN_INTERVAL_S"}:
+        if not v:
+            return str(R.runtime_catalog()[key]["default"])
+        try:
+            number = float(v)
+        except ValueError:
+            return None
+        return str(number) if math.isfinite(number) and R.catalog_number_in_range(key, v) else None
     if key in {"NUWAX_NAV_MAX_STEP_UP_M", "NUWAX_NAV_MAX_STEP_DOWN_M"}:
         # 留空继承已有能力；显式零表示该方向不允许离散台阶。
         if not v:

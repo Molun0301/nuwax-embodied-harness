@@ -90,6 +90,8 @@ def test_discovery_and_default_disabled(device,runtime):
 
 def test_success_is_physical_terminal_not_acceptance(device,runtime):
     task=submit(runtime)
+    # 终态先于最终清理发布；等待运行器退出后再核对资源释放。
+    runtime.task_manager.wait_for_task(task.task_id, timeout=2)
     assert terminal(runtime,task).state.value=='succeeded'
     result=runtime.task_manager.get_task_result(task.task_id)
     assert result['device_status']['result']['physics_success'] is True

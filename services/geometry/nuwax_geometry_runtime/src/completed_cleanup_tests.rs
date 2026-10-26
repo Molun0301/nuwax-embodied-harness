@@ -97,6 +97,11 @@ fn run_saved_case(rich: bool, recorded: Option<&std::path::Path>) {
         "synthetic-corridor-initial-stand-slow-walk"
     });
     let session = format!("saved-human-{}", uuid::Uuid::new_v4().simple());
+    let previous_log_root=std::env::var_os("NUWAX_RAW_SCAN_DIRECTORY");
+    let previous_interval=std::env::var_os("NUWAX_RAW_SCAN_INTERVAL_S");
+    std::env::set_var("NUWAX_RAW_SCAN_DIRECTORY",folder.join("scans"));
+    std::env::set_var("NUWAX_RAW_SCAN_INTERVAL_S","0");
+    let scan_worker=nuwax_cloud_cleanup::scan_log::StorageWorker::start().unwrap();
     let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
     assert!(writer.begin_session(1).is_some());
     let config = MappingBackendComputeConfig {
@@ -282,6 +287,7 @@ fn run_saved_case(rich: bool, recorded: Option<&std::path::Path>) {
         grid.data.iter().map(|&v| v as u8).collect::<Vec<_>>(),
     )
     .unwrap();
+    drop(scan_worker);
     let logs = std::env::var_os("NUWAX_RAW_SCAN_DIRECTORY")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("runtime_data/scan_logs"));
@@ -293,6 +299,8 @@ fn run_saved_case(rich: bool, recorded: Option<&std::path::Path>) {
         },
     );
     std::fs::copy(log, folder.join("raw-scans.scan")).unwrap();
+    if let Some(value)=previous_log_root {std::env::set_var("NUWAX_RAW_SCAN_DIRECTORY",value);} else {std::env::remove_var("NUWAX_RAW_SCAN_DIRECTORY");}
+    if let Some(value)=previous_interval {std::env::set_var("NUWAX_RAW_SCAN_INTERVAL_S",value);} else {std::env::remove_var("NUWAX_RAW_SCAN_INTERVAL_S");}
     let descriptor = serde_json::json!({"width":grid.width,"height":grid.height,"resolution":grid.resolution,"origin_x":grid.origin[0],"origin_y":grid.origin[1],"frame_id":"map","timestamp_ns":last_stamp});
     std::fs::write(
         folder.join("occupancy-descriptor.json"),
@@ -364,6 +372,10 @@ fn run_saved_case(rich: bool, recorded: Option<&std::path::Path>) {
         report.preview.candidate_points,
         before_keys.difference(&after_keys).count()
     );
+    assert!(after_keys.is_subset(&before_keys), "离线清理不能复活历史已移除的点");
+    assert_eq!(report.recovered_voxels,0);
+    assert_eq!(report.recovered_points,0);
+    assert!(report.dense_after <= report.dense_before);
     assert_eq!(report.offline_frames, 190);
     assert!(report.offline_complete);
     let mut dense_file = File::open(request.output.join("dense.bin")).unwrap();
@@ -599,7 +611,7 @@ fn scene(
 }
 
 #[test]
-fn completed_cleanup_saved_floating_without_raw_log() {
+fn completed_cleanup_saved_radius_outliers_without_raw_log() {
     let folder = directory("synthetic-floating-support");
     let mut points = Vec::new();
     for x in -20..=20 {
@@ -621,6 +633,13 @@ fn completed_cleanup_saved_floating_without_raw_log() {
             }
         }
     }
+    // 保留原地面、细柱与浮空小片，再加入具有已知邻距的真实离群点。
+    // 分散点组提供不同邻距，力度变化必须真实改变空间支持，不能按点数配额删除。
+    points.extend(std::iter::repeat_n(Point3::new(3.,3.,3.),4));
+    for (x, spacing) in [(4.013,0.135),(5.013,0.11)] {
+        for i in 0..3 {points.push(Point3::new(x+i as f64*spacing,5.013,1.013));}
+    }
+    for i in 0..3 {points.push(Point3::new(6.013+i as f64*0.025,5.013+i as f64*0.075,1.013));}
     let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
     assert!(writer.begin_session(1).is_some());
     assert!(writer.accumulate_mapping_scan(1, &points, Some([0., 0., 0.65]), 100));
@@ -728,8 +747,8 @@ fn completed_cleanup_saved_floating_without_raw_log() {
         assert_eq!(std::fs::read(&request.fine).unwrap(), original);
         counts.push(report.preview.candidate_points);
     }
-    assert_eq!(counts[0], 0);
+    assert_eq!(counts[0],1, "最保守力度也应删除单独离群体素，重复观测不能构成空间邻居");
     assert!(counts[1] > counts[0] && counts[2] > counts[1]);
-    assert!(counts[3] >= counts[2]);
-    std::fs::write(folder.join("strength-counts.json"),serde_json::to_vec_pretty(&serde_json::json!({"strength_percent":[0,37,73,100],"actual_removed_voxels":counts,"static_loss":0,"raw_log":"absent; floating-only, no full human replay claim"})).unwrap()).unwrap();
+    assert!(counts[3] > counts[2]);
+    std::fs::write(folder.join("strength-counts.json"),serde_json::to_vec_pretty(&serde_json::json!({"strength_percent":[0,37,73,100],"actual_removed_voxels":counts,"static_loss":0,"raw_log":"absent; radius-outlier fallback, offline_complete=false"})).unwrap()).unwrap();
 }

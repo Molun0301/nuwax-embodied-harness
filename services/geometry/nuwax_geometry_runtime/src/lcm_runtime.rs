@@ -5101,7 +5101,7 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
                     frame_generation: Some(transaction.map_frame_generation),
                     poses: map.final_poses,
                 };
-                if let Err(error) = nuwax_cloud_cleanup::scan_log::save_final_poses(&scan_root, &poses) {
+                if let Err(error) = nuwax_cloud_cleanup::scan_log::enqueue_final_poses(scan_root, poses) {
                     // 地图和后端已经提交；辅助轨迹落盘失败不能把已提交校正改成失败。
                     tracing::warn!(event = "mapping.raw_scan_poses_incomplete", %error,
                         "最终位姿记录失败，保留已提交PGO地图；离线清理不得声称完整重判");

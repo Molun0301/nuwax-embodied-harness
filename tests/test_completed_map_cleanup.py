@@ -153,22 +153,63 @@ def test_cancel_never_writes_source_or_publishes_map(tmp_path):
     service.executor.shutdown(wait=True)
 
 
+def v2_header(value):
+    data = json.dumps(value).encode()
+    return struct.pack("<I", len(data)) + data
+
+
+def v2_record(value, points=()):
+    payload = v2_header(value) + b"".join(struct.pack("<fff", *p) for p in points)
+    return struct.pack("<I", len(payload)) + payload + hashlib.sha256(payload).digest()
+
+
+def v2_scan(stamp, points):
+    return v2_record({"kind": "scan", "metadata": {"source_timestamp_ns": stamp, "point_count": len(points)},
+                      "intensity": False}, points)
+
+
+def v2_progress(stamp, dropped=0):
+    return v2_record({"kind": "progress", "source_timestamp_ns": stamp, "dropped_frames": dropped})
+
+
 def test_raw_scan_capture_stops_at_saved_timestamp_and_keeps_original_indexes(tmp_path):
     source=tmp_path/'logs';source.mkdir();target=tmp_path/'saved';target.mkdir()
     checkpoint=SimpleNamespace(source_session_id='test',source_session_generation=3,cloud_receipt={'source_timestamp_ns':20,'cloud_revision':2},fine_archive=None)
     stem=hashlib.sha256(b'test:3').hexdigest()
-    def header(value):
-        b=json.dumps(value).encode();return struct.pack('<I',len(b))+b
-    initial=b'NEHSCAN1'+header({'session_id':'test','generation':3})
-    frames=[]
-    for stamp in [10,20,30]:
-        frames.append(header({'source_timestamp_ns':stamp,'point_count':2})+struct.pack('<dddddd',1,2,3,1,2,3)+b'\x04\x06')
+    initial=b'NEHSCAN2'+v2_header({'session_id':'test','generation':3})
+    frames=[v2_scan(stamp, [(1,2,3),(1,2,3)])+v2_progress(stamp) for stamp in [10,20,30]]
     (source/(stem+'.scan')).write_bytes(initial+b''.join(frames))
+    original_hash=hashlib.sha256
     with patch.dict(os.environ,NUWAX_RAW_SCAN_DIRECTORY=str(source)), patch.object(
-            hashlib, 'sha256', side_effect=AssertionError('扫描读取不能重算拥有方文件名摘要')):
+            hashlib, 'sha256', wraps=original_hash) as digest:
         report=copy_raw_scan_history(checkpoint,target)
-    assert report['complete'] and report['frames']==2
+    assert all(call.args[0] != b'test:3' for call in digest.call_args_list)
+    assert report['complete'] and report['frames']==2 and report['observed_until_ns']==20
     assert (target/'raw-scans.scan').read_bytes()==initial+b''.join(frames[:2])
+
+
+def test_sampled_history_uses_progress_and_queue_loss_revokes_completeness(tmp_path, monkeypatch):
+    source=tmp_path/'logs';source.mkdir();monkeypatch.setenv('NUWAX_RAW_SCAN_DIRECTORY',str(source))
+    checkpoint=SimpleNamespace(source_session_id='sampled',source_session_generation=1,
+        cloud_receipt={'source_timestamp_ns':20,'cloud_revision':2},fine_archive=None)
+    path=source/'owned-name.scan'
+    for dropped in [0,1]:
+        target=tmp_path/str(dropped);target.mkdir()
+        path.write_bytes(b'NEHSCAN2'+v2_header({'session_id':'sampled','generation':1})+
+            v2_scan(10,[(1,2,3)])+v2_progress(10)+v2_progress(20,dropped))
+        report=copy_raw_scan_history(checkpoint,target)
+        assert report['frames']==1 and report['last_timestamp_ns']==10
+        assert report['complete'] is (dropped==0)
+
+
+def test_v1_scan_is_explicitly_rejected_without_partial_saved_asset(tmp_path, monkeypatch):
+    source=tmp_path/'logs';source.mkdir();target=tmp_path/'saved';target.mkdir()
+    (source/'legacy.scan').write_bytes(b'NEHSCAN1'+v2_header({'session_id':'old','generation':1}))
+    monkeypatch.setenv('NUWAX_RAW_SCAN_DIRECTORY',str(source))
+    checkpoint=SimpleNamespace(source_session_id='old',source_session_generation=1)
+    report=copy_raw_scan_history(checkpoint,target)
+    assert report['complete'] is False and 'v1' in report['note']
+    assert not list(target.iterdir())
 
 
 def native_fixture(root, case):
@@ -359,11 +400,8 @@ def test_failed_pgo_without_failure_marker_cannot_use_stale_trajectory(tmp_path,
     target = tmp_path / '地图'; target.mkdir()
     stem = hashlib.sha256(b'poses:2').hexdigest()
     session = {'session_id': 'poses', 'generation': 2}
-    def record(value):
-        data = json.dumps(value).encode()
-        return struct.pack('<I', len(data)) + data
-    (root / (stem + '.scan')).write_bytes(b'NEHSCAN1' + record(session) +
-        record({'source_timestamp_ns': 10, 'point_count': 1}) + struct.pack('<dddB', 1., 2., 3., 7))
+    (root / (stem + '.scan')).write_bytes(b'NEHSCAN2' + v2_header(session) +
+        v2_scan(10,[(1.,2.,3.)])+v2_progress(10))
     (root / (stem + '-poses-1.json')).write_text(json.dumps({'session': session, 'cloud_revision': 1, 'frame_generation': 1, 'poses': []}))
     checkpoint = SimpleNamespace(source_session_id='poses', source_session_generation=2,
         cloud_receipt={'source_timestamp_ns': 10, 'cloud_revision': 2}, fine_archive=fine_bytes(2, frame_generation=2))
@@ -407,3 +445,39 @@ def test_cleanup_close_waits_for_admitted_preview_preparation(tmp_path):
     assert closed.is_set() and not started.is_alive() and not closing.is_alive()
     assert len(errors) == 1 and '关闭' in str(errors[0])
     assert not service.jobs and not list(service.root.iterdir())
+
+
+def test_scan_settings_reject_invalid_without_writing_then_roundtrip(tmp_path, monkeypatch):
+    from core import config_io
+    from core.config_values import read_env_values
+    bootstrap = tmp_path / ".env"
+    bootstrap.write_text("NUWAX_ACTIVE_ROBOT=go2\n")
+    monkeypatch.setattr(config_io, "_CORE_ENV", bootstrap)
+    monkeypatch.delenv("NUWAX_USER_CONFIG_ENV_FILE", raising=False)
+    settings = tmp_path / "drivers/go2/configs/默认.env"
+    settings.parent.mkdir(parents=True)
+    (settings.parent.parent / "manifest.py").touch()
+    (settings.parent.parent / "assembly.py").touch()
+    settings.write_text("NUWAX_RAW_SCAN_MAX_MIB=1024\n")
+    invalid = {"NUWAX_RAW_SCAN_MAX_MIB": "63", "NUWAX_RAW_SCAN_TRANSLATION_M": "nan",
+               "NUWAX_RAW_SCAN_ROTATION_DEG": "181", "NUWAX_RAW_SCAN_INTERVAL_S": "-1",
+               "NUWAX_RAW_SCAN_QUEUE_FRAMES": "1.5"}
+    before = settings.read_bytes()
+    rejected = config_io.save_values(invalid)
+    assert set(rejected.rejected) == set(invalid)
+    assert not rejected.written and settings.read_bytes() == before
+    values = {"NUWAX_RAW_SCAN_MAX_MIB": "128", "NUWAX_RAW_SCAN_TRANSLATION_M": "0",
+              "NUWAX_RAW_SCAN_ROTATION_DEG": "4.5", "NUWAX_RAW_SCAN_INTERVAL_S": "2",
+              "NUWAX_RAW_SCAN_QUEUE_FRAMES": "8"}
+    result = config_io.save_values(values)
+    assert not result.rejected
+    assert set(result.written["robot_profile_env"]) == set(values)
+    saved = read_env_values(settings)
+    assert {key: float(saved[key]) for key in values} == {key: float(value) for key, value in values.items()}
+    defaults = config_io.save_values({key: "" for key in values})
+    assert not defaults.rejected
+    saved = read_env_values(settings)
+    assert {key: float(saved[key]) for key in values} == {
+        "NUWAX_RAW_SCAN_MAX_MIB": 1024, "NUWAX_RAW_SCAN_TRANSLATION_M": .1,
+        "NUWAX_RAW_SCAN_ROTATION_DEG": 3, "NUWAX_RAW_SCAN_INTERVAL_S": 1,
+        "NUWAX_RAW_SCAN_QUEUE_FRAMES": 16}

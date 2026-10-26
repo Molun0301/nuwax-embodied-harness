@@ -673,8 +673,8 @@ def _validate(key: str, value: str, typ: str) -> Optional[str]:
     """返回规范化后的值；非法返回 None（由调用方记入 rejected）。"""
 
     v = value.strip()
-    if key in {"NUWAX_GEOMETRY_FINE_CLOUD_CACHE_MIB", "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_AUTO_MAX_MIB"}:
-        # 两项空值均恢复目录默认；固定预算仅接受十进制整数，避免浮点或布尔值混入。
+    if key in {"NUWAX_GEOMETRY_FINE_CLOUD_CACHE_MIB", "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_AUTO_MAX_MIB", "NUWAX_RAW_SCAN_MAX_MIB"}:
+        # 存储预算空值恢复目录默认；仅接受十进制整数，避免浮点或布尔值混入。
         if not v:
             return str(R.runtime_catalog()[key]["default"])
         if key == "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_MIB" and v == "auto":

@@ -23,7 +23,7 @@ use dynamic_cloud::DynamicCloudFilter;
 #[path = "fine_cloud.rs"]
 mod fine_cloud;
 use fine_cloud::FineCloud;
-pub(crate) use fine_cloud::{configure_fine_cloud_cache, parse_fine_cloud_cache, FineCloudCache,
+pub(crate) use fine_cloud::{configure_fine_cloud_cache, configured_writer_cache, parse_fine_cloud_cache,
     FINE_CLOUD_CACHE_AUTO_MAX_VAR, FINE_CLOUD_CACHE_MIB_VAR};
 
 #[path = "paged_voxel_snapshot.rs"]
@@ -528,12 +528,29 @@ impl CloudMapShmWriter {
         self.accumulate_mapping_scan_inner(session_generation, points, sensor_origin_map,
             source.timestamp_ns(), Some(fine_cloud::FrameSource::Corrected(source,frame)))
     }
-    pub(crate) fn classify_admitted_scan(&mut self,source:&crate::lio_ingress::AcceptedRegisteredCloud)->Result<crate::dynamic_scene::MappedFrameDecision,String>{
-        let generation=source.scan().binding().mapping_session_generation;
-        if self.session_generation!=generation{self.reset_accumulator(generation);}
-        let (ground,known)=if let Some(fine)=self.fine_cloud.as_mut(){fine.measured_ground(source.map_points())?}else{(Vec::new(),Vec::new())};
-        let frame=self.dynamic_filter.classify(source.scan(),&ground,&known)?;
-        crate::dynamic_scene::MappedFrameDecision::new(frame,source.scan().binding().registration_map_from_odom,source.map_points(),0)
+    pub(crate) fn classify_admitted_scan(&mut self, source: &crate::lio_ingress::AcceptedRegisteredCloud)
+        -> Result<crate::dynamic_scene::MappedFrameDecision, String> {
+        #[cfg(test)]
+        let started = std::time::Instant::now();
+        // 点云代次由原拥有方启动登记；分类不能替输入登记，否则会绕过安装时的代次围栏。
+        // 未登记输入继续沿准备/安装失配路径拒绝，并由建图拥有方执行原退休流程。
+        let (ground, known) = if let Some(fine) = self.fine_cloud.as_mut() {
+            fine.measured_ground(source.map_points())?
+        } else { (Vec::new(), Vec::new()) };
+        #[cfg(test)]
+        let ground_ms = started.elapsed().as_secs_f64() * 1e3;
+        let frame = self.dynamic_filter.classify(source.scan(), &ground, &known)?;
+        #[cfg(test)]
+        let classify_ms = started.elapsed().as_secs_f64() * 1e3;
+        let mapped = crate::dynamic_scene::MappedFrameDecision::new(frame,
+            source.scan().binding().registration_map_from_odom, source.map_points(), 0)?;
+        #[cfg(test)]
+        if std::env::var_os("NUWAX_DYNAMIC_PHASE_DIAGNOSTIC").is_some() {
+            eprintln!("CLASSIFY_TOP timestamp={} ground_ms={ground_ms:.3} classify_ms={:.3} mapped_ms={:.3}",
+                source.scan().source_timestamp_ns(), classify_ms - ground_ms,
+                started.elapsed().as_secs_f64() * 1e3 - classify_ms);
+        }
+        Ok(mapped)
     }
 
     fn accumulate_mapping_scan_inner(&mut self, session_generation: u64,
@@ -548,21 +565,15 @@ impl CloudMapShmWriter {
         }
         // 一次计算全部体素键，同时完成有限值/范围校验；失败前不改变任何累加状态。
         let key_voxel_size = self.voxel_size;
-        let Some(mut hits) = points
+        let Some(()) = points
             .iter()
             .map(|point| voxel_key([point.x, point.y, point.z], self.voxel_size))
-            .collect::<Option<HashSet<_>>>()
+            .map(|key| key.map(|_| ())).collect::<Option<()>>()
         else {
             return false;
         };
         if self.session_generation != session_generation {
             self.reset_accumulator(session_generation);
-            if self.voxel_size != key_voxel_size {
-                hits = points
-                    .iter()
-                    .filter_map(|point| voxel_key([point.x, point.y, point.z], self.voxel_size))
-                    .collect();
-            }
         }
         if self.fine_cloud.is_none() {
             match FineCloud::fresh() {
@@ -607,7 +618,7 @@ impl CloudMapShmWriter {
         let fine=self.fine_cloud.as_ref().unwrap();
         let removed:Vec<_>=self.voxels.iter().copied().filter(|&k|fine.clears(voxel_center_f64(k,self.voxel_size))).collect();
         for key in removed {self.voxels.remove(&key);self.ordered_voxels.removed(key,self.max_points);}
-        hits=points.iter().filter(|p|!fine.is_dynamic(p)).filter_map(|p|voxel_key([p.x,p.y,p.z],self.voxel_size)).collect();
+        let hits: HashSet<_>=points.iter().filter(|p|!fine.is_dynamic(p)).filter_map(|p|voxel_key([p.x,p.y,p.z],self.voxel_size)).collect();
         if self.voxel_size != key_voxel_size {
             // 切换自适应粗化会话时保留原接纳/过滤语义，常规扫描复用已经验证的键。
             return self.accumulate_mapping_frame(session_generation, points);
@@ -2026,6 +2037,8 @@ fn cloud_map_duplicate_admitted_frame_preserves_dense_coarse_and_fine_state() {
         for stamp in 2..=3 {
             assert!(writer.accumulate_mapping_scan(1, &background, origin, stamp));
         }
+        let expected: HashSet<_> = [(40, 0, 0), (80, 0, 0)].into_iter().collect();
+        assert_eq!(*writer.voxels, expected);
         let before = writer.voxels.clone();
         assert!(!writer.accumulate_mapping_scan(1, &background, Some([f64::NAN; 3]), 4));
         assert!(!writer.accumulate_mapping_scan(1, &[Point3::new(f64::NAN, 0.0, 0.0)], origin, 4));
@@ -2033,6 +2046,10 @@ fn cloud_map_duplicate_admitted_frame_preserves_dense_coarse_and_fine_state() {
         assert_eq!(writer.voxels, before);
         writer.commit_accumulated().unwrap();
         let checkpoint = writer.committed_snapshot().unwrap();
+        assert_eq!(checkpoint.session_generation, 1);
+        assert_eq!(checkpoint.point_count, 2);
+        assert_eq!(decode_checkpoint_voxels(checkpoint.voxel_size, checkpoint.point_count,
+            &checkpoint.xyz_f32_le, CM_MAX_POINTS).unwrap(), expected);
         let receipt = OccupancyCommitReceipt {
             commit_id: crate::mapping_commit::MappingCommitId {
                 boot_nonce: 1,
@@ -2053,28 +2070,37 @@ fn cloud_map_duplicate_admitted_frame_preserves_dense_coarse_and_fine_state() {
                 &checkpoint.xyz_f32_le,
             )
             .unwrap();
-        // 检查点不携带未完成的删除投票，恢复后重新获得三次反证。
+        assert_eq!(writer.session_generation, 2);
+        assert_eq!(*writer.voxels, expected);
+        // 同高孤立点受到现行地面回退保护；重复射线没有完整邻域反证，两个已提交点均须保留。
         for stamp in 6..=8 {
             assert!(writer.accumulate_mapping_scan(2, &background, origin, stamp));
-            assert_eq!(writer.voxels.contains(&(40, 0, 0)), stamp < 8);
+            assert_eq!(*writer.voxels, expected);
         }
         writer.commit_accumulated().unwrap();
-        let cleaned = writer.committed_snapshot().unwrap();
-        assert_eq!(cleaned.point_count, 1);
+        let retained = writer.committed_snapshot().unwrap();
+        assert_eq!(retained.session_generation, 2);
+        assert_eq!(retained.point_count, 2);
         assert_eq!(
             decode_checkpoint_voxels(
-                cleaned.voxel_size,
-                cleaned.point_count,
-                &cleaned.xyz_f32_le,
+                retained.voxel_size,
+                retained.point_count,
+                &retained.xyz_f32_le,
                 CM_MAX_POINTS
             )
             .unwrap(),
             *writer.voxels
         );
         writer.begin_session(3).unwrap();
+        assert!(writer.voxels.is_empty());
+        let cleared = writer.committed_snapshot().unwrap();
+        assert_eq!(cleared.session_generation, 3);
+        assert_eq!(cleared.point_count, 0);
+        assert!(cleared.xyz_f32_le.is_empty());
         assert!(writer.accumulate_mapping_scan(3, &person, origin, 1));
+        assert_eq!(*writer.voxels, [(40, 0, 0)].into_iter().collect::<HashSet<_>>());
         assert!(writer.accumulate_mapping_scan(3, &background, origin, 2));
-        assert!(writer.voxels.contains(&(40, 0, 0)));
+        assert_eq!(*writer.voxels, expected);
         drop(writer);
         std::fs::remove_file(path).unwrap();
     }

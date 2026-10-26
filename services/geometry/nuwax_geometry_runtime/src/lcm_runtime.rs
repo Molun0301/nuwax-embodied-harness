@@ -5091,10 +5091,21 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
                 context.mapping.lock().commit_pgo_install(prepared)?;
                 shared.map = next_map;
                 shared.cloud_map_revision = output_cloud_revision;
-                let scan_root=std::env::var_os("NUWAX_RAW_SCAN_DIRECTORY").map(std::path::PathBuf::from).unwrap_or_else(||std::path::PathBuf::from("runtime_data/scan_logs"));
-                nuwax_cloud_cleanup::scan_log::save_final_poses(&scan_root,&nuwax_cloud_cleanup::scan_log::FinalPoses{
-                    session:nuwax_cloud_cleanup::scan_log::Session{session_id:transaction.mapping_session_id.clone(),generation:transaction.mapping_session_generation},
-                    cloud_revision:output_cloud_revision,poses:map.final_poses})?;
+                let scan_root = nuwax_cloud_cleanup::scan_log::scan_directory();
+                let poses = nuwax_cloud_cleanup::scan_log::FinalPoses {
+                    session: nuwax_cloud_cleanup::scan_log::Session {
+                        session_id: transaction.mapping_session_id.clone(),
+                        generation: transaction.mapping_session_generation,
+                    },
+                    cloud_revision: output_cloud_revision,
+                    frame_generation: Some(transaction.map_frame_generation),
+                    poses: map.final_poses,
+                };
+                if let Err(error) = nuwax_cloud_cleanup::scan_log::save_final_poses(&scan_root, &poses) {
+                    // 地图和后端已经提交；辅助轨迹落盘失败不能把已提交校正改成失败。
+                    tracing::warn!(event = "mapping.raw_scan_poses_incomplete", %error,
+                        "最终位姿记录失败，保留已提交PGO地图；离线清理不得声称完整重判");
+                }
                 Ok(())
             })();
             if let Err(error) = result {

@@ -8,7 +8,7 @@ use crate::mapping_backend::{
     MappingBackendComputeConfig, MappingBackendInput, MappingBackendSpec,
 };
 use nuwax_cloud_cleanup::offline_residual_cleanup::{asset_key, CompletedMap};
-use std::{fs::File, io::Write, path::PathBuf};
+use std::{fs::File, path::PathBuf};
 fn directory(name: &str) -> PathBuf {
     let root = std::env::var_os("NEH_CLEANUP_EVIDENCE_ROOT")
         .map(PathBuf::from)
@@ -26,21 +26,79 @@ fn keyset(map: &CompletedMap) -> ahash::AHashSet<[i32; 3]> {
     map.keys.iter().copied().collect()
 }
 #[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "190帧×8601点的保存与全量离线重放，使用发布构建独立验收"
+)]
 fn completed_cleanup_saved_corridor_ten_seconds_after_departure() {
-    run_saved_case(false);
+    run_saved_case(false, None);
 }
 #[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "190帧×8601点的保存与全量离线重放，使用发布构建独立验收"
+)]
 fn completed_cleanup_saved_poles_legs_stairs_box() {
-    run_saved_case(true);
+    run_saved_case(true, None);
 }
-fn run_saved_case(rich: bool) {
-    let folder = directory(if rich {
+#[test]
+#[ignore = "需要原生配对实录文件，使用发布构建独立运行"]
+fn completed_cleanup_recorded_original_scans() {
+    let source = PathBuf::from(
+        std::env::var_os("NEH_CLEANUP_RECORDED_SCANS").expect("指定原生配对扫描实录"),
+    );
+    run_saved_case(false, Some(&source));
+}
+
+fn recorded_frames(
+    path: &std::path::Path,
+) -> Vec<(u64, nalgebra::Isometry3<f64>, Vec<Point3<f64>>)> {
+    use std::io::Read;
+    let mut file = std::io::BufReader::new(File::open(path).unwrap());
+    let mut scans = Vec::new();
+    for _ in 0..190 {
+        let mut header = [0; 68];
+        file.read_exact(&mut header).expect("实录必须完整包含190帧");
+        let stamp = u64::from_le_bytes(header[..8].try_into().unwrap());
+        let pose: [f64; 7] = std::array::from_fn(|i| {
+            f64::from_le_bytes(header[8 + i * 8..16 + i * 8].try_into().unwrap())
+        });
+        let size = u32::from_le_bytes(header[64..68].try_into().unwrap()) as usize;
+        let mut bytes = vec![0; size * 12];
+        file.read_exact(&mut bytes).unwrap();
+        let odom_from_body = nalgebra::Isometry3::from_parts(
+            nalgebra::Translation3::new(pose[0], pose[1], pose[2]),
+            nalgebra::UnitQuaternion::new_normalize(nalgebra::Quaternion::new(
+                pose[6], pose[3], pose[4], pose[5],
+            )),
+        );
+        let points = bytes
+            .chunks_exact(12)
+            .map(|b| {
+                odom_from_body
+                    * Point3::new(
+                        f32::from_le_bytes(b[..4].try_into().unwrap()) as f64,
+                        f32::from_le_bytes(b[4..8].try_into().unwrap()) as f64,
+                        f32::from_le_bytes(b[8..12].try_into().unwrap()) as f64,
+                    )
+            })
+            .collect();
+        scans.push((stamp, odom_from_body, points));
+    }
+    scans
+}
+
+fn run_saved_case(rich: bool, recorded: Option<&std::path::Path>) {
+    let folder = directory(if recorded.is_some() {
+        "recorded-original-190-frames"
+    } else if rich {
         "synthetic-static-structures"
     } else {
         "synthetic-corridor-initial-stand-slow-walk"
     });
     let session = format!("saved-human-{}", uuid::Uuid::new_v4().simple());
     let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
+    assert!(writer.begin_session(1).is_some());
     let config = MappingBackendComputeConfig {
         resolution: 0.1,
         initial_safe_radius_meters: 0.0,
@@ -54,9 +112,12 @@ fn run_saved_case(rich: bool) {
     let mut last_grid = None;
     let mut persistent: Option<crate::persistent_occupancy::PersistentOccupancyGrid> = None;
     let start = std::time::Instant::now();
+    let mut stages = [0.0; 5];
+    let recorded_frames = recorded.map(recorded_frames);
+    let mut last_stamp = 0;
+    let mut total_points = 0;
     for frame in 1..=190u64 {
-        // Existing ray generator, original body dimensions and density. The
-        // final 100 frames are ten seconds after the person has departed.
+        // 合成场景保留原射线密度与机体尺寸，最后100帧覆盖人离开十秒；实录使用原点与位姿。
         let person = if frame <= 50 {
             Some(0.)
         } else if frame <= 90 {
@@ -64,8 +125,31 @@ fn run_saved_case(rich: bool) {
         } else {
             None
         };
-        let (points, truth, kinds) = scene(person, (frame % 3) as f64, rich);
-        let stamp = frame * 100_000_000;
+        let (points, truth, kinds, stamp, odom_from_body, origin) =
+            if let Some(scans) = &recorded_frames {
+                let (stamp, pose, points) = &scans[(frame - 1) as usize];
+                let origin: [f64; 3] = (*pose * Point3::new(0.28945, 0., -0.046825)).coords.into();
+                (
+                    points.clone(),
+                    vec![false; points.len()],
+                    vec!["unlabeled_recorded"; points.len()],
+                    *stamp,
+                    *pose,
+                    origin,
+                )
+            } else {
+                let (points, truth, kinds) = scene(person, (frame % 3) as f64, rich);
+                (
+                    points,
+                    truth,
+                    kinds,
+                    frame * 100_000_000,
+                    nalgebra::Isometry3::identity(),
+                    ORIGIN,
+                )
+            };
+        last_stamp = stamp;
+        total_points += points.len();
         for ((p, is_human), kind) in points.iter().zip(&truth).zip(kinds) {
             let k = asset_key([p.x, p.y, p.z], VOXEL_SIZE);
             if *is_human {
@@ -85,11 +169,11 @@ fn run_saved_case(rich: bool) {
             mapping_session_id: session.clone(),
             mapping_session_generation: 1,
             map_frame_generation: 0,
-            frozen_odom_from_body: nalgebra::Isometry3::identity(),
+            frozen_odom_from_body: odom_from_body,
             base_anchor_map_from_odom: nalgebra::Isometry3::identity(),
             registration_map_from_odom: nalgebra::Isometry3::identity(),
             registration_correction_revision: 0,
-            sensor_origin_map: Some(ORIGIN),
+            sensor_origin_map: Some(origin),
             frame_capture_relocalization_epoch: Some(0),
         };
         let accepted = AcceptedRegisteredCloud::from_map_points_for_test(
@@ -100,7 +184,9 @@ fn run_saved_case(rich: bool) {
             "base_link",
             binding,
         );
+        let stage = std::time::Instant::now();
         let shared = writer.classify_admitted_scan(&accepted).unwrap();
+        stages[0] += stage.elapsed().as_secs_f64();
         assert_eq!(shared.decision.labels.labels.len(), points.len());
         let input = MappingBackendInput {
             session_id: session.clone(),
@@ -110,10 +196,11 @@ fn run_saved_case(rich: bool) {
             source_timestamp_ns: stamp,
             received_at_ns: stamp,
             registered_frame_id: "map".into(),
-            sensor_origin_map: ORIGIN,
+            sensor_origin_map: origin,
             dynamic_frame: Some(shared),
             registered_points_map: points.clone(),
         };
+        let stage = std::time::Instant::now();
         let candidate = compute_candidate_in_place_with_interval(&mut kernel, &input, config, 0)
             .unwrap()
             .unwrap();
@@ -121,6 +208,8 @@ fn run_saved_case(rich: bool) {
             candidate.accepted_points_map, points,
             "raw current returns stay available to realtime obstacles"
         );
+        stages[1] += stage.elapsed().as_secs_f64();
+        let stage = std::time::Instant::now();
         persistent = Some(
             crate::persistent_occupancy::PersistentOccupancyGrid::stage_observation(
                 persistent.as_ref(),
@@ -129,17 +218,21 @@ fn run_saved_case(rich: bool) {
             .unwrap(),
         );
         last_grid = Some(persistent.as_ref().unwrap().grid.clone());
+        stages[2] += stage.elapsed().as_secs_f64();
+        let stage = std::time::Instant::now();
         let source = crate::admitted_cloud::AcceptedMappingCloud::from(accepted);
         assert!(
             writer.accumulate_mapping_scan_with_source(
                 1,
                 &points,
-                Some(ORIGIN),
+                Some(origin),
                 stamp,
                 Some(&source)
             ),
             "frame {frame}"
         );
+        stages[3] += stage.elapsed().as_secs_f64();
+        let stage = std::time::Instant::now();
         let receipt = OccupancyCommitReceipt {
             commit_id: crate::mapping_commit::MappingCommitId {
                 boot_nonce: 133,
@@ -156,7 +249,10 @@ fn run_saved_case(rich: bool) {
             .commit_accumulated_snapshot(&receipt)
             .unwrap()
             .unwrap();
+        stages[4] += stage.elapsed().as_secs_f64();
     }
+    let online_seconds = start.elapsed().as_secs_f64();
+    let source_cloud_revision = writer.last_cloud_receipt().unwrap().cloud_revision;
     let fine = writer.committed_fine_cloud().unwrap();
     archive_file(
         nuwax_map_chunks::archive_file(fine.manifest(), &fine.repository)
@@ -197,7 +293,7 @@ fn run_saved_case(rich: bool) {
         },
     );
     std::fs::copy(log, folder.join("raw-scans.scan")).unwrap();
-    let descriptor = serde_json::json!({"width":grid.width,"height":grid.height,"resolution":grid.resolution,"origin_x":grid.origin[0],"origin_y":grid.origin[1],"frame_id":"map","timestamp_ns":19_000_000_000u64});
+    let descriptor = serde_json::json!({"width":grid.width,"height":grid.height,"resolution":grid.resolution,"origin_x":grid.origin[0],"origin_y":grid.origin[1],"frame_id":"map","timestamp_ns":last_stamp});
     std::fs::write(
         folder.join("occupancy-descriptor.json"),
         serde_json::to_vec_pretty(&descriptor).unwrap(),
@@ -210,7 +306,7 @@ fn run_saved_case(rich: bool) {
         strength_percent: 50,
         scan_log: Some(folder.join("raw-scans.scan")),
         final_poses: None,
-        source_timestamp_ns: 19_000_000_000,
+        source_timestamp_ns: last_stamp,
         cancel_file: None,
         backend: Some(folder.join("original-backend.bin")),
         occupancy: Some(folder.join("original-occupancy.bin")),
@@ -219,7 +315,9 @@ fn run_saved_case(rich: bool) {
     let original_fine = std::fs::read(&request.fine).unwrap();
     let original_dense = std::fs::read(&request.dense).unwrap();
     let before = CompletedMap::read(&request.fine).unwrap();
+    let cleanup_start = std::time::Instant::now();
     let report = prepare(&request).unwrap();
+    let cleanup_seconds = cleanup_start.elapsed().as_secs_f64();
     let after = CompletedMap::read(&request.output.join("fine.bin")).unwrap();
     let before_keys = keyset(&before);
     let after_keys = keyset(&after);
@@ -249,11 +347,11 @@ fn run_saved_case(rich: bool) {
         .filter(|k| static_keys.contains(*k))
         .count();
     let structures=structure_keys.iter().map(|(kind,keys)|(*kind,serde_json::json!({"observed_unique_voxels":keys.len(),"present_before":before_keys.intersection(keys).count(),"deleted":before_keys.difference(&after_keys).filter(|k|keys.contains(*k)).count()}))).collect::<std::collections::BTreeMap<_,_>>();
-    let result = serde_json::json!({"fixture":if rich{"synthetic room with early/revealed poles, table legs, stairs and box; not a recording"}else{"existing synthetic ray-cast corridor, not a robot recording"},"structures":structures,"frames":190,"source_points_per_frame":61*141,"empty_tail_seconds":10,
-        "before_human_ge15_5to15_le5_cm":before_residual,"after_human_ge15_5to15_le5_cm":after_residual,
-        "before_human_highest_m":before_highest,"after_human_highest_m":after_highest,"new_static_voxels_deleted":static_removed,
+    let result = serde_json::json!({"fixture":if recorded.is_some(){"original paired robot recording, first 190 frames, all original returns; no human truth labels"}else if rich{"synthetic room with early/revealed poles, table legs, stairs and box; not a recording"}else{"existing synthetic ray-cast corridor, not a robot recording"},"structures":structures,"frames":190,"source_points_per_frame":if recorded.is_some(){total_points/190}else{61*141},"source_points_total":total_points,"source_points_per_frame_min":recorded_frames.as_ref().map(|v|v.iter().map(|f|f.2.len()).min().unwrap()),"source_points_per_frame_max":recorded_frames.as_ref().map(|v|v.iter().map(|f|f.2.len()).max().unwrap()),"recorded_source":recorded,"empty_tail_seconds":if recorded.is_none(){Some(10)}else{None},"truth_labels_available":recorded.is_none(),
+        "before_human_ge15_5to15_le5_cm":if recorded.is_none(){Some(before_residual)}else{None},"after_human_ge15_5to15_le5_cm":if recorded.is_none(){Some(after_residual)}else{None},
+        "before_human_highest_m":if recorded.is_none(){Some(before_highest)}else{None},"after_human_highest_m":if recorded.is_none(){Some(after_highest)}else{None},"new_static_voxels_deleted":if recorded.is_none(){Some(static_removed)}else{None},
         "preview_candidate_voxels":report.preview.candidate_points,"actual_removed_voxels":before_keys.difference(&after_keys).count(),"recovered_voxels":report.recovered_voxels,
-        "seconds":start.elapsed().as_secs_f64(),"source_session":session,"source_cloud_revision":190});
+        "seconds":start.elapsed().as_secs_f64(),"source_session":session,"source_cloud_revision":source_cloud_revision,"online_seconds":online_seconds,"cleanup_seconds":cleanup_seconds,"stage_seconds":{"classify":stages[0],"kernel":stages[1],"persistent_occupancy":stages[2],"accumulate":stages[3],"commit":stages[4]}});
     std::fs::write(
         folder.join("acceptance.json"),
         serde_json::to_vec_pretty(&result).unwrap(),
@@ -282,6 +380,52 @@ fn run_saved_case(rich: bool) {
             .len()
             > 0
     );
+    // 从磁盘新建恢复拥有方，核对清理产物确实可以独立恢复。
+    let cleaned_payload = std::fs::read(request.output.join("backend.bin")).unwrap();
+    let restored_worker =
+        crate::mapping_backend::MappingBackendWorker::start(MappingBackendSpec::Voxel, 2, config)
+            .unwrap();
+    let restored_client = restored_worker.client();
+    restored_client
+        .restore_checkpoint(cleaned_payload.clone())
+        .unwrap()
+        .blocking_recv()
+        .unwrap()
+        .unwrap()
+        .commit()
+        .unwrap();
+    assert_eq!(
+        restored_client
+            .export_checkpoint()
+            .unwrap()
+            .blocking_recv()
+            .unwrap()
+            .unwrap(),
+        cleaned_payload
+    );
+    restored_worker.stop_and_join().unwrap();
+    let imported = prepare_fine_cloud_archive(
+        File::open(request.output.join("fine.bin")).unwrap(),
+        &session,
+        1,
+        source_cloud_revision + 1,
+        last_stamp,
+    )
+    .unwrap();
+    assert_eq!(imported.voxel_size(), VOXEL_SIZE);
+    let mut dense_archive = File::open(request.output.join("dense.bin")).unwrap();
+    let (dense_metadata, _) = crate::dense_cloud::read_metadata(&mut dense_archive).unwrap();
+    let restored_dense =
+        crate::dense_cloud::DenseCloud::from_archive(dense_archive, &dense_metadata).unwrap();
+    let mut cloud_receipt = writer.last_cloud_receipt().unwrap();
+    cloud_receipt.cloud_revision += 1;
+    assert_eq!(
+        restored_dense
+            .snapshot(&cloud_receipt, &session)
+            .unwrap()
+            .point_count,
+        report.dense_after as u64
+    );
     let cancel = folder.join("cancel");
     std::fs::write(&cancel, b"cancel").unwrap();
     let mut cancelled = request;
@@ -289,14 +433,16 @@ fn run_saved_case(rich: bool) {
     cancelled.output = folder.join("cancelled");
     assert!(prepare(&cancelled).is_err());
     assert_eq!(std::fs::read(&cancelled.fine).unwrap(), original_fine);
-    assert_eq!(
-        after_residual[0], 0,
-        ">=15cm human residuals must be solved; 5–15cm are reported separately"
-    );
-    assert_eq!(
-        static_removed, 0,
-        "cleanup must preserve retained static geometry"
-    );
+    if recorded.is_none() {
+        assert_eq!(
+            after_residual[0], 0,
+            ">=15cm human residuals must be solved; 5–15cm are reported separately"
+        );
+        assert_eq!(
+            static_removed, 0,
+            "cleanup must preserve retained static geometry"
+        );
+    }
 }
 
 #[test]
@@ -476,6 +622,7 @@ fn completed_cleanup_saved_floating_without_raw_log() {
         }
     }
     let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
+    assert!(writer.begin_session(1).is_some());
     assert!(writer.accumulate_mapping_scan(1, &points, Some([0., 0., 0.65]), 100));
     let receipt = OccupancyCommitReceipt {
         commit_id: crate::mapping_commit::MappingCommitId {
@@ -505,6 +652,11 @@ fn completed_cleanup_saved_floating_without_raw_log() {
         dense.archive("map").unwrap().0,
         &folder.join("original-dense.bin"),
     );
+    std::fs::write(
+        folder.join("original-cloud.xyzf32"),
+        &writer.committed_snapshot().unwrap().xyz_f32_le,
+    )
+    .unwrap();
     let config = MappingBackendComputeConfig {
         resolution: 0.1,
         initial_safe_radius_meters: 0.0,
@@ -538,6 +690,11 @@ fn completed_cleanup_saved_floating_without_raw_log() {
     )
     .unwrap();
     let descriptor = serde_json::json!({"width":grid.width,"height":grid.height,"resolution":grid.resolution,"origin_x":grid.origin[0],"origin_y":grid.origin[1],"frame_id":"map","timestamp_ns":100});
+    std::fs::write(
+        folder.join("occupancy-descriptor.json"),
+        serde_json::to_vec_pretty(&descriptor).unwrap(),
+    )
+    .unwrap();
     let original = std::fs::read(folder.join("original-fine.bin")).unwrap();
     let before = keyset(&CompletedMap::read(&folder.join("original-fine.bin")).unwrap());
     let mut counts = Vec::new();

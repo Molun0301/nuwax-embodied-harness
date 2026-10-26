@@ -8,9 +8,11 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from functools import wraps
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -20,6 +22,9 @@ import threading
 import uuid
 
 from core.errors import GatewayError
+from core.config_values import configuration_values, raw_value, runtime_value
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _error(message):
@@ -34,45 +39,90 @@ def _sha(path):
         return digest.hexdigest()
 
 
+def raw_scan_directory():
+    configured = str(runtime_value("NUWAX_RAW_SCAN_DIRECTORY", "") or "").strip()
+    runtime_root = str(runtime_value("NUWAX_RUNTIME_DATA_DIR", "runtime_data") or "").strip() or "runtime_data"
+    return Path(configured) if configured else Path(runtime_root) / "scan_logs"
+
+
 def copy_raw_scan_history(checkpoint, destination):
-    """Capture only complete frames up to this exact saved source timestamp."""
-    root = Path(os.environ.get("NUWAX_RAW_SCAN_DIRECTORY", "runtime_data/scan_logs"))
+    """辅助扫描存储中断不阻止地图保存，完整性在资产元数据中明确返回。"""
+    try:
+        return _copy_raw_scan_history(checkpoint, destination)
+    except (OSError, ValueError, KeyError, TypeError, struct.error) as error:
+        for filename in ("raw-scans.scan", "final-poses.json"):
+            (Path(destination) / filename).unlink(missing_ok=True)
+        LOGGER.warning("原始扫描保存不完整：%s", error)
+        return {"complete": False, "note": f"原始扫描保存不完整：{error}"}
+
+
+def _scan_record(stream):
+    size = stream.read(4)
+    if not size:
+        return None
+    if len(size) != 4:
+        raise ValueError("原始扫描记录头不完整")
+    length = struct.unpack("<I", size)[0]
+    if length > 65536:
+        raise ValueError("原始扫描记录头无效")
+    data = stream.read(length)
+    if len(data) != length:
+        raise ValueError("原始扫描记录头不完整")
+    return size + data, json.loads(data)
+
+
+def _find_session_scan(root, session):
+    """文件名由原生记录拥有方决定，Python只消费文件头中的既有会话身份。"""
+    invalid = False
+    for path in root.glob("*.scan"):
+        try:
+            with path.open("rb") as stream:
+                if stream.read(8) != b"NEHSCAN1":
+                    raise ValueError("原始扫描日志格式无效")
+                entry = _scan_record(stream)
+                if entry is None:
+                    raise ValueError("原始扫描记录头不完整")
+                if entry[1] == session:
+                    return path
+        except (OSError, ValueError, TypeError, struct.error):
+            invalid = True
+    if invalid:
+        raise ValueError("原始扫描记录头损坏，无法确认保存会话")
+    return None
+
+
+def _copy_raw_scan_history(checkpoint, destination):
+    """只复制保存源时间戳以内的完整帧。"""
+    root = raw_scan_directory()
     session = {"session_id": checkpoint.source_session_id, "generation": checkpoint.source_session_generation}
-    stem = hashlib.sha256(f"{session['session_id']}:{session['generation']}".encode()).hexdigest()
-    source = root / (stem + ".scan")
-    if not source.is_file():
+    source = _find_session_scan(root, session)
+    if source is None:
         return {"complete": False, "note": "原始扫描日志缺失，不能完成全量人体离线重判"}
+    stem = source.stem
+    session_file = source.name
+    if source.with_suffix(".incomplete").exists():
+        return {"complete": False, "note": "原始扫描记录此前已中断，不能完成全量人体离线重判"}
     timestamp = checkpoint.cloud_receipt["source_timestamp_ns"]
     target = Path(destination) / "raw-scans.scan"
     frames = 0
     last = 0
-    def record(stream):
-        size = stream.read(4)
-        if not size:
-            return None
-        if len(size) != 4:
-            raise ValueError("原始扫描记录头不完整")
-        length = struct.unpack("<I", size)[0]
-        if length > 65536:
-            raise ValueError("原始扫描记录头无效")
-        data = stream.read(length)
-        if len(data) != length:
-            raise ValueError("原始扫描记录头不完整")
-        return size + data, json.loads(data)
     with source.open("rb") as inp, target.open("xb") as out:
         magic = inp.read(8)
         if magic != b"NEHSCAN1":
             raise ValueError("原始扫描日志格式无效")
-        header, identity = record(inp)
+        header, identity = _scan_record(inp)
         if identity != session:
             raise ValueError("原始扫描日志不属于保存会话")
         out.write(magic + header)
         while last < timestamp:
-            entry = record(inp)
+            entry = _scan_record(inp)
             if entry is None:
                 break
             header, frame = entry
-            if frame["source_timestamp_ns"] > timestamp:
+            stamp = frame["source_timestamp_ns"]
+            if type(stamp) is not int or stamp <= last:
+                raise ValueError("原始扫描时间戳未严格前进")
+            if stamp > timestamp:
                 break
             count = frame["point_count"]
             if type(count) is not int or not 0 <= count <= 2_000_000:
@@ -89,7 +139,8 @@ def copy_raw_scan_history(checkpoint, destination):
             last = frame["source_timestamp_ns"]
         out.flush()
         os.fsync(out.fileno())
-    result = {"path": target.name, "frames": frames, "last_timestamp_ns": last, "complete": last == timestamp}
+    result = {"path": target.name, "frames": frames, "last_timestamp_ns": last, "complete": last == timestamp,
+              "bytes": target.stat().st_size, "session": session, "session_file": session_file}
     revisions = []
     for path in root.glob(stem + "-poses-*.json"):
         try:
@@ -98,14 +149,62 @@ def copy_raw_scan_history(checkpoint, destination):
             continue
         if revision <= checkpoint.cloud_receipt["cloud_revision"]:
             revisions.append((revision, path))
-    if revisions:
-        _, source = max(revisions)
+    fine_archive = checkpoint.fine_archive
+    frame_generation = None
+    if fine_archive is not None:
+        from services.geometry.fine_map_archive import read_fine_archive_root
+        _, fine_root, _ = read_fine_archive_root(fine_archive)
+        frame_generation = fine_root["domain"]["frame_generation"]
+    matching = []
+    for revision, source in revisions:
         poses = json.loads(source.read_text())
         if poses["session"] != session:
             raise ValueError("最终位姿不属于保存会话")
+        recorded_generation = poses.get("frame_generation")
+        if frame_generation is None or recorded_generation == frame_generation or (
+                frame_generation == 0 and recorded_generation is None):
+            matching.append((revision, source))
+    if matching:
+        _, source = max(matching)
         shutil.copyfile(source, Path(destination) / "final-poses.json")
         result["final_poses"] = "final-poses.json"
+    elif frame_generation:
+        result.update(complete=False, note="保存地图缺少相同坐标代际的最终位姿，不能完成全量人体离线重判")
     return result
+
+
+def mark_saved_raw_scan_history(bundle, source_root):
+    """仅在地图资产发布成功后记录可回收范围，活动扫描的文件锁仍阻止回收。"""
+    history = bundle.metadata.get("raw_scan_history") or {}
+    if not history.get("complete") or not history.get("session"):
+        return
+    saved = Path(source_root) / history["path"]
+    size = saved.stat().st_size
+    if size != history["bytes"]:
+        return
+    filename = history.get("session_file")
+    if not filename:
+        return
+    member = Path(filename)
+    if member.name != filename or member.suffix != ".scan":
+        raise ValueError("原始扫描暂存文件名无效")
+    (raw_scan_directory() / member.with_suffix(".saved")).write_text(str(size), encoding="ascii")
+
+
+def _owned_cleanup_preparation(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self.condition:
+            if self.closed:
+                raise _error("地图清理拥有方正在关闭")
+            self.preparing += 1
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            with self.condition:
+                self.preparing -= 1
+                self.condition.notify_all()
+    return wrapped
 
 
 class CompletedMapCleanup:
@@ -115,9 +214,45 @@ class CompletedMapCleanup:
         self.root.mkdir(parents=True, exist_ok=True)
         self.jobs = {}
         self.lock = threading.RLock()
+        self.condition = threading.Condition(self.lock)
+        self.preparing = 0
+        self.closed = False
+        self.process = None
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="map-cleanup")
 
+    def close(self):
+        with self.lock:
+            self.closed = True
+            for job in self.jobs.values():
+                if job["state"] in {"queued", "running", "ready"}:
+                    try:
+                        (job["folder"] / "cancel").touch()
+                    except OSError:
+                        LOGGER.warning("清理取消标记未写入，关闭流程继续回收工作进程。", exc_info=True)
+                    job["state"] = "cancelled"
+            process = self.process
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        self.executor.shutdown(wait=True)
+        with self.condition:
+            while self.preparing or any(job["state"] == "applying" for job in self.jobs.values()):
+                self.condition.wait()
+        for job in self.jobs.values():
+            shutil.rmtree(job["folder"], ignore_errors=True)
+
+    @_owned_cleanup_preparation
     def start(self, *, map_name, strength_percent=50):
+        with self.lock:
+            if self.closed:
+                raise _error("地图清理拥有方正在关闭")
         if type(strength_percent) is not int or not 0 <= strength_percent <= 100:
             raise _error("清理力度必须是 0–100 的整数百分比")
         source = self.owner.get_map_asset_bundle(map_name=map_name)
@@ -163,13 +298,18 @@ class CompletedMapCleanup:
             "backend": str(folder / "backend.source"), "occupancy": str(folder / "occupancy.source"),
             "occupancy_descriptor": dict(stored.occupancy_asset), "output": str(folder / "result"),
             "strength_percent": strength_percent, "source_timestamp_ns": stored.checkpoint.cloud_receipt["source_timestamp_ns"],
-            "scan_log": saved_file("path"), "final_poses": saved_file("final_poses"), "cancel_file": str(folder / "cancel")}
+            "scan_log": saved_file("path") if history.get("complete") else None,
+            "final_poses": saved_file("final_poses") if history.get("complete") else None,
+            "cancel_file": str(folder / "cancel")}
         (folder / "request.json").write_text(json.dumps(request), encoding="utf-8")
         job = dict(id=job_id, state="queued", map_name=map_name, strength_percent=strength_percent,
                    source=source, source_root=source_root, stored=stored, folder=folder, report=None, error=None, result_map=None)
         with self.lock:
+            if self.closed:
+                shutil.rmtree(folder)
+                raise _error("地图清理拥有方正在关闭")
             self.jobs[job_id] = job
-        self.executor.submit(self._compute, job)
+            self.executor.submit(self._compute, job)
         return self.status(job_id)
 
     def _compute(self, job):
@@ -183,8 +323,25 @@ class CompletedMapCleanup:
             if not binary.is_file():
                 raise _error("清理运行程序尚未构建，请更新几何运行程序")
             with (job["folder"] / "worker.log").open("wb") as log:
-                process = subprocess.run([str(binary), "--cleanup-completed-cloud", str(job["folder"] / "request.json")],
-                                         stdout=log, stderr=subprocess.STDOUT, check=False)
+                files = configuration_values()
+                environment = dict(os.environ)
+                for key in ("NUWAX_GEOMETRY_FINE_CLOUD_CACHE_MIB", "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_AUTO_MAX_MIB"):
+                    value = raw_value(key, "", files)
+                    if value:
+                        environment[key] = value
+                    else:
+                        environment.pop(key, None)
+                with self.lock:
+                    if self.closed or job["state"] == "cancelled":
+                        return
+                    process = subprocess.Popen([str(binary), "--cleanup-completed-cloud", str(job["folder"] / "request.json")],
+                        stdout=log, stderr=subprocess.STDOUT, env=environment)
+                    self.process = process
+                try:
+                    process.wait()
+                finally:
+                    with self.lock:
+                        self.process = None
             if (job["folder"] / "cancel").exists():
                 state, report = "cancelled", None
             elif process.returncode:
@@ -196,7 +353,8 @@ class CompletedMapCleanup:
                 job.update(state=state, report=report)
         except Exception as error:
             with self.lock:
-                job.update(state="failed", error=str(error))
+                if job["state"] != "cancelled":
+                    job.update(state="failed", error=str(error))
 
     def _job(self, job_id):
         try:
@@ -238,6 +396,8 @@ class CompletedMapCleanup:
         if confirmed is not True:
             raise _error("请确认预览，再另存清理后的新地图")
         with self.lock:
+            if self.closed:
+                raise _error("地图清理拥有方正在关闭")
             job = self._job(job_id)
             if job["state"] == "applied" and job["result_map"] == new_map_name:
                 return self.status(job_id)
@@ -259,9 +419,11 @@ class CompletedMapCleanup:
         except Exception as error:
             with self.lock:
                 job.update(state="failed", error=str(error))
+                self.condition.notify_all()
             raise
         with self.lock:
             job.update(state="applied", result_map=name)
+            self.condition.notify_all()
         return self.status(job_id)
 
     def _save_copy(self, job, name):

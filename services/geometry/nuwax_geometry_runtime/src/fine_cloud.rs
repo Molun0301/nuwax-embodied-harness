@@ -70,6 +70,15 @@ pub(super) struct FineCloud {
     latest_ground_source: Option<crate::lio_ingress::WeakAdmittedRegisteredScan>,
     latest_ground_indices: Arc<[u32]>,
 }
+/// 在线、私有重放和离线清理共享进程启动时已解析的写入器预算。
+pub(crate) fn configured_writer_cache() -> (usize, CachePolicy) {
+    match CONFIGURED_CACHE.get().copied().unwrap_or(DEFAULT_CACHE) {
+        FineCloudCache::Fixed { mib } => (mib * MIB, CachePolicy::Fixed),
+        FineCloudCache::Auto { max_mib } => (AUTO_START_MIB * MIB,
+            CachePolicy::Auto { max_bytes: max_mib * MIB }),
+    }
+}
+
 impl FineCloud {
     pub(super) fn from_archive(file: std::fs::File) -> Result<(Self, nuwax_map_chunks::ArchivedRoot), String> {
         let mut archive = nuwax_map_chunks::ArchiveReader::open(file)?;
@@ -80,11 +89,8 @@ impl FineCloud {
         Ok((cloud, root))
     }
     pub(super) fn new(size: f32) -> Result<Self, String> {
-        let (initial_mib, policy) = match CONFIGURED_CACHE.get().copied().unwrap_or(DEFAULT_CACHE) {
-            FineCloudCache::Fixed { mib } => (mib, CachePolicy::Fixed),
-            FineCloudCache::Auto { max_mib } => (AUTO_START_MIB, CachePolicy::Auto { max_bytes: max_mib * MIB }),
-        };
-        let mut writer = Writer::new(Repository::temporary()?, size, initial_mib * MIB)?;
+        let (budget, policy) = configured_writer_cache();
+        let mut writer = Writer::new(Repository::temporary()?, size, budget)?;
         writer.set_cache_policy(policy)?;
         Ok(Self { writer,
             dynamic: DynamicCloudFilter::default(), failure: None, readers: FineCloudReaders::default(), commits: 0, baseline: None, latest_unclassified_scan: None, latest_ground_source: None, latest_ground_indices: Arc::from([]) })
@@ -92,7 +98,6 @@ impl FineCloud {
     pub(super) fn fresh() -> Result<Self, String> { Self::new(VOXEL_SIZE) }
     pub(super) fn removed_keys(&self) -> &[(i32, i32, i32)] { self.dynamic.removed_keys() }
     pub(super) fn clears(&self, point:[f64;3])->bool {self.dynamic.clears(point)}
-    pub(super) fn labels(&self)->&crate::human_point_labels::FrameLabels {self.dynamic.labels()}
     pub(super) fn voxel_size(&self) -> f32 { self.writer.voxel_size_m() }
     pub(super) fn is_dynamic(&self, point: &Point3<f64>) -> bool {
         self.dynamic.is_dynamic([point.x, point.y, point.z])
@@ -192,10 +197,12 @@ impl FineCloud {
             let low = voxel_key(origin.map(|v| v - 30.0 - f64::from(size)), size).ok_or("精细动态窗口越界")?;
             let high = voxel_key(origin.map(|v| v + 30.0 + f64::from(size)), size).ok_or("精细动态窗口越界")?;
             let local = self.writer.region([low.0, low.1, low.2], [high.0, high.1, high.2], 2_000_000)?;
-            let ground=self.measured_ground_indices(points)?;
             let mut voxels: VoxelIndex = local.into_iter().map(|(key, _)| (key[0], key[1], key[2])).collect();
             if let Some(shared)=shared {self.dynamic.adopt(shared,&mut voxels,size);}
-            else {self.dynamic.observe_with_ground(&mut voxels,size,origin,timestamp_ns,points,&ground);}
+            else {
+                let ground = self.measured_ground_indices(points)?;
+                self.dynamic.observe_with_ground(&mut voxels,size,origin,timestamp_ns,points,&ground);
+            }
             self.writer.remove(self.dynamic.removed_keys().iter().map(|key| [key.0, key.1, key.2]))?;
         }
         if timestamp_ns == 0 {

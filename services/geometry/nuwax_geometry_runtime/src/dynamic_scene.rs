@@ -12,7 +12,7 @@ const EVIDENCE_GAP_NS: u64 = 2_000_000_000;
 const RECOVERY_NS: u64 = 2_000_000_000;
 const RECOVERY_OBSERVATIONS: u16 = 20;
 const MAX_CELLS: usize = 500_000;
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 struct Evidence {
     free_count: u8,
     last_free: u64,
@@ -111,12 +111,51 @@ impl MappedFrameDecision {
     pub(crate) fn is_dynamic(&self, p: [f64; 3]) -> bool {
         self.point_labels.get(&bits(p)).is_some_and(|l| l.dynamic())
     }
-    pub(crate) fn label(&self, p: [f64; 3]) -> PointLabel {
-        self.point_labels
-            .get(&bits(p))
-            .copied()
-            .unwrap_or(PointLabel::PendingNew)
+    pub(crate) fn has_clears(&self) -> bool {
+        !self.decision.clear_cells.is_empty()
     }
+
+    /// 清除格在里程计系；八角变换后的地图包围盒只作保守预判，实际删除仍用 clears。
+    pub(crate) fn potential_window_clear_cells(&self, cells: &HashMap<Cell, u32>) -> Option<HashSet<Cell>> {
+        let mut candidates = HashSet::new();
+        if self.odom_from_map == nalgebra::Isometry3::identity() {
+            return Some(self.decision.clear_cells.iter().filter(|k| cells.contains_key(k)).copied().collect());
+        }
+        let map_from_odom = self.map_from_odom();
+        for &(x, y, z) in &self.decision.clear_cells {
+            let mut lower = [f64::INFINITY; 3];
+            let mut upper = [f64::NEG_INFINITY; 3];
+            for corner in 0..8 {
+                let odom = Point3::new(
+                    (f64::from(x) + f64::from(corner & 1)) * CELL_SIZE,
+                    (f64::from(y) + f64::from((corner >> 1) & 1)) * CELL_SIZE,
+                    (f64::from(z) + f64::from((corner >> 2) & 1)) * CELL_SIZE);
+                let map = map_from_odom * odom;
+                for axis in 0..3 {
+                    // 兼顾正逆变换与格边界的舍入；不确定或越界时回退逐点判断。
+                    let error = 128.0 * f64::EPSILON * (1.0 + odom.coords.abs().sum()
+                        + map.coords.abs().sum() + map_from_odom.translation.vector.abs().sum());
+                    lower[axis] = lower[axis].min(map[axis] - error);
+                    upper[axis] = upper[axis].max(map[axis] + error);
+                }
+            }
+            let (Some(a), Some(b)) = (cell(lower), cell(upper)) else { return None; };
+            // 刚体变换的单格范围只跨少量格；异常数值不能让预判无限枚举。
+            if i64::from(b.0) - i64::from(a.0) > 4
+                || i64::from(b.1) - i64::from(a.1) > 4
+                || i64::from(b.2) - i64::from(a.2) > 4 { return None; }
+            for i in a.0..=b.0 { for j in a.1..=b.1 { for k in a.2..=b.2 {
+                if cells.contains_key(&(i,j,k)) { candidates.insert((i,j,k)); }
+            } } }
+        }
+        Some(candidates)
+    }
+
+    #[cfg(test)]
+    fn may_clear_window(&self, cells: &HashMap<Cell, u32>) -> bool {
+        self.potential_window_clear_cells(cells).is_none_or(|keys| !keys.is_empty())
+    }
+
     pub(crate) fn clears(&self, p: [f64; 3]) -> bool {
         let p = self.odom_from_map * Point3::from(p);
         let p = [p.x, p.y, p.z];
@@ -176,9 +215,8 @@ pub(crate) fn cell(point: [f64; 3]) -> Option<Cell> {
         .then(|| (v[0] as i32, v[1] as i32, v[2] as i32))
 }
 fn neighbors(k: Cell) -> impl Iterator<Item = Cell> {
-    (-1..=1).flat_map(move |x| {
-        (-1..=1).flat_map(move |y| (-1..=1).map(move |z| (k.0 + x, k.1 + y, k.2 + z)))
-    })
+    // 顺序保持外层X、内层Z；单层迭代避免逐格创建嵌套迭代器。
+    (0..27).map(move |i| (k.0 + i / 9 - 1, k.1 + (i / 3) % 3 - 1, k.2 + i % 3 - 1))
 }
 fn bits(p: [f64; 3]) -> [u64; 3] {
     p.map(f64::to_bits)
@@ -228,9 +266,6 @@ impl DynamicScene {
         self.labels.labels.clear();
         self.point_labels.clear();
     }
-    pub(crate) fn labels(&self) -> &FrameLabels {
-        &self.labels
-    }
     pub(crate) fn known_void(&self, p: [f64; 3]) -> bool {
         cell(p)
             .and_then(|k| self.evidence.get(&k))
@@ -256,6 +291,12 @@ impl DynamicScene {
         ground: &[u32],
         known: &[u32],
     ) {
+        #[cfg(test)]
+        let diagnostic = std::env::var_os("NUWAX_DYNAMIC_PHASE_DIAGNOSTIC").is_some();
+        #[cfg(test)]
+        let phase = std::time::Instant::now();
+        #[cfg(test)]
+        let mut phases = Vec::new();
         self.clear_frame();
         if stamp == 0
             || stamp <= self.last_timestamp_ns
@@ -286,8 +327,34 @@ impl DynamicScene {
             }
         }
         let mut free = HashSet::new();
-        for (p, r) in rays {
-            trace(origin, p, r, self.minimum_range_m, &hits, &mut free);
+        // 每束射线独立遍历；按原射线及步进顺序汇入同一集合，保留原散列插入次序。
+        if rays.len() >= 512 && rayon::current_num_threads() >= 2 {
+            use rayon::prelude::*;
+            // 分批保留至多八个局部结果，临时内存不随整帧射线数量累计。
+            for batch in rays.chunks(8 * 256) {
+            let chunks: Vec<Vec<Cell>> = batch.par_chunks(256).map(|chunk| {
+                let mut cells = Vec::new();
+                for &(p, r) in chunk {
+                    trace(origin, p, r, self.minimum_range_m, &hits, &mut |k| cells.push(k));
+                }
+                cells
+            }).collect();
+            for chunk in chunks {
+                for k in chunk { free.insert(k); }
+            }
+            }
+        } else {
+            for &(p, r) in &rays {
+                trace(origin, p, r, self.minimum_range_m, &hits, &mut |k| { free.insert(k); });
+            }
+        }
+        #[cfg(test)]
+        if std::env::var_os("NUWAX_DYNAMIC_RAY_SHADOW").is_some() {
+            let mut original = HashSet::new();
+            for &(p, r) in &rays {
+                trace(origin, p, r, self.minimum_range_m, &hits, &mut |k| { original.insert(k); });
+            }
+            assert_eq!(free, original, "并行射线遍历不得改变任何自由格");
         }
         self.last_timestamp_ns = stamp;
         let observed: HashSet<_> = hits.iter().chain(free.iter()).copied().collect();
@@ -310,6 +377,8 @@ impl DynamicScene {
             .iter()
             .flat_map(|f| f.2.iter().copied())
             .collect();
+        #[cfg(test)]
+        if diagnostic { phases.push(("rays", phase.elapsed().as_secs_f64() * 1e3)); }
         let raw: Vec<_> = points.iter().map(|p| [p.x, p.y, p.z]).collect();
         let mut ground_set: HashSet<usize> = ground
             .iter()
@@ -336,10 +405,14 @@ impl DynamicScene {
         let eligible: HashSet<_> = raw
             .iter()
             .enumerate()
-            .filter_map(|(i, &p)| (!ground_set.contains(&i)).then_some(i))
+            .filter_map(|(i, _)| (!ground_set.contains(&i)).then_some(i))
             .collect();
+        #[cfg(test)]
+        if diagnostic { phases.push(("ground", phase.elapsed().as_secs_f64() * 1e3)); }
         let before = self.tracks.prepare(&raw, &eligible, origin, stamp);
         let held: HashSet<_> = before.keys().filter_map(|&i| cell(raw[i])).collect();
+        #[cfg(test)]
+        if diagnostic { phases.push(("tracks_prepare", phase.elapsed().as_secs_f64() * 1e3)); }
         let mut recovered = Vec::new();
         for k in &hits {
             let e = self.evidence.entry(*k).or_default();
@@ -399,9 +472,13 @@ impl DynamicScene {
                 self.clear_cells.insert(*k);
             }
         }
+        #[cfg(test)]
+        if diagnostic { phases.push(("evidence", phase.elapsed().as_secs_f64() * 1e3)); }
         let clears = &self.clear_cells;
         self.references
             .remove_where(|p| cell(p).is_some_and(|k| clears.contains(&k)));
+        #[cfg(test)]
+        if diagnostic { phases.push(("references_remove", phase.elapsed().as_secs_f64() * 1e3)); }
         let mut labels: Vec<_> = raw
             .iter()
             .enumerate()
@@ -417,7 +494,11 @@ impl DynamicScene {
                 }
             })
             .collect();
+        #[cfg(test)]
+        if diagnostic { phases.push(("labels", phase.elapsed().as_secs_f64() * 1e3)); }
         crate::human_point_labels::grow(points, &mut labels);
+        #[cfg(test)]
+        if diagnostic { phases.push(("grow", phase.elapsed().as_secs_f64() * 1e3)); }
         let evidence = &self.evidence;
         self.tracks.update(&raw, &mut labels, stamp, &|k| {
             evidence
@@ -425,17 +506,23 @@ impl DynamicScene {
                 .filter(|e| e.known_free)
                 .map(|e| e.void_since)
         });
+        #[cfg(test)]
+        if diagnostic { phases.push(("tracks_update", phase.elapsed().as_secs_f64() * 1e3)); }
         for (&p, &label) in raw.iter().zip(&labels) {
             self.point_labels.insert(bits(p), label);
             if label.dynamic() {
                 self.dynamic_cells.insert(cell(p).unwrap());
             }
         }
+        #[cfg(test)]
+        if diagnostic { phases.push(("point_labels", phase.elapsed().as_secs_f64() * 1e3)); }
         self.references.observe(points, &labels, stamp);
         self.labels = FrameLabels {
             source_timestamp_ns: stamp,
             labels,
         };
+        #[cfg(test)]
+        if diagnostic { phases.push(("references_observe", phase.elapsed().as_secs_f64() * 1e3)); }
         // Capacity eviction forgets only evidence, never geometry. Retain near
         // cells first rather than resetting the whole map when one frame is big.
         if !self.offline && self.evidence.len() > MAX_CELLS {
@@ -453,6 +540,8 @@ impl DynamicScene {
                 self.evidence.remove(&k);
             }
         }
+        #[cfg(test)]
+        if diagnostic { eprintln!("DYNAMIC_PHASE frame={} points={} cells={} clears={} stages={:?} total_ms={:.3}", self.frame, points.len(), self.evidence.len(), self.clear_cells.len(), phases, phase.elapsed().as_secs_f64() * 1e3); }
     }
     pub(crate) fn new_void_cells(&self) -> impl Iterator<Item = Cell> + '_ {
         self.clear_cells.iter().copied()
@@ -481,7 +570,7 @@ fn trace(
     range: f64,
     minimum_range_m: f64,
     hits: &HashSet<Cell>,
-    free: &mut HashSet<Cell>,
+    visit: &mut impl FnMut(Cell),
 ) {
     let end = (range - SURFACE_MARGIN).min(RANGE);
     if end <= minimum_range_m {
@@ -522,7 +611,7 @@ fn trace(
         };
         let exit = next[a].min(end);
         if distance >= minimum_range_m && exit - distance > CELL_SIZE * 0.05 {
-            free.insert(c);
+            visit(c);
         }
         if next[a] >= end {
             break;
@@ -538,6 +627,62 @@ pub(crate) mod tests {
     use super::*;
 
     pub(crate) const ORIGIN: [f64; 3] = [0.03, 0.03, 0.65];
+
+    pub(crate) fn mapped_clear_decision(keys: &[Cell], map_from_odom: nalgebra::Isometry3<f64>,
+        protected: &[Point3<f64>]) -> MappedFrameDecision {
+        let mut references = StaticReferences::default();
+        references.observe(protected, &vec![PointLabel::Ground; protected.len()], 1);
+        let decision = std::sync::Arc::new(FrameDecision { labels: FrameLabels {
+            source_timestamp_ns: 1, labels: Vec::new() }, clear_cells: keys.iter().copied().collect(), references });
+        MappedFrameDecision::new(decision, map_from_odom, &[], 0).unwrap()
+    }
+
+    #[test]
+    fn parallel_observation_matches_serial_state_and_labels_each_frame() {
+        let serial = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let parallel = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let mut expected = DynamicScene::with_minimum_range(0.05);
+        let mut actual = DynamicScene::with_minimum_range(0.05);
+        for frame in 1..=24 {
+            let person = (7..=16).contains(&frame).then_some((frame as f64 - 7.0) * 0.12);
+            let points = corridor(person, (frame % 3) as f64).0;
+            serial.install(|| expected.observe(&points, ORIGIN, frame * 100_000_000));
+            parallel.install(|| actual.observe(&points, ORIGIN, frame * 100_000_000));
+            assert_eq!(actual.evidence, expected.evidence, "第{frame}帧证据改变");
+            assert_eq!(actual.clear_cells, expected.clear_cells, "第{frame}帧清除格改变");
+            assert_eq!(actual.labels, expected.labels, "第{frame}帧标签改变");
+        }
+        assert!(actual.evidence.len() >= 4096);
+    }
+
+    #[test]
+    fn mapped_clear_window_bounds_cover_rotations_translations_and_cell_edges() {
+        let decision = std::sync::Arc::new(FrameDecision {
+            labels: FrameLabels { source_timestamp_ns: 1, labels: Vec::new() },
+            clear_cells: [(-30, 0, 7), (0, -1, 0), (14, 25, -9)].into_iter().collect(),
+            references: Default::default(),
+        });
+        for turn in 0..32 {
+            let transform = nalgebra::Isometry3::from_parts(
+                nalgebra::Translation3::new(turn as f64 * 0.13 - 2.0, -0.31, 0.017),
+                nalgebra::UnitQuaternion::from_euler_angles(turn as f64 * 0.031, -0.08, turn as f64 * 0.17));
+            let frame = MappedFrameDecision::new(decision.clone(), transform, &[], 0).unwrap();
+            for &(x,y,z) in &decision.clear_cells {
+                for f in [0.0, f64::EPSILON, 0.001, 0.4999, 0.999, 1.0 - f64::EPSILON] {
+                    let p = transform * Point3::new((x as f64 + f)*CELL_SIZE,
+                        (y as f64 + f)*CELL_SIZE, (z as f64 + f)*CELL_SIZE);
+                    if frame.clears([p.x,p.y,p.z]) {
+                        let cells = [(cell([p.x,p.y,p.z]).unwrap(),1)].into_iter().collect();
+                        assert!(frame.may_clear_window(&cells), "旋转/平移后的清除格不得漏检");
+                    }
+                }
+            }
+            assert!(!frame.may_clear_window(&[((10000,10000,10000),1)].into_iter().collect()));
+        }
+        let identity = MappedFrameDecision::new(decision, nalgebra::Isometry3::identity(), &[], 0).unwrap();
+        assert!(identity.may_clear_window(&[((0,-1,0),1)].into_iter().collect()));
+        assert!(!identity.may_clear_window(&[((1,-1,0),1)].into_iter().collect()));
+    }
 
     #[test]
     fn known_free_person_trail_retires_after_local_visibility_returns() {

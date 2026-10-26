@@ -112,15 +112,20 @@ impl StaticReferences {
         }
         protect_from_points(p, &nearby)
     }
-    /// Copy only references near actual new voids for immutable frame consumers.
+    /// 只复制实际清除格附近的参照；重叠邻域按首次访问顺序逐桶处理。
     pub fn near(&self, positions: impl Iterator<Item = [f64; 3]>) -> Self {
         let mut out = Self::default();
+        let mut visited = HashSet::new();
         for p in positions {
             let k = key(p, REFERENCE_M);
             for x in -2..=2 {
                 for y in -2..=2 {
                     for z in -2..=2 {
-                        if let Some(ids) = self.buckets.get(&[k[0] + x, k[1] + y, k[2] + z]) {
+                        let bucket = [k[0] + x, k[1] + y, k[2] + z];
+                        if !visited.insert(bucket) {
+                            continue;
+                        }
+                        if let Some(ids) = self.buckets.get(&bucket) {
                             for id in ids {
                                 let v = &self.points[id];
                                 if v.ground
@@ -279,6 +284,161 @@ pub fn grow(points: &[Point3<f64>], labels: &mut [PointLabel]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn near_without_bucket_dedup(
+        source: &StaticReferences,
+        positions: impl Iterator<Item = [f64; 3]>,
+    ) -> StaticReferences {
+        let mut out = StaticReferences::default();
+        for p in positions {
+            let k = key(p, REFERENCE_M);
+            for x in -2..=2 {
+                for y in -2..=2 {
+                    for z in -2..=2 {
+                        if let Some(ids) = source.buckets.get(&[k[0] + x, k[1] + y, k[2] + z]) {
+                            for id in ids {
+                                let v = &source.points[id];
+                                if v.ground
+                                    || (v.hits >= 5
+                                        && v.last.saturating_sub(v.first) >= 2_000_000_000)
+                                {
+                                    out.points.insert(*id, v.clone());
+                                    out.buckets
+                                        .entry(key(v.point, REFERENCE_M))
+                                        .or_default()
+                                        .insert(*id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn overlapping_reference_fixture() -> (StaticReferences, Vec<[f64; 3]>) {
+        let mut entries = Vec::new();
+        for x in -12..=12 {
+            for y in -12..=12 {
+                entries.push(Reference {
+                    point: [x as f64 * 0.03, y as f64 * 0.03, 0.5],
+                    first: 1,
+                    last: 2_000_000_001,
+                    hits: 5,
+                    ground: false,
+                });
+            }
+        }
+        for z in -8..=8 {
+            entries.push(Reference {
+                point: [0.7, 0., z as f64 * 0.03 + 0.5],
+                first: 1,
+                last: 2_000_000_001,
+                hits: 5,
+                ground: false,
+            });
+        }
+        for (point, hits, first, last, ground) in [
+            ([-0.51, 0., 0.5], 1, 1, 1, true),
+            ([0.02, 0.02, 0.7], 4, 1, 2_000_000_001, false),
+            ([0.04, 0.02, 0.7], 5, 1, 2_000_000_000, false),
+            ([0.5, 0.02, 0.7], 5, 1, 2_000_000_001, false),
+            ([4., 0., 0.5], 5, 1, 2_000_000_001, false),
+        ] {
+            entries.push(Reference {
+                point,
+                first,
+                last,
+                hits,
+                ground,
+            });
+        }
+        let mut positions: Vec<_> = (-5..=5)
+            .flat_map(|x| (-5..=5).map(move |y| [x as f64 * 0.05, y as f64 * 0.05, 0.5]))
+            .collect();
+        positions.extend([[-0.6, 0., 0.5], [0.7, 0., 0.5], [0.15, -0.15, 0.5]]);
+        (entries.into(), positions)
+    }
+
+    #[test]
+    fn near_bucket_dedup_matches_original_references_and_protection() {
+        let (source, positions) = overlapping_reference_fixture();
+        for positions in [
+            Vec::new(),
+            positions.clone(),
+            positions.iter().rev().copied().collect(),
+            positions
+                .iter()
+                .cycle()
+                .take(positions.len() * 5)
+                .copied()
+                .collect(),
+        ] {
+            let baseline = near_without_bucket_dedup(&source, positions.iter().copied());
+            let current = source.near(positions.iter().copied());
+            assert_eq!(
+                current, baseline,
+                "引用内容、时间、命中次数和桶集合必须完全相同"
+            );
+            assert!(!current
+                .points
+                .contains_key(&key([0.02, 0.02, 0.7], SURFACE_M)));
+            assert!(!current
+                .points
+                .contains_key(&key([0.04, 0.02, 0.7], SURFACE_M)));
+            assert!(!current.points.contains_key(&key([4., 0., 0.5], SURFACE_M)));
+            for x in -4..=4 {
+                for y in -4..=4 {
+                    for dz in [-0.031, -0.029, 0., 0.029, 0.031] {
+                        let point = [x as f64 * 0.06, y as f64 * 0.06, 0.5 + dz];
+                        for before in [None, Some(0), Some(1), Some(2_000_000_001)] {
+                            assert_eq!(
+                                current.protect(point, before),
+                                baseline.protect(point, before)
+                            );
+                        }
+                    }
+                }
+            }
+            for point in [[0.729, 0., 0.5], [0.731, 0., 0.5], [-0.51, 0., 0.529]] {
+                assert_eq!(current.protect(point, None), baseline.protect(point, None));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "邻桶重叠规模计时对照，发布构建独立运行"]
+    fn near_bucket_dedup_cost() {
+        let (source, positions) = overlapping_reference_fixture();
+        let positions: Vec<_> = positions
+            .iter()
+            .cycle()
+            .take(positions.len() * 20)
+            .copied()
+            .collect();
+        let baseline = near_without_bucket_dedup(&source, positions.iter().copied());
+        assert_eq!(source.near(positions.iter().copied()), baseline);
+        let mut old_ms = Vec::new();
+        let mut new_ms = Vec::new();
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            std::hint::black_box(near_without_bucket_dedup(
+                &source,
+                positions.iter().copied(),
+            ));
+            old_ms.push(start.elapsed().as_secs_f64() * 1000.);
+            let start = std::time::Instant::now();
+            std::hint::black_box(source.near(positions.iter().copied()));
+            new_ms.push(start.elapsed().as_secs_f64() * 1000.);
+        }
+        eprintln!(
+            "NEH_NEAR_COST {}",
+            serde_json::json!({"positions":positions.len(),
+            "source_references":source.points.len(),"selected_references":baseline.points.len(),
+            "baseline_ms":old_ms,"dedup_ms":new_ms})
+        );
+    }
+
     #[test]
     fn plane_line_and_point_protection_are_distinct() {
         let plane: Vec<_> = (-2..=2)

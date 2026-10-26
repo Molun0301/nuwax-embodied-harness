@@ -11951,74 +11951,392 @@ use nuwax_protocol::RawLcmFrame;
     async fn dense_chunk_finishes_pinned_version_during_dynamic_removal_and_rejects_new_owner() {
         use crate::dynamic_scene::tests::{corridor, ORIGIN};
         use crate::mapping_commit::{MappingCommitId, OccupancyCommitReceipt};
-        let (handle, _, path) = ray_runtime_with_cloud_writer("动态分块").await;
-        let mut owner = crate::lcm_runtime::attach_root_task_owner_for_tests(handle);
-        let handle = owner.handle.clone();
-        let service = GeometryRuntimeService::new(handle.clone());
-        assert!(start_mapping_session(&service, "动态分块", "动态分块").await.active);
-        let mut pinned: Option<DenseCloudChunk> = None;
-        let mut expected_tail = Vec::new();
-        for frame in 1..=22 {
-            let person = (7..=16).contains(&frame).then(|| -0.5 + (frame - 7) as f64 * 0.12);
-            let (points, _) = corridor(person, (frame % 3) as f64);
-            {
-                let mut guard = handle.cloud_map_writer.lock();
-                let writer = guard.as_mut().unwrap();
-                assert!(writer.accumulate_mapping_scan(1, &points, Some(ORIGIN), frame * 100_000_000));
-                let receipt = OccupancyCommitReceipt {
-                    commit_id: MappingCommitId { boot_nonce: 800, sequence: frame },
-                    session_id: "动态分块".into(), session_generation: 1, occupancy_revision: frame,
-                    source_timestamp_ns: frame * 100_000_000,
-                    backend_kind: crate::mapping_backend::MappingBackendKind::Raytracing,
-                    backend_generation: 1,
+        let read_all = |snapshot: &crate::dense_cloud::DenseSnapshot, start: u64, count: u64| {
+            let mut bytes = Vec::new();
+            let end = start + count;
+            let mut offset = start;
+            while offset < end {
+                let data = snapshot
+                    .read(
+                        offset,
+                        (end - offset).min(u64::from(crate::dense_cloud::CHUNK_POINTS)) as u32,
+                    )
+                    .unwrap();
+                assert!(!data.is_empty());
+                offset += data.len() as u64 / 12;
+                bytes.extend(data);
+            }
+            bytes
+        };
+        let point_bits = |bytes: &[u8]| -> [u32; 3] {
+            std::array::from_fn(|axis| {
+                u32::from_le_bytes(bytes[axis * 4..axis * 4 + 4].try_into().unwrap())
+            })
+        };
+        // 原22帧输入验证已知自由区提前过滤人体后的追加语义；补充输入从未知人体开始，验证真正的历史删除。
+        for initially_unknown_person in [false, true] {
+            let name = if initially_unknown_person {
+                "未知人体动态分块"
+            } else {
+                "动态分块"
+            };
+            let pin_frame = if initially_unknown_person { 1 } else { 10 };
+            let (handle, _, path) = ray_runtime_with_cloud_writer(name).await;
+            let mut owner = crate::lcm_runtime::attach_root_task_owner_for_tests(handle);
+            let handle = owner.handle.clone();
+            let service = GeometryRuntimeService::new(handle.clone());
+            assert!(start_mapping_session(&service, name, name).await.active);
+            let mut pinned: Option<DenseCloudChunk> = None;
+            let mut pinned_snapshot: Option<crate::dense_cloud::DenseSnapshot> = None;
+            let mut pinned_bytes = Vec::new();
+            let mut pinned_human_bits = ahash::AHashSet::new();
+            let mut last_snapshot = None;
+            let mut last_points = Vec::new();
+            let mut removed_total = 0;
+            let mut trace = Vec::new();
+            for frame in 1..=22 {
+                let person = if initially_unknown_person {
+                    if frame <= 3 {
+                        Some(-0.5)
+                    } else if frame <= 12 {
+                        Some(-0.5 + (frame - 3) as f64 * 0.12)
+                    } else {
+                        None
+                    }
+                } else {
+                    (7..=16)
+                        .contains(&frame)
+                        .then(|| -0.5 + (frame - 7) as f64 * 0.12)
                 };
-                writer.commit_accumulated_snapshot(&receipt).unwrap().unwrap();
-                if frame == 10 {
-                    expected_tail = writer.committed_dense_cloud().unwrap().unwrap().read(10, 100).unwrap();
+                let (points, truth) = corridor(person, (frame % 3) as f64);
+                let snapshot = {
+                    let mut guard = handle.cloud_map_writer.lock();
+                    let writer = guard.as_mut().unwrap();
+                    let previous = writer.committed_dense_cloud().unwrap();
+                    assert!(writer.accumulate_mapping_scan(
+                        1,
+                        &points,
+                        Some(ORIGIN),
+                        frame * 100_000_000
+                    ));
+                    let receipt = OccupancyCommitReceipt {
+                        commit_id: MappingCommitId {
+                            boot_nonce: 800,
+                            sequence: frame,
+                        },
+                        session_id: name.into(),
+                        session_generation: 1,
+                        occupancy_revision: frame,
+                        source_timestamp_ns: frame * 100_000_000,
+                        backend_kind: crate::mapping_backend::MappingBackendKind::Raytracing,
+                        backend_generation: 1,
+                    };
+                    writer
+                        .commit_accumulated_snapshot(&receipt)
+                        .unwrap()
+                        .unwrap();
+                    let current = writer.committed_dense_cloud().unwrap().unwrap();
+                    let removed = previous
+                        .as_ref()
+                        .map(|old| current.removed_prefix_ranges(old, old.point_count).unwrap())
+                        .unwrap_or_default();
+                    let removed_count: u64 = removed.chunks_exact(2).map(|range| range[1]).sum();
+                    removed_total += removed_count;
+                    trace.push(serde_json::json!({"frame":frame,"source_points":points.len(),
+                        "total_points":current.point_count,"epoch":current.epoch,"removed_points":removed_count}));
+                    current
+                };
+                if frame == pin_frame {
+                    pinned_bytes = read_all(&snapshot, 0, snapshot.point_count);
+                    pinned_human_bits = points
+                        .iter()
+                        .zip(&truth)
+                        .filter(|(_, human)| **human)
+                        .map(|(point, _)| [point.x, point.y, point.z].map(|v| (v as f32).to_bits()))
+                        .collect();
+                    if initially_unknown_person {
+                        let persisted_human = pinned_bytes
+                            .chunks_exact(12)
+                            .filter(|point| pinned_human_bits.contains(&point_bits(point)))
+                            .count();
+                        assert!(
+                            persisted_human > 0,
+                            "补充场景必须实际保存未知人体，不能用已提前过滤的空前提代替删除"
+                        );
+                    }
+                    let head = GeometryRuntime::get_dense_cloud_chunk(
+                        &service,
+                        Request::new(DenseCloudChunkRequest {
+                            allow_delta: false,
+                            expected_epoch: String::new(),
+                            offset_points: 0,
+                            max_points: 10,
+                        }),
+                    )
+                    .await
+                    .unwrap()
+                    .into_inner();
+                    assert_eq!(head.epoch, snapshot.epoch);
+                    assert_eq!(head.total_points, snapshot.point_count);
+                    assert_eq!(head.xyz_f32_le, snapshot.read(0, 10).unwrap());
+                    pinned = Some(head);
+                    pinned_snapshot = Some(snapshot.clone());
+                } else if frame > pin_frame {
+                    let pin = pinned.as_ref().unwrap();
+                    if initially_unknown_person && snapshot.epoch != pin.epoch {
+                        // 持续领取已变更代际的旧读者，避免用测试耗时触发30秒闲置淘汰。
+                        let tail = GeometryRuntime::get_dense_cloud_chunk(
+                            &service,
+                            Request::new(DenseCloudChunkRequest {
+                                allow_delta: false,
+                                expected_epoch: pin.epoch.clone(),
+                                offset_points: 10,
+                                max_points: 100,
+                            }),
+                        )
+                        .await
+                        .unwrap()
+                        .into_inner();
+                        assert_eq!(tail.epoch, pin.epoch);
+                        assert_eq!(tail.total_points, pin.total_points);
+                        assert_eq!(tail.xyz_f32_le, pinned_bytes[10 * 12..110 * 12]);
+                    } else if !initially_unknown_person {
+                        assert_eq!(
+                            snapshot.epoch, pin.epoch,
+                            "原输入在第10帧后只追加，提前过滤的人体不应再改变内容代际"
+                        );
+                        assert!(snapshot
+                            .removed_prefix_ranges(pinned_snapshot.as_ref().unwrap(), pin.total_points)
+                            .unwrap()
+                            .is_empty());
+                    }
+                }
+                last_points = points;
+                last_snapshot = Some(snapshot);
+            }
+            eprintln!(
+                "DENSE_CHUNK_CASE {}",
+                serde_json::json!({"initially_unknown_person":initially_unknown_person,
+                "frames":trace,"removed_total":removed_total})
+            );
+            let pinned = pinned.unwrap();
+            let latest_snapshot = last_snapshot.unwrap();
+            let tail = GeometryRuntime::get_dense_cloud_chunk(
+                &service,
+                Request::new(DenseCloudChunkRequest {
+                    allow_delta: false,
+                    expected_epoch: pinned.epoch.clone(),
+                    offset_points: 10,
+                    max_points: 100,
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            assert_eq!(tail.epoch, pinned.epoch);
+            assert_eq!(tail.xyz_f32_le, pinned_bytes[10 * 12..110 * 12]);
+            if initially_unknown_person {
+                assert!(removed_total > 0);
+                assert_ne!(latest_snapshot.epoch, pinned.epoch);
+                assert_eq!(tail.total_points, pinned.total_points);
+                let frozen = GeometryRuntime::get_dense_cloud_chunk(
+                    &service,
+                    Request::new(DenseCloudChunkRequest {
+                        allow_delta: false,
+                        expected_epoch: pinned.epoch.clone(),
+                        offset_points: 0,
+                        max_points: crate::dense_cloud::CHUNK_POINTS as u32,
+                    }),
+                )
+                .await
+                .unwrap()
+                .into_inner();
+                assert_eq!(frozen.xyz_f32_le, pinned_bytes);
+                let exhausted = GeometryRuntime::get_dense_cloud_chunk(
+                    &service,
+                    Request::new(DenseCloudChunkRequest {
+                        allow_delta: false,
+                        expected_epoch: pinned.epoch.clone(),
+                        offset_points: pinned.total_points,
+                        max_points: 10,
+                    }),
+                )
+                .await
+                .unwrap_err();
+                assert!(exhausted.message().contains("DENSE_CLOUD_SOURCE_CHANGED"));
+            } else {
+                assert_eq!(tail.total_points, latest_snapshot.point_count);
+                assert!(latest_snapshot.point_count > pinned.total_points);
+                assert_eq!(
+                    read_all(&latest_snapshot, 0, pinned.total_points),
+                    pinned_bytes,
+                    "同源追加必须完整保留已读取字节前缀"
+                );
+                let appended = GeometryRuntime::get_dense_cloud_chunk(
+                    &service,
+                    Request::new(DenseCloudChunkRequest {
+                        allow_delta: false,
+                        expected_epoch: pinned.epoch.clone(),
+                        offset_points: pinned.total_points,
+                        max_points: 10,
+                    }),
+                )
+                .await
+                .unwrap()
+                .into_inner();
+                assert_eq!(
+                    appended.xyz_f32_le,
+                    latest_snapshot.read(pinned.total_points, 10).unwrap()
+                );
+                assert_eq!(appended.total_points, latest_snapshot.point_count);
+            }
+            let latest = GeometryRuntime::get_dense_cloud_chunk(
+                &service,
+                Request::new(DenseCloudChunkRequest {
+                    allow_delta: false,
+                    expected_epoch: String::new(),
+                    offset_points: 0,
+                    max_points: 10,
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            assert_eq!(latest.epoch, latest_snapshot.epoch);
+            assert_eq!(latest.total_points, latest_snapshot.point_count);
+            let delta = GeometryRuntime::get_dense_cloud_chunk(
+                &service,
+                Request::new(DenseCloudChunkRequest {
+                    allow_delta: true,
+                    expected_epoch: pinned.epoch.clone(),
+                    offset_points: pinned.total_points,
+                    max_points: 100,
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            let expected_removed = latest_snapshot
+                .removed_prefix_ranges(pinned_snapshot.as_ref().unwrap(), pinned.total_points)
+                .unwrap();
+            assert_eq!(delta.epoch, latest.epoch);
+            assert_eq!(delta.total_points, latest.total_points);
+            assert_eq!(delta.base_offset_points, pinned.total_points);
+            assert_eq!(delta.removed_ranges, expected_removed);
+            if initially_unknown_person {
+                assert_eq!(delta.base_epoch, pinned.epoch);
+                assert!(!delta.removed_ranges.is_empty());
+                let removed_human = pinned_bytes
+                    .chunks_exact(12)
+                    .enumerate()
+                    .filter(|(index, point)| {
+                        delta.removed_ranges.chunks_exact(2).any(|range| {
+                            *index as u64 >= range[0] && (*index as u64) < range[0] + range[1]
+                        }) && pinned_human_bits.contains(&point_bits(point))
+                    })
+                    .count();
+                assert!(removed_human > 0, "删除范围必须包含首帧实际持久化的人体点");
+            } else {
+                assert!(delta.base_epoch.is_empty());
+                assert!(delta.removed_ranges.is_empty());
+            }
+            let removed: u64 = delta
+                .removed_ranges
+                .chunks_exact(2)
+                .map(|range| range[1])
+                .sum();
+            assert_eq!(delta.offset_points, pinned.total_points - removed);
+            assert_eq!(
+                delta.xyz_f32_le,
+                latest_snapshot.read(delta.offset_points, 100).unwrap()
+            );
+            let mut installed = Vec::new();
+            for (index, point) in pinned_bytes.chunks_exact(12).enumerate() {
+                if !delta
+                    .removed_ranges
+                    .chunks_exact(2)
+                    .any(|range| index as u64 >= range[0] && (index as u64) < range[0] + range[1])
+                {
+                    installed.extend_from_slice(point);
                 }
             }
-            if frame == 10 {
-                pinned = Some(GeometryRuntime::get_dense_cloud_chunk(&service, Request::new(DenseCloudChunkRequest { allow_delta: false,
-                    expected_epoch: String::new(), offset_points: 0, max_points: 10,
-                })).await.unwrap().into_inner());
+            assert_eq!(installed.len() as u64 / 12, delta.offset_points);
+            installed.extend_from_slice(&delta.xyz_f32_le);
+            let mut offset = installed.len() as u64 / 12;
+            while offset < latest.total_points {
+                let next = GeometryRuntime::get_dense_cloud_chunk(
+                    &service,
+                    Request::new(DenseCloudChunkRequest {
+                        allow_delta: true,
+                        expected_epoch: latest.epoch.clone(),
+                        offset_points: offset,
+                        max_points: crate::dense_cloud::CHUNK_POINTS as u32,
+                    }),
+                )
+                .await
+                .unwrap()
+                .into_inner();
+                assert_eq!(next.offset_points, offset);
+                assert_eq!(next.total_points, latest.total_points);
+                assert!(next.base_epoch.is_empty() && next.removed_ranges.is_empty());
+                assert!(!next.xyz_f32_le.is_empty());
+                offset += next.xyz_f32_le.len() as u64 / 12;
+                installed.extend_from_slice(&next.xyz_f32_le);
             }
+            assert_eq!(
+                installed,
+                read_all(&latest_snapshot, 0, latest_snapshot.point_count)
+            );
+            // 新拥有方具有真实非空地图，旧代际仍必须被来源身份拒绝。
+            let mut replacement = CloudMapShmWriter::new_private_for_test().unwrap();
+            assert!(replacement.begin_session(2).is_some());
+            assert!(replacement.accumulate_mapping_scan(2, &last_points, Some(ORIGIN), 2_300_000_000));
+            replacement
+                .commit_accumulated_snapshot(&OccupancyCommitReceipt {
+                    commit_id: MappingCommitId {
+                        boot_nonce: 801,
+                        sequence: 1,
+                    },
+                    session_id: format!("{name}新拥有方"),
+                    session_generation: 2,
+                    occupancy_revision: 1,
+                    source_timestamp_ns: 2_300_000_000,
+                    backend_kind: crate::mapping_backend::MappingBackendKind::Raytracing,
+                    backend_generation: 2,
+                })
+                .unwrap()
+                .unwrap();
+            *handle.cloud_map_writer.lock() = Some(replacement);
+            let rejected = GeometryRuntime::get_dense_cloud_chunk(
+                &service,
+                Request::new(DenseCloudChunkRequest {
+                    allow_delta: false,
+                    expected_epoch: pinned.epoch.clone(),
+                    offset_points: 10,
+                    max_points: 100,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert!(rejected.message().contains("DENSE_CLOUD_SOURCE_CHANGED"));
+            let fresh = GeometryRuntime::get_dense_cloud_chunk(
+                &service,
+                Request::new(DenseCloudChunkRequest {
+                    allow_delta: false,
+                    expected_epoch: String::new(),
+                    offset_points: 0,
+                    max_points: 10,
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            assert_eq!(fresh.session_generation, 2);
+            assert!(fresh.total_points > 0);
+            assert!(owner.task_owner.shutdown().await.producers_settled());
+            let _ = std::fs::remove_file(path);
         }
-        let pinned = pinned.unwrap();
-        let tail = GeometryRuntime::get_dense_cloud_chunk(&service, Request::new(DenseCloudChunkRequest { allow_delta: false,
-            expected_epoch: pinned.epoch.clone(), offset_points: 10, max_points: 100,
-        })).await.unwrap().into_inner();
-        assert_eq!(tail.epoch, pinned.epoch);
-        assert_eq!(tail.total_points, pinned.total_points);
-        assert_eq!(tail.xyz_f32_le, expected_tail);
-        let exhausted = GeometryRuntime::get_dense_cloud_chunk(&service, Request::new(DenseCloudChunkRequest { allow_delta: false,
-            expected_epoch: pinned.epoch.clone(), offset_points: pinned.total_points, max_points: 10,
-        })).await.unwrap_err();
-        assert!(exhausted.message().contains("DENSE_CLOUD_SOURCE_CHANGED"));
-        let latest = GeometryRuntime::get_dense_cloud_chunk(&service, Request::new(DenseCloudChunkRequest { allow_delta: false,
-            expected_epoch: String::new(), offset_points: 0, max_points: 10,
-        })).await.unwrap().into_inner();
-        assert_ne!(latest.epoch, pinned.epoch);
-        let delta = GeometryRuntime::get_dense_cloud_chunk(&service, Request::new(DenseCloudChunkRequest {
-            allow_delta: true, expected_epoch: pinned.epoch.clone(), offset_points: pinned.total_points, max_points: 100,
-        })).await.unwrap().into_inner();
-        assert_eq!(delta.base_epoch, pinned.epoch);
-        assert_eq!(delta.epoch, latest.epoch);
-        assert_eq!(delta.base_offset_points, pinned.total_points);
-        assert!(!delta.removed_ranges.is_empty());
-        let removed: u64 = delta.removed_ranges.chunks_exact(2).map(|range| range[1]).sum();
-        assert_eq!(delta.offset_points, pinned.total_points - removed);
-        let expected = handle.cloud_map_writer.lock().as_ref().unwrap().committed_dense_cloud().unwrap().unwrap()
-            .read(delta.offset_points, 100).unwrap();
-        assert_eq!(delta.xyz_f32_le, expected);
-        // 替换拥有方后不能用其前任的分块代际继续读取。
-        *handle.cloud_map_writer.lock() = Some(CloudMapShmWriter::new_private_for_test().unwrap());
-        assert!(GeometryRuntime::get_dense_cloud_chunk(&service, Request::new(DenseCloudChunkRequest { allow_delta: false,
-            expected_epoch: pinned.epoch, offset_points: 10, max_points: 100,
-        })).await.is_err());
-        assert!(owner.task_owner.shutdown().await.producers_settled());
-        let _ = std::fs::remove_file(path);
     }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ray_backend_checkpoint_activation_preserves_continuation_and_receipts() {
         let (source_handle, _, source_cloud_path) =

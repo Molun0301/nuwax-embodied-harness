@@ -1,10 +1,10 @@
-/* Saved-map cleanup. The slider controls evidence tolerance, not a quota. */
+/* 已保存地图清理；力度表示证据容忍度，不是删除配额。 */
 (function () {
   'use strict';
   const $ = id => document.getElementById(id);
   const panel = $('mapCleanupPanel');
   if (!panel) return;
-  const state = {job: null, epoch: 0, timer: null, source: null, candidates: null, angle: -.6, tilt: .65, zoom: 1};
+  const state = {job: null, epoch: 0, timer: null, source: null, candidates: null, previewReady: false, cancelling: null, angle: -.6, tilt: .65, zoom: 1};
   const say = text => { $('mapCleanupStatus').textContent = text; };
   async function api(path, body) {
     const response = await fetch('/api/maps/cleanup' + path, {credentials: 'same-origin',
@@ -14,16 +14,25 @@
     return value.result ?? value;
   }
   function buttons() {
-    const ready = state.job?.state === 'ready';
+    const ready = state.job?.state === 'ready' && state.previewReady;
     $('mapCleanupApply').disabled = !ready;
+    $('mapCleanupPreview').disabled = !!state.cancelling;
     $('mapCleanupCancel').disabled = !state.job || ['applied','cancelled','failed'].includes(state.job.state);
   }
   async function invalidate() {
     const old = state.job;
-    state.epoch++; state.job = null; clearTimeout(state.timer); buttons();
+    state.epoch++; state.job = null; state.previewReady = false; clearTimeout(state.timer); buttons();
     state.source = null; state.candidates = null; $('mapCleanupCanvas').hidden = true; $('mapCleanupDetails').textContent = '';
+    if (state.cancelling) return state.cancelling;
     if (old && ['queued','running','ready','cancel_error'].includes(old.state)) {
-      try { await api('/' + old.id + '/cancel', {}); } catch (error) { state.job = {...old, state: 'cancel_error'}; buttons(); say(error.message); return false; }
+      // 连续拖动力度时共用取消回执，不能让旧失败覆盖新任务。
+      state.cancelling = (async () => {
+        try { await api('/' + old.id + '/cancel', {}); return true; }
+        catch (error) { state.job = {...old, state: 'cancel_error'}; say(error.message); return false; }
+      })();
+      buttons();
+      const cancelled = await state.cancelling;
+      state.cancelling = null; buttons(); return cancelled;
     }
     return true;
   }
@@ -36,7 +45,7 @@
     const [source, candidates] = await Promise.all([points('source'), points('candidates')]);
     if (epoch !== state.epoch) return;
     state.source = source; state.candidates = candidates; state.zoom = 1;
-    $('mapCleanupCanvas').hidden = false; draw();
+    $('mapCleanupCanvas').hidden = false; draw(); state.previewReady = true; buttons();
   }
   async function poll(id, epoch) {
     try {
@@ -45,16 +54,17 @@
       state.job = job; buttons();
       if (job.state === 'ready') {
         const r = job.report;
-        say(`实际候选删除 ${r.preview.candidate_points.toLocaleString()} 个细点云体素；累计扫描点 ${r.dense_before.toLocaleString()} → ${r.dense_after.toLocaleString()}。${r.offline_note} 原图未改变。`);
+        say('计算已完成，正在读取预览点云…');
         $('mapCleanupDetails').textContent = `原图灰色，候选红色。力度 ${job.strength_percent}%。人体重判 ${r.offline_frames} 帧；回补 ${r.recovered_voxels} 个体素。拖动旋转，滚轮缩放；大图仅显示抽样，候选计数为全量。`;
         await loadPoints(job, epoch);
+        if (epoch === state.epoch) say(`实际候选删除 ${r.preview.candidate_points.toLocaleString()} 个细点云体素；累计扫描点 ${r.dense_before.toLocaleString()} → ${r.dense_after.toLocaleString()}。${r.offline_note} 原图未改变。`);
       } else if (['failed','cancelled','applied'].includes(job.state)) {
         say(job.error || (job.state === 'cancelled' ? '已取消，原图未改变。' : `已另存为 ${job.result_map}，原图保留。`));
       } else {
         say('正在用保存的累计地图计算实际候选，原图未改变…');
         state.timer = setTimeout(() => poll(id, epoch), 1000);
       }
-    } catch (error) { if (epoch === state.epoch) { say(error.message); state.job = null; buttons(); } }
+    } catch (error) { if (epoch === state.epoch) { say(error.message); state.previewReady = false; buttons(); } }
   }
   $('mapCleanupPreview').addEventListener('click', async () => {
     if (!await invalidate()) return; const epoch = state.epoch;
@@ -78,7 +88,7 @@
   $('mapCleanupCancel').addEventListener('click', async () => { if (await invalidate()) say('已请求取消预览，原图未改变。'); });
   $('mapCleanupApply').addEventListener('click', async () => {
     const job = state.job, name = $('mapCleanupNewName').value.trim();
-    if (!job || job.state !== 'ready') return;
+    if (!job || job.state !== 'ready' || !state.previewReady) return;
     if (!name || name === job.map_name) { say('请填写不同的新地图名称。'); return; }
     if (!window.confirm(`确认按当前 ${job.strength_percent}% 力度删除预览中的 ${job.report.preview.candidate_points} 个体素，并另存为“${name}”？原图“${job.map_name}”保留。`)) return;
     $('mapCleanupApply').disabled = true; $('mapCleanupCancel').disabled = true;
@@ -86,7 +96,14 @@
     try {
       state.job = await api('/' + job.id + '/apply', {new_map_name: name, confirmed: true});
       buttons(); say(`已另存为 ${state.job.result_map}，原图 ${job.map_name} 保留；未切换当前地图。`);
-    } catch (error) { say(error.message); state.job = null; buttons(); }
+    } catch (error) {
+      // 请求回执丢失或服务端拒绝时，查询原任务再决定能否重试。
+      const visible = state.previewReady; state.previewReady = false;
+      try { state.job = await api('/' + job.id); state.previewReady = visible; }
+      catch (_) { /* 保留任务标识，继续显示未确认原因。 */ }
+      buttons();
+      say(state.job?.state === 'applied' ? `已另存为 ${state.job.result_map}，原图 ${job.map_name} 保留；未切换当前地图。` : error.message);
+    }
     finally { for (const id of ['mapCleanupSource','mapCleanupStrength','mapCleanupPreview']) $(id).disabled = false; }
   });
   async function maps() {

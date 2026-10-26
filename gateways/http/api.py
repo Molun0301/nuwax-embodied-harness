@@ -860,7 +860,10 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
 
     @router.post("/api/maps/cleanup")
     async def api_map_cleanup_preview(request: Request):
-        return await run_in_threadpool(_invoke_capability, request, "preview_map_cleanup", await request.json(), unwrap=True)
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise GatewayError("清理请求必须是对象。", error_code="invalid_arguments", http_status=400)
+        return await run_in_threadpool(_invoke_capability, request, "preview_map_cleanup", payload, unwrap=True)
 
     @router.get("/api/maps/cleanup/{preview_id}")
     def api_map_cleanup_status(preview_id: str, request: Request):
@@ -873,12 +876,14 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     @router.post("/api/maps/cleanup/{preview_id}/apply")
     async def api_map_cleanup_apply(preview_id: str, request: Request):
         payload = await request.json()
+        if not isinstance(payload, dict):
+            raise GatewayError("清理请求必须是对象。", error_code="invalid_arguments", http_status=400)
         return await run_in_threadpool(_invoke_capability, request, "apply_map_cleanup",
             {**payload, "preview_id": preview_id}, unwrap=True)
 
     @router.get("/api/maps/cleanup/{preview_id}/points/{kind}")
     def api_map_cleanup_points(preview_id: str, kind: str, request: Request):
-        access_manager.authorize_capability(runtime.capability_registry.get_descriptor("get_map_cleanup"))
+        _invoke_capability(request, "get_map_cleanup", {"preview_id": preview_id}, unwrap=True)
         path = runtime.map_workspace_service.completed_cleanup().points(preview_id, kind)
         return FileResponse(path, media_type="application/octet-stream")
 

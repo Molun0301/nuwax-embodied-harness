@@ -203,6 +203,15 @@ fn replay(
         if saved.session != scans.session || saved.cloud_revision > root.revision() {
             return Err("最终位姿与保存地图不匹配".into());
         }
+        let generation = root.domain().frame_generation;
+        if !saved
+            .frame_generation
+            .map_or(generation == 0, |saved| saved == generation)
+        {
+            return Ok(Replay::Unavailable(
+                "最终位姿的地图坐标代际与保存地图不一致；本次仅分析完成地图的浮空支撑".into(),
+            ));
+        }
         poses.extend(saved.poses);
     } else if root.domain().frame_generation > 0 {
         return Ok(Replay::Unavailable(
@@ -572,11 +581,14 @@ pub(crate) fn prepare(request: &Request) -> Result<Report, String> {
         return Err("清理已取消，原图未改变".into());
     }
     // Exact preview membership is the only deletion input to the archive writer.
-    nuwax_cloud_cleanup::offline_residual_cleanup::apply_fine_with_recovery(
+    let (cache_bytes, cache_policy) = crate::pointcloud::configured_writer_cache();
+    nuwax_cloud_cleanup::offline_residual_cleanup::apply_fine_with_recovery_with_cache(
         &request.fine,
         &request.output.join("fine.bin"),
         &preview,
         &recovered_keys,
+        cache_bytes,
+        cache_policy,
     )?;
     let mut output_dense: Vec<_> = dense
         .iter()
@@ -777,6 +789,106 @@ pub(crate) fn run_requested() -> Option<Result<(), String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn final_poses_require_the_saved_map_frame_generation() {
+        use nuwax_cloud_cleanup::scan_log::{ScanLog, ScanMetadata, Session};
+        let folder = std::env::temp_dir().join(format!(
+            "neh-cleanup-final-poses-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&folder).unwrap();
+        let session = Session {
+            session_id: "位姿代际验证".into(),
+            generation: 1,
+        };
+        let identity: [f64; 16] = nalgebra::Matrix4::identity().as_slice().try_into().unwrap();
+        let mut log = ScanLog::open(&folder.join("scans"), session.clone()).unwrap();
+        log.append(
+            &ScanMetadata {
+                source_timestamp_ns: 100,
+                source_sequence: 1,
+                sensor: "lidar".into(),
+                source_generation: 1,
+                odom_from_body: identity,
+                map_from_odom: identity,
+                sensor_origin_body: None,
+                observation_minimum_range_m: None,
+                point_count: 1,
+            },
+            [[0.025, 0.025, 0.025]].into_iter(),
+            &[PointLabel::PendingNew],
+        )
+        .unwrap();
+        log.sync().unwrap();
+        for generation in [0, 2] {
+            let mut writer = nuwax_map_chunks::Writer::new(
+                nuwax_map_chunks::Repository::temporary().unwrap(),
+                0.05,
+                4 * 1024 * 1024,
+            )
+            .unwrap();
+            writer.seed_unknown([[0, 0, 0]]).unwrap();
+            let sealed = writer
+                .seal(
+                    nuwax_map_chunks::Domain {
+                        session: session.session_id.clone(),
+                        generation: 1,
+                        frame_generation: generation,
+                        producer_generation: 1,
+                    },
+                    1,
+                    100,
+                )
+                .unwrap();
+            let fine = folder.join(format!("fine-{generation}.bin"));
+            let (mut archive, _) =
+                nuwax_map_chunks::archive_file(sealed.manifest(), &sealed.repository).unwrap();
+            std::io::copy(&mut archive, &mut File::create(&fine).unwrap()).unwrap();
+            let map = CompletedMap::read(&fine).unwrap();
+            let ground = Ground::new(&map);
+            for supplied in [Some(generation), Some(1), None] {
+                let poses = folder.join(format!("poses-{generation}-{supplied:?}.json"));
+                let mut value = serde_json::json!({ "session": session, "cloud_revision": 1,
+                    "poses": [[100, identity]] });
+                if let Some(supplied) = supplied {
+                    value["frame_generation"] = supplied.into();
+                }
+                std::fs::write(&poses, serde_json::to_vec(&value).unwrap()).unwrap();
+                let output = folder.join(format!("output-{generation}-{supplied:?}"));
+                std::fs::create_dir_all(&output).unwrap();
+                let request = Request {
+                    fine: fine.clone(),
+                    dense: PathBuf::new(),
+                    output,
+                    strength_percent: 50,
+                    scan_log: Some(log.path.clone()),
+                    final_poses: Some(poses),
+                    source_timestamp_ns: 100,
+                    backend: None,
+                    occupancy: None,
+                    occupancy_descriptor: None,
+                    cancel_file: None,
+                };
+                let outcome = replay(&request, &map, &ground, &|| false).unwrap();
+                let expected =
+                    supplied == Some(generation) || (supplied.is_none() && generation == 0);
+                match outcome {
+                    Replay::Available(result) => {
+                        assert!(expected);
+                        assert!(result.complete);
+                        assert_eq!(result.frames, 1);
+                    }
+                    Replay::Unavailable(reason) => {
+                        assert!(!expected);
+                        assert!(reason.contains("代际"));
+                    }
+                }
+            }
+        }
+        drop(log);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
     #[test]
     fn historical_removed_point_must_still_pass_recovery_evidence() {
         let p = [1., 1., 1.];

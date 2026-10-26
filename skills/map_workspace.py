@@ -87,6 +87,21 @@ class _RelocalizationRecoveryOutcome:
     pending: Optional[Dict[str, object]] = None
 
 
+def _record_saved_scan_history(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        bundle = method(self, *args, **kwargs)
+        if not (bundle.metadata.get("raw_scan_history") or {}).get("complete"):
+            return bundle
+        from services.mapping.completed_cleanup import mark_saved_raw_scan_history
+        try:
+            mark_saved_raw_scan_history(bundle, self._asset_repository.current_directory(bundle.map_name))
+        except (OSError, ValueError, KeyError, TypeError):
+            LOGGER.warning("地图已保存，原始扫描暂存回收标记未写入。", exc_info=True)
+        return bundle
+    return wrapped
+
+
 class MapWorkspaceService:
     """地图资产目录与当前工作区聚合服务。"""
 
@@ -113,6 +128,9 @@ class MapWorkspaceService:
         self._state_store = state_store
         self._event_bus = event_bus
         self._auto_create_library = bool(auto_create_library)
+        self._completed_cleanup_lock = threading.RLock()
+        self._completed_cleanup = None
+        self._closed = False
         self._map_activation_execution_state = threading.local()
         self._map_activation_fence_arm_error: Optional[Dict[str, object]] = None
         with self._repository.map_activation_guard():
@@ -141,9 +159,12 @@ class MapWorkspaceService:
 
     def completed_cleanup(self):
         from services.mapping.completed_cleanup import CompletedMapCleanup
-        if not hasattr(self, "_completed_cleanup"):
-            self._completed_cleanup = CompletedMapCleanup(self)
-        return self._completed_cleanup
+        with self._completed_cleanup_lock:
+            if self._closed:
+                raise GatewayError("地图工作区正在关闭。", error_code="map_workspace_closed", http_status=409)
+            if self._completed_cleanup is None:
+                self._completed_cleanup = CompletedMapCleanup(self)
+            return self._completed_cleanup
 
     def submit_mapping_cloud_goal(
         self,
@@ -690,6 +711,7 @@ class MapWorkspaceService:
                 source="map_workspace_service", metadata={"kind": "map_asset", "map_name": name})
         return bundle
 
+    @_record_saved_scan_history
     def finalize_active_map(
         self, *, map_name: Optional[str] = None, reason: str = "",
         metadata: Optional[Dict[str, object]] = None,
@@ -851,6 +873,11 @@ class MapWorkspaceService:
     def close(self) -> Dict[str, object]:
         """保留可重启 durable owner 的 workspace 关闭入口。"""
 
+        with self._completed_cleanup_lock:
+            self._closed = True
+            cleanup = self._completed_cleanup
+        if cleanup is not None:
+            cleanup.close()
         return self.shutdown_relocalization_owner()
 
     def relocalize_active_map(

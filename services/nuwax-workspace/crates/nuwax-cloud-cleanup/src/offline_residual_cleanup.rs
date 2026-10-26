@@ -6,7 +6,7 @@
 //! to delete it. Real support and coherent static structures are checked first.
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use nalgebra::{Matrix3, SymmetricEigen, Vector3};
-use nuwax_map_chunks::{ArchiveReader, GroundRecordRef, Key, Repository, Writer};
+use nuwax_map_chunks::{ArchiveReader, CachePolicy, GroundRecordRef, Key, Repository, Writer};
 use petgraph::unionfind::UnionFind;
 use serde::{Deserialize, Serialize};
 use std::{fs::File, path::Path};
@@ -655,6 +655,25 @@ pub fn apply_fine_with_recovery(
     preview: &CleanupPreview,
     recovered: &HashSet<Key>,
 ) -> Result<usize, String> {
+    apply_fine_with_recovery_with_cache(
+        input,
+        output,
+        preview,
+        recovered,
+        32 * 1024 * 1024,
+        CachePolicy::Fixed,
+    )
+}
+
+/// 生产拥有方显式传入已解析的缓存预算与策略，地图内容及预览选择保持一致。
+pub fn apply_fine_with_recovery_with_cache(
+    input: &Path,
+    output: &Path,
+    preview: &CleanupPreview,
+    recovered: &HashSet<Key>,
+    cache_bytes: usize,
+    cache_policy: CachePolicy,
+) -> Result<usize, String> {
     if input == output {
         return Err("清理必须另存新图".into());
     }
@@ -664,7 +683,8 @@ pub fn apply_fine_with_recovery(
     if root.points() as usize != preview.source_points {
         return Err("原图已变化，请重新预览".into());
     }
-    let mut writer = Writer::new(repository, root.voxel_size_m(), 32 * 1024 * 1024)?;
+    let mut writer = Writer::new(repository, root.voxel_size_m(), cache_bytes)?;
+    writer.set_cache_policy(cache_policy)?;
     writer.restore_archived(&root)?;
     writer.remove(preview.removed_keys.iter().copied())?;
     writer.seed_unknown(recovered.iter().copied())?;
@@ -877,6 +897,96 @@ mod tests {
             preview.removed_keys
         );
     }
+    #[test]
+    fn configured_cleanup_cache_preserves_selected_keys_and_recovery() {
+        let folder = std::env::temp_dir().join(format!(
+            "neh-cleanup-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&folder).unwrap();
+        let repository = Repository::temporary().unwrap();
+        let mut writer = Writer::new(repository, 0.05, 4 * 1024 * 1024).unwrap();
+        writer
+            .seed_unknown([[0, 0, 0], [1, 0, 0], [2, 0, 0]])
+            .unwrap();
+        let sealed = writer
+            .seal(
+                nuwax_map_chunks::Domain {
+                    session: "清理缓存验证".into(),
+                    generation: 1,
+                    frame_generation: 0,
+                    producer_generation: 1,
+                },
+                1,
+                100,
+            )
+            .unwrap();
+        let (mut archive, _) =
+            nuwax_map_chunks::archive_file(sealed.manifest(), &sealed.repository).unwrap();
+        let input = folder.join("source.bin");
+        std::io::copy(&mut archive, &mut File::create(&input).unwrap()).unwrap();
+        let original = std::fs::read(&input).unwrap();
+        let preview = CleanupPreview {
+            settings: CleanupSettings::default(),
+            gap_tolerance_m: 0.175,
+            source_points: 3,
+            candidate_points: 1,
+            measured_ground_points: 0,
+            components: vec![],
+            removed_keys: vec![[1, 0, 0]],
+        };
+        let recovered = HashSet::from([[3, 0, 0]]);
+        for (index, budget, policy) in [
+            (0, 4, CachePolicy::Fixed),
+            (1, 64, CachePolicy::Fixed),
+            (
+                2,
+                4,
+                CachePolicy::Auto {
+                    max_bytes: 128 * 1024 * 1024,
+                },
+            ),
+        ] {
+            let output = folder.join(format!("cleaned-{index}.bin"));
+            assert_eq!(
+                apply_fine_with_recovery_with_cache(
+                    &input,
+                    &output,
+                    &preview,
+                    &recovered,
+                    budget * 1024 * 1024,
+                    policy
+                )
+                .unwrap(),
+                3
+            );
+            let map = CompletedMap::read(&output).unwrap();
+            assert_eq!(
+                map.keys.into_iter().collect::<HashSet<_>>(),
+                HashSet::from([[0, 0, 0], [2, 0, 0], [3, 0, 0]])
+            );
+        }
+        let invalid = folder.join("invalid-policy.bin");
+        assert!(apply_fine_with_recovery_with_cache(
+            &input,
+            &invalid,
+            &preview,
+            &recovered,
+            8 * 1024 * 1024,
+            CachePolicy::Auto {
+                max_bytes: 4 * 1024 * 1024
+            }
+        )
+        .is_err());
+        assert!(!invalid.exists(), "无效缓存策略必须在写出制品之前报告");
+        assert_eq!(std::fs::read(input).unwrap(), original);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
     #[test]
     fn asset_key_uses_the_stored_f32_quantum() {
         let q = 0.05_f32;

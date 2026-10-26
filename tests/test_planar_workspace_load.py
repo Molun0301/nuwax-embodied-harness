@@ -113,7 +113,7 @@ class WorkspaceLoadTests(assets.AssetCatalogTests):
 
     def test_finalize_new_planar_dispatches_assigned_entry(self):
         owner, name = self.prepare_finalization_owner()
-        marker = object()
+        marker = assets.MapAssetBundle(map_name=name, source_name="fixture", frame_id="map", snapshot=assets.snapshot(name))
         with patch.object(save, 'finalize_assigned_cloud_map', return_value=marker) as called:
             self.assertIs(owner.finalize_active_map(map_name=name, _save_operation_id='save:one'), marker)
         self.assertEqual(called.call_count, 1)
@@ -124,7 +124,7 @@ class WorkspaceLoadTests(assets.AssetCatalogTests):
     def test_finalize_existing_planar_dispatches_new_operation_continuation(self):
         owner, name = self.prepare_finalization_owner(existing=True)
         previous = self.catalog.get_map_asset(name).asset_identity
-        marker = object()
+        marker = assets.MapAssetBundle(map_name=name, source_name="fixture", frame_id="map", snapshot=assets.snapshot(name))
         with patch.object(save, 'finalize_assigned_cloud_map', return_value=marker) as called:
             self.assertIs(owner.finalize_active_map(map_name=name, _save_operation_id='save:two'), marker)
         self.assertEqual(called.call_count, 1)
@@ -134,7 +134,7 @@ class WorkspaceLoadTests(assets.AssetCatalogTests):
     def test_finalize_no_operation_id_keeps_planar_continuation(self):
         owner, name = self.prepare_finalization_owner(existing=True)
         previous = self.catalog.get_map_asset(name).asset_identity
-        marker = object()
+        marker = assets.MapAssetBundle(map_name=name, source_name="fixture", frame_id="map", snapshot=assets.snapshot(name))
         with patch.object(save, 'finalize_assigned_cloud_map', return_value=marker) as called:
             self.assertIs(owner.finalize_active_map(map_name=name), marker)
         self.assertEqual(called.call_args.kwargs['expected_previous_identity'], previous)

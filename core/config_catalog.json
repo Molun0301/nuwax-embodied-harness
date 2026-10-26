@@ -2541,5 +2541,38 @@
     "default": 256,
     "minimum": 32,
     "description": "自动模式下每个写入器的增长上限，单位 MiB（二进制兆字节），填 32～4096 的整数；留空使用 256。在线建图与 PGO（位姿图优化）重放各自独立遵守上限，二者同时存在时不能把此值当作合计内存上限。固定模式忽略此项。"
+  },
+  "NUWAX_RAW_SCAN_DIRECTORY": {
+    "section_id": "geometry_quality",
+    "target_file": "core_env",
+    "advanced": true,
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/dynamic_cloud.rs",
+      "services/geometry/nuwax_geometry_runtime/src/lcm_runtime.rs",
+      "services/mapping/completed_cleanup.py"
+    ],
+    "apply_scope": "重启网关和几何运行时后生效",
+    "effective_value_scope": "external_process",
+    "zh_name": "原始扫描暂存目录",
+    "type": "str",
+    "default": "",
+    "description": "保存完成地图清理所需的原始扫描与最终位姿。留空使用运行数据根目录下的 scan_logs；相对路径按项目工作目录解析。已发布地图的完整副本单独保存在地图资产包内。仅在会话已保存完整副本且写入器关闭后，后续会话才回收该暂存。"
+  },
+  "NUWAX_RAW_SCAN_MAX_MIB": {
+    "section_id": "geometry_quality",
+    "target_file": "core_env",
+    "advanced": true,
+    "consumers": [
+      "services/geometry/nuwax_geometry_runtime/src/main.rs",
+      "services/nuwax-workspace/crates/nuwax-cloud-cleanup/src/scan_log.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效",
+    "effective_value_scope": "external_process",
+    "zh_name": "原始扫描暂存目录上限（MiB）",
+    "type": "int",
+    "default": 8192,
+    "minimum": 64,
+    "maximum": 1048576,
+    "description": "原始扫描和最终位姿共用的磁盘预算，单位 MiB（二进制兆字节），默认8192，允许64～1048576。达到上限或写入失败后，本会话停止辅助扫描记录并明确标记离线重判不完整，在线建图继续。未固化的现场扫描保留；已有资产包副本由地图管理负责。"
   }
 }

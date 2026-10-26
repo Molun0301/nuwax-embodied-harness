@@ -1231,8 +1231,21 @@ fn print_requested_release_artifacts() -> Option<ExitCode> {
     }
 }
 
+fn configure_pointcloud_storage() -> Result<(), String> {
+    nuwax_cloud_cleanup::scan_log::storage_budget_bytes()?;
+    let env_text = |name: &str| match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} 不是有效的 UTF-8 文本")),
+    };
+    let fine_cloud_cache = env_text(pointcloud::FINE_CLOUD_CACHE_MIB_VAR)
+        .and_then(|mode| Ok((mode, env_text(pointcloud::FINE_CLOUD_CACHE_AUTO_MAX_VAR)?)))
+        .and_then(|(mode, auto_max)| pointcloud::parse_fine_cloud_cache(mode.as_deref(), auto_max.as_deref()))
+        .and_then(pointcloud::configure_fine_cloud_cache);
+    fine_cloud_cache
+}
+
 fn main() -> ExitCode {
-    if let Some(result)=completed_cleanup::run_requested(){return match result{Ok(())=>ExitCode::SUCCESS,Err(e)=>{eprintln!("{e}");ExitCode::FAILURE}};}
 
     nuwax_core::logging::init_component_logging(
         "nuwax-geometry-runtime",
@@ -1257,6 +1270,21 @@ fn main() -> ExitCode {
             Err(error) => {
                 error!(event = "process.failed", "{error}");
                 ExitCode::from(1)
+            }
+        };
+    }
+
+    // 在线拥有方与离线清理必须在创建写入器之前使用同一份缓存配置。
+    if let Err(error) = configure_pointcloud_storage() {
+        error!(event = "process.failed", "点云存储配置无效: {error}");
+        return ExitCode::from(2);
+    }
+    if let Some(result) = completed_cleanup::run_requested() {
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                error!(event = "process.failed", "{error}");
+                ExitCode::FAILURE
             }
         };
     }
@@ -1341,21 +1369,6 @@ async fn run(lcm_backend: lcm_runtime::LcmBackendKind, preflight: StartupPreflig
             std::env::var("NUWAX_RUNTIME_DATA_DIR").unwrap_or_else(|_| "runtime_data".into());
         format!("{runtime_dir}/geometry/nuwax_geometry_runtime.ready")
     });
-
-    // 精细点云写入器缓存预算：非法值启动即退出，错误写明变量名与合法范围。
-    let env_text = |name: &str| match std::env::var(name) {
-        Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} 不是有效的 UTF-8 文本")),
-    };
-    let fine_cloud_cache = env_text(pointcloud::FINE_CLOUD_CACHE_MIB_VAR)
-        .and_then(|mode| Ok((mode, env_text(pointcloud::FINE_CLOUD_CACHE_AUTO_MAX_VAR)?)))
-        .and_then(|(mode, auto_max)| pointcloud::parse_fine_cloud_cache(mode.as_deref(), auto_max.as_deref()))
-        .and_then(pointcloud::configure_fine_cloud_cache);
-    if let Err(e) = fine_cloud_cache {
-        error!("精细点云写入器缓存配置无效: {e}");
-        return ExitCode::from(2);
-    }
 
     if let Err(e) = remove_ready_file(&ready_path) {
         error!("清理旧 ready file 失败: {:?}", e);

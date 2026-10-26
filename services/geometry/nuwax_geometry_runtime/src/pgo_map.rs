@@ -443,8 +443,7 @@ impl ReplayBuilder {
             mapping_backend::validate_backend_input(&self.kernel, &input)?;
             self.kernel_time += validation_started.elapsed();
             let use_parallel = self.cloud_worker.is_some()
-                || (self.background
-                    && self.background_parallel_available
+                || (self.background_parallel_available
                     && self.processed >= 8
                     && self.kernel_time.as_nanos() / self.processed as u128 >= 250_000
                     && self.cloud_time.as_nanos() / self.processed as u128 >= 250_000);
@@ -822,6 +821,9 @@ pub(crate) fn rebuild(
         let mut builder = ReplayBuilder::new(
             &scans, trajectory, anchor, spec, config, frame_id, budget, &cancelled,
         )?;
+        // 同步调用仍检查原截止时间；只复用既有两路私有阶段，不切换成无总时限后台模式。
+        builder.background_parallel_available =
+            std::thread::available_parallelism().is_ok_and(|count| count.get() >= 4);
         let appended = builder.append(&scans, &cancelled);
         processed = builder.processed;
         kernel_time = builder.kernel_time;
@@ -838,6 +840,12 @@ pub(crate) fn rebuild(
             }
         }
     })();
+    #[cfg(test)]
+    if std::env::var_os("NUWAX_PGO_BUDGET_DIAGNOSTIC").is_some() {
+        eprintln!("REBUILD_BUDGET frames={frames} processed={processed} kernel_ms={} cloud_ms={} elapsed_ms={} threads={} result={:?}",
+            kernel_time.as_millis(), cloud_time.as_millis(), started.elapsed().as_millis(),
+            rayon::current_num_threads(), result.as_ref().err());
+    }
     tracing::info!(event = "pgo.map.rebuilt", frames, processed,
         kernel_ms = kernel_time.as_millis() as u64, cloud_ms = cloud_time.as_millis() as u64,
         elapsed_ms = started.elapsed().as_millis() as u64, success = result.is_ok(),
@@ -1189,6 +1197,31 @@ mod tests {
         (scans, trajectory)
     }
 
+    /// 用在线拥有方相同的分类和点云接纳准备冻结决策，准备成本与重放分开报告。
+    fn classify_recorded_input(scans: &mut [ArchivedScan]) {
+        use crate::admitted_cloud::AcceptedMappingCloud;
+        use crate::lio_ingress::AcceptedRegisteredCloud;
+        let mut cloud = CloudMapShmWriter::new_private().unwrap();
+        cloud.begin_session(1).unwrap();
+        let started = Instant::now();
+        for (index, scan) in scans.iter_mut().enumerate() {
+            let points: Vec<_> = scan.body_points.iter().map(|p| scan.odom_from_body * p).collect();
+            let mut binding = test_binding();
+            binding.cloud_source_sequence = index as i64 + 1;
+            binding.frozen_odom_from_body = scan.odom_from_body;
+            binding.sensor_origin_map = scan.sensor_origin_body.map(|p| (scan.odom_from_body * p).coords.into());
+            let accepted = AcceptedMappingCloud::from(AcceptedRegisteredCloud::from_map_points_for_test(
+                points.clone(), scan.source_timestamp_ns, scan.received_at_ns, "map", "body", binding));
+            cloud.classify_admitted_scan(accepted.lidar().unwrap()).unwrap();
+            assert!(cloud.accumulate_mapping_scan_with_source(1, &points,
+                accepted.lidar().unwrap().scan().binding().sensor_origin_map, scan.source_timestamp_ns, Some(&accepted)));
+            scan.source = accepted.source();
+            assert!(scan.source.lidar().unwrap().dynamic_frame().is_some());
+        }
+        eprintln!("CLASSIFY_PREP frames={} wall_ms={}", scans.len(), started.elapsed().as_millis());
+        cloud.cleanup_product_owned_file().unwrap();
+    }
+
     /// 真实规模基准：NUWAX_PGO_RECORDED_SCANS 指向实录配对扫描，NUWAX_PGO_RECORDED_FRAMES 为帧数，
     /// NUWAX_PGO_SENSOR_ORIGIN_BODY 为雷达在机体系的原点（JSON数组）。分别测开启与关闭地面捕获。
     #[test]
@@ -1200,7 +1233,8 @@ mod tests {
             .expect("指定雷达机体原点")).unwrap();
         let captures: Vec<bool> = std::env::var("NUWAX_PGO_CAPTURE_MODES").ok()
             .map(|v| v.split(',').map(|m| m == "on").collect()).unwrap_or_else(|| vec![true, false]);
-        let (scans, trajectory) = recorded_input(&path, frames, origin);
+        let (mut scans, trajectory) = recorded_input(&path, frames, origin);
+        classify_recorded_input(&mut scans);
         let points: usize = scans.iter().map(|scan| scan.body_points.len()).sum();
         let config = MappingBackendComputeConfig { resolution: 0.05, initial_safe_radius_meters: 0.0,
             window_capacity: nuwax_mapping::mapping_session::DEFAULT_BOUNDED_CAPACITY };
@@ -1222,13 +1256,21 @@ mod tests {
                 let mut result = Ok(());
                 for chunk in scans.chunks(100) {
                     let (kernel, cloud) = (builder.kernel_time, builder.cloud_time);
+                    let segment_started = Instant::now();
+                    let segment_cpu = process_cpu_ms();
                     result = builder.append(chunk, &|| false);
                     if result.is_err() { break; }
                     let count = chunk.len() as f64;
-                    eprintln!("REAL_SEGMENT backend={backend} capture={capture} frames={} kernel_ms={:.2} cloud_ms={:.2}", builder.processed,
-                        (builder.kernel_time - kernel).as_secs_f64() * 1e3 / count, (builder.cloud_time - cloud).as_secs_f64() * 1e3 / count);
+                    eprintln!("REAL_SEGMENT backend={backend} capture={capture} frames={} kernel_ms={:.2} cloud_ms={:.2} wall_ms={:.2} cpu_ms={:.2}", builder.processed,
+                        (builder.kernel_time - kernel).as_secs_f64() * 1e3 / count, (builder.cloud_time - cloud).as_secs_f64() * 1e3 / count,
+                        segment_started.elapsed().as_secs_f64() * 1e3 / count, (process_cpu_ms() - segment_cpu) / count);
                 }
                 let result = result.and_then(|()| builder.prepare(&|| false));
+                if let Ok(prepared) = &result {
+                    let hash = |bytes: &[u8]| bytes.iter().fold(0xcbf29ce484222325_u64, |h,b| (h ^ u64::from(*b)).wrapping_mul(0x100000001b3));
+                    eprintln!("REAL_DIGEST backend={backend} capture={capture} checkpoint={:016x} cloud={:016x}",
+                        hash(&prepared.backend_checkpoint), hash(&prepared.cloud.xyz_f32_le));
+                }
                 eprintln!("REAL_SCALE backend={backend} capture={capture} frames={} points={points} processed={} kernel_ms={} cloud_ms={} wall_ms={} cpu_ms={:.0} cloud_points={:?} result={:?}",
                     scans.len(), builder.processed, builder.kernel_time.as_millis(), builder.cloud_time.as_millis(),
                     builder.started.elapsed().as_millis(), process_cpu_ms() - cpu, result.as_ref().ok().map(|p| p.cloud.point_count), result.as_ref().err());
@@ -1254,9 +1296,14 @@ mod tests {
         let (scans, _) = recorded_input(&path, frames, origin);
         for capture in captures {
             let mut cloud = CloudMapShmWriter::new_private().unwrap();
+            cloud.begin_session(1).unwrap();
             let (mut segment, mut worst, mut total) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
             let mut stages = [0.0; 3];
             let mut segment_cpu = process_cpu_ms();
+            let config = MappingBackendComputeConfig { resolution: 0.05, initial_safe_radius_meters: 0.0,
+                window_capacity: nuwax_mapping::mapping_session::DEFAULT_BOUNDED_CAPACITY };
+            let mut kernel = MappingBackendSpec::Voxel.into_kernel(config.window_capacity);
+            let (mut classify_ms, mut kernel_ms) = (0.0, 0.0);
             for (index, scan) in scans.iter().enumerate() {
                 let map_points: Vec<_> = scan.body_points.iter().map(|p| scan.odom_from_body * p).collect();
                 let origin_body = scan.sensor_origin_body.expect("实录基准的每帧都带实测雷达原点");
@@ -1268,6 +1315,17 @@ mod tests {
                 let accepted = AcceptedMappingCloud::from(AcceptedRegisteredCloud::from_map_points_for_test(
                     map_points.clone(), scan.source_timestamp_ns, scan.source_timestamp_ns, "map", "body", binding));
                 let started = Instant::now();
+                let classify_started = Instant::now();
+                let frame = cloud.classify_admitted_scan(accepted.lidar().unwrap()).unwrap();
+                classify_ms += classify_started.elapsed().as_secs_f64() * 1e3;
+                let input = MappingBackendInput { session_id: "online-cost".into(), session_generation: 1,
+                    backend_generation: 1, frame_sequence: index as u64 + 1, source_timestamp_ns: scan.source_timestamp_ns,
+                    received_at_ns: scan.received_at_ns, registered_frame_id: "map".into(), sensor_origin_map: sensor_origin,
+                    dynamic_frame: Some(frame), registered_points_map: map_points.clone() };
+                let kernel_started = Instant::now();
+                mapping_backend::validate_backend_input(&kernel, &input).unwrap();
+                mapping_backend::compute_candidate_in_place(&mut kernel, &input, config).unwrap();
+                kernel_ms += kernel_started.elapsed().as_secs_f64() * 1e3;
                 assert!(cloud.accumulate_mapping_scan_with_source(1, &map_points, Some(sensor_origin),
                     scan.source_timestamp_ns, capture.then_some(&accepted)));
                 let elapsed = started.elapsed();
@@ -1278,10 +1336,12 @@ mod tests {
                 if (index + 1) % 100 == 0 || index + 1 == scans.len() {
                     let count = (index % 100 + 1) as f64;
                     let cpu = process_cpu_ms();
-                    eprintln!("ONLINE capture={capture} frames={} segment_mean_ms={:.2} segment_cpu_ms={:.2} segment_max_ms={:.2} total_mean_ms={:.2} fine/dense/voxel_ms={:.2}/{:.2}/{:.2}",
+                    eprintln!("ONLINE capture={capture} frames={} segment_mean_ms={:.2} segment_cpu_ms={:.2} segment_max_ms={:.2} total_mean_ms={:.2} fine/dense/voxel_ms={:.2}/{:.2}/{:.2} classify_ms={:.2} kernel_ms={:.2}",
                         index + 1, segment.as_secs_f64() * 1e3 / count, (cpu - segment_cpu) / count, worst.as_secs_f64() * 1e3,
                         total.as_secs_f64() * 1e3 / (index + 1) as f64,
-                        stages[0] / count, stages[1] / count, stages[2] / count);
+                        stages[0] / count, stages[1] / count, stages[2] / count, classify_ms / count, kernel_ms / count);
+                    classify_ms = 0.0;
+                    kernel_ms = 0.0;
                     segment_cpu = cpu;
                     stages = [0.0; 3];
                     segment = Duration::ZERO;

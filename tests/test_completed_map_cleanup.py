@@ -24,8 +24,8 @@ from services.mapping.catalog import MapCatalogRepository
 from services.mapping.completed_cleanup import CompletedMapCleanup, copy_raw_scan_history
 
 
-def fine_bytes(revision):
-    root = dict(version=2, domain=dict(session='source', generation=3, frame_generation=0, producer_generation=8),
+def fine_bytes(revision, frame_generation=0):
+    root = dict(version=2, domain=dict(session='source', generation=3, frame_generation=frame_generation, producer_generation=8),
         revision=revision, geometry_revision=revision, source_timestamp_ns=11, voxel_size_m=.125,
         blocks=[dict(key=[0, 0, 0], points=1, object=dict(kind='assigned', value=[40]*16),
                      block_revision=7, geometry_revision=7)])
@@ -155,7 +155,7 @@ def test_cancel_never_writes_source_or_publishes_map(tmp_path):
 
 def test_raw_scan_capture_stops_at_saved_timestamp_and_keeps_original_indexes(tmp_path):
     source=tmp_path/'logs';source.mkdir();target=tmp_path/'saved';target.mkdir()
-    checkpoint=SimpleNamespace(source_session_id='test',source_session_generation=3,cloud_receipt={'source_timestamp_ns':20,'cloud_revision':2})
+    checkpoint=SimpleNamespace(source_session_id='test',source_session_generation=3,cloud_receipt={'source_timestamp_ns':20,'cloud_revision':2},fine_archive=None)
     stem=hashlib.sha256(b'test:3').hexdigest()
     def header(value):
         b=json.dumps(value).encode();return struct.pack('<I',len(b))+b
@@ -164,7 +164,8 @@ def test_raw_scan_capture_stops_at_saved_timestamp_and_keeps_original_indexes(tm
     for stamp in [10,20,30]:
         frames.append(header({'source_timestamp_ns':stamp,'point_count':2})+struct.pack('<dddddd',1,2,3,1,2,3)+b'\x04\x06')
     (source/(stem+'.scan')).write_bytes(initial+b''.join(frames))
-    with patch.dict(os.environ,NUWAX_RAW_SCAN_DIRECTORY=str(source)):
+    with patch.dict(os.environ,NUWAX_RAW_SCAN_DIRECTORY=str(source)), patch.object(
+            hashlib, 'sha256', side_effect=AssertionError('扫描读取不能重算拥有方文件名摘要')):
         report=copy_raw_scan_history(checkpoint,target)
     assert report['complete'] and report['frames']==2
     assert (target/'raw-scans.scan').read_bytes()==initial+b''.join(frames[:2])
@@ -280,3 +281,129 @@ def test_live_mapping_must_finish_before_preview(tmp_path):
         service.start(map_name='original',strength_percent=50)
     assert not service.jobs
     service.executor.shutdown(wait=True)
+
+
+def test_broken_raw_scan_does_not_abort_map_save_or_leave_partial_asset(tmp_path, monkeypatch):
+    source = tmp_path / '扫描'; source.mkdir()
+    target = tmp_path / '资产'; target.mkdir()
+    checkpoint = SimpleNamespace(source_session_id='broken', source_session_generation=1,
+        cloud_receipt={'source_timestamp_ns': 20, 'cloud_revision': 2})
+    stem = hashlib.sha256(b'broken:1').hexdigest()
+    (source / (stem + '.scan')).write_bytes(b'NEHSCAN1\x04')
+    monkeypatch.setenv('NUWAX_RAW_SCAN_DIRECTORY', str(source))
+    result = copy_raw_scan_history(checkpoint, target)
+    assert result['complete'] is False
+    assert '不完整' in result['note']
+    assert not list(target.iterdir())
+
+
+def test_incomplete_history_is_not_sent_to_native_worker(tmp_path):
+    owner = fixture(tmp_path)
+    original = owner.get_map_asset_bundle(map_name='original')
+    original = type(original)(**{**{key: getattr(original, key) for key in type(original).model_fields},
+        'metadata': {'raw_scan_history': {'complete': False, 'path': 'missing.scan', 'note': '磁盘写入失败'}}})
+    service = CompletedMapCleanup(owner)
+    with patch.object(owner, 'get_map_asset_bundle', return_value=original), patch.object(service.executor, 'submit'):
+        status = service.start(map_name='original')
+    request = json.loads((service.jobs[status['id']]['folder'] / 'request.json').read_text())
+    assert request['scan_log'] is None and request['final_poses'] is None
+    service.close()
+
+
+def test_cleanup_close_stops_real_worker_and_revokes_new_jobs(tmp_path):
+    import sys
+    import time
+    owner = fixture(tmp_path)
+    worker = tmp_path / '清理工作进程'
+    worker.write_text(f'#!{sys.executable}\nimport time\ntime.sleep(60)\n')
+    worker.chmod(0o755)
+    owner._geometry_runtime.config.runtime_binary = str(worker)
+    service = CompletedMapCleanup(owner)
+    status = service.start(map_name='original')
+    deadline = time.monotonic() + 3
+    while service.process is None and time.monotonic() < deadline:
+        time.sleep(.01)
+    process = service.process
+    assert process is not None
+    folder = service.jobs[status['id']]['folder']
+    service.close()
+    assert process.poll() is not None
+    assert service.status(status['id'])['state'] == 'cancelled'
+    assert not folder.exists()
+    with pytest.raises(Exception, match='关闭'):
+        service.start(map_name='original')
+
+
+def test_saved_scan_marker_requires_published_complete_copy(tmp_path, monkeypatch):
+    from services.mapping.completed_cleanup import mark_saved_raw_scan_history
+    root = tmp_path / '扫描'; root.mkdir()
+    saved = tmp_path / '地图'; saved.mkdir()
+    monkeypatch.setenv('NUWAX_RAW_SCAN_DIRECTORY', str(root))
+    session = {'session_id': 'test', 'generation': 2}
+    history = {'session': session, 'bytes': 5, 'path': 'raw-scans.scan', 'complete': True,
+        'session_file': hashlib.sha256(b'test:2').hexdigest() + '.scan'}
+    (saved / history['path']).write_bytes(b'12345')
+    bundle = SimpleNamespace(metadata={'raw_scan_history': history})
+    with patch.object(hashlib, 'sha256', side_effect=AssertionError('回收标记不能重算文件名摘要')):
+        mark_saved_raw_scan_history(bundle, saved)
+    marker = root / (hashlib.sha256(b'test:2').hexdigest() + '.saved')
+    assert marker.read_text() == '5'
+    marker.unlink()
+    history['complete'] = False
+    mark_saved_raw_scan_history(bundle, saved)
+    assert not marker.exists()
+
+
+def test_failed_pgo_without_failure_marker_cannot_use_stale_trajectory(tmp_path, monkeypatch):
+    root = tmp_path / '扫描'; root.mkdir()
+    target = tmp_path / '地图'; target.mkdir()
+    stem = hashlib.sha256(b'poses:2').hexdigest()
+    session = {'session_id': 'poses', 'generation': 2}
+    def record(value):
+        data = json.dumps(value).encode()
+        return struct.pack('<I', len(data)) + data
+    (root / (stem + '.scan')).write_bytes(b'NEHSCAN1' + record(session) +
+        record({'source_timestamp_ns': 10, 'point_count': 1}) + struct.pack('<dddB', 1., 2., 3., 7))
+    (root / (stem + '-poses-1.json')).write_text(json.dumps({'session': session, 'cloud_revision': 1, 'frame_generation': 1, 'poses': []}))
+    checkpoint = SimpleNamespace(source_session_id='poses', source_session_generation=2,
+        cloud_receipt={'source_timestamp_ns': 10, 'cloud_revision': 2}, fine_archive=fine_bytes(2, frame_generation=2))
+    monkeypatch.setenv('NUWAX_RAW_SCAN_DIRECTORY', str(root))
+    result = copy_raw_scan_history(checkpoint, target)
+    assert result['complete'] is False
+    assert '最终位姿' in result['note']
+    assert 'final_poses' not in result
+    assert not (target / 'final-poses.json').exists()
+
+
+def test_cleanup_close_waits_for_admitted_preview_preparation(tmp_path):
+    import threading
+    import time
+    owner = fixture(tmp_path)
+    service = CompletedMapCleanup(owner)
+    entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+    source = owner.get_map_asset_bundle(map_name='original')
+    def blocked_source(**kwargs):
+        entered.set()
+        assert release.wait(3)
+        return source
+    owner.get_map_asset_bundle = blocked_source
+    errors = []
+    def start():
+        try:
+            service.start(map_name='original')
+        except Exception as error:
+            errors.append(error)
+    started = threading.Thread(target=start)
+    closing = threading.Thread(target=lambda: (service.close(), closed.set()))
+    started.start()
+    assert entered.wait(3)
+    closing.start()
+    deadline = time.monotonic() + 3
+    while not service.closed and time.monotonic() < deadline:
+        time.sleep(.01)
+    assert service.closed and not closed.is_set()
+    release.set()
+    started.join(3); closing.join(3)
+    assert closed.is_set() and not started.is_alive() and not closing.is_alive()
+    assert len(errors) == 1 and '关闭' in str(errors[0])
+    assert not service.jobs and not list(service.root.iterdir())

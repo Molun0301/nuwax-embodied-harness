@@ -1235,8 +1235,9 @@ impl MappingBackendSpec {
         match self {
             Self::SlamToolbox => unreachable!("二维进程不能进入点云内核"),
             Self::Voxel => MappingKernel::Voxel(VoxelKernel {
-                current_window: VecDeque::new(),
+                current_window: VoxelWindow::default(),
                 window_cells: Default::default(),
+                window_point_indices: Default::default(),
                 capacity: window_capacity,
                 last_candidate_point_count: 0,
                 last_candidate_received_at_ns: 0,
@@ -1331,11 +1332,110 @@ impl MappingKernel {
     }
 }
 
+const NO_WINDOW_SLOT: u32 = u32::MAX;
+
+#[derive(Clone, Debug)]
+struct VoxelWindowNode {
+    point: Point3<f64>,
+    previous: u32,
+    next: u32,
+}
+
+/// 有界稳定槽位；顺序链只记录有效点，空槽复用，不把派生槽号写入检查点。
+#[derive(Clone, Debug)]
+struct VoxelWindow {
+    slots: Vec<VoxelWindowNode>,
+    free: Vec<u32>,
+    first: u32,
+    last: u32,
+    len: usize,
+}
+impl Default for VoxelWindow {
+    fn default() -> Self {
+        Self { slots: Vec::new(), free: Vec::new(), first: NO_WINDOW_SLOT,
+            last: NO_WINDOW_SLOT, len: 0 }
+    }
+}
+impl VoxelWindow {
+    fn len(&self) -> usize { self.len }
+    fn is_empty(&self) -> bool { self.len == 0 }
+    fn try_reserve_exact(&mut self, additional: usize) -> Result<(), std::collections::TryReserveError> {
+        self.slots.try_reserve_exact(additional)
+    }
+    fn point(&self, slot: u32) -> &Point3<f64> { &self.slots[slot as usize].point }
+    fn push_back(&mut self, point: Point3<f64>) -> u32 {
+        let node = VoxelWindowNode { point, previous: self.last, next: NO_WINDOW_SLOT };
+        let slot = if let Some(slot) = self.free.pop() {
+            self.slots[slot as usize] = node;
+            slot
+        } else {
+            let slot = self.slots.len() as u32;
+            self.slots.push(node);
+            slot
+        };
+        if self.last == NO_WINDOW_SLOT { self.first = slot; }
+        else { self.slots[self.last as usize].next = slot; }
+        self.last = slot;
+        self.len += 1;
+        slot
+    }
+    fn remove(&mut self, slot: u32) -> Point3<f64> {
+        let VoxelWindowNode { point, previous, next } = self.slots[slot as usize];
+        if previous == NO_WINDOW_SLOT { self.first = next; }
+        else { self.slots[previous as usize].next = next; }
+        if next == NO_WINDOW_SLOT { self.last = previous; }
+        else { self.slots[next as usize].previous = previous; }
+        self.len -= 1;
+        self.free.push(slot);
+        point
+    }
+    fn indexed_iter(&self) -> VoxelWindowIter<'_> {
+        VoxelWindowIter { window: self, next: self.first, remaining: self.len }
+    }
+    fn iter(&self) -> impl ExactSizeIterator<Item = &Point3<f64>> {
+        self.indexed_iter().map(|(_, point)| point)
+    }
+    fn retain(&mut self, mut keep: impl FnMut(&Point3<f64>) -> bool) {
+        let mut slot = self.first;
+        while slot != NO_WINDOW_SLOT {
+            let next = self.slots[slot as usize].next;
+            if !keep(self.point(slot)) { self.remove(slot); }
+            slot = next;
+        }
+    }
+}
+struct VoxelWindowIter<'a> { window: &'a VoxelWindow, next: u32, remaining: usize }
+impl<'a> Iterator for VoxelWindowIter<'a> {
+    type Item = (u32, &'a Point3<f64>);
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next == NO_WINDOW_SLOT { return None; }
+        let slot = self.next;
+        let node = &self.window.slots[slot as usize];
+        self.next = node.next;
+        self.remaining -= 1;
+        Some((slot, &node.point))
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) { (self.remaining, Some(self.remaining)) }
+}
+impl ExactSizeIterator for VoxelWindowIter<'_> {}
+impl FromIterator<Point3<f64>> for VoxelWindow {
+    fn from_iter<T: IntoIterator<Item=Point3<f64>>>(points: T) -> Self {
+        let mut window = Self::default();
+        for point in points { window.push_back(point); }
+        window
+    }
+}
+impl PartialEq<VecDeque<Point3<f64>>> for VoxelWindow {
+    fn eq(&self, other: &VecDeque<Point3<f64>>) -> bool { self.iter().eq(other.iter()) }
+}
+
 #[derive(Clone)]
 pub(crate) struct VoxelKernel {
-    current_window: VecDeque<Point3<f64>>,
-    // 窗口内各动态清除格的点数，与 current_window 同步维护；落不进格的点不会被清除，不计入。
+    current_window: VoxelWindow,
+    // 与窗口同步计数；不能量化的点放入保留键，带坐标变换的清除必须回退逐点。
     window_cells: ahash::AHashMap<crate::dynamic_scene::Cell, u32>,
+    // 单格内按到达顺序保存稳定槽号，只在实际删除或容量淘汰时移除对应槽。
+    window_point_indices: ahash::AHashMap<crate::dynamic_scene::Cell, VecDeque<u32>>,
     capacity: usize,
     last_candidate_point_count: usize,
     last_candidate_received_at_ns: u64,
@@ -1350,55 +1450,117 @@ impl VoxelKernel {
         let retained_start = points.len().saturating_sub(accepted);
         let existing_budget = retention_capacity.saturating_sub(accepted);
         let evicted = self.current_window.len().saturating_sub(existing_budget);
-        for point in self.current_window.drain(..evicted) {
+        for _ in 0..evicted {
+            let point = self.current_window.remove(self.current_window.first);
             uncount_window_cell(&mut self.window_cells, &point);
+            let key = window_cell(&point);
+            let indices = self.window_point_indices.get_mut(&key).unwrap();
+            indices.pop_front();
+            if indices.is_empty() { self.window_point_indices.remove(&key); }
         }
-        for point in &points[retained_start..] {
-            count_window_cell(&mut self.window_cells, point);
+        for &point in &points[retained_start..] {
+            let slot = self.current_window.push_back(point);
+            count_window_cell(&mut self.window_cells, &point);
+            self.window_point_indices.entry(window_cell(&point)).or_default().push_back(slot);
         }
-        self.current_window
-            .extend(points[retained_start..].iter().copied());
     }
-    /// 逐点撤销本帧判定为空的历史点。使用本进程动态场景时，`clears` 只对落在清除格内的点
-    /// 返回真，清除格里没有窗口点就不会删除任何点，直接跳过遍历，结果与逐点筛除相同。
-    /// 预计算帧决策先把点变换到里程计坐标系再查清除格，按地图坐标维护的窗口格计数
-    /// 不能用来预判，照原样逐点筛除。
+
+    fn rebuild_window_index(&mut self) {
+        self.window_cells = window_cells(&self.current_window);
+        self.window_point_indices = window_point_indices(&self.current_window);
+    }
+
+    /// 先核对相交格里的具体点；无实际删除则不遍历整窗，保持原点序与参考保护。
     fn retain_uncleared(&mut self, frame: Option<&crate::dynamic_scene::MappedFrameDecision>) {
-        if frame.is_none()
-            && (!self.dynamic_scene.has_clears()
-                || !self.dynamic_scene.clear_cells().any(|cell| self.window_cells.contains_key(cell)))
-        {
-            return;
-        }
-        let (scene, cells) = (&self.dynamic_scene, &mut self.window_cells);
-        self.current_window.retain(|point| {
-            let p = [point.x, point.y, point.z];
-            let cleared = frame.map_or_else(|| scene.clears(p), |frame| frame.clears(p));
-            if cleared {
-                uncount_window_cell(cells, point);
+        #[cfg(test)]
+        let force_full = std::env::var_os("NUWAX_PGO_FULL_WINDOW_FILTER").is_some();
+        #[cfg(not(test))]
+        let force_full = false;
+        let candidates = if force_full {
+            None
+        } else if let Some(frame) = frame {
+            if frame.has_clears() && self.window_cells.contains_key(&UNINDEXED_WINDOW_CELL) { None }
+            else { frame.potential_window_clear_cells(&self.window_cells) }
+        } else {
+            Some(self.dynamic_scene.clear_cells().filter(|key| self.window_cells.contains_key(key)).copied().collect())
+        };
+        if let Some(candidates) = candidates {
+            #[cfg(test)]
+            let indexed_started = Instant::now();
+            #[cfg(test)]
+            let (candidate_count, mut checked) = (candidates.len(), 0usize);
+            let mut removed = ahash::AHashSet::new();
+            for key in &candidates {
+                for &index in &self.window_point_indices[key] {
+                    #[cfg(test)]
+                    { checked += 1; }
+                    let point = self.current_window.point(index);
+                    let p = [point.x, point.y, point.z];
+                    if frame.map_or_else(|| self.dynamic_scene.clears(p), |f| f.clears(p)) { removed.insert(index); }
+                }
             }
-            !cleared
-        });
+            #[cfg(test)]
+            if std::env::var_os("NUWAX_PGO_WINDOW_SHADOW").is_some() {
+                let expected: ahash::AHashSet<_> = self.current_window.indexed_iter().filter_map(|(i,p)|
+                    frame.map_or_else(|| self.dynamic_scene.clears([p.x,p.y,p.z]), |f| f.clears([p.x,p.y,p.z]))
+                        .then_some(i)).collect();
+                assert_eq!(removed, expected, "窗口索引不得漏掉或误报任何待删点");
+            }
+            #[cfg(test)]
+            if std::env::var_os("NUWAX_PGO_WINDOW_DIAGNOSTIC").is_some() {
+                eprintln!("WINDOW_INDEX points={} candidate_cells={candidate_count} checked={checked} removed={} lookup_ms={:.3}",
+                    self.current_window.len(), removed.len(), indexed_started.elapsed().as_secs_f64() * 1e3);
+            }
+            if removed.is_empty() { return; }
+            #[cfg(test)]
+            let rebuilding = Instant::now();
+            for key in candidates {
+                let indices = self.window_point_indices.get_mut(&key).unwrap();
+                indices.retain(|slot| !removed.contains(slot));
+                if indices.is_empty() { self.window_point_indices.remove(&key); }
+            }
+            for slot in removed {
+                let point = self.current_window.remove(slot);
+                uncount_window_cell(&mut self.window_cells, &point);
+            }
+            #[cfg(test)]
+            if std::env::var_os("NUWAX_PGO_WINDOW_DIAGNOSTIC").is_some() {
+                eprintln!("WINDOW_REMOVE points={} ms={:.3}", self.current_window.len(), rebuilding.elapsed().as_secs_f64()*1e3);
+            }
+        } else {
+            let before = self.current_window.len();
+            self.current_window.retain(|point| {
+                let p = [point.x, point.y, point.z];
+                !frame.map_or_else(|| self.dynamic_scene.clears(p), |f| f.clears(p))
+            });
+            if self.current_window.len() != before { self.rebuild_window_index(); }
+        }
     }
+}
+// cell()排除i32边缘，保留键不与任何真实格冲突。
+const UNINDEXED_WINDOW_CELL: crate::dynamic_scene::Cell = (i32::MIN, i32::MIN, i32::MIN);
+fn window_cell(point: &Point3<f64>) -> crate::dynamic_scene::Cell {
+    crate::dynamic_scene::cell([point.x, point.y, point.z]).unwrap_or(UNINDEXED_WINDOW_CELL)
+}
+fn window_point_indices(window: &VoxelWindow) -> ahash::AHashMap<crate::dynamic_scene::Cell, VecDeque<u32>> {
+    let mut indices: ahash::AHashMap<_, VecDeque<u32>> = Default::default();
+    for (index, point) in window.indexed_iter() { indices.entry(window_cell(point)).or_default().push_back(index); }
+    indices
 }
 fn count_window_cell(cells: &mut ahash::AHashMap<crate::dynamic_scene::Cell, u32>, point: &Point3<f64>) {
-    if let Some(cell) = crate::dynamic_scene::cell([point.x, point.y, point.z]) {
-        *cells.entry(cell).or_default() += 1;
-    }
+    let key = crate::dynamic_scene::cell([point.x, point.y, point.z]).unwrap_or(UNINDEXED_WINDOW_CELL);
+    *cells.entry(key).or_default() += 1;
 }
 fn uncount_window_cell(cells: &mut ahash::AHashMap<crate::dynamic_scene::Cell, u32>, point: &Point3<f64>) {
-    if let Some(cell) = crate::dynamic_scene::cell([point.x, point.y, point.z]) {
-        if let std::collections::hash_map::Entry::Occupied(mut entry) = cells.entry(cell) {
-            *entry.get_mut() -= 1;
-            if *entry.get() == 0 {
-                entry.remove();
-            }
-        }
+    let key = crate::dynamic_scene::cell([point.x, point.y, point.z]).unwrap_or(UNINDEXED_WINDOW_CELL);
+    if let std::collections::hash_map::Entry::Occupied(mut entry) = cells.entry(key) {
+        *entry.get_mut() -= 1;
+        if *entry.get() == 0 { entry.remove(); }
     }
 }
-fn window_cells(window: &VecDeque<Point3<f64>>) -> ahash::AHashMap<crate::dynamic_scene::Cell, u32> {
+fn window_cells(window: &VoxelWindow) -> ahash::AHashMap<crate::dynamic_scene::Cell, u32> {
     let mut cells = ahash::AHashMap::new();
-    for point in window {
+    for point in window.iter() {
         count_window_cell(&mut cells, point);
     }
     cells
@@ -1635,7 +1797,7 @@ pub(crate) fn export_mapping_kernel_checkpoint(kernel: &MappingKernel) -> Result
                     .to_le_bytes(),
             );
             payload.extend_from_slice(&voxel.last_candidate_received_at_ns.to_le_bytes());
-            for point in &voxel.current_window {
+            for point in voxel.current_window.iter() {
                 payload.extend_from_slice(&point.x.to_bits().to_le_bytes());
                 payload.extend_from_slice(&point.y.to_bits().to_le_bytes());
                 payload.extend_from_slice(&point.z.to_bits().to_le_bytes());
@@ -1926,7 +2088,7 @@ fn restore_mapping_kernel_checkpoint(
                     reader.remaining()
                 ));
             }
-            let mut current_window = VecDeque::new();
+            let mut current_window = VoxelWindow::default();
             current_window
                 .try_reserve_exact(point_count)
                 .map_err(|error| {
@@ -1945,6 +2107,7 @@ fn restore_mapping_kernel_checkpoint(
             reader.finish()?;
             Ok(MappingKernel::Voxel(VoxelKernel {
                 window_cells: window_cells(&current_window),
+                window_point_indices: window_point_indices(&current_window),
                 current_window,
                 capacity,
                 last_candidate_point_count,
@@ -2351,6 +2514,49 @@ fn compute_candidate_with_parallelism(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voxel_point_index_matches_full_filter_through_eviction_protection_and_restore() {
+        let config = MappingBackendComputeConfig { resolution: 0.05,
+            initial_safe_radius_meters: 0.0, window_capacity: 7 };
+        let MappingKernel::Voxel(mut indexed) = MappingBackendSpec::Voxel.into_kernel(7) else { unreachable!() };
+        let mut expected = VecDeque::new();
+        for frame in 0..30 {
+            let mut points: Vec<_> = (0..3).map(|i| Point3::new(frame as f64 * 0.031 + i as f64 * 0.099,
+                (i - 1) as f64 * 0.1, 0.15)).collect();
+            if frame == 7 { points.push(Point3::new(1e12, 0.0, 0.0)); }
+            indexed.append_frame(&points);
+            expected.extend(points);
+            while expected.len() > 7 { expected.pop_front(); }
+            let map_from_odom = if frame == 8 { nalgebra::Isometry3::translation(1e12, 0.0, 0.0) }
+                else { nalgebra::Isometry3::from_parts(nalgebra::Translation3::new(0.013, -0.2, 0.03),
+                    nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, frame as f64 * 0.037)) };
+            let odom_from_map = map_from_odom.inverse();
+            let odom: Vec<_> = expected.iter().map(|p| odom_from_map * p).collect();
+            let keys: Vec<_> = if frame == 8 { odom.iter().filter_map(|p| crate::dynamic_scene::cell([p.x,p.y,p.z])).collect() }
+                else if frame % 4 == 0 { vec![(1000,1000,1000)] }
+                else { odom.iter().step_by(3).filter_map(|p| crate::dynamic_scene::cell([p.x,p.y,p.z])).collect() };
+            let protected = if frame % 5 == 0 { odom.clone() } else { Vec::new() };
+            let decision = crate::dynamic_scene::tests::mapped_clear_decision(&keys, map_from_odom, &protected);
+            expected.retain(|p| !decision.clears([p.x,p.y,p.z]));
+            indexed.retain_uncleared(Some(&decision));
+            assert_eq!(indexed.current_window, expected, "第{frame}帧与原逐点结果不一致");
+            assert_eq!(indexed.window_point_indices.values().map(VecDeque::len).sum::<usize>(), expected.len());
+            assert!(indexed.current_window.slots.len() <= 7, "回收槽必须复用，不能累积超过窗口容量");
+            for (key, positions) in &indexed.window_point_indices {
+                assert_eq!(indexed.window_cells[key] as usize, positions.len());
+                for &position in positions {
+                    assert_eq!(&window_cell(indexed.current_window.point(position)), key);
+                }
+            }
+            if matches!(frame, 5 | 17) {
+                let payload = export_mapping_kernel_checkpoint(&MappingKernel::Voxel(indexed.clone())).unwrap();
+                let MappingKernel::Voxel(restored) = restore_mapping_kernel_checkpoint(MappingBackendSpec::Voxel, config, &payload).unwrap() else { unreachable!() };
+                indexed = restored;
+                assert_eq!(indexed.current_window, expected);
+            }
+        }
+    }
 
     #[test]
     fn both_mapping_kernels_clear_passing_person_history_and_keep_current_obstacles() {
@@ -3037,6 +3243,7 @@ mod tests {
         let one_point = MappingKernel::Voxel(VoxelKernel {
             current_window: [Point3::new(1.0, 2.0, 3.0)].into_iter().collect(),
             window_cells: window_cells(&[Point3::new(1.0, 2.0, 3.0)].into_iter().collect()),
+            window_point_indices: window_point_indices(&[Point3::new(1.0, 2.0, 3.0)].into_iter().collect()),
             capacity: config.window_capacity,
             last_candidate_point_count: 1,
             last_candidate_received_at_ns: 7,
@@ -3264,8 +3471,9 @@ pub(crate) fn cleanup_completed_checkpoint(payload:&[u8], q:f32,
                 if !removed.contains(&asset_key([p.x,p.y,p.z],q)){points.push_back(p);}
             }reader.finish()?;
             // 窗口格计数与恢复检查点时相同，按清理后保留的窗口点重建。
+            let points: VoxelWindow = points.into_iter().collect();
             let window_cells=window_cells(&points);
-            MappingKernel::Voxel(VoxelKernel{last_candidate_point_count:points.len(),window_cells,current_window:points,capacity,last_candidate_received_at_ns:stamp,dirty_since_candidate:false,dynamic_scene:Default::default()})
+            MappingKernel::Voxel(VoxelKernel{last_candidate_point_count:points.len(),window_cells,window_point_indices:window_point_indices(&points),current_window:points,capacity,last_candidate_received_at_ns:stamp,dirty_since_candidate:false,dynamic_scene:Default::default()})
         },
         MappingBackendSpec::Raytracing(_)=>{
             let c=decode_ray_config(&mut reader)?;

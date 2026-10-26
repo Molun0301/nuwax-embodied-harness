@@ -13,3 +13,4 @@ serde_json = { workspace = true }
 petgraph = "=0.7.1"
 nuwax-map-chunks = { path = "../nuwax-map-chunks" }
 sha2 = "0.10"
+libc = { workspace = true }

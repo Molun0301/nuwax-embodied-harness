@@ -13,6 +13,7 @@ pub(super) struct DynamicCloudFilter {
     shared: Option<crate::dynamic_scene::MappedFrameDecision>,
     source_domain: Option<(String, u64)>,
     raw_log: Option<nuwax_cloud_cleanup::scan_log::ScanLog>,
+    raw_log_failed: bool,
     removed_keys: Vec<VoxelKey>,
 }
 
@@ -95,11 +96,6 @@ impl DynamicCloudFilter {
     ) -> usize {
         self.observe_with_ground(voxels, size, origin, stamp, points, &[])
     }
-    pub(super) fn labels(&self) -> &crate::human_point_labels::FrameLabels {
-        self.shared
-            .as_ref()
-            .map_or_else(|| self.scene.labels(), |f| &f.decision.labels)
-    }
     pub(super) fn clears(&self, p: [f64; 3]) -> bool {
         self.shared
             .as_ref()
@@ -131,6 +127,10 @@ impl DynamicCloudFilter {
         if let Some(frame) = source.dynamic_frame() {
             return Ok(frame);
         }
+        #[cfg(test)]
+        let diagnostic = std::env::var_os("NUWAX_DYNAMIC_PHASE_DIAGNOSTIC").is_some();
+        #[cfg(test)]
+        let phase_started = std::time::Instant::now();
         let binding = source.binding();
         let domain = (
             binding.mapping_session_id.clone(),
@@ -140,6 +140,7 @@ impl DynamicCloudFilter {
             self.scene = Default::default();
             self.source_domain = Some(domain);
             self.raw_log = None;
+            self.raw_log_failed = false;
         }
         let points = source
             .body_points()
@@ -150,6 +151,8 @@ impl DynamicCloudFilter {
         let origin = binding
             .sensor_origin_map
             .map(|p| odom_from_map * Point3::from(p));
+        #[cfg(test)]
+        let prepare_ms = phase_started.elapsed().as_secs_f64() * 1e3;
         if let Some(origin) = origin {
             self.scene.observe_with_known_ground(
                 &points,
@@ -161,26 +164,31 @@ impl DynamicCloudFilter {
         } else {
             self.scene.clear_frame();
         }
-        let mut frame = (*self.scene.decision()).clone();
+        #[cfg(test)]
+        let observed_ms = phase_started.elapsed().as_secs_f64() * 1e3;
+        let mut frame = self.scene.decision();
         if frame.labels.labels.is_empty() {
-            frame.labels = crate::human_point_labels::FrameLabels {
+            std::sync::Arc::make_mut(&mut frame).labels = crate::human_point_labels::FrameLabels {
                 source_timestamp_ns: source.source_timestamp_ns(),
                 labels: vec![crate::human_point_labels::PointLabel::PendingNew; points.len()],
             };
         }
-        let frame = std::sync::Arc::new(frame);
+        #[cfg(test)]
+        let decision_ms = phase_started.elapsed().as_secs_f64() * 1e3;
         use nuwax_cloud_cleanup::scan_log::{ScanLog, ScanMetadata, Session};
-        if self.raw_log.is_none() {
-            let root = std::env::var_os("NUWAX_RAW_SCAN_DIRECTORY")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from("runtime_data/scan_logs"));
-            self.raw_log = Some(ScanLog::open(
-                &root,
-                Session {
-                    session_id: binding.mapping_session_id.clone(),
-                    generation: binding.mapping_session_generation,
-                },
-            )?);
+        if self.raw_log.is_none() && !self.raw_log_failed {
+            let root = nuwax_cloud_cleanup::scan_log::scan_directory();
+            match ScanLog::open(&root, Session {
+                session_id: binding.mapping_session_id.clone(),
+                generation: binding.mapping_session_generation,
+            }) {
+                Ok(log) => self.raw_log = Some(log),
+                Err(error) => {
+                    self.raw_log_failed = true;
+                    tracing::warn!(event = "mapping.raw_scan_incomplete", %error,
+                        "原始扫描记录不可用，继续建图；保存时将明确标记离线重判输入不完整");
+                }
+            }
         }
         let body_from_map =
             (binding.registration_map_from_odom * binding.frozen_odom_from_body).inverse();
@@ -208,12 +216,27 @@ impl DynamicCloudFilter {
             sensor_origin_body: origin_body.map(|p| p.coords.into()),
             point_count: source.body_points().len(),
         };
-        self.raw_log.as_mut().unwrap().append(
-            &metadata,
-            source.body_points().iter().map(|p| [p.x, p.y, p.z]),
-            &frame.labels.labels,
-        )?;
+        if let Some(log) = self.raw_log.as_mut() {
+            if let Err(error) = log.append(&metadata,
+                source.body_points().iter().map(|p| [p.x, p.y, p.z]), &frame.labels.labels) {
+                let _ = std::fs::File::create(log.path.with_extension("incomplete"));
+                self.raw_log = None;
+                self.raw_log_failed = true;
+                tracing::warn!(event = "mapping.raw_scan_incomplete", %error,
+                    "原始扫描记录已中断，继续建图；保存时将明确标记离线重判输入不完整");
+            }
+        }
+        #[cfg(test)]
+        let scanlog_ms = phase_started.elapsed().as_secs_f64() * 1e3;
         source.record_decision(frame.clone())?;
+        #[cfg(test)]
+        if diagnostic {
+            let elapsed = phase_started.elapsed().as_secs_f64() * 1e3;
+            eprintln!("DYNAMIC_CLASSIFY timestamp={} points={} prepare_ms={:.3} observe_ms={:.3} decision_ms={:.3} scanlog_ms={:.3} record_ms={:.3} total_ms={:.3}",
+                source.source_timestamp_ns(), source.body_points().len(), prepare_ms,
+                observed_ms - prepare_ms, decision_ms - observed_ms,
+                scanlog_ms - decision_ms, elapsed - scanlog_ms, elapsed);
+        }
         Ok(frame)
     }
 }

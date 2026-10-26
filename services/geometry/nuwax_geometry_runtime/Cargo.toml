@@ -12,6 +12,7 @@ path = "src/lib.rs"
 # MSRV 1.88；目标机 aarch64 + Ubuntu 20.04；仅使用 LCM 数据面。
 
 [dependencies]
+nuwax-dufomap-native = { path = "../../nuwax-workspace/crates/nuwax-dufomap-native" }
 base64 = "0.22.1"
 nuwax-cloud-cleanup = { path = "../../nuwax-workspace/crates/nuwax-cloud-cleanup" }
 # 体素键只在进程内索引，使用工作区已有的带随机密钥快速散列。

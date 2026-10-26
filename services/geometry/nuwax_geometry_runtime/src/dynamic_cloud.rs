@@ -12,7 +12,7 @@ pub(super) struct DynamicCloudFilter {
     scene: crate::dynamic_scene::DynamicScene,
     shared: Option<crate::dynamic_scene::MappedFrameDecision>,
     source_domain: Option<(String, u64)>,
-    raw_log: Option<nuwax_cloud_cleanup::scan_log::ScanLog>,
+    raw_log: Option<nuwax_cloud_cleanup::scan_log::Recorder>,
     raw_log_failed: bool,
     removed_keys: Vec<VoxelKey>,
 }
@@ -175,10 +175,10 @@ impl DynamicCloudFilter {
         }
         #[cfg(test)]
         let decision_ms = phase_started.elapsed().as_secs_f64() * 1e3;
-        use nuwax_cloud_cleanup::scan_log::{ScanLog, ScanMetadata, Session};
+        use nuwax_cloud_cleanup::scan_log::{Recorder, ScanMetadata, Session};
         if self.raw_log.is_none() && !self.raw_log_failed {
             let root = nuwax_cloud_cleanup::scan_log::scan_directory();
-            match ScanLog::open(&root, Session {
+            match Recorder::new(root, Session {
                 session_id: binding.mapping_session_id.clone(),
                 generation: binding.mapping_session_generation,
             }) {
@@ -213,13 +213,12 @@ impl DynamicCloudFilter {
                 .try_into()
                 .unwrap(),
             observation_minimum_range_m: Some(self.scene.minimum_range_m()),
-            sensor_origin_body: origin_body.map(|p| p.coords.into()),
+            sensor_origin_body: origin_body.map(|p| [p.x as f32, p.y as f32, p.z as f32]),
             point_count: source.body_points().len(),
         };
         if let Some(log) = self.raw_log.as_mut() {
-            if let Err(error) = log.append(&metadata,
-                source.body_points().iter().map(|p| [p.x, p.y, p.z]), &frame.labels.labels) {
-                let _ = std::fs::File::create(log.path.with_extension("incomplete"));
+            if let Err(error) = log.observe(metadata,
+                source.body_points().iter().map(|p| [p.x as f32, p.y as f32, p.z as f32])) {
                 self.raw_log = None;
                 self.raw_log_failed = true;
                 tracing::warn!(event = "mapping.raw_scan_incomplete", %error,

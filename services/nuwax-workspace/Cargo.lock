@@ -1562,6 +1562,7 @@ dependencies = [
  "ahash",
  "libc",
  "nalgebra 0.33.3",
+ "nuwax-dufomap-native",
  "nuwax-map-chunks",
  "petgraph",
  "serde",

@@ -55,7 +55,7 @@
       if (job.state === 'ready') {
         const r = job.report;
         say('计算已完成，正在读取预览点云…');
-        $('mapCleanupDetails').textContent = `原图灰色，候选红色。力度 ${job.strength_percent}%。人体重判 ${r.offline_frames} 帧；回补 ${r.recovered_voxels} 个体素。拖动旋转，滚轮缩放；大图仅显示抽样，候选计数为全量。`;
+        $('mapCleanupDetails').textContent = `原图灰色，候选红色。力度 ${job.strength_percent}%。离线判定 ${r.offline_frames} 帧；输入${r.offline_complete ? '完整' : '不完整'}。拖动旋转，滚轮缩放；大图仅显示抽样，候选计数为全量。`;
         await loadPoints(job, epoch);
         if (epoch === state.epoch) say(`实际候选删除 ${r.preview.candidate_points.toLocaleString()} 个细点云体素；累计扫描点 ${r.dense_before.toLocaleString()} → ${r.dense_after.toLocaleString()}。${r.offline_note} 原图未改变。`);
       } else if (['failed','cancelled','applied'].includes(job.state)) {

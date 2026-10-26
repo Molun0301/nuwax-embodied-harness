@@ -1232,7 +1232,7 @@ fn print_requested_release_artifacts() -> Option<ExitCode> {
 }
 
 fn configure_pointcloud_storage() -> Result<(), String> {
-    nuwax_cloud_cleanup::scan_log::storage_budget_bytes()?;
+    nuwax_cloud_cleanup::scan_log::StorageWorker::validate_config()?;
     let env_text = |name: &str| match std::env::var(name) {
         Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotPresent) => Ok(None),
@@ -1314,6 +1314,10 @@ fn main() -> ExitCode {
             );
             return ExitCode::from(2);
         }
+    };
+    let _scan_storage = match nuwax_cloud_cleanup::scan_log::StorageWorker::start() {
+        Ok(worker) => worker,
+        Err(error) => { error!(event = "process.failed", "原始扫描后台启动失败: {error}"); return ExitCode::from(2); }
     };
     let exit_code = runtime.block_on(run(lcm_backend, preflight));
     finalize_geometry_runtime(runtime, exit_code)

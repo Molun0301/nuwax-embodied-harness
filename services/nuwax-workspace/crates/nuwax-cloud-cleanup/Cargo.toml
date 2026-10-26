@@ -14,3 +14,4 @@ petgraph = "=0.7.1"
 nuwax-map-chunks = { path = "../nuwax-map-chunks" }
 sha2 = "0.10"
 libc = { workspace = true }
+nuwax-dufomap-native = { path = "../nuwax-dufomap-native" }

@@ -2,3 +2,4 @@
 pub mod human_point_labels;
 pub mod offline_residual_cleanup;
 pub mod scan_log;
+pub mod offline_dufomap;

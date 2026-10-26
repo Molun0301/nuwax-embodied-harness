@@ -1,10 +1,11 @@
-//! 有界样本的在线参数评估：合成真值和实录相对指标分别输出。
+//! 稀疏扫描与滑动窗口参数评估；真实方向合成有逐点真值，实录只报告相对指标。
+#[path = "online_params/saved.rs"]
+mod saved;
+#[path = "online_params/support.rs"]
+mod support;
 use nuwax_dufomap_native::{DownSampling, DufoMap, Params};
-use std::{
-    fs::File,
-    io::{BufReader, Read},
-    time::Instant,
-};
+use std::{fs::File, io::Write, time::Instant};
+use support::{array, distribution, js, object, Density, Input, Scan, Selector};
 
 const SAMPLE_CAP: usize = 100_000;
 const GROUPS: [&str; 8] = [
@@ -17,50 +18,6 @@ const GROUPS: [&str; 8] = [
     "person_body",
     "person_feet",
 ];
-
-#[derive(Clone, Copy)]
-struct Sample {
-    point: [f32; 3],
-    group: usize,
-    online: bool,
-}
-
-struct Reservoir {
-    points: Vec<Sample>,
-    count: u64,
-    state: u64,
-}
-impl Reservoir {
-    fn new() -> Self {
-        Self {
-            points: Vec::with_capacity(SAMPLE_CAP),
-            count: 0,
-            state: 0x4d595df4d0f33173,
-        }
-    }
-    fn push(&mut self, sample: Sample) {
-        self.count += 1;
-        // 固定种子的水塘抽样，所有参数使用相同样本，内存不随实录长度增长。
-        self.state ^= self.state << 13;
-        self.state ^= self.state >> 7;
-        self.state ^= self.state << 17;
-        if self.points.len() < SAMPLE_CAP {
-            self.points.push(sample);
-        } else {
-            let index = (self.state % self.count) as usize;
-            if index < SAMPLE_CAP {
-                self.points[index] = sample;
-            }
-        }
-    }
-}
-
-struct Scan {
-    origin: [f32; 3],
-    points: Vec<[f32; 3]>,
-    groups: Vec<usize>,
-    timestamp: f64,
-}
 
 #[derive(Clone, Copy)]
 struct Box3 {
@@ -157,86 +114,39 @@ fn boxes(frame: usize) -> Vec<Box3> {
     out
 }
 
-fn synthetic(frame: usize, dense: bool) -> Scan {
-    let origin = [0.53 + 3.0 * frame as f32 / 89.0, 0.013, 0.53];
-    let scene = boxes(frame);
-    let (naz, nel) = if dense { (121, 61) } else { (64, 32) };
-    let (mut points, mut groups) = (Vec::new(), Vec::new());
-    for az in 0..naz {
-        for el in 0..nel {
-            // 固定扫描线，稀疏场景约2048点/帧，不靠跨帧抖动人为填满未知区域。
-            let a = (-45.0 + 90.0 * az as f32 / (naz - 1) as f32).to_radians();
-            let e = (-30.0 + 60.0 * el as f32 / (nel - 1) as f32).to_radians();
-            let dir = [a.cos() * e.cos(), a.sin() * e.cos(), e.sin()];
-            if let Some((distance, mut group)) = scene
-                .iter()
-                .filter_map(|b| b.hit(origin, dir).map(|d| (d, b.group)))
-                .min_by(|a, b| a.0.total_cmp(&b.0))
-            {
-                let point = std::array::from_fn(|k| origin[k] + dir[k] * distance);
-                if group == 6 && point[2] <= 0.33 {
-                    group = 7;
-                }
-                points.push(point);
-                groups.push(group);
+#[derive(Clone, Copy)]
+struct Sample {
+    point: [f32; 3],
+    group: usize,
+    online: bool,
+}
+struct Reservoir {
+    points: Vec<Sample>,
+    count: u64,
+    state: u64,
+}
+impl Reservoir {
+    fn new() -> Self {
+        Self {
+            points: Vec::with_capacity(SAMPLE_CAP),
+            count: 0,
+            state: 0x4d595df4d0f33173,
+        }
+    }
+    fn push(&mut self, sample: Sample) {
+        self.count += 1;
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        if self.points.len() < SAMPLE_CAP {
+            self.points.push(sample);
+        } else {
+            let index = (self.state % self.count) as usize;
+            if index < SAMPLE_CAP {
+                self.points[index] = sample;
             }
         }
     }
-    Scan {
-        origin,
-        points,
-        groups,
-        timestamp: frame as f64 / 15.0,
-    }
-}
-
-fn rotate(q: [f64; 4], v: [f64; 3]) -> [f64; 3] {
-    let [w, x, y, z] = q;
-    let t = [
-        2.0 * (y * v[2] - z * v[1]),
-        2.0 * (z * v[0] - x * v[2]),
-        2.0 * (x * v[1] - y * v[0]),
-    ];
-    [
-        v[0] + w * t[0] + y * t[2] - z * t[1],
-        v[1] + w * t[1] + z * t[0] - x * t[2],
-        v[2] + w * t[2] + x * t[1] - y * t[0],
-    ]
-}
-
-fn recorded(reader: &mut BufReader<File>) -> Option<Scan> {
-    let mut header = [0u8; 68];
-    // 只有完整文件结尾允许无下一帧，截断输入直接失败。
-    if reader.read(&mut header[..1]).unwrap() == 0 {
-        return None;
-    }
-    reader.read_exact(&mut header[1..]).unwrap();
-    let timestamp = u64::from_le_bytes(header[..8].try_into().unwrap()) as f64 * 1e-9;
-    let pose: [f64; 7] = std::array::from_fn(|k| {
-        f64::from_le_bytes(header[8 + k * 8..16 + k * 8].try_into().unwrap())
-    });
-    let count = u32::from_le_bytes(header[64..68].try_into().unwrap()) as usize;
-    assert!(count < 1_000_000, "单帧点数不合理");
-    let mut bytes = vec![0; count * 12];
-    reader.read_exact(&mut bytes).unwrap();
-    let world = |point: [f64; 3]| {
-        let r = rotate([pose[6], pose[3], pose[4], pose[5]], point);
-        std::array::from_fn(|k| (r[k] + pose[k]) as f32)
-    };
-    let points: Vec<_> = bytes
-        .chunks_exact(12)
-        .map(|p| {
-            world(std::array::from_fn(|k| {
-                f32::from_le_bytes(p[k * 4..k * 4 + 4].try_into().unwrap()) as f64
-            }))
-        })
-        .collect();
-    Some(Scan {
-        origin: world([0.28945, 0.0, -0.046825]),
-        groups: vec![0; count],
-        points,
-        timestamp,
-    })
 }
 
 #[repr(C)]
@@ -304,128 +214,409 @@ fn config(name: &str) -> (Params, usize) {
         "none" => p.down_sampling = DownSampling::None,
         "centroid" => p.down_sampling = DownSampling::Centroid,
         "uniform" => p.down_sampling = DownSampling::Uniform,
-        "range10" => p.max_range = 10.0,
-        "range20" => p.max_range = 20.0,
+        "range10" => p.max_range = 10.,
+        "range20" => p.max_range = 20.,
         "merge3" => merge = 3,
-        _ => panic!("未知参数名称: {name}"),
+        _ if name.starts_with("window") => {
+            p.sliding_window_size = name[6..].parse().expect("窗口参数名称应为windowN")
+        }
+        _ => panic!("未知参数名称:{name}"),
     }
     (p, merge)
 }
 
+struct Options {
+    scene: String,
+    name: String,
+    path: Option<String>,
+    limit: usize,
+    direction_start: usize,
+    mode: String,
+    sampling: String,
+    params: Params,
+    merge: usize,
+    metrics: Option<String>,
+    final_mask: Option<String>,
+}
+impl Options {
+    fn parse() -> Self {
+        let args: Vec<_> = std::env::args().skip(1).collect();
+        assert!(args.len()>=2,"用法: online_params sparse|dense|l2|recorded|density|saved 参数名 [实录路径] [帧数] [--mode online|offline --sampling all|v2|keyframe --window N --unknown N --hits 米 --resolution 米 --direction-start 帧 --frame-metrics 路径 --final-mask 路径]");
+        let (params, merge) = config(&args[1]);
+        let mut out = Self {
+            scene: args[0].clone(),
+            name: args[1].clone(),
+            path: None,
+            limit: 0,
+            direction_start: 0,
+            mode: "online".into(),
+            sampling: "all".into(),
+            params,
+            merge,
+            metrics: None,
+            final_mask: None,
+        };
+        let mut i = 2;
+        if args.get(i).is_some_and(|v| !v.starts_with("--")) {
+            out.path = Some(args[i].clone());
+            i += 1;
+        }
+        if args.get(i).is_some_and(|v| !v.starts_with("--")) {
+            out.limit = args[i].parse().unwrap();
+            i += 1;
+        }
+        while i < args.len() {
+            let key = &args[i];
+            let value = args.get(i + 1).expect("选项缺少值");
+            match key.as_str() {
+                "--mode" => out.mode = value.clone(),
+                "--sampling" => out.sampling = value.clone(),
+                "--window" => out.params.sliding_window_size = value.parse().unwrap(),
+                "--unknown" => out.params.inflate_unknown = value.parse().unwrap(),
+                "--hits" => out.params.inflate_hits_dist = value.parse().unwrap(),
+                "--resolution" => out.params.resolution = value.parse().unwrap(),
+                "--direction-start" => out.direction_start = value.parse().unwrap(),
+                "--frames" => out.limit = value.parse().unwrap(),
+                "--frame-metrics" => out.metrics = Some(value.clone()),
+                "--final-mask" => out.final_mask = Some(value.clone()),
+                "--compensation" => {
+                    out.params.inflate_unknown_compensation = value.parse().unwrap()
+                }
+                _ => panic!("未知选项:{key}"),
+            }
+            i += 2;
+        }
+        assert!(
+            matches!(out.mode.as_str(), "online" | "offline"),
+            "未知模式"
+        );
+        Selector::new(&out.sampling);
+        out
+    }
+    fn input(&self) -> Input {
+        Input::new(
+            &self.scene,
+            self.path.as_deref(),
+            self.limit,
+            self.direction_start,
+        )
+    }
+}
+
+struct Latency {
+    points: Vec<[f32; 3]>,
+    groups: Vec<usize>,
+    first: Vec<Option<usize>>,
+    curve: Vec<String>,
+}
+impl Latency {
+    fn new() -> Self {
+        Self {
+            points: vec![],
+            groups: vec![],
+            first: vec![],
+            curve: vec![],
+        }
+    }
+    fn collect(&mut self, scan: &Scan) {
+        for (&point, &group) in scan.points.iter().zip(&scan.groups) {
+            if group >= 6 {
+                self.points.push(point);
+                self.groups.push(group);
+                self.first.push(None);
+            }
+        }
+    }
+    fn observe(&mut self, map: &DufoMap, frame: usize) {
+        // 第44帧仍有人；此时已判空记延迟0。第45帧是离开后的第1帧。
+        if frame < 44 {
+            return;
+        }
+        let delay = frame - 44;
+        for (first, free) in self
+            .first
+            .iter_mut()
+            .zip(map.seen_free(&self.points).unwrap())
+        {
+            if free && first.is_none() {
+                *first = Some(delay);
+            }
+        }
+        let counts = |g| {
+            self.first
+                .iter()
+                .zip(&self.groups)
+                .filter(|(first, group)| **group == g && first.is_some())
+                .count()
+        };
+        self.curve.push(object(&[
+            ("source_frame", frame.to_string()),
+            ("frames_after_departure", delay.to_string()),
+            ("body_deleted", counts(6).to_string()),
+            ("feet_deleted", counts(7).to_string()),
+        ]));
+    }
+    fn json(&self) -> String {
+        let mut values = vec![
+            ("departure_source_frame", 45.to_string()),
+            ("curve", format!("[{}]", self.curve.join(","))),
+        ];
+        for (g, name) in [(6, "body"), (7, "feet")] {
+            let delays: Vec<_> = self
+                .first
+                .iter()
+                .zip(&self.groups)
+                .filter(|(_, group)| **group == g)
+                .map(|(first, _)| *first)
+                .collect();
+            let deleted: Vec<_> = delays.iter().filter_map(|v| v.map(|x| x as f64)).collect();
+            values.push((
+                name,
+                object(&[
+                    ("total", delays.len().to_string()),
+                    ("deleted", deleted.len().to_string()),
+                    ("not_deleted", (delays.len() - deleted.len()).to_string()),
+                    ("delay_frames_deleted_only", distribution(&deleted)),
+                    (
+                        "already_deleted_at_departure",
+                        deleted.iter().filter(|&&v| v == 0.).count().to_string(),
+                    ),
+                ]),
+            ));
+        }
+        object(&values)
+    }
+}
+
+struct FrameMetric {
+    frame: usize,
+    selected: bool,
+    points: usize,
+    insert_ms: f64,
+    query_ms: f64,
+    cpu_ms: f64,
+    tree: usize,
+    window: usize,
+}
 struct Eval {
     map: DufoMap,
     samples: Reservoir,
+    midpoints: Reservoir,
     total: [u64; 8],
     online: [u64; 8],
+    inserted: [u64; 8],
     frames: usize,
+    selected: usize,
+    calls: usize,
+    first_time: Option<f64>,
+    last_time: f64,
     insert_s: f64,
     query_s: f64,
     assemble_s: f64,
     cpu_s: f64,
-    calls: usize,
-    max_pending_points: usize,
+    latency_s: f64,
+    latency_cpu_s: f64,
+    final_propagate_s: f64,
+    final_propagate_cpu_s: f64,
+    peak_tree: usize,
+    peak_window: usize,
+    max_pending: usize,
     max_origin_shift: f32,
-    first_time: Option<f64>,
-    last_time: f64,
     last_points: Vec<[f32; 3]>,
     last_origin: [f32; 3],
+    metrics: Vec<FrameMetric>,
+    latency: Latency,
 }
 impl Eval {
     fn new(p: &Params) -> Self {
         Self {
             map: DufoMap::new(p).unwrap(),
             samples: Reservoir::new(),
+            midpoints: Reservoir::new(),
             total: [0; 8],
             online: [0; 8],
+            inserted: [0; 8],
             frames: 0,
+            selected: 0,
+            calls: 0,
+            first_time: None,
+            last_time: 0.,
             insert_s: 0.,
             query_s: 0.,
             assemble_s: 0.,
             cpu_s: 0.,
-            calls: 0,
-            max_pending_points: 0,
+            latency_s: 0.,
+            latency_cpu_s: 0.,
+            final_propagate_s: 0.,
+            final_propagate_cpu_s: 0.,
+            peak_tree: 0,
+            peak_window: 0,
+            max_pending: 0,
             max_origin_shift: 0.,
-            first_time: None,
-            last_time: 0.,
-            last_points: Vec::new(),
+            last_points: vec![],
             last_origin: [0.; 3],
+            metrics: vec![],
+            latency: Latency::new(),
         }
     }
-    fn batch(&mut self, scans: &[Scan]) {
+    fn batch(&mut self, scans: &[(Scan, bool)], online: bool, labelled: bool) {
         let cpu = cpu_seconds();
-        let stage = Instant::now();
-        let origin = scans.last().unwrap().origin;
-        let points: Vec<_> = scans
+        let assembly = Instant::now();
+        let selected: Vec<_> = scans
+            .iter()
+            .filter(|(_, selected)| *selected)
+            .map(|(scan, _)| scan)
+            .collect();
+        let origin = selected.last().map(|s| s.origin);
+        let points: Vec<_> = selected
             .iter()
             .flat_map(|s| s.points.iter().copied())
             .collect();
-        self.assemble_s += stage.elapsed().as_secs_f64();
-        self.max_pending_points = self.max_pending_points.max(points.len());
-        for s in scans {
-            self.max_origin_shift = self.max_origin_shift.max(
-                (0..3)
-                    .map(|k| (s.origin[k] - origin[k]).powi(2))
-                    .sum::<f32>()
-                    .sqrt(),
-            );
+        self.assemble_s += assembly.elapsed().as_secs_f64();
+        let assembly_cpu = cpu_seconds() - cpu;
+        self.max_pending = self.max_pending.max(points.len());
+        let mut insert = 0.;
+        let mut insert_cpu = 0.;
+        if let Some(origin) = origin {
+            for scan in &selected {
+                self.selected += 1;
+                for &g in &scan.groups {
+                    self.inserted[g] += 1;
+                }
+                self.max_origin_shift = self.max_origin_shift.max(
+                    scan.origin
+                        .iter()
+                        .zip(origin)
+                        .map(|(a, b)| (a - b).powi(2))
+                        .sum::<f32>()
+                        .sqrt(),
+                );
+            }
+            let t = Instant::now();
+            let c = cpu_seconds();
+            self.map.insert(&points, origin, online).unwrap();
+            insert_cpu = cpu_seconds() - c;
+            insert = t.elapsed().as_secs_f64();
+            self.insert_s += insert;
+            self.calls += 1;
         }
-        let stage = Instant::now();
-        self.map.insert(&points, origin, true).unwrap();
-        self.insert_s += stage.elapsed().as_secs_f64();
-        let stage = Instant::now();
-        let flags = self.map.seen_free(&points).unwrap();
-        self.query_s += stage.elapsed().as_secs_f64();
-        self.cpu_s += cpu_seconds() - cpu;
-        let mut index = 0;
-        for scan in scans {
+        let mut batch_query = 0.;
+        let mut batch_query_cpu = 0.;
+        let mut frame_query = Vec::new();
+        for (scan, _) in scans {
             self.frames += 1;
             self.first_time.get_or_insert(scan.timestamp);
             self.last_time = scan.timestamp;
-            for (&point, &group) in scan.points.iter().zip(&scan.groups) {
-                let online = flags[index];
-                index += 1;
+            let t = Instant::now();
+            let c = cpu_seconds();
+            let flags = if online {
+                self.map.seen_free(&scan.points).unwrap()
+            } else {
+                vec![false; scan.points.len()]
+            };
+            let query = if online {
+                t.elapsed().as_secs_f64()
+            } else {
+                0.
+            };
+            let query_cpu = if online { cpu_seconds() - c } else { 0. };
+            batch_query += query;
+            batch_query_cpu += query_cpu;
+            frame_query.push((query, query_cpu));
+            for ((&point, &group), free) in scan.points.iter().zip(&scan.groups).zip(flags) {
                 self.total[group] += 1;
-                self.online[group] += u64::from(online);
+                self.online[group] += u64::from(free);
                 self.samples.push(Sample {
                     point,
                     group,
-                    online,
+                    online: free,
                 });
-            }
-        }
-        self.calls += 1;
-        self.last_points.clone_from(&scans.last().unwrap().points);
-        self.last_origin = origin;
-    }
-    fn report(&self, scene: &str, name: &str, p: &Params, merge: usize, elapsed: f64) {
-        let points: Vec<_> = self.samples.points.iter().map(|s| s.point).collect();
-        let flags = self.map.seen_free(&points).unwrap();
-        let (mut sampled, mut final_free, mut late_free) = ([0u64; 8], [0u64; 8], [0u64; 8]);
-        for (sample, free) in self.samples.points.iter().zip(flags) {
-            sampled[sample.group] += 1;
-            final_free[sample.group] += u64::from(free);
-            late_free[sample.group] += u64::from(free && !sample.online);
-        }
-        // 合成输入可确定性重建，按帧复算完整终态，不累计全量历史点。
-        let mut final_exact = [0u64; 8];
-        if scene != "recorded" {
-            for frame in 0..90 {
-                let scan = synthetic(frame, scene == "dense");
-                for (group, free) in scan
-                    .groups
+                if point
                     .iter()
-                    .zip(self.map.seen_free(&scan.points).unwrap())
+                    .zip(scan.origin)
+                    .map(|(a, b)| (a - b).powi(2))
+                    .sum::<f32>()
+                    > 2.25
                 {
-                    final_exact[*group] += u64::from(free);
+                    self.midpoints.push(Sample {
+                        point: std::array::from_fn(|k| (point[k] + scan.origin[k]) * 0.5),
+                        group: 0,
+                        online: false,
+                    });
                 }
             }
+            if labelled && online {
+                self.latency.collect(scan);
+            }
+            self.last_points.clone_from(&scan.points);
+            self.last_origin = scan.origin;
+        }
+        self.query_s += batch_query;
+        // CPU仅计拼接、插入和当前点查询；采样与真值记账开销由whole_run_s体现。
+        let cpu = assembly_cpu + insert_cpu + batch_query_cpu;
+        self.cpu_s += cpu;
+        self.peak_tree = self.peak_tree.max(self.map.memory_bytes());
+        self.peak_window = self.peak_window.max(self.map.window_memory_bytes());
+        if online && labelled {
+            let t = Instant::now();
+            let c = cpu_seconds();
+            self.latency
+                .observe(&self.map, scans.last().unwrap().0.frame);
+            self.latency_s += t.elapsed().as_secs_f64();
+            self.latency_cpu_s += cpu_seconds() - c;
+        }
+        for ((scan, selected), (query, query_cpu)) in scans.iter().zip(frame_query) {
+            self.metrics.push(FrameMetric {
+                frame: scan.frame,
+                selected: *selected,
+                points: scan.points.len(),
+                insert_ms: insert * 1e3 / scans.len() as f64,
+                query_ms: query * 1e3,
+                cpu_ms: (assembly_cpu + insert_cpu) * 1e3 / scans.len() as f64 + query_cpu * 1e3,
+                tree: self.map.memory_bytes(),
+                window: self.map.window_memory_bytes(),
+            });
+        }
+    }
+    fn report(&self, o: &Options, started: Instant) {
+        let final_started = Instant::now();
+        let final_cpu = cpu_seconds();
+        let mut final_exact = [0u64; 8];
+        let mut final_total = [0u64; 8];
+        // 重新逐帧读入完整输入。抽帧仅改变插入，不改变最终查询分母和真值。
+        let mut input = o.input();
+        let mut mask_file = o
+            .final_mask
+            .as_ref()
+            .map(|path| File::create(path).unwrap());
+        while let Some(scan) = input.next() {
+            let flags = self.map.seen_free(&scan.points).unwrap();
+            if let Some(file) = &mut mask_file {
+                // 按完整源帧/源点顺序输出0/1字节，供连续力度的逐点掩码嵌套核对。
+                file.write_all(&flags.iter().map(|&free| u8::from(free)).collect::<Vec<_>>())
+                    .unwrap();
+            }
+            for (&group, free) in scan.groups.iter().zip(flags) {
+                final_total[group] += 1;
+                final_exact[group] += u64::from(free);
+            }
+        }
+        assert_eq!(self.total, final_total, "终态查询没有覆盖相同输入全集");
+        let points: Vec<_> = self.samples.points.iter().map(|s| s.point).collect();
+        let flags = self.map.seen_free(&points).unwrap();
+        let (mut sampled, mut sample_free, mut late_free) = ([0u64; 8], [0u64; 8], [0u64; 8]);
+        for (sample, free) in self.samples.points.iter().zip(flags) {
+            sampled[sample.group] += 1;
+            sample_free[sample.group] += u64::from(free);
+            late_free[sample.group] += u64::from(free && !sample.online);
         }
         let midpoints: Vec<_> = self
             .last_points
             .iter()
             .filter(|p| {
-                (0..3)
-                    .map(|k| (p[k] - self.last_origin[k]).powi(2))
+                p.iter()
+                    .zip(self.last_origin)
+                    .map(|(a, b)| (a - b).powi(2))
                     .sum::<f32>()
                     > 2.25
             })
@@ -436,59 +627,266 @@ impl Eval {
             .seen_free(&midpoints)
             .unwrap()
             .into_iter()
-            .filter(|f| *f)
+            .filter(|v| *v)
             .count();
-        let group_json = (0..8).filter(|g| scene != "recorded" || *g == 0).map(|g| format!("\"{}\":{{\"total\":{},\"online_free\":{},\"sampled\":{},\"final_free\":{},\"late_free\":{},\"final_exact\":{}}}", if scene == "recorded" { "unlabelled" } else { GROUPS[g] }, self.total[g], self.online[g], sampled[g], final_free[g], late_free[g], if scene == "recorded" { "null".to_owned() } else { final_exact[g].to_string() })).collect::<Vec<_>>().join(",");
-        println!("{{\"scene\":\"{scene}\",\"case\":\"{name}\",\"resolution\":{},\"unknown\":{},\"compensation\":{},\"hits\":{},\"down_sampling\":\"{:?}\",\"max_range\":{},\"merge_frames\":{merge},\"frames\":{},\"points\":{},\"duration_s\":{},\"insert_calls\":{},\"insert_ms_per_frame\":{},\"query_ms_per_frame\":{},\"assemble_ms_per_frame\":{},\"cpu_ms_per_frame\":{},\"whole_run_s\":{elapsed},\"map_bytes\":{},\"map_nodes\":{},\"peak_rss_kib\":{},\"sample_cap\":{SAMPLE_CAP},\"samples\":{},\"sample_bytes\":{},\"max_pending_points\":{},\"merged_points_bytes\":{},\"max_origin_shift_m\":{},\"ray_midpoints\":{},\"ray_midpoints_free\":{},\"groups\":{{{group_json}}}}}",
-            p.resolution, p.inflate_unknown, p.inflate_unknown_compensation, p.inflate_hits_dist, p.down_sampling, p.max_range,
-            self.frames, self.total.iter().sum::<u64>(), self.last_time - self.first_time.unwrap_or(self.last_time), self.calls,
-            self.insert_s * 1e3 / self.frames as f64, self.query_s * 1e3 / self.frames as f64, self.assemble_s * 1e3 / self.frames as f64,
-            self.cpu_s * 1e3 / self.frames as f64, self.map.memory_bytes(), self.map.num_nodes(), peak_kib(), self.samples.points.len(),
-            self.samples.points.capacity() * std::mem::size_of::<Sample>(), self.max_pending_points, self.max_pending_points * 12,
-            self.max_origin_shift, midpoints.len(), midpoint_free);
+        let sample_midpoints: Vec<_> = self.midpoints.points.iter().map(|s| s.point).collect();
+        let sample_midpoint_free = self
+            .map
+            .seen_free(&sample_midpoints)
+            .unwrap()
+            .into_iter()
+            .filter(|v| *v)
+            .count();
+        let final_s = final_started.elapsed().as_secs_f64();
+        let final_cpu_s = cpu_seconds() - final_cpu;
+        let groups: Vec<_> = (0..8)
+            .filter(|g| o.scene != "recorded" || *g == 0)
+            .map(|g| {
+                let name = if o.scene == "recorded" {
+                    "unlabelled"
+                } else {
+                    GROUPS[g]
+                };
+                (
+                    name,
+                    object(&[
+                        ("total", self.total[g].to_string()),
+                        ("inserted_total", self.inserted[g].to_string()),
+                        (
+                            "online_free",
+                            if o.mode == "online" {
+                                self.online[g].to_string()
+                            } else {
+                                "null".into()
+                            },
+                        ),
+                        ("sampled", sampled[g].to_string()),
+                        ("final_free", sample_free[g].to_string()),
+                        (
+                            "late_free",
+                            if o.mode == "online" {
+                                late_free[g].to_string()
+                            } else {
+                                "null".into()
+                            },
+                        ),
+                        ("final_exact", final_exact[g].to_string()),
+                    ]),
+                )
+            })
+            .collect();
+        let metric = |f: fn(&FrameMetric) -> f64| {
+            distribution(&self.metrics.iter().map(f).collect::<Vec<_>>())
+        };
+        let p = &o.params;
+        let mut values = vec![
+            ("scene", js(&o.scene)),
+            ("case", js(&o.name)),
+            ("mode", js(&o.mode)),
+            ("sampling", js(&o.sampling)),
+            ("resolution", p.resolution.to_string()),
+            ("unknown", p.inflate_unknown.to_string()),
+            ("compensation", p.inflate_unknown_compensation.to_string()),
+            ("hits", p.inflate_hits_dist.to_string()),
+            ("window_frames", p.sliding_window_size.to_string()),
+            ("down_sampling", js(&format!("{:?}", p.down_sampling))),
+            ("max_range", p.max_range.to_string()),
+            ("merge_frames", o.merge.to_string()),
+            ("direction_start", o.direction_start.to_string()),
+            ("sensor_origin_body", array(&support::SENSOR)),
+            ("frames", self.frames.to_string()),
+            ("selected_frames", self.selected.to_string()),
+            ("points", self.total.iter().sum::<u64>().to_string()),
+            (
+                "duration_s",
+                (self.last_time - self.first_time.unwrap_or(self.last_time)).to_string(),
+            ),
+            ("insert_calls", self.calls.to_string()),
+            (
+                "insert_ms_per_frame",
+                (self.insert_s * 1e3 / self.frames as f64).to_string(),
+            ),
+            (
+                "insert_ms_per_selected_frame",
+                (self.insert_s * 1e3 / self.selected.max(1) as f64).to_string(),
+            ),
+            (
+                "query_ms_per_frame",
+                (self.query_s * 1e3 / self.frames as f64).to_string(),
+            ),
+            (
+                "assemble_ms_per_frame",
+                (self.assemble_s * 1e3 / self.frames as f64).to_string(),
+            ),
+            (
+                "cpu_ms_per_frame",
+                (self.cpu_s * 1e3 / self.frames as f64).to_string(),
+            ),
+            (
+                "insert_ms_distribution_source_frames",
+                metric(|m| m.insert_ms),
+            ),
+            (
+                "query_ms_distribution_source_frames",
+                metric(|m| m.query_ms),
+            ),
+            ("cpu_ms_distribution_source_frames", metric(|m| m.cpu_ms)),
+            ("latency_query_s", self.latency_s.to_string()),
+            ("latency_query_cpu_s", self.latency_cpu_s.to_string()),
+            ("final_propagate_s", self.final_propagate_s.to_string()),
+            (
+                "final_propagate_cpu_s",
+                self.final_propagate_cpu_s.to_string(),
+            ),
+            (
+                "native_wall_s",
+                (self.assemble_s + self.insert_s + self.query_s + self.final_propagate_s)
+                    .to_string(),
+            ),
+            (
+                "native_cpu_s",
+                (self.cpu_s + self.final_propagate_cpu_s).to_string(),
+            ),
+            ("final_exact_replay_query_s", final_s.to_string()),
+            ("final_exact_replay_query_cpu_s", final_cpu_s.to_string()),
+            ("whole_run_s", started.elapsed().as_secs_f64().to_string()),
+            ("map_bytes", self.map.memory_bytes().to_string()),
+            ("map_peak_bytes", self.peak_tree.to_string()),
+            ("window_bytes", self.map.window_memory_bytes().to_string()),
+            ("window_peak_bytes", self.peak_window.to_string()),
+            ("map_nodes", self.map.num_nodes().to_string()),
+            ("peak_rss_kib", peak_kib().to_string()),
+            ("sample_cap", SAMPLE_CAP.to_string()),
+            ("samples", self.samples.points.len().to_string()),
+            (
+                "sample_bytes",
+                (self.samples.points.capacity() * std::mem::size_of::<Sample>()).to_string(),
+            ),
+            ("max_pending_points", self.max_pending.to_string()),
+            ("merged_points_bytes", (self.max_pending * 12).to_string()),
+            ("max_origin_shift_m", self.max_origin_shift.to_string()),
+            ("ray_midpoints", midpoints.len().to_string()),
+            ("ray_midpoints_free", midpoint_free.to_string()),
+            (
+                "ray_midpoints_all_source_total",
+                self.midpoints.count.to_string(),
+            ),
+            ("ray_midpoints_sampled", sample_midpoints.len().to_string()),
+            (
+                "ray_midpoints_sampled_free",
+                sample_midpoint_free.to_string(),
+            ),
+            ("groups", object(&groups)),
+            (
+                "latency",
+                if o.mode == "online" && o.scene != "recorded" {
+                    self.latency.json()
+                } else {
+                    "null".into()
+                },
+            ),
+        ];
+        if o.scene != "recorded" {
+            values.push((
+                "static_total",
+                self.total[..6].iter().sum::<u64>().to_string(),
+            ));
+            values.push((
+                "static_online_false_free",
+                if o.mode == "online" {
+                    self.online[..6].iter().sum::<u64>().to_string()
+                } else {
+                    "null".into()
+                },
+            ));
+            values.push((
+                "static_final_false_free",
+                final_exact[..6].iter().sum::<u64>().to_string(),
+            ));
+        }
+        println!("{}", object(&values));
+        if let Some(path) = &o.metrics {
+            let mut file = File::create(path).unwrap();
+            writeln!(
+                file,
+                "source_frame,selected,points,insert_ms,query_ms,cpu_ms,tree_bytes,window_bytes"
+            )
+            .unwrap();
+            for m in &self.metrics {
+                writeln!(
+                    file,
+                    "{},{},{},{},{},{},{},{}",
+                    m.frame,
+                    m.selected,
+                    m.points,
+                    m.insert_ms,
+                    m.query_ms,
+                    m.cpu_ms,
+                    m.tree,
+                    m.window
+                )
+                .unwrap();
+            }
+        }
     }
 }
 
 fn main() {
-    let args: Vec<_> = std::env::args().collect();
-    assert!(
-        args.len() >= 3,
-        "用法: online_params sparse|dense|recorded 参数名称 [实录路径] [帧数，0表示全部]"
-    );
-    let (scene, name) = (args[1].as_str(), args[2].as_str());
-    let (p, merge) = config(name);
-    let mut eval = Eval::new(&p);
+    let o = Options::parse();
+    if o.scene == "saved" {
+        saved::evaluate(&o);
+        return;
+    }
     let started = Instant::now();
-    let mut pending = Vec::with_capacity(merge);
-    let mut process = |scan: Scan| {
-        pending.push(scan);
-        if pending.len() == merge {
-            eval.batch(&pending);
+    if o.scene == "density" {
+        let mut values = Vec::new();
+        for scene in ["sparse", "dense", "l2", "recorded"] {
+            let mut input = Input::new(scene, o.path.as_deref(), o.limit, o.direction_start);
+            let mut density = Density::new();
+            while let Some(scan) = input.next() {
+                density.observe(&scan);
+            }
+            values.push((scene, density.json()));
+        }
+        println!(
+            "{}",
+            object(&[
+                ("analysis", js("input_density")),
+                ("sensor_origin_body", array(&support::SENSOR)),
+                ("min_range_m", "0.2".into()),
+                ("bin_width_deg", "10".into()),
+                ("sources", object(&values)),
+                ("whole_run_s", started.elapsed().as_secs_f64().to_string())
+            ])
+        );
+        return;
+    }
+    let mut eval = Eval::new(&o.params);
+    let mut input = o.input();
+    let mut selector = Selector::new(&o.sampling);
+    let mut pending = Vec::new();
+    let mut selected_pending = 0;
+    while let Some(scan) = input.next() {
+        let selected = selector.selects(&scan);
+        selected_pending += usize::from(selected);
+        pending.push((scan, selected));
+        if o.merge == 1 || selected_pending >= o.merge {
+            eval.batch(&pending, o.mode == "online", o.scene != "recorded");
             pending.clear();
+            selected_pending = 0;
         }
-    };
-    match scene {
-        "sparse" | "dense" => {
-            for frame in 0..90 {
-                process(synthetic(frame, scene == "dense"));
-            }
-        }
-        "recorded" => {
-            let mut file = BufReader::new(File::open(&args[3]).unwrap());
-            let limit: usize = args.get(4).map_or(0, |s| s.parse().unwrap());
-            let mut frames = 0;
-            while let Some(scan) = recorded(&mut file) {
-                process(scan);
-                frames += 1;
-                if limit != 0 && frames >= limit {
-                    break;
-                }
-            }
-        }
-        _ => panic!("未知场景"),
     }
     if !pending.is_empty() {
-        eval.batch(&pending);
+        eval.batch(&pending, o.mode == "online", o.scene != "recorded");
     }
-    eval.report(scene, name, &p, merge, started.elapsed().as_secs_f64());
+    assert!(eval.frames > 0, "输入没有帧");
+    if o.mode == "offline" {
+        let t = Instant::now();
+        let c = cpu_seconds();
+        eval.map.propagate();
+        eval.final_propagate_s = t.elapsed().as_secs_f64();
+        eval.final_propagate_cpu_s = cpu_seconds() - c;
+        eval.peak_tree = eval.peak_tree.max(eval.map.memory_bytes());
+    }
+    eval.report(&o, started);
 }

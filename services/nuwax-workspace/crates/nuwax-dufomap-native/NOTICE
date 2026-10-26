@@ -11,6 +11,10 @@ nuwax-dufomap-native 引入的上游代码
    参数默认值取自上游 config.toml。
    G3 本地扩展：派生地图旁观首次 setSeenFree 迁移，返回带深度的有符号空单元键，
    供在线历史撤销；不改积分规则。深复制仅用于既有私有内核暂存/物化，不共享可变八叉树。
+   G3 滑动窗口扩展：开放上游 IntegrationParams::sliding_window_size，默认0；直接使用上游逐帧
+   原点射线网格窗口，不修改积分算法。clear同步释放misses/hits窗口并重置下标，值复制包含窗口。
+   memory_bytes仅统计八叉树，window_memory_bytes另报窗口容器/桶/键与网格载荷的常驻估算量，
+   不含哈希节点实现开销、分配器元数据和积分临时并集。
 
 2. UFOMap（DUFOMap 的子模块）
    来源：https://github.com/UnknownFreeOccupied/ufomap

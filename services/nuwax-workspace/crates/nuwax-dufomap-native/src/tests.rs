@@ -133,6 +133,7 @@ fn online_marks_person_entering_space_seen_free_earlier() {
 fn clear_resets_map_and_rejects_invalid_input() {
     assert!(DufoMap::new(&Params { resolution: 0.0, ..Params::default() }).is_err());
     assert!(DufoMap::new(&Params { levels: 1, ..Params::default() }).is_err());
+    assert!(DufoMap::new(&Params { sliding_window_size: u32::MAX, ..Params::default() }).is_err());
     let mut map = DufoMap::new(&Params::default()).unwrap();
     assert!(map.insert(&[[1.0, 0.0, 0.0]], [f32::NAN, 0.0, 0.0], true).is_err());
     let before = map.num_nodes();
@@ -150,9 +151,16 @@ fn clear_resets_map_and_rejects_invalid_input() {
 
 #[test]
 fn incremental_free_cells_match_final_query_and_clone_is_independent() {
+    for window in [0, 1, 3, 10] {
+        check_incremental_free_cells(window);
+    }
+}
+
+fn check_incremental_free_cells(window: u32) {
     use std::collections::HashSet;
     let params = Params { resolution: 0.15, inflate_unknown: 3,
-        inflate_unknown_compensation: false, inflate_hits_dist: 0.25, ..Params::default() };
+        inflate_unknown_compensation: false, inflate_hits_dist: 0.25,
+        sliding_window_size: window, ..Params::default() };
     let mut tracked = DufoMap::new(&params).unwrap();
     let mut original = DufoMap::new(&params).unwrap();
     let mut cells = HashSet::new();
@@ -167,13 +175,14 @@ fn incremental_free_cells_match_final_query_and_clone_is_independent() {
         assert_eq!(tracked.seen_free(&points).unwrap(), original.seen_free(&points).unwrap(),
             "追踪不能改变上游积分结果");
         probes.extend(points.iter().step_by(13).copied());
+        probes.extend(points.iter().step_by(23).map(|p| std::array::from_fn(|axis| (p[axis] + origin[axis]) * 0.5)));
     }
     let from_cells: Vec<_> = probes.iter().map(|p| {
         let key = p.map(|v| (v as f64 / params.resolution).floor() as i32);
         (0..=1).any(|depth| { let step = 1 << depth;
             cells.contains(&(key.map(|v| v.div_euclid(step) * step), depth)) })
     }).collect();
-    assert_eq!(from_cells, tracked.seen_free(&probes).unwrap(), "增量撤销应等于最终空体素判定");
+    assert_eq!(from_cells, tracked.seen_free(&probes).unwrap(), "窗口{window}：增量撤销应等于最终空体素判定");
     assert!(from_cells.iter().any(|v| *v));
     let mut copy = tracked.clone();
     copy.clear();
@@ -182,6 +191,55 @@ fn incremental_free_cells_match_final_query_and_clone_is_independent() {
     tracked.clear();
     let (origin, points, _) = scan(40);
     assert!(!tracked.insert_with_free_cells(&points, origin).unwrap().is_empty(), "新会话重新交付空体素");
+}
+
+#[test]
+fn sliding_window_accumulates_sparse_rays_clones_history_and_clears_session() {
+    let params = Params { sliding_window_size: 3, inflate_unknown_compensation: false, ..Params::default() };
+    let mut map = DufoMap::new(&params).unwrap();
+    let mut single = DufoMap::new(&Params { sliding_window_size: 1, ..params.clone() }).unwrap();
+    assert_eq!(Params::default().sliding_window_size, 0);
+    assert_eq!(map.window_memory_bytes(), 0);
+    let frames: Vec<_> = (0..9).map(|frame| {
+        let (origin, points, _) = scan(frame + 40);
+        let sparse = points.into_iter().enumerate().filter_map(|(i, p)| (i % 3 == frame % 3).then_some(p)).collect::<Vec<_>>();
+        (origin, sparse)
+    }).collect();
+    let probes: Vec<_> = frames.iter().flat_map(|(origin, points)| points.iter().step_by(7)
+        .map(|p| std::array::from_fn(|axis| (p[axis] + origin[axis]) * 0.5))).collect();
+    for (origin, points) in &frames[..2] {
+        map.insert(points, *origin, true).unwrap();
+        single.insert(points, *origin, true).unwrap();
+    }
+    assert!(map.window_memory_bytes() > 0, "窗口应实际保留射线与命中网格");
+    assert_eq!(single.window_memory_bytes(), 0, "窗口1沿用上游单帧分支");
+    let mut copy = map.clone();
+    assert_eq!(copy.window_memory_bytes(), map.window_memory_bytes());
+    let mut more_free_than_single = false;
+    // 相同后续输入跨过环形回绕，深复制必须连窗口内容和下标一起保留。
+    for (origin, points) in &frames[2..] {
+        map.insert(points, *origin, true).unwrap();
+        copy.insert(points, *origin, true).unwrap();
+        single.insert(points, *origin, true).unwrap();
+        let expected = map.seen_free(&probes).unwrap();
+        assert_eq!(copy.seen_free(&probes).unwrap(), expected, "深复制后的窗口续算必须逐点一致");
+        let single_free = single.seen_free(&probes).unwrap();
+        more_free_than_single |= expected.iter().zip(single_free).any(|(window, one)| *window && !one);
+    }
+    assert!(more_free_than_single, "稀疏互补射线须通过窗口产生单帧没有的空闲证据");
+    let retained = map.seen_free(&probes).unwrap();
+    copy.clear();
+    assert_eq!(copy.window_memory_bytes(), 0, "清空必须释放两类窗口网格");
+    assert!(copy.seen_free(&probes).unwrap().iter().all(|free| !free));
+    let mut fresh = DufoMap::new(&params).unwrap();
+    // 新会话使用反向顺序，旧 misses 或 hits 残留都会影响与新地图的逐点比较。
+    for (origin, points) in frames.iter().rev() {
+        copy.insert(points, *origin, true).unwrap();
+        fresh.insert(points, *origin, true).unwrap();
+        assert_eq!(copy.seen_free(&probes).unwrap(), fresh.seen_free(&probes).unwrap(), "清空后的窗口必须等于新会话");
+        assert_eq!(copy.window_memory_bytes(), fresh.window_memory_bytes());
+    }
+    assert_eq!(map.seen_free(&probes).unwrap(), retained, "副本清空与续算不得改变原地图和窗口");
 }
 
 /// 单位四元数 (w, x, y, z) 旋转向量。

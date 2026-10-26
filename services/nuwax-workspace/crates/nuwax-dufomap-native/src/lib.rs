@@ -25,6 +25,7 @@ struct RawParams {
     hit_depth: u32,
     miss_depth: u32,
     only_valid: u8,
+    sliding_window_size: u32,
 }
 
 extern "C" {
@@ -35,6 +36,7 @@ extern "C" {
     fn nuwax_dufomap_propagate(handle: *mut c_void);
     fn nuwax_dufomap_seen_free(handle: *const c_void, xyz: *const f32, n: usize, out: *mut u8) -> i32;
     fn nuwax_dufomap_memory_bytes(handle: *const c_void) -> usize;
+    fn nuwax_dufomap_window_memory_bytes(handle: *const c_void) -> usize;
     fn nuwax_dufomap_num_nodes(handle: *const c_void) -> usize;
     fn nuwax_dufomap_clear(handle: *mut c_void);
     fn nuwax_dufomap_clone(handle: *const c_void) -> *mut c_void;
@@ -59,7 +61,7 @@ pub enum DownSampling {
     Uniform = 3,
 }
 
-/// 与上游 `dufomap.toml` 一一对应；[`Default`] 取上游默认配置。
+/// 对应上游 DUFOMap 配置与积分参数；[`Default`] 取上游默认值。
 #[derive(Clone, Debug, PartialEq)]
 pub struct Params {
     /// 体素边长（米），论文中的 v。
@@ -82,6 +84,9 @@ pub struct Params {
     pub hit_depth: u32,
     pub miss_depth: u32,
     pub only_valid: bool,
+    /// 最近几次插入的射线网格合并后再判空；0（上游默认）与1均只使用当前帧。
+    /// 每次插入保留自己的传感器原点，窗口中的命中共同保护静态点。
+    pub sliding_window_size: u32,
 }
 
 impl Default for Params {
@@ -101,6 +106,7 @@ impl Default for Params {
             hit_depth: 0,
             miss_depth: 0,
             only_valid: false,
+            sliding_window_size: 0,
         }
     }
 }
@@ -122,6 +128,7 @@ impl Params {
             hit_depth: self.hit_depth,
             miss_depth: self.miss_depth,
             only_valid: self.only_valid as u8,
+            sliding_window_size: self.sliding_window_size,
         }
     }
 }
@@ -143,7 +150,7 @@ pub struct DufoMap {
 unsafe impl Send for DufoMap {}
 
 impl DufoMap {
-    /// 在线单次积分并交付新增空单元；不会复制整棵树，也不保存扫描历史。
+    /// 在线单次积分并交付新增空单元；不会复制整棵树，启用窗口时仅保留有限帧的射线网格。
     pub fn insert_with_free_cells(&mut self, points: &[[f32; 3]], origin: [f32; 3]) -> Result<Vec<FreeCell>, String> {
         unsafe { nuwax_dufomap_track_free(self.handle.as_ptr()) };
         let result = self.insert(points, origin, true);
@@ -198,16 +205,22 @@ impl DufoMap {
         Ok(out)
     }
 
-    /// 八叉树已分配的内存（字节）。
+    /// 八叉树已分配的内存（字节），不包含滑动窗口和积分临时内存。
     pub fn memory_bytes(&self) -> usize {
         unsafe { nuwax_dufomap_memory_bytes(self.handle.as_ptr()) }
+    }
+
+    /// 滑动窗口常驻内存的估算值（字节）：容器容量、哈希桶及键/网格有效载荷。
+    /// 不包含哈希节点实现开销、分配器元数据和积分时的临时并集；未启用窗口或清空后为0。
+    pub fn window_memory_bytes(&self) -> usize {
+        unsafe { nuwax_dufomap_window_memory_bytes(self.handle.as_ptr()) }
     }
 
     pub fn num_nodes(&self) -> usize {
         unsafe { nuwax_dufomap_num_nodes(self.handle.as_ptr()) }
     }
 
-    /// 清空地图，保留参数，供新建图会话复用。
+    /// 清空地图及窗口射线与下标，保留参数，供新建图会话复用。
     pub fn clear(&mut self) {
         unsafe { nuwax_dufomap_clear(self.handle.as_ptr()) }
     }

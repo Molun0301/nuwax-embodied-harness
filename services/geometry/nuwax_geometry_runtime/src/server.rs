@@ -11994,7 +11994,15 @@ use nuwax_protocol::RawLcmFrame;
             let mut last_points = Vec::new();
             let mut removed_total = 0;
             let mut trace = Vec::new();
-            for frame in 1..=22 {
+            // 未知人体离开后，继续真实空场观测直到命中退出滑动窗口，并覆盖三种扫描相位。
+            let last_frame = if initially_unknown_person
+                && crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::DufoMap
+            {
+                22.max(12 + u64::from(crate::dynamic_backend::online_params().sliding_window_size) + 3)
+            } else {
+                22
+            };
+            for frame in 1..=last_frame {
                 let person = if initially_unknown_person {
                     if frame <= 3 {
                         Some(-0.5)

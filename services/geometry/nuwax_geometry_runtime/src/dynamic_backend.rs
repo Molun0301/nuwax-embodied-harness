@@ -38,9 +38,10 @@ pub(crate) fn backend() -> Backend {
 pub(crate) fn online_params() -> Params {
     Params {
         resolution: 0.15,
-        inflate_unknown: 3,
+        inflate_unknown: 2,
         inflate_unknown_compensation: false,
-        inflate_hits_dist: 0.25,
+        inflate_hits_dist: 0.30,
+        sliding_window_size: 30,
         ..Params::default()
     }
 }

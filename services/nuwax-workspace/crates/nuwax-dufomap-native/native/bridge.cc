@@ -9,7 +9,9 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <new>
+#include <type_traits>
 #include <vector>
 #include <cmath>
 
@@ -52,7 +54,7 @@ void write_error(char* out, std::size_t len, char const* message)
 
 extern "C" {
 
-// 与上游 dufomap 配置项一一对应；取值含义见 native/upstream/dufomap/config.toml。
+// 对应上游 dufomap 配置及 IntegrationParams；取值含义见 config.toml 与积分参数头文件。
 struct nuwax_dufomap_params {
 	double   resolution;
 	uint32_t levels;
@@ -68,6 +70,7 @@ struct nuwax_dufomap_params {
 	uint32_t hit_depth;
 	uint32_t miss_depth;
 	uint8_t  only_valid;
+	uint32_t sliding_window_size;
 };
 
 void* nuwax_dufomap_new(nuwax_dufomap_params const* p, char* err, std::size_t err_len)
@@ -79,6 +82,10 @@ void* nuwax_dufomap_new(nuwax_dufomap_params const* p, char* err, std::size_t er
 		}
 		if (!(p->resolution > 0.0) || p->levels < 2 || p->levels > 21) {
 			write_error(err, err_len, "分辨率必须为正，八叉树层数须在2～21之间");
+			return nullptr;
+		}
+		if (p->sliding_window_size > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+			write_error(err, err_len, "滑动窗口帧数超出上游整数范围");
 			return nullptr;
 		}
 		auto* m = new NuwaxDufoMap(p->resolution, static_cast<ufo::depth_t>(p->levels));
@@ -96,6 +103,7 @@ void* nuwax_dufomap_new(nuwax_dufomap_params const* p, char* err, std::size_t er
 		ip.hit_depth                     = static_cast<ufo::depth_t>(p->hit_depth);
 		ip.miss_depth                    = static_cast<ufo::depth_t>(p->miss_depth);
 		ip.only_valid                    = p->only_valid != 0;
+		ip.sliding_window_size           = static_cast<int>(p->sliding_window_size);
 		// 不在库内开线程；并行由调用方按设备核心数决定。
 		ip.parallel = false;
 		return m;
@@ -111,6 +119,7 @@ void nuwax_dufomap_free(void* handle) { delete static_cast<NuwaxDufoMap*>(handle
 
 void* nuwax_dufomap_clone(void const* handle)
 {
+	// IntegrationParams 的值复制同时深复制 misses/hits 容器及其环形下标。
 	try { return new NuwaxDufoMap(*static_cast<NuwaxDufoMap const*>(handle)); }
 	catch (...) { return nullptr; }
 }
@@ -208,9 +217,36 @@ std::size_t nuwax_dufomap_num_nodes(void const* handle)
 	return m == nullptr ? 0 : m->map.numNodes();
 }
 
+std::size_t nuwax_dufomap_window_memory_bytes(void const* handle)
+{
+	auto const* m = static_cast<NuwaxDufoMap const*>(handle);
+	if (m == nullptr) return 0;
+	// 仅统计公开容器可确定的容量与有效载荷，避免把实现相关的节点开销冒充精确分配量。
+	auto bytes = [](auto const& window) {
+		using GridMap = typename std::decay_t<decltype(window)>::value_type;
+		std::size_t total = window.capacity() * sizeof(GridMap);
+		for (auto const& grids : window) {
+			// 默认空 unordered_map 的单桶可内嵌于对象中，不重复计为堆分配。
+			if (grids.bucket_count() > 1) total += grids.bucket_count() * sizeof(void*);
+			total += grids.size() * sizeof(typename GridMap::value_type);
+		}
+		return total;
+	};
+	return bytes(m->params.misses) + bytes(m->params.hits);
+}
+
 void nuwax_dufomap_clear(void* handle)
 {
 	auto* m = static_cast<NuwaxDufoMap*>(handle);
-	if (m != nullptr) { m->map.clear(); m->map.newly_free.clear(); m->map.tracking = false; }
+	if (m != nullptr) {
+		m->map.clear();
+		m->map.newly_free.clear();
+		m->map.tracking = false;
+		// 窗口随会话重置并释放常驻网格，下一会话不能继承上一会话的射线或命中保护。
+		decltype(m->params.misses){}.swap(m->params.misses);
+		decltype(m->params.hits){}.swap(m->params.hits);
+		m->params.misses_idx = 0;
+		m->params.hits_idx = 0;
+	}
 }
 }

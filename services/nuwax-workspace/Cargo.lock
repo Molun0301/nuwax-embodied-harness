@@ -1600,6 +1600,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuwax-dufomap-native"
+version = "0.1.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "nuwax-exploration"
 version = "0.1.0"
 dependencies = [

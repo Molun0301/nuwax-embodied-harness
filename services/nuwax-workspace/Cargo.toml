@@ -58,6 +58,7 @@ members = [
     # 多层表面规划与运动运行时
     "crates/nuwax-nav-mls-planner",
     "crates/nuwax-nav-pct-native",
+    "crates/nuwax-dufomap-native",
     "crates/nuwax-nav-scan-native",
     "crates/nuwax-motion-safety-guard",
     "crates/nuwax-nav-runtime",

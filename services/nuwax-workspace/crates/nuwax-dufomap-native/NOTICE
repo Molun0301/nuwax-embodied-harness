@@ -1,0 +1,32 @@
+nuwax-dufomap-native 引入的上游代码
+
+1. DUFOMap
+   来源：https://github.com/KTH-RPL/dufomap
+   固定提交：9e239ddd5995136e14f5212f33382a6ebc59e518（2025-08-31）
+   许可证：BSD-3-Clause，见 native/upstream/dufomap/LICENSE
+   引用：Duberg D., Zhang Q., Jia M., Jensfelt P. "DUFOMap: Efficient Dynamic Awareness Mapping",
+   IEEE Robotics and Automation Letters, 2024.
+   本地使用：native/upstream/dufomap/dufomap.cpp 与 config.toml 仅作参考，不参与编译；
+   native/bridge.cc 只封装其核心流程（带原点逐帧插入、传播、按“曾被观测为空”判定点），
+   参数默认值取自上游 config.toml。
+
+2. UFOMap（DUFOMap 的子模块）
+   来源：https://github.com/UnknownFreeOccupied/ufomap
+   固定提交：fcb20f445d257280c039c07ab756c9d5b37ebd78（2024-04-19）
+   许可证：BSD-3-Clause，见 native/upstream/ufomap/LICENSE
+   只引入 include/ 头文件；src/map/io.cpp（地图文件读写，依赖 LZ4）未引入，本封装不读写地图文件。
+   本地修改（Nuwax，2026-10-26）：
+   a. include/ufo/map/{key.hpp,code.hpp,ray_caster/ray_caster.hpp}：
+      `#include <immintrin.h>` 只在 x86 上包含。BMI2 指令原本已有 `__BMI2__` 条件和软件实现，
+      其它平台走软件实现。
+   b. include/ufo/map/integration/misses.hpp：上游非并行分支为 `// TODO: Implement`，直接返回空集合，
+      未定义 UFO_PARALLEL（需要 TBB 与 OpenMP）时不会记录任何空闲体素。按并行分支逐项补全为单线程实现。
+   c. include/ufo/map/octree/octree.hpp `toKey`：负坐标的 floor 结果原先直接转为无符号键类型，属于
+      未定义行为。x86 上恰好按模回绕得到正确键；aarch64 上 fcvtzu 饱和为 0，所有负坐标落到同一键。
+      改为先转 int64_t 再转无符号。回归用例：negative_coordinates_keep_distinct_voxels_and_free_space。
+
+3. liblzf
+   来源：http://dist.schmorp.de/liblzf/liblzf-3.6.tar.gz
+   （SHA-256 9c5de01f7b9ccae40c3f619d26a7abec9986c06c36d260c179cedd04b89fb46a）
+   许可证：BSD-2-Clause（另可选 GPL-2.0），见 native/upstream/liblzf/LICENSE
+   只引入 lzf.h：UFOMap 的 point_cloud.hpp 包含该头文件，但本封装用到的代码不调用 liblzf 函数。

@@ -37,6 +37,17 @@ extern "C" {
     fn nuwax_dufomap_memory_bytes(handle: *const c_void) -> usize;
     fn nuwax_dufomap_num_nodes(handle: *const c_void) -> usize;
     fn nuwax_dufomap_clear(handle: *mut c_void);
+    fn nuwax_dufomap_clone(handle: *const c_void) -> *mut c_void;
+    fn nuwax_dufomap_track_free(handle: *mut c_void);
+    fn nuwax_dufomap_free_cells(handle: *mut c_void, out: *mut FreeCell, capacity: usize) -> usize;
+}
+
+/// 首次被观测为空的八叉树单元；key 为以分辨率为单位的有符号下界，边长为 2^depth。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FreeCell {
+    pub key: [i32; 3],
+    pub depth: u32,
 }
 
 /// 插入前的降采样方式，与上游 `down_sampling_method` 相同。
@@ -123,6 +134,7 @@ fn error_text(buffer: &[c_char; ERROR_LEN], fallback: &str) -> String {
 }
 
 /// 一张 DUFOMap 地图。可在线程间移交，不可并发访问。
+#[derive(Debug)]
 pub struct DufoMap {
     handle: NonNull<c_void>,
 }
@@ -131,6 +143,16 @@ pub struct DufoMap {
 unsafe impl Send for DufoMap {}
 
 impl DufoMap {
+    /// 在线单次积分并交付新增空单元；不会复制整棵树，也不保存扫描历史。
+    pub fn insert_with_free_cells(&mut self, points: &[[f32; 3]], origin: [f32; 3]) -> Result<Vec<FreeCell>, String> {
+        unsafe { nuwax_dufomap_track_free(self.handle.as_ptr()) };
+        let result = self.insert(points, origin, true);
+        let count = unsafe { nuwax_dufomap_free_cells(self.handle.as_ptr(), std::ptr::null_mut(), 0) };
+        let mut cells = vec![FreeCell::default(); count];
+        unsafe { nuwax_dufomap_free_cells(self.handle.as_ptr(), cells.as_mut_ptr(), cells.len()) };
+        result.map(|_| cells)
+    }
+
     pub fn new(params: &Params) -> Result<Self, String> {
         let raw = params.raw();
         let mut err = [0 as c_char; ERROR_LEN];
@@ -188,6 +210,13 @@ impl DufoMap {
     /// 清空地图，保留参数，供新建图会话复用。
     pub fn clear(&mut self) {
         unsafe { nuwax_dufomap_clear(self.handle.as_ptr()) }
+    }
+}
+
+impl Clone for DufoMap {
+    fn clone(&self) -> Self {
+        let handle = unsafe { nuwax_dufomap_clone(self.handle.as_ptr()) };
+        Self { handle: NonNull::new(handle).expect("复制 DUFOMap 内存不足") }
     }
 }
 

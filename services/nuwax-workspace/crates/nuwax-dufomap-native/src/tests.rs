@@ -135,11 +135,53 @@ fn clear_resets_map_and_rejects_invalid_input() {
     assert!(DufoMap::new(&Params { levels: 1, ..Params::default() }).is_err());
     let mut map = DufoMap::new(&Params::default()).unwrap();
     assert!(map.insert(&[[1.0, 0.0, 0.0]], [f32::NAN, 0.0, 0.0], true).is_err());
+    let before = map.num_nodes();
+    for point in [[f32::NAN, 0.0, 0.0], [f32::INFINITY, 0.0, 0.0], [1e20, 0.0, 0.0]] {
+        assert!(map.insert(&[[1.0, 0.0, 0.0], point], [0.0; 3], true).is_err());
+        assert_eq!(map.num_nodes(), before, "非法点须在修改原生地图之前拒绝整帧");
+        assert!(map.seen_free(&[point]).is_err());
+    }
     let (origin, points, _) = scan(40);
     map.insert(&points, origin, true).unwrap();
     assert!(map.num_nodes() > 0);
     map.clear();
     assert!(map.seen_free(&points).unwrap().iter().all(|flag| !flag), "清空后不应保留空闲证据");
+}
+
+#[test]
+fn incremental_free_cells_match_final_query_and_clone_is_independent() {
+    use std::collections::HashSet;
+    let params = Params { resolution: 0.15, inflate_unknown: 3,
+        inflate_unknown_compensation: false, inflate_hits_dist: 0.25, ..Params::default() };
+    let mut tracked = DufoMap::new(&params).unwrap();
+    let mut original = DufoMap::new(&params).unwrap();
+    let mut cells = HashSet::new();
+    let mut probes = Vec::new();
+    for frame in 0..60 {
+        let (origin, points, _) = scan(frame);
+        for cell in tracked.insert_with_free_cells(&points, origin).unwrap() {
+            assert!(cell.depth <= 1, "默认射线深度只生成叶子或其父单元");
+            cells.insert((cell.key, cell.depth));
+        }
+        original.insert(&points, origin, true).unwrap();
+        assert_eq!(tracked.seen_free(&points).unwrap(), original.seen_free(&points).unwrap(),
+            "追踪不能改变上游积分结果");
+        probes.extend(points.iter().step_by(13).copied());
+    }
+    let from_cells: Vec<_> = probes.iter().map(|p| {
+        let key = p.map(|v| (v as f64 / params.resolution).floor() as i32);
+        (0..=1).any(|depth| { let step = 1 << depth;
+            cells.contains(&(key.map(|v| v.div_euclid(step) * step), depth)) })
+    }).collect();
+    assert_eq!(from_cells, tracked.seen_free(&probes).unwrap(), "增量撤销应等于最终空体素判定");
+    assert!(from_cells.iter().any(|v| *v));
+    let mut copy = tracked.clone();
+    copy.clear();
+    assert!(copy.seen_free(&probes).unwrap().iter().all(|v| !v));
+    assert_eq!(from_cells, tracked.seen_free(&probes).unwrap(), "私有副本不得共享可变地图");
+    tracked.clear();
+    let (origin, points, _) = scan(40);
+    assert!(!tracked.insert_with_free_cells(&points, origin).unwrap().is_empty(), "新会话重新交付空体素");
 }
 
 /// 单位四元数 (w, x, y, z) 旋转向量。

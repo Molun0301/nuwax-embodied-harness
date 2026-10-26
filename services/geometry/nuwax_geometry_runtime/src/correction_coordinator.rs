@@ -15528,6 +15528,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
 
         #[test]
         fn accepted_static_scan_reaches_library_and_native_before_keyframes_and_loop_processing() {
+            let _backend = crate::dynamic_backend::test_backend(crate::dynamic_backend::Backend::Legacy);
             use crate::dynamic_scene::tests::{corridor, ORIGIN};
             let (people_scan, labels) = corridor(Some(0.0), 0.0);
             let people = labels.iter().filter(|label| **label).count();

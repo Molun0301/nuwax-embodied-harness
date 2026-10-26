@@ -278,6 +278,8 @@ struct AdmittedRegisteredScanData {
     binding: RegistrationBinding,
     body_points: crate::correction_points::CorrectionPoints,
     labels: OnceLock<Arc<crate::dynamic_scene::FrameDecision>>,
+    static_indices: OnceLock<Arc<[u32]>>,
+    online_frame: OnceLock<std::sync::Weak<crate::dynamic_backend::MappedFrame>>,
 }
 
 impl AdmittedRegisteredScan {
@@ -286,10 +288,16 @@ impl AdmittedRegisteredScan {
         let body_from_map = (binding.registration_map_from_odom * binding.frozen_odom_from_body).inverse();
         let body_points = map_points.iter().map(|point| body_from_map.transform_point(point)).collect::<Vec<_>>();
         Self(Arc::new(AdmittedRegisteredScanData {
-            source, frames, source_point_count, binding, body_points: body_points.into(), labels: OnceLock::new(),
+            source, frames, source_point_count, binding, body_points: body_points.into(), labels: OnceLock::new(), static_indices: OnceLock::new(), online_frame: OnceLock::new(),
         }))
     }
 
+    pub(crate) fn record_static_indices(&self, indices: Vec<u32>, frame: &Arc<crate::dynamic_backend::MappedFrame>) -> Result<(), String> {
+        self.0.static_indices.set(indices.into()).map_err(|_| "原扫描静态索引已记录")?;
+        self.0.online_frame.set(Arc::downgrade(frame)).map_err(|_| "原扫描在线判定已记录".into())
+    }
+    pub(crate) fn static_indices(&self) -> Option<Arc<[u32]>> { self.0.static_indices.get().cloned() }
+    pub(crate) fn online_frame(&self) -> Option<Arc<crate::dynamic_backend::MappedFrame>> { self.0.online_frame.get().and_then(std::sync::Weak::upgrade) }
     pub(crate) fn record_decision(&self,frame:Arc<crate::dynamic_scene::FrameDecision>)->Result<(),String>{
         if frame.labels.source_timestamp_ns!=self.source_timestamp_ns()||frame.labels.labels.len()!=self.body_points().len(){return Err("人体点标签与原扫描来源不一致".into());}
         if let Some(old)=self.0.labels.get(){return if old.labels==frame.labels{Ok(())}else{Err("同一原扫描标签冲突".into())};}
@@ -394,7 +402,7 @@ mod registered_scan_ownership_tests {
 
     fn owner(points: Vec<Point3<f64>>) -> AdmittedRegisteredScan {
         AdmittedRegisteredScan(Arc::new(AdmittedRegisteredScanData {
-            labels: OnceLock::new(),
+            labels: OnceLock::new(), static_indices: OnceLock::new(), online_frame: OnceLock::new(),
             source: SourceIdentity { backend: LIO_BACKEND_DEVICE, runtime_generation: 7,
                 source_sequence: 3, source_timestamp_ns: 10 },
             frames: ["sensor".into(), "body".into(), "odom".into(), "map".into()],
@@ -404,7 +412,7 @@ mod registered_scan_ownership_tests {
 
     fn edited(source: &AdmittedRegisteredScan, edit: impl FnOnce(&mut AdmittedRegisteredScanData)) -> AdmittedRegisteredScan {
         let mut data = AdmittedRegisteredScanData {
-            labels: OnceLock::new(),
+            labels: OnceLock::new(), static_indices: OnceLock::new(), online_frame: OnceLock::new(),
             source: source.0.source, frames: source.0.frames.clone(), source_point_count: source.0.source_point_count,
             binding: source.0.binding.clone(), body_points: source.0.body_points.clone(),
         };

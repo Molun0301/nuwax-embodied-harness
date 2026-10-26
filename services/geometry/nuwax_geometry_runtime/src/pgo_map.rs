@@ -92,6 +92,7 @@ pub(crate) struct ScanHistory {
     point_count: usize,
     incomplete: bool,
     dynamic_scene: crate::dynamic_scene::DynamicScene,
+    dufo: crate::dynamic_backend::OnlineDufo,
     latest_static_scan: Option<(u64, usize, crate::lio_ingress::WeakAdmittedRegisteredScan, Arc<[u32]>)>,
 }
 
@@ -101,6 +102,7 @@ impl ScanHistory {
         self.point_count = 0;
         self.incomplete = false;
         self.dynamic_scene = Default::default();
+        self.dufo = Default::default();
         self.latest_static_scan = None;
     }
 
@@ -125,7 +127,14 @@ impl ScanHistory {
         let body_from_map =
             (binding.registration_map_from_odom * binding.frozen_odom_from_body).inverse();
         let sensor_origin = binding.sensor_origin_map.map(|p| body_from_map * Point3::from(p));
-        let static_indices = if let Some(labels)=source.point_labels(){
+        let static_indices = if let Some(indices) = source.static_indices() { indices.to_vec() }
+        else if crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::DufoMap {
+            if let Some(origin) = sensor_origin {
+                let points: Vec<_> = body_points.iter().map(|p| binding.frozen_odom_from_body * p).collect();
+                let origin = binding.frozen_odom_from_body * origin;
+                self.dufo.observe(&points, origin.coords.into(), source_timestamp_ns, Isometry3::identity())?.1
+            } else { (0..body_points.len() as u32).collect() }
+        } else if let Some(labels)=source.point_labels(){
             labels.labels.iter().enumerate().filter_map(|(i,label)|(!label.dynamic() && *label != crate::human_point_labels::PointLabel::PendingTrack).then_some(i as u32)).collect::<Vec<_>>()
         } else {
             self.dynamic_scene.clear_frame();
@@ -160,11 +169,16 @@ impl ScanHistory {
         if let Some(existing) = self.scans.get(&key) {
             return if existing.source == scan.source { Ok(()) } else { Err("PGO归档来源冲突".into()) };
         }
-        if self.incomplete { return Ok(()); }
+        if self.incomplete {
+            self.dufo = Default::default();
+            return Ok(());
+        }
         if self.point_count.saturating_add(scan.body_points.len()) > MAX_ARCHIVED_POINTS {
             tracing::warn!(event = "pgo.history.exhausted", archived_points = self.point_count,
                 incoming_points = scan.body_points.len(), "PGO归档容量耗尽，本会话停止完整历史校正，正常建图继续");
             self.scans.clear(); self.point_count = 0; self.incomplete = true;
+            // 原始历史退休时一起释放私有兜底证据，不让未分类来源继续积累第二棵树。
+            self.dufo = Default::default();
             return Ok(());
         }
         self.point_count += scan.body_points.len();
@@ -227,6 +241,7 @@ pub(crate) fn optimized_pose(frame: &OptimizedKeyframe) -> Isometry3<f64> {
 
 /// 私有重放拥有方保留内核和动态反证；追赶只追加新扫描，不反复重算历史前缀。
 pub(crate) struct ReplayBuilder {
+    dufo: crate::dynamic_backend::OnlineDufo,
     kernel: mapping_backend::MappingKernel,
     spec: MappingBackendSpec,
     persistent: Option<PersistentOccupancyGrid>,
@@ -306,6 +321,7 @@ impl ReplayBuilder {
         let timeline = CorrectionTimeline::new(keyframes).map_err(|e| e.to_string())?;
         let cloud = CloudMapShmWriter::new_private().map_err(|e| e.to_string())?;
         Ok(Self {
+            dufo: Default::default(),
             kernel: spec.into_kernel(config.window_capacity),
             spec,
             persistent: None,
@@ -424,8 +440,13 @@ impl ReplayBuilder {
                 .map(|point| map_from_body * point)
                 .collect();
             let origin = map_from_body * scan.sensor_origin_body.ok_or("PGO原始扫描缺少实测雷达原点，保留当前地图，不补造射线")?;
-            let dynamic_frame=scan.source.lidar().and_then(|scan|scan.dynamic_frame())
-                .map(|frame|crate::dynamic_scene::MappedFrameDecision::new(frame,map_from_body*scan.odom_from_body.inverse(),&points,0)).transpose()?;
+            let dynamic_frame = if crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::DufoMap {
+                Some(self.dufo.observe(&points, origin.coords.into(), scan.source_timestamp_ns, Isometry3::identity())?.0)
+            } else {
+                scan.source.lidar().and_then(|scan| scan.dynamic_frame())
+                    .map(|frame| crate::dynamic_backend::MappedFrame::new(frame,
+                        map_from_body * scan.odom_from_body.inverse(), &points, 0)).transpose()?
+            };
             let input = Arc::new(MappingBackendInput {
                 session_id: "pgo-private-rebuild".into(),
                 session_generation: 1,
@@ -1014,6 +1035,7 @@ mod tests {
         let next_retained = next.retention_probe_for_test();
         history.record(&next, 21).unwrap();
         assert!(!source_retained());
+        assert_eq!(history.dufo.memory_bytes(), 0, "历史耗尽同时释放私有重算证据");
         assert!(history.snapshot().is_err());
         history.record(&next, 22).unwrap();
         assert_eq!(&*history.static_point_indices(&next).unwrap(), &[0]);
@@ -1027,6 +1049,7 @@ mod tests {
         let latest = AdmittedRegisteredScan::from_map_points_for_test(30, test_binding(), &points);
         let latest_retained = latest.retention_probe_for_test();
         history.record(&latest, 31).unwrap();
+        assert_eq!(history.dufo.memory_bytes(), 0, "不完整会话不能随新来源重新积累私有树");
         assert!(!next_retained());
         drop(latest);
         assert!(!latest_retained());
@@ -1216,7 +1239,12 @@ mod tests {
             assert!(cloud.accumulate_mapping_scan_with_source(1, &points,
                 accepted.lidar().unwrap().scan().binding().sensor_origin_map, scan.source_timestamp_ns, Some(&accepted)));
             scan.source = accepted.source();
-            assert!(scan.source.lidar().unwrap().dynamic_frame().is_some());
+            if crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::Legacy {
+                assert!(scan.source.lidar().unwrap().dynamic_frame().is_some());
+            } else {
+                assert!(scan.source.lidar().unwrap().dynamic_frame().is_none());
+                assert!(scan.source.lidar().unwrap().static_indices().is_some());
+            }
         }
         eprintln!("CLASSIFY_PREP frames={} wall_ms={}", scans.len(), started.elapsed().as_millis());
         cloud.cleanup_product_owned_file().unwrap();
@@ -1303,6 +1331,7 @@ mod tests {
             let config = MappingBackendComputeConfig { resolution: 0.05, initial_safe_radius_meters: 0.0,
                 window_capacity: nuwax_mapping::mapping_session::DEFAULT_BOUNDED_CAPACITY };
             let mut kernel = MappingBackendSpec::Voxel.into_kernel(config.window_capacity);
+            let mut persistent: Option<PersistentOccupancyGrid> = None;
             let (mut classify_ms, mut kernel_ms) = (0.0, 0.0);
             for (index, scan) in scans.iter().enumerate() {
                 let map_points: Vec<_> = scan.body_points.iter().map(|p| scan.odom_from_body * p).collect();
@@ -1324,7 +1353,10 @@ mod tests {
                     dynamic_frame: Some(frame), registered_points_map: map_points.clone() };
                 let kernel_started = Instant::now();
                 mapping_backend::validate_backend_input(&kernel, &input).unwrap();
-                mapping_backend::compute_candidate_in_place(&mut kernel, &input, config).unwrap();
+                if let Some(candidate) = mapping_backend::compute_candidate_in_place(&mut kernel, &input, config).unwrap() {
+                    if let Some(grid) = persistent.as_mut() { grid.merge_observation(&candidate.latest_frame_occupancy).unwrap(); }
+                    else { persistent = Some(PersistentOccupancyGrid::stage_observation(None, &candidate.latest_frame_occupancy).unwrap()); }
+                }
                 kernel_ms += kernel_started.elapsed().as_secs_f64() * 1e3;
                 assert!(cloud.accumulate_mapping_scan_with_source(1, &map_points, Some(sensor_origin),
                     scan.source_timestamp_ns, capture.then_some(&accepted)));
@@ -1346,6 +1378,20 @@ mod tests {
                     stages = [0.0; 3];
                     segment = Duration::ZERO;
                     worst = Duration::ZERO;
+                }
+            }
+            cloud.commit_accumulated().unwrap();
+            let snapshot = cloud.committed_snapshot().unwrap();
+            eprintln!("ONLINE_MAP backend={:?} capture={capture} static_points={} voxel_size={}",
+                crate::dynamic_backend::backend(), snapshot.point_count, snapshot.voxel_size);
+            if let Ok(root) = std::env::var("NUWAX_G3_EVIDENCE_DIR") {
+                let root = std::path::Path::new(&root);
+                std::fs::create_dir_all(root).unwrap();
+                std::fs::write(root.join("静态点云.bin"), &snapshot.xyz_f32_le).unwrap();
+                if let Some(grid) = persistent {
+                    std::fs::write(root.join("二维占据.json"), serde_json::to_vec(&serde_json::json!({
+                        "resolution":grid.grid.resolution,"origin":[grid.grid.origin[0],grid.grid.origin[1]],
+                        "width":grid.grid.width,"height":grid.grid.height,"data":grid.grid.data})).unwrap()).unwrap();
                 }
             }
             cloud.cleanup_product_owned_file().unwrap();

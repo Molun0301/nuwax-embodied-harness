@@ -54,7 +54,7 @@ pub(crate) fn configure_fine_cloud_cache(cache: FineCloudCache) -> Result<(), St
 #[derive(Clone, Copy)]
 pub(super) enum FrameSource<'a> {
     Canonical(&'a crate::admitted_cloud::AcceptedMappingCloud),
-    Corrected(&'a crate::admitted_cloud::AdmittedCloudSource, Option<&'a crate::dynamic_scene::MappedFrameDecision>),
+    Corrected(&'a crate::admitted_cloud::AdmittedCloudSource, Option<&'a crate::dynamic_backend::MappedFrame>),
 }
 
 pub(super) struct FineCloud {
@@ -97,6 +97,7 @@ impl FineCloud {
     }
     pub(super) fn fresh() -> Result<Self, String> { Self::new(VOXEL_SIZE) }
     pub(super) fn removed_keys(&self) -> &[(i32, i32, i32)] { self.dynamic.removed_keys() }
+    pub(super) fn shared_frame(&self) -> Option<&crate::dynamic_backend::MappedFrame> { self.dynamic.shared_frame() }
     pub(super) fn clears(&self, point:[f64;3])->bool {self.dynamic.clears(point)}
     pub(super) fn voxel_size(&self) -> f32 { self.writer.voxel_size_m() }
     pub(super) fn is_dynamic(&self, point: &Point3<f64>) -> bool {
@@ -151,12 +152,15 @@ impl FineCloud {
                     }
                 } else { points }
             } else { points };
-            let shared=match input {
-                Some(FrameSource::Canonical(value))=>value.lidar().and_then(|value|value.scan().dynamic_frame().map(|f|(f,value.scan().binding().registration_map_from_odom,value.map_points().len()-actual.len()))),
-                // Corrected replay uses stored labels, not a new online classification.
-                Some(FrameSource::Corrected(_,frame))=>frame.map(|f|(f.decision.clone(),f.map_from_odom(),0)),
-                None=>None,
-            }.map(|(frame,transform,first)|crate::dynamic_scene::MappedFrameDecision::new(frame,transform,actual,first)).transpose()?;
+            let shared = match input {
+                Some(FrameSource::Canonical(value)) => value.lidar().map(|value| {
+                    if let Some(frame) = value.scan().online_frame() { Ok(Some((*frame).clone())) }
+                    else { value.scan().dynamic_frame().map(|frame| crate::dynamic_backend::MappedFrame::new(frame,
+                        value.scan().binding().registration_map_from_odom, actual, value.map_points().len()-actual.len())).transpose() }
+                }).transpose()?.flatten(),
+                Some(FrameSource::Corrected(_, frame)) => frame.cloned(),
+                None => None,
+            };
             let keys = self.accumulate_inner(actual, origin, timestamp_ns,shared)?;
             if let Some((source, namespace, sequence, first)) = capture {
                 let returns: Vec<_> = actual.iter().zip(keys).enumerate().filter_map(|(index, (point, key))| {
@@ -186,16 +190,23 @@ impl FineCloud {
         }
         result
     }
-    fn accumulate_inner(&mut self, points: &[Point3<f64>], origin: Option<[f64; 3]>, timestamp_ns: u64,shared:Option<crate::dynamic_scene::MappedFrameDecision>) -> Result<Vec<nuwax_map_chunks::Key>, String> {
+    fn accumulate_inner(&mut self, points: &[Point3<f64>], origin: Option<[f64; 3]>, timestamp_ns: u64,mut shared:Option<crate::dynamic_backend::MappedFrame>) -> Result<Vec<nuwax_map_chunks::Key>, String> {
         self.dynamic.clear_frame();
         let size = self.writer.voxel_size_m();
         let keys = points.iter().map(|p| voxel_key([p.x, p.y, p.z], size)
             .map(|k| [k.0,k.1,k.2]).ok_or("精细输入坐标无效"))
             .collect::<Result<Vec<_>, _>>()?;
         let hits: AHashSet<_> = keys.iter().map(|k| (k[0],k[1],k[2])).collect();
-        if let Some(origin) = origin {
-            let low = voxel_key(origin.map(|v| v - 30.0 - f64::from(size)), size).ok_or("精细动态窗口越界")?;
-            let high = voxel_key(origin.map(|v| v + 30.0 + f64::from(size)), size).ok_or("精细动态窗口越界")?;
+        if shared.is_none() && timestamp_ns > 0 && crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::DufoMap {
+            if let Some(origin) = origin { shared = Some(self.dynamic.observe_dufo(points, origin, timestamp_ns)?); }
+        }
+        if shared.as_ref().is_some_and(|f| f.is_dufo() && !f.has_clears()) {
+            self.dynamic.adopt(shared.take().unwrap(), &mut VoxelIndex::default(), size);
+        } else if let Some(origin) = origin {
+            let (low, high) = shared.as_ref().filter(|f| f.is_dufo()).and_then(|f| f.clear_bounds())
+                .unwrap_or((origin.map(|v| v - 30.0 - f64::from(size)), origin.map(|v| v + 30.0 + f64::from(size))));
+            let low = voxel_key(low, size).ok_or("精细动态窗口越界")?;
+            let high = voxel_key(high, size).ok_or("精细动态窗口越界")?;
             let local = self.writer.region([low.0, low.1, low.2], [high.0, high.1, high.2], 2_000_000)?;
             let mut voxels: VoxelIndex = local.into_iter().map(|(key, _)| (key[0], key[1], key[2])).collect();
             if let Some(shared)=shared {self.dynamic.adopt(shared,&mut voxels,size);}

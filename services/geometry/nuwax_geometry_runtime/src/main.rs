@@ -55,6 +55,7 @@ mod persistent_occupancy;
 mod pgo_map;
 mod pointcloud;
 mod dynamic_scene;
+mod dynamic_backend;
 mod dynamic_tracks;
 mod completed_cleanup;
 mod dense_cloud;
@@ -1238,6 +1239,7 @@ fn configure_pointcloud_storage() -> Result<(), String> {
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} 不是有效的 UTF-8 文本")),
     };
+    dynamic_backend::configure(dynamic_backend::parse_backend(env_text(dynamic_backend::BACKEND_VAR)?.as_deref())?)?;
     let fine_cloud_cache = env_text(pointcloud::FINE_CLOUD_CACHE_MIB_VAR)
         .and_then(|mode| Ok((mode, env_text(pointcloud::FINE_CLOUD_CACHE_AUTO_MAX_VAR)?)))
         .and_then(|(mode, auto_max)| pointcloud::parse_fine_cloud_cache(mode.as_deref(), auto_max.as_deref()))

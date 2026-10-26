@@ -524,26 +524,25 @@ impl CloudMapShmWriter {
     pub(crate) fn last_stage_ms(&self) -> [f64; 3] { self.last_stage_ms }
     pub(crate) fn accumulate_mapping_replayed_scan(&mut self, session_generation: u64,
         points: &[Point3<f64>], sensor_origin_map: Option<[f64;3]>,
-        source: &crate::admitted_cloud::AdmittedCloudSource,frame:Option<&crate::dynamic_scene::MappedFrameDecision>) -> bool {
+        source: &crate::admitted_cloud::AdmittedCloudSource,frame:Option<&crate::dynamic_backend::MappedFrame>) -> bool {
         self.accumulate_mapping_scan_inner(session_generation, points, sensor_origin_map,
             source.timestamp_ns(), Some(fine_cloud::FrameSource::Corrected(source,frame)))
     }
     pub(crate) fn classify_admitted_scan(&mut self, source: &crate::lio_ingress::AcceptedRegisteredCloud)
-        -> Result<crate::dynamic_scene::MappedFrameDecision, String> {
+        -> Result<crate::dynamic_backend::MappedFrame, String> {
         #[cfg(test)]
         let started = std::time::Instant::now();
         // 点云代次由原拥有方启动登记；分类不能替输入登记，否则会绕过安装时的代次围栏。
         // 未登记输入继续沿准备/安装失配路径拒绝，并由建图拥有方执行原退休流程。
-        let (ground, known) = if let Some(fine) = self.fine_cloud.as_mut() {
-            fine.measured_ground(source.map_points())?
+        let (ground, known) = if crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::Legacy {
+            if let Some(fine) = self.fine_cloud.as_mut() { fine.measured_ground(source.map_points())? }
+            else { (Vec::new(), Vec::new()) }
         } else { (Vec::new(), Vec::new()) };
         #[cfg(test)]
         let ground_ms = started.elapsed().as_secs_f64() * 1e3;
-        let frame = self.dynamic_filter.classify(source.scan(), &ground, &known)?;
+        let mapped = self.dynamic_filter.classify_online(source, &ground, &known)?;
         #[cfg(test)]
         let classify_ms = started.elapsed().as_secs_f64() * 1e3;
-        let mapped = crate::dynamic_scene::MappedFrameDecision::new(frame,
-            source.scan().binding().registration_map_from_odom, source.map_points(), 0)?;
         #[cfg(test)]
         if std::env::var_os("NUWAX_DYNAMIC_PHASE_DIAGNOSTIC").is_some() {
             eprintln!("CLASSIFY_TOP timestamp={} ground_ms={ground_ms:.3} classify_ms={:.3} mapped_ms={:.3}",
@@ -599,7 +598,8 @@ impl CloudMapShmWriter {
                 let fine = self.fine_cloud.as_ref().unwrap();
                 if self.dense_cloud.is_none() { self.dense_cloud = Some(DenseCloud::with_voxel_size(fine.voxel_size())?); }
                 let dense = self.dense_cloud.as_mut().unwrap();
-                dense.remove_voxels(fine.removed_keys(), fine.voxel_size())?;
+                if let Some(frame) = fine.shared_frame().filter(|f| f.is_dufo()) { dense.remove_free_frame(frame)?; }
+                else { dense.remove_voxels(fine.removed_keys(), fine.voxel_size())?; }
                 let static_points = points.iter().filter(|point| !fine.is_dynamic(point)).copied().collect::<Vec<_>>();
                 dense.append(&static_points)
             })();
@@ -1814,6 +1814,7 @@ fn cloud_map_duplicate_admitted_frame_preserves_dense_coarse_and_fine_state() {
 
     #[test]
     fn persistent_cloud_filters_dynamic_points_and_survives_save_restore() {
+        let _backend = crate::dynamic_backend::test_backend(crate::dynamic_backend::Backend::Legacy);
         use crate::dynamic_scene::tests::{corridor, ORIGIN};
         let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
         let mut static_total = 0_u64;
@@ -2011,6 +2012,7 @@ fn cloud_map_duplicate_admitted_frame_preserves_dense_coarse_and_fine_state() {
 
     #[test]
     fn pgo_install_preserves_real_observed_neighbourhood_evidence(){
+        let _backend = crate::dynamic_backend::test_backend(crate::dynamic_backend::Backend::Legacy);
         use crate::dynamic_scene::tests::{corridor,ORIGIN};
         let mut source=CloudMapShmWriter::new_private_for_test().unwrap();
         let mut target=CloudMapShmWriter::new_private_for_test().unwrap();
@@ -2501,3 +2503,7 @@ mod activation_decode_diagnostic_tests;
 #[cfg(test)]
 #[path = "completed_cleanup_tests.rs"]
 mod completed_cleanup_tests;
+
+#[cfg(test)]
+#[path = "online_dufomap_tests.rs"]
+mod online_dufomap_tests;

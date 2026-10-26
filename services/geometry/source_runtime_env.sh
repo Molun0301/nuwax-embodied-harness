@@ -6,6 +6,15 @@ source "${GEOMETRY_RUNTIME_REPO_ROOT}/scripts/lib/config_env.sh"
 
 load_platform_config || return 1
 
+# 在线去动态后端默认使用 DUFOMap，子进程重启时重新读取后来保存的方案。
+if [[ "${NUWAX_GEOMETRY_DYNAMIC_BACKEND:-}" != *[![:space:]]* ]]; then
+  NUWAX_GEOMETRY_DYNAMIC_BACKEND=dufomap
+  if [[ -z "${_NUWAX_CONFIG_INITIAL_KEYS[NUWAX_GEOMETRY_DYNAMIC_BACKEND]+x}" ]]; then
+    export _NUWAX_CONFIG_FILE_KEYS="${_NUWAX_CONFIG_FILE_KEYS:-}NUWAX_GEOMETRY_DYNAMIC_BACKEND:"
+  fi
+fi
+export NUWAX_GEOMETRY_DYNAMIC_BACKEND
+
 # 导航与探索共用地形来源；物化默认后，子进程仍须能读取后来保存的方案。
 if [[ "${NUWAX_NAV_PCT_TERRAIN_SOURCE:-}" != *[![:space:]]* ]]; then
   NUWAX_NAV_PCT_TERRAIN_SOURCE=tomography

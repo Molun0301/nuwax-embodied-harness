@@ -10,12 +10,34 @@
 #include <cstring>
 #include <exception>
 #include <new>
+#include <vector>
+#include <cmath>
 
 namespace {
 using DufoMapType = ufo::Map<ufo::MapType::SEEN_FREE | ufo::MapType::REFLECTION>;
 
+struct FreeCell { int32_t x, y, z; uint32_t depth; };
+
+// 只旁观首次空闲迁移，不改变上游积分、保护或传播规则。
+struct TrackedMap : DufoMapType {
+	using DufoMapType::DufoMapType;
+	using DufoMapType::setSeenFree;
+	bool tracking = false;
+	std::vector<FreeCell> newly_free;
+	void setSeenFree(ufo::Index node) {
+		if (tracking && !seenFree(node)) {
+			auto key = toKey(center(node), depth(node));
+			auto zero = toKey(ufo::Point(0, 0, 0));
+			newly_free.push_back({static_cast<int32_t>(int64_t(key.x()) - zero.x()),
+			                     static_cast<int32_t>(int64_t(key.y()) - zero.y()),
+			                     static_cast<int32_t>(int64_t(key.z()) - zero.z()), depth(node)});
+		}
+		DufoMapType::setSeenFree(node);
+	}
+};
+
 struct NuwaxDufoMap {
-	DufoMapType            map;
+	TrackedMap            map;
 	ufo::IntegrationParams params;
 	NuwaxDufoMap(double resolution, ufo::depth_t levels) : map(resolution, levels) {}
 };
@@ -87,6 +109,29 @@ void* nuwax_dufomap_new(nuwax_dufomap_params const* p, char* err, std::size_t er
 
 void nuwax_dufomap_free(void* handle) { delete static_cast<NuwaxDufoMap*>(handle); }
 
+void* nuwax_dufomap_clone(void const* handle)
+{
+	try { return new NuwaxDufoMap(*static_cast<NuwaxDufoMap const*>(handle)); }
+	catch (...) { return nullptr; }
+}
+
+void nuwax_dufomap_track_free(void* handle) {
+	auto& map = static_cast<NuwaxDufoMap*>(handle)->map;
+	map.newly_free.clear();
+	map.tracking = true;
+}
+
+std::size_t nuwax_dufomap_free_cells(void* handle, FreeCell* out, std::size_t capacity) {
+	auto& map = static_cast<NuwaxDufoMap*>(handle)->map;
+	auto count = map.newly_free.size();
+	if (out != nullptr && capacity >= count) {
+		std::copy(map.newly_free.begin(), map.newly_free.end(), out);
+		map.newly_free.clear();
+		map.tracking = false;
+	}
+	return count;
+}
+
 // xyz 为全局坐标系点（n×3 个 float），origin 为同一坐标系的传感器原点。
 int nuwax_dufomap_insert(void* handle, float const* xyz, std::size_t n, float const* origin,
                          uint8_t propagate, char* err, std::size_t err_len)
@@ -96,6 +141,15 @@ int nuwax_dufomap_insert(void* handle, float const* xyz, std::size_t n, float co
 		if (m == nullptr || (n > 0 && xyz == nullptr) || origin == nullptr) {
 			write_error(err, err_len, "无效句柄或输入");
 			return -1;
+		}
+		auto valid = [&](float const* p) {
+			return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]) &&
+			       m->map.isInside(ufo::Point(p[0], p[1], p[2]));
+		};
+		// 在积分前拒绝整帧，避免原生断言终止进程或留下半帧状态。
+		if (!valid(origin)) { write_error(err, err_len, "雷达原点不在有限八叉树范围内"); return -1; }
+		for (std::size_t i = 0; i < n; ++i) {
+			if (!valid(xyz + 3 * i)) { write_error(err, err_len, "点坐标不在有限八叉树范围内"); return -1; }
 		}
 		ufo::PointCloud cloud;
 		cloud.reserve(n);
@@ -132,6 +186,8 @@ int nuwax_dufomap_seen_free(void const* handle, float const* xyz, std::size_t n,
 	if (m == nullptr || (n > 0 && (xyz == nullptr || out == nullptr))) return -1;
 	try {
 		for (std::size_t i = 0; i < n; ++i) {
+			if (!std::isfinite(xyz[3*i]) || !std::isfinite(xyz[3*i+1]) || !std::isfinite(xyz[3*i+2]) ||
+			    !m->map.isInside(ufo::Point(xyz[3*i], xyz[3*i+1], xyz[3*i+2]))) return -1;
 			out[i] = m->map.seenFree(xyz[3 * i], xyz[3 * i + 1], xyz[3 * i + 2]) ? 1 : 0;
 		}
 		return 0;
@@ -155,6 +211,6 @@ std::size_t nuwax_dufomap_num_nodes(void const* handle)
 void nuwax_dufomap_clear(void* handle)
 {
 	auto* m = static_cast<NuwaxDufoMap*>(handle);
-	if (m != nullptr) m->map.clear();
+	if (m != nullptr) { m->map.clear(); m->map.newly_free.clear(); m->map.tracking = false; }
 }
 }

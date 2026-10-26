@@ -9,6 +9,8 @@ nuwax-dufomap-native 引入的上游代码
    本地使用：native/upstream/dufomap/dufomap.cpp 与 config.toml 仅作参考，不参与编译；
    native/bridge.cc 只封装其核心流程（带原点逐帧插入、传播、按“曾被观测为空”判定点），
    参数默认值取自上游 config.toml。
+   G3 本地扩展：派生地图旁观首次 setSeenFree 迁移，返回带深度的有符号空单元键，
+   供在线历史撤销；不改积分规则。深复制仅用于既有私有内核暂存/物化，不共享可变八叉树。
 
 2. UFOMap（DUFOMap 的子模块）
    来源：https://github.com/UnknownFreeOccupied/ufomap

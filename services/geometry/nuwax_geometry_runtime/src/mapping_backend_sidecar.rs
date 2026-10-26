@@ -1243,7 +1243,7 @@ fn decode_input(decoder: &mut WireDecoder<'_>) -> Result<MappingBackendInput, St
     let registered_points_map = decoder.points()?;
     let decision_range=decoder.bytes_range()?;
     let decision_bytes=&decoder.frame[decision_range];
-    let dynamic_frame=if decision_bytes.is_empty(){None}else{Some(crate::dynamic_scene::MappedFrameDecision::decode(&decision_bytes)?)};
+    let dynamic_frame=if decision_bytes.is_empty(){None}else{Some(crate::dynamic_backend::MappedFrame::decode(&decision_bytes)?)};
     Ok(MappingBackendInput {
         dynamic_frame,
         session_id,

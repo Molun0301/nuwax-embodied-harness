@@ -370,6 +370,45 @@ impl DenseCloud {
         Ok(count)
     }
 
+    /// 仅复核新增空证据包围盒相交的历史页，逐个原坐标判定，保留同一细体素中的静态点。
+    pub(crate) fn remove_free_frame(&mut self, frame: &crate::dynamic_backend::MappedFrame) -> Result<usize, String> {
+        let Some((low, high)) = frame.clear_bounds() else { return Ok(0); };
+        let mut changes = Vec::new();
+        let mut count = 0;
+        for (index, old) in self.pages.iter().enumerate() {
+            if old.count == 0 || (0..3).any(|a| f64::from(old.high[a]) < low[a] || f64::from(old.low[a]) > high[a]) { continue; }
+            let mut bytes = vec![0; old.length * 12];
+            self.file.read_exact_at(&mut bytes, (index * PAGE_POINTS * 12) as u64).map_err(|e| e.to_string())?;
+            let mut page = (**old).clone();
+            page.low = [f32::INFINITY; 3];
+            page.high = [f32::NEG_INFINITY; 3];
+            for (local, xyz) in bytes.chunks_exact(12).enumerate() {
+                if page.visible[local / 64] & (1 << (local % 64)) == 0 { continue; }
+                let point = decode_point(xyz);
+                if frame.clears(point.map(f64::from)) {
+                    page.visible[local / 64] &= !(1 << (local % 64));
+                    page.count -= 1;
+                } else {
+                    for axis in 0..3 { page.low[axis] = page.low[axis].min(point[axis]); page.high[axis] = page.high[axis].max(point[axis]); }
+                }
+            }
+            if page.count != old.count { count += (old.count - page.count) as usize; changes.push((index, Arc::new(page))); }
+        }
+        if count > 0 {
+            let pages = Arc::make_mut(&mut self.pages);
+            for (index, page) in changes { pages[index] = page; }
+            self.point_count -= count as u64;
+            self.bounds_min = [f32::INFINITY; 3];
+            self.bounds_max = [f32::NEG_INFINITY; 3];
+            for page in pages.iter().filter(|page| page.count > 0) {
+                for axis in 0..3 { self.bounds_min[axis] = self.bounds_min[axis].min(page.low[axis]); self.bounds_max[axis] = self.bounds_max[axis].max(page.high[axis]); }
+            }
+            // 页过滤器与 live_keys 允许保守假阳性，不会漏掉以后需要删除的可见点。
+            self.epoch = uuid::Uuid::new_v4().simple().to_string();
+        }
+        Ok(count)
+    }
+
     pub fn snapshot(
         &self,
         receipt: &CloudCommitReceipt,

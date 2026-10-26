@@ -2533,6 +2533,30 @@
     "apply_scope": "重启运动守卫后生效",
     "description": "未填写导航能力标定时，停车后等待实测反馈确认停稳的最长时间（秒，0～30），超时按停车失败处理；填写标定后改用标定的制动时间。"
   },
+  "NUWAX_GEOMETRY_DYNAMIC_BACKEND": {
+    "section_id": "geometry_quality",
+    "target_file": "core_env",
+    "advanced": false,
+    "consumers": [
+      "services/geometry/source_runtime_env.sh",
+      "services/geometry/nuwax_geometry_runtime/src/main.rs",
+      "services/geometry/nuwax_geometry_runtime/src/dynamic_cloud.rs"
+    ],
+    "apply_scope": "重启几何运行时后生效，无需重新构建",
+    "effective_value_scope": "external_process",
+    "zh_name": "在线去动态后端",
+    "type": "str",
+    "default": "dufomap",
+    "choices": [
+      "dufomap",
+      "legacy"
+    ],
+    "choice_labels": [
+      "DUFOMap（默认）",
+      "旧在线分类链路"
+    ],
+    "description": "选择建图时的在线去动态算法。dufomap 使用 DUFOMap 判定静态点并撤销后来观测为空的历史点；legacy 保留旧在线分类链路。两种后端均保留原始扫描录制和近期障碍输入。空白恢复 dufomap；修改后须重启几何运行时。"
+  },
   "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_MIB": {
     "section_id": "geometry_quality",
     "target_file": "core_env",

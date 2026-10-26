@@ -1,15 +1,15 @@
-//! 已接纳扫描的原坐标归档；不可变可见性快照同步撤销已证实动态的历史点。
+//! 已接纳扫描的原坐标归档；按精细撤销原键更新历史可见位，并保留不可变读者快照。
 #[path = "dense_cloud/page_table.rs"]
 mod page_table;
-#[path = "dense_cloud/spatial_index.rs"]
-mod spatial_index;
+#[path = "dense_cloud/block_directory.rs"]
+mod block_directory;
 #[cfg(test)]
 #[path = "dense_cloud/revoke_tests.rs"]
 mod revoke_tests;
 use page_table::PageTable;
-use spatial_index::SpatialIndex;
+use block_directory::BlockDirectory;
 use crate::mapping_commit::CloudCommitReceipt;
-use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use ahash::AHashSet as HashSet;
 use nalgebra::Point3;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -27,7 +27,7 @@ const PAGE_POINTS: usize = 4096;
 const INDEX_BLOCK_M: f64 = 1.6;
 const MAX_INDEX_ENTRIES: usize = 1_000_000;
 /// 每页可见点体素键的布隆过滤器：32768 位、7 个哈希位置（一页约 3500 个不同体素时单键
-/// 假阳性约 1%）。只为前 16384 页建，约 6700 万点，每页 4 KiB，共 64 MiB；之后的页照常逐页扫描。
+/// 假阳性约 1%）。只为前 16384 页建，约 6700 万点，每页 4 KiB，共 64 MiB；之后的候选页直接读原键。
 const FILTER_WORDS: usize = 512;
 const FILTER_HASHES: u32 = 7;
 const MAX_FILTER_PAGES: usize = 16_384;
@@ -77,17 +77,21 @@ fn decode_point(bytes: &[u8]) -> [f32; 3] {
     std::array::from_fn(|i| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()))
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct RevokeStats { coordinate_pages: usize, key_pages: usize, candidate_pages: usize, candidate_points: usize }
+
 pub(crate) struct DenseCloud {
     file: Arc<File>,
     keys_file: File,
-    spatial_index: Option<SpatialIndex>,
     voxel_size: f32,
     epoch: String,
     point_count: u64,
     stored_count: u64,
     pages: Arc<PageTable>,
-    block_pages: Option<HashMap<Key, HashSet<usize>>>,
-    block_entries: usize,
+    block_directory: BlockDirectory,
+    #[cfg(test)]
+    last_revoke: RevokeStats,
     live_keys: Option<HashSet<Key>>,
     // 前 MAX_FILTER_PAGES 页中可见点的体素键（追加时登记，删除改动后重建）；
     // 只供删除时跳过必不含可见删除键的页。
@@ -153,16 +157,15 @@ impl DenseCloud {
         Ok(Self {
             file: Arc::new(temporary_file()?),
             keys_file: temporary_file()?,
-            spatial_index: if crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::DufoMap {
-                Some(SpatialIndex::new()?)
-            } else { None },
             voxel_size,
             epoch: uuid::Uuid::new_v4().simple().to_string(),
             point_count: 0,
             stored_count: 0,
             pages: Arc::new(PageTable::default()),
-            block_pages: Some(HashMap::new()),
-            block_entries: 0,
+            block_directory: BlockDirectory::new(
+                crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::DufoMap, voxel_size),
+            #[cfg(test)]
+            last_revoke: RevokeStats::default(),
             live_keys: Some(HashSet::new()),
             filters: Vec::new(),
             readers: Default::default(),
@@ -208,7 +211,7 @@ impl DenseCloud {
         self.keys_file
             .write_all_at(&keys, self.stored_count * 12)
             .map_err(|e| e.to_string())?;
-        if let Some(index) = &mut self.spatial_index { index.append(&bytes, self.stored_count)?; }
+        self.block_directory.begin_append();
         let pages = Arc::make_mut(&mut self.pages);
         // 每页只复制固定页表路径；旧快照仍持有追加前的可见性。
         let mut index = 0;
@@ -235,13 +238,7 @@ impl DenseCloud {
                     page.high[axis] = page.high[axis].max(point[axis]);
                 }
                 let source = points[index];
-                if let Some(blocks) = &mut self.block_pages {
-                    if blocks.entry(index_block([source.x, source.y, source.z])).or_default().insert(page_index) {
-                        self.block_entries += 1;
-                    }
-                    // 达到预算后回退逐页检查，不丢点，也不无限扩大派生索引。
-                    if self.block_entries > MAX_INDEX_ENTRIES { self.block_pages = None; }
-                }
+                self.block_directory.insert(index_block([source.x, source.y, source.z]), page_index);
                 // 复用降精度前已验证并写入的键，不重复计算或从单精度坐标推导。
                 let offset = index * 12;
                 let key: [i32; 3] = std::array::from_fn(|axis| {
@@ -269,9 +266,9 @@ impl DenseCloud {
 
     /// 仅检查删除区域关联的文件页。旧快照仍持有原可见性，读取/保存不会跨修订串帧。
     pub fn remove_voxels(&mut self, keys: &[Key], voxel_size: f32) -> Result<usize, String> {
-        if keys.is_empty() {
-            return Ok(0);
-        }
+        #[cfg(test)]
+        { self.last_revoke = RevokeStats::default(); }
+        if keys.is_empty() { return Ok(0); }
         if !voxel_size.is_finite() || voxel_size <= 0.0 {
             return Err("完整点云删除精度非法".into());
         }
@@ -284,16 +281,19 @@ impl DenseCloud {
         if removed.is_empty() { return Ok(0); }
         let mut candidates = HashSet::new();
         for &(x, y, z) in &removed {
-            let low = index_block([x, y, z].map(|v| v as f64 * f64::from(voxel_size)));
-            let high = index_block([x, y, z].map(|v| (v as f64 + 1.0) * f64::from(voxel_size)));
-            if self.block_pages.is_none() || voxel_size as f64 > INDEX_BLOCK_M {
+            if self.block_directory.missing()
+                || (!self.block_directory.compacting() && voxel_size as f64 > INDEX_BLOCK_M) {
+                if self.block_directory.compacting() { return Err("DUFO完整点云空间目录丢失".into()); }
+                // 旧后端保留原回退；DUFO预算饱和只压缩目录，不进入全页枚举。
                 candidates.extend(0..self.pages.len());
                 break;
             }
-            for bx in low.0..=high.0 {
-                for by in low.1..=high.1 {
-                    for bz in low.2..=high.2 {
-                        if let Some(pages) = self.block_pages.as_ref().unwrap().get(&(bx, by, bz)) {
+            let low = self.block_directory.key(index_block([x, y, z].map(|v| v as f64 * f64::from(voxel_size))));
+            let high = self.block_directory.key(index_block([x, y, z].map(|v| (v as f64 + 1.0) * f64::from(voxel_size))));
+            for bx in low[0]..=high[0] {
+                for by in low[1]..=high[1] {
+                    for bz in low[2]..=high[2] {
+                        if let Some(pages) = self.block_directory.get([bx, by, bz]) {
                             candidates.extend(pages.iter().copied());
                         }
                     }
@@ -307,6 +307,8 @@ impl DenseCloud {
             if old.count == 0 {
                 continue;
             }
+            #[cfg(test)]
+            { self.last_revoke.candidate_pages += 1; }
             // 过滤器全部否定的页必不含任何删除键（无假阴性），原本也不会改动，不必读键扫描。
             if self.filters.get(index).is_some_and(|filter| !removed.iter().any(|&key| filter_may_contain(filter, key))) {
                 continue;
@@ -315,6 +317,8 @@ impl DenseCloud {
             self.keys_file
                 .read_exact_at(&mut keys, (index * PAGE_POINTS * 12) as u64)
                 .map_err(|e| e.to_string())?;
+            #[cfg(test)]
+            { self.last_revoke.key_pages += 1; self.last_revoke.candidate_points += old.count as usize; }
             let mut page = (**old).clone();
             let key_at = |local: usize| -> Key {
                 let key: [i32; 3] = std::array::from_fn(|axis| {
@@ -348,6 +352,8 @@ impl DenseCloud {
                 let mut bytes = vec![0; old.length * 12];
                 self.file.read_exact_at(&mut bytes, (index * PAGE_POINTS * 12) as u64)
                     .map_err(|e| e.to_string())?;
+                #[cfg(test)]
+                { self.last_revoke.coordinate_pages += 1; }
                 for (local, bytes) in bytes.chunks_exact(12).enumerate() {
                     if page.visible[local / 64] & (1 << (local % 64)) == 0 { continue; }
                     let point = decode_point(bytes);
@@ -370,112 +376,64 @@ impl DenseCloud {
                 if let Some(filter) = filter { self.filters[index] = filter; }
             }
             self.point_count -= count as u64;
-            self.bounds_min = [f32::INFINITY; 3];
-            self.bounds_max = [f32::NEG_INFINITY; 3];
-            for page in pages.iter() {
-                for axis in 0..3 {
-                    self.bounds_min[axis] = self.bounds_min[axis].min(page.low[axis]);
-                    self.bounds_max[axis] = self.bounds_max[axis].max(page.high[axis]);
-                }
-            }
+            (self.bounds_min, self.bounds_max) = pages.bounds();
             // 删除打破了追加前缀，客户端必须按新内容代际重取，不能只比较点数。
             self.epoch = uuid::Uuid::new_v4().simple().to_string();
         }
         Ok(count)
     }
 
-    /// 按新增空单元定位磁盘索引，只修改相关页及固定三层页表路径。
-    pub(crate) fn remove_free_frame(&mut self, frame: &crate::dynamic_backend::MappedFrame) -> Result<usize, String> {
-        #[cfg(test)]
-        if crate::dynamic_backend::reference_revoke() { return self.remove_free_frame_reference(frame); }
-        let Some(regions) = frame.clear_regions() else { return Ok(0); };
-        let mut regions = regions.peekable();
-        if regions.peek().is_none() {
-            if let Some(index) = &mut self.spatial_index {
-                index.last_read_pages = 0;
-                index.last_candidate_points = 0;
-                index.last_index_read_pages = 0;
+    #[cfg(test)]
+    pub(crate) fn storage_memory_bytes(&self) -> [usize; 5] {
+        let live = self.live_keys.as_ref().map_or(0, |keys|
+            block_directory::allocation(keys.capacity(), std::mem::size_of::<Key>()));
+        [self.pages.memory_bytes(), self.pages.len() * (std::mem::size_of::<Page>() + 2 * std::mem::size_of::<usize>()),
+            self.filters.len() * FILTER_WORDS * 8 + self.filters.capacity() * std::mem::size_of::<Box<[u64; FILTER_WORDS]>>(),
+            self.block_directory.memory_bytes(), live]
+    }
+    #[cfg(test)]
+    pub(crate) fn revoke_index_memory_bytes(&self) -> usize { self.storage_memory_bytes().into_iter().sum() }
+    #[cfg(test)]
+    pub(crate) fn last_revoke_read_pages(&self) -> usize { self.last_revoke.coordinate_pages }
+    #[cfg(test)]
+    pub(crate) fn last_revoke_candidate_points(&self) -> usize { self.last_revoke.candidate_points }
+    #[cfg(test)]
+    pub(crate) fn last_revoke_key_read_pages(&self) -> usize { self.last_revoke.key_pages }
+    #[cfg(test)]
+    pub(crate) fn last_revoke_candidate_pages(&self) -> usize { self.last_revoke.candidate_pages }
+    #[cfg(test)]
+    pub(crate) fn last_revoke_index_read_pages(&self) -> usize { self.last_revoke.key_pages }
+    #[cfg(test)]
+    pub(crate) fn revoke_index_disk_bytes(&self) -> u64 { 0 }
+    #[cfg(test)]
+    pub(crate) fn storage_disk_bytes(&self) -> [u64; 6] {
+        use std::os::unix::fs::MetadataExt;
+        let xyz = self.file.metadata().expect("完整源原坐标句柄有效");
+        let keys = self.keys_file.metadata().expect("完整源原键句柄有效");
+        [xyz.len(), keys.len(), 0, xyz.blocks() * 512, keys.blocks() * 512, 0]
+    }
+    #[cfg(test)]
+    pub(crate) fn directory_stats(&self) -> [usize; 5] {
+        [self.block_directory.level() as usize, self.block_directory.entries(), self.block_directory.last_compactions,
+            self.block_directory.last_compaction_entries, self.block_directory.last_compaction_peak_bytes]
+    }
+    #[cfg(test)]
+    pub(crate) fn export_key_audit(&self, path: &std::path::Path) -> Result<(), String> {
+        let mut output = std::io::BufWriter::new(File::create(path).map_err(|e| e.to_string())?);
+        for (index, page) in self.pages.iter().enumerate() {
+            let mut xyz = vec![0; page.length * 12];
+            let mut keys = vec![0; page.length * 12];
+            self.file.read_exact_at(&mut xyz, (index * PAGE_POINTS * 12) as u64).map_err(|e| e.to_string())?;
+            self.keys_file.read_exact_at(&mut keys, (index * PAGE_POINTS * 12) as u64).map_err(|e| e.to_string())?;
+            for local in 0..page.length {
+                output.write_all(&xyz[local * 12..local * 12 + 12]).map_err(|e| e.to_string())?;
+                output.write_all(&keys[local * 12..local * 12 + 12]).map_err(|e| e.to_string())?;
+                output.write_all(&[u8::from(page.visible[local / 64] & (1 << (local % 64)) != 0)]).map_err(|e| e.to_string())?;
             }
-            return Ok(0);
         }
-        let index = self.spatial_index.as_mut().ok_or("完整点云缺少当前后端的空间索引")?;
-        let changes = index.remove(regions, frame, &self.pages, &self.file)?;
-        let count = changes.iter().map(|(index, page)| (self.pages[*index].count - page.count) as usize).sum::<usize>();
-        if count > 0 {
-            let pages = Arc::make_mut(&mut self.pages);
-            for (index, page) in changes { pages.set(index, page); }
-            self.point_count -= count as u64;
-            (self.bounds_min, self.bounds_max) = pages.bounds();
-            self.epoch = uuid::Uuid::new_v4().simple().to_string();
-        }
-        Ok(count)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn revoke_index_memory_bytes(&self) -> usize {
-        self.spatial_index.as_ref().map_or(0, SpatialIndex::memory_bytes) + self.pages.memory_bytes()
-    }
-    #[cfg(test)]
-    pub(crate) fn last_revoke_read_pages(&self) -> usize {
-        self.spatial_index.as_ref().map_or(0, |index| index.last_read_pages)
-    }
-    #[cfg(test)]
-    pub(crate) fn last_revoke_candidate_points(&self) -> usize {
-        self.spatial_index.as_ref().map_or(0, |index| index.last_candidate_points)
-    }
-    #[cfg(test)]
-    pub(crate) fn revoke_index_disk_bytes(&self) -> u64 {
-        self.spatial_index.as_ref().map_or(0, SpatialIndex::disk_bytes)
-    }
-    #[cfg(test)]
-    pub(crate) fn last_revoke_index_read_pages(&self) -> usize {
-        self.spatial_index.as_ref().map_or(0, |index| index.last_index_read_pages)
-    }
-    #[cfg(test)]
-    pub(crate) fn revoke_index_memory_limit_bytes() -> usize {
-        SpatialIndex::maximum_memory_bytes() + PageTable::maximum_memory_bytes()
+        output.flush().map_err(|e| e.to_string())
     }
     pub(crate) fn point_count(&self) -> u64 { self.point_count }
-
-    /// 测试参考保留原包围盒遍历，使用同一持久页表以维持快照语义。
-    #[cfg(test)]
-    fn remove_free_frame_reference(&mut self, frame: &crate::dynamic_backend::MappedFrame) -> Result<usize, String> {
-        let Some((low, high)) = frame.clear_bounds() else { return Ok(0); };
-        let mut changes = Vec::new();
-        let mut count = 0;
-        for (index, old) in self.pages.iter().enumerate() {
-            if old.count == 0 || (0..3).any(|a| f64::from(old.high[a]) < low[a] || f64::from(old.low[a]) > high[a]) { continue; }
-            let mut bytes = vec![0; old.length * 12];
-            self.file.read_exact_at(&mut bytes, (index * PAGE_POINTS * 12) as u64).map_err(|e| e.to_string())?;
-            let mut page = (**old).clone();
-            page.low = [f32::INFINITY; 3];
-            page.high = [f32::NEG_INFINITY; 3];
-            for (local, xyz) in bytes.chunks_exact(12).enumerate() {
-                if page.visible[local / 64] & (1 << (local % 64)) == 0 { continue; }
-                let point = decode_point(xyz);
-                if frame.clears(point.map(f64::from)) {
-                    page.visible[local / 64] &= !(1 << (local % 64));
-                    page.count -= 1;
-                } else {
-                    for axis in 0..3 { page.low[axis] = page.low[axis].min(point[axis]); page.high[axis] = page.high[axis].max(point[axis]); }
-                }
-            }
-            if page.count != old.count { count += (old.count - page.count) as usize; changes.push((index, Arc::new(page))); }
-        }
-        if count > 0 {
-            let pages = Arc::make_mut(&mut self.pages);
-            for (index, page) in changes { pages.set(index, page); }
-            self.point_count -= count as u64;
-            self.bounds_min = [f32::INFINITY; 3];
-            self.bounds_max = [f32::NEG_INFINITY; 3];
-            for page in pages.iter().filter(|page| page.count > 0) {
-                for axis in 0..3 { self.bounds_min[axis] = self.bounds_min[axis].min(page.low[axis]); self.bounds_max[axis] = self.bounds_max[axis].max(page.high[axis]); }
-            }
-            // 页过滤器与 live_keys 允许保守假阳性，不会漏掉以后需要删除的可见点。
-            self.epoch = uuid::Uuid::new_v4().simple().to_string();
-        }
-        Ok(count)
-    }
 
     pub fn snapshot(
         &self,
@@ -855,7 +813,7 @@ mod tests {
         let before_bytes = before.read(0, CHUNK_POINTS).unwrap();
         let before_pages = Arc::clone(&cloud.pages);
         let before_live = cloud.live_keys.clone();
-        let before_entries = cloud.block_entries;
+        let before_entries = cloud.block_directory.entries();
         let size = cloud.file.metadata().unwrap().len();
         assert!(cloud.append(&[Point3::new(1.0, 2.0, 3.0), Point3::new(f64::NAN, 0.0, 0.0)]).is_err());
         assert_eq!(cloud.file.metadata().unwrap().len(), size);
@@ -867,7 +825,7 @@ mod tests {
         assert_eq!(cloud.stored_count, 1);
         assert!(Arc::ptr_eq(&cloud.pages, &before_pages));
         assert_eq!(cloud.live_keys, before_live);
-        assert_eq!(cloud.block_entries, before_entries);
+        assert_eq!(cloud.block_directory.entries(), before_entries);
         assert_eq!(cloud.bounds_min, before.bounds_min);
         assert_eq!(cloud.bounds_max, before.bounds_max);
         assert_eq!(cloud.snapshot(&receipt(2), "失败重试").unwrap().read(0, CHUNK_POINTS).unwrap(), before_bytes);
@@ -900,6 +858,7 @@ mod tests {
 
     #[test]
     fn dynamic_removal_preserves_frozen_reads_order_coordinates_and_archive() {
+        let _backend = crate::dynamic_backend::test_backend(crate::dynamic_backend::Backend::Legacy);
         let mut cloud = DenseCloud::new().unwrap();
         let points = (0..12_000)
             .map(|i| {
@@ -949,7 +908,7 @@ mod tests {
                 .unwrap(),
             expected
         );
-        cloud.block_pages = None;
+        cloud.block_directory.disable();
         cloud.live_keys = None;
         cloud.append(&[Point3::new(2.025, 0.025, 1.025)]).unwrap();
         let newest = cloud.snapshot(&receipt(4), "动态归档").unwrap();

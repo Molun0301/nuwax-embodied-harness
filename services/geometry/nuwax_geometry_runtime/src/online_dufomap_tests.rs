@@ -71,7 +71,7 @@ fn dense_points(snapshot: &DenseSnapshot) -> Vec<[f32; 3]> {
 }
 
 #[test]
-fn dufomap_history_matches_final_native_verdict_and_keeps_static_structure() {
+fn dufomap_history_follows_fine_keys_and_keeps_static_structure() {
     let _backend = test_backend(Backend::DufoMap);
     use crate::dynamic_scene::tests::{corridor, ORIGIN};
     let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
@@ -81,6 +81,7 @@ fn dufomap_history_matches_final_native_verdict_and_keeps_static_structure() {
     let mut originals = Vec::new();
     let mut truth = Vec::new();
     let mut source_keys = Vec::new();
+    let mut expected_dense: Vec<([f32; 3], (i32, i32, i32))> = Vec::new();
     let mut initial_dense = None;
     let config = MappingBackendComputeConfig {
         resolution: 0.05,
@@ -101,8 +102,10 @@ fn dufomap_history_matches_final_native_verdict_and_keeps_static_structure() {
             .map(|p| [p.x as f32, p.y as f32, p.z as f32])
             .collect();
         oracle.insert(&xyz, ORIGIN.map(|v| v as f32), true).unwrap();
-        source_keys.extend(points.iter().map(|p| voxel_key([p.x,p.y,p.z], VOXEL_SIZE).unwrap()));
-        originals.extend(xyz);
+        let current_dynamic = oracle.seen_free(&xyz).unwrap();
+        let frame_keys: Vec<_> = points.iter().map(|p| voxel_key([p.x,p.y,p.z], VOXEL_SIZE).unwrap()).collect();
+        source_keys.extend(frame_keys.iter().copied());
+        originals.extend(xyz.iter().copied());
         truth.extend(labels);
         let source = admitted(points.clone(), ORIGIN, frame * 100_000_000, 1);
         let shared = writer.classify_admitted_scan(&source).unwrap();
@@ -149,10 +152,17 @@ fn dufomap_history_matches_final_native_verdict_and_keeps_static_structure() {
             frame * 100_000_000,
             Some(&accepted)
         ));
+        let removed: HashSet<_> = writer.fine_cloud.as_ref().unwrap().removed_keys().iter().copied().collect();
+        expected_dense.retain(|(_, key)| !removed.contains(key));
+        expected_dense.extend(xyz.iter().zip(frame_keys).zip(&current_dynamic)
+            .filter_map(|((&point, key), &dynamic)| (!dynamic).then_some((point, key))));
         writer
             .commit_accumulated_snapshot(&receipt(frame))
             .unwrap()
             .unwrap();
+        assert_eq!(dense_points(&writer.committed_dense_cloud().unwrap().unwrap()),
+            expected_dense.iter().map(|(point, _)| *point).collect::<Vec<_>>(),
+            "每次提交已完成精细键对应的全部历史撤销，当前点仍按独立原生判定追加");
         if frame == 10 {
             let snapshot = writer.committed_dense_cloud().unwrap().unwrap();
             let points = dense_points(&snapshot);
@@ -160,16 +170,12 @@ fn dufomap_history_matches_final_native_verdict_and_keeps_static_structure() {
         }
     }
     let flags = oracle.seen_free(&originals).unwrap();
-    let expected: Vec<_> = originals
-        .iter()
-        .zip(&flags)
-        .filter_map(|(p, removed)| (!removed).then_some(*p))
-        .collect();
+    let expected: Vec<_> = expected_dense.iter().map(|(point, _)| *point).collect();
     let snapshot = writer.committed_dense_cloud().unwrap().unwrap();
     assert_eq!(
         dense_points(&snapshot),
         expected,
-        "历史撤销后完整静态点须逐点等于结束时原生判定，含重复点和顺序"
+        "完整历史跟随精细原键，含原坐标、重复点和顺序"
     );
     let expected_keys: HashSet<_> = source_keys.iter().zip(&flags).filter_map(|(k, free)| (!free).then_some(*k)).collect();
     assert_eq!(writer.voxels.len(), expected_keys.len(), "可见静态体素数须与结束时判定一致");
@@ -239,6 +245,65 @@ fn dufomap_history_matches_final_native_verdict_and_keeps_static_structure() {
         1,
         Some(&source.into())
     ));
+}
+
+#[test]
+fn corrected_dense_history_follows_fine_keys_on_both_sides_of_free_boundary() {
+    let _backend = test_backend(Backend::DufoMap);
+    let transform = nalgebra::Isometry3::from_parts(
+        nalgebra::Translation3::new(-1.2, 2.3, 0.1),
+        nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, 0.61));
+    let frame = crate::dynamic_backend::test_free_cells(0.15, [([0; 3], 0)], transform);
+    let (low, high) = frame.clear_regions().unwrap().next().unwrap();
+    let low = voxel_key(low, VOXEL_SIZE).unwrap();
+    let high = voxel_key(high, VOXEL_SIZE).unwrap();
+    let mut retained_boundary = None;
+    let mut removed_boundary = None;
+    let size = f64::from(VOXEL_SIZE);
+    for x in low.0..=high.0 {
+        for y in low.1..=high.1 {
+            for z in low.2..=high.2 {
+                let center = voxel_center_f64((x, y, z), VOXEL_SIZE);
+                for dx in [-0.4, 0.0, 0.4] {
+                    for dy in [-0.4, 0.0, 0.4] {
+                        let p = [center[0] + dx * size, center[1] + dy * size, center[2]];
+                        let archived = p.map(|v| f64::from(v as f32));
+                        match (frame.clears(archived), frame.clears(center)) {
+                            (true, false) => { retained_boundary.get_or_insert(p); },
+                            (false, true) => { removed_boundary.get_or_insert(p); },
+                            _ => {},
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let retained = retained_boundary.expect("旋转空单元中须有点判空、中心未判空的边界");
+    let removed = removed_boundary.expect("旋转空单元中须有中心判空、点未判空的边界");
+    let removed_key = voxel_key(removed, VOXEL_SIZE).unwrap();
+    let retained_key = voxel_key(retained, VOXEL_SIZE).unwrap();
+    assert_ne!(removed_key, retained_key);
+    let anchor = [10.025, 10.025, 1.025];
+    let first = [retained, removed, retained, anchor].map(Point3::from);
+    let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
+    writer.begin_session(1).unwrap();
+    assert!(writer.accumulate_mapping_scan(1, &first, None, 100_000_000));
+    writer.commit_accumulated_snapshot(&receipt(1)).unwrap().unwrap();
+    let pinned = writer.committed_dense_cloud().unwrap().unwrap();
+    let pinned_points = dense_points(&pinned);
+    let current = vec![Point3::from(anchor)];
+    let source = AcceptedMappingCloud::from(admitted(current.clone(), anchor, 200_000_000, 1)).source();
+    assert!(writer.accumulate_mapping_replayed_scan(1, &current, Some(anchor), &source, Some(&frame)));
+    assert_eq!(writer.fine_cloud.as_ref().unwrap().removed_keys(), &[removed_key]);
+    writer.commit_accumulated_snapshot(&receipt(2)).unwrap().unwrap();
+    let after = writer.committed_dense_cloud().unwrap().unwrap();
+    let expected: Vec<_> = [retained, retained, anchor, anchor].map(|p| p.map(|v| v as f32)).into();
+    assert_eq!(dense_points(&after), expected,
+        "完整源按精细原键删除，旋转边界两侧均须遵守新契约，原序和重复不变");
+    assert_eq!(dense_points(&pinned), pinned_points, "旧读者仍持有撤销前的全部点");
+    assert_ne!(after.epoch, pinned.epoch);
+    assert!(frame.clears(retained.map(|v| f64::from(v as f32))));
+    assert!(!frame.clears(removed.map(|v| f64::from(v as f32))));
 }
 
 #[test]

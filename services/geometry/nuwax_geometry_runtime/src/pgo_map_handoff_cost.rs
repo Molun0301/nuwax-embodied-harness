@@ -52,6 +52,7 @@ pub(super) struct FrameRecord {
     pub dense_removed_points: usize,
     pub dense_index_pages_read: usize,
     pub peak_rss_kib: u64,
+    pub dense_storage_memory: [usize; 5],
 }
 
 fn distribution(values: impl Iterator<Item = f64>) -> Value {
@@ -101,6 +102,7 @@ pub(super) struct Recorder {
     started: Instant,
     capture: bool,
     preloaded_input_peak_rss_kib: u64,
+    frame_audit: Option<BufWriter<File>>,
 }
 impl Recorder {
     pub(super) fn from_env(capture: bool, multiple_captures: bool) -> Option<Self> {
@@ -113,13 +115,46 @@ impl Recorder {
         let mut csv = BufWriter::new(File::create(root.join("逐帧.csv")).unwrap());
         writeln!(csv,"frame,source_timestamp_ns,source_points,cumulative_source_points,wall_ms,cpu_ms,classify_wall_ms,occupancy_wall_ms,fine_wall_ms,dense_wall_ms,visible_wall_ms,fine_revoke_wall_ms,dense_revoke_wall_ms,dense_append_wall_ms,visible_revoke_wall_ms,classify_cpu_ms,occupancy_cpu_ms,cloud_cpu_ms,fine_blocks,dense_points,visible_points,new_free_cells,occupancy_cells,dense_index_bytes,fine_index_bytes,visible_index_bytes,fine_blocks_read,dense_coordinate_pages_read,dense_candidate_points,dense_removed_points,dense_index_pages_read,peak_rss_kib").unwrap();
         Some(Self {
-            root,
+            root: root.clone(),
             csv,
             records: Vec::new(),
             started: Instant::now(),
             capture,
             preloaded_input_peak_rss_kib: process_usage().1,
+            frame_audit: std::env::var_os("NUWAX_G3_KEY_AUDIT").map(|_| {
+                let mut file = BufWriter::new(File::create(root.join("逐帧撤销审计.bin")).unwrap());
+                file.write_all(b"G3FAUD1\0").unwrap();
+                file
+            }),
         })
+    }
+    pub(super) fn audit_enabled(&self) -> bool {
+        self.frame_audit.is_some()
+    }
+    pub(super) fn audit_frame(
+        &mut self,
+        frame_index: usize,
+        timestamp_ns: u64,
+        frame: &crate::dynamic_backend::MappedFrame,
+        removed: &[[i32; 3]],
+    ) {
+        let Some(file) = self.frame_audit.as_mut() else {
+            return;
+        };
+        // 仅显式量化批次记录现有帧编码及真正删掉的精细键，位于帧计时之后。
+        let encoded = frame.encode().unwrap();
+        file.write_all(&(frame_index as u32).to_le_bytes()).unwrap();
+        file.write_all(&timestamp_ns.to_le_bytes()).unwrap();
+        file.write_all(&(encoded.len() as u32).to_le_bytes())
+            .unwrap();
+        file.write_all(&(removed.len() as u32).to_le_bytes())
+            .unwrap();
+        file.write_all(&encoded).unwrap();
+        for key in removed {
+            for value in key {
+                file.write_all(&value.to_le_bytes()).unwrap();
+            }
+        }
     }
     pub(super) fn push(&mut self, row: FrameRecord) {
         let fine_blocks = row.fine_blocks.map_or_else(String::new, |v| v.to_string());
@@ -146,7 +181,52 @@ impl Recorder {
         self.csv.flush().unwrap();
         assert!(!self.records.is_empty());
         let final_dense_index_allocated_disk_bytes = cloud.revocation_index_disk_bytes();
+        let dense_storage_disk = cloud.dense_storage_disk_bytes();
+        let dense_directory = cloud.dense_directory_stats();
+        let storage_memory_names = [
+            "page_table_directory",
+            "page_visibility_metadata",
+            "bloom_filters",
+            "block_directory_estimated",
+            "live_keys_estimated",
+        ];
+        let mut storage_memory_peak = serde_json::Map::new();
+        let mut storage_memory_final = serde_json::Map::new();
+        for (index, name) in storage_memory_names.iter().enumerate() {
+            storage_memory_peak.insert(
+                (*name).into(),
+                json!(self
+                    .records
+                    .iter()
+                    .map(|r| r.dense_storage_memory[index])
+                    .max()
+                    .unwrap()),
+            );
+            storage_memory_final.insert(
+                (*name).into(),
+                json!(self.records.last().unwrap().dense_storage_memory[index]),
+            );
+        }
         let before_export = process_usage();
+        let audit_started = Instant::now();
+        let key_audit = if let Some(file) = self.frame_audit.as_mut() {
+            file.flush().unwrap();
+            let path = self.root.join("完整原键审计.bin");
+            cloud.export_dense_key_audit(&path).unwrap();
+            Some(
+                json!({"keys":artifact(&path, dense_storage_disk[0]/12,Some(25)),
+                "frames":artifact(&self.root.join("逐帧撤销审计.bin"),self.records.len() as u64,None),
+                "format":"每已存点25字节：xyz原f32位模式u32×3、降f32前i32×3体素键、u8当前可见性，含已撤销点；顺序与原追加文件相同"}),
+            )
+        } else {
+            None
+        };
+        let key_audit_export_wall_ms = if key_audit.is_some() {
+            audit_started.elapsed().as_secs_f64() * 1e3
+        } else {
+            0.0
+        };
+        let after_audit = process_usage();
         let export_started = Instant::now();
         let maps = export_maps(&self.root, cloud, persistent, source_timestamp_ns);
         let export_wall_ms = export_started.elapsed().as_secs_f64() * 1e3;
@@ -158,7 +238,8 @@ impl Recorder {
                 "dense_points":last.dense_points,"visible_points":last.visible_points,"fine_blocks":last.fine_blocks,
                 "occupancy_cells":last.occupancy_cells,"dense_index_bytes":last.dense_index_bytes,
                 "fine_index_bytes":last.fine_index_bytes,"visible_index_bytes":last.visible_index_bytes,
-                "new_free_cells":chunk.iter().map(|r|r.new_free_cells).sum::<usize>()})
+                "new_free_cells":chunk.iter().map(|r|r.new_free_cells).sum::<usize>(),
+                "dense_storage_memory_peak_bytes":storage_memory_names.iter().enumerate().map(|(i,n)|((*n).to_string(),json!(chunk.iter().map(|r|r.dense_storage_memory[i]).max().unwrap()))).collect::<serde_json::Map<String,Value>>()})
         }).collect();
         let summary = json!({
             "backend":format!("{:?}",crate::dynamic_backend::backend()),
@@ -174,12 +255,19 @@ impl Recorder {
             "peak_rss_before_export_kib":before_export.1,"peak_rss_with_export_kib":after_export.1,
             "preloaded_input_peak_rss_kib":self.preloaded_input_peak_rss_kib,
             "final_dense_index_allocated_disk_bytes":final_dense_index_allocated_disk_bytes,
+            "dense_storage_disk_bytes":{"xyz_logical":dense_storage_disk[0],"keys_logical":dense_storage_disk[1],"new_derived_logical":dense_storage_disk[2],
+                "xyz_allocated":dense_storage_disk[3],"keys_allocated":dense_storage_disk[4],"new_derived_allocated":dense_storage_disk[5]},
+            "dense_storage_memory_peak_bytes":storage_memory_peak,"dense_storage_memory_final_bytes":storage_memory_final,
+            "dense_directory_terminal":{"level":dense_directory[0],"entries":dense_directory[1],"last_frame_compactions":dense_directory[2],
+                "last_frame_compaction_entries":dense_directory[3],"last_frame_compaction_peak_bytes_estimated":dense_directory[4]},
+            "key_audit":key_audit,"key_audit_export_wall_ms":key_audit_export_wall_ms,
+            "key_audit_export_cpu_ms":after_audit.0-before_export.0,
             "peak_index_bytes":{"dense":self.records.iter().map(|r|r.dense_index_bytes).max().unwrap(),
                 "fine":self.records.iter().map(|r|r.fine_index_bytes).max().unwrap(),
                 "visible":self.records.iter().map(|r|r.visible_index_bytes).max().unwrap(),
                 "total":self.records.iter().map(|r|r.dense_index_bytes+r.fine_index_bytes+r.visible_index_bytes).max().unwrap()},
             "export_wall_ms":export_wall_ms,
-            "export_cpu_ms":after_export.0-before_export.0,
+            "export_cpu_ms":after_export.0-after_audit.0,
             "whole_instrumented_run_s":self.started.elapsed().as_secs_f64(),"maps":maps,
             "clock_scope":"整帧含分类、二维计算/持久融合、精细、完整、可见；不含实录预读、当前帧变换/来源构建、CSV/规模统计和终态提交导出",
             "input_memory_scope":"沿用原recorded_input预读方式，进程RSS包含完整实录冻结输入；另报新增索引字节",

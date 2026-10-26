@@ -561,6 +561,32 @@ impl CloudMapShmWriter {
     }
 
     #[cfg(test)]
+    pub(crate) fn dense_storage_disk_bytes(&self) -> [u64; 6] {
+        self.dense_cloud.as_ref().map_or([0; 6], DenseCloud::storage_disk_bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dense_storage_memory_bytes(&self) -> [usize; 5] {
+        self.dense_cloud.as_ref().map_or([0; 5], DenseCloud::storage_memory_bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dense_directory_stats(&self) -> [usize; 5] {
+        self.dense_cloud.as_ref().map_or([0; 5], DenseCloud::directory_stats)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn export_dense_key_audit(&self, path: &std::path::Path) -> Result<(), String> {
+        self.dense_cloud.as_ref().ok_or("完整源尚未创建")?.export_key_audit(path)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn audit_removed_fine_keys(&self) -> Vec<[i32; 3]> {
+        self.fine_cloud.as_ref().map_or_else(Vec::new, |fine|
+            fine.removed_keys().iter().map(|&(x, y, z)| [x, y, z]).collect())
+    }
+
+    #[cfg(test)]
     pub(crate) fn revocation_map_sizes(&self) -> (Option<usize>, u64, usize, usize) {
         (
             None,
@@ -644,7 +670,7 @@ impl CloudMapShmWriter {
         }
         #[cfg(test)]
         let phase_started = std::time::Instant::now();
-        // 完整显示保留静态扫描原坐标和重复观测，同步撤销动态历史。
+        // 完整显示保留当前静态原坐标和重复观测，历史按精细本帧实际撤销键移除。
         // 故障锁存并撤销完整源，不能继续发布缺帧历史或影响原导航地图。
         if !self.dense_history_missing && self.dense_error.is_none() {
             let result = (|| {
@@ -653,8 +679,7 @@ impl CloudMapShmWriter {
                 let dense = self.dense_cloud.as_mut().unwrap();
                 #[cfg(test)]
                 let revoke_started = std::time::Instant::now();
-                let removed = if let Some(frame) = fine.shared_frame().filter(|f| f.is_dufo()) { dense.remove_free_frame(frame)? }
-                else { dense.remove_voxels(fine.removed_keys(), fine.voxel_size())? };
+                let removed = dense.remove_voxels(fine.removed_keys(), fine.voxel_size())?;
                 #[cfg(test)]
                 {
                     self.last_revoke_stage_ms[1] = revoke_started.elapsed().as_secs_f64() * 1000.0;

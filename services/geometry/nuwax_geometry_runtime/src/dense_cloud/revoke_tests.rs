@@ -7,18 +7,17 @@ fn receipt(revision: u64) -> CloudCommitReceipt {
         session_generation: 4, occupancy_revision: revision, cloud_revision: revision,
         source_timestamp_ns: revision * 100, point_count: 1 }
 }
-
 fn bytes(points: &[Point3<f64>]) -> Vec<u8> {
     points.iter().flat_map(|p| [p.x, p.y, p.z].into_iter().flat_map(|v| (v as f32).to_le_bytes())).collect()
 }
+fn key(point: &Point3<f64>) -> Key { crate::pointcloud::voxel_key([point.x, point.y, point.z], 0.05).unwrap() }
 
 #[test]
-fn distant_free_cell_only_reads_one_related_page_at_every_archive_scale() {
+fn voxel_revoke_only_reads_related_key_and_coordinate_pages_at_archive_scale() {
     let _backend = dynamic_backend::test_backend(Backend::DufoMap);
     for page_count in [4, 256, 1024] {
         let mut cloud = DenseCloud::new().unwrap();
         for page in 0..page_count {
-            // 所有页的包围盒都跨过目标，但原坐标都远离目标，只有末页的两个重复观测有关。
             let mut points = (0..PAGE_POINTS).map(|local| Point3::new(
                 (if local % 2 == 0 { 1.0 } else { -1.0 }) * (1000.025 + page as f64),
                 0.025, 1.025)).collect::<Vec<_>>();
@@ -28,91 +27,118 @@ fn distant_free_cell_only_reads_one_related_page_at_every_archive_scale() {
             }
             cloud.append(&points).unwrap();
         }
-        let before = cloud.snapshot(&receipt(1), "局部规模").unwrap();
-        let frozen_tail = before.read(before.point_count - 4, 4).unwrap();
-        let frame = dynamic_backend::test_free_cells(0.15, [([0, 0, 6], 0)], Isometry3::identity());
-        assert_eq!(cloud.remove_free_frame(&frame).unwrap(), 2);
-        assert_eq!(cloud.last_revoke_read_pages(), 1, "只因相关页边界重算读取这一页");
-        assert_eq!(cloud.last_revoke_candidate_points(), 2, "空间索引不能读出其余包围盒相交页的点");
-        assert!(cloud.last_revoke_index_read_pages() <= 16, "B树定位读取页数应有固定的小上界");
-        assert!(cloud.revoke_index_memory_bytes() <= DenseCloud::revoke_index_memory_limit_bytes());
-        assert_eq!(before.read(before.point_count - 4, 4).unwrap(), frozen_tail);
-        let after = cloud.snapshot(&receipt(2), "局部规模").unwrap();
+        let before = cloud.snapshot(&receipt(1), "按键局部规模").unwrap();
+        let tail = before.read(before.point_count - 4, 4).unwrap();
+        let target = key(&Point3::new(0.025, 0.025, 1.025));
+        assert_eq!(cloud.remove_voxels(&[target], 0.05).unwrap(), 2);
+        assert_eq!(cloud.last_revoke_candidate_pages(), 1);
+        assert_eq!(cloud.last_revoke_key_read_pages(), 1);
+        assert_eq!(cloud.last_revoke_read_pages(), 1);
+        assert_eq!(cloud.last_revoke_candidate_points(), PAGE_POINTS);
+        assert_eq!(before.read(before.point_count - 4, 4).unwrap(), tail);
+        let after = cloud.snapshot(&receipt(2), "按键局部规模").unwrap();
         assert_eq!(after.point_count, before.point_count - 2);
-        assert_ne!(after.epoch, before.epoch);
-        assert_eq!(cloud.remove_free_frame(&frame).unwrap(), 0);
-        assert_eq!(cloud.last_revoke_candidate_points(), 0, "已撤销的索引记录应同步消失");
+        assert_ne!(before.epoch, after.epoch);
+        assert_eq!(cloud.remove_voxels(&[target], 0.05).unwrap(), 0);
+        assert_eq!(cloud.last_revoke_key_read_pages(), 0);
         assert_eq!(cloud.last_revoke_read_pages(), 0);
-        let empty = dynamic_backend::test_free_cells(0.15, [([1_000_000, 0, 6], 0)], Isometry3::identity());
-        assert_eq!(cloud.remove_free_frame(&empty).unwrap(), 0);
-        assert_eq!(cloud.last_revoke_read_pages(), 0);
-        eprintln!("DENSE_REVOKE_LOCALITY pages={page_count} read_pages=1 candidate_points=2 index_resident_bytes={} index_disk_bytes={} resident_limit_bytes={}",
-            cloud.revoke_index_memory_bytes(), cloud.revoke_index_disk_bytes(), DenseCloud::revoke_index_memory_limit_bytes());
+        let absent = key(&Point3::new(-99_999.025, 0.025, 1.025));
+        assert_eq!(cloud.remove_voxels(&[absent], 0.05).unwrap(), 0);
+        assert_eq!(cloud.last_revoke_candidate_pages(), 0, "全局原键集合排除目标后无需访问候选页");
+        let disk = cloud.storage_disk_bytes();
+        assert_eq!(disk[0], before.point_count * 12);
+        assert_eq!(disk[1], disk[0]);
+        assert_eq!([disk[2], disk[5]], [0, 0], "没有新的线性磁盘派生物");
+        eprintln!("DENSE_VOXEL_LOCALITY pages={page_count} key_pages=1 coordinate_pages=1 visible_points_scanned={} memory={:?} disk={disk:?}", PAGE_POINTS, cloud.storage_memory_bytes());
     }
 }
 
 #[test]
-fn repeated_static_points_outside_free_cell_do_not_become_archive_sized_candidates() {
+fn same_block_unrelated_keys_are_rejected_by_existing_filters_without_disk_reads() {
     let _backend = dynamic_backend::test_backend(Backend::DufoMap);
-    let frame = dynamic_backend::test_free_cells(0.15, [([1, 0, 2], 0)], Isometry3::identity());
-    let repeated = Point3::new(0.025, 0.025, 0.325);
-    assert!(!frame.clears([repeated.x, repeated.y, repeated.z]));
     for page_count in [4, 256, 1024] {
         let mut cloud = DenseCloud::new().unwrap();
-        let points = vec![repeated; PAGE_POINTS];
+        let points = vec![Point3::new(0.025, 0.025, 0.325); PAGE_POINTS];
         for _ in 0..page_count { cloud.append(&points).unwrap(); }
-        let before = cloud.snapshot(&receipt(1), "同格静态重复").unwrap();
-        assert_eq!(cloud.remove_free_frame(&frame).unwrap(), 0);
-        eprintln!("DENSE_REVOKE_SAME_CELL pages={page_count} candidates={} coordinate_reads={} index_reads={}",
-            cloud.last_revoke_candidate_points(), cloud.last_revoke_read_pages(), cloud.last_revoke_index_read_pages());
-        assert_eq!(cloud.last_revoke_candidate_points(), 0,
-            "同粗格、但不在新增空单元范围内的静态重复点不能随全部归档增长成为候选");
+        let absent = key(&Point3::new(0.175, 0.025, 0.325));
+        assert_eq!(cloud.remove_voxels(&[absent], 0.05).unwrap(), 0);
+        assert_eq!(cloud.last_revoke_candidate_pages(), 0);
+        // 明确观测全局原键集合耗尽后的边界：候选元数据可随同域页增长，键/坐标IO仍被过滤。
+        cloud.live_keys = None;
+        assert_eq!(cloud.remove_voxels(&[absent], 0.05).unwrap(), 0);
+        assert_eq!(cloud.last_revoke_candidate_pages(), page_count);
+        assert_eq!(cloud.last_revoke_candidate_points(), 0);
+        assert_eq!(cloud.last_revoke_key_read_pages(), 0);
         assert_eq!(cloud.last_revoke_read_pages(), 0);
-        assert_eq!(cloud.snapshot(&receipt(2), "同格静态重复").unwrap().epoch, before.epoch);
-        assert_eq!(before.read(0, 2).unwrap(), bytes(&points[..2]));
+        eprintln!("DENSE_BLOOM_BOUNDARY pages={page_count} metadata_candidates={} key_pages=0 coordinate_pages=0", cloud.last_revoke_candidate_pages());
     }
 }
 
 #[test]
-fn indexed_revoke_matches_reference_with_rotation_boundaries_duplicates_and_restore() {
+fn original_directory_budget_compacts_conservatively_and_keeps_remote_queries_local() {
+    let _backend = dynamic_backend::test_backend(Backend::DufoMap);
+    let mut cloud = DenseCloud::new().unwrap();
+    let points = (0..MAX_INDEX_ENTRIES + 3).map(|i| Point3::new(i as f64 * 3.2 + 0.025, 0.025, 0.025)).collect::<Vec<_>>();
+    cloud.append(&points[..MAX_INDEX_ENTRIES]).unwrap();
+    assert_eq!(cloud.directory_stats()[1], MAX_INDEX_ENTRIES);
+    let before_bytes = cloud.storage_memory_bytes()[3];
+    let frozen = cloud.snapshot(&receipt(1), "原预算压缩").unwrap();
+    cloud.append(&points[MAX_INDEX_ENTRIES..]).unwrap();
+    let stats = cloud.directory_stats();
+    assert!(!cloud.block_directory.missing(), "预算耗尽不能丢掉DUFO目录");
+    assert!(stats[0] > 0 && stats[2] > 0);
+    assert!(stats[1] <= MAX_INDEX_ENTRIES);
+    assert!(stats[3] <= 32 * MAX_INDEX_ENTRIES, "压缩单次迁移受32层和原1M预算约束");
+    assert!(stats[4] <= 2 * (before_bytes + cloud.storage_memory_bytes()[3]), "压缩瞬态按旧新目录容量给上界");
+    assert_eq!(cloud.remove_voxels(&[key(&points[0])], 0.05).unwrap(), 1);
+    assert_eq!(cloud.last_revoke_candidate_pages(), 1);
+    assert_eq!(cloud.last_revoke_key_read_pages(), 1);
+    assert_eq!(cloud.last_revoke_read_pages(), 1);
+    assert_eq!(frozen.read(0, 2).unwrap(), bytes(&points[..2]));
+    eprintln!("DENSE_DIRECTORY_BUDGET level={} entries={} compactions={} migrated={} transient_directory_capacity_bytes={}", stats[0], stats[1], stats[2], stats[3], stats[4]);
+}
+
+#[test]
+fn voxel_follow_preserves_original_bits_order_duplicates_and_restored_snapshots() {
     let _backend = dynamic_backend::test_backend(Backend::DufoMap);
     let transform = Isometry3::new(nalgebra::Vector3::new(-4.2, 3.1, -0.7), nalgebra::Vector3::new(0.2, -0.4, 0.8));
-    let frame = dynamic_backend::test_free_cells(0.15, [([-2, -2, -2], 1), ([2, 2, 2], 0)], transform);
-    let mut points = Vec::new();
-    for ix in -9..10 { for iy in -9..10 { for iz in -3..4 {
-        let p = transform * Point3::new(ix as f64 * 0.05, iy as f64 * 0.05, iz as f64 * 0.15);
-        points.extend([p, p]);
-    } } }
-    // 浮点边界两侧，最后仍按归档f32坐标精确复核，不能仅凭候选格删除。
-    for x in [-0.30000000001, -0.3, -0.29999999999, 0.29999999999, 0.3, 0.30000000001] {
-        points.push(transform * Point3::new(x, -0.15, -0.15));
-    }
-    let mut cloud = DenseCloud::new().unwrap();
-    let mut reference = DenseCloud::new().unwrap();
-    cloud.append(&points).unwrap();
-    reference.append(&points).unwrap();
-    let before = cloud.snapshot(&receipt(1), "旋转边界").unwrap();
-    let before_bytes = before.read(0, CHUNK_POINTS).unwrap();
-    let expected: Vec<_> = before_bytes.chunks_exact(12).filter(|p| !frame.clears(decode_point(p).map(f64::from)))
-        .flat_map(|p| p.iter().copied()).collect();
-    assert!(expected.len() < before_bytes.len());
-    assert_eq!(cloud.remove_free_frame(&frame).unwrap(), reference.remove_free_frame_reference(&frame).unwrap());
-    let after = cloud.snapshot(&receipt(2), "旋转边界").unwrap();
-    let legacy = reference.snapshot(&receipt(2), "旋转边界").unwrap();
-    assert_eq!(after.read(0, CHUNK_POINTS).unwrap(), expected);
-    assert_eq!(after.read(0, CHUNK_POINTS).unwrap(), legacy.read(0, CHUNK_POINTS).unwrap());
-    assert_eq!((after.bounds_min, after.bounds_max), (legacy.bounds_min, legacy.bounds_max));
-    assert_eq!(before.read(0, CHUNK_POINTS).unwrap(), before_bytes);
-    let (mut archive, _) = after.archive("map").unwrap();
-    validate_archive(&mut archive).unwrap();
-    let mut restored = DenseCloud::from_archive(archive, &after.metadata("map")).unwrap();
-    let more = dynamic_backend::test_free_cells(0.15, [([0, 0, 0], 0)], transform);
-    let expected: Vec<_> = expected.chunks_exact(12).filter(|p| !more.clears(decode_point(p).map(f64::from)))
-        .flat_map(|p| p.iter().copied()).collect();
-    restored.remove_free_frame(&more).unwrap();
-    let restored = restored.snapshot(&receipt(3), "恢复索引").unwrap();
-    assert_eq!(restored.read(0, CHUNK_POINTS).unwrap(), expected);
+    let points: Vec<_> = (-9..10).flat_map(|ix| (-9..10).flat_map(move |iy| (-3..4).map(move |iz|
+        transform * Point3::new(ix as f64 * 0.05 + 0.017, iy as f64 * 0.05 + 0.013, iz as f64 * 0.15 + 0.021))))
+        .flat_map(|point| [point, point]).collect();
+    let removed: HashSet<_> = points.iter().step_by(7).map(key).collect();
+    let expected_points: Vec<_> = points.iter().filter(|point| !removed.contains(&key(point))).copied().collect();
+    let mut cloud = DenseCloud::new().unwrap(); cloud.append(&points).unwrap();
+    let before = cloud.snapshot(&receipt(1), "体素跟随").unwrap();
+    assert_eq!(cloud.remove_voxels(&removed.into_iter().collect::<Vec<_>>(), 0.05).unwrap(), points.len() - expected_points.len());
+    let after = cloud.snapshot(&receipt(2), "体素跟随").unwrap();
+    assert_eq!(after.read(0, CHUNK_POINTS).unwrap(), bytes(&expected_points));
     assert_eq!(before.read(0, CHUNK_POINTS).unwrap(), bytes(&points));
+    let (mut file, _) = after.archive("map").unwrap(); validate_archive(&mut file).unwrap();
+    let mut restored = DenseCloud::from_archive(file, &after.metadata("map")).unwrap();
+    let archived: Vec<_> = expected_points.iter().map(|p| Point3::new(p.x as f32 as f64, p.y as f32 as f64, p.z as f32 as f64)).collect();
+    let target = key(&archived[0]);
+    let survivors: Vec<_> = archived.iter().filter(|point| key(point) != target).copied().collect();
+    restored.remove_voxels(&[target], 0.05).unwrap();
+    assert_eq!(restored.snapshot(&receipt(3), "恢复").unwrap().read(0, CHUNK_POINTS).unwrap(), bytes(&survivors));
+    assert_eq!(before.read(0, CHUNK_POINTS).unwrap(), bytes(&points));
+}
+
+#[test]
+fn key_audit_preserves_pre_f32_keys_and_invisible_source_records() {
+    let _backend = dynamic_backend::test_backend(Backend::DufoMap);
+    let boundary = f64::from(0.05_f32) * 40.0;
+    let points = [Point3::new(boundary - 1e-10, -0.025, 0.025), Point3::new(boundary + 1e-10, -0.025, 0.025)];
+    assert_eq!(bytes(&points[..1]), bytes(&points[1..]));
+    let mut cloud = DenseCloud::new().unwrap(); cloud.append(&points).unwrap();
+    cloud.remove_voxels(&[(39, -1, 0)], 0.05).unwrap();
+    let path = std::env::temp_dir().join(format!("nuwax-dense-key-audit-{}", uuid::Uuid::new_v4()));
+    cloud.export_key_audit(&path).unwrap();
+    let audit = std::fs::read(&path).unwrap(); std::fs::remove_file(&path).unwrap();
+    assert_eq!(audit.len(), 50);
+    assert_eq!(&audit[..12], &audit[25..37]);
+    assert_eq!(i32::from_le_bytes(audit[12..16].try_into().unwrap()), 39);
+    assert_eq!(i32::from_le_bytes(audit[37..41].try_into().unwrap()), 40);
+    assert_eq!([audit[24], audit[49]], [0, 1]);
 }
 
 #[test]

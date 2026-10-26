@@ -1445,6 +1445,15 @@ mod tests {
                         cloud.revocation_map_sizes();
                     let (dense_index_bytes, fine_index_bytes, visible_index_bytes) =
                         cloud.revocation_index_memory_bytes();
+                    let dense_storage_memory = cloud.dense_storage_memory_bytes();
+                    if recorder.audit_enabled() {
+                        recorder.audit_frame(
+                            index + 1,
+                            scan.source_timestamp_ns,
+                            input.dynamic_frame.as_ref().unwrap(),
+                            &cloud.audit_removed_fine_keys(),
+                        );
+                    }
                     let revoke_stages = cloud.last_revoke_stage_ms();
                     let (
                         fine_blocks_read,
@@ -1490,6 +1499,7 @@ mod tests {
                         dense_removed_points,
                         dense_index_pages_read,
                         peak_rss_kib: after.1,
+                        dense_storage_memory,
                     });
                 }
                 if (index + 1) % 100 == 0 || index + 1 == scans.len() {

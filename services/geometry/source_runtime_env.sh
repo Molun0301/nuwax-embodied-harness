@@ -6,6 +6,15 @@ source "${GEOMETRY_RUNTIME_REPO_ROOT}/scripts/lib/config_env.sh"
 
 load_platform_config || return 1
 
+# 导航与探索共用地形来源；物化默认后，子进程仍须能读取后来保存的方案。
+if [[ "${NUWAX_NAV_PCT_TERRAIN_SOURCE:-}" != *[![:space:]]* ]]; then
+  NUWAX_NAV_PCT_TERRAIN_SOURCE=tomography
+  if [[ -z "${_NUWAX_CONFIG_INITIAL_KEYS[NUWAX_NAV_PCT_TERRAIN_SOURCE]+x}" ]]; then
+    export _NUWAX_CONFIG_FILE_KEYS="${_NUWAX_CONFIG_FILE_KEYS:-}NUWAX_NAV_PCT_TERRAIN_SOURCE:"
+  fi
+fi
+export NUWAX_NAV_PCT_TERRAIN_SOURCE
+
 # 空白与未设置采用约定默认；非空值原样交给 Rust 启动边界校验。
 if [[ "${NUWAX_GEOMETRY_FINE_CLOUD_CACHE_MIB:-}" != *[![:space:]]* ]]; then
   NUWAX_GEOMETRY_FINE_CLOUD_CACHE_MIB=auto

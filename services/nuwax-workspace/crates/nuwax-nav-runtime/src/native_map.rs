@@ -3,6 +3,32 @@ use crate::SurfaceSnapshot;
 use nuwax_nav_pct_native::{Band, Cell, Config};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// 全局导航与探索共用的地形来源，旧表面链保留到设备验收。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PctTerrainSource {
+    #[default]
+    Tomography,
+    Mls,
+}
+
+impl PctTerrainSource {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "" | "tomography" => Ok(Self::Tomography),
+            "mls" => Ok(Self::Mls),
+            value => Err(format!("NUWAX_NAV_PCT_TERRAIN_SOURCE 不支持 {value:?}，应为 tomography 或 mls")),
+        }
+    }
+
+    pub fn from_env() -> Result<Self, String> {
+        match std::env::var("NUWAX_NAV_PCT_TERRAIN_SOURCE") {
+            Ok(value) => Self::parse(&value),
+            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
+            Err(error) => Err(format!("无法读取 PCT 地形来源：{error}")),
+        }
+    }
+}
+
 /// 原地面高度与实体占据，二者保持独立。
 #[derive(Clone, Debug)]
 pub struct NativeMap {
@@ -308,8 +334,19 @@ pub fn pct_input(
             high: f64::INFINITY,
         });
     }
+    let config = pct_config(map, body_to_ground, boundary, input.resolution);
+    Ok((config, input.cells, input.bands))
+}
+
+/// 两种地形来源共用完整机体参数，来源切换不改变碰撞和通行能力。
+fn pct_config(
+    map: &SurfaceSnapshot,
+    body_to_ground: f64,
+    boundary: &[[f64; 2]],
+    resolution: f64,
+) -> Config {
     let mut config = Config {
-        resolution: input.resolution,
+        resolution,
         point_resolution: f64::from(map.source_voxel_size_m()),
         robot_height: f64::from(map.config().robot_height),
         footprint_radius: f64::from(map.config().wall_clearance_m),
@@ -336,8 +373,80 @@ pub fn pct_input(
         config.max_step_down = body.max_step_down_m;
         config.max_slope = body.max_cross_slope_deg.to_radians();
     }
-    Ok((config, input.cells, input.bands))
+    config
 }
+
+/// 从当前快照的源点生成层析；占据带和禁区交现有原生桥判定。
+pub fn pct_input_from_tomogram(
+    map: &SurfaceSnapshot,
+    body_to_ground: f64,
+    boundary: &[[f64; 2]],
+) -> Result<(Config, Vec<Cell>, Vec<Band>), String> {
+    let (resolution, columns) = map.navigation_source_columns(None);
+    let config = pct_config(map, body_to_ground, boundary, resolution);
+    let mut points = Vec::new();
+    if let Some(measured) = map.navigation_measured_points() {
+        points.extend(measured.iter().map(|p| p.map(|v| v as f32)));
+    } else {
+        // 旧存档没有格内实测均值时，仅恢复已有源体素中心，不读取旧表面地层。
+        for (column, bands) in columns {
+            let xy = column.map(|v| (f64::from(v) + 0.5) * resolution);
+            for [low, high] in bands {
+                let count = ((high - low) / config.point_resolution).round().max(1.0) as usize;
+                for index in 0..count {
+                    points.push([
+                        xy[0] as f32,
+                        xy[1] as f32,
+                        (low + (index as f64 + 0.5) * (high - low) / count as f64) as f32,
+                    ]);
+                }
+            }
+        }
+    }
+    let (recent_ground, recent_obstacles) = map.navigation_recent_samples();
+    points.extend(recent_ground.iter().map(|p| p.map(|v| v as f32)));
+    let slice_dh = config.robot_height.max(config.point_resolution);
+    let min_z = points.iter().map(|p| f64::from(p[2])).fold(f64::INFINITY, f64::min);
+    let slice_h0 = if min_z.is_finite() { min_z + slice_dh } else { 0.0 };
+    let mut tomogram = nuwax_pct_tomography::build(&points, &nuwax_pct_tomography::TomographyConfig {
+        resolution,
+        point_resolution: config.point_resolution,
+        slice_h0,
+        slice_dh,
+    })?;
+    // 近期非地面只补实体占据，不能把动态物体顶面变成全局地形。
+    let half = config.point_resolution * 0.5;
+    tomogram.bands.extend(recent_obstacles.iter().map(|p| Band {
+        x: (p[0] / resolution).floor() as i32,
+        y: (p[1] / resolution).floor() as i32,
+        low: p[2] - half,
+        high: p[2] + half,
+    }));
+    tomogram.bands.extend(map.navigation_forbidden_columns(resolution).into_iter().map(|column| Band {
+        x: column[0],
+        y: column[1],
+        low: f64::NEG_INFINITY,
+        high: f64::INFINITY,
+    }));
+    Ok((config, tomogram.cells, tomogram.bands))
+}
+
+/// 显式来源便于两个消费者使用同一配置，并把来源纳入缓存身份。
+pub fn pct_input_for_source(
+    map: &SurfaceSnapshot,
+    body_to_ground: f64,
+    boundary: &[[f64; 2]],
+    source: PctTerrainSource,
+) -> Result<(Config, Vec<Cell>, Vec<Band>), String> {
+    match source {
+        PctTerrainSource::Tomography => pct_input_from_tomogram(map, body_to_ground, boundary),
+        PctTerrainSource::Mls => pct_input(map, body_to_ground, boundary),
+    }
+}
+
+#[cfg(test)]
+#[path = "native_map_tomography_tests.rs"]
+mod tomography_tests;
 
 #[cfg(test)]
 mod tests {

@@ -184,6 +184,31 @@
     "apply_scope": "重启相关服务后生效",
     "description": ""
   },
+  "NUWAX_NAV_PCT_TERRAIN_SOURCE": {
+    "zh_name": "PCT 三维地形来源",
+    "type": "str",
+    "default": "tomography",
+    "section_id": "nav_stack",
+    "target_file": "core_env",
+    "advanced": false,
+    "consumers": [
+      "services/geometry/source_runtime_env.sh",
+      "services/nuwax-workspace/crates/nuwax-nav-runtime/src/native_map.rs",
+      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_oriented.rs",
+      "services/nuwax-workspace/crates/nuwax-exploration/src/surface_adapter.rs"
+    ],
+    "apply_scope": "重启导航后端和几何运行时后生效，无需重新构建",
+    "effective_value_scope": "external_process",
+    "choices": [
+      "tomography",
+      "mls"
+    ],
+    "choice_labels": [
+      "PCT 点云层析（默认）",
+      "MLS 多层表面（旧链路）"
+    ],
+    "description": "三维导航与探索使用的地形输入。tomography 使用 PCT（点云层析）从静态点云生成分层地面、净空和占据带；mls 使用 MLS（多层表面）旧链路。二维执行链不使用此项。缺省或手工配置为空白时使用 tomography；修改后须重启导航后端和几何运行时。"
+  },
   "NUWAX_FORBIDDEN_ZONES_PATH": {
     "zh_name": "禁行区数据文件",
     "type": "str",

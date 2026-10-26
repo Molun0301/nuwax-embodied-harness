@@ -171,6 +171,7 @@ pub struct FrozenSurfacePlanningInput {
 
 #[derive(Clone)]
 struct CachedFrontierPlanner {
+    terrain_source: nuwax_nav_runtime::native_map::PctTerrainSource,
     offset: f64,
     boundary: Vec<[f64; 2]>,
     resolution: f64,
@@ -197,18 +198,20 @@ impl NativeFrontierCache {
         if nuwax_nav_pct_native::planning_cancelled() {
             return Err("PCT规划已取消".into());
         }
+        let terrain_source = nuwax_nav_runtime::native_map::PctTerrainSource::from_env()?;
         let mut state = self
             .state
             .lock()
             .map_err(|_| "前沿原生地图缓存锁已失效".to_string())?;
         if let Some(cached) = state
             .as_ref()
-            .filter(|cached| cached.offset == offset && cached.boundary == boundary)
+            .filter(|cached| cached.offset == offset && cached.boundary == boundary
+                && cached.terrain_source == terrain_source)
         {
             return Ok(cached.clone());
         }
         let (config, cells, bands) =
-            nuwax_nav_runtime::native_map::pct_input(snapshot, offset, boundary)?;
+            nuwax_nav_runtime::native_map::pct_input_for_source(snapshot, offset, boundary, terrain_source)?;
         let mut measured = std::collections::BTreeMap::<[i32; 2], Vec<f64>>::new();
         for cell in &cells {
             measured
@@ -221,6 +224,7 @@ impl NativeFrontierCache {
         tracing::debug!(target:"navigation.pct",event="navigation.pct.map",cells=cells.len(),
             occupied_bands=bands.len(),"探索PCT原生输入构建完成");
         let cached = CachedFrontierPlanner {
+            terrain_source,
             offset,
             boundary: boundary.to_vec(),
             resolution,

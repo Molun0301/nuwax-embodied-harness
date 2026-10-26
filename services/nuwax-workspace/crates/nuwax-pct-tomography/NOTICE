@@ -1,0 +1,19 @@
+Copyright (c) 2024 Bowen Yang <byangar@connect.ust.hk>, Jie Cheng <jchengai@connect.ust.hk>
+
+来源：https://github.com/byangw/PCT_planner
+固定提交：35cd73fd82bcd51bc538429294af7646b2a09815
+原始来源：tomography/scripts/tomogram.py、tomography/scripts/kernels.py。
+原样保存在 upstream/，完整 GNU GPL v2 许可证保存在 LICENSE。
+本模块及其移植部分适用 GPL-2.0-or-later；原作者许可说明见上游 NOTICE。
+
+Nuwax 本地修改（2026-10-26）：
+- 将逐切片 ground 最大值、ceiling 最小值移植为 Rust/rayon CPU（中央处理器）实现。
+- 使用既有原生桥的地图零点 floor 平面格；上游使用相对地图中心 round 格。
+- 采用稀疏列和排序高度，省略无地面单元，正无穷表示无观测顶面。
+- 同列几何完全相同的切片去重；保留所有不同 ground/ceiling 对，交原生桥计算通行性。
+  上游完整层简化还依赖通行代价与膨胀，四字段几何接口未移植该代价阶段。
+- 占据带按既有原生桥 point_resolution * 1.5 的相邻采样间距合并。
+- 增加输入校验、区域筛选、行为测试、离线数值与性能复现入口。
+
+本程序为自由软件，可按 GNU General Public License 第 2 版或任意后续版本分发和修改；
+不提供任何担保，包括适销性或针对特定用途的适用性。详见 LICENSE。

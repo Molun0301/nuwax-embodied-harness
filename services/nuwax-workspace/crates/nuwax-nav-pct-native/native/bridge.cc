@@ -249,6 +249,34 @@ struct Planner {
     std::vector<unsigned char> measured(static_cast<size_t>(layers)*nx*ny,0);
     auto key_index=[&](int l,int y,int x){return (static_cast<size_t>(l)*ny+y)*nx+x;};
     const double dx=goal[0]-start[0],dy=goal[1]-start[1];
+    auto continuous_grade_sq=[&](XY key,double height) {
+      double grade_sq=0;
+      const double tolerance=cfg.point_resolution*0.5+1e-8;
+      auto nearest=[&](XY neighbor)->const PctCell* {
+        auto column=columns.find(neighbor);
+        if(column==columns.end()||column->second.surfaces.empty())return nullptr;
+        const auto& surfaces=column->second.surfaces;
+        return &*std::min_element(surfaces.begin(),surfaces.end(),[&](const PctCell& a,const PctCell& b) {
+          return std::abs(a.ground-height)<std::abs(b.ground-height);
+        });
+      };
+      for(int axis=0;axis<2;++axis) {
+        const int coordinate=axis==0?key.first:key.second;
+        if(coordinate==std::numeric_limits<int>::min()||coordinate==std::numeric_limits<int>::max())continue;
+        XY minus=key,plus=key;
+        (axis==0?minus.first:minus.second)--;
+        (axis==0?plus.first:plus.second)++;
+        const auto* lower=nearest(minus);const auto* upper=nearest(plus);
+        if(!lower||!upper)continue;
+        const double before=height-lower->ground,after=upper->ground-height;
+        // 双侧同向且高度增量相符才计连续坡面；阶边一侧为踏面时仍由原阶高判定。
+        if(before*after>0&&std::abs(before-after)<=tolerance) {
+          const double grade=std::min(std::abs(before),std::abs(after))/q;
+          grade_sq+=grade*grade;
+        }
+      }
+      return grade_sq;
+    };
     for(const auto& entry:columns){
       if(cancel&&cancel(user))return false;
       const int x=entry.first.first-minx,y=entry.first.second-miny;
@@ -262,7 +290,9 @@ struct Planner {
           if(std::abs(heights(l*ny+y,x)-(low+l*spacing))<=std::abs(s.ground-(low+l*spacing)))continue;
         }
         measured[index]=1;heights(l*ny+y,x)=s.ground;
-        cost(l*ny+y,x)=s.ceiling-s.ground+1e-8<cfg.robot_height?100:0;
+        // 完整平面梯度与行进方向无关，不能通过斜向走格绕过连续坡度上限。
+        const bool steep=continuous_grade_sq(entry.first,s.ground)>std::pow(std::tan(cfg.max_slope),2)+1e-8;
+        cost(l*ny+y,x)=s.ceiling-s.ground+1e-8<cfg.robot_height||steep?100:0;
       }
     }
     add_clearance_cost(cost,measured,layers,nx,ny,q);

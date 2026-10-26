@@ -8,6 +8,7 @@ pub type BodyPose = ([f64; 3], [f64; 4]);
 
 struct CachedPlanner {
     source: SurfaceSnapshot,
+    terrain_source: native_map::PctTerrainSource,
     boundary: Vec<[f64; 2]>,
     offset: f64,
     /// 原生内核的XY格边长，端点格判断与内核用同一个值。
@@ -24,16 +25,18 @@ impl PctPlanner {
     pub fn route(&self, map: &SurfaceSnapshot, start: BodyPose, goal: BodyPose,
         options: GoalOptions, boundary: &[[f64; 2]], offset: f64,
         cancelled: Option<&AtomicBool>) -> Result<Vec<BodyPose>, String> {
+        let terrain_source = native_map::PctTerrainSource::from_env()?;
         let mut cache = self.cached.lock().map_err(|error| error.to_string())?;
         let reusable = cache.as_ref().is_some_and(|current|
-            current.source.same_body_query_view(map) && current.boundary == boundary && current.offset == offset);
+            current.source.same_body_query_view(map) && current.terrain_source == terrain_source
+                && current.boundary == boundary && current.offset == offset);
         if !reusable {
-            let (config, cells, bands) = native_map::pct_input(map, offset, boundary)?;
+            let (config, cells, bands) = native_map::pct_input_for_source(map, offset, boundary, terrain_source)?;
             let resolution = config.resolution;
             let planner = nuwax_nav_pct_native::Planner::from_cells(config, &cells, &bands)?;
             tracing::debug!(target:"navigation.pct", event="navigation.pct.map",
-                cells=cells.len(), occupied_bands=bands.len(), "PCT原生输入构建完成");
-            *cache = Some(CachedPlanner { source: map.clone(), boundary: boundary.to_vec(), offset,
+                ?terrain_source, cells=cells.len(), occupied_bands=bands.len(), "PCT原生输入构建完成");
+            *cache = Some(CachedPlanner { source: map.clone(), terrain_source, boundary: boundary.to_vec(), offset,
                 resolution, planner });
         }
         let cached = cache.as_mut().expect("原生地图已创建");

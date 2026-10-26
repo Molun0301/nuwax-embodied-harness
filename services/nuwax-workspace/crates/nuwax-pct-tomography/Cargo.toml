@@ -1,0 +1,11 @@
+[package]
+name = "nuwax-pct-tomography"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "GPL-2.0-or-later"
+publish = false
+
+[dependencies]
+nuwax-nav-pct-native = { path = "../nuwax-nav-pct-native" }
+rayon = "1"

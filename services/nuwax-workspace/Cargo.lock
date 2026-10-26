@@ -2063,6 +2063,7 @@ dependencies = [
  "nuwax-nav-pct-native",
  "nuwax-nav-scan-native",
  "nuwax-nav-types-messages",
+ "nuwax-pct-tomography",
  "prost",
  "serde_json",
  "thiserror 1.0.69",
@@ -2245,6 +2246,14 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "nuwax-pct-tomography"
+version = "0.1.0"
+dependencies = [
+ "nuwax-nav-pct-native",
+ "rayon",
 ]
 
 [[package]]

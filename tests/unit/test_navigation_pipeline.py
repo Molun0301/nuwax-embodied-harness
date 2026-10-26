@@ -164,3 +164,66 @@ def test_legacy_mls_profile_migrates_to_current_3d_navigation():
     assert resolve_navigation_profile("lio_3d", "mls-3d") == "pct-scan-3d"
     with pytest.raises(ValueError):
         resolve_navigation_profile("slam_2d", "mls-3d")
+
+
+_TERRAIN_SOURCE = "NUWAX_NAV_PCT_TERRAIN_SOURCE"
+
+
+def _terrain_profile(tmp_path, monkeypatch):
+    """将配置保存与方案选择限定在本次测试目录。"""
+    monkeypatch.setattr(config_io, "_CORE_ENV", tmp_path / ".env")
+    profile = tmp_path / "drivers/go2/configs/默认.env"
+    profile.parent.mkdir(parents=True)
+    (profile.parent.parent / "manifest.py").touch()
+    (profile.parent.parent / "assembly.py").touch()
+    profile.write_text("NUWAX_GEOMETRY_PIPELINE=lio_3d\n")
+    return profile
+
+
+@pytest.mark.parametrize("source", ["tomography", "mls"])
+def test_pct_terrain_source_saves_to_robot_scheme_and_remains_external(tmp_path, monkeypatch, source):
+    profile = _terrain_profile(tmp_path, monkeypatch)
+    result = config_io.save_values({_TERRAIN_SOURCE: source}, robot="go2", profile="默认")
+    assert not result.rejected
+    assert result.written["robot_profile_env"] == [_TERRAIN_SOURCE]
+    assert read_env_values(profile)[_TERRAIN_SOURCE] == source
+    schema = config_io.build_schema(robot="go2", profile="默认")
+    field = next(field for section in schema["sections"] for field in section["fields"]
+                 if field["key"] == _TERRAIN_SOURCE)
+    assert field["value"] == field["saved_value"] == source
+    assert field["default_value"] == "tomography"
+    assert field["choices"] == ["tomography", "mls"]
+    assert field["effective_value_scope"] == "external_process"
+    assert field["effective_value_known"] is False
+    assert field["effective_value"] is None
+
+
+def test_pct_terrain_source_invalid_save_and_activation_preserve_selected_scheme(tmp_path, monkeypatch):
+    from core.config_profiles import activate_profile
+
+    profile = _terrain_profile(tmp_path, monkeypatch)
+    saved = config_io.save_values({_TERRAIN_SOURCE: "mls"}, robot="go2", profile="默认")
+    assert not saved.rejected
+    activate_profile(root=tmp_path, robot="go2", profile="默认")
+    before = profile.read_bytes()
+    result = config_io.save_values({_TERRAIN_SOURCE: "invalid"}, robot="go2", profile="默认")
+    assert _TERRAIN_SOURCE in result.rejected
+    assert profile.read_bytes() == before
+    selected = tmp_path / "runtime_data/settings/active.env"
+    previous_target = selected.readlink()
+    invalid = profile.with_name("无效.env")
+    invalid.write_text(f"{_TERRAIN_SOURCE}=invalid\n")
+    with pytest.raises(ValueError, match=_TERRAIN_SOURCE):
+        activate_profile(root=tmp_path, robot="go2", profile="无效")
+    assert selected.readlink() == previous_target
+    assert (profile.parent / ".active").read_text() == "默认\n"
+
+
+@pytest.mark.parametrize("source", ["tomography", "mls"])
+def test_installer_keeps_configured_pct_terrain_source(tmp_path, source):
+    from scripts.module_installer.runtime import write_runtime
+
+    prefix = tmp_path / "generation"
+    write_runtime(root=ROOT, prefix=prefix, modules=["core", "geometry", "navigation"],
+                  robot="customrobot", existing={_TERRAIN_SOURCE: source})
+    assert read_env_values(prefix / "settings.env")[_TERRAIN_SOURCE] == source

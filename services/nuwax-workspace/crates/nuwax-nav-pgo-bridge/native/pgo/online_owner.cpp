@@ -1315,6 +1315,7 @@ struct ProcessedRequest {
     std::string reason;
     std::optional<GraphState> proposed_state;
     bool consumes_request_sequence{true};
+    bool accepted_keyframe{false};
 };
 
 ProcessedRequest cancelledRequest(const Request& request) {
@@ -1409,6 +1410,7 @@ ProcessedRequest processRequest(const GraphState& state, int64_t last_request_se
     if (!loop_target) {
         ProcessedRequest completed{noCandidateResult(request), TerminalKind::Succeeded,
                                    Status::REASON_NONE, "no loop candidate"};
+        completed.accepted_keyframe = true;
         completed.proposed_state = std::move(trial);
         return completed;
     }
@@ -1432,6 +1434,7 @@ ProcessedRequest processRequest(const GraphState& state, int64_t last_request_se
     if (registration.disposition == IcpDisposition::NoCandidate) {
         ProcessedRequest completed{noCandidateResult(request), TerminalKind::Succeeded,
                                    Status::REASON_NONE, "ICP did not prove a loop"};
+        completed.accepted_keyframe = true;
         completed.proposed_state = std::move(trial);
         return completed;
     }
@@ -1474,6 +1477,7 @@ ProcessedRequest processRequest(const GraphState& state, int64_t last_request_se
         trial.last_loop_timestamp_ns = request.source_timestamp_ns;
         ProcessedRequest completed{noCandidateResult(request), TerminalKind::Succeeded,
                                    Status::REASON_NONE, "zero residual loop"};
+        completed.accepted_keyframe = true;
         completed.proposed_state = std::move(trial);
         return completed;
     }
@@ -1509,6 +1513,7 @@ ProcessedRequest processRequest(const GraphState& state, int64_t last_request_se
     trial.last_loop_timestamp_ns = request.source_timestamp_ns;
     ProcessedRequest completed{*result, TerminalKind::Succeeded, Status::REASON_NONE,
                                "correction"};
+    completed.accepted_keyframe = true;
     completed.proposed_state = std::move(trial);
     return completed;
 }
@@ -1991,10 +1996,12 @@ private:
                                             ? cancelledRequest(*work.request)
                                             : shutdownInterruptedRequest(*work.request);
                         }
+                        bool graph_committed = false;
                         if (!cancelled && !stop_requested_ &&
                             entry.phase == RequestPhase::Running &&
                             processed.proposed_state) {
                             graph_state_ = std::move(*processed.proposed_state);
+                            graph_committed = true;
                         }
                         if (processed.consumes_request_sequence &&
                             work.request->request_sequence > last_request_sequence_) {
@@ -2013,7 +2020,10 @@ private:
                             }
                         } else {
                             int32_t terminal_state = Status::TERMINAL_SUCCEEDED;
-                            int32_t reason_code = Status::REASON_NONE;
+                            int32_t reason_code = Status::REASON_NO_KEYFRAME;
+                            if (processed.accepted_keyframe && graph_committed) {
+                                reason_code = Status::REASON_KEYFRAME_ACCEPTED;
+                            }
                             std::string reason;
                             if (processed.terminal_kind == TerminalKind::Rejected) {
                                 terminal_state = Status::TERMINAL_REJECTED;

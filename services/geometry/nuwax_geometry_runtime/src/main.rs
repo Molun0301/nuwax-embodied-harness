@@ -53,6 +53,7 @@ mod occupancy_shm;
 mod owner_profile;
 mod persistent_occupancy;
 mod pgo_map;
+mod pgo_keyframe_poses;
 mod pointcloud;
 mod dynamic_scene;
 mod dynamic_backend;

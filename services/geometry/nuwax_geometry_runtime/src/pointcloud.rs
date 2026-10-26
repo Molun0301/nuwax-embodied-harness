@@ -626,6 +626,17 @@ impl CloudMapShmWriter {
         Ok(mapped)
     }
 
+    pub(crate) fn pgo_replay_source(&self) -> Option<nuwax_cloud_cleanup::scan_log::ReplaySource> {
+        self.dynamic_filter.replay_source()
+    }
+    pub(crate) fn pgo_terminal_dufo(&self) -> crate::dynamic_backend::OnlineDufo {
+        self.dynamic_filter.terminal_dufo()
+    }
+    pub(crate) fn pgo_free_revision(&self) -> u64 { self.dynamic_filter.free_revision() }
+    pub(crate) fn pgo_terminal_dufo_since(&self, revision: u64) -> (crate::dynamic_backend::OnlineDufo, Option<Vec<nuwax_dufomap_native::FreeCell>>) {
+        self.dynamic_filter.terminal_dufo_since(revision)
+    }
+
     fn accumulate_mapping_scan_inner(&mut self, session_generation: u64,
         points: &[Point3<f64>], sensor_origin_map: Option<[f64;3]>, source_timestamp_ns: u64,
         source: Option<fine_cloud::FrameSource<'_>>) -> bool {
@@ -1090,7 +1101,7 @@ impl CloudMapShmWriter {
     /// Source carried by the most recent successful nonempty fine accumulation.
     /// Empty/rejected inputs do not replace it. This is neither the newest input
     /// nor evidence attached to the current published root, and is not ground.
-    /// Older payloads remain solely in existing ScanHistory where available.
+    /// legacy历史由ScanHistory保留；dufomap旧帧从完整日志前缀读取。
     pub(crate) fn latest_unclassified_fine_scan(&self) -> Option<crate::lio_ingress::AdmittedRegisteredScan> {
         self.fine_cloud.as_ref()?.latest_unclassified_scan().cloned()
     }
@@ -1099,8 +1110,8 @@ impl CloudMapShmWriter {
         self.fine_cloud.as_ref()?.latest_ground_indices(source)
     }
 
-    /// The private PGO rebuild carries the original admitted scan plus its
-    /// corrected rigid pose. Reprojection replaces its geometry, not its identity.
+    /// 私有PGO保留真实实时末帧或日志帧来源，并分别施加校正位姿；
+    /// 磁盘重放不重造实时准入身份。
 
 
     pub(crate) fn committed_fine_cloud(&self) -> Option<Arc<nuwax_map_chunks::SealedMap>> {

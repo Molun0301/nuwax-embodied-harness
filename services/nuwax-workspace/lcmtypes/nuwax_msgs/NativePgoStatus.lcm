@@ -47,6 +47,9 @@ struct NativePgoStatus {
     const int32_t REASON_CANCEL_TOO_LATE = 12;
     const int32_t REASON_CHILD_EXITED = 13;
     const int32_t REASON_CHILD_CRASHED = 14;
+    // 成功终态中的精确关键帧接纳回执，沿用现有字段布局。
+    const int32_t REASON_KEYFRAME_ACCEPTED = 15;
+    const int32_t REASON_NO_KEYFRAME = 16;
 
     int32_t schema_version;
     int32_t backend;

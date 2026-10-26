@@ -20,6 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+// legacy保留原点数上限；dufomap只持末帧并从日志流式读取。
 const MAX_ARCHIVED_POINTS: usize = 8_000_000;
 pub(crate) const REBUILD_BUDGET: Duration = Duration::from_secs(3);
 // 后台准备按小段让出计算资源；累计历史耗时不再成为丢弃回环的条件。
@@ -27,6 +28,10 @@ pub(crate) const REPLAY_SLICE: Duration = Duration::from_millis(8);
 pub(crate) const REPLAY_YIELD: Duration = Duration::from_millis(2);
 // 时间片仍是首要边界，轻帧不再因16帧上限反复休眠；每帧继续检查取消。
 const REPLAY_SLICE_MAX_FRAMES: usize = 128;
+
+#[path = "pgo_disk_replay.rs"]
+mod disk_replay;
+pub(crate) use disk_replay::{rebuild_disk, DiskReplayInput};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum RebuildError {
@@ -70,6 +75,7 @@ impl ArchivedSource {
             Self::Lidar(_) => ArchiveSourceKey::Lidar,
             Self::Auxiliary(source) => { let (sensor, clock, sequence) = source.key();
                 ArchiveSourceKey::Auxiliary(sensor, clock, sequence) }
+            Self::Logged(_) => ArchiveSourceKey::Lidar,
         }
     }
 }
@@ -84,6 +90,11 @@ type ArchiveKey = (u64, ArchiveSourceKey);
 
 impl ArchivedScan {
     fn key(&self) -> ArchiveKey { (self.source_timestamp_ns, self.source.key()) }
+
+    #[cfg(test)]
+    pub(crate) fn retain_keyframe_for_test(&self) -> Result<(), String> {
+        self.source.lidar().ok_or("测试关键帧必须来自真实接纳LiDAR扫描")?.retain_pgo_keyframe()
+    }
 }
 
 #[derive(Default)]
@@ -94,6 +105,16 @@ pub(crate) struct ScanHistory {
     dynamic_scene: crate::dynamic_scene::DynamicScene,
     dufo: crate::dynamic_backend::OnlineDufo,
     latest_static_scan: Option<(u64, usize, crate::lio_ingress::WeakAdmittedRegisteredScan, Arc<[u32]>)>,
+    stream: Option<StreamHistory>,
+}
+
+#[derive(Default)]
+struct StreamHistory {
+    latest: Option<ArchivedScan>,
+    first_receipt: Option<(u64, u64)>,
+    source: Option<nuwax_cloud_cleanup::scan_log::ReplaySource>,
+    keyframes: crate::pgo_keyframe_poses::KeyframePoseStore,
+    unsupported_auxiliary: bool,
 }
 
 impl ScanHistory {
@@ -104,6 +125,39 @@ impl ScanHistory {
         self.dynamic_scene = Default::default();
         self.dufo = Default::default();
         self.latest_static_scan = None;
+        if self.stream.is_some() { self.stream = Some(StreamHistory::default()); }
+    }
+
+    pub(crate) fn enable_streaming(&mut self) { self.stream = Some(StreamHistory::default()); }
+
+    pub(crate) fn bind_replay_source(&mut self, source: Option<nuwax_cloud_cleanup::scan_log::ReplaySource>) {
+        if let Some(stream) = &mut self.stream { stream.source = source; }
+    }
+
+    pub(crate) fn disk_input(&self, trajectory: &[OptimizedKeyframe]) -> Result<Option<DiskReplayInput>, RebuildError> {
+        let Some(stream) = &self.stream else { return Ok(None); };
+        if stream.unsupported_auxiliary { return Err(RebuildError::HistoryUnavailable); }
+        let latest = stream.latest.clone().ok_or(RebuildError::HistoryUnavailable)?;
+        let source = stream.source.clone().ok_or(RebuildError::HistoryUnavailable)?;
+        let binding = latest.source.lidar().expect("流式尾部来自实际接纳LiDAR").binding();
+        if source.session().session_id != binding.mapping_session_id
+            || source.session().generation != binding.mapping_session_generation {
+            return Err(RebuildError::HistoryUnavailable);
+        }
+        let locals = stream.keyframes.snapshot_for(trajectory).map_err(|error| {
+            tracing::warn!(event = "pgo.keyframe_history.incomplete", %error, "PGO缺少精确关键帧依据，保留当前地图");
+            RebuildError::HistoryUnavailable
+        })?;
+        let first_receipt = stream.first_receipt.ok_or(RebuildError::HistoryUnavailable)?;
+        Ok(Some(DiskReplayInput { source, latest, locals, first_receipt }))
+    }
+
+    pub(crate) fn disk_tail(&self) -> Result<Option<ArchivedScan>, RebuildError> {
+        match &self.stream {
+            Some(stream) if stream.unsupported_auxiliary || stream.source.is_none() => Err(RebuildError::HistoryUnavailable),
+            Some(stream) => stream.latest.clone().map(Some).ok_or(RebuildError::HistoryUnavailable),
+            None => Ok(None),
+        }
     }
 
     pub fn record(
@@ -113,6 +167,7 @@ impl ScanHistory {
     ) -> Result<(), String> {
         let source_timestamp_ns = source.source_timestamp_ns();
         let binding = source.binding();
+        if let Some(stream) = &self.stream { source.bind_pgo_keyframes(stream.keyframes.clone())?; }
         if let Some(existing) = self.scans.get(&(source_timestamp_ns, ArchiveSourceKey::Lidar)) {
             return if existing.source.lidar() == Some(source) { Ok(()) }
                 else { Err("PGO历史扫描来源冲突".into()) };
@@ -147,16 +202,27 @@ impl ScanHistory {
                 (!self.dynamic_scene.is_dynamic([p.x,p.y,p.z])).then_some(i as u32)}).collect()
         };
         self.latest_static_scan = Some((source_timestamp_ns, body_points.len(), source.downgrade(), static_indices.into()));
-        self.archive(ArchivedScan {
+        let scan = ArchivedScan {
             source_timestamp_ns, received_at_ns, odom_from_body: binding.frozen_odom_from_body,
             sensor_origin_body: sensor_origin,
             body_points: body_points.clone(), source: ArchivedSource::Lidar(source.clone()),
-        })
+        };
+        if let Some(stream) = &mut self.stream {
+            // 常驻历史仅持最后一帧；未写盘的选中扫描仍由原有界队列拥有。
+            stream.first_receipt.get_or_insert((source_timestamp_ns, received_at_ns));
+            stream.latest = Some(scan);
+            Ok(())
+        } else { self.archive(scan) }
     }
 
     pub(crate) fn record_auxiliary(&mut self,
         source: crate::lcm_runtime::mapping_observation::RegisteredObservation,
     ) -> Result<(), String> {
+        if let Some(stream) = &mut self.stream {
+            // 辅助来源没有进入LiDAR日志，不能用不完整输入替换整图。
+            stream.unsupported_auxiliary = true;
+            return Ok(());
+        }
         self.archive(ArchivedScan {
             source_timestamp_ns: source.timestamp_ns(), received_at_ns: source.received_at_ns(),
             odom_from_body: source.odom_from_body(), sensor_origin_body: Some(source.origin_body()),
@@ -196,10 +262,15 @@ impl ScanHistory {
     }
 
     pub fn latest_timestamp_ns(&self) -> Option<u64> {
+        if let Some(stream) = &self.stream { return stream.latest.as_ref().map(|scan| scan.source_timestamp_ns); }
         self.scans.last_key_value().map(|((stamp, _), _)| *stamp)
     }
 
     pub fn snapshot_after(&self, after: u64) -> Result<Vec<ArchivedScan>, RebuildError> {
+        if let Some(stream) = &self.stream {
+            if stream.unsupported_auxiliary { return Err(RebuildError::HistoryUnavailable); }
+            return Ok(stream.latest.iter().filter(|scan| scan.source_timestamp_ns > after).cloned().collect());
+        }
         if self.incomplete {
             return Err(RebuildError::HistoryUnavailable);
         }
@@ -224,6 +295,7 @@ impl ScanHistory {
 pub(crate) struct RebuiltMap {
     pub persistent: PersistentOccupancyGrid,
     pub final_poses:Vec<(u64,[f64;16])>,
+    pub final_pose_spool: Option<nuwax_cloud_cleanup::scan_log::PoseSpool>,
     pub cloud: CommittedCloudMapSnapshot,
     pub backend_checkpoint: Vec<u8>,
     pub accumulator: crate::pointcloud::PreparedCloudAccumulator,
@@ -239,9 +311,11 @@ pub(crate) fn optimized_pose(frame: &OptimizedKeyframe) -> Isometry3<f64> {
     )
 }
 
-/// 私有重放拥有方保留内核和动态反证；追赶只追加新扫描，不反复重算历史前缀。
+/// 私有重放保留内核与动态依据；无关变化继续追赶，相关终态变化由拥有方重新筛选。
 pub(crate) struct ReplayBuilder {
     dufo: crate::dynamic_backend::OnlineDufo,
+    terminal_dufo: Option<crate::dynamic_backend::OnlineDufo>,
+    processed_evidence: Option<crate::dynamic_backend::free_evidence::ProcessedEvidence>,
     kernel: mapping_backend::MappingKernel,
     spec: MappingBackendSpec,
     persistent: Option<PersistentOccupancyGrid>,
@@ -256,6 +330,7 @@ pub(crate) struct ReplayBuilder {
     last_archive_key: Option<ArchiveKey>,
     processed: usize,
     final_poses:Vec<(u64,[f64;16])>,
+    pose_spool: Option<nuwax_cloud_cleanup::scan_log::PoseSpool>,
     started: Instant,
     budget: Duration,
     background: bool,
@@ -319,9 +394,18 @@ impl ReplayBuilder {
             return Err("PGO优化改变了固定首节点".into());
         }
         let timeline = CorrectionTimeline::new(keyframes).map_err(|e| e.to_string())?;
+        Self::with_timeline(timeline, first, anchor, spec, config, frame_id, budget, started)
+    }
+
+    fn with_timeline(
+        timeline: CorrectionTimeline, first: i64, anchor: Isometry3<f64>, spec: MappingBackendSpec,
+        config: MappingBackendComputeConfig, frame_id: String, budget: Duration, started: Instant,
+    ) -> Result<Self, RebuildError> {
         let cloud = CloudMapShmWriter::new_private().map_err(|e| e.to_string())?;
         Ok(Self {
             dufo: Default::default(),
+            terminal_dufo: None,
+            processed_evidence: None,
             kernel: spec.into_kernel(config.window_capacity),
             spec,
             persistent: None,
@@ -336,6 +420,7 @@ impl ReplayBuilder {
             last_archive_key: None,
             processed: 0,
             final_poses:Vec::new(),
+            pose_spool: None,
             started,
             budget,
             background: false,
@@ -366,6 +451,19 @@ impl ReplayBuilder {
         self.background_parallel_available =
             std::thread::available_parallelism().is_ok_and(|count| count.get() >= 4);
         self
+    }
+
+    /// 与已保留点确定无关的新空单元只更新终态；相关或变化缺口交回新树以重放。
+    pub(crate) fn update_terminal(
+        &mut self, tree: crate::dynamic_backend::OnlineDufo,
+        changes: Option<&[nuwax_dufomap_native::FreeCell]>,
+    ) -> Result<(), crate::dynamic_backend::OnlineDufo> {
+        if changes.is_none_or(|cells| self.processed_evidence.as_ref().is_none_or(|seen| seen.may_intersect(cells))) {
+            Err(tree)
+        } else {
+            self.terminal_dufo = Some(tree);
+            Ok(())
+        }
     }
 
     /// 每个切片至少推进一帧；单次内核调用不可抢占，片间由异步拥有方让出资源。
@@ -441,7 +539,18 @@ impl ReplayBuilder {
                 .collect();
             let origin = map_from_body * scan.sensor_origin_body.ok_or("PGO原始扫描缺少实测雷达原点，保留当前地图，不补造射线")?;
             let dynamic_frame = if crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::DufoMap {
-                Some(self.dufo.observe(&points, origin.coords.into(), scan.source_timestamp_ns, Isometry3::identity())?.0)
+                Some(if let Some(terminal) = &self.terminal_dufo {
+                    let evidence: Vec<_> = scan.body_points.iter().map(|point| scan.odom_from_body * point).collect();
+                    let frame = terminal.terminal_frame(&evidence, &points)?;
+                    if let Some(seen) = &mut self.processed_evidence {
+                        for (original, corrected) in evidence.iter().zip(&points) {
+                            if !frame.is_dynamic([corrected.x, corrected.y, corrected.z]) {
+                                seen.insert_point(*original);
+                            }
+                        }
+                    }
+                    frame
+                } else { self.dufo.observe(&points, origin.coords.into(), scan.source_timestamp_ns, Isometry3::identity())?.0 })
             } else {
                 scan.source.lidar().and_then(|scan| scan.dynamic_frame())
                     .map(|frame| crate::dynamic_backend::MappedFrame::new(frame,
@@ -487,7 +596,13 @@ impl ReplayBuilder {
                 append_cloud_stage(self.cloud.as_mut().expect("本地点云已保留"), &input, capture_source)?;
                 self.cloud_time += phase.elapsed();
             }
-            self.final_poses.push((scan.source_timestamp_ns,map_from_body.to_homogeneous().as_slice().try_into().unwrap()));
+            let pose = map_from_body.to_homogeneous().as_slice().try_into().unwrap();
+            if let Some(spool) = &mut self.pose_spool {
+                spool.append(scan.source_timestamp_ns, pose).map_err(|error| {
+                    tracing::warn!(event = "pgo.pose_spool.unavailable", %error, "最终位姿暂存不可用，保留当前地图");
+                    RebuildError::HistoryUnavailable
+                })?;
+            } else { self.final_poses.push((scan.source_timestamp_ns, pose)); }
             self.processed += 1;
             self.last_input = Some(input);
             self.last_archive_key = Some(scan.key());
@@ -636,6 +751,7 @@ impl ReplayBuilder {
         }
         let result = RebuiltMap {
             final_poses:std::mem::take(&mut self.final_poses),
+            final_pose_spool: self.pose_spool.take(),
             persistent: prepared.persistent,
             cloud: prepared.cloud,
             backend_checkpoint: prepared.backend_checkpoint,
@@ -879,6 +995,11 @@ pub(crate) fn rebuild(
 mod tests {
     use super::*;
     use crate::lio_ingress::RegistrationBinding;
+
+    mod disk_tests {
+        include!("pgo_disk_replay_tests.rs");
+    }
+
 
     #[test]
     fn planar_scan_replay_observes_each_frame_and_materialization_does_not_vote_again() {

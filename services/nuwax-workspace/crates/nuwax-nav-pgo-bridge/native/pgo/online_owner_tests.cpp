@@ -497,6 +497,55 @@ void verifyConcreteCorrectionConflicts() {
 #undef INVALID_CORRECTION
 }
 
+void verifyActualKeyframeAcceptanceReceiptsAndBound() {
+    OnlinePgoOptions options;
+    GraphState state(options.graph);
+    auto cancelled = std::make_shared<std::atomic<bool>>(false);
+    auto request = fixtureRequest();
+    auto first = processRequest(state, 0, request, options, cancelled);
+    require(first.terminal_kind == TerminalKind::Succeeded && first.accepted_keyframe &&
+                first.result.result_disposition == Result::DISPOSITION_NO_CANDIDATE && first.proposed_state,
+            "actual first keyframe has no accepted receipt");
+    state = std::move(*first.proposed_state);
+    request.request_sequence = 2;
+    request.mapping_commit_sequence = 2;
+    request.occupancy_revision = 2;
+    request.cloud_revision = 2;
+    request.registered_cloud_source_sequence = 2;
+    request.source_timestamp_ns = 1'000'000'000;
+    request.registered_cloud_source_timestamp_ns = request.source_timestamp_ns;
+    request.committed_map_source_timestamp_ns = request.source_timestamp_ns;
+    request.frozen_odom_translation_m[0] = 0.1;
+    auto stationary = processRequest(state, 1, request, options, cancelled);
+    require(stationary.terminal_kind == TerminalKind::Succeeded && !stationary.accepted_keyframe &&
+                stationary.proposed_state->graph.keyPosesSe3().size() == 1,
+            "below-threshold request incorrectly accepted a keyframe");
+    request.frozen_odom_translation_m[0] = 1.0;
+    request.registered_body_point_count = 1;
+    request.registered_body_coordinate_count = 3;
+    request.registered_body_points_xyz = {0.0, 0.0, 1.0};
+    auto rejected = processRequest(state, 1, request, options, cancelled);
+    require(rejected.terminal_kind == TerminalKind::Rejected && !rejected.accepted_keyframe && !rejected.proposed_state,
+            "rejected trial retained its keyframe");
+    cancelled->store(true);
+    auto interrupted = processRequest(state, 1, request, options, cancelled);
+    require(interrupted.terminal_kind == TerminalKind::Cancelled && !interrupted.accepted_keyframe && !interrupted.proposed_state,
+            "cancelled trial retained its keyframe");
+    cancelled->store(false);
+    GraphState full(options.graph);
+    require(!advanceSessionBoundary(full, fixtureRequest(), options.graph), "could not initialize full graph session");
+    for (int64_t index = 0; index < Result::MAX_GRAPH_NODES; ++index) {
+        PoseWithTimeSe3 pose;
+        pose.setTime(static_cast<int32_t>(index), 0);
+        pose.pose.t.x = static_cast<double>(index);
+        require(full.graph.addKeyPoseSe3(pose), "could not fill frozen graph node bound");
+    }
+    auto limited = processRequest(full, 1, request, options, cancelled);
+    require(limited.terminal_kind == TerminalKind::Rejected && !limited.accepted_keyframe && !limited.proposed_state &&
+                limited.result.rejection_reason_code == Result::REJECTION_RESOURCE_LIMIT,
+            "existing 2000-node graph limit did not reject additional metadata");
+}
+
 }  // namespace
 
 int main() {
@@ -510,6 +559,7 @@ int main() {
         verifyCancelReceiptConflict();
         verifyCancellationOrdering();
         verifyConcreteCorrectionConflicts();
+        verifyActualKeyframeAcceptanceReceiptsAndBound();
     } catch (const std::exception& error) {
         std::cerr << "online owner contract fixture failed: " << error.what() << '\n';
         return 1;

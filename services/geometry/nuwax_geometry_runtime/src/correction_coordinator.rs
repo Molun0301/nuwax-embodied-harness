@@ -1666,6 +1666,7 @@ mod preflight_only_contract {
             ) {
                 self.keyframe_source_timestamps_ns
                     .push(input.registered_cloud().source_timestamp_ns);
+                input.source_owner.retain_pgo_keyframe().map_err(CorrectionOwnerError::Pipeline)?;
                 tracing::info!(
                     event = "pgo.keyframe",
                     source_timestamp_ns = input.registered_cloud().source_timestamp_ns,
@@ -4649,11 +4650,18 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
                 &self.body_frame_id,
                 &input,
             )?;
-            let submit = self.ingress.submit(request);
+            let submit_started = AtomicBool::new(false);
+            let submit = async {
+                submit_started.store(true, Ordering::Relaxed);
+                self.ingress.submit(request).await
+            };
             tokio::pin!(submit);
             let validated = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => {
+                    if !submit_started.load(Ordering::Relaxed) {
+                        return Ok(CandidateProduction::Cancelled);
+                    }
                     let owner = self.owner.as_mut().ok_or_else(|| {
                         CorrectionRuntimeError::NativePgo(
                             "native PGO retained owner is unavailable".to_owned(),
@@ -4663,11 +4671,19 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
                         .cancel_in_flight()
                         .await
                         .map_err(|error| CorrectionRuntimeError::NativePgo(error.to_string()))?;
+                    // 取消太晚时原生图已经提交，仍须消费精确终态并保留其原始位姿。
+                    let completed = submit.await.map_err(|error| CorrectionRuntimeError::NativePgo(error.to_string()))?;
+                    if completed.accepted_keyframe() == Some(true) {
+                        input.source_owner.retain_pgo_keyframe().map_err(CorrectionRuntimeError::Apply)?;
+                    }
                     return Ok(CandidateProduction::Cancelled);
                 }
                 result = &mut submit => result
                     .map_err(|error| CorrectionRuntimeError::NativePgo(error.to_string()))?,
             };
+            if validated.accepted_keyframe() == Some(true) {
+                input.source_owner.retain_pgo_keyframe().map_err(CorrectionRuntimeError::Apply)?;
+            }
             match validated.disposition() {
                 ValidatedOnlinePgoDisposition::NoCandidate => Ok(CandidateProduction::NoCandidate),
                 ValidatedOnlinePgoDisposition::Rejected => {
@@ -15877,6 +15893,27 @@ assert candidate.occupancy_revision != candidate.cloud_revision
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn cancelled_native_request_does_not_retain_keyframe_and_owner_stays_usable() {
+            let _release_env = native_correction_test_guard().await;
+            let store = crate::pgo_keyframe_poses::KeyframePoseStore::new();
+            let mut owner = CorrectionCandidateOwner::start(CorrectionOwnerSpec::NativePgo {
+                map_frame_id: "robot_map".into(), odom_frame_id: "robot_odom".into(),
+                body_frame_id: "robot_body".into(), executable: nuwax_nav_pgo_bridge::native_executable(),
+            }, owner_identity(), &crate::lcm_runtime::test_lcm_url()).await.unwrap();
+            let cancelled = CorrectionRequestCancellation::new();
+            cancelled.cancel();
+            let input = frame(1, 1_000_000_000, 0.0);
+            input.source_owner.bind_pgo_keyframes(store.clone()).unwrap();
+            assert!(matches!(owner.submit_frame(input, &cancelled).await.unwrap(), CandidateProduction::Cancelled));
+            assert_eq!(store.len(), 0);
+            let input = frame(2, 2_000_000_000, 1.0);
+            input.source_owner.bind_pgo_keyframes(store.clone()).unwrap();
+            assert!(matches!(owner.submit_frame(input, &CorrectionRequestCancellation::new()).await.unwrap(), CandidateProduction::NoCandidate));
+            assert_eq!(store.len(), 1);
+            owner.shutdown().await.unwrap();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn actual_native_owner_returns_typed_dispositions_and_direct_finalizes_candidate() {
             let _release_env = native_correction_test_guard().await;
             let provider = crate::lcm_runtime::test_lcm_url();
@@ -15901,10 +15938,13 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let source = crate::lio_ingress::CommonLioIngress::new(
                 crate::lio_ingress::DeviceLioIngressSpec::new(31,"robot_sensor","robot_body","robot_odom","robot_map").unwrap());
             source.bind_relocalization_mode_fence(ingress.relocalization_mode_fence()).unwrap();
+            let keyframe_poses = crate::pgo_keyframe_poses::KeyframePoseStore::new();
             let frame=|sequence,timestamp_ns,x| {
                 let pose=Isometry3::translation(x,0.0,0.0);
                 let points=asymmetric_cloud().iter().map(|point|pose*Point3::from(point.coords*3.0)).collect();
-                frame_from_admitted_source(sequence,admit_frame_source_with_ingress(sequence,timestamp_ns,timestamp_ns,pose,points,&adapter,&source))
+                let input = frame_from_admitted_source(sequence,admit_frame_source_with_ingress(sequence,timestamp_ns,timestamp_ns,pose,points,&adapter,&source));
+                input.source_owner.bind_pgo_keyframes(keyframe_poses.clone()).unwrap();
+                input
             };
 
 
@@ -15913,6 +15953,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 asymmetric_cloud().into_iter().take(3).collect(), &adapter,
                 &source,
             ));
+            rejected.source_owner.bind_pgo_keyframes(keyframe_poses.clone()).unwrap();
             match ingress.submit(rejected).await.unwrap() {
                 CorrectionSubmitDisposition::Rejected {
                     reason_code,
@@ -15926,17 +15967,25 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 }
                 disposition => panic!("expected typed native rejection, got {disposition:?}"),
             }
+            assert_eq!(keyframe_poses.len(), 0);
 
             assert_eq!(
                 ingress.submit(frame(2, 2_000_000_000, 0.0)).await.unwrap(),
                 CorrectionSubmitDisposition::NoCandidate
             );
+            assert_eq!(keyframe_poses.len(), 1);
             assert_eq!(
-                ingress.submit(frame(3, 63_000_000_000, 2.0)).await.unwrap(),
+                ingress.submit(frame(3, 2_500_000_000, 0.1)).await.unwrap(),
                 CorrectionSubmitDisposition::NoCandidate
             );
+            assert_eq!(keyframe_poses.len(), 1);
+            assert_eq!(
+                ingress.submit(frame(4, 63_000_000_000, 2.0)).await.unwrap(),
+                CorrectionSubmitDisposition::NoCandidate
+            );
+            assert_eq!(keyframe_poses.len(), 2);
             let processed = ingress
-                .submit(frame(4, 124_000_000_000, 0.2))
+                .submit(frame(5, 124_000_000_000, 0.2))
                 .await
                 .expect("native correction request");
             let (candidate_sequence, processed_candidate) = match processed {
@@ -15947,7 +15996,10 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 } => (candidate_sequence, candidate),
                 disposition => panic!("expected applied native candidate, got {disposition:?}"),
             };
-            assert_eq!(candidate_sequence, 4);
+            assert_eq!(candidate_sequence, 5);
+            assert_eq!(keyframe_poses.len(), 3);
+            let local = keyframe_poses.snapshot_for(&processed_candidate.trajectory).unwrap();
+            assert_eq!(local.iter().map(|pose| pose.translation.vector.x).collect::<Vec<_>>(), vec![0.0, 2.0, 0.2]);
             assert_eq!(CandidateApplyKey::from(&processed_candidate).candidate_sequence, candidate_sequence);
             {
                 let applied = sink.applied.lock();
@@ -15959,7 +16011,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 assert_eq!(applied[0].identity.candidate_sequence, candidate_sequence);
                 assert_eq!(applied[0], processed_candidate);
             }
-            assert_eq!(*sink.discarded.lock(), vec![1, 2, 3]);
+            assert_eq!(*sink.discarded.lock(), vec![1, 2, 3, 4]);
             assert!(sink.staged.lock().is_empty());
 
             owner.shutdown().await.expect("native owner clean shutdown");
@@ -17683,6 +17735,38 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 .into_sticky_error()
                 .expect("retained terminal cause must survive shutdown")
                 .contains("injected correction staging failure"));
+        }
+
+        #[test]
+        fn library_retains_only_actually_accepted_keyframe_poses() {
+            let store = crate::pgo_keyframe_poses::KeyframePoseStore::new();
+            let mut library = CorrectionOwnerHandle::start(transport_library_spec(), owner_identity()).unwrap();
+            for (sequence, stamp, x, count) in [(1, 0, 0.0, 1), (2, 100_000_000, 0.01, 1), (3, 1_000_000_000, 2.0, 2)] {
+                let input = frame(sequence, stamp, x);
+                input.source_owner.bind_pgo_keyframes(store.clone()).unwrap();
+                assert!(library.submit_frame(input).unwrap().is_none());
+                assert_eq!(store.len(), count);
+            }
+            let mut rejected = frame(4, 2_000_000_000, 3.0);
+            rejected.source_owner.bind_pgo_keyframes(store.clone()).unwrap();
+            rejected.static_point_indices = Some(vec![u32::MAX].into());
+            assert!(library.submit_frame(rejected).is_err());
+            assert_eq!(store.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn cancelled_library_request_does_not_retain_keyframe_pose() {
+            let store = crate::pgo_keyframe_poses::KeyframePoseStore::new();
+            let input = frame(1, 0, 0.0);
+            input.source_owner.bind_pgo_keyframes(store.clone()).unwrap();
+            let cancellation = CorrectionRequestCancellation::new();
+            cancellation.cancel();
+            let mut owner = CorrectionCandidateOwner::Local(Some(
+                CorrectionOwnerHandle::start(transport_library_spec(), owner_identity()).unwrap(),
+            ));
+            assert!(matches!(owner.submit_frame(input, &cancellation).await.unwrap(), CandidateProduction::Cancelled));
+            assert_eq!(store.len(), 0);
+            owner.shutdown().await.unwrap();
         }
 
         #[test]

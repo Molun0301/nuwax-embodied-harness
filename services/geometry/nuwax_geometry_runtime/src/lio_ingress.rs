@@ -280,6 +280,7 @@ struct AdmittedRegisteredScanData {
     labels: OnceLock<Arc<crate::dynamic_scene::FrameDecision>>,
     static_indices: OnceLock<Arc<[u32]>>,
     online_frame: OnceLock<std::sync::Weak<crate::dynamic_backend::MappedFrame>>,
+    pgo_keyframes: OnceLock<crate::pgo_keyframe_poses::KeyframePoseStore>,
 }
 
 impl AdmittedRegisteredScan {
@@ -288,8 +289,28 @@ impl AdmittedRegisteredScan {
         let body_from_map = (binding.registration_map_from_odom * binding.frozen_odom_from_body).inverse();
         let body_points = map_points.iter().map(|point| body_from_map.transform_point(point)).collect::<Vec<_>>();
         Self(Arc::new(AdmittedRegisteredScanData {
-            source, frames, source_point_count, binding, body_points: body_points.into(), labels: OnceLock::new(), static_indices: OnceLock::new(), online_frame: OnceLock::new(),
+            source, frames, source_point_count, binding, body_points: body_points.into(), labels: OnceLock::new(), static_indices: OnceLock::new(), online_frame: OnceLock::new(), pgo_keyframes: OnceLock::new(),
         }))
+    }
+
+    pub(crate) fn bind_pgo_keyframes(&self, store: crate::pgo_keyframe_poses::KeyframePoseStore) -> Result<(), String> {
+        if let Some(bound) = self.0.pgo_keyframes.get() {
+            return if bound.same_store(&store) { Ok(()) } else { Err("原扫描已绑定其它PGO会话位姿表".into()) };
+        }
+        self.0.pgo_keyframes.set(store).or_else(|store| {
+            if self.0.pgo_keyframes.get().is_some_and(|bound| bound.same_store(&store)) {
+                Ok(())
+            } else {
+                Err("原扫描PGO位姿表绑定发生冲突".into())
+            }
+        })
+    }
+
+    pub(crate) fn retain_pgo_keyframe(&self) -> Result<(), String> {
+        if let Some(store) = self.0.pgo_keyframes.get() {
+            store.retain(self.source_timestamp_ns(), self.0.binding.frozen_odom_from_body)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn record_static_indices(&self, indices: Vec<u32>, frame: &Arc<crate::dynamic_backend::MappedFrame>) -> Result<(), String> {
@@ -402,7 +423,7 @@ mod registered_scan_ownership_tests {
 
     fn owner(points: Vec<Point3<f64>>) -> AdmittedRegisteredScan {
         AdmittedRegisteredScan(Arc::new(AdmittedRegisteredScanData {
-            labels: OnceLock::new(), static_indices: OnceLock::new(), online_frame: OnceLock::new(),
+            labels: OnceLock::new(), static_indices: OnceLock::new(), online_frame: OnceLock::new(), pgo_keyframes: OnceLock::new(),
             source: SourceIdentity { backend: LIO_BACKEND_DEVICE, runtime_generation: 7,
                 source_sequence: 3, source_timestamp_ns: 10 },
             frames: ["sensor".into(), "body".into(), "odom".into(), "map".into()],
@@ -412,12 +433,31 @@ mod registered_scan_ownership_tests {
 
     fn edited(source: &AdmittedRegisteredScan, edit: impl FnOnce(&mut AdmittedRegisteredScanData)) -> AdmittedRegisteredScan {
         let mut data = AdmittedRegisteredScanData {
-            labels: OnceLock::new(), static_indices: OnceLock::new(), online_frame: OnceLock::new(),
+            labels: OnceLock::new(), static_indices: OnceLock::new(), online_frame: OnceLock::new(), pgo_keyframes: OnceLock::new(),
             source: source.0.source, frames: source.0.frames.clone(), source_point_count: source.0.source_point_count,
             binding: source.0.binding.clone(), body_points: source.0.body_points.clone(),
         };
         edit(&mut data);
         AdmittedRegisteredScan(Arc::new(data))
+    }
+
+    #[test]
+    fn pgo_keyframe_binding_is_session_scoped_and_does_not_retain_scan_payload() {
+        let old = crate::pgo_keyframe_poses::KeyframePoseStore::new();
+        let new = crate::pgo_keyframe_poses::KeyframePoseStore::new();
+        let source = owner(vec![Point3::origin(); 20]);
+        let alive = source.retention_probe_for_test();
+        source.retain_pgo_keyframe().unwrap();
+        assert_eq!(old.len(), 0);
+        source.bind_pgo_keyframes(old.clone()).unwrap();
+        source.bind_pgo_keyframes(old.clone()).unwrap();
+        assert!(source.bind_pgo_keyframes(new.clone()).is_err());
+        source.retain_pgo_keyframe().unwrap();
+        assert_eq!(old.len(), 1);
+        assert_eq!(new.len(), 0);
+        drop(source);
+        assert!(!alive(), "位姿表不得延长原扫描点云生存期");
+        assert_eq!(old.len(), 1);
     }
 
     #[test]

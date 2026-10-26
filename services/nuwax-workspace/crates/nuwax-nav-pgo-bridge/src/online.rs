@@ -359,6 +359,7 @@ pub enum ValidatedOnlinePgoDisposition {
 pub struct ValidatedOnlinePgoResult {
     result: NativePgoResult,
     transform: Option<ValidatedOnlinePgoTransform>,
+    accepted_keyframe: Option<bool>,
 }
 
 impl ValidatedOnlinePgoResult {
@@ -380,7 +381,11 @@ impl ValidatedOnlinePgoResult {
                 "unknown decoded result disposition {disposition}"
             )))?,
         };
-        Ok(Self { result, transform })
+        Ok(Self {
+            result,
+            transform,
+            accepted_keyframe: None,
+        })
     }
 
     /// Return the validated result disposition.
@@ -400,6 +405,12 @@ impl ValidatedOnlinePgoResult {
     #[must_use]
     pub fn result(&self) -> &NativePgoResult {
         &self.result
+    }
+
+    /// 精确成功终态证明是否新增关键帧；旧拥有方未提供标志时返回未知。
+    #[must_use]
+    pub fn accepted_keyframe(&self) -> Option<bool> {
+        self.accepted_keyframe
     }
 
     /// Return the correction transform when the disposition is CORRECTION.
@@ -1328,8 +1339,14 @@ fn try_finish_active(
         return Ok(false);
     }
     validate_result_terminal_matrix(result, terminal, current.cancel_ack)?;
+    let accepted_keyframe = match terminal.reason_code {
+        codec::NATIVE_PGO_REASON_KEYFRAME_ACCEPTED => Some(true),
+        codec::NATIVE_PGO_REASON_NO_KEYFRAME => Some(false),
+        _ => None,
+    };
     let mut current = active.take().expect("active request checked above");
-    let result = current.result.take().expect("result checked above");
+    let mut result = current.result.take().expect("result checked above");
+    result.accepted_keyframe = accepted_keyframe;
     if let (Some(reply), Some(outcome)) = (current.cancel_reply.take(), current.cancel_ack) {
         let _ = reply.send(Ok(outcome));
     }
@@ -1360,6 +1377,13 @@ fn validate_result_terminal_matrix(
             result.result().result_disposition,
             terminal.terminal_state
         )));
+    }
+    if result.disposition() == ValidatedOnlinePgoDisposition::Correction
+        && terminal.reason_code == codec::NATIVE_PGO_REASON_NO_KEYFRAME
+    {
+        return Err(OnlinePgoError::Protocol(
+            "correction terminal denies its newly committed keyframe".into(),
+        ));
     }
     match cancel_ack {
         Some(OnlinePgoCancelOutcome::Cancelled) => {
@@ -2086,6 +2110,53 @@ mod tests {
     }
 
     #[test]
+    fn keyframe_receipt_requires_exact_successful_terminal_and_preserves_unknown_legacy() {
+        let request = prepare_request(complete_request(14, 5, 1, 4_000_000_000), 14, 5, 1).unwrap();
+        for (code, expected) in [
+            (codec::NATIVE_PGO_REASON_NONE, None),
+            (codec::NATIVE_PGO_REASON_KEYFRAME_ACCEPTED, Some(true)),
+            (codec::NATIVE_PGO_REASON_NO_KEYFRAME, Some(false)),
+        ] {
+            let (mut current, mut reply) = active_request(request.clone());
+            current.accepted = true;
+            current.running = true;
+            current.result = Some(
+                ValidatedOnlinePgoResult::from_result(&request, no_candidate(&request)).unwrap(),
+            );
+            current.terminal = Some(request_status(
+                &request,
+                5,
+                codec::NATIVE_PGO_EVENT_TERMINAL,
+                codec::NATIVE_PGO_TERMINAL_SUCCEEDED,
+                codec::NATIVE_PGO_CANCEL_NONE,
+                code,
+                "",
+            ));
+            let mut active = Some(current);
+            assert!(try_finish_active(&mut active, &AtomicBool::new(true)).unwrap());
+            assert_eq!(
+                reply.try_recv().unwrap().unwrap().accepted_keyframe(),
+                expected
+            );
+        }
+        let correction =
+            ValidatedOnlinePgoResult::from_result(&request, correction(&request)).unwrap();
+        let denied = request_status(
+            &request,
+            5,
+            codec::NATIVE_PGO_EVENT_TERMINAL,
+            codec::NATIVE_PGO_TERMINAL_SUCCEEDED,
+            codec::NATIVE_PGO_CANCEL_NONE,
+            codec::NATIVE_PGO_REASON_NO_KEYFRAME,
+            "",
+        );
+        assert!(validate_result_terminal_matrix(&correction, &denied, None).is_err());
+        let rejected =
+            ValidatedOnlinePgoResult::from_result(&request, rejected(&request, false)).unwrap();
+        assert!(validate_result_terminal_matrix(&rejected, &denied, None).is_err());
+    }
+
+    #[test]
     fn wrong_generation_late_malformed_and_terminal_matrix_fail_closed() {
         let topics = OnlinePgoTopics::for_runtime(14, 5).unwrap();
         let request = prepare_request(complete_request(14, 5, 1, 4_000_000_000), 14, 5, 1).unwrap();
@@ -2356,6 +2427,16 @@ mod tests {
             result.disposition(),
             ValidatedOnlinePgoDisposition::NoCandidate
         );
+        assert_eq!(result.accepted_keyframe(), Some(true));
+        let stationary = ingress
+            .submit(complete_request(20_001, 1, 2, 7_000_000_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            stationary.disposition(),
+            ValidatedOnlinePgoDisposition::NoCandidate
+        );
+        assert_eq!(stationary.accepted_keyframe(), Some(false));
         let shutdown = owner.shutdown().await.unwrap();
         assert_eq!(shutdown.cause, OnlinePgoStopCause::Requested);
         assert!(shutdown.logs.stdout.total_bytes < 64 * 1024);
@@ -2391,6 +2472,7 @@ mod tests {
             ValidatedOnlinePgoDisposition::Correction,
             "third keyframe did not produce a correction"
         );
+        assert_eq!(correction.accepted_keyframe(), Some(true));
         let result = correction.result();
         let transform = correction.transform().unwrap();
         assert_eq!(
@@ -2451,6 +2533,7 @@ mod tests {
         };
         assert_eq!(cancel, OnlinePgoCancelOutcome::Cancelled);
         let result = submitted.await.unwrap().unwrap();
+        assert_eq!(result.accepted_keyframe(), None);
         assert_eq!(
             result.disposition(),
             ValidatedOnlinePgoDisposition::Rejected,

@@ -4,6 +4,9 @@ use nalgebra::{Isometry3, Point3};
 use nuwax_dufomap_native::{DufoMap, Params};
 use std::sync::OnceLock;
 
+#[path = "pgo_free_evidence.rs"]
+pub(crate) mod free_evidence;
+
 pub(crate) const BACKEND_VAR: &str = "NUWAX_GEOMETRY_DYNAMIC_BACKEND";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Backend {
@@ -71,8 +74,40 @@ pub(crate) fn test_free_cells(
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OnlineDufo {
     map: Option<DufoMap>,
+    free_revision: u64,
+    free_changes: free_evidence::FreeChangeJournal,
 }
 impl OnlineDufo {
+    pub(crate) fn free_revision(&self) -> u64 { self.free_revision }
+
+    /// 调用者持地图拥有方锁时，树与完整变化增量来自同一个不可变状态。
+    pub(crate) fn snapshot_since(&self, revision: u64) -> (Self, Option<Vec<nuwax_dufomap_native::FreeCell>>) {
+        (self.clone(), self.free_changes.since(revision, self.free_revision))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn free_change_payload_stats(&self) -> (usize, usize) {
+        self.free_changes.payload_stats()
+    }
+
+    /// 只查询冻结终态，不再以抽帧扫描重新积分另一套时域证据。
+    pub(crate) fn terminal_frame(
+        &self,
+        evidence_points: &[Point3<f64>],
+        corrected_points: &[Point3<f64>],
+    ) -> Result<MappedFrame, String> {
+        let xyz: Vec<_> = evidence_points.iter().map(|p| [p.x as f32, p.y as f32, p.z as f32]).collect();
+        let flags = match &self.map {
+            Some(map) => map.seen_free(&xyz)?,
+            None => vec![false; xyz.len()],
+        };
+        let mut frame = MappedFrame::unfiltered();
+        if let MappedFrame::Dufo(frame) = &mut frame {
+            frame.dynamic_points = corrected_points.iter().zip(flags).filter_map(|(p, flag)|
+                flag.then_some([p.x.to_bits(), p.y.to_bits(), p.z.to_bits()])).collect();
+        }
+        Ok(frame)
+    }
     #[cfg(test)]
     pub(crate) fn memory_bytes(&self) -> usize { self.map.as_ref().map_or(0, DufoMap::memory_bytes) }
     pub(crate) fn observe(
@@ -94,6 +129,10 @@ impl OnlineDufo {
             .collect();
         if stamp > 0 {
             free = map.insert_with_free_cells(&xyz, origin.map(|v| v as f32))?;
+        }
+        if !free.is_empty() {
+            self.free_revision = self.free_revision.checked_add(1).ok_or("DUFOMap自由证据修订溢出")?;
+            self.free_changes.record(self.free_revision, &free);
         }
         let flags = map.seen_free(&xyz)?;
         let indices = flags

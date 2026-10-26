@@ -136,6 +136,10 @@ pub const NATIVE_PGO_REASON_CANCEL_TOO_LATE: i32 = 12;
 pub const NATIVE_PGO_REASON_CHILD_EXITED: i32 = 13;
 /// Native child crashed.
 pub const NATIVE_PGO_REASON_CHILD_CRASHED: i32 = 14;
+/// 原生图已提交本次请求对应的关键帧。
+pub const NATIVE_PGO_REASON_KEYFRAME_ACCEPTED: i32 = 15;
+/// 本次成功请求没有新增关键帧。
+pub const NATIVE_PGO_REASON_NO_KEYFRAME: i32 = 16;
 
 const MAX_IDENTITY_STRING_BYTES: usize = 255;
 const MAX_REASON_BYTES: usize = 1_024;
@@ -1463,7 +1467,12 @@ fn validate_terminal_status(message: &NativePgoStatus, reason_present: bool) -> 
     match message.terminal_state {
         NATIVE_PGO_TERMINAL_SUCCEEDED => {
             message.cancel_state == NATIVE_PGO_CANCEL_NONE
-                && message.reason_code == NATIVE_PGO_REASON_NONE
+                && matches!(
+                    message.reason_code,
+                    NATIVE_PGO_REASON_NONE
+                        | NATIVE_PGO_REASON_KEYFRAME_ACCEPTED
+                        | NATIVE_PGO_REASON_NO_KEYFRAME
+                )
                 && message.reason.is_empty()
         }
         NATIVE_PGO_TERMINAL_FAILED => {
@@ -2209,6 +2218,40 @@ mod tests {
     }
 
     #[test]
+    fn keyframe_receipt_status_codes_preserve_layout_and_reject_wrong_states() {
+        let request = request();
+        let mut status = cancelled_status(&request);
+        status.event_kind = NATIVE_PGO_EVENT_TERMINAL;
+        status.terminal_state = NATIVE_PGO_TERMINAL_SUCCEEDED;
+        status.cancel_state = NATIVE_PGO_CANCEL_NONE;
+        status.reason_code = NATIVE_PGO_REASON_NONE;
+        status.reason.clear();
+        let legacy = encode_native_pgo_status_wire(&status).unwrap();
+        for code in [
+            NATIVE_PGO_REASON_KEYFRAME_ACCEPTED,
+            NATIVE_PGO_REASON_NO_KEYFRAME,
+        ] {
+            status.reason_code = code;
+            let wire = encode_native_pgo_status_wire(&status).unwrap();
+            assert_eq!(wire.len(), legacy.len());
+            assert_eq!(&wire[..8], &NATIVE_PGO_STATUS_FINGERPRINT_V3);
+            assert_eq!(decode_native_pgo_status_wire(&wire).unwrap(), status);
+            let mut invalid = status.clone();
+            invalid.reason = "untyped text".into();
+            assert!(seal_native_pgo_status(invalid).is_err());
+            for terminal in [
+                NATIVE_PGO_TERMINAL_REJECTED,
+                NATIVE_PGO_TERMINAL_FAILED,
+                NATIVE_PGO_TERMINAL_CANCELLED,
+            ] {
+                let mut invalid = status.clone();
+                invalid.terminal_state = terminal;
+                assert!(seal_native_pgo_status(invalid).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn status_matrix_covers_ready_health_cancel_and_terminal() {
         let request = request();
         let statuses = [
@@ -2715,6 +2758,8 @@ assert NativePgoStatus.EVENT_CANCEL_ACKNOWLEDGED == 8
 assert NativePgoStatus.TERMINAL_CANCELLED == 4
 assert NativePgoStatus.CANCEL_ACKNOWLEDGED == 2
 assert NativePgoStatus.REASON_CANCELLED == 11
+assert NativePgoStatus.REASON_KEYFRAME_ACCEPTED == 15
+assert NativePgoStatus.REASON_NO_KEYFRAME == 16
 
 assert NativePgoRequest().get_hash() == 0x1dfa283cdea6215d
 assert NativePgoResult().get_hash() == 0x7918f955c88ef8d6

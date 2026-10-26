@@ -8,7 +8,12 @@ use std::{
     path::{Path, PathBuf},
 };
 mod async_writer;
-pub use async_writer::{enqueue_final_poses, Recorder, SavePolicy, StorageWorker};
+mod pose_spool;
+pub use async_writer::{
+    enqueue_final_poses, enqueue_spooled_final_poses, Recorder, ReplaySource, SavePolicy,
+    StorageWorker,
+};
+pub use pose_spool::PoseSpool;
 const MAGIC: &[u8; 8] = b"NEHSCAN2";
 const MAX_POINTS: usize = 2_000_000;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -30,10 +35,37 @@ pub struct LoggedScan {
     pub points: Vec<[f32; 3]>,
     pub intensities: Option<Vec<f32>>,
 }
+#[derive(Clone, Debug)]
+pub enum ReplayRecord {
+    Scan(LoggedScan),
+    Progress,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Session {
     pub session_id: String,
     pub generation: u64,
+}
+/// 后台已写完扫描及进度记录的只读前缀；不表示已经逐帧同步到持久介质。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplayPrefix {
+    path: PathBuf,
+    session: Session,
+    valid_bytes: u64,
+    observed_until_ns: u64,
+}
+impl ReplayPrefix {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+    pub fn valid_bytes(&self) -> u64 {
+        self.valid_bytes
+    }
+    pub fn observed_until_ns(&self) -> u64 {
+        self.observed_until_ns
+    }
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -323,7 +355,8 @@ impl ScanLog {
     }
 }
 pub struct ScanReader {
-    file: BufReader<File>,
+    file: std::io::Take<BufReader<File>>,
+    prefix: Option<ReplayPrefix>,
     pub session: Session,
     pub observed_until_ns: u64,
     pub dropped_frames: u64,
@@ -346,7 +379,8 @@ impl ScanReader {
         let session = read_json(&mut file)?;
         let valid_bytes = file.stream_position().map_err(error)?;
         Ok(Self {
-            file: BufReader::with_capacity(1024 * 1024, file),
+            file: BufReader::with_capacity(1024 * 1024, file).take(u64::MAX),
+            prefix: None,
             session,
             observed_until_ns: 0,
             dropped_frames: 0,
@@ -354,80 +388,151 @@ impl ScanReader {
             valid_bytes,
         })
     }
+    /// 固定读取完整的已发布边界，后台追加不会改变本次读取范围。
+    pub fn open_prefix(prefix: &ReplayPrefix) -> Result<Self, String> {
+        let mut reader = Self::open(prefix.path())?;
+        if reader.session != prefix.session {
+            return Err("原始扫描重放前缀会话不匹配".into());
+        }
+        if prefix.valid_bytes < reader.valid_bytes
+            || reader
+                .file
+                .get_ref()
+                .get_ref()
+                .metadata()
+                .map_err(error)?
+                .len()
+                < prefix.valid_bytes
+        {
+            return Err("原始扫描重放前缀字节范围无效".into());
+        }
+        reader
+            .file
+            .set_limit(prefix.valid_bytes - reader.valid_bytes);
+        reader.prefix = Some(prefix.clone());
+        Ok(reader)
+    }
+    /// 保留当前位置和单帧缓冲，仅扩展同一路径、同会话的已发布范围。
+    pub fn extend_prefix(&mut self, prefix: &ReplayPrefix) -> Result<(), String> {
+        let current = self.prefix.as_ref().ok_or("原始扫描读取器未使用重放前缀")?;
+        if current.path != prefix.path
+            || current.session != prefix.session
+            || prefix.valid_bytes < current.valid_bytes
+            || prefix.observed_until_ns < current.observed_until_ns
+        {
+            return Err("原始扫描重放前缀不能切换会话或回退".into());
+        }
+        if self.truncated
+            || self
+                .file
+                .get_ref()
+                .get_ref()
+                .metadata()
+                .map_err(error)?
+                .len()
+                < prefix.valid_bytes
+        {
+            return Err("原始扫描重放前缀文件不完整".into());
+        }
+        self.file
+            .set_limit(self.file.limit() + prefix.valid_bytes - current.valid_bytes);
+        self.prefix = Some(prefix.clone());
+        Ok(())
+    }
     pub fn next_scan(&mut self) -> Result<Option<LoggedScan>, String> {
         loop {
-            let mut size = [0; 4];
-            let first = self.file.read(&mut size[..1]).map_err(error)?;
-            if first == 0 {
-                return Ok(None);
-            }
-            if let Err(e) = self.file.read_exact(&mut size[1..]) {
-                return self.tail(e);
-            }
-            let n = u32::from_le_bytes(size) as usize;
-            if !(4..=MAX_POINTS * 16 + 65540).contains(&n) {
-                return Err("原始扫描记录长度无效".into());
-            }
-            let mut bytes = vec![0; n];
-            if let Err(e) = self.file.read_exact(&mut bytes) {
-                return self.tail(e);
-            }
-            let mut checksum = [0; 32];
-            if let Err(e) = self.file.read_exact(&mut checksum) {
-                return self.tail(e);
-            }
-            if Sha256::digest(&bytes)[..] != checksum {
-                return Err("原始扫描记录校验失败".into());
-            }
-            let mut input = std::io::Cursor::new(&bytes);
-            let header: Record = read_json(&mut input)?;
-            let offset = input.position() as usize;
-            self.valid_bytes = self.file.stream_position().map_err(error)?;
-            match header {
-                Record::Progress {
-                    source_timestamp_ns,
-                    dropped_frames,
-                } => {
-                    if offset != n || source_timestamp_ns < self.observed_until_ns {
-                        return Err("原始扫描进度无效".into());
-                    }
-                    self.observed_until_ns = source_timestamp_ns;
-                    self.dropped_frames = self.dropped_frames.max(dropped_frames);
-                }
-                Record::Scan {
-                    metadata,
-                    intensity,
-                } => {
-                    if metadata.point_count > MAX_POINTS
-                        || n - offset != metadata.point_count * if intensity { 16 } else { 12 }
-                    {
-                        return Err("原始扫描点数与记录大小不一致".into());
-                    }
-                    let floats: Vec<f32> = bytes[offset..]
-                        .chunks_exact(4)
-                        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                        .collect();
-                    if !floats.iter().all(|v| v.is_finite()) {
-                        return Err("原始扫描含无效坐标或强度".into());
-                    }
-                    let points = floats[..metadata.point_count * 3]
-                        .chunks_exact(3)
-                        .map(|p| [p[0], p[1], p[2]])
-                        .collect();
-                    let intensities =
-                        intensity.then(|| floats[metadata.point_count * 3..].to_vec());
-                    return Ok(Some(LoggedScan {
-                        metadata,
-                        points,
-                        intensities,
-                    }));
-                }
+            match self.next_record()? {
+                Some(ReplayRecord::Scan(scan)) => return Ok(Some(scan)),
+                Some(ReplayRecord::Progress) => {}
+                None => return Ok(None),
             }
         }
     }
-    fn tail(&mut self, e: std::io::Error) -> Result<Option<LoggedScan>, String> {
+    /// 每次只解析一条记录，为在线重放保留进度记录之间的取消和让出边界。
+    pub fn next_record(&mut self) -> Result<Option<ReplayRecord>, String> {
+        let mut size = [0; 4];
+        let first = self.file.read(&mut size[..1]).map_err(error)?;
+        if first == 0 {
+            if let Some(prefix) = &self.prefix {
+                if self.file.limit() != 0
+                    || self.valid_bytes != prefix.valid_bytes
+                    || self.observed_until_ns != prefix.observed_until_ns
+                    || self.dropped_frames != 0
+                {
+                    return Err("原始扫描重放前缀缺少完整源时间进度".into());
+                }
+            }
+            return Ok(None);
+        }
+        if let Err(e) = self.file.read_exact(&mut size[1..]) {
+            return self.tail(e);
+        }
+        let n = u32::from_le_bytes(size) as usize;
+        if !(4..=MAX_POINTS * 16 + 65540).contains(&n) {
+            return Err("原始扫描记录长度无效".into());
+        }
+        let mut bytes = vec![0; n];
+        if let Err(e) = self.file.read_exact(&mut bytes) {
+            return self.tail(e);
+        }
+        let mut checksum = [0; 32];
+        if let Err(e) = self.file.read_exact(&mut checksum) {
+            return self.tail(e);
+        }
+        if Sha256::digest(&bytes)[..] != checksum {
+            return Err("原始扫描记录校验失败".into());
+        }
+        let mut input = std::io::Cursor::new(&bytes);
+        let header: Record = read_json(&mut input)?;
+        let offset = input.position() as usize;
+        self.valid_bytes = self.file.get_mut().stream_position().map_err(error)?;
+        match header {
+            Record::Progress {
+                source_timestamp_ns,
+                dropped_frames,
+            } => {
+                if offset != n || source_timestamp_ns < self.observed_until_ns {
+                    return Err("原始扫描进度无效".into());
+                }
+                self.observed_until_ns = source_timestamp_ns;
+                self.dropped_frames = self.dropped_frames.max(dropped_frames);
+                Ok(Some(ReplayRecord::Progress))
+            }
+            Record::Scan {
+                metadata,
+                intensity,
+            } => {
+                if metadata.point_count > MAX_POINTS
+                    || n - offset != metadata.point_count * if intensity { 16 } else { 12 }
+                {
+                    return Err("原始扫描点数与记录大小不一致".into());
+                }
+                let floats: Vec<f32> = bytes[offset..]
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                    .collect();
+                if !floats.iter().all(|v| v.is_finite()) {
+                    return Err("原始扫描含无效坐标或强度".into());
+                }
+                let points = floats[..metadata.point_count * 3]
+                    .chunks_exact(3)
+                    .map(|p| [p[0], p[1], p[2]])
+                    .collect();
+                let intensities = intensity.then(|| floats[metadata.point_count * 3..].to_vec());
+                Ok(Some(ReplayRecord::Scan(LoggedScan {
+                    metadata,
+                    points,
+                    intensities,
+                })))
+            }
+        }
+    }
+    fn tail(&mut self, e: std::io::Error) -> Result<Option<ReplayRecord>, String> {
         if e.kind() != std::io::ErrorKind::UnexpectedEof {
             return Err(error(e));
+        }
+        if self.prefix.is_some() {
+            return Err("原始扫描重放前缀包含不完整记录".into());
         }
         self.truncated = true;
         Ok(None)
@@ -660,6 +765,124 @@ mod v2_tests {
         std::fs::write(&log.path, bytes).unwrap();
         let mut reader = ScanReader::open(&log.path).unwrap();
         assert!(reader.next_scan().unwrap_err().contains("校验"));
+        drop(log);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn replay_prefix_rejects_other_sessions_partial_records_and_missing_progress() {
+        let root = folder("prefix-boundaries");
+        let session = Session {
+            session_id: "prefix".into(),
+            generation: 1,
+        };
+        let mut log = ScanLog::open(&root, session.clone()).unwrap();
+        log.append(&metadata(10), [[1., 2., 3.]; 2].into_iter(), None)
+            .unwrap();
+        let scan_end = log.file.stream_position().unwrap();
+        log.progress(20, 0).unwrap();
+        let prefix = ReplayPrefix {
+            path: log.path.clone(),
+            session,
+            valid_bytes: log.file.stream_position().unwrap(),
+            observed_until_ns: 20,
+        };
+        let mut other = prefix.clone();
+        other.session.generation += 1;
+        assert!(ScanReader::open_prefix(&other)
+            .err()
+            .unwrap()
+            .contains("会话不匹配"));
+        let mut reader = ScanReader::open_prefix(&prefix).unwrap();
+        assert!(reader
+            .extend_prefix(&other)
+            .unwrap_err()
+            .contains("切换会话"));
+        let mut other_path = prefix.clone();
+        other_path.path = root.join("another.scan");
+        assert!(reader
+            .extend_prefix(&other_path)
+            .unwrap_err()
+            .contains("切换会话"));
+
+        let mut missing_progress = prefix.clone();
+        missing_progress.valid_bytes = scan_end;
+        let mut reader = ScanReader::open_prefix(&missing_progress).unwrap();
+        assert!(reader.next_scan().unwrap().is_some());
+        assert!(reader.next_scan().unwrap_err().contains("源时间进度"));
+
+        let mut partial = prefix.clone();
+        partial.valid_bytes -= 1;
+        let mut reader = ScanReader::open_prefix(&partial).unwrap();
+        assert!(reader.next_scan().unwrap().is_some());
+        assert!(reader.next_scan().unwrap_err().contains("不完整记录"));
+
+        // 后台可继续写入半帧；固定的已发布前缀仍能完整读完且不触及该帧。
+        log.file.write_all(&[1, 2, 3]).unwrap();
+        let mut reader = ScanReader::open_prefix(&prefix).unwrap();
+        assert_eq!(
+            reader
+                .next_scan()
+                .unwrap()
+                .unwrap()
+                .metadata
+                .source_timestamp_ns,
+            10
+        );
+        assert!(reader.next_scan().unwrap().is_none());
+        assert_eq!(reader.valid_bytes, prefix.valid_bytes());
+        assert!(!reader.truncated);
+        drop(log);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn one_record_reader_yields_at_every_progress_before_the_next_scan() {
+        let root = folder("single-record");
+        let session = Session {
+            session_id: "single-record".into(),
+            generation: 1,
+        };
+        let mut log = ScanLog::open(&root, session.clone()).unwrap();
+        log.append(&metadata(10), [[1., 2., 3.]; 2].into_iter(), None)
+            .unwrap();
+        for stamp in 10..=1010 {
+            log.progress(stamp, 0).unwrap();
+        }
+        log.append(&metadata(2000), [[4., 5., 6.]; 2].into_iter(), None)
+            .unwrap();
+        log.progress(2000, 0).unwrap();
+        let prefix = ReplayPrefix {
+            path: log.path.clone(),
+            session,
+            valid_bytes: log.file.stream_position().unwrap(),
+            observed_until_ns: 2000,
+        };
+        let mut reader = ScanReader::open_prefix(&prefix).unwrap();
+        assert!(
+            matches!(reader.next_record().unwrap(), Some(ReplayRecord::Scan(scan))
+            if scan.metadata.source_timestamp_ns == 10)
+        );
+        assert_eq!(reader.observed_until_ns, 0);
+        for stamp in 10..=1010 {
+            assert!(matches!(
+                reader.next_record().unwrap(),
+                Some(ReplayRecord::Progress)
+            ));
+            assert_eq!(
+                reader.observed_until_ns, stamp,
+                "单步读取不能跨过下一条进度"
+            );
+        }
+        assert!(
+            matches!(reader.next_record().unwrap(), Some(ReplayRecord::Scan(scan))
+            if scan.metadata.source_timestamp_ns == 2000)
+        );
+        assert_eq!(reader.observed_until_ns, 1010);
+        assert!(matches!(
+            reader.next_record().unwrap(),
+            Some(ReplayRecord::Progress)
+        ));
+        assert_eq!(reader.observed_until_ns, 2000);
+        assert!(reader.next_record().unwrap().is_none());
         drop(log);
         std::fs::remove_dir_all(root).unwrap();
     }

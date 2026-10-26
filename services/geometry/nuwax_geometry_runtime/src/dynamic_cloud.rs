@@ -20,6 +20,14 @@ pub(super) struct DynamicCloudFilter {
 }
 
 impl DynamicCloudFilter {
+    pub(crate) fn replay_source(&self) -> Option<nuwax_cloud_cleanup::scan_log::ReplaySource> {
+        self.raw_log.as_ref().map(|recorder| recorder.replay_source())
+    }
+    pub(crate) fn terminal_dufo(&self) -> crate::dynamic_backend::OnlineDufo { self.dufo.clone() }
+    pub(crate) fn terminal_dufo_since(&self, revision: u64) -> (crate::dynamic_backend::OnlineDufo, Option<Vec<nuwax_dufomap_native::FreeCell>>) {
+        self.dufo.snapshot_since(revision)
+    }
+    pub(crate) fn free_revision(&self) -> u64 { self.dufo.free_revision() }
     pub(crate) fn has_source_domain(&self) -> bool {
         self.source_domain.is_some()
     }

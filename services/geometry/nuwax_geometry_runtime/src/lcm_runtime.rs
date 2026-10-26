@@ -22,6 +22,9 @@
 //!
 //! 这里的 `nav_msgs/Odometry` 等名称仅是 LCM typed message 命名空间字符串。
 
+#[path = "pgo_background_replay.rs"]
+mod pgo_background_replay;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -4583,7 +4586,12 @@ impl GeometryCanonicalCorrectionApplier {
                 Reject::OccupancyRevisionMismatch,
             ));
         }
-        let (scans, spec, config, backend_generation) = snapshot(0)?;
+        let (_, spec, config, backend_generation) = snapshot(u64::MAX)?;
+        let disk_input = context.mapping.lock().pgo_disk_input(&transaction.trajectory)
+            .map_err(pgo_preparation_error)?;
+        let (scans, spec, config, backend_generation) = if disk_input.is_some() {
+            (Vec::new(), spec, config, backend_generation)
+        } else { snapshot(0)? };
         self.validate_transaction(transaction)
             .map_err(ApplyError::Failed)?;
         cancellation.begin_background_preparation();
@@ -4595,6 +4603,10 @@ impl GeometryCanonicalCorrectionApplier {
                 _ = cancellation.cancelled() => return Err(ApplyError::Cancelled),
                 _ = release.notified() => {},
             }
+        }
+        if let Some(input) = disk_input {
+            return self.prepare_background_disk_pgo(transaction, cancellation, context.clone(), input,
+                spec, config, backend_generation).await;
         }
         let trajectory = transaction.trajectory.clone();
         let anchor = transaction.base_anchor_map_from_odom;
@@ -4867,7 +4879,7 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
                 background_expected = Some(expected);
                 Some(map)
             } else {
-                let (scans, spec, config) = {
+                let (scans, spec, config, disk_input) = {
                     let mapping = context.mapping.lock();
                     let session = mapping.snapshot();
                     let anchor = mapping
@@ -4883,15 +4895,24 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
                     {
                         return Err(ApplyError::Failed("PGO地图拥有方或锚点不匹配".into()));
                     }
-                    mapping.pgo_rebuild_input().map_err(preparation_error)?
+                    let (scans, spec, config) = mapping.pgo_rebuild_input().map_err(preparation_error)?;
+                    let disk_input = mapping.pgo_disk_input(&transaction.trajectory).map_err(preparation_error)?;
+                    (scans, spec, config, disk_input)
                 };
                 let trajectory = transaction.trajectory.clone();
                 let anchor = transaction.base_anchor_map_from_odom;
                 let frame = self.map_frame_id.clone();
                 let cancelled = cancellation.clone();
                 let budget = self.rebuild_budget;
+                let terminal = if disk_input.is_some() {
+                    context.cloud_writer.lock().as_ref().ok_or_else(|| ApplyError::Failed("PGO点云拥有方缺失".into()))?.pgo_terminal_dufo()
+                } else { Default::default() };
                 Some(
                     tokio::task::spawn_blocking(move || {
+                        if let Some(input) = disk_input {
+                            return crate::pgo_map::rebuild_disk(input, trajectory, anchor, spec, config, frame, budget,
+                                terminal, || cancelled.is_cancelled());
+                        }
                         crate::pgo_map::rebuild(
                             scans,
                             trajectory,
@@ -5101,7 +5122,14 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
                     frame_generation: Some(transaction.map_frame_generation),
                     poses: map.final_poses,
                 };
-                if let Err(error) = nuwax_cloud_cleanup::scan_log::enqueue_final_poses(scan_root, poses) {
+                let saved = match map.final_pose_spool {
+                    Some(spool) => nuwax_cloud_cleanup::scan_log::enqueue_spooled_final_poses(scan_root, poses, spool),
+                    None => nuwax_cloud_cleanup::scan_log::enqueue_final_poses(scan_root, poses),
+                };
+                if let Err(error) = saved {
+                    if let Some(source) = context.cloud_writer.lock().as_ref().and_then(|writer| writer.pgo_replay_source()) {
+                        source.mark_incomplete();
+                    }
                     // 地图和后端已经提交；辅助轨迹落盘失败不能把已提交校正改成失败。
                     tracing::warn!(event = "mapping.raw_scan_poses_incomplete", %error,
                         "最终位姿记录失败，保留已提交PGO地图；离线清理不得声称完整重判");
@@ -11594,7 +11622,9 @@ pub(crate) async fn handoff_admitted_registered_cloud(handle: &GeometryRuntimeHa
         canonical_mapping_source(accepted)?,Some((binding.mapping_session_generation,binding.map_frame_generation,binding.registration_correction_revision)),
         None,None,binding.sensor_origin_map,Some(accepted.clone().into())).await?;
     {
+        let log = handle.cloud_map_writer.lock().as_ref().and_then(|writer| writer.pgo_replay_source());
         let mut adapter=handle.mapping_adapter.as_ref().ok_or("建图拥有方缺失")?.lock();
+        adapter.bind_pgo_replay_source(log);
         adapter.record_auxiliary_scans(auxiliary)?;
         if !commit.outcome.accepted_map_points.is_empty() { adapter.record_pgo_scan(accepted)?; }
     }
@@ -11699,7 +11729,9 @@ pub(crate) async fn handoff_registered_lio_cloud_with_correction(
     .await?;
     {
         // 同刻辅助与LiDAR归档对PGO快照原子可见，避免时间水位追赶漏掉其中一帧。
+        let log = handle.cloud_map_writer.lock().as_ref().and_then(|writer| writer.pgo_replay_source());
         let mut adapter=handle.mapping_adapter.as_ref().ok_or("mapping adapter unavailable")?.lock();
+        adapter.bind_pgo_replay_source(log);
         adapter.record_auxiliary_scans(auxiliary)?;
         if !commit.outcome.accepted_map_points.is_empty() { adapter.record_pgo_scan(accepted)?; }
     }
@@ -17282,6 +17314,31 @@ pub(crate) mod mapping_feed_tests {
         use nalgebra::{Isometry3, Translation3, UnitQuaternion};
         use nuwax_codec::lcm::native_pgo::OptimizedKeyframe;
 
+        struct RawLogFixture {
+            worker: Option<nuwax_cloud_cleanup::scan_log::StorageWorker>,
+            root: std::path::PathBuf,
+            previous: Option<std::ffi::OsString>,
+        }
+        impl RawLogFixture {
+            fn new() -> Self {
+                let root = std::env::temp_dir().join(format!("nuwax-g2-pgo-chain-{}", uuid::Uuid::new_v4()));
+                std::fs::create_dir_all(&root).unwrap();
+                let previous = std::env::var_os("NUWAX_RAW_SCAN_DIRECTORY");
+                std::env::set_var("NUWAX_RAW_SCAN_DIRECTORY", &root);
+                Self { worker: Some(nuwax_cloud_cleanup::scan_log::StorageWorker::start().unwrap()), root, previous }
+            }
+        }
+        impl Drop for RawLogFixture {
+            fn drop(&mut self) {
+                drop(self.worker.take());
+                match &self.previous {
+                    Some(path) => std::env::set_var("NUWAX_RAW_SCAN_DIRECTORY", path),
+                    None => std::env::remove_var("NUWAX_RAW_SCAN_DIRECTORY"),
+                }
+                std::fs::remove_dir_all(&self.root).unwrap();
+            }
+        }
+
         // 人为给定已接受的完整优化轨迹，专门验证大校正的生产坐标/地图提交，不替代回环检测测试。
         let new_cancellation = || {
             if background {
@@ -17298,6 +17355,8 @@ pub(crate) mod mapping_feed_tests {
                 MappingBackendSpec::Voxel,
                 MappingBackendSpec::Raytracing(RaytracingBackendSpec::default()),
             ] {
+                // 与生产根拥有方一致启动日志；每种组合使用独立会话文件，避免旧轮次污染。
+                let _raw_log = RawLogFixture::new();
                 let handle = build_handle_for_tests_with_cloud_writer(true, Some(map_backend))
                     .await
                     .unwrap();
@@ -17381,6 +17440,19 @@ pub(crate) mod mapping_feed_tests {
                     origin * Isometry3::from_parts(Translation3::new(0.5, 2.0, 0.0), turn),
                 ];
                 let mut pending = None;
+                let mut stored_truth: Option<(crate::mapping_backend::MappingKernel,
+                    Option<crate::persistent_occupancy::PersistentOccupancyGrid>)> = None;
+                let apply_truth = |kernel: &mut crate::mapping_backend::MappingKernel,
+                    persistent: &mut Option<crate::persistent_occupancy::PersistentOccupancyGrid>,
+                    input: &crate::mapping_backend::MappingBackendInput,
+                    config: crate::mapping_backend::MappingBackendComputeConfig| {
+                    if let Some(candidate) = crate::mapping_backend::compute_candidate_in_place_with_interval(
+                        kernel, input, config, 0).unwrap() {
+                        if let Some(grid) = persistent.as_mut() { grid.merge_observation(&candidate.latest_frame_occupancy).unwrap(); }
+                        else { *persistent = Some(crate::persistent_occupancy::PersistentOccupancyGrid::stage_observation(
+                            None, &candidate.latest_frame_occupancy).unwrap()); }
+                    }
+                };
                 for index in [0usize, 1, 2, 3, 4, 6] {
                     let stamp = (index as u64 + 1) * 1_000_000_000;
                     {
@@ -17480,6 +17552,11 @@ pub(crate) mod mapping_feed_tests {
                     )
                     .await
                     .unwrap());
+                    // 本夹具显式注入每个已接纳源帧的优化节点，对应保留它的精确局部位姿。
+                    let archived = mapping.lock().pgo_rebuild_input().unwrap().0;
+                    let keyframe = archived.last().expect("显式PGO轨迹的真实已接纳源帧");
+                    assert_eq!(keyframe.source_timestamp_ns, stamp);
+                    keyframe.retain_keyframe_for_test().unwrap();
                     if index == 4 {
                         // 第6帧在第2次校正之前已注册，且新的里程计已到达；校正后它必须被拒绝。
                         let latest_stamp = 6_000_000_000;
@@ -17655,7 +17732,8 @@ pub(crate) mod mapping_feed_tests {
                             let (result, ()) = tokio::join!(
                                 applier.apply_transaction(transaction.clone(), cancelled.clone()),
                                 async {
-                                    entered.notified().await;
+                                    tokio::time::timeout(crate::pgo_map::REBUILD_BUDGET, entered.notified()).await
+                                        .expect("后台校正必须真正进入准备阶段，不能在握手前结束");
                                     let guard = tokio::time::timeout(
                                         Duration::from_millis(100),
                                         handle.mapping_lifecycle_lock.lock(),
@@ -17679,7 +17757,8 @@ pub(crate) mod mapping_feed_tests {
                             let (result, ()) = tokio::join!(
                                 applier.apply_transaction(transaction, cancellation.clone()),
                                 async {
-                                    entered.notified().await;
+                                    tokio::time::timeout(crate::pgo_map::REBUILD_BUDGET, entered.notified()).await
+                                        .expect("后台校正必须真正进入准备阶段，不能在握手前结束");
                                     let guard = tokio::time::timeout(
                                         Duration::from_millis(100),
                                         handle.mapping_lifecycle_lock.lock(),
@@ -17777,14 +17856,61 @@ pub(crate) mod mapping_feed_tests {
                         assert_eq!(handle.state.read().await.map.revision, before);
                     }
                     if index >= 2 {
+                        if crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::DufoMap {
+                            let (_, spec, config) = mapping.lock().pgo_rebuild_input().unwrap();
+                            if index == 2 || index == 4 {
+                                // v2的机体点和雷达原点是f32；从真实日志生成同输入的独立正确轨迹参考。
+                                // 原双精度原点恰在栅格边界，不能要求量化前后的自由栅格边界逐字相同。
+                                let source = handle.cloud_map_writer.lock().as_ref().unwrap().pgo_replay_source().unwrap();
+                                let mut reader = nuwax_cloud_cleanup::scan_log::ScanReader::open_prefix(
+                                    &source.snapshot().unwrap().unwrap()).unwrap();
+                                let mut kernel = spec.into_kernel(config.window_capacity);
+                                let mut persistent = None;
+                                while let Some(scan) = reader.next_scan().unwrap() {
+                                    let timestamp = scan.metadata.source_timestamp_ns;
+                                    if timestamp > stamp { break; }
+                                    let truth_index = (timestamp / 1_000_000_000 - 1) as usize;
+                                    let pose = binding.base_anchor_map_from_odom * optimized[truth_index];
+                                    let points = scan.points.iter().map(|p| pose * Point3::from(p.map(f64::from))).collect();
+                                    let sensor = pose * Point3::from(scan.metadata.sensor_origin_body.unwrap().map(f64::from));
+                                    let input = crate::mapping_backend::MappingBackendInput {
+                                        session_id: "pgo-log-truth".into(), session_generation: 1, backend_generation: 1,
+                                        frame_sequence: scan.metadata.source_sequence, source_timestamp_ns: timestamp,
+                                        received_at_ns: timestamp, registered_frame_id: "map".into(),
+                                        sensor_origin_map: sensor.coords.into(), dynamic_frame: Some(crate::dynamic_backend::MappedFrame::unfiltered()),
+                                        registered_points_map: points,
+                                    };
+                                    apply_truth(&mut kernel, &mut persistent, &input, config);
+                                }
+                                stored_truth = Some((kernel, persistent));
+                            } else {
+                                let (kernel, persistent) = stored_truth.as_mut().unwrap();
+                                let input = crate::mapping_backend::MappingBackendInput {
+                                    session_id: "pgo-log-truth".into(), session_generation: 1, backend_generation: 1,
+                                    frame_sequence: index as u64 + 1, source_timestamp_ns: stamp,
+                                    received_at_ns: (index as u64 + 1) * 300_000_000,
+                                    registered_frame_id: "map".into(), sensor_origin_map: truth_origin,
+                                    dynamic_frame: Some(crate::dynamic_backend::MappedFrame::unfiltered()),
+                                    registered_points_map: world.clone(),
+                                };
+                                apply_truth(kernel, persistent, &input, config);
+                            }
+                        }
                         let actual_grid = mapping.lock().raw_map_snapshot().unwrap();
-                        let truth_grid = baseline
+                        let mut truth_grid = baseline
                             .mapping_adapter
                             .as_ref()
                             .unwrap()
                             .lock()
                             .raw_map_snapshot()
                             .unwrap();
+                        if let Some((_, Some(reference))) = &stored_truth {
+                            truth_grid.width = reference.grid.width;
+                            truth_grid.height = reference.grid.height;
+                            truth_grid.origin_x = reference.grid.origin[0];
+                            truth_grid.origin_y = reference.grid.origin[1];
+                            truth_grid.data = reference.grid.data.clone();
+                        }
                         assert_eq!(
                             (actual_grid.width, actual_grid.height),
                             (truth_grid.width, truth_grid.height)

@@ -2433,7 +2433,28 @@ impl MappingAdapter {
 
     pub(crate) fn enable_pgo_history(&mut self) {
         self.pgo_history
-            .get_or_insert_with(crate::pgo_map::ScanHistory::default);
+            .get_or_insert_with(|| {
+                let mut history = crate::pgo_map::ScanHistory::default();
+                if crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::DufoMap {
+                    history.enable_streaming();
+                }
+                history
+            });
+    }
+
+    pub(crate) fn bind_pgo_replay_source(&mut self, source: Option<nuwax_cloud_cleanup::scan_log::ReplaySource>) {
+        if let Some(history) = &mut self.pgo_history { history.bind_replay_source(source); }
+    }
+
+    pub(crate) fn pgo_disk_input(&self, trajectory: &[nuwax_codec::lcm::native_pgo::OptimizedKeyframe])
+        -> Result<Option<crate::pgo_map::DiskReplayInput>, crate::pgo_map::RebuildError> {
+        if self.checkpoint_activation_key.is_some() { return Err(crate::pgo_map::RebuildError::HistoryUnavailable); }
+        self.pgo_history.as_ref().ok_or(crate::pgo_map::RebuildError::HistoryUnavailable)?.disk_input(trajectory)
+    }
+
+    pub(crate) fn pgo_disk_tail(&self) -> Result<Option<crate::pgo_map::ArchivedScan>, crate::pgo_map::RebuildError> {
+        if self.checkpoint_activation_key.is_some() { return Err(crate::pgo_map::RebuildError::HistoryUnavailable); }
+        self.pgo_history.as_ref().ok_or(crate::pgo_map::RebuildError::HistoryUnavailable)?.disk_tail()
     }
 
     pub(crate) fn record_pgo_scan(

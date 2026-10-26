@@ -1313,58 +1313,185 @@ mod tests {
     #[test]
     #[ignore = "需要显式提供实录配对扫描，release构建独立执行"]
     fn online_recorded_frame_handoff_cost() {
+        mod handoff_evidence {
+            include!("pgo_map_handoff_cost.rs");
+        }
         use crate::admitted_cloud::AcceptedMappingCloud;
         use crate::lio_ingress::AcceptedRegisteredCloud;
         let path = std::env::var("NUWAX_PGO_RECORDED_SCANS").expect("指定实录配对扫描文件");
-        let frames = std::env::var("NUWAX_PGO_RECORDED_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(1500);
-        let origin: [f64; 3] = serde_json::from_str(&std::env::var("NUWAX_PGO_SENSOR_ORIGIN_BODY")
-            .expect("指定雷达机体原点")).unwrap();
-        let captures: Vec<bool> = std::env::var("NUWAX_PGO_CAPTURE_MODES").ok()
-            .map(|v| v.split(',').map(|m| m == "on").collect()).unwrap_or_else(|| vec![true]);
+        let frames = std::env::var("NUWAX_PGO_RECORDED_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1500);
+        let origin: [f64; 3] = serde_json::from_str(
+            &std::env::var("NUWAX_PGO_SENSOR_ORIGIN_BODY").expect("指定雷达机体原点"),
+        )
+        .unwrap();
+        let captures: Vec<bool> = std::env::var("NUWAX_PGO_CAPTURE_MODES")
+            .ok()
+            .map(|v| v.split(',').map(|m| m == "on").collect())
+            .unwrap_or_else(|| vec![true]);
         let (scans, _) = recorded_input(&path, frames, origin);
+        let multiple_captures = captures.len() > 1;
         for capture in captures {
+            let mut evidence = handoff_evidence::Recorder::from_env(capture, multiple_captures);
             let mut cloud = CloudMapShmWriter::new_private().unwrap();
             cloud.begin_session(1).unwrap();
-            let (mut segment, mut worst, mut total) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+            let (mut segment, mut worst, mut total) =
+                (Duration::ZERO, Duration::ZERO, Duration::ZERO);
             let mut stages = [0.0; 3];
             let mut segment_cpu = process_cpu_ms();
-            let config = MappingBackendComputeConfig { resolution: 0.05, initial_safe_radius_meters: 0.0,
-                window_capacity: nuwax_mapping::mapping_session::DEFAULT_BOUNDED_CAPACITY };
+            let config = MappingBackendComputeConfig {
+                resolution: 0.05,
+                initial_safe_radius_meters: 0.0,
+                window_capacity: nuwax_mapping::mapping_session::DEFAULT_BOUNDED_CAPACITY,
+            };
             let mut kernel = MappingBackendSpec::Voxel.into_kernel(config.window_capacity);
             let mut persistent: Option<PersistentOccupancyGrid> = None;
             let (mut classify_ms, mut kernel_ms) = (0.0, 0.0);
+            let mut cumulative_source_points = 0u64;
             for (index, scan) in scans.iter().enumerate() {
-                let map_points: Vec<_> = scan.body_points.iter().map(|p| scan.odom_from_body * p).collect();
-                let origin_body = scan.sensor_origin_body.expect("实录基准的每帧都带实测雷达原点");
+                let map_points: Vec<_> = scan
+                    .body_points
+                    .iter()
+                    .map(|p| scan.odom_from_body * p)
+                    .collect();
+                let origin_body = scan
+                    .sensor_origin_body
+                    .expect("实录基准的每帧都带实测雷达原点");
                 let sensor_origin = (scan.odom_from_body * origin_body).coords.into();
                 let mut binding = test_binding();
                 binding.cloud_source_sequence = index as i64 + 1;
                 binding.frozen_odom_from_body = scan.odom_from_body;
                 binding.sensor_origin_map = Some(sensor_origin);
-                let accepted = AcceptedMappingCloud::from(AcceptedRegisteredCloud::from_map_points_for_test(
-                    map_points.clone(), scan.source_timestamp_ns, scan.source_timestamp_ns, "map", "body", binding));
+                let accepted =
+                    AcceptedMappingCloud::from(AcceptedRegisteredCloud::from_map_points_for_test(
+                        map_points.clone(),
+                        scan.source_timestamp_ns,
+                        scan.source_timestamp_ns,
+                        "map",
+                        "body",
+                        binding,
+                    ));
+                let cpu_before = evidence
+                    .as_ref()
+                    .map(|_| handoff_evidence::process_usage().0);
                 let started = Instant::now();
                 let classify_started = Instant::now();
-                let frame = cloud.classify_admitted_scan(accepted.lidar().unwrap()).unwrap();
-                classify_ms += classify_started.elapsed().as_secs_f64() * 1e3;
-                let input = MappingBackendInput { session_id: "online-cost".into(), session_generation: 1,
-                    backend_generation: 1, frame_sequence: index as u64 + 1, source_timestamp_ns: scan.source_timestamp_ns,
-                    received_at_ns: scan.received_at_ns, registered_frame_id: "map".into(), sensor_origin_map: sensor_origin,
-                    dynamic_frame: Some(frame), registered_points_map: map_points.clone() };
+                let frame = cloud
+                    .classify_admitted_scan(accepted.lidar().unwrap())
+                    .unwrap();
+                let classify_elapsed_ms = classify_started.elapsed().as_secs_f64() * 1e3;
+                classify_ms += classify_elapsed_ms;
+                let cpu_after_classify = evidence
+                    .as_ref()
+                    .map(|_| handoff_evidence::process_usage().0);
+                let input = MappingBackendInput {
+                    session_id: "online-cost".into(),
+                    session_generation: 1,
+                    backend_generation: 1,
+                    frame_sequence: index as u64 + 1,
+                    source_timestamp_ns: scan.source_timestamp_ns,
+                    received_at_ns: scan.received_at_ns,
+                    registered_frame_id: "map".into(),
+                    sensor_origin_map: sensor_origin,
+                    dynamic_frame: Some(frame),
+                    registered_points_map: map_points.clone(),
+                };
                 let kernel_started = Instant::now();
                 mapping_backend::validate_backend_input(&kernel, &input).unwrap();
-                if let Some(candidate) = mapping_backend::compute_candidate_in_place(&mut kernel, &input, config).unwrap() {
-                    if let Some(grid) = persistent.as_mut() { grid.merge_observation(&candidate.latest_frame_occupancy).unwrap(); }
-                    else { persistent = Some(PersistentOccupancyGrid::stage_observation(None, &candidate.latest_frame_occupancy).unwrap()); }
+                if let Some(candidate) =
+                    mapping_backend::compute_candidate_in_place(&mut kernel, &input, config)
+                        .unwrap()
+                {
+                    if let Some(grid) = persistent.as_mut() {
+                        grid.merge_observation(&candidate.latest_frame_occupancy)
+                            .unwrap();
+                    } else {
+                        persistent = Some(
+                            PersistentOccupancyGrid::stage_observation(
+                                None,
+                                &candidate.latest_frame_occupancy,
+                            )
+                            .unwrap(),
+                        );
+                    }
                 }
-                kernel_ms += kernel_started.elapsed().as_secs_f64() * 1e3;
-                assert!(cloud.accumulate_mapping_scan_with_source(1, &map_points, Some(sensor_origin),
-                    scan.source_timestamp_ns, capture.then_some(&accepted)));
+                let kernel_elapsed_ms = kernel_started.elapsed().as_secs_f64() * 1e3;
+                kernel_ms += kernel_elapsed_ms;
+                let cpu_after_occupancy = evidence
+                    .as_ref()
+                    .map(|_| handoff_evidence::process_usage().0);
+                assert!(cloud.accumulate_mapping_scan_with_source(
+                    1,
+                    &map_points,
+                    Some(sensor_origin),
+                    scan.source_timestamp_ns,
+                    capture.then_some(&accepted)
+                ));
                 let elapsed = started.elapsed();
-                for (sum, stage) in stages.iter_mut().zip(cloud.last_stage_ms()) { *sum += stage; }
+                let usage_after = evidence.as_ref().map(|_| handoff_evidence::process_usage());
+                let current_stages = cloud.last_stage_ms();
+                for (sum, stage) in stages.iter_mut().zip(current_stages) {
+                    *sum += stage;
+                }
                 segment += elapsed;
                 total += elapsed;
                 worst = worst.max(elapsed);
+                cumulative_source_points += map_points.len() as u64;
+                if let Some(recorder) = evidence.as_mut() {
+                    // 只在显式评估开关下取规模与索引信息，且位于整帧计时之外。
+                    let (fine_blocks, dense_points, visible_points, new_free_cells) =
+                        cloud.revocation_map_sizes();
+                    let (dense_index_bytes, fine_index_bytes, visible_index_bytes) =
+                        cloud.revocation_index_memory_bytes();
+                    let revoke_stages = cloud.last_revoke_stage_ms();
+                    let (
+                        fine_blocks_read,
+                        dense_coordinate_pages_read,
+                        dense_candidate_points,
+                        dense_removed_points,
+                        dense_index_pages_read,
+                    ) = cloud.revocation_io_counts();
+                    let before = cpu_before.unwrap();
+                    let classified = cpu_after_classify.unwrap();
+                    let occupancy = cpu_after_occupancy.unwrap();
+                    let after = usage_after.unwrap();
+                    recorder.push(handoff_evidence::FrameRecord {
+                        frame: index + 1,
+                        source_timestamp_ns: scan.source_timestamp_ns,
+                        source_points: map_points.len(),
+                        cumulative_source_points,
+                        wall_ms: elapsed.as_secs_f64() * 1e3,
+                        cpu_ms: after.0 - before,
+                        classify_ms: classify_elapsed_ms,
+                        occupancy_ms: kernel_elapsed_ms,
+                        fine_ms: current_stages[0],
+                        dense_ms: current_stages[1],
+                        visible_ms: current_stages[2],
+                        fine_revoke_ms: revoke_stages[0],
+                        dense_revoke_ms: revoke_stages[1],
+                        dense_append_ms: revoke_stages[2],
+                        visible_revoke_ms: revoke_stages[3],
+                        classify_cpu_ms: classified - before,
+                        occupancy_cpu_ms: occupancy - classified,
+                        cloud_cpu_ms: after.0 - occupancy,
+                        fine_blocks,
+                        dense_points,
+                        visible_points,
+                        new_free_cells,
+                        occupancy_cells: persistent.as_ref().map_or(0, |p| p.grid.data.len()),
+                        dense_index_bytes,
+                        fine_index_bytes,
+                        visible_index_bytes,
+                        fine_blocks_read,
+                        dense_coordinate_pages_read,
+                        dense_candidate_points,
+                        dense_removed_points,
+                        dense_index_pages_read,
+                        peak_rss_kib: after.1,
+                    });
+                }
                 if (index + 1) % 100 == 0 || index + 1 == scans.len() {
                     let count = (index % 100 + 1) as f64;
                     let cpu = process_cpu_ms();
@@ -1380,24 +1507,26 @@ mod tests {
                     worst = Duration::ZERO;
                 }
             }
-            cloud.commit_accumulated().unwrap();
-            let snapshot = cloud.committed_snapshot().unwrap();
-            eprintln!("ONLINE_MAP backend={:?} capture={capture} static_points={} voxel_size={}",
-                crate::dynamic_backend::backend(), snapshot.point_count, snapshot.voxel_size);
-            if let Ok(root) = std::env::var("NUWAX_G3_EVIDENCE_DIR") {
-                let root = std::path::Path::new(&root);
-                std::fs::create_dir_all(root).unwrap();
-                std::fs::write(root.join("静态点云.bin"), &snapshot.xyz_f32_le).unwrap();
-                if let Some(grid) = persistent {
-                    std::fs::write(root.join("二维占据.json"), serde_json::to_vec(&serde_json::json!({
-                        "resolution":grid.grid.resolution,"origin":[grid.grid.origin[0],grid.grid.origin[1]],
-                        "width":grid.grid.width,"height":grid.grid.height,"data":grid.grid.data})).unwrap()).unwrap();
-                }
+            if let Some(recorder) = evidence {
+                recorder.finish(
+                    &mut cloud,
+                    persistent.as_ref(),
+                    scans.last().unwrap().source_timestamp_ns,
+                    frames,
+                );
+            } else {
+                cloud.commit_accumulated().unwrap();
+                let snapshot = cloud.committed_snapshot().unwrap();
+                eprintln!(
+                    "ONLINE_MAP backend={:?} capture={capture} static_points={} voxel_size={}",
+                    crate::dynamic_backend::backend(),
+                    snapshot.point_count,
+                    snapshot.voxel_size
+                );
             }
             cloud.cleanup_product_owned_file().unwrap();
         }
     }
-
     #[test]
     fn background_catchup_preserves_replay_cadence_maps_and_checkpoint() {
         let (scans, mut trajectory) = scale_input(31);

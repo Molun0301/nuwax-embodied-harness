@@ -171,6 +171,10 @@ struct PendingFineFrameRehome {
 pub struct CloudMapShmWriter {
     #[cfg(test)]
     last_stage_ms: [f64; 3],
+    #[cfg(test)]
+    last_revoke_stage_ms: [f64; 4],
+    #[cfg(test)]
+    last_dense_removed: usize,
     mmap: MmapMut,
     shm_path: std::path::PathBuf,
     shm_identity: Option<ProductOwnedMmapIdentity>,
@@ -430,6 +434,10 @@ impl CloudMapShmWriter {
             dynamic_filter: DynamicCloudFilter::default(),
             #[cfg(test)]
             last_stage_ms: [0.0; 3],
+            #[cfg(test)]
+            last_revoke_stage_ms: [0.0; 4],
+            #[cfg(test)]
+            last_dense_removed: 0,
             fine_cloud: None,
             committed_fine_cloud: None,
             fine_owner: None,
@@ -522,6 +530,46 @@ impl CloudMapShmWriter {
     /// 最近一帧三个阶段的耗时：精细点云（含地面捕获）、完整点云、动态清除与体素累加。
     #[cfg(test)]
     pub(crate) fn last_stage_ms(&self) -> [f64; 3] { self.last_stage_ms }
+
+    /// 分别记录精细撤销、完整撤销、完整追加和可见撤销，避免把地面捕获混入撤销耗时。
+    #[cfg(test)]
+    pub(crate) fn last_revoke_stage_ms(&self) -> [f64; 4] { self.last_revoke_stage_ms }
+
+    #[cfg(test)]
+    pub(crate) fn revocation_io_counts(&self) -> (usize, usize, usize, usize, usize) {
+        (
+            self.fine_cloud.as_ref().map_or(0, FineCloud::last_revoke_read_blocks),
+            self.dense_cloud.as_ref().map_or(0, DenseCloud::last_revoke_read_pages),
+            self.dense_cloud.as_ref().map_or(0, DenseCloud::last_revoke_candidate_points),
+            self.last_dense_removed,
+            self.dense_cloud.as_ref().map_or(0, DenseCloud::last_revoke_index_read_pages),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn revocation_index_memory_bytes(&self) -> (usize, usize, usize) {
+        (
+            self.dense_cloud.as_ref().map_or(0, DenseCloud::revoke_index_memory_bytes),
+            self.fine_cloud.as_ref().map_or(0, FineCloud::revoke_index_memory_bytes),
+            0,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn revocation_index_disk_bytes(&self) -> u64 {
+        self.dense_cloud.as_ref().map_or(0, DenseCloud::revoke_index_disk_bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn revocation_map_sizes(&self) -> (Option<usize>, u64, usize, usize) {
+        (
+            None,
+            self.dense_cloud.as_ref().map_or(0, DenseCloud::point_count),
+            self.voxels.len(),
+            self.fine_cloud.as_ref().and_then(FineCloud::shared_frame)
+                .map_or(0, crate::dynamic_backend::MappedFrame::free_cell_count),
+        )
+    }
     pub(crate) fn accumulate_mapping_replayed_scan(&mut self, session_generation: u64,
         points: &[Point3<f64>], sensor_origin_map: Option<[f64;3]>,
         source: &crate::admitted_cloud::AdmittedCloudSource,frame:Option<&crate::dynamic_backend::MappedFrame>) -> bool {
@@ -581,6 +629,8 @@ impl CloudMapShmWriter {
             }
         }
         #[cfg(test)]
+        { self.last_revoke_stage_ms = [0.0; 4]; self.last_dense_removed = 0; }
+        #[cfg(test)]
         let phase_started = std::time::Instant::now();
         match self.fine_cloud.as_mut().unwrap().accumulate_frame(points, sensor_origin_map, source_timestamp_ns, source) {
             Ok(true) => {},
@@ -588,7 +638,10 @@ impl CloudMapShmWriter {
             Err(error) => { warn!(%error, "精细导航源拒绝不完整输入"); return false; },
         }
         #[cfg(test)]
-        { self.last_stage_ms[0] = phase_started.elapsed().as_secs_f64() * 1000.0; }
+        {
+            self.last_stage_ms[0] = phase_started.elapsed().as_secs_f64() * 1000.0;
+            self.last_revoke_stage_ms[0] = self.fine_cloud.as_ref().unwrap().last_revoke_ms();
+        }
         #[cfg(test)]
         let phase_started = std::time::Instant::now();
         // 完整显示保留静态扫描原坐标和重复观测，同步撤销动态历史。
@@ -598,10 +651,24 @@ impl CloudMapShmWriter {
                 let fine = self.fine_cloud.as_ref().unwrap();
                 if self.dense_cloud.is_none() { self.dense_cloud = Some(DenseCloud::with_voxel_size(fine.voxel_size())?); }
                 let dense = self.dense_cloud.as_mut().unwrap();
-                if let Some(frame) = fine.shared_frame().filter(|f| f.is_dufo()) { dense.remove_free_frame(frame)?; }
-                else { dense.remove_voxels(fine.removed_keys(), fine.voxel_size())?; }
+                #[cfg(test)]
+                let revoke_started = std::time::Instant::now();
+                let removed = if let Some(frame) = fine.shared_frame().filter(|f| f.is_dufo()) { dense.remove_free_frame(frame)? }
+                else { dense.remove_voxels(fine.removed_keys(), fine.voxel_size())? };
+                #[cfg(test)]
+                {
+                    self.last_revoke_stage_ms[1] = revoke_started.elapsed().as_secs_f64() * 1000.0;
+                    self.last_dense_removed = removed;
+                }
+                #[cfg(not(test))]
+                let _ = removed;
+                #[cfg(test)]
+                let append_started = std::time::Instant::now();
                 let static_points = points.iter().filter(|point| !fine.is_dynamic(point)).copied().collect::<Vec<_>>();
-                dense.append(&static_points)
+                let result = dense.append(&static_points);
+                #[cfg(test)]
+                { self.last_revoke_stage_ms[2] = append_started.elapsed().as_secs_f64() * 1000.0; }
+                result
             })();
             if let Err(error) = result {
                 warn!(%error, "完整扫描归档失败，完整点云不可用");
@@ -616,8 +683,25 @@ impl CloudMapShmWriter {
         // Fine, dense and visible maps use the same admitted frame decision.
         // Raw realtime obstacle publication is separate and stays unfiltered.
         let fine=self.fine_cloud.as_ref().unwrap();
-        let removed:Vec<_>=self.voxels.iter().copied().filter(|&k|fine.clears(voxel_center_f64(k,self.voxel_size))).collect();
+        let candidates = if !crate::dynamic_backend::reference_revoke() {
+            match fine.shared_frame() {
+                Some(frame) => frame.candidate_grid_keys(f64::from(self.voxel_size),
+                    |key| self.voxels.contains(&key)),
+                // 缺少雷达原点等情况下没有自由证据，不必查询已有可见点。
+                None if crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::DufoMap =>
+                    Some(HashSet::new()),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let removed: Vec<_> = candidates.map(|keys| keys.into_iter()
+            .filter(|&key| fine.clears(voxel_center_f64(key, self.voxel_size))).collect())
+            .unwrap_or_else(|| self.voxels.iter().copied()
+                .filter(|&key| fine.clears(voxel_center_f64(key, self.voxel_size))).collect());
         for key in removed {self.voxels.remove(&key);self.ordered_voxels.removed(key,self.max_points);}
+        #[cfg(test)]
+        { self.last_revoke_stage_ms[3] = phase_started.elapsed().as_secs_f64() * 1000.0; }
         let hits: HashSet<_>=points.iter().filter(|p|!fine.is_dynamic(p)).filter_map(|p|voxel_key([p.x,p.y,p.z],self.voxel_size)).collect();
         if self.voxel_size != key_voxel_size {
             // 切换自适应粗化会话时保留原接纳/过滤语义，常规扫描复用已经验证的键。

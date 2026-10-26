@@ -46,6 +46,28 @@ pub(crate) fn online_params() -> Params {
     }
 }
 
+/// 仅测试程序可启用旧包围盒路径，生产构建不读取这个比较开关。
+pub(crate) fn reference_revoke() -> bool {
+    #[cfg(test)]
+    { std::env::var_os("NUWAX_G3_REVOKE_REFERENCE").is_some() }
+    #[cfg(not(test))]
+    { false }
+}
+
+#[cfg(test)]
+pub(crate) fn test_free_cells(
+    resolution: f64,
+    cells: impl IntoIterator<Item = ([i32; 3], u32)>,
+    map_from_evidence: Isometry3<f64>,
+) -> MappedFrame {
+    MappedFrame::Dufo(DufoFrame {
+        resolution,
+        evidence_from_map: map_from_evidence.inverse(),
+        free: cells.into_iter().map(|cell| (cell, ())).collect(),
+        dynamic_points: AHashSet::new(),
+    })
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OnlineDufo {
     map: Option<DufoMap>,
@@ -148,6 +170,69 @@ impl MappedFrame {
         }
         Some((low, high))
     }
+
+    /// 每个新增空单元各自产生候选范围，不合并跨越无关地图的空隙。
+    pub(crate) fn clear_regions(
+        &self,
+    ) -> Option<impl Iterator<Item = ([f64; 3], [f64; 3])> + '_> {
+        let Self::Dufo(frame) = self else { return None; };
+        let transform = frame.evidence_from_map.inverse();
+        Some(frame.free.keys().map(move |&(key, depth)| {
+            let step = f64::from(1u32 << depth) * frame.resolution;
+            let evidence_low = key.map(|v| f64::from(v) * frame.resolution);
+            let evidence_high = evidence_low.map(|v| v + step);
+            // clears先把证据坐标降为f32；范围覆盖该舍入的原像，避免细分范围遗漏边界原点。
+            let pad: [f64; 3] = std::array::from_fn(|axis| {
+                evidence_low[axis].abs().max(evidence_high[axis].abs())
+                    * f64::from(f32::EPSILON) + 1e-6
+            });
+            let mut low = [f64::INFINITY; 3];
+            let mut high = [f64::NEG_INFINITY; 3];
+            for corner in 0..8 {
+                let point = transform * Point3::from(std::array::from_fn::<_, 3, _>(|axis| {
+                    if corner & (1 << axis) == 0 { evidence_low[axis] - pad[axis] }
+                    else { evidence_high[axis] + pad[axis] }
+                }));
+                for axis in 0..3 {
+                    low[axis] = low[axis].min(point[axis]);
+                    high[axis] = high[axis].max(point[axis]);
+                }
+            }
+            (low, high)
+        }))
+    }
+
+    /// 有规则格键的表示可直接枚举相交键，查询次数只取决于新增空单元。
+    pub(crate) fn candidate_grid_keys(
+        &self,
+        size: f64,
+        mut present: impl FnMut((i32, i32, i32)) -> bool,
+    ) -> Option<AHashSet<(i32, i32, i32)>> {
+        let regions = self.clear_regions()?;
+        let mut candidates = AHashSet::new();
+        for (low, high) in regions {
+            let low = low.map(|v| (v / size).floor());
+            let high = high.map(|v| (v / size).floor());
+            if (0..3).any(|axis| high[axis] < f64::from(i32::MIN)
+                || low[axis] > f64::from(i32::MAX)) { continue; }
+            let low = low.map(|v| v.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32);
+            let high = high.map(|v| v.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32);
+            for x in low[0]..=high[0] {
+                for y in low[1]..=high[1] {
+                    for z in low[2]..=high[2] {
+                        let key = (x, y, z);
+                        if !candidates.contains(&key) && present(key) { candidates.insert(key); }
+                    }
+                }
+            }
+        }
+        Some(candidates)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn free_cell_count(&self) -> usize {
+        match self { Self::Dufo(frame) => frame.free.len(), Self::Legacy(_) => 0 }
+    }
     pub(crate) fn unfiltered() -> Self {
         Self::Dufo(DufoFrame {
             resolution: online_params().resolution,
@@ -210,6 +295,19 @@ impl MappedFrame {
         }
     }
     pub(crate) fn potential_window_clear_cells(
+        &self,
+        cells: &AHashMap<crate::dynamic_scene::Cell, u32>,
+    ) -> Option<AHashSet<crate::dynamic_scene::Cell>> {
+        #[cfg(test)]
+        if reference_revoke() { return self.potential_window_clear_cells_reference(cells); }
+        match self {
+            Self::Legacy(frame) => frame.potential_window_clear_cells(cells),
+            Self::Dufo(_) => self.candidate_grid_keys(crate::dynamic_scene::CELL_SIZE,
+                |key| cells.contains_key(&key)),
+        }
+    }
+    #[cfg(test)]
+    fn potential_window_clear_cells_reference(
         &self,
         cells: &AHashMap<crate::dynamic_scene::Cell, u32>,
     ) -> Option<AHashSet<crate::dynamic_scene::Cell>> {
@@ -339,6 +437,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sparse_clear_regions_probe_only_local_grid_keys_on_large_maps() {
+        let frame = test_free_cells(0.15, [([0, 0, 0], 0), ([6000, 0, 0], 0)], Isometry3::identity());
+        let expected: AHashSet<_> = [(1, 1, 1), (18001, 1, 1)].into_iter().collect();
+        let mut small_queries = 0;
+        let small = frame.candidate_grid_keys(0.05, |key| {
+            small_queries += 1;
+            expected.contains(&key)
+        }).unwrap();
+        let mut large = expected.clone();
+        large.extend((0..100_000).map(|i| (1_000_000 + i, 17, 19)));
+        let mut large_queries = 0;
+        let actual = frame.candidate_grid_keys(0.05, |key| {
+            large_queries += 1;
+            large.contains(&key)
+        }).unwrap();
+        assert_eq!(small, expected);
+        assert_eq!(actual, expected);
+        assert_eq!(small_queries, large_queries, "远处历史体素不能增加候选格查询次数");
+        assert!(small_queries < 400, "两端空单元之间的900米不应被枚举");
+        let empty = test_free_cells(0.15, [], Isometry3::identity());
+        assert!(empty.candidate_grid_keys(0.05, |_| panic!("无新增空单元不应查询地图")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn transformed_regions_cover_the_f32_rounding_preimage_at_negative_coordinates() {
+        let transform = Isometry3::from_parts(nalgebra::Translation3::new(-1.7, 21.3, 0.4),
+            nalgebra::UnitQuaternion::from_euler_angles(0.04, -0.07, 0.7));
+        let frame = test_free_cells(0.15, [([-500_000, 100_000, -20], 0)], transform);
+        // 这个双精度证据坐标略低于单元面，但f32舍入后实际落在本次新增空单元内。
+        let point = transform * Point3::new(-75_000.001, 15_000.075, -2.925);
+        let xyz = [point.x, point.y, point.z];
+        assert!(frame.clears(xyz));
+        let key = crate::dynamic_scene::cell(xyz).unwrap();
+        let candidates = frame.candidate_grid_keys(crate::dynamic_scene::CELL_SIZE, |candidate| candidate == key).unwrap();
+        assert!(candidates.contains(&key), "空间定位必须覆盖精确clears接受的舍入原像");
+        assert!(frame.clear_regions().unwrap().any(|(low, high)|
+            (0..3).all(|axis| xyz[axis] >= low[axis] && xyz[axis] <= high[axis])));
+    }
+
+    #[test]
     fn corrected_frame_and_sidecar_keep_exact_static_points_and_free_cell_centers() {
         use crate::dynamic_scene::tests::{corridor, ORIGIN};
         let transform = Isometry3::from_parts(nalgebra::Translation3::new(-12.31, 2.13, 0.17),
@@ -356,15 +494,18 @@ mod tests {
                 assert_eq!(decoded.is_dynamic([p.x,p.y,p.z]), !keep.contains(&(i as u32)));
             }
             let MappedFrame::Dufo(dufo) = &frame else { unreachable!() };
+            let mut cells = AHashMap::new();
             for &(key, depth) in dufo.free.keys() {
                 let center = transform * Point3::from(key.map(|v| (v as f64 + (1u32 << depth) as f64 * 0.5) * dufo.resolution));
                 let p = [center.x, center.y, center.z];
                 assert!(frame.clears(p) && decoded.clears(p), "校正及跨进程编码必须保留历史空单元身份");
                 let cell = crate::dynamic_scene::cell(p).unwrap();
-                let cells = [(cell, 1)].into_iter().collect();
-                assert!(decoded.potential_window_clear_cells(&cells).unwrap().contains(&cell));
+                cells.insert(cell, 1);
                 checked += 1;
             }
+            // 按生产入口每帧查询一次，仍逐一检查全部原空单元，避免把空间查询重复为平方级。
+            let candidates = decoded.potential_window_clear_cells(&cells).unwrap();
+            for cell in cells.keys() { assert!(candidates.contains(cell)); }
         }
         assert!(checked > 0, "用真实新增空体素检验校正坐标，不能空集合通过");
     }

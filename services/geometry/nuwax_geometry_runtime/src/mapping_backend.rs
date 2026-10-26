@@ -2448,11 +2448,26 @@ fn compute_candidate_with_parallelism(
                         )
                     })
                     .collect();
-                ray.map.voxels.retain(|key, _| {
-                    hits.contains(key)
-                        || !{let p=[(key.0 as f64+0.5)*size,(key.1 as f64+0.5)*size,(key.2 as f64+0.5)*size];
-                            input.dynamic_frame.as_ref().map_or_else(||ray.dynamic_scene.clears(p),|f|f.clears(p))}
-                });
+                let candidates = (!crate::dynamic_backend::reference_revoke())
+                    .then(|| input.dynamic_frame.as_ref().and_then(|frame|
+                        frame.candidate_grid_keys(size, |key|
+                            !hits.contains(&key) && ray.map.voxels.contains_key(&key))))
+                    .flatten();
+                if let Some(candidates) = candidates {
+                    let frame = input.dynamic_frame.as_ref().unwrap();
+                    for key in candidates {
+                        let point = [(key.0 as f64 + 0.5) * size,
+                            (key.1 as f64 + 0.5) * size, (key.2 as f64 + 0.5) * size];
+                        if frame.clears(point) { ray.map.voxels.remove(&key); }
+                    }
+                } else {
+                    // legacy与测试参考路径保留原来的整表复核和本帧命中保护。
+                    ray.map.voxels.retain(|key, _| {
+                        hits.contains(key)
+                            || !{let p=[(key.0 as f64+0.5)*size,(key.1 as f64+0.5)*size,(key.2 as f64+0.5)*size];
+                                input.dynamic_frame.as_ref().map_or_else(||ray.dynamic_scene.clears(p),|f|f.clears(p))}
+                    });
+                }
             }
             #[cfg(test)]
             if diagnostic {

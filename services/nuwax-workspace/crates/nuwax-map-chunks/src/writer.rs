@@ -654,6 +654,51 @@ impl Writer {
         retained.extend(roots.iter().flat_map(|r| r.root.blocks.iter().map(|b| b.object)));
         self.repository.collect_objects(&retained)
     }
+    /// 按区域的块坐标直接查找现有非空块，并入调用方的帧内去重集合。
+    /// 返回实际执行的块坐标查找次数；不沿地图目录或某个坐标轴的整片目录遍历。
+    /// 脏块覆盖已落盘块，包括已删除但尚未刷写的空脏块。
+    pub fn collect_intersecting_blocks(&self, min: Key, max: Key, selected: &mut BTreeSet<Key>)
+        -> Result<usize, String> {
+        if (0..3).any(|i| min[i] > max[i]) { return Err("reversed region".into()); }
+        let low = block_key(min);
+        let high = block_key(max);
+        let mut lookups = 0;
+        for x in low[0]..=high[0] {
+            for y in low[1]..=high[1] {
+                for z in low[2]..=high[2] {
+                    let key = [x, y, z];
+                    lookups += 1;
+                    let present = self.dirty.get(&key).map_or_else(
+                        || self.blocks.contains_key(&key), |dirty| !dirty.block.is_empty());
+                    if present { selected.insert(key); }
+                }
+            }
+        }
+        Ok(lookups)
+    }
+    /// 每个已选块只访问一次，在块内精确筛选实际存在的体素。
+    /// 返回命中的全局体素键和实际访问的块数（脏块及读缓存命中也计一次）。
+    /// 不设整图点数预算，也不物化未命中的体素；调用方在局部判定后沿原删除入口处理。
+    pub fn matching_keys_in_blocks(&mut self, selected: &BTreeSet<Key>, mut matches: impl FnMut(Key) -> bool)
+        -> Result<(Vec<Key>, usize), String> {
+        let mut out = Vec::new();
+        let mut read_blocks = 0;
+        for &key in selected {
+            let persisted: Arc<Block>;
+            let block = if let Some(dirty) = self.dirty.get(&key) {
+                dirty.block.as_ref()
+            } else if let Some(reference) = self.blocks.get(&key) {
+                persisted = self.reader.block(reference)?;
+                persisted.as_ref()
+            } else { continue; };
+            read_blocks += 1;
+            for &local in block.keys() {
+                let global = global_key(key, local)?;
+                if matches(global) { out.push(global); }
+            }
+        }
+        Ok((out, read_blocks))
+    }
     pub fn region(&mut self, min: Key, max: Key, point_budget: usize) -> Result<Vec<(Key, Evidence)>, String> {
         if (0..3).any(|i| min[i] > max[i]) { return Err("reversed region".into()); }
         let low = block_key(min); let high = block_key(max);

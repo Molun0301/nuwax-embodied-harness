@@ -3,7 +3,7 @@ use super::{dynamic_cloud::DynamicCloudFilter, voxel_index::VoxelIndex, voxel_ke
 use ahash::AHashSet;
 use nalgebra::Point3;
 use nuwax_map_chunks::{CachePolicy, Repository, SealedMap, Writer};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, OnceLock, Weak};
 #[cfg(test)]
 #[path = "ground_observations.rs"]
@@ -69,6 +69,12 @@ pub(super) struct FineCloud {
     latest_unclassified_scan: Option<crate::lio_ingress::AdmittedRegisteredScan>,
     latest_ground_source: Option<crate::lio_ingress::WeakAdmittedRegisteredScan>,
     latest_ground_indices: Arc<[u32]>,
+    #[cfg(test)]
+    last_revoke_read_blocks: usize,
+    #[cfg(test)]
+    last_revoke_block_lookups: usize,
+    #[cfg(test)]
+    last_revoke_ms: f64,
 }
 /// 在线、私有重放和离线清理共享进程启动时已解析的写入器预算。
 pub(crate) fn configured_writer_cache() -> (usize, CachePolicy) {
@@ -93,12 +99,24 @@ impl FineCloud {
         let mut writer = Writer::new(Repository::temporary()?, size, budget)?;
         writer.set_cache_policy(policy)?;
         Ok(Self { writer,
-            dynamic: DynamicCloudFilter::default(), failure: None, readers: FineCloudReaders::default(), commits: 0, baseline: None, latest_unclassified_scan: None, latest_ground_source: None, latest_ground_indices: Arc::from([]) })
+            dynamic: DynamicCloudFilter::default(), failure: None, readers: FineCloudReaders::default(), commits: 0, baseline: None, latest_unclassified_scan: None, latest_ground_source: None, latest_ground_indices: Arc::from([]),
+            #[cfg(test)] last_revoke_read_blocks: 0,
+            #[cfg(test)] last_revoke_block_lookups: 0,
+            #[cfg(test)] last_revoke_ms: 0.0 })
     }
     pub(super) fn fresh() -> Result<Self, String> { Self::new(VOXEL_SIZE) }
     pub(super) fn removed_keys(&self) -> &[(i32, i32, i32)] { self.dynamic.removed_keys() }
     pub(super) fn shared_frame(&self) -> Option<&crate::dynamic_backend::MappedFrame> { self.dynamic.shared_frame() }
     pub(super) fn clears(&self, point:[f64;3])->bool {self.dynamic.clears(point)}
+    /// 复用原写入器块目录，没有新增常驻撤销索引。
+    #[cfg(test)]
+    pub(super) fn revoke_index_memory_bytes(&self) -> usize { 0 }
+    #[cfg(test)]
+    pub(super) fn last_revoke_read_blocks(&self) -> usize { self.last_revoke_read_blocks }
+    #[cfg(test)]
+    pub(super) fn last_revoke_block_lookups(&self) -> usize { self.last_revoke_block_lookups }
+    #[cfg(test)]
+    pub(super) fn last_revoke_ms(&self) -> f64 { self.last_revoke_ms }
     pub(super) fn voxel_size(&self) -> f32 { self.writer.voxel_size_m() }
     pub(super) fn is_dynamic(&self, point: &Point3<f64>) -> bool {
         self.dynamic.is_dynamic([point.x, point.y, point.z])
@@ -192,30 +210,59 @@ impl FineCloud {
     }
     fn accumulate_inner(&mut self, points: &[Point3<f64>], origin: Option<[f64; 3]>, timestamp_ns: u64,mut shared:Option<crate::dynamic_backend::MappedFrame>) -> Result<Vec<nuwax_map_chunks::Key>, String> {
         self.dynamic.clear_frame();
+        #[cfg(test)] { self.last_revoke_read_blocks = 0; self.last_revoke_block_lookups = 0; self.last_revoke_ms = 0.0; }
         let size = self.writer.voxel_size_m();
         let keys = points.iter().map(|p| voxel_key([p.x, p.y, p.z], size)
             .map(|k| [k.0,k.1,k.2]).ok_or("精细输入坐标无效"))
             .collect::<Result<Vec<_>, _>>()?;
         let hits: AHashSet<_> = keys.iter().map(|k| (k[0],k[1],k[2])).collect();
-        if shared.is_none() && timestamp_ns > 0 && crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::DufoMap {
+        // 零时间种子也先取得DUFO分类；observe内部不插入，其空增量应绕过旧窗口查询。
+        if shared.is_none() && crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::DufoMap {
             if let Some(origin) = origin { shared = Some(self.dynamic.observe_dufo(points, origin, timestamp_ns)?); }
         }
+        #[cfg(test)]
+        let revoke_started = std::time::Instant::now();
         if shared.as_ref().is_some_and(|f| f.is_dufo() && !f.has_clears()) {
             self.dynamic.adopt(shared.take().unwrap(), &mut VoxelIndex::default(), size);
         } else if let Some(origin) = origin {
-            let (low, high) = shared.as_ref().filter(|f| f.is_dufo()).and_then(|f| f.clear_bounds())
-                .unwrap_or((origin.map(|v| v - 30.0 - f64::from(size)), origin.map(|v| v + 30.0 + f64::from(size))));
-            let low = voxel_key(low, size).ok_or("精细动态窗口越界")?;
-            let high = voxel_key(high, size).ok_or("精细动态窗口越界")?;
-            let local = self.writer.region([low.0, low.1, low.2], [high.0, high.1, high.2], 2_000_000)?;
-            let mut voxels: VoxelIndex = local.into_iter().map(|(key, _)| (key[0], key[1], key[2])).collect();
-            if let Some(shared)=shared {self.dynamic.adopt(shared,&mut voxels,size);}
-            else {
-                let ground = self.measured_ground_indices(points)?;
-                self.dynamic.observe_with_ground(&mut voxels,size,origin,timestamp_ns,points,&ground);
+            #[cfg(test)]
+            let reference = crate::dynamic_backend::reference_revoke();
+            #[cfg(not(test))]
+            let reference = false;
+            if let Some(frame) = shared.as_ref().filter(|frame| frame.is_dufo() && !reference) {
+                let mut blocks = BTreeSet::new();
+                for (low, high) in frame.clear_regions().expect("DUFO帧必须提供新增空单元迭代器") {
+                    let low = voxel_key(low, size).ok_or("精细动态窗口越界")?;
+                    let high = voxel_key(high, size).ok_or("精细动态窗口越界")?;
+                    let lookups = self.writer.collect_intersecting_blocks(
+                        [low.0, low.1, low.2], [high.0, high.1, high.2], &mut blocks)?;
+                    #[cfg(test)] { self.last_revoke_block_lookups += lookups; }
+                    #[cfg(not(test))] let _ = lookups;
+                }
+                let (removed, read_blocks) = self.writer.matching_keys_in_blocks(&blocks, |key|
+                    frame.clears(super::voxel_center_f64((key[0], key[1], key[2]), size)))?;
+                #[cfg(test)] { self.last_revoke_read_blocks = read_blocks; }
+                #[cfg(not(test))] let _ = read_blocks;
+                let mut voxels = removed.into_iter().map(|key| (key[0], key[1], key[2])).collect();
+                // 仍由原过滤器复核并生成撤销增量，后续地面关联与提交语义不变。
+                self.dynamic.adopt(shared.take().unwrap(), &mut voxels, size);
+                self.writer.remove(self.dynamic.removed_keys().iter().map(|key| [key.0, key.1, key.2]))?;
+            } else {
+                let (low, high) = shared.as_ref().filter(|f| f.is_dufo()).and_then(|f| f.clear_bounds())
+                    .unwrap_or((origin.map(|v| v - 30.0 - f64::from(size)), origin.map(|v| v + 30.0 + f64::from(size))));
+                let low = voxel_key(low, size).ok_or("精细动态窗口越界")?;
+                let high = voxel_key(high, size).ok_or("精细动态窗口越界")?;
+                let local = self.writer.region([low.0, low.1, low.2], [high.0, high.1, high.2], 2_000_000)?;
+                let mut voxels: VoxelIndex = local.into_iter().map(|(key, _)| (key[0], key[1], key[2])).collect();
+                if let Some(shared)=shared {self.dynamic.adopt(shared,&mut voxels,size);}
+                else {
+                    let ground = self.measured_ground_indices(points)?;
+                    self.dynamic.observe_with_ground(&mut voxels,size,origin,timestamp_ns,points,&ground);
+                }
+                self.writer.remove(self.dynamic.removed_keys().iter().map(|key| [key.0, key.1, key.2]))?;
             }
-            self.writer.remove(self.dynamic.removed_keys().iter().map(|key| [key.0, key.1, key.2]))?;
         }
+        #[cfg(test)] { self.last_revoke_ms = revoke_started.elapsed().as_secs_f64() * 1000.0; }
         if timestamp_ns == 0 {
             self.writer.seed_unknown(hits.into_iter().map(|key| [key.0, key.1, key.2]))?;
         } else {
@@ -360,6 +407,115 @@ mod revision_tests {
         drop(first);
         drop(pinned);
         assert!(readers.pin_root(&identity, &reference).is_err());
+    }
+}
+
+#[cfg(test)]
+mod revoke_locality_tests {
+    use super::*;
+    use nuwax_map_chunks::{block_key, Key, RegionReader};
+
+    fn domain() -> nuwax_map_chunks::Domain {
+        nuwax_map_chunks::Domain { session: "fine-revoke-locality".into(), generation: 1,
+            frame_generation: 1, producer_generation: 1 }
+    }
+
+    #[test]
+    fn scattered_free_cells_revoke_over_two_million_voxels_by_two_blocks() {
+        let _backend = crate::dynamic_backend::test_backend(crate::dynamic_backend::Backend::DufoMap);
+        let mut fine = FineCloud::fresh().unwrap();
+        let side = 128;
+        let count = (side * side * side) as usize;
+        assert!(count > 2_000_000);
+        fine.writer.seed_unknown((0..side).flat_map(|x|
+            (0..side).flat_map(move |y| (0..side).map(move |z| [x, y, z])))).unwrap();
+        let old = fine.seal(domain(), 1, 1).unwrap();
+        assert_eq!(old.manifest().blocks.iter().map(|block| block.points as usize).sum::<usize>(), count);
+        let frame = crate::dynamic_backend::test_free_cells(0.15,
+            [([0; 3], 0), ([42; 3], 0)], nalgebra::Isometry3::identity());
+        let (low, high) = frame.clear_bounds().unwrap();
+        let low = voxel_key(low, fine.voxel_size()).unwrap();
+        let high = voxel_key(high, fine.voxel_size()).unwrap();
+        assert_eq!(fine.writer.region([low.0, low.1, low.2], [high.0, high.1, high.2], 2_000_000),
+            Err("region exceeds point budget".into()), "同一真实大图必须触发原整体查询故障");
+
+        // 有原点的零时间种子只查询当前分类；不能读取整图，也不能重记已有命中。
+        let observed_key = [64; 3];
+        let unknown_key = [65; 3];
+        fine.writer.observe([observed_key], 1).unwrap();
+        let seed_points = [observed_key, unknown_key].map(|key|
+            Point3::from(super::super::voxel_center_f64((key[0], key[1], key[2]), fine.voxel_size())));
+        fine.accumulate_inner(&seed_points, Some([0.0; 3]), 0, None).unwrap();
+        assert_eq!(fine.last_revoke_read_blocks(), 0);
+        assert_eq!(fine.last_revoke_block_lookups(), 0);
+        assert!(fine.removed_keys().is_empty());
+        assert!(fine.shared_frame().is_some_and(|frame| frame.is_dufo() && !frame.has_clears()));
+        assert!(seed_points.iter().all(|point| !fine.is_dynamic(point)));
+        assert_eq!(fine.writer.region(observed_key, observed_key, 1).unwrap()[0].1,
+            nuwax_map_chunks::Evidence { observed_ns: 1, hits: 1 });
+        assert_eq!(fine.writer.region(unknown_key, unknown_key, 1).unwrap()[0].1,
+            nuwax_map_chunks::Evidence { observed_ns: 0, hits: 0 });
+
+        fine.accumulate_inner(&[], Some([0.0; 3]), 2, Some(frame)).unwrap();
+        assert_eq!(fine.last_revoke_read_blocks(), 2, "中间62个精细块不属于新增free范围");
+        assert_eq!(fine.last_revoke_block_lookups(), 16);
+        assert_eq!(fine.removed_keys().len(), 35);
+        assert_eq!(fine.revoke_index_memory_bytes(), 0);
+        let new = fine.seal(domain(), 2, 2).unwrap();
+        assert_eq!(new.manifest().blocks.iter().map(|block| block.points as usize).sum::<usize>(), count - 35);
+        let mut reader = RegionReader::new(old.repository.clone(), 4 * MIB);
+        assert_eq!(reader.region(old.manifest(), [0; 3], [2; 3], 27).unwrap().len(), 27,
+            "已发布旧读者仍能读取撤销前的全部点");
+        assert!(reader.region(new.manifest(), [0; 3], [2; 3], 27).unwrap().is_empty());
+        println!("FINE_REVOKE_LOCALITY voxels={count} blocks=64 read_blocks=2 block_lookups=16 removed=35 persistent_index_bytes=0");
+    }
+
+    #[test]
+    fn rotated_negative_free_cells_match_full_scan_and_read_only_intersections() {
+        let transform = nalgebra::Isometry3::from_parts(nalgebra::Translation3::new(-1.7, 2.4, -0.03),
+            nalgebra::UnitQuaternion::from_euler_angles(0.11, -0.09, 0.37));
+        let frame = crate::dynamic_backend::test_free_cells(0.15,
+            [([-2, 0, -1], 0), ([12, -8, 4], 1)], transform);
+        let mut fine = FineCloud::fresh().unwrap();
+        let size = fine.voxel_size();
+        let regions: Vec<_> = frame.clear_regions().unwrap().map(|(low, high)| {
+            let low = voxel_key(low, size).unwrap();
+            let high = voxel_key(high, size).unwrap();
+            ([low.0, low.1, low.2], [high.0, high.1, high.2])
+        }).collect();
+        let mut keys = BTreeSet::new();
+        for &(low, high) in &regions {
+            for x in low[0] - 1..=high[0] + 1 {
+                for y in low[1] - 1..=high[1] + 1 {
+                    for z in low[2] - 1..=high[2] + 1 { keys.insert([x, y, z]); }
+                }
+            }
+        }
+        let first_x = keys.first().unwrap()[0];
+        keys.extend((1000..4000).map(|y| [first_x, y, 0]));
+        let expected_removed: BTreeSet<_> = keys.iter().copied().filter(|key|
+            frame.clears(super::super::voxel_center_f64((key[0], key[1], key[2]), size))).collect();
+        assert!(!expected_removed.is_empty());
+        let existing_blocks: BTreeSet<_> = keys.iter().copied().map(block_key).collect();
+        // 独立遍历夹具的完整块集合，按块的闭区间相交关系确定应访问集合。
+        let expected_blocks: BTreeSet<_> = existing_blocks.iter().copied().filter(|block|
+            regions.iter().any(|(low, high)| (0..3).all(|axis|
+                block[axis] * 32 <= high[axis] && block[axis] * 32 + 31 >= low[axis]))).collect();
+        fine.writer.seed_unknown(keys.iter().copied()).unwrap();
+        fine.writer.flush().unwrap();
+        fine.accumulate_inner(&[], Some([0.0; 3]), 1, Some(frame)).unwrap();
+        assert_eq!(fine.last_revoke_read_blocks(), expected_blocks.len());
+        assert!(fine.last_revoke_read_blocks() < existing_blocks.len());
+        assert_eq!(fine.removed_keys().iter().map(|key| [key.0, key.1, key.2]).collect::<BTreeSet<_>>(), expected_removed);
+        let actual: BTreeSet<Key> = fine.writer.region([i32::MIN; 3], [i32::MAX; 3], keys.len()).unwrap()
+            .into_iter().map(|(key, _)| key).collect();
+        assert_eq!(actual, keys.difference(&expected_removed).copied().collect());
+        println!("FINE_REVOKE_ROTATED blocks={} read_blocks={} block_lookups={} removed={}", existing_blocks.len(),
+            fine.last_revoke_read_blocks(), fine.last_revoke_block_lookups(), expected_removed.len());
+        fine.accumulate_inner(&[], Some([0.0; 3]), 2,
+            Some(crate::dynamic_backend::MappedFrame::unfiltered())).unwrap();
+        assert_eq!(fine.last_revoke_read_blocks(), 0);
+        assert_eq!(fine.last_revoke_block_lookups(), 0);
     }
 }
 

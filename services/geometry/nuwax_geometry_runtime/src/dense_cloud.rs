@@ -1,4 +1,13 @@
 //! 已接纳扫描的原坐标归档；不可变可见性快照同步撤销已证实动态的历史点。
+#[path = "dense_cloud/page_table.rs"]
+mod page_table;
+#[path = "dense_cloud/spatial_index.rs"]
+mod spatial_index;
+#[cfg(test)]
+#[path = "dense_cloud/revoke_tests.rs"]
+mod revoke_tests;
+use page_table::PageTable;
+use spatial_index::SpatialIndex;
 use crate::mapping_commit::CloudCommitReceipt;
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use nalgebra::Point3;
@@ -71,11 +80,12 @@ fn decode_point(bytes: &[u8]) -> [f32; 3] {
 pub(crate) struct DenseCloud {
     file: Arc<File>,
     keys_file: File,
+    spatial_index: Option<SpatialIndex>,
     voxel_size: f32,
     epoch: String,
     point_count: u64,
     stored_count: u64,
-    pages: Arc<Vec<Arc<Page>>>,
+    pages: Arc<PageTable>,
     block_pages: Option<HashMap<Key, HashSet<usize>>>,
     block_entries: usize,
     live_keys: Option<HashSet<Key>>,
@@ -94,8 +104,7 @@ pub(crate) struct DenseCloudReaders(Arc<parking_lot::Mutex<std::collections::Vec
 #[derive(Clone)]
 pub(crate) struct DenseSnapshot {
     file: Arc<File>,
-    pages: Arc<Vec<Arc<Page>>>,
-    page_ends: Arc<Vec<u64>>,
+    pages: Arc<PageTable>,
     pub epoch: String,
     pub point_count: u64,
     pub bounds_min: [f32; 3],
@@ -144,11 +153,14 @@ impl DenseCloud {
         Ok(Self {
             file: Arc::new(temporary_file()?),
             keys_file: temporary_file()?,
+            spatial_index: if crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::DufoMap {
+                Some(SpatialIndex::new()?)
+            } else { None },
             voxel_size,
             epoch: uuid::Uuid::new_v4().simple().to_string(),
             point_count: 0,
             stored_count: 0,
-            pages: Arc::new(Vec::new()),
+            pages: Arc::new(PageTable::default()),
             block_pages: Some(HashMap::new()),
             block_entries: 0,
             live_keys: Some(HashSet::new()),
@@ -196,8 +208,9 @@ impl DenseCloud {
         self.keys_file
             .write_all_at(&keys, self.stored_count * 12)
             .map_err(|e| e.to_string())?;
+        if let Some(index) = &mut self.spatial_index { index.append(&bytes, self.stored_count)?; }
         let pages = Arc::make_mut(&mut self.pages);
-        // 每页只执行一次写时复制；旧快照仍持有追加前的可见性。
+        // 每页只复制固定页表路径；旧快照仍持有追加前的可见性。
         let mut index = 0;
         while index < points.len() {
             let position = self.stored_count as usize + index;
@@ -208,7 +221,7 @@ impl DenseCloud {
                     self.filters.push(Box::new([0; FILTER_WORDS]));
                 }
             }
-            let page = Arc::make_mut(&mut pages[page_index]);
+            let mut page = (**pages.get(page_index).unwrap()).clone();
             let end = points.len().min(index + PAGE_POINTS - position % PAGE_POINTS);
             for index in index..end {
                 let local = (self.stored_count as usize + index) % PAGE_POINTS;
@@ -244,6 +257,7 @@ impl DenseCloud {
                     if live.len() > MAX_INDEX_ENTRIES { self.live_keys = None; }
                 }
             }
+            pages.set(page_index, Arc::new(page));
             index = end;
         }
         self.point_count += points.len() as u64;
@@ -352,7 +366,7 @@ impl DenseCloud {
         if count > 0 {
             let pages = Arc::make_mut(&mut self.pages);
             for (index, page, filter) in changes {
-                pages[index] = page;
+                pages.set(index, page);
                 if let Some(filter) = filter { self.filters[index] = filter; }
             }
             self.point_count -= count as u64;
@@ -370,8 +384,62 @@ impl DenseCloud {
         Ok(count)
     }
 
-    /// 仅复核新增空证据包围盒相交的历史页，逐个原坐标判定，保留同一细体素中的静态点。
+    /// 按新增空单元定位磁盘索引，只修改相关页及固定三层页表路径。
     pub(crate) fn remove_free_frame(&mut self, frame: &crate::dynamic_backend::MappedFrame) -> Result<usize, String> {
+        #[cfg(test)]
+        if crate::dynamic_backend::reference_revoke() { return self.remove_free_frame_reference(frame); }
+        let Some(regions) = frame.clear_regions() else { return Ok(0); };
+        let mut regions = regions.peekable();
+        if regions.peek().is_none() {
+            if let Some(index) = &mut self.spatial_index {
+                index.last_read_pages = 0;
+                index.last_candidate_points = 0;
+                index.last_index_read_pages = 0;
+            }
+            return Ok(0);
+        }
+        let index = self.spatial_index.as_mut().ok_or("完整点云缺少当前后端的空间索引")?;
+        let changes = index.remove(regions, frame, &self.pages, &self.file)?;
+        let count = changes.iter().map(|(index, page)| (self.pages[*index].count - page.count) as usize).sum::<usize>();
+        if count > 0 {
+            let pages = Arc::make_mut(&mut self.pages);
+            for (index, page) in changes { pages.set(index, page); }
+            self.point_count -= count as u64;
+            (self.bounds_min, self.bounds_max) = pages.bounds();
+            self.epoch = uuid::Uuid::new_v4().simple().to_string();
+        }
+        Ok(count)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn revoke_index_memory_bytes(&self) -> usize {
+        self.spatial_index.as_ref().map_or(0, SpatialIndex::memory_bytes) + self.pages.memory_bytes()
+    }
+    #[cfg(test)]
+    pub(crate) fn last_revoke_read_pages(&self) -> usize {
+        self.spatial_index.as_ref().map_or(0, |index| index.last_read_pages)
+    }
+    #[cfg(test)]
+    pub(crate) fn last_revoke_candidate_points(&self) -> usize {
+        self.spatial_index.as_ref().map_or(0, |index| index.last_candidate_points)
+    }
+    #[cfg(test)]
+    pub(crate) fn revoke_index_disk_bytes(&self) -> u64 {
+        self.spatial_index.as_ref().map_or(0, SpatialIndex::disk_bytes)
+    }
+    #[cfg(test)]
+    pub(crate) fn last_revoke_index_read_pages(&self) -> usize {
+        self.spatial_index.as_ref().map_or(0, |index| index.last_index_read_pages)
+    }
+    #[cfg(test)]
+    pub(crate) fn revoke_index_memory_limit_bytes() -> usize {
+        SpatialIndex::maximum_memory_bytes() + PageTable::maximum_memory_bytes()
+    }
+    pub(crate) fn point_count(&self) -> u64 { self.point_count }
+
+    /// 测试参考保留原包围盒遍历，使用同一持久页表以维持快照语义。
+    #[cfg(test)]
+    fn remove_free_frame_reference(&mut self, frame: &crate::dynamic_backend::MappedFrame) -> Result<usize, String> {
         let Some((low, high)) = frame.clear_bounds() else { return Ok(0); };
         let mut changes = Vec::new();
         let mut count = 0;
@@ -396,7 +464,7 @@ impl DenseCloud {
         }
         if count > 0 {
             let pages = Arc::make_mut(&mut self.pages);
-            for (index, page) in changes { pages[index] = page; }
+            for (index, page) in changes { pages.set(index, page); }
             self.point_count -= count as u64;
             self.bounds_min = [f32::INFINITY; 3];
             self.bounds_max = [f32::NEG_INFINITY; 3];
@@ -417,15 +485,6 @@ impl DenseCloud {
         (self.point_count > 0).then(|| DenseSnapshot {
             file: Arc::clone(&self.file),
             pages: Arc::clone(&self.pages),
-            page_ends: Arc::new(
-                self.pages
-                    .iter()
-                    .scan(0_u64, |sum, page| {
-                        *sum += page.count;
-                        Some(*sum)
-                    })
-                    .collect(),
-            ),
             epoch: self.epoch.clone(),
             point_count: self.point_count,
             bounds_min: self.bounds_min,
@@ -543,13 +602,7 @@ impl DenseSnapshot {
         if count == 0 {
             return Ok(output);
         }
-        let start = self.page_ends.partition_point(|end| *end <= offset);
-        let mut skip = offset
-            - if start == 0 {
-                0
-            } else {
-                self.page_ends[start - 1]
-            };
+        let (start, mut skip) = self.pages.locate(offset).ok_or("完整点云可见性索引与点数不符")?;
         for index in start..self.pages.len() {
             let page = &self.pages[index];
             if page.count == 0 {

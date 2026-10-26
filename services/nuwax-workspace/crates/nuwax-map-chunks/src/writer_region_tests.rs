@@ -258,3 +258,72 @@ fn region_borrowed_dirty_keeps_budget_and_persisted_error_order() {
     });
     assert_eq!(same_as_full_scan(&mut writer, [0; 3], [32, 0, 0], 2).unwrap().len(), 2);
 }
+
+#[test]
+fn local_blocks_read_only_scattered_intersections_not_the_x_slab() {
+    let mut writer = writer();
+    // 所有远端块具有同一个X，旧region的目录选择会访问整条Y走廊。
+    writer.observe((-2048..2048).map(|y| [0, y * 32, 0]), 1).unwrap();
+    writer.flush().unwrap();
+    writer.reader = RegionReader::new(writer.repository.clone(), 0);
+    let before = writer.repository.counts().0;
+    let mut selected = BTreeSet::new();
+    let mut lookups = 0;
+    for y in [-2048 * 32, 2047 * 32, -2048 * 32] {
+        lookups += writer.collect_intersecting_blocks([0, y, 0], [0, y, 0], &mut selected).unwrap();
+    }
+    assert_eq!(lookups, 3, "按实际坐标查询，重复区域也只各查一个位置");
+    assert_eq!(selected.len(), 2);
+    let (actual, reads) = writer.matching_keys_in_blocks(&selected, |_| true).unwrap();
+    assert_eq!(reads, 2, "分散空单元之间的4094个块不能读取");
+    assert_eq!(writer.repository.counts().0 - before, 2, "实际磁盘读取与所选块一致");
+    assert_eq!(actual, vec![[0, -2048 * 32, 0], [0, 2047 * 32, 0]]);
+}
+
+#[test]
+fn local_blocks_preserve_negative_boundaries_dirty_overrides_and_exact_predicate() {
+    let mut writer = writer();
+    writer.observe([[-33, -1, -1], [-32, -1, -1], [-1; 3], [0; 3], [31; 3], [32; 3]], 1).unwrap();
+    writer.flush().unwrap();
+    writer.remove([[-32, -1, -1], [32; 3]]).unwrap();
+    writer.observe([[1, 0, 0]], 2).unwrap();
+    let mut selected = BTreeSet::new();
+    assert_eq!(writer.collect_intersecting_blocks([-1; 3], [32; 3], &mut selected).unwrap(), 27);
+    assert_eq!(selected, BTreeSet::from([[-1; 3], [0; 3]]), "空脏块必须遮盖原持久引用");
+    let exact = |key: Key| key == [-1; 3] || key == [1, 0, 0];
+    let (actual, reads) = writer.matching_keys_in_blocks(&selected, exact).unwrap();
+    assert_eq!(reads, 2);
+    let expected = writer.region([-1; 3], [32; 3], 10).unwrap().into_iter()
+        .filter_map(|(key, _)| exact(key).then_some(key)).collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+    assert_eq!(writer.collect_intersecting_blocks([1, 0, 0], [0; 3], &mut selected), Err("reversed region".into()));
+    for key in [[i32::MIN; 3], [i32::MAX; 3]] {
+        writer.observe([key], 3).unwrap();
+        let mut edge = BTreeSet::new();
+        assert_eq!(writer.collect_intersecting_blocks(key, key, &mut edge).unwrap(), 1);
+        assert_eq!(writer.matching_keys_in_blocks(&edge, |_| true).unwrap(), (vec![key], 1));
+    }
+}
+
+#[test]
+fn local_revoke_ground_maintenance_reads_only_the_affected_block_column() {
+    let mut writer = writer();
+    writer.observe((0..4096).map(|y| [0, y * 32, 0]).chain([[0, 0, 33]]), 20).unwrap();
+    let column = heightfield_observations::HeightfieldColumn::from_counts([0, 0], 0.05,
+        [0, 33].into_iter().map(|z| (z, [1, 0, 0, 0, 0, 0, 0, 0])).collect()).unwrap().unwrap();
+    let ground = ColumnGroundRecords { classified_empty: false, legacy: vec![],
+        heightfields: vec![HeightfieldSurface { column, samples: vec![] }] };
+    writer.replace_ground_columns([([0, 0], &ground)]).unwrap();
+    writer.flush().unwrap();
+    assert_eq!(writer.blocks.len(), 4097);
+    writer.reader = RegionReader::new(writer.repository.clone(), 0);
+    let before = writer.repository.counts().0;
+    writer.remove([[0, 0, 0]]).unwrap();
+    let reads = writer.repository.counts().0 - before;
+    assert_eq!(reads, 3, "版本检查读目标块一次，地面柱仅再读本XY的两个高度块");
+    let retained = writer.ground_column([0, 0]).unwrap();
+    let members: Vec<_> = retained.heightfields.iter().flat_map(|surface| surface.column.members())
+        .map(|(z, _)| z).collect();
+    assert_eq!(members, [33]);
+    println!("FINE_REVOKE_GROUND blocks=4097 cold_object_reads={reads} unrelated_xy_reads=0");
+}

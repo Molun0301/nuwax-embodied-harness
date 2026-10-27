@@ -1,6 +1,33 @@
 --- a/src/IMU_Processing.hpp
 +++ b/src/IMU_Processing.hpp
-@@ -73,9 +73,10 @@
+@@ -2,6 +2,8 @@
+ #define IMU_PROCESSING_H_
+ 
+ #include <cmath>
++#include <iostream>
++#include <stdexcept>
+ #include <math.h>
+ #include <deque>
+ #include <mutex>
+@@ -22,7 +24,7 @@
+ 
+ /// *************Preconfiguration
+ 
+-#define MAX_INI_COUNT (10)
++// 初始化按源时间覆盖完整窗口，避免把采样频率写死为固定点数。
+ 
+ const bool time_list(PointType &x, PointType &y) {return (x.curvature < y.curvature);};
+ 
+@@ -60,7 +62,7 @@
+   bool gravity_align_en = true;
+ 
+  private:
+-  void IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N);
++  bool IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N);
+   void UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_in_out);
+ 
+   PointCloudXYZI::Ptr cur_pcl_un_;
+@@ -73,12 +75,31 @@
    V3D mean_acc;
    V3D mean_gyr;
    V3D angvel_last;
@@ -13,7 +40,28 @@
    int    init_iter_num = 1;
    bool   b_first_frame_ = true;
    bool   imu_need_init_ = true;
-@@ -106,6 +107,8 @@
++  // 四段启动仿真与Go2静止实录共同确定；时间用纳秒，加速度用米每二次方秒，角速度用弧度每秒。
++  static constexpr uint64_t init_window_ns_ = 1000000000ULL;
++  static constexpr uint64_t init_timeout_ns_ = 10000000000ULL;
++  static constexpr uint64_t init_max_gap_ns_ = 50000000ULL;
++  static constexpr double init_acc_norm_std_ = 0.05;
++  static constexpr double init_acc_std_ = 0.10;
++  static constexpr double init_gyro_max_ = 0.06;
++  struct InitWindow {
++    V3D acc = Zero3d, gyr = Zero3d;
++    double norm_std = 0.0, acc_std = 0.0, gyro_max = 0.0, score = 0.0;
++    uint64_t begin_ns = 0, end_ns = 0;
++    size_t count = 0;
++  };
++  deque<ImuConstPtr> init_samples_;
++  InitWindow init_selected_;
++  uint64_t init_begin_ns_ = 0, init_last_ns_ = 0;
++  bool init_has_sample_ = false;
++  bool init_timed_out_ = false;
+ };
+ 
+ ImuProcess::ImuProcess()
+@@ -106,9 +127,16 @@
    mean_acc      = V3D(0, 0, -1.0);
    mean_gyr      = V3D(0, 0, 0);
    angvel_last       = Zero3d;
@@ -22,17 +70,163 @@
    imu_need_init_    = true;
    start_timestamp_  = -1;
    init_iter_num     = 1;
-@@ -236,6 +239,9 @@
++  b_first_frame_ = true;
++  init_samples_.clear();
++  init_selected_ = InitWindow{};
++  init_has_sample_ = false;
++  init_timed_out_ = false;
+   v_imu_.clear();
+   IMUpose.clear();
+   last_imu_.reset(new custom_messages::Imu());
+@@ -153,42 +181,107 @@
+   cov_bias_acc = b_a;
+ }
+ 
+-void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N)
+-{
+-  /** 1. initializing the gravity, gyro bias, acc and gyro covariance
+-   ** 2. normalize the acceleration measurenments to unit gravity **/
+-  
+-  V3D cur_acc, cur_gyr;
+-  
++bool ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N)
++{
+   if (b_first_frame_)
+   {
+     Reset();
+-    N = 1;
+     b_first_frame_ = false;
+-    const auto &imu_acc = meas.imu.front()->linear_acceleration;
+-    const auto &gyr_acc = meas.imu.front()->angular_velocity;
+-    mean_acc << imu_acc.x, imu_acc.y, imu_acc.z;
+-    mean_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
+     first_lidar_time = meas.lidar_beg_time;
+-  }
+-
++    std::cerr << "[fastlio2] IMU初始化等待静止：窗口1秒，最长等待10秒\n";
++  }
++
++  bool ready = false;
+   for (const auto &imu : meas.imu)
+   {
+-    const auto &imu_acc = imu->linear_acceleration;
+-    const auto &gyr_acc = imu->angular_velocity;
+-    cur_acc << imu_acc.x, imu_acc.y, imu_acc.z;
+-    cur_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
+-
+-    mean_acc      += (cur_acc - mean_acc) / N;
+-    mean_gyr      += (cur_gyr - mean_gyr) / N;
+-
+-    cov_acc = cov_acc * (N - 1.0) / N + (cur_acc - mean_acc).cwiseProduct(cur_acc - mean_acc) * (N - 1.0) / (N * N);
+-    cov_gyr = cov_gyr * (N - 1.0) / N + (cur_gyr - mean_gyr).cwiseProduct(cur_gyr - mean_gyr) * (N - 1.0) / (N * N);
+-
+-    // cout<<"acc norm: "<<cur_acc.norm()<<" "<<mean_acc.norm()<<endl;
+-
+-    N ++;
+-  }
++    const uint64_t stamp = imu->header.stamp.toNsec();
++    // 配组边界的重复样本不能增加窗口覆盖或权重。
++    if (init_has_sample_ && stamp <= init_last_ns_) continue;
++    if (!init_has_sample_)
++    {
++      init_begin_ns_ = stamp;
++      init_has_sample_ = true;
++    }
++    else if (stamp - init_last_ns_ > init_max_gap_ns_)
++    {
++      // 缺测区间不能冒充一秒连续静止数据，已有最优完整窗口仍可供超时使用。
++      init_samples_.clear();
++    }
++    init_last_ns_ = stamp;
++    init_samples_.push_back(imu);
++    // 保留窗口起点之前最近的一点，实际覆盖时长至少一秒。
++    while (init_samples_.size() > 1 &&
++        stamp - init_samples_[1]->header.stamp.toNsec() >= init_window_ns_)
++      init_samples_.pop_front();
++
++    if (stamp - init_samples_.front()->header.stamp.toNsec() >= init_window_ns_)
++    {
++      InitWindow window;
++      window.begin_ns = init_samples_.front()->header.stamp.toNsec();
++      window.end_ns = stamp;
++      window.count = init_samples_.size();
++      double mean_norm = 0.0;
++      for (const auto &sample : init_samples_)
++      {
++        const auto &a = sample->linear_acceleration;
++        const auto &g = sample->angular_velocity;
++        const V3D acc(a.x, a.y, a.z), gyr(g.x, g.y, g.z);
++        window.acc += acc;
++        window.gyr += gyr;
++        mean_norm += acc.norm();
++        window.gyro_max = std::max(window.gyro_max, gyr.norm());
++      }
++      window.acc /= window.count;
++      window.gyr /= window.count;
++      mean_norm /= window.count;
++      double norm_variance = 0.0, acc_variance = 0.0;
++      for (const auto &sample : init_samples_)
++      {
++        const auto &a = sample->linear_acceleration;
++        const V3D acc(a.x, a.y, a.z);
++        norm_variance += std::pow(acc.norm() - mean_norm, 2);
++        acc_variance += (acc - window.acc).squaredNorm();
++      }
++      window.norm_std = std::sqrt(norm_variance / window.count);
++      window.acc_std = std::sqrt(acc_variance / window.count);
++      // 模长稳定仍可能在转动，三轴波动与原始角速度峰值共同排除启动晃动。
++      window.score = norm_variance / window.count / std::pow(init_acc_norm_std_, 2)
++          + acc_variance / window.count / std::pow(init_acc_std_, 2)
++          + std::pow(window.gyro_max / init_gyro_max_, 2);
++      const bool stationary = window.norm_std <= init_acc_norm_std_
++          && window.acc_std <= init_acc_std_ && window.gyro_max <= init_gyro_max_;
++      // 零合力没有重力方向，不能用于初始化。
++      if (window.acc.norm() > 1e-3 &&
++          (stationary || init_selected_.count == 0 || window.score < init_selected_.score))
++        init_selected_ = window;
++      ready = stationary && window.acc.norm() > 1e-3;
++    }
++
++    if (!ready && stamp - init_begin_ns_ >= init_timeout_ns_)
++    {
++      if (init_selected_.count == 0)
++        throw std::runtime_error("FAST-LIO IMU初始化超时：没有连续一秒且重力方向有效的窗口");
++      init_timed_out_ = true;
++      ready = true;
++    }
++    if (ready) break;
++  }
++  if (!ready) return false;
++
++  mean_acc = init_selected_.acc;
++  mean_gyr = init_selected_.gyr;
++  N = static_cast<int>(init_selected_.count);
++  std::cerr << "[fastlio2] IMU初始化完成 quality="
++      << (init_timed_out_ ? "degraded_timeout" : "stationary")
++      << " wait_s=" << (init_last_ns_ - init_begin_ns_) * 1e-9
++      << " window_s=[" << (init_selected_.begin_ns - init_begin_ns_) * 1e-9
++      << "," << (init_selected_.end_ns - init_begin_ns_) * 1e-9
++      << "] samples=" << N << " acc_norm_std=" << init_selected_.norm_std
++      << " acc_std=" << init_selected_.acc_std << " gyro_max=" << init_selected_.gyro_max
++      << " bias=" << mean_gyr.transpose()
++      << (init_timed_out_ ? " WARNING:未检测到静止，使用最优完整窗口，重力和零偏精度未保证" : "")
++      << std::endl;
++  init_samples_.clear();
+   state_ikfom init_state = kf_state.get_x();
+   if (gravity_align_en)
+   {
+@@ -236,6 +329,10 @@
    init_P(21,21) = init_P(22,22) = 0.00001; 
    kf_state.change_P(init_P);
    last_imu_ = meas.imu.back();
 +  // 初始状态对应这次扫描末端；后续积分从这个已知时刻继续。
 +  last_lidar_end_time_ = meas.lidar_end_time;
 +  acc_s_last = Zero3d;
++  return true;
  }
  
  void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_out)
-@@ -258,7 +264,9 @@
+@@ -258,7 +355,9 @@
    /*** Initialize IMU pose ***/
    state_ikfom imu_state = kf_state.get_x();
    IMUpose.clear();
@@ -43,7 +237,7 @@
  
    /*** forward propagation at each imu point ***/
    V3D angvel_avr, acc_avr, acc_imu, vel_imu, pos_imu;
-@@ -312,7 +320,9 @@
+@@ -312,7 +411,9 @@
        acc_s_last[i] += imu_state.grav[i];
      }
      double &&offs_t = tail->header.stamp.toSec() - pcl_beg_time;
@@ -54,7 +248,7 @@
    }
  
    /*** calculated the pos and attitude prediction at the frame-end ***/
-@@ -327,8 +337,35 @@
+@@ -327,8 +428,35 @@
    /*** undistort each lidar point (backward propagation) ***/
    // std::cout << "pcl_out.points.begin() == pcl_out.points.end(): " << (pcl_out.points.begin() == pcl_out.points.end()) << std::endl;
    if (pcl_out.points.begin() == pcl_out.points.end()) return;
@@ -92,21 +286,22 @@
    {
      auto head = it_kp - 1;
      auto tail = it_kp;
-@@ -339,9 +376,11 @@
+@@ -339,9 +467,11 @@
      acc_imu<<VEC_FROM_ARRAY(tail->acc);
      angvel_avr<<VEC_FROM_ARRAY(tail->gyr);
  
 -    for(; it_pcl->curvature / double(1000) > head->offset_time; it_pcl --)
+-    {
+-      dt = it_pcl->curvature / double(1000) - head->offset_time;
 +    // 区间左闭右开；相同时间的整批点归入同一区间，最末区间包含扫描终点。
 +    while (it_pcl != pcl_out.points.begin() && point_time(*(it_pcl - 1)) >= head->offset_time)
-     {
--      dt = it_pcl->curvature / double(1000) - head->offset_time;
++    {
 +      --it_pcl;
 +      dt = point_time(*it_pcl) - head->offset_time;
  
        /* Transform to the 'end' frame, using only the rotation
         * Note: Compensation direction is INVERSE of Frame's moving direction
-@@ -358,7 +397,6 @@
+@@ -358,7 +488,6 @@
        it_pcl->y = P_compensate(1);
        it_pcl->z = P_compensate(2);
  
@@ -114,6 +309,35 @@
      }
    }
  }
+@@ -374,24 +503,11 @@
+ 
+   if (imu_need_init_)
+   {
+-    /// The very first lidar frame
+-    // std::cout << "IMU1" << std::endl;
+-    IMU_init(meas, kf_state, init_iter_num);
+-    // std::cout << "IMU2" << std::endl;
+-    imu_need_init_ = true;
+-    
+-    last_imu_   = meas.imu.back();
+-
+-    // std::cout << last_imu_->orientation.x << " " << last_imu_->orientation.y << " " << last_imu_->orientation.z << std::endl; 
+-
+-    state_ikfom imu_state = kf_state.get_x();
+-    // std::cout << "IMU3" << std::endl;
+-    if (init_iter_num > MAX_INI_COUNT)
+-    {
+-      // std::cout << "IMU4" << std::endl;
+-      cov_acc *= pow(G_m_s2 / mean_acc.norm(), 2);
++    // 等待期间与完成初始化的本帧均不去畸变、不建图。
++    cur_pcl_un_->clear();
++    if (IMU_init(meas, kf_state, init_iter_num))
++    {
+       imu_need_init_ = false;
+-
+       cov_acc = cov_acc_scale;
+       cov_gyr = cov_gyr_scale;
+     //   ROS_INFO("IMU Initial Done");
 --- a/src/laserMapping.hpp
 +++ b/src/laserMapping.hpp
 @@ -10,6 +10,7 @@

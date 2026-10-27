@@ -85,7 +85,8 @@ std::int64_t Astar::GetHash(const Node* node) const {
   return (static_cast<std::int64_t>(node->layer) * max_y_ + node->idx[1]) * max_x_ + node->idx[2];
 }
 
-bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
+bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal,
+                   std::function<void(const Node*)> visitor) {
   // 失败也可能更新过节点代价；每次搜索都必须清除上次状态。
   Reset();
   auto start_node = FindNode(start[0], start[2], start[1]);
@@ -94,11 +95,11 @@ bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
   Node requested_goal;
   requested_goal.idx = Eigen::Vector3i(0, goal[2], goal[1]);
   requested_goal.height = start_node ? start_node->height : 0.0;
-  if (!goal_node && approach_score_) goal_node = &requested_goal;
+  if ((!goal_node && approach_score_) || visitor) goal_node = &requested_goal;
   if (!start_node || !goal_node) return false;
   if (start_node->cost > cost_threshold_ || (!approach_score_ && goal_node->cost > cost_threshold_)) return false;
   start_node->g = 0.0;
-  start_node->f = GetHeuristic(start_node, goal_node);
+  start_node->f = visitor ? 0.0 : GetHeuristic(start_node, goal_node);
   std::priority_queue<OpenEntry, std::vector<OpenEntry>, NodeCompare> open_set;
   std::unordered_map<std::int64_t, Node*> closed_set;
   std::uint64_t sequence = 0;
@@ -114,6 +115,7 @@ bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
     auto closed = closed_set.find(GetHash(current_node));
     if (closed != closed_set.end() && closed->second->g < entry.g) continue;
     ++expanded_;
+    if (visitor) visitor(current_node);
     if (approach_score_) {
       const double score = approach_score_(current_node);
       if (score < closest_score) { closest_score = score; closest = current_node; }
@@ -150,7 +152,7 @@ bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
             std::sqrt(dz * dz + diff[1] * diff[1] + diff[2] * diff[2]) + step_cost;
         if (tentative_g < neighbor_node->g) {
           neighbor_node->g = tentative_g;
-          neighbor_node->f = tentative_g + GetHeuristic(neighbor_node, goal_node);
+          neighbor_node->f = tentative_g + (visitor ? 0.0 : GetHeuristic(neighbor_node, goal_node));
           neighbor_node->parent = current_node;
           open_set.push({neighbor_node, neighbor_node->f, neighbor_node->g, sequence++});
         }

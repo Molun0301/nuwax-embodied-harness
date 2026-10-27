@@ -101,6 +101,25 @@ pub struct Route {
     pub elapsed_ms: f64,
     pub expanded: usize,
 }
+/// 完整查询的真实路线长度、末点和末段朝向，不向探索复制整条路线。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RouteCost {
+    pub cost: f64,
+    pub endpoint: [f64; 3],
+    pub yaw: f64,
+    pub elapsed_ms: f64,
+    pub expanded: usize,
+}
+/// 本轮真实转移检查及复用次数；逻辑目标预算仍由调用方拥有。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MultiGoalStats {
+    pub checks: usize,
+    pub hits: usize,
+    pub source_searches: usize,
+    pub rejected: usize,
+}
 #[repr(C)]
 struct ConfigRaw {
     resolution: f64,
@@ -144,6 +163,14 @@ unsafe extern "C" {
     fn pct_geometry_sizes(planner: *const c_void, ncells: *mut usize, nbands: *mut usize);
     fn pct_geometry_copy(planner: *const c_void, cells: *mut Cell, bands: *mut Band);
     fn pct_result_free(result: *mut ResultRaw);
+    fn pct_multi_goal_create(planner: *mut c_void, err: *mut c_char, cap: usize) -> *mut c_void;
+    fn pct_multi_goal_destroy(search: *mut c_void);
+    fn pct_multi_goal_stats(search: *const c_void) -> MultiGoalStats;
+    fn pct_multi_goal_cost(
+        search: *mut c_void, start: *const f64, goal: *const f64, cost: *mut RouteCost,
+        cancel: extern "C" fn(*const c_void) -> bool, user: *const c_void,
+        err: *mut c_char, cap: usize,
+    ) -> i32;
     fn pct_plan(
         planner: *mut c_void,
         start: *const f64,
@@ -164,6 +191,33 @@ pub struct Planner {
 }
 // 原生实例无共享全局可变状态，移动所有权不会产生并发访问。
 unsafe impl Send for Planner {}
+/// 一轮多目标评估共享惰性转移图；可变借用保证地图与机体配置不会在轮内变化。
+/// 仍沿各目标的原裁剪窗口、软代价及稳定队列选路，保持路线长度与末段朝向。
+pub struct MultiGoalSearch<'a> {
+    native: NonNull<c_void>,
+    _planner: std::marker::PhantomData<&'a mut Planner>,
+}
+impl Drop for MultiGoalSearch<'_> {
+    fn drop(&mut self) { unsafe { pct_multi_goal_destroy(self.native.as_ptr()) } }
+}
+impl MultiGoalSearch<'_> {
+    pub fn cost(&mut self, start: [f64; 3], goal: [f64; 3]) -> Result<RouteCost, String> {
+        self.cost_inner(start, goal, std::ptr::null())
+    }
+    pub fn cost_cancellable(&mut self, start: [f64; 3], goal: [f64; 3], cancel: &AtomicBool) -> Result<RouteCost, String> {
+        self.cost_inner(start, goal, (cancel as *const AtomicBool).cast())
+    }
+    fn cost_inner(&mut self, start: [f64; 3], goal: [f64; 3], cancel: *const c_void) -> Result<RouteCost, String> {
+        let mut result = RouteCost::default();
+        let mut error = [0; 512];
+        let status = unsafe { pct_multi_goal_cost(self.native.as_ptr(), start.as_ptr(), goal.as_ptr(),
+            &mut result, cancelled, cancel, error.as_mut_ptr(), error.len()) };
+        if status == 0 { Ok(result) } else { Err(native_error(&error)) }
+    }
+    pub fn stats(&self) -> MultiGoalStats {
+        unsafe { pct_multi_goal_stats(self.native.as_ptr()) }
+    }
+}
 impl Drop for Planner {
     fn drop(&mut self) {
         unsafe { pct_destroy(self.native.as_ptr()) }
@@ -182,6 +236,13 @@ extern "C" fn cancelled(user: *const c_void) -> bool {
     }
 }
 impl Planner {
+    /// 创建只属于本轮的多目标评估；释放后全部共享转移随之回收。
+    pub fn multi_goal_search(&mut self) -> Result<MultiGoalSearch<'_>, String> {
+        let mut error = [0; 512];
+        let native = unsafe { pct_multi_goal_create(self.native.as_ptr(), error.as_mut_ptr(), error.len()) };
+        NonNull::new(native).map(|native| MultiGoalSearch { native, _planner: std::marker::PhantomData })
+            .ok_or_else(|| native_error(&error))
+    }
     pub fn new(config: Config, points: &[[f64; 3]]) -> Result<Self, String> {
         Self::create(config, &[], &[], points)
     }
@@ -707,3 +768,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod multi_goal_tests;

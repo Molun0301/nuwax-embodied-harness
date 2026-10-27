@@ -660,6 +660,10 @@ impl SurfaceGoalSourceAdapter {
             }
         }
         let planner = native.planner;
+        let mut planner_guard = planner.lock().map_err(|_| {
+            ExploreError::SourceError("native frontier planner lock is poisoned".into())
+        })?;
+        let mut search = planner_guard.multi_goal_search().map_err(ExploreError::SourceError)?;
         delta.last_snapshot = Some(Some(Arc::downgrade(source_snapshot)));
         delta.last_notification = Some(Some(notification));
         delta.last_query_body = Some(Some([position.x, position.y, position.z]));
@@ -842,7 +846,7 @@ impl SurfaceGoalSourceAdapter {
             }
             route_query_count += 1;
             let Some((cost, endpoint, route_yaw)) =
-                frontier_route_cost(&planner, current_body.0, body, &route_budget)
+                frontier_route_cost(&mut search, current_body.0, body, &route_budget)
             else {
                 continue;
             };
@@ -941,7 +945,7 @@ impl SurfaceGoalSourceAdapter {
                         .iter()
                         .map(|&target| {
                             frontier_route_cost(
-                                &planner,
+                                &mut search,
                                 admissible[source].1 .0,
                                 admissible[target].1 .0,
                                 &route_budget,
@@ -1426,7 +1430,7 @@ fn frontier_geometry(
 }
 
 fn frontier_route_cost(
-    planner: &Mutex<nuwax_nav_pct_native::Planner>,
+    search: &mut nuwax_nav_pct_native::MultiGoalSearch<'_>,
     start: [f64; 3],
     goal: [f64; 3],
     budget: &FrontierRouteBudget,
@@ -1434,27 +1438,18 @@ fn frontier_route_cost(
     if budget.exhausted() {
         return None;
     }
+    // 保留逻辑目标预留次数；转移复用不能让本轮跳过原预算或游标。
     budget.queries.set(budget.queries.get() + 1);
     let started = std::time::Instant::now();
-    tracing::debug!(target: "navigation.exploration.compute", query = budget.queries.get(), ?start, ?goal, "开始前沿完整路线查询");
-    let result = planner.lock().ok()?.plan(start, goal);
+    let result = search.cost(start, goal);
     tracing::debug!(target: "navigation.exploration.compute", elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-        expanded = result.as_ref().ok().map(|route| route.expanded), error = ?result.as_ref().err(), "前沿完整路线查询完成");
+        query = budget.queries.get(), ?start, ?goal,
+        expanded = result.as_ref().ok().map(|route| route.expanded), error = ?result.as_ref().err(),
+        checks = search.stats().checks, hits = search.stats().hits,
+        source_searches = search.stats().source_searches, rejected = search.stats().rejected, "前沿共享路线查询完成");
     let route = result.ok()?;
     budget.expanded.set(budget.expanded.get() + route.expanded);
-    let cost = route
-        .path
-        .windows(2)
-        .map(|edge| distance(edge[0], edge[1]))
-        .sum();
-    let yaw = route.path.windows(2).last().map_or(0.0, |edge| {
-        (edge[1][1] - edge[0][1]).atan2(edge[1][0] - edge[0][0])
-    });
-    route
-        .path
-        .last()
-        .copied()
-        .map(|endpoint| (cost, endpoint, yaw))
+    Some((route.cost, route.endpoint, route.yaw))
 }
 
 fn inside_boundary(point: [f64; 2], boundary: &[[f64; 2]]) -> bool {
@@ -3957,20 +3952,46 @@ mod tests {
             .collect();
         let planner =
             Mutex::new(nuwax_nav_pct_native::Planner::from_cells(cfg.clone(), &[], &bands).unwrap());
+        let mut guard = planner.lock().unwrap();
+        let mut search = guard.multi_goal_search().unwrap();
         assert!(frontier_route_cost(
-            &planner, [0.05, 0.05, 0.4], [2.05, 0.05, 0.4],
+            &mut search, [0.05, 0.05, 0.4], [2.05, 0.05, 0.4],
             &FrontierRouteBudget::default()).is_none());
         let cells: Vec<_> = (-5..26).flat_map(|x| (-12..13).map(move |y|
             nuwax_nav_pct_native::Cell {x,y,ground:0.0,ceiling:f64::INFINITY}
         )).collect();
         let planner =
             Mutex::new(nuwax_nav_pct_native::Planner::from_cells(cfg, &cells, &bands).unwrap());
+        let mut guard = planner.lock().unwrap();
+        let mut search = guard.multi_goal_search().unwrap();
         let budget = FrontierRouteBudget::default();
         let (cost, end, _) =
-            frontier_route_cost(&planner, [0.05, 0.05, 0.4], [2.05, 0.05, 0.4], &budget).unwrap();
+            frontier_route_cost(&mut search, [0.05, 0.05, 0.4], [2.05, 0.05, 0.4], &budget).unwrap();
         assert!(cost > 2.2);
         assert_eq!(end, [2.05, 0.05, 0.4]);
         assert!(budget.expanded.get() > 1);
+    }
+
+    #[test]
+    fn shared_frontier_search_reserves_exact_budget_and_new_batch_can_continue() {
+        let cfg = nuwax_nav_pct_native::Config { resolution: 0.1, footprint_radius: 0.1, ..Default::default() };
+        let cells: Vec<_> = (-5..26).flat_map(|x| (-5..6).map(move |y|
+            nuwax_nav_pct_native::Cell {x,y,ground:0.0,ceiling:f64::INFINITY}
+        )).collect();
+        let mut planner = nuwax_nav_pct_native::Planner::from_cells(cfg, &cells, &[]).unwrap();
+        let mut search = planner.multi_goal_search().unwrap();
+        let budget = FrontierRouteBudget::default();
+        for _ in 0..MAX_FRONTIER_ROUTE_QUERIES {
+            assert!(frontier_route_cost(&mut search, [0.05,0.05,0.4], [2.05,0.05,0.4], &budget).is_some());
+        }
+        assert_eq!(budget.queries.get(), MAX_FRONTIER_ROUTE_QUERIES);
+        let before = search.stats();
+        assert!(frontier_route_cost(&mut search, [0.05,0.05,0.4], [2.05,0.05,0.4], &budget).is_none());
+        assert_eq!(search.stats().checks, before.checks);
+        assert_eq!(search.stats().hits, before.hits);
+        assert_eq!(search.stats().source_searches, 1);
+        // 下一批次只重置逻辑预算，仍通过原查询取得真实目标。
+        assert!(frontier_route_cost(&mut search, [0.05,0.05,0.4], [2.15,0.05,0.4], &FrontierRouteBudget::default()).is_some());
     }
 
     #[test]

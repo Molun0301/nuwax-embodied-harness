@@ -69,7 +69,9 @@ class Astar {
 
   void Debug() { debug_ = true; }
 
-  bool Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal);
+  // visitor非空时执行无目标的单源Dijkstra展开，不恢复任意目标路线。
+  bool Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal,
+              std::function<void(const Node*)> visitor = {});
 
   std::vector<PathPoint> GetPathPoints() const;
 

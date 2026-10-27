@@ -10,6 +10,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 extern "C" {
 struct PctConfig {
@@ -21,12 +22,31 @@ struct PctConfig {
 struct PctCell { int32_t x, y; double ground, ceiling; };
 struct PctBand { int32_t x, y; double low, high; };
 struct PctResult { double* points; size_t length; double elapsed_ms; size_t expanded; int32_t kind; };
+struct PctCost { double cost, endpoint[3], yaw, elapsed_ms; size_t expanded; };
+struct PctSearchStats { size_t checks, hits, source_searches, rejected; };
 using CancelFn = bool (*)(const void*);
 }
 
 namespace {
 using XY = std::pair<int,int>;
 using Point = std::array<double, 2>;
+using Edge = std::array<double, 6>;
+struct EdgeHash {
+  size_t operator()(const Edge& edge) const {
+    size_t hash=0;
+    for(double value:edge)hash^=std::hash<double>{}(value)+0x9e3779b9+(hash<<6)+(hash>>2);
+    return hash;
+  }
+};
+// 同一冻结几何内的纯转移判定。键包含两端真实坐标，保留格内偏移、方向与层高。
+struct SharedTransitions {
+  std::unordered_map<Edge,bool,EdgeHash> edges;
+  PctSearchStats stats{};
+  std::map<XY,std::vector<double>> nodes,reachable;
+  Edge source{};
+  std::array<double,3> requested_source{};
+  bool complete=false;
+};
 struct Column { std::vector<PctCell> surfaces; std::vector<PctBand> occupied; };
 bool inside(const std::vector<Point>& polygon, double x, double y) {
   if (polygon.empty()) return true;
@@ -117,6 +137,7 @@ struct Planner {
   std::map<XY,std::vector<PctBand>> collision_buckets;
   int bucket_cells=1;
   Astar astar;
+  SharedTransitions* shared=nullptr;
   explicit Planner(const PctConfig& c):cfg(c) {
     for(size_t i=0;i<c.footprint_len;++i) footprint.push_back({c.footprint[2*i],c.footprint[2*i+1]});
     for(size_t i=0;i<c.boundary_len;++i) boundary.push_back({c.boundary[2*i],c.boundary[2*i+1]});
@@ -175,6 +196,40 @@ struct Planner {
     }
     return false;
   }
+  bool transition(const Edge& edge,XY from,XY to) {
+    const double ax=edge[0],ay=edge[1],bx=edge[3],by=edge[4];
+    if(shared) {
+      auto found=shared->edges.find(edge);
+      if(found!=shared->edges.end()){++shared->stats.hits;return found->second;}
+    }
+    auto check=[&] {
+    const double h=std::hypot(bx-ax,by-ay),dh=std::abs(edge[5]-edge[2]);
+    const double step=edge[5]>=edge[2]?cfg.max_step:cfg.max_step_down;
+    if(dh>std::max(step,std::tan(cfg.max_slope)*h)+1e-8)return false;
+    if(dh>std::tan(cfg.max_slope)*h+1e-8) {
+      // 连续实测斜面不能被逐格误解释成台阶；真正高度跳变两侧的踏面仍用阶高。
+      const int ex=to.first-from.first,ey=to.second-from.second;
+      const double signed_dh=edge[5]-edge[2],tolerance=cfg.point_resolution*0.5+1e-8;
+      auto measured_height=[&](int x,int y,double expected) {
+        auto col=columns.find({x,y});
+        if(col==columns.end())return false;
+        return std::any_of(col->second.surfaces.begin(),col->second.surfaces.end(),
+            [&](const PctCell& cell){return std::abs(cell.ground-expected)<=tolerance;});
+      };
+      if(measured_height(from.first,from.second,edge[2])&&measured_height(to.first,to.second,edge[5])&&
+         measured_height(from.first-ex,from.second-ey,edge[2]-signed_dh)&&
+         measured_height(to.first+ex,to.second+ey,edge[5]+signed_dh))return false;
+    }
+    const double yaw=std::atan2(by-ay,bx-ax);
+    // 两端与中点检查覆盖对角薄墙，保持真实足迹而非外包圆膨胀。
+    for(int i=0;i<=2;++i){double t=i*0.5;
+      if(collision(ax+(bx-ax)*t,ay+(by-ay)*t,edge[2]+(edge[5]-edge[2])*t,yaw))return false;}
+    return true;
+    };
+    const bool allowed=check();
+    if(shared){++shared->stats.checks;shared->edges.emplace(edge,allowed);}
+    return allowed;
+  }
   void add_points(const double* points,size_t count) {
     std::map<XY,std::vector<double>> heights;
     const double q=cfg.resolution,sq=cfg.point_resolution;
@@ -199,7 +254,7 @@ struct Planner {
     }
   }
   bool plan_region(const double* start,const double* goal,double margin,PctResult& result,
-                   CancelFn cancel,const void* user,bool progressive=false,bool allow_partial=false) {
+                   CancelFn cancel,const void* user,bool progressive=false,bool allow_partial=false,bool connectivity=false) {
     astar.Reset();
     const double q=cfg.resolution,sg=start[2]-cfg.body_to_ground,gg=goal[2]-cfg.body_to_ground;
     int minx=static_cast<int>(std::floor((std::min(start[0],goal[0])-margin)/q));
@@ -325,10 +380,42 @@ struct Planner {
     const double goal_x=gx==original_gx&&gy==original_gy?goal[0]:(gx+minx+0.5)*q;
     const double goal_y=gx==original_gx&&gy==original_gy?goal[1]:(gy+miny+0.5)*q;
 
-    if(sx==gx&&sy==gy&&sl==gl) {
+    if(!connectivity && sx==gx&&sy==gy&&sl==gl) {
       const double yaw=std::atan2(dy,dx);
       if(collision(start_x,start_y,heights(sl*ny+sy,sx),yaw)||
          collision(goal_x,goal_y,heights(gl*ny+gy,gx),yaw))return false;
+    }
+    if(shared && !progressive) {
+      const Edge source{start_x,start_y,heights(sl*ny+sy,sx),0,0,0};
+      if(connectivity) {
+        shared->source=source;
+        for(int l=0;l<layers;++l)for(int y=0;y<ny;++y)for(int x=0;x<nx;++x)
+          if(measured[key_index(l,y,x)] && cost(l*ny+y,x)<=20)
+            shared->nodes[{x+minx,y+miny}].push_back(heights(l*ny+y,x));
+        gl=-1;
+      } else if(shared->complete && shared->source==source && !(sx==gx&&sy==gy&&sl==gl)) {
+        // 全图必须覆盖本窗口的每个真实节点；层分组不同则沿原查询，不能错误排除。
+        bool compatible=true;
+        for(int l=0;l<layers && compatible;++l)for(int y=0;y<ny && compatible;++y)for(int x=0;x<nx;++x) {
+          if(!measured[key_index(l,y,x)] || cost(l*ny+y,x)>20)continue;
+          auto found=shared->nodes.find({x+minx,y+miny});
+          if(found==shared->nodes.end() || std::find(found->second.begin(),found->second.end(),heights(l*ny+y,x))==found->second.end()) {compatible=false;break;}
+        }
+        bool possible=!compatible;
+        const double limit=std::max({cfg.max_step,cfg.max_step_down,std::tan(cfg.max_slope)*q*std::sqrt(2.0)})+1e-8;
+        for(int y=gy-1;y<=gy+1 && !possible;++y)for(int x=gx-1;x<=gx+1 && !possible;++x) {
+          if(x==gx && y==gy)continue;
+          const XY xy{x+minx,y+miny};
+          auto found=shared->reachable.find(xy);if(found==shared->reachable.end())continue;
+          for(double ground:found->second) {
+            if(std::abs(ground-heights(gl*ny+gy,gx))>limit)continue;
+            const bool first=x==sx && y==sy && ground==source[2];
+            if(transition({first?start_x:(xy.first+0.5)*q,first?start_y:(xy.second+0.5)*q,ground,
+                           goal_x,goal_y,heights(gl*ny+gy,gx)},xy,{gx+minx,gy+miny})) {possible=true;break;}
+          }
+        }
+        if(!possible){++shared->stats.rejected;return false;}
+      }
     }
     astar.Init(20,layers,q,1,cost,heights,elevation);
     astar.SetHeightLimit(std::max({cfg.max_step,cfg.max_step_down,std::tan(cfg.max_slope)*q*std::sqrt(2.0)})+1e-8);
@@ -344,29 +431,17 @@ struct Planner {
       const bool last=b->layer==gl&&b->idx[2]==gx&&b->idx[1]==gy;
       const double ax=first?start_x:(a->idx[2]+minx+0.5)*q,ay=first?start_y:(a->idx[1]+miny+0.5)*q;
       const double bx=last?goal_x:(b->idx[2]+minx+0.5)*q,by=last?goal_y:(b->idx[1]+miny+0.5)*q;
-      const double h=std::hypot(bx-ax,by-ay),dh=std::abs(b->height-a->height);
-      const double step=b->height>=a->height?cfg.max_step:cfg.max_step_down;
-      if(dh>std::max(step,std::tan(cfg.max_slope)*h)+1e-8)return false;
-      if(dh>std::tan(cfg.max_slope)*h+1e-8) {
-        // 连续实测斜面不能被逐格误解释成台阶；真正高度跳变两侧的踏面仍用阶高。
-        const int ex=b->idx[2]-a->idx[2],ey=b->idx[1]-a->idx[1];
-        const double signed_dh=b->height-a->height,tolerance=cfg.point_resolution*0.5+1e-8;
-        auto measured_height=[&](int x,int y,double expected) {
-          auto col=columns.find({x+minx,y+miny});
-          if(col==columns.end())return false;
-          return std::any_of(col->second.surfaces.begin(),col->second.surfaces.end(),
-              [&](const PctCell& cell){return std::abs(cell.ground-expected)<=tolerance;});
-        };
-        if(measured_height(a->idx[2],a->idx[1],a->height)&&measured_height(b->idx[2],b->idx[1],b->height)&&
-           measured_height(a->idx[2]-ex,a->idx[1]-ey,a->height-signed_dh)&&
-           measured_height(b->idx[2]+ex,b->idx[1]+ey,b->height+signed_dh))return false;
-      }
-      const double yaw=std::atan2(by-ay,bx-ax);
-      // 两端与中点检查覆盖对角薄墙，保持真实足迹而非外包圆膨胀。
-      for(int i=0;i<=2;++i){double t=i*0.5;
-        if(collision(ax+(bx-ax)*t,ay+(by-ay)*t,a->height+(b->height-a->height)*t,yaw))return false;}
-      return true;
+      return transition({ax,ay,a->height,bx,by,b->height},
+                        {a->idx[2]+minx,a->idx[1]+miny},{b->idx[2]+minx,b->idx[1]+miny});
     });
+    if(connectivity) {
+      ++shared->stats.source_searches;
+      astar.Search({sl,sx,sy},{-1,0,0},[&](const Node* node) {
+        shared->reachable[{node->idx[2]+minx,node->idx[1]+miny}].push_back(node->height);
+      });
+      shared->complete=!astar.Cancelled() && !(cancel&&cancel(user));
+      return false;
+    }
     const bool found=astar.Search({sl,sx,sy},{gl,gx,gy});result.expanded+=astar.Expanded();
     if(!found && (!allow_partial || astar.Cancelled()))return false;
     const auto path=astar.GetPathPoints();
@@ -427,6 +502,64 @@ extern "C" int pct_plan(void* planner,const double* start,const double* goal,Pct
     }
     error(err,cap,"PCT未找到满足已知占据与机体尺寸的路径");return 1;
   }catch(const std::exception& e){error(err,cap,e.what());return 3;}
+}
+namespace {
+struct MultiGoalSearch {
+  Planner& planner;
+  SharedTransitions transitions;
+  explicit MultiGoalSearch(Planner& p):planner(p) {}
+};
+}
+extern "C" void* pct_multi_goal_create(void* planner,char* err,size_t cap) {
+  try{return new MultiGoalSearch(*static_cast<Planner*>(planner));}
+  catch(const std::exception& e){error(err,cap,e.what());return nullptr;}
+}
+extern "C" void pct_multi_goal_destroy(void* search){delete static_cast<MultiGoalSearch*>(search);}
+extern "C" PctSearchStats pct_multi_goal_stats(const void* search){
+  return static_cast<const MultiGoalSearch*>(search)->transitions.stats;
+}
+extern "C" int pct_multi_goal_cost(void* search,const double* start,const double* goal,PctCost* cost,
+                                    CancelFn cancel,const void* user,char* err,size_t cap) {
+  try {
+  auto& s=*static_cast<MultiGoalSearch*>(search);
+  // 缓存仅在本次同步查询绑定；普通导航与逐步逼近没有共享搜索状态。
+  struct Restore {Planner& p;~Restore(){p.shared=nullptr;}} restore{s.planner};
+  s.planner.shared=&s.transitions;
+  PctResult route{};
+  const std::array<double,3> requested{start[0],start[1],start[2]};
+  if(!s.transitions.complete || s.transitions.requested_source!=requested) {
+    s.transitions.complete=false;s.transitions.nodes.clear();s.transitions.reachable.clear();
+    s.transitions.requested_source=requested;
+    double full=std::max(s.planner.cfg.search_margin,s.planner.cfg.resolution*2);
+    for(const auto& entry:s.planner.columns)full=std::max({full,
+        std::abs(entry.first.first*s.planner.cfg.resolution-start[0])+s.planner.cfg.resolution*2,
+        std::abs(entry.first.second*s.planner.cfg.resolution-start[1])+s.planner.cfg.resolution*2});
+    s.planner.plan_region(start,start,full,route,cancel,user,false,false,true);
+    if(cancel&&cancel(user)){error(err,cap,"PCT规划已取消");return 2;}
+  }
+  const int status=pct_plan(&s.planner,start,goal,&route,cancel,user,false,err,cap);
+  if(status==0) {
+    cost->cost=0;cost->yaw=0;cost->elapsed_ms=route.elapsed_ms;cost->expanded=route.expanded;
+    for(size_t i=1;i<route.length;++i) {
+      const double* a=route.points+3*(i-1);const double* b=route.points+3*i;
+      cost->cost+=std::hypot(std::hypot(b[0]-a[0],b[1]-a[1]),b[2]-a[2]);
+      cost->yaw=std::atan2(b[1]-a[1],b[0]-a[0]);
+    }
+    std::copy(route.points+3*(route.length-1),route.points+3*route.length,cost->endpoint);
+  }
+  delete[] route.points;
+  return status;
+  }catch(const std::exception& e){error(err,cap,e.what());return 3;}
+}
+extern "C" bool pct_single_source_cancellation_regression() {
+  Astar a;Eigen::MatrixXd cost=Eigen::MatrixXd::Zero(10,10),height=cost,ele=cost;
+  a.Init(20,1,0.1,1,cost,height,ele);
+  size_t visited=0,callbacks=0;
+  a.SetCancellation([&]{return ++callbacks==8;});
+  a.Search({0,0,0},{-1,0,0},[&](const Node*){++visited;});
+  if(!a.Cancelled() || visited!=7 || a.Expanded()!=7)return false;
+  a.SetCancellation({});
+  return a.Search({0,0,0},{0,9,9}) && !a.Cancelled();
 }
 // 直接复用同一上游对象验证失败残留清理，不通过重建对象掩盖错误。
 extern "C" bool pct_retry_regression(){

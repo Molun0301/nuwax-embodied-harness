@@ -706,9 +706,11 @@ impl SurfaceGoalSourceAdapter {
         let mut accepted_regions = std::collections::BTreeSet::new();
         let mut evaluated_candidate_count = 0;
         let mut route_query_count = 0;
-        let route_budget = FrontierRouteBudget::default();
+        // 总查询数保持64；预留一次给选中目标的原完整路线核验。
+        let mut route_budget = FrontierRouteBudget { reserved: 1, ..Default::default() };
         let mut route_budget_limited = false;
         let mut next_route_cursor = 0;
+        let mut examined_route_cursor = 0;
         let cursor = deferred.map_or(if continuing { self.route_cursor } else { 0 }, |route| {
             route.resume_cursor
         });
@@ -721,6 +723,7 @@ impl SurfaceGoalSourceAdapter {
         delta.route_cursor = Some(0);
         delta.deferred_route = Some(None);
         for (ordinal, mut candidate) in candidates.into_iter().enumerate().skip(cursor) {
+            examined_route_cursor = ordinal + 1;
             if nuwax_nav_pct_native::planning_cancelled() {
                 return Err(ExploreError::SourceError(
                     "frontier planning cancelled".into(),
@@ -846,7 +849,7 @@ impl SurfaceGoalSourceAdapter {
             }
             route_query_count += 1;
             let Some((cost, endpoint, route_yaw)) =
-                frontier_route_cost(&mut search, current_body.0, body, &route_budget)
+                frontier_rank_cost(&mut search, current_body.0, body, &route_budget)
             else {
                 continue;
             };
@@ -944,7 +947,7 @@ impl SurfaceGoalSourceAdapter {
                     goals
                         .iter()
                         .map(|&target| {
-                            frontier_route_cost(
+                            frontier_rank_cost(
                                 &mut search,
                                 admissible[source].1 .0,
                                 admissible[target].1 .0,
@@ -969,8 +972,8 @@ impl SurfaceGoalSourceAdapter {
         // The candidate loop already records a cursor when another query remains.
         let selected_index =
             retry_index.or_else(|| selection.as_ref().map(|selection| selection.index));
-        let Some((candidate, (body, candidate_quaternion), view)) =
-            selected_index.and_then(|index| admissible.get(index))
+        let Some((mut candidate, (mut body, mut candidate_quaternion), mut view)) =
+            selected_index.and_then(|index| admissible.get(index)).cloned()
         else {
             if next_route_cursor > 0 && next_route_cursor < geometric_candidate_count {
                 delta.deferred_route = Some(Some(continuation(next_route_cursor)));
@@ -984,12 +987,39 @@ impl SurfaceGoalSourceAdapter {
             delta.last_error = Some(None);
             return Ok(ExplorationPoll::NoFrontier);
         };
+        route_budget.reserved = 0;
+        let Some((travel, endpoint, yaw)) = frontier_route_cost(&mut search, current_body.0, body, &route_budget) else {
+            // 全图与目标窗口的层表示不同可能使精确核验失败；继续剩余候选，
+            // 不把资源额度或单次表示差异记为导航失败，也不重算刚完成的批次。
+            delta.deferred_route = Some(Some(continuation(examined_route_cursor)));
+            delta.route_cursor = Some(examined_route_cursor);
+            delta.last_no_frontier = Some(false);
+            return Ok(ExplorationPoll::Pending);
+        };
+        body = endpoint;
+        if !self.observation_model.as_ref().is_some_and(|model| model.horizontal_fov_rad < std::f64::consts::TAU - 1e-6) {
+            candidate_quaternion = [0.0, 0.0, (yaw * 0.5).sin(), (yaw * 0.5).cos()];
+        }
+        candidate.support_xyz = snapshot.support_position_from_body(body, candidate_quaternion, self.body_to_support_z_m)
+            .map_err(|error| ExploreError::SourceError(error.to_string()))?;
+        if let Some(model) = self.observation_model.as_ref() {
+            view = Some(snapshot.estimate_observation_view(model, body, candidate_quaternion, &observation_targets)
+                .map_err(ExploreError::SourceError)?);
+            candidate.gain = view.as_ref().map_or(0, |v| v.cells.len()) as f64 * f64::from(snapshot.config().voxel_size).powi(2);
+        }
+        if self.excluded(candidate.support_xyz, vertical_radius)
+            || view.as_ref().is_some_and(|view| view.cells.is_empty()) {
+            delta.deferred_route = Some(Some(continuation(examined_route_cursor)));
+            delta.route_cursor = Some(examined_route_cursor);
+            delta.last_no_frontier = Some(false);
+            return Ok(ExplorationPoll::Pending);
+        }
+        candidate.travel_cost = travel;
         delta.retry_support = Some(None);
         let next_goal_id = self.next_goal_id.checked_add(1).ok_or_else(|| {
             ExploreError::SourceError("surface frontier goal identifier exhausted".into())
         })?;
         delta.next_goal_id = Some(next_goal_id);
-        let travel = candidate.travel_cost;
         let mut goal = FrontierGoal::new(
             format!(
                 "{}-surface-{:016x}-{}",
@@ -1011,7 +1041,7 @@ impl SurfaceGoalSourceAdapter {
             (candidate.gain / (1.0 + travel)) as f32,
         );
         goal.information_gain = Some(candidate.gain as f32);
-        if let Some(view) = view {
+        if let Some(view) = &view {
             goal.metadata.insert(
                 "gain_basis".into(),
                 "calibrated_visible_support_cells".into(),
@@ -1025,6 +1055,9 @@ impl SurfaceGoalSourceAdapter {
         }
         goal.frontier_area_m2 = Some(candidate.gain as f32);
         goal.distance_cost = Some(travel as f32);
+        goal.metadata.insert("route_cost_basis".into(), "full_transition_source_tree_then_selected_astar".into());
+        goal.metadata.insert("route_exact_queries".into(), search.stats().exact_queries.to_string());
+        goal.metadata.insert("route_source_searches".into(), search.stats().source_searches.to_string());
         goal.producer = "nuwax-exploration/surface".into();
         goal.metadata.insert(
             "ground_reference_policy".into(),
@@ -1361,10 +1394,11 @@ const MAX_FRONTIER_ROUTE_QUERIES: usize = 64;
 struct FrontierRouteBudget {
     queries: std::cell::Cell<usize>,
     expanded: std::cell::Cell<usize>,
+    reserved: usize,
 }
 impl FrontierRouteBudget {
     fn exhausted(&self) -> bool {
-        self.queries.get() >= MAX_FRONTIER_ROUTE_QUERIES
+        self.queries.get() >= MAX_FRONTIER_ROUTE_QUERIES - self.reserved
     }
 }
 
@@ -1435,18 +1469,33 @@ fn frontier_route_cost(
     goal: [f64; 3],
     budget: &FrontierRouteBudget,
 ) -> Option<(f64, [f64; 3], f64)> {
+    frontier_query_cost(search, start, goal, budget, false)
+}
+
+fn frontier_rank_cost(
+    search: &mut nuwax_nav_pct_native::MultiGoalSearch<'_>,
+    start: [f64; 3], goal: [f64; 3], budget: &FrontierRouteBudget,
+) -> Option<(f64, [f64; 3], f64)> {
+    frontier_query_cost(search, start, goal, budget, true)
+}
+
+fn frontier_query_cost(
+    search: &mut nuwax_nav_pct_native::MultiGoalSearch<'_>,
+    start: [f64; 3], goal: [f64; 3], budget: &FrontierRouteBudget, rank: bool,
+) -> Option<(f64, [f64; 3], f64)> {
     if budget.exhausted() {
         return None;
     }
     // 保留逻辑目标预留次数；转移复用不能让本轮跳过原预算或游标。
     budget.queries.set(budget.queries.get() + 1);
     let started = std::time::Instant::now();
-    let result = search.cost(start, goal);
+    let result = if rank { search.rank_cost(start, goal) } else { search.cost(start, goal) };
     tracing::debug!(target: "navigation.exploration.compute", elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
         query = budget.queries.get(), ?start, ?goal,
         expanded = result.as_ref().ok().map(|route| route.expanded), error = ?result.as_ref().err(),
         checks = search.stats().checks, hits = search.stats().hits,
         source_searches = search.stats().source_searches, rejected = search.stats().rejected, "前沿共享路线查询完成");
+    tracing::debug!(target: "navigation.exploration.compute", stats = ?search.stats(), "前沿搜索累计分段");
     let route = result.ok()?;
     budget.expanded.set(budget.expanded.get() + route.expanded);
     Some((route.cost, route.endpoint, route.yaw))
@@ -4048,4 +4097,17 @@ mod tests {
     }
 
     include!("surface_view_ownership_tests.rs");
+
+    #[test]
+    fn reachable_frontier_batch_only_exactly_checks_the_selected_goal() {
+        let receiver = SurfaceInputReceiver::new();
+        receiver.observe(map()).unwrap();
+        let mut adapter = source(receiver, 1);
+        let selected = goal(adapter.poll_goal(&state(0.4, 1)).unwrap());
+        assert_eq!(selected.metadata["route_exact_queries"], "1");
+        assert!(selected.metadata["geometric_candidate_count"].parse::<usize>().unwrap() > 64);
+        assert!(selected.metadata["route_source_searches"].parse::<usize>().unwrap() <= 10);
+        assert!(selected.metadata["route_query_count"].parse::<usize>().unwrap() <= MAX_FRONTIER_ROUTE_QUERIES);
+        assert_eq!(selected.metadata["route_cost_basis"], "full_transition_source_tree_then_selected_astar");
+    }
 }

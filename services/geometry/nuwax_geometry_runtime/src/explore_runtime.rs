@@ -71,6 +71,7 @@ const POLICY_HIGHEST_SCORE: &str = "highest_score";
 const POLICY_FIRST_AVAILABLE: &str = "first_available";
 const DEFAULT_SCHEDULER_PERIOD: Duration = Duration::from_millis(200);
 const DEFAULT_POSE_RECEIPT_TTL: Duration = Duration::from_secs(1);
+const DEFAULT_POSE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_COSTMAP_RECEIPT_TTL: Duration = Duration::from_secs(2);
 const DEFAULT_NO_FRONTIER_STABILITY: Duration = Duration::from_secs(5);
 #[cfg(not(test))]
@@ -880,6 +881,7 @@ pub struct ExploreRuntimeInner {
     // 与守卫回执共用 CLOCK_MONOTONIC，不改变进度和输入新鲜度的原时钟。
     started_guard_clock_ns: u64,
     no_frontier_since: Option<Instant>,
+    pose_wait_since: Option<Instant>,
     frontiers: Vec<FrontierGoal>,
     frontier_revision: u64,
 }
@@ -946,6 +948,7 @@ impl ExploreRuntimeInner {
             started_at_ns: 0,
             started_guard_clock_ns: 0,
             no_frontier_since: None,
+            pose_wait_since: None,
             frontiers: Vec::new(),
             frontier_revision: 0,
         }
@@ -1953,6 +1956,7 @@ impl ExploreRuntimeHandle {
         guard.child_sequence = 0;
         guard.reached_goals = 0;
         guard.started_at_ns = now_unix_nanos();
+        guard.pose_wait_since = None;
         guard.started_guard_clock_ns = nuwax_motion_safety_guard::measured_motion::monotonic_ns();
         if let Some(saved)=restored {
             guard.mission=saved.mission;guard.return_reason=saved.return_reason;guard.reached_goals=saved.reached_goals;
@@ -2532,13 +2536,14 @@ impl ExploreRuntimeHandle {
 
     pub async fn tick_with_pose(&self, pose: ExploreRobotPose) -> ExploreRuntimeSnapshot {
         let generation = self.generation.load(Ordering::SeqCst);
-        self.tick_generation(generation, pose).await
+        self.tick_generation(generation, pose, None).await
     }
 
     async fn tick_generation(
         &self,
         generation: u64,
         pose: ExploreRobotPose,
+        pose_provider: Option<&dyn ExplorePoseProvider>,
     ) -> ExploreRuntimeSnapshot {
         let Ok(tick_permit) = self.tick_gate.clone().try_lock_owned() else { return self.snapshot(); };
         if ![pose.x, pose.y, pose.z]
@@ -2593,6 +2598,7 @@ impl ExploreRuntimeHandle {
         if generation != guard.generation || !guard.logical_active {
             return self.snapshot();
         }
+        guard.pose_wait_since = None;
 
         if guard.retained_child_dispatch {
             // Normally the original task still owns tick_gate. A panic can drop
@@ -2806,7 +2812,7 @@ impl ExploreRuntimeHandle {
                 ),
             );
             self.store_snapshot(snapshot);
-            return self.dispatch_child(generation, request, guard, tick_permit).await;
+            return self.dispatch_child_with_fresh_pose(generation, request, guard, tick_permit, pose_provider).await;
         }
 
         // 先确认提交所需的同步上下文，再允许选择器领取目标。
@@ -3045,7 +3051,7 @@ impl ExploreRuntimeHandle {
                 self.store_snapshot(dispatching);
                 guard.pending_child_dispatch = Some(request.clone());
                 selection_ticket.finish(&mut guard);
-                self.dispatch_child(generation, request, guard, tick_permit).await
+                self.dispatch_child_with_fresh_pose(generation, request, guard, tick_permit, pose_provider).await
             }
             Ok(ExplorationPoll::NoFrontier) => {
                 selection_ticket.finish(&mut guard);
@@ -3104,6 +3110,94 @@ impl ExploreRuntimeHandle {
                 )
                 .await
             }
+        }
+    }
+
+    async fn dispatch_child_with_fresh_pose(
+        &self,
+        generation: u64,
+        request: ChildNavigationRequest,
+        guard: tokio::sync::MutexGuard<'_, ExploreRuntimeInner>,
+        tick_permit: tokio::sync::OwnedMutexGuard<()>,
+        pose_provider: Option<&dyn ExplorePoseProvider>,
+    ) -> ExploreRuntimeSnapshot {
+        let Some(provider) = pose_provider else {
+            return self.dispatch_child(generation, request, guard, tick_permit).await;
+        };
+        // 原待派发请求已拥有本轮结果。等待不重新领取候选，也不释放单次派发许可。
+        drop(guard);
+        loop {
+            match provider.current_pose().await {
+                Ok(pose) => {
+                    let mut guard = self.inner.lock().await;
+                    if generation != guard.generation || !guard.logical_active
+                        || guard.pending_child_dispatch.as_ref() != Some(&request) {
+                        return self.snapshot();
+                    }
+                    if ![pose.x, pose.y, pose.z].iter().all(|value| value.is_finite())
+                        || !pose.orientation.yaw().is_finite()
+                        || normalize_frame(&pose.frame_id) != self.expected_map_frame.as_ref()
+                        || pose.source_timestamp_ns == 0 || pose.received_monotonic_ns == 0
+                        || now_monotonic_nanos().saturating_sub(pose.received_monotonic_ns) > DEFAULT_POSE_RECEIPT_TTL.as_nanos() as u64 {
+                        drop(guard);
+                        return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded,
+                            "恢复后的探索位姿无效".into()).await;
+                    }
+                    guard.pose_wait_since = None;
+                    if !guard.map_input_is_fresh(now_monotonic_nanos()) {
+                        let snapshot = guard.snapshot(STATUS_PENDING, "目标决策已保留，等待当前地图输入恢复");
+                        drop(guard);
+                        return self.store_snapshot(snapshot);
+                    }
+                    // 运动准入、当前位姿及地图身份仍由原导航投递拥有方再次核验。
+                    return self.dispatch_child(generation, request, guard, tick_permit).await;
+                }
+                Err(error) => {
+                    self.record_pose_wait(error).await;
+                    if !self.is_active().await { return self.snapshot(); }
+                }
+            }
+            tokio::time::sleep(DEFAULT_SCHEDULER_PERIOD).await;
+        }
+    }
+
+    async fn record_pose_wait(&self, error: String) -> ExploreRuntimeSnapshot {
+        let mut guard = self.inner.lock().await;
+        if !guard.logical_active || guard.pending_child_cancellation.is_some() { return self.snapshot(); }
+        let since = *guard.pose_wait_since.get_or_insert_with(Instant::now);
+        guard.no_frontier_since = None;
+        guard.last_poll = Some(ExplorationPoll::SourceUnavailable(error.clone()));
+        let parent_expired = guard.active_config.as_ref().and_then(|config| config.stop_conditions.max_duration_ms)
+            .is_some_and(|limit| now_unix_nanos().saturating_sub(guard.started_at_ns) >= limit.saturating_mul(1_000_000));
+        let input_expired = guard.active_child.is_none() && since.elapsed() >= DEFAULT_POSE_RECOVERY_TIMEOUT;
+        if parent_expired || input_expired {
+            drop(guard);
+            return self.finish_session(None, ExplorationStopReason::NoReachableFreeSpace,
+                format!("位姿输入持续未恢复，等待已到期限（{:.1}秒）：{error}", since.elapsed().as_secs_f64())).await;
+        }
+        let status = if guard.active_child.is_some() { STATUS_ACTIVE } else { STATUS_PENDING };
+        let retained = if guard.pending_child_dispatch.is_some() { "目标决策已保留" } else { "等待新鲜输入" };
+        let snapshot = guard.snapshot(status, format!("等待位姿输入恢复，{retained}（已等待{:.1}秒）：{error}", since.elapsed().as_secs_f64()));
+        drop(guard);
+        self.store_snapshot(snapshot)
+    }
+
+    async fn refresh_compute_status(&self, elapsed: Duration) {
+        let guard = self.inner.lock().await;
+        if !guard.logical_active || guard.pending_child_cancellation.is_some() { return; }
+        let expired = guard.active_config.as_ref().and_then(|config| config.stop_conditions.max_duration_ms)
+            .is_some_and(|limit| now_unix_nanos().saturating_sub(guard.started_at_ns) >= limit.saturating_mul(1_000_000));
+        // 需要返航的任务仍由原tick按同一份路线建议处理期限，状态刷新不能抢先结束父任务。
+        let return_on_completion = guard.mission.is_some()
+            && guard.active_config.as_ref().is_some_and(|config| config.return_policy.return_on_completion);
+        if expired && !return_on_completion {
+            drop(guard);
+            self.finish_session(None, ExplorationStopReason::DurationExceeded, "探索计算期间已到任务期限".into()).await;
+        } else if guard.compute.query_pending() && guard.pose_wait_since.is_none() {
+            let status = if guard.active_child.is_some() { STATUS_ACTIVE } else { STATUS_PENDING };
+            let snapshot = guard.snapshot(status, format!("正在评估探索前沿（已计算{:.1}秒）", elapsed.as_secs_f64()));
+            drop(guard);
+            self.store_snapshot(snapshot);
         }
     }
 
@@ -4320,28 +4414,23 @@ impl ExploreSchedulerHandle {
                         }
                         match pose_provider.current_pose().await {
                             Ok(pose) => {
-                                let _ = runtime.tick_with_pose(pose).await;
+                                let generation = runtime.generation.load(Ordering::SeqCst);
+                                let tick = runtime.tick_generation(generation, pose, Some(pose_provider.as_ref()));
+                                tokio::pin!(tick);
+                                let started = Instant::now();
+                                loop {
+                                    tokio::select! {
+                                        _ = &mut tick => break,
+                                        _ = interval.tick() => runtime.refresh_compute_status(started.elapsed()).await,
+                                        changed = shutdown_rx.changed() => {
+                                            if changed.is_err() || *shutdown_rx.borrow() { return; }
+                                        }
+                                    }
+                                }
                             }
                             Err(error) => {
-                                // 决策层允许低频输入。活动子导航由执行守卫按源时效停车，
-                                // 探索保留任务并等待其具名终态，不能抢先终止整个父任务。
-                                let mut guard = runtime.inner.lock().await;
-                                if !guard.logical_active || guard.pending_child_cancellation.is_some() {
-                                    continue;
-                                }
-                                guard.no_frontier_since = None;
-                                guard.last_poll = Some(ExplorationPoll::SourceUnavailable(error.clone()));
-                                let expired = guard.active_config.as_ref().and_then(|config| config.stop_conditions.max_duration_ms)
-                                    .is_some_and(|limit| now_unix_nanos().saturating_sub(guard.started_at_ns) >= limit.saturating_mul(1_000_000));
-                                if expired {
-                                    drop(guard);
-                                    let _ = runtime.finish_session(None, ExplorationStopReason::NoReachableFreeSpace,
-                                        format!("任务期限内位姿输入未恢复：{error}")).await;
-                                    continue;
-                                }
-                                let status = if guard.active_child.is_some() { STATUS_ACTIVE } else { STATUS_PENDING };
-                                let snapshot = guard.snapshot(status, format!("等待位姿输入恢复，目标决策已保留：{error}"));
-                                runtime.store_snapshot(snapshot);
+                                // 活动子导航的停车仍归执行端；无子目标的连续失鲜有界等待。
+                                runtime.record_pose_wait(error).await;
                             }
                         }
                     }
@@ -7426,6 +7515,7 @@ mod tests {
     }
 
     include!("explore_compute_runtime_tests.rs");
+    include!("explore_pose_recovery_tests.rs");
     include!("explore_compute_surface_tests.rs");
     include!("explore_composite_map_tests.rs");
     include!("explore_surface_incomplete_tests.rs");

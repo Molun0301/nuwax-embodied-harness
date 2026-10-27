@@ -119,6 +119,12 @@ pub struct MultiGoalStats {
     pub hits: usize,
     pub source_searches: usize,
     pub rejected: usize,
+    pub source_expanded: usize,
+    pub exact_queries: usize,
+    pub exact_searches: usize,
+    pub exact_expanded: usize,
+    pub source_elapsed_ms: f64,
+    pub exact_elapsed_ms: f64,
 }
 #[repr(C)]
 struct ConfigRaw {
@@ -171,6 +177,11 @@ unsafe extern "C" {
         cancel: extern "C" fn(*const c_void) -> bool, user: *const c_void,
         err: *mut c_char, cap: usize,
     ) -> i32;
+    fn pct_multi_goal_rank_cost(
+        search: *mut c_void, start: *const f64, goal: *const f64, cost: *mut RouteCost,
+        cancel: extern "C" fn(*const c_void) -> bool, user: *const c_void,
+        err: *mut c_char, cap: usize,
+    ) -> i32;
     fn pct_plan(
         planner: *mut c_void,
         start: *const f64,
@@ -192,7 +203,7 @@ pub struct Planner {
 // 原生实例无共享全局可变状态，移动所有权不会产生并发访问。
 unsafe impl Send for Planner {}
 /// 一轮多目标评估共享惰性转移图；可变借用保证地图与机体配置不会在轮内变化。
-/// 仍沿各目标的原裁剪窗口、软代价及稳定队列选路，保持路线长度与末段朝向。
+/// 完整查询保留原目标窗口与启发式；排名查询使用全图单源父链。
 pub struct MultiGoalSearch<'a> {
     native: NonNull<c_void>,
     _planner: std::marker::PhantomData<&'a mut Planner>,
@@ -201,6 +212,15 @@ impl Drop for MultiGoalSearch<'_> {
     fn drop(&mut self) { unsafe { pct_multi_goal_destroy(self.native.as_ptr()) } }
 }
 impl MultiGoalSearch<'_> {
+    /// 同一完整转移图单源父链的真实几何长度；目标只核验真实端点入边。
+    /// 用于前沿排序，允许与目标专属启发式搜索选取不同的等权路线。
+    pub fn rank_cost(&mut self, start: [f64; 3], goal: [f64; 3]) -> Result<RouteCost, String> {
+        let mut result = RouteCost::default();
+        let mut error = [0; 512];
+        let status = unsafe { pct_multi_goal_rank_cost(self.native.as_ptr(), start.as_ptr(), goal.as_ptr(),
+            &mut result, cancelled, std::ptr::null(), error.as_mut_ptr(), error.len()) };
+        if status == 0 { Ok(result) } else { Err(native_error(&error)) }
+    }
     pub fn cost(&mut self, start: [f64; 3], goal: [f64; 3]) -> Result<RouteCost, String> {
         self.cost_inner(start, goal, std::ptr::null())
     }

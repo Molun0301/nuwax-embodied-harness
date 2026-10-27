@@ -570,6 +570,9 @@ impl Default for ComputeState {
     }
 }
 impl ComputeState {
+    pub(super) fn query_pending(&self) -> bool {
+        self.job.is_some()
+    }
     #[cfg(test)]
     pub(super) fn lifecycle_counter_for_tests(&self) -> u64 {
         self.lifecycle_sequence

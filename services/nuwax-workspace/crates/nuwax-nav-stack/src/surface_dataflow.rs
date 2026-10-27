@@ -623,6 +623,8 @@ struct SurfaceJobTicket {
     goal_key: GoalKey,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     source: Arc<SurfaceSnapshot>,
+    /// 同域几何更新能否退休这次搜索；上一次搜索已被新几何退休时，本次必须算完。
+    retire_on_geometry: bool,
 }
 
 /// 联验可注入真实但隔离的LCM连接，生产包装仍执行同一循环。
@@ -668,6 +670,8 @@ async fn run_surface_planner_with_computer(
     let mut computations = tokio::task::JoinSet::new();
     let mut path_computations = tokio::task::JoinSet::new();
     let mut path_cancellation: Option<SurfaceJobTicket> = None;
+    // 建图期间几何持续更新；搜索比更新间隔慢时，逐次退休会让同一目标永远等不到结果。
+    let mut geometry_retired = false;
     let mut pending_map: Option<(Arc<schema::NavigationMap3D>, Instant, u64, Option<Arc<nuwax_map_chunks::Manifest>>)> = None;
     let mut map_retry_after = Instant::now();
     let mut map_retry_dependency: Option<SurfaceMapRetryDependency> = None;
@@ -824,9 +828,11 @@ async fn run_surface_planner_with_computer(
                     last_path = None; execution_admitted = false;
                 }
                 if let (Some(ticket), Ok(current)) = (&path_cancellation, &update.snapshot) {
-                    if !nuwax_nav_runtime::native_map::same_source_geometry(&ticket.source, current) {
+                    if ticket.retire_on_geometry
+                        && !nuwax_nav_runtime::native_map::same_source_geometry(&ticket.source, current) {
                         ticket.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
                         needs_plan = true;
+                        geometry_retired = true;
                     }
                 }
                 hub.publish(update.clone());
@@ -843,6 +849,7 @@ async fn run_surface_planner_with_computer(
                     || goal.as_ref().is_none_or(|active| active.goal_key() != planned_goal.goal_key()) {
                     continue;
                 }
+                geometry_retired = false;
                 match result {
                     Ok(path) => {
                         path_revision += 1;
@@ -944,7 +951,7 @@ async fn run_surface_planner_with_computer(
                 failed_input = None;
                 newest_goal = Some(incoming.clone()); goal = Some(incoming);
                 path_revision = 0; last_path = None; needs_plan = true; execution_admitted = false;
-                retry_after = Instant::now();
+                retry_after = Instant::now(); geometry_retired = false;
             }
             frame = poses.next() => {
                 let Some(input)=drain_guarded_pose_input(frame,&mut poses,&mut diagnostics,None)? else {continue;};
@@ -981,6 +988,7 @@ async fn run_surface_planner_with_computer(
                 config.planning_cancelled = Some(Arc::clone(&cancelled));
                 path_cancellation = Some(SurfaceJobTicket {
                     epoch, goal_key: planned_goal.goal_key(), cancelled, source: Arc::clone(&surface),
+                    retire_on_geometry: !geometry_retired,
                 });
                 let computer = Arc::clone(&computer);
                 hub.planning.send_replace(Some((planned_goal.session_id.clone(), planned_goal.goal_key(), "正在计算PCT全局路线".into())));
@@ -2603,6 +2611,51 @@ mod tests {
         }).await.expect("旧搜索必须收到明确取消");
         harness.wait_controlling().await;
         assert_eq!(harness.scheduler.status().path_revision,path.path_revision as u64);
+        harness.cancel(&goal).await;harness.terminal(TerminalOutcome::Cancelled).await;
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn continuous_geometry_updates_cannot_starve_a_slow_search() {
+        use std::sync::atomic::{AtomicBool,AtomicUsize,Ordering as Order};
+        // 每次搜索都比几何更新间隔慢；被新几何退休一次后，下一次搜索必须算完并交付。
+        let retired=Arc::new(AtomicUsize::new(0));let counted=Arc::clone(&retired);
+        let computer:SurfacePathComputer=Arc::new(move |map,pose,goal,config| {
+            let deadline=Instant::now()+Duration::from_millis(250);
+            while Instant::now()<deadline {
+                if config.planning_cancelled.as_ref().is_some_and(|flag|flag.load(Order::Relaxed)) {
+                    counted.fetch_add(1,Order::SeqCst);
+                    return Err(module_error("test slow search","已被新几何退休"));
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            body_path(map,pose,goal,config)
+        });
+        let mut harness=Harness::start_with_computer(computer).await;
+        harness.wait_ready().await;
+        let running=Arc::new(AtomicBool::new(true));
+        let (feed,keep)=(Arc::clone(&harness.feed),Arc::clone(&running));
+        // 远离路线的新增点只改变几何，不改变可达性。
+        let mutator=tokio::spawn(async move {
+            let mut index=0_u32;
+            while keep.load(Order::SeqCst) {
+                {
+                    let mut feed=feed.lock().unwrap();
+                    for value in [-3.0_f32-0.05*(index%40) as f32,-3.0,0.05] {feed.map.cloud.data.extend_from_slice(&value.to_le_bytes());}
+                    feed.map.cloud.width+=1;feed.map.cloud.row_step+=12;
+                }
+                index+=1;
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        });
+        let goal=goal_for(&harness.feed.lock().unwrap().map,1,[3.2,1.55,2.5]);
+        harness.goal(&goal).await;
+        let path=tokio::time::timeout(Duration::from_secs(3),harness.path_for(&goal)).await
+            .expect("持续建图时搜索被反复退休，路线永远不交付");
+        assert!(!path.path.poses.is_empty());
+        assert!(retired.load(Order::SeqCst)<=1,"连续退休了{}次",retired.load(Order::SeqCst));
+        running.store(false,Order::SeqCst);
+        mutator.await.unwrap();
         harness.cancel(&goal).await;harness.terminal(TerminalOutcome::Cancelled).await;
         harness.shutdown().await;
     }

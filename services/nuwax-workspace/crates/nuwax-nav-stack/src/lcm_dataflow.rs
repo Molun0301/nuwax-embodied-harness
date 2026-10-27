@@ -2967,15 +2967,48 @@ where
     let Some(active_goal) = eligible else {
         return GuardedInputSettlement { input: input.await, cancel: Ok(None) };
     };
+    let mut status = scheduler.subscribe_status();
+    let mut heartbeat = tokio::time::interval(Duration::from_millis(500));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tokio::pin!(input);
     loop {
+        // 输入确认可能等待原停车证明；等待期间继续发布实际状态，
+        // 不发布规划输入观察，不把尚未消费的位姿或地图标成新鲜。
+        let mut observed_status = false;
         let message = tokio::select! {
             biased;
             result = &mut input => return GuardedInputSettlement { input: result, cancel: Ok(None) },
             message = cancels.next() => message,
+            changed = status.changed() => {
+                if changed.is_ok() { observed_status = true; }
+                None
+            },
+            _ = heartbeat.tick() => { observed_status = true; None },
         };
-        arbiter.record_dispatch(GuardedNavSource::Cancel);
-        let decoded = decode_guarded_cancel(message).map(|decoded| match decoded {
+        let mut publication_error = None;
+        if observed_status {
+            let snapshot = status.borrow_and_update().clone();
+            let publication = publish_guarded_nav_state(transport, &node.outputs[1], snapshot, telemetry, None);
+            // 状态回执的背压同样沿现有发布/取消协作收敛，不能挡住守卫归零。
+            match await_guarded_tail_publication(publication, scheduler, cancels,
+                Some(active_goal), watermark, arbiter).await {
+                Ok(None) => continue,
+                Ok(Some(OwnerInput::Accepted(completion))) => {
+                    return GuardedInputSettlement { input: input.await, cancel: Ok(Some(completion)) };
+                }
+                Ok(Some(OwnerInput::Rejected(reason))) => {
+                    match publish_guarded_rejection(transport, &node.outputs[1], scheduler.status(),
+                        telemetry, "cancel", &reason).await {
+                        Ok(()) => continue,
+                        Err(error) => publication_error = Some(error),
+                    }
+                }
+                Err(error) => publication_error = Some(error),
+            }
+            // 发布失败沿已有关闭清理收敛在途输入，不能遗失已入队的请求。
+        }
+        if !observed_status { arbiter.record_dispatch(GuardedNavSource::Cancel); }
+        let decoded = publication_error.map_or_else(|| decode_guarded_cancel(message), Err).map(|decoded| match decoded {
             OwnerInput::Accepted((cancel, generation)) => {
                 match admit_guarded_active_cancel(&cancel, generation, active_goal, watermark) {
                     Ok(()) => OwnerInput::Accepted((cancel, generation)),

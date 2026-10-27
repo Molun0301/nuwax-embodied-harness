@@ -2217,7 +2217,8 @@ where
                 self.publish_status(status_tx);
                 original
             }
-            Err(RuntimeError::StopUnconfirmed(reason)) => RuntimeError::StopUnconfirmed(format!("{original}; {reason}")),
+            // finish_terminal 已将首因和停车失败一并发布，不能在返回时重复拼接。
+            Err(RuntimeError::StopUnconfirmed(reason)) => RuntimeError::StopUnconfirmed(reason),
             Err(fence_error) => RuntimeError::Motion(format!(
                 "{original}; explicit fence also failed: {fence_error}"
             )),
@@ -2254,9 +2255,15 @@ where
             if self.status.phase != SchedulerPhase::Cancelling {
                 self.status.phase = SchedulerPhase::Fencing;
                 self.status.message = format!("waiting for {terminal:?} fence proof");
+                if let Some(reason) = &failure_reason {
+                    self.status.message.push_str("; ");
+                    self.status.message.push_str(reason);
+                }
                 self.publish_status(status_tx);
             }
             let operation_id = self.next_operation_id("fence")?;
+            tracing::info!(session_id = ?self.status.session_id, %operation_id, ?terminal,
+                reason = ?failure_reason, "导航开始撤租归零并等待停稳");
             #[cfg(feature = "surface-recovery-qualification")]
             self.qualification_snapshot("scheduler.fence.enter", self.status.pose_source_timestamp_ns, None, 0);
             let outcome = {
@@ -2270,11 +2277,15 @@ where
             let proof = match outcome {
                 Ok(proof) => proof,
                 Err(error) => {
-                    self.fail_status(status_tx, &error.message);
+                    // 通信/执行失败的首因须留在同一安全失败中；规划失败仍以原停车错误为主。
+                    let reason = failure_reason.as_ref().filter(|_| terminal == TerminalOutcome::SafetyFailed)
+                        .map_or_else(|| error.message.clone(),
+                        |cause| format!("{cause}; fence failed: {}", error.message));
+                    self.fail_status(status_tx, &reason);
                     if error.stop_unconfirmed {
-                        return Err(RuntimeError::StopUnconfirmed(error.message));
+                        return Err(RuntimeError::StopUnconfirmed(reason));
                     }
-                    return Err(RuntimeError::Motion(error.message));
+                    return Err(RuntimeError::Motion(reason));
                 }
             };
             self.lease_active = false;
@@ -5279,6 +5290,30 @@ mod tests {
             assert!(status.last_zero_ack_id.is_some());
             assert!(status.message.contains("目标前方没有可行支撑"),"首次终态丢失原因: {}",status.message);
         }
+    }
+
+    #[tokio::test]
+    async fn failed_motion_and_unconfirmed_fence_keep_both_causes() {
+        let motion = FakeMotion(Arc::new(Mutex::new(FakeMotionState {
+            unconfirmed_fences: 1, ..Default::default()
+        })));
+        let mut scheduler = NavScheduler::new(motion, FakePlanner::commanding(),
+            SchedulerConfig::default()).unwrap();
+        scheduler.session = Some(session());
+        scheduler.lease_active = true;
+        let (sender, observed) = watch::channel(scheduler.status.clone());
+        let error = scheduler.fail_closed(&sender,
+            RuntimeError::Motion("injected APPLIED timeout".into())).await;
+        assert!(matches!(error, RuntimeError::StopUnconfirmed(_)));
+        let snapshot = observed.borrow().clone();
+        assert!(snapshot.message.contains("injected APPLIED timeout"));
+        assert!(snapshot.message.contains("等待实际停稳"));
+        assert!(snapshot.last_terminal.is_none());
+        assert!(snapshot.last_zero_ack_id.is_none());
+        assert!(!snapshot.motion_sink_ready);
+        assert!(scheduler.lease_active && scheduler.session.is_some());
+        scheduler.cancel(&sender, "goal-1").await.unwrap();
+        assert_eq!(observed.borrow().last_terminal, Some(TerminalOutcome::Cancelled));
     }
 
     #[tokio::test]

@@ -470,7 +470,7 @@ fn source_fixture(goal: &schema::GoalEnvelope, source: i64, received_at: Instant
         cloud_source_timestamp_ns: source, commit_boot_nonce: goal.committed_map_boot_nonce,
     };
     surface_dataflow::PreparedSurfaceMap { authority, source_timestamp_ns: source, received_at,
-        awaiting_build: false, snapshot: Ok(snapshot), planar_reference: None, change_basis: None,
+        awaiting_build: false, snapshot: Ok(snapshot), change_basis: None,
         geometry_changes: Arc::new(crate::surface_map::SurfaceGeometryChanges::Empty) }
 }
 #[cfg(feature = "mls")]
@@ -1018,4 +1018,57 @@ async fn guarded_ordinary_ack_unconfirmed_stop_never_publishes_cancelled() {
     assert!(first(&report, A) < first(&report, B));
     assert_eq!(matching(&report, "scheduler.input.reply.ok", 2_000_000_000).len(), 1);
     assert!(first(&report, "ordinary_ack_test.unconfirmed_checkpoint") < first(&report, "ordinary_ack_test.fence_proof"));
+}
+
+
+#[tokio::test(flavor = "current_thread")]
+async fn pending_input_keeps_state_heartbeat_without_refreshing_planner_observation() {
+    run(|h| Box::pin(async move {
+        let goal = h.activate("pending-input-heartbeat").await;
+        while h.states.next().now_or_never().is_some() {}
+        h.block_renew().await;
+        received(h.pose(2)).await;
+        // 只接纳原输入进入等待之后生成的状态，不能拿历史帧充当心跳。
+        let mut after = current_unix_timestamp_ns().unwrap();
+        for _ in 0..2 {
+            let state = h.state_when(|s| s.session_id == goal.session_id
+                && s.runtime_generation == 0 && s.pose_source_timestamp_ns == 1_000_000_000
+                && s.stamp_sec * 1_000_000_000 + i64::from(s.stamp_nsec) > after).await;
+            after = state.stamp_sec * 1_000_000_000 + i64::from(state.stamp_nsec);
+            assert!(state.planner_map_frame.is_empty() && state.planner_pose_frame.is_empty());
+            assert!(state.zero_ack_id.is_empty());
+            assert_eq!(h.scheduler.status().pose_source_timestamp_ns, 1_000_000_000);
+        }
+        h.probe.release(Gate::Renew);
+        h.status_when(|s| s.pose_source_timestamp_ns == 2_000_000_000).await;
+        let state = h.state_when(|s| s.session_id == goal.session_id
+            && s.runtime_generation > 0 && s.pose_source_timestamp_ns == 2_000_000_000).await;
+        assert!(!state.planner_pose_frame.is_empty());
+    })).await;
+}
+
+
+#[tokio::test(flavor = "current_thread")]
+async fn pending_input_publishes_real_fencing_status_before_stop_proof() {
+    run(|h| Box::pin(async move {
+        let goal = h.activate("pending-input-fence-state").await;
+        while h.states.next().now_or_never().is_some() {}
+        h.probe.arm(Gate::Fence);
+        let scheduler = h.scheduler.clone();
+        let report = tokio::spawn(async move {
+            scheduler.report_planning_failure(goal.session_id.clone(), goal.goal_key(),
+                "测试规划失败".into()).await
+        });
+        h.probe.wait(MotionEvent::Enter(Gate::Fence)).await;
+        received(h.pose(2)).await;
+        let state = h.state_when(|s| s.message.contains("waiting for PlannerFailed fence proof")).await;
+        assert!(state.message.contains("测试规划失败"));
+        assert!(state.zero_ack_id.is_empty());
+        assert_eq!(state.runtime_generation, 0);
+        assert_eq!(state.pose_source_timestamp_ns, 1_000_000_000);
+        assert!(state.planner_pose_frame.is_empty());
+        h.probe.release(Gate::Fence);
+        report.await.unwrap().unwrap();
+        h.status_when(|s| s.pose_source_timestamp_ns == 2_000_000_000).await;
+    })).await;
 }

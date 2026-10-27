@@ -608,7 +608,6 @@ async fn matrix_scheduler(
             handle.start_session(nuwax_nav_runtime::NavSession {
                 boundary: Vec::new(), options: Default::default(),
                 goal: nuwax_nav_runtime::ExecutionGoal::Body(pose_from_schema(&goal.goal).expect("matrix goal pose")),
-                ground_initial: None,
                 session_id: goal.session_id.clone(),
                 execution_identity: guarded_goal_execution_identity(goal),
 

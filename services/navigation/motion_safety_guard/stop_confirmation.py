@@ -30,7 +30,7 @@ class StopProgress:
     deadline: float
     earliest: float
     has_feedback: bool
-    first_settled: Optional[float] = None
+    first_settled: Optional[int] = None
     previous_source: int = 0
     count: int = 0
     samples: deque = field(default_factory=lambda: deque(maxlen=64))
@@ -154,7 +154,9 @@ class StopConfirmation:
                 samples = progress.samples
                 now_ns = round(now * 1_000_000_000)
                 samples.append((now_ns, math.hypot(value.linear_x_mps, value.linear_y_mps), abs(value.angular_z_rps)))
-                while len(samples) > 1 and samples[1][0] <= now_ns - 100_000_000:
+                # 时间跨度和样本数都是下限；低频反馈也须保留三个不同采样。
+                # 断流仍由原新鲜度校验清空窗口，不借保留样本延长反馈有效期。
+                while len(samples) > 3 and samples[1][0] <= now_ns - 100_000_000:
                     samples.popleft()
                 linear = sum(sample[1] for sample in samples) / len(samples)
                 angular = sum(sample[2] for sample in samples) / len(samples)
@@ -164,9 +166,9 @@ class StopConfirmation:
                     "停稳反馈窗口%.3f秒，速度均值%.4f米/秒、角速度均值%.4f弧度/秒，尚未满足连续停稳条件。"
                     % ((now_ns - samples[0][0]) / 1_000_000_000, linear, angular))
                 if now >= progress.earliest and stopped:
-                    progress.first_settled = now if progress.first_settled is None else progress.first_settled
+                    progress.first_settled = now_ns if progress.first_settled is None else progress.first_settled
                     progress.count += 1
-                    if progress.count >= 2 and now - progress.first_settled >= 0.05:
+                    if progress.count >= 2 and now_ns - progress.first_settled >= 50_000_000:
                         return self._complete(StopEvidence(True, "measured_feedback", value.source_timestamp_ns))
                 else:
                     progress.first_settled, progress.count = None, 0

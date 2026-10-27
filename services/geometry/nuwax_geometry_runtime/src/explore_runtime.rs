@@ -72,6 +72,7 @@ const POLICY_FIRST_AVAILABLE: &str = "first_available";
 const DEFAULT_SCHEDULER_PERIOD: Duration = Duration::from_millis(200);
 const DEFAULT_POSE_RECEIPT_TTL: Duration = Duration::from_secs(1);
 const DEFAULT_POSE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_SELECTION_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_COSTMAP_RECEIPT_TTL: Duration = Duration::from_secs(2);
 const DEFAULT_NO_FRONTIER_STABILITY: Duration = Duration::from_secs(5);
 #[cfg(not(test))]
@@ -882,6 +883,7 @@ pub struct ExploreRuntimeInner {
     started_guard_clock_ns: u64,
     no_frontier_since: Option<Instant>,
     pose_wait_since: Option<Instant>,
+    selection_wait_since: Option<Instant>,
     frontiers: Vec<FrontierGoal>,
     frontier_revision: u64,
 }
@@ -949,6 +951,7 @@ impl ExploreRuntimeInner {
             started_guard_clock_ns: 0,
             no_frontier_since: None,
             pose_wait_since: None,
+            selection_wait_since: None,
             frontiers: Vec::new(),
             frontier_revision: 0,
         }
@@ -956,6 +959,24 @@ impl ExploreRuntimeInner {
 
     fn session_in_progress(&self) -> bool {
         self.logical_active || self.compute.start_reservation.is_some() || self.compute.control_pending() || self.pending_child_cancellation.is_some()
+    }
+
+    /// 待继续、换图丢弃和短暂失鲜共用同一等待期限，只有实际交付子导航才清除。
+    fn selection_wait_failure(&mut self) -> Option<String> {
+        if !self.logical_active || self.active_child.is_some()
+            || self.pending_child_cancellation.is_some()
+            || (self.no_frontier_since.is_some()
+                && matches!(self.last_poll, Some(ExplorationPoll::NoFrontier))) {
+            return None;
+        }
+        let since = *self.selection_wait_since.get_or_insert_with(Instant::now);
+        let limit = self.active_config.as_ref()
+            .and_then(|config| config.stop_conditions.no_frontier_timeout_ms)
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_SELECTION_PROGRESS_TIMEOUT);
+        (since.elapsed() >= limit).then(|| format!(
+            "ResourceLimited: exploration_selection_stalled，连续{:.1}秒未能交付子导航；前沿是否可达尚未确定",
+            since.elapsed().as_secs_f64()))
     }
 
     fn update_frontiers(&mut self, frontiers: Vec<FrontierGoal>) -> Option<FrontierSnapshot> {
@@ -1957,6 +1978,7 @@ impl ExploreRuntimeHandle {
         guard.reached_goals = 0;
         guard.started_at_ns = now_unix_nanos();
         guard.pose_wait_since = None;
+        guard.selection_wait_since = None;
         guard.started_guard_clock_ns = nuwax_motion_safety_guard::measured_motion::monotonic_ns();
         if let Some(saved)=restored {
             guard.mission=saved.mission;guard.return_reason=saved.return_reason;guard.reached_goals=saved.reached_goals;
@@ -2745,6 +2767,11 @@ impl ExploreRuntimeHandle {
             return self.store_snapshot(snapshot);
         }
 
+        if let Some(error) = guard.selection_wait_failure() {
+            drop(guard);
+            return self.finish_session(None, ExplorationStopReason::PlanningResourceLimited, error).await;
+        }
+
         let surface_mode = guard.surface_mode.is_some();
         let costmap = if surface_mode {
             if !guard
@@ -3165,6 +3192,10 @@ impl ExploreRuntimeHandle {
         let mut guard = self.inner.lock().await;
         if !guard.logical_active || guard.pending_child_cancellation.is_some() { return self.snapshot(); }
         let since = *guard.pose_wait_since.get_or_insert_with(Instant::now);
+        if let Some(error) = guard.selection_wait_failure() {
+            drop(guard);
+            return self.finish_session(None, ExplorationStopReason::PlanningResourceLimited, error).await;
+        }
         guard.no_frontier_since = None;
         guard.last_poll = Some(ExplorationPoll::SourceUnavailable(error.clone()));
         let parent_expired = guard.active_config.as_ref().and_then(|config| config.stop_conditions.max_duration_ms)
@@ -3183,8 +3214,13 @@ impl ExploreRuntimeHandle {
     }
 
     async fn refresh_compute_status(&self, elapsed: Duration) {
-        let guard = self.inner.lock().await;
+        let mut guard = self.inner.lock().await;
         if !guard.logical_active || guard.pending_child_cancellation.is_some() { return; }
+        if let Some(error) = guard.selection_wait_failure() {
+            drop(guard);
+            self.finish_session(None, ExplorationStopReason::PlanningResourceLimited, error).await;
+            return;
+        }
         let expired = guard.active_config.as_ref().and_then(|config| config.stop_conditions.max_duration_ms)
             .is_some_and(|limit| now_unix_nanos().saturating_sub(guard.started_at_ns) >= limit.saturating_mul(1_000_000));
         // 需要返航的任务仍由原tick按同一份路线建议处理期限，状态刷新不能抢先结束父任务。
@@ -3341,6 +3377,7 @@ impl ExploreRuntimeHandle {
                     return;
                 }
                 guard.pending_child_dispatch = None;
+                guard.selection_wait_since = None;
                 let child_request_id = ticket.lease.session_id.clone();
                 guard.active_child = Some(ActiveChildNavigation {
                     request_id: child_request_id.clone(),
@@ -3579,6 +3616,34 @@ impl ExploreRuntimeHandle {
         drop(guard);
         self.publish_frontiers(frontier_update);
         self.store_snapshot(snapshot)
+    }
+
+    /// 未确认停车不属于前沿失败；结束业务并由原停车拥有方保留精确租约的回收责任。
+    pub async fn report_navigation_stop_unconfirmed(
+        &self,
+        child_request_id: &str,
+        proof: ChildNavigationTerminalProof,
+        reason: String,
+    ) -> Result<ExploreRuntimeSnapshot, String> {
+        let mut guard = self.inner.lock().await;
+        let child = guard.active_child.as_ref().ok_or("no active exploration child navigation")?;
+        if child.request_id != child_request_id || !child.lease.matches(&proof.lease) {
+            return Err("unconfirmed stop does not match active child ownership".into());
+        }
+        let lease = child.lease.clone();
+        guard.pending_child_cancellation.get_or_insert_with(|| PendingChildCancellation {
+            action: PendingChildAction {
+                reason: ExplorationStopReason::ConsecutiveFailuresExceeded,
+                message: "子导航停车未确认，探索结束".into(),
+            },
+            ticket: None,
+            failure: None,
+            dispatch_in_flight: false,
+            early_terminals: Vec::new(),
+        });
+        drop(guard);
+        Ok(self.record_child_cancel_failure(&lease,
+            format!("子导航停车未确认，保留原租约停车责任：{reason}"), None).await)
     }
 
     pub async fn report_navigation_result(
@@ -7516,6 +7581,7 @@ mod tests {
 
     include!("explore_compute_runtime_tests.rs");
     include!("explore_pose_recovery_tests.rs");
+    include!("explore_stop_recovery_tests.rs");
     include!("explore_compute_surface_tests.rs");
     include!("explore_composite_map_tests.rs");
     include!("explore_surface_incomplete_tests.rs");

@@ -6536,7 +6536,23 @@ async fn report_exploration_navigation_terminal(
     {
         return;
     }
-    if let Some(result) = exploration_navigation_terminal_result(update) {
+    if update.state.status == "FAILED" && !update.feedback.actuator_zeroed
+        && update.feedback.reason_code != "LEASE_NOT_GRANTED"
+        && !matches!(update.feedback.cancel_phase.as_str(), "FAILED" | "TIMED_OUT") {
+        let proof = crate::explore_runtime::ChildNavigationTerminalProof {
+            lease: crate::explore_runtime::ChildNavigationLease {
+                session_id: update.state.goal_id.clone(),
+                owner_kind: update.feedback.owner_kind,
+                parent_request_id: update.feedback.parent_request_id.clone(),
+                goal_generation: update.feedback.goal_generation,
+                producer_runtime_generation: update.producer_runtime_generation,
+            },
+        };
+        if let Err(error) = explore.report_navigation_stop_unconfirmed(
+            &child_task_id, proof, update.state.message.clone()).await {
+            warn!(child_task_id, %error, "exploration unconfirmed child stop rejected");
+        }
+    } else if let Some(result) = exploration_navigation_terminal_result(update) {
         if let Err(error) = explore
             .report_navigation_result(&child_task_id, result)
             .await
@@ -6552,7 +6568,7 @@ async fn fanout_navigation_update(
     explore: &crate::explore_runtime::ExploreRuntimeHandle,
     update: NavigationUpdate,
 ) {
-    if exploration_navigation_terminal_result(&update).is_some() {
+    if matches!(update.state.status.as_str(), "SUCCEEDED" | "FAILED" | "CANCELLED") {
         match state.try_write() {
             Ok(mut state) => state.nav_state = update.state.clone(),
             Err(_) => warn!(
@@ -6582,7 +6598,7 @@ fn exploration_navigation_terminal_result(
         },
     };
     match update.state.status.as_str() {
-        "SUCCEEDED" => Some(crate::explore_runtime::ChildNavigationResult::Reached(
+        "SUCCEEDED" if update.feedback.actuator_zeroed => Some(crate::explore_runtime::ChildNavigationResult::Reached(
             proof,
         )),
         "FAILED"
@@ -6599,7 +6615,8 @@ fn exploration_navigation_terminal_result(
                 },
             )
         }
-        "FAILED" => Some(crate::explore_runtime::ChildNavigationResult::Failed {
+        // 原准入拥有方已证明没有取得运动租约的拒绝，仍沿原前沿反馈收敛。
+        "FAILED" if update.feedback.actuator_zeroed || update.feedback.reason_code == "LEASE_NOT_GRANTED" => Some(crate::explore_runtime::ChildNavigationResult::Failed {
             proof,
             reason: update.state.message.clone(),
         }),
@@ -20513,6 +20530,18 @@ mod exploration_adapter_tests {
 
     #[test]
     fn exploration_terminal_adapter_preserves_zeroed_and_failure_proof() {
+        for status in ["SUCCEEDED", "FAILED"] {
+            let mut update = exploration_update(status);
+            assert!(exploration_navigation_terminal_result(&update).is_none(),
+                "未确认停车不能交付前沿终态");
+            update.feedback.actuator_zeroed = true;
+            assert!(exploration_navigation_terminal_result(&update).is_some());
+        }
+        let mut unleased = exploration_update("FAILED");
+        unleased.feedback.reason_code = "LEASE_NOT_GRANTED".into();
+        assert!(matches!(exploration_navigation_terminal_result(&unleased),
+            Some(crate::explore_runtime::ChildNavigationResult::Failed { .. })),
+            "具名无租约拒绝不要求伪造停车证明");
         let mut cancelled = exploration_update("CANCELLED");
         cancelled.feedback.actuator_zeroed = true;
         cancelled.feedback.cancel_generation = 11;

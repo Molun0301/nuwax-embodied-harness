@@ -78,7 +78,7 @@ async fn active(
     ttl: Duration,
 ) -> (Harness, schema::NavigationMap3D, schema::GoalEnvelope, i64) {
     let mut harness = Harness::start_with_components(
-        Arc::new(body_path),
+        Arc::new(|m,p,g,c|body_path(m,p,g,c).map(SurfacePlan::complete)),
         Duration::from_millis(25),
         config(),
         true,

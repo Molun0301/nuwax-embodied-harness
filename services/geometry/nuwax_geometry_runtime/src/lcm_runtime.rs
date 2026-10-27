@@ -21514,7 +21514,8 @@ admitted_guard_clock_ns: nuwax_motion_safety_guard::measured_motion::monotonic_n
         assert_eq!(nav.active_goal_lease().await.unwrap().path_revision, 0);
 
         let path = schema::PathEnvelope {
-            schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
+            route_kind: 0,
+            schema_version: schema::PATH_ENVELOPE_SCHEMA_VERSION,
             session_id: lease.session_id.clone(),
 
 
@@ -24562,7 +24563,8 @@ mod retained_firstfix_proof_controls {
             schema::decode_goal_envelope_body(&frame.payload).unwrap()
         };
         let path = schema::PathEnvelope {
-            schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
+            route_kind: 0,
+            schema_version: schema::PATH_ENVELOPE_SCHEMA_VERSION,
             session_id: lease.session_id.clone(),
              goal_generation: lease.goal_generation as i64,
 

@@ -29,6 +29,11 @@ struct _nuwax_msgs_PathEnvelope
     int64_t    goal_generation;
     int64_t    planner_runtime_generation;
     int64_t    path_revision;
+
+    /**
+     * 0为完整路线，1为仅到可达已观测地面的逼近路线。
+     */
+    int8_t     route_kind;
     nav_msgs_Path path;
 };
 

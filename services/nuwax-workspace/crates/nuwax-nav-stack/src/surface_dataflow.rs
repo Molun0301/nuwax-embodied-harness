@@ -35,7 +35,7 @@ struct SurfaceMapHub {
     body_reference_frame_id: Arc<str>,
     latest: Arc<Mutex<Option<PreparedSurfaceMap>>>,
     events: tokio::sync::broadcast::Sender<PreparedSurfaceMap>,
-    planning: tokio::sync::watch::Sender<Option<(String,GoalKey,String)>>,
+    planning: tokio::sync::watch::Sender<Option<(String,GoalKey,String,bool)>>,
     // Same in-process scheduler owner; no new wire fields or inferred ground.
     execution_feedback: tokio::sync::watch::Sender<Option<SurfaceReplanFeedback>>,
     #[cfg(test)] map_computer: Option<SurfaceMapComputer>,
@@ -226,8 +226,10 @@ where
         loop {
             planning.changed().await.map_err(|error|module_error("planning diagnostics",error))?;
             let update=planning.borrow_and_update().clone();
-            if let Some((id,hash,message))=update {
-                scheduler.report_planning_diagnostic(id,hash,message).await.map_err(|error|module_error("planning diagnostics",error))?;
+            if let Some((id,hash,message,failed))=update {
+                if failed { scheduler.report_planning_failure(id,hash,message).await }
+                else { scheduler.report_planning_diagnostic(id,hash,message).await }
+                    .map_err(|error|module_error("planning diagnostics",error))?;
             }
         }
         #[allow(unreachable_code)] Ok::<(),NavStackError>(())
@@ -507,6 +509,13 @@ fn prepare_surface_map_with_retry(
     (prepared, missing_object)
 }
 
+#[derive(Clone)]
+struct SurfacePlan { path: Path3D, kind: nuwax_nav_runtime::RouteKind, resolution: f64 }
+impl SurfacePlan {
+    #[cfg(test)] fn complete(path: Path3D) -> Self { Self {path,kind:nuwax_nav_runtime::RouteKind::Complete,resolution:0.1} }
+}
+
+#[cfg(test)]
 fn body_path(surface: &SurfaceSnapshot, start: &PoseStamped, goal: &schema::GoalEnvelope,
     config: &SurfaceNavigationConfig) -> NavStackResult<Path3D> {
     let p = start.pose.position;
@@ -521,6 +530,22 @@ fn body_path(surface: &SurfaceSnapshot, start: &PoseStamped, goal: &schema::Goal
         pose: Pose3 { position: Point3::new(point[0], point[1], point[2]),
             orientation: Quaternion {x:orientation[0],y:orientation[1],z:orientation[2],w:orientation[3]} },
     }).collect() })
+}
+
+fn body_path_progressive(surface: &SurfaceSnapshot, start: &PoseStamped, goal: &schema::GoalEnvelope,
+    config: &SurfaceNavigationConfig) -> NavStackResult<SurfacePlan> {
+    let p = start.pose.position;
+    let q = start.pose.orientation;
+    let boundary: Vec<_> = goal.boundary_points.iter().map(|point| [point[0], point[1]]).collect();
+    let route = config.planner.route_progressive(surface, ([p.x, p.y, p.z], [q.x, q.y, q.z, q.w]),
+        (goal.goal.pose.position, goal.goal.pose.orientation_xyzw), goal.options, &boundary,
+        config.follower.body_to_support_z_m, config.planning_cancelled.as_deref())
+        .map_err(NavStackError::Planning)?;
+    Ok(SurfacePlan { kind: route.kind, resolution: route.resolution, path: Path3D { poses: route.poses.into_iter().map(|(point, orientation)| PoseStamped {
+        frame_id: start.frame_id.clone(), stamp: start.stamp,
+        pose: Pose3 { position: Point3::new(point[0], point[1], point[2]),
+            orientation: Quaternion {x:orientation[0],y:orientation[1],z:orientation[2],w:orientation[3]} },
+    }).collect() } })
 }
 
 fn surface_replan_input(surface: &Arc<SurfaceSnapshot>, start: &PoseStamped,
@@ -563,6 +588,7 @@ async fn publish_surface_path(
     generation: i64,
     revision: i64,
     path: &Path3D,
+    kind: nuwax_nav_runtime::RouteKind,
 ) -> NavStackResult<()> {
     let stamp = current_unix_timestamp_ns()?;
     let header = schema_header(
@@ -578,13 +604,14 @@ async fn publish_surface_path(
             Ok(pose)
         })
         .collect::<NavStackResult<Vec<_>>>()?;
-    let envelope = build_versioned_path_from_schema(
+    let mut envelope = build_versioned_path_from_schema(
         goal,
         generation,
         revision,
         stamp,
         schema::Path { header, poses },
     )?;
+    envelope.route_kind = if kind == nuwax_nav_runtime::RouteKind::Approach {1} else {0};
     let body = schema::encode_path_envelope_body(&envelope)
         .map_err(|error| module_error("surface path encoding", error))?;
     publish_body(transport, channel, "nuwax_msgs.PathEnvelope", body).await
@@ -618,6 +645,28 @@ fn retire_goal(goal: &mut Option<schema::GoalEnvelope>, retired: &mut VecDeque<G
     }
 }
 
+struct ApproachProgress { endpoint: Point3, best_distance: f64, stagnant: u32 }
+
+fn approach_failure(point: Point3,target:Point3,attempts:u32)->String {
+    format!("PCT无法继续逼近：最近可达点=({:.3}, {:.3}, {:.3})，距目标三维距离={:.3}米，无进展重规划{}次；缺少连续已观测且满足机体约束的地面",point.x,point.y,point.z,point.distance(target),attempts)
+}
+
+fn approach_map_relevant(changes:&SurfaceGeometryChanges,start:Point3,end:Point3,goal:[f64;3])->bool {
+    let hits=|column:[i32;2],size:f32| {
+        let xy=column.map(|c|(f64::from(c)+0.5)*f64::from(size));
+        (0..2).all(|axis| {
+            let a=[start.x,start.y][axis];let b=[end.x,end.y][axis];
+            xy[axis]>=a.min(b).min(goal[axis])-1.0 && xy[axis]<=a.max(b).max(goal[axis])+1.0
+        })
+    };
+    match changes {
+        SurfaceGeometryChanges::Empty=>false,
+        SurfaceGeometryChanges::Unknown=>true,
+        SurfaceGeometryChanges::Columns {fine_size,fine,planner_size,coarse} =>
+            fine.iter().any(|&c|hits(c,*fine_size)) || coarse.iter().any(|&c|hits(c,*planner_size)),
+    }
+}
+
 struct SurfaceJobTicket {
     epoch: u64,
     goal_key: GoalKey,
@@ -629,7 +678,7 @@ struct SurfaceJobTicket {
 
 /// 联验可注入真实但隔离的LCM连接，生产包装仍执行同一循环。
 type SurfacePathComputer = Arc<dyn Fn(&SurfaceSnapshot, &PoseStamped, &schema::GoalEnvelope,
-    &SurfaceNavigationConfig) -> NavStackResult<Path3D> + Send + Sync>;
+    &SurfaceNavigationConfig) -> NavStackResult<SurfacePlan> + Send + Sync>;
 #[cfg(test)]
 type SurfaceMapComputer = Arc<dyn Fn(Arc<schema::NavigationMap3D>, Instant,
     &SurfaceNavigationConfig, &mut SurfaceGeometryCache) -> PreparedSurfaceMap + Send + Sync>;
@@ -642,7 +691,7 @@ async fn run_surface_planner_with_transport(
     shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
 ) -> NavStackResult<()> {
-    run_surface_planner_with_computer(node,hub,config,transport,shutdown,ready,Arc::new(body_path)).await
+    run_surface_planner_with_computer(node,hub,config,transport,shutdown,ready,Arc::new(body_path_progressive)).await
 }
 
 async fn run_surface_planner_with_computer(
@@ -672,6 +721,8 @@ async fn run_surface_planner_with_computer(
     let mut path_cancellation: Option<SurfaceJobTicket> = None;
     // 建图期间几何持续更新；搜索比更新间隔慢时，逐次退休会让同一目标永远等不到结果。
     let mut geometry_retired = false;
+    let mut approach: Option<ApproachProgress> = None;
+    let mut approach_failure_pending=false;
     let mut pending_map: Option<(Arc<schema::NavigationMap3D>, Instant, u64, Option<Arc<nuwax_map_chunks::Manifest>>)> = None;
     let mut map_retry_after = Instant::now();
     let mut map_retry_dependency: Option<SurfaceMapRetryDependency> = None;
@@ -745,6 +796,7 @@ async fn run_surface_planner_with_computer(
                 if goal.as_ref().is_some_and(|active| validate_cancel_goal_correlation(&cancel, active).is_ok()) {
                     retire_goal(&mut goal, &mut retired_goals);
                     successful.clear();
+                    approach = None;
                     failed_input = None;
                     last_path = None; needs_plan = false; execution_admitted = false;
                 }
@@ -835,6 +887,11 @@ async fn run_surface_planner_with_computer(
                         geometry_retired = true;
                     }
                 }
+                if let (Some(progress),Some(active),Some(current))=(&approach,&goal,&pose) {
+                    if approach_map_relevant(&update.geometry_changes,current.pose.position,progress.endpoint,active.goal.pose.position) {
+                        needs_plan=true;successful.clear();
+                    }
+                }
                 hub.publish(update.clone());
                 complete_map_source = update.snapshot.is_ok().then_some(message);
                 latest_map = Some(update);
@@ -842,7 +899,7 @@ async fn run_surface_planner_with_computer(
             }
             computed = path_computations.join_next(), if !path_computations.is_empty() => {
                 let ticket = path_cancellation.take();
-                let (epoch, planned_goal, input, result): (u64, schema::GoalEnvelope, SurfaceReplanInput, NavStackResult<Path3D>) =
+                let (epoch, planned_goal, input, result): (u64, schema::GoalEnvelope, SurfaceReplanInput, NavStackResult<SurfacePlan>) =
                     computed.expect("已有PCT任务").map_err(|error| module_error("PCT规划任务", error))?;
                 if ticket.as_ref().is_some_and(|ticket| ticket.cancelled.load(std::sync::atomic::Ordering::Relaxed))
                     || epoch != map_epoch || !execution_admitted
@@ -851,19 +908,54 @@ async fn run_surface_planner_with_computer(
                 }
                 geometry_retired = false;
                 match result {
-                    Ok(path) => {
+                    Ok(plan) => {
+                        let is_approach=plan.kind==nuwax_nav_runtime::RouteKind::Approach;
+                        if is_approach {
+                            let end=plan.path.poses.last().expect("原生非空路线").pose.position;
+                            let target=Point3::new(planned_goal.goal.pose.position[0],planned_goal.goal.pose.position[1],planned_goal.goal.pose.position[2]);
+                            let start=input.start.pose.position;
+                            // 两格避免量化抖动；0.25米使一次逼近超过普通格心偏移。
+                            let threshold=0.25_f64.max(2.0*plan.resolution);
+                            let state=approach.get_or_insert(ApproachProgress {endpoint:end,best_distance:f64::INFINITY,stagnant:0});
+                            let improvement=state.best_distance-end.distance(target);
+                            let can_advance=start.distance(target)-end.distance(target)>=threshold;
+                            if !can_advance || improvement<threshold {
+                                // 0.35米内提前寻找新路；仍在执行原逼近段时不累计失败。
+                                let stopped=execution_feedback.as_ref().is_some_and(|feedback|
+                                    feedback.zero_confirmed_rejection
+                                        && feedback.path_identity.session_id==planned_goal.session_id
+                                        && feedback.path_identity.goal_key==planned_goal.goal_key()
+                                        && feedback.path_identity.planner_runtime_generation==generation
+                                        && feedback.path_identity.path_revision==path_revision as u64);
+                                let at_end=start.distance(state.endpoint)<=0.15;
+                                if !state.best_distance.is_finite() || at_end || stopped {
+                                    state.stagnant+=1;
+                                    if !state.best_distance.is_finite() || state.stagnant>=3 {
+                                        let reason=approach_failure(end,target,state.stagnant);
+                                        hub.planning.send_replace(Some((planned_goal.session_id.clone(),planned_goal.goal_key(),reason,true)));
+                                        needs_plan=false;approach_failure_pending=true;
+                                        continue;
+                                    }
+                                    successful.clear();needs_plan=true;
+                                } else {needs_plan=false;}
+                                retry_after=Instant::now()+Duration::from_secs(1);
+                                continue;
+                            }
+                            state.endpoint=end;state.best_distance=end.distance(target);state.stagnant=0;
+                            retry_after=Instant::now()+Duration::from_secs(1);
+                        } else { approach=None; }
                         path_revision += 1;
-                        publish_surface_path(&transport, &node.outputs[0], &planned_goal, generation, path_revision, &path).await?;
+                        publish_surface_path(&transport, &node.outputs[0], &planned_goal, generation, path_revision, &plan.path, plan.kind).await?;
                         successful.published(published_surface_identity(&planned_goal,generation,path_revision), input);
                         failed_input = None;
-                        last_path = Some(path); needs_plan = false;
+                        last_path = Some(plan.path); needs_plan = false;
                     }
                     Err(error) => {
                         diagnostics.reject("PCT原生全局规划", &error.to_string());
                         retry_after = Instant::now() + Duration::from_secs(1);
                         failed_input = Some(input);
                         hub.planning.send_replace(Some((planned_goal.session_id.clone(), planned_goal.goal_key(),
-                            format!("PCT原生全局规划：{error}"))));
+                            format!("PCT原生全局规划：{error}"),false)));
                     }
                 }
             }
@@ -948,6 +1040,8 @@ async fn run_surface_planner_with_computer(
                 if newest_goal.as_ref().is_some_and(|current| validate_goal_envelope_order(&incoming, current).is_err()) { continue; }
                 if let Err(error) = navigation_boundary_from_goal(&incoming) { diagnostics.reject("surface goal boundary",&error.to_string());continue; }
                 successful.clear();
+                approach = None;
+                approach_failure_pending=false;
                 failed_input = None;
                 newest_goal = Some(incoming.clone()); goal = Some(incoming);
                 path_revision = 0; last_path = None; needs_plan = true; execution_admitted = false;
@@ -961,7 +1055,12 @@ async fn run_surface_planner_with_computer(
                 }
             }
             _ = ticker.tick() => {
-                if !path_computations.is_empty() || (!needs_plan && last_path.is_some())
+                if let (Some(progress),Some(current))=(&approach,&pose) {
+                    if current.pose.position.distance(progress.endpoint)<=0.35 {
+                        needs_plan=true;successful.clear();
+                    }
+                }
+                if approach_failure_pending || !path_computations.is_empty() || (!needs_plan && last_path.is_some())
                     || Instant::now() < retry_after { continue; }
                 let (Some(map), Some(pose), Some(active_goal)) = (latest_map.as_ref(), pose.as_ref(), goal.as_ref()) else { continue; };
                 if !execution_admitted || !map.authority.permits_goal(active_goal) { continue; }
@@ -991,12 +1090,12 @@ async fn run_surface_planner_with_computer(
                     retire_on_geometry: !geometry_retired,
                 });
                 let computer = Arc::clone(&computer);
-                hub.planning.send_replace(Some((planned_goal.session_id.clone(), planned_goal.goal_key(), "正在计算PCT全局路线".into())));
+                hub.planning.send_replace(Some((planned_goal.session_id.clone(), planned_goal.goal_key(), "正在计算PCT全局路线".into(),false)));
                 path_computations.spawn_blocking(move || {
                     let started = Instant::now();
                     let result = computer(&surface, &pose, &planned_goal, &config);
                     tracing::info!(goal_id=%planned_goal.session_id, elapsed_ms=started.elapsed().as_secs_f64()*1000.0,
-                        points=result.as_ref().ok().map(|path|path.poses.len()), error=?result.as_ref().err(), "PCT原生全局路线计算完成");
+                        points=result.as_ref().ok().map(|plan|plan.path.poses.len()), error=?result.as_ref().err(), "PCT原生全局路线计算完成");
                     (epoch, planned_goal, input, result)
                 });
             }
@@ -2143,7 +2242,7 @@ mod tests {
 
     impl Harness {
         async fn start() -> Self {
-            Self::start_with_computer(Arc::new(body_path)).await
+            Self::start_with_computer(Arc::new(|m,p,g,c|body_path(m,p,g,c).map(SurfacePlan::complete))).await
         }
 
         async fn start_with_computer(computer: SurfacePathComputer) -> Self {
@@ -2527,7 +2626,7 @@ mod tests {
 
     #[tokio::test]
     async fn continuous_inputs_do_not_starve_path_generation() {
-        let mut harness=Harness::start_with_rate(Arc::new(body_path),Duration::from_micros(100)).await;
+        let mut harness=Harness::start_with_rate(Arc::new(|m,p,g,c|body_path(m,p,g,c).map(SurfacePlan::complete)),Duration::from_micros(100)).await;
         harness.wait_ready().await;
         let goal=goal_for(&harness.feed.lock().unwrap().map,1,[1.55,1.55,2.5]);
         let started=Instant::now();harness.goal(&goal).await;
@@ -2587,7 +2686,7 @@ mod tests {
                 b.store(true,Order::SeqCst);
                 return Err(module_error("test old search","已被新图路线退休"));
             }
-            body_path(map,pose,goal,config)
+            body_path(map,pose,goal,config).map(SurfacePlan::complete)
         });
         let mut harness=Harness::start_with_computer(computer).await;
         harness.wait_ready().await;
@@ -2629,7 +2728,7 @@ mod tests {
                 }
                 std::thread::sleep(Duration::from_millis(2));
             }
-            body_path(map,pose,goal,config)
+            body_path(map,pose,goal,config).map(SurfacePlan::complete)
         });
         let mut harness=Harness::start_with_computer(computer).await;
         harness.wait_ready().await;
@@ -2660,8 +2759,102 @@ mod tests {
         harness.shutdown().await;
     }
 
+    fn remove_gap(map:&mut schema::NavigationMap3D) {
+        map.cloud.data=map.cloud.data.chunks_exact(12).filter(|bytes| {
+            let x=f32::from_le_bytes(bytes[0..4].try_into().unwrap());
+            x<1.8 || x>=2.6
+        }).flat_map(|bytes|bytes.iter().copied()).collect();
+        map.cloud.width=(map.cloud.data.len()/12) as i32;
+        map.cloud.row_step=map.cloud.data.len() as i32;
+    }
+
+    async fn progressive_harness() -> Harness {
+        let harness=Harness::start_with_computer(Arc::new(body_path_progressive)).await;
+        { let mut feed=harness.feed.lock().unwrap();remove_gap(&mut feed.map); }
+        harness.wait_ready().await;
+        harness
+    }
+
     #[tokio::test]
-    async fn failed_global_search_is_rate_limited_and_never_delivers_a_prefix() {
+    async fn progressive_gap_preserves_goal_then_new_ground_switches_to_complete_and_arrives() {
+        let mut harness=progressive_harness().await;
+        let mut options=nuwax_nav_types_messages::GoalOptions::default();options.position_tolerance_m=0.12;
+        let goal=goal_for_with_options(&harness.feed.lock().unwrap().map,1,[3.2,1.55,2.45],options);
+        harness.goal(&goal).await;
+        let partial=harness.path_for(&goal).await;
+        assert_eq!(partial.route_kind,1,"缺口不能得到完整路线");
+        assert!(partial.path.poses.iter().all(|pose|pose.pose.position[0]<1.8),"未知地面不能进入路径");
+        harness.wait_controlling().await;
+        assert_eq!(harness.scheduler.status().last_terminal,None);
+        assert!(harness.scheduler.status().message.contains("逐步逼近"));
+        let end=partial.path.poses.last().unwrap().pose.position;
+        {
+            let mut feed=harness.feed.lock().unwrap();
+            feed.position=end;
+            // 模拟已走到逼近端；此刻仍保留原目标。随后同域地图真实补齐缺口。
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(harness.scheduler.status().last_terminal,None,"走完逼近段不能报告成功");
+        { let mut feed=harness.feed.lock().unwrap();let restored=map_message(1,"first-map");
+            feed.map.cloud.data=restored.cloud.data;feed.map.cloud.width=restored.cloud.width;
+            feed.map.cloud.row_step=restored.cloud.row_step;
+        }
+        let complete=harness.path_for(&goal).await;
+        assert_eq!(complete.route_kind,0);
+        assert_eq!(complete.goal_key(),partial.goal_key());
+        assert!(complete.path_revision>partial.path_revision);
+        assert!((complete.path.poses.last().unwrap().pose.position[0]-3.2).abs()<1e-6);
+        {let mut feed=harness.feed.lock().unwrap();feed.position=[3.2,1.55,2.45];}
+        harness.terminal(TerminalOutcome::Succeeded).await;
+        assert_eq!(harness.scheduler.status().last_applied_twist,Some(Twist2::ZERO));
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn progressive_permanent_gap_fails_with_nearest_point_and_distance() {
+        let mut harness=progressive_harness().await;
+        let goal=goal_for(&harness.feed.lock().unwrap().map,1,[3.2,1.55,2.45]);
+        harness.goal(&goal).await;
+        let partial=harness.path_for(&goal).await;
+        assert_eq!(partial.route_kind,1);
+        harness.wait_controlling().await;
+        harness.feed.lock().unwrap().position=partial.path.poses.last().unwrap().pose.position;
+        harness.terminal(TerminalOutcome::PlannerFailed).await;
+        let state=harness.scheduler.status();
+        assert!(state.message.contains("最近可达点="),"{state:?}");
+        assert!(state.message.contains("距目标三维距离="));
+        assert!(state.message.contains("无进展重规划3次"));
+        assert!(state.last_zero_ack_id.is_some());
+        assert_eq!(state.last_applied_twist,Some(Twist2::ZERO));
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn progressive_no_initial_advance_fails_and_cancellation_still_fences() {
+        let mut harness=progressive_harness().await;
+        harness.feed.lock().unwrap().position=[1.75,1.55,2.45];
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let goal=goal_for(&harness.feed.lock().unwrap().map,1,[3.2,1.55,2.45]);
+        harness.goal(&goal).await;
+        harness.terminal(TerminalOutcome::PlannerFailed).await;
+        assert!(harness.scheduler.status().message.contains("最近可达点="));
+        let changed_after=current_unix_timestamp_ns().unwrap();
+        harness.feed.lock().unwrap().position=[0.55,1.55,2.5];
+        tokio::time::timeout(Duration::from_secs(1),async {
+            while harness.scheduler.status().pose_source_timestamp_ns<=changed_after {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("新目标前等待当前位置进入原输入通道");
+        let next=goal_for(&harness.feed.lock().unwrap().map,2,[3.2,1.55,2.45]);
+        harness.goal(&next).await;
+        assert_eq!(harness.path_for(&next).await.route_kind,1);
+        harness.cancel(&next).await;harness.terminal(TerminalOutcome::Cancelled).await;
+        assert!(harness.scheduler.status().last_zero_ack_id.is_some());
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_global_search_is_rate_limited_and_never_labels_a_prefix_complete() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
@@ -2674,7 +2867,7 @@ mod tests {
         let goal = goal_for(&harness.feed.lock().unwrap().map, 1, [8.0, 1.55, 2.5]);
         harness.goal(&goal).await;
         assert!(tokio::time::timeout(Duration::from_millis(1300), harness.paths.next()).await.is_err(),
-            "完整路线缺失时不能发布近端短段");
+            "无可达逼近结果的失败搜索不能发布半截路线，更不能标为完整路线");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "同图无路不能持续占用处理器重试");
         harness.feed.lock().unwrap().position[0] += 0.1;
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -2704,7 +2897,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(5));
                 }
             }
-            body_path(map,pose,goal,config)
+            body_path(map,pose,goal,config).map(SurfacePlan::complete)
         });
         let mut harness=Harness::start_with_computer(computer).await;
         harness.wait_ready().await;
@@ -2889,7 +3082,7 @@ mod tests {
         let captured = Arc::clone(&starts);
         let computer: SurfacePathComputer = Arc::new(move |map, pose, goal, config| {
             captured.lock().unwrap().push(pose.pose.position.x);
-            body_path(map, pose, goal, config)
+            body_path(map, pose, goal, config).map(SurfacePlan::complete)
         });
         let mut harness = Harness::start_with_computer(computer).await;
         harness.wait_ready().await;

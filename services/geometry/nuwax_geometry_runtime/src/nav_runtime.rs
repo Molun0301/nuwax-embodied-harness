@@ -5034,7 +5034,8 @@ mod tests {
 
     fn sealed_path(lease: &GoalLease, path_revision: u64, x: f64) -> schema::PathEnvelope {
         let path = schema::PathEnvelope {
-            schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
+            route_kind: 0,
+            schema_version: schema::PATH_ENVELOPE_SCHEMA_VERSION,
             session_id: lease.session_id.clone(),
 
 

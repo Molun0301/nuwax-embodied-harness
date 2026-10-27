@@ -2087,6 +2087,8 @@ where
                 let settlement = await_guarded_active_input(
                     scheduler
                     .submit_path(nuwax_nav_runtime::VersionedPath {
+                        route_kind: if path_envelope.route_kind == 1 {nuwax_nav_runtime::RouteKind::Approach}
+                            else {nuwax_nav_runtime::RouteKind::Complete},
                         session_id: path_envelope.session_id.clone(),
                         execution_identity: guarded_path_execution_identity(&path_envelope),
                         path_revision: u64::try_from(path_envelope.path_revision)
@@ -6690,7 +6692,8 @@ fn build_versioned_path_from_schema(
     path: schema::Path,
 ) -> NavStackResult<schema::PathEnvelope> {
     let envelope = schema::PathEnvelope {
-        schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
+        route_kind: 0,
+        schema_version: schema::PATH_ENVELOPE_SCHEMA_VERSION,
         session_id: goal.session_id.clone(),
 
 
@@ -8229,7 +8232,8 @@ mod guarded_tests {
 
     fn sealed_path(goal: &schema::GoalEnvelope) -> schema::PathEnvelope {
         let mut path = schema::PathEnvelope {
-            schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
+            route_kind: 0,
+            schema_version: schema::PATH_ENVELOPE_SCHEMA_VERSION,
             session_id: goal.session_id.clone(),
 
 
@@ -10693,6 +10697,7 @@ mod guarded_tests {
             .expect("map-a session");
         handle
             .submit_path(nuwax_nav_runtime::VersionedPath {
+                route_kind: nuwax_nav_runtime::RouteKind::Complete,
                 path_yaws: None,
                 session_id: goal_a.session_id.clone(),
                 execution_identity: path_identity,

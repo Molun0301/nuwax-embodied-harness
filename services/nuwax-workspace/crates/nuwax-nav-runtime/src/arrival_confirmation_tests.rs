@@ -374,3 +374,37 @@ async fn arrival_surface_worker_replays_current_map_and_goal_after_stopping_drif
     assert_eq!(motion.lock().unwrap().calls.iter().filter(|v| v.starts_with("fence:")).count(), 2);
     handle.shutdown().await.unwrap(); task.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn approach_success_signal_keeps_original_goal_and_wait_deadline() {
+    let motion=Arc::new(Mutex::new(FakeMotionState::default()));
+    let planner=FakePlanner::commanding();
+    planner.state.lock().unwrap().step=PlannerStep::Succeeded;
+    let mut scheduler=NavScheduler::new(FakeMotion(motion.clone()),planner,SchedulerConfig::default()).unwrap();
+    let (status,mut events)=watch::channel(scheduler.status.clone());
+    scheduler.observe_odometry(&status,map_pose_at(1),None).unwrap();
+    scheduler.observe_costmap(&status,costmap_at(1_000_000_000),Instant::now()).unwrap();
+    let original=session();scheduler.start_session(&status,original.clone()).await.unwrap();
+    let initial_deadline=scheduler.path_wait_started_at;
+    let mut approach=path();approach.route_kind=RouteKind::Approach;
+    scheduler.submit_path(&status,approach.clone()).await.unwrap();
+    let mut relabeled=approach.clone();relabeled.route_kind=RouteKind::Complete;
+    assert!(matches!(scheduler.submit_path(&status,relabeled).await,Err(RuntimeError::PathMutation {..})),
+        "同修订不能把逼近路线重新标为完整路线");
+    scheduler.control_tick(&status).await.unwrap();
+    assert_eq!(scheduler.status.phase,SchedulerPhase::AwaitingPath);
+    assert_eq!(scheduler.status.last_terminal,None);
+    assert_eq!(scheduler.session.as_ref(),Some(&original));
+    assert_eq!(scheduler.status.last_applied_twist,Some(Twist2::ZERO));
+    assert_eq!(scheduler.path_wait_started_at,initial_deadline,"新逼近路径和零速不能延长连续等待");
+    assert!(events.borrow_and_update().message.contains("逐步逼近"));
+    approach.path_revision=2;approach.execution_identity.path_revision=2;
+    scheduler.submit_path(&status,approach).await.unwrap();
+    scheduler.control_tick(&status).await.unwrap();
+    assert_eq!(scheduler.path_wait_started_at,initial_deadline);
+    scheduler.path_wait_started_at=Some(Instant::now()-scheduler.config.path_wait_timeout);
+    scheduler.check_path_wait_timeout(&status).await.unwrap();
+    assert_eq!(scheduler.status.last_terminal,Some(TerminalOutcome::PlannerFailed));
+    assert!(scheduler.status.last_zero_ack_id.is_some());
+    assert!(motion.lock().unwrap().calls.iter().any(|call|call.starts_with("fence:")));
+}

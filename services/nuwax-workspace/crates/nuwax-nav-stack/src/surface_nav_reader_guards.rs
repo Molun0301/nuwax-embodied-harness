@@ -266,7 +266,7 @@ async fn start_reader_harness() -> Harness {
     // ALL fixture setup, preconditions and business assertions are caught below.
     assert_eq!(std::env::var("NUWAX_LCM_URL").ok().as_deref(), Some("memq://"),
         "invoke the selected tests with NUWAX_LCM_URL=memq:// externally");
-    Harness::start_with_components(Arc::new(body_path),
+    Harness::start_with_components(Arc::new(|m,p,g,c|body_path(m,p,g,c).map(SurfacePlan::complete)),
         Duration::from_millis(25), config(), true, None,
         nuwax_nav_runtime::SchedulerConfig { costmap_ttl: Duration::ZERO, ..Default::default() }).await
 }

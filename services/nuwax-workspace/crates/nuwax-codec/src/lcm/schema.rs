@@ -23,7 +23,7 @@ pub const PATH_FINGERPRINT: [u8; 8] = 0xc3ae_62ac_b357_93e2_u64.to_be_bytes();
 /// `nuwax_msgs.GoalEnvelope` generated-C recursive fingerprint.
 pub const GOAL_ENVELOPE_FINGERPRINT: [u8; 8] = 0x894973021b295f7e_u64.to_be_bytes();
 /// `nuwax_msgs.PathEnvelope` generated-C recursive fingerprint.
-pub const PATH_ENVELOPE_FINGERPRINT: [u8; 8] = 0x80563fb3d7e66c57_u64.to_be_bytes();
+pub const PATH_ENVELOPE_FINGERPRINT: [u8; 8] = 0x6043ce6a7625adca_u64.to_be_bytes();
 /// `nav_msgs.OccupancyGrid` fingerprint from `dimos-lcm==0.1.3`.
 pub const OCCUPANCY_GRID_FINGERPRINT: [u8; 8] = 0xe7df_d179_cdfc_3b65_u64.to_be_bytes();
 /// `nav_msgs.Odometry` fingerprint from `dimos-lcm==0.1.3`.
@@ -61,6 +61,8 @@ pub const FRONTIER_LIST_FINGERPRINT: [u8; 8] = 0x213d_b68f_b817_1f76_u64.to_be_b
 pub const FRONTIER_LIST_CAPACITY: usize = 256;
 /// Current immutable navigation-envelope schema.
 pub const NAVIGATION_ENVELOPE_SCHEMA_VERSION: i32 = 9;
+/// 路径第10版新增明确的完整/逼近类型，旧路径不能被静默解释。
+pub const PATH_ENVELOPE_SCHEMA_VERSION: i32 = 10;
 /// A public navigation request owns the goal lease.
 pub const NAVIGATION_OWNER_KIND_PUBLIC_NAV: i32 = 1;
 /// An exploration parent owns the child navigation goal lease.
@@ -256,7 +258,7 @@ impl GoalEnvelope {
 /// Planner output correlated to exactly one versioned goal.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PathEnvelope {
-    /// 当前线格式版本为9。
+    /// 当前线格式版本为10。
     pub schema_version: i32,
     /// 原目标会话。
     pub session_id: String,
@@ -268,6 +270,8 @@ pub struct PathEnvelope {
     pub planner_runtime_generation: i64,
     /// 同一目标内单调路径修订。
     pub path_revision: i64,
+    /// 0为完整路线，1为逼近路线；只可沿原目标继续重规划。
+    pub route_kind: i8,
     /// 真实路径载荷，保留头部和各点原始来源时间。
     pub path: Path,
 }
@@ -1605,6 +1609,7 @@ fn encode_path_envelope_prefix(message: &PathEnvelope, out: &mut Vec<u8>) -> Cod
     out.extend_from_slice(&message.goal_generation.to_be_bytes());
     out.extend_from_slice(&message.planner_runtime_generation.to_be_bytes());
     out.extend_from_slice(&message.path_revision.to_be_bytes());
+    out.push(message.route_kind as u8);
     Ok(())
 }
 
@@ -1616,12 +1621,14 @@ fn decode_path_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<PathEnvelop
         goal_generation: cursor.read_i64()?,
         planner_runtime_generation: cursor.read_i64()?,
         path_revision: cursor.read_i64()?,
+        route_kind: cursor.read_u8()? as i8,
         path: decode_path_from(cursor)?,
     })
 }
 
 fn validate_path_envelope_semantics(message: &PathEnvelope) -> Result<(), String> {
-    if message.schema_version != NAVIGATION_ENVELOPE_SCHEMA_VERSION {
+    if !matches!(message.route_kind, 0 | 1) { return Err("invalid path route_kind".into()); }
+    if message.schema_version != PATH_ENVELOPE_SCHEMA_VERSION {
         return Err("unsupported navigation envelope schema version".into());
     }
     if message.session_id.trim().is_empty() || message.session_id.trim() != message.session_id {
@@ -3478,7 +3485,7 @@ int main(int argc, char **argv) {
                 message.boundary_points_length == 3);
         }
         if (!strcmp(argv[3], "PathEnvelope")) {
-            ROUNDTRIP(nuwax_msgs_PathEnvelope, message.schema_version == 9 &&
+            ROUNDTRIP(nuwax_msgs_PathEnvelope, message.schema_version == 10 &&
                 message.producer_runtime_generation == 7 && message.goal_generation == 2 &&
                 message.planner_runtime_generation == 8 && message.path_revision == 1 &&
                 message.path.poses_length == 1);
@@ -3577,7 +3584,7 @@ else:
     if name == "NavigationState":
         assert message.runtime_generation == 99 and message.local_path_count == 1
     else:
-        assert message.schema_version == 9
+        assert message.schema_version == 10
 assert message.encode() == raw
 Path(sys.argv[3]).write_bytes(message.encode())
 "#]).arg(&py_dir).arg(&input).arg(&py_output).arg(name);
@@ -3802,7 +3809,8 @@ mod tests {
 
     pub(super) fn configured_frame_path(goal: &GoalEnvelope, frame_id: &str) -> PathEnvelope {
         PathEnvelope {
-            schema_version: NAVIGATION_ENVELOPE_SCHEMA_VERSION,
+            route_kind: 0,
+            schema_version: PATH_ENVELOPE_SCHEMA_VERSION,
             session_id: goal.session_id.clone(),
 
 
@@ -3886,6 +3894,8 @@ mod tests {
             |m| m.producer_runtime_generation = -1,
             |m| m.planner_runtime_generation = 0,
             |m| m.path_revision = 0,
+            |m| m.route_kind = 2,
+            |m| m.schema_version = 9,
         ] {
             let mut invalid = path.clone();
             mutate(&mut invalid);
@@ -3922,6 +3932,7 @@ mod tests {
         goal.committed_map_source_timestamp_ns = 0;
         validate_goal_envelope(&goal).unwrap();
         let mut path = configured_frame_path(&goal, "robot/map");
+        path.route_kind=1;
         validate_path_envelope(&path).unwrap();
         let planar = crate::lcm::planar_navigation::PlanarNavigationMap {
             map_frame_generation: 1, runtime_generation: 7,
@@ -3967,7 +3978,8 @@ elif name == 'GoalEnvelope':
         assert message.body_reference_frame_id == 'robot/body'
         assert message.has_body_to_support_z == 1 and message.body_to_support_z_m == 0.4
 else:
-    assert message.schema_version == 9
+    assert message.schema_version == 10
+    assert message.route_kind == 1
     assert message.path.header.frame_id == 'robot/map'
 assert message.encode() == raw
 sys.stdout.buffer.write(message.encode())

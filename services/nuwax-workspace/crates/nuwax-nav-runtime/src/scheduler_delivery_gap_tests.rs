@@ -233,7 +233,7 @@ async fn delivery_gap_input_flood_cannot_extend_original_deadline() {
                 let (reply, _) = oneshot::channel();
                 if input.blocking_send(InputCommand {
                     kind: InputKind::PlanningDiagnostic("other-goal".into(),
-                        execution_identity_for("other-goal", 0).goal_key(), "queued".into()),
+                        execution_identity_for("other-goal", 0).goal_key(), "queued".into(),false),
                     reply,
                 }).is_err() { break; }
                 sent.fetch_add(1, Ordering::Relaxed);

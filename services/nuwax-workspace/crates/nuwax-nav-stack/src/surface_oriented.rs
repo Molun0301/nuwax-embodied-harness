@@ -5,6 +5,18 @@ use nuwax_nav_runtime::native_map;
 use nuwax_nav_types_messages::GoalOptions;
 
 pub type BodyPose = ([f64; 3], [f64; 4]);
+pub use nuwax_nav_pct_native::RouteKind;
+
+/// 路线用途随结果传递，探索和返航的完整路线接口不会消费逼近结果。
+pub struct SurfaceRoute {
+    /// 保留机体高度与姿态的路线。
+    pub poses: Vec<BodyPose>,
+    /// 完整或逼近用途。
+    pub kind: RouteKind,
+    /// 实际原生平面格边长，用于进展判定。
+    pub resolution: f64,
+}
+
 
 struct CachedPlanner {
     source: SurfaceSnapshot,
@@ -25,6 +37,16 @@ impl PctPlanner {
     pub fn route(&self, map: &SurfaceSnapshot, start: BodyPose, goal: BodyPose,
         options: GoalOptions, boundary: &[[f64; 2]], offset: f64,
         cancelled: Option<&AtomicBool>) -> Result<Vec<BodyPose>, String> {
+        self.route_inner(map,start,goal,options,boundary,offset,cancelled,false).map(|route|route.poses)
+    }
+    pub fn route_progressive(&self, map: &SurfaceSnapshot, start: BodyPose, goal: BodyPose,
+        options: GoalOptions, boundary: &[[f64; 2]], offset: f64,
+        cancelled: Option<&AtomicBool>) -> Result<SurfaceRoute, String> {
+        self.route_inner(map,start,goal,options,boundary,offset,cancelled,true)
+    }
+    fn route_inner(&self, map: &SurfaceSnapshot, start: BodyPose, goal: BodyPose,
+        options: GoalOptions, boundary: &[[f64; 2]], offset: f64,
+        cancelled: Option<&AtomicBool>, progressive: bool) -> Result<SurfaceRoute, String> {
         let terrain_source = native_map::PctTerrainSource::from_env()?;
         let mut cache = self.cached.lock().map_err(|error| error.to_string())?;
         let reusable = cache.as_ref().is_some_and(|current|
@@ -40,15 +62,15 @@ impl PctPlanner {
                 resolution, planner });
         }
         let cached = cache.as_mut().expect("原生地图已创建");
-        let route = match cancelled {
+        let route = if progressive { cached.planner.plan_progressive(start.0,goal.0,cancelled)? } else { match cancelled {
             Some(flag) => cached.planner.plan_cancellable(start.0, goal.0, flag)?,
             None => cached.planner.plan(start.0, goal.0)?,
-        };
+        }};
         tracing::debug!(elapsed_ms=route.elapsed_ms, expanded=route.expanded,
             points=route.path.len(), "PCT原生全局搜索完成");
         let mut path = route.path;
-        if let Some(last) = path.last_mut() {
-            *last = goal_bound_endpoint(*last, goal.0, cached.resolution);
+        if route.kind == RouteKind::Complete {
+            if let Some(last) = path.last_mut() { *last = goal_bound_endpoint(*last, goal.0, cached.resolution); }
         }
         let mut poses: Vec<BodyPose> = path.iter().enumerate().map(|(index, &point)| {
             let next = path.get(index + 1).copied().unwrap_or(point);
@@ -56,10 +78,10 @@ impl PctPlanner {
             (point, [0.0, 0.0, (yaw * 0.5).sin(), (yaw * 0.5).cos()])
         }).collect();
         if let Some(first) = poses.first_mut() { *first = start; }
-        if options.requires_orientation() {
+        if route.kind == RouteKind::Complete && options.requires_orientation() {
             if let Some(last) = poses.last_mut() { last.1 = goal.1; }
         }
-        Ok(poses)
+        Ok(SurfaceRoute { poses, kind: route.kind, resolution: cached.resolution })
     }
 }
 

@@ -141,6 +141,7 @@ fn session() -> NavSession {
 
 fn path() -> VersionedPath {
     VersionedPath {
+        route_kind: nuwax_nav_runtime::RouteKind::Complete,
         path_yaws: None,
         session_id: "nav_scheduler_20hz_baseline-nav".to_string(),
         execution_identity: identity("nav_scheduler_20hz_baseline-nav", 1),

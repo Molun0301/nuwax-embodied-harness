@@ -70,7 +70,7 @@ async fn held_global_owner_keeps_unchanged_mask_work_but_changed_mask_retires_it
             b.store(true, Ordering::SeqCst);
             return Err(module_error("held mask owner", "retired"));
         }
-        body_path(map, pose, goal, configured)
+        body_path(map, pose, goal, configured).map(SurfacePlan::complete)
     });
     let mut configured = config();
     configured.apply_calibration(Some(nuwax_nav_types_messages::RobotGeometry {

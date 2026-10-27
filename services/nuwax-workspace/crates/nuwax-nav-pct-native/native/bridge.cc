@@ -20,7 +20,7 @@ struct PctConfig {
 };
 struct PctCell { int32_t x, y; double ground, ceiling; };
 struct PctBand { int32_t x, y; double low, high; };
-struct PctResult { double* points; size_t length; double elapsed_ms; size_t expanded; };
+struct PctResult { double* points; size_t length; double elapsed_ms; size_t expanded; int32_t kind; };
 using CancelFn = bool (*)(const void*);
 }
 
@@ -199,7 +199,7 @@ struct Planner {
     }
   }
   bool plan_region(const double* start,const double* goal,double margin,PctResult& result,
-                   CancelFn cancel,const void* user) {
+                   CancelFn cancel,const void* user,bool progressive=false,bool allow_partial=false) {
     astar.Reset();
     const double q=cfg.resolution,sg=start[2]-cfg.body_to_ground,gg=goal[2]-cfg.body_to_ground;
     int minx=static_cast<int>(std::floor((std::min(start[0],goal[0])-margin)/q));
@@ -312,8 +312,14 @@ struct Planner {
       return layer;
     };
     const int original_sx=sx,original_sy=sy,original_gx=gx,original_gy=gy;
-    const int sl=snap_endpoint(sx,sy,sg,start),gl=snap_endpoint(gx,gy,gg,goal);
-    if(sl<0||gl<0)return false;
+    const int sl=snap_endpoint(sx,sy,sg,start);
+    int gl=snap_endpoint(gx,gy,gg,goal);
+    if(sl<0 || (gl<0 && !progressive))return false;
+    // 完整路线必须绑定原目标所在地面格，端点搜索半径不能把远处缺测目标当成已到达。
+    if(progressive && (gl<0 || goal[0]<(gx+minx)*q || goal[0]>(gx+minx+1)*q ||
+        goal[1]<(gy+miny)*q || goal[1]>(gy+miny+1)*q)) {
+      gx=original_gx;gy=original_gy;gl=-1;
+    }
     const double start_x=sx==original_sx&&sy==original_sy?start[0]:(sx+minx+0.5)*q;
     const double start_y=sx==original_sx&&sy==original_sy?start[1]:(sy+miny+0.5)*q;
     const double goal_x=gx==original_gx&&gy==original_gy?goal[0]:(gx+minx+0.5)*q;
@@ -327,6 +333,12 @@ struct Planner {
     astar.Init(20,layers,q,1,cost,heights,elevation);
     astar.SetHeightLimit(std::max({cfg.max_step,cfg.max_step_down,std::tan(cfg.max_slope)*q*std::sqrt(2.0)})+1e-8);
     astar.SetCancellation([&]{return cancel&&cancel(user);});
+    astar.SetApproachScore(progressive ? std::function<double(const Node*)>([&](const Node* node) -> double {
+      const double x=(node->idx[2]+minx+0.5)*q,y=(node->idx[1]+miny+0.5)*q;
+      // 非起点节点已通过入边的完整机体检查；起点也必须确实容纳机体。
+      if(node->parent==nullptr && collision(start_x,start_y,node->height,std::atan2(dy,dx)))return INFINITY;
+      return std::hypot(std::hypot(x-goal[0],y-goal[1]),node->height+cfg.body_to_ground-goal[2]);
+    }) : std::function<double(const Node*)>());
     astar.SetTransition([&](const Node* a,const Node* b){
       const bool first=a->layer==sl&&a->idx[2]==sx&&a->idx[1]==sy;
       const bool last=b->layer==gl&&b->idx[2]==gx&&b->idx[1]==gy;
@@ -356,8 +368,10 @@ struct Planner {
       return true;
     });
     const bool found=astar.Search({sl,sx,sy},{gl,gx,gy});result.expanded+=astar.Expanded();
-    if(!found)return false;
+    if(!found && (!allow_partial || astar.Cancelled()))return false;
     const auto path=astar.GetPathPoints();
+    if(path.empty())return false;
+    result.kind=found?0:1;
     result.length=path.size();result.points=new double[3*path.size()];
     for(size_t i=0;i<path.size();++i){
       result.points[3*i]=(path[i].x+minx+0.5)*q;
@@ -366,7 +380,7 @@ struct Planner {
     }
     // 已有端点格保留调用方XY；缺测端点使用原规则选择的实测格心。
     result.points[0]=start_x;result.points[1]=start_y;
-    result.points[3*(path.size()-1)]=goal_x;result.points[3*(path.size()-1)+1]=goal_y;
+    if(found){result.points[3*(path.size()-1)]=goal_x;result.points[3*(path.size()-1)+1]=goal_y;}
     return true;
   }
 };
@@ -387,7 +401,7 @@ extern "C" void* pct_create(const PctConfig* config,const PctCell* cells,size_t 
 extern "C" void pct_destroy(void* planner){delete static_cast<Planner*>(planner);}
 extern "C" void pct_result_free(PctResult* result){delete[] result->points;result->points=nullptr;}
 extern "C" int pct_plan(void* planner,const double* start,const double* goal,PctResult* result,
-                         CancelFn cancel,const void* user,char* err,size_t cap){
+                         CancelFn cancel,const void* user,bool progressive,char* err,size_t cap){
   const auto begin=std::chrono::steady_clock::now();
   try {
     auto& p=*static_cast<Planner*>(planner);
@@ -404,7 +418,7 @@ extern "C" int pct_plan(void* planner,const double* start,const double* goal,Pct
     }
     for(;;){
       if(cancel&&cancel(user)){error(err,cap,"PCT规划已取消");return 2;}
-      if(p.plan_region(start,goal,margin,*result,cancel,user)){
+      if(p.plan_region(start,goal,margin,*result,cancel,user,progressive,progressive && margin>=full)){
         result->elapsed_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();return 0;
       }
       if(p.astar.Cancelled()||(cancel&&cancel(user))){error(err,cap,"PCT规划已取消");return 2;}

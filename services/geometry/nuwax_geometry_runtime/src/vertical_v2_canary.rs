@@ -4044,7 +4044,8 @@ fn acceptance_test_path(
     revision: i64,
 ) -> PathLedgerEntry {
     let path = schema::PathEnvelope {
-        schema_version: goal.schema_version,
+        route_kind: 0,
+        schema_version: schema::PATH_ENVELOPE_SCHEMA_VERSION,
         session_id: goal.session_id.clone(),
 
 

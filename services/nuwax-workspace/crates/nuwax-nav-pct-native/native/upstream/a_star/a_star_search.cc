@@ -89,15 +89,22 @@ bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
   // 失败也可能更新过节点代价；每次搜索都必须清除上次状态。
   Reset();
   auto start_node = FindNode(start[0], start[2], start[1]);
-  auto goal_node = FindNode(goal[0], goal[2], goal[1]);
+  auto goal_node = goal[0] >= 0 && goal[0] < max_layers_ ? FindNode(goal[0], goal[2], goal[1]) : nullptr;
+  // 缺测目标只作为启发式坐标，不插入地面图，也不能被搜索到。
+  Node requested_goal;
+  requested_goal.idx = Eigen::Vector3i(0, goal[2], goal[1]);
+  requested_goal.height = start_node ? start_node->height : 0.0;
+  if (!goal_node && approach_score_) goal_node = &requested_goal;
   if (!start_node || !goal_node) return false;
-  if (start_node->cost > cost_threshold_ || goal_node->cost > cost_threshold_) return false;
+  if (start_node->cost > cost_threshold_ || (!approach_score_ && goal_node->cost > cost_threshold_)) return false;
   start_node->g = 0.0;
   start_node->f = GetHeuristic(start_node, goal_node);
   std::priority_queue<OpenEntry, std::vector<OpenEntry>, NodeCompare> open_set;
   std::unordered_map<std::int64_t, Node*> closed_set;
   std::uint64_t sequence = 0;
   open_set.push({start_node, start_node->f, start_node->g, sequence++});
+  Node* closest = nullptr;
+  double closest_score = INFINITY;
   while (!open_set.empty()) {
     if (cancelled_ && cancelled_()) { was_cancelled_ = true; return false; }
     const auto entry = open_set.top();
@@ -107,6 +114,10 @@ bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
     auto closed = closed_set.find(GetHash(current_node));
     if (closed != closed_set.end() && closed->second->g < entry.g) continue;
     ++expanded_;
+    if (approach_score_) {
+      const double score = approach_score_(current_node);
+      if (score < closest_score) { closest_score = score; closest = current_node; }
+    }
     if (current_node == goal_node) {
       while (current_node != nullptr) {
         search_result_.emplace_back(current_node);
@@ -147,6 +158,9 @@ bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
     }
   }
   if (debug_) ConvertClosedSetToMatrix(closed_set);
+  // 保留失败与成功的返回值区别；逼近路线只能由明确启用该契约的调用方读取。
+  while (closest) { search_result_.push_back(closest); closest = closest->parent; }
+  std::reverse(search_result_.begin(), search_result_.end());
   return false;
 }
 

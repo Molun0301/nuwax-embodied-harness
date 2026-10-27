@@ -60,6 +60,8 @@ class Astar {
     transition_ = std::move(transition);
   }
   void SetCancellation(std::function<bool()> cancelled) { cancelled_ = std::move(cancelled); }
+  // 仅在需要逼近结果时启用；评分只遍历本次搜索实际展开的可达节点。
+  void SetApproachScore(std::function<double(const Node*)> score) { approach_score_ = std::move(score); }
   std::size_t Expanded() const { return expanded_; }
   bool Cancelled() const { return was_cancelled_; }
   void SetHeightLimit(double limit) { height_limit_ = limit; }
@@ -101,6 +103,7 @@ class Astar {
  private:
   std::function<bool(const Node*, const Node*)> transition_;
   std::function<bool()> cancelled_;
+  std::function<double(const Node*)> approach_score_;
   std::size_t expanded_ = 0;
   bool was_cancelled_ = false;
   double height_limit_ = 0.3;

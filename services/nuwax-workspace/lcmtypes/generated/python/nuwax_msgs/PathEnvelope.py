@@ -11,11 +11,11 @@ import nav_msgs
 
 class PathEnvelope(object):
 
-    __slots__ = ["schema_version", "session_id", "producer_runtime_generation", "goal_generation", "planner_runtime_generation", "path_revision", "path"]
+    __slots__ = ["schema_version", "session_id", "producer_runtime_generation", "goal_generation", "planner_runtime_generation", "path_revision", "route_kind", "path"]
 
-    __typenames__ = ["int32_t", "string", "int64_t", "int64_t", "int64_t", "int64_t", "nav_msgs.Path"]
+    __typenames__ = ["int32_t", "string", "int64_t", "int64_t", "int64_t", "int64_t", "int8_t", "nav_msgs.Path"]
 
-    __dimensions__ = [None, None, None, None, None, None, None]
+    __dimensions__ = [None, None, None, None, None, None, None, None]
 
     def __init__(self):
         self.schema_version = 0
@@ -30,6 +30,12 @@ class PathEnvelope(object):
         """ LCM Type: int64_t """
         self.path_revision = 0
         """ LCM Type: int64_t """
+        self.route_kind = 0
+        """
+        0为完整路线，1为仅到可达已观测地面的逼近路线。
+        LCM Type: int8_t
+        """
+
         self.path = nav_msgs.Path()
         """ LCM Type: nav_msgs.Path """
 
@@ -45,7 +51,7 @@ class PathEnvelope(object):
         buf.write(struct.pack('>I', len(__session_id_encoded)+1))
         buf.write(__session_id_encoded)
         buf.write(b"\0")
-        buf.write(struct.pack(">qqqq", self.producer_runtime_generation, self.goal_generation, self.planner_runtime_generation, self.path_revision))
+        buf.write(struct.pack(">qqqqb", self.producer_runtime_generation, self.goal_generation, self.planner_runtime_generation, self.path_revision, self.route_kind))
         assert self.path._get_packed_fingerprint() == nav_msgs.Path._get_packed_fingerprint()
         self.path._encode_one(buf)
 
@@ -65,7 +71,7 @@ class PathEnvelope(object):
         self.schema_version = struct.unpack(">i", buf.read(4))[0]
         __session_id_len = struct.unpack('>I', buf.read(4))[0]
         self.session_id = buf.read(__session_id_len)[:-1].decode('utf-8', 'replace')
-        self.producer_runtime_generation, self.goal_generation, self.planner_runtime_generation, self.path_revision = struct.unpack(">qqqq", buf.read(32))
+        self.producer_runtime_generation, self.goal_generation, self.planner_runtime_generation, self.path_revision, self.route_kind = struct.unpack(">qqqqb", buf.read(33))
         self.path = nav_msgs.Path._decode_one(buf)
         return self
 
@@ -73,7 +79,7 @@ class PathEnvelope(object):
     def _get_hash_recursive(parents):
         if PathEnvelope in parents: return 0
         newparents = parents + [PathEnvelope]
-        tmphash = (0xfc7cbd2d389ba249+ nav_msgs.Path._get_hash_recursive(newparents)) & 0xffffffffffffffff
+        tmphash = (0x6c73848887bb4303+ nav_msgs.Path._get_hash_recursive(newparents)) & 0xffffffffffffffff
         tmphash  = (((tmphash<<1)&0xffffffffffffffff) + (tmphash>>63)) & 0xffffffffffffffff
         return tmphash
     _packed_fingerprint = None

@@ -207,9 +207,14 @@ pub struct NavSession {
     pub goal: ExecutionGoal,
 }
 
-/// A planner path with the correlation fields required for safe cutover.
+/// 路线用途沿原生规划、消息与调度入口保持一致。
+pub use nuwax_nav_pct_native::RouteKind;
+
+/// 带完整关联身份与路线用途的执行输入。
 #[derive(Debug, Clone, PartialEq)]
 pub struct VersionedPath {
+    /// 明确区分完整路线与逼近路线，逼近结束不能完成业务目标。
+    pub route_kind: RouteKind,
     /// Goal/session identifier copied from the versioned goal envelope.
     pub session_id: String,
     /// Complete identity copied from the sealed goal and path envelopes.
@@ -1076,6 +1081,7 @@ pub struct NavScheduler<M, P> {
     session: Option<NavSession>,
     lease_active: bool,
     current_path_revision: u64,
+    current_route_kind: RouteKind,
 
     current_path: Option<(ExecutionPath, Option<Vec<f64>>)>,
     current_execution_identity: Option<Arc<PathExecutionIdentity>>,
@@ -1122,6 +1128,7 @@ where
             session: None,
             lease_active: false,
             current_path_revision: 0,
+            current_route_kind: RouteKind::Complete,
 
             current_path: None,
             current_execution_identity: None,
@@ -1437,7 +1444,7 @@ where
                 InputKind::UpdateCostmap(map, _) => ("scheduler.input.map", map.source_timestamp_ns),
                 // Runtime owns no recent source timestamp; record its actual incoming bound.
                 InputKind::UpdateObstacleSource(_, _, _, _) => ("scheduler.input.recent", 0),
-                InputKind::PlanningDiagnostic(_, _, _) => ("scheduler.input.planning_diagnostic", 0),
+                InputKind::PlanningDiagnostic(_, _, _, _) => ("scheduler.input.planning_diagnostic", 0),
                 InputKind::CapturePlanningActual(_, _) => ("scheduler.input.capture_actual", 0),
             };
             sink.mark("scheduler.input.dequeue", source);
@@ -1486,12 +1493,19 @@ where
                 let _ = reply.send(context);
                 Ok(())
             }
-            InputKind::PlanningDiagnostic(goal_id, key, message) => {
-                if self.status.phase == SchedulerPhase::AwaitingPath && self.session.as_ref().is_some_and(|session|
-                    session.session_id == goal_id && session.execution_identity.goal_key() == key) {
-                    self.status.message = message; self.publish_status(status_tx);
-                }
-                Ok(())
+            InputKind::PlanningDiagnostic(goal_id, key, message, failed) => {
+                if matches!(self.status.phase,SchedulerPhase::AwaitingPath | SchedulerPhase::Controlling)
+                    && self.session.as_ref().is_some_and(|session|
+                        session.session_id == goal_id && session.execution_identity.goal_key() == key) {
+                    if failed {
+                        self.status.message=message.clone();self.publish_status(status_tx);
+                        let result=self.finish_terminal(status_tx,TerminalOutcome::PlannerFailed,SchedulerPhase::Failed).await;
+                        if result.is_ok() {self.status.message=message;self.publish_status(status_tx);}
+                        result
+                    } else if self.status.phase == SchedulerPhase::AwaitingPath {
+                        self.status.message = message; self.publish_status(status_tx);Ok(())
+                    } else {Ok(())}
+                } else {Ok(())}
             }
         };
         #[cfg(feature = "surface-recovery-qualification")]
@@ -1671,6 +1685,7 @@ where
         self.planner.configure_boundary(&session.boundary);
         self.session = Some(session);
         self.current_path_revision = 0;
+        self.current_route_kind = RouteKind::Complete;
 
         self.current_path = None;
         self.current_execution_identity = None;
@@ -1757,7 +1772,7 @@ where
             return Err(path_rejected("path revision is stale"));
         }
         if path.path_revision == self.current_path_revision && self.current_path_revision != 0 {
-            let immutable = self.current_path.as_ref().is_some_and(|(current, yaws)| {
+            let immutable = self.current_route_kind == path.route_kind && self.current_path.as_ref().is_some_and(|(current, yaws)| {
                     same_execution_path(current, &path.path) && yaws == &path.path_yaws
                 })
                 && self
@@ -1785,6 +1800,7 @@ where
 
         let VersionedPath {
             path: planner_path,
+            route_kind,
             path_yaws,
             execution_identity,
             path_revision,
@@ -1797,6 +1813,7 @@ where
             session.goal.clone(),
         )?;
         self.current_path_revision = path_revision;
+        self.current_route_kind = route_kind;
 
         self.current_path = Some((planner_path, path_yaws));
         self.current_execution_identity = Some(Arc::new(execution_identity));
@@ -1855,11 +1872,22 @@ where
         }
         #[cfg(feature = "surface-recovery-qualification")]
         self.qualification_snapshot("scheduler.control_tick.fresh", self.status.pose_source_timestamp_ns, Some(false), 0);
-        let step = {
+        let mut step = {
             #[cfg(feature = "surface-recovery-qualification")]
             let _qualification_span = self.qualification_span("scheduler.planner.step", self.status.pose_source_timestamp_ns);
             self.planner.step(self.config.robot_width_m)
         };
+        if self.current_route_kind == RouteKind::Approach {
+            let near_endpoint = match (&self.current_path,&self.latest_pose) {
+                (Some((ExecutionPath::Surface(path),_)),Some(pose)) => path.poses.last()
+                    .is_some_and(|end|pose.pose.position.distance(end.pose.position)<=0.15),
+                _ => false,
+            };
+            if matches!(&step,PlannerStep::Succeeded) || near_endpoint
+                && matches!(&step,PlannerStep::Command(_) | PlannerStep::Pending(_)) {
+                step=PlannerStep::ReplanRequired("逼近路线已到近端，原目标仍活动，等待新观测地面与重规划".into());
+            }
+        }
         let intent = self.wrap_local_intent(step)?;
         // This evidence belongs to the exact delivered step and accepted path.
         // It is not reconstructed from the scheduler's latest map/pose inputs.
@@ -2344,6 +2372,10 @@ where
 
     fn publish_status(&self, status_tx: &watch::Sender<SchedulerStatus>) {
         let mut status = self.status.clone();
+        if self.current_route_kind == RouteKind::Approach && status.last_terminal.is_none()
+            && matches!(status.phase,SchedulerPhase::Controlling | SchedulerPhase::AwaitingPath) {
+            status.message=format!("正在逐步逼近目标；{}",status.message);
+        }
         if status.phase == SchedulerPhase::Controlling && status.last_terminal.is_none() {
             status.local_path = self.planner.local_path_for_display();
         } else {
@@ -2502,9 +2534,13 @@ impl NavSchedulerHandle {
         result.await.map_err(|_| RuntimeError::SchedulerStopped)?
     }
 
-    /// 规划诊断按目标摘要关联，仅更新等待路径阶段，不能覆盖执行或终态。
+    /// 全局拥有方确认无法继续逼近时沿当前会话的原停车围栏结束。
+    pub async fn report_planning_failure(&self,goal_id:String,key:GoalKey,message:String)->Result<(),RuntimeError> {
+        self.send_input(InputKind::PlanningDiagnostic(goal_id,key,message,true)).await
+    }
+    /// 规划诊断按原目标身份关联，仅更新等待路径阶段，不能覆盖执行或终态。
     pub async fn report_planning_diagnostic(&self,goal_id:String,key:GoalKey,message:String)->Result<(),RuntimeError> {
-        self.send_input(InputKind::PlanningDiagnostic(goal_id,key,message)).await
+        self.send_input(InputKind::PlanningDiagnostic(goal_id,key,message,false)).await
     }
 
     /// Read the latest scheduler status.
@@ -2528,7 +2564,7 @@ impl NavSchedulerHandle {
                 InputKind::UpdateOdometry(pose, _, _) => ("scheduler.send.pose", pose.stamp.nanos),
                 InputKind::UpdateCostmap(map, _) => ("scheduler.send.map", map.source_timestamp_ns),
                 InputKind::UpdateObstacleSource(_, _, _, _) => ("scheduler.send.recent", 0),
-                InputKind::PlanningDiagnostic(_, _, _) => ("scheduler.send.planning_diagnostic", 0),
+                InputKind::PlanningDiagnostic(_, _, _, _) => ("scheduler.send.planning_diagnostic", 0),
                 InputKind::CapturePlanningActual(_, _) => ("scheduler.send.capture_actual", 0),
             };
             if let InputKind::UpdateObstacleSource(_, _, bound, _) = &kind {
@@ -2685,7 +2721,7 @@ enum InputKind {
     UpdateOdometry(PoseStamped, Option<Instant>, Instant),
     UpdateCostmap(CostmapObservation, Instant),
     UpdateObstacleSource(Option<ExecutionMap>,bool,Option<CommandDispatchBound>,Option<Option<Arc<RegisteredFrame>>>),
-    PlanningDiagnostic(String, GoalKey, String),
+    PlanningDiagnostic(String, GoalKey, String, bool),
     CapturePlanningActual(PathExecutionIdentity, oneshot::Sender<Option<Arc<ActualExecutionContext>>>),
 }
 
@@ -3517,6 +3553,7 @@ mod tests {
 
     pub(crate) fn path_for(session_id: &str, path_revision: u64) -> VersionedPath {
         VersionedPath {
+            route_kind: RouteKind::Complete,
             session_id: session_id.into(),
             execution_identity: execution_identity_for(session_id, path_revision),
             path_revision,

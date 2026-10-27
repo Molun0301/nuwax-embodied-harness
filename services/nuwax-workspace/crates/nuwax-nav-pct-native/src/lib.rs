@@ -90,8 +90,12 @@ pub struct Band {
     pub low: f64,
     pub high: f64,
 }
+/// 完整路线与仅到已观测可达区域边缘的逼近路线。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteKind { Complete, Approach }
 #[derive(Clone, Debug)]
 pub struct Route {
+    pub kind: RouteKind,
     /// 与起终点相同的机体中心坐标。
     pub path: Vec<[f64; 3]>,
     pub elapsed_ms: f64,
@@ -122,6 +126,7 @@ struct ResultRaw {
     length: usize,
     elapsed_ms: f64,
     expanded: usize,
+    kind: i32,
 }
 unsafe extern "C" {
     fn pct_create(
@@ -146,6 +151,7 @@ unsafe extern "C" {
         result: *mut ResultRaw,
         cancel: extern "C" fn(*const c_void) -> bool,
         user: *const c_void,
+        progressive: bool,
         err: *mut c_char,
         cap: usize,
     ) -> i32;
@@ -238,7 +244,7 @@ impl Planner {
         (cells, bands)
     }
     pub fn plan(&mut self, start: [f64; 3], goal: [f64; 3]) -> Result<Route, String> {
-        self.plan_inner(start, goal, std::ptr::null())
+        self.plan_inner(start, goal, std::ptr::null(), false)
     }
     pub fn plan_cancellable(
         &mut self,
@@ -246,13 +252,18 @@ impl Planner {
         goal: [f64; 3],
         cancel: &AtomicBool,
     ) -> Result<Route, String> {
-        self.plan_inner(start, goal, (cancel as *const AtomicBool).cast())
+        self.plan_inner(start, goal, (cancel as *const AtomicBool).cast(), false)
+    }
+    /// 完整路线优先；失败时返回本次搜索已展开区域内三维距离最近的可达格。
+    pub fn plan_progressive(&mut self, start: [f64; 3], goal: [f64; 3], cancel: Option<&AtomicBool>) -> Result<Route, String> {
+        self.plan_inner(start, goal, cancel.map_or(std::ptr::null(), |flag| (flag as *const AtomicBool).cast()), true)
     }
     fn plan_inner(
         &mut self,
         start: [f64; 3],
         goal: [f64; 3],
         cancel: *const c_void,
+        progressive: bool,
     ) -> Result<Route, String> {
         let mut result = ResultRaw::default();
         let mut error = [0; 512];
@@ -265,6 +276,7 @@ impl Planner {
                 &mut result,
                 cancelled,
                 cancel,
+                progressive,
                 error.as_mut_ptr(),
                 error.len(),
             )
@@ -272,6 +284,7 @@ impl Planner {
         let route = if status == 0 && result.length > 0 {
             let values = unsafe { std::slice::from_raw_parts(result.points, result.length * 3) };
             Ok(Route {
+                kind: if result.kind == 0 { RouteKind::Complete } else { RouteKind::Approach },
                 path: values.chunks_exact(3).map(|v| [v[0], v[1], v[2]]).collect(),
                 elapsed_ms: result.elapsed_ms,
                 expanded: result.expanded,
@@ -314,6 +327,75 @@ mod tests {
             x, y, ground: 0.0, ceiling: f64::INFINITY,
         })).collect()
     }
+    #[test]
+    fn progressive_gap_returns_nearest_reachable_cell_without_unknown_ground() {
+        let cells: Vec<_> = flat_cells(0..40,-4..5).into_iter()
+            .filter(|c|c.x<15 || c.x>=25).collect();
+        let mut p=Planner::from_cells(config(),&cells,&[]).unwrap();
+        let start=[0.35,0.05,0.4];let goal=[3.65,0.05,0.4];
+        assert!(p.plan(start,goal).is_err(),"完整接口不能交付逼近结果");
+        let route=p.plan_progressive(start,goal,None).unwrap();
+        assert_eq!(route.kind,RouteKind::Approach);
+        let end=route.path.last().unwrap();
+        assert!((end[0]-1.45).abs()<1e-9 && (end[1]-0.05).abs()<1e-9 && (end[2]-0.4).abs()<1e-9);
+        assert!(route.path.iter().all(|point|cells.iter().any(|cell|
+            cell.x==(point[0]/0.1).floor() as i32 && cell.y==(point[1]/0.1).floor() as i32)));
+        assert!(route.expanded>0);
+    }
+
+    #[test]
+    fn progressive_missing_goal_still_searches_measured_reachable_region() {
+        let cells=flat_cells(0..20,-4..5);
+        let mut p=Planner::from_cells(config(),&cells,&[]).unwrap();
+        assert!(p.plan([0.35,0.05,0.4],[8.05,0.05,0.4]).is_err());
+        let route=p.plan_progressive([0.35,0.05,0.4],[8.05,0.05,0.4],None).unwrap();
+        assert_eq!(route.kind,RouteKind::Approach);
+        assert!((route.path.last().unwrap()[0]-1.95).abs()<1e-9);
+        assert_eq!(p.geometry().0.len(),cells.len(),"缺测目标不能创建地面节点");
+    }
+
+    #[test]
+    fn progressive_complete_path_preserves_original_search_and_cancellation() {
+        let cells=flat_cells(0..40,-4..5);
+        let mut p=Planner::from_cells(config(),&cells,&[]).unwrap();
+        let start=[0.35,0.05,0.4];let goal=[3.65,0.05,0.4];
+        let original=p.plan(start,goal).unwrap();
+        let route=p.plan_progressive(start,goal,None).unwrap();
+        assert_eq!(route.kind,RouteKind::Complete);
+        assert_eq!(route.path,original.path);
+        assert_eq!(route.expanded,original.expanded,"不得额外执行全图搜索");
+        let cancelled=AtomicBool::new(true);
+        assert!(p.plan_progressive(start,goal,Some(&cancelled)).unwrap_err().contains("取消"));
+        assert_eq!(p.plan_progressive(start,goal,None).unwrap().path,original.path);
+    }
+
+    #[test]
+    fn progressive_candidate_keeps_full_body_clear_of_a_wall() {
+        let cells=flat_cells(0..40,-4..5);
+        let wall:Vec<_>=(-6..7).map(|y|Band{x:15,y,low:0.0,high:1.5}).collect();
+        let mut p=Planner::from_cells(config(),&cells,&wall).unwrap();
+        let route=p.plan_progressive([0.35,0.05,0.4],[3.65,0.05,0.4],None).unwrap();
+        assert_eq!(route.kind,RouteKind::Approach);
+        assert!(route.path.iter().all(|p|p[0]+config().footprint_radius<1.5));
+    }
+
+    #[test]
+    fn progressive_closest_distance_includes_height_instead_of_only_xy() {
+        let mut cfg=config();cfg.max_slope=80_f64.to_radians();
+        let cells:Vec<_>=flat_cells(0..35,0..1).into_iter().map(|mut cell| {
+            cell.ground=f64::from((cell.x-9).max(0))*0.1;cell
+        }).collect();
+        let goal=[4.0,0.05,0.4];
+        let distance=|cell:&Cell|((f64::from(cell.x)+0.5)*0.1-goal[0]).powi(2)+(cell.ground+cfg.body_to_ground-goal[2]).powi(2);
+        let closest=cells.iter().min_by(|a,b|distance(a).total_cmp(&distance(b))).unwrap();
+        let mut planner=Planner::from_cells(cfg,&cells,&[]).unwrap();
+        let route=planner.plan_progressive([0.35,0.05,0.4],goal,None).unwrap();
+        assert_eq!(route.kind,RouteKind::Approach);
+        let endpoint=route.path.last().unwrap();
+        assert!((endpoint[0]-(f64::from(closest.x)+0.5)*0.1).abs()<1e-9);
+        assert!(endpoint[0]<3.0,"只按水平距离会错误选择最高的远端格");
+    }
+
     #[test]
     fn entirely_unknown_space_has_no_native_surface_route() {
         let mut p = Planner::new(config(), &[]).unwrap();

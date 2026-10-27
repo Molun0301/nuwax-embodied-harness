@@ -32,6 +32,88 @@
  }
  
  void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_out)
+@@ -258,7 +264,9 @@
+   /*** Initialize IMU pose ***/
+   state_ikfom imu_state = kf_state.get_x();
+   IMUpose.clear();
+-  IMUpose.push_back(set_pose6d(0.0, acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
++  // 当前状态属于上一扫描末端；扫描间隙不能被误标为本帧零时刻。
++  IMUpose.push_back(set_pose6d(last_lidar_end_time_ - pcl_beg_time,
++      acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
+ 
+   /*** forward propagation at each imu point ***/
+   V3D angvel_avr, acc_avr, acc_imu, vel_imu, pos_imu;
+@@ -312,7 +320,9 @@
+       acc_s_last[i] += imu_state.grav[i];
+     }
+     double &&offs_t = tail->header.stamp.toSec() - pcl_beg_time;
+-    IMUpose.push_back(set_pose6d(offs_t, acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
++    // 零时长积分不新增重复时间节点，保留原有滤波预测顺序。
++    if (offs_t > IMUpose.back().offset_time)
++      IMUpose.push_back(set_pose6d(offs_t, acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
+   }
+ 
+   /*** calculated the pos and attitude prediction at the frame-end ***/
+@@ -327,8 +337,35 @@
+   /*** undistort each lidar point (backward propagation) ***/
+   // std::cout << "pcl_out.points.begin() == pcl_out.points.end(): " << (pcl_out.points.begin() == pcl_out.points.end()) << std::endl;
+   if (pcl_out.points.begin() == pcl_out.points.end()) return;
+-  auto it_pcl = pcl_out.points.end() - 1;
+-  for (auto it_kp = IMUpose.end() - 1; it_kp != IMUpose.begin(); it_kp--)
++  // 从真实历史插值出扫描起点，不改变估计器积分、初始化或末端状态。
++  auto start_tail = std::upper_bound(IMUpose.begin(), IMUpose.end(), 0.0,
++      [](double time, const Pose6D &pose) { return time < pose.offset_time; });
++  auto start_head = start_tail == IMUpose.begin() ? start_tail : start_tail - 1;
++  const auto &start_rate = start_tail == IMUpose.end() ? IMUpose.back() : *start_tail;
++  R_imu << MAT_FROM_ARRAY(start_head->rot);
++  vel_imu << VEC_FROM_ARRAY(start_head->vel);
++  pos_imu << VEC_FROM_ARRAY(start_head->pos);
++  acc_imu << VEC_FROM_ARRAY(start_rate.acc);
++  angvel_avr << VEC_FROM_ARRAY(start_rate.gyr);
++  dt = -start_head->offset_time;
++  const M3D start_rot = R_imu * Exp(angvel_avr, dt);
++  const V3D start_pos = pos_imu + vel_imu * dt + 0.5 * acc_imu * dt * dt;
++  const V3D start_vel = vel_imu + acc_imu * dt;
++  const auto start_pose = set_pose6d(0.0, acc_imu, angvel_avr, start_vel, start_pos, start_rot);
++  IMUpose.erase(IMUpose.begin(), start_tail);
++  IMUpose.insert(IMUpose.begin(), start_pose);
++  if (IMUpose.size() == 1)
++    IMUpose.push_back(set_pose6d(pcl_end_time - pcl_beg_time, acc_s_last,
++        angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
++
++  // 时间字段来自无符号偏移；异常越界仍保留点，按最近扫描端点补偿，避免无依据外推。
++  const auto point_time = [&](const PointType &point) {
++    return std::max(0.0, std::min(pcl_end_time - pcl_beg_time, point.curvature / double(1000)));
++  };
++  // 游标表示尚未处理区间的右开端，处理后始终递减，首点不会在前一区间重复处理。
++  auto it_pcl = pcl_out.points.end();
++  for (auto it_kp = IMUpose.end() - 1;
++       it_kp != IMUpose.begin() && it_pcl != pcl_out.points.begin(); it_kp--)
+   {
+     auto head = it_kp - 1;
+     auto tail = it_kp;
+@@ -339,9 +376,11 @@
+     acc_imu<<VEC_FROM_ARRAY(tail->acc);
+     angvel_avr<<VEC_FROM_ARRAY(tail->gyr);
+ 
+-    for(; it_pcl->curvature / double(1000) > head->offset_time; it_pcl --)
++    // 区间左闭右开；相同时间的整批点归入同一区间，最末区间包含扫描终点。
++    while (it_pcl != pcl_out.points.begin() && point_time(*(it_pcl - 1)) >= head->offset_time)
+     {
+-      dt = it_pcl->curvature / double(1000) - head->offset_time;
++      --it_pcl;
++      dt = point_time(*it_pcl) - head->offset_time;
+ 
+       /* Transform to the 'end' frame, using only the rotation
+        * Note: Compensation direction is INVERSE of Frame's moving direction
+@@ -358,7 +397,6 @@
+       it_pcl->y = P_compensate(1);
+       it_pcl->z = P_compensate(2);
+ 
+-      if (it_pcl == pcl_out.points.begin()) break;
+     }
+   }
+ }
 --- a/src/laserMapping.hpp
 +++ b/src/laserMapping.hpp
 @@ -10,6 +10,7 @@

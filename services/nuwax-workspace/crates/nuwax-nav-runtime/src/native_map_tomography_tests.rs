@@ -159,3 +159,110 @@ fn native_bridge_distinguishes_continuous_ramps_from_independent_steps() {
         0.01 + 0.9 * 3.45
     ));
 }
+
+/// 精细源只有体素占据与独立地面记录，地面高度取自高度场统计。
+/// `extra` 为非地面成员的占据体素，键为精细格坐标。
+fn heightfield_floor(height: impl Fn(f64) -> f64, extra: &[[i32; 3]], max_step: f64) -> SurfaceSnapshot {
+    use nuwax_map_chunks::heightfield_observations::HeightfieldColumn;
+    use nuwax_map_chunks::{ColumnGroundRecords, Domain, HeightfieldSurface, Receiver, Repository, Transfer, Writer};
+    use nuwax_nav_mls_planner::surface::{SurfaceObservation, SurfaceObservations};
+    const Q: f32 = 0.05;
+    let bin = f64::from(Q) / 8.0;
+    let mut writer = Writer::new(Repository::temporary().unwrap(), Q, 4 * 1024 * 1024).unwrap();
+    let mut points = Vec::new();
+    for x in 0..80 {
+        for y in -6..6 {
+            // 回波在实际高度上下约2厘米内分布，贴近量化边界的地面占两层体素。
+            let center = (height((f64::from(x) + 0.5) * f64::from(Q)) / bin).floor() as i32;
+            let mut counts = BTreeMap::<i32, [u32; 8]>::new();
+            for offset in -3..=3 {
+                let sub = center + offset;
+                counts.entry(sub.div_euclid(8)).or_default()[sub.rem_euclid(8) as usize] += 4 - offset.abs() as u32;
+            }
+            let column = HeightfieldColumn::from_counts([x, y], Q, counts).unwrap().unwrap();
+            for (z, _) in column.members() {
+                writer.observe([[x, y, z]], 20).unwrap();
+                points.push(((x as f32 + 0.5) * Q, (y as f32 + 0.5) * Q, (z as f32 + 0.5) * Q));
+            }
+            writer.replace_ground_column([x, y], &ColumnGroundRecords {
+                classified_empty: false,
+                legacy: vec![],
+                heightfields: vec![HeightfieldSurface { column, samples: vec![] }],
+            }).unwrap();
+        }
+    }
+    writer.observe(extra.iter().copied(), 20).unwrap();
+    points.extend(extra.iter().map(|&[x, y, z]| ((x as f32 + 0.5) * Q, (y as f32 + 0.5) * Q, (z as f32 + 0.5) * Q)));
+    let domain = Domain { session: "tomography-ground".into(), generation: 1, frame_generation: 0, producer_generation: 1 };
+    let root = writer.snapshot(domain, 1, 20).unwrap();
+    let mut receiver = Receiver::new(Repository::temporary().unwrap());
+    receiver.receive(&Transfer { root: root.encode().unwrap(), included: BTreeMap::new() }, &root.domain,
+        |_, r| writer.repository().read_object(r.object, nuwax_map_chunks::MAX_BLOCK_BYTES)).unwrap();
+    let mut observations = SurfaceObservations::new(Q, 32).unwrap();
+    let mut parts = Vec::new();
+    for r in &root.blocks {
+        let (block, records) = receiver.ground_parts(r).unwrap();
+        observations.replace_block(r.key, block.iter().map(|(&local, e)| (
+            nuwax_map_chunks::global_key(r.key, local).unwrap(),
+            SurfaceObservation { observed_ns: e.observed_ns, hits: e.hits },
+        )).collect()).unwrap();
+        parts.push((r.key, records));
+    }
+    for xy in parts.iter().map(|(k, _)| [k[0], k[1]]).collect::<BTreeSet<_>>() {
+        let group: Vec<_> = parts.iter().filter(|(k, _)| k[..2] == xy).cloned().collect();
+        observations.replace_heightfield_columns(xy, &group);
+    }
+    observations.mark_complete_geometry_source();
+    let (_, base) = crate::native_test_helpers::fixture();
+    let body = nuwax_nav_mls_planner::SurfaceBodyEnvelope {
+        fixed_collision: None,
+        footprint_xy_m: vec![[-0.06, -0.06], [0.06, -0.06], [0.06, 0.06], [-0.06, 0.06]],
+        // 机体底面落到支撑面，地面厚度若被当作占据会直接挡住机体。
+        z_bounds_m: [-0.4, 0.1],
+        body_to_support_z_m: 0.4,
+        max_step_up_m: max_step,
+        max_step_down_m: max_step,
+        max_cross_slope_deg: 18.0,
+        support_uncertainty_m: 0.0,
+    };
+    SurfaceSnapshot::from_points(&points, base.config().clone(), Q)
+        .unwrap()
+        .with_body_envelope(body)
+        .unwrap()
+        .with_observations(Some(std::sync::Arc::new(observations)))
+}
+
+fn heightfield_route(map: &SurfaceSnapshot, height: impl Fn(f64) -> f64) -> Result<Vec<[f64; 3]>, String> {
+    let (config, cells, bands) = pct_input_from_tomogram(map, 0.4, &[]).unwrap();
+    let mut planner = nuwax_nav_pct_native::Planner::from_cells(config, &cells, &bands)?;
+    planner.plan([0.125, 0.025, height(0.125) + 0.4], [3.875, 0.025, height(3.875) + 0.4]).map(|route| route.path)
+}
+
+#[test]
+fn tomography_uses_continuous_ground_records_across_voxel_boundaries() {
+    // 1°缓坡在4米内升高约7厘米，跨过一个5厘米体素边界；阶高为0时只能按连续坡度通行。
+    let height = |x: f64| 0.012 + 1.0_f64.to_radians().tan() * x;
+    let map = heightfield_floor(height, &[], 0.0);
+    let (config, cells, bands) = pct_input_from_tomogram(&map, 0.4, &[]).unwrap();
+    assert_eq!(config.max_step, 0.0);
+    // 每列一个记录高度；两层体素厚的地面只留零厚度的地面带，不成为机体障碍。
+    assert_eq!(cells.len(), 80 * 12);
+    assert!(bands.iter().all(|band| band.high == band.low));
+    assert!(cells.iter().all(|cell| (cell.ground - height((f64::from(cell.x) + 0.5) * 0.05)).abs() < 0.02));
+    let path = heightfield_route(&map, height).expect("缓坡跨量化边界应可通行");
+    let limit = 18.0_f64.to_radians().tan() * 0.05 * 2.0_f64.sqrt();
+    assert!(path.windows(2).all(|pair| (pair[1][2] - pair[0][2]).abs() <= limit + 1e-6));
+    drop((config, cells, bands));
+
+    // 非地面成员的占据体素仍是实体：地面以上一整排低矮实体挡住阶高0的机体。
+    let wall: Vec<_> = (-6..6).map(|y| [40, y, 2]).collect();
+    assert!(heightfield_route(&heightfield_floor(height, &wall, 0.0), height).is_err());
+}
+
+#[test]
+fn tomography_ground_records_keep_real_steps_under_step_limit() {
+    // 记录高度本身有5厘米跳变时是真实台阶：阶高0拒绝，阶高足够时通行。
+    let height = |x: f64| if x < 2.0 { 0.012 } else { 0.062 };
+    assert!(heightfield_route(&heightfield_floor(height, &[], 0.0), height).is_err());
+    assert!(heightfield_route(&heightfield_floor(height, &[], 0.08), height).is_ok());
+}

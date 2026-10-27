@@ -314,7 +314,7 @@ impl ComputeBasis {
         }
         // Tick admission validates the sampled pose. Completion can outlive
         // that sample's receipt TTL; navigation consumers check their live pose.
-        // Map identity and the current installed map receipt still qualify here.
+        // 地图身份与来源活性仍需复核；同域新发布不因旧快照的计算延迟而过期。
         if !inner.logical_active
             || self.generation != inner.generation
             || self.parent != inner.last_request_id
@@ -326,9 +326,7 @@ impl ComputeBasis {
                 .feedback
                 .as_ref()
                 .is_some_and(|feedback| feedback.result.is_none())
-            || inner.costmap_received_monotonic_ns == 0
-            || now_monotonic_nanos().saturating_sub(inner.costmap_received_monotonic_ns)
-                > inner.costmap_receipt_ttl.as_nanos() as u64
+            || !inner.map_input_is_fresh(now_monotonic_nanos())
         {
             return false;
         }

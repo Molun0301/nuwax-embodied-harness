@@ -212,6 +212,8 @@ impl NativeFrontierCache {
         }
         let (config, cells, bands) =
             nuwax_nav_runtime::native_map::pct_input_for_source(snapshot, offset, boundary, terrain_source)?;
+        let started = std::time::Instant::now();
+        tracing::debug!(target: "navigation.exploration.compute", cells = cells.len(), bands = bands.len(), "开始构建前沿原生规划器");
         let mut measured = std::collections::BTreeMap::<[i32; 2], Vec<f64>>::new();
         for cell in &cells {
             measured
@@ -221,6 +223,7 @@ impl NativeFrontierCache {
         }
         let resolution = config.resolution;
         let planner = nuwax_nav_pct_native::Planner::from_cells(config, &cells, &bands)?;
+        tracing::debug!(target: "navigation.exploration.compute", elapsed_ms = started.elapsed().as_secs_f64() * 1000.0, "前沿原生规划器构建完成");
         tracing::debug!(target:"navigation.pct",event="navigation.pct.map",cells=cells.len(),
             occupied_bands=bands.len(),"探索PCT原生输入构建完成");
         let cached = CachedFrontierPlanner {
@@ -587,6 +590,7 @@ impl SurfaceGoalSourceAdapter {
         // still refer to the original frozen source, never its planning fork.
         let query_view = planning.and_then(FrozenSurfacePlanningInput::query_snapshot);
         let snapshot = query_view.unwrap_or(source_snapshot);
+        let compute_started = std::time::Instant::now();
         // An unchanged-input wait cannot select a frontier. Its private fork
         // will be discarded, so only retain the required body/support checks
         // below. Synchronous callers keep their original cache behavior.
@@ -595,6 +599,7 @@ impl SurfaceGoalSourceAdapter {
                 .prepare_frontier_geometry(&boundary)
                 .map_err(|error| ExploreError::SourceError(error.to_string()))?;
         }
+        tracing::debug!(target: "navigation.exploration.compute", elapsed_ms = compute_started.elapsed().as_secs_f64() * 1000.0, "前沿几何索引就绪");
         let current_body = ([position.x, position.y, position.z], quaternion);
         // This is only a calibrated planning reference. It neither inserts a
         // floor nor requires an observed support cell under the current body.
@@ -632,6 +637,7 @@ impl SurfaceGoalSourceAdapter {
         .map_err(|error| ExploreError::SourceError(error.to_string()))?;
         let mut candidates = geometry.candidates;
         let observation_targets = geometry.targets;
+        tracing::debug!(target: "navigation.exploration.compute", candidates = candidates.len(), targets = observation_targets.len(), elapsed_ms = compute_started.elapsed().as_secs_f64() * 1000.0, "前沿候选与观测目标就绪");
         // 前沿路线使用与导航相同的原生实测层与占据输入，缺测不补造可通行节点。
         let uncached = NativeFrontierCache::default();
         let cache = planning.map_or(&uncached, |input| input.native_cache.as_ref());
@@ -1429,7 +1435,12 @@ fn frontier_route_cost(
         return None;
     }
     budget.queries.set(budget.queries.get() + 1);
-    let route = planner.lock().ok()?.plan(start, goal).ok()?;
+    let started = std::time::Instant::now();
+    tracing::debug!(target: "navigation.exploration.compute", query = budget.queries.get(), ?start, ?goal, "开始前沿完整路线查询");
+    let result = planner.lock().ok()?.plan(start, goal);
+    tracing::debug!(target: "navigation.exploration.compute", elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        expanded = result.as_ref().ok().map(|route| route.expanded), error = ?result.as_ref().err(), "前沿完整路线查询完成");
+    let route = result.ok()?;
     budget.expanded.set(budget.expanded.get() + route.expanded);
     let cost = route
         .path

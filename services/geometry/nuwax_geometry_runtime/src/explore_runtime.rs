@@ -885,6 +885,23 @@ pub struct ExploreRuntimeInner {
 }
 
 impl ExploreRuntimeInner {
+    /// 来源活性使用最新准入发布的接收时刻；已安装图保留自身票据身份和计算延迟。
+    /// 清图、换域及失败会撤销完整快照，不能仅凭新发布取得探索许可。
+    fn map_input_is_fresh(&self, now_monotonic_ns: u64) -> bool {
+        let received = match &self.surface_mode {
+            Some(mode) => {
+                if !mode.accepting || !mode.input_ready || mode.installed_revision.is_none() {
+                    return false;
+                }
+                mode.latest.as_ref().map_or(0, |ticket| ticket.received_monotonic_ns)
+            }
+            None => self.costmap_received_monotonic_ns,
+        };
+        received != 0
+            && now_monotonic_ns.saturating_sub(received)
+                <= self.costmap_receipt_ttl.as_nanos() as u64
+    }
+
     fn new() -> Self {
         Self {
             logical_active: false,
@@ -2767,10 +2784,7 @@ impl ExploreRuntimeHandle {
                 )
                 .await;
         }
-        if guard.costmap_received_monotonic_ns == 0
-            || now_monotonic_nanos().saturating_sub(guard.costmap_received_monotonic_ns)
-                > guard.costmap_receipt_ttl.as_nanos() as u64
-        {
+        if !guard.map_input_is_fresh(now_monotonic_nanos()) {
             guard.no_frontier_since = None;
             let snapshot = guard.snapshot(
                 STATUS_PENDING,
@@ -5504,6 +5518,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn surface_slow_build_uses_live_source_without_relabeling_installed_map() {
+        let (handle, sink) = configured_handle();
+        handle.configure_surface_source(Ok(surface_config("map")), 37, [7; 16])
+            .await.unwrap();
+        let first = surface_message("map", 1);
+        // 模拟耗时超过接收期限的构建，后续发布继续由真实接纳入口更新。
+        let old_receipt = now_monotonic_nanos()
+            .saturating_sub((DEFAULT_COSTMAP_RECEIPT_TTL + Duration::from_secs(1)).as_nanos() as u64);
+        let ticket = handle.begin_surface_map_update(&first, old_receipt).await.unwrap().unwrap();
+        let snapshot = Arc::new(SurfaceSnapshot::from_points(
+            &schema::navigation_map_3d_points(&first).unwrap(),
+            surface_config("map").geometry, first.source_voxel_size,
+        ).unwrap());
+        let next = surface_message("map", 2);
+        handle.begin_surface_map_update(&next, now_monotonic_nanos()).await.unwrap();
+        assert_eq!(handle.start("surface-slow-build", "prefer_wavefront").await.status, STATUS_ACCEPTED);
+        let waiting = handle.tick_with_pose(surface_pose(&snapshot, 0.0, Quaternion::IDENTITY)).await;
+        assert_eq!(waiting.status, STATUS_PENDING, "{}", waiting.message);
+        assert!(sink.submitted.lock().unwrap().is_empty(), "仅有新发布但没有完整图不能派发");
+        assert!(handle.finish_surface_map_update(ticket, Ok(snapshot.clone())).await);
+        let active = handle.tick_with_pose(surface_pose(&snapshot, 0.0, Quaternion::IDENTITY)).await;
+        assert_eq!(active.status, STATUS_ACTIVE, "{}", active.message);
+        let requests = sink.submitted.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].intent.committed_map, first.committed_map);
+        drop(requests);
+        let guard = handle.inner.lock().await;
+        assert_eq!(guard.committed_map.as_ref(), Some(&first.committed_map));
+        assert_eq!(guard.costmap_received_monotonic_ns, old_receipt);
+    }
+
+    #[tokio::test]
+    async fn surface_duplicate_publication_cannot_keep_stopped_source_alive() {
+        let (handle, sink) = configured_handle();
+        let (message, _, snapshot) = install_surface_fixture(&handle, "map").await;
+        handle.start("surface-stopped-source", "prefer_wavefront").await;
+        {
+            let mut guard = handle.inner.lock().await;
+            // 来源停止超过原期限；只读查询和重复消息均不能延长它。
+            guard.surface_mode.as_mut().unwrap().latest.as_mut().unwrap().received_monotonic_ns =
+                now_monotonic_nanos().saturating_sub((DEFAULT_COSTMAP_RECEIPT_TTL + Duration::from_secs(1)).as_nanos() as u64);
+        }
+        assert!(handle.begin_surface_map_update(&message, now_monotonic_nanos()).await.is_err());
+        let waiting = handle.tick_with_pose(surface_pose(&snapshot, 0.0, Quaternion::IDENTITY)).await;
+        assert_eq!(waiting.status, STATUS_PENDING);
+        assert!(waiting.message.contains("surface map input stale"));
+        assert!(sink.submitted.lock().unwrap().is_empty());
+        assert!(handle.inner.lock().await.no_frontier_since.is_none());
+    }
+
+    #[tokio::test]
     async fn surface_continuous_same_domain_updates_install_progress_without_crossing_clear() {
         let (handle, _) = configured_handle();
         handle
@@ -7364,6 +7429,43 @@ mod tests {
     include!("explore_compute_surface_tests.rs");
     include!("explore_composite_map_tests.rs");
     include!("explore_surface_incomplete_tests.rs");
+
+    #[tokio::test]
+    async fn compute_owner_surface_slow_prepare_accepts_live_unbuilt_publication() {
+        let (handle, sink) = configured_handle();
+        let (first, _, snapshot) = install_surface_fixture(&handle, "map").await;
+        let request_id = "surface-live-slow-prepare";
+        assert_eq!(handle.start(request_id, "prefer_wavefront").await.status, STATUS_ACCEPTED);
+        let audit = Arc::new(StdMutex::new(SurfaceOwnerAudit::default()));
+        let gate = Arc::new(OwnerRuntimeGate::default());
+        let _release = OwnerRuntimeGateRelease(gate.clone());
+        install_gated_real_surface_source(&handle, audit.clone(), gate.clone(), None).await;
+        let tick = tokio::spawn({
+            let handle = handle.clone();
+            let pose = surface_pose(&snapshot, 0.0, Quaternion::IDENTITY);
+            async move { handle.tick_with_pose(pose).await }
+        });
+        owner_watchdog(gate.entered()).await;
+        tokio::time::sleep(DEFAULT_COSTMAP_RECEIPT_TTL + Duration::from_millis(20)).await;
+        // 新地图仍在计算中；接收不能冒充安装，也不能使已完成前沿永远被退休。
+        let next = surface_message("map", 2);
+        handle.begin_surface_map_update(&next, now_monotonic_nanos()).await.unwrap();
+        {
+            let guard = handle.inner.lock().await;
+            assert_eq!(guard.committed_map.as_ref(), Some(&first.committed_map));
+            assert!(now_monotonic_nanos().saturating_sub(guard.costmap_received_monotonic_ns)
+                > DEFAULT_COSTMAP_RECEIPT_TTL.as_nanos() as u64);
+        }
+        gate.release();
+        let active = owner_watchdog(tick).await.unwrap();
+        assert_eq!(active.status, STATUS_ACTIVE, "{}", active.message);
+        assert_eq!(sink.submitted.lock().unwrap().len(), 1);
+        {
+            let audit = audit.lock().unwrap();
+            assert_eq!((audit.captures.len(), audit.commits.len(), audit.discards), (1, 1, 0));
+        }
+        finish_surface_owner_success(&handle, request_id, &active, &audit).await;
+    }
 
     #[tokio::test]
     async fn compute_owner_surface_slow_prepare_keeps_result_but_rejects_stale_next_tick() {

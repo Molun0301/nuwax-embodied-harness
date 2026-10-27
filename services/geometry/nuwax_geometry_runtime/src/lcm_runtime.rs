@@ -8108,7 +8108,13 @@ async fn run_owned_surface_map_consumer(
                 let rejected_ticket = ticket.clone();
                 let compute = move || {
                     let mut cache = cache.lock().map_err(|_| "共享表面计算缓存已失效".to_owned())?;
+                    let started = std::time::Instant::now();
                     let result = cache.build_typed(&message);
+                    tracing::debug!(target: "navigation.exploration.compute",
+                        cloud_revision = message.cloud_revision,
+                        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                        succeeded = result.is_ok(), stats = ?cache.last_build_stats(),
+                        "探索表面构建完成");
                     let retained_source = if matches!(&result, Err(SurfaceMapBuildError::IncompleteFineSource(_))) {
                         cache.retained_source_for_incomplete(&message)
                     } else { None };

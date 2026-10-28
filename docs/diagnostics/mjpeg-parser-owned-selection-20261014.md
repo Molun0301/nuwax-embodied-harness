@@ -14,7 +14,7 @@ The final source is text-equivalent to the measured in-memory candidate. The por
 
 Go2 WebRTC encodes JPEG upstream, then sends it over UDS to the Rust relay. Python `VideoShmReader` takes an independent bytes snapshot. `_SharedMjpegFrameSource` builds one immutable multipart bytes object and shares it across browser clients; formatting happens outside its source lock and final reader join happens off the event loop. Browser `video.frame` publications carry metadata, not base64 images. No additional server-side encoding/cache/lock change is justified.
 
-The perception source has its own reader and lifecycle. Unifying it with browser connection ownership would expand scope. Existing independent SHM snapshot ownership and server multipart sharing remain intact. See the earlier [MJPEG single-join audit](../c1-mjpeg-single-join-20261008.md) and [stream audit](../stream-delivery-audit-20261013.md).
+The perception source has its own reader and lifecycle. Unifying it with browser connection ownership would expand scope. Existing independent SHM snapshot ownership and server multipart sharing remain intact. See the earlier [MJPEG single-join audit](../验证证据/c1-mjpeg-single-join-20261008.md) and [stream audit](../验证证据/stream-delivery-audit-20261013.md).
 
 ## Qualification
 

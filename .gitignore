@@ -197,7 +197,7 @@ drivers/.active_robot.lock
 !/docs/公开文档/安装前准备.md
 !/docs/公开文档/配置说明.md
 !/docs/公开文档/控制台使用指南.md
-!/docs/公开文档/升级与恢复.md
+!/docs/公开文档/安装与更新.md
 !/docs/公开文档/常见问题与排障.md
 !/docs/公开文档/安全与数据说明.md
 !/docs/公开文档/贡献指南.md
@@ -259,5 +259,7 @@ drivers/.active_robot.lock
 !/tests/conftest.py
 
 # 正式安装和自动发布的公开使用入口。
-!/docs/公开文档/轻量安装与自动发布.md
 !/docs/公开文档/开发工具使用指南.md
+
+# 迁移后的历史验证记录继续随仓库保存。
+!/docs/验证证据/*.md

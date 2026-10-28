@@ -31,7 +31,7 @@
 | 单区域轮廓点变化 | 18 / 3 | 2 / 0 |
 | 地图绑定修订变化 | 18 / 3 | 18 / 3 |
 
-基线为 `66176b86a82ffa272a427cd73cfffc121702b100`。完整计数保存在 [semantic-region-reuse-counts.json](performance-evidence/semantic-region-reuse-counts.json)。测试使用实际网页模块和仓库 Three 模块、模拟 Canvas2D、合成区域，不是浏览器或 GPU 测量，也不推算实机帧率、网络或整图吞吐量。
+基线为 `66176b86a82ffa272a427cd73cfffc121702b100`。完整计数保存在 [semantic-region-reuse-counts.json](../performance-evidence/semantic-region-reuse-counts.json)。测试使用实际网页模块和仓库 Three 模块、模拟 Canvas2D、合成区域，不是浏览器或 GPU 测量，也不推算实机帧率、网络或整图吞吐量。
 
 复现当前计数：`node scripts/measure_semantic_region_reuse.mjs`。可传入原版 `semantic-regions3d.js` 的本地路径对比基线。
 

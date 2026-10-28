@@ -45,7 +45,7 @@ A separate count-only pass uses the unchanged real handler, without concurrent i
 
 For the 1 MiB fixture, the worker tool envelope is 1,048,826 bytes and the final RPC response is 1,048,868 bytes. `_json_bytes` returns only length and discards encoded bytes. Thus there is no already-retained exact final RPC byte string that can simply replace JSONResponse. Reusing the transient inner-envelope bytes would require changing the shared builder's return contract and composing the outer RPC envelope while preserving its separate limit and encoding/error behavior.
 
-The prior [serialization audit](../observation-state-serialization-audit-20261013.md) already measured and rejected a more complicated size-accounting rewrite that avoided re-traversing structuredContent; it retained conversion/redaction. Retaining/reusing inner-envelope bytes is technically different but is not a demonstrated minimal fix for the dominant delays here. This audit stops rather than widening into a new serializer or cache API.
+The prior [serialization audit](../验证证据/observation-state-serialization-audit-20261013.md) already measured and rejected a more complicated size-accounting rewrite that avoided re-traversing structuredContent; it retained conversion/redaction. Retaining/reusing inner-envelope bytes is technically different but is not a demonstrated minimal fix for the dominant delays here. This audit stops rather than widening into a new serializer or cache API.
 
 ## Reproduction and retained outputs
 

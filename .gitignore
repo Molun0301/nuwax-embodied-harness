@@ -263,3 +263,11 @@ drivers/.active_robot.lock
 
 # 迁移后的历史验证记录继续随仓库保存。
 !/docs/验证证据/*.md
+
+# 两平台按程序预编译的固定环境与公开检查入口。
+!/scripts/ci/prebuilt.py
+!/scripts/ci/check_prebuilt.py
+!/scripts/ci/prebuilt/
+/scripts/ci/prebuilt/*
+!/scripts/ci/prebuilt/focal-arm64.Dockerfile
+!/scripts/ci/prebuilt/noble-x86_64.Dockerfile

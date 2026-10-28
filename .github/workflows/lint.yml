@@ -6,10 +6,8 @@ name: lint
 
 on:
   pull_request:
-  push:
-    branches:
-      - main
-      - 'feature/**'
+  workflow_call:
+  workflow_dispatch:
 
 jobs:
   guardrails:

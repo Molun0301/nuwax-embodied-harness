@@ -53,3 +53,26 @@ def wait_until_idle(engine, job):
         message = readiness.get("reason", "等待维护时间窗") if window_open else "等待维护时间窗"
         engine._progress(job, "waiting_idle", 74, "更新已准备，" + message)
         time.sleep(5)
+
+
+def wait_prebuilt(engine, source, job):
+    request = job["_plan"].get("_request", {})
+    if request.get("local_build") or not source["repository"].startswith("https://github.com/"):
+        return
+    from scripts.neh_prebuilt import PrebuiltPending, PrebuiltUnavailable, fetch_index, platform_key, program_names
+    if not platform_key() or not program_names(job["_plan"]["modules"]):
+        return
+    while True:
+        engine._cancelled(job["id"])
+        try:
+            fetch_index(source["repository"], source["revision"])
+            return
+        except PrebuiltPending:
+            engine._progress(job, "prebuilt_pending", 18, "云端编译中；默认等待，每15分钟重查。可取消任务后选择本机编译。")
+        except PrebuiltUnavailable:
+            # 网络或索引校验故障由共同构建器按程序回退本机编译。
+            return
+        deadline = time.monotonic() + 900
+        while time.monotonic() < deadline:
+            engine._cancelled(job["id"])
+            time.sleep(1)

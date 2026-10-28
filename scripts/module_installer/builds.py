@@ -510,7 +510,7 @@ def _cmake(source: Path, build: Path, prefix: Path, jobs: int, run: Callable,
     run((
         "cmake", "-S", str(source), "-B", str(build),
         "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_INSTALL_PREFIX=" + str(prefix),
-        "-DCMAKE_POLICY_VERSION_MINIMUM=3.5", *options,
+        "-DCMAKE_POLICY_VERSION_MINIMUM=3.5", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON", *options,
     ))
     run(("cmake", "--build", str(build), "--parallel", str(jobs)))
     run(("cmake", "--install", str(build)))
@@ -588,10 +588,18 @@ def _executable(path: Path) -> None:
 
 
 def build_modules(root: Path, prefix: Path, cache: Path, modules: Iterable[str],
-                  jobs: int, run: Callable) -> dict[str, str]:
+                  jobs: int, run: Callable, *, prebuilt: Optional[Mapping] = None,
+                  local_build: bool = False, programs: Optional[Iterable[str]] = None) -> dict[str, str]:
     """构建所选模块；run 接收参数数组及 cwd/env，命令失败必须抛出异常。"""
     root, prefix, cache = Path(root).resolve(), Path(prefix).resolve(), Path(cache).resolve()
     selected = set(modules)
+    from scripts.neh_prebuilt import PROGRAMS, prepare_prebuilt, program_names, record_local
+    requested = set(program_names(selected))
+    if programs is not None:
+        narrowed = set(programs)
+        if not narrowed.issubset(requested) or not narrowed.issubset(PROGRAMS):
+            raise ValueError("逐程序构建范围不属于所选模块。")
+        requested = narrowed
     if not isinstance(jobs, int) or isinstance(jobs, bool) or jobs < 1:
         raise ValueError("编译并行数必须是正整数。")
     print(f"构建并行预算：{jobs}；独立 CMake/Boost 使用此配额，Cargo 原生构建共享任务池。", flush=True)
@@ -602,21 +610,27 @@ def build_modules(root: Path, prefix: Path, cache: Path, modules: Iterable[str],
         raise RuntimeError("请用普通用户运行安装器；系统依赖由安装器单独提权处理。")
     (prefix / "bin").mkdir(parents=True, exist_ok=True)
     cache.mkdir(parents=True, exist_ok=True)
+    fingerprints = {}
+    if prebuilt and not local_build and requested:
+        binaries, fingerprints = prepare_prebuilt(root, prefix, cache, requested, prebuilt)
+    remaining = requested - set(binaries)
+    if not remaining:
+        return binaries
     for name in ("fastlio2", "pointlio"):
-        if name in selected:
+        if name + "_native" in remaining:
             binary = _build_native(root, prefix, cache, name, jobs, run)
             _executable(binary)
             binaries[binary.name] = str(binary)
-    rust_modules = [name for name in _RUST_BUILDS if name in selected]
-    if rust_modules:
+    rust_modules = [name for name in _RUST_BUILDS if _RUST_BUILDS[name][2] in remaining]
+    if rust_modules or _MAPPING_BUILD[2] in remaining:
         cargo, environment = _rust_toolchain(cache, run)
         environment = {**environment, **_protocol_compiler(cache), "CARGO_BUILD_JOBS": str(jobs)}
-        if "slam2d" in selected:
+        if "nuwax-slam-2d-worker" in remaining:
             from scripts.prepare_slam2d_dependencies import build_dependencies
             build_dependencies(prefix, cache / "slam2d-dependencies", jobs=jobs, run=run)
             _cmake(root / "drivers/sensors/slamtec_native", cache / "build/slamtec", prefix, jobs, run)
         recipes = [_RUST_BUILDS[name] for name in rust_modules]
-        if "geometry" in selected:
+        if _MAPPING_BUILD[2] in remaining:
             recipes.append(_MAPPING_BUILD)
         for manifest, package, binary_name, features in recipes:
             if not (root / manifest).with_name("Cargo.lock").is_file():
@@ -657,6 +671,9 @@ def build_modules(root: Path, prefix: Path, cache: Path, modules: Iterable[str],
                 shutil.copytree(root / "drivers/sensors/slamtec_native", driver_sources)
                 # 运行版本不能回到可变编译缓存寻找二维动态库。
                 run(("patchelf", "--set-rpath", "$ORIGIN/../lib:$ORIGIN/../lib64", str(installed)))
+    for program in remaining:
+        if program in fingerprints and program in binaries:
+            record_local(prefix, cache, program, fingerprints[program])
     return binaries
 
 

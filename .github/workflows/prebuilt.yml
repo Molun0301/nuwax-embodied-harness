@@ -1,0 +1,130 @@
+name: NEH七程序增量预编译
+
+# 由产品发布总工作流调用，测试与两平台都成功后才发布main通道。
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: 预编译 ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: focal-arm64
+            runner: ubuntu-24.04-arm
+            base: ubuntu:20.04
+          - platform: noble-x86_64
+            runner: ubuntu-24.04
+            base: ubuntu:24.04
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: 读取已有专用Release程序附件
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/neh-prebuilt"
+          python3 scripts/ci/prebuilt.py inventory --repository "$GITHUB_REPOSITORY" --output "$RUNNER_TEMP/neh-prebuilt/assets.json"
+      - uses: docker/setup-buildx-action@v3
+      - name: 固定本轮基础镜像摘要
+        id: base
+        env:
+          BASE_TAG: ${{ matrix.base }}
+        run: |
+          docker pull "$BASE_TAG"
+          BASE_DIGEST=$(docker image inspect "$BASE_TAG" --format '{{index .RepoDigests 0}}')
+          printf 'image=%s@%s\n' "$BASE_TAG" "${BASE_DIGEST#*@}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: scripts/ci/prebuilt/${{ matrix.platform }}.Dockerfile
+          load: true
+          tags: neh-prebuilt:${{ matrix.platform }}
+          build-args: BASE_IMAGE=${{ steps.base.outputs.image }}
+          cache-from: type=gha,scope=neh-image-${{ matrix.platform }}
+          cache-to: type=gha,scope=neh-image-${{ matrix.platform }},mode=max
+      - name: 恢复该平台独立编译缓存
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/neh-build-cache
+          key: neh-build-v1-${{ matrix.platform }}-${{ github.sha }}
+          restore-keys: |
+            neh-build-v1-${{ matrix.platform }}-
+      - name: 检查边界并按程序输入指纹编译
+        env:
+          TARGET_PLATFORM: ${{ matrix.platform }}
+          BASE_IMAGE: ${{ steps.base.outputs.image }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/neh-build-cache" "$RUNNER_TEMP/neh-output"
+          sudo chown -R 1001:1001 "$RUNNER_TEMP/neh-build-cache" "$RUNNER_TEMP/neh-output"
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/workspace:ro" \
+            -v "$RUNNER_TEMP/neh-build-cache:/cache" \
+            -v "$RUNNER_TEMP/neh-output:/output" \
+            -v "$RUNNER_TEMP/neh-prebuilt/assets.json:/assets.json:ro" \
+            -e NEH_BASE_IMAGE="$BASE_IMAGE" \
+            -e CARGO_TARGET_DIR=/cache/ci-target \
+            -e CARGO_BUILD_JOBS=4 \
+            "neh-prebuilt:$TARGET_PLATFORM" bash -c \
+            'git config --global --add safe.directory /workspace && python3 scripts/ci/check_prebuilt.py && python3 scripts/ci/prebuilt.py build --platform '"$TARGET_PLATFORM"' --cache /cache --output /output --assets /assets.json --jobs 4'
+      - name: 保存已完成的编译缓存（包含失败前完成部分）
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/neh-build-cache
+          key: neh-build-v1-${{ matrix.platform }}-${{ github.sha }}
+      - name: 收集本轮产生的程序与源码文件
+        id: artifacts
+        if: success()
+        run: |
+          if find "$RUNNER_TEMP/neh-output" -type f \( -name '*.tar.zst' -o -name 'source-*.tar.gz' \) -print -quit | read -r _; then
+            printf 'new=true\n' >> "$GITHUB_OUTPUT"
+          fi
+      - name: 为每个新文件生成构建来源证明
+        if: steps.artifacts.outputs.new == 'true'
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            ${{ runner.temp }}/neh-output/*.tar.zst
+            ${{ runner.temp }}/neh-output/source-*.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neh-prebuilt-${{ matrix.platform }}
+          path: ${{ runner.temp }}/neh-output/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: 发布完整提交预编译索引
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: neh-prebuilt-release-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: neh-prebuilt-*
+          path: ${{ runner.temp }}/neh-prebuilt-publish
+      - name: 增量上传并清理超过30天的未引用附件
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/ci/prebuilt.py publish --repository "$GITHUB_REPOSITORY" --revision "$GITHUB_SHA" --output "$RUNNER_TEMP/neh-prebuilt-publish"

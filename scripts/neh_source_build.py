@@ -170,7 +170,10 @@ def execute(payload):
         return prepare_dependencies(request, hardware, candidate, run)
     if operation == "build":
         prefix, cache = Path(payload["build_prefix"]), Path(payload["build_cache"])
-        binaries = build_modules(root, prefix, cache, modules, request.jobs, run)
+        options = {}
+        if "prebuilt" in inspect.signature(build_modules).parameters:
+            options.update(prebuilt=payload.get("prebuilt"), local_build=payload.get("local_build", False))
+        binaries = build_modules(root, prefix, cache, modules, request.jobs, run, **options)
         _copy_runtime(prefix, candidate, binaries)
         checked = verify_native(candidate, home / "cache/source", run)
         return {"binaries": sorted(binaries), "native_files": checked}

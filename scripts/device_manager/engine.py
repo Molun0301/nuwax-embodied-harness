@@ -1004,6 +1004,8 @@ class Engine:
                              run=run_command, allow_local=selected.get("allow_local", False),
                              cancelled=lambda: self._cancelled(job["id"]),
                              progress=lambda message: self._progress(job, "source_download", 15, message)) as source:
+            from .update_flow import wait_prebuilt
+            wait_prebuilt(self, source, job)
             candidate.mkdir()
             export_source(source["root"], source["revision"], candidate / "source")
             self._cancelled(job["id"])

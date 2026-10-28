@@ -63,6 +63,10 @@ def bridge(engine, source, candidate, operation, job, **values):
     payload = dict(values, operation=operation, root=str(source["root"]), candidate=str(candidate), home=str(engine.home),
                    build_prefix=str(source["build_prefix"]), build_cache=str(source["build_cache"]),
                    modules=job["_plan"]["modules"], robot=job["_plan"]["robot"], revision=source["revision"])
+    payload.update(prebuilt={"repository": source["repository"], "revision": source["revision"], "branch": source["branch"]},
+                   local_build=bool(job["_plan"].get("_request", {}).get("local_build")))
+    if not source["repository"].startswith("https://github.com/"):
+        payload["prebuilt"] = None
     environment = clean_environment(candidate)
     if operation == "build":
         # 原生检查解析readelf/ldd的字段，固定工具语言而不修改设备或业务语言。

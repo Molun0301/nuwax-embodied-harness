@@ -1,0 +1,21 @@
+name: NEH产品检查与增量预编译
+
+on:
+  push:
+    branches: [main, 'fix/**', 'feature/**', 'feat/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-check:
+    uses: ./.github/workflows/source-install.yml
+  guardrails:
+    uses: ./.github/workflows/lint.yml
+  prebuilt:
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/prebuilt.yml

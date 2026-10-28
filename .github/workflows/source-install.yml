@@ -1,9 +1,8 @@
 name: NEH源码安装入口检查
 
-# 云端只检查源码；机器人程序由设备取得固定提交后增量构建。
+# 产品总工作流复用入口检查，原生预编译由独立任务负责。
 on:
-  push:
-    branches: [main, 'fix/**', 'feature/**', 'feat/**']
+  workflow_call:
   pull_request:
   workflow_dispatch:
 

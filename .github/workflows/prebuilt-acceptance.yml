@@ -17,11 +17,6 @@ on:
 permissions:
   contents: write
 
-# 所有注入共享同一个验证Release，等待完整恢复后才允许下一轮运行。
-concurrency:
-  group: neh-prebuilt-validation
-  cancel-in-progress: false
-
 jobs:
   attachment-fallback:
     runs-on: ubuntu-24.04
@@ -68,15 +63,11 @@ jobs:
         run: |
           mkdir -p "$VALIDATION_CACHE" "$VALIDATION_STATE"
           sudo chown -R 1001:1001 "$VALIDATION_CACHE" "$VALIDATION_STATE"
-      - name: 匿名保存生产原件并创建隔离验收副本
+      - name: T3创建本轮独立Release（从不上传程序附件）
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 scripts/ci/prebuilt_acceptance.py prepare --repository "$GITHUB_REPOSITORY" --revision "$SOURCE_REVISION" --state "$VALIDATION_STATE"
-      - name: T3删除验收附件
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/ci/prebuilt_acceptance.py inject --state "$VALIDATION_STATE" --case missing
+          python3 scripts/ci/prebuilt_acceptance.py prepare --repository "$GITHUB_REPOSITORY" --revision "$SOURCE_REVISION" --state "$VALIDATION_STATE" --case missing
       - name: T3匿名404后真实编译人物跟随
         run: |
           docker run --rm \
@@ -88,10 +79,10 @@ jobs:
             -e NEH_ACCEPTANCE_HARNESS_REVISION="$GITHUB_SHA" \
             neh-prebuilt-validation:noble-x86_64 bash -c \
             'git config --global --add safe.directory /workspace && python3 /harness/scripts/ci/prebuilt_acceptance.py client --state /state --case missing --source-root /workspace --cache /cache --jobs 4'
-      - name: T4上传同名损坏验收附件
+      - name: T4创建本轮独立Release（首次只上传损坏副本）
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/ci/prebuilt_acceptance.py inject --state "$VALIDATION_STATE" --case corrupt
+        run: python3 scripts/ci/prebuilt_acceptance.py prepare --repository "$GITHUB_REPOSITORY" --revision "$SOURCE_REVISION" --state "$VALIDATION_STATE" --case corrupt
       - name: T4匿名下载摘要拒绝后真实编译人物跟随
         run: |
           docker run --rm \
@@ -109,18 +100,18 @@ jobs:
         with:
           path: ${{ runner.temp }}/neh-prebuilt-validation-cache
           key: neh-prebuilt-validation-rust-v2-${{ github.sha }}
-      - name: 总是恢复原始验收附件并匿名核对摘要
+      - name: 总是删除本轮创建的临时Release及tag
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/ci/prebuilt_acceptance.py restore --state "$VALIDATION_STATE"
-      - name: 保存真实回退、HTTP和恢复证据
+        run: python3 scripts/ci/prebuilt_acceptance.py cleanup --state "$VALIDATION_STATE"
+      - name: 保存真实回退、HTTP和清理证据
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: neh-prebuilt-attachment-fallback-${{ inputs.source_revision || github.sha }}
           path: |
-            ${{ env.VALIDATION_STATE }}/*.json
-            ${{ env.VALIDATION_STATE }}/*.txt
+            ${{ env.VALIDATION_STATE }}/**/*.json
+            ${{ env.VALIDATION_STATE }}/**/*.txt
           if-no-files-found: warn
           retention-days: 7

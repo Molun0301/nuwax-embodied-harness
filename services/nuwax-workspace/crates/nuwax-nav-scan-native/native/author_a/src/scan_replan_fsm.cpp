@@ -614,7 +614,8 @@ namespace scan_planner
         // std::cerr << "near end" << endl;
         return;
       }
-      else if ((info->start_pos_ - pos).norm() < replan_thresh_)
+      // 参考模式的重规划位移也由实际机体提供；不能因计划时钟前进而反复重置执行周期。
+      else if ((info->start_pos_ - (navi_mode_ == NAVI_MODE::REFERENCE_PATH ? odom_pos_ : pos)).norm() < replan_thresh_)
       {
         // std::cerr << "near start" << endl;
         return;
@@ -681,10 +682,12 @@ namespace scan_planner
 
     if (navi_mode_ == NAVI_MODE::REFERENCE_PATH)
     {
-      start_velocity_source_=start_acceleration_source_=1; // original mode3 history
-      start_pt_ = info->position_traj_.evaluateDeBoorT(t_cur);
-      start_velocity_source_=start_acceleration_source_=1;
-    start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
+      // 已发布曲线不能证明机体已到达该位置；重规划绑定本次实际里程计。
+      start_pt_ = odom_pos_;
+      start_velocity_source_=odom_velocity_measured_?0:1;
+      start_acceleration_source_=1;
+      if (odom_velocity_measured_) start_vel_ = odom_vel_;
+      else start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
       start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t_cur);
 
       bool success = callReboundReplan(false, false);
@@ -918,13 +921,36 @@ namespace scan_planner
 
     double t_proj = 0.0;
     double min_dist_to_start = 9999.0;
-    for (double t = 0.0; t < duration; t += t_step)
+    if (route.ready())
     {
-      Eigen::Vector3d pos_t = referencePosition(t);
-      double dist_to_start = (pos_t - start_pt_).norm();
-      if (dist_to_start < min_dist_to_start)
+      // 解析投影只细化本次参考窗口；执行时钟仍沿原时标，不保存新的空间进度游标。
+      double nearest_arc = 0.;
+      double nearest_distance = std::numeric_limits<double>::infinity();
+      for (size_t i = 1; i < route.points.size(); ++i)
       {
-        min_dist_to_start = dist_to_start;
+        const Eigen::Vector3d delta = route.points[i] - route.points[i - 1];
+        const double fraction = delta.squaredNorm() > 0.
+            ? std::clamp((start_pt_ - route.points[i - 1]).dot(delta) / delta.squaredNorm(), 0., 1.) : 0.;
+        const double distance = (start_pt_ - route.points[i - 1] - fraction * delta).squaredNorm();
+        if (distance < nearest_distance) {
+          nearest_distance = distance;
+          nearest_arc = route.arcs[i - 1] + fraction * (route.arcs[i] - route.arcs[i - 1]);
+        }
+      }
+      t_proj = route.times.back();
+      for (size_t i = 1; i < route.timed_arcs.size(); ++i) {
+        if (nearest_arc > route.timed_arcs[i]) continue;
+        const double length = route.timed_arcs[i] - route.timed_arcs[i - 1];
+        const double fraction = length > 0. ? (nearest_arc - route.timed_arcs[i - 1]) / length : 0.;
+        t_proj = route.times[i - 1] + fraction * (route.times[i] - route.times[i - 1]);
+        break;
+      }
+    }
+    else for (double t = 0.0; t < duration; t += t_step)
+    {
+      const double distance = (referencePosition(t) - start_pt_).norm();
+      if (distance < min_dist_to_start) {
+        min_dist_to_start = distance;
         t_proj = t;
       }
     }

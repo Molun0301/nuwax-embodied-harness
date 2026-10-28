@@ -73,7 +73,10 @@ namespace scan_planner
           const double fraction = lengths[i] > 0. ? distance / lengths[i] : 0.;
           const double arc = anchors[i].arc + fraction * (anchors[i + 1].arc - anchors[i].arc);
           Eigen::Vector3d point = anchors[i].point + fraction * (anchors[i + 1].point - anchors[i].point);
-          point.z() = route.heightAtArc(arc);
+          // 实测端点可能偏离参考高程；连续吸收这一边界差，不能在首个内部点突然跳回旧高度。
+          const double from_offset = anchors[i].point.z() - route.heightAtArc(anchors[i].arc);
+          const double to_offset = anchors[i + 1].point.z() - route.heightAtArc(anchors[i + 1].arc);
+          point.z() = route.heightAtArc(arc) + (1. - fraction) * from_offset + fraction * to_offset;
           controls.col(column++) = point; control_arcs.push_back(arc);
         }
       }
@@ -182,9 +185,31 @@ namespace scan_planner
                                         Eigen::Vector3d local_target_vel, bool flag_polyInit, bool flag_randomPolyTraj)
   {
 
-    // 首试保留原多项式；第一次失败后在原重试槽使用完整参考，其余保留原历史/随机流程。
-    const bool route_time_seed = !flag_first_call && flag_polyInit && local_data_.traj_id_ == 0
-        && continuous_failures_count_ == 1 && route_height_.ready()
+    const double resolution = grid_map_->getResolution();
+    bool reference_detour = false;
+    if (route_height_.ready()) {
+      const Eigen::Vector2d chord = (local_target_pt - start_pt).head<2>();
+      for (size_t i = 0; i < route_height_.points.size(); ++i) {
+        if (route_height_.arcs[i] <= route_height_.begin_arc || route_height_.arcs[i] >= route_height_.end_arc) continue;
+        const Eigen::Vector2d offset = (route_height_.points[i] - start_pt).head<2>();
+        const double fraction = chord.squaredNorm() > 0.
+            ? std::clamp(offset.dot(chord) / chord.squaredNorm(), 0., 1.) : 0.;
+        if ((offset - fraction * chord).squaredNorm() > resolution * resolution) {
+          reference_detour = true;
+          break;
+        }
+      }
+    }
+    bool reanchor = false;
+    if (local_data_.traj_id_ > 0) {
+      const double t = std::clamp((ros::Time::now() - local_data_.start_time_).toSec(), 0., local_data_.duration_);
+      reanchor = (local_data_.position_traj_.evaluateDeBoorT(t) - start_pt).norm() > resolution;
+    }
+    // 可分辨的绕行不能退化为首尾初值；机体落后时也不能继续旧计划位置。
+    // 普通直线及亚体素过渡仍保留原初始化，仅改变当前窗口确需重建的几何来源。
+    const bool original_retry_seed = !flag_first_call && flag_polyInit && local_data_.traj_id_ == 0
+        && continuous_failures_count_ == 1;
+    const bool route_time_seed = (reference_detour || reanchor || original_retry_seed) && route_height_.ready()
         && route_height_.end_time > route_height_.begin_time;
     const bool ordered_xyz_fallback = !route_time_seed && !flag_first_call && flag_polyInit && !flag_randomPolyTraj;
     // ROS node-local lifetime becomes native session lifetime.
@@ -219,6 +244,8 @@ namespace scan_planner
     bool flag_regenerate = false;
     if (route_time_seed)
     {
+      flag_first_call = false;
+      flag_force_polynomial = false;
       // 使用既有完整参考的时标，不把拐角重试再次压成起终点直线。
       const double span = route_height_.end_time - route_height_.begin_time;
       const int capacity = std::max(7, static_cast<int>(std::floor(pp_.planning_horizon_ / pp_.ctrl_pt_dist * 3)));
@@ -305,6 +332,11 @@ namespace scan_planner
 
         vector<double> pseudo_arc_length;
         vector<Eigen::Vector3d> segment_point;
+        // 实际机体未到目标时，旧曲线仍可能已经到期；空历史必须按原分支重建初值。
+        if (!std::isfinite(t_cur) || t_cur < 0. || !(t_cur < local_data_.duration_)) {
+          flag_force_polynomial = flag_regenerate = true;
+          continue;
+        }
         pseudo_arc_length.push_back(0.0);
         for (t = t_cur; t < local_data_.duration_ + 1e-3; t += ts)
         {
@@ -340,6 +372,11 @@ namespace scan_planner
           }
         }
 
+        if (pseudo_arc_length.size() < 2 || !std::isfinite(pseudo_arc_length.back())
+            || !(pseudo_arc_length.back() > 0.)) {
+          flag_force_polynomial = flag_regenerate = true;
+          continue;
+        }
         double sample_length = 0;
         double cps_dist = pp_.ctrl_pt_dist * 1.5; // cps_dist will be divided by 1.5 in the next
         size_t id = 0;
@@ -351,6 +388,11 @@ namespace scan_planner
           id = 0;
           while ((id <= pseudo_arc_length.size() - 2) && sample_length <= pseudo_arc_length.back())
           {
+            // 沿用原历史种子容量；在扩张向量前判定，避免坏历史耗尽内存或阻塞退出。
+            if (point_set.size() >= pp_.planning_horizon_ / pp_.ctrl_pt_dist * 3) {
+              flag_force_polynomial = flag_regenerate = true;
+              break;
+            }
             if (sample_length >= pseudo_arc_length[id] && sample_length < pseudo_arc_length[id + 1])
             {
               point_set.push_back((sample_length - pseudo_arc_length[id]) / (pseudo_arc_length[id + 1] - pseudo_arc_length[id]) * segment_point[id + 1] +
@@ -360,12 +402,16 @@ namespace scan_planner
             else
               id++;
           }
+          if (flag_regenerate) break;
           point_set.push_back(local_target_pt);
         } while (point_set.size() < 7); // If the start point is very close to end point, this will help
+        if (flag_regenerate) continue;
 
-        start_end_derivatives.push_back(local_data_.velocity_traj_.evaluateDeBoorT(t_cur));
+        // 点距为满足原最少点数而缩小时，时距同步缩小，保留原计划速度而非拉长短尾段。
+        ts *= cps_dist / pp_.ctrl_pt_dist;
+        start_end_derivatives.push_back(start_vel);
         start_end_derivatives.push_back(local_target_vel);
-        start_end_derivatives.push_back(local_data_.acceleration_traj_.evaluateDeBoorT(t_cur));
+        start_end_derivatives.push_back(start_acc);
         start_end_derivatives.push_back(Eigen::Vector3d::Zero());
 
         if (point_set.size() > pp_.planning_horizon_ / pp_.ctrl_pt_dist * 3) // The initial path is abnormally too long!
@@ -392,6 +438,9 @@ namespace scan_planner
           point_set[i]=route_height_.positionAtArc(height_sample_arcs[i]);
         else
           point_set[i].z()=route_height_.heightAtArc(height_sample_arcs[i]);
+        const double from_offset = start_pt.z() - route_height_.heightAtArc(route_height_.begin_arc);
+        const double to_offset = local_target_pt.z() - route_height_.heightAtArc(route_height_.end_arc);
+        point_set[i].z() += (1. - fraction) * from_offset + fraction * to_offset;
       }
       }
       // Retain requested boundary positions and the original LS derivatives.
@@ -402,6 +451,13 @@ namespace scan_planner
       bspline_optimizer_rebound_->bind_route_segment_={};
     }
 
+    if (!(ts > 0.) || !std::isfinite(ts)
+        || !std::all_of(point_set.begin(), point_set.end(), [](const auto& p){return p.allFinite();})
+        || !std::all_of(start_end_derivatives.begin(), start_end_derivatives.end(), [](const auto& p){return p.allFinite();})) {
+      ROS_WARN("局部轨迹初值包含无效数值，等待重新规划。");
+      ++continuous_failures_count_;
+      return false;
+    }
     Eigen::MatrixXd ctrl_pts;
     std::vector<double> seed_control_arcs;
     if (route_time_seed) {

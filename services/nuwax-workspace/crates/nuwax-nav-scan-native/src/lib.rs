@@ -336,6 +336,7 @@ fn call_native(
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("detour_following_tests.rs");
     // These component fixtures provide static occupancy, not live sensor frames.
     // One call remains one real FSM tick; no synthetic catch-up ticks are added.
     fn fixture_planner() -> Planner {

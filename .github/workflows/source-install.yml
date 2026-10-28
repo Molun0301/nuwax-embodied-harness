@@ -3,7 +3,7 @@ name: NEH源码安装入口检查
 # 云端只检查源码；机器人程序由设备取得固定提交后增量构建。
 on:
   push:
-    branches: [main, 'fix/**', 'feature/**']
+    branches: [main, 'fix/**', 'feature/**', 'feat/**']
   pull_request:
   workflow_dispatch:
 
@@ -35,7 +35,7 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: 检查单命令入口与目标解释器语法
         run: |
-          bash -n install.sh get-neh.sh scripts/neh_private_install.sh scripts/install_motion_guard_deployment.sh scripts/systemd/check_motion_guard_python.sh
+          bash -n install.sh get-neh.sh scripts/install_motion_guard_deployment.sh scripts/systemd/check_motion_guard_python.sh
           python3 scripts/ci/check_pep604.py scripts/neh_bootstrap.py scripts/neh_source.py scripts/neh_source_build.py scripts/device_manager scripts/module_installer scripts/go2_update install.py scripts/update_go2.py
       - name: 仅从源码组装并导入管理程序
         run: |

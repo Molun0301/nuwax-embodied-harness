@@ -149,17 +149,8 @@
                         <input id="wizardFeedUrl" class="field" type="text" placeholder="https://…">
                       </label>
                     </div>
-                    <div class="config-row">
-                      <label class="config-row-wide">
-                        <span class="config-label">私有源访问令牌（可选）</span>
-                        <input id="wizardToken" class="field" type="password" autocomplete="off"
-                               placeholder="留空表示保持现有令牌">
-                      </label>
-                    </div>
                     <div class="source-actions">
                       <button id="wizardSaveSource" class="btn primary" type="button">保存来源设置</button>
-                      <button id="wizardClearToken" class="btn" type="button">清除已存令牌</button>
-                      <span id="wizardTokenState" class="source-token-state"></span>
                     </div>
                     <div id="wizardSourceMessage" class="inline-message" hidden></div>
                   </div>
@@ -433,17 +424,8 @@
                 <input id="feedUrl" class="field" type="text" placeholder="https://…">
               </label>
             </div>
-            <div class="config-row">
-              <label class="config-row-wide">
-                <span class="config-label">私有源访问令牌（可选）</span>
-                <input id="sourceToken" class="field" type="password" autocomplete="off"
-                       placeholder="留空表示保持现有令牌">
-              </label>
-            </div>
             <div class="source-actions">
               <button id="saveUpdateConfig" class="btn primary" type="button">保存来源设置</button>
-              <button id="clearSourceToken" class="btn" type="button">清除已存令牌</button>
-              <span id="tokenState" class="source-token-state"></span>
             </div>
             <div id="updateConfigMessage" class="inline-message" hidden></div>
           </div>

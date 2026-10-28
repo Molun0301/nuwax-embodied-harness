@@ -105,12 +105,18 @@ def parser():
     result.add_argument("--install-dir", "--home", dest="home",
                         default=os.environ.get("NEH_HOME") or str(default_install_home()), metavar="PATH",
                         help="设备安装根目录（兼容--home）；默认NEH_HOME或~/Nuwax-embodied-harness；已有旧安装沿用原位置")
-    sub = result.add_subparsers(dest="command", required=True)
+    sub = result.add_subparsers(dest="command")
     server = sub.add_parser("serve", help="提供独立设备网页")
     server.add_argument("--host", default="127.0.0.1")
     server.add_argument("--port", type=int, default=8765)
     for name in ("status", "hardware", "modules", "jobs", "migration-sources"):
         sub.add_parser(name)
+    update = sub.add_parser("update", help="检查、准备候选、等待空闲并更新重启，失败自动回退")
+    update.add_argument("--check", action="store_true", help="只检查更新")
+    update.add_argument("--local-build", action="store_true", help="云端编译中时选择立即本机编译")
+    update.add_argument("--retry", action="store_true", help="明确重试此前失败的修订")
+    uninstall = sub.add_parser("uninstall", help="卸载程序，默认保留配置和数据")
+    uninstall.add_argument("--purge", action="store_true", help="同时删除本安装的配置、数据与构建缓存")
     releases = sub.add_parser("releases", help="查询或主动刷新版本目录")
     releases.add_argument("--refresh", action="store_true")
     releases.add_argument("--catalog", help="显式本机catalog.json路径，仅供离线安装和验收")
@@ -151,7 +157,6 @@ def parser():
     settings.add_argument("--gateway-port", type=int, help="首次安装前设定业务端口，默认8766")
     settings.add_argument("--channel", choices=("stable", "preview"))
     settings.add_argument("--auto-start", choices=("true", "false"))
-    settings.add_argument("--token-stdin", action="store_true", help="从标准输入保存私有源码或旧目录访问令牌，查询时不返回")
     password = sub.add_parser("password")
     password.add_argument("--stdin", action="store_true", help="逐行读取当前密码和新密码；未设密码时只读新密码")
     password.add_argument("--disable", action="store_true")
@@ -170,7 +175,7 @@ def main(argv=None):
     args = parser().parse_args(argv)
     try:
         engine = Engine(args.home)
-        command = args.command
+        command = args.command or "status"
         if command == "serve":
             serve(engine, args.host, args.port)
             return 0
@@ -186,14 +191,22 @@ def main(argv=None):
             result = {"jobs": engine.jobs()}
         elif command == "releases":
             result = engine.releases(args.refresh, args.catalog)
+        elif command == "update":
+            if args.check:
+                engine.releases(refresh=True)
+                result = engine.status()
+            else:
+                from .update_flow import begin_update
+                job = begin_update(engine, local_build=args.local_build, retry=args.retry)
+                result = wait_job(engine, job["id"])
+        elif command == "uninstall":
+            from .uninstall import uninstall
+            result = uninstall(engine, purge=args.purge)
         elif command == "settings":
             values = {key: getattr(args, key) for key in ("feed_url", "source_repository", "source_branch", "source_mode", "channel", "gateway_port") if getattr(args, key) is not None}
             if args.auto_start is not None:
                 values["auto_start"] = args.auto_start == "true"
             result = engine.save_settings(values, allow_local_source=args.allow_local_source) if values else engine.settings()
-            if args.token_stdin:
-                engine.set_token(sys.stdin.readline().rstrip("\r\n"))
-                result = engine.settings()
         elif command == "password":
             auth = Authentication(engine)
             current = (sys.stdin.readline().rstrip("\r\n") if args.stdin else getpass.getpass("当前密码：")) if auth.enabled() else ""

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-import base64
 import fcntl
 import json
 import os
@@ -65,49 +64,21 @@ def source_allowed(relative):
     return not ((name.startswith(".env") or name.endswith(".env")) and not name.endswith((".example", ".template")))
 
 
-def _environment(repository, token, token_origin):
+def _environment(repository):
     environment = {key: value for key, value in os.environ.items()
                    if not key.startswith("GIT_") and key not in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")}
     environment.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_SYSTEM=os.devnull,
                        GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0", GIT_LFS_SKIP_SMUDGE="1",
                        GIT_ASKPASS="/bin/false", SSH_ASKPASS="/bin/false", NEH_SOURCE_REPOSITORY=repository)
-    source, origin = urlsplit(repository), urlsplit(token_origin)
+    source = urlsplit(repository)
     # Git2.25不支持COUNT/KEY/VALUE；沿其自身-c实现使用带引号的PARAMETERS环境。
     # GLOBAL=/dev/null只对新Git生效；旧Git仍读取全局文件，受控项由_git显式覆盖。
     parameters = ["http.extraHeader=", "http.sslVerify=true", "http.followRedirects=false",
                   "protocol.allow=never", "protocol.https.allow=always",
                   "protocol.file.allow=" + ("always" if source.scheme == "file" else "never")]
-    source_path = source.path.rstrip("/")
-    if source_path.endswith(".git"):
-        source_path = source_path[:-4]
-    origin_path = origin.path.rstrip("/")
-    if origin_path.endswith(".git"):
-        origin_path = origin_path[:-4]
-    trusted = (token and source.scheme == origin.scheme == "https"
-               and source.netloc == origin.netloc
-               and origin_path == source_path)
-    if trusted:
-        authorization = base64.b64encode(("x-access-token:" + token).encode("utf-8")).decode("ascii")
-        parameters.extend(["http." + repository + ".extraHeader=",
-                           "http." + repository + ".extraHeader=Authorization: Basic " + authorization])
-    # 与Git2.25的sq_quote_buf一致；凭据始终不进入进程参数或仓库配置文件。
+    # 与Git2.25的sq_quote_buf一致，保留受控环境配置。
     environment["GIT_CONFIG_PARAMETERS"] = " ".join("'" + value.replace("'", "'\\''").replace("!", "'\\!'") + "'" for value in parameters)
     return environment
-
-
-def _failure_message(stderr, environment):
-    """Git诊断可能引用环境配置；隐藏本次授权及其编码后再交给上层。"""
-    message = stderr.strip()[-2000:]
-    parameters = (environment or {}).get("GIT_CONFIG_PARAMETERS", "")
-    for encoded in re.findall(r"Authorization: Basic ([A-Za-z0-9+/=]+)", parameters):
-        message = message.replace(encoded, "[已隐藏]")
-        try:
-            token = base64.b64decode(encoded).decode("utf-8").partition(":")[2]
-        except (ValueError, UnicodeError):
-            continue
-        if token:
-            message = message.replace(token, "[已隐藏]")
-    return "Git操作失败：" + message
 
 
 def _execute(argv, *, environment=None, run=None, cancelled=None, timeout=900):
@@ -133,7 +104,7 @@ def _execute(argv, *, environment=None, run=None, cancelled=None, timeout=900):
             except subprocess.TimeoutExpired:
                 continue
         if process.returncode:
-            raise SourceError(_failure_message(stderr, environment))
+            raise SourceError("无法访问仓库或Git操作失败：" + stderr.strip()[-2000:])
         return stdout
     finally:
         if process.poll() is None:
@@ -174,11 +145,11 @@ def _branch(branch):
     return value
 
 
-def remote_revision(repository=DEFAULT_REPOSITORY, branch=DEFAULT_BRANCH, *, token="", token_origin="", run=None, allow_local=False):
+def remote_revision(repository=DEFAULT_REPOSITORY, branch=DEFAULT_BRANCH, *, run=None, allow_local=False):
     repository, branch = validate_repository(repository, allow_local=allow_local), _branch(branch)
     reference = "refs/heads/" + branch
     output = _git(["ls-remote", "--exit-code", "--refs", repository, reference],
-                  environment=_environment(repository, token, token_origin), run=run)
+                  environment=_environment(repository), run=run)
     matches = [line.split()[0] for line in output.splitlines() if line.split()[1:] == [reference]]
     if len(matches) != 1:
         raise SourceError("源码仓库未返回唯一的目标分支")
@@ -186,7 +157,7 @@ def remote_revision(repository=DEFAULT_REPOSITORY, branch=DEFAULT_BRANCH, *, tok
 
 
 @contextmanager
-def source_checkout(home, repository=DEFAULT_REPOSITORY, branch=DEFAULT_BRANCH, revision=None, *, token="", token_origin="", run=None, progress=None, cancelled=None, allow_local=False):
+def source_checkout(home, repository=DEFAULT_REPOSITORY, branch=DEFAULT_BRANCH, revision=None, *, run=None, progress=None, cancelled=None, allow_local=False):
     repository, branch = validate_repository(repository, allow_local=allow_local), _branch(branch)
     area = Path(home).expanduser().resolve() / "cache/source"
     area.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -195,7 +166,7 @@ def source_checkout(home, repository=DEFAULT_REPOSITORY, branch=DEFAULT_BRANCH, 
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise SourceError("另一个安装任务正在使用源码和构建缓存") from exc
-        environment = _environment(repository, token, token_origin)
+        environment = _environment(repository)
         root = area / "checkout"
         if root.is_symlink() or (root.exists() and not root.is_dir()):
             raise SourceError("源码缓存目录类型异常")
@@ -211,8 +182,7 @@ def source_checkout(home, repository=DEFAULT_REPOSITORY, branch=DEFAULT_BRANCH, 
         git(["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"])
         previous = git(["rev-parse", "--verify", "--quiet", "HEAD"]).strip() if git(["branch", "--all"]).strip() else None
         if revision is None:
-            revision = remote_revision(repository, branch, token=token, token_origin=token_origin,
-                                       run=run, allow_local=allow_local)["revision"]
+            revision = remote_revision(repository, branch, run=run, allow_local=allow_local)["revision"]
         version = source_version(revision)
         if progress:
             progress("增量获取源码提交 " + revision[:12])
@@ -237,7 +207,7 @@ def source_checkout(home, repository=DEFAULT_REPOSITORY, branch=DEFAULT_BRANCH, 
 def export_source(root, revision, destination):
     root, destination = Path(root).resolve(), Path(destination)
     source_version(revision)
-    environment = _environment("", "", "")
+    environment = _environment("")
     if _git(["rev-parse", "HEAD"], root=root, environment=environment).strip() != revision:
         raise SourceError("源码导出修订与构建工作区不一致")
     if _git(["status", "--porcelain", "--untracked-files=normal"], root=root, environment=environment).strip():

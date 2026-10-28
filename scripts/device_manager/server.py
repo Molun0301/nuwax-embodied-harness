@@ -92,7 +92,7 @@ class ManagerServer(ThreadingHTTPServer):
         if not request or request.get("instance_id") != engine.instance_id:
             return
         job = engine.job(request.get("job_id", ""))
-        if job["status"] != "succeeded":
+        if job["status"] != "succeeded" and not (request.get("adopted") and job.get("status") == "running"):
             return
         target = (engine.manager_home / "manager/current").resolve()
         if target.parent != engine.manager_home / "manager/versions":
@@ -151,7 +151,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise ManagerError("origin_denied", "拒绝跨站请求。", 403)
         elif required:
             raise ManagerError("origin_required", "该请求必须携带同源Origin。", 403)
-        if self.headers.get("Sec-Fetch-Site") == "cross-site":
+        document_navigation = (self.command in ("GET", "HEAD") and urllib.parse.urlsplit(self.path).path in ("/", "/index.html")
+                               and self.headers.get("Sec-Fetch-Mode") == "navigate")
+        if self.headers.get("Sec-Fetch-Site") == "cross-site" and not document_navigation:
             raise ManagerError("origin_denied", "拒绝跨站请求。", 403)
 
     def _session(self, create=False):
@@ -314,6 +316,11 @@ class Handler(BaseHTTPRequestHandler):
             result = {"authenticated": False}
         elif path == "status" and not mutation:
             result = engine.status()
+        elif path == "update" and self.command == "POST":
+            from .update_flow import begin_update
+            if set(body) - {"local_build", "retry"} or any(type(value) is not bool for value in body.values()):
+                raise ManagerError("invalid_update", "更新参数必须是local_build或retry布尔值。")
+            result = begin_update(engine, **body)
         elif path == "install-location" and self.command == "PUT":
             result = engine.save_install_location(body)
         elif path == "install-location" and not mutation:
@@ -355,12 +362,6 @@ class Handler(BaseHTTPRequestHandler):
             result = engine.save_settings(body)
         elif path == "settings" and not mutation:
             result = engine.settings()
-        elif path == "source-credentials" and self.command == "POST":
-            token = body.get("token", "")
-            if not isinstance(token, str) or len(token) > 4096 or "\n" in token:
-                raise ManagerError("invalid_token", "发布源令牌格式无效。")
-            engine.set_token(token)
-            result = {"has_download_token": engine.settings()["has_download_token"]}
         elif path == "password" and self.command == "POST":
             result = auth.change(body.get("password"), body.get("current_password", ""))
             session = self._rotate_session(key)

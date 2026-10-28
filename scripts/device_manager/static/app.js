@@ -822,7 +822,7 @@
       show(boxError, false);
       text($('availableVersion'), update.available ? (update.version || '--') : '仅管理程序有更新');
     } else {
-      text(updateBadge, '已是最新');
+      text(updateBadge, ({older:'当前版本领先',diverged:'当前版本已分叉',unknown:'尚未确认版本关系'})[update.relation] || (update.failed ? '此版本此前更新失败' : '已是最新'));
       setClass(updateBadge, 'status-badge good');
       show(boxAvailable, false);
       show(boxNone, true);
@@ -1768,7 +1768,6 @@
       generatePlan();
     });
     $('wizardSaveSource').addEventListener('click', function () { saveSourceSettings('wizard'); });
-    $('wizardClearToken').addEventListener('click', function () { clearSourceToken('wizard'); });
   }
 
   // ===== 功能模块（主界面）=====
@@ -1923,13 +1922,7 @@
     }
   }
 
-  // ===== 更新来源与私有源凭据 =====
-  // 令牌只写入、不读取回来；UI 只反映“是否已保存”。
-  function renderTokenState(prefix, hasToken) {
-    const el = $(prefix === 'wizard' ? 'wizardTokenState' : 'tokenState');
-    if (el) text(el, hasToken ? '已保存访问令牌' : '未保存访问令牌');
-  }
-
+  // ===== 公开更新来源 =====
   function applySourceSettings(settings, prefix) {
     const channelEl = $(prefix === 'wizard' ? 'wizardChannel' : 'updateChannel');
     const feedEl = $(prefix === 'wizard' ? 'wizardFeedUrl' : 'feedUrl');
@@ -1948,7 +1941,6 @@
       feedEl.dataset.sourceMode = sourceMode;
       text(feedEl.closest('label').querySelector('.config-label'), sourceMode === 'git' ? '源码仓库地址' : '版本目录地址');
     }
-    renderTokenState(prefix, Boolean(settings.has_download_token));
     const summary = $('wizardSourceSummary');
     if (summary) {
       text(summary, settings.feed_url ? settings.feed_url + (sourceMode === 'git' ? ' · ' + (settings.source_branch || 'main') : '') : '未配置');
@@ -1958,7 +1950,6 @@
   async function saveSourceSettings(prefix) {
     const channelEl = $(prefix === 'wizard' ? 'wizardChannel' : 'updateChannel');
     const feedEl = $(prefix === 'wizard' ? 'wizardFeedUrl' : 'feedUrl');
-    const tokenEl = $(prefix === 'wizard' ? 'wizardToken' : 'sourceToken');
     const messageEl = $(prefix === 'wizard' ? 'wizardSourceMessage' : 'updateConfigMessage');
     const button = $(prefix === 'wizard' ? 'wizardSaveSource' : 'saveUpdateConfig');
 
@@ -1966,7 +1957,6 @@
     const sourceMode = feedEl ? feedEl.dataset.sourceMode || 'git' : 'git';
     const channel = channelEl ? channelEl.value : 'stable';
     const feedUrl = feedEl ? feedEl.value.trim() : '';
-    const token = tokenEl ? tokenEl.value : '';
 
     if (button) button.disabled = true;
 
@@ -1978,21 +1968,9 @@
           : { source_mode: 'catalog', channel: channel, feed_url: feedUrl }
       });
 
-      // 只有用户实际填写时才提交令牌；留空保持原值。
-      if (token) {
-        await apiCall('/api/manager/source-credentials', {
-          method: 'POST',
-          body: { token: token }
-        });
-      }
-
       const refreshed = await apiCall('/api/manager/settings');
       applySourceSettings(refreshed, prefix);
-      if (tokenEl) tokenEl.value = '';
-
-      inlineMessage(messageEl, token
-        ? '来源设置与访问令牌已保存。'
-        : '来源设置已保存。', 'good');
+      inlineMessage(messageEl, '来源设置已保存。', 'good');
 
       if (prefix === 'wizard') {
         // 保存后立即反映模块与发布可见性，避免停在“无可用版本”。
@@ -2007,28 +1985,6 @@
       return null;
     } finally {
       if (button) button.disabled = false;
-    }
-  }
-
-  async function clearSourceToken(prefix) {
-    const messageEl = $(prefix === 'wizard' ? 'wizardSourceMessage' : 'updateConfigMessage');
-    const ok = await confirmDialog({
-      title: '清除访问令牌',
-      text: '清除后从私有源下载将不再携带凭据。已保存的令牌内容不会被读回，确认后立即失效。',
-      confirmText: '清除令牌',
-      danger: true
-    });
-    if (!ok) return;
-
-    try {
-      const result = await apiCall('/api/manager/source-credentials', {
-        method: 'POST',
-        body: { token: '' }
-      });
-      renderTokenState(prefix, Boolean(result.has_download_token));
-      inlineMessage(messageEl, '访问令牌已清除。', 'good');
-    } catch (error) {
-      inlineMessage(messageEl, '清除失败：' + error.message, 'bad');
     }
   }
 
@@ -2386,7 +2342,7 @@
     const params = { version: version };
 
     try {
-      let plan = await apiCall('/api/manager/plan', { method: 'POST', body: { action: 'update', version: version } });
+      let plan = await apiCall('/api/manager/plan', { method: 'POST', body: { action: 'update', version: version, one_step: true } });
 
       if (Array.isArray(plan.blockers) && plan.blockers.length) {
         plan = await withStopConfirmation(plan, 'update', params);
@@ -2948,7 +2904,6 @@
     $('configSave').addEventListener('click', saveConfig);
 
     $('saveUpdateConfig').addEventListener('click', function () { saveSourceSettings('main'); });
-    $('clearSourceToken').addEventListener('click', function () { clearSourceToken('main'); });
     $('updateManagerButton').addEventListener('click', startManagerUpdate);
 
     $('autoStart').addEventListener('change', async function (event) {

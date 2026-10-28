@@ -31,15 +31,6 @@ def normalized_settings(stored):
     return result
 
 
-def credentials(engine):
-    values = read_json(engine.manager_home / "config/credentials.json", {})
-    origin = values.get("origin", "")
-    # 只迁移本项目旧默认目录的同仓库授权，不扩大自定义源的凭据范围。
-    if origin and is_project_default(origin):
-        origin = DEFAULT_REPOSITORY
-    return {"token": values.get("token", ""), "token_origin": origin}
-
-
 def discover(engine, *, refresh=False, request=None, local_request=False):
     settings = engine.settings()
     request = request or {}
@@ -54,9 +45,9 @@ def discover(engine, *, refresh=False, request=None, local_request=False):
     if not refresh and not request and cache.get("identity") == identity:
         return cache["source"]
     try:
-        info = remote_revision(repository, branch, run=run_command, allow_local=allow_local, **credentials(engine))
+        info = remote_revision(repository, branch, run=run_command, allow_local=allow_local)
     except (SourceError, OSError) as exc:
-        raise ManagerError("source_unavailable", "无法读取源码分支，请检查仓库、分支与私有访问授权。", 502) from exc
+        raise ManagerError("source_unavailable", "无法访问仓库，请检查公开HTTPS地址、分支与网络。", 502) from exc
     # 计划查询也刷新真实分支提交；显式固定旧提交只影响本次计划，不能覆盖分支目录。
     info = dict(info, allow_local=allow_local)
     atomic_json(cache_path, {"identity": identity, "source": info})

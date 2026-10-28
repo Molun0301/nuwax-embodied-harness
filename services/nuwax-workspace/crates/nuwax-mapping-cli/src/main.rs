@@ -1,4 +1,4 @@
-//! nuwax-mapping-cli binary entrypoint
+//! 离线地图处理命令行入口：先解析参数，再执行所选地图操作。
 //! - `rename.py` → `nuwax-mapping-cli rename`
 //! - `pose_fill.py` → `nuwax-mapping-cli pose-fill`
 //! - `summary.py` → `nuwax-mapping-cli summary`

@@ -75,22 +75,73 @@ def assets(repository, release_id):
     return [item for page in pages for item in page]
 
 
-def anonymous_download(url, destination, *, size, sha256):
+def observe_asset(url, destination, *, size, timeout=60):
+    """使用和设备相同的匿名直链，记录完整对象或明确的404。"""
     digest, received = hashlib.sha256(), 0
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with common._urlopen(url, timeout=60) as response, destination.open("wb") as output:
-        while True:
-            block = response.read(1024 * 1024)
-            if not block:
+    header_names = ("Date", "Age", "Cache-Control", "X-Cache", "Via", "ETag", "X-GitHub-Request-Id")
+    try:
+        with common._urlopen(url, timeout=timeout) as response, destination.open("wb") as output:
+            if response.status != 200:
+                raise RuntimeError("匿名附件下载需要完整HTTP 200响应")
+            headers = {name: response.headers[name] for name in header_names if response.headers.get(name) is not None}
+            while received <= size:
+                block = response.read(min(1024 * 1024, size + 1 - received))
+                if not block:
+                    break
+                received += len(block)
+                digest.update(block)
+                output.write(block)
+    except urllib.error.HTTPError as exc:
+        try:
+            if exc.code != 404:
+                raise
+            return {"http_status": 404, "url": url, "headers": {name: exc.headers[name] for name in header_names if exc.headers.get(name) is not None}}
+        finally:
+            exc.close()
+    return {"http_status": 200, "bytes": received, "sha256": digest.hexdigest(), "url": url, "headers": headers}
+
+
+def anonymous_download(url, destination, *, size, sha256):
+    observation = observe_asset(url, destination, size=size)
+    if observation["http_status"] != 200 or observation["bytes"] != size or observation["sha256"] != sha256:
+        raise RuntimeError("匿名附件下载与目标大小或SHA-256不符：" + json.dumps(observation, ensure_ascii=False))
+    return observation
+
+
+def wait_visibility(url, destination, *, size, sha256, report_path, missing=False, previous_sha256=()):
+    """仅等待验收控制的对象传播；普通网络错误和未知内容直接失败。"""
+    started = time.monotonic()
+    report = {"url": url, "expected": {"http_status": 404 if missing else 200, "bytes": size, "sha256": sha256}, "attempts": [], "success": False}
+    try:
+        # 有响应才判定是否传播中；不使用查询参数绕开设备将访问的缓存键。
+        for delay in (0, 1, 2, 4, 8, 16, 16, 16):
+            remaining = 120 - (time.monotonic() - started)
+            if remaining <= delay:
                 break
-            received += len(block)
-            if received > size:
-                raise RuntimeError("匿名附件下载超出索引大小")
-            digest.update(block)
-            output.write(block)
-    if received != size or digest.hexdigest() != sha256:
-        raise RuntimeError("匿名附件下载与生产索引摘要不符")
-    return {"bytes": received, "sha256": digest.hexdigest(), "url": url}
+            if delay:
+                time.sleep(delay)
+            observation = observe_asset(url, destination, size=size, timeout=min(30, remaining - delay))
+            report["attempts"].append({"elapsed_seconds": round(time.monotonic() - started, 3), **observation})
+            if observation["http_status"] == 404:
+                ready = missing
+            else:
+                exact = observation["bytes"] == size and observation["sha256"] == sha256
+                ready = not missing and exact
+                if not ready and (observation["bytes"] != size or observation["sha256"] not in previous_sha256):
+                    raise RuntimeError("验收对象既不是目标也不是已知旧版本，拒绝作为传播延迟重试")
+            if ready:
+                report["success"] = True
+                return observation
+            print("验收附件尚未呈现目标状态，第" + str(len(report["attempts"])) + "次匿名核验：" + json.dumps(observation, ensure_ascii=False), flush=True)
+        raise RuntimeError("验收附件在8次/120秒上限内未呈现目标状态")
+    except BaseException as exc:
+        report["error"] = str(exc)
+        raise
+    finally:
+        report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        dump(report_path, report)
+        destination.unlink(missing_ok=True)
 
 
 def prepare(args):
@@ -118,8 +169,8 @@ def prepare(args):
     dump(copied_index, copied)
     gh(["release", "upload", VALIDATION_RELEASE, str(original), str(copied_index), "--repo", repository, "--clobber"])
     common.RELEASE = VALIDATION_RELEASE
-    verification = anonymous_download(common.release_url(repository, entry["asset"]), state / "验证下载临时文件", size=entry["size"], sha256=entry["sha256"])
-    (state / "验证下载临时文件").unlink()
+    verification = wait_visibility(common.release_url(repository, entry["asset"]), state / "验证下载临时文件", size=entry["size"], sha256=entry["sha256"], report_path=state / "准备附件可见性.json")
+    wait_visibility(common.release_url(repository, copied_index.name), state / "验证下载临时文件", size=copied_index.stat().st_size, sha256=common.sha256(copied_index), report_path=state / "准备索引可见性.json")
     if common.fetch_index(repository, args.revision)["platforms"][PLATFORM]["programs"][PROGRAM] != entry:
         raise RuntimeError("验收索引副本与生产条目不符")
     payload.update(prepared=True, validation_original=verification)
@@ -139,11 +190,14 @@ def inject(args):
         raise RuntimeError("恢复原件损坏，拒绝故障注入")
     # 故障意图先记入状态，即使后续API失败always步骤仍可恢复原件。
     payload["fault"] = args.case
+    payload["fault_ready"] = False
     dump(args.state / "验收状态.json", payload)
     if args.case == "missing":
         candidates = [item for item in assets(payload["repository"], validated["id"]) if item["name"] == payload["entry"]["asset"]]
         if len(candidates) != 1:
             raise RuntimeError("验收附件不存在或不唯一，不能执行删除场景")
+        payload["fault_expected"] = {"http_status": 404}
+        dump(args.state / "验收状态.json", payload)
         gh(["api", "--method", "DELETE", "repos/" + payload["repository"] + "/releases/assets/" + str(candidates[0]["id"])])
     else:
         damaged = args.state / "故障附件" / original.name
@@ -157,7 +211,13 @@ def inject(args):
             output.write(bytes([byte[0] ^ 0xFF]))
         if damaged.stat().st_size != original.stat().st_size or common.sha256(damaged) == payload["entry"]["sha256"]:
             raise RuntimeError("故障附件未按计划改变摘要")
+        payload["fault_expected"] = {"http_status": 200, "bytes": damaged.stat().st_size, "sha256": common.sha256(damaged)}
+        dump(args.state / "验收状态.json", payload)
         gh(["release", "upload", VALIDATION_RELEASE, str(damaged), "--repo", payload["repository"], "--clobber"])
+    common.RELEASE = VALIDATION_RELEASE
+    observation = wait_visibility(common.release_url(payload["repository"], original.name), args.state / "故障核验临时文件", size=payload["entry"]["size"], sha256=payload["fault_expected"].get("sha256", payload["entry"]["sha256"]), missing=args.case == "missing", previous_sha256=(payload["entry"]["sha256"],), report_path=args.state / (args.case + "-附件可见性.json"))
+    payload.update(fault_ready=True, fault_visibility=observation)
+    dump(args.state / "验收状态.json", payload)
     print("已对验收Release注入附件故障：" + args.case, flush=True)
 
 
@@ -179,7 +239,7 @@ def client(args):
     if os.geteuid() == 0 or common.platform_key() != PLATFORM:
         raise RuntimeError("设备验收必须在非root的noble-x86_64环境执行")
     payload = load_state(args.state)
-    if not payload.get("prepared") or payload.get("fault") != args.case:
+    if not payload.get("prepared") or payload.get("fault") != args.case or not payload.get("fault_ready"):
         raise RuntimeError("验收状态与故障场景不符")
     root, cache = args.source_root.resolve(), args.cache.resolve()
     revision = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
@@ -224,7 +284,7 @@ def client(args):
                 requests.append(url)
     sys.addaudithook(audit)
     started = time.monotonic()
-    report = {"schema": 1, "case": args.case, "source_revision": revision, "harness_revision": os.environ.get("NEH_ACCEPTANCE_HARNESS_REVISION", ""), "validation_release": VALIDATION_RELEASE, "repository": payload["repository"], "expected_asset": payload["entry"], "success": False}
+    report = {"schema": 1, "case": args.case, "source_revision": revision, "harness_revision": os.environ.get("NEH_ACCEPTANCE_HARNESS_REVISION", ""), "validation_release": VALIDATION_RELEASE, "repository": payload["repository"], "expected_asset": payload["entry"], "fault_expected": payload["fault_expected"], "fault_visibility": payload["fault_visibility"], "success": False}
     log_path = args.state / (args.case + "-客户端日志.txt")
     def run(command, *, cwd=None, env=None):
         argv = list(map(str, command))
@@ -244,23 +304,13 @@ def client(args):
             raise subprocess.CalledProcessError(code, argv)
     try:
         with log_path.open("w", encoding="utf-8") as output, contextlib.redirect_stdout(Tee(output)):
-            # 先独立确认GitHub真的呈现本轮故障；设备调度随后再次实际匿名请求。
+            # 容器与编排主机可能看到不同暂态，客户端也独立确认同一故障目标。
             asset_url = common.release_url(payload["repository"], payload["entry"]["asset"])
-            if args.case == "missing":
-                try:
-                    with common._urlopen(asset_url, timeout=60):
-                        raise RuntimeError("T3故障附件仍然能下载")
-                except urllib.error.HTTPError as exc:
-                    if exc.code != 404:
-                        raise
-                    report["fault_observation"] = {"http_status": 404, "url": asset_url}
-            else:
-                with common._urlopen(asset_url, timeout=60) as response:
-                    received = response.read(payload["entry"]["size"] + 1)
-                observed = hashlib.sha256(received).hexdigest()
-                if len(received) != payload["entry"]["size"] or observed == payload["entry"]["sha256"]:
-                    raise RuntimeError("T4故障附件未保持大小并改变摘要")
-                report["fault_observation"] = {"bytes": len(received), "sha256": observed, "url": asset_url}
+            expected = payload["fault_expected"]
+            if args.case == "corrupt":
+                if expected["bytes"] != payload["entry"]["size"] or expected["sha256"] == payload["entry"]["sha256"]:
+                    raise RuntimeError("T4故障目标未保持大小并改变摘要")
+            report["fault_observation"] = wait_visibility(asset_url, args.state / "客户端故障核验临时文件", size=payload["entry"]["size"], sha256=expected.get("sha256", payload["entry"]["sha256"]), missing=args.case == "missing", previous_sha256=(payload["entry"]["sha256"],), report_path=args.state / (args.case + "-客户端附件可见性.json"))
             result = builds.build_modules(root, prefix, cache, ["follow"], args.jobs, run, prebuilt={"repository": payload["repository"], "revision": revision}, programs=[PROGRAM], capture_link_args=True)
             if set(result) != {PROGRAM}:
                 raise RuntimeError("真实构建器返回程序集合错误")
@@ -312,9 +362,9 @@ def restore(args):
         raise RuntimeError("验收Release身份变化，拒绝恢复到未知位置")
     gh(["release", "upload", VALIDATION_RELEASE, str(original), "--repo", payload["repository"], "--clobber"])
     common.RELEASE = VALIDATION_RELEASE
-    verification = anonymous_download(common.release_url(payload["repository"], original.name), args.state / "恢复核验临时文件", size=payload["entry"]["size"], sha256=payload["entry"]["sha256"])
-    (args.state / "恢复核验临时文件").unlink()
-    payload.update(fault=None, restored=True, restore_verification=verification)
+    previous = payload.get("fault_expected", {}).get("sha256")
+    verification = wait_visibility(common.release_url(payload["repository"], original.name), args.state / "恢复核验临时文件", size=payload["entry"]["size"], sha256=payload["entry"]["sha256"], previous_sha256=(previous,) if previous else (), report_path=args.state / "恢复附件可见性.json")
+    payload.update(fault=None, fault_ready=False, restored=True, restore_verification=verification)
     dump(args.state / "验收状态.json", payload)
     dump(args.state / "恢复报告.json", {"success": True, "validation_release": VALIDATION_RELEASE, "original_sha256": payload["entry"]["sha256"], "anonymous_verification": verification})
     # 原件仅为注入恢复服务；恢复核验完成后清除本地副本和故障副本。

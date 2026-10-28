@@ -442,6 +442,9 @@ class HTTPChecks(LocationChecks):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join()
+        # 监听退出后仍须等回收/检查线程结束，才能删除它可能写入的临时目录。
+        if self.server.recovery_thread is not None:
+            self.server.recovery_thread.join()
 
     def request(self, method, path, body=None, *, authorized=True, origin=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)

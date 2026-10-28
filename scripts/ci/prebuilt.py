@@ -224,7 +224,8 @@ def private_libraries(program, prefix, cache):
 
 def copy_notices(root, prefix, cache, staging, spec, audit):
     """仅收集实际读取/链接组件的声明，不能用历史缓存推断组成。"""
-    notice_root = staging / "share/licenses"
+    notice_base = common.program_share(audit["program"]) + "/licenses"
+    notice_root = staging / notice_base
     notice_root.mkdir(parents=True)
     selected = {root / "LICENSE", root / "docs/公开文档/第三方许可证说明.md"}
     for value in audit["repository_inputs"] + audit["external_inputs"]:
@@ -282,7 +283,7 @@ def copy_notices(root, prefix, cache, staging, spec, audit):
         destination = notice_root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
-        files.append({"path": "share/licenses/" + relative, "source": canonical(source, root, cache), "sha256": common.sha256(source), "scope": "project-overview" if source.name == "第三方许可证说明.md" else "common-license-text" if source.parent == Path("/usr/share/common-licenses") else "actual-component"})
+        files.append({"path": notice_base + "/" + relative, "source": canonical(source, root, cache), "sha256": common.sha256(source), "scope": "project-overview" if source.name == "第三方许可证说明.md" else "common-license-text" if source.parent == Path("/usr/share/common-licenses") else "actual-component"})
     audit["license_files"] = files
     audit["system_packages_used"] = capture(["dpkg-query", "-W", "-f=${binary:Package}=${Version}\n", *sorted(system_packages)]).splitlines() if system_packages else []
     return len(files)
@@ -317,6 +318,8 @@ def corresponding_sources(root, program, spec, audit, revision, repository):
 def package(root, prefix, cache, output, program, fingerprint_value, spec, audit):
     if program not in common.PROGRAMS:
         raise RuntimeError("禁止打包仅限本机源码构建的程序")
+    if audit["program"] != program:
+        raise RuntimeError("程序打包与实际审计身份不一致")
     with tempfile.TemporaryDirectory(prefix=".package-", dir=output) as directory:
         staging = Path(directory)
         (staging / "bin").mkdir()
@@ -334,14 +337,16 @@ def package(root, prefix, cache, output, program, fingerprint_value, spec, audit
         notices = copy_notices(root, prefix, cache, staging, spec, audit)
         revision = capture(["git", "-C", str(root), "rev-parse", "HEAD"])
         repository = capture(["git", "-C", str(root), "remote", "get-url", "origin"])
-        dump(staging / "share/sources/对应源码.json", corresponding_sources(root, program, spec, audit, revision, repository))
+        materials = Path(common.program_share(program))
+        sources = materials / "sources"
+        dump(staging / sources / "对应源码.json", corresponding_sources(root, program, spec, audit, revision, repository))
         # LGPL组件源码及替换共享库所需的包装源码随程序一起提供。
         if program == "nuwax-slam-2d-worker":
             for path in ("services/nuwax-workspace/crates/nuwax-slam-toolbox-sys/native", "drivers/sensors/slamtec_native"):
-                shutil.copytree(root / path, staging / "share/sources" / path)
-        audit["relink_materials"] = {"sources": "share/sources", "corresponding_source": "share/sources/对应源码.json", "private_libraries": sorted(libraries), "build_recipe": "scripts/module_installer/builds.py"}
+                shutil.copytree(root / path, staging / sources / path)
+        audit["relink_materials"] = {"sources": sources.as_posix(), "corresponding_source": (sources / "对应源码.json").as_posix(), "private_libraries": sorted(libraries), "build_recipe": "scripts/module_installer/builds.py"}
         audit["review_key"] = review_key(audit, root, cache)
-        dump(staging / "share/audit/inputs.json", audit)
+        dump(staging / materials / "audit/inputs.json", audit)
         files = [path.relative_to(staging).as_posix() for path in staging.rglob("*") if path.is_file()]
         manifest = {"schema": common.SCHEMA, "program": program, "fingerprint": fingerprint_value, "files": common._receipt_files(staging, files), "license_files": notices}
         dump(staging / "prebuilt-manifest.json", manifest)
@@ -1310,7 +1315,7 @@ def build(args):
                         unpacked = directory / "unpacked"
                         unpacked.mkdir()
                         common._extract(archive, unpacked, program, value)
-                        audit = json.loads((unpacked / "share/audit/inputs.json").read_text())
+                        audit = json.loads((unpacked / common.program_share(program) / "audit/inputs.json").read_text())
                         dump(audit_cache, audit)
                 audit = json.loads(audit_cache.read_text())
                 if audit.get("program") != program or audit.get("fingerprint") != value or not audit.get("review_key"):

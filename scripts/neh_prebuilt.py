@@ -44,6 +44,13 @@ _MAX_ARCHIVE = 2 * 1024 ** 3
 _MAX_EXPANDED = 8 * 1024 ** 3
 
 
+def program_share(program: str) -> str:
+    """程序专属说明材料只落在本程序的share命名空间。"""
+    if program not in PROGRAMS:
+        raise ValueError("未知可预编译程序的说明材料目录")
+    return "share/neh-prebuilt/" + program
+
+
 class PrebuiltPending(RuntimeError):
     """完整提交尚未由云端发布；管理程序可展示状态并延后重试。"""
     status = "prebuilt_pending"
@@ -325,22 +332,66 @@ def reusable(prefix: Path, receipt: Path, fingerprint_value: str) -> bool:
             return False
         payload = json.loads(receipt.read_text(encoding="utf-8"))
         files = payload["files"]
-        return (payload["fingerprint"] == fingerprint_value and isinstance(files, dict) and bool(files) and _receipt_files(prefix, files) == files)
-    except (OSError, ValueError, KeyError, TypeError):
+        if payload["fingerprint"] != fingerprint_value or not isinstance(files, dict) or not files:
+            return False
+        if payload.get("local_runtime") is True and set(files) != {"bin/" + payload["program"], *_local_runtime_files(prefix, payload["program"])}:
+            return False
+        return _receipt_files(prefix, files) == files
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError):
         return False
+
+
+def _local_runtime_files(prefix: Path, program: str) -> set:
+    """只核对实际动态闭包；显式dlopen按本程序固定归属加入。"""
+    if program not in PROGRAMS:
+        raise ValueError("本机回退回执只接受可预编译程序")
+    prefix = prefix.resolve(strict=True)
+    pending = [_ordinary_file(prefix, "bin/" + program)]
+    if program == "nuwax-slam-2d-worker":
+        pending.append(prefix / "lib/libnuwax_slamtec.so.1")
+    files, seen = set(), set()
+    while pending:
+        binary = pending.pop().resolve(strict=True)
+        if not binary.is_file():
+            raise ValueError("实际动态依赖不是普通文件")
+        if binary in seen:
+            continue
+        seen.add(binary)
+        if binary != prefix / "bin" / program:
+            files.add(binary.relative_to(prefix).as_posix())
+        listing = subprocess.check_output(["ldd", str(binary)], text=True, env={**os.environ, "LC_ALL": "C"})
+        if "not found" in listing:
+            raise ValueError("实际动态依赖缺失：" + listing)
+        for line in listing.splitlines():
+            line = line.strip()
+            if not line or line == "statically linked" or line.startswith("linux-vdso.so.1 "):
+                continue
+            match = re.fullmatch(r"(?:\S+\s+=>\s+)?(/.+?)\s+\(0x[0-9a-fA-F]+\)", line)
+            if match is None:
+                raise ValueError("无法解析实际动态依赖来源：" + line)
+            selected = Path(match.group(1)).resolve(strict=True)
+            if selected == prefix or prefix in selected.parents:
+                pending.append(selected)
+            elif not any(selected == base or base in selected.parents for base in map(Path, ("/usr", "/lib", "/lib64"))):
+                raise ValueError("实际动态依赖未安装到受管前缀或系统目录：" + str(selected))
+    return files
 
 
 def record_local(prefix: Path, cache: Path, program: str, fingerprint_value: str) -> None:
     """本机回退成功后也记录文件摘要，使下一版本能按同一指纹复用。"""
-    files = {"bin/" + program}
-    # 前缀只含受管动态库，记录私有依赖；其它程序不会改变相同库的内容。
-    for directory in ("lib", "lib64"):
-        parent = prefix / directory
-        if parent.is_dir():
-            for path in parent.rglob("*"):
-                if path.is_file() and not path.is_symlink() and ".so" in path.name:
-                    files.add(path.relative_to(prefix).as_posix())
-    _write_json(cache / "prebuilt/receipts" / (program + ".json"), {"schema": SCHEMA, "program": program, "fingerprint": fingerprint_value, "files": _receipt_files(prefix, files)})
+    files = {"bin/" + program, *_local_runtime_files(prefix, program)}
+    checked = _receipt_files(prefix, files)
+    current = prefix
+    if current.is_symlink():
+        raise ValueError("本机回退前缀不能为符号链接")
+    for part in PurePosixPath(program_share(program)).parts:
+        current = current / part
+        if current.is_symlink() or current.exists() and not current.is_dir():
+            raise ValueError("本机回退材料目录包含符号链接或非目录")
+    # 真实本机输出通过核对后，清除本程序旧云端证明，不能冒充新输出的来源。
+    if current.exists():
+        shutil.rmtree(current)
+    _write_json(cache / "prebuilt/receipts" / (program + ".json"), {"schema": SCHEMA, "program": program, "fingerprint": fingerprint_value, "local_runtime": True, "files": checked})
 
 
 def _decode_zstd_library(archive: Path, stream) -> None:
@@ -467,7 +518,7 @@ def _extract(archive: Path, destination: Path, program: str, fingerprint_value: 
     if _receipt_files(destination, files) != files:
         raise ValueError("预编译归档内部文件摘要不符")
     for relative in files:
-        if not (relative == "bin/" + program or relative.startswith(("lib/", "lib64/", "share/"))):
+        if not (relative == "bin/" + program or relative.startswith(("lib/", "lib64/", program_share(program) + "/"))):
             raise ValueError("预编译归档写入非程序目录")
     binary = destination / "bin" / program
     with binary.open("rb") as handle:

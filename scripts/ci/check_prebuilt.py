@@ -61,9 +61,10 @@ def main():
         (staging / "bin").mkdir(parents=True)
         shutil.copyfile(shutil.which("true"), staging / "bin" / program)
         (staging / "bin" / program).chmod(0o755)
-        (staging / "share/licenses").mkdir(parents=True)
-        (staging / "share/licenses/LICENSE").write_text("隔离制品许可夹具\n", encoding="utf-8")
-        files = ["bin/" + program, "share/licenses/LICENSE"]
+        notices = common.program_share(program) + "/licenses"
+        (staging / notices).mkdir(parents=True)
+        (staging / notices / "LICENSE").write_text("隔离制品许可夹具\n", encoding="utf-8")
+        files = ["bin/" + program, notices + "/LICENSE"]
         manifest = {"schema": common.SCHEMA, "program": program, "fingerprint": value, "files": common._receipt_files(staging, files)}
         (staging / "prebuilt-manifest.json").write_text(json.dumps(manifest))
         raw = base / "program.tar"

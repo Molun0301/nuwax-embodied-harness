@@ -290,9 +290,10 @@ def native_link_evidence(program, cache, spec, linked, actual_inputs):
             if path in visited:
                 continue
             command = path.read_text().strip()
-            cwd = next((parent for parent in path.parents if (parent / "CMakeCache.txt").is_file()), None)
-            if cwd is None:
-                raise RuntimeError("原生链接记录缺少CMake构建根：" + str(path))
+            cmake_root = next((parent for parent in path.parents if (parent / "CMakeCache.txt").is_file()), None)
+            if cmake_root is None or path.parent.parent.name != "CMakeFiles":
+                raise RuntimeError("原生链接记录缺少CMake工作目录或构建根：" + str(path))
+            cwd = path.parents[2]
             arguments = shlex.split(command.splitlines()[0])
             archive = Path(arguments[0]).name.endswith("ar")
             output = arguments[2] if archive else arguments[arguments.index("-o") + 1] if "-o" in arguments else None
@@ -313,7 +314,7 @@ def native_link_evidence(program, cache, spec, linked, actual_inputs):
             else:
                 parsed = resolve_link_inputs(arguments, cwd)
             needed.update(str(Path(item["path"]).resolve()) for item in parsed)
-            result.append({"record": str(path), "command": command, "output": str(destination), "inputs": parsed, "cmake_root": str(cwd)})
+            result.append({"record": str(path), "command": command, "output": str(destination), "inputs": parsed, "cmake_root": str(cmake_root), "working_directory": str(cwd)})
             changed = True
         if not changed:
             break

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import hashlib
 import datetime
 import json
@@ -14,7 +13,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tarfile
 import tempfile
 import traceback
 
@@ -79,6 +77,11 @@ def enable_ci_native_diagnostics(cache):
         if not shlex.split(flags) or shlex.split(flags)[-1] != "-MD":
             os.environ[name] = (flags + " -MD").strip()
     os.environ["CC_ENABLE_DEBUG_OUTPUT"] = "1"
+    temporary = cache / "compiler-tmp"
+    if temporary.is_symlink():
+        raise RuntimeError("CI编译临时目录不能为符号链接")
+    temporary.mkdir(parents=True, exist_ok=True)
+    os.environ["TMPDIR"] = str(temporary)
     real_cmake = Path(os.environ.get("NEH_CI_REAL_CMAKE") or shutil.which("cmake")).resolve(strict=True)
     version = re.search(r"cmake version (\d+)\.(\d+)", capture([str(real_cmake), "--version"]))
     if version is None:
@@ -184,7 +187,7 @@ def identity(platform_key, root):
         "system_packages": capture(["dpkg-query", "-W", "-f=${binary:Package}=${Version}\n"]),
         "image": {"base": base_image, "dockerfile_sha256": common.sha256(root / "scripts/ci/prebuilt" / (platform_key + ".Dockerfile"))},
         # 不含路径和并行数；它们不改变代码语义，源码内优化配置由Git树覆盖。
-        "parameters": {"cargo": ["rustc", "--locked", "--release", "-vv", "--message-format=json-render-diagnostics", "--print=link-args", "-Clink-arg=-Wl,-Map=$CACHE/audit-linkmaps/<program>.map"], "native_diagnostics": {"dependency": "-MD", "boost_compiler_wrapper": 1, "legacy_cmake_cached_flags": "preserve-and-append-MD-v1", "cargo_migration": "current-package-build-script-output-v1", "boost_map": "$CACHE/audit-linkmaps/boost/<output-digest>.map"}, "cmake": ["CMAKE_BUILD_TYPE=Release", "CMAKE_GENERATOR=Unix Makefiles"], "environment": {name: os.environ.get(name, "") for name in ("RUSTFLAGS", "CFLAGS", "CXXFLAGS", "LDFLAGS", "NUWAX_CXX20", "CC_ENABLE_DEBUG_OUTPUT")}},
+        "parameters": {"cargo": ["rustc", "--locked", "--release", "-vv", "--message-format=json-render-diagnostics", "--print=link-args", "-Clink-arg=-Wl,-Map=$CACHE/compiler-tmp/linkmaps/<program>.map"], "native_diagnostics": {"dependency": "-MD", "environment_audit": "registered-roots-and-components-v1", "temporary_directory": "$CACHE/compiler-tmp", "legacy_cmake_cached_flags": "preserve-and-append-MD-v1", "cargo_migration": "current-package-build-script-output-v1"}, "cmake": ["CMAKE_BUILD_TYPE=Release", "CMAKE_GENERATOR=Unix Makefiles"], "environment": {name: os.environ.get(name, "") for name in ("RUSTFLAGS", "CFLAGS", "CXXFLAGS", "LDFLAGS", "NUWAX_CXX20", "CC_ENABLE_DEBUG_OUTPUT")}},
     }
 
 
@@ -223,69 +226,57 @@ def private_libraries(program, prefix, cache):
 
 
 def copy_notices(root, prefix, cache, staging, spec, audit):
-    """仅收集实际读取/链接组件的声明，不能用历史缓存推断组成。"""
+    """按实际组件收集声明；不再沿每个编译头文件追溯许可。"""
     notice_base = common.program_share(audit["program"]) + "/licenses"
-    notice_root = staging / notice_base
-    notice_root.mkdir(parents=True)
     selected = {root / "LICENSE", root / "docs/公开文档/第三方许可证说明.md"}
-    for value in audit["repository_inputs"] + audit["external_inputs"]:
-        path = root / value if not Path(value).is_absolute() else Path(value)
-        owner = source_owner(path, spec, root, cache, audit["program"])
-        if owner["kind"] == "system":
-            continue
-        current = path.parent
-        boundary = Path(owner["root"])
-        if not (current == boundary or boundary in current.parents):
-            current = boundary
-        while current == boundary or boundary in current.parents:
-            if current.is_dir():
-                for entry in current.iterdir():
-                    if entry.is_file() and entry.name.upper().startswith(("LICENSE", "LICENCE", "COPYING", "NOTICE")):
-                        selected.add(entry)
-            if current == boundary:
-                break
-            current = current.parent
-    system_paths = [value for value in audit["external_inputs"] if value.startswith(("/usr/", "/lib/"))]
-    system_paths.extend(item["path"] for item in audit["link_inputs"] if item["path"].startswith(("/usr/", "/lib/")))
-    if any(item["kind"] == "rust-toolchain" for item in audit["external_sources"]):
-        sysroot = Path(capture(["rustc", "--print", "sysroot"]))
-        notices = sysroot / "share/doc/rust"
-        if (notices / "COPYRIGHT-library.html").is_file():
-            selected.add(notices / "COPYRIGHT-library.html")
-        selected.update(path for path in (notices / "licenses").glob("*") if path.is_file())
-    aliases = []
-    for path in system_paths:
-        aliases.append(path)
-        if path.startswith(("/usr/lib/", "/usr/bin/", "/usr/sbin/")):
-            aliases.append(path[4:])
-    system_paths = sorted(set(aliases))
-    system_packages = set()
-    for offset in range(0, len(system_paths), 200):
-        query = subprocess.run(["dpkg-query", "-S", *system_paths[offset:offset + 200]], text=True, capture_output=True)
+    for component in audit["external_sources"]:
+        directories = component.get("notice_roots", [component["root"]])
+        for directory in map(Path, directories):
+            if directory.is_dir():
+                candidates = directory.rglob("*") if component["kind"] in ("crate", "repository-embedded", "embedded-component") else directory.iterdir()
+                selected.update(path for path in candidates if path.is_file() and path.name.upper().startswith(("LICENSE", "LICENCE", "COPYING", "NOTICE", "THIRD_PARTY_NOTICES")))
+        selected.update(Path(value) for value in component.get("notice_files", []))
+        if component["kind"] == "rust-toolchain":
+            directory = Path(component["root"]) / "share/doc/rust"
+            selected.add(directory / "COPYRIGHT-library.html")
+            selected.update(path for path in (directory / "licenses").glob("*") if path.is_file())
+    # 系统组件由实际链接路径确定；header-only组件只按已知根归类一次。
+    system_paths = {str(Path(item["path"]).resolve()) for item in audit["link_inputs"] if item["path"].startswith(("/usr/", "/lib/"))}
+    header_components = {name: Path(directory) for name, directory in (("Eigen3", "/usr/include/eigen3"), ("Boost-system-headers", "/usr/include/boost")) if any(Path(directory) == Path(value) or Path(directory) in Path(value).parents for value in audit["external_inputs"])}
+    system_paths.update(str(directory) for directory in header_components.values())
+    system_paths.update(value[4:] for value in list(system_paths) if value.startswith("/usr/lib/"))
+    packages, owners = set(), {}
+    paths = sorted(system_paths)
+    for offset in range(0, len(paths), 200):
+        query = subprocess.run(["dpkg-query", "-S", *paths[offset:offset + 200]], text=True, capture_output=True)
         for line in query.stdout.splitlines():
             if ": /" in line:
-                system_packages.update(line.split(": /", 1)[0].split(", "))
-    for package_name in system_packages:
-        copyright_file = Path("/usr/share/doc") / package_name.split(":", 1)[0] / "copyright"
-        if copyright_file.is_file():
-            selected.add(copyright_file)
-    for name in ("GPL-2", "GPL-3", "LGPL-2.1", "LGPL-3", "Apache-2.0", "BSD"):
-        source = Path("/usr/share/common-licenses") / name
-        if source.is_file():
-            selected.add(source)
+                owner, path = line.split(": /", 1)
+                names = set(owner.split(", "))
+                packages.update(names)
+                owners.setdefault("/" + path, set()).update(names)
+    audit["system_packages_used"] = capture(["dpkg-query", "-W", "-f=${binary:Package}=${Version}\n", *sorted(packages)]).splitlines() if packages else []
+    component_index = {item["kind"] + ":" + item["id"]: item for item in audit["external_sources"]}
+    for name, directory in header_components.items():
+        component_index["header-only-component:" + name] = {"kind": "header-only-component", "id": name, "root": str(directory), "package_owners": sorted(owners.get(str(directory), [])), "usage": ["compile-environment"]}
+    for package in audit["system_packages_used"]:
+        name, version = package.split("=", 1)
+        directory = Path("/usr/share/doc") / name.split(":", 1)[0]
+        selected.add(directory / "copyright")
+        component_index["system-package:" + name] = {"kind": "system-package", "id": name, "version": version, "root": str(directory)}
+    audit["external_sources"] = sorted(component_index.values(), key=lambda item: (item["kind"], item["id"]))
+    for name in ("GPL-2", "GPL-3", "LGPL-2.1", "LGPL-3", "Apache-2.0", "BSD", "MPL-2.0", "BSL-1.0"):
+        selected.add(Path("/usr/share/common-licenses") / name)
     if not (root / "LICENSE").is_file():
         raise RuntimeError("发布程序缺少项目LICENSE")
     files = []
-    for index, source in enumerate(sorted(selected)):
-        if not source.is_file():
-            continue
-        relative = str(index) + "/" + source.name
-        destination = notice_root / relative
+    for index, source in enumerate(sorted(path for path in selected if path.is_file())):
+        relative = notice_base + "/" + str(index) + "/" + source.name
+        destination = staging / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
-        files.append({"path": notice_base + "/" + relative, "source": canonical(source, root, cache), "sha256": common.sha256(source), "scope": "project-overview" if source.name == "第三方许可证说明.md" else "common-license-text" if source.parent == Path("/usr/share/common-licenses") else "actual-component"})
+        files.append({"path": relative, "source": canonical(source, root, cache), "sha256": common.sha256(source), "scope": "project-overview" if source.name == "第三方许可证说明.md" else "common-license-text" if source.parent == Path("/usr/share/common-licenses") else "component-declaration"})
     audit["license_files"] = files
-    audit["system_packages_used"] = capture(["dpkg-query", "-W", "-f=${binary:Package}=${Version}\n", *sorted(system_packages)]).splitlines() if system_packages else []
     return len(files)
 
 
@@ -303,6 +294,7 @@ def corresponding_sources(root, program, spec, audit, revision, repository):
         "project": {"repository": repository, "revision": revision, "source_archive": source_url + "/archive/" + revision + ".tar.gz"},
         "actual_upstreams": upstreams,
         "actual_external_crates": crates,
+        "component_declarations": [{key: value for key, value in item.items() if key not in ("root", "notice_roots", "notice_files")} for item in audit["external_sources"]],
         "cargo": {"manifest": manifest, "lockfile": cargo_lock, "lockfile_sha256": common.sha256(root / cargo_lock), "retrieve": "cargo fetch --locked --manifest-path " + manifest, "说明": "依照此固定提交的Cargo.lock重新取得实际crate和Git依赖；保留其中的固定版本、提交与checksum，不能换成未锁定版本。"},
         "rebuild": {"entry": "scripts/module_installer/builds.py:build_modules", "module": common.PROGRAMS[program]["module"], "programs": [program], "local_build": True, "recipe": "scripts/ci/prebuilt.py", "container": "scripts/ci/prebuilt/" + audit.get("platform", "目标平台") + ".Dockerfile", "rust": builds.RUST_VERSION, "input_spec": {key: spec[key] for key in ("paths", "exclude")}, "说明": "取得固定项目源码后，按镜像配方准备编译器与系统开发库；以独立prefix/cache调用build_modules，local_build=True且programs只选本程序。构建脚本中固定的上游Git提交、归档SHA256、补丁和构建参数均属于对应源码，不得省略。"},
         "GPL3完整源码与替换说明": [
@@ -411,10 +403,7 @@ def native_command_output(arguments):
 
 
 def native_link_evidence(program, cache, spec, linked, actual_inputs):
-    target = rust_target(program, cache)
-    packages = {item["name"] for item in spec["cargo_packages"]}
-    active = actual_inputs + linked["linker_arguments"]
-    roots = [directory for directory in (target / "release/build").iterdir() if directory.name.rsplit("-", 1)[0] in packages and any(str(directory) in value for value in active)]
+    roots = [Path(event["out_dir"]) for event in cargo_build_scripts(spec, linked)]
     if program == "nuwax-slam-2d-worker":
         roots.extend((cache / "build/slamtec", cache / "slam2d-dependencies/build"))
     private = private_libraries(program, cache / "prefix", cache)
@@ -462,10 +451,6 @@ def native_link_evidence(program, cache, spec, linked, actual_inputs):
             changed = True
         if not changed:
             break
-    matched_outputs = {Path(item["output"]).name for item in result}
-    for name, library in private.items():
-        if not name.startswith("libboost_") and library.name not in matched_outputs:
-            raise RuntimeError("实际私有动态库缺少匹配的原生最终链接记录：" + name)
     return result, private
 
 
@@ -476,347 +461,90 @@ def object_dependency(path):
     raise RuntimeError("实际采用的原生对象缺少编译器依赖记录（object.d/object.o.d）：" + str(path))
 
 
-def archive_index(path):
-    """读取普通GNU/BSD归档的真实成员偏移与符号表，保留重复成员名。"""
-    members, tables, names = [], [], b""
-    with path.open("rb") as source:
-        if source.read(8) != b"!<arch>\n":
-            raise RuntimeError("实际采用的原生归档不是受支持的普通ar格式：" + str(path))
-        while True:
-            offset = source.tell()
-            header = source.read(60)
-            if not header:
-                break
-            if len(header) != 60 or header[58:] != b"`\n":
-                raise RuntimeError("原生归档成员头损坏：" + str(path))
-            label = header[:16].decode("utf-8").strip()
-            size = int(header[48:58])
-            if size < 0 or offset + 60 + size > path.stat().st_size:
-                raise RuntimeError("原生归档成员大小越界：" + str(path))
-            data_offset = source.tell()
-            if label == "//":
-                names = source.read(size)
-            elif label in ("/", "/SYM64/"):
-                tables.append((8 if label == "/SYM64/" else 4, source.read(size)))
-            else:
-                name, payload_size = label.rstrip("/"), size
-                if label.startswith("#1/"):
-                    length = int(label[3:])
-                    name = source.read(length).rstrip(b"\0").decode("utf-8")
-                    data_offset += length
-                    payload_size -= length
-                elif label.startswith("/"):
-                    position = int(label[1:])
-                    name = names[position:].split(b"/\n", 1)[0].rstrip(b"\0").decode("utf-8")
-                digest = hashlib.sha256()
-                remaining = payload_size
-                while remaining:
-                    block = source.read(min(1024 * 1024, remaining))
-                    if not block:
-                        raise RuntimeError("原生归档成员被截断：" + str(path))
-                    digest.update(block)
-                    remaining -= len(block)
-                members.append({"name": name, "offset": offset, "data_offset": data_offset, "size": payload_size, "sha256": digest.hexdigest(), "symbols": []})
-            source.seek(offset + 60 + size + size % 2)
-    by_offset = {item["offset"]: item for item in members}
-    for width, table in tables:
-        count = int.from_bytes(table[:width], "big")
-        end = width * (count + 1)
-        if end > len(table):
-            raise RuntimeError("原生归档符号表长度无效：" + str(path))
-        symbols = table[end:].split(b"\0")
-        if len(symbols) < count:
-            raise RuntimeError("原生归档符号表被截断：" + str(path))
-        for index in range(count):
-            offset = int.from_bytes(table[width * (index + 1):width * (index + 2)], "big")
-            if offset not in by_offset:
-                raise RuntimeError("原生归档符号指向未知成员偏移：" + str(path))
-            by_offset[offset]["symbols"].append(symbols[index].decode("utf-8"))
-    return members
-
-
-def linker_map_members(linked):
-    path = Path(linked.get("link_map", "/nonexistent-link-map"))
-    if not path.is_file() or common.sha256(path) != linked.get("link_map_sha256"):
-        raise RuntimeError("缺少经最终ELF回执验证的实际GNU链接图")
-    text = path.read_text(encoding="utf-8", errors="strict")
-    if "Archive member included" not in text and "Linker script and memory map" not in text:
-        raise RuntimeError("无法解析实际GNU链接图格式")
-    pattern = r"([^\s()]+\.(?:rlib|a))\(([^()\n]+)\)"
-    selections, pending = {}, None
-    if "Archive member included" in text:
-        header = text.split("Archive member included", 1)[1].split("\n", 1)[1]
-        for line in header.splitlines():
-            match = re.match(pattern, line)
-            if match:
-                pending = {"archive": match.group(1), "member": match.group(2), "map_reference": line}
-                selections.setdefault((match.group(1), match.group(2)), []).append(pending)
-                tail = line[match.end():]
-            elif pending is not None and line.startswith(" "):
-                pending["map_reference"] += "\n" + line
-                tail = line
-            elif line and not line.startswith(" "):
-                break
-            else:
-                continue
-            symbol = re.search(r"\s\((.+)\)\s*$", tail)
-            if symbol:
-                pending["selection_symbol"] = symbol.group(1)
-    result = []
-    for archive, member in sorted(set(re.findall(pattern, text))):
-        if member.endswith((".o", ".obj", ".oS", ".os")):
-            result.extend(selections.get((archive, member), [{"archive": archive, "member": member}]))
-    return result
-
-
-def archive_adoption_evidence(program, cache, spec, linked):
-    target = rust_target(program, cache)
-    adopted = linker_map_members(linked)
-    def rust_member(name):
-        return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*-[0-9a-f]{16}\..*\.rcgu\.o", name))
-    wanted = {item["member"] for item in adopted if not rust_member(item["member"])}
-    candidates = {}
-    archive_members = {}
-    active_directories = []
-    for directory in (target / "release/build").iterdir():
-        if not any(str(directory) in argument for argument in linked["linker_arguments"]):
-            continue
-        output = directory / "output"
-        if not output.is_file():
-            continue
-        package_name = directory.name.rsplit("-", 1)[0]
-        owners = [item for item in spec["cargo_packages"] if item["name"] == package_name]
-        text = output.read_text()
-        names = set(re.findall(r"cargo(?:::|:)rustc-link-lib=static(?::[^=\n]+)?=([^\s]+)", text))
-        if not names:
-            continue
-        if len(owners) != 1:
-            raise RuntimeError("实际原生静态库的构建脚本包归属不唯一：" + str(directory))
-        active_directories.append({"directory": str(directory), "package": owners[0], "build_script_output": str(output)})
-        roots = [directory / "out"]
-        roots.extend(Path(value) for value in re.findall(r"cargo(?:::|:)rustc-link-search=(?:native=)?([^\n]+)", text))
-        archives = {archive.resolve() for root in roots if root.is_dir() and (root.resolve() == cache or cache in root.resolve().parents) for name in names for archive in root.rglob("lib" + name + ".a")}
-        for archive in archives:
-            members = archive_index(archive)
-            archive_members[str(archive)] = members
-            for member in wanted.intersection(item["name"] for item in members):
-                candidates.setdefault(member, []).append({"archive": str(archive), "package": owners[0], "build_script_output": str(output), "build_directory": str(directory)})
-    resolved, skipped, seen = [], [], set()
-    sysroot = Path(capture(["rustc", "--print", "sysroot"]))
-    for used in adopted:
-        member, archive = used["member"], Path(used["archive"])
-        if rust_member(member):
-            continue
-        stable = archive
-        if not stable.is_file():
-            choices = [target / "release/deps" / archive.name]
-            choices.extend(sysroot.glob("lib/rustlib/*/lib/" + archive.name))
-            stable = next((choice for choice in choices if choice.is_file()), None)
-        if stable is not None and (sysroot == stable or sysroot in stable.parents or str(stable).startswith(("/usr/", "/lib/"))):
-            ownership = None
-            if not (sysroot == stable or sysroot in stable.parents):
-                aliases = [str(stable)] + ([str(stable)[4:]] if str(stable).startswith("/usr/lib/") else [])
-                query = subprocess.run(["dpkg-query", "-S", *aliases], capture_output=True, text=True)
-                ownership = sorted({line.split(": /", 1)[0] for line in query.stdout.splitlines() if ": /" in line})
-                if not ownership:
-                    raise RuntimeError("实际采用的系统原生归档无法映射已安装软件包：" + str(stable))
-            skipped.append({**used, "stable_archive": str(stable), "system_packages": ownership, "basis": "prebuilt-toolchain-or-system-package"})
-            continue
-        if stable is None:
-            raise RuntimeError("实际链接采用的归档无法回溯稳定原件：" + used["archive"])
-        available = archive_members.get(str(stable))
-        if available is None:
-            available = archive_index(stable)
-            archive_members[str(stable)] = available
-        selected = [item for item in available if item["name"] == member]
-        if len(selected) > 1:
-            symbol = used.get("selection_symbol")
-            selected = [item for item in selected if symbol in item["symbols"]]
-        if len(selected) != 1:
-            raise RuntimeError("实际重复归档成员无法凭Map采用符号与符号表偏移唯一定位：" + str(stable) + "(" + member + ")")
-        bundled = selected[0]
-        bundled_sha = bundled["sha256"]
-        matches = []
-        for candidate in candidates.get(member, []):
-            original = Path(candidate["archive"])
-            original_members = [item for item in archive_members[str(original)] if item["name"] == member and item["sha256"] == bundled_sha]
-            if len(original_members) != 1:
-                continue
-            for obj in original.parent.rglob(Path(member).name):
-                if obj.is_file() and common.sha256(obj) == bundled_sha:
-                    matches.append({**candidate, **used, "archive": str(original), "object": str(obj), "member": member, "object_sha256": bundled_sha, "adopted_archive": used["archive"], "stable_bundle": str(stable), "stable_member_offset": bundled["offset"], "original_member_offset": original_members[0]["offset"], "stable_member_symbols": bundled["symbols"], "original_member_symbols": original_members[0]["symbols"], "dependency_record": str(object_dependency(obj)), "working_directory": str(Path(candidate["package"]["manifest_path"]).parent)})
-        unique = {(item["object"], item["package"]["id"]): item for item in matches}
-        if len(unique) != 1:
-            raise RuntimeError("实际采用的原生成员无法用build-script、原生归档及rlib成员SHA唯一绑定：" + used["archive"] + "(" + member + ")")
-        record = next(iter(unique.values()))
-        key = record["object"]
-        if key not in seen:
-            resolved.append(record)
-            seen.add(key)
-    return {"adopted_native_objects": resolved, "prebuilt_native_members": skipped, "build_script_sources": active_directories, "link_map": linked["link_map"], "link_map_sha256": linked["link_map_sha256"]}
-
-
-def native_compiler(args):
-    arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else list(args.arguments)
-    output = None
-    if "-o" in arguments:
-        index = arguments.index("-o")
-        if index + 1 < len(arguments):
-            output = (Path.cwd() / arguments[index + 1]).resolve()
-    cache = args.records.parent.resolve()
-    kind = "compile" if "-c" in arguments else "link" if "-shared" in arguments else None
-    observed = kind and output is not None and cache in output.parents
-    link_map = None
-    snapshots = []
-    if observed and kind == "compile" and "-MD" not in arguments:
-        arguments.append("-MD")
-    if observed and kind == "link":
-        args.map_dir.mkdir(parents=True, exist_ok=True)
-        link_map = args.map_dir / (hashlib.sha256(str(output).encode()).hexdigest() + ".map")
-        arguments.append("-Wl,-Map=" + str(link_map))
-        for value in arguments:
-            if not value.startswith("-") and value.endswith(".o"):
-                obj = (Path.cwd() / value).resolve()
-                if not obj.is_file():
-                    raise RuntimeError("Boost实际链接对象缺失：" + str(obj))
-                snapshots.append({"path": str(obj), "sha256": common.sha256(obj)})
-    status = subprocess.run([args.compiler, *arguments]).returncode
-    if observed:
-        record = {"kind": kind, "success": status == 0, "compiler_arguments": [args.compiler, *arguments], "working_directory": str(Path.cwd()), "output": str(output), "output_sha256": common.sha256(output) if status == 0 and output.is_file() else None}
-        if status == 0 and kind == "compile":
-            dependency = object_dependency(output)
-            record.update(dependency_record=str(dependency), dependency_sha256=common.sha256(dependency))
-        if status == 0 and kind == "link":
-            if not link_map.is_file():
-                raise RuntimeError("Boost实际共享库链接未产生Map")
-            record.update(link_map=str(link_map), link_map_sha256=common.sha256(link_map), input_objects=snapshots, build_id=re.findall(r"Build ID: (\S+)", capture(["readelf", "--notes", str(output)])))
-        dump(args.records / (hashlib.sha256((str(output) + str(kind)).encode()).hexdigest() + ".json"), record)
-    return status
-
-
-@contextlib.contextmanager
-def diagnostic_command(argv, cwd, cache, link_map):
+def diagnostic_command(argv, link_map):
     arguments = list(map(str, argv))
     if len(arguments) > 1 and arguments[1] == "rustc":
         arguments.insert(arguments.index("--"), "--message-format=json-render-diagnostics")
         arguments.extend(("-C", "link-arg=-Wl,-Map=" + str(link_map)))
-    if Path(arguments[0]).name != "b2":
-        yield arguments
-        return
-    config_arg = next((value for value in arguments if value.startswith("--user-config=")), None)
-    if config_arg is None:
-        raise RuntimeError("Boost审计缺少受管user-config")
-    configuration = Path(config_arg.split("=", 1)[1])
-    original = configuration.read_text()
-    match = re.search(r'using gcc\s*:\s*nuwax\s*:\s*"([^"\n]+)"\s*;', original)
-    if match is None:
-        raise RuntimeError("Boost实际编译器配置无法唯一解析")
-    compiler = match.group(1)
-    records = cache / "audit-boost-commands"
-    wrapper = cache / "audit-tools/boost-cxx"
-    wrapper.parent.mkdir(parents=True, exist_ok=True)
-    command = [sys.executable, str(Path(__file__).resolve()), "native-compiler", "--compiler", compiler, "--records", str(records), "--map-dir", str(cache / "audit-linkmaps/boost"), "--"]
-    wrapper.write_text("#!/bin/sh\nexec " + " ".join(shlex.quote(value) for value in command) + ' "$@"\n')
-    wrapper.chmod(0o755)
-    marker = records / "complete-v1.json"
-    expected = {"recipe": 1, "compiler": compiler, "compiler_sha256": common.sha256(Path(compiler).resolve()), "arguments": [canonical(value, ROOT, cache) for value in arguments], "dependency": "-MD", "link_map": True}
-    try:
-        previous = json.loads(marker.read_text())
-    except (OSError, ValueError):
-        previous = None
-    if previous != expected:
-        arguments.append("-a")
-    arguments.append("-d+2")
-    done = False
-    try:
-        configuration.write_text(original[:match.start(1)] + str(wrapper) + original[match.end(1):])
-        yield arguments
-        done = True
-    finally:
-        configuration.write_text(original)
-        if done:
-            dump(marker, expected)
-            if "install" in arguments:
-                record_boost_installation(arguments, Path(cwd), cache)
+    return arguments
 
 
-def record_boost_installation(arguments, cwd, cache):
-    from scripts.prepare_slam2d_dependencies import BOOST_URL, BOOST_SHA256
-    source = cache / "slam2d-dependencies/boost-source/boost_1_83_0"
-    archive = cache / "slam2d-dependencies/downloads/boost_1_83_0.tar.bz2"
-    prefix = cache / "prefix"
-    if cwd.resolve() != source.resolve() or Path(arguments[0]).resolve() != (source / "b2").resolve() or "--prefix=" + str(prefix) not in arguments:
-        raise RuntimeError("Boost安装命令不属于固定来源与受管前缀")
-    if not archive.is_file() or common.sha256(archive) != BOOST_SHA256:
-        raise RuntimeError("Boost安装缺少固定源码归档摘要证明")
-    components = sorted(value.split("--with-", 1)[1] for value in arguments if value.startswith("--with-"))
-    directories = [prefix / "lib/cmake" / (name + "-1.83.0") for name in ["Boost", "boost_headers", *["boost_" + component for component in components]]]
-    files = {path.relative_to(prefix).as_posix(): common.sha256(path) for directory in directories for path in directory.glob("*.cmake") if path.is_file()}
-    for component in components:
-        files.update({path.relative_to(prefix).as_posix(): common.sha256(path) for path in (prefix / "lib").glob("libboost_" + component + ".so*") if path.is_file()})
-    dump(cache / "audit-boost-install/installation-v1.json", {"source": str(source), "url": BOOST_URL, "sha256": BOOST_SHA256, "prefix": str(prefix), "components": components, "b2_sha256": common.sha256(source / "b2"), "arguments": [canonical(value, ROOT, cache) for value in arguments if value not in ("-a", "-d+2")], "files": files})
+def cargo_build_scripts(spec, linked):
+    """Cargo每次都会报告实际OUT_DIR，fresh也不能靠名称扫描其它版本。"""
+    packages = {item["id"]: item for item in spec["cargo_packages"]}
+    result = []
+    for event in linked.get("build_script_events", []):
+        package = packages.get(event["package_id"])
+        if package is None:
+            raise RuntimeError("本次构建脚本不属于固定Cargo闭包：" + event["package_id"])
+        out = Path(event["out_dir"]).resolve()
+        if not out.is_dir():
+            raise RuntimeError("实际Cargo OUT_DIR缺失：" + str(out))
+        result.append({"package": package, "out_dir": str(out), "linked_libs": event["linked_libs"], "linked_paths": event["linked_paths"]})
+    return result
 
 
-def boost_installation_owner(selected, spec, cache):
-    prefix = cache / "prefix"
-    if prefix not in selected.parents:
-        return None
-    relative = selected.relative_to(prefix).as_posix()
-    if not (relative.startswith("include/boost/") or relative.startswith("lib/libboost_") or re.match(r"lib/cmake/(?:Boost|boost_[A-Za-z0-9_]+)-1\.83\.0/", relative)):
-        return None
-    if "_boost_installation" not in spec:
-        try:
-            record = json.loads((cache / "audit-boost-install/installation-v1.json").read_text())
-        except (OSError, ValueError) as exc:
-            raise RuntimeError("实际Boost安装输入缺少B2安装回执：" + str(selected)) from exc
-        from scripts.prepare_slam2d_dependencies import BOOST_URL, BOOST_SHA256
-        source = cache / "slam2d-dependencies/boost-source/boost_1_83_0"
-        if record["prefix"] != str(prefix) or record["source"] != str(source) or record["url"] != BOOST_URL or record["sha256"] != BOOST_SHA256 or "--prefix=$CACHE/prefix" not in record["arguments"] or "install" not in record["arguments"] or common.sha256(source / "b2") != record["b2_sha256"]:
-            raise RuntimeError("实际Boost安装回执与固定来源/前缀不符")
-        spec["_boost_installation"] = record
-    record = spec["_boost_installation"]
-    expected = record["files"].get(relative)
-    if relative.startswith("include/boost/"):
-        original = Path(record["source"]) / relative[len("include/"):]
-        expected = common.sha256(original) if original.is_file() else None
-    if expected is None or not selected.is_file() or common.sha256(selected) != expected:
-        raise RuntimeError("实际Boost安装输入未被精确安装回执/源码副本覆盖：" + str(selected))
-    return {"kind": "pinned-source", "id": "boost-1.83.0", "root": record["source"], "url": record["url"], "sha256": record["sha256"], "installation_components": record["components"], "installation_receipt": "$CACHE/audit-boost-install/installation-v1.json"}
+def declared_static_archives(spec, linked):
+    result = []
+    for event in cargo_build_scripts(spec, linked):
+        roots = [Path(value.split("=", 1)[-1]) for value in event["linked_paths"]]
+        for value in event["linked_libs"]:
+            if not value.startswith("static=") and not value.startswith("static:"):
+                continue
+            name = value.rsplit("=", 1)[-1]
+            path = next((root / ("lib" + name + ".a") for root in roots if (root / ("lib" + name + ".a")).is_file()), None)
+            if path is None:
+                found = capture(["cc", "-print-file-name=lib" + name + ".a"])
+                path = Path(found) if Path(found).is_absolute() and Path(found).is_file() else None
+            if path is None:
+                raise RuntimeError("实际Cargo静态链接声明无法定位归档：" + value)
+            result.append({"path": str(path.resolve()), "package_id": event["package"]["id"]})
+    return sorted({(item["path"], item["package_id"]): item for item in result}.values(), key=lambda item: (item["path"], item["package_id"]))
 
 
-def boost_native_evidence(private, cache):
-    libraries = {str(path): path for name, path in private.items() if name.startswith("libboost_")}
-    if not libraries:
-        return {"links": [], "objects": []}
-    records = [json.loads(path.read_text()) for path in (cache / "audit-boost-commands").glob("*.json") if path.name != "complete-v1.json"]
-    compiles = {item["output"]: item for item in records if item.get("kind") == "compile" and item.get("success")}
-    result, objects = [], {}
-    for path in libraries.values():
-        digest = common.sha256(path)
-        build_ids = re.findall(r"Build ID: (\S+)", capture(["readelf", "--notes", str(path)]))
-        matches = [item for item in records if item.get("kind") == "link" and item.get("success") and (item["output_sha256"] == digest or build_ids and item.get("build_id") == build_ids)]
-        if len(matches) != 1:
-            raise RuntimeError("Boost私有库缺少唯一的实际编译器/链接图回执：" + str(path))
-        link = matches[0]
-        map_file = Path(link["link_map"])
-        if not map_file.is_file() or common.sha256(map_file) != link["link_map_sha256"]:
-            raise RuntimeError("Boost私有库链接图不存在或被改变")
-        map_text = map_file.read_text()
-        for adopted in link["input_objects"]:
-            obj = Path(adopted["path"])
-            compiled = compiles.get(str(obj))
-            if compiled is None or compiled.get("output_sha256") != adopted["sha256"] or not obj.is_file() or common.sha256(obj) != adopted["sha256"]:
-                raise RuntimeError("Boost实际采用对象无法绑定到编译回执：" + str(obj))
-            if str(obj) not in map_text:
-                raise RuntimeError("Boost对象未出现在该实际共享库链接图：" + str(obj))
-            dependency = Path(compiled["dependency_record"])
-            if not dependency.is_file() or common.sha256(dependency) != compiled["dependency_sha256"]:
-                raise RuntimeError("Boost实际对象的MD依赖记录缺失或改变")
-            objects[str(obj)] = {"object": str(obj), "object_sha256": adopted["sha256"], "dependency_record": str(dependency), "dependency_sha256": compiled["dependency_sha256"], "working_directory": compiled["working_directory"], "compiler_arguments": compiled["compiler_arguments"], "library": str(path)}
-        if not link["input_objects"]:
-            raise RuntimeError("Boost共享库实际链接没有可核对的原生对象")
-        result.append(link)
-    return {"links": result, "objects": sorted(objects.values(), key=lambda item: item["object"])}
+def classify_native_usage(program, cache, spec, linked, records, private):
+    """成员名只用于组件级采用证据，不追逐单成员字节或符号偏移。"""
+    artifact_packages = {Path(path).name: item["package_id"] for item in linked["compiler_artifacts"] for path in item["filenames"]}
+    by_package = {}
+    static = {item["path"]: item["package_id"] for item in declared_static_archives(spec, linked)}
+    for archive, member in re.findall(r"([^\s()]+\.(?:rlib|a))\(([^()\n]+)\)", Path(linked["link_map"]).read_text()):
+        package = artifact_packages.get(Path(archive).name) or static.get(str(Path(archive).resolve()))
+        if package and member.endswith(".o") and not member.endswith(".rcgu.o"):
+            by_package.setdefault(package, set()).add(member)
+    linked["map_native_packages"] = sorted(by_package)
+    runtime = {str(path.resolve()) for path in private.values()}
+    binary = None
+    for record in records:
+        path = Path(record["output"])
+        record["usage"] = "build-component"
+        package = static.get(str(path))
+        if package in by_package:
+            members = set(capture(["ar", "t", str(path)]).splitlines())
+            matched = sorted(members & by_package[package])
+            if matched:
+                record.update(usage="linked-native", map_member_names=matched, package_id=package)
+                runtime.add(str(path))
+        if path.name in {value.name for value in private.values()}:
+            runtime.add(str(path))
+        elif path.is_file() and path.suffix not in (".a", ".so") and ".so." not in path.name and os.access(path, os.X_OK):
+            data = path.read_bytes()
+            if data.startswith(b"\x7fELF"):
+                if binary is None:
+                    binary = (cache / "prefix/bin" / program).read_bytes()
+                if data in binary:
+                    record["usage"] = "embedded-runtime"
+                    runtime.add(str(path))
+    changed = True
+    while changed:
+        changed = False
+        for record in records:
+            if record["output"] in runtime:
+                if record["usage"] == "build-component":
+                    record["usage"] = "runtime-target-link"
+                for item in record["inputs"]:
+                    if item["path"] not in runtime:
+                        runtime.add(item["path"])
+                        changed = True
 
 
 def dependency_records(program, cache, spec, linked):
@@ -828,7 +556,6 @@ def dependency_records(program, cache, spec, linked):
     artifacts = linked.get("compiler_artifacts", [])
     if not artifacts:
         raise RuntimeError("缺少本次Cargo精确产物事件，拒绝扫描共享target推断版本")
-    artifact_owners = {}
     for artifact in artifacts:
         package = packages.get(artifact["package_id"])
         if package is None or Path(artifact["manifest_path"]).resolve() != Path(package["manifest_path"]).resolve():
@@ -838,7 +565,6 @@ def dependency_records(program, cache, spec, linked):
         candidates = set()
         for filename in artifact["filenames"]:
             path = Path(filename)
-            artifact_owners[str(path.resolve())] = package
             name = path.name
             if name.startswith("lib") and path.suffix in (".rlib", ".rmeta", ".so", ".a"):
                 candidates.add(path.with_name(name[3:]).with_suffix(".d"))
@@ -852,22 +578,6 @@ def dependency_records(program, cache, spec, linked):
             raise RuntimeError("本次Cargo精确产物缺少对应Rust依赖记录：" + artifact["package_id"])
         for record in candidates:
             rust_records.setdefault(record, set()).add(package_root)
-    spec["_artifact_owners"] = artifact_owners
-    codegen_owners = {}
-    for command in linked["compiler_commands"]:
-        if "Running `" not in command:
-            continue
-        arguments = shlex.split(command.split("Running `", 1)[1].rsplit("`", 1)[0])
-        if "--crate-name" not in arguments or "--out-dir" not in arguments:
-            continue
-        crate = arguments[arguments.index("--crate-name") + 1]
-        out_dir = Path(arguments[arguments.index("--out-dir") + 1])
-        suffix = next((value.split("=-", 1)[1] for value in arguments if value.startswith("extra-filename=-")), None)
-        manifest_dir = next((value.split("=", 1)[1] for value in arguments if value.startswith("CARGO_MANIFEST_DIR=")), None)
-        owners = {event["package_id"]: packages[event["package_id"]] for event in artifacts if event["target"]["name"].replace("-", "_") == crate and str(Path(event["manifest_path"]).parent) == manifest_dir}
-        if suffix and len(owners) == 1:
-            codegen_owners[str((out_dir / (crate + "-" + suffix)).resolve())] = next(iter(owners.values()))
-    spec["_codegen_owners"] = codegen_owners
     rust_origins = []
     for record, package_roots in sorted(rust_records.items()):
         dependencies = common.dependency_paths(record)
@@ -907,11 +617,10 @@ def dependency_records(program, cache, spec, linked):
         records.append(record)
     linked["rust_dependency_record_origins"] = rust_origins
     actual = common.dependency_paths(records[0])
-    adoption = archive_adoption_evidence(program, cache, spec, linked)
-    # 原始.a即便被rustc bundle进rlib，也必须沿实际成员SHA链回到CMake。
-    actual.extend(item["archive"] for item in adoption["adopted_native_objects"])
+    actual.extend(item["path"] for item in declared_static_archives(spec, linked))
     native, private = native_link_evidence(program, cache, spec, linked, actual)
-    cmake_cwds = {}
+    classify_native_usage(program, cache, spec, linked, native, private)
+    native_objects = []
     for entry in native:
         records.extend((Path(entry["cmake_root"]) / "CMakeFiles").rglob("Makefile.cmake"))
         for item in entry["inputs"]:
@@ -920,21 +629,21 @@ def dependency_records(program, cache, spec, linked):
                 record = object_dependency(obj)
                 records.append(record)
                 record_cwds[str(record.resolve())] = entry["working_directory"]
-                cmake_cwds[str(obj)] = entry["working_directory"]
-    for item in adoption["adopted_native_objects"]:
-        record = Path(item["dependency_record"])
-        item["working_directory"] = cmake_cwds.get(item["object"], item["working_directory"])
-        item["backend"] = "cmake" if item["object"] in cmake_cwds else "build-script-static-archive"
-        records.append(record)
-        record_cwds[str(record.resolve())] = item["working_directory"]
-    boost = boost_native_evidence(private, cache)
-    for item in boost["objects"]:
-        record = Path(item["dependency_record"])
-        records.append(record)
-        record_cwds[str(record.resolve())] = item["working_directory"]
-    linked["native_adoption"] = adoption
-    linked["boost_adoption"] = boost
-    return sorted({path for path in records if path.is_file()}), record_cwds
+                native_objects.append({"object": str(obj), "dependency_record": str(record), "working_directory": entry["working_directory"], "backend": "cmake-link-record", "usage": entry["usage"]})
+    for event in cargo_build_scripts(spec, linked):
+        out = Path(event["out_dir"])
+        for obj in out.rglob("*.o"):
+            # CMake对象由实际link.txt选择；其配置探针不属于cc::Build对象集合。
+            if any((parent / "CMakeCache.txt").is_file() for parent in obj.parents if parent == out or out in parent.parents):
+                continue
+            record = object_dependency(obj)
+            records.append(record)
+            cwd = str(Path(event["package"]["manifest_path"]).parent)
+            record_cwds[str(record.resolve())] = cwd
+            native_objects.append({"object": str(obj), "dependency_record": str(record), "working_directory": cwd, "package_id": event["package"]["id"], "backend": "cargo-build-script"})
+    linked["native_link_records"] = native
+    linked["native_compilation_records"] = native_objects
+    return sorted(set(records)), record_cwds
 
 
 def reject_lio_assets(items):
@@ -951,17 +660,15 @@ def canonical(value, root, cache):
     home = os.environ.get("RUSTUP_HOME")
     if home:
         value = value.replace(home, "$RUSTUP")
-    value = re.sub(r"/tmp/rustc[^/ ]+", "$RUSTC_TEMP", value)
     value = re.sub(r"-[0-9a-f]{32}(?=/|$)", "-<slot>", value)
     value = re.sub(r"-[0-9a-f]{16}(?=[./]|$)", "-<artifact>", value)
-    value = re.sub(r"(?<=/)[0-9a-f]{16}-", "<cc-object>-", value)
     return value
 
 
 def link_arguments(logged, program, binary, cache, link_map=None):
     candidates = []
     compiler = []
-    artifacts = []
+    artifacts, build_scripts = [], []
     for line in logged.splitlines():
         if line.startswith("{"):
             try:
@@ -970,6 +677,8 @@ def link_arguments(logged, program, binary, cache, link_map=None):
                 event = {}
             if event.get("reason") == "compiler-artifact":
                 artifacts.append(event)
+            elif event.get("reason") == "build-script-executed":
+                build_scripts.append(event)
         if line.startswith("LC_ALL=") and '"-o"' in line and program.replace("-", "_") in line:
             arguments = shlex.split(line)
             position = next((i for i, value in enumerate(arguments) if "=" not in value), None)
@@ -998,6 +707,7 @@ def link_arguments(logged, program, binary, cache, link_map=None):
     if not artifacts:
         raise RuntimeError("本次Cargo未提供compiler-artifact事件，无法核对依赖产物")
     result["compiler_artifacts"] = artifacts
+    result["build_script_events"] = build_scripts
     dump(receipt, result)
     return {**result, "captured_this_build": bool(candidates)}
 
@@ -1097,169 +807,152 @@ def pinned_cmake_sources(spec, root):
     return spec["_pinned_cmake_sources"]
 
 
-def source_owner(path, spec, root, cache, program):
+def registered_environment(root, cache, spec, program):
+    """根的身份由镜像/配方/锁文件进入指纹，根内不做安装文件白名单。"""
+    manifest = root / common.PROGRAMS[program]["manifest"]
+    lock = manifest.with_name("Cargo.lock")
+    lock_relative = lock.relative_to(root).as_posix()
+    if not common.covered(lock_relative, spec):
+        raise RuntimeError("登记Cargo环境根的锁文件未进入程序指纹：" + lock_relative)
+    def recipe_identity(relative):
+        if not common.covered(relative, spec):
+            raise RuntimeError("登记环境根的配方未进入程序指纹：" + relative)
+        return {"path": relative, "git_blob": capture(["git", "-C", str(root), "rev-parse", "HEAD:" + relative])}
+    program_identity = {"program": program, "binding": "current program fingerprint+Cargo.lock", "recipe": recipe_identity("scripts/module_installer/builds.py")}
+    entries = []
+    def add(path, kind, identity):
+        entries.append({"path": str(Path(path).resolve()), "kind": kind, "identity": identity})
+    for path in ("/usr", "/lib", "/lib64"):
+        add(path, "system-image", {"binding": "build_identity.image+system_packages"})
+    add(os.environ["RUSTUP_HOME"], "rust-toolchain", {"version": builds.RUST_VERSION})
+    for path in ("/opt/protoc", "/opt/lcm-gen-1.5.2"):
+        if Path(path).is_dir():
+            add(path, "image-tool-prefix", {"binding": "build_identity.image.dockerfile_sha256"})
+    for path in ("registry", "git"):
+        add(cache / "cargo" / path, "cargo-sources", {"lockfile": lock_relative, "sha256": common.sha256(lock)})
+    add(cache / "prefix", "program-build-output", program_identity)
+    if program == "nuwax-slam-2d-worker":
+        from scripts.prepare_slam2d_dependencies import BOOST_URL, BOOST_SHA256, SOURCES, SOURCE_ROLES
+        native_identity = {"recipe": recipe_identity("scripts/prepare_slam2d_dependencies.py"), "boost": {"url": BOOST_URL, "sha256": BOOST_SHA256}, "sources": SOURCES}
+        for path in (cache / "build/slamtec", cache / "slam2d-dependencies/build", cache / "slam2d-dependencies/boost-source/boost_1_83_0"):
+            add(path, "fixed-native-environment", native_identity)
+        registry = cache / "slam2d-dependencies/sources/source-paths-v1.json"
+        if registry.is_file():
+            slots = json.loads(registry.read_text())["slots"]
+            for name, (url, revision) in SOURCES.items():
+                entry = slots.get(SOURCE_ROLES[name])
+                if entry:
+                    if entry["url"] != url or entry["revision"] != revision:
+                        raise RuntimeError("固定原生源码根身份与受审配方不符：" + name)
+                    directory = (registry.parent / common._relative(entry["path"])).resolve()
+                    if registry.parent.resolve() not in directory.parents:
+                        raise RuntimeError("固定原生源码登记根越出受管缓存")
+                    add(directory, "fixed-source-checkout", {"repository": url, "revision": revision, "recipe": native_identity["recipe"]})
+    add(rust_target(program, cache), "cargo-build-output", {"binding": "program fingerprint+Cargo.lock"})
+    add(cache / "compiler-tmp", "compiler-temporary-output", {"version": builds.RUST_VERSION, "binding": "build_identity.image+fixed TMPDIR", "recipe": recipe_identity("scripts/ci/prebuilt.py")})
+    return sorted({json.dumps(item, sort_keys=True): item for item in entries}.values(), key=lambda item: item["path"])
+
+
+def check_registered_path(path, roots):
     selected = Path(path).resolve()
-    for item in spec["cargo_packages"]:
-        directory = Path(item["manifest_path"]).parent.resolve()
-        if selected == directory or directory in selected.parents:
-            return {"kind": "crate" if item["source"] else "repository", "id": item["id"] if item["source"] else item["name"], "root": str(directory), "license": item["license"], "version": item["version"]}
-    if selected == root or root in selected.parents:
-        return {"kind": "repository", "id": selected.relative_to(root).as_posix(), "root": str(root)}
-    artifact_package = spec.get("_artifact_owners", {}).get(str(selected))
-    if artifact_package is None and ("/release/deps/" in str(selected) or str(selected).startswith("/tmp/rustc")):
-        matches = {item["id"]: item for name, item in spec.get("_artifact_owners", {}).items() if Path(name).name == selected.name}
-        if len(matches) == 1:
-            artifact_package = next(iter(matches.values()))
-        elif matches:
-            raise RuntimeError("实际链接Cargo产物无法唯一匹配本次包身份：" + str(selected))
-    codegen = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*-[0-9a-f]{16})\..*\.rcgu\.o", selected.name)
-    if artifact_package is None and codegen:
-        artifact_package = spec.get("_codegen_owners", {}).get(str(selected.parent / codegen.group(1)))
-    if artifact_package:
-        item = artifact_package
-        return {"kind": "compiled-crate", "id": item["id"] if item["source"] else item["name"], "root": str(Path(item["manifest_path"]).parent), "license": item["license"], "version": item["version"]}
-    # Cargo的OUT_DIR是生成输入；来源绑定到实际执行build.rs的包，而非整个cache。
-    match = re.search(r"/release/build/([^/]+)-[0-9a-f]+/out(?:/|$)", str(selected))
-    if match:
-        package = next((item for item in spec["cargo_packages"] if item["name"] == match.group(1)), None)
-        if package:
-            native = Path(package["manifest_path"]).parent
-            upstream = pinned_cmake_sources(spec, root) if "/_deps/" in str(selected) else []
-            for origin in upstream:
-                prefix = str(selected).split("/_deps/", 1)[0]
-                marker = "/_deps/" + origin["name"].lower()
-                if marker + "-src/" in str(selected) or marker + "-build/" in str(selected):
-                    return {"kind": "pinned-source", "id": origin["name"], "root": prefix + marker + "-src", "url": origin["url"], "sha256": origin["sha256"], "recipe": origin["recipe"]}
-            if "/_deps/" in str(selected):
-                raise RuntimeError("生成目录中的外部源码缺少受指纹约束的固定来源：" + str(selected))
-            return {"kind": "generated", "id": package["name"], "root": str(native), "upstream": upstream}
+    candidates = [item for item in roots if selected == Path(item["path"]) or Path(item["path"]) in selected.parents]
+    if not candidates:
+        raise RuntimeError("实际输入不在登记构建环境根内：" + str(selected))
+    return max(candidates, key=lambda item: len(Path(item["path"]).parts))
+
+
+def actual_cargo_packages(spec, linked):
+    packages = {item["id"]: item for item in spec["cargo_packages"]}
+    return [packages[key] for key in sorted({item["package_id"] for item in linked["compiler_artifacts"]})]
+
+
+def component_sources(spec, linked, native_links, private, root, cache):
+    """组件组成来自实际Cargo事件、链接记录和固定内嵌目录。"""
+    from scripts.prepare_slam2d_dependencies import BOOST_URL, BOOST_SHA256
+    components = {}
+    locks = {path: common.sha256(root / path) for path in spec["paths"] if path.endswith("Cargo.lock") and (root / path).is_file()}
+    def add(item):
+        components[item["kind"] + ":" + item["id"]] = item
+    for package in actual_cargo_packages(spec, linked):
+        directory = Path(package["manifest_path"]).parent
+        add({"kind": "crate" if package["source"] else "repository-crate", "id": package["id"], "name": package["name"], "version": package["version"], "source": package["source"], "license": package["license"], "role": "compiled-cargo-package", "dependency_roles": package["dependency_roles"], "native_linked": package["id"] in linked.get("map_native_packages", []), "lockfiles": locks, "root": str(directory), "notice_files": [str(directory / package["license_file"])] if package.get("license_file") else []})
+        for embedded in (directory / "native/upstream", directory / "native/sdk"):
+            if embedded.is_dir() and root in embedded.parents:
+                relative = embedded.relative_to(root).as_posix()
+                add({"kind": "repository-embedded", "id": relative, "tree": capture(["git", "-C", str(root), "rev-parse", "HEAD:" + relative]), "root": str(embedded), "usage": ["linked-native" if package["id"] in linked.get("map_native_packages", []) else "build-component"], "notice_roots": [str(directory), str(embedded.parent), str(embedded)]})
+    add({"kind": "rust-toolchain", "id": "Rust-" + builds.RUST_VERSION, "version": builds.RUST_VERSION, "root": capture(["rustc", "--print", "sysroot"])})
+    for record in native_links:
+        values = cmake_cache_values(Path(record["cmake_root"]) / "CMakeCache.txt")
+        home = Path(values["CMAKE_HOME_DIRECTORY"]).resolve()
+        if root in home.parents:
+            for embedded in (home / "upstream", home / "sdk"):
+                if embedded.is_dir():
+                    relative = embedded.relative_to(root).as_posix()
+                    add({"kind": "repository-embedded", "id": relative, "tree": capture(["git", "-C", str(root), "rev-parse", "HEAD:" + relative]), "root": str(embedded), "usage": [record["usage"]], "notice_roots": [str(home), str(embedded)]})
+    for recipe in pinned_cmake_sources(spec, root):
+        marker = "/_deps/" + recipe["name"].lower()
+        bases = {item["output"].split(marker, 1)[0] for item in native_links if marker in item["output"]}
+        for base in sorted(bases):
+            directory = Path(base + marker + "-src")
+            component = {"kind": "pinned-source", "id": recipe["name"], "root": str(directory), "usage": sorted({item["usage"] for item in native_links if marker in item["output"]}), **{key: recipe[key] for key in ("url", "sha256", "recipe")}}
+            add(component)
+            if recipe["name"].lower() == "gtsam_source":
+                declarations = {
+                    "Cephes": ("gtsam/3rdparty/cephes", ["LICENSE.txt", "README.md", "cephes/readme", "cephes/igami.c", "cephes/lanczos.c", "cephes/lanczos.h"]),
+                    "METIS": ("gtsam/3rdparty/metis", ["LICENSE.txt"]),
+                    "GKlib": ("gtsam/3rdparty/metis/GKlib", ["getopt.c", "gk_mksort.h", "gkregex.c", "gkregex.h"]),
+                }
+                for name, (relative, notices) in declarations.items():
+                    nested = directory / relative
+                    add({"kind": "embedded-component", "id": "GTSAM/" + name, "root": str(nested), "usage": component["usage"], "url": recipe["url"], "sha256": recipe["sha256"], "notice_files": [str(nested / value) for value in notices if (nested / value).is_file()]})
     for source_cache in (cache, cache / "slam2d-dependencies"):
         registry = source_cache / "sources/source-paths-v1.json"
         if registry.is_file():
-            for role, entry in json.loads(registry.read_text())["slots"].items():
-                directory = source_cache / "sources" / entry["path"]
-                if selected == directory or directory in selected.parents:
-                    return {"kind": "pinned-source", "id": role, "root": str(directory), "repository": entry["url"], "revision": entry["revision"]}
-    if "boost-source/boost_1_83_0" in str(selected):
-        from scripts.prepare_slam2d_dependencies import BOOST_URL, BOOST_SHA256
-        directory = Path(str(selected).split("boost_1_83_0", 1)[0] + "boost_1_83_0")
-        return {"kind": "pinned-source", "id": "boost-1.83.0", "root": str(directory), "url": BOOST_URL, "sha256": BOOST_SHA256}
-    if cache / "build/slamtec" in selected.parents:
-        return {"kind": "generated", "id": "slamtec-driver", "root": str(root / "drivers/sensors/slamtec_native")}
-    if cache / "slam2d-dependencies/build" in selected.parents:
-        for parent in selected.parents:
-            cmake_cache = parent / "CMakeCache.txt"
-            if cmake_cache.is_file():
-                match = re.search(r"^CMAKE_HOME_DIRECTORY:INTERNAL=(.+)$", cmake_cache.read_text(), re.MULTILINE)
-                if match:
-                    origin = source_owner(Path(match.group(1)), spec, root, cache, program)
-                    return {**origin, "generated_from": origin["root"]}
-            if parent == cache / "slam2d-dependencies/build":
-                break
-        if cache / "slam2d-dependencies/build/boost" in selected.parents:
-            from scripts.prepare_slam2d_dependencies import BOOST_URL, BOOST_SHA256
-            return {"kind": "pinned-source", "id": "boost-1.83.0", "root": str(cache / "slam2d-dependencies/boost-source/boost_1_83_0"), "url": BOOST_URL, "sha256": BOOST_SHA256}
-    if any(str(selected).startswith(prefix) for prefix in ("/usr/", "/lib/", "/lib64/")):
-        return {"kind": "system", "id": str(selected), "root": "/usr/share/doc"}
-    rustup = os.environ.get("RUSTUP_HOME", "/nonexistent-rustup")
-    if str(selected).startswith(rustup + "/") or str(selected).startswith("/tmp/rustc"):
-        return {"kind": "rust-toolchain", "id": "Rust-" + builds.RUST_VERSION, "root": rustup}
-    if selected == cache / "prefix" or cache / "prefix" in selected.parents:
-        text = str(selected)
-        boost_owner = boost_installation_owner(selected, spec, cache)
-        if boost_owner:
-            return boost_owner
-        role = "slam2d-ceres" if "ceres" in text else "slam2d-onetbb" if "tbb" in text else None
-        registry = cache / "slam2d-dependencies/sources/source-paths-v1.json"
-        if role and registry.is_file():
-            entry = json.loads(registry.read_text())["slots"][role]
-            return {"kind": "pinned-source", "id": role, "root": str(registry.parent / entry["path"]), "repository": entry["url"], "revision": entry["revision"]}
-        directory = root / ("drivers/sensors/slamtec_native" if "slamtec" in text else common.WORKSPACE + "/crates/nuwax-slam-toolbox-sys/native" if "slam_toolbox" in text else "")
-        if directory != root:
-            return {"kind": "repository", "id": directory.relative_to(root).as_posix(), "root": str(directory)}
-    if str(selected).startswith(("/opt/protoc/", "/opt/lcm-gen-1.5.2/")):
-        return {"kind": "build-tool", "id": selected.name, "root": str(selected.parent.parent)}
-    raise RuntimeError("实际编译/链接输入无法映射到受审源码来源：" + str(selected))
+            for role, item in json.loads(registry.read_text())["slots"].items():
+                directory = registry.parent / item["path"]
+                if any(str(directory) in str(value) for record in native_links for value in (cmake_cache_values(Path(record["cmake_root"]) / "CMakeCache.txt").get("CMAKE_HOME_DIRECTORY", ""),)):
+                    add({"kind": "pinned-source", "id": role, "root": str(directory), "repository": item["url"], "revision": item["revision"], "usage": sorted({record["usage"] for record in native_links if str(directory) in cmake_cache_values(Path(record["cmake_root"]) / "CMakeCache.txt").get("CMAKE_HOME_DIRECTORY", "")})})
+    if any(name.startswith("libboost_") for name in private):
+        add({"kind": "pinned-source", "id": "boost-1.83.0", "root": str(cache / "slam2d-dependencies/boost-source/boost_1_83_0"), "url": BOOST_URL, "sha256": BOOST_SHA256, "usage": ["runtime-library"]})
+    return sorted(components.values(), key=lambda item: (item["kind"], item["id"]))
 
 
 def collect_audit(program, spec, checked, linked, root, cache):
     link_inputs = resolve_link_inputs(linked["linker_arguments"], root)
-    adoption = linked.get("native_adoption", {})
-    actual = checked["external_inputs"] + [item["archive"] for item in adoption.get("adopted_native_objects", [])]
-    native_links, private = native_link_evidence(program, cache, spec, linked, actual)
+    native_links = linked["native_link_records"]
+    private = private_libraries(program, cache / "prefix", cache)
     for record in native_links:
         link_inputs.extend(record["inputs"])
-    for item in adoption.get("prebuilt_native_members", []):
-        link_inputs.append({"kind": "adopted-prebuilt-native-archive", "path": item["stable_archive"], "member": item["member"], "exists_after_link": True})
-    for item in adoption.get("adopted_native_objects", []):
-        link_inputs.append({"kind": "adopted-native-object", "path": item["object"], "object_sha256": item["object_sha256"], "exists_after_link": True})
-    for item in linked.get("boost_adoption", {}).get("objects", []):
-        link_inputs.append({"kind": "adopted-native-object", "path": item["object"], "object_sha256": item["object_sha256"], "exists_after_link": True})
-    runtime = {}
+    map_text = Path(linked["link_map"]).read_text()
+    map_archives = sorted(set(re.findall(r"([^\s()]+\.(?:rlib|a))\(", map_text)))
+    link_inputs.extend({"kind": "map-archive", "path": value, "exists_after_link": Path(value).is_file()} for value in map_archives)
+    runtime, private_records = {}, []
     for binary in [cache / "prefix/bin" / program, *private.values()]:
         listing = capture(["ldd", str(binary)])
         if "not found" in listing:
-            raise RuntimeError("实际程序私有库闭包有无法解析的动态依赖")
+            raise RuntimeError("实际程序动态依赖闭包有缺失")
         for name, path in re.findall(r"^\s*(\S+)\s+=>\s+(/\S+)", listing, re.MULTILINE):
-            runtime[str(Path(path).resolve())] = {"kind": "transitive-runtime-library", "name": name, "path": str(Path(path).resolve()), "exists_after_link": True}
-        for path in re.findall(r"^\s*(/\S+)\s+\(", listing, re.MULTILINE):
-            runtime[str(Path(path).resolve())] = {"kind": "runtime-loader", "path": str(Path(path).resolve()), "exists_after_link": True}
+            runtime[str(Path(path).resolve())] = {"kind": "runtime-library", "name": name, "path": str(Path(path).resolve()), "exists_after_link": True}
     link_inputs.extend(runtime.values())
-    private_records = []
+    roots = registered_environment(root, cache, spec, program)
+    for value in checked["external_inputs"] + [item["path"] for item in link_inputs]:
+        selected = Path(value).resolve()
+        if selected == root or root in selected.parents:
+            if not common.covered(selected.relative_to(root).as_posix(), spec):
+                raise RuntimeError("程序指纹漏掉实际链接输入：" + str(selected))
+        else:
+            check_registered_path(selected, roots)
     for name, path in sorted(private.items()):
-        symbols = capture(["readelf", "--wide", "--symbols", str(path)])
-        units = sorted(set(re.findall(r"FILE\s+LOCAL\s+DEFAULT\s+ABS\s+(.+)$", symbols, re.MULTILINE)))
         dynamic = capture(["readelf", "--dynamic", str(path)])
-        notes = capture(["readelf", "--notes", str(path)])
-        origin = source_owner(path, spec, root, cache, program)
-        record = {"name": name, "path": str(path), "sha256": common.sha256(path), "needed": re.findall(r"\(NEEDED\).*\[([^]]+)\]", dynamic), "build_id": re.findall(r"Build ID: (\S+)", notes), "elf_compilation_units": units, "origin": origin, "load": "explicit-dlopen" if name.startswith("libnuwax_slamtec") else "dynamic-dependency"}
-        if name.startswith("libboost_"):
-            evidence = [item for item in linked["boost_adoption"]["objects"] if item["library"] == str(path)]
-            if not evidence:
-                raise RuntimeError("Boost私有库缺少真实MD/对象SHA/链接图证据")
-            record["native_object_evidence"] = evidence
-            record["dependency_basis"] = "compiler-MD + object-SHA + actual-link-map"
-        private_records.append(record)
-        link_inputs.append({"kind": "runtime-private-library", "name": name, "path": str(path), "exists_after_link": True})
-    checked["external_inputs"] = sorted(set(checked["external_inputs"]))
-    cmake_diagnostics = []
-    for directory in sorted({item["cmake_root"] for item in native_links}):
-        receipt = cache / "audit-cmake-configs" / (hashlib.sha256(directory.encode()).hexdigest() + ".json")
-        if receipt.is_file():
-            recorded = json.loads(receipt.read_text())
-            if recorded["build_directory"] != directory or not recorded["success"]:
-                raise RuntimeError("实际原生配置诊断回执与CMake构建根不符")
-            cmake_diagnostics.append(recorded)
-    origins = {}
-    inputs = checked["repository_inputs"] + checked["external_inputs"] + [item["path"] for item in link_inputs]
-    for value in inputs:
-        path = root / value if not Path(value).is_absolute() else Path(value)
-        try:
-            relative = path.resolve().relative_to(root).as_posix()
-        except ValueError:
-            relative = None
-        if relative is not None and not common.covered(relative, spec):
-            raise RuntimeError("程序指纹漏掉实际链接输入：" + relative)
-        owner = source_owner(path, spec, root, cache, program)
-        owner_key = owner["kind"] + ":" + owner["id"]
-        origins[owner_key] = owner
-    return {**checked, "schema": 1, "program": program, "compiler_commands": linked["compiler_commands"], "compiler_artifacts": linked["compiler_artifacts"], "compiled_binary_sha256": linked["binary_sha256"], "link_record_origin": "executed" if linked["captured_this_build"] else "binary-sha-matched-cache", "linker_arguments": linked["linker_arguments"], "link_inputs": link_inputs, "native_link_records": native_links, "cmake_configuration_diagnostics": cmake_diagnostics, "native_archive_adoption": adoption, "rust_dependency_record_origins": linked.get("rust_dependency_record_origins", []), "boost_native_adoption": linked.get("boost_adoption", {}), "boost_installation": spec.get("_boost_installation"), "private_library_records": private_records, "external_sources": sorted(origins.values(), key=lambda item: (item["kind"], item["id"])), "cargo_resolution": spec["cargo_packages"], "source_revision": capture(["git", "-C", str(root), "rev-parse", "HEAD"])}
+        private_records.append({"name": name, "path": str(path), "sha256": common.sha256(path), "needed": re.findall(r"\(NEEDED\).*\[([^]]+)\]", dynamic), "build_id": re.findall(r"Build ID: (\S+)", capture(["readelf", "--notes", str(path)])), "environment": check_registered_path(path, roots), "load": "explicit-dlopen" if name.startswith("libnuwax_slamtec") else "dynamic-dependency"})
+    components = component_sources(spec, linked, native_links, private, root, cache)
+    return {**checked, "schema": 2, "program": program, "compiler_commands": linked["compiler_commands"], "compiler_artifacts": linked["compiler_artifacts"], "build_script_events": linked["build_script_events"], "compiled_binary_sha256": linked["binary_sha256"], "link_record_origin": "executed" if linked["captured_this_build"] else "binary-sha-matched-cache", "linker_arguments": linked["linker_arguments"], "link_inputs": link_inputs, "native_link_records": native_links, "native_compilation_records": linked["native_compilation_records"], "rust_dependency_record_origins": linked["rust_dependency_record_origins"], "environment_roots": roots, "private_library_records": private_records, "external_sources": components, "cargo_resolution": actual_cargo_packages(spec, linked), "source_revision": capture(["git", "-C", str(root), "rev-parse", "HEAD"])}
 
 
 def review_key(audit, root, cache):
-    def normal(value):
-        value = canonical(value, root, cache)
-        value = re.sub(r"[^/ ]+\.rcgu\.o", "<rust-codegen>.o", value)
-        value = re.sub(r"\$RUSTC_TEMP/[^/ ]+", "$RUSTC_TEMP/<generated-object>", value)
-        return value
-    payload = {
-        "repository_inputs": sorted(audit["repository_inputs"]),
-        "external_sources": sorted({json.dumps({key: normal(str(value)) for key, value in source.items() if key != "root"}, sort_keys=True) for source in audit["external_sources"]}),
-        "link_inputs": sorted({normal(item["path"]) for item in audit["link_inputs"]}),
-        "licenses": sorted((item["source"], item["sha256"]) for item in audit["license_files"]),
-        "system_packages": audit["system_packages_used"],
-    }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    identities = [{key: value for key, value in item.items() if key not in ("root", "notice_roots", "notice_files")} for item in audit["external_sources"]]
+    payload = {"repository_inputs": sorted(audit["repository_inputs"]), "components": sorted(json.dumps(item, sort_keys=True) for item in identities), "native_libraries": sorted(item["name"] for item in audit["private_library_records"]), "licenses": sorted((item["source"], item["sha256"]) for item in audit["license_files"]), "system_packages": audit["system_packages_used"]}
+    return hashlib.sha256(canonical(json.dumps(payload, sort_keys=True), root, cache).encode()).hexdigest()
 
 
 def require_license_review(indexes, policy_path):
@@ -1327,37 +1020,36 @@ def build(args):
                 continue
             migrations = migrate_cmake_diagnostics(program, cache, spec)
             dump(output / ("cmake-migrations-" + program + ".json"), migrations)
-            link_map = cache / "audit-linkmaps" / (program + ".map")
+            link_map = cache / "compiler-tmp/linkmaps" / (program + ".map")
             link_map.parent.mkdir(parents=True, exist_ok=True)
             log_path = output / (program + ".build.log")
             with log_path.open("w", encoding="utf-8") as log:
                 def recording_run(argv, *, cwd=None, env=None):
-                    with diagnostic_command(argv, cwd, cache, link_map) as actual_argv:
-                        log.write("执行：" + " ".join(map(str, actual_argv)) + "\n")
+                    actual_argv = diagnostic_command(argv, link_map)
+                    log.write("执行：" + " ".join(map(str, actual_argv)) + "\n")
+                    log.flush()
+                    process = subprocess.Popen(actual_argv, cwd=cwd, env={**os.environ, **(env or {})}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                    try:
+                        for line in process.stdout:
+                            sys.stdout.write(line)
+                            sys.stdout.flush()
+                            log.write(line)
+                        status = process.wait()
+                    finally:
+                        process.stdout.close()
                         log.flush()
-                        process = subprocess.Popen(actual_argv, cwd=cwd, env={**os.environ, **(env or {})}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                        try:
-                            for line in process.stdout:
-                                sys.stdout.write(line)
-                                sys.stdout.flush()
-                                log.write(line)
-                            status = process.wait()
-                        finally:
-                            process.stdout.close()
-                            log.flush()
-                            if process.poll() is None:
-                                process.kill()
-                                process.wait()
-                        if status:
-                            raise subprocess.CalledProcessError(status, argv)
+                        if process.poll() is None:
+                            process.kill()
+                            process.wait()
+                    if status:
+                        raise subprocess.CalledProcessError(status, argv)
                 builds.build_modules(root, prefix, cache, [recipe["module"]], args.jobs, recording_run, local_build=True, programs=[program], capture_link_args=True)
             shutil.copyfile(prefix / "bin" / program, output / (program + ".elf"))
             linked = link_arguments(log_path.read_text(), program, prefix / "bin" / program, cache, link_map)
             shutil.copyfile(link_map, output / (program + ".link.map"))
             dump(output / ("audit-" + program + ".json"), {"program": program, "link_record": linked, "status": "dependency-record-mapping-in-progress"})
             records, record_cwds = dependency_records(program, cache, spec, linked)
-            generated = [cache / path for path in ("build", "sources", "slam2d-dependencies", "prefix", "cargo/registry", "cargo/git")]
-            generated.extend((Path(os.environ["RUSTUP_HOME"]), Path("/opt/protoc"), Path("/opt/lcm-gen-1.5.2")))
+            roots = registered_environment(root, cache, spec, program)
             dependency_artifacts = []
             for record in records:
                 name = hashlib.sha256(str(record).encode()).hexdigest() + record.suffix
@@ -1365,11 +1057,7 @@ def build(args):
                 saved.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(record, saved)
                 dependency_artifacts.append({"source": str(record), "artifact": saved.relative_to(output).as_posix(), "sha256": common.sha256(record), "working_directory": record_cwds.get(str(record.resolve()), str(root))})
-            for native_map in linked["boost_adoption"]["links"]:
-                saved = output / "native-maps" / (program + "-" + Path(native_map["link_map"]).name)
-                saved.parent.mkdir(exist_ok=True)
-                shutil.copyfile(native_map["link_map"], saved)
-            checked = common.audit_dependencies(root, spec, records, generated_roots=generated, record_cwds=record_cwds)
+            checked = common.audit_dependencies(root, spec, records, environment_roots=roots, record_cwds=record_cwds)
             dump(output / ("audit-" + program + ".json"), {**checked, "link_record": linked, "status": "source-mapping-in-progress"})
             audit = collect_audit(program, spec, checked, linked, root, cache)
             audit.update(platform=args.platform, fingerprint=value, dependency_record_artifacts=dependency_artifacts, cmake_diagnostic_migrations=migrations)
@@ -1524,11 +1212,6 @@ def main():
     command.add_argument("--cmake", required=True)
     command.add_argument("--cache", type=Path, required=True)
     command.add_argument("arguments", nargs=argparse.REMAINDER)
-    command = commands.add_parser("native-compiler")
-    command.add_argument("--compiler", required=True)
-    command.add_argument("--records", type=Path, required=True)
-    command.add_argument("--map-dir", type=Path, required=True)
-    command.add_argument("arguments", nargs=argparse.REMAINDER)
     command = commands.add_parser("publish")
     command.add_argument("--repository", required=True)
     command.add_argument("--revision", required=True)
@@ -1536,8 +1219,6 @@ def main():
     args = parser.parse_args()
     if args.command == "native-cmake":
         return native_cmake(args)
-    if args.command == "native-compiler":
-        return native_compiler(args)
     if args.command == "probe":
         probe(args.output)
     else:

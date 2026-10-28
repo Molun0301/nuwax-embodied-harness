@@ -169,6 +169,26 @@ def main():
         report = common.audit_dependencies(root, {"paths": ["declared", "outside"], "exclude": []}, [record])
         assert report["coverage"] == "complete"
 
+        # 登记的是固定环境根，Boost配置名和新子路径无需逐文件安装回执。
+        environment = base / "fixed-environment"
+        headers = [environment / "lib/cmake/Boost-1.83.0/BoostConfig.cmake", environment / "lib/cmake/BoostDetectToolset-1.83.0.cmake", environment / "new/arbitrary/input.inc"]
+        for index, header in enumerate(headers):
+            header.parent.mkdir(parents=True, exist_ok=True)
+            header.write_text("#define ENV_NUMBER_" + str(index) + " 7\n")
+        source = root / "declared/environment.c"
+        source.write_text("".join('#include "' + str(path) + '"\n' for path in headers) + "int value(void){return ENV_NUMBER_0+ENV_NUMBER_1+ENV_NUMBER_2;}\n")
+        external_record = base / "external.d"
+        run(["cc", "-MD", "-MF", external_record, "-c", source, "-o", base / "external.o"])
+        system_roots = [Path("/usr"), Path("/lib"), Path("/lib64")]
+        try:
+            common.audit_dependencies(root, {"paths": ["declared"], "exclude": []}, [external_record], environment_roots=system_roots)
+        except RuntimeError as exc:
+            assert str(environment) in str(exc)
+        else:
+            raise AssertionError("登记根之外的真实编译输入必须拒绝")
+        checked = common.audit_dependencies(root, {"paths": ["declared"], "exclude": []}, [external_record], environment_roots=[*system_roots, environment])
+        assert all(str(path) in checked["external_inputs"] for path in headers)
+
         with mock.patch.object(common, "_urlopen", side_effect=urllib.error.HTTPError("https://github.com/", 404, "pending", {}, None)):
             try:
                 common.fetch_index("example/repository", revision)
@@ -183,7 +203,7 @@ def main():
                 pass
             else:
                 raise AssertionError("网络故障必须与云端待编译分开")
-    print("预编译隔离行为检查通过：T1/T2指纹与零下载；T3/T4本机回退；T5真实编译器漏输入拒绝；索引等待与网络故障区分。")
+    print("预编译隔离行为检查通过：T1/T2指纹与零下载；T3/T4本机回退；T5真实编译器漏输入拒绝；登记环境根核查；索引等待与网络故障区分。")
 
 
 if __name__ == "__main__":

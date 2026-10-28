@@ -185,15 +185,16 @@ def discover_inputs(root: Path, program: str, cargo: Path, environment: Mapping,
     pending = [key for key, item in packages.items() if item["name"] == recipe["package"] and item.get("source") is None]
     if len(pending) != 1:
         raise RuntimeError("Cargo无法唯一确定程序包：" + program)
-    seen = set()
-    cargo_packages = []
+    pending = [(pending[0], "runtime")]
+    seen, roles, cargo_packages = set(), {}, {}
     while pending:
-        key = pending.pop()
-        if key in seen:
+        key, role = pending.pop()
+        if (key, role) in seen:
             continue
-        seen.add(key)
+        seen.add((key, role))
+        roles.setdefault(key, set()).add(role)
         item = packages[key]
-        cargo_packages.append({field: item.get(field) for field in ("id", "name", "version", "source", "license", "manifest_path")})
+        cargo_packages[key] = {field: item.get(field) for field in ("id", "name", "version", "source", "license", "license_file", "manifest_path")}
         if item.get("source") is None:
             directory = Path(item["manifest_path"]).parent.relative_to(root).as_posix()
             paths.add(directory)
@@ -208,8 +209,13 @@ def discover_inputs(root: Path, program: str, cargo: Path, environment: Mapping,
             if directory == WORKSPACE + "/crates/nuwax-lio-backends":
                 excluded.append(directory + "/native")
         for dependency in nodes[key].get("deps", []):
-            if any(kind["kind"] != "dev" for kind in dependency["dep_kinds"]):
-                pending.append(dependency["pkg"])
+            destination = dependency["pkg"]
+            proc_macro = any("proc-macro" in target["kind"] for target in packages[destination]["targets"])
+            for kind in dependency["dep_kinds"]:
+                if kind["kind"] != "dev":
+                    pending.append((destination, "build" if role == "build" or kind["kind"] == "build" or proc_macro else "runtime"))
+    for key, item in cargo_packages.items():
+        item["dependency_roles"] = sorted(roles[key])
     paths.update((manifest, str(PurePosixPath(manifest).with_name("Cargo.lock")), WORKSPACE + "/Cargo.toml", WORKSPACE + "/build_support", WORKSPACE + "/lcmtypes", "services/navigation/proto", "services/geometry/nuwax_geometry_runtime/proto"))
     if program == "nuwax-slam-2d-worker":
         paths.update(("scripts/prepare_slam2d_dependencies.py", "drivers/sensors/slamtec_native"))
@@ -217,7 +223,7 @@ def discover_inputs(root: Path, program: str, cargo: Path, environment: Mapping,
     for config in (".cargo", "rust-toolchain", "rust-toolchain.toml"):
         if (root / config).exists():
             paths.add(config)
-    return {"paths": sorted(paths), "exclude": sorted(excluded), "cargo_packages": sorted(cargo_packages, key=lambda item: item["id"])}
+    return {"paths": sorted(paths), "exclude": sorted(set(excluded)), "cargo_packages": sorted(cargo_packages.values(), key=lambda item: item["id"])}
 
 
 def fingerprint(root: Path, program: str, target_platform: str, input_spec: Mapping, build_identity: Mapping) -> str:
@@ -242,7 +248,7 @@ def fingerprint(root: Path, program: str, target_platform: str, input_spec: Mapp
         entries.append([relative, metadata.decode("ascii")])
     if not entries:
         raise ValueError("指纹范围未包含任何受版本控制的源码")
-    payload = {"schema": SCHEMA, "program": program, "platform": target_platform, "recipe": PROGRAMS[program], "input_spec": {"paths": sorted(paths), "exclude": sorted(excluded)}, "git_tree": sorted(entries), "build_identity": build_identity}
+    payload = {"schema": SCHEMA, "program": program, "platform": target_platform, "recipe": PROGRAMS[program], "input_spec": {"paths": sorted(paths), "exclude": sorted(set(excluded))}, "git_tree": sorted(entries), "build_identity": build_identity}
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
@@ -262,10 +268,10 @@ def dependency_paths(record: Path) -> list:
     return result
 
 
-def audit_dependencies(root: Path, input_spec: Mapping, records: Iterable[Path], *, generated_roots: Iterable[Path] = (), record_cwds: Optional[Mapping] = None) -> dict:
+def audit_dependencies(root: Path, input_spec: Mapping, records: Iterable[Path], *, environment_roots: Iterable[Path] = (), record_cwds: Optional[Mapping] = None) -> dict:
     """不自动把漏算输入加入范围；失败必须由维护者修正声明并重新编译。"""
     root = Path(root).resolve()
-    generated = [Path(item).resolve() for item in generated_roots]
+    registered = [Path(item["path"] if isinstance(item, Mapping) else item).resolve() for item in environment_roots]
     seen, external, missing, record_count = set(), set(), set(), 0
     for record in records:
         record_count += 1
@@ -274,20 +280,24 @@ def audit_dependencies(root: Path, input_spec: Mapping, records: Iterable[Path],
             if not path.is_absolute():
                 base = Path((record_cwds or {}).get(str(record.resolve()), root))
                 path = base / path
+            lexical = Path(os.path.abspath(path))
+            if root == lexical or root in lexical.parents:
+                relative = lexical.relative_to(root).as_posix()
+                if covered(relative, input_spec):
+                    seen.add(relative)
+                else:
+                    missing.add(relative)
             absolute = path.resolve()
             try:
                 relative = absolute.relative_to(root).as_posix()
             except ValueError:
                 external.add(str(absolute))
-                resolved = absolute.resolve()
-                if not any(resolved == allowed or allowed in resolved.parents for allowed in generated):
-                    if not any(resolved == Path(base) or Path(base) in resolved.parents for base in ("/usr", "/lib", "/lib64", "/opt/rust")):
-                        missing.add(str(absolute))
+                if not any(absolute == allowed or allowed in absolute.parents for allowed in registered):
+                    missing.add(str(absolute))
                 continue
             if not covered(relative, input_spec):
-                # 独立target若在仓库内仍为生成物，不能将整个仓库作为白名单。
-                if not any(absolute == allowed or allowed in absolute.parents for allowed in generated):
-                    missing.add(relative)
+                # 仓内路径始终属于程序指纹核查，登记外部根不能放宽仓内范围。
+                missing.add(relative)
             else:
                 seen.add(relative)
     if not record_count or not seen:

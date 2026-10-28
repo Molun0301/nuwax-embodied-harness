@@ -100,7 +100,7 @@ def identity(platform_key, root):
         "system_packages": capture(["dpkg-query", "-W", "-f=${binary:Package}=${Version}\n"]),
         "image": {"base": base_image, "dockerfile_sha256": common.sha256(root / "scripts/ci/prebuilt" / (platform_key + ".Dockerfile"))},
         # 不含路径和并行数；它们不改变代码语义，源码内优化配置由Git树覆盖。
-        "parameters": {"cargo": ["rustc", "--locked", "--release", "-vv", "--print=link-args", "-Clink-arg=-Wl,-Map=$CACHE/audit-linkmaps/<program>.map"], "native_diagnostics": {"dependency": "-MD", "boost_compiler_wrapper": 1, "boost_map": "$CACHE/audit-linkmaps/boost/<output-digest>.map"}, "cmake": ["CMAKE_BUILD_TYPE=Release", "CMAKE_GENERATOR=Unix Makefiles"], "environment": {name: os.environ.get(name, "") for name in ("RUSTFLAGS", "CFLAGS", "CXXFLAGS", "LDFLAGS", "NUWAX_CXX20", "CC_ENABLE_DEBUG_OUTPUT")}},
+        "parameters": {"cargo": ["rustc", "--locked", "--release", "-vv", "--message-format=json-render-diagnostics", "--print=link-args", "-Clink-arg=-Wl,-Map=$CACHE/audit-linkmaps/<program>.map"], "native_diagnostics": {"dependency": "-MD", "boost_compiler_wrapper": 1, "boost_map": "$CACHE/audit-linkmaps/boost/<output-digest>.map"}, "cmake": ["CMAKE_BUILD_TYPE=Release", "CMAKE_GENERATOR=Unix Makefiles"], "environment": {name: os.environ.get(name, "") for name in ("RUSTFLAGS", "CFLAGS", "CXXFLAGS", "LDFLAGS", "NUWAX_CXX20", "CC_ENABLE_DEBUG_OUTPUT")}},
     }
 
 
@@ -387,6 +387,65 @@ def object_dependency(path):
     raise RuntimeError("实际采用的原生对象缺少编译器依赖记录（object.d/object.o.d）：" + str(path))
 
 
+def archive_index(path):
+    """读取普通GNU/BSD归档的真实成员偏移与符号表，保留重复成员名。"""
+    members, tables, names = [], [], b""
+    with path.open("rb") as source:
+        if source.read(8) != b"!<arch>\n":
+            raise RuntimeError("实际采用的原生归档不是受支持的普通ar格式：" + str(path))
+        while True:
+            offset = source.tell()
+            header = source.read(60)
+            if not header:
+                break
+            if len(header) != 60 or header[58:] != b"`\n":
+                raise RuntimeError("原生归档成员头损坏：" + str(path))
+            label = header[:16].decode("utf-8").strip()
+            size = int(header[48:58])
+            if size < 0 or offset + 60 + size > path.stat().st_size:
+                raise RuntimeError("原生归档成员大小越界：" + str(path))
+            data_offset = source.tell()
+            if label == "//":
+                names = source.read(size)
+            elif label in ("/", "/SYM64/"):
+                tables.append((8 if label == "/SYM64/" else 4, source.read(size)))
+            else:
+                name, payload_size = label.rstrip("/"), size
+                if label.startswith("#1/"):
+                    length = int(label[3:])
+                    name = source.read(length).rstrip(b"\0").decode("utf-8")
+                    data_offset += length
+                    payload_size -= length
+                elif label.startswith("/"):
+                    position = int(label[1:])
+                    name = names[position:].split(b"/\n", 1)[0].rstrip(b"\0").decode("utf-8")
+                digest = hashlib.sha256()
+                remaining = payload_size
+                while remaining:
+                    block = source.read(min(1024 * 1024, remaining))
+                    if not block:
+                        raise RuntimeError("原生归档成员被截断：" + str(path))
+                    digest.update(block)
+                    remaining -= len(block)
+                members.append({"name": name, "offset": offset, "data_offset": data_offset, "size": payload_size, "sha256": digest.hexdigest(), "symbols": []})
+            source.seek(offset + 60 + size + size % 2)
+    by_offset = {item["offset"]: item for item in members}
+    for width, table in tables:
+        count = int.from_bytes(table[:width], "big")
+        end = width * (count + 1)
+        if end > len(table):
+            raise RuntimeError("原生归档符号表长度无效：" + str(path))
+        symbols = table[end:].split(b"\0")
+        if len(symbols) < count:
+            raise RuntimeError("原生归档符号表被截断：" + str(path))
+        for index in range(count):
+            offset = int.from_bytes(table[width * (index + 1):width * (index + 2)], "big")
+            if offset not in by_offset:
+                raise RuntimeError("原生归档符号指向未知成员偏移：" + str(path))
+            by_offset[offset]["symbols"].append(symbols[index].decode("utf-8"))
+    return members
+
+
 def linker_map_members(linked):
     path = Path(linked.get("link_map", "/nonexistent-link-map"))
     if not path.is_file() or common.sha256(path) != linked.get("link_map_sha256"):
@@ -394,8 +453,31 @@ def linker_map_members(linked):
     text = path.read_text(encoding="utf-8", errors="strict")
     if "Archive member included" not in text and "Linker script and memory map" not in text:
         raise RuntimeError("无法解析实际GNU链接图格式")
-    members = sorted(set(re.findall(r"([^\s()]+\.(?:rlib|a))\(([^()\n]+)\)", text)))
-    return [{"archive": archive, "member": member} for archive, member in members if member.endswith((".o", ".obj", ".oS", ".os"))]
+    pattern = r"([^\s()]+\.(?:rlib|a))\(([^()\n]+)\)"
+    selections, pending = {}, None
+    if "Archive member included" in text:
+        header = text.split("Archive member included", 1)[1].split("\n", 1)[1]
+        for line in header.splitlines():
+            match = re.match(pattern, line)
+            if match:
+                pending = {"archive": match.group(1), "member": match.group(2), "map_reference": line}
+                selections.setdefault((match.group(1), match.group(2)), []).append(pending)
+                tail = line[match.end():]
+            elif pending is not None and line.startswith(" "):
+                pending["map_reference"] += "\n" + line
+                tail = line
+            elif line and not line.startswith(" "):
+                break
+            else:
+                continue
+            symbol = re.search(r"\s\((.+)\)\s*$", tail)
+            if symbol:
+                pending["selection_symbol"] = symbol.group(1)
+    result = []
+    for archive, member in sorted(set(re.findall(pattern, text))):
+        if member.endswith((".o", ".obj", ".oS", ".os")):
+            result.extend(selections.get((archive, member), [{"archive": archive, "member": member}]))
+    return result
 
 
 def archive_adoption_evidence(program, cache, spec, linked):
@@ -426,9 +508,9 @@ def archive_adoption_evidence(program, cache, spec, linked):
         roots.extend(Path(value) for value in re.findall(r"cargo(?:::|:)rustc-link-search=(?:native=)?([^\n]+)", text))
         archives = {archive.resolve() for root in roots if root.is_dir() and (root.resolve() == cache or cache in root.resolve().parents) for name in names for archive in root.rglob("lib" + name + ".a")}
         for archive in archives:
-            members = capture(["ar", "t", str(archive)]).splitlines()
+            members = archive_index(archive)
             archive_members[str(archive)] = members
-            for member in wanted.intersection(members):
+            for member in wanted.intersection(item["name"] for item in members):
                 candidates.setdefault(member, []).append({"archive": str(archive), "package": owners[0], "build_script_output": str(output), "build_directory": str(directory)})
     resolved, skipped, seen = [], [], set()
     sysroot = Path(capture(["rustc", "--print", "sysroot"]))
@@ -455,21 +537,25 @@ def archive_adoption_evidence(program, cache, spec, linked):
             raise RuntimeError("实际链接采用的归档无法回溯稳定原件：" + used["archive"])
         available = archive_members.get(str(stable))
         if available is None:
-            available = capture(["ar", "t", str(stable)]).splitlines()
+            available = archive_index(stable)
             archive_members[str(stable)] = available
-        if available.count(member) != 1:
-            raise RuntimeError("实际rlib/归档成员不唯一或不存在：" + str(stable) + "(" + member + ")")
-        bundled_sha = hashlib.sha256(subprocess.check_output(["ar", "p", str(stable), member])).hexdigest()
+        selected = [item for item in available if item["name"] == member]
+        if len(selected) > 1:
+            symbol = used.get("selection_symbol")
+            selected = [item for item in selected if symbol in item["symbols"]]
+        if len(selected) != 1:
+            raise RuntimeError("实际重复归档成员无法凭Map采用符号与符号表偏移唯一定位：" + str(stable) + "(" + member + ")")
+        bundled = selected[0]
+        bundled_sha = bundled["sha256"]
         matches = []
         for candidate in candidates.get(member, []):
             original = Path(candidate["archive"])
-            if archive_members[str(original)].count(member) != 1:
-                continue
-            if hashlib.sha256(subprocess.check_output(["ar", "p", str(original), member])).hexdigest() != bundled_sha:
+            original_members = [item for item in archive_members[str(original)] if item["name"] == member and item["sha256"] == bundled_sha]
+            if len(original_members) != 1:
                 continue
             for obj in original.parent.rglob(Path(member).name):
                 if obj.is_file() and common.sha256(obj) == bundled_sha:
-                    matches.append({**candidate, "object": str(obj), "member": member, "object_sha256": bundled_sha, "adopted_archive": used["archive"], "stable_bundle": str(stable), "dependency_record": str(object_dependency(obj)), "working_directory": str(Path(candidate["package"]["manifest_path"]).parent)})
+                    matches.append({**candidate, **used, "archive": str(original), "object": str(obj), "member": member, "object_sha256": bundled_sha, "adopted_archive": used["archive"], "stable_bundle": str(stable), "stable_member_offset": bundled["offset"], "original_member_offset": original_members[0]["offset"], "stable_member_symbols": bundled["symbols"], "original_member_symbols": original_members[0]["symbols"], "dependency_record": str(object_dependency(obj)), "working_directory": str(Path(candidate["package"]["manifest_path"]).parent)})
         unique = {(item["object"], item["package"]["id"]): item for item in matches}
         if len(unique) != 1:
             raise RuntimeError("实际采用的原生成员无法用build-script、原生归档及rlib成员SHA唯一绑定：" + used["archive"] + "(" + member + ")")
@@ -523,6 +609,7 @@ def native_compiler(args):
 def diagnostic_command(argv, cwd, cache, link_map):
     arguments = list(map(str, argv))
     if len(arguments) > 1 and arguments[1] == "rustc":
+        arguments.insert(arguments.index("--"), "--message-format=json-render-diagnostics")
         arguments.extend(("-C", "link-arg=-Wl,-Map=" + str(link_map)))
     if Path(arguments[0]).name != "b2":
         yield arguments
@@ -560,6 +647,52 @@ def diagnostic_command(argv, cwd, cache, link_map):
         configuration.write_text(original)
         if done:
             dump(marker, expected)
+            if "install" in arguments:
+                record_boost_installation(arguments, Path(cwd), cache)
+
+
+def record_boost_installation(arguments, cwd, cache):
+    from scripts.prepare_slam2d_dependencies import BOOST_URL, BOOST_SHA256
+    source = cache / "slam2d-dependencies/boost-source/boost_1_83_0"
+    archive = cache / "slam2d-dependencies/downloads/boost_1_83_0.tar.bz2"
+    prefix = cache / "prefix"
+    if cwd.resolve() != source.resolve() or Path(arguments[0]).resolve() != (source / "b2").resolve() or "--prefix=" + str(prefix) not in arguments:
+        raise RuntimeError("Boost安装命令不属于固定来源与受管前缀")
+    if not archive.is_file() or common.sha256(archive) != BOOST_SHA256:
+        raise RuntimeError("Boost安装缺少固定源码归档摘要证明")
+    components = sorted(value.split("--with-", 1)[1] for value in arguments if value.startswith("--with-"))
+    directories = [prefix / "lib/cmake" / (name + "-1.83.0") for name in ["Boost", "boost_headers", *["boost_" + component for component in components]]]
+    files = {path.relative_to(prefix).as_posix(): common.sha256(path) for directory in directories for path in directory.glob("*.cmake") if path.is_file()}
+    for component in components:
+        files.update({path.relative_to(prefix).as_posix(): common.sha256(path) for path in (prefix / "lib").glob("libboost_" + component + ".so*") if path.is_file()})
+    dump(cache / "audit-boost-install/installation-v1.json", {"source": str(source), "url": BOOST_URL, "sha256": BOOST_SHA256, "prefix": str(prefix), "components": components, "b2_sha256": common.sha256(source / "b2"), "arguments": [canonical(value, ROOT, cache) for value in arguments if value not in ("-a", "-d+2")], "files": files})
+
+
+def boost_installation_owner(selected, spec, cache):
+    prefix = cache / "prefix"
+    if prefix not in selected.parents:
+        return None
+    relative = selected.relative_to(prefix).as_posix()
+    if not (relative.startswith("include/boost/") or relative.startswith("lib/libboost_") or re.match(r"lib/cmake/(?:Boost|boost_[A-Za-z0-9_]+)-1\.83\.0/", relative)):
+        return None
+    if "_boost_installation" not in spec:
+        try:
+            record = json.loads((cache / "audit-boost-install/installation-v1.json").read_text())
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("实际Boost安装输入缺少B2安装回执：" + str(selected)) from exc
+        from scripts.prepare_slam2d_dependencies import BOOST_URL, BOOST_SHA256
+        source = cache / "slam2d-dependencies/boost-source/boost_1_83_0"
+        if record["prefix"] != str(prefix) or record["source"] != str(source) or record["url"] != BOOST_URL or record["sha256"] != BOOST_SHA256 or "--prefix=$CACHE/prefix" not in record["arguments"] or "install" not in record["arguments"] or common.sha256(source / "b2") != record["b2_sha256"]:
+            raise RuntimeError("实际Boost安装回执与固定来源/前缀不符")
+        spec["_boost_installation"] = record
+    record = spec["_boost_installation"]
+    expected = record["files"].get(relative)
+    if relative.startswith("include/boost/"):
+        original = Path(record["source"]) / relative[len("include/"):]
+        expected = common.sha256(original) if original.is_file() else None
+    if expected is None or not selected.is_file() or common.sha256(selected) != expected:
+        raise RuntimeError("实际Boost安装输入未被精确安装回执/源码副本覆盖：" + str(selected))
+    return {"kind": "pinned-source", "id": "boost-1.83.0", "root": record["source"], "url": record["url"], "sha256": record["sha256"], "installation_components": record["components"], "installation_receipt": "$CACHE/audit-boost-install/installation-v1.json"}
 
 
 def boost_native_evidence(private, cache):
@@ -602,11 +735,50 @@ def dependency_records(program, cache, spec, linked):
     records = [target / "release" / (program + ".d")]
     record_cwds = {}
     rust_records = {}
-    for item in spec["cargo_packages"]:
-        crate = item["name"].replace("-", "_")
-        package_root = Path(item["manifest_path"]).parent.resolve()
-        for record in (target / "release/deps").glob(crate + "-*.d"):
+    packages = {item["id"]: item for item in spec["cargo_packages"]}
+    artifacts = linked.get("compiler_artifacts", [])
+    if not artifacts:
+        raise RuntimeError("缺少本次Cargo精确产物事件，拒绝扫描共享target推断版本")
+    artifact_owners = {}
+    for artifact in artifacts:
+        package = packages.get(artifact["package_id"])
+        if package is None or Path(artifact["manifest_path"]).resolve() != Path(package["manifest_path"]).resolve():
+            raise RuntimeError("本次Cargo产物不属于当前固定依赖闭包：" + artifact["package_id"])
+        package_root = Path(package["manifest_path"]).parent.resolve()
+        crate = artifact["target"]["name"].replace("-", "_")
+        candidates = set()
+        for filename in artifact["filenames"]:
+            path = Path(filename)
+            artifact_owners[str(path.resolve())] = package
+            name = path.name
+            if name.startswith("lib") and path.suffix in (".rlib", ".rmeta", ".so", ".a"):
+                candidates.add(path.with_name(name[3:]).with_suffix(".d"))
+            elif "custom-build" in artifact["target"]["kind"]:
+                candidates.update(path.parent.glob(crate + "-*.d"))
+                candidates.add(path.parent / (crate + ".d"))
+            else:
+                candidates.add(path.with_name(name + ".d"))
+        candidates = {path for path in candidates if path.is_file()}
+        if not candidates:
+            raise RuntimeError("本次Cargo精确产物缺少对应Rust依赖记录：" + artifact["package_id"])
+        for record in candidates:
             rust_records.setdefault(record, set()).add(package_root)
+    spec["_artifact_owners"] = artifact_owners
+    codegen_owners = {}
+    for command in linked["compiler_commands"]:
+        if "Running `" not in command:
+            continue
+        arguments = shlex.split(command.split("Running `", 1)[1].rsplit("`", 1)[0])
+        if "--crate-name" not in arguments or "--out-dir" not in arguments:
+            continue
+        crate = arguments[arguments.index("--crate-name") + 1]
+        out_dir = Path(arguments[arguments.index("--out-dir") + 1])
+        suffix = next((value.split("=-", 1)[1] for value in arguments if value.startswith("extra-filename=-")), None)
+        manifest_dir = next((value.split("=", 1)[1] for value in arguments if value.startswith("CARGO_MANIFEST_DIR=")), None)
+        owners = {event["package_id"]: packages[event["package_id"]] for event in artifacts if event["target"]["name"].replace("-", "_") == crate and str(Path(event["manifest_path"]).parent) == manifest_dir}
+        if suffix and len(owners) == 1:
+            codegen_owners[str((out_dir / (crate + "-" + suffix)).resolve())] = next(iter(owners.values()))
+    spec["_codegen_owners"] = codegen_owners
     rust_origins = []
     for record, package_roots in sorted(rust_records.items()):
         dependencies = common.dependency_paths(record)
@@ -700,7 +872,15 @@ def canonical(value, root, cache):
 def link_arguments(logged, program, binary, cache, link_map=None):
     candidates = []
     compiler = []
+    artifacts = []
     for line in logged.splitlines():
+        if line.startswith("{"):
+            try:
+                event = json.loads(line)
+            except ValueError:
+                event = {}
+            if event.get("reason") == "compiler-artifact":
+                artifacts.append(event)
         if line.startswith("LC_ALL=") and '"-o"' in line and program.replace("-", "_") in line:
             arguments = shlex.split(line)
             position = next((i for i, value in enumerate(arguments) if "=" not in value), None)
@@ -711,7 +891,7 @@ def link_arguments(logged, program, binary, cache, link_map=None):
     receipt = cache / "audit-links" / (program + ".json")
     digest = common.sha256(binary)
     if candidates:
-        result = {"binary_sha256": digest, "linker_arguments": candidates[-1], "compiler_commands": compiler}
+        result = {"binary_sha256": digest, "linker_arguments": candidates[-1], "compiler_commands": compiler, "compiler_artifacts": artifacts}
         if link_map is not None:
             if not link_map.is_file():
                 raise RuntimeError("实际最终链接没有产生GNU链接图：" + program)
@@ -726,6 +906,10 @@ def link_arguments(logged, program, binary, cache, link_map=None):
             raise RuntimeError("最终链接回执与当前ELF不符：" + program)
     if link_map is not None and (result.get("link_map") != str(link_map) or not link_map.is_file() or result.get("link_map_sha256") != common.sha256(link_map)):
         raise RuntimeError("最终链接图回执与当前ELF/链接记录不符：" + program)
+    if not artifacts:
+        raise RuntimeError("本次Cargo未提供compiler-artifact事件，无法核对依赖产物")
+    result["compiler_artifacts"] = artifacts
+    dump(receipt, result)
     return {**result, "captured_this_build": bool(candidates)}
 
 
@@ -832,14 +1016,19 @@ def source_owner(path, spec, root, cache, program):
             return {"kind": "crate" if item["source"] else "repository", "id": item["id"] if item["source"] else item["name"], "root": str(directory), "license": item["license"], "version": item["version"]}
     if selected == root or root in selected.parents:
         return {"kind": "repository", "id": selected.relative_to(root).as_posix(), "root": str(root)}
-    if "/release/deps/" in str(selected):
-        filename = selected.name[3:] if selected.name.startswith("lib") else selected.name
-        name = re.sub(r"-[0-9a-f]{16}.*$", "", filename)
-        package = next((item for item in spec["cargo_packages"] if item["name"].replace("-", "_") == name), None)
-        if package is None and selected.name.startswith(program.replace("-", "_")):
-            package = next(item for item in spec["cargo_packages"] if item["name"] == common.PROGRAMS[program]["package"])
-        if package:
-            return {"kind": "compiled-crate", "id": package["id"] if package["source"] else package["name"], "root": str(Path(package["manifest_path"]).parent), "license": package["license"], "version": package["version"]}
+    artifact_package = spec.get("_artifact_owners", {}).get(str(selected))
+    if artifact_package is None and ("/release/deps/" in str(selected) or str(selected).startswith("/tmp/rustc")):
+        matches = {item["id"]: item for name, item in spec.get("_artifact_owners", {}).items() if Path(name).name == selected.name}
+        if len(matches) == 1:
+            artifact_package = next(iter(matches.values()))
+        elif matches:
+            raise RuntimeError("实际链接Cargo产物无法唯一匹配本次包身份：" + str(selected))
+    codegen = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*-[0-9a-f]{16})\..*\.rcgu\.o", selected.name)
+    if artifact_package is None and codegen:
+        artifact_package = spec.get("_codegen_owners", {}).get(str(selected.parent / codegen.group(1)))
+    if artifact_package:
+        item = artifact_package
+        return {"kind": "compiled-crate", "id": item["id"] if item["source"] else item["name"], "root": str(Path(item["manifest_path"]).parent), "license": item["license"], "version": item["version"]}
     # Cargo的OUT_DIR是生成输入；来源绑定到实际执行build.rs的包，而非整个cache。
     match = re.search(r"/release/build/([^/]+)-[0-9a-f]+/out(?:/|$)", str(selected))
     if match:
@@ -888,9 +1077,9 @@ def source_owner(path, spec, root, cache, program):
         return {"kind": "rust-toolchain", "id": "Rust-" + builds.RUST_VERSION, "root": rustup}
     if selected == cache / "prefix" or cache / "prefix" in selected.parents:
         text = str(selected)
-        if "boost" in text:
-            from scripts.prepare_slam2d_dependencies import BOOST_URL, BOOST_SHA256
-            return {"kind": "pinned-source", "id": "boost-1.83.0", "root": str(cache / "slam2d-dependencies/boost-source/boost_1_83_0"), "url": BOOST_URL, "sha256": BOOST_SHA256}
+        boost_owner = boost_installation_owner(selected, spec, cache)
+        if boost_owner:
+            return boost_owner
         role = "slam2d-ceres" if "ceres" in text else "slam2d-onetbb" if "tbb" in text else None
         registry = cache / "slam2d-dependencies/sources/source-paths-v1.json"
         if role and registry.is_file():
@@ -957,7 +1146,7 @@ def collect_audit(program, spec, checked, linked, root, cache):
         owner = source_owner(path, spec, root, cache, program)
         owner_key = owner["kind"] + ":" + owner["id"]
         origins[owner_key] = owner
-    return {**checked, "schema": 1, "program": program, "compiler_commands": linked["compiler_commands"], "compiled_binary_sha256": linked["binary_sha256"], "link_record_origin": "executed" if linked["captured_this_build"] else "binary-sha-matched-cache", "linker_arguments": linked["linker_arguments"], "link_inputs": link_inputs, "native_link_records": native_links, "native_archive_adoption": adoption, "rust_dependency_record_origins": linked.get("rust_dependency_record_origins", []), "boost_native_adoption": linked.get("boost_adoption", {}), "private_library_records": private_records, "external_sources": sorted(origins.values(), key=lambda item: (item["kind"], item["id"])), "cargo_resolution": spec["cargo_packages"], "source_revision": capture(["git", "-C", str(root), "rev-parse", "HEAD"])}
+    return {**checked, "schema": 1, "program": program, "compiler_commands": linked["compiler_commands"], "compiler_artifacts": linked["compiler_artifacts"], "compiled_binary_sha256": linked["binary_sha256"], "link_record_origin": "executed" if linked["captured_this_build"] else "binary-sha-matched-cache", "linker_arguments": linked["linker_arguments"], "link_inputs": link_inputs, "native_link_records": native_links, "native_archive_adoption": adoption, "rust_dependency_record_origins": linked.get("rust_dependency_record_origins", []), "boost_native_adoption": linked.get("boost_adoption", {}), "boost_installation": spec.get("_boost_installation"), "private_library_records": private_records, "external_sources": sorted(origins.values(), key=lambda item: (item["kind"], item["id"])), "cargo_resolution": spec["cargo_packages"], "source_revision": capture(["git", "-C", str(root), "rev-parse", "HEAD"])}
 
 
 def review_key(audit, root, cache):

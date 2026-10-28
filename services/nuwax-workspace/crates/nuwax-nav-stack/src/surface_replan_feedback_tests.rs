@@ -53,7 +53,7 @@ fn fixture() -> (Arc<SurfaceSnapshot>,PoseStamped,schema::GoalEnvelope,SurfaceNa
     let actual=Arc::new(ActualExecutionContext {measured_motion:None,source:surface.clone(),odometry:start.clone(),
         applied:Twist2::ZERO});
     let feedback=SurfaceReplanFeedback {path_identity:Arc::new(published_surface_identity(&goal,31,7)),
-        rejected_context:Some(actual.clone()),current_context:Some(actual),zero_confirmed_rejection:true};
+        rejected_context:Some(actual.clone()),current_context:Some(actual),zero_confirmed_rejection:true,rejection_reason:Some("Current body pose is occupied or outside the local map".into())};
     (surface,start,goal,config,feedback)
 }
 #[test]
@@ -102,4 +102,22 @@ fn adapter_preserves_rejected_b_when_current_and_published_inputs_return_to_a() 
     assert!(memo.should_reuse(surface_replan_rejection(Some(&feedback),&goal),&restored));
     let mut foreign=goal.clone(); foreign.goal_generation+=1;
     assert!(!memo.should_reuse(surface_replan_rejection(Some(&feedback),&foreign),&restored));
+}
+
+#[test]
+fn recomputation_progress_keeps_original_refusal_without_borrowing_another_goal() {
+    let (_,_,goal,_,mut feedback)=fixture();
+    // 后端没有可复用的实际上下文，也不能丢掉已确认的拒绝事实。
+    feedback.rejected_context=None;
+    feedback.current_context=None;
+    let message=surface_planning_diagnostic(Some(&feedback),&goal,"正在计算PCT全局路线");
+    assert!(message.contains("Current body pose is occupied or outside the local map"));
+    assert!(message.contains("正在计算PCT全局路线"));
+    assert!(message.contains("已归零"));
+    let mut replacement=goal.clone();replacement.goal_generation+=1;
+    assert_eq!(surface_planning_diagnostic(Some(&feedback),&replacement,"正在计算PCT全局路线"),
+        "正在计算PCT全局路线");
+    feedback.zero_confirmed_rejection=false;
+    assert_eq!(surface_planning_diagnostic(Some(&feedback),&goal,"正在计算PCT全局路线"),
+        "正在计算PCT全局路线");
 }

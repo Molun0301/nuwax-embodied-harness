@@ -1896,6 +1896,7 @@ where
             rejected_context: None,
             current_context: intent.execution_context.clone(),
             zero_confirmed_rejection: false,
+            rejection_reason: None,
         });
         match intent.payload {
             LocalExecutionPayload::Command(twist) => {
@@ -1947,6 +1948,7 @@ where
                     rejected_context: intent.execution_context,
                     current_context: stopped_context,
                     zero_confirmed_rejection: true,
+                    rejection_reason: Some(reason.clone()),
                 });
                 self.status.message = format!("路径失效，零速已执行，等待更新路径: {reason}");
                 self.publish_status(status_tx);
@@ -4369,6 +4371,7 @@ mod tests {
         assert_eq!(held.last_terminal, None);
         let feedback=held.surface_replan_feedback.as_ref().expect("typed rejection after ZERO");
         assert!(feedback.zero_confirmed_rejection);
+        assert_eq!(feedback.rejection_reason.as_deref(), Some("连接阻断"));
         assert_eq!(feedback.path_identity.as_ref(),&path().execution_identity);
         // Unsupported backends preserve the refusal but provide no reuse proof.
         assert!(feedback.rejected_context.is_none() && feedback.current_context.is_none());

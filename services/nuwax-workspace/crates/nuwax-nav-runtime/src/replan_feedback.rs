@@ -25,6 +25,8 @@ pub struct SurfaceReplanFeedback {
     pub current_context: Option<Arc<ActualExecutionContext>>,
     /// 原归零链已经确认停车。
     pub zero_confirmed_rejection: bool,
+    /// 原局部拒绝的具名原因，只在真实归零成功后随原路径发布。
+    pub rejection_reason: Option<String>,
 }
 /// 全局规划实际使用的输入。
 #[derive(Clone)]

@@ -573,6 +573,18 @@ fn surface_replan_rejection<'a>(
             .map(|rejected| (feedback.path_identity.as_ref(), rejected)))
 }
 
+/// 原局部拒绝与后续全局进度分开记录；另一目标不能继承该原因。
+fn surface_planning_diagnostic(feedback: Option<&SurfaceReplanFeedback>,
+    goal: &schema::GoalEnvelope, progress: &str) -> String {
+    match feedback.filter(|feedback| feedback.zero_confirmed_rejection
+        && feedback.path_identity.session_id == goal.session_id
+        && feedback.path_identity.goal_key == goal.goal_key()) {
+        Some(feedback) => format!("局部执行拒绝并已归零：{}；{progress}；连续等待仍受原期限约束",
+            feedback.rejection_reason.as_deref().unwrap_or("局部规划要求更新路径")),
+        None => progress.into(),
+    }
+}
+
 fn published_surface_identity(goal: &schema::GoalEnvelope, generation: i64, revision: i64)
     -> nuwax_nav_runtime::PathExecutionIdentity {
     let mut identity=guarded_goal_execution_identity(goal);
@@ -831,7 +843,7 @@ async fn run_surface_planner_with_computer(
                         && feedback.path_identity.path_revision==path_revision as u64 {
                         needs_plan=true;
                         hub.planning.send_replace(Some((active.session_id.clone(),active.goal_key(),
-                            "局部执行拒绝并已归零，按一秒间隔等待全局重规划；连续等待仍受原期限约束".into(),false)));
+                            surface_planning_diagnostic(Some(feedback),active,"按一秒间隔等待全局重规划"),false)));
                     }
                 }
             }
@@ -1096,7 +1108,7 @@ async fn run_surface_planner_with_computer(
                     retire_on_geometry: !geometry_retired,
                 });
                 let computer = Arc::clone(&computer);
-                hub.planning.send_replace(Some((planned_goal.session_id.clone(), planned_goal.goal_key(), "正在计算PCT全局路线".into(),false)));
+                hub.planning.send_replace(Some((planned_goal.session_id.clone(), planned_goal.goal_key(), surface_planning_diagnostic(execution_feedback.as_ref(),&planned_goal,"正在计算PCT全局路线"),false)));
                 path_computations.spawn_blocking(move || {
                     let started = Instant::now();
                     let result = computer(&surface, &pose, &planned_goal, &config);

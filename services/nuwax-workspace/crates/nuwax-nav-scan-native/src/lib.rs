@@ -101,6 +101,8 @@ extern "C" {
     fn nuwax_scan_session_set_static_fixture(session:*mut std::ffi::c_void,enabled:std::ffi::c_int);
     fn nuwax_scan_session_ingest_registered_frame(session:*mut std::ffi::c_void,config:*const Config,points:*const f64,count:usize,
         origin:*const f64,body_position:*const f64,timestamp_ns:i64)->std::ffi::c_int;
+    fn nuwax_scan_session_ingest_registered_frame_with_ground(session:*mut std::ffi::c_void,config:*const Config,points:*const f64,count:usize,
+        ground_members:*const u32,ground_count:usize,origin:*const f64,body_position:*const f64,timestamp_ns:i64)->std::ffi::c_int;
     fn nuwax_scan_session_create() -> *mut std::ffi::c_void;
     fn nuwax_scan_session_destroy(session: *mut std::ffi::c_void);
     fn nuwax_scan_session_reset(session: *mut std::ffi::c_void);
@@ -226,6 +228,14 @@ impl Planner {
         let status=unsafe {nuwax_scan_session_ingest_registered_frame(self.handle,config,points.as_ptr().cast(),points.len(),
             origin.as_ptr(),body_position.as_ptr(),timestamp_ns)};
         if status==0 {Ok(())} else {Err("invalid paired registered frame for author SCAN map".into())}
+    }
+    /// 同帧发布的真实地面成员只复核量化格顶，不改变原占据概率或碰撞带。
+    pub fn ingest_registered_frame_with_ground(&mut self, config:&Config, points:&[[f64;3]], ground_point_indices:&[u32],
+        origin:[f64;3],body_position:[f64;3],timestamp_ns:i64)->Result<(),String> {
+        self.ensure_session()?;
+        let status=unsafe {nuwax_scan_session_ingest_registered_frame_with_ground(self.handle,config,points.as_ptr().cast(),points.len(),
+            ground_point_indices.as_ptr(),ground_point_indices.len(),origin.as_ptr(),body_position.as_ptr(),timestamp_ns)};
+        if status==0 {Ok(())} else {Err("invalid paired registered frame or ground members for author SCAN map".into())}
     }
     pub fn plan_count(&self) -> u64 {
         unsafe { nuwax_scan_session_plan_count(self.handle) }
@@ -845,6 +855,180 @@ mod tests {
         let outcome = drive(&mut fixture_planner(), &mut req, [3.0, 0.0]);
         assert!(!matches!(outcome, Ok((Some(_), _))), "零越阶机体越过了支撑格上方的矮坎");
         assert!(req.start_position[0] + 0.35 < 1.5, "机身应停在矮坎前：{:?}", req.start_position);
+    }
+
+    fn go2_support_request() -> PlanRequest<'static> {
+        let mut req=request(&[],&[]);
+        req.config.resolution=f64::from(0.05_f32);
+        req.config.body_length=0.7363955361934972;
+        req.config.body_width=0.41704432480493203;
+        req.config.body_height=0.4108918899416131;
+        req.config.body_center_x=-0.0026277680952758176;
+        req.config.body_center_y=0.003659895132201413;
+        req.config.body_z_min=-0.3923118907927897;
+        req.config.body_z_max=0.018579999148823356;
+        req.config.body_to_ground=0.36385;
+        req.config.max_step_up=0.;req.config.max_step_down=0.;
+        req.start_position=[0.,0.,0.0123];
+        req.goal_yaw=Some(0.);
+        req
+    }
+
+    fn observe_support(planner:&mut Planner,req:&mut PlanRequest<'_>,points:&[[f64;3]],members:&[u32]) -> Result<PlanResult,String> {
+        let mut result=None;
+        for _ in 0..3 {
+            req.odometry_timestamp_ns+=100_000_000;
+            planner.ingest_registered_frame_with_ground(&req.config,points,members,req.start_position,
+                req.start_position,req.odometry_timestamp_ns).unwrap();
+            result=Some(planner.step(req));
+        }
+        result.unwrap()
+    }
+
+    #[test]
+    fn registered_support_members_remove_only_quantized_floor_overlap() {
+        // Go2原探索实测：下沿约-0.30155，真实支撑-0.347所在格顶-0.30越入1.55毫米。
+        let points=[[0.025,0.025,-0.347]];
+        let mut req=go2_support_request();
+        let original=observe_support(&mut Planner::new(),&mut req,&points,&[]).unwrap_err();
+        assert!(original.contains("Current body pose is occupied"),"{original}");
+        let accepted=observe_support(&mut Planner::new(),&mut req,&points,&[0]).unwrap();
+        assert_eq!([accepted.command_forward,accepted.command_lateral,accepted.command_yaw_rate],[0.;3]);
+    }
+
+    #[test]
+    fn registered_support_keeps_above_mixed_and_unknown_occupancy() {
+        for (case,(points,members)) in [
+            // 上方实体与地面使用可独立看见的射线；实体后方地面不能同时作为自由穿越证据。
+            (vec![[0.225,0.125,-0.347],[0.025,0.025,-0.29]],vec![0]),
+            (vec![[0.025,0.025,-0.347],[0.026,0.026,-0.315]],vec![0]),
+            (vec![[0.025,0.025,-0.300]],vec![0]),
+            (vec![[0.025,0.025,-0.347]],vec![]),
+        ].into_iter().enumerate() {
+            let mut req=go2_support_request();
+            let error=observe_support(&mut Planner::new(),&mut req,&points,&members)
+                .expect_err(&format!("反例{case}必须保留原占据"));
+            assert!(error.contains("Current body pose is occupied"),"{error}");
+        }
+    }
+
+    #[test]
+    fn registered_support_cannot_erase_unreleased_nonmember_history() {
+        let mut req=go2_support_request();let mut planner=Planner::new();
+        assert!(observe_support(&mut planner,&mut req,&[[0.025,0.025,-0.315]],&[]).is_err());
+        assert!(observe_support(&mut planner,&mut req,&[[0.025,0.025,-0.347]],&[0]).is_err(),
+            "同格新地面成员不能清掉仍有原概率占据的非成员");
+    }
+
+    #[test]
+    fn registered_support_retirement_rebuild_and_invalid_members_keep_identity() {
+        let mut req=go2_support_request();let mut planner=Planner::new();let points=[[0.025,0.025,-0.347]];
+        observe_support(&mut planner,&mut req,&points,&[0]).unwrap();
+        planner.reset_execution();
+        assert!(planner.step(&req).is_ok(),"取消只退休执行，保留同源地图与地面身份");
+        for members in [&[1][..],&[0,0][..]] {
+            assert!(planner.ingest_registered_frame_with_ground(&req.config,&points,members,
+                req.start_position,req.start_position,req.odometry_timestamp_ns+1).is_err());
+            assert!(planner.step(&req).is_ok(),"非法成员不能替换已有合法帧");
+        }
+        planner.reset_execution();req.config.body_width+=0.01;
+        assert!(planner.configure(&req.config).unwrap());
+        let error=observe_support(&mut planner,&mut req,&points,&[]).unwrap_err();
+        assert!(error.contains("Current body pose is occupied"),"地图重建必须清除旧支撑身份：{error}");
+    }
+
+    #[test]
+    fn short_reference_preserves_real_detour_and_clear_final_direction() {
+        // 原捕获10点短绕行。按0.5米距离抽样只剩首尾，末段从-2.82弧度变成-1.57弧度，
+        // 同一终点的真实机体因此撞到下方实体；保留拐角后仍由原求解器和碰撞检查验收。
+        let route=[
+            [-0.19957526078069113,0.013856169486265677,0.024536172545340695],
+            [-0.37500000558793545,-0.02500000037252903,0.01697498807907105],
+            [-0.4250000063329935,-0.07500000111758709,0.01697498807907105],
+            [-0.37500000558793545,-0.12500000186264515,0.01697498807907105],
+            [-0.3250000048428774,-0.1750000026077032,0.01697498807907105],
+            [-0.27500000409781933,-0.22500000335276127,0.01697498807907105],
+            [-0.22500000335276127,-0.27500000409781933,0.01697498807907105],
+            [-0.1750000026077032,-0.3250000048428774,0.01697498807907105],
+            [-0.12500000186264515,-0.37500000558793545,0.01697498807907105],
+            [-0.2,-0.4,0.01697498807907105],
+        ];
+        let obstacles=[
+            [-0.296437531709671,-0.77738356590271,-0.0840628445148468],
+            [-0.3430383503437042,-0.7771164178848267,-0.008730334229767323],
+            [-0.31034231185913086,-0.7773557901382446,-0.061080947518348694],
+            [-0.323816180229187,-0.7771331071853638,0.014047613367438316],
+        ];
+        for duplicates in [false,true] {
+            let reference:Vec<_>=route.iter().flat_map(|p|std::iter::repeat(*p).take(if duplicates {2}else {1})).collect();
+            let mut req=request(&reference,&obstacles);req.config=go2_support_request().config;
+            req.config.max_acceleration=0.5;req.config.planning_horizon=5.;req.config.sample_dt=0.05;
+            req.start_position=route[0];req.start_yaw=-1.601;req.start_velocity=None;
+            req.start_acceleration=None;req.start_yaw_rate=None;
+            let mut planner=fixture_planner();let mut produced=false;
+            for tick in 0..20 {
+                req.odometry_timestamp_ns=1_000_000_000+tick*50_000_000;
+                let result=planner.step(&req).unwrap_or_else(|reason|panic!("重复点={duplicates}，原真实短绕行被拒绝：{reason}"));
+                if !result.samples.is_empty() && [result.command_forward,result.command_lateral,result.command_yaw_rate]
+                    .into_iter().any(|value|value.abs()>1e-10) {produced=true;break;}
+            }
+            assert!(produced,"重复点={duplicates}，原短绕行虽接纳但未生成局部轨迹及非零命令");
+        }
+    }
+
+    #[test]
+    fn rejected_duplicate_reference_retires_previous_target_and_controller() {
+        let route=[[0.,0.,0.35],[2.,0.,0.35]];
+        let repeated=[[0.5,0.,0.35];3];
+        let mut req=request(&route,&[]);let mut planner=fixture_planner();let mut active=false;
+        for tick in 0..10 {
+            req.odometry_timestamp_ns=1_000_000_000+tick*100_000_000;
+            let output=planner.step(&req).unwrap();
+            if !output.samples.is_empty(){active=true;break;}
+        }
+        assert!(active,"反例必须先建立真实旧目标和控制器轨迹");
+        let previous_plans=planner.plan_count();
+        req.reference=&repeated;req.odometry_timestamp_ns+=100_000_000;
+        let reason=planner.step(&req).expect_err("全相邻重复的新参考必须明确拒绝");
+        assert!(reason.contains("two distinct consecutive points"),"{reason}");
+        req.reference=&[];req.goal_yaw=Some(req.start_yaw);req.odometry_timestamp_ns+=100_000_000;
+        let stopped=planner.step(&req).unwrap();
+        assert!(stopped.samples.is_empty());
+        assert_eq!([stopped.command_forward,stopped.command_lateral,stopped.command_yaw_rate],[0.;3]);
+        assert_eq!(planner.plan_count(),previous_plans,"拒绝后不能重发旧轨迹");
+        req.reference=&route;req.goal_yaw=None;req.odometry_timestamp_ns+=100_000_000;
+        assert!(planner.step(&req).unwrap().samples.is_empty(),"下一有效参考从原INIT重新开始，旧轨迹不能复活");
+    }
+
+    #[test]
+    fn ordered_reference_keeps_dense_door_height_transition_and_endpoint() {
+        // 原窄门的102点：最初7毫米过渡后是一米长的实测平面。共线化后的原全局多项式
+        // 会落到z=-5.478米；有序PCT参考自身仅在0.395至0.4米，局部目标必须取同一真实折线。
+        let fine=f64::from(0.01_f32);let y=33.*fine/2.;let level=0.4-fine/2.;
+        let mut route=vec![[-0.5,y,0.4]];
+        route.extend((-50..50).map(|x|[(f64::from(x)+0.5)*fine,y,level]));
+        route.push([0.5,y,level]);assert_eq!(route.len(),102);
+        let mut req=request(&route,&[]);req.start_position=route[0];req.config.body_to_ground=0.4;
+        req.config.max_velocity=0.3;req.config.max_acceleration=1.;req.config.planning_horizon=3.5;
+        req.config.body_length=0.6;req.config.body_width=32.*fine;req.config.sample_dt=0.05;
+        let mut planner=fixture_planner();let mut produced=false;
+        for tick in 0..20 {
+            req.odometry_timestamp_ns=1_000_000_000+tick*50_000_000;
+            let result=planner.step(&req).unwrap();
+            if !result.samples.is_empty() {
+                assert!((result.local_target[0]-0.5).abs()<1e-8 && (result.local_target[2]-level).abs()<1e-8,
+                    "局部目标越出原PCT终点：{:?}",result.local_target);
+                assert!(result.reference_progress<=result.reference_duration+1e-8);
+                let low=result.samples.iter().map(|p|p.position[2]).fold(f64::INFINITY,f64::min);
+                let high=result.samples.iter().map(|p|p.position[2]).fold(f64::NEG_INFINITY,f64::max);
+                // 同一102点输入在63b43ed0原局部求解器的已有拟合范围；参考修复不改变该样条行为。
+                assert!((low-0.39416981200047052).abs()<1e-8 && (high-0.39798499736324322).abs()<1e-8,
+                    "原局部样条高度行为发生变化：{low}至{high}");
+                assert!(result.command_forward>0.);
+                produced=true;break;
+            }
+        }
+        assert!(produced,"原102点高度过渡必须生成局部轨迹，不能停原位反复求解");
     }
 
     #[test]

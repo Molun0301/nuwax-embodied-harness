@@ -121,6 +121,7 @@ impl RecentSourceState {
                 },sequence:cloud.source_sequence,timestamp_ns:cloud.source_timestamp_ns,
             },
             points_world:Arc::clone(&raw_points),sensor_origin_world:pose.sensor_origin_map,
+            ground_point_indices:packet.ground_point_indices.clone().into(),
             body_position_world:pose.body_position_map,body_orientation_xyzw:pose.body_orientation_xyzw,
             paired_odometry_sequence:cloud.correlated_odometry_source_sequence,
             paired_odometry_timestamp_ns:cloud.correlated_odometry_source_timestamp_ns,
@@ -264,6 +265,7 @@ mod tests {
         assert!(nuwax_nav_runtime::native_map::same_source_geometry(&map,state.snapshot.as_ref().unwrap()));
         let frame=state.registered_frame.as_ref().unwrap().clone();
         assert_eq!(frame.points_world.as_ref(),&[[0.5,1.0,0.5]]);
+        assert!(frame.ground_point_indices.is_empty());
         assert_eq!(frame.sensor_origin_world,[5.,7.,9.]);
         assert_eq!(frame.body_position_world,[4.,6.,8.]);
         assert_eq!(frame.paired_odometry_timestamp_ns,now);
@@ -290,8 +292,11 @@ mod tests {
         packet.commit_boot_nonce=[7;16];
         // A newer real acquisition may establish a new correction domain.
         packet.registration.as_mut().unwrap().registration_correction_revision=4;
+        // 新真实采集保留发布者的原成员身份，不在消费方根据点高补标签。
+        packet.ground_point_indices=vec![0];
         state.consume(&recent_cloud::encode_body(&packet).unwrap(),Some(&authority),&handle).await.unwrap();
         assert_eq!(state.registered_frame.as_ref().unwrap().identity.domain.registration_correction_revision,4);
+        assert_eq!(state.registered_frame.as_ref().unwrap().ground_point_indices.as_ref(),&[0]);
         let accepted_new=state.watermark;
         // The same acquisition under another correction is not fresh. It must
         // revoke old native history while waiting for a genuinely new scan.
@@ -302,6 +307,7 @@ mod tests {
         assert!(!handle.status().planner_inputs_fresh);
         packet.registration=None;
         packet.cloud=None;
+        packet.ground_point_indices.clear();
         state.consume(&recent_cloud::encode_body(&packet).unwrap(),Some(&authority),&handle).await.unwrap();
         assert!(!handle.status().planner_inputs_fresh);
         assert!(state.registered_frame.is_none());

@@ -7,6 +7,7 @@
 #![warn(missing_docs)]
 
 pub mod client;
+pub mod command_limits;
 pub mod constants;
 pub mod measured_motion;
 pub mod wire;

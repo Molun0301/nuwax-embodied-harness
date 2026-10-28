@@ -830,6 +830,8 @@ async fn run_surface_planner_with_computer(
                         && feedback.path_identity.planner_runtime_generation==generation
                         && feedback.path_identity.path_revision==path_revision as u64 {
                         needs_plan=true;
+                        hub.planning.send_replace(Some((active.session_id.clone(),active.goal_key(),
+                            "局部执行拒绝并已归零，按一秒间隔等待全局重规划；连续等待仍受原期限约束".into(),false)));
                     }
                 }
             }
@@ -949,6 +951,10 @@ async fn run_surface_planner_with_computer(
                         successful.published(published_surface_identity(&planned_goal,generation,path_revision), input);
                         failed_input = None;
                         last_path = Some(plan.path); needs_plan = false;
+                        // 全局有路不代表局部可执行。真实位姿和感知每拍变化时，
+                        // 精确输入复用不能抑制重复局部拒绝，统一留出一秒重试间隔。
+                        // 期限只在本次结果交付后建立，后续输入不能不断顺延它。
+                        retry_after=Instant::now()+Duration::from_secs(1);
                     }
                     Err(error) => {
                         diagnostics.reject("PCT原生全局规划", &error.to_string());

@@ -19,6 +19,7 @@
 #include <set>
 #include <stdexcept>
 #include <tuple>
+#include <unordered_map>
 #include <plan_env/raycast.h>
 
 #define logit(x) (log((x) / (1 - (x))))
@@ -100,6 +101,8 @@ struct MappingData {
   // 原概率占据阈值的派生位图，布局按XY列分组，和原环形缓冲一同更新与清除。
   std::vector<std::uint64_t> occupancy_bits_;
   int occupancy_words_per_column_;
+  // 只保存仍有原概率证据的同源地面成员；无条目表示未证明为纯支撑。
+  std::unordered_map<int, double> support_member_max_z_;
   vector<Eigen::Vector3i> inflate_offsets_;
 
   // raycast origin and sensor pose data
@@ -121,6 +124,7 @@ struct MappingData {
   // depth image projected point cloud
 
   vector<Eigen::Vector3d> proj_points_;
+  vector<char> proj_ground_members_;
   int proj_points_cnt;
 
   // flag buffers for speeding up raycasting
@@ -191,7 +195,8 @@ public:
   bool ingestLidarFrame(const std::vector<Eigen::Vector3d>& points,
                         const Eigen::Vector3d& paired_sensor_origin,
                         const Eigen::Quaterniond& paired_sensor_orientation,
-                        const Eigen::Vector3d& paired_body_pos);
+                        const Eigen::Vector3d& paired_body_pos,
+                        const std::vector<std::uint32_t>& ground_members = {});
   // Host invokes at the original 0.05-second occupancy timer cadence.
   void updateOccupancyCallback(const ros::TimerEvent& event);
 
@@ -244,7 +249,9 @@ private:
   inline int getLocalIndex(int id, int dim) const;
   inline int toAddressLocal(const Eigen::Vector3i& id_l) const;
   inline int toAddressLocal(int x, int y, int z) const;
-  int setCacheOccupancy(Eigen::Vector3d pos, int occ);
+  int setCacheOccupancy(Eigen::Vector3d pos, int occ, bool ground_member = false);
+  struct FrameHitEvidence { double maximum_z; bool only_ground; };
+  std::unordered_map<int, FrameHitEvidence> frame_hit_evidence_;
   Eigen::Vector3d closetPointInMap(const Eigen::Vector3d& pt, const Eigen::Vector3d& ray_pos);
   void updateSlidingMap(const Eigen::Vector3d& center);
   void updateMapBoundaryFromIndex();
@@ -428,7 +435,16 @@ inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos, double yaw) {
           if (word == first_word) mask &= ~std::uint64_t{0} << (begin % 64);
           if (word == last_word && (begin + count) % 64 != 0)
             mask &= (std::uint64_t{1} << ((begin + count) % 64)) - 1;
-          if (bits[word] & mask) return true;
+          auto hits = bits[word] & mask;
+          while (hits) {
+            const int z = word * 64 + __builtin_ctzll(hits);
+            const int address = static_cast<int>(column) * nz + z;
+            const auto member = md_.support_member_max_z_.find(address);
+            // 原碰撞带不移动：只有真实支撑点全部低于下沿时，排除体素格顶放大的虚假相交。
+            if (member == md_.support_member_max_z_.end() || !(member->second < low))
+              return true;
+            hits &= hits - 1;
+          }
         }
         return false;
       };

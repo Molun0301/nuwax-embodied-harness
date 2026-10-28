@@ -290,8 +290,10 @@ namespace scan_planner
 
     constexpr double sample_dt = 0.05;
     const int sample_num = std::max(1, static_cast<int>(std::ceil(duration / sample_dt)));
-    const Eigen::Vector3d final_pt = global_data.global_traj_.evaluate(duration);
-    const Eigen::Vector3d final_prev = global_data.global_traj_.evaluate(duration * (sample_num - 1) / sample_num);
+    const auto& route=planner_manager_->route_height_;
+    const Eigen::Vector3d final_pt = route.ready()?route.points.back():global_data.global_traj_.evaluate(duration);
+    const Eigen::Vector3d final_prev = route.ready()?route.points[route.points.size()-2]
+        :global_data.global_traj_.evaluate(duration * (sample_num - 1) / sample_num);
     const int final_occ = map->getInflateOccupancy(final_pt, estimateYawFromSegment(final_prev, final_pt));
     if (final_occ <= 0)
       return true;
@@ -314,42 +316,39 @@ namespace scan_planner
       return;
     }
 
-    trigger_ = true;
-    end_pt_ << msg->poses.back().pose.position.x,
-        msg->poses.back().pose.position.y,
-        msg->poses.back().pose.position.z + body_height_;
-
     std::vector<Eigen::Vector3d> full_height_route;
-    for (const auto &p : msg->poses)
-      full_height_route.emplace_back(p.pose.position.x,p.pose.position.y,p.pose.position.z+body_height_);
-    planner_manager_->route_height_.set(full_height_route);
-    size_t height_index=0;
-    std::vector<Eigen::Vector3d> waypoints;
-    waypoints.reserve(msg->poses.size());
-    constexpr double min_dist = 0.5;
-    Eigen::Vector3d last_wp;
-    bool first = true;
-
-    for (const auto &pose_stamped : msg->poses)
-    {
-      Eigen::Vector3d wp;
-      wp(0) = pose_stamped.pose.position.x;
-      wp(1) = pose_stamped.pose.position.y;
-      wp(2) = pose_stamped.pose.position.z + body_height_;
-
-      if (first || (wp - last_wp).norm() >= min_dist)
-      {
-        waypoints.push_back(wp);
-        planner_manager_->route_height_.waypoint_arcs.push_back(planner_manager_->route_height_.arcs[height_index]);
-        last_wp = wp;
-        first = false;
-      }
-      ++height_index;
+    full_height_route.reserve(msg->poses.size());
+    for (const auto &p : msg->poses) {
+      const Eigen::Vector3d point(p.pose.position.x,p.pose.position.y,p.pose.position.z+body_height_);
+      // 相邻完全重复点没有位移；短距离拐角和末段方向仍是原真实参考的一部分。
+      if (full_height_route.empty() || (point.array()!=full_height_route.back().array()).any())
+        full_height_route.push_back(point);
     }
-
-    if ((waypoints.back() - end_pt_).norm() > 1e-6) {
-      waypoints.push_back(end_pt_);
-      planner_manager_->route_height_.waypoint_arcs.push_back(planner_manager_->route_height_.arcs.back());
+    if (full_height_route.size()<2) {
+      retireExecution();
+      ROS_WARN("[pathCallback] Reference path requires at least two distinct consecutive points.");
+      return;
+    }
+    trigger_ = true;
+    end_pt_=full_height_route.back();
+    planner_manager_->route_height_.set(full_height_route);
+    // 原多项式使用稠密矩阵；只移除严格共线且同向的中间点，不让长直线增加求解规模。
+    std::vector<size_t> indices;
+    for (size_t i=0;i<full_height_route.size();++i) {
+      while (indices.size()>=2) {
+        const auto& a=full_height_route[indices[indices.size()-2]];
+        const auto& b=full_height_route[indices.back()];
+        const Eigen::Vector3d before=b-a,after=full_height_route[i]-b,cross=before.cross(after);
+        if ((cross.array()==0.0).all() && before.dot(after)>0.0) indices.pop_back();
+        else break;
+      }
+      indices.push_back(i);
+    }
+    std::vector<Eigen::Vector3d> waypoints;
+    waypoints.reserve(indices.size());
+    for (const auto i:indices) {
+      waypoints.push_back(full_height_route[i]);
+      planner_manager_->route_height_.waypoint_arcs.push_back(planner_manager_->route_height_.arcs[i]);
     }
 
     bool success = planGlobalTrajByWaypoints(waypoints);
@@ -370,7 +369,9 @@ namespace scan_planner
     }
     else
     {
-      ROS_ERROR("❌ Unable to generate global trajectory!");
+      const std::string reason=scan_native_diagnostic;
+      retireExecution();
+      ROS_ERROR("❌ Unable to generate global trajectory! %s",reason.c_str());
     }
   }
 
@@ -906,6 +907,12 @@ namespace scan_planner
     const double max_vel = planner_manager_->pp_.max_vel_;
     const double max_acc = planner_manager_->pp_.max_acc_;
     const double duration = planner_manager_->global_data_.global_duration_;
+    const auto& route=planner_manager_->route_height_;
+    // 原多项式保留已有时序；完整PCT折线同时拥有目标XYZ、参考速度与局部高度种子。
+    // 不能让无约束平滑曲线越出真实折线后，再把其异常高度当成必须满足的局部终点。
+    const auto referencePosition=[&](double t)->Eigen::Vector3d {
+      return route.ready()?route.positionAtArc(route.arcAtTime(t)):planner_manager_->global_data_.getPosition(t);
+    };
     double t_step = max_vel > 1e-6 ? planning_horizon_ / 20.0 / max_vel : 0.01;
     t_step = std::max(t_step, 0.01);
 
@@ -913,7 +920,7 @@ namespace scan_planner
     double min_dist_to_start = 9999.0;
     for (double t = 0.0; t < duration; t += t_step)
     {
-      Eigen::Vector3d pos_t = planner_manager_->global_data_.getPosition(t);
+      Eigen::Vector3d pos_t = referencePosition(t);
       double dist_to_start = (pos_t - start_pt_).norm();
       if (dist_to_start < min_dist_to_start)
       {
@@ -925,12 +932,12 @@ namespace scan_planner
     double target_t = duration;
     double total_dist = 0.0;
     bool target_found = false;
-    Eigen::Vector3d prev_pos = planner_manager_->global_data_.getPosition(t_proj);
+    Eigen::Vector3d prev_pos = referencePosition(t_proj);
     local_target_pt_ = end_pt_;
 
     for (double t = t_proj; t < duration; t += t_step)
     {
-      Eigen::Vector3d pos_t = planner_manager_->global_data_.getPosition(t);
+      Eigen::Vector3d pos_t = referencePosition(t);
       total_dist += (pos_t - prev_pos).norm();
       if (total_dist >= planning_horizon_)
       {
@@ -957,7 +964,7 @@ namespace scan_planner
         double t_forward = target_t + dt;
         if (t_forward <= planner_manager_->global_data_.global_duration_)
         {
-          Eigen::Vector3d pt = planner_manager_->global_data_.getPosition(t_forward);
+          Eigen::Vector3d pt = referencePosition(t_forward);
           if (targetOccupancy(pt) == 0)
           {
             local_target_pt_ = pt;
@@ -970,7 +977,7 @@ namespace scan_planner
         double t_backward = target_t - dt;
         if (t_backward >= std::max(0.0, t_proj))
         {
-          Eigen::Vector3d pt = planner_manager_->global_data_.getPosition(t_backward);
+          Eigen::Vector3d pt = referencePosition(t_backward);
           if (targetOccupancy(pt) == 0)
           {
             local_target_pt_ = pt;
@@ -1002,7 +1009,7 @@ namespace scan_planner
     }
     else
     {
-      local_target_vel_ = planner_manager_->global_data_.getVelocity(target_t);
+      local_target_vel_ = route.ready()?route.velocityAtTime(target_t):planner_manager_->global_data_.getVelocity(target_t);
       if (local_target_vel_.norm() > max_vel)
         local_target_vel_ = local_target_vel_.normalized() * max_vel;
       // std::cerr << "AA" << endl;

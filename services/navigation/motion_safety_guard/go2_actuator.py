@@ -173,6 +173,17 @@ def _require_zero_success(code: object, operation: str) -> None:
 class Go2Actuator:
     """The only production owner of Unitree motion SDK clients."""
 
+    def get_motion_command_limits(self):
+        """直接公开本执行器实际采用的速度策略。"""
+        from contracts.motion_limits import MotionCommandLimits
+        return MotionCommandLimits(
+            max_linear_x_mps=self._max_linear_velocity_mps,
+            max_linear_y_mps=self._max_linear_velocity_mps,
+            max_angular_z_rps=self._max_yaw_rate_rps,
+            max_planar_speed_mps=self._max_linear_velocity_mps,
+            source="go2_motion_guard_config",
+        )
+
     def __init__(
         self,
         *,

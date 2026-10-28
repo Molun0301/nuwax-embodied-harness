@@ -187,6 +187,8 @@ void GridMap::rebuildInflationOffsets()
 
 void GridMap::resetAllMapData()
 {
+  md_.support_member_max_z_.clear();
+  frame_hit_evidence_.clear();
   std::fill(md_.occupancy_buffer_.begin(), md_.occupancy_buffer_.end(), mp_.clamp_min_log_ - mp_.unknown_flag_);
   std::fill(md_.occupancy_buffer_inflate_.begin(), md_.occupancy_buffer_inflate_.end(), 0);
   std::fill(md_.occupancy_buffer_inflate_cnt_.begin(), md_.occupancy_buffer_inflate_cnt_.end(), 0);
@@ -266,6 +268,8 @@ void GridMap::applyOccupancyUpdate(const Eigen::Vector3i& id, double new_log_odd
   const bool now_occ = new_log_odds > mp_.min_occupancy_log_;
 
   md_.occupancy_buffer_[addr] = new_log_odds;
+  if (new_log_odds <= mp_.clamp_min_log_)
+    md_.support_member_max_z_.erase(addr);
   if (was_occ != now_occ) {
     updateOccupiedBit(addr, now_occ);
     updateInflation(id, now_occ ? 1 : -1);
@@ -282,6 +286,7 @@ void GridMap::resetCellByAddress(int addr)
   }
 
   md_.occupancy_buffer_[addr] = mp_.clamp_min_log_ - mp_.unknown_flag_;
+  md_.support_member_max_z_.erase(addr);
   md_.count_hit_[addr] = 0;
   md_.count_hit_and_miss_[addr] = 0;
   md_.flag_rayend_[addr] = -1;
@@ -382,6 +387,7 @@ void GridMap::updateSlidingMap(const Eigen::Vector3d& center)
 
   for (int addr : clear_addrs)
   {
+    md_.support_member_max_z_.erase(addr);
     md_.occupancy_buffer_[addr] = mp_.clamp_min_log_ - mp_.unknown_flag_;
     md_.occupancy_buffer_inflate_cnt_[addr] = 0;
     md_.occupancy_buffer_inflate_[addr] = 0;
@@ -423,7 +429,7 @@ void GridMap::resetBuffer(Eigen::Vector3d min_pos, Eigen::Vector3d max_pos)
     }
 }
 
-int GridMap::setCacheOccupancy(Eigen::Vector3d pos, int occ)
+int GridMap::setCacheOccupancy(Eigen::Vector3d pos, int occ, bool ground_member)
 {
   if (occ != 1 && occ != 0)
     return INVALID_IDX;
@@ -443,7 +449,15 @@ int GridMap::setCacheOccupancy(Eigen::Vector3d pos, int occ)
   }
 
   if (occ == 1)
+  {
     md_.count_hit_[idx_ctns] += 1;
+    auto [hit, inserted] = frame_hit_evidence_.try_emplace(
+        idx_ctns, FrameHitEvidence{pos.z(), ground_member});
+    if (!inserted) {
+      hit->second.maximum_z = std::max(hit->second.maximum_z, pos.z());
+      hit->second.only_ground = hit->second.only_ground && ground_member;
+    }
+  }
 
   return idx_ctns;
 }
@@ -459,6 +473,7 @@ void GridMap::raycastProcess()
   ros::Time t1, t2;
 
   md_.raycast_num_ += 1;
+  frame_hit_evidence_.clear();
 
   int vox_idx;
   double length;
@@ -504,7 +519,7 @@ void GridMap::raycastProcess()
       }
       else
       {
-        vox_idx = setCacheOccupancy(pt_w, 1);
+        vox_idx = setCacheOccupancy(pt_w, 1, md_.proj_ground_members_[i] != 0);
       }
     }
 
@@ -590,6 +605,17 @@ void GridMap::raycastProcess()
         md_.count_hit_[idx_ctns] >= md_.count_hit_and_miss_[idx_ctns] - md_.count_hit_[idx_ctns] ? mp_.prob_hit_log_ : mp_.prob_miss_log_;
 
     md_.count_hit_[idx_ctns] = md_.count_hit_and_miss_[idx_ctns] = 0;
+    const auto hit = frame_hit_evidence_.find(idx_ctns);
+    if (hit != frame_hit_evidence_.end()) {
+      auto previous = md_.support_member_max_z_.find(idx_ctns);
+      if (!hit->second.only_ground)
+        md_.support_member_max_z_.erase(idx_ctns);
+      else if (previous != md_.support_member_max_z_.end())
+        previous->second = std::max(previous->second, hit->second.maximum_z);
+      else if (md_.occupancy_buffer_[idx_ctns] <= mp_.clamp_min_log_)
+        md_.support_member_max_z_.emplace(idx_ctns, hit->second.maximum_z);
+      // 无条目且概率尚未被原自由射线清空，说明旧非成员命中仍未解除。
+    }
 
     if (log_odds_update >= 0 && md_.occupancy_buffer_[idx_ctns] >= mp_.clamp_max_log_)
     {
@@ -677,10 +703,16 @@ void GridMap::updateOccupancyCallback(const ros::TimerEvent & /*event*/)
 bool GridMap::ingestLidarFrame(const std::vector<Eigen::Vector3d>& points,
                                const Eigen::Vector3d& paired_sensor_origin,
                                const Eigen::Quaterniond& paired_sensor_orientation,
-                               const Eigen::Vector3d& paired_body_pos)
+                               const Eigen::Vector3d& paired_body_pos,
+                               const std::vector<std::uint32_t>& ground_members)
 {
   if (mp_.sensor_type_ != "lidar" || points.empty())
     return false;
+  std::vector<char> members(points.size(), 0);
+  for (const auto index : ground_members) {
+    if (index >= members.size() || members[index]) return false;
+    members[index] = 1;
+  }
   Eigen::Quaterniond ray_q = paired_sensor_orientation;
   if (!ray_q.coeffs().allFinite() || ray_q.norm() < 1e-6 ||
       !paired_sensor_origin.allFinite() || !paired_body_pos.allFinite())
@@ -701,7 +733,9 @@ bool GridMap::ingestLidarFrame(const std::vector<Eigen::Vector3d>& points,
   // frames cannot attach a new pose to a previous frame's pending returns.
   const Eigen::Matrix3d sensor_r = ray_q.toRotationMatrix();
   std::vector<Eigen::Vector3d> accepted_points;
+  std::vector<char> accepted_members;
   accepted_points.reserve(points.size());
+  accepted_members.reserve(points.size());
   for (size_t i = 0; i < points.size(); ++i)
   {
     const Eigen::Vector3d& pt = points[i];
@@ -723,6 +757,7 @@ bool GridMap::ingestLidarFrame(const std::vector<Eigen::Vector3d>& points,
     if (!in_local_range && ray_length <= mp_.max_ray_length_)
       continue;
     accepted_points.push_back(pt_world);
+    accepted_members.push_back(members[i]);
   }
   if (accepted_points.empty())
     return false;
@@ -734,6 +769,7 @@ bool GridMap::ingestLidarFrame(const std::vector<Eigen::Vector3d>& points,
   md_.has_cloud_ = true;
   updateSlidingMap(md_.ray_pos_);
   md_.proj_points_.swap(accepted_points);
+  md_.proj_ground_members_.swap(accepted_members);
   md_.proj_points_cnt = static_cast<int>(md_.proj_points_.size());
   md_.use_cloud_update_ = true;
   md_.occ_need_update_ = true;

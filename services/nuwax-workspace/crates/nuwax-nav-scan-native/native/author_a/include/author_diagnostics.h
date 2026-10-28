@@ -38,6 +38,11 @@ inline void traceMapProbe(std::ostream& out, GridMap& map,
  center.x()+=c*parameters.body_center_offset_.x()-s*parameters.body_center_offset_.y();
  center.y()+=s*parameters.body_center_offset_.x()+c*parameters.body_center_offset_.y();
  center.z()+=parameters.body_center_offset_.z();
+ out << ",\"collision_band\":[" << center.z()-parameters.obstacles_inflation_z_up
+     << ',' << center.z()+parameters.obstacles_inflation_z_down << ']';
+ out << ",\"map_min\":"; traceMatrix(out,parameters.map_min_boundary_);
+ out << ",\"map_max\":"; traceMatrix(out,parameters.map_max_boundary_);
+ out << ",\"support_evidence_cells\":" << map.mappingData().support_member_max_z_.size();
  const Eigen::Vector3d heading(c,s,0.);
  out << ",\"front_cell\":"; cell(center+parameters.double_cylinder_offset_*heading);
  out << ",\"rear_cell\":"; cell(center-parameters.double_cylinder_offset_*heading);

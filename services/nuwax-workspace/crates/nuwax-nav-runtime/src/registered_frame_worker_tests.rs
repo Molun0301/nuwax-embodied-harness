@@ -29,6 +29,7 @@ fn duplicate_registered_identity_does_not_replace_points_or_extend_original_dead
     let version=worker.shared.0.lock().unwrap().map_version;
     let mut duplicate=(*original).clone();
     duplicate.points_world=vec![[900.,900.,900.]].into();
+    duplicate.ground_point_indices=vec![0].into();
     duplicate.dispatch_bound=Some(CommandDispatchBound::from_source_timestamp(1,Duration::ZERO));
     worker.observe_registered_frame(Some(Arc::new(duplicate)));
     let input=worker.shared.0.lock().unwrap();

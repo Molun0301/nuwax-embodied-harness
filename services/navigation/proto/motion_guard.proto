@@ -279,6 +279,20 @@ message StopAllMotionResponse {
 
 }
 
+// 设备命令帧的实际策略；平面变换与 Python MotionCommandLimits 使用同一系数。
+message MotionCommandLimits {
+  double max_linear_x_mps = 1;
+  double max_linear_y_mps = 2;
+  double max_angular_z_rps = 3;
+  optional double max_planar_speed_mps = 4;
+  string source = 5;
+  string input_frame_id = 6;
+  string limit_frame_id = 7;
+  repeated double command_from_input_rotation = 8; // 按行排列的2×2矩阵。
+  double input_origin_in_command_x_m = 9;
+  double input_origin_in_command_y_m = 10;
+}
+
 message GetReadinessResponse {
   reserved 4, 6, 10;
   reserved "epoch_durable", "generation", "recovery_fence_held";
@@ -289,6 +303,7 @@ message GetReadinessResponse {
   bytes boot_nonce = 7;
   bool startup_zero_confirmed = 8;
   uint64 motion_stop_generation = 9;
+  MotionCommandLimits command_limits = 11;
 
 }
 

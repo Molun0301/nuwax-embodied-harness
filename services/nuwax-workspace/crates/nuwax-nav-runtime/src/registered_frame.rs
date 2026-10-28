@@ -41,6 +41,8 @@ pub struct RegisteredFrame {
     pub identity: RegisteredFrameIdentity,
     /// Complete registered returns, including ground returns.
     pub points_world: Arc<[[f64; 3]]>,
+    /// 原始发布者认定的同帧地面成员下标，不按当前高度重新推测。
+    pub ground_point_indices: Arc<[u32]>,
     /// Same-frame calibrated sensor origin, never filled from latest odometry.
     pub sensor_origin_world: [f64; 3],
     /// Same-frame frozen body position.
@@ -70,6 +72,7 @@ pub(crate) fn test_frame(sequence:i64) -> Arc<RegisteredFrame> {
             sequence,timestamp_ns:1_000_000_000+sequence,
         },
         points_world:vec![[0.0,0.0,0.0],[1.0,0.0,0.0]].into(),
+        ground_point_indices:Arc::from([]),
         sensor_origin_world:[0.5,1.0,0.5],body_position_world:[0.5,1.0,0.5],
         body_orientation_xyzw:[0.0,0.0,0.0,1.0],paired_odometry_sequence:sequence,
         paired_odometry_timestamp_ns:900_000_000+sequence,dispatch_bound:None,

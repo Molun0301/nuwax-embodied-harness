@@ -52,6 +52,9 @@ void nuwax_scan_session_set_static_fixture(void *session,int enabled);
 /* Runtime validates frame identity/lifecycle/freshness before this synchronous transport. */
 int nuwax_scan_session_ingest_registered_frame(void *session,const ScanConfig *config,const double *points,size_t count,
  const double origin[3],const double body_position[3],int64_t timestamp_ns);
+/* 地面成员下标必须来自同一个已接纳注册帧；缺身份沿旧入口保留完整占据。 */
+int nuwax_scan_session_ingest_registered_frame_with_ground(void *session,const ScanConfig *config,const double *points,size_t count,
+ const uint32_t *ground_members,size_t ground_count,const double origin[3],const double body_position[3],int64_t timestamp_ns);
 void nuwax_scan_free(ScanOutput *output);
 #ifdef __cplusplus
 }

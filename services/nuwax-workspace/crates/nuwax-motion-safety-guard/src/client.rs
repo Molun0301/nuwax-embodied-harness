@@ -55,7 +55,7 @@ impl Default for ClientConfig {
 }
 
 /// Typed NAV readiness returned by the guard.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReadinessStatus {
     /// Whether a NAV lease may be acquired now.
     pub ready: bool,
@@ -69,6 +69,8 @@ pub struct ReadinessStatus {
     pub startup_zero_confirmed: bool,
     /// Guard-owned global-stop barrier sampled with this readiness result.
     pub motion_stop_generation: u64,
+    /// 设备实际命令限制，缺失保持未知，不构造默认声明。
+    pub command_limits: Option<crate::wire::MotionCommandLimits>,
 }
 
 /// Immutable request-level proof authorizing one direct lease acquisition.
@@ -396,6 +398,12 @@ impl MotionGuardClient {
         let motion_guard_response::Outcome::GetReadiness(response) = outcome else {
             unreachable!("exchange already correlated the outcome")
         };
+        if let Some(limits) = &response.command_limits {
+            if let Err(reason)=limits.validate() {
+                self.poison(reason.clone());
+                return Err(MotionGuardClientError::Protocol(reason));
+            }
+        }
         Ok(ReadinessStatus {
             ready: response.ready,
             actuator_configured: response.actuator_configured,
@@ -403,6 +411,7 @@ impl MotionGuardClient {
             boot_nonce: response.boot_nonce,
             startup_zero_confirmed: response.startup_zero_confirmed,
             motion_stop_generation: response.motion_stop_generation,
+            command_limits: response.command_limits,
         })
     }
 
@@ -1037,6 +1046,36 @@ fn outcome_result(outcome: &motion_guard_response::Outcome) -> Option<&GuardResu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn real_readiness_transfers_device_axes_and_rigid_transform_without_defaults() {
+        let (stream,mut peer)=UnixStream::pair().unwrap();
+        let mut client=MotionGuardClient {stream:Some(stream),config:ClientConfig::default(),
+            lease_tuple:None,poison_reason:None,renewal_due_at:None,measured_motion:Default::default()};
+        let limits=crate::wire::MotionCommandLimits {max_linear_x_mps:1.,max_linear_y_mps:0.2,
+            max_angular_z_rps:1.,source:"设备实际声明".into(),input_frame_id:"imu".into(),
+            limit_frame_id:"base_link".into(),command_from_input_rotation:vec![1.,0.,0.,1.],
+            input_origin_in_command_x_m:-0.0256,..Default::default()};
+        let expected=limits.clone();
+        let server=tokio::spawn(async move {
+            for declared in [Some(limits),None] {
+                let size=peer.read_u32().await.unwrap();let mut bytes=vec![0;size as usize];
+                peer.read_exact(&mut bytes).await.unwrap();
+                let request=MotionGuardRequest::decode(bytes.as_slice()).unwrap();
+                let outcome=crate::wire::GetReadinessResponse {
+                    result:Some(GuardResult {ack:AckCode::Received as i32,
+                        lease:crate::wire::LeaseState::Idle as i32,error:None}),
+                    ready:true,actuator_configured:true,startup_zero_confirmed:true,
+                    boot_nonce:vec![7;16],command_limits:declared,..Default::default()};
+                let response=MotionGuardResponse {api_version:API_VERSION,request_id:request.request_id,
+                    outcome:Some(motion_guard_response::Outcome::GetReadiness(outcome)),..Default::default()}.encode_to_vec();
+                peer.write_u32(response.len() as u32).await.unwrap();peer.write_all(&response).await.unwrap();
+            }
+        });
+        assert_eq!(client.get_readiness().await.unwrap().command_limits,Some(expected));
+        assert!(client.get_readiness().await.unwrap().command_limits.is_none());
+        server.await.unwrap();
+    }
 
     #[test]
     fn dispatch_deadline_rejects_at_and_after_fixed_bound_without_one_ns_extension() {

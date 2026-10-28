@@ -115,11 +115,6 @@ extern "C" int nuwax_scan_session_plan(void* raw,SCAN_ARGUMENTS) {
   for(size_t i=0;i<forbidden_count;++i)forbidden.emplace_back(forbidden_columns[2*i],forbidden_columns[2*i+1]);
   auto business=std::make_shared<BusinessConstraintMask>(c.resolution,c.body_length,c.body_width,c.body_center_x,c.body_center_y,std::move(polygon),forbidden);
   map->setBusinessConstraintQuery([business](const Vector3d& p,double yaw){return business->rejects(p,yaw);});
-  // 起点必须使用当前实测机体查询；已有曲线的计划时刻不能代替实际位置。
-  if(map->getInflateOccupancy(position,start_yaw)!=0)
-   throw std::runtime_error(business->rejects(position,start_yaw)
-    ? "Current body pose is outside the explicit user boundary or forbidden mask"
-    : "Current body pose is occupied or outside the local map");
   if(scan_planner::authorTraceEnabled()) {
    auto out=scan_planner::authorTraceStream();
    out << "{\"event\":\"map_probes\",\"stamp_ns\":" << odometry_timestamp_ns
@@ -129,6 +124,11 @@ extern "C" int nuwax_scan_session_plan(void* raw,SCAN_ARGUMENTS) {
    scan_planner::traceMapProbe(out,*map,position+Vector3d(.5*std::cos(start_yaw),.5*std::sin(start_yaw),0.),start_yaw);
    out << "}\n";
   }
+  // 起点必须使用当前实测机体查询；已有曲线的计划时刻不能代替实际位置。
+  if(map->getInflateOccupancy(position,start_yaw)!=0)
+   throw std::runtime_error(business->rejects(position,start_yaw)
+    ? "Current body pose is outside the explicit user boundary or forbidden mask"
+    : "Current body pose is occupied or outside the local map");
   auto odom=std::make_shared<nav_msgs::Odometry>();odom->pose.pose.position.x=position.x();odom->pose.pose.position.y=position.y();odom->pose.pose.position.z=position.z();
   odom->pose.pose.orientation.w=std::cos(start_yaw/2.);odom->pose.pose.orientation.z=std::sin(start_yaw/2.);
   if(start_velocity){odom->twist.twist.linear.x=start_velocity[0];odom->twist.twist.linear.y=start_velocity[1];odom->twist.twist.linear.z=start_velocity[2];}
@@ -149,7 +149,13 @@ extern "C" int nuwax_scan_session_plan(void* raw,SCAN_ARGUMENTS) {
      // same calibrated constant; this reversible transport conversion is not a terrain projection.
      p.pose.position.z=reference[3*i+2]-c.body_to_ground;path->poses.push_back(p);}
     if(scan_planner::authorTraceEnabled()){auto out=scan_planner::authorTraceStream();out<<"{\"event\":\"reference_event\",\"stamp_ns\":"<<odometry_timestamp_ns<<",\"points\":[";for(size_t i=0;i<incoming.size();++i){if(i)out<<',';out<<incoming[i];}out<<"]}\n";}
-    s.fsm->onReferencePath(path);if(!s.fsm->hasTarget())throw std::runtime_error(scan_native_diagnostic.empty()?"Author A reference path was not accepted":scan_native_diagnostic);s.reference=std::move(incoming);s.cycle_complete=false;s.execution_failed=false;
+    s.fsm->onReferencePath(path);
+    if(!s.fsm->hasTarget()) {
+     const std::string reason=scan_native_diagnostic.empty()?"Author A reference path was not accepted":scan_native_diagnostic;
+     // 新参考明确失败时退休完整执行拥有者，旧控制器不能凭先前目标继续导出速度。
+     s.retireExecution();throw std::runtime_error(reason);
+    }
+    s.reference=std::move(incoming);s.cycle_complete=false;s.execution_failed=false;
    }
    // Current host cadence is the real caller cadence. No fabricated catch-up
    // timer ticks using a single physical odometry sample.
@@ -272,7 +278,11 @@ extern "C" void nuwax_scan_free(ScanOutput* p){std::free(p->samples);p->samples=
 
 extern "C" int nuwax_scan_session_ingest_registered_frame(void* p,const ScanConfig* config,const double* points,size_t count,
  const double origin[3],const double body_position[3],int64_t timestamp) {
- if(!p||!config||!origin||!body_position||(count&&!points))return 1;
+ return nuwax_scan_session_ingest_registered_frame_with_ground(p,config,points,count,nullptr,0,origin,body_position,timestamp);
+}
+extern "C" int nuwax_scan_session_ingest_registered_frame_with_ground(void* p,const ScanConfig* config,const double* points,size_t count,
+ const uint32_t* ground_members,size_t ground_count,const double origin[3],const double body_position[3],int64_t timestamp) {
+ if(!p||!config||!origin||!body_position||(count&&!points)||(ground_count&&!ground_members))return 1;
  auto& s=*static_cast<AuthorSession*>(p);
  RegisteredFrame f;f.origin=Eigen::Map<const Vector3d>(origin);f.body=Eigen::Map<const Vector3d>(body_position);
  // All points already use map axes. Identity denotes that coordinate basis,
@@ -281,9 +291,11 @@ extern "C" int nuwax_scan_session_ingest_registered_frame(void* p,const ScanConf
  if(!f.origin.allFinite()||!f.body.allFinite())return 1;
  f.timestamp=timestamp;f.points.reserve(count);
  for(size_t i=0;i<count;++i)f.points.emplace_back(Eigen::Map<const Vector3d>(points+i*3));
+ std::vector<std::uint32_t> members;
+ if(ground_count)members.assign(ground_members,ground_members+ground_count);
  try {
   s.configure(*config);
-  if(!s.fsm->manager().grid_map_->ingestLidarFrame(f.points,f.origin,f.orientation,f.body))return 1;
+  if(!s.fsm->manager().grid_map_->ingestLidarFrame(f.points,f.origin,f.orientation,f.body,members))return 1;
   s.frame=std::move(f);s.has_frame=true;s.safety_dirty=true;return 0;
  } catch(const std::exception&) {return 1;}
 }

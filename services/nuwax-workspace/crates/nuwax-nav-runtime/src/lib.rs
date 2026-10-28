@@ -2667,13 +2667,18 @@ pub async fn spawn_production_scheduler_with_backend(
 pub async fn spawn_production_surface_scheduler(
     socket_path: impl Into<PathBuf>,
     config: SchedulerConfig,
-    surface_config: SurfaceFollowerConfig,
+    mut surface_config: SurfaceFollowerConfig,
 ) -> Result<(NavSchedulerHandle, JoinHandle<Result<(), RuntimeError>>), RuntimeError> {
     validate_config(config)?;
-    let backend = production_surface_backend(surface_config)?;
-    let motion = ProductionNavMotionPort::connect(production_client_config(socket_path))
+    // 先校验标定，再连接原守卫查询真实设备限制，不创建第二个设备执行器。
+    let _ = SurfaceFollower::new(surface_config.clone())?;
+    let mut motion = ProductionNavMotionPort::connect(production_client_config(socket_path))
         .await
         .map_err(|error| RuntimeError::Motion(error.message))?;
+    let readiness=motion.normal_client().await.map_err(|error|RuntimeError::Motion(error.message))?
+        .get_readiness().await.map_err(|error|RuntimeError::Motion(error.to_string()))?;
+    surface_config.command_limits=readiness.command_limits;
+    let backend = production_surface_backend(surface_config)?;
     Ok(spawn_scheduler(NavScheduler::new(motion, backend, config)?))
 }
 

@@ -54,5 +54,18 @@ class RouteHeightReference {
     }
     return points.back().z();
   }
+  // 计划参考速度由同一原时间到弧长映射求导，不能当作实际运动边界。
+  Eigen::Vector3d velocityAtTime(double t)const {
+    if(!ready() || t<times.front() || t>=times.back())return Eigen::Vector3d::Zero();
+    const size_t ti=std::upper_bound(times.begin(),times.end(),t)-times.begin();
+    const double duration=times[ti]-times[ti-1];
+    if(!(duration>0.))return Eigen::Vector3d::Zero();
+    const double arc=arcAtTime(t);
+    const size_t pi=std::upper_bound(arcs.begin(),arcs.end(),arc)-arcs.begin();
+    if(pi==0 || pi>=points.size())return Eigen::Vector3d::Zero();
+    const double length=arcs[pi]-arcs[pi-1];
+    if(!(length>0.))return Eigen::Vector3d::Zero();
+    return (points[pi]-points[pi-1])*((timed_arcs[ti]-timed_arcs[ti-1])/(duration*length));
+  }
 };
 }

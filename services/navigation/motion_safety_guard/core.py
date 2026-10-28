@@ -231,6 +231,15 @@ class MotionGuardCore:
         outcome.boot_nonce = self._boot_nonce
         outcome.startup_zero_confirmed = self._startup_zero_confirmed
         outcome.motion_stop_generation = self._motion_stop_generation
+        getter = getattr(self._actuator, "get_motion_command_limits", None)
+        try:
+            limits = getter() if callable(getter) else None
+        except ActuatorError as exc:
+            raise GuardFailure(exc.code, exc.message) from exc
+        if limits is not None:
+            values = limits.model_dump(exclude={"rounding_relative_tolerance"}, exclude_none=True)
+            values["command_from_input_rotation"] = [value for row in limits.command_from_input_rotation for value in row]
+            outcome.command_limits.CopyFrom(pb.MotionCommandLimits(**values))
         return response
 
     def _handle_get_guard_state(self, request, _peer, _source):

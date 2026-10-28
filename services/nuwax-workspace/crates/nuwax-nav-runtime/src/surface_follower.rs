@@ -27,6 +27,8 @@ pub struct SurfaceFollowerConfig {
     pub motion_limits: Option<MotionLimits>,
     /// 无完整制动标定时已有的运动通道。
     pub basic_kinematics: Option<MotionKinematics>,
+    /// 守卫转交的设备命令帧限制，供局部搜索预留刚体变换耦合量。
+    pub command_limits: Option<nuwax_motion_safety_guard::wire::MotionCommandLimits>,
     /// 感知拥有方配置的来源时效。
     pub max_observation_age_sec: Option<f64>,
     /// 原速度、周期和目标容差。
@@ -67,6 +69,7 @@ impl SurfaceFollowerConfig {
             body_to_support_z_m,
             motion_limits: None,
             basic_kinematics: None,
+            command_limits: None,
             max_observation_age_sec: None,
             controller: LocalPlannerConfig::default_config(),
             max_angular_speed_rps: 0.55,
@@ -123,6 +126,11 @@ impl SurfaceFollower {
     pub fn measured_boundary(&self)->Option<&crate::motion_feedback::MotionBoundary> {self.motion_boundary.as_ref()}
     /// 构造纯计算后端。
     pub fn new(config: SurfaceFollowerConfig) -> Result<Self, RuntimeError> {
+        if let Some(limits)=&config.command_limits {
+            limits.validate().map_err(|reason|RuntimeError::InvalidInput {
+                field:"surface.command_limits",reason,
+            })?;
+        }
         if let Some(limits) = &config.motion_limits {
             limits
                 .validate()
@@ -339,6 +347,14 @@ impl SurfaceFollower {
                 .angular_acceleration_rps2
                 .min(limits.guaranteed_angular_braking_rps2);
         }
+        if let Some(limits) = &self.config.command_limits {
+            let [forward,reverse,lateral,yaw] = limits.search_bounds(config.max_velocity,
+                config.max_reverse_velocity,config.max_lateral_velocity,config.max_yaw_rate);
+            config.max_velocity=forward;
+            config.max_reverse_velocity=reverse;
+            config.max_lateral_velocity=lateral;
+            config.max_yaw_rate=yaw;
+        }
         if let Some(body) = map.body_envelope() {
             let bounds = body.footprint_xy_m.iter().fold(
                 [[f64::INFINITY; 2], [f64::NEG_INFINITY; 2]],
@@ -419,7 +435,7 @@ impl SurfaceFollower {
                 self.motion_dispatch_bound=Some(self.motion_dispatch_bound.map_or(bound,|old|old.earliest(bound)));
             }
             if self.ingested_frame.as_ref()!=Some(&frame.identity) {
-                self.native_planner.ingest_registered_frame(&config,&frame.points_world,
+                self.native_planner.ingest_registered_frame_with_ground(&config,&frame.points_world,&frame.ground_point_indices,
                     frame.sensor_origin_world,frame.body_position_world,frame.identity.timestamp_ns)?;
                 tracing::debug!(target:"navigation.registered_frame", source=?frame.identity,
                     paired_odometry_sequence=frame.paired_odometry_sequence,
@@ -768,6 +784,35 @@ mod native_execution_tests {
             )
             .unwrap();
         follower
+    }
+    #[test]
+    fn actual_scan_commands_fit_device_limits_after_reference_point_transform() {
+        let (_,source)=crate::native_test_helpers::fixture();
+        let mut local=follower(pose(0.5,1.5,0.3),source);
+        let motion=local.config.motion_limits.as_mut().unwrap();
+        motion.model=nuwax_nav_types_messages::MotionModel::Omnidirectional;
+        motion.max_lateral_mps=0.5;
+        local.config.command_limits=Some(nuwax_motion_safety_guard::wire::MotionCommandLimits {
+            max_linear_x_mps:1.,max_linear_y_mps:0.2,max_angular_z_rps:1.,
+            source:"Go2测试设备声明".into(),input_frame_id:"imu".into(),limit_frame_id:"base_link".into(),
+            command_from_input_rotation:vec![1.,0.,0.,1.],input_origin_in_command_x_m:-0.0256,
+            ..Default::default()
+        });
+        let mut moving=0;
+        for _ in 0..40 {
+            next_sample(&mut local);
+            match local.step(0.2) {
+                PlannerStep::Command(command)=>{
+                    let x=command.linear.x;
+                    let y=command.linear.y+0.0256*command.angular_z;
+                    assert!(x.abs()<=1. && y.abs()<=0.2 && command.angular_z.abs()<=1.,"{command:?}");
+                    moving+=usize::from(command!=Twist2::ZERO);
+                    local.observe_applied_command(command);
+                }
+                other=>panic!("有效平地必须实际输出受约束命令：{other:?}"),
+            }
+        }
+        assert!(moving>0,"不能用持续零速通过设备约束验收");
     }
     fn unknown() -> Arc<SurfaceSnapshot> {
         let (_, known) = crate::native_test_helpers::fixture();

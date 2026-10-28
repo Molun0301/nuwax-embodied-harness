@@ -73,6 +73,14 @@ class MotionControlActuator:
     def supports_motion_feedback(self) -> bool:
         return callable(getattr(self._control, "get_motion_execution_feedback", None))
 
+    def get_motion_command_limits(self):
+        """转交设备已有声明；不另写一份导航速度配置。"""
+        getter = getattr(self._control, "get_motion_command_limits", None)
+        limits = getter() if callable(getter) else None
+        if limits is not None and limits.input_frame_id != self._frame_id:
+            raise ActuatorError("ACTUATOR_CONFIG_INVALID", "设备速度声明与守卫命令参考帧不一致。")
+        return limits
+
     def get_motion_execution_feedback(self):
         getter = getattr(self._control, "get_motion_execution_feedback", None)
         return getter() if callable(getter) else None

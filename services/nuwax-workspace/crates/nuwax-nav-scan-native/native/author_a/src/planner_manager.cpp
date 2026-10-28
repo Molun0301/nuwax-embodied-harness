@@ -8,6 +8,92 @@ namespace scan_planner
 {
   namespace
   {
+    // 与正时距域求交：常数项非负，负二次项只有一个非负出口。
+    bool intersectTimeBound(double a, double b, double c, double& lower, double& upper)
+    {
+      if (a == 0.) {
+        if (b < 0.) lower = std::max(lower, -c / b);
+        else if (b > 0.) upper = std::min(upper, -c / b);
+        else if (c > 0.) return false;
+      } else {
+        const double discriminant = b * b - 4. * a * c;
+        if (discriminant < 0.) return false;
+        const double root = std::sqrt(discriminant);
+        if (a < 0.) lower = std::max(lower, b < 0. ? 2. * c / (root - b) : (b + root) / (-2. * a));
+        else {
+          const double right = (-b + root) / (2. * a);
+          if (!(right > 0.)) return false;
+          lower = std::max(lower, c / (a * right));
+          upper = std::min(upper, right);
+        }
+      }
+      return upper > 0. && lower <= upper;
+    }
+
+    bool retimeReferenceControls(Eigen::MatrixXd& controls, const std::vector<double>& arcs, double& dt,
+        const Eigen::Vector3d& start, const Eigen::Vector3d& velocity, const Eigen::Vector3d& acceleration,
+        const Eigen::Vector3d& target, const Eigen::Vector3d& target_velocity,
+        double max_velocity, double max_acceleration)
+    {
+      const int count = controls.cols();
+      Eigen::MatrixXd positions = controls;
+      Eigen::MatrixXd velocities = Eigen::MatrixXd::Zero(3, count);
+      Eigen::MatrixXd accelerations = Eigen::MatrixXd::Zero(3, count);
+      // 时距变化时重建真实边界；直接整体放慢会篡改非零实测导数。
+      for (int i = 0; i < 3; ++i) {
+        positions.col(i) = start;
+        positions.col(count - 3 + i) = target;
+      }
+      velocities.col(0) = -velocity; velocities.col(2) = velocity;
+      velocities.col(count - 3) = -target_velocity; velocities.col(count - 1) = target_velocity;
+      accelerations.col(0) = accelerations.col(2) = acceleration / 3.;
+      accelerations.col(1) = -acceleration / 6.;
+      double first_corner = arcs.back(), last_corner = arcs.front();
+      for (int i = 3; i + 2 < count - 3; ++i) {
+        if (arcs[i] == arcs[i + 1] && arcs[i] == arcs[i + 2]) {
+          first_corner = std::min(first_corner, arcs[i]);
+          last_corner = std::max(last_corner, arcs[i]);
+        }
+      }
+      // 非零边界沿首末原直段衰减；不能把前进中的端点骤接到静止初值而产生回头。
+      for (int i = 3; i < count - 3; ++i) {
+        const double from = first_corner > arcs.front()
+            ? std::clamp((first_corner - arcs[i]) / (first_corner - arcs.front()), 0., 1.) : 0.;
+        const double to = arcs.back() > last_corner
+            ? std::clamp((arcs[i] - last_corner) / (arcs.back() - last_corner), 0., 1.) : 0.;
+        velocities.col(i) = from * velocity - to * target_velocity;
+        accelerations.col(i) = from * acceleration / 3.;
+      }
+      double lower = dt, upper = std::numeric_limits<double>::infinity();
+      for (int i = 0; i + 1 < count; ++i) {
+        const Eigen::Vector3d p = positions.col(i + 1) - positions.col(i);
+        const Eigen::Vector3d v = velocities.col(i + 1) - velocities.col(i);
+        const Eigen::Vector3d a = accelerations.col(i + 1) - accelerations.col(i);
+        // 无加速度项时精确求速度范数；其余用三角不等式给出保守充分界。
+        const bool feasible = a.isZero(0.)
+            ? intersectTimeBound(v.squaredNorm() - max_velocity * max_velocity,
+                2. * p.dot(v), p.squaredNorm(), lower, upper)
+            : intersectTimeBound(a.norm(), v.norm() - max_velocity, p.norm(), lower, upper);
+        if (!feasible) return false;
+      }
+      for (int i = 0; i + 2 < count; ++i) {
+        const Eigen::Vector3d p = positions.col(i + 2) - 2. * positions.col(i + 1) + positions.col(i);
+        const Eigen::Vector3d v = velocities.col(i + 2) - 2. * velocities.col(i + 1) + velocities.col(i);
+        const Eigen::Vector3d a = accelerations.col(i + 2) - 2. * accelerations.col(i + 1) + accelerations.col(i);
+        if (!intersectTimeBound(a.norm() - max_acceleration, v.norm(), p.norm(), lower, upper)) return false;
+      }
+      // 覆盖浮点差分舍入，最终仍按原严格上限核验，且不新增求解重试。
+      dt = std::nextafter(lower * (1. + std::numeric_limits<double>::epsilon() * (count + 4)),
+          std::numeric_limits<double>::infinity());
+      if (!std::isfinite(dt) || dt > upper) return false;
+      controls = positions + velocities * dt + accelerations * (dt * dt);
+      for (int i = 0; i + 1 < count; ++i) {
+        const Eigen::Vector3d direction = positions.col(i + 1) - positions.col(i);
+        if ((controls.col(i + 1) - controls.col(i)).dot(direction) < 0.) return false;
+      }
+      return controls.allFinite();
+    }
+
     bool buildReferenceControls(const RouteHeightReference& route, const Eigen::Vector3d& start,
         const Eigen::Vector3d& target, int count, double resolution, double max_velocity, double max_acceleration,
         Eigen::MatrixXd& controls, std::vector<double>& control_arcs)
@@ -556,28 +642,24 @@ namespace scan_planner
 
     bool accepted = flag_step_2_success && checkDynamicFeasibility(pos)
         && (!route_time_seed || (trajectoryCollisionFree(pos) && strictDynamicScale(pos) <= 1.));
-    if (!accepted && reference_free && start_vel.isZero(0.) && start_acc.isZero(0.)
-        && local_target_vel.isZero(0.)) {
-      // 零边界下只缩放时间，位置几何、端点和零导数保持；上界来自原控制多边形。
-      double scale = 1.;
-      for (int i = 0; i + 1 < reference_controls.cols(); ++i)
-        scale = std::max(scale, (reference_controls.col(i + 1) - reference_controls.col(i)).norm()
-            / (reference_dt * pp_.max_vel_));
-      for (int i = 0; i + 2 < reference_controls.cols(); ++i)
-        scale = std::max(scale, std::sqrt((reference_controls.col(i + 2) - 2. * reference_controls.col(i + 1)
-            + reference_controls.col(i)).norm() / (reference_dt * reference_dt * pp_.max_acc_)));
-      // 向保守方向覆盖浮点差分舍入，不放宽最终速度/加速度上限比较。
-      scale = std::nextafter(scale * (1. + std::numeric_limits<double>::epsilon()
-          * (reference_controls.cols() + 4)), std::numeric_limits<double>::infinity());
-      UniformBspline retained(reference_controls, 3, reference_dt * scale);
-      if (trajectoryCollisionFree(retained) && checkDynamicFeasibility(retained)
-          && strictDynamicScale(retained) <= 1.) {
-        pos = std::move(retained);
-        accepted = true;
-        if (authorTraceEnabled()) {
-          auto out = authorTraceStream();
-          out << "{\"event\":\"retained_reference_seed\",\"scale\":" << scale
-              << ",\"duration\":" << pos.getTimeSum() << "}\n";
+    // 首条轨迹缺少可执行历史，允许保留真实非零边界；执行中仍沿用原保留条件。
+    const bool retain_boundary = local_data_.traj_id_ == 0
+        || (start_vel.isZero(0.) && start_acc.isZero(0.) && local_target_vel.isZero(0.));
+    if (!accepted && reference_free && retain_boundary) {
+      Eigen::MatrixXd retained_controls = reference_controls;
+      double retained_dt = reference_dt;
+      if (retimeReferenceControls(retained_controls, seed_control_arcs, retained_dt, start_pt, start_vel, start_acc,
+          local_target_pt, local_target_vel, pp_.max_vel_, pp_.max_acc_)) {
+        UniformBspline retained(retained_controls, 3, retained_dt);
+        if (trajectoryCollisionFree(retained) && checkDynamicFeasibility(retained)
+            && strictDynamicScale(retained) <= 1.) {
+          pos = std::move(retained);
+          accepted = true;
+          if (authorTraceEnabled()) {
+            auto out = authorTraceStream();
+            out << "{\"event\":\"retained_reference_seed\",\"scale\":" << retained_dt / reference_dt
+                << ",\"duration\":" << pos.getTimeSum() << "}\n";
+          }
         }
       }
     }

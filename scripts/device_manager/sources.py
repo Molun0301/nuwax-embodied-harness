@@ -46,6 +46,8 @@ def discover(engine, *, refresh=False, request=None, local_request=False):
     cache = read_json(cache_path, {})
     identity = {"repository": repository, "branch": branch, "channel": settings["channel"]}
     if not refresh and not request and cache.get("identity") == identity:
+        if cache.get("pending"):
+            raise ManagerError("channel_pending", cache["message"], 409)
         if cache.get("error"):
             raise ManagerError("source_unavailable", cache["error"], 502)
         return cache["source"]
@@ -61,6 +63,9 @@ def discover(engine, *, refresh=False, request=None, local_request=False):
             info = remote_revision(repository, branch, run=run_command, allow_local=allow_local)
     except (SourceError, OSError, ManagerError) as exc:
         message = exc.message if isinstance(exc, ManagerError) else "无法访问仓库，请检查公开HTTPS地址、分支与网络。"
+        if isinstance(exc, ManagerError) and exc.code == "channel_pending":
+            atomic_json(cache_path, {"identity": identity, "pending": True, "message": message})
+            raise
         atomic_json(cache_path, {"identity": identity, "error": message})
         raise ManagerError("source_unavailable", message, 502) from exc
     # 计划查询也刷新真实分支提交；显式固定旧提交只影响本次计划，不能覆盖分支目录。
@@ -81,6 +86,8 @@ def bridge(engine, source, candidate, operation, job, **values):
     payload.update(prebuilt={"repository": source["repository"], "revision": source["revision"], "branch": source["branch"]},
                    local_build=bool(job["_plan"].get("_request", {}).get("local_build")),
                    background=bool(job["_plan"].get("_request", {}).get("automatic")))
+    if operation == "build" and source.get("prebuilt_index") is not None:
+        payload["prebuilt"]["index"] = source["prebuilt_index"]
     if not source["repository"].startswith("https://github.com/"):
         payload["prebuilt"] = None
     environment = clean_environment(candidate)

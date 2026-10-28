@@ -11,6 +11,16 @@ from .runtime import clean_environment
 
 
 def begin_update(engine, *, local_build=False, retry=False, automatic=False):
+    settings = engine.settings()
+    if settings.get("source_mode") == "git" and settings.get("channel") == "main":
+        engine.releases(refresh=True)
+        state = engine.status()
+        update = state["update"]
+        relation = update.get("relation")
+        if update.get("pending") or (not update.get("error") and state["installation"]["installed"] and
+                (relation in ("older", "diverged", "unknown") or (relation == "same" and not update.get("manager_available")))):
+            return {"status": "deferred", "relation": relation,
+                    "message": update.get("message") or "通道尚未出现可采用的新版本，保留当前安装，稍后再查。"}
     plan = engine.plan({"action": "update", "one_step": True, "local_build": local_build,
                         "retry": retry, "automatic": automatic}, local_request=True)
     if plan["blockers"]:
@@ -60,14 +70,14 @@ def wait_prebuilt(engine, source, job):
     request = job["_plan"].get("_request", {})
     if request.get("local_build") or not source["repository"].startswith("https://github.com/"):
         return
-    from scripts.neh_prebuilt import PrebuiltPending, PrebuiltUnavailable, fetch_index, platform_key, eligible_program_names
+    from scripts.neh_prebuilt import PrebuiltPending, PrebuiltUnavailable, fetch_index, validate_index, platform_key, eligible_program_names
     if not platform_key() or not eligible_program_names(job["_plan"]["modules"]):
         return
     while True:
         engine._cancelled(job["id"])
         try:
-            fetch_index(source["repository"], source["revision"])
-            return
+            index = fetch_index(source["repository"], source["revision"])
+            return validate_index(index, source["revision"], eligible_program_names(job["_plan"]["modules"]), platform_key())
         except PrebuiltPending:
             engine._progress(job, "prebuilt_pending", 18, "云端编译中；默认等待，每15分钟重查。可取消任务后选择本机编译。")
         except PrebuiltUnavailable:

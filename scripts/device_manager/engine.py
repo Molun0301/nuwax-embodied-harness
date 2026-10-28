@@ -281,7 +281,10 @@ class Engine:
                 result["releases"][-1].update(compatible=bool(compatible), reason="" if compatible else "没有与当前系统匹配的运行包",
                                               modules=sorted({m for a in compatible for m in a["modules"]}))
         except ManagerError as exc:
-            result["error"] = exc.message
+            if exc.code == "channel_pending":
+                result.update(pending=True, message=exc.message)
+            else:
+                result["error"] = exc.message
         return result
 
     def _job_path(self, job_id):
@@ -351,6 +354,7 @@ class Engine:
         return {"product": "NEH", "manager_version": MANAGER_VERSION, "manager_revision": MANAGER_REVISION, "manager_development": MANAGER_DEVELOPMENT, "instance_id": self.instance_id, "installation": installation,
                 "runtime": self.runtime.status(), "active_job": self.active_job(),
                 "update": {"available": bool(available and current and relation == 1 and not failed), "failed": failed or None,
+                           "pending": bool(releases.get("pending")), "message": releases.get("message"),
                            "requires_confirmation": channel_record.get("requires_confirmation", False), "display_version": available.get("display_version") if available else None,
                            "check": read_json(self.manager_home / "config/update-check.json", {}),
                            "version": available["version"] if available else None, "revision": available.get("revision") if available else None, "error": releases.get("error"), "manager_available": bool(latest_manager and manager_relation == 1 and not failed), "manager_version": latest_manager, "manager_switch_available": bool(latest_manager and manager_relation == 1 and not failed), "manager_relation": manager_relation_name, "relation": relation_name},
@@ -1063,7 +1067,7 @@ class Engine:
                              cancelled=lambda: self._cancelled(job["id"]),
                              progress=lambda message: self._progress(job, "source_download", 15, message)) as source:
             from .update_flow import wait_prebuilt
-            wait_prebuilt(self, selected, job)
+            source["prebuilt_index"] = wait_prebuilt(self, selected, job)
             candidate.mkdir()
             export_source(source["root"], source["revision"], candidate / "source")
             self._cancelled(job["id"])

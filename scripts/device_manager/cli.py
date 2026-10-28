@@ -203,7 +203,7 @@ def main(argv=None):
             else:
                 from .update_flow import begin_update
                 job = begin_update(engine, local_build=args.local_build, retry=args.retry)
-                result = wait_job(engine, job["id"])
+                result = job if job.get("status") == "deferred" else wait_job(engine, job["id"])
         elif command == "uninstall":
             from .uninstall import uninstall
             result = uninstall(engine, purge=args.purge)

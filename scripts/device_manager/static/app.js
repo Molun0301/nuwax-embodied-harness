@@ -826,7 +826,7 @@
       show(boxError, false);
       text($('availableVersion'), update.available ? (update.version || '--') : '仅管理程序有更新');
     } else {
-      text(updateBadge, ({older:'当前版本领先',diverged:'当前版本已分叉',unknown:'尚未确认版本关系'})[update.relation] || (update.failed ? '此版本此前更新失败' : '已是最新'));
+      text(updateBadge, update.pending ? '通道稍后再查' : (({older:'当前版本领先',diverged:'当前版本已分叉',unknown:'尚未确认版本关系'})[update.relation] || (update.failed ? '此版本此前更新失败' : '已是最新')));
       setClass(updateBadge, 'status-badge good');
       show(boxAvailable, false);
       show(boxNone, true);
@@ -2894,6 +2894,10 @@
     state.submitting = true;
     try {
       const job = await apiCall('/api/manager/update', {method:'POST', body:{local_build:Boolean($('updateLocalBuild') && $('updateLocalBuild').checked)}});
+      if (job.status === 'deferred') {
+        showMessage($('overviewLoadError'), job.message, 'info');
+        return;
+      }
       showView('jobs');
       trackJob(job.id);
       loadJobsView();

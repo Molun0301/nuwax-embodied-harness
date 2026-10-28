@@ -122,8 +122,28 @@ def _urlopen(url: str, *, timeout: int):
     return response
 
 
+def validate_index(payload: Mapping, revision: str, programs: Iterable[str] = (), target_platform: Optional[str] = None) -> dict:
+    """索引旧内容或选中项暂缺只等待；其它无效内容继续严格拒绝。"""
+    if not isinstance(payload, dict) or payload.get("schema") != SCHEMA or not isinstance(payload.get("platforms"), dict):
+        raise ValueError("预编译索引身份不符")
+    if payload.get("revision") != revision:
+        if isinstance(payload.get("revision"), str) and _REVISION.fullmatch(payload["revision"]):
+            raise PrebuiltPending(revision)
+        raise ValueError("预编译索引提交无效")
+    for key, entry in payload["platforms"].items():
+        if key not in PLATFORMS or not isinstance(entry, dict) or not isinstance(entry.get("programs"), dict):
+            raise ValueError("预编译索引平台无效")
+        if not set(entry["programs"]).issubset(PROGRAMS) or payload.get("source_archives"):
+            raise ValueError("预编译索引包含禁止分发的LIO程序或源码包")
+    if target_platform is not None:
+        target = payload["platforms"].get(target_platform, {})
+        if not set(programs).issubset(target.get("programs", {})):
+            raise PrebuiltPending(revision)
+    return payload
+
+
 def fetch_index(repository: str, revision: str, *, timeout: int = 20) -> dict:
-    """只用匿名Release直链；404表示待构建，其余错误与等待状态分开。"""
+    """只用匿名Release直链；404或旧提交等待，其它无效内容单独拒绝。"""
     if not isinstance(revision, str) or not _REVISION.fullmatch(revision):
         raise ValueError("预编译索引需要完整提交")
     try:
@@ -131,15 +151,7 @@ def fetch_index(repository: str, revision: str, *, timeout: int = 20) -> dict:
             raw = response.read(4 * 1024 * 1024 + 1)
         if len(raw) > 4 * 1024 * 1024:
             raise ValueError("预编译索引过大")
-        payload = json.loads(raw)
-        if not isinstance(payload, dict) or payload.get("schema") != SCHEMA or payload.get("revision") != revision or not isinstance(payload.get("platforms"), dict):
-            raise ValueError("预编译索引身份不符")
-        for key, entry in payload["platforms"].items():
-            if key not in PLATFORMS or not isinstance(entry, dict) or not isinstance(entry.get("programs"), dict):
-                raise ValueError("预编译索引平台无效")
-            if not set(entry["programs"]).issubset(PROGRAMS) or payload.get("source_archives"):
-                raise ValueError("预编译索引包含禁止分发的LIO程序或源码包")
-        return payload
+        return validate_index(json.loads(raw), revision)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             raise PrebuiltPending(revision) from exc
@@ -591,7 +603,7 @@ def install_archive(root: Path, prefix: Path, cache: Path, program: str, entry: 
 
 
 def prepare_prebuilt(root: Path, prefix: Path, cache: Path, programs: Iterable[str], config: Mapping) -> tuple:
-    """返回已复用路径和可记录的指纹；仅缺索引时等待，其它失败逐程序回退。"""
+    """返回已复用路径和指纹；索引暂缺/旧内容等待，附件故障逐程序回退。"""
     programs = tuple(name for name in programs if name in PROGRAMS)
     if not programs:
         return {}, {}
@@ -606,14 +618,13 @@ def prepare_prebuilt(root: Path, prefix: Path, cache: Path, programs: Iterable[s
     if _capture(["git", "-C", str(root), "rev-parse", "HEAD"]) != revision:
         raise ValueError("预编译请求与实际源码提交不符")
     try:
-        index = fetch_index(repository, revision)
+        # 管理进程已读到完整索引时交接同一快照，避免构建子进程再次命中旧404。
+        index = config["index"] if "index" in config else fetch_index(repository, revision)
+        validate_index(index, revision, programs, key)
     except PrebuiltUnavailable as exc:
         print(str(exc) + "；退回本机编译。", flush=True)
         return {}, {}
     target = index["platforms"].get(key)
-    if not target:
-        print("版本索引缺少当前平台，退回本机编译。", flush=True)
-        return {}, {}
     binaries, fingerprints = {}, {}
     for program in programs:
         entry = target["programs"].get(program)

@@ -6,6 +6,7 @@ import json
 import random
 import re
 import time
+import urllib.error
 from urllib.parse import urlsplit
 
 from scripts.neh_source import SourceError, source_version
@@ -44,7 +45,11 @@ def read_channel(repository):
         if not isinstance(value.get("version"), str) or not value["version"]:
             raise ValueError("缺少显示版本")
         return value
-    except (ManagerError, SourceError, ValueError, TypeError, KeyError) as exc:
+    except (ManagerError, SourceError, ValueError, TypeError, KeyError, urllib.error.HTTPError) as exc:
+        cause = exc.__cause__ if isinstance(exc, ManagerError) else exc
+        if isinstance(cause, urllib.error.HTTPError) and cause.code == 404:
+            cause.close()
+            raise ManagerError("channel_pending", "main通道尚未可见，保留当前安装，稍后再查。", 409) from exc
         raise ManagerError("channel_unavailable", "main通道尚未就绪或无法读取，请等待云端检查与预编译完成。", 502) from exc
 
 
@@ -83,12 +88,17 @@ def tick(engine, *, now=None):
                 status = engine.status()
                 if status["update"].get("error"):
                     raise ManagerError("update_check", status["update"]["error"], 502)
-                state.update(revision=status["update"].get("revision"), relation=status["update"].get("relation"))
+                state.update(revision=status["update"].get("revision"), relation=status["update"].get("relation"),
+                             pending=bool(status["update"].get("pending")), message=status["update"].get("message"))
                 if (settings.get("auto_update") == "idle" and status["update"]["available"]
                         and not status["update"].get("requires_confirmation") and not engine.active_job()
                         and in_window(settings.get("maintenance_window", ""))):
                     from .update_flow import begin_update
-                    state["job_id"] = begin_update(engine, automatic=True)["id"]
+                    result = begin_update(engine, automatic=True)
+                    if result.get("id"):
+                        state["job_id"] = result["id"]
+                    else:
+                        state.update(pending=True, message=result["message"])
             except (ManagerError, OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
                 state["error"] = getattr(exc, "message", str(exc))
             atomic_json(path, state)

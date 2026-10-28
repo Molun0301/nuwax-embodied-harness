@@ -647,6 +647,14 @@ class Engine:
             try:
                 self._cancelled(job_id)
                 self._assert_location()
+                if job.get("_manager_adopted"):
+                    from .sources import normalized_settings
+                    expected = job["_plan"]["_fingerprint"]
+                    migrated = dict(expected, settings=normalized_settings(expected["settings"]))
+                    # 只迁移新管理程序定义的默认值；真实配置、拥有方或版本变化仍须拒绝。
+                    if migrated == self._fingerprint():
+                        job["_plan"]["_fingerprint"] = migrated
+                        atomic_json(self._job_path(job_id), job)
                 if job["_plan"]["_fingerprint"] != self._fingerprint():
                     raise ManagerError("plan_stale", "任务执行前设备状态已变化，请重新生成计划。", 409)
                 result = self._execute(job)

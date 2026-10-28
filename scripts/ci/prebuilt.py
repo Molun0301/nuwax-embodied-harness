@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import datetime
 import json
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import traceback
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -71,6 +73,14 @@ def probe(output):
     dump(output, {"protocol": capture([os.environ.get("PROTOC", "protoc"), "--version"]), "lcm_generator": {"version": capture([generator, "--version"]), "sha256": common.sha256(Path(generator)), "wire_v3": "generated-and-linked"}, "packages": {name: capture(["pkg-config", "--modversion", name]) for name in ("lcm", "glib-2.0", "eigen3")}, "link": "passed"})
 
 
+def enable_ci_native_diagnostics():
+    for name in ("CFLAGS", "CXXFLAGS"):
+        flags = os.environ.get(name, "").strip()
+        if not shlex.split(flags) or shlex.split(flags)[-1] != "-MD":
+            os.environ[name] = (flags + " -MD").strip()
+    os.environ["CC_ENABLE_DEBUG_OUTPUT"] = "1"
+
+
 def identity(platform_key, root):
     cargo = Path(shutil.which("cargo") or "cargo")
     rustc = Path(shutil.which("rustc") or "rustc")
@@ -90,7 +100,7 @@ def identity(platform_key, root):
         "system_packages": capture(["dpkg-query", "-W", "-f=${binary:Package}=${Version}\n"]),
         "image": {"base": base_image, "dockerfile_sha256": common.sha256(root / "scripts/ci/prebuilt" / (platform_key + ".Dockerfile"))},
         # 不含路径和并行数；它们不改变代码语义，源码内优化配置由Git树覆盖。
-        "parameters": {"cargo": ["rustc", "--locked", "--release", "-vv", "--print=link-args"], "cmake": ["CMAKE_BUILD_TYPE=Release", "CMAKE_GENERATOR=Unix Makefiles"], "environment": {name: os.environ.get(name, "") for name in ("RUSTFLAGS", "CFLAGS", "CXXFLAGS", "LDFLAGS", "NUWAX_CXX20")}},
+        "parameters": {"cargo": ["rustc", "--locked", "--release", "-vv", "--print=link-args", "-Clink-arg=-Wl,-Map=$CACHE/audit-linkmaps/<program>.map"], "native_diagnostics": {"dependency": "-MD", "boost_compiler_wrapper": 1, "boost_map": "$CACHE/audit-linkmaps/boost/<output-digest>.map"}, "cmake": ["CMAKE_BUILD_TYPE=Release", "CMAKE_GENERATOR=Unix Makefiles"], "environment": {name: os.environ.get(name, "") for name in ("RUSTFLAGS", "CFLAGS", "CXXFLAGS", "LDFLAGS", "NUWAX_CXX20", "CC_ENABLE_DEBUG_OUTPUT")}},
     }
 
 
@@ -268,6 +278,49 @@ def rust_target(program, cache):
     return cache / "build/rust" / slots[builds._TARGET_ROLES[manifest]]["path"]
 
 
+def cmake_link_commands(text):
+    commands = []
+    for line in text.splitlines():
+        lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        current = []
+        for token in lexer:
+            if token in ("&&", ";", "||"):
+                if current:
+                    commands.append(current)
+                current = []
+            else:
+                current.append(token)
+        if current:
+            commands.append(current)
+    return commands
+
+
+def native_command_output(arguments):
+    tool = Path(arguments[0]).name
+    if tool in ("cmake", "cmake3") and arguments[1:3] == ["-E", "env"]:
+        position = next((index for index in range(3, len(arguments)) if "=" not in arguments[index]), None)
+        if position is None:
+            return None
+        return native_command_output(arguments[position:])
+    if tool in ("cmake", "cmake3") or "ranlib" in tool:
+        return None
+    if re.search(r"(?:^|[-_])ar(?:-[0-9.]+)?$", tool):
+        operation = next((index for index, value in enumerate(arguments[1:], 1) if re.fullmatch(r"-?[abcdDfilmMpNoOPqrstxSTuvV]+", value) and any(letter in value for letter in "dmpqrstx")), None)
+        if operation is None or operation + 1 >= len(arguments):
+            return None
+        return {"archive": True, "output": arguments[operation + 1], "object_arguments": arguments[operation + 2:], "arguments": arguments}
+    if "-o" in arguments:
+        index = arguments.index("-o")
+        if index + 1 < len(arguments):
+            return {"archive": False, "output": arguments[index + 1], "arguments": arguments}
+    combined = next((value[2:] for value in arguments if value.startswith("-o") and len(value) > 2), None)
+    if combined:
+        return {"archive": False, "output": combined, "arguments": arguments}
+    return None
+
+
 def native_link_evidence(program, cache, spec, linked, actual_inputs):
     target = rust_target(program, cache)
     packages = {item["name"] for item in spec["cargo_packages"]}
@@ -282,39 +335,41 @@ def native_link_evidence(program, cache, spec, linked, actual_inputs):
         private_ids[library.name] = private_ids[name]
     needed = {str(Path(item["path"]).resolve()) for item in resolve_link_inputs(linked["linker_arguments"], ROOT)}
     needed.update(str(Path(value).resolve()) for value in actual_inputs if Path(value).is_absolute())
-    candidates = sorted({path for directory in roots for path in directory.rglob("link.txt")})
+    candidates = [(path, index, command) for path in sorted({path for directory in roots for path in directory.rglob("link.txt")}) for index, command in enumerate(cmake_link_commands(path.read_text()))]
     result, visited = [], set()
     while True:
         changed = False
-        for path in candidates:
-            if path in visited:
+        for path, command_index, arguments in candidates:
+            if (path, command_index) in visited:
                 continue
-            command = path.read_text().strip()
+            command = shlex.join(arguments)
             cmake_root = next((parent for parent in path.parents if (parent / "CMakeCache.txt").is_file()), None)
             if cmake_root is None or path.parent.parent.name != "CMakeFiles":
                 raise RuntimeError("原生链接记录缺少CMake工作目录或构建根：" + str(path))
             cwd = path.parents[2]
-            arguments = shlex.split(command.splitlines()[0])
-            archive = Path(arguments[0]).name.endswith("ar")
-            output = arguments[2] if archive else arguments[arguments.index("-o") + 1] if "-o" in arguments else None
-            if output is None:
-                raise RuntimeError("原生链接记录无法定位输出：" + str(path))
-            destination = (cwd / output).resolve()
+            parsed_command = native_command_output(arguments)
+            if parsed_command is None:
+                if any(str(value) in needed or Path(value).name in private_ids for value in arguments) and not (Path(arguments[0]).name in ("cmake", "cmake3") or "ranlib" in Path(arguments[0]).name):
+                    raise RuntimeError("实际采用的原生链接命令无法解析：" + command)
+                continue
+            archive = parsed_command["archive"]
+            arguments = parsed_command["arguments"]
+            destination = (cwd / parsed_command["output"]).resolve()
             matches = str(destination) in needed
             if not matches and destination.name in private_ids and destination.is_file():
                 build_ids = re.findall(r"Build ID: (\S+)", capture(["readelf", "--notes", str(destination)]))
                 matches = bool(build_ids and build_ids == private_ids[destination.name])
             if not matches:
                 continue
-            visited.add(path)
+            visited.add((path, command_index))
             if archive:
-                parsed = [{"kind": "object", "path": str((cwd / value).resolve()), "exists_after_link": (cwd / value).is_file()} for value in arguments[3:] if value.endswith(".o")]
+                parsed = [{"kind": "object", "path": str((cwd / value).resolve()), "exists_after_link": (cwd / value).is_file()} for value in parsed_command["object_arguments"] if value.endswith(".o")]
                 if not parsed:
                     raise RuntimeError("静态归档链接记录无法解析：" + str(path))
             else:
                 parsed = resolve_link_inputs(arguments, cwd)
             needed.update(str(Path(item["path"]).resolve()) for item in parsed)
-            result.append({"record": str(path), "command": command, "output": str(destination), "inputs": parsed, "cmake_root": str(cmake_root), "working_directory": str(cwd)})
+            result.append({"record": str(path), "command": command, "output": str(destination), "inputs": parsed, "cmake_root": str(cmake_root), "working_directory": str(cwd), "command_index": command_index})
             changed = True
         if not changed:
             break
@@ -325,23 +380,300 @@ def native_link_evidence(program, cache, spec, linked, actual_inputs):
     return result, private
 
 
+def object_dependency(path):
+    for candidate in (Path(str(path) + ".d"), path.with_suffix(".d")):
+        if candidate.is_file():
+            return candidate
+    raise RuntimeError("实际采用的原生对象缺少编译器依赖记录（object.d/object.o.d）：" + str(path))
+
+
+def linker_map_members(linked):
+    path = Path(linked.get("link_map", "/nonexistent-link-map"))
+    if not path.is_file() or common.sha256(path) != linked.get("link_map_sha256"):
+        raise RuntimeError("缺少经最终ELF回执验证的实际GNU链接图")
+    text = path.read_text(encoding="utf-8", errors="strict")
+    if "Archive member included" not in text and "Linker script and memory map" not in text:
+        raise RuntimeError("无法解析实际GNU链接图格式")
+    members = sorted(set(re.findall(r"([^\s()]+\.(?:rlib|a))\(([^()\n]+)\)", text)))
+    return [{"archive": archive, "member": member} for archive, member in members if member.endswith((".o", ".obj", ".oS", ".os"))]
+
+
+def archive_adoption_evidence(program, cache, spec, linked):
+    target = rust_target(program, cache)
+    adopted = linker_map_members(linked)
+    def rust_member(name):
+        return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*-[0-9a-f]{16}\..*\.rcgu\.o", name))
+    wanted = {item["member"] for item in adopted if not rust_member(item["member"])}
+    candidates = {}
+    archive_members = {}
+    active_directories = []
+    for directory in (target / "release/build").iterdir():
+        if not any(str(directory) in argument for argument in linked["linker_arguments"]):
+            continue
+        output = directory / "output"
+        if not output.is_file():
+            continue
+        package_name = directory.name.rsplit("-", 1)[0]
+        owners = [item for item in spec["cargo_packages"] if item["name"] == package_name]
+        text = output.read_text()
+        names = set(re.findall(r"cargo(?:::|:)rustc-link-lib=static(?::[^=\n]+)?=([^\s]+)", text))
+        if not names:
+            continue
+        if len(owners) != 1:
+            raise RuntimeError("实际原生静态库的构建脚本包归属不唯一：" + str(directory))
+        active_directories.append({"directory": str(directory), "package": owners[0], "build_script_output": str(output)})
+        roots = [directory / "out"]
+        roots.extend(Path(value) for value in re.findall(r"cargo(?:::|:)rustc-link-search=(?:native=)?([^\n]+)", text))
+        archives = {archive.resolve() for root in roots if root.is_dir() and (root.resolve() == cache or cache in root.resolve().parents) for name in names for archive in root.rglob("lib" + name + ".a")}
+        for archive in archives:
+            members = capture(["ar", "t", str(archive)]).splitlines()
+            archive_members[str(archive)] = members
+            for member in wanted.intersection(members):
+                candidates.setdefault(member, []).append({"archive": str(archive), "package": owners[0], "build_script_output": str(output), "build_directory": str(directory)})
+    resolved, skipped, seen = [], [], set()
+    sysroot = Path(capture(["rustc", "--print", "sysroot"]))
+    for used in adopted:
+        member, archive = used["member"], Path(used["archive"])
+        if rust_member(member):
+            continue
+        stable = archive
+        if not stable.is_file():
+            choices = [target / "release/deps" / archive.name]
+            choices.extend(sysroot.glob("lib/rustlib/*/lib/" + archive.name))
+            stable = next((choice for choice in choices if choice.is_file()), None)
+        if stable is not None and (sysroot == stable or sysroot in stable.parents or str(stable).startswith(("/usr/", "/lib/"))):
+            ownership = None
+            if not (sysroot == stable or sysroot in stable.parents):
+                aliases = [str(stable)] + ([str(stable)[4:]] if str(stable).startswith("/usr/lib/") else [])
+                query = subprocess.run(["dpkg-query", "-S", *aliases], capture_output=True, text=True)
+                ownership = sorted({line.split(": /", 1)[0] for line in query.stdout.splitlines() if ": /" in line})
+                if not ownership:
+                    raise RuntimeError("实际采用的系统原生归档无法映射已安装软件包：" + str(stable))
+            skipped.append({**used, "stable_archive": str(stable), "system_packages": ownership, "basis": "prebuilt-toolchain-or-system-package"})
+            continue
+        if stable is None:
+            raise RuntimeError("实际链接采用的归档无法回溯稳定原件：" + used["archive"])
+        available = archive_members.get(str(stable))
+        if available is None:
+            available = capture(["ar", "t", str(stable)]).splitlines()
+            archive_members[str(stable)] = available
+        if available.count(member) != 1:
+            raise RuntimeError("实际rlib/归档成员不唯一或不存在：" + str(stable) + "(" + member + ")")
+        bundled_sha = hashlib.sha256(subprocess.check_output(["ar", "p", str(stable), member])).hexdigest()
+        matches = []
+        for candidate in candidates.get(member, []):
+            original = Path(candidate["archive"])
+            if archive_members[str(original)].count(member) != 1:
+                continue
+            if hashlib.sha256(subprocess.check_output(["ar", "p", str(original), member])).hexdigest() != bundled_sha:
+                continue
+            for obj in original.parent.rglob(Path(member).name):
+                if obj.is_file() and common.sha256(obj) == bundled_sha:
+                    matches.append({**candidate, "object": str(obj), "member": member, "object_sha256": bundled_sha, "adopted_archive": used["archive"], "stable_bundle": str(stable), "dependency_record": str(object_dependency(obj)), "working_directory": str(Path(candidate["package"]["manifest_path"]).parent)})
+        unique = {(item["object"], item["package"]["id"]): item for item in matches}
+        if len(unique) != 1:
+            raise RuntimeError("实际采用的原生成员无法用build-script、原生归档及rlib成员SHA唯一绑定：" + used["archive"] + "(" + member + ")")
+        record = next(iter(unique.values()))
+        key = record["object"]
+        if key not in seen:
+            resolved.append(record)
+            seen.add(key)
+    return {"adopted_native_objects": resolved, "prebuilt_native_members": skipped, "build_script_sources": active_directories, "link_map": linked["link_map"], "link_map_sha256": linked["link_map_sha256"]}
+
+
+def native_compiler(args):
+    arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else list(args.arguments)
+    output = None
+    if "-o" in arguments:
+        index = arguments.index("-o")
+        if index + 1 < len(arguments):
+            output = (Path.cwd() / arguments[index + 1]).resolve()
+    cache = args.records.parent.resolve()
+    kind = "compile" if "-c" in arguments else "link" if "-shared" in arguments else None
+    observed = kind and output is not None and cache in output.parents
+    link_map = None
+    snapshots = []
+    if observed and kind == "compile" and "-MD" not in arguments:
+        arguments.append("-MD")
+    if observed and kind == "link":
+        args.map_dir.mkdir(parents=True, exist_ok=True)
+        link_map = args.map_dir / (hashlib.sha256(str(output).encode()).hexdigest() + ".map")
+        arguments.append("-Wl,-Map=" + str(link_map))
+        for value in arguments:
+            if not value.startswith("-") and value.endswith(".o"):
+                obj = (Path.cwd() / value).resolve()
+                if not obj.is_file():
+                    raise RuntimeError("Boost实际链接对象缺失：" + str(obj))
+                snapshots.append({"path": str(obj), "sha256": common.sha256(obj)})
+    status = subprocess.run([args.compiler, *arguments]).returncode
+    if observed:
+        record = {"kind": kind, "success": status == 0, "compiler_arguments": [args.compiler, *arguments], "working_directory": str(Path.cwd()), "output": str(output), "output_sha256": common.sha256(output) if status == 0 and output.is_file() else None}
+        if status == 0 and kind == "compile":
+            dependency = object_dependency(output)
+            record.update(dependency_record=str(dependency), dependency_sha256=common.sha256(dependency))
+        if status == 0 and kind == "link":
+            if not link_map.is_file():
+                raise RuntimeError("Boost实际共享库链接未产生Map")
+            record.update(link_map=str(link_map), link_map_sha256=common.sha256(link_map), input_objects=snapshots, build_id=re.findall(r"Build ID: (\S+)", capture(["readelf", "--notes", str(output)])))
+        dump(args.records / (hashlib.sha256((str(output) + str(kind)).encode()).hexdigest() + ".json"), record)
+    return status
+
+
+@contextlib.contextmanager
+def diagnostic_command(argv, cwd, cache, link_map):
+    arguments = list(map(str, argv))
+    if len(arguments) > 1 and arguments[1] == "rustc":
+        arguments.extend(("-C", "link-arg=-Wl,-Map=" + str(link_map)))
+    if Path(arguments[0]).name != "b2":
+        yield arguments
+        return
+    config_arg = next((value for value in arguments if value.startswith("--user-config=")), None)
+    if config_arg is None:
+        raise RuntimeError("Boost审计缺少受管user-config")
+    configuration = Path(config_arg.split("=", 1)[1])
+    original = configuration.read_text()
+    match = re.search(r'using gcc\s*:\s*nuwax\s*:\s*"([^"\n]+)"\s*;', original)
+    if match is None:
+        raise RuntimeError("Boost实际编译器配置无法唯一解析")
+    compiler = match.group(1)
+    records = cache / "audit-boost-commands"
+    wrapper = cache / "audit-tools/boost-cxx"
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    command = [sys.executable, str(Path(__file__).resolve()), "native-compiler", "--compiler", compiler, "--records", str(records), "--map-dir", str(cache / "audit-linkmaps/boost"), "--"]
+    wrapper.write_text("#!/bin/sh\nexec " + " ".join(shlex.quote(value) for value in command) + ' "$@"\n')
+    wrapper.chmod(0o755)
+    marker = records / "complete-v1.json"
+    expected = {"recipe": 1, "compiler": compiler, "compiler_sha256": common.sha256(Path(compiler).resolve()), "arguments": [canonical(value, ROOT, cache) for value in arguments], "dependency": "-MD", "link_map": True}
+    try:
+        previous = json.loads(marker.read_text())
+    except (OSError, ValueError):
+        previous = None
+    if previous != expected:
+        arguments.append("-a")
+    arguments.append("-d+2")
+    done = False
+    try:
+        configuration.write_text(original[:match.start(1)] + str(wrapper) + original[match.end(1):])
+        yield arguments
+        done = True
+    finally:
+        configuration.write_text(original)
+        if done:
+            dump(marker, expected)
+
+
+def boost_native_evidence(private, cache):
+    libraries = {str(path): path for name, path in private.items() if name.startswith("libboost_")}
+    if not libraries:
+        return {"links": [], "objects": []}
+    records = [json.loads(path.read_text()) for path in (cache / "audit-boost-commands").glob("*.json") if path.name != "complete-v1.json"]
+    compiles = {item["output"]: item for item in records if item.get("kind") == "compile" and item.get("success")}
+    result, objects = [], {}
+    for path in libraries.values():
+        digest = common.sha256(path)
+        build_ids = re.findall(r"Build ID: (\S+)", capture(["readelf", "--notes", str(path)]))
+        matches = [item for item in records if item.get("kind") == "link" and item.get("success") and (item["output_sha256"] == digest or build_ids and item.get("build_id") == build_ids)]
+        if len(matches) != 1:
+            raise RuntimeError("Boost私有库缺少唯一的实际编译器/链接图回执：" + str(path))
+        link = matches[0]
+        map_file = Path(link["link_map"])
+        if not map_file.is_file() or common.sha256(map_file) != link["link_map_sha256"]:
+            raise RuntimeError("Boost私有库链接图不存在或被改变")
+        map_text = map_file.read_text()
+        for adopted in link["input_objects"]:
+            obj = Path(adopted["path"])
+            compiled = compiles.get(str(obj))
+            if compiled is None or compiled.get("output_sha256") != adopted["sha256"] or not obj.is_file() or common.sha256(obj) != adopted["sha256"]:
+                raise RuntimeError("Boost实际采用对象无法绑定到编译回执：" + str(obj))
+            if str(obj) not in map_text:
+                raise RuntimeError("Boost对象未出现在该实际共享库链接图：" + str(obj))
+            dependency = Path(compiled["dependency_record"])
+            if not dependency.is_file() or common.sha256(dependency) != compiled["dependency_sha256"]:
+                raise RuntimeError("Boost实际对象的MD依赖记录缺失或改变")
+            objects[str(obj)] = {"object": str(obj), "object_sha256": adopted["sha256"], "dependency_record": str(dependency), "dependency_sha256": compiled["dependency_sha256"], "working_directory": compiled["working_directory"], "compiler_arguments": compiled["compiler_arguments"], "library": str(path)}
+        if not link["input_objects"]:
+            raise RuntimeError("Boost共享库实际链接没有可核对的原生对象")
+        result.append(link)
+    return {"links": result, "objects": sorted(objects.values(), key=lambda item: item["object"])}
+
+
 def dependency_records(program, cache, spec, linked):
     target = rust_target(program, cache)
     records = [target / "release" / (program + ".d")]
+    record_cwds = {}
+    rust_records = {}
     for item in spec["cargo_packages"]:
         crate = item["name"].replace("-", "_")
-        records.extend((target / "release/deps").glob(crate + "-*.d"))
+        package_root = Path(item["manifest_path"]).parent.resolve()
+        for record in (target / "release/deps").glob(crate + "-*.d"):
+            rust_records.setdefault(record, set()).add(package_root)
+    rust_origins = []
+    for record, package_roots in sorted(rust_records.items()):
+        dependencies = common.dependency_paths(record)
+        relative = [value for value in dependencies if not Path(value).is_absolute()]
+        if relative:
+            roots = package_roots | {ROOT.resolve(), (ROOT / common.WORKSPACE).resolve(), (ROOT / common.PROGRAMS[program]["manifest"]).parent.resolve()}
+            possibilities = {}
+            for base in roots:
+                resolved = tuple(str((base / value).resolve()) for value in relative)
+                if all(Path(value).exists() for value in resolved):
+                    possibilities.setdefault(resolved, base)
+            if len(possibilities) > 1:
+                # 新执行的真实Rustc命令可用extra-filename与源码参数消除同名包歧义。
+                suffix = record.stem.rsplit("-", 1)[-1]
+                hinted = {}
+                for command in linked["compiler_commands"]:
+                    if "extra-filename=-" + suffix not in command or "Running `" not in command:
+                        continue
+                    arguments = shlex.split(command.split("Running `", 1)[1].rsplit("`", 1)[0])
+                    manifest_dir = next((Path(value.split("=", 1)[1]).resolve() for value in arguments if value.startswith("CARGO_MANIFEST_DIR=")), None)
+                    source = next((Path(value) for value in arguments if value.endswith(".rs") and not value.startswith("-") and "=" not in value), None)
+                    if source is None or manifest_dir is None:
+                        continue
+                    for resolved, base in possibilities.items():
+                        actual_source = source.resolve() if source.is_absolute() else (base / source).resolve()
+                        if str(actual_source) in resolved and (actual_source == manifest_dir or manifest_dir in actual_source.parents):
+                            hinted[resolved] = base
+                if hinted:
+                    possibilities = hinted
+            if len(possibilities) != 1:
+                raise RuntimeError("Rust依赖记录无法唯一归属已知crate/workspace/repo工作目录，拒绝静默丢弃：" + str(record))
+            base = next(iter(possibilities.values()))
+            record_cwds[str(record.resolve())] = str(base)
+            rust_origins.append({"record": str(record), "working_directory": str(base), "basis": "unique-known-cwd-or-record-matched-rustc-source"})
+        else:
+            rust_origins.append({"record": str(record), "basis": "absolute-dependency-paths"})
+        records.append(record)
+    linked["rust_dependency_record_origins"] = rust_origins
     actual = common.dependency_paths(records[0])
-    native, _private = native_link_evidence(program, cache, spec, linked, actual)
+    adoption = archive_adoption_evidence(program, cache, spec, linked)
+    # 原始.a即便被rustc bundle进rlib，也必须沿实际成员SHA链回到CMake。
+    actual.extend(item["archive"] for item in adoption["adopted_native_objects"])
+    native, private = native_link_evidence(program, cache, spec, linked, actual)
+    cmake_cwds = {}
     for entry in native:
         records.extend((Path(entry["cmake_root"]) / "CMakeFiles").rglob("Makefile.cmake"))
         for item in entry["inputs"]:
             if item["kind"] == "object":
-                record = Path(item["path"] + ".d")
-                if not record.is_file():
-                    raise RuntimeError("实际原生链接对象缺少编译器依赖记录：" + item["path"])
+                obj = Path(item["path"])
+                record = object_dependency(obj)
                 records.append(record)
-    return sorted({path for path in records if path.is_file()})
+                record_cwds[str(record.resolve())] = entry["working_directory"]
+                cmake_cwds[str(obj)] = entry["working_directory"]
+    for item in adoption["adopted_native_objects"]:
+        record = Path(item["dependency_record"])
+        item["working_directory"] = cmake_cwds.get(item["object"], item["working_directory"])
+        item["backend"] = "cmake" if item["object"] in cmake_cwds else "build-script-static-archive"
+        records.append(record)
+        record_cwds[str(record.resolve())] = item["working_directory"]
+    boost = boost_native_evidence(private, cache)
+    for item in boost["objects"]:
+        record = Path(item["dependency_record"])
+        records.append(record)
+        record_cwds[str(record.resolve())] = item["working_directory"]
+    linked["native_adoption"] = adoption
+    linked["boost_adoption"] = boost
+    return sorted({path for path in records if path.is_file()}), record_cwds
 
 
 def reject_lio_assets(items):
@@ -361,10 +693,11 @@ def canonical(value, root, cache):
     value = re.sub(r"/tmp/rustc[^/ ]+", "$RUSTC_TEMP", value)
     value = re.sub(r"-[0-9a-f]{32}(?=/|$)", "-<slot>", value)
     value = re.sub(r"-[0-9a-f]{16}(?=[./]|$)", "-<artifact>", value)
+    value = re.sub(r"(?<=/)[0-9a-f]{16}-", "<cc-object>-", value)
     return value
 
 
-def link_arguments(logged, program, binary, cache):
+def link_arguments(logged, program, binary, cache, link_map=None):
     candidates = []
     compiler = []
     for line in logged.splitlines():
@@ -379,6 +712,10 @@ def link_arguments(logged, program, binary, cache):
     digest = common.sha256(binary)
     if candidates:
         result = {"binary_sha256": digest, "linker_arguments": candidates[-1], "compiler_commands": compiler}
+        if link_map is not None:
+            if not link_map.is_file():
+                raise RuntimeError("实际最终链接没有产生GNU链接图：" + program)
+            result.update(link_map=str(link_map), link_map_sha256=common.sha256(link_map))
         dump(receipt, result)
     else:
         try:
@@ -387,6 +724,8 @@ def link_arguments(logged, program, binary, cache):
             raise RuntimeError("未捕获实际最终链接参数，且无有效链接回执：" + program) from exc
         if result.get("binary_sha256") != digest or not result.get("linker_arguments"):
             raise RuntimeError("最终链接回执与当前ELF不符：" + program)
+    if link_map is not None and (result.get("link_map") != str(link_map) or not link_map.is_file() or result.get("link_map_sha256") != common.sha256(link_map)):
+        raise RuntimeError("最终链接图回执与当前ELF/链接记录不符：" + program)
     return {**result, "captured_this_build": bool(candidates)}
 
 
@@ -567,9 +906,17 @@ def source_owner(path, spec, root, cache, program):
 
 def collect_audit(program, spec, checked, linked, root, cache):
     link_inputs = resolve_link_inputs(linked["linker_arguments"], root)
-    native_links, private = native_link_evidence(program, cache, spec, linked, checked["external_inputs"])
+    adoption = linked.get("native_adoption", {})
+    actual = checked["external_inputs"] + [item["archive"] for item in adoption.get("adopted_native_objects", [])]
+    native_links, private = native_link_evidence(program, cache, spec, linked, actual)
     for record in native_links:
         link_inputs.extend(record["inputs"])
+    for item in adoption.get("prebuilt_native_members", []):
+        link_inputs.append({"kind": "adopted-prebuilt-native-archive", "path": item["stable_archive"], "member": item["member"], "exists_after_link": True})
+    for item in adoption.get("adopted_native_objects", []):
+        link_inputs.append({"kind": "adopted-native-object", "path": item["object"], "object_sha256": item["object_sha256"], "exists_after_link": True})
+    for item in linked.get("boost_adoption", {}).get("objects", []):
+        link_inputs.append({"kind": "adopted-native-object", "path": item["object"], "object_sha256": item["object_sha256"], "exists_after_link": True})
     runtime = {}
     for binary in [cache / "prefix/bin" / program, *private.values()]:
         listing = capture(["ldd", str(binary)])
@@ -589,17 +936,11 @@ def collect_audit(program, spec, checked, linked, root, cache):
         origin = source_owner(path, spec, root, cache, program)
         record = {"name": name, "path": str(path), "sha256": common.sha256(path), "needed": re.findall(r"\(NEEDED\).*\[([^]]+)\]", dynamic), "build_id": re.findall(r"Build ID: (\S+)", notes), "elf_compilation_units": units, "origin": origin, "load": "explicit-dlopen" if name.startswith("libnuwax_slamtec") else "dynamic-dependency"}
         if name.startswith("libboost_"):
-            module = name.split("libboost_", 1)[1].split(".so", 1)[0]
-            source_root = Path(origin["root"]) / "libs" / module / "src"
-            actual = [unit for unit in units if unit.endswith((".cpp", ".cc", ".cxx"))]
-            if not actual:
-                raise RuntimeError("Boost私有库缺少实际ELF编译单元，拒绝推断组成：" + name)
-            files = [path for path in source_root.rglob("*") if path.is_file()]
-            matched = {unit: [str(path) for path in files if path.name == Path(unit).name] for unit in actual}
-            if any(not candidates for candidates in matched.values()):
-                raise RuntimeError("Boost私有库编译单元无法映射固定源码：" + name)
-            record["compiled_sources"] = matched
-            checked["external_inputs"].extend(source for candidates in matched.values() for source in candidates)
+            evidence = [item for item in linked["boost_adoption"]["objects"] if item["library"] == str(path)]
+            if not evidence:
+                raise RuntimeError("Boost私有库缺少真实MD/对象SHA/链接图证据")
+            record["native_object_evidence"] = evidence
+            record["dependency_basis"] = "compiler-MD + object-SHA + actual-link-map"
         private_records.append(record)
         link_inputs.append({"kind": "runtime-private-library", "name": name, "path": str(path), "exists_after_link": True})
     checked["external_inputs"] = sorted(set(checked["external_inputs"]))
@@ -616,7 +957,7 @@ def collect_audit(program, spec, checked, linked, root, cache):
         owner = source_owner(path, spec, root, cache, program)
         owner_key = owner["kind"] + ":" + owner["id"]
         origins[owner_key] = owner
-    return {**checked, "schema": 1, "program": program, "compiler_commands": linked["compiler_commands"], "compiled_binary_sha256": linked["binary_sha256"], "link_record_origin": "executed" if linked["captured_this_build"] else "binary-sha-matched-cache", "linker_arguments": linked["linker_arguments"], "link_inputs": link_inputs, "native_link_records": native_links, "private_library_records": private_records, "external_sources": sorted(origins.values(), key=lambda item: (item["kind"], item["id"])), "cargo_resolution": spec["cargo_packages"], "source_revision": capture(["git", "-C", str(root), "rev-parse", "HEAD"])}
+    return {**checked, "schema": 1, "program": program, "compiler_commands": linked["compiler_commands"], "compiled_binary_sha256": linked["binary_sha256"], "link_record_origin": "executed" if linked["captured_this_build"] else "binary-sha-matched-cache", "linker_arguments": linked["linker_arguments"], "link_inputs": link_inputs, "native_link_records": native_links, "native_archive_adoption": adoption, "rust_dependency_record_origins": linked.get("rust_dependency_record_origins", []), "boost_native_adoption": linked.get("boost_adoption", {}), "private_library_records": private_records, "external_sources": sorted(origins.values(), key=lambda item: (item["kind"], item["id"])), "cargo_resolution": spec["cargo_packages"], "source_revision": capture(["git", "-C", str(root), "rev-parse", "HEAD"])}
 
 
 def review_key(audit, root, cache):
@@ -655,8 +996,10 @@ def build(args):
         raise RuntimeError("构建环境与所选目标平台不符")
     output.mkdir(parents=True, exist_ok=True)
     cache.mkdir(parents=True, exist_ok=True)
+    (output / ("platform-" + args.platform + ".json")).unlink(missing_ok=True)
     prefix = cache / "prefix"
     prefix.mkdir(exist_ok=True)
+    enable_ci_native_diagnostics()
     probe(output / "probe.json")
     cargo, build_identity = identity(args.platform, root)
     environment = {"CARGO_INCREMENTAL": "0", "CARGO_HOME": str(cache / "cargo")}
@@ -665,74 +1008,100 @@ def build(args):
     reject_lio_assets(inventory)
     assets = {item["name"]: item for item in inventory}
     programs, compiled, reused, packaged = {}, [], [], []
+    failures = []
     for program, recipe in common.PROGRAMS.items():
-        spec = common.discover_inputs(root, program, cargo, environment, target)
-        public_spec = {name: spec[name] for name in ("paths", "exclude")}
-        value = common.fingerprint(root, program, args.platform, spec, build_identity)
-        name = program + "-" + value + ".tar.zst"
-        existing = asset_entry(assets[name]) if name in assets else None
-        audit_cache = cache / "audits" / (value + ".json")
-        if existing:
-            if not audit_cache.is_file():
-                with tempfile.TemporaryDirectory(prefix=".read-audit-", dir=cache) as temporary:
-                    directory = Path(temporary)
-                    archive = directory / name
-                    with common._urlopen(common.release_url(args.repository, name), timeout=60) as source, archive.open("wb") as destination:
-                        shutil.copyfileobj(source, destination)
-                    if common.sha256(archive) != existing["sha256"]:
-                        raise RuntimeError("已有程序附件摘要错误")
-                    unpacked = directory / "unpacked"
-                    unpacked.mkdir()
-                    common._extract(archive, unpacked, program, value)
-                    audit = json.loads((unpacked / "share/audit/inputs.json").read_text())
-                    dump(audit_cache, audit)
-            audit = json.loads(audit_cache.read_text())
-            if audit.get("program") != program or audit.get("fingerprint") != value or not audit.get("review_key"):
-                raise RuntimeError("已有程序缺少可核查的实际输入审计")
+        try:
+            spec = common.discover_inputs(root, program, cargo, environment, target)
+            public_spec = {name: spec[name] for name in ("paths", "exclude")}
+            value = common.fingerprint(root, program, args.platform, spec, build_identity)
+            name = program + "-" + value + ".tar.zst"
+            existing = asset_entry(assets[name]) if name in assets else None
+            audit_cache = cache / "audits" / (value + ".json")
+            if existing:
+                if not audit_cache.is_file():
+                    with tempfile.TemporaryDirectory(prefix=".read-audit-", dir=cache) as temporary:
+                        directory = Path(temporary)
+                        archive = directory / name
+                        with common._urlopen(common.release_url(args.repository, name), timeout=60) as source, archive.open("wb") as destination:
+                            shutil.copyfileobj(source, destination)
+                        if common.sha256(archive) != existing["sha256"]:
+                            raise RuntimeError("已有程序附件摘要错误")
+                        unpacked = directory / "unpacked"
+                        unpacked.mkdir()
+                        common._extract(archive, unpacked, program, value)
+                        audit = json.loads((unpacked / "share/audit/inputs.json").read_text())
+                        dump(audit_cache, audit)
+                audit = json.loads(audit_cache.read_text())
+                if audit.get("program") != program or audit.get("fingerprint") != value or not audit.get("review_key"):
+                    raise RuntimeError("已有程序缺少可核查的实际输入审计")
+                dump(output / ("audit-" + program + ".json"), audit)
+                programs[program] = {**existing, "fingerprint": value, "input_spec": public_spec, "audit": {"review_key": audit["review_key"], "coverage": "complete"}}
+                reused.append(program)
+                print("云端跳过同指纹程序：" + program, flush=True)
+                continue
+            link_map = cache / "audit-linkmaps" / (program + ".map")
+            link_map.parent.mkdir(parents=True, exist_ok=True)
+            log_path = output / (program + ".build.log")
+            with log_path.open("w", encoding="utf-8") as log:
+                def recording_run(argv, *, cwd=None, env=None):
+                    with diagnostic_command(argv, cwd, cache, link_map) as actual_argv:
+                        log.write("执行：" + " ".join(map(str, actual_argv)) + "\n")
+                        log.flush()
+                        process = subprocess.Popen(actual_argv, cwd=cwd, env={**os.environ, **(env or {})}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                        try:
+                            for line in process.stdout:
+                                sys.stdout.write(line)
+                                sys.stdout.flush()
+                                log.write(line)
+                            status = process.wait()
+                        finally:
+                            process.stdout.close()
+                            log.flush()
+                            if process.poll() is None:
+                                process.kill()
+                                process.wait()
+                        if status:
+                            raise subprocess.CalledProcessError(status, argv)
+                builds.build_modules(root, prefix, cache, [recipe["module"]], args.jobs, recording_run, local_build=True, programs=[program], capture_link_args=True)
+            shutil.copyfile(prefix / "bin" / program, output / (program + ".elf"))
+            linked = link_arguments(log_path.read_text(), program, prefix / "bin" / program, cache, link_map)
+            shutil.copyfile(link_map, output / (program + ".link.map"))
+            dump(output / ("audit-" + program + ".json"), {"program": program, "link_record": linked, "status": "dependency-record-mapping-in-progress"})
+            records, record_cwds = dependency_records(program, cache, spec, linked)
+            generated = [cache / path for path in ("build", "sources", "slam2d-dependencies", "prefix", "cargo/registry", "cargo/git")]
+            generated.extend((Path(os.environ["RUSTUP_HOME"]), Path("/opt/protoc"), Path("/opt/lcm-gen-1.5.2")))
+            dependency_artifacts = []
+            for record in records:
+                name = hashlib.sha256(str(record).encode()).hexdigest() + record.suffix
+                saved = output / "native-dependencies" / program / name
+                saved.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(record, saved)
+                dependency_artifacts.append({"source": str(record), "artifact": saved.relative_to(output).as_posix(), "sha256": common.sha256(record), "working_directory": record_cwds.get(str(record.resolve()), str(root))})
+            for native_map in linked["boost_adoption"]["links"]:
+                saved = output / "native-maps" / (program + "-" + Path(native_map["link_map"]).name)
+                saved.parent.mkdir(exist_ok=True)
+                shutil.copyfile(native_map["link_map"], saved)
+            checked = common.audit_dependencies(root, spec, records, generated_roots=generated, record_cwds=record_cwds)
+            dump(output / ("audit-" + program + ".json"), {**checked, "link_record": linked, "status": "source-mapping-in-progress"})
+            audit = collect_audit(program, spec, checked, linked, root, cache)
+            audit.update(platform=args.platform, fingerprint=value, dependency_record_artifacts=dependency_artifacts)
+            # 即使许可尚未批准，也保存真实输入与构建证据；发布在另一作业严格拒绝。
             dump(output / ("audit-" + program + ".json"), audit)
-            programs[program] = {**existing, "fingerprint": value, "input_spec": public_spec, "audit": {"review_key": audit["review_key"], "coverage": "complete"}}
-            reused.append(program)
-            print("云端跳过同指纹程序：" + program, flush=True)
-            continue
-        log_path = output / (program + ".build.log")
-        with log_path.open("w", encoding="utf-8") as log:
-            def recording_run(argv, *, cwd=None, env=None):
-                log.write("执行：" + " ".join(map(str, argv)) + "\n")
-                log.flush()
-                process = subprocess.Popen(list(map(str, argv)), cwd=cwd, env={**os.environ, **(env or {})}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                try:
-                    for line in process.stdout:
-                        sys.stdout.write(line)
-                        sys.stdout.flush()
-                        log.write(line)
-                    status = process.wait()
-                finally:
-                    process.stdout.close()
-                    log.flush()
-                    if process.poll() is None:
-                        process.kill()
-                        process.wait()
-                if status:
-                    raise subprocess.CalledProcessError(status, argv)
-            builds.build_modules(root, prefix, cache, [recipe["module"]], args.jobs, recording_run, local_build=True, programs=[program], capture_link_args=True)
-        linked = link_arguments(log_path.read_text(), program, prefix / "bin" / program, cache)
-        records = dependency_records(program, cache, spec, linked)
-        generated = [cache / path for path in ("build", "sources", "slam2d-dependencies", "prefix", "cargo/registry", "cargo/git")]
-        generated.extend((Path(os.environ["RUSTUP_HOME"]), Path("/opt/protoc"), Path("/opt/lcm-gen-1.5.2")))
-        checked = common.audit_dependencies(root, spec, records, generated_roots=generated)
-        shutil.copyfile(prefix / "bin" / program, output / (program + ".elf"))
-        dump(output / ("audit-" + program + ".json"), {**checked, "link_record": linked, "status": "source-mapping-in-progress"})
-        audit = collect_audit(program, spec, checked, linked, root, cache)
-        audit.update(platform=args.platform, fingerprint=value)
-        # 即使许可尚未批准，也保存真实输入与构建证据；发布在另一作业严格拒绝。
-        dump(output / ("audit-" + program + ".json"), audit)
-        entry = package(root, prefix, cache, output, program, value, spec, audit)
-        dump(output / ("audit-" + program + ".json"), audit)
-        dump(audit_cache, audit)
-        programs[program] = {**entry, "fingerprint": value, "input_spec": public_spec, "audit": {"review_key": audit["review_key"], "coverage": "complete"}}
-        packaged.append(program)
-        if linked["captured_this_build"]:
-            compiled.append(program)
+            entry = package(root, prefix, cache, output, program, value, spec, audit)
+            dump(output / ("audit-" + program + ".json"), audit)
+            dump(audit_cache, audit)
+            programs[program] = {**entry, "fingerprint": value, "input_spec": public_spec, "audit": {"review_key": audit["review_key"], "coverage": "complete"}}
+            packaged.append(program)
+            if linked["captured_this_build"]:
+                compiled.append(program)
+        except Exception as exc:
+            failure = {"program": program, "error": str(exc), "traceback": traceback.format_exc()}
+            failures.append(failure)
+            dump(output / ("error-" + program + ".json"), failure)
+            print("程序失败，保留证据后继续其余程序：" + program + "：" + str(exc), flush=True)
+    if failures:
+        dump(output / "build-report.json", {"success": False, "failures": failures, "compiled": compiled, "reused": reused, "packaged": packaged})
+        raise RuntimeError("五程序构建/审计存在失败，拒绝生成发布索引：" + ", ".join(item["program"] for item in failures))
     revision = capture(["git", "rev-parse", "HEAD"], cwd=root)
     dump(output / ("platform-" + args.platform + ".json"), {"schema": common.SCHEMA, "revision": revision, "platform": args.platform, "build_identity": build_identity, "programs": programs})
     dump(output / "build-report.json", {"compiled": compiled, "reused": reused, "packaged": packaged, "counts": {"compiled": len(compiled), "reused": len(reused), "packaged": len(packaged)}})
@@ -859,11 +1228,18 @@ def main():
     command.add_argument("--output", type=Path, required=True)
     command.add_argument("--assets", type=Path, required=True)
     command.add_argument("--jobs", type=int, default=4)
+    command = commands.add_parser("native-compiler")
+    command.add_argument("--compiler", required=True)
+    command.add_argument("--records", type=Path, required=True)
+    command.add_argument("--map-dir", type=Path, required=True)
+    command.add_argument("arguments", nargs=argparse.REMAINDER)
     command = commands.add_parser("publish")
     command.add_argument("--repository", required=True)
     command.add_argument("--revision", required=True)
     command.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.command == "native-compiler":
+        return native_compiler(args)
     if args.command == "probe":
         probe(args.output)
     else:
@@ -871,4 +1247,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

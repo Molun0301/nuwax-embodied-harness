@@ -255,7 +255,7 @@ def dependency_paths(record: Path) -> list:
     return result
 
 
-def audit_dependencies(root: Path, input_spec: Mapping, records: Iterable[Path], *, generated_roots: Iterable[Path] = ()) -> dict:
+def audit_dependencies(root: Path, input_spec: Mapping, records: Iterable[Path], *, generated_roots: Iterable[Path] = (), record_cwds: Optional[Mapping] = None) -> dict:
     """不自动把漏算输入加入范围；失败必须由维护者修正声明并重新编译。"""
     root = Path(root).resolve()
     generated = [Path(item).resolve() for item in generated_roots]
@@ -265,7 +265,8 @@ def audit_dependencies(root: Path, input_spec: Mapping, records: Iterable[Path],
         for value in dependency_paths(record):
             path = Path(value)
             if not path.is_absolute():
-                path = root / path
+                base = Path((record_cwds or {}).get(str(record.resolve()), root))
+                path = base / path
             absolute = path.resolve()
             try:
                 relative = absolute.relative_to(root).as_posix()

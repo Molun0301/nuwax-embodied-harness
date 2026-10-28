@@ -86,8 +86,12 @@ def bridge(engine, source, candidate, operation, job, **values):
     payload.update(prebuilt={"repository": source["repository"], "revision": source["revision"], "branch": source["branch"]},
                    local_build=bool(job["_plan"].get("_request", {}).get("local_build")),
                    background=bool(job["_plan"].get("_request", {}).get("automatic")))
-    if operation == "build" and source.get("prebuilt_index") is not None:
-        payload["prebuilt"]["index"] = source["prebuilt_index"]
+    if operation == "build" and "prebuilt_index" in source:
+        if source["prebuilt_index"] is None:
+            # 预检已选择本机配方，子进程不再请求一次可能暂缺的索引。
+            payload["local_build"] = True
+        else:
+            payload["prebuilt"]["index"] = source["prebuilt_index"]
     if not source["repository"].startswith("https://github.com/"):
         payload["prebuilt"] = None
     environment = clean_environment(candidate)

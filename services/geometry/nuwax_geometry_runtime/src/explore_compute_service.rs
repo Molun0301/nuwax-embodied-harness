@@ -305,6 +305,14 @@ impl ComputeBasis {
         self.current_at_history(inner, self.history)
     }
     fn current_at_history(&self, inner: &ExploreRuntimeInner, expected_history: u64) -> bool {
+        let fresh = inner.map_input_is_fresh(now_monotonic_nanos());
+        #[cfg(test)]
+        let fresh = self.inspection || fresh;
+        fresh && self.current_query_at_history(inner, expected_history)
+    }
+
+    /// 仅核对任务和原查询；纯待继续进度可在失鲜时提交，不能据此取得运动许可。
+    fn current_query_at_history(&self, inner: &ExploreRuntimeInner, expected_history: u64) -> bool {
         #[cfg(test)]
         if self.inspection {
             return inner.logical_active
@@ -314,7 +322,7 @@ impl ComputeBasis {
         }
         // Tick admission validates the sampled pose. Completion can outlive
         // that sample's receipt TTL; navigation consumers check their live pose.
-        // 地图身份与来源活性仍需复核；同域新发布不因旧快照的计算延迟而过期。
+        // 查询仍需核对地图身份；接收时效由调用方按结果用途单独核验。
         if !inner.logical_active
             || self.generation != inner.generation
             || self.parent != inner.last_request_id
@@ -326,7 +334,6 @@ impl ComputeBasis {
                 .feedback
                 .as_ref()
                 .is_some_and(|feedback| feedback.result.is_none())
-            || !inner.map_input_is_fresh(now_monotonic_nanos())
         {
             return false;
         }
@@ -1601,12 +1608,33 @@ fn drain_locked(
                     ..
                 }))
         );
+        // 候选批次的待继续事务仅推进候选状态，不产生目标、无前沿结论或路线建议。
+        // 短暂接收空档不能抹掉这份进度；来源几何、反馈历史或任务变化仍撤销原事务。
+        let pending_progress = matches!(&job.basis.input, ComputeInput::Surface { .. })
+            && matches!(job.prepared.as_ref().map(|value| &value.projection),
+                Some(ComputeProjection::Selection(SelectionProjection {
+                    poll: Ok(ExplorationPoll::Pending), mission: None, cancelled: false,
+                })));
+        let current = if pending_progress {
+            job.basis.current_query_at_history(inner, job.basis.history)
+        } else {
+            job.basis.current(inner)
+        };
         let decision =
-            if !job.abandoned.load(Ordering::Acquire) && !cancelled && job.basis.current(inner) {
+            if !job.abandoned.load(Ordering::Acquire) && !cancelled && current {
                 exchange::Decision::Accept
             } else {
                 exchange::Decision::Discard
             };
+        if decision == exchange::Decision::Discard {
+            tracing::info!(event = "exploration.selection.discarded", request_id = %job.basis.parent,
+                abandoned = job.abandoned.load(Ordering::Acquire), cancelled, pending_progress,
+                query_current = job.basis.current_query_at_history(inner, job.basis.history),
+                input = %inner.selection_wait_detail(), "探索计算结果已撤销，等待当前输入重新评估");
+        } else if pending_progress && !inner.map_input_is_fresh(now_monotonic_nanos()) {
+            tracing::info!(event = "exploration.progress.retained", request_id = %job.basis.parent,
+                input = %inner.selection_wait_detail(), "表面输入暂时过期，保留已完成候选批次的待继续进度");
+        }
         let ack = owner
             .resolve(job.id, decision)
             .map_err(|error| error.to_string())?;

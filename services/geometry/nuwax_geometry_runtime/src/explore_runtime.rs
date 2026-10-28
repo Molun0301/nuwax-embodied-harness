@@ -974,9 +974,47 @@ impl ExploreRuntimeInner {
             .and_then(|config| config.stop_conditions.no_frontier_timeout_ms)
             .map(Duration::from_millis)
             .unwrap_or(DEFAULT_SELECTION_PROGRESS_TIMEOUT);
-        (since.elapsed() >= limit).then(|| format!(
-            "ResourceLimited: exploration_selection_stalled，连续{:.1}秒未能交付子导航；前沿是否可达尚未确定",
-            since.elapsed().as_secs_f64()))
+        (since.elapsed() >= limit).then(|| {
+            let code = if self.map_input_is_fresh(now_monotonic_nanos()) {
+                "exploration_selection_stalled"
+            } else {
+                "exploration_source_stalled"
+            };
+            format!("ResourceLimited: {code}，连续{:.1}秒未能交付子导航；{}；前沿是否可达尚未确定",
+                since.elapsed().as_secs_f64(), self.selection_wait_detail())
+        })
+    }
+
+    /// 直接记录接纳、安装和计算事实，避免把来源等待统一解释成前沿计算未完成。
+    fn selection_wait_detail(&self) -> String {
+        let now = now_monotonic_nanos();
+        let compute = self.compute.query_pending();
+        let dispatch = self.pending_child_dispatch.is_some();
+        let poll = match self.last_poll.as_ref() {
+            Some(ExplorationPoll::Pending) => "pending",
+            Some(ExplorationPoll::SourceUnavailable(_)) => "source_unavailable",
+            Some(ExplorationPoll::NoFrontier) => "no_frontier",
+            Some(ExplorationPoll::Goal(_)) => "goal",
+            Some(ExplorationPoll::Stop(_)) => "stop",
+            None => "none",
+        };
+        if let Some(mode) = self.surface_mode.as_ref() {
+            let age = mode.latest.as_ref().map(|ticket|
+                now.saturating_sub(ticket.received_monotonic_ns) / 1_000_000);
+            let state = if !mode.accepting { "surface input owner stopped" }
+                else if !mode.input_ready { "surface map input unavailable" }
+                else if !self.map_input_is_fresh(now) { "surface map input stale" }
+                else if mode.latest.as_ref().map(SurfaceMapTicket::revision) != mode.installed_revision {
+                    "surface map build pending"
+                } else { "surface map input fresh" };
+            format!("{state}；已接纳修订={:?}；已安装修订={:?}；接收年龄={age:?}毫秒；来源就绪={}；来源错误={:?}；计算在途={compute}；待派发={dispatch}；上次选择={poll}",
+                mode.latest.as_ref().map(SurfaceMapTicket::revision), mode.installed_revision,
+                mode.input_ready, mode.input_error)
+        } else {
+            let state = if self.map_input_is_fresh(now) { "costmap input fresh" } else { "costmap input stale" };
+            format!("{state}；接收年龄={}毫秒；计算在途={compute}；待派发={dispatch}；上次选择={poll}",
+                now.saturating_sub(self.costmap_received_monotonic_ns) / 1_000_000)
+        }
     }
 
     fn update_frontiers(&mut self, frontiers: Vec<FrontierGoal>) -> Option<FrontierSnapshot> {
@@ -2819,14 +2857,8 @@ impl ExploreRuntimeHandle {
         }
         if !guard.map_input_is_fresh(now_monotonic_nanos()) {
             guard.no_frontier_since = None;
-            let snapshot = guard.snapshot(
-                STATUS_PENDING,
-                if surface_mode {
-                    "source unavailable: surface map input stale"
-                } else {
-                    "source unavailable: costmap input stale"
-                },
-            );
+            let snapshot = guard.snapshot(STATUS_PENDING,
+                format!("source unavailable: {}", guard.selection_wait_detail()));
             drop(guard);
             return self.store_snapshot(snapshot);
         }
@@ -3099,7 +3131,7 @@ impl ExploreRuntimeHandle {
                 guard.last_poll = Some(ExplorationPoll::Pending);
                 let snapshot = guard.snapshot(
                     STATUS_PENDING,
-                    "exploration source is awaiting work completion",
+                    format!("exploration source is awaiting work completion；{}", guard.selection_wait_detail()),
                 );
                 drop(guard);
                 self.publish_frontiers(frontier_update);

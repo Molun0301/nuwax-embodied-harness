@@ -130,3 +130,117 @@ async fn endless_source_pending_expires_but_a_dispatched_child_clears_the_wait()
     handle.request_compute_shutdown().await;
     owner_watchdog(handle.compute_service.join()).await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_surface_pending_keeps_real_candidate_progress_without_dispatch() {
+    let (handle, sink) = configured_handle();
+    let (message, _, bare) = install_surface_fixture(&handle, "map").await;
+    // 已知地面外围有前沿，真实禁区围住当前位置；每批候选仍走原生可达查询。
+    let points: Vec<_> = (0..120).flat_map(|x| (0..100).map(move |y|
+        ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, 0.0))).collect();
+    let floor = SurfaceSnapshot::from_points(&points, bare.config().clone(), 0.1).unwrap();
+    // 禁区栅格需包含外围未知区；图外按禁行处理，不能把整个前沿遮掉。
+    let mut mask = vec![false; 160 * 140];
+    for y in 0..140 {
+        for x in 0..160 {
+            if ((x == 29 || x == 41) && (29..=41).contains(&y))
+                || ((y == 29 || y == 41) && (29..=41).contains(&x)) {
+                mask[y * 160 + x] = true;
+            }
+        }
+    }
+    let snapshot = Arc::new(floor.with_virtual_obstacles([-2.0, -2.0], 0.1, 160, 140, &mask).unwrap());
+    assert!(snapshot.frontier_candidates(&[]).unwrap().len() > 128);
+    publish_surface_owner_receipt(&handle, &message.committed_map, 2, snapshot.clone()).await;
+    handle.start("source-gap-progress", "prefer_wavefront").await;
+    let audit = Arc::new(StdMutex::new(SurfaceOwnerAudit::default()));
+    let gate = Arc::new(OwnerRuntimeGate::default());
+    let _release = OwnerRuntimeGateRelease(gate.clone());
+    install_gated_real_surface_source(&handle, audit.clone(), gate.clone(), None).await;
+    let pose = surface_pose(&snapshot, 0.0, Quaternion::IDENTITY);
+    let tick = tokio::spawn({
+        let handle = handle.clone();
+        let pose = pose.clone();
+        async move { handle.tick_with_pose(pose).await }
+    });
+    owner_watchdog(gate.entered()).await;
+    let preview = audit.lock().unwrap().captures[0].preview.clone();
+    assert!(matches!(preview, Ok(ExplorationPoll::Pending)), "{preview:?}");
+    let ttl = handle.inner.lock().await.costmap_receipt_ttl;
+    tokio::time::sleep(ttl + Duration::from_millis(1)).await;
+    gate.release();
+    owner_watchdog(tick).await.unwrap();
+    let committed_before_refresh = audit.lock().unwrap().commits.len();
+    assert!(sink.submitted.lock().unwrap().is_empty());
+    let stale = handle.tick_with_pose(surface_pose(&snapshot, 0.0, Quaternion::IDENTITY)).await;
+    assert!(stale.message.contains("surface map input stale"));
+    let since = handle.inner.lock().await.selection_wait_since;
+    let mut completed = false;
+    for revision in 3..23 {
+        publish_surface_owner_receipt(&handle, &message.committed_map, revision, snapshot.clone()).await;
+        handle.tick_with_pose(surface_pose(&snapshot, 0.0, Quaternion::IDENTITY)).await;
+        if matches!(handle.inner.lock().await.last_poll, Some(ExplorationPoll::NoFrontier)) {
+            completed = true;
+            break;
+        }
+    }
+    assert_eq!(handle.inner.lock().await.selection_wait_since, since);
+    assert!(sink.submitted.lock().unwrap().is_empty());
+    handle.stop("source-gap-progress").await;
+    handle.request_compute_shutdown().await;
+    owner_watchdog(handle.compute_service.join()).await.unwrap();
+    assert_eq!(committed_before_refresh, 1, "短暂失鲜不得丢弃真实候选扫描的待继续进度");
+    assert!(completed, "恢复后必须有限批次完成候选扫描");
+    assert_eq!(audit.lock().unwrap().discards, 0);
+}
+
+#[tokio::test]
+async fn no_path_child_and_short_surface_gap_retry_once_after_real_receipt() {
+    let (handle, sink) = configured_handle();
+    let (message, _, snapshot) = install_surface_fixture(&handle, "map").await;
+    handle.start("no-path-source-gap", "prefer_wavefront").await;
+    let pose = surface_pose(&snapshot, 0.0, Quaternion::IDENTITY);
+    assert_eq!(handle.tick_with_pose(pose.clone()).await.status, STATUS_ACTIVE);
+    let lease = active_child_lease(&handle).await;
+    handle.report_navigation_result(&lease.session_id, ChildNavigationResult::Failed {
+        proof: terminal_proof(&lease),
+        reason: "planner path timeout after 30000ms; PCT未找到路径; PlannerFailed after verified fence".into(),
+    }).await.unwrap();
+    let ttl = handle.inner.lock().await.costmap_receipt_ttl;
+    tokio::time::sleep(ttl + Duration::from_millis(1)).await;
+    let pose = surface_pose(&snapshot, 0.0, Quaternion::IDENTITY);
+    assert!(handle.tick_with_pose(pose.clone()).await.message.contains("surface map input stale"));
+    let since = handle.inner.lock().await.selection_wait_since;
+    assert!(since.is_some());
+    assert_eq!(sink.submitted.lock().unwrap().len(), 1);
+    publish_surface_owner_receipt(&handle, &message.committed_map, 2, snapshot).await;
+    assert_eq!(handle.inner.lock().await.selection_wait_since, since);
+    assert_eq!(handle.tick_with_pose(pose.clone()).await.status, STATUS_ACTIVE);
+    assert!(handle.inner.lock().await.selection_wait_since.is_none());
+    handle.tick_with_pose(pose).await;
+    assert_eq!(sink.submitted.lock().unwrap().len(), 2);
+    stop_owner_runtime_child(&handle, "no-path-source-gap").await;
+    handle.request_compute_shutdown().await;
+    owner_watchdog(handle.compute_service.join()).await.unwrap();
+}
+
+#[tokio::test]
+async fn permanent_surface_gap_reports_source_age_and_revision_at_original_deadline() {
+    let (handle, sink) = configured_handle();
+    let (_, _, snapshot) = install_surface_fixture(&handle, "map").await;
+    handle.start("permanent-source-gap", "prefer_wavefront").await;
+    let ttl = handle.inner.lock().await.costmap_receipt_ttl;
+    tokio::time::sleep(ttl + Duration::from_millis(1)).await;
+    handle.inner.lock().await.selection_wait_since = Some(Instant::now() - DEFAULT_SELECTION_PROGRESS_TIMEOUT);
+    let failed = handle.tick_with_pose(surface_pose(&snapshot, 0.0, Quaternion::IDENTITY)).await;
+    handle.request_compute_shutdown().await;
+    owner_watchdog(handle.compute_service.join()).await.unwrap();
+    assert_eq!(failed.status, STATUS_FAILED);
+    assert_eq!(failed.last_stop_reason, "planning_resource_limited");
+    assert!(failed.message.contains("exploration_source_stalled"), "{}", failed.message);
+    assert!(failed.message.contains("surface map input stale"));
+    assert!(failed.message.contains("已接纳修订=Some((1, 1))"));
+    assert!(failed.message.contains("已安装修订=Some((1, 1))"));
+    assert!(failed.message.contains("接收年龄="));
+    assert!(sink.submitted.lock().unwrap().is_empty());
+}

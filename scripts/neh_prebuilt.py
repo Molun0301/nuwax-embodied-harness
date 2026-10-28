@@ -155,7 +155,7 @@ def discover_inputs(root: Path, program: str, cargo: Path, environment: Mapping,
     """Cargo解析真实特性依赖闭包；CMake外部源码固定在仓库锁文件中。"""
     root = Path(root).resolve()
     recipe = PROGRAMS[program]
-    paths = {"scripts/module_installer/builds.py", "scripts/neh_prebuilt.py"}
+    paths = {"scripts/module_installer/builds.py", "scripts/neh_prebuilt.py", "scripts/ci/prebuilt.py", "LICENSE", "docs/公开文档/第三方许可证说明.md"}
     excluded = []
     if "native" in recipe:
         paths.update((NATIVE_ROOT + "/" + recipe["native"] + "/cpp", NATIVE_ROOT + "/common", NATIVE_ROOT + "/livox/cpp/flake.nix", WORKSPACE + "/lcmtypes"))

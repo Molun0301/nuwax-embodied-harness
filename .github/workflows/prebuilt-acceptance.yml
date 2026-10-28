@@ -1,0 +1,114 @@
+name: NEH预编译附件真实故障验收
+
+on:
+  workflow_call:
+    inputs:
+      source_revision:
+        description: 已通过生产预编译的完整提交；空值使用当前提交
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      source_revision:
+        description: 已通过生产预编译的完整提交；空值使用当前提交
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+# 所有注入共享同一个验证Release，等待完整恢复后才允许下一轮运行。
+concurrency:
+  group: neh-prebuilt-validation
+  cancel-in-progress: false
+
+jobs:
+  attachment-fallback:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      SOURCE_REVISION: ${{ inputs.source_revision || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: 记录本作业隔离目录
+        run: |
+          printf 'VALIDATION_STATE=%s\n' "$RUNNER_TEMP/neh-prebuilt-validation-state" >> "$GITHUB_ENV"
+          printf 'VALIDATION_CACHE=%s\n' "$RUNNER_TEMP/neh-prebuilt-validation-cache" >> "$GITHUB_ENV"
+      - name: 检出与生产预编译一致的真实编译源码
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_revision || github.sha }}
+          path: acceptance-source
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - name: 固定本轮基础镜像摘要
+        id: base
+        run: |
+          docker pull ubuntu:24.04
+          BASE_DIGEST=$(docker image inspect ubuntu:24.04 --format '{{index .RepoDigests 0}}')
+          printf 'image=ubuntu:24.04@%s\n' "${BASE_DIGEST#*@}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: scripts/ci/prebuilt/noble-x86_64.Dockerfile
+          load: true
+          tags: neh-prebuilt-validation:noble-x86_64
+          build-args: BASE_IMAGE=${{ steps.base.outputs.image }}
+          cache-from: type=gha,scope=neh-image-noble-x86_64
+          cache-to: type=gha,scope=neh-image-noble-x86_64,mode=max
+      - name: 准备专用验收缓存与报告目录
+        run: |
+          mkdir -p "$VALIDATION_CACHE" "$VALIDATION_STATE"
+          sudo chown -R 1001:1001 "$VALIDATION_CACHE" "$VALIDATION_STATE"
+      - name: 匿名保存生产原件并创建隔离验收副本
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/ci/prebuilt_acceptance.py prepare --repository "$GITHUB_REPOSITORY" --revision "$SOURCE_REVISION" --state "$VALIDATION_STATE"
+      - name: T3删除验收附件
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/prebuilt_acceptance.py inject --state "$VALIDATION_STATE" --case missing
+      - name: T3匿名404后真实编译PointLIO
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/harness:ro" \
+            -v "$GITHUB_WORKSPACE/acceptance-source:/workspace:ro" \
+            -v "$VALIDATION_CACHE:/cache" \
+            -v "$VALIDATION_STATE:/state" \
+            -e CARGO_TARGET_DIR=/cache/target -e CARGO_BUILD_JOBS=4 \
+            -e NEH_ACCEPTANCE_HARNESS_REVISION="$GITHUB_SHA" \
+            neh-prebuilt-validation:noble-x86_64 bash -c \
+            'git config --global --add safe.directory /workspace && python3 /harness/scripts/ci/prebuilt_acceptance.py client --state /state --case missing --source-root /workspace --cache /cache --jobs 4'
+      - name: T4上传同名损坏验收附件
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/prebuilt_acceptance.py inject --state "$VALIDATION_STATE" --case corrupt
+      - name: T4匿名下载摘要拒绝后真实编译PointLIO
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/harness:ro" \
+            -v "$GITHUB_WORKSPACE/acceptance-source:/workspace:ro" \
+            -v "$VALIDATION_CACHE:/cache" \
+            -v "$VALIDATION_STATE:/state" \
+            -e CARGO_TARGET_DIR=/cache/target -e CARGO_BUILD_JOBS=4 \
+            -e NEH_ACCEPTANCE_HARNESS_REVISION="$GITHUB_SHA" \
+            neh-prebuilt-validation:noble-x86_64 bash -c \
+            'git config --global --add safe.directory /workspace && python3 /harness/scripts/ci/prebuilt_acceptance.py client --state /state --case corrupt --source-root /workspace --cache /cache --jobs 4'
+      - name: 总是恢复原始验收附件并匿名核对摘要
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/prebuilt_acceptance.py restore --state "$VALIDATION_STATE"
+      - name: 保存真实回退、HTTP和恢复证据
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neh-prebuilt-attachment-fallback-${{ inputs.source_revision || github.sha }}
+          path: |
+            ${{ env.VALIDATION_STATE }}/*.json
+            ${{ env.VALIDATION_STATE }}/*.txt
+          if-no-files-found: warn
+          retention-days: 7

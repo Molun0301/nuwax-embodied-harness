@@ -36,15 +36,23 @@ def dump(path, payload):
 
 def probe(output):
     """在任何长编译前确认协议、包配置、目标库与OpenMP最终链接。"""
+    generator = os.environ.get("LCM_GEN_EXECUTABLE") or shutil.which("lcm-gen")
+    if not generator or capture([generator, "--version"]) != "lcm-gen 1.5.2":
+        raise RuntimeError("PGO wire V3要求固定lcm-gen 1.5.2，请设置LCM_GEN_EXECUTABLE")
     with tempfile.TemporaryDirectory(prefix="neh-prebuilt-probe-") as directory:
         temporary = Path(directory)
         protocol = temporary / "probe.proto"
         protocol.write_text('syntax = "proto3"; message Probe { optional int32 number = 1; }\n', encoding="utf-8")
         run([os.environ.get("PROTOC", "protoc"), "--experimental_allow_proto3_optional", "--proto_path=" + str(temporary), "--descriptor_set_out=" + str(temporary / "probe.pb"), str(protocol)])
+        idl = ROOT / common.WORKSPACE / "lcmtypes/nuwax_msgs"
+        run([generator, "-x", "--cpp-std", "c++11", "--cpp-hpath", str(temporary), *[str(idl / (name + ".lcm")) for name in ("NativePgoRequest", "NativePgoResult", "NativePgoStatus")]])
+        for name in ("NativePgoRequest", "NativePgoResult", "NativePgoStatus"):
+            if not (temporary / "nuwax_msgs" / (name + ".hpp")).is_file():
+                raise RuntimeError("PGO wire V3真实消息生成失败：" + name)
         for package in ("lcm", "glib-2.0", "eigen3"):
             run(["pkg-config", "--exists", package])
-        (temporary / "probe.cpp").write_text('#include <lcm/lcm.h>\n#include <pcl/point_types.h>\n#include <omp.h>\nint main(){ lcm_t* l=lcm_create("memq://"); if(!l)return 1; int n=omp_get_max_threads(); lcm_destroy(l); return n<1; }\n', encoding="utf-8")
-        (temporary / "CMakeLists.txt").write_text('cmake_minimum_required(VERSION 3.16)\nproject(neh_probe LANGUAGES C CXX)\nfind_package(PkgConfig REQUIRED)\npkg_check_modules(LCM REQUIRED IMPORTED_TARGET lcm)\nfind_package(PCL REQUIRED COMPONENTS common filters registration)\nfind_package(OpenMP REQUIRED COMPONENTS CXX)\nadd_executable(probe probe.cpp)\ntarget_include_directories(probe PRIVATE ${PCL_INCLUDE_DIRS})\ntarget_link_libraries(probe PRIVATE PkgConfig::LCM ${PCL_LIBRARIES} OpenMP::OpenMP_CXX)\n', encoding="utf-8")
+        (temporary / "probe.cpp").write_text('#include <lcm/lcm.h>\n#include <pcl/point_types.h>\n#include <omp.h>\n#include "nuwax_msgs/NativePgoRequest.hpp"\n#include "nuwax_msgs/NativePgoResult.hpp"\n#include "nuwax_msgs/NativePgoStatus.hpp"\nint main(){ lcm_t* l=lcm_create("memq://"); if(!l)return 1; int n=omp_get_max_threads(); lcm_destroy(l); return n<1 || nuwax_msgs::NativePgoRequest::getHash()==0 || nuwax_msgs::NativePgoResult::getHash()==0 || nuwax_msgs::NativePgoStatus::getHash()==0; }\n', encoding="utf-8")
+        (temporary / "CMakeLists.txt").write_text('cmake_minimum_required(VERSION 3.16)\nproject(neh_probe LANGUAGES C CXX)\nset(CMAKE_CXX_STANDARD 17)\nfind_package(PkgConfig REQUIRED)\npkg_check_modules(LCM REQUIRED IMPORTED_TARGET lcm)\nfind_package(PCL REQUIRED COMPONENTS common filters registration)\nfind_package(OpenMP REQUIRED COMPONENTS CXX)\nadd_executable(probe probe.cpp)\ntarget_include_directories(probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${PCL_INCLUDE_DIRS})\ntarget_link_libraries(probe PRIVATE PkgConfig::LCM ${PCL_LIBRARIES} OpenMP::OpenMP_CXX)\n', encoding="utf-8")
         run(["cmake", "-S", str(temporary), "-B", str(temporary / "build"), "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"])
         run(["cmake", "--build", str(temporary / "build"), "--parallel", "2"])
         run([str(temporary / "build/probe")])
@@ -58,7 +66,7 @@ def probe(output):
             (temporary / "concept.cpp").write_text('#include <concepts>\ntemplate <std::integral T> T f(T x){return x;}\nint main(){return f(0);}\n', encoding="utf-8")
             run([os.environ.get("NUWAX_CXX20", "g++-10"), "-std=c++20", str(temporary / "concept.cpp"), "-o", str(temporary / "concept")])
             run([str(temporary / "concept")])
-    dump(output, {"protocol": capture([os.environ.get("PROTOC", "protoc"), "--version"]), "packages": {name: capture(["pkg-config", "--modversion", name]) for name in ("lcm", "glib-2.0", "eigen3")}, "link": "passed"})
+    dump(output, {"protocol": capture([os.environ.get("PROTOC", "protoc"), "--version"]), "lcm_generator": {"version": capture([generator, "--version"]), "sha256": common.sha256(Path(generator)), "wire_v3": "generated-and-linked"}, "packages": {name: capture(["pkg-config", "--modversion", name]) for name in ("lcm", "glib-2.0", "eigen3")}, "link": "passed"})
 
 
 def identity(platform_key, root):
@@ -76,6 +84,7 @@ def identity(platform_key, root):
         "cxx20": capture([os.environ.get("NUWAX_CXX20", "c++"), "--version"]).splitlines()[0],
         "cmake": capture(["cmake", "--version"]).splitlines()[0],
         "protoc": capture([os.environ.get("PROTOC", "protoc"), "--version"]),
+        "lcm_generator": {"version": capture([os.environ["LCM_GEN_EXECUTABLE"], "--version"]), "sha256": common.sha256(Path(os.environ["LCM_GEN_EXECUTABLE"]))},
         "system_packages": capture(["dpkg-query", "-W", "-f=${binary:Package}=${Version}\n"]),
         "image": {"base": base_image, "dockerfile_sha256": common.sha256(root / "scripts/ci/prebuilt" / (platform_key + ".Dockerfile"))},
         # 不含路径和并行数；它们不改变代码语义，源码内优化配置由Git树覆盖。
@@ -127,6 +136,15 @@ def copy_notices(root, prefix, cache, staging, spec):
     for source in (root / "LICENSE", root / "THIRD_PARTY_NOTICES.md"):
         if source.is_file():
             shutil.copyfile(source, notice_root / source.name)
+    third_party = root / "docs/公开文档/第三方许可证说明.md"
+    if third_party.is_file():
+        shutil.copyfile(third_party, notice_root / third_party.name)
+    common_licenses = notice_root / "通用许可"
+    common_licenses.mkdir()
+    for name in ("GPL-2", "GPL-3", "LGPL-2.1", "LGPL-3", "Apache-2.0", "BSD"):
+        source = Path("/usr/share/common-licenses") / name
+        if source.is_file():
+            shutil.copyfile(source, common_licenses / name)
     if not (notice_root / "LICENSE").is_file():
         raise RuntimeError("发布程序缺少项目LICENSE")
     count = 0
@@ -147,7 +165,7 @@ def copy_notices(root, prefix, cache, staging, spec):
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source, destination)
                 count += 1
-    return count
+    return sum(1 for path in notice_root.rglob("*") if path.is_file())
 
 
 def package(root, prefix, cache, output, program, fingerprint_value, spec):
@@ -261,7 +279,7 @@ def build(args):
         builds.build_modules(root, prefix, cache, [recipe["module"]], args.jobs, run, local_build=True, programs=[program])
         records = dependency_records(program, cache, spec)
         generated = [cache / path for path in ("build", "sources", "slam2d-dependencies", "prefix", "cargo/registry", "cargo/git")]
-        generated.extend((Path(os.environ["RUSTUP_HOME"]), Path("/opt/protoc")))
+        generated.extend((Path(os.environ["RUSTUP_HOME"]), Path("/opt/protoc"), Path("/opt/lcm-gen-1.5.2")))
         audit = common.audit_dependencies(root, spec, records, generated_roots=generated)
         entry = package(root, prefix, cache, output, program, value, spec)
         programs[program] = {**entry, "fingerprint": value, "input_spec": spec, "audit": audit}

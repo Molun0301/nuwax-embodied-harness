@@ -38,3 +38,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/ci/publish_channel.py
+
+  fault-acceptance:
+    name: 专用副本真实附件故障验收
+    needs: [source-check, guardrails, prebuilt]
+    if: github.ref == 'refs/heads/feat/install-update-productization' && contains(github.event.head_commit.message, '[预编译验收]')
+    permissions:
+      contents: write
+    uses: ./.github/workflows/prebuilt-acceptance.yml
+    with:
+      source_revision: ${{ github.sha }}

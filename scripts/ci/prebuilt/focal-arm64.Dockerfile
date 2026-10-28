@@ -16,6 +16,20 @@ RUN curl -fsSL --retry 3 https://github.com/protocolbuffers/protobuf/releases/do
     && echo '9eae1f20f70cccc912d1c318c3929b86aebf5afd4b0f32c196ef682c222ed5ae  /tmp/protoc.zip' | sha256sum -c - \
     && unzip -q /tmp/protoc.zip -d /opt/protoc && rm /tmp/protoc.zip \
     && /opt/protoc/bin/protoc --version | grep -Fx 'libprotoc 25.3'
+# 固定PGO wire V3宿主生成器；只构建此工具，不安装或替换目标LCM运行库。
+RUN curl -fsSL --retry 3 https://codeload.github.com/lcm-proj/lcm/tar.gz/bac6b256144b25e8e41a172d1a45f4581e49717d -o /tmp/lcm-1.5.2.tar.gz \
+    && echo '3c6634d089d69f6be5a7dfd80c2379beb65c6bbf3a2ec852d8ba37f644ddeeb4  /tmp/lcm-1.5.2.tar.gz' | sha256sum -c - \
+    && mkdir /tmp/lcm-1.5.2 && tar -xzf /tmp/lcm-1.5.2.tar.gz --strip-components=1 -C /tmp/lcm-1.5.2 \
+    && cmake -S /tmp/lcm-1.5.2 -B /tmp/lcm-1.5.2-build -DCMAKE_BUILD_TYPE=Release \
+       -DLCM_ENABLE_PYTHON=OFF -DLCM_ENABLE_JAVA=OFF -DLCM_ENABLE_LUA=OFF \
+       -DLCM_ENABLE_GO=OFF -DLCM_ENABLE_TESTS=OFF -DLCM_ENABLE_EXAMPLES=OFF \
+    && cmake --build /tmp/lcm-1.5.2-build --target lcm-gen --parallel 2 \
+    && mkdir -p /opt/lcm-gen-1.5.2/bin /opt/lcm-gen-1.5.2/share \
+    && cp /tmp/lcm-1.5.2-build/lcmgen/lcm-gen /opt/lcm-gen-1.5.2/bin/lcm-gen \
+    && cp /tmp/lcm-1.5.2/COPYING /opt/lcm-gen-1.5.2/share/COPYING \
+    && /opt/lcm-gen-1.5.2/bin/lcm-gen --version | grep -Fx 'lcm-gen 1.5.2' \
+    && rm -rf /tmp/lcm-1.5.2 /tmp/lcm-1.5.2-build /tmp/lcm-1.5.2.tar.gz
+ENV LCM_GEN_EXECUTABLE=/opt/lcm-gen-1.5.2/bin/lcm-gen
 RUN useradd --create-home --uid 1001 builder
 USER builder
 ENV RUSTUP_HOME=/home/builder/.rustup CARGO_HOME=/home/builder/.cargo \

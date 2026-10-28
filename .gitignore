@@ -268,6 +268,7 @@ drivers/.active_robot.lock
 !/scripts/ci/prebuilt.py
 !/scripts/ci/check_prebuilt.py
 !/scripts/ci/publish_channel.py
+!/scripts/ci/prebuilt_acceptance.py
 !/scripts/ci/prebuilt/
 /scripts/ci/prebuilt/*
 !/scripts/ci/prebuilt/focal-arm64.Dockerfile

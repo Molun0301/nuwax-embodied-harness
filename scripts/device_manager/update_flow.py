@@ -60,8 +60,8 @@ def wait_prebuilt(engine, source, job):
     request = job["_plan"].get("_request", {})
     if request.get("local_build") or not source["repository"].startswith("https://github.com/"):
         return
-    from scripts.neh_prebuilt import PrebuiltPending, PrebuiltUnavailable, fetch_index, platform_key, program_names
-    if not platform_key() or not program_names(job["_plan"]["modules"]):
+    from scripts.neh_prebuilt import PrebuiltPending, PrebuiltUnavailable, fetch_index, platform_key, eligible_program_names
+    if not platform_key() or not eligible_program_names(job["_plan"]["modules"]):
         return
     while True:
         engine._cancelled(job["id"])

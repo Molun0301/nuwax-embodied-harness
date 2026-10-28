@@ -49,13 +49,13 @@ def main():
         revision = commit(root)
         identity = {"compiler": "隔离夹具"}
         original = {name: common.fingerprint(root, name, "noble-x86_64", spec, identity) for name, spec in specs.items()}
-        (root / "pointlio_native/input.cpp").write_text("// PointLIO输入已改变\n", encoding="utf-8")
+        (root / "nuwax-person-follow/input.cpp").write_text("// 人物跟随输入已改变\n", encoding="utf-8")
         revision = commit(root)
         changed = {name: common.fingerprint(root, name, "noble-x86_64", spec, identity) for name, spec in specs.items()}
-        assert [name for name in original if changed[name] != original[name]] == ["pointlio_native"], "T1：只允许PointLIO指纹改变"
+        assert [name for name in original if changed[name] != original[name]] == ["nuwax-person-follow"], "T1：只允许人物跟随指纹改变"
         assert changed == {name: common.fingerprint(root, name, "noble-x86_64", spec, identity) for name, spec in specs.items()}, "T2：相同输入指纹必须稳定"
 
-        program = "pointlio_native"
+        program = "nuwax-person-follow"
         value = changed[program]
         staging = base / "staging"
         (staging / "bin").mkdir(parents=True)
@@ -64,7 +64,7 @@ def main():
         (staging / "share/licenses").mkdir(parents=True)
         (staging / "share/licenses/LICENSE").write_text("隔离制品许可夹具\n", encoding="utf-8")
         files = ["bin/" + program, "share/licenses/LICENSE"]
-        manifest = {"schema": 1, "program": program, "fingerprint": value, "files": common._receipt_files(staging, files)}
+        manifest = {"schema": common.SCHEMA, "program": program, "fingerprint": value, "files": common._receipt_files(staging, files)}
         (staging / "prebuilt-manifest.json").write_text(json.dumps(manifest))
         raw = base / "program.tar"
         with tarfile.open(raw, "w") as archive:
@@ -73,7 +73,7 @@ def main():
         archive = base / "program.tar.zst"
         run(["zstd", "-q", str(raw), "-o", archive])
         entry = {"fingerprint": value, "asset": program + "-" + value + ".tar.zst", "sha256": common.sha256(archive), "size": archive.stat().st_size, "input_spec": specs[program]}
-        index = {"schema": 1, "revision": revision, "platforms": {"noble-x86_64": {"build_identity": identity, "programs": {program: entry}}}}
+        index = {"schema": common.SCHEMA, "revision": revision, "platforms": {"noble-x86_64": {"build_identity": identity, "programs": {program: entry}}}}
         config = {"revision": revision, "repository": "example/repository"}
         payload = archive.read_bytes()
         original_which = shutil.which
@@ -111,13 +111,13 @@ def main():
             assert set(resolved) == {program}
 
         compiled = []
-        def local_builder(_root, _prefix, _cache, name, _jobs, _run):
-            compiled.append(name)
-            (_prefix / "bin").mkdir(exist_ok=True)
-            destination = _prefix / "bin" / (name + "_native")
-            shutil.copyfile(shutil.which("true"), destination)
-            destination.chmod(0o755)
-            return destination
+        target = base / "rust-target"
+        def rust_build(command, **kwargs):
+            compiled.append(tuple(command))
+            binary = target / "release" / program
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(original_which("true"), binary)
+            binary.chmod(0o755)
 
         for scenario in ("missing", "corrupt"):
             (prefix / "bin" / program).unlink()
@@ -125,12 +125,32 @@ def main():
             cached.unlink(missing_ok=True)
             failure = urllib.error.HTTPError("https://github.com/example/repository", 404, "missing", {}, None)
             effect = failure if scenario == "missing" else None
-            with mock.patch.object(common, "platform_key", return_value="noble-x86_64"), mock.patch.object(common, "fetch_index", return_value=index), mock.patch.object(common, "_urlopen", side_effect=effect, return_value=io.BytesIO(b"tampered")), mock.patch.object(builds, "_build_native", side_effect=local_builder):
-                result = builds.build_modules(root, prefix, cache, ["pointlio"], 1, run, prebuilt=config)
+            manifest = root / common.PROGRAMS[program]["manifest"]
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.with_name("Cargo.lock").write_text("# 隔离调度夹具\n")
+            with mock.patch.object(common, "platform_key", return_value="noble-x86_64"), mock.patch.object(common, "fetch_index", return_value=index), mock.patch.object(common, "_urlopen", side_effect=effect, return_value=io.BytesIO(b"tampered")), mock.patch.object(builds, "_rust_toolchain", return_value=(Path("cargo"), {})), mock.patch.object(builds, "_protocol_compiler", return_value={}), mock.patch.object(builds, "_rust_target", return_value=target):
+                result = builds.build_modules(root, prefix, cache, ["follow"], 1, rust_build, prebuilt=config)
                 assert set(result) == {program}
                 assert (prefix / "bin" / program).read_bytes()[:4] == b"\x7fELF"
             assert not cached.exists(), "T3/T4：坏下载不能成为有效制品缓存"
-        assert compiled == ["pointlio", "pointlio"], "T3/T4：必须回退真实本机构建入口"
+        assert len(compiled) == 2 and all("--package" in command and "nuwax-nav-visual-servoing" in command for command in compiled), "T3/T4：必须回到人物跟随Rust编译入口"
+        # 这里只验证调度；独立云端故障作业使用真正Rust编译器，不替换构建器。
+        assert common.eligible_program_names(["fastlio2", "pointlio"]) == ()
+        assert set(common.program_names(["fastlio2", "pointlio"])) == set(common.LOCAL_PROGRAMS)
+        def local_native(_root, _prefix, _cache, name, _jobs, _run):
+            path = _prefix / "bin" / (name + "_native")
+            shutil.copyfile(original_which("true"), path)
+            path.chmod(0o755)
+            return path
+        with mock.patch.object(common, "fetch_index", side_effect=AssertionError("LIO-only不允许读取索引")), mock.patch.object(builds, "_build_native", side_effect=local_native):
+            result = builds.build_modules(root, prefix, cache, ["pointlio"], 1, run, prebuilt=config)
+            assert set(result) == {"pointlio_native"}
+        try:
+            common.install_archive(root, prefix, cache, "pointlio_native", entry, config["repository"])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("LIO不能安装任何预编译附件")
 
         # T5通过真实编译器依赖记录发现未声明的跨目录头文件。
         (root / "declared").mkdir()

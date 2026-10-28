@@ -589,15 +589,16 @@ def _executable(path: Path) -> None:
 
 def build_modules(root: Path, prefix: Path, cache: Path, modules: Iterable[str],
                   jobs: int, run: Callable, *, prebuilt: Optional[Mapping] = None,
-                  local_build: bool = False, programs: Optional[Iterable[str]] = None) -> dict[str, str]:
+                  local_build: bool = False, programs: Optional[Iterable[str]] = None,
+                  capture_link_args: bool = False) -> dict[str, str]:
     """构建所选模块；run 接收参数数组及 cwd/env，命令失败必须抛出异常。"""
     root, prefix, cache = Path(root).resolve(), Path(prefix).resolve(), Path(cache).resolve()
     selected = set(modules)
-    from scripts.neh_prebuilt import PROGRAMS, prepare_prebuilt, program_names, record_local
+    from scripts.neh_prebuilt import ALL_PROGRAMS, prepare_prebuilt, program_names, record_local
     requested = set(program_names(selected))
     if programs is not None:
         narrowed = set(programs)
-        if not narrowed.issubset(requested) or not narrowed.issubset(PROGRAMS):
+        if not narrowed.issubset(requested) or not narrowed.issubset(ALL_PROGRAMS):
             raise ValueError("逐程序构建范围不属于所选模块。")
         requested = narrowed
     if not isinstance(jobs, int) or isinstance(jobs, bool) or jobs < 1:
@@ -643,6 +644,9 @@ def build_modules(root: Path, prefix: Path, cache: Path, modules: Iterable[str],
             ]
             if features:
                 command.extend(("--features", ",".join(features)))
+            if capture_link_args:
+                command[1] = "rustc"
+                command.extend(("-vv", "--", "--print=link-args"))
             build_environment = environment
             if binary_name == "nuwax-slam-2d-worker":
                 build_environment = {**environment, "NUWAX_SLAM2D_DEPENDENCY_PREFIX": str(prefix),

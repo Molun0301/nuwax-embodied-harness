@@ -273,3 +273,6 @@ drivers/.active_robot.lock
 /scripts/ci/prebuilt/*
 !/scripts/ci/prebuilt/focal-arm64.Dockerfile
 !/scripts/ci/prebuilt/noble-x86_64.Dockerfile
+
+# 按实际编译及链接记录维护的预编译许可核查。
+!/docs/公开文档/预编译许可证清单.md

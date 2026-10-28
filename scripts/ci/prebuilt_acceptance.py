@@ -22,7 +22,7 @@ from scripts.module_installer import builds
 
 VALIDATION_RELEASE = "neh-prebuilt-validation-v1"
 PRODUCTION_RELEASE = "neh-prebuilt-v1"
-PROGRAM = "pointlio_native"
+PROGRAM = "nuwax-person-follow"
 PLATFORM = "noble-x86_64"
 
 
@@ -112,7 +112,7 @@ def prepare(args):
     validated = release(repository, create_revision=args.revision)
     payload["release_id"] = validated["id"]
     dump(state / "验收状态.json", payload)
-    # 验收副本只包含当前平台PointLIO，原输入声明与编译器身份完整保留。
+    # 验收副本只包含当前平台人物跟随，原输入声明与编译器身份完整保留。
     copied = {**index, "platforms": {PLATFORM: {**target, "programs": {PROGRAM: entry}}}, "validation_copy_of": PRODUCTION_RELEASE}
     copied_index = state / ("index-" + args.revision + ".json")
     dump(copied_index, copied)
@@ -199,12 +199,15 @@ def client(args):
         dump(owner, expected_owner)
     prefix = cache / "prefix"
     prefix.mkdir(exist_ok=True)
-    # 每轮让PointLIO目标从源码实际重编译；固定源码与Livox公共依赖可复用。
-    native_build = cache / "build/native/pointlio"
-    if native_build.is_symlink():
-        raise RuntimeError("验收构建目录不能为符号链接")
-    if native_build.exists():
-        shutil.rmtree(native_build)
+    # 只移除本程序的Rust输出，依赖与固定target槽复用，确保本轮真实重新链接。
+    target = builds._rust_target(cache, root, common.PROGRAMS[PROGRAM]["manifest"])
+    own_outputs = [target / "release" / PROGRAM]
+    own_outputs.extend((target / "release/deps").glob(PROGRAM.replace("-", "_") + "-*"))
+    for output in own_outputs:
+        if output.is_symlink():
+            raise RuntimeError("验收Rust输出不能为符号链接")
+        if output.is_file():
+            output.unlink()
     for path in (prefix / "bin" / PROGRAM, cache / "prebuilt/receipts" / (PROGRAM + ".json"), cache / "prebuilt/archives" / payload["entry"]["asset"]):
         if path.is_symlink():
             raise RuntimeError("验收清理目标不能为符号链接")
@@ -258,7 +261,7 @@ def client(args):
                 if len(received) != payload["entry"]["size"] or observed == payload["entry"]["sha256"]:
                     raise RuntimeError("T4故障附件未保持大小并改变摘要")
                 report["fault_observation"] = {"bytes": len(received), "sha256": observed, "url": asset_url}
-            result = builds.build_modules(root, prefix, cache, ["pointlio"], args.jobs, run, prebuilt={"repository": payload["repository"], "revision": revision}, programs=[PROGRAM])
+            result = builds.build_modules(root, prefix, cache, ["follow"], args.jobs, run, prebuilt={"repository": payload["repository"], "revision": revision}, programs=[PROGRAM], capture_link_args=True)
             if set(result) != {PROGRAM}:
                 raise RuntimeError("真实构建器返回程序集合错误")
             binary = Path(result[PROGRAM])
@@ -269,21 +272,21 @@ def client(args):
             dependencies = subprocess.check_output(["ldd", str(binary)], text=True, env={**os.environ, "LC_ALL": "C"})
             if "not found" in dependencies:
                 raise RuntimeError("回退程序有无法解析的动态依赖")
-            if not any(command["argv"][:2] == ["cmake", "-S"] and str(root / common.NATIVE_ROOT / "pointlio/cpp") in command["argv"] for command in commands):
-                raise RuntimeError("未经过真正PointLIO CMake源码配置")
-            if not any((cache / "build/native/pointlio").rglob("*.o")):
-                raise RuntimeError("PointLIO回退没有产生真实目标文件")
+            if not any("rustc" in command["argv"] and "--bin" in command["argv"] and PROGRAM in command["argv"] and "nuwax-nav-visual-servoing" in command["argv"] for command in commands):
+                raise RuntimeError("未经过真正人物跟随Rust源码编译")
             expected_index = common.release_url(payload["repository"], "index-" + revision + ".json")
             if expected_index not in requests or requests.count(asset_url) < 2:
                 raise RuntimeError("设备没有实际匿名请求验收索引和故障程序")
             receipt = cache / "prebuilt/receipts" / (PROGRAM + ".json")
             if not common.reusable(prefix, receipt, payload["entry"]["fingerprint"]):
                 raise RuntimeError("本机回退未产生可复用程序收据")
-            report.update(success=True, binary_sha256=common.sha256(binary), elf_header=info, dynamic_dependencies=dependencies, compiled_objects=len(list(native_build.rglob("*.o"))))
+            report.update(success=True, binary_sha256=common.sha256(binary), elf_header=info, dynamic_dependencies=dependencies, rust_target=str(target))
         logged = log_path.read_text(encoding="utf-8")
         expected_error = "HTTP Error 404" if args.case == "missing" else "预编译下载SHA-256（文件校验摘要）不符"
-        if expected_error not in logged or "退回本机编译 pointlio_native" not in logged:
+        if expected_error not in logged or "退回本机编译 " + PROGRAM not in logged:
             raise RuntimeError("设备日志缺少明确故障拒绝与本机编译回退证据")
+        if '--crate-name nuwax_person_follow' not in logged or not any(line.startswith("LC_ALL=") and '"-o"' in line for line in logged.splitlines()):
+            raise RuntimeError("缺少真实Rustc执行与最终链接命令证据")
     except BaseException as exc:
         report.update(success=False, error=str(exc))
         raise

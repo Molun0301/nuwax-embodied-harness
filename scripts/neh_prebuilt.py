@@ -21,19 +21,22 @@ from pathlib import Path, PurePosixPath
 from typing import Iterable, Mapping, Optional, Sequence
 
 RELEASE = "neh-prebuilt-v1"
-SCHEMA = 1
+SCHEMA = 2
 NATIVE_ROOT = "services/nuwax-workspace/crates/nuwax-lio-backends/native"
 WORKSPACE = "services/nuwax-workspace"
 # 每个条目与实际 build_modules 配方相同；映射工具属于几何模块。
-PROGRAMS = {
+LOCAL_PROGRAMS = {
     "fastlio2_native": {"module": "fastlio2", "native": "fastlio2"},
     "pointlio_native": {"module": "pointlio", "native": "pointlio"},
+}
+PROGRAMS = {
     "nuwax-slam-2d-worker": {"module": "slam2d", "manifest": WORKSPACE + "/Cargo.toml", "package": "nuwax-slam-2d-runtime", "features": ["worker"]},
     "nuwax-geometry-runtime": {"module": "geometry", "manifest": "services/geometry/nuwax_geometry_runtime/Cargo.toml", "package": "nuwax-geometry-runtime", "features": []},
     "nuwax-nav-stack": {"module": "navigation", "manifest": WORKSPACE + "/Cargo.toml", "package": "nuwax-nav-stack", "features": ["simple-2d", "replanning-astar", "mls"]},
     "nuwax-person-follow": {"module": "follow", "manifest": WORKSPACE + "/Cargo.toml", "package": "nuwax-nav-visual-servoing", "features": ["link-liblcm"]},
     "nuwax-mapping-cli": {"module": "geometry", "manifest": WORKSPACE + "/Cargo.toml", "package": "nuwax-mapping-cli", "features": []},
 }
+ALL_PROGRAMS = {**LOCAL_PROGRAMS, **PROGRAMS}
 PLATFORMS = {"focal-arm64", "noble-x86_64"}
 _HEX = re.compile(r"[0-9a-f]{64}")
 _REVISION = re.compile(r"[0-9a-f]{40}")
@@ -74,6 +77,12 @@ def platform_key() -> Optional[str]:
 
 
 def program_names(modules: Iterable[str]) -> tuple:
+    selected = set(modules)
+    return tuple(name for name, recipe in ALL_PROGRAMS.items() if recipe["module"] in selected)
+
+
+def eligible_program_names(modules: Iterable[str]) -> tuple:
+    """仅返回允许云端分发的五程序；设备等待索引必须使用此入口。"""
     selected = set(modules)
     return tuple(name for name, recipe in PROGRAMS.items() if recipe["module"] in selected)
 
@@ -121,6 +130,8 @@ def fetch_index(repository: str, revision: str, *, timeout: int = 20) -> dict:
         for key, entry in payload["platforms"].items():
             if key not in PLATFORMS or not isinstance(entry, dict) or not isinstance(entry.get("programs"), dict):
                 raise ValueError("预编译索引平台无效")
+            if not set(entry["programs"]).issubset(PROGRAMS) or payload.get("source_archives"):
+                raise ValueError("预编译索引包含禁止分发的LIO程序或源码包")
         return payload
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
@@ -157,43 +168,49 @@ def discover_inputs(root: Path, program: str, cargo: Path, environment: Mapping,
     recipe = PROGRAMS[program]
     paths = {"scripts/module_installer/builds.py", "scripts/neh_prebuilt.py", "scripts/ci/prebuilt.py", "LICENSE", "docs/公开文档/第三方许可证说明.md"}
     excluded = []
-    if "native" in recipe:
-        paths.update((NATIVE_ROOT + "/" + recipe["native"] + "/cpp", NATIVE_ROOT + "/common", NATIVE_ROOT + "/livox/cpp/flake.nix", WORKSPACE + "/lcmtypes"))
-    else:
-        manifest = recipe["manifest"]
-        command = [str(cargo), "metadata", "--locked", "--format-version", "1", "--filter-platform", target, "--manifest-path", str(root / manifest)]
-        if recipe["features"]:
-            command.extend(("--features", ",".join(recipe["package"] + "/" + feature for feature in recipe["features"])))
-        metadata = json.loads(_capture(command, cwd=root, env=environment))
-        packages = {item["id"]: item for item in metadata["packages"]}
-        nodes = {item["id"]: item for item in metadata["resolve"]["nodes"]}
-        pending = [key for key, item in packages.items() if item["name"] == recipe["package"] and item.get("source") is None]
-        if len(pending) != 1:
-            raise RuntimeError("Cargo无法唯一确定程序包：" + program)
-        seen = set()
-        while pending:
-            key = pending.pop()
-            if key in seen:
-                continue
-            seen.add(key)
-            item = packages[key]
-            if item.get("source") is None:
-                directory = Path(item["manifest_path"]).parent.relative_to(root).as_posix()
-                paths.add(directory)
-                # Rust适配层不会编译两个独立LIO进程；依赖记录审计会拒绝新增的跨界读取。
-                if directory == WORKSPACE + "/crates/nuwax-lio-backends":
-                    excluded.append(directory + "/native")
-            for dependency in nodes[key].get("deps", []):
-                if any(kind["kind"] != "dev" for kind in dependency["dep_kinds"]):
-                    pending.append(dependency["pkg"])
-        paths.update((manifest, str(PurePosixPath(manifest).with_name("Cargo.lock")), WORKSPACE + "/Cargo.toml", WORKSPACE + "/build_support", WORKSPACE + "/lcmtypes", "services/navigation/proto", "services/geometry/nuwax_geometry_runtime/proto"))
-        if program == "nuwax-slam-2d-worker":
-            paths.update(("scripts/prepare_slam2d_dependencies.py", "drivers/sensors/slamtec_native"))
+    manifest = recipe["manifest"]
+    command = [str(cargo), "metadata", "--locked", "--format-version", "1", "--filter-platform", target, "--manifest-path", str(root / manifest)]
+    if recipe["features"]:
+        command.extend(("--features", ",".join(recipe["package"] + "/" + feature for feature in recipe["features"])))
+    metadata = json.loads(_capture(command, cwd=root, env=environment))
+    packages = {item["id"]: item for item in metadata["packages"]}
+    nodes = {item["id"]: item for item in metadata["resolve"]["nodes"]}
+    pending = [key for key, item in packages.items() if item["name"] == recipe["package"] and item.get("source") is None]
+    if len(pending) != 1:
+        raise RuntimeError("Cargo无法唯一确定程序包：" + program)
+    seen = set()
+    cargo_packages = []
+    while pending:
+        key = pending.pop()
+        if key in seen:
+            continue
+        seen.add(key)
+        item = packages[key]
+        cargo_packages.append({field: item.get(field) for field in ("id", "name", "version", "source", "license", "manifest_path")})
+        if item.get("source") is None:
+            directory = Path(item["manifest_path"]).parent.relative_to(root).as_posix()
+            paths.add(directory)
+            external_inputs = {
+                "nuwax-mapping": "contracts/pgo_options.json",
+                "nuwax-lio-backends": "contracts/pointlio_options.json",
+                "nuwax-nav-pgo-bridge": WORKSPACE + "/crates/nuwax-gtsam/native",
+            }
+            if item["name"] in external_inputs:
+                paths.add(external_inputs[item["name"]])
+            # Rust适配层不会编译两个独立LIO进程；依赖记录审计会拒绝新增的跨界读取。
+            if directory == WORKSPACE + "/crates/nuwax-lio-backends":
+                excluded.append(directory + "/native")
+        for dependency in nodes[key].get("deps", []):
+            if any(kind["kind"] != "dev" for kind in dependency["dep_kinds"]):
+                pending.append(dependency["pkg"])
+    paths.update((manifest, str(PurePosixPath(manifest).with_name("Cargo.lock")), WORKSPACE + "/Cargo.toml", WORKSPACE + "/build_support", WORKSPACE + "/lcmtypes", "services/navigation/proto", "services/geometry/nuwax_geometry_runtime/proto"))
+    if program == "nuwax-slam-2d-worker":
+        paths.update(("scripts/prepare_slam2d_dependencies.py", "drivers/sensors/slamtec_native"))
     # 编译器读到的Cargo配置也是构建输入；外部配置由CI隔离的CARGO_HOME控制。
     for config in (".cargo", "rust-toolchain", "rust-toolchain.toml"):
         if (root / config).exists():
             paths.add(config)
-    return {"paths": sorted(paths), "exclude": sorted(excluded)}
+    return {"paths": sorted(paths), "exclude": sorted(excluded), "cargo_packages": sorted(cargo_packages, key=lambda item: item["id"])}
 
 
 def fingerprint(root: Path, program: str, target_platform: str, input_spec: Mapping, build_identity: Mapping) -> str:
@@ -242,7 +259,7 @@ def audit_dependencies(root: Path, input_spec: Mapping, records: Iterable[Path],
     """不自动把漏算输入加入范围；失败必须由维护者修正声明并重新编译。"""
     root = Path(root).resolve()
     generated = [Path(item).resolve() for item in generated_roots]
-    seen, missing, record_count = set(), set(), 0
+    seen, external, missing, record_count = set(), set(), set(), 0
     for record in records:
         record_count += 1
         for value in dependency_paths(record):
@@ -253,6 +270,7 @@ def audit_dependencies(root: Path, input_spec: Mapping, records: Iterable[Path],
             try:
                 relative = absolute.relative_to(root).as_posix()
             except ValueError:
+                external.add(str(absolute))
                 resolved = absolute.resolve()
                 if not any(resolved == allowed or allowed in resolved.parents for allowed in generated):
                     if not any(resolved == Path(base) or Path(base) in resolved.parents for base in ("/usr", "/lib", "/lib64", "/opt/rust")):
@@ -268,7 +286,7 @@ def audit_dependencies(root: Path, input_spec: Mapping, records: Iterable[Path],
         raise RuntimeError("缺少编译器依赖记录，拒绝发布未审计程序")
     if missing:
         raise RuntimeError("程序指纹漏掉实际编译输入：\n" + "\n".join(sorted(missing)))
-    return {"records": record_count, "repository_inputs": len(seen), "coverage": "complete"}
+    return {"records": record_count, "repository_inputs": sorted(seen), "external_inputs": sorted(external), "coverage": "complete"}
 
 
 def _write_json(path: Path, payload: Mapping) -> None:
@@ -458,6 +476,8 @@ def _extract(archive: Path, destination: Path, program: str, fingerprint_value: 
 
 
 def install_archive(root: Path, prefix: Path, cache: Path, program: str, entry: Mapping, repository: str) -> None:
+    if program not in PROGRAMS:
+        raise ValueError("本机源码构建专用程序禁止使用预编译附件")
     fingerprint_value = entry["fingerprint"]
     asset, expected = entry["asset"], entry["sha256"]
     if not _HEX.fullmatch(fingerprint_value) or not _HEX.fullmatch(expected) or asset != program + "-" + fingerprint_value + ".tar.zst":
@@ -510,6 +530,9 @@ def install_archive(root: Path, prefix: Path, cache: Path, program: str, entry: 
 
 def prepare_prebuilt(root: Path, prefix: Path, cache: Path, programs: Iterable[str], config: Mapping) -> tuple:
     """返回已复用路径和可记录的指纹；仅缺索引时等待，其它失败逐程序回退。"""
+    programs = tuple(name for name in programs if name in PROGRAMS)
+    if not programs:
+        return {}, {}
     key = platform_key()
     if key is None:
         return {}, {}

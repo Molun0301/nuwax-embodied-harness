@@ -1,0 +1,86 @@
+{
+  "schema": 1,
+  "说明": "按实际编译器依赖、最终链接输入与许可正文逐程序核查；pending不能发布。两个LIO程序禁止进入本清单。",
+  "programs": {
+    "nuwax-slam-2d-worker": {
+      "platforms": {
+        "focal-arm64": {
+          "decision": "pending",
+          "review_key": "",
+          "license_expression": "",
+          "reviewed_components": []
+        },
+        "noble-x86_64": {
+          "decision": "pending",
+          "review_key": "",
+          "license_expression": "",
+          "reviewed_components": []
+        }
+      }
+    },
+    "nuwax-geometry-runtime": {
+      "platforms": {
+        "focal-arm64": {
+          "decision": "pending",
+          "review_key": "",
+          "license_expression": "",
+          "reviewed_components": []
+        },
+        "noble-x86_64": {
+          "decision": "pending",
+          "review_key": "",
+          "license_expression": "",
+          "reviewed_components": []
+        }
+      }
+    },
+    "nuwax-nav-stack": {
+      "platforms": {
+        "focal-arm64": {
+          "decision": "pending",
+          "review_key": "",
+          "license_expression": "",
+          "reviewed_components": []
+        },
+        "noble-x86_64": {
+          "decision": "pending",
+          "review_key": "",
+          "license_expression": "",
+          "reviewed_components": []
+        }
+      }
+    },
+    "nuwax-person-follow": {
+      "platforms": {
+        "focal-arm64": {
+          "decision": "pending",
+          "review_key": "",
+          "license_expression": "",
+          "reviewed_components": []
+        },
+        "noble-x86_64": {
+          "decision": "pending",
+          "review_key": "",
+          "license_expression": "",
+          "reviewed_components": []
+        }
+      }
+    },
+    "nuwax-mapping-cli": {
+      "platforms": {
+        "focal-arm64": {
+          "decision": "pending",
+          "review_key": "",
+          "license_expression": "",
+          "reviewed_components": []
+        },
+        "noble-x86_64": {
+          "decision": "pending",
+          "review_key": "",
+          "license_expression": "",
+          "reviewed_components": []
+        }
+      }
+    }
+  }
+}

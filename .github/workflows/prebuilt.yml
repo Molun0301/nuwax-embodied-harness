@@ -1,4 +1,4 @@
-name: NEH七程序增量预编译
+name: NEH五程序增量预编译
 
 # 由产品发布总工作流调用，测试与两平台都成功后才发布main通道。
 on:
@@ -75,10 +75,11 @@ jobs:
             -v "$RUNNER_TEMP/neh-output:/output" \
             -v "$RUNNER_TEMP/neh-prebuilt/assets.json:/assets.json:ro" \
             -e NEH_BASE_IMAGE="$BASE_IMAGE" \
+            -e NEH_PREBUILT_REPOSITORY="$GITHUB_REPOSITORY" \
             -e CARGO_TARGET_DIR=/cache/ci-target \
             -e CARGO_BUILD_JOBS=4 \
             "neh-prebuilt:$TARGET_PLATFORM" bash -c \
-            'git config --global --add safe.directory /workspace && python3 scripts/ci/check_prebuilt.py && python3 scripts/ci/prebuilt.py build --platform '"$TARGET_PLATFORM"' --cache /cache --output /output --assets /assets.json --jobs 4'
+            'git config --global --add safe.directory /workspace && python3 scripts/ci/check_prebuilt.py && python3 scripts/ci/prebuilt.py build --platform '"$TARGET_PLATFORM"' --repository "$NEH_PREBUILT_REPOSITORY" --cache /cache --output /output --assets /assets.json --jobs 4'
       - name: 保存已完成的编译缓存（包含失败前完成部分）
         if: always()
         uses: actions/cache/save@v4
@@ -89,7 +90,7 @@ jobs:
         id: artifacts
         if: success()
         run: |
-          if find "$RUNNER_TEMP/neh-output" -type f \( -name '*.tar.zst' -o -name 'source-*.tar.gz' \) -print -quit | read -r _; then
+          if find "$RUNNER_TEMP/neh-output" -type f -name '*.tar.zst' -print -quit | read -r _; then
             printf 'new=true\n' >> "$GITHUB_OUTPUT"
           fi
       - name: 为每个新文件生成构建来源证明
@@ -98,8 +99,8 @@ jobs:
         with:
           subject-path: |
             ${{ runner.temp }}/neh-output/*.tar.zst
-            ${{ runner.temp }}/neh-output/source-*.tar.gz
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: neh-prebuilt-${{ matrix.platform }}
           path: ${{ runner.temp }}/neh-output/

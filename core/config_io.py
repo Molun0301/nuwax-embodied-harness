@@ -97,13 +97,15 @@ def _valid_rotation_calibration(raw: str) -> bool:
         payload = json.loads(raw)
         translation = payload["translation_m"]
         rotation = payload["rotation_row_major"]
+        ray_origin = payload.get("ray_origin_in_input_m", [0, 0, 0])
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return False
-    if not isinstance(translation, (list, tuple)) or not isinstance(rotation, (list, tuple)):
+    if (not isinstance(translation, (list, tuple)) or not isinstance(rotation, (list, tuple))
+            or not isinstance(ray_origin, (list, tuple))):
         return False
-    if len(translation) != 3 or len(rotation) != 9:
+    if len(translation) != 3 or len(rotation) != 9 or len(ray_origin) != 3:
         return False
-    values = list(translation) + list(rotation)
+    values = list(translation) + list(rotation) + list(ray_origin)
     if any(
         isinstance(value, bool) or not isinstance(value, (int, float))
         for value in values
@@ -112,9 +114,10 @@ def _valid_rotation_calibration(raw: str) -> bool:
     try:
         numeric_translation = [float(value) for value in translation]
         numeric_rotation = [float(value) for value in rotation]
+        numeric_origin = [float(value) for value in ray_origin]
     except (OverflowError, TypeError, ValueError):
         return False
-    if not all(math.isfinite(value) for value in numeric_translation + numeric_rotation):
+    if not all(math.isfinite(value) for value in numeric_translation + numeric_rotation + numeric_origin):
         return False
     rows = [numeric_rotation[0:3], numeric_rotation[3:6], numeric_rotation[6:9]]
     for index, row in enumerate(rows):

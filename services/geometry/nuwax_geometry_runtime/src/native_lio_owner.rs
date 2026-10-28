@@ -49,6 +49,9 @@ const OUTPUT_TAIL_BYTES: usize = 64 * 1024;
 struct BodyFromSensorJson {
     translation_m: [f64; 3],
     rotation_row_major: [f64; 9],
+    /// 物理雷达原点在输入点云坐标中的位置；旧设备原始载荷仍以零点为原点。
+    #[serde(default)]
+    ray_origin_in_input_m: [f64; 3],
 }
 
 /// Concrete rigid transform required before a native backend may be spawned.
@@ -61,6 +64,7 @@ pub(crate) struct BodyFromSensorTransform {
 struct BodyFromSensorData {
     translation_m: Vector3<f64>,
     rotation: Matrix3<f64>,
+    ray_origin_in_input_m: Point3<f64>,
 }
 
 impl BodyFromSensorTransform {
@@ -83,6 +87,7 @@ impl BodyFromSensorTransform {
             format!("NATIVE_LIO_PREFLIGHT_FAILED env={env_name} invalid_json: {error}")
         })?;
         if !parsed.translation_m.iter().all(|value| value.is_finite())
+            || !parsed.ray_origin_in_input_m.iter().all(|value| value.is_finite())
             || !parsed
                 .rotation_row_major
                 .iter()
@@ -112,12 +117,17 @@ impl BodyFromSensorTransform {
             data: Box::new(BodyFromSensorData {
                 translation_m: Vector3::from_row_slice(&parsed.translation_m),
                 rotation,
+                ray_origin_in_input_m: Point3::from(parsed.ray_origin_in_input_m),
             }),
         })
     }
 
     pub(crate) fn transform_point(&self, sensor_point: &Point3<f64>) -> Point3<f64> {
         Point3::from(self.data.rotation * sensor_point.coords + self.data.translation_m)
+    }
+
+    pub(crate) fn ray_origin_body(&self) -> Point3<f64> {
+        self.transform_point(&self.data.ray_origin_in_input_m)
     }
 
     pub(crate) fn translation_m(&self) -> [f64; 3] {
@@ -1080,6 +1090,24 @@ mod tests {
         assert!(BodyFromSensorTransform::from_json(reflection).is_err());
         let scaled = r#"{"translation_m":[0.0,0.0,0.0],"rotation_row_major":[2.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0]}"#;
         assert!(BodyFromSensorTransform::from_json(scaled).is_err());
+    }
+
+    #[test]
+    fn independent_ray_origin_preserves_payload_transform_and_legacy_default() {
+        let old = BodyFromSensorTransform::from_json(rotated_json()).unwrap();
+        assert_eq!(old.ray_origin_body(), old.transform_point(&Point3::origin()));
+        let mut json: serde_json::Value = serde_json::from_str(rotated_json()).unwrap();
+        json["ray_origin_in_input_m"] = serde_json::json!([0.31502, 0.0, -0.089145]);
+        let independent = BodyFromSensorTransform::from_json(&json.to_string()).unwrap();
+        assert_eq!(independent.translation_m(), old.translation_m());
+        assert_eq!(independent.rotation_row_major(), old.rotation_row_major());
+        assert_eq!(independent.transform_point(&Point3::new(4., 5., 6.)),
+            old.transform_point(&Point3::new(4., 5., 6.)));
+        assert_eq!(independent.ray_origin_body(), Point3::new(1., 2.31502, 2.910855));
+        for bad in [serde_json::json!([1, 2]), serde_json::json!([1, 2, null]), serde_json::json!(null)] {
+            json["ray_origin_in_input_m"] = bad;
+            assert!(BodyFromSensorTransform::from_json(&json.to_string()).is_err());
+        }
     }
 
     #[test]

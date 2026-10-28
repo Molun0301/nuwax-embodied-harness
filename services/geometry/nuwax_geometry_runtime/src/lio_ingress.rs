@@ -1655,7 +1655,7 @@ impl NativeLioIngress {
             ..NativePairState::default()
         };
         let mut common = CommonLioIngress::new(spec);
-        common.sensor_origin_body = Some(body_from_sensor.transform_point(&Point3::origin()));
+        common.sensor_origin_body = Some(body_from_sensor.ray_origin_body());
         Ok(Self {
             common,
             body_from_sensor,
@@ -1687,7 +1687,7 @@ impl NativeLioIngress {
         let (source_pair_ready_tx, source_pair_ready_rx) = watch::channel(false);
         let mut common =
             CommonLioIngress::with_runtime(spec, handle, public_odometry, public_cloud, tf);
-        common.sensor_origin_body = Some(body_from_sensor.transform_point(&Point3::origin()));
+        common.sensor_origin_body = Some(body_from_sensor.ray_origin_body());
         Ok(Self {
             common,
             body_from_sensor,
@@ -5765,6 +5765,45 @@ mod tests {
             transformed,
             vec![Point3::new(1.0, 3.0, 3.0), Point3::new(0.0, 2.0, 3.0)]
         );
+    }
+
+    #[test]
+    fn native_independent_ray_origin_reaches_registration_without_moving_points() {
+        for backend in [LIO_BACKEND_FASTLIO2, LIO_BACKEND_POINTLIO] {
+            let extrinsic = BodyFromSensorTransform::from_json(
+                r#"{"translation_m":[1,2,3],"rotation_row_major":[0,-1,0,1,0,0,0,0,1],"ray_origin_in_input_m":[0.31502,0,-0.089145]}"#,
+            ).unwrap();
+            let mut ingress = NativeLioIngress::without_runtime(
+                DeviceLioIngressSpec::new_for_backend(backend, 7, "lidar", "base_link", "odom", "map").unwrap(),
+                extrinsic, Duration::from_millis(1),
+            ).unwrap();
+            ingress.common.self_cloud_filter = Ok(None);
+            let mut odometry = valid_odometry();
+            odometry.pose.position = [10., 20., 30.];
+            let half_yaw = std::f64::consts::FRAC_PI_4;
+            odometry.pose.orientation_xyzw = [0., 0., half_yaw.sin(), half_yaw.cos()];
+            let source = SourceIdentity { backend, runtime_generation: 7, source_sequence: 1, source_timestamp_ns: 1000 };
+            let pair = NativeSourcePair {
+                odometry: NativeOdometrySample { identity: source, odometry },
+                cloud: NativeCloudSample { identity: source, source_point_count: 1,
+                    sensor_points: vec![Point3::new(4., 5., 6.)], registration_mode_token: RegistrationModeToken::default() },
+            };
+            let points = transform_native_pair(&pair, &ingress.body_from_sensor).unwrap();
+            assert!((points[0]-Point3::new(4., 16., 39.)).norm() < 1e-12);
+            let adapter = active_adapter("map");
+            let frozen = odometry_pose_isometry(&pair.odometry.odometry).unwrap();
+            let prepared = ingress.common.register_odom_points_with_mode_token(
+                source, CorrelatedOdometry { source_sequence: 1, source_timestamp_ns: 1000 },
+                1000, 1, points, &adapter, ingress.common.capture_registration_mode_token(), Some(frozen),
+            ).unwrap();
+            let state = ingress.common.state.lock();
+            let binding = &state.pending_registrations[&(7, 1)].binding;
+            // 独立计算：载荷原点先经外参旋转，再经90度里程计旋转和平移。
+            let expected = binding.registration_map_from_odom * Point3::new(7.68498, 21., 32.910855);
+            let actual = Point3::from(binding.sensor_origin_map.unwrap());
+            assert!((actual-expected).norm() < 1e-10);
+            assert_eq!(prepared.envelope_for_test().emitted_point_count, 1);
+        }
     }
 
     #[tokio::test]

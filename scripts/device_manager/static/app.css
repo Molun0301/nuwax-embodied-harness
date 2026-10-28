@@ -2450,3 +2450,7 @@ textarea.field {
     transition: none !important;
   }
 }
+
+/* 新版本提醒跨页面持续可见。 */
+.update-banner { display:flex; align-items:center; justify-content:space-between; gap:1rem; padding:0.8rem 1.5rem; border-bottom:1px solid var(--line); background:var(--surface); }
+.update-banner[hidden] { display:none; }

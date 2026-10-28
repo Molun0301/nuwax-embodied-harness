@@ -20,7 +20,8 @@ def begin_update(engine, *, local_build=False, retry=False, automatic=False):
 
 def adopt_manager(engine, job):
     source = job["_plan"].get("_source")
-    if not source or source["revision"] == MANAGER_REVISION:
+    from .versioning import source_tree_unchanged
+    if not source or source_tree_unchanged(engine, source, MANAGER_REVISION):
         job["_manager_adopted"] = True
         return
     from .self_update import apply_manager

@@ -80,7 +80,7 @@
       python_environment:'准备运行环境',runtime_files:'准备启动文件',stopping:'停止原服务',
       switching:'切换版本',starting:'启动服务',rollback:'恢复原版本',failed:'未完成',
       source_download:'获取源码',native_build:'增量构建',source_verify:'验证候选版本',models:'准备模型',
-      manager_source:'从源码准备管理程序',manager_download:'下载管理程序',manager_verify:'校验管理程序',manager_switch:'切换管理程序'})[stage] || '正在处理';
+      waiting_idle:'等待安全空闲',prebuilt_pending:'云端编译中',manager_source:'从源码准备管理程序',manager_download:'下载管理程序',manager_verify:'校验管理程序',manager_switch:'切换管理程序'})[stage] || '正在处理';
   }
 
   function escapeHtml(value) {
@@ -436,6 +436,10 @@
   function applyStatus(status) {
     const previousDir = state.status && state.status.installation && state.status.installation.install_dir;
     state.status = status;
+    const update = status.update || {};
+    show($('updateBanner'), Boolean(update.available));
+    text($('updateBannerText'), '发现新版本 ' + (update.display_version || update.version || '') + (update.requires_confirmation ? '，需要人工确认' : ''));
+    if ($('immediateUpdate')) $('immediateUpdate').disabled = Boolean(status.active_job);
     state.passwordEnabled = Boolean(status.password_enabled);
     state.platformSupported = status.platform_supported !== false;
 
@@ -1455,7 +1459,8 @@
         body: {
           action: 'install',
           modules: Array.from(state.selectedModules),
-          robot: state.robot || undefined
+          robot: state.robot || undefined,
+          local_build: Boolean($('wizardLocalBuild') && $('wizardLocalBuild').checked)
         }
       });
       if (generation !== state.planGeneration) return;
@@ -2339,10 +2344,10 @@
     state.submitting = true;
     showMessage($('releasesStatus'), '');
 
-    const params = { version: version };
+    const params = { version: version, one_step: true, local_build: Boolean($('updateLocalBuild') && $('updateLocalBuild').checked) };
 
     try {
-      let plan = await apiCall('/api/manager/plan', { method: 'POST', body: { action: 'update', version: version, one_step: true } });
+      let plan = await apiCall('/api/manager/plan', { method: 'POST', body: Object.assign({ action: 'update' }, params) });
 
       if (Array.isArray(plan.blockers) && plan.blockers.length) {
         plan = await withStopConfirmation(plan, 'update', params);
@@ -2685,6 +2690,9 @@
       ]);
 
       $('autoStart').checked = Boolean(settings.auto_start);
+      $('settingsChannel').value = settings.channel || 'main';
+      $('settingsAutoUpdate').value = settings.auto_update || 'notify';
+      $('maintenanceWindow').value = settings.maintenance_window || '';
       state.passwordEnabled = Boolean(settings.password_enabled);
       updatePasswordControls();
 
@@ -2881,8 +2889,38 @@
     }
   }
 
+  async function immediateUpdate() {
+    if (state.submitting) return;
+    state.submitting = true;
+    try {
+      const job = await apiCall('/api/manager/update', {method:'POST', body:{local_build:Boolean($('updateLocalBuild') && $('updateLocalBuild').checked)}});
+      showView('jobs');
+      trackJob(job.id);
+      loadJobsView();
+    } catch (error) {
+      showMessage($('overviewLoadError'), error.message, 'error');
+    } finally {
+      state.submitting = false;
+    }
+  }
+
+  async function saveUpdatePreferences() {
+    try {
+      await apiCall('/api/manager/settings', {method:'PUT', body:{
+        channel:$('settingsChannel').value.trim(), auto_update:$('settingsAutoUpdate').value,
+        maintenance_window:$('maintenanceWindow').value.trim()
+      }});
+      showMessage($('settingsMessage'), '更新设置已保存。', 'good');
+    } catch (error) {
+      showMessage($('settingsMessage'), error.message, 'error');
+    }
+  }
+
   // ===== 事件绑定 =====
   function initEvents() {
+    $('immediateUpdate').addEventListener('click', immediateUpdate);
+    $('wizardLocalBuild').addEventListener('change', generatePlan);
+    $('saveUpdatePreferences').addEventListener('click', saveUpdatePreferences);
     $('startRuntime').addEventListener('click', function () { runtimeAction('start'); });
     $('stopRuntime').addEventListener('click', function () { runtimeAction('stop'); });
     $('restartRuntime').addEventListener('click', function () { runtimeAction('restart'); });
@@ -3016,6 +3054,11 @@
   function init() {
     bindOnce();
     boot();
+    // 只刷新管理状态；远端查询由服务端的30分钟调度拥有。
+    setInterval(async function () {
+      if (!state.status || document.hidden) return;
+      try { applyStatus(await apiCall('/api/manager/status')); } catch (ignored) { /* 下一次刷新继续。 */ }
+    }, 15000);
   }
 
   // 管理服务可能在更新后重启；这里最多等待一次短窗口，避免首屏直接报错。

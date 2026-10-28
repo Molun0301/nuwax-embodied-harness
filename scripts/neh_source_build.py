@@ -158,7 +158,9 @@ def execute(payload):
     hardware = hardware_probe.detect_hardware(home)
     # The installed manager also builds older pinned source revisions.
     resolve_jobs = getattr(hardware_probe, "resolve_build_jobs", lambda root, hardware: hardware.build_jobs)
-    request = InstallRequest(root=root, home=home, modules=modules, robot=payload["robot"], jobs=resolve_jobs(home, hardware=hardware), python=sys.executable)
+    jobs = resolve_jobs(home, hardware=hardware)
+    request = InstallRequest(root=root, home=home, modules=modules, robot=payload["robot"],
+                             jobs=min(jobs, 2) if payload.get("background") else jobs, python=sys.executable)
     operation = payload["operation"]
     run = _runner(root, home, candidate, library_prefix=Path(payload["build_prefix"]) if operation == "build" else None)
     if operation == "metadata":

@@ -25,6 +25,11 @@
     <button id="themeToggle" type="button" title="切换主题" aria-label="切换亮色或暗色主题">🌙</button>
   </header>
 
+  <aside id="updateBanner" class="update-banner" role="status" hidden>
+    <span id="updateBannerText"></span>
+    <button id="immediateUpdate" class="btn primary" type="button">立即更新</button>
+  </aside>
+
   <div id="viewHost" class="manager-views">
 
     <!-- 首屏加载态：设备状态读回前只显示这一屏，避免空数据被当成已安装结果。 -->
@@ -188,6 +193,7 @@
                 <div id="planSteps" class="plan-steps" hidden></div>
                 <div id="planWarnings" class="warning-list" hidden></div>
                 <div id="planBlockers" class="blocker-list" hidden></div>
+                <label class="config-label"><input id="wizardLocalBuild" type="checkbox">云端未就绪时立即本机编译</label>
                 <div class="step-actions">
                   <button id="backToModules" class="btn" type="button">上一步</button>
                   <button id="regeneratePlan" class="btn" type="button" hidden>重新生成</button>
@@ -405,6 +411,7 @@
             </div>
           </div>
 
+          <label class="config-label"><input id="updateLocalBuild" type="checkbox">云端未就绪时立即本机编译</label>
           <div class="update-config">
             <h3>更新来源</h3>
             <div class="config-row">
@@ -510,6 +517,17 @@
           </div>
 
           <div id="settingsMessage" class="status-message" hidden></div>
+
+          <section class="settings-section">
+            <h3>安装与更新</h3>
+            <p class="section-desc">默认每30分钟检查并提醒；空闲安装会等待任务结束、电机停用和新鲜状态。</p>
+            <div class="config-row">
+              <label><span class="config-label">更新通道</span><input id="settingsChannel" class="field" placeholder="main 或 branch:分支名称"></label>
+              <label><span class="config-label">更新档位</span><select id="settingsAutoUpdate" class="field"><option value="notify">检查并提醒（默认）</option><option value="off">关闭定时检查</option><option value="idle">空闲时自动安装</option></select></label>
+              <label><span class="config-label">维护时间窗</span><input id="maintenanceWindow" class="field" placeholder="02:00-05:00；留空全天"></label>
+            </div>
+            <button id="saveUpdatePreferences" class="btn primary" type="button">保存更新设置</button>
+          </section>
 
           <section class="settings-section">
             <h3>访问控制</h3>

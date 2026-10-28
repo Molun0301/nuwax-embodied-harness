@@ -267,6 +267,7 @@ drivers/.active_robot.lock
 # 两平台按程序预编译的固定环境与公开检查入口。
 !/scripts/ci/prebuilt.py
 !/scripts/ci/check_prebuilt.py
+!/scripts/ci/publish_channel.py
 !/scripts/ci/prebuilt/
 /scripts/ci/prebuilt/*
 !/scripts/ci/prebuilt/focal-arm64.Dockerfile

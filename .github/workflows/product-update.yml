@@ -19,3 +19,22 @@ jobs:
       id-token: write
       attestations: write
     uses: ./.github/workflows/prebuilt.yml
+
+  channel:
+    name: 发布通过检查的main通道
+    needs: [source-check, guardrails, prebuilt]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: neh-prebuilt-release-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: 发布匿名通道文件
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/publish_channel.py

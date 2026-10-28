@@ -21,13 +21,16 @@ def is_project_default(value):
 
 def normalized_settings(stored):
     result = dict(feed_url=DEFAULT_REPOSITORY, source_repository=DEFAULT_REPOSITORY,
-                  source_branch=DEFAULT_BRANCH, source_mode="git", channel="stable", auto_start=True, gateway_port=8766)
+                  source_branch=DEFAULT_BRANCH, source_mode="git", channel="main", auto_start=True, gateway_port=8766,
+                  auto_update="notify", check_interval_minutes=30, maintenance_window="")
     result.update(stored)
     if "source_mode" not in stored:
         result["source_mode"] = "git" if stored.get("source_repository") or is_project_default(stored.get("feed_url", "")) else "catalog"
     if result["source_mode"] == "git":
         result["source_repository"] = result.get("source_repository") or DEFAULT_REPOSITORY
         result["feed_url"] = result["source_repository"]
+        if result["channel"] in ("stable", "preview") or "channel" not in stored:
+            result["channel"] = "main" if result["source_branch"] == "main" else "branch:" + result["source_branch"]
     return result
 
 
@@ -41,13 +44,25 @@ def discover(engine, *, refresh=False, request=None, local_request=False):
         raise ManagerError("local_only", "临时源码仓库覆盖只能从设备命令行指定；网页请先保存源码设置。", 403)
     cache_path = engine.home / "cache/source-catalog.json"
     cache = read_json(cache_path, {})
-    identity = {"repository": repository, "branch": branch}
+    identity = {"repository": repository, "branch": branch, "channel": settings["channel"]}
     if not refresh and not request and cache.get("identity") == identity:
+        if cache.get("error"):
+            raise ManagerError("source_unavailable", cache["error"], 502)
         return cache["source"]
+    if not refresh and not request and settings.get("auto_update") == "off":
+        raise ManagerError("checks_disabled", "定时检查已关闭，可执行neh update --check主动检查。", 409)
     try:
-        info = remote_revision(repository, branch, run=run_command, allow_local=allow_local)
-    except (SourceError, OSError) as exc:
-        raise ManagerError("source_unavailable", "无法访问仓库，请检查公开HTTPS地址、分支与网络。", 502) from exc
+        if settings["channel"] == "main" and not any(request.get(key) for key in ("source_repository", "source_branch", "source_revision")):
+            from .updates import read_channel
+            channel = read_channel(repository)
+            info = {"repository": repository, "branch": "main", "revision": channel["revision"],
+                    "version": source_version(channel["revision"]), "channel_record": channel}
+        else:
+            info = remote_revision(repository, branch, run=run_command, allow_local=allow_local)
+    except (SourceError, OSError, ManagerError) as exc:
+        message = exc.message if isinstance(exc, ManagerError) else "无法访问仓库，请检查公开HTTPS地址、分支与网络。"
+        atomic_json(cache_path, {"identity": identity, "error": message})
+        raise ManagerError("source_unavailable", message, 502) from exc
     # 计划查询也刷新真实分支提交；显式固定旧提交只影响本次计划，不能覆盖分支目录。
     info = dict(info, allow_local=allow_local)
     atomic_json(cache_path, {"identity": identity, "source": info})
@@ -64,7 +79,8 @@ def bridge(engine, source, candidate, operation, job, **values):
                    build_prefix=str(source["build_prefix"]), build_cache=str(source["build_cache"]),
                    modules=job["_plan"]["modules"], robot=job["_plan"]["robot"], revision=source["revision"])
     payload.update(prebuilt={"repository": source["repository"], "revision": source["revision"], "branch": source["branch"]},
-                   local_build=bool(job["_plan"].get("_request", {}).get("local_build")))
+                   local_build=bool(job["_plan"].get("_request", {}).get("local_build")),
+                   background=bool(job["_plan"].get("_request", {}).get("automatic")))
     if not source["repository"].startswith("https://github.com/"):
         payload["prebuilt"] = None
     environment = clean_environment(candidate)

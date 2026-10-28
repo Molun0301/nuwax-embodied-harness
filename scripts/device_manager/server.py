@@ -76,6 +76,8 @@ class ManagerServer(ThreadingHTTPServer):
     def _recover_background(self):
         try:
             self.engine.recover_if_needed()
+            from .updates import tick
+            tick(self.engine)
         except ManagerError:
             # 状态接口会返回损坏记录的真实错误；监听线程继续提供管理入口。
             pass

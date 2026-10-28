@@ -117,6 +117,11 @@ def parser():
     update.add_argument("--retry", action="store_true", help="明确重试此前失败的修订")
     uninstall = sub.add_parser("uninstall", help="卸载程序，默认保留配置和数据")
     uninstall.add_argument("--purge", action="store_true", help="同时删除本安装的配置、数据与构建缓存")
+    channel = sub.add_parser("channel", help="选择main或branch:分支名称")
+    channel.add_argument("value", nargs="?")
+    automatic = sub.add_parser("auto-update", help="设置定时检查与空闲更新档位，默认notify")
+    automatic.add_argument("mode", choices=("off", "notify", "idle"), nargs="?")
+    automatic.add_argument("--window", help="设备本地维护窗口，如02:00-05:00；空字符串表示全天")
     releases = sub.add_parser("releases", help="查询或主动刷新版本目录")
     releases.add_argument("--refresh", action="store_true")
     releases.add_argument("--catalog", help="显式本机catalog.json路径，仅供离线安装和验收")
@@ -155,7 +160,7 @@ def parser():
     settings.add_argument("--source-mode", choices=("git", "catalog"))
     settings.add_argument("--allow-local-source", action="store_true", help="明确允许本机Git夹具；网页不能启用此选项")
     settings.add_argument("--gateway-port", type=int, help="首次安装前设定业务端口，默认8766")
-    settings.add_argument("--channel", choices=("stable", "preview"))
+    settings.add_argument("--channel", help="main、branch:名称；旧目录保留stable/preview选择")
     settings.add_argument("--auto-start", choices=("true", "false"))
     password = sub.add_parser("password")
     password.add_argument("--stdin", action="store_true", help="逐行读取当前密码和新密码；未设密码时只读新密码")
@@ -202,6 +207,13 @@ def main(argv=None):
         elif command == "uninstall":
             from .uninstall import uninstall
             result = uninstall(engine, purge=args.purge)
+        elif command == "channel":
+            result = engine.save_settings({"channel": args.value}) if args.value else engine.settings()
+        elif command == "auto-update":
+            values = {"auto_update": args.mode} if args.mode else {}
+            if args.window is not None:
+                values["maintenance_window"] = args.window
+            result = engine.save_settings(values) if values else engine.settings()
         elif command == "settings":
             values = {key: getattr(args, key) for key in ("feed_url", "source_repository", "source_branch", "source_mode", "channel", "gateway_port") if getattr(args, key) is not None}
             if args.auto_start is not None:

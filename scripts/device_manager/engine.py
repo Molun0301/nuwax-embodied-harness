@@ -118,12 +118,37 @@ class Engine:
         from .sources import is_project_default
         from scripts.neh_source import SourceError, validate_repository
         values = dict(values)
-        if set(values) - {"feed_url", "source_repository", "source_branch", "source_mode", "channel", "auto_start", "gateway_port"}:
+        if set(values) - {"feed_url", "source_repository", "source_branch", "source_mode", "channel", "auto_start", "gateway_port",
+                          "auto_update", "check_interval_minutes", "maintenance_window"}:
             raise ManagerError("invalid_settings", "存在未知管理设置。")
         if "feed_url" in values and values["feed_url"]:
             validate_url(values["feed_url"])
         if "channel" in values and values["channel"] not in ("stable", "preview"):
-            raise ManagerError("invalid_settings", "通道必须是stable或preview。")
+            from scripts.neh_source import _branch
+            channel = values["channel"]
+            if channel == "main":
+                branch = "main"
+            elif isinstance(channel, str) and channel.startswith("branch:"):
+                try:
+                    branch = _branch(channel[7:])
+                except SourceError as exc:
+                    raise ManagerError("invalid_settings", str(exc)) from exc
+            else:
+                raise ManagerError("invalid_settings", "当前通道支持main或branch:分支名称，stable尚未开放。")
+            if values.get("source_branch", branch) != branch:
+                raise ManagerError("invalid_settings", "通道与源码分支不一致。")
+            values.update(source_branch=branch, source_mode="git")
+        elif "source_branch" in values and "channel" not in values:
+            values["channel"] = "main" if values["source_branch"] == "main" else "branch:" + str(values["source_branch"])
+        if "auto_update" in values and values["auto_update"] not in ("off", "notify", "idle"):
+            raise ManagerError("invalid_settings", "更新档位支持off、notify、idle。")
+        if "check_interval_minutes" in values and (type(values["check_interval_minutes"]) is not int or not 15 <= values["check_interval_minutes"] <= 1440):
+            raise ManagerError("invalid_settings", "检查间隔必须为15—1440分钟。")
+        if "maintenance_window" in values:
+            from .updates import validate_window
+            if not isinstance(values["maintenance_window"], str):
+                raise ManagerError("invalid_settings", "维护窗口必须是字符串。")
+            validate_window(values["maintenance_window"])
         if "source_mode" in values and values["source_mode"] not in ("git", "catalog"):
             raise ManagerError("invalid_settings", "源码模式只支持git或catalog。")
         if "source_branch" in values and (not isinstance(values["source_branch"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}", values["source_branch"]) or ".." in values["source_branch"]):
@@ -158,6 +183,8 @@ class Engine:
             result.update(values)
             result.pop("password_enabled", None)
             atomic_json(self.manager_home / "config/settings.json", result)
+            if set(values) & {"channel", "auto_update", "source_branch", "source_repository", "check_interval_minutes"}:
+                (self.manager_home / "config/update-check.json").unlink(missing_ok=True)
         return self.settings()
 
     def _source_options(self, catalog=None):
@@ -241,7 +268,8 @@ class Engine:
                 source = catalog["source"]
                 result.update(source_mode="git", source_repository=source["repository"], source_branch=source["branch"], source_revision=source["revision"])
                 result["releases"] = [{"version": source["version"], "revision": source["revision"], "channel": settings["channel"],
-                    "notes": "设备下载固定源码并复用本机构建缓存", "published_at": "", "compatible": self.hardware()["supported"],
+                    "notes": "设备下载固定源码并按程序指纹复用、下载或构建", "published_at": source.get("channel_record", {}).get("published_at", ""), "compatible": self.hardware()["supported"],
+                    "display_version": source.get("channel_record", {}).get("version", source["branch"] + "@" + source["revision"][:8]),
                     "reason": "", "modules": list(MODULES)}]
                 return result
             for release in self._ordered_releases(catalog):
@@ -287,9 +315,11 @@ class Engine:
         source_mode = self.settings()["source_mode"] == "git"
         relation_name = {1: "newer", 0: "same", -1: "older"}.get(relation, "unknown")
         if source_mode and available and current:
-            from .versioning import revision_relation
+            from .versioning import revision_relation, source_tree_unchanged
             try:
                 relation_name = revision_relation(self, self.catalog()["source"], current.get("revision"))
+                if relation_name == "newer" and source_tree_unchanged(self, self.catalog()["source"], current.get("revision")):
+                    relation_name = "same"
             except (OSError, RuntimeError) as exc:
                 relation_name = "unknown"
                 releases["error"] = "无法核对完整提交历史：" + str(exc)
@@ -301,15 +331,18 @@ class Engine:
             latest_manager = None
         manager_relation = None if MANAGER_DEVELOPMENT else compare_versions(latest_manager, installed_manager)
         if source_mode and available:
-            from .versioning import revision_relation
+            from .versioning import revision_relation, source_tree_unchanged
             try:
                 manager_relation_name = revision_relation(self, self.catalog()["source"], MANAGER_REVISION)
+                if manager_relation_name == "newer" and source_tree_unchanged(self, self.catalog()["source"], MANAGER_REVISION):
+                    manager_relation_name = "same"
             except (OSError, RuntimeError):
                 manager_relation_name = "unknown"
             manager_relation = {"newer": 1, "same": 0, "older": -1}.get(manager_relation_name)
         else:
             manager_relation_name = {1: "newer", 0: "same", -1: "older"}.get(manager_relation, "unknown")
         failed = read_json(self.manager_home / "config/failed-updates.json", {}).get(available.get("revision") if available else "", {})
+        channel_record = self.catalog().get("source", {}).get("channel_record", {}) if source_mode and available else {}
         installation = {"installed": bool(current), "install_dir": str(self.home), "version": current.get("version"), "modules": current.get("modules", []),
                         "robot": current.get("robot", "customrobot"), "previous_version": history.get("previous_version"), "source": current.get("source"), "revision": current.get("revision", "")}
         location = self.install_location()
@@ -318,7 +351,9 @@ class Engine:
         return {"product": "NEH", "manager_version": MANAGER_VERSION, "manager_revision": MANAGER_REVISION, "manager_development": MANAGER_DEVELOPMENT, "instance_id": self.instance_id, "installation": installation,
                 "runtime": self.runtime.status(), "active_job": self.active_job(),
                 "update": {"available": bool(available and current and relation == 1 and not failed), "failed": failed or None,
-                           "version": available["version"] if available else None, "revision": available.get("revision") if available else None, "error": releases.get("error"), "manager_available": bool(latest_manager and manager_relation == 1), "manager_version": latest_manager, "manager_switch_available": bool(latest_manager and manager_relation == 1), "manager_relation": manager_relation_name, "relation": relation_name},
+                           "requires_confirmation": channel_record.get("requires_confirmation", False), "display_version": available.get("display_version") if available else None,
+                           "check": read_json(self.manager_home / "config/update-check.json", {}),
+                           "version": available["version"] if available else None, "revision": available.get("revision") if available else None, "error": releases.get("error"), "manager_available": bool(latest_manager and manager_relation == 1 and not failed), "manager_version": latest_manager, "manager_switch_available": bool(latest_manager and manager_relation == 1 and not failed), "manager_relation": manager_relation_name, "relation": relation_name},
                 "password_enabled": self.settings()["password_enabled"], "platform_supported": self.hardware()["supported"]}
 
     def _plan_source(self, plan, request, local_request):
@@ -330,6 +365,12 @@ class Engine:
                     source_branch=source["branch"], _source=source, download_bytes=None,
                     download_breakdown={"application": None, "dependencies": None, "models": None})
         current = self.current()
+        channel_record = source.get("channel_record", {})
+        if request.get("automatic") and channel_record.get("requires_confirmation"):
+            plan["blockers"].append("此版本需要人工确认，自动更新只提醒。")
+        if (channel_record.get("minimum_manager_version") and plan["action"] != "update-manager"
+                and not request.get("one_step") and MANAGER_VERSION != channel_record["minimum_manager_version"]):
+            plan["blockers"].append("此版本需要先更新管理程序，请执行neh update或先应用管理程序更新计划。")
         if plan["action"] in ("update", "update-manager") and not request.get("source_revision"):
             from .versioning import revision_relation
             installed = MANAGER_REVISION if plan["action"] == "update-manager" else current.get("revision")
@@ -343,7 +384,12 @@ class Engine:
                     plan["blockers"].append({"older": "当前版本领先通道", "diverged": "当前版本与通道已分叉"}.get(relation, "无法确认更新方向") + "；如需切换，请显式指定完整source_revision。")
             if read_json(self.manager_home / "config/failed-updates.json", {}).get(source["revision"]) and not request.get("retry"):
                 plan["blockers"].append("此版本此前更新失败；请等待新版本或使用--retry明确重试。")
-        unchanged = current.get("revision") == source["revision"] and set(current.get("modules", [])) == set(plan["modules"]) and current.get("robot") == plan["robot"] and not request.get("configuration")
+        from .versioning import source_tree_unchanged
+        try:
+            same_tree = source_tree_unchanged(self, source, current.get("revision")) if current else False
+        except (OSError, RuntimeError):
+            same_tree = False
+        unchanged = same_tree and set(current.get("modules", [])) == set(plan["modules"]) and current.get("robot") == plan["robot"] and not request.get("configuration")
         plan["_source_noop"] = MANAGER_REVISION == source["revision"] if plan["action"] == "update-manager" else (plan["action"] in ("update", "modules") and unchanged)
         if plan["_source_noop"]:
             plan["requires_stop"] = False
@@ -593,6 +639,10 @@ class Engine:
             if not job or job["status"] in TERMINAL:
                 return
             job.update(status="running", _process=process_identity(os.getpid()))
+            if job["_plan"].get("_request", {}).get("automatic"):
+                os.nice(10)
+                if shutil.which("ionice"):
+                    subprocess.run(["ionice", "-c", "3", "-p", str(os.getpid())], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self._progress(job, "preflight", 2, "正在复核持久计划")
             try:
                 self._cancelled(job_id)
@@ -1005,7 +1055,7 @@ class Engine:
                              cancelled=lambda: self._cancelled(job["id"]),
                              progress=lambda message: self._progress(job, "source_download", 15, message)) as source:
             from .update_flow import wait_prebuilt
-            wait_prebuilt(self, source, job)
+            wait_prebuilt(self, selected, job)
             candidate.mkdir()
             export_source(source["root"], source["revision"], candidate / "source")
             self._cancelled(job["id"])

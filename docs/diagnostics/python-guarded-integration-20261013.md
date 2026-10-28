@@ -12,9 +12,9 @@ Execution HEAD before and after was exactly `3073f85e731842668dafbb7ebca223d2236
 
 The [57-target list](../../scripts/diagnostics/python-guarded-integration-20261013-targets.txt) is the deduplicated union of:
 
-- The earlier [652-case and 572-case selections](../overnight-python-integration-20261013.md)
-- Seven [artifact metadata regression modules](../performance-artifact-metadata-access.md), previously reporting 177 cases
-- Eight [AR1 qualification modules](../ar1-assigned-import-proposal-20261013.md), previously reporting 143 cases
+- The earlier [652-case and 572-case selections](../验证证据/overnight-python-integration-20261013.md)
+- Seven [artifact metadata regression modules](../验证证据/performance-artifact-metadata-access.md), previously reporting 177 cases
+- Eight [AR1 qualification modules](../验证证据/ar1-assigned-import-proposal-20261013.md), previously reporting 143 cases
 
 Historical counts are not added together. Actual final collection found 1,161 cases, with 1,160 unique selected node IDs; each has a passing call-phase report in the preserved JSON. The artifact runtime module overlaps the earlier broad selection and runs once.
 

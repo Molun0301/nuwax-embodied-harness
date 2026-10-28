@@ -1,5 +1,6 @@
 #pragma once
 
+// PointLIO输入参数的边界校验；此头由原生入口直接包含。
 #include <cmath>
 #include <stdexcept>
 #include <string>

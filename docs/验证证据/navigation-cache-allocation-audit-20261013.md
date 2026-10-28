@@ -70,7 +70,7 @@ Common single-band results were noisy and showed no stable gain. The proposed re
 
 ## Reproduction and evidence
 
-- Durable structured summaries, ranges, build features, hashes and scoped bounds: [results JSON](diagnostics/navigation-cache-allocation-audit-20261013-results.json)
+- Durable structured summaries, ranges, build features, hashes and scoped bounds: [results JSON](../diagnostics/navigation-cache-allocation-audit-20261013-results.json)
 - Retained test: `nuwax-nav-runtime/src/route_moving_worker_tests.rs::selected_guard_contact_domain_profile_5cm_10cm`
 - Build: `cargo test --offline --locked --release -p nuwax-nav-runtime --features body-query-profile --lib --no-run --message-format=json`
 - Run its emitted executable with `--exact route_moving_worker_tests::selected_guard_contact_domain_profile_5cm_10cm --ignored --nocapture --test-threads=1`

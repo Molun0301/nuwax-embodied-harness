@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # 固定同一源码提交准备引导程序；设备缓存源码后自行组装管理入口。
+# 完整解析函数和末尾调用块后才运行，避免管道下载截断时执行安装。
+{
+main() {
 set -euo pipefail
 umask 077
 
@@ -36,13 +39,10 @@ export NEH_BOOTSTRAP_STAGE="$NEH_BOOTSTRAP_TEMP"
 export NEH_BOOTSTRAP_REPOSITORY='https://github.com/Molun0301/nuwax-embodied-harness.git'
 export NEH_BOOTSTRAP_BRANCH=main
 export NEH_BOOTSTRAP_REVISION=''
-export NEH_BOOTSTRAP_TOKEN_FILE=''
 export NEH_BOOTSTRAP_ALLOW_LOCAL=0
 NEH_BOOTSTRAP_ARGS=("$@")
 for ((neh_i=0; neh_i < ${#NEH_BOOTSTRAP_ARGS[@]}; neh_i++)); do
   case ${NEH_BOOTSTRAP_ARGS[neh_i]} in
-    --token-file) export NEH_BOOTSTRAP_TOKEN_FILE="${NEH_BOOTSTRAP_ARGS[neh_i+1]:-}" ;;
-    --token-file=*) export NEH_BOOTSTRAP_TOKEN_FILE="${NEH_BOOTSTRAP_ARGS[neh_i]#--token-file=}" ;;
     --repository) export NEH_BOOTSTRAP_REPOSITORY="${NEH_BOOTSTRAP_ARGS[neh_i+1]:-}" ;;
     --repository=*) export NEH_BOOTSTRAP_REPOSITORY="${NEH_BOOTSTRAP_ARGS[neh_i]#--repository=}" ;;
     --branch) export NEH_BOOTSTRAP_BRANCH="${NEH_BOOTSTRAP_ARGS[neh_i+1]:-}" ;;
@@ -55,7 +55,7 @@ for ((neh_i=0; neh_i < ${#NEH_BOOTSTRAP_ARGS[@]}; neh_i++)); do
 unset PYTHONHOME PYTHONPATH
 export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
 python3 - <<'PY'
-import errno, http.client, json, os, pathlib, re, shutil, socket, ssl, subprocess, sys, tempfile, time
+import errno, http.client, json, os, pathlib, re, socket, ssl, subprocess, sys, time
 import urllib.error, urllib.parse, urllib.request
 if not (3, 8) <= sys.version_info[:2] < (3, 13):
     raise SystemExit("引导安装需要Python 3.8至3.12")
@@ -72,16 +72,6 @@ environment = {key: value for key, value in os.environ.items() if not key.starts
 environment.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0")
 if subprocess.run(["git", "check-ref-format", "--branch", branch], env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
     raise SystemExit("源码分支名称无效")
-token = ""
-token_file = os.environ["NEH_BOOTSTRAP_TOKEN_FILE"]
-if token_file:
-    path = pathlib.Path(token_file).expanduser()
-    if not path.is_file() or path.stat().st_mode & 0o077:
-        raise SystemExit("下载凭据文件须设置为0600权限")
-    token = path.read_text().strip()
-    if not token or "\n" in token or len(token) > 4096:
-        raise SystemExit("下载凭据文件无效")
-
 class Redirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         if urllib.parse.urlsplit(newurl).scheme != "https":
@@ -96,17 +86,13 @@ MAX_DOWNLOAD = 2 * 1024 * 1024
 DOWNLOAD_ATTEMPTS = 3
 DOWNLOAD_TIMEOUT = 45
 RETRY_HTTP = {408, 429, 500, 502, 503, 504}
-# 私有入口已经用gh取得本脚本；直接复用相同传输及已有授权。
-# 不要求匿名入口安装gh，也不依赖用户持久保存的gh登录配置。
-gh = shutil.which("gh") if token else None
-
 class DownloadError(Exception):
     def __init__(self, reason, retry=False):
         self.reason, self.retry = reason, retry
 
 def http_failure(status):
     if status in (401, 403, 404):
-        return DownloadError("HTTP %s；请核对仓库、分支及私有仓库访问权限" % status)
+        return DownloadError("HTTP %s；请核对公开仓库地址、分支及网络访问限制" % status)
     return DownloadError("HTTP %s" % status, status in RETRY_HTTP)
 
 def network_failure(exc):
@@ -122,63 +108,15 @@ def network_failure(exc):
     # 只显示已知类别，底层异常可能包含代理凭据、令牌或响应内容。
     return DownloadError("TLS或网络连接中断" if transient else "TLS或网络请求失败", transient)
 
-def gh_download(url, accept):
-    if urllib.parse.urlsplit(url).netloc != "api.github.com" or not url.startswith("https://"):
-        raise DownloadError("拒绝非GitHub官方API下载地址")
-    gh_environment = dict(environment)
-    for key in ("GH_DEBUG", "DEBUG", "GH_FORCE_TTY", "CLICOLOR_FORCE", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"):
-        gh_environment.pop(key, None)
-    gh_environment.update(GH_TOKEN=token, GH_HOST="github.com", GH_PROMPT_DISABLED="1", GH_PAGER="cat", NO_COLOR="1", GH_NO_UPDATE_NOTIFIER="1")
-    # 令牌只放在本次子进程环境中，不进入参数、日志或新的登录配置。
-    with tempfile.TemporaryFile() as output:
-        try:
-            result = subprocess.run([gh, "api", "--hostname", "github.com", "--method", "GET", "--include",
-                                     "--header", "Accept: " + accept, url], env=gh_environment,
-                                    stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.PIPE,
-                                    timeout=DOWNLOAD_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            raise DownloadError("GitHub请求超时", True) from None
-        output.seek(0)
-        status_line = output.readline(8193)
-        status_match = re.match(br"HTTP/\S+ (\d{3})\b", status_line)
-        status = int(status_match.group(1)) if status_match else None
-        if status is not None and not 200 <= status < 300:
-            raise http_failure(status)
-        if result.returncode:
-            error = result.stderr.lower()
-            if b"certificate" in error or b"x509:" in error:
-                raise DownloadError("TLS证书验证失败；请检查设备时间与CA证书，不要关闭证书验证")
-            transient = result.returncode == 1 and any(part in error for part in (
-                b"eof", b"timeout", b"timed out", b"connection reset", b"connection refused",
-                b"error connecting to", b"temporary failure", b"network is unreachable",
-                b"context deadline exceeded", b"stream error", b"goaway"))
-            raise DownloadError("GitHub连接中断" if transient else "GitHub CLI请求失败；请检查已有登录与网络", transient)
-        if status is None:
-            raise DownloadError("GitHub API响应缺少有效状态")
-        header_bytes = len(status_line)
-        while True:
-            line = output.readline(8193)
-            header_bytes += len(line)
-            if not line or len(line) > 8192 or header_bytes > 65536:
-                raise DownloadError("GitHub API响应头无效")
-            if line in (b"\n", b"\r\n"):
-                break
-        return output.read(MAX_DOWNLOAD + 1)
-
 def download(url, accept):
     headers = {"User-Agent": "NEH-source-bootstrap/1", "Accept": accept}
-    if token:
-        headers["Authorization"] = "Bearer " + token
     for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
         try:
-            if gh:
-                content = gh_download(url, accept)
-            else:
-                with opener.open(urllib.request.Request(url, headers=headers), timeout=DOWNLOAD_TIMEOUT) as response:
-                    content = response.read(MAX_DOWNLOAD + 1)
-                    # read(limit)可能静默返回被截断的Content-Length响应。
-                    if len(content) <= MAX_DOWNLOAD and getattr(response, "length", 0):
-                        raise http.client.IncompleteRead(content)
+            with opener.open(urllib.request.Request(url, headers=headers), timeout=DOWNLOAD_TIMEOUT) as response:
+                content = response.read(MAX_DOWNLOAD + 1)
+                # read(limit)可能静默返回被截断的Content-Length响应。
+                if len(content) <= MAX_DOWNLOAD and getattr(response, "length", 0):
+                    raise http.client.IncompleteRead(content)
             if len(content) > MAX_DOWNLOAD:
                 raise DownloadError("引导源码超过大小限制")
             return content
@@ -199,8 +137,8 @@ def download(url, accept):
 
 local = os.environ["NEH_BOOTSTRAP_ALLOW_LOCAL"] == "1" and parsed.scheme in ("", "file")
 if local:
-    if token or parsed.netloc:
-        raise SystemExit("本机源码验收不能附带远端凭据或主机名")
+    if parsed.netloc:
+        raise SystemExit("本机源码验收不能附带主机名")
     root = pathlib.Path(urllib.parse.unquote(parsed.path) if parsed.scheme else repository).expanduser().resolve(strict=True)
     def git(*args):
         return subprocess.check_output(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-C", str(root), *args], env=environment)
@@ -230,3 +168,8 @@ if [[ " ${NEH_BOOTSTRAP_ARGS[*]} " == *' --cli '* ]] && ( : </dev/tty ) 2>/dev/n
 else
   python3 "$NEH_BOOTSTRAP_TEMP/scripts/neh_bootstrap.py" "${NEH_BOOTSTRAP_ARGS[@]}" --revision "$NEH_BOOTSTRAP_FIXED_REVISION"
 fi
+}
+
+# 外层块的右花括号必须为最后一个字节，截断的下载不能执行命令。
+main "$@"
+}

@@ -51,8 +51,8 @@ These are cloud synthetic software integration results, not physical sensor/actu
 
 ## Related qualification history
 
-- [Incremental optimization and earlier integration results](../performance-incremental-updates.md)
-- [Native offline regression scope](../native-offline-regression-20261013.md)
+- [Incremental optimization and earlier integration results](../验证证据/performance-incremental-updates.md)
+- [Native offline regression scope](../验证证据/native-offline-regression-20261013.md)
 - [Scan reuse qualification](scan-polyline-reuse-and-guide-eligibility-20261013.md)
 
 This repository report and evidence JSON were materialized from preserved logs. No tests or builds were rerun during materialization.

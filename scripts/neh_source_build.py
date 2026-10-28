@@ -103,6 +103,8 @@ def prepare_dependencies(request, hardware, candidate, run):
 
 
 def _copy_runtime(prefix, candidate, binaries):
+    from scripts.neh_prebuilt import PROGRAMS, program_share
+
     for name, original in binaries.items():
         path = Path(original)
         if Path(name).name != name or not path.is_file() or not os.access(path, os.X_OK):
@@ -121,7 +123,15 @@ def _copy_runtime(prefix, candidate, binaries):
             target.parent.mkdir(parents=True, exist_ok=True)
             # 库别名也成为候选普通文件，不保留指向可变构建目录的链接。
             shutil.copy2(path.resolve(strict=True), target)
-    if (prefix / "share/nuwax-slam2d").is_dir() and "nuwax-slam-2d-worker" in binaries:
+    for name in binaries:
+        if name not in PROGRAMS:
+            continue
+        relative = program_share(name)
+        source = prefix / relative
+        if source.is_dir():
+            # 许可、审计与对应源码随各自程序进入候选，不依赖可变构建缓存。
+            shutil.copytree(source, candidate / relative, symlinks=False)
+    if (prefix / "share/nuwax-slam2d").is_dir() and "nuwax-slam-2d-worker" in binaries and not (prefix / program_share("nuwax-slam-2d-worker")).is_dir():
         shutil.copytree(prefix / "share/nuwax-slam2d", candidate / "share/nuwax-slam2d", symlinks=False)
 
 
@@ -158,7 +168,9 @@ def execute(payload):
     hardware = hardware_probe.detect_hardware(home)
     # The installed manager also builds older pinned source revisions.
     resolve_jobs = getattr(hardware_probe, "resolve_build_jobs", lambda root, hardware: hardware.build_jobs)
-    request = InstallRequest(root=root, home=home, modules=modules, robot=payload["robot"], jobs=resolve_jobs(home, hardware=hardware), python=sys.executable)
+    jobs = resolve_jobs(home, hardware=hardware)
+    request = InstallRequest(root=root, home=home, modules=modules, robot=payload["robot"],
+                             jobs=min(jobs, 2) if payload.get("background") else jobs, python=sys.executable)
     operation = payload["operation"]
     run = _runner(root, home, candidate, library_prefix=Path(payload["build_prefix"]) if operation == "build" else None)
     if operation == "metadata":
@@ -170,7 +182,10 @@ def execute(payload):
         return prepare_dependencies(request, hardware, candidate, run)
     if operation == "build":
         prefix, cache = Path(payload["build_prefix"]), Path(payload["build_cache"])
-        binaries = build_modules(root, prefix, cache, modules, request.jobs, run)
+        options = {}
+        if "prebuilt" in inspect.signature(build_modules).parameters:
+            options.update(prebuilt=payload.get("prebuilt"), local_build=payload.get("local_build", False))
+        binaries = build_modules(root, prefix, cache, modules, request.jobs, run, **options)
         _copy_runtime(prefix, candidate, binaries)
         checked = verify_native(candidate, home / "cache/source", run)
         return {"binaries": sorted(binaries), "native_files": checked}

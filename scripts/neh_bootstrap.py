@@ -70,13 +70,9 @@ class SafeRedirect(urllib.request.HTTPRedirectHandler):
         return redirect
 
 
-def fetch(url, target, *, token="", limit=MAX_MANAGER_BYTES, expected_size=None):
+def fetch(url, target, *, limit=MAX_MANAGER_BYTES, expected_size=None):
     valid_url(url)
-    if token:
-        url = github_asset_url(url, token)
     headers = {"User-Agent": "NEH-bootstrap/1", "Accept": "application/octet-stream"}
-    if token:
-        headers["Authorization"] = "Bearer " + token
     request = urllib.request.Request(url, headers=headers)
     total = 0
     digest = hashlib.sha256()
@@ -94,48 +90,10 @@ def fetch(url, target, *, token="", limit=MAX_MANAGER_BYTES, expected_size=None)
             output.flush()
             os.fsync(output.fileno())
     except urllib.error.HTTPError as exc:
-        raise BootstrapError("下载失败（HTTP %s）；请核对版本已发布及私有仓库访问权限" % exc.code) from exc
+        raise BootstrapError("下载失败（HTTP %s）；请核对公开版本地址及网络连接" % exc.code) from exc
     if expected_size is not None and total != expected_size:
         raise BootstrapError("下载大小与版本清单不符")
     return digest.hexdigest()
-
-
-def github_asset_url(url, token):
-    """私有仓库的版本附件通过正式资产接口下载，令牌不进入网址。"""
-    parsed = urllib.parse.urlsplit(url)
-    parts = parsed.path.strip("/").split("/")
-    if parsed.hostname != "github.com" or len(parts) < 6 or parts[2] != "releases":
-        return url
-    repository = "/".join(parts[:2])
-    if parts[3:5] == ["latest", "download"]:
-        release_path = "latest"
-        filename = urllib.parse.unquote("/".join(parts[5:]))
-    elif parts[3] == "download" and len(parts) >= 6:
-        release_path = "tags/" + parts[4]
-        filename = urllib.parse.unquote("/".join(parts[5:]))
-    else:
-        return url
-    request = urllib.request.Request("https://api.github.com/repos/" + repository + "/releases/" + release_path,
-                                     headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
-                                              "User-Agent": "NEH-bootstrap/1"})
-    with urllib.request.build_opener(SafeRedirect()).open(request, timeout=30) as response:
-        payload = response.read(8 * 1024 * 1024 + 1)
-    if len(payload) > 8 * 1024 * 1024:
-        raise BootstrapError("版本资产目录过大")
-    metadata = json.loads(payload)
-    for asset in metadata.get("assets", []):
-        if asset.get("name") == filename:
-            candidate = asset.get("url", "")
-            if urllib.parse.urlsplit(candidate).netloc != "api.github.com":
-                raise BootstrapError("版本资产地址不可信")
-            return candidate
-    raise BootstrapError("已发布版本缺少附件：" + filename)
-
-
-def matching_token(source, target, token):
-    origin = urllib.parse.urlsplit(source).netloc
-    destination = urllib.parse.urlsplit(target).netloc
-    return token if origin == destination or (origin == "github.com" and destination == "api.github.com") else ""
 
 
 def digest_file(path):
@@ -474,17 +432,6 @@ def launch(args, python, instance_id, manager_version):
         raise
 
 
-def read_token(path):
-    if path is None:
-        return ""
-    if not path.is_file() or path.stat().st_mode & 0o077:
-        raise BootstrapError("下载凭据文件须仅当前用户可读（权限0600）")
-    value = path.read_text(encoding="utf-8").strip()
-    if not value or "\n" in value or len(value) > 4096:
-        raise BootstrapError("下载凭据文件无效")
-    return value
-
-
 def device_urls(port):
     """只枚举本机地址，直接给无头安装者可复制的网址。"""
     result = []
@@ -505,7 +452,7 @@ def device_urls(port):
     return list(dict.fromkeys(result))
 
 
-def source_manager(args, destination, token):
+def source_manager(args, destination):
     """在持久源码缓存锁内固定提交并组装管理源码，服务只运行独立版本目录。"""
     root = str(Path(__file__).resolve().parents[1])
     if root not in sys.path:
@@ -514,8 +461,8 @@ def source_manager(args, destination, token):
     if not shutil.which("git"):
         raise BootstrapError("源码安装需要git；请使用get-neh.sh自动准备，或先安装git")
     try:
-        with source_checkout(args.home, args.repository, args.branch, args.revision, token=token,
-                             token_origin=args.repository, allow_local=args.allow_local_source,
+        with source_checkout(args.home, args.repository, args.branch, args.revision,
+                             allow_local=args.allow_local_source,
                              progress=lambda message: print(message, flush=True)) as source:
             archive = destination / "manager.tar.gz"
             print("从固定源码组装管理程序：" + source["version"], flush=True)
@@ -582,6 +529,51 @@ def install_home(args):
     return resolve_manager_home(home)
 
 
+def link_command(home, bin_dir):
+    """登记本安装创建的命令链接，已有其它入口由用户自行选择。"""
+    home, bin_dir = Path(home).resolve(), Path(bin_dir).expanduser().resolve()
+    binary, link = home / "bin/neh", bin_dir / "neh"
+    registry = home / "config/command-links.json"
+    try:
+        record = json.loads(registry.read_text())
+    except FileNotFoundError:
+        record = {"links": [], "path_notices": []}
+    links = record["links"]
+    notices = record["path_notices"]
+    created = False
+    if link.exists() or link.is_symlink():
+        owned = (str(link) in links and link.is_symlink()
+                 and Path(os.path.abspath(os.path.join(str(link.parent), os.readlink(link)))) == binary)
+        if not owned:
+            print("命令链接位置已有其它入口：%s；请使用原路径 %s。" % (link, binary), flush=True)
+            return None
+    else:
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(binary)
+        created = True
+        if str(link) not in links:
+            links.append(str(link))
+    path_entries = {Path(value).expanduser().resolve() for value in os.get_exec_path() if value}
+    notice = str(bin_dir) not in notices and bin_dir not in path_entries
+    if notice:
+        notices.append(str(bin_dir))
+    temporary = registry.with_suffix(".json.new")
+    try:
+        temporary.write_text(json.dumps(record, ensure_ascii=False) + "\n", encoding="utf-8")
+        temporary.chmod(0o600)
+        os.replace(str(temporary), str(registry))
+    except BaseException:
+        if created:
+            link.unlink()
+        raise
+    finally:
+        temporary.unlink(missing_ok=True)
+    if notice:
+        print("命令目录尚未加入PATH（命令搜索路径）：%s；在终端配置加入 export PATH=%s:\"$PATH\"。"
+              % (bin_dir, shlex.quote(str(bin_dir))), flush=True)
+    return link
+
+
 def install(args):
     if sys.platform != "linux":
         raise BootstrapError("当前端侧安装入口支持Linux；其它系统尚未完成验证")
@@ -601,7 +593,6 @@ def install(args):
     manager = home / "manager"
     versions = manager / "versions"
     versions.mkdir(parents=True, exist_ok=True)
-    token = read_token(args.token_file)
     with (manager / "bootstrap.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         args.port = choose_manager_port(home, args.host, args.port)
@@ -618,7 +609,7 @@ def install(args):
             elif args.catalog:
                 catalog_path = stage / "catalog.json"
                 if args.catalog.startswith(("https://", "http://")):
-                    fetch(args.catalog, catalog_path, token=token, limit=8 * 1024 * 1024)
+                    fetch(args.catalog, catalog_path, limit=8 * 1024 * 1024)
                 else:
                     shutil.copyfile(Path(args.catalog).expanduser(), catalog_path)
                 catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
@@ -631,11 +622,11 @@ def install(args):
                     raise BootstrapError("管理包大小声明无效")
                 archive = stage / "manager.tar.gz"
                 url = urllib.parse.urljoin(args.catalog, metadata["url"])
-                digest = fetch(url, archive, token=matching_token(args.catalog, url, token), expected_size=metadata["size"])
+                digest = fetch(url, archive, expected_size=metadata["size"])
                 if digest != metadata["sha256"]:
                     raise BootstrapError("管理包下载完整性校验失败")
             else:
-                archive, metadata = source_manager(args, stage, token)
+                archive, metadata = source_manager(args, stage)
                 digest = digest_file(archive)
             unpacked = stage / "unpacked"
             unpacked.mkdir()
@@ -670,9 +661,9 @@ def install(args):
             service_name = "neh-manager.service" if args.service == "user" else "neh-manager-%s.service" % os.getuid()
             was_active = bool(previous and args.service != "none" and subprocess.run(
                 service_command + ["is-active", "--quiet", service_name], check=False).returncode == 0)
-            # 备份只存在于权限0700的准备目录内；保留文件权限及链接，不输出凭据。
+            # 回滚副本只存在于权限0700的准备目录内，保留文件权限及链接。
             saved_files = {}
-            for relative in ("config/settings.json", "config/credentials.json", "config/manager-listen.json", "bin/neh"):
+            for relative in ("config/settings.json", "config/manager-listen.json", "bin/neh"):
                 path = home / relative
                 backup = stage / "rollback" / relative
                 if path.exists() or path.is_symlink():
@@ -700,9 +691,6 @@ def install(args):
                 elif args.catalog and args.catalog.startswith(("https://", "http://")):
                     subprocess.run(cli_command(home, python, "settings", "--feed-url", args.catalog, "--channel", args.channel),
                                    cwd=str(target), env=python_environment(), check=True)
-                if token:
-                    subprocess.run(cli_command(home, python, "settings", "--token-stdin"), input=token,
-                                   text=True, cwd=str(target), env=python_environment(), check=True, stdout=subprocess.DEVNULL)
                 state = subprocess.run(cli_command(home, python, "status"), cwd=str(target), text=True,
                                        env=python_environment(), capture_output=True, check=True, timeout=30)
                 instance_id = json.loads(state.stdout).get("instance_id")
@@ -715,6 +703,7 @@ def install(args):
                 temporary.chmod(0o600)
                 os.replace(str(temporary), str(listen_path))
                 url = launch(args, python, instance_id, manifest["version"])
+                (home / "config/credentials.json").unlink(missing_ok=True)
             except BaseException:
                 for path, backup in saved_files.items():
                     if backup is None:
@@ -765,6 +754,19 @@ def install(args):
             print("设备网络地址：" + address)
         if not addresses:
             print("未检测到外部网络地址；连接设备网络后使用该设备地址和端口%s访问。" % args.port)
+    bin_link = None
+    if not args.no_bin_link:
+        try:
+            bin_link = link_command(home, args.bin_dir)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print("命令链接未创建（%s）；请使用原路径。" % type(exc).__name__, flush=True)
+    bootstrap_path = home / "config/bootstrap.json"
+    bootstrap_record = json.loads(bootstrap_path.read_text()) if bootstrap_path.exists() else {}
+    bootstrap_record.update(service=args.service, bin_link=str(bin_link) if bin_link else None)
+    temporary = bootstrap_path.with_suffix(".json.new")
+    temporary.write_text(json.dumps(bootstrap_record, ensure_ascii=False) + "\n", encoding="utf-8")
+    temporary.chmod(0o600)
+    os.replace(str(temporary), str(bootstrap_path))
     print("命令行入口：" + shlex.quote(str(binary)))
     if args.configure:
         command = cli_command(home, python, "apply", "--file", str(args.configure.resolve()), "--wait")
@@ -790,7 +792,9 @@ def parser():
     result.add_argument("--catalog", help="显式兼容旧版本目录；默认直接从Git源码安装")
     result.add_argument("--manager-package", type=Path, help="使用本地管理包")
     result.add_argument("--sha256", help="本地管理包预期摘要")
-    result.add_argument("--token-file", type=Path, help="私有下载凭据文件，权限0600")
+    result.add_argument("--bin-dir", type=Path, default=Path.home() / ".local/bin", metavar="PATH",
+                        help="用户命令链接目录；默认~/.local/bin")
+    result.add_argument("--no-bin-link", action="store_true", help="跳过创建用户命令链接")
     result.add_argument("--host", default="0.0.0.0")
     result.add_argument("--port", type=int, help="管理端口；默认复用既有端口或自动选择空闲端口")
     result.add_argument("--channel", choices=("stable", "preview"), default="stable")

@@ -34,7 +34,7 @@ Let `C[i]` denote the post-drop/clear checkpoint for zero-based goal leg `i`. Bo
 
 `mean(C[39:49]) - mean(C[5:15])`
 
-That is, early one-based drains **6–15**, after skipping the first five drains, versus late drains **40–49**. It is not the mean of every drain after the fifth, and neither window is terminal teardown. The convention matches the earlier first-ten-after-five versus final-ten summary. All checkpoints, full start/end/ranges, per-phase summaries and raw vector rows are retained in the [structured results](diagnostics/navigation-rss-ownership-20261013-results.json), so interpretation need not depend on those two windows.
+That is, early one-based drains **6–15**, after skipping the first five drains, versus late drains **40–49**. It is not the mean of every drain after the fifth, and neither window is terminal teardown. The convention matches the earlier first-ten-after-five versus final-ten summary. All checkpoints, full start/end/ranges, per-phase summaries and raw vector rows are retained in the [structured results](../diagnostics/navigation-rss-ownership-20261013-results.json), so interpretation need not depend on those two windows.
 
 | Post-drain measure | OFF | ON |
 |---|---:|---:|

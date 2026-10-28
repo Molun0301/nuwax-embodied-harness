@@ -1,0 +1,50 @@
+name: NEH产品检查与增量预编译
+
+on:
+  push:
+    branches: [main, 'fix/**', 'feature/**', 'feat/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-check:
+    uses: ./.github/workflows/source-install.yml
+  guardrails:
+    uses: ./.github/workflows/lint.yml
+  prebuilt:
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/prebuilt.yml
+
+  channel:
+    name: 发布通过检查的main通道
+    needs: [source-check, guardrails, prebuilt]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: neh-prebuilt-release-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: 发布匿名通道文件
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/publish_channel.py
+
+  fault-acceptance:
+    name: 专用副本真实附件故障验收
+    needs: [source-check, guardrails, prebuilt]
+    if: github.ref == 'refs/heads/feat/install-update-productization' && contains(github.event.head_commit.message, '[预编译验收]')
+    permissions:
+      contents: write
+    uses: ./.github/workflows/prebuilt-acceptance.yml
+    with:
+      source_revision: ${{ github.sha }}

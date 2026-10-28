@@ -44,7 +44,7 @@ scandir calls (root and image subdirectory), while raw construction issues zero.
 Timing is diagnostic only; the deterministic directory-entry count establishes
 repeated O(N) traversal even with the sidecar parse cache warm.
 
-[Full samples and counters](diagnostics/artifact-metadata-access-20261013-results.json)
+[Full samples and counters](../diagnostics/artifact-metadata-access-20261013-results.json)
 
 ## Existing optimizations preserved
 
@@ -102,7 +102,7 @@ zero at all sizes, versus baseline 201/2,001/20,001. Both warm parse counts rema
 zero. There is no claim about different IDs on every request, sidecar-only
 polling, device storage, or HTTP transfer performance.
 
-[Candidate full samples](diagnostics/artifact-metadata-candidate-20261013-results.json)
+[Candidate full samples](../diagnostics/artifact-metadata-candidate-20261013-results.json)
 
 Twelve test-only checks pass: warm reuse; in-place edit with size and mtime
 preserved; atomic replacement; returned-copy isolation; moved and deleted
@@ -175,9 +175,9 @@ discovery is unchanged. Indexed controls scan zero entries with either version:
 metadata median 0.0342 → 0.0338 ms; sequential flow 0.1283 → 0.1193 ms. These tiny
 indexed differences are not claimed as an optimization benefit.
 
-[Full canonical measurements](diagnostics/artifact-canonical-lookup-20261013-results.json)
+[Full canonical measurements](../diagnostics/artifact-canonical-lookup-20261013-results.json)
 
-[Proposed canonical diff](diagnostics/artifact-canonical-lookup-20261013.diff)
+[Proposed canonical diff](../diagnostics/artifact-canonical-lookup-20261013.diff)
 
 Ten final production regressions pass, including all seven kinds, cold and warm
 metadata with traversal forbidden, legacy unknown-kind fallback, moved nested
@@ -258,7 +258,7 @@ a desired global unique-owner contract or endorse the ambiguous state.
 Changing which bytes are returned cannot be introduced as a performance-only
 change; the broader payload ambiguity policy needs separate treatment.
 
-[Tiny diagnostic](../scripts/diagnostics/artifact_payload_lookup_boundary.py)
+[Tiny diagnostic](../../scripts/diagnostics/artifact_payload_lookup_boundary.py)
 reproduces both the accepted orphan state and a production save with
 `extension="custom"`. It uses two owned temporary directories, ordinary literal
 payloads and the actual production store; it performs no hashing or timing.

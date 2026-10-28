@@ -40,6 +40,9 @@ class FakeRuntime:
     def port(self):
         return 8766
 
+    def update_readiness(self):
+        return {"ready": True}
+
     def start(self, prefix):
         self.calls.append("start")
         if self.running:

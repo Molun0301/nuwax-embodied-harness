@@ -80,7 +80,7 @@
       python_environment:'准备运行环境',runtime_files:'准备启动文件',stopping:'停止原服务',
       switching:'切换版本',starting:'启动服务',rollback:'恢复原版本',failed:'未完成',
       source_download:'获取源码',native_build:'增量构建',source_verify:'验证候选版本',models:'准备模型',
-      manager_source:'从源码准备管理程序',manager_download:'下载管理程序',manager_verify:'校验管理程序',manager_switch:'切换管理程序'})[stage] || '正在处理';
+      waiting_idle:'等待安全空闲',prebuilt_pending:'云端编译中',manager_source:'从源码准备管理程序',manager_download:'下载管理程序',manager_verify:'校验管理程序',manager_switch:'切换管理程序'})[stage] || '正在处理';
   }
 
   function escapeHtml(value) {
@@ -436,6 +436,10 @@
   function applyStatus(status) {
     const previousDir = state.status && state.status.installation && state.status.installation.install_dir;
     state.status = status;
+    const update = status.update || {};
+    show($('updateBanner'), Boolean(update.available));
+    text($('updateBannerText'), '发现新版本 ' + (update.display_version || update.version || '') + (update.requires_confirmation ? '，需要人工确认' : ''));
+    if ($('immediateUpdate')) $('immediateUpdate').disabled = Boolean(status.active_job);
     state.passwordEnabled = Boolean(status.password_enabled);
     state.platformSupported = status.platform_supported !== false;
 
@@ -822,7 +826,7 @@
       show(boxError, false);
       text($('availableVersion'), update.available ? (update.version || '--') : '仅管理程序有更新');
     } else {
-      text(updateBadge, '已是最新');
+      text(updateBadge, update.pending ? '通道稍后再查' : (({older:'当前版本领先',diverged:'当前版本已分叉',unknown:'尚未确认版本关系'})[update.relation] || (update.failed ? '此版本此前更新失败' : '已是最新')));
       setClass(updateBadge, 'status-badge good');
       show(boxAvailable, false);
       show(boxNone, true);
@@ -1455,7 +1459,8 @@
         body: {
           action: 'install',
           modules: Array.from(state.selectedModules),
-          robot: state.robot || undefined
+          robot: state.robot || undefined,
+          local_build: Boolean($('wizardLocalBuild') && $('wizardLocalBuild').checked)
         }
       });
       if (generation !== state.planGeneration) return;
@@ -1768,7 +1773,6 @@
       generatePlan();
     });
     $('wizardSaveSource').addEventListener('click', function () { saveSourceSettings('wizard'); });
-    $('wizardClearToken').addEventListener('click', function () { clearSourceToken('wizard'); });
   }
 
   // ===== 功能模块（主界面）=====
@@ -1923,13 +1927,7 @@
     }
   }
 
-  // ===== 更新来源与私有源凭据 =====
-  // 令牌只写入、不读取回来；UI 只反映“是否已保存”。
-  function renderTokenState(prefix, hasToken) {
-    const el = $(prefix === 'wizard' ? 'wizardTokenState' : 'tokenState');
-    if (el) text(el, hasToken ? '已保存访问令牌' : '未保存访问令牌');
-  }
-
+  // ===== 公开更新来源 =====
   function applySourceSettings(settings, prefix) {
     const channelEl = $(prefix === 'wizard' ? 'wizardChannel' : 'updateChannel');
     const feedEl = $(prefix === 'wizard' ? 'wizardFeedUrl' : 'feedUrl');
@@ -1948,7 +1946,6 @@
       feedEl.dataset.sourceMode = sourceMode;
       text(feedEl.closest('label').querySelector('.config-label'), sourceMode === 'git' ? '源码仓库地址' : '版本目录地址');
     }
-    renderTokenState(prefix, Boolean(settings.has_download_token));
     const summary = $('wizardSourceSummary');
     if (summary) {
       text(summary, settings.feed_url ? settings.feed_url + (sourceMode === 'git' ? ' · ' + (settings.source_branch || 'main') : '') : '未配置');
@@ -1958,7 +1955,6 @@
   async function saveSourceSettings(prefix) {
     const channelEl = $(prefix === 'wizard' ? 'wizardChannel' : 'updateChannel');
     const feedEl = $(prefix === 'wizard' ? 'wizardFeedUrl' : 'feedUrl');
-    const tokenEl = $(prefix === 'wizard' ? 'wizardToken' : 'sourceToken');
     const messageEl = $(prefix === 'wizard' ? 'wizardSourceMessage' : 'updateConfigMessage');
     const button = $(prefix === 'wizard' ? 'wizardSaveSource' : 'saveUpdateConfig');
 
@@ -1966,7 +1962,6 @@
     const sourceMode = feedEl ? feedEl.dataset.sourceMode || 'git' : 'git';
     const channel = channelEl ? channelEl.value : 'stable';
     const feedUrl = feedEl ? feedEl.value.trim() : '';
-    const token = tokenEl ? tokenEl.value : '';
 
     if (button) button.disabled = true;
 
@@ -1978,21 +1973,9 @@
           : { source_mode: 'catalog', channel: channel, feed_url: feedUrl }
       });
 
-      // 只有用户实际填写时才提交令牌；留空保持原值。
-      if (token) {
-        await apiCall('/api/manager/source-credentials', {
-          method: 'POST',
-          body: { token: token }
-        });
-      }
-
       const refreshed = await apiCall('/api/manager/settings');
       applySourceSettings(refreshed, prefix);
-      if (tokenEl) tokenEl.value = '';
-
-      inlineMessage(messageEl, token
-        ? '来源设置与访问令牌已保存。'
-        : '来源设置已保存。', 'good');
+      inlineMessage(messageEl, '来源设置已保存。', 'good');
 
       if (prefix === 'wizard') {
         // 保存后立即反映模块与发布可见性，避免停在“无可用版本”。
@@ -2007,28 +1990,6 @@
       return null;
     } finally {
       if (button) button.disabled = false;
-    }
-  }
-
-  async function clearSourceToken(prefix) {
-    const messageEl = $(prefix === 'wizard' ? 'wizardSourceMessage' : 'updateConfigMessage');
-    const ok = await confirmDialog({
-      title: '清除访问令牌',
-      text: '清除后从私有源下载将不再携带凭据。已保存的令牌内容不会被读回，确认后立即失效。',
-      confirmText: '清除令牌',
-      danger: true
-    });
-    if (!ok) return;
-
-    try {
-      const result = await apiCall('/api/manager/source-credentials', {
-        method: 'POST',
-        body: { token: '' }
-      });
-      renderTokenState(prefix, Boolean(result.has_download_token));
-      inlineMessage(messageEl, '访问令牌已清除。', 'good');
-    } catch (error) {
-      inlineMessage(messageEl, '清除失败：' + error.message, 'bad');
     }
   }
 
@@ -2383,10 +2344,10 @@
     state.submitting = true;
     showMessage($('releasesStatus'), '');
 
-    const params = { version: version };
+    const params = { version: version, one_step: true, local_build: Boolean($('updateLocalBuild') && $('updateLocalBuild').checked) };
 
     try {
-      let plan = await apiCall('/api/manager/plan', { method: 'POST', body: { action: 'update', version: version } });
+      let plan = await apiCall('/api/manager/plan', { method: 'POST', body: Object.assign({ action: 'update' }, params) });
 
       if (Array.isArray(plan.blockers) && plan.blockers.length) {
         plan = await withStopConfirmation(plan, 'update', params);
@@ -2729,6 +2690,9 @@
       ]);
 
       $('autoStart').checked = Boolean(settings.auto_start);
+      $('settingsChannel').value = settings.channel || 'main';
+      $('settingsAutoUpdate').value = settings.auto_update || 'notify';
+      $('maintenanceWindow').value = settings.maintenance_window || '';
       state.passwordEnabled = Boolean(settings.password_enabled);
       updatePasswordControls();
 
@@ -2925,8 +2889,42 @@
     }
   }
 
+  async function immediateUpdate() {
+    if (state.submitting) return;
+    state.submitting = true;
+    try {
+      const job = await apiCall('/api/manager/update', {method:'POST', body:{local_build:Boolean($('updateLocalBuild') && $('updateLocalBuild').checked)}});
+      if (job.status === 'deferred') {
+        showMessage($('overviewLoadError'), job.message, 'info');
+        return;
+      }
+      showView('jobs');
+      trackJob(job.id);
+      loadJobsView();
+    } catch (error) {
+      showMessage($('overviewLoadError'), error.message, 'error');
+    } finally {
+      state.submitting = false;
+    }
+  }
+
+  async function saveUpdatePreferences() {
+    try {
+      await apiCall('/api/manager/settings', {method:'PUT', body:{
+        channel:$('settingsChannel').value.trim(), auto_update:$('settingsAutoUpdate').value,
+        maintenance_window:$('maintenanceWindow').value.trim()
+      }});
+      showMessage($('settingsMessage'), '更新设置已保存。', 'good');
+    } catch (error) {
+      showMessage($('settingsMessage'), error.message, 'error');
+    }
+  }
+
   // ===== 事件绑定 =====
   function initEvents() {
+    $('immediateUpdate').addEventListener('click', immediateUpdate);
+    $('wizardLocalBuild').addEventListener('change', generatePlan);
+    $('saveUpdatePreferences').addEventListener('click', saveUpdatePreferences);
     $('startRuntime').addEventListener('click', function () { runtimeAction('start'); });
     $('stopRuntime').addEventListener('click', function () { runtimeAction('stop'); });
     $('restartRuntime').addEventListener('click', function () { runtimeAction('restart'); });
@@ -2948,7 +2946,6 @@
     $('configSave').addEventListener('click', saveConfig);
 
     $('saveUpdateConfig').addEventListener('click', function () { saveSourceSettings('main'); });
-    $('clearSourceToken').addEventListener('click', function () { clearSourceToken('main'); });
     $('updateManagerButton').addEventListener('click', startManagerUpdate);
 
     $('autoStart').addEventListener('change', async function (event) {
@@ -3061,6 +3058,11 @@
   function init() {
     bindOnce();
     boot();
+    // 只刷新管理状态；远端查询由服务端的30分钟调度拥有。
+    setInterval(async function () {
+      if (!state.status || document.hidden) return;
+      try { applyStatus(await apiCall('/api/manager/status')); } catch (ignored) { /* 下一次刷新继续。 */ }
+    }, 15000);
   }
 
   // 管理服务可能在更新后重启；这里最多等待一次短窗口，避免首屏直接报错。

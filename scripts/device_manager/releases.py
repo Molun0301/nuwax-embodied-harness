@@ -53,29 +53,16 @@ class SafeRedirect(urllib.request.HTTPRedirectHandler):
         return result
 
 
-def open_source(url, *, allow_file=False, token="", token_origin=""):
+def open_source(url, *, allow_file=False):
     parsed = validate_url(url, allow_file=allow_file)
     if parsed.scheme in ("", "file"):
         return open(urllib.request.url2pathname(parsed.path), "rb")
-    target = urllib.parse.urlsplit(token_origin)
-    trusted = token and (parsed.scheme, parsed.hostname, parsed.port) == (target.scheme, target.hostname, target.port)
-    if token and not trusted and target.hostname == "github.com" and parsed.scheme == "https" and parsed.netloc == "api.github.com":
-        parts = target.path.strip("/").split("/")
-        trusted = len(parts) >= 2 and parsed.path.startswith("/repos/{}/{}/releases/assets/".format(parts[0], parts[1]))
-    if trusted and parsed.hostname == "github.com":
-        from scripts.neh_bootstrap import github_asset_url
-        try:
-            url = github_asset_url(url, token)
-        except Exception as exc:
-            raise ManagerError("download_failed", "无法读取私有GitHub发布资产。", 502) from exc
     headers = {"User-Agent": "NEH-Device-Manager/1", "Accept": "application/octet-stream"}
-    if trusted:
-        headers["Authorization"] = "Bearer " + token
     request = urllib.request.Request(url, headers=headers)
     try:
         return urllib.request.build_opener(urllib.request.ProxyHandler({}) if parsed.scheme == "http" else urllib.request.ProxyHandler(), SafeRedirect()).open(request, timeout=30)
     except (OSError, urllib.error.URLError) as exc:
-        raise ManagerError("download_failed", "无法读取发布源，请检查网络、地址和访问凭据。", 502) from exc
+        raise ManagerError("download_failed", "无法读取公开发布源，请检查网络和地址。", 502) from exc
 
 
 def load_catalog(url, **kwargs):
@@ -250,16 +237,14 @@ def unpack(archive, destination, expected, *, cancelled=lambda: None):
         raise
 
 
-def github_catalog_url(url, channel, token="", token_origin=""):
+def github_catalog_url(url, channel):
     """固定GitHub发布源按通道查询正式API；通用目录仍由目录自身管理通道。"""
     parsed = urllib.parse.urlsplit(url)
     parts = parsed.path.strip("/").split("/")
     if parsed.hostname != "github.com" or len(parts) != 6 or parts[2:] != ["releases", "latest", "download", "catalog.json"]:
         return url, False
-    source = urllib.parse.urlsplit(token_origin)
-    trusted_token = token if (parsed.scheme, parsed.hostname, parsed.port) == (source.scheme, source.hostname, source.port) else ""
     endpoint = "https://api.github.com/repos/{}/{}/releases?per_page=100".format(parts[0], parts[1])
-    with open_source(endpoint, token=trusted_token, token_origin="https://api.github.com") as response:
+    with open_source(endpoint) as response:
         raw = response.read(MAX_CATALOG + 1)
     if len(raw) > MAX_CATALOG:
         raise ManagerError("catalog_invalid", "GitHub版本目录响应超过限制。")
@@ -270,9 +255,11 @@ def github_catalog_url(url, channel, token="", token_origin=""):
                 continue
             for asset in release.get("assets", []):
                 if asset.get("name") == "catalog.json":
-                    candidate = urllib.parse.urlsplit(asset.get("url", ""))
-                    expected = "/repos/{}/{}/releases/assets/".format(parts[0], parts[1])
-                    if candidate.scheme != "https" or candidate.netloc != "api.github.com" or not candidate.path.startswith(expected):
+                    candidate = urllib.parse.urlsplit(asset.get("browser_download_url", ""))
+                    expected = "/{}/{}/releases/download/".format(parts[0], parts[1])
+                    if (candidate.scheme != "https" or candidate.netloc != "github.com"
+                            or candidate.username or candidate.password or candidate.fragment
+                            or not candidate.path.startswith(expected)):
                         raise ManagerError("catalog_invalid", "GitHub返回了不受信任的目录资产地址。")
                     return candidate.geturl(), True
     except (ValueError, KeyError, TypeError, AttributeError) as exc:

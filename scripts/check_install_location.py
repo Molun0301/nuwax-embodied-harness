@@ -5,7 +5,6 @@ from __future__ import annotations
 # ruff: noqa: E402
 import json
 import os
-import shlex
 import subprocess
 import sys
 import tempfile
@@ -171,28 +170,6 @@ class EntryChecks(unittest.TestCase):
         self.environment = dict(os.environ, NEH_TEST_CAPTURE=str(self.capture), NEH_TEST_PYTHON=sys.executable,
                                 NEH_TEST_CAPTURE_SCRIPT=str(self.capture_script),
                                 NEH_HOME=str(self.root / "environment home"), PATH=str(self.root) + os.pathsep + os.environ["PATH"])
-        self.stub = '#!/usr/bin/env bash\nexec "$NEH_TEST_PYTHON" "$NEH_TEST_CAPTURE_SCRIPT" "$@"\n'
-        gh = self.root / "gh"
-        gh.write_text("#!" + sys.executable + "\nimport sys\n"
-                      "if sys.argv[1:3] == ['auth', 'token']: print('fixture-token')\n"
-                      "elif sys.argv[1] == 'api': print(" + repr(self.stub) + ")\n")
-        gh.chmod(0o755)
-
-    def run_entry(self, command):
-        subprocess.run(command, cwd=str(ROOT), env=self.environment, check=True, capture_output=True, text=True)
-        captured = json.loads(self.capture.read_text())
-        self.assertEqual(captured["args"][-2:], ["--install-dir", str(self.custom)])
-        self.assertEqual(captured["home"], self.environment["NEH_HOME"])
-        return captured
-
-    def test_private_script_forwards_location(self):
-        captured = self.run_entry(["bash", "scripts/neh_private_install.sh", "--install-dir", str(self.custom)])
-        self.assertEqual(captured["args"][0], "--token-file")
-
-    def test_documented_private_command_does_not_swallow_first_flag(self):
-        document = (ROOT / "docs/公开文档/轻量安装与自动发布.md").read_text()
-        command = document.split("```bash\n", 1)[1].split("\n```", 1)[0]
-        self.run_entry(["bash", "-c", command + " --install-dir " + shlex.quote(str(self.custom))])
 
     def run_public_entry(self, arguments, *, terminal=False):
         python = self.root / "python3"

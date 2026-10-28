@@ -51,7 +51,6 @@ class BootstrapRecoveryChecks(unittest.TestCase):
         (self.home / "manager/current").symlink_to(self.old)
         self.engine = Engine(self.home)
         self.engine.save_settings({"source_repository": "https://github.com/example/previous.git", "source_branch": "previous"})
-        self.engine.set_token("fixture-old-token-not-real")
         self.binary = self.home / "bin/neh"
         self.binary.parent.mkdir()
         self.binary.write_bytes(b'#!/bin/sh\nexec /opt/previous-python "$@"\n')
@@ -60,14 +59,11 @@ class BootstrapRecoveryChecks(unittest.TestCase):
         listen.write_text('{"host": "127.0.0.1", "port": 18765}\n')
         listen.chmod(0o600)
         self.paths = [self.home / relative for relative in (
-            "config/settings.json", "config/credentials.json", "config/manager-listen.json", "bin/neh")]
+            "config/settings.json", "config/manager-listen.json", "bin/neh")]
         self.before = {path: (path.read_bytes(), path.stat().st_mode & 0o777) for path in self.paths}
-        token = self.home / "fixture-token"
-        token.write_text("fixture-new-token-not-real")
-        token.chmod(0o600)
         self.args = bootstrap.parser().parse_args([
             "--install-dir", str(self.home), "--repository", "https://github.com/example/candidate.git",
-            "--branch", "candidate", "--token-file", str(token), "--service", "none",
+            "--branch", "candidate", "--service", "none", "--bin-dir", str(self.home.parent / "bin"),
             "--host", "127.0.0.1", "--port", "18767", "--no-browser"])
         self.events = []
         self.old_command = bootstrap.cli_command(self.home, "/opt/previous-python", "serve", "--host", "::1", "--port", "18765")
@@ -98,8 +94,6 @@ class BootstrapRecoveryChecks(unittest.TestCase):
         for path, (content, mode) in self.before.items():
             self.assertEqual(path.read_bytes(), content)
             self.assertEqual(path.stat().st_mode & 0o777, mode)
-        self.assertNotIn("fixture-old-token-not-real", self.output.getvalue())
-        self.assertNotIn("fixture-new-token-not-real", self.output.getvalue())
         self.assertEqual(list((self.home / "manager/versions").glob(".prepare-*")), [])
 
     def run_command(self, command, **kwargs):
@@ -117,10 +111,8 @@ class BootstrapRecoveryChecks(unittest.TestCase):
                     values[name] = command[command.index(flag) + 1]
             if values:
                 self.engine.save_settings(values)
-            if "--token-stdin" in command:
-                self.engine.set_token(kwargs["input"])
-                if self.fail_settings:
-                    raise subprocess.CalledProcessError(1, ["fixture-settings"])
+            if self.fail_settings:
+                raise subprocess.CalledProcessError(1, ["fixture-settings"])
             return SimpleNamespace(returncode=0)
         if "is-active" in command:
             return SimpleNamespace(returncode=0 if self.running else 1)
@@ -221,8 +213,8 @@ class BootstrapRecoveryChecks(unittest.TestCase):
         self.assert_restored()
         self.assertEqual(self.events, [])
 
-    def test_absent_credentials_and_listen_remain_absent(self):
-        absent = [self.home / "config/credentials.json", self.home / "config/manager-listen.json"]
+    def test_absent_listen_remains_absent(self):
+        absent = [self.home / "config/manager-listen.json"]
         for path in absent:
             path.unlink()
             del self.before[path]
@@ -270,20 +262,15 @@ class BootstrapRecoveryChecks(unittest.TestCase):
         self.assert_restored()
         self.assertEqual(self.events, ["restart-service"])
 
-    def test_success_keeps_new_settings_credentials_and_listener(self):
+    def test_success_keeps_new_settings_and_listener(self):
         self.fail_launch = False
         self.assertEqual(bootstrap.install(self.args), 0)
         self.assertNotEqual((self.home / "manager/current").resolve(), self.old)
         settings = json.loads((self.home / "config/settings.json").read_text())
         self.assertEqual(settings["source_branch"], "candidate")
-        credentials = json.loads((self.home / "config/credentials.json").read_text())
-        self.assertEqual(credentials["token"], "fixture-new-token-not-real")
-        self.assertEqual(credentials["origin"], self.args.repository)
-        self.assertEqual((self.home / "config/credentials.json").stat().st_mode & 0o777, 0o600)
         self.assertEqual(json.loads((self.home / "config/manager-listen.json").read_text()), {"host": "127.0.0.1", "port": 18767})
         self.assertEqual(self.binary.stat().st_mode & 0o777, 0o755)
         self.assertNotIn("start-previous", self.events)
-        self.assertNotIn("fixture-new-token-not-real", self.output.getvalue())
         self.assertEqual((self.home / "manager/previous").resolve(), self.old)
         marker = json.loads((self.home / "manager/current/installed.json").read_text())
         self.assertEqual(marker, {"complete": True, "product": "neh-manager", "version": "fixture-candidate"})

@@ -44,11 +44,10 @@ def apply_manager(engine, job):
         return {"manager_version": source["version"], "revision": source["revision"], "unchanged": True, "restart_required": False}
     if source:
         from scripts.neh_source import source_checkout
-        from .sources import credentials
         engine._progress(job, "manager_source", 5, "获取固定源码并在设备本地组装管理程序")
         archive = engine.home / "cache" / ("source-manager-" + job["id"] + ".tar.gz")
         with source_checkout(engine.home, source["repository"], source["branch"], source["revision"],
-                             run=run_command, allow_local=source.get("allow_local", False), **credentials(engine),
+                             run=run_command, allow_local=source.get("allow_local", False),
                              cancelled=lambda: engine._cancelled(job["id"]),
                              progress=lambda message: engine._progress(job, "manager_source", 25, message)) as checkout:
             # 使用目标提交自己的打包规则，新增管理依赖不会被旧版本白名单遗漏。

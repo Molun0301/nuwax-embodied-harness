@@ -81,10 +81,6 @@ def safe_diagnostic(text, home=None):
         for key, value in read_settings(active).items():
             if re.search(r"PASSWORD|TOKEN|SECRET|API_KEY|AUTHORIZATION", key, re.I) and len(value) >= 4:
                 text = text.replace(value, "[已隐藏]")
-        from .locations import manager_home
-        token = read_json(manager_home(home) / "config/credentials.json", {}).get("token", "")
-        if token:
-            text = text.replace(token, "[已隐藏]")
     text = re.sub(r'(?i)Bearer\s+[^\s,;]+', 'Bearer [已隐藏]', text)
     text = re.sub(r'(?i)(["\']?(?:password|token|secret|api[_-]?key|authorization)["\']?\s*[:=]\s*)[^\s,;]+', r'\1[已隐藏]', text)
     text = re.sub(r'(https?://)[^/@\s]+:[^/@\s]+@', r'\1[已隐藏]@', text)
@@ -223,6 +219,20 @@ class Runtime:
     def has_owner(self):
         record = read_json(self.state_path, {})
         return process_alive(record.get("process")) or bool(self._supervisor())
+
+    def update_readiness(self):
+        if not self.has_owner():
+            # 已停止的受管拥有方没有可被本次更新中断的任务。
+            return {"ready": True}
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open("http://127.0.0.1:{}/api/updates/readiness".format(self.port()), timeout=3) as response:
+                result = json.loads(response.read(65537))
+            if isinstance(result, dict) and type(result.get("ready")) is bool:
+                return result
+        except (OSError, ValueError):
+            pass
+        return {"ready": False, "reason": "无法读取新鲜的网关空闲状态，稍后重查"}
 
     def status(self):
         record = read_json(self.state_path, {})

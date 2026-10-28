@@ -22,6 +22,7 @@ SOURCE_FILES = (
     "scripts/__init__.py", "core/config_values.py", "core/config_catalog.json",
     "core/config_descriptions.json", "scripts/neh_bootstrap.py", "scripts/neh_system_helper.py",
     "scripts/neh_source.py", "scripts/neh_source_build.py", "scripts/go2_dependencies.py",
+    "scripts/neh_prebuilt.py",
     "scripts/systemd/check_lcm_multicast.sh", "scripts/systemd/prepare_lcm_network.py",
 )
 REQUIRED_FILES = (

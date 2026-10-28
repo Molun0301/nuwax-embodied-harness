@@ -197,11 +197,12 @@ drivers/.active_robot.lock
 !/docs/公开文档/安装前准备.md
 !/docs/公开文档/配置说明.md
 !/docs/公开文档/控制台使用指南.md
-!/docs/公开文档/升级与恢复.md
+!/docs/公开文档/安装与更新.md
 !/docs/公开文档/常见问题与排障.md
 !/docs/公开文档/安全与数据说明.md
 !/docs/公开文档/贡献指南.md
 !/docs/公开文档/发布与兼容性.md
+!/docs/公开文档/第三方许可证说明.md
 
 # 完整合并候选的具名回归；仅开放下列目录与文件，其他本地测试仍忽略。
 !/tests/
@@ -258,5 +259,20 @@ drivers/.active_robot.lock
 !/tests/conftest.py
 
 # 正式安装和自动发布的公开使用入口。
-!/docs/公开文档/轻量安装与自动发布.md
 !/docs/公开文档/开发工具使用指南.md
+
+# 迁移后的历史验证记录继续随仓库保存。
+!/docs/验证证据/*.md
+
+# 两平台按程序预编译的固定环境与公开检查入口。
+!/scripts/ci/prebuilt.py
+!/scripts/ci/check_prebuilt.py
+!/scripts/ci/publish_channel.py
+!/scripts/ci/prebuilt_acceptance.py
+!/scripts/ci/prebuilt/
+/scripts/ci/prebuilt/*
+!/scripts/ci/prebuilt/focal-arm64.Dockerfile
+!/scripts/ci/prebuilt/noble-x86_64.Dockerfile
+
+# 按实际编译及链接记录维护的预编译许可核查。
+!/docs/公开文档/预编译许可证清单.md

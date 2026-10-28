@@ -12,7 +12,7 @@ The [rejected ownership optimization audit](exploration-view-ownership-audit-202
 
 The original `blind_start_selects_a_goal_on_observed_ground` failed before polling for a goal: it expected `validate_body_pose` to reject a rectangular patch of absent floor samples.
 
-The current [MLS collision checker](../../services/nuwax-workspace/crates/nuwax-nav-mls-planner/src/surface/body.rs) explicitly permits a missing nominal support anchor during collision interpretation (`check_body_pose`, lines 1445–1458). Unknown footprint columns still receive actual occupied-volume checking rather than acting as occupied obstacles (lines 1544–1553). Existing MLS tests explicitly distinguish geometric clearance from inferred support (lines 6156, 6482–6483). This matches the [shared terrain/recent-obstacle contract](../terrain-recent-obstacles-refactor.md#数据与责任边界), not an undocumented feature-selection workaround.
+The current [MLS collision checker](../../services/nuwax-workspace/crates/nuwax-nav-mls-planner/src/surface/body.rs) explicitly permits a missing nominal support anchor during collision interpretation (`check_body_pose`, lines 1445–1458). Unknown footprint columns still receive actual occupied-volume checking rather than acting as occupied obstacles (lines 1544–1553). Existing MLS tests explicitly distinguish geometric clearance from inferred support (lines 6156, 6482–6483). This matches the [shared terrain/recent-obstacle contract](../验证证据/terrain-recent-obstacles-refactor.md#数据与责任边界), not an undocumented feature-selection workaround.
 
 The corrected test keeps the original scene and requires all of the following:
 

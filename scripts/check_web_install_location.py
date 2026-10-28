@@ -25,7 +25,6 @@ from scripts.device_manager import MANAGER_REVISION
 from scripts.device_manager.auth import Authentication
 from scripts.device_manager.common import ManagerError, atomic_json, read_json
 from scripts.device_manager.engine import Engine
-from scripts.device_manager.runtime import safe_diagnostic
 from scripts.device_manager.server import ManagerServer
 from scripts.device_manager.storage import storage_plan
 
@@ -192,9 +191,8 @@ class LocationChecks(unittest.TestCase):
         self.assertEqual(result["install_dir"], preview["install_dir"])
         self.assertEqual(result["user_home"], str(self.root))
 
-    def test_auth_settings_token_and_runtime_port_remain_single_owner(self):
+    def test_auth_settings_and_runtime_port_remain_single_owner(self):
         self.engine.save_settings({"gateway_port": 19876, "auto_start": False})
-        self.engine.set_token("fixture-private-download-token")
         auth = Authentication(self.engine)
         auth.change("fixture-password")
         self.select()
@@ -203,11 +201,8 @@ class LocationChecks(unittest.TestCase):
         self.assertTrue(self.engine.settings()["password_enabled"])
         self.assertFalse(self.engine.settings()["auto_start"])
         self.assertEqual(self.engine.runtime.port(), 19876)
-        self.assertEqual(self.engine._source_options()["token"], "fixture-private-download-token")
-        self.assertNotIn("fixture-private-download-token", safe_diagnostic("fixture-private-download-token", self.target))
         self.assertFalse((self.target / "config/password.json").exists())
         self.assertFalse((self.target / "config/settings.json").exists())
-        self.assertFalse((self.target / "config/credentials.json").exists())
 
     def test_invalid_nonempty_conflicting_and_unwritable_paths(self):
         occupied = self.root / "occupied"
@@ -447,6 +442,9 @@ class HTTPChecks(LocationChecks):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join()
+        # 监听退出后仍须等回收/检查线程结束，才能删除它可能写入的临时目录。
+        if self.server.recovery_thread is not None:
+            self.server.recovery_thread.join()
 
     def request(self, method, path, body=None, *, authorized=True, origin=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)

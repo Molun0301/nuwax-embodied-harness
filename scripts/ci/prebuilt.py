@@ -73,12 +73,96 @@ def probe(output):
     dump(output, {"protocol": capture([os.environ.get("PROTOC", "protoc"), "--version"]), "lcm_generator": {"version": capture([generator, "--version"]), "sha256": common.sha256(Path(generator)), "wire_v3": "generated-and-linked"}, "packages": {name: capture(["pkg-config", "--modversion", name]) for name in ("lcm", "glib-2.0", "eigen3")}, "link": "passed"})
 
 
-def enable_ci_native_diagnostics():
+def enable_ci_native_diagnostics(cache):
     for name in ("CFLAGS", "CXXFLAGS"):
         flags = os.environ.get(name, "").strip()
         if not shlex.split(flags) or shlex.split(flags)[-1] != "-MD":
             os.environ[name] = (flags + " -MD").strip()
     os.environ["CC_ENABLE_DEBUG_OUTPUT"] = "1"
+    real_cmake = Path(os.environ.get("NEH_CI_REAL_CMAKE") or shutil.which("cmake")).resolve(strict=True)
+    version = re.search(r"cmake version (\d+)\.(\d+)", capture([str(real_cmake), "--version"]))
+    if version is None:
+        raise RuntimeError("无法确认真实CMake版本以选择编译器依赖诊断")
+    os.environ["NEH_CI_REAL_CMAKE"] = str(real_cmake)
+    os.environ["NEH_CI_LEGACY_CMAKE"] = "1" if tuple(map(int, version.groups())) < (3, 20) else "0"
+    wrapper = cache / "audit-tools/cmake"
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    command = [sys.executable, str(Path(__file__).resolve()), "native-cmake", "--cmake", str(real_cmake), "--cache", str(cache), "--"]
+    wrapper.write_text("#!/bin/sh\nexec " + " ".join(shlex.quote(value) for value in command) + ' "$@"\n')
+    wrapper.chmod(0o755)
+    os.environ["PATH"] = str(wrapper.parent) + os.pathsep + os.environ["PATH"]
+
+
+def cmake_cache_values(path):
+    return dict(re.findall(r"^([^/#:\r\n][^:=\r\n]*):[^=\r\n]+=(.*)$", path.read_text(), re.MULTILINE))
+
+
+def legacy_cmake_dependencies(values):
+    return os.environ.get("NEH_CI_LEGACY_CMAKE") == "1" or values.get("CMAKE_DEPENDS_USE_COMPILER", "").upper() in ("FALSE", "OFF", "0", "NO")
+
+
+def native_cmake(args):
+    arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else list(args.arguments)
+    special = ("--build", "--install", "--open", "--find-package", "-E", "-P", "--version", "--help", "-h")
+    if any(value in special or value.startswith("--help-") for value in arguments):
+        return subprocess.run([args.cmake, *arguments]).returncode
+    directory = next((arguments[index + 1] for index, value in enumerate(arguments[:-1]) if value == "-B"), None)
+    directory = directory or next((value[2:] for value in arguments if value.startswith("-B") and len(value) > 2), None)
+    build = (Path.cwd() / directory).resolve() if directory else Path.cwd().resolve()
+    cache_file = build / "CMakeCache.txt"
+    changes = {}
+    if args.cache.resolve() in build.parents and cache_file.is_file():
+        values = cmake_cache_values(cache_file)
+        if legacy_cmake_dependencies(values):
+            flattened = [value for value in arguments if value != "-D"]
+            explicit = dict(re.findall(r"^-?D?(CMAKE_(?:C|CXX)_FLAGS)(?::[^=]+)?=(.*)$", "\n".join(flattened), re.MULTILINE))
+            for name in ("CMAKE_C_FLAGS", "CMAKE_CXX_FLAGS"):
+                before = explicit.get(name, values.get(name))
+                if before is not None and "-MD" not in shlex.split(before):
+                    after = (before + " -MD").strip()
+                    arguments.append("-D" + name + ":STRING=" + after)
+                    changes[name] = {"before": before, "after": after}
+    status = subprocess.run([args.cmake, *arguments]).returncode
+    if args.cache.resolve() in build.parents and cache_file.is_file():
+        dump(args.cache / "audit-cmake-configs" / (hashlib.sha256(str(build).encode()).hexdigest() + ".json"), {"build_directory": str(build), "working_directory": str(Path.cwd()), "arguments": [args.cmake, *arguments], "diagnostic_changes": changes, "success": status == 0})
+    return status
+
+
+def migrate_cmake_diagnostics(program, cache, spec):
+    target = builds._rust_target(cache, ROOT, common.PROGRAMS[program]["manifest"])
+    result = []
+    for package_directory in sorted((target / "release/build").glob("*")):
+        if not package_directory.is_dir():
+            continue
+        name = package_directory.name.rsplit("-", 1)[0]
+        packages = [item for item in spec["cargo_packages"] if item["name"] == name]
+        if not packages:
+            continue
+        out = package_directory / "out"
+        pending = []
+        for record in sorted(out.rglob("CMakeCache.txt")):
+            if any((parent / "CMakeCache.txt").is_file() for parent in record.parent.parents if out == parent or out in parent.parents):
+                continue
+            values = cmake_cache_values(record)
+            missing = {key: values[key] for key in ("CMAKE_C_FLAGS", "CMAKE_CXX_FLAGS") if key in values and "-MD" not in shlex.split(values[key])}
+            if not legacy_cmake_dependencies(values) or not missing:
+                continue
+            home = Path(values.get("CMAKE_HOME_DIRECTORY", "/nonexistent-cmake-source")).resolve()
+            owners = [item for item in packages if Path(item["manifest_path"]).parent.resolve() == home or Path(item["manifest_path"]).parent.resolve() in home.parents]
+            if not owners:
+                continue
+            if len(owners) != 1 or not re.fullmatch(re.escape(name) + r"-[0-9a-f]+", package_directory.name) or record.is_symlink() or target.resolve() not in record.resolve().parents:
+                raise RuntimeError("旧CMake诊断迁移的Cargo包/构建路径无法唯一归属：" + str(record))
+            pending.append({"package_id": owners[0]["id"], "manifest_path": owners[0]["manifest_path"], "cmake_cache": str(record), "source_directory": str(home), "original_flags": missing})
+        if pending:
+            output = package_directory / "output"
+            if output.is_symlink():
+                raise RuntimeError("旧CMake诊断迁移拒绝符号链接output")
+            receipt = {"program": program, "basis": "current-package-legacy-cmake-cache-lacks-compiler-MD", "configurations": pending, "invalidated_record": str(output), "original_sha256": common.sha256(output) if output.is_file() else None, "action": "remove-single-build-script-output" if output.is_file() else "already-missing-build-script-output"}
+            dump(cache / "audit-cmake-migrations" / (hashlib.sha256(str(package_directory).encode()).hexdigest() + ".json"), receipt)
+            output.unlink(missing_ok=True)
+            result.append(receipt)
+    return result
 
 
 def identity(platform_key, root):
@@ -100,7 +184,7 @@ def identity(platform_key, root):
         "system_packages": capture(["dpkg-query", "-W", "-f=${binary:Package}=${Version}\n"]),
         "image": {"base": base_image, "dockerfile_sha256": common.sha256(root / "scripts/ci/prebuilt" / (platform_key + ".Dockerfile"))},
         # 不含路径和并行数；它们不改变代码语义，源码内优化配置由Git树覆盖。
-        "parameters": {"cargo": ["rustc", "--locked", "--release", "-vv", "--message-format=json-render-diagnostics", "--print=link-args", "-Clink-arg=-Wl,-Map=$CACHE/audit-linkmaps/<program>.map"], "native_diagnostics": {"dependency": "-MD", "boost_compiler_wrapper": 1, "boost_map": "$CACHE/audit-linkmaps/boost/<output-digest>.map"}, "cmake": ["CMAKE_BUILD_TYPE=Release", "CMAKE_GENERATOR=Unix Makefiles"], "environment": {name: os.environ.get(name, "") for name in ("RUSTFLAGS", "CFLAGS", "CXXFLAGS", "LDFLAGS", "NUWAX_CXX20", "CC_ENABLE_DEBUG_OUTPUT")}},
+        "parameters": {"cargo": ["rustc", "--locked", "--release", "-vv", "--message-format=json-render-diagnostics", "--print=link-args", "-Clink-arg=-Wl,-Map=$CACHE/audit-linkmaps/<program>.map"], "native_diagnostics": {"dependency": "-MD", "boost_compiler_wrapper": 1, "legacy_cmake_cached_flags": "preserve-and-append-MD-v1", "cargo_migration": "current-package-build-script-output-v1", "boost_map": "$CACHE/audit-linkmaps/boost/<output-digest>.map"}, "cmake": ["CMAKE_BUILD_TYPE=Release", "CMAKE_GENERATOR=Unix Makefiles"], "environment": {name: os.environ.get(name, "") for name in ("RUSTFLAGS", "CFLAGS", "CXXFLAGS", "LDFLAGS", "NUWAX_CXX20", "CC_ENABLE_DEBUG_OUTPUT")}},
     }
 
 
@@ -1133,6 +1217,14 @@ def collect_audit(program, spec, checked, linked, root, cache):
         private_records.append(record)
         link_inputs.append({"kind": "runtime-private-library", "name": name, "path": str(path), "exists_after_link": True})
     checked["external_inputs"] = sorted(set(checked["external_inputs"]))
+    cmake_diagnostics = []
+    for directory in sorted({item["cmake_root"] for item in native_links}):
+        receipt = cache / "audit-cmake-configs" / (hashlib.sha256(directory.encode()).hexdigest() + ".json")
+        if receipt.is_file():
+            recorded = json.loads(receipt.read_text())
+            if recorded["build_directory"] != directory or not recorded["success"]:
+                raise RuntimeError("实际原生配置诊断回执与CMake构建根不符")
+            cmake_diagnostics.append(recorded)
     origins = {}
     inputs = checked["repository_inputs"] + checked["external_inputs"] + [item["path"] for item in link_inputs]
     for value in inputs:
@@ -1146,7 +1238,7 @@ def collect_audit(program, spec, checked, linked, root, cache):
         owner = source_owner(path, spec, root, cache, program)
         owner_key = owner["kind"] + ":" + owner["id"]
         origins[owner_key] = owner
-    return {**checked, "schema": 1, "program": program, "compiler_commands": linked["compiler_commands"], "compiler_artifacts": linked["compiler_artifacts"], "compiled_binary_sha256": linked["binary_sha256"], "link_record_origin": "executed" if linked["captured_this_build"] else "binary-sha-matched-cache", "linker_arguments": linked["linker_arguments"], "link_inputs": link_inputs, "native_link_records": native_links, "native_archive_adoption": adoption, "rust_dependency_record_origins": linked.get("rust_dependency_record_origins", []), "boost_native_adoption": linked.get("boost_adoption", {}), "boost_installation": spec.get("_boost_installation"), "private_library_records": private_records, "external_sources": sorted(origins.values(), key=lambda item: (item["kind"], item["id"])), "cargo_resolution": spec["cargo_packages"], "source_revision": capture(["git", "-C", str(root), "rev-parse", "HEAD"])}
+    return {**checked, "schema": 1, "program": program, "compiler_commands": linked["compiler_commands"], "compiler_artifacts": linked["compiler_artifacts"], "compiled_binary_sha256": linked["binary_sha256"], "link_record_origin": "executed" if linked["captured_this_build"] else "binary-sha-matched-cache", "linker_arguments": linked["linker_arguments"], "link_inputs": link_inputs, "native_link_records": native_links, "cmake_configuration_diagnostics": cmake_diagnostics, "native_archive_adoption": adoption, "rust_dependency_record_origins": linked.get("rust_dependency_record_origins", []), "boost_native_adoption": linked.get("boost_adoption", {}), "boost_installation": spec.get("_boost_installation"), "private_library_records": private_records, "external_sources": sorted(origins.values(), key=lambda item: (item["kind"], item["id"])), "cargo_resolution": spec["cargo_packages"], "source_revision": capture(["git", "-C", str(root), "rev-parse", "HEAD"])}
 
 
 def review_key(audit, root, cache):
@@ -1188,7 +1280,7 @@ def build(args):
     (output / ("platform-" + args.platform + ".json")).unlink(missing_ok=True)
     prefix = cache / "prefix"
     prefix.mkdir(exist_ok=True)
-    enable_ci_native_diagnostics()
+    enable_ci_native_diagnostics(cache)
     probe(output / "probe.json")
     cargo, build_identity = identity(args.platform, root)
     environment = {"CARGO_INCREMENTAL": "0", "CARGO_HOME": str(cache / "cargo")}
@@ -1228,6 +1320,8 @@ def build(args):
                 reused.append(program)
                 print("云端跳过同指纹程序：" + program, flush=True)
                 continue
+            migrations = migrate_cmake_diagnostics(program, cache, spec)
+            dump(output / ("cmake-migrations-" + program + ".json"), migrations)
             link_map = cache / "audit-linkmaps" / (program + ".map")
             link_map.parent.mkdir(parents=True, exist_ok=True)
             log_path = output / (program + ".build.log")
@@ -1273,7 +1367,7 @@ def build(args):
             checked = common.audit_dependencies(root, spec, records, generated_roots=generated, record_cwds=record_cwds)
             dump(output / ("audit-" + program + ".json"), {**checked, "link_record": linked, "status": "source-mapping-in-progress"})
             audit = collect_audit(program, spec, checked, linked, root, cache)
-            audit.update(platform=args.platform, fingerprint=value, dependency_record_artifacts=dependency_artifacts)
+            audit.update(platform=args.platform, fingerprint=value, dependency_record_artifacts=dependency_artifacts, cmake_diagnostic_migrations=migrations)
             # 即使许可尚未批准，也保存真实输入与构建证据；发布在另一作业严格拒绝。
             dump(output / ("audit-" + program + ".json"), audit)
             entry = package(root, prefix, cache, output, program, value, spec, audit)
@@ -1288,6 +1382,10 @@ def build(args):
             failures.append(failure)
             dump(output / ("error-" + program + ".json"), failure)
             print("程序失败，保留证据后继续其余程序：" + program + "：" + str(exc), flush=True)
+    for receipt in (cache / "audit-cmake-configs").glob("*.json"):
+        destination = output / "cmake-configuration-ledger" / receipt.name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(receipt, destination)
     if failures:
         dump(output / "build-report.json", {"success": False, "failures": failures, "compiled": compiled, "reused": reused, "packaged": packaged})
         raise RuntimeError("五程序构建/审计存在失败，拒绝生成发布索引：" + ", ".join(item["program"] for item in failures))
@@ -1417,6 +1515,10 @@ def main():
     command.add_argument("--output", type=Path, required=True)
     command.add_argument("--assets", type=Path, required=True)
     command.add_argument("--jobs", type=int, default=4)
+    command = commands.add_parser("native-cmake")
+    command.add_argument("--cmake", required=True)
+    command.add_argument("--cache", type=Path, required=True)
+    command.add_argument("arguments", nargs=argparse.REMAINDER)
     command = commands.add_parser("native-compiler")
     command.add_argument("--compiler", required=True)
     command.add_argument("--records", type=Path, required=True)
@@ -1427,6 +1529,8 @@ def main():
     command.add_argument("--revision", required=True)
     command.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.command == "native-cmake":
+        return native_cmake(args)
     if args.command == "native-compiler":
         return native_compiler(args)
     if args.command == "probe":

@@ -5,80 +5,236 @@
     "nuwax-slam-2d-worker": {
       "platforms": {
         "focal-arm64": {
-          "decision": "pending",
-          "review_key": "",
-          "license_expression": "",
-          "reviewed_components": []
+          "decision": "approved",
+          "review_key": "9a5dc61f771f13687328c8e77cbec4558bfbed34a6027aee3e8538abcf281a5c",
+          "license_expression": "GPL-3.0-only",
+          "reviewed_components": [
+            "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
+            "实际编译Cargo包101个：逐包许可及build/runtime角色见随包组件记录",
+            "实际系统运行库及适用GNU运行库例外，版权材料随包提供",
+            "Eigen3",
+            "boost-1.83.0",
+            "slam2d-ceres",
+            "slam2d-onetbb",
+            "drivers/sensors/slamtec_native/sdk",
+            "services/nuwax-workspace/crates/nuwax-slam-toolbox-sys/native/upstream"
+          ],
+          "evidence": {
+            "run_id": 40653942719,
+            "source_revision": "adc068a43a355de7269d94cb3e0159976dd4648a",
+            "audit": "share/neh-prebuilt/nuwax-slam-2d-worker/audit/inputs.json",
+            "reviewed_at": "2026-10-28T08:43:04.536910+00:00",
+            "说明": "按实际编译Cargo包、最终Map/ELF原生组件及固定内嵌目录核对；原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
+          }
         },
         "noble-x86_64": {
-          "decision": "pending",
-          "review_key": "",
-          "license_expression": "",
-          "reviewed_components": []
+          "decision": "approved",
+          "review_key": "89b3179e3c10552d7dd9f913574c74ea13dde24d929543cb67db14bcd60b1464",
+          "license_expression": "GPL-3.0-only",
+          "reviewed_components": [
+            "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
+            "实际编译Cargo包101个：逐包许可及build/runtime角色见随包组件记录",
+            "实际系统运行库及适用GNU运行库例外，版权材料随包提供",
+            "Eigen3",
+            "boost-1.83.0",
+            "slam2d-ceres",
+            "slam2d-onetbb",
+            "drivers/sensors/slamtec_native/sdk",
+            "services/nuwax-workspace/crates/nuwax-slam-toolbox-sys/native/upstream"
+          ],
+          "evidence": {
+            "run_id": 40653942719,
+            "source_revision": "adc068a43a355de7269d94cb3e0159976dd4648a",
+            "audit": "share/neh-prebuilt/nuwax-slam-2d-worker/audit/inputs.json",
+            "reviewed_at": "2026-10-28T08:31:46Z",
+            "说明": "按实际编译Cargo包、最终Map/ELF原生组件及固定内嵌目录核对；原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
+          }
         }
       }
     },
     "nuwax-geometry-runtime": {
       "platforms": {
         "focal-arm64": {
-          "decision": "pending",
-          "review_key": "",
-          "license_expression": "",
-          "reviewed_components": []
+          "decision": "approved",
+          "review_key": "fa40ccf853aaf339b4d7cb10dc333ef17df296aff6c526644511cdba709dabf2",
+          "license_expression": "GPL-3.0-only",
+          "reviewed_components": [
+            "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
+            "实际编译Cargo包300个：逐包许可及build/runtime角色见随包组件记录",
+            "实际系统运行库及适用GNU运行库例外，版权材料随包提供",
+            "GTSAM/Cephes",
+            "GTSAM/GKlib",
+            "GTSAM/METIS",
+            "Boost-system-headers",
+            "Eigen3",
+            "gtsam_source",
+            "services/nuwax-workspace/crates/nuwax-nav-pct-native/native/upstream",
+            "services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream"
+          ],
+          "evidence": {
+            "run_id": 40653942719,
+            "source_revision": "adc068a43a355de7269d94cb3e0159976dd4648a",
+            "audit": "share/neh-prebuilt/nuwax-geometry-runtime/audit/inputs.json",
+            "reviewed_at": "2026-10-28T08:43:04.548793+00:00",
+            "说明": "按实际编译Cargo包、最终Map/ELF原生组件及固定内嵌目录核对；原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
+          }
         },
         "noble-x86_64": {
-          "decision": "pending",
-          "review_key": "",
-          "license_expression": "",
-          "reviewed_components": []
+          "decision": "approved",
+          "review_key": "031094e26e1c80a3c808e6396704649c1cfbc7a90a1b7706e9ec3fa0351316c1",
+          "license_expression": "GPL-3.0-only",
+          "reviewed_components": [
+            "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
+            "实际编译Cargo包300个：逐包许可及build/runtime角色见随包组件记录",
+            "实际系统运行库及适用GNU运行库例外，版权材料随包提供",
+            "GTSAM/Cephes",
+            "GTSAM/GKlib",
+            "GTSAM/METIS",
+            "Boost-system-headers",
+            "Eigen3",
+            "gtsam_source",
+            "services/nuwax-workspace/crates/nuwax-nav-pct-native/native/upstream",
+            "services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream"
+          ],
+          "evidence": {
+            "run_id": 40653942719,
+            "source_revision": "adc068a43a355de7269d94cb3e0159976dd4648a",
+            "audit": "share/neh-prebuilt/nuwax-geometry-runtime/audit/inputs.json",
+            "reviewed_at": "2026-10-28T08:31:46Z",
+            "说明": "按实际编译Cargo包、最终Map/ELF原生组件及固定内嵌目录核对；原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
+          }
         }
       }
     },
     "nuwax-nav-stack": {
       "platforms": {
         "focal-arm64": {
-          "decision": "pending",
-          "review_key": "",
-          "license_expression": "",
-          "reviewed_components": []
+          "decision": "approved",
+          "review_key": "db48417cff0ba4404cc179814c31aaf64f490083db3289e4a5d49cdb2278c0a5",
+          "license_expression": "GPL-3.0-only",
+          "reviewed_components": [
+            "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
+            "实际编译Cargo包223个：逐包许可及build/runtime角色见随包组件记录",
+            "实际系统运行库及适用GNU运行库例外，版权材料随包提供",
+            "Eigen3",
+            "services/nuwax-workspace/crates/nuwax-nav-pct-native/native/upstream",
+            "services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream"
+          ],
+          "evidence": {
+            "run_id": 40653942719,
+            "source_revision": "adc068a43a355de7269d94cb3e0159976dd4648a",
+            "audit": "share/neh-prebuilt/nuwax-nav-stack/audit/inputs.json",
+            "reviewed_at": "2026-10-28T08:43:04.552479+00:00",
+            "说明": "按实际编译Cargo包、最终Map/ELF原生组件及固定内嵌目录核对；原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
+          }
         },
         "noble-x86_64": {
-          "decision": "pending",
-          "review_key": "",
-          "license_expression": "",
-          "reviewed_components": []
+          "decision": "approved",
+          "review_key": "f935c00376d39db69173ae9cef014c95f5fbf88202565902fb2a2209bc57ec5f",
+          "license_expression": "GPL-3.0-only",
+          "reviewed_components": [
+            "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
+            "实际编译Cargo包223个：逐包许可及build/runtime角色见随包组件记录",
+            "实际系统运行库及适用GNU运行库例外，版权材料随包提供",
+            "Eigen3",
+            "services/nuwax-workspace/crates/nuwax-nav-pct-native/native/upstream",
+            "services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream"
+          ],
+          "evidence": {
+            "run_id": 40653942719,
+            "source_revision": "adc068a43a355de7269d94cb3e0159976dd4648a",
+            "audit": "share/neh-prebuilt/nuwax-nav-stack/audit/inputs.json",
+            "reviewed_at": "2026-10-28T08:31:46Z",
+            "说明": "按实际编译Cargo包、最终Map/ELF原生组件及固定内嵌目录核对；原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
+          }
         }
       }
     },
     "nuwax-person-follow": {
       "platforms": {
         "focal-arm64": {
-          "decision": "pending",
-          "review_key": "",
-          "license_expression": "",
-          "reviewed_components": []
+          "decision": "approved",
+          "review_key": "9318657c42e761edd9e49cbd5f38d9bb7b02de061bdab3d9884d95f0c8e684b0",
+          "license_expression": "GPL-3.0-only",
+          "reviewed_components": [
+            "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
+            "实际编译Cargo包182个：逐包许可及build/runtime角色见随包组件记录",
+            "实际系统运行库及适用GNU运行库例外，版权材料随包提供"
+          ],
+          "evidence": {
+            "run_id": 40653942719,
+            "source_revision": "adc068a43a355de7269d94cb3e0159976dd4648a",
+            "audit": "share/neh-prebuilt/nuwax-person-follow/audit/inputs.json",
+            "reviewed_at": "2026-10-28T08:43:04.556958+00:00",
+            "说明": "按实际编译Cargo包、最终Map/ELF原生组件及固定内嵌目录核对；原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
+          }
         },
         "noble-x86_64": {
-          "decision": "pending",
-          "review_key": "",
-          "license_expression": "",
-          "reviewed_components": []
+          "decision": "approved",
+          "review_key": "6369408f58408ac1713dda4108f93528f39fb8d859ebe6a02d87e948b2a37f71",
+          "license_expression": "GPL-3.0-only",
+          "reviewed_components": [
+            "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
+            "实际编译Cargo包182个：逐包许可及build/runtime角色见随包组件记录",
+            "实际系统运行库及适用GNU运行库例外，版权材料随包提供"
+          ],
+          "evidence": {
+            "run_id": 40653942719,
+            "source_revision": "adc068a43a355de7269d94cb3e0159976dd4648a",
+            "audit": "share/neh-prebuilt/nuwax-person-follow/audit/inputs.json",
+            "reviewed_at": "2026-10-28T08:31:46Z",
+            "说明": "按实际编译Cargo包、最终Map/ELF原生组件及固定内嵌目录核对；原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
+          }
         }
       }
     },
     "nuwax-mapping-cli": {
       "platforms": {
         "focal-arm64": {
-          "decision": "pending",
-          "review_key": "",
-          "license_expression": "",
-          "reviewed_components": []
+          "decision": "approved",
+          "review_key": "6b369ea27af4cc4d9bb7334d19b4d4c486bbd77775cb8266325c042fafd47a88",
+          "license_expression": "GPL-3.0-only",
+          "reviewed_components": [
+            "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
+            "实际编译Cargo包231个：逐包许可及build/runtime角色见随包组件记录",
+            "实际系统运行库及适用GNU运行库例外，版权材料随包提供",
+            "GTSAM/Cephes",
+            "GTSAM/GKlib",
+            "GTSAM/METIS",
+            "Boost-system-headers",
+            "Eigen3",
+            "gtsam_source"
+          ],
+          "evidence": {
+            "run_id": 40653942719,
+            "source_revision": "adc068a43a355de7269d94cb3e0159976dd4648a",
+            "audit": "share/neh-prebuilt/nuwax-mapping-cli/audit/inputs.json",
+            "reviewed_at": "2026-10-28T08:43:04.565876+00:00",
+            "说明": "按实际编译Cargo包、最终Map/ELF原生组件及固定内嵌目录核对；原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
+          }
         },
         "noble-x86_64": {
-          "decision": "pending",
-          "review_key": "",
-          "license_expression": "",
-          "reviewed_components": []
+          "decision": "approved",
+          "review_key": "2e7ec0147036e6107dd38e3a726b715bdf54de8f59d6e8565c38715104da3487",
+          "license_expression": "GPL-3.0-only",
+          "reviewed_components": [
+            "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
+            "实际编译Cargo包231个：逐包许可及build/runtime角色见随包组件记录",
+            "实际系统运行库及适用GNU运行库例外，版权材料随包提供",
+            "GTSAM/Cephes",
+            "GTSAM/GKlib",
+            "GTSAM/METIS",
+            "Boost-system-headers",
+            "Eigen3",
+            "gtsam_source"
+          ],
+          "evidence": {
+            "run_id": 40653942719,
+            "source_revision": "adc068a43a355de7269d94cb3e0159976dd4648a",
+            "audit": "share/neh-prebuilt/nuwax-mapping-cli/audit/inputs.json",
+            "reviewed_at": "2026-10-28T08:31:46Z",
+            "说明": "按实际编译Cargo包、最终Map/ELF原生组件及固定内嵌目录核对；原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
+          }
         }
       }
     }

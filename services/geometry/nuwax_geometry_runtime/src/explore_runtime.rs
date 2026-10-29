@@ -1520,7 +1520,7 @@ impl ExploreRuntimeHandle {
                 mode.input_ready = false;
                 mode.input_error = Some(
                     if message.cleared {
-                        "surface map cleared"
+                        schema::navigation_map_clear_reason(message)
                     } else {
                         "surface map domain changed"
                     }
@@ -1549,7 +1549,7 @@ impl ExploreRuntimeHandle {
                 Some(&request_id),
                 ExplorationStopReason::MapRevisionChanged,
                 if message.cleared {
-                    "surface map cleared by mapping owner"
+                    schema::navigation_map_clear_reason(message)
                 } else {
                     "surface map domain changed"
                 }
@@ -5513,6 +5513,7 @@ mod tests {
 
     #[tokio::test]
     async fn surface_clear_stops_exact_child_and_discards_old_inputs_and_computation() {
+        for ground_block_failed in [false, true] {
         let (handle, sink) = configured_handle();
         let (message, ticket, snapshot) = install_surface_fixture(&handle, "map").await;
         handle.start("surface-clear", "prefer_wavefront").await;
@@ -5523,6 +5524,7 @@ mod tests {
         let lease = active_child_lease(&handle).await;
         let mut clear = message.clone();
         clear.cleared = true;
+        clear.ground_block_failed = ground_block_failed;
         clear.cloud_revision = 2;
         clear.source_timestamp_ns = 0;
         clear.commit_sequence = 0;
@@ -5568,6 +5570,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stopped.status, STATUS_FAILED);
+        if ground_block_failed { assert!(stopped.message.contains("mapping_ground_block_write_failed")); }
         assert_eq!(stopped.last_stop_reason, "map_revision_changed");
         assert!(stopped.child_task_id.is_empty());
         assert!(handle
@@ -5581,6 +5584,7 @@ mod tests {
             .snapshot()
             .unwrap()
             .is_none());
+        }
     }
 
     #[tokio::test]

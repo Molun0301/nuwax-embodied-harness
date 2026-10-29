@@ -6,6 +6,9 @@ struct Dirty { block: Arc<Block>, layers: GroundRecords, layer_bytes: usize, cha
 
 fn watermark_bytes(source: &LayerSource) -> usize { source.resident_bytes() + 80 }
 struct Pending { object: ObjectIdentity, bytes: Vec<u8>, installed: bool }
+/// 最近一次块编码或写入失败；拥有方据此隔离数据故障，不靠错误文本分类。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockWriteFailure { pub key: Key, pub reason: String }
 /// Dirty payload is bounded; membership baselines retain references, never copied member lists.
 pub struct Writer {
     repository: Repository, blocks: BTreeMap<Key, BlockRef>, dirty: BTreeMap<Key, Dirty>,
@@ -19,6 +22,7 @@ pub struct Writer {
     voxel_size_m: f32, dirty_point_budget: usize, dirty_points: usize, dirty_layer_bytes: usize, max_observed_ns: u64,
     // 自动模式的预算上限（字节）；`None` 为固定预算。首次超过上限时记下所需与上限。
     cache_limit_bytes: Option<usize>, cache_warning: Option<(usize, usize)>,
+    block_write_failure: Option<BlockWriteFailure>,
     #[cfg(test)] pub(crate) cache_warnings: usize,
 }
 /// 写入器缓存策略。固定：始终使用构造时的预算；自动：即将压力刷写时，若把预算扩到
@@ -38,9 +42,10 @@ impl Writer {
         Ok(Self { reader: RegionReader::new(repository.clone(), cache_bytes / 2), repository,
             blocks: BTreeMap::new(), dirty: BTreeMap::new(), pending: BTreeMap::new(), touched: BTreeSet::new(), membership_touched: BTreeSet::new(),
             source_watermarks: BTreeMap::new(), source_watermark_bytes: 0, source_watermarks_changed: false, published: None, legacy_baseline: None, id_source: Box::new(id_source), #[cfg(test)] encoded_blocks: 0, write_format: 4, voxel_size_m, dirty_point_budget: cache_bytes / 128, dirty_points: 0, dirty_layer_bytes: 0, max_observed_ns: 0,
-            cache_limit_bytes: None, cache_warning: None, #[cfg(test)] cache_warnings: 0 })
+            cache_limit_bytes: None, cache_warning: None, block_write_failure: None, #[cfg(test)] cache_warnings: 0 })
     }
     pub fn repository(&self) -> &Repository { &self.repository }
+    pub fn block_write_failure(&self) -> Option<&BlockWriteFailure> { self.block_write_failure.as_ref() }
     /// 切换缓存策略；自动模式的上限不能低于当前预算（预算只增不减）。
     pub fn set_cache_policy(&mut self, policy: CachePolicy) -> Result<(), String> {
         match policy {
@@ -549,17 +554,27 @@ impl Writer {
         Ok(())
     }
     pub fn flush(&mut self) -> Result<(), String> {
+        self.block_write_failure = None;
         let keys: Vec<_> = self.dirty.iter().filter(|(_, d)| d.changed && !d.block.is_empty()).map(|(k, _)| *k).collect();
         for key in keys {
             if !self.pending.contains_key(&key) {
                 let object = ObjectIdentity::Assigned((self.id_source)()?); object.validate()?;
-                let bytes = encode_ground_block(&self.dirty[&key].block, &self.dirty[&key].layers)?;
+                let dirty = &self.dirty[&key];
+                let bytes = encode_ground_block(&dirty.block, &dirty.layers).map_err(|error| {
+                    let reason = format!("ground block {key:?}: points={} records={}: {error}", dirty.block.len(), dirty.layers.iter().count());
+                    self.block_write_failure = Some(BlockWriteFailure { key, reason: reason.clone() });
+                    reason
+                })?;
                 #[cfg(test)] { self.encoded_blocks += 1; }
                 self.pending.insert(key, Pending { object, bytes, installed: false });
             }
             let pending = self.pending.get_mut(&key).unwrap();
             if !pending.installed {
-                self.repository.put_object(pending.object, &pending.bytes)?;
+                self.repository.put_object(pending.object, &pending.bytes).map_err(|error| {
+                    tracing::error!(?key, bytes = pending.bytes.len(), %error, "地面块写入失败，保留原根");
+                    self.block_write_failure = Some(BlockWriteFailure { key, reason: format!("ground block {key:?} write failed: {error}") });
+                    error
+                })?;
                 pending.installed = true;
             }
         }

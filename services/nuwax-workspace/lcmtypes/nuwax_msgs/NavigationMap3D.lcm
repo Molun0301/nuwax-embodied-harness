@@ -20,7 +20,7 @@ struct NavigationMap3D {
     float source_voxel_size;
     byte commit_boot_nonce[16];
     int64_t commit_sequence;
-    // 0为生效地图，1为显式清空。
+    // 0为生效地图，1为显式清空，2为建图地面块提交失败后的来源撤销。
     int8_t cleared;
     // 仅表示同次提交的虚拟禁区，不包含二维物理投影。
     int8_t has_virtual_obstacles;

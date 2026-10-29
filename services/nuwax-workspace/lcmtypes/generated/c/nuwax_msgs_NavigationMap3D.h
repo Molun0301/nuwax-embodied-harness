@@ -61,7 +61,7 @@ struct _nuwax_msgs_NavigationMap3D
     int64_t    commit_sequence;
 
     /**
-     * 0为生效地图，1为显式清空。
+     * 0为生效地图，1为显式清空，2为建图地面块提交失败后的来源撤销。
      */
     int8_t     cleared;
 

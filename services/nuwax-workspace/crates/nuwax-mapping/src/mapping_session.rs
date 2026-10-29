@@ -53,6 +53,8 @@ pub const ODOM_QUANTIZE_MM: i64 = 1000;
 /// `MappingSession` 错误基类(对应 W12 Python `SessionError`)。
 #[derive(Debug)]
 pub enum SessionError {
+    /// 块写入失败已完成来源撤销及后端退休，几何服务仍可接受查询和新会话。
+    MapSourceUnavailable { session_generation: u64, reason: String },
     /// 配置为零容量，无法保留任何输入点。
     ResourceExhausted {
         /// 配置的最大点数。
@@ -85,6 +87,8 @@ pub enum SessionError {
 impl fmt::Display for SessionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MapSourceUnavailable { session_generation, reason } => write!(f,
+                "mapping_ground_block_write_failed: session_generation={session_generation}: {reason}"),
             Self::ResourceExhausted {
                 capacity,
                 current_size,

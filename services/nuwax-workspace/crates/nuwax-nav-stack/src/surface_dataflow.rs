@@ -485,7 +485,7 @@ fn prepare_surface_map_with_retry(
     let source_timestamp_ns = message.source_timestamp_ns;
     let snapshot = if message.cleared {
         cache.reset();
-        Err("surface map cleared by mapping owner".into())
+        Err(schema::navigation_map_clear_reason(&message).into())
     } else if message.committed_map.frame_id != config.geometry.world_frame {
         Err("surface map frame differs from configured map frame".into())
     } else {
@@ -1028,7 +1028,9 @@ async fn run_surface_planner_with_computer(
                     if !future_goal_matches { retire_goal(&mut goal, &mut retired_goals); }
                     pose = None; last_path = None; execution_admitted = false;
                     let invalid = PreparedSurfaceMap { authority: authority.clone(), source_timestamp_ns: message.source_timestamp_ns,
-                        received_at, awaiting_build: !message.cleared, snapshot: Err("规范地图清空或切换，等待该域完整精细源".into()),
+                        received_at, awaiting_build: !message.cleared, snapshot: Err(if message.cleared {
+                            schema::navigation_map_clear_reason(&message).into()
+                        } else { "规范地图清空或切换，等待该域完整精细源".into() }),
                         change_basis: None, geometry_changes: Arc::new(SurfaceGeometryChanges::Unknown) };
                     hub.publish(invalid.clone()); latest_map = Some(invalid);
                 }
@@ -1564,6 +1566,7 @@ mod tests {
             commit_boot_nonce: [0x44; 16],
             commit_sequence: revision,
             cleared: false,
+            ground_block_failed: false,
             virtual_obstacles: None,
             fine: None,
             cloud: schema::PointCloud2 {
@@ -3211,6 +3214,46 @@ mod tests {
         harness.terminal(TerminalOutcome::Cancelled).await;
         harness.shutdown().await;
     }
+    #[tokio::test]
+    async fn ground_block_failure_revokes_active_navigation_with_explicit_reason() {
+        let mut harness = Harness::start().await;
+        harness.wait_ready().await;
+        let goal = goal_for(&harness.feed.lock().unwrap().map, 1, [3.2, 1.55, 2.5]);
+        harness.goal(&goal).await;
+        harness.path_for(&goal).await;
+        harness.wait_controlling().await;
+        let old = harness.freeze_map().await;
+        let mut failed = old.clone();
+        failed.cloud_revision += 1;
+        failed.cleared = true;
+        failed.ground_block_failed = true;
+        failed.virtual_obstacles = None;
+        failed.fine = None;
+        failed.committed_map = schema::CommittedMapIdentity {
+            session_id: old.committed_map.session_id.clone(),
+            session_generation: old.committed_map.session_generation,
+            frame_id: old.committed_map.frame_id.clone(), ..Default::default()
+        };
+        failed.source_timestamp_ns = 0;
+        failed.commit_sequence = 0;
+        failed.cloud_occupancy_revision = 0;
+        failed.cloud = schema::PointCloud2 {
+            header: schema::Header {seq:failed.cloud_revision as i32,frame_id:"map".into(),..Default::default()},
+            ..Default::default()
+        };
+        harness.map(&failed).await;
+        harness.terminal(TerminalOutcome::SafetyFailed).await;
+        assert!(harness.scheduler.status().message.contains("mapping_ground_block_write_failed"));
+        assert_eq!(harness.scheduler.status().last_applied_twist, Some(Twist2::ZERO));
+        assert!(harness.calls.lock().unwrap().iter().any(|call|call.starts_with("zero:")));
+        harness.calls.lock().unwrap().clear();
+        harness.map(&old).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(harness.calls.lock().unwrap().is_empty(), "旧快照不能恢复运动");
+        assert!(!harness.scheduler.status().planner_inputs_fresh);
+        harness.shutdown().await;
+    }
+
     #[tokio::test]
     async fn real_lcm_future_map_goal_clear_and_owner_shutdown_remain_isolated() {
         use nuwax_nav_runtime::{SchedulerPhase, TerminalOutcome};

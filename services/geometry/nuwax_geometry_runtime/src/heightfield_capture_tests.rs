@@ -462,5 +462,5 @@ fn heightfield_capture_claim_only_withdrawal_keeps_original_legacy_diagnostics()
         .repository()
         .read_object(root.blocks[0].object, nuwax_map_chunks::MAX_BLOCK_BYTES)
         .unwrap();
-    assert!(bytes.starts_with(b"NUWAXBL4"));
+    assert!(bytes.starts_with(b"NUWAXBL5"));
 }

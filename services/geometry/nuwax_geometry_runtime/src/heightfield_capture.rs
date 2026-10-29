@@ -1046,3 +1046,7 @@ fn retain_samples(samples: &mut Vec<LayerSample>, current: &LayerSource) {
 #[cfg(test)]
 #[path = "heightfield_capture_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "heightfield_budget_tests.rs"]
+mod budget_tests;

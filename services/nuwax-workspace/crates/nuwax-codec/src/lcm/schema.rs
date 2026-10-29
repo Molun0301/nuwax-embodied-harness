@@ -594,6 +594,8 @@ pub struct NavigationMap3D {
     pub commit_sequence: i64,
     /// 明确清空三维地图，清空时内部点云必须为空。
     pub cleared: bool,
+    /// 建图地面块提交失败导致的撤销；复用cleared枚举值2，旧读器明确拒绝。
+    pub ground_block_failed: bool,
     /// 同次占据提交中的纯虚拟禁区；不包含二维物理投影。
     pub virtual_obstacles: Option<OccupancyGrid>,
     /// 固定精度完整根；有该字段时不另携带全量云。
@@ -616,11 +618,19 @@ impl Default for NavigationMap3D {
             commit_boot_nonce: [0; 16],
             commit_sequence: 0,
             cleared: false,
+            ground_block_failed: false,
             virtual_obstacles: None,
             fine: None,
             cloud: PointCloud2::default(),
         }
     }
+}
+
+/// 来源撤销的稳定业务原因；普通清空沿用原语义。
+pub fn navigation_map_clear_reason(message: &NavigationMap3D) -> &'static str {
+    if message.ground_block_failed {
+        "mapping_ground_block_write_failed: 建图地面块提交失败，地图来源已撤销"
+    } else { "surface map cleared by mapping owner" }
 }
 
 /// 校验三维导航地图身份、内部云头及有限三维点布局。
@@ -631,6 +641,9 @@ pub fn validate_navigation_map_3d(message: &NavigationMap3D) -> Result<(), Strin
 fn validate_navigation_map_3d_with_root(
     message: &NavigationMap3D,
 ) -> Result<Option<nuwax_map_chunks::Manifest>, String> {
+    if message.ground_block_failed && !message.cleared {
+        return Err("ground block failure requires a cleared NavigationMap3D".into());
+    }
     if message.schema_version != NAVIGATION_MAP_3D_SCHEMA_VERSION {
         return Err("unsupported NavigationMap3D schema_version".into());
     }
@@ -981,7 +994,7 @@ pub fn encode_navigation_map_3d_body(message: &NavigationMap3D) -> CodecResult<V
     out.extend_from_slice(&message.source_voxel_size.to_be_bytes());
     out.extend_from_slice(&message.commit_boot_nonce);
     out.extend_from_slice(&message.commit_sequence.to_be_bytes());
-    out.push(u8::from(message.cleared));
+    out.push(if message.ground_block_failed { 2 } else { u8::from(message.cleared) });
     out.push(u8::from(message.virtual_obstacles.is_some()));
     out.extend_from_slice(&encode_occupancy_grid_body(
         message
@@ -1048,12 +1061,13 @@ pub fn decode_navigation_map_3d_body_with_root(
         .try_into()
         .expect("16字节点云提交进程标识");
     let commit_sequence = cursor.read_i64()?;
-    let cleared = match cursor.read_u8()? {
-        0 => false,
-        1 => true,
+    let (cleared, ground_block_failed) = match cursor.read_u8()? {
+        0 => (false, false),
+        1 => (true, false),
+        2 => (true, true),
         _ => {
             return Err(CodecError::LcmDecode(
-                "NavigationMap3D cleared must be 0 or 1".into(),
+                "NavigationMap3D cleared must be 0, 1 or 2".into(),
             ))
         }
     };
@@ -1110,6 +1124,7 @@ pub fn decode_navigation_map_3d_body_with_root(
         commit_boot_nonce,
         commit_sequence,
         cleared,
+        ground_block_failed,
         virtual_obstacles,
         fine,
         cloud,
@@ -2964,6 +2979,19 @@ mod navigation_map_3d_tests {
         let mut clear = cleared_map();
         clear.virtual_obstacles = message.virtual_obstacles;
         assert!(validate_navigation_map_3d(&clear).is_err());
+    }
+
+    #[test]
+    fn ground_block_failure_roundtrips_as_an_explicit_clear_and_rejects_live_geometry() {
+        let mut message = cleared_map();
+        message.ground_block_failed = true;
+        let bytes = encode_navigation_map_3d(&message).unwrap();
+        assert_eq!(decode_navigation_map_3d(&bytes).unwrap(), message);
+        assert!(navigation_map_clear_reason(&message).contains("mapping_ground_block_write_failed"));
+        message.cleared = false;
+        assert!(encode_navigation_map_3d(&message).is_err());
+        let mut live = live_map(); live.ground_block_failed = true;
+        assert!(encode_navigation_map_3d(&live).is_err());
     }
 
     #[test]

@@ -9,7 +9,18 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from services.geometry.fine_map_archive import read_fine_archive_root, validate_fine_archive
+from services.geometry.fine_map_archive import read_fine_archive_root, validate_fine_archive, _heightfield_samples
+from services.geometry.fine_ground_binary import decode_ground_binary
+
+
+def decode_records(body, end):
+    if body[:8] == b"NUWAXBL5":
+        def integer(value, low, high):
+            if type(value) is not int or not low <= value <= high:
+                raise ValueError("测试样本整数越界")
+            return value
+        return decode_ground_binary(body[end:], json.loads, lambda value: _heightfield_samples(value, integer))
+    return json.loads(body[end:])
 
 
 class DetachedLegacyArchiveCodecTests(unittest.TestCase):
@@ -38,7 +49,7 @@ class DetachedLegacyArchiveCodecTests(unittest.TestCase):
         evidence = {local: (stamp, hits)
                     for local, stamp, hits in struct.iter_unpack("<HQH", body[16:end])}
         self.assertEqual(len(evidence), points)
-        ground = json.loads(body[end:])
+        ground = decode_records(body, end)
         return magic, root, body[:8], evidence, ground
 
     def test_real_rust_claim_withdrawal_keeps_original_sample_and_occupancy(self):
@@ -49,7 +60,7 @@ class DetachedLegacyArchiveCodecTests(unittest.TestCase):
         self.assertEqual(validate_fine_archive(before_bytes, session="heightfield-storage"), before[1])
         self.assertEqual(validate_fine_archive(after_bytes, session="heightfield-storage"), after[1])
         self.assertEqual((before[0], before[2]), (b"NUWAXAR4", b"NUWAXBL3"))
-        self.assertEqual((after[0], after[2]), (b"NUWAXAR5", b"NUWAXBL4"))
+        self.assertEqual((after[0], after[2]), (b"NUWAXAR5", b"NUWAXBL5"))
         self.assertEqual(before[3], {0: (10, 1), 1024: (20, 1)})
         self.assertEqual(after[3], before[3])
         self.assertEqual(before[4][0][1]["members"], [0, 1024])
@@ -77,7 +88,7 @@ class DetachedLegacyArchiveCodecTests(unittest.TestCase):
     def test_real_rust_mutations_reject_unproven_sample_evidence(self):
         good_bytes = self._rust_artifact("h3-detached-legacy.ar5")
         _, good_root, good_magic, good_evidence, good_ground = self._single_block(good_bytes)
-        self.assertEqual(good_magic, b"NUWAXBL4")
+        self.assertEqual(good_magic, b"NUWAXBL5")
         validate_fine_archive(good_bytes, session="heightfield-storage")
         q = struct.unpack("<f", struct.pack("<f", good_root["voxel_size_m"]))[0]
         cases = ("future-sample", "occupied-wrong-voxel", "missing-voxel",
@@ -137,11 +148,11 @@ class DetachedLegacyArchiveCodecTests(unittest.TestCase):
             offset += length
         self.assertEqual(offset, len(payload))
         self.assertEqual(sum(ref["points"] for ref in root["blocks"]), 4)
-        marked = [i for i, block in enumerate(blocks) if block[:8] == b"NUWAXBL4"]
+        marked = [i for i, block in enumerate(blocks) if block[:8] == b"NUWAXBL5"]
         self.assertEqual(marked, [0])
         body = blocks[0]
         end = 16 + root["blocks"][0]["points"] * 12
-        record = json.loads(body[end:])
+        record = decode_records(body, end)
         self.assertEqual(record, [[0, {"representation": "classified_empty_column", "data": {}}]])
         root_bytes = json.dumps(root, separators=(",", ":")).encode()
         for variant in ("unknown", "extra", "no_occupancy", "outside_xy"):
@@ -155,7 +166,7 @@ class DetachedLegacyArchiveCodecTests(unittest.TestCase):
             else:
                 edited[0][0] = 1024
             tail = json.dumps(edited, separators=(",", ":")).encode()
-            changed = body[:12] + struct.pack("<I", len(tail)) + body[16:end] + tail
+            changed = b"NUWAXBL4" + body[8:12] + struct.pack("<I", len(tail)) + body[16:end] + tail
             values = [changed] + blocks[1:]
             bad = (magic + struct.pack("<Q", len(root_bytes)) + root_bytes
                    + struct.pack("<Q", len(values))

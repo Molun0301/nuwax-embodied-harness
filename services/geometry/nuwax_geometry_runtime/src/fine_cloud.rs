@@ -118,6 +118,9 @@ impl FineCloud {
     #[cfg(test)]
     pub(super) fn last_revoke_ms(&self) -> f64 { self.last_revoke_ms }
     pub(super) fn voxel_size(&self) -> f32 { self.writer.voxel_size_m() }
+    #[cfg(test)]
+    pub(super) fn stage_oversized_block(&mut self, stamp: u64) { budget_fixture::stage(self, stamp); }
+    pub(super) fn block_write_failure(&self) -> Option<&nuwax_map_chunks::BlockWriteFailure> { self.writer.block_write_failure() }
     pub(super) fn is_dynamic(&self, point: &Point3<f64>) -> bool {
         self.dynamic.is_dynamic([point.x, point.y, point.z])
     }
@@ -1042,3 +1045,7 @@ mod ground_deletion_qualification;
 #[cfg(test)]
 #[path = "heightfield_consumer_controls.rs"]
 mod heightfield_consumer_controls;
+
+#[cfg(test)]
+#[path = "ground_budget_fixture.rs"]
+mod budget_fixture;

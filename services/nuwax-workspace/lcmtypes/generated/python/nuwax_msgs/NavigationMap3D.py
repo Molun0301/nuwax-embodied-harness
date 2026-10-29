@@ -62,7 +62,7 @@ class NavigationMap3D(object):
         """ LCM Type: int64_t """
         self.cleared = 0
         """
-        0为生效地图，1为显式清空。
+        0为生效地图，1为显式清空，2为建图地面块提交失败后的来源撤销。
         LCM Type: int8_t
         """
 

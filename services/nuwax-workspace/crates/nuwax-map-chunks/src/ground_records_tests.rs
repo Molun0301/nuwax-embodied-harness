@@ -286,7 +286,7 @@ fn heightfield_cross_block_writer_receiver_archive_restore_exact_members() {
     let mut receiver = Receiver::new(Repository::temporary().unwrap());
     let pinned = receive(&mut receiver,&root,w.repository()).unwrap();
     assert_eq!(assembled(&mut receiver,&pinned,xy),value);
-    assert!(root.blocks.iter().all(|r| w.repository().read_object(r.object,MAX_BLOCK_BYTES).unwrap().starts_with(b"NUWAXBL4")));
+    assert!(root.blocks.iter().all(|r| w.repository().read_object(r.object,MAX_BLOCK_BYTES).unwrap().starts_with(b"NUWAXBL5")));
     let bytes = archive_bytes(&root,w.repository()); assert!(bytes.starts_with(b"NUWAXAR5")); artifact("cross-block.ar5",&bytes);
     let repo = Repository::temporary().unwrap(); let path = repo.path().to_path_buf();
     let restored = ArchiveReader::open(Cursor::new(bytes)).unwrap().import(&repo).unwrap();
@@ -542,7 +542,7 @@ fn h3_legacy_claim_withdrawal_retains_original_sample_across_storage() {
     let old_bytes = f.writer.repository().read_object(f.before.blocks[0].object, MAX_BLOCK_BYTES).unwrap();
     let new_bytes = f.writer.repository().read_object(f.after.blocks[0].object, MAX_BLOCK_BYTES).unwrap();
     assert!(old_bytes.starts_with(b"NUWAXBL3"));
-    assert!(new_bytes.starts_with(b"NUWAXBL4"), "pure Legacy must not compact into invalid BL3");
+    assert!(new_bytes.starts_with(b"NUWAXBL5"), "pure Legacy must not compact into invalid BL3");
     let (old_block, _) = decode_block_parts(&old_bytes).unwrap();
     let (block, records) = decode_block_parts(&new_bytes).unwrap();
     assert_eq!(block, old_block); // Includes original observed_ns and hit counts.

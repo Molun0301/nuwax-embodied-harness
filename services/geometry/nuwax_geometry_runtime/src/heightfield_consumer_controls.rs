@@ -120,7 +120,7 @@ fn message(root:&SealedMap) -> schema::NavigationMap3D {
         map_frame_generation:manifest.domain.frame_generation as i64,
         cloud_revision:revision,cloud_occupancy_revision:revision,source_timestamp_ns:stamp,
         source_voxel_size:manifest.voxel_size_m,commit_boot_nonce:[0x63;16],commit_sequence:revision,
-        cleared:false,virtual_obstacles:None,
+        cleared:false,ground_block_failed:false,virtual_obstacles:None,
         fine:Some(transfer),
         cloud:schema::PointCloud2 {
             header:schema::Header {seq:revision as i32,stamp_sec:(stamp/1_000_000_000) as i32,

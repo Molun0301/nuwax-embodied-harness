@@ -170,7 +170,7 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
             raise ValueError("精细地图同一对象身份的实际字节不一致")
         offset += length
         sourced = version >= 4 and block[:8] == b"NUWAXBL3"
-        versioned = version >= 5 and block[:8] == b"NUWAXBL4"
+        versioned = version >= 5 and block[:8] in (b"NUWAXBL4", b"NUWAXBL5")
         layered = (version >= 3 and block[:8] == b"NUWAXBL2") or sourced or versioned
         layer_length = struct.unpack("<I", block[12:16])[0]
         if (block[:8] != b"NUWAXBL1" and not layered
@@ -186,7 +186,13 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
         else:
             _validate_vector_block_evidence(block, points, source_time)
         if layered:
-            layers = json.loads(block[records_end:], object_pairs_hook=_unique_json_fields, parse_constant=_reject_nonfinite_json)
+            if block[:8] == b"NUWAXBL5":
+                from services.geometry.fine_ground_binary import decode_ground_binary
+                layers = decode_ground_binary(block[records_end:],
+                    lambda raw: json.loads(raw, object_pairs_hook=_unique_json_fields, parse_constant=_reject_nonfinite_json),
+                    lambda encoded: _heightfield_samples(encoded, integer))
+            else:
+                layers = json.loads(block[records_end:], object_pairs_hook=_unique_json_fields, parse_constant=_reject_nonfinite_json)
             if versioned:
                 if ground_bindings.setdefault(object_id, (key, size)) != (key, size):
                     raise ValueError("精细地图地表对象空间绑定改变")

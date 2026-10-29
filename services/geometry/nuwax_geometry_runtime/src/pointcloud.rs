@@ -200,6 +200,8 @@ pub struct CloudMapShmWriter {
     pending_dense_readers: Option<DenseCloudReaders>,
     pending_fine_readers: Option<fine_cloud::FineCloudReaders>,
     scan_preparation: Option<uuid::Uuid>,
+    // 已隔离来源的撤销修订与原始原因；旧提交仍可只读，新会话跨过该撤销围栏。
+    source_failure: Option<(u64, String)>,
     dense_error: Option<String>,
     dense_history_missing: bool,
     max_points: usize,
@@ -448,6 +450,7 @@ impl CloudMapShmWriter {
             pending_dense_readers: None,
             pending_fine_readers: None,
             scan_preparation: None,
+            source_failure: None,
             dense_error: None,
             dense_history_missing: false,
             max_points: CM_MAX_POINTS,
@@ -839,6 +842,7 @@ impl CloudMapShmWriter {
 
     /// 移交可变累积状态，公开读者继续使用原提交；计算结果只凭本次票据安装。
     pub(crate) fn prepare_scan_work(&mut self) -> Result<(uuid::Uuid, Self), String> {
+        if let Some((_, reason)) = &self.source_failure { return Err(reason.clone()); }
         if self.scan_preparation.is_some() { return Err("点云已有在途准备".into()); }
         let mut work = Self::new_private().map_err(|e| e.to_string())?;
         let ticket = uuid::Uuid::new_v4();
@@ -861,6 +865,24 @@ impl CloudMapShmWriter {
         work.committed_dense_cloud = self.committed_dense_cloud.clone();
         self.scan_preparation = Some(ticket);
         Ok((ticket, work))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stage_oversized_ground_block(&mut self, stamp: u64) { self.fine_cloud.as_mut().unwrap().stage_oversized_block(stamp); }
+    pub(crate) fn block_write_failure(&self) -> Option<&nuwax_map_chunks::BlockWriteFailure> {
+        self.fine_cloud.as_ref().and_then(FineCloud::block_write_failure)
+    }
+    pub(crate) fn source_failure(&self) -> Option<(u64, &str)> {
+        self.source_failure.as_ref().map(|(revision, reason)| (*revision, reason.as_str()))
+    }
+    /// 只接回失败前未发布的工作状态；原根、共享内存与观测时间不变。
+    pub(crate) fn retain_failed_scan_work(&mut self, ticket: uuid::Uuid, work: Self, reason: String) -> Result<(), String> {
+        if work.revision != self.revision { return Err("failed scan unexpectedly published a revision".into()); }
+        let fence = self.revision.checked_add(1).filter(|v| *v <= i32::MAX as u64)
+            .ok_or("source failure cloud fence exhausted")?;
+        self.install_scan_work(ticket, work)?;
+        self.source_failure = Some((fence, reason));
+        Ok(())
     }
 
     pub(crate) fn install_scan_work(&mut self, ticket: uuid::Uuid, mut work: Self) -> Result<(), String> {
@@ -1260,6 +1282,7 @@ impl CloudMapShmWriter {
     }
 
     fn prepare_publication(&self, allow_empty: bool, revision_floor: u64) -> Option<u64> {
+        if self.source_failure.is_some() { return None; }
         if self.session_generation == 0 || (!allow_empty && self.voxels.is_empty()) { return None; }
         if self.voxels.len() > self.max_points || self.voxels.len() > CM_MAX_POINTS { return None; }
         let revision = self.revision.max(revision_floor).checked_add(1)?;
@@ -1345,6 +1368,7 @@ impl CloudMapShmWriter {
     }
 
     fn reset_accumulator(&mut self, session_generation: u64) {
+        if let Some((fence, _)) = self.source_failure.take() { self.revision = self.revision.max(fence); }
         self.committed_snapshot_cache.take();
         self.publication_receipt = None;
         self.scan_preparation = None;

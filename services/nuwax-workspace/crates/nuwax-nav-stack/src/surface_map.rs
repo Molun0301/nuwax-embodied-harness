@@ -345,7 +345,7 @@ impl SurfaceMapCache {
         schema::validate_navigation_map_3d(message)?;
         if message.cleared {
             self.reset();
-            return Err("surface map cleared by mapping owner".into());
+            return Err(schema::navigation_map_clear_reason(message).into());
         }
         if message.committed_map.frame_id != self.config.world_frame {
             return Err("surface map frame differs from configured map frame".into());

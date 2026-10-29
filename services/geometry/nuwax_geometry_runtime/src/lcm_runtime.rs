@@ -2966,6 +2966,7 @@ async fn geometry_runtime_retained_tasks_settle_before_mapping_and_shm_cleanup()
                 Some(&task_control),
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -9113,6 +9114,7 @@ async fn ingest_mapping_points_with_backend(
     task_control: Option<&GeometryRuntimeTaskControl>,
     sensor_origin_map: Option<[f64; 3]>,
     accepted_cloud: Option<crate::admitted_cloud::AcceptedMappingCloud>,
+    failure_notifier: Option<GeometryRuntimeHandle>,
 ) -> Result<MappingIngestCommit, nuwax_mapping::SessionError> {
     let owned_mapping = mapping.clone();
     let owned_lifecycle_lock = lifecycle_lock.clone();
@@ -9127,7 +9129,7 @@ async fn ingest_mapping_points_with_backend(
     let target_frame_id = mapping.lock().configured_map_frame_id().to_owned();
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let task = async move {
-        let result = ingest_mapping_points_with_backend_owned(
+        let mut result = ingest_mapping_points_with_backend_owned(
             &owned_mapping,
             &owned_lifecycle_lock,
             &owned_explore_projection_gate,
@@ -9148,10 +9150,21 @@ async fn ingest_mapping_points_with_backend(
             accepted_cloud,
         )
         .await;
-        let terminal = result
-            .as_ref()
-            .map(|_| ())
-            .map_err(|error| error.to_string());
+        if let Err(nuwax_mapping::SessionError::MapSourceUnavailable { session_generation, .. }) = &result {
+            if let Some(handle) = failure_notifier {
+                if let Err(reason) = mapping_source_failure::notify(&handle, *session_generation).await {
+                    result = Err(nuwax_mapping::SessionError::FrameTransformUnavailable {
+                        source_frame_id: owned_frame_id.clone(), target_frame_id: owned_frame_id.clone(),
+                        reason: format!("mapping source revocation failed: {reason}"),
+                    });
+                }
+            }
+        }
+        // 仅已完成安全隔离的数据失败属于业务结果；所有权/退休/通知故障仍交根监督。
+        let terminal = match &result {
+            Ok(_) | Err(nuwax_mapping::SessionError::MapSourceUnavailable { .. }) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        };
         let _ = result_tx.send(result);
         terminal
     };
@@ -9456,8 +9469,21 @@ async fn ingest_mapping_points_with_backend_owned(
                     (Some(epoch), Some(mode)) => { let value = mode.snapshot(); !value.active && value.epoch == epoch }
                     _ => true,
                 };
+            let mut isolated_block_failure = None;
             let (outcome, acceptance) = match prepared {
-                Ok((outcome, work, acceptance)) => {
+                Ok((outcome, mut work, mut acceptance)) => {
+                    if acceptance.is_err() && still_current {
+                        if let Some(reason) = work.as_ref().and_then(|(_, work)| work.block_write_failure()).map(|failure| failure.reason.clone()) {
+                            let (ticket, failed_work) = work.take().unwrap();
+                            let retained = cloud_map_writer.lock().as_mut()
+                                .ok_or_else(|| "point-cloud writer disappeared while retaining failed scan".to_owned())
+                                .and_then(|writer| writer.retain_failed_scan_work(ticket, failed_work, reason.clone()));
+                            match retained {
+                                Ok(()) => isolated_block_failure = Some(current_session.session_generation),
+                                Err(error) => acceptance = Err(format!("{reason}; failed scan retention failed: {error}")),
+                            }
+                        }
+                    }
                     let acceptance = acceptance.and_then(|cloud_commit| {
                         if !still_current {
                             return Err("point-cloud preparation crossed mapping session or relocalization mode".into());
@@ -9481,11 +9507,18 @@ async fn ingest_mapping_points_with_backend_owned(
                 let mut reasons = Vec::new();
                 if let Err(error) = acceptance { reasons.push(error); }
                 if let Err(error) = resolved {
+                    isolated_block_failure = None;
                     reasons.push(format!("mapping backend completion resolution failed: {error}"));
                 }
-                let reason = reasons.join("; ");
-                let retirement = adapter.stop_session_detached(&token.session_id).ok().and_then(|v| v.retirement);
-                Err((target_frame_id, reason, retirement))
+                let retirement = match adapter.stop_session_detached(&token.session_id) {
+                    Ok(transition) => transition.retirement,
+                    Err(error) => {
+                        isolated_block_failure = None;
+                        reasons.push(format!("mapping backend stop failed: {error}"));
+                        None
+                    }
+                };
+                Err((target_frame_id, reasons.join("; "), retirement, isolated_block_failure))
             }
         }
         Ok(None) => {
@@ -9504,17 +9537,20 @@ async fn ingest_mapping_points_with_backend_owned(
         Err(reason) => {
             let retirement = mapping.lock().stop_session_detached(&token.session_id).ok().and_then(|v| v.retirement);
             drop(lifecycle_guard);
-            Err((target_frame_id, reason, retirement))
+            Err((target_frame_id, reason, retirement, None))
         }
     };
     let mut commit_result = commit_result;
-    if commit_result.as_ref().is_err_and(|(_, _, retirement)| retirement.is_some()) {
+    if commit_result.as_ref().is_err_and(|(_, _, retirement, isolated)| retirement.is_some() || isolated.is_some()) {
         let _lifecycle_guard = lifecycle_lock.lock().await;
         projection_guard.pending_latest = None;
         if let Err(error) = GeometryRuntimeHandle::revoke_committed_map_projection_parts_locked(
             committed_map_authority, map_revision_latest_tx,
         ) {
-            if let Err((_, reason, _)) = &mut commit_result { *reason = format!("{reason}; authority revoke failed: {error}"); }
+            if let Err((_, reason, _, isolated)) = &mut commit_result {
+                *isolated = None;
+                *reason = format!("{reason}; authority revoke failed: {error}");
+            }
         }
     }
     drop(projection_guard);
@@ -9525,7 +9561,7 @@ async fn ingest_mapping_points_with_backend_owned(
         "几何提交阶段耗时");
     match commit_result {
         Ok(commit) => Ok(commit),
-        Err((target_frame_id, reason, retirement)) => {
+        Err((target_frame_id, reason, retirement, isolated)) => {
             finish_mapping_ingest_failure(
                 mapping,
                 lifecycle_lock,
@@ -9533,6 +9569,7 @@ async fn ingest_mapping_points_with_backend_owned(
                 target_frame_id,
                 reason,
                 retirement,
+                isolated,
             )
             .await
         }
@@ -9546,9 +9583,12 @@ async fn finish_mapping_ingest_failure(
     target_frame_id: String,
     mut reason: String,
     retirement: Option<crate::mapping_adapter::MappingBackendRetirement>,
+    isolated: Option<u64>,
 ) -> Result<MappingIngestCommit, nuwax_mapping::SessionError> {
     if let Err(error) = finish_backend_retirement(mapping, lifecycle_lock, retirement).await {
         reason = format!("{reason}; retirement failed: {error}");
+    } else if let Some(session_generation) = isolated {
+        return Err(nuwax_mapping::SessionError::MapSourceUnavailable { session_generation, reason });
     }
     Err(nuwax_mapping::SessionError::FrameTransformUnavailable {
         source_frame_id: frame_id.to_owned(),
@@ -10225,6 +10265,7 @@ fn build_navigation_map_3d_publication_frame_with_baseline(
         commit_boot_nonce: metadata.commit_boot_nonce,
         commit_sequence: metadata.commit_sequence,
         cleared: publication.receipt.is_none(),
+        ground_block_failed: false,
         virtual_obstacles: metadata.virtual_obstacles.as_ref().map(|mask| schema::OccupancyGrid {
             header: mask.header.clone(), info: mask.info.clone(), data: mask_data,
         }),
@@ -10674,6 +10715,7 @@ fn latest_canonical_cloud_publication(
     let Some(writer) = guard.as_ref() else {
         return Ok(None);
     };
+    if writer.source_failure().is_some() { return Ok(None); }
     let publish_state = writer.typed_publish_state();
     let Some(snapshot) = writer.committed_metadata() else {
         return Ok(None);
@@ -12187,6 +12229,7 @@ async fn commit_registered_lio_cloud_inner(
         handle.task_control.as_ref(),
         sensor_origin_map,
         accepted_cloud,
+        Some(handle.clone()),
     )
     .await
     .map_err(|error| error.to_string())?;
@@ -12405,6 +12448,7 @@ fn spawn_mapping_feed_tasks(
                 parsed.timestamp_ns,
                 &state_lidar,
                 MappingCloudSource::Legacy,
+                None,
                 None,
                 None,
                 None,
@@ -13756,6 +13800,8 @@ pub(crate) mod mapping_feed_tests {
             .expect("active mapping test session");
         adapter
     }
+
+    include!("mapping_block_failure_tests.rs");
 
     fn shared_active_mapping_adapter() -> Arc<parking_lot::Mutex<MappingAdapter>> {
         Arc::new(parking_lot::Mutex::new(active_mapping_adapter()))
@@ -15416,6 +15462,7 @@ pub(crate) mod mapping_feed_tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
             })
@@ -15490,6 +15537,7 @@ pub(crate) mod mapping_feed_tests {
                     None,
                     Some(expected_epoch),
                     Some(mode),
+                    None,
                     None,
                     None,
                     None,
@@ -20264,6 +20312,7 @@ pub(crate) mod mapping_feed_tests {
                 100,
                 &state,
                 MappingCloudSource::Legacy,
+                None,
                 None,
                 None,
                 None,
@@ -25988,3 +26037,6 @@ fn scheme_a_unlisted_codes_and_text_do_not_create_retry_or_stage_proof() {
         exploration_channels_round_trip_over_real_lcm("robot/map").await;
     }
 }
+
+#[path = "mapping_source_failure.rs"]
+mod mapping_source_failure;

@@ -8,7 +8,7 @@ use std::sync::Arc;
 mod repository;
 pub use repository::{ObjectRangeRead, Repository, RegionReader};
 mod writer;
-pub use writer::{CachePolicy, Writer};
+pub use writer::{BlockWriteFailure, CachePolicy, Writer};
 /// Observation moments reused by the capture owner and bounded layer records.
 pub mod surface_statistics;
 /// Column-local height statistics; capture/storage integration is a separate step.
@@ -16,6 +16,9 @@ pub mod heightfield_observations;
 mod terrain_observations;
 pub use terrain_observations::{LayerObservation, LayerObservations, LayerSample, LayerSource, SourceWatermark, MAX_LAYER_SAMPLES, MAX_LAYERS_PER_BLOCK, MAX_LAYER_MEMBERS, layer_geometry_eq};
 mod ground_records;
+mod ground_binary;
+#[cfg(test)]
+mod ground_binary_tests;
 pub use ground_records::{ColumnGroundRecords, GroundRecord, GroundRecordRef, GroundRecords, HeightfieldFragment, HeightfieldSurface};
 mod archive;
 pub use archive::{archive_file, ArchiveReader, ArchivedRoot, LegacyRoot, MAX_ARCHIVE_BYTES};
@@ -69,7 +72,11 @@ pub fn decode_block(bytes: &[u8]) -> Result<Block, String> {
 fn decode_block_parts(bytes: &[u8]) -> Result<(Block, GroundRecords), String> {
     let mut block = Block::new();
     visit_block_records(bytes, |key, evidence| { block.insert(key, evidence); })?;
-    let layers = if bytes.starts_with(b"NUWAXBL4") {
+    let layers = if bytes.starts_with(b"NUWAXBL5") {
+        let records = ground_binary::decode(&bytes[16 + block.len() * 12..])?;
+        ground_records::validate_records(&records, &block)?;
+        records
+    } else if bytes.starts_with(b"NUWAXBL4") {
         let start = 16 + block.len() * 12;
         let entries: Vec<(u16, GroundRecord)> = serde_json::from_slice(&bytes[start..]).map_err(|e| e.to_string())?;
         if entries.is_empty() || entries.windows(2).any(|w| w[0].0 >= w[1].0) { return Err("invalid ground record anchors".into()); }
@@ -110,13 +117,8 @@ pub fn encode_ground_block(block: &Block, records: &GroundRecords) -> Result<Vec
         GroundRecords::Legacy(v) => encode_layer_block(block, v),
         GroundRecords::Versioned(v) => {
             ground_records::validate_records(records, block)?;
-            let mut bytes = encode_block(block)?;
-            if v.is_empty() { return Ok(bytes); }
-            let json = serde_json::to_vec(&v.iter().collect::<Vec<_>>()).map_err(|e| e.to_string())?;
-            if bytes.len() + json.len() > MAX_BLOCK_BYTES { return Err("ground block exceeds byte budget".into()); }
-            bytes[..8].copy_from_slice(b"NUWAXBL4");
-            bytes[12..16].copy_from_slice(&(json.len() as u32).to_le_bytes());
-            bytes.extend(json); Ok(bytes)
+            if v.is_empty() { return encode_block(block); }
+            ground_binary::encode(block, v)
         }
     }
 }
@@ -150,7 +152,7 @@ fn read_layers(bytes: &[u8], block: &Block) -> Result<LayerObservations, String>
     Ok(layers)
 }
 fn visit_block(bytes: &[u8], mut visit: impl FnMut(u16, Evidence)) -> Result<u32, String> {
-    if bytes.starts_with(b"NUWAXBL2") || bytes.starts_with(b"NUWAXBL3") || bytes.starts_with(b"NUWAXBL4") {
+    if bytes.starts_with(b"NUWAXBL2") || bytes.starts_with(b"NUWAXBL3") || bytes.starts_with(b"NUWAXBL4") || bytes.starts_with(b"NUWAXBL5") {
         let (block, _) = decode_block_parts(bytes)?;
         for (&key, &evidence) in &block { visit(key, evidence); }
         Ok(block.len() as u32)
@@ -160,7 +162,7 @@ fn visit_block_records(bytes: &[u8], mut visit: impl FnMut(u16, Evidence)) -> Re
     if bytes.len() < 16 || bytes.len() > MAX_BLOCK_BYTES { return Err("精细块格式或长度无效".into()); }
     let layer_bytes = match &bytes[..8] {
         b"NUWAXBL1" if bytes[12..16] == [0; 4] => 0,
-        b"NUWAXBL2" | b"NUWAXBL3" | b"NUWAXBL4" => u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize,
+        b"NUWAXBL2" | b"NUWAXBL3" | b"NUWAXBL4" | b"NUWAXBL5" => u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize,
         _ => return Err("精细块格式或长度无效".into()),
     };
     let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
@@ -337,8 +339,9 @@ fn intrinsic(block: &Block) -> Intrinsic {
     Intrinsic { layered: false, sourced: false, versioned: false, points: block.len() as u32, latest: block.values().map(|e| e.observed_ns).max().unwrap_or(0) }
 }
 fn intrinsic_bytes(bytes: &[u8], block: &Block) -> Intrinsic {
-    Intrinsic { layered: bytes.starts_with(b"NUWAXBL2") || bytes.starts_with(b"NUWAXBL3") || bytes.starts_with(b"NUWAXBL4"),
-        sourced: bytes.starts_with(b"NUWAXBL3") || bytes.starts_with(b"NUWAXBL4"), versioned: bytes.starts_with(b"NUWAXBL4"), ..intrinsic(block) }
+    let versioned = bytes.starts_with(b"NUWAXBL4") || bytes.starts_with(b"NUWAXBL5");
+    Intrinsic { layered: bytes.starts_with(b"NUWAXBL2") || bytes.starts_with(b"NUWAXBL3") || versioned,
+        sourced: bytes.starts_with(b"NUWAXBL3") || versioned, versioned, ..intrinsic(block) }
 }
 fn admit_format(info: Intrinsic, root: &Manifest) -> Result<(), String> {
     if info.versioned && root.version < 5 { Err("heightfield block requires root version 5".into()) }

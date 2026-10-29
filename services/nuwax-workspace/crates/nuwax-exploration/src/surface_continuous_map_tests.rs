@@ -298,3 +298,67 @@ fn changed_queries_rotate_unfinished_work_without_committing_old_absence() {
         "新查询须轮转工作顺序，不能永久重做第一批"
     );
 }
+
+#[test]
+fn failed_navigation_keeps_unfinished_search_order_across_changed_maps() {
+    let points: Vec<_> = (0..120)
+        .flat_map(|x| (0..100).map(move |y| ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, 0.0)))
+        .collect();
+    let floor = SurfaceSnapshot::from_points(&points, map().config().clone(), 0.1).unwrap();
+    let receiver = SurfaceInputReceiver::new();
+    receiver.observe(Arc::new(floor.clone())).unwrap();
+    let mut adapter = source(receiver.clone(), 1);
+    let mut pose = state(0.3, 1);
+    pose.robot_pose.pose.position.x = 1.55;
+    pose.robot_pose.pose.position.y = 1.55;
+    let selected = goal(adapter.poll_goal(&pose).unwrap());
+    adapter.report_goal_feedback(&selected.id,
+        ExplorationGoalFeedback::Failed("已核验停车的导航失败".into())).unwrap();
+    let retry = adapter.retry_support.expect("真实失败反馈应保留一次重试资格");
+    let checkpoint = adapter.checkpoint().unwrap();
+    // 新图把原实际站位围住，剩余前沿只能分批判定；远处更新不能反复重做第一批。
+    let mut mask = vec![false; 160 * 140];
+    for y in 0..140 {
+        for x in 0..160 {
+            if ((x == 29 || x == 41) && (29..=41).contains(&y))
+                || ((y == 29 || y == 41) && (29..=41).contains(&x)) {
+                mask[y * 160 + x] = true;
+            }
+        }
+    }
+    let blocked = floor.with_virtual_obstacles([-2., -2.], 0.1, 160, 140, &mask).unwrap();
+    assert!(blocked.frontier_candidates(&[]).unwrap().len() > MAX_FRONTIER_CANDIDATE_EVALUATIONS);
+    let mut next_offset = 0;
+    for sequence in 2..=4 {
+        receiver.observe(Arc::new(blocked.with_recent_obstacle_points(sequence, sequence, 0,
+            &[], [(0, [50. + sequence as f64, 50., 0.3])]).unwrap())).unwrap();
+        let planning = receiver.freeze().unwrap().fork_for_planning().with_revalidation_advice();
+        let prepared = adapter.prepare_poll_with_planning_input(&pose, &planning).unwrap();
+        assert_eq!(prepared.outcome().as_ref().unwrap(), &ExplorationPoll::Pending);
+        let continuation = adapter.prepared_poll.as_ref().unwrap().delta.deferred_route
+            .as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(continuation.rotation_offset, next_offset,
+            "导航失败重试也应从上一批尚未查询项开始，不能因重试资格重置搜索顺序");
+        next_offset = continuation.rotation_offset + continuation.resume_cursor;
+        assert!(continuation.resume_cursor > 0);
+        adapter.discard_prepared_poll().unwrap();
+        assert_eq!(adapter.checkpoint().unwrap(), checkpoint, "撤销不得增加失败或提交旧无前沿结论");
+        assert_eq!(adapter.retry_support, Some(retry));
+        assert!(adapter.selected.is_none());
+    }
+    // 新图停止变化后，仍须把这一幅当前图完整检查到无前沿；旧批次不能拼成结论。
+    let planning = receiver.freeze().unwrap().fork_for_planning().with_revalidation_advice();
+    let maximum_batches = blocked.frontier_candidates(&[]).unwrap().len()
+        .div_ceil(MAX_FRONTIER_ROUTE_QUERIES - 1) + 2;
+    let mut exhausted = false;
+    for _ in 0..maximum_batches {
+        adapter.prepare_poll_with_planning_input(&pose, &planning).unwrap();
+        match adapter.commit_prepared_poll().unwrap() {
+            ExplorationPoll::NoFrontier => { exhausted = true; break; }
+            ExplorationPoll::Pending => {}
+            other => panic!("封闭站位不应产生可执行路线：{other:?}"),
+        }
+    }
+    assert!(exhausted, "当前输入完整处理后必须自然耗尽，不能继续空转");
+    assert_eq!(adapter.history[0].failures, 1, "规划不可达不能冒充又一次子导航失败");
+}

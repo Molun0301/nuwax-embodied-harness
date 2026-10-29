@@ -5,6 +5,7 @@
 #include <author_diagnostics.h>
 #include <author_parameters.h>
 #include <business_constraint_mask.h>
+#include <surface_obstacle_layer.h>
 #include <scan_native.h>
 #include <cstring>
 #include <cstdlib>
@@ -23,6 +24,7 @@ struct AuthorSession {
  std::unique_ptr<scan_planner::SCANReplanFSM> fsm;
  scan_planner::AuthorController controller;
  scan_planner::AuthorOverlapEscape escape;
+ std::shared_ptr<SurfaceObstacleLayer> surface;
  geometry_msgs::Twist raw_command;
  std::vector<double> reference;
  RegisteredFrame frame;bool has_frame=false,static_fixture=false,static_imported=false;
@@ -75,6 +77,7 @@ struct AuthorSession {
  void initialize(const ScanConfig& c) {
   // 地图或实体几何重建后，旧格索引和退出轴不再具有同一身份。
   escape=scan_planner::AuthorOverlapEscape{};
+  surface.reset();
   config=c;auto params=scan_planner::authorParameters(c);
   fsm=std::make_unique<scan_planner::SCANReplanFSM>();fsm->init(params);
   controller=scan_planner::AuthorController{};
@@ -103,6 +106,7 @@ extern "C" int nuwax_scan_session_plan(void* raw,SCAN_ARGUMENTS) {
   const auto& c=*config;const Vector3d position=Eigen::Map<const Vector3d>(start_position);
   auto map=s.fsm->manager().grid_map_;
   if(s.static_fixture) {
+   map->setSurfaceCollisionQuery({});
    std::vector<Vector3d> occupied;occupied.reserve(obstacle_count+ground_count);
    for(size_t i=0;i<obstacle_count;++i)occupied.emplace_back(Eigen::Map<const Vector3d>(obstacles+3*i));
    for(size_t i=0;i<ground_count;++i)occupied.emplace_back(Eigen::Map<const Vector3d>(ground+3*i));
@@ -112,6 +116,12 @@ extern "C" int nuwax_scan_session_plan(void* raw,SCAN_ARGUMENTS) {
   } else {
    if(!s.has_frame)throw std::runtime_error("Author A map requires a registered source frame with its paired sensor origin; fused surface snapshot is not a raycast input");
    map->updateOccupancyCallback({});
+   // 真实雷达未看到的已知深度实体仍参加局部查询；相同几何复用，删除随当前表面生效。
+   if(!s.surface||!s.surface->matches(obstacles,obstacle_count,ground,ground_count))
+    s.surface=std::make_shared<SurfaceObstacleLayer>(c,obstacles,obstacle_count,ground,ground_count);
+   map->setSurfaceCollisionQuery([surface=s.surface](const Vector3d& p,double yaw,double padding) {
+    return surface->intersects(p,yaw,padding);
+   });
   }
   std::vector<Eigen::Vector2d> polygon;polygon.reserve(boundary_count);
   for(size_t i=0;i<boundary_count;++i)polygon.emplace_back(boundary[2*i],boundary[2*i+1]);
@@ -132,6 +142,8 @@ extern "C" int nuwax_scan_session_plan(void* raw,SCAN_ARGUMENTS) {
   // 起点必须使用当前实测机体查询；已有曲线的计划时刻不能代替实际位置。
   const int start_occupancy=map->getInflateOccupancy(position,start_yaw);
   if(start_occupancy!=0) {
+   if(!s.static_fixture&&s.surface&&s.surface->intersects(position,start_yaw))
+    throw std::runtime_error("Current body pose intersects the current known surface collision layer");
    if(start_occupancy==1&&reference_count>=2&&!business->rejects(position,start_yaw)) {
     if(!s.escape.active())s.retireExecution();
     s.escape.plan(*map,c,position,start_yaw,start_velocity,start_yaw_rate,odometry_timestamp_ns,*output);

@@ -766,6 +766,34 @@ mod tests {
     }
 
     #[test]
+    fn registered_execution_obeys_current_surface_obstacles_and_raised_ground() {
+        let route = [[0., 0., 0.35], [2., 0., 0.35]];
+        let mut req = request(&route, &[]);
+        let mut planner = Planner::new();
+        // 雷达该方向无命中；另一实测来源给出桌面时，不得依赖雷达盲区继续执行。
+        planner.ingest_registered_frame(&req.config, &[[0., 0., -1.]],
+            [0., 0., 1.], req.start_position, 0).unwrap();
+        assert!(planner.step(&req).is_ok());
+        let table = [[0.05, 0., 0.35]];
+        req.obstacles = &table;
+        req.odometry_timestamp_ns += 100_000_000;
+        let failure = planner.step(&req).expect_err("当前已知深度实体必须阻止原雷达未知区域内的动作");
+        assert!(failure.contains("surface"), "{failure}");
+        planner.reset_execution();
+        req.obstacles = &[];
+        req.ground = &table;
+        req.odometry_timestamp_ns += 100_000_000;
+        assert!(planner.step(&req).is_err(), "高处支撑面同样是下层机体不能穿越的实体");
+        planner.reset_execution();
+        req.ground = &[[0.05, 0., 0.0]];
+        req.odometry_timestamp_ns += 100_000_000;
+        assert!(planner.step(&req).is_ok(), "原地面低于机体碰撞带，旧融合障碍须随新输入撤销；不重放雷达帧");
+        planner.reset();
+        assert!(planner.step(&req).unwrap_err().contains("registered source frame"),
+            "融合层不能伪造必需的注册雷达来源");
+    }
+
+    #[test]
     fn author_rejected_first_frames_do_not_initialize_map_or_replace_valid_frame() {
         let route=[[0.,0.,0.35],[2.,0.,0.35]];
         let req=request(&route,&[]);

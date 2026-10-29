@@ -621,7 +621,9 @@ impl SurfaceGoalSourceAdapter {
         });
         let search_hint = self.search_hint.as_ref().filter(|hint| {
             planning.is_some_and(|input|input.revalidation_advice)
-                && deferred.is_none() && self.retry_support.is_none()
+                // 失败反馈只保留重试优先级，不撤销换图后的未完成搜索顺序。
+                // 提示不携带旧可达结论，下面仍以当前输入重核候选及完整路线。
+                && deferred.is_none()
                 && (hint.candidate.is_some() || hint.source.upgrade().is_none_or(|previous|
                     !previous.same_planning_query_view(source_snapshot)))
         });

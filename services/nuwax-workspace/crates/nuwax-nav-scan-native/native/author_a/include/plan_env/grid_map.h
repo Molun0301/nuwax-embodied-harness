@@ -191,6 +191,8 @@ public:
   }
   using BusinessEnvelopeQuery = std::function<bool(const Eigen::Vector3d&, double, double)>;
   void setBusinessEnvelopeQuery(BusinessEnvelopeQuery query) { business_envelope_query_ = std::move(query); }
+  // 已知融合表面是附加实体约束，不写入雷达概率和未知状态。
+  void setSurfaceCollisionQuery(BusinessEnvelopeQuery query) { surface_collision_query_ = std::move(query); }
 
   // One atomic LiDAR observation: points, sensor pose and body position MUST belong
   // to the same registered frame/correction generation. Identity/freshness checks
@@ -278,6 +280,7 @@ private:
   ros::NodeHandle node_;
   BusinessConstraintQuery business_constraint_query_;
   BusinessEnvelopeQuery business_envelope_query_;
+  BusinessEnvelopeQuery surface_collision_query_;
 
   //
   uniform_real_distribution<double> rand_noise_;
@@ -384,6 +387,7 @@ inline int GridMap::getOccupancy(Eigen::Vector3d pos) {
 
 inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos, double yaw) {
   if (business_constraint_query_ && business_constraint_query_(pos, yaw)) return 1;
+  if (surface_collision_query_ && surface_collision_query_(pos, yaw, 0.)) return 1;
   // Explicit physical calibration adapter. For the author reference convention
   // all offsets are zero and this reduces exactly to the original query.
   const double c = std::cos(yaw), s = std::sin(yaw);
@@ -465,6 +469,8 @@ inline int GridMap::bodyContacts(Eigen::Vector3d pos, double yaw, double padding
   if (contacts) contacts->clear();
   if (business_envelope_query_ ? business_envelope_query_(pos,yaw,padding)
       : business_constraint_query_ && business_constraint_query_(pos,yaw)) return -1;
+  // 独立表面没有原雷达格身份，不能把它纳入浅重叠退出的旧格豁免。
+  if (surface_collision_query_ && surface_collision_query_(pos,yaw,padding)) return -1;
   const double c=std::cos(yaw),s=std::sin(yaw),ac=std::abs(c),as=std::abs(s);
   pos += Eigen::Vector3d(c*mp_.body_center_offset_.x()-s*mp_.body_center_offset_.y(),
       s*mp_.body_center_offset_.x()+c*mp_.body_center_offset_.y(),mp_.body_center_offset_.z());

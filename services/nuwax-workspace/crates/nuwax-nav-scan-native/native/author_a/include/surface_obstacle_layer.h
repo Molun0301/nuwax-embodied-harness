@@ -1,10 +1,12 @@
 #pragma once
 #include <scan_native.h>
+#include <body_collision_cell.h>
 #include <Eigen/Core>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <unordered_map>
+#include <set>
 #include <vector>
 
 // 当前完整表面的已知实体，独立于注册雷达概率图；不生成射线、自由格或来源时效。
@@ -38,7 +40,12 @@ class SurfaceObstacleLayer {
         &&(!ground_count||std::equal(ground_.begin(),ground_.end(),ground));
   }
   bool intersects(const Eigen::Vector3d& reference,double yaw,double padding=0.)const {
+    return contacts(reference,yaw,padding,nullptr,nullptr);
+  }
+  bool contacts(const Eigen::Vector3d& reference,double yaw,double padding,
+      std::vector<BodyCollisionCell>* output,const std::set<BodyCollisionCell>* initial)const {
     if(columns_.empty())return false;
+    bool hit=false;
     const auto& cfg=config_;const double r=cfg.resolution,c=std::cos(yaw),s=std::sin(yaw);
     const double ac=std::abs(c),as=std::abs(s);
     const double x=reference.x()+c*cfg.body_center_x-s*cfg.body_center_y;
@@ -55,9 +62,13 @@ class SurfaceObstacleLayer {
         if(std::abs(dx)>ex+r/2.||std::abs(dy)>ey+r/2.
             ||std::abs(c*dx+s*dy)>hx+r/2.*(ac+as)||std::abs(-s*dx+c*dy)>hy+r/2.*(ac+as))continue;
         for(const auto& band:found->second) {
-          if(band.low==band.high ? band.low>=low&&band.low<high : band.high>low&&band.low<high)return true;
+          if(!(band.low==band.high ? band.low>=low&&band.low<high : band.high>low&&band.low<high))continue;
+          const BodyCollisionCell cell{ix,iy,0,true,band.low,band.high};
+          if(initial&&initial->count(cell))continue;
+          if(!output)return true;
+          output->push_back(cell);hit=true;
         }
       }
-    return false;
+    return hit;
   }
 };

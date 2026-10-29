@@ -338,6 +338,7 @@ mod tests {
     use super::*;
     include!("detour_following_tests.rs");
     include!("command_limit_tests.rs");
+    include!("surface_execution_tests.rs");
     // These component fixtures provide static occupancy, not live sensor frames.
     // One call remains one real FSM tick; no synthetic catch-up ticks are added.
     fn fixture_planner() -> Planner {

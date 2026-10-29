@@ -2761,6 +2761,7 @@ mod tests {
 
     include!("measured_motion_worker_tests.rs");
     include!("registered_frame_worker_tests.rs");
+    include!("surface_update_worker_tests.rs");
     include!("author_cycle_completion_tests.rs");
 
 }

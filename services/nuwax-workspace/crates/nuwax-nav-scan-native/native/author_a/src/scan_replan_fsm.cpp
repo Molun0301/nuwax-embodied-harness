@@ -1,4 +1,5 @@
 #include <author_host.h>
+#include <trajectory_heading.h>
 
 #include <plan_manage/scan_replan_fsm.h>
 #include <cmath>
@@ -794,8 +795,8 @@ namespace scan_planner
         break;
 
       Eigen::Vector3d pos = info->position_traj_.evaluateDeBoorT(t);
-      Eigen::Vector3d pos_next = info->position_traj_.evaluateDeBoorT(std::min(t + time_step, info->duration_));
-      if (map->getInflateOccupancy(pos, estimateYawFromSegment(pos, pos_next)))
+      const double yaw=trajectoryHeading(info->velocity_traj_,info->duration_,t,time_step,getOdomYaw());
+      if (map->getInflateOccupancy(pos, yaw))
       {
         if (planFromCurrentTraj()) // Make a chance
         {

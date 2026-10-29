@@ -1,5 +1,6 @@
 #include <author_host.h>
 #include <author_diagnostics.h>
+#include <trajectory_heading.h>
 // #include <fstream>
 #include <plan_manage/planner_manager.h>
 #include <thread>
@@ -96,7 +97,7 @@ namespace scan_planner
 
     bool buildReferenceControls(const RouteHeightReference& route, const Eigen::Vector3d& start,
         const Eigen::Vector3d& target, int count, double resolution, double max_velocity, double max_acceleration,
-        Eigen::MatrixXd& controls, std::vector<double>& control_arcs)
+        GridMap& map, Eigen::MatrixXd& controls, std::vector<double>& control_arcs)
     {
       struct Anchor { Eigen::Vector3d point; double arc; };
       std::vector<Anchor> input{{start, route.begin_arc}};
@@ -107,7 +108,7 @@ namespace scan_planner
       // 仅简化初始化参考，不修改原点云或完整参考，硬碰撞仍按原实体判定。
       std::vector<char> keep(input.size(), 0);
       keep.front() = keep.back() = 1;
-      std::vector<std::pair<std::size_t, std::size_t>> pending{{0, input.size() - 1}};
+      std::vector<std::pair<std::size_t, std::size_t>> pending{{0,input.size()-1}};
       while (!pending.empty()) {
         const auto [first, last] = pending.back(); pending.pop_back();
         const Eigen::Vector3d delta = input[last].point - input[first].point;
@@ -119,6 +120,29 @@ namespace scan_planner
               ? std::clamp((input[i].point - input[first].point).dot(delta) / length2, 0., 1.) : 0.;
           const double distance = (input[i].point - input[first].point - fraction * delta).squaredNorm();
           if (distance > maximum) { maximum = distance; farthest = i; }
+        }
+        // 亚体素转折也可能提供必要净空。简化捷径若与当前实体相交，保留最偏离
+        // 捷径的原点再分段；空旷段仍沿原容量简化。这里只选初值，完整曲线与命令
+        // 继续经过原碰撞/动态/连续制动门禁，采样未命中不构成运动许可。
+        if (farthest == first && last > first+1) {
+          const double yaw=std::atan2(delta.y(),delta.x());
+          const int steps=std::max(1,static_cast<int>(std::ceil(delta.norm()/(resolution*.25))));
+          for (int j=0;j<=steps;++j) {
+            const double fraction=double(j)/steps;
+            Eigen::Vector3d point=input[first].point+fraction*delta;
+            const double arc=input[first].arc+fraction*(input[last].arc-input[first].arc);
+            point.z()=route.heightAtArc(arc)
+                +(1.-fraction)*(input[first].point.z()-route.heightAtArc(input[first].arc))
+                +fraction*(input[last].point.z()-route.heightAtArc(input[last].arc));
+            if (map.getInflateOccupancy(point,yaw)==0)continue;
+            double deviation=-1.;
+            for (std::size_t i=first+1;i<last;++i) {
+              const double along=length2>0.?std::clamp((input[i].point-input[first].point).dot(delta)/length2,0.,1.):0.;
+              const double distance=(input[i].point-input[first].point-along*delta).squaredNorm();
+              if (distance>deviation){deviation=distance;farthest=i;}
+            }
+            break;
+          }
         }
         if (farthest != first) {
           keep[farthest] = 1;
@@ -550,7 +574,7 @@ namespace scan_planner
       // 控制多边形保持原折线的单调段，避免插值在窄通道拐角产生反向摆动。
       const int size = static_cast<int>(point_set.size()) + 2;
       if (!buildReferenceControls(route_height_, start_pt, local_target_pt, size,
-          grid_map_->getResolution(), pp_.max_vel_, pp_.max_acc_, ctrl_pts, seed_control_arcs)) {
+          grid_map_->getResolution(), pp_.max_vel_, pp_.max_acc_, *grid_map_, ctrl_pts, seed_control_arcs)) {
         ROS_WARN("Reference corners exceed the existing control-point capacity.");
         ++continuous_failures_count_;
         return false;
@@ -594,6 +618,31 @@ namespace scan_planner
     if (route_time_seed) {
       UniformBspline reference_curve(reference_controls, 3, reference_dt);
       reference_free = trajectoryCollisionFree(reference_curve);
+    }
+    // 原参考本身已经可行时先交付其严格证书，避免优化器不断切掉必要拐角后
+    // 才回退到同一参考，导致计算超过原命令交付窗。实测边界和所有门禁仍相同。
+    const bool history_executable = local_data_.traj_id_ > 0
+        && (ros::Time::now() - local_data_.start_time_).toSec() < local_data_.duration_;
+    const bool retain_boundary = !history_executable
+        || (start_vel.isZero(0.) && start_acc.isZero(0.) && local_target_vel.isZero(0.));
+    if (reference_free && retain_boundary) {
+      Eigen::MatrixXd retained_controls = reference_controls;
+      double retained_dt = reference_dt;
+      if (retimeReferenceControls(retained_controls, seed_control_arcs, retained_dt, start_pt, start_vel, start_acc,
+          local_target_pt, local_target_vel, pp_.max_vel_, pp_.max_acc_)) {
+        UniformBspline retained(retained_controls, 3, retained_dt);
+        if (trajectoryCollisionFree(retained) && checkDynamicFeasibility(retained)
+            && strictDynamicScale(retained) <= 1.) {
+          if (authorTraceEnabled()) {
+            auto out = authorTraceStream();
+            out << "{\"event\":\"retained_reference_seed\",\"scale\":" << retained_dt / reference_dt
+                << ",\"duration\":" << retained.getTimeSum() << "}\n";
+          }
+          updateTrajInfo(retained, ros::Time::now());
+          continuous_failures_count_ = 0;
+          return true;
+        }
+      }
     }
     a_star_paths = bspline_optimizer_rebound_->initControlPoints(ctrl_pts, true);
 
@@ -642,29 +691,6 @@ namespace scan_planner
 
     bool accepted = flag_step_2_success && checkDynamicFeasibility(pos)
         && (!route_time_seed || (trajectoryCollisionFree(pos) && strictDynamicScale(pos) <= 1.));
-    // 编号不代表历史仍可执行；来源时间已过期时同样必须保留真实边界重新起步。
-    const bool history_executable = local_data_.traj_id_ > 0
-        && (ros::Time::now() - local_data_.start_time_).toSec() < local_data_.duration_;
-    const bool retain_boundary = !history_executable
-        || (start_vel.isZero(0.) && start_acc.isZero(0.) && local_target_vel.isZero(0.));
-    if (!accepted && reference_free && retain_boundary) {
-      Eigen::MatrixXd retained_controls = reference_controls;
-      double retained_dt = reference_dt;
-      if (retimeReferenceControls(retained_controls, seed_control_arcs, retained_dt, start_pt, start_vel, start_acc,
-          local_target_pt, local_target_vel, pp_.max_vel_, pp_.max_acc_)) {
-        UniformBspline retained(retained_controls, 3, retained_dt);
-        if (trajectoryCollisionFree(retained) && checkDynamicFeasibility(retained)
-            && strictDynamicScale(retained) <= 1.) {
-          pos = std::move(retained);
-          accepted = true;
-          if (authorTraceEnabled()) {
-            auto out = authorTraceStream();
-            out << "{\"event\":\"retained_reference_seed\",\"scale\":" << retained_dt / reference_dt
-                << ",\"duration\":" << pos.getTimeSum() << "}\n";
-          }
-        }
-      }
-    }
     if (!accepted)
     {
       std::fprintf(stderr,"\033[34mThis refined trajectory is unsafe or dynamically infeasible. Skip publishing it.\n\033[0m");
@@ -925,14 +951,13 @@ namespace scan_planner
   bool SCANPlannerManager::trajectoryCollisionFree(UniformBspline& trajectory)
   {
     const double duration = trajectory.getTimeSum();
+    auto velocity=trajectory.getDerivative();
     const double dt = std::min(.01, grid_map_->getResolution() / (4. * pp_.max_vel_));
     const int samples = std::max(1, static_cast<int>(std::ceil(duration / dt)));
     for (int i = 0; i <= samples; ++i) {
       const double time = duration * i / samples;
       const Eigen::Vector3d point = trajectory.evaluateDeBoorT(time);
-      const Eigen::Vector3d next = trajectory.evaluateDeBoorT(std::min(duration, time + dt));
-      const Eigen::Vector2d direction = (next - point).head<2>();
-      const double yaw = direction.squaredNorm() < 1e-8 ? 0. : std::atan2(direction.y(), direction.x());
+      const double yaw = trajectoryHeading(velocity,duration,time,dt,0.);
       if (grid_map_->getInflateOccupancy(point, yaw) != 0) return false;
     }
     return true;

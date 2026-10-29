@@ -4,6 +4,7 @@
 // Ported from wuyi2121/SCAN-Planner@348e8a590a50a5a6bbab8d8c6dcfd171f009be26.
 // 保留作者A的占据概率、射线及滑动缓存；真实机体查询和静态夹具由宿主适配。
 #include <author_host.h>
+#include <body_collision_cell.h>
 #include <Eigen/Eigen>
 #include <Eigen/StdVector>
 #include <algorithm>
@@ -169,8 +170,8 @@ public:
   inline int getOccupancy(Eigen::Vector3d pos);
   inline int getOccupancy(Eigen::Vector3i id);
   inline int getInflateOccupancy(Eigen::Vector3d pos, double yaw);
-  using BodyCell = std::array<int, 3>;
-  // 连续扫掠的保守外包；只读原概率位图，忽略集合仅供已证明单调退出的初始格。
+  using BodyCell = BodyCollisionCell;
+  // 连续扫掠查询两层当前实体；忽略集合仅供已证明单调退出的初始接触。
   inline int bodyContacts(Eigen::Vector3d pos, double yaw, double padding,
       std::vector<BodyCell>* contacts = nullptr, const std::set<BodyCell>* initial = nullptr);
   // 双圆柱候选查询保留前后顺序及图外-1；真实外包由getInflateOccupancy复核。
@@ -192,7 +193,9 @@ public:
   using BusinessEnvelopeQuery = std::function<bool(const Eigen::Vector3d&, double, double)>;
   void setBusinessEnvelopeQuery(BusinessEnvelopeQuery query) { business_envelope_query_ = std::move(query); }
   // 已知融合表面是附加实体约束，不写入雷达概率和未知状态。
-  void setSurfaceCollisionQuery(BusinessEnvelopeQuery query) { surface_collision_query_ = std::move(query); }
+  using SurfaceContactQuery = std::function<bool(const Eigen::Vector3d&, double, double,
+      std::vector<BodyCell>*, const std::set<BodyCell>*)>;
+  void setSurfaceCollisionQuery(SurfaceContactQuery query) { surface_collision_query_ = std::move(query); }
 
   // One atomic LiDAR observation: points, sensor pose and body position MUST belong
   // to the same registered frame/correction generation. Identity/freshness checks
@@ -280,7 +283,7 @@ private:
   ros::NodeHandle node_;
   BusinessConstraintQuery business_constraint_query_;
   BusinessEnvelopeQuery business_envelope_query_;
-  BusinessEnvelopeQuery surface_collision_query_;
+  SurfaceContactQuery surface_collision_query_;
 
   //
   uniform_real_distribution<double> rand_noise_;
@@ -387,7 +390,7 @@ inline int GridMap::getOccupancy(Eigen::Vector3d pos) {
 
 inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos, double yaw) {
   if (business_constraint_query_ && business_constraint_query_(pos, yaw)) return 1;
-  if (surface_collision_query_ && surface_collision_query_(pos, yaw, 0.)) return 1;
+  if (surface_collision_query_ && surface_collision_query_(pos, yaw, 0., nullptr, nullptr)) return 1;
   // Explicit physical calibration adapter. For the author reference convention
   // all offsets are zero and this reduces exactly to the original query.
   const double c = std::cos(yaw), s = std::sin(yaw);
@@ -469,8 +472,8 @@ inline int GridMap::bodyContacts(Eigen::Vector3d pos, double yaw, double padding
   if (contacts) contacts->clear();
   if (business_envelope_query_ ? business_envelope_query_(pos,yaw,padding)
       : business_constraint_query_ && business_constraint_query_(pos,yaw)) return -1;
-  // 独立表面没有原雷达格身份，不能把它纳入浅重叠退出的旧格豁免。
-  if (surface_collision_query_ && surface_collision_query_(pos,yaw,padding)) return -1;
+  bool found = surface_collision_query_ && surface_collision_query_(pos,yaw,padding,contacts,initial);
+  if (found && !contacts) return 1;
   const double c=std::cos(yaw),s=std::sin(yaw),ac=std::abs(c),as=std::abs(s);
   pos += Eigen::Vector3d(c*mp_.body_center_offset_.x()-s*mp_.body_center_offset_.y(),
       s*mp_.body_center_offset_.x()+c*mp_.body_center_offset_.y(),mp_.body_center_offset_.z());
@@ -485,7 +488,7 @@ inline int GridMap::bodyContacts(Eigen::Vector3d pos, double yaw, double padding
   int z0=static_cast<int>(std::floor(low/r)),z1=static_cast<int>(std::ceil(high/r))-1;
   while(z0<=z1&&(z0+1.)*r<=low)++z0;
   while(z0<=z1&&z1*r>=high)--z1;
-  const int nz=mp_.map_voxel_num_.z();bool found=false;
+  const int nz=mp_.map_voxel_num_.z();
   for(int x=std::max(x0,mp_.map_bound_min_idx_.x());x<=std::min(x1,mp_.map_bound_max_idx_.x());++x)
     for(int y=std::max(y0,mp_.map_bound_min_idx_.y());y<=std::min(y1,mp_.map_bound_max_idx_.y());++y) {
       const double dx=(x+.5)*r-pos.x(),dy=(y+.5)*r-pos.y();

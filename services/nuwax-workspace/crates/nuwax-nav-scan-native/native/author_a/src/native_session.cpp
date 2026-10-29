@@ -119,8 +119,9 @@ extern "C" int nuwax_scan_session_plan(void* raw,SCAN_ARGUMENTS) {
    // 真实雷达未看到的已知深度实体仍参加局部查询；相同几何复用，删除随当前表面生效。
    if(!s.surface||!s.surface->matches(obstacles,obstacle_count,ground,ground_count))
     s.surface=std::make_shared<SurfaceObstacleLayer>(c,obstacles,obstacle_count,ground,ground_count);
-   map->setSurfaceCollisionQuery([surface=s.surface](const Vector3d& p,double yaw,double padding) {
-    return surface->intersects(p,yaw,padding);
+   map->setSurfaceCollisionQuery([surface=s.surface](const Vector3d& p,double yaw,double padding,
+       std::vector<GridMap::BodyCell>* contacts,const std::set<GridMap::BodyCell>* initial) {
+    return surface->contacts(p,yaw,padding,contacts,initial);
    });
   }
   std::vector<Eigen::Vector2d> polygon;polygon.reserve(boundary_count);
@@ -142,11 +143,15 @@ extern "C" int nuwax_scan_session_plan(void* raw,SCAN_ARGUMENTS) {
   // 起点必须使用当前实测机体查询；已有曲线的计划时刻不能代替实际位置。
   const int start_occupancy=map->getInflateOccupancy(position,start_yaw);
   if(start_occupancy!=0) {
-   if(!s.static_fixture&&s.surface&&s.surface->intersects(position,start_yaw))
-    throw std::runtime_error("Current body pose intersects the current known surface collision layer");
    if(start_occupancy==1&&reference_count>=2&&!business->rejects(position,start_yaw)) {
     if(!s.escape.active())s.retireExecution();
-    s.escape.plan(*map,c,position,start_yaw,start_velocity,start_yaw_rate,odometry_timestamp_ns,*output);
+    try {
+     s.escape.plan(*map,c,position,start_yaw,start_velocity,start_yaw_rate,odometry_timestamp_ns,*output);
+    } catch(const std::runtime_error& failure) {
+     if(!s.static_fixture&&s.surface&&s.surface->intersects(position,start_yaw))
+      throw std::runtime_error(std::string("Current body pose intersects the current known surface collision layer; ")+failure.what());
+     throw;
+    }
     // 独立短距证明没有执行原曲线；退出后由原FSM从真实新位置重新起算。
     const double cs=std::cos(start_yaw),sn=std::sin(start_yaw);
     s.previous_control={cs*output->command_forward-sn*output->command_lateral,

@@ -89,6 +89,7 @@ class AuthorOverlapEscape {
       if(map.bodyContacts(p,yaw,0.,&cells)!=1||cells.empty())
         throw std::runtime_error("Current body pose is occupied or outside the local map; no eligible contacts");
       for(const auto& cell:cells) {
+        if(initial_.count(cell))continue;
         Contact selected{cell,Eigen::Vector2d::Zero(),std::numeric_limits<double>::infinity()};
         const Eigen::Vector2d center=p.head<2>()+world({c.body_center_x,c.body_center_y},yaw);
         const Eigen::Vector2d delta=center-Eigen::Vector2d((cell[0]+.5)*c.resolution,(cell[1]+.5)*c.resolution);

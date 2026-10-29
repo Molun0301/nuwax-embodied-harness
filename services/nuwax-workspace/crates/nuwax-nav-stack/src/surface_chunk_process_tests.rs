@@ -51,6 +51,10 @@ impl RpcHandler for BlockServer {
         let Some(scope) = request.args.0.first() else {
             return RpcResponse::error(request.id, serde_json::json!({"message":"缺少块请求"}));
         };
+        if mode == "legacy-reject" && scope.get("part_encoding").is_some() {
+            return RpcResponse::error(request.id, serde_json::json!({"type_name":"InvalidArguments",
+                "args":["unknown field `part_encoding`, expected one of `schema_version`, `root`, `block`, `offset`, `max_bytes`"]}));
+        }
         let Some(revision) = scope.get("root").and_then(|root| root.get("revision"))
             .and_then(serde_json::Value::as_u64) else {
             return RpcResponse::error(request.id, serde_json::json!({"message":"缺少根修订"}));
@@ -87,8 +91,14 @@ impl RpcHandler for BlockServer {
         if mode=="truncated-tail" && offset>0 {bytes.pop();}
         let mut response = scope.clone();
         response["total_bytes"] = serde_json::json!(total_bytes);
-        response["data_base64"] = serde_json::json!(base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD, &bytes));
+        if let Some(encoded) = (scope["part_encoding"] == "lz4")
+            .then(|| nuwax_codec::lcm::map_block_part::compress(&bytes)).flatten() {
+            response["data_lz4_base64"] = serde_json::json!(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD, &encoded));
+        } else {
+            response["data_base64"] = serde_json::json!(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD, &bytes));
+        }
         if mode=="changed-total" && offset>0 {response["total_bytes"]=serde_json::json!(total_bytes+1);}
         if mode=="repeated-part" && offset>0 {response["offset"]=serde_json::json!(0);}
         if mode=="wrong-root" {response["root"]["revision"] = serde_json::json!(revision + 1);}
@@ -189,6 +199,10 @@ async fn real_process_rpc_recovers_late_missing_and_corrupt_blocks_without_parti
     // 慢读者持有的旧根仍可读，且读取的是消费者自己已验证的对象。
     let (old_columns,count)=reader.columns(&old,None,0.1).unwrap();assert!(!old_columns.is_empty());assert_eq!(count,36000);
     let (reader,result)=receive(reader,first).await;assert!(result.is_err());assert_eq!(reader.receiver.current().unwrap().revision,6);
+    std::fs::write(root.join("mode"), "legacy-reject").unwrap();
+    let (reader, result) = receive(reader, message(&repository, 7, 7)).await;
+    assert_eq!(result.unwrap().revision, 7);
+    assert!(!reader.compress_parts, "严格旧服务只探测一次，后续段使用原编码");
     drop(reader);
     std::fs::write(root.join("stop"),"stop").unwrap();
     let deadline=Instant::now()+Duration::from_secs(3);

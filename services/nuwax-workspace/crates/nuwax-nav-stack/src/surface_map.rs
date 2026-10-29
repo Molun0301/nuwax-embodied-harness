@@ -336,6 +336,7 @@ impl SurfaceMapCache {
         &mut self,
         message: &schema::NavigationMap3D,
     ) -> Result<SurfaceMapUpdate, SurfaceMapBuildError> {
+        let started = std::time::Instant::now();
         // A failed mask derivation may have advanced physical/builder state. Its
         // next local delta cannot be attached to the previous successful source.
         let change_basis = self.latest.as_ref().map(|old| Arc::clone(&old.snapshot));
@@ -359,6 +360,7 @@ impl SurfaceMapCache {
         } else {
             None
         };
+        let receive_ms = started.elapsed().as_secs_f64() * 1000.0;
         // 原生规划始终消费完整精细几何和地面记录，与旧机体复核开关无关。
         let (observations, fine_changes) = match fine_root.as_ref() {
             Some(root) => {
@@ -368,6 +370,7 @@ impl SurfaceMapCache {
             }
             None => (None, self.observations.is_none().then(Vec::new)),
         };
+        let observations_ms = started.elapsed().as_secs_f64() * 1000.0 - receive_ms;
         let domain = schema::navigation_map_3d_domain(message);
         let physical_revision = match fine_root.as_ref() {
             Some(root) => GeometryRevision::Fine {
@@ -436,6 +439,10 @@ impl SurfaceMapCache {
         // rebuilding geometry. Full-cloud compatibility goes through the builder's
         // existing exact column comparison on each new publication revision.
         self.fine_built_root = fine_root.clone();
+        tracing::debug!(target: "navigation.surface.build", event="surface.build.stages",
+            cloud_revision=message.cloud_revision, receive_ms, observations_ms,
+            geometry_ms=started.elapsed().as_secs_f64()*1000.0-receive_ms-observations_ms,
+            stats=?self.last_stats, "表面构建阶段耗时");
         #[cfg(test)]
         let mut compared_cells = 0;
         let same_mask = self.latest.as_ref().is_some_and(|previous| {

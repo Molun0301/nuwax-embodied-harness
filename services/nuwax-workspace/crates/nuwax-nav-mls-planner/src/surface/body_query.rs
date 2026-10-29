@@ -459,17 +459,28 @@ impl SurfaceSnapshot {
     /// nor permission to reuse a live body-execution cache. All derived layer
     /// fields, occupancy, completeness, body geometry and recent input remain equal.
     pub fn same_planning_query_view(&self,other:&Self)->bool {
-        let observations=match (&self.observations,&other.observations) {
-            (None,None)=>true,
-            (Some(left),Some(right))=>left.same_planning_query_view(right),
-            _=>false,
+        self.planning_query_change(other).is_none()
+    }
+
+    /// 原完整查询资格的首个差异；只读既有身份，不刷新时间或建立运动许可。
+    pub fn planning_query_change(&self,other:&Self)->Option<&'static str> {
+        if !Arc::ptr_eq(&self.data,&other.data) { return Some("surface_geometry"); }
+        if self.ground_evidence!=other.ground_evidence { return Some("ground_interpretation"); }
+        let measured=match (&self.navigation_measurements,&other.navigation_measurements) {
+            (None,None)=>true,(Some(left),Some(right))=>Arc::ptr_eq(left,right),_=>false,
         };
+        if !measured { return Some("navigation_measurements"); }
+        match (&self.observations,&other.observations) {
+            (None,None)=>{},
+            (Some(left),Some(right))=>{
+                if let Some(reason)=left.planning_query_change(right) { return Some(reason); }
+            },
+            _=>return Some("observation_presence"),
+        }
         let recent=match (&self.recent_obstacles,&other.recent_obstacles) {
-            (None,None)=>true,
-            (Some(left),Some(right))=>Arc::ptr_eq(left,right),
-            _=>false,
+            (None,None)=>true,(Some(left),Some(right))=>Arc::ptr_eq(left,right),_=>false,
         };
-        self.same_geometry(other) && observations && recent
+        (!recent).then_some("recent_obstacles")
     }
 
     pub(super) fn can_defer_body_query_edges(&self)->bool {

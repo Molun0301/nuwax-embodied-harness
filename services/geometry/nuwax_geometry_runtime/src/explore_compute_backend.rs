@@ -229,7 +229,8 @@ impl ExploreComputeBackend {
         let planning = self.surface_planning.as_ref()
             .filter(|(config, _)| Arc::ptr_eq(config, &context.config))
             .and_then(|(_, planning)| planning.rebind_original(original))
-            .unwrap_or_else(|| original.fork_for_planning());
+            .unwrap_or_else(|| original.fork_for_planning())
+            .with_revalidation_advice();
         self.surface_planning = Some((Arc::clone(&context.config), planning.clone()));
         Some(planning)
     }
@@ -248,6 +249,10 @@ impl ExploreComputeBackend {
             #[cfg(test)]
             ComputeRequest::InspectCheckpoint { context } => context,
         };
+        let compute_started = Instant::now();
+        let captured_now_ns = context.now.nanos;
+        tracing::info!(event="exploration.compute.started", captured_now_ns,
+            monotonic_ns=now_monotonic_nanos(), "探索工作线程开始处理原捕获输入");
         #[cfg(test)]
         let attribution = context.attribution.clone();
         let original_surface = match &context.input {
@@ -292,6 +297,9 @@ impl ExploreComputeBackend {
         {
             self.surface_planning = None;
         }
+        tracing::info!(event="exploration.compute.prepared", captured_now_ns,
+            monotonic_ns=now_monotonic_nanos(), compute_ms=compute_started.elapsed().as_secs_f64()*1000.0,
+            "探索工作线程完成准备，尚未提交结论");
         self.prepared = Some(PreparedJob {
             #[cfg(test)]
             attribution,
@@ -326,6 +334,7 @@ impl ExploreComputeBackend {
             .attribution
             .as_ref()
             .map(|trace| trace.begin(attribution::Stage::OwnerSelection, 0));
+        let selection_started = Instant::now();
         let (poll, controller_prepared) = if progress.as_ref().is_some_and(|p| p.returning) {
             (Ok(ExplorationPoll::Pending), false)
         } else {
@@ -344,6 +353,15 @@ impl ExploreComputeBackend {
         };
         #[cfg(test)]
         drop(selection_span);
+        let poll_kind = match &poll {
+            Ok(ExplorationPoll::Goal(_))=>"goal", Ok(ExplorationPoll::Pending)=>"pending",
+            Ok(ExplorationPoll::NoFrontier)=>"no_frontier", Ok(ExplorationPoll::SourceUnavailable(_))=>"source_unavailable",
+            Ok(ExplorationPoll::Stop(_))=>"stop", Err(_)=>"error",
+        };
+        tracing::info!(event="exploration.compute.selection", captured_now_ns=context.now.nanos,
+            elapsed_ms=selection_started.elapsed().as_secs_f64()*1000.0, poll_kind,
+            "探索候选阶段完成");
+        let route_started = Instant::now();
         let mut output = SelectionProjection {
             poll,
             mission: None,
@@ -404,6 +422,9 @@ impl ExploreComputeBackend {
                 }
             }
         }
+        tracing::info!(event="exploration.compute.mission", captured_now_ns=context.now.nanos,
+            elapsed_ms=route_started.elapsed().as_secs_f64()*1000.0, queried=output.mission.is_some(),
+            "探索任务路线核验阶段完成");
         (ComputeProjection::Selection(output), controller_prepared)
     }
 

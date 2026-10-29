@@ -118,6 +118,7 @@ impl FrozenSurfaceInput {
         FrozenSurfacePlanningInput {
             original: self.clone(),
             native_cache: Arc::new(NativeFrontierCache::default()),
+            revalidation_advice: false,
             query_view: self
                 .snapshot
                 .as_ref()
@@ -128,10 +129,15 @@ impl FrozenSurfaceInput {
     /// Compare only Explore's derived query inputs. Raw evidence and captured
     /// notifications may differ; source identity and lifecycle checks stay separate.
     pub fn same_planning_query_view(&self, other: &Self) -> bool {
+        self.planning_query_change(other).is_none()
+    }
+
+    /// 保留原查询相等规则，供事务拥有方区分具体失效组成。
+    pub fn planning_query_change(&self, other: &Self) -> Option<&'static str> {
         match (&self.snapshot, &other.snapshot) {
-            (Some(left), Some(right)) => left.same_planning_query_view(right),
-            (None, None) => true,
-            _ => false,
+            (Some(left), Some(right)) => left.planning_query_change(right),
+            (None, None) => None,
+            _ => Some("surface_presence"),
         }
     }
 
@@ -167,6 +173,7 @@ pub struct FrozenSurfacePlanningInput {
     original: FrozenSurfaceInput,
     query_view: Option<Arc<SurfaceSnapshot>>,
     native_cache: Arc<NativeFrontierCache>,
+    revalidation_advice: bool,
 }
 
 #[derive(Clone)]
@@ -251,7 +258,15 @@ impl FrozenSurfacePlanningInput {
             original: captured.clone(),
             query_view: self.query_view.clone(),
             native_cache: Arc::clone(&self.native_cache),
+            revalidation_advice: self.revalidation_advice,
         })
+    }
+
+    /// 原事务仍须结算；唯一计算拥有方可在新源上优先重核不含结论的搜索提示。
+    /// 普通准备/丢弃调用默认不启用，保留其重复计算与事务副作用合同。
+    pub fn with_revalidation_advice(mut self) -> Self {
+        self.revalidation_advice = true;
+        self
     }
 
     /// Qualify against the captured ORIGINAL source, never the private query fork.
@@ -284,6 +299,8 @@ struct SurfacePollDelta {
     last_frontiers: Option<Vec<FrontierGoal>>,
     last_error: Option<Option<String>>,
     regional: Option<nuwax_explore_routing::RegionalPresenceDelta>,
+    // 仅是下一次搜索的顺序，不写入控制器历史或提交检查点。
+    next_search_offset: Option<usize>,
 }
 
 impl SurfacePollDelta {
@@ -340,6 +357,15 @@ impl SurfacePollDelta {
 struct PendingSurfacePoll {
     outcome: ExploreResult<ExplorationPoll>,
     delta: SurfacePollDelta,
+    search_hint: Option<SurfaceSearchHint>,
+}
+
+/// 不含路线、收益、负面结论或许可的有界工作提示，原地图仅保留弱引用。
+#[derive(Clone)]
+struct SurfaceSearchHint {
+    source: Weak<SurfaceSnapshot>,
+    candidate: Option<([f64; 3], [f64; 4])>,
+    next_offset: usize,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -389,6 +415,7 @@ pub struct SurfaceGoalSourceAdapter {
     last_frontiers: Vec<FrontierGoal>,
     last_error: Option<String>,
     prepared_poll: Option<PendingSurfacePoll>,
+    search_hint: Option<SurfaceSearchHint>,
 }
 
 impl SurfaceGoalSourceAdapter {
@@ -430,6 +457,7 @@ impl SurfaceGoalSourceAdapter {
             last_frontiers: Vec::new(),
             last_error: None,
             prepared_poll: None,
+            search_hint: None,
         })
     }
 
@@ -445,6 +473,7 @@ impl SurfaceGoalSourceAdapter {
         }
         self.route_cursor = 0;
         self.deferred_route = None;
+        self.search_hint = None;
         self.observation_model = Some(model);
         self.last_no_frontier = false;
         self.last_snapshot = None;
@@ -466,6 +495,7 @@ impl SurfaceGoalSourceAdapter {
         }
         self.route_cursor = 0;
         self.deferred_route = None;
+        self.search_hint = None;
         self.boundary = boundary;
         self.max_navigation_retries = max_navigation_retries;
         self.blacklist_radius_m = blacklist_radius_m;
@@ -495,16 +525,33 @@ impl SurfaceGoalSourceAdapter {
         self.ensure_no_prepared_poll()?;
         let mut delta = SurfacePollDelta::default();
         let outcome = self.evaluate_poll(state, input, None, &mut delta);
-        Ok(self.stage_poll(outcome, delta))
+        Ok(self.stage_poll(outcome, delta, false))
     }
 
     fn stage_poll(
         &mut self,
         outcome: ExploreResult<ExplorationPoll>,
         delta: SurfacePollDelta,
+        retain_hint: bool,
     ) -> PreparedExplorationPoll {
         let preview = PreparedExplorationPoll::new(outcome.clone());
-        self.prepared_poll = Some(PendingSurfacePoll { outcome, delta });
+        let search_hint = if retain_hint { delta.last_snapshot.as_ref().and_then(|source| source.clone()).and_then(|source| {
+            let candidate = match &outcome {
+                Ok(ExplorationPoll::Goal(goal)) => delta.selected.as_ref().and_then(|selected| selected.as_ref()).map(|selected| {
+                    let q=goal.pose.pose.orientation;
+                    (selected.support_xyz, [q.x,q.y,q.z,q.w])
+                }),
+                Ok(ExplorationPoll::Pending) => None,
+                _ => return None,
+            };
+            let next_offset=if matches!(outcome,Ok(ExplorationPoll::Pending)) {
+                delta.deferred_route.as_ref().and_then(|route|route.as_ref())
+                    .map(|route|route.rotation_offset+route.resume_cursor)
+                    .or(delta.next_search_offset).unwrap_or(0)
+            } else {delta.next_search_offset.unwrap_or(0)};
+            Some(SurfaceSearchHint { source, candidate, next_offset })
+        }) } else { None };
+        self.prepared_poll = Some(PendingSurfacePoll { outcome, delta, search_hint });
         preview
     }
 
@@ -519,7 +566,7 @@ impl SurfaceGoalSourceAdapter {
         self.ensure_no_prepared_poll()?;
         let mut delta = SurfacePollDelta::default();
         let outcome = self.evaluate_poll(state, &input.original, Some(input), &mut delta);
-        Ok(self.stage_poll(outcome, delta))
+        Ok(self.stage_poll(outcome, delta, input.revalidation_advice))
     }
 
     fn evaluate_poll(
@@ -571,6 +618,12 @@ impl SurfaceGoalSourceAdapter {
                             .goal_tolerance
                             .max(source_snapshot.config().voxel_size),
                     )
+        });
+        let search_hint = self.search_hint.as_ref().filter(|hint| {
+            planning.is_some_and(|input|input.revalidation_advice)
+                && deferred.is_none() && self.retry_support.is_none()
+                && (hint.candidate.is_some() || hint.source.upgrade().is_none_or(|previous|
+                    !previous.same_planning_query_view(source_snapshot)))
         });
         let continuing =
             (!new_snapshot && same_query && self.route_cursor > 0) || deferred.is_some();
@@ -663,7 +716,6 @@ impl SurfaceGoalSourceAdapter {
         let mut planner_guard = planner.lock().map_err(|_| {
             ExploreError::SourceError("native frontier planner lock is poisoned".into())
         })?;
-        let mut search = planner_guard.multi_goal_search().map_err(ExploreError::SourceError)?;
         delta.last_snapshot = Some(Some(Arc::downgrade(source_snapshot)));
         delta.last_notification = Some(Some(notification));
         delta.last_query_body = Some(Some([position.x, position.y, position.z]));
@@ -702,12 +754,29 @@ impl SurfaceGoalSourceAdapter {
                 .then_with(|| a.support_xyz[1].total_cmp(&b.support_xyz[1]))
                 .then_with(|| a.support_xyz[2].total_cmp(&b.support_xyz[2]))
         });
+        let mut evaluated_candidate_count = 0;
+        // 提示的核验也计入原128候选和64查询，不额外增加额度。
+        let mut route_budget = FrontierRouteBudget { reserved: 1, ..Default::default() };
+        if let Some((support, orientation)) = search_hint.and_then(|hint| hint.candidate) {
+            let key=|point:[f64;3]| point.map(|value|(value/f64::from(snapshot.config().voxel_size)).floor() as i32);
+            if let Some(candidate)=candidates.iter().find(|candidate|key(candidate.support_xyz)==key(support)) {
+                evaluated_candidate_count += 1;
+                if let Some(goal)=self.revalidate_candidate(state,snapshot,current_body,robot_support,
+                    candidate.clone(),orientation,&observation_targets,&boundary,vertical_radius,
+                    &mut planner_guard,&route_budget,delta)? {
+                    return Ok(ExplorationPoll::Goal(goal));
+                }
+            }
+        }
+        let hint_exact_queries=route_budget.queries.get();
+        let mut route_query_count = hint_exact_queries;
         let mut admissible = Vec::new();
         let mut accepted_regions = std::collections::BTreeSet::new();
-        let mut evaluated_candidate_count = 0;
-        let mut route_query_count = 0;
-        // 总查询数保持64；预留一次给选中目标的原完整路线核验。
-        let mut route_budget = FrontierRouteBudget { reserved: 1, ..Default::default() };
+        let rotation_offset = deferred.map(|route|route.rotation_offset)
+            .or_else(||search_hint.map(|hint|hint.next_offset)).unwrap_or(0)
+            % candidates.len().max(1);
+        candidates.rotate_left(rotation_offset);
+        let mut search = planner_guard.multi_goal_search().map_err(ExploreError::SourceError)?;
         let mut route_budget_limited = false;
         let mut next_route_cursor = 0;
         let mut examined_route_cursor = 0;
@@ -719,11 +788,13 @@ impl SurfaceGoalSourceAdapter {
             start_body: deferred.map_or(current_body.0, |old| old.start_body),
             start_orientation: deferred.map_or(current_body.1, |old| old.start_orientation),
             resume_cursor,
+            rotation_offset,
         };
         delta.route_cursor = Some(0);
         delta.deferred_route = Some(None);
         for (ordinal, mut candidate) in candidates.into_iter().enumerate().skip(cursor) {
             examined_route_cursor = ordinal + 1;
+            delta.next_search_offset = Some(rotation_offset + examined_route_cursor);
             if nuwax_nav_pct_native::planning_cancelled() {
                 return Err(ExploreError::SourceError(
                     "frontier planning cancelled".into(),
@@ -1015,6 +1086,40 @@ impl SurfaceGoalSourceAdapter {
             return Ok(ExplorationPoll::Pending);
         }
         candidate.travel_cost = travel;
+        let mut goal=self.make_candidate_goal(state,&candidate,(body,candidate_quaternion),view.as_ref(),travel,delta)?;
+        for (key,value) in [
+            ("route_cost_basis","full_transition_source_tree_then_selected_astar".into()),
+            ("route_exact_queries",(search.stats().exact_queries+hint_exact_queries).to_string()),
+            ("route_source_searches",search.stats().source_searches.to_string()),
+            ("route_query_count",route_budget.queries.get().to_string()),
+            ("candidate_route_query_count",route_query_count.to_string()),
+            ("route_expanded_successes",route_budget.expanded.get().to_string()),
+            ("route_budget_limited",route_budget_limited.to_string()),
+            ("geometric_candidate_count",geometric_candidate_count.to_string()),
+            ("evaluated_candidate_count",evaluated_candidate_count.to_string()),
+            ("admissible_candidate_count",admissible.len().to_string()),
+            ("selection_method",if retry_index.is_some(){"navigation_retry"}else{"regional_route"}.into()),
+        ] {goal.metadata.insert(key.into(),value);}
+        if let Some(selection)=selection {
+            for (key,value) in [
+                ("region_wait_rounds",selection.priority_wait_rounds.to_string()),
+                ("route_regions",selection.regional_order.len().to_string()),
+                ("available_regions",selection.region_count.to_string()),
+                ("route_cost_m",selection.route_cost.to_string()),
+            ] {goal.metadata.insert(key.into(),value);}
+        }
+        Ok(self.stage_selected_goal(goal,candidate.support_xyz,vertical_radius,delta))
+    }
+
+    fn make_candidate_goal(
+        &self,
+        state: &ExplorationStateSnapshot<'_>,
+        candidate: &FrontierCandidate,
+        body: BodyPose,
+        view: Option<&nuwax_explore_routing::observation::ViewEstimate>,
+        travel: f64,
+        delta: &mut SurfacePollDelta,
+    ) -> ExploreResult<FrontierGoal> {
         delta.retry_support = Some(None);
         let next_goal_id = self.next_goal_id.checked_add(1).ok_or_else(|| {
             ExploreError::SourceError("surface frontier goal identifier exhausted".into())
@@ -1029,19 +1134,19 @@ impl SurfaceGoalSourceAdapter {
                 frame_id: state.robot_pose.frame_id.clone(),
                 stamp: state.now,
                 pose: Pose3 {
-                    position: Point3::new(body[0], body[1], body[2]),
+                    position: Point3::new(body.0[0], body.0[1], body.0[2]),
                     orientation: nuwax_nav_types_messages::Quaternion {
-                        x: candidate_quaternion[0],
-                        y: candidate_quaternion[1],
-                        z: candidate_quaternion[2],
-                        w: candidate_quaternion[3],
+                        x: body.1[0],
+                        y: body.1[1],
+                        z: body.1[2],
+                        w: body.1[3],
                     },
                 },
             },
             (candidate.gain / (1.0 + travel)) as f32,
         );
         goal.information_gain = Some(candidate.gain as f32);
-        if let Some(view) = &view {
+        if let Some(view) = view {
             goal.metadata.insert(
                 "gain_basis".into(),
                 "calibrated_visible_support_cells".into(),
@@ -1055,41 +1160,10 @@ impl SurfaceGoalSourceAdapter {
         }
         goal.frontier_area_m2 = Some(candidate.gain as f32);
         goal.distance_cost = Some(travel as f32);
-        goal.metadata.insert("route_cost_basis".into(), "full_transition_source_tree_then_selected_astar".into());
-        goal.metadata.insert("route_exact_queries".into(), search.stats().exact_queries.to_string());
-        goal.metadata.insert("route_source_searches".into(), search.stats().source_searches.to_string());
         goal.producer = "nuwax-exploration/surface".into();
         goal.metadata.insert(
             "ground_reference_policy".into(),
             "known_terrain_or_calibrated_current_layer".into(),
-        );
-        goal.metadata.insert(
-            "route_query_count".into(),
-            route_budget.queries.get().to_string(),
-        );
-        goal.metadata.insert(
-            "candidate_route_query_count".into(),
-            route_query_count.to_string(),
-        );
-        goal.metadata.insert(
-            "route_expanded_successes".into(),
-            route_budget.expanded.get().to_string(),
-        );
-        goal.metadata.insert(
-            "route_budget_limited".into(),
-            route_budget_limited.to_string(),
-        );
-        goal.metadata.insert(
-            "geometric_candidate_count".into(),
-            geometric_candidate_count.to_string(),
-        );
-        goal.metadata.insert(
-            "evaluated_candidate_count".into(),
-            evaluated_candidate_count.to_string(),
-        );
-        goal.metadata.insert(
-            "admissible_candidate_count".into(),
-            admissible.len().to_string(),
         );
         goal.metadata.insert(
             "goal_orientation_required".into(),
@@ -1098,41 +1172,160 @@ impl SurfaceGoalSourceAdapter {
                 .is_some_and(|model| model.horizontal_fov_rad < std::f64::consts::TAU - 1e-6)
                 .to_string(),
         );
-        goal.metadata.insert(
-            "selection_method".into(),
-            if retry_index.is_some() {
-                "navigation_retry"
-            } else {
-                "regional_route"
-            }
-            .into(),
-        );
-        if let Some(selection) = selection {
-            goal.metadata.insert(
-                "region_wait_rounds".into(),
-                selection.priority_wait_rounds.to_string(),
-            );
-            goal.metadata.insert(
-                "route_regions".into(),
-                selection.regional_order.len().to_string(),
-            );
-            goal.metadata.insert(
-                "available_regions".into(),
-                selection.region_count.to_string(),
-            );
-            goal.metadata
-                .insert("route_cost_m".into(), selection.route_cost.to_string());
-        }
         goal.stamp = state.now;
+        Ok(goal)
+    }
+
+    fn stage_selected_goal(
+        &self,
+        goal: FrontierGoal,
+        support_xyz: [f64; 3],
+        vertical_radius_m: f64,
+        delta: &mut SurfacePollDelta,
+    ) -> ExplorationPoll {
         delta.last_frontiers = Some(vec![goal.clone()]);
         delta.selected = Some(Some(SelectedGoal {
             goal: goal.clone(),
-            support_xyz: candidate.support_xyz,
-            vertical_radius_m: vertical_radius,
+            support_xyz,
+            vertical_radius_m,
         }));
         delta.last_no_frontier = Some(false);
         delta.last_error = Some(None);
-        Ok(ExplorationPoll::Goal(goal))
+        ExplorationPoll::Goal(goal)
+    }
+
+    /// 旧候选只是提示；地面、机体、收益、路线均重新取本次原始输入。
+    fn revalidate_candidate(
+        &self,
+        state: &ExplorationStateSnapshot<'_>,
+        snapshot: &SurfaceSnapshot,
+        current: BodyPose,
+        robot_support: [f64; 3],
+        mut candidate: FrontierCandidate,
+        mut orientation: [f64; 4],
+        targets: &[nuwax_explore_routing::observation::ObservationTarget],
+        boundary: &[[f64; 2]],
+        vertical_radius: f64,
+        planner: &mut nuwax_nav_pct_native::Planner,
+        budget: &FrontierRouteBudget,
+        delta: &mut SurfacePollDelta,
+    ) -> ExploreResult<Option<FrontierGoal>> {
+        let started = std::time::Instant::now();
+        let minimum = f64::from(
+            snapshot
+                .config()
+                .goal_tolerance
+                .max(snapshot.config().voxel_size),
+        );
+        if self.excluded(candidate.support_xyz, vertical_radius)
+            || distance(robot_support, candidate.support_xyz) <= minimum
+        {
+            return Ok(None);
+        }
+        let body = snapshot
+            .body_position_from_support(
+                candidate.support_xyz,
+                orientation,
+                self.body_to_support_z_m,
+            )
+            .map_err(|error| ExploreError::SourceError(error.to_string()))?;
+        if !inside_boundary([body[0], body[1]], boundary)
+            || snapshot.body_envelope().is_some()
+                && snapshot.validate_body_pose(body, orientation).is_err()
+            || budget.exhausted()
+        {
+            return Ok(None);
+        }
+        budget.queries.set(budget.queries.get() + 1);
+        let route = match planner.plan(current.0, body) {
+            Ok(route) => route,
+            Err(_) => return Ok(None),
+        };
+        if nuwax_nav_pct_native::planning_cancelled() {
+            return Err(ExploreError::SourceError(
+                "frontier planning cancelled".into(),
+            ));
+        }
+        budget.expanded.set(budget.expanded.get() + route.expanded);
+        let Some(&endpoint) = route.path.last() else {
+            return Ok(None);
+        };
+        if route.path.len() < 2
+            || distance(endpoint, body) > f64::from(snapshot.config().voxel_size) * 0.25
+        {
+            return Ok(None);
+        }
+        if !self
+            .observation_model
+            .as_ref()
+            .is_some_and(|model| model.horizontal_fov_rad < std::f64::consts::TAU - 1e-6)
+        {
+            let previous = route.path[route.path.len() - 2];
+            let yaw = (endpoint[1] - previous[1]).atan2(endpoint[0] - previous[0]);
+            orientation = [0., 0., (yaw * 0.5).sin(), (yaw * 0.5).cos()];
+        }
+        if snapshot.body_envelope().is_some()
+            && snapshot.validate_body_pose(endpoint, orientation).is_err()
+        {
+            return Ok(None);
+        }
+        candidate.support_xyz = snapshot
+            .support_position_from_body(endpoint, orientation, self.body_to_support_z_m)
+            .map_err(|error| ExploreError::SourceError(error.to_string()))?;
+        let view = self
+            .observation_model
+            .as_ref()
+            .map(|model| snapshot.estimate_observation_view(model, endpoint, orientation, targets))
+            .transpose()
+            .map_err(ExploreError::SourceError)?;
+        if view.as_ref().is_some_and(|view| view.cells.is_empty())
+            || self.excluded(candidate.support_xyz, vertical_radius)
+        {
+            return Ok(None);
+        }
+        if let Some(view) = &view {
+            candidate.gain =
+                view.cells.len() as f64 * f64::from(snapshot.config().voxel_size).powi(2);
+        }
+        let travel = route
+            .path
+            .windows(2)
+            .map(|pair| distance(pair[0], pair[1]))
+            .sum::<f64>();
+        let mut goal = self.make_candidate_goal(
+            state,
+            &candidate,
+            (endpoint, orientation),
+            view.as_ref(),
+            travel,
+            delta,
+        )?;
+        for (key, value) in [
+            ("route_cost_basis", "current_input_selected_astar".into()),
+            ("route_exact_queries", "1".into()),
+            ("route_source_searches", "0".into()),
+            ("route_query_count", budget.queries.get().to_string()),
+            ("candidate_route_query_count", "1".into()),
+            (
+                "route_expanded_successes",
+                budget.expanded.get().to_string(),
+            ),
+            ("route_budget_limited", "false".into()),
+            ("evaluated_candidate_count", "1".into()),
+            ("admissible_candidate_count", "1".into()),
+            ("selection_method", "current_map_revalidation".into()),
+        ] {
+            goal.metadata.insert(key.into(), value);
+        }
+        tracing::info!(target:"navigation.exploration.compute",event="exploration.candidate.revalidated",
+            elapsed_ms=started.elapsed().as_secs_f64()*1000.0,expanded=route.expanded,
+            "旧候选已在当前输入完成独立完整路线核验");
+        let ExplorationPoll::Goal(goal) =
+            self.stage_selected_goal(goal, candidate.support_xyz, vertical_radius, delta)
+        else {
+            unreachable!()
+        };
+        Ok(Some(goal))
     }
 
     fn excluded(&self, point: [f64; 3], vertical_radius: f64) -> bool {
@@ -1205,6 +1398,7 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         }
         self.route_cursor = 0;
         self.deferred_route = None;
+        self.search_hint = None;
         self.history = history;
         self.regional_schedule = schedule;
         self.last_snapshot = None;
@@ -1233,6 +1427,7 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         self.ensure_no_prepared_poll()?;
         self.route_cursor = 0;
         self.deferred_route = None;
+        self.search_hint = None;
         self.active = true;
         self.selected = None;
         self.history.clear();
@@ -1253,6 +1448,7 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         self.ensure_no_prepared_poll()?;
         self.route_cursor = 0;
         self.deferred_route = None;
+        self.search_hint = None;
         self.active = false;
         self.selected = None;
         self.retry_support = None;
@@ -1285,10 +1481,10 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         if !self.active {
             let mut delta = SurfacePollDelta::default();
             let outcome = Ok(delta.unavailable("surface source is not active"));
-            return Ok(self.stage_poll(outcome, delta));
+            return Ok(self.stage_poll(outcome, delta, false));
         }
         if self.selected.is_some() {
-            return Ok(self.stage_poll(Ok(ExplorationPoll::Pending), SurfacePollDelta::default()));
+            return Ok(self.stage_poll(Ok(ExplorationPoll::Pending), SurfacePollDelta::default(), false));
         }
         if let Some(input) = state.frozen_surface_input {
             return self.prepare_poll_with_planning_input(state, input);
@@ -1296,7 +1492,7 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         match self.receiver.freeze() {
             Ok(input) => self.prepare_poll_with_input(state, &input),
             // Input read failures are algorithm outcomes, not transactional API errors.
-            Err(error) => Ok(self.stage_poll(Err(error), SurfacePollDelta::default())),
+            Err(error) => Ok(self.stage_poll(Err(error), SurfacePollDelta::default(), false)),
         }
     }
 
@@ -1305,14 +1501,14 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
             .prepared_poll
             .take()
             .ok_or(ExploreError::NoPreparedPoll)?;
+        self.search_hint=pending.search_hint;
         pending.delta.commit(self);
         pending.outcome
     }
 
     fn discard_prepared_poll(&mut self) -> ExploreResult<()> {
-        self.prepared_poll
-            .take()
-            .ok_or(ExploreError::NoPreparedPoll)?;
+        let pending=self.prepared_poll.take().ok_or(ExploreError::NoPreparedPoll)?;
+        self.search_hint=pending.search_hint;
         Ok(())
     }
 
@@ -1331,6 +1527,7 @@ impl ExplorationGoalSource for SurfaceGoalSourceAdapter {
         }
         self.route_cursor = 0;
         self.deferred_route = None;
+        self.search_hint = None;
         let selected = self.selected.take().expect("goal identity was checked");
         self.retry_support = None;
         self.last_no_frontier = false;
@@ -1418,6 +1615,7 @@ struct DeferredFrontierRoute {
     start_body: [f64; 3],
     start_orientation: [f64; 4],
     resume_cursor: usize,
+    rotation_offset: usize,
 }
 
 struct FrontierGeometry {
@@ -1531,6 +1729,7 @@ fn inside_boundary(point: [f64; 2], boundary: &[[f64; 2]]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod continuous_map_tests { include!("surface_continuous_map_tests.rs"); }
     #[test]
     fn legacy_replan_keeps_reached_world_points_and_resets_old_neighborhoods() {
         use super::*;

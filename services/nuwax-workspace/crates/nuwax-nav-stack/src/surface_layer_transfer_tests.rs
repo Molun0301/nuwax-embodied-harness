@@ -199,7 +199,7 @@ fn heightfield_reader_native_members_metadata_withdrawal_and_retirement() {
         let repo=Repository::temporary().unwrap();
         let mut writer=Writer::new(repo.clone(),0.05,4*1024*1024).unwrap();
         let mut reader=FineMapReader {receiver:Receiver::with_cache_budget(Repository::temporary().unwrap(),budget),
-            client:None,lcm_url:String::new()};
+            client:None,compress_parts:true,lcm_url:String::new()};
         let domain=Domain {session:"hf-reader".into(),generation:1,frame_generation:1,producer_generation:1};
         let mut previous:Option<(Arc<Manifest>,Arc<nuwax_nav_mls_planner::SurfaceObservations>)>=None;
         let mut pinned=None;

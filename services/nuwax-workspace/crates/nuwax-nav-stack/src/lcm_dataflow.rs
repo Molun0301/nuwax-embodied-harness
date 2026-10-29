@@ -948,7 +948,8 @@ struct GuardedPoseInput {
     pose: PoseStamped,
     frame_id: String,
     current: [f64; 3],
-    source_deadline: Option<tokio::time::Instant>,
+    source_max_age: Option<Duration>,
+    acquired_at: tokio::time::Instant,
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -966,20 +967,25 @@ fn drain_guarded_pose_input(
         let frame = required_frame(next, "guarded_nav_scheduler.map_pose")?;
         match decode_guarded_pose_input(&frame.payload)? {
             OwnerInput::Accepted(mut candidate) => {
-                let valid = source_max_age
-                    .map(|maximum| {
-                        guarded_pose_source_deadline(
-                            candidate.pose.stamp.nanos,
-                            maximum,
-                            wall_now,
-                            mono_now,
-                        )
-                    })
-                    .transpose();
+                let valid = source_max_age.map(|maximum| {
+                    let unix = wall_now.duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|_| "当前墙钟早于Unix纪元".to_string())?.as_nanos() as u64;
+                    let source = u64::try_from(candidate.pose.stamp.nanos)
+                        .ok().filter(|v| *v > 0).ok_or("位姿源时间必须为正")?;
+                    let age = nuwax_nav_types_messages::source_time::data_age_ns_at(source, unix)?;
+                    if u128::from(age) >= maximum.as_nanos() {
+                        return Err(format!("位姿来源数据已过期：{}毫秒", age / 1_000_000));
+                    }
+                    // 执行采集时刻继续保留真实经过的墙钟时间，来源判龄不能让它变新。
+                    let capture_age = nuwax_nav_types_messages::source_time::age_ns_at(source, unix)?;
+                    mono_now.checked_sub(Duration::from_nanos(capture_age))
+                        .ok_or_else(|| "位姿采集单调时刻下溢".into())
+                }).transpose();
                 match valid {
                     Err(reason) => diagnostics.reject("guarded_nav_scheduler.map_pose", &reason),
-                    Ok(deadline) => {
-                        candidate.source_deadline = deadline;
+                    Ok(acquired_at) => {
+                        candidate.source_max_age = source_max_age;
+                        candidate.acquired_at = acquired_at.unwrap_or(mono_now);
                         if newest.as_ref().is_none_or(|value| candidate.pose.stamp.nanos > value.pose.stamp.nanos) {
                             newest = Some(candidate);
                         }
@@ -1078,7 +1084,8 @@ fn decode_guarded_pose_input(payload: &[u8]) -> OwnerInputResult<GuardedPoseInpu
         pose,
         frame_id: pose_message.header.frame_id,
         current,
-        source_deadline: None,
+        source_max_age: None,
+        acquired_at: tokio::time::Instant::now(),
     }))
 }
 
@@ -1605,22 +1612,18 @@ where
                 else {
                     continue;
                 };
-                let source_deadline = input.source_deadline;
+                let source_age_limit = input.source_max_age;
                 #[cfg(all(test,feature="surface-recovery-qualification"))]
                 if let Some(t)=scheduler.qualification_timing() {t.mark("bridge.pose.drained",input.pose.stamp.nanos);}
                 let mut candidate_telemetry = telemetry.clone();
                 commit_guarded_pose_telemetry(&mut candidate_telemetry, &input);
                 #[cfg(all(test,feature="surface-recovery-qualification"))]
                 let pose_ack=scheduler.qualification_timing().map(|t|t.span("bridge.pose.scheduler_ack",input.pose.stamp.nanos));
-                let acquired_at = source_deadline.map(|deadline| {
-                    deadline.checked_sub(source_max_age.expect("已配置来源期限"))
-                        .ok_or_else(|| NavStackError::InvalidConfig("位姿采集单调时刻下溢".into()))
-                }).transpose()?;
                 let settlement = await_guarded_active_input(async {
-                    match (source_deadline, acquired_at) {
-                        (Some(deadline), Some(acquired_at)) => scheduler
-                            .update_odometry_with_acquisition(input.pose, acquired_at, deadline).await,
-                        _ => scheduler.update_odometry(input.pose).await,
+                    match source_age_limit {
+                        Some(maximum) => scheduler
+                            .update_odometry_with_source_age(input.pose, input.acquired_at, maximum).await,
+                        None => scheduler.update_odometry(input.pose).await,
                     }
                 }, node, transport, scheduler, &mut cancels, active_session.as_ref(),
                     &mut cancel_generation_watermark, &mut arbiter, &telemetry).await;

@@ -336,13 +336,19 @@ impl SurfaceObservations {
     // Sufficient equality for Explore's derived queries, not raw evidence.
     // Exact columns and block_edge also preserve block presence for partial
     // sources: replace_block never retains an empty raw block.
+    #[cfg(test)]
     pub(super) fn same_planning_query_view(&self,other:&Self)->bool {
-        self.size_m.to_bits()==other.size_m.to_bits()
-            && self.block_edge==other.block_edge
-            && self.complete_geometry_source==other.complete_geometry_source
-            && self.columns.ptr_eq(&other.columns)
-            && self.observed_layers.ptr_eq(&other.observed_layers)
-            && Arc::ptr_eq(&self.layer_geometry,&other.layer_geometry)
+        self.planning_query_change(other).is_none()
+    }
+    /// 沿原查询资格逐项说明变化，不用修订号或接收时间代替几何判断。
+    pub(super) fn planning_query_change(&self,other:&Self)->Option<&'static str> {
+        if self.size_m.to_bits()!=other.size_m.to_bits() { Some("observation_resolution") }
+        else if self.block_edge!=other.block_edge { Some("observation_block_layout") }
+        else if self.complete_geometry_source!=other.complete_geometry_source { Some("observation_completeness") }
+        else if !self.columns.ptr_eq(&other.columns) { Some("observation_occupancy") }
+        else if !self.observed_layers.ptr_eq(&other.observed_layers) { Some("observed_layer_query") }
+        else if !Arc::ptr_eq(&self.layer_geometry,&other.layer_geometry) { Some("ground_layer_geometry") }
+        else { None }
     }
     pub(super) fn navigation_columns(&self)->impl Iterator<Item=([i32;2],&[i32])> {
         self.columns.iter().map(|(&key,levels)|(key,levels.as_slice()))

@@ -316,6 +316,16 @@ async fn publish_surface_owner_receipt(
     ticket
 }
 
+// 代表真正的新观测；与上面的同一来源重发夹具分开，重发不能刷新数据年龄。
+async fn publish_fresh_surface_observation(
+    handle: &ExploreRuntimeHandle, revision: i32, snapshot: Arc<SurfaceSnapshot>,
+) -> SurfaceMapTicket {
+    let message = surface_message("map", revision);
+    let ticket = handle.begin_surface_map_update(&message, now_monotonic_nanos()).await.unwrap().unwrap();
+    assert!(handle.finish_surface_map_update(ticket.clone(), Ok(snapshot)).await);
+    ticket
+}
+
 fn surface_owner_goal(poll: &ExplorationPoll) -> &FrontierGoal {
     match poll {
         ExplorationPoll::Goal(goal) => goal,

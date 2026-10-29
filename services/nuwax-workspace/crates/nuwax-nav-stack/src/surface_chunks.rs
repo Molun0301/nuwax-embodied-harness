@@ -9,6 +9,7 @@ pub(super) struct FineMapReader {
     receiver: Receiver,
     client: Option<nuwax_rpc::RpcClient>,
     lcm_url: String,
+    compress_parts: bool,
 }
 impl FineMapReader {
     /// 按块证据修订刷新观察块；几何未变化的时间更新也必须交付。
@@ -113,12 +114,13 @@ impl FineMapReader {
         Ok(Self {
             receiver: Receiver::with_cache_budget(repository, 32 * 1024 * 1024),
             client: None,
+            compress_parts: true,
             lcm_url,
         })
     }
     #[cfg(feature = "surface-source-qualification")]
     pub(super) fn from_admitted_receiver(receiver: Receiver) -> Self {
-        Self { receiver, client: None, lcm_url: "memq://".into() }
+        Self { receiver, client: None, lcm_url: "memq://".into(), compress_parts: true }
     }
 
     pub(super) fn receive(
@@ -132,6 +134,7 @@ impl FineMapReader {
         let deadline = Instant::now() + Duration::from_secs(2);
         let client = &mut self.client;
         let url = &self.lcm_url;
+        let compress_parts = &mut self.compress_parts;
         let mut fetched_blocks=0_usize;
         let received=receive_with_fetch(&mut self.receiver, transfer, &expected, |root, reference| {
             fetched_blocks+=1;
@@ -142,35 +145,8 @@ impl FineMapReader {
                 ).map_err(|e| e.to_string())?);
             }
             let runtime = tokio::runtime::Handle::try_current().map_err(|_| "可靠补取必须在原受管阻塞构建任务中执行")?;
-            let mut request = block_request(root, reference);
-            let mut joined = Vec::new();
-            let mut total = None;
-            loop {
-                request["offset"] = serde_json::json!(joined.len());
-                let mut last = "精细块补取期限耗尽".to_string();
-                let mut reply = None;
-                for _ in 0..3 {
-                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else { break; };
-                    let result = runtime.block_on(client.as_ref().unwrap().call_scoped((vec![request.clone()], Default::default()), remaining.min(Duration::from_millis(350))));
-                    match result {
-                        Ok(value) => { reply=Some(value); break; }
-                        Err(error @ (nuwax_rpc::RpcError::Timeout { .. } | nuwax_rpc::RpcError::Transport(_))) => {
-                            last = error.to_string();
-                        }
-                        Err(error) => return Err(SurfaceMapBuildError::Invalid(error.to_string())),
-                    }
-                }
-                let reply=reply.ok_or_else(|| SurfaceMapBuildError::IncompleteFineSource(
-                    crate::surface_map::MissingFineObject { object: reference.object, key: reference.key, reason: last }))?;
-                let part=block_response(&request,&reply)?;
-                let length=reply["total_bytes"].as_u64().expect("分段格式已检查") as usize;
-                if total.is_some_and(|previous|previous!=length) {
-                    return Err(SurfaceMapBuildError::Invalid("精细块分段总长变化".into()));
-                }
-                total=Some(length);
-                joined.extend_from_slice(&part);
-                if joined.len()==length {return Ok(joined);}
-            }
+            runtime.block_on(fetch_block_parts(client.as_ref().unwrap(), root, reference, deadline, compress_parts))
+
         })?;
         if fetched_blocks>0 {tracing::debug!(fetched_blocks,blocks=received.blocks.len(),revision=received.revision,"精细地图可靠补取完成");}
         Ok(received)
@@ -263,6 +239,54 @@ impl FineMapReader {
     }
 }
 
+/// 同一对象最多四段并发，总期限仍是原构建拥有方的两秒；每段仍受256KiB限制。
+async fn fetch_block_parts(client: &nuwax_rpc::RpcClient, root: &Manifest,
+    reference: &nuwax_map_chunks::BlockRef, deadline: Instant, compress_parts: &mut bool) -> Result<Vec<u8>, SurfaceMapBuildError> {
+    async fn part(client: &nuwax_rpc::RpcClient, mut request: serde_json::Value,
+        reference: &nuwax_map_chunks::BlockRef, deadline: Instant) -> Result<(Vec<u8>, usize, bool), SurfaceMapBuildError> {
+        let mut last = "精细块补取期限耗尽".to_string();
+        for _ in 0..3 {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else { break; };
+            match client.call_scoped((vec![request.clone()], Default::default()),
+                remaining.min(Duration::from_millis(350))).await {
+                Ok(reply) => {
+                    let data = block_response(&request, &reply)?;
+                    return Ok((data, reply["total_bytes"].as_u64().expect("分段格式已检查") as usize,
+                        request.get("part_encoding").is_some()));
+                }
+                Err(error @ (nuwax_rpc::RpcError::Timeout { .. } | nuwax_rpc::RpcError::Transport(_))) => last = error.to_string(),
+                Err(nuwax_rpc::RpcError::RemoteException(error)) if request.get("part_encoding").is_some()
+                    && error["type_name"] == "InvalidArguments"
+                    && error["args"][0].as_str().is_some_and(|reason| reason.contains("unknown field `part_encoding`")) => {
+                    // 仅针对旧服务明确拒绝协商字段降级；身份、范围及校验错误均不降级。
+                    request.as_object_mut().unwrap().remove("part_encoding");
+                }
+                Err(error) => return Err(SurfaceMapBuildError::Invalid(error.to_string())),
+            }
+        }
+        Err(SurfaceMapBuildError::IncompleteFineSource(crate::surface_map::MissingFineObject {
+            object: reference.object, key: reference.key, reason: last }))
+    }
+    let mut request = block_request(root, reference);
+    if !*compress_parts { request.as_object_mut().unwrap().remove("part_encoding"); }
+    let (mut joined, total, supported) = part(client, request.clone(), reference, deadline).await?;
+    *compress_parts = supported;
+    if !supported { request.as_object_mut().unwrap().remove("part_encoding"); }
+    while joined.len() < total {
+        let requests = (joined.len()..total).step_by(MAX_BLOCK_TRANSFER_PART_BYTES).take(4).map(|offset| {
+            let mut request = request.clone();
+            request["offset"] = serde_json::json!(offset);
+            part(client, request, reference, deadline)
+        });
+        // 返回次序与偏移次序一致；任一段失败时原接收器不会安装不完整根。
+        for (bytes, length, _) in futures::future::try_join_all(requests).await? {
+            if length != total { return Err(SurfaceMapBuildError::Invalid("精细块分段总长变化".into())); }
+            joined.extend_from_slice(&bytes);
+        }
+    }
+    Ok(joined)
+}
+
 /// Receiver commits only complete, verified roots. Preserve the fetch failure's
 /// type across its string-error API without classifying arbitrary error text.
 fn receive_with_fetch(
@@ -295,6 +319,7 @@ pub(super) fn block_request(root: &Manifest, reference: &nuwax_map_chunks::Block
     };
     serde_json::json!({
         "schema_version": 3,
+        "part_encoding": "lz4",
         "offset": 0,
         "max_bytes": MAX_BLOCK_TRANSFER_PART_BYTES,
         "root": root.identity(),
@@ -318,7 +343,11 @@ fn block_response(request: &serde_json::Value, response: &serde_json::Value) -> 
     if request["schema_version"].as_u64() == Some(3) {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         if response.get("data").is_some() { return Err("精细块响应包含混合编码".into()); }
-        let encoded = response.get("data_base64").and_then(serde_json::Value::as_str)
+        let compressed = response.get("data_lz4_base64");
+        if compressed.is_some() && (request["part_encoding"] != "lz4" || response.get("data_base64").is_some()) {
+            return Err("精细块响应包含未协商或混合编码".into());
+        }
+        let encoded = compressed.or_else(|| response.get("data_base64")).and_then(serde_json::Value::as_str)
             .ok_or("精细块紧凑响应格式错误")?;
         let offset=request["offset"].as_u64().filter(|value|*value<MAX_BLOCK_BYTES as u64)
             .ok_or("精细块请求偏移错误")?;
@@ -331,6 +360,9 @@ fn block_response(request: &serde_json::Value, response: &serde_json::Value) -> 
         // 分配前限制编码长度，解码后要求精确段长；空段、错序及尾部缺字节不能推进。
         if encoded.len() > expected.div_ceil(3) * 4 { return Err("精细块响应长度错误".into()); }
         let data = STANDARD.decode(encoded).map_err(|_| "精细块紧凑响应编码无效")?;
+        if compressed.is_some() {
+            return nuwax_codec::lcm::map_block_part::decompress(&data, expected);
+        }
         if data.len()!=expected { return Err("精细块响应长度错误".into()); }
         return Ok(data);
     }
@@ -372,6 +404,33 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     include!("surface_layer_transfer_tests.rs");
     include!("surface_chunk_retry_tests.rs");
+    include!("surface_input_capture.rs");
+
+    #[test]
+    fn compressed_reply_keeps_scope_extent_and_legacy_fallback_checks() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let source = Repository::temporary().unwrap();
+        let root = install(&source, &BTreeSet::from([[0,0,0]]), 0.05, 1);
+        let request = block_request(&root, &root.blocks[0]);
+        let bytes = vec![7; MAX_BLOCK_TRANSFER_PART_BYTES];
+        let mut reply = request.clone();
+        reply["total_bytes"] = serde_json::json!(bytes.len());
+        reply["data_lz4_base64"] = serde_json::json!(STANDARD.encode(
+            nuwax_codec::lcm::map_block_part::compress(&bytes).unwrap()));
+        assert_eq!(block_response(&request, &reply).unwrap(), bytes);
+        let mut mixed = reply.clone();
+        mixed["data_base64"] = serde_json::json!(STANDARD.encode(&bytes));
+        assert!(block_response(&request, &mixed).is_err());
+        let mut wrong = reply.clone();
+        wrong["block"]["geometry_revision"] = serde_json::json!(1000);
+        assert!(block_response(&request, &wrong).is_err());
+        let mut unnegotiated = request.clone();
+        unnegotiated.as_object_mut().unwrap().remove("part_encoding");
+        assert!(block_response(&unnegotiated, &reply).is_err());
+        reply.as_object_mut().unwrap().remove("data_lz4_base64");
+        reply["data_base64"] = serde_json::json!(STANDARD.encode(&bytes));
+        assert_eq!(block_response(&request, &reply).unwrap(), bytes, "旧服务原编码仍可接收");
+    }
 
     // Fresh-root compatibility for existing doorway diagnostic recipes.
     #[allow(dead_code)]
@@ -405,6 +464,7 @@ mod tests {
         FineMapReader {
             receiver: Receiver::with_cache_budget(repository, 1024 * 1024),
             client: None,
+            compress_parts: true,
             lcm_url: String::new(),
         }
     }

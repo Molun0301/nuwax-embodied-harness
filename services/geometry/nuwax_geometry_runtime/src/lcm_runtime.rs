@@ -5493,7 +5493,7 @@ struct SharedStatePoseProvider {
     state: Arc<RwLock<SharedState>>,
     expected_map_frame: Arc<str>,
     freshness: Arc<parking_lot::Mutex<PoseFreshnessTracker>>,
-    max_receipt_age: Duration,
+    max_source_age: Duration,
 }
 
 #[derive(Default)]
@@ -5513,9 +5513,9 @@ impl crate::explore_runtime::ExplorePoseProvider for SharedStatePoseProvider {
                 self.expected_map_frame, pose.frame_id, pose.timestamp_ns,
             ));
         }
-        let source_age_ns = nuwax_nav_types_messages::source_time::age_ns_at(
+        let source_age_ns = nuwax_nav_types_messages::source_time::data_age_ns_at(
             pose.timestamp_ns, crate::explore_runtime::now_unix_nanos())?;
-        if source_age_ns > self.max_receipt_age.as_nanos() as u64 {
+        if source_age_ns > self.max_source_age.as_nanos() as u64 {
             return Err(format!(
                 "map-frame pose source timestamp is stale (source_timestamp_ns={}, source_age_ms={})",
                 pose.timestamp_ns,
@@ -5534,7 +5534,7 @@ impl crate::explore_runtime::ExplorePoseProvider for SharedStatePoseProvider {
                 .ok_or_else(|| "map-frame pose freshness observation is unavailable".to_string())?;
             (freshness.received_monotonic_ns, received_at.elapsed())
         };
-        if receipt_age > self.max_receipt_age {
+        if !nuwax_nav_types_messages::source_time::input_is_alive(receipt_age.as_nanos() as u64) {
             return Err(format!(
                 "map-frame pose is stale (source_timestamp_ns={}, receipt_age_ms={})",
                 pose.timestamp_ns,
@@ -8886,7 +8886,7 @@ pub async fn spawn_geometry_runtime(
         state: state.clone(),
         expected_map_frame: expected_map_frame.clone(),
         freshness: Arc::new(parking_lot::Mutex::new(PoseFreshnessTracker::default())),
-        max_receipt_age: Duration::from_millis(pose_ttl_ms),
+        max_source_age: Duration::from_millis(pose_ttl_ms),
     });
     let scheduler_period = Duration::from_millis(scheduler_period_ms);
     let scheduler_shutdown_rx = task_control.shutdown_receiver();
@@ -9197,6 +9197,7 @@ async fn ingest_mapping_points_with_backend_owned(
     sensor_origin_map: Option<[f64; 3]>,
     accepted_cloud: Option<crate::admitted_cloud::AcceptedMappingCloud>,
 ) -> Result<MappingIngestCommit, nuwax_mapping::SessionError> {
+    let stage_start = std::time::Instant::now();
     let prepared = {
         let _lifecycle_guard = lifecycle_lock.lock().await;
         let mut adapter = mapping.lock();
@@ -9290,12 +9291,14 @@ async fn ingest_mapping_points_with_backend_owned(
     if let Some(origin) = sensor_origin_map {
         prepared.input.sensor_origin_map = origin;
     }
+    let admission_ms = stage_start.elapsed().as_secs_f64() * 1000.0;
     if let Some(source)=accepted_cloud.as_ref().and_then(|s|s.lidar()) {
         if let Some(writer)=cloud_map_writer.lock().as_mut(){
             prepared.input.dynamic_frame=Some(writer.classify_admitted_scan(source).map_err(|reason|nuwax_mapping::SessionError::FrameTransformUnavailable{
                 source_frame_id:frame_id.into(),target_frame_id:frame_id.into(),reason})?);
         }
     }
+    let classify_ms = stage_start.elapsed().as_secs_f64() * 1000.0 - admission_ms;
     let token = prepared.token.clone();
     let completion_rx = match prepared.worker.submit(prepared.token, prepared.input) {
         Ok(receiver) => receiver,
@@ -9350,6 +9353,7 @@ async fn ingest_mapping_points_with_backend_owned(
         }
     };
     let preparation = mapping.lock().prepare_backend_completion(completion);
+    let backend_ms = stage_start.elapsed().as_secs_f64() * 1000.0 - admission_ms - classify_ms;
     let prepared_completion = match tokio::task::spawn_blocking(move || preparation.compute()).await
     {
         Ok(prepared) => prepared,
@@ -9374,6 +9378,7 @@ async fn ingest_mapping_points_with_backend_owned(
             });
         }
     };
+    let occupancy_ms = stage_start.elapsed().as_secs_f64() * 1000.0 - admission_ms - classify_ms - backend_ms;
     let mut projection_guard = explore_projection_gate.clone().lock_owned().await;
     let lifecycle_guard = lifecycle_lock.lock().await;
     let committed_result = {
@@ -9513,6 +9518,11 @@ async fn ingest_mapping_points_with_backend_owned(
         }
     }
     drop(projection_guard);
+    tracing::debug!(target: "mapping.commit.stages", event="mapping.commit.stages",
+        source_timestamp_ns, point_count=points.len(), admission_ms, classify_ms, backend_ms, occupancy_ms,
+        cloud_commit_ms=stage_start.elapsed().as_secs_f64()*1000.0-admission_ms-classify_ms-backend_ms-occupancy_ms,
+        total_ms=stage_start.elapsed().as_secs_f64()*1000.0, succeeded=commit_result.is_ok(),
+        "几何提交阶段耗时");
     match commit_result {
         Ok(commit) => Ok(commit),
         Err((target_frame_id, reason, retirement)) => {
@@ -15257,7 +15267,7 @@ pub(crate) mod mapping_feed_tests {
             state,
             expected_map_frame: Arc::from("map"),
             freshness: Arc::new(parking_lot::Mutex::new(PoseFreshnessTracker::default())),
-            max_receipt_age: Duration::from_secs(1),
+            max_source_age: Duration::from_secs(1),
         };
         let pose = crate::explore_runtime::ExplorePoseProvider::current_pose(&provider)
             .await
@@ -19464,7 +19474,7 @@ pub(crate) mod mapping_feed_tests {
             state,
             expected_map_frame: Arc::from(MAP_FRAME),
             freshness: Arc::new(parking_lot::Mutex::new(PoseFreshnessTracker::default())),
-            max_receipt_age: Duration::from_secs(1),
+            max_source_age: Duration::from_secs(1),
         };
         let pose = crate::explore_runtime::ExplorePoseProvider::current_pose(&provider)
             .await
@@ -20475,7 +20485,7 @@ mod exploration_adapter_tests {
                 state: state.clone(),
                 expected_map_frame: Arc::from("map"),
                 freshness: Arc::new(parking_lot::Mutex::new(PoseFreshnessTracker::default())),
-                max_receipt_age: ttl,
+                max_source_age: ttl,
             },
             state,
         )

@@ -151,7 +151,7 @@ async fn stale_surface_pending_keeps_real_candidate_progress_without_dispatch() 
     }
     let snapshot = Arc::new(floor.with_virtual_obstacles([-2.0, -2.0], 0.1, 160, 140, &mask).unwrap());
     assert!(snapshot.frontier_candidates(&[]).unwrap().len() > 128);
-    publish_surface_owner_receipt(&handle, &message.committed_map, 2, snapshot.clone()).await;
+    publish_fresh_surface_observation(&handle, 2, snapshot.clone()).await;
     handle.start("source-gap-progress", "prefer_wavefront").await;
     let audit = Arc::new(StdMutex::new(SurfaceOwnerAudit::default()));
     let gate = Arc::new(OwnerRuntimeGate::default());
@@ -177,7 +177,7 @@ async fn stale_surface_pending_keeps_real_candidate_progress_without_dispatch() 
     let since = handle.inner.lock().await.selection_wait_since;
     let mut completed = false;
     for revision in 3..23 {
-        publish_surface_owner_receipt(&handle, &message.committed_map, revision, snapshot.clone()).await;
+        publish_fresh_surface_observation(&handle, revision, snapshot.clone()).await;
         handle.tick_with_pose(surface_pose(&snapshot, 0.0, Quaternion::IDENTITY)).await;
         if matches!(handle.inner.lock().await.last_poll, Some(ExplorationPoll::NoFrontier)) {
             completed = true;
@@ -213,7 +213,9 @@ async fn no_path_child_and_short_surface_gap_retry_once_after_real_receipt() {
     let since = handle.inner.lock().await.selection_wait_since;
     assert!(since.is_some());
     assert_eq!(sink.submitted.lock().unwrap().len(), 1);
-    publish_surface_owner_receipt(&handle, &message.committed_map, 2, snapshot).await;
+    publish_surface_owner_receipt(&handle, &message.committed_map, 2, snapshot.clone()).await;
+    assert!(handle.tick_with_pose(pose.clone()).await.message.contains("surface map input stale"), "原来源重发不能复活过期数据");
+    publish_fresh_surface_observation(&handle, 3, snapshot).await;
     assert_eq!(handle.inner.lock().await.selection_wait_since, since);
     assert_eq!(handle.tick_with_pose(pose.clone()).await.status, STATUS_ACTIVE);
     assert!(handle.inner.lock().await.selection_wait_since.is_none());

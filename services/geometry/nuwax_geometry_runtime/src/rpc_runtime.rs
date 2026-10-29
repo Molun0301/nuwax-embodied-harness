@@ -75,6 +75,10 @@ fn decode_request<T: DeserializeOwned>(args: RpcArgs) -> Result<T, InvocationErr
 }
 
 fn encode_navigation_map_block_response(response: NavigationMapBlockResponse) -> Result<Value, InvocationError> {
+    encode_navigation_map_block_part(response, false)
+}
+
+fn encode_navigation_map_block_part(response: NavigationMapBlockResponse, compressed: bool) -> Result<Value, InvocationError> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     match response.schema_version {
         2 => Ok(serde_json::json!({"schema_version":2,"root":response.root,
@@ -88,6 +92,11 @@ fn encode_navigation_map_block_response(response: NavigationMapBlockResponse) ->
             }
             // 只改变显式新版RPC的字节表示，避免数百万整数值及容器克隆。
             // 原不可变块、完整身份、拥有方和期限继续由原服务检查。
+            if let Some(data) = compressed.then(|| nuwax_codec::lcm::map_block_part::compress(&response.data)).flatten() {
+                return Ok(serde_json::json!({"schema_version":3,"root":response.root,
+                    "block":response.block,"offset":response.offset,"total_bytes":response.total_bytes,
+                    "data_lz4_base64":STANDARD.encode(data)}));
+            }
             Ok(serde_json::json!({"schema_version":3,"root":response.root,
                 "block":response.block,"offset":response.offset,"total_bytes":response.total_bytes,
                 "data_base64":STANDARD.encode(&response.data)}))
@@ -100,12 +109,21 @@ struct GeometryRpcHandler {
     service: Arc<GeometryRuntimeService>,
 }
 
+fn take_part_compression(args: &mut RpcArgs) -> bool {
+    let encoding = args.0.first_mut().and_then(Value::as_object_mut)
+        .and_then(|value| value.remove("part_encoding"))
+        .or_else(|| args.1.remove("part_encoding"));
+    encoding.is_some_and(|v| v.as_str() == Some("lz4"))
+}
+
 impl GeometryRpcHandler {
-    async fn invoke(&self, args: RpcArgs) -> Result<Value, InvocationError> {
+    async fn invoke(&self, mut args: RpcArgs) -> Result<Value, InvocationError> {
+        // 旧客户端不请求新编码；新客户端也能消费旧服务返回的原Base64段。
+        let compressed = take_part_compression(&mut args);
         let request = decode_request::<NavigationMapBlockRequest>(args)?;
         let response = GeometryRuntime::get_navigation_map_block(&*self.service, Request::new(request))
             .await.map_err(InvocationError::status)?;
-        encode_navigation_map_block_response(response.into_inner())
+        encode_navigation_map_block_part(response.into_inner(), compressed)
     }
 }
 
@@ -156,6 +174,24 @@ mod tests {
                 schema_version, root: None, block: None, data: vec![0; length],offset:0,total_bytes:length as u32,
             }).is_err());
         }
+    }
+
+    #[test]
+    fn compressed_parts_preserve_exact_object_bytes_and_require_explicit_negotiation() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let data = vec![42; nuwax_map_chunks::MAX_BLOCK_TRANSFER_PART_BYTES];
+        let response = NavigationMapBlockResponse { schema_version:3, root:None, block:None,
+            data:data.clone(), offset:0, total_bytes:data.len() as u32 };
+        let plain = encode_navigation_map_block_response(response.clone()).unwrap();
+        assert!(plain.get("data_lz4_base64").is_none());
+        let compressed = encode_navigation_map_block_part(response, true).unwrap();
+        assert!(compressed.get("data_base64").is_none());
+        let bytes = STANDARD.decode(compressed["data_lz4_base64"].as_str().unwrap()).unwrap();
+        assert_eq!(nuwax_codec::lcm::map_block_part::decompress(&bytes, data.len()).unwrap(), data);
+        let request = serde_json::json!({"schema_version":3,"max_bytes":256,"part_encoding":"lz4"});
+        let mut args = (vec![request], HashMap::new());
+        assert!(take_part_compression(&mut args));
+        assert!(decode_request::<NavigationMapBlockRequest>(args).is_ok(), "外层协商不能进入严格protobuf字段解码");
     }
 
     #[test]

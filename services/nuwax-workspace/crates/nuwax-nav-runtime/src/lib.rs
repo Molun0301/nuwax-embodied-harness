@@ -1091,6 +1091,7 @@ pub struct NavScheduler<M, P> {
     pose_acquired_at: Option<Instant>,
     pose_receipt: Option<PlannerInputReceipt>,
     pose_valid_until: Option<Instant>,
+    pose_source_max_age: Option<Duration>,
     obstacle_source_available: bool,
     obstacle_source_bound: Option<CommandDispatchBound>,
     costmap_receipt: Option<PlannerInputReceipt>,
@@ -1138,6 +1139,7 @@ where
             pose_acquired_at: None,
             pose_receipt: None,
             pose_valid_until: None,
+            pose_source_max_age: None,
             obstacle_source_available: true,
             obstacle_source_bound: None,
             costmap_receipt: None,
@@ -1440,7 +1442,7 @@ where
             let (kind, source) = match &command.kind {
                 InputKind::StartSession(_) => ("scheduler.input.start_session", 0),
                 InputKind::SubmitPath(_) => ("scheduler.input.path", 0),
-                InputKind::UpdateOdometry(pose, _, _) => ("scheduler.input.pose", pose.stamp.nanos),
+                InputKind::UpdateOdometry(pose, _, _) | InputKind::UpdateSourceOdometry(pose, _, _) => ("scheduler.input.pose", pose.stamp.nanos),
                 InputKind::UpdateCostmap(map, _) => ("scheduler.input.map", map.source_timestamp_ns),
                 // Runtime owns no recent source timestamp; record its actual incoming bound.
                 InputKind::UpdateObstacleSource(_, _, _, _) => ("scheduler.input.recent", 0),
@@ -1463,6 +1465,9 @@ where
             InputKind::SubmitPath(path) => self.submit_path(status_tx, path).await,
             InputKind::UpdateOdometry(odometry, valid_until, acquired_at) => {
                 self.observe_odometry_at(status_tx, odometry, valid_until, acquired_at)
+            }
+            InputKind::UpdateSourceOdometry(odometry, acquired_at, max_age) => {
+                self.observe_odometry_qualified_at(status_tx, odometry, None, acquired_at, Some(max_age))
             }
             InputKind::UpdateCostmap(observation, received_at) => {
                 self.observe_costmap(status_tx, observation, received_at)
@@ -1529,11 +1534,19 @@ where
     }
 
     fn observe_odometry_at(
+        &mut self, status_tx: &watch::Sender<SchedulerStatus>, odometry: PoseStamped,
+        valid_until: Option<Instant>, acquired_at: Instant,
+    ) -> Result<(), RuntimeError> {
+        self.observe_odometry_qualified_at(status_tx, odometry, valid_until, acquired_at, None)
+    }
+
+    fn observe_odometry_qualified_at(
         &mut self,
         status_tx: &watch::Sender<SchedulerStatus>,
         odometry: PoseStamped,
         valid_until: Option<Instant>,
         acquired_at: Instant,
+        source_max_age: Option<Duration>,
     ) -> Result<(), RuntimeError> {
         if acquired_at > Instant::now() {
             return Err(RuntimeError::InvalidInput {
@@ -1552,6 +1565,9 @@ where
             ));
         }
         let source_timestamp_ns = odometry.stamp.nanos;
+        if let Some(max_age) = source_max_age {
+            check_pose_data_age(source_timestamp_ns, max_age)?;
+        }
         validate_source_timestamp(
             "odometry.source_timestamp_ns",
             source_timestamp_ns,
@@ -1565,6 +1581,7 @@ where
             received_at: Instant::now(),
         });
         self.pose_valid_until = valid_until;
+        self.pose_source_max_age = source_max_age;
         self.refresh_input_status(Instant::now());
         if self.status.last_terminal.is_none() && self.session.is_none() {
             self.status.message = "fresh map pose consumed".into();
@@ -1625,7 +1642,11 @@ where
         self.status.costmap_receipt_age_ms = receipt_age_ms(self.costmap_receipt, now);
         self.status.planner_inputs_fresh = self
             .pose_receipt
-            .is_some_and(|receipt| self.config.pose_ttl.is_zero() || now.duration_since(receipt.received_at) <= self.config.pose_ttl)
+            .is_some_and(|receipt| self.pose_source_max_age.map_or_else(
+                || self.config.pose_ttl.is_zero() || now.duration_since(receipt.received_at) <= self.config.pose_ttl,
+                |maximum| nuwax_nav_types_messages::source_time::input_is_alive(
+                    now.saturating_duration_since(receipt.received_at).as_nanos() as u64)
+                    && check_pose_data_age(receipt.source_timestamp_ns, maximum).is_ok()))
             && self.pose_valid_until.is_none_or(|deadline| now < deadline)
             && self.obstacle_source_available
             && self.obstacle_source_bound.is_none_or(|bound|!bound.expired_now())
@@ -1640,7 +1661,14 @@ where
         if self.obstacle_source_bound.is_some_and(CommandDispatchBound::expired_now) {
             return Some("recent obstacle source deadline elapsed".into());
         }
-        let pose_reason =
+        let pose_reason = if let Some(maximum) = self.pose_source_max_age {
+            self.pose_receipt.and_then(|receipt| {
+                if !nuwax_nav_types_messages::source_time::input_is_alive(
+                    now.saturating_duration_since(receipt.received_at).as_nanos() as u64) {
+                    Some("pose input liveness deadline elapsed".into())
+                } else { check_pose_data_age(receipt.source_timestamp_ns, maximum).err().map(|e| e.to_string()) }
+            })
+        } else {
             stale_receipt_reason("pose", self.pose_receipt, now, self.config.pose_ttl).or_else(
                 || {
                     self.pose_valid_until
@@ -1652,7 +1680,8 @@ where
                             )
                         })
                 },
-            );
+            )
+        };
         let costmap_reason = stale_receipt_reason(
             "costmap",
             self.costmap_receipt,
@@ -2457,6 +2486,14 @@ impl NavSchedulerHandle {
         self.send_input(InputKind::UpdateOdometry(odometry, Some(valid_until), acquired_at)).await
     }
 
+    /// 生产位姿按来源钟动态判龄；采集单调时刻保留真实墙钟年龄，不能续期执行许可。
+    pub async fn update_odometry_with_source_age(
+        &self, odometry: PoseStamped, acquired_at: Instant, max_source_age: Duration,
+    ) -> Result<(), RuntimeError> {
+        self.send_input(InputKind::UpdateSourceOdometry(odometry, acquired_at, max_source_age)).await
+    }
+
+
     /// Update the planner costmap with its real revision and source timestamp.
     pub async fn update_costmap(
         &self,
@@ -2574,7 +2611,7 @@ impl NavSchedulerHandle {
             let (phase, source) = match &kind {
                 InputKind::StartSession(_) => ("scheduler.send.start_session", 0),
                 InputKind::SubmitPath(_) => ("scheduler.send.path", 0),
-                InputKind::UpdateOdometry(pose, _, _) => ("scheduler.send.pose", pose.stamp.nanos),
+                InputKind::UpdateOdometry(pose, _, _) | InputKind::UpdateSourceOdometry(pose, _, _) => ("scheduler.send.pose", pose.stamp.nanos),
                 InputKind::UpdateCostmap(map, _) => ("scheduler.send.map", map.source_timestamp_ns),
                 InputKind::UpdateObstacleSource(_, _, _, _) => ("scheduler.send.recent", 0),
                 InputKind::PlanningDiagnostic(_, _, _, _) => ("scheduler.send.planning_diagnostic", 0),
@@ -2728,6 +2765,18 @@ impl DeferredControl {
 
 enum SchedulerEvent { Input(Option<InputCommand>), Tick, Publication(bool), ControlReady }
 
+fn check_pose_data_age(source_ns: i64, maximum: Duration) -> Result<(), RuntimeError> {
+    let source = u64::try_from(source_ns).ok().filter(|v| *v > 0)
+        .ok_or_else(|| RuntimeError::StaleInput("pose source timestamp invalid".into()))?;
+    let age = nuwax_nav_types_messages::source_time::data_age_ns_at(source,
+        command_dispatch::unix_ns().unwrap_or(0)).map_err(RuntimeError::StaleInput)?;
+    if u128::from(age) >= maximum.as_nanos() {
+        return Err(RuntimeError::StaleInput(format!(
+            "pose source deadline elapsed (source_timestamp_ns={source_ns}, source_age_ms={})", age / 1_000_000)));
+    }
+    Ok(())
+}
+
 struct InputCommand {
     kind: InputKind,
     reply: oneshot::Sender<Result<(), RuntimeError>>,
@@ -2737,6 +2786,7 @@ enum InputKind {
     StartSession(NavSession),
     SubmitPath(VersionedPath),
     UpdateOdometry(PoseStamped, Option<Instant>, Instant),
+    UpdateSourceOdometry(PoseStamped, Instant, Duration),
     UpdateCostmap(CostmapObservation, Instant),
     UpdateObstacleSource(Option<ExecutionMap>,bool,Option<CommandDispatchBound>,Option<Option<Arc<RegisteredFrame>>>),
     PlanningDiagnostic(String, GoalKey, String, bool),
@@ -3465,6 +3515,48 @@ mod tests {
         handle.report_planning_diagnostic("goal-1".into(),execution_identity_for("goal-1",0).goal_key(),"晚到报告".into()).await.unwrap();
         assert_eq!(handle.status().last_terminal,Some(TerminalOutcome::Cancelled));
         handle.shutdown().await.unwrap();task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_pose_age_uses_slow_clock_and_still_rejects_stopped_clock_or_link() {
+        const CHILD: &str = "NEH_TEST_POSE_DATA_TIME";
+        let Some(path) = std::env::var_os(CHILD) else {
+            let path = std::env::temp_dir().join(format!("neh-nav-data-clock-{}", std::process::id()));
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::source_pose_age_uses_slow_clock_and_still_rejects_stopped_clock_or_link"])
+                .env(CHILD, &path).env("NUWAX_SOURCE_TIME_FILE", &path).status().unwrap();
+            std::fs::remove_file(path).unwrap();
+            assert!(status.success());
+            return;
+        };
+        let source = 1_000_000_000_000_u64;
+        let write_clock = |current: u64, live: bool| {
+            let mono = if live { nuwax_motion_safety_guard::measured_motion::monotonic_ns() } else { 0 };
+            let mut bytes = b"NEHTIME1".to_vec();
+            for value in [1_u64, 1, current, 0, mono] { bytes.extend_from_slice(&value.to_le_bytes()); }
+            std::fs::write(&path, bytes).unwrap();
+        };
+        write_clock(source + 200_000_000, true);
+        let mut scheduler = NavScheduler::new(FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))),
+            FakePlanner::commanding(), SchedulerConfig::default()).unwrap();
+        let (tx, _) = watch::channel(scheduler.status.clone());
+        scheduler.observe_costmap(&tx, costmap_at(1), Instant::now()).unwrap();
+        // 0.35倍时这份来源年龄200ms的数据，实际墙龄已超过原500ms来源期限。
+        let acquired = Instant::now() - Duration::from_millis(572);
+        let mut pose = map_pose_at(1);
+        pose.stamp.nanos = source as i64;
+        scheduler.observe_odometry_qualified_at(&tx, pose, None, acquired,
+            Some(Duration::from_millis(500))).unwrap();
+        assert_eq!(scheduler.pose_acquired_at, Some(acquired), "数据判龄不能刷新执行采集时刻");
+        scheduler.refresh_input_status(Instant::now() + Duration::from_secs(1));
+        assert!(scheduler.status.planner_inputs_fresh, "墙钟推进不等于来源数据变旧");
+        write_clock(source + 600_000_000, true);
+        assert!(scheduler.stale_input_reason(Instant::now()).unwrap().contains("pose source deadline elapsed"));
+        write_clock(source + 200_000_000, true);
+        assert!(scheduler.stale_input_reason(Instant::now() + Duration::from_secs(6))
+            .unwrap().contains("liveness"), "来源钟有更新，断流输入仍须拒绝");
+        write_clock(source + 200_000_000, false);
+        assert!(scheduler.stale_input_reason(Instant::now()).unwrap().contains("停止推进"));
     }
 
     #[tokio::test]

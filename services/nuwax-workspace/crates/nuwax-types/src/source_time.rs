@@ -1,7 +1,10 @@
-//! 将同机仿真采集时间用于真实新鲜度判断；不改动传感器时间或进程墙钟。
+//! 来源数据年龄与执行采集年龄分开计算；不改动传感器时间或进程墙钟。
 use std::{fs::File, os::unix::fs::FileExt, path::Path};
 
 const CAPACITY: u64 = 16384;
+
+/// 独立墙钟判活：与建图后端已有的五秒无响应界限一致，不表示数据可保留五秒。
+pub const INPUT_LIVENESS_TIMEOUT_NS: u64 = 5_000_000_000;
 
 #[derive(Debug)]
 struct Acquisition {
@@ -79,16 +82,53 @@ fn recorded_age(path: &Path, source_ns: u64, now_monotonic_ns: u64) -> Result<u6
         .ok_or_else(|| "采集单调时间晚于当前宿主时钟".into())
 }
 
+fn recorded_data_age(path: &Path, source_ns: u64, now_monotonic_ns: u64) -> Result<u64, String> {
+    let file = File::open(path).map_err(|e| format!("打开来源时钟失败：{e}"))?;
+    let header = read::<16>(&file, 0)?;
+    if &header[..8] != b"NEHTIME1" {
+        return Err("来源时钟格式无效".into());
+    }
+    let end = u64::from_le_bytes(header[8..].try_into().unwrap());
+    if end == 0 { return Err("来源时钟尚未开始".into()); }
+    let current = record(&file, end)?;
+    let clock_idle = now_monotonic_ns.checked_sub(current.monotonic_ns)
+        .ok_or("来源时钟采集时刻位于宿主未来")?;
+    if clock_idle > INPUT_LIVENESS_TIMEOUT_NS {
+        return Err(format!("来源时钟停止推进：墙钟判活年龄={}毫秒", clock_idle / 1_000_000));
+    }
+    if source_ns > current.source_ns.saturating_add(1000) {
+        return Err("数据源时间超前当前来源时钟".into());
+    }
+    Ok(current.source_ns.saturating_sub(source_ns))
+}
+
+/// 数据年龄始终等于当前来源时间减原始来源时间。仿真不外推倍率，停钟独立按墙钟判活。
+/// 原执行器的采集年龄与期限换算继续使用 age_ns_at / comparison_timestamp_ns_at。
+pub fn data_age_ns_at(source_ns: u64, wall_now_ns: u64) -> Result<u64, String> {
+    if source_ns == 0 { return Err("数据来源时间必须为正".into()); }
+    match std::env::var_os("NUWAX_SOURCE_TIME_FILE") {
+        Some(path) => recorded_data_age(Path::new(&path), source_ns, monotonic_ns()?),
+        None => age_ns_at(source_ns, wall_now_ns),
+    }
+}
+
+/// 只判输入链路是否断流；来源时钟仍推进也不能让不再更新的输入永远有效。
+pub fn input_is_alive(receipt_age_ns: u64) -> bool {
+    receipt_age_ns <= INPUT_LIVENESS_TIMEOUT_NS
+}
+
+fn wall_age(source_ns: u64, wall_now_ns: u64) -> Result<u64, String> {
+    if source_ns > wall_now_ns.saturating_add(50_000_000) {
+        return Err("位姿源时间超前当前墙钟超过50毫秒".into());
+    }
+    Ok(wall_now_ns.saturating_sub(source_ns))
+}
+
 /// 默认按真实Unix时间计龄；显式同机仿真使用原采集单调时间，包含所有上游积压。
 pub fn age_ns_at(source_ns: u64, wall_now_ns: u64) -> Result<u64, String> {
     match std::env::var_os("NUWAX_SOURCE_TIME_FILE") {
         Some(path) => recorded_age(Path::new(&path), source_ns, monotonic_ns()?),
-        None => {
-            if source_ns > wall_now_ns.saturating_add(50_000_000) {
-                return Err("位姿源时间超前当前墙钟超过50毫秒".into());
-            }
-            Ok(wall_now_ns.saturating_sub(source_ns))
-        }
+        None => wall_age(source_ns, wall_now_ns),
     }
 }
 
@@ -105,6 +145,31 @@ pub fn comparison_timestamp_ns_at(source_ns: u64, wall_now_ns: u64) -> Result<u6
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn data_age_follows_source_at_point_three_five_speed_and_liveness_is_independent() {
+        let path = std::env::temp_dir().join(format!("neh-data-age-{}", std::process::id()));
+        let mut file = File::create(&path).unwrap();
+        file.write_all(b"NEHTIME1").unwrap();
+        file.write_all(&2_u64.to_le_bytes()).unwrap();
+        // 一秒来源时间耗费约2.857秒墙钟；同一来源年龄在实时和慢钟下完全一致。
+        for row in [[1_u64, 10_000_000_000, 0, 1_000_000_000],
+                    [2, 11_000_000_000, 0, 3_857_142_857]] {
+            for field in row { file.write_all(&field.to_le_bytes()).unwrap(); }
+        }
+        assert_eq!(recorded_data_age(&path, 10_000_000_000, 3_857_142_857).unwrap(),
+            wall_age(10_000_000_000, 11_000_000_000).unwrap());
+        assert_eq!(recorded_data_age(&path, 10_800_000_000, 4_000_000_000).unwrap(), 200_000_000);
+        // 查询不推进来源；停钟超过独立墙钟界限仍拒绝，不能永久保持零数据年龄。
+        assert_eq!(recorded_data_age(&path, 11_000_000_000, 5_000_000_000).unwrap(), 0);
+        assert!(recorded_data_age(&path, 11_000_000_000,
+            3_857_142_857 + INPUT_LIVENESS_TIMEOUT_NS + 1).unwrap_err().contains("停止推进"));
+        assert!(recorded_data_age(&path, 11_001_000_000, 4_000_000_000).is_err());
+        assert!(input_is_alive(INPUT_LIVENESS_TIMEOUT_NS));
+        assert!(!input_is_alive(INPUT_LIVENESS_TIMEOUT_NS + 1));
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn comparison_clock_preserves_capture_age_without_rejuvenating_old_frames() {

@@ -313,57 +313,45 @@ impl ComputeBasis {
 
     /// 仅核对任务和原查询；纯待继续进度可在失鲜时提交，不能据此取得运动许可。
     fn current_query_at_history(&self, inner: &ExploreRuntimeInner, expected_history: u64) -> bool {
+        self.query_invalidation(inner, expected_history).is_none()
+    }
+
+    /// 逐项保留原资格条件；失败原因用于取证，不据此放宽提交。
+    fn query_invalidation(&self, inner: &ExploreRuntimeInner, expected_history: u64) -> Option<&'static str> {
+        if !inner.logical_active { return Some("session_inactive"); }
+        if self.generation != inner.generation { return Some("runtime_generation"); }
+        if self.parent != inner.last_request_id { return Some("request_identity"); }
+        if expected_history != inner.compute.history { return Some("feedback_history"); }
         #[cfg(test)]
-        if self.inspection {
-            return inner.logical_active
-                && self.generation == inner.generation
-                && self.parent == inner.last_request_id
-                && expected_history == inner.compute.history;
-        }
-        // Tick admission validates the sampled pose. Completion can outlive
-        // that sample's receipt TTL; navigation consumers check their live pose.
-        // 查询仍需核对地图身份；接收时效由调用方按结果用途单独核验。
-        if !inner.logical_active
-            || self.generation != inner.generation
-            || self.parent != inner.last_request_id
-            || expected_history != inner.compute.history
-            || self.frame != input_frame(inner)
-            || inner.pending_child_cancellation.is_some()
-            || inner
-                .compute
-                .feedback
-                .as_ref()
-                .is_some_and(|feedback| feedback.result.is_none())
-        {
-            return false;
+        if self.inspection { return None; }
+        if self.frame != input_frame(inner) { return Some("map_frame_generation"); }
+        if inner.pending_child_cancellation.is_some() { return Some("child_cancellation"); }
+        if inner.compute.feedback.as_ref().is_some_and(|feedback| feedback.result.is_none()) {
+            return Some("feedback_pending");
         }
         match (&self.input, &inner.surface_mode, &inner.costmap_input) {
             (ComputeInput::Planar(before), None, Some(now)) => {
-                self.committed_map == inner.committed_map && Arc::ptr_eq(before, now)
+                if self.committed_map != inner.committed_map { Some("planar_map_identity") }
+                else if !Arc::ptr_eq(before, now) { Some("planar_query_view") }
+                else { None }
             }
             (ComputeInput::Surface { original, .. }, Some(mode), _) => {
-                // A query-equivalent composite receipt may advance without changing
-                // the frozen computation. Keep its original identity for GoalIntent;
-                // domain changes and conflicting/non-monotonic commits still fail.
+                if !mode.accepting { return Some("surface_owner_stopped"); }
+                if !mode.input_ready { return Some("surface_input_unavailable"); }
                 let map_current = self.committed_map == inner.committed_map
-                    || self
-                        .committed_map
-                        .as_ref()
-                        .zip(inner.committed_map.as_ref())
+                    || self.committed_map.as_ref().zip(inner.committed_map.as_ref())
                         .is_some_and(|(before, now)| {
                             crate::nav_runtime::same_committed_map_domain(before, now)
                                 && before.revision < now.revision
                                 && before.commit_sequence < now.commit_sequence
                         });
-                mode.accepting
-                    && mode.input_ready
-                    && map_current
-                    && mode
-                        .receiver
-                        .freeze()
-                        .is_ok_and(|now| original.same_planning_query_view(&now))
+                if !map_current { return Some("surface_map_lineage"); }
+                match mode.receiver.freeze() {
+                    Ok(now) => original.planning_query_change(&now),
+                    Err(_) => Some("surface_receiver_unavailable"),
+                }
             }
-            _ => false,
+            _ => Some("input_kind"),
         }
     }
 }
@@ -378,6 +366,8 @@ fn input_frame(inner: &ExploreRuntimeInner) -> i64 {
 }
 
 pub(super) struct JobRecord {
+    admitted_at: Instant,
+    captured_now_ns: i64,
     terminal_action: Option<ControlSerial>,
     id: exchange::Id,
     basis: ComputeBasis,
@@ -775,9 +765,24 @@ impl ExploreRuntimeHandle {
             #[cfg(test)]
             inspection: matches!(&request, ComputeRequest::InspectCheckpoint { .. }),
         };
+        let admitted_at = Instant::now();
+        let queued_monotonic_ns = now_monotonic_nanos();
+        let captured_now_ns = context.now.nanos;
+        let source_notification = match &context.input {
+            ComputeInput::Surface { original, .. } => Some(original.notification()),
+            ComputeInput::Planar(_) => None,
+        };
         let id = owner.submit(request).map_err(|error| error.to_string())?;
+        tracing::info!(event="exploration.compute.queued", request_id=%inner.last_request_id,
+            incarnation=id.incarnation, sequence=id.sequence, captured_now_ns, queued_monotonic_ns,
+            source_notification, committed_map=?inner.committed_map,
+            installed_surface_revision=?inner.surface_mode.as_ref().and_then(|mode|mode.installed_revision),
+            captured_pose=?context.robot_pose, frame_generation=basis.frame, feedback_history=basis.history,
+            "探索计算已排队，保留原捕获身份");
         let abandoned = Arc::new(AtomicBool::new(false));
         inner.compute.job = Some(JobRecord {
+            admitted_at,
+            captured_now_ns,
             terminal_action: None,
             id,
             basis: basis.clone(),
@@ -1615,19 +1620,31 @@ fn drain_locked(
                 Some(ComputeProjection::Selection(SelectionProjection {
                     poll: Ok(ExplorationPoll::Pending), mission: None, cancelled: false,
                 })));
+        let qualification_started = Instant::now();
         let current = if pending_progress {
             job.basis.current_query_at_history(inner, job.basis.history)
         } else {
             job.basis.current(inner)
         };
+        let query_invalidation = job.basis.query_invalidation(inner, job.basis.history);
+        let qualification_ms = qualification_started.elapsed().as_secs_f64() * 1000.0;
         let decision =
             if !job.abandoned.load(Ordering::Acquire) && !cancelled && current {
                 exchange::Decision::Accept
             } else {
                 exchange::Decision::Discard
             };
+        tracing::info!(event="exploration.compute.qualified", request_id=%job.basis.parent,
+            incarnation=job.id.incarnation, sequence=job.id.sequence, captured_now_ns=job.captured_now_ns,
+            monotonic_ns=now_monotonic_nanos(), queue_and_compute_ms=job.admitted_at.elapsed().as_secs_f64()*1000.0,
+            qualification_ms, query_invalidation, source_fresh=inner.map_input_is_fresh(now_monotonic_nanos()),
+            current_generation=inner.generation, current_history=inner.compute.history,
+            current_surface_revision=?inner.surface_mode.as_ref().and_then(|mode|mode.installed_revision),
+            current_committed_map=?inner.committed_map,
+            decision=?decision, "探索结果完成原提交资格核对");
         if decision == exchange::Decision::Discard {
             tracing::info!(event = "exploration.selection.discarded", request_id = %job.basis.parent,
+                query_invalidation, qualification_ms, captured_now_ns=job.captured_now_ns,
                 abandoned = job.abandoned.load(Ordering::Acquire), cancelled, pending_progress,
                 query_current = job.basis.current_query_at_history(inner, job.basis.history),
                 input = %inner.selection_wait_detail(), "探索计算结果已撤销，等待当前输入重新评估");

@@ -171,6 +171,20 @@ pub fn now_monotonic_nanos() -> u64 {
 }
 
 
+fn configured_pose_data_ttl() -> Duration {
+    std::env::var("NUWAX_EXPLORE_POSE_TTL_MS").ok().and_then(|v| v.parse().ok())
+        .map(Duration::from_millis).unwrap_or(DEFAULT_POSE_RECEIPT_TTL)
+}
+
+fn pose_input_is_fresh(pose: &ExploreRobotPose, now_monotonic_ns: u64) -> bool {
+    use nuwax_nav_types_messages::source_time;
+    pose.received_monotonic_ns != 0
+        && source_time::input_is_alive(now_monotonic_ns.saturating_sub(pose.received_monotonic_ns))
+        && source_time::data_age_ns_at(pose.source_timestamp_ns, now_unix_nanos())
+            .is_ok_and(|age| age <= configured_pose_data_ttl().as_nanos() as u64)
+}
+
+
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExploreStopConditions {
@@ -790,6 +804,7 @@ pub(crate) struct SurfaceMapTicket {
     cloud_revision: i64,
     commit_boot_nonce: [u8; 16],
     received_monotonic_ns: u64,
+    source_timestamp_ns: u64,
 }
 
 impl SurfaceMapTicket {
@@ -853,6 +868,7 @@ pub struct ExploreRuntimeInner {
     /// 最近一次有效地图输入的本地接收时刻，不参与地图身份。
     costmap_received_monotonic_ns: u64,
     costmap_receipt_ttl: Duration,
+    costmap_source_timestamp_ns: Option<u64>,
     committed_map: Option<schema::CommittedMapIdentity>,
     costmap_frame_generation: i64,
     active_config: Option<Arc<ExploreStartConfig>>,
@@ -889,21 +905,29 @@ pub struct ExploreRuntimeInner {
 }
 
 impl ExploreRuntimeInner {
-    /// 来源活性使用最新准入发布的接收时刻；已安装图保留自身票据身份和计算延迟。
-    /// 清图、换域及失败会撤销完整快照，不能仅凭新发布取得探索许可。
+    /// 同域最新输入按来源钟判龄；已安装身份及计算完成时刻不提供续期。
     fn map_input_is_fresh(&self, now_monotonic_ns: u64) -> bool {
-        let received = match &self.surface_mode {
+        use nuwax_nav_types_messages::source_time;
+        match &self.surface_mode {
             Some(mode) => {
                 if !mode.accepting || !mode.input_ready || mode.installed_revision.is_none() {
                     return false;
                 }
-                mode.latest.as_ref().map_or(0, |ticket| ticket.received_monotonic_ns)
+                mode.latest.as_ref().is_some_and(|ticket| {
+                    source_time::input_is_alive(now_monotonic_ns.saturating_sub(ticket.received_monotonic_ns))
+                        && ticket.received_monotonic_ns != 0
+                        && source_time::data_age_ns_at(ticket.source_timestamp_ns, now_unix_nanos())
+                            .is_ok_and(|age| age <= self.costmap_receipt_ttl.as_nanos() as u64)
+                })
             }
-            None => self.costmap_received_monotonic_ns,
-        };
-        received != 0
-            && now_monotonic_ns.saturating_sub(received)
-                <= self.costmap_receipt_ttl.as_nanos() as u64
+            None => self.costmap_received_monotonic_ns != 0 && self.costmap_source_timestamp_ns.map_or_else(
+                // 旧二维兼容投影没有独立观测戳，仍仅保留原接收期限。
+                || now_monotonic_ns.saturating_sub(self.costmap_received_monotonic_ns)
+                    <= self.costmap_receipt_ttl.as_nanos() as u64,
+                |source| source_time::input_is_alive(now_monotonic_ns.saturating_sub(self.costmap_received_monotonic_ns))
+                    && source_time::data_age_ns_at(source, now_unix_nanos())
+                        .is_ok_and(|age| age <= self.costmap_receipt_ttl.as_nanos() as u64)),
+        }
     }
 
     fn new() -> Self {
@@ -925,6 +949,7 @@ impl ExploreRuntimeInner {
             surface_mode: None,
             costmap_received_monotonic_ns: 0,
             costmap_receipt_ttl: DEFAULT_COSTMAP_RECEIPT_TTL,
+            costmap_source_timestamp_ns: None,
             committed_map: None,
             costmap_frame_generation: 0,
             active_config: None,
@@ -1001,13 +1026,16 @@ impl ExploreRuntimeInner {
         if let Some(mode) = self.surface_mode.as_ref() {
             let age = mode.latest.as_ref().map(|ticket|
                 now.saturating_sub(ticket.received_monotonic_ns) / 1_000_000);
+            let data_age = mode.latest.as_ref().map(|ticket|
+                nuwax_nav_types_messages::source_time::data_age_ns_at(ticket.source_timestamp_ns, now_unix_nanos())
+                    .map(|age| age / 1_000_000));
             let state = if !mode.accepting { "surface input owner stopped" }
                 else if !mode.input_ready { "surface map input unavailable" }
                 else if !self.map_input_is_fresh(now) { "surface map input stale" }
                 else if mode.latest.as_ref().map(SurfaceMapTicket::revision) != mode.installed_revision {
                     "surface map build pending"
                 } else { "surface map input fresh" };
-            format!("{state}；已接纳修订={:?}；已安装修订={:?}；接收年龄={age:?}毫秒；来源就绪={}；来源错误={:?}；计算在途={compute}；待派发={dispatch}；上次选择={poll}",
+            format!("{state}；已接纳修订={:?}；已安装修订={:?}；接收年龄={age:?}毫秒；来源数据年龄={data_age:?}毫秒；来源就绪={}；来源错误={:?}；计算在途={compute}；待派发={dispatch}；上次选择={poll}",
                 mode.latest.as_ref().map(SurfaceMapTicket::revision), mode.installed_revision,
                 mode.input_ready, mode.input_error)
         } else {
@@ -1444,6 +1472,7 @@ impl ExploreRuntimeHandle {
             cloud_revision: message.cloud_revision,
             commit_boot_nonce: message.commit_boot_nonce,
             received_monotonic_ns,
+            source_timestamp_ns: message.source_timestamp_ns as u64,
         };
         let mut guard = self.inner.lock().await;
         let (invalidates, same_installed_source) = {
@@ -2635,7 +2664,7 @@ impl ExploreRuntimeHandle {
         let pose_age_ns = now_monotonic_nanos().saturating_sub(pose.received_monotonic_ns);
         if pose.source_timestamp_ns == 0
             || pose.received_monotonic_ns == 0
-            || pose_age_ns > DEFAULT_POSE_RECEIPT_TTL.as_nanos() as u64
+            || !pose_input_is_fresh(&pose, now_monotonic_nanos())
         {
             return self
                 .finish_session(
@@ -2752,8 +2781,7 @@ impl ExploreRuntimeHandle {
         if condition.is_none() && guard.return_reason.is_none()
             && guard.active_config.as_ref().is_some_and(|config| config.stop_conditions.max_coverage_pct.is_some())
             && guard.costmap_input.is_some() && guard.committed_map.is_some()
-            && guard.costmap_received_monotonic_ns != 0
-            && now_monotonic_nanos().saturating_sub(guard.costmap_received_monotonic_ns) <= guard.costmap_receipt_ttl.as_nanos() as u64
+            && guard.map_input_is_fresh(now_monotonic_nanos())
         {
             let context = match self.capture_compute_context(&guard, &pose, now_ns) { Ok(context) => context, Err(_) => return self.snapshot() };
             let coverage_ticket = match self.admit_compute_locked(&mut guard, &context, ComputeRequest::Coverage { context: context.clone() }) {
@@ -3197,7 +3225,7 @@ impl ExploreRuntimeHandle {
                         || !pose.orientation.yaw().is_finite()
                         || normalize_frame(&pose.frame_id) != self.expected_map_frame.as_ref()
                         || pose.source_timestamp_ns == 0 || pose.received_monotonic_ns == 0
-                        || now_monotonic_nanos().saturating_sub(pose.received_monotonic_ns) > DEFAULT_POSE_RECEIPT_TTL.as_nanos() as u64 {
+                        || !pose_input_is_fresh(&pose, now_monotonic_nanos()) {
                         drop(guard);
                         return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded,
                             "恢复后的探索位姿无效".into()).await;
@@ -3930,8 +3958,8 @@ impl ExploreRuntimeHandle {
         use nuwax_nav_types_messages::grid::OccupancyCell;
         value.validate().map_err(|e| e.to_string())?;
         if value.cleared { return Err("撤销消息不能作为二维探索图".into()); }
-        if value.source_timestamp_ns as u64 > now_unix_nanos().saturating_add(50_000_000) { return Err("二维派生探索源位于未来".into()); }
-        let source_age = now_unix_nanos().saturating_sub(value.source_timestamp_ns as u64);
+        let source_age = nuwax_nav_types_messages::source_time::data_age_ns_at(
+            value.source_timestamp_ns as u64, now_unix_nanos())?;
         let ttl = Duration::from_nanos(nuwax_codec::lcm::planar_navigation::MAX_SOURCE_AGE_NS as u64);
         if source_age > ttl.as_nanos() as u64 { return Err("二维派生探索源已经过期".into()); }
         let snapshot = ExploreCostmapSnapshot { grid: OccupancyGrid2D::new(
@@ -3944,7 +3972,7 @@ impl ExploreRuntimeHandle {
             commit_sequence: value.map_commit_sequence, source_timestamp_ns: value.map_source_timestamp_ns,
             frame_id: value.grid.header.frame_id.clone() };
         self.ingest_costmap_with_identity(snapshot, Some(identity), value.map_frame_generation,
-            Some((now_monotonic_nanos().saturating_sub(source_age), ttl))).await
+            Some((now_monotonic_nanos(), ttl, value.source_timestamp_ns as u64))).await
     }
 
     async fn ingest_costmap_with_identity(
@@ -3952,7 +3980,7 @@ impl ExploreRuntimeHandle {
         snapshot: ExploreCostmapSnapshot,
         committed_map: Option<schema::CommittedMapIdentity>,
         frame_generation: i64,
-        observation: Option<(u64, Duration)>,
+        observation: Option<(u64, Duration, u64)>,
     ) -> Result<bool, String> {
         if frame_generation < 0 { return Err("二维探索坐标代际无效".into()); }
         validate_costmap_snapshot(&snapshot, self.expected_map_frame.as_ref())?;
@@ -3977,7 +4005,8 @@ impl ExploreRuntimeHandle {
             guard.costmap_input = Some(Arc::new(snapshot));
             return Ok(changed);
         }
-        let (received, ttl) = observation.unwrap_or_else(|| (now_monotonic_nanos(), DEFAULT_COSTMAP_RECEIPT_TTL));
+        let source = observation.map(|value| value.2);
+        let (received, ttl, _) = observation.unwrap_or_else(|| (now_monotonic_nanos(), DEFAULT_COSTMAP_RECEIPT_TTL, 0));
         if guard.costmap_input.as_deref() == Some(&snapshot)
             && guard.committed_map.as_ref() == committed_map.as_ref()
             && guard.costmap_frame_generation == frame_generation
@@ -3985,6 +4014,7 @@ impl ExploreRuntimeHandle {
             // 新的输入接收事件可以续期，状态查询或缓存读取不会进入这里。
             guard.costmap_received_monotonic_ns = received;
             guard.costmap_receipt_ttl = ttl;
+            guard.costmap_source_timestamp_ns = source;
             return Ok(false);
         }
         if let Some(identity) = committed_map.as_ref() {
@@ -4008,6 +4038,7 @@ impl ExploreRuntimeHandle {
         guard.costmap_frame_generation = frame_generation;
         guard.costmap_received_monotonic_ns = received;
         guard.costmap_receipt_ttl = ttl;
+        guard.costmap_source_timestamp_ns = source;
 
         // 实时地图只刷新下一轮探索输入，不取消当前目标。
         guard.costmap_input = Some(Arc::new(snapshot));
@@ -5267,6 +5298,7 @@ mod tests {
         assert_eq!(stored.commit_sequence, 4);
         assert_eq!(stored.source_timestamp_ns, 7);
         assert_ne!(stored.source_timestamp_ns, value.source_timestamp_ns);
+        assert_eq!(handle.inner.lock().await.costmap_source_timestamp_ns, Some(value.source_timestamp_ns as u64));
         for field in 0..3 {
             let mut conflict = value.clone();
             match field {
@@ -5742,9 +5774,10 @@ mod tests {
         handle.start("surface-stopped-source", "prefer_wavefront").await;
         {
             let mut guard = handle.inner.lock().await;
-            // 来源停止超过原期限；只读查询和重复消息均不能延长它。
-            guard.surface_mode.as_mut().unwrap().latest.as_mut().unwrap().received_monotonic_ns =
-                now_monotonic_nanos().saturating_sub((DEFAULT_COSTMAP_RECEIPT_TTL + Duration::from_secs(1)).as_nanos() as u64);
+            // 来源数据超过原两秒期限；接收心跳、只读查询和重发均不能延长它。
+            let old_source = now_unix_nanos().saturating_sub(
+                (DEFAULT_COSTMAP_RECEIPT_TTL + Duration::from_secs(1)).as_nanos() as u64);
+            guard.surface_mode.as_mut().unwrap().latest.as_mut().unwrap().source_timestamp_ns = old_source;
         }
         assert!(handle.begin_surface_map_update(&message, now_monotonic_nanos()).await.is_err());
         let waiting = handle.tick_with_pose(surface_pose(&snapshot, 0.0, Quaternion::IDENTITY)).await;
@@ -5752,6 +5785,39 @@ mod tests {
         assert!(waiting.message.contains("surface map input stale"));
         assert!(sink.submitted.lock().unwrap().is_empty());
         assert!(handle.inner.lock().await.no_frontier_since.is_none());
+    }
+
+    #[tokio::test]
+    async fn surface_age_follows_slow_source_and_link_liveness_remains_bounded() {
+        const CHILD: &str = "NEH_TEST_SURFACE_DATA_CLOCK";
+        let Some(path) = std::env::var_os(CHILD) else {
+            let path = std::env::temp_dir().join(format!("neh-surface-data-clock-{}", std::process::id()));
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "explore_runtime::tests::surface_age_follows_slow_source_and_link_liveness_remains_bounded"])
+                .env(CHILD, &path).env("NUWAX_SOURCE_TIME_FILE", &path).status().unwrap();
+            std::fs::remove_file(path).unwrap();
+            assert!(status.success());
+            return;
+        };
+        let (handle, _) = configured_handle();
+        let (message, _, _) = install_surface_fixture(&handle, "map").await;
+        let source = message.source_timestamp_ns as u64;
+        let write_clock = |current: u64, live: bool| {
+            let mono = if live { nuwax_motion_safety_guard::measured_motion::monotonic_ns() } else { 0 };
+            let mut bytes = b"NEHTIME1".to_vec();
+            for field in [1_u64, 1, current, 0, mono] { bytes.extend_from_slice(&field.to_le_bytes()); }
+            std::fs::write(&path, bytes).unwrap();
+        };
+        let mut inner = handle.inner.lock().await;
+        inner.surface_mode.as_mut().unwrap().latest.as_mut().unwrap().received_monotonic_ns = 1;
+        write_clock(source + 1_050_000_000, true);
+        assert!(inner.map_input_is_fresh(3_000_000_001), "0.35倍的三秒墙钟只产生1.05秒数据年龄");
+        write_clock(source + 2_000_000_001, true);
+        assert!(!inner.map_input_is_fresh(2), "新接收事件也不能刷新真实过期数据");
+        write_clock(source + 1_050_000_000, true);
+        assert!(!inner.map_input_is_fresh(5_000_000_002), "时钟仍活着时，断流输入也必须过期");
+        write_clock(source + 1_050_000_000, false);
+        assert!(!inner.map_input_is_fresh(2), "来源钟停止也必须被独立判活拒绝");
     }
 
     #[tokio::test]
@@ -7615,6 +7681,7 @@ mod tests {
     include!("explore_pose_recovery_tests.rs");
     include!("explore_stop_recovery_tests.rs");
     include!("explore_compute_surface_tests.rs");
+    include!("explore_continuous_map_tests.rs");
     include!("explore_composite_map_tests.rs");
     include!("explore_surface_incomplete_tests.rs");
 

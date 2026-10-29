@@ -4,6 +4,13 @@ use std::sync::{Condvar, Mutex};
 
 type Route = (ExecutionPath, Option<Vec<f64>>, ExecutionGoal);
 
+// 此结论只撤租停车，不证明当前几何。目标/路径代际仍必须匹配，
+// 位姿与来源持续更新不能吞掉已经发生的恢复失败。
+fn recovery_stop(step: &PlannerStep) -> bool {
+    matches!(step, PlannerStep::Failed(reason)
+        if reason.contains(nuwax_nav_types_messages::BODY_OVERLAP_RECOVERY_FAILED))
+}
+
 struct ExecutionContextPublication {
     epoch: u64,
     map_version: u64,
@@ -344,18 +351,19 @@ impl PlannerWorker {
                         && slow_log_at.is_none_or(|last| last.elapsed() >= Duration::from_secs(5)))
                         .then(|| format!("{computed:?}"));
                     let mut input = lock.lock().unwrap();
+                    let stop_only=recovery_stop(&computed);
                     let current = input.epoch == version
-                        && input.applied_version == applied_seq
-                        && input.motion_version == motion_seq
-                        && input.map_version == map_seq
                         && input.boundary_version == boundary_seq
-                        && (!matches!(computed,PlannerStep::Command(v) if v!=Twist2::ZERO)
-                            || input.pose_version == pose_seq)
-                        && (!matches!(computed, PlannerStep::ReplanRequired(_) | PlannerStep::Failed(_))
-                            || input.pose_version == pose_seq)
+                        && (stop_only || (input.applied_version == applied_seq
+                            && input.motion_version == motion_seq
+                            && input.map_version == map_seq
+                            && (!matches!(computed,PlannerStep::Command(v) if v!=Twist2::ZERO)
+                                || input.pose_version == pose_seq)
+                            && (!matches!(computed, PlannerStep::ReplanRequired(_) | PlannerStep::Failed(_))
+                                || input.pose_version == pose_seq)))
                         && !input.closed;
                     // 换目标、换路径、取消或来源撤销后的迟到结果一律退休。
-                    if current {
+                    if current && !input.result.as_ref().is_some_and(|(_,step)|recovery_stop(step)) {
                         let computed=if dispatch_bound.is_some_and(CommandDispatchBound::expired_now) {
                             dispatch_bound=None;
                             wait_reason=Some("观察扫掠凭据在发布前已过期，保持零速并重新计算".into());
@@ -366,7 +374,7 @@ impl PlannerWorker {
                             applied_version:applied_seq,motion_version:motion_seq,boundary_version:boundary_seq,
                             context:execution_context,
                         };
-                        input.result_execution_context=if publication.is_current(&input) {
+                        input.result_execution_context=if !stop_only && publication.is_current(&input) {
                             let context=publication.context.clone();
                             input.execution_context=Some(publication);
                             // Completion requests another route but cannot be reused
@@ -616,6 +624,9 @@ impl NavPlanner for PlannerWorker {
             return None;
         }
         input.control_width = Some(width);
+        if input.result.as_ref().is_some_and(|(_,step)|recovery_stop(step)) {
+            return None;
+        }
         // Subscribe and inspect under the publication lock: a result cannot be
         // published between the eligibility check and the receiver's baseline.
         let mut publication = self.publication.clone();
@@ -669,14 +680,15 @@ impl NavPlanner for PlannerWorker {
         let arrival_changed = input.result.as_ref().is_some_and(|(_, step)|
             (matches!(step, PlannerStep::Succeeded) && input.result_pose_version != input.pose_version
                 && !arrival_event_still_in_goal(&input)));
-        let terminal_changed = input.result.as_ref().is_some_and(|(_, step)|
+        let stop_only=input.result.as_ref().is_some_and(|(_,step)|recovery_stop(step));
+        let terminal_changed = !stop_only && input.result.as_ref().is_some_and(|(_, step)|
             (matches!(step, PlannerStep::ReplanRequired(_) | PlannerStep::Failed(_))
                 && input.result_pose_version != input.pose_version)
             || (matches!(step, PlannerStep::Succeeded | PlannerStep::ReplanRequired(_) | PlannerStep::Failed(_))
                 && (input.result_applied_version != input.applied_version
                     || input.result_motion_version != input.motion_version)));
         // A stored result authorizes only the exact map and boundary it consumed.
-        let source_changed = input.result.is_some()
+        let source_changed = !stop_only && input.result.is_some()
             && (input.result_map_version != input.map_version
                 || input.result_boundary_version != input.boundary_version);
         if input.result.is_none() || input.result.as_ref().is_some_and(|(_,s)|matches!(s,PlannerStep::Pending(_))) || expired || dispatch_expired || arrival_changed || terminal_changed || source_changed || command_state_changed {
@@ -2235,6 +2247,40 @@ mod tests {
             wait_for_source_result(&worker);
             assert_eq!(worker.step(0.3), negative, "a genuine current failure must stay authoritative");
             worker.stop();
+        }
+    }
+
+    #[test]
+    fn overlap_stop_survives_observation_updates_but_not_execution_retirement() {
+        for retired in [false, true] {
+            let (mut worker, started, finish) = terminal_worker();
+            worker.update_odometry(route_pose(0.5, 0));
+            worker.step(0.3);
+            started.recv_timeout(Duration::from_secs(1)).unwrap();
+            worker.update_odometry(route_pose(0.500001, 1));
+            worker.update_costmap(CostMap2D::new_all_free("map", 2, 2, 0.1));
+            worker.observe_applied_command(Twist2 {
+                linear:nuwax_nav_types_messages::Point2::new(0.01,0.),angular_z:0.,
+            });
+            let failure=PlannerStep::Failed(format!("{} escape time or distance budget exhausted",
+                nuwax_nav_types_messages::BODY_OVERLAP_RECOVERY_FAILED));
+            if retired {worker.stop();worker.step(0.3);}
+            finish.send(failure.clone()).unwrap();
+            if retired {
+                // 退休后的生命周期通知在旧计算之后执行，不得交付旧目标失败。
+                started.recv_timeout(Duration::from_secs(1)).unwrap();
+                assert!(worker.shared.0.lock().unwrap().result.is_none());
+                finish.send(PlannerStep::Pending(Vec::new())).unwrap();
+            } else {
+                started.recv_timeout(Duration::from_secs(1)).unwrap();
+                worker.update_odometry(route_pose(0.500002, 2));
+                assert!(worker.prepare_control_step(0.3,true).is_none());
+                assert_eq!(worker.step(0.3),failure);
+                assert!(worker.take_step_execution_context(Twist2::ZERO).is_none(),
+                    "停止结论不能携带旧几何或速度凭据");
+            }
+            worker.stop();
+            let _=finish.send(PlannerStep::Pending(Vec::new()));
         }
     }
     #[test]

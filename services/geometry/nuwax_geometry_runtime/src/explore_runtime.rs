@@ -3868,6 +3868,27 @@ impl ExploreRuntimeHandle {
             return Ok(self.complete_pending_child_action(guard));
         }
 
+        // 已核对原子任务租约，且自然终态沿原导航停车证明链进入。
+        // 机体重叠恢复失败与目标位置无关；换前沿无法修复，直接结束探索。
+        if let ChildNavigationResult::Failed { reason, .. } = &result {
+            if reason.contains(nuwax_nav_types_messages::BODY_OVERLAP_RECOVERY_FAILED) {
+                let action=PendingChildAction {
+                    reason:if reason.contains("escape proof computation exhausted") {
+                        ExplorationStopReason::PlanningResourceLimited
+                    } else {ExplorationStopReason::NoReachableFreeSpace},
+                    message:format!("机体重叠恢复失败，原子导航已确认停车，探索结束：{reason}"),
+                };
+                guard.active_child=None;
+                guard.return_after_cancellation=false;
+                let generation=self.next_exploration_generation(&mut guard);
+                self.record_child_action_stop_locked(&mut guard,generation,action.reason);
+                let (snapshot,readiness,frontiers)=self.prepare_no_child_stop_locked(&mut guard,action);
+                drop(guard);
+                *self.readiness_cache.lock()=readiness;
+                self.publish_frontiers(frontiers);
+                return Ok(self.store_snapshot(snapshot));
+            }
+        }
         let frontier_goal_id = active_child.frontier_goal_id.clone();
         if guard.return_goal_id.as_deref()==Some(frontier_goal_id.as_str()) {
             guard.active_child=None;
@@ -4990,6 +5011,36 @@ mod tests {
         handle.stop("receipt-none-once").await;
         handle.report_navigation_result(&lease.session_id,
             ChildNavigationResult::Cancelled(zero_proof(&lease, 1))).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn overlap_recovery_failure_finishes_exploration_without_dispatching_again() {
+        for (cause,expected) in [("escape time or distance budget exhausted",ExplorationStopReason::NoReachableFreeSpace),
+            ("escape proof computation exhausted",ExplorationStopReason::PlanningResourceLimited)] {
+            let (handle,sink)=configured_handle();
+            ingest_committed_costmap_fixture(&handle,frontier_costmap(1),1).await.unwrap();
+            handle.start("overlap-stop","prefer_wavefront").await;
+            let active=handle.tick((2.,2.)).await;
+            assert!(!active.child_task_id.is_empty());
+            let lease=active_child_lease(&handle).await;
+            let reason=format!("PlannerFailed cause=LocalPlanner: {} {cause}",
+                nuwax_nav_types_messages::BODY_OVERLAP_RECOVERY_FAILED);
+            let mut stale=terminal_proof(&lease);
+            stale.lease.goal_generation+=1;
+            assert!(handle.report_navigation_result(&lease.session_id,
+                ChildNavigationResult::Failed {proof:stale,reason:reason.clone()}).await.is_err());
+            let stopped=handle.report_navigation_result(&lease.session_id,
+                ChildNavigationResult::Failed {proof:terminal_proof(&lease),reason:reason.clone()}).await.unwrap();
+            assert_eq!(stopped.status,STATUS_FAILED);
+            assert_eq!(stopped.last_stop_reason,stop_reason_str(expected));
+            assert!(stopped.message.contains(&reason));
+            assert!(stopped.child_task_id.is_empty());
+            for _ in 0..3 {
+                assert_eq!(handle.tick((2.,2.)).await.status,STATUS_FAILED);
+            }
+            assert_eq!(sink.submitted.lock().unwrap().len(),1,
+                "已停车的机体重叠失败不能靠不断更换前沿重试");
+        }
     }
 
     async fn child_paused_in_receipt_read(

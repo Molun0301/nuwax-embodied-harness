@@ -5,6 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// 机体重叠恢复已失败的停止专用标记；不构成任何几何通行或运动许可。
+pub const BODY_OVERLAP_RECOVERY_FAILED: &str = "BODY_OVERLAP_RECOVERY_FAILED:";
+
 /// 诊断严重等级
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

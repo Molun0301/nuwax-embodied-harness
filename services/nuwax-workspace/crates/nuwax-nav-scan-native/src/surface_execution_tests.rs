@@ -69,6 +69,85 @@ fn registered_surface_overlap_escapes_across_updates_and_execution_retirement() 
 }
 
 #[test]
+fn registered_surface_failed_initialization_does_not_poison_later_shallow_escape() {
+    let route = [[0.095, 0.025, 0.35], [0.6, 0.025, 0.35]];
+    let contact = [[-0.025, 0.025, 0.35]];
+    let mut req = shallow_surface_request(&route, &contact);
+    let mut planner = registered_fixture(&req);
+    req.start_position[0] = 0.06;
+    let failure = planner.step(&req).unwrap_err();
+    assert!(failure.contains("half a voxel"));
+    assert!(failure.contains("BODY_OVERLAP_RECOVERY_FAILED:"));
+    planner.reset_execution();
+    req.start_position = route[0];
+    let mut cleared = false;
+    let mut normal_motion = false;
+    for tick in 1..100 {
+        req.odometry_timestamp_ns = tick * 50_000_000;
+        let out = planner.step(&req).expect("未动作的初始化拒绝不能毒化后续浅接触");
+        let old = req.start_velocity.unwrap();
+        let before = req.start_position[0];
+        req.start_position[0] += (old[0] + out.command_forward) * 0.025;
+        req.start_position[1] += (old[1] + out.command_lateral) * 0.025;
+        req.start_yaw += out.command_yaw_rate * 0.05;
+        req.start_velocity = Some([out.command_forward, out.command_lateral, 0.]);
+        if !cleared {
+            assert!(req.start_position[0] > before);
+            assert_eq!(out.command_lateral, 0.);
+            assert_eq!(out.command_yaw_rate, 0.);
+            assert!(req.start_position[0] - route[0][0] <= req.config.resolution);
+            // 独立轴向矩形边界：退出前不能增加与初始格的相交。
+            for sample in &out.samples {
+                assert!(sample.position[0] >= before);
+            }
+            cleared = req.start_position[0] - req.config.body_length / 2. > 0.;
+        } else if out.command_forward > 0. && planner.plan_count() > 0 {
+            normal_motion = true;
+            break;
+        }
+    }
+    assert!(cleared && normal_motion, "退出初始格后必须继续正常规划和前进");
+}
+
+#[test]
+fn registered_surface_failed_first_proof_can_retry_without_rearming_issued_budget() {
+    let route = [[0.095, 0.025, 0.35], [1., 0.025, 0.35]];
+    let contact = [[-0.025, 0.025, 0.35]];
+    let mut req = shallow_surface_request(&route, &contact);
+    let mut planner = registered_fixture(&req);
+    req.start_yaw_rate = None;
+    let missing = planner.step(&req).unwrap_err();
+    assert!(missing.contains("requires measured velocity and yaw rate"));
+    assert!(!missing.contains("BODY_OVERLAP_RECOVERY_FAILED:"),
+        "输入缺测仍可恢复，不能误标为脱困失败终态");
+    req.start_yaw_rate = Some(0.);
+    req.start_velocity = Some([-0.02, 0., 0.]);
+    assert!(planner.step(&req).unwrap_err().contains("no monotone"));
+    planner.reset_execution();
+    req.start_velocity = Some([0.; 3]);
+    req.odometry_timestamp_ns = 50_000_000;
+    assert!(planner.step(&req).unwrap().command_forward > 0.);
+    req.odometry_timestamp_ns = 2_050_000_001;
+    let exhausted = planner.step(&req).unwrap_err();
+    assert!(exhausted.contains("budget exhausted"));
+    planner.reset_execution();
+    req.odometry_timestamp_ns += 50_000_000;
+    assert_eq!(planner.step(&req).unwrap_err(), exhausted,
+        "发出动作后的耗尽首因必须跨目标保留，不能重置额度或被泛化");
+    // 满足旧的两格净离开条件后才是新事件；新失败不能继承旧事件首因。
+    req.start_position[0] = 0.3;
+    planner.step(&req).unwrap();
+    planner.reset_execution();
+    req.start_position = route[0];
+    req.odometry_timestamp_ns += 50_000_000;
+    assert!(planner.step(&req).unwrap().command_forward > 0.);
+    req.odometry_timestamp_ns -= 1;
+    let next_failure = planner.step(&req).unwrap_err();
+    assert!(next_failure.contains("source clock regressed"));
+    assert!(!next_failure.contains("budget exhausted"));
+}
+
+#[test]
 fn registered_surface_escape_rejects_new_band_deep_overlap_and_inward_motion() {
     let route = [[0.095, 0.025, 0.35], [1., 0.025, 0.35]];
     let contact = [[-0.025, 0.025, 0.35]];

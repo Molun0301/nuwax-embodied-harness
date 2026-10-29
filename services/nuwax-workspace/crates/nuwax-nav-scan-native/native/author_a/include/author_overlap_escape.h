@@ -12,6 +12,7 @@ class AuthorOverlapEscape {
   unsigned ticks_=0;
   double traveled_=0.;
   double admitted_=0.;
+  std::string failure_;
   Eigen::Vector3d origin_=Eigen::Vector3d::Zero(),last_=Eigen::Vector3d::Zero();
   std::vector<Contact> contacts_;
   std::set<GridMap::BodyCell> initial_;
@@ -78,12 +79,31 @@ class AuthorOverlapEscape {
 
   void plan(GridMap& map,const ScanConfig& c,const Eigen::Vector3d& p,double yaw,
       const double* velocity,double angular,int64_t stamp,ScanOutput& output) {
-    using namespace command_check_detail;
+    // 缺测尚不能开始恢复证明，保留原输入等待语义，不宣告几何恢复失败。
     if(!velocity||!std::isfinite(angular))
       throw std::runtime_error("Current body pose is occupied; escape requires measured velocity and yaw rate");
+    const bool issued=latched_;
+    try {
+      planImpl(map,c,p,yaw,velocity,angular,stamp,output);
+      // 只有通过整拍和制动证明并输出动作，才消耗跨目标事件。
+      latched_=true;
+    } catch(const std::runtime_error& error) {
+      const std::string reason=error.what();
+      if(!issued) *this=AuthorOverlapEscape{};
+      else {active_=false;if(failure_.empty())failure_=reason;}
+      throw std::runtime_error("BODY_OVERLAP_RECOVERY_FAILED: "+reason);
+    }
+  }
+
+ private:
+  void planImpl(GridMap& map,const ScanConfig& c,const Eigen::Vector3d& p,double yaw,
+      const double* velocity,double angular,int64_t stamp,ScanOutput& output) {
+    using namespace command_check_detail;
     if(!active_) {
-      if(latched_)throw std::runtime_error("Current body pose is occupied; escape episode is already exhausted or completed");
-      latched_=true;origin_=last_=p;began_=last_stamp_=stamp;ticks_=0;traveled_=admitted_=0.;
+      if(latched_)throw std::runtime_error(failure_.empty()
+          ? "Current body pose is occupied; escape episode is already exhausted or completed"
+          : failure_);
+      origin_=last_=p;began_=last_stamp_=stamp;ticks_=0;traveled_=admitted_=0.;failure_.clear();
       contacts_.clear();initial_.clear();
       std::vector<GridMap::BodyCell> cells;
       if(map.bodyContacts(p,yaw,0.,&cells)!=1||cells.empty())

@@ -293,7 +293,9 @@ impl SurfaceFollower {
         self.position_reached() && yaw
     }
     fn computed_failure_step(&self, reason: String) -> PlannerStep {
-        if self.execution_failed { PlannerStep::Failed(reason) }
+        if self.execution_failed || reason.contains(nuwax_nav_types_messages::BODY_OVERLAP_RECOVERY_FAILED) {
+            PlannerStep::Failed(reason)
+        }
         else { PlannerStep::ReplanRequired(reason) }
     }
     fn compute(&mut self, robot_width_m: f64) -> Result<Twist2, String> {
@@ -959,6 +961,8 @@ mod native_execution_tests {
         assert!(matches!(follower.computed_failure_step("exhausted".into()),PlannerStep::Failed(_)));
         follower.execution_failed=false;
         assert!(matches!(follower.computed_failure_step("ordinary refusal".into()),PlannerStep::ReplanRequired(_)));
+        assert!(matches!(follower.computed_failure_step(format!("{} no monotone escape",
+            nuwax_nav_types_messages::BODY_OVERLAP_RECOVERY_FAILED)),PlannerStep::Failed(_)));
         follower.execution_failed=true;
         follower.update_odometry(pose(3.,1.,0.));
         assert!(matches!(follower.step(0.3),PlannerStep::Succeeded));

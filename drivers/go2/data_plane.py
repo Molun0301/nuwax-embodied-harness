@@ -35,7 +35,7 @@ from adapters.sensors.go2_l2 import (
 )
 from contracts.geometry import FrameTree, Pose, Quaternion, Vector3
 from contracts.pointcloud import PointCloudFrame, PointField
-from contracts.robot_state import IMUState
+from contracts.robot_state import IMUState, JointState
 from contracts.sensors import RegistrationState, SensorSample
 from core.logging_utils import LogRateLimiter, SamplingLogFilter as _SamplingLogFilter
 
@@ -383,6 +383,7 @@ def _load_go2_official_sdk_modules(
             unitree_go_dds_module = importlib.import_module("unitree_sdk2py.idl.unitree_go.msg.dds_")
             modules["ChannelSubscriber"] = getattr(channel_module, "ChannelSubscriber")
             modules["SportModeState"] = getattr(unitree_go_dds_module, "SportModeState_")
+            modules["LowState"] = getattr(unitree_go_dds_module, "LowState_", None)
             if config.lio_backend in {"fastlio2", "pointlio"}:
                 qos_module = importlib.import_module("cyclonedds.qos")
                 core_module = importlib.import_module("cyclonedds.core")
@@ -444,10 +445,13 @@ class Go2DirectDdsBridge:
         self._direct_dds_stop_event: Optional[threading.Event] = None
         self._direct_dds_threads: List[threading.Thread] = []
         self._direct_pose_subscriber = None
+        self._direct_joint_subscriber = None
         self._direct_point_cloud_subscriber = None
         self._direct_point_cloud_msg_type = None
         self._latest_pose_from_dds: Optional[Pose] = None
         self._latest_imu_state_from_dds: Optional[IMUState] = None
+        self._latest_joint_snapshot = None
+        self._latest_joint_tick = None
         self._latest_local_point_cloud: Optional[PointCloudFrame] = None
         self._latest_pose_generation: Optional[int] = None
         self._latest_imu_generation: Optional[int] = None
@@ -533,6 +537,76 @@ class Go2DirectDdsBridge:
                 if active and self._latest_imu_state_from_dds is not None
                 else None
             )
+
+    def get_joint_snapshot(self):
+        """复制同一次低层采样的关节与来源时间；读取不刷新采样时间。"""
+        with self._lock:
+            sample = self._latest_joint_snapshot
+            if not self._started or not self._direct_dds_started or sample is None:
+                return None
+            return {"joints": [joint.model_copy(deep=False) for joint in sample["joints"]],
+                    "metadata": dict(sample["metadata"])}
+
+    def _on_low_state(self, message, *, generation):
+        """官方电机序号依次为 FR、FL、RR、RL，各腿为髋、大腿、小腿。"""
+        # 序号依据 SDK example/go2/low_level/unitree_legged_const.py，名称对应 Go2 URDF。
+        names = tuple(leg + "_" + joint + "_joint" for leg in ("FR", "FL", "RR", "RL")
+                      for joint in ("hip", "thigh", "calf"))
+        now, received = datetime.now(timezone.utc), time.monotonic()
+        try:
+            tick = message.tick
+            if isinstance(tick, bool) or not isinstance(tick, int) or not 0 <= tick < 2 ** 32:
+                raise ValueError("Go2 lowstate 缺少合法 tick")
+            motors = message.motor_state
+            if len(motors) < len(names):
+                raise ValueError("Go2 lowstate 电机状态不完整")
+            joints = []
+            for name, motor in zip(names, motors):
+                position, velocity, effort = float(motor.q), float(motor.dq), float(motor.tau_est)
+                if not all(math.isfinite(value) for value in (position, velocity, effort)):
+                    raise ValueError("Go2 lowstate 电机状态不是有限值")
+                joints.append(JointState(name=name, position_rad=position, velocity_rad_s=velocity,
+                                         effort_nm=effort))
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            with self._lock:
+                if self._is_generation_active_locked(generation):
+                    self._latest_joint_snapshot = None
+            return
+        with self._lock:
+            if not self._is_generation_active_locked(generation):
+                return
+            previous = self._latest_joint_tick
+            if previous is not None:
+                delta = (tick - previous) % (2 ** 32)
+                # 重复样本和回退计数不能续命；uint32 正常回绕仍按递增处理。
+                if delta == 0 or delta >= 2 ** 31:
+                    return
+            self._latest_joint_tick = tick
+            self._latest_joint_snapshot = {"joints": joints, "metadata": {
+                "joint_source_timestamp": now.isoformat(),
+                "joint_received_monotonic": received,
+                # LowState 只有设备 tick，没有 UTC 时间，明确采用接收时间关联定位。
+                "joint_timestamp_basis": "dds_receive_time",
+                "joint_source_sequence": tick,
+                "joint_source_topic": "dds:" + self.config.direct_dds.low_state_topic,
+                "joint_source_generation": generation,
+            }}
+
+    def _direct_joint_reader_loop(self, generation, stop_event, subscriber):
+        while not stop_event.is_set():
+            try:
+                sample = subscriber.Read(float(self.config.direct_dds.read_timeout_sec))
+            except Exception:
+                with self._lock:
+                    if not self._is_generation_active_locked(generation, stop_event):
+                        return
+                    self._latest_joint_snapshot = None
+                _DRIVER_ERROR_LIMITER.log(LOGGER, logging.ERROR, "读取 Go2 关节状态失败",
+                                         key="go2-joints", interval_sec=30.0, exc_info=True)
+                stop_event.wait(0.1)
+                continue
+            if sample is not None:
+                self._on_low_state(sample, generation=generation)
 
     def get_latest_local_point_cloud(self, *, max_points: Optional[int] = None) -> Optional[PointCloudFrame]:
         with self._lock:
@@ -769,6 +843,8 @@ class Go2DirectDdsBridge:
         self._dds_input_timing.clear()
         self._latest_pose_from_dds = None
         self._latest_imu_state_from_dds = None
+        self._latest_joint_snapshot = None
+        self._latest_joint_tick = None
         self._latest_pose_generation = None
         self._latest_imu_generation = None
         self._latest_imu_source_timestamp_ns = None
@@ -957,6 +1033,7 @@ class Go2DirectDdsBridge:
 
         point_cloud_enabled = bool(self.config.direct_dds.point_cloud_enabled)
         pose_subscriber = None
+        joint_subscriber = None
         point_cloud_subscriber = None
         point_cloud_type = None
         try:
@@ -997,6 +1074,16 @@ class Go2DirectDdsBridge:
             )
             pose_subscriber.Init()
 
+            # 外观关节独立只读订阅；SDK 缺失该类型时保留既有惯性和定位输入。
+            if modules.get("LowState") is not None:
+                try:
+                    joint_subscriber = subscriber_class(self.config.direct_dds.low_state_topic, modules["LowState"])
+                    joint_subscriber.Init()
+                except Exception:
+                    self._close_direct_dds_subscriber(joint_subscriber, "关节订阅器")
+                    joint_subscriber = None
+                    LOGGER.warning("Go2 关节订阅不可用，外观将使用参考姿态", exc_info=True)
+
             if point_cloud_enabled:
                 point_cloud_type = modules.get("PointCloud2")
                 if point_cloud_type is None:
@@ -1033,6 +1120,7 @@ class Go2DirectDdsBridge:
         except Exception as exc:
             LOGGER.warning("初始化 Go2 官方 DDS 订阅器失败：%s", str(exc))
             self._close_direct_dds_subscriber(point_cloud_subscriber, "点云订阅器")
+            self._close_direct_dds_subscriber(joint_subscriber, "关节订阅器")
             self._close_direct_dds_subscriber(pose_subscriber, "位姿订阅器")
             with self._lock:
                 self._direct_pose_subscriber = None
@@ -1043,6 +1131,7 @@ class Go2DirectDdsBridge:
 
         with self._lock:
             self._direct_pose_subscriber = pose_subscriber
+            self._direct_joint_subscriber = joint_subscriber
             self._direct_point_cloud_subscriber = point_cloud_subscriber
             self._direct_point_cloud_msg_type = point_cloud_type
         self._direct_dds_threads = [
@@ -1053,6 +1142,11 @@ class Go2DirectDdsBridge:
                 daemon=True,
             ),
         ]
+        if joint_subscriber is not None:
+            self._direct_dds_threads.append(threading.Thread(
+                target=self._direct_joint_reader_loop, args=(generation, stop_event, joint_subscriber),
+                name=f"go2_direct_joint_reader_g{generation}", daemon=True,
+            ))
         if self._direct_point_cloud_subscriber is not None:
             self._direct_dds_threads.append(
                 threading.Thread(
@@ -1086,13 +1180,16 @@ class Go2DirectDdsBridge:
             stop_event = self._direct_dds_stop_event
             threads = tuple(self._direct_dds_threads)
             pose_subscriber = self._direct_pose_subscriber
+            joint_subscriber = self._direct_joint_subscriber
             point_cloud_subscriber = self._direct_point_cloud_subscriber
             self._direct_dds_threads = []
             self._direct_pose_subscriber = None
+            self._direct_joint_subscriber = None
             self._direct_point_cloud_subscriber = None
             self._direct_point_cloud_msg_type = None
         if stop_event is not None:
             stop_event.set()
+        self._close_direct_dds_subscriber(joint_subscriber, "关节订阅器")
         if pose_subscriber is not None:
             try:
                 pose_subscriber.Close()
@@ -1135,6 +1232,7 @@ class Go2DirectDdsBridge:
             if not self._is_generation_active_locked(generation) or self._sensor_process_failure is not None:
                 return
             self._sensor_process_status = snapshot["status"]
+            self._latest_joint_snapshot = snapshot.get("joint_snapshot")
             if pose is not None:
                 self._latest_pose_from_dds = pose
                 self._latest_imu_state_from_dds = imu
@@ -2007,6 +2105,12 @@ class Go2DataPlaneRuntime:
         if pose is None:
             return None
         return FrameTree(root_frame_id=pose.frame_id)
+
+    def get_joint_snapshot(self):
+        with self._lock:
+            active = self._started and self._active_generation is not None
+        getter = getattr(self.bridge, "get_joint_snapshot", None)
+        return getter() if active and callable(getter) else None
 
     def get_localization_state(self) -> Dict[str, Any]:
         pose = self.get_current_pose()

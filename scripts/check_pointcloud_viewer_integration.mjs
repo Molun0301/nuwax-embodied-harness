@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 const stage=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..'),repo=path.resolve(process.argv[2]||stage);
 const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'neh-cloud-viewer-'));
-const modules=['pointcloud3d.js','pointcloud-incremental.js','pointcloud-pages.js','three.module.min.js','semantic-regions3d.js','scene-graph3d.js','OrbitControls.js','pointcloud-processing.js','dense-pointcloud.js'];
+const modules=['robot-model3d.js', 'pointcloud3d.js','pointcloud-incremental.js','pointcloud-pages.js','three.module.min.js','semantic-regions3d.js','scene-graph3d.js','OrbitControls.js','pointcloud-processing.js','dense-pointcloud.js'];
 for(const name of modules){const staged=path.join(stage,'gateways/http/static/js',name);fs.copyFileSync(fs.existsSync(staged)?staged:path.join(repo,'gateways/http/static/js',name),path.join(temporary,name));}
 fs.writeFileSync(path.join(temporary,'package.json'),'{"type":"module"}');
 class Socket extends EventTarget{static OPEN=1;static all=[];constructor(){super();this.readyState=0;this.sent=[];Socket.all.push(this);}send(text){this.sent.push(JSON.parse(text));}emit(type,data){if(type==='open')this.readyState=1;const event=new Event(type);if(data!==undefined)Object.defineProperty(event,'data',{value:data});this.dispatchEvent(event);}close(){this.readyState=3;this.emit('close');}}

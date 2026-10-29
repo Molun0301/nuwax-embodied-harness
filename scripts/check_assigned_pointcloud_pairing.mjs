@@ -10,7 +10,7 @@ import { setImmediate as nextTurn } from 'node:timers/promises';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const repository = path.resolve(process.argv[2] || root);
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'neh-assigned-pairing-'));
-const modules = ['pointcloud3d.js', 'pointcloud-incremental.js', 'pointcloud-pages.js',
+const modules = ['robot-model3d.js', 'pointcloud3d.js', 'pointcloud-incremental.js', 'pointcloud-pages.js',
   'three.module.min.js', 'semantic-regions3d.js', 'scene-graph3d.js', 'OrbitControls.js',
   'pointcloud-processing.js', 'dense-pointcloud.js'];
 for (const name of modules) {

@@ -86,19 +86,27 @@ class Go2ProviderBundle(
             data_plane_status = self.assembly.data_plane.get_status()
             metadata["data_plane"] = data_plane_status
 
+        joint_snapshot = self._read_joint_snapshot()
+        metadata.update(joint_snapshot["metadata"])
+
         return RobotState(
             robot_id=self.assembly.defaults.parameters["robot_id"],
             frame_id=self.assembly.defaults.frame_ids["base"],
             mode=_to_control_mode(self.assembly.current_mode),
             pose=self._read_current_pose_for_state(),
-            joints=self.get_joint_states(),
+            joints=joint_snapshot["joints"],
             imu=self.get_imu_state(),
             safety=self.get_safety_state(),
             metadata=metadata,
         )
 
     def get_joint_states(self) -> List[JointState]:
-        return []
+        return self._read_joint_snapshot()["joints"]
+
+    def _read_joint_snapshot(self):
+        getter = getattr(self.assembly.data_plane, "get_joint_snapshot", None)
+        sample = getter() if callable(getter) else None
+        return sample or {"joints": [], "metadata": {"joint_source_timestamp": None}}
 
     def get_imu_state(self) -> Optional[IMUState]:
         if self.assembly.data_plane is not None:
@@ -200,18 +208,20 @@ class Go2ProviderBundle(
             unsubscriber(subscription_id)
 
     def _build_robot_state_from_stream(self, pose: Optional[Pose], metadata: Dict[str, object]) -> RobotState:
+        joint_snapshot = self._read_joint_snapshot()
         return RobotState(
             robot_id=self.assembly.defaults.parameters["robot_id"],
             frame_id=self.assembly.defaults.frame_ids["base"],
             mode=_to_control_mode(self.assembly.current_mode),
             pose=pose,
-            joints=self.get_joint_states(),
+            joints=joint_snapshot["joints"],
             imu=self.get_imu_state(),
             safety=self.get_safety_state(),
             metadata={
                 "control_mode": self.assembly.current_mode,
                 "source_kind": "go2_dds_stream",
                 **dict(metadata or {}),
+                **joint_snapshot["metadata"],
             },
         )
 

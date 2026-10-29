@@ -179,11 +179,13 @@ def _sensor_process_main(config, data, status, commands, stop, source_factory, f
             cloud = source.get_latest_local_point_cloud()
             pose_stamp = pose.timestamp if pose is not None else None
             cloud_stamp = cloud.timestamp if cloud is not None else None
+            joint_getter = getattr(source, "get_joint_snapshot", None)
             # 仅显示状态可合并；300Hz惯性和每帧雷达始终走上面的完整通道。
             snapshot = {
                 "pose": pose if pose_stamp != previous_pose else None,
                 "imu": imu if pose_stamp != previous_pose else None,
                 "cloud": cloud if cloud_stamp != previous_cloud else None,
+                "joint_snapshot": joint_getter() if callable(joint_getter) else None,
                 "status": source.get_status(), "pending_samples": depth, "pending_bytes": size,
                 "pose_metadata": latest_pose_metadata,
                 "input_delivery": delivery.get_status() if delivery is not None else None,

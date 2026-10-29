@@ -247,6 +247,8 @@ drivers/.active_robot.lock
 !/tests/test_planar_workspace_load.py
 !/tests/unit/test_config_registry.py
 !/tests/unit/test_g1_sim_gateway.py
+!/tests/unit/test_robot_model_api.py
+!/tests/unit/test_robot_visual_assets.py
 !/tests/unit/test_geometry_runtime_attach_only.py
 !/tests/unit/test_geometry_runtime_ready_minimal.py
 !/tests/unit/test_geometry_same_owner_health_recovery.py

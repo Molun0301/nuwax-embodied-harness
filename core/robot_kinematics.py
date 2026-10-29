@@ -129,17 +129,21 @@ def load_robot_kinematic_model(
     *,
     base_link: str = "",
     max_hull_points: int = 64,
+    load_hulls: bool = True,
+    urdf_data: Optional[bytes] = None,
 ) -> RobotKinematicModel:
     """读取已展开的 URDF，生成运动学树和每个连杆不超过 max_hull_points 的凸包。
 
     只读取本地文件；网格支持与 robot_geometry 相同的 STL/OBJ，基本形状按外接点集近似。
+    load_hulls=False 仅加载关节树，供独立外观资产加载器复用运动学；默认行为不变。
+    urdf_data 可传入已安全读取的模型快照，避免内容寻址后再次按路径读取。
     """
     from core import robot_geometry as geometry
     path = Path(model_path).expanduser().resolve()
     if not 8 <= max_hull_points <= 64:
         raise RobotKinematicsError("连杆凸包预算必须为8至64点")
     try:
-        links, elements, edges, root_link, selected = geometry._read_urdf_description(path, base_link)
+        links, elements, edges, root_link, selected = geometry._read_urdf_description(path, base_link, urdf_data=urdf_data)
         joints, pending = [], [root_link]
         visited = {root_link}
         while pending:
@@ -182,7 +186,7 @@ def load_robot_kinematic_model(
                 seen.add(current.name)
                 current = by_name[current.mimic[0]]
         hulls = []
-        for name, link in links.items():
+        for name, link in (links.items() if load_hulls else ()):
             points = []
             for collision in link.findall("collision"):
                 node = collision.find("geometry")

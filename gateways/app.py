@@ -53,6 +53,8 @@ _LOW_VALUE_HTTP_PATHS = frozenset(
         "/api/logs",
         "/console",
         "/console/",
+        "/api/robot-model",
+        "/api/robot-model/state",
         "/events/stream",
         "/streams/sse",
         "/streams/video.mjpeg",

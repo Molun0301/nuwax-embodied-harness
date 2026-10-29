@@ -296,6 +296,7 @@
                     <span class="lg"><span class="sw" style="background:#a5e27e"></span>全局路线</span>
                     <span class="lg"><span class="sw" style="background:#69dedc"></span>局部路线</span>
                     <span class="lg"><span class="sw" style="background:var(--robot)"></span><span id="robotGeometryLegend">机器人</span></span>
+                    <label id="robotEnvelopeControl" class="lg" hidden><input id="robotEnvelopeToggle" type="checkbox" checked>导航外包轮廓</label>
                     <span class="lg"><span class="sw" style="background:var(--frontier)"></span>前沿</span>
                     <span class="lg"><span class="sw" style="background:var(--goal)"></span>目标</span>
                     <span id="mapCameraHint" class="lg" hidden>自由视角：拖拽平移 · 滚轮缩放 · 复位适配完整地图</span>
@@ -306,6 +307,7 @@
                   <summary class="map-status-toggle" title="收起或展开地图状态"><span class="map-status-arrow" aria-hidden="true">‹</span><span>状态</span></summary>
                   <div class="map-status-body">
                     <div class="map-status-line"><div id="mapMeta" class="kv map-summary-kv"></div></div>
+                    <div id="robotModelStatusRow" class="map-status-line" hidden><span id="robotModelStatus" role="status">正在加载机器人外观</span></div>
                     <div class="map-status-line">
                       <div id="mapPoseHud" class="map-pose-hud" aria-live="polite" aria-label="机器人位姿">
                         <span id="mapPoseState" class="map-pose-state" data-state="missing">未定位</span>
@@ -528,7 +530,7 @@
   </script>
   <script type="module">
     if (window.__NUWAX_GEOMETRY_PIPELINE__ !== "slam_2d") {
-      await import("/static/js/pointcloud3d.js?v=20261015-object-labels");
+      await import("/static/js/pointcloud3d.js?v=20261029-real-robot");
     }
   </script>
   <!-- 地图导航与禁行区面板均在地图内展示。 -->

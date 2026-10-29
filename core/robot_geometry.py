@@ -265,7 +265,7 @@ def _read_bounded(path: Path, limit: int, label: str) -> bytes:
     return data
 
 
-def _mesh_vertices(element, model_path: Path):
+def _mesh_vertices(element, model_path: Path, *, resource_bytes: Optional[Mapping[Path, bytes]] = None):
     filename = element.get("filename", "").strip()
     if filename.startswith("package://"):
         parts = filename[len("package://"):].split("/", 1)
@@ -286,7 +286,13 @@ def _mesh_vertices(element, model_path: Path):
     suffix = path.suffix.lower()
     if suffix not in (".stl", ".obj"):
         raise RobotGeometryError("不支持该网格格式，请使用STL/OBJ或手填外包：" + str(path), "unsupported_robot_geometry")
-    data = _read_bounded(path, _MAX_MESH_BYTES, "网格")
+    if resource_bytes is None:
+        data = _read_bounded(path, _MAX_MESH_BYTES, "网格")
+    else:
+        # 显示服务传入已审计快照；缺项直接失败，禁止回到路径读取。
+        data = resource_bytes.get(path.resolve())
+        if data is None or len(data) > _MAX_MESH_BYTES:
+            raise RobotGeometryError("安全模型快照缺少网格或超出读取预算。")
     scale = _vector(element.get("scale"), (1.0, 1.0, 1.0), "网格缩放")
     if any(value == 0 for value in scale):
         raise RobotGeometryError("网格缩放不能为0。")
@@ -323,7 +329,7 @@ def _mesh_vertices(element, model_path: Path):
     return [tuple(_number(point[i], "网格顶点") * scale[i] for i in range(3)) for point in points]
 
 
-def _geometry_points(geometry, transform, model_path: Path):
+def _geometry_points(geometry, transform, model_path: Path, *, resource_bytes: Optional[Mapping[Path, bytes]] = None):
     children = list(geometry)
     if len(children) != 1:
         raise RobotGeometryError("每个碰撞/显示几何必须恰好包含一种形状。")
@@ -335,7 +341,7 @@ def _geometry_points(geometry, transform, model_path: Path):
             raise RobotGeometryError("模型盒尺寸必须完整且大于0。")
         local = [(x*size[0]/2, y*size[1]/2, z*size[2]/2) for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
     elif shape.tag == "mesh":
-        local = _mesh_vertices(shape, model_path)
+        local = _mesh_vertices(shape, model_path, resource_bytes=resource_bytes)
     elif shape.tag in ("sphere", "cylinder"):
         radius = _number(shape.get("radius"), "模型半径", positive=True)
         length = _number(shape.get("length"), "圆柱长度", positive=True) if shape.tag == "cylinder" else 0.0
@@ -364,8 +370,10 @@ def _geometry_points(geometry, transform, model_path: Path):
     return [(p[0],p[1]) for p in points], min(p[2] for p in points), max(p[2] for p in points)
 
 
-def _read_urdf_description(path: Path, base_link: str):
-    data = _read_bounded(path, _MAX_MODEL_BYTES, "机器人模型")
+def _read_urdf_description(path: Path, base_link: str, *, urdf_data: Optional[bytes] = None):
+    data = _read_bounded(path, _MAX_MODEL_BYTES, "机器人模型") if urdf_data is None else urdf_data
+    if len(data) > _MAX_MODEL_BYTES:
+        raise RobotGeometryError("机器人模型超过允许读取大小。")
     if b"<!DOCTYPE" in data.upper() or b"<!ENTITY" in data.upper():
         raise RobotGeometryError("机器人模型不支持文档类型或实体声明。")
     try:
@@ -400,10 +408,17 @@ def _read_urdf_description(path: Path, base_link: str):
     return links, joints, edges, root_link, selected
 
 
-def _parse_urdf(path: Path, base_link: str, positions: Dict[str, float], *, source_prefix: str):
+def _parse_urdf(path: Path, base_link: str, positions: Dict[str, float], *, source_prefix: str,
+                resource_bytes: Optional[Mapping[Path, bytes]] = None):
     from core.robot_kinematics import load_robot_kinematic_model, RobotKinematicsError
     try:
-        model = load_robot_kinematic_model(path, base_link=base_link)
+        if resource_bytes is None:
+            model = load_robot_kinematic_model(path, base_link=base_link)
+        else:
+            urdf_data = resource_bytes.get(path)
+            if urdf_data is None:
+                raise RobotGeometryError("安全模型快照缺少机器人描述文件。")
+            model = load_robot_kinematic_model(path, base_link=base_link, load_hulls=False, urdf_data=urdf_data)
     except RobotKinematicsError as exc:
         raise RobotGeometryError(str(exc), exc.code) from exc
     links, joints = model.link_elements, model.joint_elements
@@ -471,7 +486,8 @@ def _parse_urdf(path: Path, base_link: str, positions: Dict[str, float], *, sour
             geometry = item.find("geometry")
             if geometry is None:
                 raise RobotGeometryError("模型几何描述缺失：" + name)
-            points, lo, hi = _geometry_points(geometry, _compose(inverse, _compose(transforms[name], _origin(item))), path)
+            points, lo, hi = _geometry_points(geometry, _compose(inverse, _compose(transforms[name], _origin(item))), path,
+                                             resource_bytes=resource_bytes)
             xy.extend(points); lows.append(lo); highs.append(hi)
     if not xy:
         raise RobotGeometryError("模型没有可读取的碰撞或显示外形。", "robot_geometry_missing")
@@ -524,7 +540,8 @@ def _box(length, width, height, center, source):
                                   (x+length/2,y+width/2),(x-length/2,y+width/2)), z-height/2, z+height/2, source)
 
 
-def resolve_robot_geometry(config: RobotGeometryConfig, *, robot_name: str, base_dir) -> ResolvedRobotGeometry:
+def resolve_robot_geometry(config: RobotGeometryConfig, *, robot_name: str, base_dir,
+                           resource_bytes: Optional[Mapping[Path, bytes]] = None) -> ResolvedRobotGeometry:
     """按完整手填、指定模型、驱动默认模型、通用兼容外包解析；不启动设备。"""
     dimensions = tuple(_optional_number(getattr(config, name), name, positive=True) for name in ("length_m","width_m","height_m"))
     centers = tuple(_optional_number(getattr(config, name), name) for name in ("center_x_m","center_y_m","center_z_m"))
@@ -548,7 +565,7 @@ def resolve_robot_geometry(config: RobotGeometryConfig, *, robot_name: str, base
                 model = None
         if model is not None:
             result = _parse_urdf(model.resolve(), config.model_base_link, _joint_positions(config.model_joint_positions_json),
-                                 source_prefix="urdf" if explicit else "robot_default_urdf")
+                                 source_prefix="urdf" if explicit else "robot_default_urdf", resource_bytes=resource_bytes)
         else:
             # 通用回退沿原0.25米外包半宽与0.6米高度，来源明确，不伪称真实模型。
             result = replace(_box(0.5,0.5,0.6,_ZERO,"legacy_default"), warnings=("当前机器人没有外形模型，暂用默认外形；请配置模型或手填实际尺寸。",))

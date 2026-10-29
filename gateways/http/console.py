@@ -9,10 +9,10 @@ from typing import Any, TYPE_CHECKING
 from fastapi import APIRouter
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, RedirectResponse
-from core.robot_geometry import RobotGeometryError, resolve_robot_geometry
 from core.config_values import runtime_value
 from contracts.navigation_pipeline import navigation_support_distance
 from gateways.serialization import to_jsonable
+from gateways.http.robot_model import build_robot_model_router
 
 if TYPE_CHECKING:
     from gateways.runtime import GatewayRuntime
@@ -41,21 +41,14 @@ def render_console_page(pointcloud3d_config: Any = None, robot_geometry: Any = N
 
 def build_console_router(runtime: GatewayRuntime) -> APIRouter:
     router = APIRouter()
+    router.include_router(build_robot_model_router(runtime))
 
     @router.get("/console", response_class=HTMLResponse)
     @router.get("/console/", response_class=HTMLResponse)
     async def console_page() -> HTMLResponse:
         def render() -> str:
-            robot = runtime.config.robot
-            try:
-                geometry = resolve_robot_geometry(
-                    robot.geometry, robot_name=robot.active_robot,
-                    base_dir=Path(__file__).resolve().parents[2],
-                ).to_runtime_dict()
-            except (RobotGeometryError, OSError) as exc:
-                # 外形错误不妨碍打开控制台修正设置，也不伪造另一套显示尺寸。
-                geometry = {"error": str(exc)}
-            return render_console_page(getattr(runtime.config.gateway, "pointcloud3d", None), geometry,
+            # 外形由模型接口动态读取，避免页面初始注入在配置变更后滞留。
+            return render_console_page(getattr(runtime.config.gateway, "pointcloud3d", None), None,
                                        getattr(runtime.config.geometry, "pipeline", "lio_3d"),
                                        runtime_value("NUWAX_NAV_BODY_TO_SUPPORT_Z_M", ""))
 

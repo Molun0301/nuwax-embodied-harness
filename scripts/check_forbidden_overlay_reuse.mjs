@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 const repo = path.resolve(process.argv[2] || path.join(path.dirname(fileURLToPath(import.meta.url)), '..'));
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'neh-forbidden-overlay-'));
-const modules = ['pointcloud3d.js', 'pointcloud-incremental.js', 'pointcloud-pages.js', 'three.module.min.js',
+const modules = ['robot-model3d.js', 'pointcloud3d.js', 'pointcloud-incremental.js', 'pointcloud-pages.js', 'three.module.min.js',
   'semantic-regions3d.js', 'scene-graph3d.js', 'OrbitControls.js', 'pointcloud-processing.js', 'dense-pointcloud.js'];
 for (const name of modules) fs.copyFileSync(path.join(repo, 'gateways/http/static/js', name), path.join(temp, name));
 fs.writeFileSync(path.join(temp, 'package.json'), '{"type":"module"}');

@@ -18,9 +18,9 @@ fn fixture() -> (Block, GroundRecords) {
 #[test]
 fn bl5_keeps_exact_bits_and_both_historical_bl4_spellings() {
     let (block, records) = fixture();
-    let current = encode_ground_block(&block, &records).unwrap();
-    assert!(current.starts_with(b"NUWAXBL5"));
     let GroundRecords::Versioned(entries) = &records else { unreachable!() };
+    let current = ground_binary::encode(&block, entries).unwrap();
+    assert!(current.starts_with(b"NUWAXBL5"));
     let compact = serde_json::to_vec(&entries.iter().collect::<Vec<_>>()).unwrap();
     let mut old_entries = serde_json::to_value(entries.iter().collect::<Vec<_>>()).unwrap();
     let GroundRecord::HeightfieldV1(field) = &entries[&0] else { unreachable!() };
@@ -40,14 +40,19 @@ fn bl5_keeps_exact_bits_and_both_historical_bl4_spellings() {
         let GroundRecordRef::HeightfieldV1(decoded) = actual.get(0).unwrap() else { unreachable!() };
         assert_eq!(decoded.height_m.to_bits(), field.height_m.to_bits());
         assert_eq!(decoded.samples[0].point.map(f64::to_bits), field.samples[0].point.map(f64::to_bits));
-        assert_eq!(encode_ground_block(&actual_block, &actual).unwrap(), current);
+        let GroundRecords::Versioned(entries) = &actual else { unreachable!() };
+        assert_eq!(ground_binary::encode(&actual_block, entries).unwrap(), current);
+        let newest = encode_ground_block(&actual_block, &actual).unwrap();
+        assert!(newest.starts_with(b"NUWAXBL6"));
+        assert_eq!(decode_ground_records(&newest).unwrap(), records);
     }
 }
 
 #[test]
 fn bl5_rejects_truncation_counts_tags_trailing_and_invalid_float_without_panicking() {
     let (block, records) = fixture();
-    let bytes = encode_ground_block(&block, &records).unwrap();
+    let GroundRecords::Versioned(entries) = &records else { unreachable!() };
+    let bytes = ground_binary::encode(&block, entries).unwrap();
     let start = 16 + block.len() * 12;
     for end in 0..bytes.len() {
         let mut truncated = bytes[..end].to_vec();

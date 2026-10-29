@@ -371,7 +371,7 @@ fn block_response(request: &serde_json::Value, response: &serde_json::Value) -> 
     }
     let data = response.get("data").and_then(serde_json::Value::as_array)
         .ok_or("精细块响应格式错误")?;
-    if data.len() > MAX_BLOCK_BYTES { return Err("精细块响应长度错误".into()); }
+    if data.len() > nuwax_map_chunks::MAX_V1_TO_V5_BLOCK_BYTES { return Err("精细块响应长度错误".into()); }
     data.iter().map(|byte| byte.as_u64().and_then(|v| u8::try_from(v).ok())
         .ok_or_else(|| "精细块响应字节无效".into())).collect()
 }
@@ -641,7 +641,7 @@ mod tests {
         assert!(block_response(&request, &wrong).is_err());
         for data in [serde_json::json!([-1]), serde_json::json!([256]),
             serde_json::json!([1.5]), serde_json::json!(["1"]), serde_json::json!("00"),
-            serde_json::json!(vec![0_u8; MAX_BLOCK_BYTES + 1])]
+            serde_json::json!(vec![0_u8; nuwax_map_chunks::MAX_V1_TO_V5_BLOCK_BYTES + 1])]
         {
             let mut wrong = response.clone();
             wrong["data"] = data;
@@ -672,7 +672,7 @@ mod tests {
             assert!(block_response(&request, &invalid).is_err());
         }
         for encoded in [serde_json::json!("!"), serde_json::json!("AAH+/w"),
-            serde_json::json!([0, 1]), serde_json::json!("A".repeat(MAX_BLOCK_BYTES.div_ceil(3) * 4 + 4))] {
+            serde_json::json!([0, 1]), serde_json::json!("A".repeat(nuwax_map_chunks::MAX_V1_TO_V5_BLOCK_BYTES.div_ceil(3) * 4 + 4))] {
             let mut invalid = response.clone(); invalid["data_base64"] = encoded;
             assert!(block_response(&request, &invalid).is_err());
         }

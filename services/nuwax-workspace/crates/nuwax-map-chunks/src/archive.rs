@@ -49,8 +49,9 @@ pub fn archive_file(root: &Manifest, repository: &Repository) -> Result<(File, u
     let mut written_size = 24 + root_bytes.len() as u64;
     for reference in &root.blocks {
         let bytes = repository.read_object(reference.object, MAX_BLOCK_BYTES)?;
-        let (block, _layers) = decode_block_parts(&bytes)?;
+        let (block, layers) = decode_block_parts(&bytes)?;
         admit_format(intrinsic_bytes(&bytes, &block), root)?;
+        ground_shared::admit(intrinsic_bytes(&bytes, &block), &layers, root)?;
         admit_intrinsic(intrinsic(&block), reference.points, root.source_timestamp_ns)?;
         written_size += 4 + bytes.len() as u64;
         if written_size > MAX_ARCHIVE_BYTES { return Err("精细地图资产超出1吉比字节预算".into()); }
@@ -153,6 +154,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         match &self.root {
             ArchivedRoot::Current(root) => {
                 admit_format(intrinsic_bytes(&bytes, &block), root)?;
+                ground_shared::admit(intrinsic_bytes(&bytes, &block), &layers, root)?;
                 if root.version >= 5 { ground_records::validate_legacy_sample_occupancy(&layers, &block, key, root.voxel_size_m)?; }
             },
             ArchivedRoot::Legacy(_) if !layers.is_empty() => return Err("legacy archive contains observed layer block".into()),

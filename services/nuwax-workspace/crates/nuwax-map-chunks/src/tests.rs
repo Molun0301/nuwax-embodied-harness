@@ -32,6 +32,8 @@ fn block_roundtrip_negative_coordinates_and_evidence() {
 
 // 摘要优化前的解码器原样冻结；不得改为调用共享解析器。
 fn frozen_decode_block(bytes: &[u8]) -> Result<Block, String> {
+    // 历史解析器的4MiB上限也冻结，不能跟随新格式容量变化。
+    const MAX_BLOCK_BYTES: usize = 4 * 1024 * 1024;
     if bytes.len() < 16 || bytes.len() > MAX_BLOCK_BYTES || &bytes[..8] != b"NUWAXBL1" || bytes[12..16] != [0; 4] {
         return Err("精细块格式或长度无效".into());
     }
@@ -104,7 +106,7 @@ fn block_summary_matches_frozen_header_count_and_error_precedence() {
         assert_block_oracle(&format!("reserved byte {offset}"), &bad, format);
     }
     let mut bad = valid.clone();
-    bad.resize(MAX_BLOCK_BYTES + 1, 0);
+    bad.resize(4 * 1024 * 1024 + 1, 0);
     assert_block_oracle("over maximum size", &bad, format);
     assert_block_oracle("empty block", &unchecked_block(&[]), count);
     for points in [0_u32, 2, 32768, 32769, u32::MAX] {

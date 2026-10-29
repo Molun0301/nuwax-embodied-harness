@@ -9,16 +9,18 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from services.geometry.fine_map_archive import read_fine_archive_root, validate_fine_archive, _heightfield_samples
-from services.geometry.fine_ground_binary import decode_ground_binary
+from services.geometry.fine_map_archive import read_fine_archive_root, validate_fine_archive, _heightfield_samples, _binary_source_identity
+from services.geometry.fine_ground_binary import decode_ground_binary, decode_ground_shared
 
 
 def decode_records(body, end):
-    if body[:8] == b"NUWAXBL5":
+    if body[:8] in (b"NUWAXBL5", b"NUWAXBL6"):
         def integer(value, low, high):
             if type(value) is not int or not low <= value <= high:
                 raise ValueError("测试样本整数越界")
             return value
+        if body[:8] == b"NUWAXBL6":
+            return decode_ground_shared(body[end:], lambda value: _binary_source_identity(value, integer))[1]
         return decode_ground_binary(body[end:], json.loads, lambda value: _heightfield_samples(value, integer))
     return json.loads(body[end:])
 
@@ -60,7 +62,7 @@ class DetachedLegacyArchiveCodecTests(unittest.TestCase):
         self.assertEqual(validate_fine_archive(before_bytes, session="heightfield-storage"), before[1])
         self.assertEqual(validate_fine_archive(after_bytes, session="heightfield-storage"), after[1])
         self.assertEqual((before[0], before[2]), (b"NUWAXAR4", b"NUWAXBL3"))
-        self.assertEqual((after[0], after[2]), (b"NUWAXAR5", b"NUWAXBL5"))
+        self.assertEqual((after[0], after[2]), (b"NUWAXAR5", b"NUWAXBL6"))
         self.assertEqual(before[3], {0: (10, 1), 1024: (20, 1)})
         self.assertEqual(after[3], before[3])
         self.assertEqual(before[4][0][1]["members"], [0, 1024])
@@ -88,7 +90,7 @@ class DetachedLegacyArchiveCodecTests(unittest.TestCase):
     def test_real_rust_mutations_reject_unproven_sample_evidence(self):
         good_bytes = self._rust_artifact("h3-detached-legacy.ar5")
         _, good_root, good_magic, good_evidence, good_ground = self._single_block(good_bytes)
-        self.assertEqual(good_magic, b"NUWAXBL5")
+        self.assertEqual(good_magic, b"NUWAXBL6")
         validate_fine_archive(good_bytes, session="heightfield-storage")
         q = struct.unpack("<f", struct.pack("<f", good_root["voxel_size_m"]))[0]
         cases = ("future-sample", "occupied-wrong-voxel", "missing-voxel",
@@ -133,6 +135,26 @@ class DetachedLegacyArchiveCodecTests(unittest.TestCase):
                     validate_fine_archive(payload, session="heightfield-storage")
                 print("H3_DETACHED_RUST mutation=%s admission=REJECT" % case)
 
+    def test_bl6_multilayer_blocks_preserve_samples_and_shared_source_budget(self):
+        for layers in (3, 4):
+            payload = self._rust_artifact(f"BL6-{layers}层.ar5")
+            _, root, block_magic, evidence, records = self._single_block(payload)
+            self.assertEqual(block_magic, b"NUWAXBL6")
+            self.assertGreater(len(payload), 4 * 1024 * 1024)
+            self.assertEqual(validate_fine_archive(payload), root)
+            self.assertEqual(len(evidence), 1024 * layers)
+            self.assertEqual(len(records), 1024 * layers)
+            self.assertEqual(sum(len(record[1]["data"]["samples"]) for record in records), 1024 * layers * 32)
+        payload = self._rust_artifact("BL6-来源边界.ar5")
+        magic, root, offset = read_fine_archive_root(payload)
+        self.assertEqual(validate_fine_archive(payload), root)
+        root["source_watermarks"] = []
+        root["revision"] = 2
+        encoded = json.dumps(root, separators=(",", ":")).encode()
+        changed = magic + struct.pack("<Q", len(encoded)) + encoded + payload[offset:]
+        with self.assertRaisesRegex(ValueError, "未声明来源"):
+            validate_fine_archive(changed)
+
     def test_real_classified_empty_column_keeps_occupancy_and_strict_tag(self):
         payload = self._rust_artifact("h3-classified-empty.ar5")
         magic, root, offset = read_fine_archive_root(payload)
@@ -148,7 +170,7 @@ class DetachedLegacyArchiveCodecTests(unittest.TestCase):
             offset += length
         self.assertEqual(offset, len(payload))
         self.assertEqual(sum(ref["points"] for ref in root["blocks"]), 4)
-        marked = [i for i, block in enumerate(blocks) if block[:8] == b"NUWAXBL5"]
+        marked = [i for i, block in enumerate(blocks) if block[:8] == b"NUWAXBL6"]
         self.assertEqual(marked, [0])
         body = blocks[0]
         end = 16 + root["blocks"][0]["points"] * 12

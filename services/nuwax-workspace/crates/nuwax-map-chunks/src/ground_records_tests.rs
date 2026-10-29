@@ -199,7 +199,7 @@ fn compact_heightfield_full_block_retains_all_32_samples_with_original_byte_budg
     }
     let records = GroundRecords::Versioned(Arc::new(records));
     let old = old_heightfield_block(&block, &records);
-    assert!(old.len() > MAX_BLOCK_BYTES, "复现原持续采样会超出块预算");
+    assert!(old.len() > MAX_V1_TO_V5_BLOCK_BYTES, "复现原持续采样会超出块预算");
     let encoded = encode_ground_block(&block, &records).unwrap();
     assert!(encoded.len() < MAX_BLOCK_BYTES);
     assert_eq!(decode_ground_records(&encoded).unwrap(), records);
@@ -286,7 +286,7 @@ fn heightfield_cross_block_writer_receiver_archive_restore_exact_members() {
     let mut receiver = Receiver::new(Repository::temporary().unwrap());
     let pinned = receive(&mut receiver,&root,w.repository()).unwrap();
     assert_eq!(assembled(&mut receiver,&pinned,xy),value);
-    assert!(root.blocks.iter().all(|r| w.repository().read_object(r.object,MAX_BLOCK_BYTES).unwrap().starts_with(b"NUWAXBL5")));
+    assert!(root.blocks.iter().all(|r| w.repository().read_object(r.object,MAX_BLOCK_BYTES).unwrap().starts_with(b"NUWAXBL6")));
     let bytes = archive_bytes(&root,w.repository()); assert!(bytes.starts_with(b"NUWAXAR5")); artifact("cross-block.ar5",&bytes);
     let repo = Repository::temporary().unwrap(); let path = repo.path().to_path_buf();
     let restored = ArchiveReader::open(Cursor::new(bytes)).unwrap().import(&repo).unwrap();
@@ -463,7 +463,10 @@ fn heightfield_full_horizontal_block_and_existing_byte_budget_roundtrip() {
         f.samples=vec![LayerSample {source:Arc::new(LayerSource::Auxiliary {sensor_id:"x".repeat(5000),clock_id:"clock".into(),runtime_generation:1,session_generation:1}),
             point:[0.,0.,0.],source_sequence:0,source_timestamp_ns:20,point_index:0}];
     }}
-    assert!(encode_ground_block(&block,&GroundRecords::Versioned(Arc::new(oversized))).unwrap_err().contains("budget"));
+    assert!(ground_binary::encode(&block, &oversized).unwrap_err().contains("budget"));
+    let records = GroundRecords::Versioned(Arc::new(oversized));
+    let bytes = encode_ground_block(&block, &records).unwrap();
+    assert_eq!(decode_ground_records(&bytes).unwrap(), records, "旧格式超限案例现在完整存储");
     eprintln!("H2 full_columns=1024 encoded_block_bytes={} byte_budget={MAX_BLOCK_BYTES}",bytes.len());
 }
 
@@ -542,7 +545,7 @@ fn h3_legacy_claim_withdrawal_retains_original_sample_across_storage() {
     let old_bytes = f.writer.repository().read_object(f.before.blocks[0].object, MAX_BLOCK_BYTES).unwrap();
     let new_bytes = f.writer.repository().read_object(f.after.blocks[0].object, MAX_BLOCK_BYTES).unwrap();
     assert!(old_bytes.starts_with(b"NUWAXBL3"));
-    assert!(new_bytes.starts_with(b"NUWAXBL5"), "pure Legacy must not compact into invalid BL3");
+    assert!(new_bytes.starts_with(b"NUWAXBL6"), "pure Legacy must not compact into invalid BL3");
     let (old_block, _) = decode_block_parts(&old_bytes).unwrap();
     let (block, records) = decode_block_parts(&new_bytes).unwrap();
     assert_eq!(block, old_block); // Includes original observed_ns and hit counts.

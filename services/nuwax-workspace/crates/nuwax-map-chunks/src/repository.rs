@@ -81,7 +81,7 @@ impl Repository {
     /// Publish once using a no-replace hard link. Existing IDs must have exact equal bytes.
     pub fn put_object(&self, object: ObjectIdentity, bytes: &[u8]) -> Result<(), String> {
         object.validate()?;
-        if bytes.len() > MAX_MANIFEST_BYTES { return Err("object exceeds repository budget".into()); }
+        if bytes.len() > MAX_BLOCK_BYTES.max(MAX_MANIFEST_BYTES) { return Err("object exceeds repository budget".into()); }
         #[cfg(test)] {
             use std::sync::atomic::Ordering::Relaxed;
             self.stats.puts.fetch_add(1, Relaxed);
@@ -117,9 +117,10 @@ impl Repository {
         for block in &root.blocks {
             if !copied.insert(block.object) { continue; }
             let bytes = self.read_object(block.object, MAX_BLOCK_BYTES)?;
-            let (decoded, _) = decode_block_parts(&bytes)?;
+            let (decoded, records) = decode_block_parts(&bytes)?;
             admit_intrinsic(intrinsic(&decoded), block.points, root.source_timestamp_ns)?;
             admit_format(intrinsic_bytes(&bytes, &decoded), root)?;
+            ground_shared::admit(intrinsic_bytes(&bytes, &decoded), &records, root)?;
             destination.put_object(block.object, &bytes)?;
         }
         Ok(())

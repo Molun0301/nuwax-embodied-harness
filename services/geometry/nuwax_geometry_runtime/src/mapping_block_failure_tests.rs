@@ -1,5 +1,5 @@
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn oversized_ground_block_keeps_runtime_alive_and_new_session_recovers() {
+async fn ground_block_write_conflict_keeps_runtime_alive_and_new_session_recovers() {
     let mut handle = build_handle_for_tests_without_cloud_writer().await.unwrap();
     let mut fixture = NavigationMap3DFixture::new();
     fixture.context.producer_runtime_generation = handle.nav.producer_runtime_generation();
@@ -22,6 +22,8 @@ async fn oversized_ground_block_keeps_runtime_alive_and_new_session_recovers() {
             "map".into(),0.5,0.2,0.6,0.1,0.15,18.0,0.2).unwrap()),
             handle.nav.producer_runtime_generation(), fixture.context.mapping.lock().mapping_commit_boot_nonce().to_be_bytes()).await.unwrap();
     }
+    // 三层现在必须正常编码；失败隔离改用实际不可变对象写入冲突，不修改编码结果。
+    fixture.writer.lock().as_mut().unwrap().force_actual_ground_write_conflict();
     fixture.writer.lock().as_mut().unwrap().stage_oversized_ground_block(2_000_000_000);
     let mapping = handle.mapping_adapter.as_ref().unwrap();
     let outcome = ingest_mapping_points_with_backend(mapping, &handle.mapping_lifecycle_lock,
@@ -38,7 +40,7 @@ async fn oversized_ground_block_keeps_runtime_alive_and_new_session_recovers() {
         assert_eq!(writer.committed_metadata().unwrap().revision, baseline.metadata.revision);
         assert_eq!(writer.last_cloud_receipt().unwrap(), baseline.receipt);
         assert_eq!(writer.committed_fine_cloud().unwrap().manifest().identity(), old_root.manifest().identity());
-        assert!(writer.source_failure().unwrap().1.contains("byte budget"));
+        assert!(writer.source_failure().unwrap().1.contains("immutable object identity conflicts"));
         assert_eq!(writer.block_write_failure().unwrap().key, [10,10,0]);
         writer.source_failure().unwrap().0
     };

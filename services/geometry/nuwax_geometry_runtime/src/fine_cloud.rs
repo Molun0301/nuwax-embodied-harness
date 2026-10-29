@@ -120,6 +120,14 @@ impl FineCloud {
     pub(super) fn voxel_size(&self) -> f32 { self.writer.voxel_size_m() }
     #[cfg(test)]
     pub(super) fn stage_oversized_block(&mut self, stamp: u64) { budget_fixture::stage(self, stamp); }
+    #[cfg(test)]
+    pub(super) fn force_actual_object_conflict(&mut self, root: &nuwax_map_chunks::Manifest) {
+        let nuwax_map_chunks::ObjectIdentity::Assigned(id) = root.blocks[0].object else { panic!("分配身份夹具"); };
+        let mut writer = Writer::with_id_source(self.writer.repository().clone(), self.writer.voxel_size_m(),
+            self.writer.cache_budget_bytes(), move || Ok(id)).unwrap();
+        writer.restore(root).unwrap();
+        self.writer = writer;
+    }
     pub(super) fn block_write_failure(&self) -> Option<&nuwax_map_chunks::BlockWriteFailure> { self.writer.block_write_failure() }
     pub(super) fn is_dynamic(&self, point: &Point3<f64>) -> bool {
         self.dynamic.is_dynamic([point.x, point.y, point.z])

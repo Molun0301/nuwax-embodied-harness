@@ -115,6 +115,14 @@ class HeightfieldArchiveConsumerTests(unittest.TestCase):
             document['canonical_assets']['occupancy']['timestamp_ns'] = root['source_timestamp_ns']
             document['canonical_assets']['cloud']['source_cloud_revision'] = root['revision']
             manifest.write_bytes(checkpoint_store._encode_json(document))
+            # 旧导入同时核对展示栅格时间；按原纳秒来源精确截到其微秒表达，不重标制品。
+            from datetime import datetime, timedelta, timezone
+            bundle_path = fixture.current / 'bundle.json'
+            bundle = json.loads(bundle_path.read_text())
+            bundle['snapshot']['occupancy_grid']['timestamp'] = (
+                datetime(1970, 1, 1, tzinfo=timezone.utc)
+                + timedelta(microseconds=root['source_timestamp_ns'] // 1000)).isoformat()
+            bundle_path.write_bytes(checkpoint_store._encode_json(bundle))
             fixture.add_fine_archive(payload)
             before = legacy.inventory(fixture.current)
             result = fixture.import_current()
@@ -195,7 +203,7 @@ class HeightfieldArchiveConsumerTests(unittest.TestCase):
         if not directory:
             self.skipTest('set NEH_HEIGHTFIELD_ARCHIVE_DIR to Rust storage qualification output')
         for name in ('cross-block.ar5', 'zero-mass-withdrawn.ar5', 'mixed.ar5',
-                     'full-1024.ar5', 'legacy.ar4'):
+                     'full-1024.ar5', 'legacy.ar4', 'BL6-3层.ar5', 'BL6-4层.ar5', 'BL6-旧平面大块.ar4'):
             with self.subTest(name=name):
                 payload = (Path(directory) / name).read_bytes()
                 self.roundtrip(payload, self.fixture.root / name)

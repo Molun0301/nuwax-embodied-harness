@@ -280,10 +280,16 @@ async fn recorded_large_block_crosses_real_process_rpc_with_original_deadlines()
     let root=repository.path();
     let mut input=message(&repository,1,1);
     let mut manifest=Manifest::decode(&input.fine.as_ref().unwrap().root).unwrap();
-    manifest.version=4;
+    let records=decode_ground_records(&bytes).unwrap();
+    manifest.version=if matches!(&records,GroundRecords::Versioned(_)){5}else{4};
     let mut watermarks=BTreeMap::<Arc<LayerSource>,(u64,u64)>::new();
-    for layer in decode_layer_observations(&bytes).unwrap().values() {
-        for sample in &layer.samples {
+    for (_,record) in records.iter() {
+        let samples=match record {
+            GroundRecordRef::LegacyPlane(layer)=>&layer.samples,
+            GroundRecordRef::HeightfieldV1(field)=>&field.samples,
+            GroundRecordRef::ClassifiedEmptyColumn=>continue,
+        };
+        for sample in samples {
             if !sample.source.is_legacy() {
                 let marker=(sample.source_timestamp_ns,sample.source_sequence);
                 watermarks.entry(sample.source.clone()).and_modify(|old|*old=(*old).max(marker)).or_insert(marker);
@@ -294,7 +300,7 @@ async fn recorded_large_block_crosses_real_process_rpc_with_original_deadlines()
         SourceWatermark {source,source_timestamp_ns,source_sequence}).collect();
     let object=ObjectIdentity::Assigned(ObjectId::random().unwrap());
     repository.put_object(object,&bytes).unwrap();
-    manifest.source_timestamp_ns=latest.max(manifest.source_timestamp_ns);
+    manifest.source_timestamp_ns=latest;
     manifest.blocks=vec![BlockRef { key:[0,0,0],object,block_revision:1,
         geometry_revision:1,points }];
     let encoded=manifest.encode().unwrap();
@@ -302,6 +308,8 @@ async fn recorded_large_block_crosses_real_process_rpc_with_original_deadlines()
     input.fine.as_mut().unwrap().root=encoded;
     input.source_timestamp_ns=manifest.source_timestamp_ns as i64;
     input.committed_map.source_timestamp_ns=input.source_timestamp_ns;
+    input.cloud.header.stamp_sec=(latest/1_000_000_000) as i32;
+    input.cloud.header.stamp_nsec=(latest%1_000_000_000) as i32;
     let (url,rpc_name)=test_endpoint();
     std::fs::write(root.join("mode"),"good").unwrap();
     let mut child=ChildOwner(Command::new(std::env::current_exe().unwrap())
@@ -326,6 +334,7 @@ async fn recorded_large_block_crosses_real_process_rpc_with_original_deadlines()
         if let Err(error)=result {failed.push(error.to_string());}
         else {
             assert_eq!(reader.receiver.block(&manifest.blocks[0]).unwrap().len(),points as usize);
+            assert_eq!(reader.receiver.ground_records(&manifest.blocks[0]).unwrap(),records);
         }
         drop(reader);
     }

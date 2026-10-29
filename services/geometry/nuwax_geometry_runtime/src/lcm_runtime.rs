@@ -3275,7 +3275,7 @@ impl GeometryRuntimeHandle {
             tokio::task::spawn_blocking(move || match range {
                 Some((offset, maximum)) => fine.repository.read_object_range(
                     object, nuwax_map_chunks::MAX_BLOCK_BYTES, offset, maximum),
-                None => fine.repository.read_object(object, nuwax_map_chunks::MAX_BLOCK_BYTES)
+                None => fine.repository.read_object(object, nuwax_map_chunks::MAX_V1_TO_V5_BLOCK_BYTES)
                     .map(|bytes| nuwax_map_chunks::ObjectRangeRead::Data {
                         total_bytes: bytes.len(), bytes,
                     }),

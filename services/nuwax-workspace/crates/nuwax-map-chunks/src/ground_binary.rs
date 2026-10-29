@@ -1,10 +1,12 @@
 //! BL5：数值按原位宽小端保存；每条记录共享来源表，不改动地面语义。
 use crate::*;
 
+#[cfg(test)]
 struct Output(Vec<u8>);
+#[cfg(test)]
 impl Output {
     fn put(&mut self, bytes: &[u8]) -> Result<(), String> {
-        if bytes.len() > MAX_BLOCK_BYTES - self.0.len() {
+        if bytes.len() > MAX_V1_TO_V5_BLOCK_BYTES - self.0.len() {
             return Err("ground block exceeds byte budget".into());
         }
         self.0.extend_from_slice(bytes);
@@ -36,6 +38,7 @@ impl Output {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn encode(block: &Block, records: &BTreeMap<u16, GroundRecord>) -> Result<Vec<u8>, String> {
     let mut out = Output(encode_block(block)?);
     let start = out.0.len();

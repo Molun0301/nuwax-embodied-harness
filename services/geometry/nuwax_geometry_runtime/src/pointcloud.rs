@@ -869,6 +869,11 @@ impl CloudMapShmWriter {
 
     #[cfg(test)]
     pub(crate) fn stage_oversized_ground_block(&mut self, stamp: u64) { self.fine_cloud.as_mut().unwrap().stage_oversized_block(stamp); }
+    #[cfg(test)]
+    pub(crate) fn force_actual_ground_write_conflict(&mut self) {
+        let root = self.committed_fine_cloud.as_ref().unwrap().manifest().clone();
+        self.fine_cloud.as_mut().unwrap().force_actual_object_conflict(&root);
+    }
     pub(crate) fn block_write_failure(&self) -> Option<&nuwax_map_chunks::BlockWriteFailure> {
         self.fine_cloud.as_ref().and_then(FineCloud::block_write_failure)
     }

@@ -1,4 +1,4 @@
-//! 超限反例使用真实块结构，不降低生产字节预算或替换编码返回值。
+//! 三层满样本输入使用真实块结构；BL6必须完整保存，不替换编码返回值。
 pub(super) fn stage(fine: &mut super::FineCloud, stamp: u64) {
     use nuwax_map_chunks::{ColumnGroundRecords, HeightfieldSurface, LayerSample, LayerSource};
     use nuwax_map_chunks::heightfield_observations::HeightfieldColumn;

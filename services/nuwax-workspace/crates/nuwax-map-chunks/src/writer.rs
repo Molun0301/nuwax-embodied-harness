@@ -138,6 +138,7 @@ impl Writer {
         for reference in &root.blocks {
             let (block, info, records) = self.reader.parts(reference.object, reference.points)?;
             admit_format(info, root)?;
+            ground_shared::admit(info, &records, root)?;
             if root.version >= 5 && info.versioned {
                 ground_records::validate_legacy_sample_occupancy(&records, &block, reference.key, root.voxel_size_m)?;
                 admit_layer_spatial_binding(&mut bindings, reference.object, &records, reference.key, root.voxel_size_m)?;
@@ -560,7 +561,13 @@ impl Writer {
             if !self.pending.contains_key(&key) {
                 let object = ObjectIdentity::Assigned((self.id_source)()?); object.validate()?;
                 let dirty = &self.dirty[&key];
-                let bytes = encode_ground_block(&dirty.block, &dirty.layers).map_err(|error| {
+                let bytes = encode_ground_block(&dirty.block, &dirty.layers).and_then(|bytes| {
+                    if intrinsic_bytes(&bytes, &dirty.block).source_budget_required {
+                        let declared = self.source_watermarks.keys().map(|source| source.as_ref()).collect();
+                        ground_shared::validate_unregistered_sources(&dirty.layers, &declared)?;
+                    }
+                    Ok(bytes)
+                }).map_err(|error| {
                     let reason = format!("ground block {key:?}: points={} records={}: {error}", dirty.block.len(), dirty.layers.iter().count());
                     self.block_write_failure = Some(BlockWriteFailure { key, reason: reason.clone() });
                     reason

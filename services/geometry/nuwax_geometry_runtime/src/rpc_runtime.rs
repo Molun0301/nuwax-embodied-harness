@@ -81,8 +81,13 @@ fn encode_navigation_map_block_response(response: NavigationMapBlockResponse) ->
 fn encode_navigation_map_block_part(response: NavigationMapBlockResponse, compressed: bool) -> Result<Value, InvocationError> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     match response.schema_version {
-        2 => Ok(serde_json::json!({"schema_version":2,"root":response.root,
-            "block":response.block,"data":response.data})),
+        2 => {
+            if response.data.len() > nuwax_map_chunks::MAX_V1_TO_V5_BLOCK_BYTES {
+                return Err(InvocationError::serialization("旧整块接口仍限制4MiB，请使用分段接口"));
+            }
+            Ok(serde_json::json!({"schema_version":2,"root":response.root,
+                "block":response.block,"data":response.data}))
+        },
         3 => {
             if response.data.is_empty()
                 || response.data.len() > nuwax_map_chunks::MAX_BLOCK_TRANSFER_PART_BYTES
@@ -169,7 +174,7 @@ mod tests {
                 assert!(value.get("data").is_none());
             }
         }
-        for (schema_version, length) in [(3, nuwax_map_chunks::MAX_BLOCK_BYTES + 1), (4, 1)] {
+        for (schema_version, length) in [(2, nuwax_map_chunks::MAX_V1_TO_V5_BLOCK_BYTES + 1), (3, nuwax_map_chunks::MAX_V1_TO_V5_BLOCK_BYTES + 1), (3, nuwax_map_chunks::MAX_BLOCK_TRANSFER_PART_BYTES + 1), (4, 1)] {
             assert!(encode_navigation_map_block_response(NavigationMapBlockResponse {
                 schema_version, root: None, block: None, data: vec![0; length],offset:0,total_bytes:length as u32,
             }).is_err());

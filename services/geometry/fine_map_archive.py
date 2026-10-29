@@ -8,7 +8,9 @@ import numpy as np
 from services.geometry.checkpoint_payload import FrozenPayload
 
 MAX_FINE_ARCHIVE_BYTES = 1024 * 1024 * 1024
-_MAX_LAYER_BLOCK_BYTES = 4 * 1024 * 1024
+_MAX_OLD_LAYER_BLOCK_BYTES = 4 * 1024 * 1024
+# 与Rust相同：全部占据、全部32样本记录、原根来源及旧格式兼容来源。
+_MAX_LAYER_BLOCK_BYTES = 16 + 12 * 32768 + 13 + (41 + 66 + 48 * 32) * 32768 + 36 * 1024 * 1024
 _FINE_RECORD_DTYPE = np.dtype([("local", "<u2"), ("stamp", "<u8"), ("hits", "<u2")])
 
 
@@ -169,9 +171,13 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
         if first_offset != offset and (first_length != length or payload[first_offset:first_offset + length] != block):
             raise ValueError("精细地图同一对象身份的实际字节不一致")
         offset += length
-        sourced = version >= 4 and block[:8] == b"NUWAXBL3"
-        versioned = version >= 5 and block[:8] in (b"NUWAXBL4", b"NUWAXBL5")
-        layered = (version >= 3 and block[:8] == b"NUWAXBL2") or sourced or versioned
+        shared = block[:8] == b"NUWAXBL6"
+        if not shared and length > _MAX_OLD_LAYER_BLOCK_BYTES:
+            raise ValueError("旧格式精细地图块长度超过原4MiB上限")
+        mode = block[records_end] if shared and len(block) > records_end else -1
+        sourced = version >= 4 and (block[:8] == b"NUWAXBL3" or (shared and mode == 1))
+        versioned = version >= 5 and (block[:8] in (b"NUWAXBL4", b"NUWAXBL5") or (shared and mode == 2))
+        layered = (version >= 3 and (block[:8] == b"NUWAXBL2" or (shared and mode == 0))) or sourced or versioned
         layer_length = struct.unpack("<I", block[12:16])[0]
         if (block[:8] != b"NUWAXBL1" and not layered
                 or struct.unpack("<I", block[8:12])[0] != points
@@ -186,7 +192,15 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
         else:
             _validate_vector_block_evidence(block, points, source_time)
         if layered:
-            if block[:8] == b"NUWAXBL5":
+            if shared:
+                from services.geometry.fine_ground_binary import decode_ground_shared
+                _, layers, sources = decode_ground_shared(block[records_end:],
+                    lambda source: _binary_source_identity(source, integer))
+                declared = {_binary_source_identity(mark["source"], integer) for mark in root.get("source_watermarks", [])}
+                if sum(_binary_source_bytes(source) for source in sources
+                       if _binary_source_identity(source, integer) not in declared) > _MAX_OLD_LAYER_BLOCK_BYTES:
+                    raise ValueError("精细地图BL6未声明来源超过旧块兼容额度")
+            elif block[:8] == b"NUWAXBL5":
                 from services.geometry.fine_ground_binary import decode_ground_binary
                 layers = decode_ground_binary(block[records_end:],
                     lambda raw: json.loads(raw, object_pairs_hook=_unique_json_fields, parse_constant=_reject_nonfinite_json),
@@ -476,3 +490,18 @@ def _validate_heightfield_columns(columns, resolution):
         height = (math.floor((moment / retained) / width) + .5) * width
         if height != declared_height:
             raise ValueError("精细地图完整高程列代表高度错误")
+
+
+def _binary_source_identity(source, integer):
+    if source == {"kind": "legacy"}:
+        return (0,)
+    identity = _validate_observation_source(source, integer)
+    return ({"lidar": 1, "auxiliary": 2}[identity[0]], *identity[1:])
+
+
+def _binary_source_bytes(source):
+    if source["kind"] == "legacy":
+        return 1
+    if source["kind"] == "lidar":
+        return 17 + len(source["sensor_frame_id"].encode("utf-8"))
+    return 25 + len(source["sensor_id"].encode("utf-8")) + len(source["clock_id"].encode("utf-8"))

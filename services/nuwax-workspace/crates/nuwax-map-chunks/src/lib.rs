@@ -17,6 +17,9 @@ mod terrain_observations;
 pub use terrain_observations::{LayerObservation, LayerObservations, LayerSample, LayerSource, SourceWatermark, MAX_LAYER_SAMPLES, MAX_LAYERS_PER_BLOCK, MAX_LAYER_MEMBERS, layer_geometry_eq};
 mod ground_records;
 mod ground_binary;
+mod ground_shared;
+#[cfg(test)]
+mod ground_shared_tests;
 #[cfg(test)]
 mod ground_binary_tests;
 pub use ground_records::{ColumnGroundRecords, GroundRecord, GroundRecordRef, GroundRecords, HeightfieldFragment, HeightfieldSurface};
@@ -27,8 +30,16 @@ pub use archive::{archive_file, ArchiveReader, ArchivedRoot, LegacyRoot, MAX_ARC
 pub const BLOCK_SIDE: i32 = 32;
 pub const MAX_BLOCKS: usize = 131_072;
 pub const MAX_LEGACY_BLOCK_BYTES: usize = 16 + 32_768 * 12;
-pub const MAX_BLOCK_BYTES: usize = 4 * 1024 * 1024;
-/// 可靠补取单段上限；整块仍由原4MiB预算及完整校验约束。
+/// BL1～BL5沿用原编码上限；不扩大旧格式的接收范围。
+pub const MAX_V1_TO_V5_BLOCK_BYTES: usize = 4 * 1024 * 1024;
+/// 现有根来源预算，加上没有来源水位的旧块全部来源兼容额度。
+pub const MAX_BLOCK_SOURCE_BYTES: usize = MAX_MANIFEST_BYTES + MAX_V1_TO_V5_BLOCK_BYTES;
+/// BL6完整数值区的最坏情况：占据、模式/表计数、全部记录/成员及32个原样本。
+pub const MAX_BLOCK_NUMERIC_BYTES: usize = 16 + 12 * 32768 + 13
+    + 41 * MAX_LAYERS_PER_BLOCK + 66 * 32768 + 48 * MAX_LAYERS_PER_BLOCK * MAX_LAYER_SAMPLES;
+/// 每个合法BL6块均可容纳的完整上界：91979805字节，非经验倍增。
+pub const MAX_BLOCK_BYTES: usize = MAX_BLOCK_NUMERIC_BYTES + MAX_BLOCK_SOURCE_BYTES;
+/// 可靠补取单段上限保持256KiB；完整块按格式专属边界和结构校验约束。
 pub const MAX_BLOCK_TRANSFER_PART_BYTES: usize = 256 * 1024;
 pub const MAX_MANIFEST_BYTES: usize = 32 * 1024 * 1024;
 pub type Key = [i32; 3];
@@ -72,7 +83,11 @@ pub fn decode_block(bytes: &[u8]) -> Result<Block, String> {
 fn decode_block_parts(bytes: &[u8]) -> Result<(Block, GroundRecords), String> {
     let mut block = Block::new();
     visit_block_records(bytes, |key, evidence| { block.insert(key, evidence); })?;
-    let layers = if bytes.starts_with(b"NUWAXBL5") {
+    let layers = if bytes.starts_with(b"NUWAXBL6") {
+        let records = ground_shared::decode(&bytes[16 + block.len() * 12..])?;
+        ground_records::validate_records(&records, &block)?;
+        records
+    } else if bytes.starts_with(b"NUWAXBL5") {
         let records = ground_binary::decode(&bytes[16 + block.len() * 12..])?;
         ground_records::validate_records(&records, &block)?;
         records
@@ -102,9 +117,24 @@ pub fn block_summary(bytes: &[u8]) -> Result<(u32, u64), String> {
 pub fn encode_layer_block(block: &Block, layers: &LayerObservations) -> Result<Vec<u8>, String> {
     if layers.is_empty() { return encode_block(block); }
     terrain_observations::validate_layers(layers, block)?;
-    let json = serde_json::to_vec(&layers.iter().collect::<Vec<_>>()).map_err(|e| e.to_string())?;
     let mut bytes = encode_block(block)?;
-    if bytes.len() + json.len() > MAX_BLOCK_BYTES { return Err("layer block exceeds byte budget".into()); }
+    // 旧文本写法只尝试原4MiB范围，超出后无损转BL6，不先分配完整巨型JSON。
+    struct LimitedJson { bytes: Vec<u8>, limit: usize, exceeded: bool }
+    impl std::io::Write for LimitedJson {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.limit - self.bytes.len() {
+                self.exceeded = true; return Err(std::io::Error::other("legacy JSON block budget"));
+            }
+            self.bytes.extend_from_slice(bytes); Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let mut json = LimitedJson { bytes: Vec::new(), limit: MAX_V1_TO_V5_BLOCK_BYTES - bytes.len(), exceeded: false };
+    if let Err(error) = serde_json::to_writer(&mut json, &layers.iter().collect::<Vec<_>>()) {
+        if json.exceeded { return ground_shared::encode(block, &GroundRecords::Legacy(Arc::new(layers.clone()))); }
+        return Err(error.to_string());
+    }
+    let json = json.bytes;
     let typed = layers.values().any(|layer| layer.samples.iter().any(|sample| !sample.source.is_legacy()));
     bytes[..8].copy_from_slice(if typed { b"NUWAXBL3" } else { b"NUWAXBL2" });
     bytes[12..16].copy_from_slice(&(json.len() as u32).to_le_bytes());
@@ -118,7 +148,7 @@ pub fn encode_ground_block(block: &Block, records: &GroundRecords) -> Result<Vec
         GroundRecords::Versioned(v) => {
             ground_records::validate_records(records, block)?;
             if v.is_empty() { return encode_block(block); }
-            ground_binary::encode(block, v)
+            ground_shared::encode(block, records)
         }
     }
 }
@@ -152,7 +182,7 @@ fn read_layers(bytes: &[u8], block: &Block) -> Result<LayerObservations, String>
     Ok(layers)
 }
 fn visit_block(bytes: &[u8], mut visit: impl FnMut(u16, Evidence)) -> Result<u32, String> {
-    if bytes.starts_with(b"NUWAXBL2") || bytes.starts_with(b"NUWAXBL3") || bytes.starts_with(b"NUWAXBL4") || bytes.starts_with(b"NUWAXBL5") {
+    if bytes.starts_with(b"NUWAXBL2") || bytes.starts_with(b"NUWAXBL3") || bytes.starts_with(b"NUWAXBL4") || bytes.starts_with(b"NUWAXBL5") || bytes.starts_with(b"NUWAXBL6") {
         let (block, _) = decode_block_parts(bytes)?;
         for (&key, &evidence) in &block { visit(key, evidence); }
         Ok(block.len() as u32)
@@ -160,9 +190,10 @@ fn visit_block(bytes: &[u8], mut visit: impl FnMut(u16, Evidence)) -> Result<u32
 }
 fn visit_block_records(bytes: &[u8], mut visit: impl FnMut(u16, Evidence)) -> Result<u32, String> {
     if bytes.len() < 16 || bytes.len() > MAX_BLOCK_BYTES { return Err("精细块格式或长度无效".into()); }
+    if !bytes.starts_with(b"NUWAXBL6") && bytes.len() > MAX_V1_TO_V5_BLOCK_BYTES { return Err("精细块格式或长度无效".into()); }
     let layer_bytes = match &bytes[..8] {
         b"NUWAXBL1" if bytes[12..16] == [0; 4] => 0,
-        b"NUWAXBL2" | b"NUWAXBL3" | b"NUWAXBL4" | b"NUWAXBL5" => u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize,
+        b"NUWAXBL2" | b"NUWAXBL3" | b"NUWAXBL4" | b"NUWAXBL5" | b"NUWAXBL6" => u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize,
         _ => return Err("精细块格式或长度无效".into()),
     };
     let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
@@ -334,11 +365,18 @@ impl SealedMap {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transfer { pub root: Vec<u8>, pub included: BTreeMap<ObjectIdentity, Vec<u8>> }
 #[derive(Debug, Clone, Copy)]
-struct Intrinsic { points: u32, latest: u64, layered: bool, sourced: bool, versioned: bool }
+struct Intrinsic { points: u32, latest: u64, layered: bool, sourced: bool, versioned: bool, source_budget_required: bool }
 fn intrinsic(block: &Block) -> Intrinsic {
-    Intrinsic { layered: false, sourced: false, versioned: false, points: block.len() as u32, latest: block.values().map(|e| e.observed_ns).max().unwrap_or(0) }
+    Intrinsic { layered: false, sourced: false, versioned: false, source_budget_required: false, points: block.len() as u32, latest: block.values().map(|e| e.observed_ns).max().unwrap_or(0) }
 }
 fn intrinsic_bytes(bytes: &[u8], block: &Block) -> Intrinsic {
+    if bytes.starts_with(b"NUWAXBL6") {
+        let mode = bytes[16 + block.len() * 12];
+        let offset = 16 + block.len() * 12 + 1;
+        let source_bytes = u32::from_le_bytes(bytes[offset..offset+4].try_into().unwrap()) as usize;
+        return Intrinsic { layered: true, sourced: mode > 0, versioned: mode == 2,
+            source_budget_required: source_bytes > MAX_V1_TO_V5_BLOCK_BYTES, ..intrinsic(block) };
+    }
     let versioned = bytes.starts_with(b"NUWAXBL4") || bytes.starts_with(b"NUWAXBL5");
     Intrinsic { layered: bytes.starts_with(b"NUWAXBL2") || bytes.starts_with(b"NUWAXBL3") || versioned,
         sourced: bytes.starts_with(b"NUWAXBL3") || versioned, versioned, ..intrinsic(block) }
@@ -406,6 +444,7 @@ impl Receiver {
                 let decoded = Arc::new(decoded); let info = intrinsic_bytes(bytes, &decoded);
                 admit_intrinsic(info, points, candidate.source_timestamp_ns)?;
                 admit_format(info, &candidate)?;
+                ground_shared::admit(info, &layers, &candidate)?;
                 self.admit_layer_binding(object, &layers, &decoded, key, candidate.voxel_size_m)?;
                 self.repository.put_object(object, bytes)?;
                 self.reader.cache_decoded(object, decoded, info, layers);
@@ -414,7 +453,21 @@ impl Receiver {
             if same { return Ok(self.current.as_ref().unwrap().clone()); }
             for block in &candidate.blocks {
                 if let Some(&info) = self.verified.get(&block.object) {
-                    admit_intrinsic(info, block.points, candidate.source_timestamp_ns)?; admit_format(info, &candidate)?; continue;
+                    admit_intrinsic(info, block.points, candidate.source_timestamp_ns)?; admit_format(info, &candidate)?;
+                    if info.source_budget_required {
+                        let declared = ground_shared::declared_sources(&candidate)?;
+                        // 失败候选也可能留下已核验对象；只有属于当前已接纳根的对象
+                        // 才能复用该根的来源证明，不能借另一失败候选的水位跳过重验。
+                        let retained = self.current.as_ref().is_some_and(|old|
+                            old.blocks.binary_search_by_key(&block.key, |r| r.key).ok()
+                                .is_some_and(|i| old.blocks[i].object == block.object)
+                            && old.source_watermarks.iter()
+                                .all(|source| declared.contains(source.source.as_ref())));
+                        if !retained {
+                            ground_shared::validate_unregistered_sources(&self.reader.ground_records(block)?, &declared)?;
+                        }
+                    }
+                    continue;
                 }
                 let bytes = match self.repository.read_object(block.object, MAX_BLOCK_BYTES) {
                     Ok(bytes) => bytes,
@@ -425,6 +478,7 @@ impl Receiver {
                         let (decoded, layers) = decode_block_parts(&bytes)?;
                 let decoded = Arc::new(decoded); let info = intrinsic_bytes(&bytes, &decoded);
                         admit_intrinsic(info, block.points, candidate.source_timestamp_ns)?; admit_format(info, &candidate)?;
+                        ground_shared::admit(info, &layers, &candidate)?;
                         self.admit_layer_binding(block.object, &layers, &decoded, block.key, candidate.voxel_size_m)?;
                         self.repository.put_object(block.object, &bytes)?;
                         self.reader.cache_decoded(block.object, decoded, info, layers);
@@ -434,6 +488,7 @@ impl Receiver {
                 let (decoded, layers) = decode_block_parts(&bytes)?;
                 let decoded = Arc::new(decoded); let info = intrinsic_bytes(&bytes, &decoded);
                 admit_intrinsic(info, block.points, candidate.source_timestamp_ns)?; admit_format(info, &candidate)?;
+                ground_shared::admit(info, &layers, &candidate)?;
                 self.admit_layer_binding(block.object, &layers, &decoded, block.key, candidate.voxel_size_m)?;
                 self.reader.cache_decoded(block.object, decoded, info, layers);
                         self.verified.insert(block.object, info);

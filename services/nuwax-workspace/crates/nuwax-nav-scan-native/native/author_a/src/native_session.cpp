@@ -1,6 +1,7 @@
 #include <plan_manage/scan_replan_fsm.h>
 #include <author_controller.h>
 #include <author_command_check.h>
+#include <author_overlap_escape.h>
 #include <author_diagnostics.h>
 #include <author_parameters.h>
 #include <business_constraint_mask.h>
@@ -21,6 +22,7 @@ struct AuthorSession {
  ScanConfig config{};
  std::unique_ptr<scan_planner::SCANReplanFSM> fsm;
  scan_planner::AuthorController controller;
+ scan_planner::AuthorOverlapEscape escape;
  geometry_msgs::Twist raw_command;
  std::vector<double> reference;
  RegisteredFrame frame;bool has_frame=false,static_fixture=false,static_imported=false;
@@ -71,6 +73,8 @@ struct AuthorSession {
   config=c;return false;
  }
  void initialize(const ScanConfig& c) {
+  // 地图或实体几何重建后，旧格索引和退出轴不再具有同一身份。
+  escape=scan_planner::AuthorOverlapEscape{};
   config=c;auto params=scan_planner::authorParameters(c);
   fsm=std::make_unique<scan_planner::SCANReplanFSM>();fsm->init(params);
   controller=scan_planner::AuthorController{};
@@ -115,6 +119,7 @@ extern "C" int nuwax_scan_session_plan(void* raw,SCAN_ARGUMENTS) {
   for(size_t i=0;i<forbidden_count;++i)forbidden.emplace_back(forbidden_columns[2*i],forbidden_columns[2*i+1]);
   auto business=std::make_shared<BusinessConstraintMask>(c.resolution,c.body_length,c.body_width,c.body_center_x,c.body_center_y,std::move(polygon),forbidden);
   map->setBusinessConstraintQuery([business](const Vector3d& p,double yaw){return business->rejects(p,yaw);});
+  map->setBusinessEnvelopeQuery([business](const Vector3d& p,double yaw,double padding){return business->rejectsEnvelope(p,yaw,padding);});
   if(scan_planner::authorTraceEnabled()) {
    auto out=scan_planner::authorTraceStream();
    out << "{\"event\":\"map_probes\",\"stamp_ns\":" << odometry_timestamp_ns
@@ -125,10 +130,23 @@ extern "C" int nuwax_scan_session_plan(void* raw,SCAN_ARGUMENTS) {
    out << "}\n";
   }
   // 起点必须使用当前实测机体查询；已有曲线的计划时刻不能代替实际位置。
-  if(map->getInflateOccupancy(position,start_yaw)!=0)
+  const int start_occupancy=map->getInflateOccupancy(position,start_yaw);
+  if(start_occupancy!=0) {
+   if(start_occupancy==1&&reference_count>=2&&!business->rejects(position,start_yaw)) {
+    if(!s.escape.active())s.retireExecution();
+    s.escape.plan(*map,c,position,start_yaw,start_velocity,start_yaw_rate,odometry_timestamp_ns,*output);
+    // 独立短距证明没有执行原曲线；退出后由原FSM从真实新位置重新起算。
+    const double cs=std::cos(start_yaw),sn=std::sin(start_yaw);
+    s.previous_control={cs*output->command_forward-sn*output->command_lateral,
+        sn*output->command_forward+cs*output->command_lateral};
+    s.previous_w=output->command_yaw_rate;s.has_control=true;
+    return 0;
+   }
    throw std::runtime_error(business->rejects(position,start_yaw)
     ? "Current body pose is outside the explicit user boundary or forbidden mask"
     : "Current body pose is occupied or outside the local map");
+  }
+  s.escape.observeClear(position,c.resolution);
   auto odom=std::make_shared<nav_msgs::Odometry>();odom->pose.pose.position.x=position.x();odom->pose.pose.position.y=position.y();odom->pose.pose.position.z=position.z();
   odom->pose.pose.orientation.w=std::cos(start_yaw/2.);odom->pose.pose.orientation.z=std::sin(start_yaw/2.);
   if(start_velocity){odom->twist.twist.linear.x=start_velocity[0];odom->twist.twist.linear.y=start_velocity[1];odom->twist.twist.linear.z=start_velocity[2];}
@@ -231,6 +249,7 @@ extern "C" int nuwax_scan_session_plan(void* raw,SCAN_ARGUMENTS) {
     auto out=scan_planner::authorTraceStream();
     out<<"{\"event\":\"command_geometry\",\"stamp_ns\":"<<odometry_timestamp_ns
        <<",\"paused\":"<<s.command_paused<<",\"waiting\":"<<command_waiting
+       <<",\"proof_exhausted\":"<<checked.exhausted
        <<",\"braking_translation\":"<<checked.hold_translation
        <<",\"command\":["<<output->command_forward<<','<<output->command_lateral<<','<<output->command_yaw_rate<<"]}\n";
    }

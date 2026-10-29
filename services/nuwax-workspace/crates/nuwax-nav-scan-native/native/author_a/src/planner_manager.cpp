@@ -642,8 +642,10 @@ namespace scan_planner
 
     bool accepted = flag_step_2_success && checkDynamicFeasibility(pos)
         && (!route_time_seed || (trajectoryCollisionFree(pos) && strictDynamicScale(pos) <= 1.));
-    // 首条轨迹缺少可执行历史，允许保留真实非零边界；执行中仍沿用原保留条件。
-    const bool retain_boundary = local_data_.traj_id_ == 0
+    // 编号不代表历史仍可执行；来源时间已过期时同样必须保留真实边界重新起步。
+    const bool history_executable = local_data_.traj_id_ > 0
+        && (ros::Time::now() - local_data_.start_time_).toSec() < local_data_.duration_;
+    const bool retain_boundary = !history_executable
         || (start_vel.isZero(0.) && start_acc.isZero(0.) && local_target_vel.isZero(0.));
     if (!accepted && reference_free && retain_boundary) {
       Eigen::MatrixXd retained_controls = reference_controls;

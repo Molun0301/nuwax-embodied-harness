@@ -169,6 +169,10 @@ public:
   inline int getOccupancy(Eigen::Vector3d pos);
   inline int getOccupancy(Eigen::Vector3i id);
   inline int getInflateOccupancy(Eigen::Vector3d pos, double yaw);
+  using BodyCell = std::array<int, 3>;
+  // 连续扫掠的保守外包；只读原概率位图，忽略集合仅供已证明单调退出的初始格。
+  inline int bodyContacts(Eigen::Vector3d pos, double yaw, double padding,
+      std::vector<BodyCell>* contacts = nullptr, const std::set<BodyCell>* initial = nullptr);
   // 双圆柱候选查询保留前后顺序及图外-1；真实外包由getInflateOccupancy复核。
   inline int getAuthorInflateOccupancy(Eigen::Vector3d pos, double yaw);
 
@@ -185,6 +189,8 @@ public:
   void setBusinessConstraintQuery(BusinessConstraintQuery query) {
     business_constraint_query_ = std::move(query);
   }
+  using BusinessEnvelopeQuery = std::function<bool(const Eigen::Vector3d&, double, double)>;
+  void setBusinessEnvelopeQuery(BusinessEnvelopeQuery query) { business_envelope_query_ = std::move(query); }
 
   // One atomic LiDAR observation: points, sensor pose and body position MUST belong
   // to the same registered frame/correction generation. Identity/freshness checks
@@ -271,6 +277,7 @@ private:
 
   ros::NodeHandle node_;
   BusinessConstraintQuery business_constraint_query_;
+  BusinessEnvelopeQuery business_envelope_query_;
 
   //
   uniform_real_distribution<double> rand_noise_;
@@ -451,6 +458,56 @@ inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos, double yaw) {
       if (occupied(local_z, first_count) || occupied(0, second_count)) return 1;
     }
   return 0;
+}
+
+inline int GridMap::bodyContacts(Eigen::Vector3d pos, double yaw, double padding,
+    std::vector<BodyCell>* contacts, const std::set<BodyCell>* initial) {
+  if (contacts) contacts->clear();
+  if (business_envelope_query_ ? business_envelope_query_(pos,yaw,padding)
+      : business_constraint_query_ && business_constraint_query_(pos,yaw)) return -1;
+  const double c=std::cos(yaw),s=std::sin(yaw),ac=std::abs(c),as=std::abs(s);
+  pos += Eigen::Vector3d(c*mp_.body_center_offset_.x()-s*mp_.body_center_offset_.y(),
+      s*mp_.body_center_offset_.x()+c*mp_.body_center_offset_.y(),mp_.body_center_offset_.z());
+  const double hx=mp_.body_length_/2.+padding,hy=mp_.body_width_/2.+padding;
+  const double ex=ac*hx+as*hy,ey=as*hx+ac*hy,r=mp_.resolution_,half=r/2.;
+  const double low=pos.z()-mp_.obstacles_inflation_z_up,high=pos.z()+mp_.obstacles_inflation_z_down;
+  // 外包必须完整位于当前环形缓存内，不能把未扫描的图外当成自由。
+  if (!isInMap(Eigen::Vector3d(pos.x()-ex,pos.y()-ey,low))
+      || !isInMap(Eigen::Vector3d(pos.x()+ex,pos.y()+ey,high))) return -1;
+  const int x0=static_cast<int>(std::floor((pos.x()-ex)/r))-1,x1=static_cast<int>(std::floor((pos.x()+ex)/r));
+  const int y0=static_cast<int>(std::floor((pos.y()-ey)/r))-1,y1=static_cast<int>(std::floor((pos.y()+ey)/r));
+  int z0=static_cast<int>(std::floor(low/r)),z1=static_cast<int>(std::ceil(high/r))-1;
+  while(z0<=z1&&(z0+1.)*r<=low)++z0;
+  while(z0<=z1&&z1*r>=high)--z1;
+  const int nz=mp_.map_voxel_num_.z();bool found=false;
+  for(int x=std::max(x0,mp_.map_bound_min_idx_.x());x<=std::min(x1,mp_.map_bound_max_idx_.x());++x)
+    for(int y=std::max(y0,mp_.map_bound_min_idx_.y());y<=std::min(y1,mp_.map_bound_max_idx_.y());++y) {
+      const double dx=(x+.5)*r-pos.x(),dy=(y+.5)*r-pos.y();
+      if(std::abs(dx)>ex+half||std::abs(dy)>ey+half
+          ||std::abs(c*dx+s*dy)>hx+half*(ac+as)||std::abs(-s*dx+c*dy)>hy+half*(ac+as))continue;
+      const size_t column=getLocalIndex(x,0)*mp_.map_voxel_num_.y()+getLocalIndex(y,1);
+      const auto* bits=md_.occupancy_bits_.data()+column*md_.occupancy_words_per_column_;
+      // 与原查询一样按位图字跳过空高度段，不能让连续证明耗尽原计算预算。
+      for(int z=z0;z<=z1;) {
+        const int local=getLocalIndex(z,2),count=std::min({z1-z+1,nz-local,64-local%64});
+        std::uint64_t mask=~std::uint64_t{0}<<(local%64);
+        if((local+count)%64)mask&=(std::uint64_t{1}<<((local+count)%64))-1;
+        auto hits=bits[local/64]&mask;
+        while(hits) {
+          const int lz=(local/64)*64+__builtin_ctzll(hits),global=z+lz-local;
+          const auto support=md_.support_member_max_z_.find(static_cast<int>(column)*nz+lz);
+          const BodyCell cell{x,y,global};
+          if((support==md_.support_member_max_z_.end()||!(support->second<low))
+              &&(!initial||!initial->count(cell))) {
+            found=true;if(!contacts)return 1;
+            contacts->push_back(cell);
+          }
+          hits&=hits-1;
+        }
+        z+=count;
+      }
+    }
+  return found?1:0;
 }
 
 inline int GridMap::getAuthorInflateOccupancy(Eigen::Vector3d pos, double yaw) {

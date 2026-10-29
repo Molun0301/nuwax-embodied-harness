@@ -35,6 +35,41 @@ struct State {
   double angular;
 };
 
+inline State motionAt(const State& start, const Eigen::Vector2d& mean, double angular, double time) {
+  const double rotation=angular*time;
+  Eigen::Vector2d displacement;
+  if(std::abs(angular)<1e-9)displacement=mean*time;
+  else {
+    const double a=std::sin(rotation)/angular,b=(1.-std::cos(rotation))/angular;
+    displacement={a*mean.x()-b*mean.y(),b*mean.x()+a*mean.y()};
+  }
+  State result=start;result.position.head<2>()+=world(displacement,start.yaw);result.yaw+=rotation;
+  return result;
+}
+
+// 中点外包包含整段所有机体点；有候选时二分收紧，期限或深度耗尽即拒绝。
+// 初始格的豁免必须另外通过固定退出轴的连续单调证明。
+inline bool sweepFree(GridMap& map,const State& start,const Eigen::Vector2d& mean,double angular,
+    double radius,double begin,double end,Clock::time_point deadline,bool& exhausted,
+    const std::set<GridMap::BodyCell>* initial=nullptr,int depth=0) {
+  if(Clock::now()>=deadline){exhausted=true;return false;}
+  const double mid=(begin+end)/2.;const auto pose=motionAt(start,mean,angular,mid);
+  if(depth==0) {
+    const auto finish=motionAt(start,mean,angular,end);
+    // 已知真实采样碰撞立即拒绝；二分只解决外包的保守候选，避免把确定碰撞细分到深度上限。
+    if(initial) {
+      if(map.bodyContacts(pose.position,pose.yaw,0.,nullptr,initial)!=0
+          ||map.bodyContacts(finish.position,finish.yaw,0.,nullptr,initial)!=0)return false;
+    } else if(map.getInflateOccupancy(pose.position,pose.yaw)!=0
+        ||map.getInflateOccupancy(finish.position,finish.yaw)!=0)return false;
+  }
+  const double padding=(mean.norm()+radius*std::abs(angular))*(end-begin)/2.;
+  if(map.bodyContacts(pose.position,pose.yaw,padding,nullptr,initial)==0)return true;
+  if(depth>=12||padding<=1e-8)return false;
+  return sweepFree(map,start,mean,angular,radius,begin,mid,deadline,exhausted,initial,depth+1)
+      &&sweepFree(map,start,mean,angular,radius,mid,end,deadline,exhausted,initial,depth+1);
+}
+
 inline CheckedCommand bounded(const Eigen::Vector2d& requested, double angular,
     const State& actual, const ScanConfig& c, bool stop) {
   Eigen::Vector2d target(std::clamp(requested.x(), -c.max_reverse_velocity, c.max_velocity),
@@ -57,27 +92,9 @@ inline bool advance(GridMap& map, State& actual, const Eigen::Vector2d& target,
       actual.angular + c.max_yaw_acceleration * c.sample_dt);
   const Eigen::Vector2d mean = actual.linear * .5 + next * .5;
   const double mean_angular = actual.angular * .5 + next_angular * .5;
-  const double travel = (std::hypot(mean.x(), mean.y()) + radius * std::abs(mean_angular)) * c.sample_dt;
-  const double fraction_step = travel > 0. ? std::min(1., c.resolution / (4. * travel)) : 1.;
-  Eigen::Vector3d position = actual.position;
-  double yaw = actual.yaw;
-  for (double fraction = 0.; fraction < 1.;) {
-    if (Clock::now() >= deadline) { exhausted = true; return false; }
-    fraction = std::min(1., fraction + fraction_step);
-    const double time = c.sample_dt * fraction, rotation = mean_angular * time;
-    Eigen::Vector2d displacement;
-    if (std::abs(mean_angular) < 1e-9) displacement = mean * time;
-    else {
-      const double a = std::sin(rotation) / mean_angular, b = (1. - std::cos(rotation)) / mean_angular;
-      displacement = {a * mean.x() - b * mean.y(), b * mean.x() + a * mean.y()};
-    }
-    position = actual.position;
-    position.head<2>() += world(displacement, actual.yaw);
-    yaw = actual.yaw + rotation;
-    // 平面命令按当前实际高度检查；原三维轨迹查询继续独立执行。
-    if (map.getInflateOccupancy(position, yaw) != 0) return false;
-  }
-  actual = {position, yaw, next, next_angular};
+  if(!sweepFree(map,actual,mean,mean_angular,radius,0.,c.sample_dt,deadline,exhausted))return false;
+  actual=motionAt(actual,mean,mean_angular,c.sample_dt);
+  actual.linear=next;actual.angular=next_angular;
   return true;
 }
 

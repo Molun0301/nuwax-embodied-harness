@@ -2,6 +2,7 @@
 
 #include <Eigen/Eigen>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <stdexcept>
 #include <unordered_map>
@@ -51,6 +52,27 @@ class BusinessConstraintMask {
     return intersectsForbidden(front) || intersectsForbidden(rear);
   }
 
+  // 半径padding包住整段机体点的位移，业务边界与禁行格同样不能在采样间隙穿越。
+  bool rejectsEnvelope(const Eigen::Vector3d& reference, double yaw, double padding) const {
+    Eigen::Vector2d heading(std::cos(yaw), std::sin(yaw));
+    Eigen::Vector2d center = reference.head<2>() + Eigen::Vector2d(
+        body_center_x_*heading.x()-body_center_y_*heading.y(),
+        body_center_x_*heading.y()+body_center_y_*heading.x());
+    for (const auto& p : std::array<Eigen::Vector2d,3>{reference.head<2>(),
+        center+offset_*heading,center-offset_*heading}) {
+      if (boundary_.size() >= 3) {
+        if (!insideBoundary(p)) return true;
+        for (size_t i=0,j=boundary_.size()-1;i<boundary_.size();j=i++) {
+          const auto d=(boundary_[i]-boundary_[j]).eval();
+          const double t=d.squaredNorm()>0.?std::clamp((p-boundary_[j]).dot(d)/d.squaredNorm(),0.,1.):0.;
+          if ((p-(boundary_[j]+t*d)).norm() <= padding) return true;
+        }
+      }
+    }
+    return intersectsForbidden(Eigen::Vector3d(center.x()+offset_*heading.x(),center.y()+offset_*heading.y(),0.),padding)
+        || intersectsForbidden(Eigen::Vector3d(center.x()-offset_*heading.x(),center.y()-offset_*heading.y(),0.),padding);
+  }
+
  private:
   struct Key {
     int x, y;
@@ -69,20 +91,21 @@ class BusinessConstraintMask {
             static_cast<int>(std::floor(y / bucket_resolution_))};
   }
 
-  bool intersectsForbidden(const Eigen::Vector3d& p) const {
+  bool intersectsForbidden(const Eigen::Vector3d& p, double padding=0.) const {
     if (buckets_.empty()) return false;
     const double half_voxel = resolution_ / 2.0;
     // Same broad-phase extent as NEH's original anyBucket. Buckets only select
     // candidates; the original disk-to-cell-square predicate below decides.
-    const Key low = bucketKey(p.x() - radius_ - half_voxel, p.y() - radius_ - half_voxel);
-    const Key high = bucketKey(p.x() + radius_ + half_voxel, p.y() + radius_ + half_voxel);
+    const double radius=radius_+padding;
+    const Key low = bucketKey(p.x() - radius - half_voxel, p.y() - radius - half_voxel);
+    const Key high = bucketKey(p.x() + radius + half_voxel, p.y() + radius + half_voxel);
     for (int x = low.x; x <= high.x; ++x) for (int y = low.y; y <= high.y; ++y) {
       const auto found = buckets_.find({x, y});
       if (found == buckets_.end()) continue;
       for (const auto& c : found->second) {
         const double dx = std::max(0.0, std::abs((c.x() + 0.5) * resolution_ - p.x()) - half_voxel);
         const double dy = std::max(0.0, std::abs((c.y() + 0.5) * resolution_ - p.y()) - half_voxel);
-        if (dx * dx + dy * dy <= radius_ * radius_) return true;
+        if (dx * dx + dy * dy <= radius * radius) return true;
       }
     }
     return false;

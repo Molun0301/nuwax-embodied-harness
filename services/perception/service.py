@@ -48,6 +48,11 @@ from services.perception.detectors import DetectorPipeline
 from services.perception.geometry import DetectionGeometryAugmentor
 from services.perception.observation_geometry import capture_geometry
 from services.perception.scene import SimpleSceneDescriptionBackend
+from services.perception.self_body import (
+    DisabledSelfBodyFilter,
+    SelfBodyFilter,
+    region_from_detection_metadata,
+)
 from services.perception.trackers import Basic2DTrackerBackend
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.perception.service")
@@ -85,6 +90,7 @@ class PerceptionService:
         scene_description_backend: Optional[SceneDescriptionBackend] = None,
         segmentation_backend: Optional[SegmentationBackend] = None,
         geometry_augmentor: Optional[DetectionGeometryAugmentor] = None,
+        self_body_filter: Optional[SelfBodyFilter] = None,
         event_bus: Optional[EventBus] = None,
         stream_bus: Optional[StreamBus] = None,
         video_frame_sink: Optional[VideoFrameSink] = None,
@@ -103,6 +109,7 @@ class PerceptionService:
         self._scene_description_backend = scene_description_backend or SimpleSceneDescriptionBackend()
         self._segmentation_backend = segmentation_backend or DisabledSegmentationBackend()
         self._geometry_augmentor = geometry_augmentor or DetectionGeometryAugmentor()
+        self._self_body_filter = self_body_filter or DisabledSelfBodyFilter("not_configured")
         self._event_bus = event_bus
         self._stream_bus = stream_bus
         self._video_frame_sink = video_frame_sink
@@ -292,6 +299,12 @@ class PerceptionService:
                 detector_spec.backend_kind,
                 detection_bundle.metadata,
             )
+            stage_started_at = perf_counter()
+            detection_bundle = self._apply_self_body_filter(
+                detection_bundle, image_frame=image_frame, camera_info=camera_info,
+                frame_tree=cached_geometry_inputs[1] if cached_geometry_inputs is not None else None,
+            )
+            stage_duration_ms["self_body"] = self._elapsed_ms(stage_started_at)
 
             stage_started_at = perf_counter()
             detector_available = stage_status["detector"] in {"completed", "fallback"}
@@ -690,6 +703,11 @@ class PerceptionService:
             detector_spec.backend_kind,
             detection_bundle.metadata,
         )
+        stage_started_at = perf_counter()
+        detection_bundle = self._apply_self_body_filter(
+            detection_bundle, image_frame=image_frame, camera_info=camera_info, frame_tree=None,
+        )
+        stage_duration_ms["self_body"] = self._elapsed_ms(stage_started_at)
 
         stage_started_at = perf_counter()
         detector_available = stage_status["detector"] in {"completed", "fallback"}
@@ -835,7 +853,8 @@ class PerceptionService:
             return context, None, None
         detections, metadata = self._geometry_augmentor.augment_detections(
             tuple(context.observation.detections_2d), image_frame=image_frame, camera_info=camera_info,
-            point_cloud=geometry.point_cloud, frame_tree=geometry.frame_tree, current_pose=geometry.pose)
+            point_cloud=geometry.point_cloud, frame_tree=geometry.frame_tree, current_pose=geometry.pose,
+            self_region=region_from_detection_metadata(context.metadata.get("detection_metadata")))
         metadata = {**metadata, "geometry_synchronization": "same_acquisition_time",
                     "geometry_input_sources": list(geometry.sources)}
         if geometry.reason:
@@ -1490,6 +1509,8 @@ class PerceptionService:
                 "height_px": bbox.height_px,
             },
             "attributes": {key: detection.attributes[key] for key in ("display_name_zh",) if key in detection.attributes},
+            # 机器人自身的检测保留显示，页面灰显，不代表环境物体。
+            "self_body": detection.attributes.get("self_body") is True,
         }
 
     def _publish_video_frame(self, image_frame, *, source_name: str) -> None:
@@ -1677,6 +1698,27 @@ class PerceptionService:
             return cloud, tree, pose
         return None
 
+    def self_body_filter_status(self) -> Dict[str, Any]:
+        return self._self_body_filter.status()
+
+    def _apply_self_body_filter(self, detection_bundle, *, image_frame, camera_info, frame_tree):
+        """标记机器人自身检测；只增补属性和区域元数据，检测数量与顺序不变。"""
+        if not detection_bundle.detections_2d:
+            return detection_bundle
+        if frame_tree is None:
+            frame_tree = self._latest_stream_payload("localization.frame_tree")
+        if frame_tree is None:
+            frame_tree = self._read_live_pose_and_frame_tree()[1]
+        result = self._self_body_filter.apply(
+            detection_bundle.detections_2d, image_frame=image_frame,
+            camera_info=camera_info, frame_tree=frame_tree,
+        )
+        return detection_bundle.__class__(
+            detections_2d=result.detections_2d,
+            detections_3d=detection_bundle.detections_3d,
+            metadata={**dict(detection_bundle.metadata), **result.metadata},
+        )
+
     def _augment_detection_geometry(
         self,
         detection_bundle,
@@ -1730,6 +1772,7 @@ class PerceptionService:
             point_cloud=point_cloud_frame,
             frame_tree=frame_tree,
             current_pose=current_pose,
+            self_region=region_from_detection_metadata(detection_bundle.metadata),
         )
         if not self._has_usable_point_cloud(point_cloud_frame):
             geometry_metadata = {

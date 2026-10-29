@@ -119,6 +119,7 @@ from services.navigation.motion_guard_client import MotionGuardError
 from services.observation_service import ObservationService
 from services.perception import PerceptionService, PerceptionVideoRuntime, build_platform_perception_components
 from services.perception.service import VideoFrameSource
+from services.perception.self_body import build_self_body_filter, robot_joint_state_source
 from services.robot_state_service import RobotStateService
 from services.telemetry import SystemMetricsCollector
 from skills import SkillRegistry
@@ -998,7 +999,18 @@ class GatewayRuntime:
             stream_bus=self.stream_bus,
         )
         perception_components = _build_perception_components(config)
+        self_body_filter = build_self_body_filter(
+            config.perception.self_filter,
+            robot_geometry=config.robot.geometry,
+            base_dir=config.base_dir,
+            joint_state_source=robot_joint_state_source(robot),
+        )
+        from services.perception.geometry import DetectionGeometryAugmentor
         self.perception_service = PerceptionService(
+            geometry_augmentor=DetectionGeometryAugmentor(
+                support_voxel_size_m=config.perception.instance_association.support_voxel_size_m,
+                support_max_voxels=config.perception.instance_association.support_max_voxels),
+            self_body_filter=self_body_filter,
             spatial_context_provider=lambda: self.memory_service.capture_observation_spatial_context(),
             provider_owner=robot,
             localization_provider_owner=self.platform_geometry_runtime,
@@ -1072,6 +1084,7 @@ class GatewayRuntime:
             embedding_base_url=config.runtime_data.memory_embedding_base_url,
             embedding_timeout_sec=config.runtime_data.memory_embedding_timeout_sec,
             deferred_projection_config=config.perception.deferred_projection,
+            association_config=config.perception.instance_association,
             accumulated_cloud_provider=self._provide_accumulated_pointcloud_xyz,
         )
         from services.memory.scene_mapping import SceneMappingService
@@ -4898,6 +4911,7 @@ class GatewayRuntime:
             "last_error": getattr(status, "last_error", None),
             # vis-three-fixes 任务 6.3：启动期预热状态并入健康摘要。
             "prewarm_status": metadata.get("prewarm_status"),
+            "self_body_filter": self.perception_service.self_body_filter_status(),
         }
 
     def _health_workspace_summary(self, workspace: Any) -> Dict[str, Any]:

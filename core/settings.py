@@ -458,6 +458,37 @@ class PerceptionPostProcessConfig:
 
 
 @dataclass
+class PerceptionSelfFilterConfig:
+    """机器人自体检测过滤：按 URDF 与实时关节角求机身在画面中的区域。
+
+    模型来源沿用 NUWAX_ROBOT_MODEL_PATH / NUWAX_ROBOT_MODEL_BASE_LINK；缺模型、
+    关节或外参时过滤器报告不可用原因，不把检测当成“非自体”静默放行到记忆。
+    static_regions_json 为每台相机手填的归一化忽略多边形，供没有关节数据的机器人使用，
+    格式：{"相机标识": [[[x, y], ...], ...]}，坐标取 0—1。
+    """
+
+    enabled: bool = True
+    coverage_threshold: float = 0.5
+    dilation_px: float = 6.0
+    max_joint_age_sec: float = 0.5
+    static_regions_json: str = ""
+
+
+@dataclass
+class MemoryInstanceAssociationConfig:
+    """语义实例去重：测量不确定度门限、支持点累积、确认期与合并。"""
+
+    confirmation_window_sec: float = 60.0
+    confirmation_min_observations: int = 3
+    support_voxel_size_m: float = 0.03
+    support_max_voxels: int = 1024
+    uncertainty_gate_sigma: float = 3.0
+    cross_label_min_overlap: float = 0.5
+    cross_label_max_size_ratio: float = 3.0
+    merge_on_activation: bool = True
+
+
+@dataclass
 class PerceptionConfig:
     """统一视觉感知配置。"""
 
@@ -471,6 +502,8 @@ class PerceptionConfig:
     stream_runtime: PerceptionStreamRuntimeConfig = field(default_factory=PerceptionStreamRuntimeConfig)
     deferred_projection: DeferredProjectionConfig = field(default_factory=DeferredProjectionConfig)
     postprocess: PerceptionPostProcessConfig = field(default_factory=lambda: PerceptionPostProcessConfig())
+    self_filter: PerceptionSelfFilterConfig = field(default_factory=PerceptionSelfFilterConfig)
+    instance_association: MemoryInstanceAssociationConfig = field(default_factory=MemoryInstanceAssociationConfig)
 
 
 @dataclass
@@ -844,6 +877,23 @@ def load_config() -> NuwaxRobotBridgeConfig:
                 0.0,
                 min(1.0, _cfg_float("NUWAX_PERCEPTION_POSTPROCESS_NMS_IOU", 0.55)),
             ),
+        ),
+        self_filter=PerceptionSelfFilterConfig(
+            enabled=_cfg_bool("NUWAX_PERCEPTION_SELF_FILTER_ENABLED", True),
+            coverage_threshold=max(0.05, min(1.0, _cfg_float("NUWAX_PERCEPTION_SELF_FILTER_COVERAGE", 0.5))),
+            dilation_px=max(0.0, _cfg_float("NUWAX_PERCEPTION_SELF_FILTER_DILATION_PX", 6.0)),
+            max_joint_age_sec=max(0.01, _cfg_float("NUWAX_PERCEPTION_SELF_FILTER_MAX_JOINT_AGE_SEC", 0.5)),
+            static_regions_json=_cfg_str("NUWAX_PERCEPTION_SELF_FILTER_STATIC_REGIONS_JSON", ""),
+        ),
+        instance_association=MemoryInstanceAssociationConfig(
+            confirmation_window_sec=max(1.0, _cfg_float("NUWAX_MEMORY_ASSOCIATION_CONFIRM_WINDOW_SEC", 60.0)),
+            confirmation_min_observations=max(1, _cfg_int("NUWAX_MEMORY_ASSOCIATION_CONFIRM_MIN_OBSERVATIONS", 3)),
+            support_voxel_size_m=max(0.005, _cfg_float("NUWAX_MEMORY_ASSOCIATION_VOXEL_SIZE_M", 0.03)),
+            support_max_voxels=max(16, _cfg_int("NUWAX_MEMORY_ASSOCIATION_MAX_VOXELS", 1024)),
+            uncertainty_gate_sigma=max(0.5, _cfg_float("NUWAX_MEMORY_ASSOCIATION_GATE_SIGMA", 3.0)),
+            cross_label_min_overlap=max(0.0, min(1.0, _cfg_float("NUWAX_MEMORY_ASSOCIATION_CROSS_LABEL_OVERLAP", 0.5))),
+            cross_label_max_size_ratio=max(1.0, _cfg_float("NUWAX_MEMORY_ASSOCIATION_CROSS_LABEL_SIZE_RATIO", 3.0)),
+            merge_on_activation=_cfg_bool("NUWAX_MEMORY_ASSOCIATION_MERGE_ON_ACTIVATION", True),
         ),
     )
 

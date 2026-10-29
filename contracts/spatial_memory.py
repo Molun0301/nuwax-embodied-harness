@@ -18,7 +18,7 @@ from contracts.naming import (
     validate_observation_id,
     validate_scene_space_id,
 )
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 class SpatialAnchorKind(StrEnum):
@@ -54,6 +54,31 @@ class InstanceDynamicState(StrEnum):
     DYNAMIC = "dynamic"
     QUASI_STATIC = "quasi_static"
     UNKNOWN = "unknown"
+
+
+class InstanceConfirmationState(StrEnum):
+    """实例准入状态：连续感知新实例先待确认，多次独立观察后确认。"""
+
+    TENTATIVE = "tentative"
+    CONFIRMED = "confirmed"
+
+
+class InstanceSupportEvidence(ContractModel):
+    """跨观察累积的物体几何与标签证据；不进入网页实例行与实时流载荷。"""
+
+    frame_id: str = Field(description="体素坐标所在坐标系，与实例位姿相同。")
+    voxel_size_m: float = Field(gt=0.0, description="支持点体素边长，单位米。")
+    voxel_keys: List[int] = Field(
+        default_factory=list,
+        description="已占据体素的整数索引，按 [ix, iy, iz, ...] 三个一组展平，有上限。",
+    )
+    position_weight: float = Field(default=0.0, ge=0.0, description="位置融合累计逆方差权重。")
+    position_sigma_m: Optional[float] = Field(default=None, ge=0.0, description="融合后位置标准差估计，单位米。")
+    label_votes: Dict[str, float] = Field(default_factory=dict, description="各标签累计检测置信度。")
+    confirmation_observation_ids: List[str] = Field(
+        default_factory=list,
+        description="待确认期间计入的独立源观察标识，确认后不再增长。",
+    )
 
 
 class InstanceObservationWindowSample(TimestampedContract):
@@ -361,6 +386,19 @@ class SemanticInstance(TimestampedContract):
     summary_node_ids: List[str] = Field(default_factory=list, description="关联层级摘要节点集合。")
     attributes: MetadataDict = Field(default_factory=dict, description="附加属性。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
+    # 旧持久记录没有以下字段，按已确认、无累积证据、无合并来源读取。
+    confirmation_state: InstanceConfirmationState = Field(
+        default=InstanceConfirmationState.CONFIRMED,
+        description="准入状态；待确认实例不显示、不落盘、不作导航候选。",
+    )
+    support_evidence: Optional[InstanceSupportEvidence] = Field(
+        default=None,
+        description="跨观察累积的几何与标签证据。",
+    )
+    merged_instance_ids: List[str] = Field(
+        default_factory=list,
+        description="已合并进本实例的旧实例标识，查询与导航按别名解析到本实例。",
+    )
 
     @field_validator("instance_id")
     @classmethod

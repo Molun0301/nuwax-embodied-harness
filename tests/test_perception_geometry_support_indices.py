@@ -1,4 +1,4 @@
-"""Cloud-local polygon selection retains full-mask ordering and fallbacks."""
+"""完整主体簇选择、掩码边界及载荷所有权，不依赖生产选点函数作为预期值。"""
 from unittest.mock import patch
 
 import numpy as np
@@ -43,14 +43,21 @@ def test_selection_matches_full_mask_oracle(count, polygon):
         polygon_count = int(np.count_nonzero(polygon_mask))
         if polygon_count:
             support_mask, status, method = polygon_mask, 'mask_depth_support', 'pointcloud_mask_projection'
-        elif bbox_count:
-            status = 'mask_no_depth_support_bbox_fallback'
         else:
             support_mask, status, method = polygon_mask, 'mask_no_depth_support', 'pointcloud_mask_projection'
     elif not bbox_count:
         status = 'segmentation_absent_no_depth_support'
-    indices = np.flatnonzero(support_mask)
-    selected = indices[np.argsort(depths[indices], kind='stable')[:24]]
+    indices=np.flatnonzero(support_mask)
+    if not polygon:
+        # 该夹具的框为100至200，收缩后只保留115至185内的中心像素。
+        indices=indices[(pixels[indices,0]>=115)&(pixels[indices,0]<=185)
+                        &(pixels[indices,1]>=115)&(pixels[indices,1]<=185)]
+        if bbox_count and not len(indices):
+            status='support_cluster_empty'
+    # 夹具有四个相隔1米的独立平面，主体必须为点数最多的一个平面；同数优先近面。
+    planes=[indices[depths[indices]==depth] for depth in (1.,2.,3.,4.)]
+    dominant=max(planes,key=lambda group:len(group))
+    selected=dominant[np.linspace(0,len(dominant)-1,min(24,len(dominant)),dtype=np.int64)] if len(dominant) else dominant
     result, support_count = augmentor._augment_single_detection(
         detection=detection, camera_info=camera(), projected_pixels=pixels,
         camera_points=points, map_points=maps, map_frame_id='map')
@@ -61,7 +68,7 @@ def test_selection_matches_full_mask_oracle(count, polygon):
     assert attrs['geometry_projection_method'] == method
     assert attrs['geometry_support_point_count'] == selected.size
     if polygon:
-        assert attrs['segmentation_support_point_count'] == min(polygon_count, 24)
+        assert attrs['segmentation_support_point_count'] == selected.size
     if selected.size:
         assert attrs['camera_points']['points'] == augmentor._serialize_points(points[selected])
         assert attrs['support_points_2d'] == augmentor._serialize_pixels(pixels[selected])
@@ -95,9 +102,9 @@ def test_multiple_detections_share_one_calibrated_projection():
         result, metadata = augmentor.augment_detections((detection,) * 3,
             image_frame=image, camera_info=cam, point_cloud=cloud)
     assert project.call_count == 1
-    assert metadata['geometry_support_point_total'] == 6
+    assert metadata['geometry_support_point_total'] == 3
     for item in result:
-        assert item.attributes['geometry_support_point_count'] == 2
+        assert item.attributes['geometry_support_point_count'] == 1
         assert item.attributes['geometry_projection_status'] == 'mask_depth_support'
     result[0].attributes['support_points_3d']['points'][0]['x'] = 999.
     assert result[1].attributes['support_points_3d']['points'][0]['x'] != 999.

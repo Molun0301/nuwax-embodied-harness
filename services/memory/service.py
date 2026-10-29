@@ -51,6 +51,7 @@ from contracts.perception import Detection2D
 from contracts.runtime_views import LocalizationSnapshot, MapSnapshot, NavigationSemanticContext, TopologyNodeSummary, PerceptionContext
 from contracts.spatial_memory import (
     GroundingQueryPlan,
+    InstanceConfirmationState,
     InstanceDynamicState,
     InstanceLifecycleState,
     InstanceMovability,
@@ -76,6 +77,8 @@ from core.errors import GatewayError
 from services.localization import LocalizationService
 from services.mapping.service import MappingService
 from services.memory.grounding_query_planner import GroundingQueryPlanner
+from services.memory.instance_evidence import ADMISSION_AUTOMATIC, ADMISSION_EXPLICIT
+from services.memory.vectorization_outbox import OutboxConflict
 from services.memory.instance_association_service import AssociationOutcome, InstanceAssociationService
 from services.memory.instance_stream import SemanticInstancePublisher
 from services.memory.scene_mapping_state import MANAGED_KEY, SceneMappingMemoryMixin
@@ -209,6 +212,7 @@ class MemoryService(SceneMappingMemoryMixin):
         vision_language_embedder: Optional[VisionLanguageEmbedder] = None,
         evaluation_service: Optional[Any] = None,
         deferred_projection_config: Optional[Any] = None,
+        association_config: Optional[Any] = None,
         accumulated_cloud_provider: Optional[Any] = None,
         live_pose_provider: Optional[Any] = None,
         stream_bus=None,
@@ -292,10 +296,13 @@ class MemoryService(SceneMappingMemoryMixin):
                 getattr(deferred_projection_config, "triangulation_max_residual_m", 0.5)
             ),
         )
+        self._association_config = association_config
         self._instance_association_service = InstanceAssociationService(
             text_embedder=self._text_embedder,
             inspection_pose_planner=self._inspection_pose_planner,
+            association_config=association_config,
         )
+        self._association_config = self._instance_association_service._association_config
         self._grounding_query_planner = GroundingQueryPlanner()
         self._evaluation_service = evaluation_service
 
@@ -700,6 +707,8 @@ class MemoryService(SceneMappingMemoryMixin):
             self._active_library_name = resolved_name
         if load_history:
             self._load_persisted_memory(library_name=resolved_name)
+            if getattr(self._association_config, "merge_on_activation", True):
+                self._consolidate_loaded_instances()
         self._instance_publisher.notify()
         self._start_vectorization_worker()
         self._start_deferred_refine_worker()
@@ -2422,6 +2431,9 @@ class MemoryService(SceneMappingMemoryMixin):
         effective_localization_session_id = str(
             localization_session_id or active_localization_session_id or ""
         ).strip() or None
+        resolved_instance = self.get_semantic_instance(query)
+        if resolved_instance is not None:
+            query = resolved_instance.instance_id
         known_labels = self._collect_known_grounding_labels()
         known_object_labels = self._collect_known_grounding_object_labels()
         grounding_plan = self._grounding_query_planner.plan(
@@ -3270,7 +3282,7 @@ class MemoryService(SceneMappingMemoryMixin):
         with self._instances_lock:
             library = self._active_library_name if self._memory_enabled else None
             instances = tuple(item for item in self._semantic_instances_by_id.values()
-                              if library and self._record_library_name(item) == library)
+                              if library and self._record_library_name(item) == library and self._instance_is_confirmed(item))
         selected = heapq.nlargest(limit, instances, key=self._instance_view_order)
         rows = self._semantic_instance_rows(selected, library or "", now)
         # 无新观察时只在下一个生命周期边界唤醒一次，避免定频扫库。
@@ -3298,6 +3310,8 @@ class MemoryService(SceneMappingMemoryMixin):
         }
         result: List[Dict[str, object]] = []
         for inst in instances:
+            if not self._instance_is_confirmed(inst):
+                continue
             if label_lower is not None and str(inst.label).lower().strip() != label_lower:
                 continue
             pose = inst.pose
@@ -3803,7 +3817,8 @@ class MemoryService(SceneMappingMemoryMixin):
             visible = [(kind, record) for kind, records in (
                 ("location", self._tagged_locations_by_id), ("memory", self._semantic_entries_by_id),
                 ("instance", self._semantic_instances_by_id), ("event", self._observation_events_by_id),
-                ("scene", self._scene_spaces_by_id)) for record in records.values()]
+                ("scene", self._scene_spaces_by_id)) for record in records.values()
+                if kind!="instance" or self._instance_is_confirmed(record)]
         # Validate before recall truncation. Each page captures source, desired
         # versions, acknowledgements and shared vectors in one short snapshot.
         # Weak lexical candidates retain the original per-modality top-k rule;
@@ -3836,6 +3851,8 @@ class MemoryService(SceneMappingMemoryMixin):
             for key, value in page_counts.items():
                 provenance_counts[key] = provenance_counts.get(key, 0) + value
             for kind, source, point, version in page:
+                if kind=="instance" and not self._instance_is_confirmed(source):
+                    continue
                 if point.record_kind not in allowed_values:
                     continue
                 if payload_filter is not None and not self._point_matches_filter(point, payload_filter):
@@ -4037,6 +4054,8 @@ class MemoryService(SceneMappingMemoryMixin):
             location_or_memory_pose = tagged_location.pose
             timestamp = tagged_location.timestamp
         elif semantic_instance is not None:
+            if not self._instance_is_confirmed(semantic_instance):
+                return None
             record_kind = MemoryRecordKind.OBJECT_INSTANCE
             lexical_score, lexical_reason = lexical_override if lexical_override is not None else self._score_semantic_instance(normalized_query, semantic_instance)
             location_or_memory_pose = semantic_instance.pose
@@ -6194,12 +6213,13 @@ class MemoryService(SceneMappingMemoryMixin):
         segments = [
             instance.label,
             instance.display_name or "",
+            " ".join([instance.instance_id,*instance.merged_instance_ids]),
             " ".join(instance.semantic_labels),
             " ".join(instance.visual_labels),
             " ".join(instance.vision_tags),
             instance.semantic_region_id or "",
             instance.topo_node_id or "",
-            " ".join("%s:%s" % (key, value) for key, value in sorted(instance.attributes.items())),
+            " ".join("%s:%s" % (key,instance.attributes[key]) for key in self._instance_association_service._SEMANTIC_ATTRIBUTE_KEYS if key in instance.attributes),
         ]
         return " ".join(segment for segment in segments if segment).strip()
 
@@ -6257,6 +6277,8 @@ class MemoryService(SceneMappingMemoryMixin):
         ]
 
     def _score_semantic_instance(self, normalized_query: str, instance: SemanticInstance) -> Tuple[float, str]:
+        if normalized_query in {self._normalize_text(key) for key in [instance.instance_id,*instance.merged_instance_ids]}:
+            return 1.0,"命中实例标识或合并别名。"
         texts = [
             instance.label,
             instance.display_name or "",
@@ -6265,7 +6287,7 @@ class MemoryService(SceneMappingMemoryMixin):
             *instance.vision_tags,
             instance.semantic_region_id or "",
             instance.topo_node_id or "",
-            *["%s:%s" % (key, value) for key, value in sorted(instance.attributes.items())],
+            *["%s:%s" % (key,instance.attributes[key]) for key in self._instance_association_service._SEMANTIC_ATTRIBUTE_KEYS if key in instance.attributes],
         ]
         return self._score_text_candidates(normalized_query, texts, fallback_reason="与空间语义实例相似。")
 
@@ -7155,6 +7177,36 @@ class MemoryService(SceneMappingMemoryMixin):
         with self._instances_lock:
             self._cache_artifact_record("scene", scene_space)
 
+    def _prepare_ingested_instance(self,accepted_instance,platform_metadata):
+        """普通关联和合并结果共用捕获地图身份与导航质量物化。"""
+        projection_metadata = dict(accepted_instance.metadata)
+        # 关联可能保留历史可靠坐标，其质量证据必须与最终坐标保持一致。
+        # 当前帧退化信息由观察事件单独保存，不能覆盖实例已选中的投影证据。
+        projection_metadata.update(platform_metadata)
+        projection_metadata.update(
+            self._evaluate_navigation_metadata(
+                projection_metadata,
+                backend_name=str(
+                    projection_metadata.get("backend")
+                    or projection_metadata.get("backend_type")
+                    or "memory_service.semantic_instance"
+                ),
+                map_name=str(platform_metadata.get("map_name") or "").strip() or None,
+                localization_session_id=str(platform_metadata.get("localization_session_id") or "").strip() or None,
+            )
+        )
+        return accepted_instance.model_copy(
+            update={
+                "metadata": self._attach_library_metadata(
+                    {
+                        **projection_metadata,
+                        **platform_metadata,
+                    }
+                )
+            },
+            deep=False,
+        )
+
     def ingest_perception_observation(
         self,
         *,
@@ -7167,6 +7219,7 @@ class MemoryService(SceneMappingMemoryMixin):
         localization_session_id: Optional[str] = None,
         now: Optional[datetime] = None,
         persist: bool = True,
+        admission: str = ADMISSION_AUTOMATIC,
     ):
         """感知摄入（连续路径）：投影 + 关联 + 射线累积，独立于记忆写入。
 
@@ -7205,6 +7258,11 @@ class MemoryService(SceneMappingMemoryMixin):
                 localization_snapshot=localization_snapshot,
                 ray_history=ray_history,
             )
+            with self._instances_lock:
+                self._assert_observation_library(expected_library,expected_generation)
+                for key,instance in tuple(self._semantic_instances_by_id.items()):
+                    if self._instance_association_service.tentative_expired(instance,resolved_now):
+                        self._remove_artifact_record("instance",key)
             if not projected:
                 return None, None, []
             resolved_session_id = localization_session_id or (
@@ -7230,43 +7288,46 @@ class MemoryService(SceneMappingMemoryMixin):
                     localization_session_id=resolved_session_id,
                     map_asset_id=platform_metadata.get("map_asset_id"),
                     occupancy_grid=map_snapshot.occupancy_grid if map_snapshot is not None else None,
-                    cost_map=map_snapshot.cost_map if map_snapshot is not None else None, now=resolved_now)
+                    cost_map=map_snapshot.cost_map if map_snapshot is not None else None, now=resolved_now,
+                    admission=admission)
+                updated_instances, merges = self._instance_association_service.consolidate(
+                    updated_instances,
+                    candidate_ids={outcome.instance.instance_id for outcome in outcomes if outcome.instance is not None},
+                )
+            merged_published = set()
+            if merges:
+                for merge in merges:
+                    updated_instances[merge.survivor_id]=self._prepare_ingested_instance(
+                        updated_instances[merge.survivor_id],platform_metadata)
+                merged_published = self._apply_instance_merges(merges,base_instances=base_instances,
+                    updated_instances=updated_instances,persist=persist,
+                    expected_library=expected_library,expected_generation=expected_generation)
+                aliases={old:merge.survivor_id for merge in merges for old in merge.merged_ids}
+                outcomes=tuple(AssociationOutcome(
+                    updated_instances[aliases.get(outcome.instance.instance_id,outcome.instance.instance_id)]
+                    if outcome.instance is not None else None,
+                    bool(outcome.created and outcome.instance is not None
+                         and aliases.get(outcome.instance.instance_id,outcome.instance.instance_id) not in base_instances),
+                    outcome.matched_score) for outcome in outcomes)
+            # 待确认超时即释放实时实例与制品持有；它从未进入持久仓储。
+            with self._instances_lock:
+                self._assert_observation_library(expected_library,expected_generation)
+                for key,prior in base_instances.items():
+                    if key not in updated_instances and self._instance_association_service.tentative_expired(prior,resolved_now):
+                        if self._semantic_instances_by_id.get(key) is prior:
+                            self._remove_artifact_record("instance",key)
             linked_instance_ids: List[str] = []
-            published_instance_ids = set()
+            published_instance_ids = set(merged_published)
             for _projected_item, outcome in zip(projected, outcomes):
+                if outcome.instance is None:
+                    continue
                 instance_id = outcome.instance.instance_id
                 if instance_id in published_instance_ids:
                     linked_instance_ids.append(instance_id)
                     continue
                 # 多个来源观察可关联同一 ID；提交该批最后的完整证据一次。
                 accepted_instance = updated_instances[instance_id]
-                projection_metadata = dict(accepted_instance.metadata)
-                # 关联可能保留历史可靠坐标，其质量证据必须与最终坐标保持一致。
-                # 当前帧退化信息由观察事件单独保存，不能覆盖实例已选中的投影证据。
-                projection_metadata.update(platform_metadata)
-                projection_metadata.update(
-                    self._evaluate_navigation_metadata(
-                        projection_metadata,
-                        backend_name=str(
-                            projection_metadata.get("backend")
-                            or projection_metadata.get("backend_type")
-                            or "memory_service.semantic_instance"
-                        ),
-                        map_name=str(platform_metadata.get("map_name") or "").strip() or None,
-                        localization_session_id=str(platform_metadata.get("localization_session_id") or "").strip() or None,
-                    )
-                )
-                instance = accepted_instance.model_copy(
-                    update={
-                        "metadata": self._attach_library_metadata(
-                            {
-                                **projection_metadata,
-                                **platform_metadata,
-                            }
-                        )
-                    },
-                    deep=False,
-                )
+                instance = self._prepare_ingested_instance(accepted_instance,platform_metadata)
                 if persist and (getattr(instance, TOKEN, None) is None or getattr(instance, "_memory_source_deleted", False)):
                     instance = instance.model_copy(deep=False)
                     object.__setattr__(instance, TOKEN, base_tokens.get(instance.instance_id, ("raw", None)))
@@ -7302,7 +7363,7 @@ class MemoryService(SceneMappingMemoryMixin):
                         self._write_semantic_instance_state(instance)
                 published_instance_ids.add(instance.instance_id)
                 linked_instance_ids.append(instance.instance_id)
-            matched_ids = {outcome.instance.instance_id for outcome in outcomes}
+            matched_ids = {outcome.instance.instance_id for outcome in outcomes if outcome.instance is not None}
             for point_id, aged in updated_instances.items():
                 if point_id not in matched_ids and point_id in base_instances and aged is not base_instances[point_id]:
                     self._publish_live_instance(aged, expected=base_instances[point_id])
@@ -7320,6 +7381,10 @@ class MemoryService(SceneMappingMemoryMixin):
         camera_id: Optional[str],
     ) -> None:
         # 记忆写入路径（低频）：完整感知摄入（persist=True）+ ObservationEvent 绑定。
+        # 持续感知自动关键帧标记 source=perception_video_runtime，其余来自用户/上层的显式记忆请求。
+        admission = (ADMISSION_AUTOMATIC
+                     if str((memory_entry.metadata or {}).get("source") or "") == "perception_video_runtime"
+                     else ADMISSION_EXPLICIT)
         projected, outcomes, linked_instance_ids = self.ingest_perception_observation(
             perception_context=perception_context,
             map_snapshot=map_snapshot,
@@ -7332,6 +7397,7 @@ class MemoryService(SceneMappingMemoryMixin):
             or None,
             now=memory_entry.timestamp,
             persist=True,
+            admission=admission,
         )
         if not projected:
             return
@@ -7418,7 +7484,93 @@ class MemoryService(SceneMappingMemoryMixin):
         LOGGER.info("ObservationEvent TTL 清理：已删除 %d 条过期事件（max_age_sec=%.0f）", len(expired_ids), max_age_sec)
         return len(expired_ids)
 
+    def _apply_instance_merges(self,merges,*,base_instances,updated_instances,persist,expected_library,expected_generation):
+        """在共享仓储事务内更新保留实例、删除旧实例并改指观察事件。
+
+        merged_instance_ids 是持久别名的权威来源。向量撤销、重新向量化及业务令牌
+        均复用仓储现有变更钩子；内存与通知只在事务提交后发布。
+        """
+        aliases={old:merge.survivor_id for merge in merges for old in merge.merged_ids}
+        changed=set(aliases.values())
+        with self._instances_lock:
+            self._assert_observation_library(expected_library,expected_generation)
+            for key in set(aliases)|changed:
+                if self._semantic_instances_by_id.get(key) is not base_instances.get(key):
+                    raise OutboxConflict("实例在合并计算后发生变化")
+            stored_events=self._repository.load_observation_events(library_name=expected_library)
+            events={event.event_id:event for event in stored_events}
+            events.update(self._observation_events_by_id)
+            with self._repository.storage.transaction() as tx:
+                # 删除与保留记录使用同一次捕获的令牌，冲突时整个事务回滚。
+                removed=list(aliases)
+                self._repository.delete_semantic_instances(removed,expected_tokens={key:getattr(base_instances.get(key),TOKEN,("raw",None)) for key in removed})
+                survivors=[]
+                for key in sorted(changed):
+                    instance=updated_instances[key]
+                    instance=instance.model_copy(update={"metadata":self._attach_library_metadata(instance.metadata)})
+                    object.__setattr__(instance,TOKEN,getattr(base_instances.get(key),TOKEN,("raw",None)))
+                    if self._is_long_term_static_instance(instance):
+                        self._repository.upsert_semantic_instance(instance)
+                    else:
+                        self._repository.delete_semantic_instances([key],expected_tokens={key:getattr(instance,TOKEN)})
+                        object.__setattr__(instance,"_memory_live_only",True)
+                    survivors.append(instance)
+                    updated_instances[key]=instance
+                for event in events.values():
+                    ids=list(dict.fromkeys(aliases.get(key,key) for key in event.linked_instance_ids))
+                    if ids!=event.linked_instance_ids:
+                        self._repository.upsert_observation_event(event.model_copy(update={"linked_instance_ids":ids}))
+                def publish():
+                    with self._instances_lock:
+                        for key in removed:
+                            prior=base_instances.get(key)
+                            if prior is not None:
+                                self._state_store.discard_if_value(StateNamespace.MEMORY,"instance:"+key,prior)
+                            self._remove_artifact_record("instance",key)
+                        for instance in survivors:
+                            if getattr(instance,"_memory_live_only",False):
+                                self._cache_artifact_record("instance",instance)
+                                self._write_semantic_instance_state(instance)
+                        self._instance_publisher.notify()
+                tx.after_commit(publish)
+        return changed
+
+    def _consolidate_loaded_instances(self) -> None:
+        with self._instances_lock:
+            base=dict(self._semantic_instances_by_id)
+            library=self._active_library_name
+            generation=self._durable_index.activation_generation
+        with self._association_compute_lock:
+            updated,merges=self._instance_association_service.consolidate(base)
+        if merges:
+            self._apply_instance_merges(merges,base_instances=base,updated_instances=updated,persist=True,
+                expected_library=library,expected_generation=generation)
+
+    def get_semantic_instance(self,instance_id,*,library_name=None):
+        """按现用或已合并的历史标识读取确认实例。"""
+        library=self._active_library_name if library_name is None else str(library_name).strip()
+        if not library:
+            return None
+        with self._instances_lock:
+            if library==self._active_library_name:
+                for instance in self._semantic_instances_by_id.values():
+                    if (instance.instance_id==instance_id or instance_id in instance.merged_instance_ids) and self._instance_is_confirmed(instance):
+                        return instance
+                return None
+        return self._repository.get_semantic_instance(instance_id,library_name=library)
+
+    def resolve_instance_id(self,instance_id):
+        instance=self.get_semantic_instance(instance_id)
+        return instance.instance_id if instance is not None else instance_id
+
+    @staticmethod
+    def _instance_is_confirmed(instance: SemanticInstance) -> bool:
+        """待确认实例不显示、不落盘、不作导航候选；旧记录没有该字段按已确认读取。"""
+        return getattr(instance, "confirmation_state", InstanceConfirmationState.CONFIRMED) != InstanceConfirmationState.TENTATIVE
+
     def _is_long_term_static_instance(self, instance: SemanticInstance) -> bool:
+        if not self._instance_is_confirmed(instance):
+            return False
         dynamic_state = self._instance_dynamic_state(instance)
         metadata = dict(instance.metadata or {})
         if dynamic_state in {InstanceDynamicState.DYNAMIC, InstanceDynamicState.QUASI_STATIC}:
@@ -7466,6 +7618,8 @@ class MemoryService(SceneMappingMemoryMixin):
             labels.extend(entry.tags)
             labels.extend(entry.semantic_labels)
         for instance in self._semantic_instances_by_id.values():
+            if not self._instance_is_confirmed(instance):
+                continue
             labels.append(instance.label)
             labels.extend(instance.semantic_labels)
             labels.extend(instance.visual_labels)
@@ -7477,6 +7631,8 @@ class MemoryService(SceneMappingMemoryMixin):
     def _collect_known_grounding_object_labels(self) -> List[str]:
         labels: List[str] = []
         for instance in self._semantic_instances_by_id.values():
+            if not self._instance_is_confirmed(instance):
+                continue
             labels.append(instance.label)
             if instance.display_name:
                 labels.append(instance.display_name)
@@ -7556,6 +7712,8 @@ class MemoryService(SceneMappingMemoryMixin):
                 return anchor.inspection_poses[0]
         if anchor_id:
             for instance in self._semantic_instances_by_id.values():
+                if not self._instance_is_confirmed(instance):
+                    continue
                 if instance.anchor_id == anchor_id and instance.inspection_poses:
                     return instance.inspection_poses[0]
         return fallback_pose
@@ -7582,7 +7740,7 @@ class MemoryService(SceneMappingMemoryMixin):
         )
         events: List[ObservationEvent] = []
         for item, outcome in zip(projected, association_outcomes):
-            matched_instance_id = outcome.instance.instance_id
+            matched_instance_id = outcome.instance.instance_id if outcome.instance is not None else ""
             matched_instance = self._semantic_instances_by_id.get(matched_instance_id)
             long_term_static_instance = matched_instance is not None and self._is_long_term_static_instance(matched_instance)
             linked_ids = [matched_instance_id] if long_term_static_instance else []
@@ -7825,10 +7983,15 @@ class MemoryService(SceneMappingMemoryMixin):
         if navigation_candidate is None:
             return None
         if isinstance(navigation_candidate, MemoryNavigationCandidate):
+            if navigation_candidate.record_kind==MemoryRecordKind.OBJECT_INSTANCE:
+                resolved_id=self.resolve_instance_id(navigation_candidate.record_id)
+                return navigation_candidate.model_copy(update={"record_id":resolved_id})
             return navigation_candidate
         return self._to_legacy_navigation_candidate(navigation_candidate)
 
     def _write_semantic_instance_state(self, instance: SemanticInstance) -> None:
+        if not self._instance_is_confirmed(instance):
+            return
         self._state_store.write(
             StateNamespace.MEMORY,
             "instance:%s" % instance.instance_id,

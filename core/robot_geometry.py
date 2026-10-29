@@ -364,7 +364,7 @@ def _geometry_points(geometry, transform, model_path: Path):
     return [(p[0],p[1]) for p in points], min(p[2] for p in points), max(p[2] for p in points)
 
 
-def _parse_urdf(path: Path, base_link: str, positions: Dict[str, float], *, source_prefix: str):
+def _read_urdf_description(path: Path, base_link: str):
     data = _read_bounded(path, _MAX_MODEL_BYTES, "机器人模型")
     if b"<!DOCTYPE" in data.upper() or b"<!ENTITY" in data.upper():
         raise RobotGeometryError("机器人模型不支持文档类型或实体声明。")
@@ -380,9 +380,6 @@ def _parse_urdf(path: Path, base_link: str, positions: Dict[str, float], *, sour
     joints = {joint.get("name"): joint for joint in root.findall("joint")}
     if None in joints or "" in joints or len(joints) != len(root.findall("joint")):
         raise RobotGeometryError("模型关节名称缺失或重复。")
-    unknown = set(positions) - set(joints)
-    if unknown:
-        raise RobotGeometryError("参考姿态包含未知关节：" + ",".join(sorted(unknown)))
     children = {}
     edges = {name: [] for name in links}
     for name, joint in joints.items():
@@ -400,6 +397,20 @@ def _parse_urdf(path: Path, base_link: str, positions: Dict[str, float], *, sour
     selected = base_link or next((name for name in ("base_link", "base", "trunk") if name in links), root_link)
     if selected not in links:
         raise RobotGeometryError("模型不存在指定机体基准连杆：" + selected)
+    return links, joints, edges, root_link, selected
+
+
+def _parse_urdf(path: Path, base_link: str, positions: Dict[str, float], *, source_prefix: str):
+    from core.robot_kinematics import load_robot_kinematic_model, RobotKinematicsError
+    try:
+        model = load_robot_kinematic_model(path, base_link=base_link)
+    except RobotKinematicsError as exc:
+        raise RobotGeometryError(str(exc), exc.code) from exc
+    links, joints = model.link_elements, model.joint_elements
+    selected = model.base_link
+    unknown = set(positions) - set(joints)
+    if unknown:
+        raise RobotGeometryError("参考姿态包含未知关节：" + ",".join(sorted(unknown)))
     values, warnings, resolving = {}, [], set()
     out_of_limit = []
     def joint_value(name):
@@ -437,43 +448,16 @@ def _parse_urdf(path: Path, base_link: str, positions: Dict[str, float], *, sour
         resolving.remove(name)
         values[name] = value
         return value
-    transforms = {root_link: (_IDENTITY, _ZERO)}
-    pending = [root_link]
-    moving = []
-    while pending:
-        parent = pending.pop()
-        for child, joint in edges[parent]:
-            if child in transforms:
-                raise RobotGeometryError("模型关节树存在循环。")
-            name, kind = joint.get("name"), joint.get("type")
-            motion = (_IDENTITY, _ZERO)
-            if kind == "fixed":
-                if name in positions:
-                    raise RobotGeometryError("固定关节不能配置参考位置：" + name)
-            elif kind in ("revolute", "continuous", "prismatic"):
-                moving.append(name)
-                value = joint_value(name)
-                axis_node = joint.find("axis")
-                axis = _vector(axis_node.get("xyz") if axis_node is not None else None, (1.0,0.0,0.0), "关节轴")
-                norm = math.hypot(*axis)
-                if not math.isfinite(norm) or norm == 0:
-                    raise RobotGeometryError("关节轴必须为有限非零向量：" + name)
-                axis = tuple(v/norm for v in axis)
-                if kind == "prismatic":
-                    motion = _IDENTITY, tuple(v*value for v in axis)
-                else:
-                    x,y,z = axis
-                    c,s,k = math.cos(value),math.sin(value),1-math.cos(value)
-                    motion = ((c+x*x*k,x*y*k-z*s,x*z*k+y*s),(y*x*k+z*s,c+y*y*k,y*z*k-x*s),(z*x*k-y*s,z*y*k+x*s,c+z*z*k)), _ZERO
-            else:
-                raise RobotGeometryError("不支持该关节类型的静态标量参考姿态：" + str(kind), "unsupported_robot_geometry")
-            transforms[child] = _compose(transforms[parent], _compose(_origin(joint), motion))
-            pending.append(child)
-    if len(transforms) != len(links):
-        raise RobotGeometryError("模型包含断开的连杆或关节循环。")
-    base_r, base_t = transforms[selected]
-    inverse_r = tuple(tuple(base_r[j][i] for j in range(3)) for i in range(3))
-    inverse = inverse_r, _apply(inverse_r, tuple(-v for v in base_t))
+    moving = [joint.name for joint in model.joints if joint.joint_type != "fixed"]
+    for name in positions:
+        if joints[name].get("type") == "fixed":
+            raise RobotGeometryError("固定关节不能配置参考位置：" + name)
+    for name in moving:
+        joint_value(name)
+    matrices = model.link_transforms(values)
+    transforms = {name: (tuple(tuple(float(v) for v in row) for row in matrix[:3, :3]),
+                         tuple(float(v) for v in matrix[:3, 3])) for name, matrix in matrices.items()}
+    inverse = _IDENTITY, _ZERO
     if out_of_limit:
         # 同类关节合并为一条，避免每个关节重复同一句提示。
         warnings.append("{}个关节的模型零位超出运动限位（{}），外形按该静态姿态计算。".format(

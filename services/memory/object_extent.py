@@ -111,16 +111,25 @@ def resolve_object_extent(record) -> Optional[Dict[str, object]]:
     return None
 
 
-def merge_object_extent(current, observation, *, pose=None) -> Optional[Dict[str, object]]:
-    """Retain dimensions through weaker observations; never grow boxes by union."""
+def merge_object_extent(current, observation, *, pose=None, support_evidence=None) -> Optional[Dict[str, object]]:
+    """检测器尺寸沿原规则保留；可见点尺寸优先使用跨观察累积体素的分位范围。"""
     previous = resolve_object_extent(current) if current is not None else None
     incoming = None if observation.attributes.get('projection_method') == 'current_pose_fallback' else resolve_object_extent(observation)
     if previous is not None and not frame_ids_semantically_equal(previous['frame_id'], observation.pose.frame_id):
         previous = None
     if incoming is None:
+        if support_evidence is not None and (previous is None or previous['source']!='detection3d'):
+            from services.memory.instance_evidence import support_extent
+            return support_extent(support_evidence,pose=pose or observation.pose) or previous
         return previous
     if previous is not None and previous['source'] == 'detection3d' and incoming['source'] == 'observed_points':
         return previous
+    if support_evidence is not None and incoming['source']!='detection3d':
+        from services.memory.instance_evidence import support_extent
+        accumulated=support_extent(support_evidence,pose=pose or observation.pose)
+        if accumulated is not None:
+            accumulated['source_observation_id']=incoming['source_observation_id']
+            return accumulated
     if pose is not None:
         # Keep the observed map-space midpoint exact even when the navigation
         # centroid is filtered across uneven surface samples. Retained dimensions

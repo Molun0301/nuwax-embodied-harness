@@ -41,14 +41,14 @@ def test_point_bounds_use_midpoint_without_changing_observed_centroid_or_floor()
         [Vector3(x=1,y=2,z=-2), Vector3(x=1,y=2,z=-2), Vector3(x=5,y=4,z=0)],
         current_pose=Pose(frame_id='map', orientation=Quaternion(z=1)), map_frame='map',
         projection_method='map_point_samples', projection_confidence=.9)
-    assert pose.position.x == pytest.approx(7/3)
-    assert attributes['centroid_map']['x'] == pytest.approx(7/3, abs=1e-6)
-    assert attributes['bbox_3d_map']['center'] == {'x':3, 'y':3, 'z':-1}
+    assert pose.position.x == pytest.approx(1)
+    assert attributes['centroid_map']['x'] == pytest.approx(1, abs=1e-6)
+    assert attributes['bbox_3d_map']['center'] == {'x':2.8, 'y':2.9, 'z':-1.1}
     payload = object_extent_payload(observation(attributes, pose))
-    assert payload['center'] == pytest.approx({'x':3, 'y':3, 'z':-1})
-    assert payload['size_m'] == {'x':4, 'y':2, 'z':2}
+    assert payload['center'] == pytest.approx({'x':2.8, 'y':2.9, 'z':-1.1})
+    assert payload['size_m'] == pytest.approx({'x':3.6, 'y':1.8, 'z':1.8})
     assert payload['orientation'] == {'x':0,'y':0,'z':0,'w':1}
-    assert payload['top_z_m'] == 0
+    assert payload['top_z_m'] == pytest.approx(-.2)
 
 
 def test_legacy_bbox_prefers_extrema_over_incorrect_old_centroid():
@@ -68,11 +68,11 @@ def test_invalid_dimensions_remain_unknown(bad):
 
 def test_zero_point_span_is_preserved_and_single_depth_or_2d_bbox_is_not_size():
     service = VisionToMapProjectionService()
-    for points, expected in [([Vector3(x=1), Vector3(x=3)], {'x':2,'y':0,'z':0}), ([Vector3(x=2)], None)]:
+    for points, expected in [([Vector3(x=1), Vector3(x=3)], {'x':1.8,'y':0,'z':0}), ([Vector3(x=2)], None)]:
         pose, attrs = service._pose_from_resolved_points(points,current_pose=Pose(frame_id='map'),
             map_frame='map',projection_method='map_point_samples',projection_confidence=.9)
         result = object_extent_payload(observation(attrs,pose))
-        assert (result['size_m'] if result else None) == expected
+        assert (result['size_m'] if result else None) == (pytest.approx(expected) if expected else None)
     assert resolve_object_extent(observation({'bbox_xyxy':[0,0,800,600], 'depth_m':3})) is None
 
 
@@ -161,9 +161,10 @@ def test_changing_surface_sampling_preserves_box_midpoint_through_pose_blending(
         current = policy._merge_instance(current,incoming,map_name='house',localization_session_id='session',
             occupancy_grid=None,cost_map=None,now=now+timedelta(seconds=index*10))
         result = object_extent_payload(current)
-        assert result['center'] == pytest.approx({'x':2,'y':3,'z':-1})
-        assert result['size_m'] == {'x':2,'y':2,'z':2}
-        assert current.pose.position.x != incoming.pose.position.x
+        assert result['center'] == pytest.approx({'x':2.01,'y':3,'z':-.99})
+        assert result['size_m'] == pytest.approx({'x':2.04,'y':2.04,'z':2.04})
+        # 新中位数在此稀疏夹具中跳变1米，运动分类后采用最新位置。
+        assert current.pose.position.x == incoming.pose.position.x
         center,sizes,_ = policy._spatial_geometry(current)
         assert center == pytest.approx(tuple(result['center'][axis] for axis in 'xyz'))
         assert sizes == pytest.approx(tuple(result['size_m'][axis] for axis in 'xyz'))

@@ -12,6 +12,7 @@ from contracts.runtime_views import LocalizationSnapshot, PerceptionContext
 from services.localization.frame_tree_ops import transform_points_to_frame, transform_pose_to_frame
 from services.memory.semantic_map_builder import SemanticMapBuildResult
 from services.perception.ray_triangulation import triangulate_rays, triangulation_confidence
+from services.perception.self_body import is_self_body
 
 
 @dataclass(frozen=True)
@@ -177,6 +178,8 @@ class VisionToMapProjectionService:
         projected: List[ProjectedObservation] = []
         track_pose_by_id = self._build_track_pose_index(perception_context)
         for detection in perception_context.observation.detections_3d:
+            if is_self_body(detection.attributes):
+                continue
             if frame_ids_semantically_equal(detection.pose.frame_id, map_context.frame_id):
                 projected_pose = self._resolve_pose_to_map(
                     detection.pose, current_pose=effective_pose, map_frame=map_context.frame_id, frame_tree=frame_tree,
@@ -241,6 +244,9 @@ class VisionToMapProjectionService:
             )
 
         for detection in perception_context.observation.detections_2d:
+            # 机器人自身不是环境物体，不产生地图投影、实例或观察事件。
+            if is_self_body(detection.attributes):
+                continue
             projected_pose, projection_attributes = self._resolve_detection2d_projection(
                 detection=detection,
                 perception_context=perception_context,
@@ -602,6 +608,7 @@ class VisionToMapProjectionService:
                 map_frame=map_frame,
                 projection_method="map_point_samples",
                 projection_confidence=0.97,
+                cluster_summary=attributes.get("support_cluster_summary"),
                 map_projection_coverage=1.0,
             )
             try:
@@ -910,13 +917,19 @@ class VisionToMapProjectionService:
         projection_confidence: float,
         map_projection_coverage: float = 1.0,
         projection_degradation_reason: str = "",
+        cluster_summary: Optional[Dict[str, object]] = None,
     ) -> Tuple[Optional[Pose], Dict[str, object]]:
         point_list = list(points)
         if not point_list:
             return None, {}
         array = np.asarray([[float(item.x), float(item.y), float(item.z)] for item in point_list], dtype=np.float64)
-        centroid = array.mean(axis=0)
-        extent = array.max(axis=0) - array.min(axis=0)
+        centroid = np.median(array, axis=0)
+        min_values, max_values = np.quantile(array,[0.05,0.95],axis=0)
+        if cluster_summary and frame_ids_semantically_equal(str(cluster_summary.get("frame_id") or map_frame), map_frame):
+            centroid = np.asarray(cluster_summary["center"],dtype=np.float64)
+            min_values = np.asarray(cluster_summary["min"],dtype=np.float64)
+            max_values = np.asarray(cluster_summary["max"],dtype=np.float64)
+        extent = max_values-min_values
         projected_pose = Pose(
             frame_id=map_frame,
             position=Vector3(
@@ -926,10 +939,7 @@ class VisionToMapProjectionService:
             ),
             orientation=current_pose.orientation,
         )
-        min_values = array.min(axis=0)
-        max_values = array.max(axis=0)
-        # Mean support location remains the instance/navigation pose; box center
-        # is the midpoint of extrema and can differ with unevenly sampled surfaces.
+        # 位置使用主体中位数；显示范围使用完整主体的分位边界，不由载荷抽样极值决定。
         box_center = (min_values + max_values) * 0.5
         bbox_3d_map = {
             "frame_id": map_frame,

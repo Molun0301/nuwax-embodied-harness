@@ -36,9 +36,13 @@ class Sequence:
             [replace(item, source_observation_id=f'obs_{self.index}')],
             existing_instances=self.instances, map_name='house', localization_session_id=session,
             now=self.now + timedelta(seconds=self.index),
-        )
-        assert len(self.instances) == 1
-        return outcomes[0].instance
+         admission="explicit")
+        if not self.instances:
+            assert item.attributes['projection_method']=='current_pose_fallback'
+            assert outcomes[0].instance is None
+            return None
+        assert len(self.instances)==1
+        return outcomes[0].instance or next(iter(self.instances.values()))
 
 
 @pytest.mark.parametrize('reliable_count', [0, 1])
@@ -48,6 +52,9 @@ def test_fallback_observer_positions_never_supply_motion_or_static_evidence(reli
         seq.add(observation())
     for i in range(30):
         obj = seq.add(observation(float(i), fallback=True))
+        if not reliable_count:
+            assert obj is None and not seq.instances
+            continue
         assert obj.dynamic_state == InstanceDynamicState.UNKNOWN
         assert obj.metadata['dynamic_observation_count'] == reliable_count
         assert obj.metadata['dynamic_window_displacement_m'] == 0
@@ -56,7 +63,7 @@ def test_fallback_observer_positions_never_supply_motion_or_static_evidence(reli
         assert obj.pose.position.x == pytest.approx(8.385)
         assert not obj.metadata['observation_only']
     else:
-        assert obj.metadata['navigable'] is False
+        assert obj is None
 
 
 def test_static_geometric_history_survives_many_fast_frames_bounded():
@@ -69,7 +76,7 @@ def test_static_geometric_history_survives_many_fast_frames_bounded():
         assert obj.metadata['dynamic_observation_count'] == 3
         assert obj.metadata['dynamic_window_duration_sec'] == 2
         assert len(obj.observation_window) <= 8
-        assert obj.observation_window[-1].metadata['projection_method'] == 'current_pose_fallback'
+        assert obj.observation_window[-1].metadata['projection_method'] == 'support_points_map'
     assert obj.metadata.get('non_navigable_reason') not in {'dynamic_entity', 'quasi_static_entity'}
 
 
@@ -107,7 +114,7 @@ def test_legacy_dynamic_reason_is_not_restored_by_fallback_pose_preservation():
     seq = Sequence()
     for _ in range(3):obj = seq.add(observation())
     obj.metadata.update(navigable=False, non_navigable_reason='dynamic_entity', navigation_exclusion_scope='long_term_static_target', local_retry_policy='retry_after_dynamic_obstacle_clears')
-    obj = seq.add(observation(0, fallback=True))
+    obj = seq.add(observation(0, fallback=True,ray_origin_map=[0,-1.029,.627],ray_dir_map=[1,0,0],ray_cone_half_angle_rad=.02))
     assert obj.dynamic_state == InstanceDynamicState.STATIC
     assert obj.metadata.get('non_navigable_reason') != 'dynamic_entity'
     assert obj.metadata.get('navigable') is not False

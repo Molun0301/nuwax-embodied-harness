@@ -32,7 +32,7 @@ class Sequence:
     def add(self, *observations, seconds=0, map_name='house', session='session', asset=None):
         self.instances, outcomes = self.service.associate(observations,
             existing_instances=self.instances, map_name=map_name, localization_session_id=session,
-            map_asset_id=asset, now=NOW+timedelta(seconds=seconds))
+            map_asset_id=asset, now=NOW+timedelta(seconds=seconds), admission="explicit")
         return [outcome.instance for outcome in outcomes]
 
 
@@ -65,7 +65,7 @@ def test_better_geometry_assignment_wins_before_weaker_detection_regardless_orde
         seq = Sequence()
         known = seq.add(observation(x=1,size=(.2,.2,.2)))[0]
         close = observation(x=1.01,size=(.2,.2,.2),source='next')
-        farther = observation(x=1.09,size=(.2,.2,.2),source='next')
+        farther = observation(x=1.12,size=(.2,.2,.2),source='next')
         values = [close,farther] if not reverse else [farther,close]
         result = seq.add(*values,seconds=1)
         assert result[values.index(close)].instance_id == known.instance_id
@@ -99,12 +99,13 @@ def test_map_frame_and_assigned_asset_isolation_but_runtime_session_restart_allo
 def test_geometryless_fallback_requires_scoped_track_and_never_moves_saved_geometry():
     seq = Sequence()
     first = seq.add(observation(track='t'))[0]
-    weak = seq.add(observation(x=20,track='t',fallback=True,source='weak'),seconds=1)[0]
+    weak = seq.add(observation(x=20,track='t',fallback=True,source='weak',ray_origin_map=[0,3,.5],ray_dir_map=[1,0,0],ray_cone_half_angle_rad=.03),seconds=1)[0]
     assert weak.instance_id == first.instance_id
     assert weak.pose == first.pose
     assert weak.metadata['object_extent'] == first.metadata['object_extent']
     unrelated = seq.add(observation(x=20,fallback=True,source='unknown'),seconds=2)[0]
-    assert unrelated.instance_id != first.instance_id
+    assert unrelated is None
+    assert len(seq.instances)==1
 
 
 def test_centroid_only_projection_uses_measured_ray_support_not_fixed_meter_radius():
@@ -199,7 +200,7 @@ def test_nonfinite_position_cannot_match_known_object():
     assert bad.instance_id != first.instance_id
 
 
-def test_same_camera_source_track_modalities_share_identity_but_different_tracks_do_not():
+def test_same_frame_overlapping_modalities_share_identity_even_with_different_tracks():
     seq = Sequence()
     full = observation(track='same')
     projected = replace(full,attributes={**full.attributes,'projection_method':'support_points_map',
@@ -211,7 +212,11 @@ def test_same_camera_source_track_modalities_share_identity_but_different_tracks
     assert len(seq.instances) == 1
     other = seq.add(replace(full,source_observation_id='next',track_id='one'),
                     replace(projected,source_observation_id='next',track_id='two'),seconds=1)
-    assert len({item.instance_id for item in other}) == 2
+    assert len({item.instance_id for item in other}) == 1
+    assert other[0].observation_count == 2
+    separate = seq.add(observation(x=2.1,source='third',track='three'),
+                       observation(x=2.,source='third',track='four'),seconds=2)
+    assert len({item.instance_id for item in separate}) == 2
 
 
 @pytest.mark.parametrize('size',[(20.,.01,.01),(.01,20.,.01),(.01,.01,20.),(.08,.08,.12)])

@@ -2687,5 +2687,174 @@
     "minimum": 1,
     "maximum": 256,
     "description": "有界后台队列默认16条记录，满时丢弃新交接并计数，标记离线判定不完整；在线建图继续。"
+  },
+  "NUWAX_PERCEPTION_SELF_FILTER_ENABLED": {
+    "zh_name": "启用机器人自体检测过滤",
+    "type": "bool",
+    "default": true,
+    "section_id": "perception_detect",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/perception/self_body.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "按机器人模型和与图像同时的关节状态计算自体区域，覆盖达到比例的检测只在叠加层灰显；模型、关节或外参缺失会报告原因。"
+  },
+  "NUWAX_PERCEPTION_SELF_FILTER_COVERAGE": {
+    "zh_name": "自体区域覆盖判定比例",
+    "type": "float",
+    "default": 0.5,
+    "section_id": "perception_detect",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/perception/self_body.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "检测掩码（没有掩码时用框）与自体区域并集的面积比达到此值时标为机器人自身，范围大于0且不超过1。"
+  },
+  "NUWAX_PERCEPTION_SELF_FILTER_DILATION_PX": {
+    "zh_name": "自体区域膨胀（像素）",
+    "type": "float",
+    "default": 6.0,
+    "section_id": "perception_detect",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/perception/self_body.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "运动学投影区域向外扩展的像素数，补偿轮廓压缩和标定误差；不改变手填静态区域。"
+  },
+  "NUWAX_PERCEPTION_SELF_FILTER_MAX_JOINT_AGE_SEC": {
+    "zh_name": "自体过滤关节数据最大时差（秒）",
+    "type": "float",
+    "default": 0.5,
+    "section_id": "perception_detect",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/perception/self_body.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "关节源时间与图像源时间允许的最大绝对差，超过时停用本帧运动学区域并报告关节数据过旧。"
+  },
+  "NUWAX_PERCEPTION_SELF_FILTER_STATIC_REGIONS_JSON": {
+    "zh_name": "各相机自体静态忽略区域（JSON）",
+    "type": "str",
+    "default": "",
+    "section_id": "perception_detect",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/perception/self_body.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "按相机标识填写归一化多边形，例如 {\"front_camera\":[[[0,0.8],[1,0.8],[1,1],[0,1]]]}。坐标0至1；运动学不可用时仍使用该相机静态区域。"
+  },
+  "NUWAX_MEMORY_ASSOCIATION_CONFIRM_WINDOW_SEC": {
+    "zh_name": "新物体确认窗口（秒）",
+    "type": "float",
+    "default": 60.0,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/instance_association_service.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "自动感知新物体需在此秒数内积累指定次数的独立源观察，否则丢弃；显式记忆直接确认。"
+  },
+  "NUWAX_MEMORY_ASSOCIATION_CONFIRM_MIN_OBSERVATIONS": {
+    "zh_name": "新物体确认所需观察次数",
+    "type": "int",
+    "default": 3,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/instance_association_service.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "确认物体需要的不同源观察标识数量；同帧重放、同帧精化和同源多相机不会重复确认。"
+  },
+  "NUWAX_MEMORY_ASSOCIATION_VOXEL_SIZE_M": {
+    "zh_name": "物体支持点体素尺寸（米）",
+    "type": "float",
+    "default": 0.03,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/instance_association_service.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "跨视角支持点累积体素的边长，单位米；显示尺寸取累积体素的5%至95%分位范围。"
+  },
+  "NUWAX_MEMORY_ASSOCIATION_MAX_VOXELS": {
+    "zh_name": "单个物体支持体素上限",
+    "type": "int",
+    "default": 1024,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/instance_association_service.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "每个实例累积的支持体素数量上限，超限按稳定散列保留有界证据。"
+  },
+  "NUWAX_MEMORY_ASSOCIATION_GATE_SIGMA": {
+    "zh_name": "物体关联不确定度倍数",
+    "type": "float",
+    "default": 3.0,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/instance_association_service.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "空间关联门限为尺寸半宽加此倍数的合成测量标准差；双方标准差平方和开方，不按类别设置米数。"
+  },
+  "NUWAX_MEMORY_ASSOCIATION_CROSS_LABEL_OVERLAP": {
+    "zh_name": "跨标签合并最小包含比例",
+    "type": "float",
+    "default": 0.5,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/instance_association_service.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "标签不同时，较小一方落在较大一方中的比例至少达到此值；有双方体素时按体素数确定小方，否则按实测范围体积。另须通过逐轴尺寸比及历史同帧共现否决。"
+  },
+  "NUWAX_MEMORY_ASSOCIATION_CROSS_LABEL_SIZE_RATIO": {
+    "zh_name": "跨标签合并最大尺寸比",
+    "type": "float",
+    "default": 3.0,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/instance_association_service.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "跨标签关联或合并时允许的最大逐轴尺寸比，避免把桌上的书与桌子归为一物。"
+  },
+  "NUWAX_MEMORY_ASSOCIATION_MERGE_ON_ACTIVATION": {
+    "zh_name": "激活记忆库时合并重复物体",
+    "type": "bool",
+    "default": true,
+    "section_id": "runtime_data",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/memory/instance_association_service.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "激活记忆库后检查已加载实例并合并重复；保留最早确认实例标识和历史别名，原观察事件保留。"
   }
 }

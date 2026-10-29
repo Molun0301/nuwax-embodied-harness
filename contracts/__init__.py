@@ -52,10 +52,12 @@ from contracts.memory import (
 )
 from contracts.spatial_memory import (
     GroundingQueryPlan,
+    InstanceConfirmationState,
     InstanceDynamicState,
     InstanceLifecycleState,
     InstanceMovability,
     InstanceObservationWindowSample,
+    InstanceSupportEvidence,
     NavigationCandidate,
     NavigationTrajectoryEvent,
     NavigationTrajectoryEventKind,
@@ -182,8 +184,10 @@ __all__ = [
     "FrameTree",
     "IMUState",
     "ImageEncoding",
+    "InstanceConfirmationState",
     "InstanceDynamicState",
     "InstanceObservationWindowSample",
+    "InstanceSupportEvidence",
     "ImageFrame",
     "JointState",
     "LaserScanFrame",

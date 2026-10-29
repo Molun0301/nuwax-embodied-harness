@@ -491,6 +491,7 @@ class PerceptionVideoRuntime:
                 "memory_write_scheduled": memory_written,
                 "remember_keyframes": self._remember_keyframes,
                 "detection_metadata": dict(detection_metadata or {}),
+                "self_body_filter_status": dict(context.metadata.get("detection_metadata") or {}).get("self_body_filter_status"),
                 "video_ingest_status": dict(video_status),
                 "fast_path": True,
                 "fast_processed_frames": self._fast_processed_frames,

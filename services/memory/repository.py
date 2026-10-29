@@ -180,6 +180,14 @@ class MemoryRepository:
             "semantic_instances", SemanticInstance, "updated_at ASC, instance_id ASC", library_name
         )
 
+    def get_semantic_instance(self,instance_id,*,library_name=None):
+        """历史标识由保留记录的 merged_instance_ids 解析，无第二份可漂移别名库。"""
+        for instance in self.load_semantic_instances(library_name=library_name):
+            if instance.instance_id==instance_id or instance_id in instance.merged_instance_ids:
+                if instance.confirmation_state.value=="confirmed":
+                    return instance
+        return None
+
     def load_observation_events(self, *, library_name: Optional[str] = None) -> List[ObservationEvent]:
         return self._load_library_records(
             "observation_events", ObservationEvent, "created_at ASC, event_id ASC", library_name

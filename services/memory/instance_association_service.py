@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from collections import OrderedDict
 import copy
 import inspect
 import math
 import re
+import numpy as np
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from contracts.base import utc_now
@@ -16,6 +17,8 @@ from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 from contracts.naming import build_anchor_id, build_instance_id
 from contracts.spatial_memory import (
     DeferredProjectionInput,
+    InstanceConfirmationState,
+    InstanceSupportEvidence,
     InstanceDynamicState,
     InstanceLifecycleState,
     InstanceMovability,
@@ -23,6 +26,16 @@ from contracts.spatial_memory import (
     SemanticInstance,
 )
 from services.memory.inspection_pose_planner import InspectionPosePlanner
+from services.memory.instance_consolidation import InstanceConsolidator, InstanceMerge
+from services.memory.instance_evidence import (
+    ADMISSION_AUTOMATIC, ADMISSION_EXPLICIT, measurement_sigma_m, observation_support_points,
+    accumulate_support_voxels, support_extent, fuse_position, update_label_votes, primary_label,
+    cross_label_geometry_compatible, record_support_evidence,
+    cooccurrence_evidence, observation_source_key, observation_window_sources,
+    remember_coobserved_instances, instance_identity_ids,
+    observation_source_index, historical_coobserved_ids,
+    geometry_overlap_diagnostics,
+)
 from services.memory.object_extent import merge_object_extent, resolve_object_extent
 from services.memory.spatial_candidate_index import SpatialCandidateIndex, overlaps
 from services.memory.vectorizer import TextEmbedder
@@ -36,7 +49,7 @@ _UNRESOLVED_GEOMETRY = object()
 class AssociationOutcome:
     """一次实例关联输出。"""
 
-    instance: SemanticInstance
+    instance: Optional[SemanticInstance]
     created: bool
     matched_score: float
 
@@ -109,7 +122,13 @@ class InstanceAssociationService:
         *,
         text_embedder: Optional[TextEmbedder],
         inspection_pose_planner: Optional[InspectionPosePlanner] = None,
+        association_config=None,
     ) -> None:
+        if association_config is None:
+            from core.settings import MemoryInstanceAssociationConfig
+            association_config = MemoryInstanceAssociationConfig()
+        self._association_config = association_config
+        self._consolidator = InstanceConsolidator(config=association_config)
         self._text_embedder = text_embedder
         self._text_embedder_cache_identity = self._embedder_cache_identity(text_embedder)
         self._inspection_pose_planner = inspection_pose_planner or InspectionPosePlanner()
@@ -212,6 +231,111 @@ class InstanceAssociationService:
             self._embedding_cache.popitem(last=False)
         return vector
 
+    @staticmethod
+    def _record_sigma(record):
+        evidence = getattr(record,"support_evidence",None)
+        if evidence is not None and evidence.position_sigma_m is not None and evidence.position_sigma_m>0:
+            return evidence.position_sigma_m
+        attrs = {**record.attributes,**(getattr(record,"metadata",None) or {})}
+        if not attrs.get("depth_m") and isinstance(attrs.get("ray_origin_map"),(list,tuple)):
+            origin=attrs["ray_origin_map"]
+            if len(origin)==3 and all(type(v) in (int,float) and math.isfinite(v) for v in origin):
+                attrs["depth_m"]=math.sqrt(sum((getattr(record.pose.position,k)-origin[i])**2 for i,k in enumerate("xyz")))
+        return measurement_sigma_m(attrs) or 0.005
+
+    def _accumulate_evidence(self,evidence,observation):
+        points = observation_support_points(observation.attributes,frame_id=observation.pose.frame_id)
+        return accumulate_support_voxels(evidence,np.empty((0,3)) if points is None else points,
+            frame_id=observation.pose.frame_id,voxel_size_m=self._association_config.support_voxel_size_m,
+            max_voxels=self._association_config.support_max_voxels)
+
+    @staticmethod
+    def _label_display(current,observation,label):
+        names=dict(current.metadata.get("label_display_names") or {})
+        names.setdefault(current.label,current.display_name)
+        names[observation.label.strip().lower()]=str(observation.attributes.get("display_name_zh") or observation.label)
+        return names.get(label,label)
+
+    def tentative_expired(self,instance,now):
+        return (instance.confirmation_state == InstanceConfirmationState.TENTATIVE
+                and (now-instance.first_seen_ts).total_seconds()>self._association_config.confirmation_window_sec)
+
+    def _confirm_instance(self,instance,observation,*,admission):
+        if self._is_fallback_observation(observation):
+            return instance
+        evidence=instance.support_evidence
+        ids=list(evidence.confirmation_observation_ids)
+        if instance.confirmation_state == InstanceConfirmationState.TENTATIVE and observation.source_observation_id not in ids:
+            ids.append(observation.source_observation_id)
+        state=instance.confirmation_state
+        if admission==ADMISSION_EXPLICIT or len(ids)>=self._association_config.confirmation_min_observations:
+            state=InstanceConfirmationState.CONFIRMED
+        metadata=dict(instance.metadata)
+        names=dict(metadata.get("label_display_names") or {})
+        names[observation.label.strip().lower()]=str(observation.attributes.get("display_name_zh") or observation.label)
+        metadata["label_display_names"]=names
+        return instance.model_copy(update={"confirmation_state":state,"metadata":metadata,
+            "support_evidence":evidence.model_copy(update={"confirmation_observation_ids":ids})})
+
+    def _fallback_score(self,observation,candidate):
+        if self._label_similarity(observation.label,candidate.label)<=0 or not self._instance_pose_is_reliable(candidate):
+            return 0.
+        attrs=observation.attributes
+        origin,direction,angle=(attrs.get(k) for k in ("ray_origin_map","ray_dir_map","ray_cone_half_angle_rad"))
+        if not isinstance(origin,(list,tuple)) or not isinstance(direction,(list,tuple)) or not isinstance(angle,(int,float)):
+            return 0.
+        direction=np.asarray(direction,dtype=float);origin=np.asarray(origin,dtype=float)
+        if direction.shape!=(3,) or origin.shape!=(3,) or not np.isfinite(direction).all() or not np.isfinite(origin).all() or not math.isfinite(angle) or not 0<angle<math.pi/2:
+            return 0.
+        norm=np.linalg.norm(direction)
+        if norm<=0:
+            return 0.
+        direction=direction/norm
+        delta=np.array([getattr(candidate.pose.position,k) for k in "xyz"])-origin
+        along=float(delta @ direction)
+        lateral=float(np.linalg.norm(delta-along*direction))
+        return 0.8 if along>0 and lateral<=along*math.tan(angle) else 0.
+
+    def _identity_anchors(self,observation,candidates,now,localization_session_id,geometry):
+        tracked=tuple(candidate for candidate in candidates if self._same_track(observation,candidate,now,localization_session_id))
+        if tracked:
+            return tracked
+        label=observation.label.strip().lower()
+        same_label=tuple(candidate for candidate in candidates if candidate.label.strip().lower()==label
+            and not self._conflicting_appearance(observation,candidate)
+            and self._geometry_fit(observation,candidate,left=geometry(observation),right=geometry(candidate)) is not None)
+        source=observation_source_key(observation)
+        replay=tuple(candidate for candidate in same_label if source in observation_window_sources(candidate))
+        return replay or same_label
+
+    def _same_frame_duplicate(self,left,right):
+        if not frame_ids_semantically_equal(left.pose.frame_id,right.pose.frame_id) or self._conflicting_appearance(left,right):
+            return False
+        if self._spatial_geometry(left) is not None and self._spatial_geometry(right) is not None:
+            details=geometry_overlap_diagnostics(left,right,self._association_config)
+            if details["reason"] in ("compatible","cross_label_size_ratio","cross_label_containment"):
+                return details["compatible"]
+        # 兼容原明确跟踪号的成对模态；未知几何本身不提供新的去重依据。
+        return bool(left.camera_id and left.track_id and left.track_id==right.track_id
+            and left.label.strip().lower()==right.label.strip().lower()
+            and (self._is_fallback_observation(left) or self._is_fallback_observation(right)
+                 or self._geometry_fit(left,right) is not None))
+
+    @staticmethod
+    def _observation_label_votes(observation):
+        return dict(observation.attributes.get("frame_label_votes")
+                    or update_label_votes(None,observation.label,observation.score))
+
+    def _frame_geometry(self,observation):
+        extent=resolve_object_extent(observation) if not self._is_fallback_observation(observation) else None
+        if extent is None or self._spatial_geometry(observation) is None:
+            return None
+        attributes={"object_extent":extent,"projection_method":observation.attributes.get("projection_method")}
+        support=record_support_evidence(observation,self._association_config)
+        if support is not None and support.voxel_keys:
+            attributes["support_voxels_map"]=support.model_dump(mode="json")
+        return {"pose":observation.pose.model_dump(mode="json"),"attributes":attributes}
+
     def associate(
         self,
         projected_observations: Iterable[ProjectedObservation],
@@ -223,10 +347,13 @@ class InstanceAssociationService:
         occupancy_grid=None,
         cost_map=None,
         now: Optional[datetime] = None,
+        admission: str = ADMISSION_AUTOMATIC,
     ) -> Tuple[Dict[str, SemanticInstance], Tuple[AssociationOutcome, ...]]:
+        """admission 决定本批新建实例的准入：自动感知先待确认，显式记忆直接确认。"""
         resolved_now = now or utc_now()
-        instances = dict(existing_instances)
-        observations = tuple(projected_observations)
+        instances = {key:value for key,value in existing_instances.items()
+                     if not self.tentative_expired(value, resolved_now)}
+        observations = list(projected_observations)
         outcomes = [None] * len(observations)
         groups = {}
         for index, item in enumerate(observations):
@@ -261,32 +388,41 @@ class InstanceAssociationService:
                 track_ids.setdefault(track, set()).add(instance_id)
         spatial_index = SpatialCandidateIndex(bounds_by_id.items())
         changed_ids = set()
+        # 旧窗口是迁移前的共现证据。按来源反查伙伴，在任何一次窗口滚动前
+        # 写入当前实例的有界永久记录，避免两边先后淘汰旧样本后遗忘否决。
+        source_instance_ids = observation_source_index(instances.values())
 
         for indices in groups.values():
             edges = []
             representatives = []
             duplicate_of = {}
-            by_track = {}
-            for index in indices:
+            duplicate_groups = {}
+            # 可靠几何优先，组内要求两两相容，避免A重合B、B重合C造成链式误并。
+            ordered = sorted(indices,key=lambda index:(self._is_fallback_observation(observations[index]),
+                -observations[index].score,self._observation_order(observations[index])))
+            for index in ordered:
                 item = observations[index]
-                duplicate = None
-                if item.camera_id and item.track_id:
-                    for prior_index in by_track.get(item.track_id, ()):
-                        prior = observations[prior_index]
-                        if (frame_ids_semantically_equal(item.pose.frame_id, prior.pose.frame_id)
-                                and self._label_similarity(item.label, prior.label) > 0.0
-                                and not self._conflicting_appearance(item, prior)
-                                and (self._is_fallback_observation(item) or self._is_fallback_observation(prior)
-                                     or self._geometry_fit(item, prior, left=geometry(item), right=geometry(prior)) is not None)):
-                            duplicate = prior_index
-                            break
+                duplicate = next((prior for prior in representatives if all(
+                    self._same_frame_duplicate(item,observations[member]) for member in duplicate_groups[prior])),None)
                 if duplicate is None:
                     representatives.append(index)
-                    if item.camera_id and item.track_id:
-                        by_track.setdefault(item.track_id, []).append(index)
+                    duplicate_groups[index]=[index]
                 else:
-                    # 明确同跟踪对象的 3D/2D 证据保留各自输出，只占一个实例名额。
                     duplicate_of[index] = duplicate
+                    duplicate_groups[duplicate].append(index)
+            for members in duplicate_groups.values():
+                votes={}
+                frame_geometries=[self._frame_geometry(observations[index]) for index in members]
+                for index in members:
+                    item=observations[index]
+                    if not self._is_fallback_observation(item):
+                        label=item.label.strip().lower()
+                        # 同帧同标签的模态/重复框只取最高置信度，不制造独立票数。
+                        votes[label]=max(votes.get(label,0.),item.score)
+                for index in members:
+                    item=observations[index]
+                    observations[index]=replace(item,attributes={**item.attributes,"frame_label_votes":votes,
+                        "frame_geometries":frame_geometries})
             for index in representatives:
                 item = observations[index]
                 bounds = self._spatial_bounds(item)
@@ -295,12 +431,15 @@ class InstanceAssociationService:
                     candidates.update(value for value in spatial_index.query(bounds) if value not in changed_ids)
                     candidates.update(value for value in changed_ids
                                       if value in bounds_by_id and overlaps(bounds, bounds_by_id[value]))
-                for instance_id in candidates:
-                    candidate = instances[instance_id]
-                    if not eligible(candidate):
-                        continue
+                if self._is_fallback_observation(item):
+                    candidates = set(instances)
+                eligible_candidates=tuple(instances[key] for key in candidates if eligible(instances[key])
+                    and frame_ids_semantically_equal(item.pose.frame_id,instances[key].pose.frame_id))
+                anchors=self._identity_anchors(item,eligible_candidates,resolved_now,localization_session_id,geometry)
+                for candidate in eligible_candidates:
+                    instance_id=candidate.instance_id
                     score = self._association_score(item, candidate, resolved_now,
-                        localization_session_id=localization_session_id,
+                        localization_session_id=localization_session_id,identity_anchors=anchors,
                         observation_geometry=geometry(item), candidate_geometry=geometry(candidate))
                     if score >= 0.6:
                         # 几何/跟踪证据优先；同分旧重复记录固定选择最早 ID，不改写历史。
@@ -313,23 +452,37 @@ class InstanceAssociationService:
                     assignments[index] = (instance_id, -negative_score)
                     reserved.add(instance_id)
             # 同一相机同一观测内一对一；先决定归属，避免输入顺序抢走更吻合的物体。
-            for index in indices:
+            for index in (member for prior in representatives for member in duplicate_groups[prior]):
                 item = observations[index]
                 selected = assignments.get(index)
                 if index in duplicate_of:
                     prior_outcome = outcomes[duplicate_of[index]]
-                    selected = (prior_outcome.instance.instance_id, prior_outcome.matched_score)
+                    selected = ((prior_outcome.instance.instance_id, prior_outcome.matched_score)
+                                if prior_outcome.instance is not None else None)
                 if selected is not None:
                     current = instances[selected[0]]
+                    peer_ids = historical_coobserved_ids(current, source_instance_ids,self._association_config)
+                    if peer_ids:
+                        current = remember_coobserved_instances(current, peer_ids)
                     instance = self._merge_instance(current, item, map_name=map_name,
                         localization_session_id=localization_session_id, occupancy_grid=occupancy_grid,
                         cost_map=cost_map, now=resolved_now)
                     old_track = (current.metadata.get("last_camera_id"), current.metadata.get("last_track_id"))
                     track_ids.get(old_track, set()).discard(current.instance_id)
                 else:
+                    if self._is_fallback_observation(item):
+                        outcomes[index] = AssociationOutcome(None, False, 0.0)
+                        continue
                     instance = self._create_instance(item, map_name=map_name,
                         localization_session_id=localization_session_id, occupancy_grid=occupancy_grid,
                         cost_map=cost_map, now=resolved_now)
+                instance = self._confirm_instance(instance, item, admission=admission)
+                source = observation_source_key(item)
+                if source is not None:
+                    peer_ids=historical_coobserved_ids(instance,source_instance_ids,self._association_config)
+                    if peer_ids:
+                        instance=remember_coobserved_instances(instance,peer_ids)
+                    source_instance_ids.setdefault(source,{})[instance.instance_id]=instance
                 if map_asset_id:
                     instance.metadata["map_asset_id"] = map_asset_id
                 instances[instance.instance_id] = instance
@@ -345,6 +498,18 @@ class InstanceAssociationService:
                 outcomes[index] = AssociationOutcome(instance=instance, created=selected is None,
                     matched_score=selected[1] if selected is not None else 1.0)
 
+            # 新共现只接受本帧几何不重合的证明；旧伙伴保持保守语义。
+            observed_ids={outcomes[index].instance.instance_id for index in indices if outcomes[index].instance is not None}
+            for instance_id in observed_ids:
+                peers={other for other in observed_ids if other!=instance_id and cooccurrence_evidence(
+                    instances[instance_id],instances[other],self._association_config) is not None}
+                if peers:
+                    instances[instance_id]=remember_coobserved_instances(instances[instance_id],peers)
+            for index in indices:
+                outcome=outcomes[index]
+                if outcome.instance is not None:
+                    outcomes[index]=AssociationOutcome(instances[outcome.instance.instance_id],outcome.created,outcome.matched_score)
+
         for key, value in instances.items():
             if (value.lifecycle_state == InstanceLifecycleState.REMOVED
                     and value.metadata.get("lifecycle_aged") is not True):
@@ -354,6 +519,18 @@ class InstanceAssociationService:
                 aged.metadata["lifecycle_aged"] = True
             instances[key] = aged
         return instances, tuple(outcomes)
+
+    def consolidate(
+        self,
+        instances: Dict[str, SemanticInstance],
+        *,
+        candidate_ids: Optional[Iterable[str]] = None,
+    ) -> Tuple[Dict[str, SemanticInstance], Tuple[InstanceMerge, ...]]:
+        """合并指向同一物体的实例；调用方须持有关联计算锁，结果由 MemoryService 持久化。"""
+        merges = self._consolidator.find_merges(instances, candidate_ids=candidate_ids)
+        if not merges:
+            return instances, ()
+        return self._consolidator.apply(instances, merges), merges
 
     @staticmethod
     def _observation_order(item):
@@ -369,12 +546,7 @@ class InstanceAssociationService:
 
     @staticmethod
     def _spatial_geometry(record):
-        """可比地图坐标、轴向支持范围和尺度相关容差；容差不是测量协方差。
-
-        点云只描述可见表面，细长物体的深度抖动不能用最薄轴当作精确误差。
-        取最大已测跨度的 10% 作为支持范围容差，不使用类别固定米数。
-        没有尺寸时不伪造尺度，只允许精确位置或独立跟踪连续性。
-        """
+        """地图坐标、尺寸范围与位置一倍标准差；不再以尺寸比例冒充误差。"""
         pose = record.pose
         metadata = record.attributes if isinstance(record, ProjectedObservation) else record.metadata
         if (metadata.get("pending_localization") or metadata.get("observation_only")
@@ -387,8 +559,7 @@ class InstanceAssociationService:
         if extent is None:
             # 可靠深度中心/三角化点没有实体尺寸时，仍可使用原投影的米制残差
             # 或该深度处的观测视锥支持范围；这不是用于渲染的虚构物体尺寸。
-            radius = InstanceAssociationService._position_support_radius(record)
-            return center, (2.0*radius, 2.0*radius, 2.0*radius), 0.0
+            return center, (0.,0.,0.), InstanceAssociationService._record_sigma(record)
         if not frame_ids_semantically_equal(extent["frame_id"], pose.frame_id):
             return None
         center = tuple(center[index] + extent["center_offset_m"][axis] for index, axis in enumerate("xyz"))
@@ -399,7 +570,7 @@ class InstanceAssociationService:
                     (2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)))
         sizes = tuple(extent["size_m"][axis] for axis in "xyz")
         world_sizes = tuple(sum(abs(rotation[row][col])*sizes[col] for col in range(3)) for row in range(3))
-        return center, world_sizes, 0.1 * max(sizes)
+        return center, world_sizes, InstanceAssociationService._record_sigma(record)
 
     @staticmethod
     def _position_support_radius(record):
@@ -442,7 +613,7 @@ class InstanceAssociationService:
                         and math.isfinite(qx*qx+qy*qy+qz*qz+qw*qw)
                         and qx*qx+qy*qy+qz*qz+qw*qw >= 1e-24):
                     center = (pose.position.x+ox, pose.position.y+oy, pose.position.z+oz)
-                    radius = 0.5*math.sqrt(sx*sx+sy*sy+sz*sz) + 0.1*max(sx,sy,sz)
+                    radius = 0.5*math.sqrt(sx*sx+sy*sy+sz*sz) + self._association_config.uncertainty_gate_sigma*self._record_sigma(record)
                     if all(math.isfinite(v) for v in center) and math.isfinite(radius):
                         return (tuple(v-radius for v in center), tuple(v+radius for v in center))
             except (KeyError,TypeError):
@@ -452,8 +623,8 @@ class InstanceAssociationService:
         if geometry is None:
             return None
         center, sizes, tolerance = geometry
-        return (tuple(center[i] - sizes[i]*0.5 - tolerance for i in range(3)),
-                tuple(center[i] + sizes[i]*0.5 + tolerance for i in range(3)))
+        return (tuple(center[i] - sizes[i]*0.5 - self._association_config.uncertainty_gate_sigma*tolerance for i in range(3)),
+                tuple(center[i] + sizes[i]*0.5 + self._association_config.uncertainty_gate_sigma*tolerance for i in range(3)))
 
     def _geometry_fit(self, observation, candidate, *, left=_UNRESOLVED_GEOMETRY, right=_UNRESOLVED_GEOMETRY):
         if left is _UNRESOLVED_GEOMETRY:
@@ -465,7 +636,7 @@ class InstanceAssociationService:
         residuals = []
         for axis in range(3):
             delta = abs(left[0][axis] - right[0][axis])
-            gate = 0.5 * max(left[1][axis], right[1][axis]) + max(left[2], right[2])
+            gate = 0.5 * max(left[1][axis], right[1][axis]) + self._association_config.uncertainty_gate_sigma * math.hypot(left[2], right[2])
             if delta > gate and not math.isclose(delta, gate, rel_tol=1e-12, abs_tol=0.0):
                 return None
             residuals.append(delta / gate if gate > 0.0 else 0.0)
@@ -484,11 +655,17 @@ class InstanceAssociationService:
 
     def _association_score(self, observation, candidate, now, *, localization_session_id=None,
                            observation_geometry=_UNRESOLVED_GEOMETRY,
-                           candidate_geometry=_UNRESOLVED_GEOMETRY) -> float:
+                           candidate_geometry=_UNRESOLVED_GEOMETRY, identity_anchors=()) -> float:
         if not frame_ids_semantically_equal(observation.pose.frame_id, candidate.pose.frame_id):
             return 0.0
         if not math.isfinite(self._distance(observation.pose, candidate.pose)):
             return 0.0
+        candidate_ids=instance_identity_ids(candidate)
+        if not any(candidate_ids & instance_identity_ids(anchor) for anchor in identity_anchors):
+            if any(cooccurrence_evidence(anchor,candidate,self._association_config) is not None for anchor in identity_anchors):
+                return 0.0
+        if self._is_fallback_observation(observation):
+            return self._fallback_score(observation,candidate)
         same_track = self._same_track(observation, candidate, now, localization_session_id)
         geometry_fit = self._geometry_fit(observation, candidate,
             left=observation_geometry, right=candidate_geometry)
@@ -499,8 +676,11 @@ class InstanceAssociationService:
         if candidate.movability == InstanceMovability.TRANSIENT and age_sec > max_time_gap_sec:
             return 0.0
         label_score = self._label_similarity(observation.label, candidate.label)
-        if label_score == 0.0 or self._conflicting_appearance(observation, candidate):
+        if self._conflicting_appearance(observation,candidate):
             return 0.0
+        if observation.label.strip().lower()!=candidate.label.strip().lower():
+            return (0.8 + 0.2*(geometry_fit or 0.0)
+                    if cross_label_geometry_compatible(observation,candidate,self._association_config) else 0.0)
         attribute_score = self._attribute_similarity(observation, candidate)
         if attribute_score < self._ATTRIBUTE_SIMILARITY_GATE[candidate.movability]:
             return 0.0
@@ -641,37 +821,57 @@ class InstanceAssociationService:
         cost_map,
         now: datetime,
     ) -> SemanticInstance:
-        repeated = self._observation_already_seen(current, observation)
+        if self._is_fallback_observation(observation):
+            return current.model_copy(update={"last_seen_ts":now,"metadata":{
+                **self._apply_dynamic_navigation_policy(current.metadata,current.dynamic_state),"last_observation_projection_method":"current_pose_fallback",
+                "last_fallback_source_observation_id":observation.source_observation_id}})
+        repeated = self._observation_already_seen(current,observation)
         prior_sample = next((sample for sample in current.observation_window
-            if sample.metadata.get("source_observation_id") == observation.source_observation_id
-            and sample.metadata.get("camera_id", "") == (observation.camera_id or "")), None)
+            if sample.metadata.get("source_observation_id")==observation.source_observation_id
+            and sample.metadata.get("camera_id", "")== (observation.camera_id or "")),None)
         replaces_reliable = prior_sample is not None and self._sample_projection_reliable(prior_sample)
         updated_count = current.observation_count + (0 if repeated else 1)
-        reliable_pose_count = int(current.metadata.get("position_observation_count") or 0)
-        if self._instance_pose_is_reliable(current) and reliable_pose_count <= 0:
-            reliable_pose_count = current.observation_count
-        # 阶段0 quality-gated blend：
-        # - fallback 观测(坐标=机器人位姿)不参与位置加权；既有可信则保留，否则用本次。
-        # - 可信观测遇到 pending/不可信的既有坐标(哨兵无意义) → 完全覆盖，不做加权。
-        # - 其余(双方可信) → 只按有几何依据的观测次数加权融合。
-        if self._is_fallback_observation(observation):
-            blended_pose = current.pose if self._instance_pose_is_reliable(current) else observation.pose
-        elif not self._instance_pose_is_reliable(current):
-            blended_pose = observation.pose
-        elif replaces_reliable:
-            # 同一观察重放不重复加权；同帧精化只替换其原有贡献。
-            blended_pose = current.pose.model_copy(update={"position": current.pose.position.model_copy(update={
-                axis: getattr(current.pose.position, axis)
-                    + (getattr(observation.pose.position, axis) - getattr(prior_sample.pose.position, axis))
-                    / float(max(1, reliable_pose_count)) for axis in "xyz"})})
+        reliable_pose_count = int(current.metadata.get("position_observation_count") or current.observation_count)
+        sigma = self._record_sigma(observation)
+        prior_geometry = record_support_evidence(current,self._association_config)
+        evidence = current.support_evidence or InstanceSupportEvidence(frame_id=current.pose.frame_id,
+            voxel_keys=prior_geometry.voxel_keys if prior_geometry is not None else [],
+            voxel_size_m=self._association_config.support_voxel_size_m,
+            position_weight=reliable_pose_count/self._record_sigma(current)**2,
+            position_sigma_m=self._record_sigma(current),
+            label_votes={current.label:current.confidence*current.observation_count})
+        if not self._instance_pose_is_reliable(current):
+            # 升级前遗留的观察者回退位置没有测量权重，也不能贡献地图体素。
+            reliable_pose_count=0
+            evidence=evidence.model_copy(update={"position_weight":0.0,"position_sigma_m":None,"voxel_keys":[]})
+        weight = evidence.position_weight
+        original_pose = current.pose
+        if replaces_reliable:
+            prior_sigma = prior_sample.metadata.get("measurement_sigma_m") or self._record_sigma(current)
+            prior_weight = 1/max(1e-12,float(prior_sigma)**2)
+            remaining = max(0.,weight-prior_weight)
+            if remaining > 1e-9:
+                original_pose = current.pose.model_copy(update={"position":current.pose.position.model_copy(update={
+                    axis:(getattr(current.pose.position,axis)*weight-getattr(prior_sample.pose.position,axis)*prior_weight)/remaining for axis in "xyz"})})
+            weight = remaining
+        if repeated and not replaces_reliable:
+            blended_pose, position_weight, position_sigma = current.pose,evidence.position_weight,evidence.position_sigma_m
         else:
-            blended_pose = self._blend_pose(
-                current.pose,
-                observation.pose,
-                weight=float(reliable_pose_count) / float(reliable_pose_count + 1),
-            )
+            blended_pose, position_weight, position_sigma = fuse_position(original_pose,weight,observation.pose,sigma)
+        votes = dict(evidence.label_votes)
+        if replaces_reliable:
+            old_votes=prior_sample.metadata.get("frame_label_votes") or {
+                prior_sample.metadata.get("label",current.label):prior_sample.confidence}
+            for old_label,score in old_votes.items():
+                votes[old_label] = max(0.,votes.get(old_label,0.)-score)
+        if not repeated or replaces_reliable:
+            for voted_label,score in self._observation_label_votes(observation).items():
+                votes=update_label_votes(votes,voted_label,score)
+        evidence = self._accumulate_evidence(evidence,observation)
+        evidence = evidence.model_copy(update={"position_weight":position_weight,"position_sigma_m":position_sigma,"label_votes":votes})
+        label = primary_label(votes,current.label)
         visual_labels = self._merge_strings(current.visual_labels, observation.visual_labels)
-        semantic_labels = self._merge_strings(current.semantic_labels, observation.semantic_labels)
+        semantic_labels = self._merge_strings(current.semantic_labels, [*observation.semantic_labels,current.label,observation.label])
         artifact_ids = self._merge_strings(current.artifact_ids, observation.source_artifact_ids)
         supporting_event_ids = self._merge_strings(
             current.supporting_observation_event_ids,
@@ -708,6 +908,9 @@ class InstanceAssociationService:
                 and dynamic_state in {InstanceDynamicState.DYNAMIC, InstanceDynamicState.QUASI_STATIC}):
             # 已关联的移动物体不能继续拖着全生命周期平均位置。
             blended_pose = observation.pose
+            # 运动中的地图绝对点不能把走过的路径累积成物体尺寸。
+            evidence = self._accumulate_evidence(evidence if repeated else evidence.model_copy(update={"voxel_keys":[]}),observation)
+            evidence = evidence.model_copy(update={"position_weight":1/sigma**2,"position_sigma_m":sigma})
         inspection_poses = self._inspection_pose_planner.plan_for_target(
             target_pose=blended_pose, observer_body_pose=observation.observer_body_pose,
             occupancy_grid=occupancy_grid, cost_map=cost_map,
@@ -730,7 +933,7 @@ class InstanceAssociationService:
                     metadata.pop(key, None)
             metadata["observation_only"] = False
             metadata.update(self._summarize_segmentation_metadata(metadata))
-        extent = merge_object_extent(current, observation, pose=blended_pose)
+        extent = merge_object_extent(current, observation, pose=blended_pose,support_evidence=evidence)
         if extent is not None:
             metadata["object_extent"] = extent
         if not self._is_fallback_observation(observation):
@@ -748,6 +951,9 @@ class InstanceAssociationService:
         if was_pending and self._is_fallback_observation(observation):
             merged_lifecycle = InstanceLifecycleState.UNCERTAIN
         updates = {
+            "label": label,
+            "display_name": self._label_display(current,observation,label),
+            "support_evidence": evidence,
             "pose": blended_pose,
             "map_name": map_name or current.map_name,
             "localization_session_id": localization_session_id or current.localization_session_id,
@@ -824,7 +1030,17 @@ class InstanceAssociationService:
             metadata["navigable"] = False
             metadata["non_navigable_reason"] = "current_pose_fallback_no_geometry"
             created_lifecycle = InstanceLifecycleState.UNCERTAIN
+        evidence = self._accumulate_evidence(None,observation)
+        sigma = self._record_sigma(observation)
+        evidence = evidence.model_copy(update={"position_weight":1/sigma**2,"position_sigma_m":sigma,
+            "label_votes":self._observation_label_votes(observation)})
+        if extent is None or extent["source"] != "detection3d":
+            extent = support_extent(evidence,pose=observation.pose) or extent
+            if extent is not None:
+                metadata["object_extent"] = extent
         return SemanticInstance(
+            support_evidence=evidence,
+            confirmation_state=InstanceConfirmationState.TENTATIVE,
             instance_id=instance_id,
             anchor_id=anchor_id,
             label=observation.label.strip().lower(),
@@ -1012,6 +1228,7 @@ class InstanceAssociationService:
             "last_track_id": observation.track_id or "",
             "last_camera_id": observation.camera_id or "",
             "last_source_observation_id": observation.source_observation_id,
+            "last_observation_label": observation.label.strip().lower(),
             "last_observation_projection_method": str(observation.attributes.get("projection_method") or ""),
             "last_observation_projection_confidence": observation.attributes.get("projection_confidence"),
             "association_policy": movability.value,
@@ -1084,6 +1301,7 @@ class InstanceAssociationService:
             item.metadata.get("source_observation_id") == observation.source_observation_id
             and item.metadata.get("camera_id", "") == (observation.camera_id or ""))]
         projection_method = str(observation.attributes.get("projection_method") or "")
+        frame_geometry=observation.attributes.get("frame_geometries",[self._frame_geometry(observation)])
         window.append(
             InstanceObservationWindowSample(
                 timestamp=now,
@@ -1101,6 +1319,10 @@ class InstanceAssociationService:
                     "projection_method": projection_method,
                     # 阶段0：标记该样本坐标是否可信(非 fallback)，供动态分类位移计算过滤。
                     "projection_reliable": not self._is_fallback_observation(observation),
+                    "measurement_sigma_m":measurement_sigma_m(observation.attributes),
+                    "label":observation.label.strip().lower(),
+                    "frame_label_votes":self._observation_label_votes(observation),
+                    "frame_geometry":frame_geometry,
                 },
             )
         )

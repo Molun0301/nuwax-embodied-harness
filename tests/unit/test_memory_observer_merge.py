@@ -121,7 +121,9 @@ def test_observerless_fallback_retains_previous_observer_extent_and_inspection_p
     original = replace(observation(
         observer_body_pose=robot.model_dump(mode='json')), observer_body_pose=robot)
     known = seq.add(original)
-    fallback = seq.add(observation(x=20, fallback=True, source='weak'),seconds=1)
+    outcome = seq.add(observation(x=20, fallback=True, source='weak'),seconds=1)
+    assert outcome is None
+    fallback=seq.instances[known.instance_id]
     assert fallback.instance_id == known.instance_id
     assert fallback.pose == known.pose
     assert fallback.metadata['object_extent'] == known.metadata['object_extent']

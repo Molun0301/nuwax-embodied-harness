@@ -11,6 +11,8 @@ from contracts.image import CameraInfo, ImageFrame
 from contracts.perception import Detection2D
 from contracts.pointcloud import PointCloudFrame
 from services.localization.frame_tree_ops import resolve_frame_transform
+from services.perception.self_body import SelfBodyRegion, is_self_body
+from services.perception.support_points import select_object_support
 
 
 class DetectionGeometryAugmentor:
@@ -25,9 +27,13 @@ class DetectionGeometryAugmentor:
         *,
         max_points_per_detection: int = 24,
         min_depth_m: float = 0.05,
+        support_voxel_size_m: float = 0.03,
+        support_max_voxels: int = 1024,
     ) -> None:
         self._max_points_per_detection = max(1, int(max_points_per_detection))
         self._min_depth_m = max(0.001, float(min_depth_m))
+        self._support_voxel_size_m = support_voxel_size_m
+        self._support_max_voxels = support_max_voxels
 
     def augment_detections(
         self,
@@ -38,6 +44,7 @@ class DetectionGeometryAugmentor:
         point_cloud: Optional[PointCloudFrame],
         frame_tree: Optional[FrameTree] = None,
         current_pose: Optional[Pose] = None,
+        self_region: Optional[SelfBodyRegion] = None,
     ) -> Tuple[Tuple[Detection2D, ...], Dict[str, object]]:
         if not detections_2d:
             return detections_2d, {}
@@ -80,6 +87,12 @@ class DetectionGeometryAugmentor:
             return detections_2d, {**metadata, "geometry_projection_degradation_reason": "no_projectable_points"}
 
         projected_pixels, camera_points, map_points, map_frame_id = prepared
+        if self._self_region_applies(self_region, image_frame):
+            # 机器人自身占据的像素上的点不是任何环境物体的几何支持。
+            keep = ~self_region.contains_pixels(projected_pixels)
+            metadata["geometry_self_body_point_count"] = int(keep.size - np.count_nonzero(keep))
+            projected_pixels, camera_points = projected_pixels[keep], camera_points[keep]
+            map_points = map_points[keep] if map_points is not None else None
         augmented = []
         augmented_count = 0
         support_point_total = 0
@@ -87,6 +100,9 @@ class DetectionGeometryAugmentor:
             if detection.camera_id not in (None, image_frame.camera_id):
                 augmented.append(detection)
                 metadata["geometry_camera_mismatch_count"] = int(metadata.get("geometry_camera_mismatch_count") or 0) + 1
+                continue
+            if is_self_body(detection.attributes):
+                augmented.append(detection)
                 continue
             updated_detection, support_count = self._augment_single_detection(
                 detection=detection,
@@ -384,8 +400,9 @@ class DetectionGeometryAugmentor:
                 projection_method = "pointcloud_mask_projection"
                 projection_status = "mask_depth_support"
             elif bbox_support_count:
-                support_indices = bbox_indices
-                projection_status = "mask_no_depth_support_bbox_fallback"
+                support_indices = polygon_indices
+                projection_method = "pointcloud_mask_projection"
+                projection_status = "mask_no_depth_support"
             else:
                 support_indices = polygon_indices
                 projection_method = "pointcloud_mask_projection"
@@ -413,19 +430,56 @@ class DetectionGeometryAugmentor:
                 attributes["segmentation_projection_status"] = projection_status
             return detection.model_copy(update={"attributes": attributes}, deep=False), 0
 
-        depths = camera_points[support_indices, 2]
-        if support_indices.size > self._max_points_per_detection:
-            cutoff = np.partition(depths, self._max_points_per_detection - 1)[self._max_points_per_detection - 1]
-            nearest = np.flatnonzero(depths < cutoff)
-            tied = np.flatnonzero(depths == cutoff)[: self._max_points_per_detection - nearest.size]
-            nearest = np.concatenate((nearest, tied))
-            selected_indices = support_indices[nearest[np.argsort(depths[nearest], kind="stable")]]
-        else:
-            selected_indices = support_indices[np.argsort(depths, kind="stable")]
+        selection = select_object_support(
+            candidate_indices=support_indices,
+            camera_points=camera_points,
+            projected_pixels=projected_pixels,
+            bbox_xyxy=(x_min, y_min, x_max, y_max),
+            from_mask=projection_status == "mask_depth_support",
+            max_points=self._max_points_per_detection,
+        )
+        selected_indices = selection.indices
+        attributes["support_selection_method"] = selection.method
+        attributes["support_candidate_point_count"] = selection.candidate_point_count
+        attributes["support_cluster_point_count"] = selection.cluster_point_count
+        if selection.depth_spread_m is not None:
+            attributes["support_depth_spread_m"] = round(float(selection.depth_spread_m), 6)
+        if selection.measurement_sigma_m is not None:
+            attributes["measurement_sigma_m"] = round(float(selection.measurement_sigma_m), 6)
+        if selected_indices.size == 0:
+            # 主体选择可能排除全部候选（例如全部是背景/地面），按无深度支持处理。
+            attributes["geometry_support_point_count"] = 0
+            attributes["support_point_count"] = 0
+            attributes["projection_degradation_reason"] = "support_cluster_empty"
+            attributes["geometry_projection_status"] = "support_cluster_empty"
+            attributes["depth_coverage"] = 0.0
+            attributes["map_projection_coverage"] = 0.0
+            attributes["coverage"] = 0.0
+            if polygon:
+                attributes["segmentation_projection_status"] = "support_cluster_empty"
+                attributes["segmentation_support_point_count"] = 0
+            return detection.model_copy(update={"attributes": attributes}, deep=False), 0
         selected_camera = camera_points[selected_indices]
         selected_map = map_points[selected_indices] if map_points is not None else None
         selected_pixels = projected_pixels[selected_indices]
+        full_cluster = map_points[selection.cluster_indices] if map_points is not None else camera_points[selection.cluster_indices]
+        low, high = np.quantile(full_cluster, [0.05,0.95],axis=0)
+        attributes["support_cluster_summary"] = {
+            "frame_id": map_frame_id if map_points is not None else camera_info.frame_id,
+            "center": np.median(full_cluster,axis=0).tolist(),
+            "min": low.tolist(), "max": high.tolist(), "point_count": selection.cluster_point_count,
+        }
+
+        if map_points is not None:
+            keys=np.unique(np.floor(full_cluster/self._support_voxel_size_m).astype(np.int64),axis=0)
+            if len(keys)>self._support_max_voxels:
+                rank=(keys[:,0]*73856093)^(keys[:,1]*19349663)^(keys[:,2]*83492791)
+                keys=keys[np.argsort(rank.astype(np.uint64),kind="stable")[:self._support_max_voxels]]
+            attributes["support_voxels_map"]={"frame_id":map_frame_id,"voxel_size_m":self._support_voxel_size_m,
+                "voxel_keys":keys.reshape(-1).tolist()}
         support_count = int(selected_indices.size)
+        if polygon:
+            attributes["segmentation_support_point_count"] = support_count
 
         if not self._has_any_geometry_key(attributes, self._CAMERA_POINT_KEYS):
             attributes["camera_points"] = {
@@ -438,7 +492,7 @@ class DetectionGeometryAugmentor:
                 "points": self._serialize_points(selected_map),
             }
         if self._float_or_none(attributes.get("depth_m")) is None:
-            attributes["depth_m"] = round(float(np.median(selected_camera[:, 2])), 6)
+            attributes["depth_m"] = round(float(np.median(camera_points[selection.cluster_indices, 2])), 6)
         if not self._has_any_geometry_key(attributes, self._PIXEL_CENTER_KEYS):
             pixel_center = selected_pixels.mean(axis=0)
             attributes["pixel_center_px"] = [round(float(pixel_center[0]), 4), round(float(pixel_center[1]), 4)]
@@ -475,6 +529,14 @@ class DetectionGeometryAugmentor:
             )
 
         return detection.model_copy(update={"attributes": attributes}, deep=False), support_count
+
+    @staticmethod
+    def _self_region_applies(self_region: Optional[SelfBodyRegion], image_frame: ImageFrame) -> bool:
+        return (
+            self_region is not None and bool(self_region.polygons_px)
+            and self_region.camera_id == image_frame.camera_id
+            and (self_region.width_px, self_region.height_px) == (int(image_frame.width_px), int(image_frame.height_px))
+        )
 
     def _resolve_array_to_frame(
         self,

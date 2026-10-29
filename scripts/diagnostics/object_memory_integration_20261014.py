@@ -108,6 +108,7 @@ class ObjectMemoryIntegration(unittest.TestCase):
 
     def ingest(self, service, detections, *, second=0, camera='front_camera', session='morning',
                pose=None, context=None, persist=True, map_snapshot=None):
+        service._mapping_service.get_semantic_snapshot = lambda: map_snapshot
         return service.ingest_perception_observation(perception_context=context or self.context(detections, camera=camera),
             map_snapshot=map_snapshot, localization_snapshot=None, current_pose=pose or position(0, 0, 0),
             camera_id=camera, map_name=service.get_active_library_name(), localization_session_id=session,
@@ -176,7 +177,7 @@ class ObjectMemoryIntegration(unittest.TestCase):
         self.assertEqual(len(self.stored(second)), 1)
         self.assertEqual(self.stored(second)[0].observation_count, 4)
         self.assertEqual(len(second.list_semantic_instances()), 1)
-        self.assert_size(second.list_semantic_instances()[0], (.9, .9, 1.1))
+        self.assert_size(second.list_semantic_instances()[0], (.96, .93, 1.11))
 
     def test_nearby_cups_seen_separately_and_reordered_batch_stay_distinct(self):
         service = self.service()
@@ -207,7 +208,7 @@ class ObjectMemoryIntegration(unittest.TestCase):
         _, _, ids = self.settle(service, [detection2d()])
         before = service.list_semantic_instances()[0]
         _, _, weak_ids = self.ingest(service, [detection2d(fallback=True)], second=11, pose=position(30, 30, 0))
-        self.assertEqual(weak_ids, ids)
+        self.assertEqual(weak_ids, [])
         row = service.list_semantic_instances()[0]
         self.assertEqual(row['pose'], before['pose'])
         self.assertEqual(row['object_extent'], before['object_extent'])
@@ -250,21 +251,23 @@ class ObjectMemoryIntegration(unittest.TestCase):
             self.assertEqual(len(ids), 2)
             self.assertEqual(ids[0], ids[1])
             identifier = ids[0]
-            # Two simultaneous views establish geometry, not elapsed static
-            # history. The first batch remains live-only under existing policy.
-            self.assertEqual(writes.call_count, 0 if index == 1 else 1)
+            # 同源双相机只计一次确认；第三个独立源观察后才对外显示并持久化。
+            self.assertEqual(writes.call_count, 0 if index < 3 else 1)
             stored = self.stored(service)
-            self.assertEqual(len(stored), 0 if index == 1 else 1)
+            self.assertEqual(len(stored), 0 if index < 3 else 1)
             if stored:
                 self.assertEqual(stored[0].observation_count, index * 2)
+            if index<3:
+                self.assertEqual(service.list_semantic_instances(), [])
+                continue
             row = service.list_semantic_instances()[0]
             self.assertEqual(row['observation_count'], index * 2)
-            self.assert_size(row, (.9, .9, 1.1))
+            self.assert_size(row, (.93, .93, 1.11))
         service.close()
         reopened = self.service()
         self.assertEqual(self.stored(reopened)[0].instance_id, identifier)
         self.assertEqual(self.stored(reopened)[0].observation_count, 6)
-        self.assert_size(reopened.list_semantic_instances()[0], (.9, .9, 1.1))
+        self.assert_size(reopened.list_semantic_instances()[0], (.93, .93, 1.11))
         self.ingest(reopened, [], context=context, second=11)
         self.assertEqual(self.stored(reopened)[0].observation_count, 6)
 
@@ -297,13 +300,16 @@ class ObjectMemoryIntegration(unittest.TestCase):
                 if first_track is not None:
                     attributes['track_id'] = first_track
                 detector = detection3d('cup', size=(.08, .08, .12)).model_copy(update={'attributes':attributes})
-                support = detection2d('cup', size=(.08, .08, .12), track=second_track)
+                # 两只8厘米杯子相距10厘米，几何不重合；缺跟踪号本身不再代表不同物体。
+                support = detection2d('cup', x=2.1, size=(.08, .08, .12), track=second_track)
                 self.settle(service, [detector, support])
                 rows = service.list_semantic_instances(label='cup')
                 self.assertEqual(len(rows), 2)
                 self.assertEqual(len(self.stored(service)), 2)
                 self.assertEqual(sorted(row['observation_count'] for row in rows), [3, 3])
                 self.assertEqual(len({row['instance_id'] for row in rows}), 2)
+                positions=sorted(record.pose.position.x for record in self.stored(service))
+                self.assertAlmostEqual(positions[1]-positions[0],.1,places=6)
                 service.close()
 
     def test_same_source_replay_does_not_inflate_observation_count(self):
@@ -343,7 +349,7 @@ class ObjectMemoryIntegration(unittest.TestCase):
         self.assertEqual(saved_old.pose.frame_id, 'odom')
         self.assertEqual(saved_old.observation_count, 3)
 
-    def test_legacy_bounds_are_readable_without_rewriting_or_merging_history(self):
+    def test_legacy_bounds_merge_on_activation_and_keep_aliases(self):
         service = self.service()
         bounds = {'frame_id': 'map', 'min': {'x':1.8, 'y':.8, 'z':.1},
                   'max': {'x':2.2, 'y':1.2, 'z':1.3}}
@@ -354,14 +360,15 @@ class ObjectMemoryIntegration(unittest.TestCase):
         service.activate_memory_library(library_name='house', load_history=True)
         before = {row.instance_id: row.model_dump(mode='json') for row in self.stored(service)}
         rows = service.list_semantic_instances(label='cup')
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 1)
         for row in rows:
             self.assert_size(row, (.4, .4, 1.2))
         self.assertEqual(before, {row.instance_id: row.model_dump(mode='json') for row in self.stored(service)})
         self.ingest(service, [detection2d('cup', size=(.4, .4, 1.2))], second=15)
         after = self.stored(service)
         self.assertEqual({row.instance_id for row in after}, set(before))
-        self.assertEqual(sorted(row.observation_count for row in after), [3, 4])
+        self.assertEqual(sorted(row.observation_count for row in after), [7])
+        self.assertEqual(service.get_semantic_instance(duplicate.instance_id).instance_id, original.instance_id)
 
     def assigned_session(self, asset, session):
         from contracts.map_activation import AssignedActivationReceipt
@@ -439,15 +446,15 @@ class ObjectMemoryIntegration(unittest.TestCase):
             'support_points_map':points + [[1.55, 1., .7]]}})
         self.settle(service, [first])
         row = service.list_semantic_instances()[0]
-        self.assertAlmostEqual(row['pose']['x'], 1.95)
-        self.assertAlmostEqual(row['object_extent']['center']['x'], 2.)
+        self.assertAlmostEqual(row['pose']['x'], 1.55)
+        self.assertAlmostEqual(row['object_extent']['center']['x'], 1.995)
         second = base.model_copy(update={'attributes':{**base.attributes,
             'support_points_map':points + [[2.45, 1., .7]]}})
         self.ingest(service, [second], second=20)
         row = service.list_semantic_instances()[0]
-        self.assertAlmostEqual(row['pose']['x'], 1.975)
-        self.assertAlmostEqual(row['object_extent']['center']['x'], 2.)
-        self.assert_size(row, (.9, .9, 1.1))
+        self.assertAlmostEqual(row['pose']['x'], 2.45)
+        self.assertAlmostEqual(row['object_extent']['center']['x'], 1.995)
+        self.assert_size(row, (.93, .93, 1.11))
 
     def test_http_route_preserves_extent_and_filter_after_database_reopen(self):
         from gateways.http.api import build_http_router

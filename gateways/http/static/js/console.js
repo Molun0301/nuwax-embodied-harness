@@ -4702,16 +4702,17 @@
           if (!(right > left && bottom > top)) continue;
           const x = geometry.x + left * geometry.scale, y = geometry.y + top * geometry.scale;
           const boxWidth = (right - left) * geometry.scale, boxHeight = (bottom - top) * geometry.scale;
-          const label = `${detection.label} ${formatDetectionScore(detection.score)}`;
+          const selfBody = detection.self_body === true || detection.attributes?.self_body === true;
+          const label = `${selfBody ? "机器人自身" : detection.label} ${formatDetectionScore(detection.score)}`;
           const labelMaxWidth = Math.max(20, Math.min(240, width - x - 10));
           const fitted = fitSemanticMarkerLabel(context, label, labelMaxWidth);
           const labelWidth = Math.min(width - x, context.measureText(fitted).width + 10);
           const labelTop = Math.max(geometry.y, y - 20);
-          context.strokeStyle = "#22d3ee";
+          context.strokeStyle = selfBody ? "#94a3b8" : "#22d3ee";
           context.strokeRect(x, y, boxWidth, boxHeight);
           context.fillStyle = "rgba(2, 6, 23, 0.88)";
           context.fillRect(x, labelTop, labelWidth, 20);
-          context.fillStyle = "#e0f2fe";
+          context.fillStyle = selfBody ? "#cbd5e1" : "#e0f2fe";
           context.fillText(fitted, x + 5, labelTop + 14);
         }
         canvas.hidden = false;

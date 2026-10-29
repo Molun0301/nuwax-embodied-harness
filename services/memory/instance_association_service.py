@@ -31,10 +31,10 @@ from services.memory.instance_evidence import (
     ADMISSION_AUTOMATIC, ADMISSION_EXPLICIT, measurement_sigma_m, observation_support_points,
     accumulate_support_voxels, support_extent, fuse_position, update_label_votes, primary_label,
     cross_label_geometry_compatible, record_support_evidence,
-    cooccurrence_evidence, observation_source_key, observation_window_sources,
+    cooccurrence_evidence, cooccurrence_sources, observation_source_key, observation_window_sources,
     remember_coobserved_instances, instance_identity_ids,
     observation_source_index, historical_coobserved_ids,
-    geometry_overlap_diagnostics,
+    geometry_overlap_diagnostics, measurement_geometry_fit,
 )
 from services.memory.object_extent import merge_object_extent, resolve_object_extent
 from services.memory.spatial_candidate_index import SpatialCandidateIndex, overlaps
@@ -278,7 +278,7 @@ class InstanceAssociationService:
             "support_evidence":evidence.model_copy(update={"confirmation_observation_ids":ids})})
 
     def _fallback_score(self,observation,candidate):
-        if self._label_similarity(observation.label,candidate.label)<=0 or not self._instance_pose_is_reliable(candidate):
+        if observation.label.strip().lower()!=candidate.label.strip().lower() or not self._instance_pose_is_reliable(candidate):
             return 0.
         attrs=observation.attributes
         origin,direction,angle=(attrs.get(k) for k in ("ray_origin_map","ray_dir_map","ray_cone_half_angle_rad"))
@@ -295,6 +295,25 @@ class InstanceAssociationService:
         along=float(delta @ direction)
         lateral=float(np.linalg.norm(delta-along*direction))
         return 0.8 if along>0 and lateral<=along*math.tan(angle) else 0.
+
+    def _admit_observation_support(self,observation):
+        """少量点云支持只证明最近见过；完整三维检测及多视角三角化沿原准入规则。"""
+        attrs=observation.attributes
+        method=attrs.get("projection_method")
+        count=attrs.get("support_cluster_point_count")
+        if count is None and isinstance(attrs.get("support_cluster_summary"),dict):
+            count=attrs["support_cluster_summary"].get("point_count")
+        point_methods=("map_point_samples","camera_point_samples","depth_pose_fallback",
+            "pointcloud_bbox_projection","pointcloud_mask_projection")
+        if count is None and method in point_methods:
+            count=attrs.get("support_point_count")
+        sparse=attrs.get("support_insufficient") is True or (
+            method in point_methods and type(count) in (int,float)
+            and count<self._association_config.min_support_points)
+        if not sparse:
+            return observation
+        return replace(observation,attributes={**attrs,"projection_method":"current_pose_fallback",
+            "projection_degradation_reason":"support_cluster_sparse","support_insufficient":True})
 
     def _identity_anchors(self,observation,candidates,now,localization_session_id,geometry):
         tracked=tuple(candidate for candidate in candidates if self._same_track(observation,candidate,now,localization_session_id))
@@ -330,7 +349,8 @@ class InstanceAssociationService:
         extent=resolve_object_extent(observation) if not self._is_fallback_observation(observation) else None
         if extent is None or self._spatial_geometry(observation) is None:
             return None
-        attributes={"object_extent":extent,"projection_method":observation.attributes.get("projection_method")}
+        attributes={"object_extent":extent,"projection_method":observation.attributes.get("projection_method"),
+                    "measurement_sigma_m":self._record_sigma(observation)}
         support=record_support_evidence(observation,self._association_config)
         if support is not None and support.voxel_keys:
             attributes["support_voxels_map"]=support.model_dump(mode="json")
@@ -353,7 +373,7 @@ class InstanceAssociationService:
         resolved_now = now or utc_now()
         instances = {key:value for key,value in existing_instances.items()
                      if not self.tentative_expired(value, resolved_now)}
-        observations = list(projected_observations)
+        observations = [self._admit_observation_support(item) for item in projected_observations]
         outcomes = [None] * len(observations)
         groups = {}
         for index, item in enumerate(observations):
@@ -501,8 +521,11 @@ class InstanceAssociationService:
             # 新共现只接受本帧几何不重合的证明；旧伙伴保持保守语义。
             observed_ids={outcomes[index].instance.instance_id for index in indices if outcomes[index].instance is not None}
             for instance_id in observed_ids:
-                peers={other for other in observed_ids if other!=instance_id and cooccurrence_evidence(
-                    instances[instance_id],instances[other],self._association_config) is not None}
+                peers={}
+                for other in observed_ids-{instance_id}:
+                    proof=cooccurrence_sources(instances[instance_id],instances[other],self._association_config)
+                    if proof["sources"] or proof["legacy"] or proof["known"]:
+                        peers[other]=proof["sources"]
                 if peers:
                     instances[instance_id]=remember_coobserved_instances(instances[instance_id],peers)
             for index in indices:
@@ -631,16 +654,7 @@ class InstanceAssociationService:
             left = self._spatial_geometry(observation)
         if right is _UNRESOLVED_GEOMETRY:
             right = self._spatial_geometry(candidate)
-        if left is None or right is None:
-            return None
-        residuals = []
-        for axis in range(3):
-            delta = abs(left[0][axis] - right[0][axis])
-            gate = 0.5 * max(left[1][axis], right[1][axis]) + self._association_config.uncertainty_gate_sigma * math.hypot(left[2], right[2])
-            if delta > gate and not math.isclose(delta, gate, rel_tol=1e-12, abs_tol=0.0):
-                return None
-            residuals.append(delta / gate if gate > 0.0 else 0.0)
-        return 1.0 - max(residuals)
+        return measurement_geometry_fit(left,right,self._association_config.uncertainty_gate_sigma)
 
     @staticmethod
     def _conflicting_appearance(observation, candidate):

@@ -22,6 +22,7 @@ class SupportSelection:
     depth_spread_m: Optional[float] = None
     measurement_sigma_m: Optional[float] = None
     cluster_indices: Optional[np.ndarray] = None
+    sampling_sigma_m: Optional[float] = None
 
 
 def select_object_support(
@@ -32,6 +33,7 @@ def select_object_support(
     bbox_xyxy: Tuple[float, float, float, float],
     from_mask: bool,
     max_points: int,
+    focal_lengths_px: Optional[Tuple[float,float]] = None,
 ) -> SupportSelection:
     """从候选点中选择物体主体支持点。
 
@@ -61,9 +63,20 @@ def select_object_support(
     low,high = np.quantile(points,[0.05,0.95],axis=0)
     spread = float(high[2]-low[2])
     median_depth = float(np.median(points[:,2]))
-    robust_sigma = float(np.max((high-low)/3.29))
+    robust_sigma = float(np.max((high-low)/3.29)) if len(cluster)>=3 else 0.0
+    sampling_sigma=0.0
+    if focal_lengths_px is not None:
+        # 像素采样单元的均匀量化误差；少于3点时用检测内框跨度，不能由两点推离散度。
+        if len(cluster)<3:
+            span=np.array((bbox_xyxy[2]-bbox_xyxy[0],bbox_xyxy[3]-bbox_xyxy[1]))
+            spacing=np.maximum(1.,span*(1. if from_mask else .7)/np.sqrt(len(cluster)))
+        else:
+            span=np.ptp(projected_pixels[cluster],axis=0)
+            spacing=np.maximum(1.,span/max(1.,np.sqrt(len(cluster))-1.))
+        angular_step=float(np.max(spacing/np.asarray(focal_lengths_px)))
+        sampling_sigma=median_depth*angular_step/np.sqrt(12.)
     # 系统深度误差不随点数消失；只把簇离散的独立分量除以根号点数。
     sensor_floor = 0.005 + 0.002*median_depth**2
-    sigma = float(np.hypot(sensor_floor, robust_sigma/np.sqrt(len(cluster))))
+    sigma = float(np.sqrt(sensor_floor**2 + (robust_sigma/np.sqrt(len(cluster)))**2 + sampling_sigma**2))
     selected = cluster[np.linspace(0,len(cluster)-1,min(max_points,len(cluster)),dtype=np.int64)]
-    return SupportSelection(selected,"dominant_depth_cluster",count,len(cluster),spread,sigma,cluster)
+    return SupportSelection(selected,"dominant_depth_cluster",count,len(cluster),spread,sigma,cluster,sampling_sigma)

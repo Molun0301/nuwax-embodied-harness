@@ -58,6 +58,9 @@ def test_selection_matches_full_mask_oracle(count, polygon):
     planes=[indices[depths[indices]==depth] for depth in (1.,2.,3.,4.)]
     dominant=max(planes,key=lambda group:len(group))
     selected=dominant[np.linspace(0,len(dominant)-1,min(24,len(dominant)),dtype=np.int64)] if len(dominant) else dominant
+    if 0<len(dominant)<5:
+        selected=np.empty(0,dtype=np.int64)
+        status="support_cluster_sparse"
     result, support_count = augmentor._augment_single_detection(
         detection=detection, camera_info=camera(), projected_pixels=pixels,
         camera_points=points, map_points=maps, map_frame_id='map')
@@ -92,9 +95,9 @@ def test_multiple_detections_share_one_calibrated_projection():
     cam.distortion_coefficients = [.1, -.02, .001, .002, 0.]
     image = ImageFrame(camera_id='cam', frame_id='camera', width_px=640,
                        height_px=480, encoding='rgb8', data=b'x')
-    points = np.array([[0., 0., 2.], [.1, .2, 1.], [0., 0., 0.],
-                       [np.nan, 0., 1.], [0., 0., -.1]])
-    cloud = PointCloudFrame(frame_id='camera', point_count=5, points_xyz_array=points)
+    points = np.array([[(i-2)*.01,0.,2.] for i in range(6)]+[[.1,.2,1.],
+        [0.,0.,0.],[np.nan,0.,1.],[0.,0.,-.1]])
+    cloud = PointCloudFrame(frame_id='camera', point_count=len(points), points_xyz_array=points)
     detection = Detection2D(label='item', score=.9, camera_id='cam',
         bbox=BoundingBox2D(x_px=0, y_px=0, width_px=640, height_px=480),
         segmentation=SegmentationMask2D(polygon_px=((0, 0), (640, 0), (640, 480), (0, 480))))
@@ -102,9 +105,9 @@ def test_multiple_detections_share_one_calibrated_projection():
         result, metadata = augmentor.augment_detections((detection,) * 3,
             image_frame=image, camera_info=cam, point_cloud=cloud)
     assert project.call_count == 1
-    assert metadata['geometry_support_point_total'] == 3
+    assert metadata['geometry_support_point_total'] == 18
     for item in result:
-        assert item.attributes['geometry_support_point_count'] == 1
+        assert item.attributes['geometry_support_point_count'] == 6
         assert item.attributes['geometry_projection_status'] == 'mask_depth_support'
     result[0].attributes['support_points_3d']['points'][0]['x'] = 999.
     assert result[1].attributes['support_points_3d']['points'][0]['x'] != 999.

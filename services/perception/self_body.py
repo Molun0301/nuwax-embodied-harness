@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
 from datetime import datetime, timezone
 import json
 import logging
@@ -59,6 +60,9 @@ class SelfBodyRegion:
     polygons_px: Tuple[Polygon, ...]
     sources: Tuple[str, ...] = ()
     joint_age_sec: Optional[float] = None
+    ground_base_z_m: Optional[float] = None
+    ground_status: str = "ground_height_unavailable"
+    static_polygon_count: int = 0
 
     def to_metadata(self) -> Dict[str, object]:
         return {
@@ -68,6 +72,9 @@ class SelfBodyRegion:
             "height_px": int(self.height_px),
             "polygons_px": [[[round(float(u), 2), round(float(v), 2)] for u, v in polygon] for polygon in self.polygons_px],
             "sources": list(self.sources),
+            "ground_base_z_m": self.ground_base_z_m,
+            "ground_status": self.ground_status,
+            "static_polygon_count": self.static_polygon_count,
             "joint_age_sec": None if self.joint_age_sec is None else round(float(self.joint_age_sec), 4),
         }
 
@@ -89,6 +96,9 @@ class SelfBodyRegion:
                 polygons_px=polygons,
                 sources=tuple(str(item) for item in value.get("sources") or ()),
                 joint_age_sec=None if joint_age is None else float(joint_age),
+                ground_base_z_m=None if value.get("ground_base_z_m") is None else float(value["ground_base_z_m"]),
+                ground_status=str(value.get("ground_status") or "ground_height_unavailable"),
+                static_polygon_count=int(value.get("static_polygon_count",len(polygons) if value.get("sources")==["static"] else 0)),
             )
         except (KeyError, TypeError, ValueError, IndexError):
             return None
@@ -107,13 +117,58 @@ class SelfBodyRegion:
         return max(1, int(np.ceil(max(self.width_px, self.height_px) / 640.0)))
 
     @cached_property
-    def _mask(self):
+    def _link_mask(self):
         result = np.zeros((int(np.ceil(self.height_px/self._raster_scale)),
                            int(np.ceil(self.width_px/self._raster_scale))), dtype=np.uint8)
         # 分别填充再求并集，防止相交多边形被奇偶填充规则误挖空。
-        for polygon in self.polygons_px:
+        for polygon in self.polygons_px[self.static_polygon_count:]:
             _fill_polygon(result, polygon, self._raster_scale)
         return result
+
+    @cached_property
+    def _component_hulls(self):
+        # 连通性在膨胀后的像素并集上判断；先裁到画面，避免画外连接误包住环境。
+        contours,_ = cv2.findContours(self._link_mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+        return tuple(cv2.convexHull(contour).reshape(-1,2)*self._raster_scale
+                     for contour in contours if len(contour)>=3)
+
+    @cached_property
+    def _mask(self):
+        result=np.zeros_like(self._link_mask)
+        # 手工忽略区保留用户画出的轮廓；连杆部件才填指缝、参与外接框判定。
+        for polygon in self.polygons_px[:self.static_polygon_count]:
+            _fill_polygon(result,polygon,self._raster_scale)
+        for hull in self._component_hulls:
+            _fill_polygon(result,hull,self._raster_scale)
+        return result
+
+    @cached_property
+    def _candidate_boxes(self):
+        hulls=self._component_hulls
+        groups=[(i,) for i in range(len(hulls))]+list(combinations(range(len(hulls)),2))
+        if len(hulls)>2:
+            groups.append(tuple(range(len(hulls))))
+        boxes=[]
+        for group in groups:
+            points=np.concatenate([hulls[i] for i in group])
+            low=np.maximum(points.min(axis=0),0.)
+            high=np.minimum(points.max(axis=0)+self._raster_scale,(self.width_px,self.height_px))
+            boxes.append((low,high))
+        return tuple(boxes)
+
+    def bbox_iou_of_detection(self,detection):
+        """检测框与单部件、两部件及全部部件的画面内外接框的最大交并比。"""
+        b=detection.bbox
+        low=np.maximum((b.x_px,b.y_px),0.)
+        high=np.minimum((b.x_px+b.width_px,b.y_px+b.height_px),(self.width_px,self.height_px))
+        area=float(np.prod(np.maximum(high-low,0.)))
+        best=0.
+        for a,z in self._candidate_boxes:
+            intersection=float(np.prod(np.maximum(np.minimum(high,z)-np.maximum(low,a),0.)))
+            union=area+float(np.prod(z-a))-intersection
+            if union>0:
+                best=max(best,intersection/union)
+        return best
 
     def coverage_of_detection(self, detection: Detection2D) -> float:
         """检测掩码或框与区域并集的面积比；所有查询复用同一张有界栅格。"""
@@ -194,7 +249,11 @@ class KinematicSelfBodyFilter(SelfBodyFilter):
         dilation_px: float,
         max_joint_age_sec: float,
         static_regions: Mapping[str, Tuple[Polygon, ...]],
+        bbox_iou_threshold: float = 0.5,
+        static_ground_z_m: Optional[float] = None,
     ) -> None:
+        self._bbox_iou_threshold = float(bbox_iou_threshold)
+        self._static_ground_z_m = static_ground_z_m
         self._last_status = "not_evaluated"
         self._excluded_camera_links = ()
         self._model = model
@@ -220,12 +279,14 @@ class KinematicSelfBodyFilter(SelfBodyFilter):
         flagged = 0
         for detection in detections_2d:
             coverage = region.coverage_of_detection(detection)
-            self_body = bool(coverage >= self._coverage_threshold)
+            bbox_iou = region.bbox_iou_of_detection(detection)
+            self_body = bool(coverage >= self._coverage_threshold or bbox_iou >= self._bbox_iou_threshold)
             flagged += int(self_body)
             annotated.append(detection.model_copy(update={"attributes": {
                 **dict(detection.attributes or {}),
                 SELF_BODY_KEY: self_body,
                 SELF_BODY_COVERAGE_KEY: round(float(coverage), 4),
+                "self_body_bbox_iou": round(float(bbox_iou),4),
             }}, deep=False))
         metadata["self_body_detection_count"] = flagged
         return SelfBodyFilterResult(detections_2d=tuple(annotated), region=region, metadata=metadata)
@@ -246,76 +307,81 @@ class KinematicSelfBodyFilter(SelfBodyFilter):
         polygons = [tuple((x*width,y*height) for x,y in polygon)
                     for polygon in self._static_regions.get(image_frame.camera_id, ())]
         sources = ["static"] if polygons else []
+        static_count=len(polygons)
         age, status = None, "ok"
         excluded=[]
         self._excluded_camera_links=()
-        if self._model is None:
-            status = "model_unavailable:" + str(self._model_error)
-        elif not self._model.hulls:
-            status = "model_unavailable:collision_geometry_missing"
-        elif camera_info is None:
-            status = "camera_intrinsics_unavailable"
-        else:
-            status = DetectionGeometryAugmentor._camera_geometry_error(image_frame, camera_info) or "ok"
-            sample = self._joint_state_source() if status == "ok" else None
-            if status == "ok":
-                if sample is None:
-                    status = "joint_state_missing"
-                else:
-                    image_ts = image_frame.timestamp
-                    joint_ts = sample.timestamp
-                    image_ts = image_ts.replace(tzinfo=timezone.utc) if image_ts.tzinfo is None else image_ts
-                    joint_ts = joint_ts.replace(tzinfo=timezone.utc) if joint_ts.tzinfo is None else joint_ts
-                    age = abs((image_ts-joint_ts).total_seconds())
-                    if age > self._max_joint_age_sec:
-                        status = "joint_state_stale"
-            if status == "ok":
-                # 配置中的基准连杆对应平台机体语义坐标；URDF 名称不必叫 base_link。
-                extrinsic = resolve_frame_transform(frame_tree, source_frame_id="base", target_frame_id=camera_info.frame_id)
-                if extrinsic is None:
-                    status = "camera_extrinsic_unavailable"
-                else:
+        ground_z=self._static_ground_z_m
+        ground_status="static_robot_geometry" if ground_z is not None else "ground_height_unavailable"
+        transforms=None
+        joint_status="joint_state_missing"
+        if self._model is not None and self._model.hulls:
+            sample=self._joint_state_source()
+            if sample is not None:
+                image_ts=image_frame.timestamp
+                joint_ts=sample.timestamp
+                image_ts=image_ts.replace(tzinfo=timezone.utc) if image_ts.tzinfo is None else image_ts
+                joint_ts=joint_ts.replace(tzinfo=timezone.utc) if joint_ts.tzinfo is None else joint_ts
+                age=abs((image_ts-joint_ts).total_seconds())
+                joint_status="joint_state_stale" if age>self._max_joint_age_sec else "ok"
+                if joint_status=="ok":
                     try:
-                        transforms = self._model.link_transforms(sample.positions)
+                        transforms=self._model.link_transforms(sample.positions)
                     except RobotKinematicsError as exc:
-                        status = exc.code
+                        joint_status=exc.code
                     else:
-                        transform = extrinsic.matrix
-                        for hull in self._model.hulls:
-                            camera_from_link = transform @ transforms[hull.link_name]
-                            rotation,translation = camera_from_link[:3,:3],camera_from_link[:3,3]
-                            planes=hull.planes_local
-                            if planes is not None and len(planes):
-                                camera_origin_local = -rotation.T @ translation
-                                if np.all(planes[:,:3] @ camera_origin_local <= planes[:,3]+1e-9):
-                                    # 相机外壳凸包会封住光学孔；从内部投影不能作为整幅画面的自体证据。
-                                    excluded.append(hull.link_name)
-                                    continue
-                            camera = hull.points_local @ rotation.T + translation
-                            camera = _clip_near_plane(camera, 0.01)
-                            if len(camera) < 3:
+                        ground_z=min(float((h.points_local @ transforms[h.link_name][:3,:3].T
+                            + transforms[h.link_name][:3,3])[:,2].min()) for h in self._model.hulls)
+                        ground_status="kinematic_foot_minimum"
+            if transforms is None:
+                ground_status += ":"+joint_status
+        if self._model is None:
+            status="model_unavailable:"+str(self._model_error)
+        elif not self._model.hulls:
+            status="model_unavailable:collision_geometry_missing"
+        elif camera_info is None:
+            status="camera_intrinsics_unavailable"
+        else:
+            status=DetectionGeometryAugmentor._camera_geometry_error(image_frame,camera_info) or joint_status
+            if status=="ok":
+                extrinsic=resolve_frame_transform(frame_tree,source_frame_id="base",target_frame_id=camera_info.frame_id)
+                if extrinsic is None:
+                    status="camera_extrinsic_unavailable"
+                else:
+                    transform=extrinsic.matrix
+                    for body_hull in self._model.hulls:
+                        camera_from_link=transform @ transforms[body_hull.link_name]
+                        rotation,translation=camera_from_link[:3,:3],camera_from_link[:3,3]
+                        planes=body_hull.planes_local
+                        if planes is not None and len(planes):
+                            camera_origin_local=-rotation.T @ translation
+                            if np.all(planes[:,:3] @ camera_origin_local <= planes[:,3]+1e-9):
+                                excluded.append(body_hull.link_name)
                                 continue
-                            pixels = DetectionGeometryAugmentor._project_camera_points(camera, camera_info)
-                            pixels = pixels[np.isfinite(pixels).all(axis=1)]
-                            if len(pixels) < 3:
-                                continue
-                            hull = cv2.convexHull(pixels.astype(np.float32)).reshape(-1,2)
-                            if self._dilation_px > 0:
-                                angles = np.arange(8)*np.pi/4
-                                offsets = np.column_stack((np.cos(angles),np.sin(angles))) * self._dilation_px/np.cos(np.pi/8)
-                                hull = cv2.convexHull((hull[:,None,:]+offsets).reshape(-1,2).astype(np.float32)).reshape(-1,2)
-                            if hull[:,0].max() < 0 or hull[:,1].max() < 0 or hull[:,0].min() > width or hull[:,1].min() > height:
-                                continue
-                            polygons.append(tuple((float(x),float(y)) for x,y in hull))
-                        sources.append("kinematics")
-                        self._excluded_camera_links=tuple(excluded)
+                        camera=_clip_near_plane(body_hull.points_local @ rotation.T + translation,0.01)
+                        if len(camera)<3:
+                            continue
+                        pixels=DetectionGeometryAugmentor._project_camera_points(camera,camera_info)
+                        pixels=pixels[np.isfinite(pixels).all(axis=1)]
+                        if len(pixels)<3:
+                            continue
+                        hull=cv2.convexHull(pixels.astype(np.float32)).reshape(-1,2)
+                        if self._dilation_px>0:
+                            angles=np.arange(8)*np.pi/4
+                            offsets=np.column_stack((np.cos(angles),np.sin(angles)))*self._dilation_px/np.cos(np.pi/8)
+                            hull=cv2.convexHull((hull[:,None,:]+offsets).reshape(-1,2).astype(np.float32)).reshape(-1,2)
+                        if hull[:,0].max()<0 or hull[:,1].max()<0 or hull[:,0].min()>width or hull[:,1].min()>height:
+                            continue
+                        polygons.append(tuple((float(x),float(y)) for x,y in hull))
+                    sources.append("kinematics")
+                    self._excluded_camera_links=tuple(excluded)
         if status != "ok" and polygons:
             status = "static_only:" + status
         self._last_status = status
-        if not sources:
+        if not sources and ground_z is None:
             return None, status
         return SelfBodyRegion(image_frame.camera_id, image_frame.frame_id, width, height,
-                              tuple(polygons), tuple(sources), age), status
+                              tuple(polygons), tuple(sources), age,ground_z,ground_status,static_count), status
 
     def status(self) -> Dict[str, object]:
         return {
@@ -326,6 +392,7 @@ class KinematicSelfBodyFilter(SelfBodyFilter):
             "model_error": self._model_error,
             "static_region_cameras": sorted(self._static_regions),
             "coverage_threshold": self._coverage_threshold,
+            "bbox_iou_threshold": self._bbox_iou_threshold,
             "dilation_px": self._dilation_px,
             "max_joint_age_sec": self._max_joint_age_sec,
         }
@@ -454,8 +521,8 @@ def build_self_body_filter(
         except RobotKinematicsError as exc:
             model_error = exc.code
             LOGGER.warning("自体过滤无法加载机器人模型 %s：%s", path, exc)
-    if model is None and not static_regions:
-        return DisabledSelfBodyFilter("model_unavailable:" + str(model_error))
+    from core.robot_geometry import resolve_robot_geometry
+    static_ground=resolve_robot_geometry(robot_geometry,robot_name="",base_dir=base_dir).z_min_m
     return KinematicSelfBodyFilter(
         model=model,
         model_error=model_error,
@@ -464,6 +531,8 @@ def build_self_body_filter(
         dilation_px=config.dilation_px,
         max_joint_age_sec=config.max_joint_age_sec,
         static_regions=static_regions,
+        bbox_iou_threshold=config.bbox_iou_threshold,
+        static_ground_z_m=static_ground,
     )
 
 

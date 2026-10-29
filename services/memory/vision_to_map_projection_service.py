@@ -305,6 +305,14 @@ class VisionToMapProjectionService:
             base_attributes["ray_origin_map"] = list(current_ray.origin)
             base_attributes["ray_dir_map"] = list(current_ray.direction)
             base_attributes["ray_cone_half_angle_rad"] = float(current_ray.half_angle_rad)
+        if base_attributes.get("support_insufficient") is True:
+            reason=("support_cluster_sparse" if (base_attributes.get("support_cluster_point_count") or 0)>0
+                    else "current_pose_fallback_no_geometry")
+            return current_pose,self._merge_projection_attributes(base_attributes,
+                projection_method="current_pose_fallback",projection_confidence=0.0,
+                support_point_count=0,map_projection_coverage=0.0,
+                projection_degradation_reason=reason,navigable=False,
+                non_navigable_reason=reason)
         explicit_pose = self._pose_from_attributes(base_attributes, map_frame=map_frame)
         if explicit_pose is not None:
             projected_pose = self._resolve_pose_to_map(

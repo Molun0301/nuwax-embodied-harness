@@ -29,11 +29,15 @@ class DetectionGeometryAugmentor:
         min_depth_m: float = 0.05,
         support_voxel_size_m: float = 0.03,
         support_max_voxels: int = 1024,
+        min_support_points: int = 5,
+        ground_tolerance_m: float = 0.04,
     ) -> None:
         self._max_points_per_detection = max(1, int(max_points_per_detection))
         self._min_depth_m = max(0.001, float(min_depth_m))
         self._support_voxel_size_m = support_voxel_size_m
         self._support_max_voxels = support_max_voxels
+        self._min_support_points = min_support_points
+        self._ground_tolerance_m = ground_tolerance_m
 
     def augment_detections(
         self,
@@ -93,6 +97,23 @@ class DetectionGeometryAugmentor:
             metadata["geometry_self_body_point_count"] = int(keep.size - np.count_nonzero(keep))
             projected_pixels, camera_points = projected_pixels[keep], camera_points[keep]
             map_points = map_points[keep] if map_points is not None else None
+        ground_status="ground_height_unavailable"
+        ground_map_z=None
+        if self_region is not None and self_region.camera_id==image_frame.camera_id:
+            ground_status=self_region.ground_status
+            if self_region.ground_base_z_m is not None:
+                if current_pose is not None and map_points is not None:
+                    # 机器人直立且局部地面水平；基准连杆脚底高度加捕获的机体地图高度。
+                    ground_map_z=float(current_pose.position.z)+self_region.ground_base_z_m
+                else:
+                    ground_status="ground_map_pose_unavailable"
+        ground_meta={"ground_filter_status":ground_status,"ground_z_map_m":ground_map_z,
+            "ground_filter_tolerance_m":self._ground_tolerance_m,"ground_removed_point_count":0}
+        if ground_map_z is not None:
+            keep=np.abs(map_points[:,2]-ground_map_z)>self._ground_tolerance_m
+            ground_meta["ground_removed_point_count"]=int(keep.size-np.count_nonzero(keep))
+            projected_pixels,camera_points,map_points=projected_pixels[keep],camera_points[keep],map_points[keep]
+        metadata.update(ground_meta)
         augmented = []
         augmented_count = 0
         support_point_total = 0
@@ -105,7 +126,7 @@ class DetectionGeometryAugmentor:
                 augmented.append(detection)
                 continue
             updated_detection, support_count = self._augment_single_detection(
-                detection=detection,
+                detection=detection.model_copy(update={"attributes":{**detection.attributes,**ground_meta}},deep=False),
                 camera_info=camera_info,
                 projected_pixels=projected_pixels,
                 camera_points=camera_points,
@@ -411,6 +432,11 @@ class DetectionGeometryAugmentor:
             projection_status = "segmentation_absent_no_depth_support"
 
         attributes = dict(detection.attributes or {})
+        # 本次主体选择拥有几何输出；不能让过滤前的旧点、深度或范围绕过地面/稀疏拒绝。
+        for key in (*self._MAP_POINT_KEYS,*self._CAMERA_POINT_KEYS,"support_voxels_map",
+                    "support_cluster_summary","object_extent","bbox_3d_map","depth_m"):
+            attributes.pop(key,None)
+        attributes["support_insufficient"]=False
         attributes["geometry_bbox_support_point_count"] = bbox_support_count
         attributes["geometry_projection_method"] = projection_method
         attributes["geometry_projection_status"] = projection_status
@@ -420,6 +446,8 @@ class DetectionGeometryAugmentor:
                 self._max_points_per_detection,
             )
         if support_indices.size == 0:
+            attributes["support_insufficient"]=True
+            attributes["support_cluster_point_count"]=0
             attributes["geometry_support_point_count"] = 0
             attributes["support_point_count"] = 0
             attributes["depth_coverage"] = 0.0
@@ -437,11 +465,18 @@ class DetectionGeometryAugmentor:
             bbox_xyxy=(x_min, y_min, x_max, y_max),
             from_mask=projection_status == "mask_depth_support",
             max_points=self._max_points_per_detection,
+            focal_lengths_px=(camera_info.fx,camera_info.fy),
         )
         selected_indices = selection.indices
         attributes["support_selection_method"] = selection.method
         attributes["support_candidate_point_count"] = selection.candidate_point_count
         attributes["support_cluster_point_count"] = selection.cluster_point_count
+        attributes["support_sampling_sigma_m"] = selection.sampling_sigma_m
+        attributes["support_min_points"] = self._min_support_points
+        sparse=selection.cluster_point_count<self._min_support_points
+        attributes["support_insufficient"]=sparse
+        if sparse:
+            selected_indices=np.empty(0,dtype=np.int64)
         if selection.depth_spread_m is not None:
             attributes["support_depth_spread_m"] = round(float(selection.depth_spread_m), 6)
         if selection.measurement_sigma_m is not None:
@@ -450,8 +485,8 @@ class DetectionGeometryAugmentor:
             # 主体选择可能排除全部候选（例如全部是背景/地面），按无深度支持处理。
             attributes["geometry_support_point_count"] = 0
             attributes["support_point_count"] = 0
-            attributes["projection_degradation_reason"] = "support_cluster_empty"
-            attributes["geometry_projection_status"] = "support_cluster_empty"
+            attributes["projection_degradation_reason"] = "support_cluster_sparse" if sparse and selection.cluster_point_count else "support_cluster_empty"
+            attributes["geometry_projection_status"] = attributes["projection_degradation_reason"]
             attributes["depth_coverage"] = 0.0
             attributes["map_projection_coverage"] = 0.0
             attributes["coverage"] = 0.0

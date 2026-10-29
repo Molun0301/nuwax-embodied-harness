@@ -469,6 +469,8 @@ class PerceptionSelfFilterConfig:
 
     enabled: bool = True
     coverage_threshold: float = 0.5
+    bbox_iou_threshold: float = 0.5
+    ground_tolerance_m: float = 0.04
     dilation_px: float = 6.0
     max_joint_age_sec: float = 0.5
     static_regions_json: str = ""
@@ -482,6 +484,7 @@ class MemoryInstanceAssociationConfig:
     confirmation_min_observations: int = 3
     support_voxel_size_m: float = 0.03
     support_max_voxels: int = 1024
+    min_support_points: int = 5
     uncertainty_gate_sigma: float = 3.0
     cross_label_min_overlap: float = 0.5
     cross_label_max_size_ratio: float = 3.0
@@ -881,6 +884,8 @@ def load_config() -> NuwaxRobotBridgeConfig:
         self_filter=PerceptionSelfFilterConfig(
             enabled=_cfg_bool("NUWAX_PERCEPTION_SELF_FILTER_ENABLED", True),
             coverage_threshold=max(0.05, min(1.0, _cfg_float("NUWAX_PERCEPTION_SELF_FILTER_COVERAGE", 0.5))),
+            bbox_iou_threshold=max(0.0,min(1.0,_cfg_float("NUWAX_PERCEPTION_SELF_FILTER_BBOX_IOU",0.5))),
+            ground_tolerance_m=max(0.0,_cfg_float("NUWAX_PERCEPTION_GROUND_TOLERANCE_M",0.04)),
             dilation_px=max(0.0, _cfg_float("NUWAX_PERCEPTION_SELF_FILTER_DILATION_PX", 6.0)),
             max_joint_age_sec=max(0.01, _cfg_float("NUWAX_PERCEPTION_SELF_FILTER_MAX_JOINT_AGE_SEC", 0.5)),
             static_regions_json=_cfg_str("NUWAX_PERCEPTION_SELF_FILTER_STATIC_REGIONS_JSON", ""),
@@ -890,6 +895,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             confirmation_min_observations=max(1, _cfg_int("NUWAX_MEMORY_ASSOCIATION_CONFIRM_MIN_OBSERVATIONS", 3)),
             support_voxel_size_m=max(0.005, _cfg_float("NUWAX_MEMORY_ASSOCIATION_VOXEL_SIZE_M", 0.03)),
             support_max_voxels=max(16, _cfg_int("NUWAX_MEMORY_ASSOCIATION_MAX_VOXELS", 1024)),
+            min_support_points=max(1,_cfg_int("NUWAX_PERCEPTION_SUPPORT_MIN_POINTS",5)),
             uncertainty_gate_sigma=max(0.5, _cfg_float("NUWAX_MEMORY_ASSOCIATION_GATE_SIGMA", 3.0)),
             cross_label_min_overlap=max(0.0, min(1.0, _cfg_float("NUWAX_MEMORY_ASSOCIATION_CROSS_LABEL_OVERLAP", 0.5))),
             cross_label_max_size_ratio=max(1.0, _cfg_float("NUWAX_MEMORY_ASSOCIATION_CROSS_LABEL_SIZE_RATIO", 3.0)),

@@ -2702,7 +2702,7 @@
     "description": "按机器人模型和与图像同时的关节状态计算自体区域，覆盖达到比例的检测只在叠加层灰显；模型、关节或外参缺失会报告原因。"
   },
   "NUWAX_PERCEPTION_SELF_FILTER_COVERAGE": {
-    "zh_name": "自体区域覆盖判定比例",
+    "zh_name": "自体部件凸包覆盖判定比例",
     "type": "float",
     "default": 0.5,
     "section_id": "perception_detect",
@@ -2712,7 +2712,7 @@
       "services/perception/self_body.py"
     ],
     "apply_scope": "重启网关后生效",
-    "description": "检测掩码（没有掩码时用框）与自体区域并集的面积比达到此值时标为机器人自身，范围大于0且不超过1。"
+    "description": "检测掩码（没有掩码时用框）被膨胀后连通部件凸包并集覆盖的比例；与部件外接框交并比任一达到阈值即判自体。"
   },
   "NUWAX_PERCEPTION_SELF_FILTER_DILATION_PX": {
     "zh_name": "自体区域膨胀（像素）",
@@ -2856,5 +2856,45 @@
     ],
     "apply_scope": "重启网关后生效",
     "description": "激活记忆库后检查已加载实例并合并重复；保留最早确认实例标识和历史别名，原观察事件保留。"
+  },
+  "NUWAX_PERCEPTION_SELF_FILTER_BBOX_IOU": {
+    "zh_name": "自体部件集合外接框交并比",
+    "type": "float",
+    "default": 0.5,
+    "section_id": "perception_detect",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/perception/self_body.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "单部件、任意两部件、全部部件的画面内外接框与检测框的最大交并比；与凸包覆盖任一达到阈值即判自体。"
+  },
+  "NUWAX_PERCEPTION_GROUND_TOLERANCE_M": {
+    "zh_name": "物体支持地面剔除容差（米）",
+    "type": "float",
+    "default": 0.04,
+    "section_id": "perception_detect",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/perception/geometry.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "直立机器人、局部水平地面假设下，剔除与模型估计地面高度差不超过该值的支持点；更薄的贴地物品可能无法记忆。"
+  },
+  "NUWAX_PERCEPTION_SUPPORT_MIN_POINTS": {
+    "zh_name": "物体主体最少支持点数",
+    "type": "int",
+    "default": 5,
+    "section_id": "perception_detect",
+    "target_file": "core_env",
+    "consumers": [
+      "core/settings.py",
+      "services/perception/geometry.py",
+      "services/memory/instance_association_service.py"
+    ],
+    "apply_scope": "重启网关后生效",
+    "description": "主体簇点数不足时不新建实例、不更新物体位置或尺寸；仅按回退观察规则更新最近观察。完整三维检测尺寸与三角化不按点云簇点数拒绝。"
   }
 }

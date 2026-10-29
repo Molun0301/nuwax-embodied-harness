@@ -1009,7 +1009,9 @@ class GatewayRuntime:
         self.perception_service = PerceptionService(
             geometry_augmentor=DetectionGeometryAugmentor(
                 support_voxel_size_m=config.perception.instance_association.support_voxel_size_m,
-                support_max_voxels=config.perception.instance_association.support_max_voxels),
+                support_max_voxels=config.perception.instance_association.support_max_voxels,
+                min_support_points=config.perception.instance_association.min_support_points,
+                ground_tolerance_m=config.perception.self_filter.ground_tolerance_m),
             self_body_filter=self_body_filter,
             spatial_context_provider=lambda: self.memory_service.capture_observation_spatial_context(),
             provider_owner=robot,

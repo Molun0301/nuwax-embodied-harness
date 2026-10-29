@@ -135,7 +135,7 @@ def record_support_evidence(record,config):
         voxel_size_m=config.support_voxel_size_m,max_voxels=config.support_max_voxels)
 
 
-# 只保留有界伙伴标识，不累计每帧历史；满额后保守禁止继续跨标签扩张。
+# 伙伴及独立来源有界；容量饱和只作诊断，不能代替两源分离证明。
 COOBSERVED_INSTANCE_IDS = "coobserved_instance_ids"
 COOBSERVATION_SATURATED = "coobservation_saturated"
 MAX_COOBSERVED_INSTANCES = 256
@@ -173,28 +173,56 @@ def observation_source_index(records):
     return result
 
 
+COOBSERVATION_SOURCES = "coobservation_sources"
+
+
+def measurement_geometry_fit(left,right,gate_sigma):
+    """关联与共现共用逐轴门限和浮点边界；返回匹配评分，明确分开时为None。"""
+    if left is None or right is None:
+        return None
+    residuals=[]
+    for axis in range(3):
+        delta=abs(left[0][axis]-right[0][axis])
+        gate=.5*max(left[1][axis],right[1][axis])+gate_sigma*math.hypot(left[2],right[2])
+        if delta>gate and not math.isclose(delta,gate,rel_tol=1e-12,abs_tol=0.):
+            return None
+        residuals.append(delta/gate if gate>0. else 0.)
+    return 1.-max(residuals)
+
+
 def historical_coobserved_ids(record,source_index,config=None):
-    peers=set()
-    for source in observation_window_sources(record):
-        peers.update(key for key,other in source_index.get(source,{}).items()
-                     if cooccurrence_evidence(record,other,config) is not None)
-    return peers-instance_identity_ids(record)
+    """窗口滚动前迁移已出现的分离来源；一次证据也保留，但不足以否决。"""
+    others={key:other for source in observation_window_sources(record)
+            for key,other in source_index.get(source,{}).items() if key not in instance_identity_ids(record)}
+    result={}
+    for key,other in others.items():
+        proof=cooccurrence_sources(record,other,config)
+        if proof["sources"] or proof["legacy"] or proof["known"]:
+            result[key]=proof["sources"]
+    return result
 
 
-def cooccurrence_evidence(left,right,config=None):
-    """不同实例的共现证明；伙伴标识不老化，饱和后不遗忘已知否决。"""
+def cooccurrence_sources(left,right,config=None):
+    """不同身份在独立源中的明确分离证据；旧无来源伙伴仅作一次弱证据。"""
     left_ids,right_ids=instance_identity_ids(left),instance_identity_ids(right)
-    if left_ids & right_ids:
-        return None
-    lm,rm=(getattr(left,"metadata",None) or {}),(getattr(right,"metadata",None) or {})
-    if not left_ids or not right_ids:
-        if lm.get(COOBSERVATION_SATURATED) or rm.get(COOBSERVATION_SATURATED):
-            return {"reason":"coobservation_capacity_exhausted","limit":MAX_COOBSERVED_INSTANCES}
-        return None
-    peers=(set(lm.get(COOBSERVED_INSTANCE_IDS) or ()) & right_ids
-           | set(rm.get(COOBSERVED_INSTANCE_IDS) or ()) & left_ids)
-    if peers:
-        return {"reason":"coobserved_instances","matched_instance_ids":sorted(peers)}
+    result={"sources":[],"legacy":False,"known":False}
+    if not left_ids or not right_ids or left_ids & right_ids:
+        return result
+    sources=set()
+    for record,ids in ((left,right_ids),(right,left_ids)):
+        metadata=record.metadata
+        stored=metadata.get(COOBSERVATION_SOURCES) or {}
+        for peer in ids:
+            values=stored.get(peer) or ()
+            sources.update(values)
+            if peer in (metadata.get(COOBSERVED_INSTANCE_IDS) or ()):
+                result["known"]=True
+                if peer not in stored:
+                    result["legacy"]=True
+    if config is None:
+        from core.settings import MemoryInstanceAssociationConfig
+        config=MemoryInstanceAssociationConfig()
+    from services.memory.instance_association_service import InstanceAssociationService
     for source,camera in sorted(observation_window_sources(left) & observation_window_sources(right)):
         def sample(record):
             return next(item for item in reversed(record.observation_window)
@@ -202,54 +230,105 @@ def cooccurrence_evidence(left,right,config=None):
                 and (item.metadata.get("camera_id") or "")==camera)
         a,b=sample(left),sample(right)
         if "frame_geometry" not in a.metadata or "frame_geometry" not in b.metadata:
-            # 旧窗口没有当时的几何，不能用后来累积的尺寸反推它是重复框。
-            return {"reason":"coobserved_observation_window","source_observation_id":source,"camera_id":camera}
-        if config is None:
-            from core.settings import MemoryInstanceAssociationConfig
-            config=MemoryInstanceAssociationConfig()
+            result["legacy"]=True
+            continue
+        separated=False
+        evaluated=False
         for ga in a.metadata["frame_geometry"] or ():
             for gb in b.metadata["frame_geometry"] or ():
                 if ga is None or gb is None:
                     continue
-                details=geometry_overlap_diagnostics(
-                    SimpleNamespace(pose=Pose.model_validate(ga["pose"]),attributes=ga["attributes"]),
-                    SimpleNamespace(pose=Pose.model_validate(gb["pose"]),attributes=gb["attributes"]),config)
-                if details["reason"] in ("cross_label_size_ratio","cross_label_containment"):
-                    return {"reason":"coobserved_observation_window","source_observation_id":source,
-                            "camera_id":camera,"geometry":details}
-    if lm.get(COOBSERVATION_SATURATED) or rm.get(COOBSERVATION_SATURATED):
-        return {"reason":"coobservation_capacity_exhausted","limit":MAX_COOBSERVED_INSTANCES}
+                ra=SimpleNamespace(pose=Pose.model_validate(ga["pose"]),attributes=ga["attributes"],metadata=ga["attributes"])
+                rb=SimpleNamespace(pose=Pose.model_validate(gb["pose"]),attributes=gb["attributes"],metadata=gb["attributes"])
+                ag,bg=InstanceAssociationService._spatial_geometry(ra),InstanceAssociationService._spatial_geometry(rb)
+                if ag is None or bg is None or not frame_ids_semantically_equal(ra.pose.frame_id,rb.pose.frame_id):
+                    continue
+                evaluated=True
+                if measurement_geometry_fit(ag,bg,config.uncertainty_gate_sigma) is None:
+                    separated=True
+        if separated:
+            sources.add(source)
+        elif evaluated:
+            # 同源精化可撤销该源的分离票，不将一次错误主体估计永久留在账上。
+            sources.discard(source)
+    result["sources"]=sorted(sources)[:2]
+    return result
+
+
+def cooccurrence_evidence(left,right,config=None):
+    """至少两个可识别的独立源都明确分离才否决；旧来源未知不能证明独立。"""
+    proof=cooccurrence_sources(left,right,config)
+    if len(proof["sources"])>=2:
+        return {"reason":"coobserved_instances","source_observation_ids":proof["sources"],
+                "independent_source_count":len(proof["sources"])}
     return None
 
 
-def remember_coobserved_instances(instance,peer_ids):
-    """当前帧一对一分配形成的不同身份写入原元数据。"""
-    peers=set(instance.metadata.get(COOBSERVED_INSTANCE_IDS) or ())
-    peers.update(peer_ids)
-    peers.difference_update(instance_identity_ids(instance))
-    saturated=bool(instance.metadata.get(COOBSERVATION_SATURATED)) or len(peers)>MAX_COOBSERVED_INSTANCES
-    metadata={**instance.metadata,COOBSERVED_INSTANCE_IDS:sorted(peers)[:MAX_COOBSERVED_INSTANCES]}
+def same_frame_distinct_same_label(left,right,config):
+    """保留最新同帧同标签的一对一分配；不产生永久或历史共现否决。"""
+    if instance_identity_ids(left) & instance_identity_ids(right):
+        return False
+    lm,rm=left.metadata,right.metadata
+    source=lm.get("last_source_observation_id")
+    camera=lm.get("last_camera_id") or ""
+    label=lm.get("last_observation_label")
+    if not source or source!=rm.get("last_source_observation_id") or camera!=(rm.get("last_camera_id") or ""):
+        return False
+    if not label or label!=rm.get("last_observation_label"):
+        return False
+    def geometries(record):
+        return next((sample.metadata.get("frame_geometry") or () for sample in reversed(record.observation_window)
+            if sample.metadata.get("source_observation_id")==source
+            and (sample.metadata.get("camera_id") or "")==camera),())
+    for ga in geometries(left):
+        for gb in geometries(right):
+            if ga is None or gb is None:
+                continue
+            details=geometry_overlap_diagnostics(
+                SimpleNamespace(pose=Pose.model_validate(ga["pose"]),attributes=ga["attributes"]),
+                SimpleNamespace(pose=Pose.model_validate(gb["pose"]),attributes=gb["attributes"]),config)
+            if details["reason"] in ("cross_label_size_ratio","cross_label_containment"):
+                return True
+    return False
+
+
+def _bounded_cooccurrence_metadata(peers,sources,saturated=False):
+    # 优先保留两源证明；溢出只作诊断，不凭容量饱和制造未知身份的否决。
+    keys=sorted(peers,key=lambda key:(-len(sources.get(key) or ()),key))
+    saturated=saturated or len(keys)>MAX_COOBSERVED_INSTANCES
+    keys=keys[:MAX_COOBSERVED_INSTANCES]
+    result={COOBSERVED_INSTANCE_IDS:keys,COOBSERVATION_SOURCES:{key:sorted(set(sources[key]))[:2]
+            for key in keys if key in sources}}
     if saturated:
-        metadata[COOBSERVATION_SATURATED]=True
+        result[COOBSERVATION_SATURATED]=True
+    return result
+
+
+def remember_coobserved_instances(instance,peer_ids):
+    """复用元数据，按伙伴保存至多两个真实源标识；纯旧ID输入视为弱证据。"""
+    peers=set(instance.metadata.get(COOBSERVED_INSTANCE_IDS) or ())
+    sources={key:set(values) for key,values in (instance.metadata.get(COOBSERVATION_SOURCES) or {}).items()}
+    peers.update(peer_ids)
+    if isinstance(peer_ids,Mapping):
+        for key,values in peer_ids.items():
+            sources[key]=set(values)
+    peers.difference_update(instance_identity_ids(instance))
+    metadata={**instance.metadata,**_bounded_cooccurrence_metadata(peers,sources,
+              bool(instance.metadata.get(COOBSERVATION_SATURATED)))}
     return instance.model_copy(update={"metadata":metadata})
 
 
 def merge_cooccurrence_metadata(records):
-    """并入旧伙伴及饱和状态；伙伴仍可通过保留实例的历史别名解析。"""
-    records=tuple(records)
-    peers=set()
-    own_ids=set()
-    saturated=False
+    """并集保留真实独立来源和旧弱伙伴，旧伙伴ID仍可通过实例别名匹配。"""
+    peers=set();sources={};own_ids=set();saturated=False
     for record in records:
         peers.update(record.metadata.get(COOBSERVED_INSTANCE_IDS) or ())
+        for key,values in (record.metadata.get(COOBSERVATION_SOURCES) or {}).items():
+            sources.setdefault(key,set()).update(values)
         own_ids.update(instance_identity_ids(record))
         saturated=saturated or bool(record.metadata.get(COOBSERVATION_SATURATED))
     peers.difference_update(own_ids)
-    saturated=saturated or len(peers)>MAX_COOBSERVED_INSTANCES
-    result={COOBSERVED_INSTANCE_IDS:sorted(peers)[:MAX_COOBSERVED_INSTANCES]}
-    if saturated:
-        result[COOBSERVATION_SATURATED]=True
-    return result
+    return _bounded_cooccurrence_metadata(peers,sources,saturated)
 
 
 def cross_label_geometry_diagnostics(left,right,config):

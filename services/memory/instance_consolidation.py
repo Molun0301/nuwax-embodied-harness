@@ -14,7 +14,7 @@ from contracts.frame_semantics import frame_ids_semantically_equal
 from services.memory.instance_evidence import (accumulate_support_voxels, support_extent, fuse_position,
     primary_label, cross_label_geometry_compatible, record_support_evidence,
     cooccurrence_evidence, merge_cooccurrence_metadata, remember_coobserved_instances,
-    observation_source_index, historical_coobserved_ids)
+    observation_source_index, historical_coobserved_ids, same_frame_distinct_same_label)
 from services.memory.object_extent import resolve_object_extent
 from services.memory.spatial_candidate_index import SpatialCandidateIndex
 import math
@@ -65,6 +65,8 @@ class InstanceConsolidator:
             if aa and bb and aa!=bb:
                 return False
             if a.confirmation_state==b.confirmation_state==InstanceConfirmationState.TENTATIVE:
+                return False
+            if same_frame_distinct_same_label(a,b,self._config):
                 return False
             if cooccurrence_evidence(a,b,self._config) is not None:
                 return False

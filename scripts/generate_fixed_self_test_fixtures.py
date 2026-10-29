@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """用生产解析器生成跨语言资格夹具；仅包含模型数学坐标，不声明实机标定。"""
 import importlib.util
+from importlib.machinery import ModuleSpec
 import json
 from pathlib import Path
 import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
+# 本夹具只加载真实模型数学模块，沿用原入口不启动运行时核心的隔离范围。
+# 给新增的跨模块导入提供真实源码包路径，不替换任何生产解析函数。
+core_spec = ModuleSpec("core", loader=None, is_package=True)
+core_package = importlib.util.module_from_spec(core_spec)
+core_package.__path__ = [str(ROOT / "core")]
+sys.modules["core"] = core_package
 spec = importlib.util.spec_from_file_location("fixed_self_fixture_geometry", ROOT / "core/robot_geometry.py")
 geometry = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = geometry

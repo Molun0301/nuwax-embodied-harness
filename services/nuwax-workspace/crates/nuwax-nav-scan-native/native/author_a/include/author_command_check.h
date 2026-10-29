@@ -11,6 +11,7 @@ struct CheckedCommand {
   Eigen::Vector2d linear = Eigen::Vector2d::Zero();
   double angular = 0.;
   bool found = false, limited = false, hold_translation = false, exhausted = false;
+  bool hard_limited = false;
 };
 
 namespace command_check_detail {
@@ -70,17 +71,28 @@ inline bool sweepFree(GridMap& map,const State& start,const Eigen::Vector2d& mea
       &&sweepFree(map,start,mean,angular,radius,mid,end,deadline,exhausted,initial,depth+1);
 }
 
+// 命令盒是硬约束：即使实测状态超限，发送请求也必须在盒内。
+// 投影不修改actual；真实响应仍由advance按原加减速预测。它本身不暂停曲线。
+inline CheckedCommand commandBox(const Eigen::Vector2d& requested, double angular, const ScanConfig& c) {
+  CheckedCommand result;
+  result.linear={std::clamp(requested.x(),-c.max_reverse_velocity,c.max_velocity),
+      std::clamp(requested.y(),-c.max_lateral_velocity,c.max_lateral_velocity)};
+  result.angular=std::clamp(angular,-c.max_yaw_rate,c.max_yaw_rate);
+  result.found=true;
+  result.hard_limited=(result.linear.array()!=requested.array()).any()||result.angular!=angular;
+  return result;
+}
+
 inline CheckedCommand bounded(const Eigen::Vector2d& requested, double angular,
     const State& actual, const ScanConfig& c, bool stop) {
   Eigen::Vector2d target(std::clamp(requested.x(), -c.max_reverse_velocity, c.max_velocity),
       std::clamp(requested.y(), -c.max_lateral_velocity, c.max_lateral_velocity));
   auto linear = toward(actual.linear, target, c.max_acceleration * c.sample_dt);
-  linear.x() = std::clamp(linear.x(), -c.max_reverse_velocity, c.max_velocity);
-  linear.y() = std::clamp(linear.y(), -c.max_lateral_velocity, c.max_lateral_velocity);
   angular = std::clamp(angular, actual.angular - c.max_yaw_acceleration * c.sample_dt,
       actual.angular + c.max_yaw_acceleration * c.sample_dt);
-  angular = std::clamp(angular, -c.max_yaw_rate, c.max_yaw_rate);
-  return {linear, angular, true, true, stop, false};
+  auto result=commandBox(linear,angular,c);
+  result.limited=true;result.hold_translation=stop;
+  return result;
 }
 
 inline bool advance(GridMap& map, State& actual, const Eigen::Vector2d& target,
@@ -119,7 +131,7 @@ inline CheckedCommand checkAuthorCommand(GridMap& map, const ScanConfig& c,
       c.body_width / 2. + std::abs(c.body_center_y));
   bool exhausted = false;
   State stopped = actual;
-  CheckedCommand original{preferred, preferred_angular, true, false, false, false};
+  auto original=commandBox(preferred,preferred_angular,c);
   if (collisionFree(map, actual, original, c, radius, deadline, exhausted, stopped)) return original;
   CheckedCommand best;
   if (exhausted) { best.exhausted = true; return best; }

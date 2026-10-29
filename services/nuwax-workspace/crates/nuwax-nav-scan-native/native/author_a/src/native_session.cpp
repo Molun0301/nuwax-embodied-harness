@@ -226,8 +226,10 @@ extern "C" int nuwax_scan_session_plan(void* raw,SCAN_ARGUMENTS) {
   if(execution_retired){output->command_forward=0.;output->command_lateral=0.;output->command_yaw_rate=0.;}
   bool command_waiting=false;
   if(!execution_retired) {
+   const Eigen::Vector2d preferred(output->command_forward,output->command_lateral);
+   const double preferred_w=output->command_yaw_rate;
    const auto checked=scan_planner::checkAuthorCommand(*map,c,position,start_yaw,actual_v,actual_w,
-       Eigen::Vector2d(output->command_forward,output->command_lateral),output->command_yaw_rate,
+       preferred,preferred_w,
        s.command_target,s.command_target_yaw,reference_count>=2&&s.controller.receive_traj);
    // 几何修正动作尚未执行原轨迹，曲线暂停；实测位置仍可真实移动。
    s.command_paused=(!checked.found&&checked.exhausted)||checked.limited;
@@ -245,11 +247,17 @@ extern "C" int nuwax_scan_session_plan(void* raw,SCAN_ARGUMENTS) {
     s.fsm->manager().local_data_.start_time_=ros::Time(ros::Time::now().toSec()-s.controller.exec_time);
    }
    s.fsm->onFrozen(s.command_paused);
-   if(scan_planner::authorTraceEnabled()&&(checked.limited||command_waiting)) {
+   if(scan_planner::authorTraceEnabled()&&(checked.hard_limited||checked.limited||command_waiting)) {
     auto out=scan_planner::authorTraceStream();
     out<<"{\"event\":\"command_geometry\",\"stamp_ns\":"<<odometry_timestamp_ns
        <<",\"paused\":"<<s.command_paused<<",\"waiting\":"<<command_waiting
        <<",\"proof_exhausted\":"<<checked.exhausted
+       <<",\"hard_limited\":"<<checked.hard_limited
+       <<",\"actual_world_velocity\":["<<actual_v.x()<<','<<actual_v.y()<<"]"
+       <<",\"actual_yaw_rate\":"<<actual_w
+       <<",\"preferred_command\":["<<preferred.x()<<','<<preferred.y()<<','<<preferred_w<<"]"
+       <<",\"controller_active\":"<<s.controller.receive_traj
+       <<",\"trajectory_id\":"<<s.controller.traj_id
        <<",\"braking_translation\":"<<checked.hold_translation
        <<",\"command\":["<<output->command_forward<<','<<output->command_lateral<<','<<output->command_yaw_rate<<"]}\n";
    }

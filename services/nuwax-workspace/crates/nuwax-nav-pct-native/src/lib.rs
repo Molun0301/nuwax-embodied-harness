@@ -388,6 +388,7 @@ pub fn classify_points(
 
 #[cfg(test)]
 mod tests {
+    include!("clearance_tests.rs");
     use super::*;
     fn config() -> Config {
         Config {

@@ -59,6 +59,10 @@ class Astar {
   void SetTransition(std::function<bool(const Node*, const Node*)> transition) {
     transition_ = std::move(transition);
   }
+  // 实体表面余量沿实际转移计费，不进入硬占据阈值。
+  void SetTraversalCost(std::function<double(const Node*, const Node*)> cost) {
+    traversal_cost_ = std::move(cost);
+  }
   void SetCancellation(std::function<bool()> cancelled) { cancelled_ = std::move(cancelled); }
   // 仅在需要逼近结果时启用；评分只遍历本次搜索实际展开的可达节点。
   void SetApproachScore(std::function<double(const Node*)> score) { approach_score_ = std::move(score); }
@@ -104,6 +108,7 @@ class Astar {
 
  private:
   std::function<bool(const Node*, const Node*)> transition_;
+  std::function<double(const Node*, const Node*)> traversal_cost_;
   std::function<bool()> cancelled_;
   std::function<double(const Node*)> approach_score_;
   std::size_t expanded_ = 0;

@@ -127,6 +127,19 @@ namespace scan_planner
         if (farthest == first && last > first+1) {
           const double yaw=std::atan2(delta.y(),delta.x());
           const int steps=std::max(1,static_cast<int>(std::ceil(delta.norm()/(resolution*.25))));
+          const double margin=std::max(.05,resolution);
+          double reference_clearance=margin;
+          // 宽处保留目标余量；已知窄段沿原硬可行规则简化，由最小净距软代价选择可留余量。
+          for(int j=0;j<=steps;++j) {
+            const double arc=input[first].arc+double(j)/steps*(input[last].arc-input[first].arc);
+            const Eigen::Vector3d before=route.positionAtArc(std::max(input[first].arc,arc-resolution*.25));
+            const Eigen::Vector3d after=route.positionAtArc(std::min(input[last].arc,arc+resolution*.25));
+            const double heading=std::atan2(after.y()-before.y(),after.x()-before.x());
+            if(map.bodyClearance(route.positionAtArc(arc),heading,margin)<margin) {
+              reference_clearance=0.;
+              break;
+            }
+          }
           for (int j=0;j<=steps;++j) {
             const double fraction=double(j)/steps;
             Eigen::Vector3d point=input[first].point+fraction*delta;
@@ -134,7 +147,8 @@ namespace scan_planner
             point.z()=route.heightAtArc(arc)
                 +(1.-fraction)*(input[first].point.z()-route.heightAtArc(input[first].arc))
                 +fraction*(input[last].point.z()-route.heightAtArc(input[last].arc));
-            if (map.getInflateOccupancy(point,yaw)==0)continue;
+            if (map.getInflateOccupancy(point,yaw)==0
+                && map.bodyClearance(point,yaw,margin)>=reference_clearance)continue;
             double deviation=-1.;
             for (std::size_t i=first+1;i<last;++i) {
               const double along=length2>0.?std::clamp((input[i].point-input[first].point).dot(delta)/length2,0.,1.):0.;
@@ -292,10 +306,13 @@ namespace scan_planner
 
   bool SCANPlannerManager::reboundReplan(Eigen::Vector3d start_pt, Eigen::Vector3d start_vel,
                                         Eigen::Vector3d start_acc, Eigen::Vector3d local_target_pt,
-                                        Eigen::Vector3d local_target_vel, bool flag_polyInit, bool flag_randomPolyTraj)
+                                        Eigen::Vector3d local_target_vel, bool flag_polyInit, bool flag_randomPolyTraj,
+                                        double start_yaw)
   {
 
     const double resolution = grid_map_->getResolution();
+    bspline_optimizer_rebound_->setInitialClearance(grid_map_->bodyClearance(
+        start_pt,start_yaw,2.*std::max(.05,resolution)));
     bool reference_detour = false;
     if (route_height_.ready()) {
       const Eigen::Vector2d chord = (local_target_pt - start_pt).head<2>();
@@ -612,7 +629,7 @@ namespace scan_planner
       auto out=authorTraceStream();out<<"{\"event\":\"initial_control_points\",\"attempt\":"<<count-1<<",\"ts\":"<<ts<<",\"points\":";traceMatrix(out,ctrl_pts);out<<"}\n";
     }
     vector<vector<Eigen::Vector3d>> a_star_paths;
-    const Eigen::MatrixXd reference_controls = route_time_seed ? ctrl_pts : Eigen::MatrixXd{};
+    Eigen::MatrixXd reference_controls = route_time_seed ? ctrl_pts : Eigen::MatrixXd{};
     const double reference_dt = ts;
     bool reference_free = false;
     if (route_time_seed) {
@@ -633,14 +650,20 @@ namespace scan_planner
         UniformBspline retained(retained_controls, 3, retained_dt);
         if (trajectoryCollisionFree(retained) && checkDynamicFeasibility(retained)
             && strictDynamicScale(retained) <= 1.) {
-          if (authorTraceEnabled()) {
-            auto out = authorTraceStream();
-            out << "{\"event\":\"retained_reference_seed\",\"scale\":" << retained_dt / reference_dt
-                << ",\"duration\":" << retained.getTimeSum() << "}\n";
+          if (trajectoryHasPreferredClearance(retained)) {
+            if (authorTraceEnabled()) {
+              auto out = authorTraceStream();
+              out << "{\"event\":\"retained_reference_seed\",\"scale\":" << retained_dt / reference_dt
+                  << ",\"duration\":" << retained.getTimeSum() << "}\n";
+            }
+            updateTrajInfo(retained, ros::Time::now());
+            continuous_failures_count_ = 0;
+            return true;
           }
-          updateTrajInfo(retained, ros::Time::now());
-          continuous_failures_count_ = 0;
-          return true;
+          // 离障改进沿用已有严格定时的初值，实测导数和原速度/加速度上限一起保留。
+          ctrl_pts=retained_controls;
+          reference_controls=retained_controls;
+          ts=retained_dt;
         }
       }
     }
@@ -678,15 +701,25 @@ namespace scan_planner
     pos.setPhysicalLimits(pp_.max_vel_, pp_.max_acc_, pp_.feasibility_tolerance_);
 
     double ratio;
+    const bool needs_reallocation=route_time_seed
+        ? ((ratio=strictDynamicScale(pos))>1.) : !pos.checkFeasibility(ratio,false);
     bool flag_step_2_success = true;
-    if (!pos.checkFeasibility(ratio, false))
+    if (needs_reallocation)
     {
       std::cerr << "Need to reallocate time." << endl;
-
-      Eigen::MatrixXd optimal_control_points;
-      flag_step_2_success = refineTrajAlgo(pos, start_end_derivatives, ratio, ts, optimal_control_points);
-      if (flag_step_2_success)
-        pos = UniformBspline(optimal_control_points, 3, ts);
+      if(route_time_seed) {
+        // 已优化轨迹只调整时标；静止边界整体缩放，移动边界沿原节点保留首末导数。
+        const double scale=ratio*(1.+std::numeric_limits<double>::epsilon()*(ctrl_pts.cols()+4));
+        if(start_vel.isZero(0.)&&start_acc.isZero(0.)&&local_target_vel.isZero(0.))
+          pos.setKnot((pos.getKnot()*scale).eval());
+        else
+          pos.lengthenTime(scale);
+      } else {
+        Eigen::MatrixXd optimal_control_points;
+        flag_step_2_success = refineTrajAlgo(pos, start_end_derivatives, ratio, ts, optimal_control_points);
+        if (flag_step_2_success)
+          pos = UniformBspline(optimal_control_points, 3, ts);
+      }
     }
 
     bool accepted = flag_step_2_success && checkDynamicFeasibility(pos)
@@ -959,6 +992,21 @@ namespace scan_planner
       const Eigen::Vector3d point = trajectory.evaluateDeBoorT(time);
       const double yaw = trajectoryHeading(velocity,duration,time,dt,0.);
       if (grid_map_->getInflateOccupancy(point, yaw) != 0) return false;
+    }
+    return true;
+  }
+
+  // 已有余量或确实窄到无法留足余量时可直交参考，其余情况进入原样条优化。
+  bool SCANPlannerManager::trajectoryHasPreferredClearance(UniformBspline& trajectory)
+  {
+    const double duration=trajectory.getTimeSum();
+    auto velocity=trajectory.getDerivative();
+    const double dt=std::min(.01,grid_map_->getResolution()/(4.*pp_.max_vel_));
+    const int samples=std::max(1,static_cast<int>(std::ceil(duration/dt)));
+    for(int i=0;i<=samples;++i) {
+      const double time=duration*i/samples;
+      const double yaw=trajectoryHeading(velocity,duration,time,dt,0.);
+      if(!grid_map_->bodyHasPreferredClearance(trajectory.evaluateDeBoorT(time),yaw))return false;
     }
     return true;
   }

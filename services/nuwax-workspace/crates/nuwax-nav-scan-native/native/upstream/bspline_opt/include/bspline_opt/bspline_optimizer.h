@@ -62,6 +62,7 @@ namespace scan_planner
     // required inputs
     void setControlPoints(const Eigen::MatrixXd &points);
     void setBsplineInterval(const double &ts);
+    void setInitialClearance(double distance) { initial_clearance_=distance; }
     void setCostFunction(const int &cost_function);
     void setTerminateCond(const int &max_num_id, const int &max_time_id);
 
@@ -117,6 +118,7 @@ namespace scan_planner
     int a;
     //
     double dist0_;             // safe distance
+    double initial_clearance_; // 实际起步外包净距
     double max_vel_, max_acc_; // dynamic limits
 
     int variable_num_;              // optimization variables
@@ -138,6 +140,7 @@ namespace scan_planner
     void calcFeasibilityCost(const Eigen::MatrixXd &q, double &cost,
                              Eigen::MatrixXd &gradient);
     void calcDistanceCostRebound(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient, int iter_num, double smoothness_cost);
+    void calcClearanceCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient);
     void calcFitnessCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient);
     bool check_collision_and_rebound(void);
     double estimateSegmentYaw(const Eigen::Vector3d &from, const Eigen::Vector3d &to) const;

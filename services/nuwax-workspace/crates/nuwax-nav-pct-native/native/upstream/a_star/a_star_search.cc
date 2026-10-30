@@ -146,7 +146,7 @@ bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal,
         if (transition_ && !transition_(current_node, neighbor_node)) continue;
         const auto diff = neighbor_node->idx - current_node->idx;
         double step_cost = step_cost_weight_ * neighbor_node->cost;
-        if (step_cost < 5) step_cost = 0.0;
+        if (traversal_cost_) step_cost += traversal_cost_(current_node, neighbor_node);
         const double dz = (neighbor_node->height - current_node->height) / resolution_;
         const double tentative_g = current_node->g +
             std::sqrt(dz * dz + diff[1] * diff[1] + diff[2] * diff[2]) + step_cost;

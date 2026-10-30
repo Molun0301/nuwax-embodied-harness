@@ -43,7 +43,7 @@ class SurfaceObstacleLayer {
     return contacts(reference,yaw,padding,nullptr,nullptr);
   }
   bool contacts(const Eigen::Vector3d& reference,double yaw,double padding,
-      std::vector<BodyCollisionCell>* output,const std::set<BodyCollisionCell>* initial)const {
+      std::vector<BodyCollisionCell>* output,const std::set<BodyCollisionCell>* initial,bool planar=false)const {
     if(columns_.empty())return false;
     bool hit=false;
     const auto& cfg=config_;const double r=cfg.resolution,c=std::cos(yaw),s=std::sin(yaw);
@@ -67,6 +67,8 @@ class SurfaceObstacleLayer {
           if(initial&&initial->count(cell))continue;
           if(!output)return true;
           output->push_back(cell);hit=true;
+          // 软净距只依赖平面列；恢复证明仍保留每一个真实高度带。
+          if(planar)break;
         }
       }
     return hit;

@@ -2077,6 +2077,7 @@ name = "nuwax-nav-scan-native"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "nuwax-nav-pct-native",
  "serde_json",
 ]
 

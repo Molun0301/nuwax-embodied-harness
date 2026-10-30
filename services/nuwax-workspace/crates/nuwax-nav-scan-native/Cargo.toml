@@ -11,3 +11,4 @@ cc = "1"
 
 [dev-dependencies]
 serde_json = "1"
+nuwax-nav-pct-native = { path = "../nuwax-nav-pct-native" }

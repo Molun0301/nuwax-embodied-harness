@@ -120,8 +120,8 @@ extern "C" int nuwax_scan_session_plan(void* raw,SCAN_ARGUMENTS) {
    if(!s.surface||!s.surface->matches(obstacles,obstacle_count,ground,ground_count))
     s.surface=std::make_shared<SurfaceObstacleLayer>(c,obstacles,obstacle_count,ground,ground_count);
    map->setSurfaceCollisionQuery([surface=s.surface](const Vector3d& p,double yaw,double padding,
-       std::vector<GridMap::BodyCell>* contacts,const std::set<GridMap::BodyCell>* initial) {
-    return surface->contacts(p,yaw,padding,contacts,initial);
+       std::vector<GridMap::BodyCell>* contacts,const std::set<GridMap::BodyCell>* initial,bool planar) {
+    return surface->contacts(p,yaw,padding,contacts,initial,planar);
    });
   }
   std::vector<Eigen::Vector2d> polygon;polygon.reserve(boundary_count);

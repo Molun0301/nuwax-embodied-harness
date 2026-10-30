@@ -173,7 +173,11 @@ public:
   using BodyCell = BodyCollisionCell;
   // 连续扫掠查询两层当前实体；忽略集合仅供已证明单调退出的初始接触。
   inline int bodyContacts(Eigen::Vector3d pos, double yaw, double padding,
-      std::vector<BodyCell>* contacts = nullptr, const std::set<BodyCell>* initial = nullptr);
+      std::vector<BodyCell>* contacts = nullptr, const std::set<BodyCell>* initial = nullptr,
+      bool planar = false);
+  inline double bodyClearance(Eigen::Vector3d pos, double yaw, double range);
+  inline double bodyClearanceCost(Eigen::Vector3d pos, double yaw, double range);
+  inline bool bodyHasPreferredClearance(Eigen::Vector3d pos, double yaw);
   // 双圆柱候选查询保留前后顺序及图外-1；真实外包由getInflateOccupancy复核。
   inline int getAuthorInflateOccupancy(Eigen::Vector3d pos, double yaw);
 
@@ -194,7 +198,7 @@ public:
   void setBusinessEnvelopeQuery(BusinessEnvelopeQuery query) { business_envelope_query_ = std::move(query); }
   // 已知融合表面是附加实体约束，不写入雷达概率和未知状态。
   using SurfaceContactQuery = std::function<bool(const Eigen::Vector3d&, double, double,
-      std::vector<BodyCell>*, const std::set<BodyCell>*)>;
+      std::vector<BodyCell>*, const std::set<BodyCell>*, bool)>;
   void setSurfaceCollisionQuery(SurfaceContactQuery query) { surface_collision_query_ = std::move(query); }
 
   // One atomic LiDAR observation: points, sensor pose and body position MUST belong
@@ -390,7 +394,7 @@ inline int GridMap::getOccupancy(Eigen::Vector3d pos) {
 
 inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos, double yaw) {
   if (business_constraint_query_ && business_constraint_query_(pos, yaw)) return 1;
-  if (surface_collision_query_ && surface_collision_query_(pos, yaw, 0., nullptr, nullptr)) return 1;
+  if (surface_collision_query_ && surface_collision_query_(pos, yaw, 0., nullptr, nullptr, false)) return 1;
   // Explicit physical calibration adapter. For the author reference convention
   // all offsets are zero and this reduces exactly to the original query.
   const double c = std::cos(yaw), s = std::sin(yaw);
@@ -468,11 +472,11 @@ inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos, double yaw) {
 }
 
 inline int GridMap::bodyContacts(Eigen::Vector3d pos, double yaw, double padding,
-    std::vector<BodyCell>* contacts, const std::set<BodyCell>* initial) {
+    std::vector<BodyCell>* contacts, const std::set<BodyCell>* initial, bool planar) {
   if (contacts) contacts->clear();
   if (business_envelope_query_ ? business_envelope_query_(pos,yaw,padding)
       : business_constraint_query_ && business_constraint_query_(pos,yaw)) return -1;
-  bool found = surface_collision_query_ && surface_collision_query_(pos,yaw,padding,contacts,initial);
+  bool found = surface_collision_query_ && surface_collision_query_(pos,yaw,padding,contacts,initial,planar);
   if (found && !contacts) return 1;
   const double c=std::cos(yaw),s=std::sin(yaw),ac=std::abs(c),as=std::abs(s);
   pos += Eigen::Vector3d(c*mp_.body_center_offset_.x()-s*mp_.body_center_offset_.y(),
@@ -496,6 +500,7 @@ inline int GridMap::bodyContacts(Eigen::Vector3d pos, double yaw, double padding
           ||std::abs(c*dx+s*dy)>hx+half*(ac+as)||std::abs(-s*dx+c*dy)>hy+half*(ac+as))continue;
       const size_t column=getLocalIndex(x,0)*mp_.map_voxel_num_.y()+getLocalIndex(y,1);
       const auto* bits=md_.occupancy_bits_.data()+column*md_.occupancy_words_per_column_;
+      bool column_hit=false;
       // 与原查询一样按位图字跳过空高度段，不能让连续证明耗尽原计算预算。
       for(int z=z0;z<=z1;) {
         const int local=getLocalIndex(z,2),count=std::min({z1-z+1,nz-local,64-local%64});
@@ -510,13 +515,63 @@ inline int GridMap::bodyContacts(Eigen::Vector3d pos, double yaw, double padding
               &&(!initial||!initial->count(cell))) {
             found=true;if(!contacts)return 1;
             contacts->push_back(cell);
+            if(planar){column_hit=true;break;}
           }
           hits&=hits-1;
         }
+        if(column_hit)break;
         z+=count;
       }
     }
   return found?1:0;
+}
+
+// 只供软代价：实际矩形向四边扩张至当前实体所需的距离，硬查询仍使用零扩张。
+inline double GridMap::bodyClearance(Eigen::Vector3d pos, double yaw, double range) {
+  if (bodyContacts(pos,yaw,range)==0) return range;
+  double low=0.,high=range;
+  for(int i=0;i<8;++i) {
+    const double middle=(low+high)/2.;
+    if(bodyContacts(pos,yaw,middle)==0)low=middle;
+    else high=middle;
+  }
+  return low;
+}
+
+// 实际外包的最小净距连续产生软代价，窄门在中线取得可实现的最大净距。
+inline double GridMap::bodyClearanceCost(Eigen::Vector3d pos, double yaw, double range) {
+  std::vector<BodyCell> cells;
+  const double margin=std::max(.05,mp_.resolution_);
+  if(bodyContacts(pos,yaw,range,&cells,nullptr,true)<0) {
+    // 显式边界或局部缓存的边缘仍按原外包查询计算可用扩张距离。
+    const double clearance=bodyClearance(pos,yaw,range),deficit=range-clearance;
+    return deficit*deficit/margin;
+  }
+  const double c=std::cos(yaw),s=std::sin(yaw),ac=std::abs(c),as=std::abs(s);
+  pos.x()+=c*mp_.body_center_offset_.x()-s*mp_.body_center_offset_.y();
+  pos.y()+=s*mp_.body_center_offset_.x()+c*mp_.body_center_offset_.y();
+  const double hx=mp_.body_length_/2.,hy=mp_.body_width_/2.,half=mp_.resolution_/2.;
+  double clearance=range;
+  for(const auto& cell:cells) {
+    const double dx=(cell[0]+.5)*mp_.resolution_-pos.x();
+    const double dy=(cell[1]+.5)*mp_.resolution_-pos.y();
+    const double u=c*dx+s*dy,v=-s*dx+c*dy;
+    const double distance=std::max({0.,
+        (std::abs(dx)-ac*hx-as*hy-half)/(ac+as),
+        (std::abs(dy)-as*hx-ac*hy-half)/(ac+as),
+        std::abs(u)-hx-half*(ac+as),std::abs(v)-hy-half*(ac+as)});
+    clearance=std::min(clearance,distance);
+  }
+  const double deficit=range-clearance;
+  return deficit*deficit/margin;
+}
+
+inline bool GridMap::bodyHasPreferredClearance(Eigen::Vector3d pos, double yaw) {
+  const double margin=std::max(.05,mp_.resolution_);
+  if(bodyContacts(pos,yaw,margin)==0)return true;
+  // 在参考方向横移一个余量即可留足空间时进入优化；两侧均受限的门洞保留原可行初值。
+  const Eigen::Vector3d lateral(-std::sin(yaw)*margin,std::cos(yaw)*margin,0.);
+  return bodyContacts(pos+lateral,yaw,margin)!=0&&bodyContacts(pos-lateral,yaw,margin)!=0;
 }
 
 inline int GridMap::getAuthorInflateOccupancy(Eigen::Vector3d pos, double yaw) {

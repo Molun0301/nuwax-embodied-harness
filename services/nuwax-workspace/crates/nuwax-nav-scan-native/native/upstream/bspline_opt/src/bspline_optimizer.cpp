@@ -483,6 +483,47 @@ namespace scan_planner
     }
   }
 
+  // 尚未碰撞也计算机体表面排斥；采样样条结点，朝向梯度回传到相邻控制点。
+  void BsplineOptimizer::calcClearanceCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient)
+  {
+    cost=0.;
+    const double initial_speed=(q.col(2)-q.col(0)).head<2>().norm()/(2.*bspline_interval_);
+    const double speed_limit=std::max(max_vel_,initial_speed);
+    const double acceleration_time=(speed_limit-initial_speed)/max_acc_;
+    const double h=grid_map_->getResolution()/8.,angle=.01;
+    for(int i=order_-1;i<q.cols()-order_;++i) {
+      // 当前不足目标净距时，软目标只按原速度/加速度允许的位移上界增长。
+      const double time=(i-order_+2)*bspline_interval_;
+      const double accelerating=std::min(time,acceleration_time);
+      const double travel=initial_speed*accelerating+.5*max_acc_*accelerating*accelerating
+          +speed_limit*(time-accelerating);
+      const double range=std::min(dist0_,initial_clearance_+travel);
+      auto penalty=[&](const Eigen::Vector3d& point,double yaw) {
+        return grid_map_->bodyClearanceCost(point,yaw,range);
+      };
+      const Eigen::Vector3d point=(q.col(i-1)+4.*q.col(i)+q.col(i+1))/6.;
+      const Eigen::Vector3d tangent=q.col(i+1)-q.col(i-1);
+      const double yaw=estimateSegmentYaw(q.col(i-1),q.col(i+1));
+      cost+=penalty(point,yaw);
+      Eigen::Vector3d position_gradient=Eigen::Vector3d::Zero();
+      for(int axis=0;axis<2;++axis) {
+        Eigen::Vector3d plus=point,minus=point;plus[axis]+=h;minus[axis]-=h;
+        position_gradient[axis]=(penalty(plus,yaw)-penalty(minus,yaw))/(2.*h);
+      }
+      gradient.col(i-1)+=position_gradient/6.;
+      gradient.col(i)+=4.*position_gradient/6.;
+      gradient.col(i+1)+=position_gradient/6.;
+      const double length2=tangent.head<2>().squaredNorm();
+      // 与estimateSegmentYaw的静止阈值一致，固定为零的朝向不能产生atan2梯度。
+      if(length2>=1e-8) {
+        const double turn=(penalty(point,yaw+angle)-penalty(point,yaw-angle))/(2.*angle);
+        const Eigen::Vector3d direction(-tangent.y()/length2,tangent.x()/length2,0.);
+        gradient.col(i-1)-=turn*direction;
+        gradient.col(i+1)+=turn*direction;
+      }
+    }
+  }
+
   void BsplineOptimizer::calcFitnessCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient)
   {
 
@@ -690,69 +731,33 @@ namespace scan_planner
     ts = bspline_interval_;
     ts_inv2 = 1 / ts / ts;
 
-    /* velocity feasibility */
-    for (int i = 0; i < q.cols() - 1; i++)
+    // 与原严格动力学检查使用相同的完整向量范数，避免斜向各轴合格但总速度超限。
+    for (int i = 0; i < q.cols() - 1; ++i)
     {
-      Eigen::Vector3d vi = (q.col(i + 1) - q.col(i)) / ts;
-
-      //std::cerr << "temp_v * vi=" ;
-      for (int j = 0; j < 3; j++)
+      const Eigen::Vector3d velocity = (q.col(i + 1) - q.col(i)) / ts;
+      const double speed = velocity.norm();
+      if (speed > max_vel_)
       {
-        if (vi(j) > max_vel_)
-        {
-          // std::cerr << "fuck VEL" << endl;
-          // std::cerr << vi(j) << endl;
-          cost += pow(vi(j) - max_vel_, 2) * ts_inv2; // multiply ts_inv3 to make vel and acc has similar magnitude
-
-          gradient(j, i + 0) += -2 * (vi(j) - max_vel_) / ts * ts_inv2;
-          gradient(j, i + 1) += 2 * (vi(j) - max_vel_) / ts * ts_inv2;
-        }
-        else if (vi(j) < -max_vel_)
-        {
-          cost += pow(vi(j) + max_vel_, 2) * ts_inv2;
-
-          gradient(j, i + 0) += -2 * (vi(j) + max_vel_) / ts * ts_inv2;
-          gradient(j, i + 1) += 2 * (vi(j) + max_vel_) / ts * ts_inv2;
-        }
-        else
-        {
-          /* code */
-        }
+        const double excess = speed - max_vel_;
+        cost += excess * excess * ts_inv2;
+        const Eigen::Vector3d derivative = 2. * excess / speed * velocity / ts * ts_inv2;
+        gradient.col(i) -= derivative;
+        gradient.col(i + 1) += derivative;
       }
     }
-
-    /* acceleration feasibility */
-    for (int i = 0; i < q.cols() - 2; i++)
+    for (int i = 0; i < q.cols() - 2; ++i)
     {
-      Eigen::Vector3d ai = (q.col(i + 2) - 2 * q.col(i + 1) + q.col(i)) * ts_inv2;
-
-      //std::cerr << "temp_a * ai=" ;
-      for (int j = 0; j < 3; j++)
+      const Eigen::Vector3d acceleration = (q.col(i + 2) - 2. * q.col(i + 1) + q.col(i)) * ts_inv2;
+      const double magnitude = acceleration.norm();
+      if (magnitude > max_acc_)
       {
-        if (ai(j) > max_acc_)
-        {
-          // std::cerr << "fuck ACC" << endl;
-          // std::cerr << ai(j) << endl;
-          cost += pow(ai(j) - max_acc_, 2);
-
-          gradient(j, i + 0) += 2 * (ai(j) - max_acc_) * ts_inv2;
-          gradient(j, i + 1) += -4 * (ai(j) - max_acc_) * ts_inv2;
-          gradient(j, i + 2) += 2 * (ai(j) - max_acc_) * ts_inv2;
-        }
-        else if (ai(j) < -max_acc_)
-        {
-          cost += pow(ai(j) + max_acc_, 2);
-
-          gradient(j, i + 0) += 2 * (ai(j) + max_acc_) * ts_inv2;
-          gradient(j, i + 1) += -4 * (ai(j) + max_acc_) * ts_inv2;
-          gradient(j, i + 2) += 2 * (ai(j) + max_acc_) * ts_inv2;
-        }
-        else
-        {
-          /* code */
-        }
+        const double excess = magnitude - max_acc_;
+        cost += excess * excess;
+        const Eigen::Vector3d derivative = 2. * excess / magnitude * acceleration * ts_inv2;
+        gradient.col(i) += derivative;
+        gradient.col(i + 1) -= 2. * derivative;
+        gradient.col(i + 2) += derivative;
       }
-      //std::cerr << endl;
     }
 
 #endif
@@ -1189,7 +1194,7 @@ namespace scan_planner
     memcpy(cps_.points.data() + 3 * order_, x, n * sizeof(x[0]));
 
     /* ---------- evaluate cost and gradient ---------- */
-    double f_smoothness, f_distance, f_feasibility;
+    double f_smoothness, f_distance, f_feasibility, f_clearance;
 
     Eigen::MatrixXd g_smoothness = Eigen::MatrixXd::Zero(3, cps_.size);
     Eigen::MatrixXd g_distance = Eigen::MatrixXd::Zero(3, cps_.size);
@@ -1197,6 +1202,8 @@ namespace scan_planner
 
     calcSmoothnessCost(cps_.points, f_smoothness, g_smoothness);
     calcDistanceCostRebound(cps_.points, f_distance, g_distance, iter_num_, f_smoothness);
+    calcClearanceCost(cps_.points, f_clearance, g_distance);
+    f_distance+=f_clearance;
     calcFeasibilityCost(cps_.points, f_feasibility, g_feasibility);
 
     f_combine = lambda1_ * f_smoothness + new_lambda2_ * f_distance + lambda3_ * f_feasibility;
@@ -1214,24 +1221,26 @@ namespace scan_planner
     memcpy(cps_.points.data() + 3 * order_, x, n * sizeof(x[0]));
 
     /* ---------- evaluate cost and gradient ---------- */
-    double f_smoothness, f_fitness, f_feasibility;
+    double f_smoothness, f_fitness, f_feasibility, f_clearance;
 
     Eigen::MatrixXd g_smoothness = Eigen::MatrixXd::Zero(3, cps_.points.cols());
     Eigen::MatrixXd g_fitness = Eigen::MatrixXd::Zero(3, cps_.points.cols());
     Eigen::MatrixXd g_feasibility = Eigen::MatrixXd::Zero(3, cps_.points.cols());
+    Eigen::MatrixXd g_clearance = Eigen::MatrixXd::Zero(3, cps_.points.cols());
 
     //time_satrt = ros::Time::now();
 
     calcSmoothnessCost(cps_.points, f_smoothness, g_smoothness);
     calcFitnessCost(cps_.points, f_fitness, g_fitness);
     calcFeasibilityCost(cps_.points, f_feasibility, g_feasibility);
+    calcClearanceCost(cps_.points, f_clearance, g_clearance);
 
     /* ---------- convert to solver format...---------- */
-    f_combine = lambda1_ * f_smoothness + lambda4_ * f_fitness + lambda3_ * f_feasibility;
+    f_combine = lambda1_ * f_smoothness + lambda4_ * f_fitness + lambda3_ * f_feasibility + lambda2_ * f_clearance;
     // std::fprintf(stderr,"origin %f %f %f %f\n", f_smoothness, f_fitness, f_feasibility, f_combine);
 
     Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + lambda4_ * g_fitness +
-                              lambda3_ * g_feasibility;
+                              lambda3_ * g_feasibility + lambda2_ * g_clearance;
     grad_3D.row(2).setZero();
     memcpy(grad, grad_3D.data() + 3 * order_, n * sizeof(grad[0]));
   }

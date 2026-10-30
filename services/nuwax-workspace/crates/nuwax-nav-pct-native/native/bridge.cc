@@ -85,9 +85,9 @@ bool intersects(const std::vector<Point>& polygon, double x0, double y0, double 
   }
   return true;
 }
-// 复用上游pct_scan_bridge/clearance_cost.py的软代价公式；距离变换改为无Python依赖的等价两遍算法。
+// 保留地面边缘的连续软势场，影响距离由真实包络和期望余量共同确定。
 void add_clearance_cost(Eigen::MatrixXd& cost,const std::vector<unsigned char>& measured,
-                        int layers,int nx,int ny,double resolution) {
+                        int layers,int nx,int ny,double resolution,double influence) {
   const int width=nx+2,height=ny+2;
   std::vector<double> distances(static_cast<size_t>(width)*height);
   std::vector<int> vertices(width);
@@ -130,7 +130,7 @@ void add_clearance_cost(Eigen::MatrixXd& cost,const std::vector<unsigned char>& 
         if(!valid(x,y))continue;
         const double dx=x-vertices[envelope];
         const double clearance=std::sqrt(dx*dx+row[vertices[envelope]])*resolution;
-        const double soft_cost=20.0*std::clamp(1.0-clearance/0.5,0.0,1.0);
+        const double soft_cost=20.0*std::clamp(1.0-clearance/influence,0.0,1.0);
         // 上游将软代价封顶于原可通行阈值，窄通道保持连通。
         auto& value=cost(layer*ny+y-1,x-1);
         value=std::max(value,std::min(soft_cost,20.0));
@@ -141,6 +141,7 @@ void add_clearance_cost(Eigen::MatrixXd& cost,const std::vector<unsigned char>& 
 struct Planner {
   PctConfig cfg;
   std::vector<Point> footprint,boundary;
+  double clearance_radius=0.;
   std::map<XY,Column> columns;
   // 粗桶只筛候选，桶内仍保留每个原分辨率占据区间和原足迹判定。
   std::map<XY,std::vector<PctBand>> collision_buckets;
@@ -156,6 +157,7 @@ struct Planner {
         footprint.push_back({c.footprint_radius*std::cos(a),c.footprint_radius*std::sin(a)});
       }
     }
+    for(auto p:footprint)clearance_radius=std::max(clearance_radius,std::hypot(p[0],p[1]));
   }
   int bucket(int cell) const {
     const int whole=cell/bucket_cells;
@@ -204,6 +206,39 @@ struct Planner {
       }
     }
     return false;
+  }
+  // 全姿态外包圆生成连续软代价，避免无朝向状态的二维搜索靠瞬时转向降低代价。
+  double clearance_cost(const Edge& edge) const {
+    const double q=cfg.resolution,margin=std::max(0.05,q);
+    const double radius=clearance_radius,range=2.*margin,reach=radius+range;
+    double clearance=range;
+    for(int i=0;i<=2;++i) {
+      const double t=i*.5,ground=edge[2]+t*(edge[5]-edge[2]);
+      const double x=edge[0]+t*(edge[3]-edge[0]),y=edge[1]+t*(edge[4]-edge[1]);
+      const double bottom=std::max(ground+cfg.max_step,ground+cfg.body_to_ground+cfg.body_z_min);
+      const double top=ground+cfg.body_to_ground+cfg.body_z_max;
+      for(int bx=bucket(int(std::floor((x-reach)/q)));bx<=bucket(int(std::floor((x+reach)/q)));++bx)
+        for(int by=bucket(int(std::floor((y-reach)/q)));by<=bucket(int(std::floor((y+reach)/q)));++by) {
+          auto block=collision_buckets.find({bx,by});if(block==collision_buckets.end())continue;
+          auto band=std::upper_bound(block->second.begin(),block->second.end(),bottom+1e-8,
+              [](double low,const PctBand& b){return low<b.high;});
+          for(;band!=block->second.end();++band) {
+            if(band->low>=top-1e-8)continue;
+            bool support=false;
+            if(band->high-band->low<=cfg.point_resolution*1.5) {
+              for(auto surface:columns.at({band->x,band->y}).surfaces)
+                if(surface.ground>=band->low-1e-8&&surface.ground<=band->high+1e-8&&
+                    std::abs(surface.ground-ground)<=cfg.point_resolution*1.5){support=true;break;}
+            }
+            if(support)continue;
+            const double dx=std::max(0.,std::abs((band->x+.5)*q-x)-q/2.);
+            const double dy=std::max(0.,std::abs((band->y+.5)*q-y)-q/2.);
+            clearance=std::min(clearance,std::hypot(dx,dy)-radius);
+          }
+        }
+    }
+    // 包络在窄门处可有负净距，软代价仍连续；原真实多边形硬判定保留通行能力。
+    return 20.*(1.-clearance/range)*std::hypot(edge[3]-edge[0],edge[4]-edge[1])/q;
   }
   bool transition(const Edge& edge,XY from,XY to) {
     const double ax=edge[0],ay=edge[1],bx=edge[3],by=edge[4];
@@ -359,7 +394,8 @@ struct Planner {
         cost(l*ny+y,x)=s.ceiling-s.ground+1e-8<cfg.robot_height||steep?100:0;
       }
     }
-    add_clearance_cost(cost,measured,layers,nx,ny,q);
+    // 地面边缘距离按格中心测量，额外一格补偿格内偏移；实体带按真实格方形计算。
+    add_clearance_cost(cost,measured,layers,nx,ny,q,clearance_radius+std::max(.05,q)+q);
     // 原planner_node的snap_search_radius_cells=10；用三维距离绑定附近有效实测层。
     // 搜索半径只用于端点选择，不会在两个已知岛之间补地面。
     auto snap_endpoint=[&](int& x,int& y,double z,const double* requested) {
@@ -445,6 +481,13 @@ struct Planner {
       const double bx=last?goal_x:(b->idx[2]+minx+0.5)*q,by=last?goal_y:(b->idx[1]+miny+0.5)*q;
       return transition({ax,ay,a->height,bx,by,b->height},
                         {a->idx[2]+minx,a->idx[1]+miny},{b->idx[2]+minx,b->idx[1]+miny});
+    });
+    astar.SetTraversalCost([&](const Node* a,const Node* b){
+      const bool first=a->layer==sl&&a->idx[2]==sx&&a->idx[1]==sy;
+      const bool last=b->layer==gl&&b->idx[2]==gx&&b->idx[1]==gy;
+      return clearance_cost({first?start_x:(a->idx[2]+minx+.5)*q,
+          first?start_y:(a->idx[1]+miny+.5)*q,a->height,
+          last?goal_x:(b->idx[2]+minx+.5)*q,last?goal_y:(b->idx[1]+miny+.5)*q,b->height});
     });
     if(connectivity) {
       ++shared->stats.source_searches;
@@ -632,7 +675,7 @@ extern "C" int pct_multi_goal_rank_cost(void* search,const double* start,const d
           const double ax=first?t.source[0]:(x+0.5)*q,ay=first?t.source[1]:(y+0.5)*q;
           if(!p.transition({ax,ay,previous.ground,gx,gy,label->ground},{x,y},target))continue;
           const double dz=(label->ground-previous.ground)/q;
-          const double soft=label->cost<5?0:label->cost;
+          const double soft=label->cost+p.clearance_cost({ax,ay,previous.ground,gx,gy,label->ground});
           const double g=previous.weighted+std::sqrt(dz*dz+(x-target.first)*(x-target.first)+(y-target.second)*(y-target.second))+soft;
           if(g<weight) {
             weight=g;out->cost=previous.length+std::hypot(std::hypot(gx-ax,gy-ay),label->ground-previous.ground);

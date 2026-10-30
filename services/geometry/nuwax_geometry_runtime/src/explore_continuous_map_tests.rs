@@ -127,14 +127,60 @@ mod continuous_map_transaction_tests {
         publish_surface_owner_receipt(handle, committed, *revision, changed).await;
     }
 
+    #[derive(Clone, Copy)]
+    enum MapChange { Unrelated, Target, Refinement, RouteBlocked }
+
+    async fn publish_route_update(
+        handle: &ExploreRuntimeHandle,
+        message: &schema::NavigationMap3D,
+        snapshot: &SurfaceSnapshot,
+        audit: &Arc<StdMutex<SurfaceOwnerAudit>>,
+        committed: &mut schema::CommittedMapIdentity,
+        revision: &mut i32,
+        blocked: bool,
+    ) {
+        *revision += 1;
+        let (start, end) = {
+            let guard = audit.lock().unwrap();
+            let capture = if blocked { &guard.captures[0] } else { guard.captures.last().unwrap() };
+            let goal = surface_owner_goal(capture.preview.as_ref().unwrap());
+            (capture.pose.pose.position, goal.pose.pose.position)
+        };
+        let middle = [(start.x + end.x) * 0.5, (start.y + end.y) * 0.5];
+        let changed = if blocked {
+            let axis = usize::from((end.y-start.y).abs() > (end.x-start.x).abs());
+            let points: Vec<_> = (-20..=70).flat_map(|i| (2..=5).map(move |z| {
+                let mut p = [middle[0],middle[1],f64::from(z)*0.1];
+                p[1-axis] = f64::from(i)*0.1;
+                p
+            })).enumerate().map(|(i,p)| (i as u32,p)).collect();
+            snapshot.with_recent_obstacle_points(*revision as u64,*revision as u64,0,&[],points).unwrap()
+        } else {
+            let points: Vec<_> = schema::navigation_map_3d_points(message).unwrap().into_iter().map(|(x,y,z)| {
+                let near = (f64::from(x)-start.x).hypot(f64::from(y)-start.y) < 0.2
+                    || (f64::from(x)-middle[0]).hypot(f64::from(y)-middle[1]) < 0.15;
+                (x,y,z+if z < 1.0 && near { *revision as f32*0.001 } else { 0.0 })
+            }).collect();
+            let refined = SurfaceSnapshot::from_points(&points,snapshot.config().clone(),snapshot.source_voxel_size_m()).unwrap();
+            assert_ne!(refined.navigation_measured_points(), snapshot.navigation_measured_points(),
+                "起点和路线中段须实际细化实测高度");
+            refined
+        };
+        committed.revision += 1;
+        committed.commit_sequence += 1;
+        committed.source_timestamp_ns = now_unix_nanos() as i64;
+        publish_surface_owner_receipt(handle,committed,*revision,Arc::new(changed)).await;
+    }
+
     async fn update_case(
         allow_advice: bool,
-        change_target: bool,
+        change: MapChange,
         qualification_enabled: bool,
         gate_every_prepare: bool,
         interval: Duration,
         follow_up: bool,
     ) -> (bool, usize) {
+        let change_target = matches!(change, MapChange::Target);
         let (handle, sink) = configured_handle();
         let (message, _, snapshot) = install_surface_fixture(&handle, "map").await;
         let request = "continuous-map-advice";
@@ -209,8 +255,13 @@ mod continuous_map_transaction_tests {
                             },
                             _=timer.tick(), if !interval.is_zero() => {
                                 // 接收节拍独立于计算；计算在途时地图仍每1～3秒更新。
-                                publish_unrelated_geometry(&handle, &message, &snapshot,
-                                    &mut committed, &mut publication_revision).await;
+                                if matches!(change, MapChange::Refinement | MapChange::RouteBlocked) {
+                                    publish_route_update(&handle,&message,&snapshot,&audit,
+                                        &mut committed,&mut publication_revision,matches!(change,MapChange::RouteBlocked)).await;
+                                } else {
+                                    publish_unrelated_geometry(&handle, &message, &snapshot,
+                                        &mut committed, &mut publication_revision).await;
+                                }
                                 published_maps.insert(publication_revision as u64, committed.clone());
                                 if prepared { break true; }
                             },
@@ -251,7 +302,19 @@ mod continuous_map_transaction_tests {
             }
             original_wait = Some(since);
             gates_since_dispatch += 1;
-            if interval.is_zero() && gate_every_prepare && !change_target {
+            if interval.is_zero() && matches!(change,MapChange::RouteBlocked) && index == 0 {
+                // 首轮只换远处地图；第二轮完整重核通过后才横向封闭实际所选路线。
+                publish_unrelated_geometry(&handle,&message,&snapshot,
+                    &mut committed,&mut publication_revision).await;
+            } else if interval.is_zero() && matches!(change,MapChange::Refinement | MapChange::RouteBlocked) {
+                if matches!(change,MapChange::RouteBlocked) && index == 1 {
+                    let guard = audit.lock().unwrap();
+                    let goal = surface_owner_goal(guard.captures.last().unwrap().preview.as_ref().unwrap());
+                    assert_eq!(goal.metadata["selection_method"],"current_map_revalidation");
+                }
+                publish_route_update(&handle,&message,&snapshot,&audit,
+                    &mut committed,&mut publication_revision,matches!(change,MapChange::RouteBlocked)).await;
+            } else if interval.is_zero() && gate_every_prepare && !change_target {
                 publish_unrelated_geometry(
                     &handle,
                     &message,
@@ -356,7 +419,7 @@ mod continuous_map_transaction_tests {
                 .intent
                 .committed_map
                 .clone();
-            if interval.is_zero() {
+            if interval.is_zero() && matches!(change,MapChange::Unrelated | MapChange::Target) {
                 assert_eq!(
                     submitted_map, committed,
                     "新目标须保留当前核验输入的提交身份"
@@ -393,8 +456,8 @@ mod continuous_map_transaction_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn changing_unrelated_maps_revalidate_then_dispatch_without_accepting_old_transaction() {
-        let old = update_case(false, false, true, false, Duration::ZERO, false).await;
-        let new = update_case(true, false, true, false, Duration::ZERO, false).await;
+        let old = update_case(false, MapChange::Unrelated, true, false, Duration::ZERO, false).await;
+        let new = update_case(true, MapChange::Unrelated, true, false, Duration::ZERO, false).await;
         assert!(!old.0 && old.1 >= 2, "旧策略应在受控持续换图下反复撤销");
         assert!(
             new.0 && new.1 >= 1,
@@ -404,7 +467,7 @@ mod continuous_map_transaction_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn target_changes_still_discard_results_and_keep_original_stall_deadline() {
-        let result = update_case(true, true, true, true, Duration::ZERO, false).await;
+        let result = update_case(true, MapChange::Target, true, true, Duration::ZERO, false).await;
         assert!(
             !result.0 && result.1 >= 2,
             "实体持续覆盖候选时不得提交过时结果"
@@ -413,18 +476,35 @@ mod continuous_map_transaction_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn completed_revalidation_dispatches_with_unrelated_updates_every_one_to_three_seconds() {
-        let old = update_case(true, false, false, true, Duration::ZERO, false).await;
+        let old = update_case(true, MapChange::Unrelated, false, true, Duration::ZERO, false).await;
         assert!(
             !old.0 && old.1 >= 2,
             "原资格即使完成候选复核仍反复撤销并在原期限结束"
         );
         for seconds in 1..=3 {
             let current =
-                update_case(true, false, true, true, Duration::from_secs(seconds), true).await;
+                update_case(true, MapChange::Unrelated, true, true, Duration::from_secs(seconds), true).await;
             assert!(
                 current.0 && current.1 >= 1,
                 "每{seconds}秒更新无关区域时，重核候选必须进入实际子导航派发"
             );
         }
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn continuous_start_and_route_refinement_dispatches_within_original_deadline() {
+        for seconds in 1..=3 {
+            let result = update_case(true,MapChange::Refinement,true,true,Duration::from_secs(seconds),true).await;
+            assert!(result.0 && result.1 >= 1,
+                "起点及沿线每{seconds}秒细化后，应完成复核并持续派发两个子导航");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn crossing_route_obstacles_withhold_and_reevaluate_without_resetting_deadline() {
+        let result = update_case(true,MapChange::RouteBlocked,true,true,Duration::ZERO,false).await;
+        assert!(!result.0 && result.1 >= 2,
+            "候选完整复核后，沿线新实体应扣下结果并重新评估，原期限内不得误派发");
+    }
+
 }

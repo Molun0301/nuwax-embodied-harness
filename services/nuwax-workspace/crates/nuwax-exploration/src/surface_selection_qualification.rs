@@ -1,20 +1,13 @@
-//! 已完整重核候选的提交依据；只比较实际路线和目标依赖，不重新搜索路线。
+//! 已完整重核候选的提交依据；在当前输入上核验已选路线和目标。
 use super::*;
-use nuwax_nav_pct_native::{Band, Cell, Config};
-use std::collections::{BTreeMap, BTreeSet};
-
-#[derive(Debug)]
-pub(super) struct NativeSelectionInput {
-    pub config: Config,
-    pub cells: Vec<Cell>,
-    pub bands: Vec<Band>,
-}
+use nuwax_nav_pct_native::{Config, Planner};
+use std::collections::BTreeSet;
 
 /// 已完成完整精确路线复核的候选，在最新地图上的实际依赖。
 #[derive(Clone, Debug)]
 pub struct SurfaceSelectionQualification {
     source: SurfaceSnapshot,
-    native: Arc<NativeSelectionInput>,
+    native: Arc<Config>,
     terrain_source: nuwax_nav_runtime::native_map::PctTerrainSource,
     frontier: FrontierCandidate,
     goal: FrontierGoal,
@@ -22,7 +15,7 @@ pub struct SurfaceSelectionQualification {
     target_radius: f64,
     targets: Vec<([i32; 3], [f64; 3])>,
     visible: Option<BTreeSet<[i32; 3]>>,
-    route_columns: BTreeMap<i64, Vec<(i64, i64)>>,
+    routes: Vec<([f64; 3], [f64; 3])>,
     checked: Arc<Mutex<Option<(Weak<SurfaceSnapshot>, Option<&'static str>)>>>,
 }
 
@@ -41,7 +34,6 @@ impl SurfaceSelectionQualification {
         targets: &[nuwax_explore_routing::observation::ObservationTarget],
         view: Option<&nuwax_explore_routing::observation::ViewEstimate>,
         start: [f64; 3],
-        path: &[[f64; 3]],
     ) -> Self {
         let size = f64::from(source.config().voxel_size);
         let lookahead =
@@ -73,70 +65,30 @@ impl SurfaceSelectionQualification {
             target_radius,
             targets: Vec::new(),
             visible: view.map(|view| view.cells.clone()),
-            route_columns: BTreeMap::new(),
+            routes: vec![(
+                start,
+                [
+                    goal.pose.pose.position.x,
+                    goal.pose.pose.position.y,
+                    goal.pose.pose.position.z,
+                ],
+            )],
             checked: Arc::new(Mutex::new(None)),
         };
         result.targets = result.target_cells(targets);
-        result.include_route(path.iter().copied());
-        result.include_route(std::iter::once(start));
         result
     }
 
-    /// 同一计算中的返航、候选往返路线必须一起保留其实际依赖。
+    /// 同一计算中的返航、候选往返路线一起按原查询端点复核。
     pub fn include_route(&mut self, path: impl IntoIterator<Item = [f64; 3]>) {
-        let config = &self.native.config;
-        // 原生转移的足迹、坡度/台阶邻列及原净距软代价读取范围。
-        let radius = config
-            .footprint
-            .iter()
-            .map(|p| p[0].hypot(p[1]))
-            .fold(config.footprint_radius, f64::max)
-            + 4.0 * config.resolution
-            + 2.0 * config.resolution.max(0.05);
-        let endpoint_radius = 11.0 * config.resolution;
-        let mut first = None;
-        let mut last = None;
-        for point in path {
-            let xy = [point[0], point[1]];
-            first.get_or_insert(xy);
-            self.include_window(last.unwrap_or(xy), xy, radius);
-            last = Some(xy);
-        }
-        // 原生端点在正负10格内选择实测层，新近支撑也会改变起止绑定。
-        for xy in first.into_iter().chain(last) {
-            self.include_window(xy, xy, endpoint_radius);
-        }
-        for intervals in self.route_columns.values_mut() {
-            intervals.sort_unstable();
-            let mut merged: Vec<(i64, i64)> = Vec::new();
-            for &(start, end) in intervals.iter() {
-                if let Some(previous) = merged.last_mut().filter(|previous| start <= previous.1 + 1)
-                {
-                    previous.1 = previous.1.max(end);
-                } else {
-                    merged.push((start, end));
-                }
+        let mut points = path.into_iter();
+        if let Some(first) = points.next() {
+            let route = (first, points.last().unwrap_or(first));
+            if !self.routes.contains(&route) {
+                self.routes.push(route);
             }
-            *intervals = merged;
         }
         self.checked = Arc::new(Mutex::new(None));
-    }
-
-    fn include_window(&mut self, from: [f64; 2], to: [f64; 2], radius: f64) {
-        let size = self.native.config.resolution;
-        // 列的闭区间与段相触也纳入；向外保留一格，覆盖格边及坐标舍入。
-        let min: [i64; 2] = std::array::from_fn(|axis| {
-            ((from[axis].min(to[axis]) - radius) / size).floor() as i64 - 1
-        });
-        let max: [i64; 2] = std::array::from_fn(|axis| {
-            ((from[axis].max(to[axis]) + radius) / size).floor() as i64 + 1
-        });
-        for x in min[0]..=max[0] {
-            self.route_columns
-                .entry(x)
-                .or_default()
-                .push((min[1], max[1]));
-        }
     }
 
     fn target_cells(
@@ -171,7 +123,15 @@ impl SurfaceSelectionQualification {
             }
         }
         // 提交核对使用私有查询缓存，保持来源快照的缓存归属。
+        let started = std::time::Instant::now();
         let reason = self.check(&current.fork_for_planning());
+        tracing::info!(
+            event = "exploration.selection.current_input_checked",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            routes = self.routes.len(),
+            invalidation = reason,
+            "已选结果完成当前输入提交资格核对"
+        );
         *checked = Some((Arc::downgrade(current), reason));
         reason
     }
@@ -184,14 +144,14 @@ impl SurfaceSelectionQualification {
         }
         let (config, cells, bands) = match nuwax_nav_runtime::native_map::pct_input_for_source(
             current,
-            self.native.config.body_to_ground,
-            &self.native.config.boundary,
+            self.native.body_to_ground,
+            &self.native.boundary,
             self.terrain_source,
         ) {
             Ok(input) => input,
             Err(_) => return Some("selected_route_input_unavailable"),
         };
-        let before = &self.native.config;
+        let before = &self.native;
         let parameters = |c: &Config| {
             [
                 c.resolution,
@@ -213,38 +173,26 @@ impl SurfaceSelectionQualification {
         {
             return Some("selected_query_parameters");
         }
-        // 只比较逐段读取列的全部高度，不把路线外接矩形的空角当成依赖。
-        let inside = |x: i32, y: i32| {
-            self.route_columns
-                .get(&i64::from(x))
-                .is_some_and(|intervals| {
-                    intervals
-                        .iter()
-                        .any(|&(start, end)| start <= i64::from(y) && i64::from(y) <= end)
-                })
+        // 几何细化只触发当前输入的完整精确查询，数值变化本身不是阻断。
+        // 仅查询已选路线端点，不重新排名前沿，也不追加重试。
+        let mut planner = match Planner::from_cells(config, &cells, &bands) {
+            Ok(planner) => planner,
+            Err(_) => return Some("selected_route_input_unavailable"),
         };
-        let cell_values = |cells: &[Cell]| {
-            let mut values: Vec<_> = cells
-                .iter()
-                .filter(|c| inside(c.x, c.y))
-                .map(|c| (c.x, c.y, c.ground.to_bits(), c.ceiling.to_bits()))
-                .collect();
-            values.sort_unstable();
-            values
-        };
-        let band_values = |bands: &[Band]| {
-            let mut values: Vec<_> = bands
-                .iter()
-                .filter(|b| inside(b.x, b.y))
-                .map(|b| (b.x, b.y, b.low.to_bits(), b.high.to_bits()))
-                .collect();
-            values.sort_unstable();
-            values
-        };
-        if cell_values(&self.native.cells) != cell_values(&cells)
-            || band_values(&self.native.bands) != band_values(&bands)
-        {
-            return Some("selected_route_geometry");
+        for (index, &(from, to)) in self.routes.iter().enumerate() {
+            let route = match planner.plan(from, to) {
+                Ok(route) => route,
+                Err(_) => return Some("selected_route_blocked"),
+            };
+            // 所选候选保留独立完整复核的原端点容差；返航沿原完整查询合同。
+            if index == 0
+                && (route.path.len() < 2
+                    || route.path.last().is_none_or(|&end| {
+                        distance(end, to) > f64::from(current.config().voxel_size) * 0.25
+                    }))
+            {
+                return Some("selected_route_blocked");
+            }
         }
         let boundary = &before.boundary;
         let candidates = match current.frontier_candidates(boundary) {

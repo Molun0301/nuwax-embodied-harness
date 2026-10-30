@@ -17,7 +17,6 @@ use crate::{
 #[path = "surface_selection_qualification.rs"]
 mod selection_qualification;
 pub use selection_qualification::SurfaceSelectionQualification;
-use selection_qualification::NativeSelectionInput;
 
 /// 根拥有方注入的几何引用；地图身份、真实时效及域切换仍由注入方负责。
 #[derive(Clone, Default)]
@@ -191,7 +190,7 @@ struct CachedFrontierPlanner {
     resolution: f64,
     measured: Arc<std::collections::BTreeMap<[i32; 2], Vec<f64>>>,
     planner: Arc<Mutex<nuwax_nav_pct_native::Planner>>,
-    input: Arc<NativeSelectionInput>,
+    input: Arc<nuwax_nav_pct_native::Config>,
 }
 #[derive(Default)]
 struct NativeFrontierCache {
@@ -248,7 +247,7 @@ impl NativeFrontierCache {
             resolution,
             measured: Arc::new(measured),
             planner: Arc::new(Mutex::new(planner)),
-            input: Arc::new(NativeSelectionInput { config, cells, bands }),
+            input: Arc::new(config),
         };
         *state = Some(cached.clone());
         Ok(cached)
@@ -1341,7 +1340,7 @@ impl SurfaceGoalSourceAdapter {
             *planning.selection_qualification.lock().unwrap() = Some(
                 SurfaceSelectionQualification::new(
                     snapshot, native, frontier, &goal, self.observation_model.clone(),
-                    targets, view.as_ref(), current.0, &route.path,
+                    targets, view.as_ref(), current.0,
                 ),
             );
         }

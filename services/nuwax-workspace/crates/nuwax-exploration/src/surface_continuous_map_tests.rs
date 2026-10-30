@@ -164,7 +164,7 @@ fn revalidated_selection_compares_current_route_and_target_instead_of_whole_map_
     receiver.observe(blocked).unwrap();
     assert_eq!(
         qualification.invalidation(&receiver.freeze().unwrap()),
-        Some("selected_route_geometry")
+        Some("selected_route_blocked")
     );
     adapter.discard_prepared_poll().unwrap();
 }
@@ -529,4 +529,61 @@ fn failed_navigation_keeps_unfinished_search_order_across_changed_maps() {
     }
     assert!(exhausted, "当前输入完整处理后必须自然耗尽，不能继续空转");
     assert_eq!(adapter.history[0].failures, 1, "规划不可达不能冒充又一次子导航失败");
+}
+
+
+#[test]
+fn start_and_route_refinement_remains_feasible_but_a_crossing_wall_withholds_selection() {
+    let original = map();
+    let receiver = SurfaceInputReceiver::new();
+    receiver.observe(original.clone()).unwrap();
+    let mut adapter = source(receiver.clone(), 1);
+    let current = state(0.4, 1);
+    let first = receiver.freeze().unwrap().fork_for_planning().with_revalidation_advice();
+    let first_goal = goal(adapter.prepare_poll_with_planning_input(&current, &first)
+        .unwrap().outcome().as_ref().unwrap().clone());
+    adapter.discard_prepared_poll().unwrap();
+    let input = receiver.freeze().unwrap().fork_for_planning().with_revalidation_advice();
+    let selected = goal(adapter.prepare_poll_with_planning_input(&current, &input)
+        .unwrap().outcome().as_ref().unwrap().clone());
+    assert_eq!(selected.pose.pose.position, first_goal.pose.pose.position);
+    let qualification = input.selection_qualification().unwrap();
+    let start = current.robot_pose.pose.position;
+    let end = selected.pose.pose.position;
+    let middle = [(start.x + end.x) * 0.5, (start.y + end.y) * 0.5];
+    let original_native = NativeFrontierCache::default().get(&original, 0.3, &[]).unwrap();
+    let (before, _) = original_native.planner.lock().unwrap().geometry();
+    for revision in 1..=3 {
+        let points: Vec<_> = original.navigation_measured_points().unwrap().iter().map(|p| {
+            let near = (p[0] - start.x).hypot(p[1] - start.y) < 0.2
+                || (p[0] - middle[0]).hypot(p[1] - middle[1]) < 0.15;
+            (p[0] as f32, p[1] as f32, (p[2] + if p[2] < 1.0 && near { f64::from(revision) * 0.001 } else { 0.0 }) as f32)
+        }).collect();
+        let refined = Arc::new(SurfaceSnapshot::from_points(&points, original.config().clone(), 0.1).unwrap());
+        let native = NativeFrontierCache::default().get(&refined, 0.3, &[]).unwrap();
+        let (after, _) = native.planner.lock().unwrap().geometry();
+        assert!(before.iter().zip(&after).any(|(a,b)| a.ground != b.ground),
+            "细化必须实际改变原生地面高度，不能只更换地图引用");
+        receiver.observe(refined).unwrap();
+        assert_eq!(qualification.invalidation(&receiver.freeze().unwrap()), None,
+            "起点及路线中段的可通行细化不能扣留候选");
+    }
+    let axis = usize::from((end.y - start.y).abs() > (end.x - start.x).abs());
+    let wall: Vec<_> = (-10..=30).flat_map(|i| (2..=5).map(move |z| {
+        let mut point = [middle[0], middle[1], f64::from(z) * 0.1];
+        point[1-axis] = f64::from(i) * 0.1;
+        point
+    })).enumerate().map(|(i,p)| (i as u32,p)).collect();
+    let blocked = Arc::new(original.with_recent_obstacle_points(5,5,0,&[],wall).unwrap());
+    receiver.observe(blocked).unwrap();
+    assert_eq!(qualification.invalidation(&receiver.freeze().unwrap()), Some("selected_route_blocked"),
+        "横穿路线的实体必须扣下结果");
+    adapter.discard_prepared_poll().unwrap();
+    receiver.observe(original).unwrap();
+    let next = receiver.freeze().unwrap().fork_for_planning().with_revalidation_advice();
+    let restored = goal(adapter.prepare_poll_with_planning_input(&current, &next)
+        .unwrap().outcome().as_ref().unwrap().clone());
+    assert_eq!(restored.metadata["selection_method"], "current_map_revalidation");
+    assert!(next.selection_qualification().is_some());
+    adapter.commit_prepared_poll().unwrap();
 }

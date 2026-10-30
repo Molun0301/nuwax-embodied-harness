@@ -58,6 +58,7 @@ struct Inputs {
     pose: Option<PoseStamped>,
     pose_version: u64,
     requested: Option<f64>,
+    recheck_candidate: Option<(Twist2,u64,std::time::Instant)>,
     control_width: Option<f64>,
     control_period: Option<Duration>,
     applied: Twist2,
@@ -69,6 +70,7 @@ struct Inputs {
     result_execution_context: Option<Arc<ActualExecutionContext>>,
     execution_context: Option<ExecutionContextPublication>,
     result_dispatch_bound: Option<CommandDispatchBound>,
+    result_execution_window: Option<(u64,Duration)>,
     #[cfg(test)]
     result_proof: Option<crate::command_proof_trace::PublishedCommandContext>,
     result_pose_version: u64,
@@ -134,10 +136,25 @@ pub(crate) struct PlannerWorker {
     delivered_pending: Option<std::time::Instant>,
     delivered_dispatch_bound: Option<CommandDispatchBound>,
     delivered_execution_context: Option<Arc<ActualExecutionContext>>,
+    delivered_command: Option<ExecutingCommand>,
+    executing_command: Option<ExecutingCommand>,
+    computation_pending: bool,
     #[cfg(test)]
     delivered_command_deadline: Option<std::time::Instant>,
     #[cfg(test)]
     delivered_command_context: Option<crate::command_proof_trace::DeliveredCommandContext>,
+}
+
+// 只保存已选命令原有的执行范围；APPLIED之后才能用它跨过计算空档。
+struct ExecutingCommand {
+    command: Twist2,
+    epoch: u64,
+    map_version: u64,
+    boundary_version: u64,
+    started: std::time::Instant,
+    dispatch_bound: Option<CommandDispatchBound>,
+    source_timestamp_ns: u64,
+    duration: Duration,
 }
 impl PlannerWorker {
     #[cfg(test)]
@@ -175,6 +192,7 @@ impl PlannerWorker {
                         pose,
                         pose_seq,
                         width,
+                        recheck_candidate,
                         control_period,
                         applied,
                         applied_seq,
@@ -203,6 +221,17 @@ impl PlannerWorker {
                         }
                         input.lifecycle_update=false;
                         input.map_pending=false;
+                        let recheck_candidate=input.recheck_candidate.take().or_else(|| {
+                            let (started,PlannerStep::Command(command))=input.result.as_ref()? else {return None;};
+                            let stale=input.result_pose_version!=input.pose_version
+                                || input.result_motion_version!=input.motion_version
+                                || input.result_map_version!=input.map_version
+                                || input.result_boundary_version!=input.boundary_version;
+                            (stale && *command!=Twist2::ZERO && input.applied!=Twist2::ZERO
+                                && input.result_applied_version==input.applied_version
+                                && started.elapsed()<=DEFAULT_CONTROL_HORIZON)
+                                .then_some((*command,input.applied_version,*started))
+                        });
                         (
                             input.epoch,
                             input.goal_id.clone(),
@@ -220,6 +249,7 @@ impl PlannerWorker {
                                 input.pose.clone(),
                             input.pose_version,
                             input.requested.take(),
+                            recheck_candidate,
                             input.control_period,
                             input.applied,
                             input.applied_version,
@@ -240,7 +270,8 @@ impl PlannerWorker {
                         )
                     };
                     if let Some(period)=control_period {planner.set_control_period(period);}
-                    let started = std::time::Instant::now();
+                    let compute_started = std::time::Instant::now();
+                    let mut started=compute_started;
                     let mut inputs_consumed=false;
                     let mut admission_refusal_context=None;
                     let consumed_applied=applied;
@@ -308,13 +339,22 @@ impl PlannerWorker {
                         }
                         planner.observe_applied_command(applied);
                         inputs_consumed=true;
-                        Ok(width.map_or(PlannerStep::Pending(Vec::new()),|width|planner.step(width)))
+                        Ok(width.map_or(PlannerStep::Pending(Vec::new()),|width| {
+                            let checked=recheck_candidate.filter(|(_,version,origin)|
+                                *version==applied_seq && applied!=Twist2::ZERO && origin.elapsed()<=DEFAULT_CONTROL_HORIZON)
+                                .and_then(|(command,_,origin)|planner.recheck_command(width,command).map(|step|(step,origin)));
+                            match checked {
+                                Some((step,origin))=>{started=origin;step},
+                                None=>planner.step(width),
+                            }
+                        }))
                     })()
                     .unwrap_or_else(|error| PlannerStep::ReplanRequired(error.to_string()));
                     let cycle_complete=inputs_consumed && width.is_some()
                         && matches!(&computed,PlannerStep::ReplanRequired(_))
                         && planner.execution_cycle_complete();
                     let mut dispatch_bound=planner.take_command_dispatch_bound();
+                    let execution_window=planner.take_command_execution_window();
                     #[cfg(test)] let computed_proof=compute_trace.and_then(|trace|trace.finish(&computed));
                     if !matches!(&computed,PlannerStep::Command(v) if *v!=Twist2::ZERO) {dispatch_bound=None;}
                     // Geometry stays on this worker, outside the input lock. Bind
@@ -344,7 +384,7 @@ impl PlannerWorker {
                     let display_path = if matches!(computed, PlannerStep::Command(_)) {
                         planner.local_path_for_display()
                     } else { Vec::new() };
-                    let elapsed = started.elapsed();
+                    let elapsed = compute_started.elapsed();
                     // 快速重规划也保留原因，避免被紧接着的路径接纳状态覆盖；不改变计算结果。
                     let diagnostic_result = ((elapsed > DEFAULT_CONTROL_HORIZON
                         || matches!(computed, PlannerStep::ReplanRequired(_) | PlannerStep::Failed(_)))
@@ -363,6 +403,16 @@ impl PlannerWorker {
                                 || input.pose_version == pose_seq)))
                         && !input.closed;
                     // 换目标、换路径、取消或来源撤销后的迟到结果一律退休。
+                    if !current && input.epoch==version && !input.closed && input.applied!=Twist2::ZERO
+                        && input.applied_version==applied_seq {
+                        if let PlannerStep::Command(command)=&computed {
+                            if *command!=Twist2::ZERO && started.elapsed()<=DEFAULT_CONTROL_HORIZON {
+                                // 只复核仍基于同一真实执行版本的已选指令，不重放已消费结果。
+                                input.recheck_candidate=Some((*command,applied_seq,started));
+                                input.requested=input.control_width;
+                            }
+                        }
+                    }
                     if current && !input.result.as_ref().is_some_and(|(_,step)|recovery_stop(step)) {
                         let computed=if dispatch_bound.is_some_and(CommandDispatchBound::expired_now) {
                             dispatch_bound=None;
@@ -382,6 +432,7 @@ impl PlannerWorker {
                             if cycle_complete {None} else {context}
                         } else {None};
                         input.result_dispatch_bound=dispatch_bound;
+                        input.result_execution_window=execution_window;
                         input.result = Some((started, computed));
                         #[cfg(test)] {input.result_proof=if matches!(input.result.as_ref(),Some((_,PlannerStep::Command(_)))) {computed_proof.map(|proof|proof.published_for(started))}else{None};}
                         input.result_pose_version = pose_seq;
@@ -413,6 +464,9 @@ impl PlannerWorker {
             delivered_pending: None,
             delivered_dispatch_bound: None,
             delivered_execution_context: None,
+            delivered_command: None,
+            executing_command: None,
+            computation_pending: false,
             #[cfg(test)]
             delivered_command_deadline: None,
             #[cfg(test)]
@@ -464,6 +518,7 @@ impl NavPlanner for PlannerWorker {
         options.validate().map_err(RuntimeError::Planner)?;
         let mut input = self.shared.0.lock().unwrap();
         input.epoch += 1;
+        input.recheck_candidate=None;
         input.result = None;
         input.result_execution_context=None;
         input.result_dispatch_bound=None;
@@ -494,6 +549,7 @@ impl NavPlanner for PlannerWorker {
         self.delivered_execution_context=None;
         let mut input = self.shared.0.lock().unwrap();
         input.epoch += 1;
+        input.recheck_candidate=None;
         input.result = None;
         input.result_execution_context=None;
         input.result_dispatch_bound=None;
@@ -513,10 +569,11 @@ impl NavPlanner for PlannerWorker {
             !same_pose(previous, &pose))
         {
             input.pose_version += 1;
-            // Refresh an unissued selection ahead of the next control tick.
-            // This is one trajectory check; unchanged timestamp-only receipts
-            // neither invalidate nor re-enumerate the selected candidate.
-            if input.result.as_ref().is_some_and(|(_,step)|matches!(step,PlannerStep::Command(c) if *c!=Twist2::ZERO)) {
+            // 行进期间的新位姿立即请求下一次复核，包括结果尚在计算中的情况。
+            // 退休旧采样的在途结果后，直接消费已排队的新快照，不空等发布拍。
+            // 只有时间戳变化、几何相同的回执仍不触发额外计算。
+            if input.applied!=Twist2::ZERO
+                || input.result.as_ref().is_some_and(|(_,step)|matches!(step,PlannerStep::Command(c) if *c!=Twist2::ZERO)) {
                 input.requested=input.control_width;
             }
             input.lifecycle_update=true;
@@ -563,6 +620,11 @@ impl NavPlanner for PlannerWorker {
         self.shared.1.notify_one();
     }
     fn observe_applied_command(&mut self, command: Twist2) {
+        if let Some(delivered)=self.delivered_command.take() {
+            self.executing_command= same_applied(delivered.command,command).then_some(delivered);
+        } else if self.executing_command.as_ref().is_some_and(|active|!same_applied(active.command,command)) {
+            self.executing_command=None;
+        }
         self.delivered_dispatch_bound=None;
         self.delivered_execution_context=None;
         let mut input = self.shared.0.lock().unwrap();
@@ -618,13 +680,49 @@ impl NavPlanner for PlannerWorker {
         self.shared.1.notify_one();
     }
     fn take_command_dispatch_bound(&mut self)->Option<CommandDispatchBound> {self.delivered_dispatch_bound.take()}
+    fn retain_applied_command(&self)->bool {
+        if !self.computation_pending {
+            return false;
+        }
+        let Some(active)=&self.executing_command else {
+            return false;
+        };
+        let input=self.shared.0.lock().unwrap();
+        // step取快照后可能刚发布停车结果，不能再用先前的计算空档覆盖它。
+        let stored_stop=input.result.as_ref().is_some_and(|(_,step)|
+            !matches!(step,PlannerStep::Command(command) if *command!=Twist2::ZERO));
+        let identity_current=active.epoch==input.epoch && active.map_version==input.map_version
+            && active.boundary_version==input.boundary_version && !input.closed
+            && same_applied(active.command,input.applied);
+        let (mut issue_age,mut dispatch_expired,mut source_age)=(None,None,None);
+        let permitted= !stored_stop && identity_current
+            && {let age=active.started.elapsed();issue_age=Some(age);age<=DEFAULT_CONTROL_HORIZON}
+            && {let expired=active.dispatch_bound.is_some_and(CommandDispatchBound::expired_now);
+                dispatch_expired=Some(expired);!expired}
+            && crate::command_dispatch::unix_ns().is_some_and(|now| {
+                let age=nuwax_nav_types_messages::source_time::data_age_ns_at(active.source_timestamp_ns,now);
+                let allowed=age.as_ref().is_ok_and(|age|u128::from(*age)<active.duration.as_nanos());
+                source_age=Some(age);allowed
+            });
+        if !permitted {
+            // 只记录本次实际求值的结果；None表示短路未求值，不重新判定时效。
+            tracing::debug!(target:"navigation.command",event="continuation_not_held",stored_stop,identity_current,
+                issue_age_ms=?issue_age.map(|age|age.as_secs_f64()*1000.),?dispatch_expired,source_age_ns=?source_age,
+                duration_ms=active.duration.as_secs_f64()*1000.,active_map_version=active.map_version,
+                current_map_version=input.map_version,"命令保持资格的原判定结果");
+        }
+        permitted
+    }
     fn prepare_control_step(&mut self, width: f64, continuing_wait: bool) -> Option<watch::Receiver<()>> {
         let mut input = self.shared.0.lock().unwrap();
         if self.thread.as_ref().is_none_or(|thread| thread.is_finished()) {
             return None;
         }
         input.control_width = Some(width);
-        if input.result.as_ref().is_some_and(|(_,step)|recovery_stop(step)) {
+        let retained_wait=continuing_wait && self.computation_pending && self.executing_command.is_some();
+        // 空档只转为一次订阅；下一次就绪检查必须交付结果，不能反复订阅已就绪结果。
+        if retained_wait {self.computation_pending=false;}
+        if !retained_wait && input.result.as_ref().is_some_and(|(_,step)|recovery_stop(step)) {
             return None;
         }
         // Subscribe and inspect under the publication lock: a result cannot be
@@ -651,14 +749,21 @@ impl NavPlanner for PlannerWorker {
             || input.result_motion_version != input.motion_version
             || input.result_map_version != input.map_version
             || input.result_boundary_version != input.boundary_version);
-        if !refresh_in_tick && !delivery_gap && !still_waiting {
+        if !refresh_in_tick && !delivery_gap && !still_waiting && !retained_wait {
             return None;
+        }
+        if retained_wait && input.result.as_ref().is_some_and(|(_,step)|
+            !still_waiting || !matches!(step,PlannerStep::Command(command) if *command!=Twist2::ZERO)) {
+            // 结果可能在step读取空档后已经发布；仅唤醒本订阅者，交付仍经原版本检查。
+            publication.mark_changed();
         }
         input.requested = Some(width);
         self.shared.1.notify_one();
         Some(publication)
     }
     fn step(&mut self, width: f64) -> PlannerStep {
+        self.delivered_command=None;
+        self.computation_pending=false;
         self.delivered_dispatch_bound=None;
         self.delivered_execution_context=None;
         #[cfg(test)] {self.delivered_command_context=None;}
@@ -712,6 +817,17 @@ impl NavPlanner for PlannerWorker {
                 }
             })
             .map(|(_, step)| step.clone());
+        // 明确的待定、零速和终态仍要求停车；只有计算尚未交付才能保持原命令。
+        self.computation_pending=ready.is_none() && !input.result.as_ref().is_some_and(|(_,step)|
+            !matches!(step,PlannerStep::Command(command) if *command!=Twist2::ZERO));
+        self.delivered_command=match (&ready,input.result_execution_window) {
+            (Some(PlannerStep::Command(command)),Some((source_timestamp_ns,duration))) if *command!=Twist2::ZERO => {
+                Some(ExecutingCommand {command:*command,epoch:input.epoch,map_version:input.result_map_version,
+                    boundary_version:input.result_boundary_version,started:input.result.as_ref().unwrap().0,
+                    dispatch_bound:input.result_dispatch_bound,source_timestamp_ns,duration})
+            },
+            _=>None,
+        };
         #[cfg(test)]
         { self.delivered_command_deadline=if matches!(&ready,Some(PlannerStep::Command(_))) {
             input.result.as_ref().map(|(started,_)|*started+DEFAULT_CONTROL_HORIZON)
@@ -771,6 +887,9 @@ impl NavPlanner for PlannerWorker {
         self.wait_reason.clone()
     }
     fn stop(&mut self) {
+        self.delivered_command=None;
+        self.executing_command=None;
+        self.computation_pending=false;
         self.delivered_dispatch_bound=None;
         self.delivered_execution_context=None;
         self.delivered_pending=None;
@@ -783,6 +902,7 @@ impl NavPlanner for PlannerWorker {
                 publication.is_current(&input) && publication.context.as_ref()
                     .is_some_and(|context|same_applied(context.applied,Twist2::ZERO)));
         input.epoch += 1;
+        input.recheck_candidate=None;
         input.result = None;
         input.result_execution_context=None;
         input.result_dispatch_bound=None;

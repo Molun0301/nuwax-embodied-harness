@@ -105,6 +105,7 @@ pub struct SurfaceFollower {
     #[cfg(test)]
     frame_ingestion_count:usize,
     motion_dispatch_bound: Option<crate::CommandDispatchBound>,
+    command_execution_window: Option<(u64,std::time::Duration)>,
     motion_boundary: Option<crate::motion_feedback::MotionBoundary>,
     motion_boundary_sources: Option<[nuwax_nav_scan_native::MotionBoundarySource;3]>,
     progress: f64,
@@ -188,6 +189,7 @@ impl SurfaceFollower {
             #[cfg(test)]
             frame_ingestion_count:0,
             motion_dispatch_bound: None,
+            command_execution_window: None,
             motion_boundary: None,
             motion_boundary_sources: None,
             progress: 0.,
@@ -299,6 +301,9 @@ impl SurfaceFollower {
         else { PlannerStep::ReplanRequired(reason) }
     }
     fn compute(&mut self, robot_width_m: f64) -> Result<Twist2, String> {
+        self.compute_command(robot_width_m,None)
+    }
+    fn compute_command(&mut self, robot_width_m:f64, selected:Option<Twist2>) -> Result<Twist2,String> {
         self.update_progress();
         let map = self.map.as_ref().ok_or("等待局部感知")?;
         let pose = self.odometry.as_ref().ok_or("等待实际位姿")?;
@@ -449,9 +454,12 @@ impl SurfaceFollower {
             }
         }
         let position_reached = self.position_reached();
-        let result = self
-            .native_planner
-            .step(&nuwax_nav_scan_native::PlanRequest {
+        // 命令周期从本次检查开始算，观测采样的原截止仍由motion_dispatch_bound保留。
+        // 来源时间只读实际采集记录，不按倍率外推，也不改变检查使用的位姿与测速。
+        let execution_started=crate::command_dispatch::unix_ns().and_then(|now|
+            nuwax_nav_types_messages::source_time::data_age_ns_at(pose.stamp.nanos as u64,now)
+                .ok().map(|age|pose.stamp.nanos as u64+age));
+        let request = nuwax_nav_scan_native::PlanRequest {
                 obstacles: &obstacles,
                 ground: &ground,
                 forbidden_columns: &input.forbidden_columns,
@@ -473,7 +481,15 @@ impl SurfaceFollower {
                 start_yaw_rate: boundary.yaw_rate,
                 odometry_timestamp_ns: pose.stamp.nanos,
                 config,
-            })?;
+            };
+        let result=if let (Some(command),Some(velocity),Some(rate))=(selected,boundary.velocity,boundary.yaw_rate) {
+            self.native_planner.recheck_command(&request,[command.linear.x,command.linear.y,command.angular_z],velocity,rate)?
+        } else {self.native_planner.step(&request)?};
+        self.command_execution_window=execution_started.map(|started|(started,
+            std::time::Duration::from_secs_f64(result.command_duration)));
+        if selected.is_some() && boundary.velocity.is_some() && boundary.yaw_rate.is_some() {
+            return Ok(Twist2{linear:Point2::new(result.command_forward,result.command_lateral),angular_z:result.command_yaw_rate});
+        }
         if self.motion_boundary_sources != Some(result.motion_boundary_sources) {
             tracing::info!(target:"navigation.motion_feedback", source=?boundary.source_id,
                 motion_timestamp_ns=?boundary.motion_timestamp_ns,pose_timestamp_ns=boundary.pose_timestamp_ns,
@@ -520,6 +536,7 @@ impl SurfaceFollower {
                 .collect(),
             ..path.clone()
         });
+        // 保留原生扫掠的一个执行周期，计算等待不创建新的运动证明。
         Ok(Twist2 {
             linear: Point2::new(result.command_forward, result.command_lateral),
             angular_z: result.command_yaw_rate,
@@ -660,6 +677,9 @@ impl NavPlanner for SurfaceFollower {
         self.measured_motion=motion.filter(crate::MeasuredMotion::is_current);
     }
     fn take_command_dispatch_bound(&mut self)->Option<crate::CommandDispatchBound> { self.motion_dispatch_bound.take() }
+    fn take_command_execution_window(&mut self)->Option<(u64,std::time::Duration)> {
+        self.command_execution_window.take()
+    }
     fn refresh_execution_context(
         &mut self,
         applied: Twist2,
@@ -682,6 +702,7 @@ impl NavPlanner for SurfaceFollower {
         self.execution_cycle_complete=false;
         self.execution_failed=false;
         self.motion_dispatch_bound=None;
+        self.command_execution_window=None;
         if self.reached() {
             return PlannerStep::Succeeded;
         }
@@ -698,6 +719,19 @@ impl NavPlanner for SurfaceFollower {
                 self.computed_failure_step(reason)
             }
         }
+    }
+    fn recheck_command(&mut self,robot_width_m:f64,command:Twist2)->Option<PlannerStep> {
+        if self.position_reached() {return None;}
+        // 初始化、源域重置和原状态机停车阶段不进入独立复核。
+        if !self.native_planner.command_recheck_ready() {return None;}
+        self.execution_cycle_complete=false;
+        self.execution_failed=false;
+        self.motion_dispatch_bound=None;
+        self.command_execution_window=None;
+        Some(match self.compute_command(robot_width_m,Some(command)) {
+            Ok(command)=>{self.wait_reason=None;PlannerStep::Command(command)},
+            Err(reason)=>{self.wait_reason=Some(reason.clone());self.computed_failure_step(reason)},
+        })
     }
     fn stop(&mut self) {
         self.path = None;
@@ -870,6 +904,7 @@ mod native_execution_tests {
         next.identity.domain.runtime_generation+=1;
         follower.observe_registered_frame(Some(Arc::new(next)));
         assert!(follower.ingested_frame.is_none());
+        assert!(follower.recheck_command(0.3,Twist2{linear:Point2::new(0.1,0.),angular_z:0.}).is_none());
         let _=follower.compute(0.3);
         assert_eq!(follower.frame_ingestion_count,2);
         follower.observe_registered_frame(None);

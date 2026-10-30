@@ -858,6 +858,12 @@ pub trait NavPlanner: Send + 'static {
     /// Take observation timing metadata belonging only to the immediately returned command.
     /// None means that this result has no finite observation-time dependency.
     fn take_command_dispatch_bound(&mut self)->Option<CommandDispatchBound> {None}
+    /// 原生检查开始的实际来源时刻与命令执行周期；不代表观测续期或新的下发许可。
+    fn take_command_execution_window(&mut self)->Option<(u64,Duration)> {None}
+    /// 计算空档内，已应用命令是否仍在原有证明周期中；不得重新下发或续期。
+    fn retain_applied_command(&self)->bool {false}
+    /// 在途结果的执行版本仍匹配时，以最新输入复核已选指令；其它后端沿原计算步骤。
+    fn recheck_command(&mut self,_robot_width_m:f64,_command:Twist2)->Option<PlannerStep> {None}
     /// 传递既有导航会话标识用于计算线程日志，不参与运动准入。
     fn set_goal_log_context(&mut self, _goal_id: &str) {}
     /// 接续局部路线时保留已受理任务边界；无局部重规划的后端可沿原全局路径。
@@ -1097,6 +1103,7 @@ pub struct NavScheduler<M, P> {
     costmap_receipt: Option<PlannerInputReceipt>,
     map_invalidated_at: Option<Instant>,
     operation_sequence: u64,
+    retained_command_publication: Option<watch::Receiver<()>>,
     status: SchedulerStatus,
     #[cfg(feature = "surface-recovery-qualification")]
     qualification_timing: Option<qualification_timing::TraceSink>,
@@ -1145,6 +1152,7 @@ where
             costmap_receipt: None,
             map_invalidated_at: None,
             operation_sequence: 0,
+            retained_command_publication: None,
             status,
             #[cfg(feature = "surface-recovery-qualification")]
             qualification_timing: None,
@@ -1214,6 +1222,14 @@ where
         let mut deferred_control: Option<DeferredControl> = None;
 
         loop {
+            if let Some(publication)=self.retained_command_publication.take() {
+                if let Some(identity)=self.current_execution_identity.clone() {
+                    deferred_control=Some(DeferredControl {
+                        publication,deadline:Instant::now()+self.config.tick_interval,
+                        identity,queued_inputs:None,finish_wait:false,
+                    });
+                }
+            }
             // A deferred tick belongs to one accepted path, never the next goal
             // or a replacement path admitted while computation was outstanding.
             if deferred_control.as_ref().is_some_and(|wait|
@@ -1882,6 +1898,7 @@ where
         &mut self,
         status_tx: &watch::Sender<SchedulerStatus>,
     ) -> Result<(), RuntimeError> {
+        self.retained_command_publication=None;
         #[cfg(feature = "surface-recovery-qualification")]
         let _qualification_span = self.qualification_span("scheduler.control_tick", self.status.pose_source_timestamp_ns);
         #[cfg(feature = "surface-recovery-qualification")]
@@ -1930,6 +1947,10 @@ where
         match intent.payload {
             LocalExecutionPayload::Command(twist) => {
                 let wait_reason = self.planner.execution_wait_reason();
+                if twist==Twist2::ZERO {
+                    tracing::info!(target:"navigation.command", zero_source="controller",
+                        reason=?wait_reason, "导航零指令来源");
+                }
                 if !self.apply_controller_twist_with_bound(status_tx, twist, intent.dispatch_bound).await? {
                     self.path_wait_started_at.get_or_insert_with(Instant::now);
                     return self.check_path_wait_timeout(status_tx).await;
@@ -1947,6 +1968,15 @@ where
                 Ok(())
             }
             LocalExecutionPayload::Pending(failures) => {
+                if self.planner.retain_applied_command() {
+                    // 原命令有效期间继续等待下一结果；完成即交付，不空等下一发布拍。
+                    self.retained_command_publication=self.planner.prepare_control_step(self.config.robot_width_m,true);
+                    self.status.message = "局部轨迹正在计算，已应用命令仍在原证明周期内".into();
+                    self.publish_status(status_tx);
+                    return Ok(());
+                }
+                tracing::info!(target:"navigation.command", zero_source="pending",
+                    reason=?self.planner.execution_wait_reason(), "导航零指令来源");
                 self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
                 self.path_wait_started_at.get_or_insert_with(Instant::now);
                 // Rebuild from this tick's evidence; never append to the previous status.
@@ -1960,6 +1990,7 @@ where
                 self.check_path_wait_timeout(status_tx).await
             }
             LocalExecutionPayload::ReplanRequired(reason) => {
+                tracing::info!(target:"navigation.command", zero_source="replan", %reason, "导航零指令来源");
                 self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
                 // A same-valued ZERO receipt leaves the worker's exact actual
                 // input versions current. Preserve that snapshot before stop
@@ -2059,6 +2090,7 @@ where
             match outcome {
                 Ok(BoundedTwistOutcome::Applied(_))=>{},
                 Ok(BoundedTwistOutcome::ExpiredNotApplied) if bound.is_some()=>{
+                    tracing::info!(target:"navigation.command", zero_source="dispatch_expired", "导航零指令来源");
                     applied_twist=Twist2::ZERO;bound=None;expired=true;continue;
                 },
                 Ok(BoundedTwistOutcome::ExpiredNotApplied)=>{
@@ -2158,6 +2190,7 @@ where
         // 重复过期、零速回执和新路径都不能重置原等待起点。
         self.path_wait_started_at.get_or_insert_with(Instant::now);
         if self.lease_active {
+            tracing::info!(target:"navigation.command", zero_source="stale_input", %reason, "导航零指令来源");
             self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
         }
         self.status.message = format!("等待新鲜导航输入: {reason}");
@@ -2914,6 +2947,7 @@ fn path_rejected(reason: impl Into<String>) -> RuntimeError {
 #[cfg(test)]
 mod tests {
     include!("scheduler_delivery_gap_tests.rs");
+    mod command_continuity { include!("command_continuity_tests.rs"); }
     include!("arrival_confirmation_tests.rs");
     include!("position_zero_runtime_tests.rs");
     include!("yaw_zero_contract_tests.rs");

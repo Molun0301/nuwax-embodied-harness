@@ -199,7 +199,7 @@ fn check_recorded_start(route: &[[f64; 3]], velocity: [f64; 3], registered: bool
         req.odometry_timestamp_ns = 1_000_000_000 + tick * 50_000_000;
         let result = planner.step(&req).unwrap();
         if !result.samples.is_empty() && result.command_forward.hypot(result.command_lateral) > 1e-6 {
-            assert_eq!(result.motion_boundary_sources[0], MotionBoundarySource::Measured);
+            assert_eq!(result.motion_boundary_sources[0], MotionBoundarySource::SmoothedMeasured);
             // 首次加速度沿用原初始化来源，不能把没有的观测伪装成实测。
             assert_eq!(result.motion_boundary_sources[1], MotionBoundarySource::InitialZeroAssumption);
             let first = result.samples[0];

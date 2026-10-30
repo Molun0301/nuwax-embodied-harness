@@ -58,7 +58,7 @@ pub struct TrajectorySample {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MotionBoundarySource { Measured, PreviousTrajectory, InitialZeroAssumption, PreviousControlEstimate, AuthorDirectionReset }
+pub enum MotionBoundarySource { Measured, PreviousTrajectory, InitialZeroAssumption, PreviousControlEstimate, AuthorDirectionReset, SmoothedMeasured }
 
 #[derive(Debug, Clone)]
 pub struct PlanResult {
@@ -326,6 +326,7 @@ fn call_native(
             0 => MotionBoundarySource::Measured, 1 => MotionBoundarySource::PreviousTrajectory,
             3 => MotionBoundarySource::PreviousControlEstimate,
             4 => MotionBoundarySource::AuthorDirectionReset,
+            5 => MotionBoundarySource::SmoothedMeasured,
             _ => MotionBoundarySource::InitialZeroAssumption,
         }),
     };
@@ -340,6 +341,7 @@ mod tests {
     include!("command_limit_tests.rs");
     include!("surface_execution_tests.rs");
     include!("clearance_tests.rs");
+    include!("gait_velocity_tests.rs");
     // These component fixtures provide static occupancy, not live sensor frames.
     // One call remains one real FSM tick; no synthetic catch-up ticks are added.
     fn fixture_planner() -> Planner {

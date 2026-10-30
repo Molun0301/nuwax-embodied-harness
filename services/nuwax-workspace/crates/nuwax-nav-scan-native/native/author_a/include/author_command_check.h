@@ -122,11 +122,13 @@ inline bool collisionFree(GridMap& map, State actual, const CheckedCommand& comm
 
 inline CheckedCommand checkAuthorCommand(GridMap& map, const ScanConfig& c,
     const Eigen::Vector3d& position, double yaw, const Eigen::Vector2d& actual_world_velocity,
-    double actual_angular, const Eigen::Vector2d& preferred, double preferred_angular,
+    double actual_angular, const Eigen::Vector2d& command_world_velocity,
+    const Eigen::Vector2d& preferred, double preferred_angular,
     const Eigen::Vector3d& reference_position, double desired_yaw, bool translation_goal) {
   using namespace command_check_detail;
   const auto deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(c.sample_dt));
   const State actual{position, yaw, body(actual_world_velocity, yaw), actual_angular};
+  const State command_start{position, yaw, body(command_world_velocity, yaw), actual_angular};
   const double radius = std::hypot(c.body_length / 2. + std::abs(c.body_center_x),
       c.body_width / 2. + std::abs(c.body_center_y));
   bool exhausted = false;
@@ -150,7 +152,8 @@ inline CheckedCommand checkAuthorCommand(GridMap& map, const ScanConfig& c,
   };
   std::vector<CheckedCommand> candidates;
   const auto add = [&](const Eigen::Vector2d& target, double angular, bool stop) {
-    auto candidate = bounded(target, angular, actual, c, stop);
+    // 修正导航目标也从上一拍请求起步；制动候选和全部扫掠证明保留真实速度。
+    auto candidate = bounded(target, angular, stop?actual:command_start, c, stop);
     if ((original.linear.array() == candidate.linear.array()).all() && original.angular == candidate.angular) return;
     for (const auto& old : candidates)
       if ((old.linear.array() == candidate.linear.array()).all() && old.angular == candidate.angular) return;
@@ -176,7 +179,7 @@ inline CheckedCommand checkAuthorCommand(GridMap& map, const ScanConfig& c,
     add(preferred, angular, preferred.isZero(0.));
     if (translation_goal) {
       for (double x : fractions) for (double y : fractions)
-        add(actual.linear + Eigen::Vector2d(x, y) * (c.max_acceleration * c.sample_dt), angular, false);
+        add(command_start.linear + Eigen::Vector2d(x, y) * (c.max_acceleration * c.sample_dt), angular, false);
     }
   }
   // 排序只确定检查顺序，最终选择必须通过同一实际积分及制动查询。

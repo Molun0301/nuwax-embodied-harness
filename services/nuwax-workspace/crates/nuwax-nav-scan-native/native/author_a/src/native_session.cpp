@@ -35,6 +35,7 @@ struct AuthorSession {
  Vector3d last_position=Vector3d::Zero();double last_yaw=0;
  uint64_t plans=0;
  Eigen::Vector2d previous_control=Eigen::Vector2d::Zero(),sample_control=Eigen::Vector2d::Zero();
+ Vector3d travel_velocity=Vector3d::Zero();
  double previous_w=0,sample_w=0;bool has_control=false,has_sample=false;int64_t sample_time=0;
  void retireExecution() {
   if(fsm)fsm->retireExecution();
@@ -45,6 +46,7 @@ struct AuthorSession {
   command_target.setZero();command_target_yaw=0.;
   last_fsm=last_safety=last_control=std::numeric_limits<int64_t>::min();
   last_position.setZero();last_yaw=0.;previous_control.setZero();sample_control.setZero();
+  travel_velocity.setZero();
   previous_w=sample_w=0.;has_control=has_sample=false;sample_time=0;
  }
  bool hasExecution()const{return !reference.empty()||controller.receive_traj;}
@@ -153,9 +155,7 @@ extern "C" int nuwax_scan_session_plan(void* raw,SCAN_ARGUMENTS) {
      throw;
     }
     // 独立短距证明没有执行原曲线；退出后由原FSM从真实新位置重新起算。
-    const double cs=std::cos(start_yaw),sn=std::sin(start_yaw);
-    s.previous_control={cs*output->command_forward-sn*output->command_lateral,
-        sn*output->command_forward+cs*output->command_lateral};
+    s.previous_control={output->command_forward,output->command_lateral};
     s.previous_w=output->command_yaw_rate;s.has_control=true;
     return 0;
    }
@@ -167,10 +167,26 @@ extern "C" int nuwax_scan_session_plan(void* raw,SCAN_ARGUMENTS) {
   auto odom=std::make_shared<nav_msgs::Odometry>();odom->pose.pose.position.x=position.x();odom->pose.pose.position.y=position.y();odom->pose.pose.position.z=position.z();
   odom->pose.pose.orientation.w=std::cos(start_yaw/2.);odom->pose.pose.orientation.z=std::sin(start_yaw/2.);
   if(start_velocity){odom->twist.twist.linear.x=start_velocity[0];odom->twist.twist.linear.y=start_velocity[1];odom->twist.twist.linear.z=start_velocity[2];}
-  s.fsm->onOdometry(odom,start_velocity!=nullptr);s.controller.odomCallback(odom);
-  if(!s.has_sample||odometry_timestamp_ns>s.sample_time){s.sample_time=odometry_timestamp_ns;s.sample_control=s.previous_control;s.sample_w=s.previous_w;s.has_sample=true;}
-  const Eigen::Vector2d actual_v=start_velocity?Eigen::Map<const Vector3d>(start_velocity).head<2>().eval():s.sample_control;
+  const double cs=std::cos(start_yaw),sn=std::sin(start_yaw);
+  if(!s.has_sample||odometry_timestamp_ns>s.sample_time){
+   const Vector3d measured(odom->twist.twist.linear.x,odom->twist.twist.linear.y,odom->twist.twist.linear.z);
+   if(!s.has_sample)s.travel_velocity=measured;
+   else {
+    // 一秒时间常数覆盖步态周期；只平滑规划边界，安全检查始终保留原始实测。
+    const double weight=-std::expm1(-double(odometry_timestamp_ns-s.sample_time)*1e-9);
+    s.travel_velocity.head<2>()+=weight*(measured-s.travel_velocity).head<2>();
+    s.travel_velocity.z()=measured.z();
+   }
+   s.sample_time=odometry_timestamp_ns;
+   // 保存机体系请求；转向后的下一拍按当前姿态表达，保持原机体系动态限。
+   s.sample_control=s.has_control?s.previous_control:Eigen::Vector2d(cs*measured.x()+sn*measured.y(),-sn*measured.x()+cs*measured.y());
+   s.sample_w=s.previous_w;s.has_sample=true;
+  }
+  s.fsm->onOdometry(odom,start_velocity!=nullptr,s.travel_velocity);s.controller.odomCallback(odom);
+  const Eigen::Vector2d command_v(cs*s.sample_control.x()-sn*s.sample_control.y(),sn*s.sample_control.x()+cs*s.sample_control.y());
+  const Eigen::Vector2d actual_v=start_velocity?Eigen::Map<const Vector3d>(start_velocity).head<2>().eval():command_v;
   const double actual_w=std::isfinite(start_yaw_rate)?start_yaw_rate:s.sample_w;
+  // 同一采样重复查询沿用同一个命令起点，不回灌步态的瞬时横速。
   const uint64_t previous_plans=s.plans;
   const int state_before=s.fsm->state();
   double control_time_before=s.controller.exec_time;
@@ -223,12 +239,11 @@ extern "C" int nuwax_scan_session_plan(void* raw,SCAN_ARGUMENTS) {
    const double remaining=angle(goal_yaw-start_yaw),step=c.max_yaw_acceleration*c.sample_dt;
    s.raw_command={};s.raw_command.angular.z=std::copysign(std::min(c.max_yaw_rate,std::sqrt(step*step+2*c.max_yaw_acceleration*std::abs(remaining))-step),remaining);
   } else s.raw_command={};
-  const double cs=std::cos(start_yaw),sn=std::sin(start_yaw);
   const double vx=std::clamp(s.raw_command.linear.x,-c.max_reverse_velocity,c.max_velocity);
   const double vy=std::clamp(s.raw_command.linear.y,-c.max_lateral_velocity,c.max_lateral_velocity);
-  Eigen::Vector2d target(cs*vx-sn*vy,sn*vx+cs*vy),delta=target-actual_v;
+  Eigen::Vector2d target(cs*vx-sn*vy,sn*vx+cs*vy),delta=target-command_v;
   const double step=c.max_acceleration*c.sample_dt;if(delta.norm()>step)delta*=step/delta.norm();
-  const Eigen::Vector2d chosen=actual_v+delta;
+  const Eigen::Vector2d chosen=command_v+delta;
   // 变回机体系后兑现实际通道边界；坐标旋转舍入不能生成被声明为零的横移或倒退。
   output->command_forward=std::clamp(cs*chosen.x()+sn*chosen.y(),-c.max_reverse_velocity,c.max_velocity);
   output->command_lateral=std::clamp(-sn*chosen.x()+cs*chosen.y(),-c.max_lateral_velocity,c.max_lateral_velocity);
@@ -246,6 +261,7 @@ extern "C" int nuwax_scan_session_plan(void* raw,SCAN_ARGUMENTS) {
    const Eigen::Vector2d preferred(output->command_forward,output->command_lateral);
    const double preferred_w=output->command_yaw_rate;
    const auto checked=scan_planner::checkAuthorCommand(*map,c,position,start_yaw,actual_v,actual_w,
+       command_v,
        preferred,preferred_w,
        s.command_target,s.command_target_yaw,reference_count>=2&&s.controller.receive_traj);
    // 几何修正动作尚未执行原轨迹，曲线暂停；实测位置仍可真实移动。
@@ -281,8 +297,7 @@ extern "C" int nuwax_scan_session_plan(void* raw,SCAN_ARGUMENTS) {
    if(!checked.found&&!checked.exhausted)
     throw std::runtime_error("Current motion and braking sweep intersect the body collision map");
   } else {s.command_paused=false;s.fsm->onFrozen(false);}
-  s.previous_control=Eigen::Vector2d(cs*output->command_forward-sn*output->command_lateral,
-                                  sn*output->command_forward+cs*output->command_lateral);
+  s.previous_control={output->command_forward,output->command_lateral};
   s.previous_w=output->command_yaw_rate;s.has_control=true;
   output->motion_boundary_sources[0]=s.fsm->startVelocitySource();output->motion_boundary_sources[1]=s.fsm->startAccelerationSource();output->motion_boundary_sources[2]=std::isfinite(start_yaw_rate)?0u:3u;
   auto& manager=s.fsm->manager();

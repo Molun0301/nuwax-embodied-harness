@@ -54,6 +54,7 @@ namespace scan_planner
     continuously_called_times_ = 0; fsm_num_ = 0;
     preset_waypoints_.clear(); active_waypoints_.clear();
     odom_pos_.setZero(); odom_vel_.setZero(); odom_acc_.setZero(); odom_orient_.setIdentity();
+    travel_vel_.setZero();
     init_pt_.setZero(); start_pt_.setZero(); start_vel_.setZero(); start_acc_.setZero(); start_yaw_.setZero();
     end_pt_.setZero(); end_vel_.setZero(); local_target_pt_.setZero(); local_target_vel_.setZero();
     odom_velocity_measured_ = false; start_velocity_source_ = start_acceleration_source_ = 2;
@@ -685,9 +686,9 @@ namespace scan_planner
     {
       // 已发布曲线不能证明机体已到达该位置；重规划绑定本次实际里程计。
       start_pt_ = odom_pos_;
-      start_velocity_source_=odom_velocity_measured_?0:1;
+      start_velocity_source_=odom_velocity_measured_?5:1;
       start_acceleration_source_=1;
-      if (odom_velocity_measured_) start_vel_ = odom_vel_;
+      if (odom_velocity_measured_) start_vel_ = travel_vel_;
       else start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
       start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t_cur);
 
@@ -748,9 +749,10 @@ namespace scan_planner
   void SCANReplanFSM::setStartStateFromOdomOrCurrentTraj()
   {
     start_pt_ = odom_pos_;
-    start_velocity_source_=odom_velocity_measured_?0:2;
+    start_velocity_source_=odom_velocity_measured_?5:2;
     start_acceleration_source_=2;
-    start_vel_ = odom_vel_;
+    // 轨迹初始及重规划速度使用行进慢变量，紧急停车退出仍查询 odom_vel_。
+    start_vel_ = travel_vel_;
     start_acc_.setZero();
 
     LocalTrajData *info = &planner_manager_->local_data_;

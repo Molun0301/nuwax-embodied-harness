@@ -68,6 +68,7 @@ namespace scan_planner
     ros::Time last_freeze_update_time_;
 
     Eigen::Vector3d odom_pos_, odom_vel_, odom_acc_; // odometry state
+    Eigen::Vector3d travel_vel_;
     Eigen::Quaterniond odom_orient_;
 
     Eigen::Vector3d init_pt_, start_pt_, start_vel_, start_acc_, start_yaw_; // start state
@@ -133,7 +134,10 @@ namespace scan_planner
     void retireExecution();
     void refreshParameters(ros::NodeHandle &nh);
     // Transport entrypoints. The owner schedules original timer callbacks.
-    void onOdometry(const nav_msgs::OdometryConstPtr& msg,bool measured_velocity=true){odom_velocity_measured_=measured_velocity;odometryCallback(msg);}
+    void onOdometry(const nav_msgs::OdometryConstPtr& msg,bool measured_velocity,const Eigen::Vector3d& travel_velocity){
+      odom_velocity_measured_=measured_velocity;odometryCallback(msg);
+      travel_vel_=measured_velocity?travel_velocity:odom_vel_;
+    }
     void onReferencePath(const nav_msgs::PathConstPtr& msg){pathCallback(msg);}
     void tick(){execFSMCallback(ros::TimerEvent{});}
     void safetyTick(){checkCollisionCallback(ros::TimerEvent{});}

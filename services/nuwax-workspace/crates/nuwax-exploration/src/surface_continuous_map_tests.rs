@@ -109,7 +109,7 @@ fn revalidated_selection_compares_current_route_and_target_instead_of_whole_map_
     adapter
         .prepare_poll_with_planning_input(&state(0.4, 1), &first)
         .unwrap();
-    assert!(first.selection_qualification().is_none());
+    assert!(first.selection_qualification().is_some(), "完整查询也必须携带所选候选复核依据");
     adapter.discard_prepared_poll().unwrap();
     let input = receiver
         .freeze()
@@ -586,4 +586,66 @@ fn start_and_route_refinement_remains_feasible_but_a_crossing_wall_withholds_sel
     assert_eq!(restored.metadata["selection_method"], "current_map_revalidation");
     assert!(next.selection_qualification().is_some());
     adapter.commit_prepared_poll().unwrap();
+}
+
+
+#[test]
+fn completed_full_query_is_revoked_when_observation_removes_its_frontier() {
+    let original = map();
+    let receiver = SurfaceInputReceiver::new();
+    receiver.observe(original.clone()).unwrap();
+    let mut adapter = source(receiver.clone(), 1);
+    let current = state(0.4, 1);
+    let planning = receiver.freeze().unwrap().fork_for_planning().with_revalidation_advice();
+    let selected = goal(adapter.prepare_poll_with_planning_input(&current, &planning)
+        .unwrap().outcome().as_ref().unwrap().clone());
+    let qualification = planning.selection_qualification().unwrap();
+    // 在原已测区域四周补入真实地面观测，让原边缘视点失去前沿收益。
+    let points: Vec<_> = [0.05_f32, 3.05].into_iter().flat_map(|z|
+        (-40..60).flat_map(move |x| (-40..60).map(move |y|
+            ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, z)))).collect();
+    let observed = Arc::new(SurfaceSnapshot::from_points(&points, original.config().clone(), 0.1).unwrap());
+    let native = NativeFrontierCache::default().get(&observed, 0.3, &[]).unwrap();
+    let p = current.robot_pose.pose.position;
+    let q = selected.pose.pose.position;
+    native.planner.lock().unwrap().plan([p.x,p.y,p.z], [q.x,q.y,q.z])
+        .expect("收益失效夹具的完整路线必须仍然可行");
+    receiver.observe(observed).unwrap();
+    assert_eq!(qualification.invalidation(&receiver.freeze().unwrap()), Some("selected_frontier_geometry"),
+        "路线仍可通行，但实际新增观测已消除所选目标的前沿收益");
+    adapter.discard_prepared_poll().unwrap();
+    assert_eq!(adapter.next_goal_id, 0);
+}
+
+
+#[test]
+fn changed_visible_gain_stays_eligible_while_current_gain_is_positive() {
+    let template = map();
+    let mut points: Vec<_> = (0..60).flat_map(|x| (0..60).filter_map(move |y|
+        ((x,y) != (37,37)).then_some(((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,0.05)))).collect();
+    let original = Arc::new(SurfaceSnapshot::from_points(&points, template.config().clone(), 0.1).unwrap());
+    let receiver = SurfaceInputReceiver::new();
+    receiver.observe(original.clone()).unwrap();
+    let mut adapter = source(receiver.clone(), 1);
+    let mut model = volume_model();
+    model.max_range_m = 10.0;
+    model.max_rays = 4096;
+    adapter.set_observation_model(model.clone()).unwrap();
+    let planning = receiver.freeze().unwrap().fork_for_planning().with_revalidation_advice();
+    let selected = goal(adapter.prepare_poll_with_planning_input(&state(0.4,1), &planning)
+        .unwrap().outcome().as_ref().unwrap().clone());
+    let p = selected.pose.pose.position;
+    let q = selected.pose.pose.orientation;
+    let view = |map: &SurfaceSnapshot| map.estimate_observation_view(&model,
+        [p.x,p.y,p.z], [q.x,q.y,q.z,q.w], &map.observation_targets(&[]).unwrap()).unwrap().cells;
+    let before = view(&original);
+    points.push((3.75,3.75,0.05));
+    let observed = Arc::new(SurfaceSnapshot::from_points(&points, template.config().clone(), 0.1).unwrap());
+    let after = view(&observed);
+    assert_ne!(before, after, "实际新增观测必须改变当前候选可见收益");
+    assert!(!after.is_empty(), "当前可见收益必须仍为正");
+    receiver.observe(observed).unwrap();
+    assert_eq!(planning.selection_qualification().unwrap().invalidation(&receiver.freeze().unwrap()), None,
+        "收益数量变化但仍有实际可见增益，不能作废完整查询结果");
+    adapter.discard_prepared_poll().unwrap();
 }

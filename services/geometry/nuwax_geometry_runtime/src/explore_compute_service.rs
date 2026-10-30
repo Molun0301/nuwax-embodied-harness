@@ -1,5 +1,5 @@
-//! Runtime side of the bounded owner. The drain task is independent of tick and
-//! feedback waiters and keeps running after logical stop. No backend call runs here.
+//! 有界计算拥有方的运行时侧：原排空任务独立于tick与反馈等待者，逻辑停止后继续收尾。
+//! 所选结果的当前输入复核由服务保留阻塞工作句柄，执行期间不持探索状态锁。
 use super::compute_backend::*;
 use super::*;
 use crate::explore_compute_owner as exchange;
@@ -18,6 +18,8 @@ struct WeakRuntimeContext {
     inner: Weak<Mutex<ExploreRuntimeInner>>,
     service: Weak<ComputeService>,
     tick_gate: Weak<Mutex<()>>,
+    surface_install_gate: Weak<Mutex<()>>,
+    qualification_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     expected_map_frame: Arc<str>,
     readiness_cache: Weak<SyncMutex<ExplorationReadinessDetail>>,
     snapshot_cache: Weak<RwLock<ExploreRuntimeSnapshot>>,
@@ -36,6 +38,8 @@ impl WeakRuntimeContext {
             inner: Arc::downgrade(&runtime.inner),
             service: Arc::downgrade(&runtime.compute_service),
             tick_gate: Arc::downgrade(&runtime.tick_gate),
+            surface_install_gate: Arc::downgrade(&runtime.surface_install_gate),
+            qualification_task: runtime.compute_service.qualification_task.clone(),
             expected_map_frame: runtime.expected_map_frame.clone(),
             readiness_cache: Arc::downgrade(&runtime.readiness_cache),
             snapshot_cache: Arc::downgrade(&runtime.snapshot_cache),
@@ -54,6 +58,7 @@ impl WeakRuntimeContext {
             inner: self.inner.upgrade()?,
             compute_service: self.service.upgrade()?,
             tick_gate: self.tick_gate.upgrade()?,
+            surface_install_gate: self.surface_install_gate.upgrade()?,
             expected_map_frame: self.expected_map_frame.clone(),
             readiness_cache: self.readiness_cache.upgrade()?,
             snapshot_cache: self.snapshot_cache.upgrade()?,
@@ -197,6 +202,9 @@ pub(super) struct ComputeService {
     pub changed: Arc<Notify>,
     driver: OnceLock<Mutex<JoinHandle<()>>>,
     driver_joined: AtomicBool,
+    qualification_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    #[cfg(test)]
+    qualification_hook: SyncMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     terminal: watch::Sender<Option<Result<(), String>>>,
 }
 impl ComputeService {
@@ -207,6 +215,9 @@ impl ComputeService {
             changed: Arc::new(Notify::new()),
             driver: OnceLock::new(),
             driver_joined: AtomicBool::new(false),
+            qualification_task: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            qualification_hook: SyncMutex::new(None),
             terminal,
         }
     }
@@ -256,9 +267,48 @@ impl ComputeService {
                 .map_err(|_| "exploration compute terminal channel closed".to_string())?;
         }
     }
+    // 句柄归原服务保留；取消等待者不会丢失工作，后继等待及关闭继续join。
+    async fn finish_qualification(&self) -> Result<(), String> {
+        finish_qualification_task(&self.qualification_task).await
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_qualification_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.qualification_hook.lock() = Some(hook);
+    }
+
+    async fn qualify(&self, basis: &ComputeBasis, inner: &Mutex<ExploreRuntimeInner>) -> Result<(), String> {
+        self.finish_qualification().await?;
+        let work = {
+            let guard = inner.lock().await;
+            basis.surface_selection.get().cloned().zip(
+                guard.surface_mode.as_ref().and_then(|mode| mode.receiver.freeze().ok())
+            ).filter(|(_, current)| match &basis.input {
+                ComputeInput::Surface { original, .. } => selected_result_covers_change(original.planning_query_change(current)),
+                _ => false,
+            })
+        };
+        if let Some((qualification, current)) = work {
+            let mut task = self.qualification_task.lock().await;
+            #[cfg(test)]
+            let hook = self.qualification_hook.lock().clone();
+            *task = Some(tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                if let Some(hook) = hook { hook(); }
+                qualification.invalidation(&current);
+            }));
+            // 直接等待保留的句柄；释放状态锁后，接收与二维展示分发可继续。
+            let result = task.as_mut().expect("刚登记的复核工作").await;
+            *task = None;
+            result.map_err(|error| format!("exploration qualification join failed: {error}"))?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn join(&self) -> Result<(), String> {
+        let qualification = self.finish_qualification().await;
         let Some(driver) = self.driver.get() else {
-            return Ok(());
+            return qualification;
         };
         let mut task = driver.lock().await;
         if !self.driver_joined.load(Ordering::Acquire) {
@@ -274,9 +324,19 @@ impl ComputeService {
         }
         self.terminal.borrow().clone().unwrap_or_else(|| {
             Err("exploration compute driver exited without terminal settlement".into())
-        })
+        }).and(qualification)
     }
 }
+async fn finish_qualification_task(task: &Mutex<Option<JoinHandle<()>>>) -> Result<(), String> {
+    let mut task = task.lock().await;
+    if let Some(running) = task.as_mut() {
+        let result = running.await;
+        *task = None;
+        result.map_err(|error| format!("exploration qualification join failed: {error}"))?;
+    }
+    Ok(())
+}
+
 impl Drop for ComputeService {
     fn drop(&mut self) {
         // The driver owns the native JoinHandle, not this async-drop path. It has
@@ -284,6 +344,12 @@ impl Drop for ComputeService {
         // close and join the native worker without blocking the async executor.
         self.wake.notify_one();
     }
+}
+
+// 原查询的几何变化可复核所选结果；来源语义围栏仍按原原因撤销。
+fn selected_result_covers_change(change: Option<&str>) -> bool {
+    matches!(change, Some("surface_geometry" | "navigation_measurements" | "observation_occupancy"
+        | "recent_obstacles"))
 }
 
 #[derive(Clone)]
@@ -353,7 +419,8 @@ impl ComputeBasis {
                     Ok(now) => {
                         let change = original.planning_query_change(&now);
                         match (change, self.surface_selection.get()) {
-                            (Some(_), Some(selection)) => selection.invalidation(&now),
+                            // 只重核几何及占据细化；来源完整性、地面层不确定性等原语义围栏保留。
+                            (Some(_), Some(selection)) if selected_result_covers_change(change) => selection.invalidation(&now),
                             _ => change,
                         }
                     },
@@ -412,9 +479,15 @@ impl JobTicket {
                 incarnation=self.id.incarnation, sequence=self.id.sequence,
                 query_invalidation=self.basis.query_invalidation(inner, self.basis.history),
                 source_fresh=inner.map_input_is_fresh(now_monotonic_nanos()),
+                input=%inner.selection_wait_detail(),
                 "已重核候选在交付时失效");
         }
         current
+    }
+    pub(super) async fn qualify(&self, runtime: &ExploreRuntimeHandle) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+        let permit = runtime.surface_install_gate.clone().lock_owned().await;
+        runtime.compute_service.qualify(&self.basis, &runtime.inner).await?;
+        Ok(permit)
     }
     /// Requalify the original sampled advice after its own exact accepted
     /// Cancelled feedback. Only that acknowledgment's one history increment is
@@ -1279,6 +1352,7 @@ async fn drain_owner(
         ))
         .catch_unwind()
         .await;
+        let qualification = finish_qualification_task(&context.qualification_task).await;
         let result = match drained {
             Ok(result) => result,
             Err(_) => {
@@ -1319,6 +1393,7 @@ async fn drain_owner(
                 Err(error)
             }
         };
+        let result = result.and(qualification);
         native_done.send_replace(true);
         changed.notify_waiters();
         result
@@ -1451,6 +1526,23 @@ async fn drain_owner_loop(
         let mut retired_job = None;
         let mut should_shutdown = false;
         if let Some(inner) = inner.upgrade() {
+            let install_gate = context.surface_install_gate.upgrade();
+            let install_permit = match &install_gate {
+                Some(gate) => Some(gate.lock().await),
+                None => None,
+            };
+            let mut guard = inner.lock().await;
+            let received = receive_prepared(&mut guard, &handle);
+            let basis = guard.compute.job.as_ref()
+                .filter(|job| guard.logical_active && guard.compute.fault.is_none()
+                    && job.decision.is_none() && !job.abandoned.load(Ordering::Acquire)
+                    && matches!(job.prepared.as_ref().map(|prepared| &prepared.projection),
+                        Some(ComputeProjection::Selection(SelectionProjection { cancelled: false, .. }))))
+                .map(|job| job.basis.clone());
+            drop(guard);
+            let qualified = if let (Ok(()), Some(basis), Some(service)) = (&received, basis, context.service.upgrade()) {
+                service.qualify(&basis, &inner).await
+            } else { Ok(()) };
             let mut guard = inner.lock().await;
             #[cfg(test)]
             if std::mem::take(&mut guard.compute.panic_driver) {
@@ -1458,7 +1550,9 @@ async fn drain_owner_loop(
             }
             let history_before = guard.compute.history;
             let was_active = guard.logical_active;
-            if let Err(error) = drain_locked(&mut guard, &handle, &mut retired_job, context) {
+            let drained = received.and(qualified)
+                .and_then(|()| drain_locked(&mut guard, &handle, &mut retired_job, context));
+            if let Err(error) = drained {
                 guard.compute.fault.get_or_insert(error.clone());
                 if !guard.compute.fault_action_scheduled {
                     guard.compute.fault_action_scheduled = true;
@@ -1556,6 +1650,7 @@ async fn drain_owner_loop(
                 *snapshot_cache.write() = snapshot;
             }
             drop(guard);
+            drop(install_permit);
         } else {
             should_shutdown = true;
         }
@@ -1587,23 +1682,7 @@ async fn drain_owner_loop(
     terminal_error.map_or(Ok(()), Err)
 }
 
-fn drain_locked(
-    inner: &mut ExploreRuntimeInner,
-    owner: &Owner,
-    retired: &mut Option<JobRecord>,
-    context: &WeakRuntimeContext,
-) -> Result<(), String> {
-    if inner
-        .compute
-        .start_abandoned
-        .as_ref()
-        .is_some_and(|abandoned| abandoned.load(Ordering::Acquire))
-    {
-        inner.request_compute_stop(ExplorationStopReason::UserCancelled);
-    }
-    if let Some(fault) = owner.status().fault {
-        return Err(format!("exploration compute fault: {fault:?}"));
-    }
+fn receive_prepared(inner: &mut ExploreRuntimeInner, owner: &Owner) -> Result<(), String> {
     if let Some(prepared) = owner
         .try_take_prepared()
         .map_err(|error| error.to_string())?
@@ -1620,6 +1699,26 @@ fn drain_locked(
                 let _ = job.basis.surface_selection.set(qualification.clone());
             }
         }
+    }
+    Ok(())
+}
+
+fn drain_locked(
+    inner: &mut ExploreRuntimeInner,
+    owner: &Owner,
+    retired: &mut Option<JobRecord>,
+    context: &WeakRuntimeContext,
+) -> Result<(), String> {
+    if inner
+        .compute
+        .start_abandoned
+        .as_ref()
+        .is_some_and(|abandoned| abandoned.load(Ordering::Acquire))
+    {
+        inner.request_compute_stop(ExplorationStopReason::UserCancelled);
+    }
+    if let Some(fault) = owner.status().fault {
+        return Err(format!("exploration compute fault: {fault:?}"));
     }
     if inner
         .compute

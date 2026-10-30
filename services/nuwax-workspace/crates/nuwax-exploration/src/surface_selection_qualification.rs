@@ -1,7 +1,6 @@
 //! 已完整重核候选的提交依据；在当前输入上核验已选路线和目标。
 use super::*;
 use nuwax_nav_pct_native::{Config, Planner};
-use std::collections::BTreeSet;
 
 /// 已完成完整精确路线复核的候选，在最新地图上的实际依赖。
 #[derive(Clone, Debug)]
@@ -12,9 +11,6 @@ pub struct SurfaceSelectionQualification {
     frontier: FrontierCandidate,
     goal: FrontierGoal,
     model: Option<nuwax_nav_types_messages::ObservationModel>,
-    target_radius: f64,
-    targets: Vec<([i32; 3], [f64; 3])>,
-    visible: Option<BTreeSet<[i32; 3]>>,
     routes: Vec<([f64; 3], [f64; 3])>,
     checked: Arc<Mutex<Option<(Weak<SurfaceSnapshot>, Option<&'static str>)>>>,
 }
@@ -31,40 +27,15 @@ impl SurfaceSelectionQualification {
         frontier: FrontierCandidate,
         goal: &FrontierGoal,
         model: Option<nuwax_nav_types_messages::ObservationModel>,
-        targets: &[nuwax_explore_routing::observation::ObservationTarget],
-        view: Option<&nuwax_explore_routing::observation::ViewEstimate>,
         start: [f64; 3],
     ) -> Self {
-        let size = f64::from(source.config().voxel_size);
-        let lookahead =
-            (source
-                .body_envelope()
-                .map_or(f64::from(source.config().wall_clearance_m), |body| {
-                    body.radius()
-                        .max(f64::from(source.config().wall_clearance_m))
-                })
-                / size)
-                .ceil()
-                + 2.0;
-        let target_radius = model.as_ref().map_or(lookahead * size + size, |model| {
-            model.max_range_m
-                + model
-                    .sensor_translation_body_m
-                    .into_iter()
-                    .map(|v| v * v)
-                    .sum::<f64>()
-                    .sqrt()
-        });
-        let mut result = Self {
+        Self {
             source: source.clone(),
             native: native.input.clone(),
             terrain_source: native.terrain_source,
             frontier,
             goal: goal.clone(),
             model,
-            target_radius,
-            targets: Vec::new(),
-            visible: view.map(|view| view.cells.clone()),
             routes: vec![(
                 start,
                 [
@@ -74,9 +45,7 @@ impl SurfaceSelectionQualification {
                 ],
             )],
             checked: Arc::new(Mutex::new(None)),
-        };
-        result.targets = result.target_cells(targets);
-        result
+        }
     }
 
     /// 同一计算中的返航、候选往返路线一起按原查询端点复核。
@@ -89,26 +58,6 @@ impl SurfaceSelectionQualification {
             }
         }
         self.checked = Arc::new(Mutex::new(None));
-    }
-
-    fn target_cells(
-        &self,
-        targets: &[nuwax_explore_routing::observation::ObservationTarget],
-    ) -> Vec<([i32; 3], [f64; 3])> {
-        let p = self.goal.pose.pose.position;
-        let center = if self.model.is_some() {
-            [p.x, p.y, p.z]
-        } else {
-            self.frontier.support_xyz
-        };
-        targets
-            .iter()
-            .filter(|target| {
-                (0..2)
-                    .all(|axis| (target.position[axis] - center[axis]).abs() <= self.target_radius)
-            })
-            .map(|target| (target.cell, target.position))
-            .collect()
     }
 
     /// 返回最新已安装输入中首先影响所选结果的变化；不刷新来源时刻。
@@ -127,6 +76,7 @@ impl SurfaceSelectionQualification {
         let reason = self.check(&current.fork_for_planning());
         tracing::info!(
             event = "exploration.selection.current_input_checked",
+            goal_id = %self.goal.id,
             elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
             routes = self.routes.len(),
             invalidation = reason,
@@ -137,6 +87,7 @@ impl SurfaceSelectionQualification {
     }
 
     fn check(&self, current: &SurfaceSnapshot) -> Option<&'static str> {
+        let started = std::time::Instant::now();
         if self.source.body_envelope() != current.body_envelope()
             || self.source.config().voxel_size != current.config().voxel_size
         {
@@ -151,6 +102,7 @@ impl SurfaceSelectionQualification {
             Ok(input) => input,
             Err(_) => return Some("selected_route_input_unavailable"),
         };
+        let input_ms = started.elapsed().as_secs_f64() * 1000.0;
         let before = &self.native;
         let parameters = |c: &Config| {
             [
@@ -179,6 +131,8 @@ impl SurfaceSelectionQualification {
             Ok(planner) => planner,
             Err(_) => return Some("selected_route_input_unavailable"),
         };
+        let planner_ms = started.elapsed().as_secs_f64() * 1000.0 - input_ms;
+        let routes_started = std::time::Instant::now();
         for (index, &(from, to)) in self.routes.iter().enumerate() {
             let route = match planner.plan(from, to) {
                 Ok(route) => route,
@@ -194,6 +148,8 @@ impl SurfaceSelectionQualification {
                 return Some("selected_route_blocked");
             }
         }
+        let routes_ms = routes_started.elapsed().as_secs_f64() * 1000.0;
+        let target_started = std::time::Instant::now();
         let boundary = &before.boundary;
         let candidates = match current.frontier_candidates(boundary) {
             Ok(candidates) => candidates,
@@ -201,17 +157,9 @@ impl SurfaceSelectionQualification {
         };
         if !candidates.iter().any(|candidate| {
             [candidate.cell.0, candidate.cell.1, candidate.cell.2] == self.frontier.frontier_cell
-                && candidate.gain == self.frontier.gain
+                && candidate.gain > 0.0
         }) {
             return Some("selected_frontier_geometry");
-        }
-        let targets = match current.observation_targets(boundary) {
-            Ok(targets) => targets,
-            Err(_) => return Some("selected_observation_unavailable"),
-        };
-        // 已标定候选以下面的实际可见单元核对收益；视域外的全图目标不属于该结论。
-        if self.model.is_none() && self.targets != self.target_cells(&targets) {
-            return Some("selected_observation_targets");
         }
         let p = self.goal.pose.pose.position;
         let q = self.goal.pose.pose.orientation;
@@ -221,11 +169,19 @@ impl SurfaceSelectionQualification {
             return Some("selected_body_pose");
         }
         if let Some(model) = &self.model {
+            let targets = match current.observation_targets(boundary) {
+                Ok(targets) => targets,
+                Err(_) => return Some("selected_observation_unavailable"),
+            };
+            // 当前可见收益仍为正即可；新增观测改变数量不能等同于收益失效。
             match current.estimate_observation_view(model, body, rotation, &targets) {
-                Ok(view) if Some(&view.cells) == self.visible.as_ref() => {}
+                Ok(view) if !view.cells.is_empty() => {}
                 _ => return Some("selected_observation_view"),
             }
         }
+        tracing::info!(event="exploration.selection.recheck_stages", goal_id=%self.goal.id, input_ms, planner_ms, routes_ms,
+            target_ms=target_started.elapsed().as_secs_f64()*1000.0,
+            "所选路线与目标复核阶段耗时");
         None
     }
 }

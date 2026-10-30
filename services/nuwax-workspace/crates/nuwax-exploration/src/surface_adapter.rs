@@ -668,7 +668,7 @@ impl SurfaceGoalSourceAdapter {
                 .prepare_frontier_geometry(&boundary)
                 .map_err(|error| ExploreError::SourceError(error.to_string()))?;
         }
-        tracing::debug!(target: "navigation.exploration.compute", elapsed_ms = compute_started.elapsed().as_secs_f64() * 1000.0, "前沿几何索引就绪");
+        let geometry_ms = compute_started.elapsed().as_secs_f64() * 1000.0;
         let current_body = ([position.x, position.y, position.z], quaternion);
         // This is only a calibrated planning reference. It neither inserts a
         // floor nor requires an observed support cell under the current body.
@@ -706,7 +706,8 @@ impl SurfaceGoalSourceAdapter {
         .map_err(|error| ExploreError::SourceError(error.to_string()))?;
         let mut candidates = geometry.candidates;
         let observation_targets = geometry.targets;
-        tracing::debug!(target: "navigation.exploration.compute", candidates = candidates.len(), targets = observation_targets.len(), elapsed_ms = compute_started.elapsed().as_secs_f64() * 1000.0, "前沿候选与观测目标就绪");
+        let frontier_ms = compute_started.elapsed().as_secs_f64() * 1000.0 - geometry_ms;
+        let native_started = std::time::Instant::now();
         // 前沿路线使用与导航相同的原生实测层与占据输入，缺测不补造可通行节点。
         let uncached = NativeFrontierCache::default();
         let cache = planning.map_or(&uncached, |input| input.native_cache.as_ref());
@@ -728,10 +729,13 @@ impl SurfaceGoalSourceAdapter {
                 }
             }
         }
+        let native_input_ms = native_started.elapsed().as_secs_f64() * 1000.0;
         let planner = native.planner.clone();
+        let lock_started = std::time::Instant::now();
         let mut planner_guard = planner.lock().map_err(|_| {
             ExploreError::SourceError("native frontier planner lock is poisoned".into())
         })?;
+        let planner_lock_ms = lock_started.elapsed().as_secs_f64() * 1000.0;
         delta.last_snapshot = Some(Some(Arc::downgrade(source_snapshot)));
         delta.last_notification = Some(Some(notification));
         delta.last_query_body = Some(Some([position.x, position.y, position.z]));
@@ -770,6 +774,8 @@ impl SurfaceGoalSourceAdapter {
                 .then_with(|| a.support_xyz[1].total_cmp(&b.support_xyz[1]))
                 .then_with(|| a.support_xyz[2].total_cmp(&b.support_xyz[2]))
         });
+        let native_ms = native_started.elapsed().as_secs_f64() * 1000.0;
+        let ranking_started = std::time::Instant::now();
         let mut evaluated_candidate_count = 0;
         // 提示的核验也计入原128候选和64查询，不额外增加额度。
         let mut route_budget = FrontierRouteBudget { reserved: 1, ..Default::default() };
@@ -1074,6 +1080,8 @@ impl SurfaceGoalSourceAdapter {
             delta.last_error = Some(None);
             return Ok(ExplorationPoll::NoFrontier);
         };
+        let ranking_ms = ranking_started.elapsed().as_secs_f64() * 1000.0;
+        let exact_started = std::time::Instant::now();
         route_budget.reserved = 0;
         let Some((travel, endpoint, yaw)) = frontier_route_cost(&mut search, current_body.0, body, &route_budget) else {
             // 全图与目标窗口的层表示不同可能使精确核验失败；继续剩余候选，
@@ -1123,6 +1131,20 @@ impl SurfaceGoalSourceAdapter {
                 ("available_regions",selection.region_count.to_string()),
                 ("route_cost_m",selection.route_cost.to_string()),
             ] {goal.metadata.insert(key.into(),value);}
+        }
+        tracing::info!(event="exploration.selection.stages", captured_now_ns=state.now.nanos, geometry_ms, frontier_ms, native_ms, native_input_ms, planner_lock_ms, ranking_ms,
+            exact_ms=exact_started.elapsed().as_secs_f64()*1000.0,
+            candidates=geometric_candidate_count, targets=observation_targets.len(),
+            route_queries=route_budget.queries.get(), expanded=route_budget.expanded.get(),
+            "完整前沿评估阶段耗时");
+        // 完整查询已对最终候选执行同一精确A*；提交资格只依赖所选路线与目标。
+        if let Some(planning) = planning {
+            *planning.selection_qualification.lock().unwrap() = Some(
+                SurfaceSelectionQualification::new(
+                    snapshot, &native, candidate.clone(), &goal, self.observation_model.clone(),
+                    current_body.0,
+                ),
+            );
         }
         Ok(self.stage_selected_goal(goal,candidate.support_xyz,vertical_radius,delta))
     }
@@ -1340,7 +1362,7 @@ impl SurfaceGoalSourceAdapter {
             *planning.selection_qualification.lock().unwrap() = Some(
                 SurfaceSelectionQualification::new(
                     snapshot, native, frontier, &goal, self.observation_model.clone(),
-                    targets, view.as_ref(), current.0,
+                    current.0,
                 ),
             );
         }

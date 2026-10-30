@@ -142,7 +142,9 @@ mod continuous_map_transaction_tests {
         *revision += 1;
         let (start, end) = {
             let guard = audit.lock().unwrap();
-            let capture = if blocked { &guard.captures[0] } else { guard.captures.last().unwrap() };
+            let capture = guard.captures.iter().rev().find(|capture|
+                matches!(&capture.preview, Ok(ExplorationPoll::Goal(_))))
+                .expect("路线更新前须已有真实候选，Pending不是目标");
             let goal = surface_owner_goal(capture.preview.as_ref().unwrap());
             (capture.pose.pose.position, goal.pose.pose.position)
         };
@@ -166,6 +168,19 @@ mod continuous_map_transaction_tests {
                 "起点和路线中段须实际细化实测高度");
             refined
         };
+        if blocked {
+            let offset = handle.inner.lock().await.surface_mode.as_ref().unwrap()
+                .config.as_ref().unwrap().follower.body_to_support_z_m;
+            let target = [end.x,end.y,end.z];
+            let result = nuwax_nav_stack::surface_oriented::plan(&changed,
+                ([start.x,start.y,start.z], [0.,0.,0.,1.]), (target,[0.,0.,0.,1.]),
+                nuwax_nav_types_messages::GoalOptions::default(), offset, &[]);
+            assert!(match result {
+                Err(_) => true,
+                Ok(route) => route.last().is_none_or(|p| (p.0[0]-end.x).hypot(p.0[1]-end.y).hypot(p.0[2]-end.z)
+                    > f64::from(changed.config().voxel_size)*0.25),
+            }, "横墙须实际阻断本轮所选候选的完整路线，不能只封堵第一轮旧路线");
+        }
         committed.revision += 1;
         committed.commit_sequence += 1;
         committed.source_timestamp_ns = now_unix_nanos() as i64;
@@ -179,6 +194,7 @@ mod continuous_map_transaction_tests {
         gate_every_prepare: bool,
         interval: Duration,
         follow_up: bool,
+        minimum_prepare: Duration,
     ) -> (bool, usize) {
         let change_target = matches!(change, MapChange::Target);
         let (handle, sink) = configured_handle();
@@ -244,6 +260,7 @@ mod continuous_map_transaction_tests {
             let entered = loop {
                 let entered = tokio::time::timeout(Duration::from_secs(5), async {
                     let mut prepared = false;
+                    let mut prepared_at = None;
                     loop {
                         tokio::select! {
                             biased;
@@ -251,6 +268,7 @@ mod continuous_map_transaction_tests {
                                 tokio::task::yield_now().await;}}=>break false,
                             _=gate.entered(), if !prepared => {
                                 prepared = true;
+                                prepared_at = Some(Instant::now());
                                 if interval.is_zero() { break true; }
                             },
                             _=timer.tick(), if !interval.is_zero() => {
@@ -263,7 +281,7 @@ mod continuous_map_transaction_tests {
                                         &mut committed, &mut publication_revision).await;
                                 }
                                 published_maps.insert(publication_revision as u64, committed.clone());
-                                if prepared { break true; }
+                                if prepared && prepared_at.is_some_and(|at| at.elapsed() >= minimum_prepare) { break true; }
                             },
                         }
                     }
@@ -287,7 +305,8 @@ mod continuous_map_transaction_tests {
                     )
                     .await
                     .unwrap();
-                owner_watchdog(handle.await_compute_idle()).await.unwrap();
+                // 终态调用已等待原反馈确认；调度器可立即领取下一轮，不能再等待全局空闲。
+                // 下一轮可能已持有下一个受控准备门，等待空闲会让夹具自己卡住该门。
                 handled_dispatches = 1;
                 gates_since_dispatch = 0;
                 original_wait = None;
@@ -302,16 +321,7 @@ mod continuous_map_transaction_tests {
             }
             original_wait = Some(since);
             gates_since_dispatch += 1;
-            if interval.is_zero() && matches!(change,MapChange::RouteBlocked) && index == 0 {
-                // 首轮只换远处地图；第二轮完整重核通过后才横向封闭实际所选路线。
-                publish_unrelated_geometry(&handle,&message,&snapshot,
-                    &mut committed,&mut publication_revision).await;
-            } else if interval.is_zero() && matches!(change,MapChange::Refinement | MapChange::RouteBlocked) {
-                if matches!(change,MapChange::RouteBlocked) && index == 1 {
-                    let guard = audit.lock().unwrap();
-                    let goal = surface_owner_goal(guard.captures.last().unwrap().preview.as_ref().unwrap());
-                    assert_eq!(goal.metadata["selection_method"],"current_map_revalidation");
-                }
+            if interval.is_zero() && matches!(change,MapChange::Refinement | MapChange::RouteBlocked) {
                 publish_route_update(&handle,&message,&snapshot,&audit,
                     &mut committed,&mut publication_revision,matches!(change,MapChange::RouteBlocked)).await;
             } else if interval.is_zero() && gate_every_prepare && !change_target {
@@ -404,10 +414,9 @@ mod continuous_map_transaction_tests {
                 assert!(
                     audit.lock().unwrap().captures.iter().any(
                         |capture| matches!(&capture.preview, Ok(ExplorationPoll::Goal(goal))
-                        if goal.metadata.get("selection_method").map(String::as_str)
-                            == Some("current_map_revalidation"))
+                        if goal.metadata["route_exact_queries"].parse::<usize>().unwrap() > 0)
                     ),
-                    "须实际经过完整候选复核"
+                    "候选须经过真实原生精确路线查询"
                 );
             }
             let submitted_map = sink
@@ -419,31 +428,12 @@ mod continuous_map_transaction_tests {
                 .intent
                 .committed_map
                 .clone();
-            if interval.is_zero() && matches!(change,MapChange::Unrelated | MapChange::Target) {
-                assert_eq!(
-                    submitted_map, committed,
-                    "新目标须保留当前核验输入的提交身份"
-                );
-            } else {
-                let captured = audit
-                    .lock()
-                    .unwrap()
-                    .captures
-                    .last()
-                    .unwrap()
-                    .original
-                    .notification();
-                assert!(
-                    publication_revision as u64 > captured,
-                    "候选完整复核后必须实际再换图，不能让资格比较退化为原查询相等"
-                );
-                assert_eq!(submitted_map, published_maps[&captured],
-                    "最新输入只核对结果资格，请求必须保留实际冻结计算身份");
-                assert!(crate::nav_runtime::same_committed_map_domain(
-                    &submitted_map,
-                    &committed
-                ));
-            }
+            let captured = audit.lock().unwrap().captures.last().unwrap().original.notification();
+            assert!(publication_revision as u64 > captured,
+                "完整查询产出后必须实际再换图，不能退化为原查询相等");
+            assert_eq!(submitted_map, published_maps[&captured],
+                "当前输入只复核资格，请求必须保留实际冻结计算身份");
+            assert!(crate::nav_runtime::same_committed_map_domain(&submitted_map, &committed));
             stop_owner_runtime_child(&handle, request).await;
         } else {
             handle.stop(request).await;
@@ -456,18 +446,18 @@ mod continuous_map_transaction_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn changing_unrelated_maps_revalidate_then_dispatch_without_accepting_old_transaction() {
-        let old = update_case(false, MapChange::Unrelated, true, false, Duration::ZERO, false).await;
-        let new = update_case(true, MapChange::Unrelated, true, false, Duration::ZERO, false).await;
+        let old = update_case(false, MapChange::Unrelated, true, false, Duration::ZERO, false, Duration::ZERO).await;
+        let new = update_case(true, MapChange::Unrelated, true, false, Duration::ZERO, false, Duration::ZERO).await;
         assert!(!old.0 && old.1 >= 2, "旧策略应在受控持续换图下反复撤销");
         assert!(
-            new.0 && new.1 >= 1,
-            "旧事务撤销后应以当前输入完成新核验并派发一次"
+            new.0 && new.1 == 0,
+            "完整查询须直接完成当前输入复核并派发，不能先撤销一轮"
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn target_changes_still_discard_results_and_keep_original_stall_deadline() {
-        let result = update_case(true, MapChange::Target, true, true, Duration::ZERO, false).await;
+        let result = update_case(true, MapChange::Target, true, true, Duration::ZERO, false, Duration::ZERO).await;
         assert!(
             !result.0 && result.1 >= 2,
             "实体持续覆盖候选时不得提交过时结果"
@@ -476,16 +466,16 @@ mod continuous_map_transaction_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn completed_revalidation_dispatches_with_unrelated_updates_every_one_to_three_seconds() {
-        let old = update_case(true, MapChange::Unrelated, false, true, Duration::ZERO, false).await;
+        let old = update_case(true, MapChange::Unrelated, false, true, Duration::ZERO, false, Duration::ZERO).await;
         assert!(
             !old.0 && old.1 >= 2,
             "原资格即使完成候选复核仍反复撤销并在原期限结束"
         );
         for seconds in 1..=3 {
             let current =
-                update_case(true, MapChange::Unrelated, true, true, Duration::from_secs(seconds), true).await;
+                update_case(true, MapChange::Unrelated, true, true, Duration::from_secs(seconds), true, Duration::ZERO).await;
             assert!(
-                current.0 && current.1 >= 1,
+                current.0 && current.1 == 0,
                 "每{seconds}秒更新无关区域时，重核候选必须进入实际子导航派发"
             );
         }
@@ -494,17 +484,205 @@ mod continuous_map_transaction_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn continuous_start_and_route_refinement_dispatches_within_original_deadline() {
         for seconds in 1..=3 {
-            let result = update_case(true,MapChange::Refinement,true,true,Duration::from_secs(seconds),true).await;
-            assert!(result.0 && result.1 >= 1,
+            let result = update_case(true,MapChange::Refinement,true,true,Duration::from_secs(seconds),true,Duration::ZERO).await;
+            assert!(result.0 && result.1 == 0,
                 "起点及沿线每{seconds}秒细化后，应完成复核并持续派发两个子导航");
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn crossing_route_obstacles_withhold_and_reevaluate_without_resetting_deadline() {
-        let result = update_case(true,MapChange::RouteBlocked,true,true,Duration::ZERO,false).await;
+        let result = update_case(true,MapChange::RouteBlocked,true,true,Duration::ZERO,false,Duration::ZERO).await;
         assert!(!result.0 && result.1 >= 2,
             "候选完整复核后，沿线新实体应扣下结果并重新评估，原期限内不得误派发");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multi_second_full_queries_dispatch_continuously_during_one_to_three_hz_refinement() {
+        let baseline_started = Instant::now();
+        let baseline = update_case(true, MapChange::Refinement, false, true,
+            Duration::from_millis(333), false, Duration::from_secs(3)).await;
+        assert!(!baseline.0 && baseline.1 >= 2,
+            "相同真实细化和慢准备输入下，关闭所选结果依据的原策略须撤销并触发原有界终止");
+        println!("原策略：交付=0，撤销={}，运行={:?}，第三轮显式推进到原停滞边界", baseline.1, baseline_started.elapsed());
+        for hz in 1..=3 {
+            let started = Instant::now();
+            let result = update_case(true, MapChange::Refinement, true, true,
+                Duration::from_millis(1000 / hz), true, Duration::from_secs(3)).await;
+            assert!(result.0 && result.1 == 0,
+                "每秒{hz}次真实沿线细化、每轮至少3秒时须直接提交并连续派发两个子导航");
+            println!("持续细化 hz={hz}，完整查询最短3秒，撤销={}，两次交付耗时={:?}", result.1, started.elapsed());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn three_second_recheck_keeps_receipts_and_costmap_fanout_live() {
+        let (handle, sink) = configured_handle();
+        let (message, _, snapshot) = install_surface_fixture(&handle, "map").await;
+        let request = "slow-selected-recheck";
+        handle.start(request, "prefer_wavefront").await;
+        let audit = Arc::new(StdMutex::new(SurfaceOwnerAudit::default()));
+        let prepared = Arc::new(OwnerRuntimeGate::default());
+        let _release = OwnerRuntimeGateRelease(prepared.clone());
+        install_gated_real_surface_source(&handle, audit.clone(), prepared.clone(), None).await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        handle.compute_service.set_qualification_hook(Arc::new({
+            let entered = entered.clone();
+            let first = AtomicBool::new(true);
+            move || { if first.swap(false, Ordering::SeqCst) {
+                entered.notify_one(); std::thread::sleep(Duration::from_secs(3));
+            } }
+        }));
+        let tick = tokio::spawn({
+            let handle = handle.clone();
+            let pose = surface_pose(&snapshot, 0.0, Quaternion::IDENTITY);
+            async move { handle.tick_with_pose(pose).await }
+        });
+        owner_watchdog(prepared.entered()).await;
+        let mut committed = message.committed_map.clone();
+        let mut revision = 1;
+        publish_unrelated_geometry(&handle, &message, &snapshot, &mut committed, &mut revision).await;
+        prepared.release();
+        owner_watchdog(entered.notified()).await;
+        let started = Instant::now();
+        let mut maximum_receipt = Duration::ZERO;
+        let mut maximum_fanout = Duration::ZERO;
+        while started.elapsed() < Duration::from_secs(3) {
+            revision += 1;
+            let next = surface_message("map", revision);
+            let at = Instant::now();
+            tokio::time::timeout(Duration::from_millis(200),
+                handle.begin_surface_map_update(&next, now_monotonic_nanos())).await.unwrap().unwrap();
+            maximum_receipt = maximum_receipt.max(at.elapsed());
+            let at = Instant::now();
+            tokio::time::timeout(Duration::from_millis(200),
+                handle.ingest_committed_costmap_snapshot_in_frame(frontier_costmap(1), next.committed_map, 1)).await.unwrap().unwrap();
+            maximum_fanout = maximum_fanout.max(at.elapsed());
+            tokio::time::sleep(Duration::from_millis(333)).await;
+        }
+        let result = owner_watchdog(tick).await.unwrap();
+        assert_eq!(result.status, STATUS_ACTIVE, "{}", result.message);
+        assert_eq!(sink.submitted.lock().unwrap().len(), 1);
+        assert_eq!(audit.lock().unwrap().discards, 0);
+        println!("复核至少3秒，接收最长={maximum_receipt:?}，二维分发最长={maximum_fanout:?}，交付={:?}", started.elapsed());
+        stop_owner_runtime_child(&handle, request).await;
+        owner_watchdog(handle.await_compute_idle()).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_surface_consumer_receives_while_completed_install_waits_for_recheck() {
+        use futures::FutureExt;
+        use crate::lcm_runtime::mapping_feed_tests::F1RealEntryFixture;
+        let (handle, _) = configured_handle();
+        let mut input = F1RealEntryFixture::start(handle.clone()).await.unwrap();
+        let result = std::panic::AssertUnwindSafe(async {
+            input.wait_finished(input.first.cloud_revision).await.unwrap();
+            let install = handle.surface_install_gate.lock().await;
+            let waiting = input.prepare_complete_candidate().await.unwrap();
+            input.publish_candidate(&waiting).await.unwrap();
+            f1_wait_latest(&handle, &waiting).await;
+            // 读取原消费者实际收到构建结果的事件，不能靠睡眠推断已完成计算。
+            let pending = format!("surface-map-install-pending-cloud:{}", waiting.cloud_revision);
+            owner_watchdog(async {
+                while !input.probe.events().iter().any(|event| event == &pending) {
+                    tokio::task::yield_now().await;
+                }
+            }).await;
+            for _ in 0..3 {
+                let next = input.prepare_complete_candidate().await.unwrap();
+                input.publish_candidate(&next).await.unwrap();
+                tokio::time::timeout(Duration::from_millis(500), f1_wait_latest(&handle, &next)).await.unwrap();
+                let guard = handle.inner.lock().await;
+                let mode = guard.surface_mode.as_ref().unwrap();
+                assert_eq!(mode.installed_revision, Some((input.first.cloud_revision, input.first.committed_map.revision)));
+                assert!(guard.map_input_is_fresh(now_monotonic_nanos()));
+                drop(guard);
+                tokio::time::sleep(Duration::from_millis(333)).await;
+            }
+            let final_revision = handle.inner.lock().await.surface_mode.as_ref().unwrap().latest.as_ref().unwrap().cloud_revision;
+            drop(install);
+            input.wait_finished(final_revision).await.unwrap();
+            assert_eq!(handle.inner.lock().await.surface_mode.as_ref().unwrap().installed_revision.unwrap().0, final_revision);
+        }).catch_unwind().await;
+        f1_finish_all_owners(&mut input, &handle, "install-source-live").await;
+        if let Err(panic) = result { std::panic::resume_unwind(panic); }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_delivery_retains_recheck_until_original_owner_shutdown() {
+        let (handle, sink) = configured_handle();
+        let (message, _, snapshot) = install_surface_fixture(&handle, "map").await;
+        let request = "cancel-selected-recheck";
+        handle.start(request, "prefer_wavefront").await;
+        let audit = Arc::new(StdMutex::new(SurfaceOwnerAudit::default()));
+        let prepared = Arc::new(OwnerRuntimeGate::default());
+        let recheck = Arc::new(OwnerRuntimeGate::default());
+        let _release_prepare = OwnerRuntimeGateRelease(prepared.clone());
+        let _release_recheck = OwnerRuntimeGateRelease(recheck.clone());
+        install_gated_real_surface_source(&handle, audit, prepared.clone(), None).await;
+        handle.compute_service.set_qualification_hook(Arc::new({
+            let recheck = recheck.clone(); move || recheck.hold()
+        }));
+        let tick = tokio::spawn({
+            let handle = handle.clone();
+            let pose = surface_pose(&snapshot, 0.0, Quaternion::IDENTITY);
+            async move { handle.tick_with_pose(pose).await }
+        });
+        owner_watchdog(prepared.entered()).await;
+        let mut committed = message.committed_map.clone();
+        let mut revision = 1;
+        publish_unrelated_geometry(&handle, &message, &snapshot, &mut committed, &mut revision).await;
+        prepared.release();
+        owner_watchdog(recheck.entered()).await;
+        tick.abort();
+        assert!(tick.await.unwrap_err().is_cancelled());
+        handle.request_compute_shutdown().await;
+        let joined = tokio::spawn({
+            let handle = handle.clone(); async move { handle.compute_service.join().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!joined.is_finished(), "不能在原阻塞复核仍持有地图时宣称关闭完成");
+        recheck.release();
+        owner_watchdog(joined).await.unwrap().unwrap();
+        assert!(sink.submitted.lock().unwrap().is_empty(), "取消后不得交付候选");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_recheck_uses_original_fault_drain_and_joins_worker() {
+        let (handle, sink) = configured_handle();
+        let (message, _, snapshot) = install_surface_fixture(&handle, "map").await;
+        let request = "failed-selected-recheck";
+        handle.start(request, "prefer_wavefront").await;
+        let audit = Arc::new(StdMutex::new(SurfaceOwnerAudit::default()));
+        let prepared = Arc::new(OwnerRuntimeGate::default());
+        let _release = OwnerRuntimeGateRelease(prepared.clone());
+        install_gated_real_surface_source(&handle, audit.clone(), prepared.clone(), None).await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        handle.compute_service.set_qualification_hook(Arc::new({
+            let calls = calls.clone();
+            move || { calls.fetch_add(1, Ordering::SeqCst); panic!("注入当前输入复核工作错误"); }
+        }));
+        let tick = tokio::spawn({
+            let handle = handle.clone();
+            let pose = surface_pose(&snapshot, 0.0, Quaternion::IDENTITY);
+            async move { handle.tick_with_pose(pose).await }
+        });
+        owner_watchdog(prepared.entered()).await;
+        let mut committed = message.committed_map.clone();
+        let mut revision = 1;
+        publish_unrelated_geometry(&handle, &message, &snapshot, &mut committed, &mut revision).await;
+        prepared.release();
+        let failed = owner_watchdog(tick).await.unwrap();
+        assert_eq!(failed.status, STATUS_FAILED, "{}", failed.message);
+        let joined = owner_watchdog(handle.compute_service.join()).await;
+        assert!(joined.is_err(), "工作错误必须进入原故障终态，不能伪装为正常关闭");
+        let guard = handle.inner.lock().await;
+        assert!(!guard.logical_active);
+        assert!(guard.compute.fault.as_ref().unwrap().contains("qualification join failed"));
+        assert!(guard.compute.status().unwrap().closed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "故障后不能重新发起复核");
+        assert_eq!(audit.lock().unwrap().discards, 1);
+        assert!(sink.submitted.lock().unwrap().is_empty());
     }
 
 }

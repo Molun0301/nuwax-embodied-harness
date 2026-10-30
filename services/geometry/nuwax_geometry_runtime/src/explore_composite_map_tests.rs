@@ -371,7 +371,7 @@ enum CompositeOwnerChangedSource {
     RecentObstacles,
 }
 
-async fn surface_owner_new_commit_changed_source_discards(change: CompositeOwnerChangedSource) {
+async fn surface_owner_new_commit_rechecks_changed_source(change: CompositeOwnerChangedSource) {
     let (handle, sink) = configured_handle();
     let (first, _, snapshot, mut cache) = install_surface_composite_owner_fixture(&handle).await;
     let request_id = format!("owner-composite-reject-{change:?}");
@@ -451,6 +451,22 @@ async fn surface_owner_new_commit_changed_source_discards(change: CompositeOwner
         }
     };
     // observations/recent 由独立源附加；此处验证 owner 资格，非声称测试了真实传感器接入。
+    if matches!(change, CompositeOwnerChangedSource::RecentObstacles) {
+        let goal = surface_owner_goal(audit.lock().unwrap().captures[0].preview.as_ref().unwrap()).clone();
+        let target = goal.pose.pose.position;
+        let q = goal.pose.pose.orientation;
+        let start = pose.orientation;
+        let offset = handle.inner.lock().await.surface_mode.as_ref().unwrap()
+            .config.as_ref().unwrap().follower.body_to_support_z_m;
+        let route = nuwax_nav_stack::surface_oriented::plan(&replacement,
+            ([pose.x,pose.y,pose.z], [start.x,start.y,start.z,start.w]),
+            ([target.x,target.y,target.z], [q.x,q.y,q.z,q.w]),
+            nuwax_nav_types_messages::GoalOptions::default(), offset, &[])
+            .expect("直线被阻断不等于实际所选完整路线被阻断");
+        let endpoint = route.last().unwrap().0;
+        assert!((endpoint[0]-target.x).hypot(endpoint[1]-target.y).hypot(endpoint[2]-target.z)
+            <= f64::from(replacement.config().voxel_size)*0.25);
+    }
     assert!(!replacement.same_body_query_view(&snapshot));
     assert!(owner_watchdog(handle.finish_surface_map_update(ticket, Ok(replacement))).await);
     assert!(!original.same_source_view(&receiver.freeze().unwrap()));
@@ -487,33 +503,43 @@ async fn surface_owner_new_commit_changed_source_discards(change: CompositeOwner
     };
     settle_surface_composite_owner_fixture(&handle, &request_id).await;
 
-    assert_eq!((captures, commits, discards), (1, 0, 1), "{change:?}");
+    let feasible = matches!(change, CompositeOwnerChangedSource::RecentObstacles);
+    assert_eq!((captures, commits, discards), if feasible { (1, 1, 0) } else { (1, 0, 1) }, "{change:?}");
     assert!(
         feedback.is_empty(),
         "未接受的旧候选不能得到失败或取消反馈：{feedback:?}"
     );
-    assert_eq!(after, before, "变化输入不得污染源历史");
+    if feasible {
+        let before: serde_json::Value = serde_json::from_str(&before).unwrap();
+        let after: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(after[0], before[0]);
+        assert_eq!(after[1], before[1], "完整路线通过不能伪造导航反馈历史");
+        assert_eq!(after[2][0], before[2][0], "完整路线通过不能推进区域服务轮次");
+        assert!(after[2][1].as_array().unwrap().iter().all(|entry| entry[1] == before[2][0]));
+    } else {
+        assert_eq!(after, before, "撤销变化输入不得污染源历史");
+    }
     assert_eq!(
         (submitted, cancelled, child_sequence, reached),
-        (0, 0, 0, 0)
+        if feasible { (1, 0, 1, 0) } else { (0, 0, 0, 0) }
     );
     assert!(active, "同域输入变化不应直接终止探索会话");
 }
 
 #[tokio::test]
 async fn compute_owner_surface_new_commit_changed_mask_discards_goal() {
-    surface_owner_new_commit_changed_source_discards(CompositeOwnerChangedSource::Mask).await;
+    surface_owner_new_commit_rechecks_changed_source(CompositeOwnerChangedSource::Mask).await;
 }
 
 #[tokio::test]
 async fn compute_owner_surface_new_commit_changed_observations_discards_goal() {
-    surface_owner_new_commit_changed_source_discards(CompositeOwnerChangedSource::Observations)
+    surface_owner_new_commit_rechecks_changed_source(CompositeOwnerChangedSource::Observations)
         .await;
 }
 
 #[tokio::test]
-async fn compute_owner_surface_new_commit_changed_recent_obstacles_discards_goal() {
-    surface_owner_new_commit_changed_source_discards(CompositeOwnerChangedSource::RecentObstacles)
+async fn compute_owner_surface_new_commit_changed_recent_obstacles_keeps_feasible_goal() {
+    surface_owner_new_commit_rechecks_changed_source(CompositeOwnerChangedSource::RecentObstacles)
         .await;
 }
 

@@ -1369,6 +1369,8 @@ pub struct ExploreRuntimeHandle {
     inner: Arc<Mutex<ExploreRuntimeInner>>,
     compute_service: Arc<ComputeService>,
     tick_gate: Arc<Mutex<()>>,
+    // 只串行完整表面安装与所选结果复核，接收/清空/停止仍使用原状态锁。
+    surface_install_gate: Arc<Mutex<()>>,
     expected_map_frame: Arc<str>,
     readiness_cache: Arc<SyncMutex<ExplorationReadinessDetail>>,
     snapshot_cache: Arc<RwLock<ExploreRuntimeSnapshot>>,
@@ -1583,6 +1585,7 @@ impl ExploreRuntimeHandle {
         ticket: SurfaceMapTicket,
         result: Result<Arc<SurfaceSnapshot>, String>,
     ) -> bool {
+        let _install = if result.is_ok() { Some(self.surface_install_gate.lock().await) } else { None };
         let mut guard = self.inner.lock().await;
         let error = {
             let Some(mode) = guard.surface_mode.as_mut() else {
@@ -1623,6 +1626,7 @@ impl ExploreRuntimeHandle {
             None
         };
         drop(guard);
+        drop(_install);
         if let Some(request_id) = finish_request {
             self.finish_session(
                 Some(&request_id),
@@ -1673,6 +1677,7 @@ impl ExploreRuntimeHandle {
             inner: Arc::new(Mutex::new(ExploreRuntimeInner::new())),
             compute_service: Arc::new(ComputeService::new()),
             tick_gate: Arc::new(Mutex::new(())),
+            surface_install_gate: Arc::new(Mutex::new(())),
             #[cfg(test)]
             attribution: None,
             #[cfg(test)]
@@ -2949,10 +2954,17 @@ impl ExploreRuntimeHandle {
             Err(error) => { let snapshot = guard.snapshot(STATUS_PENDING, error); drop(guard); return self.store_snapshot(snapshot); }
         };
         drop(guard);
-        let finalized = self.await_compute(&selection_ticket).await;
+        let finalized = match self.await_compute(&selection_ticket).await {
+            Ok(value) => value,
+            Err(_) => return self.snapshot(),
+        };
+        let install_permit = match selection_ticket.qualify(self).await {
+            Ok(permit) => permit,
+            Err(error) => return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded, error).await,
+        };
         guard = self.inner.lock().await;
         if !selection_ticket.current(&guard) { return self.snapshot(); }
-        let finalized = match finalized { Ok(value) => value, Err(_) => return self.snapshot() };
+        drop(install_permit);
         // 资格比较跨过原连续等待期限时，不能再把迟到结果交给子导航。
         if let Some(error) = guard.selection_wait_failure() {
             drop(guard);
@@ -3031,7 +3043,12 @@ impl ExploreRuntimeHandle {
                         selection_ticket.feedback_handoff(&mut guard);
                         drop(guard);
                         let acknowledged = self.await_feedback(&ticket).await;
+                        let install_permit = match selection_ticket.qualify(self).await {
+                            Ok(permit) => permit,
+                            Err(error) => return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded, error).await,
+                        };
                         guard = self.inner.lock().await;
+                        drop(install_permit);
                         if generation != guard.generation || !guard.logical_active || guard.last_request_id != parent_id { return self.snapshot(); }
                         if let Err(error) = acknowledged { drop(guard); return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded, error).await; }
                         if !selection_ticket.current_after_feedback(&guard, &ticket) {

@@ -8110,6 +8110,8 @@ async fn run_owned_surface_map_consumer(
     // 缓存只由原单在途阻塞任务访问，接收/清空/关闭不等待计算锁。
     let cache = Arc::new(std::sync::Mutex::new(cache));
     let mut computing = false;
+    // 安装等待与接收一起轮询，不能因所选路线复核暂停真实来源通知。
+    let mut installing: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> = None;
     let mut latest_pending: Option<(
         schema::NavigationMap3D,
         crate::explore_runtime::SurfaceMapTicket,
@@ -8118,7 +8120,7 @@ async fn run_owned_surface_map_consumer(
     let mut retry_after = tokio::time::Instant::now();
     let mut retry_dependency: Option<SurfaceMapRetryDependency> = None;
     let terminal = loop {
-        if !computing && tokio::time::Instant::now() >= retry_after {
+        if !computing && installing.is_none() && tokio::time::Instant::now() >= retry_after {
             if let Some((message, ticket, parsed_root)) = latest_pending.take() {
                 retry_dependency = None;
                 let cache = Arc::clone(&cache);
@@ -8151,6 +8153,9 @@ async fn run_owned_surface_map_consumer(
         tokio::select! {
             biased;
             _ = wait_for_geometry_task_stop(&mut shutdown_rx) => break Ok(()),
+            _ = async { installing.as_mut().expect("已登记的表面安装").await }, if installing.is_some() => {
+                installing = None;
+            }
             completed = computed_rx.recv(), if computing => {
                 let Some((ticket, result)) = completed else {
                     break Err("surface map completion channel closed".into());
@@ -8162,7 +8167,14 @@ async fn run_owned_surface_map_consumer(
                 match result {
                     Err(error) => { explore.finish_surface_map_update(ticket, Err(error)).await; }
                     Ok(SurfaceMapBuildAttempt { message, parsed_root, result, retained_source }) => match result {
-                        Ok(snapshot) => { explore.finish_surface_map_update(ticket, Ok(snapshot)).await; }
+                        Ok(snapshot) => {
+                            #[cfg(test)] record_topology_event(format!("surface-map-install-pending-cloud:{finished_revision}"));
+                            let explore = explore.clone();
+                            installing = Some(Box::pin(async move {
+                                explore.finish_surface_map_update(ticket, Ok(snapshot)).await;
+                                #[cfg(test)] record_topology_event(format!("surface-map-finish-cloud:{finished_revision}"));
+                            }));
+                        }
                         Err(error) => {
                             let retain = if matches!(&error, SurfaceMapBuildError::IncompleteFineSource(_)) {
                                 if let Some(retained) = retained_source.as_ref() {
@@ -8199,7 +8211,7 @@ async fn run_owned_surface_map_consumer(
                         }
                     },
                 }
-                #[cfg(test)] record_topology_event(format!("surface-map-finish-cloud:{finished_revision}"));
+                #[cfg(test)] if installing.is_none() { record_topology_event(format!("surface-map-finish-cloud:{finished_revision}")); }
             }
             frame = subscription.recv() => {
                 // 接收时刻先于解码和MLS构建，计算耗时不能使旧图重新变新鲜。
@@ -8235,7 +8247,7 @@ async fn run_owned_surface_map_consumer(
                 }
             }
             _ = tokio::time::sleep_until(retry_after),
-                if !computing && latest_pending.is_some() => {}
+                if !computing && installing.is_none() && latest_pending.is_some() => {}
         }
     };
     explore.stop_surface_input_owner().await;

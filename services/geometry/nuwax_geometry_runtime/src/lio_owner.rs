@@ -2105,7 +2105,10 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
             if let Ok(contents) = std::fs::read_to_string(path) {
-                return contents;
+                // 标记文件可能已创建但尚未写入，继续沿原期限等待实际内容。
+                if !contents.is_empty() {
+                    return contents;
+                }
             }
             assert!(
                 tokio::time::Instant::now() < deadline,

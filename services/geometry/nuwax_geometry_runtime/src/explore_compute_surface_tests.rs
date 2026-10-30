@@ -900,120 +900,54 @@ async fn surface_owner_changed_source_qualifies_query_then_progresses(observatio
     ticking = None;
     let settled = joined_tick.unwrap();
     owner_watchdog(handle.await_compute_idle()).await.unwrap();
-    if observation_owner_only {
-        // Intentional migration: a new raw owner is still a different source,
-        // but the shared derived payload now qualifies this Explore selection.
-        assert!(original.same_planning_query_view(&current));
-        assert_eq!(settled.status, STATUS_ACTIVE, "{}", settled.message);
-        assert_eq!(settled.child_task_id, format!("{request_id}.nav.1"));
-        {
-            let audit = audit.lock().unwrap();
-            assert_eq!((audit.captures.len(), audit.commits.len(), audit.discards), (1, 1, 0));
-            assert!(surface_owner_goal(&audit.commits[0]).id.ends_with("-1"));
-            assert!(audit.feedback.is_empty());
-        }
-        {
-            let submitted = sink.submitted.lock().unwrap();
-            assert_eq!(submitted.len(), 1);
-            assert_eq!(submitted[0].intent.committed_map, message.committed_map);
-            assert_eq!(
-                submitted[0].frontier_goal_id,
-                surface_owner_goal(&audit.lock().unwrap().commits[0]).id
-            );
-        }
-        let status = handle.inner.lock().await.compute.status().unwrap();
-        assert_eq!(status.incarnation, incarnation);
-        assert_eq!(status.high_water.workers, 1);
-        assert_eq!(status.high_water.active, 1);
-        assert!(sink.cancelled.lock().unwrap().is_empty());
-        finish_surface_owner_success(&handle, request_id, &settled, &audit).await;
-        return;
-    }
-    assert!(!original.same_planning_query_view(&current));
+    // 原始证据换拥有方及同数值几何重建，都必须按当前所选路线资格直接提交。
+    assert_eq!(original.same_planning_query_view(&current), observation_owner_only);
+    assert_eq!(settled.status, STATUS_ACTIVE, "{}", settled.message);
+    assert_eq!(settled.child_task_id, format!("{request_id}.nav.1"));
+    let after = owner_watchdog(handle.inspect_compute_checkpoint()).await.unwrap()[0].payload.clone();
+    let before_state: serde_json::Value = serde_json::from_str(&before).unwrap();
+    let after_state: serde_json::Value = serde_json::from_str(&after).unwrap();
+    assert_eq!(after_state[0], before_state[0]);
+    assert_eq!(after_state[1], before_state[1], "接纳候选不能伪造真实导航反馈历史");
+    assert_eq!(after_state[2][0], before_state[2][0], "接纳候选不能推进区域服务轮次");
+    assert!(after_state[2][1].as_array().unwrap().iter().all(|entry| entry[1] == before_state[2][0]),
+        "新出现的区域只能登记当前轮次，不能伪造已服务记录");
     {
         let audit = audit.lock().unwrap();
-        assert_eq!(
-            (audit.captures.len(), audit.commits.len(), audit.discards),
-            (1, 0, 1)
-        );
-        assert!(
-            audit.feedback.is_empty(),
-            "a discarded proposal never owned a selected goal"
-        );
-    }
-    assert_eq!(
-        owner_watchdog(handle.inspect_compute_checkpoint())
-            .await
-            .unwrap()[0]
-            .payload,
-        before
-    );
-    assert!(sink.submitted.lock().unwrap().is_empty());
-    assert!(sink.cancelled.lock().unwrap().is_empty());
-    {
-        let guard = handle.inner.lock().await;
-        assert!(guard.logical_active);
-        assert_eq!(guard.child_sequence, 0);
-        assert_eq!(guard.reached_goals, 0);
-        assert!(guard.active_child.is_none());
-        assert!(guard.pending_child_dispatch.is_none());
-        assert!(guard.frontiers.is_empty());
-    }
-    let fresh = owner_watchdog(handle.tick_with_pose(surface_pose(
-        &replacement,
-        0.0,
-        Quaternion::IDENTITY,
-    )))
-    .await;
-    assert_eq!(fresh.status, STATUS_ACTIVE, "{}", fresh.message);
-    assert_eq!(fresh.child_task_id, format!("{request_id}.nav.1"));
-    {
-        let audit = audit.lock().unwrap();
-        assert_eq!(
-            (audit.captures.len(), audit.commits.len(), audit.discards),
-            (2, 1, 1)
-        );
-        assert_eq!(
-            audit.captures[1].original.notification(),
-            current.notification()
-        );
-        assert!(Arc::ptr_eq(
-            audit.captures[1].original.snapshot().unwrap(),
-            &replacement
-        ));
-        assert!(
-            surface_owner_goal(&audit.commits[0]).id.ends_with("-1"),
-            "discard must not consume the Surface ID"
-        );
+        assert_eq!((audit.captures.len(), audit.commits.len(), audit.discards), (1, 1, 0));
+        assert!(surface_owner_goal(&audit.commits[0]).id.ends_with("-1"));
         assert!(audit.feedback.is_empty());
+        assert_eq!(audit.captures[0].original.notification(), original.notification());
+        assert!(Arc::ptr_eq(audit.captures[0].original.snapshot().unwrap(), &snapshot));
+        assert_eq!(audit.captures[0].frontier_rebuilds, 1);
+        assert_eq!(audit.captures[0].tomogram_builds, 1);
+        assert!(audit.captures[0].tomogram_cells > 0);
+        assert!(audit.captures[0].private_frontier_before.is_none());
+        assert_eq!(audit.captures[0].frontier_evaluated_cells,
+            audit.captures[0].original.snapshot().unwrap().cell_keys().count());
+        assert!(audit.captures[0].private_query.upgrade().is_some());
     }
     {
         let submitted = sink.submitted.lock().unwrap();
         assert_eq!(submitted.len(), 1);
         assert_eq!(submitted[0].intent.committed_map, message.committed_map);
-        assert_eq!(
-            submitted[0].frontier_goal_id,
-            surface_owner_goal(&audit.lock().unwrap().commits[0]).id
-        );
+        assert_eq!(submitted[0].frontier_goal_id,
+            surface_owner_goal(&audit.lock().unwrap().commits[0]).id);
     }
     let status = handle.inner.lock().await.compute.status().unwrap();
     assert_eq!(status.incarnation, incarnation);
     assert_eq!(status.high_water.workers, 1);
     assert_eq!(status.high_water.active, 1);
     {
-        let audit = audit.lock().unwrap();
-        assert_eq!(audit.captures.iter().map(|c| c.frontier_rebuilds).collect::<Vec<_>>(), vec![1, 1]);
-        assert_eq!(audit.captures.iter().map(|c| c.tomogram_builds).collect::<Vec<_>>(), vec![1, 1]);
-        assert!(audit.captures.iter().all(|c| c.tomogram_cells > 0));
-        for capture in &audit.captures {
-            assert!(capture.private_frontier_before.is_none());
-            assert_eq!(capture.frontier_evaluated_cells,
-                capture.original.snapshot().unwrap().cell_keys().count());
-        }
-        assert!(audit.captures[0].private_query.upgrade().is_none(), "Discard releases the old query");
-        assert!(!std::sync::Weak::ptr_eq(&audit.captures[0].private_query, &audit.captures[1].private_query));
+        let guard = handle.inner.lock().await;
+        assert!(guard.logical_active);
+        assert_eq!(guard.child_sequence, 1);
+        assert_eq!(guard.reached_goals, 0);
+        assert!(guard.active_child.is_some());
+        assert!(guard.pending_child_dispatch.is_none());
     }
-    finish_surface_owner_success(&handle, request_id, &fresh, &audit).await;
+    assert!(sink.cancelled.lock().unwrap().is_empty());
+    finish_surface_owner_success(&handle, request_id, &settled, &audit).await;
     }).catch_unwind().await;
     prepare.release();
     if let Err(panic) = exercise {
@@ -1031,7 +965,7 @@ async fn compute_owner_surface_new_raw_owner_keeps_query_equivalent_selection() 
 }
 
 #[tokio::test]
-async fn compute_owner_surface_new_immutable_source_discards_without_history_or_id() {
+async fn compute_owner_surface_new_immutable_source_rechecks_once_without_history_or_id_loss() {
     surface_owner_changed_source_qualifies_query_then_progresses(false).await;
 }
 
@@ -1912,6 +1846,7 @@ async fn query_equivalent_writer_still_obeys_safety_fence(fence: QueryEquivalent
                     > second.query_ground([1.55, 1.55], 0.025).max_residual_m.unwrap());
                 assert!(!original.same_planning_query_view(&receiver.freeze().unwrap()));
                 assert!(planning.rebind_original(&receiver.freeze().unwrap()).is_none());
+                eprintln!("原地面层围栏失效原因={:?}", original.planning_query_change(&receiver.freeze().unwrap()));
             }
         }
         gate.release();

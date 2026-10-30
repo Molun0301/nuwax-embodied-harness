@@ -297,6 +297,7 @@ pub(super) struct ComputeBasis {
     return_on_completion: bool,
     mission_present: bool,
     no_frontier_timeout: Duration,
+    surface_selection: Arc<OnceLock<nuwax_exploration::surface_adapter::SurfaceSelectionQualification>>,
     #[cfg(test)]
     inspection: bool,
 }
@@ -305,18 +306,20 @@ impl ComputeBasis {
         self.current_at_history(inner, self.history)
     }
     fn current_at_history(&self, inner: &ExploreRuntimeInner, expected_history: u64) -> bool {
+        if !self.current_query_at_history(inner, expected_history) { return false; }
+        // 最新路线依赖比较结束后再取时效，不能把比较开始时的新鲜度带到提交。
         let fresh = inner.map_input_is_fresh(now_monotonic_nanos());
         #[cfg(test)]
         let fresh = self.inspection || fresh;
-        fresh && self.current_query_at_history(inner, expected_history)
+        fresh
     }
 
-    /// 仅核对任务和原查询；纯待继续进度可在失鲜时提交，不能据此取得运动许可。
+    /// 核对任务和查询依赖；纯待继续进度可在失鲜时提交，不能据此取得运动许可。
     fn current_query_at_history(&self, inner: &ExploreRuntimeInner, expected_history: u64) -> bool {
         self.query_invalidation(inner, expected_history).is_none()
     }
 
-    /// 逐项保留原资格条件；失败原因用于取证，不据此放宽提交。
+    /// 核对任务、来源及所选结果的实际依赖，并记录首先失效的组成。
     fn query_invalidation(&self, inner: &ExploreRuntimeInner, expected_history: u64) -> Option<&'static str> {
         if !inner.logical_active { return Some("session_inactive"); }
         if self.generation != inner.generation { return Some("runtime_generation"); }
@@ -347,7 +350,13 @@ impl ComputeBasis {
                         });
                 if !map_current { return Some("surface_map_lineage"); }
                 match mode.receiver.freeze() {
-                    Ok(now) => original.planning_query_change(&now),
+                    Ok(now) => {
+                        let change = original.planning_query_change(&now);
+                        match (change, self.surface_selection.get()) {
+                            (Some(_), Some(selection)) => selection.invalidation(&now),
+                            _ => change,
+                        }
+                    },
                     Err(_) => Some("surface_receiver_unavailable"),
                 }
             }
@@ -397,7 +406,15 @@ impl Drop for JobTicket {
 }
 impl JobTicket {
     pub(super) fn current(&self, inner: &ExploreRuntimeInner) -> bool {
-        self.basis.current(inner)
+        let current = self.basis.current(inner);
+        if !current && self.basis.surface_selection.get().is_some() {
+            tracing::info!(event="exploration.selection.delivery_withheld", request_id=%self.basis.parent,
+                incarnation=self.id.incarnation, sequence=self.id.sequence,
+                query_invalidation=self.basis.query_invalidation(inner, self.basis.history),
+                source_fresh=inner.map_input_is_fresh(now_monotonic_nanos()),
+                "已重核候选在交付时失效");
+        }
+        current
     }
     /// Requalify the original sampled advice after its own exact accepted
     /// Cancelled feedback. Only that acknowledgment's one history increment is
@@ -742,6 +759,7 @@ impl ExploreRuntimeHandle {
             .as_ref()
             .ok_or("exploration compute owner missing")?;
         let basis = ComputeBasis {
+            surface_selection: Arc::new(OnceLock::new()),
             generation: inner.generation,
             parent: inner.last_request_id.clone(),
             history: inner.compute.history,
@@ -1597,6 +1615,11 @@ fn drain_locked(
             .filter(|job| job.id == prepared.id)
             .ok_or("unowned exploration prepared projection")?;
         job.prepared = Some(prepared);
+        if let Some(exchange::Prepared { projection: ComputeProjection::Selection(selection), .. }) = &job.prepared {
+            if let Some(qualification) = &selection.qualification {
+                let _ = job.basis.surface_selection.set(qualification.clone());
+            }
+        }
     }
     if inner
         .compute
@@ -1618,7 +1641,7 @@ fn drain_locked(
         let pending_progress = matches!(&job.basis.input, ComputeInput::Surface { .. })
             && matches!(job.prepared.as_ref().map(|value| &value.projection),
                 Some(ComputeProjection::Selection(SelectionProjection {
-                    poll: Ok(ExplorationPoll::Pending), mission: None, cancelled: false,
+                    poll: Ok(ExplorationPoll::Pending), mission: None, cancelled: false, ..
                 })));
         let qualification_started = Instant::now();
         let current = if pending_progress {
@@ -1638,6 +1661,7 @@ fn drain_locked(
             incarnation=job.id.incarnation, sequence=job.id.sequence, captured_now_ns=job.captured_now_ns,
             monotonic_ns=now_monotonic_nanos(), queue_and_compute_ms=job.admitted_at.elapsed().as_secs_f64()*1000.0,
             qualification_ms, query_invalidation, source_fresh=inner.map_input_is_fresh(now_monotonic_nanos()),
+            qualification_scope=if job.basis.surface_selection.get().is_some() { "selected_route_and_target" } else { "full_query" },
             current_generation=inner.generation, current_history=inner.compute.history,
             current_surface_revision=?inner.surface_mode.as_ref().and_then(|mode|mode.installed_revision),
             current_committed_map=?inner.committed_map,
@@ -1680,6 +1704,13 @@ fn drain_locked(
             job.prepared = None;
             job.result = Some(match settled.result {
                 exchange::Settlement::Accepted(value) => {
+                    if let ComputeProjection::Selection(selection) = &value.projection {
+                        tracing::info!(event="exploration.selection.committed", request_id=%job.basis.parent,
+                            incarnation=job.id.incarnation, sequence=job.id.sequence,
+                            goal_id=selected_goal(&value.projection).map(|goal|goal.id.as_str()),
+                            goal=matches!(&selection.poll, Ok(ExplorationPoll::Goal(_))),
+                            "探索选择事务已提交");
+                    }
                     inner.committed = value.committed.clone();
                     Ok(Arc::new(value))
                 }

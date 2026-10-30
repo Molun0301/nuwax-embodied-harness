@@ -2,6 +2,174 @@
 use super::*;
 
 #[test]
+fn observed_cells_behind_calibrated_goal_do_not_invalidate_unchanged_visible_gain() {
+    let template = map();
+    let points: Vec<_> = (0..60).flat_map(|x| (0..60).filter_map(move |y|
+        ((x, y) != (37, 37)).then_some(((x as f32 + 0.5) * 0.1,
+            (y as f32 + 0.5) * 0.1, 0.05)))).collect();
+    let original = Arc::new(SurfaceSnapshot::from_points(&points, template.config().clone(), 0.1).unwrap());
+    let receiver = SurfaceInputReceiver::new();
+    receiver.observe(original.clone()).unwrap();
+    let mut adapter = source(receiver.clone(), 1);
+    let mut model = volume_model();
+    model.max_range_m = 6.0;
+    model.horizontal_fov_rad = std::f64::consts::FRAC_PI_2;
+    adapter.set_observation_model(model.clone()).unwrap();
+    let mut current = state(0.4, 1);
+    current.robot_pose.pose.position.x = 0.55;
+    current.robot_pose.pose.position.y = 0.55;
+    let first = receiver.freeze().unwrap().fork_for_planning().with_revalidation_advice();
+    goal(adapter.prepare_poll_with_planning_input(&current, &first)
+        .unwrap().outcome().as_ref().unwrap().clone());
+    adapter.discard_prepared_poll().unwrap();
+    let input = receiver.freeze().unwrap().fork_for_planning().with_revalidation_advice();
+    let selected = goal(adapter.prepare_poll_with_planning_input(&current, &input)
+        .unwrap().outcome().as_ref().unwrap().clone());
+    let mut filled = points;
+    filled.push((3.75, 3.75, 0.05));
+    let changed = Arc::new(SurfaceSnapshot::from_points(&filled, template.config().clone(), 0.1).unwrap());
+    let before = original.observation_targets(&[]).unwrap();
+    let after = changed.observation_targets(&[]).unwrap();
+    assert_ne!(before.iter().map(|target| target.cell).collect::<Vec<_>>(),
+        after.iter().map(|target| target.cell).collect::<Vec<_>>(), "夹具须真正观测掉远处未知单元");
+    let p = selected.pose.pose.position;
+    let q = selected.pose.pose.orientation;
+    let visible = |map: &SurfaceSnapshot, targets: &[_]| map.estimate_observation_view(
+        &model, [p.x, p.y, p.z], [q.x, q.y, q.z, q.w], targets).unwrap().cells;
+    let before_visible = visible(&original, &before);
+    assert!(!before_visible.is_empty());
+    assert_eq!(before_visible, visible(&changed, &after), "标定目标的实际可见收益须保持相同");
+    receiver.observe(changed).unwrap();
+    assert_eq!(input.selection_qualification().unwrap().invalidation(&receiver.freeze().unwrap()), None,
+        "已观测单元在相机当前视域外，不应撤销实际可见收益未变的候选");
+    adapter.discard_prepared_poll().unwrap();
+}
+
+#[test]
+fn unrelated_change_inside_route_bounding_box_preserves_revalidated_selection() {
+    let template = map();
+    let points: Vec<_> = (0..100).flat_map(|x| (0..100).map(move |y|
+        ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, 0.05))).collect();
+    let original = Arc::new(SurfaceSnapshot::from_points(&points, template.config().clone(), 0.1).unwrap());
+    let receiver = SurfaceInputReceiver::new();
+    receiver.observe(original.clone()).unwrap();
+    let mut adapter = source(receiver.clone(), 1);
+    let first = receiver.freeze().unwrap().fork_for_planning().with_revalidation_advice();
+    let mut corner = state(0.4, 1);
+    corner.robot_pose.pose.position.x = 9.05;
+    corner.robot_pose.pose.position.y = 9.05;
+    let old = goal(adapter.prepare_poll_with_planning_input(&corner, &first)
+        .unwrap().outcome().as_ref().unwrap().clone());
+    adapter.discard_prepared_poll().unwrap();
+    let input = receiver.freeze().unwrap().fork_for_planning().with_revalidation_advice();
+    let mut current = state(0.4, 2);
+    current.robot_pose.pose.position.x = if old.pose.pose.position.x < 5.0 { 9.05 } else { 0.55 };
+    current.robot_pose.pose.position.y = if old.pose.pose.position.y < 5.0 { 9.05 } else { 0.55 };
+    let selected = goal(adapter.prepare_poll_with_planning_input(&current, &input)
+        .unwrap().outcome().as_ref().unwrap().clone());
+    assert_eq!(selected.pose.pose.position, old.pose.pose.position);
+    assert_eq!(selected.metadata["route_exact_queries"], "1");
+    let qualification = input.selection_qualification().unwrap();
+    let start = current.robot_pose.pose.position;
+    let end = selected.pose.pose.position;
+    assert!((start.x - end.x).abs() > 4.0 && (start.y - end.y).abs() > 4.0,
+        "夹具须形成两个方向均跨越半张已测地图的路线");
+    let obstacle = [start.x, end.y, 0.4];
+    let changed = Arc::new(original.with_recent_obstacle_points(2, 2, 0, &[],
+        [(0, obstacle)]).unwrap());
+    let native = NativeFrontierCache::default().get(&changed, 0.3, &[]).unwrap();
+    let route = native.planner.lock().unwrap().plan([start.x, start.y, start.z],
+        [end.x, end.y, end.z]).expect("更新后的原完整路线查询须仍然通过");
+    let minimum = route.path.windows(2).map(|pair| {
+        let delta = [pair[1][0] - pair[0][0], pair[1][1] - pair[0][1]];
+        let length2 = delta[0] * delta[0] + delta[1] * delta[1];
+        let t = if length2 == 0.0 { 0.0 } else {
+            (((obstacle[0] - pair[0][0]) * delta[0] + (obstacle[1] - pair[0][1]) * delta[1]) / length2).clamp(0.0, 1.0)
+        };
+        (obstacle[0] - pair[0][0] - t * delta[0]).hypot(obstacle[1] - pair[0][1] - t * delta[1])
+    }).fold(f64::INFINITY, f64::min);
+    assert!(minimum > 2.0, "更新实体须离完整路线超过2米，实际{minimum}米");
+    receiver.observe(changed).unwrap();
+    assert_eq!(qualification.invalidation(&receiver.freeze().unwrap()), None,
+        "地图角上的实体在路线外接矩形内，但远离实际对角路线及目标，不应撤销");
+    adapter.discard_prepared_poll().unwrap();
+}
+
+#[test]
+fn revalidated_selection_compares_current_route_and_target_instead_of_whole_map_identity() {
+    let original = map();
+    let receiver = SurfaceInputReceiver::new();
+    receiver.observe(original.clone()).unwrap();
+    let mut adapter = source(receiver.clone(), 1);
+    let first = receiver
+        .freeze()
+        .unwrap()
+        .fork_for_planning()
+        .with_revalidation_advice();
+    adapter
+        .prepare_poll_with_planning_input(&state(0.4, 1), &first)
+        .unwrap();
+    assert!(first.selection_qualification().is_none());
+    adapter.discard_prepared_poll().unwrap();
+    let input = receiver
+        .freeze()
+        .unwrap()
+        .fork_for_planning()
+        .with_revalidation_advice();
+    let selected = goal(
+        adapter
+            .prepare_poll_with_planning_input(&state(0.4, 2), &input)
+            .unwrap()
+            .outcome()
+            .as_ref()
+            .unwrap()
+            .clone(),
+    );
+    let qualification = input
+        .selection_qualification()
+        .expect("完整精确路线复核的实际产物");
+    let mut points: Vec<_> = original
+        .navigation_measured_points()
+        .unwrap()
+        .iter()
+        .map(|p| (p[0] as f32, p[1] as f32, p[2] as f32))
+        .collect();
+    points.push((50.05, 50.05, points[0].2));
+    let unrelated = Arc::new(
+        SurfaceSnapshot::from_points(
+            &points,
+            original.config().clone(),
+            original.source_voxel_size_m(),
+        )
+        .unwrap()
+        .with_ground_evidence(original.ground_evidence()),
+    );
+    receiver.observe(unrelated).unwrap();
+    let latest = receiver.freeze().unwrap();
+    assert_eq!(
+        input.original_input().planning_query_change(&latest),
+        Some("surface_geometry")
+    );
+    assert_eq!(
+        qualification.invalidation(&latest),
+        None,
+        "实际重建整图并新增远处地面，不能撤销路线和目标都未变化的已重核结果"
+    );
+    let p = selected.pose.pose.position;
+    let blocked = Arc::new(
+        original
+            .with_recent_obstacle_points(3, 3, 0, &[], [(0, [p.x, p.y, p.z + 0.1])])
+            .unwrap(),
+    );
+    receiver.observe(blocked).unwrap();
+    assert_eq!(
+        qualification.invalidation(&receiver.freeze().unwrap()),
+        Some("selected_route_geometry")
+    );
+    adapter.discard_prepared_poll().unwrap();
+}
+
+#[test]
 fn fresh_receipt_rechecks_discarded_goal_even_when_query_geometry_is_unchanged() {
     let receiver = SurfaceInputReceiver::new();
     let snapshot = map();

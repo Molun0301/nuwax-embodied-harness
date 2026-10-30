@@ -14,6 +14,11 @@ use crate::{
     PreparedExplorationPoll,
 };
 
+#[path = "surface_selection_qualification.rs"]
+mod selection_qualification;
+pub use selection_qualification::SurfaceSelectionQualification;
+use selection_qualification::NativeSelectionInput;
+
 /// 根拥有方注入的几何引用；地图身份、真实时效及域切换仍由注入方负责。
 #[derive(Clone, Default)]
 pub struct SurfaceInputReceiver {
@@ -119,6 +124,7 @@ impl FrozenSurfaceInput {
             original: self.clone(),
             native_cache: Arc::new(NativeFrontierCache::default()),
             revalidation_advice: false,
+            selection_qualification: Arc::new(Mutex::new(None)),
             query_view: self
                 .snapshot
                 .as_ref()
@@ -174,6 +180,7 @@ pub struct FrozenSurfacePlanningInput {
     query_view: Option<Arc<SurfaceSnapshot>>,
     native_cache: Arc<NativeFrontierCache>,
     revalidation_advice: bool,
+    selection_qualification: Arc<Mutex<Option<SurfaceSelectionQualification>>>,
 }
 
 #[derive(Clone)]
@@ -184,6 +191,7 @@ struct CachedFrontierPlanner {
     resolution: f64,
     measured: Arc<std::collections::BTreeMap<[i32; 2], Vec<f64>>>,
     planner: Arc<Mutex<nuwax_nav_pct_native::Planner>>,
+    input: Arc<NativeSelectionInput>,
 }
 #[derive(Default)]
 struct NativeFrontierCache {
@@ -229,7 +237,7 @@ impl NativeFrontierCache {
                 .push(cell.ground);
         }
         let resolution = config.resolution;
-        let planner = nuwax_nav_pct_native::Planner::from_cells(config, &cells, &bands)?;
+        let planner = nuwax_nav_pct_native::Planner::from_cells(config.clone(), &cells, &bands)?;
         tracing::debug!(target: "navigation.exploration.compute", elapsed_ms = started.elapsed().as_secs_f64() * 1000.0, "前沿原生规划器构建完成");
         tracing::debug!(target:"navigation.pct",event="navigation.pct.map",cells=cells.len(),
             occupied_bands=bands.len(),"探索PCT原生输入构建完成");
@@ -240,6 +248,7 @@ impl NativeFrontierCache {
             resolution,
             measured: Arc::new(measured),
             planner: Arc::new(Mutex::new(planner)),
+            input: Arc::new(NativeSelectionInput { config, cells, bands }),
         };
         *state = Some(cached.clone());
         Ok(cached)
@@ -259,6 +268,7 @@ impl FrozenSurfacePlanningInput {
             query_view: self.query_view.clone(),
             native_cache: Arc::clone(&self.native_cache),
             revalidation_advice: self.revalidation_advice,
+            selection_qualification: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -279,6 +289,11 @@ impl FrozenSurfacePlanningInput {
     /// After a qualified rebind its raw evidence can remain older than original_input.
     pub fn query_snapshot(&self) -> Option<&Arc<SurfaceSnapshot>> {
         self.query_view.as_ref()
+    }
+
+    /// 只有实际完成当前候选完整路线复核的来源才会产生这份提交依据。
+    pub fn selection_qualification(&self) -> Option<SurfaceSelectionQualification> {
+        self.selection_qualification.lock().unwrap().clone()
     }
 }
 
@@ -714,7 +729,7 @@ impl SurfaceGoalSourceAdapter {
                 }
             }
         }
-        let planner = native.planner;
+        let planner = native.planner.clone();
         let mut planner_guard = planner.lock().map_err(|_| {
             ExploreError::SourceError("native frontier planner lock is poisoned".into())
         })?;
@@ -765,7 +780,7 @@ impl SurfaceGoalSourceAdapter {
                 evaluated_candidate_count += 1;
                 if let Some(goal)=self.revalidate_candidate(state,snapshot,current_body,robot_support,
                     candidate.clone(),orientation,&observation_targets,&boundary,vertical_radius,
-                    &mut planner_guard,&route_budget,delta)? {
+                    &mut planner_guard,&route_budget,delta,planning,&native)? {
                     return Ok(ExplorationPoll::Goal(goal));
                 }
             }
@@ -1211,6 +1226,8 @@ impl SurfaceGoalSourceAdapter {
         planner: &mut nuwax_nav_pct_native::Planner,
         budget: &FrontierRouteBudget,
         delta: &mut SurfacePollDelta,
+        planning: Option<&FrozenSurfacePlanningInput>,
+        native: &CachedFrontierPlanner,
     ) -> ExploreResult<Option<FrontierGoal>> {
         let started = std::time::Instant::now();
         let minimum = f64::from(
@@ -1271,6 +1288,7 @@ impl SurfaceGoalSourceAdapter {
         {
             return Ok(None);
         }
+        let frontier = candidate.clone();
         candidate.support_xyz = snapshot
             .support_position_from_body(endpoint, orientation, self.body_to_support_z_m)
             .map_err(|error| ExploreError::SourceError(error.to_string()))?;
@@ -1318,6 +1336,14 @@ impl SurfaceGoalSourceAdapter {
             ("selection_method", "current_map_revalidation".into()),
         ] {
             goal.metadata.insert(key.into(), value);
+        }
+        if let Some(planning) = planning {
+            *planning.selection_qualification.lock().unwrap() = Some(
+                SurfaceSelectionQualification::new(
+                    snapshot, native, frontier, &goal, self.observation_model.clone(),
+                    targets, view.as_ref(), current.0, &route.path,
+                ),
+            );
         }
         tracing::info!(target:"navigation.exploration.compute",event="exploration.candidate.revalidated",
             elapsed_ms=started.elapsed().as_secs_f64()*1000.0,expanded=route.expanded,
@@ -1605,6 +1631,7 @@ type BodyPose = ([f64; 3], [f64; 4]);
 
 #[derive(Clone, Debug)]
 struct FrontierCandidate {
+    frontier_cell: [i32; 3],
     support_xyz: [f64; 3],
     gain: f64,
     travel_cost: f64,
@@ -1645,6 +1672,7 @@ fn frontier_geometry(
         candidates.insert(
             key(candidate.support_xyz),
             FrontierCandidate {
+                frontier_cell: [candidate.cell.0, candidate.cell.1, candidate.cell.2],
                 support_xyz: candidate.support_xyz,
                 gain: candidate.gain,
                 travel_cost: distance(reference, candidate.support_xyz),

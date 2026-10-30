@@ -2953,6 +2953,11 @@ impl ExploreRuntimeHandle {
         guard = self.inner.lock().await;
         if !selection_ticket.current(&guard) { return self.snapshot(); }
         let finalized = match finalized { Ok(value) => value, Err(_) => return self.snapshot() };
+        // 资格比较跨过原连续等待期限时，不能再把迟到结果交给子导航。
+        if let Some(error) = guard.selection_wait_failure() {
+            drop(guard);
+            return self.finish_session(None, ExplorationStopReason::PlanningResourceLimited, error).await;
+        }
         let selection = match &finalized.projection { ComputeProjection::Selection(selection) => selection.clone(), _ => {
             drop(guard); return self.finish_session(None, ExplorationStopReason::ConsecutiveFailuresExceeded, "invalid selection compute projection".into()).await;
         }};
@@ -3274,7 +3279,9 @@ impl ExploreRuntimeHandle {
     }
 
     async fn refresh_compute_status(&self, elapsed: Duration) {
-        let mut guard = self.inner.lock().await;
+        // 选择 future 可能已排队取得此锁；监视分支不能再排队后暂停轮询选择，
+        // 否则锁许可留给选择、监视却一直等待，原调度任务会自等。
+        let Ok(mut guard) = self.inner.try_lock() else { return; };
         if !guard.logical_active || guard.pending_child_cancellation.is_some() { return; }
         if let Some(error) = guard.selection_wait_failure() {
             drop(guard);

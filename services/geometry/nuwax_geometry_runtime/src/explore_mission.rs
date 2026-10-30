@@ -399,6 +399,18 @@ impl MissionRoutes {
         options: GoalOptions,
         cancellation: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<MissionRoute, MissionRouteError> {
+        self.query_recording(from, to, options, cancellation, &mut |_| {})
+    }
+
+    /// 保留本次成功查询的真实路线，供同一选择事务核对最新输入依赖。
+    pub fn query_recording(
+        &self,
+        from: &MissionPose,
+        to: &MissionPose,
+        options: GoalOptions,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
+        record: &mut impl FnMut(&[([f64; 3], [f64; 4])]),
+    ) -> Result<MissionRoute, MissionRouteError> {
         from.validate()?;
         to.validate()?;
         // 零距离仍运行真实可通行查询；直接累计原路径，不再复制位置数组。
@@ -431,6 +443,7 @@ impl MissionRoutes {
                     cancellation,
                 )?;
                 let end = path.last().ok_or("返航路线为空")?;
+                record(&path);
                 Ok(MissionRoute {
                     length: path.windows(2).map(|p| {
                         p[0].0.iter().zip(p[1].0).map(|(a, b)| (a - b).powi(2)).sum::<f64>().sqrt()

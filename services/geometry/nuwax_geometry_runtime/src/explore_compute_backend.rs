@@ -87,6 +87,7 @@ pub(super) struct SelectionProjection {
     /// The pending delta still exists when preparation preceded cancellation.
     /// Resolve Discard; never treat omitted route work as a completed query.
     pub cancelled: bool,
+    pub qualification: Option<nuwax_exploration::surface_adapter::SurfaceSelectionQualification>,
 }
 
 #[derive(Clone, Debug)]
@@ -362,10 +363,17 @@ impl ExploreComputeBackend {
             elapsed_ms=selection_started.elapsed().as_secs_f64()*1000.0, poll_kind,
             "探索候选阶段完成");
         let route_started = Instant::now();
+        let qualification = match &poll {
+            Ok(ExplorationPoll::Goal(goal)) => planning.as_ref()
+                .and_then(|input| input.selection_qualification())
+                .filter(|qualification| qualification.matches_goal(goal)),
+            _ => None,
+        };
         let mut output = SelectionProjection {
             poll,
             mission: None,
             cancelled: false,
+            qualification,
         };
         if cancelled() {
             output.cancelled = true;
@@ -412,7 +420,12 @@ impl ExploreComputeBackend {
                             progress,
                             &context.config.return_policy,
                             target.as_ref().map(|(pose, options)| (pose, *options)),
-                            |from, to, options| routes.query(from, to, options, cancellation),
+                            |from, to, options| routes.query_recording(from, to, options, cancellation,
+                                &mut |path| {
+                                    if let Some(qualification) = output.qualification.as_mut() {
+                                        qualification.include_route(path.iter().map(|pose| pose.0));
+                                    }
+                                }),
                             cancelled,
                         ) {
                             RouteComputation::Complete(result) => output.mission = Some(result),
@@ -425,6 +438,10 @@ impl ExploreComputeBackend {
         tracing::info!(event="exploration.compute.mission", captured_now_ns=context.now.nanos,
             elapsed_ms=route_started.elapsed().as_secs_f64()*1000.0, queried=output.mission.is_some(),
             "探索任务路线核验阶段完成");
+        if output.cancelled || output.mission.as_ref().is_some_and(|advice|
+            !matches!(advice, Ok(MissionRouteAdvice { can_visit: Ok(true), .. }))) {
+            output.qualification = None;
+        }
         (ComputeProjection::Selection(output), controller_prepared)
     }
 

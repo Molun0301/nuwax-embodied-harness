@@ -175,6 +175,7 @@ class BridgeCounters:
     lio_not_ready_count: int = 0
     dropped_odom_count: int = 0
     dropped_pointcloud_count: int = 0
+    replaced_mapping_frame_count: int = 0
     dropped_lio_imu_count: int = 0
     downsampled_pointcloud_count: int = 0
     last_publish_latency_ms: float = 0.0
@@ -198,6 +199,7 @@ class BridgeCounters:
             "lio_not_ready_count": self.lio_not_ready_count,
             "dropped_odom_count": self.dropped_odom_count,
             "dropped_pointcloud_count": self.dropped_pointcloud_count,
+            "replaced_mapping_frame_count": self.replaced_mapping_frame_count,
             "dropped_lio_imu_count": self.dropped_lio_imu_count,
             "downsampled_pointcloud_count": self.downsampled_pointcloud_count,
             "last_publish_latency_ms": self.last_publish_latency_ms,
@@ -1024,6 +1026,8 @@ class RuntimeInputBridge:
         if mapping_only and not _mapping_publish:
             with self._lio_condition:
                 if self._lio_callback_is_current(_lio_generation):
+                    if self._mapping_pending is not None:
+                        self._increment_counter("replaced_mapping_frame_count")
                     self._mapping_pending = point_cloud
                     self._lio_condition.notify_all()
             return

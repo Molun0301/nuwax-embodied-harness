@@ -1788,6 +1788,54 @@ def test_pose_callback_after_stop_is_ignored() -> None:
     assert runtime.publish_odom_calls == []
 
 
+def test_slow_mapping_publish_preserves_native_input_delivery_and_counts_replacements(monkeypatch):
+    from drivers.customrobot.providers import CustomRobotProviderBundle
+
+    monkeypatch.setenv("NUWAX_GEOMETRY_LIO_BACKEND", "pointlio")
+    monkeypatch.setenv("NUWAX_GEOMETRY_LIDAR_FRAME", "go2_base_link")
+    providers = CustomRobotProviderBundle()
+    providers.start()
+    runtime = _FakeRuntimeProvider()
+    entered, release = threading.Event(), threading.Event()
+    publish = runtime.publish_point_cloud
+
+    def slow_mapping(payload, point_step, **metadata):
+        if metadata.get("mapping_only") and metadata["source_sequence"] == 1:
+            entered.set()
+            assert release.wait(5)
+        return publish(payload, point_step, **metadata)
+
+    runtime.publish_point_cloud = slow_mapping
+    bridge = RuntimeInputBridge(runtime_provider=runtime, point_cloud_provider=providers,
+                                sensor_sample_provider=providers)
+    try:
+        assert bridge.start()
+        for sequence in range(1, 22):
+            frame = _make_point_cloud(2, frame_id="go2_base_link").model_copy(update={
+                "mapping_only": True, "metadata": {"source_sequence": sequence,
+                "source_timestamp_ns": 1234567890123456789 + sequence}})
+            assert providers.publish_point_cloud(frame)
+            if sequence == 1:
+                assert entered.wait(2)
+        started = time.monotonic()
+        _feed_ready_sensor_scan(providers.publish_sensor_sample)
+        _wait_for_bridge(bridge, lambda: bridge.counters.emitted_lio_measurement_count == 1)
+        assert time.monotonic() - started < .1
+        assert bridge.counters.received_lio_imu_count == 2
+        assert bridge.counters.received_lio_pointcloud_count == 1
+        assert bridge.counters.replaced_mapping_frame_count == 19
+        assert bridge.get_status()["counters"]["replaced_mapping_frame_count"] == 19
+        release.set()
+        _wait_for_bridge(bridge, lambda: bridge.counters.published_pointcloud_count == 3)
+        mapping = [call for call in runtime.publish_point_cloud_calls if call.get("mapping_only")]
+        assert [call["source_sequence"] for call in mapping] == [1, 21]
+        assert mapping[-1]["timestamp_ns"] == 1234567890123456810
+    finally:
+        release.set()
+        bridge.stop()
+        providers.stop()
+
+
 def test_integration_mapping_ready_after_pointcloud_emitted() -> None:
     """集成测试：3 帧 odom + 1 帧 pointcloud，runtime 收到 ≥1 pointcloud 后 ``mapping_ready_poll`` 可 true。"""
     runtime = _FakeRuntimeProvider(connected=True)

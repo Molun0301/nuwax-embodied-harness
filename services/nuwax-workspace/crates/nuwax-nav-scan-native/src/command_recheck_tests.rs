@@ -26,6 +26,19 @@ fn command_recheck_keeps_command_without_advancing_local_planning() {
     assert!(!planner.command_recheck_ready(),"执行退休不能被已选指令复核越过");
 }
 
+// 步态摇摆使实测角速超过设备上限时，复核输出仍须落在设备命令盒内。
+#[test]
+fn command_recheck_keeps_device_yaw_limit_under_large_measured_yaw_rate() {
+    let route=[[0.,0.,0.35],[2.,0.,0.35]];
+    let req=request(&route,&[]);
+    let mut planner=fixture_planner();
+    let limit=req.config.max_yaw_rate;
+    for rate in [limit+0.5,-(limit+0.5)] {
+        let checked=planner.recheck_command(&req,[0.1,0.,rate.signum()*limit],[0.;3],rate).unwrap();
+        assert_eq!(checked.command_yaw_rate,rate.signum()*limit,"实测角速{rate}不能把复核命令推出设备上限");
+    }
+}
+
 #[test]
 fn command_recheck_uses_raw_braking_and_rejects_body_penetration() {
     let route=[[0.,0.,0.35],[2.,0.,0.35]];

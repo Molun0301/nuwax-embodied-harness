@@ -137,8 +137,9 @@ extern "C" int nuwax_scan_session_plan_command(void* raw,const double* selected_
    // 在途结果退休后只复核已选指令；不推进规划、曲线时钟或历史命令。
    using namespace scan_planner::command_check_detail;
    const State actual{position,start_yaw,body(Eigen::Map<const Vector3d>(start_velocity).head<2>(),start_yaw),start_yaw_rate};
-   auto command=commandBox(Eigen::Map<const Vector3d>(selected_command).head<2>(),selected_command[2],c);
-   command.angular=std::clamp(command.angular,start_yaw_rate-c.max_yaw_acceleration*c.sample_dt,start_yaw_rate+c.max_yaw_acceleration*c.sample_dt);
+   // 与bounded相同：先按实测角速做本拍偏航动态限，设备命令盒最后施加，硬限制优先。
+   const double angular=std::clamp(selected_command[2],start_yaw_rate-c.max_yaw_acceleration*c.sample_dt,start_yaw_rate+c.max_yaw_acceleration*c.sample_dt);
+   const auto command=commandBox(Eigen::Map<const Vector3d>(selected_command).head<2>(),angular,c);
    const double radius=std::hypot(c.body_length/2.+std::abs(c.body_center_x),c.body_width/2.+std::abs(c.body_center_y));
    const auto deadline=Clock::now()+std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(c.sample_dt));
    bool exhausted=false;State stopped;

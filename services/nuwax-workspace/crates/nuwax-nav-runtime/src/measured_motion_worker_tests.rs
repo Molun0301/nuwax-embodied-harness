@@ -28,7 +28,7 @@ fn measured_probe()->(PlannerWorker,std::sync::mpsc::Receiver<(Option<MeasuredMo
     (PlannerWorker::new(MeasuredWorkerProbe{measured:None,applied:Twist2::ZERO,entered,release:finish}).unwrap(),start,release)
 }
 #[test]
-fn measured_change_without_pose_or_command_change_retires_inflight_result() {
+fn measured_change_during_computation_keeps_result_and_recomputes() {
     let (mut worker,started,release)=measured_probe();
     let mut a=crate::motion_feedback::tests::measured([0.1,0.,0.],[0.;3]);
     // 合成计算允许等待，保留原测试样本的固定有效期限。
@@ -40,7 +40,8 @@ fn measured_change_without_pose_or_command_change_retires_inflight_result() {
     let mut b=a.clone();b.source_timestamp_ns+=1;b.body_linear_xyz[0]=0.2;
     worker.observe_measured_motion(Some(b.clone()));release.send(()).unwrap();
     let second=started.recv_timeout(Duration::from_secs(1)).unwrap();assert_eq!(second,(Some(b),applied));
-    assert!(worker.shared.0.lock().unwrap().result.is_none(),"旧测速结果不得晚到发布");
+    // 按原测速求得的结果仍在许可期内，可以交付；新测速另起一次计算。
+    assert!(matches!(worker.step(0.3),PlannerStep::Command(c) if c.linear.x==0.1));
     release.send(()).unwrap();wait_for_source_result(&worker);
     assert!(matches!(worker.step(0.3),PlannerStep::Command(c) if c.linear.x==0.2));
     worker.stop();

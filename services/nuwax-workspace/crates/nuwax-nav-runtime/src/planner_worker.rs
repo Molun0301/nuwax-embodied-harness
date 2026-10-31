@@ -354,13 +354,16 @@ impl PlannerWorker {
                         .then(|| format!("{computed:?}"));
                     let mut input = lock.lock().unwrap();
                     let stop_only=recovery_stop(&computed);
+                    // 非零指令按计算开始时的位姿与测速求得，计算期间到达的新位姿或测速
+                    // 不使它作废：时效由原250毫秒结果许可期约束，下一次计算再用新输入。
+                    // 位姿本身已有数百毫秒采集延迟，要求“最新一帧”不增加安全性，只会让
+                    // 计算慢于位姿更新时永远交付不了结果。
+                    let moving_command=matches!(computed,PlannerStep::Command(v) if v!=Twist2::ZERO);
                     let current = input.epoch == version
                         && input.boundary_version == boundary_seq
                         && (stop_only || (input.applied_version == applied_seq
-                            && input.motion_version == motion_seq
+                            && (moving_command || input.motion_version == motion_seq)
                             && input.map_version == map_seq
-                            && (!matches!(computed,PlannerStep::Command(v) if v!=Twist2::ZERO)
-                                || input.pose_version == pose_seq)
                             && (!matches!(computed, PlannerStep::ReplanRequired(_) | PlannerStep::Failed(_))
                                 || input.pose_version == pose_seq)))
                         && !input.closed;
@@ -675,11 +678,10 @@ impl NavPlanner for PlannerWorker {
         let expired = input.result.as_ref().is_some_and(|(started, step)|
             matches!(step, PlannerStep::Command(_)) && started.elapsed() > DEFAULT_CONTROL_HORIZON);
         let dispatch_expired=input.result_dispatch_bound.is_some_and(CommandDispatchBound::expired_now);
+        // 新位姿或测速不作废已算出的非零指令（见计算线程发布处）；只有已执行指令变化才作废。
         let command_state_changed=input.result.as_ref().is_some_and(|(_,step)|
             matches!(step,PlannerStep::Command(c) if *c!=Twist2::ZERO)
-                && (input.result_pose_version!=input.pose_version
-                    || input.result_applied_version!=input.applied_version
-                    || input.result_motion_version!=input.motion_version));
+                && input.result_applied_version!=input.applied_version);
         let arrival_changed = input.result.as_ref().is_some_and(|(_, step)|
             (matches!(step, PlannerStep::Succeeded) && input.result_pose_version != input.pose_version
                 && !arrival_event_still_in_goal(&input)));
@@ -2343,8 +2345,9 @@ mod tests {
             let _ = finish.send(PlannerStep::Pending(Vec::new()));
         }
     }
+    // 计算期间到达的新位姿不作废已算出的指令；结果仍只交付一次。
     #[test]
-    fn pose_only_motion_requires_current_first_delivery_and_cannot_replay_it() {
+    fn pose_update_during_computation_keeps_command_deliverable_once() {
         let (mut worker, started, finish) = terminal_worker();
         worker.update_odometry(route_pose(0.5, 0));
         worker.step(0.3);
@@ -2353,16 +2356,11 @@ mod tests {
         let command = PlannerStep::Command(Twist2 {
             linear: nuwax_nav_types_messages::Point2::new(0.1, 0.0), angular_z: 0.0,
         });
-        worker.step(0.3); // Unsupported selected recheck queues a new current-state computation.
-        finish.send(command.clone()).unwrap();
-        started.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(worker.shared.0.lock().unwrap().result.is_none(),"unrechecked old-pose command was published");
         finish.send(command.clone()).unwrap();
         wait_for_source_result(&worker);
-        assert_eq!(worker.step(0.3), command, "current-pose first delivery remains available");
+        assert_eq!(worker.step(0.3), command, "按计算开始时位姿求得的指令在许可期内仍可交付");
         worker.update_odometry(route_pose(0.500002, 2));
-        assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()),
-            "a consumed velocity cannot grant another hold from the newer pose");
+        assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()), "已交付的结果不能再次交付");
         worker.stop();
         let _ = finish.send(PlannerStep::Pending(Vec::new()));
     }
@@ -2727,20 +2725,18 @@ mod tests {
     }
 
     #[test]
-    fn current_tick_refresh_timeout_keeps_zero_and_stop_responsive() {
+    fn newer_pose_does_not_block_delivery_and_stop_stays_responsive() {
         let(mut worker,started,finish)=terminal_worker();
         worker.update_odometry(route_pose(0.5,0));
         worker.step(0.3);started.recv_timeout(Duration::from_secs(1)).unwrap();
-        finish.send(PlannerStep::Command(Twist2 {
-            linear:nuwax_nav_types_messages::Point2::new(0.1,0.0),angular_z:0.0,
-        })).unwrap();
+        let command=Twist2 {linear:nuwax_nav_types_messages::Point2::new(0.1,0.0),angular_z:0.0};
+        finish.send(PlannerStep::Command(command)).unwrap();
         wait_for_source_result(&worker);
         worker.update_odometry(route_pose(0.6,1));
-        // 新计算由通道挂起；控制拍必须在有界时间内归零，不能续用旧许可。
+        // 新位姿触发的计算由通道挂起；控制拍在有界时间内交付按原位姿算出、仍在许可期内的指令。
         let began=std::time::Instant::now();
-        assert!(matches!(worker.step(0.3),PlannerStep::Pending(_)));
+        assert_eq!(worker.step(0.3),PlannerStep::Command(command));
         assert!(began.elapsed()<DEFAULT_TICK_INTERVAL*2,"等待超过一个控制拍加调度余量");
-        assert!(worker.delivered_command_deadline_for_test().is_none());
         let stopped=std::time::Instant::now();
         worker.stop();
         assert!(stopped.elapsed()<Duration::from_millis(20));

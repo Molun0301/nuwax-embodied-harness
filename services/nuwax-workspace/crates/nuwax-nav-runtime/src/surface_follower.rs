@@ -84,7 +84,7 @@ impl SurfaceFollowerConfig {
             .or(self.basic_kinematics)
     }
 }
-/// 唯一三维局部计算拥有者，实际运动端仍属于调度器。
+/// 三维轨迹与命令扫掠计算后端；各实例由独立拥有方串行调用，实际运动端属于调度器。
 pub struct SurfaceFollower {
     config: SurfaceFollowerConfig,
     map: Option<Arc<SurfaceSnapshot>>,
@@ -114,12 +114,15 @@ pub struct SurfaceFollower {
     wait_reason: Option<String>,
     execution_cycle_complete:bool,
     execution_failed:bool,
+    recheck_only:bool,
+    static_map_fixture:bool,
 }
 impl SurfaceFollower {
     /// 仅供显式模拟/静态地图夹具使用作者 A 的静态占据输入。
     /// 生产默认关闭，不能用静态表面快照伪装注册点云原帧。
     pub fn enable_author_static_map_fixture(&mut self, enabled: bool) {
         self.native_planner.set_static_map_fixture(enabled);
+        self.static_map_fixture=enabled;
     }
     /// 最近一次边界来源：实测、历史轨迹或首次边界假设，不与 APPLIED 混用。
     pub fn motion_boundary_sources(&self)->Option<[nuwax_nav_scan_native::MotionBoundarySource;3]> { self.motion_boundary_sources }
@@ -198,6 +201,8 @@ impl SurfaceFollower {
             wait_reason: None,
             execution_cycle_complete:false,
             execution_failed:false,
+            recheck_only:false,
+            static_map_fixture:false,
         })
     }
     /// 实际位置投影到全局参考的累计进度。
@@ -482,12 +487,15 @@ impl SurfaceFollower {
                 odometry_timestamp_ns: pose.stamp.nanos,
                 config,
             };
-        let result=if let (Some(command),Some(velocity),Some(rate))=(selected,boundary.velocity,boundary.yaw_rate) {
+        let result=if let Some(command)=selected {
+            let (Some(velocity),Some(rate))=(boundary.velocity,boundary.yaw_rate) else {
+                return Err("已选指令复核缺少当前原始实测速度或角速度".into());
+            };
             self.native_planner.recheck_command(&request,[command.linear.x,command.linear.y,command.angular_z],velocity,rate)?
         } else {self.native_planner.step(&request)?};
         self.command_execution_window=execution_started.map(|started|(started,
             std::time::Duration::from_secs_f64(result.command_duration)));
-        if selected.is_some() && boundary.velocity.is_some() && boundary.yaw_rate.is_some() {
+        if selected.is_some() {
             return Ok(Twist2{linear:Point2::new(result.command_forward,result.command_lateral),angular_z:result.command_yaw_rate});
         }
         if self.motion_boundary_sources != Some(result.motion_boundary_sources) {
@@ -720,10 +728,20 @@ impl NavPlanner for SurfaceFollower {
             }
         }
     }
+    fn command_recheck_ready(&self)->bool {
+        self.native_planner.command_recheck_ready() && self.motion_boundary.as_ref()
+            .is_some_and(|boundary|boundary.velocity.is_some() && boundary.yaw_rate.is_some())
+    }
+    fn command_rechecker(&self)->Result<Option<Box<dyn NavPlanner>>,RuntimeError> {
+        let mut checker=Self::new(self.config.clone())?;
+        checker.recheck_only=true;
+        checker.enable_author_static_map_fixture(self.static_map_fixture);
+        Ok(Some(Box::new(checker)))
+    }
     fn recheck_command(&mut self,robot_width_m:f64,command:Twist2)->Option<PlannerStep> {
         if self.position_reached() {return None;}
         // 初始化、源域重置和原状态机停车阶段不进入独立复核。
-        if !self.native_planner.command_recheck_ready() {return None;}
+        if !self.recheck_only && !self.native_planner.command_recheck_ready() {return None;}
         self.execution_cycle_complete=false;
         self.execution_failed=false;
         self.motion_dispatch_bound=None;

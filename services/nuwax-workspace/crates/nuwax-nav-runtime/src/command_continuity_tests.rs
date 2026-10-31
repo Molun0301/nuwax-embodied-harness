@@ -29,13 +29,15 @@ impl tracing::Subscriber for CommandDiagnostics {
 }
 
 struct SlowSurface {
-    inner: SurfaceFollower,
+    inner: Box<dyn NavPlanner>,
     calls: usize,
     slow: Arc<AtomicBool>,
     native_max_ns: Arc<AtomicU64>,
     rechecks: Arc<AtomicUsize>,
     observed_frames: Arc<AtomicUsize>,
     last_frame: Option<RegisteredFrameIdentity>,
+    online: bool,
+    is_rechecker: bool,
 }
 impl NavPlanner for SlowSurface {
     fn set_control_period(&mut self,p:Duration) {self.inner.set_control_period(p);}
@@ -51,7 +53,7 @@ impl NavPlanner for SlowSurface {
     fn observe_registered_frame(&mut self,frame:Option<Arc<RegisteredFrame>>) {
         let identity=frame.as_ref().map(|f|f.identity.clone());
         if identity!=self.last_frame {
-            if identity.is_some() {self.observed_frames.fetch_add(1,Ordering::Relaxed);}
+            if identity.is_some() && !self.is_rechecker {self.observed_frames.fetch_add(1,Ordering::Relaxed);}
             self.last_frame=identity;
         }
         self.inner.observe_registered_frame(frame);
@@ -66,15 +68,23 @@ impl NavPlanner for SlowSurface {
         if self.slow.load(Ordering::Relaxed) {
             self.native_max_ns.fetch_max(started.elapsed().as_nanos() as u64,Ordering::Relaxed);
             // 总计算周期周期性为70毫秒，包含原算法耗时；原算法本身不能被缩短。
-            let period=Duration::from_millis(if self.calls%3==0 {70}else{8});
+            let period=Duration::from_millis(if self.online || self.calls%3==0 {70}else{8});
             std::thread::sleep(period.saturating_sub(started.elapsed()));
         }
         step
+    }
+    fn command_recheck_ready(&self)->bool {self.inner.command_recheck_ready()}
+    fn command_rechecker(&self)->Result<Option<Box<dyn NavPlanner>>,RuntimeError> {
+        Ok(self.inner.command_rechecker()?.map(|inner|Box::new(Self {
+            inner,calls:0,slow:self.slow.clone(),native_max_ns:self.native_max_ns.clone(),
+            rechecks:self.rechecks.clone(),observed_frames:self.observed_frames.clone(),last_frame:None,online:self.online,is_rechecker:true,
+        }) as Box<dyn NavPlanner>))
     }
     fn recheck_command(&mut self,w:f64,command:Twist2)->Option<PlannerStep> {
         self.rechecks.fetch_add(1,Ordering::Relaxed);
         let started=std::time::Instant::now();
         let step=self.inner.recheck_command(w,command);
+        if self.online {std::thread::sleep(Duration::from_millis(15).saturating_sub(started.elapsed()));}
         self.native_max_ns.fetch_max(started.elapsed().as_nanos() as u64,Ordering::Relaxed);
         step
     }
@@ -85,11 +95,15 @@ struct ContinuousMotion {
     inner: FakeMotion,
     command: Arc<Mutex<Twist2>>,
     measured: Arc<Mutex<MeasuredMotion>>,
+    feedback_available:Arc<AtomicBool>,
+    expire_next_bounded:bool,
     output: Arc<Mutex<Vec<(std::time::Instant,Twist2)>>>,
 }
 #[async_trait]
 impl NavMotionPort for ContinuousMotion {
-    fn measured_motion(&self)->Option<MeasuredMotion> {Some(self.measured.lock().unwrap().clone())}
+    fn measured_motion(&self)->Option<MeasuredMotion> {
+        self.feedback_available.load(Ordering::Relaxed).then(||self.measured.lock().unwrap().clone())
+    }
     async fn acquire(&mut self,id:&str,a:&NavMotionAdmission)->Result<LeaseProof,MotionPortError> {self.inner.acquire(id,a).await}
     async fn renew(&mut self,id:&str)->Result<(),MotionPortError> {self.inner.renew(id).await}
     async fn submit_twist(&mut self,id:&str,c:Twist2)->Result<AppliedProof,MotionPortError> {
@@ -99,6 +113,9 @@ impl NavMotionPort for ContinuousMotion {
         Ok(proof)
     }
     async fn submit_twist_bounded(&mut self,id:&str,c:Twist2,b:Option<CommandDispatchBound>)->Result<BoundedTwistOutcome,MotionPortError> {
+        if self.expire_next_bounded && b.is_some() {
+            self.expire_next_bounded=false;return Ok(BoundedTwistOutcome::ExpiredNotApplied);
+        }
         if b.is_some_and(CommandDispatchBound::expired_now) {return Ok(BoundedTwistOutcome::ExpiredNotApplied);}
         self.submit_twist(id,c).await.map(BoundedTwistOutcome::Applied)
     }
@@ -145,6 +162,9 @@ async fn command_continuity_real_surface_at_point_three_rate() {
     // 只订阅既有诊断，零段失败时保留实际原因；日志初始化不作为行为门禁。
     let _=tracing::subscriber::set_global_default(CommandDiagnostics{
         origin:std::time::Instant::now(),next_span:AtomicU64::new(0)});
+    let online=std::env::var_os("NUWAX_CONTINUITY_ONLINE").is_some();
+    let turning=std::env::var_os("NUWAX_CONTINUITY_TURN").is_some();
+    let drop_feedback=std::env::var_os("NUWAX_CONTINUITY_DROP_FEEDBACK").is_some();
     let pose_period_ms=std::env::var("NUWAX_CONTINUITY_POSE_MS").unwrap().parse::<u64>().unwrap();
     let file=Arc::new(std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true)
         .open(std::env::var_os("NUWAX_SOURCE_TIME_FILE").unwrap()).unwrap());
@@ -159,23 +179,26 @@ async fn command_continuity_real_surface_at_point_three_rate() {
         file.write_all_at(&seq.to_le_bytes(),8).unwrap();
     };
     write_clock(1,source_now());
-    let (config,map)=crate::native_test_helpers::fixture();
+    let (mut config,map)=crate::native_test_helpers::fixture();
+    if online {config.max_angular_speed_rps=0.2;}
     let slow=Arc::new(AtomicBool::new(false));
     let native_max_ns=Arc::new(AtomicU64::new(0));
     let rechecks=Arc::new(AtomicUsize::new(0));
     let observed_frames=Arc::new(AtomicUsize::new(0));
-    let follower=SlowSurface{inner:SurfaceFollower::new(config).unwrap(),calls:0,slow:slow.clone(),native_max_ns:native_max_ns.clone(),rechecks:rechecks.clone(),observed_frames:observed_frames.clone(),last_frame:None};
+    let follower=SlowSurface{inner:Box::new(SurfaceFollower::new(config).unwrap()),calls:0,slow:slow.clone(),native_max_ns:native_max_ns.clone(),rechecks:rechecks.clone(),observed_frames:observed_frames.clone(),last_frame:None,online,is_rechecker:false};
     let worker=planner_worker::PlannerWorker::new(follower).unwrap();
     let command=Arc::new(Mutex::new(Twist2::ZERO));
     let mut motion=crate::motion_feedback::tests::measured([0.;3],[0.;3]);
     motion.source_timestamp_ns=source_now();
+    let feedback_available=Arc::new(AtomicBool::new(true));
     let measured=Arc::new(Mutex::new(motion));let output=Arc::new(Mutex::new(Vec::new()));
     let port=ContinuousMotion{inner:FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))),
-        command:command.clone(),measured:measured.clone(),output:output.clone()};
+        command:command.clone(),measured:measured.clone(),feedback_available:feedback_available.clone(),expire_next_bounded:false,output:output.clone()};
     let mut scheduler=NavScheduler::new(port,worker,SchedulerConfig::default()).unwrap();
     let mut start=map_pose();start.pose.position=Point3::new(0.65,1.05,0.45);
     start.pose.orientation=Quaternion::from_yaw(0.);start.stamp=Timestamp {nanos:source_now()as i64,clock:nuwax_nav_types_messages::ClockKind::Unix};
     let mut goal=start.clone();goal.pose.position.x=4.5;
+    if turning {goal.pose.position.y=2.5;}
     let mut request=session();request.goal=ExecutionGoal::Body(goal.clone());
     let (status,_)=watch::channel(scheduler.status.clone());
     scheduler.observe_odometry(&status,start.clone(),None).unwrap();
@@ -192,6 +215,7 @@ async fn command_continuity_real_surface_at_point_three_rate() {
         std::thread::spawn(move || {
             let mut seq=1;let mut pose=start;let mut last=std::time::Instant::now();let mut last_pose=last;let mut last_motion=last;let mut last_frame=last;
             let mut actual=Twist2::ZERO;let mut yaw=0.0_f64;
+            let mut delayed=std::collections::VecDeque::new();
             while running.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(5));seq+=1;
                 let stamp=source_now();write_clock(seq,stamp);
@@ -214,9 +238,20 @@ async fn command_continuity_real_surface_at_point_three_rate() {
                 }
                 if last_pose.elapsed()>=Duration::from_millis(pose_period_ms) {
                     pose.stamp=Timestamp {nanos:stamp as i64,clock:nuwax_nav_types_messages::ClockKind::Unix};
-                    let (reply,_)=oneshot::channel();
-                    if handle.input_tx.blocking_send(InputCommand{kind:InputKind::UpdateOdometry(pose.clone(),None,Instant::now()),reply}).is_err(){break;}
+                    if online {
+                        // 真实采样后排队0.5～0.9秒；保留原采样时间和几何，不重标为接收时刻。
+                        let delay=Duration::from_millis([500,700,900][samples.load(Ordering::Relaxed)%3]);
+                        delayed.push_back((now+delay,pose.clone()));
+                    } else {
+                        let (reply,_)=oneshot::channel();
+                        if handle.input_tx.blocking_send(InputCommand{kind:InputKind::UpdateOdometry(pose.clone(),None,Instant::now()),reply}).is_err(){break;}
+                    }
                     samples.fetch_add(1,Ordering::Relaxed);last_pose=now;
+                }
+                while delayed.front().is_some_and(|(due,_)|now>=*due) {
+                    let (_,sample)=delayed.pop_front().unwrap();
+                    let (reply,_)=oneshot::channel();
+                    if handle.input_tx.blocking_send(InputCommand{kind:InputKind::UpdateOdometry(sample,None,Instant::now()),reply}).is_err(){break;}
                 }
                 if last_frame.elapsed()>=Duration::from_millis(334) {
                     let mut frozen=pose.clone();frozen.stamp.nanos=stamp as i64;
@@ -235,23 +270,50 @@ async fn command_continuity_real_surface_at_point_three_rate() {
     eprintln!("WALK_START {:?}",handle.status().last_applied_twist);
     let walking_started=std::time::Instant::now();
     output.lock().unwrap().clear();slow.store(true,Ordering::Relaxed);
-    tokio::time::sleep(Duration::from_secs(if pose_period_ms==100 {3}else{8})).await;
+    if drop_feedback {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        feedback_available.store(false,Ordering::Relaxed);
+        let until=Instant::now()+Duration::from_secs(1);
+        while handle.status().last_terminal.is_none() {
+            assert!(Instant::now()<until,"原始测速丢失后必须进入原停车确认链");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        feedback_available.store(true,Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    } else {
+        // 20秒覆盖100/334毫秒输入与50毫秒发布之间约16.7秒的完整相位轮转。
+        tokio::time::sleep(Duration::from_secs(if online {20}else if pose_period_ms==100 {3}else{8})).await;
+    }
     let walking=output.lock().unwrap().clone();
     let snapshot=handle.status();
-    let cancel_start=std::time::Instant::now();handle.cancel("goal-1").await.unwrap();let cancel_elapsed=cancel_start.elapsed();
+    let cancel_start=std::time::Instant::now();let cancelled=handle.cancel("goal-1").await;let cancel_elapsed=cancel_start.elapsed();
     let stopped=*command.lock().unwrap();
     running.store(false,Ordering::Relaxed);producer.join().unwrap();
     handle.shutdown().await.unwrap();task.await.unwrap().unwrap();
-    for (i,(at,c)) in walking.iter().enumerate().filter(|(_,(_,c))|*c==Twist2::ZERO) {
+    for (i,(at,_c)) in walking.iter().enumerate().filter(|(_,(_,c))|*c==Twist2::ZERO) {
         eprintln!("CONTINUITY_ZERO at_s={} previous={:?}",at.duration_since(walking_started).as_secs_f64(),i.checked_sub(1).map(|j|walking[j].1));
     }
     let zeros=walking.iter().filter(|(_,c)|*c==Twist2::ZERO).count();
-    eprintln!("CONTINUITY rate=0.3 pose_period_wall_ms={pose_period_ms} commands={} zeros={zeros} pose_samples={} cancel_ms={} native_max_ms={} status={}",walking.len(),samples.load(Ordering::Relaxed),cancel_elapsed.as_secs_f64()*1000.,native_max_ns.load(Ordering::Relaxed) as f64/1e6,snapshot.message);
+    eprintln!("CONTINUITY online={online} turning={turning} rate=0.3 pose_period_wall_ms={pose_period_ms} commands={} zeros={zeros} pose_samples={} cancel_ms={} native_max_ms={} status={}",walking.len(),samples.load(Ordering::Relaxed),cancel_elapsed.as_secs_f64()*1000.,native_max_ns.load(Ordering::Relaxed) as f64/1e6,snapshot.message);
     eprintln!("CONTINUITY_RECHECKS {} FRAMES {}",rechecks.load(Ordering::Relaxed),observed_frames.load(Ordering::Relaxed));
     assert!(observed_frames.load(Ordering::Relaxed)>2,"必须实际消费新注册帧");
     assert!(walking.len()>10);assert!(samples.load(Ordering::Relaxed)>20);
     assert!(rechecks.load(Ordering::Relaxed)>0,"必须实际执行原生命令复核");
+    if drop_feedback {
+        assert_eq!(snapshot.last_terminal,Some(TerminalOutcome::PlannerFailed));
+        let zero=walking.iter().position(|(_,command)|*command==Twist2::ZERO).expect("测速丢失必须归零");
+        assert!(zero>0,"失去测速前应实际行进");
+        assert!(walking[zero..].iter().all(|(_,command)|*command==Twist2::ZERO),"测速恢复后不能复活已停车的旧目标");
+        assert!(snapshot.last_zero_ack_id.is_some());
+        return;
+    }
+    assert_eq!(snapshot.last_terminal,None,"开阔行进不应因证明缺失终止");
     assert_eq!(zeros,0,"开阔直线行进出现短暂零段");
+    if online {
+        assert!(walking.iter().any(|(_,command)|command.linear.x.hypot(command.linear.y)>0.05),"必须实际推进完整选择，不能停留在首个微小非零命令");
+        if turning {assert!(walking.iter().any(|(_,command)|command.angular_z.abs()>0.05),"必须实际转向");}
+    }
+    cancelled.unwrap();
     assert_eq!(stopped,Twist2::ZERO);assert!(cancel_elapsed<Duration::from_millis(20));
 }
 
@@ -287,8 +349,10 @@ impl NavPlanner for WindowPlanner {
             self.window=Some((self.pose.stamp.nanos as u64,Duration::from_millis(50)));
             PlannerStep::Command(delivery_gap_command())
         } else if let Some(step)=&self.following {
+            self.bound=self.initial_bound;
             step.clone()
         } else {
+            self.bound=self.initial_bound;
             self.entered.send(()).unwrap();
             let step=self.release.recv_timeout(Duration::from_secs(2)).expect("释放本次计算");
             self.following=Some(step.clone());
@@ -308,7 +372,7 @@ async fn window_fixture(bound_lifetime:Option<Duration>)->(NavScheduler<Continuo
     let planner=WindowPlanner{pose:pose.clone(),window:None,first:true,applied:Twist2::ZERO,following:None,rechecked:rechecked.clone(),bound_lifetime,initial_bound:None,bound:None,entered,release:finish};
     let worker=planner_worker::PlannerWorker::new(planner).unwrap();
     let port=ContinuousMotion{inner:FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))),
-        command:Arc::new(Mutex::new(Twist2::ZERO)),measured:Arc::new(Mutex::new(crate::motion_feedback::tests::measured([0.;3],[0.;3]))),output:Arc::new(Mutex::new(Vec::new()))};
+        command:Arc::new(Mutex::new(Twist2::ZERO)),measured:Arc::new(Mutex::new(crate::motion_feedback::tests::measured([0.;3],[0.;3]))),feedback_available:Arc::new(AtomicBool::new(true)),expire_next_bounded:false,output:Arc::new(Mutex::new(Vec::new()))};
     let mut scheduler=NavScheduler::new(port,worker,SchedulerConfig::default()).unwrap();
     let (status,_)=watch::channel(scheduler.status.clone());
     scheduler.observe_odometry(&status,pose,None).unwrap();scheduler.observe_costmap(&status,costmap_at(1),Instant::now()).unwrap();
@@ -318,7 +382,12 @@ async fn window_fixture(bound_lifetime:Option<Duration>)->(NavScheduler<Continuo
         assert!(Instant::now()<deadline);
         scheduler.control_tick(&status).await.unwrap();tokio::task::yield_now().await;
     }
-    starts.recv_timeout(Duration::from_secs(1)).unwrap();
+    while starts.try_recv().is_err() {
+        assert!(Instant::now()<deadline,"先复核已应用命令，再进入完整计算");
+        scheduler.control_tick(&status).await.unwrap();
+        tokio::task::yield_now().await;
+    }
+    rechecked.lock().unwrap().clear();
     (scheduler,status,release,rechecked)
 }
 
@@ -439,4 +508,220 @@ async fn command_continuity_recheck_preserves_original_selection_horizon() {
     let step=scheduler.planner.step(0.3);
     drop(release);scheduler.planner.stop();
     assert!(matches!(step,PlannerStep::Pending(_)),"复核不能重置原250毫秒许可: {step:?}");
+}
+
+// 在线的位姿延迟、完整计算和复核开销必须共同出现，避免无延迟夹具漏掉发布竞争。
+#[test]
+fn command_continuity_online_delayed_straight_and_turn() {
+    let dir=std::env::temp_dir().join(format!("在线时序-{}",std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut results=Vec::new();
+    for (period,turning) in [(100,false),(100,true),(334,false),(334,true)] {
+        let mut child=std::process::Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact","tests::command_continuity::command_continuity_real_surface_at_point_three_rate","--nocapture"])
+            .env("NUWAX_CONTINUITY_CHILD","1").env("NUWAX_CONTINUITY_ONLINE","1")
+            .env("NUWAX_CONTINUITY_POSE_MS",period.to_string())
+            .env("NUWAX_SOURCE_TIME_FILE",dir.join(format!("来源时钟-{period}-{turning}.bin")));
+        if turning {child.env("NUWAX_CONTINUITY_TURN","1");}
+        results.push(child.status().unwrap());
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+    assert!(results.iter().all(|r|r.success()));
+}
+
+struct FailingCommandProof {
+    reject:Arc<AtomicBool>,
+    ready:Arc<AtomicBool>,
+    following:Option<PlannerStep>,
+    applied:Twist2,
+    entered:Option<std::sync::mpsc::Sender<()>>,
+    release:Option<std::sync::mpsc::Receiver<()>>,
+    window:Option<(u64,Duration)>,
+    failure:PlannerStep,
+}
+impl NavPlanner for FailingCommandProof {
+    fn command_recheck_ready(&self)->bool {self.ready.load(Ordering::Relaxed)}
+    fn replace_path(&mut self,_:Path2D) {}
+    fn update_odometry(&mut self,_:PoseStamped) {}
+    fn update_costmap(&mut self,_:CostMap2D) {}
+    fn observe_applied_command(&mut self,command:Twist2) {self.applied=command;}
+    fn take_command_execution_window(&mut self)->Option<(u64,Duration)> {self.window.take()}
+    fn command_rechecker(&self)->Result<Option<Box<dyn NavPlanner>>,RuntimeError> {
+        Ok(Some(Box::new(Self {reject:self.reject.clone(),ready:self.ready.clone(),following:None,
+            applied:Twist2::ZERO,entered:None,release:None,window:None,failure:self.failure.clone()})))
+    }
+    fn step(&mut self,_:f64)->PlannerStep {
+        if self.applied!=Twist2::ZERO {
+            if let Some(release)=self.release.take() {
+                self.entered.take().unwrap().send(()).unwrap();
+                release.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+        }
+        self.window=Some((crate::command_dispatch::unix_ns().unwrap(),Duration::from_millis(50)));
+        if self.applied!=Twist2::ZERO {
+            if let Some(step)=&self.following {return step.clone();}
+        }
+        PlannerStep::Command(delivery_gap_command())
+    }
+    fn recheck_command(&mut self,_:f64,command:Twist2)->Option<PlannerStep> {
+        let source=crate::command_dispatch::unix_ns().unwrap();
+        std::thread::sleep(Duration::from_millis(15));
+        self.window=Some((source,Duration::from_millis(50)));
+        Some(if self.reject.load(Ordering::Relaxed) {self.failure.clone()}
+            else {PlannerStep::Command(command)})
+    }
+    fn stop(&mut self) {}
+}
+
+#[tokio::test]
+async fn command_continuity_failed_recheck_stays_stopped_despite_late_full_result_and_new_pose() {
+    for failure in [PlannerStep::ReplanRequired("原始实测制动扫掠与障碍相交".into()),
+        PlannerStep::Command(Twist2::ZERO),PlannerStep::Pending(Vec::new()),PlannerStep::Failed("扫掠失败".into())] {
+    let reject=Arc::new(AtomicBool::new(false));
+    let (entered,starts)=std::sync::mpsc::channel();let (release,finish)=std::sync::mpsc::channel();
+    let planner=FailingCommandProof {reject:reject.clone(),ready:Arc::new(AtomicBool::new(true)),following:None,applied:Twist2::ZERO,entered:Some(entered),release:Some(finish),window:None,failure};
+    let worker=planner_worker::PlannerWorker::new(planner).unwrap();
+    let state=Arc::new(Mutex::new(FakeMotionState::default()));
+    let mut scheduler=NavScheduler::new(FakeMotion(state.clone()),worker,SchedulerConfig::default()).unwrap();
+    let (status,_)=watch::channel(scheduler.status.clone());
+    scheduler.observe_odometry(&status,map_pose(),None).unwrap();
+    scheduler.observe_costmap(&status,costmap_at(1),Instant::now()).unwrap();
+    scheduler.start_session(&status,session()).await.unwrap();scheduler.submit_path(&status,path()).await.unwrap();
+    let deadline=Instant::now()+Duration::from_secs(1);
+    while scheduler.status.last_applied_twist!=Some(delivery_gap_command()) {
+        assert!(Instant::now()<deadline);scheduler.control_tick(&status).await.unwrap();tokio::task::yield_now().await;
+    }
+    starts.recv_timeout(Duration::from_secs(1)).unwrap();
+    // 完整计算仍在阻塞时，独立复核应在15毫秒后交付失败，不能等完整计算释放。
+    reject.store(true,Ordering::Relaxed);
+    let mut publication=scheduler.planner.prepare_control_step(0.3,false).unwrap();
+    let mut pose=map_pose();pose.pose.position.x=0.01;pose.stamp.nanos+=1;
+    scheduler.observe_odometry(&status,pose.clone(),None).unwrap();
+    publication.changed().await.unwrap();
+    let failed=scheduler.planner.step(0.3);
+    assert!(matches!(&failed,PlannerStep::Failed(_)),"复核交付应为失败: {failed:?}");
+    // 后到的位姿、恢复为通过的复核和完整计算都不能吞掉已经发生的停车结论。
+    reject.store(false,Ordering::Relaxed);pose.pose.position.x=0.02;pose.stamp.nanos+=1;
+    scheduler.planner.observe_registered_frame(Some(crate::registered_frame::test_frame(1)));
+    scheduler.observe_odometry(&status,pose.clone(),None).unwrap();release.send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(matches!(scheduler.planner.step(0.3),PlannerStep::Failed(_)));
+    state.lock().unwrap().unconfirmed_fences=1;
+    assert!(matches!(scheduler.control_tick(&status).await,Err(RuntimeError::StopUnconfirmed(_))),"必须等待原停车确认，不能把零回执当停稳");
+    assert_eq!(scheduler.status.last_applied_twist,Some(delivery_gap_command()),"未确认的停车不得伪称已归零");
+    scheduler.cancel(&status,"goal-1").await.unwrap();
+    assert_eq!(scheduler.status.last_applied_twist,Some(Twist2::ZERO));
+    let applied=scheduler.status.applied_commands;
+    for i in 0..3 {
+        pose.pose.position.x+=0.01;pose.stamp.nanos+=1;
+        scheduler.observe_odometry(&status,pose.clone(),None).unwrap();
+        scheduler.session_tick(&status).await.unwrap();
+        assert_eq!(scheduler.status.applied_commands,applied,"停车后第{i}拍不能恢复旧导航");
+    }
+    assert!(!scheduler.lease_active);
+    assert!(state.lock().unwrap().calls.iter().any(|call|call.starts_with("fence:")));
+}
+}
+
+#[tokio::test]
+async fn command_continuity_independent_rechecks_do_not_renew_first_selection_horizon() {
+    let (entered,starts)=std::sync::mpsc::channel();let (release,finish)=std::sync::mpsc::channel();
+    let planner=FailingCommandProof {reject:Arc::new(AtomicBool::new(false)),ready:Arc::new(AtomicBool::new(true)),following:None,applied:Twist2::ZERO,
+        entered:Some(entered),release:Some(finish),window:None,failure:PlannerStep::Pending(Vec::new())};
+    let mut worker=planner_worker::PlannerWorker::new(planner).unwrap();
+    worker.set_control_period(Duration::from_millis(50));
+    let mut pose=map_pose();worker.configure_goal(&pose,nuwax_nav_types_messages::GoalOptions::default()).unwrap();
+    worker.replace_execution_path(path().path,None,pose.clone()).unwrap();
+    worker.update_odometry(pose.clone());worker.update_execution_map(costmap_at(1).costmap).unwrap();
+    let until=Instant::now()+Duration::from_secs(1);
+    loop {
+        if matches!(worker.step(0.3),PlannerStep::Command(command) if command==delivery_gap_command()) {break;}
+        assert!(Instant::now()<until);tokio::task::yield_now().await;
+    }
+    let original=worker.delivered_command_deadline_for_test().unwrap();
+    worker.observe_applied_command(delivery_gap_command());starts.recv_timeout(Duration::from_secs(1)).unwrap();
+    for _ in 0..3 {
+        let mut publication=worker.prepare_control_step(0.3,false).unwrap();
+        pose.pose.position.x+=0.01;pose.stamp.nanos+=1;worker.update_odometry(pose.clone());
+        let waiting=worker.pending_recheck_deadline().expect("真实输入触发独立复核等待");
+        assert!(waiting.into_std()<=original,"等待仍受首次选择250毫秒约束");
+        assert!(worker.pending_recheck_deadline().unwrap().into_std()<=original,
+            "再次查询仍受原选择截止约束");
+        publication.changed().await.unwrap();
+        assert!(matches!(worker.step(0.3),PlannerStep::Command(command) if command==delivery_gap_command()));
+        assert_eq!(worker.delivered_command_deadline_for_test(),Some(original),"新的扫掠不能续期原选择");
+        worker.observe_applied_command(delivery_gap_command());
+    }
+    tokio::time::sleep_until(Instant::from_std(original)+Duration::from_millis(1)).await;
+    assert!(matches!(worker.step(0.3),PlannerStep::Pending(_)));
+    assert!(!worker.retain_applied_command());
+    release.send(()).unwrap();worker.stop();
+}
+
+// 原始测速一旦用于连续行进，后续缺失不能切换到无测速的原路径恢复旧运动。
+#[test]
+fn command_continuity_online_feedback_loss_stays_stopped_after_feedback_returns() {
+    let dir=std::env::temp_dir().join(format!("在线测速丢失-{}",std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let result=std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact","tests::command_continuity::command_continuity_real_surface_at_point_three_rate","--nocapture"])
+        .env("NUWAX_CONTINUITY_CHILD","1").env("NUWAX_CONTINUITY_ONLINE","1")
+        .env("NUWAX_CONTINUITY_DROP_FEEDBACK","1").env("NUWAX_CONTINUITY_POSE_MS","100")
+        .env("NUWAX_SOURCE_TIME_FILE",dir.join("来源时钟.bin")).status().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();assert!(result.success());
+}
+
+// 已选轨迹的观察证明与接收端下发截止失效后，都不能一拍零速后恢复。
+#[tokio::test]
+async fn command_continuity_expired_observation_and_receiving_admission_stay_stopped() {
+    for receiving_expiry in [false,true] {
+        let (mut scheduler,status,release,_)=window_fixture(
+            if receiving_expiry {None} else {Some(Duration::from_millis(25))}).await;
+        let mut publication=scheduler.planner.prepare_control_step(0.3,false).unwrap();
+        release.send(PlannerStep::Command(delivery_gap_command())).unwrap();
+        publication.changed().await.unwrap();
+        if receiving_expiry {
+            // 接收端在提交时判定过期，原调用方持有的截止尚有效。
+            scheduler.obstacle_source_bound=Some(handoff_bound(1_000_000_000));
+            scheduler.motion.expire_next_bounded=true;
+        } else {
+            tokio::time::sleep(Duration::from_millis(28)).await;
+        }
+        scheduler.control_tick(&status).await.unwrap();
+        assert_eq!(scheduler.status.last_terminal,Some(TerminalOutcome::PlannerFailed));
+        assert!(scheduler.status.last_zero_ack_id.is_some());
+        let outputs=scheduler.motion.output.lock().unwrap().len();
+        scheduler.obstacle_source_bound=None;
+        for _ in 0..3 {scheduler.session_tick(&status).await.unwrap();}
+        assert_eq!(scheduler.motion.output.lock().unwrap().len(),outputs,"观察恢复不能复活旧运动");
+        assert_eq!(*scheduler.motion.command.lock().unwrap(),Twist2::ZERO);
+    }
+}
+
+// 完整原状态机已撤回普通轨迹并发布停车，另一个拥有方的晚到成功不能覆盖它。
+#[tokio::test]
+async fn command_continuity_author_stop_overrides_late_independent_success() {
+    let ready=Arc::new(AtomicBool::new(true));
+    let (entered,starts)=std::sync::mpsc::channel();let (release,finish)=std::sync::mpsc::channel();
+    let planner=FailingCommandProof {reject:Arc::new(AtomicBool::new(false)),ready:ready.clone(),
+        following:Some(PlannerStep::Command(Twist2::ZERO)),applied:Twist2::ZERO,
+        entered:Some(entered),release:Some(finish),window:None,failure:PlannerStep::Pending(Vec::new())};
+    let mut worker=planner_worker::PlannerWorker::new(planner).unwrap();
+    worker.set_control_period(Duration::from_millis(50));
+    let mut pose=map_pose();worker.configure_goal(&pose,nuwax_nav_types_messages::GoalOptions::default()).unwrap();
+    worker.replace_execution_path(path().path,None,pose.clone()).unwrap();
+    worker.update_odometry(pose.clone());worker.update_execution_map(costmap_at(1).costmap).unwrap();
+    let until=Instant::now()+Duration::from_secs(1);
+    loop {
+        if matches!(worker.step(0.3),PlannerStep::Command(command) if command==delivery_gap_command()) {break;}
+        assert!(Instant::now()<until);tokio::task::yield_now().await;
+    }
+    worker.observe_applied_command(delivery_gap_command());starts.recv_timeout(Duration::from_secs(1)).unwrap();
+    // 原始输入更新先启动15毫秒独立复核，再让完整状态机撤回普通轨迹资格。
+    pose.pose.position.x+=0.01;pose.stamp.nanos+=1;worker.update_odometry(pose);
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    ready.store(false,Ordering::Relaxed);release.send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(35)).await;
+    assert_eq!(worker.step(0.3),PlannerStep::Command(Twist2::ZERO),"晚到复核不得覆盖原状态机停车");
+    assert!(!worker.retain_applied_command());worker.stop();
 }

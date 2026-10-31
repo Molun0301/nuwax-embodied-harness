@@ -139,7 +139,8 @@ async fn delivery_gap_red_wait_must_honor_configured_control_period() {
         release.send(()).unwrap();
         handle.shutdown().await.unwrap(); task.await.unwrap().unwrap();
         eprintln!("DELIVERY_GAP cadence configured_ms={} actual_ms={} applied={applied:?}", tick_interval.as_millis(), elapsed.as_secs_f64()*1000.0);
-        assert_eq!(applied, Some(Twist2::ZERO), "timeout must keep zero semantics");
+        // 计算空档仍在上一指令原许可期内：按期下发，沿用上一指令而不插零。
+        assert_eq!(applied, Some(delivery_gap_command()), "计算空档在原许可期内沿用上一指令");
         observations.push((tick_interval, elapsed));
     }
     assert!(observations.iter().all(|(configured, elapsed)| *elapsed < *configured * 2 + Duration::from_millis(20)),
@@ -254,7 +255,7 @@ async fn delivery_gap_input_flood_cannot_extend_original_deadline() {
     handle.shutdown().await.unwrap(); task.await.unwrap().unwrap();
     producer.join().unwrap();
     eprintln!("DELIVERY_GAP input_flood elapsed_ms={} inputs={}", elapsed.as_secs_f64()*1000.0, sent.load(Ordering::Relaxed));
-    assert_eq!(result.last_applied_twist, Some(Twist2::ZERO));
+    assert_eq!(result.last_applied_twist, Some(delivery_gap_command()), "计算空档在原许可期内沿用上一指令");
     assert!(sent.load(Ordering::Relaxed) > INPUT_CAPACITY);
     assert!(elapsed < Duration::from_millis(80), "refilling input tail starved the control deadline: {elapsed:?}");
 }

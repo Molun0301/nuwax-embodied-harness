@@ -132,6 +132,8 @@ pub(crate) struct PlannerWorker {
     thread: Option<std::thread::JoinHandle<()>>,
     wait_reason: Option<String>,
     delivered_pending: Option<std::time::Instant>,
+    // 上一条交付的非零指令、其计算起点与目标代次；只用于新结果未出时继续执行。
+    held: Option<(Twist2, std::time::Instant, u64)>,
     delivered_dispatch_bound: Option<CommandDispatchBound>,
     delivered_execution_context: Option<Arc<ActualExecutionContext>>,
     #[cfg(test)]
@@ -411,6 +413,7 @@ impl PlannerWorker {
             thread: Some(thread),
             wait_reason: None,
             delivered_pending: None,
+            held: None,
             delivered_dispatch_bound: None,
             delivered_execution_context: None,
             #[cfg(test)]
@@ -752,6 +755,14 @@ impl NavPlanner for PlannerWorker {
         } else {
             Some("局部轨迹正在计算，保持零速等待".into())
         };
+        // 规划器给出的任何新结论（零速、待定、停车、失败、到达）都结束对上一指令的沿用。
+        if let Some(step)=&ready {
+            self.held=match (step,&input.result) {
+                (PlannerStep::Command(command),Some((started,_))) if *command!=Twist2::ZERO =>
+                    Some((*command,*started,input.epoch)),
+                _=>None,
+            };
+        }
         if matches!(&ready, Some(PlannerStep::Command(command)) if *command != Twist2::ZERO) {
             // Consume only a selection rechecked for the latest received state.
             // A same-valued future command needs a new selection. Applied
@@ -770,7 +781,15 @@ impl NavPlanner for PlannerWorker {
     fn execution_wait_reason(&self) -> Option<String> {
         self.wait_reason.clone()
     }
+    fn held_command(&self) -> Option<Twist2> {
+        let (command,started,epoch)=self.held?;
+        let input=self.shared.0.lock().unwrap();
+        // 沿用期就是该指令原有的结果许可期，不另设期限；目标或已执行指令变化即失效。
+        (input.epoch==epoch && same_applied(input.applied,command)
+            && started.elapsed()<=DEFAULT_CONTROL_HORIZON).then_some(command)
+    }
     fn stop(&mut self) {
+        self.held=None;
         self.delivered_dispatch_bound=None;
         self.delivered_execution_context=None;
         self.delivered_pending=None;
@@ -1981,6 +2000,27 @@ mod tests {
         release.send(()).unwrap();
         wait_for_source_result(&worker);
         assert_eq!(worker.step(0.3), PlannerStep::Command(Twist2::ZERO));
+    }
+    // 下一结果计算中时，上一条已执行指令只在其原许可期内继续沿用。
+    #[test]
+    fn executing_command_is_held_only_within_its_original_license() {
+        let (mut worker, start, release) = source_worker();
+        worker.update_costmap(CostMap2D::new_all_free("map", 1, 1, 0.1));
+        worker.step(0.3);
+        start.recv_timeout(Duration::from_secs(1)).unwrap();
+        release.send(()).unwrap();
+        wait_for_source_result(&worker);
+        let command = Twist2 { linear: nuwax_nav_types_messages::Point2::new(0.2, 0.0), angular_z: 0.0 };
+        assert_eq!(worker.step(0.3), PlannerStep::Command(command));
+        assert_eq!(worker.held_command(), None, "尚未执行的指令不能沿用");
+        worker.observe_applied_command(command);
+        // 执行回执触发下一次计算；计算未完成时取不到新结果。
+        start.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()));
+        assert_eq!(worker.held_command(), Some(command));
+        std::thread::sleep(DEFAULT_CONTROL_HORIZON);
+        assert_eq!(worker.held_command(), None, "超出原许可期不能继续沿用");
+        release.send(()).unwrap();
     }
     #[test]
     fn boundary_replacement_retires_inflight_result_without_goal_change() {

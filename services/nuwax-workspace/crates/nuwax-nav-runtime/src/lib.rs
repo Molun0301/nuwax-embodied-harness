@@ -929,6 +929,8 @@ pub trait NavPlanner: Send + 'static {
     fn execution_cycle_complete(&self) -> bool { false }
     /// 计算未完成或控制许可过期时的等待原因；命令回执不能覆盖该执行阶段。
     fn execution_wait_reason(&self) -> Option<String> { None }
+    /// 新结果未出时，上一条已交付且仍在执行的非零指令；超出其原有许可期返回None。
+    fn held_command(&self) -> Option<Twist2> { None }
     /// 只读展示当前局部规划，不改变速度或路径许可。
     fn local_path_for_display(&self) -> Vec<[f64; 3]> { Vec::new() }
     /// Prepare a deferred control result without blocking the scheduler task.
@@ -1947,6 +1949,12 @@ where
                 Ok(())
             }
             LocalExecutionPayload::Pending(failures) => {
+                // 只是下一结果未出时，上一指令在原许可期内继续执行；
+                // 足式机器人一两拍零速停不下来，只会打断步态。
+                if let Some(held) = self.planner.held_command() {
+                    self.apply_controller_twist(status_tx, held).await?;
+                    return Ok(());
+                }
                 self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
                 self.path_wait_started_at.get_or_insert_with(Instant::now);
                 // Rebuild from this tick's evidence; never append to the previous status.

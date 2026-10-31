@@ -98,7 +98,7 @@ double angle(double a){return std::atan2(std::sin(a),std::cos(a));}
  double goal_yaw,int64_t odometry_timestamp_ns,ScanOutput *output,char *error,size_t error_capacity
 #define SCAN_FORWARD config,obstacles,obstacle_count,ground,ground_count,reference,reference_count,start_position,start_velocity,start_acceleration,\
  start_yaw,start_yaw_rate,boundary,boundary_count,forbidden_columns,forbidden_count,goal_yaw,odometry_timestamp_ns,output,error,error_capacity
-extern "C" int nuwax_scan_session_plan_command(void* raw,const double* selected_command,SCAN_ARGUMENTS) {
+extern "C" int nuwax_scan_session_plan(void* raw,SCAN_ARGUMENTS) {
  AuthorSession ephemeral;auto& s=raw?*static_cast<AuthorSession*>(raw):ephemeral;
  *output={};scan_native_diagnostic.clear();
  try {
@@ -133,24 +133,6 @@ extern "C" int nuwax_scan_session_plan_command(void* raw,const double* selected_
   auto business=std::make_shared<BusinessConstraintMask>(c.resolution,c.body_length,c.body_width,c.body_center_x,c.body_center_y,std::move(polygon),forbidden);
   map->setBusinessConstraintQuery([business](const Vector3d& p,double yaw){return business->rejects(p,yaw);});
   map->setBusinessEnvelopeQuery([business](const Vector3d& p,double yaw,double padding){return business->rejectsEnvelope(p,yaw,padding);});
-  if(selected_command) {
-   // 在途结果退休后只复核已选指令；不推进规划、曲线时钟或历史命令。
-   using namespace scan_planner::command_check_detail;
-   const State actual{position,start_yaw,body(Eigen::Map<const Vector3d>(start_velocity).head<2>(),start_yaw),start_yaw_rate};
-   // 与bounded相同：先按实测角速做本拍偏航动态限，设备命令盒最后施加，硬限制优先。
-   const double angular=std::clamp(selected_command[2],start_yaw_rate-c.max_yaw_acceleration*c.sample_dt,start_yaw_rate+c.max_yaw_acceleration*c.sample_dt);
-   const auto command=commandBox(Eigen::Map<const Vector3d>(selected_command).head<2>(),angular,c);
-   const double radius=std::hypot(c.body_length/2.+std::abs(c.body_center_x),c.body_width/2.+std::abs(c.body_center_y));
-   const auto deadline=Clock::now()+std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(c.sample_dt));
-   bool exhausted=false;State stopped;
-   const bool free=collisionFree(*map,actual,command,c,radius,deadline,exhausted,stopped);
-   output->command_duration=c.sample_dt;
-   output->motion_boundary_sources[0]=0;output->motion_boundary_sources[1]=2;output->motion_boundary_sources[2]=0;
-   if(free) {
-    output->command_forward=command.linear.x();output->command_lateral=command.linear.y();output->command_yaw_rate=command.angular;
-   } else if(!exhausted)throw std::runtime_error("Current motion and braking sweep intersect the body collision map");
-   return 0;
-  }
   if(scan_planner::authorTraceEnabled()) {
    auto out=scan_planner::authorTraceStream();
    out << "{\"event\":\"map_probes\",\"stamp_ns\":" << odometry_timestamp_ns
@@ -337,12 +319,7 @@ extern "C" int nuwax_scan_session_plan_command(void* raw,const double* selected_
   (void)start_acceleration;return 0;
  } catch(const std::exception& e){if(error_capacity){std::strncpy(error,e.what(),error_capacity-1);error[error_capacity-1]=0;}nuwax_scan_free(output);return 1;}
 }
-extern "C" int nuwax_scan_session_plan(void* raw,SCAN_ARGUMENTS){return nuwax_scan_session_plan_command(raw,nullptr,SCAN_FORWARD);}
 extern "C" int nuwax_scan_plan(SCAN_ARGUMENTS){return nuwax_scan_session_plan(nullptr,SCAN_FORWARD);}
-extern "C" int nuwax_scan_session_command_recheck_ready(const void* raw) {
- const auto* s=static_cast<const AuthorSession*>(raw);
- return s&&s->fsm&&s->controller.receive_traj&&!s->cycle_complete&&!s->execution_failed&&!s->fsm->emergencyStopping();
-}
 extern "C" void* nuwax_scan_session_create(){return new(std::nothrow) AuthorSession;}
 extern "C" void nuwax_scan_session_destroy(void* p){delete static_cast<AuthorSession*>(p);}
 extern "C" void nuwax_scan_session_reset(void* p){if(p){auto* s=static_cast<AuthorSession*>(p);const bool fixture=s->static_fixture;const bool enabled=s->local_enabled;const auto plans=s->plans;*s=AuthorSession{};s->static_fixture=fixture;s->local_enabled=enabled;s->plans=plans;}}

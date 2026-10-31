@@ -111,10 +111,8 @@ extern "C" {
     fn nuwax_scan_session_configure(session: *mut std::ffi::c_void,config: *const Config,map_rebuilt: *mut i32,error: *mut std::ffi::c_char,capacity: usize)->i32;
     fn nuwax_scan_session_set_local_planning(session: *mut std::ffi::c_void, enabled: i32);
     fn nuwax_scan_session_plan_count(session: *const std::ffi::c_void) -> u64;
-    fn nuwax_scan_session_command_recheck_ready(session:*const std::ffi::c_void)->i32;
-    fn nuwax_scan_session_plan_command(
+    fn nuwax_scan_session_plan(
         session: *mut std::ffi::c_void,
-        selected_command: *const f64,
         config: *const Config,
         obstacles: *const f64,
         obstacle_count: usize,
@@ -142,7 +140,7 @@ extern "C" {
 
 /// 单次规划供组件诊断；持续执行使用持有原轨迹的 Planner。
 pub fn plan(request: &PlanRequest<'_>) -> Result<PlanResult, String> {
-    call_native(request, std::ptr::null_mut(),None)
+    call_native(request, std::ptr::null_mut())
 }
 
 /// 原 SCAN 样条与闭环控制器的单线程拥有者。
@@ -190,17 +188,7 @@ impl Planner {
     }
     pub fn step(&mut self, request:&PlanRequest<'_>)->Result<PlanResult,String>{
         self.ensure_session()?;
-        call_native(request,self.handle,None)
-    }
-    /// 用最新原始运动复核已选命令的响应及归零制动，不推进局部规划状态。
-    pub fn recheck_command(&mut self,request:&PlanRequest<'_>,command:[f64;3],
-        velocity:[f64;3],yaw_rate:f64)->Result<PlanResult,String> {
-        self.ensure_session()?;
-        call_native(request,self.handle,Some((command,velocity,yaw_rate)))
-    }
-    /// 原执行拥有方当前允许独立命令复核；初始化及停车阶段继续走原状态机。
-    pub fn command_recheck_ready(&self)->bool {
-        unsafe {nuwax_scan_session_command_recheck_ready(self.handle)!=0}
+        call_native(request,self.handle)
     }
     /// Notify an accepted map or explicit business-constraint event without advancing odometry.
     pub fn notify_source_changed(&mut self) {
@@ -264,7 +252,6 @@ impl Drop for Planner {
 fn call_native(
     request: &PlanRequest<'_>,
     handle: *mut std::ffi::c_void,
-    selected: Option<([f64;3],[f64;3],f64)>,
 ) -> Result<PlanResult, String> {
     let mut output = NativeOutput {
         duration: 0.0,
@@ -285,9 +272,8 @@ fn call_native(
     let mut error = [0 as c_char; 512];
     // 输入切片存活至同步 C 接口返回，输出由 C++ 分配并由配套接口释放。
     let status = unsafe {
-        nuwax_scan_session_plan_command(
+        nuwax_scan_session_plan(
             handle,
-            selected.as_ref().map_or(std::ptr::null(),|(command,_,_)|command.as_ptr()),
             &request.config,
             request.obstacles.as_ptr().cast(),
             request.obstacles.len(),
@@ -296,11 +282,10 @@ fn call_native(
             request.reference.as_ptr().cast(),
             request.reference.len(),
             request.start_position.as_ptr(),
-            selected.as_ref().map_or_else(||request.start_velocity.as_ref().map_or(std::ptr::null(),|v|v.as_ptr()),
-                |(_,velocity,_)|velocity.as_ptr()),
+            request.start_velocity.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
             request.start_acceleration.as_ref().map_or(std::ptr::null(), |a| a.as_ptr()),
             request.start_yaw,
-            selected.as_ref().map_or(request.start_yaw_rate.unwrap_or(f64::NAN),|(_,_,rate)|*rate),
+            request.start_yaw_rate.unwrap_or(f64::NAN),
             request.boundary.as_ptr().cast(),
             request.boundary.len(),
             request.forbidden_columns.as_ptr().cast(),
@@ -357,7 +342,6 @@ mod tests {
     include!("surface_execution_tests.rs");
     include!("clearance_tests.rs");
     include!("gait_velocity_tests.rs");
-    include!("command_recheck_tests.rs");
     // These component fixtures provide static occupancy, not live sensor frames.
     // One call remains one real FSM tick; no synthetic catch-up ticks are added.
     fn fixture_planner() -> Planner {

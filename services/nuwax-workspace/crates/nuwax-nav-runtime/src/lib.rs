@@ -858,22 +858,6 @@ pub trait NavPlanner: Send + 'static {
     /// Take observation timing metadata belonging only to the immediately returned command.
     /// None means that this result has no finite observation-time dependency.
     fn take_command_dispatch_bound(&mut self)->Option<CommandDispatchBound> {None}
-    /// 原生检查开始的实际来源时刻与命令执行周期；不代表观测续期或新的下发许可。
-    fn take_command_execution_window(&mut self)->Option<(u64,Duration)> {None}
-    /// 数值改变或停车结论到达时唤醒交付；同值证明仍按原控制拍提交。
-    fn command_change_publication(&self)->Option<watch::Receiver<()>> {None}
-    /// 最新真实复核请求的原等待截止；不许可重新下发旧命令。
-    fn pending_recheck_deadline(&self)->Option<Instant> {None}
-    /// 已进入已证明命令连续行进后，证明失效须走原停车确认链。
-    fn continuation_requires_stop(&self)->bool {false}
-    /// 计算空档内，已应用命令是否仍在原有证明周期中；不得重新下发或续期。
-    fn retain_applied_command(&self)->bool {false}
-    /// 原状态机是否允许对当前选择做独立扫掠；停车、恢复和初始化不越过此状态。
-    fn command_recheck_ready(&self)->bool {true}
-    /// 独立拥有的命令扫掠实例；与完整轨迹计算并行，不共享原生可变状态。
-    fn command_rechecker(&self)->Result<Option<Box<dyn NavPlanner>>,RuntimeError> {Ok(None)}
-    /// 在途结果的执行版本仍匹配时，以最新输入复核已选指令；其它后端沿原计算步骤。
-    fn recheck_command(&mut self,_robot_width_m:f64,_command:Twist2)->Option<PlannerStep> {None}
     /// 传递既有导航会话标识用于计算线程日志，不参与运动准入。
     fn set_goal_log_context(&mut self, _goal_id: &str) {}
     /// 接续局部路线时保留已受理任务边界；无局部重规划的后端可沿原全局路径。
@@ -1113,7 +1097,6 @@ pub struct NavScheduler<M, P> {
     costmap_receipt: Option<PlannerInputReceipt>,
     map_invalidated_at: Option<Instant>,
     operation_sequence: u64,
-    retained_command_publication: Option<watch::Receiver<()>>,
     status: SchedulerStatus,
     #[cfg(feature = "surface-recovery-qualification")]
     qualification_timing: Option<qualification_timing::TraceSink>,
@@ -1162,7 +1145,6 @@ where
             costmap_receipt: None,
             map_invalidated_at: None,
             operation_sequence: 0,
-            retained_command_publication: None,
             status,
             #[cfg(feature = "surface-recovery-qualification")]
             qualification_timing: None,
@@ -1232,14 +1214,6 @@ where
         let mut deferred_control: Option<DeferredControl> = None;
 
         loop {
-            if let Some(publication)=self.retained_command_publication.take() {
-                if let Some(identity)=self.current_execution_identity.clone() {
-                    deferred_control=Some(DeferredControl {
-                        publication,deadline:Instant::now()+self.config.tick_interval,
-                        identity,queued_inputs:None,finish_wait:false,
-                    });
-                }
-            }
             // A deferred tick belongs to one accepted path, never the next goal
             // or a replacement path admitted while computation was outstanding.
             if deferred_control.as_ref().is_some_and(|wait|
@@ -1314,7 +1288,6 @@ where
                                 biased;
                                 finish = wait.ready() => SchedulerEvent::Publication(finish),
                                 command = input_rx.recv(), if input_open => SchedulerEvent::Input(command),
-                                _=tick.tick(), if controlling=>SchedulerEvent::Tick,
                             },
                         }
                     } else {
@@ -1345,21 +1318,13 @@ where
                             wait.finish_wait = finish_wait;
                         }
                     }
-                    event @ (SchedulerEvent::Tick | SchedulerEvent::ControlReady) => {
-                        // 控制拍领取一次原始测速；结果完成通知只交付该请求。
-                        // 唤醒时再次领取会使刚完成的复核自行失效，重复占用发布拍。
-                        let tick_event=matches!(event,SchedulerEvent::Tick);
-                        if tick_event {self.planner.observe_measured_motion(self.motion.measured_motion());}
+                    SchedulerEvent::Tick | SchedulerEvent::ControlReady => {
+                        self.planner.observe_measured_motion(self.motion.measured_motion());
                         let previous = deferred_control.take();
-                        let mut deadline = previous.as_ref().map_or_else(
+                        let deadline = previous.as_ref().map_or_else(
                             || Instant::now() + self.config.tick_interval, |wait| wait.deadline);
-                        let mut finish_wait = previous.as_ref().is_some_and(|wait| wait.finish_wait)
+                        let finish_wait = previous.as_ref().is_some_and(|wait| wait.finish_wait)
                             || Instant::now() >= deadline;
-                        if let Some(current)=self.planner.pending_recheck_deadline() {
-                            // 新输入已退休旧请求，按新请求捕获的原等待拍复核。
-                            // 原候选250毫秒、已执行周期和观察截止仍约束本次等待。
-                            deadline=current;finish_wait=Instant::now()>=deadline;
-                        }
                         if !finish_wait && self.status.phase == SchedulerPhase::Controlling
                             && self.arrival_confirmation.is_none() {
                             if let Some(identity) = self.current_execution_identity.clone() {
@@ -1367,7 +1332,7 @@ where
                                     #[cfg(feature = "surface-recovery-qualification")]
                                     let _qualification_span = self.qualification_span(
                                         "scheduler.prepare_control_step", self.status.pose_source_timestamp_ns);
-                                    self.planner.prepare_control_step(self.config.robot_width_m, previous.is_some() && !tick_event)
+                                    self.planner.prepare_control_step(self.config.robot_width_m, previous.is_some())
                                 };
                                 if let Some(publication) = publication {
                                     deferred_control = Some(DeferredControl {
@@ -1917,7 +1882,6 @@ where
         &mut self,
         status_tx: &watch::Sender<SchedulerStatus>,
     ) -> Result<(), RuntimeError> {
-        self.retained_command_publication=None;
         #[cfg(feature = "surface-recovery-qualification")]
         let _qualification_span = self.qualification_span("scheduler.control_tick", self.status.pose_source_timestamp_ns);
         #[cfg(feature = "surface-recovery-qualification")]
@@ -1966,14 +1930,7 @@ where
         match intent.payload {
             LocalExecutionPayload::Command(twist) => {
                 let wait_reason = self.planner.execution_wait_reason();
-                if twist==Twist2::ZERO {
-                    tracing::info!(target:"navigation.command", zero_source="controller",
-                        reason=?wait_reason, "导航零指令来源");
-                }
                 if !self.apply_controller_twist_with_bound(status_tx, twist, intent.dispatch_bound).await? {
-                    if self.planner.continuation_requires_stop() {
-                        return self.stop_unproved_continuation(status_tx,"执行来源凭据在下发前已过期".into()).await;
-                    }
                     self.path_wait_started_at.get_or_insert_with(Instant::now);
                     return self.check_path_wait_timeout(status_tx).await;
                 }
@@ -1987,25 +1944,9 @@ where
                     return self.check_path_wait_timeout(status_tx).await;
                 }
                 self.path_wait_started_at = None;
-                // 新选中的不同命令一旦证明完成就交付；同值命令保持原控制节拍。
-                self.retained_command_publication=self.planner.command_change_publication();
                 Ok(())
             }
             LocalExecutionPayload::Pending(failures) => {
-                if self.planner.retain_applied_command() {
-                    // 原命令有效期间继续等待下一结果；完成即交付，不空等下一发布拍。
-                    self.retained_command_publication=self.planner.prepare_control_step(self.config.robot_width_m,true);
-                    self.status.message = "局部轨迹正在计算，已应用命令仍在原证明周期内".into();
-                    self.publish_status(status_tx);
-                    return Ok(());
-                }
-                tracing::info!(target:"navigation.command", zero_source="pending",
-                    reason=?self.planner.execution_wait_reason(), "导航零指令来源");
-                if self.planner.continuation_requires_stop()
-                    && self.status.last_applied_twist.is_some_and(|command|command!=Twist2::ZERO) {
-                    return self.stop_unproved_continuation(status_tx,
-                        self.planner.execution_wait_reason().unwrap_or_default()).await;
-                }
                 self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
                 self.path_wait_started_at.get_or_insert_with(Instant::now);
                 // Rebuild from this tick's evidence; never append to the previous status.
@@ -2019,7 +1960,6 @@ where
                 self.check_path_wait_timeout(status_tx).await
             }
             LocalExecutionPayload::ReplanRequired(reason) => {
-                tracing::info!(target:"navigation.command", zero_source="replan", %reason, "导航零指令来源");
                 self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
                 // A same-valued ZERO receipt leaves the worker's exact actual
                 // input versions current. Preserve that snapshot before stop
@@ -2119,7 +2059,6 @@ where
             match outcome {
                 Ok(BoundedTwistOutcome::Applied(_))=>{},
                 Ok(BoundedTwistOutcome::ExpiredNotApplied) if bound.is_some()=>{
-                    tracing::info!(target:"navigation.command", zero_source="dispatch_expired", "导航零指令来源");
                     applied_twist=Twist2::ZERO;bound=None;expired=true;continue;
                 },
                 Ok(BoundedTwistOutcome::ExpiredNotApplied)=>{
@@ -2211,14 +2150,6 @@ where
         Ok(())
     }
 
-    async fn stop_unproved_continuation(
-        &mut self,status_tx:&watch::Sender<SchedulerStatus>,reason:String,
-    )->Result<(),RuntimeError> {
-        self.status.message=format!("连续运动证明已失效: {reason}");
-        self.publish_status(status_tx);
-        self.finish_terminal(status_tx,TerminalOutcome::PlannerFailed,SchedulerPhase::Failed).await
-    }
-
     async fn wait_for_fresh_input(
         &mut self,
         status_tx: &watch::Sender<SchedulerStatus>,
@@ -2227,7 +2158,6 @@ where
         // 重复过期、零速回执和新路径都不能重置原等待起点。
         self.path_wait_started_at.get_or_insert_with(Instant::now);
         if self.lease_active {
-            tracing::info!(target:"navigation.command", zero_source="stale_input", %reason, "导航零指令来源");
             self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
         }
         self.status.message = format!("等待新鲜导航输入: {reason}");
@@ -2984,7 +2914,6 @@ fn path_rejected(reason: impl Into<String>) -> RuntimeError {
 #[cfg(test)]
 mod tests {
     include!("scheduler_delivery_gap_tests.rs");
-    mod command_continuity { include!("command_continuity_tests.rs"); }
     include!("arrival_confirmation_tests.rs");
     include!("position_zero_runtime_tests.rs");
     include!("yaw_zero_contract_tests.rs");

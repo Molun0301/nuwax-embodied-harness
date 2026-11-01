@@ -950,8 +950,15 @@ def collect_audit(program, spec, checked, linked, root, cache):
 
 
 def review_key(audit, root, cache):
-    identities = [{key: value for key, value in item.items() if key not in ("root", "notice_roots", "notice_files")} for item in audit["external_sources"]]
-    payload = {"repository_inputs": sorted(audit["repository_inputs"]), "components": sorted(json.dumps(item, sort_keys=True) for item in identities), "native_libraries": sorted(item["name"] for item in audit["private_library_records"]), "licenses": sorted((item["source"], item["sha256"]) for item in audit["license_files"]), "system_packages": audit["system_packages_used"]}
+    # 只绑定第三方组成与许可：项目源码路径、锁文件摘要和项目汇总说明不计入；
+    # 仓库内crate只计名称与声明许可，内嵌上游目录仍按Git树身份计入。
+    identities, repository_crates = [], []
+    for item in audit["external_sources"]:
+        if item["kind"] == "repository-crate":
+            repository_crates.append([item["name"], item["license"]])
+        else:
+            identities.append({key: value for key, value in item.items() if key not in ("root", "notice_roots", "notice_files", "lockfiles")})
+    payload = {"repository_crates": sorted(repository_crates), "components": sorted(json.dumps(item, sort_keys=True) for item in identities), "native_libraries": sorted(item["name"] for item in audit["private_library_records"]), "licenses": sorted((item["source"], item["sha256"]) for item in audit["license_files"] if item["scope"] != "project-overview"), "system_packages": audit["system_packages_used"]}
     return hashlib.sha256(canonical(json.dumps(payload, sort_keys=True), root, cache).encode()).hexdigest()
 
 

@@ -1,5 +1,5 @@
 // Copyright 2026 Nuwax Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-2.0-or-later
 
 //! Production-profile graph conformance for the canonical Guard route.
 

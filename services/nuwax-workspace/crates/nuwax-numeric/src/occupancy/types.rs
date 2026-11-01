@@ -1,10 +1,10 @@
 //! 占据栅格基础类型
 //!
-//! SSOT：`dimos/msgs/nav_msgs/OccupancyGrid.py`
+//! 兼容 DimOS `OccupancyGrid` 消息
 //!   + lcm `lcmtypes/nav_msgs/OccupancyGrid.lcm`
 //!     （若存在）。本模块为 Rust 端结构化表达，必须保持 wire format 兼容。
 //!
-//! 修复要点（见 docs/.../20_rework20_全仓审计_对dimos原始.md §2.1）：
+//! 修复要点：
 //! - H-1：`OccupancyValue::from_i8` 对齐 Python `IntEnum {UNKNOWN=-1, FREE=0, OCCUPIED=100}`，
 //!   删掉 `v >= 65` 阈值（Python 中不存在）。
 //! - H-1：删掉 `CostValues` bitflags（dimos wire format 仅三态）。

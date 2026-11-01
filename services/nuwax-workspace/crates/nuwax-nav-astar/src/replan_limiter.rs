@@ -1,7 +1,5 @@
 //! Replan limiter — 与 Python `ReplanLimiter` 兼容
 //!
-//! 对应 Python 源 `dimos/navigation/replanning_a_star/replan_limiter.py`。
-//!
 //! 严格语义：
 //! - `_max_attempts = 6`
 //! - `_reset_distance = 2.0 m`

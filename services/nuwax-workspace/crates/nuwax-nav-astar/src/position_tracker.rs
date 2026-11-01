@@ -1,7 +1,5 @@
 //! 位置追踪与 stuck 检测
 //!
-//! 对应 Python 源 `dimos/navigation/replanning_a_star/position_tracker.py`。
-//!
 //! 行为契约：
 //! - 维护时间窗内（默认 8s）最近的位置采样（环形缓冲，1000 samples/s 容量）。
 //! - `is_stuck()`：当所有最近点到质心的距离 < threshold 时返回 true。

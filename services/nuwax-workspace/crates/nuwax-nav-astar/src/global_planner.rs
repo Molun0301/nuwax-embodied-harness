@@ -1,7 +1,5 @@
 //! 全局规划器（含 replanning 状态机）
 //!
-//! 对应 Python 源 `dimos/navigation/replanning_a_star/global_planner.py`。
-//!
 //! 状态机：Idle / Planning / Moving / Blocked（与方案文档 §5.1 表格对齐）。
 //!
 //! 行为契约：

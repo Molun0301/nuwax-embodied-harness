@@ -1,7 +1,5 @@
 //! Safe goal BFS
 //!
-//! 对应 Python 源 `dimos/navigation/replanning_a_star/goal_validator.py`。
-//!
 //! 行为契约：
 //! - BFS 8 邻接。
 //! - 半径内 (`max_search_distance`) 寻找最近满足 `_is_position_safe` 的 cell。

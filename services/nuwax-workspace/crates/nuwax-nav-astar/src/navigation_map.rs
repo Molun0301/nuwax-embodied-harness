@@ -1,7 +1,5 @@
 //! 二元 / 梯度 costmap 缓存
 //!
-//! 对应 Python 源 `dimos/navigation/replanning_a_star/navigation_map.py`。
-//!
 //! 设计：
 //! - `CostMap2D`：u8 占据栅格，`0=FREE`, `100=OCCUPIED`, `255=UNKNOWN`。
 //! - `NavigationMap`：缓存最近一次 binary costmap，提供 `make_gradient_costmap` 接口。

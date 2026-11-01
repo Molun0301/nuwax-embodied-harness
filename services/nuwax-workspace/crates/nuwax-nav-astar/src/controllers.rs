@@ -1,7 +1,5 @@
 //! P / PD 角速度控制器
 //!
-//! 对应 Python 源 `dimos/navigation/replanning_a_star/controllers.py`。
-//!
 //! 行为契约：
 //! - `Controller` trait：`advance(lookahead, odom) -> Twist`、`rotate(yaw_error) -> Twist`、
 //!   `reset_errors()`、`reset_yaw_error(value)`。

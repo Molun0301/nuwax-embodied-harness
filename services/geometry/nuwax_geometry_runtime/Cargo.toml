@@ -2,6 +2,7 @@
 name = "nuwax-geometry-runtime"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-2.0-or-later"
 description = "nuwax 平台几何 LCM/nuwax native runtime 子进程（独立于 Python 网关）"
 
 [lib]

@@ -1,7 +1,5 @@
 //! 局部路径跟随状态机
 //!
-//! 对应 Python 源 `dimos/navigation/replanning_a_star/local_planner.py`。
-//!
 //! 状态机：
 //! - `Idle` → `InitialRotation` → `PathFollowing` → `FinalRotation` → `Arrived`
 //! - 或 `Idle` → `PathFollowing`（如果 yaw error 在 tolerance 内且位置未到）

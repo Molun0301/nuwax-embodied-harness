@@ -1,7 +1,5 @@
 //! 最小代价 8 邻接 A* 搜索
 //!
-//! 对应 Python 源 `dimos/navigation/replanning_a_star/min_cost_astar.py`（不依赖 C++ extension）。
-//!
 //! 严格语义：
 //! - 8 邻接网格，默认直行 cost=1.0，对角 cost=1.42，实际步长遵循选项。
 //! - 对角移动要求相邻两个直行格均可通行，避免跨过障碍角点。

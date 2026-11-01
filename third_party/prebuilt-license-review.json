@@ -6,7 +6,7 @@
       "platforms": {
         "focal-arm64": {
           "decision": "approved",
-          "review_key": "f13cd05c5eaf240deb7a0c761a2b064268bb89643936a7abd8f241befe10a7b9",
+          "review_key": "ae04822e0d5c64db69cb3cad136329c85090c165b9717833a25dfbae434c0bad",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
@@ -20,16 +20,16 @@
             "services/nuwax-workspace/crates/nuwax-slam-toolbox-sys/native/upstream"
           ],
           "evidence": {
-            "run_id": 41270802604,
-            "source_revision": "a257e0b64d6fb4a5450de3c5dc3c831754c007c8",
+            "run_id": 41289319821,
+            "source_revision": "e9ebe536aa452b5e6fe53b3d10716044499b0b5f",
             "audit": "share/neh-prebuilt/nuwax-slam-2d-worker/audit/inputs.json",
-            "reviewed_at": "2026-11-01T08:31:43.290516+00:00",
-            "说明": "按实际编译Cargo包、最终Map/ELF原生组件及固定内嵌目录核对；review_key自2026-11-01起不计项目源码路径。原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
+            "reviewed_at": "2026-11-01T09:55:55.904372+00:00",
+            "说明": "以运行41289319821已发布审计为基础，代入工作区许可改为GPL-2.0-or-later后的仓库内crate声明及DimOS派生crate的LICENSE/NOTICE核对；review_key不计项目源码路径。原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
           }
         },
         "noble-x86_64": {
           "decision": "approved",
-          "review_key": "9a846b1d43563b6081a2e16f07ef6bfc0a3365601aff231f2ec649e55962a5f2",
+          "review_key": "e8695951209416758bf66f6138084a32fbb11683281a1323a1b4f444051b513f",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
@@ -43,11 +43,11 @@
             "services/nuwax-workspace/crates/nuwax-slam-toolbox-sys/native/upstream"
           ],
           "evidence": {
-            "run_id": 41270802604,
-            "source_revision": "a257e0b64d6fb4a5450de3c5dc3c831754c007c8",
+            "run_id": 41289319821,
+            "source_revision": "e9ebe536aa452b5e6fe53b3d10716044499b0b5f",
             "audit": "share/neh-prebuilt/nuwax-slam-2d-worker/audit/inputs.json",
-            "reviewed_at": "2026-11-01T08:31:43.290516+00:00",
-            "说明": "按实际编译Cargo包、最终Map/ELF原生组件及固定内嵌目录核对；review_key自2026-11-01起不计项目源码路径。原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
+            "reviewed_at": "2026-11-01T09:55:55.904372+00:00",
+            "说明": "以运行41289319821已发布审计为基础，代入工作区许可改为GPL-2.0-or-later后的仓库内crate声明及DimOS派生crate的LICENSE/NOTICE核对；review_key不计项目源码路径。原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
           }
         }
       }
@@ -56,10 +56,11 @@
       "platforms": {
         "focal-arm64": {
           "decision": "approved",
-          "review_key": "c8151e6327463826b59e384aa2b76cdca2e1bc76fa7d705093b79b21bb259eab",
+          "review_key": "293d5fb0a6676effe9bc15c272dabadce0bbedfe86f5c7275cc56e7a4e0ec764",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
+            "DimOS派生crate（Apache-2.0，Dimensional Inc.）：nuwax-nav-mls-planner、nuwax-mapping-raytracing",
             "实际编译Cargo包302个：逐包许可及build/runtime角色见随包组件记录",
             "实际系统运行库及适用GNU运行库例外，版权材料随包提供",
             "GTSAM/Cephes",
@@ -73,19 +74,20 @@
             "services/nuwax-workspace/crates/nuwax-dufomap-native/native/upstream"
           ],
           "evidence": {
-            "run_id": 41270802604,
-            "source_revision": "a257e0b64d6fb4a5450de3c5dc3c831754c007c8",
+            "run_id": 41289319821,
+            "source_revision": "e9ebe536aa452b5e6fe53b3d10716044499b0b5f",
             "audit": "share/neh-prebuilt/nuwax-geometry-runtime/audit/inputs.json",
-            "reviewed_at": "2026-11-01T08:31:43.290516+00:00",
-            "说明": "按实际编译Cargo包、最终Map/ELF原生组件及固定内嵌目录核对；review_key自2026-11-01起不计项目源码路径。原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
+            "reviewed_at": "2026-11-01T09:55:55.904372+00:00",
+            "说明": "以运行41289319821已发布审计为基础，代入工作区许可改为GPL-2.0-or-later后的仓库内crate声明及DimOS派生crate的LICENSE/NOTICE核对；review_key不计项目源码路径。原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
           }
         },
         "noble-x86_64": {
           "decision": "approved",
-          "review_key": "437f9b413e166ca4d9df9828e72334a1ec2c7932b682b823a1279f0934133be9",
+          "review_key": "ff32dd34347600dd7f14d0f0c900721e149cd7c29b2883c50f2c0795a12408a1",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
+            "DimOS派生crate（Apache-2.0，Dimensional Inc.）：nuwax-nav-mls-planner、nuwax-mapping-raytracing",
             "实际编译Cargo包302个：逐包许可及build/runtime角色见随包组件记录",
             "实际系统运行库及适用GNU运行库例外，版权材料随包提供",
             "GTSAM/Cephes",
@@ -99,11 +101,11 @@
             "services/nuwax-workspace/crates/nuwax-dufomap-native/native/upstream"
           ],
           "evidence": {
-            "run_id": 41270802604,
-            "source_revision": "a257e0b64d6fb4a5450de3c5dc3c831754c007c8",
+            "run_id": 41289319821,
+            "source_revision": "e9ebe536aa452b5e6fe53b3d10716044499b0b5f",
             "audit": "share/neh-prebuilt/nuwax-geometry-runtime/audit/inputs.json",
-            "reviewed_at": "2026-11-01T08:31:43.290516+00:00",
-            "说明": "按实际编译Cargo包、最终Map/ELF原生组件及固定内嵌目录核对；review_key自2026-11-01起不计项目源码路径。原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
+            "reviewed_at": "2026-11-01T09:55:55.904372+00:00",
+            "说明": "以运行41289319821已发布审计为基础，代入工作区许可改为GPL-2.0-or-later后的仓库内crate声明及DimOS派生crate的LICENSE/NOTICE核对；review_key不计项目源码路径。原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
           }
         }
       }
@@ -112,10 +114,11 @@
       "platforms": {
         "focal-arm64": {
           "decision": "approved",
-          "review_key": "a79afd017d133130ab95994459ebd3474156bbe32eb7947a261db597eab0daeb",
+          "review_key": "4a558d9226e9f014904a6303143324642f1f218bb3058de222bbd2ad5b50f43b",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
+            "DimOS派生crate（Apache-2.0，Dimensional Inc.）：nuwax-nav-mls-planner",
             "实际编译Cargo包224个：逐包许可及build/runtime角色见随包组件记录",
             "实际系统运行库及适用GNU运行库例外，版权材料随包提供",
             "Eigen3",
@@ -123,19 +126,20 @@
             "services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream"
           ],
           "evidence": {
-            "run_id": 41270802604,
-            "source_revision": "a257e0b64d6fb4a5450de3c5dc3c831754c007c8",
+            "run_id": 41289319821,
+            "source_revision": "e9ebe536aa452b5e6fe53b3d10716044499b0b5f",
             "audit": "share/neh-prebuilt/nuwax-nav-stack/audit/inputs.json",
-            "reviewed_at": "2026-11-01T08:31:43.290516+00:00",
-            "说明": "按实际编译Cargo包、最终Map/ELF原生组件及固定内嵌目录核对；review_key自2026-11-01起不计项目源码路径。原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
+            "reviewed_at": "2026-11-01T09:55:55.904372+00:00",
+            "说明": "以运行41289319821已发布审计为基础，代入工作区许可改为GPL-2.0-or-later后的仓库内crate声明及DimOS派生crate的LICENSE/NOTICE核对；review_key不计项目源码路径。原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
           }
         },
         "noble-x86_64": {
           "decision": "approved",
-          "review_key": "83562ab005c123d6fc1f3e65de8ab19cf37853375da1a32bdf513c241250ffe6",
+          "review_key": "9c2fe43be1b7bc901f7091c905ea92f9ade56d2502f9d7dc118a8c072cbba50a",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
+            "DimOS派生crate（Apache-2.0，Dimensional Inc.）：nuwax-nav-mls-planner",
             "实际编译Cargo包224个：逐包许可及build/runtime角色见随包组件记录",
             "实际系统运行库及适用GNU运行库例外，版权材料随包提供",
             "Eigen3",
@@ -143,11 +147,11 @@
             "services/nuwax-workspace/crates/nuwax-nav-scan-native/native/upstream"
           ],
           "evidence": {
-            "run_id": 41270802604,
-            "source_revision": "a257e0b64d6fb4a5450de3c5dc3c831754c007c8",
+            "run_id": 41289319821,
+            "source_revision": "e9ebe536aa452b5e6fe53b3d10716044499b0b5f",
             "audit": "share/neh-prebuilt/nuwax-nav-stack/audit/inputs.json",
-            "reviewed_at": "2026-11-01T08:31:43.290516+00:00",
-            "说明": "按实际编译Cargo包、最终Map/ELF原生组件及固定内嵌目录核对；review_key自2026-11-01起不计项目源码路径。原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
+            "reviewed_at": "2026-11-01T09:55:55.904372+00:00",
+            "说明": "以运行41289319821已发布审计为基础，代入工作区许可改为GPL-2.0-or-later后的仓库内crate声明及DimOS派生crate的LICENSE/NOTICE核对；review_key不计项目源码路径。原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
           }
         }
       }
@@ -156,7 +160,7 @@
       "platforms": {
         "focal-arm64": {
           "decision": "approved",
-          "review_key": "6f84a83d7d050c6718287aec8389f2261ef0e4a1cd62b9c43fd6bc33a65050bf",
+          "review_key": "6d93c8d6d00fe9fbeeb2134337e854c76ccb38c31e12b9f3be2e25533099fe4b",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
@@ -164,16 +168,16 @@
             "实际系统运行库及适用GNU运行库例外，版权材料随包提供"
           ],
           "evidence": {
-            "run_id": 41270802604,
-            "source_revision": "a257e0b64d6fb4a5450de3c5dc3c831754c007c8",
+            "run_id": 41289319821,
+            "source_revision": "e9ebe536aa452b5e6fe53b3d10716044499b0b5f",
             "audit": "share/neh-prebuilt/nuwax-person-follow/audit/inputs.json",
-            "reviewed_at": "2026-11-01T08:31:43.290516+00:00",
-            "说明": "按实际编译Cargo包、最终Map/ELF原生组件及固定内嵌目录核对；review_key自2026-11-01起不计项目源码路径。原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
+            "reviewed_at": "2026-11-01T09:55:55.904372+00:00",
+            "说明": "以运行41289319821已发布审计为基础，代入工作区许可改为GPL-2.0-or-later后的仓库内crate声明及DimOS派生crate的LICENSE/NOTICE核对；review_key不计项目源码路径。原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
           }
         },
         "noble-x86_64": {
           "decision": "approved",
-          "review_key": "f72eabae4bb75afac7ea08d6a46234ff660fcc0600b62d484245574a0d449214",
+          "review_key": "679a45117c5d25c0c56a31cb4e771ba1cba1da1326929b1bfd985c5474baeee4",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
@@ -181,11 +185,11 @@
             "实际系统运行库及适用GNU运行库例外，版权材料随包提供"
           ],
           "evidence": {
-            "run_id": 41270802604,
-            "source_revision": "a257e0b64d6fb4a5450de3c5dc3c831754c007c8",
+            "run_id": 41289319821,
+            "source_revision": "e9ebe536aa452b5e6fe53b3d10716044499b0b5f",
             "audit": "share/neh-prebuilt/nuwax-person-follow/audit/inputs.json",
-            "reviewed_at": "2026-11-01T08:31:43.290516+00:00",
-            "说明": "按实际编译Cargo包、最终Map/ELF原生组件及固定内嵌目录核对；review_key自2026-11-01起不计项目源码路径。原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
+            "reviewed_at": "2026-11-01T09:55:55.904372+00:00",
+            "说明": "以运行41289319821已发布审计为基础，代入工作区许可改为GPL-2.0-or-later后的仓库内crate声明及DimOS派生crate的LICENSE/NOTICE核对；review_key不计项目源码路径。原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
           }
         }
       }
@@ -194,7 +198,7 @@
       "platforms": {
         "focal-arm64": {
           "decision": "approved",
-          "review_key": "16190b2594b2ee97b0a9d0d73683e42db1795c06a627be8437b4e99a30e6dac1",
+          "review_key": "d37f49e8656035f06c899fd480ef57d861d514f4df5aff3c8b40328afc855a1f",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
@@ -208,16 +212,16 @@
             "gtsam_source"
           ],
           "evidence": {
-            "run_id": 41270802604,
-            "source_revision": "a257e0b64d6fb4a5450de3c5dc3c831754c007c8",
+            "run_id": 41289319821,
+            "source_revision": "e9ebe536aa452b5e6fe53b3d10716044499b0b5f",
             "audit": "share/neh-prebuilt/nuwax-mapping-cli/audit/inputs.json",
-            "reviewed_at": "2026-11-01T08:31:43.290516+00:00",
-            "说明": "按实际编译Cargo包、最终Map/ELF原生组件及固定内嵌目录核对；review_key自2026-11-01起不计项目源码路径。原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
+            "reviewed_at": "2026-11-01T09:55:55.904372+00:00",
+            "说明": "以运行41289319821已发布审计为基础，代入工作区许可改为GPL-2.0-or-later后的仓库内crate声明及DimOS派生crate的LICENSE/NOTICE核对；review_key不计项目源码路径。原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
           }
         },
         "noble-x86_64": {
           "decision": "approved",
-          "review_key": "70810ed2f263780b98b05ced74a8e051fa9b019fc27e4f97632dd822e6ed17cc",
+          "review_key": "bc2144a6ca3e1501c0a979f71209138b60064f74bc70a6ccc4deddb281b3adf7",
           "license_expression": "GPL-3.0-only",
           "reviewed_components": [
             "NEH自有代码：GPL-2.0-or-later，本组合选择GPL-3.0",
@@ -231,11 +235,11 @@
             "gtsam_source"
           ],
           "evidence": {
-            "run_id": 41270802604,
-            "source_revision": "a257e0b64d6fb4a5450de3c5dc3c831754c007c8",
+            "run_id": 41289319821,
+            "source_revision": "e9ebe536aa452b5e6fe53b3d10716044499b0b5f",
             "audit": "share/neh-prebuilt/nuwax-mapping-cli/audit/inputs.json",
-            "reviewed_at": "2026-11-01T08:31:43.290516+00:00",
-            "说明": "按实际编译Cargo包、最终Map/ELF原生组件及固定内嵌目录核对；review_key自2026-11-01起不计项目源码路径。原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
+            "reviewed_at": "2026-11-01T09:55:55.904372+00:00",
+            "说明": "以运行41289319821已发布审计为基础，代入工作区许可改为GPL-2.0-or-later后的仓库内crate声明及DimOS派生crate的LICENSE/NOTICE核对；review_key不计项目源码路径。原组件许可、NOTICE及对应源码/替换重建条件继续保留。"
           }
         }
       }

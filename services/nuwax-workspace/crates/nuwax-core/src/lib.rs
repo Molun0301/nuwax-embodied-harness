@@ -1,8 +1,6 @@
 //! nuwax Module 基类与 `In<T>`/`Out<T>` 类型化流
 //! - `In<T>` / `Out<T>` 类型化流
 //!
-//! SSOT: 对齐 dimos Python `In` / `Out` 类型化流,见
-//! `/home/ml/Deeprob/dimos/dimos/stream/core/inout.py`。
 //! 端口策略:`Out<T>` 单 mpsc(Single) 与 broadcast(Broadcast) 二选一,
 //! broadcast 模式对应 RxPy `Subject` 多订阅语义。
 

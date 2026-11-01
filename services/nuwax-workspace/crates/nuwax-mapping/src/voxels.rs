@@ -1,9 +1,6 @@
 //! 体素地图
 //!
-//! ARCH-DEVIATION: see `docs/开发文档/建图导航探索重构/补丁文档/2026-07-09_移植问题修复/
-//! 20_rework20_全仓审计_对dimos原始.md` §2.1 H-7。
-//!
-//! Python SSOT：`/home/ml/Deeprob/dimos/dimos/mapping/voxels.py`
+//! 行为参考 DimOS Python 体素地图：
 //!   - 用 Open3D `o3d.t.geometry.VoxelBlockGrid`（CUDA 加速）
 //!   - `block_count=2_000_000` + `block_resolution=1`
 //!   - `_carve_and_insert()` 列雕刻（删除同 (X,Y) 已存在 voxel 再 insert）

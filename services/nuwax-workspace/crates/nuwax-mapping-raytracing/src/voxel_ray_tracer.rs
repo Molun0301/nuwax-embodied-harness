@@ -1,4 +1,5 @@
-// Copyright 2026 Nuwax Team
+// Copyright 2026 Dimensional Inc.
+// Modifications Copyright 2026 Nuwax Team
 // SPDX-License-Identifier: Apache-2.0
 
 use ahash::{AHashMap, AHashSet};

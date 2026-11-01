@@ -1,7 +1,5 @@
 //! 路径距离辅助
 //!
-//! 对应 Python 源 `dimos/navigation/replanning_a_star/path_distancer.py`。
-//!
 //! 提供：
 //! - 累积距离数组（按 segment 累加的 world-frame 距离）
 //! - `find_lookahead_point`：从 `start_idx` 沿路径前进 `lookahead_dist` 米

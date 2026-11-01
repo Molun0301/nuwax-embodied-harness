@@ -1,4 +1,5 @@
-// Copyright 2026 Nuwax Inc.
+// Copyright 2026 Dimensional Inc.
+// Modifications Copyright 2026 Nuwax Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! Node placement: identify standable cells far from any wall, place graph

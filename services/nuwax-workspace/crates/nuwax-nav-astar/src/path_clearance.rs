@@ -1,7 +1,5 @@
 //! 路径前向障碍检测
 //!
-//! 对应 Python 源 `dimos/navigation/replanning_a_star/path_clearance.py`。
-//!
 //! Phase 1 实现：
 //! - `PathClearance` 缓存最近一次 costmap 与 pose_index。
 //! - `mask`：根据 `robot_width`（米）计算圆盘膨胀（cell 单位），并结合 `path_lookup_distance`

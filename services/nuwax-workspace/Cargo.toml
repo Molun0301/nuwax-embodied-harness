@@ -69,7 +69,7 @@ members = [
 [workspace.package]
 edition = "2021"
 rust-version = "1.88"
-license = "Apache-2.0"
+license = "GPL-2.0-or-later"
 authors = ["Nuwax Team <build@nuwax.dev>"]
 repository = "https://github.com/nuwax-org/nuwax"
 publish = false

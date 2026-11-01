@@ -1,4 +1,5 @@
-// Copyright 2026 Nuwax Inc.
+// Copyright 2026 Dimensional Inc.
+// Modifications Copyright 2026 Nuwax Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! 共享多层表面地图的几何与前沿配置。

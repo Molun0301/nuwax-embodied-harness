@@ -2,11 +2,10 @@
 //!
 //! 提供 Subject / Observer 抽象,与 `nuwax-core::In<T>/Out<T>` 互转。
 //!
-//! SSOT:dimos Python 端
+//! 与 DimOS Python 端兼容：
 //! - `Subject` 来自 RxPy(`reactivex.subject.Subject`),提供 `on_completed()` / `on_error()`
-//!   标准钩子(见 `/home/ml/Deeprob/dimos/dimos/stream/audio/node_key_recorder.py:23` 等)
-//! - 视频帧类型为 `SerializableVideoFrame`(见
-//!   `/home/ml/Deeprob/dimos/dimos/robot/unitree/connection.py:70-93`),
+//!   标准钩子
+//! - 视频帧类型为 `SerializableVideoFrame`,
 //!   Rust 端口命名为 `VideoFrame`,字段集与 Python 等价
 
 #![deny(unsafe_code)]
@@ -22,8 +21,6 @@ use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
 
 /// 可序列化的视频帧 — 对齐 dimos `SerializableVideoFrame`
-///
-/// 见 `/home/ml/Deeprob/dimos/dimos/robot/unitree/connection.py:70-93`
 ///
 /// Python 端的 `data` 是 `np.ndarray`,因此除字节外还必须保留
 /// shape / dtype / strides。`data` 保存 ndarray 底层 buffer,

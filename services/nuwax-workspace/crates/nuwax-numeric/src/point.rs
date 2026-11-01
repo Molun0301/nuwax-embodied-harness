@@ -1,9 +1,9 @@
 //! 点与点云基础类型
 //!
-//! SSOT：`/home/ml/Deeprob/dimos/dimos/msgs/sensor_msgs/PointCloud2.py`
+//! 兼容 DimOS `PointCloud2` 消息
 //! + `services/nuwax-workspace/lcmtypes/sensor_msgs/PointCloud2.lcm`
 //!
-//! 修复要点（见 docs/.../20_rework20_全仓审计_对dimos原始.md §2.1 H-3）：
+//! 修复要点：
 //! `PointCloud2Like` 之前缺 intensities/colors 通道；本次补齐默认实现
 //! 返回 `None` / `0` / `false`，由实现方按需 override。
 

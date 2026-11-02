@@ -440,6 +440,34 @@ def _remote_is_connected(remote: Optional[GeometryRuntimeProvider]) -> bool:
     return remote is not None and remote.is_connected
 
 
+def _checkpoint_snapshot_metadata(metadata, occupancy_receipt, cloud_receipt):
+    """检查点物理栅格只携带源回执，不继承实时有效栅格的提交身份。"""
+    def receipt_view(receipt):
+        if receipt is None:
+            return None
+        commit = dict(receipt["commit_id"])
+        if isinstance(commit["boot_nonce"], bytes):
+            commit["boot_nonce"] = commit["boot_nonce"].hex()
+        return {**receipt, "commit_id": commit}
+
+    result = {key: value for key, value in metadata.items() if key not in {
+        "content_identity", "content_identity_status", "map_provenance", "source_epoch",
+        "update_sequence", "content_revision", "occupancy_content_revision",
+        "layer_content_identities", "occupancy_mapping_identity", "cost_map_mapping_identity",
+        "live_map_provider", "occupancy_metrics", "cost_map_metrics",
+        "occupancy_sequence", "cost_map_sequence", "mapping_revision",
+        "asset_identity", "activation_receipt_v2", "map_activation_generation",
+    }}
+    result.update(source_kind="map_asset_bundle", map_snapshot_kind="offline_checkpoint",
+        live_streaming_ready=False, mapping_live_streaming_ready=False,
+        source_occupancy_receipt=receipt_view(occupancy_receipt), source_cloud_receipt=receipt_view(cloud_receipt),
+        mapping_session_id=occupancy_receipt["session_id"],
+        session_id=occupancy_receipt["session_id"],
+        session_generation=occupancy_receipt["session_generation"],
+        timestamp_ns=occupancy_receipt["source_timestamp_ns"])
+    return result
+
+
 def _remote_connection_generation(remote: Optional[GeometryRuntimeProvider]) -> Optional[int]:
     return remote.connection_generation if remote is not None else None
 
@@ -3320,7 +3348,9 @@ class PlatformGeometryRuntime:
                 checkpoint_bundle.checkpoint.source_session_generation], separators=(",", ":")),
             "update_sequence": max(1, int(meta.revision)),
             "metadata": {
-                **dict(map_bundle.snapshot.metadata),
+                **_checkpoint_snapshot_metadata(map_bundle.snapshot.metadata,
+                    checkpoint_bundle.checkpoint.occupancy_receipt,
+                    checkpoint_bundle.checkpoint.cloud_receipt),
                 "mapping_backend_checkpoint": checkpoint_metadata,
                 "saved_occupancy_layer": "canonical_physical_raw",
             },
@@ -3350,6 +3380,7 @@ class PlatformGeometryRuntime:
         bundle: MapAssetBundle,
         checkpoint_bundle: MappingBackendCheckpointExportBundle,
         mapping_context: Optional[Dict[str, object]],
+        *, source_map_name: Optional[str] = None,
     ) -> Dict[str, object]:
         context = self._clone_metadata(mapping_context or {})
         session_id = str(context.get("session_id") or "").strip()
@@ -3361,7 +3392,7 @@ class PlatformGeometryRuntime:
         if (
             not bool(context.get("active"))
             or not session_id
-            or map_name != bundle.map_name
+            or map_name != (source_map_name or bundle.map_name)
             or session_generation <= 0
         ):
             raise RuntimeError(
@@ -3416,6 +3447,7 @@ class PlatformGeometryRuntime:
         bundle_root: Path,
         skip_pcd_export: bool = False,
         export_backend_checkpoint: bool = True,
+        source_map_name: Optional[str] = None,
     ) -> MapAssetBundle:
         """在受控 staging 根目录生成一个 finalized 地图的几何资产。"""
 
@@ -3496,6 +3528,7 @@ class PlatformGeometryRuntime:
                 bundle,
                 checkpoint_bundle,
                 mapping_context_after,
+                source_map_name=source_map_name,
             )
             bundle = self._replace_bundle_occupancy_from_checkpoint(
                 bundle,
@@ -4023,7 +4056,8 @@ class PlatformGeometryRuntime:
         source = document["target"][source_key]
         # Detached small views retain the sealed tuple/packed payload owners.
         snapshot = prepared.bundle.snapshot
-        metadata = {**snapshot.metadata, "identity_schema_version": 2,
+        metadata = {**_checkpoint_snapshot_metadata(snapshot.metadata,
+                    source["occupancy_receipt"], source["cloud_receipt"]), "identity_schema_version": 2,
                     "asset_identity": request["asset_identity"],
                     "activation_receipt_v2": document,
                     "source_occupancy_receipt": source["occupancy_receipt"],
@@ -4675,6 +4709,13 @@ class PlatformGeometryRuntime:
             source_kind="map_asset_bundle",
             activation_result=activation_result,
         )
+        snapshot_metadata = dict(bundle.snapshot.metadata)
+        if bundle.identity_schema_version == 2:
+            document = activation_result["activation_receipt_v2"].to_dict()
+            source_key = "source_graph_member" if document["activation"]["backend_kind"] == "slam_toolbox" else "source_cloud_member"
+            source = document["target"][source_key]
+            snapshot_metadata = _checkpoint_snapshot_metadata(snapshot_metadata,
+                source["occupancy_receipt"], source["cloud_receipt"])
         snapshot = MapSnapshot(
             map_name=bundle.snapshot.map_name,
             source_name=bundle.snapshot.source_name,
@@ -4685,7 +4726,7 @@ class PlatformGeometryRuntime:
             cost_map=cost_map,
             semantic_map=semantic_map,
             metadata={
-                **dict(bundle.snapshot.metadata),
+                **snapshot_metadata,
                 **geometry_metadata,
             },
         )
@@ -4832,6 +4873,7 @@ class PlatformGeometryRuntime:
             metadata.update(
                 {
                     "mapping_session_id": mapping_session_id,
+                    "session_id": mapping_session_id,
                     "session_generation": mapping_session_generation,
                     "mapping_revision": int(mapping_context.get("revision") or 0),
                 }
@@ -4913,10 +4955,15 @@ class PlatformGeometryRuntime:
         source_kind: str,
         activation_result: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
+        activation = (activation_result if activation_result is not None
+                      else self._activation_result_from_snapshot(self._map_activation_snapshot_read()))
         bundle_metadata = {
             "semantic_reference_identity": bundle.snapshot_identity,
             "asset_identity": bundle.asset_identity.model_dump(),
         }
+        if bundle.identity_schema_version == 2:
+            bundle_metadata.update(identity_schema_version=2,
+                activation_receipt_v2=activation["activation_receipt_v2"].to_dict())
         metadata = {
             "source_kind": source_kind,
             "map_snapshot_kind": map_snapshot_kind,
@@ -4949,13 +4996,7 @@ class PlatformGeometryRuntime:
             "geometry_diagnostics": self._clone_metadata(
                 geometry_asset.quality_metrics.get("diagnostics", []) if geometry_asset is not None else []
             ),
-            "geometry_activation": _mapping_state_document(
-                activation_result
-                if activation_result is not None
-                else self._activation_result_from_snapshot(
-                    self._map_activation_snapshot_read()
-                )
-            ),
+            "geometry_activation": _mapping_state_document(activation),
             "profile": self._clone_metadata(
                 geometry_asset.parameter_summary.get("profile") if geometry_asset is not None else self.config.build_metadata().get("profile")
             ),
@@ -4973,6 +5014,9 @@ class PlatformGeometryRuntime:
         }
         if geometry_asset is not None:
             metadata.update(dict(geometry_asset.metadata))
+        if live_available:
+            # 几何资产的源会话仅作历史说明，不能覆盖实时提供器的当前会话。
+            metadata.pop("session_id", None)
         metadata["source_kind"] = source_kind
         metadata["map_snapshot_kind"] = map_snapshot_kind
         metadata["mapping_live_streaming_ready"] = bool(live_available)

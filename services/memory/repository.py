@@ -421,6 +421,40 @@ class MemoryRepository:
             )
         return int(cursor.rowcount or 0) > 0
 
+    def rename_memory_library(self, library_name: str, new_library_name: str) -> None:
+        """同一事务迁移八类源记录，再经原索引/制品引用写入钩子更新派生状态。"""
+        def rename_names(value):
+            if isinstance(value, dict):
+                return {key: new_library_name if key in {"map_name", "map_id", "memory_library_name"}
+                        and item == library_name else rename_names(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [rename_names(item) for item in value]
+            return value
+
+        from services.memory.durable_index import SOURCES
+        with self._transaction() as transaction:
+            indexed = []
+            for table in self._LIBRARY_NAME_TABLES:
+                rows = transaction.execute(f'SELECT rowid,payload_json,map_name FROM {table} WHERE library_name=?',
+                                           (library_name,)).fetchall()
+                for row in rows:
+                    payload = rename_names(json.loads(row["payload_json"]))
+                    payload_json = json.dumps(payload, ensure_ascii=False)
+                    transaction.execute(f'UPDATE {table} SET library_name=?,map_name=?,payload_json=? WHERE rowid=?',
+                        (new_library_name, new_library_name if row["map_name"] == library_name else row["map_name"],
+                         payload_json, row["rowid"]))
+                    for kind, (source_table, _column, model) in SOURCES.items():
+                        if source_table == table:
+                            indexed.append((kind, model.model_validate(payload), payload_json))
+            transaction.execute('UPDATE memory_libraries SET library_name=? WHERE library_name=?',
+                                (new_library_name, library_name))
+            if self._index is not None:
+                self._index.rename_library(library_name, new_library_name)
+            for kind, record, payload_json in indexed:
+                with self._source_mutation(kind, record, payload_json=payload_json):
+                    pass
+            transaction.execute('DELETE FROM memory_scene_graph_inputs WHERE library_name=?', (library_name,))
+
     def upsert_tagged_location(self, location: TaggedLocation) -> None:
         origin = location
         expected = getattr(origin, "_memory_business_token", None)

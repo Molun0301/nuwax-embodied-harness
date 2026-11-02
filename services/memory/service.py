@@ -648,6 +648,17 @@ class MemoryService(SceneMappingMemoryMixin):
             )
         return self.create_memory_library(library_name=resolved_name)
 
+    def rename_memory_library(self, *, library_name: str, new_library_name: str) -> None:
+        """建图另存迁移同名记忆；先撤销原观察代次，提交后加载原记录。"""
+        if self.has_memory_library(new_library_name):
+            raise GatewayError("目标记忆库已存在。", error_code="memory_library_already_exists", http_status=409)
+        active = self.get_active_library_name() == library_name
+        if active:
+            self.disable_memory_library()
+        self._repository.rename_memory_library(library_name, new_library_name)
+        if active:
+            self.activate_memory_library(library_name=new_library_name)
+
     def activate_memory_library(
         self,
         *,

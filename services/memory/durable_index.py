@@ -123,6 +123,17 @@ class DurableMemoryIndex:
             alias = self._alias(tx, 'lib', '', name)
             return self.outbox.create_library(alias)
 
+    def rename_library(self, old_name, new_name):
+        """只迁移业务别名；保留库、记录、向量任务和场景实体的原身份。"""
+        identity = self.library_identity(old_name)
+        with self.storage.transaction() as tx:
+            tx.execute("UPDATE memory_index_aliases SET external_key=? WHERE alias_kind='lib' AND namespace='' AND external_key=?",
+                       (new_name, old_name))
+            tx.execute('UPDATE memory_index_sources SET library_name=? WHERE library_name=?', (new_name, old_name))
+            tx.execute('DELETE FROM memory_index_reconciliation WHERE library_name=?', (old_name,))
+            tx.execute('UPDATE memory_scene_identity_scopes SET map_name=? WHERE library_incarnation=? AND map_name=?',
+                       (new_name, identity.incarnation, old_name))
+
     def activate(self, name, *, load_history=True):
         identity = self.library_identity(name) if name is not None else None
         self.activation_generation = self.outbox.activate(identity)

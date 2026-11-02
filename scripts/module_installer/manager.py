@@ -331,7 +331,7 @@ def _vendor_constraints(python: str, target: Path, names: Sequence[str]) -> None
     atomic_write(target, (result.stdout).encode("utf-8"), mode=0o600)
 
 
-def _check_dependencies(python: str, exposed: Optional[Path]) -> None:
+def _check_dependencies(python: str) -> None:
     """pip check只追究本环境与厂商包；Jetson环境可见的系统包自身缺依赖时只记录。"""
     environment = dict(os.environ)
     environment.pop("PYTHONPATH", None)
@@ -342,10 +342,12 @@ def _check_dependencies(python: str, exposed: Optional[Path]) -> None:
         return
     code = (
         "import importlib.metadata as m, json, os, sys, sysconfig\n"
-        "roots = {os.path.realpath(sysconfig.get_paths()[k]) for k in ('purelib', 'platlib')} | {os.path.realpath(p) for p in sys.argv[1:]}\n"
+        "roots = {os.path.realpath(sysconfig.get_paths()[k]) for k in ('purelib', 'platlib')}\n"
+        "pth = os.path.join(sysconfig.get_paths()['purelib'], 'nuwax-jetson-vendor.pth')\n"
+        "roots |= {os.path.realpath(line.strip()) for line in open(pth) if line.strip()} if os.path.exists(pth) else set()\n"
         "print(json.dumps(sorted({d.metadata['Name'] for d in m.distributions() if os.path.realpath(str(d.locate_file(''))) in roots})))"
     )
-    names = json.loads(subprocess.check_output([python, "-c", code] + ([str(exposed)] if exposed else []), text=True, env=environment))
+    names = json.loads(subprocess.check_output([python, "-c", code], text=True, env=environment))
     normalize = lambda name: re.sub(r"[-_.]+", "-", name).lower()
     owned = {normalize(name) for name in list(names) + list(_JETSON_VENDOR_PACKAGES)}
     problems = [line for line in result.stdout.splitlines() if line.strip() and normalize(line.split()[0]) in owned]
@@ -414,7 +416,7 @@ def _python_environment(request: InstallRequest, hardware, prefix: Path, seed: s
              "--prefix", str(prefix), "--cache", str(request.home / "cache/go2")])
     if hardware.architecture == "aarch64":
         _preload_bundled_openmp(python)
-    _check_dependencies(python, prefix / "jetson-vendor" if vendor and vendor["site"] else None)
+    _check_dependencies(python)
     run([python, "-c", "import importlib; [importlib.import_module(n) for n in " + repr(list(module_imports(request.modules, request.robot))) + "]"])
 
 

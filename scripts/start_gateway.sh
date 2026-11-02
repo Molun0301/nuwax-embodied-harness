@@ -119,31 +119,6 @@ person_follow_is_alive() {
   [[ -n "${state}" && "${state:0:1}" != "Z" ]]
 }
 
-wait_for_motion_guard_transport() {
-  local helper="${REPO_ROOT}/scripts/systemd/wait_for_motion_guard_socket.sh"
-  local timeout_sec="${NUWAX_MOTION_GUARD_START_TIMEOUT_SEC:-15}"
-  local attempts=0
-  case "${timeout_sec}" in
-    ''|*[!0-9]*)
-      echo "invalid NUWAX_MOTION_GUARD_START_TIMEOUT_SEC=${timeout_sec}" >&2
-      return 1
-      ;;
-  esac
-  attempts=$((timeout_sec * 10 + 1))
-
-  for ((attempt = 0; attempt < attempts; attempt++)); do
-    if bash "${helper}" check >/dev/null 2>&1; then
-      echo "motion guard transport ready: ${NUWAX_MOTION_GUARD_SOCKET:-/run/nuwax/motion-guard.sock}"
-      return 0
-    fi
-    sleep 0.1
-  done
-
-  bash "${helper}" check
-  echo "refusing to start the motion-capable navigation stack without motion guard transport" >&2
-  return 1
-}
-
 wait_for_geometry_runtime_ready() {
   local ready_file="${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-${REPO_ROOT}/runtime_data/geometry/nuwax_geometry_runtime.ready}"
   # 调用方多在 if 条件中，set -e 不生效；早退或超时须显式返回失败，不能被随后的提示覆盖。
@@ -1041,16 +1016,7 @@ activate_requested_runtime_components() {
     RUNTIME_ACTIVATION_STAGE="request"
     RUNTIME_ACTIVATION_STARTED=()
     check_runtime_activation_cancelled || return 1
-    if [[ "${RUNTIME_ACTIVATION_LEVEL}" == "guard" \
-      || "${RUNTIME_ACTIVATION_LEVEL}" == "motion" \
-      || "${RUNTIME_ACTIVATION_LEVEL}" == "person_follow" ]]; then
-      write_runtime_activation_result activating motion_guard "waiting for motion guard component"
-      if ! wait_for_motion_guard_transport; then
-        fail_runtime_activation failed motion_guard "运动守卫传输不可用。" runtime_activation_failed
-        return 1
-      fi
-      check_runtime_activation_cancelled || return 1
-    fi
+    # 守卫是否可用由网关和导航程序实际连接判定；启动器不按socket文件属主预先判定。
     if [[ "${RUNTIME_ACTIVATION_LEVEL}" == "motion" \
       || "${RUNTIME_ACTIVATION_LEVEL}" == "person_follow" ]]; then
       start_runtime_activation_component nav_stack NAV_STACK_PID nav_stack_managed_by_systemd || return 1

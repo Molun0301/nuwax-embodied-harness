@@ -49,20 +49,10 @@ class ManagerServer(ThreadingHTTPServer):
         self.static_root = Path(static_root or Path(__file__).parent / "static").resolve()
         self.sessions, self.attempts = {}, {}
         self.session_lock = threading.Lock()
-        self.allowed_hosts = {"localhost", "127.0.0.1", "::1", socket.gethostname().lower()}
-        try:
-            self.allowed_hosts.update(entry[4][0] for entry in socket.getaddrinfo(socket.gethostname(), None))
-        except OSError:
-            pass
-        # 内核路由查询只枚举本机地址，不根据请求提供的主机名进行域名解析。
-        import subprocess
-        try:
-            output = subprocess.run(["ip", "-json", "address", "show"], capture_output=True, text=True, timeout=3)
-            self.allowed_hosts.update(info["local"] for interface in json.loads(output.stdout) for info in interface.get("addr_info", []))
-        except (OSError, ValueError, KeyError, subprocess.SubprocessError):
-            pass
-        if address[0] not in ("0.0.0.0", "::"):
-            self.allowed_hosts.add(address[0].lower())
+        self.bind_host = address[0].lower()
+        self.allowed_hosts = self._local_hosts()
+        self.hosts_refreshed = time.monotonic()
+        self.hosts_lock = threading.Lock()
         self.slots = threading.BoundedSemaphore(64)
         self.last_recovery = 0
         self.recovery_thread = None
@@ -111,6 +101,33 @@ class ManagerServer(ThreadingHTTPServer):
         os.chdir(str(target))
         os.execve(sys.executable, arguments, environment)
 
+    def _local_hosts(self):
+        hosts = {"localhost", "127.0.0.1", "::1", socket.gethostname().lower()}
+        try:
+            hosts.update(entry[4][0] for entry in socket.getaddrinfo(socket.gethostname(), None))
+        except OSError:
+            pass
+        # 内核路由查询只枚举本机地址，不根据请求提供的主机名进行域名解析。
+        import subprocess
+        try:
+            output = subprocess.run(["ip", "-json", "address", "show"], capture_output=True, text=True, timeout=3)
+            hosts.update(info["local"] for interface in json.loads(output.stdout) for info in interface.get("addr_info", []))
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+            pass
+        if self.bind_host not in ("0.0.0.0", "::"):
+            hosts.add(self.bind_host)
+        return hosts
+
+    def host_allowed(self, hostname):
+        if hostname in self.allowed_hosts:
+            return True
+        # 开机时网口可能晚于本服务取得地址，DHCP也会换址；未命中时重新枚举本机地址，限频避免被请求拖住。
+        with self.hosts_lock:
+            if time.monotonic() - self.hosts_refreshed >= 2:
+                self.allowed_hosts = self._local_hosts()
+                self.hosts_refreshed = time.monotonic()
+        return hostname in self.allowed_hosts
+
     def process_request(self, request, client_address):
         if not self.slots.acquire(blocking=False):
             request.close()
@@ -144,7 +161,7 @@ class Handler(BaseHTTPRequestHandler):
     def _same_origin(self, required=False):
         host = self.headers.get("Host", "")
         parsed = urllib.parse.urlsplit("http://" + host)
-        if not parsed.hostname or parsed.hostname.lower() not in self.server.allowed_hosts or parsed.username or parsed.password:
+        if not parsed.hostname or not self.server.host_allowed(parsed.hostname.lower()) or parsed.username or parsed.password:
             raise ManagerError("host_denied", "请求主机不是本设备的受支持访问地址。", 403)
         origin = self.headers.get("Origin")
         if origin:

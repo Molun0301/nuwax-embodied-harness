@@ -149,6 +149,7 @@ class ServiceTests(unittest.TestCase):
         self.lease = 0
         self.runtime = SimpleNamespace(
             task_manager=SimpleNamespace(has_active_tasks=lambda: False),
+            mapping_recorder=SimpleNamespace(status=lambda: {"recording": False}),
             config=SimpleNamespace(robot=SimpleNamespace(active_robot="customrobot"),
                                    gateway=SimpleNamespace(host="127.0.0.1", port=8766)),
             motion_guard=SimpleNamespace(has_connected=False,
@@ -207,6 +208,16 @@ class ServiceTests(unittest.TestCase):
         for adapter in ("customrobot", "go2", "g1", "raspi_lidar_robot", "future_adapter"):
             self.runtime.config.robot.active_robot = adapter
             self.service.require_idle()
+
+    def test_mapping_recording_blocks_readiness_until_stopped(self):
+        recording = {"recording": True}
+        self.runtime.mapping_recorder.status = lambda: recording
+        response = self.client.get("/api/updates/readiness")
+        self.assertEqual(response.json(), {
+            "ready": False, "reason": "正在录制建图，请先保存或停止建图",
+        })
+        recording["recording"] = False
+        self.assertEqual(self.client.get("/api/updates/readiness").json(), {"ready": True})
 
     def test_active_motion_lease_blocks(self):
         self.runtime.motion_guard.has_connected = True

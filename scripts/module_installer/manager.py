@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
 from scripts.device_manager.common import atomic_write, fsync_directory
+from scripts.neh_system_helper import dependency_plan
 
 from .builds import build_modules, describe_builds, prune_build_cache
 from .catalog import ROBOT_REQUIREMENTS, module_imports, module_requirements, module_system_packages, resolve_modules
@@ -250,18 +251,8 @@ def idle_gateway(root: Path):
 
 
 def _system_dependencies(packages: Sequence[str], run, *, noninteractive: bool = False) -> None:
-    missing = []
-    for package in packages:
-        status = subprocess.run(
-            ["dpkg-query", "-W", "-f=${Status}", package], capture_output=True, text=True, check=False,
-        )
-        if package == "libglib2.0-0" and (status.returncode or status.stdout.strip() != "install ok installed"):
-            # 新版发行版由时间类型迁移后的包提供同一运行库。
-            status = subprocess.run(
-                ["dpkg-query", "-W", "-f=${Status}", "libglib2.0-0t64"], capture_output=True, text=True, check=False,
-            )
-        if status.returncode or status.stdout.strip() != "install ok installed":
-            missing.append(package)
+    payload = {"packages": list(packages)}
+    missing = dependency_plan(payload)["missing"]
     if missing and noninteractive:
         raise InstallError("自动更新缺少系统依赖，请由管理员先安装：" + ", ".join(missing))
     if missing:
@@ -271,8 +262,24 @@ def _system_dependencies(packages: Sequence[str], run, *, noninteractive: bool =
                 raise InstallError("缺少系统依赖且找不到 sudo（提权工具）：" + ", ".join(missing))
             # 密码提示直接连接终端，不隐藏到安装日志。
             subprocess.run(["sudo", "-v"], check=True)
-        run(prefix + ["apt-get", "update"])
-        run(prefix + ["apt-get", "install", "-y", "--no-install-recommends"] + missing)
+        # 沿用命令执行器的日志与进程组回收，只容许刷新命令的非零退出。
+        with run.log.open("a+", encoding="utf-8") as output:
+            output.seek(0, os.SEEK_END)
+            start = output.tell()
+            try:
+                run(prefix + ["apt-get", "update"])
+            except InstallError:
+                pass
+            output.seek(start)
+            refresh_diagnostic = output.read()
+        # 与特权助手共用刷新后的包名解析，包含发行版的t64映射。
+        missing = dependency_plan(payload)["missing"]
+        if missing:
+            try:
+                run(prefix + ["apt-get", "install", "-y", "--no-install-recommends"] + missing)
+            except InstallError as exc:
+                raise InstallError("系统依赖安装失败（" + "、".join(missing) + "）：" + str(exc)
+                                   + "\n包列表刷新诊断：\n" + refresh_diagnostic) from exc
 
 
 _JETSON_VENDOR_PACKAGES = ("torch", "torchvision")

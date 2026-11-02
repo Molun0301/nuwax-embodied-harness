@@ -153,9 +153,10 @@ def dependency_plan(payload):
 def install_dependencies(payload):
     plan = dependency_plan(payload)
     missing, manager = plan["missing"], plan["manager"]
+    refresh = None
     if missing:
         if manager == "apt-get":
-            run([manager, "update"])
+            refresh = run([manager, "update"], check=False)
             # 空镜像可能尚无包索引；刷新后重新解析t64等实际包名。
             missing = dependency_plan(payload)["missing"]
             if not missing:
@@ -169,7 +170,16 @@ def install_dependencies(payload):
             command = [manager, "--non-interactive", "install", "--no-recommends", "--"]
         else:
             command = [manager, "add", "--no-cache", "--"]
-        run(command + missing)
+        try:
+            run(command + missing)
+        except subprocess.CalledProcessError as exc:
+            # 网页以末行作为失败原因：末行写明装不上的包和刷新失败的源，完整输出在前。
+            refresh_output = refresh.stdout if refresh is not None else ""
+            failed = [line.split(None, 1)[1] for line in refresh_output.splitlines() if line.startswith("Err:") and " " in line]
+            message = refresh_output + "\n" + (exc.stdout or "") + "\n系统依赖安装失败：" + "、".join(missing)
+            if failed:
+                message += "；包列表刷新失败的源：" + "；".join(failed)
+            raise RuntimeError(message) from exc
     return {"installed": missing, "message": "系统依赖检查完成"}
 
 

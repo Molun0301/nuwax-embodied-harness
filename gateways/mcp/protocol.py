@@ -432,20 +432,9 @@ def _resolve_tool_invocation(
 
 def _negotiate_protocol_version(params: Dict[str, Any]) -> str:
     requested_version = str(params.get("protocolVersion") or "").strip()
-    if not requested_version:
-        return _DEFAULT_PROTOCOL_VERSION
     if requested_version in _SUPPORTED_PROTOCOL_VERSIONS:
         return requested_version
-    raise GatewayError(
-        f"不支持的 MCP 协议版本: {requested_version}。",
-        error_code="unsupported_mcp_protocol_version",
-        http_status=400,
-        jsonrpc_code=-32602,
-        details={
-            "requested_protocol_version": requested_version,
-            "supported_protocol_versions": list(_SUPPORTED_PROTOCOL_VERSIONS),
-        },
-    )
+    return _DEFAULT_PROTOCOL_VERSION
 
 
 def _build_initialize_result(runtime: GatewayRuntime, protocol_version: str) -> Dict[str, Any]:

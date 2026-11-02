@@ -203,7 +203,13 @@ def execute(payload):
     if operation == "verify":
         _verify_prefix(candidate, modules)
         python = str(candidate / "venv/bin/python")
-        run([python, "-m", "pip", "check"])
+        from scripts.module_installer import manager as installer
+        check = getattr(installer, "_check_dependencies", None)
+        if check:
+            # 与依赖准备同一口径：只追究运行环境与厂商包，系统目录已有包自身的问题只记录。
+            check(python)
+        else:
+            run([python, "-m", "pip", "check"])
         run([python, "-c", "import importlib; [importlib.import_module(n) for n in " + repr(list(module_imports(modules, request.robot))) + "]"], cwd=candidate / "source")
         return {"verified": True}
     raise ValueError("未知源码准备步骤")

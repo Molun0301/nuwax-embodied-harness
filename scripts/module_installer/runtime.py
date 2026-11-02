@@ -55,6 +55,17 @@ def _config_path(root: Path, value: str) -> Path:
     return path if path.is_absolute() else root / path
 
 
+def _current_release_path(path: Path, root: Path, prefix: Path) -> Path:
+    """沿用旧配置时，其它版本目录内的项目路径改到当前版本；旧版本目录保留期满后会被清理。"""
+    try:
+        parts = path.relative_to(prefix.parent).parts
+    except ValueError:
+        return path
+    if len(parts) > 2 and parts[0] != prefix.name and parts[1] == root.name:
+        return root.joinpath(*parts[2:])
+    return path
+
+
 def read_settings(path: Path) -> dict[str, str]:
     """读取单份设置；安装器不必初始化 core 包及其运行依赖。"""
     return dict(_VALUES.read_env_values(path))
@@ -178,7 +189,7 @@ def write_runtime(
     for key in _ROOT_RELATIVE_PATH_KEYS:
         value = values.get(key, "").strip()
         if value:
-            values[key] = str(_config_path(root, value))
+            values[key] = str(_current_release_path(_config_path(root, value), root, prefix))
     settings_path = prefix / "settings.env"
     binary_dir = prefix / "bin"
     python_bin = prefix / "venv/bin/python"
@@ -196,6 +207,9 @@ def write_runtime(
     geometry = "geometry" in selected
     perception = "perception" in selected
     memory = "memory" in selected
+    # Go2几何建图只从数据面DDS直连读取原始雷达点云；模板默认关闭订阅，首次选择几何模块时打开，已有设置保持用户选择。
+    if robot == "go2" and geometry and "GO2_DIRECT_DDS_POINT_CLOUD_ENABLED" not in existing:
+        values["GO2_DIRECT_DDS_POINT_CLOUD_ENABLED"] = "true"
     # 这些是安装产物与入口身份，不能继承旧安装或调用环境里的位置。
     fixed = {key: str(settings_path) for key in _CONFIG_PATH_KEYS}
     fixed.update({

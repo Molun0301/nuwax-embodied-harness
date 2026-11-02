@@ -274,16 +274,45 @@ def _system_dependencies(packages: Sequence[str], run, *, noninteractive: bool =
         run(prefix + ["apt-get", "install", "-y", "--no-install-recommends"] + missing)
 
 
-def _probe_imports(python: str, names: Sequence[str]) -> bool:
+_JETSON_VENDOR_PACKAGES = ("torch", "torchvision")
+
+
+def jetson_vendor_packages(python: str) -> dict:
+    """定位Jetson厂商torch/torchvision：先查系统目录，再查当前用户目录。
+
+    返回 {"site": 所在用户目录或空串, "versions": {...}}；空串表示位于系统目录。
+    """
+    code = (
+        "import importlib, importlib.metadata as m, json, os, site\n"
+        f"names = {list(_JETSON_VENDOR_PACKAGES)!r}\n"
+        "modules = [importlib.import_module(n) for n in names]\n"
+        "user = os.path.realpath(site.getusersitepackages()) if site.ENABLE_USER_SITE else ''\n"
+        "inside = [bool(user) and os.path.realpath(x.__file__).startswith(user + os.sep) for x in modules]\n"
+        "print(json.dumps({'versions': {n: m.version(n) for n in names}, 'user_site': user, 'inside': inside}))"
+    )
     environment = dict(os.environ)
     environment.pop("PYTHONPATH", None)
     environment.pop("PYTHONHOME", None)
-    environment["PYTHONNOUSERSITE"] = "1"
-    result = subprocess.run(
-        [python, "-c", "import importlib; [importlib.import_module(n) for n in " + repr(list(names)) + "]"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45, check=False, env=environment,
+    reason = ""
+    for user_site in (False, True):
+        if user_site:
+            environment.pop("PYTHONNOUSERSITE", None)
+        else:
+            environment["PYTHONNOUSERSITE"] = "1"
+        result = subprocess.run([python, "-c", code], capture_output=True, text=True, timeout=45, check=False, env=environment)
+        if result.returncode:
+            reason = (result.stderr.strip().splitlines() or ["无法导入"])[-1]
+            continue
+        found = json.loads(result.stdout.strip().splitlines()[-1])
+        if not user_site:
+            return {"site": "", "versions": found["versions"]}
+        if all(found["inside"]):
+            return {"site": found["user_site"], "versions": found["versions"]}
+        reason = "torch与torchvision分别位于系统目录和用户目录，请安装到同一位置"
+    raise InstallError(
+        "检测到 Jetson（嵌入式计算平台）；本地视觉与语义记忆需要与 JetPack（厂商软件栈）匹配的 torch/torchvision（张量与视觉库），"
+        f"{python} 在系统目录和当前用户目录都不能使用：{reason}。请先安装厂商 torch/torchvision，或先安装其它模块。"
     )
-    return result.returncode == 0
 
 
 def _vendor_constraints(python: str, target: Path, names: Sequence[str]) -> None:
@@ -298,18 +327,22 @@ def _vendor_constraints(python: str, target: Path, names: Sequence[str]) -> None
 
 def _python_environment(request: InstallRequest, hardware, prefix: Path, seed: str, run) -> None:
     models = bool(set(request.modules) & {"perception", "memory"})
-    vendor = hardware.is_jetson and models
+    vendor = jetson_vendor_packages(seed) if hardware.is_jetson and models else None
     venv_args = [seed, "-m", "venv"]
-    if vendor:
+    if vendor is not None:
         venv_args.append("--system-site-packages")
     run(venv_args + [str(prefix / "venv")])
     python = str(prefix / "venv/bin/python")
+    if vendor and vendor["site"]:
+        # venv不读用户目录；用.pth把厂商包所在用户目录排在venv之后、系统目录之前，与普通解释器的搜索顺序一致。
+        purelib = subprocess.check_output([python, "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"], text=True).strip()
+        atomic_write(Path(purelib) / "nuwax-jetson-vendor.pth", (vendor["site"] + "\n").encode("utf-8"), mode=0o644)
     pip = [python, "-m", "pip", "install"]
     tools = ["pip==25.0.1", "setuptools==75.3.2", "wheel==0.45.1"] if request.robot == "go2" else ["pip", "setuptools", "wheel"]
     run(pip + ["--upgrade"] + tools)
     constraints = prefix / "constraints.txt"
     if models:
-        if not vendor:
+        if vendor is None:
             torch_args = ["torch", "torchvision"]
             if not hardware.nvidia_gpu:
                 torch_args += ["--index-url", "https://download.pytorch.org/whl/cpu"]
@@ -406,9 +439,8 @@ def check_prerequisites(request: InstallRequest, hardware, *, system_packages_ma
     if not ancestor.is_dir() or not os.access(ancestor, os.W_OK | os.X_OK):
         raise InstallError(f"安装位置不可写：{request.home}；请用 --install-dir 选择当前用户可写的目录。")
     seed = choose_python(request.python)
-    models = bool(set(request.modules) & {"perception", "memory"})
-    if hardware.is_jetson and models and not _probe_imports(seed, ("torch", "torchvision")):
-        raise InstallError("检测到 Jetson（嵌入式计算平台）；本地模型需要已安装且可导入的厂商 torch/torchvision（张量与视觉库）。可先安装其它模块。")
+    if hardware.is_jetson and set(request.modules) & {"perception", "memory"}:
+        jetson_vendor_packages(seed)
     if request.robot == "go2" and request.wheel_dir is not None:
         for name in ("unitree_sdk2py", "cyclonedds"):
             wheels = list(request.wheel_dir.glob(name + "-*.whl")) if request.wheel_dir else []

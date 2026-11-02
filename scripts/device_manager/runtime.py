@@ -162,8 +162,12 @@ def probe(prefix, operation, **kwargs):
 def system_helper(action, payload=None):
     if not Path("/usr/local/libexec/neh-system-helper").is_file():
         raise ManagerError("system_setup_required", "系统依赖准备入口尚未安装，请由设备管理员完成引导器的系统集成步骤。", 409)
+    environment = None
+    if os.environ.get("NEH_MANAGER_WORKER_HOME"):
+        # 助手失败输出（如包管理器报错）与其它受管步骤一样落盘并进入诊断。
+        environment = dict(os.environ, NEH_MANAGER_LOG_DIR=str(Path(os.environ["NEH_MANAGER_WORKER_HOME"]) / "logs"))
     return run_command(["sudo", "-n", "/usr/local/libexec/neh-system-helper", action],
-                       payload=json.dumps(payload or {}), timeout=1800)
+                       environment=environment, payload=json.dumps(payload or {}), timeout=1800)
 
 
 class Runtime:

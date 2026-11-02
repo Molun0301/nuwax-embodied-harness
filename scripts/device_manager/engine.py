@@ -504,6 +504,13 @@ class Engine:
                 if plan["_migration"]["running"] and not request.get("stop_running"):
                     blockers.append("迁入源正在运行，请明确允许停止原拥有方。")
                 plan["requires_stop"] = plan["requires_stop"] or plan["_migration"]["running"]
+            if hardware["hardware"].get("is_jetson") and set(plan["modules"]) & {"perception", "memory"}:
+                # 与源码构建前置检查使用同一探测，生成计划时就给出原因。
+                from scripts.module_installer.manager import InstallError, jetson_vendor_packages
+                try:
+                    jetson_vendor_packages(sys.executable)
+                except InstallError as exc:
+                    blockers.append(str(exc))
             if not local_catalog and settings["source_mode"] == "git":
                 self._plan_source(plan, request, local_request)
             else:

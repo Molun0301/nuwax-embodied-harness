@@ -58,8 +58,14 @@ def _dependency_inputs(request, hardware, seed):
     identity = subprocess.check_output([seed, "-c", "import sys,sysconfig,json; print(json.dumps({'python':list(sys.version_info[:3]),'platform':sysconfig.get_platform()}))"], text=True)
     vendor = {}
     if hardware.is_jetson and set(request.modules) & {"perception", "memory"}:
-        code = "import importlib.metadata as m,json; print(json.dumps({name:m.version(name) for name in ('torch','torchvision')}))"
-        vendor = json.loads(subprocess.check_output([seed, "-c", code], text=True))
+        locate = getattr(manager, "jetson_vendor_packages", None)
+        if locate:
+            # 用户目录中的厂商包同样可用；位置写入输入，位置变化时不复用旧环境。
+            found = locate(seed)
+            vendor = dict(found["versions"], **({"site": found["site"]} if found["site"] else {}))
+        else:
+            code = "import importlib.metadata as m,json; print(json.dumps({name:m.version(name) for name in ('torch','torchvision')}))"
+            vendor = json.loads(subprocess.check_output([seed, "-c", code], text=True))
     # The selected source owns dependency semantics, not the installed bridge.
     return {"schema": 2, "recipe_version": getattr(manager, "DEPENDENCY_RECIPE_VERSION", 0), "files": records, "robot": request.robot, "interpreter": str(interpreter),
             "interpreter_size": interpreter.stat().st_size, "interpreter_mtime_ns": interpreter.stat().st_mtime_ns,

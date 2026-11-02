@@ -65,6 +65,28 @@
     if (el) el.className = className;
   }
 
+  // 失败说明后附服务端已脱敏诊断的最后一行，直接显示实际原因。
+  function jobErrorText(error) {
+    if (!error) return '';
+    if (typeof error === 'string') return error;
+    const message = error.message || JSON.stringify(error);
+    const diagnostic = error.details && typeof error.details.diagnostic === 'string' ? error.details.diagnostic : '';
+    let lines = diagnostic.split('\n').map(function (line) { return line.trim(); }).filter(Boolean);
+    let reason = lines.length ? lines[lines.length - 1] : '';
+    try {
+      // 系统助手以一行JSON报告错误，取其中包管理器输出的最后一行。
+      const parsed = JSON.parse(reason);
+      if (parsed && typeof parsed.error === 'string') {
+        lines = parsed.error.split('\n').map(function (line) { return line.trim(); }).filter(Boolean);
+        reason = lines.length ? lines[lines.length - 1] : '';
+      }
+    } catch (ignored) {
+      // 普通文本诊断直接使用。
+    }
+    reason = reason.replace(/^[\w.]+(?:Error|Exception):\s*/, '');
+    return reason ? message + ' 原因：' + reason : message;
+  }
+
   function robotLabel(key) {
     return (state.robotLabels || {})[key] || key || '--';
   }
@@ -967,7 +989,7 @@
     }).join('') + '</div>');
 
     if (job.error) {
-      const errText = typeof job.error === 'string' ? job.error : (job.error.message || JSON.stringify(job.error));
+      const errText = jobErrorText(job.error);
       parts.push('<div class="error-message">' + escapeHtml(errText) + '</div>');
     }
 
@@ -1426,7 +1448,7 @@
     if (robotOptions.length) {
       robotSelect.innerHTML = robotOptions.map(function (key) {
         const label = (state.robotLabels && state.robotLabels[key]) || key;
-        return '<option value=”' + escapeHtml(key) + '”' + (key === state.robot ? ' selected' : '') + '>' + escapeHtml(label) + '</option>';
+        return '<option value="' + escapeHtml(key) + '"' + (key === state.robot ? ' selected' : '') + '>' + escapeHtml(label) + '</option>';
       }).join('');
       show(robotRow, true);
     } else {
@@ -1715,9 +1737,7 @@
       show($('retrySetup'), true);
       show($('cancelInstall'), false);
     } else {
-      const errText = job.error
-        ? (typeof job.error === 'string' ? job.error : (job.error.message || JSON.stringify(job.error)))
-        : '任务未完成。';
+      const errText = job.error ? jobErrorText(job.error) : '任务未完成。';
       setClass(result, 'result-card error');
       result.innerHTML =
         '<h3>' + escapeHtml(jobStatusText(job.status)) + '</h3>' +
@@ -2135,9 +2155,7 @@
         }
 
         if (job.status !== 'running' && job.status !== 'queued') {
-          const errText = job.error
-            ? (typeof job.error === 'string' ? job.error : (job.error.message || JSON.stringify(job.error)))
-            : '任务未完成。';
+          const errText = job.error ? jobErrorText(job.error) : '任务未完成。';
           failure('管理程序更新未完成：' + errText);
         }
       } catch (error) {

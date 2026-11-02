@@ -11,6 +11,7 @@ import os
 import struct
 import tempfile
 import unittest
+import pytest
 from contextlib import ExitStack
 from copy import deepcopy
 from pathlib import Path
@@ -21,6 +22,7 @@ from tests.conftest import LostReply
 from tests.test_assigned_asset_storage import LEGACY_BUNDLE, LEGACY_MANIFEST, LEGACY_SHA, MAP_NAME, bundle_fixture, write
 from tests.test_assigned_workspace_activation import MemoryEndpoint, WorkspaceNativeStub
 from tests.conftest import TransferStub, response_fixture
+from tests.unit.test_scene_mapping_service import setup, remember
 
 from contracts.geometry import Pose
 from contracts.map_workspace import AssetIdentityV2, MapAssetBundle, MapAssetStatus
@@ -157,6 +159,209 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
 
     def save(self):
         return self.service.finalize_active_map(map_name=MAP_NAME, reason="paired save acceptance")
+
+    def ingest_live_receipt(self):
+        """生产快照有严格凭据；导出检查点可晚于捕获快照一个修订。"""
+        from services.mapping.service import _receipt_source_epoch
+        receipt = self.stub.response.occupancy_receipt
+        provenance = {"schema_version": 2, "commit_id": {
+            "boot_nonce": receipt.commit_id.boot_nonce.hex(), "sequence": receipt.commit_id.sequence},
+            "session_id": receipt.session_id, "session_generation": receipt.session_generation,
+            "occupancy_revision": receipt.occupancy_revision - 1,
+            "source_timestamp_ns": receipt.source_timestamp_ns, "backend_kind": receipt.backend_kind,
+            "backend_generation": receipt.backend_generation, "frame_id": "map"}
+        identity = {"kind": "committed_occupancy", "representation": "effective", "provenance": provenance}
+        self.mapping.ingest_external_snapshot(map_name=MAP_NAME, source_name="live-fixture",
+            source_epoch=_receipt_source_epoch(identity), occupancy_grid=bundle_fixture().snapshot.occupancy_grid,
+            metadata={"content_identity": identity, "source_kind": "platform_live_map_provider",
+                      "mapping_session_id": receipt.session_id, "session_generation": receipt.session_generation})
+
+    def test_live_receipt_save_then_activate_keeps_checkpoint_source_separate(self):
+        self.ingest_live_receipt()
+        saved = self.save()
+        workspace = self.service.activate_map(map_name=MAP_NAME)
+        self.assertTrue(workspace.map_loaded)
+        self.assertNotIn("content_identity", saved.snapshot.metadata)
+        self.assertEqual(saved.snapshot.metadata["source_occupancy_receipt"]["occupancy_revision"], 6)
+        self.assertNotEqual(workspace.active_localization_session.session_id, "source")
+        self.assertIsNone(self.service._repository.get_map_activation())
+        self.assertFalse(self.runtime.is_map_asset_activation_recovery_pending())
+
+    def test_historical_contaminated_asset_loads_and_new_live_generation_remains_strict(self):
+        from tests.test_map_receipt_stream_v2 import update
+        self.ingest_live_receipt()
+        captured_metadata = dict(self.mapping.get_latest_snapshot().metadata)
+        prepare = self.runtime.prepare_map_asset_bundle
+        def historical_prepare(bundle, **kwargs):
+            prepared = prepare(bundle, **kwargs)
+            # 模拟旧版本已定稿资产：检查点栅格仍携捕获时的实时凭据。
+            prepared.snapshot.metadata.update(captured_metadata)
+            return prepared
+        with patch.object(self.runtime, "prepare_map_asset_bundle", historical_prepare):
+            saved = self.save()
+        before = (self.service._asset_repository.current_directory(MAP_NAME) / "manifest.json").read_bytes()
+        workspace = self.service.activate_map(map_name=MAP_NAME)
+        self.assertTrue(workspace.map_loaded)
+        self.runtime.describe_backend = lambda: {}
+        self.runtime.get_live_mapping_diagnostics = lambda **kwargs: {}
+        with patch.object(self.provider, "get_occupancy_grid", return_value=None), \
+                patch.object(self.provider, "get_cost_map", return_value=None):
+            offline = self.runtime.get_map_snapshot()
+        self.mapping.ingest_external_snapshot(map_name=MAP_NAME, source_name=offline.source_name,
+            source_epoch=offline.source_epoch, occupancy_grid=offline.occupancy_grid,
+            metadata=offline.metadata, update_sequence_override=offline.update_sequence)
+        live = update(revision=3295, sequence=3296, timestamp=11, nonce=b"Z" * 16)
+        live.map_name = MAP_NAME
+        live.session_id = self.stub.state.session_id
+        live.session_generation = self.stub.state.session_generation
+        live.occupancy_receipt.session_id = live.session_id
+        live.occupancy_receipt.session_generation = live.session_generation
+        live.occupancy_receipt.backend_generation = self.stub.state.backend_generation
+        payload = self.provider._map_update_to_payload(live)
+        self.mapping._handle_provider_map_update(self.runtime._attach_active_map_bundle_to_live_map_payload(payload))
+        current = self.mapping.get_latest_snapshot()
+        self.assertEqual(current.metadata["content_revision"], 3295)
+        self.assertEqual(current.metadata["session_generation"], live.session_generation)
+        self.assertEqual(current.metadata["session_id"], live.session_id)
+        self.assertIsNotNone(self.service.get_active_workspace(refresh_localization=False))
+        pulled = self.runtime.get_map_snapshot()
+        self.assertEqual(pulled.metadata["mapping_session_id"], live.session_id)
+        self.assertEqual(pulled.metadata["session_id"], live.session_id)
+        self.mapping.ingest_external_snapshot(map_name=MAP_NAME, source_name=pulled.source_name,
+            source_epoch=pulled.source_epoch, occupancy_grid=pulled.occupancy_grid,
+            metadata=pulled.metadata, update_sequence_override=pulled.update_sequence)
+        self.assertIsNotNone(self.service.get_active_workspace(refresh_localization=False))
+        self.assertEqual(offline.metadata["source_occupancy_receipt"]["occupancy_revision"], 6)
+        self.assertEqual((self.service._asset_repository.current_directory(MAP_NAME) / "manifest.json").read_bytes(), before)
+        wrong = {**current.metadata, "session_generation": 3}
+        with self.assertRaises(GatewayError) as rejected:
+            self.mapping.ingest_external_snapshot(map_name=MAP_NAME, source_name=current.source_name,
+                source_epoch=current.source_epoch, occupancy_grid=current.occupancy_grid, metadata=wrong)
+        self.assertEqual(rejected.exception.error_code, "map_snapshot_receipt_mismatch")
+
+    def test_failed_map_publication_recovers_through_public_activation_without_reinstall(self):
+        self.ingest_live_receipt()
+        saved = self.save()
+        with patch.object(self.mapping, "ingest_external_snapshot", side_effect=RuntimeError("发布失败")):
+            with self.assertRaises(GatewayError):
+                self.service.activate_map(map_name=MAP_NAME)
+        pending = self.service._repository.get_map_activation()
+        self.assertTrue(self.runtime.is_map_asset_activation_recovery_pending())
+        workspace = self.service.activate_map(map_name=MAP_NAME)
+        self.assertTrue(workspace.map_loaded)
+        self.assertEqual(workspace.map_asset.asset_identity, saved.asset_identity)
+        self.assertEqual(workspace.active_localization_session.activation_receipt_v2.to_dict()["request"],
+                         pending["activation_request"])
+        self.assertEqual(self.stub.installs, 1)
+        self.assertIsNone(self.service._repository.get_map_activation())
+        self.assertFalse(self.runtime.is_map_asset_activation_recovery_pending())
+
+    def save_as_associations(self):
+        from contracts.forbidden_zones import ForbiddenZone, ForbiddenZonePoint
+        from services.navigation.forbidden_zones import ForbiddenZoneStore
+        libraries = {MAP_NAME}
+        self.memory.has_memory_library = lambda name: name in libraries
+        def rename(**kwargs):
+            libraries.remove(kwargs["library_name"])
+            libraries.add(kwargs["new_library_name"])
+        self.memory.rename_memory_library = rename
+        zones = ForbiddenZoneStore(self.root / "禁行区.json")
+        zones.replace(map_name=MAP_NAME, zones=[ForbiddenZone(id="入口禁区", shape="circle",
+            center=ForbiddenZonePoint(x=1, y=2), radius_m=.5)])
+        self.navigation.list_forbidden_zones = lambda **kw: zones.list_for_map(kw["map_name"])
+        self.navigation.replace_forbidden_zones = zones.replace
+        self.navigation.delete_forbidden_zones_for_map = lambda **kw: zones.delete_for_map(kw["map_name"])
+        return libraries, zones
+
+    def test_save_current_mapping_as_new_name_migrates_associations_and_reopens(self):
+        self.ingest_live_receipt()
+        libraries, zones = self.save_as_associations()
+        saved = self.service.finalize_active_map(map_name="新办公室")
+        self.assertEqual(saved.map_name, "新办公室")
+        self.assertEqual(saved.snapshot.map_name, "新办公室")
+        self.assertEqual(saved.snapshot.occupancy_grid.map_id, "新办公室")
+        self.assertEqual(saved.geometry_asset.map_name, "新办公室")
+        self.assertEqual(libraries, {"新办公室"})
+        self.assertEqual(zones.load().maps["新办公室"].zones[0].id, "入口禁区")
+        self.assertNotIn(MAP_NAME, zones.load().maps)
+        self.assertIsNone(self.service._repository.get_map_asset(MAP_NAME))
+        self.assertFalse(self.service._asset_repository.current_directory(MAP_NAME).parent.exists())
+        workspace = self.service.activate_map(map_name="新办公室")
+        self.assertEqual(workspace.map_asset.asset_identity, saved.asset_identity)
+        self.assertEqual(workspace.active_localization_session.map_name, "新办公室")
+        self.assertEqual(self.stub.installs, 1)
+
+    def test_save_as_activation_failure_resumes_migration_via_public_activate(self):
+        self.ingest_live_receipt()
+        libraries, zones = self.save_as_associations()
+        self.stub.error = LostReply()
+        with self.assertRaises(GatewayError):
+            self.service.finalize_active_map(map_name="新办公室")
+        self.assertIsNotNone(self.service._repository.get_map_asset(MAP_NAME))
+        self.assertEqual(libraries, {"新办公室"})
+        self.stub.error = None
+        workspace = self.service.activate_map(map_name="新办公室")
+        self.assertTrue(workspace.map_loaded)
+        self.assertEqual(self.stub.installs, 1)
+        self.assertIsNone(self.service._repository.get_map_asset(MAP_NAME))
+        self.assertNotIn(MAP_NAME, zones.load().maps)
+        self.assertIsNone(self.service._repository.get_map_activation())
+        self.assertFalse(self.runtime.is_map_asset_activation_recovery_pending())
+
+    def test_save_as_existing_map_rejects_without_export_and_keeps_active_session(self):
+        self.memory.has_memory_library = lambda name: False
+        self.service.create_map(map_name="已有地图")
+        with self.assertRaises(GatewayError):
+            self.service.finalize_active_map(map_name="已有地图")
+        self.assertEqual(self.stub.exports, [])
+        self.assertTrue(self.stub.state.active)
+        self.assertEqual(self.service._repository.get_active_map_name(), MAP_NAME)
+
+    def test_finalized_source_save_as_preserves_current_memory_and_zones(self):
+        from contracts.memory import SemanticMemoryEntry
+        from contracts.naming import build_memory_id
+        from services.memory.service import MemoryService
+        self.ingest_live_receipt()
+        _, zones = self.save_as_associations()
+        memory = MemoryService(localization_service=self.localization, mapping_service=self.mapping,
+            observation_service=SimpleNamespace(), perception_service=SimpleNamespace(), state_store=self.store,
+            memory_db_path=str(self.root / "记忆.sqlite"),
+            text_embedding_model="disabled", image_embedding_model="disabled")
+        self.addCleanup(lambda: self.assertTrue(memory.close()))
+        self.service._memory_service = memory
+        memory.activate_memory_library(library_name=MAP_NAME)
+        memory._repository.upsert_semantic_memory(SemanticMemoryEntry(memory_id=build_memory_id("note"),
+            title="原地图记忆", summary="入口有办公桌", map_name=MAP_NAME,
+            metadata={"memory_library_name": MAP_NAME}))
+        original = self.save()
+        current = self.service._asset_repository.current_directory(MAP_NAME)
+        inode = current.stat().st_ino
+        files = {str(path.relative_to(current)): path.read_bytes() for path in current.rglob("*") if path.is_file()}
+        original_records = memory._repository.load_semantic_memories(library_name=MAP_NAME)
+        original_library = memory._repository.load_memory_libraries()[0]
+        original_zones = zones.load().maps[MAP_NAME]
+        # 每次原生导出重新登记传输制品；首轮保存已释放旧传输引用。
+        self.stub.entries = TransferStub(self.stub.response).entries
+
+        saved = self.service.finalize_active_map(map_name="新办公室2")
+
+        self.assertEqual(current.stat().st_ino, inode)
+        self.assertEqual({str(path.relative_to(current)): path.read_bytes()
+            for path in current.rglob("*") if path.is_file()}, files)
+        self.assertEqual(self.service._repository.get_map_asset(MAP_NAME).asset_identity, original.asset_identity)
+        self.assertNotEqual(saved.asset_identity, original.asset_identity)
+        self.assertEqual(self.stub.exports, [b"", b""])
+        self.assertEqual(memory._repository.load_semantic_memories(library_name=MAP_NAME), original_records)
+        self.assertIn(original_library, memory._repository.load_memory_libraries())
+        self.assertTrue(memory.has_memory_library("新办公室2"))
+        for kind in memory._repository._LIBRARY_NAME_TABLES:
+            self.assertEqual(getattr(memory._repository, "load_" + kind)(library_name="新办公室2"), [])
+        self.assertEqual(zones.load().maps[MAP_NAME], original_zones)
+        self.assertEqual(zones.load().maps["新办公室2"].zones, original_zones.zones)
+        self.assertNotIn("save_as_source_map", self.service._repository.get_map_asset("新办公室2").metadata)
+        workspace = self.service.activate_map(map_name="新办公室2")
+        self.assertTrue(workspace.map_loaded)
+        self.assertEqual(workspace.map_asset.asset_identity, saved.asset_identity)
 
     def assert_unlocked(self, operation):
         for name in ("_runtime_state_lock", "_mapping_lifecycle_lock", "_provider_attach_lock"):
@@ -719,6 +924,62 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
         self.assertEqual({relative: (current / relative).read_bytes() for relative in files}, files)
         self.assertEqual(self.stub.exports, [])
         self.assertEqual(self.stub.calls, [])
+
+
+def test_mapping_rename_preserves_records_and_index_incarnation(setup):
+    holder, memory, _, scene_service = setup
+    location, _ = memory.tag_location("入口", attach_latest_observation=False,
+        attach_latest_perception=False, auto_create_memory=False)
+    for x in (2, 3):
+        remember(memory, holder, x)
+    scene_service.run_once()
+    repository = memory._repository
+    from contracts.base import utc_now
+    from contracts.naming import build_anchor_id, build_instance_id, build_observation_event_id
+    from contracts.spatial_memory import (SemanticInstance, ObservationEvent, NavigationTrajectoryEvent,
+        SemanticGraphRelation, SemanticSummaryNode)
+    now = utc_now()
+    scope = {"map_name": "lab", "metadata": {"memory_library_name": "lab"}}
+    repository.upsert_semantic_instance(SemanticInstance(instance_id=build_instance_id("desk"),
+        anchor_id=build_anchor_id("desk"), label="desk", pose=Pose(frame_id="map"),
+        first_seen_ts=now, last_seen_ts=now, **scope))
+    repository.upsert_observation_event(ObservationEvent(event_id=build_observation_event_id("front"),
+        title="入口观察", summary="可见办公桌", **scope))
+    repository.upsert_navigation_trajectory_event(NavigationTrajectoryEvent(
+        trajectory_event_id="nte_visit_0123456789ab", event_kind="visited_pose", **scope))
+    repository.upsert_semantic_graph_relation(SemanticGraphRelation(relation_id="办公关系", relation_kind="nearby",
+        source_node_kind="location", source_node_id=location.location_id,
+        target_node_kind="location", target_node_id=location.location_id, **scope))
+    repository.upsert_semantic_summary_node(SemanticSummaryNode(summary_id="办公室摘要", summary_kind="region",
+        title="办公区", summary="入口连接办公桌", **scope))
+    kinds = repository._LIBRARY_NAME_TABLES
+    before = {kind: getattr(repository, "load_" + kind)(library_name="lab") for kind in kinds}
+    identity = memory._durable_index.library_identity("lab")
+    memory.rename_memory_library(library_name="lab", new_library_name="新办公室")
+    assert memory.get_active_library_name() == "新办公室"
+    assert not memory.has_memory_library("lab")
+    assert memory._durable_index.library_identity("新办公室") == identity
+    for kind in kinds:
+        records = getattr(repository, "load_" + kind)(library_name="新办公室")
+        assert len(records) == len(before[kind]) and records
+        assert getattr(repository, "load_" + kind)(library_name="lab") == []
+        assert all(row.map_name == "新办公室" and row.metadata["memory_library_name"] == "新办公室"
+                   for row in records)
+    with repository.storage.read_snapshot() as tx:
+        rows = tx.execute("SELECT library_name,external_id FROM memory_index_sources").fetchall()
+    assert rows and all(row["library_name"] == "新办公室" for row in rows)
+    assert location.location_id in {row["external_id"] for row in rows}
+    memory.disable_memory_library()
+    memory.activate_memory_library(library_name="新办公室")
+    assert repository.load_tagged_locations(library_name="新办公室")[0].location_id == location.location_id
+
+
+def test_mapping_rename_conflict_keeps_original_active_library(setup):
+    _, memory, _, _ = setup
+    memory.ensure_memory_library(library_name="已有库")
+    with pytest.raises(GatewayError, match="目标记忆库已存在"):
+        memory.rename_memory_library(library_name="lab", new_library_name="已有库")
+    assert memory.get_active_library_name() == "lab"
 
 
 if __name__ == "__main__":

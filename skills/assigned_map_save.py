@@ -109,20 +109,24 @@ def reconcile_assigned_current(owner, asset, bundle, *, captured, reason=None, m
 
 
 def finalize_assigned_cloud_map(owner, asset, *, context, reason, metadata, georeference,
-                                save_operation_id=None, expected_previous_identity=None):
+                                save_operation_id=None, expected_previous_identity=None,
+                                source_asset=None):
     name = asset.map_name
+    source_asset = source_asset or asset
+    source_name = source_asset.map_name
     metadata = dict(owner._sanitize_map_metadata(metadata) or {})
     metadata.pop("save_operation_id", None)  # 仅私有逻辑保存入口可写入该关联字段。
     captured = catalog_owner(owner, asset)
+    source_captured = captured if source_asset is asset else catalog_owner(owner, source_asset)
     if asset.finalized and expected_previous_identity != asset.asset_identity:
         raise _problem("地图元数据标记为 finalized，但 current 资产包不存在。", "map_asset_bundle_missing")
-    if context.get("active") is not True or context.get("map_name") != name:
+    if context.get("active") is not True or context.get("map_name") != source_name:
         raise _problem("分配式保存要求目标地图的活动原生建图会话。")
     if georeference is not None and not isinstance(georeference, MapGeoreferenceV1):
         raise GatewayError("地图地理参考必须使用 MapGeoreferenceV1 强类型合同。",
             error_code="invalid_params", http_status=422, jsonrpc_code=-32602)
     coherent = owner._read_coherent_active_map_snapshot()
-    if coherent is None or coherent[0] != name:
+    if coherent is None or coherent[0] != source_name:
         raise _problem("当前没有属于激活地图的可发布地图快照。", "map_snapshot_unavailable")
     snapshot = coherent[1]
     frame = owner._resolve_map_frame_id(snapshot)
@@ -136,6 +140,11 @@ def finalize_assigned_cloud_map(owner, asset, *, context, reason, metadata, geor
     snapshot_metadata["map_name"] = name
     values = {key: getattr(snapshot, key) for key in type(snapshot).model_fields}
     values["metadata"] = snapshot_metadata
+    values["map_name"] = name
+    if source_name != name:
+        for layer in ("occupancy_grid", "cost_map", "semantic_map"):
+            if values[layer] is not None:
+                values[layer] = values[layer].model_copy(update={"map_id": name})
     draft = MapAssetBundle(map_name=name, source_name=snapshot.source_name, frame_id=frame,
         snapshot=MapSnapshot(**values),
         georeference=MapGeoreferenceBindingV1(contract=georeference) if georeference is not None else None,
@@ -148,11 +157,14 @@ def finalize_assigned_cloud_map(owner, asset, *, context, reason, metadata, geor
     staging = owner._asset_repository.create_staging_directory(name)
     try:
         prepared = owner._geometry_runtime.prepare_map_asset_bundle(
-            draft, bundle_root=staging)
+            draft, bundle_root=staging,
+            **({"source_map_name": source_name} if source_name != name else {}))
         with owner._repository.map_activation_guard():
             require_catalog_owner(owner, asset, captured)
+            if source_asset is not asset:
+                require_catalog_owner(owner, source_asset, source_captured)
             owner._require_no_map_activation_recovery("finalize_active_map")
-            if owner._repository.get_active_map_name() != name:
+            if owner._repository.get_active_map_name() != source_name:
                 raise _problem("保存准备期间活动地图已改变。", "map_asset_owner_changed")
         # 所有内容更新先完成；分配后的候选不可修改或重新生成身份。
         identity = AssetIdentityV2(asset_id=uuid.uuid4().hex)
@@ -200,3 +212,67 @@ def finalize_assigned_cloud_map(owner, asset, *, context, reason, metadata, geor
         owner._state_store.discard_if_value(StateNamespace.MAP, f"asset:{name}", committed)
         raise
     return finalized
+
+
+def save_current_mapping_as(owner, source_asset, name, *, reason, metadata, georeference, save_operation_id):
+    """以新名封存当前会话；未定稿来源改名，已定稿来源保留原资产和记忆。"""
+    from contracts.map_workspace import MapAsset
+    if owner._repository.get_map_asset(name) is not None or owner._memory_service.has_memory_library(name):
+        raise _problem(f"地图或记忆库 {name} 已存在，不能覆盖。", "map_already_exists")
+    asset_metadata = dict(source_asset.metadata)
+    if not source_asset.finalized:
+        asset_metadata.update({
+            "save_as_source_map": source_asset.map_name,
+            "save_as_source_created_at": source_asset.created_at.isoformat()})
+    asset = MapAsset(map_name=name, display_name=name, bound_memory_library_name=name,
+        frame_id=source_asset.frame_id, metadata=asset_metadata)
+    owner._repository.save_map_asset(asset)
+    captured = catalog_owner(owner, asset)
+    try:
+        bundle = finalize_assigned_cloud_map(owner, asset,
+            context=owner._geometry_runtime.get_mapping_session_context(), source_asset=source_asset,
+            reason=reason, metadata=metadata, georeference=georeference,
+            save_operation_id=save_operation_id)
+    except BaseException:
+        # 已发布的 current 继续归其资产拥有方；只清理未发布的新目录。
+        with owner._repository.map_activation_guard():
+            current = owner._repository.get_map_asset(name)
+            if (current is not None and catalog_owner(owner, current) == captured
+                    and not owner._asset_repository.current_directory(name).exists()):
+                owner._repository.delete_map_asset(name)
+        raise
+    if source_asset.finalized:
+        zones = owner._navigation_service.list_forbidden_zones(map_name=source_asset.map_name)
+        entry = zones.maps[source_asset.map_name]
+        if entry.zones:
+            owner._navigation_service.replace_forbidden_zones(map_name=name, zones=entry.zones)
+    owner.activate_map(map_name=name)
+    return bundle
+
+
+def reconcile_saved_map_name(owner, asset, *, completed=False):
+    """另存后的公开激活继续收敛关联数据，失败时保留原名称迁移标记。"""
+    source_name = asset.metadata.get("save_as_source_map")
+    if source_name is None:
+        return
+    source = owner._repository.get_map_asset(source_name)
+    if source is not None and source.created_at.isoformat() != asset.metadata["save_as_source_created_at"]:
+        raise _problem("另存来源目录拥有方已改变。", "map_asset_owner_changed")
+    if not completed:
+        if owner._memory_service.has_memory_library(source_name):
+            owner._memory_service.rename_memory_library(library_name=source_name, new_library_name=asset.map_name)
+        zones = owner._navigation_service.list_forbidden_zones(map_name=source_name)
+        entry = zones.maps[source_name]
+        if entry.zones:
+            owner._navigation_service.replace_forbidden_zones(map_name=asset.map_name, zones=entry.zones)
+        return
+    owner._navigation_service.delete_forbidden_zones_for_map(map_name=source_name)
+    owner._repository.delete_map_asset(source_name)
+    key = f"asset:{source_name}"
+    cached = owner._state_store.read(StateNamespace.MAP, key)
+    if cached is not None:
+        owner._state_store.discard_if_value(StateNamespace.MAP, key, cached.value)
+    metadata = dict(asset.metadata)
+    metadata.pop("save_as_source_map")
+    metadata.pop("save_as_source_created_at")
+    owner._repository.save_map_asset(asset.model_copy(update={"metadata": metadata}))

@@ -2954,6 +2954,7 @@ class GatewayRuntime:
                 "activate_map",
                 "启用地图",
                 "选择并启用地图工作区与同名记忆库；若地图已完成，则加载其唯一的 current 资产包。"
+                "激活失败后再次以相同地图名调用，可继续原请求的恢复对账。"
                 "不启动建图或探索。本能力为异步任务，立即返回 task_id。",
                 execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.LOW,
@@ -2996,7 +2997,11 @@ class GatewayRuntime:
             _descriptor(
                 "finalize_active_map",
                 "完成当前地图",
-                "将当前建图结果原子发布为该地图唯一的 current 资产包。本地地图可省略地理参考；已完成地图不可被不同内容覆盖。",
+                "将当前建图结果原子发布为该地图唯一的 current 资产包。map_name 可直接指定新名称，无需先切工作区；"
+                "来源未定稿时按改名处理，迁移记忆和禁行区并清理原名称；来源已定稿时保留原地图、记忆库和禁行区，"
+                "新图保存本次几何并复制禁行区，新名称记忆库从空开始。"
+                "另存会收敛原建图会话并激活新地图，随后可 start_mapping 继续建图。"
+                "目标已存在则拒绝覆盖。本地地图可省略地理参考。",
                 execution_mode=CapabilityExecutionMode.SYNC,
                 risk_level=CapabilityRiskLevel.LOW,
                 input_schema=_schema_object(
@@ -4112,8 +4117,10 @@ class GatewayRuntime:
                 name="finalize_active_map",
                 display_name="完成当前地图",
                 description=(
-                    "将当前激活地图工作区原子发布为唯一的 current 资产包。"
-                    "已完成地图不可被不同内容覆盖。"
+                    "将当前建图结果原子发布为唯一的 current 资产包；map_name 可直接指定新名称，无需先切工作区。"
+                    "来源未定稿时迁移记忆和禁行区并清理原名称；来源已定稿时保留原地图、记忆库和禁行区，"
+                    "新图保存本次几何并复制禁行区，新名称记忆库从空开始。"
+                    "另存停止原建图会话后激活新地图；目标已存在则拒绝覆盖。"
                 ),
                 category=SkillCategory.MEMORY,
                 capability_name="finalize_active_map",

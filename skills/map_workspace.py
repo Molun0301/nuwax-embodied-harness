@@ -291,10 +291,14 @@ class MapWorkspaceService:
                 error_code="map_asset_import_unsupported", http_status=409, details={"map_name": name})
         if bundle is not None:
             from skills.assigned_map_activation import activate_assigned_workspace
-            return activate_assigned_workspace(self, bundle,
+            from skills.assigned_map_save import reconcile_saved_map_name
+            reconcile_saved_map_name(self, asset)
+            workspace = activate_assigned_workspace(self, bundle,
                 _activation_read=loaded if type(loaded) is _AssignedActivationRead else None,
                 load_memory_history=load_memory_history, reset_memory_library=reset_memory_library,
                 metadata=metadata)
+            reconcile_saved_map_name(self, self._repository.get_map_asset(name), completed=True)
+            return workspace
         if asset.finalized:
             raise GatewayError("已定稿地图缺少可加载的资产包。",
                 error_code="map_asset_bundle_not_found", http_status=409, details={"map_name": name})
@@ -723,8 +727,13 @@ class MapWorkspaceService:
         active = self._repository.get_active_map_name()
         name = self._require_map_name(map_name or active or "")
         if name != active:
-            raise GatewayError("完成地图前必须先激活目标地图工作区：%s" % name,
-                error_code="map_not_activated", http_status=409, jsonrpc_code=-32000)
+            from skills.assigned_map_save import save_current_mapping_as
+            source = self._repository.get_map_asset(active) if active else None
+            if source is None:
+                raise GatewayError("当前没有活动地图工作区。", error_code="map_not_activated", http_status=409)
+            return save_current_mapping_as(self, source, name,
+                reason=reason, metadata=metadata, georeference=georeference,
+                save_operation_id=_save_operation_id)
         asset = self._repository.get_map_asset(name)
         if asset is None:
             raise GatewayError("未找到地图：%s" % name, error_code="map_not_found", http_status=404)

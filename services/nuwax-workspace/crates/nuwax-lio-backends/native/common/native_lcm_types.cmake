@@ -3,9 +3,30 @@ set(NUWAX_NATIVE_ACK_SCHEMA "${CMAKE_CURRENT_LIST_DIR}/../../../../lcmtypes/nuwa
     CACHE FILEPATH "原生扫描处理回执的权威消息定义")
 function(nuwax_generate_native_lcm_types schema_root)
   find_program(NUWAX_LCM_GEN_EXECUTABLE NAMES lcm-gen)
-  if(NOT NUWAX_LCM_GEN_EXECUTABLE)
+  set(generator "${NUWAX_LCM_GEN_EXECUTABLE}")
+  if(LCM_VERSION)
+    # 生成的C++头文件依赖同版本lcm_coretypes.h：Ubuntu 20.04的LCM 1.3.1头文件不能编译1.5.x生成器的输出。
+    # 安装器构建时PATH最前面是Python环境，其中pip附带的lcm-gen可能与系统库不同版本，因此按库版本挑选；
+    # 用局部变量，旧构建目录缓存的生成器路径版本不符时不再沿用。
+    set(generator "")
+    foreach(candidate IN ITEMS "${LCM_PREFIX}/bin/lcm-gen" "${NUWAX_LCM_GEN_EXECUTABLE}")
+      if(NOT generator AND EXISTS "${candidate}")
+        execute_process(COMMAND "${candidate}" --version
+          OUTPUT_VARIABLE candidate_version OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        if(candidate_version STREQUAL "lcm-gen ${LCM_VERSION}")
+          set(generator "${candidate}")
+        endif()
+      endif()
+    endforeach()
+    if(NOT generator)
+      message(FATAL_ERROR "Native LIO requires lcm-gen ${LCM_VERSION} matching the selected LCM library; "
+        "checked ${LCM_PREFIX}/bin/lcm-gen and ${NUWAX_LCM_GEN_EXECUTABLE}")
+    endif()
+  endif()
+  if(NOT generator)
     message(FATAL_ERROR "Native LIO requires lcm-gen matching the selected LCM library")
   endif()
+  message(STATUS "Native LIO messages use ${generator} for LCM ${LCM_VERSION}")
   set(message_names
     std_msgs_Time std_msgs_Header
     geometry_msgs_Point geometry_msgs_Quaternion geometry_msgs_Vector3
@@ -23,7 +44,7 @@ function(nuwax_generate_native_lcm_types schema_root)
   get_filename_component(native_schema_directory "${NUWAX_NATIVE_ACK_SCHEMA}" DIRECTORY)
   list(APPEND schemas "${NUWAX_NATIVE_ACK_SCHEMA}" "${native_schema_directory}/LioInputFrame.lcm")
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    ${schemas} "${NUWAX_LCM_GEN_EXECUTABLE}")
+    ${schemas} "${generator}")
   set(output_dir "${CMAKE_CURRENT_BINARY_DIR}/nuwax-lcm-types")
   # Generate the complete set before touching consumed headers. Discard only
   # this generator-owned staging directory, including leftovers after failure.
@@ -31,7 +52,7 @@ function(nuwax_generate_native_lcm_types schema_root)
   file(REMOVE_RECURSE "${staging_dir}")
   file(MAKE_DIRECTORY "${staging_dir}")
   execute_process(
-    COMMAND "${NUWAX_LCM_GEN_EXECUTABLE}" --cpp --cpp-hpath "${staging_dir}" ${schemas}
+    COMMAND "${generator}" --cpp --cpp-hpath "${staging_dir}" ${schemas}
     RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
   if(NOT result EQUAL 0)
     message(FATAL_ERROR "Native LIO message generation failed: ${output}${error}")

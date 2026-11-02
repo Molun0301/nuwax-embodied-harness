@@ -146,8 +146,11 @@ wait_for_motion_guard_transport() {
 
 wait_for_geometry_runtime_ready() {
   local ready_file="${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-${REPO_ROOT}/runtime_data/geometry/nuwax_geometry_runtime.ready}"
-  NUWAX_GEOMETRY_RUNTIME_READY_FILE="${ready_file}" \
-    bash "${REPO_ROOT}/scripts/systemd/wait_for_geometry_runtime_ready.sh" wait
+  # 调用方多在 if 条件中，set -e 不生效；早退或超时须显式返回失败，不能被随后的提示覆盖。
+  if ! NUWAX_GEOMETRY_RUNTIME_READY_FILE="${ready_file}" \
+    bash "${REPO_ROOT}/scripts/systemd/wait_for_geometry_runtime_ready.sh" wait; then
+    return 1
+  fi
   echo "nuwax-geometry-runtime ready: ${ready_file}"
 }
 
@@ -791,8 +794,9 @@ start_go2_video_streamer() {
   if ! should_start_go2_video_streamer; then
     return 0
   fi
-  if ! geometry_runtime_managed_by_systemd; then
-    start_geometry_runtime
+  if ! geometry_runtime_managed_by_systemd && ! start_geometry_runtime; then
+    echo "nuwax-geometry-runtime is not ready; not starting the Go2 video streamer that depends on its receiver" >&2
+    return 1
   fi
   echo "starting Go2 side video streamer -> UDS /tmp/nuwax_video.sock"
   (run_with_title "nuwax-go2-video-streamer" "${PYTHON_BIN}" -m drivers.go2.video_streamer) &
@@ -852,7 +856,10 @@ monitor_geometry_runtime() {
       echo "nuwax-geometry-runtime (pid ${GEOMETRY_RUNTIME_PID}) crashed, restarting..." >&2
       rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm 2>/dev/null || true
       GEOMETRY_RUNTIME_PID=""
-      start_geometry_runtime
+      if ! start_geometry_runtime; then
+        echo "nuwax-geometry-runtime restart failed; geometry monitor stops" >&2
+        return 1
+      fi
     fi
   done
 }

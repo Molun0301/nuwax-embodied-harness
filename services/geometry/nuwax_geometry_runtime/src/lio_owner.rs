@@ -12,7 +12,7 @@ use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrame, RawLcmFrameBuilder};
 use nuwax_transport::{LcmTransport, OwnedLcmSubscription};
 use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::channel_registry::{ChannelKey, ValidatedChannelBindings};
 use crate::lcm_runtime::{
@@ -1517,7 +1517,13 @@ async fn run_subscription_worker(
                             .accept(ingress.as_ref(), frame, &mut shutdown_rx)
                             .await
                         {
-                            warn!(source = kind.label(), %error, "LIO ingress rejected source frame");
+                            if error == "registered LIO cloud handoff rejected: mapping session is inactive"
+                                || error.ends_with("reason=mapping session is inactive")
+                            {
+                                debug!(source = kind.label(), %error, "LIO ingress rejected source frame");
+                            } else {
+                                warn!(source = kind.label(), %error, "LIO ingress rejected source frame");
+                            }
                         }
                     }
                     Err(error) => {

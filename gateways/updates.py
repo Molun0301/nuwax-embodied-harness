@@ -5,11 +5,9 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import logging
-import math
 import os
 import threading
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -17,6 +15,7 @@ from fastapi import APIRouter, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
+from gateways.motion_guard import GatewayMotionGuardError
 from scripts import self_update as updater
 
 LOG = logging.getLogger("nuwax_robot_bridge.updates")
@@ -148,29 +147,17 @@ class UpdateService:
     def require_idle(self):
         if self.runtime.task_manager.has_active_tasks():
             raise RuntimeError("有任务正在运行，请先完成或取消任务")
-        health = self.runtime.get_health_summary()
-        robot = health.get("latest_robot_snapshot")
-        if hasattr(robot, "model_dump"):
-            robot = robot.model_dump(mode="json")
-        # 无真实设备的基础网关允许更新；已接入设备必须确认电机停用。
-        if not robot:
-            if self.runtime.robot.has_motion_actuator() is False:
-                return
-            raise RuntimeError("缺少机器人状态，无法确认安全停机")
-        if not isinstance(robot, dict):
-            raise RuntimeError("无法核对机器人安全状态")  # noqa: TRY004 - 公开安全准入错误
-        timestamp = robot.get("timestamp")
+        # 更新只重启本系统软件，要确认的是此刻没有在控制运动，与电机是否上电无关。
+        # 所有运动都须持有运动守卫租约，撤销租约要等到零速确认才完成；本次运行未接入守卫则未发出过运动。
+        guard = self.runtime.motion_guard
+        if not guard.has_connected:
+            return
         try:
-            age = (
-                time.time()
-                - datetime.fromisoformat(str(timestamp).replace("Z", "+00:00")).astimezone(timezone.utc).timestamp()
-            )
-        except (ValueError, TypeError):
-            raise RuntimeError("机器人状态缺少有效时间戳")
-        if not math.isfinite(age) or not -1 <= age <= 5:
-            raise RuntimeError("机器人状态已过期，拒绝更新")
-        if (robot.get("safety") or {}).get("motors_enabled") is not False:
-            raise RuntimeError("请先停稳并停用机器人电机，再执行软件更新")
+            state = guard.guard_state()
+        except GatewayMotionGuardError:
+            raise RuntimeError("无法读取运动守卫状态，稍后重查")
+        if state.active_lease_id:
+            raise RuntimeError("运动控制仍在进行，请先停止运动")
 
     def begin_mutation(self):
         with self.mutex:

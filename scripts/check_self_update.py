@@ -7,7 +7,6 @@ import sys
 import tempfile
 import time
 import unittest
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
@@ -16,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from gateways.motion_guard import GatewayMotionGuardUnavailable
 from gateways.updates import UpdateMaintenanceMiddleware, UpdateService, build_update_router
 from scripts import self_update as u
 from scripts.module_installer import builds, lifecycle
@@ -146,13 +146,13 @@ class ServiceTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        self.robot = None
+        self.lease = 0
         self.runtime = SimpleNamespace(
             task_manager=SimpleNamespace(has_active_tasks=lambda: False),
             config=SimpleNamespace(robot=SimpleNamespace(active_robot="customrobot"),
                                    gateway=SimpleNamespace(host="127.0.0.1", port=8766)),
-            robot=SimpleNamespace(has_motion_actuator=lambda: None),
-            get_health_summary=lambda: {"latest_robot_snapshot": self.robot},
+            motion_guard=SimpleNamespace(has_connected=False,
+                                         guard_state=lambda: SimpleNamespace(active_lease_id=self.lease)),
         )
         self.service = UpdateService(self.runtime, self.root)
         app = FastAPI()
@@ -202,43 +202,29 @@ class ServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "任务"):
             self.service.require_idle()
 
-    def test_explicit_no_actuator_needs_no_snapshot_or_module_special_case(self):
-        self.runtime.robot.has_motion_actuator = lambda: False
-        with patch.object(u, "install_home") as installation:
-            for adapter in ("customrobot", "go2", "g1", "raspi_lidar_robot", "future_adapter"):
-                self.runtime.config.robot.active_robot = adapter
-                self.service.require_idle()
-            installation.assert_not_called()
-
-    def test_present_unknown_or_nonboolean_actuator_needs_telemetry(self):
-        for value in (True, None, 0, "false"):
-            with self.subTest(value=value):
-                self.runtime.robot.has_motion_actuator = lambda value=value: value
-                with self.assertRaisesRegex(RuntimeError, "缺少机器人状态"):
-                    self.service.require_idle()
-
-
-    def test_no_actuator_does_not_ignore_armed_snapshot(self):
-        self.runtime.robot.has_motion_actuator = lambda: False
-        self.robot = {"timestamp": datetime.now(timezone.utc).isoformat(), "safety": {"motors_enabled": True}}
-        with self.assertRaisesRegex(RuntimeError, "电机"):
+    def test_no_guard_connection_means_no_motion_was_issued(self):
+        # 不读取电机或机器人遥测；任何机器人在未接入运动守卫时都可更新。
+        for adapter in ("customrobot", "go2", "g1", "raspi_lidar_robot", "future_adapter"):
+            self.runtime.config.robot.active_robot = adapter
             self.service.require_idle()
 
-    def test_armed_robot_blocked(self):
-        self.robot = {"timestamp": datetime.now(timezone.utc).isoformat(), "safety": {"motors_enabled": True}}
-        with self.assertRaisesRegex(RuntimeError, "电机"):
+    def test_active_motion_lease_blocks(self):
+        self.runtime.motion_guard.has_connected = True
+        self.lease = 7
+        with self.assertRaisesRegex(RuntimeError, "运动控制"):
             self.service.require_idle()
 
-    def test_disarmed_robot_ready(self):
-        self.robot = {"timestamp": datetime.now(timezone.utc).isoformat(), "safety": {"motors_enabled": False}}
+    def test_released_lease_after_zero_confirmation_ready(self):
+        self.runtime.motion_guard.has_connected = True
+        self.lease = 0
         self.service.require_idle()
 
-    def test_stale_robot_blocked(self):
-        self.robot = {
-            "timestamp": (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat(),
-            "safety": {"motors_enabled": False},
-        }
-        with self.assertRaisesRegex(RuntimeError, "过期"):
+    def test_unreadable_guard_blocks(self):
+        def unavailable():
+            raise GatewayMotionGuardUnavailable("socket closed")
+        self.runtime.motion_guard.has_connected = True
+        self.runtime.motion_guard.guard_state = unavailable
+        with self.assertRaisesRegex(RuntimeError, "运动守卫"):
             self.service.require_idle()
 
     def test_maintenance_freezes_writes(self):

@@ -23,7 +23,7 @@ from .config_client import ConfigurationClient
 from .common import (ManagerError, compare_versions, atomic_json, atomic_write, digest_file, file_lock,
                      fsync_directory, identifier, process_alive, process_identity, read_json, timestamp)
 from .releases import download, github_catalog_url, load_catalog, platform_issues, unpack, validate_url
-from .runtime import Runtime, clean_environment, probe, run_command, system_helper
+from .runtime import Runtime, append_job_output, clean_environment, probe, run_command, system_helper
 
 TERMINAL = {"succeeded", "failed", "cancelled", "interrupted"}
 ACTIONS = {"install", "update", "modules", "rollback", "start", "stop", "restart", "migrate", "update-manager"}
@@ -295,6 +295,26 @@ class Engine:
         if job is None:
             raise ManagerError("not_found", "任务不存在。", 404)
         return {key: value for key, value in job.items() if not key.startswith("_")}
+
+    def job_output(self, job_id, offset=0, tail=None):
+        """按字节偏移读取任务详细日志；tail给出时从末尾该字节数之后的完整行开始。"""
+        self.job(job_id)
+        path = self.manager_home / "logs" / (identifier(job_id) + ".output.log")
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            return {"offset": 0, "size": 0, "text": ""}
+        start = max(0, size - tail) if tail is not None else min(max(0, offset), size)
+        with path.open("rb") as handle:
+            handle.seek(start)
+            data = handle.read(512 * 1024)
+        if tail is not None and start > 0:
+            skipped = data.find(b"\n") + 1
+            data, start = data[skipped:], start + skipped
+        if start + len(data) < size and b"\n" in data:
+            # 只返回完整行，下次从断开处继续，避免切断多字节字符。
+            data = data[:data.rfind(b"\n") + 1]
+        return {"offset": start + len(data), "size": size, "text": data.decode("utf-8", errors="replace")}
 
     def jobs(self):
         result = [self.job(path.stem) for path in (self.manager_home / "jobs").glob("*.json")]
@@ -628,6 +648,8 @@ class Engine:
         if not job["log"] or job["log"][-1]["message"] != message:
             job["log"].append({"time": timestamp(), "stage": stage, "message": message})
             job["log"] = job["log"][-300:]
+            # 详细日志里用阶段标记分隔各步骤的命令输出。
+            append_job_output("==> " + message, home=self.manager_home, job_id=job["id"])
         atomic_json(self._job_path(job["id"]), job)
 
     def run_job(self, job_id):

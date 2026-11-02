@@ -373,6 +373,13 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 2 and not mutation:
                 engine.recover_if_needed()
                 result = engine.job(parts[1])
+            elif len(parts) == 3 and parts[2] == "output" and not mutation:
+                try:
+                    offset = int(query.get("offset", ["0"])[0])
+                    tail = int(query["tail"][0]) if "tail" in query else None
+                except ValueError as exc:
+                    raise ManagerError("invalid_offset", "日志位置必须是整数。") from exc
+                result = engine.job_output(parts[1], offset, tail)
             elif len(parts) == 3 and parts[2] == "cancel" and self.command == "POST":
                 result = engine.cancel(parts[1])
             else:

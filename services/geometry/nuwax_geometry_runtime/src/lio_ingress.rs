@@ -2202,7 +2202,7 @@ impl LioIngressSink for CommonLioIngress {
         };
         let committed = handoff_admitted_registered_cloud(&runtime.handle, &accepted).await?;
         if !committed {
-            return Err("registered LIO cloud handoff committed no map revision".to_string());
+            return Err(uncommitted_cloud_reason(&runtime.handle));
         }
         Ok(())
     }
@@ -2582,9 +2582,17 @@ async fn accept_public_cloud_with_correction(
             );
             return Ok(());
         }
-        return Err("registered LIO cloud handoff committed no map revision".to_owned());
+        return Err(uncommitted_cloud_reason(&runtime.handle));
     }
     Ok(())
+}
+
+fn uncommitted_cloud_reason(handle: &GeometryRuntimeHandle) -> String {
+    if handle.mapping_adapter.as_ref().is_some_and(|adapter| !adapter.lock().snapshot().active) {
+        "registered LIO cloud handoff rejected: mapping session is inactive".to_owned()
+    } else {
+        "registered LIO cloud handoff committed no map revision".to_owned()
+    }
 }
 
 async fn mapping_admission_guard<'a>(
@@ -5086,7 +5094,7 @@ mod tests {
         let error = LioIngressSink::accept_public_cloud(&ingress, frame.clone(), &mut shutdown_rx)
             .await
             .expect_err("stopped mapping must reject cloud zero commit");
-        assert!(error.contains("committed no map revision"));
+        assert_eq!(error, "registered LIO cloud handoff rejected: mapping session is inactive");
         let after = {
             let adapter = mapping.lock();
             (

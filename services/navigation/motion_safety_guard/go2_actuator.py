@@ -97,7 +97,8 @@ def _prepend_sdk_path(path_value: str) -> Path:
 
 
 def _load_sdk_factories(sdk_path: str) -> Go2Factories:
-    _prepend_sdk_path(sdk_path)
+    if sdk_path:
+        _prepend_sdk_path(sdk_path)
     try:
         channel_module = importlib.import_module("unitree_sdk2py.core.channel")
         sport_module = importlib.import_module(
@@ -355,8 +356,6 @@ class Go2Actuator:
             runtime_value("GO2_SDK_PATH", "").strip()
             or runtime_value("NUWAX_GO2_SDK_PATH", "").strip()
         )
-        if not sdk_path:
-            raise ActuatorError("SDK_PATH_INVALID", "GO2_SDK_PATH is required")
         try:
             timeout = float(runtime_value("GO2_OFFICIAL_CLIENT_TIMEOUT_SEC", "3.0"))
             max_linear = float(

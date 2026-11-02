@@ -234,9 +234,20 @@ def write_runtime(
         "NUWAX_GEOMETRY_EXTRA_ENV_FILES": "",
         "NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD": "false",
         "NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD": "false",
+        "NUWAX_MOTION_GUARD_MANAGED_BY_SYSTEMD": "false",
+        # 套接字路径不能超过107字节，放在安装根而非版本目录下。
+        "NUWAX_MOTION_GUARD_SOCKET": str(prefix.parent.parent / "run/motion-guard.sock"),
+        "NUWAX_MOTION_GUARD_LOCK": str(prefix.parent.parent / "run/motion-guard.lock"),
         "NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD": "false",
         "NUWAX_GO2_VIDEO_STREAMER_MANAGED_BY_SYSTEMD": "false",
     })
+    if robot == "go2":
+        # SDK已安装在本发布的虚拟环境，由同一解释器直接导入，清除旧部署路径。
+        fixed.update({
+            "NUWAX_MOTION_GUARD_BACKEND": "unitree_sdk2py",
+            "GO2_SDK_PATH": "",
+            "NUWAX_GO2_SDK_PATH": "",
+        })
     if "slam2d" in selected:
         fixed["LD_LIBRARY_PATH"] = str(prefix / "lib") + ":" + str(prefix / "lib64")
         raw_device = values.get("NUWAX_GEOMETRY_SLAM2D_DEVICE", "").strip()

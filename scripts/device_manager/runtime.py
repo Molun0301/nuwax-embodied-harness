@@ -1,13 +1,16 @@
 """沿原网关拥有方管理进程；配置通过当前版本的共同实现读写。"""
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
+import shlex
 import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -72,20 +75,79 @@ def clean_environment(prefix=None):
 
 
 
-def safe_diagnostic(text, home=None):
-    """只向网页返回有限诊断，隐藏配置密钥和网址中的认证部分。"""
-    text = text[-6000:]
+def redactor(home=None):
+    """隐藏配置密钥和网址中的认证部分；进入网页的诊断与详细日志共用。"""
+    secrets = []
     if home:
         from scripts.module_installer.runtime import read_settings
         active = Path(home) / "data/settings/active.env"
-        for key, value in read_settings(active).items():
-            if re.search(r"PASSWORD|TOKEN|SECRET|API_KEY|AUTHORIZATION", key, re.I) and len(value) >= 4:
-                text = text.replace(value, "[已隐藏]")
-    text = re.sub(r'(?i)Bearer\s+[^\s,;]+', 'Bearer [已隐藏]', text)
-    text = re.sub(r'(?i)(["\']?(?:password|token|secret|api[_-]?key|authorization)["\']?\s*[:=]\s*)[^\s,;]+', r'\1[已隐藏]', text)
-    text = re.sub(r'(https?://)[^/@\s]+:[^/@\s]+@', r'\1[已隐藏]@', text)
-    text = re.sub(r'(https?://[^\s?]+)\?[^\s]+', r'\1?[已隐藏]', text)
-    return "\n".join(text.splitlines()[-20:])[-4000:]
+        secrets = [value for key, value in read_settings(active).items()
+                   if re.search(r"PASSWORD|TOKEN|SECRET|API_KEY|AUTHORIZATION", key, re.I) and len(value) >= 4]
+
+    def redact(text):
+        for value in secrets:
+            text = text.replace(value, "[已隐藏]")
+        text = re.sub(r'(?i)Bearer\s+[^\s,;]+', 'Bearer [已隐藏]', text)
+        text = re.sub(r'(?i)(["\']?(?:password|token|secret|api[_-]?key|authorization)["\']?\s*[:=]\s*)[^\s,;]+', r'\1[已隐藏]', text)
+        text = re.sub(r'(https?://)[^/@\s]+:[^/@\s]+@', r'\1[已隐藏]@', text)
+        return re.sub(r'(https?://[^\s?]+)\?[^\s]+', r'\1?[已隐藏]', text)
+    return redact
+
+
+def safe_diagnostic(text, home=None):
+    """只向网页返回有限诊断，隐藏配置密钥和网址中的认证部分。"""
+    return "\n".join(redactor(home)(text[-6000:]).splitlines()[-20:])[-4000:]
+
+
+_PROTOCOL_LINES = ("NEH_RESULT=", "NEH_SOURCE_RESULT=")
+
+
+def job_output_path(home=None, job_id=None):
+    """当前任务的详细日志：受管命令的逐行输出（已脱敏）与阶段标记。"""
+    home = home or os.environ.get("NEH_MANAGER_WORKER_HOME")
+    job_id = job_id or os.environ.get("NEH_MANAGER_WORKER_JOB")
+    return Path(home) / "logs" / (job_id + ".output.log") if home and job_id else None
+
+
+def append_job_output(text, home=None, job_id=None):
+    path = job_output_path(home, job_id)
+    if path:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(text if text.endswith("\n") else text + "\n")
+
+
+def failure_reason(text):
+    """从失败命令的输出中取出可直接展示的原因。"""
+    lines = [line.strip() for line in text.splitlines() if line.strip() and not line.startswith(_PROTOCOL_LINES)]
+    if not lines:
+        return ""
+    last = lines[-1]
+    try:
+        # 系统助手以一行JSON报告错误，取其中包管理器输出的最后一行。
+        parsed = json.loads(last)
+        if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
+            inner = [line.strip() for line in parsed["error"].splitlines() if line.strip()]
+            return inner[-1] if inner else parsed["error"]
+    except ValueError:
+        pass
+    match = re.match(r"^([\w.]+(?:Error|Exception)):\s*(.*)$", last)
+    if not match:
+        return last[-500:]
+    kind, message = match.groups()
+    if not kind.endswith("CalledProcessError"):
+        return message[-500:]
+    # 子命令失败：Python回溯只说明哪条命令失败，原因在回溯之前的输出里。
+    command = re.search(r"Command '(\[.*\])' returned", message)
+    try:
+        words = [str(word) for word in ast.literal_eval(command.group(1))] if command else []
+    except (ValueError, SyntaxError):
+        words = []
+    shown = " ".join([Path(words[0]).name] + [word for word in words[1:4] if not word.startswith("/") and " " not in word]) if words else "子命令"
+    start = max(index for index, line in enumerate(lines) if line.startswith("Traceback"))
+    before = [line for line in lines[:start] if not line.startswith("WARNING")]
+    errors = [line for line in before if re.search(r"(?i)\berror\b|错误", line) and not re.match(r"^make(\[\d+\])?: \*\*\*", line)]
+    detail = errors[0] if errors else (before[-1] if before else "")
+    return (shown + " 失败：" + detail)[-500:] if detail else message[-500:]
 
 
 def runtime_diagnostic(home):
@@ -109,18 +171,52 @@ def run_command(argv, *, cwd=None, environment=None, payload=None, timeout=600, 
         atomic_json(command_state, process_identity(process.pid))
     data = payload.encode("utf-8") if isinstance(payload, str) else payload
     deadline = time.monotonic() + timeout
-    try:
-        while True:
-            cancelled()
+    # 任务进程中逐行写入详细日志，网页据此实时显示；内部协议行可能带配置值，不写入。
+    log_path = job_output_path()
+    redact = redactor((environment or {}).get("NUWAX_MANAGED_HOME") or os.environ.get("NEH_MANAGER_WORKER_HOME"))
+    chunks = []
+
+    def pump():
+        log = log_path.open("a", encoding="utf-8") if log_path else None
+        try:
+            if log:
+                log.write(redact("$ " + shlex.join(str(item) for item in argv)) + "\n")
+                log.flush()
+            for raw in iter(process.stdout.readline, b""):
+                chunks.append(raw)
+                line = raw.decode("utf-8", errors="replace")
+                if log and not line.startswith(_PROTOCOL_LINES):
+                    log.write(redact(line if line.endswith("\n") else line + "\n"))
+                    log.flush()
+        finally:
+            if log:
+                log.close()
+
+    def feed():
+        try:
+            if data:
+                process.stdin.write(data)
+        except BrokenPipeError:
+            pass
+        finally:
             try:
-                output, _ = process.communicate(data, timeout=0.25)
-                break
-            except subprocess.TimeoutExpired:
-                data = None
-                if time.monotonic() > deadline:
-                    raise ManagerError("command_timeout", "安装或拥有方操作超时，正在恢复。", 500)
+                process.stdin.close()
+            except BrokenPipeError:
+                pass
+
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+    threading.Thread(target=feed, daemon=True).start()
+    try:
+        while reader.is_alive() or process.poll() is None:
+            cancelled()
+            if time.monotonic() > deadline:
+                raise ManagerError("command_timeout", "安装或拥有方操作超时，正在恢复。", 500)
+            reader.join(0.25)
+        process.wait()
+        output = b"".join(chunks)
         if process.returncode:
-            # 配置和第三方进程可能输出密钥；只公开退出码，私密原始日志不进入接口。
+            # 配置和第三方进程可能输出密钥；未脱敏的原始输出只留在本地文件，接口只给脱敏后的原因与诊断。
             details = None
             if environment and environment.get("NEH_MANAGER_LOG_DIR"):
                 directory = Path(environment["NEH_MANAGER_LOG_DIR"])
@@ -129,7 +225,8 @@ def run_command(argv, *, cwd=None, environment=None, payload=None, timeout=600, 
                 path = directory / ("command-" + str(process.pid) + ".log")
                 atomic_write(path, output)
                 details = {"log_file": str(path), "diagnostic": safe_diagnostic(output.decode("utf-8", errors="replace"), environment.get("NUWAX_MANAGED_HOME"))}
-            raise ManagerError("command_failed", "受管步骤失败（退出码 {}）：{}；原始诊断仅保存在设备本地日志。".format(process.returncode, Path(argv[0]).name), 500, details)
+            reason = redact(failure_reason(output.decode("utf-8", errors="replace")))
+            raise ManagerError("command_failed", reason or "受管步骤失败（退出码 {}）：{}".format(process.returncode, Path(argv[0]).name), 500, details)
         return output.decode("utf-8", errors="replace")
     finally:
         if process.poll() is None:

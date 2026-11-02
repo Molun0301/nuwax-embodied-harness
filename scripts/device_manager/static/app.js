@@ -21,6 +21,8 @@
     robot: '',
     plan: null,
     installJobId: null,
+    outputJobId: null,
+    outputOffset: 0,
     hardwareReady: false,
     hardwareGeneration: 0,
     locationSaving: false,
@@ -65,26 +67,10 @@
     if (el) el.className = className;
   }
 
-  // 失败说明后附服务端已脱敏诊断的最后一行，直接显示实际原因。
+  // 服务端失败消息已是从命令输出提取的原因（已脱敏），直接显示。
   function jobErrorText(error) {
     if (!error) return '';
-    if (typeof error === 'string') return error;
-    const message = error.message || JSON.stringify(error);
-    const diagnostic = error.details && typeof error.details.diagnostic === 'string' ? error.details.diagnostic : '';
-    let lines = diagnostic.split('\n').map(function (line) { return line.trim(); }).filter(Boolean);
-    let reason = lines.length ? lines[lines.length - 1] : '';
-    try {
-      // 系统助手以一行JSON报告错误，取其中包管理器输出的最后一行。
-      const parsed = JSON.parse(reason);
-      if (parsed && typeof parsed.error === 'string') {
-        lines = parsed.error.split('\n').map(function (line) { return line.trim(); }).filter(Boolean);
-        reason = lines.length ? lines[lines.length - 1] : '';
-      }
-    } catch (ignored) {
-      // 普通文本诊断直接使用。
-    }
-    reason = reason.replace(/^[\w.]+(?:Error|Exception):\s*/, '');
-    return reason ? message + ' 原因：' + reason : message;
+    return typeof error === 'string' ? error : (error.message || JSON.stringify(error));
   }
 
   function robotLabel(key) {
@@ -996,8 +982,17 @@
     if (!opts.compact && Array.isArray(job.log) && job.log.length) {
       parts.push(
         '<details class="job-log-details" open>' +
-          '<summary>任务日志（' + job.log.length + ' 条）</summary>' +
+          '<summary>步骤记录（' + job.log.length + ' 条）</summary>' +
           '<div class="job-log">' + escapeHtml(formatLog(job.log)) + '</div>' +
+        '</details>'
+      );
+    }
+
+    if (!opts.compact && !canCancel(job)) {
+      parts.push(
+        '<details class="job-log-details" data-job-output="' + escapeHtml(job.id) + '">' +
+          '<summary>详细日志</summary>' +
+          '<div class="job-log job-output">展开后读取…</div>' +
         '</details>'
       );
     }
@@ -1061,6 +1056,7 @@
         }
         if (state.wizardStep === 'install') {
           renderInstallProgress(job);
+          await pullInstallOutput(jobId);
         }
 
         if (job.status !== 'running' && job.status !== 'queued') {
@@ -1666,8 +1662,36 @@
     show($('cancelInstall'), canCancel(job));
     show($('finishSetup'), false);
     show($('retrySetup'), false);
-    text($('installLogContent'), '正在读取任务日志…');
+    text($('installSteps'), '');
+    resetInstallOutput(job.id);
     $('installLog').open = false;
+  }
+
+  function resetInstallOutput(jobId) {
+    state.outputJobId = jobId;
+    state.outputOffset = 0;
+    text($('installLogContent'), '等待命令输出…');
+  }
+
+  // 按字节偏移增量读取任务详细日志；首次只取末尾，页面只保留最近部分。
+  async function pullInstallOutput(jobId) {
+    if (state.outputJobId !== jobId) resetInstallOutput(jobId);
+    const content = $('installLogContent');
+    for (let round = 0; round < 8; round += 1) {
+      const query = state.outputOffset ? 'offset=' + state.outputOffset : 'tail=262144';
+      const chunk = await apiCall('/api/manager/jobs/' + encodeURIComponent(jobId) + '/output?' + query);
+      if (state.outputJobId !== jobId) return;
+      if (chunk.text) {
+        const nearBottom = content.scrollHeight - content.scrollTop - content.clientHeight < 40;
+        const previous = state.outputOffset ? content.textContent : '';
+        let combined = previous + chunk.text;
+        if (combined.length > 400000) combined = combined.slice(combined.indexOf('\n', combined.length - 400000) + 1);
+        content.textContent = combined;
+        if (nearBottom || !previous) content.scrollTop = content.scrollHeight;
+      }
+      state.outputOffset = chunk.offset;
+      if (chunk.offset >= chunk.size) return;
+    }
   }
 
   function renderInstallProgress(job) {
@@ -1703,9 +1727,9 @@
     }
 
     if (Array.isArray(job.log) && job.log.length) {
-      const content = $('installLogContent');
-      content.textContent = formatLog(job.log);
-      content.scrollTop = content.scrollHeight;
+      const steps = $('installSteps');
+      steps.textContent = formatLog(job.log);
+      steps.scrollTop = steps.scrollHeight;
     }
 
     show($('cancelInstall'), canCancel(job));
@@ -1741,8 +1765,7 @@
       setClass(result, 'result-card error');
       result.innerHTML =
         '<h3>' + escapeHtml(jobStatusText(job.status)) + '</h3>' +
-        '<p>' + escapeHtml(errText) + '</p>' +
-        '<p class="muted small">可以查看下方日志了解实际失败位置，处理后重新生成计划再试。</p>';
+        '<p>' + escapeHtml(errText) + '</p>';
       show($('finishSetup'), false);
       show($('retrySetup'), true);
       show($('cancelInstall'), false);
@@ -3003,6 +3026,7 @@
     initNavigation();
     initEvents();
     initWizardEvents();
+    initJobOutputEvents();
 
     const retry = $('bootRetry');
     if (retry) {
@@ -3071,6 +3095,22 @@
     } catch (error) {
       showBoot('读取设备状态失败：' + error.message, true);
     }
+  }
+
+  // 任务卡片的详细日志在展开时读取末尾部分；toggle事件不冒泡，用捕获阶段监听。
+  function initJobOutputEvents() {
+    document.addEventListener('toggle', async function (event) {
+      const details = event.target;
+      if (!details || !details.dataset || !details.dataset.jobOutput || !details.open) return;
+      const box = details.querySelector('.job-output');
+      try {
+        const chunk = await apiCall('/api/manager/jobs/' + encodeURIComponent(details.dataset.jobOutput) + '/output?tail=262144');
+        box.textContent = chunk.text || '该任务没有命令输出。';
+        box.scrollTop = box.scrollHeight;
+      } catch (error) {
+        box.textContent = '读取详细日志失败：' + error.message;
+      }
+    }, true);
   }
 
   function init() {

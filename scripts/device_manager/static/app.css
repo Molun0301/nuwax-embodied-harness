@@ -1285,9 +1285,25 @@ textarea.field {
   border-bottom: 1px solid var(--line);
 }
 
+.install-steps {
+  margin-top: 10px;
+  max-height: 150px;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.install-steps:empty {
+  display: none;
+}
+
 .log-content {
   padding: 14px;
-  max-height: 300px;
+  max-height: 420px;
   overflow: auto;
   font-family: var(--mono);
   font-size: 11px;

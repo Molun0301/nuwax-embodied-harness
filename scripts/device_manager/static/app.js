@@ -1452,7 +1452,7 @@
     }
   }
 
-  async function generatePlan() {
+  async function generatePlan(startImmediately) {
     if (state.locationSaving || installLocationDirty()) return;
     const generation = ++state.planGeneration;
     setWizardStep('plan');
@@ -1484,6 +1484,17 @@
       if (generation !== state.planGeneration) return;
       state.plan = plan;
       renderPlan(plan, statusCard);
+      // 未知下载量不要求确认；只累加计划中已经可预报的部分。
+      const downloadBytes = plan.download_bytes || Object.values(plan.download_breakdown || {}).reduce(function (total, size) {
+        return total + (size || 0);
+      }, 0);
+      const largeDownload = downloadBytes >= 1024 * 1024 * 1024;
+      if (largeDownload && !plan.blockers.length) {
+        text($('planStatusText'), '预计下载至少 ' + formatBytes(downloadBytes) + '，请确认后开始安装。');
+      }
+      if (startImmediately === true && !plan.blockers.length && !plan.requires_stop && !largeDownload) {
+        await submitInstall();
+      }
     } catch (error) {
       if (generation !== state.planGeneration) return;
       setClass(statusCard, 'status-card error');
@@ -1497,7 +1508,10 @@
     const warnings = Array.isArray(plan.warnings) ? plan.warnings : [];
     const steps = Array.isArray(plan.steps) ? plan.steps : [];
 
-    if (blockers.length) {
+    const stopOnly = plan.requires_stop && blockers.length && blockers.every(function (item) {
+      return item.indexOf('stop_running') !== -1;
+    });
+    if (blockers.length && !stopOnly) {
       setClass(statusCard, 'status-card error');
       statusCard.querySelector('.status-icon').className = 'status-icon error';
       text($('planStatusText'), '存在阻止安装的问题，需要先处理。');
@@ -1600,7 +1614,8 @@
     let plan = state.plan;
     const params = {
       modules: Array.from(state.selectedModules),
-      robot: state.robot || undefined
+      robot: state.robot || undefined,
+      local_build: Boolean($('wizardLocalBuild') && $('wizardLocalBuild').checked)
     };
 
     try {
@@ -1617,11 +1632,11 @@
         state.plan = plan;
         renderPlan(plan, $('planStatus'));
         state.submitting = false;
-        $('startInstall').disabled = false;
         return;
       }
 
-      if (plan.requires_stop) {
+      // 停机确认已生成新计划时，直接提交该计划，不再重复确认。
+      if (plan.requires_stop && plan === state.plan) {
         const ok = await confirmDialog({
           title: '开始安装',
           text: '安装期间业务服务会停止，正在运行的任务不会跨版本恢复。',
@@ -1788,11 +1803,11 @@
           text: '当前没有选择任何功能模块，安装后业务能力可能不可用。是否继续？',
           confirmText: '继续'
         }).then(function (ok) {
-          if (ok) generatePlan();
+          if (ok) generatePlan(true);
         });
         return;
       }
-      generatePlan();
+      generatePlan(true);
     });
     $('backToModules').addEventListener('click', function () {
       state.planGeneration += 1;

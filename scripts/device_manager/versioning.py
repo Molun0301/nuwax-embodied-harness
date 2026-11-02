@@ -61,6 +61,10 @@ def revision_relation(engine, source, installed):
         def git(*arguments):
             return _git(arguments, root=graph, environment=environment)
         git("config", "remote.origin.url", repository)
+        # Ubuntu 20.04的Git 2.25只在已声明部分克隆的仓库接受--filter；新版Git拉取时会自动写入同样配置。
+        git("config", "core.repositoryformatversion", "1")
+        git("config", "extensions.partialClone", "origin")
+        git("config", "remote.origin.promisor", "true")
         _import_installed_history(engine, graph)
         # 单独保存完整提交图；不用业务的浅克隆，也不下载源码内容。
         try:

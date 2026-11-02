@@ -22,6 +22,7 @@ CONTROL_LOCK_FD=""
 GATEWAY_PID=""
 VIDEO_STREAMER_PID=""
 NAV_STACK_PID=""
+MOTION_GUARD_PID=""
 GEOMETRY_RUNTIME_PID=""
 PERSON_FOLLOW_PID=""
 NAV_STACK_MONITOR_PID=""
@@ -75,6 +76,14 @@ geometry_runtime_managed_by_systemd() {
 
 nav_stack_managed_by_systemd() {
   is_truthy "${NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD:-false}"
+}
+
+motion_guard_managed_by_systemd() {
+  is_truthy "${NUWAX_MOTION_GUARD_MANAGED_BY_SYSTEMD:-${NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD:-false}}"
+}
+
+should_start_motion_guard() {
+  [[ -n "${NUWAX_MOTION_GUARD_BACKEND:-}" ]]
 }
 
 person_follow_managed_by_systemd() {
@@ -135,6 +144,29 @@ wait_for_nav_stack_ready() {
   NUWAX_NAV_STACK_READY_FILE="${ready_file}" \
     bash "${helper}" wait
   echo "nuwax-nav-stack ready: ${ready_file}"
+}
+
+wait_for_motion_guard_ready() {
+  # 等守卫真正接受连接后再启动依赖它的导航程序；只连接，不检查文件属主或权限。
+  "${PYTHON_BIN}" - <<'PY'
+import os
+import socket
+import time
+
+path = os.environ.get("NUWAX_MOTION_GUARD_SOCKET", "/run/nuwax/motion-guard.sock")
+deadline = time.monotonic() + float(os.environ.get("NUWAX_MOTION_GUARD_START_TIMEOUT_SEC", "15"))
+while True:
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(0.1)
+            connection.connect(path)
+        break
+    except OSError as error:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SystemExit("运动安全守卫连接未就绪：%s：%s" % (path, error))
+        time.sleep(min(0.1, remaining))
+PY
 }
 
 wait_for_person_follow_ready() {
@@ -612,6 +644,39 @@ should_start_go2_video_streamer() {
     && [[ "$(printf '%s' "${NUWAX_ACTIVE_ROBOT:-}" | tr '[:upper:]' '[:lower:]')" == "go2" ]]
 }
 
+start_motion_guard() {
+  if [[ -n "${MOTION_GUARD_PID}" ]] && is_pid_alive "${MOTION_GUARD_PID}"; then
+    return 0
+  fi
+  # 系统服务管理的守卫不归启动器所有，是否可用由网关和导航程序实际连接判定。
+  if motion_guard_managed_by_systemd; then
+    return 0
+  fi
+  echo "正在启动运动安全守卫"
+  (run_with_title "nuwax-motion-safety-guard" "${PYTHON_BIN}" -m services.navigation.motion_safety_guard) &
+  MOTION_GUARD_PID="$!"
+  if wait_for_motion_guard_ready; then
+    return 0
+  fi
+  terminate_process_scope "${MOTION_GUARD_PID}" "未就绪的运动安全守卫"
+  wait "${MOTION_GUARD_PID}" >/dev/null 2>&1 || true
+  MOTION_GUARD_PID=""
+  return 1
+}
+
+stop_motion_guard() {
+  if motion_guard_managed_by_systemd; then
+    return 0
+  fi
+  if [[ -n "${MOTION_GUARD_PID}" ]] && is_pid_alive "${MOTION_GUARD_PID}" \
+    && process_belongs_to_instance "${MOTION_GUARD_PID}" \
+    && ! process_managed_by_systemd "${MOTION_GUARD_PID}"; then
+    terminate_process_scope "${MOTION_GUARD_PID}" "运动安全守卫"
+    wait "${MOTION_GUARD_PID}" >/dev/null 2>&1 || true
+  fi
+  MOTION_GUARD_PID=""
+}
+
 start_nav_stack() {
   if [[ -n "${NAV_STACK_PID}" ]] && is_pid_alive "${NAV_STACK_PID}"; then
     return 0
@@ -1016,7 +1081,13 @@ activate_requested_runtime_components() {
     RUNTIME_ACTIVATION_STAGE="request"
     RUNTIME_ACTIVATION_STARTED=()
     check_runtime_activation_cancelled || return 1
-    # 守卫是否可用由网关和导航程序实际连接判定；启动器不按socket文件属主预先判定。
+    if [[ "${RUNTIME_ACTIVATION_LEVEL}" == "guard" \
+      || "${RUNTIME_ACTIVATION_LEVEL}" == "motion" \
+      || "${RUNTIME_ACTIVATION_LEVEL}" == "person_follow" ]]; then
+      if should_start_motion_guard; then
+        start_runtime_activation_component motion_guard MOTION_GUARD_PID motion_guard_managed_by_systemd || return 1
+      fi
+    fi
     if [[ "${RUNTIME_ACTIVATION_LEVEL}" == "motion" \
       || "${RUNTIME_ACTIVATION_LEVEL}" == "person_follow" ]]; then
       start_runtime_activation_component nav_stack NAV_STACK_PID nav_stack_managed_by_systemd || return 1
@@ -1053,12 +1124,14 @@ cleanup_runtime_activation_owner() {
   [[ "${PERSON_FOLLOW_PID}" == "${initial_follow_pid}" ]] || stop_person_follow
   [[ "${GEOMETRY_RUNTIME_PID}" == "${initial_geometry_pid}" ]] || stop_geometry_runtime
   [[ "${NAV_STACK_PID}" == "${initial_nav_pid}" ]] || stop_nav_stack
+  [[ "${MOTION_GUARD_PID}" == "${initial_guard_pid}" ]] || stop_motion_guard
   exit 0
 }
 
 monitor_runtime_activation_requests() {
   local request_file="${NUWAX_RUNTIME_ACTIVATION_REQUEST}"
   local initial_geometry_pid="${GEOMETRY_RUNTIME_PID}" initial_nav_pid="${NAV_STACK_PID}" initial_follow_pid="${PERSON_FOLLOW_PID}"
+  local initial_guard_pid="${MOTION_GUARD_PID}"
   local RUNTIME_ACTIVATION_REQUEST_ID="" RUNTIME_ACTIVATION_STAGE="request"
   local last_handled_request_id="" invalid_reported=0
   local -a RUNTIME_ACTIVATION_STARTED=()
@@ -1085,6 +1158,14 @@ monitor_runtime_activation_requests() {
     # 监督与启动留在同一拥有方，重启后的 PID 不再遗失在另一个后台 shell 中。
     if ((SECONDS >= next_health_check)); then
       next_health_check=$((SECONDS + 5))
+      if [[ -n "${MOTION_GUARD_PID}" && "${MOTION_GUARD_PID}" != "${initial_guard_pid}" ]] && ! is_pid_alive "${MOTION_GUARD_PID}"; then
+        wait "${MOTION_GUARD_PID}" >/dev/null 2>&1 || true
+        MOTION_GUARD_PID=""
+        if ! start_motion_guard; then
+          send_signal_to_process_scope TERM "${GATEWAY_PID}"
+          break
+        fi
+      fi
       if [[ -n "${NAV_STACK_PID}" && "${NAV_STACK_PID}" != "${initial_nav_pid}" ]] && ! is_pid_alive "${NAV_STACK_PID}"; then
         wait "${NAV_STACK_PID}" >/dev/null 2>&1 || true
         NAV_STACK_PID=""
@@ -1108,7 +1189,7 @@ monitor_runtime_activation_requests() {
 }
 
 start_runtime_activation_monitor() {
-  if geometry_runtime_managed_by_systemd && nav_stack_managed_by_systemd; then
+  if geometry_runtime_managed_by_systemd && nav_stack_managed_by_systemd && motion_guard_managed_by_systemd; then
     return 0
   fi
   monitor_runtime_activation_requests &

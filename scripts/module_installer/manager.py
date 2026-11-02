@@ -354,6 +354,16 @@ def _check_dependencies(python: str, exposed: Optional[Path]) -> None:
     print("运行环境外的已有包存在依赖问题，不影响本环境：" + "；".join(line for line in result.stdout.splitlines() if line.strip()), flush=True)
 
 
+def _preload_bundled_openmp(python: str) -> None:
+    """aarch64上glibc 2.31的静态TLS余量很小，torch、cv2等加载后再加载轮子自带的libgomp会失败；让本环境的进程启动时先加载。"""
+    purelib = Path(subprocess.check_output([python, "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"], text=True).strip())
+    libraries = sorted(str(path) for path in purelib.glob("*.libs/libgomp-*.so*"))
+    if libraries:
+        # 局部加载，不进入全局符号表；torch仍使用它链接的系统libgomp。
+        line = "import ctypes; " + "; ".join(f"ctypes.CDLL({library!r})" for library in libraries) + "\n"
+        atomic_write(purelib / "nuwax-preload-openmp.pth", line.encode("utf-8"), mode=0o644)
+
+
 def _python_environment(request: InstallRequest, hardware, prefix: Path, seed: str, run) -> None:
     models = bool(set(request.modules) & {"perception", "memory"})
     vendor = jetson_vendor_packages(seed) if hardware.is_jetson and models else None
@@ -402,6 +412,8 @@ def _python_environment(request: InstallRequest, hardware, prefix: Path, seed: s
     if request.robot == "go2" and request.wheel_dir is None:
         run([python, str(request.root / "scripts/go2_dependencies.py"), "--root", str(request.root),
              "--prefix", str(prefix), "--cache", str(request.home / "cache/go2")])
+    if hardware.architecture == "aarch64":
+        _preload_bundled_openmp(python)
     _check_dependencies(python, prefix / "jetson-vendor" if vendor and vendor["site"] else None)
     run([python, "-c", "import importlib; [importlib.import_module(n) for n in " + repr(list(module_imports(request.modules, request.robot))) + "]"])
 

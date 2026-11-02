@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -280,7 +281,8 @@ _JETSON_VENDOR_PACKAGES = ("torch", "torchvision")
 def jetson_vendor_packages(python: str) -> dict:
     """定位Jetson厂商torch/torchvision：先查系统目录，再查当前用户目录。
 
-    返回 {"site": 所在用户目录或空串, "versions": {...}}；空串表示位于系统目录。
+    返回 {"site": 所在用户目录或空串, "versions": {...}, "entries": [...]}；空串表示位于系统目录，
+    entries 为两个发行包在用户目录中的顶层文件与元数据目录。
     """
     code = (
         "import importlib, importlib.metadata as m, json, os, site\n"
@@ -288,7 +290,8 @@ def jetson_vendor_packages(python: str) -> dict:
         "modules = [importlib.import_module(n) for n in names]\n"
         "user = os.path.realpath(site.getusersitepackages()) if site.ENABLE_USER_SITE else ''\n"
         "inside = [bool(user) and os.path.realpath(x.__file__).startswith(user + os.sep) for x in modules]\n"
-        "print(json.dumps({'versions': {n: m.version(n) for n in names}, 'user_site': user, 'inside': inside}))"
+        "entries = sorted({f.parts[0] for n in names for f in (m.distribution(n).files or []) if f.parts and f.parts[0] != '..'})\n"
+        "print(json.dumps({'versions': {n: m.version(n) for n in names}, 'user_site': user, 'inside': inside, 'entries': entries}))"
     )
     environment = dict(os.environ)
     environment.pop("PYTHONPATH", None)
@@ -306,8 +309,11 @@ def jetson_vendor_packages(python: str) -> dict:
         found = json.loads(result.stdout.strip().splitlines()[-1])
         if not user_site:
             return {"site": "", "versions": found["versions"]}
+        if all(found["inside"]) and found["entries"]:
+            return {"site": found["user_site"], "versions": found["versions"], "entries": found["entries"]}
         if all(found["inside"]):
-            return {"site": found["user_site"], "versions": found["versions"]}
+            reason = "用户目录中的 torch/torchvision 缺少安装记录（RECORD），无法单独接入"
+            continue
         reason = "torch与torchvision分别位于系统目录和用户目录，请安装到同一位置"
     raise InstallError(
         "检测到 Jetson（嵌入式计算平台）；本地视觉与语义记忆需要与 JetPack（厂商软件栈）匹配的 torch/torchvision（张量与视觉库），"
@@ -325,6 +331,29 @@ def _vendor_constraints(python: str, target: Path, names: Sequence[str]) -> None
     atomic_write(target, (result.stdout).encode("utf-8"), mode=0o600)
 
 
+def _check_dependencies(python: str, exposed: Optional[Path]) -> None:
+    """pip check只追究本环境与厂商包；Jetson环境可见的系统包自身缺依赖时只记录。"""
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+    environment.pop("PYTHONHOME", None)
+    environment.update({"PYTHONNOUSERSITE": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1"})
+    result = subprocess.run([python, "-m", "pip", "check"], capture_output=True, text=True, timeout=300, check=False, env=environment)
+    if not result.returncode:
+        return
+    code = (
+        "import importlib.metadata as m, json, os, sys, sysconfig\n"
+        "roots = {os.path.realpath(sysconfig.get_paths()[k]) for k in ('purelib', 'platlib')} | {os.path.realpath(p) for p in sys.argv[1:]}\n"
+        "print(json.dumps(sorted({d.metadata['Name'] for d in m.distributions() if os.path.realpath(str(d.locate_file(''))) in roots})))"
+    )
+    names = json.loads(subprocess.check_output([python, "-c", code] + ([str(exposed)] if exposed else []), text=True, env=environment))
+    normalize = lambda name: re.sub(r"[-_.]+", "-", name).lower()
+    owned = {normalize(name) for name in list(names) + list(_JETSON_VENDOR_PACKAGES)}
+    problems = [line for line in result.stdout.splitlines() if line.strip() and normalize(line.split()[0]) in owned]
+    if problems:
+        raise InstallError("Python 依赖不一致：" + "；".join(problems))
+    print("运行环境外的已有包存在依赖问题，不影响本环境：" + "；".join(line for line in result.stdout.splitlines() if line.strip()), flush=True)
+
+
 def _python_environment(request: InstallRequest, hardware, prefix: Path, seed: str, run) -> None:
     models = bool(set(request.modules) & {"perception", "memory"})
     vendor = jetson_vendor_packages(seed) if hardware.is_jetson and models else None
@@ -334,9 +363,14 @@ def _python_environment(request: InstallRequest, hardware, prefix: Path, seed: s
     run(venv_args + [str(prefix / "venv")])
     python = str(prefix / "venv/bin/python")
     if vendor and vendor["site"]:
-        # venv不读用户目录；用.pth把厂商包所在用户目录排在venv之后、系统目录之前，与普通解释器的搜索顺序一致。
+        # 只接入两个厂商发行包本身，其余依赖仍装进本环境，不借用用户目录里的其它包。
+        exposed = prefix / "jetson-vendor"
+        shutil.rmtree(exposed, ignore_errors=True)
+        exposed.mkdir()
+        for entry in vendor["entries"]:
+            (exposed / entry).symlink_to(Path(vendor["site"]) / entry)
         purelib = subprocess.check_output([python, "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"], text=True).strip()
-        atomic_write(Path(purelib) / "nuwax-jetson-vendor.pth", (vendor["site"] + "\n").encode("utf-8"), mode=0o644)
+        atomic_write(Path(purelib) / "nuwax-jetson-vendor.pth", (str(exposed) + "\n").encode("utf-8"), mode=0o644)
     pip = [python, "-m", "pip", "install"]
     tools = ["pip==25.0.1", "setuptools==75.3.2", "wheel==0.45.1"] if request.robot == "go2" else ["pip", "setuptools", "wheel"]
     run(pip + ["--upgrade"] + tools)
@@ -368,7 +402,7 @@ def _python_environment(request: InstallRequest, hardware, prefix: Path, seed: s
     if request.robot == "go2" and request.wheel_dir is None:
         run([python, str(request.root / "scripts/go2_dependencies.py"), "--root", str(request.root),
              "--prefix", str(prefix), "--cache", str(request.home / "cache/go2")])
-    run([python, "-m", "pip", "check"])
+    _check_dependencies(python, prefix / "jetson-vendor" if vendor and vendor["site"] else None)
     run([python, "-c", "import importlib; [importlib.import_module(n) for n in " + repr(list(module_imports(request.modules, request.robot))) + "]"])
 
 

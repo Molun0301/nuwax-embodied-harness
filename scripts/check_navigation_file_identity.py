@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""建筑和探索检查点的无摘要寻址、旧文件发现与发布并发回归。"""
+"""建筑和探索检查点的直接寻址、旧文件隔离与发布并发回归。"""
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
@@ -9,7 +9,6 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
-import sqlite3
 import stat
 import sys
 import tempfile
@@ -29,7 +28,7 @@ from gateways.exploration_checkpoint import store as checkpoint_store
 from services.mapping.catalog import MapCatalogRepository
 from services.navigation.building_catalog import BuildingCatalog
 from services.navigation.exploration_checkpoint import ExplorationCheckpoint, ExplorationCheckpointStore
-from services.navigation.file_identity import LegacyFileIndex, MAX_RECORD_BYTES, read_record_text
+from services.navigation.file_identity import MAX_RECORD_BYTES, read_record_text
 
 WORK = Path(tempfile.gettempdir()) / 'neh-navigation-file-identity-checks'
 
@@ -131,33 +130,31 @@ class FileIdentityChecks(unittest.TestCase):
         for identity in ['', 'x' * 129]:
             with self.assertRaises(ValueError): self.buildings._files.direct_path(identity)
 
-    def test_legacy_files_keep_paths_ids_and_bytes_on_read_and_restart(self):
+    def test_legacy_files_are_not_read_or_listed(self):
         building, saved = topology(), checkpoint()
         bp, cp = self.legacy(building), self.legacy(saved)
         originals = bp.read_bytes(), cp.read_bytes()
-        self.assertEqual(self.buildings.get(building.building_id), building)
-        self.assertEqual(self.checkpoints.load(saved.checkpoint_id), saved)
-        self.assertEqual(self.buildings.list(), (building,))
-        self.assertEqual(self.checkpoints.list()[0]['checkpoint_id'], saved.checkpoint_id)
-        self.assertEqual(BuildingCatalog(MapCatalogRepository(str(self.root))).get(building.building_id), building)
-        self.assertEqual(ExplorationCheckpointStore(self.root).load(saved.checkpoint_id, validate_asset=False), saved)
+        self.assertIsNone(self.buildings.get(building.building_id))
+        with self.assertRaises(FileNotFoundError): self.checkpoints.load(saved.checkpoint_id)
+        self.assertEqual(self.buildings.list(), ())
+        self.assertEqual(self.checkpoints.list(), [])
         self.assertEqual((bp.read_bytes(), cp.read_bytes()), originals)
-        self.assertEqual(self.buildings._path(building.building_id), bp)
-        self.assertEqual(self.checkpoints._path(saved.checkpoint_id), cp)
+        self.assertFalse((self.buildings.root / 'legacy-paths.sqlite3').exists())
 
-    def test_legacy_building_revision_writes_same_path_and_conflicts_remain(self):
-        first = topology(); path = self.legacy(first)
-        second = topology(revision=2)
-        self.buildings.save(second, expected_revision=1)
-        self.assertEqual(self.buildings._path(first.building_id), path)
-        self.assertEqual(self.buildings.get(first.building_id), second)
+    def test_new_building_uses_direct_path_despite_same_id_in_legacy_file(self):
+        first = topology(); path = self.legacy(first); before = path.read_bytes()
+        self.buildings.save(first)
+        self.buildings.save(topology(revision=2), expected_revision=1)
+        self.assertEqual(self.buildings.get(first.building_id), topology(revision=2))
+        self.assertEqual(path.read_bytes(), before)
+        self.assertNotEqual(self.buildings._path(first.building_id), path)
         with self.assertRaises(ValueError): self.buildings.save(topology(revision=3), expected_revision=1)
-        self.assertFalse(self.buildings._files.direct_path(first.building_id).exists())
 
-    def test_checkpoint_new_wrapper_and_old_same_value_save_preserve_native_payload(self):
+    def test_checkpoint_direct_save_preserves_native_payload(self):
         old = checkpoint('old'); path = self.legacy(old); before = path.read_bytes()
         self.checkpoints.save(old)
         self.assertEqual(path.read_bytes(), before)
+        self.assertNotEqual(self.checkpoints._path('old'), path)
         new = checkpoint('new'); self.checkpoints.save(new)
         envelope = json.loads(self.checkpoints._path('new').read_text())
         self.assertEqual(set(envelope), {'schema_version', 'payload'})
@@ -245,8 +242,7 @@ class FileIdentityChecks(unittest.TestCase):
         runtime.task_manager.update_task_metadata.assert_not_called()
 
     def test_warm_and_fresh_store_gets_and_misses_never_scan(self):
-        self.legacy(topology('old')); self.legacy(checkpoint('old'))
-        self.buildings.get('old'); self.checkpoints.load('old')
+        self.buildings.save(topology('old')); self.checkpoints.save(checkpoint('old'))
         with patch('services.navigation.file_identity.os.scandir', side_effect=AssertionError('unexpected scan')):
             for _ in range(10):
                 self.assertEqual(self.buildings.get('old').building_id, 'old')
@@ -255,47 +251,37 @@ class FileIdentityChecks(unittest.TestCase):
                 self.assertEqual(fresh.load('old', validate_asset=False).checkpoint_id, 'old')
                 with self.assertRaises(FileNotFoundError): fresh.load('missing', validate_asset=False)
 
-    def test_external_legacy_import_requires_explicit_refresh(self):
+    def test_new_direct_import_is_immediately_visible(self):
         self.assertIsNone(self.buildings.get('later'))
-        self.legacy(topology('later'))
-        self.assertIsNone(self.buildings.get('later'))
-        self.assertEqual(self.buildings.list()[0].building_id, 'later')
+        self.buildings.save(topology('later'))
         self.assertEqual(self.buildings.get('later').building_id, 'later')
+        self.assertEqual(self.buildings.list()[0].building_id, 'later')
 
-    def test_duplicate_legacy_or_legacy_and_new_records_fail_even_when_identical(self):
-        value = topology('duplicate'); self.legacy(value)
-        self.buildings.get(value.building_id)
-        published = self.buildings._files._index_path.read_bytes()
-        duplicate = self.legacy(value, 2)
-        with self.assertRaisesRegex(ValueError, '多个旧'): self.buildings.list()
-        self.assertEqual(self.buildings._files._index_path.read_bytes(), published)
-        duplicate.unlink()
-        direct = self.buildings._files.direct_path(value.building_id)
-        direct.parent.mkdir(parents=True); direct.write_text(value.model_dump_json())
-        with self.assertRaisesRegex(ValueError, '旧路径和新路径'): self.buildings.get(value.building_id)
-        with self.assertRaisesRegex(ValueError, '旧路径和新路径'): self.buildings.list()
+    def test_duplicate_legacy_files_do_not_affect_direct_records(self):
+        value = topology('duplicate')
+        self.legacy(value); self.legacy(value, 2)
+        self.buildings.save(value)
+        self.assertEqual(self.buildings.get(value.building_id), value)
+        self.assertEqual(self.buildings.list(), (value,))
 
-    def test_missing_indexed_file_blocks_replacement_and_embedded_id_swap_is_rejected(self):
-        value = topology('old'); path = self.legacy(value)
-        self.buildings.get('old')
+    def test_embedded_id_swap_is_rejected_for_direct_records(self):
+        value = topology('current'); self.buildings.save(value)
+        path = self.buildings._path(value.building_id)
         path.write_text(topology('other').model_dump_json())
-        with self.assertRaisesRegex(ValueError, '身份'): self.buildings.get('old')
-        path.unlink()
-        with self.assertRaises(FileNotFoundError): self.buildings.save(value)
-        self.assertFalse(self.buildings._files.direct_path('old').exists())
+        with self.assertRaisesRegex(ValueError, '身份'): self.buildings.get('current')
 
-    def test_over_4096_valid_legacy_records_discover_and_list_without_catalog_cap(self):
-        self.buildings.root.mkdir()
+    def test_over_4096_direct_records_list_without_catalog_cap(self):
         template = topology().model_dump(mode='json')
         for number in range(4105):
-            template['building_id'] = 'legacy-' + str(number)
-            (self.buildings.root / (format(number, '064x') + '.json')).write_text(json.dumps(template))
-        self.assertEqual(self.buildings.get('legacy-4104').building_id, 'legacy-4104')
-        with sqlite3.connect(self.buildings._files._index_path) as connection:
-            self.assertEqual(connection.execute('SELECT count(*) FROM paths').fetchone()[0], 4105)
+            identity = 'current-' + str(number)
+            template['building_id'] = identity
+            path = self.buildings._files.direct_path(identity)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(template))
+        self.assertEqual(self.buildings.get('current-4104').building_id, 'current-4104')
         self.assertEqual(len(self.buildings.list()), 4105)
 
-    def test_checkpoint_listing_parses_only_selected_new_records_and_detects_hidden_conflict(self):
+    def test_checkpoint_listing_parses_only_selected_direct_records(self):
         for number in range(8):
             value = checkpoint('item-' + str(number)); self.checkpoints.save(value)
             os.utime(self.checkpoints._path(value.checkpoint_id), ns=(number + 1, number + 1))
@@ -304,10 +290,9 @@ class FileIdentityChecks(unittest.TestCase):
         self.assertEqual([item['checkpoint_id'] for item in listed], ['item-7', 'item-6'])
         self.assertEqual(read.call_count, 2)
         self.legacy(checkpoint('item-0'))
-        with self.assertRaisesRegex(ValueError, '旧路径和新路径'): self.checkpoints.list(limit=1)
+        self.assertEqual(self.checkpoints.list(limit=1)[0]['checkpoint_id'], 'item-7')
 
     def test_new_path_iteration_consumes_directory_entries_lazily(self):
-        self.buildings._files.prepare()
         for number in range(200):
             path = self.buildings._files.direct_path('new-' + str(number))
             path.parent.mkdir(parents=True); path.write_text(topology('new-' + str(number)).model_dump_json())
@@ -327,7 +312,6 @@ class FileIdentityChecks(unittest.TestCase):
             finally: paths.close()
 
     def test_directory_links_are_fsynced_before_save_even_if_components_already_exist(self):
-        self.buildings._files.prepare()
         value = topology('😀' * 128); path = self.buildings._files.direct_path(value.building_id)
         path.parent.mkdir(parents=True)
         synced = set(); original = os.fsync
@@ -345,8 +329,7 @@ class FileIdentityChecks(unittest.TestCase):
             directory = directory.parent
 
     def test_failed_atomic_record_publication_preserves_old_record_and_leaves_no_new_record(self):
-        old = topology('old'); old_path = self.legacy(old); before = old_path.read_bytes()
-        self.buildings._files.prepare(); self.checkpoints._files.prepare()
+        old = topology('old'); self.buildings.save(old); old_path = self.buildings._path('old'); before = old_path.read_bytes()
         original = os.replace
         def fail_record(source, target):
             if Path(target).suffix == '.json': raise OSError('synthetic record publication failure')
@@ -381,30 +364,20 @@ class FileIdentityChecks(unittest.TestCase):
         with self.assertRaises(ValueError): ExplorationCheckpoint.model_validate(raw)
 
     def test_oversized_and_symlink_records_and_noncanonical_paths_fail(self):
-        path = self.legacy(topology())
+        path = self.buildings._path('unused')
+        self.buildings._files.prepare_parent(path)
         with path.open('wb') as stream: stream.truncate(MAX_RECORD_BYTES + 1)
         with self.assertRaisesRegex(ValueError, '四兆'): self.buildings.get('unused')
         path.unlink(); outside = self.root / 'outside.json'; outside.write_text(topology().model_dump_json())
         path.symlink_to(outside)
         with self.assertRaises(ValueError): self.buildings.get('unused')
-        path.unlink(); self.buildings._files.prepare()
+        path.unlink()
         direct = self.buildings._files.direct_path('linked'); direct.parent.mkdir(parents=True); direct.symlink_to(outside)
         with self.assertRaisesRegex(ValueError, '符号链接'): self.buildings.get('linked')
         invalid = self.buildings.root / 'by-id-v1' / 'id-%61' / 'record.json'
         invalid.parent.mkdir(); invalid.write_text(topology('a').model_dump_json())
         with self.assertRaises(ValueError): self.buildings._files._identity_from_direct_path(invalid)
 
-    def test_namespace_and_discovery_lock_symlinks_are_rejected_without_external_writes(self):
-        outside = self.root / 'external'; outside.mkdir()
-        self.buildings.root.symlink_to(outside, target_is_directory=True)
-        with self.assertRaisesRegex(ValueError, '符号链接'): self.buildings.get('any')
-        self.assertEqual(list(outside.iterdir()), [])
-        self.buildings.root.unlink(); self.buildings.root.mkdir()
-        lock_target = outside / 'lock'; lock_target.write_text('preserved')
-        (self.buildings.root / '.legacy-discovery.lock').symlink_to(lock_target)
-        with self.assertRaises(OSError): self.buildings.get('any')
-        self.assertEqual(lock_target.read_text(), 'preserved')
-        self.assertFalse(self.buildings._files._index_path.exists())
 
     def test_new_namespace_root_parent_is_fsynced_and_invalid_cold_id_does_not_scan(self):
         seen = set(); original = os.fsync
@@ -415,104 +388,30 @@ class FileIdentityChecks(unittest.TestCase):
         with patch('services.navigation.file_identity.os.scandir', side_effect=AssertionError('unexpected scan')):
             with self.assertRaises(ValueError): self.checkpoints.load('')
         self.assertFalse(self.checkpoints.root.exists())
-        # 模拟另一进程已 mkdir 但未同步父目录；本次发现仍必须完成同步。
+        # 模拟另一进程已创建目录，本次发布仍必须同步父目录。
         self.checkpoints.root.mkdir()
         with patch('services.navigation.file_identity.os.fsync', side_effect=remember):
-            self.checkpoints._files.prepare()
+            self.checkpoints.save(checkpoint('direct'))
         status = self.root.stat()
         self.assertIn((status.st_dev, status.st_ino), seen)
 
-    def test_failed_initial_discovery_and_failed_refresh_never_publish_partial_index(self):
-        self.legacy(topology('valid'))
-        bad = self.buildings.root / ('f' * 64 + '.json'); bad.write_text('bad json')
-        with self.assertRaises(ValueError): self.buildings.get('valid')
-        self.assertFalse(self.buildings._files._index_path.exists())
-        bad.unlink(); self.assertEqual(self.buildings.get('valid').building_id, 'valid')
-        before = self.buildings._files._index_path.read_bytes()
-        bad.write_text('bad json')
-        with self.assertRaises(ValueError): self.buildings.list()
-        self.assertEqual(self.buildings._files._index_path.read_bytes(), before)
-        self.assertEqual(BuildingCatalog(MapCatalogRepository(str(self.root))).get('valid').building_id, 'valid')
 
-    def test_index_publish_failure_retains_completed_index_and_cleans_private_temporary(self):
-        self.legacy(topology('old')); self.buildings.get('old')
-        before = self.buildings._files._index_path.read_bytes()
-        original = os.replace
-        def fail(source, target):
-            if Path(target) == self.buildings._files._index_path: raise OSError('synthetic publish failure')
-            return original(source, target)
-        with patch('services.navigation.file_identity.os.replace', side_effect=fail):
-            with self.assertRaises(OSError): self.buildings.list()
-        self.assertEqual(self.buildings._files._index_path.read_bytes(), before)
-        self.assertEqual(list(self.buildings.root.glob('.legacy-paths-*')), [])
-
-    def test_post_replace_fsync_error_reports_failure_with_only_complete_index_visible(self):
-        self.legacy(topology('old')); self.buildings.get('old')
-        self.legacy(topology('later'), 2)
-        root_status = self.buildings.root.stat(); original = os.fsync
-        def fail_publication_directory(descriptor):
-            status = os.fstat(descriptor)
-            if (status.st_dev, status.st_ino) == (root_status.st_dev, root_status.st_ino):
-                raise OSError('synthetic post-replace durability failure')
-            original(descriptor)
-        with patch('services.navigation.file_identity.os.fsync', side_effect=fail_publication_directory):
-            with self.assertRaisesRegex(OSError, 'post-replace'): self.buildings._files.refresh()
-        with sqlite3.connect(self.buildings._files._index_path) as connection:
-            self.assertEqual(connection.execute('SELECT count(*) FROM paths').fetchone()[0], 2)
-            self.assertEqual(connection.execute('SELECT version, complete FROM discovery').fetchone(), (1, 1))
-        self.assertEqual(self.buildings.get('later').building_id, 'later')
-
-    def test_refresh_io_does_not_block_completed_reads_or_independent_map_activation(self):
-        self.legacy(topology('old')); self.buildings.get('old')
-        entered, release = threading.Event(), threading.Event()
-        original = self.buildings._files._read_identity
-        def blocked(path):
-            entered.set()
-            if not release.wait(5): raise TimeoutError('test did not release discovery')
-            return original(path)
-        with ThreadPoolExecutor(max_workers=2) as pool, patch.object(self.buildings._files, '_read_identity', side_effect=blocked):
-            future = pool.submit(self.buildings._files.refresh)
-            self.assertTrue(entered.wait(3))
-            try:
-                other = BuildingCatalog(MapCatalogRepository(str(self.root)))
-                self.assertEqual(other.get('old').building_id, 'old')
-                with other.maps.map_activation_guard():
-                    self.assertEqual(other.get('old').revision, 1)
-            finally: release.set()
-            future.result(timeout=3)
-
-    def test_writes_wait_for_discovery_before_taking_map_activation_lock(self):
-        self.legacy(topology('old')); self.buildings.get('old')
-        entered, release = threading.Event(), threading.Event()
-        original = self.buildings._files._read_identity
-        def blocked(path):
-            entered.set(); release.wait(5); return original(path)
-        with ThreadPoolExecutor(max_workers=2) as pool, patch.object(self.buildings._files, '_read_identity', side_effect=blocked):
-            refreshing = pool.submit(self.buildings._files.refresh); self.assertTrue(entered.wait(3))
-            writing = pool.submit(self.buildings.save, topology('new'))
-            try:
-                with self.buildings.maps.map_activation_guard(): self.assertFalse(writing.done())
-            finally: release.set()
-            refreshing.result(timeout=3); writing.result(timeout=3)
-
-    def test_cold_discovery_under_map_guard_fails_without_scan_or_wait(self):
+    def test_cold_direct_read_under_map_guard_never_scans(self):
         with self.buildings.maps.map_activation_guard(), patch('services.navigation.file_identity.os.scandir', side_effect=AssertionError('scan')):
-            with self.assertRaisesRegex(RuntimeError, '事务之外'): self.buildings.get('cold')
-        self.assertFalse(self.buildings._files._index_path.exists())
+            self.assertIsNone(self.buildings.get('cold'))
 
-    def test_concurrent_process_builders_publish_one_complete_index(self):
-        self.legacy(topology('old'))
+    def test_concurrent_processes_read_same_direct_record(self):
+        self.buildings.save(topology('old'))
         context = multiprocessing.get_context('fork'); start = context.Event(); results = context.Queue()
         workers = [context.Process(target=discover_in_process, args=(str(self.root), start, results)) for _ in range(2)]
         for worker in workers: worker.start()
         start.set()
         for worker in workers:
             worker.join(8)
-            if worker.is_alive(): worker.terminate(); worker.join(); self.fail('discovery process stuck')
+            if worker.is_alive(): worker.terminate(); worker.join(); self.fail('read process stuck')
             self.assertEqual(worker.exitcode, 0)
         self.assertEqual([results.get(timeout=2) for _ in workers], ['old', 'old'])
-        with sqlite3.connect(self.buildings._files._index_path) as connection:
-            self.assertEqual(connection.execute('SELECT count(*) FROM paths').fetchone()[0], 1)
+        self.assertFalse((self.buildings.root / 'legacy-paths.sqlite3').exists())
         results.close()
 
     def test_concurrent_building_revision_and_immutable_checkpoint_writes(self):

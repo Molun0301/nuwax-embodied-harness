@@ -198,8 +198,6 @@ class NavigationService:
         self._forbidden_zone_required_generation: Optional[int] = None
         self._forbidden_zone_required_signature: Optional[str] = None
         self._forbidden_zone_required_map_name: Optional[str] = None
-        self._forbidden_zone_cancel_wait_timeout_sec = 5.0
-        self._forbidden_zone_cancel_poll_interval_sec = 0.05
         self._forbidden_zone_revision_wait_timeout_sec = 2.0
         self._forbidden_zone_revision_poll_interval_sec = 0.05
         # 平台导航状态机
@@ -514,27 +512,9 @@ class NavigationService:
                 exploration_request_id=exploration_request_id,
             )
             if exploration_request_id:
-                exploration_context = self.stop_exploration(
-                    request_id=exploration_request_id
-                )
-                self._wait_for_forbidden_zone_exploration_stop(
-                    exploration_request_id,
-                    initial_state=getattr(
-                        exploration_context,
-                        "exploration_state",
-                        None,
-                    ),
-                )
+                self.stop_exploration(request_id=exploration_request_id)
             if goal_id:
-                navigation_context = self.cancel_goal(request_id=goal_id)
-                self._wait_for_forbidden_zone_navigation_stop(
-                    goal_id,
-                    initial_state=getattr(
-                        navigation_context,
-                        "navigation_state",
-                        None,
-                    ),
-                )
+                self.cancel_goal(request_id=goal_id)
 
             envelope = self._forbidden_zone_store.replace(
                 map_name=map_name,
@@ -781,162 +761,6 @@ class NavigationService:
             and str(getattr(state, "current_goal_id", "") or "").strip() == goal_id
         )
 
-    def _forbidden_zone_cancel_wait_settings(self) -> Tuple[float, float]:
-        timeout_sec = max(
-            0.0,
-            float(
-                self._forbidden_zone_cancel_wait_timeout_sec
-            ),
-        )
-        poll_interval_sec = max(
-            0.01,
-            float(
-                self._forbidden_zone_cancel_poll_interval_sec
-            ),
-        )
-        return timeout_sec, poll_interval_sec
-
-    def _wait_for_forbidden_zone_navigation_stop(
-        self,
-        goal_id: str,
-        *,
-        initial_state=None,
-    ) -> None:
-        provider = self._forbidden_zone_navigation_provider()
-        if initial_state is not None and self._navigation_has_terminal(
-            initial_state,
-            goal_id=goal_id,
-        ):
-            return
-        if provider is None:
-            raise GatewayError(
-                "导航取消已下发，但无法读取后端终态。",
-                error_code="navigation_cancel_confirmation_unavailable",
-                http_status=503,
-                details={"goal_id": goal_id},
-            )
-        timeout_sec, poll_interval_sec = (
-            self._forbidden_zone_cancel_wait_settings()
-        )
-        deadline = time.monotonic() + timeout_sec
-        last_state = initial_state
-        while True:
-            try:
-                last_state = provider.get_navigation_state()
-            except Exception as exc:
-                raise GatewayError(
-                    "导航取消后无法读取后端终态。",
-                    error_code="navigation_cancel_confirmation_unavailable",
-                    http_status=503,
-                    details={"goal_id": goal_id},
-                ) from exc
-            if self._navigation_has_terminal(
-                last_state,
-                goal_id=goal_id,
-            ):
-                return
-            metadata = dict(getattr(last_state, "metadata", {}) or {})
-            cancel_phase = str(metadata.get("cancel_phase") or "").strip().upper()
-            if (
-                self._status_value(last_state) == NavigationStatus.FAILED.value
-                or cancel_phase in {"FAILED", "TIMED_OUT"}
-            ):
-                raise GatewayError(
-                    "导航取消失败，尚未取得本目标终态。",
-                    error_code="navigation_cancel_failed",
-                    http_status=409,
-                    details={
-                        "goal_id": goal_id,
-                        "cancel_phase": cancel_phase or None,
-                    },
-                )
-            if time.monotonic() >= deadline:
-                raise GatewayError(
-                    "等待导航后端终态超时，禁行区未写入。",
-                    error_code="navigation_cancel_confirmation_timeout",
-                    http_status=503,
-                    details={
-                        "goal_id": goal_id,
-                        "active_status": self._status_value(last_state) or None,
-                    },
-                )
-            time.sleep(poll_interval_sec)
-
-    def _wait_for_forbidden_zone_exploration_stop(
-        self,
-        request_id: str,
-        *,
-        initial_state=None,
-    ) -> None:
-        if initial_state is not None and _is_complete_exploration_terminal(
-            initial_state,
-            request_id=request_id,
-        ):
-            return
-        owner = self._provider_owner
-        provider = getattr(owner, "providers", None)
-        state_reader = getattr(provider, "get_exploration_state", None)
-        if not callable(state_reader):
-            raise GatewayError(
-                "探索停止已下发，但无法验证 child navigation 已清空。",
-                error_code="exploration_stop_confirmation_unavailable",
-                http_status=503,
-                details={"request_id": request_id},
-            )
-        timeout_sec, poll_interval_sec = (
-            self._forbidden_zone_cancel_wait_settings()
-        )
-        deadline = time.monotonic() + timeout_sec
-        last_state = initial_state
-        while True:
-            try:
-                last_state = state_reader()
-            except Exception as exc:
-                raise GatewayError(
-                    "探索停止后无法读取 child navigation 清理状态。",
-                    error_code="exploration_stop_confirmation_unavailable",
-                    http_status=503,
-                    details={"request_id": request_id},
-                ) from exc
-            if _is_complete_exploration_terminal(
-                last_state,
-                request_id=request_id,
-            ):
-                return
-            observed_request_id = str(
-                getattr(last_state, "current_request_id", "") or ""
-            ).strip()
-            if (
-                observed_request_id
-                and observed_request_id != request_id
-                and self._status_value(last_state)
-                in {
-                    ExplorationStatus.ACCEPTED.value,
-                    ExplorationStatus.RUNNING.value,
-                }
-            ):
-                raise GatewayError(
-                    "探索停止确认时检测到其它活动 request_id。",
-                    error_code="exploration_request_mismatch",
-                    http_status=409,
-                    details={
-                        "request_id": request_id,
-                        "active_request_id": observed_request_id,
-                    },
-                )
-            if time.monotonic() >= deadline:
-                metadata = dict(getattr(last_state, "metadata", {}) or {})
-                raise GatewayError(
-                    "等待探索 child navigation 清空超时，禁行区未写入。",
-                    error_code="exploration_stop_confirmation_timeout",
-                    http_status=503,
-                    details={
-                        "request_id": request_id,
-                        "active_status": self._status_value(last_state) or None,
-                        "child_task_id": metadata.get("child_task_id"),
-                    },
-                )
-            time.sleep(poll_interval_sec)
 
     def _forbidden_zone_navigation_provider(self):
         owner = self._provider_owner

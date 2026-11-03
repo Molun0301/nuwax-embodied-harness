@@ -153,121 +153,6 @@ _MCP_STANDALONE_TOOL_TARGETS: Dict[str, str] = {
 _MCP_STANDALONE_TOOL_TARGETS["start_exploration"] = "explore_area_v2"
 
 
-# V2 新增 tool 的 input_schema（spec mcp-end-to-end §MCP 工具四件套 + §错误码契约统一）。
-_MCP_STANDALONE_TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
-    "navigate_to_pose": {
-        "type": "object",
-        "properties": {
-            "pose": {
-                "type": "object",
-                "description": "目标位姿 Pose2D。",
-                "properties": {
-                    "x": {"type": "number", "description": "X 坐标（米）。"},
-                    "y": {"type": "number", "description": "Y 坐标（米）。"},
-                    "yaw": {"type": "number", "description": "偏航角（弧度）。"},
-                    "frame_id": {"type": "string", "description": "坐标系 ID，默认 map。"},
-                },
-                "required": ["x", "y"],
-            },
-            "timeout_sec": {
-                "type": "integer",
-                "minimum": 1,
-                "default": 60,
-                "description": "超时秒数（默认 60s）。",
-            },
-        },
-        "required": ["pose"],
-        "additionalProperties": False,
-    },
-    "cancel_navigation": {
-        "type": "object",
-        "properties": {
-            "request_id": {
-                "type": "string",
-                "description": "可选；指定 request_id 时仅取消该目标，缺省取消当前 ACTIVE。",
-            },
-        },
-        "additionalProperties": False,
-    },
-    "get_navigation_state": {
-        "type": "object",
-        "properties": {},
-        "additionalProperties": False,
-    },
-    "start_exploration": {
-        "type": "object",
-        "properties": {
-            "boundary_line_segments": {
-                "type": "array",
-                "description": "手划多段线段；每段 [p1, p2]，p = {x, y, yaw?}。",
-                "items": {
-                    "type": "array",
-                    "minItems": 2,
-                    "maxItems": 2,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "x": {"type": "number"},
-                            "y": {"type": "number"},
-                            "yaw": {"type": "number"},
-                            "frame_id": {"type": "string"},
-                        },
-                        "required": ["x", "y"],
-                        "additionalProperties": False,
-                    },
-                },
-                "minItems": 1,
-            },
-            "map_name": {
-                "type": "string",
-                "description": "目标地图名称（可选；缺省走当前激活地图）。",
-            },
-            "frame_id": {"type": "string", "default": "map"},
-            "strategy": {"type": "string", "default": "wavefront"},
-            "arbitration": {"type": "string", "default": "prefer_wavefront"},
-            "stop_conditions": {
-                "type": "object",
-                "properties": {
-                    "max_coverage_pct": {
-                        "type": "number",
-                        "exclusiveMinimum": 0.0,
-                        "maximum": 100.0,
-                    },
-                    "no_frontier_timeout_ms": {"type": "integer", "minimum": 1},
-                    "max_duration_ms": {"type": "integer", "minimum": 1},
-                    "max_goals": {"type": "integer", "minimum": 1},
-                },
-                "additionalProperties": False,
-            },
-            "max_navigation_retries": {
-                "type": "integer",
-                "minimum": 0,
-                "default": 1,
-            },
-            "blacklist_radius_m": {
-                "type": "number",
-                "minimum": 0.0,
-                "default": 0.75,
-            },
-            "max_duration_sec": {
-                "type": "number",
-                "exclusiveMinimum": 0.0,
-            },
-            "poll_interval_sec": {
-                "type": "number",
-                "exclusiveMinimum": 0.0,
-                "default": 0.2,
-            },
-            "timeout_sec": {
-                "type": "number",
-                "exclusiveMinimum": 0.0,
-            },
-        },
-        "additionalProperties": False,
-    },
-}
-
-
 def _tool_layer(descriptor: SkillDescriptor) -> str:
     return str(getattr(descriptor, "metadata", {}).get("capability_layer") or "platform")
 
@@ -363,8 +248,7 @@ def _build_standalone_platform_tools(platform_catalog: Dict[str, Dict[str, Any]]
     for tool_name in _MCP_STANDALONE_PLATFORM_TOOLS:
         target_name = _MCP_STANDALONE_TOOL_TARGETS[tool_name]
         item = platform_catalog.get(target_name)
-        fallback_schema = _MCP_STANDALONE_TOOL_SCHEMAS.get(tool_name)
-        # 目录只发布当前可调用目标；参数模式只能补充已存在目标的描述。
+        # 目录只发布当前可调用目标。
         if item is None:
             continue
         tools.append(
@@ -374,7 +258,7 @@ def _build_standalone_platform_tools(platform_catalog: Dict[str, Dict[str, Any]]
                     f"{item['display_name']}。{item['description']} "
                     "这是独立 MCP 工具，直接传参调用，不要走 platform.function。"
                 ),
-                "inputSchema": item.get("input_schema") or fallback_schema or {"type": "object", "properties": {}, "additionalProperties": False},
+                "inputSchema": item["input_schema"],
             }
         )
     return tools

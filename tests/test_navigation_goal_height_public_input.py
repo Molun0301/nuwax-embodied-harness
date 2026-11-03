@@ -24,7 +24,7 @@ from core.event_bus import EventBus
 from core.settings import GatewayServerConfig
 from gateways.auth import GatewayAccessManager
 from gateways.errors import GatewayError
-from gateways.http.api import NavigationGoalRequest, _build_navigation_goal, build_http_router
+from gateways.http.api import build_http_router
 from gateways.mcp.protocol import _build_collection_tools, _resolve_tool_invocation
 from gateways.motion_guard import MotionAdmission
 from gateways.runtime import GatewayRuntime
@@ -209,8 +209,6 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
                     for phrase in ("schema 2", "schema 1", "定位准备", "新鲜", "不代表拥有方高度证据"):
                         self.assertIn(phrase, description)
                 self.assertNotIn("pose", schema["properties"])
-        for phrase in ("schema 2", "schema 1", "定位准备", "新鲜", "不代表拥有方高度证据"):
-            self.assertIn(phrase, NavigationGoalRequest.model_json_schema()["properties"]["pose"]["description"])
 
     def test_generic_pose_helper_remains_unchanged_for_exploration(self):
         gateway = self.configure_runner(self.gateway())
@@ -247,23 +245,20 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
 
     def test_legacy_3d_http_xy_keeps_zero_without_reading_unbound_pose(self):
         for raises in (False, True):
-            for nested in (False, True):
-                with self.subTest(raises=raises, nested=nested):
-                    gateway = self.configure_runner(self.gateway(), schema_version=1)
-                    getter = gateway.map_workspace_service.get_relocalized_pose
-                    getter.side_effect = AssertionError("不应读取旧式未绑定高度") if raises else None
-                    getter.return_value = Pose(frame_id="map", position=Vector3(z=91.5))
-                    coordinates = {"x": 4.25, "y": -1.5}
-                    pose = {"position": coordinates} if nested else coordinates
-                    response = self.client(gateway).post("/api/navigation/goal",
-                        json={"goal_id": "legacy-height-goal", "pose": pose})
-                    self.assertEqual(response.status_code, 200, response.text)
-                    self.assertNotIn("z", gateway.forwarded_arguments[-1][1])
-                    self.assert_pending_target(gateway)
-                    self.run_latest(gateway)
-                    self.assertEqual(gateway.dispatched[-1].target_pose.position.z, 0.0)
-                    self.assertNotIn("navigation_height_pending", gateway.dispatched[-1].metadata)
-                    getter.assert_not_called()
+            with self.subTest(raises=raises):
+                gateway = self.configure_runner(self.gateway(), schema_version=1)
+                getter = gateway.map_workspace_service.get_relocalized_pose
+                getter.side_effect = AssertionError("不应读取旧式未绑定高度") if raises else None
+                getter.return_value = Pose(frame_id="map", position=Vector3(z=91.5))
+                response = self.client(gateway).post("/api/capabilities/navigate_to_pose/invoke", json={"arguments": {
+                    "goal_id": "legacy-height-goal", "frame_id": "map", "x": 4.25, "y": -1.5}})
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertNotIn("z", gateway.forwarded_arguments[-1][1])
+                self.assert_pending_target(gateway)
+                self.run_latest(gateway)
+                self.assertEqual(gateway.dispatched[-1].target_pose.position.z, 0.0)
+                self.assertNotIn("navigation_height_pending", gateway.dispatched[-1].metadata)
+                getter.assert_not_called()
 
     def test_async_schema_choice_uses_workspace_after_localization_preparation(self):
         for before, after, expected_z in ((1, 2, 7.25), (2, 1, 0.0)):
@@ -321,58 +316,32 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
                     self.assertEqual(gateway.dispatched[-1].target_pose.position.z, z)
             gateway.map_workspace_service.get_relocalized_pose.assert_not_called()
 
-    def test_http_compatibility_helper_preserves_missing_vs_explicit_zero_for_both_shapes(self):
-        for nested in (False, True):
-            with self.subTest(nested=nested):
-                coordinates = {"x": 4.25, "y": -1.5}
-                missing = {"position": coordinates} if nested else coordinates
-                explicit_coordinates = {**coordinates, "z": 0.0}
-                explicit = {"position": explicit_coordinates} if nested else explicit_coordinates
-                goals = [_build_navigation_goal(NavigationGoalRequest(goal_id="height-goal", pose=pose))
-                         for pose in (missing, explicit)]
-                self.assertNotIn("z", goals[0].target_pose.position.model_fields_set)
-                self.assertIn("z", goals[1].target_pose.position.model_fields_set)
-                self.assertEqual(goals[1].target_pose.position.z, 0.0)
+    def test_removed_navigation_route_is_absent(self):
+        gateway = self.configure_runner(self.gateway())
+        response = self.client(gateway).post("/api/navigation/goal", json={"goal_id": "old", "pose": {"x": 1, "y": 2}})
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(gateway.forwarded_arguments, [])
 
     def test_real_http_3d_xy_preserves_omission_and_dispatches_owned_height(self):
         gateway = self.configure_runner(self.gateway())
-        client = self.client(gateway)
-        for nested in (False, True):
-            with self.subTest(nested=nested):
-                coordinates = {"x": 4.25, "y": -1.5}
-                pose = {"position": coordinates} if nested else coordinates
-                response = client.post("/api/navigation/goal", json={"goal_id": "height-goal", "pose": pose})
-                self.assertEqual(response.status_code, 200, response.text)
-                capability, forwarded = gateway.forwarded_arguments[-1]
-                self.assertEqual(capability, "navigate_to_pose")
-                self.assertEqual(forwarded, {
-                    "goal_id": "height-goal", "frame_id": "map",
-                    "x": 4.25, "y": -1.5,
-                })
-                self.assert_pending_target(gateway)
-                self.run_latest(gateway)
-                self.assertEqual(gateway.dispatched[-1].target_pose.position.z, 7.25)
-                self.assertFalse(gateway.dispatched[-1].require_goal_orientation)
+        arguments = {"goal_id": "height-goal", "frame_id": "map", "x": 4.25, "y": -1.5}
+        response = self.client(gateway).post("/api/capabilities/navigate_to_pose/invoke", json={"arguments": arguments})
+        self.assertEqual(response.status_code, 200, response.text)
+        capability, forwarded = gateway.forwarded_arguments[-1]
+        self.assertEqual(capability, "navigate_to_pose")
+        self.assertEqual(forwarded, arguments)
+        self.assert_pending_target(gateway)
+        self.run_latest(gateway)
+        self.assertEqual(gateway.dispatched[-1].target_pose.position.z, 7.25)
+        self.assertFalse(gateway.dispatched[-1].require_goal_orientation)
 
-    def test_real_http_preserves_explicit_yaw_including_zero_for_flat_and_nested_shapes(self):
+    def test_real_http_preserves_explicit_yaw_including_zero(self):
         gateway = self.configure_runner(self.gateway())
         client = self.client(gateway)
-        coordinates = {"x": 4.25, "y": -1.5}
-        cases = [
-            ({**coordinates, key: yaw}, yaw)
-            for key in ("yaw", "yaw_rad") for yaw in (0.0, 0.75, -0.75)
-        ]
-        cases.extend([
-            ({**coordinates, "yaw": 0.75, "yaw_rad": 0.0}, 0.0),
-            ({"position": coordinates, "orientation": {}}, 0.0),
-            ({"position": coordinates, "orientation": {"z": 0.0, "w": 1.0}}, 0.0),
-            ({"position": coordinates, "orientation": {
-                "z": math.sin(-0.75 / 2.0), "w": math.cos(-0.75 / 2.0),
-            }}, -0.75),
-        ])
-        for pose, yaw in cases:
-            with self.subTest(pose=pose):
-                response = client.post("/api/navigation/goal", json={"goal_id": "yaw-goal", "pose": pose})
+        for yaw in (0.0, 0.75, -0.75):
+            with self.subTest(yaw=yaw):
+                response = client.post("/api/capabilities/navigate_to_pose/invoke", json={"arguments": {
+                    "goal_id": "yaw-goal", "frame_id": "map", "x": 4.25, "y": -1.5, "yaw_rad": yaw}})
                 self.assertEqual(response.status_code, 200, response.text)
                 forwarded = gateway.forwarded_arguments[-1][1]
                 self.assertAlmostEqual(forwarded["yaw_rad"], yaw)
@@ -406,38 +375,36 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
                     self.assertEqual(goal.tolerance_yaw_rad, yaw_tolerance)
                     self.assertTrue(goal.allow_reverse)
 
-    def test_real_http_preserves_explicit_height_for_both_shapes_and_pipelines(self):
+    def test_real_http_preserves_explicit_height_for_both_pipelines(self):
         for pipeline, schema_version in ((p, s) for p in ("lio_3d", "slam_2d") for s in (1, 2)):
             gateway = self.configure_runner(self.gateway(pipeline), schema_version=schema_version)
             self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'owned_pose', None, create=True))
             client = self.client(gateway)
-            for nested in (False, True):
-                for z in (2.75, 0.0, -1.25):
-                    with self.subTest(pipeline=pipeline, schema_version=schema_version, nested=nested, z=z):
-                        coordinates = {"x": 4.25, "y": -1.5, "z": z}
-                        pose = {"position": coordinates} if nested else coordinates
-                        response = client.post("/api/navigation/goal", json={"goal_id": "height-goal", "pose": pose})
-                        self.assertEqual(response.status_code, 200, response.text)
-                        self.assertEqual(gateway.forwarded_arguments[-1][1]["z"], z)
-                        self.assert_queued_target(gateway, z=z)
-                        self.run_latest(gateway)
-                        self.assertEqual(gateway.dispatched[-1].target_pose.position.z, z)
+            for z in (2.75, 0.0, -1.25):
+                with self.subTest(pipeline=pipeline, schema_version=schema_version, z=z):
+                    response = client.post("/api/capabilities/navigate_to_pose/invoke", json={"arguments": {
+                        "goal_id": "height-goal", "frame_id": "map", "x": 4.25, "y": -1.5, "z": z}})
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual(gateway.forwarded_arguments[-1][1]["z"], z)
+                    self.assert_queued_target(gateway, z=z)
+                    self.run_latest(gateway)
+                    self.assertEqual(gateway.dispatched[-1].target_pose.position.z, z)
             gateway.map_workspace_service.get_relocalized_pose.assert_not_called()
 
-    def test_planar_xy_compatibility_remains_accepted_via_mcp_and_http(self):
+    def test_planar_xy_remains_accepted_via_mcp_and_http(self):
         gateway = self.configure_runner(self.gateway("slam_2d"))
         self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'owned_pose', None, create=True))
-        self.mcp_call(gateway, {"frame_id": "map", "x": 4.25, "y": -1.5})
+        arguments = {"frame_id": "map", "x": 4.25, "y": -1.5}
+        self.mcp_call(gateway, arguments)
         self.assert_queued_target(gateway, z=0.0)
         self.run_latest(gateway)
-        client = self.client(gateway)
-        for pose in ({"x": 4.25, "y": -1.5}, {"position": {"x": 4.25, "y": -1.5}}):
-            response = client.post("/api/navigation/goal", json={"goal_id": "planar-height-goal", "pose": pose})
-            self.assertEqual(response.status_code, 200, response.text)
-            self.assertNotIn("z", gateway.forwarded_arguments[-1][1])
-            self.assert_queued_target(gateway, z=0.0)
-            self.run_latest(gateway)
-        self.assertEqual([goal.target_pose.position.z for goal in gateway.dispatched], [0.0] * 3)
+        response = self.client(gateway).post("/api/capabilities/navigate_to_pose/invoke", json={"arguments": {
+            "goal_id": "planar-height-goal", **arguments}})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertNotIn("z", gateway.forwarded_arguments[-1][1])
+        self.assert_queued_target(gateway, z=0.0)
+        self.run_latest(gateway)
+        self.assertEqual([goal.target_pose.position.z for goal in gateway.dispatched], [0.0] * 2)
         gateway.map_workspace_service.get_relocalized_pose.assert_not_called()
 
     def test_unavailable_stale_future_wrong_frame_and_invalid_pose_never_guess_or_dispatch(self):

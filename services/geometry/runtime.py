@@ -6655,7 +6655,7 @@ class PlatformGeometryRuntime:
         if not running:
             guidance = (
                 "几何栈未运行。遥控建图请调用 start_mapping(map_name)；"
-                "自主探索请调用 explore_area(map_name)。"
+                "自主探索请调用 explore_area_v2(map_name)。"
                 "activate_map 用于切换地图工作区。"
             )
         elif launch_mode == "mapping":
@@ -6692,7 +6692,7 @@ class PlatformGeometryRuntime:
             "exploration_active": exploration_active,
             "exploration_terminal": terminal_state is not None,
             "teleop_mapping_api": "start_mapping",
-            "autonomous_explore_api": "explore_area",
+            "autonomous_explore_api": "explore_area_v2",
             "stop_exploration_api": "stop_exploration",
             "stop_geometry_stack_api": "stop_mapping",
             "agent_guidance": guidance,

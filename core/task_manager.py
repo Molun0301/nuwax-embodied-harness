@@ -211,6 +211,13 @@ class TaskExecutionContext:
 
         return self.manager.update_task(self.task_id, progress=progress, stage=stage, message=message, payload=payload)
 
+    def retain_result(self, result: Any) -> None:
+        """保存中断后仍需交付的业务结果，不改变任务终态与停车确认。"""
+        with self.manager._lock:
+            record = self.manager._records[self.task_id]
+            record.result = _snapshot(result)
+            self.manager._receipt_changed_locked(record)
+
     def is_cancel_requested(self) -> bool:
         """判断是否已请求取消。"""
 
@@ -1364,7 +1371,7 @@ class TaskManager:
                 }
             )
             self._active_records.pop(task_id, None)
-            if not record.runner_returned:
+            if not record.runner_returned and (result is not None or record.result is None):
                 record.result = result
             record.error = error
             record.error_payload = terminal_error_payload or None

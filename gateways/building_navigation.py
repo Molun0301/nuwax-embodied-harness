@@ -42,6 +42,8 @@ class GatewayBuildingPorts:
 
     def progress(self, state) -> None:
         self.state = state
+        if state.terminal:
+            self.context.retain_result({"request_id": state.request.request_id, "building_navigation": state})
         self.context.update(stage="floor_" + state.stage, message=state.last_message or "正在执行楼层连接。",
                             payload={"building_navigation": state.model_dump(mode="json")})
         self.context.update_metadata({"building_request_id": state.request.request_id, "building_stage": state.stage})
@@ -177,8 +179,6 @@ class GatewayBuildingPorts:
                 self.runtime.map_workspace_service.create_map(map_name=floor.map_name,display_name=floor.display_name,
                     metadata={"floor_creation_request_id":request_id,"floor_id":floor.floor_id})
             elif existing.finalized:
-                if existing.identity_schema_version!=2 or existing.asset_identity is None:
-                    raise GatewayError("旧层图检查点需先导入分配身份，不能按旧摘要恢复。",error_code="floor_legacy_asset_requires_import")
                 restored=floor.model_copy(update={"asset_identity":existing.asset_identity})
                 if not self.activate_and_localize(restored,connection.arrival_pose):
                     raise GatewayError("初始层图已有检查点，但尚未恢复定位。",error_code="floor_new_map_localization_required")

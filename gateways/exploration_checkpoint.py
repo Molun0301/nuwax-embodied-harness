@@ -18,7 +18,7 @@ def request_pause(runtime, request_id):
     """只请求原任务中断；存图结果由原任务元数据单独报告。"""
     for status in runtime.task_manager.list_active_tasks():
         spec = runtime.task_manager.get_task_spec(status.task_id)
-        if spec.capability_name not in {"explore_area", "explore_area_v2"} or not runtime._task_matches_exploration_request(status.task_id, request_id):
+        if spec.capability_name != "explore_area_v2" or not runtime._task_matches_exploration_request(status.task_id, request_id):
             continue
         checkpoint_id = spec.metadata.get("pause_checkpoint_id") or "exploration-" + uuid.uuid4().hex
         runtime.task_manager.update_task_metadata(status.task_id, {"pause_checkpoint_id": checkpoint_id, "exploration_checkpoint": {"status": "pending", "checkpoint_id": checkpoint_id}})

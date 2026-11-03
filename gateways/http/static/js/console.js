@@ -34,7 +34,7 @@
       const LOCALIZATION_DISPLAY_IDLE_MESSAGE = "无活跃地图/建图/导航/探索，隐藏定位。";
       const ACTIVE_SPATIAL_STATUSES = new Set(["accepted", "planning", "running"]);
       const ACTIVE_SPATIAL_CAPABILITIES = new Set([
-        "explore_area",
+        "explore_area_v2",
         "explore_and_find_target",
         "navigate_to_pose",
         "navigate_to_named_location",

@@ -388,11 +388,11 @@ _ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE: Dict[str, Dict[str, object]] = {
             "同名记忆库会一并激活。提交后先等待约 45 秒，再每 12 秒轮询 get_task_status。"
         ),
     },
-    "explore_area": {
+    "explore_area_v2": {
         "initial_wait_sec": 30.0,
         "poll_interval_sec": 15.0,
         "hint": (
-            "explore_area 受理后在后台启动服务、准备地图并等待定位与导航输入，"
+            "explore_area_v2 受理后在后台启动服务、准备地图并等待定位与导航输入，"
             "约 30 秒后再 get_task_status，之后每 15 秒轮询至任务终态。"
             "准备阶段看 waiting_for 与 message；accepted 不代表已经开始移动。"
             "探索进度看 frontier_count，失败时保留具体原因。"
@@ -400,10 +400,6 @@ _ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE: Dict[str, Dict[str, object]] = {
         ),
     },
 }
-# Keep v2 policy values aligned while preventing mutation through either entry.
-_ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE["explore_area_v2"] = dict(
-    _ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE["explore_area"]
-)
 _RUNTIME_ACTIVATION_TIMEOUT_SEC = 95.0
 _PERSON_FOLLOW_TARGET_MAX_PERIOD_SEC = 0.2
 _PERSON_FOLLOW_DEFAULT_LOST_TIMEOUT_SEC = 2.0
@@ -427,7 +423,6 @@ _MOTION_STACK_CAPABILITY_NAMES = frozenset(
         "navigate_to_place",
         "navigate_to_named_location",
         "find_target",
-        "explore_area",
         "explore_area_v2",
         "explore_and_find_target",
     }
@@ -1320,7 +1315,6 @@ class GatewayRuntime:
                 self.robot.manifest.robot_name,
                 self.robot.manifest.robot_model,
             )
-            pending_floor=self._pending_floor_execution() or self._pending_building_exploration()
             self._mark_geometry_cmd_vel_sink_unavailable()
             self.robot.start()
             self._started = True
@@ -1330,16 +1324,15 @@ class GatewayRuntime:
             except Exception:
                 RUNTIME_LOGGER.exception("自动启动持续视频感知运行时失败。")
             self._start_data_frame_stream_sources()
-            # 地图工作区仅由 MCP activate_map 显式切换，启动时不自动恢复。
-            if self.config.runtime_data.map_active_restore_on_start and pending_floor is None:
+            # 按启动配置恢复地图工作区。
+            if self.config.runtime_data.map_active_restore_on_start:
                 try:
                     self.map_workspace_service.restore_active_workspace(load_memory_history=True)
                 except Exception:
                     RUNTIME_LOGGER.exception("恢复激活地图工作区失败。")
             else:
                 RUNTIME_LOGGER.info(
-                    "存在未决跨层任务，地图恢复由原任务核对设施后执行。" if pending_floor is not None
-                    else "启动时跳过自动恢复地图工作区（NUWAX_ACTIVE_MAP_RESTORE_ON_START=false）。"
+                    "启动时跳过自动恢复地图工作区（NUWAX_ACTIVE_MAP_RESTORE_ON_START=false）。"
                 )
             self._publish_pointcloud_map_stream_frame(reason="runtime_start_post_restore")
             self._refresh_dynamic_capability_matrix()
@@ -2972,7 +2965,7 @@ class GatewayRuntime:
             _descriptor(
                 "stop_exploration",
                 "停止自主探索",
-                "与 explore_area/explore_area_v2 配对：停止探索 controller，取消在途 child navigation，"
+                "与 explore_area_v2 配对：停止探索 controller，取消在途 child navigation，"
                 "等待 guard ZEROED 终态并取消父任务；request_id 可省略以停止当前探索。不会停止建图会话。",
                 execution_mode=CapabilityExecutionMode.SYNC,
                 risk_level=CapabilityRiskLevel.MEDIUM,
@@ -3377,7 +3370,6 @@ class GatewayRuntime:
                 output_schema=_schema_object(
                     {
                         "ok": {"type": "boolean"},
-                        "alias_of": {"type": "string"},
                         "request_id": {"type": ["string", "null"]},
                         "navigation_state": {"type": "object"},
                         "cancellation_requested": {"type": "boolean"},
@@ -3398,7 +3390,6 @@ class GatewayRuntime:
                 output_schema=_schema_object(
                     {
                         "ok": {"type": "boolean"},
-                        "alias_of": {"type": "string"},
                         "navigation_state": {"type": "object"},
                         "error_code": {"type": "string"},
                         "unavailable_reason": {"type": "string"},
@@ -3457,40 +3448,6 @@ class GatewayRuntime:
                 cancel_supported=True,
             ),
             _descriptor(
-                "explore_area",
-                "探索区域",
-                "通过 nuwax-geometry-runtime 启动 wavefront 前沿探索，持续使用最新地图 revision "
-                "并把 frontier 子目标交给 guard-backed 导航链。停止时调用 stop_exploration；"
-                "遥控建图仍使用 start_mapping。",
-                execution_mode=CapabilityExecutionMode.ASYNC_TASK,
-                risk_level=CapabilityRiskLevel.MEDIUM,
-                input_schema=_schema_object(
-                    {
-                        "map_name": {"type": "string"},
-                        "target_name": {"type": "string"},
-                        "frame_id": {"type": "string"},
-                        "x": {"type": "number"},
-                        "y": {"type": "number"},
-                        "z": {"type": "number", "default": 0.0},
-                        "radius_m": {"type": "number", "exclusiveMinimum": 0.0},
-                        "strategy": {"type": "string", "default": "wavefront"},
-                        "max_duration_sec": {"type": "number", "exclusiveMinimum": 0.0},
-                        "stop_conditions": _exploration_stop_conditions_schema(),
-                        "return_policy": _exploration_return_policy_schema(),
-                        "poll_interval_sec": {"type": "number", "exclusiveMinimum": 0.0, "default": 0.2},
-                        "timeout_sec": {"type": "number", "exclusiveMinimum": 0.0},
-                    }
-                ),
-                output_schema=_schema_object({"task": {"type": "object"}, "status": {"type": "object"}}),
-                required_resources=(
-                    RuntimeResource.BASE_MOTION.value,
-                    RuntimeResource.NAVIGATION.value,
-                    RuntimeResource.CAMERA_OBSERVATION.value,
-                ),
-                timeout_sec=_DEFAULT_ASYNC_TASK_TIMEOUT_SEC,
-                cancel_supported=True,
-            ),
-            _descriptor(
                 "explore_area_v2",
                 "探索区域（边界约束）",
                 "通过 nuwax-geometry-runtime 启动带有手划边界、停止条件、子导航重试/黑名单"
@@ -3500,6 +3457,11 @@ class GatewayRuntime:
                 input_schema=_schema_object(
                     {
                         "map_name": {"type": "string"},
+                        "target_name": {"type": "string"},
+                        "x": {"type": "number"},
+                        "y": {"type": "number"},
+                        "z": {"type": "number", "default": 0.0},
+                        "radius_m": {"type": "number", "exclusiveMinimum": 0.0},
                         "frame_id": {"type": "string", "default": "map"},
                         "strategy": {"type": "string", "default": "wavefront"},
                         "arbitration": {"type": "string", "default": "prefer_wavefront"},
@@ -3734,7 +3696,6 @@ class GatewayRuntime:
             "cancel_navigation": self._handle_cancel_navigation,
             "get_navigation_state": self._handle_get_navigation_state,
             "find_target": self._handle_find_target,
-            "explore_area": self._handle_explore_area,
             "explore_area_v2": self._handle_explore_area_v2,
             "explore_and_find_target": self._handle_explore_and_find_target,
             "inspect_target": self._handle_inspect_target,
@@ -4024,7 +3985,7 @@ class GatewayRuntime:
                 name="stop_exploration",
                 display_name="停止自主探索",
                 description=(
-                    "与 explore_area/explore_area_v2 配对：停止探索、取消 child navigation 并等待零速终态；"
+                    "与 explore_area_v2 配对：停止探索、取消 child navigation 并等待零速终态；"
                     "request_id 可省略以停止当前探索；建图会话保持运行。"
                 ),
                 category=SkillCategory.TASK,
@@ -4145,16 +4106,6 @@ class GatewayRuntime:
                 description="用开放词汇视觉识别查找物品，写入语义记忆后低歧义导航，高歧义澄清。",
                 category=SkillCategory.TASK,
                 capability_name="find_target",
-            ),
-            SkillDescriptor(
-                name="explore_area",
-                display_name="探索区域",
-                description=(
-                    "通过 nuwax-geometry-runtime 执行 wavefront 前沿探索。"
-                    "运行中用 get_task_status 查看 frontier_count/revision；结束时调用 stop_exploration。"
-                ),
-                category=SkillCategory.TASK,
-                capability_name="explore_area",
             ),
             SkillDescriptor(
                 name="explore_area_v2",
@@ -4431,8 +4382,6 @@ class GatewayRuntime:
             message=f"能力 {descriptor.name} 调用开始。",
         )
         try:
-            if self._requires_motion_admission(descriptor) or descriptor.name in {"activate_map", "start_mapping", "delete_map", "finalize_active_map", "relocalize_active_map"}:
-                self._assert_floor_execution_allows_public_request(descriptor.name)
             if self._requires_motion_admission(descriptor):
                 payload[motion_skills.MOTION_ADMISSION_ARGUMENT] = self._admit_motion_request(
                     descriptor.name, request_id=str(context.get("request_id") or ""),
@@ -6445,7 +6394,7 @@ class GatewayRuntime:
         raw_status = getattr(exploration_state, "status", "")
         terminal_status = str(getattr(raw_status, "value", raw_status) or "").lower()
         cancelled_parent_task_ids: List[str] = []
-        parent_capabilities = {"explore_area", "explore_area_v2", "explore_and_find_target"}
+        parent_capabilities = {"explore_area_v2", "explore_and_find_target"}
         for task_status in self.task_manager.list_active_tasks():
             task_id = str(getattr(task_status, "task_id", "") or "")
             if not task_id:
@@ -6503,26 +6452,6 @@ class GatewayRuntime:
                 self._building_navigation_service=BuildingNavigationService(self._get_building_catalog(),load_facility_providers(self.config.geometry.navigation.facility_providers_json))
             return self._building_navigation_service
 
-    def _pending_floor_execution(self):
-        from services.navigation.building_execution import BuildingExecutionJournal
-        root=self.config.runtime_data.map_catalog_root
-        if not root or not (Path(root)/"building_execution.json").exists():
-            return None
-        state=BuildingExecutionJournal(self._get_building_catalog()).load()
-        return state if state is not None and not state.terminal else None
-
-    def _assert_floor_execution_allows_public_request(self, capability_name: str) -> None:
-        if capability_name in {"resume_floor_navigation","resume_building_exploration"}:
-            return
-        # 未决设施恢复前，不自动启动新的公开运动或切换地图。
-        workflow=self._pending_building_exploration()
-        if workflow is not None:
-            raise GatewayError("逐层探索尚未完成，请继续原工作流。",error_code="building_exploration_pending",http_status=409,
-                details={"request_id":workflow.request.request_id,"recommended_next_tool":"resume_building_exploration"})
-        state=self._pending_floor_execution()
-        if state is not None:
-            raise GatewayError("已有跨层任务正在执行或等待设施对账，请先恢复该冻结请求。",error_code="floor_execution_pending",http_status=409,
-                details={"request_id":state.request.request_id,"stage":state.stage,"recommended_next_tool":"resume_floor_navigation"})
 
     def _get_building_exploration_service(self):
         from services.navigation.building_exploration import BuildingExplorationService
@@ -6531,11 +6460,6 @@ class GatewayRuntime:
                 self._building_exploration_service=BuildingExplorationService(self._get_building_catalog())
             return self._building_exploration_service
 
-    def _pending_building_exploration(self):
-        root=self.config.runtime_data.map_catalog_root
-        if not root or not (Path(root)/"building_exploration.json").exists():return None
-        state=self._get_building_exploration_service().load()
-        return state if state is not None and not state.terminal else None
 
     def _handle_pause_exploration(self, arguments, *, requested_by=None):
         from gateways.exploration_checkpoint import request_pause
@@ -6574,7 +6498,7 @@ class GatewayRuntime:
 
     def _handle_resume_building_exploration(self,arguments,*,requested_by=None,request_context=None):
         state=self._get_building_exploration_service().load()
-        if state is None or state.terminal or state.request.request_id!=self._require_str(arguments,"request_id"):
+        if state is None or state.request.request_id!=self._require_str(arguments,"request_id"):
             raise GatewayError("没有匹配的未决逐层探索。")
         return self._submit_building_exploration(arguments,state.request,True,requested_by,request_context)
 
@@ -6602,7 +6526,6 @@ class GatewayRuntime:
     def _handle_register_building(self, arguments, *, requested_by=None):
         del requested_by
         from contracts.building_navigation import BuildingTopology
-        self._assert_floor_execution_allows_public_request("register_building")
         topology=BuildingTopology.model_validate(arguments.get("topology"))
         return {"building":self._get_building_catalog().save(topology,expected_revision=int(arguments.get("expected_revision",0)))}
 
@@ -6623,7 +6546,7 @@ class GatewayRuntime:
     def _handle_resume_floor_navigation(self, arguments, *, requested_by=None, request_context=None):
         service=self._get_building_navigation_service()
         state=service.journal.load()
-        if state is None or state.terminal or state.request.request_id!=self._require_str(arguments,"request_id"):
+        if state is None or state.request.request_id!=self._require_str(arguments,"request_id"):
             raise GatewayError("没有匹配的未决跨层请求。",error_code="floor_resume_request_mismatch",http_status=409)
         service.catalog.validate_frozen(state.request)
         return self._submit_floor_navigation(arguments,state.request,True,requested_by,request_context)
@@ -6857,7 +6780,6 @@ class GatewayRuntime:
         state = navigation_context.navigation_state
         return {
             "ok": True,
-            "alias_of": "cancel_navigation",
             "request_id": request_id,
             "navigation_state": to_jsonable(state),
             "cancellation_requested": True,
@@ -6882,7 +6804,6 @@ class GatewayRuntime:
         navigation_context = self.navigation_service.refresh_navigation()
         return {
             "ok": True,
-            "alias_of": "get_navigation_state",
             "navigation_state": to_jsonable(navigation_context.navigation_state),
             "metadata": {
                 "requested_by": requested_by or "unknown",
@@ -6982,21 +6903,6 @@ class GatewayRuntime:
             )
         return segments
 
-    def _handle_explore_area_v2(
-        self,
-        arguments: Dict[str, Any],
-        *,
-        requested_by: Optional[str] = None,
-        request_context: Optional[MetadataDict] = None,
-    ):
-        """启动带边界与完整停止/重试约束的 geometry-runtime 探索。"""
-
-        return self._handle_explore_area(
-            arguments,
-            requested_by=requested_by,
-            request_context=request_context,
-            capability_name="explore_area_v2",
-        )
 
     def _handle_navigate_to_named_location(
         self,
@@ -7313,13 +7219,13 @@ class GatewayRuntime:
                 deferred_interrupt=True,
             )
 
-    def _handle_explore_area(
+    def _handle_explore_area_v2(
         self,
         arguments: Dict[str, Any],
         *,
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
-        capability_name: str = "explore_area",
+        capability_name: str = "explore_area_v2",
     ):
         removed_fields = sorted(
             {"auto_loop_close", "extend_radius_m"}.intersection(arguments)
@@ -10689,7 +10595,6 @@ class GatewayRuntime:
                 "protected task ownership classification is unavailable"
             ) from exc
         if str(getattr(spec, "capability_name", "")) not in {
-            "explore_area",
             "explore_area_v2",
             "explore_and_find_target",
         }:
@@ -11944,7 +11849,7 @@ class GatewayRuntime:
         requested_by: Optional[str],
         request_context: Optional[MetadataDict] = None,
         task_metadata: Optional[MetadataDict] = None,
-        capability_name: str = "explore_area",
+        capability_name: str = "explore_area_v2",
     ):
         descriptor = self.capability_registry.get_descriptor(capability_name)
         poll_interval_sec = max(0.05, poll_interval_sec)
@@ -13229,10 +13134,6 @@ class GatewayRuntime:
                 "平台几何运行时已禁用。",
             ),
             "find_target": (
-                lambda: geometry_config_enabled,
-                "平台几何运行时已禁用。",
-            ),
-            "explore_area": (
                 lambda: geometry_config_enabled,
                 "平台几何运行时已禁用。",
             ),

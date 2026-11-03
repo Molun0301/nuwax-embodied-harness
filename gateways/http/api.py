@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import weakref
 from contextlib import asynccontextmanager
 from typing import Dict, Optional, Any
@@ -15,9 +14,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.forbidden_zones import ReplaceForbiddenZonesRequest
-from contracts.navigation import NavigationGoal
 from gateways.auth import GatewayAccessManager
 from gateways.errors import GatewayError, as_gateway_error
 from gateways.feedback import build_task_summary, build_mcp_tool_result
@@ -63,52 +60,12 @@ class CapabilityInvokeRequest(BaseModel):
     arguments: Dict[str, Any] = Field(default_factory=dict, description="调用参数。")
 
 
-class NavigationGoalRequest(BaseModel):
-    """公共导航目标请求。"""
-
-    model_config = {"extra": "forbid"}
-
-    goal_id: str = Field(..., min_length=1, description="客户端生成的 goal 标识。")
-    pose: Dict[str, Any] = Field(default_factory=dict, description="目标位姿字典，可用 x/y/z 或 position。显式 z（含 0）原样保留；分配式 schema 2 三维地图省略 z 时，在定位准备后读取同坐标系、当前拥有方验证且新鲜的机体高度，不可用时失败。旧式 schema 1 三维及二维省略时为兼容值 0，不代表拥有方高度证据。")
-    frame_id: str = Field(default="map", description="位姿所在的坐标系。")
-
-
 class NavigationCancelRequest(BaseModel):
     """公共导航取消请求。"""
 
     model_config = {"extra": "forbid"}
 
     goal_id: str = Field(..., min_length=1, description="待取消的 goal 标识。")
-
-
-def _build_navigation_goal(goal: NavigationGoalRequest) -> NavigationGoal:
-    pose_payload = dict(goal.pose or {})
-    if not pose_payload:
-        raise ValueError("pose 不能为空。")
-
-    if "position" in pose_payload or "orientation" in pose_payload:
-        pose_payload.setdefault("frame_id", goal.frame_id)
-        target_pose = Pose.model_validate(pose_payload)
-    else:
-        if "x" not in pose_payload or "y" not in pose_payload:
-            raise ValueError("pose 至少需要 x 和 y。")
-        yaw_rad = float(pose_payload.get("yaw_rad", pose_payload.get("yaw", 0.0)))
-        half_yaw = yaw_rad / 2.0
-        target_pose = Pose(
-            frame_id=goal.frame_id,
-            position=Vector3(
-                x=float(pose_payload["x"]),
-                y=float(pose_payload["y"]),
-                **({"z": float(pose_payload["z"])} if "z" in pose_payload else {}),
-            ),
-            orientation=Quaternion(z=math.sin(half_yaw), w=math.cos(half_yaw)),
-        )
-
-    return NavigationGoal(
-        goal_id=goal.goal_id,
-        target_pose=target_pose,
-        metadata={"requested_by": "http_api", "source": "api_navigation_goal"},
-    )
 
 
 def _payload_value(payload: Any, key: str, default: Any = None) -> Any:
@@ -902,26 +859,6 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     ) -> Dict[str, Any]:
         return await run_in_threadpool(_invoke_capability, request, "replace_forbidden_zones", body.model_dump(mode="json"), unwrap=True)
 
-    @router.post("/api/navigation/goal")
-    async def api_navigation_goal(request: Request, goal: NavigationGoalRequest) -> Dict[str, Any]:
-        """兼容旧坐标请求，返回统一导航任务的受理结果。"""
-        try:
-            navigation_goal = _build_navigation_goal(goal)
-            pose = navigation_goal.target_pose
-            orientation = pose.orientation
-            if abs(orientation.x) > 1e-8 or abs(orientation.y) > 1e-8:
-                raise ValueError("导航目标只接受位置与偏航角，不能指定俯仰或横滚。")
-            arguments = {
-                "goal_id": goal.goal_id,
-                "frame_id": pose.frame_id,
-                "x": pose.position.x, "y": pose.position.y,
-                **({"z": pose.position.z} if "z" in pose.position.model_fields_set else {}),
-            }
-            if any(key in goal.pose for key in ("yaw", "yaw_rad", "orientation")):
-                arguments["yaw_rad"] = 2.0 * math.atan2(orientation.z, orientation.w)
-            return await run_in_threadpool(_invoke_capability, request, "navigate_to_pose", arguments)
-        except Exception as exc:
-            raise as_gateway_error(exc) from exc
 
     @router.post("/api/navigation/place-goal")
     async def api_navigation_place_goal(request: Request) -> Dict[str, Any]:

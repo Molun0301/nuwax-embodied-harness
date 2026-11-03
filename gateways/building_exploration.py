@@ -22,6 +22,8 @@ class GatewayBuildingExplorationPorts:
 
     def progress(self,state):
         self.state=state
+        if state.terminal:
+            self.context.retain_result({"request_id": state.request.request_id, "building_exploration": state})
         self.context.update(stage="building_"+state.stage,progress=state.next_floor_index/len(state.request.floors),
             message=state.message or "按冻结顺序执行逐层探索。",payload={"building_exploration":state.model_dump(mode="json")})
 
@@ -33,8 +35,8 @@ class GatewayBuildingExplorationPorts:
 
     def submit_transfer(self,floor,business_id,*,resume=False):
         service=self.runtime._get_building_navigation_service()
-        previous=service.journal.load()
-        restoring=bool(resume and previous is not None and not previous.terminal and previous.request.request_id==business_id)
+        previous=service.journal.load() if resume else None
+        restoring=bool(resume and previous is not None and previous.request.request_id==business_id)
         if restoring:
             request=previous.request
         else:
@@ -105,7 +107,7 @@ class GatewayBuildingExplorationPorts:
         return {"state":"missing","message":"原子任务记录不在当前进程，需按持久状态恢复。"}
 
     def _saved_receipt(self,state,floor):
-        bundle=self.runtime._get_building_catalog().assets.get_map_asset_bundle(floor.map_name,migrate_legacy=False)
+        bundle=self.runtime._get_building_catalog().assets.get_map_asset_bundle(floor.map_name)
         if bundle is not None and bundle.metadata.get("exploration_request_id")==state.child_request_id and bundle.identity_schema_version==2 and bundle.asset_identity is not None:
             return {"status":"succeeded","asset_identity":bundle.asset_identity.model_dump()}
         return None

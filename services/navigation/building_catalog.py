@@ -10,7 +10,7 @@ from typing import Callable, Iterable, Optional
 from contracts.building_navigation import BuildingTopology, FloorNavigationRequest, FloorPose, FloorRecord
 from services.mapping.asset_store import MapAssetBundleRepository
 from services.mapping.catalog import MapCatalogRepository, _atomic_write_text
-from services.navigation.file_identity import LegacyFileIndex, read_record_text
+from services.navigation.file_identity import DirectFileStore, read_record_text
 
 
 class BuildingCatalog:
@@ -20,17 +20,16 @@ class BuildingCatalog:
         self.maps = maps
         self.assets = assets or MapAssetBundleRepository(str(maps.root_dir))
         self.root = maps.root_dir / "buildings"
-        self._files = LegacyFileIndex(self.root, lambda path: self._read(path).building_id,
-            discovery_forbidden=lambda: bool(getattr(self.maps._activation_guard_state.local, "depth", 0)))
+        self._files = DirectFileStore(self.root)
 
     def _path(self, building_id: str) -> Path:
-        return self._files.resolve(building_id)
+        path = self._files.direct_path(building_id)
+        self._files._check_components(path)
+        return path
 
     @staticmethod
     def _read(path: Path) -> BuildingTopology:
         document = json.loads(read_record_text(path))
-        if not isinstance(document, dict) or type(document.get("schema_version")) is not int or document["schema_version"] != 2:
-            raise ValueError("旧楼层目录依赖已退役的摘要身份，请导入资产并重新登记楼层。")
         return BuildingTopology.model_validate(document)
 
     def get(self, building_id: str) -> Optional[BuildingTopology]:
@@ -43,7 +42,6 @@ class BuildingCatalog:
         return value
 
     def list(self) -> tuple[BuildingTopology, ...]:
-        self._files.refresh()
         values = []
         for path in self._files.iter_paths():
             value = self._read(path)
@@ -67,7 +65,7 @@ class BuildingCatalog:
             raise ValueError(f"楼层 {floor.display_name} 需要可恢复和定位的二维完整图。")
 
     def save(self, topology: BuildingTopology, *, expected_revision: int = 0) -> BuildingTopology:
-        with self._files.write_guard(), self.maps.map_activation_guard():
+        with self.maps.map_activation_guard():
             current = self.get(topology.building_id)
             revision = current.revision if current else 0
             if expected_revision != revision or topology.revision != revision + 1:
@@ -84,7 +82,6 @@ class BuildingCatalog:
         supported_connections: Iterable[str], target_floor_id: Optional[str] = None,
         timeout_sec: float = 600.0, allow_unmapped_target: bool = False,
     ) -> FloorNavigationRequest:
-        self._files.prepare()
         with self.maps.map_activation_guard():
             topology = self.get(building_id)
             if topology is None:

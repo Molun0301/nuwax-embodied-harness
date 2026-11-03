@@ -37,7 +37,7 @@ class BuildingExecutionPorts(Protocol):
 
 
 class BuildingExecutionJournal:
-    """一台机器人只保留一个未决跨层拥有方；意图先于设施副作用落盘。"""
+    """保存最近一次跨层工作流；意图先于设施副作用落盘。"""
 
     def __init__(self, catalog: BuildingCatalog) -> None:
         self.catalog = catalog
@@ -62,15 +62,10 @@ class BuildingExecutionJournal:
         if self.path.stat().st_size > 1024 * 1024:
             raise ValueError("跨层任务记录超过大小预算。")
         document = json.loads(self.path.read_text(encoding="utf-8"))
-        if not isinstance(document, dict) or type(document.get("schema_version")) is not int or document["schema_version"] != 2:
-            raise ValueError("旧跨层任务依赖已退役的摘要身份，不能自动恢复；请先对账原设施操作。")
         return FloorExecutionState.model_validate(document)
 
     def save(self, state: FloorExecutionState) -> None:
         with self.catalog.maps.map_activation_guard():
-            previous = self.load()
-            if previous is not None and not previous.terminal and previous.request.request_id != state.request.request_id:
-                raise RuntimeError("另一个跨层任务尚未完成对账。")
             _atomic_write_text(self.path, state.model_dump_json(indent=2))
 
 
@@ -213,24 +208,29 @@ class BuildingNavigationService:
 
     def run(self, request: FloorNavigationRequest, ports: BuildingExecutionPorts, *, resume: bool = False) -> FloorExecutionState:
         with self.journal.execution_guard():
-            previous = self.journal.load()
+            previous = self.journal.load() if resume else None
             if resume:
-                if previous is None or previous.request != request or previous.terminal:
+                if previous is None or previous.request != request:
                     raise RuntimeError("没有与当前冻结请求一致的待恢复跨层任务。")
                 state = previous
-                proof = ports.stop_navigation(state.navigation_goal_id)
-                if proof.get("zeroed") is not True:
-                    raise RuntimeError("恢复前尚未确认机器人停车。")
-                state.navigation_goal_id = None
-                state.attempt += 1
-                state.needs_reconciliation = False
-                if state.pending_operation is not None and state.pending_operation.state == "failed":
-                    state.pending_operation = None
+                state.terminal = False
             else:
-                if previous is not None and not previous.terminal:
-                    raise RuntimeError("旧跨层任务需要先恢复或对账。")
                 state = FloorExecutionState(request=request, current_floor_id=request.source_floor_id)
             state.owner_task_id = getattr(ports, "task_id", None)
+            if resume:
+                try:
+                    proof = ports.stop_navigation(state.navigation_goal_id)
+                    if proof.get("zeroed") is not True:
+                        raise RuntimeError("恢复前尚未确认机器人停车。")
+                    state.navigation_goal_id = None
+                    state.attempt += 1
+                    state.needs_reconciliation = False
+                    if state.pending_operation is not None and state.pending_operation.state == "failed":
+                        state.pending_operation = None
+                except Exception:
+                    state.terminal = True
+                    self._save(state, ports)
+                    raise
             self._save(state, ports)
             try:
                 while True:
@@ -257,12 +257,14 @@ class BuildingNavigationService:
                     state.facility_state = None
                     self._save(state, ports, "accepted", "当前连接已完成，准备下一段。")
             except Exception:
-                proof = ports.stop_navigation(state.navigation_goal_id)
-                state.last_zero_proof = dict(proof)
-                safe_outside = state.stage in {"accepted", "navigating_waiting", "navigating_final"} and state.facility_session_id is None
-                state.needs_reconciliation = not safe_outside or proof.get("zeroed") is not True
-                state.terminal = not state.needs_reconciliation
-                self._save(state, ports, message="执行已中断；机器人停车结果与设施未决操作已保留。")
+                try:
+                    proof = ports.stop_navigation(state.navigation_goal_id)
+                    state.last_zero_proof = dict(proof)
+                    safe_outside = state.stage in {"accepted", "navigating_waiting", "navigating_final"} and state.facility_session_id is None
+                    state.needs_reconciliation = not safe_outside or proof.get("zeroed") is not True
+                finally:
+                    state.terminal = True
+                    self._save(state, ports, message="执行已中断；机器人停车结果与设施未决操作已保留。")
                 ports.interrupt_barrier(proof, reconciled=not state.needs_reconciliation)
                 raise
 

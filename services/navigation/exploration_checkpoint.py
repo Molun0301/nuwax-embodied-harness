@@ -18,7 +18,7 @@ from services.mapping.asset_store import (
     ValidatedMapAssetBundleSnapshot,
 )
 from services.mapping.catalog import MapCatalogRepository, _atomic_write_text, _fsync_directory
-from services.navigation.file_identity import LegacyFileIndex, read_record_text
+from services.navigation.file_identity import DirectFileStore, read_record_text
 
 
 class ExplorationCheckpoint(BaseModel):
@@ -87,17 +87,18 @@ class ExplorationCheckpoint(BaseModel):
 
 
 class ExplorationCheckpointStore:
-    """业务标识直接寻址；旧文件通过有界内存的派生索引读取。"""
+    """业务标识直接寻址。"""
 
     def __init__(self, root: Union[str, Path]):
         self.maps = MapCatalogRepository(str(root))
         self.assets = MapAssetBundleRepository(str(root))
         self.root = Path(root) / "exploration_progress"
-        self._files = LegacyFileIndex(self.root, lambda path: self._read(path).checkpoint_id,
-            discovery_forbidden=lambda: bool(getattr(self.maps._activation_guard_state.local, "depth", 0)))
+        self._files = DirectFileStore(self.root)
 
     def _path(self, checkpoint_id: str) -> Path:
-        return self._files.resolve(checkpoint_id)
+        path = self._files.direct_path(checkpoint_id)
+        self._files._check_components(path)
+        return path
 
     @staticmethod
     def _read(path: Path) -> ExplorationCheckpoint:
@@ -184,7 +185,7 @@ class ExplorationCheckpointStore:
             if self._record_observation(path) != observed:
                 raise ValueError("探索检查点读取期间已改变，请重试")
         envelope = json.dumps({"schema_version": 2, "payload": payload}, ensure_ascii=False)
-        with self._files.write_guard(), self.maps.map_activation_guard():
+        with self.maps.map_activation_guard():
             if self._path(value.checkpoint_id) != path or self._record_observation(path) != observed:
                 raise ValueError("探索检查点拥有方已改变，请重试")
             if isinstance(snapshot, ValidatedMapAssetBundleSnapshot):
@@ -210,7 +211,6 @@ class ExplorationCheckpointStore:
         return value
 
     def list(self, limit: int = 50) -> list[dict]:
-        self._files.refresh()
         records = []
         previous_snapshot = None
         paths = heapq.nlargest(max(1, min(limit, 100)), self._files.iter_paths(), key=lambda path: (path.stat().st_mtime_ns, str(path)))

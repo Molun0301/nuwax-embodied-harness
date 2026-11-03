@@ -82,7 +82,7 @@ def normalize_robot_geometry_setting(key: str, value: str) -> str:
 
 @dataclass(frozen=True)
 class RobotGeometryConfig:
-    """外形用户设置；空尺寸或中心逐轴继承模型/兼容默认。"""
+    """外形用户设置；空尺寸或中心逐轴继承模型默认。"""
 
     model_path: str = ""
     model_base_link: str = ""
@@ -93,7 +93,6 @@ class RobotGeometryConfig:
     center_x_m: Optional[float] = None
     center_y_m: Optional[float] = None
     center_z_m: Optional[float] = None
-    legacy_nav_width_m: Optional[float] = None
 
     @classmethod
     def from_values(cls, values: Mapping[str, object]) -> "RobotGeometryConfig":
@@ -109,10 +108,6 @@ class RobotGeometryConfig:
             center_x_m=_optional_number(values.get("NUWAX_ROBOT_CENTER_X_M"), "外包中心X"),
             center_y_m=_optional_number(values.get("NUWAX_ROBOT_CENTER_Y_M"), "外包中心Y"),
             center_z_m=_optional_number(values.get("NUWAX_ROBOT_CENTER_Z_M"), "外包中心Z"),
-            legacy_nav_width_m=(
-                _optional_number(values.get("NUWAX_NAV_ROBOT_WIDTH_M"), "兼容导航宽度", positive=True)
-                if not model_path and width is None else None
-            ),
         )
 
 
@@ -572,9 +567,6 @@ def resolve_robot_geometry(config: RobotGeometryConfig, *, robot_name: str, base
         old_sizes = (result.length_m,result.width_m,result.height_m)
         old_center = result.center_xyz_m
         effective = list(dimensions)
-        legacy = not explicit and effective[1] is None and config.legacy_nav_width_m is not None
-        if legacy:
-            effective[1] = _number(config.legacy_nav_width_m, "兼容导航宽度", positive=True)
         sizes = tuple(old_sizes[i] if effective[i] is None else effective[i] for i in range(3))
         center = tuple(old_center[i] if centers[i] is None else centers[i] for i in range(3))
         if any(v <= 0 or not math.isfinite(v) for v in sizes + old_sizes[:2]):
@@ -583,8 +575,6 @@ def resolve_robot_geometry(config: RobotGeometryConfig, *, robot_name: str, base
         source = result.source
         if any(v is not None for v in dimensions + centers):
             source += "+manual_override"
-        if legacy:
-            source += "+legacy_nav_width"
         result = replace(result, footprint_xy_m=points, z_min_m=center[2]-sizes[2]/2,
                          z_max_m=center[2]+sizes[2]/2, source=source)
     result = replace(result, footprint_xy_m=_hull(result.footprint_xy_m))

@@ -41,7 +41,6 @@ class BuildingExplorationService:
         if not self.path.exists():return None
         if self.path.stat().st_size>1024*1024:raise ValueError("逐层探索记录超出预算。")
         document=json.loads(self.path.read_text(encoding="utf-8"))
-        if not isinstance(document,dict) or type(document.get("schema_version")) is not int or document["schema_version"]!=2:raise ValueError("旧逐层探索依赖已退役的摘要身份，不能自动恢复；请先对账原子任务。")
         return BuildingExplorationState.model_validate(document)
 
     def save(self,state,ports):
@@ -87,26 +86,31 @@ class BuildingExplorationService:
 
     def run(self,request:BuildingExplorationRequest,ports:BuildingExplorationPorts,*,resume=False):
         with self.guard():
-            previous=self.load()
+            previous=self.load() if resume else None
             if resume:
-                if previous is None or previous.terminal or previous.request!=request:raise ValueError("没有匹配的逐层探索进度。")
-                state=previous;state.attempt+=1;state.needs_reconciliation=False
-                ports.progress(state)
-                observed=ports.child(state.child_task_id) if state.child_kind else {"state":"missing"}
-                if observed["state"]=="succeeded":state.child_succeeded=True
-                # 旧任务还存在时先等待它真正退出；不存在时按原设施/地图状态恢复。
-                if state.child_task_id and observed["state"] not in {"succeeded","failed","cancelled","timeout","missing"}:
-                    ports.stop_child(state)
-                if state.child_kind=="transfer" and not state.child_succeeded:
-                    _,floors=self._topology(state);floor=floors[request.floors[state.next_floor_index].floor_id]
-                    task=ports.submit_transfer(floor,state.child_request_id,resume=True)
-                    state.child_task_id=task[0];state.child_request_id=task[1]
-                elif state.child_kind=="explore" and not state.child_succeeded:
-                    state.child_task_id=None;state.child_request_id=None;state.child_kind=None;state.stage="accepted"
+                if previous is None or previous.request!=request:raise ValueError("没有匹配的逐层探索进度。")
+                state=previous;state.terminal=False;state.attempt+=1;state.needs_reconciliation=False
             else:
-                if previous is not None and not previous.terminal:raise ValueError("旧逐层探索需要先恢复。")
                 state=BuildingExplorationState(request=request,topology_revision=request.topology_revision)
-            state.owner_task_id=ports.task_id;self.save(state,ports)
+            state.owner_task_id=ports.task_id
+            if resume:
+                try:
+                    ports.progress(state)
+                    observed=ports.child(state.child_task_id) if state.child_kind else {"state":"missing"}
+                    if observed["state"]=="succeeded":state.child_succeeded=True
+                    # 旧任务还存在时先等待它真正退出；不存在时按原设施/地图状态恢复。
+                    if state.child_task_id and observed["state"] not in {"succeeded","failed","cancelled","timeout","missing"}:
+                        ports.stop_child(state)
+                    if state.child_kind=="transfer" and not state.child_succeeded:
+                        _,floors=self._topology(state);floor=floors[request.floors[state.next_floor_index].floor_id]
+                        task=ports.submit_transfer(floor,state.child_request_id,resume=True)
+                        state.child_task_id=task[0];state.child_request_id=task[1]
+                    elif state.child_kind=="explore" and not state.child_succeeded:
+                        state.child_task_id=None;state.child_request_id=None;state.child_kind=None;state.stage="accepted"
+                except Exception:
+                    state.terminal=True;state.needs_reconciliation=True
+                    self.save(state,ports);raise
+            self.save(state,ports)
             try:
                 while state.next_floor_index<len(request.floors):
                     ports.ensure_active()
@@ -142,12 +146,16 @@ class BuildingExplorationService:
                 state.stage="succeeded";state.terminal=True;state.message="设定的楼层探索与地图保存已完成。"
                 self.save(state,ports);return state
             except Exception as error:
-                proof=ports.stop_child(state)
-                state.needs_reconciliation=True;state.message=str(error)
-                if state.child_kind=="explore":
-                    try:
-                        _,floors=self._topology(state);floor=floors[request.floors[state.next_floor_index].floor_id]
-                        identity=ports.checkpoint(floor,state)
-                        if identity:self._bind_asset(state,floor,identity)
-                    except Exception as save_error:state.message+="；地图检查点未完成："+str(save_error)
-                self.save(state,ports);ports.interrupt_barrier(proof);raise
+                try:
+                    proof=ports.stop_child(state)
+                    state.message=str(error)
+                    if state.child_kind=="explore":
+                        try:
+                            _,floors=self._topology(state);floor=floors[request.floors[state.next_floor_index].floor_id]
+                            identity=ports.checkpoint(floor,state)
+                            if identity:self._bind_asset(state,floor,identity)
+                        except Exception as save_error:state.message+="；地图检查点未完成："+str(save_error)
+                finally:
+                    state.terminal=True;state.needs_reconciliation=True
+                    self.save(state,ports)
+                ports.interrupt_barrier(proof);raise

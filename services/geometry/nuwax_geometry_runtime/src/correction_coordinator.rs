@@ -7,11 +7,6 @@
 mod preflight_only_contract {
 
     use std::collections::{HashMap, HashSet, VecDeque};
-    use std::ffi::OsString;
-    use std::fs::{self, File, OpenOptions};
-    use std::io::{Read, Write};
-    use std::os::unix::fs::MetadataExt;
-    use std::path::{Path, PathBuf};
     use std::sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         mpsc as std_mpsc, Arc,
@@ -19,7 +14,6 @@ mod preflight_only_contract {
     use std::time::{Duration, Instant};
 
     use nalgebra::{Isometry3, Point3, Quaternion, Translation3, UnitQuaternion};
-    use nix::fcntl::{Flock, FlockArg};
     use nuwax_codec::lcm::native_pgo as native_pgo_codec;
     use nuwax_mapping::loop_closure::{
         LoopClosureCoordinator, LoopClosurePipelineConfig, ProcessFrameResult,
@@ -80,17 +74,6 @@ mod preflight_only_contract {
     const RELOCALIZATION_MAX_WAITERS: usize = 16;
     const RELOCALIZATION_MAX_COMMAND_RECORDS: usize = 1_024;
     pub(crate) const RELOCALIZATION_MAX_TERMINAL_BYTES: usize = 65_536;
-    pub(crate) const RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES: usize =
-        2 * RELOCALIZATION_MAX_TERMINAL_BYTES + 128 + 3 * 64 + 512;
-    const RELOCALIZATION_TERMINAL_TEMP_PREFIX: &str = ".nuwax-relocalization-terminal-store-v4.";
-    const RELOCALIZATION_TERMINAL_TEMP_SUFFIX: &str = ".tmp";
-    const RELOCALIZATION_TERMINAL_LEASE_PREFIX: &str = ".nuwax-relocalization-owner-v4.";
-    const RELOCALIZATION_TERMINAL_LEASE_SUFFIX: &str = ".lease";
-    const RELOCALIZATION_TERMINAL_CLEANUP_LOCK_NAME: &str = ".cleanup.lock";
-    const RELOCALIZATION_TERMINAL_OWNER_TOKEN_BYTES: usize = 16;
-    const RELOCALIZATION_TERMINAL_ATTEMPT_TOKEN_BYTES: usize = 16;
-    const RELOCALIZATION_TERMINAL_STORE_DIR_ENV: &str =
-        "NUWAX_GEOMETRY_RELOCALIZATION_TERMINAL_STORE_DIR";
     const RELOCALIZATION_MAX_CONFLICTS_PER_RECORD: usize = 64;
     const RELOCALIZATION_MAX_FRAME_PROOF_SCOPES: usize = 8;
     const RELOCALIZATION_MAX_FRAME_PROOFS_PER_SCOPE: usize = 16;
@@ -5442,19 +5425,12 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
         mapping_lifecycle_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     }
 
-    struct RelocalizationTerminalQueryRequest {
-        request_id: String,
-        identity: RelocalizationRequestIdentity,
-        response: oneshot::Sender<Result<RelocalizationTerminalQuerySnapshot, &'static str>>,
-    }
-
     #[derive(Clone)]
     pub(crate) struct RelocalizationCommandIngress {
         // Original actor identity; no new generation, lease, or authority is allocated.
         owner_identity: Option<CorrectionOwnerRuntimeIdentity>,
         sender: mpsc::Sender<RelocalizationAdmissionRequest>,
-        terminal_query_sender: mpsc::Sender<RelocalizationTerminalQueryRequest>,
-        #[cfg(test)] terminal_store: RelocalizationTerminalStore,
+        terminal_store: RelocalizationTerminalStore,
         admission_open: Arc<AtomicBool>,
         admission_rx: watch::Receiver<bool>,
         waiter_capacity: Arc<Semaphore>,
@@ -5543,69 +5519,11 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
 
 
 
-        pub(crate) async fn terminal_snapshot_assigned(
-            &self, query: &AssignedRelocalizationTerminalQueryV2,
-        ) -> Result<RelocalizationTerminalQuerySnapshot, &'static str> {
-            self.terminal_snapshot_exact(query.request().request_id(),
-                query.request().clone()).await
-        }
-
-        async fn terminal_snapshot_exact(
+        pub(crate) fn terminal_snapshot_exact(
             &self, request_id: &str, identity: RelocalizationRequestIdentity,
-        ) -> Result<RelocalizationTerminalQuerySnapshot, &'static str> {
-            let (response, response_rx) = oneshot::channel();
-            self.terminal_query_sender.send(RelocalizationTerminalQueryRequest {
-                request_id: request_id.to_owned(), identity, response,
-            }).await.map_err(|_| "RELOCALIZATION_TERMINAL_QUERY_OWNER_UNAVAILABLE")?;
-            response_rx.await.map_err(|_| "RELOCALIZATION_TERMINAL_QUERY_RESPONSE_LOST")?
+        ) -> RelocalizationTerminalSnapshot {
+            self.terminal_store.snapshot_exact(request_id, &identity)
         }
-
-        #[cfg(test)]
-        pub(crate) fn seed_terminal_query_for_tests(&self, wire: crate::proto::RelocalizeRequest,
-            result: Option<crate::proto::RelocalizeResult>) {
-            let request=validate_relocalize_request(wire).unwrap();
-            if let Some(result)=result {
-                let terminal=AssignedRelocalizationTerminalV2::new(request.identity.clone(),result);
-                self.terminal_store.persist_terminal(request.request_id(),&request.key(),&terminal).unwrap();
-            } else { self.terminal_store.mark_pending(&request).unwrap(); }
-        }
-
-        #[cfg(test)]
-        pub(crate) fn terminal_query_fixture_for_tests(root: PathBuf) -> Self {
-            let (sender, _receiver) = mpsc::channel(1);
-            let (terminal_query_sender, mut terminal_query_receiver) =
-                mpsc::channel::<RelocalizationTerminalQueryRequest>(1);
-            let terminal_store = RelocalizationTerminalStore::open_at(root)
-                .expect("open terminal query fixture store");
-            let query_store = terminal_store.clone();
-            tokio::spawn(async move {
-                while let Some(query) = terminal_query_receiver.recv().await {
-                    let terminal = query_store.snapshot_exact(&query.request_id, &query.identity);
-                    let _ = query.response.send(Ok(RelocalizationTerminalQuerySnapshot {
-                        terminal,
-                        ledger_observation: crate::proto::RelocalizationLedgerObservation {
-                            observation_schema_version: 1,
-                            observation_epoch: 1,
-                            ..Default::default()
-                        },
-                    }));
-                }
-            });
-            let (_admission_tx, admission_rx) = watch::channel(true);
-            Self {
-                owner_identity: None,
-                sender,
-                terminal_query_sender,
-                #[cfg(test)] terminal_store,
-                admission_open: Arc::new(AtomicBool::new(true)),
-                admission_rx,
-                waiter_capacity: Arc::new(Semaphore::new(RELOCALIZATION_MAX_WAITERS)),
-            }
-        }
-
-
-
-
 
         pub(crate) fn is_open(&self) -> bool {
             self.admission_open.load(Ordering::Acquire)
@@ -5613,10 +5531,7 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
     }
 
     use crate::relocalization_identity::AssignedCloudRelocalizeRequestIdentityV2;
-    use crate::relocalization_terminal_v2::{
-        AssignedRelocalizationTerminalV2, AssignedRelocalizationTerminalQueryV2,
-        assigned_terminal_filename_v2,
-    };
+    use crate::relocalization_terminal_v2::AssignedRelocalizationTerminalV2;
 
     /// One identity domain in the existing ledger. Legacy values are opaque
     /// read-only aliases; no assigned request is converted into a digest.
@@ -5671,569 +5586,30 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
         IdentityConflict,
     }
 
-    pub(crate) struct RelocalizationTerminalQuerySnapshot {
-        pub(crate) terminal: RelocalizationTerminalSnapshot,
-        pub(crate) ledger_observation: crate::proto::RelocalizationLedgerObservation,
-    }
-
-
-
-    #[derive(Clone)]
-    struct DurableRelocalizationTerminal {
-        identity: RelocalizationRequestIdentity,
-        terminal: StoredRelocalizationResult,
-    }
-
+    #[derive(Default)]
     struct RelocalizationTerminalStoreState {
-        terminals: HashMap<String, DurableRelocalizationTerminal>,
+        terminals: HashMap<String, StoredRelocalizationResult>,
         pending: HashMap<String, RelocalizationRequestIdentity>,
-        // 打开时按修改时间排序，运行中按终态提交顺序追加。
-        retained_order: VecDeque<(String, PathBuf)>,
+        // 同时只执行一个请求，终结顺序与接纳顺序一致。
+        retained_order: VecDeque<String>,
     }
 
-    struct RelocalizationTerminalOwnerLease {
-        root: PathBuf,
-        owner_token: String,
-        _lock: Flock<File>,
-    }
-
-    impl Drop for RelocalizationTerminalOwnerLease {
-        fn drop(&mut self) {
-            let cleanup_lock = match lock_terminal_cleanup(&self.root) {
-                Ok(lock) => lock,
-                Err(error) => {
-                    tracing::warn!(error = %error, "terminal owner lease cleanup deferred");
-                    return;
-                }
-            };
-            if terminal_owner_has_temporary(&self.root, &self.owner_token) != Ok(false) {
-                drop(cleanup_lock);
-                return;
-            }
-            let lease_path = self.root.join(terminal_lease_name(&self.owner_token));
-            match fs::remove_file(lease_path) {
-                Ok(()) => {
-                    if let Err(error) = fsync_directory(&self.root) {
-                        tracing::warn!(error = %error, "terminal owner lease cleanup deferred");
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    tracing::warn!(error = %error, "terminal owner lease cleanup deferred");
-                }
-            }
-        }
-    }
-
-    #[derive(Clone)]
+    #[derive(Clone, Default)]
     pub(crate) struct RelocalizationTerminalStore {
-        root: Arc<PathBuf>,
-        owner_token: Arc<String>,
-        _owner_lease: Arc<RelocalizationTerminalOwnerLease>,
         state: Arc<parking_lot::Mutex<RelocalizationTerminalStoreState>>,
-        #[cfg(test)]
-        _test_root: Option<Arc<tests::RelocalizationTerminalTestRoot>>,
-    }
-
-
-
-    fn decode_hex(value: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
-        if value.len() % 2 != 0 || value.len() / 2 > max_bytes {
-            return Err("RELOCALIZATION_TERMINAL_STORE_HEX_INVALID".to_owned());
-        }
-        fn digit(value: u8) -> Option<u8> {
-            match value {
-                b'0'..=b'9' => Some(value - b'0'),
-                b'a'..=b'f' => Some(value - b'a' + 10),
-                _ => None,
-            }
-        }
-        value
-            .as_bytes()
-            .chunks_exact(2)
-            .map(|pair| {
-                let high = digit(pair[0])
-                    .ok_or_else(|| "RELOCALIZATION_TERMINAL_STORE_HEX_INVALID".to_owned())?;
-                let low = digit(pair[1])
-                    .ok_or_else(|| "RELOCALIZATION_TERMINAL_STORE_HEX_INVALID".to_owned())?;
-                Ok((high << 4) | low)
-            })
-            .collect()
-    }
-
-    fn read_terminal_record_bytes(
-        mut reader: impl Read,
-        metadata_len: u64,
-    ) -> Result<Vec<u8>, String> {
-        if metadata_len > RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES as u64 {
-            return Err("RELOCALIZATION_TERMINAL_STORE_RECORD_TOO_LARGE".to_owned());
-        }
-        let mut bytes = Vec::new();
-        reader
-            .by_ref()
-            .take((RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?;
-        if bytes.len() > RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES {
-            return Err("RELOCALIZATION_TERMINAL_STORE_RECORD_TOO_LARGE".to_owned());
-        }
-        Ok(bytes)
-    }
-
-    fn read_terminal_record(path: &Path) -> Result<Vec<u8>, String> {
-        let file = File::open(path)
-            .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?;
-        let metadata_len = file
-            .metadata()
-            .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?
-            .len();
-        read_terminal_record_bytes(file, metadata_len)
-    }
-
-    fn terminal_store_root_from(
-        explicit: Option<OsString>,
-        state_directory: Option<OsString>,
-        runtime_data: Option<OsString>,
-        current_directory: impl FnOnce() -> std::io::Result<PathBuf>,
-    ) -> Result<PathBuf, String> {
-        let root = if let Some(value) = explicit {
-            let root = PathBuf::from(value);
-            if root.as_os_str().is_empty() {
-                return Err("RELOCALIZATION_TERMINAL_STORE_PATH_INVALID".to_owned());
-            }
-            root
-        } else if let Some(value) = state_directory {
-            let root = std::env::split_paths(&value)
-                .next()
-                .ok_or_else(|| "RELOCALIZATION_TERMINAL_STORE_PATH_INVALID".to_owned())?;
-            return if root.is_absolute() {
-                Ok(root.join("relocalization_terminals_v1"))
-            } else {
-                Err("RELOCALIZATION_TERMINAL_STORE_PATH_NOT_ABSOLUTE".to_owned())
-            };
-        } else {
-            let root =
-                PathBuf::from(runtime_data.unwrap_or_else(|| OsString::from("runtime_data")));
-            if root.as_os_str().is_empty() {
-                return Err("RELOCALIZATION_TERMINAL_STORE_PATH_INVALID".to_owned());
-            }
-            root.join("geometry").join("relocalization_terminals_v1")
-        };
-        if root.is_absolute() {
-            return Ok(root);
-        }
-        // 仅相对路径需要当前目录；绝对部署路径不增加工作目录可访问性的前置。
-        let current_directory = current_directory()
-            .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_CWD_UNAVAILABLE:{error}"))?;
-        Ok(current_directory.join(root))
-    }
-
-    fn terminal_store_root() -> Result<PathBuf, String> {
-        terminal_store_root_from(
-            std::env::var_os(RELOCALIZATION_TERMINAL_STORE_DIR_ENV),
-            std::env::var_os("STATE_DIRECTORY"),
-            std::env::var_os("NUWAX_RUNTIME_DATA_DIR"),
-            std::env::current_dir,
-        )
-    }
-
-    fn fsync_directory(path: &Path) -> Result<(), String> {
-        File::open(path)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_FSYNC_FAILED:{error}"))
-    }
-
-    fn lock_terminal_cleanup(root: &Path) -> Result<Flock<File>, String> {
-        let lock_path = root.join(RELOCALIZATION_TERMINAL_CLEANUP_LOCK_NAME);
-        let lock_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|error| {
-                format!("RELOCALIZATION_TERMINAL_STORE_CLEANUP_LOCK_OPEN_FAILED:{error}")
-            })?;
-        let lock_file_metadata = lock_file.metadata().map_err(|error| {
-            format!("RELOCALIZATION_TERMINAL_STORE_CLEANUP_LOCK_OPEN_FAILED:{error}")
-        })?;
-        let lock = Flock::lock(lock_file, FlockArg::LockExclusive).map_err(|(_, error)| {
-            format!("RELOCALIZATION_TERMINAL_STORE_CLEANUP_LOCK_FAILED:{error}")
-        })?;
-        let path_metadata = fs::metadata(&lock_path).map_err(|error| {
-            format!("RELOCALIZATION_TERMINAL_STORE_CLEANUP_LOCK_OPEN_FAILED:{error}")
-        })?;
-        if lock_file_metadata.dev() != path_metadata.dev()
-            || lock_file_metadata.ino() != path_metadata.ino()
-        {
-            return Err("RELOCALIZATION_TERMINAL_STORE_CLEANUP_LOCK_IDENTITY_CHANGED".to_owned());
-        }
-        lock.sync_all().map_err(|error| {
-            format!("RELOCALIZATION_TERMINAL_STORE_CLEANUP_LOCK_FSYNC_FAILED:{error}")
-        })?;
-        fsync_directory(root)?;
-        Ok(lock)
-    }
-
-    fn terminal_owner_token() -> String {
-        uuid::Uuid::new_v4().simple().to_string()
-    }
-
-    fn terminal_lease_name(owner_token: &str) -> String {
-        format!(
-            "{RELOCALIZATION_TERMINAL_LEASE_PREFIX}{owner_token}{RELOCALIZATION_TERMINAL_LEASE_SUFFIX}"
-        )
-    }
-
-    fn terminal_owner_token_from_lease_name(file_name: &str) -> Option<&str> {
-        let token = file_name
-            .strip_prefix(RELOCALIZATION_TERMINAL_LEASE_PREFIX)?
-            .strip_suffix(RELOCALIZATION_TERMINAL_LEASE_SUFFIX)?;
-        is_terminal_token(token, RELOCALIZATION_TERMINAL_OWNER_TOKEN_BYTES).then_some(token)
-    }
-
-    fn is_terminal_token(value: &str, bytes: usize) -> bool {
-        value.len() == bytes * 2 && decode_hex(value, bytes).is_ok()
-    }
-
-    fn terminal_owner_token_from_temporary_name(file_name: &str) -> Option<&str> {
-        let body = file_name
-            .strip_prefix(RELOCALIZATION_TERMINAL_TEMP_PREFIX)?
-            .strip_suffix(RELOCALIZATION_TERMINAL_TEMP_SUFFIX)?;
-        let assigned_fields = body.split('.').collect::<Vec<_>>();
-        if let [owner, attempt, "assigned-v2"] = assigned_fields.as_slice() {
-            return (is_terminal_token(owner, RELOCALIZATION_TERMINAL_OWNER_TOKEN_BYTES)
-                && is_terminal_token(attempt, RELOCALIZATION_TERMINAL_ATTEMPT_TOKEN_BYTES))
-                .then_some(*owner);
-        }
-        let mut fields = body.split('.');
-        let (Some(owner), Some(attempt), Some(request), Some(record), None) = (
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-        ) else {
-            return None;
-        };
-        (is_terminal_token(owner, RELOCALIZATION_TERMINAL_OWNER_TOKEN_BYTES)
-            && is_terminal_token(attempt, RELOCALIZATION_TERMINAL_ATTEMPT_TOKEN_BYTES)
-            && is_terminal_token(request, 32)
-            && is_terminal_token(record, 32))
-        .then_some(owner)
-    }
-
-    #[cfg(test)]
-    fn is_owned_terminal_temporary_name(file_name: &str) -> bool {
-        terminal_owner_token_from_temporary_name(file_name).is_some()
-    }
-
-    fn terminal_owner_has_temporary(root: &Path, owner_token: &str) -> Result<bool, String> {
-        let entries = fs::read_dir(root)
-            .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?;
-        for entry in entries {
-            let entry = entry
-                .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?;
-            let file_name = entry.file_name();
-            if file_name
-                .to_str()
-                .and_then(terminal_owner_token_from_temporary_name)
-                == Some(owner_token)
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    fn cleanup_terminal_owner(
-        root: &Path,
-        owner_token: &str,
-        _cleanup_lock: &Flock<File>,
-    ) -> Result<usize, String> {
-        let lease_path = root.join(terminal_lease_name(owner_token));
-        let lease_file = match OpenOptions::new().read(true).write(true).open(&lease_path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err("RELOCALIZATION_TERMINAL_STORE_OWNER_LEASE_MISSING".to_owned())
-            }
-            Err(error) => {
-                return Err(format!(
-                    "RELOCALIZATION_TERMINAL_STORE_OWNER_LEASE_OPEN_FAILED:{error}"
-                ))
-            }
-        };
-        let lease = match Flock::lock(lease_file, FlockArg::LockExclusiveNonblock) {
-            Ok(lease) => lease,
-            Err((lease_file, error))
-                if error == nix::errno::Errno::EWOULDBLOCK
-                    || error == nix::errno::Errno::EAGAIN =>
-            {
-                drop(lease_file);
-                return Ok(0);
-            }
-            Err((lease_file, error)) => {
-                drop(lease_file);
-                return Err(format!(
-                    "RELOCALIZATION_TERMINAL_STORE_OWNER_LEASE_LOCK_FAILED:{error}"
-                ));
-            }
-        };
-        let entries = fs::read_dir(root)
-            .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?;
-        let mut removed = 0_usize;
-        for entry in entries {
-            let file_name = entry.file_name();
-            if file_name
-                .to_str()
-                .and_then(terminal_owner_token_from_temporary_name)
-                == Some(owner_token)
-            {
-                remove_terminal_temporary(&entry.path(), root)?;
-                removed += 1;
-            }
-        }
-        if !terminal_owner_has_temporary(root, owner_token)? {
-            match fs::remove_file(&lease_path) {
-                Ok(()) => fsync_directory(root)?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return Ok(removed),
-            }
-        }
-        drop(lease);
-        Ok(removed)
-    }
-
-    fn cleanup_failed_terminal_owner_lease(
-        root: &Path,
-        lease_path: &Path,
-        primary: String,
-        _cleanup_lock: &Flock<File>,
-    ) -> String {
-        match fs::remove_file(lease_path) {
-            Ok(()) => match fsync_directory(root) {
-                Ok(()) => primary,
-                Err(_) => format!("{primary}|OWNER_LEASE_CLEANUP_FAILED"),
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => primary,
-            Err(_) => format!("{primary}|OWNER_LEASE_CLEANUP_FAILED"),
-        }
-    }
-
-    fn create_terminal_owner_lease(
-        root: &Path,
-        cleanup_lock: &Flock<File>,
-    ) -> Result<(String, Flock<File>), String> {
-        for _ in 0..16 {
-            let owner_token = terminal_owner_token();
-            let lease_path = root.join(terminal_lease_name(&owner_token));
-            let lease_file = match OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&lease_path)
-            {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => {
-                    return Err(format!(
-                        "RELOCALIZATION_TERMINAL_STORE_OWNER_LEASE_CREATE_FAILED:{error}"
-                    ))
-                }
-            };
-            let lease = match Flock::lock(lease_file, FlockArg::LockExclusiveNonblock) {
-                Ok(lease) => lease,
-                Err((lease_file, error)) => {
-                    drop(lease_file);
-                    let primary =
-                        format!("RELOCALIZATION_TERMINAL_STORE_OWNER_LEASE_LOCK_FAILED:{error}");
-                    return Err(cleanup_failed_terminal_owner_lease(
-                        root,
-                        &lease_path,
-                        primary,
-                        cleanup_lock,
-                    ));
-                }
-            };
-            if let Err(error) = lease.sync_all() {
-                let primary =
-                    format!("RELOCALIZATION_TERMINAL_STORE_OWNER_LEASE_FSYNC_FAILED:{error}");
-                drop(lease);
-                return Err(cleanup_failed_terminal_owner_lease(
-                    root,
-                    &lease_path,
-                    primary,
-                    cleanup_lock,
-                ));
-            }
-            if let Err(primary) = fsync_directory(root) {
-                drop(lease);
-                return Err(cleanup_failed_terminal_owner_lease(
-                    root,
-                    &lease_path,
-                    primary,
-                    cleanup_lock,
-                ));
-            }
-            return Ok((owner_token, lease));
-        }
-        Err("RELOCALIZATION_TERMINAL_STORE_OWNER_LEASE_COLLISION".to_owned())
-    }
-
-    fn remove_terminal_temporary(path: &Path, root: &Path) -> Result<(), String> {
-        match fs::remove_file(path) {
-            Ok(()) => fsync_directory(root),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(format!(
-                "RELOCALIZATION_TERMINAL_STORE_TEMP_CLEANUP_FAILED:{error}"
-            )),
-        }
-    }
-
-    fn combine_terminal_persist_results(
-        write_result: Result<(), String>,
-        cleanup_result: Result<(), String>,
-    ) -> Result<(), String> {
-        match (write_result, cleanup_result) {
-            (Err(primary), Err(_)) => Err(format!("{primary}|TEMP_CLEANUP_FAILED")),
-            (Err(primary), Ok(())) => Err(primary),
-            (Ok(()), Err(cleanup)) => {
-                tracing::warn!(error = %cleanup, "durable terminal temp cleanup deferred");
-                Ok(())
-            }
-            (Ok(()), Ok(())) => Ok(()),
-        }
     }
 
     impl RelocalizationTerminalStore {
-        #[cfg(not(test))]
-        fn open() -> Result<Self, String> {
-            Self::open_at(terminal_store_root()?)
-        }
-
-        #[cfg(test)]
-        fn open() -> Result<Self, String> {
-            let root = Arc::new(tests::RelocalizationTerminalTestRoot::new());
-            let mut store = Self::open_at(root.path().to_path_buf())?;
-            store._test_root = Some(root);
-            Ok(store)
-        }
-
-        fn open_at(root: PathBuf) -> Result<Self, String> {
-            fs::create_dir_all(&root)
-                .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_OPEN_FAILED:{error}"))?;
-            fsync_directory(&root)?;
-            {
-                let cleanup_lock = lock_terminal_cleanup(&root)?;
-                let mut entries = fs::read_dir(&root)
-                    .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| {
-                        format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}")
-                    })?;
-                entries.sort_by_key(std::fs::DirEntry::file_name);
-                let mut owner_tokens = HashSet::new();
-                for entry in &entries {
-                    let file_name = entry.file_name();
-                    if let Some(owner_token) = file_name
-                        .to_str()
-                        .and_then(terminal_owner_token_from_temporary_name)
-                        .or_else(|| {
-                            file_name
-                                .to_str()
-                                .and_then(terminal_owner_token_from_lease_name)
-                        })
-                    {
-                        owner_tokens.insert(owner_token.to_owned());
-                    }
-                }
-                for owner_token in owner_tokens {
-                    cleanup_terminal_owner(&root, &owner_token, &cleanup_lock)?;
-                }
-            }
-            let mut entries = Vec::new();
-            let mut removed_legacy = false;
-            for entry in fs::read_dir(&root)
-                .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?
-            {
-                let entry = entry.map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?;
-                let path = entry.path();
-                let filename = entry.file_name().into_string()
-                    .map_err(|_| "RELOCALIZATION_TERMINAL_STORE_FILENAME_INVALID")?;
-                let assigned = filename.starts_with("assigned-")
-                    || path.extension().and_then(|value| value.to_str()) == Some("terminal");
-                if path.extension().and_then(|value| value.to_str()) == Some("json") {
-                    fs::remove_file(&path).map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_EVICT_FAILED:{error}"))?;
-                    removed_legacy = true;
-                    continue;
-                }
-                if !assigned { continue; }
-                let modified = entry.metadata().and_then(|metadata| metadata.modified())
-                    .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_READ_FAILED:{error}"))?;
-                entries.push((modified, filename, path));
-            }
-            entries.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
-            let excess = entries.len().saturating_sub(RELOCALIZATION_MAX_COMMAND_RECORDS);
-            for (_, _, path) in entries.drain(..excess) {
-                fs::remove_file(path)
-                    .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_EVICT_FAILED:{error}"))?;
-            }
-            if excess > 0 || removed_legacy { fsync_directory(&root)?; }
-            let mut terminals = HashMap::new();
-            let mut retained_order = VecDeque::new();
-            for (_, filename, path) in entries {
-                let bytes = read_terminal_record(&path)?;
-                let terminal = AssignedRelocalizationTerminalV2::decode_durable_named(&filename, &bytes)?;
-                let request_id = terminal.request().request_id().to_owned();
-                let durable = DurableRelocalizationTerminal { identity: terminal.request().clone(), terminal };
-                if terminals.insert(request_id.clone(), durable).is_some() {
-                    return Err("RELOCALIZATION_TERMINAL_STORE_DUPLICATE".into());
-                }
-                retained_order.push_back((request_id, path));
-            }
-            let cleanup_lock = lock_terminal_cleanup(&root)?;
-            let (owner_token, owner_lock) = create_terminal_owner_lease(&root, &cleanup_lock)?;
-            drop(cleanup_lock);
-            let owner_lease = RelocalizationTerminalOwnerLease {
-                root: root.clone(),
-                owner_token: owner_token.clone(),
-                _lock: owner_lock,
-            };
-            Ok(Self {
-                root: Arc::new(root),
-                owner_token: Arc::new(owner_token),
-                _owner_lease: Arc::new(owner_lease),
-                state: Arc::new(parking_lot::Mutex::new(RelocalizationTerminalStoreState {
-                    terminals,
-                    pending: HashMap::new(),
-                    retained_order,
-                })),
-                #[cfg(test)]
-                _test_root: None,
-            })
-        }
-
         fn remove_terminal_locked(
             &self, state: &mut RelocalizationTerminalStoreState, request_id: &str,
-        ) -> Result<(), String> {
-            let Some(index) = state.retained_order.iter().position(|(id, _)| id == request_id) else {
-                return Ok(());
-            };
-            let path = &state.retained_order[index].1;
-            match fs::remove_file(path) {
-                Ok(()) => {},
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-                Err(error) => return Err(format!("RELOCALIZATION_TERMINAL_STORE_EVICT_FAILED:{error}")),
+        ) {
+            if let Some(index) = state.retained_order.iter().position(|id| id == request_id) {
+                state.retained_order.remove(index);
+                state.terminals.remove(request_id);
             }
-            fsync_directory(&self.root)?;
-            state.retained_order.remove(index);
-            state.terminals.remove(request_id);
-            Ok(())
         }
 
-        fn remove_terminal(&self, request_id: &str) -> Result<(), String> {
+        fn remove_terminal(&self, request_id: &str) {
             self.remove_terminal_locked(&mut self.state.lock(), request_id)
         }
 
@@ -6241,7 +5617,7 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
             let mut state = self.state.lock();
             let identity = request.key();
             if let Some(existing) = state.terminals.get(request.request_id()) {
-                return if existing.identity == identity { Ok(()) }
+                return if existing.request() == &identity { Ok(()) }
                     else { Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".into()) };
             }
             if state.pending.get(request.request_id()).is_some_and(|existing| existing != &identity) {
@@ -6251,7 +5627,7 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
             Ok(())
         }
 
-        fn persist_terminal(
+        fn store_terminal(
             &self, request_id: &str, identity: &RelocalizationRequestIdentity,
             terminal: &StoredRelocalizationResult,
         ) -> Result<(), String> {
@@ -6261,48 +5637,19 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
             }
             let mut state = self.state.lock();
             if let Some(existing) = state.terminals.get(request_id) {
-                return if &existing.identity == identity && existing.terminal.encoded() == terminal.encoded() {
+                return if existing.request() == identity && existing.encoded() == terminal.encoded() {
                     Ok(())
                 } else { Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".into()) };
             }
             if state.terminals.len() >= RELOCALIZATION_MAX_COMMAND_RECORDS {
-                let oldest = state.retained_order.front().expect("终态顺序与存储一致").0.clone();
-                self.remove_terminal_locked(&mut state, &oldest)?;
+                let oldest = state.retained_order.front().expect("终态顺序与存储一致").clone();
+                self.remove_terminal_locked(&mut state, &oldest);
             }
             if state.pending.get(request_id).is_some_and(|existing| existing != identity) {
                 return Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".into());
             }
-            let bytes = assigned.encode_durable()?;
-            let final_path = self.root.join(assigned_terminal_filename_v2(request_id)?);
-            // Existing owner/attempt uniqueness, with no request/content digest.
-            let attempt = terminal_owner_token();
-            let temporary_path = self.root.join(format!(
-                "{RELOCALIZATION_TERMINAL_TEMP_PREFIX}{}.{attempt}.assigned-v2{RELOCALIZATION_TERMINAL_TEMP_SUFFIX}",
-                self.owner_token,
-            ));
-            let mut temporary = OpenOptions::new().write(true).create_new(true).open(&temporary_path)
-                .map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_CREATE_FAILED:{error}"))?;
-            let write_result = (|| {
-                temporary.write_all(&bytes).map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_WRITE_FAILED:{error}"))?;
-                temporary.sync_all().map_err(|error| format!("RELOCALIZATION_TERMINAL_STORE_FSYNC_FAILED:{error}"))?;
-                drop(temporary);
-                match fs::hard_link(&temporary_path, &final_path) {
-                    Ok(()) => {},
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        if read_terminal_record(&final_path)? != bytes {
-                            return Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".into());
-                        }
-                    },
-                    Err(error) => return Err(format!("RELOCALIZATION_TERMINAL_STORE_PUBLISH_FAILED:{error}")),
-                }
-                fsync_directory(&self.root)
-            })();
-            let cleanup_result = remove_terminal_temporary(&temporary_path, &self.root);
-            combine_terminal_persist_results(write_result, cleanup_result)?;
-            state.terminals.insert(request_id.to_owned(), DurableRelocalizationTerminal {
-                identity: identity.clone(), terminal: terminal.clone(),
-            });
-            state.retained_order.push_back((request_id.to_owned(), final_path));
+            state.terminals.insert(request_id.to_owned(), terminal.clone());
+            state.retained_order.push_back(request_id.to_owned());
             state.pending.remove(request_id);
             Ok(())
         }
@@ -6312,8 +5659,8 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
         {
             let state = self.state.lock();
             if let Some(terminal) = state.terminals.get(request_id) {
-                return if &terminal.identity == identity {
-                    RelocalizationTerminalSnapshot::AssignedTerminal(terminal.terminal.clone())
+                return if terminal.request() == identity {
+                    RelocalizationTerminalSnapshot::AssignedTerminal(terminal.clone())
                 } else { RelocalizationTerminalSnapshot::IdentityConflict };
             }
             match state.pending.get(request_id) {
@@ -6336,15 +5683,8 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
         claim_phase: RelocalizationClaimPhase,
     }
 
-    #[allow(clippy::large_enum_variant)]
-    enum RelocalizationLedgerOrigin {
-        Admitted(RelocalizationLedgerAdmissionMetadata),
-        // 已持久化终态没有上一进程的Instant，重放不能重建运行截止时刻。
-        RestoredTerminal,
-    }
-
     struct RelocalizationLedgerRecord {
-        origin: RelocalizationLedgerOrigin,
+        admission: RelocalizationLedgerAdmissionMetadata,
         identity: RelocalizationRequestIdentity,
         waiter_ids: HashSet<u64>,
         terminal: Option<StoredRelocalizationResult>,
@@ -6383,42 +5723,24 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
         retained_order: VecDeque<String>,
         active_request_id: Option<String>,
         next_admission_ordinal: u64,
-        admitted_command_count: u64,
-        claimed_command_count: u64,
-        observation_epoch: u64,
         relocalization_mode: Arc<RelocalizationModeFence>,
     }
 
     #[cfg(test)]
     impl Default for RelocalizationCommandLedger {
         fn default() -> Self {
-            Self::from_terminal_store(&RelocalizationTerminalStore::open().expect("测试终态存储"))
+            Self::new(RelocalizationTerminalStore::default())
         }
     }
 
     impl RelocalizationCommandLedger {
-        fn from_terminal_store(store: &RelocalizationTerminalStore) -> Self {
-            let state = store.state.lock();
-            let mut epoch_bytes = [0_u8; 8];
-            epoch_bytes.copy_from_slice(&uuid::Uuid::new_v4().as_bytes()[..8]);
+        fn new(terminal_store: RelocalizationTerminalStore) -> Self {
             Self {
-                records: state.terminals.iter().map(|(request_id, durable)| (
-                    request_id.clone(),
-                    RelocalizationLedgerRecord {
-                        origin: RelocalizationLedgerOrigin::RestoredTerminal,
-                        identity: durable.identity.clone(),
-                        waiter_ids: HashSet::new(),
-                        terminal: Some(durable.terminal.clone()),
-                        conflicts: Vec::new(),
-                    },
-                )).collect(),
-                terminal_store: store.clone(),
-                retained_order: state.retained_order.iter().map(|(request_id, _)| request_id.clone()).collect(),
+                records: HashMap::new(),
+                terminal_store,
+                retained_order: VecDeque::new(),
                 active_request_id: None,
                 next_admission_ordinal: 0,
-                admitted_command_count: 0,
-                claimed_command_count: 0,
-                observation_epoch: u64::from_be_bytes(epoch_bytes).max(1),
                 relocalization_mode: Arc::new(RelocalizationModeFence::default()),
             }
         }
@@ -6442,9 +5764,8 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
                     if let Some(terminal) = &record.terminal {
                         return Ok(RelocalizationLedgerAdmission::Replay(terminal.clone()));
                     }
-                    let RelocalizationLedgerOrigin::Admitted(_metadata) = &record.origin else {
-                        return Err("RELOCALIZATION_RESTORED_TERMINAL_MISSING".into());
-                    };
+                    #[cfg(test)]
+                    let _metadata = &record.admission;
                     #[cfg(test)]
                     let admission_ordinal = _metadata.admission_ordinal;
                     #[cfg(test)]
@@ -6480,8 +5801,8 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
             }
             if self.records.len() >= RELOCALIZATION_MAX_COMMAND_RECORDS {
                 let oldest = self.retained_order.front().expect("空闲账本中的记录均已终结").clone();
-                // 磁盘删除成功后才移除两份内存索引；当前活动请求在上方已返回繁忙。
-                self.terminal_store.remove_terminal(&oldest)?;
+                // 当前活动请求已在上方返回繁忙，只淘汰最旧的已终结记录。
+                self.terminal_store.remove_terminal(&oldest);
                 self.retained_order.pop_front();
                 self.records.remove(&oldest);
             }
@@ -6489,28 +5810,21 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
                 .next_admission_ordinal
                 .checked_add(1)
                 .ok_or("RELOCALIZATION_ADMISSION_ORDINAL_EXHAUSTED")?;
-            let admitted_command_count = self
-                .admitted_command_count
-                .checked_add(1)
-                .ok_or("RELOCALIZATION_ADMITTED_COMMAND_COUNT_EXHAUSTED")?;
             let logical_deadline = now
                 .checked_add(Duration::from_millis(request.timeout_ms()))
                 .ok_or("RELOCALIZATION_LOGICAL_DEADLINE_OVERFLOW")?;
             self.relocalization_mode.activate()?;
             self.next_admission_ordinal = admission_ordinal;
-            self.admitted_command_count = admitted_command_count;
             self.active_request_id = Some(request.request_id().to_owned());
             self.records.insert(
                 request.request_id().to_owned(),
                 RelocalizationLedgerRecord {
-                    origin: RelocalizationLedgerOrigin::Admitted(
-                        RelocalizationLedgerAdmissionMetadata {
-                            request: request.clone(),
-                            admission_ordinal,
-                            logical_deadline,
-                            claim_phase: RelocalizationClaimPhase::Preclaim,
-                        },
-                    ),
+                    admission: RelocalizationLedgerAdmissionMetadata {
+                        request: request.clone(),
+                        admission_ordinal,
+                        logical_deadline,
+                        claim_phase: RelocalizationClaimPhase::Preclaim,
+                    },
                     identity: request.key(),
                     waiter_ids: HashSet::from([waiter_id]),
                     terminal: None,
@@ -6535,14 +5849,8 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
             if &record.identity != identity || record.terminal.is_some() {
                 return Err("RELOCALIZATION_LEDGER_IDENTITY_MISMATCH");
             }
-            let RelocalizationLedgerOrigin::Admitted(metadata) = &mut record.origin else {
-                return Err("RELOCALIZATION_RESTORED_TERMINAL_MISSING");
-            };
+            let metadata = &mut record.admission;
             if metadata.claim_phase == RelocalizationClaimPhase::Preclaim {
-                self.claimed_command_count = self
-                    .claimed_command_count
-                    .checked_add(1)
-                    .ok_or("RELOCALIZATION_CLAIMED_COMMAND_COUNT_EXHAUSTED")?;
                 metadata.claim_phase = RelocalizationClaimPhase::Postclaim;
             }
             Ok(())
@@ -6561,9 +5869,7 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
             if &record.identity != identity || record.terminal.is_some() {
                 return Err("RELOCALIZATION_LEDGER_IDENTITY_MISMATCH");
             }
-            let RelocalizationLedgerOrigin::Admitted(metadata) = &record.origin else {
-                return Err("RELOCALIZATION_RESTORED_TERMINAL_MISSING");
-            };
+            let metadata = &record.admission;
             record.waiter_ids.remove(&waiter_id);
             Ok(record.waiter_ids.is_empty()
                 && metadata.claim_phase == RelocalizationClaimPhase::Preclaim)
@@ -6605,70 +5911,6 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
             })
         }
 
-        fn observation(
-            &self,
-        ) -> Result<crate::proto::RelocalizationLedgerObservation, &'static str> {
-            // Observation counters describe this actor generation. Restored
-            // terminals still consume ledger capacity, but cannot count as
-            // newly admitted or claimed commands (nor their terminal records).
-            let terminal_record_count =
-                self.records.values().try_fold(0_u64, |count, record| {
-                    if matches!(&record.origin, RelocalizationLedgerOrigin::Admitted(_))
-                        && record.terminal.is_some()
-                    {
-                        count
-                            .checked_add(1)
-                            .ok_or("RELOCALIZATION_TERMINAL_RECORD_COUNT_EXHAUSTED")
-                    } else {
-                        Ok(count)
-                    }
-                })?;
-            let pending_record_count = self.records.values().try_fold(0_u64, |count, record| {
-                if matches!(&record.origin, RelocalizationLedgerOrigin::Admitted(_))
-                    && record.terminal.is_none()
-                {
-                    count
-                        .checked_add(1)
-                        .ok_or("RELOCALIZATION_PENDING_RECORD_COUNT_EXHAUSTED")
-                } else {
-                    Ok(count)
-                }
-            })?;
-            let active_waiter_count = self.records.values().try_fold(0_u64, |count, record| {
-                let record_waiters = u64::try_from(record.waiter_ids.len())
-                    .map_err(|_| "RELOCALIZATION_ACTIVE_WAITER_COUNT_EXHAUSTED")?;
-                count
-                    .checked_add(record_waiters)
-                    .ok_or("RELOCALIZATION_ACTIVE_WAITER_COUNT_EXHAUSTED")
-            })?;
-            let record_count = u64::try_from(
-                self.records
-                    .values()
-                    .filter(|record| {
-                        matches!(&record.origin, RelocalizationLedgerOrigin::Admitted(_))
-                    })
-                    .count(),
-            )
-            .map_err(|_| "RELOCALIZATION_RECORD_COUNT_EXHAUSTED")?;
-            if terminal_record_count
-                .checked_add(pending_record_count)
-                .ok_or("RELOCALIZATION_RECORD_COUNT_EXHAUSTED")?
-                != record_count
-                || self.observation_epoch == 0
-            {
-                return Err("RELOCALIZATION_LEDGER_OBSERVATION_INCONSISTENT");
-            }
-            Ok(crate::proto::RelocalizationLedgerObservation {
-                observation_schema_version: 1,
-                admitted_command_count: self.admitted_command_count,
-                claimed_command_count: self.claimed_command_count,
-                terminal_record_count,
-                pending_record_count,
-                active_waiter_count,
-                observation_epoch: self.observation_epoch,
-            })
-        }
-
         fn terminal(&self, request_id: &str) -> Option<&StoredRelocalizationResult> {
             self.records
                 .get(request_id)
@@ -6676,10 +5918,7 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
         }
 
         fn request(&self, request_id: &str) -> Option<&ValidatedRelocalizeRequest> {
-            match &self.records.get(request_id)?.origin {
-                RelocalizationLedgerOrigin::Admitted(metadata) => Some(&metadata.request),
-                RelocalizationLedgerOrigin::RestoredTerminal => None,
-            }
+            Some(&self.records.get(request_id)?.admission.request)
         }
 
         fn active_identity(
@@ -6687,9 +5926,7 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
         ) -> Option<(String, RelocalizationRequestIdentity, u64, Instant, RelocalizationClaimPhase)> {
             let request_id = self.active_request_id.as_ref()?;
             let record = self.records.get(request_id)?;
-            let RelocalizationLedgerOrigin::Admitted(metadata) = &record.origin else {
-                return None;
-            };
+            let metadata = &record.admission;
             Some((
                 request_id.clone(),
                 record.identity.clone(),
@@ -6815,7 +6052,6 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
                 odom_frame_id,
                 body_frame_id,
                 None,
-                None,
             )
         }
 
@@ -6853,7 +6089,6 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
                 odom_frame_id,
                 body_frame_id,
                 Some(runtime),
-                None,
             )
         }
 
@@ -6864,26 +6099,20 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
             odom_frame_id: String,
             body_frame_id: String,
             runtime: Option<RelocalizationRuntimeContext>,
-            prepared_store: Option<RelocalizationTerminalStore>,
         ) -> Self {
             let (sender, receiver) = mpsc::channel(RELOCALIZATION_COMMAND_QUEUE_CAPACITY);
-            let (terminal_query_sender, terminal_query_receiver) =
-                mpsc::channel(RELOCALIZATION_COMMAND_QUEUE_CAPACITY);
             let (detached_tx, detached_rx) = mpsc::unbounded_channel();
-            let terminal_store = prepared_store.unwrap_or_else(||RelocalizationTerminalStore::open()
-                .expect("durable relocalization terminal store must open before admission"));
+            let terminal_store = RelocalizationTerminalStore::default();
             let ingress = RelocalizationCommandIngress {
                 owner_identity: Some(owner_identity.clone()),
                 sender,
-                terminal_query_sender,
-                #[cfg(test)] terminal_store: terminal_store.clone(),
+                terminal_store: terminal_store.clone(),
                 admission_open: Arc::clone(&phase_a.admission_open),
                 admission_rx: phase_a.admission_tx.subscribe(),
                 waiter_capacity: Arc::new(Semaphore::new(RELOCALIZATION_MAX_WAITERS)),
             };
             let worker = tokio::spawn(run_relocalization_command_owner(
                 receiver,
-                terminal_query_receiver,
                 detached_rx,
                 detached_tx,
                 RelocalizationOwnerConfig {
@@ -6966,8 +6195,7 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
                 map_frame_id,
                 odom_frame_id,
                 body_frame_id,
-                RelocalizationTerminalStore::open()
-                    .expect("durable relocalization terminal store must open"),
+                RelocalizationTerminalStore::default(),
             )
         }
 
@@ -6979,7 +6207,7 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
             terminal_store: RelocalizationTerminalStore,
         ) -> Self {
             Self {
-                ledger: RelocalizationCommandLedger::from_terminal_store(&terminal_store),
+                ledger: RelocalizationCommandLedger::new(terminal_store.clone()),
                 waiter_responses: HashMap::new(),
                 waiter_requests: HashMap::new(),
                 next_waiter_id: 0,
@@ -6993,17 +6221,6 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
                 next_candidate_sequence: 0,
                 terminal_store,
             }
-        }
-
-        fn handle_terminal_query(&self, query: RelocalizationTerminalQueryRequest) {
-            let terminal = self.terminal_store.snapshot_exact(&query.request_id, &query.identity);
-            let result = self.ledger.observation().map(|ledger_observation| {
-                RelocalizationTerminalQuerySnapshot {
-                    terminal,
-                    ledger_observation,
-                }
-            });
-            let _ = query.response.send(result);
         }
 
         fn next_waiter_id(&mut self) -> Result<u64, RelocalizationCommandError> {
@@ -7108,14 +6325,14 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
                 "RELOCALIZATION_OWNER_BUSY")?.to_wire())
         }
 
-        fn settle_terminal_durable(
+        fn settle_terminal(
             &mut self, request_id: &str, identity: &RelocalizationRequestIdentity,
             terminal: StoredRelocalizationResult,
         ) -> Result<RelocalizationTerminalWaiters, CorrectionRuntimeError> {
             let request = self.ledger.request(request_id).ok_or_else(||
-                CorrectionRuntimeError::Apply("relocalization request missing before durable terminal".into()))?;
-            if &request.key() != identity { return Err(CorrectionRuntimeError::Apply("relocalization durable identity mismatch".into())); }
-            self.terminal_store.persist_terminal(request_id, identity, &terminal).map_err(CorrectionRuntimeError::Apply)?;
+                CorrectionRuntimeError::Apply("relocalization request missing before terminal".into()))?;
+            if &request.key() != identity { return Err(CorrectionRuntimeError::Apply("relocalization terminal identity mismatch".into())); }
+            self.terminal_store.store_terminal(request_id, identity, &terminal).map_err(CorrectionRuntimeError::Apply)?;
             self.ledger.settle_terminal(request_id, identity, terminal)
                 .map_err(|detail| CorrectionRuntimeError::Apply(detail.into()))
         }
@@ -7162,7 +6379,7 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
                 CorrectionRuntimeError::Apply("relocalization request missing".to_owned())
             })?;
             let terminal = self.terminal_result(&request, Some(ordinal), disposition, detail)?;
-            let terminal = self.settle_terminal_durable(&request_id, &identity, terminal)?;
+            let terminal = self.settle_terminal(&request_id, &identity, terminal)?;
             self.notify_terminal(terminal);
             self.clear_frame_proofs();
             self.drop_synchronous_preclaim_execution();
@@ -7740,7 +6957,7 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
                 correction_revision,
                 detail,
             )?;
-            let terminal = self.settle_terminal_durable(
+            let terminal = self.settle_terminal(
                 computed.request.request_id(),
                 &computed.request.key(),
                 terminal,
@@ -8089,7 +7306,6 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
 
     async fn run_relocalization_command_owner(
         mut admissions: mpsc::Receiver<RelocalizationAdmissionRequest>,
-        mut terminal_queries: mpsc::Receiver<RelocalizationTerminalQueryRequest>,
         mut detached: mpsc::UnboundedReceiver<RelocalizationWaiterEvent>,
         detached_tx: mpsc::UnboundedSender<RelocalizationWaiterEvent>,
         config: RelocalizationOwnerConfig,
@@ -8116,7 +7332,6 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
                 run_relocalization_runtime_loop(
                     &mut actor,
                     &mut admissions,
-                    &mut terminal_queries,
                     &mut detached,
                     &detached_tx,
                     &phase_a,
@@ -8128,7 +7343,6 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
                 run_relocalization_ledger_loop(
                     &mut actor,
                     &mut admissions,
-                    &mut terminal_queries,
                     &mut detached,
                     &detached_tx,
                     &phase_a,
@@ -8140,7 +7354,6 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
 
     async fn run_relocalization_ledger_loop(
         actor: &mut RelocalizationCommandActor, admissions: &mut mpsc::Receiver<RelocalizationAdmissionRequest>,
-        terminal_queries: &mut mpsc::Receiver<RelocalizationTerminalQueryRequest>,
         detached: &mut mpsc::UnboundedReceiver<RelocalizationWaiterEvent>,
         detached_tx: &mpsc::UnboundedSender<RelocalizationWaiterEvent>, phase_a: &CorrectionPhaseAControl,
     ) -> Result<(), CorrectionRuntimeError> {
@@ -8202,7 +7415,7 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
                             let result = assigned_planar_relocalization_result(&request.identity, outcome.disposition,
                                 outcome.correction_revision, &outcome.detail, evidence);
                             let terminal = AssignedRelocalizationTerminalV2::new(request.identity.clone(), result);
-                            let terminal = actor.settle_terminal_durable(&id, &identity, terminal)?;
+                            let terminal = actor.settle_terminal(&id, &identity, terminal)?;
                             actor.notify_terminal(terminal);
                         }
                     },
@@ -8212,9 +7425,6 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
                         return Err(CorrectionRuntimeError::WorkerJoin(format!("planar retained task failed: {error}")));
                     },
                     None => {},
-                },
-                query = terminal_queries.recv() => match query {
-                    Some(query) => actor.handle_terminal_query(query), None => return Err(CorrectionRuntimeError::IngressClosed),
                 },
                 event = detached.recv() => match event {
                     Some(RelocalizationWaiterEvent::Detached(id)) => actor.handle_detached(id)?,
@@ -8232,7 +7442,6 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
     async fn run_relocalization_runtime_loop(
         actor: &mut RelocalizationCommandActor,
         admissions: &mut mpsc::Receiver<RelocalizationAdmissionRequest>,
-        terminal_queries: &mut mpsc::Receiver<RelocalizationTerminalQueryRequest>,
         detached: &mut mpsc::UnboundedReceiver<RelocalizationWaiterEvent>,
         detached_tx: &mpsc::UnboundedSender<RelocalizationWaiterEvent>,
         phase_a: &CorrectionPhaseAControl,
@@ -8304,10 +7513,6 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
                         )));
                     }
                     None => {}
-                },
-                query = terminal_queries.recv() => match query {
-                    Some(query) => actor.handle_terminal_query(query),
-                    None => return Err(CorrectionRuntimeError::IngressClosed),
                 },
                 event = detached.recv() => match event {
                     Some(RelocalizationWaiterEvent::Detached(waiter_id)) => {
@@ -8949,7 +8154,6 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
 
         async fn start_inner(spec:CorrectionOwnerSpec,identity:CorrectionOwnerRuntimeIdentity,provider:&str,sink:Arc<dyn CorrectionCandidateSink>,relocalization_mode:Arc<RelocalizationModeFence>,planar_frames:Option<(String,String,String)>)->Result<Self,CorrectionRuntimeError> {
             let planar_only=planar_frames.is_some();
-            let mut planar_store=if planar_only {Some(RelocalizationTerminalStore::open().map_err(CorrectionRuntimeError::Apply)?)} else {None};
             let background = matches!(
                 &spec,
                 CorrectionOwnerSpec::LibraryPgo { .. } | CorrectionOwnerSpec::NativePgo { .. }
@@ -9073,7 +8277,7 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
             let (producer_worker, relocalization) = match relocalization_frames {
                 Some((map_frame_id, odom_frame_id, body_frame_id)) if planar_only => {
                     drop(request_rx);
-                    (None,Some(RelocalizationOwnerSupervisor::start_inner(phase_a.clone(),identity.clone(),map_frame_id,odom_frame_id,body_frame_id,None,planar_store.take())))
+                    (None,Some(RelocalizationOwnerSupervisor::start_inner(phase_a.clone(),identity.clone(),map_frame_id,odom_frame_id,body_frame_id,None)))
                 },
                 Some((map_frame_id, odom_frame_id, body_frame_id)) => (
                     None,
@@ -10482,33 +9686,6 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
             NATIVE_CORRECTION_TEST_LOCK.lock().await
         }
 
-        pub(super) struct RelocalizationTerminalTestRoot(PathBuf);
-
-        impl RelocalizationTerminalTestRoot {
-            pub(super) fn new() -> Self {
-                Self(std::env::temp_dir().join(format!(
-                    "nuwax-relocalization-test-{}-{}",
-                    std::process::id(),
-                    uuid::Uuid::new_v4(),
-                )))
-            }
-
-            pub(super) fn path(&self) -> &Path {
-                &self.0
-            }
-        }
-
-        impl Drop for RelocalizationTerminalTestRoot {
-            fn drop(&mut self) {
-                // 存储的最后一份共享引用释放租约后，才删除该测试独占的终态目录。
-                if let Err(error) = fs::remove_dir_all(&self.0) {
-                    if error.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(%error, "重定位测试终态目录清理失败");
-                    }
-                }
-            }
-        }
-
         fn exact_hex(bytes: &[u8]) -> String {
             bytes.iter().map(|byte| format!("{byte:02x}")).collect()
         }
@@ -10525,304 +9702,6 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
             assert_eq!(
                 validate_relocalization_request_id(&"a".repeat(129)),
                 Err("RELOCALIZATION_REQUEST_ID_INVALID".to_owned())
-            );
-        }
-
-        #[test]
-        fn relocalization_terminal_store_root_resolves_deployment_and_local_paths() {
-            let current_directory = || Ok(PathBuf::from("/workspace"));
-            assert_eq!(
-                terminal_store_root_from(
-                    Some(OsString::from("/override/store")),
-                    Some(OsString::from("/var/lib/nuwax/geometry-runtime:/ignored")),
-                    Some(OsString::from("/runtime-data")),
-                    || panic!("绝对终态目录不应读取当前工作目录"),
-                ),
-                Ok(PathBuf::from("/override/store"))
-            );
-            assert_eq!(
-                terminal_store_root_from(
-                    None,
-                    Some(OsString::from("/var/lib/nuwax/geometry-runtime:/ignored")),
-                    Some(OsString::from("/runtime-data")),
-                    || panic!("绝对部署目录不应读取当前工作目录"),
-                ),
-                Ok(PathBuf::from(
-                    "/var/lib/nuwax/geometry-runtime/relocalization_terminals_v1"
-                ))
-            );
-            assert_eq!(
-                terminal_store_root_from(
-                    None,
-                    None,
-                    Some(OsString::from("/runtime-data")),
-                    || panic!("绝对运行数据目录不应读取当前工作目录"),
-                ),
-                Ok(PathBuf::from(
-                    "/runtime-data/geometry/relocalization_terminals_v1"
-                ))
-            );
-            assert_eq!(
-                terminal_store_root_from(
-                    Some(OsString::from("relative")),
-                    Some(OsString::from("/state")),
-                    Some(OsString::from("/runtime-data")),
-                    current_directory,
-                ),
-                Ok(PathBuf::from("/workspace/relative"))
-            );
-            assert_eq!(
-                terminal_store_root_from(
-                    None,
-                    Some(OsString::from("relative:/state")),
-                    None,
-                    current_directory,
-                ),
-                Err("RELOCALIZATION_TERMINAL_STORE_PATH_NOT_ABSOLUTE".to_owned())
-            );
-            assert_eq!(
-                terminal_store_root_from(None, None, None, current_directory),
-                Ok(PathBuf::from(
-                    "/workspace/runtime_data/geometry/relocalization_terminals_v1"
-                ))
-            );
-            assert_eq!(
-                terminal_store_root_from(
-                    None,
-                    None,
-                    Some(OsString::from("relative-data")),
-                    current_directory,
-                ),
-                Ok(PathBuf::from(
-                    "/workspace/relative-data/geometry/relocalization_terminals_v1"
-                ))
-            );
-            assert_eq!(
-                terminal_store_root_from(Some(OsString::new()), None, None, current_directory,),
-                Err("RELOCALIZATION_TERMINAL_STORE_PATH_INVALID".to_owned())
-            );
-        }
-
-        #[test]
-        fn relocalization_default_and_relative_roots_persist_and_reopen() {
-            for (explicit, runtime, expected) in [
-                (None, None, "runtime_data/geometry/relocalization_terminals_v1"),
-                (Some("relative-terminals"), None, "relative-terminals"),
-                (None, Some("relative-data"), "relative-data/geometry/relocalization_terminals_v1"),
-            ] {
-                let base = RelocalizationTerminalTestRoot::new();
-                let root = terminal_store_root_from(explicit.map(OsString::from), None, runtime.map(OsString::from),
-                    || Ok(base.path().to_path_buf())).unwrap();
-                assert_eq!(root, base.path().join(expected));
-                let request = validate_relocalize_request(relocalization_command_request("relative-reopen", 7)).unwrap();
-                let terminal = relocalization_command_terminal(&request, crate::proto::RelocalizeDisposition::Cancelled, "cancelled");
-                { let store = RelocalizationTerminalStore::open_at(root.clone()).unwrap();
-                  store.persist_terminal(request.request_id(), &request.key(), &terminal).unwrap(); }
-                let reopened = RelocalizationTerminalStore::open_at(root).unwrap();
-                match reopened.snapshot_exact(request.request_id(), &request.key()) {
-                    RelocalizationTerminalSnapshot::AssignedTerminal(value) => assert_eq!(value.encoded(), terminal.encoded()),
-                    other => panic!("unexpected reopened terminal {other:?}"),
-                }
-            }
-        }
-
-        #[test]
-        fn durable_relocalization_terminal_store_reopens_and_detects_identity_conflict() {
-            let root = RelocalizationTerminalTestRoot::new();
-            let request = validate_relocalize_request(relocalization_command_request("reopen-exact", 7)).unwrap();
-            let terminal = relocalization_command_terminal(&request, crate::proto::RelocalizeDisposition::Cancelled, "cancelled");
-            { let store = RelocalizationTerminalStore::open_at(root.path().into()).unwrap();
-              store.mark_pending(&request).unwrap();
-              assert!(matches!(store.snapshot_exact(request.request_id(), &request.key()), RelocalizationTerminalSnapshot::Pending));
-              store.persist_terminal(request.request_id(), &request.key(), &terminal).unwrap(); }
-            let reopened = RelocalizationTerminalStore::open_at(root.path().into()).unwrap();
-            match reopened.snapshot_exact(request.request_id(), &request.key()) {
-                RelocalizationTerminalSnapshot::AssignedTerminal(value) => assert_eq!(value.encoded(), terminal.encoded()),
-                other => panic!("unexpected reopened terminal {other:?}"),
-            }
-            let conflict = validate_relocalize_request(relocalization_command_request("reopen-exact", 8)).unwrap();
-            assert!(matches!(reopened.snapshot_exact(request.request_id(), &conflict.key()), RelocalizationTerminalSnapshot::IdentityConflict));
-        }
-
-
-
-
-
-
-
-        #[test]
-        fn durable_relocalization_terminal_store_removes_temporary_on_publish_conflict() {
-            let root = RelocalizationTerminalTestRoot::new();
-            let request = validate_relocalize_request(relocalization_command_request("publish-conflict", 7)).unwrap();
-            let terminal = relocalization_command_terminal(&request, crate::proto::RelocalizeDisposition::Cancelled, "cancelled");
-            let store = RelocalizationTerminalStore::open_at(root.path().into()).unwrap();
-            let path = root.path().join(assigned_terminal_filename_v2(request.request_id()).unwrap());
-            fs::write(&path, b"different terminal").unwrap();
-            assert_eq!(store.persist_terminal(request.request_id(), &request.key(), &terminal), Err("RELOCALIZATION_TERMINAL_STORE_IDENTITY_CONFLICT".into()));
-            assert_eq!(fs::read(&path).unwrap(), b"different terminal");
-            assert!(!fs::read_dir(root.path()).unwrap().map(Result::unwrap).any(|entry|
-                entry.file_name().to_str().is_some_and(is_owned_terminal_temporary_name)));
-            assert!(store.state.lock().terminals.is_empty());
-        }
-
-        #[test]
-        fn durable_relocalization_terminal_store_bounds_publish_conflict_read() {
-            let root = RelocalizationTerminalTestRoot::new();
-            let request = validate_relocalize_request(relocalization_command_request("bounded-conflict", 7)).unwrap();
-            let terminal = relocalization_command_terminal(&request, crate::proto::RelocalizeDisposition::Cancelled, "cancelled");
-            let store = RelocalizationTerminalStore::open_at(root.path().into()).unwrap();
-            let path = root.path().join(assigned_terminal_filename_v2(request.request_id()).unwrap());
-            File::create(&path).unwrap().set_len(RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES as u64 + 1).unwrap();
-            assert_eq!(store.persist_terminal(request.request_id(), &request.key(), &terminal), Err("RELOCALIZATION_TERMINAL_STORE_RECORD_TOO_LARGE".into()));
-            assert!(!fs::read_dir(root.path()).unwrap().map(Result::unwrap).any(|entry|
-                entry.file_name().to_str().is_some_and(is_owned_terminal_temporary_name)));
-        }
-
-
-        #[test]
-        fn durable_relocalization_terminal_store_cleans_only_unlocked_owner() {
-            let root = std::env::temp_dir().join(format!(
-                "nuwax-relocalization-terminal-temp-cleanup-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("system clock")
-                    .as_nanos(),
-            ));
-            fs::create_dir_all(&root).expect("create terminal store root");
-            let digest = "0".repeat(64);
-            let active_owner = terminal_owner_token();
-            let active_lease_path = root.join(terminal_lease_name(&active_owner));
-            let active_lease_file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&active_lease_path)
-                .expect("create active lease");
-            let active_lease = Flock::lock(active_lease_file, FlockArg::LockExclusiveNonblock)
-                .expect("lock active lease");
-            let active = root.join(format!(
-                "{RELOCALIZATION_TERMINAL_TEMP_PREFIX}{}.{}.{}.{}{RELOCALIZATION_TERMINAL_TEMP_SUFFIX}",
-                active_owner,
-                terminal_owner_token(),
-                digest,
-                digest,
-            ));
-            fs::write(&active, b"active").expect("write active temp");
-
-            let orphan_owner = terminal_owner_token();
-            let orphan_lease = root.join(terminal_lease_name(&orphan_owner));
-            fs::write(&orphan_lease, b"").expect("write orphan lease");
-            let orphan = root.join(format!(
-                "{RELOCALIZATION_TERMINAL_TEMP_PREFIX}{}.{}.{}.{}{RELOCALIZATION_TERMINAL_TEMP_SUFFIX}",
-                orphan_owner,
-                terminal_owner_token(),
-                digest,
-                digest,
-            ));
-            fs::write(&orphan, b"orphan").expect("write orphan temp");
-
-            RelocalizationTerminalStore::open_at(root.clone()).expect("open terminal store");
-
-            assert!(active.exists());
-            assert!(active_lease_path.exists());
-            assert!(!orphan.exists());
-            assert!(!orphan_lease.exists());
-            drop(active_lease);
-            fs::remove_dir_all(root).expect("remove terminal store");
-        }
-
-        #[test]
-        fn durable_relocalization_terminal_store_lock_unknown_is_retained() {
-            let root = std::env::temp_dir().join(format!(
-                "nuwax-relocalization-terminal-lock-unknown-{}-{}",
-                std::process::id(),
-                terminal_owner_token(),
-            ));
-            fs::create_dir_all(&root).expect("create terminal store root");
-            let owner = terminal_owner_token();
-            let digest = "0".repeat(64);
-            let temporary = root.join(format!(
-                "{RELOCALIZATION_TERMINAL_TEMP_PREFIX}{}.{}.{}.{}{RELOCALIZATION_TERMINAL_TEMP_SUFFIX}",
-                owner,
-                terminal_owner_token(),
-                digest,
-                digest,
-            ));
-            fs::write(&temporary, b"unknown").expect("write unknown temp");
-
-            let cleanup_lock = lock_terminal_cleanup(&root).expect("lock terminal cleanup");
-            assert_eq!(
-                cleanup_terminal_owner(&root, &owner, &cleanup_lock),
-                Err("RELOCALIZATION_TERMINAL_STORE_OWNER_LEASE_MISSING".to_owned())
-            );
-            drop(cleanup_lock);
-            assert!(temporary.exists());
-            fs::remove_dir_all(root).expect("remove terminal store");
-        }
-
-        #[test]
-        fn durable_relocalization_terminal_store_incarnations_do_not_collide() {
-            let first = terminal_owner_token();
-            let second = terminal_owner_token();
-            assert_ne!(first, second);
-            assert!(is_terminal_token(
-                &first,
-                RELOCALIZATION_TERMINAL_OWNER_TOKEN_BYTES
-            ));
-            assert!(is_terminal_token(
-                &second,
-                RELOCALIZATION_TERMINAL_OWNER_TOKEN_BYTES
-            ));
-            assert_ne!(terminal_lease_name(&first), terminal_lease_name(&second));
-        }
-
-        #[test]
-        fn durable_relocalization_terminal_store_preserves_primary_on_cleanup_failure() {
-            assert_eq!(
-                combine_terminal_persist_results(
-                    Err("RELOCALIZATION_TERMINAL_STORE_WRITE_FAILED:disk".to_owned()),
-                    Err("RELOCALIZATION_TERMINAL_STORE_TEMP_CLEANUP_FAILED:denied".to_owned()),
-                ),
-                Err(
-                    "RELOCALIZATION_TERMINAL_STORE_WRITE_FAILED:disk|TEMP_CLEANUP_FAILED"
-                        .to_owned()
-                )
-            );
-            assert_eq!(
-                combine_terminal_persist_results(
-                    Ok(()),
-                    Err("RELOCALIZATION_TERMINAL_STORE_TEMP_CLEANUP_FAILED:denied".to_owned()),
-                ),
-                Ok(())
-            );
-        }
-
-        #[test]
-        fn terminal_record_reader_enforces_fixed_limit_and_growth_boundary() {
-            let at_limit = vec![b'x'; RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES];
-            assert_eq!(
-                read_terminal_record_bytes(
-                    std::io::Cursor::new(at_limit.clone()),
-                    RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES as u64,
-                )
-                .expect("fixed-limit reader accepts exactly the byte limit"),
-                at_limit
-            );
-            assert_eq!(
-                read_terminal_record_bytes(
-                    std::io::Cursor::new(vec![b'x'; RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES + 1]),
-                    (RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES + 1) as u64,
-                ),
-                Err("RELOCALIZATION_TERMINAL_STORE_RECORD_TOO_LARGE".to_owned())
-            );
-            assert_eq!(
-                read_terminal_record_bytes(
-                    std::io::Cursor::new(vec![b'x'; RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES + 1]),
-                    RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES as u64,
-                ),
-                Err("RELOCALIZATION_TERMINAL_STORE_RECORD_TOO_LARGE".to_owned()),
-                "bounded read must detect growth after metadata inspection"
             );
         }
 
@@ -10872,16 +9751,6 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
             AssignedRelocalizationTerminalV2::from_encoded((result).encode_to_vec()).unwrap()
         }
 
-        fn relocalization_query(request: &ValidatedRelocalizeRequest) -> AssignedRelocalizationTerminalQueryV2 {
-            AssignedRelocalizationTerminalQueryV2::admit(crate::proto::GetRelocalizationTerminalRequest {
-                schema_version: 2, request_id: request.request_id().into(), assigned_request_v2: Some(request.identity.to_wire()),
-                ..Default::default()
-            }).unwrap()
-        }
-
-
-
-
         #[test]
         fn relocalization_command_ledger_join_preserves_first_logical_deadline() {
             let request = validate_relocalize_request(relocalization_command_request("req-a", 7))
@@ -10927,55 +9796,6 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
         }
 
         #[test]
-        fn relocalization_ledger_observation_counts_only_new_admission_and_first_claim() {
-            let request = validate_relocalize_request(relocalization_command_request("req-a", 7))
-                .expect("valid request");
-            let mut ledger = RelocalizationCommandLedger::default();
-            let epoch = ledger
-                .observation()
-                .expect("initial observation")
-                .observation_epoch;
-            assert_ne!(epoch, 0);
-
-            ledger
-                .admit(&request, 1, Instant::now(), || unreachable!("no conflict"))
-                .expect("first admission");
-            ledger
-                .admit(&request, 2, Instant::now(), || {
-                    unreachable!("same identity")
-                })
-                .expect("same-ID join");
-            let before_claim = ledger.observation().expect("before claim observation");
-            assert_eq!(before_claim.admitted_command_count, 1);
-            assert_eq!(before_claim.claimed_command_count, 0);
-            assert_eq!(before_claim.terminal_record_count, 0);
-            assert_eq!(before_claim.pending_record_count, 1);
-            assert_eq!(before_claim.active_waiter_count, 2);
-
-            ledger
-                .mark_postclaim("req-a", &request.key())
-                .expect("first claim");
-            ledger
-                .mark_postclaim("req-a", &request.key())
-                .expect("idempotent claim");
-            let terminal = relocalization_command_terminal(
-                &request,
-                crate::proto::RelocalizeDisposition::Cancelled,
-                "RELOCALIZATION_CANCELLED",
-            );
-            ledger
-                .settle_terminal("req-a", &request.key(), terminal)
-                .expect("terminal settlement");
-            let settled = ledger.observation().expect("settled observation");
-            assert_eq!(settled.observation_epoch, epoch);
-            assert_eq!(settled.admitted_command_count, 1);
-            assert_eq!(settled.claimed_command_count, 1);
-            assert_eq!(settled.terminal_record_count, 1);
-            assert_eq!(settled.pending_record_count, 0);
-            assert_eq!(settled.active_waiter_count, 0);
-        }
-
-        #[test]
         fn relocalization_command_terminal_is_stored_before_waiter_notification_and_replays() {
             let request = validate_relocalize_request(relocalization_command_request("req-a", 7))
                 .expect("valid request");
@@ -10992,7 +9812,7 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
                 .settle_terminal("req-a", &request.key(), terminal.clone())
                 .expect("terminal settlement");
 
-            let stored_before_notify = ledger.terminal("req-a").expect("terminal is durable");
+            let stored_before_notify = ledger.terminal("req-a").expect("终态已保存在内存");
             assert_eq!(stored_before_notify.encoded(), terminal.encoded());
             assert_eq!(pending_notifications.waiter_ids, vec![9]);
             assert_eq!(pending_notifications.result.encoded(), terminal.encoded());
@@ -11092,7 +9912,7 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
                     RelocalizationLedgerAdmission::Started { .. }));
                 let terminal = relocalization_command_terminal(&request,
                     crate::proto::RelocalizeDisposition::Cancelled, "cancelled");
-                ledger.terminal_store.persist_terminal(request.request_id(), &request.key(), &terminal).unwrap();
+                ledger.terminal_store.store_terminal(request.request_id(), &request.key(), &terminal).unwrap();
                 ledger.settle_terminal(request.request_id(), &request.key(), terminal).unwrap();
             }
             let first = validate_relocalize_request(relocalization_command_request("bounded-0000", 7)).unwrap();
@@ -11106,7 +9926,6 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
             assert!(!ledger.records.contains_key(first.request_id()));
             assert!(matches!(ledger.terminal_store.snapshot_exact(first.request_id(), &first.key()),
                 RelocalizationTerminalSnapshot::NotFound));
-            assert!(!ledger.terminal_store.root.join(assigned_terminal_filename_v2(first.request_id()).unwrap()).exists());
             assert_eq!(ledger.terminal_store.state.lock().terminals.len(), RELOCALIZATION_MAX_COMMAND_RECORDS - 1);
             assert!(matches!(ledger.admit(&active, 2002, Instant::now(), || unreachable!()).unwrap(),
                 RelocalizationLedgerAdmission::Joined { admission_ordinal: 1025, .. }));
@@ -11291,62 +10110,6 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
             assert!(!postclaim
                 .detach_waiter("req-a", &request.key(), 3)
                 .expect("detach postclaim waiter"));
-        }
-
-        #[test]
-        fn relocalization_restored_store_evicts_oldest_and_accepts_new_commands() {
-            let root = RelocalizationTerminalTestRoot::new();
-            fs::create_dir_all(root.path()).unwrap();
-            for index in 0..1100 {
-                let request = validate_relocalize_request(relocalization_command_request(
-                    &format!("restored-{index:04}"), 7,
-                )).unwrap();
-                let terminal = relocalization_command_terminal(&request,
-                    crate::proto::RelocalizeDisposition::Cancelled, "cancelled");
-
-                let path = root.path().join(assigned_terminal_filename_v2(request.request_id()).unwrap());
-                fs::write(&path, terminal.encode_durable().unwrap()).unwrap();
-                File::open(path).unwrap().set_times(std::fs::FileTimes::new().set_modified(
-                    std::time::UNIX_EPOCH + Duration::from_secs(index + 1),
-                )).unwrap();
-            }
-            let store = RelocalizationTerminalStore::open_at(root.path().into()).unwrap();
-            let mut ledger = RelocalizationCommandLedger::from_terminal_store(&store);
-            assert_eq!(ledger.records.len(), RELOCALIZATION_MAX_COMMAND_RECORDS);
-            assert_eq!(store.state.lock().terminals.len(), RELOCALIZATION_MAX_COMMAND_RECORDS);
-            assert_eq!(ledger.retained_order.front().map(String::as_str), Some("restored-0076"));
-            for index in 0..76 {
-                assert!(!root.path().join(assigned_terminal_filename_v2(&format!("restored-{index:04}")).unwrap()).exists());
-            }
-            let recent = validate_relocalize_request(relocalization_command_request("restored-1099", 7)).unwrap();
-            assert!(matches!(ledger.admit(&recent, 1, Instant::now(), || unreachable!()).unwrap(),
-                RelocalizationLedgerAdmission::Replay(_)));
-            let changed = validate_relocalize_request(relocalization_command_request(recent.request_id(), 8)).unwrap();
-            assert!(matches!(ledger.admit(&changed, 2, Instant::now(), || relocalization_command_terminal(
-                &changed, crate::proto::RelocalizeDisposition::ReplayConflict, "conflict",
-            )).unwrap(), RelocalizationLedgerAdmission::Conflict(_)));
-            assert_eq!(ledger.admitted_command_count, 0);
-            assert_eq!(ledger.next_admission_ordinal, 0);
-            let next = validate_relocalize_request(relocalization_command_request("new-after-reopen", 7)).unwrap();
-            assert!(matches!(ledger.admit(&next, 3, Instant::now(), || unreachable!()).unwrap(),
-                RelocalizationLedgerAdmission::Started { admission_ordinal: 1, .. }));
-            assert!(!ledger.records.contains_key("restored-0076"));
-            assert!(!root.path().join(assigned_terminal_filename_v2("restored-0076").unwrap()).exists());
-            let terminal = relocalization_command_terminal(&next,
-                crate::proto::RelocalizeDisposition::Cancelled, "cancelled");
-            store.persist_terminal(next.request_id(), &next.key(), &terminal).unwrap();
-            ledger.settle_terminal(next.request_id(), &next.key(), terminal.clone()).unwrap();
-            assert_eq!(ledger.records.len(), RELOCALIZATION_MAX_COMMAND_RECORDS);
-            assert_eq!(store.state.lock().terminals.len(), RELOCALIZATION_MAX_COMMAND_RECORDS);
-            drop(ledger);
-            drop(store);
-            let reopened = RelocalizationTerminalStore::open_at(root.path().into()).unwrap();
-            assert_eq!(reopened.state.lock().terminals.len(), RELOCALIZATION_MAX_COMMAND_RECORDS);
-            assert_eq!(reopened.state.lock().retained_order.front().unwrap().0, "restored-0077");
-            match reopened.snapshot_exact(next.request_id(), &next.key()) {
-                RelocalizationTerminalSnapshot::AssignedTerminal(result) => assert_eq!(result.encoded(), terminal.encoded()),
-                other => panic!("新命令重开后可重放：{other:?}"),
-            }
         }
 
         fn install_relocalization_target_for_request(
@@ -13230,53 +11993,6 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
         }
 
         #[test]
-        fn retained_policy_v2_applied_reopens_with_current_records_and_queries_exact_bytes() {
-            let root = RelocalizationTerminalTestRoot::new();
-            fs::create_dir_all(root.path()).unwrap();
-            let mut expected = Vec::new();
-            for (historical, request_id) in [(true, "historical-applied"), (false, "current-applied")] {
-                let mut result = assigned_finalized_terminal_fixture();
-                result.request_id = request_id.into();
-                let request = result.assigned_cloud_v2.as_mut().unwrap().request.as_mut().unwrap();
-                request.request_id = request_id.into();
-                if historical {
-                    relocalization_request_body(request).policy = Some(
-                        crate::relocalization_identity::tests::historical_policy_fixture());
-                    assert!(validate_relocalize_request(request.clone()).is_err());
-                }
-                let terminal = AssignedRelocalizationTerminalV2::from_encoded((result).encode_to_vec()).unwrap();
-                assert_eq!(terminal.body().disposition, crate::proto::RelocalizeDisposition::Applied as i32);
-                assert!(!terminal.body().candidate_payload_v3.is_empty());
-                let durable = terminal.encode_durable().unwrap();
-                let path = root.path().join(crate::relocalization_terminal_v2::assigned_terminal_filename_v2(request_id).unwrap());
-                fs::write(&path, &durable).unwrap();
-                expected.push((terminal, durable, path));
-            }
-            let store = RelocalizationTerminalStore::open_at(root.path().into()).unwrap();
-            for (original, durable, path) in expected {
-                let key = original.request().clone();
-                let reopened = match store.snapshot_exact(original.request().request_id(), &key) {
-                    RelocalizationTerminalSnapshot::AssignedTerminal(value) => value,
-                    other => panic!("未读到已持久化的完整终态: {other:?}"),
-                };
-                assert_eq!(reopened.encoded(), original.encoded());
-                assert_eq!(fs::read(path).unwrap(), durable, "打开仓库不得改写历史字节");
-                let query = AssignedRelocalizationTerminalQueryV2::admit(crate::proto::GetRelocalizationTerminalRequest {
-                    schema_version: 2,
-                    request_id: reopened.request().request_id().into(),
-                    assigned_request_v2: Some(reopened.request().to_wire()),
-                    ..Default::default()
-                }).unwrap();
-                let response = query.response(crate::proto::RelocalizationTerminalStatus::Terminal, Some(&reopened), None);
-                assert_eq!(response.terminal.unwrap().encode_to_vec(), original.encoded());
-            }
-        }
-
-
-
-
-
-        #[test]
         fn relocalization_frame_proof_ledger_is_scoped_and_conflict_permanent() {
             let mut actor = RelocalizationCommandActor::new(owner_identity(), "robot_map".into(), "robot_odom".into(), "robot_body".into());
             let input = Arc::new(frame(1, 10, 0.0));
@@ -13325,41 +12041,6 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
             assert!(stable_stratified_source(vec![Point3::origin(); RELOCALIZATION_MAX_AGGREGATE_POINTS+1]).is_err());
         }
 
-        #[tokio::test]
-        async fn relocalization_actor_restart_replays_before_conflict_busy_and_side_effects() {
-            let root = RelocalizationTerminalTestRoot::new();
-            let result = assigned_finalized_terminal_fixture();
-            let terminal = AssignedRelocalizationTerminalV2::from_encoded((result.clone()).encode_to_vec()).unwrap();
-            let request = ValidatedRelocalizeRequest { identity: terminal.request().clone() };
-            { let store = RelocalizationTerminalStore::open_at(root.path().into()).unwrap();
-              store.persist_terminal(request.request_id(), &request.key(), &terminal).unwrap(); }
-            let path = root.path().join(assigned_terminal_filename_v2(request.request_id()).unwrap());
-            let persisted = fs::read(&path).unwrap();
-            let phase_a = CorrectionPhaseAControl::for_tests();
-            let mut supervisor = RelocalizationOwnerSupervisor::start_inner(phase_a.clone(),
-                CorrectionOwnerRuntimeIdentity { runtime_generation: 2, ..owner_identity() },
-                "robot_map".into(), "robot_odom".into(), "robot_body".into(), None,
-                Some(RelocalizationTerminalStore::open_at(root.path().into()).unwrap()));
-            let ingress = supervisor.ingress();
-            let before = ingress.terminal_snapshot_assigned(&relocalization_query(&request)).await.unwrap().ledger_observation;
-            let mut conflict_wire = request.identity.to_wire();
-            relocalization_request_body(&mut conflict_wire).target.as_mut().unwrap().activation.as_mut().unwrap().lifecycle_epoch += 1;
-            let conflict = ingress.admit(conflict_wire.clone()).await.unwrap().wait().await.unwrap();
-            assert_eq!(relocalization_terminal_body(&conflict).disposition, crate::proto::RelocalizeDisposition::ReplayConflict as i32);
-            assert_eq!(ingress.admit(conflict_wire).await.unwrap().wait().await.unwrap().encode_to_vec(), conflict.encode_to_vec());
-            for _ in 0..3 {
-                assert_eq!(ingress.admit(request.identity.to_wire()).await.unwrap().wait().await.unwrap().encode_to_vec(), result.encode_to_vec());
-            }
-            let after = ingress.terminal_snapshot_assigned(&relocalization_query(&request)).await.unwrap();
-            assert!(matches!(after.terminal, RelocalizationTerminalSnapshot::AssignedTerminal(_)));
-            assert_eq!(before.encode_to_vec(), after.ledger_observation.encode_to_vec());
-            assert_eq!(after.ledger_observation.admitted_command_count, 0);
-            assert_eq!(after.ledger_observation.claimed_command_count, 0);
-            assert_eq!(phase_a.relocalization_mode().snapshot(), RelocalizationModeSnapshot { epoch: 0, active: false });
-            assert_eq!(fs::read(path).unwrap(), persisted);
-            phase_a.begin(); supervisor.shutdown().await.unwrap();
-        }
-
         struct PlanarNoHash;
         impl PlanarNoHash { fn enter() -> Self { crate::map_checksum::FORBID_HASH.with(|value| value.set(true)); Self } }
         impl Drop for PlanarNoHash { fn drop(&mut self) { crate::map_checksum::FORBID_HASH.with(|value| value.set(false)); } }
@@ -13368,12 +12049,10 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
             RelocalizationOwnerSupervisor::start_inner(phase_a.clone(), CorrectionOwnerRuntimeIdentity {
                 runtime_generation: 3, backend_generation: 9,
                 correction_lease: CorrectionLeaseId { boot_nonce: 4, generation: 8 },
-            }, "map".into(), "odom".into(), "body".into(), None, None)
+            }, "map".into(), "odom".into(), "body".into(), None)
         }
-        fn planar_c_query(request: crate::proto::RelocalizeRequest) -> AssignedRelocalizationTerminalQueryV2 {
-            AssignedRelocalizationTerminalQueryV2::admit(crate::proto::GetRelocalizationTerminalRequest {
-                schema_version: 2, request_id: request.request_id.clone(), assigned_request_v2: Some(request), ..Default::default()
-            }).unwrap()
+        fn planar_c_identity(request: crate::proto::RelocalizeRequest) -> RelocalizationRequestIdentity {
+            AssignedCloudRelocalizeRequestIdentityV2::admit_retained(request).unwrap()
         }
         fn planar_c_unrun_work() -> PlanarCommandWork {
             Box::new(|_| Box::pin(async { panic!("joined/replayed planar work must never run") }))
@@ -13401,10 +12080,9 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
             let (epoch, deadline) = claimed_rx.await.unwrap();
             assert_eq!(epoch,1); assert!(deadline > Instant::now());
             drop(waiter); // Response is unknown to the caller, but claim retains command authority.
-            let query = planar_c_query(request.clone());
-            let pending = ingress.terminal_snapshot_assigned(&query).await.unwrap();
-            assert!(matches!(pending.terminal,RelocalizationTerminalSnapshot::Pending));
-            assert_eq!(pending.ledger_observation.claimed_command_count,1);
+            let query = planar_c_identity(request.clone());
+            let pending = ingress.terminal_snapshot_exact(query.request_id(), query.clone());
+            assert!(matches!(pending,RelocalizationTerminalSnapshot::Pending));
             let replay_waiter = ingress.admit_planar(request.clone(),Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,planar_c_unrun_work()).await.unwrap();
             finish_tx.send(()).unwrap();
             let terminal = replay_waiter.wait().await.unwrap();
@@ -13419,10 +12097,9 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
             assert!(!ingress.owns_receipt(&replaced_owner));
             let replay = ingress.admit_planar(request,Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,planar_c_unrun_work()).await.unwrap().wait().await.unwrap();
             assert_eq!(terminal.encode_to_vec(),replay.encode_to_vec());
-            let snapshot = ingress.terminal_snapshot_assigned(&query).await.unwrap();
-            assert_eq!(snapshot.ledger_observation.admitted_command_count,1);
-            assert_eq!(snapshot.ledger_observation.claimed_command_count,1);
-            assert_eq!(snapshot.ledger_observation.terminal_record_count,1);
+            let snapshot = ingress.terminal_snapshot_exact(query.request_id(), query.clone());
+            let RelocalizationTerminalSnapshot::AssignedTerminal(stored) = snapshot else { panic!("终态应保留在内存"); };
+            assert_eq!(stored.encoded(), terminal.encode_to_vec());
             assert!(!phase_a.relocalization_mode().snapshot().active);
             phase_a.begin();supervisor.shutdown().await.unwrap();
         }
@@ -13450,14 +12127,14 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
             body.seed.as_mut().unwrap().x=10.0;
             let conflict=ingress.admit_planar(changed.clone(),Arc::new(tokio::sync::Mutex::new(())).lock_owned().await,planar_c_unrun_work()).await.unwrap().wait().await.unwrap();
             assert_eq!(conflict.assigned_planar_v2.unwrap().disposition,crate::proto::RelocalizeDisposition::ReplayConflict as i32);
-            assert!(matches!(ingress.terminal_snapshot_assigned(&planar_c_query(changed)).await.unwrap().terminal,RelocalizationTerminalSnapshot::IdentityConflict));
+            assert!(matches!(ingress.terminal_snapshot_exact(&changed.request_id, planar_c_identity(changed.clone())),RelocalizationTerminalSnapshot::IdentityConflict));
             let mut absent=request.clone();absent.request_id="planar:absent".into();
-            assert!(matches!(ingress.terminal_snapshot_assigned(&planar_c_query(absent)).await.unwrap().terminal,RelocalizationTerminalSnapshot::NotFound));
+            assert!(matches!(ingress.terminal_snapshot_exact(&absent.request_id, planar_c_identity(absent.clone())),RelocalizationTerminalSnapshot::NotFound));
             drop(waiter);drop(joined);
-            let query=planar_c_query(request);
+            let query=planar_c_identity(request);
             tokio::time::timeout(Duration::from_secs(2),async {
                 loop {
-                    if let RelocalizationTerminalSnapshot::AssignedTerminal(terminal)=ingress.terminal_snapshot_assigned(&query).await.unwrap().terminal {
+                    if let RelocalizationTerminalSnapshot::AssignedTerminal(terminal)=ingress.terminal_snapshot_exact(query.request_id(), query.clone()) {
                         assert_eq!(terminal.result().assigned_planar_v2.as_ref().unwrap().disposition,crate::proto::RelocalizeDisposition::Cancelled as i32);break;
                     }
                     tokio::task::yield_now().await;
@@ -13539,7 +12216,7 @@ pub(crate) fn mark_typed_global_map_published(&self, token: &ActivationToken) ->
             let retries = (0..64).map(|_| terminal.clone()).collect::<Vec<_>>();
             assert!(retries.iter().all(|value| value.encoded().as_ptr() == encoded));
             assert!(retries.iter().all(|value| value.to_wire().encode_to_vec() == terminal.encoded()));
-            let reopened = AssignedRelocalizationTerminalV2::decode_durable(&terminal.encode_durable().unwrap()).unwrap();
+            let reopened = AssignedRelocalizationTerminalV2::from_encoded(terminal.to_wire().encode_to_vec()).unwrap();
             assert_eq!(reopened.encoded(), terminal.encoded());
         }
 
@@ -18951,7 +17628,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
 }
 
 pub(crate) use preflight_only_contract::{
-    RELOCALIZATION_MAX_TERMINAL_BYTES, RELOCALIZATION_MAX_TERMINAL_RECORD_BYTES, RELOCALIZATION_MAX_CANDIDATE_PREIMAGE_BYTES, validate_relocalization_request_id,
+    RELOCALIZATION_MAX_TERMINAL_BYTES, RELOCALIZATION_MAX_CANDIDATE_PREIMAGE_BYTES, validate_relocalization_request_id,
     relocalization_source_policy_preimage_v1, relocalization_deadline_policy_preimage_v1,
     relocalization_algorithm_options_preimage_v1, retained_algorithm_options_v2, normalize_relocalization_logical_timeout_ms,
     assigned_pose_isometry, CorrectionCandidate,

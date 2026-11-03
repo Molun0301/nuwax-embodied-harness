@@ -8412,6 +8412,25 @@ fn matrix_validate_assigned_candidate(result: &native_fixture_proto::RelocalizeR
 }
 
 #[cfg(all(feature = "nuwax-lio-test-child", unix))]
+async fn matrix_relocalize_same_request(
+    mut client: GeometryClient,
+    request: native_fixture_proto::RelocalizeRequest,
+    deadline: tokio::time::Instant,
+) -> native_fixture_proto::RelocalizeResult {
+    loop {
+        match client.relocalize(request.clone()).await {
+            Ok(response) => return response.into_inner(),
+            Err(error) if error.code()==tonic::Code::FailedPrecondition
+                && error.message()=="mapping backend checkpoint export is already pending" => {
+                assert!(tokio::time::Instant::now()<deadline,"同号同体请求未在原有期限内完成准入");
+                tokio::task::yield_now().await;
+            },
+            Err(error) => panic!("matrix Relocalize command RPC: {error}"),
+        }
+    }
+}
+
+#[cfg(all(feature = "nuwax-lio-test-child", unix))]
 fn start_proven_active_relocalization(
     runtime: &tokio::runtime::Runtime,
     client: &mut GeometryClient,
@@ -8419,37 +8438,46 @@ fn start_proven_active_relocalization(
     scenario: &str,
 ) -> tokio::task::JoinHandle<native_fixture_proto::RelocalizeResult> {
     runtime.block_on(async {
-        let mut command_client=client.clone();let command_request=request.clone();
-        let command=tokio::spawn(async move {
-            command_client.relocalize(command_request).await.expect("matrix Relocalize command RPC").into_inner()
-        });
-        let deadline=tokio::time::Instant::now()+Duration::from_millis(500);
-        loop {
-            let query=client.get_relocalization_terminal(native_fixture_proto::GetRelocalizationTerminalRequest {
-                schema_version:2,request_id:request.request_id.clone(),assigned_request_v2:Some(request.clone()),
-            }).await.expect("read actual admitted command").into_inner();
-            if query.status==native_fixture_proto::RelocalizationTerminalStatus::Pending as i32 {break;}
-            assert_eq!(query.status,native_fixture_proto::RelocalizationTerminalStatus::NotFound as i32,"{scenario}: command settled before real source");
-            assert!(tokio::time::Instant::now()<deadline,"{scenario}: command did not become pending");
-            tokio::task::yield_now().await;
-        }
+        let command_client=client.clone();let command_request=request.clone();
+        let join_client=client.clone();let join_request=request.clone();
+        let mut probe_client=client.clone();
         let mut probe=request.clone();probe.request_id=format!("{}-busy",request.request_id);
-        loop {
-            match client.relocalize(probe.clone()).await {
-                Ok(response)=>{
-                    let result=response.into_inner();let body=matrix_cloud_result(&result);
-                    assert_eq!(body.disposition,native_fixture_proto::RelocalizeDisposition::Busy as i32,"{scenario}: {}",body.detail);
-                    assert!(body.candidate_payload_v3.is_empty(),"{scenario}");
-                    return command;
-                },
-                Err(error) if error.code()==tonic::Code::FailedPrecondition
-                    && error.message()=="mapping backend checkpoint export is already pending" => {
-                    assert!(tokio::time::Instant::now()<deadline,"{scenario}: original admission did not release its drain barrier");
-                    tokio::task::yield_now().await;
-                },
-                Err(error)=>panic!("{scenario}: BUSY probe RPC failed: {error}"),
-            }
-        }
+        let scenario=scenario.to_owned();
+        let (active_tx,active_rx)=tokio::sync::oneshot::channel();
+        let command=tokio::spawn(async move {
+            let deadline=tokio::time::Instant::now()+Duration::from_millis(500);
+            let busy=async move {
+                // 读取原有生命周期锁推进已派发请求，实际活动由忙碌回执证明。
+                probe_client.get_mapping_state(native_fixture_proto::Empty {}).await
+                    .expect("重定位派发后的生命周期读取屏障");
+                loop {
+                    match probe_client.relocalize(probe.clone()).await {
+                        Ok(response)=>{
+                            let result=response.into_inner();let body=matrix_cloud_result(&result);
+                            assert_eq!(body.disposition,native_fixture_proto::RelocalizeDisposition::Busy as i32,"{scenario}: {}",body.detail);
+                            assert!(body.candidate_payload_v3.is_empty(),"{scenario}");
+                            active_tx.send(()).expect("实际忙碌回执交给测试主流程");
+                            return;
+                        },
+                        Err(error) if error.code()==tonic::Code::FailedPrecondition
+                            && error.message()=="mapping backend checkpoint export is already pending" => {
+                            assert!(tokio::time::Instant::now()<deadline,"{scenario}: original admission did not release its drain barrier");
+                            tokio::task::yield_now().await;
+                        },
+                        Err(error)=>panic!("{scenario}: BUSY probe RPC failed: {error}"),
+                    }
+                }
+            };
+            // 同号同体请求只会加入或重放；网络层只有终态回复，不伪造接纳回执。
+            let (result,joined,())=tokio::join!(biased;
+                matrix_relocalize_same_request(command_client,command_request,deadline),
+                matrix_relocalize_same_request(join_client,join_request,deadline),
+                busy);
+            assert_eq!(result.encode_to_vec(),joined.encode_to_vec(),"同号同体加入或重放必须返回同一终态");
+            result
+        });
+        active_rx.await.expect("原请求实际接纳后收到忙碌回执");
+        command
     })
 }
 

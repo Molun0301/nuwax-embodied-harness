@@ -413,45 +413,6 @@ message RelocalizeRequest {
   }
 }
 
-enum RelocalizationTerminalStatus {
-  RELOCALIZATION_TERMINAL_STATUS_UNSPECIFIED = 0;
-  RELOCALIZATION_TERMINAL_STATUS_TERMINAL = 1;
-  RELOCALIZATION_TERMINAL_STATUS_PENDING = 2;
-  RELOCALIZATION_TERMINAL_STATUS_NOT_FOUND = 3;
-  RELOCALIZATION_TERMINAL_STATUS_IDENTITY_CONFLICT = 4;
-}
-
-message GetRelocalizationTerminalRequest {
-  reserved 3, 4;
-  reserved "request_identity_sha256", "activation_identity_sha256";
-  uint32 schema_version = 1;
-  string request_id = 2;
-  // Schema 2 binds the complete assigned request. Legacy digests are absent.
-  RelocalizeRequest assigned_request_v2 = 5;
-}
-
-message RelocalizationLedgerObservation {
-  uint32 observation_schema_version = 1;
-  uint64 admitted_command_count = 2;
-  uint64 claimed_command_count = 3;
-  uint64 terminal_record_count = 4;
-  uint64 pending_record_count = 5;
-  uint64 active_waiter_count = 6;
-  uint64 observation_epoch = 7;
-}
-
-message GetRelocalizationTerminalResponse {
-  reserved 3, 4;
-  reserved "request_identity_sha256", "activation_identity_sha256";
-  uint32 schema_version = 1;
-  string request_id = 2;
-  RelocalizationTerminalStatus status = 5;
-  optional RelocalizeResult terminal = 6;
-  optional RelocalizationLedgerObservation ledger_observation = 7;
-  // The normalized exact request queried, including when no terminal exists.
-  RelocalizeRequest assigned_request_v2 = 8;
-}
-
 // IEEE-754 bits, not numeric protobuf equality: signed zero is significant.
 message RelocalizationPoseBitsV2 {
   repeated fixed64 translation_m_bits = 1; // exactly 3
@@ -1065,7 +1026,6 @@ service GeometryRuntime {
   rpc ExportMappingBackendCheckpoint(ExportMappingBackendCheckpointRequest) returns (MappingBackendCheckpoint);
   rpc ActivateMap(ActivateMapRequest) returns (MappingSessionState);
   rpc Relocalize(RelocalizeRequest) returns (RelocalizeResult);
-  rpc GetRelocalizationTerminal(GetRelocalizationTerminalRequest) returns (GetRelocalizationTerminalResponse);
   rpc GetAssignedLocalizationSample(RelocalizeRequest) returns (AssignedLocalizationSampleV2);
 
   // 导航兼容（与 nuwax-nav-stack LCM channel 接口对应）

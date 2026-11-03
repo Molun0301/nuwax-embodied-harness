@@ -71,7 +71,6 @@ def configure(output, calibrated_motion=False, pipeline="lio_3d", calibrated_obs
         "NUWAX_FORBIDDEN_ZONES_PATH": str(working / "forbidden_zones.json"),
         "NUWAX_GEOMETRY_SEQUENCE_STATE_PATH": str(working / "sequence.json"),
         "NUWAX_GEOMETRY_EXPLORATION_RECONCILIATION_JOURNAL_PATH": str(working / "exploration.json"),
-        "NUWAX_GEOMETRY_RELOCALIZATION_TERMINAL_STORE_DIR": str(working / "relocalization-terminals"),
         "NUWAX_CLOUDMAP_SHM_PATH": str(working / "cloud.shm"),
         "NUWAX_OCCUPANCY_SHM_PATH": str(working / "occupancy.shm"),
         "NUWAX_VIDEO_SHM_PATH": str(working / "video.shm"),

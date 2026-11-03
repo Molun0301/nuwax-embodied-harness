@@ -4561,13 +4561,7 @@ impl GeometryRuntime for GeometryRuntimeService {
             .map_err(Status::invalid_argument)?;
         let ingress = self.relocalization_ingress.as_ref()
             .ok_or_else(|| Status::failed_precondition("RELOCALIZATION_OWNER_NOT_SELECTED"))?;
-        let query = crate::relocalization_terminal_v2::AssignedRelocalizationTerminalQueryV2::admit(
-            GetRelocalizationTerminalRequest {schema_version:2, request_id:request.request_id().into(),
-                assigned_request_v2:Some(request.to_wire()), ..Default::default()})
-            .map_err(Status::invalid_argument)?;
-        // The retained actor query must finish before taking its lifecycle fence.
-        let terminal = match ingress.terminal_snapshot_assigned(&query).await
-            .map_err(Status::failed_precondition)?.terminal {
+        let terminal = match ingress.terminal_snapshot_exact(request.request_id(), request.clone()) {
             crate::correction_coordinator::RelocalizationTerminalSnapshot::AssignedTerminal(terminal) => terminal,
             _ => return Err(Status::failed_precondition("ASSIGNED_SAMPLE_TERMINAL_UNAVAILABLE")),
         };
@@ -4593,23 +4587,6 @@ impl GeometryRuntime for GeometryRuntimeService {
             return Err(Status::failed_precondition("ASSIGNED_SAMPLE_ACTIVATION_REPLACED"));
         }
         Ok(Response::new(sample))
-    }
-
-    async fn get_relocalization_terminal(&self, req: Request<GetRelocalizationTerminalRequest>)
-        -> Result<Response<GetRelocalizationTerminalResponse>, Status> {
-        let query = crate::relocalization_terminal_v2::AssignedRelocalizationTerminalQueryV2::admit(req.into_inner())
-            .map_err(Status::invalid_argument)?;
-        let ingress = self.relocalization_ingress.as_ref()
-            .ok_or_else(|| Status::failed_precondition("RELOCALIZATION_OWNER_NOT_SELECTED"))?;
-        let snapshot = ingress.terminal_snapshot_assigned(&query).await.map_err(Status::failed_precondition)?;
-        let (status, terminal) = match snapshot.terminal {
-            crate::correction_coordinator::RelocalizationTerminalSnapshot::AssignedTerminal(terminal) =>
-                (RelocalizationTerminalStatus::Terminal, Some(terminal)),
-            crate::correction_coordinator::RelocalizationTerminalSnapshot::Pending => (RelocalizationTerminalStatus::Pending, None),
-            crate::correction_coordinator::RelocalizationTerminalSnapshot::NotFound => (RelocalizationTerminalStatus::NotFound, None),
-            crate::correction_coordinator::RelocalizationTerminalSnapshot::IdentityConflict => (RelocalizationTerminalStatus::IdentityConflict, None),
-        };
-        Ok(Response::new(query.response(status, terminal.as_ref(), Some(snapshot.ledger_observation))))
     }
 
     async fn get_occupancy_grid(
@@ -8851,7 +8828,7 @@ use nuwax_protocol::RawLcmFrame;
             assert_eq!(sample.schema_version,2);
             assert_eq!(sample.correction_revision,1);
             assert!(!fixture.handle.mapping_adapter.as_ref().unwrap().lock().checkpoint_localization_required);
-            // A lost response is settled by exact query/replay, without another apply.
+            // 同号同体从内存重放终态，不再次提交修正。
             let replay = client.relocalize(request.clone()).await.unwrap().into_inner();
             assert_eq!(replay.encode_to_vec(),retained.encode_to_vec());
             assert_eq!(applier.snapshot().unwrap().correction_revision,1);
@@ -8963,14 +8940,11 @@ use nuwax_protocol::RawLcmFrame;
         let accepted=common.accept_public_cloud(prepared.encoded_for_test().as_ref(),sequence as i64*10+2).unwrap();
         crate::lcm_runtime::handoff_registered_lio_cloud_with_correction(&fixture.handle,&accepted,&owner.ingress())
             .await.expect("actual admitted scan reaches real sink and canonical applier");
-        // Intentionally discard the RPC response to model an unknown client
-        // outcome; recovery below only uses the exact retained terminal query.
-        drop(tokio::time::timeout(Duration::from_secs(20),reply).await.expect("real RPC settles").unwrap().unwrap());
-        let query=GetRelocalizationTerminalRequest {schema_version:2,request_id:request.request_id.clone(),
-            assigned_request_v2:Some(request),..Default::default()};
-        let recovered=client.get_relocalization_terminal(query).await.unwrap().into_inner();
-        assert_eq!(recovered.status,RelocalizationTerminalStatus::Terminal as i32,"{recovered:?}");
-        let terminal=recovered.terminal.unwrap();
+        // 丢弃请求回复后，通过内存终态取得当前定位样本。
+        drop(tokio::time::timeout(Duration::from_secs(20), reply).await
+            .expect("真实重定位请求完成").unwrap().unwrap());
+        let terminal = client.get_assigned_localization_sample(request).await.unwrap()
+            .into_inner().terminal.unwrap();
         assert_eq!(terminal.assigned_cloud_v2.as_ref().unwrap().disposition,RelocalizeDisposition::Applied as i32,"{terminal:?}");
         assert_eq!(applier.snapshot().unwrap().correction_revision,sequence);
         terminal
@@ -14839,80 +14813,6 @@ global_stop_confirmation: None,
         .await
         .expect_err("public RPC cannot forge exploration owner");
         assert_eq!(rejected.code(), tonic::Code::InvalidArgument);
-    }
-}
-
-#[cfg(test)]
-mod relocalization_terminal_query_tests {
-    use super::*;
-
-    async fn query_service(
-        ingress: crate::correction_coordinator::RelocalizationCommandIngress,
-    ) -> GeometryRuntimeService {
-        let handle = crate::lcm_runtime::build_handle_for_tests()
-            .await
-            .expect("real-lcm test handle");
-        let phase_a = crate::correction_coordinator::CorrectionPhaseAControl::for_tests();
-        let (shutdown, _listener) = shutdown_channel_inner(None, Some(phase_a), None);
-        GeometryRuntimeService::new_with_shutdown_and_point_cloud_binding(
-            handle,
-            shutdown,
-            None,
-            None,
-            None,
-            None,
-            Some(ingress),
-        )
-    }
-
-    fn query_request(request_id:&str, changed:bool) -> GetRelocalizationTerminalRequest {
-        let mut request=crate::relocalization_terminal_v2::planar_tests::wire(); request.request_id=request_id.into();
-        if changed { let Some(relocalize_request::AssignedTarget::AssignedPlanarV2(body))=request.assigned_target.as_mut() else{unreachable!()}; body.seed.as_mut().unwrap().x=9.0; }
-        GetRelocalizationTerminalRequest{schema_version:2,request_id:request_id.into(),assigned_request_v2:Some(request)}
-    }
-
-    fn query_root(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "nuwax-terminal-query-{name}-{}-{}",
-            std::process::id(),
-            now_ns()
-        ))
-    }
-
-    #[tokio::test]
-    async fn terminal_query_rejects_invalid_id_and_identity_lengths() {
-        let root=query_root("invalid");
-        let ingress=crate::correction_coordinator::RelocalizationCommandIngress::terminal_query_fixture_for_tests(root.clone());
-        let service=query_service(ingress).await;
-        let mut missing=query_request("req-missing",false);missing.assigned_request_v2=None;
-        let mut old=query_request("req-old",false);old.schema_version=1;
-        for request in [query_request(" invalid",false),missing,old] {
-            assert_eq!(GeometryRuntime::get_relocalization_terminal(&service,Request::new(request)).await.unwrap_err().code(),tonic::Code::InvalidArgument);
-        }
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn terminal_query_projects_four_read_only_states_without_mutating_runtime() {
-        let root=query_root("states");
-        let ingress=crate::correction_coordinator::RelocalizationCommandIngress::terminal_query_fixture_for_tests(root.clone());
-        ingress.seed_terminal_query_for_tests(query_request("req-pending",false).assigned_request_v2.unwrap(),None);
-        let terminal_request=query_request("req-terminal",false).assigned_request_v2.unwrap();
-        let mut result=crate::relocalization_terminal_v2::planar_tests::terminal(false);
-        result.request_id=terminal_request.request_id.clone();result.assigned_planar_v2.as_mut().unwrap().request=Some(terminal_request.clone());
-        ingress.seed_terminal_query_for_tests(terminal_request,Some(result));
-        let service=query_service(ingress.clone()).await; let before=service.bridge.state.read().await.map.revision;
-        for (id,changed,status,has_terminal) in [("req-terminal",false,RelocalizationTerminalStatus::Terminal,true),
-            ("req-pending",false,RelocalizationTerminalStatus::Pending,false),("req-missing",false,RelocalizationTerminalStatus::NotFound,false),
-            ("req-terminal",true,RelocalizationTerminalStatus::IdentityConflict,false)] {
-            let response=GeometryRuntime::get_relocalization_terminal(&service,Request::new(query_request(id,changed))).await.unwrap().into_inner();
-            assert_eq!(response.status,status as i32);assert_eq!(response.terminal.is_some(),has_terminal);
-            assert_eq!(response.ledger_observation.unwrap().admitted_command_count,0);
-        }
-        assert_eq!(service.bridge.state.read().await.map.revision,before);
-        let query=crate::relocalization_terminal_v2::AssignedRelocalizationTerminalQueryV2::admit(query_request("req-pending",false)).unwrap();
-        assert!(matches!(ingress.terminal_snapshot_assigned(&query).await.unwrap().terminal,crate::correction_coordinator::RelocalizationTerminalSnapshot::Pending));
-        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

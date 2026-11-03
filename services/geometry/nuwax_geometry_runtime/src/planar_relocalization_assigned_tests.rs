@@ -1,7 +1,7 @@
 //! Assigned planar codec/lineage checks. Native lifecycle qualification is separate.
 use crate::proto::*;
 use crate::relocalization_identity::{AssignedCloudRelocalizeRequestIdentityV2 as Identity, CanonicalRelocalizationPolicyV2};
-use crate::relocalization_terminal_v2::{AssignedRelocalizationTerminalV2 as Terminal, AssignedRelocalizationTerminalQueryV2 as Query};
+use crate::relocalization_terminal_v2::AssignedRelocalizationTerminalV2 as Terminal;
 use prost::Message;
 
 struct NoHash;
@@ -91,29 +91,22 @@ fn planar_c_mixed_cloud_missing_seed_and_policy_substitution_fail_closed() {
 }
 
 #[test]
-fn planar_c_applied_terminal_and_existing_durable_codec_replay_without_hash() {
+fn planar_c_applied_terminal_replays_in_memory_without_hash() {
     let _guard = NoHash::enter();
     let first=Terminal::from_encoded((terminal(true)).encode_to_vec()).unwrap();
     assert!(first.result().assigned_cloud_v2.is_none());
-    let encoded=first.encode_durable().unwrap();
-    assert_eq!(Terminal::decode_durable(&encoded).unwrap(),first);
-    let query=Query::admit(GetRelocalizationTerminalRequest { schema_version:2,request_id:first.request().request_id().into(),
-        assigned_request_v2:Some(first.request().to_wire()),..Default::default() }).unwrap();
-    for status in [RelocalizationTerminalStatus::Pending,RelocalizationTerminalStatus::NotFound,RelocalizationTerminalStatus::IdentityConflict] {
-        let response=query.response(status,None,None); assert!(response.terminal.is_none()); assert_eq!(response.status,status as i32);
-    }
-    let response=query.response(RelocalizationTerminalStatus::Terminal,Some(&first),None);
-    assert_eq!(response.terminal,Some(first.to_wire()));
+    assert_eq!(Terminal::from_encoded(first.to_wire().encode_to_vec()).unwrap(),first);
+
 }
 
 
 
 #[test]
-fn planar_c_cancel_and_unknown_query_do_not_fabricate_scan_or_cloud_evidence() {
+fn planar_c_cancel_does_not_fabricate_scan_or_cloud_evidence() {
     let _guard = NoHash::enter();
     for disposition in [RelocalizeDisposition::Cancelled,RelocalizeDisposition::DeadlineExceeded,RelocalizeDisposition::OwnerFailed] {
         let mut value=terminal(false);value.assigned_planar_v2.as_mut().unwrap().disposition=disposition as i32;
-        let value=Terminal::from_encoded((value).encode_to_vec()).unwrap();assert_eq!(Terminal::decode_durable(&value.encode_durable().unwrap()).unwrap(),value);
+        let value=Terminal::from_encoded((value).encode_to_vec()).unwrap();assert_eq!(Terminal::from_encoded(value.to_wire().encode_to_vec()).unwrap(),value);
     }
     let mut malformed=terminal(true);malformed.assigned_cloud_v2=Some(AssignedCloudRelocalizeResultV2::default());
     assert!(Terminal::from_encoded((malformed).encode_to_vec()).is_err());

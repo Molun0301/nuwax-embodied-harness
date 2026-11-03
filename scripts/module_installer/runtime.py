@@ -42,7 +42,6 @@ _ROOT_RELATIVE_PATH_KEYS = (
     "NUWAX_GEOMETRY_SEQUENCE_STATE_PATH",
     "NUWAX_GEOMETRY_EXPLORATION_RECONCILIATION_JOURNAL_PATH",
     "NUWAX_NUWAX_WORKSPACE_DIR", "NUWAX_MOTION_GUARD_SOCKET",
-    "GO2_PROXY_LOG_DIR", "GO2_PROXY_LOG_FILE",
 )
 
 
@@ -84,12 +83,7 @@ def _memory_settings(
     configured: Optional[Mapping[str, str]] = None,
 ) -> dict[str, str]:
     """停用本地模型时记住自定义模型，重新加入模块后可恢复。"""
-    # 模板的新键不能遮蔽用户仍在使用的旧文本模型键。
     current = dict(values if configured is None else configured)
-    for suffix in ("MODEL", "DIM"):
-        key = f"NUWAX_MEMORY_TEXT_EMBEDDING_{suffix}"
-        if not current.get(key, "").strip():
-            current[key] = current.get(f"NUWAX_MEMORY_EMBEDDING_{suffix}", "")
 
     def uses_default_model(model: str) -> bool:
         lowered = model.lower()
@@ -100,8 +94,6 @@ def _memory_settings(
         "NUWAX_MEMORY_TEXT_EMBEDDING_DIM": "256",
         "NUWAX_MEMORY_IMAGE_EMBEDDING_MODEL": "disabled",
         "NUWAX_MEMORY_IMAGE_EMBEDDING_DIM": "512",
-        "NUWAX_MEMORY_EMBEDDING_MODEL": "lexical-only",
-        "NUWAX_MEMORY_EMBEDDING_DIM": "256",
     }
     if not enabled:
         for key in _MEMORY_KEYS:
@@ -131,8 +123,6 @@ def _memory_settings(
             current_dim = dimension
         result[model_key] = model
         result[dim_key] = current_dim or dimension
-    result["NUWAX_MEMORY_EMBEDDING_MODEL"] = result["NUWAX_MEMORY_TEXT_EMBEDDING_MODEL"]
-    result["NUWAX_MEMORY_EMBEDDING_DIM"] = result["NUWAX_MEMORY_TEXT_EMBEDDING_DIM"]
     return result
 
 
@@ -209,9 +199,6 @@ def write_runtime(
         # 启动器在读取用户方案后，按后端从本版本bin选择匹配的程序。
         "NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE": "",
         "NUWAX_GEOMETRY_SLAM2D_BINARY": str(binary_dir / "nuwax-slam-2d-worker") if "slam2d" in selected else "",
-        "NUWAX_GEOMETRY_RELEASE_MANIFEST": "",
-        "NUWAX_GEOMETRY_RELEASE_NATIVE_PGO_EXECUTABLE": "",
-        "NUWAX_GEOMETRY_RELEASE_GROUP_GUARDIAN_EXECUTABLE": "",
         # 套接字路径不能超过107字节，放在安装根而非版本目录下。
         "NUWAX_MOTION_GUARD_SOCKET": str(prefix.parent.parent / "run/motion-guard.sock"),
         "NUWAX_MOTION_GUARD_LOCK": str(prefix.parent.parent / "run/motion-guard.lock"),

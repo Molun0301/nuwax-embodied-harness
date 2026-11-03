@@ -28,7 +28,6 @@ def configure(output, calibrated_motion=False, pipeline="lio_3d", calibrated_obs
         port = sock.getsockname()[1]
     env = {
         "NUWAX_NAV_CAPABILITIES_JSON": "",
-        "NUWAX_GEOMETRY_RELEASE_MANIFEST": "",
         "NUWAX_GEOMETRY_RUNTIME_BINARY": os.environ.get("NUWAX_GEOMETRY_RUNTIME_BINARY") or str(
             ROOT / "services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime"
         ),
@@ -42,7 +41,7 @@ def configure(output, calibrated_motion=False, pipeline="lio_3d", calibrated_obs
         "NUWAX_GEOMETRY_IMU_FRAME": "sim_lidar",
         "NUWAX_BASE_FRAME": "sim_body",
         "NUWAX_MAP_FRAME": "map",
-        "NUWAX_GEOMETRY_MAP_FRAME": "map",
+        "NUWAX_MAP_FRAME": "map",
         "NUWAX_GEOMETRY_ODOM_FRAME": "odom",
         "NUWAX_GEOMETRY_LIO_BODY_FROM_SENSOR": json.dumps(
             {"translation_m": [0, 0, 0], "rotation_row_major": [1, 0, 0, 0, 1, 0, 0, 0, 1]}

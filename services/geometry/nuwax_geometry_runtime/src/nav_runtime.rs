@@ -173,14 +173,10 @@ impl NavAdmissionIo {
 
 /// `/nav/goal` typed channel 平台级 channel name。
 pub const GOAL_CHANNEL_PLATFORM: &str = "NUWAX_LCM_CHANNEL_GOAL_POSE";
-/// `/nav/goal` 本进程内 alias。
-pub const GOAL_CHANNEL_RUNTIME: &str = "NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL";
 /// `/nav/goal` 内置 default。
 pub const GOAL_CHANNEL_DEFAULT: &str = "/nav/goal#nuwax_msgs.GoalEnvelope";
 /// `/nav/path` versioned planner output platform key.
 pub const PATH_CHANNEL_PLATFORM: &str = "NUWAX_LCM_CHANNEL_NAV_PATH";
-/// `/nav/path` versioned planner output runtime alias.
-pub const PATH_CHANNEL_RUNTIME: &str = "NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL";
 /// `/nav/path` immutable envelope default.
 pub const PATH_CHANNEL_DEFAULT: &str = "/nav/path#nuwax_msgs.PathEnvelope";
 
@@ -2144,11 +2140,10 @@ pub fn render_dry_run(handle: &NavStackHandle) -> String {
 }
 
 /// Stable machine-readable readiness result code.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum NavigationReadinessCode {
-    /// Compatibility default for payloads produced before typed codes existed.
-    #[default]
+    /// 配置锁忙时无法取得当前就绪诊断。
     Unknown,
     /// Every required observation is fresh and usable.
     Ready,
@@ -2211,8 +2206,7 @@ pub struct NavigationReadinessDetail {
     pub ready: bool,
     /// 顶层 reason(中文 + 关键 blocker 标签)。
     pub reason: String,
-    /// Stable primary readiness result.
-    #[serde(default)]
+    /// 当前就绪诊断结果。
     pub reason_code: NavigationReadinessCode,
     /// All currently active blockers in deterministic priority order.
     #[serde(default)]
@@ -2225,8 +2219,6 @@ pub struct NavigationReadinessDetail {
     pub costmap: bool,
     /// Whether profile, planner input, and stack heartbeat are all usable.
     pub planner: bool,
-    /// Backward-compatible alias of the guard-backed sink readiness.
-    pub cmd_vel_sink: bool,
     /// 当前 profile(给 driver / debug 用)。
     pub profile: String,
     /// module graph 节点 ID 数量(给 operator 看是否成功 build graph)。
@@ -2331,7 +2323,6 @@ pub async fn compute_readiness(
         && observations.planner_ready
         && observations.planner_frame_matches
         && costmap;
-    let cmd_vel_sink = cmd_vel_sink_ready;
     let backend = match handle.transport_backend_name {
         "real-lcm" | "real-lcm-unavailable" => "RealLcm",
         other => {
@@ -2362,7 +2353,7 @@ pub async fn compute_readiness(
         tf,
         costmap,
         planner,
-        cmd_vel_sink,
+
         profile: profile.to_string(),
         module_node_count: state.module_nodes().await.len(),
         p1_native_profiles: P1_NATIVE_PROFILES.iter().map(|s| s.to_string()).collect(),
@@ -2434,7 +2425,7 @@ fn compute_admission_readiness<'a>(
             tf,
             costmap,
             planner,
-            cmd_vel_sink: cmd_vel_sink_ready,
+
             profile: profile.to_string(),
             module_node_count: state.module_nodes().await.len(),
             p1_native_profiles: P1_NATIVE_PROFILES.iter().map(|s| s.to_string()).collect(),
@@ -2503,7 +2494,7 @@ fn observation_blockers(
 
 fn readiness_reason(code: NavigationReadinessCode) -> &'static str {
     match code {
-        NavigationReadinessCode::Unknown => "UNKNOWN: readiness payload lacks a typed code",
+        NavigationReadinessCode::Unknown => "UNKNOWN: 当前就绪诊断不可用",
         NavigationReadinessCode::Ready => "READY: navigation inputs are ready",
         NavigationReadinessCode::LcmBackendUnavailable => {
             "LCM_BACKEND_UNAVAILABLE: real LCM backend unavailable"
@@ -4201,12 +4192,11 @@ pub fn parse_channel_with_suffix(channel: &str) -> Result<(LcmTopic, Option<Stri
 }
 
 fn resolve_strict_typed_binding(
-    runtime_key: &str,
     platform_key: &str,
     default_channel: &str,
     expected_type: &str,
 ) -> Result<(LcmTopic, LcmMessageType), String> {
-    let channel = channel_registry::resolve_channel(runtime_key, platform_key, default_channel);
+    let channel = channel_registry::resolve_channel(platform_key, default_channel);
     strict_typed_binding(&channel, expected_type)
 }
 
@@ -4233,7 +4223,6 @@ fn strict_typed_binding(
 /// Resolve the strict versioned path channel consumed by geometry runtime.
 pub fn goal_envelope_binding() -> Result<(LcmTopic, LcmMessageType), String> {
     resolve_strict_typed_binding(
-        GOAL_CHANNEL_RUNTIME,
         GOAL_CHANNEL_PLATFORM,
         GOAL_CHANNEL_DEFAULT,
         "nuwax_msgs.GoalEnvelope",
@@ -4243,7 +4232,6 @@ pub fn goal_envelope_binding() -> Result<(LcmTopic, LcmMessageType), String> {
 /// Resolve the strict versioned path channel consumed by geometry runtime.
 pub fn path_envelope_binding() -> Result<(LcmTopic, LcmMessageType), String> {
     let channel = channel_registry::resolve_strict_channel(
-        PATH_CHANNEL_RUNTIME,
         PATH_CHANNEL_PLATFORM,
         PATH_CHANNEL_DEFAULT,
     )
@@ -4271,7 +4259,6 @@ async fn publish_cancel_frame(
     cancel_generation: u64,
 ) -> Result<(), String> {
     let (topic, msg_type) = resolve_strict_typed_binding(
-        "NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL",
         "NUWAX_LCM_CHANNEL_NAV_CANCEL",
         "/nav/cancel#nuwax_msgs.CancelNavigation",
         "nuwax_msgs.CancelNavigation",
@@ -5282,7 +5269,7 @@ mod tests {
             tf: true,
             costmap: true,
             planner: true,
-            cmd_vel_sink: true,
+
             profile: PROFILE_SIMPLE_2D.into(),
             module_node_count: 4,
             p1_native_profiles: P1_NATIVE_PROFILES.iter().map(|s| s.to_string()).collect(),
@@ -5424,8 +5411,7 @@ mod tests {
         let handle = make_handle().await;
         let state = NavRuntimeState::from_env();
         let cancel_channel = channel_registry::resolve_channel(
-            "NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL",
-            "NUWAX_LCM_CHANNEL_NAV_CANCEL",
+                "NUWAX_LCM_CHANNEL_NAV_CANCEL",
             "/nav/cancel#nuwax_msgs.CancelNavigation",
         );
         let (cancel_topic, _) = parse_channel_with_suffix(&cancel_channel).expect("cancel topic");
@@ -5827,7 +5813,6 @@ mod tests {
         let state = NavRuntimeState::from_env();
         observe_ready_execution_chain(&state).await;
         let cmd_channel = channel_registry::resolve_channel(
-            "NUWAX_GEOMETRY_RUNTIME_CMD_VEL_CHANNEL",
             "NUWAX_LCM_CHANNEL_CMD_VEL",
             "/cmd_vel#geometry_msgs.Twist",
         );
@@ -5840,8 +5825,7 @@ mod tests {
             )
             .await;
         let goal_channel = channel_registry::resolve_channel(
-            GOAL_CHANNEL_RUNTIME,
-            GOAL_CHANNEL_PLATFORM,
+                GOAL_CHANNEL_PLATFORM,
             GOAL_CHANNEL_DEFAULT,
         );
         let (goal_topic, _) = parse_channel_with_suffix(&goal_channel).expect("goal topic");
@@ -5909,8 +5893,7 @@ mod tests {
         let state = NavRuntimeState::from_env();
         observe_ready_execution_chain(&state).await;
         let (goal_topic, _) = parse_channel_with_suffix(&channel_registry::resolve_channel(
-            GOAL_CHANNEL_RUNTIME,
-            GOAL_CHANNEL_PLATFORM,
+                GOAL_CHANNEL_PLATFORM,
             GOAL_CHANNEL_DEFAULT,
         ))
         .expect("goal topic");
@@ -6009,8 +5992,7 @@ mod tests {
             })
             .expect("ready motion sink observation");
         let (goal_topic, _) = parse_channel_with_suffix(&channel_registry::resolve_channel(
-            GOAL_CHANNEL_RUNTIME,
-            GOAL_CHANNEL_PLATFORM,
+                GOAL_CHANNEL_PLATFORM,
             GOAL_CHANNEL_DEFAULT,
         ))
         .expect("goal topic");
@@ -8459,7 +8441,6 @@ mod tests {
             slot.goal = Some(test_active_goal("single-owner", 1));
         }
         let cmd_channel = channel_registry::resolve_channel(
-            "NUWAX_GEOMETRY_RUNTIME_CMD_VEL_CHANNEL",
             "NUWAX_LCM_CHANNEL_CMD_VEL",
             "/cmd_vel#geometry_msgs.Twist",
         );

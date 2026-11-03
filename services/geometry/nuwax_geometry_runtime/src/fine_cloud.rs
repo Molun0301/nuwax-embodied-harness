@@ -179,11 +179,8 @@ impl FineCloud {
                 } else { points }
             } else { points };
             let shared = match input {
-                Some(FrameSource::Canonical(value)) => value.lidar().map(|value| {
-                    if let Some(frame) = value.scan().online_frame() { Ok(Some((*frame).clone())) }
-                    else { value.scan().dynamic_frame().map(|frame| crate::dynamic_backend::MappedFrame::new(frame,
-                        value.scan().binding().registration_map_from_odom, actual, value.map_points().len()-actual.len())).transpose() }
-                }).transpose()?.flatten(),
+                Some(FrameSource::Canonical(value)) => value.lidar()
+                    .and_then(|value| value.scan().online_frame().map(|frame| (*frame).clone())),
                 Some(FrameSource::Corrected(_, frame)) => frame.cloned(),
                 None => None,
             };
@@ -225,19 +222,19 @@ impl FineCloud {
             .collect::<Result<Vec<_>, _>>()?;
         let hits: AHashSet<_> = keys.iter().map(|k| (k[0],k[1],k[2])).collect();
         // 零时间种子也先取得DUFO分类；observe内部不插入，其空增量应绕过旧窗口查询。
-        if shared.is_none() && crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::DufoMap {
+        if shared.is_none() {
             if let Some(origin) = origin { shared = Some(self.dynamic.observe_dufo(points, origin, timestamp_ns)?); }
         }
         #[cfg(test)]
         let revoke_started = std::time::Instant::now();
-        if shared.as_ref().is_some_and(|f| f.is_dufo() && !f.has_clears()) {
+        if shared.as_ref().is_some_and(|f| !f.has_clears()) {
             self.dynamic.adopt(shared.take().unwrap(), &mut VoxelIndex::default(), size);
         } else if let Some(origin) = origin {
             #[cfg(test)]
             let reference = crate::dynamic_backend::reference_revoke();
             #[cfg(not(test))]
             let reference = false;
-            if let Some(frame) = shared.as_ref().filter(|frame| frame.is_dufo() && !reference) {
+            if let Some(frame) = shared.as_ref().filter(|_| !reference) {
                 let mut blocks = BTreeSet::new();
                 for (low, high) in frame.clear_regions().expect("DUFO帧必须提供新增空单元迭代器") {
                     let low = voxel_key(low, size).ok_or("精细动态窗口越界")?;
@@ -256,7 +253,7 @@ impl FineCloud {
                 self.dynamic.adopt(shared.take().unwrap(), &mut voxels, size);
                 self.writer.remove(self.dynamic.removed_keys().iter().map(|key| [key.0, key.1, key.2]))?;
             } else {
-                let (low, high) = shared.as_ref().filter(|f| f.is_dufo()).and_then(|f| f.clear_bounds())
+                let (low, high) = shared.as_ref().and_then(|f| f.clear_bounds())
                     .unwrap_or((origin.map(|v| v - 30.0 - f64::from(size)), origin.map(|v| v + 30.0 + f64::from(size))));
                 let low = voxel_key(low, size).ok_or("精细动态窗口越界")?;
                 let high = voxel_key(high, size).ok_or("精细动态窗口越界")?;
@@ -264,8 +261,7 @@ impl FineCloud {
                 let mut voxels: VoxelIndex = local.into_iter().map(|(key, _)| (key[0], key[1], key[2])).collect();
                 if let Some(shared)=shared {self.dynamic.adopt(shared,&mut voxels,size);}
                 else {
-                    let ground = self.measured_ground_indices(points)?;
-                    self.dynamic.observe_with_ground(&mut voxels,size,origin,timestamp_ns,points,&ground);
+                        self.dynamic.observe_with_ground(&mut voxels,size,origin,timestamp_ns,points);
                 }
                 self.writer.remove(self.dynamic.removed_keys().iter().map(|key| [key.0, key.1, key.2]))?;
             }
@@ -278,33 +274,6 @@ impl FineCloud {
             self.writer.observe(retained, timestamp_ns)?;
         }
         Ok(keys)
-    }
-    pub(super) fn measured_ground_indices(&mut self,points:&[Point3<f64>])->Result<Vec<u32>,String>{
-        Ok(self.measured_ground(points)?.0)
-    }
-    pub(super) fn measured_ground(&mut self,points:&[Point3<f64>])->Result<(Vec<u32>,Vec<u32>),String>{
-        let size=self.writer.voxel_size_m();
-        let keys=points.iter().map(|p|voxel_key([p.x,p.y,p.z],size).ok_or("地面查询坐标无效")).collect::<Result<Vec<_>,_>>()?;
-        let old=self.writer.ground_columns(keys.iter().map(|k|[k.0,k.1]))?;
-        let mut samples=Vec::new(); let mut seen=AHashSet::new();
-        for column in old.values(){
-            for p in column.heightfields.iter().flat_map(|v|&v.samples).map(|v|v.point){
-                if seen.insert(p.map(f64::to_bits)){samples.push(p);}
-            }
-        }
-        let mut qualified: ahash::AHashMap<[i32;2],Vec<f64>>=Default::default();
-        for i in crate::offline_residual_cleanup::local_ground_indices(&samples){
-            let p=samples[i];let k=voxel_key(p,size).unwrap();
-            qualified.entry([k.0,k.1]).or_default().push(p[2]);
-        }
-        let mut ground=Vec::new();let mut known=Vec::new();
-        for (i,(p,k)) in points.iter().zip(&keys).enumerate(){
-            if let Some(heights)=qualified.get(&[k.0,k.1]){
-                known.push(i as u32);
-                if heights.iter().any(|h|(p.z-h).abs()<=0.03){ground.push(i as u32);}
-            }
-        }
-        Ok((ground,known))
     }
     pub(super) fn publication_floor(&self, domain: &nuwax_map_chunks::Domain) -> u64 {
         self.baseline.as_ref().filter(|root| &root.domain == domain).map_or(0, |root| root.revision)
@@ -429,7 +398,7 @@ mod revoke_locality_tests {
 
     #[test]
     fn scattered_free_cells_revoke_over_two_million_voxels_by_two_blocks() {
-        let _backend = crate::dynamic_backend::test_backend(crate::dynamic_backend::Backend::DufoMap);
+
         let mut fine = FineCloud::fresh().unwrap();
         let side = 128;
         let count = (side * side * side) as usize;
@@ -456,7 +425,7 @@ mod revoke_locality_tests {
         assert_eq!(fine.last_revoke_read_blocks(), 0);
         assert_eq!(fine.last_revoke_block_lookups(), 0);
         assert!(fine.removed_keys().is_empty());
-        assert!(fine.shared_frame().is_some_and(|frame| frame.is_dufo() && !frame.has_clears()));
+        assert!(fine.shared_frame().is_some_and(|frame| !frame.has_clears()));
         assert!(seed_points.iter().all(|point| !fine.is_dynamic(point)));
         assert_eq!(fine.writer.region(observed_key, observed_key, 1).unwrap()[0].1,
             nuwax_map_chunks::Evidence { observed_ns: 1, hits: 1 });

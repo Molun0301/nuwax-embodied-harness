@@ -1931,22 +1931,18 @@ impl ExploreRuntimeHandle {
                     return self.store_snapshot(snapshot);
                 }
             };
-        let mut legacy_replanned = false;
         let mut restored=if config.resume_progress_json.is_empty(){None}else{
             let result=(|| {
-                let mut saved=ExplorationCheckpoint::parse(&config.resume_progress_json)?;
+                let saved=ExplorationCheckpoint::parse(&config.resume_progress_json)?;
                 let map_name=self.navigation_sink.read().as_ref().ok_or("导航地图来源缺失")?.current_map_name()?;
                 if saved.map_name!=map_name || saved.map_frame_id!=self.expected_map_frame.as_ref() {
                     return Err("探索进度与当前地图不匹配".into());
                 }
-                legacy_replanned = saved.resume_requires_replan(
+                saved.validate_resume_configuration(
                     &ExplorationConfiguration::capture(&config, surface_mode),
                     navigation_configuration.as_ref().map_err(Clone::clone)?,
                 )?;
                 if config.return_policy.enabled()!=saved.mission.is_some(){return Err("探索进度缺少行程或请求未启用行程".into());}
-                if legacy_replanned {
-                    saved.prepare_history_for_replan();
-                }
                 Ok::<_,String>(saved)
             })();
             match result {Ok(saved)=>Some(saved),Err(error)=>{
@@ -1980,7 +1976,7 @@ impl ExploreRuntimeHandle {
                     .is_some_and(|sink| sink.current_map_name().is_ok_and(|name| &name == expected)))
         };
         let restore = restored.as_mut().map(|saved| ComputeRestore {
-            sources: std::mem::take(&mut saved.sources), replan: legacy_replanned,
+            sources: std::mem::take(&mut saved.sources),
         });
         drop(guard);
         // Old accepted feedback and end settle before begin/restore/install. This
@@ -2061,10 +2057,9 @@ impl ExploreRuntimeHandle {
         let snapshot = guard.snapshot(
             STATUS_ACCEPTED,
             format!(
-                "exploration accepted (source={}, arbitration={}){}",
+                "exploration accepted (source={}, arbitration={})",
                 if surface_mode { "surface" } else { "wavefront" },
                 arbitration_policy_str(policy),
-                if legacy_replanned { "; legacy history resumed under current settings; route and retry decisions replanned" } else { "" }
             ),
         );
         let backend_available = self.readiness_cache.lock().backend_available;
@@ -4263,7 +4258,6 @@ impl ExploreRuntimeHandle {
             origin_session_id:origin.0.clone(),origin_session_generation:origin.1,origin_frame_generation:origin.2,
             configuration:Some(ExplorationConfiguration::capture(config, guard.surface_mode.is_some())),
             navigation_configuration:Some(guard.navigation_configuration.as_ref().ok_or("探索启动配置不存在")?.as_ref().map_err(Clone::clone)?.clone()),
-            configuration_sha256:None,navigation_configuration_sha256:None,
             elapsed_ns:guard.progress_stopped_ns.unwrap_or_else(now_unix_nanos).saturating_sub(guard.started_at_ns),reached_goals:guard.reached_goals,mission:guard.mission.clone(),return_reason:guard.return_reason,
             sources:Vec::new()};
         drop(guard);
@@ -8083,36 +8077,6 @@ mod tests {
         assert!(sink.submitted.lock().unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn checkpoint_legacy_changed_settings_preserve_world_history_and_replan_without_dispatch() {
-        let (payload, mut config) = hashfree_checkpoint_fixture().await;
-        let mut saved = ExplorationCheckpoint::parse(&payload).unwrap();
-        saved.schema_version = 1;
-        saved.configuration = None;
-        saved.navigation_configuration = None;
-        saved.configuration_sha256 = Some([0x22; 32]);
-        saved.navigation_configuration_sha256 = Some([0x99; 32]);
-        let legacy_payload = serde_json::to_string(&saved).unwrap();
-        config.resume_progress_json = legacy_payload.clone();
-        config.max_navigation_retries = 9;
-        config.blacklist_radius_m = 0.25;
-        let (resumed, sink) = configured_handle();
-        let accepted = resumed.start_with_config("legacy-current-settings", config).await;
-        assert_eq!(accepted.status, STATUS_ACCEPTED, "{}", accepted.message);
-        assert!(accepted.message.contains("legacy history resumed under current settings"));
-        let source = resumed.inspect_compute_checkpoint().await.unwrap();
-        let guard = resumed.inner.lock().await;
-        assert_eq!(guard.reached_goals, 1);
-        assert!(now_unix_nanos().saturating_sub(guard.started_at_ns) >= saved.elapsed_ns);
-        let history: serde_json::Value = serde_json::from_str(&source[0].payload).unwrap();
-        assert_eq!(history[1]["explored_goals"], serde_json::json!([{ "x": 12.5, "y": -3.25 }]));
-        assert_eq!(history[1]["blacklisted_goals"], serde_json::json!([]));
-        assert_eq!(history[1]["failed_goals"], serde_json::json!([]));
-        assert_eq!(history[1]["consecutive_failures"], serde_json::json!(0));
-        assert!(guard.active_child.is_none());
-        assert!(sink.submitted.lock().unwrap().is_empty());
-        assert_eq!(serde_json::to_string(&ExplorationCheckpoint::parse(&legacy_payload).unwrap()).unwrap(), legacy_payload);
-    }
 
     #[tokio::test]
     async fn checkpoint_save_uses_start_snapshot_without_environment_recapture() {

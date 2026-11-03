@@ -33,7 +33,6 @@ cd "${REPO_ROOT}"
 GATEWAY_RUNTIME_PORT="${NUWAX_GEOMETRY_RUNTIME_PORT:-50051}"
 GATEWAY_RUNTIME_READY_FILE="${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-/run/nuwax/geometry/nuwax_geometry_runtime.ready}"
 GEOMETRY_DATA_DIR="${NUWAX_GEOMETRY_DATA_DIR:-/var/lib/nuwax_robot_bridge}"
-PROFILE_FILE="${NUWAX_DEPLOYMENT_PROFILE:-${REPO_ROOT}/deploy/profiles/go2-jetson.json}"
 
 PYTHON_BIN="${NUWAX_PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
 if [[ -z "${NUWAX_PYTHON_BIN:-}" && ! -x "${PYTHON_BIN}" ]]; then
@@ -46,7 +45,6 @@ miss(){ printf '  [MISSING] %s\n' "$1"; }
 nr()  { printf '  [NOT RUN] %s\n' "$1"; }
 
 bar "1. 诊断输入"
-printf '  deployment profile = %s\n' "${PROFILE_FILE}"
 
 bar "2. motion guard:module / UDS / 单实例锁"
 GUARD_MODULE="${REPO_ROOT}/services/navigation/motion_safety_guard/__main__.py"
@@ -248,46 +246,6 @@ PY
   rm -f "${RT_LOG}"
 fi
 
-PROFILE_CONTRACT_OUT="$("${PYTHON_BIN}" - "${PROFILE_FILE}" <<'PY' 2>&1
-import json
-import sys
-
-profile_path = sys.argv[1]
-expected_always_on = {
-    "nuwax-runtime-activation.path",
-    "nuwax-host-gateway.service",
-    "nuwax-go2-video-streamer.service",
-}
-expected_on_demand = {
-    "nuwax-motion-safety-guard.service",
-    "nuwax-nav-stack.service",
-    "nuwax-geometry-runtime.service",
-    "nuwax-person-follow.service",
-    "nuwax-runtime-activation.service",
-}
-try:
-    with open(profile_path, "r", encoding="utf-8") as stream:
-        profile = json.load(stream)
-    metadata = profile["metadata"]
-    always_on = set(metadata["always_on_services"])
-    on_demand = set(metadata["on_demand_services"])
-    services = set(profile["services"])
-    if always_on != expected_always_on:
-        raise ValueError("always_on_services={}".format(sorted(always_on)))
-    if on_demand != expected_on_demand:
-        raise ValueError("on_demand_services={}".format(sorted(on_demand)))
-    if always_on & on_demand or always_on | on_demand != services:
-        raise ValueError("activation sets do not cover profile.services exactly")
-    print("PROFILE_CONTRACT_OK")
-except Exception as exc:
-    print("PROFILE_CONTRACT_ERROR: {}".format(exc))
-PY
-)"
-if [[ "${PROFILE_CONTRACT_OUT}" == "PROFILE_CONTRACT_OK" ]]; then
-  ok "profile 常驻/按需服务契约完整"
-else
-  miss "profile 懒启动契约 drift: ${PROFILE_CONTRACT_OUT}"
-fi
 
 echo
 echo "==> evidence bundle 完成 (Phase 8 / 2026-07-07)"

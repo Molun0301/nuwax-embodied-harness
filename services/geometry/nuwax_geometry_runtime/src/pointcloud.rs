@@ -611,13 +611,9 @@ impl CloudMapShmWriter {
         let started = std::time::Instant::now();
         // 点云代次由原拥有方启动登记；分类不能替输入登记，否则会绕过安装时的代次围栏。
         // 未登记输入继续沿准备/安装失配路径拒绝，并由建图拥有方执行原退休流程。
-        let (ground, known) = if crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::Legacy {
-            if let Some(fine) = self.fine_cloud.as_mut() { fine.measured_ground(source.map_points())? }
-            else { (Vec::new(), Vec::new()) }
-        } else { (Vec::new(), Vec::new()) };
         #[cfg(test)]
         let ground_ms = started.elapsed().as_secs_f64() * 1e3;
-        let mapped = self.dynamic_filter.classify_online(source, &ground, &known)?;
+        let mapped = self.dynamic_filter.classify_online(source)?;
         #[cfg(test)]
         let classify_ms = started.elapsed().as_secs_f64() * 1e3;
         #[cfg(test)]
@@ -727,9 +723,7 @@ impl CloudMapShmWriter {
                 Some(frame) => frame.candidate_grid_keys(f64::from(self.voxel_size),
                     |key| self.voxels.contains(&key)),
                 // 缺少雷达原点等情况下没有自由证据，不必查询已有可见点。
-                None if crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::DufoMap =>
-                    Some(HashSet::new()),
-                None => None,
+                None => Some(HashSet::new()),
             }
         } else {
             None
@@ -1961,65 +1955,6 @@ fn cloud_map_duplicate_admitted_frame_preserves_dense_coarse_and_fine_state() {
             "max_ms": durations.last().unwrap(), "labeled_humans": false}));
     }
 
-    #[test]
-    fn persistent_cloud_filters_dynamic_points_and_survives_save_restore() {
-        let _backend = crate::dynamic_backend::test_backend(crate::dynamic_backend::Backend::Legacy);
-        use crate::dynamic_scene::tests::{corridor, ORIGIN};
-        let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
-        let mut static_total = 0_u64;
-        let mut people_total = 0_u64;
-        let mut last_receipt = None;
-        for frame in 1..=22 {
-            let person = (7..=16).contains(&frame).then(|| -0.5 + (frame - 7) as f64 * 0.12);
-            let (points, labels) = corridor(person, (frame % 3) as f64);
-            people_total += labels.iter().filter(|label| **label).count() as u64;
-            static_total += labels.iter().filter(|label| !**label).count() as u64;
-            assert!(writer.accumulate_mapping_scan(1, &points, Some(ORIGIN), frame * 100_000_000));
-            // Persistence excludes actual dynamic labels. Realtime raw-return
-            // preservation is exercised through accepted candidates in the
-            // cumulative saved-map test, not asserted on a persistent map.
-            let fine=writer.fine_cloud.as_ref().unwrap();
-            for point in points.iter().filter(|p|!fine.is_dynamic(p)) {
-                assert!(writer.voxels.contains(&voxel_key([point.x,point.y,point.z],writer.voxel_size).unwrap()));
-            }
-            let receipt = OccupancyCommitReceipt {
-                commit_id: crate::mapping_commit::MappingCommitId { boot_nonce: 80, sequence: frame },
-                session_id: "人员经过".into(), session_generation: 1, occupancy_revision: frame,
-                source_timestamp_ns: frame * 100_000_000, backend_kind: crate::mapping_backend::MappingBackendKind::Voxel,
-                backend_generation: 1,
-            };
-            writer.commit_accumulated_snapshot(&receipt).unwrap().unwrap();
-            last_receipt = Some(receipt);
-        }
-        let snapshot = writer.committed_dense_cloud().unwrap().unwrap();
-        let mut offset = 0;
-        let mut remaining_person = 0;
-        let mut remaining_static = 0;
-        while offset < snapshot.point_count {
-            let bytes = snapshot.read(offset, crate::dense_cloud::CHUNK_POINTS).unwrap();
-            offset += bytes.len() as u64 / 12;
-            for bytes in bytes.chunks_exact(12) {
-                let xyz: [f32; 3] = std::array::from_fn(|axis| f32::from_le_bytes(bytes[axis * 4..axis * 4 + 4].try_into().unwrap()));
-                if xyz[0] > 2.7 && xyz[0] < 3.3 && xyz[2] > 0.1 && xyz[2] < 1.9 { remaining_person += 1; }
-                else { remaining_static += 1; }
-            }
-        }
-        eprintln!("完整扫描人体原始={people_total} 剩余={remaining_person} 静态原始={static_total} 保留={remaining_static}");
-        assert!(remaining_person * 5 < people_total);
-        assert_eq!(remaining_static, static_total);
-        let (mut archive, _) = snapshot.archive("map").unwrap();
-        crate::dense_cloud::validate_archive(&mut archive).unwrap();
-        let restored = DenseCloud::from_archive(archive, &snapshot.metadata("map")).unwrap();
-        let restored = restored.snapshot(&snapshot.receipt, "人员经过").unwrap();
-        assert_eq!(restored.point_count, snapshot.point_count);
-        assert_eq!(restored.read(0, crate::dense_cloud::CHUNK_POINTS).unwrap(), snapshot.read(0, crate::dense_cloud::CHUNK_POINTS).unwrap());
-        let receipt = last_receipt.unwrap();
-        let mut next = CloudMapShmWriter::new_private_for_test().unwrap();
-        next.install_prepared_accumulator(&receipt, writer.take_prepared_accumulator()).unwrap();
-        assert_eq!(next.committed_dense_cloud().unwrap().unwrap().point_count, snapshot.point_count);
-        assert!(next.accumulate_mapping_scan(2, &corridor(Some(0.0), 0.0).0, Some(ORIGIN), 1));
-        assert!(next.fine_cloud.as_ref().unwrap().removed_keys().is_empty(), "换图不复用旧动态证据");
-    }
 
     #[test]
     fn prepared_scan_keeps_previous_dense_reader_until_install() {
@@ -2159,23 +2094,6 @@ fn cloud_map_duplicate_admitted_frame_preserves_dense_coarse_and_fine_state() {
         target.cleanup_product_owned_file().unwrap();
     }
 
-    #[test]
-    fn pgo_install_preserves_real_observed_neighbourhood_evidence(){
-        let _backend = crate::dynamic_backend::test_backend(crate::dynamic_backend::Backend::Legacy);
-        use crate::dynamic_scene::tests::{corridor,ORIGIN};
-        let mut source=CloudMapShmWriter::new_private_for_test().unwrap();
-        let mut target=CloudMapShmWriter::new_private_for_test().unwrap();
-        let (person,truth)=corridor(Some(0.),1.);
-        let p=person.iter().zip(&truth).find(|(p,h)|**h && crate::dynamic_scene::cell([p.x,p.y,p.z])==crate::dynamic_scene::cell([2.7,0.03,0.65])).unwrap().0;
-        let key=voxel_key([p.x,p.y,p.z],VOXEL_SIZE).unwrap();
-        assert!(source.accumulate_mapping_scan(1,&person,Some(ORIGIN),100_000_000));
-        for frame in 2..=5{assert!(source.accumulate_mapping_scan(1,&corridor(None,(frame%3) as f64).0,Some(ORIGIN),frame*100_000_000));}
-        assert!(source.voxels.contains(&key));
-        let receipt=OccupancyCommitReceipt{commit_id:crate::mapping_commit::MappingCommitId{boot_nonce:1,sequence:1},session_id:"pgo-observed".into(),session_generation:2,occupancy_revision:1,source_timestamp_ns:500_000_000,backend_kind:crate::mapping_backend::MappingBackendKind::Voxel,backend_generation:1};
-        target.install_prepared_accumulator(&receipt,source.take_prepared_accumulator()).unwrap();
-        assert!(target.accumulate_mapping_scan(2,&corridor(None,0.).0,Some(ORIGIN),600_000_000));
-        assert!(!target.voxels.contains(&key),"the already accumulated observed neighbourhood survives installation");
-    }
 
     #[test]
     fn dynamic_cloud_checkpoint_and_session_reset_keep_only_committed_geometry() {

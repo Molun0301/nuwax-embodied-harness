@@ -1,7 +1,7 @@
 // 由 pgo_map::tests::disk_tests 包含；行为回归与显式实录基准共用真实磁盘重放入口。
 use super::*;
 use crate::admitted_cloud::AcceptedMappingCloud;
-use crate::dynamic_backend::{test_backend, Backend, MappedFrame, OnlineDufo};
+use crate::dynamic_backend::{MappedFrame, OnlineDufo};
 use crate::lio_ingress::AcceptedRegisteredCloud;
 use nuwax_cloud_cleanup::scan_log::{
     Recorder, ReplaySource, SavePolicy, ScanMetadata, ScanReader, Session, StorageWorker,
@@ -291,12 +291,11 @@ fn disk_saved_poses(owner: &mut DiskTestOwner, rebuilt: &mut RebuiltMap) -> Vec<
 
 #[test]
 fn streamed_history_crosses_eight_million_real_points_and_rebuilds_corrected_tail() {
-    let _backend = test_backend(Backend::DufoMap);
+
     let mut owner = DiskTestOwner::new(None);
     let mut recorder = owner.recorder(1);
     let replay = recorder.replay_source();
     let mut history = ScanHistory::default();
-    history.enable_streaming();
     history.bind_replay_source(Some(replay.clone()));
     let frame = Arc::new(MappedFrame::unfiltered());
     let mut total = 0usize;
@@ -340,13 +339,9 @@ fn streamed_history_crosses_eight_million_real_points_and_rebuilds_corrected_tai
             ));
         }
         total += source.scan().body_points().len();
-        assert!(history.scans.is_empty());
-        assert_eq!(history.point_count, 0);
         assert_eq!(
             history
                 .stream
-                .as_ref()
-                .unwrap()
                 .latest
                 .as_ref()
                 .unwrap()
@@ -354,13 +349,12 @@ fn streamed_history_crosses_eight_million_real_points_and_rebuilds_corrected_tai
                 .len(),
             62_501
         );
-        assert!(!history.incomplete);
         last_source = Some(source);
         disk_wait_written(&replay, stamp);
     }
-    assert!(total > MAX_ARCHIVED_POINTS, "必须实际接纳超过旧上限的源点");
+    assert!(total > 8_000_000, "必须实际接纳超过旧上限的源点");
     owner.finish_storage();
-    let input = history.disk_input(&nodes).unwrap().unwrap();
+    let input = history.disk_input(&nodes).unwrap();
     let mut reader = ScanReader::open_prefix(&replay.snapshot().unwrap().unwrap()).unwrap();
     let mut logged = Vec::new();
     while let Some(scan) = reader.next_scan().unwrap() {
@@ -402,12 +396,11 @@ fn streamed_history_crosses_eight_million_real_points_and_rebuilds_corrected_tai
 
 #[test]
 fn streamed_keyframes_use_exact_unsampled_pose_and_reset_isolates_old_store() {
-    let _backend = test_backend(Backend::DufoMap);
+
     let mut owner = DiskTestOwner::new(None);
     let mut recorder = owner.recorder(1);
     let replay = recorder.replay_source();
     let mut history = ScanHistory::default();
-    history.enable_streaming();
     history.bind_replay_source(Some(replay.clone()));
     let frame = Arc::new(MappedFrame::unfiltered());
     let mut held = Vec::new();
@@ -465,10 +458,10 @@ fn streamed_keyframes_use_exact_unsampled_pose_and_reset_isolates_old_store() {
         reader.next_scan().unwrap().is_none(),
         "默认v2只选择第一帧，关键帧不能取邻居近似"
     );
-    let input = history.disk_input(&nodes).unwrap().unwrap();
+    let input = history.disk_input(&nodes).unwrap();
     assert_eq!(input.locals[1], held[2].binding().frozen_odom_from_body);
     assert_eq!(input.locals[2], held[5].binding().frozen_odom_from_body);
-    let old_store = history.stream.as_ref().unwrap().keyframes.clone();
+    let old_store = history.stream.keyframes.clone();
     let mut rebuilt = disk_run(input, nodes.clone(), OnlineDufo::default());
     assert_eq!(rebuilt.final_pose_spool.as_ref().unwrap().len(), 2);
     let saved = disk_saved_poses(&mut owner, &mut rebuilt);
@@ -476,18 +469,16 @@ fn streamed_keyframes_use_exact_unsampled_pose_and_reset_isolates_old_store() {
     let tail = nalgebra::Matrix4::from_column_slice(&saved.last().unwrap().1);
     assert!((tail[(1, 3)] - 0.35).abs() < 1e-12);
     history.clear();
-    assert!(history.stream.as_ref().unwrap().source.is_none());
-    assert!(history.stream.as_ref().unwrap().latest.is_none());
+    assert!(history.stream.source.is_none());
+    assert!(history.stream.latest.is_none());
     assert!(!history
         .stream
-        .as_ref()
-        .unwrap()
         .keyframes
         .same_store(&old_store));
     held[2].scan().retain_pgo_keyframe().unwrap();
     assert_eq!(old_store.len(), 3);
     assert_eq!(
-        history.stream.as_ref().unwrap().keyframes.len(),
+        history.stream.keyframes.len(),
         0,
         "旧扫描不能污染新会话位姿表"
     );
@@ -518,7 +509,7 @@ fn streamed_keyframes_use_exact_unsampled_pose_and_reset_isolates_old_store() {
 
 #[test]
 fn streamed_unavailable_or_cancelled_replay_keeps_current_map_and_releases_sources() {
-    let _backend = test_backend(Backend::DufoMap);
+
     let mut owner = DiskTestOwner::new(None);
     let mut recorder = owner.recorder(1);
     let replay = recorder.replay_source();
@@ -541,7 +532,6 @@ fn streamed_unavailable_or_cancelled_replay_keeps_current_map_and_releases_sourc
         .record_static_indices(vec![0], &frame)
         .unwrap();
     let mut history = ScanHistory::default();
-    history.enable_streaming();
     history.record(source.scan(), 1_000_000_000).unwrap();
     source.scan().retain_pgo_keyframe().unwrap();
     let nodes = vec![disk_node(1_000_000_000, Isometry3::identity())];
@@ -560,7 +550,7 @@ fn streamed_unavailable_or_cancelled_replay_keeps_current_map_and_releases_sourc
         .unwrap();
     disk_wait_written(&replay, 1_000_000_000);
     history.bind_replay_source(Some(replay.clone()));
-    let input = history.disk_input(&nodes).unwrap().unwrap();
+    let input = history.disk_input(&nodes).unwrap();
     let latest = input.latest.clone();
     let (builder, cursor) = input
         .start(
@@ -588,7 +578,7 @@ fn streamed_unavailable_or_cancelled_replay_keeps_current_map_and_releases_sourc
     assert!(polls.get() >= 5, "取消必须发生在已经推进的真实后台切片中");
     assert_eq!(current.committed_snapshot().unwrap().xyz_f32_le, before);
     std::fs::write(replay.path().with_extension("incomplete"), "合成不完整日志").unwrap();
-    let input = history.disk_input(&nodes).unwrap().unwrap();
+    let input = history.disk_input(&nodes).unwrap();
     let (builder, cursor) = input
         .start(
             nodes.clone(),
@@ -616,7 +606,7 @@ fn streamed_unavailable_or_cancelled_replay_keeps_current_map_and_releases_sourc
         .unwrap();
     owner.finish_storage();
     assert!(replay.snapshot().is_err());
-    let input = history.disk_input(&nodes).unwrap().unwrap();
+    let input = history.disk_input(&nodes).unwrap();
     let (builder, cursor) = input
         .start(
             nodes,
@@ -680,13 +670,12 @@ fn disk_dense_points(snapshot: &crate::dense_cloud::DenseSnapshot) -> Vec<[f32; 
 
 #[test]
 fn streamed_terminal_b_filters_actual_corrected_fine_dense_and_visible_same_population() {
-    let _backend = test_backend(Backend::DufoMap);
+
     use crate::dynamic_scene::tests::{corridor, ORIGIN};
     let mut owner = DiskTestOwner::new(None);
     let mut cloud = CloudMapShmWriter::new_private_for_test().unwrap();
     cloud.begin_session(1).unwrap();
     let mut history = ScanHistory::default();
-    history.enable_streaming();
     let mut oracle =
         nuwax_dufomap_native::DufoMap::new(&crate::dynamic_backend::online_params()).unwrap();
     let mut frames = Vec::new();
@@ -735,7 +724,7 @@ fn streamed_terminal_b_filters_actual_corrected_fine_dense_and_visible_same_popu
     }
     history.bind_replay_source(cloud.pgo_replay_source());
     owner.finish_storage();
-    let input = history.disk_input(&nodes).unwrap().unwrap();
+    let input = history.disk_input(&nodes).unwrap();
     let mut selected = Vec::new();
     let mut reader = ScanReader::open_prefix(&input.source.snapshot().unwrap().unwrap()).unwrap();
     while let Some(scan) = reader.next_scan().unwrap() {
@@ -899,7 +888,7 @@ fn disk_usage() -> (u64, u64) {
 #[test]
 #[ignore = "显式提供实录，发布测试程序独立进程执行3000和10000帧，主代理调度重负载"]
 fn pgo_streamed_recorded_memory_cost() {
-    let _backend = test_backend(Backend::DufoMap);
+
     let path = PathBuf::from(std::env::var_os("NUWAX_PGO_RECORDED_SCANS").expect("指定原生实录"));
     let frames: usize = std::env::var("NUWAX_PGO_RECORDED_FRAMES")
         .expect("指定3000或10000帧")
@@ -920,7 +909,6 @@ fn pgo_streamed_recorded_memory_cost() {
     let mut kernel = MappingBackendSpec::Voxel.into_kernel(config.window_capacity);
     let mut persistent = None;
     let mut history = ScanHistory::default();
-    history.enable_streaming();
     let mut raw_nodes = Vec::new();
     let mut source_points = 0u64;
     let mut max_frame_points = 0usize;
@@ -948,14 +936,9 @@ fn pgo_streamed_recorded_memory_cost() {
             raw_nodes.push((stamp, source.scan().binding().frozen_odom_from_body));
         }
         history_s += started.elapsed();
-        assert!(history.scans.is_empty());
-        assert_eq!(history.point_count, 0);
-        assert!(!history.incomplete);
         max_history_points = max_history_points.max(
             history
                 .stream
-                .as_ref()
-                .unwrap()
                 .latest
                 .as_ref()
                 .unwrap()
@@ -1043,12 +1026,12 @@ fn pgo_streamed_recorded_memory_cost() {
             disk_node(*stamp, delta * pose)
         })
         .collect();
-    let disk = history.disk_input(&nodes).unwrap().unwrap();
+    let disk = history.disk_input(&nodes).unwrap();
     assert_eq!(
         disk.locals,
         raw_nodes.iter().map(|(_, pose)| *pose).collect::<Vec<_>>()
     );
-    assert_eq!(history.stream.as_ref().unwrap().keyframes.len(), 3);
+    assert_eq!(history.stream.keyframes.len(), 3);
     let latest = disk.latest.clone();
     let snapshot_started = Instant::now();
     let terminal = cloud.pgo_terminal_dufo();
@@ -1160,7 +1143,7 @@ fn pgo_streamed_recorded_memory_cost() {
         json!({"final_pose_spool_records":pose_spool_records,"final_pose_spool_bytes":pose_spool_bytes,
             "final_pose_archive":pose_archive,"final_pose_archive_s":pose_archive_s,"resident_final_pose_vector":0,
             "max_source_frame_points":max_frame_points,"resident_history_max_points":max_history_points,
-            "archived_scans":history.scans.len(),"archived_point_count":history.point_count,"retained_keyframe_poses":3}),
+            "retained_keyframe_poses":3}),
         json!({"online_wall_s":online_wall_s,"online_classify_s":classify_s.as_secs_f64(),"online_kernel_s":kernel_s.as_secs_f64(),
             "online_cloud_with_ground_capture_s":cloud_s.as_secs_f64(),"online_history_s":history_s.as_secs_f64(),
             "terminal_snapshot_s":snapshot_s,"terminal_tree_bytes":terminal_tree_bytes,"terminal_window_bytes":null,
@@ -1203,14 +1186,13 @@ fn pgo_streamed_recorded_memory_cost() {
 
 #[test]
 fn streamed_long_history_keeps_progress_during_continuous_unrelated_free_changes() {
-    let _backend = test_backend(Backend::DufoMap);
+
     use crate::dynamic_backend::OnlineDufo;
     use crate::dynamic_scene::tests::{corridor, ORIGIN};
     let mut owner = DiskTestOwner::new(None);
     let mut recorder = owner.recorder(1);
     let replay = recorder.replay_source();
     let mut history = ScanHistory::default();
-    history.enable_streaming();
     history.bind_replay_source(Some(replay.clone()));
     let frame = Arc::new(MappedFrame::unfiltered());
     let point = Point3::new(8., 0.03, 0.65);
@@ -1250,7 +1232,7 @@ fn streamed_long_history_keeps_progress_during_continuous_unrelated_free_changes
         .terminal_frame(&[point], &[point])
         .unwrap()
         .is_dynamic([point.x, point.y, point.z]));
-    let input = history.disk_input(&nodes).unwrap().unwrap();
+    let input = history.disk_input(&nodes).unwrap();
     let latest = input.latest.clone();
     let (terminal, changes) = online.snapshot_since(online.free_revision());
     assert_eq!(changes, Some(Vec::new()));
@@ -1330,7 +1312,7 @@ fn streamed_long_history_keeps_progress_during_continuous_unrelated_free_changes
     );
 
     // 另起同一日志的候选，已处理点后来被真实射线打空时必须交回新树以重启。
-    let input = history.disk_input(&nodes).unwrap().unwrap();
+    let input = history.disk_input(&nodes).unwrap();
     let (builder, cursor) = input
         .start(
             nodes,

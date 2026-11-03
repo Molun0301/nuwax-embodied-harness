@@ -112,7 +112,7 @@ def load_go2_data_plane_config(
 
     return Go2DataPlaneConfig(
         enabled=_cfg_bool("GO2_DATA_PLANE_ENABLED", False),
-        dds_iface=_cfg_str("GO2_DATA_PLANE_DDS_IFACE", _cfg_str("GO2_DDS_IFACE", "")),
+        dds_iface=_cfg_str("GO2_DATA_PLANE_DDS_IFACE", ""),
         expected_odom_frame=str(
             platform_geometry.frames.odom_frame if platform_geometry is not None else ""
         ).strip(),

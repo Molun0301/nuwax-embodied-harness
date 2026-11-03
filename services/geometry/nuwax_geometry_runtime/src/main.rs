@@ -57,7 +57,6 @@ mod pgo_keyframe_poses;
 mod pointcloud;
 mod dynamic_scene;
 mod dynamic_backend;
-mod dynamic_tracks;
 mod completed_cleanup;
 mod dense_cloud;
 mod rpc_runtime;
@@ -1240,7 +1239,7 @@ fn configure_pointcloud_storage() -> Result<(), String> {
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} 不是有效的 UTF-8 文本")),
     };
-    dynamic_backend::configure(dynamic_backend::parse_backend(env_text(dynamic_backend::BACKEND_VAR)?.as_deref())?)?;
+    dynamic_backend::parse_backend(env_text(dynamic_backend::BACKEND_VAR)?.as_deref())?;
     let fine_cloud_cache = env_text(pointcloud::FINE_CLOUD_CACHE_MIB_VAR)
         .and_then(|mode| Ok((mode, env_text(pointcloud::FINE_CLOUD_CACHE_AUTO_MAX_VAR)?)))
         .and_then(|(mode, auto_max)| pointcloud::parse_fine_cloud_cache(mode.as_deref(), auto_max.as_deref()))
@@ -4023,54 +4022,6 @@ pub(crate) mod lifecycle_tests {
             .permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&binary, permissions).expect("fake runtime executable");
-        let release_root = guard.test_dir.join("release-generation");
-        let release_manifest = release_root.join("manifest.json");
-        let prepare_release = r#"
-import hashlib, json, pathlib, shutil, sys
-source = pathlib.Path(sys.argv[1])
-root = pathlib.Path(sys.argv[2])
-entries = []
-def canonical(value):
-    return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':')) + '\n').encode()
-def add(role, name, executable=True, content=None):
-    path = pathlib.Path('artifacts') / role.replace(':', '-') / name
-    target = root / path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if content is None:
-        shutil.copyfile(source, target)
-    else:
-        target.write_bytes(content)
-    target.chmod(0o755 if executable else 0o644)
-    payload = target.read_bytes()
-    entries.append({'role': role, 'path': path.as_posix(), 'size': len(payload),
-                    'sha256': hashlib.sha256(payload).hexdigest(), 'executable': executable})
-add('geometry_runtime', source.name)
-add('native_pgo_payload', 'native-pgo')
-add('group_guardian', 'group-guardian')
-add('offline_mapping_cli', 'mapping-cli')
-add('native_lio_payload:fastlio2', 'nuwax-fastlio2-backend')
-add('build_input_closure', 'build-inputs.json', False, b'{}\n')
-entries.sort(key=lambda item: item['role'])
-generation = hashlib.sha256(canonical(entries)).hexdigest()
-manifest = {'schema_version': 'nuwax.geometry.release.v1', 'generation': generation,
-            'available_native_lio_roles': ['fastlio2'], 'selected_native_lio_roles': [],
-            'artifacts': entries}
-manifest_path = root / 'manifest.json'
-manifest_path.write_bytes(canonical(manifest))
-manifest_path.chmod(0o644)
-for directory in root.rglob('*'):
-    if directory.is_dir():
-        directory.chmod(0o755)
-root.chmod(0o755)
-"#;
-        let release_status = std::process::Command::new("python3")
-            .arg("-c")
-            .arg(prepare_release)
-            .arg("/bin/bash")
-            .arg(&release_root)
-            .status()
-            .expect("prepare fake release manifest");
-        assert!(release_status.success(), "prepare fake release failed");
         let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(std::path::Path::parent)
@@ -4098,7 +4049,6 @@ root.chmod(0o755)
                 .env("NUWAX_GEOMETRY_EXTRA_ENV_FILES", "")
                 .env("NUWAX_GEOMETRY_RUNTIME_BINARY", &binary)
                 .env("BASH_ENV", &binary)
-                .env("NUWAX_GEOMETRY_RELEASE_MANIFEST", &release_manifest)
                 .env("NUWAX_GEOMETRY_RUNTIME_READY_FILE", &ready)
                 .env("NUWAX_GEOMETRY_RUNTIME_PORT", "50051")
                 .env("NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT", "2")
@@ -4131,7 +4081,3 @@ root.chmod(0o755)
         assert!(!LauncherGuard::process_is_alive(runtime_identity));
     }
 }
-
-use nuwax_cloud_cleanup::human_point_labels;
-
-use nuwax_cloud_cleanup::offline_residual_cleanup;

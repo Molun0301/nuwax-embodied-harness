@@ -1633,7 +1633,7 @@ _NAV_READINESS_FIELDS = (
     "tf",
     "costmap",
     "planner",
-    "cmd_vel_sink",
+
     "profile",
     "backend",
     "tf_count",
@@ -1747,7 +1747,7 @@ def _parse_navigation_readiness_reason(ready: bool, reason: str) -> Dict[str, An
         "tf": None,
         "costmap": None,
         "planner": None,
-        "cmd_vel_sink": None,
+
         "profile": None,
     }
     marker = "; details="
@@ -1778,7 +1778,7 @@ def _nav_readiness_disconnected_dict(message: str = "未连接") -> Dict[str, An
         "tf": None,
         "costmap": None,
         "planner": None,
-        "cmd_vel_sink": None,
+
         "profile": None,
         # Phase 7 增量字段
         "backend": None,
@@ -1963,10 +1963,6 @@ def _merge_static_edges(frame_tree: Optional[FrameTree], static_edges: List[Tran
     live_base_frame = next((f for f in present_frames if infer_frame_role(f) == "base"), None)
     if live_base_frame is None:
         configured_base = _normalize_frame(runtime_value("NUWAX_BASE_FRAME", ""))
-        if not configured_base:
-            configured_base = _normalize_frame(
-                os.environ.get("NUWAX_GEOMETRY_BASE_FRAME", "")
-            )
         if configured_base and configured_base in present_frames:
             live_base_frame = configured_base
 
@@ -3964,7 +3960,7 @@ class GeometryRuntimeProvider:
           - ``ready`` (bool): nuwax nav_runtime + lcm backend 都健康
           - ``lcm_backend`` (str): canonical LCM backend 名
           - ``readiness`` (dict): `GetNavigationReadiness` 解析后字段
-            (ready/message/lcm_backend/tf/costmap/planner/cmd_vel_sink/profile/
+            (ready/message/lcm_backend/tf/costmap/planner/cmd_vel_sink_ready/profile/
              当前原生就绪字段)
           - ``profile`` / ``active_profile`` (str|None): 当前 nav profile
             (Phase 7 兼容旧 `profile` + 新 `active_profile`)
@@ -4081,13 +4077,9 @@ class GeometryRuntimeProvider:
                 return None, None
             token = self._map_delivery_token_locked()
             static_edges = tuple(self._static_extrinsic_edges)
-        tree_reader = getattr(stub, "GetFrameTree", None)
-        pose_reader = getattr(stub, "GetCurrentPose", None)
-        if not callable(tree_reader) or not callable(pose_reader):
-            return None, None
         try:
-            tree_response = tree_reader(pb2.Empty(), timeout=_pose_deadline_sec())
-            pose_response = pose_reader(pb2.PoseRequest(), timeout=_pose_deadline_sec())
+            tree_response = stub.GetFrameTree(pb2.Empty(), timeout=_pose_deadline_sec())
+            pose_response = stub.GetCurrentPose(pb2.PoseRequest(), timeout=_pose_deadline_sec())
             frame_tree = _merge_static_edges(
                 _build_frame_tree(tree_response.transforms), static_edges)
             pose = _build_pose(pose_response)
@@ -4799,7 +4791,7 @@ class GeometryRuntimeProvider:
         - ``ready`` (bool): 整体 ready
         - ``message`` (str): 顶层 reason
         - ``lcm_backend`` / ``tf`` / ``costmap`` / ``planner`` /
-          ``cmd_vel_sink`` (bool): 子项
+          ``cmd_vel_sink_ready`` (bool): 子项
         - ``profile`` (str): 当前 NUWAX_NAV_PROFILE
         """
         self._raise_if_stopping("get_navigation_readiness")

@@ -68,34 +68,31 @@ const STARTUP_ENV_KEYS: &[&str] = &[
     "NUWAX_MAPPING_RAYTRACING_MAX_HEALTH",
     "NUWAX_MAPPING_RAYTRACING_GRAZE_COS",
     "NUWAX_MAPPING_RAYTRACING_RECENCY_WINDOW",
-    "NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL",
     "NUWAX_LCM_CHANNEL_ODOM",
-    "NUWAX_GEOMETRY_RUNTIME_TF_CHANNEL",
+    "NUWAX_LCM_CHANNEL_ODOM",
     "NUWAX_LCM_CHANNEL_TF",
-    "NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL",
+    "NUWAX_LCM_CHANNEL_TF",
     "NUWAX_LCM_CHANNEL_POINTCLOUD",
-    "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL",
+    "NUWAX_LCM_CHANNEL_POINTCLOUD",
     "NUWAX_LCM_CHANNEL_CLOUD_MAP",
-    "NUWAX_GEOMETRY_RUNTIME_OCCUPANCY_CHANNEL",
+    "NUWAX_LCM_CHANNEL_CLOUD_MAP",
     "NUWAX_LCM_CHANNEL_OCCUPANCY",
-    "NUWAX_GEOMETRY_RUNTIME_CMD_VEL_CHANNEL",
+    "NUWAX_LCM_CHANNEL_OCCUPANCY",
     "NUWAX_LCM_CHANNEL_CMD_VEL",
-    "NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL",
+    "NUWAX_LCM_CHANNEL_CMD_VEL",
     "NUWAX_LCM_CHANNEL_GOAL_POSE",
-    "NUWAX_GEOMETRY_RUNTIME_NAV_STATE_CHANNEL",
+    "NUWAX_LCM_CHANNEL_GOAL_POSE",
     "NUWAX_LCM_CHANNEL_NAV_STATE",
-    "NUWAX_GEOMETRY_RUNTIME_FRONTIERS_CHANNEL",
+    "NUWAX_LCM_CHANNEL_NAV_STATE",
     "NUWAX_LCM_CHANNEL_FRONTIER",
-    "NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL",
+    "NUWAX_LCM_CHANNEL_FRONTIER",
     "NUWAX_LCM_CHANNEL_NAV_CANCEL",
-    "NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL",
+    "NUWAX_LCM_CHANNEL_NAV_CANCEL",
     "NUWAX_LCM_CHANNEL_NAV_PATH",
-    "NUWAX_GEOMETRY_MAP_FRAME",
+    "NUWAX_LCM_CHANNEL_NAV_PATH",
     "NUWAX_MAP_FRAME",
     "NUWAX_GEOMETRY_ODOM_FRAME",
-    "NUWAX_ODOM_FRAME",
     "NUWAX_BASE_FRAME",
-    "NUWAX_GEOMETRY_BASE_FRAME",
     "NUWAX_GEOMETRY_LIDAR_FRAME",
     "NUWAX_GEOMETRY_LIO_BODY_FROM_SENSOR",
     "NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE",
@@ -1093,16 +1090,16 @@ fn selected_raytracing_configuration_fails_before_startup_side_effects() {
 #[test]
 fn every_registry_channel_is_preflighted_before_startup_side_effects() {
     let channels = [
-        ("odom", "NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL"),
-        ("tf", "NUWAX_GEOMETRY_RUNTIME_TF_CHANNEL"),
-        ("pointcloud", "NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL"),
-        ("cloud_map", "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL"),
-        ("occupancy", "NUWAX_GEOMETRY_RUNTIME_OCCUPANCY_CHANNEL"),
-        ("cmd_vel", "NUWAX_GEOMETRY_RUNTIME_CMD_VEL_CHANNEL"),
-        ("goal_pose", "NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL"),
-        ("nav_state", "NUWAX_GEOMETRY_RUNTIME_NAV_STATE_CHANNEL"),
-        ("frontiers", "NUWAX_GEOMETRY_RUNTIME_FRONTIERS_CHANNEL"),
-        ("cancel", "NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL"),
+        ("odom", "NUWAX_LCM_CHANNEL_ODOM"),
+        ("tf", "NUWAX_LCM_CHANNEL_TF"),
+        ("pointcloud", "NUWAX_LCM_CHANNEL_POINTCLOUD"),
+        ("cloud_map", "NUWAX_LCM_CHANNEL_CLOUD_MAP"),
+        ("occupancy", "NUWAX_LCM_CHANNEL_OCCUPANCY"),
+        ("cmd_vel", "NUWAX_LCM_CHANNEL_CMD_VEL"),
+        ("goal_pose", "NUWAX_LCM_CHANNEL_GOAL_POSE"),
+        ("nav_state", "NUWAX_LCM_CHANNEL_NAV_STATE"),
+        ("frontiers", "NUWAX_LCM_CHANNEL_FRONTIER"),
+        ("cancel", "NUWAX_LCM_CHANNEL_NAV_CANCEL"),
     ];
 
     for (channel, variable) in channels {
@@ -1120,26 +1117,6 @@ fn every_registry_channel_is_preflighted_before_startup_side_effects() {
     }
 }
 
-#[test]
-fn whitespace_runtime_channel_does_not_fall_through_to_platform() {
-    let scenario = "whitespace-runtime-channel";
-    let probe = ProbeDir::fail_closed(scenario);
-    let artifacts = SeededStartupArtifacts::new(&probe, scenario);
-    let mut command = runtime_command("real-lcm", &probe);
-    command
-        .env("NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL", " \t\n")
-        .env("NUWAX_LCM_CHANNEL_ODOM", "/odom#nav_msgs.Odometry");
-
-    assert_preflight_failure(
-        &mut command,
-        &artifacts,
-        scenario,
-        concat!(
-            "LCM_CHANNEL_PREFLIGHT_FAILED channel=odom: ",
-            "env=NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL value_is_empty"
-        ),
-    );
-}
 
 #[cfg(unix)]
 #[test]
@@ -1168,7 +1145,7 @@ fn goal_channel_rejects_the_legacy_pose_type_before_startup() {
     let artifacts = SeededStartupArtifacts::new(&probe, scenario);
     let mut command = runtime_command("real-lcm", &probe);
     command.env(
-        "NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL",
+        "NUWAX_LCM_CHANNEL_GOAL_POSE",
         "/nav/goal#geometry_msgs.PoseStamped",
     );
     assert_preflight_failure(
@@ -1186,7 +1163,7 @@ fn versioned_path_channel_is_preflighted_before_startup() {
     let artifacts = SeededStartupArtifacts::new(&probe, scenario);
     let mut command = runtime_command("real-lcm", &probe);
     command.env(
-        "NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL",
+        "NUWAX_LCM_CHANNEL_NAV_PATH",
         "not-an-lcm-topic#nuwax_msgs.PathEnvelope",
     );
     assert_preflight_failure(
@@ -1197,33 +1174,6 @@ fn versioned_path_channel_is_preflighted_before_startup() {
     );
 }
 
-#[cfg(unix)]
-#[test]
-fn non_unicode_runtime_path_does_not_fall_through_to_platform() {
-    let scenario = "non-unicode-runtime-path";
-    let probe = ProbeDir::fail_closed(scenario);
-    let artifacts = SeededStartupArtifacts::new(&probe, scenario);
-    let mut command = runtime_command("real-lcm", &probe);
-    command
-        .env(
-            "NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL",
-            OsString::from_vec(vec![0xff]),
-        )
-        .env(
-            "NUWAX_LCM_CHANNEL_NAV_PATH",
-            "/nav/path#nuwax_msgs.PathEnvelope",
-        );
-
-    assert_preflight_failure(
-        &mut command,
-        &artifacts,
-        scenario,
-        concat!(
-            "LCM_PATH_PREFLIGHT_FAILED: ",
-            "env=NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL value_is_not_unicode"
-        ),
-    );
-}
 
 #[test]
 fn whitespace_platform_path_does_not_fall_through_to_default() {
@@ -1279,30 +1229,13 @@ fn persistence_startup_failure_preserves_sequence_state_error() {
 
 #[test]
 fn map_odom_and_base_frames_fail_closed_before_startup_side_effects() {
-    let cases = [
-        ("map", "NUWAX_GEOMETRY_MAP_FRAME", "NUWAX_MAP_FRAME", "map"),
-        (
-            "odom",
-            "NUWAX_GEOMETRY_ODOM_FRAME",
-            "NUWAX_ODOM_FRAME",
-            "odom",
-        ),
-        (
-            "base",
-            "NUWAX_BASE_FRAME",
-            "NUWAX_GEOMETRY_BASE_FRAME",
-            "base_link",
-        ),
-    ];
-
-    for (role, preferred, legacy, legacy_value) in cases {
+    let cases = [("map", "NUWAX_MAP_FRAME"), ("odom", "NUWAX_GEOMETRY_ODOM_FRAME"), ("base", "NUWAX_BASE_FRAME")];
+    for (role, preferred) in cases {
         let scenario = format!("invalid-{role}-frame");
         let probe = ProbeDir::fail_closed(&scenario);
         let artifacts = SeededStartupArtifacts::new(&probe, &scenario);
         let mut command = runtime_command("real-lcm", &probe);
-        command
-            .env(preferred, "invalid frame")
-            .env(legacy, legacy_value);
+        command.env(preferred, "invalid frame");
         assert_preflight_failure(
             &mut command,
             &artifacts,

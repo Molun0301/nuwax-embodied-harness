@@ -1,10 +1,7 @@
-//! Google Maps HTTP client.
+//! 谷歌地图网络客户端。
 //!
-//! Network access is explicit. [`CloudMode::Live`] performs an HTTPS request
-//! using `GOOGLE_MAPS_API_KEY` (or the legacy
-//! `NUWAX_GOOGLE_MAPS_API_KEY`). [`CloudMode::Offline`] and the legacy
-//! [`CloudMode::Mock`] never fabricate a location and return
-//! [`CloudError::Offline`].
+//! [`CloudMode::Live`] 显式发起网络请求，密钥只读取 `NUWAX_GOOGLE_MAPS_API_KEY`。
+//! [`CloudMode::Offline`] 与 [`CloudMode::Mock`] 返回 [`CloudError::Offline`]。
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
@@ -15,7 +12,7 @@ const GOOGLE_MAPS_BASE_URL: &str = "https://maps.googleapis.com/maps/api";
 #[derive(Debug, Error)]
 pub enum CloudError {
     /// A Google Maps live request was selected without an API key.
-    #[error("missing API key (set GOOGLE_MAPS_API_KEY)")]
+    #[error("missing API key (set NUWAX_GOOGLE_MAPS_API_KEY)")]
     ApiKeyMissing,
     /// The caller selected an explicit no-network mode.
     #[error("operation is unavailable in offline mode")]
@@ -141,15 +138,13 @@ pub struct GoogleMapsClient {
 }
 
 impl GoogleMapsClient {
-    /// Construct from `GOOGLE_MAPS_API_KEY` and optional
+    /// 从规范密钥配置构造；请求地址可由下一项指定：
     /// `NUWAX_GOOGLE_MAPS_BASE_URL`.
     ///
     /// # Errors
-    /// Returns [`CloudError::ApiKeyMissing`] when neither supported API-key
-    /// environment variable is set or when it is empty.
+    /// 规范密钥配置不存在或为空时返回 [`CloudError::ApiKeyMissing`]。
     pub fn from_env() -> Result<Self, CloudError> {
-        let api_key = std::env::var("GOOGLE_MAPS_API_KEY")
-            .or_else(|_| std::env::var("NUWAX_GOOGLE_MAPS_API_KEY"))
+        let api_key = std::env::var("NUWAX_GOOGLE_MAPS_API_KEY")
             .map_err(|_| CloudError::ApiKeyMissing)?;
         if api_key.trim().is_empty() {
             return Err(CloudError::ApiKeyMissing);

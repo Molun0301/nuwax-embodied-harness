@@ -74,5 +74,5 @@
   "NUWAX_PERCEPTION_STREAM_AUTO_START": "网关启动时自动开启持续视频感知；需同时启用持续视频感知。",
   "NUWAX_PERCEPTION_STREAM_INTERVAL_SEC": "持续视频感知两次检测之间的间隔（秒，至少0.05）；越小越及时，计算负担越大。",
   "NUWAX_MAP_CATALOG_ROOT": "保存地图的目录，地图列表、激活和删除都在此目录下进行。",
-  "NUWAX_MEMORY_EMBEDDING_API_KEY": "使用 DashScope（阿里云模型服务）向量模型时的访问密钥；留空时读取环境变量 DASHSCOPE_API_KEY。"
+  "DASHSCOPE_API_KEY": "DashScope（阿里云模型服务）向量模型的访问密钥。"
 }

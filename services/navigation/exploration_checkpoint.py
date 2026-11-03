@@ -57,7 +57,7 @@ class ExplorationCheckpoint(BaseModel):
         if self.asset_identity is None or self.mapping_checkpoint_id is None:
             raise ValueError("探索检查点必须绑定分配身份资产与建图检查点")
         value = json.loads(self.geometry_progress_json)
-        if not isinstance(value, dict) or type(value.get("schema_version")) is not int or value["schema_version"] not in (1, 2) or value.get("map_name") != self.request.map_name or value.get("request_id") != self.request.request_id:
+        if not isinstance(value, dict) or type(value.get("schema_version")) is not int or value["schema_version"] != 2 or value.get("map_name") != self.request.map_name or value.get("request_id") != self.request.request_id:
             raise ValueError("探索进度与冻结请求的地图或原任务身份不一致")
         for name in ("map_name", "map_frame_id", "origin_session_id"):
             if not isinstance(value.get(name), str) or not value[name].strip():
@@ -170,7 +170,7 @@ class ExplorationCheckpointStore:
                 self._validate_catalog_identity(value)
                 if not self.assets.map_asset_bundle_snapshot_is_current(value.request.map_name, snapshot):
                     raise ValueError("检查点绑定的完整地图在保存前已改变")
-            elif value.schema_version == 2:
+            else:
                 raise ValueError("新版探索检查点缺少已验证的完整地图快照")
             self._files.prepare_parent(path)
             if observed is not None:

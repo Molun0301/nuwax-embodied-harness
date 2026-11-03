@@ -19,7 +19,7 @@ def _code_read_keys() -> set:
     keys = set()
     for rel in ("core/settings.py", "drivers/go2/settings.py"):
         src = (_REPO / rel).read_text(encoding="utf-8")
-        for m in re.finditer(r'_cfg_(?:str|int|bool|float|csv)(?:_alias)?\(\s*"([A-Z0-9_]+)"', src):
+        for m in re.finditer(r'_cfg_(?:str|int|bool|float|csv)\(\s*"([A-Z0-9_]+)"', src):
             keys.add(m.group(1))
         # _prefer_platform_str(platform_value, "KEY", default)：键在第二个字面量实参
         for m in re.finditer(r'_prefer_platform_str\(\s*[^,]+,\s*"([A-Z0-9_]+)"', src):
@@ -30,8 +30,7 @@ def _code_read_keys() -> set:
 def test_registry_covers_all_read_keys():
     reg_keys = set(R.all_keys())
     code_keys = _code_read_keys()
-    aliases = {key for entry in R.runtime_catalog().values() for key in entry.get("aliases", ())}
-    missing = code_keys - reg_keys - aliases
+    missing = code_keys - reg_keys
     assert not missing, f"registry 缺失代码读取键: {sorted(missing)}"
 
 

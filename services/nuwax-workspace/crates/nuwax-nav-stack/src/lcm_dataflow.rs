@@ -709,7 +709,7 @@ async fn run_map_pose_adapter(
     let mut odometry = typed_stream(&transport, &node.inputs[0], "nav_msgs.Odometry").await?;
     let mut transforms = typed_stream(&transport, &node.inputs[1], "tf2_msgs.TFMessage").await?;
     let mut adapter = bound_map_pose_adapter(
-        configured_frame("NUWAX_GEOMETRY_MAP_FRAME", "map")?,
+        configured_frame("NUWAX_MAP_FRAME", "map")?,
         configured_frame("NUWAX_GEOMETRY_ODOM_FRAME", "odom")?,
         &body_reference_frame_id,
     )?;
@@ -799,7 +799,6 @@ async fn run_map_pose_adapter(
     }
 }
 
-#[cfg(feature = "guard-runtime")]
 fn configured_frame(key: &str, fallback: &str) -> NavStackResult<String> {
     let value = std::env::var(key).unwrap_or_else(|_| fallback.to_string());
     let value = value.trim();
@@ -812,32 +811,7 @@ fn configured_frame(key: &str, fallback: &str) -> NavStackResult<String> {
     }
 }
 
-fn configured_frame_alias(
-    preferred_key: &str,
-    legacy_key: &str,
-    fallback: &str,
-) -> NavStackResult<String> {
-    let preferred = std::env::var(preferred_key).ok();
-    let legacy = std::env::var(legacy_key).ok();
-    resolve_frame_alias(preferred.as_deref(), legacy.as_deref(), fallback).ok_or_else(|| {
-        NavStackError::InvalidConfig(format!(
-            "{preferred_key}, {legacy_key}, and fallback frame must not all be empty"
-        ))
-    })
-}
 
-fn resolve_frame_alias(
-    preferred: Option<&str>,
-    legacy: Option<&str>,
-    fallback: &str,
-) -> Option<String> {
-    preferred
-        .and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()))
-        .or_else(|| {
-            legacy.and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()))
-        })
-        .or_else(|| (!fallback.trim().is_empty()).then(|| fallback.trim().to_string()))
-}
 
 #[cfg(feature = "guard-runtime")]
 pub(crate) fn guarded_nav_scheduler_owner(
@@ -4673,7 +4647,7 @@ fn validate_goal_reference(
 }
 
 pub(crate) fn capture_body_reference() -> Result<Arc<str>, String> {
-    let body = configured_frame_alias("NUWAX_BASE_FRAME", "NUWAX_GEOMETRY_BASE_FRAME", "base_link")
+    let body = configured_frame("NUWAX_BASE_FRAME", "base_link")
         .map_err(|error| error.to_string())?;
     if !crate::map_pose::valid_body_reference(&body) {
         return Err("navigation body reference must be a valid frame ID".into());
@@ -8203,21 +8177,6 @@ mod guarded_tests {
         ));
     }
 
-    #[test]
-    fn canonical_base_frame_value_precedes_legacy_alias() {
-        assert_eq!(
-            resolve_frame_alias(Some(" body "), Some("base_footprint"), "base_link"),
-            Some("body".to_string())
-        );
-        assert_eq!(
-            resolve_frame_alias(Some("  "), Some(" base_footprint "), "base_link"),
-            Some("base_footprint".to_string())
-        );
-        assert_eq!(
-            resolve_frame_alias(None, None, " base_link "),
-            Some("base_link".to_string())
-        );
-    }
 
     fn active_goal(session_id: &str) -> schema::GoalEnvelope {
         schema::GoalEnvelope {

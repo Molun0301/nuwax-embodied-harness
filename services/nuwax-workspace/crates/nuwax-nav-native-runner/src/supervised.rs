@@ -39,7 +39,6 @@ const GUARDIAN_MESSAGE_READY: u32 = 2;
 const GUARDIAN_MESSAGE_ERROR: u32 = 3;
 const GUARDIAN_DISARM: u8 = b'D';
 const GROUP_GUARDIAN_PATH: &str = env!("NUWAX_GROUP_GUARDIAN_PATH");
-const VERIFIED_GROUP_GUARDIAN_ENV: &str = "NUWAX_GEOMETRY_RELEASE_GROUP_GUARDIAN_EXECUTABLE";
 #[cfg(test)]
 const TEST_GROUP_GUARDIAN_PATH: &str = env!("NUWAX_GROUP_GUARDIAN_TEST_PATH");
 
@@ -49,13 +48,6 @@ pub fn discovery_group_guardian_executable() -> &'static Path {
     Path::new(GROUP_GUARDIAN_PATH)
 }
 
-fn verified_group_guardian_executable() -> PathBuf {
-    std::env::var_os(VERIFIED_GROUP_GUARDIAN_ENV)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        // 发布部署使用显式固定路径；源码构建直接使用同次构建生成的守护进程。
-        .unwrap_or_else(|| discovery_group_guardian_executable().to_path_buf())
-}
 
 /// Explicit executable, argument, working-directory, and environment contract.
 ///
@@ -194,10 +186,10 @@ impl SupervisedNativeCommand {
             if self.guardian_test_checkpoint.is_some() || self.guardian_test_exit.is_some() {
                 PathBuf::from(TEST_GROUP_GUARDIAN_PATH)
             } else {
-                verified_group_guardian_executable()
+                discovery_group_guardian_executable().to_path_buf()
             };
         #[cfg(not(test))]
-        let guardian_path = verified_group_guardian_executable();
+        let guardian_path = discovery_group_guardian_executable().to_path_buf();
         let mut command = Command::new(guardian_path);
         command
             .arg("--parent-pid")

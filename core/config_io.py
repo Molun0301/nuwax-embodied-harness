@@ -121,55 +121,40 @@ def _valid_rotation_calibration(raw: str) -> bool:
 
 
 def _release_capabilities() -> Dict[str, object]:
-    """查看可执行后端；发布清单的完整验证由实际启动入口执行。"""
+    """查看本次构建可执行后端。"""
 
     paths = {}
-    manifest_path = _current_value("NUWAX_GEOMETRY_RELEASE_MANIFEST").strip()
-    if manifest_path:
-        manifest = Path(manifest_path).expanduser()
-        try:
-            payload = json.loads(manifest.read_text(encoding="utf-8"))
-            for artifact in payload["artifacts"]:
-                paths[str(artifact["role"])] = manifest.parent / artifact["path"]
-        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
-            return {"valid": False, "roles": set(), "reason": str(exc)}
-    else:
-        runtime = _current_value("NUWAX_GEOMETRY_RUNTIME_BINARY").strip()
-        paths["geometry_runtime"] = Path(runtime).expanduser() if runtime else (
-            _REPO_ROOT / "services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime"
+    runtime = _current_value("NUWAX_GEOMETRY_RUNTIME_BINARY").strip()
+    paths["geometry_runtime"] = Path(runtime).expanduser() if runtime else (
+        _REPO_ROOT / "services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime"
+    )
+    native = _current_value("NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE").strip()
+    selected_backend = _current_value("NUWAX_GEOMETRY_LIO_BACKEND").strip()
+    for backend in ("fastlio2", "pointlio"):
+        paths[_NATIVE_LIO_ROLE_PREFIX + backend] = (
+            Path(native).expanduser() if native and backend == selected_backend else
+            _REPO_ROOT / "services/nuwax-workspace/crates/nuwax-lio-backends/native"
+            / backend / "cpp/result/bin" / (backend + "_native")
         )
-        native = _current_value("NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE").strip()
-        selected_backend = _current_value("NUWAX_GEOMETRY_LIO_BACKEND").strip()
-        for backend in ("fastlio2", "pointlio"):
-            paths[_NATIVE_LIO_ROLE_PREFIX + backend] = (
-                Path(native).expanduser() if native and backend == selected_backend else
-                _REPO_ROOT / "services/nuwax-workspace/crates/nuwax-lio-backends/native"
-                / backend / "cpp/result/bin" / (backend + "_native")
+    # 本地运行程序已经记录同次构建的优化器路径；读取轻量发现接口，避免猜构建目录。
+    runtime_path = paths["geometry_runtime"]
+    if runtime_path.is_file() and os.access(runtime_path, os.X_OK):
+        try:
+            discovery = subprocess.run(
+                [str(runtime_path.resolve()), "--print-release-artifacts"],
+                capture_output=True, text=True, timeout=2, check=True,
             )
-        # 本地运行程序已经记录同次构建的优化器路径；读取轻量发现接口，避免猜构建目录。
-        runtime_path = paths["geometry_runtime"]
-        if runtime_path.is_file() and os.access(runtime_path, os.X_OK):
-            try:
-                discovery = subprocess.run(
-                    [str(runtime_path.resolve()), "--print-release-artifacts"],
-                    capture_output=True, text=True, timeout=2, check=True,
-                )
-                for artifact in json.loads(discovery.stdout).get("artifacts", []):
-                    if artifact.get("role") in {"native_pgo_payload", "group_guardian"}:
-                        paths[artifact["role"]] = Path(artifact["path"])
-            except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, AttributeError):
-                pass
-        pgo = _current_value("NUWAX_GEOMETRY_RELEASE_NATIVE_PGO_EXECUTABLE").strip()
-        if pgo:
-            paths["native_pgo_payload"] = Path(pgo).expanduser()
+            for artifact in json.loads(discovery.stdout).get("artifacts", []):
+                if artifact.get("role") in {"native_pgo_payload", "group_guardian"}:
+                    paths[artifact["role"]] = Path(artifact["path"])
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, AttributeError):
+            pass
     roles = {role for role, path in paths.items() if path.is_file()}
     return {
-        "valid": True,
         "roles": roles,
         "executable_roles": {
             role for role, path in paths.items() if role in roles and os.access(path, os.X_OK)
         },
-        "reason": "",
     }
 
 
@@ -177,16 +162,14 @@ def geometry_backend_statuses() -> List[GeometryCombinationStatus]:
     """报告后端组合的当前程序和标定缺项；合法选择均可先保存再部署。"""
 
     release = _release_capabilities()
-    roles = release["roles"] if release["valid"] else set()
-    executable_roles = release.get("executable_roles", set()) if release["valid"] else set()
+    roles = release["roles"]
+    executable_roles = release.get("executable_roles", set())
     statuses: List[GeometryCombinationStatus] = []
     for lio in _GEOMETRY_LIO_BACKENDS:
         for mapping in _GEOMETRY_MAPPING_BACKENDS:
             for correction in _GEOMETRY_CORRECTION_BACKENDS:
                 prerequisite_reasons: List[str] = []
-                if not release["valid"]:
-                    prerequisite_reasons.append("本机 Geometry 发布清单不可读取：%s" % release.get("reason", ""))
-                elif "geometry_runtime" not in roles:
+                if "geometry_runtime" not in roles:
                     prerequisite_reasons.append("未找到 Geometry 运行程序，请构建或设置 NUWAX_GEOMETRY_RUNTIME_BINARY")
                 elif "geometry_runtime" not in executable_roles:
                     prerequisite_reasons.append("Geometry 运行程序不可执行")
@@ -410,13 +393,10 @@ def _build_schema(location, *, profile_snapshot=None, revision_owner=None, runti
     def saved_value(field: R.ConfigField):
         if field.key in user_vals:
             return user_vals[field.key], user_path, "user_file"
-        for alias in field.aliases:
-            if alias in user_vals:
-                return user_vals[alias], user_path, "legacy_file"
         return None, "", "default"
 
     source_labels = {
-        "user_file": "机器人配置方案", "default": "程序默认值", "legacy_file": "旧版配置别名",
+        "user_file": "机器人配置方案", "default": "程序默认值",
     }
 
     geometry_statuses = geometry_backend_statuses()
@@ -458,7 +438,6 @@ def _build_schema(location, *, profile_snapshot=None, revision_owner=None, runti
             "sensitive": f.sensitive,
             "target_file": _save_target(f.key, f.target_file),
             "default_repr": f.default_repr,
-            "alias_of": f.alias_of,
             "choices": list(f.choices),
             "choice_labels": list(f.choice_labels),
             "choice_disabled_reasons": {},
@@ -479,7 +458,6 @@ def _build_schema(location, *, profile_snapshot=None, revision_owner=None, runti
             "target_path": str(location["path"]) if location else "",
             "source_path": source_path,
             "consumers": list(f.consumers),
-            "aliases": list(f.aliases),
             "is_set": raw_value is not None,
         })
 
@@ -677,13 +655,10 @@ def _apply_updates_to_text(original: str, updates: Dict[str, str]) -> str:
     """在保留注释/顺序/其它键的前提下，就地更新已存在键，追加新键。"""
 
     remaining = dict(updates)
-    aliases = {alias for key in updates for alias in (R.get_field(key).aliases if R.get_field(key) else ())}
     out_lines: List[str] = []
     for raw_line in original.splitlines():
         parsed = parse_env_line(raw_line)
         key = parsed[0] if parsed else None
-        if key in aliases:
-            continue
         if key in updates:
             if key in remaining:
                 out_lines.append(env_assignment(key, remaining.pop(key)))

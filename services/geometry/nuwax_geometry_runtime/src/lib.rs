@@ -2,7 +2,6 @@
 
 mod dynamic_scene;
 mod dynamic_backend;
-mod dynamic_tracks;
 
 #[doc(hidden)]
 pub mod mapping_backend;

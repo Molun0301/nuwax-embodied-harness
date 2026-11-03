@@ -234,7 +234,7 @@ class _DashScopeEmbeddingBase(VectorCodecMixin):
         if not self._api_key:
             raise RuntimeError(
                 "当前 DashScope 多模态向量模型需要配置 API Key。"
-                "请设置 `NUWAX_MEMORY_EMBEDDING_API_KEY` 或 `DASHSCOPE_API_KEY`。"
+                "请设置 `DASHSCOPE_API_KEY`。"
             )
         self._endpoint_url = _resolve_dashscope_endpoint(base_url)
         self._timeout_sec = max(1.0, float(timeout_sec))

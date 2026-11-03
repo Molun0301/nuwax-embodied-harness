@@ -192,12 +192,7 @@ fn run_saved_case(rich: bool, recorded: Option<&std::path::Path>) {
         let stage = std::time::Instant::now();
         let shared = writer.classify_admitted_scan(&accepted).unwrap();
         stages[0] += stage.elapsed().as_secs_f64();
-        if let crate::dynamic_backend::MappedFrame::Legacy(frame) = &shared {
-            assert_eq!(frame.decision.labels.labels.len(), points.len());
-        } else {
-            assert!(accepted.scan().dynamic_frame().is_none());
-            assert!(accepted.scan().static_indices().unwrap().iter().all(|&i| (i as usize) < points.len()));
-        }
+        assert!(accepted.scan().static_indices().unwrap().iter().all(|&i| (i as usize) < points.len()));
         let input = MappingBackendInput {
             session_id: session.clone(),
             session_generation: 1,

@@ -2,55 +2,13 @@
 // 在不破坏 contract 前提下用 file-level allow 标注；P2 收口期 Phase 6 后期再清理。
 
 
-//! LCM typed channel registry —— 统一解析 env + 公共 channel_for(key) helper。
-//!
-//! 该模块把 `lcm_runtime.rs` / `main.rs` / `server.rs` / `nav_runtime.rs`
-//! 中分散的 channel 字面量收敛到单一入口,并把 `NUWAX_LCM_CHANNEL_*`
-//! (Python contracts 平台级) 与 `NUWAX_GEOMETRY_RUNTIME_*_CHANNEL`
-//! (本进程内部 alias) 按优先级统一:
-//!
-//! 1. `NUWAX_GEOMETRY_RUNTIME_<NAME>_CHANNEL` —— 本进程内直读(Phase 1 channel
-//!    registry 补齐的 typed channel:odom/cmd_vel/nav_cancel 等)
-//! 2. `NUWAX_LCM_CHANNEL_<NAME>` —— 平台级 Python contract 默认
-//! 3. 内置 default(本文件固化,仅在 CI/contract test 改)
-//!
-//! ## 命名约定
-//! - channel 字符串必须是 LCM typed format:`/topic#pkg.Msg`
-//! - `channel_for(key)` 在 key 对应 default 缺少 `#msg_type` 时自动补 typed
-//!   suffix;`parse_subscription_pattern` 校验后返回 `LcmTopic`。
-//!
-//! ## 不读取
-//! - `NUWAX_LCM_BACKEND` / `NUWAX_LCM_URL` —— 这两个是 backend 选择,不属于
-//!   channel registry
-//! - 任何 `NUWAX_GEOMETRY_RUNTIME_*` 中非 `_CHANNEL` 后缀的 env(端口/ready
-//!   文件/二进制路径)
+//! LCM（轻量通信与编组）通道注册表，只读取平台规范配置名。
 
 use std::{env::VarError, fmt};
 
 use nuwax_protocol::{LcmMessageType, LcmTopic};
 use tracing::warn;
 
-// ============================================================================
-// Phase 4：channel_for(key) 公共 helper + ChannelKey 枚举
-// ============================================================================
-//
-// 取代 lcm_runtime.rs / server.rs 中所有散落的 `LcmTopic::new("/...")`
-// 硬编码 + untyped `topic_or_default(...)` 兜底。
-//
-// 设计要点：
-// 1. 每个 `ChannelKey` 必须映射到 *唯一* 一组 (env_runtime, env_platform, default)
-//    与一组 (channel_name, msg_type_suffix)。`SUFFIX_DEFAULTS` 在 default 缺
-//    typed suffix 时自动补 msg_type，确保 100% typed。
-// 2. env 探测顺序：NUWAX_GEOMETRY_RUNTIME_<X>_CHANNEL > NUWAX_LCM_CHANNEL_<X> >
-//    内置 default。
-// 3. 向后兼容：旧硬编码 `/odom` 等若通过 env 传入（未带 #msg_type）会在
-//    stderr 打一行 deprecation-warning，但不阻断启动；后续会移除。
-// 4. channel 解析与 LCM URL/backend 选择解耦。
-
-/// Phase 4：runtime 与 server.rs 共用的 channel 键枚举。
-///
-/// 每变体对应 `(env_runtime, env_platform, default_channel, default_msg_type)`
-/// 四元组（部分 channel 没有 env_runtime alias，回退到 env_platform + default）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChannelKey {
     Odom,
@@ -107,114 +65,93 @@ impl ChannelKey {
 /// `(env_runtime_key, env_platform_key, default_channel_without_suffix, default_msg_type)`
 ///
 /// `default_msg_type` 在 default_channel 或 env 值缺 `#msg_type` 时自动补。
-const CHANNEL_KEY_TABLE: &[(ChannelKey, &str, &str, &str, &str)] = &[
-    // env_runtime                          env_platform                  default                              msg_type
+const CHANNEL_KEY_TABLE: &[(ChannelKey, &str, &str, &str)] = &[
+    // 配置名、默认话题、消息类型。
     (
         ChannelKey::Odom,
-        "NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL",
         "NUWAX_LCM_CHANNEL_ODOM",
         "/odom",
         "nav_msgs.Odometry",
     ),
     (
         ChannelKey::Tf,
-        "NUWAX_GEOMETRY_RUNTIME_TF_CHANNEL",
         "NUWAX_LCM_CHANNEL_TF",
         "/tf",
         "tf2_msgs.TFMessage",
     ),
     (
         ChannelKey::PointCloud,
-        "NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL",
         "NUWAX_LCM_CHANNEL_POINTCLOUD",
         "/lidar/points",
         "sensor_msgs.PointCloud2",
     ),
     (
         ChannelKey::Imu,
-        "NUWAX_GEOMETRY_RUNTIME_IMU_CHANNEL",
         "NUWAX_LCM_CHANNEL_IMU",
         "/imu/data",
         "sensor_msgs.Imu",
     ),
     (
         ChannelKey::CloudMap,
-        "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL",
         "NUWAX_LCM_CHANNEL_CLOUD_MAP",
         "/cloud_map",
         "sensor_msgs.PointCloud2",
     ),
     (
         ChannelKey::PlanarNavigation,
-        "NUWAX_GEOMETRY_RUNTIME_PLANAR_NAVIGATION_CHANNEL",
         "NUWAX_LCM_CHANNEL_PLANAR_NAVIGATION",
         nuwax_codec::lcm::planar_navigation::DEFAULT_TOPIC,
         nuwax_codec::lcm::planar_navigation::TYPE_NAME,
     ),
     (
         ChannelKey::RecentCloud3D,
-        "", "",
+        "",
         nuwax_codec::lcm::recent_cloud::DEFAULT_TOPIC,
         nuwax_codec::lcm::recent_cloud::TYPE_NAME,
     ),
     (
         ChannelKey::Occupancy,
-        "NUWAX_GEOMETRY_RUNTIME_OCCUPANCY_CHANNEL",
         "NUWAX_LCM_CHANNEL_OCCUPANCY",
         "/map/occupancy",
         "nav_msgs.OccupancyGrid",
     ),
     (
         ChannelKey::CmdVel,
-        "NUWAX_GEOMETRY_RUNTIME_CMD_VEL_CHANNEL",
         "NUWAX_LCM_CHANNEL_CMD_VEL",
         "/cmd_vel",
         "geometry_msgs.Twist",
     ),
     (
         ChannelKey::GoalPose,
-        crate::nav_runtime::GOAL_CHANNEL_RUNTIME,
         crate::nav_runtime::GOAL_CHANNEL_PLATFORM,
         "/nav/goal",
         "nuwax_msgs.GoalEnvelope",
     ),
     (
         ChannelKey::NavState,
-        "NUWAX_GEOMETRY_RUNTIME_NAV_STATE_CHANNEL",
         "NUWAX_LCM_CHANNEL_NAV_STATE",
         "/nav/state",
         "nuwax_msgs.NavigationState",
     ),
     (
         ChannelKey::Frontiers,
-        "NUWAX_GEOMETRY_RUNTIME_FRONTIERS_CHANNEL",
         "NUWAX_LCM_CHANNEL_FRONTIER",
         "/explore/frontiers",
         "nuwax_msgs.FrontierList",
     ),
     (
         ChannelKey::Cancel,
-        "NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL",
         "NUWAX_LCM_CHANNEL_NAV_CANCEL",
         "/nav/cancel",
         "nuwax_msgs.CancelNavigation",
     ),
 ];
 
-/// 按 `ChannelKey` 查表,返回 `(env_runtime, env_platform, default_channel, default_msg_type)`。
-///
-/// rework19 fix(2026-07-09): 旧的 unsafe `&*(row as *const _ as *const (4-tuple))` 错误
-/// — row 是 5 元组 `(ChannelKey, &str, &str, &str, &str)`,cast 写成了 4 元组,
-/// 导致重新解释内存布局时偏移错位 + default_type 落到 ChannelKey/padding 字节,
-/// `*const u8 = 0x0` + `len = 0xaaaa_...` → `format!("/odom#{}")` 内部 alloc 一个
-/// 长度 ~187GB 的 String → `__rust_alloc` 触发 OOM abort。
-///
-/// 修复:直接解构 row,免去 unsafe cast 的偏移错位风险。
+/// 按通道键查表，返回规范配置名、默认话题与消息类型。
 fn lookup(
     key: ChannelKey,
 ) -> (
     ChannelKey,
-    &'static str,
     &'static str,
     &'static str,
     &'static str,
@@ -227,19 +164,11 @@ fn lookup(
     unreachable!("ChannelKey table is exhaustive; key={:?} not found", key)
 }
 
-/// 解析 env：env_runtime > env_platform > default；返回 typed pattern 字符串
-/// （自动补 msg_type）。
+/// 读取规范配置名并补齐消息类型。
 fn resolve_typed(key: ChannelKey) -> String {
-    let (_key, env_runtime, env_platform, default_ch, default_type) = lookup(key);
-    let raw = if !env_runtime.is_empty() {
-        std::env::var(env_runtime).ok()
-    } else {
-        None
-    };
-    let raw = raw
-        .or_else(|| std::env::var(env_platform).ok())
-        .unwrap_or_else(|| default_ch.to_string());
-    ensure_typed_suffix(&raw, default_ch, default_type, env_runtime, env_platform)
+    let (_key, env_key, default_ch, default_type) = lookup(key);
+    let raw = std::env::var(env_key).unwrap_or_else(|_| default_ch.to_string());
+    ensure_typed_suffix(&raw, default_ch, default_type, env_key)
 }
 
 /// 把 `<channel>` 或 `<channel>#<msg_type>` 规范成 `<channel>#<msg_type>`。
@@ -253,8 +182,7 @@ fn ensure_typed_suffix(
     raw: &str,
     default_ch: &str,
     default_type: &str,
-    env_runtime: &str,
-    env_platform: &str,
+    env_key: &str,
 ) -> String {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -269,12 +197,7 @@ fn ensure_typed_suffix(
     if raw != default_ch {
         warn!(
             "{}={} 不含 typed suffix，已自动补 msg_type={}（推荐显式指定 #suffix）",
-            env_platform, raw, default_type
-        );
-    } else if !env_runtime.is_empty() && std::env::var(env_runtime).is_ok() {
-        warn!(
-            "{}={} 缺 typed suffix，已自动补 msg_type={}（请显式指定 #suffix）",
-            env_runtime, raw, default_type
+            env_key, raw, default_type
         );
     }
     format!("{}#{}", raw, default_type)
@@ -367,14 +290,10 @@ impl std::error::Error for StrictChannelEnvError {}
 /// Resolve startup configuration without repairing an explicitly invalid
 /// higher-priority value. Only an absent variable may fall through.
 pub(crate) fn resolve_strict_channel(
-    runtime_alias: &str,
-    platform_alias: &str,
+    env_key: &str,
     default: &str,
 ) -> Result<String, StrictChannelEnvError> {
-    if let Some(value) = strict_env_value(runtime_alias)? {
-        return Ok(value);
-    }
-    if let Some(value) = strict_env_value(platform_alias)? {
+    if let Some(value) = strict_env_value(env_key)? {
         return Ok(value);
     }
     Ok(default.to_string())
@@ -429,10 +348,10 @@ impl ValidatedChannelBindings {
 fn strict_binding_for_key(
     key: ChannelKey,
 ) -> Result<TypedChannelBinding, TypedChannelBindingError> {
-    let (_key, runtime_env, platform_env, default_channel, expected_type) = lookup(key);
+    let (_key, env_key, default_channel, expected_type) = lookup(key);
     let default_pattern = format!("{default_channel}#{expected_type}");
     let raw =
-        resolve_strict_channel(runtime_env, platform_env, &default_pattern).map_err(|error| {
+        resolve_strict_channel(env_key, &default_pattern).map_err(|error| {
             TypedChannelBindingError {
                 key,
                 reason: error.to_string(),
@@ -478,28 +397,14 @@ fn strict_binding_from_pattern(
     })
 }
 
-/// 探测 `runtime-alias → platform-alias → default`,返回第一个非空字符串。
-///
-/// 不校验 channel 是否为合法 LCM typed format;校验由调用方在拿到
-/// `LcmTopic::new` 时完成,以保留 warn 信息(fallback 路径不会因为
-/// `LcmTopic::new` 报错而 panic)。
-pub fn resolve_channel(runtime_alias: &str, platform_alias: &str, default: &str) -> String {
-    if let Ok(value) = std::env::var(runtime_alias) {
+/// 读取规范通道配置，缺省使用现有默认值。
+pub fn resolve_channel(env_key: &str, default: &str) -> String {
+    if let Ok(value) = std::env::var(env_key) {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
         }
-        warn!(
-            "{} 设置为空字符串；回退到 {} / default",
-            runtime_alias, platform_alias
-        );
-    }
-    if let Ok(value) = std::env::var(platform_alias) {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-        warn!("{} 设置为空字符串；回退到 default", platform_alias);
+        warn!("{} 设置为空字符串；回退到 default", env_key);
     }
     default.to_string()
 }
@@ -515,79 +420,23 @@ mod tests {
     fn resolve_channel_uses_default_when_no_env() {
         // 不污染环境:用不可能设置的 env 名
         let got = resolve_channel(
-            "TEST_NUWAX_RUNTIME_NOT_SET",
             "TEST_NUWAX_PLATFORM_NOT_SET",
             "/foo#bar.Baz",
         );
         assert_eq!(got, "/foo#bar.Baz");
     }
 
-    #[test]
-    fn resolve_channel_runtime_wins_over_platform() {
-        // 用临时 env 验证优先级
-        std::env::set_var("TEST_RUNTIME_X", "/rt#x.Rt");
-        std::env::set_var("TEST_PLATFORM_X", "/pf#x.Pf");
-        let got = resolve_channel("TEST_RUNTIME_X", "TEST_PLATFORM_X", "/df#x.Df");
-        assert_eq!(got, "/rt#x.Rt");
-        std::env::remove_var("TEST_RUNTIME_X");
-        std::env::remove_var("TEST_PLATFORM_X");
-    }
 
     #[test]
     fn resolve_channel_platform_used_when_runtime_missing() {
         std::env::remove_var("TEST_RUNTIME_Y");
         std::env::set_var("TEST_PLATFORM_Y", "/pf#y.Pf");
-        let got = resolve_channel("TEST_RUNTIME_Y", "TEST_PLATFORM_Y", "/df#y.Df");
+        let got = resolve_channel("TEST_PLATFORM_Y", "/df#y.Df");
         assert_eq!(got, "/pf#y.Pf");
         std::env::remove_var("TEST_PLATFORM_Y");
     }
 
-    #[test]
-    fn strict_channel_resolution_preserves_valid_precedence_and_default() {
-        const RUNTIME: &str = "TEST_STRICT_CHANNEL_VALID_RUNTIME";
-        const PLATFORM: &str = "TEST_STRICT_CHANNEL_VALID_PLATFORM";
-        std::env::remove_var(RUNTIME);
-        std::env::remove_var(PLATFORM);
 
-        assert_eq!(
-            resolve_strict_channel(RUNTIME, PLATFORM, "/default#pkg.Default")
-                .expect("missing aliases use the default"),
-            "/default#pkg.Default"
-        );
-
-        std::env::set_var(PLATFORM, "/platform#pkg.Platform");
-        assert_eq!(
-            resolve_strict_channel(RUNTIME, PLATFORM, "/default#pkg.Default")
-                .expect("a valid platform alias is accepted"),
-            "/platform#pkg.Platform"
-        );
-
-        std::env::set_var(RUNTIME, "/runtime#pkg.Runtime");
-        std::env::set_var(PLATFORM, " ");
-        assert_eq!(
-            resolve_strict_channel(RUNTIME, PLATFORM, "/default#pkg.Default")
-                .expect("a valid runtime alias wins without reading platform"),
-            "/runtime#pkg.Runtime"
-        );
-
-        std::env::remove_var(RUNTIME);
-        std::env::remove_var(PLATFORM);
-    }
-
-    #[test]
-    fn strict_channel_resolution_rejects_whitespace_runtime_before_platform() {
-        const RUNTIME: &str = "TEST_STRICT_CHANNEL_EMPTY_RUNTIME";
-        const PLATFORM: &str = "TEST_STRICT_CHANNEL_EMPTY_RUNTIME_PLATFORM";
-        std::env::set_var(RUNTIME, " \t\n");
-        std::env::set_var(PLATFORM, "/platform#pkg.Platform");
-
-        let error = resolve_strict_channel(RUNTIME, PLATFORM, "/default#pkg.Default")
-            .expect_err("an explicit empty runtime alias must not fall through");
-        assert_eq!(error.to_string(), format!("env={RUNTIME} value_is_empty"));
-
-        std::env::remove_var(RUNTIME);
-        std::env::remove_var(PLATFORM);
-    }
 
     #[test]
     fn strict_channel_resolution_rejects_whitespace_platform() {
@@ -596,31 +445,13 @@ mod tests {
         std::env::remove_var(RUNTIME);
         std::env::set_var(PLATFORM, " \t\n");
 
-        let error = resolve_strict_channel(RUNTIME, PLATFORM, "/default#pkg.Default")
+        let error = resolve_strict_channel(PLATFORM, "/default#pkg.Default")
             .expect_err("an explicit empty platform alias must not fall through");
         assert_eq!(error.to_string(), format!("env={PLATFORM} value_is_empty"));
 
         std::env::remove_var(PLATFORM);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn strict_channel_resolution_rejects_non_unicode_runtime_before_platform() {
-        const RUNTIME: &str = "TEST_STRICT_CHANNEL_NON_UNICODE_RUNTIME";
-        const PLATFORM: &str = "TEST_STRICT_CHANNEL_NON_UNICODE_RUNTIME_PLATFORM";
-        std::env::set_var(RUNTIME, OsString::from_vec(vec![0xff]));
-        std::env::set_var(PLATFORM, "/platform#pkg.Platform");
-
-        let error = resolve_strict_channel(RUNTIME, PLATFORM, "/default#pkg.Default")
-            .expect_err("a non-Unicode runtime alias must not fall through");
-        assert_eq!(
-            error.to_string(),
-            format!("env={RUNTIME} value_is_not_unicode")
-        );
-
-        std::env::remove_var(RUNTIME);
-        std::env::remove_var(PLATFORM);
-    }
 
     #[cfg(unix)]
     #[test]
@@ -630,7 +461,7 @@ mod tests {
         std::env::remove_var(RUNTIME);
         std::env::set_var(PLATFORM, OsString::from_vec(vec![0xff]));
 
-        let error = resolve_strict_channel(RUNTIME, PLATFORM, "/default#pkg.Default")
+        let error = resolve_strict_channel(PLATFORM, "/default#pkg.Default")
             .expect_err("a non-Unicode platform alias must not fall through");
         assert_eq!(
             error.to_string(),
@@ -642,13 +473,11 @@ mod tests {
 
     #[test]
     fn raw_pointcloud_and_cloud_map_have_distinct_contracts() {
-        let (_, raw_runtime, raw_platform, raw_default, raw_type) = lookup(ChannelKey::PointCloud);
-        let (_, map_runtime, map_platform, map_default, map_type) = lookup(ChannelKey::CloudMap);
+        let (_, raw_platform, raw_default, raw_type) = lookup(ChannelKey::PointCloud);
+        let (_, map_platform, map_default, map_type) = lookup(ChannelKey::CloudMap);
 
-        assert_eq!(raw_runtime, "NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL");
         assert_eq!(raw_platform, "NUWAX_LCM_CHANNEL_POINTCLOUD");
         assert_eq!(raw_default, "/lidar/points");
-        assert_eq!(map_runtime, "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL");
         assert_eq!(map_platform, "NUWAX_LCM_CHANNEL_CLOUD_MAP");
         assert_eq!(map_default, "/cloud_map");
         assert_eq!(raw_type, "sensor_msgs.PointCloud2");
@@ -658,7 +487,7 @@ mod tests {
     #[test]
     fn every_registry_default_is_a_strict_typed_binding() {
         for key in ChannelKey::ALL {
-            let (_, _, _, default_channel, expected_type) = lookup(key);
+            let (_, _, default_channel, expected_type) = lookup(key);
             let pattern = format!("{default_channel}#{expected_type}");
             let binding = strict_binding_from_pattern(key, &pattern, expected_type)
                 .expect("registry default must validate");
@@ -669,7 +498,7 @@ mod tests {
     #[test]
     fn every_registry_key_rejects_missing_or_wrong_type_suffixes() {
         for key in ChannelKey::ALL {
-            let (_, _, _, default_channel, expected_type) = lookup(key);
+            let (_, _, default_channel, expected_type) = lookup(key);
             let missing = strict_binding_from_pattern(key, default_channel, expected_type)
                 .expect_err("explicit untyped channel must fail preflight");
             assert!(missing.reason.contains("missing typed message suffix"));
@@ -694,8 +523,7 @@ mod tests {
 
     #[test]
     fn goal_pose_registry_is_the_versioned_goal_envelope_contract() {
-        let (_, runtime, platform, default_channel, expected_type) = lookup(ChannelKey::GoalPose);
-        assert_eq!(runtime, crate::nav_runtime::GOAL_CHANNEL_RUNTIME);
+        let (_, platform, default_channel, expected_type) = lookup(ChannelKey::GoalPose);
         assert_eq!(platform, crate::nav_runtime::GOAL_CHANNEL_PLATFORM);
         assert_eq!(
             format!("{default_channel}#{expected_type}"),
@@ -707,7 +535,7 @@ mod tests {
         assert_eq!(keys.len(), ChannelKey::ALL.len());
         for key in ChannelKey::ALL {
             assert!(keys.contains(&key), "每个生产通道必须出现在唯一表中：{key:?}");
-            let (_, _, _, channel, message_type) = lookup(key);
+            let (_, _, channel, message_type) = lookup(key);
             strict_binding_from_pattern(key, &format!("{channel}#{message_type}"), message_type)
                 .expect("生产默认通道必须具备正确消息类型");
         }

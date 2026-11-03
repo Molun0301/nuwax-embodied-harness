@@ -3,7 +3,7 @@ from __future__ import annotations
 
 
 MODEL_SETTINGS = {"NUWAX_PERCEPTION_YOLO_WORLD_MODEL", "NUWAX_MEMORY_TEXT_EMBEDDING_MODEL",
-                  "NUWAX_MEMORY_IMAGE_EMBEDDING_MODEL", "NUWAX_MEMORY_EMBEDDING_MODEL"}
+                  "NUWAX_MEMORY_IMAGE_EMBEDDING_MODEL"}
 
 
 def uses_default_model(value):

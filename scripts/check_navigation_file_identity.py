@@ -42,7 +42,7 @@ def checkpoint(identity='exploration-synthetic'):
     return ExplorationCheckpoint(checkpoint_id=identity, pipeline='lio_3d',
         request=ExploreAreaRequest(request_id='source-request', map_name='合成地图'),
         asset_identity=AssetIdentityV2(asset_id='d'*32), mapping_checkpoint_id='a'*32,
-        geometry_progress_json=json.dumps({'schema_version': 1, 'map_name': '合成地图',
+        geometry_progress_json=json.dumps({'schema_version': 2, 'map_name': '合成地图',
             'request_id': 'source-request', 'map_frame_id': 'map',
             'origin_session_id':'source','origin_session_generation':3,'origin_frame_generation':1,
             'configuration_sha256': [0] * 32, 'navigation_configuration_sha256': [1] * 32}))
@@ -224,22 +224,6 @@ class FileIdentityChecks(unittest.TestCase):
                 checkpoint_gateway.save_after_stop(runtime, context, request)
             runtime.task_manager.update_task_metadata.assert_not_called()
 
-    def test_pause_v1_preserves_and_compares_only_opaque_legacy_digest_values(self):
-        native = json.loads(native_v2_progress())
-        native['schema_version'] = 1
-        del native['configuration'], native['navigation_configuration']
-        native['configuration_sha256'] = [37] * 32
-        native['navigation_configuration_sha256'] = [91] * 32
-        progress = json.dumps(native, indent=2)
-        runtime, context, request = self.pause_runtime(progress, progress, 'pause-native-v1')
-        with patch.object(checkpoint_gateway, 'store', return_value=self.checkpoints):
-            checkpoint_gateway.save_after_stop(runtime, context, request)
-        self.assertEqual(self.checkpoints.load('pause-native-v1').geometry_progress_json, progress)
-        native['navigation_configuration_sha256'] = [92] * 32
-        runtime, context, request = self.pause_runtime(progress, json.dumps(native), 'pause-changed-v1')
-        with patch.object(checkpoint_gateway, 'store', return_value=self.checkpoints), self.assertRaises(ValueError):
-            checkpoint_gateway.save_after_stop(runtime, context, request)
-        runtime.task_manager.update_task_metadata.assert_not_called()
 
     def test_warm_and_fresh_store_gets_and_misses_never_scan(self):
         self.buildings.save(topology('old')); self.checkpoints.save(checkpoint('old'))

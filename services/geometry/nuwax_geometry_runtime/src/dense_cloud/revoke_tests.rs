@@ -1,5 +1,5 @@
 use super::*;
-use crate::{dynamic_backend::{self, Backend}, mapping_commit::MappingCommitId};
+use crate::{dynamic_backend, mapping_commit::MappingCommitId};
 use nalgebra::Isometry3;
 
 fn receipt(revision: u64) -> CloudCommitReceipt {
@@ -14,7 +14,6 @@ fn key(point: &Point3<f64>) -> Key { crate::pointcloud::voxel_key([point.x, poin
 
 #[test]
 fn voxel_revoke_only_reads_related_key_and_coordinate_pages_at_archive_scale() {
-    let _backend = dynamic_backend::test_backend(Backend::DufoMap);
     for page_count in [4, 256, 1024] {
         let mut cloud = DenseCloud::new().unwrap();
         for page in 0..page_count {
@@ -55,7 +54,6 @@ fn voxel_revoke_only_reads_related_key_and_coordinate_pages_at_archive_scale() {
 
 #[test]
 fn same_block_unrelated_keys_are_rejected_by_existing_filters_without_disk_reads() {
-    let _backend = dynamic_backend::test_backend(Backend::DufoMap);
     for page_count in [4, 256, 1024] {
         let mut cloud = DenseCloud::new().unwrap();
         let points = vec![Point3::new(0.025, 0.025, 0.325); PAGE_POINTS];
@@ -76,7 +74,6 @@ fn same_block_unrelated_keys_are_rejected_by_existing_filters_without_disk_reads
 
 #[test]
 fn original_directory_budget_compacts_conservatively_and_keeps_remote_queries_local() {
-    let _backend = dynamic_backend::test_backend(Backend::DufoMap);
     let mut cloud = DenseCloud::new().unwrap();
     let points = (0..MAX_INDEX_ENTRIES + 3).map(|i| Point3::new(i as f64 * 3.2 + 0.025, 0.025, 0.025)).collect::<Vec<_>>();
     cloud.append(&points[..MAX_INDEX_ENTRIES]).unwrap();
@@ -100,7 +97,6 @@ fn original_directory_budget_compacts_conservatively_and_keeps_remote_queries_lo
 
 #[test]
 fn voxel_follow_preserves_original_bits_order_duplicates_and_restored_snapshots() {
-    let _backend = dynamic_backend::test_backend(Backend::DufoMap);
     let transform = Isometry3::new(nalgebra::Vector3::new(-4.2, 3.1, -0.7), nalgebra::Vector3::new(0.2, -0.4, 0.8));
     let points: Vec<_> = (-9..10).flat_map(|ix| (-9..10).flat_map(move |iy| (-3..4).map(move |iz|
         transform * Point3::new(ix as f64 * 0.05 + 0.017, iy as f64 * 0.05 + 0.013, iz as f64 * 0.15 + 0.021))))
@@ -125,7 +121,6 @@ fn voxel_follow_preserves_original_bits_order_duplicates_and_restored_snapshots(
 
 #[test]
 fn key_audit_preserves_pre_f32_keys_and_invisible_source_records() {
-    let _backend = dynamic_backend::test_backend(Backend::DufoMap);
     let boundary = f64::from(0.05_f32) * 40.0;
     let points = [Point3::new(boundary - 1e-10, -0.025, 0.025), Point3::new(boundary + 1e-10, -0.025, 0.025)];
     assert_eq!(bytes(&points[..1]), bytes(&points[1..]));

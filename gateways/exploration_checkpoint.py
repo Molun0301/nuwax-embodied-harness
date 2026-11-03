@@ -44,8 +44,6 @@ def save_after_stop(runtime, context, request):
     except FileNotFoundError:
         retained = None
     if retained is not None:
-        if retained.schema_version != 2:
-            raise ValueError("旧暂停检查点只支持读取，不能重新保存为当前记录")
         if (retained.pipeline != runtime.config.geometry.pipeline or retained.request != frozen
                 or retained.geometry_progress_json != payload):
             raise ValueError("原暂停检查点的请求或进度已改变，不能重写")
@@ -61,7 +59,7 @@ def save_after_stop(runtime, context, request):
         raise ValueError("探索已停稳，但本次完整地图保存未成功，不能发布检查点")
     after = json.loads(runtime.platform_geometry_runtime.get_exploration_progress(request.request_id))
     version = before.get("schema_version")
-    if type(version) is not int or version not in (1, 2) or type(after.get("schema_version")) is not int:
+    if type(version) is not int or version != 2 or type(after.get("schema_version")) is not int:
         raise ValueError("探索进度版本无效，检查点未发布")
     identity = ("schema_version", "request_id", "map_name", "map_frame_id", "origin_session_id", "origin_session_generation", "origin_frame_generation")
     # 新进度比较实际配置；第一版源进度只保留原始元数据。
@@ -91,8 +89,6 @@ def prepare_resume(runtime, context, request, checkpoint_id, requested_by):
     saved = catalog.load(checkpoint_id, validate_asset=False)
     if saved.pipeline != runtime.config.geometry.pipeline or saved.request.map_name != request.map_name or saved.geometry_progress_json != request.resume_progress_json:
         raise ValueError("探索恢复请求与检查点或当前链路不一致")
-    if saved.schema_version != 2:
-        raise ValueError("旧探索检查点依赖已退役的摘要身份，不能自动恢复；请重新开始探索")
     if saved.pipeline == "slam_2d" and saved.localization_seed is None:
         raise ValueError("二维探索检查点缺少实际定位初始提示")
     snapshot = catalog.validate_asset(saved)

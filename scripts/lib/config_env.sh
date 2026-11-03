@@ -36,7 +36,6 @@ load_platform_config() {
   done < <(python3 "${_NUWAX_CONFIG_VALUES_SCRIPT}" --merged)
   [[ "${loaded}" == "1" ]] || return 1
   export _NUWAX_CONFIG_FILE_KEYS="${file_keys}"
-  normalize_config_aliases
 }
 
 load_env_file() {
@@ -53,12 +52,4 @@ load_env_file() {
       export "${key}=${value}"
     fi
   done < <(python3 "${_NUWAX_CONFIG_VALUES_SCRIPT}" "${target}")
-}
-
-normalize_config_aliases() {
-  local key="" value=""
-  while IFS= read -r -d '' key && IFS= read -r -d '' value; do
-    export "${key}=${value}"
-    export _NUWAX_CONFIG_FILE_KEYS="${_NUWAX_CONFIG_FILE_KEYS:-}${key}:"
-  done < <(python3 "${_NUWAX_CONFIG_VALUES_SCRIPT}" --aliases)
 }

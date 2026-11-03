@@ -232,18 +232,9 @@ impl Drop for StartMappingRpcWaiter {
 
 
 fn configured_base_frame() -> String {
-    resolve_base_frame_alias(
-        std::env::var("NUWAX_BASE_FRAME").ok().as_deref(),
-        std::env::var("NUWAX_GEOMETRY_BASE_FRAME").ok().as_deref(),
-    )
-}
-
-fn resolve_base_frame_alias(preferred: Option<&str>, legacy: Option<&str>) -> String {
-    preferred
-        .and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()))
-        .or_else(|| {
-            legacy.and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()))
-        })
+    std::env::var("NUWAX_BASE_FRAME").ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string())
         .unwrap_or_else(|| "base_link".to_string())
 }
 
@@ -4776,8 +4767,8 @@ impl GeometryRuntime for GeometryRuntimeService {
     // 删除 Phase 3 的 "UNIMPLEMENTED" placeholder 注释 —— readiness 与状态机
     // 都在 nav_runtime.rs 内真实执行(`set_goal` / `cancel`)。
     //
-    // Phase 7:`SetNavigationGoal` 在 real production profile 且 cmd_vel_sink=false
-    // 时被 nav_runtime::set_goal 拒绝;readiness 全量字段由
+    // 速度接收端未就绪时，生产配置的导航目标由原生运行时拒绝。
+    // 就绪字段由下列模块提供：
     // `mapping_adapter::MappingReadiness` / `nav_runtime::NavigationReadinessDetail`
     // / `explore_runtime::ExplorationReadinessDetail` 暴露,见
     // `docs/.../11_readiness_收敛.md`。
@@ -5435,7 +5426,7 @@ impl GeometryRuntime for GeometryRuntimeService {
     // ========================================================================
     //
     // Python `LcmMotionCommandBridge` 在 start/stop 时通过本 RPC 把 sink ready
-    // 状态推到 Rust handle。`compute_readiness` 的 cmd_vel_sink 子项读这个 flag;
+    // 状态写入原生运行句柄，就绪计算读取速度接收端的实际状态。
     // 之前 spawn 默认 false + 跨进程无通道 → readiness 永远 false → 真实
     // production 路径走不通。
     async fn set_cmd_vel_sink_ready(
@@ -6035,18 +6026,6 @@ mod health_identity_tests {
 mod base_frame_config_tests {
     use super::*;
 
-    #[test]
-    fn canonical_base_frame_value_precedes_legacy_alias() {
-        assert_eq!(
-            resolve_base_frame_alias(Some(" body "), Some("base_footprint")),
-            "body"
-        );
-        assert_eq!(
-            resolve_base_frame_alias(Some(" "), Some(" base_footprint ")),
-            "base_footprint"
-        );
-        assert_eq!(resolve_base_frame_alias(None, None), "base_link");
-    }
 }
 
 #[cfg(test)]
@@ -11964,7 +11943,7 @@ use nuwax_protocol::RawLcmFrame;
             let mut trace = Vec::new();
             // 未知人体离开后，继续真实空场观测直到命中退出滑动窗口，并覆盖三种扫描相位。
             let last_frame = if initially_unknown_person
-                && crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::DufoMap
+
             {
                 22.max(12 + u64::from(crate::dynamic_backend::online_params().sliding_window_size) + 3)
             } else {

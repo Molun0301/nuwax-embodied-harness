@@ -26,11 +26,6 @@ pub(crate) struct ExplorationCheckpoint {
     pub configuration: Option<ExplorationConfiguration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub navigation_configuration: Option<NavigationConfiguration>,
-    /// V1 values are opaque read-compatible metadata, never recomputed or used as proof.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub configuration_sha256: Option<[u8; 32]>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub navigation_configuration_sha256: Option<[u8; 32]>,
     pub elapsed_ns: u64,
     pub reached_goals: u32,
     pub mission: Option<nuwax_exploration::mission::MissionProgress>,
@@ -44,7 +39,7 @@ impl ExplorationCheckpoint {
         }
         let value: Self =
             serde_json::from_str(payload).map_err(|e| format!("探索进度载荷无效：{e}"))?;
-        if !matches!(value.schema_version, 1 | 2)
+        if value.schema_version != 2
             || value.map_name.trim().is_empty()
             || value.map_name.len() > 1024
             || value.map_frame_id.trim().is_empty()
@@ -70,9 +65,6 @@ impl ExplorationCheckpoint {
                 configuration.validate()?;
                 navigation.validate()?;
             }
-            (None, None) if value.schema_version == 1
-                && value.configuration_sha256.is_some()
-                && value.navigation_configuration_sha256.is_some() => {}
             _ => return Err("探索进度缺少完整的实际配置".into()),
         }
         if let Some(mission) = value.mission.as_ref() {
@@ -202,27 +194,20 @@ impl NavigationConfiguration {
 }
 
 impl ExplorationCheckpoint {
-    /// Home and measured distance are facts; the old decision to return is not.
-    pub fn prepare_history_for_replan(&mut self) {
-        if let Some(mission) = self.mission.as_mut() { mission.returning = false; }
-        self.return_reason = None;
-    }
-
-    /// True means history-only legacy resume, not proof of the original configuration.
-    pub fn resume_requires_replan(
+    /// 恢复时比较保存的实际配置。
+    pub fn validate_resume_configuration(
         &self,
         configuration: &ExplorationConfiguration,
         navigation: &NavigationConfiguration,
-    ) -> Result<bool, String> {
+    ) -> Result<(), String> {
         match (&self.configuration, &self.navigation_configuration) {
             (Some(saved), Some(saved_navigation)) => {
                 let mut changed = saved.changed_fields(configuration);
                 changed.extend(saved_navigation.changed_fields(navigation));
-                if changed.is_empty() { Ok(false) } else {
+                if changed.is_empty() { Ok(()) } else {
                     Err(format!("探索进度配置发生变化：{}", changed.join(", ")))
                 }
             }
-            (None, None) if self.schema_version == 1 => Ok(true),
             _ => Err("探索进度缺少完整的实际配置".into()),
         }
     }
@@ -508,7 +493,6 @@ pub(crate) mod tests {
             origin_session_id: "session".into(), origin_session_generation: 1, origin_frame_generation: 1,
             configuration: Some(ExplorationConfiguration::capture(&ExploreStartConfig::default(), false)),
             navigation_configuration: Some(navigation_configuration()),
-            configuration_sha256: None, navigation_configuration_sha256: None,
             elapsed_ns: 27, reached_goals: 2, mission: None, return_reason: None,
             sources: vec![nuwax_exploration::mission::SourceCheckpoint { name: "wavefront".into(), payload: "opaque-source".into() }],
         }
@@ -520,16 +504,16 @@ pub(crate) mod tests {
         assert!(!payload.contains("sha256"));
         let parsed = ExplorationCheckpoint::parse(&payload).unwrap();
         assert_eq!(parsed.schema_version, 2);
-        assert!(!parsed.resume_requires_replan(saved.configuration.as_ref().unwrap(), saved.navigation_configuration.as_ref().unwrap()).unwrap());
+        parsed.validate_resume_configuration(saved.configuration.as_ref().unwrap(), saved.navigation_configuration.as_ref().unwrap()).unwrap();
         let mut config = saved.configuration.clone().unwrap();
         config.max_navigation_retries += 1;
-        assert!(parsed.resume_requires_replan(&config, saved.navigation_configuration.as_ref().unwrap()).unwrap_err().contains("configuration.max_navigation_retries"));
+        assert!(parsed.validate_resume_configuration(&config, saved.navigation_configuration.as_ref().unwrap()).unwrap_err().contains("configuration.max_navigation_retries"));
         config = saved.configuration.clone().unwrap();
         config.stop_conditions.max_goals = Some(5);
-        assert!(parsed.resume_requires_replan(&config, saved.navigation_configuration.as_ref().unwrap()).unwrap_err().contains("configuration.stop_conditions.max_goals"));
+        assert!(parsed.validate_resume_configuration(&config, saved.navigation_configuration.as_ref().unwrap()).unwrap_err().contains("configuration.stop_conditions.max_goals"));
         let mut navigation = saved.navigation_configuration.clone().unwrap();
         navigation.body_to_support_z_m = Some(0.45);
-        assert!(parsed.resume_requires_replan(saved.configuration.as_ref().unwrap(), &navigation).unwrap_err().contains("navigation_configuration.body_to_support_z_m"));
+        assert!(parsed.validate_resume_configuration(saved.configuration.as_ref().unwrap(), &navigation).unwrap_err().contains("navigation_configuration.body_to_support_z_m"));
     }
     #[test]
     fn checkpoint_v2_compares_values_even_when_calibration_id_is_unchanged() {
@@ -548,50 +532,7 @@ pub(crate) mod tests {
         let parsed = ExplorationCheckpoint::parse(&payload).unwrap();
         let mut current = parsed.navigation_configuration.clone().unwrap();
         current.capabilities.as_mut().unwrap().motion.max_forward_mps = 0.6;
-        assert!(parsed.resume_requires_replan(parsed.configuration.as_ref().unwrap(), &current).unwrap_err().contains("navigation_configuration.capabilities"));
-    }
-    #[test]
-    fn checkpoint_legacy_metadata_is_opaque_and_settings_if_present_are_compared() {
-        let mut legacy = checkpoint();
-        let configuration = legacy.configuration.take().unwrap();
-        let navigation = legacy.navigation_configuration.take().unwrap();
-        legacy.schema_version = 1;
-        legacy.configuration_sha256 = Some([0x37; 32]);
-        legacy.navigation_configuration_sha256 = Some([0x91; 32]);
-        let payload = serde_json::to_string(&legacy).unwrap();
-        let parsed = ExplorationCheckpoint::parse(&payload).unwrap();
-        assert_eq!(serde_json::to_string(&parsed).unwrap(), payload);
-        assert!(parsed.resume_requires_replan(&configuration, &navigation).unwrap());
-        legacy.configuration = Some(configuration.clone());
-        legacy.navigation_configuration = Some(navigation.clone());
-        let parsed = ExplorationCheckpoint::parse(&serde_json::to_string(&legacy).unwrap()).unwrap();
-        assert!(!parsed.resume_requires_replan(&configuration, &navigation).unwrap());
-        let mut changed = configuration;
-        changed.blacklist_radius_m += 0.5;
-        assert!(parsed.resume_requires_replan(&changed, &navigation).is_err());
-    }
-    #[test]
-    fn checkpoint_legacy_replan_retains_home_and_distance_for_current_return_budget() {
-        let mut saved = checkpoint();
-        let mut mission = nuwax_exploration::mission::MissionProgress::new(MissionPose {
-            position: [12.5, -3.25, 2.0], orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
-        }).unwrap();
-        mission.travelled_m = 9.0;
-        mission.returning = true;
-        saved.mission = Some(mission.clone());
-        saved.return_reason = Some(nuwax_exploration::ExplorationStopReason::DistanceBudgetReached);
-        saved.prepare_history_for_replan();
-        let restored = saved.mission.unwrap();
-        assert_eq!(restored.home, mission.home);
-        assert_eq!(restored.travelled_m, 9.0);
-        assert!(!restored.returning);
-        assert_eq!(saved.return_reason, None);
-        let current_policy = nuwax_exploration::mission::ReturnPolicy {
-            maximum_distance_m: Some(10.0), reserve_distance_m: 0.0, return_on_completion: true,
-        };
-        // The runtime checks the candidate route budget before dispatching a new goal.
-        assert!(current_policy.should_return(restored.travelled_m, 2.0).unwrap());
-        assert!(!current_policy.can_visit(restored.travelled_m, 0.5, 2.0));
+        assert!(parsed.validate_resume_configuration(parsed.configuration.as_ref().unwrap(), &current).unwrap_err().contains("navigation_configuration.capabilities"));
     }
     #[test]
     fn checkpoint_v2_rejects_incomplete_or_invalid_actual_settings() {

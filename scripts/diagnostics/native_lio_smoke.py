@@ -264,7 +264,6 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
     world_from_body = np.asarray([[c, 0, s], [0, 1, 0], [-s, 0, c]])
     acceleration_sensor = tuple(body_from_sensor_rotation.T @ world_from_body.T @ np.asarray([0, 0, 9.81]))
     os.environ.update({
-        "NUWAX_GEOMETRY_RELEASE_MANIFEST": "",
         "NUWAX_GEOMETRY_RUNTIME_BINARY": str(runtime_binary),
         "NUWAX_GEOMETRY_RUNTIME_READY_FILE": str(ready),
         "NUWAX_GEOMETRY_RUNTIME_PORT": str(port),
@@ -275,7 +274,7 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
         "NUWAX_GEOMETRY_IMU_FRAME": "synthetic_lidar",
         "NUWAX_BASE_FRAME": "synthetic_body",
         "NUWAX_MAP_FRAME": "map",
-        "NUWAX_GEOMETRY_MAP_FRAME": "map",
+        "NUWAX_MAP_FRAME": "map",
         "NUWAX_GEOMETRY_ODOM_FRAME": "odom",
         "NUWAX_GEOMETRY_MAPPING_BACKEND": "voxel",
         "NUWAX_GEOMETRY_CORRECTION_BACKEND": correction_backend,

@@ -2,41 +2,16 @@
 use ahash::{AHashMap, AHashSet};
 use nalgebra::{Isometry3, Point3};
 use nuwax_dufomap_native::{DufoMap, Params};
-use std::sync::OnceLock;
 
 #[path = "pgo_free_evidence.rs"]
 pub(crate) mod free_evidence;
 
 pub(crate) const BACKEND_VAR: &str = "NUWAX_GEOMETRY_DYNAMIC_BACKEND";
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Backend {
-    DufoMap,
-    Legacy,
-}
-static CONFIGURED: OnceLock<Backend> = OnceLock::new();
-pub(crate) fn parse_backend(value: Option<&str>) -> Result<Backend, String> {
+pub(crate) fn parse_backend(value: Option<&str>) -> Result<(), String> {
     match value.map(str::trim).filter(|v| !v.is_empty()) {
-        None | Some("dufomap") => Ok(Backend::DufoMap),
-        Some("legacy") => Ok(Backend::Legacy),
-        Some(value) => Err(format!(
-            "{BACKEND_VAR} 取值非法：{value:?}，应为 dufomap 或 legacy"
-        )),
+        None | Some("dufomap") => Ok(()),
+        Some(value) => Err(format!("{BACKEND_VAR} 取值非法：{value:?}，应为 dufomap")),
     }
-}
-pub(crate) fn configure(backend: Backend) -> Result<(), String> {
-    CONFIGURED
-        .set(backend)
-        .map_err(|_| "在线去动态后端已经配置".into())
-}
-pub(crate) fn backend() -> Backend {
-    #[cfg(test)]
-    if let Some(value) = TEST_BACKEND.with(|slot| slot.get()) {
-        return value;
-    }
-    // 测试以进程环境选择整套后端，生产启动只解析一次。
-    CONFIGURED.get().copied().unwrap_or_else(|| {
-        parse_backend(std::env::var(BACKEND_VAR).ok().as_deref()).expect("在线去动态后端非法")
-    })
 }
 pub(crate) fn online_params() -> Params {
     Params {
@@ -102,10 +77,9 @@ impl OnlineDufo {
             None => vec![false; xyz.len()],
         };
         let mut frame = MappedFrame::unfiltered();
-        if let MappedFrame::Dufo(frame) = &mut frame {
-            frame.dynamic_points = corrected_points.iter().zip(flags).filter_map(|(p, flag)|
-                flag.then_some([p.x.to_bits(), p.y.to_bits(), p.z.to_bits()])).collect();
-        }
+        let MappedFrame::Dufo(dufo) = &mut frame;
+        dufo.dynamic_points = corrected_points.iter().zip(flags).filter_map(|(p, flag)|
+            flag.then_some([p.x.to_bits(), p.y.to_bits(), p.z.to_bits()])).collect();
         Ok(frame)
     }
     #[cfg(test)]
@@ -164,13 +138,7 @@ impl OnlineDufo {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum MappedFrame {
-    Legacy(crate::dynamic_scene::MappedFrameDecision),
     Dufo(DufoFrame),
-}
-impl From<crate::dynamic_scene::MappedFrameDecision> for MappedFrame {
-    fn from(value: crate::dynamic_scene::MappedFrameDecision) -> Self {
-        Self::Legacy(value)
-    }
 }
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DufoFrame {
@@ -180,13 +148,8 @@ pub(crate) struct DufoFrame {
     dynamic_points: AHashSet<[u64; 3]>,
 }
 impl MappedFrame {
-    pub(crate) fn is_dufo(&self) -> bool {
-        matches!(self, Self::Dufo(_))
-    }
     pub(crate) fn clear_bounds(&self) -> Option<([f64; 3], [f64; 3])> {
-        let Self::Dufo(frame) = self else {
-            return None;
-        };
+        let Self::Dufo(frame) = self;
         if frame.free.is_empty() {
             return None;
         }
@@ -214,7 +177,7 @@ impl MappedFrame {
     pub(crate) fn clear_regions(
         &self,
     ) -> Option<impl Iterator<Item = ([f64; 3], [f64; 3])> + '_> {
-        let Self::Dufo(frame) = self else { return None; };
+        let Self::Dufo(frame) = self;
         let transform = frame.evidence_from_map.inverse();
         Some(frame.free.keys().map(move |&(key, depth)| {
             let step = f64::from(1u32 << depth) * frame.resolution;
@@ -270,7 +233,7 @@ impl MappedFrame {
 
     #[cfg(test)]
     pub(crate) fn free_cell_count(&self) -> usize {
-        match self { Self::Dufo(frame) => frame.free.len(), Self::Legacy(_) => 0 }
+        match self { Self::Dufo(frame) => frame.free.len() }
     }
     pub(crate) fn unfiltered() -> Self {
         Self::Dufo(DufoFrame {
@@ -280,46 +243,35 @@ impl MappedFrame {
             dynamic_points: AHashSet::new(),
         })
     }
-    pub(crate) fn new(
-        decision: std::sync::Arc<crate::dynamic_scene::FrameDecision>,
-        transform: Isometry3<f64>,
-        points: &[Point3<f64>],
-        first: usize,
-    ) -> Result<Self, String> {
-        crate::dynamic_scene::MappedFrameDecision::new(decision, transform, points, first)
-            .map(Self::Legacy)
-    }
     pub(crate) fn bind_points(&mut self, points: &[Point3<f64>], static_indices: &[u32]) {
-        if let Self::Dufo(frame) = self {
-            let keep: AHashSet<_> = static_indices.iter().copied().collect();
-            frame.dynamic_points = points
-                .iter()
-                .enumerate()
-                .filter_map(|(i, p)| {
-                    (!keep.contains(&(i as u32))).then_some([
-                        p.x.to_bits(),
-                        p.y.to_bits(),
-                        p.z.to_bits(),
-                    ])
-                })
-                .collect();
-        }
+        let Self::Dufo(frame) = self;
+        let keep: AHashSet<_> = static_indices.iter().copied().collect();
+        frame.dynamic_points = points
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| {
+                (!keep.contains(&(i as u32))).then_some([
+                    p.x.to_bits(),
+                    p.y.to_bits(),
+                    p.z.to_bits(),
+                ])
+            })
+            .collect();
+
     }
+
     pub(crate) fn is_dynamic(&self, p: [f64; 3]) -> bool {
         match self {
-            Self::Legacy(f) => f.is_dynamic(p),
             Self::Dufo(f) => f.dynamic_points.contains(&p.map(f64::to_bits)),
         }
     }
     pub(crate) fn has_clears(&self) -> bool {
         match self {
-            Self::Legacy(f) => f.has_clears(),
             Self::Dufo(f) => !f.free.is_empty(),
         }
     }
     pub(crate) fn clears(&self, p: [f64; 3]) -> bool {
         match self {
-            Self::Legacy(f) => f.clears(p),
             Self::Dufo(f) => {
                 let p = f.evidence_from_map * Point3::from(p);
                 let key =
@@ -340,7 +292,6 @@ impl MappedFrame {
         #[cfg(test)]
         if reference_revoke() { return self.potential_window_clear_cells_reference(cells); }
         match self {
-            Self::Legacy(frame) => frame.potential_window_clear_cells(cells),
             Self::Dufo(_) => self.candidate_grid_keys(crate::dynamic_scene::CELL_SIZE,
                 |key| cells.contains_key(&key)),
         }
@@ -351,7 +302,6 @@ impl MappedFrame {
         cells: &AHashMap<crate::dynamic_scene::Cell, u32>,
     ) -> Option<AHashSet<crate::dynamic_scene::Cell>> {
         match self {
-            Self::Legacy(f) => f.potential_window_clear_cells(cells),
             // 先按现有有界窗口格筛候选，具体点仍由 clears 判断。
             Self::Dufo(f) => {
                 let mut candidates = AHashSet::new();
@@ -393,11 +343,6 @@ impl MappedFrame {
     }
     pub(crate) fn encode(&self) -> Result<Vec<u8>, String> {
         match self {
-            Self::Legacy(f) => {
-                let mut bytes = vec![0];
-                bytes.extend(f.encode()?);
-                Ok(bytes)
-            }
             Self::Dufo(f) => {
                 let pose: [f64; 16] = f
                     .evidence_from_map
@@ -421,9 +366,6 @@ impl MappedFrame {
     }
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, String> {
         match bytes.split_first() {
-            Some((0, body)) => {
-                crate::dynamic_scene::MappedFrameDecision::decode(body).map(Self::Legacy)
-            }
             Some((1, body)) => {
                 let (resolution, m, free, points): (
                     f64,
@@ -453,21 +395,6 @@ impl MappedFrame {
             }
             _ => Err("去动态帧编码未知".into()),
         }
-    }
-}
-
-#[cfg(test)]
-thread_local! { static TEST_BACKEND: std::cell::Cell<Option<Backend>> = const { std::cell::Cell::new(None) }; }
-#[cfg(test)]
-pub(crate) struct TestBackend(Option<Backend>);
-#[cfg(test)]
-pub(crate) fn test_backend(value: Backend) -> TestBackend {
-    TestBackend(TEST_BACKEND.with(|slot| slot.replace(Some(value))))
-}
-#[cfg(test)]
-impl Drop for TestBackend {
-    fn drop(&mut self) {
-        TEST_BACKEND.with(|slot| slot.set(self.0));
     }
 }
 
@@ -532,7 +459,7 @@ mod tests {
             for (i, p) in corrected.iter().enumerate() {
                 assert_eq!(decoded.is_dynamic([p.x,p.y,p.z]), !keep.contains(&(i as u32)));
             }
-            let MappedFrame::Dufo(dufo) = &frame else { unreachable!() };
+            let MappedFrame::Dufo(dufo) = &frame;
             let mut cells = AHashMap::new();
             for &(key, depth) in dufo.free.keys() {
                 let center = transform * Point3::from(key.map(|v| (v as f64 + (1u32 << depth) as f64 * 0.5) * dufo.resolution));

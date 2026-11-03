@@ -542,12 +542,6 @@ pub trait ExplorationGoalSource: Send {
     fn restore_checkpoint(&mut self, _payload: &str) -> ExploreResult<()> {
         Err(ExploreError::SourceError("探索源不支持恢复进度".into()))
     }
-    /// Restore confirmed history while dropping decisions derived from unknown prior settings.
-    fn restore_checkpoint_for_replan(&mut self, _payload: &str) -> ExploreResult<()> {
-        Err(ExploreError::SourceError(
-            "探索源不支持按当前配置恢复历史".into(),
-        ))
-    }
 
     /// 当前 source diagnostics(只读)
     fn diagnostics(&self) -> ExplorationSourceDiagnostics;
@@ -619,20 +613,6 @@ impl ExplorationController {
         &mut self,
         states: &[mission::SourceCheckpoint],
     ) -> ExploreResult<()> {
-        self.restore_checkpoint_inner(states, false)
-    }
-    /// A legacy checkpoint lacks its original settings; only confirmed history may survive.
-    pub fn restore_checkpoint_for_replan(
-        &mut self,
-        states: &[mission::SourceCheckpoint],
-    ) -> ExploreResult<()> {
-        self.restore_checkpoint_inner(states, true)
-    }
-    fn restore_checkpoint_inner(
-        &mut self,
-        states: &[mission::SourceCheckpoint],
-        replan: bool,
-    ) -> ExploreResult<()> {
         if let Some(error) = &self.prepared_fault {
             return Err(ExploreError::PreparedPollProtocol(error.clone()));
         }
@@ -652,11 +632,7 @@ impl ExplorationController {
                 .iter_mut()
                 .find(|s| s.source_name() == state.name)
                 .ok_or_else(|| ExploreError::SourceError("探索恢复源名称不匹配".into()))?;
-            if replan {
-                source.restore_checkpoint_for_replan(&state.payload)?;
-            } else {
-                source.restore_checkpoint(&state.payload)?;
-            }
+            source.restore_checkpoint(&state.payload)?;
         }
         Ok(())
     }

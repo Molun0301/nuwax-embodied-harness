@@ -163,7 +163,7 @@ impl NavTopicConfig {
             (
                 "goal_pose",
                 &[
-                    "NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL",
+
                     "NUWAX_LCM_CHANNEL_GOAL_POSE",
                 ][..],
                 "/nav/goal",
@@ -171,7 +171,7 @@ impl NavTopicConfig {
             (
                 "nav_cancel",
                 &[
-                    "NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL",
+
                     "NUWAX_LCM_CHANNEL_NAV_CANCEL",
                 ][..],
                 "/nav/cancel",
@@ -179,7 +179,7 @@ impl NavTopicConfig {
             (
                 "nav_state",
                 &[
-                    "NUWAX_GEOMETRY_RUNTIME_NAV_STATE_CHANNEL",
+
                     "NUWAX_LCM_CHANNEL_NAV_STATE",
                 ][..],
                 "/nav/state",
@@ -187,20 +187,20 @@ impl NavTopicConfig {
             (
                 "odometry",
                 &[
-                    "NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL",
+
                     "NUWAX_LCM_CHANNEL_ODOM",
                 ][..],
                 "/odom",
             ),
             (
                 "tf",
-                &["NUWAX_GEOMETRY_RUNTIME_TF_CHANNEL", "NUWAX_LCM_CHANNEL_TF"][..],
+                &["NUWAX_LCM_CHANNEL_TF"][..],
                 "/tf",
             ),
             (
                 "occupancy",
                 &[
-                    "NUWAX_GEOMETRY_RUNTIME_OCCUPANCY_CHANNEL",
+
                     "NUWAX_LCM_CHANNEL_OCCUPANCY",
                 ][..],
                 "/map/occupancy",
@@ -208,7 +208,7 @@ impl NavTopicConfig {
             (
                 "terrain_map",
                 &[
-                    "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL",
+
                     "NUWAX_LCM_CHANNEL_CLOUD_MAP",
                 ][..],
                 "/cloud_map",
@@ -216,7 +216,7 @@ impl NavTopicConfig {
             (
                 "terrain_map_ext",
                 &[
-                    "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL",
+
                     "NUWAX_LCM_CHANNEL_CLOUD_MAP",
                 ][..],
                 "/cloud_map",
@@ -224,7 +224,7 @@ impl NavTopicConfig {
             (
                 "cmd_vel",
                 &[
-                    "NUWAX_GEOMETRY_RUNTIME_CMD_VEL_CHANNEL",
+
                     "NUWAX_LCM_CHANNEL_CMD_VEL",
                 ][..],
                 "/cmd_vel",
@@ -252,7 +252,7 @@ impl NavTopicConfig {
         }
         if std::env::var("NUWAX_GEOMETRY_PIPELINE").as_deref()==Ok("slam_2d") {
             config.set("occupancy", configured_channel(
-                &["NUWAX_GEOMETRY_RUNTIME_PLANAR_NAVIGATION_CHANNEL","NUWAX_LCM_CHANNEL_PLANAR_NAVIGATION"],
+                &["NUWAX_LCM_CHANNEL_PLANAR_NAVIGATION"],
                 "/nav/planar_occupancy"));
         }
         config

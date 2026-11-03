@@ -56,8 +56,7 @@ impl GeometryCanonicalCorrectionApplier {
             }
             mapping
                 .pgo_disk_tail()
-                .map_err(pgo_preparation_error)?
-                .ok_or_else(|| ApplyError::Failed("PGO磁盘帧来源已改变".into()))
+                .map_err(pgo_preparation_error)
         };
         let terminal = || {
             context

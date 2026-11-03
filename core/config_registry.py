@@ -1,7 +1,7 @@
 """机器人控制台的统一设置目录。
 
 Python（编程语言）配置默认值取实际加载器源码；跨进程用户设置集中在
-config_catalog.json，记录中文名、默认值、消费者、兼容别名和生效范围。
+config_catalog.json，记录中文名、默认值、消费者、生效范围。
 config_descriptions.json 只保留结构化 Python 设置的补充说明。
 """
 
@@ -40,12 +40,10 @@ class ConfigField:
     sensitive: bool
     target_file: str
     default_repr: str  # 源码解析出的默认值文本（仅展示，不作运行时来源）
-    alias_of: Optional[str] = None
     choices: Tuple[str, ...] = field(default_factory=tuple)
     choice_labels: Tuple[str, ...] = field(default_factory=tuple)
     consumers: Tuple[str, ...] = field(default_factory=tuple)
     apply_scope: str = "重启网关后生效"
-    aliases: Tuple[str, ...] = field(default_factory=tuple)
     effective_value_scope: str = "current_process"
 
 
@@ -56,7 +54,6 @@ class _RawKey:
     key: str
     type: str
     default_repr: str
-    alias_of: Optional[str]
     target_file: str
 
 
@@ -84,7 +81,7 @@ def _node_source(node: ast.AST, source: str) -> str:
 
 
 def _parse_settings_keys(path: Path, target_file: str) -> Dict[str, _RawKey]:
-    """AST 解析 settings 文件，提取每个 _cfg_* 调用的键/类型/默认值/alias。
+    """AST 解析 settings 文件，提取每个 _cfg_* 调用的键、类型和默认值。
 
     默认值取源码字面量文本（如 ``True`` / ``'/utlidar/robot_odom'`` / 嵌套 _cfg_* 表达式），
     仅用于展示；运行时真实值仍由 settings.py 的 load_config() 决定。
@@ -108,27 +105,16 @@ def _parse_settings_keys(path: Path, target_file: str) -> Dict[str, _RawKey]:
                         default_repr = repr(ast.literal_eval(args[2]))
                     except Exception:
                         default_repr = _node_source(args[2], source)
-                raw.setdefault(key, _RawKey(key, "str", default_repr, None, target_file))
+                raw.setdefault(key, _RawKey(key, "str", default_repr, target_file))
             continue
         if not fn.startswith("_cfg_"):
             continue
-        typ = fn.replace("_cfg_", "").replace("_alias", "")
-        is_alias = fn.endswith("_alias")
+        typ = fn.replace("_cfg_", "")
         args = node.args
         if not args or not isinstance(args[0], ast.Constant) or not isinstance(args[0].value, str):
             continue
         key = args[0].value
-        alias_of: Optional[str] = None
         default_idx = 1
-        if (
-            is_alias
-            and len(args) > 1
-            and isinstance(args[1], ast.Constant)
-            and isinstance(args[1].value, str)
-            and args[1].value.isupper()
-        ):
-            alias_of = args[1].value
-            default_idx = 2
         default_repr = ""
         if len(args) > default_idx:
             try:
@@ -136,7 +122,7 @@ def _parse_settings_keys(path: Path, target_file: str) -> Dict[str, _RawKey]:
             except Exception:
                 default_repr = _node_source(args[default_idx], source)
         # 同键多次出现以首次为准（settings.py 内通常唯一）。
-        raw.setdefault(key, _RawKey(key, typ, default_repr, alias_of, target_file))
+        raw.setdefault(key, _RawKey(key, typ, default_repr, target_file))
     return raw
 
 
@@ -146,11 +132,7 @@ def _all_raw_keys() -> Dict[str, _RawKey]:
     for key, rk in _parse_settings_keys(_GO2_SETTINGS, TARGET_GO2).items():
         merged.setdefault(key, rk)
     for key, entry in runtime_catalog().items():
-        merged.setdefault(key, _RawKey(key, entry["type"], repr(entry["default"]), None, entry["target_file"]))
-    # 旧名称仅供读取与迁移，同一功能只展示一个规范设置。
-    for entry in runtime_catalog().values():
-        for alias in entry.get("aliases", ()):
-            merged.pop(alias, None)
+        merged.setdefault(key, _RawKey(key, entry["type"], repr(entry["default"]), entry["target_file"]))
     return merged
 
 
@@ -189,7 +171,7 @@ _SECTION_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("telemetry", ("NUWAX_GATEWAY_TELEMETRY",)),
     ("gateway", ("NUWAX_GATEWAY",)),
     ("relay", ("NUWAX_RELAY",)),
-    ("logging", ("NUWAX_LOG", "GO2_PROXY_LOG")),
+    ("logging", ("NUWAX_LOG",)),
     ("mapping", ("NUWAX_MAPPING", "NUWAX_OSM_", "NUWAX_NOMINATIM_", "NUWAX_GOOGLE_MAPS_")),
     ("nav_stack", ("NUWAX_NAV_", "NUWAX_PERSON_FOLLOW_", "NUWAX_EXPLORE_")),
     ("geometry_runtime", ("NUWAX_GEOMETRY_RUNTIME",)),
@@ -218,10 +200,8 @@ _SECTION_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
 _SENSITIVE_KEYS = frozenset({
     "NUWAX_RELAY_INCOMING_TOKENS",
     "NUWAX_RELAY_UPSTREAM_TOKEN",
-    "NUWAX_PERCEPTION_OPENAI_API_KEY",
     "OPENAI_API_KEY",
     "ARK_API_KEY",
-    "NUWAX_MEMORY_EMBEDDING_API_KEY",
     "DASHSCOPE_API_KEY",
     "GO2_WEBRTC_AES_128_KEY",
     "NUWAX_GOOGLE_MAPS_API_KEY",
@@ -235,6 +215,7 @@ _REGULAR_KEYS = frozenset({
     "NUWAX_GATEWAY_POINTCLOUD3D_SPACING_M", "NUWAX_GATEWAY_POINTCLOUD3D_SIZE",
     "NUWAX_GATEWAY_POINTCLOUD3D_COLOR",
     "NUWAX_GATEWAY_TELEMETRY_ENABLED", "NUWAX_GATEWAY_TELEMETRY_INTERVAL_SEC",
+    "NUWAX_MAP_CATALOG_ROOT",
     "NUWAX_LOG_LEVEL",
     "NUWAX_GEOMETRY_ENABLED",
     "NUWAX_GEOMETRY_PIPELINE",
@@ -246,7 +227,6 @@ _REGULAR_KEYS = frozenset({
     "NUWAX_PERCEPTION_STREAM_AUTO_START",
     "NUWAX_PERCEPTION_OPENAI_ENABLED", "NUWAX_PERCEPTION_SEGMENTATION_ENABLED",
     "NUWAX_PERCEPTION_STREAM_ENABLED", "NUWAX_PERCEPTION_STREAM_INTERVAL_SEC",
-    "NUWAX_MEMORY_EMBEDDING_API_KEY", "NUWAX_MAP_CATALOG_ROOT",
     "GO2_DATA_PLANE_ENABLED", "GO2_DIRECT_DDS_ENABLED",
     "GO2_OFFICIAL_BACKEND_ENABLED", "GO2_OFFICIAL_OBSTACLE_AVOIDANCE_DEFAULT_ENABLED",
     "GO2_VIDEO_STREAM_ENABLED", "GO2_ROBOT_IP",
@@ -413,7 +393,6 @@ _ZH_NAMES: Dict[str, str] = {
     'ARK_API_KEY': 'ARK API 密钥',
     'NUWAX_PERCEPTION_DEFERRED_STRATEGY': '延迟投影策略',
     'NUWAX_PERCEPTION_DEFERRED_XVAL_THRESHOLD_M': '延迟投影交叉校验阈值（米）',
-    'NUWAX_PERCEPTION_OPENAI_API_KEY': 'OpenAI API 密钥',
     'NUWAX_PERCEPTION_OPENAI_API_STYLE': 'OpenAI API 类型',
     'NUWAX_PERCEPTION_OPENAI_BACKEND_NAME': 'OpenAI 视觉后端名称',
     'NUWAX_PERCEPTION_OPENAI_BASE_URL': 'OpenAI API 基础地址',
@@ -476,7 +455,6 @@ _ZH_NAMES: Dict[str, str] = {
     'NUWAX_PERCEPTION_TRIANGULATION_MIN_PARALLAX_DEG': '三角化最小视差角（度）',
     'NUWAX_PERCEPTION_TRIANGULATION_MIN_RAYS': '三角化最少射线数',
     'NUWAX_MAP_CATALOG_ROOT': '地图目录',
-    'NUWAX_MEMORY_EMBEDDING_API_KEY': '记忆嵌入 API 密钥',
     'DASHSCOPE_API_KEY': 'DashScope API 密钥',
     'NUWAX_ACTIVE_MAP_RESTORE_ON_START': '启动时恢复激活地图',
     'NUWAX_ARTIFACT_CLEANUP_BATCH_SIZE': '制品清理批量大小',
@@ -500,8 +478,6 @@ _ZH_NAMES: Dict[str, str] = {
     'NUWAX_MEMORY_ASSOCIATION_MERGE_ON_ACTIVATION': '激活记忆库时合并重复物体',
     'NUWAX_MEMORY_DB_PATH': '记忆数据库路径',
     'NUWAX_MEMORY_EMBEDDING_BASE_URL': '记忆嵌入服务基础地址',
-    'NUWAX_MEMORY_EMBEDDING_DIM': '记忆嵌入维度',
-    'NUWAX_MEMORY_EMBEDDING_MODEL': '记忆嵌入模型',
     'NUWAX_MEMORY_EMBEDDING_TIMEOUT_SEC': '记忆嵌入超时（秒）',
     'NUWAX_MEMORY_HISTORY_LIMIT': '记忆历史记录上限',
     'NUWAX_MEMORY_IMAGE_EMBEDDING_DIM': '图像记忆嵌入维度',
@@ -606,11 +582,9 @@ def build_registry() -> Tuple[ConfigField, ...]:
             sensitive=key in sensitive_keys(),
             target_file=rk.target_file,
             default_repr=rk.default_repr,
-            alias_of=rk.alias_of,
             choices=tuple(entry.get("choices", _CHOICES.get(key, ()))),
             choice_labels=tuple(entry.get("choice_labels", _CHOICE_LABELS.get(key, ()))),
             consumers=tuple(consumers),
-            aliases=tuple(entry.get("aliases", ())),
             effective_value_scope=entry.get("effective_value_scope", "current_process"),
             apply_scope=entry.get("apply_scope", "重启机器人数据面及网关后生效" if rk.target_file == TARGET_GO2 else "重启网关后生效"),
         ))

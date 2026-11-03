@@ -23,15 +23,11 @@ use std::time::Duration;
 use nuwax_nav_base::error::NavResult;
 use nuwax_nav_base::native::NativeProcessDiagnostics;
 
-const VERIFIED_NATIVE_PGO_ENV: &str = "NUWAX_GEOMETRY_RELEASE_NATIVE_PGO_EXECUTABLE";
 
-/// 返回显式发布路径，或当前源码构建的原生位姿图优化程序。
+/// 返回本次构建的原生位姿图优化程序。
 #[must_use]
 pub fn native_executable() -> std::path::PathBuf {
-    std::env::var_os(VERIFIED_NATIVE_PGO_ENV)
-        .filter(|value| !value.is_empty())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(discovery_native_executable)
+    discovery_native_executable()
 }
 
 /// Return the build-time native PGO artifact for side-effect-free discovery only.

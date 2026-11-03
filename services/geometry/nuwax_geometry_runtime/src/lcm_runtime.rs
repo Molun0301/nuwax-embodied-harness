@@ -3730,12 +3730,9 @@ const BASE_FRAME_ALIASES: &[&str] = &[
     "go2_base_link",
 ];
 
-const MAP_FRAME_ENV: &str = "NUWAX_GEOMETRY_MAP_FRAME";
-const MAP_FRAME_LEGACY_ENV: &str = "NUWAX_MAP_FRAME";
+const MAP_FRAME_ENV: &str = "NUWAX_MAP_FRAME";
 const ODOM_FRAME_ENV: &str = "NUWAX_GEOMETRY_ODOM_FRAME";
-const ODOM_FRAME_LEGACY_ENV: &str = "NUWAX_ODOM_FRAME";
 const BASE_FRAME_ENV: &str = "NUWAX_BASE_FRAME";
-const BASE_FRAME_LEGACY_ENV: &str = "NUWAX_GEOMETRY_BASE_FRAME";
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 #[error("FRAME_BINDING_INVALID role={role} env={variable} frame={value:?}")]
@@ -3755,12 +3752,11 @@ pub(crate) struct ValidatedFrameBindings {
 impl ValidatedFrameBindings {
     pub(crate) fn from_env() -> Result<Self, FrameBindingError> {
         Ok(Self {
-            map_frame: read_frame_binding("map", MAP_FRAME_ENV, MAP_FRAME_LEGACY_ENV, "map")?,
-            odom_frame: read_frame_binding("odom", ODOM_FRAME_ENV, ODOM_FRAME_LEGACY_ENV, "odom")?,
+            map_frame: read_frame_binding("map", MAP_FRAME_ENV, "map")?,
+            odom_frame: read_frame_binding("odom", ODOM_FRAME_ENV, "odom")?,
             base_frame: read_frame_binding(
                 "base",
                 BASE_FRAME_ENV,
-                BASE_FRAME_LEGACY_ENV,
                 "base_link",
             )?,
         })
@@ -3790,21 +3786,18 @@ impl ValidatedFrameBindings {
 
 fn read_frame_binding(
     role: &'static str,
-    preferred: &'static str,
-    legacy: &'static str,
+    variable: &'static str,
     default: &'static str,
 ) -> Result<String, FrameBindingError> {
-    for variable in [preferred, legacy] {
-        match std::env::var(variable) {
-            Ok(value) => return validate_frame_binding(role, variable, value),
-            Err(std::env::VarError::NotPresent) => {}
-            Err(std::env::VarError::NotUnicode(_)) => {
-                return Err(FrameBindingError {
-                    role,
-                    variable,
-                    value: "<non-unicode>".to_string(),
-                });
-            }
+    match std::env::var(variable) {
+        Ok(value) => return validate_frame_binding(role, variable, value),
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(FrameBindingError {
+                role,
+                variable,
+                value: "<non-unicode>".to_string(),
+            });
         }
     }
     validate_frame_binding(role, "<default>", default.to_string())
@@ -4590,9 +4583,6 @@ impl GeometryCanonicalCorrectionApplier {
         let (_, spec, config, backend_generation) = snapshot(u64::MAX)?;
         let disk_input = context.mapping.lock().pgo_disk_input(&transaction.trajectory)
             .map_err(pgo_preparation_error)?;
-        let (scans, spec, config, backend_generation) = if disk_input.is_some() {
-            (Vec::new(), spec, config, backend_generation)
-        } else { snapshot(0)? };
         self.validate_transaction(transaction)
             .map_err(ApplyError::Failed)?;
         cancellation.begin_background_preparation();
@@ -4605,128 +4595,8 @@ impl GeometryCanonicalCorrectionApplier {
                 _ = release.notified() => {},
             }
         }
-        if let Some(input) = disk_input {
-            return self.prepare_background_disk_pgo(transaction, cancellation, context.clone(), input,
-                spec, config, backend_generation).await;
-        }
-        let trajectory = transaction.trajectory.clone();
-        let anchor = transaction.base_anchor_map_from_odom;
-        let frame = self.map_frame_id.clone();
-        let cancelled = cancellation.clone();
-        let initial: Arc<[crate::pgo_map::ArchivedScan]> = scans.into();
-        let builder_scans = initial.clone();
-        let mut builder = tokio::task::spawn_blocking(move || {
-            crate::pgo_map::ReplayBuilder::new(
-                &builder_scans,
-                trajectory,
-                anchor,
-                spec,
-                config,
-                frame,
-                Duration::MAX,
-                &|| cancelled.is_cancelled(),
-            )
-            .map(crate::pgo_map::ReplayBuilder::into_background)
-        })
-        .await
-        .map_err(|error| ApplyError::Failed(format!("PGO后台准备任务失败：{error}")))?
-        .map_err(pgo_preparation_error)?;
-        let mut pending = initial;
-        let mut cursor = 0;
-        let mut prepared = None;
-        loop {
-            builder
-                .check(&|| cancellation.is_cancelled())
-                .map_err(pgo_preparation_error)?;
-            // 每段开始都检查会话退休；该快照只核对身份，不复制未处理的历史前缀。
-            let (_, _, _, generation) = snapshot(u64::MAX)?;
-            if generation != backend_generation {
-                return Err(ApplyError::PreparationRejected(
-                    Reject::BackendGenerationMismatch,
-                ));
-            }
-            if cursor < pending.len() {
-                let slice = pending.clone();
-                let cancelled = cancellation.clone();
-                let (advanced, count) = tokio::task::spawn_blocking(move || {
-                    builder.append_slice(&slice[cursor..], &|| cancelled.is_cancelled())
-                })
-                .await
-                .map_err(|error| ApplyError::Failed(format!("PGO后台分段重放失败：{error}")))?
-                .map_err(pgo_preparation_error)?;
-                builder = advanced;
-                cursor += count;
-                prepared = None;
-                // 一项在途工作，加片间休息；不占满异步执行器或逐帧派生并发任务。
-                tokio::select! {
-                    biased;
-                    _ = cancellation.cancelled() => return Err(ApplyError::Cancelled),
-                    _ = tokio::time::sleep(crate::pgo_map::REPLAY_YIELD) => {},
-                }
-                continue;
-            }
-            let (tail, _, _, _) = snapshot(builder.latest_timestamp_ns())?;
-            if !tail.is_empty() {
-                pending = tail.into();
-                cursor = 0;
-                continue;
-            }
-            if prepared.is_none() {
-                let cancelled = cancellation.clone();
-                let (advanced, output) = tokio::task::spawn_blocking(move || {
-                    builder.advance(&[], &|| cancelled.is_cancelled())
-                })
-                .await
-                .map_err(|error| ApplyError::Failed(format!("PGO后台物化失败：{error}")))?
-                .map_err(pgo_preparation_error)?;
-                builder = advanced;
-                prepared = Some(output);
-            }
-            let guard = tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => return Err(ApplyError::Cancelled),
-                guard = context.lifecycle_lock.clone().lock_owned() => guard,
-            };
-            let (tail, _, _, generation) = snapshot(builder.latest_timestamp_ns())?;
-            if generation != backend_generation {
-                return Err(ApplyError::PreparationRejected(
-                    Reject::BackendGenerationMismatch,
-                ));
-            }
-            let output = prepared.as_ref().expect("后台物化结果已准备");
-            if tail.is_empty()
-                && context
-                    .mapping
-                    .lock()
-                    .pgo_replay_tail_is_current(output.source_timestamp_ns)
-            {
-                let expected = {
-                    let shared = self.state.read().await;
-                    (
-                        shared.map.revision,
-                        shared.map.timestamp_ns,
-                        shared.cloud_map_revision,
-                    )
-                };
-                let rebuilt = builder
-                    .finish(prepared.take().unwrap(), &|| cancellation.is_cancelled())
-                    .map_err(pgo_preparation_error)?;
-                cancellation.retain_background_lifecycle_guard(guard);
-                return Ok((rebuilt, expected));
-            }
-            drop(guard);
-            if tail.is_empty() {
-                // 在线扫描尚在提交，复用已物化结果，等待时释放实时输入围栏。
-                tokio::select! {
-                    biased;
-                    _ = cancellation.cancelled() => return Err(ApplyError::Cancelled),
-                    _ = tokio::time::sleep(Duration::from_millis(1)) => {},
-                }
-            } else {
-                pending = tail.into();
-                cursor = 0;
-            }
-        }
+        self.prepare_background_disk_pgo(transaction, cancellation, context.clone(), disk_input,
+            spec, config, backend_generation).await
     }
 
     fn validate_transaction(
@@ -4880,7 +4750,7 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
                 background_expected = Some(expected);
                 Some(map)
             } else {
-                let (scans, spec, config, disk_input) = {
+                let (spec, config, disk_input) = {
                     let mapping = context.mapping.lock();
                     let session = mapping.snapshot();
                     let anchor = mapping
@@ -4896,34 +4766,20 @@ impl crate::correction_coordinator::CanonicalCorrectionApplier
                     {
                         return Err(ApplyError::Failed("PGO地图拥有方或锚点不匹配".into()));
                     }
-                    let (scans, spec, config) = mapping.pgo_rebuild_input().map_err(preparation_error)?;
+                    let (_, spec, config) = mapping.pgo_rebuild_input().map_err(preparation_error)?;
                     let disk_input = mapping.pgo_disk_input(&transaction.trajectory).map_err(preparation_error)?;
-                    (scans, spec, config, disk_input)
+                    (spec, config, disk_input)
                 };
                 let trajectory = transaction.trajectory.clone();
                 let anchor = transaction.base_anchor_map_from_odom;
                 let frame = self.map_frame_id.clone();
                 let cancelled = cancellation.clone();
                 let budget = self.rebuild_budget;
-                let terminal = if disk_input.is_some() {
-                    context.cloud_writer.lock().as_ref().ok_or_else(|| ApplyError::Failed("PGO点云拥有方缺失".into()))?.pgo_terminal_dufo()
-                } else { Default::default() };
+                let terminal = context.cloud_writer.lock().as_ref().ok_or_else(|| ApplyError::Failed("PGO点云拥有方缺失".into()))?.pgo_terminal_dufo();
                 Some(
                     tokio::task::spawn_blocking(move || {
-                        if let Some(input) = disk_input {
-                            return crate::pgo_map::rebuild_disk(input, trajectory, anchor, spec, config, frame, budget,
-                                terminal, || cancelled.is_cancelled());
-                        }
-                        crate::pgo_map::rebuild(
-                            scans,
-                            trajectory,
-                            anchor,
-                            spec,
-                            config,
-                            frame,
-                            budget,
-                            || cancelled.is_cancelled(),
-                        )
+                        crate::pgo_map::rebuild_disk(disk_input, trajectory, anchor, spec, config, frame, budget,
+                            terminal, || cancelled.is_cancelled())
                     })
                     .await
                     .map_err(|e| ApplyError::Failed(format!("PGO重建任务失败：{e}")))?
@@ -8666,16 +8522,6 @@ pub async fn spawn_geometry_runtime(
         transport: transport.clone(),
         transport_backend_name: backend_name,
         lcm_backend_available: backend_available,
-        // Phase 6 / Rework-9: 默认 `false` —— 这是**生产 spawn 路径**,
-        // 该路径必须由 Python `LcmMotionCommandBridge.start()` 成功完成后,
-        // 通过 gateway `_start_motion_command_bridge` 链路真实写回 true;
-        // 若 Python 端未启动 / start 失败 / providers 不实现 MotionControl,
-        // 该 flag 保持 false,`SetNavigationGoal` 在 `compute_readiness` 因
-        // `cmd_vel_sink_ready=false` 被拒绝(参见 `REJECT_REASON_CMD_VEL_SINK_DOWN`)。
-        //
-        // 注意:`build_handle_for_tests`(第 1354 行 test helper profile)
-        // 仍保留默认 `true` —— 单测直接调 `set_cmd_vel_sink_ready(false)`
-        // 验证 readiness 拒绝分支(参照 `phase6_handle_cmd_vel_sink_ready_setter_propagates_to_readiness`)。
         cmd_vel_sink_ready: cmd_vel_sink_ready.clone(),
         nav: nav_runtime.clone(),
         explore: explore_runtime.clone(),
@@ -17943,7 +17789,7 @@ pub(crate) mod mapping_feed_tests {
                         assert_eq!(handle.state.read().await.map.revision, before);
                     }
                     if index >= 2 {
-                        if crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::DufoMap {
+                        {
                             let (_, spec, config) = mapping.lock().pgo_rebuild_input().unwrap();
                             if index == 2 || index == 4 {
                                 // v2的机体点和雷达原点是f32；从真实日志生成同输入的独立正确轨迹参考。
@@ -22929,7 +22775,7 @@ mod exploration_cancel_retry_tests {
                 let (topic, kind) = crate::nav_runtime::goal_envelope_binding().expect("original goal binding");
                 self.goal_subscription = Some(self.bridge.transport.subscribe_owned(topic, Some(kind)).await.expect("Goal subscription on SAME context"));
                 let cancel_channel = crate::channel_registry::resolve_channel(
-                    "NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL", "NUWAX_LCM_CHANNEL_NAV_CANCEL",
+                    "NUWAX_LCM_CHANNEL_NAV_CANCEL",
                     "/nav/cancel#nuwax_msgs.CancelNavigation");
                 let (topic, suffix) = crate::nav_runtime::parse_channel_with_suffix(&cancel_channel).expect("original cancel channel");
                 let kind = LcmMessageType::new(&suffix.expect("typed cancellation suffix")).expect("cancel message type");

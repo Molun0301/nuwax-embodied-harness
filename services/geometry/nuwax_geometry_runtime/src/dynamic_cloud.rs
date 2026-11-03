@@ -5,11 +5,12 @@ use ahash::AHashSet as HashSet;
 use nalgebra::Point3;
 
 use super::voxel_index::VoxelIndex;
-use super::{voxel_center_f64, voxel_key, VoxelKey};
+use super::{voxel_center_f64, VoxelKey};
+#[cfg(test)]
+use super::voxel_key;
 
 #[derive(Default)]
 pub(super) struct DynamicCloudFilter {
-    scene: crate::dynamic_scene::DynamicScene,
     dufo: crate::dynamic_backend::OnlineDufo,
     current: Option<std::sync::Arc<crate::dynamic_backend::MappedFrame>>,
     shared: Option<crate::dynamic_backend::MappedFrame>,
@@ -34,13 +35,12 @@ impl DynamicCloudFilter {
     pub(super) fn clear_frame(&mut self) {
         self.removed_keys.clear();
         self.shared = None;
-        self.scene.clear_frame();
     }
 
     pub(super) fn is_dynamic(&self, point: [f64; 3]) -> bool {
         self.shared
             .as_ref()
-            .map_or_else(|| self.scene.is_dynamic(point), |f| f.is_dynamic(point))
+            .is_some_and(|f| f.is_dynamic(point))
     }
     /// 当前扫描实际移除的体素，供确定性快照同步撤销；下一次扫描清空。
     pub(super) fn observe_dufo(&mut self, points: &[Point3<f64>], origin: [f64; 3], stamp: u64)
@@ -64,7 +64,7 @@ impl DynamicCloudFilter {
     ) -> usize {
         let hits = points
             .iter()
-            .filter_map(|p| voxel_key([p.x, p.y, p.z], voxel_size))
+            .filter_map(|p| super::voxel_key([p.x, p.y, p.z], voxel_size))
             .collect();
         self.clear_observed_free_space_with_hits(
             voxels,
@@ -83,16 +83,11 @@ impl DynamicCloudFilter {
         origin: [f64; 3],
         stamp: u64,
         points: &[Point3<f64>],
-        ground: &[u32],
     ) -> usize {
         self.removed_keys.clear();
-        if crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::DufoMap {
-            self.shared = Some(self.dufo.observe(points, origin, stamp, nalgebra::Isometry3::identity())
-                .expect("已校验的动态点云积分失败").0);
-        } else {
-            self.scene.observe_with_ground(points, origin, stamp, ground);
-        }
-        if self.shared.as_ref().map_or_else(|| self.scene.has_clears(), |f| f.has_clears()) {
+        self.shared = Some(self.dufo.observe(points, origin, stamp, nalgebra::Isometry3::identity())
+            .expect("已校验的动态点云积分失败").0);
+        if self.shared.as_ref().is_some_and(|f| f.has_clears()) {
             self.removed_keys = voxels
                 .iter()
                 .copied()
@@ -113,12 +108,12 @@ impl DynamicCloudFilter {
         points: &[Point3<f64>],
         _hits: &HashSet<VoxelKey>,
     ) -> usize {
-        self.observe_with_ground(voxels, size, origin, stamp, points, &[])
+        self.observe_with_ground(voxels, size, origin, stamp, points)
     }
     pub(super) fn clears(&self, p: [f64; 3]) -> bool {
         self.shared
             .as_ref()
-            .map_or_else(|| self.scene.clears(p), |f| f.clears(p))
+            .is_some_and(|f| f.clears(p))
     }
     pub(super) fn adopt(
         &mut self,
@@ -136,77 +131,6 @@ impl DynamicCloudFilter {
         for key in &self.removed_keys {
             voxels.remove(key);
         }
-    }
-    pub(super) fn classify(
-        &mut self,
-        source: &crate::lio_ingress::AdmittedRegisteredScan,
-        ground: &[u32],
-        known: &[u32],
-    ) -> Result<std::sync::Arc<crate::dynamic_scene::FrameDecision>, String> {
-        if let Some(frame) = source.dynamic_frame() {
-            return Ok(frame);
-        }
-        #[cfg(test)]
-        let diagnostic = std::env::var_os("NUWAX_DYNAMIC_PHASE_DIAGNOSTIC").is_some();
-        #[cfg(test)]
-        let phase_started = std::time::Instant::now();
-        let binding = source.binding();
-        let domain = (
-            binding.mapping_session_id.clone(),
-            binding.mapping_session_generation,
-        );
-        if self.source_domain.as_ref() != Some(&domain) {
-            self.scene = Default::default();
-            self.source_domain = Some(domain);
-            self.raw_log = None;
-            self.raw_log_failed = false;
-        }
-        let points = source
-            .body_points()
-            .iter()
-            .map(|p| binding.frozen_odom_from_body * p)
-            .collect::<Vec<_>>();
-        let odom_from_map = binding.registration_map_from_odom.inverse();
-        let origin = binding
-            .sensor_origin_map
-            .map(|p| odom_from_map * Point3::from(p));
-        #[cfg(test)]
-        let prepare_ms = phase_started.elapsed().as_secs_f64() * 1e3;
-        if let Some(origin) = origin {
-            self.scene.observe_with_known_ground(
-                &points,
-                origin.coords.into(),
-                source.source_timestamp_ns(),
-                ground,
-                known,
-            );
-        } else {
-            self.scene.clear_frame();
-        }
-        #[cfg(test)]
-        let observed_ms = phase_started.elapsed().as_secs_f64() * 1e3;
-        let mut frame = self.scene.decision();
-        if frame.labels.labels.is_empty() {
-            std::sync::Arc::make_mut(&mut frame).labels = crate::human_point_labels::FrameLabels {
-                source_timestamp_ns: source.source_timestamp_ns(),
-                labels: vec![crate::human_point_labels::PointLabel::PendingNew; points.len()],
-            };
-        }
-        #[cfg(test)]
-        let decision_ms = phase_started.elapsed().as_secs_f64() * 1e3;
-        self.record_raw(source);
-        #[cfg(test)]
-        let scanlog_ms = phase_started.elapsed().as_secs_f64() * 1e3;
-        source.record_decision(frame.clone())?;
-        #[cfg(test)]
-        if diagnostic {
-            let elapsed = phase_started.elapsed().as_secs_f64() * 1e3;
-            eprintln!("DYNAMIC_CLASSIFY timestamp={} points={} prepare_ms={:.3} observe_ms={:.3} decision_ms={:.3} scanlog_ms={:.3} record_ms={:.3} total_ms={:.3}",
-                source.source_timestamp_ns(), source.body_points().len(), prepare_ms,
-                observed_ms - prepare_ms, decision_ms - observed_ms,
-                scanlog_ms - decision_ms, elapsed - scanlog_ms, elapsed);
-        }
-        Ok(frame)
     }
     fn record_raw(&mut self, source: &crate::lio_ingress::AdmittedRegisteredScan) {
         let binding = source.binding();
@@ -247,9 +171,7 @@ impl DynamicCloudFilter {
                 .as_slice()
                 .try_into()
                 .unwrap(),
-            observation_minimum_range_m: Some(if crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::DufoMap {
-                crate::dynamic_backend::online_params().min_range as f64
-            } else { self.scene.minimum_range_m() }),
+            observation_minimum_range_m: Some(crate::dynamic_backend::online_params().min_range as f64),
             sensor_origin_body: origin_body.map(|p| [p.x as f32, p.y as f32, p.z as f32]),
             point_count: source.body_points().len(),
         };
@@ -263,13 +185,7 @@ impl DynamicCloudFilter {
             }
         }
     }
-    pub(super) fn classify_online(&mut self, source: &crate::lio_ingress::AcceptedRegisteredCloud,
-        ground: &[u32], known: &[u32]) -> Result<crate::dynamic_backend::MappedFrame, String> {
-        if crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::Legacy {
-            let frame = self.classify(source.scan(), ground, known)?;
-            return crate::dynamic_backend::MappedFrame::new(frame,
-                source.scan().binding().registration_map_from_odom, source.map_points(), 0);
-        }
+    pub(super) fn classify_online(&mut self, source: &crate::lio_ingress::AcceptedRegisteredCloud) -> Result<crate::dynamic_backend::MappedFrame, String> {
         let scan = source.scan();
         if let Some(frame) = scan.online_frame() { return Ok((*frame).clone()); }
         let binding = scan.binding();

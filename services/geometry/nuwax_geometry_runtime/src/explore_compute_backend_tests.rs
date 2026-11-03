@@ -355,7 +355,6 @@ fn install_restore_failure_preserves_old_history_and_allows_next_start() {
                 name: "wrong-source".into(),
                 payload: "invalid".into(),
             }],
-            replan: false,
         }),
     });
     assert!(failed.result.is_err());

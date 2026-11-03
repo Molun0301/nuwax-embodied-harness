@@ -142,7 +142,6 @@ pub(super) struct ComputeFeedbackAck {
 
 pub(super) struct ComputeRestore {
     pub sources: Vec<SourceCheckpoint>,
-    pub replan: bool,
 }
 
 pub(super) enum ComputeLifecycle {
@@ -467,11 +466,7 @@ impl ExploreComputeBackend {
                 controller.begin_exploration()?;
             }
             if let Some(restore) = restore {
-                if restore.replan {
-                    controller.restore_checkpoint_for_replan(&restore.sources)?;
-                } else {
-                    controller.restore_checkpoint(&restore.sources)?;
-                }
+                controller.restore_checkpoint(&restore.sources)?;
             }
             Ok(())
         })();

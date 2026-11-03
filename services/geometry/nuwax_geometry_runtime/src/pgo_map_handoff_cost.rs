@@ -242,7 +242,7 @@ impl Recorder {
                 "dense_storage_memory_peak_bytes":storage_memory_names.iter().enumerate().map(|(i,n)|((*n).to_string(),json!(chunk.iter().map(|r|r.dense_storage_memory[i]).max().unwrap()))).collect::<serde_json::Map<String,Value>>()})
         }).collect();
         let summary = json!({
-            "backend":format!("{:?}",crate::dynamic_backend::backend()),
+            "backend":format!("{:?}","dufomap"),
             "reference_bbox":crate::dynamic_backend::reference_revoke(),
             "capture":self.capture,"requested_frames":requested_frames,"frames":self.records.len(),
             "source_points":self.records.last().unwrap().cumulative_source_points,

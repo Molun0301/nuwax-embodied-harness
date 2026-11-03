@@ -1,7 +1,6 @@
 //! 真实拥有方接线：原始扫描、历史撤销、冻结读者及会话切换。
 use super::*;
 use crate::admitted_cloud::AcceptedMappingCloud;
-use crate::dynamic_backend::{test_backend, Backend};
 use crate::lio_ingress::{AcceptedRegisteredCloud, CorrelatedOdometry, RegistrationBinding};
 use crate::mapping_backend::{
     self, MappingBackendComputeConfig, MappingBackendInput, MappingBackendSpec,
@@ -72,7 +71,7 @@ fn dense_points(snapshot: &DenseSnapshot) -> Vec<[f32; 3]> {
 
 #[test]
 fn dufomap_history_follows_fine_keys_and_keeps_static_structure() {
-    let _backend = test_backend(Backend::DufoMap);
+
     use crate::dynamic_scene::tests::{corridor, ORIGIN};
     let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
     writer.begin_session(1).unwrap();
@@ -113,10 +112,6 @@ fn dufomap_history_follows_fine_keys_and_keeps_static_structure() {
             shared,
             writer.classify_admitted_scan(&source).unwrap(),
             "同一接纳扫描复用单次积分结果"
-        );
-        assert!(
-            source.scan().dynamic_frame().is_none(),
-            "新后端不得生成或归档旧帧决策"
         );
         assert!(source.scan().static_indices().is_some());
         let input = MappingBackendInput {
@@ -249,7 +244,7 @@ fn dufomap_history_follows_fine_keys_and_keeps_static_structure() {
 
 #[test]
 fn corrected_dense_history_follows_fine_keys_on_both_sides_of_free_boundary() {
-    let _backend = test_backend(Backend::DufoMap);
+
     let transform = nalgebra::Isometry3::from_parts(
         nalgebra::Translation3::new(-1.2, 2.3, 0.1),
         nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, 0.61));
@@ -327,8 +322,8 @@ fn both_backends_record_complete_v2_scan_before_static_selection() {
         Point3::new(1.1, 0.3, 0.7),
         Point3::new(-2.1, 0.4, 1.2),
     ];
-    for (generation, backend) in [(1, Backend::DufoMap), (2, Backend::Legacy)] {
-        let _backend = test_backend(backend);
+    for generation in [1, 2] {
+
         let mut writer = CloudMapShmWriter::new_private_for_test().unwrap();
         let source = admitted(
             points.clone(),

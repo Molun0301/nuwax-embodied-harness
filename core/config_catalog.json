@@ -290,10 +290,7 @@
       "services/nuwax-workspace/crates/nuwax-mapping-cloud/src/google_maps.rs"
     ],
     "apply_scope": "重启相关服务后生效",
-    "description": "Google地图地点检索的接口密钥；当前地名检索固定使用OpenStreetMap，此项暂不生效。",
-    "aliases": [
-      "GOOGLE_MAPS_API_KEY"
-    ]
+    "description": "Google地图地点检索的接口密钥；当前地名检索固定使用OpenStreetMap，此项暂不生效。"
   },
   "NUWAX_GEOMETRY_GRPC_READ_DEADLINE_SEC": {
     "zh_name": "几何查询超时（秒）",
@@ -488,37 +485,9 @@
     "section_id": "geometry_runtime",
     "target_file": "core_env",
     "consumers": [
-      "services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs",
-      "services/geometry/release_manifest.py"
+      "services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs"
     ],
     "apply_scope": "重启几何运行时后生效",
-    "description": ""
-  },
-  "NUWAX_GEOMETRY_RELEASE_MANIFEST": {
-    "zh_name": "可选几何发布清单",
-    "type": "str",
-    "default": "",
-    "section_id": "geometry_runtime",
-    "target_file": "core_env",
-    "consumers": [
-      "scripts/systemd/start_geometry_runtime.sh",
-      "services/geometry/nuwax_geometry_runtime/src/main.rs",
-      "services/geometry/release_manifest.py"
-    ],
-    "apply_scope": "重启几何运行时后生效",
-    "description": ""
-  },
-  "NUWAX_GEOMETRY_RELEASE_NATIVE_PGO_EXECUTABLE": {
-    "zh_name": "原生位姿图优化程序",
-    "type": "str",
-    "default": "",
-    "section_id": "geometry_runtime",
-    "target_file": "core_env",
-    "consumers": [
-      "services/geometry/release_manifest.py",
-      "services/nuwax-workspace/crates/nuwax-nav-pgo-bridge/src/lib.rs"
-    ],
-    "apply_scope": "重启相关服务后生效",
     "description": ""
   },
   "NUWAX_MAPPING_RAYTRACING_VOXEL_SIZE": {
@@ -1336,9 +1305,6 @@
       "services/geometry/nuwax_geometry_runtime/src/channel_registry.rs"
     ],
     "apply_scope": "重启几何运行时后生效",
-    "aliases": [
-      "NUWAX_GEOMETRY_RUNTIME_IMU_CHANNEL"
-    ],
     "description": "惯性测量单元（IMU）数据所用的通道。格式“/话题#消息类型”，只能修改话题名，改动消息类型会使几何运行时无法启动。"
   },
   "NUWAX_CLOUDMAP_SHM_PATH": {
@@ -1377,9 +1343,6 @@
       "services/nuwax-workspace/crates/nuwax-nav-stack/src/topics.rs"
     ],
     "apply_scope": "重启网关、几何运行时及导航后端后生效",
-    "aliases": [
-      "NUWAX_GEOMETRY_RUNTIME_ODOMETRY_CHANNEL"
-    ],
     "description": "几何运行时发布里程计位姿的通道，导航据此获取实时位置。格式“/话题#消息类型”，只能修改话题名，改动消息类型会使几何运行时无法启动。"
   },
   "NUWAX_LCM_CHANNEL_TF": {
@@ -1394,9 +1357,6 @@
       "services/nuwax-workspace/crates/nuwax-nav-stack/src/topics.rs"
     ],
     "apply_scope": "重启网关、几何运行时及导航后端后生效",
-    "aliases": [
-      "NUWAX_GEOMETRY_RUNTIME_TF_CHANNEL"
-    ],
     "description": "几何运行时发布坐标变换（地图、里程计与机体坐标系的关系）的通道。格式“/话题#消息类型”，只能修改话题名，改动消息类型会使几何运行时无法启动。"
   },
   "NUWAX_LCM_CHANNEL_POINTCLOUD": {
@@ -1411,9 +1371,6 @@
       "services/nuwax-workspace/crates/nuwax-nav-stack/src/topics.rs"
     ],
     "apply_scope": "重启网关、几何运行时及导航后端后生效",
-    "aliases": [
-      "NUWAX_GEOMETRY_RUNTIME_POINTCLOUD_CHANNEL"
-    ],
     "description": "激光雷达单帧点云所用的通道。格式“/话题#消息类型”，只能修改话题名，改动消息类型会使几何运行时无法启动。"
   },
   "NUWAX_LCM_CHANNEL_CLOUD_MAP": {
@@ -1428,9 +1385,6 @@
       "services/nuwax-workspace/crates/nuwax-nav-stack/src/topics.rs"
     ],
     "apply_scope": "重启网关、几何运行时及导航后端后生效",
-    "aliases": [
-      "NUWAX_GEOMETRY_RUNTIME_CLOUDMAP_CHANNEL"
-    ],
     "description": "三维点云地图所用的通道，几何运行时与导航共用。格式“/话题#消息类型”，只能修改话题名，改动消息类型会使几何运行时无法启动。"
   },
   "NUWAX_LCM_CHANNEL_OCCUPANCY": {
@@ -1445,9 +1399,6 @@
       "services/nuwax-workspace/crates/nuwax-nav-stack/src/topics.rs"
     ],
     "apply_scope": "重启网关、几何运行时及导航后端后生效",
-    "aliases": [
-      "NUWAX_GEOMETRY_RUNTIME_OCCUPANCY_CHANNEL"
-    ],
     "description": "几何运行时发布二维占据栅格地图（可通行区域）的通道，导航据此规划。格式“/话题#消息类型”，只能修改话题名，改动消息类型会使几何运行时无法启动。"
   },
   "NUWAX_LCM_CHANNEL_CMD_VEL": {
@@ -1462,9 +1413,6 @@
       "services/nuwax-workspace/crates/nuwax-nav-stack/src/topics.rs"
     ],
     "apply_scope": "重启网关、几何运行时及导航后端后生效",
-    "aliases": [
-      "NUWAX_GEOMETRY_RUNTIME_CMD_VEL_CHANNEL"
-    ],
     "description": "导航发出运动速度指令所用的通道。格式“/话题#消息类型”，只能修改话题名，改动消息类型会使几何运行时无法启动。"
   },
   "NUWAX_LCM_CHANNEL_NAV_STATE": {
@@ -1479,9 +1427,6 @@
       "services/nuwax-workspace/crates/nuwax-nav-stack/src/topics.rs"
     ],
     "apply_scope": "重启网关、几何运行时及导航后端后生效",
-    "aliases": [
-      "NUWAX_GEOMETRY_RUNTIME_NAV_STATE_CHANNEL"
-    ],
     "description": "导航向几何运行时报告执行状态所用的通道。格式“/话题#消息类型”，只能修改话题名，改动消息类型会使几何运行时无法启动。"
   },
   "NUWAX_LCM_CHANNEL_FRONTIER": {
@@ -1496,9 +1441,6 @@
       "services/nuwax-workspace/crates/nuwax-nav-stack/src/topics.rs"
     ],
     "apply_scope": "重启网关、几何运行时及导航后端后生效",
-    "aliases": [
-      "NUWAX_GEOMETRY_RUNTIME_FRONTIERS_CHANNEL"
-    ],
     "description": "几何运行时发布自主探索边界（已知与未知区域交界）的通道。格式“/话题#消息类型”，只能修改话题名，改动消息类型会使几何运行时无法启动。"
   },
   "NUWAX_LCM_CHANNEL_NAV_CANCEL": {
@@ -1513,9 +1455,6 @@
       "services/nuwax-workspace/crates/nuwax-nav-stack/src/topics.rs"
     ],
     "apply_scope": "重启网关、几何运行时及导航后端后生效",
-    "aliases": [
-      "NUWAX_GEOMETRY_RUNTIME_NAV_CANCEL_CHANNEL"
-    ],
     "description": "几何运行时通知导航取消当前目标所用的通道。格式“/话题#消息类型”，只能修改话题名，改动消息类型会使几何运行时无法启动。"
   },
   "RUST_LOG": {
@@ -1575,9 +1514,6 @@
       "services/geometry/nuwax_geometry_runtime/src/nav_runtime.rs"
     ],
     "apply_scope": "重启几何运行时后生效",
-    "aliases": [
-      "NUWAX_GEOMETRY_RUNTIME_NAV_GOAL_CHANNEL"
-    ],
     "description": "几何运行时向导航下发目标点所用的通道。格式“/话题#消息类型”，只能修改话题名，改动消息类型会使几何运行时无法启动。"
   },
   "NUWAX_LCM_CHANNEL_NAV_PATH": {
@@ -1590,9 +1526,6 @@
       "services/geometry/nuwax_geometry_runtime/src/nav_runtime.rs"
     ],
     "apply_scope": "重启几何运行时后生效",
-    "aliases": [
-      "NUWAX_GEOMETRY_RUNTIME_NAV_PATH_CHANNEL"
-    ],
     "description": "几何运行时接收导航规划路线所用的通道。格式“/话题#消息类型”，只能修改话题名，改动消息类型会使几何运行时无法启动。"
   },
   "NUWAX_LCM_CHANNEL_LIO_ODOMETRY": {
@@ -1605,9 +1538,6 @@
       "services/geometry/nuwax_geometry_runtime/src/lio_owner.rs"
     ],
     "apply_scope": "重启几何运行时后生效",
-    "aliases": [
-      "NUWAX_GEOMETRY_RUNTIME_LIO_ODOMETRY_CHANNEL"
-    ],
     "description": "几何运行时激光惯性定位环节传递里程计位姿所用的通道。格式“/话题#消息类型”，只能修改话题名；三个激光惯性通道的话题须互不相同，也不能与其他通道重名。"
   },
   "NUWAX_LCM_CHANNEL_LIO_CLOUD": {
@@ -1620,9 +1550,6 @@
       "services/geometry/nuwax_geometry_runtime/src/lio_owner.rs"
     ],
     "apply_scope": "重启几何运行时后生效",
-    "aliases": [
-      "NUWAX_GEOMETRY_RUNTIME_LIO_CLOUD_CHANNEL"
-    ],
     "description": "几何运行时激光惯性定位环节传递配准点云所用的通道。格式“/话题#消息类型”，只能修改话题名；三个激光惯性通道的话题须互不相同，也不能与其他通道重名。"
   },
   "NUWAX_LCM_CHANNEL_LIO_STATUS": {
@@ -1635,9 +1562,6 @@
       "services/geometry/nuwax_geometry_runtime/src/lio_owner.rs"
     ],
     "apply_scope": "重启几何运行时后生效",
-    "aliases": [
-      "NUWAX_GEOMETRY_RUNTIME_LIO_STATUS_CHANNEL"
-    ],
     "description": "几何运行时发布激光惯性定位运行状态所用的通道。格式“/话题#消息类型”，只能修改话题名；三个激光惯性通道的话题须互不相同，也不能与其他通道重名。"
   },
   "NUWAX_LOG_DIR": {
@@ -1650,9 +1574,6 @@
       "core/settings.py"
     ],
     "apply_scope": "重启网关及各独立运行进程后生效",
-    "aliases": [
-      "GO2_PROXY_LOG_DIR"
-    ],
     "description": "网关及各独立进程日志文件的保存目录，每个进程写入各自的文件；目录不可写时自动改用备用目录。"
   },
   "NUWAX_LOG_FILE": {
@@ -1664,10 +1585,7 @@
     "consumers": [
       "core/settings.py"
     ],
-    "apply_scope": "重启网关后生效",
-    "aliases": [
-      "GO2_PROXY_LOG_FILE"
-    ]
+    "apply_scope": "重启网关后生效"
   },
   "NUWAX_LOG_LEVEL": {
     "zh_name": "日志级别",
@@ -1679,9 +1597,6 @@
       "core/settings.py"
     ],
     "apply_scope": "重启网关后生效",
-    "aliases": [
-      "GO2_PROXY_LOG_LEVEL"
-    ],
     "description": "网关等Python进程的全局日志级别，各分项日志级别留空时沿用此值。几何运行时、导航等原生组件在“Rust 运行时日志过滤”留空时也用此值。"
   },
   "NUWAX_MAP_FRAME": {
@@ -1694,10 +1609,7 @@
       "core/settings.py",
       "services/geometry/nuwax_geometry_runtime/src/channel_registry.rs"
     ],
-    "apply_scope": "重启网关、几何运行时及导航后端后生效",
-    "aliases": [
-      "NUWAX_GEOMETRY_MAP_FRAME"
-    ]
+    "apply_scope": "重启网关、几何运行时及导航后端后生效"
   },
   "NUWAX_BASE_FRAME": {
     "zh_name": "机器人基座坐标系",
@@ -1709,10 +1621,7 @@
       "core/settings.py",
       "services/geometry/nuwax_geometry_runtime/src/channel_registry.rs"
     ],
-    "apply_scope": "重启网关、几何运行时及导航后端后生效",
-    "aliases": [
-      "NUWAX_GEOMETRY_BASE_FRAME"
-    ]
+    "apply_scope": "重启网关、几何运行时及导航后端后生效"
   },
   "NUWAX_GEOMETRY_ODOM_FRAME": {
     "zh_name": "里程计坐标系",
@@ -1724,10 +1633,7 @@
       "core/settings.py",
       "services/geometry/nuwax_geometry_runtime/src/lcm_runtime.rs"
     ],
-    "apply_scope": "重启网关、几何运行时及导航后端后生效",
-    "aliases": [
-      "NUWAX_ODOM_FRAME"
-    ]
+    "apply_scope": "重启网关、几何运行时及导航后端后生效"
   },
   "NUWAX_NAV_BODY_TO_SUPPORT_Z_M": {
     "zh_name": "机体到支撑面距离（米）",
@@ -2039,9 +1945,6 @@
       "services/nuwax-workspace/crates/nuwax-nav-stack/src/topics.rs"
     ],
     "apply_scope": "重启网关、Geometry及导航后端后生效",
-    "aliases": [
-      "NUWAX_GEOMETRY_RUNTIME_PLANAR_NAVIGATION_CHANNEL"
-    ],
     "description": "二维建图（slam_2d）模式下几何运行时发给导航的实时二维地图通道，话题须与占据栅格通道不同。格式“/话题#消息类型”，只能修改话题名。"
   },
   "NUWAX_NAV_CAPABILITIES_JSON": {
@@ -2522,7 +2425,7 @@
     "consumers": [
       "services/geometry/source_runtime_env.sh",
       "services/geometry/nuwax_geometry_runtime/src/main.rs",
-      "services/geometry/nuwax_geometry_runtime/src/dynamic_cloud.rs"
+      "services/geometry/nuwax_geometry_runtime/src/dynamic_backend.rs"
     ],
     "apply_scope": "重启几何运行时后生效，无需重新构建",
     "effective_value_scope": "external_process",
@@ -2530,14 +2433,12 @@
     "type": "str",
     "default": "dufomap",
     "choices": [
-      "dufomap",
-      "legacy"
+      "dufomap"
     ],
     "choice_labels": [
-      "DUFOMap（默认）",
-      "旧在线分类链路"
+      "DUFOMap（默认）"
     ],
-    "description": "选择建图时的在线去动态算法。dufomap 使用 DUFOMap 判定静态点并撤销后来观测为空的历史点；legacy 保留旧在线分类链路。两种后端均保留原始扫描录制和近期障碍输入。空白恢复 dufomap；修改后须重启几何运行时。"
+    "description": "DUFOMap 判定静态点并撤销后来观测为空的历史点，保留原始扫描录制和近期障碍输入。空白恢复 dufomap；修改后须重启几何运行时。"
   },
   "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_MIB": {
     "section_id": "geometry_quality",

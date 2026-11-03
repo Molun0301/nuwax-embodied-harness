@@ -23,8 +23,6 @@ TEXT_MODEL = "NUWAX_MEMORY_TEXT_EMBEDDING_MODEL"
 TEXT_DIM = "NUWAX_MEMORY_TEXT_EMBEDDING_DIM"
 IMAGE_MODEL = "NUWAX_MEMORY_IMAGE_EMBEDDING_MODEL"
 IMAGE_DIM = "NUWAX_MEMORY_IMAGE_EMBEDDING_DIM"
-OLD_MODEL = "NUWAX_MEMORY_EMBEDDING_MODEL"
-OLD_DIM = "NUWAX_MEMORY_EMBEDDING_DIM"
 SAVED = "_NUWAX_INSTALLER_SAVED_"
 ONLINE = "tongyi-embedding-vision-flash-2026-03-06"
 
@@ -113,11 +111,10 @@ class GeneratedMemorySettingsChecks(unittest.TestCase):
         values.update(result)
         return values
 
-    def test_disabled_module_uses_lexical_only_with_synchronized_legacy_keys(self):
+    def test_disabled_module_uses_lexical_only(self):
         result = self.settings({}, enabled=False)
         self.assertEqual(result[TEXT_MODEL], "lexical-only")
-        self.assertEqual(result[OLD_MODEL], "lexical-only")
-        self.assertEqual(result[TEXT_DIM], result[OLD_DIM])
+        self.assertEqual(result[TEXT_DIM], "256")
         self.assertEqual(result[IMAGE_MODEL], "disabled")
         self.assertEqual(result[IMAGE_DIM], "512")
 
@@ -133,8 +130,6 @@ class GeneratedMemorySettingsChecks(unittest.TestCase):
         result = self.settings(existing)
         for key, value in existing.items():
             self.assertEqual(result[key], value)
-        self.assertEqual(result[OLD_MODEL], ONLINE)
-        self.assertEqual(result[OLD_DIM], "768")
 
     def test_custom_models_and_dimensions_survive_disable_and_reenable(self):
         original = {TEXT_MODEL: "/models/my-bge", TEXT_DIM: "384", IMAGE_MODEL: "/models/my-clip", IMAGE_DIM: "768"}
@@ -165,31 +160,8 @@ class GeneratedMemorySettingsChecks(unittest.TestCase):
         self.assertEqual(restored[TEXT_MODEL], ONLINE)
         self.assertEqual(restored[TEXT_DIM], "768")
 
-    def test_old_text_keys_are_read_and_new_keys_win(self):
-        legacy = self.settings({OLD_MODEL: "sentence-transformers:custom", OLD_DIM: "384"})
-        self.assertEqual(legacy[TEXT_MODEL], "sentence-transformers:custom")
-        self.assertEqual(legacy[TEXT_DIM], "384")
-        current = self.settings({TEXT_MODEL: ONLINE, TEXT_DIM: "768", OLD_MODEL: "old-model", OLD_DIM: "32"})
-        self.assertEqual(current[TEXT_MODEL], ONLINE)
-        self.assertEqual(current[OLD_MODEL], ONLINE)
-        self.assertEqual(current[TEXT_DIM], "768")
-        self.assertEqual(current[OLD_DIM], "768")
 
-    def test_legacy_text_keys_survive_disable_and_reenable(self):
-        result = self.settings(self.settings({OLD_MODEL: ONLINE, OLD_DIM: "768"}, enabled=False))
-        self.assertEqual(result[TEXT_MODEL], ONLINE)
-        self.assertEqual(result[TEXT_DIM], "768")
 
-    def test_generated_file_template_cannot_shadow_user_legacy_model(self):
-        (self.root / ".env.example").write_text(f"{TEXT_MODEL}=template-bge\n{TEXT_DIM}=1024\n")
-        prefix = self.root / "install/generations/one"
-        runtime.write_runtime(self.root, prefix, ["core", "memory"], "customrobot", {
-            OLD_MODEL: ONLINE, OLD_DIM: "768",
-        })
-        result = runtime.read_settings(prefix / "settings.env")
-        self.assertEqual(result[TEXT_MODEL], ONLINE)
-        self.assertEqual(result[TEXT_DIM], "768")
-        self.assertEqual(result[OLD_MODEL], ONLINE)
 
     def test_generated_disabled_file_preserves_saved_real_model(self):
         prefix = self.root / "install/generations/one"

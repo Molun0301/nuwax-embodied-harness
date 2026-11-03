@@ -15,13 +15,10 @@ use nuwax_mapping::{
     loop_closure::{CorrectionKeyframe, CorrectionTimeline},
 };
 use std::{
-    collections::BTreeMap,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-// legacy保留原点数上限；dufomap只持末帧并从日志流式读取。
-const MAX_ARCHIVED_POINTS: usize = 8_000_000;
 pub(crate) const REBUILD_BUDGET: Duration = Duration::from_secs(3);
 // 后台准备按小段让出计算资源；累计历史耗时不再成为丢弃回环的条件。
 pub(crate) const REPLAY_SLICE: Duration = Duration::from_millis(8);
@@ -99,13 +96,9 @@ impl ArchivedScan {
 
 #[derive(Default)]
 pub(crate) struct ScanHistory {
-    scans: BTreeMap<ArchiveKey, ArchivedScan>,
-    point_count: usize,
-    incomplete: bool,
-    dynamic_scene: crate::dynamic_scene::DynamicScene,
     dufo: crate::dynamic_backend::OnlineDufo,
     latest_static_scan: Option<(u64, usize, crate::lio_ingress::WeakAdmittedRegisteredScan, Arc<[u32]>)>,
-    stream: Option<StreamHistory>,
+    stream: StreamHistory,
 }
 
 #[derive(Default)]
@@ -119,23 +112,18 @@ struct StreamHistory {
 
 impl ScanHistory {
     pub fn clear(&mut self) {
-        self.scans.clear();
-        self.point_count = 0;
-        self.incomplete = false;
-        self.dynamic_scene = Default::default();
         self.dufo = Default::default();
         self.latest_static_scan = None;
-        if self.stream.is_some() { self.stream = Some(StreamHistory::default()); }
+        self.stream = StreamHistory::default();
     }
 
-    pub(crate) fn enable_streaming(&mut self) { self.stream = Some(StreamHistory::default()); }
 
     pub(crate) fn bind_replay_source(&mut self, source: Option<nuwax_cloud_cleanup::scan_log::ReplaySource>) {
-        if let Some(stream) = &mut self.stream { stream.source = source; }
+        self.stream.source = source;
     }
 
-    pub(crate) fn disk_input(&self, trajectory: &[OptimizedKeyframe]) -> Result<Option<DiskReplayInput>, RebuildError> {
-        let Some(stream) = &self.stream else { return Ok(None); };
+    pub(crate) fn disk_input(&self, trajectory: &[OptimizedKeyframe]) -> Result<DiskReplayInput, RebuildError> {
+        let stream = &self.stream;
         if stream.unsupported_auxiliary { return Err(RebuildError::HistoryUnavailable); }
         let latest = stream.latest.clone().ok_or(RebuildError::HistoryUnavailable)?;
         let source = stream.source.clone().ok_or(RebuildError::HistoryUnavailable)?;
@@ -149,15 +137,13 @@ impl ScanHistory {
             RebuildError::HistoryUnavailable
         })?;
         let first_receipt = stream.first_receipt.ok_or(RebuildError::HistoryUnavailable)?;
-        Ok(Some(DiskReplayInput { source, latest, locals, first_receipt }))
+        Ok(DiskReplayInput { source, latest, locals, first_receipt })
     }
 
-    pub(crate) fn disk_tail(&self) -> Result<Option<ArchivedScan>, RebuildError> {
-        match &self.stream {
-            Some(stream) if stream.unsupported_auxiliary || stream.source.is_none() => Err(RebuildError::HistoryUnavailable),
-            Some(stream) => stream.latest.clone().map(Some).ok_or(RebuildError::HistoryUnavailable),
-            None => Ok(None),
-        }
+    pub(crate) fn disk_tail(&self) -> Result<ArchivedScan, RebuildError> {
+        let stream = &self.stream;
+        if stream.unsupported_auxiliary || stream.source.is_none() { return Err(RebuildError::HistoryUnavailable); }
+        stream.latest.clone().ok_or(RebuildError::HistoryUnavailable)
     }
 
     pub fn record(
@@ -167,11 +153,7 @@ impl ScanHistory {
     ) -> Result<(), String> {
         let source_timestamp_ns = source.source_timestamp_ns();
         let binding = source.binding();
-        if let Some(stream) = &self.stream { source.bind_pgo_keyframes(stream.keyframes.clone())?; }
-        if let Some(existing) = self.scans.get(&(source_timestamp_ns, ArchiveSourceKey::Lidar)) {
-            return if existing.source.lidar() == Some(source) { Ok(()) }
-                else { Err("PGO历史扫描来源冲突".into()) };
-        }
+        source.bind_pgo_keyframes(self.stream.keyframes.clone())?;
         if let Some((stamp, count, latest, _)) = &self.latest_static_scan {
             if source_timestamp_ns <= *stamp {
                 return if source_timestamp_ns == *stamp && source.body_points().len() == *count && latest.matches(source) { Ok(()) }
@@ -183,23 +165,12 @@ impl ScanHistory {
             (binding.registration_map_from_odom * binding.frozen_odom_from_body).inverse();
         let sensor_origin = binding.sensor_origin_map.map(|p| body_from_map * Point3::from(p));
         let static_indices = if let Some(indices) = source.static_indices() { indices.to_vec() }
-        else if crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::DufoMap {
+        else {
             if let Some(origin) = sensor_origin {
                 let points: Vec<_> = body_points.iter().map(|p| binding.frozen_odom_from_body * p).collect();
                 let origin = binding.frozen_odom_from_body * origin;
                 self.dufo.observe(&points, origin.coords.into(), source_timestamp_ns, Isometry3::identity())?.1
             } else { (0..body_points.len() as u32).collect() }
-        } else if let Some(labels)=source.point_labels(){
-            labels.labels.iter().enumerate().filter_map(|(i,label)|(!label.dynamic() && *label != crate::human_point_labels::PointLabel::PendingTrack).then_some(i as u32)).collect::<Vec<_>>()
-        } else {
-            self.dynamic_scene.clear_frame();
-            if let Some(origin)=sensor_origin {
-                let odom_points=body_points.iter().map(|p|binding.frozen_odom_from_body*p).collect::<Vec<_>>();
-                let odom_origin=binding.frozen_odom_from_body*origin;
-                self.dynamic_scene.observe(&odom_points,odom_origin.coords.into(),source_timestamp_ns);
-            }
-            body_points.iter().enumerate().filter_map(|(i,p)|{let p=binding.frozen_odom_from_body*p;
-                (!self.dynamic_scene.is_dynamic([p.x,p.y,p.z])).then_some(i as u32)}).collect()
         };
         self.latest_static_scan = Some((source_timestamp_ns, body_points.len(), source.downgrade(), static_indices.into()));
         let scan = ArchivedScan {
@@ -207,48 +178,18 @@ impl ScanHistory {
             sensor_origin_body: sensor_origin,
             body_points: body_points.clone(), source: ArchivedSource::Lidar(source.clone()),
         };
-        if let Some(stream) = &mut self.stream {
-            // 常驻历史仅持最后一帧；未写盘的选中扫描仍由原有界队列拥有。
-            stream.first_receipt.get_or_insert((source_timestamp_ns, received_at_ns));
-            stream.latest = Some(scan);
-            Ok(())
-        } else { self.archive(scan) }
+        let stream = &mut self.stream;
+        // 常驻历史仅持最后一帧；未写盘的选中扫描仍由原有界队列拥有。
+        stream.first_receipt.get_or_insert((source_timestamp_ns, received_at_ns));
+        stream.latest = Some(scan);
+        Ok(())
     }
 
     pub(crate) fn record_auxiliary(&mut self,
-        source: crate::lcm_runtime::mapping_observation::RegisteredObservation,
+        _source: crate::lcm_runtime::mapping_observation::RegisteredObservation,
     ) -> Result<(), String> {
-        if let Some(stream) = &mut self.stream {
-            // 辅助来源没有进入LiDAR日志，不能用不完整输入替换整图。
-            stream.unsupported_auxiliary = true;
-            return Ok(());
-        }
-        self.archive(ArchivedScan {
-            source_timestamp_ns: source.timestamp_ns(), received_at_ns: source.received_at_ns(),
-            odom_from_body: source.odom_from_body(), sensor_origin_body: Some(source.origin_body()),
-            body_points: source.body_points().clone(), source: ArchivedSource::Auxiliary(source),
-        })
-    }
-
-    fn archive(&mut self, scan: ArchivedScan) -> Result<(), String> {
-        let key = scan.key();
-        if let Some(existing) = self.scans.get(&key) {
-            return if existing.source == scan.source { Ok(()) } else { Err("PGO归档来源冲突".into()) };
-        }
-        if self.incomplete {
-            self.dufo = Default::default();
-            return Ok(());
-        }
-        if self.point_count.saturating_add(scan.body_points.len()) > MAX_ARCHIVED_POINTS {
-            tracing::warn!(event = "pgo.history.exhausted", archived_points = self.point_count,
-                incoming_points = scan.body_points.len(), "PGO归档容量耗尽，本会话停止完整历史校正，正常建图继续");
-            self.scans.clear(); self.point_count = 0; self.incomplete = true;
-            // 原始历史退休时一起释放私有兜底证据，不让未分类来源继续积累第二棵树。
-            self.dufo = Default::default();
-            return Ok(());
-        }
-        self.point_count += scan.body_points.len();
-        self.scans.insert(key, scan);
+        // 辅助来源没有进入雷达日志，不能用不完整输入替换整图。
+        self.stream.unsupported_auxiliary = true;
         Ok(())
     }
 
@@ -262,33 +203,12 @@ impl ScanHistory {
     }
 
     pub fn latest_timestamp_ns(&self) -> Option<u64> {
-        if let Some(stream) = &self.stream { return stream.latest.as_ref().map(|scan| scan.source_timestamp_ns); }
-        self.scans.last_key_value().map(|((stamp, _), _)| *stamp)
+        self.stream.latest.as_ref().map(|scan| scan.source_timestamp_ns)
     }
 
     pub fn snapshot_after(&self, after: u64) -> Result<Vec<ArchivedScan>, RebuildError> {
-        if let Some(stream) = &self.stream {
-            if stream.unsupported_auxiliary { return Err(RebuildError::HistoryUnavailable); }
-            return Ok(stream.latest.iter().filter(|scan| scan.source_timestamp_ns > after).cloned().collect());
-        }
-        if self.incomplete {
-            return Err(RebuildError::HistoryUnavailable);
-        }
-        use std::ops::Bound::{Excluded, Unbounded};
-        Ok(self
-            .scans
-            .range((Excluded((after, ArchiveSourceKey::Lidar)), Unbounded))
-            .filter(|((stamp, _), _)| *stamp > after)
-            .map(|(_, scan)| scan.clone())
-            .collect())
-    }
-
-    #[cfg(test)]
-    pub fn snapshot(&self) -> Result<Vec<ArchivedScan>, RebuildError> {
-        if self.incomplete {
-            return Err(RebuildError::HistoryUnavailable);
-        }
-        Ok(self.scans.values().cloned().collect())
+        if self.stream.unsupported_auxiliary { return Err(RebuildError::HistoryUnavailable); }
+        Ok(self.stream.latest.iter().filter(|scan| scan.source_timestamp_ns > after).cloned().collect())
     }
 }
 
@@ -352,6 +272,7 @@ pub(crate) struct PreparedReplay {
 }
 
 impl ReplayBuilder {
+    #[cfg(test)]
     pub(crate) fn new(
         scans: &[ArchivedScan],
         trajectory: Vec<OptimizedKeyframe>,
@@ -538,7 +459,7 @@ impl ReplayBuilder {
                 .map(|point| map_from_body * point)
                 .collect();
             let origin = map_from_body * scan.sensor_origin_body.ok_or("PGO原始扫描缺少实测雷达原点，保留当前地图，不补造射线")?;
-            let dynamic_frame = if crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::DufoMap {
+            let dynamic_frame = {
                 Some(if let Some(terminal) = &self.terminal_dufo {
                     let evidence: Vec<_> = scan.body_points.iter().map(|point| scan.odom_from_body * point).collect();
                     let frame = terminal.terminal_frame(&evidence, &points)?;
@@ -551,10 +472,6 @@ impl ReplayBuilder {
                     }
                     frame
                 } else { self.dufo.observe(&points, origin.coords.into(), scan.source_timestamp_ns, Isometry3::identity())?.0 })
-            } else {
-                scan.source.lidar().and_then(|scan| scan.dynamic_frame())
-                    .map(|frame| crate::dynamic_backend::MappedFrame::new(frame,
-                        map_from_body * scan.odom_from_body.inverse(), &points, 0)).transpose()?
             };
             let input = Arc::new(MappingBackendInput {
                 session_id: "pgo-private-rebuild".into(),
@@ -930,7 +847,8 @@ fn check_budget(
     }
 }
 
-/// 同步受管调用仍要求冻结扫描尾部；后台追赶复用同一个私有重放实现。
+/// 测试参考重放使用与生产磁盘重放相同的私有构图实现。
+#[cfg(test)]
 pub(crate) fn rebuild(
     scans: Vec<ArchivedScan>,
     trajectory: Vec<OptimizedKeyframe>,
@@ -993,6 +911,7 @@ pub(crate) fn rebuild(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use super::*;
     use crate::lio_ingress::RegistrationBinding;
 
@@ -1056,36 +975,11 @@ mod tests {
         let points=[Point3::new(1.,2.,3.)];
         let source=AdmittedRegisteredScan::from_map_points_for_test(1,binding,&points);
         let mut history=ScanHistory::default();history.record(&source,1).unwrap();
-        let snapshot=history.snapshot().unwrap();
+        let snapshot=history.snapshot_after(0).unwrap();
         assert!(snapshot[0].sensor_origin_body.is_none());
         assert_eq!(snapshot[0].body_points.as_ref(),&points);
     }
 
-    #[test]
-    fn archive_capacity_disables_only_complete_history_and_resets_with_session() {
-        let binding = test_binding();
-        let mut history = ScanHistory::default();
-        let points = [Point3::new(1.0, 2.0, 3.0)];
-        history.record(&AdmittedRegisteredScan::from_map_points_for_test(1, binding.clone(), &points), 1).unwrap();
-        assert_eq!(history.snapshot().unwrap().len(), 1);
-        // 只注入容量计数，避免为边界回归分配数百兆字节数据。
-        history.point_count = MAX_ARCHIVED_POINTS;
-        history.record(&AdmittedRegisteredScan::from_map_points_for_test(2, binding.clone(), &points), 2).unwrap();
-        assert!(matches!(
-            history.snapshot(),
-            Err(RebuildError::HistoryUnavailable)
-        ));
-        assert_eq!(history.point_count, 0);
-        assert!(history.scans.is_empty());
-        history.record(&AdmittedRegisteredScan::from_map_points_for_test(3, binding.clone(), &points), 3).unwrap();
-        assert!(matches!(
-            history.snapshot(),
-            Err(RebuildError::HistoryUnavailable)
-        ));
-        history.clear();
-        history.record(&AdmittedRegisteredScan::from_map_points_for_test(4, binding.clone(), &points), 4).unwrap();
-        assert_eq!(history.snapshot().unwrap()[0].source_timestamp_ns, 4);
-    }
 
     #[test]
     fn archive_and_correction_share_owner_points_until_their_last_retirement() {
@@ -1095,7 +989,7 @@ mod tests {
         let allocation = points.as_ptr();
         let mut history = ScanHistory::default();
         history.record(&source, 11).unwrap();
-        let replay = history.snapshot().unwrap();
+        let replay = history.snapshot_after(0).unwrap();
         assert_eq!(replay[0].body_points.as_ptr(), allocation);
         assert_eq!(replay[0].source.lidar().unwrap().body_points().as_ptr(), allocation);
         let correction_points = source.body_points().clone();
@@ -1119,8 +1013,7 @@ mod tests {
         history.record(&source, 11).unwrap();
         let indices = history.static_point_indices(&source).unwrap();
         history.record(&independent, 12).unwrap();
-        assert_eq!(history.point_count, 1);
-        assert_eq!(history.snapshot().unwrap()[0].received_at_ns, 11);
+        assert_eq!(history.snapshot_after(0).unwrap()[0].received_at_ns, 11);
         assert!(Arc::ptr_eq(&indices, &history.static_point_indices(&independent).unwrap()));
         let mut conflicts = Vec::new();
         let mut changed = binding.clone(); changed.cloud_source_sequence += 1;
@@ -1131,52 +1024,17 @@ mod tests {
         for conflict in conflicts {
             assert!(history.record(&conflict, 12).is_err());
             assert!(history.static_point_indices(&conflict).is_err());
-            assert_eq!(history.point_count, 1);
-            assert!(Arc::ptr_eq(&indices, &history.static_point_indices(&source).unwrap()));
+                assert!(Arc::ptr_eq(&indices, &history.static_point_indices(&source).unwrap()));
         }
         let newer = AdmittedRegisteredScan::from_map_points_for_test(20, binding.clone(), &points);
         history.record(&newer, 21).unwrap();
-        history.record(&source, 22).unwrap(); // archived exact duplicate remains idempotent
+        assert!(history.record(&source, 22).is_err());
         assert!(history.static_point_indices(&source).is_err());
         assert_eq!(&*indices, &[0]); // already issued static selections remain immutable
         let stale = AdmittedRegisteredScan::from_map_points_for_test(9, binding, &points);
         assert!(history.record(&stale, 22).is_err());
     }
 
-    #[test]
-    fn exhausted_history_retires_sources_without_static_selection_pinning_payload() {
-        let points = [Point3::new(1.0, 2.0, 3.0)];
-        let source = AdmittedRegisteredScan::from_map_points_for_test(10, test_binding(), &points);
-        let source_retained = source.retention_probe_for_test();
-        let mut history = ScanHistory::default();
-        history.record(&source, 11).unwrap();
-        drop(source);
-        history.point_count = MAX_ARCHIVED_POINTS;
-        let next = AdmittedRegisteredScan::from_map_points_for_test(20, test_binding(), &points);
-        let next_retained = next.retention_probe_for_test();
-        history.record(&next, 21).unwrap();
-        assert!(!source_retained());
-        assert_eq!(history.dufo.memory_bytes(), 0, "历史耗尽同时释放私有重算证据");
-        assert!(history.snapshot().is_err());
-        history.record(&next, 22).unwrap();
-        assert_eq!(&*history.static_point_indices(&next).unwrap(), &[0]);
-        let indices = history.static_point_indices(&next).unwrap();
-        drop(next);
-        assert!(!next_retained());
-        let expired = AdmittedRegisteredScan::from_map_points_for_test(20, test_binding(), &points);
-        assert!(history.record(&expired, 22).is_err());
-        assert!(history.static_point_indices(&expired).is_err());
-        assert_eq!(&*indices, &[0]);
-        let latest = AdmittedRegisteredScan::from_map_points_for_test(30, test_binding(), &points);
-        let latest_retained = latest.retention_probe_for_test();
-        history.record(&latest, 31).unwrap();
-        assert_eq!(history.dufo.memory_bytes(), 0, "不完整会话不能随新来源重新积累私有树");
-        assert!(!next_retained());
-        drop(latest);
-        assert!(!latest_retained());
-        history.clear();
-        assert!(!latest_retained());
-    }
 
     #[test]
     fn cloud_stage_stop_joins_even_with_unclaimed_reply() {
@@ -1360,12 +1218,7 @@ mod tests {
             assert!(cloud.accumulate_mapping_scan_with_source(1, &points,
                 accepted.lidar().unwrap().scan().binding().sensor_origin_map, scan.source_timestamp_ns, Some(&accepted)));
             scan.source = accepted.source();
-            if crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::Legacy {
-                assert!(scan.source.lidar().unwrap().dynamic_frame().is_some());
-            } else {
-                assert!(scan.source.lidar().unwrap().dynamic_frame().is_none());
-                assert!(scan.source.lidar().unwrap().static_indices().is_some());
-            }
+            assert!(scan.source.lidar().unwrap().static_indices().is_some());
         }
         eprintln!("CLASSIFY_PREP frames={} wall_ms={}", scans.len(), started.elapsed().as_millis());
         cloud.cleanup_product_owned_file().unwrap();
@@ -1650,7 +1503,7 @@ mod tests {
                 let snapshot = cloud.committed_snapshot().unwrap();
                 eprintln!(
                     "ONLINE_MAP backend={:?} capture={capture} static_points={} voxel_size={}",
-                    crate::dynamic_backend::backend(),
+                    "dufomap",
                     snapshot.point_count,
                     snapshot.voxel_size
                 );
@@ -2050,37 +1903,6 @@ mod tests {
         // 已取消的私有重建不污染下一次重建的内核或临时点云。
         rebuild_scale(8, Duration::from_secs(30), || false).unwrap();
     }
-    #[test]
-    fn auxiliary_same_time_keeps_lidar_owner_and_its_distinct_source() {
-        let (original,trajectory)=scale_input(2);
-        let mut history=ScanHistory::default();
-        let lidar=original[0].source.lidar().unwrap();
-        history.record(lidar,original[0].received_at_ns).unwrap();
-        let indices=history.static_point_indices(lidar).unwrap();
-        let auxiliary=crate::lcm_runtime::mapping_observation::RegisteredObservation::for_test(
-            original[0].source_timestamp_ns,"depth-front",vec![Point3::new(0.7,0.3,-0.8)],
-            original[0].odom_from_body,[0.12,0.,0.3]);
-        history.record_auxiliary(auxiliary.clone()).unwrap();
-        history.record_auxiliary(auxiliary).unwrap();
-        assert_eq!(history.static_point_indices(lidar).unwrap(),indices);
-        assert_eq!(history.snapshot().unwrap().len(),2);
-        assert!(history.snapshot_after(original[0].source_timestamp_ns).unwrap().is_empty());
-        history.record(original[1].source.lidar().unwrap(),original[1].received_at_ns).unwrap();
-        let scans=history.snapshot().unwrap();
-        assert_eq!(scans.len(),3);
-        assert!(scans[0].source.lidar().is_some());
-        assert!(scans[1].source.lidar().is_none());
-        let config=MappingBackendComputeConfig {resolution:0.1,initial_safe_radius_meters:0.,window_capacity:10_000};
-        let mut builder=ReplayBuilder::new(&scans,trajectory,Isometry3::identity(),MappingBackendSpec::Voxel,
-            config,"map".into(),Duration::from_secs(10),&||false).unwrap();
-        builder.append(&scans,&||false).unwrap();
-        assert_eq!(builder.processed,3);
-        assert!(matches!(builder.append(&scans[2..],&||false),Err(RebuildError::Invalid(_))));
-        builder.cloud.as_mut().unwrap().cleanup_product_owned_file().unwrap();
-        let conflicting=crate::lcm_runtime::mapping_observation::RegisteredObservation::for_test(
-            scans[0].source_timestamp_ns,"depth-front",vec![Point3::new(9.,9.,9.)],Isometry3::identity(),[0.12,0.,0.3]);
-        assert!(history.record_auxiliary(conflicting).unwrap_err().contains("来源冲突"));
-    }
 
     #[test]
     fn auxiliary_heightfield_replays_corrected_originals_in_serial_and_worker_lanes() {
@@ -2090,11 +1912,15 @@ mod tests {
             Point3::new(0.28, 0.008 + y as f64 * 0.02, 0.21 + z as f64 * 0.02))).collect();
         let floor: Vec<_> = (0..8).flat_map(|x| (0..8).map(move |y|
             Point3::new(0.008 + x as f64 * 0.004, 0.008 + y as f64 * 0.004, 0.01))).collect();
-        let mut history = ScanHistory::default();
+        let mut scans = Vec::new();
         for (sequence, stamp) in [(1, 1_000_000_000), (2, 1_100_000_000)] {
             let mut binding = test_binding();
             binding.cloud_source_sequence = sequence;
-            history.record(&AdmittedRegisteredScan::from_map_points_for_test(stamp, binding, &wall), stamp + 1).unwrap();
+            let source = AdmittedRegisteredScan::from_map_points_for_test(stamp, binding, &wall);
+            scans.push(ArchivedScan { source_timestamp_ns: stamp, received_at_ns: stamp + 1,
+                odom_from_body: source.binding().frozen_odom_from_body,
+                sensor_origin_body: Some(Point3::origin()), body_points: source.body_points().clone(),
+                source: ArchivedSource::Lidar(source) });
         }
         for sensor in ["depth-front", "depth-left"] {
             let mut points = floor.clone();
@@ -2103,11 +1929,13 @@ mod tests {
             let source = RegisteredObservation::for_test_source(1_100_000_000, 12,
                 LayerSource::Auxiliary { sensor_id: sensor.into(), clock_id: "clock".into(),
                     runtime_generation: 7, session_generation: 1 }, points, indices, Isometry3::identity());
-            history.record_auxiliary(source.clone()).unwrap();
-            history.record_auxiliary(source).unwrap();
+            scans.push(ArchivedScan {
+                source_timestamp_ns: source.timestamp_ns(), received_at_ns: source.received_at_ns(),
+                odom_from_body: source.odom_from_body(), sensor_origin_body: Some(source.origin_body()),
+                body_points: source.body_points().clone(), source: ArchivedSource::Auxiliary(source),
+            });
         }
-        let scans = history.snapshot().unwrap();
-        assert_eq!(scans.len(), 4, "source replay is idempotent before geometry replay");
+        assert_eq!(scans.len(), 4);
         let trajectory = vec![
             OptimizedKeyframe { source_timestamp_ns: 1_000_000_000,
                 translation_m: [0.; 3], rotation_xyzw: [0., 0., 0., 1.] },

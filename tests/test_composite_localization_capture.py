@@ -229,13 +229,6 @@ class ProviderCompositeCaptureTests(OfflineCaptureCase):
                 self.assertEqual(provider.capture_localization_sample(), (None, None))
                 self.assertEqual(stub.calls, [])
 
-    def test_missing_rpc_rejects_without_starting_partial_read(self):
-        for method in ('GetFrameTree', 'GetCurrentPose'):
-            with self.subTest(method=method):
-                provider = provider_fixture()
-                setattr(provider._stub, method, None)
-                self.assertEqual(provider.capture_localization_sample(), (None, None))
-                self.assertEqual(provider._stub.calls, [])
 
     def test_rpc_failure_discards_both_values_without_retry(self):
         for stage in ('tree', 'pose'):

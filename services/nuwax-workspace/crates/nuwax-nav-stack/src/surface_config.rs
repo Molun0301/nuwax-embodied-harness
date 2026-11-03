@@ -41,7 +41,7 @@ impl SurfaceNavigationConfig {
         let max_step = configured_number("NUWAX_GEOMETRY_TRAVERSABILITY_MAX_STEP_HEIGHT_M", 0.15)?;
         let max_slope = configured_number("NUWAX_GEOMETRY_TRAVERSABILITY_MAX_SLOPE_DEG", 18.0)?;
         let tread = configured_number("NUWAX_NAV_MIN_STAIR_TREAD_M", 0.2)?;
-        let frame = std::env::var("NUWAX_GEOMETRY_MAP_FRAME").unwrap_or_else(|_| "map".into());
+        let frame = std::env::var("NUWAX_MAP_FRAME").unwrap_or_else(|_| "map".into());
         let mut config = Self::new(
             frame, offset, width, height, voxel, max_step, max_slope, tread,
         )?;

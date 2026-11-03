@@ -1,9 +1,9 @@
 //! nuwax 地图云服务
 //!
-//! The default `cloud-enabled` feature exposes explicit live HTTP clients and
-//! offline raster utilities. Google requests require `GOOGLE_MAPS_API_KEY`;
-//! OSM endpoints and user-agent values can be overridden with `NUWAX_OSM_*`
-//! environment variables. Offline mode never fabricates network results.
+//! 默认 `cloud-enabled` 特性提供网络客户端和离线栅格工具。
+//! 谷歌地图密钥读取 `NUWAX_GOOGLE_MAPS_API_KEY`。
+//! 开放街道地图地址和客户端标识通过 `NUWAX_OSM_*` 设置。
+//! 离线模式不产生虚构网络结果。
 //!
 //! 模块：
 //! - `google_maps`: `geocode` / `places_nearby` / `GoogleMapsClient`

@@ -182,12 +182,6 @@ def config_snapshot(file_values: Mapping[str, str], environment: Optional[Mappin
         _SNAPSHOT.reset(token)
 
 
-@lru_cache(maxsize=1)
-def config_aliases() -> Dict[str, tuple]:
-    catalog = json.loads(Path(__file__).with_name("config_catalog.json").read_text(encoding="utf-8"))
-    return {key: tuple(entry["aliases"]) for key, entry in catalog.items() if entry.get("aliases")}
-
-
 def raw_value(name: str, default: str, file_values: Mapping[str, str]) -> str:
     snapshot = _SNAPSHOT.get()
     files, environment = (snapshot[0], snapshot[1]) if snapshot else (file_values, os.environ)
@@ -195,11 +189,6 @@ def raw_value(name: str, default: str, file_values: Mapping[str, str]) -> str:
         return environment[name]
     if name in files:
         return files[name]
-    for alias in config_aliases().get(name, ()):
-        if alias in environment:
-            return environment[alias]
-        if alias in files:
-            return files[alias]
     return default
 
 
@@ -238,10 +227,7 @@ def runtime_value(name: str, default=None):
 
 def main() -> None:
     # NUL（空字符）分隔避免 shell 重新解释值；输出供 read -d '' 接收。
-    if sys.argv[1] == "--aliases":
-        values = {alias: os.environ[key] for key, aliases in config_aliases().items()
-                  if key in os.environ for alias in aliases}
-    elif sys.argv[1] == "--merged":
+    if sys.argv[1] == "--merged":
         values = configuration_values()
         values["_NUWAX_CONFIG_LOAD_OK"] = "1"
     elif sys.argv[1] == "--public-keys":

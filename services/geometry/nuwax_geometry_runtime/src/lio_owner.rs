@@ -30,11 +30,8 @@ pub(crate) const DEFAULT_LIO_CLOUD_CHANNEL: &str =
     "/geometry/lio/cloud#nuwax_msgs.LioCloudEnvelope";
 pub(crate) const DEFAULT_LIO_STATUS_CHANNEL: &str = "/geometry/lio/status#nuwax_msgs.LioStatus";
 
-const LIO_ODOMETRY_CHANNEL_ENV: &str = "NUWAX_GEOMETRY_RUNTIME_LIO_ODOMETRY_CHANNEL";
 const LIO_ODOMETRY_CHANNEL_PLATFORM_ENV: &str = "NUWAX_LCM_CHANNEL_LIO_ODOMETRY";
-const LIO_CLOUD_CHANNEL_ENV: &str = "NUWAX_GEOMETRY_RUNTIME_LIO_CLOUD_CHANNEL";
 const LIO_CLOUD_CHANNEL_PLATFORM_ENV: &str = "NUWAX_LCM_CHANNEL_LIO_CLOUD";
-const LIO_STATUS_CHANNEL_ENV: &str = "NUWAX_GEOMETRY_RUNTIME_LIO_STATUS_CHANNEL";
 const LIO_STATUS_CHANNEL_PLATFORM_ENV: &str = "NUWAX_LCM_CHANNEL_LIO_STATUS";
 const LIO_SENSOR_FRAME_ENV: &str = "NUWAX_GEOMETRY_LIDAR_FRAME";
 const DEFAULT_LIO_SENSOR_FRAME: &str = "utlidar_lidar";
@@ -187,22 +184,18 @@ impl DeviceLioOwnerSpec {
         frames: &ValidatedFrameBindings,
     ) -> Result<Self, String> {
         let public_odometry_pattern = strict_env_or_default(
-            LIO_ODOMETRY_CHANNEL_ENV,
             LIO_ODOMETRY_CHANNEL_PLATFORM_ENV,
             DEFAULT_LIO_ODOMETRY_CHANNEL,
         )?;
         let public_cloud_pattern = strict_env_or_default(
-            LIO_CLOUD_CHANNEL_ENV,
             LIO_CLOUD_CHANNEL_PLATFORM_ENV,
             DEFAULT_LIO_CLOUD_CHANNEL,
         )?;
         let status_pattern = strict_env_or_default(
-            LIO_STATUS_CHANNEL_ENV,
             LIO_STATUS_CHANNEL_PLATFORM_ENV,
             DEFAULT_LIO_STATUS_CHANNEL,
         )?;
         let sensor_frame = strict_env_or_default(
-            LIO_SENSOR_FRAME_ENV,
             LIO_SENSOR_FRAME_ENV,
             DEFAULT_LIO_SENSOR_FRAME,
         )?;
@@ -1688,26 +1681,24 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
     value[..end].to_owned()
 }
 
-fn strict_env_or_default(preferred: &str, fallback: &str, default: &str) -> Result<String, String> {
-    for key in [preferred, fallback] {
-        match std::env::var(key) {
-            Ok(value) => {
-                if value.is_empty() {
-                    return Err(format!("LIO_PREFLIGHT_FAILED env={key} value_is_empty"));
-                }
-                if value != value.trim() {
-                    return Err(format!(
-                        "LIO_PREFLIGHT_FAILED env={key} value_has_surrounding_whitespace"
-                    ));
-                }
-                return Ok(value);
+fn strict_env_or_default(key: &str, default: &str) -> Result<String, String> {
+    match std::env::var(key) {
+        Ok(value) => {
+            if value.is_empty() {
+                return Err(format!("LIO_PREFLIGHT_FAILED env={key} value_is_empty"));
             }
-            Err(std::env::VarError::NotPresent) => {}
-            Err(std::env::VarError::NotUnicode(_)) => {
+            if value != value.trim() {
                 return Err(format!(
-                    "LIO_PREFLIGHT_FAILED env={key} value_is_not_unicode"
+                    "LIO_PREFLIGHT_FAILED env={key} value_has_surrounding_whitespace"
                 ));
             }
+            return Ok(value);
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!(
+                "LIO_PREFLIGHT_FAILED env={key} value_is_not_unicode"
+            ));
         }
     }
     Ok(default.to_owned())
@@ -2460,9 +2451,8 @@ mod tests {
         assert!(padded_frame.contains("invalid_frame"));
 
         let preferred = format!("NUWAX_GEOMETRY_TEST_LIO_PADDED_{}", std::process::id());
-        let fallback = format!("{preferred}_FALLBACK");
         std::env::set_var(&preferred, " padded ");
-        let padded_env = strict_env_or_default(&preferred, &fallback, "default").unwrap_err();
+        let padded_env = strict_env_or_default(&preferred, "default").unwrap_err();
         std::env::remove_var(&preferred);
         assert!(padded_env.contains("value_has_surrounding_whitespace"));
     }

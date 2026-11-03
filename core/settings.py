@@ -172,8 +172,6 @@ def _normalize_explore_arbitration(value: str) -> str:
     )
 
 
-_DEPRECATION_LOGGER = logging.getLogger("nuwax_robot_bridge.settings.deprecation")
-_DEPRECATED_ENV_NOTIFIED: set[str] = set()
 
 
 # ============================================================
@@ -204,38 +202,6 @@ EXPLORE_ARBITRATION: str = (
     _normalize_explore_arbitration(_cfg_str("NUWAX_EXPLORE_ARBITRATION", "prefer_wavefront"))
 )
 REAL_LCM_REQUIRED: bool = _cfg_bool("NUWAX_REAL_LCM_REQUIRED", False)
-
-def _notify_deprecated_env(legacy_name: str, preferred_name: str) -> None:
-    if legacy_name in _DEPRECATED_ENV_NOTIFIED:
-        return
-    _DEPRECATED_ENV_NOTIFIED.add(legacy_name)
-    _DEPRECATION_LOGGER.warning(
-        "环境变量 %s 已重命名为 %s，旧名仍兼容但下一轮治理会删除，请尽快迁移。",
-        legacy_name,
-        preferred_name,
-    )
-
-
-def _resolve_alias_env_value(preferred_name: str, legacy_name: str) -> Optional[str]:
-    """优先返回新 env 名的原值；新名缺省、老名有值时打 deprecation 提示并返回老名值。"""
-
-    preferred_raw = _raw_value(preferred_name, "")
-    if preferred_raw.strip():
-        return preferred_raw
-    legacy_raw = _raw_value(legacy_name, "")
-    if legacy_raw.strip():
-        _notify_deprecated_env(legacy_name, preferred_name)
-        return legacy_raw
-    return None
-
-
-def _cfg_str_alias(preferred_name: str, legacy_name: str, default: str = "") -> str:
-    raw = _resolve_alias_env_value(preferred_name, legacy_name)
-    value = raw.strip() if raw is not None else ""
-    return record_value(preferred_name, value if value else default)
-
-
-
 
 @dataclass
 class LoggingConfig:
@@ -738,10 +704,10 @@ def load_config() -> NuwaxRobotBridgeConfig:
     _real_lcm_required = _cfg_bool("NUWAX_REAL_LCM_REQUIRED", False)
     _lcm_backend_raw = _cfg_str("NUWAX_LCM_BACKEND", "").strip().lower()
 
-    log_dir = _cfg_str("NUWAX_LOG_DIR", _cfg_str("GO2_PROXY_LOG_DIR", str(BASE_DIR / "runtime_data" / "logs")))
+    log_dir = _cfg_str("NUWAX_LOG_DIR", str(BASE_DIR / "runtime_data" / "logs"))
     log_file = _cfg_str(
         "NUWAX_LOG_FILE",
-        _cfg_str("GO2_PROXY_LOG_FILE", str(Path(log_dir) / "nuwax_robot_bridge.log")),
+        str(Path(log_dir) / "nuwax_robot_bridge.log"),
     )
 
 
@@ -797,10 +763,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             enabled=_cfg_bool("NUWAX_PERCEPTION_OPENAI_ENABLED", False),
             backend_name=_cfg_str("NUWAX_PERCEPTION_OPENAI_BACKEND_NAME", "openai_vision"),
             base_url=_cfg_str("NUWAX_PERCEPTION_OPENAI_BASE_URL", "https://api.openai.com/v1"),
-            api_key=_cfg_str(
-                "NUWAX_PERCEPTION_OPENAI_API_KEY",
-                _cfg_str("OPENAI_API_KEY", _cfg_str("ARK_API_KEY", "")),
-            ),
+            api_key=_cfg_str("OPENAI_API_KEY", _cfg_str("ARK_API_KEY", "")),
             model_name=_cfg_str("NUWAX_PERCEPTION_OPENAI_MODEL", ""),
             api_style=_cfg_str("NUWAX_PERCEPTION_OPENAI_API_STYLE", "auto"),
             timeout_sec=max(1.0, _cfg_float("NUWAX_PERCEPTION_OPENAI_TIMEOUT_SEC", 20.0)),
@@ -931,17 +894,16 @@ def load_config() -> NuwaxRobotBridgeConfig:
             tf_topic=_cfg_str("NUWAX_GEOMETRY_TF_TOPIC", "/tf"),
             tf_static_topic=_cfg_str("NUWAX_GEOMETRY_TF_STATIC_TOPIC", "/tf_static"),
             occupancy_topic=_cfg_str("NUWAX_GEOMETRY_OCCUPANCY_TOPIC", "/map_obstacles"),
-            cloud_map_topic=_cfg_str_alias(
+            cloud_map_topic=_cfg_str(
                 "NUWAX_GEOMETRY_CLOUD_MAP_TOPIC",
-                "NUWAX_CLOUD_MAP_TOPIC",
                 "/cloud_map",
             ),
             cost_map_topic=_cfg_str("NUWAX_GEOMETRY_COST_MAP_TOPIC", "/nav/costmap"),
         ),
         frames=GeometryFrameConfig(
-            map_frame=_cfg_str_alias("NUWAX_MAP_FRAME", "NUWAX_GEOMETRY_MAP_FRAME", "map"),
+            map_frame=_cfg_str("NUWAX_MAP_FRAME", "map"),
             odom_frame=_cfg_str("NUWAX_GEOMETRY_ODOM_FRAME", "odom"),
-            base_frame=_cfg_str_alias("NUWAX_BASE_FRAME", "NUWAX_GEOMETRY_BASE_FRAME", "base_link"),
+            base_frame=_cfg_str("NUWAX_BASE_FRAME", "base_link"),
             lidar_frame=_cfg_str("NUWAX_GEOMETRY_LIDAR_FRAME", "utlidar_lidar"),
             imu_frame=_cfg_str("NUWAX_GEOMETRY_IMU_FRAME", "utlidar_imu"),
         ),
@@ -1154,20 +1116,15 @@ def load_config() -> NuwaxRobotBridgeConfig:
             "NUWAX_MEMORY_DB_PATH",
             str(BASE_DIR / "runtime_data" / "memory" / "vector_memory.db"),
         ),
-        # 兼容旧部署的通用变量名，但新配置统一应使用
-        # NUWAX_MEMORY_TEXT_EMBEDDING_* 与 NUWAX_MEMORY_IMAGE_EMBEDDING_*。
         memory_embedding_model=_cfg_str(
             "NUWAX_MEMORY_TEXT_EMBEDDING_MODEL",
-            _cfg_str(
-                "NUWAX_MEMORY_EMBEDDING_MODEL",
-                DEFAULT_MEMORY_ONLINE_EMBEDDING_MODEL,
-            ),
+            DEFAULT_MEMORY_ONLINE_EMBEDDING_MODEL,
         ),
         memory_embedding_dimension=max(
             8,
             _cfg_int(
                 "NUWAX_MEMORY_TEXT_EMBEDDING_DIM",
-                _cfg_int("NUWAX_MEMORY_EMBEDDING_DIM", 768),
+                768,
             ),
         ),
         memory_image_embedding_model=_cfg_str(
@@ -1175,10 +1132,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
             DEFAULT_MEMORY_ONLINE_EMBEDDING_MODEL,
         ),
         memory_image_embedding_dimension=max(8, _cfg_int("NUWAX_MEMORY_IMAGE_EMBEDDING_DIM", 768)),
-        memory_embedding_api_key=_cfg_str(
-            "NUWAX_MEMORY_EMBEDDING_API_KEY",
-            _cfg_str("DASHSCOPE_API_KEY", ""),
-        ),
+        memory_embedding_api_key=_cfg_str("DASHSCOPE_API_KEY", ""),
         memory_embedding_base_url=_cfg_str(
             "NUWAX_MEMORY_EMBEDDING_BASE_URL",
             DEFAULT_MEMORY_EMBEDDING_BASE_URL,
@@ -1211,7 +1165,7 @@ def load_config() -> NuwaxRobotBridgeConfig:
         logging=LoggingConfig(
             log_dir=log_dir,
             log_file=log_file,
-            level=_cfg_str("NUWAX_LOG_LEVEL", _cfg_str("GO2_PROXY_LOG_LEVEL", "INFO")),
+            level=_cfg_str("NUWAX_LOG_LEVEL", "INFO"),
             format=_cfg_str("NUWAX_LOG_FORMAT", "text"),
             max_bytes=max(0, _cfg_int("NUWAX_LOG_MAX_BYTES", 20 * 1024 * 1024)),
             backup_count=max(0, _cfg_int("NUWAX_LOG_BACKUP_COUNT", 5)),

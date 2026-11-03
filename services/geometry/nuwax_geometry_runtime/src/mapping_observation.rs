@@ -424,12 +424,9 @@ mod tests {
     fn auxiliary_same_key_compares_effective_points_indices_and_capture_binding_without_hashes() {
         let original = RegisteredObservation::for_test(10, "depth-front", vec![Point3::new(1., 0., -0.4)],
             Isometry3::identity(), [0.; 3]);
-        let mut history = crate::pgo_map::ScanHistory::default();
-        history.record_auxiliary(original.clone()).unwrap();
         let equivalent = RegisteredObservation::for_test(10, "depth-front", vec![Point3::new(1., 0., -0.4)],
             Isometry3::identity(), [0.; 3]);
-        history.record_auxiliary(equivalent).unwrap();
-        assert_eq!(history.snapshot().unwrap().len(), 1);
+        assert_eq!(original, equivalent);
         for change in 0..7 {
             let mut changed = original.clone();
             let mut observation = (*changed.observation).clone();
@@ -443,7 +440,7 @@ mod tests {
                 _ => changed.odom_from_body.translation.vector.x = 0.1,
             }
             changed.observation = Arc::new(observation);
-            assert!(history.record_auxiliary(changed).unwrap_err().contains("来源冲突"));
+            assert_ne!(original, changed);
         }
         // 不同 NaN 负载及每点末尾填充都被规范过滤；原保留索引与有效点完全相同。
         let make = |nan_bits: u32, padding: u32| {

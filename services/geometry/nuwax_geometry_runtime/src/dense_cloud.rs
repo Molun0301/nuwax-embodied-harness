@@ -163,7 +163,7 @@ impl DenseCloud {
             stored_count: 0,
             pages: Arc::new(PageTable::default()),
             block_directory: BlockDirectory::new(
-                crate::dynamic_backend::backend() == crate::dynamic_backend::Backend::DufoMap, voxel_size),
+                true, voxel_size),
             #[cfg(test)]
             last_revoke: RevokeStats::default(),
             live_keys: Some(HashSet::new()),
@@ -856,68 +856,6 @@ mod tests {
         assert!(cloud.snapshot(&receipt(2), "空图").is_none());
     }
 
-    #[test]
-    fn dynamic_removal_preserves_frozen_reads_order_coordinates_and_archive() {
-        let _backend = crate::dynamic_backend::test_backend(crate::dynamic_backend::Backend::Legacy);
-        let mut cloud = DenseCloud::new().unwrap();
-        let points = (0..12_000)
-            .map(|i| {
-                if i % 3 == 0 {
-                    Point3::new(2.025, 0.025, 1.025)
-                } else {
-                    Point3::new(-0.123, (i % 100) as f64 * 0.03, 0.007)
-                }
-            })
-            .collect::<Vec<_>>();
-        cloud.append(&points).unwrap();
-        let before = cloud.snapshot(&receipt(1), "动态归档").unwrap();
-        cloud.pin_read(before.clone(), "", 0).unwrap();
-        assert_eq!(cloud.remove_voxels(&[(40, 0, 20)], 0.05).unwrap(), 4000);
-        let after = cloud.snapshot(&receipt(2), "动态归档").unwrap();
-        assert_eq!(after.point_count, 8000);
-        assert_ne!(before.epoch, after.epoch);
-        assert_eq!(before.read(0, 12_000).unwrap().len(), 12_000 * 12);
-        let expected = points
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| i % 3 != 0)
-            .flat_map(|(_, point)| {
-                [point.x, point.y, point.z]
-                    .into_iter()
-                    .flat_map(|v| (v as f32).to_le_bytes())
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(after.read(0, 12_000).unwrap(), expected);
-        assert_eq!(
-            after.read(4093, 100).unwrap(),
-            expected[4093 * 12..4193 * 12]
-        );
-        let pinned = cloud.pin_read(after.clone(), &before.epoch, 6553).unwrap();
-        assert_eq!(pinned.epoch, before.epoch);
-        assert!(cloud
-            .pin_read(after.clone(), &before.epoch, before.point_count)
-            .is_err());
-        let (mut archive, _) = after.archive("map").unwrap();
-        validate_archive(&mut archive).unwrap();
-        let restored = DenseCloud::from_archive(archive, &after.metadata("map")).unwrap();
-        assert_eq!(
-            restored
-                .snapshot(&receipt(3), "恢复")
-                .unwrap()
-                .read(0, 12_000)
-                .unwrap(),
-            expected
-        );
-        cloud.block_directory.disable();
-        cloud.live_keys = None;
-        cloud.append(&[Point3::new(2.025, 0.025, 1.025)]).unwrap();
-        let newest = cloud.snapshot(&receipt(4), "动态归档").unwrap();
-        assert_eq!(newest.point_count, 8001);
-        assert_eq!(newest.read(8000, 1).unwrap().len(), 12);
-        assert_eq!(after.read(0, 12_000).unwrap(), expected);
-        assert_eq!(cloud.remove_voxels(&[(40, 0, 20)], 0.05).unwrap(), 1);
-        assert_eq!(cloud.snapshot(&receipt(5), "预算回退").unwrap().read(0, 12_000).unwrap(), expected);
-    }
 
     #[test]
     fn delta_keeps_surviving_prefix_and_unread_points_through_multiple_removals() {

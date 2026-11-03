@@ -37,8 +37,7 @@ class MotionControlActuator:
             raise ActuatorError("ACTUATOR_INIT_FAILED", "标准运动执行器初始化失败：%s" % exc) from exc
         return cls(
             control,
-            frame_id=(runtime_value("NUWAX_BASE_FRAME", "").strip()
-                      or runtime_value("NUWAX_GEOMETRY_BASE_FRAME", "").strip() or "base_link"),
+            frame_id=(runtime_value("NUWAX_BASE_FRAME", "").strip() or "base_link"),
         )
 
     @property

@@ -13667,7 +13667,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                     .args(["--exact", "correction_coordinator::preflight_only_contract::tests::pgo_environment_preflight_probe", "--nocapture"])
                     .env(PGO_OPTIONS_ENV, raw)
                     .env("NUWAX_PGO_PREFLIGHT_EXPECTED", expected)
-                    .env("NUWAX_GEOMETRY_MAP_FRAME", "map")
+                    .env("NUWAX_MAP_FRAME", "map")
                     .env("NUWAX_GEOMETRY_ODOM_FRAME", "odom")
                     .env("NUWAX_BASE_FRAME", "base_link")
                     .output().unwrap();
@@ -14219,96 +14219,6 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             input
         }
 
-        #[test]
-        fn accepted_static_scan_reaches_library_and_native_before_keyframes_and_loop_processing() {
-            let _backend = crate::dynamic_backend::test_backend(crate::dynamic_backend::Backend::Legacy);
-            use crate::dynamic_scene::tests::{corridor, ORIGIN};
-            let (people_scan, labels) = corridor(Some(0.0), 0.0);
-            let people = labels.iter().filter(|label| **label).count();
-            let threshold = people_scan.len() - people / 2;
-            let pipeline = LoopClosurePipelineConfig {
-                min_keyframe_points: threshold,
-                min_keyframes_for_loop_search: 100,
-                keyframe_translation: 0.001,
-                ..LoopClosurePipelineConfig::default()
-            };
-            let mut library = CorrectionOwnerHandle::start(CorrectionOwnerSpec::LibraryPgo {
-                map_frame_id: "robot_map".into(), odom_frame_id: "robot_odom".into(),
-                body_frame_id: "robot_body".into(), pipeline,
-            }, owner_identity()).unwrap();
-            let mut history = crate::pgo_map::ScanHistory::default();
-            let mut static_input = None;
-            for sequence in 1..=7 {
-                let world_points = if sequence == 7 { people_scan.clone() } else { corridor(None, 0.0).0 };
-                let pose = Isometry3::translation(sequence as f64 * 0.1, 0.0, 0.0);
-                let mut adapter = frame_source_adapter("mapping-session-owner", Isometry3::identity());
-                // Registration correction moves, but motion evidence stays in raw odometry.
-                let anchor = Isometry3::translation(sequence as f64 * 2.0, -1.0, 0.3);
-                let mut transform = adapter.map_odom_transform_snapshot().unwrap();
-                transform.correction = anchor;
-                transform.correction_revision = sequence;
-                adapter.commit_relocalization_registration(transform);
-                let sensor_origin_body = pose.inverse() * Point3::from(ORIGIN);
-                let calibration = crate::native_lio_owner::BodyFromSensorTransform::from_json(
-                    &serde_json::json!({
-                        "translation_m": [sensor_origin_body.x, sensor_origin_body.y, sensor_origin_body.z],
-                        "rotation_row_major": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-                    }).to_string(),
-                ).unwrap();
-                let ingress = crate::lio_ingress::NativeLioIngress::without_runtime(
-                    crate::lio_ingress::DeviceLioIngressSpec::new_for_backend(
-                        nuwax_codec::lcm::lio::LIO_BACKEND_FASTLIO2, 31,
-                        "robot_sensor", "robot_body", "robot_odom", "robot_map",
-                    ).unwrap(), calibration, Duration::from_millis(100),
-                ).unwrap();
-                ingress.bind_relocalization_mode_fence(Arc::new(RelocalizationModeFence::default())).unwrap();
-                let source = admit_frame_source_with_ingress(
-                    sequence, sequence * 100_000_000, sequence * 100_000_000,
-                    pose, world_points, &adapter, ingress.common_for_test(),
-                );
-                history.record(&source, sequence * 100_000_000).unwrap();
-                let mut input = frame_from_admitted_source(sequence, source.clone());
-                input.static_point_indices = Some(history.static_point_indices(&source).unwrap());
-                if sequence == 7 {
-                    let indices = input.static_point_indices.as_ref().unwrap();
-                    let retained_people = indices.iter().filter(|i| labels[**i as usize]).count();
-                    let retained_static = indices.len() - retained_people;
-                    assert!(retained_people * 5 < people);
-                    assert_eq!(retained_static, people_scan.len() - people);
-                    assert!(indices.len() < threshold && input.body_points().len() > threshold);
-                    let raw_receipt = input.registered_cloud();
-                    let raw_owner = input.source_owner.clone();
-                    let mut request = native_pgo_request(&owner_identity(), "robot_map", "robot_odom", "robot_body", &input).unwrap();
-                    request.identity.request_sequence = 1;
-                    let request = native_pgo_codec::seal_native_pgo_request(request).unwrap();
-                    let wire = native_pgo_codec::encode_native_pgo_request_wire(&request).unwrap();
-                    let decoded = native_pgo_codec::decode_native_pgo_request_wire(&wire).unwrap();
-                    assert_eq!(decoded.identity.registered_cloud.point_count as usize, indices.len());
-                    assert_eq!(decoded.identity.registered_cloud.backend, raw_receipt.backend);
-                    assert_eq!(decoded.identity.registered_cloud.runtime_generation as u64, raw_receipt.runtime_generation);
-                    assert_eq!(decoded.identity.registered_cloud.source_sequence as u64, raw_receipt.source_sequence);
-                    assert_eq!(decoded.registered_body_points_xyz,
-                        input.pgo_points().unwrap().iter().flat_map(|p| [p.x, p.y, p.z]).collect::<Vec<_>>());
-                    assert_eq!(input.registered_cloud(), raw_receipt);
-                    assert_eq!(input.source_owner, raw_owner);
-
-                    static_input = Some(source);
-                }
-                assert!(library.submit_frame(input).unwrap().is_none());
-            }
-            let CorrectionOwnerHandle::LibraryPgo { owner, .. } = &library else { unreachable!() };
-            // Six actual keyframes precede the filtered below-threshold people scan.
-            assert_eq!(owner.coordinator.graph().nodes.len(), 6);
-            let last_source = static_input.expect("last admitted static selection");
-            let adapter = frame_source_adapter("mapping-session-owner", Isometry3::identity());
-            let wrong_source = admit_frame_source(
-                8, 700_000_000, 700_000_000, Isometry3::identity(), people_scan,
-                &adapter, Arc::new(RelocalizationModeFence::default()),
-            );
-            assert!(history.static_point_indices(&wrong_source).is_err());
-            history.clear();
-            assert!(history.static_point_indices(&last_source).is_err());
-        }
 
         #[test]
         fn static_selection_rejects_invalid_source_and_indices_before_resetting_owner() {

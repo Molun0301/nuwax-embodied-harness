@@ -216,12 +216,6 @@ impl ExplorationGoalSource for GatedRealSurfaceSource {
     fn restore_checkpoint(&mut self, payload: &str) -> nuwax_exploration::ExploreResult<()> {
         self.source.restore_checkpoint(payload)
     }
-    fn restore_checkpoint_for_replan(
-        &mut self,
-        payload: &str,
-    ) -> nuwax_exploration::ExploreResult<()> {
-        self.source.restore_checkpoint_for_replan(payload)
-    }
     fn diagnostics(&self) -> nuwax_exploration::ExplorationSourceDiagnostics {
         self.source.diagnostics()
     }

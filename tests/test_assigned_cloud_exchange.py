@@ -283,14 +283,8 @@ class AssignedCloudExchangeTests(unittest.TestCase):
                 asset_identity=NEW_ID, expected_previous_identity=AssetIdentityV2(asset_id="f" * 32))
         self.assertEqual(self.repository.get_map_asset_bundle(fixtures.MAP_NAME).asset_identity, fixtures.ASSET_ID)
 
-    def test_legacy_and_planar_sources_never_enter_exchange(self):
+    def test_unknown_backend_never_enters_exchange(self):
         self.initial()
-        candidate, stage = self.candidate()
-        current = self.repository.current_directory(fixtures.MAP_NAME)
-        (current / "manifest.json").write_bytes(fixtures.LEGACY_MANIFEST)
-        with self.assertRaises(storage.AssignedMapAlreadyFinalizedError):
-            self.repository.finalize_assigned_map_asset_bundle(candidate, staging_dir=stage,
-                asset_identity=NEW_ID, expected_previous_identity=fixtures.ASSET_ID)
         candidate, stage = self.candidate()
         source = dict(candidate.geometry_asset.metadata["mapping_backend_checkpoint"], backend_kind="planar")
         geometry = candidate.geometry_asset.model_copy(update={"metadata": {"mapping_backend_checkpoint": source}})

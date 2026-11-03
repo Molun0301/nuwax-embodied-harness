@@ -168,10 +168,6 @@ class MapGeoreferenceBindingV1(ContractModel):
         default=MAP_GEOREFERENCE_RELATIVE_PATH,
         description="地理参考文件的规范相对路径。",
     )
-    raw_sha256: Optional[str] = Field(
-        default=None,
-        description="地理参考原文字节 SHA-256；候选发布时计算，最终资产中必须存在。",
-    )
     contract: MapGeoreferenceV1 = Field(description="经过类型校验的地理参考合同。")
 
     @field_validator("schema_version", mode="before")
@@ -188,19 +184,6 @@ class MapGeoreferenceBindingV1(ContractModel):
             raise ValueError("地理参考文件必须使用固定规范路径。")
         return value
 
-    @field_validator("raw_sha256")
-    @classmethod
-    def _validate_binding_raw_sha256(cls, value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return None
-        if (
-            value.strip() != value
-            or len(value) != 64
-            or any(character not in "0123456789abcdef" for character in value)
-            or value == "0" * 64
-        ):
-            raise ValueError("地理参考原文 SHA-256 非法。")
-        return value
 
     def model_copy(
         self,
@@ -209,15 +192,6 @@ class MapGeoreferenceBindingV1(ContractModel):
         deep: bool = False,
     ) -> "MapGeoreferenceBindingV1":
         changes = dict(update or {})
-        if self.raw_sha256 is not None:
-            for field_name in (
-                "schema_version",
-                "relative_path",
-                "raw_sha256",
-                "contract",
-            ):
-                if field_name in changes and changes[field_name] != getattr(self, field_name):
-                    raise TypeError("已绑定原文摘要的地理参考不可改写。")
         return _validated_model_copy(self, update=changes, deep=deep)
 
 
@@ -244,7 +218,6 @@ class MapAsset(TimestampedContract):
     finalized: bool = Field(default=False, description="地图是否已有不可变的 finalized 资产包。")
     identity_schema_version: Literal[1, 2] = 1
     asset_identity: Optional[AssetIdentityV2] = None
-    asset_manifest_sha256: Optional[str] = Field(default=None, description="finalized 资产包清单 SHA-256。")
     finalized_at: Optional[datetime] = Field(default=None, description="地图资产包完成原子提交的时间。")
     frame_id: Optional[str] = Field(default=None, description="当前地图使用的坐标系。")
     localization_ready: bool = Field(default=False, description="当前是否已完成定位。")
@@ -271,15 +244,6 @@ class MapAsset(TimestampedContract):
             return None
         return validate_frame_id(resolved)
 
-    @field_validator("asset_manifest_sha256")
-    @classmethod
-    def _validate_asset_manifest_sha256(cls, value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return None
-        resolved = str(value or "").strip().lower()
-        if len(resolved) != 64 or any(char not in "0123456789abcdef" for char in resolved):
-            raise ValueError("地图资产清单 SHA-256 非法。")
-        return resolved
 
 
     @model_serializer(mode="wrap")
@@ -294,14 +258,13 @@ class MapAsset(TimestampedContract):
     @classmethod
     def _validate_asset_identity_generation(cls, value):
         if isinstance(value, dict):
-            _validate_identity_generation(value, "asset_manifest_sha256")
+            _validate_identity_generation(value)
         return value
 
     @model_validator(mode="after")
     def _validate_asset_identity_pair(self):
         _validate_identity_generation({"identity_schema_version": self.identity_schema_version,
-            "asset_identity": self.asset_identity, "asset_manifest_sha256": self.asset_manifest_sha256},
-            "asset_manifest_sha256")
+            "asset_identity": self.asset_identity})
         return self
 
 
@@ -471,9 +434,8 @@ class MapAssetBundle(TimestampedContract):
     )
     identity_schema_version: Literal[1, 2] = 1
     asset_identity: Optional[AssetIdentityV2] = None
-    asset_state: Literal["legacy", "candidate", "finalized"] = "legacy"
+    asset_state: Literal["draft", "candidate", "finalized"] = "draft"
     _assigned_owned: bool = PrivateAttr(default=False)
-    manifest_sha256: Optional[str] = Field(default=None, description="资产包清单 SHA-256；加载时计算。")
     metadata: MetadataDict = Field(default_factory=dict, description="附加元数据。")
 
     @field_validator("map_name", "source_name")
@@ -494,24 +456,15 @@ class MapAssetBundle(TimestampedContract):
             return None
         return validate_frame_id(resolved)
 
-    @field_validator("manifest_sha256")
-    @classmethod
-    def _validate_manifest_sha256(cls, value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return None
-        resolved = str(value or "").strip().lower()
-        if len(resolved) != 64 or any(char not in "0123456789abcdef" for char in resolved):
-            raise ValueError("地图资产包清单 SHA-256 非法。")
-        return resolved
 
     @model_validator(mode="before")
     @classmethod
     def _validate_bundle_identity_generation(cls, value):
         if isinstance(value, dict):
-            _validate_identity_generation(value, "manifest_sha256")
+            _validate_identity_generation(value)
             assigned = value.get("identity_schema_version", 1) == 2
             if (assigned and value.get("asset_state") not in {"candidate", "finalized"}
-                    or not assigned and value.get("asset_state", "legacy") != "legacy"):
+                    or not assigned and value.get("asset_state", "draft") != "draft"):
                 raise ValueError("asset_state must explicitly match its identity generation")
         return value
 
@@ -540,12 +493,10 @@ class MapAssetBundle(TimestampedContract):
         if self.frame_id and self.snapshot.frame_id and self.frame_id != self.snapshot.frame_id:
             raise ValueError("地图资产包与运行态快照的 frame_id 不一致。")
         _validate_identity_generation({"identity_schema_version": self.identity_schema_version,
-            "asset_identity": self.asset_identity, "manifest_sha256": self.manifest_sha256}, "manifest_sha256")
+            "asset_identity": self.asset_identity})
         if self.identity_schema_version == 2:
             if self.asset_state not in {"candidate", "finalized"}:
                 raise ValueError("assigned bundles require an explicit candidate/finalized state")
-            if self.georeference is not None and self.georeference.raw_sha256 is not None:
-                raise ValueError("assigned georeference may not carry a legacy digest")
             if not self._assigned_owned:
                 # Capture once. Subsequent reads and state promotion share immutable
                 # cell owners and copy only mutable, small descriptors.
@@ -592,12 +543,9 @@ class MapAssetBundle(TimestampedContract):
             owned = super().__getattribute__("__pydantic_private__").get("_assigned_owned", False)
             if assigned and owned:
                 return _owned_snapshot_view(value) if name == "snapshot" else deepcopy(value)
-            manifest_sha256 = super().__getattribute__("manifest_sha256")
         except AttributeError:
             return value
-        if manifest_sha256 is None:
-            return value
-        return deepcopy(value)
+        return value
 
     def __deepcopy__(self, memo=None):
         if self.identity_schema_version == 2:
@@ -622,10 +570,6 @@ class MapAssetBundle(TimestampedContract):
             # Pydantic's generic deep copy expands packed cells. The owner is
             # already isolated and its public descriptors are detached views.
             return super().model_copy(update=effective, deep=False)
-        if self.manifest_sha256 is not None:
-            changed_fields = {field_name for field_name, value in changes.items() if value != getattr(self, field_name)}
-            if changed_fields:
-                raise TypeError("已绑定清单摘要的地图资产包不可改写。")
         return _validated_model_copy(self, update=changes, deep=deep)
 
 
@@ -654,16 +598,16 @@ def _validated_model_copy(
     return type(model).model_validate(payload)
 
 
-def _validate_identity_generation(value, digest_field):
+def _validate_identity_generation(value):
     schema = value.get("identity_schema_version", 1)
     if type(schema) is not int or schema not in {1, 2}:
         raise ValueError("identity_schema_version must be explicitly 1 or 2")
     identity = value.get("asset_identity")
     if schema == 2:
-        if identity is None or value.get(digest_field) is not None:
-            raise ValueError("assigned assets require their assigned ID and forbid legacy digests")
+        if identity is None:
+            raise ValueError("assigned assets require their assigned ID")
     elif identity is not None:
-        raise ValueError("legacy assets cannot carry assigned identities")
+        raise ValueError("draft assets cannot carry assigned identities")
 
 
 def _owned_snapshot_view(snapshot, *, capture=False):

@@ -24,13 +24,13 @@ from services.mapping.completed_cleanup import CompletedMapCleanup, copy_raw_sca
 
 
 def fine_bytes(revision, frame_generation=0):
-    root = dict(version=2, domain=dict(session='source', generation=3, frame_generation=frame_generation, producer_generation=8),
+    root = dict(version=4, domain=dict(session='source', generation=3, frame_generation=frame_generation, producer_generation=8),
         revision=revision, geometry_revision=revision, source_timestamp_ns=11, voxel_size_m=.125,
         blocks=[dict(key=[0, 0, 0], points=1, object=dict(kind='assigned', value=[40]*16),
                      block_revision=7, geometry_revision=7)])
     raw = json.dumps(root).encode()
     block = b'NUWAXBL1' + struct.pack('<IIHQH', 1, 0, 0, 11, 1)
-    return b'NUWAXAR2' + struct.pack('<Q', len(raw)) + raw + struct.pack('<QI', 1, len(block)) + block
+    return b'NUWAXAR4' + struct.pack('<Q', len(raw)) + raw + struct.pack('<QI', 1, len(block)) + block
 
 
 def dense_bytes(revision):
@@ -48,7 +48,7 @@ class Owner:
         self._geometry_runtime.get_mapping_session_context = lambda: {'active': False}
     def get_map_asset_bundle(self, *, map_name):
         asset = self._repository.get_map_asset(map_name)
-        return self._asset_repository.get_map_asset_bundle(map_name, migrate_legacy=False,
+        return self._asset_repository.get_map_asset_bundle(map_name,
             expected_asset_identity=asset.asset_identity if asset else None)
     def _require_map_name(self, name):
         if not name or '/' in name or name in {'.', '..'}:
@@ -306,7 +306,7 @@ def test_native_cumulative_preview_save_reload_and_cancel(tmp_path):
 def test_changed_source_requires_new_preview(tmp_path):
     owner=fixture(tmp_path);service,job=prepared(owner)
     original=owner.get_map_asset_bundle(map_name='original')
-    changed=SimpleNamespace(asset_identity=original.asset_identity,manifest_sha256='9'*64)
+    changed=SimpleNamespace(asset_identity=AssetIdentityV2(asset_id='9'*32))
     with patch.object(owner,'get_map_asset_bundle',return_value=changed):
         with pytest.raises(Exception,match='原地图已改变'):
             service.apply(job['id'],new_map_name='cleaned',confirmed=True)
@@ -474,3 +474,17 @@ def test_scan_settings_reject_invalid_without_writing_then_roundtrip(tmp_path, m
         "NUWAX_RAW_SCAN_MAX_MIB": 1024, "NUWAX_RAW_SCAN_TRANSLATION_M": .1,
         "NUWAX_RAW_SCAN_ROTATION_DEG": 3, "NUWAX_RAW_SCAN_INTERVAL_S": 1,
         "NUWAX_RAW_SCAN_QUEUE_FRAMES": 16}
+
+
+def test_rebuilding_cleanup_service_removes_previous_preview_directories(tmp_path):
+    owner = fixture(tmp_path)
+    first = CompletedMapCleanup(owner)
+    folder = first.root / 'interrupted-preview'
+    folder.mkdir()
+    (folder / 'fine.source').write_bytes(b'private-preview')
+    first.close()
+    second = CompletedMapCleanup(owner)
+    try:
+        assert list(second.root.iterdir()) == []
+    finally:
+        second.close()

@@ -18,8 +18,7 @@ pub struct HeightfieldFragment {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "representation", content = "data", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GroundRecord {
-    LegacyPlane(LayerObservation),
-    #[serde(rename = "heightfield_v1_compact", alias = "heightfield_v1")]
+    #[serde(rename = "heightfield_v1_compact")]
     HeightfieldV1(HeightfieldFragment),
     /// Classified XY with no ground claim. Occupancy remains solid evidence.
     ClassifiedEmptyColumn {},
@@ -27,26 +26,21 @@ pub enum GroundRecord {
 /// One original decode-cache value. Legacy readers retain their original Arc.
 #[derive(Clone, Debug, PartialEq)]
 pub enum GroundRecords {
-    Legacy(Arc<LayerObservations>),
     Versioned(Arc<BTreeMap<u16, GroundRecord>>),
 }
 #[derive(Clone, Copy, PartialEq)]
 pub enum GroundRecordRef<'a> {
-    LegacyPlane(&'a LayerObservation),
     HeightfieldV1(&'a HeightfieldFragment),
     ClassifiedEmptyColumn,
 }
 pub enum GroundRecordIter<'a> {
-    Legacy(std::collections::btree_map::Iter<'a, u16, LayerObservation>),
     Versioned(std::collections::btree_map::Iter<'a, u16, GroundRecord>),
 }
 impl<'a> Iterator for GroundRecordIter<'a> {
     type Item = (u16, GroundRecordRef<'a>);
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            Self::Legacy(iter) => iter.next().map(|(&k, v)| (k, GroundRecordRef::LegacyPlane(v))),
             Self::Versioned(iter) => iter.next().map(|(&k, v)| (k, match v {
-                GroundRecord::LegacyPlane(v) => GroundRecordRef::LegacyPlane(v),
                 GroundRecord::HeightfieldV1(v) => GroundRecordRef::HeightfieldV1(v),
                 GroundRecord::ClassifiedEmptyColumn {} => GroundRecordRef::ClassifiedEmptyColumn,
             })),
@@ -54,75 +48,25 @@ impl<'a> Iterator for GroundRecordIter<'a> {
     }
 }
 impl GroundRecords {
-    pub(crate) fn empty() -> Self { Self::Legacy(Arc::new(BTreeMap::new())) }
-    pub fn legacy(&self) -> Result<Arc<LayerObservations>, String> {
-        match self {
-            Self::Legacy(records) => Ok(records.clone()),
-            Self::Versioned(_) => Err("versioned ground requires the typed ground-record consumer".into()),
-        }
-    }
-    pub(crate) fn into_legacy(self) -> Result<LayerObservations, String> {
-        match self {
-            Self::Legacy(v) => Ok(Arc::try_unwrap(v).unwrap_or_else(|v| v.as_ref().clone())),
-            Self::Versioned(_) => Err("versioned ground requires the typed ground-record consumer".into()),
-        }
-    }
+    pub(crate) fn empty() -> Self { Self::Versioned(Arc::new(BTreeMap::new())) }
     pub fn iter(&self) -> GroundRecordIter<'_> {
-        match self { Self::Legacy(v) => GroundRecordIter::Legacy(v.iter()), Self::Versioned(v) => GroundRecordIter::Versioned(v.iter()) }
+        match self { Self::Versioned(v) => GroundRecordIter::Versioned(v.iter()) }
     }
-    /// Borrow one admitted block-local record without copying its members or bins.
     pub fn get(&self, key: u16) -> Option<GroundRecordRef<'_>> {
-        match self {
-            Self::Legacy(v) => v.get(&key).map(GroundRecordRef::LegacyPlane),
-            Self::Versioned(v) => v.get(&key).map(|r| match r {
-                GroundRecord::LegacyPlane(v) => GroundRecordRef::LegacyPlane(v),
-                GroundRecord::HeightfieldV1(v) => GroundRecordRef::HeightfieldV1(v),
-                GroundRecord::ClassifiedEmptyColumn {} => GroundRecordRef::ClassifiedEmptyColumn,
-            }),
-        }
+        match self { Self::Versioned(v) => v.get(&key).map(GroundRecord::as_ref) }
     }
     pub(crate) fn versioned_mut(&mut self) -> &mut BTreeMap<u16, GroundRecord> {
-        if matches!(self, Self::Legacy(_)) { *self = Self::Versioned(Arc::new(self.owned_versioned())); }
-        match self { Self::Versioned(v) => Arc::make_mut(v), Self::Legacy(_) => unreachable!() }
-    }
-    pub(crate) fn compact(self, block: &Block) -> Self {
-        match self {
-            Self::Versioned(v) if v.values().all(|r| match r {
-                GroundRecord::LegacyPlane(layer) => layer.latest_timestamp_ns() <= layer.members.iter().map(|k| block[k].observed_ns).max().unwrap_or(0),
-                GroundRecord::HeightfieldV1(_) | GroundRecord::ClassifiedEmptyColumn {} => false,
-            }) => {
-                let records = Arc::try_unwrap(v).unwrap_or_else(|v| v.as_ref().clone());
-                Self::Legacy(Arc::new(records.into_iter().filter_map(|(k,r)| match r {
-                    GroundRecord::LegacyPlane(v) => Some((k,v)), GroundRecord::HeightfieldV1(_) | GroundRecord::ClassifiedEmptyColumn {} => None,
-                }).collect()))
-            }
-            other => other,
-        }
+        match self { Self::Versioned(v) => Arc::make_mut(v) }
     }
     pub fn is_empty(&self) -> bool { self.iter().next().is_none() }
     pub fn has_heightfield(&self) -> bool { self.iter().any(|(_, r)| matches!(r, GroundRecordRef::HeightfieldV1(_))) }
-    pub(crate) fn owned_versioned(&self) -> BTreeMap<u16, GroundRecord> {
-        match self {
-            Self::Legacy(v) => v.iter().map(|(&k, v)| (k, GroundRecord::LegacyPlane(v.clone()))).collect(),
-            Self::Versioned(v) => v.as_ref().clone(),
-        }
-    }
-    pub(crate) fn legacy_mut(&mut self) -> Result<&mut LayerObservations, String> {
-        match self {
-            Self::Legacy(records) => Ok(Arc::make_mut(records)),
-            Self::Versioned(_) => Err("versioned ground requires whole-column mutation".into()),
-        }
-    }
-    pub(crate) fn bytes(&self) -> usize {
-        self.iter().map(|(_, r)| record_bytes(r)).sum()
-    }
+    pub(crate) fn bytes(&self) -> usize { self.iter().map(|(_, r)| record_bytes(r)).sum() }
     pub(crate) fn geometry_eq(&self, other: &Self) -> bool {
         let mut a = self.iter(); let mut b = other.iter();
         loop { match (a.next(), b.next()) {
             (None, None) => return true,
             (Some((ka, va)), Some((kb, vb))) if ka == kb => {
                 let same = match (va, vb) {
-                    (GroundRecordRef::LegacyPlane(a), GroundRecordRef::LegacyPlane(b)) => a.geometry_eq(b),
                     (GroundRecordRef::HeightfieldV1(a), GroundRecordRef::HeightfieldV1(b)) =>
                         a.anchor == b.anchor && a.height_m == b.height_m && a.occupied_bounds == b.occupied_bounds
                             && a.members.iter().map(|p| p.0).eq(b.members.iter().map(|p| p.0)),
@@ -145,7 +89,6 @@ pub struct HeightfieldSurface {
 pub struct ColumnGroundRecords {
     /// Mutually exclusive with actual ground records. No height or permission.
     pub classified_empty: bool,
-    pub legacy: Vec<(Key, LayerObservation)>,
     pub heightfields: Vec<HeightfieldSurface>,
 }
 
@@ -153,7 +96,7 @@ pub struct ColumnGroundRecords {
 /// 旧BL4对象数组继续可读；新记录标签使旧读器明确拒绝紧凑表示。
 mod sample_encoding {
     use super::*;
-    use serde::de::{Error, MapAccess, SeqAccess, Visitor};
+    use serde::de::{Error, MapAccess, Visitor};
 
     type NumericSample = (u32, [f64; 3], u64, u64, u32);
 
@@ -204,26 +147,10 @@ mod sample_encoding {
             type Value = Vec<LayerSample>;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("heightfield samples or a compact source table")
+                formatter.write_str("compact heightfield source table")
             }
 
-            fn visit_seq<A: SeqAccess<'de>>(self, mut input: A) -> Result<Self::Value, A::Error> {
-                let mut samples = Vec::new();
-                let mut sources = BTreeSet::new();
-                while let Some(mut sample) = input.next_element::<LayerSample>()? {
-                    if samples.len() == MAX_LAYER_SAMPLES {
-                        return Err(A::Error::custom("heightfield sample count exceeds budget"));
-                    }
-                    // 旧数据的来源值相同也只拥有一个不可变描述，不改变任一样本身份。
-                    if let Some(source) = sources.get(&sample.source) {
-                        sample.source = Arc::clone(source);
-                    } else {
-                        sources.insert(sample.source.clone());
-                    }
-                    samples.push(sample);
-                }
-                Ok(samples)
-            }
+
 
             fn visit_map<A: MapAccess<'de>>(self, input: A) -> Result<Self::Value, A::Error> {
                 let compact =
@@ -261,14 +188,13 @@ mod sample_encoding {
                 Ok(samples)
             }
         }
-        deserializer.deserialize_any(Samples)
+        deserializer.deserialize_map(Samples)
     }
 }
 
 /// 单条记录的常驻字节；整块字节是各条之和。
 pub(crate) fn record_bytes(record: GroundRecordRef<'_>) -> usize {
     match record {
-        GroundRecordRef::LegacyPlane(v) => terrain_observations::layer_bytes(v),
         GroundRecordRef::ClassifiedEmptyColumn => 128,
         GroundRecordRef::HeightfieldV1(v) => {
             // 来源对象按指针去重：只计每个来源第一次出现的样本，与集合去重结果相同。
@@ -282,7 +208,6 @@ pub(crate) fn record_bytes(record: GroundRecordRef<'_>) -> usize {
 impl GroundRecord {
     pub(crate) fn as_ref(&self) -> GroundRecordRef<'_> {
         match self {
-            GroundRecord::LegacyPlane(v) => GroundRecordRef::LegacyPlane(v),
             GroundRecord::HeightfieldV1(v) => GroundRecordRef::HeightfieldV1(v),
             GroundRecord::ClassifiedEmptyColumn {} => GroundRecordRef::ClassifiedEmptyColumn,
         }
@@ -308,14 +233,12 @@ pub(crate) fn overlay<'a>(base: &'a GroundRecords, delta: &'a BTreeMap<u16, Opti
 }
 
 pub(crate) fn validate_records(records: &GroundRecords, block: &Block) -> Result<(), String> {
-    if let GroundRecords::Legacy(v) = records { return terrain_observations::validate_layers(v, block); }
     validate_versioned_records(records.iter().count(), records.iter(), block)
 }
 /// 版本化记录的整块校验：先查记录数，再按键升序逐条校验，返回第一个错误。
 pub(crate) fn validate_versioned_records<'a>(count: usize,
     records: impl Iterator<Item = (u16, GroundRecordRef<'a>)>, block: &Block) -> Result<(), String> {
     if count > MAX_LAYERS_PER_BLOCK { return Err("ground record count exceeds block budget".into()); }
-    let mut latest = None;
     // 块内成员编号是 u16，用 65536 位的位表记录已认领成员，`claim` 与集合插入的返回值相同。
     let mut claimed = vec![0_u64; 1024];
     let mut claim = |member: u16| {
@@ -328,11 +251,7 @@ pub(crate) fn validate_versioned_records<'a>(count: usize,
     let mut ground_columns = BTreeSet::new();
     for (key, record) in records {
         match record {
-            GroundRecordRef::LegacyPlane(v) => {
-                ground_columns.insert(key % 1024);
-                terrain_observations::validate_versioned_legacy(&BTreeMap::from([(key, v.clone())]), block, *latest.get_or_insert_with(|| block.values().map(|v| v.observed_ns).max().unwrap_or(0)))?;
-                if v.members.iter().any(|m| !claim(*m)) { return Err("overlapping ground record members".into()); }
-            }
+
             GroundRecordRef::HeightfieldV1(v) => {
                 ground_columns.insert(key % 1024);
                 if v.members.is_empty() || v.members.len() > MAX_LAYER_MEMBERS || v.members[0].0 != key
@@ -367,30 +286,9 @@ pub(crate) fn validate_versioned_records<'a>(count: usize,
 /// Only the new BL4 variant can retain a diagnostic detached from ground
 /// membership. Original members already prove the old contract. Any newer
 /// diagnostic must be backed by its own actual occupied voxel in this block.
-pub(crate) fn validate_legacy_sample_occupancy(records: &GroundRecords, block: &Block, key: Key, q: f32) -> Result<(), String> {
-    let GroundRecords::Versioned(records) = records else { return Ok(()); };
-    validate_versioned_legacy_samples(records.values().map(GroundRecord::as_ref), block, key, q)
-}
+
 /// 版本化记录中旧平面诊断样本的占据核对，按键升序返回第一个错误。
-pub(crate) fn validate_versioned_legacy_samples<'a>(records: impl Iterator<Item = GroundRecordRef<'a>>,
-    block: &Block, key: Key, q: f32) -> Result<(), String> {
-    let reciprocal = 1.0 / f64::from(q);
-    for record in records {
-        let GroundRecordRef::LegacyPlane(layer) = record else { continue; };
-        let member_time = layer.members.iter().map(|k| block[k].observed_ns).max().unwrap_or(0);
-        for sample in layer.samples.iter().filter(|s| s.source_timestamp_ns > member_time) {
-            let cells = sample.point.map(|v| (v * reciprocal).floor());
-            if cells.iter().any(|v| !v.is_finite() || *v < f64::from(i32::MIN) || *v > f64::from(i32::MAX)) {
-                return Err("legacy diagnostic lacks actual occupancy evidence".into());
-            }
-            let actual = cells.map(|v| v as i32);
-            if block_key(actual) != key || !block.get(&local_key(actual)).is_some_and(|v| sample.source_timestamp_ns <= v.observed_ns) {
-                return Err("legacy diagnostic lacks actual occupancy evidence".into());
-            }
-        }
-    }
-    Ok(())
-}
+
 
 /// Complete declared column, assembled once at the source boundary. A removed
 /// zero-mass member is a real membership change, not an implicit missing packet.
@@ -409,12 +307,10 @@ pub(crate) fn assemble_column(
 pub(crate) fn assemble_column_records<'a>(
     xy: [i32; 2], q: f32, records: impl IntoIterator<Item = (Key, GroundRecordRef<'a>)>, samples: bool,
 ) -> Result<ColumnGroundRecords, String> {
-    let mut legacy = Vec::new();
     let mut classified_empty = false;
     let mut groups: BTreeMap<Key, Vec<(Key, &HeightfieldFragment)>> = BTreeMap::new();
     for (block, record) in records {
         match record {
-            GroundRecordRef::LegacyPlane(v) => legacy.push((block, v.clone())),
             GroundRecordRef::HeightfieldV1(v) => {
                 if v.anchor[..2] != xy { return Err("heightfield anchor changes XY".into()); }
                 groups.entry(v.anchor).or_default().push((block, v));
@@ -425,7 +321,7 @@ pub(crate) fn assemble_column_records<'a>(
             }
         }
     }
-    if classified_empty && (!legacy.is_empty() || !groups.is_empty()) {
+    if classified_empty && !groups.is_empty() {
         return Err("classified empty column conflicts with ground records".into());
     }
     let mut heightfields = Vec::new();
@@ -453,22 +349,16 @@ pub(crate) fn assemble_column_records<'a>(
         samples.truncate(MAX_LAYER_SAMPLES);
         heightfields.push(HeightfieldSurface { column, samples });
     }
-    Ok(ColumnGroundRecords { classified_empty, legacy, heightfields })
+    Ok(ColumnGroundRecords { classified_empty, heightfields })
 }
 
 pub(crate) fn split_column(xy: [i32; 2], q: f32, column: &ColumnGroundRecords) -> Result<BTreeMap<Key, BTreeMap<u16, GroundRecord>>, String> {
-    if column.classified_empty && (!column.legacy.is_empty() || !column.heightfields.is_empty()) {
+    if column.classified_empty && !column.heightfields.is_empty() {
         return Err("classified empty column conflicts with ground records".into());
     }
     // The Writer attaches an empty declaration to one actual occupied shard.
     let mut out: BTreeMap<Key, BTreeMap<u16, GroundRecord>> = BTreeMap::new();
-    for (block, layer) in &column.legacy {
-        let key = global_key(*block, *layer.members.first().ok_or("empty legacy column")?)?;
-        if key[..2] != xy { return Err("legacy column changes XY".into()); }
-        if out.entry(*block).or_default().insert(layer.members[0], GroundRecord::LegacyPlane(layer.clone())).is_some() {
-            return Err("duplicate ground anchor".into());
-        }
-    }
+
     for surface in &column.heightfields {
         if surface.column.xy() != xy || surface.column.voxel_size_m() != q { return Err("heightfield column changes XY/resolution".into()); }
         terrain_observations::validate_diagnostic_samples(&surface.samples)?;

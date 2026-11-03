@@ -20,7 +20,7 @@ fn scene(levels:impl Fn(i32)->Vec<i32>,measured:bool)->SurfaceSnapshot {
         if measured {
             layers.entry(block_key(key)).or_default().insert(local,LayerObservation {
                 members:vec![local],normal:[0.0,0.0,1.0],plane_origin:origin,
-                samples:(0..3).map(|i|LayerSample {source:Default::default(),point:origin,
+                samples:(0..3).map(|i|LayerSample {source: std::sync::Arc::new(nuwax_map_chunks::LayerSource::Lidar { backend: 1, runtime_generation: 1, sensor_frame_id: "test".into() }),point:origin,
                     source_sequence:i+1,source_timestamp_ns:100+i,point_index:u32::from(local)}).collect(),
             });
         }

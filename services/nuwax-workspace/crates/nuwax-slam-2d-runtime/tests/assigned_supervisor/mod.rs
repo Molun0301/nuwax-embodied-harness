@@ -41,7 +41,7 @@ async fn stage_and_open_keep_checkpoint_across_owner_locators() {
     let mut changed=artifact.clone();changed.identity=ArtifactIdentity::Assigned {checkpoint_id:"2".repeat(32)};
     assert!(client.open_artifact(&changed).await.is_err());
     let count=std::fs::read_dir(&target.0).unwrap().count();
-    assert!(client.stage_artifact(archive::open_regular(&path).unwrap(),artifact.payload_size,ArtifactIdentity::Legacy).await.is_err());
+    assert!(client.stage_artifact(archive::open_regular(&path).unwrap(),artifact.payload_size,ArtifactIdentity::Assigned { checkpoint_id: "f".repeat(32) }).await.is_err());
     assert_eq!(std::fs::read_dir(&target.0).unwrap().count(),count);
     client.closed.store(true,Ordering::Release);
     assert!(client.open_artifact(&artifact).await.is_err());

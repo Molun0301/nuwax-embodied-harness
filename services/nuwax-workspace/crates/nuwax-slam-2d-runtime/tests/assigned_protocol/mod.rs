@@ -13,15 +13,7 @@ fn assigned_artifact_roundtrip_never_serializes_a_digest() {
     assert_eq!(VERSION, 7);
     assert_eq!(WORKER_CONTRACT, "nuwax-slam-2d-worker-v7");
 }
-#[test]
-fn legacy_artifact_is_only_a_format_marker() {
-    let value = FileArtifact { file_name: "legacy.nws2d".into(), payload_size: 19, identity: ArtifactIdentity::Legacy };
-    value.validate().unwrap();
-    assert_eq!(serde_json::to_value(&value).unwrap(), serde_json::json!({
-        "file_name":"legacy.nws2d", "payload_size":19, "identity":{"scheme":"legacy"}
-    }));
-    assert_eq!(serde_json::from_value::<FileArtifact>(serde_json::to_value(value.clone()).unwrap()).unwrap(), value);
-}
+
 #[test]
 fn missing_identity_old_wire_and_invalid_ids_are_rejected() {
     for raw in [
@@ -37,9 +29,9 @@ fn missing_identity_old_wire_and_invalid_ids_are_rejected() {
 #[test]
 fn artifact_locators_stay_local_and_bounded() {
     for name in ["../a", "/a", ".hidden", "a/b"] {
-        assert!(FileArtifact {file_name:name.into(),payload_size:1,identity:ArtifactIdentity::Legacy}.validate().is_err());
+        assert!(FileArtifact {file_name:name.into(),payload_size:1,identity:ArtifactIdentity::Assigned { checkpoint_id: "f".repeat(32) }}.validate().is_err());
     }
     for size in [0,crate::archive::MAX_ARCHIVE+1] {
-        assert!(FileArtifact {file_name:"a.nws2d".into(),payload_size:size,identity:ArtifactIdentity::Legacy}.validate().is_err());
+        assert!(FileArtifact {file_name:"a.nws2d".into(),payload_size:size,identity:ArtifactIdentity::Assigned { checkpoint_id: "f".repeat(32) }}.validate().is_err());
     }
 }

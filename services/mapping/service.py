@@ -265,17 +265,12 @@ class MappingService:
             layer_metadata = getattr(occupancy_grid, "metadata", {})
             if (receipt_identity["representation"] != "effective" or occupancy_grid is None
                     or provenance["frame_id"] != occupancy_grid.frame_id
-                    or source_metadata.get("map_provenance", provenance) != provenance
-                    or layer_metadata.get("content_identity", receipt_identity) != receipt_identity
-                    or layer_metadata.get("map_provenance", provenance) != provenance
-                    or source_metadata.get("mapping_session_id", provenance["session_id"]) != provenance["session_id"]
-                    or source_metadata.get("session_generation", provenance["session_generation"]) != provenance["session_generation"]
-                    or any(value is not None and (type(value) is not int or value != revision)
-                           for value in (update_sequence_override, source_metadata.get("update_sequence"),
-                                         source_metadata.get("occupancy_content_revision"), source_metadata.get("content_revision")))):
+                    or layer_metadata.get("content_identity", receipt_identity) != receipt_identity):
                 raise GatewayError("实时地图与占据栅格凭据不一致。", error_code="map_snapshot_receipt_mismatch", http_status=409)
             source_metadata.update(content_identity=receipt_identity, map_provenance=provenance,
-                                   occupancy_content_revision=revision, content_revision=revision,
+                                   mapping_session_id=provenance["session_id"],
+                                   session_generation=provenance["session_generation"],
+                                   update_sequence=revision, occupancy_content_revision=revision, content_revision=revision,
                                    content_identity_status="committed")
             source_metadata["layer_content_identities"] = {
                 "occupancy": {"identity_status": "committed", "content_identity": receipt_identity, "revision": revision},
@@ -284,8 +279,6 @@ class MappingService:
             }
             update_sequence_override = revision
             receipt_epoch = _receipt_source_epoch(receipt_identity)
-            if any(value and value != receipt_epoch for value in (source_epoch, source_metadata.get("source_epoch"))):
-                raise GatewayError("实时地图来源代际与凭据不一致。", error_code="map_snapshot_receipt_mismatch", http_status=409)
             source_epoch = receipt_epoch
             if stream_occupancy_grid is not None:
                 try:

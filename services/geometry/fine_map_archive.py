@@ -51,15 +51,12 @@ def read_fine_archive_root(payload):
     if not isinstance(payload, (bytes, FrozenPayload)) or not 24 <= len(payload) <= MAX_FINE_ARCHIVE_BYTES:
         raise ValueError("精细地图资产类型或大小错误")
     magic = payload[:8]
-    if magic not in (b"NUWAXAR1", b"NUWAXAR2", b"NUWAXAR3", b"NUWAXAR4", b"NUWAXAR5"):
+    if magic not in (b"NUWAXAR4", b"NUWAXAR5"):
         raise ValueError("精细地图资产格式未知")
-    legacy = magic == b"NUWAXAR1"
-    root_offset = 48 if legacy else 16
+    root_offset = 16
     root_length = struct.unpack("<Q", payload[8:16])[0]
     if not 1 <= root_length <= 32 * 1024 * 1024 or root_offset + root_length + 8 > len(payload):
         raise ValueError("精细地图根长度错误")
-    if legacy and not any(payload[16:48]):
-        raise ValueError("精细地图旧根别名为空")
     root_bytes = payload[root_offset:root_offset + root_length]
 
     root = json.loads(root_bytes, object_pairs_hook=_unique_json_fields, parse_constant=_reject_nonfinite_json)
@@ -68,12 +65,9 @@ def read_fine_archive_root(payload):
 
 def validate_fine_archive(payload, *, session=None, generation=None, cloud_revision=None,
                           source_timestamp_ns=None, frame_generation=None, producer_generation=None):
-    """读取 AR1–AR5 完整根并核对块结构和原提交；旧摘要字段仅保留为别名。"""
+    """读取 AR4、AR5 完整根并核对块结构和原提交。"""
     magic, root, offset = read_fine_archive_root(payload)
-    legacy = magic == b"NUWAXAR1"
-    root_fields = {"version", "domain", "revision", "source_timestamp_ns", "voxel_size_m", "blocks"}
-    if not legacy:
-        root_fields.add("geometry_revision")
+    root_fields = {"version", "domain", "revision", "source_timestamp_ns", "voxel_size_m", "blocks", "geometry_revision"}
     version = int(chr(magic[-1]))
     if version >= 4 and isinstance(root, dict) and "source_watermarks" in root:
         root_fields.add("source_watermarks")
@@ -98,8 +92,7 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
         _validate_source_watermarks(root.get("source_watermarks", []), integer)
     revision = integer(root["revision"], 1, 2 ** 64 - 1)
     source_time = integer(root["source_timestamp_ns"], 1, 2 ** 64 - 1)
-    if not legacy:
-        integer(root["geometry_revision"], 1, revision)
+    integer(root["geometry_revision"], 1, revision)
     size = root["voxel_size_m"]
     if type(size) not in (int, float) or not 0 < size <= 1048576 or not math.isfinite(size):
         raise ValueError("精细地图分辨率错误")
@@ -130,8 +123,7 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
     object_points = {}
     object_offsets = {}
     ground_bindings = {}
-    reference_fields = ({"key", "sha256", "geometry_sha256", "points"} if legacy else
-                        {"key", "object", "block_revision", "geometry_revision", "points"})
+    reference_fields = {"key", "object", "block_revision", "geometry_revision", "points"}
     for reference in blocks:
         if not isinstance(reference, dict) or set(reference) != reference_fields:
             raise ValueError("精细地图块引用字段错误")
@@ -143,19 +135,15 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
             raise ValueError("精细地图块重复或无序")
         previous = key
         points = integer(reference["points"], 1, 32768)
-        if legacy:
-            object_id = ("legacy", identity_bytes(reference["sha256"], 32))
-            identity_bytes(reference["geometry_sha256"], 32)
-        else:
-            object_ref = reference["object"]
-            if not isinstance(object_ref, dict) or set(object_ref) != {"kind", "value"}:
-                raise ValueError("精细地图对象身份字段错误")
-            kind = object_ref["kind"]
-            if kind not in ("assigned", "legacy"):
-                raise ValueError("精细地图对象身份种类错误")
-            object_id = (kind, identity_bytes(object_ref["value"], 16 if kind == "assigned" else 32))
-            block_revision = integer(reference["block_revision"], 1, revision)
-            integer(reference["geometry_revision"], 1, min(block_revision, root["geometry_revision"]))
+        object_ref = reference["object"]
+        if not isinstance(object_ref, dict) or set(object_ref) != {"kind", "value"}:
+            raise ValueError("精细地图对象身份字段错误")
+        kind = object_ref["kind"]
+        if kind != "assigned":
+            raise ValueError("精细地图对象身份种类错误")
+        object_id = (kind, identity_bytes(object_ref["value"], 16))
+        block_revision = integer(reference["block_revision"], 1, revision)
+        integer(reference["geometry_revision"], 1, min(block_revision, root["geometry_revision"]))
         if object_points.setdefault(object_id, points) != points:
             raise ValueError("精细地图同一对象记录数不一致")
         if offset + 4 > len(payload):
@@ -175,9 +163,8 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
         if not shared and length > _MAX_OLD_LAYER_BLOCK_BYTES:
             raise ValueError("旧格式精细地图块长度超过原4MiB上限")
         mode = block[records_end] if shared and len(block) > records_end else -1
-        sourced = version >= 4 and (block[:8] == b"NUWAXBL3" or (shared and mode == 1))
         versioned = version >= 5 and (block[:8] in (b"NUWAXBL4", b"NUWAXBL5") or (shared and mode == 2))
-        layered = (version >= 3 and (block[:8] == b"NUWAXBL2" or (shared and mode == 0))) or sourced or versioned
+        layered = versioned
         layer_length = struct.unpack("<I", block[12:16])[0]
         if (block[:8] != b"NUWAXBL1" and not layered
                 or struct.unpack("<I", block[8:12])[0] != points
@@ -213,12 +200,6 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
                 evidence = {local: stamp for local, stamp, _ in struct.iter_unpack("<HQH", memoryview(block)[16:records_end])}
                 _validate_ground_records(layers, integer, key, evidence, heightfields, size,
                                          empty_ground_columns, declared_ground_columns)
-            else:
-                _validate_layer_structure(layers, integer, sourced=sourced)
-                if version >= 5:
-                    declared_ground_columns.update((key[0] * 32 + local % 32,
-                                                    key[1] * 32 + local // 32 % 32)
-                                                   for local, _ in layers)
     if offset != len(payload):
         raise ValueError("精细地图资产存在尾随数据")
     if version >= 5:
@@ -263,72 +244,10 @@ def _validate_source_watermarks(watermarks, integer):
         integer(watermark["source_sequence"], 1 if source[0] == "lidar" else 0, 2 ** 64 - 1)
 
 
-def _validate_layer_structure(layers, integer, *, sourced=False):
-    """Read BL2/BL3 wire shapes; physical layer semantics belong to Rust."""
-    def fail():
-        raise ValueError("精细地图层格式错误")
-
-    def vector(value):
-        if (not isinstance(value, list) or len(value) != 3
-                or any(type(v) not in (int, float) or not -1.7976931348623157e308 <= v <= 1.7976931348623157e308 for v in value)):
-            fail()
-
-    if not isinstance(layers, list) or not 1 <= len(layers) <= 32768:
-        fail()
-    for entry in layers:
-        if not isinstance(entry, list) or len(entry) != 2:
-            fail()
-        anchor, layer = entry
-        integer(anchor, 0, 65535)
-        fields = {"members", "plane_origin", "normal", "samples"}
-        if sourced and isinstance(layer, dict) and "sample_sources" in layer:
-            fields.add("sample_sources")
-        if not isinstance(layer, dict) or set(layer) != fields:
-            fail()
-        members, samples = layer["members"], layer["samples"]
-        if (not isinstance(members, list) or not 1 <= len(members) <= 32
-                or not isinstance(samples, list) or not 1 <= len(samples) <= 32):
-            fail()
-        for member in members:
-            integer(member, 0, 65535)
-        vector(layer["normal"])
-        vector(layer["plane_origin"])
-        for sample in samples:
-            if not isinstance(sample, dict) or set(sample) != {"point", "source_sequence", "source_timestamp_ns", "point_index"}:
-                fail()
-            vector(sample["point"])
-            integer(sample["source_sequence"], 0, 2 ** 64 - 1)
-            integer(sample["source_timestamp_ns"], 0, 2 ** 64 - 1)
-            integer(sample["point_index"], 0, 2 ** 32 - 1)
-        if sourced:
-            groups = layer.get("sample_sources", [])
-            if not isinstance(groups, list) or len(groups) > len(samples):
-                fail()
-            sources, positions = set(), set()
-            for group in groups:
-                if not isinstance(group, dict) or set(group) != {"source", "sample_positions"}:
-                    fail()
-                source = _validate_observation_source(group["source"], integer)
-                if source in sources:
-                    fail()
-                sources.add(source)
-                indexes = group["sample_positions"]
-                if not isinstance(indexes, list) or not 1 <= len(indexes) <= len(samples):
-                    fail()
-                for position in indexes:
-                    integer(position, 0, len(samples) - 1)
-                    if position in positions:
-                        fail()
-                    positions.add(position)
-                    sample = samples[position]
-                    integer(sample["source_timestamp_ns"], 1, 2 ** 64 - 1)
-                    integer(sample["source_sequence"], 1 if source[0] == "lidar" else 0, 2 ** 64 - 1)
 
 
 def _heightfield_samples(encoded, integer):
-    """读取旧样本数组或紧凑来源表，保留每个原始数值字段。"""
-    if isinstance(encoded, list):
-        return encoded
+    """读取紧凑来源表，保留每个原始数值字段。"""
     if not isinstance(encoded, dict) or set(encoded) != {"sources", "values"}:
         raise ValueError("精细地图紧凑样本字段错误")
     sources, values = encoded["sources"], encoded["values"]
@@ -337,9 +256,8 @@ def _heightfield_samples(encoded, integer):
         raise ValueError("精细地图紧凑样本预算错误")
     identities = []
     for source in sources:
-        identity = (("legacy",) if source == {"kind": "legacy"}
-                    else _validate_observation_source(source, integer))
-        identities.append(({"legacy": 0, "lidar": 1, "auxiliary": 2}[identity[0]], *identity[1:]))
+        identity = _validate_observation_source(source, integer)
+        identities.append(({"lidar": 1, "auxiliary": 2}[identity[0]], *identity[1:]))
     if identities != sorted(set(identities)):
         raise ValueError("精细地图紧凑来源重复或无序")
     used, samples = set(), []
@@ -379,10 +297,7 @@ def _validate_ground_records(records, integer, block_key, evidence, columns, res
             empty_columns.add(xy)
             continue
         declared_columns.add(xy)
-        if tagged["representation"] == "legacy_plane":
-            _validate_layer_structure([[local, value]], integer, sourced=True)
-            members = value["members"]
-        elif tagged["representation"] in {"heightfield_v1", "heightfield_v1_compact"}:
+        if tagged["representation"] == "heightfield_v1_compact":
             if not isinstance(value, dict) or set(value) != {"anchor", "height_m", "occupied_bounds", "members", "samples"}:
                 raise ValueError("精细地图高程片字段错误")
             anchor, bounds, pairs, samples = (value[k] for k in ("anchor", "occupied_bounds", "members", "samples"))
@@ -422,8 +337,7 @@ def _validate_ground_records(records, integer, block_key, evidence, columns, res
                 if not isinstance(sample, dict) or set(sample) != {"source", "point", "source_sequence", "source_timestamp_ns", "point_index"}:
                     raise ValueError("精细地图高程诊断样本错误")
                 source = sample["source"]
-                source_id = (("legacy",) if source == {"kind": "legacy"}
-                             else _validate_observation_source(source, integer))
+                source_id = _validate_observation_source(source, integer)
                 sequence = integer(sample["source_sequence"], 0 if source_id[0] == "auxiliary" else 1, 2 ** 64 - 1)
                 stamp = integer(sample["source_timestamp_ns"], 1, 2 ** 64 - 1)
                 index = integer(sample["point_index"], 0, 2 ** 32 - 1)
@@ -439,26 +353,6 @@ def _validate_ground_records(records, integer, block_key, evidence, columns, res
         if (members[0] != local or members != sorted(set(members))
                 or any(m % 1024 != local % 1024 or m not in evidence or m in claimed for m in members)):
             raise ValueError("精细地图地表成员归属错误")
-        if tagged["representation"] == "legacy_plane":
-            member_time = max((evidence[m] for m in members), default=0)
-            q = struct.unpack("<f", struct.pack("<f", resolution))[0]
-            if q <= 0:
-                raise ValueError("精细地图分辨率无法表示")
-            reciprocal = 1.0 / q
-            for sample in value["samples"]:
-                stamp = sample["source_timestamp_ns"]
-                if stamp <= member_time:
-                    continue
-                scaled = [v * reciprocal for v in sample["point"]]
-                if any(not math.isfinite(v) for v in scaled):
-                    raise ValueError("精细地图旧诊断缺少实际占据证据")
-                xyz = [math.floor(v) for v in scaled]
-                if (any(v < -(2 ** 31) or v > 2 ** 31 - 1 for v in xyz)
-                        or tuple(v // 32 for v in xyz) != tuple(block_key)):
-                    raise ValueError("精细地图旧诊断缺少实际占据证据")
-                local_sample = xyz[0] % 32 + 32 * (xyz[1] % 32) + 1024 * (xyz[2] % 32)
-                if stamp > evidence.get(local_sample, 0):
-                    raise ValueError("精细地图旧诊断缺少实际占据证据")
         claimed.update(members)
 
 
@@ -493,15 +387,11 @@ def _validate_heightfield_columns(columns, resolution):
 
 
 def _binary_source_identity(source, integer):
-    if source == {"kind": "legacy"}:
-        return (0,)
     identity = _validate_observation_source(source, integer)
     return ({"lidar": 1, "auxiliary": 2}[identity[0]], *identity[1:])
 
 
 def _binary_source_bytes(source):
-    if source["kind"] == "legacy":
-        return 1
     if source["kind"] == "lidar":
         return 17 + len(source["sensor_frame_id"].encode("utf-8"))
     return 25 + len(source["sensor_id"].encode("utf-8")) + len(source["clock_id"].encode("utf-8"))

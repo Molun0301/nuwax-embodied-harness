@@ -29,9 +29,9 @@ def archive(bodies, version=5, size=.125):
 
 
 def fragment(z, mass, height=4.0078125, bounds=None):
-    return [[0, dict(representation="heightfield_v1", data=dict(anchor=[0, 0, 0],
+    return [[0, dict(representation="heightfield_v1_compact", data=dict(anchor=[0, 0, 0],
              height_m=height, occupied_bounds=[0., 8.125] if bounds is None else bounds,
-             members=[[0, [mass, 0., 0., 0., 0., 0., 0., 0.]]], samples=[]))]]
+             members=[[0, [mass, 0., 0., 0., 0., 0., 0., 0.]]], samples=dict(sources=[], values=[])))]]
 
 
 def full(with_middle=True):
@@ -67,17 +67,6 @@ class HeightfieldArchiveTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_fine_archive(archive(full(), version=4))
 
-    def test_original_record_count_and_four_mib_budget(self):
-        # A complete old horizontal plane already has 1024 native columns.
-        old = [[m, dict(members=[m], plane_origin=[0., 0., .01], normal=[0., 0., 1.],
-               samples=[dict(point=[0., 0., .01], source_sequence=1, source_timestamp_ns=20, point_index=m)])]
-               for m in range(1024)]
-        raw = json.dumps(old, separators=(",", ":")).encode()
-        data = b"NUWAXBL2" + struct.pack("<II", 1024, len(raw)) + b"".join(struct.pack("<HQH", m, 20, 1) for m in range(1024)) + raw
-        self.assertEqual(validate_fine_archive(archive([([0, 0, 0], data)], version=4))["blocks"][0]["points"], 1024)
-        oversized = data + b" " * (4 * 1024 * 1024)
-        with self.assertRaisesRegex(ValueError, "块长度"):
-            validate_fine_archive(archive([([0, 0, 0], oversized)], version=4))
 
     def test_actual_rust_archive_artifacts(self):
         directory = os.environ.get("NEH_HEIGHTFIELD_ARCHIVE_DIR")

@@ -3,38 +3,26 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 pub const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
-const CURRENT_MAGIC: &[u8; 8] = b"NUWAXAR2";
-const LAYER_MAGIC: &[u8; 8] = b"NUWAXAR3";
 const HEIGHTFIELD_MAGIC: &[u8; 8] = b"NUWAXAR5";
 const SOURCE_MAGIC: &[u8; 8] = b"NUWAXAR4";
-const LEGACY_MAGIC: &[u8; 8] = b"NUWAXAR1";
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct LegacyRoot { pub manifest: LegacyManifest, pub alias: LegacyAlias, pub raw_json: Vec<u8> }
-impl LegacyRoot {
-    pub fn decode(raw_json: Vec<u8>, alias: LegacyAlias) -> Result<Self, String> {
-        ObjectIdentity::Legacy(alias).validate()?;
-        Ok(Self { manifest: LegacyManifest::decode(&raw_json)?, alias, raw_json })
-    }
-}
-#[derive(Debug, Clone, PartialEq)]
-pub enum ArchivedRoot { Legacy(LegacyRoot), Current(Manifest) }
+pub enum ArchivedRoot { Current(Manifest) }
 impl ArchivedRoot {
-    pub fn domain(&self) -> &Domain { match self { Self::Legacy(r) => &r.manifest.domain, Self::Current(r) => &r.domain } }
-    pub fn revision(&self) -> u64 { match self { Self::Legacy(r) => r.manifest.revision, Self::Current(r) => r.revision } }
+    pub fn domain(&self) -> &Domain { match self { Self::Current(r) => &r.domain } }
+    pub fn revision(&self) -> u64 { match self { Self::Current(r) => r.revision } }
     pub fn identity(&self) -> RootIdentity { RootIdentity { domain: self.domain().clone(), revision: self.revision() } }
-    pub fn source_timestamp_ns(&self) -> u64 { match self { Self::Legacy(r) => r.manifest.source_timestamp_ns, Self::Current(r) => r.source_timestamp_ns } }
-    pub fn voxel_size_m(&self) -> f32 { match self { Self::Legacy(r) => r.manifest.voxel_size_m, Self::Current(r) => r.voxel_size_m } }
-    pub fn points(&self) -> u64 { match self { Self::Legacy(r) => r.manifest.points(), Self::Current(r) => r.points() } }
+    pub fn source_timestamp_ns(&self) -> u64 { match self { Self::Current(r) => r.source_timestamp_ns } }
+    pub fn voxel_size_m(&self) -> f32 { match self { Self::Current(r) => r.voxel_size_m } }
+    pub fn points(&self) -> u64 { match self { Self::Current(r) => r.points() } }
     pub fn objects(&self) -> Vec<(Key, ObjectIdentity, u32)> {
         match self {
             Self::Current(r) => r.blocks.iter().map(|b| (b.key, b.object, b.points)).collect(),
-            Self::Legacy(r) => r.manifest.blocks.iter().map(|b| (b.key, ObjectIdentity::Legacy(b.sha256), b.points)).collect(),
         }
     }
 }
 
-/// 来源统计写 AR4，兼容几何 AR2 与层统计 AR3；逐块流式输出，根已有拥有方身份，无根或归档摘要槽。
+/// 逐块写入 AR4、AR5；根持有分配式身份。
 pub fn archive_file(root: &Manifest, repository: &Repository) -> Result<(File, u64), String> {
     let root_bytes = root.encode()?;
     let expected_size = 24 + root_bytes.len() as u64
@@ -42,7 +30,7 @@ pub fn archive_file(root: &Manifest, repository: &Repository) -> Result<(File, u
     if expected_size > MAX_ARCHIVE_BYTES { return Err("精细地图资产超出1吉比字节预算".into()); }
     let mut file = tempfile::tempfile().map_err(|e| e.to_string())?;
     let mut write = |bytes: &[u8]| file.write_all(bytes).map_err(|e| e.to_string());
-    write(match root.version { 5 => HEIGHTFIELD_MAGIC, 4 => SOURCE_MAGIC, 3 => LAYER_MAGIC, _ => CURRENT_MAGIC })?;
+    write(match root.version { 5 => HEIGHTFIELD_MAGIC, _ => SOURCE_MAGIC })?;
     write(&(root_bytes.len() as u64).to_le_bytes())?;
     write(&root_bytes)?;
     write(&(root.blocks.len() as u64).to_le_bytes())?;
@@ -65,7 +53,7 @@ pub fn archive_file(root: &Manifest, repository: &Repository) -> Result<(File, u
 }
 
 struct ArchiveObject { offset: u64, size: usize, object: ObjectIdentity, points: u32 }
-/// 旧 AR1 保留原根字节和已有别名；局部读取不解包整张地图。
+/// 根据现行根按块读取，不解包整张地图。
 pub struct ArchiveReader<R> {
     reader: R,
     root: ArchivedRoot,
@@ -79,29 +67,15 @@ impl<R: Read + Seek> ArchiveReader<R> {
         if !(24..=MAX_ARCHIVE_BYTES).contains(&length) { return Err("精细资产文件长度无效".into()); }
         reader.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         let mut header = [0; 16]; reader.read_exact(&mut header).map_err(|e| e.to_string())?;
-        let legacy = match &header[..8] {
-            magic if magic == CURRENT_MAGIC || magic == LAYER_MAGIC || magic == SOURCE_MAGIC || magic == HEIGHTFIELD_MAGIC => false,
-            magic if magic == LEGACY_MAGIC => true,
+        match &header[..8] {
+            magic if magic == SOURCE_MAGIC || magic == HEIGHTFIELD_MAGIC => {},
             _ => return Err("精细资产格式未知".into()),
-        };
+        }
         let size = u64::from_le_bytes(header[8..16].try_into().unwrap());
-        let overhead = if legacy { 56 } else { 24 };
-        if size > MAX_MANIFEST_BYTES as u64 || size + overhead > length { return Err("精细资产根超预算或截断".into()); }
-        let alias = if legacy {
-            let mut alias = [0; 32]; reader.read_exact(&mut alias).map_err(|e| e.to_string())?;
-            Some(LegacyAlias(alias))
-        } else { None };
+        if size > MAX_MANIFEST_BYTES as u64 || size + 24 > length { return Err("精细资产根超预算或截断".into()); }
         let mut bytes = vec![0; size as usize]; reader.read_exact(&mut bytes).map_err(|e| e.to_string())?;
-        let root = if let Some(alias) = alias { ArchivedRoot::Legacy(LegacyRoot::decode(bytes, alias)?) }
-            else { ArchivedRoot::Current(Manifest::decode(&bytes)?) };
-        let archive_version = match &header[..8] {
-            magic if magic == HEIGHTFIELD_MAGIC => 5,
-            magic if magic == SOURCE_MAGIC => 4,
-            magic if magic == LAYER_MAGIC => 3,
-            magic if magic == CURRENT_MAGIC => 2,
-            _ => 1,
-        };
-        let layered = archive_version >= 3;
+        let root = ArchivedRoot::Current(Manifest::decode(&bytes)?);
+        let archive_version = if &header[..8] == HEIGHTFIELD_MAGIC { 5 } else { 4 };
         if matches!(&root, ArchivedRoot::Current(r) if r.version != archive_version) { return Err("archive/root version mismatch".into()); }
         let mut count = [0; 8]; reader.read_exact(&mut count).map_err(|e| e.to_string())?;
         let objects = root.objects();
@@ -111,7 +85,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         for (key, object, points) in objects {
             let mut size = [0; 4]; reader.read_exact(&mut size).map_err(|e| e.to_string())?;
             let size = u32::from_le_bytes(size) as usize;
-            if (!layered && size != 16 + points as usize * 12) || size < 16 + points as usize * 12 || size > MAX_BLOCK_BYTES { return Err("精细资产块长度不符".into()); }
+            if size < 16 + points as usize * 12 || size > MAX_BLOCK_BYTES { return Err("精细资产块长度不符".into()); }
             let offset = reader.stream_position().map_err(|e| e.to_string())?;
             if offset.checked_add(size as u64).is_none_or(|end| end > length) { return Err("精细资产块截断".into()); }
             first.entry(object).or_insert(key);
@@ -123,17 +97,12 @@ impl<R: Read + Seek> ArchiveReader<R> {
     }
     pub fn root(&self) -> &ArchivedRoot { &self.root }
     pub fn block(&mut self, reference: &BlockRef) -> Result<Vec<u8>, String> {
-        let ArchivedRoot::Current(root) = &self.root else { return Err("旧资产需要旧引用或空间键读取".into()); };
+        let ArchivedRoot::Current(root) = &self.root;
         let index = root.blocks.binary_search_by_key(&reference.key, |b| b.key).map_err(|_| "精细资产不含请求块")?;
         if &root.blocks[index] != reference { return Err("请求描述与精细资产根不符".into()); }
         self.block_by_key(reference.key)
     }
-    pub fn legacy_block(&mut self, reference: &LegacyBlockRef) -> Result<Vec<u8>, String> {
-        let ArchivedRoot::Legacy(root) = &self.root else { return Err("新资产不能使用旧引用".into()); };
-        let index = root.manifest.blocks.binary_search_by_key(&reference.key, |b| b.key).map_err(|_| "旧精细资产不含请求块")?;
-        if &root.manifest.blocks[index] != reference { return Err("请求描述与旧精细资产根不符".into()); }
-        self.block_by_key(reference.key)
-    }
+
     fn read_block(&mut self, key: Key) -> Result<(Vec<u8>, Block, GroundRecords), String> {
         let item = self.offsets.get(&key).ok_or("精细资产不含请求块")?;
         let mut bytes = vec![0; item.size];
@@ -155,10 +124,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             ArchivedRoot::Current(root) => {
                 admit_format(intrinsic_bytes(&bytes, &block), root)?;
                 ground_shared::admit(intrinsic_bytes(&bytes, &block), &layers, root)?;
-                if root.version >= 5 { ground_records::validate_legacy_sample_occupancy(&layers, &block, key, root.voxel_size_m)?; }
             },
-            ArchivedRoot::Legacy(_) if !layers.is_empty() => return Err("legacy archive contains observed layer block".into()),
-            _ => {},
         }
         admit_intrinsic(intrinsic(&block), item.points, self.root.source_timestamp_ns())?;
         self.checked.insert(key);
@@ -188,7 +154,6 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 ground_records::validate_root_columns(root, &mut reader, &columns)?;
             }
         }
-        if let ArchivedRoot::Legacy(root) = &self.root { repository.install_legacy_root(root)?; }
         Ok(self.root.clone())
     }
     pub fn region(&mut self, min: Key, max: Key, point_budget: usize) -> Result<Vec<(Key, Evidence)>, String> {

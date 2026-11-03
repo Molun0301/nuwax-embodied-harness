@@ -12,15 +12,10 @@ fn receive(receiver: &mut Receiver, root: &Manifest, source: &Repository) -> Res
 }
 fn body(local: u16, stamp: u64, hits: u16) -> Vec<u8> { encode_block(&BTreeMap::from([(local,Evidence {observed_ns:stamp,hits})])).unwrap() }
 fn archive_bytes(root: &Manifest, bodies: &[Vec<u8>]) -> Vec<u8> {
-    let json=root.encode().unwrap(); let mut out=match root.version { 4 => b"NUWAXAR4", 3 => b"NUWAXAR3", _ => b"NUWAXAR2" }.to_vec(); out.extend((json.len() as u64).to_le_bytes()); out.extend(json);
+    let json=root.encode().unwrap(); let mut out=match root.version { 5 => b"NUWAXAR5", _ => b"NUWAXAR4" }.to_vec(); out.extend((json.len() as u64).to_le_bytes()); out.extend(json);
     out.extend((bodies.len() as u64).to_le_bytes()); for b in bodies {out.extend((b.len() as u32).to_le_bytes());out.extend(b);} out
 }
-fn legacy_bytes(stamp: u64, bodies: &[Vec<u8>], shared: bool) -> Vec<u8> {
-    let refs:Vec<_>=bodies.iter().enumerate().map(|(i,_)|LegacyBlockRef{key:[i as i32,0,0],sha256:LegacyAlias([if shared {5} else {5+i as u8};32]),geometry_sha256:LegacyAlias([9;32]),points:1}).collect();
-    let root=LegacyManifest{version:1,domain:domain(),revision:4,source_timestamp_ns:stamp,voxel_size_m:0.125,blocks:refs};
-    let json=serde_json::to_vec_pretty(&root).unwrap(); let mut out=b"NUWAXAR1".to_vec();out.extend((json.len() as u64).to_le_bytes());out.extend([7;32]);out.extend(json);
-    out.extend((bodies.len() as u64).to_le_bytes());for b in bodies {out.extend((b.len() as u32).to_le_bytes());out.extend(b);}out
-}
+
 #[test]
 fn block_roundtrip_negative_coordinates_and_evidence() {
     for key in [[-1,-1,-1],[-32,31,32],[i32::MIN,0,i32::MAX]] { assert_eq!(global_key(block_key(key),local_key(key)).unwrap(),key); }
@@ -152,14 +147,16 @@ fn block_summary_matches_frozen_maximum_valid_block() {
     assert_eq!(block_summary(&bytes), Ok((32768, 32768)));
 }
 
+
 #[test]
 fn identity_json_namespace_and_no_content_dedup() {
     let (r,mut w)=writer();w.observe([[0,0,0],[32,0,0]],1).unwrap();let m=w.snapshot(domain(),1,1).unwrap();
     assert_ne!(m.blocks[0].object,m.blocks[1].object);assert_eq!(r.read_object(m.blocks[0].object,MAX_BLOCK_BYTES).unwrap(),r.read_object(m.blocks[1].object,MAX_BLOCK_BYTES).unwrap());
     let json=serde_json::to_value(&m.blocks[0].object).unwrap();assert_eq!(json["kind"],"assigned");assert_eq!(json["value"].as_array().unwrap().len(),16);
-    assert!(ObjectIdentity::Assigned(ObjectId([0;16])).validate().is_err());assert!(ObjectIdentity::Legacy(LegacyAlias([0;32])).validate().is_err());
+    assert!(ObjectIdentity::Assigned(ObjectId([0;16])).validate().is_err());
     assert!(std::fs::read_dir(r.path()).unwrap().all(|e|e.unwrap().file_name().to_str().unwrap().starts_with("id-")));
 }
+
 #[test]
 fn manifest_rejects_invalid_revisions_and_shared_intrinsic_conflicts() {
     let (_,_,m)=one();let mut bad=(*m).clone();bad.blocks[0].geometry_revision=2;assert!(bad.validate().is_err());
@@ -217,24 +214,25 @@ fn immutable_install_conflict_never_overwrites() {
     let r=Repository::temporary().unwrap();let id=ObjectIdentity::Assigned(ObjectId([3;16]));let old=body(0,1,1);let new=body(0,2,2);
     r.put_object(id,&old).unwrap();r.put_object(id,&old).unwrap();assert!(r.put_object(id,&new).is_err());assert_eq!(r.read_object(id,MAX_BLOCK_BYTES).unwrap(),old);
 }
-#[cfg(unix)]
+
+
 #[test]
 fn repository_rejects_symlink_and_directory_without_overwrite() {
-    let r=Repository::temporary().unwrap();let alias=ObjectIdentity::Legacy(LegacyAlias([3;32]));let path=r.path().join("03".repeat(32));
+    let r=Repository::temporary().unwrap();let alias=ObjectIdentity::Assigned(ObjectId([3;16]));let path=r.path().join(format!("id-{}", "03".repeat(16)));
     let target=r.path().join("outside");std::fs::write(&target,b"unchanged").unwrap();std::os::unix::fs::symlink(&target,&path).unwrap();
     assert!(r.read_object(alias,100).is_err());assert!(r.put_object(alias,b"different").is_err());assert_eq!(std::fs::read(&target).unwrap(),b"unchanged");
     assert!(r.read_object_range(alias,100,0,7).is_err());
     std::fs::remove_file(&path).unwrap();std::fs::create_dir(&path).unwrap();assert!(r.read_object(alias,100).is_err());assert!(r.put_object(alias,b"different").is_err());
     assert!(r.read_object_range(alias,100,0,7).is_err());
 }
+
 #[test]
 fn repository_ranges_reassemble_exact_bytes_with_bounded_buffers() {
     for length in [1, MAX_BLOCK_TRANSFER_PART_BYTES - 1, MAX_BLOCK_TRANSFER_PART_BYTES,
         MAX_BLOCK_TRANSFER_PART_BYTES + 1, 393_232, MAX_BLOCK_BYTES] {
         let repository = Repository::temporary().unwrap();
         let expected: Vec<_> = (0..length).map(|index| index as u8).collect();
-        for object in [ObjectIdentity::Assigned(ObjectId([1; 16])),
-            ObjectIdentity::Legacy(LegacyAlias([2; 32]))] {
+        for object in [ObjectIdentity::Assigned(ObjectId([1; 16]))] {
             repository.put_object(object, &expected).unwrap();
             let mut joined = Vec::new();
             while joined.len() < length {
@@ -252,6 +250,7 @@ fn repository_ranges_reassemble_exact_bytes_with_bounded_buffers() {
         }
     }
 }
+
 #[test]
 fn repository_ranges_keep_bounds_separate_from_missing_or_invalid_objects() {
     let repository = Repository::temporary().unwrap();
@@ -271,13 +270,7 @@ fn repository_ranges_keep_bounds_separate_from_missing_or_invalid_objects() {
     assert!(repository.read_object_range(ObjectIdentity::Assigned(ObjectId([3; 16])),
         MAX_BLOCK_BYTES, 0, 1).is_err());
 }
-#[test]
-fn legacy_alias_paths_and_shared_spatial_keys_are_retained() {
-    let bytes=legacy_bytes(1,&[body(0,1,1),body(0,1,1)],true);let mut a=ArchiveReader::open(Cursor::new(bytes)).unwrap();let r=Repository::temporary().unwrap();let root=a.import(&r).unwrap();
-    assert!(r.path().join("05".repeat(32)).is_file());let mut w=Writer::new(r.clone(),0.125,BUDGET).unwrap();w.restore_archived(&root).unwrap();assert!(w.snapshot(domain(),4,1).is_err());
-    let current=w.snapshot(domain(),5,1).unwrap();assert_eq!(current.blocks[0].object,current.blocks[1].object);assert_eq!(current.blocks[0].geometry_revision,5);
-    let mut cache=RegionReader::new(r.clone(),BUDGET);cache.block(&current.blocks[0]).unwrap();let count=r.counts();cache.block(&current.blocks[1]).unwrap();assert_eq!(count,r.counts());
-}
+
 #[test]
 fn cached_block_hit_does_not_reopen_or_rescan_members() {
     let (r,_,m)=one();let mut cache=RegionReader::new(r.clone(),BUDGET);let first=cache.block(&m.blocks[0]).unwrap();let counts=r.counts();
@@ -360,7 +353,7 @@ fn receiver_default_budget_and_configured_working_set_remain_bounded() {
         (local, Evidence { observed_ns: 1, hits: 1 })).collect();
     let bytes = encode_block(&block).unwrap();
     let root = Manifest {
-        version: 2, domain: domain(), revision: 1, geometry_revision: 1,
+        version: 4, domain: domain(), revision: 1, geometry_revision: 1,
         source_timestamp_ns: 1, voxel_size_m: 0.05, source_watermarks: Vec::new(),
         blocks: (1..=3_u8).map(|id| BlockRef {
             key: [i32::from(id) - 1, 0, 0], object: ObjectId([id; 16]).into(),
@@ -462,30 +455,30 @@ fn archive_ar4_stream_roundtrip_and_exact_reference_binding() {
     let mut reader=ArchiveReader::open(Cursor::new(bytes)).unwrap();assert_eq!(reader.root(),&ArchivedRoot::Current((*m).clone()));let mut bad=m.blocks[0].clone();bad.block_revision+=1;assert!(reader.block(&bad).is_err());
     let target=Repository::temporary().unwrap();reader.import(&target).unwrap();assert_eq!(target.read_object(m.blocks[0].object,MAX_BLOCK_BYTES).unwrap(),r.read_object(m.blocks[0].object,MAX_BLOCK_BYTES).unwrap());
 }
-#[test]
-fn archive_ar1_preserves_literal_json_and_opaque_aliases() {
-    let bytes=legacy_bytes(1,&[body(0,1,1)],false);let size=u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
-    let reader=ArchiveReader::open(Cursor::new(bytes.clone())).unwrap();let ArchivedRoot::Legacy(root)=reader.root() else{panic!()};assert_eq!(root.raw_json,bytes[48..48+size]);assert_eq!(root.alias,LegacyAlias([7;32]));
-}
+
+
+
 #[test]
 fn both_archive_versions_reject_truncation_trailing_counts_and_evidence() {
-    let (_,_,m)=one();for bytes in [archive_bytes(&m,&[body(0,1,1)]),legacy_bytes(1,&[body(0,1,1)],false)] {
+    let (_,_,m)=one();for bytes in [archive_bytes(&m,&[body(0,1,1)]),archive_with_version(5,1,&[body(0,1,1)],false)] {
         let mut bad=bytes.clone();bad.pop();assert!(ArchiveReader::open(Cursor::new(bad)).is_err());let mut bad=bytes.clone();bad.push(0);assert!(ArchiveReader::open(Cursor::new(bad)).is_err());
-        let offset=if &bytes[..8]==b"NUWAXAR1"{48}else{16};let json=u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let offset=16;let json=u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
         let mut bad=bytes.clone();bad[offset+json..offset+json+8].copy_from_slice(&2u64.to_le_bytes());assert!(ArchiveReader::open(Cursor::new(bad)).is_err());
         let mut bad=bytes;let stamp=offset+json+8+4+16+2;bad[stamp..stamp+8].copy_from_slice(&2u64.to_le_bytes());assert!(ArchiveReader::open(Cursor::new(bad)).unwrap().block_by_key([0,0,0]).is_err());
     }
 }
+
 #[test]
 fn both_archive_versions_reject_shared_id_different_same_length_bytes() {
     let (_,_,m)=one();let mut root=(*m).clone();let mut b=root.blocks[0].clone();b.key=[1,0,0];root.blocks.push(b);
     for changed in [body(1,1,1),body(0,1,2)] {
         let mut archive=ArchiveReader::open(Cursor::new(archive_bytes(&root,&[body(0,1,1),changed.clone()]))).unwrap();
         let repository=Repository::temporary().unwrap();assert!(archive.import(&repository).is_err());assert_eq!(repository.read_object(root.blocks[0].object,MAX_BLOCK_BYTES).unwrap(),body(0,1,1));
-        assert!(ArchiveReader::open(Cursor::new(legacy_bytes(1,&[body(0,1,1),changed],true))).unwrap().block_by_key([1,0,0]).is_err());
+        assert!(ArchiveReader::open(Cursor::new(archive_with_version(5,1,&[body(0,1,1),changed],true))).unwrap().block_by_key([1,0,0]).is_err());
     }
     assert!(ArchiveReader::open(Cursor::new(archive_bytes(&root,&[body(0,1,1),body(0,1,1)]))).is_ok());
 }
+
 #[test]
 fn archive_import_existing_conflict_preserves_first_bytes() {
     let (_,_,m)=one();let bytes=archive_bytes(&m,&[body(0,1,1)]);let mut reader=ArchiveReader::open(Cursor::new(bytes)).unwrap();let repo=Repository::temporary().unwrap();let old=body(1,1,1);repo.put_object(m.blocks[0].object,&old).unwrap();
@@ -504,20 +497,8 @@ fn many_membership_edits_remain_bounded_and_gc_pins_baseline() {
     for x in 0..64 {w.remove([[x*32,0,0]]).unwrap();w.flush().unwrap();w.collect_sealed(&[]).unwrap();assert!(w.resident_bytes()<=BUDGET);}
     let root=w.snapshot(domain(),2,1).unwrap();assert_eq!(root.geometry_revision,2);assert_eq!(root.points(),64*32767);
 }
-#[test]
-fn literal_cross_language_ar1_fixture() {
-    let mut reader=ArchiveReader::open(Cursor::new(include_bytes!("fixtures/python-ar1-literal.bin").as_slice())).unwrap();
-    assert_eq!(reader.root().points(),2);let points=reader.region([-32,0,32],[-1,31,63],2).unwrap();assert_eq!(points.len(),2);assert_eq!(points[1].1.observed_ns,u64::MAX);assert_eq!(points[1].1.hits,u16::MAX);
-    assert_eq!(reader.root().revision(),9_007_199_254_740_993);
-    reader.import(&Repository::temporary().unwrap()).unwrap();
-}
-#[test]
-fn literal_cross_language_ar2_fixture() {
-    let mut reader=ArchiveReader::open(Cursor::new(include_bytes!("fixtures/python-ar2-literal.bin").as_slice())).unwrap();
-    assert_eq!(reader.root().points(),2);let points=reader.region([-32,0,32],[-1,31,63],2).unwrap();assert_eq!(points.len(),2);assert_eq!(points[1].1.observed_ns,u64::MAX);assert_eq!(points[1].1.hits,u16::MAX);
-    assert_eq!(reader.root().revision(),9_007_199_254_740_993);
-    reader.import(&Repository::temporary().unwrap()).unwrap();
-}
+
+
 
 #[test]
 fn archive_open_is_framing_only_until_a_body_is_consumed() {
@@ -840,4 +821,14 @@ fn frame_rehome_rejects_missing_baseline_and_frame_overflow() {
     let next = writer.seal(last_domain, 2, 2).unwrap();
     assert_eq!(next.manifest().blocks[0].block_revision, 2);
     assert_eq!(next.manifest().blocks[0].geometry_revision, 1);
+}
+
+fn archive_with_version(version: u32, stamp: u64, bodies: &[Vec<u8>], shared: bool) -> Vec<u8> {
+    let refs = bodies.iter().enumerate().map(|(i, _)| BlockRef {
+        key: [i as i32, 0, 0], object: ObjectId([if shared { 5 } else { 5 + i as u8 }; 16]).into(),
+        block_revision: 4, geometry_revision: 4, points: 1,
+    }).collect();
+    let root = Manifest { version, domain: domain(), revision: 4, geometry_revision: 4,
+        source_timestamp_ns: stamp, voxel_size_m: 0.125, blocks: refs, source_watermarks: vec![] };
+    archive_bytes(&root, bodies)
 }

@@ -11,15 +11,15 @@ from tests.fine_scalar_oracle import validate_fine_archive as oracle
 
 U64=2**64-1
 ERROR='精细地图块观察证据错误'
-def archive(records, legacy=False, source=U64):
-    ref=dict(key=[0,0,0],points=len(records))
-    if legacy: ref.update(sha256=[1]*32,geometry_sha256=[2]*32)
-    else: ref.update(object=dict(kind='assigned',value=[1]*16),block_revision=1,geometry_revision=1)
-    root=dict(version=1 if legacy else 2,domain=dict(session='s',generation=1,frame_generation=0,producer_generation=1),revision=1,source_timestamp_ns=source,voxel_size_m=.05,blocks=[ref])
-    if not legacy:root['geometry_revision']=1
+def archive(records, heightfield=False, source=U64):
+    ref=dict(key=[0,0,0], points=len(records), object=dict(kind='assigned',value=[1]*16),
+             block_revision=1, geometry_revision=1)
+    root=dict(version=5 if heightfield else 4,
+              domain=dict(session='s',generation=1,frame_generation=0,producer_generation=1),
+              revision=1,geometry_revision=1,source_timestamp_ns=source,voxel_size_m=.05,blocks=[ref])
     raw=json.dumps(root,separators=(',',':')).encode()
     block=b'NUWAXBL1'+struct.pack('<II',len(records),0)+b''.join(struct.pack('<HQH',*r) for r in records)
-    return (b'NUWAXAR1' if legacy else b'NUWAXAR2')+struct.pack('<Q',len(raw))+(b'X'*32 if legacy else b'')+raw+struct.pack('<QI',1,len(block))+block
+    return (b'NUWAXAR5' if heightfield else b'NUWAXAR4')+struct.pack('<Q',len(raw))+raw+struct.pack('<QI',1,len(block))+block
 
 class Borrowed(FrozenPayload):
     """Same bounded slicing contract as the ordinary repository's borrowed view."""

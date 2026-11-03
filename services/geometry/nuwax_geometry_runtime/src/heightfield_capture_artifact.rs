@@ -35,7 +35,6 @@ fn export(case: &str) {
     let columns = records(&mut fine);
     let mut sample_count = 0;
     let oracle: Vec<_> = columns.iter().map(|(xy, column)| {
-        assert!(column.legacy.is_empty(), "fresh capture must not fabricate legacy planes");
         let fields: Vec<_> = column.heightfields.iter().map(|surface| {
             for sample in &surface.samples {
                 sample_count += 1;

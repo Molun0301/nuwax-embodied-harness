@@ -4,7 +4,6 @@ use std::collections::{HashMap, HashSet};
 
 pub(crate) fn source_bytes(source: &LayerSource) -> usize {
     match source {
-        LayerSource::Legacy => 1,
         LayerSource::Lidar { sensor_frame_id, .. } => 17 + sensor_frame_id.len(),
         LayerSource::Auxiliary { sensor_id, clock_id, .. } => 25 + sensor_id.len() + clock_id.len(),
     }
@@ -12,7 +11,6 @@ pub(crate) fn source_bytes(source: &LayerSource) -> usize {
 
 fn samples(record: GroundRecordRef<'_>) -> &[LayerSample] {
     match record {
-        GroundRecordRef::LegacyPlane(v) => &v.samples,
         GroundRecordRef::HeightfieldV1(v) => &v.samples,
         GroundRecordRef::ClassifiedEmptyColumn => &[],
     }
@@ -80,7 +78,6 @@ impl Output {
     }
     fn source(&mut self, source: &LayerSource) -> Result<(), String> {
         match source {
-            LayerSource::Legacy => self.put(&[0])?,
             LayerSource::Lidar { backend, runtime_generation, sensor_frame_id } => {
                 self.put(&[1])?; self.put(&backend.to_le_bytes())?;
                 self.put(&runtime_generation.to_le_bytes())?; self.string(sensor_frame_id)?;
@@ -106,7 +103,6 @@ pub(crate) fn encode(block: &Block, records: &GroundRecords) -> Result<Vec<u8>, 
     if sources.bytes > MAX_BLOCK_SOURCE_BYTES { return Err("BL6 source metadata exceeds root and legacy allowance".into()); }
     let mode = match records {
         GroundRecords::Versioned(_) => 2,
-        GroundRecords::Legacy(_) => u8::from(sources.values.iter().any(|s| !s.is_legacy())),
     };
     let mut out = Output(encode_block(block)?); let start = out.0.len();
     out.put(&[mode])?; out.put(&(sources.bytes as u32).to_le_bytes())?;
@@ -116,12 +112,7 @@ pub(crate) fn encode(block: &Block, records: &GroundRecords) -> Result<Vec<u8>, 
     for (key, record) in records.iter() {
         out.put(&key.to_le_bytes())?;
         match record {
-            GroundRecordRef::LegacyPlane(layer) => {
-                out.put(&[0, layer.members.len() as u8])?;
-                for member in &layer.members { out.put(&member.to_le_bytes())?; }
-                out.floats(&layer.plane_origin)?; out.floats(&layer.normal)?;
-                out.samples(&layer.samples, &sources)?;
-            }
+
             GroundRecordRef::HeightfieldV1(field) => {
                 out.put(&[1])?;
                 for coord in field.anchor { out.put(&coord.to_le_bytes())?; }
@@ -158,7 +149,6 @@ impl<'a> Input<'a> {
     }
     fn source(&mut self) -> Result<Arc<LayerSource>, String> {
         let source = match self.byte()? {
-            0 => LayerSource::Legacy,
             1 => LayerSource::Lidar { backend: i32::from_le_bytes(self.array()?),
                 runtime_generation: i64::from_le_bytes(self.array()?), sensor_frame_id: self.string()? },
             2 => {
@@ -184,7 +174,7 @@ impl<'a> Input<'a> {
 
 pub(crate) fn decode(bytes: &[u8]) -> Result<GroundRecords, String> {
     let mut input = Input(bytes); let mode = input.byte()?;
-    if mode > 2 { return Err("unknown BL6 ground mode".into()); }
+    if mode != 2 { return Err("unknown BL6 ground mode".into()); }
     let size = u32::from_le_bytes(input.array()?) as usize;
     let count = u32::from_le_bytes(input.array()?) as usize;
     if size > MAX_BLOCK_SOURCE_BYTES || count > MAX_LAYERS_PER_BLOCK * MAX_LAYER_SAMPLES {
@@ -197,7 +187,6 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<GroundRecords, String> {
         sources.push(source);
     }
     if !body.0.is_empty() { return Err("BL6 source length mismatch".into()); }
-    if mode < 2 && (mode == 1) != sources.iter().any(|s| !s.is_legacy()) { return Err("BL6 source mode mismatch".into()); }
     let mut used = vec![false; count];
     let count = u32::from_le_bytes(input.array()?) as usize;
     if count == 0 || count > MAX_LAYERS_PER_BLOCK { return Err("invalid BL6 record count".into()); }
@@ -206,12 +195,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<GroundRecords, String> {
         let key = u16::from_le_bytes(input.array()?);
         if records.last_key_value().is_some_and(|(&old, _)| old >= key) { return Err("invalid ground record anchors".into()); }
         let record = match input.byte()? {
-            0 => {
-                let mut members = Vec::new();
-                for _ in 0..input.count(MAX_LAYER_MEMBERS)? { members.push(u16::from_le_bytes(input.array()?)); }
-                GroundRecord::LegacyPlane(LayerObservation { members, plane_origin: input.floats()?, normal: input.floats()?,
-                    samples: input.samples(&sources, &mut used)? })
-            }
+
             1 if mode == 2 => {
                 let mut anchor = [0; 3]; for coord in &mut anchor { *coord = i32::from_le_bytes(input.array()?); }
                 let height_m = input.floats::<1>()?[0]; let occupied_bounds = input.floats()?;
@@ -226,9 +210,5 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<GroundRecords, String> {
         records.insert(key, record);
     }
     if !input.0.is_empty() || used.contains(&false) { return Err("trailing BL6 bytes or unused source".into()); }
-    if mode == 2 { Ok(GroundRecords::Versioned(Arc::new(records))) } else {
-        Ok(GroundRecords::Legacy(Arc::new(records.into_iter().map(|(key, value)| {
-            let GroundRecord::LegacyPlane(value) = value else { unreachable!() }; (key, value)
-        }).collect())))
-    }
+    Ok(GroundRecords::Versioned(Arc::new(records)))
 }

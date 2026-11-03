@@ -28,54 +28,14 @@ class WorkspaceLoadTests(assets.AssetCatalogTests):
     def workspace(self):
         state = RecordingState()
         owner = Workspace(catalog_root=str(self.repository._root_dir),
-            geometry_runtime=types.SimpleNamespace(capture_assigned_fine_import_origin=lambda: None),
+            geometry_runtime=types.SimpleNamespace(),
             mapping_service=types.SimpleNamespace(), localization_service=types.SimpleNamespace(),
             memory_service=types.SimpleNamespace(), navigation_service=types.SimpleNamespace(), state_store=state)
         owner._repository = self.catalog
         owner._asset_repository = self.repository
         return owner
 
-    def test_normal_workspace_load_imports_once_and_persists_selection(self):
-        current, legacy, old = assets.install_literal_legacy(self.repository, self.catalog)
-        before = assets.bytes_inventory(current)
-        owner = self.workspace()
-        result = owner.get_map_asset_bundle(map_name='map')
-        self.assertEqual(result.identity_schema_version, 2)
-        committed = self.catalog.get_map_asset('map')
-        self.assertEqual(committed.asset_identity, result.asset_identity)
-        self.assertIsNone(committed.asset_manifest_sha256)
-        self.assertEqual(assets.bytes_inventory(current), before)
-        self.assertEqual(self.repository.current_directory('map'), self.repository._assigned_version_dir('map', result.asset_identity))
-        self.assertEqual(len(owner._state_store.writes), 1)
-        directories = set(self.repository._map_dir('map').iterdir())
-        selected = owner.get_map_asset_bundle(map_name='map')
-        self.assertEqual(selected.asset_identity, result.asset_identity)
-        self.assertEqual(set(self.repository._map_dir('map').iterdir()), directories)
-        self.assertEqual(len(owner._state_store.writes), 1)
-        # Normal activation read retains the same graph and exact selected root.
-        activation_read = owner.get_map_asset_bundle(map_name='map', _for_activation=True)
-        bundle, stored = activation_read.require_owner(self.repository, self.repository.current_directory('map'))
-        self.assertEqual(bundle.asset_identity, result.asset_identity)
-        self.assertEqual(stored.checkpoint.schema_version, 2)
-        self.assertEqual(stored.checkpoint.graph_reference.member_identity.checkpoint_id, stored.checkpoint.checkpoint_id)
-        self.assertEqual(assets.bytes_inventory(current), before)
 
-    def test_workspace_reconciles_independent_planar_continuation(self):
-        current, legacy, old = assets.install_literal_legacy(self.repository, self.catalog)
-        before = assets.bytes_inventory(current)
-        owner = self.workspace()
-        first = owner.get_map_asset_bundle(map_name='map')
-        original = self.catalog.get_map_asset('map')
-        captured = save.catalog_owner(owner, original)
-        staging, candidate, identity = assets.prepare_assigned(self.repository, 'map', '9' * 32, '8' * 32, '7' * 32)
-        finalized = self.repository.finalize_assigned_map_asset_bundle(candidate, staging_dir=staging,
-            asset_identity=identity, expected_previous_identity=first.asset_identity)
-        committed = save.reconcile_assigned_current(owner, original, finalized, captured=captured,
-            expected_previous_identity=first.asset_identity)
-        self.assertEqual(committed.asset_identity, identity)
-        self.assertEqual(owner.get_map_asset_bundle(map_name='map').asset_identity, identity)
-        self.assertEqual(assets.bytes_inventory(current), before)
-        self.assertTrue(self.repository.has_assigned_version('map', first.asset_identity))
 
     def test_workspace_reconciles_new_current_and_exchange(self):
         name = 'new-map'
@@ -117,7 +77,6 @@ class WorkspaceLoadTests(assets.AssetCatalogTests):
         with patch.object(save, 'finalize_assigned_cloud_map', return_value=marker) as called:
             self.assertIs(owner.finalize_active_map(map_name=name, _save_operation_id='save:one'), marker)
         self.assertEqual(called.call_count, 1)
-        self.assertEqual(called.call_args.kwargs['context']['mapping_backend_kind'], 'slam_toolbox')
         self.assertEqual(called.call_args.kwargs['save_operation_id'], 'save:one')
         self.assertNotIn('expected_previous_identity', called.call_args.kwargs)
 

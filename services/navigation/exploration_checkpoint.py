@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from contracts.geometry import Pose
 from contracts.map_identity import AssetIdentityV2
@@ -25,12 +25,11 @@ class ExplorationCheckpoint(BaseModel):
     """保存经过停车确认的源进度和当时实际完成的地图资产身份。"""
 
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
-    schema_version: Literal[1, 2] = 2
+    schema_version: Literal[2] = 2
     checkpoint_id: str = Field(min_length=1, max_length=128)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     pipeline: Literal["slam_2d", "lio_3d"]
     request: ExploreAreaRequest
-    asset_manifest_sha256: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     asset_identity: Optional[AssetIdentityV2] = None
     mapping_checkpoint_id: Optional[str] = None
     geometry_progress_json: str = Field(min_length=1, max_length=2_097_152)
@@ -39,8 +38,8 @@ class ExplorationCheckpoint(BaseModel):
     @field_validator("schema_version", mode="before")
     @classmethod
     def _check_version(cls, value):
-        if type(value) is not int or value not in (1, 2):
-            raise ValueError("探索检查点版本必须为整数 1 或 2")
+        if type(value) is not int or value != 2:
+            raise ValueError("探索检查点版本必须为整数 2")
         return value
 
     @field_validator("mapping_checkpoint_id", mode="before")
@@ -52,33 +51,20 @@ class ExplorationCheckpoint(BaseModel):
             raise ValueError("建图检查点身份必须为非零的三十二位小写十六进制 ID")
         return value
 
-    @model_serializer(mode="wrap")
-    def _serialize_identity(self, handler):
-        document = handler(self)
-        if self.schema_version == 1:
-            document.pop("asset_identity", None)
-            document.pop("mapping_checkpoint_id", None)
-        else:
-            document.pop("asset_manifest_sha256", None)
-        return document
 
     @model_validator(mode="after")
     def _check_identity(self):
-        if self.schema_version == 1:
-            if self.asset_manifest_sha256 is None or self.asset_identity is not None or self.mapping_checkpoint_id is not None:
-                raise ValueError("旧探索检查点必须且只能绑定原始地图清单摘要")
-        elif self.asset_identity is None or self.mapping_checkpoint_id is None or self.asset_manifest_sha256 is not None:
-            raise ValueError("新版探索检查点必须绑定分配身份资产与建图检查点，不能混用清单摘要")
+        if self.asset_identity is None or self.mapping_checkpoint_id is None:
+            raise ValueError("探索检查点必须绑定分配身份资产与建图检查点")
         value = json.loads(self.geometry_progress_json)
         if not isinstance(value, dict) or type(value.get("schema_version")) is not int or value["schema_version"] not in (1, 2) or value.get("map_name") != self.request.map_name or value.get("request_id") != self.request.request_id:
             raise ValueError("探索进度与冻结请求的地图或原任务身份不一致")
-        if self.schema_version == 2:
-            for name in ("map_name", "map_frame_id", "origin_session_id"):
-                if not isinstance(value.get(name), str) or not value[name].strip():
-                    raise ValueError("新版探索进度缺少源地图、坐标系或会话身份")
-            for name in ("origin_session_generation", "origin_frame_generation"):
-                if type(value.get(name)) is not int or value[name] <= 0:
-                    raise ValueError("新版探索进度缺少有效源会话或坐标代次")
+        for name in ("map_name", "map_frame_id", "origin_session_id"):
+            if not isinstance(value.get(name), str) or not value[name].strip():
+                raise ValueError("新版探索进度缺少源地图、坐标系或会话身份")
+        for name in ("origin_session_generation", "origin_frame_generation"):
+            if type(value.get(name)) is not int or value[name] <= 0:
+                raise ValueError("新版探索进度缺少有效源会话或坐标代次")
         if self.request.resume_progress_json is not None or "motion_admission" in self.request.metadata:
             raise ValueError("持久探索请求不能携带旧运动准入或嵌套恢复载荷")
         if self.localization_seed is not None and self.localization_seed.frame_id != value.get("map_frame_id"):
@@ -105,17 +91,13 @@ class ExplorationCheckpointStore:
         envelope = json.loads(read_record_text(path))
         if not isinstance(envelope, dict) or not isinstance(envelope.get("payload"), str):
             raise ValueError("探索检查点封装无效")  # noqa: TRY004 -- 持久记录准入保持 ValueError 接口
-        legacy = set(envelope) == {"payload", "sha256"}
         current = (set(envelope) == {"schema_version", "payload"}
                    and type(envelope["schema_version"]) is int and envelope["schema_version"] == 2)
-        if not legacy and not current:
+        if not current:
             raise ValueError("探索检查点封装版本无效")
-        # 旧本地摘要仅作为输入兼容字段忽略；原生进度及地图资产绑定保持原样。
         document = json.loads(envelope["payload"])
         if not isinstance(document, dict):
             raise ValueError("探索检查点载荷必须是对象")
-        if "schema_version" not in document:
-            document["schema_version"] = 1
         return ExplorationCheckpoint.model_validate(document)
 
     def _validate_catalog_identity(self, value: ExplorationCheckpoint) -> None:
@@ -127,8 +109,6 @@ class ExplorationCheckpointStore:
 
     def validate_asset(self, value: ExplorationCheckpoint, *,
                        _previous: Optional[ValidatedMapAssetBundleSnapshot] = None) -> ValidatedMapAssetBundleSnapshot:
-        if value.schema_version != 2:
-            raise ValueError("旧探索检查点依赖已退役的摘要身份，仅支持读取，不能恢复或重新保存。")
         self._validate_catalog_identity(value)
         try:
             snapshot = self.assets.get_validated_map_asset_bundle_snapshot(value.request.map_name,
@@ -171,8 +151,6 @@ class ExplorationCheckpointStore:
             raise TypeError("探索检查点必须使用完整类型契约")
         value = ExplorationCheckpoint.model_validate({name: getattr(value, name)
             for name in ExplorationCheckpoint.model_fields})
-        if value.schema_version != 2:
-            raise ValueError("旧探索检查点依赖已退役的摘要身份，仅支持读取，不能恢复或重新保存。")
         payload = value.model_dump_json()
         value = ExplorationCheckpoint.model_validate_json(payload)
         snapshot = self.validate_asset(value)
@@ -224,9 +202,8 @@ class ExplorationCheckpointStore:
             except ValueError as error:
                 previous_snapshot = None
                 available, reason = False, str(error)
-            identity = ({"schema_version": 2, "asset_identity": value.asset_identity.model_dump(),
-                         "mapping_checkpoint_id": value.mapping_checkpoint_id} if value.schema_version == 2
-                        else {"asset_manifest_sha256": value.asset_manifest_sha256})
+            identity = {"schema_version": 2, "asset_identity": value.asset_identity.model_dump(),
+                         "mapping_checkpoint_id": value.mapping_checkpoint_id}
             records.append({"checkpoint_id": value.checkpoint_id, "request_id": value.request.request_id, "map_name": value.request.map_name,
                 "created_at": value.created_at.isoformat(), "pipeline": value.pipeline, "available": available, "unavailable_reason": reason,
                 **identity})

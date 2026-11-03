@@ -41,23 +41,7 @@ def decode_ground_binary(payload, decode_json, decode_samples):
     result = []
     for _ in range(size):
         anchor, tag = numbers("<HB")
-        if tag == 0:
-            members = numbers("<" + "H" * count(32))
-            origin, normal = numbers("<3d"), numbers("<3d")
-            encoded = samples()
-            decoded = decode_samples(encoded)
-            numeric, groups = [], []
-            for source in encoded["sources"]:
-                if source != {"kind": "legacy"}:
-                    groups.append(dict(source=source, sample_positions=[i for i, sample in enumerate(decoded)
-                                                                       if sample["source"] == source]))
-            for sample in decoded:
-                numeric.append({key: value for key, value in sample.items() if key != "source"})
-            data = dict(members=members, plane_origin=origin, normal=normal, samples=numeric)
-            if groups:
-                data["sample_sources"] = groups
-            representation = "legacy_plane"
-        elif tag == 1:
+        if tag == 1:
             data = dict(anchor=numbers("<3i"), height_m=numbers("<d")[0], occupied_bounds=numbers("<2d"))
             data["members"] = [[numbers("<H")[0], numbers("<8d")] for _ in range(count(32))]
             data["samples"] = samples()
@@ -97,7 +81,7 @@ def decode_ground_shared(payload, source_identity):
         return bytes(take(numbers("<I")[0])).decode("utf-8")
 
     mode, source_bytes, source_count = numbers("<BII")
-    if mode > 2 or source_bytes > 36 * 1024 * 1024 or source_count > 32768 * 32:
+    if mode != 2 or source_bytes > 36 * 1024 * 1024 or source_count > 32768 * 32:
         raise ValueError("精细地图BL6来源上界错误")
     # 先限制来源切片，再读每个字符串，不能越过来源区去引用后续数值载荷。
     remainder = view[offset + source_bytes:]
@@ -106,9 +90,7 @@ def decode_ground_shared(payload, source_identity):
     sources, identities = [], []
     for _ in range(source_count):
         tag = numbers("<B")[0]
-        if tag == 0:
-            source = dict(kind="legacy")
-        elif tag == 1:
+        if tag == 1:
             backend, runtime = numbers("<iq")
             source = dict(kind="lidar", backend=backend, runtime_generation=runtime, sensor_frame_id=text())
         elif tag == 2:
@@ -122,7 +104,7 @@ def decode_ground_shared(payload, source_identity):
             raise ValueError("精细地图BL6来源重复或无序")
         sources.append(source)
         identities.append(identity)
-    if offset != len(view) or (mode < 2 and (mode == 1) != any(s["kind"] != "legacy" for s in sources)):
+    if offset != len(view):
         raise ValueError("精细地图BL6来源长度或模式错误")
     view, offset = remainder, 0
     record_count = numbers("<I")[0]
@@ -144,22 +126,15 @@ def decode_ground_shared(payload, source_identity):
 
     for _ in range(record_count):
         anchor, tag = numbers("<HB")
-        if tag == 0:
-            data = dict(members=numbers("<" + "H" * count(32)),
-                        plane_origin=numbers("<3d"), normal=numbers("<3d"))
-            values, indexes = samples()
-            data["samples"] = values
-            groups = [dict(source=sources[index], sample_positions=[i for i, value in enumerate(indexes) if value == index])
-                      for index in sorted(set(indexes)) if sources[index]["kind"] != "legacy"]
-            if groups:
-                data["sample_sources"] = groups
-            representation = "legacy_plane"
-        elif tag == 1 and mode == 2:
+        if tag == 1 and mode == 2:
             data = dict(anchor=numbers("<3i"), height_m=numbers("<d")[0], occupied_bounds=numbers("<2d"))
             data["members"] = [[numbers("<H")[0], numbers("<8d")] for _ in range(count(32))]
             values, indexes = samples()
-            data["samples"] = [dict(source=sources[index], **sample) for index, sample in zip(indexes, values)]
-            representation = "heightfield_v1"
+            selected = sorted(set(indexes))
+            data["samples"] = dict(sources=[sources[index] for index in selected], values=[
+                [selected.index(index), sample["point"], sample["source_sequence"], sample["source_timestamp_ns"], sample["point_index"]]
+                for index, sample in zip(indexes, values)])
+            representation = "heightfield_v1_compact"
         elif tag == 2 and mode == 2:
             data, representation = {}, "classified_empty_column"
         else:

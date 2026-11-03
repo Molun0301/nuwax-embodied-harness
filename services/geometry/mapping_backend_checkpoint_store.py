@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from services.geometry.checkpoint_payload import FrozenPayload, payload_chunks, MAX_PLANAR_ARCHIVE_BYTES
-from services.geometry.planar_archive import read_planar_structure, assign_legacy_planar_archive, MAX_GRID
+from services.geometry.planar_archive import read_planar_structure, MAX_GRID
 from services.geometry.fine_map_archive import MAX_FINE_ARCHIVE_BYTES, read_fine_archive_root, validate_fine_archive
 from services.geometry.dense_cloud import MAX_DENSE_ARCHIVE_BYTES, validate_dense_archive, read_dense_metadata
 
@@ -35,13 +35,12 @@ from typing import (
 )
 
 
-MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION = 1
+MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION = 2
 ASSIGNED_CHECKPOINT_SCHEMA_VERSION = 2
 MAX_MAPPING_BACKEND_CHECKPOINT_BYTES = 64 * 1024 * 1024
 DEFAULT_ORPHAN_GRACE_SECONDS = 24 * 60 * 60
 DEFAULT_STORE_LOCK_TIMEOUT_SECONDS = 30.0
 SUPPORTED_MAPPING_BACKEND_KINDS = frozenset({"raytracing", "voxel", "slam_toolbox"})
-CLOUD_MAP_PAYLOAD_SCHEMA_VERSION = 1
 MAX_CLOUD_MAP_VOXEL_SIZE = 1_048_576.0
 
 PUBLISH_FAULT_PHASES = (
@@ -59,14 +58,13 @@ PUBLISH_FAULT_PHASES = (
     "backend_directory_fsynced",
 )
 
-_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _TEMP_PATTERNS = (
     re.compile(r"\.tmp-checkpoint-[0-9a-f]{32}\.bin\Z"),
     re.compile(r"\.tmp-manifest-[0-9a-f]{32}\.json\Z"),
-    re.compile(r"\.tmp-checkpoint-v[12]-[0-9a-f]{32}\.json\Z"),
+    re.compile(r"\.tmp-checkpoint-v2-[0-9a-f]{32}\.json\Z"),
 )
-_OBJECT_NAME_RE = re.compile(r"(?:sha256-[0-9a-f]{64}|id-[0-9a-f]{32}(?:-(?:backend|occupancy|cloud))?)\.bin\Z")
-_MANIFEST_NAME_RE = re.compile(r"(?:sha256-[0-9a-f]{64}|id-[0-9a-f]{32})\.json\Z")
+_OBJECT_NAME_RE = re.compile(r"id-[0-9a-f]{32}(?:-(?:backend|occupancy|cloud))?\.bin\Z")
+_MANIFEST_NAME_RE = re.compile(r"id-[0-9a-f]{32}\.json\Z")
 _MAX_JSON_BYTES = 1024 * 1024
 _U32_MAX = (1 << 32) - 1
 _U64_MAX = (1 << 64) - 1
@@ -117,7 +115,6 @@ class CheckpointArtifactReference:
     size: int
     identity_schema_version: int
     member_identity: Optional[CheckpointMemberIdentity] = None
-    legacy_alias: bytes = b""
 
 
 @dataclass(frozen=True)
@@ -164,11 +161,9 @@ class StoredMappingBackendCheckpoint:
     occupancy_asset: Mapping[str, object]
     cloud_asset: Optional[Mapping[str, object]]
     selector_path: Path
-    manifest_sha256: str
     manifest_path: Path
     object_path: Path
     identity: Optional[Tuple[str, str]] = None
-    legacy_alias: Optional[str] = None
     member_paths: Mapping[str, Path] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -258,9 +253,8 @@ class MappingBackendCheckpointStore:
         validated_checkpoint = validator._validate_checkpoint(checkpoint)
         validated_occupancy_asset = _validate_occupancy_asset(
             occupancy_asset,
-            sha256_encoding="none" if checkpoint.schema_version == 2 else "bytes",
         )
-        validated_cloud_asset = _validate_optional_cloud(cloud_asset, validated_checkpoint.backend_kind, sha256_encoding="none" if checkpoint.schema_version == 2 else "bytes")
+        validated_cloud_asset = _validate_optional_cloud(cloud_asset, validated_checkpoint.backend_kind)
         _validate_asset_bindings(
             validated_checkpoint,
             validated_occupancy_asset,
@@ -280,9 +274,9 @@ class MappingBackendCheckpointStore:
         self, checkpoint: MappingBackendCheckpoint, *, occupancy_asset: Mapping[str, object],
         cloud_asset: Optional[Mapping[str, object]], fault_injector: Optional[FaultInjector] = None,
     ) -> StoredMappingBackendCheckpoint:
-        """发布当前分配式检查点；历史数据先从读取边界向前转换。"""
+        """发布当前分配式检查点。"""
         if checkpoint.schema_version != 2:
-            raise MappingBackendCheckpointValidationError("只允许发布schema 2检查点；历史检查点须先导入")
+            raise MappingBackendCheckpointValidationError("只允许发布schema 2检查点")
         return self._publish_v2(checkpoint, occupancy_asset, cloud_asset, fault_injector)
 
     def load(
@@ -383,20 +377,15 @@ class MappingBackendCheckpointStore:
             raise MappingBackendCheckpointValidationError(
                 f"payload_size mismatch: declared={payload_size} actual={len(payload)}"
             )
-        if schema_version == 2:
-            _validate_assigned_id(checkpoint.checkpoint_id, "checkpoint_id")
-            planar = backend_kind == "slam_toolbox"
-            if checkpoint.target_kind != ("planar_graph" if planar else ""):
-                raise MappingBackendCheckpointValidationError("checkpoint target kind is invalid")
-            if checkpoint.content_sha256 != b"" or type(checkpoint.backend_payload_schema_version) is not int or checkpoint.backend_payload_schema_version != (2 if planar else 1):
-                raise MappingBackendCheckpointValidationError("v2 cannot carry a legacy digest or unsupported backend payload version")
-            content_sha256 = b""
-            if not planar:
-                _validate_backend_payload_header(payload, backend_kind)
-        else:
-            if checkpoint.graph_reference is not None or checkpoint.checkpoint_id or checkpoint.cloud_identity is not None or checkpoint.backend_identity is not None or checkpoint.occupancy_identity is not None:
-                raise MappingBackendCheckpointValidationError("legacy checkpoint cannot carry assigned identity")
-            content_sha256 = _require_sha256_bytes(checkpoint.content_sha256)
+        _validate_assigned_id(checkpoint.checkpoint_id, "checkpoint_id")
+        planar = backend_kind == "slam_toolbox"
+        if checkpoint.target_kind != ("planar_graph" if planar else ""):
+            raise MappingBackendCheckpointValidationError("checkpoint target kind is invalid")
+        if checkpoint.content_sha256 != b"" or type(checkpoint.backend_payload_schema_version) is not int or checkpoint.backend_payload_schema_version != (2 if planar else 1):
+            raise MappingBackendCheckpointValidationError("v2 cannot carry a legacy digest or unsupported backend payload version")
+        content_sha256 = b""
+        if not planar:
+            _validate_backend_payload_header(payload, backend_kind)
         occupancy_receipt = _validate_occupancy_receipt(
             checkpoint.occupancy_receipt,
             source_session_id=source_session_id,
@@ -412,24 +401,6 @@ class MappingBackendCheckpointStore:
             cloud_receipt = _validate_cloud_receipt(checkpoint.cloud_receipt,
                 source_session_generation=source_session_generation, boot_nonce_encoding="bytes")
             _validate_receipt_order(occupancy_receipt, cloud_receipt)
-        if checkpoint.fine_archive is not None and schema_version == 1:
-            if backend_kind == "slam_toolbox":
-                raise MappingBackendCheckpointValidationError("二维检查点不能携带三维精细资产")
-            try:
-                validate_fine_archive(checkpoint.fine_archive, session=source_session_id,
-                    generation=source_session_generation, cloud_revision=cloud_receipt["cloud_revision"],
-                    source_timestamp_ns=cloud_receipt["source_timestamp_ns"])
-            except (ValueError, TypeError) as error:
-                raise MappingBackendCheckpointValidationError(str(error)) from error
-        if checkpoint.dense_archive is not None and schema_version == 1:
-            if backend_kind == "slam_toolbox":
-                raise MappingBackendCheckpointValidationError("二维检查点不能携带完整三维点云")
-            try:
-                validate_dense_archive(checkpoint.dense_archive, session=source_session_id,
-                    generation=source_session_generation, cloud_revision=cloud_receipt["cloud_revision"],
-                    source_timestamp_ns=cloud_receipt["source_timestamp_ns"])
-            except (ValueError, TypeError) as error:
-                raise MappingBackendCheckpointValidationError(str(error)) from error
         validated = replace(checkpoint, schema_version=schema_version, backend_kind=backend_kind,
             source_session_id=source_session_id, source_session_generation=source_session_generation,
             content_sha256=content_sha256, payload_size=payload_size, created_at_ns=created_at_ns,
@@ -448,196 +419,10 @@ class MappingBackendCheckpointStore:
         *,
         access: "_StoreAccess",
     ) -> Optional[StoredMappingBackendCheckpoint]:
-        if schema_version == 2:
-            return self._load_v2_optional(access)
-        paths = access.paths
-        try:
-            os.stat(
-                paths.selector.name,
-                dir_fd=access.backend_fd,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            return None
-        selector_bytes = _read_regular_file_at(
-            access.backend_fd,
-            paths.selector.name,
-            paths.selector,
-            maximum_bytes=_MAX_JSON_BYTES,
-            description="checkpoint selector",
-        )
-        selector = _parse_canonical_json(selector_bytes, "checkpoint selector")
-        _require_exact_fields(
-            selector,
-            ("schema_version", "backend_kind", "manifest"),
-            "checkpoint selector",
-        )
-        if _validate_schema_version(selector["schema_version"]) != schema_version:
-            raise MappingBackendCheckpointValidationError(
-                "checkpoint selector schema_version does not match its filename"
-            )
-        if _validate_backend_kind(selector["backend_kind"]) != backend_kind:
-            raise MappingBackendCheckpointValidationError(
-                "checkpoint selector backend_kind does not match its directory"
-            )
-        manifest_sha256, manifest_relative = _validate_manifest_reference(
-            selector["manifest"], "checkpoint selector manifest"
-        )
-        return self._load_referenced_checkpoint(
-            access,
-            manifest_sha256=manifest_sha256,
-            manifest_relative=manifest_relative,
-        )
+        return self._load_v2_optional(access)
 
-    def _load_referenced_checkpoint(self, access: "_StoreAccess", *, manifest_sha256: str, manifest_relative: str):
-        def read_member(relative, *, maximum_bytes, description):
-            path = self._version_dir / relative
-            descriptor = access.manifests_fd if path.parent == access.paths.manifests else access.objects_fd
-            return _read_regular_file_at(descriptor, path.name, path,
-                maximum_bytes=maximum_bytes, description=description)
-        return self._decode_legacy_checkpoint(access.paths, manifest_sha256=manifest_sha256,
-            manifest_relative=manifest_relative, read_member=read_member)
 
-    def load_legacy_import(self, backend_kind: str, *, read_member) -> StoredMappingBackendCheckpoint:
-        """读取已由历史资产拥有方固定的文件，不要求旧目录满足新发布目录权限。"""
-        kind = _validate_backend_kind(backend_kind)
-        backend = self._version_dir / "mapping_backend" / kind
-        paths = _StorePaths(kind, 1, backend, backend / "objects", backend / "manifests", backend / "checkpoint-v1.json")
-        selector = _parse_canonical_json(read_member(paths.selector.relative_to(self._version_dir).as_posix(),
-            maximum_bytes=_MAX_JSON_BYTES, description="checkpoint selector"), "checkpoint selector")
-        _require_exact_fields(selector, ("schema_version", "backend_kind", "manifest"), "checkpoint selector")
-        if _validate_schema_version(selector["schema_version"]) != 1 or _validate_backend_kind(selector["backend_kind"]) != kind:
-            raise MappingBackendCheckpointValidationError("历史检查点选择器与目录身份不一致")
-        alias, relative = _validate_manifest_reference(selector["manifest"], "checkpoint selector manifest")
-        return self._decode_legacy_checkpoint(paths, manifest_sha256=alias,
-            manifest_relative=relative, read_member=read_member)
 
-    def _decode_legacy_checkpoint(self, paths, *, manifest_sha256, manifest_relative, read_member):
-        expected_manifest_relative = _manifest_relative_path(manifest_sha256)
-        if manifest_relative != expected_manifest_relative:
-            raise MappingBackendCheckpointValidationError(
-                "checkpoint manifest path is not canonical for its SHA-256"
-            )
-        manifest_path = paths.backend / expected_manifest_relative
-        manifest_bytes = read_member(manifest_path.relative_to(self._version_dir).as_posix(),
-            maximum_bytes=_MAX_JSON_BYTES,
-            description="checkpoint manifest",
-        )
-        manifest = _parse_canonical_json(manifest_bytes, "checkpoint manifest")
-        _require_exact_fields(
-            manifest,
-            (
-                "schema_version",
-                "backend_kind",
-                "source_session_id",
-                "source_session_generation",
-                "created_at_ns",
-                "payload",
-                "canonical_receipts",
-                "canonical_assets",
-            ) + tuple(key for key in ("fine_archive", "dense_archive") if key in manifest),
-            "checkpoint manifest",
-        )
-        schema_version = _validate_schema_version(manifest["schema_version"])
-        backend_kind = _validate_backend_kind(manifest["backend_kind"])
-        if schema_version != paths.schema_version or backend_kind != paths.backend_kind:
-            raise MappingBackendCheckpointValidationError(
-                "checkpoint manifest identity does not match selector location"
-            )
-        payload_sha256, payload_relative, payload_size = _validate_payload_reference(
-            manifest["payload"]
-        )
-        object_path = paths.backend / payload_relative
-        payload = read_member(object_path.relative_to(self._version_dir).as_posix(),
-            maximum_bytes=self._payload_limit(backend_kind),
-            description="checkpoint object",
-        )
-        if len(payload) != payload_size:
-            raise MappingBackendCheckpointValidationError(
-                "checkpoint object size does not match manifest"
-            )
-        # Historical names are opaque aliases, never recomputed on read.
-        content_sha256 = bytes.fromhex(payload_sha256)
-        receipts = _require_mapping(
-            manifest["canonical_receipts"], "canonical_receipts"
-        )
-        _require_exact_fields(
-            receipts, ("occupancy", "cloud"), "canonical_receipts"
-        )
-        source_session_id = _validate_session_id(manifest["source_session_id"])
-        source_session_generation = _require_integer(
-            manifest["source_session_generation"],
-            "source_session_generation",
-            minimum=1,
-            maximum=_U64_MAX,
-        )
-        occupancy_receipt = _validate_occupancy_receipt(
-            receipts["occupancy"],
-            source_session_id=source_session_id,
-            source_session_generation=source_session_generation,
-            backend_kind=backend_kind,
-            boot_nonce_encoding="hex",
-        )
-        cloud_receipt = None
-        if backend_kind == "slam_toolbox":
-            if receipts["cloud"] is not None:
-                raise MappingBackendCheckpointValidationError("二维图清单不能携带三维收据")
-        else:
-            cloud_receipt = _validate_cloud_receipt(receipts["cloud"],
-                source_session_generation=source_session_generation, boot_nonce_encoding="hex")
-            _validate_receipt_order(occupancy_receipt, cloud_receipt)
-        assets = _require_mapping(manifest["canonical_assets"], "canonical_assets")
-        _require_exact_fields(assets, ("occupancy", "cloud"), "canonical_assets")
-        occupancy_asset = _validate_occupancy_asset(
-            assets["occupancy"], sha256_encoding="hex"
-        )
-        cloud_asset = _validate_optional_cloud(assets["cloud"], backend_kind, sha256_encoding="hex")
-        fine_archive = None
-        if "fine_archive" in manifest:
-            fine_sha, fine_relative, fine_size = _validate_payload_reference(manifest["fine_archive"])
-            fine_path = paths.backend / fine_relative
-            fine_archive = read_member(fine_path.relative_to(self._version_dir).as_posix(),
-                maximum_bytes=MAX_FINE_ARCHIVE_BYTES, description="精细地图资产")
-            if len(fine_archive) != fine_size:
-                raise MappingBackendCheckpointValidationError("精细地图资产长度或摘要与清单不符")
-        dense_archive = None
-        if "dense_archive" in manifest:
-            dense_sha, dense_relative, dense_size = _validate_payload_reference(manifest["dense_archive"])
-            dense_path = paths.backend / dense_relative
-            dense_archive = read_member(dense_path.relative_to(self._version_dir).as_posix(),
-                maximum_bytes=MAX_DENSE_ARCHIVE_BYTES, description="完整点云资产")
-            if len(dense_archive) != dense_size:
-                raise MappingBackendCheckpointValidationError("完整点云资产长度或摘要与清单不符")
-        checkpoint = self._validate_checkpoint(
-            MappingBackendCheckpoint(
-                schema_version=schema_version,
-                backend_kind=backend_kind,
-                source_session_id=source_session_id,
-                source_session_generation=source_session_generation,
-                content_sha256=content_sha256,
-                payload_size=payload_size,
-                created_at_ns=manifest["created_at_ns"],
-                payload=payload,
-                occupancy_receipt=occupancy_receipt,
-                cloud_receipt=cloud_receipt,
-                fine_archive=fine_archive,
-                dense_archive=dense_archive,
-            )
-        )
-        _validate_asset_bindings(checkpoint, occupancy_asset, cloud_asset)
-        return StoredMappingBackendCheckpoint(
-            checkpoint=checkpoint,
-            occupancy_asset=occupancy_asset,
-            cloud_asset=cloud_asset,
-            selector_path=paths.selector,
-            manifest_sha256=manifest_sha256,
-            manifest_path=manifest_path,
-            object_path=object_path,
-            legacy_alias=manifest_sha256,
-            member_paths={"backend_state": object_path,
-                **({"fine_map": fine_path} if fine_archive is not None else {}),
-                **({"dense_cloud": dense_path} if dense_archive is not None else {})},
-        )
 
 
 
@@ -841,7 +626,7 @@ class MappingBackendCheckpointStore:
                 if temp is not None and identity is not None:
                     _unlink_at_if_same(access.backend_fd, temp, identity)
             return StoredMappingBackendCheckpoint(checkpoint, occupancy_asset, cloud_asset,
-                access.paths.selector, "", manifest_path, access.paths.objects / members["planar_graph" if checkpoint.backend_kind == "slam_toolbox" else "backend_state"][0],
+                access.paths.selector, manifest_path, access.paths.objects / members["planar_graph" if checkpoint.backend_kind == "slam_toolbox" else "backend_state"][0],
                 identity=(checkpoint.checkpoint_id, "manifest"),
                 member_paths={role: access.paths.objects / data[0] for role, data in members.items()})
         finally:
@@ -916,11 +701,11 @@ class MappingBackendCheckpointStore:
         checkpoint, occupancy, cloud = self.validate_checkpoint_bundle(checkpoint,
             occupancy_asset=occupancy, cloud_asset=cloud, max_payload_bytes=self._max_payload_bytes)
         return StoredMappingBackendCheckpoint(checkpoint, occupancy, cloud, access.paths.selector,
-            "", path, member_paths[primary], identity=(checkpoint_id, "manifest"), member_paths=member_paths)
+            path, member_paths[primary], identity=(checkpoint_id, "manifest"), member_paths=member_paths)
 
     def _live_references(self, access):
         manifests, objects, issues = set(), set(), []
-        for schema in (1, 2):
+        for schema in (2,):
             name = f"checkpoint-v{schema}.json"
             if not _file_exists_at(access.backend_fd, name):
                 continue
@@ -928,28 +713,13 @@ class MappingBackendCheckpointStore:
                 selector = _parse_canonical_json(_read_regular_file_at(access.backend_fd, name,
                     access.paths.backend / name, maximum_bytes=_MAX_JSON_BYTES,
                     description="live checkpoint selector"), "live checkpoint selector")
-                if schema == 2:
-                    checkpoint_id, manifest_name = _v2_selector(selector, access.paths.backend_kind)
-                else:
-                    _require_exact_fields(selector, ("schema_version", "backend_kind", "manifest"), "legacy selector")
-                    if selector["schema_version"] != 1 or selector["backend_kind"] != access.paths.backend_kind:
-                        raise MappingBackendCheckpointValidationError("legacy live selector identity mismatch")
-                    _, relative = _validate_manifest_reference(selector["manifest"], "legacy manifest reference")
-                    manifest_name = Path(relative).name
+                checkpoint_id, manifest_name = _v2_selector(selector, access.paths.backend_kind)
                 document = _parse_canonical_json(_read_regular_file_at(access.manifests_fd, manifest_name,
                     access.paths.manifests / manifest_name, maximum_bytes=_MAX_JSON_BYTES,
                     description="live checkpoint manifest"), "live checkpoint manifest")
-                if schema == 2:
-                    _, _, _, references = _v2_manifest_metadata(document, checkpoint_id, access.paths.backend_kind)
-                    names = {Path(item["path"]).name for item in references.values()}
-                    names.update(f"id-{item['artifact']['id']}.json" for item in references.values() if "artifact" in item)
-                else:
-                    if document.get("schema_version") != 1 or document.get("backend_kind") != access.paths.backend_kind:
-                        raise MappingBackendCheckpointValidationError("legacy live manifest identity mismatch")
-                    names = {Path(_validate_payload_reference(document["payload"])[1]).name}
-                    for field_name in ("fine_archive", "dense_archive"):
-                        if field_name in document:
-                            names.add(Path(_validate_payload_reference(document[field_name])[1]).name)
+                _, _, _, references = _v2_manifest_metadata(document, checkpoint_id, access.paths.backend_kind)
+                names = {Path(item["path"]).name for item in references.values()}
+                names.update(f"id-{item['artifact']['id']}.json" for item in references.values() if "artifact" in item)
                 manifests.add(manifest_name)
                 objects.update(names)
             except (MappingBackendCheckpointStoreError, KeyError, TypeError, ValueError, OSError) as error:
@@ -1390,8 +1160,6 @@ def validate_artifact_reference(reference, *, checkpoint=None, role=None, frame=
         raise MappingBackendCheckpointValidationError("artifact identity schema must be an integer")
     if reference.identity_schema_version == 2:
         _validate_assigned_id(reference.id, "artifact id")
-        if reference.legacy_alias != b"":
-            raise MappingBackendCheckpointValidationError("assigned artifact cannot carry an active legacy digest")
         _validate_member_identity(reference.member_identity, checkpoint=checkpoint, role=role, frame=frame)
         if reference.member_identity.role not in ("fine_map", "dense_cloud", "planar_graph"):
             raise MappingBackendCheckpointValidationError("member role is not transferable")
@@ -1399,13 +1167,6 @@ def validate_artifact_reference(reference, *, checkpoint=None, role=None, frame=
             "planar_graph": MAX_PLANAR_ARCHIVE_BYTES}[reference.member_identity.role]
         if reference.size > role_maximum:
             raise MappingBackendCheckpointValidationError("artifact size exceeds its member role budget")
-    elif reference.identity_schema_version in (0, 1):
-        if not isinstance(reference.id, str) or not reference.id or len(reference.id.encode("utf-8")) > 128:
-            raise MappingBackendCheckpointValidationError("legacy artifact ID must be nonempty and at most 128 bytes")
-        if reference.member_identity is not None or not isinstance(reference.legacy_alias, bytes) or len(reference.legacy_alias) != 32 or not any(reference.legacy_alias):
-            raise MappingBackendCheckpointValidationError("legacy artifact reference is ambiguous or incomplete")
-        if checkpoint is not None and checkpoint.schema_version == 2:
-            raise MappingBackendCheckpointValidationError("v2 checkpoint requires assigned artifact references")
     else:
         raise MappingBackendCheckpointValidationError("unsupported artifact identity schema")
     return reference
@@ -1440,7 +1201,7 @@ def _validate_checkpoint_artifacts(checkpoint):
             cloud_revision=checkpoint.cloud_receipt["cloud_revision"],
             source_timestamp_ns=checkpoint.cloud_receipt["source_timestamp_ns"])
         if role == "fine_map":
-            if payload[:8] not in (b"NUWAXAR1", b"NUWAXAR2", b"NUWAXAR3", b"NUWAXAR4", b"NUWAXAR5"):
+            if payload[:8] not in (b"NUWAXAR4", b"NUWAXAR5"):
                 raise MappingBackendCheckpointValidationError("assigned fine member requires a supported archive")
             validate_fine_archive(payload, **keywords,
                 frame_generation=reference.member_identity.frame_generation,
@@ -1489,96 +1250,8 @@ def _validate_canonical_members(checkpoint, occupancy, cloud):
             _validate_member_identity(reference.member_identity, checkpoint=checkpoint, role=role, frame=cloud["frame_id"])
 
 
-def assign_legacy_cloud_checkpoint(stored_checkpoint, *, canonical_occupancy_data,
-                                   canonical_cloud_xyz, checkpoint_id, fine_artifact_id=None,
-                                   dense_artifact_id=None):
-    """Convert an actual legacy cloud owner; allocation/publication belong to importer."""
-    if not isinstance(stored_checkpoint, StoredMappingBackendCheckpoint):
-        raise TypeError("cloud import requires a stored checkpoint owner")
-    previous = stored_checkpoint.checkpoint
-    if (previous.schema_version != 1 or previous.backend_kind not in {"voxel", "raytracing"}
-            or previous.cloud_receipt is None or stored_checkpoint.cloud_asset is None):
-        raise ValueError("cloud import requires original receipts")
-    _validate_assigned_id(checkpoint_id, "checkpoint_id")
-    if (previous.fine_archive is None) != (fine_artifact_id is None):
-        raise ValueError("fine import bytes and owned artifact ID must both be present")
-    if (previous.dense_archive is None) != (dense_artifact_id is None):
-        raise ValueError("dense import bytes and owned artifact ID must both be present")
-    occupancy = {key: value for key, value in stored_checkpoint.occupancy_asset.items()
-                 if key != "raw_data_sha256"}
-    cloud = {key: value for key, value in stored_checkpoint.cloud_asset.items() if key != "xyz_sha256"}
-    cloud["payload_schema_version"] = 2
-    def member(role, frame):
-        return CheckpointMemberIdentity(checkpoint_id, role, previous.occupancy_receipt,
-            previous.cloud_receipt, frame)
-    fine_reference = None
-    if previous.fine_archive is not None:
-        if previous.fine_archive[:8] not in (b"NUWAXAR1", b"NUWAXAR2", b"NUWAXAR3", b"NUWAXAR4", b"NUWAXAR5"):
-            raise ValueError("assigned fine import requires a supported archive")
-        # Only read the bounded root here; final bundle admission validates all
-        # blocks and binds these source generations to the original receipts.
-        _, root, _ = read_fine_archive_root(previous.fine_archive)
-        try:
-            fine_member = CheckpointMemberIdentity(checkpoint_id, "fine_map", previous.occupancy_receipt,
-                previous.cloud_receipt, cloud["frame_id"], root["domain"]["frame_generation"],
-                root["domain"]["producer_generation"])
-        except (KeyError, TypeError) as error:
-            raise ValueError("fine import root domain is incomplete") from error
-        fine_reference = CheckpointArtifactReference(fine_artifact_id, len(previous.fine_archive), 2, fine_member)
-    dense_reference = None
-    if previous.dense_archive is not None:
-        _validate_assigned_id(dense_artifact_id, "dense artifact id")
-        dense_reference = CheckpointArtifactReference(dense_artifact_id, len(previous.dense_archive),
-            2, member("dense_cloud", cloud["frame_id"]))
-    checkpoint = MappingBackendCheckpoint(schema_version=2, backend_kind=previous.backend_kind,
-        source_session_id=previous.source_session_id, source_session_generation=previous.source_session_generation,
-        content_sha256=b"", payload_size=previous.payload_size, created_at_ns=previous.created_at_ns,
-        payload=previous.payload, occupancy_receipt=previous.occupancy_receipt, cloud_receipt=previous.cloud_receipt,
-        checkpoint_id=checkpoint_id, backend_payload_schema_version=1,
-        canonical_occupancy_data=canonical_occupancy_data, canonical_cloud_xyz=canonical_cloud_xyz,
-        backend_identity=member("backend_state", occupancy["frame_id"]),
-        occupancy_identity=member("canonical_occupancy", occupancy["frame_id"]),
-        cloud_identity=member("canonical_cloud", cloud["frame_id"]),
-        fine_archive=previous.fine_archive, fine_reference=fine_reference,
-        dense_archive=previous.dense_archive, dense_reference=dense_reference)
-    return MappingBackendCheckpointStore.validate_checkpoint_bundle(checkpoint,
-        occupancy_asset=occupancy, cloud_asset=cloud)
 
 
-def assign_legacy_planar_checkpoint(stored_checkpoint, *, checkpoint_id, artifact_id):
-    """Build an assigned candidate from a read-only legacy checkpoint owner.
-
-    IDs belong to the outer save/import candidate. This never publishes, changes
-    the old asset, or invents a canonical commit receipt.
-    """
-    if not isinstance(stored_checkpoint, StoredMappingBackendCheckpoint):
-        raise TypeError("planar import requires a stored checkpoint owner")
-    previous = stored_checkpoint.checkpoint
-    if (previous.schema_version != 1 or previous.backend_kind != "slam_toolbox"
-            or previous.cloud_receipt is not None or stored_checkpoint.cloud_asset is not None
-            or previous.fine_archive is not None or previous.dense_archive is not None):
-        raise ValueError("planar import requires a legacy planar checkpoint")
-    _validate_assigned_id(checkpoint_id, "checkpoint_id")
-    _validate_assigned_id(artifact_id, "artifact_id")
-    occupancy = {key: value for key, value in stored_checkpoint.occupancy_asset.items() if key != "raw_data_sha256"}
-    grid_size = occupancy["raw_data_size"]
-    if type(grid_size) is not int or not 1 <= grid_size <= MAX_GRID or grid_size > len(previous.payload):
-        raise ValueError("legacy planar canonical grid size exceeds budget")
-    payload = assign_legacy_planar_archive(previous.payload, checkpoint_id)
-    graph_identity = CheckpointMemberIdentity(checkpoint_id, "planar_graph", previous.occupancy_receipt,
-        None, occupancy["frame_id"])
-    checkpoint = MappingBackendCheckpoint(schema_version=2, backend_kind="slam_toolbox",
-        source_session_id=previous.source_session_id, source_session_generation=previous.source_session_generation,
-        content_sha256=b"", payload_size=len(payload), created_at_ns=previous.created_at_ns,
-        payload=payload, occupancy_receipt=previous.occupancy_receipt, cloud_receipt=None,
-        checkpoint_id=checkpoint_id, target_kind="planar_graph", backend_payload_schema_version=2,
-        canonical_occupancy_data=payload[len(payload) - grid_size:],
-        graph_reference=CheckpointArtifactReference(artifact_id, len(payload), 2, graph_identity),
-        occupancy_identity=CheckpointMemberIdentity(checkpoint_id, "canonical_occupancy", previous.occupancy_receipt,
-            None, occupancy["frame_id"]))
-    checkpoint, occupancy, cloud = MappingBackendCheckpointStore.validate_checkpoint_bundle(checkpoint,
-        occupancy_asset=occupancy, cloud_asset=None)
-    return checkpoint, occupancy, cloud
 
 
 def _validate_backend_payload_header(payload, kind):
@@ -1704,8 +1377,8 @@ def _v2_manifest_metadata(document, checkpoint_id, backend_kind):
         _validate_receipt_order(occupancy_receipt, cloud_receipt)
     assets = _require_mapping(document["canonical_assets"], "canonical assets")
     _require_exact_fields(assets, ("occupancy", "cloud"), "canonical assets")
-    occupancy = _validate_occupancy_asset(assets["occupancy"], sha256_encoding="none")
-    cloud = _validate_optional_cloud(assets["cloud"], backend_kind, sha256_encoding="none")
+    occupancy = _validate_occupancy_asset(assets["occupancy"])
+    cloud = _validate_optional_cloud(assets["cloud"], backend_kind)
     members = _require_mapping(document["members"], "checkpoint members")
     required = {"planar_graph", "canonical_occupancy"} if planar else {"backend_state", "canonical_occupancy", "canonical_cloud"}
     optional = set() if planar else {"fine_map", "dense_cloud"}
@@ -1803,7 +1476,7 @@ def _validate_schema_version(value: object) -> int:
         minimum=1,
         maximum=_U32_MAX,
     )
-    if schema_version not in (1, 2):
+    if schema_version != 2:
         raise MappingBackendCheckpointValidationError(
             f"unsupported mapping backend checkpoint schema_version: {schema_version}"
         )
@@ -2036,11 +1709,10 @@ def _validate_receipt_order(
 
 
 def _validate_occupancy_asset(
-    value: object, *, sha256_encoding: str
+    value: object
 ) -> Dict[str, object]:
     asset = _require_mapping(value, "occupancy_asset")
     fields = (
-        "raw_data_sha256",
         "raw_data_size",
         "width",
         "height",
@@ -2051,8 +1723,6 @@ def _validate_occupancy_asset(
         "source_occupancy_revision",
         "timestamp_ns",
     )
-    if sha256_encoding == "none":
-        fields = tuple(key for key in fields if key != "raw_data_sha256")
     _require_exact_fields(asset, fields, "occupancy_asset")
     width = _require_integer(
         asset["width"], "occupancy_asset.width", minimum=1, maximum=_U32_MAX
@@ -2072,8 +1742,6 @@ def _validate_occupancy_asset(
             "occupancy_asset.raw_data_size must equal width * height"
         )
     return {
-        **({"raw_data_sha256": _validate_asset_sha256(asset["raw_data_sha256"],
-            "occupancy_asset.raw_data_sha256", encoding=sha256_encoding)} if sha256_encoding != "none" else {}),
         "raw_data_size": raw_data_size,
         "width": width,
         "height": height,
@@ -2103,11 +1771,10 @@ def _validate_occupancy_asset(
 
 
 def _validate_cloud_asset(
-    value: object, *, sha256_encoding: str
+    value: object
 ) -> Dict[str, object]:
     asset = _require_mapping(value, "cloud_asset")
     fields = (
-        "xyz_sha256",
         "xyz_size",
         "frame_id",
         "source_cloud_revision",
@@ -2115,8 +1782,6 @@ def _validate_cloud_asset(
         "voxel_size",
         "payload_schema_version",
     )
-    if sha256_encoding == "none":
-        fields = tuple(key for key in fields if key != "xyz_sha256")
     _require_exact_fields(asset, fields, "cloud_asset")
     point_count = _require_integer(
         asset["point_count"],
@@ -2135,8 +1800,6 @@ def _validate_cloud_asset(
             "cloud_asset.xyz_size must equal point_count * 12"
         )
     return {
-        **({"xyz_sha256": _validate_asset_sha256(asset["xyz_sha256"],
-            "cloud_asset.xyz_sha256", encoding=sha256_encoding)} if sha256_encoding != "none" else {}),
         "xyz_size": xyz_size,
         "frame_id": _validate_frame_id(asset["frame_id"], "cloud_asset.frame_id"),
         "source_cloud_revision": _require_integer(
@@ -2155,17 +1818,17 @@ def _validate_cloud_asset(
         "payload_schema_version": _require_exact_integer(
             asset["payload_schema_version"],
             "cloud_asset.payload_schema_version",
-            expected=2 if sha256_encoding == "none" else CLOUD_MAP_PAYLOAD_SCHEMA_VERSION,
+            expected=2,
         ),
     }
 
 
-def _validate_optional_cloud(value, backend_kind, *, sha256_encoding):
+def _validate_optional_cloud(value, backend_kind):
     if backend_kind == "slam_toolbox":
         if value is not None:
             raise MappingBackendCheckpointValidationError("二维完整图不能携带三维资产")
         return None
-    return _validate_cloud_asset(value, sha256_encoding=sha256_encoding)
+    return _validate_cloud_asset(value)
 
 
 def _validate_asset_bindings(
@@ -2188,15 +1851,6 @@ def _validate_asset_bindings(
     if checkpoint.backend_kind == "slam_toolbox":
         if cloud_asset is not None or checkpoint.cloud_receipt is not None:
             raise MappingBackendCheckpointValidationError("二维完整图不能携带三维资产")
-        if checkpoint.schema_version == 1:
-            if checkpoint.payload[:8] != b"NWS2D001":
-                raise MappingBackendCheckpointValidationError("legacy planar envelope requires legacy archive structure")
-            try:
-                read_planar_structure(checkpoint.payload, session_id=checkpoint.source_session_id,
-                    generation=checkpoint.source_session_generation,
-                    timestamp_ns=checkpoint.occupancy_receipt["source_timestamp_ns"], occupancy=occupancy_asset)
-            except (ValueError, TypeError, KeyError) as error:
-                raise MappingBackendCheckpointValidationError(str(error)) from error
         return
     if int(cloud_asset["source_cloud_revision"]) != int(
         checkpoint.cloud_receipt["cloud_revision"]
@@ -2221,17 +1875,6 @@ def _validate_asset_bindings(
 
 
 
-def _validate_asset_sha256(value: object, name: str, *, encoding: str) -> bytes:
-    if encoding == "bytes":
-        digest = _require_bytes(value, name)
-        if len(digest) != 32:
-            raise MappingBackendCheckpointValidationError(
-                f"{name} must contain exactly 32 bytes"
-            )
-        return digest
-    if encoding == "hex":
-        return bytes.fromhex(_validate_sha256_hex(value, name))
-    raise AssertionError(f"unsupported asset SHA-256 encoding: {encoding}")
 
 
 def _require_finite_number(
@@ -2291,45 +1934,12 @@ def _receipt_document(receipt: Mapping[str, object]) -> Dict[str, object]:
     return document
 
 
-def _validate_manifest_reference(value: object, description: str) -> Tuple[str, str]:
-    reference = _require_mapping(value, description)
-    _require_exact_fields(reference, ("sha256", "path"), description)
-    sha256 = _validate_sha256_hex(reference["sha256"], f"{description}.sha256")
-    path = _require_string(reference["path"], f"{description}.path")
-    expected_path = _manifest_relative_path(sha256)
-    if path != expected_path:
-        raise MappingBackendCheckpointValidationError(
-            f"{description}.path is not canonical for its SHA-256"
-        )
-    return sha256, path
 
 
-def _validate_payload_reference(value: object) -> Tuple[str, str, int]:
-    reference = _require_mapping(value, "checkpoint manifest payload")
-    _require_exact_fields(
-        reference, ("sha256", "path", "size"), "checkpoint manifest payload"
-    )
-    sha256 = _validate_sha256_hex(reference["sha256"], "payload.sha256")
-    path = _require_string(reference["path"], "payload.path")
-    if path != _object_relative_path(sha256):
-        raise MappingBackendCheckpointValidationError(
-            "payload.path is not canonical for its SHA-256"
-        )
-    size = _require_integer(
-        reference["size"],
-        "payload.size",
-        minimum=1,
-        maximum=_U64_MAX,
-    )
-    return sha256, path, size
 
 
-def _object_relative_path(sha256: str) -> str:
-    return f"objects/sha256-{sha256}.bin"
 
 
-def _manifest_relative_path(sha256: str) -> str:
-    return f"manifests/sha256-{sha256}.json"
 
 
 def _require_mapping(value: object, description: str) -> Mapping[str, object]:
@@ -2393,21 +2003,8 @@ def _require_bytes(value: object, name: str) -> bytes:
     return value
 
 
-def _require_sha256_bytes(value: object) -> bytes:
-    digest = _require_bytes(value, "content_sha256")
-    if len(digest) != 32:
-        raise MappingBackendCheckpointValidationError(
-            "content_sha256 must contain exactly 32 bytes"
-        )
-    return digest
 
 
-def _validate_sha256_hex(value: object, name: str) -> str:
-    if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
-        raise MappingBackendCheckpointValidationError(
-            f"{name} must contain 64 lowercase hex characters"
-        )
-    return value
 
 
 def _encode_json(document: Mapping[str, object]) -> bytes:

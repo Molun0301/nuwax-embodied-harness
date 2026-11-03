@@ -257,11 +257,10 @@ pub struct Response {
     pub error: Option<String>,
 }
 
-/// Legacy is only a read-format marker; historical digests never cross this IPC.
+/// 制品持有导出时分配的检查点身份。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "scheme", rename_all = "snake_case")]
 pub enum ArtifactIdentity {
-    Legacy,
     Assigned { checkpoint_id: String },
 }
 impl ArtifactIdentity {

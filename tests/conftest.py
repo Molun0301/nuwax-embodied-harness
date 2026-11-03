@@ -67,21 +67,15 @@ def navigation_startup_root(tmp_path, monkeypatch):
     return root
 
 
-def fine_bytes(legacy=False):
-    ref = dict(key=[0, 0, 0], points=1)
-    if legacy:
-        ref.update(sha256=[20] * 32, geometry_sha256=[30] * 32)
-    else:
-        ref.update(object=dict(kind='assigned', value=[40] * 16), block_revision=7, geometry_revision=7)
-    root = dict(version=1 if legacy else 2, domain=dict(session='source', generation=3,
-        frame_generation=0, producer_generation=8), revision=7, source_timestamp_ns=11,
-        voxel_size_m=0.125, blocks=[ref])
-    if not legacy:
-        root['geometry_revision'] = 7
+def fine_bytes():
+    ref = dict(key=[0, 0, 0], points=1,
+        object=dict(kind='assigned', value=[40] * 16), block_revision=7, geometry_revision=7)
+    root = dict(version=4, domain=dict(session='source', generation=3,
+        frame_generation=0, producer_generation=8), revision=7, geometry_revision=7,
+        source_timestamp_ns=11, voxel_size_m=0.125, blocks=[ref])
     raw = json.dumps(root, separators=(',', ':')).encode()
     block = b'NUWAXBL1' + struct.pack('<IIHQH', 1, 0, 0, 11, 1)
-    return ((b'NUWAXAR1' if legacy else b'NUWAXAR2') + struct.pack('<Q', len(raw))
-        + (b'X' * 32 if legacy else b'') + raw + struct.pack('<QI', 1, len(block)) + block)
+    return b'NUWAXAR4' + struct.pack('<Q', len(raw)) + raw + struct.pack('<QI', 1, len(block)) + block
 
 
 def dense_bytes():
@@ -407,38 +401,6 @@ def write_private_file(path, data):
             stream.write(chunk)
 
 
-def write_legacy_checkpoint(store, bundle):
-    """写入明确的旧selector/manifest/object文件，返回正式历史读取结果。"""
-    checkpoint, occupancy, cloud = bundle
-    backend = store.version_dir / "mapping_backend" / checkpoint.backend_kind
-    for path in (backend.parent, backend, backend / "objects", backend / "manifests"):
-        path.mkdir(mode=0o700, parents=False, exist_ok=True)
-    alias = checkpoint.content_sha256.hex()
-    relative = "objects/sha256-" + alias + ".bin"
-    write_private_file(backend / relative, checkpoint.payload)
-    document = {"schema_version": 1, "backend_kind": checkpoint.backend_kind,
-        "source_session_id": checkpoint.source_session_id,
-        "source_session_generation": checkpoint.source_session_generation,
-        "created_at_ns": checkpoint.created_at_ns,
-        "payload": {"sha256": alias, "path": relative, "size": checkpoint.payload_size},
-        "canonical_receipts": {"occupancy": _receipt_document(checkpoint.occupancy_receipt),
-            "cloud": _receipt_document(checkpoint.cloud_receipt)},
-        "canonical_assets": {"occupancy": asset_document(occupancy, sha256_field="raw_data_sha256"),
-            "cloud": asset_document(cloud, sha256_field="xyz_sha256") if cloud is not None else None}}
-    for name, data in (("fine_archive", checkpoint.fine_archive), ("dense_archive", checkpoint.dense_archive)):
-        if data is not None:
-            payload = bytes(data)
-            alias = hashlib.sha256(payload).hexdigest()
-            relative = "objects/sha256-" + alias + ".bin"
-            write_private_file(backend / relative, payload)
-            document[name] = {"sha256": alias, "path": relative, "size": len(payload)}
-    encoded = _encode(document)
-    manifest_alias = hashlib.sha256(encoded).hexdigest()
-    relative = "manifests/sha256-" + manifest_alias + ".json"
-    write_private_file(backend / relative, encoded)
-    write_private_file(backend / "checkpoint-v1.json", _encode({"schema_version": 1,
-        "backend_kind": checkpoint.backend_kind, "manifest": {"sha256": manifest_alias, "path": relative}}))
-    return store.load(checkpoint.backend_kind, schema_version=1)
 
 
 def create_memory_mapping_service(snapshot=None, *, state_store=None):

@@ -229,7 +229,6 @@ class AssignedWorkspaceActivationTests(unittest.TestCase):
         self.assertEqual(asset.status, MapAssetStatus.LOCALIZING)
         self.assertEqual(asset.asset_identity, session.asset_identity)
         self.assertTrue(asset.active)
-        self.assertIsNone(asset.asset_manifest_sha256)
         self.assertEqual(self.service._repository.get_active_map_name(), name)
         target = self.runtime.capture_assigned_map_activation_target(map_name=name, asset_identity=asset.asset_identity)
         self.assertEqual(session.activation_receipt_v2, target.activation_receipt)

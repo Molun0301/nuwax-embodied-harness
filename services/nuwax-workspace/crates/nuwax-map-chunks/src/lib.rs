@@ -24,7 +24,7 @@ mod ground_shared_tests;
 mod ground_binary_tests;
 pub use ground_records::{ColumnGroundRecords, GroundRecord, GroundRecordRef, GroundRecords, HeightfieldFragment, HeightfieldSurface};
 mod archive;
-pub use archive::{archive_file, ArchiveReader, ArchivedRoot, LegacyRoot, MAX_ARCHIVE_BYTES};
+pub use archive::{archive_file, ArchiveReader, ArchivedRoot, MAX_ARCHIVE_BYTES};
 
 /// 每个方向32个细体素；负坐标使用欧几里得除法。
 pub const BLOCK_SIDE: i32 = 32;
@@ -98,7 +98,7 @@ fn decode_block_parts(bytes: &[u8]) -> Result<(Block, GroundRecords), String> {
         let records = GroundRecords::Versioned(Arc::new(entries.into_iter().collect()));
         ground_records::validate_records(&records, &block)?;
         records
-    } else { GroundRecords::Legacy(Arc::new(read_layers(bytes, &block)?)) };
+    } else { GroundRecords::empty() };
     Ok((block, layers))
 }
 
@@ -114,37 +114,10 @@ pub fn block_summary(bytes: &[u8]) -> Result<(u32, u64), String> {
 /// BL2 retains Legacy-only observations; BL3 adds compact typed source groups.
 /// Occupancy and numeric sample records retain their original representation.
 /// Old BL1 bytes decode with an empty layer map; no statistics are invented.
-pub fn encode_layer_block(block: &Block, layers: &LayerObservations) -> Result<Vec<u8>, String> {
-    if layers.is_empty() { return encode_block(block); }
-    terrain_observations::validate_layers(layers, block)?;
-    let mut bytes = encode_block(block)?;
-    // 旧文本写法只尝试原4MiB范围，超出后无损转BL6，不先分配完整巨型JSON。
-    struct LimitedJson { bytes: Vec<u8>, limit: usize, exceeded: bool }
-    impl std::io::Write for LimitedJson {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if bytes.len() > self.limit - self.bytes.len() {
-                self.exceeded = true; return Err(std::io::Error::other("legacy JSON block budget"));
-            }
-            self.bytes.extend_from_slice(bytes); Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
-    }
-    let mut json = LimitedJson { bytes: Vec::new(), limit: MAX_V1_TO_V5_BLOCK_BYTES - bytes.len(), exceeded: false };
-    if let Err(error) = serde_json::to_writer(&mut json, &layers.iter().collect::<Vec<_>>()) {
-        if json.exceeded { return ground_shared::encode(block, &GroundRecords::Legacy(Arc::new(layers.clone()))); }
-        return Err(error.to_string());
-    }
-    let json = json.bytes;
-    let typed = layers.values().any(|layer| layer.samples.iter().any(|sample| !sample.source.is_legacy()));
-    bytes[..8].copy_from_slice(if typed { b"NUWAXBL3" } else { b"NUWAXBL2" });
-    bytes[12..16].copy_from_slice(&(json.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(&json);
-    Ok(bytes)
-}
+
 /// Typed block encoding. Legacy records retain their existing BL1/2/3 spelling.
 pub fn encode_ground_block(block: &Block, records: &GroundRecords) -> Result<Vec<u8>, String> {
     match records {
-        GroundRecords::Legacy(v) => encode_layer_block(block, v),
         GroundRecords::Versioned(v) => {
             ground_records::validate_records(records, block)?;
             if v.is_empty() { return encode_block(block); }
@@ -156,33 +129,11 @@ pub fn decode_ground_records(bytes: &[u8]) -> Result<GroundRecords, String> {
     decode_block_parts(bytes).map(|(_, records)| records)
 }
 
-pub fn decode_layer_observations(bytes: &[u8]) -> Result<LayerObservations, String> {
-    if bytes.starts_with(b"NUWAXBL1") {
-        visit_block_records(bytes, |_, _| {})?;
-        return Ok(LayerObservations::new());
-    }
-    decode_block_parts(bytes).and_then(|(_, layers)| layers.into_legacy())
-}
 
-fn read_layers(bytes: &[u8], block: &Block) -> Result<LayerObservations, String> {
-    if &bytes[..8] == b"NUWAXBL1" { return Ok(LayerObservations::new()); }
-    let start = 16 + block.len() * 12;
-    let records: Vec<(u16, LayerObservation)> = serde_json::from_slice(&bytes[start..]).map_err(|e| e.to_string())?;
-    let mut layers = LayerObservations::new();
-    let mut previous = None;
-    for (key, layer) in records {
-        if previous.is_some_and(|old| old >= key) { return Err("unsorted or duplicate layer anchor".into()); }
-        previous = Some(key); layers.insert(key, layer);
-    }
-    if layers.is_empty() { return Err("layer block requires observed layers".into()); }
-    if bytes.starts_with(b"NUWAXBL2") && layers.values().any(|layer| layer.samples.iter().any(|sample| !sample.source.is_legacy())) {
-        return Err("typed layer sources require BL3".into());
-    }
-    terrain_observations::validate_layers(&layers, block)?;
-    Ok(layers)
-}
+
+
 fn visit_block(bytes: &[u8], mut visit: impl FnMut(u16, Evidence)) -> Result<u32, String> {
-    if bytes.starts_with(b"NUWAXBL2") || bytes.starts_with(b"NUWAXBL3") || bytes.starts_with(b"NUWAXBL4") || bytes.starts_with(b"NUWAXBL5") || bytes.starts_with(b"NUWAXBL6") {
+    if bytes.starts_with(b"NUWAXBL4") || bytes.starts_with(b"NUWAXBL5") || bytes.starts_with(b"NUWAXBL6") {
         let (block, _) = decode_block_parts(bytes)?;
         for (&key, &evidence) in &block { visit(key, evidence); }
         Ok(block.len() as u32)
@@ -193,7 +144,7 @@ fn visit_block_records(bytes: &[u8], mut visit: impl FnMut(u16, Evidence)) -> Re
     if !bytes.starts_with(b"NUWAXBL6") && bytes.len() > MAX_V1_TO_V5_BLOCK_BYTES { return Err("精细块格式或长度无效".into()); }
     let layer_bytes = match &bytes[..8] {
         b"NUWAXBL1" if bytes[12..16] == [0; 4] => 0,
-        b"NUWAXBL2" | b"NUWAXBL3" | b"NUWAXBL4" | b"NUWAXBL5" | b"NUWAXBL6" => u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize,
+        b"NUWAXBL4" | b"NUWAXBL5" | b"NUWAXBL6" => u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize,
         _ => return Err("精细块格式或长度无效".into()),
     };
     let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
@@ -222,18 +173,13 @@ impl ObjectId {
             if bytes != [0; 16] { return Ok(Self(bytes)); } }
     }
 }
-/// Historical alias retained verbatim without recomputing it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct LegacyAlias(pub [u8; 32]);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ObjectIdentity { Assigned(ObjectId), Legacy(LegacyAlias) }
+pub enum ObjectIdentity { Assigned(ObjectId) }
 impl From<ObjectId> for ObjectIdentity { fn from(id: ObjectId) -> Self { Self::Assigned(id) } }
-impl From<LegacyAlias> for ObjectIdentity { fn from(id: LegacyAlias) -> Self { Self::Legacy(id) } }
 impl ObjectIdentity {
     pub fn validate(self) -> Result<(), String> {
-        let valid = match self { Self::Assigned(v) => v.0 != [0; 16], Self::Legacy(v) => v.0 != [0; 32] };
+        let valid = match self { Self::Assigned(v) => v.0 != [0; 16] };
         if valid { Ok(()) } else { Err("zero object identity".into()) }
     }
 }
@@ -262,16 +208,6 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_watermarks: Vec<SourceWatermark>,
 }
-/// The v1 spelling is a wire format only. Both aliases are opaque.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LegacyBlockRef { pub key: Key, pub sha256: LegacyAlias, pub geometry_sha256: LegacyAlias, pub points: u32 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LegacyManifest {
-    pub version: u32, pub domain: Domain, pub revision: u64, pub source_timestamp_ns: u64,
-    pub voxel_size_m: f32, pub blocks: Vec<LegacyBlockRef>,
-}
 fn validate_header(domain: &Domain, revision: u64, timestamp: u64, voxel: f32, count: usize) -> Result<(), String> {
     domain.validate()?;
     if revision == 0 || timestamp == 0 || !voxel.is_finite() || voxel <= 0.0 || voxel > 1_048_576.0 || count > MAX_BLOCKS {
@@ -292,11 +228,8 @@ fn validate_members<'a>(members: impl Iterator<Item = (Key, ObjectIdentity, u32)
 impl Manifest {
     pub fn validate(&self) -> Result<(), String> {
         validate_header(&self.domain, self.revision, self.source_timestamp_ns, self.voxel_size_m, self.blocks.len())?;
-        if !matches!(self.version, 2 | 3 | 4 | 5) || self.geometry_revision == 0 || self.geometry_revision > self.revision { return Err("invalid current root revision".into()); }
+        if !matches!(self.version, 4 | 5) || self.geometry_revision == 0 || self.geometry_revision > self.revision { return Err("invalid current root revision".into()); }
         validate_members(self.blocks.iter().map(|b| (b.key, b.object, b.points)))?;
-        if self.version < 4 && !self.source_watermarks.is_empty() {
-            return Err("typed source watermarks require root version 4".into());
-        }
         let mut sources = BTreeSet::new();
         for watermark in &self.source_watermarks {
             watermark.validate()?;
@@ -326,18 +259,7 @@ impl Manifest {
         a.keys().chain(b.keys()).copied().collect::<BTreeSet<_>>().into_iter().filter(|k| all || a.get(k) != b.get(k)).collect()
     }
 }
-impl LegacyManifest {
-    pub fn validate(&self) -> Result<(), String> {
-        validate_header(&self.domain, self.revision, self.source_timestamp_ns, self.voxel_size_m, self.blocks.len())?;
-        if self.version != 1 || self.blocks.iter().any(|b| b.geometry_sha256.0 == [0;32]) { return Err("invalid legacy root".into()); }
-        validate_members(self.blocks.iter().map(|b| (b.key, ObjectIdentity::Legacy(b.sha256), b.points)))
-    }
-    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.len() > MAX_MANIFEST_BYTES { return Err("legacy root exceeds budget".into()); }
-        let root: Self = serde_json::from_slice(bytes).map_err(|e| e.to_string())?; root.validate()?; Ok(root)
-    }
-    pub fn points(&self) -> u64 { self.blocks.iter().map(|b| u64::from(b.points)).sum() }
-}
+
 #[derive(Clone)]
 pub struct SealedMap { root: Arc<Manifest>, pub repository: Repository }
 impl SealedMap {
@@ -378,8 +300,8 @@ fn intrinsic_bytes(bytes: &[u8], block: &Block) -> Intrinsic {
             source_budget_required: source_bytes > MAX_V1_TO_V5_BLOCK_BYTES, ..intrinsic(block) };
     }
     let versioned = bytes.starts_with(b"NUWAXBL4") || bytes.starts_with(b"NUWAXBL5");
-    Intrinsic { layered: bytes.starts_with(b"NUWAXBL2") || bytes.starts_with(b"NUWAXBL3") || versioned,
-        sourced: bytes.starts_with(b"NUWAXBL3") || versioned, versioned, ..intrinsic(block) }
+    Intrinsic { layered: versioned,
+        sourced: versioned, versioned, ..intrinsic(block) }
 }
 fn admit_format(info: Intrinsic, root: &Manifest) -> Result<(), String> {
     if info.versioned && root.version < 5 { Err("heightfield block requires root version 5".into()) }
@@ -413,9 +335,7 @@ impl Receiver {
     pub fn block(&mut self, reference: &BlockRef) -> Result<Arc<Block>, String> {
         self.reader.block(reference)
     }
-    pub fn layers(&mut self, reference: &BlockRef) -> Result<Arc<LayerObservations>, String> {
-        self.reader.layers(reference)
-    }
+
     pub fn ground_records(&mut self, reference: &BlockRef) -> Result<GroundRecords, String> {
         self.reader.ground_records(reference)
     }
@@ -547,7 +467,6 @@ impl Receiver {
         result
     }
     fn admit_layer_binding(&mut self, object: ObjectIdentity, layers: &GroundRecords, block: &Block, key: Key, quantum: f32) -> Result<(), String> {
-        ground_records::validate_legacy_sample_occupancy(layers, block, key, quantum)?;
         admit_layer_spatial_binding(&mut self.layer_bindings, object, layers, key, quantum)
     }
     fn validate_progression(&mut self, old: &Manifest, new: &Manifest) -> Result<(), String> {
@@ -572,11 +491,12 @@ impl Receiver {
 }
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod terrain_observations_tests;
 
-#[cfg(test)]
-mod source_provenance_tests;
+
+
 
 #[cfg(test)]
 mod ground_records_tests;
+
+#[cfg(test)]
+mod source_provenance_tests;

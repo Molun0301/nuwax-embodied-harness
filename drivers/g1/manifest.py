@@ -38,7 +38,6 @@ def build_g1_manifest(config: Optional["NuwaxRobotBridgeConfig"] = None) -> Robo
             required_apt_packages=(),
             forbidden_apt_packages=(),
             required_python_packages=("aiortc>=1.6", "aiohttp>=3.9"),
-            external_slam_script="G1WebRtcSlamScript",
             calibration_required=True,
             slam_dimension="3d",
             memory_mode_recommendation="cloud",

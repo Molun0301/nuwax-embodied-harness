@@ -99,7 +99,6 @@ impl GeometryRuntimeService {
         .map_err(Status::invalid_argument)?;
         let meta = occupancy.meta.as_ref().unwrap();
         let source_session = match &metadata {
-            archive::ArchiveMetadata::Legacy(source) => &source.session,
             archive::ArchiveMetadata::Assigned(assigned) => &assigned.source.session,
         };
         if source_session.session_id != source_session_id

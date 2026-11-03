@@ -28,7 +28,7 @@ from services.geometry.checkpoint_payload import FrozenPayload
 from services.geometry.mapping_backend_checkpoint_store import (
     CheckpointMemberIdentity, MappingBackendCheckpoint, MappingBackendCheckpointStore)
 from services.mapping import asset_store as storage
-from services.mapping.asset_store import (MapAlreadyFinalizedError,
+from services.mapping.asset_store import (AssignedMapAlreadyFinalizedError,
     MapAssetBundleRepository, MapAssetBundleValidationError)
 
 STAMP = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -111,10 +111,6 @@ class AssignedAssetStorageTests(unittest.TestCase):
         for name in hashlib.algorithms_guaranteed | {'new', 'file_digest'}:
             if hasattr(hashlib, name):
                 self.guard.enter_context(patch.object(hashlib, name, side_effect=AssertionError('application hash called')))
-        for name in ('_sha256_bytes', '_validated_snapshot_fingerprint'):
-            self.guard.enter_context(patch.object(storage, name, side_effect=AssertionError('legacy asset digest called')))
-        for name in ('hash', 'read_and_hash'):
-            self.guard.enter_context(patch.object(storage._ManagedRegularFile, name, side_effect=AssertionError('implicit managed hash called')))
         self.guard.enter_context(patch.object(contracts_module, '_validated_model_copy', side_effect=AssertionError('whole bundle clone called')))
         self.guard.enter_context(patch.object(MapSnapshot, '__deepcopy__', side_effect=AssertionError('whole snapshot clone called')))
         self.guard.enter_context(patch.object(PackedOccupancyCells, '__deepcopy__', side_effect=AssertionError('packed cells expanded')))
@@ -131,7 +127,6 @@ class AssignedAssetStorageTests(unittest.TestCase):
     def test_reopen_exact_identity_and_same_id_exact_request_is_idempotent(self):
         first = self.publish()
         self.assertEqual(first.asset_state, 'finalized')
-        self.assertIsNone(first.manifest_sha256)
         current = self.repository.current_directory(MAP_NAME)
         inode = current.stat().st_ino
         restarted = MapAssetBundleRepository(str(self.root))
@@ -165,26 +160,6 @@ class AssignedAssetStorageTests(unittest.TestCase):
         self.assertFalse(hasattr(raised.exception, 'existing_sha256'))
         self.assertEqual(self.repository.get_map_asset_bundle(MAP_NAME).asset_identity, ASSET_ID)
 
-    def test_assigned_finalize_preserves_legacy_current_in_independent_namespace(self):
-        current = self.repository.current_directory(MAP_NAME)
-        write(current / 'manifest.json', LEGACY_MANIFEST)
-        inode = current.stat().st_ino
-        published = self.publish()
-        self.assertEqual(published.asset_identity, ASSET_ID)
-        self.assertEqual(published.asset_state, 'finalized')
-        self.assertTrue(self.repository.has_assigned_version(MAP_NAME, ASSET_ID))
-        assigned = current.parent / ('assigned-id-' + ASSET_ID.asset_id)
-        self.assertNotEqual(assigned, current)
-        self.assertTrue(assigned.is_dir())
-        restarted = MapAssetBundleRepository(str(self.root))
-        reopened = restarted.get_map_asset_bundle(MAP_NAME, expected_asset_identity=ASSET_ID)
-        self.assertEqual(reopened.asset_identity, ASSET_ID)
-        self.assertEqual(reopened.snapshot.occupancy_grid.data, [-1, 100])
-        # Publication alone does not grant a catalog switch or overwrite legacy ownership.
-        self.assertEqual(restarted.current_directory(MAP_NAME), current)
-        self.assertEqual(current.stat().st_ino, inode)
-        self.assertEqual((current / 'manifest.json').read_bytes(), LEGACY_MANIFEST)
-        self.assertEqual({path.name for path in current.iterdir()}, {'manifest.json'})
 
     def test_concurrent_first_publishers_preserve_exact_one_owner(self):
         barrier = threading.Barrier(2)
@@ -193,7 +168,7 @@ class AssignedAssetStorageTests(unittest.TestCase):
                 fault_injector=lambda phase: barrier.wait(timeout=10) if phase == 'before_rename' else None)
             try:
                 return self.publish(repository=repository, bundle=bundle_fixture(identity)).asset_identity
-            except MapAlreadyFinalizedError:
+            except AssignedMapAlreadyFinalizedError:
                 return None
         identities = [ASSET_ID, AssetIdentityV2(asset_id='e' * 32)]
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -213,7 +188,7 @@ class AssignedAssetStorageTests(unittest.TestCase):
                 with self.assertRaises(OSError):
                     self.publish(repository=repository)
                 restarted = MapAssetBundleRepository(directory)
-                found = restarted.get_map_asset_bundle(MAP_NAME, migrate_legacy=False)
+                found = restarted.get_map_asset_bundle(MAP_NAME)
                 self.assertEqual(found is not None, phase == 'after_rename')
                 retried = self.publish(repository=restarted)
                 self.assertEqual(retried.asset_identity, ASSET_ID)
@@ -230,7 +205,6 @@ class AssignedAssetStorageTests(unittest.TestCase):
         asset = MapAsset(map_name=MAP_NAME, display_name=MAP_NAME, bound_memory_library_name=MAP_NAME,
             identity_schema_version=2, asset_identity=bundle.asset_identity, finalized=True)
         self.assertEqual(asset.asset_identity, ASSET_ID)
-        self.assertIsNone(asset.asset_manifest_sha256)
         self.assertEqual(self.publish(repository=restarted).asset_identity, ASSET_ID)
 
     def test_cleanup_refuses_replacement_directory_or_symlink(self):
@@ -325,7 +299,7 @@ class AssignedAssetStorageTests(unittest.TestCase):
 
     def test_contracts_never_issue_identity_or_reinterpret_digest(self):
         document = bundle_fixture().model_dump(mode='json')
-        for changes in ({'asset_identity': None}, {'manifest_sha256': 'f' * 64},
+        for changes in ({'asset_identity': None},
                         {'identity_schema_version': 1}, {'identity_schema_version': True}, {'asset_state': 'legacy'}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 MapAssetBundle.model_validate({**document, **changes})
@@ -406,60 +380,8 @@ class AssignedAssetStorageTests(unittest.TestCase):
         with self.assertRaisesRegex(MapAssetBundleValidationError, 'finalized catalog owner'):
             self.repository.finalize_assigned_map_asset_bundle(bundle_fixture(), staging_dir=stage,
                 asset_identity=ASSET_ID, expected_previous_identity=ASSET_ID)
-        with self.assertRaisesRegex(MapAssetBundleValidationError, 'explicit assigned'):
-            self.repository.finalize_map_asset_bundle(bundle_fixture(), staging_dir=stage)
         self.repository.discard_staging_directory(MAP_NAME, stage)
 
 
 # Exact literals emitted by the pre-D1 HEAD contracts/store, not a newly
 # generated expected document. Retrying these bytes must retain their old hash.
-LEGACY_BUNDLE = b'{"frame_id":"map","geometry_asset":{"assets":[{"asset_type":"mapping_database","built_at":"2026-01-01T00:00:00Z","frame_id":"map","metadata":{},"path":"geometry/test/state.bin","profile_summary":{},"quality_metrics":{}},{"asset_type":"navigation_map","built_at":"2026-01-01T00:00:00Z","frame_id":"map","metadata":{},"path":"geometry/test/map.yaml","profile_summary":{},"quality_metrics":{}}],"built_at":"2026-01-01T00:00:00Z","costmap_source":"canonical","frame_id":"map","geometry_stack":"test","map_name":"assigned-map","mapping_database_path":"geometry/test/state.bin","metadata":{"geometry_asset_path":"geometry/test/geometry_asset.json","geometry_asset_root":"geometry/test"},"occupancy_projection":"canonical","parameter_summary":{},"profile_summary":{},"quality_metrics":{}},"map_name":"assigned-map","metadata":{"descriptor":{"value":1}},"snapshot":{"frame_id":"map","map_name":"assigned-map","metadata":{},"schema_version":2,"source_epoch":"source-3","source_name":"test","timestamp":"2026-01-01T00:00:00Z","update_sequence":6},"source_name":"test","timestamp":"2026-01-01T00:00:00Z"}\n'
-LEGACY_MANIFEST = b'{"bundle_path":"bundle.json","files":[{"path":"bundle.json","sha256":"84c4eaffd882005aca2131a6244cdcd47b1886605dfc07a571d79e641fedd402","size":1094},{"path":"geometry/test/geometry_asset.json","sha256":"6d01cbaee26920e20a432c8ea9240eed253a2b96d2411eb2ed88177c6f00e1a9","size":747},{"path":"geometry/test/map.pgm","sha256":"908f4a3c5be5bc3c34cd33fcf3cfd280be3db1663ea5cf5369b0412f965b33a9","size":13},{"path":"geometry/test/map.yaml","sha256":"3dbbb3ac0971d792ce1957f24b5f965f06a14e219b234edc526b547fbd9fe8e6","size":33},{"path":"geometry/test/state.bin","sha256":"4ba69735ca53765ed6a709edb56c6ea236b7193a3b29a6b390c346f0f4340e4e","size":5}],"map_name":"assigned-map","schema_version":1}\n'
-LEGACY_SHA = '69ac585ecf2f0ad5ce31b65b567cb744cecee8ae30653a098b83d1b3cad48a5d'
-
-
-class LegacyAssetStorageCompatibilityTests(unittest.TestCase):
-    def test_literal_pred1_bundle_and_manifest_reopen_and_repeat_finalize(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repository = MapAssetBundleRepository(directory)
-            current = repository.current_directory(MAP_NAME)
-            bundle = MapAssetBundle.model_validate_json(LEGACY_BUNDLE)
-            self.assertEqual(storage._model_json_bytes(bundle), LEGACY_BUNDLE)
-            self.assertEqual(hashlib.sha256(LEGACY_MANIFEST).hexdigest(), LEGACY_SHA)
-            def materialize(root):
-                write(root / 'bundle.json', LEGACY_BUNDLE)
-                write(root / 'manifest.json', LEGACY_MANIFEST)
-                write(root / 'geometry/test/geometry_asset.json', storage._model_json_bytes(bundle.geometry_asset))
-                write(root / 'geometry/test/state.bin', b'state')
-                write(root / 'geometry/test/map.yaml', b'image: map.pgm\nresolution: 0.125\n')
-                write(root / 'geometry/test/map.pgm', b'P5\n2 1\n255\n\x00\x64')
-            materialize(current)
-            old_inode = current.stat().st_ino
-            reopened = repository.get_map_asset_bundle(MAP_NAME)
-            self.assertEqual(reopened.manifest_sha256, LEGACY_SHA)
-            self.assertEqual(reopened.identity_schema_version, 1)
-            self.assertIsNone(reopened.asset_identity)
-            stage = repository.create_staging_directory(MAP_NAME)
-            materialize(stage)
-            replay = repository.finalize_map_asset_bundle(bundle, staging_dir=stage)
-            self.assertEqual(replay.manifest_sha256, LEGACY_SHA)
-            self.assertEqual(current.stat().st_ino, old_inode)
-            self.assertEqual((current / 'bundle.json').read_bytes(), LEGACY_BUNDLE)
-            self.assertEqual((current / 'manifest.json').read_bytes(), LEGACY_MANIFEST)
-            asset = MapAsset(map_name=MAP_NAME, display_name=MAP_NAME,
-                bound_memory_library_name=MAP_NAME, finalized=True, asset_manifest_sha256=LEGACY_SHA)
-            self.assertNotIn('identity_schema_version', asset.model_dump(mode='json'))
-            self.assertNotIn('asset_identity', asset.model_dump(mode='json'))
-
-    def test_legacy_current_rejects_assigned_expectation_before_hashing(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repository = MapAssetBundleRepository(directory)
-            current = repository.current_directory(MAP_NAME)
-            write(current / 'manifest.json', LEGACY_MANIFEST)
-            with patch.object(storage._ManagedRegularFile, 'read_and_hash', side_effect=AssertionError('legacy body/hash reached')):
-                with self.assertRaises(MapAssetBundleValidationError):
-                    repository.get_map_asset_bundle(MAP_NAME, expected_asset_identity=ASSET_ID)
-
-
-if __name__ == '__main__':
-    unittest.main()

@@ -2168,7 +2168,6 @@ class GeometryRuntimeProvider:
         self._next_map_delivery_ticket_id = 1
         self._last_occupancy_grid: Optional[OccupancyGrid] = None
         self._last_map_update_evidence = None
-        self._assigned_fine_archive_versions = frozenset()
         self._native_input_failure_reason: Optional[str] = None
         self._last_occupancy_grid_identity: Optional[_MappingIdentity] = None
         self._last_occupancy_grid_revision = 0
@@ -2948,8 +2947,6 @@ class GeometryRuntimeProvider:
                     self._channel = staged_channel
                     self._stub = staged_stub
                     self._invalidate_map_connection_locked()
-                    self._assigned_fine_archive_versions = frozenset(
-                        resp.supported_assigned_fine_archive_versions)
                 self._invalidate_map_delivery_tickets_locked()
 
             self._wait_for_map_deliveries()
@@ -3228,7 +3225,6 @@ class GeometryRuntimeProvider:
 
     def _invalidate_map_connection_locked(self) -> None:
         self._map_connection_epoch += 1
-        self._assigned_fine_archive_versions = frozenset()
         self._mapping_transition_epoch += 1
         self._mapping_transition_inflight = False
         self._mapping_identity = None
@@ -3424,13 +3420,6 @@ class GeometryRuntimeProvider:
                     generation=identity.occupancy_receipt["session_generation"], cloud_revision=identity.cloud_receipt["cloud_revision"],
                     source_timestamp_ns=identity.cloud_receipt["source_timestamp_ns"])
                 if identity.role == "fine_map":
-                    if payload[:8] in (b"NUWAXAR1", b"NUWAXAR4", b"NUWAXAR5"):
-                        version = int(payload[7:8])
-                        origin = self.capture_assigned_activation_origin()
-                        if _stub_override is not None and origin[0] is not _stub_override:
-                            raise RuntimeError("assigned fine download connection changed")
-                        if not self.supports_assigned_fine_archive_version(version, expected_origin=origin):
-                            raise RuntimeError("runtime does not support assigned AR%d source archives" % version)
                     validate_fine_archive(payload, **keywords, frame_generation=identity.frame_generation,
                         producer_generation=identity.producer_generation)
                 elif identity.role == "dense_cloud":
@@ -3461,9 +3450,6 @@ class GeometryRuntimeProvider:
                 raise ValueError("planar upload requires its retained immutable payload owner")
         elif reference == checkpoint.fine_reference:
             retained_payload = checkpoint.fine_archive
-            if retained_payload[:8] in (b"NUWAXAR1", b"NUWAXAR4", b"NUWAXAR5"):
-                self.require_assigned_fine_archive_support(checkpoint,
-                    expected_origin=expected_origin or self.capture_assigned_activation_origin())
         elif reference == checkpoint.dense_reference:
             retained_payload = checkpoint.dense_archive
         else:
@@ -3634,7 +3620,6 @@ class GeometryRuntimeProvider:
                     origin[0] is not expected_origin[0] or origin[1] != expected_origin[1]):
                 raise RuntimeError("assigned activation connection changed before dispatch")
         stub = origin[0]
-        self.require_assigned_fine_archive_support(checkpoint, expected_origin=origin)
         transition = self._begin_mapping_transition()
         dispatched = False
         acknowledged = None
@@ -3758,16 +3743,7 @@ class GeometryRuntimeProvider:
                 raise RuntimeError("assigned activation provider is disconnected")
             return self._stub, self._map_connection_epoch
 
-    def supports_assigned_fine_archive_version(self, version, *, expected_origin):
-        with self.assigned_activation_origin_guard(expected_origin):
-            return version in (2, 3) or (version in (1, 4, 5)
-                and version in self._assigned_fine_archive_versions)
 
-    def require_assigned_fine_archive_support(self, checkpoint, *, expected_origin):
-        if checkpoint.fine_archive is not None and checkpoint.fine_archive[:8] in (b"NUWAXAR1", b"NUWAXAR4", b"NUWAXAR5"):
-            version = int(checkpoint.fine_archive[7:8])
-            if not self.supports_assigned_fine_archive_version(version, expected_origin=expected_origin):
-                raise RuntimeError("runtime does not support assigned AR%d source archives" % version)
 
     def require_assigned_activation_origin(self, expected_origin) -> None:
         with self.assigned_activation_origin_guard(expected_origin):

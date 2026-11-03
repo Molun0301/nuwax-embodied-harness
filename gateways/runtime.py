@@ -793,7 +793,6 @@ class _GatewaySavedPointCloudMapSource(PointCloudMapSource):
         path = Path(str(path_value)).expanduser().resolve(strict=False)
         frame_id = str(summary.get("frame_id") or self._default_frame_id)
         source_kind = str(summary.get("source_kind") or "configured_pcd_root")
-        manifest_sha256 = str(summary.get("asset_manifest_sha256") or "").strip().lower() or None
         asset_sha256 = str(summary.get("asset_sha256") or "").strip().lower() or None
         map_name = str(summary.get("map_name")) if summary.get("map_name") is not None else None
         delegate_key = (
@@ -801,7 +800,6 @@ class _GatewaySavedPointCloudMapSource(PointCloudMapSource):
             frame_id,
             source_kind,
             map_name,
-            manifest_sha256,
             asset_sha256,
         )
         if self._delegate is None or self._delegate_key != delegate_key:
@@ -811,7 +809,6 @@ class _GatewaySavedPointCloudMapSource(PointCloudMapSource):
                 frame_id=frame_id,
                 source_kind=source_kind,
                 map_name=map_name,
-                asset_manifest_sha256=manifest_sha256,
                 asset_sha256=asset_sha256,
                 provenance={
                     "geometry_stack": summary.get("geometry_stack"),

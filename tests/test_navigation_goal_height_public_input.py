@@ -639,7 +639,7 @@ class NavigationGoalHeightOwnedSampleTests(unittest.TestCase):
             self.assertEqual(asset.identity_schema_version, 2)
             legacy = type(asset).model_validate({**asset.model_dump(mode="json"),
                 "identity_schema_version": 1, "asset_identity": None,
-                "asset_manifest_sha256": "a" * 64})
+                "finalized": False})
             repository.save_map_asset(legacy)
             self.assertEqual(repository.get_map_asset(owned_fixtures.MAP_NAME).identity_schema_version, 1)
             self.owner.stub.calls.clear()

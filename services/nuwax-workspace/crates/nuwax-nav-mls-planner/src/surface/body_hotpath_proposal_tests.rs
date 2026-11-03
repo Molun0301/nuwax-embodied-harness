@@ -13,7 +13,7 @@ fn mixed_hotpath_map()->SurfaceSnapshot {
             let origin=[(f64::from(x)+0.5)*q,(f64::from(y)+0.5)*q,(f64::from(z)+0.5)*q];
             blocks.entry(block_key(key)).or_default().insert(local,LayerObservation {
                 members:vec![local],normal:[0.,0.,1.],plane_origin:origin,
-                samples:vec![LayerSample{source:Default::default(),point:origin,
+                samples:vec![LayerSample{source: std::sync::Arc::new(nuwax_map_chunks::LayerSource::Lidar { backend: 1, runtime_generation: 1, sensor_frame_id: "test".into() }),point:origin,
                     source_sequence:1,source_timestamp_ns:1,point_index:u32::from(local)}],
             });
         }

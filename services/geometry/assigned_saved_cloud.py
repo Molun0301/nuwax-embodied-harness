@@ -61,7 +61,7 @@ def _capture_assigned_saved_cloud_handle(owner, snapshot, prepared):
     checkpoint, cloud = stored.checkpoint, stored.cloud_asset
     geometry = bundle.geometry_asset
     reference = geometry.metadata.get("mapping_backend_checkpoint") if geometry is not None else None
-    if (bundle.asset_state != "finalized" or bundle.manifest_sha256 is not None
+    if (bundle.asset_state != "finalized"
             or checkpoint.schema_version != 2 or not isinstance(reference, dict)
             or reference.get("schema_version") != 2
             or reference.get("checkpoint_id") != checkpoint.checkpoint_id

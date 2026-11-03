@@ -38,7 +38,6 @@ impl Repository {
     fn object_path(&self, object: ObjectIdentity) -> PathBuf {
         let name = match object {
             ObjectIdentity::Assigned(id) => format!("id-{}", hex(&id.0)),
-            ObjectIdentity::Legacy(alias) => hex(&alias.0),
         };
         self.root.join(name)
     }
@@ -107,11 +106,7 @@ impl Repository {
             Err(e) => Err(e.to_string()),
         }
     }
-    pub fn install_legacy_root(&self, root: &LegacyRoot) -> Result<(), String> {
-        let admitted = LegacyRoot::decode(root.raw_json.clone(), root.alias)?;
-        if admitted.manifest != root.manifest { return Err("legacy root bytes differ from supplied metadata".into()); }
-        self.put_object(ObjectIdentity::Legacy(root.alias), &root.raw_json)
-    }
+
     pub fn copy_snapshot(&self, root: &Manifest, destination: &Self) -> Result<(), String> {
         root.validate()?; let mut copied = BTreeSet::new();
         for block in &root.blocks {
@@ -139,8 +134,7 @@ impl Repository {
             let entry = entry.map_err(|e| e.to_string())?; let name = entry.file_name();
             let Some(name) = name.to_str() else { continue; };
             let typed = name.strip_prefix("id-").is_some_and(|s| s.len() == 32 && lowercase_hex(s));
-            let legacy = name.len() == 64 && lowercase_hex(name);
-            if (typed || legacy) && !live.contains(&entry.path()) {
+            if typed && !live.contains(&entry.path()) {
                 fs::remove_file(entry.path()).map_err(|e| e.to_string())?; removed += 1;
             }
         }
@@ -169,9 +163,7 @@ impl RegionReader {
     pub fn new(repository: Repository, budget_bytes: usize) -> Self {
         Self { repository, cache: BTreeMap::new(), budget_bytes, used_bytes: 0, clock: 0 }
     }
-    pub fn layers(&mut self, reference: &BlockRef) -> Result<Arc<LayerObservations>, String> {
-        self.parts(reference.object, reference.points).and_then(|(_, _, layers)| layers.legacy())
-    }
+
     pub fn ground_records(&mut self, reference: &BlockRef) -> Result<GroundRecords, String> {
         self.parts(reference.object, reference.points).map(|(_, _, records)| records)
     }

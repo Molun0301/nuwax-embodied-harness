@@ -15,7 +15,7 @@ pub struct Writer {
     pending: BTreeMap<Key, Pending>, touched: BTreeSet<Key>, membership_touched: BTreeSet<Key>,
     source_watermarks: BTreeMap<Arc<LayerSource>, (u64, u64)>,
     source_watermark_bytes: usize, source_watermarks_changed: bool,
-    published: Option<Arc<Manifest>>, legacy_baseline: Option<(Domain, u64)>, reader: RegionReader,
+    published: Option<Arc<Manifest>>, reader: RegionReader,
     id_source: Box<dyn FnMut() -> Result<ObjectId, String> + Send>,
     #[cfg(test)] pub(crate) encoded_blocks: usize,
     write_format: u32,
@@ -41,7 +41,7 @@ impl Writer {
         }
         Ok(Self { reader: RegionReader::new(repository.clone(), cache_bytes / 2), repository,
             blocks: BTreeMap::new(), dirty: BTreeMap::new(), pending: BTreeMap::new(), touched: BTreeSet::new(), membership_touched: BTreeSet::new(),
-            source_watermarks: BTreeMap::new(), source_watermark_bytes: 0, source_watermarks_changed: false, published: None, legacy_baseline: None, id_source: Box::new(id_source), #[cfg(test)] encoded_blocks: 0, write_format: 4, voxel_size_m, dirty_point_budget: cache_bytes / 128, dirty_points: 0, dirty_layer_bytes: 0, max_observed_ns: 0,
+            source_watermarks: BTreeMap::new(), source_watermark_bytes: 0, source_watermarks_changed: false, published: None, id_source: Box::new(id_source), #[cfg(test)] encoded_blocks: 0, write_format: 4, voxel_size_m, dirty_point_budget: cache_bytes / 128, dirty_points: 0, dirty_layer_bytes: 0, max_observed_ns: 0,
             cache_limit_bytes: None, cache_warning: None, block_write_failure: None, #[cfg(test)] cache_warnings: 0 })
     }
     pub fn repository(&self) -> &Repository { &self.repository }
@@ -140,7 +140,6 @@ impl Writer {
             admit_format(info, root)?;
             ground_shared::admit(info, &records, root)?;
             if root.version >= 5 && info.versioned {
-                ground_records::validate_legacy_sample_occupancy(&records, &block, reference.key, root.voxel_size_m)?;
                 admit_layer_spatial_binding(&mut bindings, reference.object, &records, reference.key, root.voxel_size_m)?;
             }
             admit_intrinsic(info, reference.points, root.source_timestamp_ns)?; latest = latest.max(info.latest);
@@ -157,28 +156,14 @@ impl Writer {
             ground_records::validate_root_columns(root, &mut self.reader, &columns)?;
         }
         self.source_watermarks = source_watermarks; self.source_watermark_bytes = source_watermark_bytes;
-        self.write_format = root.version.max(4);
+        self.write_format = root.version;
         self.blocks = root.blocks.iter().map(|b| (b.key, b.clone())).collect();
         self.reset_pending(); self.max_observed_ns = latest;
-        self.published = Some(Arc::new(root.clone())); self.legacy_baseline = None; Ok(())
+        self.published = Some(Arc::new(root.clone())); Ok(())
     }
-    pub fn restore_legacy(&mut self, root: &LegacyManifest) -> Result<(), String> {
-        root.validate()?;
-        if root.voxel_size_m != self.voxel_size_m { return Err("restored resolution differs from writer".into()); }
-        let mut latest = 0;
-        for reference in &root.blocks {
-            let object = ObjectIdentity::Legacy(reference.sha256);
-            let (_, info, layers) = self.reader.parts(object, reference.points)?;
-            if !layers.is_empty() { return Err("legacy root cannot contain observed layers".into()); }
-            admit_intrinsic(info, reference.points, root.source_timestamp_ns)?; latest = latest.max(info.latest);
-        }
-        self.source_watermarks.clear(); self.source_watermark_bytes = 0; self.write_format = 4;
-        self.blocks = root.blocks.iter().map(|b| (b.key, BlockRef { key: b.key, object: ObjectIdentity::Legacy(b.sha256), block_revision: 0, geometry_revision: 0, points: b.points })).collect();
-        self.reset_pending(); self.max_observed_ns = latest; self.published = None;
-        self.legacy_baseline = Some((root.domain.clone(), root.revision)); Ok(())
-    }
+
     pub fn restore_archived(&mut self, root: &ArchivedRoot) -> Result<(), String> {
-        match root { ArchivedRoot::Current(root) => self.restore(root), ArchivedRoot::Legacy(root) => self.restore_legacy(&root.manifest) }
+        match root { ArchivedRoot::Current(root) => self.restore(root) }
     }
     fn reset_pending(&mut self) {
         self.dirty.clear(); self.pending.clear(); self.touched.clear(); self.membership_touched.clear(); self.dirty_points = 0; self.dirty_layer_bytes = 0; self.source_watermarks_changed = false;
@@ -204,23 +189,10 @@ impl Writer {
         self.dirty_layer_bytes
     }
     /// Read only one touched block; capture keeps no second whole-map statistics cache.
-    pub fn layer_observations(&mut self, key: Key) -> Result<LayerObservations, String> {
-        if let Some(dirty) = self.dirty.get(&key) { return dirty.layers.legacy().map(|v| v.as_ref().clone()); }
-        match self.blocks.get(&key) { Some(reference) => Ok((*self.reader.layers(reference)?).clone()), None => Ok(LayerObservations::new()) }
-    }
+
     /// Replace a touched block's associated layers after original point admission.
     /// Occupancy must already contain the real member hits. On error no layers change.
-    pub fn replace_layer_observations(&mut self, key: Key, layers: LayerObservations) -> Result<(), String> {
-        let dirty = self.load_dirty(key)?;
-        terrain_observations::validate_layers(&layers, &dirty.block)?;
-        if *dirty.layers.legacy()? == layers { return Ok(()); }
-        let before = dirty.layer_bytes;
-        let after = layers.values().map(terrain_observations::layer_bytes).sum::<usize>();
-        dirty.layers = GroundRecords::Legacy(Arc::new(layers)); dirty.layer_bytes = after; dirty.changed = true;
-        self.dirty_layer_bytes = self.dirty_layer_bytes - before + after;
-        self.pending.remove(&key); self.touched.insert(key); self.membership_touched.insert(key);
-        Ok(())
-    }
+
     fn column_parts(&mut self, xy: [i32; 2]) -> Result<Vec<(Key, Arc<Block>, GroundRecords)>, String> {
         let low = [xy[0].div_euclid(32), xy[1].div_euclid(32), i32::MIN];
         let high = [low[0], low[1], i32::MAX];
@@ -258,7 +230,7 @@ impl Writer {
         for xy in columns {
             let Some(parts) = groups.get(&[xy[0].div_euclid(32), xy[1].div_euclid(32)]) else { continue; };
             let column = ground_records::assemble_column(xy, self.voxel_size_m, parts)?;
-            if column.classified_empty || !column.legacy.is_empty() || !column.heightfields.is_empty() { result.insert(xy, column); }
+            if column.classified_empty || !column.heightfields.is_empty() { result.insert(xy, column); }
         }
         Ok(result)
     }
@@ -307,7 +279,7 @@ impl Writer {
         let mut result = BTreeMap::new();
         for (xy, column) in assembled {
             let column = column?;
-            if column.classified_empty || !column.legacy.is_empty() || !column.heightfields.is_empty() { result.insert(xy, column); }
+            if column.classified_empty || !column.heightfields.is_empty() { result.insert(xy, column); }
         }
         Ok(result)
     }
@@ -347,12 +319,10 @@ impl Writer {
                 // 有增量的块安装后必为版本化记录，按版本化分支校验。
                 Some(delta) => {
                     let view = ground_records::overlay(records, delta);
-                    ground_records::validate_versioned_records(view.len(), view.iter().copied(), block)?;
-                    ground_records::validate_versioned_legacy_samples(view.iter().map(|(_, r)| *r), block, *key, q)
+                    ground_records::validate_versioned_records(view.len(), view.iter().copied(), block)
                 }
                 None => {
-                    ground_records::validate_records(records, block)?;
-                    ground_records::validate_legacy_sample_occupancy(records, block, *key, q)
+                    ground_records::validate_records(records, block)
                 }
             }
         }).collect();
@@ -432,22 +402,21 @@ impl Writer {
                     }
                 }
             }
-            let records = records.compact(&block);
             self.dirty_points += block.len(); self.dirty_layer_bytes += layer_bytes;
             self.dirty.insert(key, Dirty { block, layers: records, layer_bytes, changed: true });
             self.pending.remove(&key); self.touched.insert(key); self.membership_touched.insert(key);
         }
     }
     pub fn remove(&mut self, keys: impl IntoIterator<Item = Key>) -> Result<(), String> {
-        if self.write_format < 5 { return self.remove_legacy(keys); }
+        if self.write_format < 5 { return self.remove_occupancy(keys); }
         let keys: BTreeSet<_> = keys.into_iter().collect();
         let block_keys: BTreeSet<_> = keys.iter().map(|k| block_key(*k)).collect();
         let mut versioned = false;
         for key in block_keys {
-            if let Some(dirty) = self.dirty.get(&key) { versioned |= matches!(dirty.layers, GroundRecords::Versioned(_)); }
-            else if let Some(reference) = self.blocks.get(&key) { versioned |= matches!(self.reader.ground_records(reference)?, GroundRecords::Versioned(_)); }
+            if let Some(dirty) = self.dirty.get(&key) { versioned |= !dirty.layers.is_empty(); }
+            else if let Some(reference) = self.blocks.get(&key) { versioned |= !self.reader.ground_records(reference)?.is_empty(); }
         }
-        if !versioned { return self.remove_legacy(keys); }
+        if !versioned { return self.remove_occupancy(keys); }
         let columns: BTreeSet<_> = keys.iter().map(|k| [k[0],k[1]]).collect();
         let mut prepared = self.prepare_ground_blocks(columns.iter().copied())?;
         let records: Vec<_> = prepared.iter().map(|(k,(_,r))| (*k,r.clone())).collect();
@@ -465,15 +434,6 @@ impl Writer {
         }
         for (xy, mut column) in originals {
             let was_native = column.classified_empty || !column.heightfields.is_empty();
-            column.legacy = column.legacy.into_iter().filter_map(|(block, mut layer)| {
-                layer.members.retain(|m| prepared[&block].0.contains_key(m));
-                if layer.members.is_empty() { return None; }
-                layer.samples.retain(|sample| {
-                    let key = sample.point.map(|v| (v * (1.0 / f64::from(self.voxel_size_m))).floor() as i32);
-                    !keys.contains(&key)
-                });
-                (!layer.samples.is_empty()).then_some((block,layer))
-            }).collect();
             column.heightfields = column.heightfields.into_iter().filter_map(|mut surface| {
                 let live = surface.column.members().map(|(z,_)| z).filter(|z| !keys.contains(&[xy[0],xy[1],*z])).collect();
                 surface.column = surface.column.retain_members(&live)?;
@@ -483,7 +443,7 @@ impl Writer {
                 });
                 Some(surface)
             }).collect();
-            column.classified_empty = was_native && column.legacy.is_empty() && column.heightfields.is_empty();
+            column.classified_empty = was_native && column.heightfields.is_empty();
             Self::merge_staged(&mut deltas, Self::stage_column(xy, self.voxel_size_m, &column, &prepared)?);
         }
         changed.extend(deltas.keys().copied());
@@ -523,33 +483,15 @@ impl Writer {
         }
         Ok(())
     }
-    fn remove_legacy(&mut self, keys: impl IntoIterator<Item = Key>) -> Result<(), String> {
-        let quantum=f64::from(self.voxel_size_m);
+
+    fn remove_occupancy(&mut self, keys: impl IntoIterator<Item = Key>) -> Result<(), String> {
         let mut grouped: BTreeMap<Key, BTreeSet<u16>> = BTreeMap::new();
         for key in keys { grouped.entry(block_key(key)).or_default().insert(local_key(key)); }
         for (key, removed) in grouped {
             if !self.blocks.contains_key(&key) && !self.dirty.contains_key(&key) { continue; }
             let dirty = self.load_dirty(key)?; let before = dirty.block.len();
             for local in &removed { Arc::make_mut(&mut dirty.block).remove(local); }
-            let before_layer_bytes=dirty.layer_bytes;
-            let layers = dirty.layers.legacy_mut()?;
-            *layers=std::mem::take(layers).into_values().filter_map(|mut layer| {
-                let previous_members=layer.members.len();
-                layer.members.retain(|member|dirty.block.contains_key(member));
-                if layer.members.is_empty() {return None;}
-                if layer.members.len()!=previous_members {
-                    // 删除只撤销被射线证实消失的成员及其原样本；剩余真实成员
-                    // 继续使用捕获时已拟合的平面，不能退回无地面身份的占据。
-                    layer.samples.retain(|sample| {
-                        let sample_key=sample.point.map(|value|(value/quantum).floor() as i32);
-                        block_key(sample_key)!=key || !removed.contains(&local_key(sample_key))
-                    });
-                }
-                (!layer.samples.is_empty()).then(||(layer.members[0],layer))
-            }).collect();
-            dirty.layer_bytes=dirty.layers.bytes();
-            let removed_layer_bytes=before_layer_bytes-dirty.layer_bytes;
-            let removed = before - dirty.block.len(); dirty.changed |= removed > 0; self.dirty_points -= removed; self.dirty_layer_bytes -= removed_layer_bytes;
+            let removed = before - dirty.block.len(); dirty.changed |= removed > 0; self.dirty_points -= removed;
             if removed > 0 { self.pending.remove(&key); self.touched.insert(key); self.membership_touched.insert(key); }
         }
         Ok(())
@@ -603,8 +545,7 @@ impl Writer {
         validate_header(&domain, revision, timestamp_ns, self.voxel_size_m, self.block_count())?;
         if self.max_observed_ns > timestamp_ns { return Err("root bound precedes observed evidence".into()); }
         let same_domain = self.published.as_ref().is_some_and(|r| r.domain == domain);
-        if self.published.as_ref().is_some_and(|r| r.domain == domain && revision <= r.revision)
-            || self.legacy_baseline.as_ref().is_some_and(|(d, r)| *d == domain && revision <= *r) {
+        if self.published.as_ref().is_some_and(|r| r.domain == domain && revision <= r.revision) {
             return Err("publication revision did not advance".into());
         }
         self.flush()?;
@@ -663,7 +604,7 @@ impl Writer {
             }
             ground_records::validate_root_columns(&root, &mut self.reader, &columns)?;
         }
-        self.blocks = blocks; self.published = Some(root.clone()); self.legacy_baseline = None;
+        self.blocks = blocks; self.published = Some(root.clone());
         self.touched.clear(); self.membership_touched.clear(); self.source_watermarks_changed = false;
         Ok(SealedMap { root, repository: self.repository.clone() })
     }
@@ -778,7 +719,7 @@ mod capture_column_tests {
             let column = crate::heightfield_observations::HeightfieldColumn::from_counts(xy, 0.05,
                 [-1,0,33].into_iter().map(|z|(z,[1,0,0,0,0,0,0,0])).collect()).unwrap().unwrap();
             writer.observe(column.members().map(|(z,_)|[xy[0],xy[1],z]),20).unwrap();
-            expected.insert(xy, ColumnGroundRecords { classified_empty: false, legacy:vec![],
+            expected.insert(xy, ColumnGroundRecords { classified_empty: false,
                 heightfields:vec![HeightfieldSurface {column,samples:vec![]}] });
         }
         writer.replace_ground_columns(expected.iter().map(|(xy,column)|(*xy,column))).unwrap();

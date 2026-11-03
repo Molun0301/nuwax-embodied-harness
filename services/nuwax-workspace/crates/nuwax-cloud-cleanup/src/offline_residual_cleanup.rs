@@ -122,13 +122,7 @@ impl CompletedMap {
                         }
                         map.ground_samples.extend(v.samples.iter().map(|v| v.point));
                     }
-                    GroundRecordRef::LegacyPlane(v) if v.normal[2] >= 0.5 => {
-                        for local in &v.members {
-                            map.ground
-                                .insert(nuwax_map_chunks::global_key(block_key, *local)?);
-                        }
-                        map.ground_samples.extend(v.samples.iter().map(|v| v.point));
-                    }
+
                     _ => {}
                 }
             }

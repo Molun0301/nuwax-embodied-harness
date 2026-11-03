@@ -15,7 +15,6 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import tests.test_checkpoint_identity_v2 as identity
 import tests.test_heightfield_archive as heightfield
-import tests.test_legacy_cloud_import as legacy
 from services.geometry import geometry_runtime_provider as provider
 from services.geometry import mapping_backend_checkpoint_store as checkpoint_store
 from services.geometry.checkpoint_payload import FrozenPayload
@@ -62,7 +61,6 @@ def peer_for(payload, versions=(5,)):
     stub.entries = {response.fine_map_artifact.id: [
         copy.deepcopy(response.fine_map_artifact), bytearray(payload), True]}
     client = identity.runtime(stub)
-    client._assigned_fine_archive_versions = frozenset(versions)
     return client, stub, response
 
 
@@ -95,92 +93,11 @@ class HeightfieldArchiveConsumerTests(unittest.TestCase):
         self.assertEqual(read_fine_archive_root(downloaded)[1], read_fine_archive_root(payload)[1])
         self.assertEqual(stub.exports, [b''])
 
-    def legacy_import(self, payload):
-        fixture = legacy.LegacyCloudImportTests()
-        fixture.setUp()
-        try:
-            fixture.prepare(dense=False)
-            _, root, _ = read_fine_archive_root(payload)
-            domain = root['domain']
-            source = fixture.bundle.geometry_asset.metadata['mapping_backend_checkpoint']
-            manifest = fixture.current / source['manifest_path']
-            document = json.loads(manifest.read_text())
-            document.update(source_session_id=domain['session'],
-                source_session_generation=domain['generation'], created_at_ns=root['source_timestamp_ns'] + 1)
-            occupancy = document['canonical_receipts']['occupancy']
-            occupancy.update(session_id=domain['session'], session_generation=domain['generation'],
-                source_timestamp_ns=root['source_timestamp_ns'])
-            document['canonical_receipts']['cloud'].update(session_generation=domain['generation'],
-                cloud_revision=root['revision'], source_timestamp_ns=root['source_timestamp_ns'])
-            document['canonical_assets']['occupancy']['timestamp_ns'] = root['source_timestamp_ns']
-            document['canonical_assets']['cloud']['source_cloud_revision'] = root['revision']
-            manifest.write_bytes(checkpoint_store._encode_json(document))
-            # 旧导入同时核对展示栅格时间；按原纳秒来源精确截到其微秒表达，不重标制品。
-            from datetime import datetime, timedelta, timezone
-            bundle_path = fixture.current / 'bundle.json'
-            bundle = json.loads(bundle_path.read_text())
-            bundle['snapshot']['occupancy_grid']['timestamp'] = (
-                datetime(1970, 1, 1, tzinfo=timezone.utc)
-                + timedelta(microseconds=root['source_timestamp_ns'] // 1000)).isoformat()
-            bundle_path.write_bytes(checkpoint_store._encode_json(bundle))
-            fixture.add_fine_archive(payload)
-            before = legacy.inventory(fixture.current)
-            result = fixture.import_current()
-            self.assertIsInstance(result, asset_store._AssignedActivationRead)
-            checkpoint = result.stored_checkpoint.checkpoint
-            self.assertEqual(bytes(checkpoint.fine_archive), payload)
-            member = checkpoint.fine_reference.member_identity
-            self.assertEqual((member.frame_generation, member.producer_generation),
-                (domain['frame_generation'], domain['producer_generation']))
-            self.assertEqual(member.cloud_receipt, checkpoint.cloud_receipt)
-            self.assertEqual(checkpoint.fine_reference.legacy_alias, b'')
-            self.assertEqual(legacy.inventory(fixture.current), before)
-            with patch.object(asset_store.uuid, 'uuid4', side_effect=AssertionError('retry allocation')):
-                retried = fixture.import_current()
-            self.assertEqual(retried.bundle.asset_identity, result.bundle.asset_identity)
-            self.assertEqual(bytes(retried.stored_checkpoint.checkpoint.fine_archive), payload)
-        finally:
-            fixture.doCleanups()
 
     def test_ar5_export_store_reopen_transfer_keeps_exact_owner_and_bytes(self):
         self.roundtrip(heightfield.archive(heightfield.full()), self.fixture.root)
 
-    def test_ar5_schema1_asset_import_preserves_archive_and_reuses_publication(self):
-        self.legacy_import(heightfield.archive(heightfield.full()))
 
-    def test_ar5_capability_is_required_at_transfer_boundary_not_offline_storage(self):
-        payload = heightfield.archive(heightfield.full())
-        # Existing AR4 semantics: export/storage are allowed, activation/upload
-        # require the connected runtime's advertised reader capability.
-        client, stub, _ = peer_for(payload, (1, 2, 3, 4, 99))
-        bundle = client.export_mapping_backend_checkpoint()
-        stored = bundle.publish_to(self.fixture.root)
-        origin = client.capture_assigned_activation_origin()
-        self.assertFalse(client.supports_assigned_fine_archive_version(5, expected_origin=origin))
-        self.assertFalse(client.supports_assigned_fine_archive_version(99, expected_origin=origin))
-        before = len(stub.requests)
-        with self.assertRaisesRegex(RuntimeError, 'does not support assigned AR5'):
-            client.require_assigned_fine_archive_support(bundle.checkpoint, expected_origin=origin)
-        with self.assertRaisesRegex(RuntimeError, 'does not support assigned AR5'):
-            client._upload_graph_artifact(bundle.checkpoint, payload=bundle.checkpoint.fine_archive)
-        client._assigned_activation_attempt = None
-        with self.assertRaisesRegex(RuntimeError, 'does not support assigned AR5'):
-            client.activate_assigned_platform_map(stored_checkpoint=stored,
-                activation_request=dict(activation_request_id='activate:ar5', session_id='mapload:ar5',
-                    map_name='map', checkpoint_id=stored.checkpoint.checkpoint_id,
-                    asset_identity={'asset_id': 'd' * 32}, expected_runtime_generation=7))
-        self.assertEqual(len(stub.requests), before)
-        client._assigned_fine_archive_versions = frozenset((5,))
-        self.assertTrue(client.supports_assigned_fine_archive_version(5, expected_origin=origin))
-        client.require_assigned_fine_archive_support(bundle.checkpoint, expected_origin=origin)
-        client._map_connection_epoch += 1
-        with self.assertRaisesRegex(RuntimeError, 'connection changed'):
-            client.require_assigned_fine_archive_support(bundle.checkpoint, expected_origin=origin)
-        client, stub, response = peer_for(payload, ())
-        with self.assertRaisesRegex(RuntimeError, 'does not support assigned AR5'):
-            client._download_graph_artifact(response.fine_map_artifact, provider.MAX_FINE_ARCHIVE_BYTES)
-        self.assertEqual([request.action for request in stub.requests], [4, 5])
-        self.assertEqual(stub.entries, {})
 
     def test_ar5_malformed_and_receipt_mismatch_keep_original_rejection(self):
         payload = heightfield.archive(heightfield.full())

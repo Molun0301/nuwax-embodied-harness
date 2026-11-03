@@ -335,7 +335,7 @@ mod tests {
     }
     fn column(xy: [i32; 2], zs: &[i32]) -> ColumnGroundRecords {
         ColumnGroundRecords {
-            classified_empty: false, legacy: vec![],
+            classified_empty: false,
             heightfields: vec![HeightfieldSurface {
                 column: HeightfieldColumn::from_counts(
                     xy,
@@ -409,16 +409,6 @@ mod tests {
                         })
                         .collect(),
                 )
-                .unwrap();
-            let legacy = records
-                .iter()
-                .filter_map(|(k, r)| match r {
-                    GroundRecordRef::LegacyPlane(r) => Some((k, r.clone())),
-                    _ => None,
-                })
-                .collect();
-            source
-                .replace_ground_layers(reference.key, Arc::new(legacy))
                 .unwrap();
             parts.push((reference.key, records));
         }
@@ -523,7 +513,7 @@ mod tests {
         let xy = [0, 0];
         let make =
             |a, b, with_middle| ColumnGroundRecords {
-                classified_empty: false, legacy: vec![],
+                classified_empty: false,
                 heightfields: vec![HeightfieldSurface {
                 // Public wire boundary constructs this admitted zero-mass fixture;
                 // the private map-chunks assembler is not exposed for tests.
@@ -607,49 +597,7 @@ mod tests {
         assert!(source.replace_heightfield_columns([0, 0], &[]).is_empty());
     }
 
-    #[test]
-    fn native_legacy_borrowing_keeps_plane_identity_and_exact_members() {
-        let mut w = writer();
-        w.observe([[0, 0, 0]], 20).unwrap();
-        let layer = nuwax_map_chunks::LayerObservation {
-            members: vec![0],
-            normal: [0., 0., 1.],
-            plane_origin: [0.025, 0.025, 0.02],
-            samples: vec![nuwax_map_chunks::LayerSample {
-                source: Default::default(),
-                point: [0.025, 0.025, 0.02],
-                source_sequence: 1,
-                source_timestamp_ns: 20,
-                point_index: 0,
-            }],
-        };
-        w.replace_layer_observations([0, 0, 0], [(0, layer)].into())
-            .unwrap();
-        let root = root(&mut w, 1);
-        let (source, _) = admitted(&w, &root);
-        let borrowed = source.ground_records([0, 0]).next().unwrap();
-        let original = source.ground_layers([0, 0]).next().unwrap();
-        let SourceGroundRecord::LegacyPlane(record) = borrowed else {
-            panic!("legacy");
-        };
-        assert!(std::ptr::eq(record, original));
-        assert_eq!(borrowed.key(), GroundKey::LegacyPlane([0, 0, 0]));
-        assert_eq!(
-            borrowed.height_at([0.025, 0.025]),
-            original.height_at([0.025, 0.025])
-        );
-        assert_eq!(borrowed.direction(), Some(original.normal));
-        assert!(borrowed.same_legacy_plane(borrowed));
-        assert_eq!(borrowed.members().collect::<Vec<_>>(), vec![0]);
-        assert!(borrowed.contains_member([0, 0, 0]));
-        assert!(!borrowed.contains_member([0, 0, 1]));
-        let mut reader = RegionReader::new(w.repository().clone(), BUDGET);
-        assert!(reader
-            .ground_records(&root.blocks[0])
-            .unwrap()
-            .legacy()
-            .is_ok());
-    }
+
     #[test]
     fn native_block_only_member_removal_retires_stale_claim() {
         let mut writer = writer();

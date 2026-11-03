@@ -236,25 +236,6 @@ fn heightfield_v1_codec_rejects_invalid_mass_and_implicit_legacy_upgrade() {
     let encoded = encode_heightfield_column(&actual).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
     assert_eq!(value["representation"], "heightfield_v1");
-    assert!(serde_json::from_slice::<crate::LayerObservation>(&encoded).is_err());
-    let legacy = crate::LayerObservation {
-        members: vec![0],
-        plane_origin: [0.025, 0.025, 0.001],
-        normal: [0.0, 0.0, 1.0],
-        samples: vec![crate::LayerSample {
-            source: std::sync::Arc::new(crate::LayerSource::Legacy),
-            point: [0.025, 0.025, 0.001],
-            source_sequence: 1,
-            source_timestamp_ns: 1,
-            point_index: 0,
-        }],
-    };
-    let old_bytes = serde_json::to_vec(&legacy).unwrap();
-    assert_eq!(
-        serde_json::from_slice::<crate::LayerObservation>(&old_bytes).unwrap(),
-        legacy
-    );
-    assert!(decode_heightfield_column(&old_bytes).is_err());
     let mut invalid = value.clone();
     invalid["representation"] = "heightfield_v2".into();
     assert!(decode_heightfield_column(&serde_json::to_vec(&invalid).unwrap()).is_err());

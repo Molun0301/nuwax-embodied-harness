@@ -186,7 +186,7 @@ fn heightfield_floor(height: impl Fn(f64) -> f64, extra: &[[i32; 3]], max_step: 
             }
             writer.replace_ground_column([x, y], &ColumnGroundRecords {
                 classified_empty: false,
-                legacy: vec![],
+
                 heightfields: vec![HeightfieldSurface { column, samples: vec![] }],
             }).unwrap();
         }

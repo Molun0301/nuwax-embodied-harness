@@ -9,7 +9,6 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from functools import wraps
-from datetime import datetime, timezone
 import hashlib
 import io
 import json
@@ -32,12 +31,6 @@ def _error(message):
     return GatewayError(message, error_code="map_cleanup_failed", http_status=409)
 
 
-def _sha(path):
-    with Path(path).open("rb") as source:
-        digest = hashlib.sha256()
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-        return digest.hexdigest()
 
 
 def raw_scan_directory():
@@ -259,6 +252,9 @@ class CompletedMapCleanup:
         self.owner = owner
         self.root = owner._asset_repository._root_dir / ".cleanup-previews"
         self.root.mkdir(parents=True, exist_ok=True)
+        for folder in self.root.iterdir():
+            if folder.is_dir():
+                shutil.rmtree(folder)
         self.jobs = {}
         self.lock = threading.RLock()
         self.condition = threading.Condition(self.lock)
@@ -455,11 +451,8 @@ class CompletedMapCleanup:
                 raise _error("请输入尚未使用的新地图名称，原图不会被覆盖")
             current = self.owner.get_map_asset_bundle(map_name=job["map_name"])
             source = job["source"]
-            if current is None or (current.asset_identity, current.manifest_sha256) != (source.asset_identity, source.manifest_sha256):
+            if current is None or current.asset_identity != source.asset_identity:
                 raise _error("原地图已改变，请重新预览")
-            for role in ("fine", "dense"):
-                if _sha(job["folder"] / (role + ".source")) != job["report"][f"source_{role}_sha256"]:
-                    raise _error("预览输入发生变化，请重新预览")
             job["state"] = "applying"
         try:
             with self.owner._repository.map_activation_executor_guard():
@@ -566,7 +559,7 @@ class CompletedMapCleanup:
             geometry_path.parent.mkdir(parents=True, exist_ok=True)
             geometry_path.write_text(geometry.model_dump_json(indent=2), encoding="utf-8")
             self.owner._asset_repository.finalize_assigned_map_asset_bundle(candidate, staging_dir=staging, asset_identity=identity)
-            finalized = self.owner._asset_repository.get_map_asset_bundle(name, migrate_legacy=False, expected_asset_identity=identity)
+            finalized = self.owner._asset_repository.get_map_asset_bundle(name, expected_asset_identity=identity)
             if finalized is None:
                 raise _error("清理后新图保存重载失败")
             # Publish the catalog entry only after the complete new bundle can

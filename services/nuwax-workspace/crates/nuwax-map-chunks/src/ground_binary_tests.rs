@@ -16,19 +16,15 @@ fn fixture() -> (Block, GroundRecords) {
 }
 
 #[test]
-fn bl5_keeps_exact_bits_and_both_historical_bl4_spellings() {
+fn bl5_keeps_exact_bits_and_compact_bl4_records() {
     let (block, records) = fixture();
     let GroundRecords::Versioned(entries) = &records else { unreachable!() };
     let current = ground_binary::encode(&block, entries).unwrap();
     assert!(current.starts_with(b"NUWAXBL5"));
     let compact = serde_json::to_vec(&entries.iter().collect::<Vec<_>>()).unwrap();
-    let mut old_entries = serde_json::to_value(entries.iter().collect::<Vec<_>>()).unwrap();
     let GroundRecord::HeightfieldV1(field) = &entries[&0] else { unreachable!() };
-    old_entries[0][1]["representation"] = "heightfield_v1".into();
-    old_entries[0][1]["data"]["samples"] = serde_json::to_value(&field.samples).unwrap();
-    let old = serde_json::to_vec(&old_entries).unwrap();
     let mut variants = vec![current.clone()];
-    for json in [compact, old] {
+    for json in [compact] {
         let mut bytes = encode_block(&block).unwrap();
         bytes[..8].copy_from_slice(b"NUWAXBL4");
         bytes[12..16].copy_from_slice(&(json.len() as u32).to_le_bytes());

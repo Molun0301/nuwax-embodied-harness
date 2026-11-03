@@ -56,7 +56,6 @@ class RuntimeAssignedSavePreparationTests(unittest.TestCase):
         self.instance._provider_attach_epoch = 3
         self.context = {'active': True, 'session_id': 'source', 'session_generation': 3,
                         'map_name': 'map', 'mapping_backend_kind': 'voxel', 'revision': 6}
-        self.instance._is_nuwax_mapping_active = lambda: True
         self.instance.get_mapping_session_context = lambda: dict(self.context)
         self.instance._resolve_mapping_backend = lambda: self.instance._remote_provider
         self.instance._managed_processes = {}
@@ -161,15 +160,14 @@ class RuntimeAssignedSavePreparationTests(unittest.TestCase):
     def test_v2_cannot_rewrite_an_assigned_or_sealed_owner(self):
         fields = {name: getattr(self.candidate, name) for name in type(self.candidate).model_fields}
         owners = (
-            MapAssetBundle(**{**fields, 'manifest_sha256': 'e' * 64}),
             MapAssetBundle(**{**fields, 'identity_schema_version': 2,
                 'asset_identity': AssetIdentityV2(asset_id='d' * 32), 'asset_state': 'candidate'}),
         )
         for owner in owners:
             with self.subTest(schema=owner.identity_schema_version):
-                with self.assertRaisesRegex(TypeError, 'unsealed legacy draft'):
+                with self.assertRaisesRegex(TypeError, 'unsealed draft'):
                     self.instance._replace_bundle_occupancy_from_checkpoint(owner, self.exported)
-                with self.assertRaisesRegex(TypeError, 'unsealed legacy draft'):
+                with self.assertRaisesRegex(TypeError, 'unsealed draft'):
                     self.instance.prepare_map_asset_bundle(owner, bundle_root=self.root)
         self.assertEqual(self.exports, [])
         self.assertEqual(list(self.root.iterdir()), [])

@@ -64,12 +64,6 @@ mod navigation_block_unit_transport_tests {
             nuwax_map_chunks::ObjectIdentity::Assigned(id) => NavigationMapObjectIdentity {
                 kind: 1,
                 object_id: id.0.to_vec(),
-                legacy_alias: Vec::new(),
-            },
-            nuwax_map_chunks::ObjectIdentity::Legacy(id) => NavigationMapObjectIdentity {
-                kind: 2,
-                object_id: Vec::new(),
-                legacy_alias: id.0.to_vec(),
             },
         };
         let request = NavigationMapBlockRequest {
@@ -144,11 +138,7 @@ mod navigation_block_unit_transport_tests {
         request: &NavigationMapBlockRequest,
     ) -> std::path::PathBuf {
         let identity = request.block.as_ref().unwrap().object.as_ref().unwrap();
-        let (prefix, bytes) = if identity.kind == 1 {
-            ("id-", &identity.object_id)
-        } else {
-            ("", &identity.legacy_alias)
-        };
+        let (prefix, bytes) = ("id-", &identity.object_id);
         let hex = bytes
             .iter()
             .map(|byte| format!("{byte:02x}"))

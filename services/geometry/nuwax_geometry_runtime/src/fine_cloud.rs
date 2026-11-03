@@ -5,9 +5,6 @@ use nalgebra::Point3;
 use nuwax_map_chunks::{CachePolicy, Repository, SealedMap, Writer};
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, OnceLock, Weak};
-#[cfg(test)]
-#[path = "ground_observations.rs"]
-mod ground_observations;
 #[path = "heightfield_capture.rs"]
 mod heightfield_capture;
 
@@ -291,8 +288,7 @@ impl FineCloud {
         let old=self.writer.ground_columns(keys.iter().map(|k|[k.0,k.1]))?;
         let mut samples=Vec::new(); let mut seen=AHashSet::new();
         for column in old.values(){
-            for p in column.heightfields.iter().flat_map(|v|&v.samples).map(|v|v.point)
-                .chain(column.legacy.iter().filter(|(_,v)|v.normal[2]>=0.85).flat_map(|(_,v)|&v.samples).map(|v|v.point)){
+            for p in column.heightfields.iter().flat_map(|v|&v.samples).map(|v|v.point){
                 if seen.insert(p.map(f64::to_bits)){samples.push(p);}
             }
         }
@@ -630,7 +626,6 @@ mod unclassified_scan_tests {
         resampled[0].x += 1e-9;
         assert!(fine.accumulate(&resampled, None, 11, Some(&next.clone().into())).unwrap());
         let observed = records(&mut fine);
-        assert!(observed.values().all(|column| column.legacy.is_empty()));
         for sample in samples(&observed) {
             let expected: [f64; 3] = points[sample.point_index as usize].coords.into();
             assert_eq!(sample.point, expected, "statistics use the admitted allocation, never supplied reconstructed floats");
@@ -654,7 +649,6 @@ mod unclassified_scan_tests {
         assert!(fine.accumulate_frame(&corrected, None, 10, Some(FrameSource::Corrected(&original,None))).unwrap());
         let observed = records(&mut fine);
         assert!(samples(&observed).next().is_some());
-        assert!(observed.values().all(|column| column.legacy.is_empty()));
         // Same original input at z=0.11, now H1's fixed q/8 representative.
         let expected_height = 17.5 * f64::from(fine.voxel_size()) / 8.0;
         for field in observed.values().flat_map(|column| &column.heightfields) {
@@ -963,35 +957,7 @@ mod auxiliary_source_tests {
         assert_eq!(snapshot(&mut fine), before);
     }
 
-    #[test]
-    fn legacy_layer_archive_does_not_invent_a_typed_source_cutoff() {
-        let points = floor();
-        let mut fine = FineCloud::fresh().unwrap();
-        // Actual Legacy plane construction. Do not run heightfield_capture and
-        // relabel its root as AR3: the archived block must really be BL2.
-        fine.accumulate(&points, None, 100, None).unwrap();
-        ground_observations::capture(&mut fine.writer, &points, 100, 100, Arc::new(LayerSource::Legacy),
-            |index| u32::try_from(index).ok(), |_| false).unwrap();
-        let legacy_column = fine.writer.ground_column([0, 0]).unwrap();
-        assert!(!legacy_column.legacy.is_empty());
-        assert!(legacy_column.heightfields.is_empty());
-        assert!(legacy_column.legacy.iter().flat_map(|(_, layer)| &layer.samples)
-            .all(|sample| matches!(sample.source.as_ref(), LayerSource::Legacy)));
-        let sealed = fine.seal(domain(), 1, 100).unwrap();
-        for reference in &sealed.manifest().blocks {
-            let bytes = sealed.repository.read_object(reference.object, nuwax_map_chunks::MAX_BLOCK_BYTES).unwrap();
-            assert!(bytes.starts_with(b"NUWAXBL2"), "AR3 fixture must contain real Legacy-only plane bytes");
-        }
-        let mut legacy = (**sealed.manifest()).clone();
-        legacy.version = 3;
-        assert!(legacy.source_watermarks.is_empty());
-        let (file, _) = nuwax_map_chunks::archive_file(&legacy, &sealed.repository).unwrap();
-        let (mut restored, _) = FineCloud::from_archive(file).unwrap();
-        let source = cloud(namespace("depth-front", "clock", 1, 1), 5, 1, points);
-        assert_eq!(restored.writer.source_watermark(&source.source().layer_source()), None);
-        assert!(ingest(&mut restored, &source));
-        assert!(samples(&records(&mut restored)).any(|sample| sample.source == source.source().layer_source()));
-    }
+
 
     #[test]
     fn auxiliary_actual_sequence_progression_and_many_sources_stay_bounded() {
@@ -1046,9 +1012,6 @@ mod cache_config_tests {
     }
 }
 
-#[cfg(test)]
-#[path = "fine_ground_deletion_qualification.rs"]
-mod ground_deletion_qualification;
 
 #[cfg(test)]
 #[path = "heightfield_consumer_controls.rs"]

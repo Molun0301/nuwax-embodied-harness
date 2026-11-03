@@ -1320,7 +1320,3 @@ use std::os::unix::fs::FileExt;
         assert_eq!(wire.source_graph_member.unwrap().role, proto::CheckpointMemberRole::PlanarGraph as i32);
     }
 }
-
-#[cfg(test)]
-#[path = "legacy_fine_import_tests.rs"]
-mod legacy_fine_import_tests;

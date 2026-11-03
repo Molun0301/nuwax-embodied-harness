@@ -81,12 +81,12 @@ fn bl6_near_full_source_and_numeric_bounds_fit_and_removing_root_sources_revalid
     let mut receiver=Receiver::with_cache_budget(Repository::temporary().unwrap(),256*1024*1024);
     receiver.receive(&Transfer{root:manifest.encode().unwrap(),included:BTreeMap::new()},&manifest.domain,
         |_,r|repo.read_object(r.object,MAX_BLOCK_BYTES)).unwrap();
-    let mut bad=manifest.clone();bad.revision=2;bad.source_watermarks.retain(|v|v.source.is_legacy());
+    let mut bad=manifest.clone();bad.revision=2;bad.source_watermarks.clear();
     let error=receiver.receive(&Transfer{root:bad.encode().unwrap(),included:BTreeMap::new()},&bad.domain,
         |_,_|panic!("已缓存对象不应补取")).unwrap_err();
     assert!(error.contains("unregistered source"),"{error}");
     assert_eq!(receiver.current().unwrap().revision,1);
-    let mut small=records.owned_versioned();small.retain(|&key,_|key==0);
+    let mut small=match &records { GroundRecords::Versioned(values) => values.as_ref().clone() };small.retain(|&key,_|key==0);
     let small_block:Block=[(0,block[&0])].into();
     let small_bytes=encode_ground_block(&small_block,&GroundRecords::Versioned(Arc::new(small))).unwrap();
     let small_id=ObjectId::random().unwrap().into();repo.put_object(small_id,&small_bytes).unwrap();
@@ -96,26 +96,12 @@ fn bl6_near_full_source_and_numeric_bounds_fit_and_removing_root_sources_revalid
     eprintln!("BL6_EXTREME records=32768 samples=1048576 bytes={} bound={MAX_BLOCK_BYTES} slack={}",bytes.len(),MAX_BLOCK_BYTES-bytes.len());
 }
 
-#[test]
-fn bl6_legacy_plane_overflow_uses_typed_binary_without_changing_legacy_reader_semantics() {
-    let(block,records,source)=dense(4);
-    let layers:LayerObservations=records.iter().map(|(key,record)|{
-        let GroundRecordRef::HeightfieldV1(f)=record else{unreachable!()};
-        (key,LayerObservation {members:vec![key],plane_origin:f.samples[0].point,normal:[0.,0.,1.],samples:f.samples.clone()})
-    }).collect();
-    let bytes=encode_layer_block(&block,&layers).unwrap();assert!(bytes.starts_with(b"NUWAXBL6"));
-    assert_eq!(decode_layer_observations(&bytes).unwrap(),layers);
-    let id=ObjectId::random().unwrap().into();let mut manifest=root(id,block.len(),vec![source]);manifest.version=4;
-    admit_format(intrinsic_bytes(&bytes,&block),&manifest).unwrap();
-    let repo=Repository::temporary().unwrap();repo.put_object(id,&bytes).unwrap();
-    artifact("BL6-旧平面大块.ar4",&manifest,&repo);
-    manifest.version=3;assert!(admit_format(intrinsic_bytes(&bytes,&block),&manifest).is_err());
-}
+
 
 #[test]
 fn bl6_rejects_bad_lengths_indices_modes_and_all_truncations_of_a_small_record() {
     let(block,records,_)=dense(1);
-    let mut one=records.owned_versioned();one.retain(|&key,_|key==0);
+    let mut one=match &records { GroundRecords::Versioned(values) => values.as_ref().clone() };one.retain(|&key,_|key==0);
     let small:Block=[(0,block[&0])].into();
     let bytes=encode_ground_block(&small,&GroundRecords::Versioned(Arc::new(one))).unwrap();let start=28;
     for end in 0..bytes.len() {
@@ -143,7 +129,7 @@ fn failed_candidate_cannot_lend_its_source_declaration_to_a_later_root() {
     let mut receiver=Receiver::with_cache_budget(Repository::temporary().unwrap(),16*1024*1024);
     receiver.receive(&Transfer{root:old.encode().unwrap(),included:BTreeMap::new()},&old.domain,
         |_,r|repo.read_object(r.object,MAX_BLOCK_BYTES)).unwrap();
-    let(_,all,_)=dense(1);let mut records=all.owned_versioned();records.retain(|&key,_|key==0);
+    let(_,all,_)=dense(1);let mut records=match &all { GroundRecords::Versioned(values) => values.as_ref().clone() };records.retain(|&key,_|key==0);
     let source=Arc::new(LayerSource::Auxiliary {sensor_id:"x".repeat(MAX_V1_TO_V5_BLOCK_BYTES+1),
         clock_id:"c".into(),runtime_generation:1,session_generation:1});
     let GroundRecord::HeightfieldV1(field)=records.get_mut(&0).unwrap() else{unreachable!()};

@@ -46,13 +46,7 @@ pub(crate) fn encode(block: &Block, records: &BTreeMap<u16, GroundRecord>) -> Re
     for (&key, record) in records {
         out.put(&key.to_le_bytes())?;
         match record {
-            GroundRecord::LegacyPlane(layer) => {
-                out.put(&[0, layer.members.len() as u8])?;
-                for member in &layer.members { out.put(&member.to_le_bytes())?; }
-                out.floats(&layer.plane_origin)?;
-                out.floats(&layer.normal)?;
-                out.samples(&layer.samples)?;
-            }
+
             GroundRecord::HeightfieldV1(field) => {
                 out.put(&[1])?;
                 for coord in field.anchor { out.put(&coord.to_le_bytes())?; }
@@ -138,14 +132,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<GroundRecords, String> {
             return Err("invalid ground record anchors".into());
         }
         let record = match input.byte()? {
-            0 => {
-                let count = input.count(MAX_LAYER_MEMBERS)?;
-                let mut members = Vec::new();
-                for _ in 0..count { members.push(u16::from_le_bytes(input.array()?)); }
-                GroundRecord::LegacyPlane(LayerObservation {
-                    members, plane_origin: input.floats()?, normal: input.floats()?, samples: input.samples()?,
-                })
-            }
+
             1 => {
                 let mut anchor = [0; 3];
                 for coord in &mut anchor { *coord = i32::from_le_bytes(input.array()?); }

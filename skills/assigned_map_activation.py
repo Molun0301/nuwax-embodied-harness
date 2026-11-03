@@ -120,7 +120,7 @@ def _save_selected_asset(owner, asset, bundle, metadata):
     values = dict(asset.metadata)
     values.update(metadata or {})
     selected = asset.model_copy(update={'identity_schema_version': 2, 'asset_identity': bundle.asset_identity,
-        'asset_manifest_sha256': None, 'finalized': True, 'finalized_at': asset.finalized_at or bundle.timestamp,
+        'finalized': True, 'finalized_at': asset.finalized_at or bundle.timestamp,
         'active': True, 'localization_ready': False, 'status': MapAssetStatus.LOCALIZING,
         'frame_id': bundle.frame_id, 'last_activated_at': now, 'updated_at': now, 'metadata': values})
     owner._repository.set_active_map_name(bundle.map_name)

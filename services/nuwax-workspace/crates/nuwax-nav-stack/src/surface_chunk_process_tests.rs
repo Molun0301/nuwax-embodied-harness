@@ -285,15 +285,12 @@ async fn recorded_large_block_crosses_real_process_rpc_with_original_deadlines()
     let mut watermarks=BTreeMap::<Arc<LayerSource>,(u64,u64)>::new();
     for (_,record) in records.iter() {
         let samples=match record {
-            GroundRecordRef::LegacyPlane(layer)=>&layer.samples,
             GroundRecordRef::HeightfieldV1(field)=>&field.samples,
             GroundRecordRef::ClassifiedEmptyColumn=>continue,
         };
         for sample in samples {
-            if !sample.source.is_legacy() {
-                let marker=(sample.source_timestamp_ns,sample.source_sequence);
-                watermarks.entry(sample.source.clone()).and_modify(|old|*old=(*old).max(marker)).or_insert(marker);
-            }
+            let marker=(sample.source_timestamp_ns,sample.source_sequence);
+            watermarks.entry(sample.source.clone()).and_modify(|old|*old=(*old).max(marker)).or_insert(marker);
         }
     }
     manifest.source_watermarks=watermarks.into_iter().map(|(source,(source_timestamp_ns,source_sequence))|

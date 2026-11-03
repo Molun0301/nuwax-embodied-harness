@@ -1,4 +1,4 @@
-"""探索检查点的双代身份、内部源凭据及锁外准入回归；不启动原生进程。"""
+"""探索检查点的分配式身份、内部源凭据及锁外准入回归；不启动原生进程。"""
 import hashlib
 import json
 import os
@@ -48,11 +48,6 @@ def record_fixture(**changes):
     return ExplorationCheckpoint(**fields)
 
 
-def legacy_fixture(**changes):
-    fields = {"schema_version": 1, "asset_identity": None, "mapping_checkpoint_id": None,
-        "asset_manifest_sha256": "a" * 64}
-    fields.update(changes)
-    return record_fixture(**fields)
 
 
 class ExplorationCheckpointIdentityTests(unittest.TestCase):
@@ -65,13 +60,6 @@ class ExplorationCheckpointIdentityTests(unittest.TestCase):
         self.assertNotIn("occupancy_receipt", document)
         self.assertNotIn("cloud_receipt", document)
         self.assertEqual(ExplorationCheckpoint.model_validate(document), assigned)
-        legacy = legacy_fixture(pipeline="slam_2d")
-        document = legacy.model_dump(mode="json")
-        self.assertEqual(document["asset_manifest_sha256"], "a" * 64)
-        self.assertNotIn("asset_identity", document)
-        self.assertNotIn("mapping_checkpoint_id", document)
-        self.assertEqual(ExplorationCheckpoint.model_validate(document), legacy)
-
     def test_missing_mixed_and_unsupported_identity_generations_are_rejected(self):
         for changes in ({"asset_identity": None}, {"mapping_checkpoint_id": None},
                         {"asset_manifest_sha256": "b" * 64},
@@ -81,10 +69,6 @@ class ExplorationCheckpointIdentityTests(unittest.TestCase):
                         {"asset_identity": {"asset_id": ASSET_ID.asset_id, "revision": 1}}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 record_fixture(**changes)
-        for changes in ({"asset_manifest_sha256": None}, {"asset_identity": ASSET_ID},
-                        {"mapping_checkpoint_id": CHECKPOINT_ID}):
-            with self.subTest(legacy=changes), self.assertRaises(ValueError):
-                legacy_fixture(**changes)
         for version in (True, False, 1.0, 2.0, "1", "2", 0, 3, None):
             with self.subTest(version=version), self.assertRaises(ValueError):
                 record_fixture(schema_version=version)
@@ -120,15 +104,6 @@ class ExplorationCheckpointIdentityTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 record_fixture(request=request)
 
-    def test_legacy_digest_and_native_v1_v2_bytes_remain_opaque(self):
-        for version in (1, 2):
-            raw = progress_fixture(schema_version=version,
-                configuration_sha256=[91] * 32, navigation_configuration_sha256=[37] * 32)
-            checkpoint = legacy_fixture(geometry_progress_json=raw)
-            self.assertEqual(ExplorationCheckpoint.model_validate_json(checkpoint.model_dump_json()).geometry_progress_json, raw)
-        minimal = json.dumps({"schema_version": 1, "map_name": MAP_NAME,
-            "request_id": "original-exploration", "map_frame_id": "map"})
-        self.assertEqual(legacy_fixture(geometry_progress_json=minimal).geometry_progress_json, minimal)
 
 
 class AssignedExplorationCheckpointStoreTests(unittest.TestCase):
@@ -155,9 +130,6 @@ class AssignedExplorationCheckpointStoreTests(unittest.TestCase):
         for name in hashlib.algorithms_guaranteed | {"new", "file_digest"}:
             if hasattr(hashlib, name):
                 guard.enter_context(patch.object(hashlib, name, side_effect=AssertionError("digest forbidden")))
-        for name in ("hash", "read_and_hash"):
-            guard.enter_context(patch.object(asset_module._ManagedRegularFile, name,
-                side_effect=AssertionError("legacy body hash forbidden")))
         guard.enter_context(patch.object(MapSnapshot, "__deepcopy__", side_effect=AssertionError("full snapshot copy forbidden")))
         guard.enter_context(patch.object(PackedOccupancyCells, "__deepcopy__", side_effect=AssertionError("full occupancy copy forbidden")))
 
@@ -222,9 +194,7 @@ class AssignedExplorationCheckpointStoreTests(unittest.TestCase):
 
     def test_snapshot_reuse_keeps_expected_identity_and_generation_checks(self):
         snapshot = self.store.validate_asset(self.record)
-        for expected in ({"expected_asset_identity": AssetIdentityV2(asset_id="e" * 32)},
-                         {"expected_manifest_sha256": "a" * 64},
-                         {"expected_asset_identity": ASSET_ID, "expected_manifest_sha256": "a" * 64}):
+        for expected in ({"expected_asset_identity": AssetIdentityV2(asset_id="e" * 32)},):
             with self.subTest(expected=expected), self.assertRaises(asset_module.MapAssetBundleValidationError):
                 self.store.assets.get_validated_map_asset_bundle_snapshot(MAP_NAME, _previous=snapshot, **expected)
 
@@ -269,9 +239,8 @@ class AssignedExplorationCheckpointStoreTests(unittest.TestCase):
         current = self.store.assets.current_directory(MAP_NAME)
         body = current / "geometry/test/map.pgm"
         original = body.read_bytes()
-        journal = current.parent / asset_module._PLANAR_EXCHANGE_JOURNAL
         read = self.store._read
-        for change in ("replacement", "missing", "body", "exchange"):
+        for change in ("replacement", "missing", "body"):
             calls = []
             old = current.with_name("previous-directory")
             def changing_read(path):
@@ -283,8 +252,6 @@ class AssignedExplorationCheckpointStoreTests(unittest.TestCase):
                             shutil.copytree(old, current)
                     elif change == "body":
                         body.write_bytes(b"invalid replacement")
-                    else:
-                        journal.write_text("{}")
                 return read(path)
             with self.subTest(change=change), patch.object(self.store, "_read", changing_read), \
                     patch.object(MapAssetBundle, "model_validate", wraps=MapAssetBundle.model_validate) as parse:
@@ -302,8 +269,6 @@ class AssignedExplorationCheckpointStoreTests(unittest.TestCase):
                     shutil.rmtree(current)
                 old.rename(current)
             body.write_bytes(original)
-            if journal.exists():
-                journal.unlink()
 
     def test_list_rejects_replacement_during_metadata_currentness_check(self):
         self._write_list_record(record_fixture(checkpoint_id="first"), 2)
@@ -485,7 +450,6 @@ class AssignedExplorationCheckpointStoreTests(unittest.TestCase):
 
     def test_save_revalidates_forged_and_nested_mutated_record_before_any_write(self):
         invalid = [self.record.model_copy(update={"schema_version": True}),
-            self.record.model_copy(update={"asset_manifest_sha256": "a" * 64}),
             self.record.model_copy(update={"mapping_checkpoint_id": "bad"})]
         request = self.record.request.model_copy(update={"resume_progress_json": "nested"})
         invalid.append(self.record.model_copy(update={"request": request}))
@@ -493,29 +457,6 @@ class AssignedExplorationCheckpointStoreTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 self.store.save(value)
         self.assertFalse(self.store._files.direct_path(self.record.checkpoint_id).exists())
-
-
-class LegacyExplorationCheckpointStoreTests(unittest.TestCase):
-    def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
-        self.store = ExplorationCheckpointStore(self.root)
-
-
-
-    def test_bad_envelope_version_or_identity_alias_is_rejected(self):
-        value = legacy_fixture()
-        path = self.store._files.direct_path(value.checkpoint_id)
-        path.parent.mkdir(parents=True)
-        for version in (True, 2.0, "2", 1, 3):
-            path.write_text(json.dumps({"schema_version": version, "payload": value.model_dump_json()}))
-            with self.subTest(version=version), self.assertRaises(ValueError):
-                self.store.load(value.checkpoint_id, validate_asset=False)
-        path.write_text(json.dumps({"schema_version": 2,
-            "payload": legacy_fixture(checkpoint_id="changed-alias").model_dump_json()}))
-        with self.assertRaisesRegex(ValueError, "身份"):
-            self.store.load(value.checkpoint_id, validate_asset=False)
 
 
 if __name__ == "__main__":

@@ -54,7 +54,6 @@ def build_customrobot_manifest(config: Optional["NuwaxRobotBridgeConfig"] = None
             required_apt_packages=(),
             forbidden_apt_packages=(),
             required_python_packages=(),
-            external_slam_script="",
             calibration_required=False,
             slam_dimension="3d",
             memory_mode_recommendation="disabled",

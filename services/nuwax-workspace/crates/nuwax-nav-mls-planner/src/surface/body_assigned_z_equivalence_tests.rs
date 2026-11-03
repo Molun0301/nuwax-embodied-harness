@@ -361,7 +361,7 @@ fn single_column_fixture(fine: f32, coarse: f32, floor_z: i32,
             let point = [(f64::from(key[0]) + 0.5)*q, (f64::from(key[1]) + 0.5)*q, height];
             layers.entry(block_key(key)).or_default().insert(local, LayerObservation {
                 members: vec![local], normal: [0.0, 0.0, 1.0], plane_origin: point,
-                samples: vec![LayerSample { source: Default::default(), point,
+                samples: vec![LayerSample { source: std::sync::Arc::new(nuwax_map_chunks::LayerSource::Lidar { backend: 1, runtime_generation: 1, sensor_frame_id: "test".into() }), point,
                     source_sequence: 1, source_timestamp_ns: 1, point_index: u32::from(local) }],
             });
         }
@@ -976,7 +976,7 @@ fn distant_classified_empty_column_preserves_real_legacy_cross_slope() {
         let key=[3200,3200,0];
         writer.observe([key],20).unwrap();
         writer.replace_ground_column([key[0],key[1]],&ColumnGroundRecords {
-            classified_empty:true,legacy:vec![],heightfields:vec![]}).unwrap();
+            classified_empty:true,heightfields:vec![]}).unwrap();
         let root=writer.snapshot(Domain {session:"distant-empty-cross-slope".into(),generation:1,
             frame_generation:0,producer_generation:1},1,20).unwrap();
         let mut receiver=Receiver::new(Repository::temporary().unwrap());

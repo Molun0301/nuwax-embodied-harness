@@ -69,56 +69,9 @@ class IdentityV2Tests(unittest.TestCase):
             self.assertEqual(uploaded, getattr(self.response, 'fine_map_artifact' if field == 'fine_reference' else 'dense_cloud_artifact'))
             self.assertEqual(client._download_graph_artifact(uploaded, provider.MAX_DENSE_ARCHIVE_BYTES), payload)
         self.assertEqual(loaded.identity, ('a' * 32, 'manifest'))
-        self.assertEqual(loaded.manifest_sha256, '')
-        self.assertIsNone(loaded.legacy_alias)
 
-    def test_ar3_layers_export_store_restart_and_reupload_keep_v2_identity(self):
-        self._layer_archive_roundtrip(3)
 
-    def test_ar4_provenance_export_store_restart_and_reupload_keep_v2_identity(self):
-        self._layer_archive_roundtrip(4)
 
-    def _layer_archive_roundtrip(self, version):
-        original = fine_bytes()
-        root_length = struct.unpack('<Q', original[8:16])[0]
-        root = json.loads(original[16:16 + root_length])
-        root['version'] = version
-        layer = dict(members=[0], normal=[0, 0, 1], plane_origin=[0.0625, 0.0625, 0.08],
-            samples=[dict(point=[0.04, 0.06, 0.08], source_sequence=5, source_timestamp_ns=11, point_index=0)])
-        if version == 4:
-            source = dict(kind='auxiliary', sensor_id='depth/front', clock_id='camera',
-                          runtime_generation=17, session_generation=3)
-            layer['samples'][0].update(source_sequence=0, source_timestamp_ns=9)
-            layer['sample_sources'] = [dict(source=source, sample_positions=[0])]
-            root['source_watermarks'] = [dict(source=source, source_timestamp_ns=900, source_sequence=0)]
-        raw = json.dumps(root, separators=(',', ':')).encode()
-        tail = json.dumps([[0, layer]], separators=(',', ':')).encode()
-        block = (b'NUWAXBL3' if version == 4 else b'NUWAXBL2') + struct.pack('<IIHQH', 1, len(tail), 0, 11, 1) + tail
-        payload = ('NUWAXAR%d' % version).encode() + struct.pack('<Q', len(raw)) + raw + struct.pack('<QI', 1, len(block)) + block
-        self.response.fine_map_artifact.size = len(payload)
-        stub = TransferStub(self.response)
-        stub.entries[self.response.fine_map_artifact.id][1] = bytearray(payload)
-        client = runtime(stub)
-        client._assigned_fine_archive_versions = frozenset([4])
-        bundle = client.export_mapping_backend_checkpoint()
-        self.assertEqual(bundle.checkpoint.fine_reference.identity_schema_version, 2)
-        self.assertEqual(bundle.checkpoint.fine_archive, payload)
-        bundle.publish_to(self.root)
-        reopened = provider.reopen_mapping_backend_checkpoint(self.root, 'voxel')
-        self.assertEqual(reopened.checkpoint.fine_archive, payload)
-        retained = reopened.checkpoint.fine_reference
-        if version == 4:
-            client._assigned_fine_archive_versions = frozenset([1, 2, 3])
-            before = len(stub.requests)
-            with self.assertRaisesRegex(RuntimeError, 'does not support assigned AR4'):
-                client._upload_graph_artifact(reopened.checkpoint,
-                    payload=reopened.checkpoint.fine_archive, reference=retained)
-            self.assertEqual(len(stub.requests), before)
-            client._assigned_fine_archive_versions = frozenset([4])
-        uploaded = client._upload_graph_artifact(reopened.checkpoint,
-            payload=reopened.checkpoint.fine_archive, reference=retained)
-        self.assertEqual(uploaded, self.response.fine_map_artifact)
-        self.assertEqual(client._download_graph_artifact(uploaded, provider.MAX_FINE_ARCHIVE_BYTES), payload)
 
     def test_explicit_backend_and_occupancy_members_reject_skew_and_conflicts(self):
         for field, role in (("backend_identity", 1), ("occupancy_identity", 2)):
@@ -253,7 +206,7 @@ class IdentityV2Tests(unittest.TestCase):
                 provider.reopen_mapping_backend_checkpoint(
                     self.root, 'voxel', expected_checkpoint_id=invalid,
                 )
-        with self.assertRaisesRegex(ValueError, 'requires schema 2'):
+        with self.assertRaises(ValueError):
             MappingBackendCheckpointStore(self.root).load(
                 'voxel', schema_version=1, expected_checkpoint_id='a' * 32,
             )
@@ -314,7 +267,6 @@ class IdentityV2Tests(unittest.TestCase):
         def export(**kwargs):
             calls.append(kwargs)
             return exported
-        instance._is_nuwax_mapping_active = lambda: True
         instance.get_mapping_session_context = lambda: dict(context)
         instance._runtime_state_lock = threading.RLock()
         instance._remote_provider = runtime(TransferStub(self.response))
@@ -384,7 +336,7 @@ class IdentityV2Tests(unittest.TestCase):
         finalized = repository.finalize_assigned_map_asset_bundle(
             candidate, staging_dir=stage, asset_identity=identity)
         reopened = MapAssetBundleRepository(str(self.root / 'assets')).get_map_asset_bundle(
-            'map', migrate_legacy=False, expected_asset_identity=identity)
+            'map', expected_asset_identity=identity)
         self.assertEqual(finalized.asset_identity, identity)
         self.assertEqual(reopened.asset_identity, identity)
         self.assertEqual(reopened.asset_state, 'finalized')
@@ -485,13 +437,12 @@ class IdentityV2Tests(unittest.TestCase):
     def test_corrupt_live_selector_preserves_uncertain_gc_set(self):
         self.bundle().publish_to(self.root)
         backend = self.root / 'mapping_backend/voxel'
-        (backend / 'checkpoint-v1.json').write_text('{bad')
+        (backend / 'checkpoint-v2.json').write_text('{bad')
         orphan = backend / 'objects' / ('id-' + 'f' * 32 + '-cloud.bin')
         orphan.write_bytes(b'orphan')
         result = MappingBackendCheckpointStore(self.root, orphan_grace_seconds=0).cleanup('voxel', schema_version=2)
         self.assertTrue(result.issues)
         self.assertTrue(orphan.exists())
-        MappingBackendCheckpointStore(self.root).load('voxel', schema_version=2)
 
     def test_single_freeze_per_large_reopened_member(self):
         self.bundle().publish_to(self.root)
@@ -506,53 +457,9 @@ class IdentityV2Tests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         self.assertTrue(any(loaded.checkpoint.fine_archive is item for item in calls))
 
-    def install_legacy(self):
-        occupancy_receipt = provider._occupancy_receipt_dict(self.response.occupancy_receipt)
-        cloud_receipt = provider._cloud_receipt_dict(self.response.cloud_receipt)
-        canonical = self.bundle()
-        occupancy = dict(canonical.occupancy_asset, raw_data_sha256=b'O' * 32)
-        cloud = dict(canonical.cloud_asset, xyz_sha256=b'C' * 32, payload_schema_version=1)
-        backend = self.root / 'mapping_backend/voxel'
-        (backend / 'objects').mkdir(parents=True, exist_ok=True, mode=0o700)
-        (backend / 'manifests').mkdir(exist_ok=True, mode=0o700)
-        backend.chmod(0o700)
-        backend.parent.chmod(0o700)
-        aliases = {'payload': '55' * 32, 'fine_archive': '66' * 32, 'dense_archive': '77' * 32}
-        payloads = {'payload': bytes(self.response.payload), 'fine_archive': fine_bytes(legacy=True), 'dense_archive': dense_bytes()}
-        references = {}
-        for role, alias in aliases.items():
-            relative = 'objects/sha256-' + alias + '.bin'
-            (backend / relative).write_bytes(payloads[role])
-            references[role] = dict(sha256=alias, path=relative, size=len(payloads[role]))
-        document = dict(schema_version=1, backend_kind='voxel', source_session_id='source', source_session_generation=3,
-            created_at_ns=12, canonical_receipts=dict(occupancy=store_module._receipt_document(occupancy_receipt),
-                cloud=store_module._receipt_document(cloud_receipt)),
-            canonical_assets=dict(occupancy=asset_document(occupancy, sha256_field='raw_data_sha256'),
-                cloud=asset_document(cloud, sha256_field='xyz_sha256')), **references)
-        manifest_alias = '88' * 32
-        manifest_relative = 'manifests/sha256-' + manifest_alias + '.json'
-        (backend / manifest_relative).write_bytes(store_module._encode_json(document))
-        selector = dict(schema_version=1, backend_kind='voxel', manifest=dict(sha256=manifest_alias, path=manifest_relative))
-        (backend / 'checkpoint-v1.json').write_bytes(store_module._encode_json(selector))
-        for path in backend.rglob('*'):
-            if path.is_file():
-                path.chmod(0o600)
-        return backend, document
 
-    def test_legacy_read_preserves_literal_aliases_and_missing_canonical_bytes(self):
-        backend, document = self.install_legacy()
-        loaded = MappingBackendCheckpointStore(self.root).load('voxel', schema_version=1)
-        self.assertEqual(loaded.legacy_alias, '88' * 32)
-        self.assertIsNone(loaded.identity)
-        self.assertEqual(loaded.checkpoint.content_sha256, bytes.fromhex('55' * 32))
-        self.assertIsNone(loaded.checkpoint.canonical_occupancy_data)
-        self.assertIsNone(loaded.checkpoint.canonical_cloud_xyz)
-        self.assertEqual(loaded.checkpoint.fine_archive, fine_bytes(legacy=True))
-        self.assertEqual(set(loaded.member_paths), {'backend_state', 'fine_map', 'dense_cloud'})
-        self.assertNotIn('manifest_sha256', document)
 
-    def test_gc_keeps_union_of_v1_v2_paths_without_payload_reads(self):
-        self.install_legacy()
+    def test_gc_keeps_selected_v2_paths_without_payload_reads(self):
         self.bundle().publish_to(self.root)
         backend = self.root / 'mapping_backend/voxel'
         live = set((backend / 'objects').iterdir()) | set((backend / 'manifests').iterdir())
@@ -569,7 +476,6 @@ class IdentityV2Tests(unittest.TestCase):
         self.assertFalse(result.issues)
         self.assertFalse(orphan.exists())
         self.assertTrue(all(path.exists() for path in live))
-        MappingBackendCheckpointStore(self.root).load('voxel', schema_version=1)
         MappingBackendCheckpointStore(self.root).load('voxel', schema_version=2)
 
     def test_fine_and_dense_same_id_changed_bytes_fail(self):

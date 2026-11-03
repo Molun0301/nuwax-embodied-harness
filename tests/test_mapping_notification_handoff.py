@@ -34,6 +34,24 @@ class MappingNotificationTests(unittest.TestCase):
         self.threads, self.releases, self.errors = [], [], []
         self.addCleanup(self.cleanup)
 
+    def test_snapshot_fields_are_derived_from_the_grid_commit_receipt(self):
+        from tests.test_map_receipt_stream_v2 import provider, update
+        from services.mapping.service import _receipt_source_epoch
+        payload = provider()._map_update_to_payload(update(7))
+        identity = payload['metadata']['content_identity']
+        metadata = {**payload['metadata'], 'mapping_session_id': 'stale',
+            'session_generation': 99, 'update_sequence': 200, 'content_revision': 200,
+            'occupancy_content_revision': 200, 'map_provenance': {}, 'source_epoch': 'stale'}
+        snapshot = self.mapping.ingest_external_snapshot(map_name=payload['map_name'], source_name='receipt',
+            source_epoch='stale', occupancy_grid=payload['occupancy_grid'], metadata=metadata,
+            update_sequence_override=200)
+        self.assertEqual(snapshot.update_sequence, 7)
+        self.assertEqual(snapshot.source_epoch, _receipt_source_epoch(identity))
+        self.assertEqual(snapshot.metadata['mapping_session_id'], 'source')
+        self.assertEqual(snapshot.metadata['session_generation'], 3)
+        self.assertEqual(snapshot.metadata['content_revision'], 7)
+        self.assertEqual(snapshot.metadata['map_provenance'], identity['provenance'])
+
     def cleanup(self):
         for event in self.releases:
             event.set()

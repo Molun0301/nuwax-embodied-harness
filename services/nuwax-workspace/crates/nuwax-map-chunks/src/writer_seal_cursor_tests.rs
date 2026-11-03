@@ -46,7 +46,6 @@ impl Pair {
         let b = &self.oracle;
         assert_eq!(a.blocks, b.blocks);
         assert_eq!(a.published, b.published);
-        assert_eq!(a.legacy_baseline, b.legacy_baseline);
         assert_eq!(a.touched, b.touched);
         assert_eq!(a.membership_touched, b.membership_touched);
         let dirty = |w: &Writer| w.dirty.iter().map(|(key, d)|
@@ -125,8 +124,7 @@ impl Writer {
         validate_header(&domain, revision, timestamp_ns, self.voxel_size_m, self.block_count())?;
         if self.max_observed_ns > timestamp_ns { return Err("root bound precedes observed evidence".into()); }
         let same_domain = self.published.as_ref().is_some_and(|r| r.domain == domain);
-        if self.published.as_ref().is_some_and(|r| r.domain == domain && revision <= r.revision)
-            || self.legacy_baseline.as_ref().is_some_and(|(d, r)| *d == domain && revision <= *r) {
+        if self.published.as_ref().is_some_and(|r| r.domain == domain && revision <= r.revision) {
             return Err("publication revision did not advance".into());
         }
         self.flush()?;
@@ -140,7 +138,7 @@ impl Writer {
                     (Some(a), Some(b)) if a.object == b.object => {},
                     (Some(a), Some(b)) => {
                         let a = self.reader.block(a)?; let b = self.reader.block(b)?;
-                        if a.keys().ne(b.keys()) || !layer_geometry_eq(&*self.reader.layers(previous.unwrap())?, &*self.reader.layers(&self.blocks[key])?) { changed_members.insert(*key); }
+                        if a.keys().ne(b.keys()) || !self.reader.ground_records(previous.unwrap())?.geometry_eq(&self.reader.ground_records(&self.blocks[key])?) { changed_members.insert(*key); }
                     }
                     _ => { changed_members.insert(*key); }
                 }
@@ -166,7 +164,7 @@ impl Writer {
             source_watermarks: self.source_watermarks.iter().map(|(source, &(source_timestamp_ns, source_sequence))|
                 SourceWatermark { source: source.clone(), source_timestamp_ns, source_sequence }).collect() });
         root.validate()?;
-        self.blocks = blocks; self.published = Some(root.clone()); self.legacy_baseline = None;
+        self.blocks = blocks; self.published = Some(root.clone());
         self.touched.clear(); self.membership_touched.clear(); self.source_watermarks_changed = false;
         Ok(SealedMap { root, repository: self.repository.clone() })
     }
@@ -180,7 +178,7 @@ fn typed_source() -> Arc<LayerSource> {
 fn layers(timestamp: u64, height: f64) -> LayerObservations {
     [(0, LayerObservation {
         members: vec![0], plane_origin: [0.0, 0.0, height], normal: [0.0, 0.0, 1.0],
-        samples: vec![LayerSample { source: Arc::new(LayerSource::Legacy), point: [0.0, 0.0, 0.0],
+        samples: vec![LayerSample { source: Arc::new(LayerSource::Lidar { backend: 1, runtime_generation: 1, sensor_frame_id: "test".into() }), point: [0.0, 0.0, 0.0],
             source_sequence: timestamp, source_timestamp_ns: timestamp, point_index: 0 }],
     })].into()
 }
@@ -306,46 +304,9 @@ fn seal_cursor_same_count_key_swap_and_sparse_inheritance_keep_fallback_results(
     assert_eq!(geometry(&no_inheritance), vec![2; 2]); // Same-domain, nonempty directory, L=0.
 }
 
-#[test]
-fn seal_cursor_layer_evidence_and_geometry_have_distinct_revision_results() {
-    let mut pair = Pair::new(BUDGET * 2);
-    pair.edit(|w| w.observe([[0, 0, 0], [32, 0, 0]], 1)).unwrap();
-    pair.edit(|w| w.replace_layer_observations([0, 0, 0], layers(1, 0.0))).unwrap();
-    let baseline = pair.seal(domain(), 1, 1).unwrap();
-    pair.edit(|w| w.observe([[0, 0, 0]], 2)).unwrap();
-    pair.edit(|w| w.replace_layer_observations([0, 0, 0], layers(2, 0.0))).unwrap();
-    let evidence = pair.seal(domain(), 2, 2).unwrap();
-    assert_eq!(geometry(&evidence), geometry(&baseline));
-    assert_eq!(evidence.geometry_revision, 1);
-    pair.edit(|w| w.replace_layer_observations([0, 0, 0], layers(2, 0.01))).unwrap();
-    let changed = pair.seal(domain(), 3, 2).unwrap();
-    assert_eq!(geometry(&changed), vec![3, 1]);
-    assert_eq!(changed.geometry_revision, 3);
-}
 
-#[test]
-fn seal_cursor_restore_domain_and_legacy_keep_original_revision_contract() {
-    let mut pair = Pair::new(BUDGET * 2);
-    pair.edit(|w| w.observe([[0, 0, 0], [32, 0, 0]], 1)).unwrap();
-    let root = pair.seal(domain(), 3, 1).unwrap();
-    pair.edit(|w| w.restore(&root)).unwrap(); // Reuse the same Writer, preserving the ID source sequence.
-    assert_eq!(pair.seal(domain(), 4, 1).unwrap().blocks, root.blocks);
-    let mut next_domain = domain(); next_domain.generation += 1;
-    let moved = pair.seal(next_domain, 1, 1).unwrap();
-    assert_eq!(geometry(&moved), vec![1; 2]);
-    assert_eq!(moved.blocks.iter().map(|b| b.object).collect::<Vec<_>>(), root.blocks.iter().map(|b| b.object).collect::<Vec<_>>());
-    let mut legacy = Pair::new(BUDGET);
-    let alias = LegacyAlias([17; 32]);
-    let bytes = encode_block(&[(0, Evidence { observed_ns: 1, hits: 1 })].into()).unwrap();
-    legacy.edit(|w| w.repository.put_object(ObjectIdentity::Legacy(alias), &bytes)).unwrap();
-    let root = LegacyManifest { version: 1, domain: domain(), revision: 9, source_timestamp_ns: 1,
-        voxel_size_m: 0.125, blocks: vec![LegacyBlockRef { key: [0, 0, 0], sha256: alias, geometry_sha256: LegacyAlias([18; 32]), points: 1 }] };
-    legacy.edit(|w| w.restore_legacy(&root)).unwrap();
-    assert!(legacy.actual.published.is_none());
-    let current = legacy.seal(domain(), 10, 1).unwrap();
-    assert_eq!(geometry(&current), vec![10]);
-    assert_eq!(legacy.seal(domain(), 11, 1).unwrap().blocks, current.blocks);
-}
+
+
 
 #[test]
 fn seal_cursor_failed_install_rehome_and_retry_preserve_frozen_ids() {
@@ -407,7 +368,6 @@ fn seal_cursor_error_precedence_and_final_validation_keep_original_state() {
 fn object_file(repository: &Repository, object: ObjectIdentity) -> std::path::PathBuf {
     let name = match object {
         ObjectIdentity::Assigned(id) => format!("id-{}", id.0.iter().map(|b| format!("{b:02x}")).collect::<String>()),
-        ObjectIdentity::Legacy(alias) => alias.0.iter().map(|b| format!("{b:02x}")).collect::<String>(),
     };
     repository.path().join(name)
 }

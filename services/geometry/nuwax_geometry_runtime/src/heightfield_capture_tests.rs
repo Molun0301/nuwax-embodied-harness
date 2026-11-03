@@ -106,7 +106,6 @@ fn expected(points: &[[f64; 3]], xy: Xy) -> HeightfieldColumn {
 }
 fn one(w: &mut Writer, xy: Xy) -> HeightfieldColumn {
     let c = w.ground_column(xy).unwrap();
-    assert!(c.legacy.is_empty());
     assert_eq!(c.heightfields.len(), 1);
     c.heightfields.into_iter().next().unwrap().column
 }
@@ -314,73 +313,7 @@ fn heightfield_capture_temporal_mass_missing_and_actual_deletion_are_distinct() 
         vec![0]
     );
 }
-#[test]
-fn heightfield_capture_cross_block_mass_phase_and_legacy_migration_are_explicit() {
-    for offset in [0.0, 0.002] {
-        let points = vec![[0.025, 0.025, 0.001 + offset]; 90]
-            .into_iter()
-            .chain(vec![[0.025, 0.025, 0.049 + offset]; 10])
-            .collect::<Vec<_>>();
-        let mut w = writer();
-        ingest(&mut w, &points, 20, |_| false);
-        assert_eq!(one(&mut w, [0, 0]), expected(&points, [0, 0]));
-    }
-    for xy_shift in [0., 32. * f64::from(Q)] {
-        let mut points = field(|_, _| vec![1.59, 1.61]);
-        for p in &mut points {
-            p[0] += xy_shift;
-            p[1] += xy_shift;
-        }
-        let mut w = writer();
-        assert_eq!(ingest(&mut w, &points, 20, |_| false).len(), points.len());
-        let xy = if xy_shift == 0. { [0, 0] } else { [32, 32] };
-        assert_eq!(one(&mut w, xy), expected(&points, xy));
-    }
-    let mut w = writer();
-    let original = field(|_, _| vec![0.01]);
-    w.observe(keyed(&original, |_| false).iter().map(|p| p.key), 19)
-        .unwrap();
-    let mut blocks: BTreeMap<Key, BTreeMap<u16, LayerObservation>> = BTreeMap::new();
-    for p in keyed(&original, |_| false) {
-        let local = nuwax_map_chunks::local_key(p.key);
-        blocks
-            .entry(nuwax_map_chunks::block_key(p.key))
-            .or_default()
-            .insert(
-                local,
-                LayerObservation {
-                    members: vec![local],
-                    plane_origin: p.point,
-                    normal: [0., 0., 1.],
-                    samples: vec![LayerSample {
-                        source: Arc::new(LayerSource::Legacy),
-                        point: p.point,
-                        source_sequence: 19,
-                        source_timestamp_ns: 19,
-                        point_index: p.index,
-                    }],
-                },
-            );
-    }
-    for (b, v) in blocks {
-        w.replace_layer_observations(b, v).unwrap();
-    }
-    ingest(&mut w, &original, 20, |_| false);
-    assert_eq!(one(&mut w, [0, 0]), expected(&original, [0, 0]));
-    let root = w
-        .snapshot(
-            Domain {
-                session: "capture-fixed".into(),
-                generation: 1,
-                frame_generation: 1,
-                producer_generation: 1,
-            },
-            1,
-            20,
-        )
-        .unwrap();
-    assert_eq!(root.version, 5);
-}
+
 
 #[test]
 fn heightfield_capture_only_middle_frame_preserves_independent_old_distributions() {
@@ -408,59 +341,4 @@ fn heightfield_capture_only_middle_frame_preserves_independent_old_distributions
     eprintln!(
         "H3 only_middle=.18 old=.01/.36 indices=0 old_distributions_exact=true occupancy=0,3,7"
     );
-}
-
-#[test]
-fn heightfield_capture_claim_only_withdrawal_keeps_original_legacy_diagnostics() {
-    let mut w = writer();
-    w.observe([[0, 0, 0]], 10).unwrap();
-    w.observe([[0, 0, 1]], 20).unwrap();
-    let source = Arc::new(LayerSource::Auxiliary {
-        sensor_id: "legacy-claim".into(),
-        clock_id: "original".into(),
-        runtime_generation: 1,
-        session_generation: 1,
-    });
-    let sample = LayerSample {
-        source,
-        point: [0.025, 0.025, 0.06],
-        source_sequence: 0,
-        source_timestamp_ns: 20,
-        point_index: 4,
-    };
-    let legacy = LayerObservation {
-        members: vec![0, 1024],
-        plane_origin: [0.025, 0.025, 0.06],
-        normal: [0., 0., 1.],
-        samples: vec![sample.clone()],
-    };
-    w.replace_layer_observations([0, 0, 0], [(0, legacy)].into())
-        .unwrap();
-    // This current voxel has actual dynamic counter-evidence. Only its ground
-    // claim is withdrawn; the original sample and real occupied voxel remain.
-    assert!(ingest(&mut w, &[[0.025, 0.025, 0.06]], 21, |_| true).is_empty());
-    let column = w.ground_column([0, 0]).unwrap();
-    assert!(column.heightfields.is_empty());
-    assert_eq!(column.legacy.len(), 1);
-    assert_eq!(column.legacy[0].1.members, vec![0]);
-    assert_eq!(column.legacy[0].1.samples, vec![sample]);
-    assert_eq!(w.region([0, 0, 0], [0, 0, 1], 4).unwrap().len(), 2);
-    let root = w
-        .snapshot(
-            Domain {
-                session: "claim-history".into(),
-                generation: 1,
-                frame_generation: 0,
-                producer_generation: 1,
-            },
-            1,
-            21,
-        )
-        .unwrap();
-    assert_eq!(root.version, 5);
-    let bytes = w
-        .repository()
-        .read_object(root.blocks[0].object, nuwax_map_chunks::MAX_BLOCK_BYTES)
-        .unwrap();
-    assert!(bytes.starts_with(b"NUWAXBL6"));
 }

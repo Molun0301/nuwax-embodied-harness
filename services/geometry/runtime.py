@@ -3113,8 +3113,8 @@ class PlatformGeometryRuntime:
     ) -> MapAssetBundle:
         """Install the exported canonical occupancy into the candidate bundle."""
 
-        if map_bundle.identity_schema_version != 1 or map_bundle.manifest_sha256 is not None:
-            raise TypeError("assigned checkpoint preparation requires an unsealed legacy draft")
+        if map_bundle.identity_schema_version != 1:
+            raise TypeError("assigned checkpoint preparation requires an unsealed draft")
         descriptor = checkpoint_bundle.occupancy_asset
         meta = SimpleNamespace(
             width=descriptor["width"], height=descriptor["height"],
@@ -3285,16 +3285,12 @@ class PlatformGeometryRuntime:
         resolved_bundle_root = self._require_bundle_root(bundle_root)
         assigned_export = export_backend_checkpoint
         if assigned_export and (
-                bundle.identity_schema_version != 1 or bundle.manifest_sha256 is not None):
-            raise TypeError("assigned checkpoint preparation requires an unsealed legacy draft")
+                bundle.identity_schema_version != 1):
+            raise TypeError("assigned checkpoint preparation requires an unsealed draft")
         if export_backend_checkpoint:
             if skip_pcd_export:
                 raise RuntimeError(
                     "finalized 地图资产包不能跳过 PCD 或 backend checkpoint 导出"
-                )
-            if not self._is_nuwax_mapping_active():
-                raise RuntimeError(
-                    "finalized 地图资产包要求匹配的 ACTIVE nuwax mapping 会话"
                 )
 
         checkpoint_bundle = None
@@ -3688,34 +3684,7 @@ class PlatformGeometryRuntime:
             raise RuntimeError("assigned activation runtime provider ownership changed")
         prepared._provider.require_assigned_activation_origin(prepared._provider_origin)
 
-    def capture_assigned_fine_import_origin(self):
-        """Use the existing connected provider's status capability, without RPC."""
-        with self._runtime_state_lock:
-            provider = self._remote_provider
-            if provider is None or self._provider_attach_stopping:
-                return None
-            try:
-                origin = provider.capture_assigned_activation_origin()
-            except RuntimeError:
-                return None
-            if not provider.supports_assigned_fine_archive_version(1, expected_origin=origin):
-                return None
-            return provider, self._provider_attach_epoch, origin
 
-    @contextmanager
-    def assigned_fine_import_origin_guard(self, captured):
-        """Fence the small catalog commit; never hold across archive I/O or callbacks."""
-        provider, attach_epoch, origin = captured
-        with self._runtime_state_lock:
-            if (self._remote_provider is not provider
-                    or self._provider_attach_epoch != attach_epoch
-                    or self._provider_attach_stopping):
-                raise RuntimeError("assigned fine import provider ownership changed")
-            if not provider.supports_assigned_fine_archive_version(1, expected_origin=origin):
-                raise RuntimeError("runtime does not support assigned AR1 source archives")
-            # Capability is immutable within this origin; reacquiring verifies its epoch.
-            with provider.assigned_activation_origin_guard(origin):
-                yield
 
     def prepare_assigned_map_activation(
         self, bundle: MapAssetBundle, *, bundle_root: Path,
@@ -3736,7 +3705,7 @@ class PlatformGeometryRuntime:
 
     def _prepare_assigned_map_activation(self, bundle, *, bundle_root, stored=None):
         if (not isinstance(bundle, MapAssetBundle) or bundle.identity_schema_version != 2
-                or bundle.asset_state != "finalized" or bundle.manifest_sha256 is not None
+                or bundle.asset_state != "finalized"
                 or not isinstance(bundle.asset_identity, AssetIdentityV2)):
             raise ValueError("assigned activation requires a finalized schema-2 bundle")
         geometry = bundle.geometry_asset
@@ -3763,8 +3732,6 @@ class PlatformGeometryRuntime:
                 or stored.checkpoint.checkpoint_id != checkpoint_metadata.get("checkpoint_id")
                 or stored.checkpoint.backend_kind != checkpoint_metadata["backend_kind"]):
             raise ValueError("assigned checkpoint differs from finalized bundle ownership")
-        if stored.checkpoint.fine_archive is not None and stored.checkpoint.fine_archive[:8] == b"NUWAXAR1":
-            provider.require_assigned_fine_archive_support(stored.checkpoint, expected_origin=origin)
         planar_default_seed = None
         if stored.checkpoint.backend_kind == "slam_toolbox":
             payload = stored.checkpoint.payload
@@ -3887,8 +3854,7 @@ class PlatformGeometryRuntime:
         source = document["target"][source_key]
         # Detached small views retain the sealed tuple/packed payload owners.
         snapshot = prepared.bundle.snapshot
-        metadata = {**_checkpoint_snapshot_metadata(snapshot.metadata,
-                    source["occupancy_receipt"], source["cloud_receipt"]), "identity_schema_version": 2,
+        metadata = {**dict(snapshot.metadata), "identity_schema_version": 2,
                     "asset_identity": request["asset_identity"],
                     "activation_receipt_v2": document,
                     "source_occupancy_receipt": source["occupancy_receipt"],
@@ -4502,12 +4468,6 @@ class PlatformGeometryRuntime:
             activation_result=activation_result,
         )
         snapshot_metadata = dict(bundle.snapshot.metadata)
-        if bundle.identity_schema_version == 2:
-            document = activation_result["activation_receipt_v2"].to_dict()
-            source_key = "source_graph_member" if document["activation"]["backend_kind"] == "slam_toolbox" else "source_cloud_member"
-            source = document["target"][source_key]
-            snapshot_metadata = _checkpoint_snapshot_metadata(snapshot_metadata,
-                source["occupancy_receipt"], source["cloud_receipt"])
         snapshot = MapSnapshot(
             map_name=bundle.snapshot.map_name,
             source_name=bundle.snapshot.source_name,
@@ -5657,20 +5617,6 @@ class PlatformGeometryRuntime:
     # Phase 3: nuwax_mapping 资产写入相关 helper
     # ========================================================================
 
-    def _is_nuwax_mapping_active(self) -> bool:
-        """Phase 3: 检查 nuwax_mapping backend 是否就绪。
-
-        返回 True 当且仅当:
-        - `GeometryRuntimeProvider` 已连接为 remote provider
-        - 远程 runtime HealthCheck 返回 healthy=True
-        - remote 端 mapping_ready_poll() 返回 True(详见 feedback_phase3.md)
-
-        返回 False 时，`prepare_map_asset_bundle` 走通用导出路径。
-        """
-        provider = self._remote_provider
-        if provider is None:
-            return False
-        return bool(provider.is_mapping_ready())
 
     def _mapping_lcm_backend_name(self) -> str:
         """Phase 3: 取 LCM backend canonical 名(给 nuwax_mapping asset metadata)。"""

@@ -49,28 +49,20 @@ def read_planar_structure(payload, *, checkpoint_id=None, session_id=None, gener
 
 def _read_planar_structure(payload, *, checkpoint_id=None, session_id=None, generation=None,
                            timestamp_ns=None, occupancy=None, cells=None, validate_grid=True):
-    """Parse once, inspect bounded grid, and optionally bind canonical provenance.
-
-    Legacy member aliases are parsed only. No graph body is scanned or copied.
-    The caller retains the immutable bytes/FrozenPayload owner.
-    """
-    if not 12 <= len(payload) <= MAX_ARCHIVE or payload[:8] not in (b'NWS2D001', b'NWS2D002'):
+    """读取有界栅格结构并按需核对来源；调用方持有不可变载荷。"""
+    if not 12 <= len(payload) <= MAX_ARCHIVE or payload[:8] != b'NWS2D002':
         raise ValueError("unsupported planar archive")
-    version = 2 if payload[:8] == b'NWS2D002' else 1
+    version = 2
     header_size, = struct.unpack('<I', payload[8:12])
     if not 1 <= header_size <= MAX_HEADER or 12 + header_size > len(payload):
         raise ValueError("planar archive header budget exceeded")
     header = json.loads(payload[12:12 + header_size].decode('utf-8'), object_pairs_hook=_pairs,
                         parse_constant=lambda value: (_ for _ in ()).throw(ValueError('nonfinite JSON')))
-    assigned_id = None
-    if version == 2:
-        _fields(header, 'checkpoint_id source')
-        assigned_id = header['checkpoint_id']
-        if not isinstance(assigned_id, str) or re.fullmatch('[0-9a-f]{32}', assigned_id) is None or assigned_id == '0' * 32:
-            raise ValueError("invalid assigned planar ID")
-        source = header['source']
-    else:
-        source = header
+    _fields(header, 'checkpoint_id source')
+    assigned_id = header['checkpoint_id']
+    if not isinstance(assigned_id, str) or re.fullmatch('[0-9a-f]{32}', assigned_id) is None or assigned_id == '0' * 32:
+        raise ValueError("invalid assigned planar ID")
+    source = header['source']
     if checkpoint_id is not None and assigned_id != checkpoint_id:
         raise ValueError("planar checkpoint identity mismatch")
     _fields(source, 'version session estimate source_unix_timestamp_ns width height resolution origin members')
@@ -125,16 +117,10 @@ def _read_planar_structure(payload, *, checkpoint_id=None, session_id=None, gene
     grid_offset = None
     for index, name in enumerate(('graph.posegraph', 'graph.data', 'grid.i8')):
         member = members[index]
-        _fields(member, 'name size' if version == 2 else 'name size sha256')
+        _fields(member, 'name size')
         if member['name'] != name:
             raise ValueError("invalid planar member role")
         _integer(member['size'], MAX_GRID if index == 2 else MAX_MEMBER, 1)
-        if version == 1:
-            alias = member['sha256']
-            if not isinstance(alias, list) or len(alias) != 32 or not any(alias):
-                raise ValueError("invalid legacy member alias")
-            for value in alias:
-                _integer(value, 255)
         if index == 2:
             grid_offset = offset
         offset += member['size']
@@ -160,32 +146,3 @@ def _read_planar_structure(payload, *, checkpoint_id=None, session_id=None, gene
         if cells is not None and block != cells[position - grid_offset:position - grid_offset + len(block)]:
             raise ValueError("planar canonical grid differs from archive")
     return header
-
-
-def assign_legacy_planar_archive(payload, checkpoint_id):
-    """Reseal an old immutable archive using its caller-owned assigned candidate ID.
-
-    Preserve the old owner. Parse historical aliases without executing them;
-    copy each member once and validate grid classes during that same copy.
-    This helper does not allocate IDs, persist assets, or publish selectors.
-    """
-    if not isinstance(payload, (bytes, FrozenPayload)) or payload[:8] != b"NWS2D001":
-        raise ValueError("legacy planar resealing requires NWS2D001")
-    if not isinstance(checkpoint_id, str) or re.fullmatch('[0-9a-f]{32}', checkpoint_id) is None or checkpoint_id == '0' * 32:
-        raise ValueError("invalid assigned planar ID")
-    source, start, grid_offset = _read_planar_structure(payload, validate_grid=False)
-    source = dict(source, version=2, members=[{'name': member['name'], 'size': member['size']} for member in source['members']])
-    header = json.dumps({'checkpoint_id': checkpoint_id, 'source': source},
-        separators=(',', ':'), ensure_ascii=False, allow_nan=False).encode('utf-8')
-    if not 1 <= len(header) <= MAX_HEADER:
-        raise ValueError("assigned planar header exceeds budget")
-    def chunks():
-        yield b'NWS2D002' + struct.pack('<I', len(header)) + header
-        for position in range(start, len(payload), 1024 * 1024):
-            block = payload[position:min(position + 1024 * 1024, len(payload))]
-            if position + len(block) > grid_offset:
-                grid = block[max(0, grid_offset - position):]
-                if any(value not in (0, 100, 255) for value in grid):
-                    raise ValueError("planar grid has invalid cell class")
-            yield block
-    return FrozenPayload(chunks(), maximum_bytes=MAX_ARCHIVE)

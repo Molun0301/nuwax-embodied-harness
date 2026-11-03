@@ -262,7 +262,6 @@ class AssignedExplorationCycleTests(unittest.TestCase):
             saved = self.pause()
             source = json.loads(saved.geometry_progress_json)
             self.assertEqual(saved.schema_version, 2)
-            self.assertIsNone(saved.asset_manifest_sha256)
             self.assertIsNone(saved.localization_seed)
             self.assertNotIn("motion_admission", saved.request.metadata)
             self.assertIsNone(saved.request.resume_progress_json)

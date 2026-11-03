@@ -8,7 +8,6 @@ use std::{
     path::Path,
 };
 
-pub const MAGIC: &[u8; 8] = b"NWS2D001";
 pub const ASSIGNED_MAGIC: &[u8; 8] = b"NWS2D002";
 pub const MAX_HEADER: usize = 64 * 1024;
 pub const MAX_MEMBER: u64 = 512 * 1024 * 1024;
@@ -18,14 +17,7 @@ pub const CHUNK_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct Member {
-    pub name: String,
-    pub size: u64,
-    pub sha256: [u8; 32],
-}
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct Metadata<M = Member> {
+pub struct Metadata<M = AssignedMember> {
     pub version: u32,
     pub session: Session,
     pub estimate: Estimate,
@@ -92,12 +84,7 @@ pub trait MemberLayout {
     fn size(&self) -> u64;
     fn identity_valid(&self) -> bool;
 }
-impl MemberLayout for Member {
-    const VERSION: u32 = 1;
-    fn name(&self) -> &str { &self.name }
-    fn size(&self) -> u64 { self.size }
-    fn identity_valid(&self) -> bool { self.sha256 != [0; 32] }
-}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AssignedMember {
@@ -139,37 +126,34 @@ pub struct AssignedArtifact {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum ArchiveMetadata {
-    Legacy(Metadata),
     Assigned(AssignedMetadata),
 }
 impl ArchiveMetadata {
     pub fn identity(&self) -> ArtifactIdentity {
         match self {
-            Self::Legacy(_) => ArtifactIdentity::Legacy,
             Self::Assigned(m) => ArtifactIdentity::Assigned { checkpoint_id: m.checkpoint_id.clone() },
         }
     }
     pub fn compatible_with(&self, session: &Session) -> Result<(), String> {
-        match self { Self::Legacy(m) => m.compatible_with(session), Self::Assigned(m) => m.source.compatible_with(session) }
+        match self { Self::Assigned(m) => m.source.compatible_with(session) }
     }
     pub fn estimate(&self) -> &Estimate {
-        match self { Self::Legacy(m) => &m.estimate, Self::Assigned(m) => &m.source.estimate }
+        match self { Self::Assigned(m) => &m.source.estimate }
     }
     pub fn source_unix_timestamp_ns(&self) -> u64 {
-        match self { Self::Legacy(m) => m.source_unix_timestamp_ns, Self::Assigned(m) => m.source.source_unix_timestamp_ns }
+        match self { Self::Assigned(m) => m.source.source_unix_timestamp_ns }
     }
     pub fn dimensions(&self) -> (u32, u32) {
-        match self { Self::Legacy(m) => (m.width, m.height), Self::Assigned(m) => (m.source.width, m.source.height) }
+        match self { Self::Assigned(m) => (m.source.width, m.source.height) }
     }
     pub fn resolution(&self) -> f64 {
-        match self { Self::Legacy(m) => m.resolution, Self::Assigned(m) => m.source.resolution }
+        match self { Self::Assigned(m) => m.source.resolution }
     }
     pub fn origin(&self) -> [f64; 2] {
-        match self { Self::Legacy(m) => m.origin, Self::Assigned(m) => m.source.origin }
+        match self { Self::Assigned(m) => m.source.origin }
     }
     fn sizes(&self) -> [u64; 3] {
         match self {
-            Self::Legacy(m) => m.members.each_ref().map(|m| m.size),
             Self::Assigned(m) => m.source.members.each_ref().map(|m| m.size),
         }
     }
@@ -193,7 +177,7 @@ pub fn read_structure(file: &mut (impl Read + Seek)) -> Result<(ArchiveMetadata,
     let mut prefix = [0; 12];
     file.read_exact(&mut prefix).map_err(|e| e.to_string())?;
     let magic = &prefix[..8];
-    if magic != MAGIC && magic != ASSIGNED_MAGIC {
+    if magic != ASSIGNED_MAGIC {
         return Err("不是受支持的二维完整图档案".into());
     }
     let size = u32::from_le_bytes(prefix[8..].try_into().unwrap()) as usize;
@@ -202,15 +186,9 @@ pub fn read_structure(file: &mut (impl Read + Seek)) -> Result<(ArchiveMetadata,
     }
     let mut bytes = vec![0; size];
     file.read_exact(&mut bytes).map_err(|e| e.to_string())?;
-    let metadata = if magic == MAGIC {
-        let m: Metadata = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        m.validate()?;
-        ArchiveMetadata::Legacy(m)
-    } else {
-        let m: AssignedMetadata = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        m.validate()?;
-        ArchiveMetadata::Assigned(m)
-    };
+    let m: AssignedMetadata = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    m.validate()?;
+    let metadata = ArchiveMetadata::Assigned(m);
     let start = 12 + size as u64;
     let expected = start + metadata.sizes().iter().sum::<u64>();
     if expected > MAX_ARCHIVE || length != expected {
@@ -227,12 +205,7 @@ pub fn read_bound_structure(file: &mut (impl Read + Seek), payload_size: u64,
     }
     Ok((metadata, start))
 }
-pub fn read_header(file: &mut File) -> Result<(Metadata, u64), String> {
-    match read_structure(file)? {
-        (ArchiveMetadata::Legacy(m), start) => Ok((m, start)),
-        _ => Err("旧二维图读取入口不支持编号档案".into()),
-    }
-}
+
 fn read_grid(file: &mut (impl Read + Seek), start: u64, sizes: [u64; 3]) -> Result<Vec<u8>, String> {
     file.seek(SeekFrom::Start(start + sizes[0] + sizes[1])).map_err(|e| e.to_string())?;
     let mut data = vec![0; sizes[2] as usize];

@@ -117,7 +117,7 @@ fn scene_with_native_columns(columns:impl Fn(i32,i32)->Vec<HeightfieldColumn>,
             writer.observe([[x,y,z]],20).unwrap();
             points.push(((x as f32+0.5)*Q,(y as f32+0.5)*Q,(z as f32+0.5)*Q));
             writer.replace_ground_column([x,y],&ColumnGroundRecords {
-                classified_empty:true,legacy:vec![],heightfields:vec![]}).unwrap();
+                classified_empty:true,heightfields:vec![]}).unwrap();
             continue;
         }
         let columns=columns(x,y);
@@ -125,7 +125,7 @@ fn scene_with_native_columns(columns:impl Fn(i32,i32)->Vec<HeightfieldColumn>,
             writer.observe([[x,y,z]],20).unwrap();
             points.push(((x as f32+0.5)*Q,(y as f32+0.5)*Q,(z as f32+0.5)*Q));
         }
-        let record=ColumnGroundRecords {classified_empty: false, legacy:vec![],heightfields:columns.into_iter().map(|column|
+        let record=ColumnGroundRecords {classified_empty: false, heightfields:columns.into_iter().map(|column|
             HeightfieldSurface {column,samples:vec![]}).collect()};
         writer.replace_ground_column([x,y],&record).unwrap();
     }}
@@ -242,7 +242,7 @@ fn legacy_plane_and_heightfield_exact_members_share_finite_contact_semantics() {
                     members:members.iter().copied().map(nuwax_map_chunks::local_key).collect(),
                     normal:[0.0,0.0,1.0],plane_origin:[xy[0],xy[1],height],
                     samples:members.iter().enumerate().map(|(i,key)|LayerSample {
-                        source:Default::default(),source_sequence:1,source_timestamp_ns:20,point_index:i as u32,
+                        source: std::sync::Arc::new(nuwax_map_chunks::LayerSource::Lidar { backend: 1, runtime_generation: 1, sensor_frame_id: "test".into() }),source_sequence:1,source_timestamp_ns:20,point_index:i as u32,
                         point:[xy[0],xy[1],(f64::from(key[2])+0.5)*f64::from(Q)]}).collect(),
                 });
         }}

@@ -61,7 +61,6 @@ def build_go2_manifest(config: Optional["NuwaxRobotBridgeConfig"] = None) -> Rob
             required_apt_packages=(),
             forbidden_apt_packages=(),
             required_python_packages=("unitree_sdk2py==1.0.1",),
-            external_slam_script="Go2ShSlamScript",
             calibration_required=True,
             slam_dimension="3d",
             memory_mode_recommendation="cloud",

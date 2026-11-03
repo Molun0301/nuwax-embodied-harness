@@ -3686,7 +3686,7 @@ impl GeometryRuntime for GeometryRuntimeService {
             uptime_ms: diag.uptime_ms,
             rss_kb: diag.rss_kb,
             lcm_backend: diag.lcm_backend,
-            supported_assigned_fine_archive_versions: vec![1, 2, 3, 4, 5],
+
         }))
     }
 
@@ -4892,12 +4892,9 @@ impl GeometryRuntime for GeometryRuntimeService {
         let wire_block = request.block.as_ref().ok_or_else(|| Status::invalid_argument("missing block reference"))?;
         let identity = wire_block.object.as_ref().ok_or_else(|| Status::invalid_argument("missing block object identity"))?;
         let object = match identity.kind {
-            1 if identity.legacy_alias.is_empty() => nuwax_map_chunks::ObjectIdentity::Assigned(
+            1 => nuwax_map_chunks::ObjectIdentity::Assigned(
                 nuwax_map_chunks::ObjectId(identity.object_id.as_slice().try_into()
                     .map_err(|_| Status::invalid_argument("assigned object identity must contain 16 bytes"))?)),
-            2 if identity.object_id.is_empty() => nuwax_map_chunks::ObjectIdentity::Legacy(
-                nuwax_map_chunks::LegacyAlias(identity.legacy_alias.as_slice().try_into()
-                    .map_err(|_| Status::invalid_argument("legacy object alias must contain 32 bytes"))?)),
             _ => return Err(Status::invalid_argument("invalid tagged object identity")),
         };
         object.validate().map_err(Status::invalid_argument)?;
@@ -8999,7 +8996,6 @@ use nuwax_protocol::RawLcmFrame;
             ];
             if native_source {
                 let status=source.service.get_status(Request::new(Empty {})).await.unwrap().into_inner();
-                assert_eq!(status.supported_assigned_fine_archive_versions,vec![1,2,3,4,5]);
             }
             let common = native_source.then(|| crate::lio_ingress::CommonLioIngress::new(
                 crate::lio_ingress::DeviceLioIngressSpec::new(1, "sensor", "base_link", "odom", "map").unwrap()));
@@ -11721,11 +11717,9 @@ use nuwax_protocol::RawLcmFrame;
         let expected = fine.repository.read_object(reference.object, nuwax_map_chunks::MAX_BLOCK_BYTES).unwrap();
         let object = match reference.object {
             nuwax_map_chunks::ObjectIdentity::Assigned(id) => NavigationMapObjectIdentity {
-                kind: 1, object_id: id.0.to_vec(), legacy_alias: Vec::new(),
+                kind: 1, object_id: id.0.to_vec(),
             },
-            nuwax_map_chunks::ObjectIdentity::Legacy(id) => NavigationMapObjectIdentity {
-                kind: 2, object_id: Vec::new(), legacy_alias: id.0.to_vec(),
-            },
+
         };
         let wire_root = NavigationMapRootIdentity { revision: root.revision, domain: Some(NavigationMapDomain {
             session: root.domain.session.clone(), generation: root.domain.generation,

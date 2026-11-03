@@ -32,7 +32,6 @@ class RobotProfile:
     required_apt_packages: Tuple[str, ...] = ()
     forbidden_apt_packages: Tuple[str, ...] = ()
     required_python_packages: Tuple[str, ...] = ()
-    external_slam_script: str = ""  # "Go2ShSlamScript" | "G1WebRtcSlamScript" | "RaspiSlamToolboxScript" | ""
     calibration_required: bool = True
     slam_dimension: str = "3d"  # "2d" | "3d"
     memory_mode_recommendation: str = "cloud"  # "cloud" | "local" | "disabled"

@@ -9,7 +9,6 @@ from pathlib import Path
 import shutil
 import tempfile
 import threading
-from urllib.parse import quote
 import weakref
 
 from contracts.map_workspace import MapAsset
@@ -265,29 +264,7 @@ class MapCatalogRepository:
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             raise ValueError("地图 metadata.json 必须是 JSON object。")
-        payload.pop("latest_version_id", None)
-        payload.pop("latest_revision", None)
-        if payload.get("identity_schema_version") == 2:
-            # Assigned reads validate persisted authority; they never infer an ID,
-            # compute a manifest digest, or mutate finalized metadata during load.
-            return MapAsset.model_validate(payload)
-        current_dir = metadata_path.parent / "current"
-        manifest_path = current_dir / "manifest.json"
-        if "finalized" not in payload:
-            payload["finalized"] = bool(current_dir.is_dir() and manifest_path.is_file())
-        if payload.get("finalized") and not payload.get("finalized_at") and current_dir.is_dir():
-            payload["finalized_at"] = payload.get("updated_at")
         return MapAsset.model_validate(payload)
 
     def _map_dir(self, map_name: str) -> Path:
-        safe_name = build_safe_dir_segment(map_name)
-        primary = self._root_dir / safe_name
-        # 向后兼容：旧版本曾用 urllib.parse.quote(map_name, safe="") 写出 URL
-        # 编码目录（如 `%E5%8A%9E%E5%85%AC%E5%AE%A4`），sqlite 在带百分号路径上
-        # 反复 FATAL `unable to open database file`。这里：当原名目录不存在但
-        # 编码目录存在时，沿用旧目录路径以读老资产；新写入永远走原名分支。
-        if not primary.exists():
-            legacy = self._root_dir / quote(str(map_name or "").strip(), safe="")
-            if legacy.exists():
-                return legacy
-        return primary
+        return self._root_dir / build_safe_dir_segment(map_name)

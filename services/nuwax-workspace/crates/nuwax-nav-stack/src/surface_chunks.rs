@@ -30,7 +30,6 @@ impl FineMapReader {
     ) -> Result<(Arc<nuwax_nav_mls_planner::SurfaceObservations>, Option<Vec<[i32; 2]>>), String> {
         use nuwax_nav_mls_planner::{SurfaceObservation, SurfaceObservations};
         use std::collections::{BTreeMap, BTreeSet};
-        use nuwax_map_chunks::{GroundRecords, GroundRecordRef};
         let previous = previous.filter(|(old, _)| old.domain == root.domain
             && old.voxel_size_m.to_bits() == root.voxel_size_m.to_bits());
         if let Some((_, grid)) = previous.filter(|(old, _)| *old == root) {
@@ -71,15 +70,6 @@ impl FineMapReader {
             }
             mutated = true;
             changed.extend(grid.replace_block_with_geometry_changes(reference.key, values)
-                .map_err(|e| e.to_string())?);
-            let layers = match &records {
-                GroundRecords::Legacy(layers) => Arc::clone(layers),
-                GroundRecords::Versioned(_) => Arc::new(records.iter().filter_map(|(key,record)| {
-                    match record { GroundRecordRef::LegacyPlane(layer)=>Some((key,layer.clone())),
-                        GroundRecordRef::HeightfieldV1(_)|GroundRecordRef::ClassifiedEmptyColumn=>None }
-                }).collect()),
-            };
-            changed.extend(grid.replace_ground_layers(reference.key, layers)
                 .map_err(|e| e.to_string())?);
             if typed {
                 native_groups.insert([reference.key[0],reference.key[1]]);
@@ -311,11 +301,9 @@ pub(super) fn block_request(root: &Manifest, reference: &nuwax_map_chunks::Block
     use nuwax_map_chunks::ObjectIdentity;
     let object = match reference.object {
         ObjectIdentity::Assigned(id) => serde_json::json!({
-            "kind": 1, "object_id": id.0, "legacy_alias": [],
+            "kind": 1, "object_id": id.0,
         }),
-        ObjectIdentity::Legacy(alias) => serde_json::json!({
-            "kind": 2, "object_id": [], "legacy_alias": alias.0,
-        }),
+
     };
     serde_json::json!({
         "schema_version": 3,
@@ -647,11 +635,7 @@ mod tests {
             wrong["data"] = data;
             assert!(block_response(&request, &wrong).is_err());
         }
-        let legacy = BlockRef { object: ObjectIdentity::Legacy(LegacyAlias([7; 32])), ..reference.clone() };
-        let legacy_request = block_request(&root, &legacy);
-        assert_eq!(legacy_request["block"]["object"]["kind"], 2);
-        assert_eq!(legacy_request["block"]["object"]["object_id"], serde_json::json!([]));
-        assert_eq!(legacy_request["block"]["object"]["legacy_alias"], serde_json::to_value([7_u8; 32]).unwrap());
+
     }
 
     #[test]

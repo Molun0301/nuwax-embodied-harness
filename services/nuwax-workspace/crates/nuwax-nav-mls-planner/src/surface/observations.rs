@@ -942,7 +942,7 @@ mod measured_layer_tests {
 
     fn record(plane:f64,sample:f64,time:u64)->Arc<LayerObservations> {
         Arc::new(BTreeMap::from([(0,LayerObservation {members:vec![0],normal:[0.0,0.0,1.0],
-            plane_origin:[0.025,0.025,plane],samples:vec![LayerSample {source: Default::default(),
+            plane_origin:[0.025,0.025,plane],samples:vec![LayerSample {source: std::sync::Arc::new(nuwax_map_chunks::LayerSource::Lidar { backend: 1, runtime_generation: 1, sensor_frame_id: "test".into() }),
                 point:[0.025,0.025,sample],source_sequence:1,source_timestamp_ns:time,point_index:0,
             }],})]))
     }
@@ -1144,7 +1144,7 @@ mod planning_query_equivalence_tests {
             normal: [0.0, 0.0, 1.0],
             plane_origin: [0.025, 0.025, 0.025],
             samples: vec![LayerSample {
-                source: Default::default(), point: [0.025, 0.025, sample_z],
+                source: std::sync::Arc::new(nuwax_map_chunks::LayerSource::Lidar { backend: 1, runtime_generation: 1, sensor_frame_id: "test".into() }), point: [0.025, 0.025, sample_z],
                 source_sequence: 1, source_timestamp_ns: time, point_index: 0,
             }],
         })]))

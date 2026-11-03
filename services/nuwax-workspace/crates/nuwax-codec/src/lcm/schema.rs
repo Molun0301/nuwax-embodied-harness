@@ -39,7 +39,6 @@ pub const NAVIGATION_MAP_BLOCK_FINGERPRINT: [u8; 8] = 0xe544_975d_2a8d_dc13_u64.
 /// C1 object/revision wire layout, distinct from the old digest-addressed v2 body.
 pub const NAVIGATION_MAP_3D_SCHEMA_VERSION: i32 = 4;
 const NAVIGATION_MAP_BLOCK_KIND_ASSIGNED: u8 = 1;
-const NAVIGATION_MAP_BLOCK_KIND_LEGACY: u8 = 2;
 const NAVIGATION_MAP_MAX_INCLUDED_BLOCKS: usize = 16_384;
 const NAVIGATION_MAP_MAX_INCLUDED_BYTES: usize = 512 * 1024;
 /// `sensor_msgs.Imu` fingerprint from the canonical DimOS nested Quaternion/Vector3 schema.
@@ -1142,22 +1141,17 @@ fn encode_navigation_map_object_identity(object: nuwax_map_chunks::ObjectIdentit
             out.extend_from_slice(&id.0);
             out.extend_from_slice(&[0; 32]);
         }
-        ObjectIdentity::Legacy(alias) => {
-            out.push(NAVIGATION_MAP_BLOCK_KIND_LEGACY);
-            out.extend_from_slice(&[0; 16]);
-            out.extend_from_slice(&alias.0);
-        }
+
     }
 }
 
 fn decode_navigation_map_object_identity(cursor: &mut Cursor<'_>) -> CodecResult<nuwax_map_chunks::ObjectIdentity> {
-    use nuwax_map_chunks::{LegacyAlias, ObjectId, ObjectIdentity};
+    use nuwax_map_chunks::{ObjectId, ObjectIdentity};
     let kind = cursor.read_u8()?;
     let object_id: [u8; 16] = cursor.read_exact(16)?.try_into().unwrap();
-    let legacy_alias: [u8; 32] = cursor.read_exact(32)?.try_into().unwrap();
+    let reserved: [u8; 32] = cursor.read_exact(32)?.try_into().unwrap();
     let object = match kind {
-        NAVIGATION_MAP_BLOCK_KIND_ASSIGNED if legacy_alias == [0; 32] => ObjectIdentity::Assigned(ObjectId(object_id)),
-        NAVIGATION_MAP_BLOCK_KIND_LEGACY if object_id == [0; 16] => ObjectIdentity::Legacy(LegacyAlias(legacy_alias)),
+        NAVIGATION_MAP_BLOCK_KIND_ASSIGNED if reserved == [0; 32] => ObjectIdentity::Assigned(ObjectId(object_id)),
         _ => return Err(CodecError::LcmDecode("invalid or mixed NavigationMapBlock object identity".into())),
     };
     object.validate().map_err(CodecError::LcmDecode)?;
@@ -2744,7 +2738,7 @@ mod navigation_map_3d_tests {
         })]);
         let root = Manifest {
             source_watermarks: Vec::new(),
-            version: 2,
+            version: 4,
             domain: navigation_map_3d_domain(&message),
             revision: message.cloud_revision as u64,
             geometry_revision: 9,
@@ -2796,7 +2790,7 @@ mod navigation_map_3d_tests {
         }).collect();
         let root = Manifest {
             source_watermarks: Vec::new(),
-            version: 2, domain: navigation_map_3d_domain(&message),
+            version: 4, domain: navigation_map_3d_domain(&message),
             revision: message.cloud_revision as u64, geometry_revision: 9,
             source_timestamp_ns: message.source_timestamp_ns as u64,
             voxel_size_m: message.source_voxel_size, blocks,
@@ -2912,7 +2906,7 @@ mod navigation_map_3d_tests {
         message.cloud.data.clear();
         let root = nuwax_map_chunks::Manifest {
             source_watermarks: Vec::new(),
-            version: 2, domain: navigation_map_3d_domain(&message),
+            version: 4, domain: navigation_map_3d_domain(&message),
             revision: message.cloud_revision as u64, geometry_revision: message.cloud_revision as u64,
             source_timestamp_ns: message.source_timestamp_ns as u64,
             voxel_size_m: message.source_voxel_size, blocks: Vec::new(),
@@ -3175,10 +3169,9 @@ mod navigation_map_3d_tests {
 
     #[test]
     fn fine_root_round_trip_and_commit_binding_rejects_mixed_source() {
-        use nuwax_map_chunks::{LegacyAlias, ObjectId, ObjectIdentity};
+        use nuwax_map_chunks::{ObjectId, ObjectIdentity};
         for object in [
             ObjectIdentity::Assigned(ObjectId([0x51; 16])),
-            ObjectIdentity::Legacy(LegacyAlias([0x72; 32])),
         ] {
             let message = fine_map(object);
             let wire = encode_navigation_map_3d(&message).unwrap();
@@ -3245,9 +3238,8 @@ mod navigation_map_3d_tests {
 
     #[test]
     fn fine_block_summary_preserves_bounds_and_full_parse_error_precedence() {
-        use nuwax_map_chunks::{Block, Evidence, LegacyAlias, Manifest, ObjectId, ObjectIdentity, encode_block};
-        for object in [ObjectIdentity::Assigned(ObjectId([0x51; 16])),
-            ObjectIdentity::Legacy(LegacyAlias([0x72; 32]))] {
+        use nuwax_map_chunks::{Block, Evidence, Manifest, ObjectId, ObjectIdentity, encode_block};
+        for object in [ObjectIdentity::Assigned(ObjectId([0x51; 16]))] {
             let mut valid = fine_map(object);
             let bound = valid.source_timestamp_ns as u64;
             let block = Block::from([(0, Evidence { observed_ns: bound, hits: 1 }),
@@ -3332,10 +3324,9 @@ mod navigation_map_3d_tests {
 
     #[test]
     fn c1_object_tags_reject_mixed_zero_unknown_and_truncated_identities() {
-        use nuwax_map_chunks::{LegacyAlias, ObjectId, ObjectIdentity};
+        use nuwax_map_chunks::{ObjectId, ObjectIdentity};
         for object in [
             ObjectIdentity::Assigned(ObjectId([0x51; 16])),
-            ObjectIdentity::Legacy(LegacyAlias([0x72; 32])),
         ] {
             let mut encoded = Vec::new();
             encode_navigation_map_object_identity(object, &mut encoded);
@@ -3629,7 +3620,6 @@ Path(sys.argv[3]).write_bytes(message.encode())
             ("clear", cleared_map()),
             ("virtual", map_with_virtual_obstacles()),
             ("assigned", fine_map(nuwax_map_chunks::ObjectIdentity::Assigned(nuwax_map_chunks::ObjectId([0x51; 16])))),
-            ("legacy_alias", fine_map(nuwax_map_chunks::ObjectIdentity::Legacy(nuwax_map_chunks::LegacyAlias([0x72; 32])))),
         ] {
             let input = temp.0.join(format!("{name}.bin"));
             let c_output = temp.0.join(format!("{name}-c.bin"));

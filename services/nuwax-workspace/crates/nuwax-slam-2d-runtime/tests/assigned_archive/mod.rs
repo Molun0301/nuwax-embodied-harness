@@ -55,7 +55,6 @@ fn three_members_roundtrip_copy_and_reopen_keep_checkpoint() {
     let unpacked = Directory::new();
     assert_eq!(unpack_structure(&mut file, &unpacked.0).unwrap(), ArchiveMetadata::Assigned(m.clone()));
     for path in paths { assert_eq!(std::fs::read(&path).unwrap(), std::fs::read(unpacked.join(path.file_name().unwrap().to_str().unwrap())).unwrap()); }
-    assert!(read_header(&mut file).is_err()); // No accidental v2 consumption by active v1 APIs.
     let header = serde_json::to_string(&m).unwrap();
     assert!(!header.contains("sha256"));
 }
@@ -147,20 +146,7 @@ fn members_stream_once_and_header_grid_reads_skip_graph_bodies() {
     read.read_bytes=0; let dir=Directory::new(); unpack_structure(&mut read,&dir.0).unwrap();
     assert_eq!(read.read_bytes,size as usize); assert!(read.max_request<=CHUNK_BYTES);
 }
-#[test]
-fn legacy_static_digest_fields_are_structure_only() {
-    // Fixed historical digest literals (abc and one NUL byte), never calculated here.
-    // Only structural compatibility is asserted; legacy hash verification is intentionally unrun.
-    const HEADER: &str = r#"{"version":1,"session":{"session_id":"s","map_name":"map","session_generation":1,"sensor_id":"laser","frame_id":"laser","map_frame_id":"map","odom_frame_id":"odom","body_frame_id":"base","clock_domain":"unix_ns","clock_id":"","calibration_ref":"calibration-1","odometry_source":"device","core_config":{"base_from_laser":[0,0,0]}},"estimate":{"source_timestamp_ns":0,"clock_domain":"","clock_id":"","source_sequence":0,"graph_revision":9,"optimizations":0,"anchor_odom_from_base":[0,0,0],"odom_from_base":[0,0,0],"map_from_base":[0,0,0],"map_from_odom":[0,0,0],"covariance":[0,0,0,0,0,0,0,0,0],"matching_response":0,"local_response":0,"disposition":"","node_count":0,"edge_count":0},"source_unix_timestamp_ns":100,"width":1,"height":1,"resolution":0.05,"origin":[1,2],"members":[{"name":"graph.posegraph","size":3,"sha256":[186,120,22,191,143,1,207,234,65,65,64,222,93,174,34,35,176,3,97,163,150,23,122,156,180,16,255,97,242,0,21,173]},{"name":"graph.data","size":3,"sha256":[186,120,22,191,143,1,207,234,65,65,64,222,93,174,34,35,176,3,97,163,150,23,122,156,180,16,255,97,242,0,21,173]},{"name":"grid.i8","size":1,"sha256":[110,52,11,156,255,179,122,152,156,165,68,230,187,120,10,44,120,144,29,63,179,55,56,118,133,17,163,6,23,175,160,29]}]}"#;
-    let bytes=raw(MAGIC,HEADER.as_bytes(),b"abcabc\0");
-    let (legacy,cells)=grid_structure(&mut Cursor::new(&bytes)).unwrap(); assert_eq!(cells,vec![0]);
-    let ArchiveMetadata::Legacy(m)=legacy else { panic!("wrong version") };
-    assert_eq!(m.members[0].sha256[0],0xba);
-    let dir=Directory::new(); let path=dir.join("legacy"); std::fs::write(&path,&bytes).unwrap();
-    assert_eq!(read_header(&mut open_regular(&path).unwrap()).unwrap().0,m);
-    let dest=Directory::new(); unpack_structure(&mut Cursor::new(bytes),&dest.0).unwrap();
-    assert_eq!(std::fs::read(dest.join("graph.posegraph")).unwrap(),b"abc");
-}
+
 
 #[test]
 fn symlink_inputs_are_rejected() {
@@ -175,7 +161,7 @@ fn descriptor_binding_rejects_changed_checkpoint_format_and_size() {
     let m=metadata(); let bytes=encoded(&m);
     let id=ArtifactIdentity::Assigned {checkpoint_id:m.checkpoint_id.clone()};
     assert!(read_bound_structure(&mut Cursor::new(&bytes),bytes.len() as u64,&id).is_ok());
-    assert!(read_bound_structure(&mut Cursor::new(&bytes),bytes.len() as u64,&ArtifactIdentity::Legacy).is_err());
+    assert!(read_bound_structure(&mut Cursor::new(&bytes),bytes.len() as u64,&ArtifactIdentity::Assigned { checkpoint_id: "f".repeat(32) }).is_err());
     assert!(read_bound_structure(&mut Cursor::new(&bytes),bytes.len() as u64+1,&id).is_err());
     let other=ArtifactIdentity::Assigned {checkpoint_id:"2".repeat(32)};
     assert!(read_bound_structure(&mut Cursor::new(&bytes),bytes.len() as u64,&other).is_err());

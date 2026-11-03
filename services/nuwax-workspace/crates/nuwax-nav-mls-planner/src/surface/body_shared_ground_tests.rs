@@ -59,7 +59,7 @@ fn with_measured_floor_heights(map:SurfaceSnapshot,height:impl Fn(i32,i32)->f64)
         let origin=[(f64::from(x)+0.5)*q,(f64::from(y)+0.5)*q,plane_z];
         blocks.entry(block_key(key)).or_default().insert(local,LayerObservation {
             members:vec![local],normal:[0.0,0.0,1.0],plane_origin:origin,
-            samples:(0..3).map(|i|LayerSample{source: Default::default(), point:origin,source_sequence:i+1,
+            samples:(0..3).map(|i|LayerSample{source: std::sync::Arc::new(nuwax_map_chunks::LayerSource::Lidar { backend: 1, runtime_generation: 1, sensor_frame_id: "test".into() }), point:origin,source_sequence:i+1,
                 source_timestamp_ns:100+i,point_index:u32::from(local)}).collect(),
         });
     }}
@@ -179,7 +179,7 @@ fn unique_upper_observed_layer_is_not_contact_without_same_physical_ground_ancho
     let mut observed=map.observations.as_ref().unwrap().as_ref().clone();
     let key=local_key([0,0,9]);let origin=[0.025,0.025,0.475];
     let layer=LayerObservation{members:vec![key],normal:[0.,0.,1.],plane_origin:origin,
-        samples:vec![LayerSample{source: Default::default(), point:origin,source_sequence:1,source_timestamp_ns:1,point_index:0}]};
+        samples:vec![LayerSample{source: std::sync::Arc::new(nuwax_map_chunks::LayerSource::Lidar { backend: 1, runtime_generation: 1, sensor_frame_id: "test".into() }), point:origin,source_sequence:1,source_timestamp_ns:1,point_index:0}]};
     observed.replace_ground_layers([0,0,0],Arc::new(std::collections::BTreeMap::from([(key,layer)]))).unwrap();
     observed.mark_complete_geometry_source();let map=map.with_observations(Some(Arc::new(observed)));
     let body=[0.025,0.025,0.4];let r=rotation([0.,0.,0.,1.]).unwrap();
@@ -217,7 +217,7 @@ fn measured_contact_members_do_not_require_a_connected_ground_anchor() {
     let local=local_key(floor);
     let layers=LayerObservations::from([(local,LayerObservation {
         members:vec![local],normal:[0.0,0.0,1.0],plane_origin:point,
-        samples:vec![LayerSample{source: Default::default(), point,source_sequence:1,source_timestamp_ns:100,point_index:0}],
+        samples:vec![LayerSample{source: std::sync::Arc::new(nuwax_map_chunks::LayerSource::Lidar { backend: 1, runtime_generation: 1, sensor_frame_id: "test".into() }), point,source_sequence:1,source_timestamp_ns:100,point_index:0}],
     })]);
     observations.replace_ground_layers(block_key(floor),Arc::new(layers)).unwrap();
     observations.mark_complete_geometry_source();
@@ -302,7 +302,7 @@ fn recent_guide_and_body_share_measured_contact_when_center_ground_is_unknown() 
     let local=local_key(key);
     let layers=LayerObservations::from([(local,LayerObservation {
         members:vec![local],normal:[0.0,0.0,1.0],plane_origin:point,
-        samples:vec![LayerSample{source:Default::default(),point,source_sequence:1,
+        samples:vec![LayerSample{source: std::sync::Arc::new(nuwax_map_chunks::LayerSource::Lidar { backend: 1, runtime_generation: 1, sensor_frame_id: "test".into() }),point,source_sequence:1,
             source_timestamp_ns:100,point_index:0}],
     })]);
     observations.replace_ground_layers(block_key(key),Arc::new(layers)).unwrap();
@@ -431,7 +431,7 @@ fn same_coarse_measured_map(measured_levels: &[i32]) -> SurfaceSnapshot {
         let origin=[(f64::from(x)+0.5)*q,(f64::from(y)+0.5)*q,(f64::from(z)+0.5)*q];
         blocks.entry(block_key(key)).or_default().insert(local,LayerObservation {
             members:vec![local],normal:[0.,0.,1.],plane_origin:origin,
-            samples:vec![LayerSample{source:Default::default(),point:origin,
+            samples:vec![LayerSample{source: std::sync::Arc::new(nuwax_map_chunks::LayerSource::Lidar { backend: 1, runtime_generation: 1, sensor_frame_id: "test".into() }),point:origin,
                 source_sequence:1,source_timestamp_ns:1,point_index:u32::from(local)}],
         });
     }}}
@@ -502,7 +502,7 @@ fn off_center_parallel_measured_slopes_select_at_the_actual_query_xy() {
         let height=0.045+f64::from(z)*0.04-0.45*(xy[0]-0.45*q);
         let origin=[xy[0],xy[1],height];
         layers.insert(local,LayerObservation{members:vec![local],normal,plane_origin:origin,
-            samples:vec![LayerSample{source:Default::default(),point:origin,
+            samples:vec![LayerSample{source: std::sync::Arc::new(nuwax_map_chunks::LayerSource::Lidar { backend: 1, runtime_generation: 1, sensor_frame_id: "test".into() }),point:origin,
                 source_sequence:1,source_timestamp_ns:1,point_index:u32::from(local)}]});
     }}}
     observations.replace_ground_layers([0,0,0],Arc::new(layers)).unwrap();
@@ -540,7 +540,7 @@ fn parallel_measured_slope_map(base_height: f64, zero_step: bool, missing_upper:
         occupancy.entry(block_key(key)).or_default().insert(key,SurfaceObservation{observed_ns:100,hits:1});
         if floor==1 && missing_upper==Some([x,y]) {continue;}
         blocks.entry(block_key(key)).or_default().insert(local,LayerObservation{members:vec![local],normal,
-            plane_origin:origin,samples:vec![LayerSample{source:Default::default(),point:origin,
+            plane_origin:origin,samples:vec![LayerSample{source: std::sync::Arc::new(nuwax_map_chunks::LayerSource::Lidar { backend: 1, runtime_generation: 1, sensor_frame_id: "test".into() }),point:origin,
                 source_sequence:1,source_timestamp_ns:100,point_index:u32::from(local)}]});
     }}}
     let mut observations=SurfaceObservations::new(0.05,32).unwrap();
@@ -910,7 +910,7 @@ fn ground_context_recent_floor_box_and_refresh_pair() {
     observations.replace_ground_layers(block_key(key), Arc::new(LayerObservations::from([
         (local, LayerObservation {
             members: vec![local], normal: [0.0, 0.0, 1.0], plane_origin: point,
-            samples: vec![LayerSample { source: Default::default(), point,
+            samples: vec![LayerSample { source: std::sync::Arc::new(nuwax_map_chunks::LayerSource::Lidar { backend: 1, runtime_generation: 1, sensor_frame_id: "test".into() }), point,
                 source_sequence: 1, source_timestamp_ns: 100, point_index: 0 }],
         }),
     ]))).unwrap();
@@ -1314,7 +1314,7 @@ fn ground_context_subcell_distinct_observed_anchors_keep_original_rejection() {
         assert_eq!((height / fine).floor() as i32, z);
         blocks.entry(block_key(key)).or_default().insert(local, LayerObservation {
             members: vec![local], normal: [0.0, 0.0, 1.0], plane_origin: origin,
-            samples: vec![LayerSample { source: Default::default(), point: origin,
+            samples: vec![LayerSample { source: std::sync::Arc::new(nuwax_map_chunks::LayerSource::Lidar { backend: 1, runtime_generation: 1, sensor_frame_id: "test".into() }), point: origin,
                 source_sequence: 1, source_timestamp_ns: 100, point_index: u32::from(local) }],
         });
     } } }

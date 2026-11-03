@@ -2641,9 +2641,6 @@ fn cloud_map_duplicate_admitted_frame_preserves_dense_coarse_and_fine_state() {
     }
 }
 
-#[cfg(test)]
-#[path = "legacy_fine_baseline_tests.rs"]
-mod legacy_fine_baseline_tests;
 
 #[cfg(test)]
 #[path = "activation_decode_diagnostic_tests.rs"]

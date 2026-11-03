@@ -166,7 +166,6 @@ fn reader(fine:&mut FineCloud, max_step:f64, stamp:u64) -> Arc<SurfaceSnapshot> 
     assert!(observed.is_complete_geometry_source());
     assert!(Arc::ptr_eq(observed,again.observations().unwrap()));
     for (xy,column) in before {
-        assert!(column.legacy.is_empty());
         let got:Vec<_>=observed.ground_records(xy).collect();
         assert_eq!(got.len(),column.heightfields.len());
         for original in column.heightfields {
@@ -215,7 +214,6 @@ fn capture_reader_thick_bands_use_actual_height_and_finite_zero_step_contact() {
         let columns=records(&mut fine);
         assert_eq!(columns.len(),81);
         for c in columns.values() {
-            assert!(c.legacy.is_empty());assert_eq!(c.heightfields.len(),1);
             let h=&c.heightfields[0].column;
             assert_eq!(h.members().map(|(z,_)|z).collect::<Vec<_>>(),(0..=last_member).collect::<Vec<_>>());
             assert_eq!(h.height(),hbin(height_bin),"producer expectation before any consumer");

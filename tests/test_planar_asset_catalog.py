@@ -29,14 +29,11 @@ def archive(version=2, checkpoint_id='a' * 32, grid=b'\0\x64\xff', graph=b'poseg
         optimizations=0, anchor_odom_from_base=[0.] * 3, odom_from_base=[0.] * 3, map_from_base=[0.] * 3,
         map_from_odom=[0.] * 3, covariance=[0.] * 9, matching_response=1., local_response=1., disposition='accepted', node_count=1, edge_count=0)
     members = [dict(name=name, size=len(data)) for name, data in zip(('graph.posegraph', 'graph.data', 'grid.i8'), (graph, scans, grid))]
-    if version == 1:
-        for member in members:
-            member['sha256'] = [17] * 32
     source = dict(version=version, session=session, estimate=estimate, source_unix_timestamp_ns=11,
         width=len(grid), height=1, resolution=.05, origin=[0., 0.], members=members)
     if source_mutator:
         source_mutator(source)
-    header = source if version == 1 else dict(checkpoint_id=checkpoint_id, source=source)
+    header = dict(checkpoint_id=checkpoint_id, source=source)
     raw = json.dumps(header, separators=(',', ':')).encode()
     return ('NWS2D00%d' % version).encode() + struct.pack('<I', len(raw)) + raw + graph + scans + grid
 
@@ -72,32 +69,6 @@ def write_navigation(root):
     (root / 'navigation/map.pgm').write_bytes(b'P5\n3 1\n255\n\xff\x00\xcd')
 
 
-def install_literal_legacy(repository, catalog_owner, name='map'):
-    current = repository._map_dir(name) / 'current'; current.mkdir(parents=True)
-    raw = archive(version=1)
-    receipt = occupancy_receipt()
-    occupancy = dict(occupancy_asset(), raw_data_sha256=b'O' * 32)
-    backend = current / 'mapping_backend/slam_toolbox'
-    (backend / 'objects').mkdir(parents=True); (backend / 'manifests').mkdir()
-    relative = 'objects/sha256-' + '50' * 32 + '.bin'; (backend / relative).write_bytes(raw)
-    checkpoint_manifest = dict(schema_version=1, backend_kind='slam_toolbox', source_session_id='source', source_session_generation=3,
-        created_at_ns=12, canonical_receipts=dict(occupancy=store._receipt_document(receipt), cloud=None),
-        canonical_assets=dict(occupancy=asset_document(occupancy, sha256_field='raw_data_sha256'), cloud=None),
-        payload=dict(sha256='50' * 32, path=relative, size=len(raw)))
-    manifest_relative = 'manifests/sha256-' + '88' * 32 + '.json'
-    (backend / manifest_relative).write_bytes(store._encode_json(checkpoint_manifest))
-    (backend / 'checkpoint-v1.json').write_bytes(store._encode_json(dict(schema_version=1, backend_kind='slam_toolbox', manifest=dict(sha256='88' * 32, path=manifest_relative))))
-    graph_path = 'mapping_backend/slam_toolbox/' + relative
-    source = dict(present=True, schema_version=1, backend_kind='slam_toolbox', manifest_path='mapping_backend/slam_toolbox/' + manifest_relative,
-        object_path=graph_path, manifest_sha256='88' * 32, content_sha256='50' * 32)
-    bundle = MapAssetBundle(map_name=name, source_name='fixture', frame_id='map', snapshot=snapshot(name), geometry_asset=geometry(name, graph_path, source))
-    (current / 'bundle.json').write_text(bundle.model_dump_json(exclude_none=True))
-    write_navigation(current)
-    entries = [dict(path=relative, size=len(data), sha256='f' * 64) for relative, data in sorted(bytes_inventory(current).items())]
-    (current / 'manifest.json').write_text(json.dumps(dict(schema_version=1, map_name=name, bundle_path='bundle.json', files=entries)))
-    asset = MapAsset(map_name=name, display_name=name, bound_memory_library_name=name, finalized=True, status='ready', frame_id='map', asset_manifest_sha256='e' * 64)
-    catalog_owner.save_map_asset(asset)
-    return current, bundle, asset
 
 
 def prepare_assigned(repository, name, asset_id, checkpoint_id='a' * 32, graph_id='b' * 32, metadata=None):
@@ -127,7 +98,7 @@ def adopt(catalog_owner, old, identity):
         latest = catalog_owner.get_map_asset(old.map_name)
         assert latest.asset_identity == old.asset_identity
         assigned = MapAsset(**{**latest.model_dump(), 'identity_schema_version': 2, 'asset_identity': identity,
-            'asset_manifest_sha256': None, 'finalized': True})
+            'finalized': True})
         return catalog_owner.save_map_asset(assigned)
 
 
@@ -139,39 +110,11 @@ class AssetCatalogTests(unittest.TestCase):
                 self.guard.enter_context(patch.object(hashlib, name, side_effect=AssertionError('hash forbidden')))
         for module in (checkpoint_payload,):
             self.guard.enter_context(patch.object(module, 'payload_digest', side_effect=AssertionError('digest forbidden')))
-        self.guard.enter_context(patch.object(asset_store, '_sha256_bytes', side_effect=AssertionError('legacy outer hash forbidden')))
         self.directory = tempfile.TemporaryDirectory(); self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         self.repository = asset_store.MapAssetBundleRepository(str(self.root))
         self.catalog = catalog.MapCatalogRepository(str(self.root))
 
-    def test_legacy_import_selection_and_independent_continuation(self):
-        current, legacy, owner = install_literal_legacy(self.repository, self.catalog)
-        before = bytes_inventory(current)
-        imported = self.repository.import_legacy_planar_bundle('map')
-        self.assertEqual(bytes_inventory(current), before)
-        self.assertEqual(self.repository.current_directory('map'), current)
-        explicit = self.repository.get_map_asset_bundle('map', expected_asset_identity=imported.asset_identity)
-        self.assertEqual(explicit.asset_identity, imported.asset_identity)
-        assigned_root = self.repository._assigned_version_dir('map', imported.asset_identity)
-        self.assertTrue(assigned_root.is_dir())
-        owner = adopt(self.catalog, owner, imported.asset_identity)
-        self.assertEqual(self.repository.current_directory('map'), assigned_root)
-        directories = set(self.repository._map_dir('map').iterdir())
-        for _ in range(2):
-            selected = self.repository.get_map_asset_bundle('map')
-            self.assertEqual(selected.asset_identity, imported.asset_identity)
-        self.assertEqual(set(self.repository._map_dir('map').iterdir()), directories)
-        staging, bundle, identity = prepare_assigned(self.repository, 'map', '9' * 32, '8' * 32, '7' * 32)
-        next_bundle = self.repository.finalize_assigned_map_asset_bundle(bundle, staging_dir=staging,
-            asset_identity=identity, expected_previous_identity=imported.asset_identity)
-        self.assertEqual(self.repository.current_directory('map'), assigned_root)
-        self.assertEqual(self.repository.get_map_asset_bundle('map', expected_asset_identity=identity).asset_identity, identity)
-        owner = adopt(self.catalog, owner, identity)
-        self.assertEqual(self.repository.get_map_asset_bundle('map').asset_identity, identity)
-        self.assertTrue(assigned_root.is_dir())
-        self.assertEqual(bytes_inventory(current), before)
-        self.assertFalse((self.repository._map_dir('map') / '.assigned-exchange-v1.json').exists())
 
     def test_new_assigned_save_and_existing_current_exchange(self):
         name = 'new-map'

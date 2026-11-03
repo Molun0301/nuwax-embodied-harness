@@ -834,7 +834,7 @@ mod planning_snapshot_identity_tests {
             members: vec![0], normal: [0.0, 0.0, 1.0],
             plane_origin: [0.025, 0.025, 0.025],
             samples: vec![LayerSample {
-                source: Default::default(), point: [0.025, 0.025, z],
+                source: std::sync::Arc::new(nuwax_map_chunks::LayerSource::Lidar { backend: 1, runtime_generation: 1, sensor_frame_id: "test".into() }), point: [0.025, 0.025, z],
                 source_sequence: time, source_timestamp_ns: time, point_index: 0,
             }],
         })]))

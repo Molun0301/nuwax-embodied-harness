@@ -11,14 +11,14 @@ pub(super) fn stage(fine: &mut super::FineCloud, stamp: u64) {
                 let column = HeightfieldColumn::from_counts([x,y], q,
                     [(z, [1,0,0,0,0,0,0,0])].into()).unwrap().unwrap();
                 surfaces.push(HeightfieldSurface { column, samples: (0..32).map(|index| LayerSample {
-                    source: std::sync::Arc::new(LayerSource::Legacy),
+                    source: std::sync::Arc::new(LayerSource::Lidar { backend: 1, runtime_generation: 1, sensor_frame_id: "test".into() }),
                     point: [(f64::from(x)+0.5)*f64::from(q),(f64::from(y)+0.5)*f64::from(q),
                         (f64::from(z)+0.0625)*f64::from(q)],
                     source_sequence: 1, source_timestamp_ns: stamp, point_index: index,
                 }).collect() });
                 fine.writer.observe([[x,y,z]], stamp).unwrap();
             }
-            columns.push(([x,y], ColumnGroundRecords { classified_empty:false, legacy: vec![], heightfields:surfaces }));
+            columns.push(([x,y], ColumnGroundRecords { classified_empty:false,  heightfields:surfaces }));
         }
     }
     fine.writer.replace_ground_columns(columns.iter().map(|(xy, column)|(*xy,column))).unwrap();

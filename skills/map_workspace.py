@@ -490,23 +490,15 @@ class MapWorkspaceService:
         from skills.assigned_map_save import catalog_owner, reconcile_assigned_current, require_catalog_owner
         captured = catalog_owner(self, asset)
         try:
-            if asset.identity_schema_version == 1:
-                imported = self._asset_repository.import_legacy_planar_bundle(name)
-                if imported is not None:
-                    asset = reconcile_assigned_current(self, asset, imported, captured=captured)
-                    captured = catalog_owner(self, asset)
             exchange = self._asset_repository.get_assigned_map_asset_exchange(name) if asset.identity_schema_version == 2 else None
             if exchange is not None and not exchange.committed:
                 self._asset_repository.settle_assigned_map_asset_exchange(name,
                     expected_previous_identity=exchange.previous_identity, asset_identity=exchange.candidate_identity)
                 exchange = None
             # current 可能已提交而目录元数据尚未写入；所有正文读取都在守卫外。
-            loaded = self._asset_repository.get_map_asset_bundle(name, migrate_legacy=False,
+            loaded = self._asset_repository.get_map_asset_bundle(name,
                 _for_activation=_for_activation, expected_asset_identity=exchange.candidate_identity if exchange is not None
                     else asset.asset_identity if asset.identity_schema_version == 2 else None)
-            if loaded is None and asset.identity_schema_version == 1:
-                # 显式兼容旧 versions；若并发发布了 current，也在守卫外按真实 schema 准入。
-                loaded = self._asset_repository.get_map_asset_bundle(name, _for_activation=_for_activation)
             from services.mapping.asset_store import _AssignedActivationRead
             bundle = loaded.bundle if type(loaded) is _AssignedActivationRead else loaded
         except MapAssetBundleError as exc:
@@ -514,31 +506,13 @@ class MapWorkspaceService:
                 error_code="map_asset_bundle_invalid", http_status=409, jsonrpc_code=-32000) from exc
         if bundle is None:
             return None
-        if bundle.identity_schema_version == 2:
-            reconcile_assigned_current(self, asset, bundle, captured=captured,
-                expected_previous_identity=exchange.previous_identity if exchange else None,
-                confirm_durable=exchange is not None)
-            if exchange is not None:
-                self._asset_repository.settle_assigned_map_asset_exchange(name,
-                    expected_previous_identity=exchange.previous_identity, asset_identity=exchange.candidate_identity)
-            return loaded
-        with self._repository.map_activation_guard():
-            current = require_catalog_owner(self, asset, captured)
-            if (not current.finalized or current.asset_manifest_sha256 != bundle.manifest_sha256
-                    or current.frame_id != bundle.frame_id or current.finalized_at is None):
-                updated = current.model_copy(update={
-                    "finalized": True, "asset_manifest_sha256": bundle.manifest_sha256,
-                    "finalized_at": current.finalized_at or bundle.timestamp,
-                    "frame_id": bundle.frame_id or current.frame_id,
-                    "updated_at": datetime.now(current.updated_at.tzinfo) if current.updated_at.tzinfo else datetime.utcnow(),
-                })
-                self._repository.save_map_asset(updated)
-            else:
-                updated = None
-        if updated is not None:
-            self._state_store.write(StateNamespace.MAP, f"asset:{name}", updated,
-                source="map_workspace_service", metadata={"kind": "map_asset", "map_name": name})
-        return bundle
+        reconcile_assigned_current(self, asset, bundle, captured=captured,
+            expected_previous_identity=exchange.previous_identity if exchange else None,
+            confirm_durable=exchange is not None)
+        if exchange is not None:
+            self._asset_repository.settle_assigned_map_asset_exchange(name,
+                expected_previous_identity=exchange.previous_identity, asset_identity=exchange.candidate_identity)
+        return loaded
 
     @_record_saved_scan_history
     def finalize_active_map(
@@ -577,46 +551,28 @@ class MapWorkspaceService:
         from skills.assigned_map_save import catalog_owner, reconcile_assigned_current
         initial_owner = catalog_owner(self, asset)
         existing = self.get_map_asset_bundle(map_name=name)
-        if (existing is not None and existing.identity_schema_version == 2 and _save_operation_id is not None
-                and existing.metadata.get("save_operation_id") != _save_operation_id):
-            current = self._repository.get_map_asset(name)
-            if (current is None or catalog_owner(self, current)[:3] != initial_owner[:3]
-                    or current.asset_identity != existing.asset_identity):
-                raise GatewayError("地图目录拥有方已改变。", error_code="map_asset_owner_changed", http_status=409)
-            context = self._geometry_runtime.get_mapping_session_context()
-            if not isinstance(context, dict) or context.get("mapping_backend_kind") not in {"voxel", "raytracing", "slam_toolbox"}:
-                raise GatewayError("分配式续存要求实际原生后端。", error_code="map_save_backend_unavailable", http_status=409)
-            from skills.assigned_map_save import finalize_assigned_cloud_map
-            return finalize_assigned_cloud_map(self, current, context=context, reason=reason, metadata=metadata,
-                georeference=georeference or (existing.georeference.contract if existing.georeference else None),
-                save_operation_id=_save_operation_id, expected_previous_identity=existing.asset_identity), None
-        if existing is not None and (existing.geometry_asset is None
-                or existing.geometry_asset.metadata.get("target_kind") != "planar_graph"
-                or (_save_operation_id is not None
-                    and existing.metadata.get("save_operation_id") == _save_operation_id)):
-            if existing.identity_schema_version == 2:
-                current = self._repository.get_map_asset(name)
-                if (current is None or catalog_owner(self, current)[:3] != initial_owner[:3]
-                        or current.identity_schema_version != 2 or current.asset_identity != existing.asset_identity):
-                    raise GatewayError("地图目录拥有方已改变。", error_code="map_asset_owner_changed", http_status=409)
-                reconcile_assigned_current(self, current, existing, captured=catalog_owner(self, current),
-                    confirm_durable=True)
-            return existing, None
         context = self._geometry_runtime.get_mapping_session_context()
         backend = context.get("mapping_backend_kind") if isinstance(context, dict) else None
         if existing is not None:
             current = self._repository.get_map_asset(name)
-            if current is None or catalog_owner(self, current)[:3] != initial_owner[:3]:
+            if (current is None or catalog_owner(self, current)[:3] != initial_owner[:3]
+                    or current.asset_identity != existing.asset_identity):
                 raise GatewayError("地图目录拥有方已改变。", error_code="map_asset_owner_changed", http_status=409)
+            if (not context or context.get("active") is not True
+                    or (_save_operation_id is not None
+                        and existing.metadata.get("save_operation_id") == _save_operation_id)):
+                reconcile_assigned_current(self, current, existing, captured=catalog_owner(self, current),
+                    confirm_durable=True)
+                return existing, None
             from skills.assigned_map_save import finalize_assigned_cloud_map
-            return finalize_assigned_cloud_map(self, current, context=context, reason=reason,
+            return finalize_assigned_cloud_map(self, current, reason=reason,
                 metadata=metadata, georeference=georeference or (existing.georeference.contract if existing.georeference else None),
                 save_operation_id=_save_operation_id, expected_previous_identity=existing.asset_identity), None
         if backend not in {"voxel", "raytracing", "slam_toolbox"}:
             raise GatewayError("当前原生建图后端身份不可用，不能选择保存协议。",
                 error_code="map_save_backend_unavailable", http_status=409, jsonrpc_code=-32000)
         from skills.assigned_map_save import finalize_assigned_cloud_map
-        return finalize_assigned_cloud_map(self, asset, context=context,
+        return finalize_assigned_cloud_map(self, asset,
             reason=reason, metadata=metadata, georeference=georeference, save_operation_id=_save_operation_id), None
 
 
@@ -1270,23 +1226,9 @@ class MapWorkspaceService:
     @classmethod
     def _sanitize_map_metadata(cls, value):
         if isinstance(value, dict):
-            retired_keys = {
-                "map_version_id",
-                "platform_map_version_id",
-                "platform_map_version_revision",
-                "seed_map_version_id",
-                "seed_map_version_revision",
-                "latest_map_version_id",
-                "latest_version_id",
-                "latest_revision",
-                "localization_session_map_version_id",
-                "mapping_map_version_id",
-                "map_revision",
-            }
             return {
                 key: cls._sanitize_map_metadata(item)
                 for key, item in value.items()
-                if key not in retired_keys
             }
         if isinstance(value, list):
             return [cls._sanitize_map_metadata(item) for item in value]

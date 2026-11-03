@@ -311,7 +311,7 @@ fn local_revoke_ground_maintenance_reads_only_the_affected_block_column() {
     writer.observe((0..4096).map(|y| [0, y * 32, 0]).chain([[0, 0, 33]]), 20).unwrap();
     let column = heightfield_observations::HeightfieldColumn::from_counts([0, 0], 0.05,
         [0, 33].into_iter().map(|z| (z, [1, 0, 0, 0, 0, 0, 0, 0])).collect()).unwrap().unwrap();
-    let ground = ColumnGroundRecords { classified_empty: false, legacy: vec![],
+    let ground = ColumnGroundRecords { classified_empty: false,
         heightfields: vec![HeightfieldSurface { column, samples: vec![] }] };
     writer.replace_ground_columns([([0, 0], &ground)]).unwrap();
     writer.flush().unwrap();

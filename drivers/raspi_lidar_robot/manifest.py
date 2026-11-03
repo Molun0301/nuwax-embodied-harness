@@ -51,12 +51,6 @@ def build_raspi_lidar_robot_manifest(config: Optional["NuwaxRobotBridgeConfig"] 
         ),
         optional_components=(
             ComponentBinding(
-                name="raspi_mapping_script",
-                path="services.geometry.external_script_runner.Go2ShSlamScript",
-                description="2D 激光雷达 native mapping 后端 launcher。",
-                required=False,
-            ),
-            ComponentBinding(
                 name="raspi_camera_v4l2",
                 path="drivers.common.streaming.V4L2VideoStreamer",
                 description="USB 摄像头 V4L2 抓帧。",
@@ -80,7 +74,6 @@ def build_raspi_lidar_robot_manifest(config: Optional["NuwaxRobotBridgeConfig"] 
             ),
             forbidden_apt_packages=(),
             required_python_packages=("pyserial>=3.5",),
-            external_slam_script="RaspiNativeSlamScript",
             calibration_required=False,
             slam_dimension="2d",
             memory_mode_recommendation="disabled",

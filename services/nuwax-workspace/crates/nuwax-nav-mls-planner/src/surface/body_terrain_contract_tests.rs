@@ -743,7 +743,7 @@ fn c0_terrain_measured_lower_only() -> SurfaceSnapshot {
         let origin = [(f64::from(x) + 0.5) * size, (f64::from(y) + 0.5) * size, height];
         blocks.entry(block_key(key)).or_default().insert(local, LayerObservation {
             members: vec![local], normal: [0.0, 0.0, 1.0], plane_origin: origin,
-            samples: (0..3).map(|i| LayerSample { source: Default::default(), point: origin,
+            samples: (0..3).map(|i| LayerSample { source: std::sync::Arc::new(nuwax_map_chunks::LayerSource::Lidar { backend: 1, runtime_generation: 1, sensor_frame_id: "test".into() }), point: origin,
                 source_sequence: i + 1, source_timestamp_ns: 100 + i, point_index: u32::from(local) }).collect(),
         });
     }

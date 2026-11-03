@@ -1392,7 +1392,6 @@ class SavedPointCloudMapSource(PointCloudMapSource):
         frame_id: str = DEFAULT_MAP_FRAME,
         source_kind: str = "map_asset",
         map_name: Optional[str] = None,
-        asset_manifest_sha256: Optional[str] = None,
         asset_sha256: Optional[str] = None,
         provenance: Optional[Dict[str, object]] = None,
     ) -> None:
@@ -1401,7 +1400,6 @@ class SavedPointCloudMapSource(PointCloudMapSource):
         self._frame_id = str(frame_id or DEFAULT_MAP_FRAME)
         self._source_kind = str(source_kind or "map_asset")
         self._map_name = str(map_name) if map_name is not None else None
-        self._asset_manifest_sha256 = str(asset_manifest_sha256 or "").strip().lower() or None
         self._asset_sha256 = str(asset_sha256 or "").strip().lower() or None
         self._provenance = dict(provenance or {})
         self._opened = False
@@ -1476,11 +1474,7 @@ class SavedPointCloudMapSource(PointCloudMapSource):
                 source=self.source,
                 terminal=True,
             )
-        if self._asset_manifest_sha256:
-            revision = "manifest:%s" % self._asset_manifest_sha256
-            revision_kind = "asset_manifest_sha256"
-            canonical_identity = True
-        elif self._asset_sha256:
+        if self._asset_sha256:
             revision = "asset:%s" % self._asset_sha256
             revision_kind = "asset_sha256"
             canonical_identity = True

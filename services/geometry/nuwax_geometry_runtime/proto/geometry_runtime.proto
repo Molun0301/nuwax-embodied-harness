@@ -10,7 +10,6 @@ package nuwax.geometry;
 
 message Empty {}
 // C1 reliable recovery is scoped to a retained root and an exact member reference.
-// Legacy aliases are opaque historical identifiers, never content-checked hashes.
 message NavigationMapDomain {
   string session = 1;
   uint64 generation = 2;
@@ -22,10 +21,11 @@ message NavigationMapRootIdentity {
   uint64 revision = 2;
 }
 message NavigationMapObjectIdentity {
-  // 1 = assigned (16 bytes), 2 = legacy alias (32 bytes); inactive bytes must be empty.
+  // 分配式对象身份为16字节。
   uint32 kind = 1;
   bytes object_id = 2;
-  bytes legacy_alias = 3;
+  reserved 3;
+  reserved "legacy_alias";
 }
 message NavigationMapBlockRef {
   // Exactly three coordinates in X, Y, Z order.
@@ -95,10 +95,8 @@ message RuntimeStatus {
   uint64 uptime_ms = 3;
   uint32 rss_kb = 4;
   string lcm_backend = 5;
-  // Empty on older servers: assigned fine payloads remain AR2/AR3 only.
-  // AR1 support means unchanged legacy source bytes under assigned ownership.
-  // AR4 source provenance requires explicit advertisement; old readers reject it.
-  repeated uint32 supported_assigned_fine_archive_versions = 6;
+  reserved 6;
+  reserved "supported_assigned_fine_archive_versions";
 }
 
 // === 定位 ===

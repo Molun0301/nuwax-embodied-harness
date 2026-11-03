@@ -141,7 +141,7 @@ fn compare_masks(local: &Local, lower: u128, upper: u128) -> Shape {
 
 use nuwax_map_chunks::heightfield_observations::HeightfieldColumn;
 use nuwax_map_chunks::{
-    ColumnGroundRecords, HeightfieldSurface, Key, LayerObservation, LayerSample, LayerSource,
+    ColumnGroundRecords, HeightfieldSurface, Key, LayerSample, LayerSource,
     Writer, MAX_LAYER_SAMPLES,
 };
 use rayon::prelude::*;
@@ -173,44 +173,31 @@ impl Return {
 fn empty_column() -> ColumnGroundRecords {
     ColumnGroundRecords {
         classified_empty: false,
-        legacy: vec![],
+
         heightfields: vec![],
     }
 }
-fn legacy_height(record: &LayerObservation, xy: Xy, q: f64) -> Option<f64> {
-    record.height_at([(f64::from(xy[0]) + 0.5) * q, (f64::from(xy[1]) + 0.5) * q])
-}
+
 #[derive(Clone, Copy)]
 enum Old<'a> {
     Heightfield(&'a HeightfieldSurface),
-    Legacy(Key, &'a LayerObservation),
 }
 impl Old<'_> {
     fn height(self, xy: Xy, q: f64) -> Option<f64> {
         match self {
             Self::Heightfield(v) => Some(v.column.height()),
-            Self::Legacy(_, v) => legacy_height(v, xy, q),
         }
     }
     fn contains(self, z: i32) -> bool {
         match self {
             Self::Heightfield(v) => v.column.members().any(|(key, _)| key == z),
-            Self::Legacy(block, v) => {
-                z.div_euclid(32) == block[2]
-                    && v.members
-                        .binary_search(&(v.members[0] % 1024 + 1024 * z.rem_euclid(32) as u16))
-                        .is_ok()
-            }
+
         }
     }
     fn members(self) -> Vec<i32> {
         match self {
             Self::Heightfield(v) => v.column.members().map(|(z, _)| z).collect(),
-            Self::Legacy(block, v) => v
-                .members
-                .iter()
-                .map(|local| block[2] * 32 + i32::from(local / 1024))
-                .collect(),
+
         }
     }
 }
@@ -219,7 +206,6 @@ fn old_records(column: &ColumnGroundRecords) -> impl Iterator<Item = Old<'_>> {
         .heightfields
         .iter()
         .map(Old::Heightfield)
-        .chain(column.legacy.iter().map(|(b, v)| Old::Legacy(*b, v)))
 }
 /// 列集合的切比雪夫邻域，以 `(x, y最小, y最大)` 行区间表示。坐标越出 i32 的列
 /// 与逐列 `checked_add` 展开一样被丢弃；区间按行排序，同行重叠或相邻者已合并。
@@ -922,13 +908,7 @@ impl Frame<'_, '_> {
                                 .cloned(),
                         );
                     }
-                    Old::Legacy(_, value) => samples.extend(
-                        value
-                            .samples
-                            .iter()
-                            .filter(|s| sample_member(s, q).is_some_and(|z| keep.contains(&z)))
-                            .cloned(),
-                    ),
+
                 }
             }
             // Two independently normalized old fields do not encode their
@@ -945,7 +925,7 @@ impl Frame<'_, '_> {
         }
         // This actual XY was classified, even when mixed/dynamic returns leave
         // no ground declaration. Preserve that distinction beside occupancy.
-        next.classified_empty = next.legacy.is_empty() && next.heightfields.is_empty();
+        next.classified_empty = next.heightfields.is_empty();
         Ok((previous.is_none_or(|before| before != &next).then_some(next), indices))
     }
 }
@@ -967,17 +947,7 @@ fn retain_old(out: &mut ColumnGroundRecords, old: Old<'_>, keep: &BTreeSet<i32>,
                 });
             }
         }
-        Old::Legacy(block, value) => {
-            let mut value = value.clone();
-            value
-                .members
-                .retain(|local| keep.contains(&(block[2] * 32 + i32::from(*local / 1024))));
-            // Claim withdrawal is not occupancy deletion. Keep real historical
-            // diagnostics; BL4 proves newer samples against their actual voxels.
-            if !value.members.is_empty() {
-                out.legacy.push((block, value));
-            }
-        }
+
     }
 }
 fn retain_samples(samples: &mut Vec<LayerSample>, current: &LayerSource) {

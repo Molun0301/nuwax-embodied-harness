@@ -10,19 +10,16 @@ MAX_FINE_ARCHIVE_BYTES = 1024 * 1024 * 1024
 
 def validate_fine_archive(payload, *, session=None, generation=None, cloud_revision=None,
                           source_timestamp_ns=None, frame_generation=None, producer_generation=None):
-    """读取 AR1/AR2 完整根并核对块结构和原提交；旧摘要字段仅保留为别名。"""
+    """逐记录核对现行完整根、块结构和原提交。"""
     if not isinstance(payload, (bytes, FrozenPayload)) or not 24 <= len(payload) <= MAX_FINE_ARCHIVE_BYTES:
         raise ValueError("精细地图资产类型或大小错误")
     magic = payload[:8]
-    if magic not in (b"NUWAXAR1", b"NUWAXAR2"):
+    if magic not in (b"NUWAXAR4", b"NUWAXAR5"):
         raise ValueError("精细地图资产格式未知")
-    legacy = magic == b"NUWAXAR1"
-    root_offset = 48 if legacy else 16
+    root_offset = 16
     root_length = struct.unpack("<Q", payload[8:16])[0]
     if not 1 <= root_length <= 32 * 1024 * 1024 or root_offset + root_length + 8 > len(payload):
         raise ValueError("精细地图根长度错误")
-    if legacy and not any(payload[16:48]):
-        raise ValueError("精细地图旧根别名为空")
     root_bytes = payload[root_offset:root_offset + root_length]
 
     def unique(pairs):
@@ -38,8 +35,7 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
 
     root = json.loads(root_bytes, object_pairs_hook=unique, parse_constant=nonfinite)
     root_fields = {"version", "domain", "revision", "source_timestamp_ns", "voxel_size_m", "blocks"}
-    if not legacy:
-        root_fields.add("geometry_revision")
+    root_fields.add("geometry_revision")
     if not isinstance(root, dict) or set(root) != root_fields:
         raise ValueError("精细地图根字段错误")
 
@@ -56,12 +52,11 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
             raise ValueError("精细地图对象身份为空")
         return result
 
-    version = 1 if legacy else 2
+    version = int(chr(magic[-1]))
     integer(root["version"], version, version)
     revision = integer(root["revision"], 1, 2 ** 64 - 1)
     source_time = integer(root["source_timestamp_ns"], 1, 2 ** 64 - 1)
-    if not legacy:
-        integer(root["geometry_revision"], 1, revision)
+    integer(root["geometry_revision"], 1, revision)
     size = root["voxel_size_m"]
     if type(size) not in (int, float) or not 0 < size <= 1048576 or not math.isfinite(size):
         raise ValueError("精细地图分辨率错误")
@@ -90,8 +85,7 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
     previous = None
     object_points = {}
     object_offsets = {}
-    reference_fields = ({"key", "sha256", "geometry_sha256", "points"} if legacy else
-                        {"key", "object", "block_revision", "geometry_revision", "points"})
+    reference_fields = {"key", "object", "block_revision", "geometry_revision", "points"}
     for reference in blocks:
         if not isinstance(reference, dict) or set(reference) != reference_fields:
             raise ValueError("精细地图块引用字段错误")
@@ -103,19 +97,15 @@ def validate_fine_archive(payload, *, session=None, generation=None, cloud_revis
             raise ValueError("精细地图块重复或无序")
         previous = key
         points = integer(reference["points"], 1, 32768)
-        if legacy:
-            object_id = ("legacy", identity_bytes(reference["sha256"], 32))
-            identity_bytes(reference["geometry_sha256"], 32)
-        else:
-            object_ref = reference["object"]
-            if not isinstance(object_ref, dict) or set(object_ref) != {"kind", "value"}:
-                raise ValueError("精细地图对象身份字段错误")
-            kind = object_ref["kind"]
-            if kind not in ("assigned", "legacy"):
-                raise ValueError("精细地图对象身份种类错误")
-            object_id = (kind, identity_bytes(object_ref["value"], 16 if kind == "assigned" else 32))
-            block_revision = integer(reference["block_revision"], 1, revision)
-            integer(reference["geometry_revision"], 1, min(block_revision, root["geometry_revision"]))
+        object_ref = reference["object"]
+        if not isinstance(object_ref, dict) or set(object_ref) != {"kind", "value"}:
+            raise ValueError("精细地图对象身份字段错误")
+        kind = object_ref["kind"]
+        if kind != "assigned":
+            raise ValueError("精细地图对象身份种类错误")
+        object_id = (kind, identity_bytes(object_ref["value"], 16))
+        block_revision = integer(reference["block_revision"], 1, revision)
+        integer(reference["geometry_revision"], 1, min(block_revision, root["geometry_revision"]))
         if object_points.setdefault(object_id, points) != points:
             raise ValueError("精细地图同一对象记录数不一致")
         if offset + 4 > len(payload):

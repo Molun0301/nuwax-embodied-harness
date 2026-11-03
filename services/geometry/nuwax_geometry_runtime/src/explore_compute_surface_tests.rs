@@ -1365,77 +1365,7 @@ async fn compute_owner_real_writer_evidence_change_keeps_prepared_query_view() {
     watermark_owner_real_publication_qualifies_prepared_selection(true).await;
 }
 
-#[tokio::test]
-async fn real_writer_same_plane_scatter_change_invalidates_complete_source_view() {
-    let config = watermark_owner_config();
-    let repository = nuwax_map_chunks::Repository::temporary().unwrap();
-    let mut writer = nuwax_map_chunks::Writer::new(repository.clone(), 0.1, 4 * 1024 * 1024).unwrap();
-    let source = watermark_owner_source();
-    let timestamp = now_unix_nanos();
-    writer.observe((0..50).flat_map(|x| (0..30).map(move |y| [x, y, 0])), timestamp).unwrap();
-    let layer_key = [15, 15, 0];
-    let anchor = nuwax_map_chunks::local_key(layer_key);
-    let block_key = nuwax_map_chunks::block_key(layer_key);
-    let layers = |spread: f64| std::collections::BTreeMap::from([(anchor,
-        nuwax_map_chunks::LayerObservation {
-            members: vec![anchor], plane_origin: [1.55, 1.55, 0.025], normal: [0.0, 0.0, 1.0],
-            samples: [0.025 - spread, 0.025 + spread].into_iter().enumerate().map(|(index, z)|
-                nuwax_map_chunks::LayerSample { source: source.clone(), point: [1.55, 1.55, z],
-                    source_sequence: 1, source_timestamp_ns: timestamp, point_index: index as u32 }).collect(),
-        })]);
-    writer.replace_layer_observations(block_key, layers(0.001)).unwrap();
-    writer.record_source_watermark(source.clone(), timestamp, 1).unwrap();
-    let (first_message, first_sealed) = watermark_owner_publication(&mut writer, None, 1, timestamp);
-    let mut cache = nuwax_nav_stack::surface_map::SurfaceMapCache::configured(&config);
-    let first = cache.build(&first_message).unwrap();
-    let receiver = SurfaceInputReceiver::new();
-    receiver.observe(first.clone()).unwrap();
-    let original = receiver.freeze().unwrap();
-    let planning = original.fork_for_planning();
-    let old_evidence = first.observations().unwrap().get(layer_key);
-    let old_layer = first.observations().unwrap().ground_layers([15, 15]).next().unwrap();
-    let old_scatter = old_layer.statistics.moments().sample_scatter().unwrap();
-    let old_query = first.query_ground([1.55, 1.55], 0.025);
-    // Same occupied members, plane, normal, sample identity and mean. Only the
-    // truthful sample spread changes; no observe() call advances voxel evidence.
-    writer.replace_layer_observations(block_key, layers(0.01)).unwrap();
-    let (second_message, second_sealed) = watermark_owner_publication(&mut writer,
-        Some(first_sealed.manifest().as_ref()), 2, timestamp + 1);
-    let first_root = first_sealed.manifest();
-    let second_root = second_sealed.manifest();
-    assert_eq!(first_root.geometry_revision, second_root.geometry_revision);
-    assert_eq!(first_root.source_watermarks, second_root.source_watermarks);
-    assert_ne!(first_root.blocks, second_root.blocks);
-    let before = first_root.blocks.iter().find(|reference| reference.key == block_key).unwrap();
-    let after = second_root.blocks.iter().find(|reference| reference.key == block_key).unwrap();
-    assert!(after.block_revision > before.block_revision);
-    assert_eq!(after.geometry_revision, before.geometry_revision);
-    assert_eq!(after.points, before.points);
-    let before_bytes = repository.read_object(before.object, nuwax_map_chunks::MAX_BLOCK_BYTES).unwrap();
-    let after_bytes = repository.read_object(after.object, nuwax_map_chunks::MAX_BLOCK_BYTES).unwrap();
-    assert_ne!(before_bytes, after_bytes);
-    let second = cache.build(&second_message).unwrap();
-    let new_layer = second.observations().unwrap().ground_layers([15, 15]).next().unwrap();
-    let new_scatter = new_layer.statistics.moments().sample_scatter().unwrap();
-    let new_query = second.query_ground([1.55, 1.55], 0.025);
-    assert_eq!(old_evidence, second.observations().unwrap().get(layer_key));
-    assert_eq!(old_layer.members, new_layer.members);
-    assert_eq!(old_layer.plane_origin, new_layer.plane_origin);
-    assert_eq!(old_layer.normal, new_layer.normal);
-    assert!((old_layer.statistics.moments().mean()[2] - new_layer.statistics.moments().mean()[2]).abs() < 1e-12);
-    assert!(new_scatter[5] > old_scatter[5]);
-    assert_eq!(old_query.height, new_query.height);
-    assert!(new_query.max_residual_m.unwrap() > old_query.max_residual_m.unwrap());
-    assert!(first.same_geometry(&second));
-    assert!(first.observations().unwrap().same_geometry(second.observations().unwrap()));
-    assert_eq!(cache.last_build_stats().unwrap().input_points, 0);
-    assert!(!Arc::ptr_eq(first.observations().unwrap(), second.observations().unwrap()));
-    receiver.observe(second).unwrap();
-    let current = receiver.freeze().unwrap();
-    assert!(!original.same_source_view(&current));
-    assert!(!original.same_planning_query_view(&current));
-    assert!(planning.rebind_original(&current).is_none());
-}
+
 
 // DRAFT ONLY: append inside the existing explore_runtime::tests inclusion via
 // explore_compute_surface_tests.rs. Reuses the real Writer, wire codec, cache,
@@ -1603,95 +1533,7 @@ async fn compute_owner_repeated_writer_evidence_keeps_query_equivalent_selection
     if let Err(panic) = cleanup { std::panic::resume_unwind(panic); }
 }
 
-#[tokio::test]
-async fn real_writer_measured_metadata_keeps_private_query_and_new_raw_evidence() {
-    let config = watermark_owner_config();
-    let repository = nuwax_map_chunks::Repository::temporary().unwrap();
-    let mut writer = nuwax_map_chunks::Writer::new(repository.clone(), 0.1, 4 * 1024 * 1024).unwrap();
-    let source = watermark_owner_source();
-    let key = [15, 15, 0];
-    let block = nuwax_map_chunks::block_key(key);
-    let anchor = nuwax_map_chunks::local_key(key);
-    let first_time = now_unix_nanos();
-    writer.observe((0..50).flat_map(|x| (0..30).map(move |y| [x, y, 0])), first_time).unwrap();
-    let layers = |timestamp, sequence| std::collections::BTreeMap::from([(anchor,
-        nuwax_map_chunks::LayerObservation {
-            members: vec![anchor], plane_origin: [1.55, 1.55, 0.025], normal: [0.0, 0.0, 1.0],
-            samples: [0.024, 0.026].into_iter().enumerate().map(|(index, z)|
-                nuwax_map_chunks::LayerSample { source: source.clone(), point: [1.55, 1.55, z],
-                    source_sequence: sequence, source_timestamp_ns: timestamp, point_index: index as u32 }).collect(),
-        })]);
-    let original_layers = layers(first_time, 1);
-    writer.replace_layer_observations(block, original_layers.clone()).unwrap();
-    writer.record_source_watermark(source.clone(), first_time, 1).unwrap();
-    let (first_message, first_sealed) = watermark_owner_publication(&mut writer, None, 1, first_time);
-    let mut cache = nuwax_nav_stack::surface_map::SurfaceMapCache::configured(&config);
-    let first = cache.build(&first_message).unwrap();
-    let receiver = SurfaceInputReceiver::new();
-    receiver.observe(first.clone()).unwrap();
-    let original = receiver.freeze().unwrap();
-    let planning = original.fork_for_planning();
-    let old_layer = first.observations().unwrap().ground_layers([15, 15]).next().unwrap();
-    let old_query = planning.query_snapshot().unwrap().query_ground([1.55, 1.55], 0.025);
-    let old_evidence = first.observations().unwrap().get(key).unwrap();
-    let mut previous = first_sealed.manifest().clone();
-    let mut timestamp = first_time;
-    let mut rebound_results = Vec::new();
-    for (revision, renew_layer_samples) in [(2, false), (3, true)] {
-        timestamp = now_unix_nanos().max(timestamp + 1);
-        writer.observe([key], timestamp).unwrap();
-        let expected_layers = if renew_layer_samples {
-            let renewed = layers(timestamp, revision as u64);
-            writer.replace_layer_observations(block, renewed.clone()).unwrap();
-            renewed
-        } else { original_layers.clone() };
-        writer.record_source_watermark(source.clone(), timestamp, revision as u64).unwrap();
-        let (message, sealed) = watermark_owner_publication(&mut writer,
-            Some(previous.as_ref()), revision, timestamp);
-        assert_eq!(previous.geometry_revision, sealed.manifest().geometry_revision);
-        assert_ne!(previous.blocks, sealed.manifest().blocks);
-        let reference = sealed.manifest().blocks.iter().find(|reference| reference.key == block).unwrap();
-        let bytes = repository.read_object(reference.object, nuwax_map_chunks::MAX_BLOCK_BYTES).unwrap();
-        assert_eq!(nuwax_map_chunks::decode_layer_observations(&bytes).unwrap(), expected_layers,
-            "raw layer sample identity/time remains truthful in the actual persisted object");
-        let current_snapshot = cache.build(&message).unwrap();
-        let current_layer = current_snapshot.observations().unwrap().ground_layers([15, 15]).next().unwrap();
-        assert_eq!(old_layer.anchor, current_layer.anchor);
-        assert_eq!(old_layer.members, current_layer.members);
-        assert_eq!(old_layer.normal, current_layer.normal);
-        assert_eq!(old_layer.plane_origin, current_layer.plane_origin);
-        assert_eq!(old_layer.statistics, current_layer.statistics);
-        assert!(first.same_geometry(&current_snapshot));
-        assert!(!Arc::ptr_eq(first.observations().unwrap(), current_snapshot.observations().unwrap()));
-        let new_evidence = current_snapshot.observations().unwrap().get(key).unwrap();
-        assert_eq!(new_evidence.observed_ns, timestamp);
-        assert_eq!(new_evidence.hits, old_evidence.hits + (revision - 1) as u16);
-        let new_query = current_snapshot.query_ground([1.55, 1.55], 0.025);
-        assert_eq!(old_query.state, new_query.state);
-        assert_eq!(old_query.height, new_query.height);
-        assert_eq!(old_query.normal, new_query.normal);
-        assert_eq!(old_query.sources, new_query.sources);
-        assert_eq!(old_query.radius_m, new_query.radius_m);
-        assert_eq!(old_query.max_residual_m, new_query.max_residual_m);
-        receiver.observe(current_snapshot.clone()).unwrap();
-        let current = receiver.freeze().unwrap();
-        assert!(!original.same_source_view(&current));
-        assert_eq!(current.notification(), original.notification() + (revision - 1) as u64);
-        let rebound = planning.rebind_original(&current);
-        if let Some(rebound) = rebound.as_ref() {
-            assert!(Arc::ptr_eq(rebound.original_input().snapshot().unwrap(), &current_snapshot));
-            assert!(Arc::ptr_eq(rebound.query_snapshot().unwrap(), planning.query_snapshot().unwrap()));
-            assert_eq!(rebound.original_input().notification(), current.notification());
-            assert_eq!(rebound.original_input().snapshot().unwrap().observations().unwrap().get(key), Some(new_evidence));
-            assert_eq!(rebound.query_snapshot().unwrap().observations().unwrap().get(key), Some(old_evidence));
-        }
-        rebound_results.push((renew_layer_samples, rebound.is_some()));
-        previous = sealed.manifest().clone();
-    }
-    assert_eq!(first.observations().unwrap().get(key).unwrap(), old_evidence);
-    assert_eq!(rebound_results, vec![(false, true), (true, true)],
-        "NEW contract: unchanged complete layer query payload must preserve the private query");
-}
+
 
 // These controls first prove a truthful Writer raw-only transition qualifies,
 // then independently revoke the prepared result through an unchanged safety gate.
@@ -1703,7 +1545,6 @@ enum QueryEquivalentSafetyFence {
     Frame,
     PartialSource,
     RecentInput,
-    LayerScatter,
 }
 
 async fn query_equivalent_writer_still_obeys_safety_fence(fence: QueryEquivalentSafetyFence) {
@@ -1724,18 +1565,6 @@ async fn query_equivalent_writer_still_obeys_safety_fence(fence: QueryEquivalent
         writer.observe([0, 30].into_iter().flat_map(|z| (0..50).flat_map(move |x|
             (0..30).map(move |y| [x, y, z]))), first_time).unwrap();
         let key = [15, 15, 0];
-        let block = nuwax_map_chunks::block_key(key);
-        let anchor = nuwax_map_chunks::local_key(key);
-        let layers = |spread: f64| std::collections::BTreeMap::from([(anchor,
-            nuwax_map_chunks::LayerObservation {
-                members: vec![anchor], plane_origin: [1.55, 1.55, 0.025], normal: [0.0, 0.0, 1.0],
-                samples: [0.025 - spread, 0.025 + spread].into_iter().enumerate().map(|(index, z)|
-                    nuwax_map_chunks::LayerSample { source: source.clone(), point: [1.55, 1.55, z],
-                        source_sequence: 1, source_timestamp_ns: first_time, point_index: index as u32 }).collect(),
-            })]);
-        if matches!(fence, QueryEquivalentSafetyFence::LayerScatter) {
-            writer.replace_layer_observations(block, layers(0.001)).unwrap();
-        }
         writer.record_source_watermark(source.clone(), first_time, 1).unwrap();
         let (first_message, first_sealed) = watermark_owner_publication(&mut writer, None, 1, first_time);
         let (first, _) = watermark_owner_install(&handle, &mut cache, &first_message).await;
@@ -1757,9 +1586,7 @@ async fn query_equivalent_writer_still_obeys_safety_fence(fence: QueryEquivalent
             // A statistics control may prepare a valid non-Goal projection. It
             // still must not commit any staged state from the changed query.
             assert!(audit.captures[0].preview.is_ok(), "{fence:?}: {:?}", audit.captures[0].preview);
-            if !matches!(fence, QueryEquivalentSafetyFence::LayerScatter) {
-                let _ = surface_owner_goal(audit.captures[0].preview.as_ref().unwrap());
-            }
+            let _ = surface_owner_goal(audit.captures[0].preview.as_ref().unwrap());
         }
         let second_time = now_unix_nanos().max(first_time + 1);
         writer.observe([key], second_time).unwrap();
@@ -1833,21 +1660,7 @@ async fn query_equivalent_writer_still_obeys_safety_fence(fence: QueryEquivalent
                 publish_surface_owner_receipt(&handle, &second_message.committed_map, 3, changed).await;
                 assert!(!original.same_planning_query_view(&receiver.freeze().unwrap()));
             }
-            QueryEquivalentSafetyFence::LayerScatter => {
-                writer.replace_layer_observations(block, layers(0.01)).unwrap();
-                let third_time = now_unix_nanos().max(second_time + 1);
-                let (third_message, third_sealed) = watermark_owner_publication(&mut writer,
-                    Some(second_sealed.manifest().as_ref()), 3, third_time);
-                assert_eq!(second_sealed.manifest().geometry_revision, third_sealed.manifest().geometry_revision);
-                let (third, _) = watermark_owner_install(&handle, &mut cache, &third_message).await;
-                assert!(second.same_geometry(&third));
-                assert_eq!(second.observations().unwrap().get(key), third.observations().unwrap().get(key));
-                assert!(third.query_ground([1.55, 1.55], 0.025).max_residual_m.unwrap()
-                    > second.query_ground([1.55, 1.55], 0.025).max_residual_m.unwrap());
-                assert!(!original.same_planning_query_view(&receiver.freeze().unwrap()));
-                assert!(planning.rebind_original(&receiver.freeze().unwrap()).is_none());
-                eprintln!("原地面层围栏失效原因={:?}", original.planning_query_change(&receiver.freeze().unwrap()));
-            }
+
         }
         gate.release();
         let joined = owner_watchdog(ticking.as_mut().unwrap()).await;
@@ -1891,8 +1704,4 @@ async fn compute_owner_query_equivalent_writer_rejects_partial_source() {
 #[tokio::test]
 async fn compute_owner_query_equivalent_writer_rejects_injected_recent() {
     query_equivalent_writer_still_obeys_safety_fence(QueryEquivalentSafetyFence::RecentInput).await;
-}
-#[tokio::test]
-async fn compute_owner_query_equivalent_writer_rejects_changed_layer_scatter() {
-    query_equivalent_writer_still_obeys_safety_fence(QueryEquivalentSafetyFence::LayerScatter).await;
 }

@@ -93,13 +93,9 @@ class AssignedSavedDisplayGatewayTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'SOURCE_CHANGED'):
             self.gateway.get_dense_cloud_chunk(expected_source_epoch='path:configured')
 
-    def test_closed_gateway_and_activation_fence_reject(self):
+    def test_closed_gateway_rejects_dense_delivery(self):
         self.gateway._closed = True
         with self.assertRaises(RuntimeError): self.dense()
-        self.gateway._closed = False
-        with patch.object(self.runtime, 'is_map_asset_activation_recovery_pending', return_value=True):
-            self.assertIsNone(self.gateway.get_pointcloud_map_snapshot())
-            with self.assertRaises(RuntimeError): self.dense()
 
     def test_display_stays_offline_without_provider_ready(self):
         self.provider._connected = False

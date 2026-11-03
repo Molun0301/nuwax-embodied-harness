@@ -462,7 +462,8 @@ class CompletedMapCleanup:
                     raise _error("预览输入发生变化，请重新预览")
             job["state"] = "applying"
         try:
-            self._save_copy(job, name)
+            with self.owner._repository.map_activation_executor_guard():
+                self._save_copy(job, name)
         except Exception as error:
             with self.lock:
                 job.update(state="failed", error=str(error))

@@ -20,7 +20,7 @@ from tests.test_assigned_asset_storage import MAP_NAME
 from tests.test_assigned_workspace_relocalization import RelocalizationNativeStub
 from tests.conftest import dense_bytes, fine_bytes
 
-from contracts.map_relocalization import AssignedRelocalizationQuery, AssignedRelocalizationRequest
+from contracts.map_relocalization import AssignedRelocalizationRequest
 from contracts.map_workspace import AssetIdentityV2
 from contracts.navigation import ExploreAreaRequest
 from contracts.runtime_views import LocalizationSessionStatus
@@ -322,48 +322,6 @@ class AssignedExplorationCycleTests(unittest.TestCase):
         self.assertEqual(self.localization.get_active_session().asset_identity, second.asset_identity)
         self.assertEqual(self.localization.get_active_session().status, LocalizationSessionStatus.READY)
 
-    def test_lost_reply_resume_retry_retains_request_timeout_and_reads_current_sample(self):
-        with self.cloud_only():
-            saved = self.pause()
-            request = saved.request.model_copy(update={"resume_progress_json": saved.geometry_progress_json}, deep=True)
-            context = self.add_task("task:retry", request)
-            def metadata_before_dispatch(request):
-                metadata = self.tasks.get_task_spec(context.task_id).metadata["resume_relocalization"]
-                self.assertEqual(metadata["request_id"], request.request_id)
-                self.assertEqual(metadata["logical_timeout_ms"], request.logical_timeout_ms)
-                self.assertEqual(metadata["asset_identity"], saved.asset_identity.model_dump())
-
-            self.stub.before_dispatch = metadata_before_dispatch
-            self.stub.lose_relocalization_reply = True
-            with self.assertRaises(GatewayError):
-                gateway_checkpoint.prepare_resume(self.gateway, context, request, saved.checkpoint_id, "acceptance")
-            original = AssignedRelocalizationRequest.from_proto(self.stub.relocalization_requests[0])
-            self.assertEqual(original.logical_timeout_ms, 12_500)
-            retained = deepcopy(self.tasks.get_task_spec(context.task_id).metadata["resume_relocalization"])
-            self.assertEqual(retained["checkpoint_id"], saved.checkpoint_id)
-            self.assertEqual(retained["asset_identity"], saved.asset_identity.model_dump())
-            self.assertEqual(retained["mapping_checkpoint_id"], saved.mapping_checkpoint_id)
-            self.assertEqual(retained["request_id"], original.request_id)
-            self.assertEqual(retained["logical_timeout_ms"], original.logical_timeout_ms)
-            self.assertNotEqual(self.localization.get_active_session().status, LocalizationSessionStatus.READY)
-            context.remaining = 2.0
-            samples_before = len(self.stub.sample_requests)
-            self.stub.sample_mutation = lambda sample: sample.Clear()
-            with self.assertRaises((ValueError, GatewayError)):
-                gateway_checkpoint.prepare_resume(self.gateway, context, request, saved.checkpoint_id, "acceptance")
-            self.assertNotEqual(self.localization.get_active_session().status, LocalizationSessionStatus.READY)
-            self.assertEqual(len(self.stub.relocalization_requests), 1)
-            self.stub.sample_mutation = None
-            gateway_checkpoint.prepare_resume(self.gateway, context, request, saved.checkpoint_id, "acceptance")
-        self.assertEqual(len(self.stub.relocalization_requests), 1)
-        self.assertEqual(self.tasks.get_task_spec(context.task_id).metadata["resume_relocalization"], retained)
-        self.assertEqual(self.stub.calls.count("ActivateMap"), 1)
-        self.assertGreater(len(self.stub.sample_requests), samples_before)
-        for wire in self.stub.query_requests:
-            self.assertTrue(AssignedRelocalizationQuery.from_proto(wire).request.exact_replay_of(original))
-        for wire in self.stub.sample_requests:
-            self.assertTrue(AssignedRelocalizationRequest.from_proto(wire).exact_replay_of(original))
-        self.assertEqual(self.localization.get_active_session().status, LocalizationSessionStatus.READY)
 
     def test_pause_rejects_native_source_skew_without_publishing_record(self):
         for key, value in (("origin_session_id", "wrong-source"), ("origin_session_generation", 99),
@@ -615,84 +573,9 @@ class AssignedExplorationCycleTests(unittest.TestCase):
             self.assertEqual(retry["map_asset_finalize"]["asset_identity"], completed.asset_identity.model_dump())
             self.assertNotIn("manifest_sha256", retry["map_asset_finalize"])
 
-    def test_prepared_fsync_failure_retry_dispatches_original_request_once(self):
-        with self.cloud_only():
-            saved = self.pause()
-            request = saved.request.model_copy(update={"resume_progress_json": saved.geometry_progress_json})
-            context = self.add_task("task:prepared-retry", request)
-            original_fsync = catalog_module._fsync_directory
-            faults = []
 
-            def fail_prepared(directory):
-                path = self.service._repository._relocalization_intent_path
-                if path.exists() and json.loads(path.read_text())["phase"] == "prepared" and not faults:
-                    faults.append(True)
-                    raise OSError("prepared request directory fsync failed before dispatch")
-                return original_fsync(directory)
 
-            with patch.object(catalog_module, "_fsync_directory", side_effect=fail_prepared), \
-                    self.assertRaises((GatewayError, OSError)):
-                gateway_checkpoint.prepare_resume(self.gateway, context, request, saved.checkpoint_id, "acceptance")
-            self.assertEqual(faults, [True])
-            pending = self.service._repository.get_assigned_relocalization_intent()
-            self.assertEqual(pending["phase"], "prepared")
-            original = AssignedRelocalizationRequest.from_dict(pending["assigned_request_v2"])
-            metadata = deepcopy(self.tasks.get_task_spec(context.task_id).metadata["resume_relocalization"])
-            self.assertEqual(original.request_id, metadata["request_id"])
-            self.assertEqual(original.logical_timeout_ms, 12_500)
-            self.assertFalse(self.stub.relocalization_requests)
-            self.assertEqual(self.stub.calls.count("ActivateMap"), 1)
-            context.remaining = 1.0
-            gateway_checkpoint.prepare_resume(self.gateway, context, request, saved.checkpoint_id, "acceptance")
-            self.assertEqual(self.tasks.get_task_spec(context.task_id).metadata["resume_relocalization"], metadata)
-            self.assertEqual(len(self.stub.relocalization_requests), 1)
-            self.assertTrue(AssignedRelocalizationRequest.from_proto(
-                self.stub.relocalization_requests[0]).exact_replay_of(original))
-            self.assertEqual(self.stub.calls.count("ActivateMap"), 1)
-            self.assertEqual(self.localization.get_active_session().status, LocalizationSessionStatus.READY)
-
-    def test_recovery_cannot_adopt_another_ready_request_on_the_same_activation(self):
-        with self.cloud_only():
-            saved = self.pause()
-            request = saved.request.model_copy(update={"resume_progress_json": saved.geometry_progress_json})
-            context = self.add_task("task:recovery-replacement", request)
-            self.stub.lose_relocalization_reply = True
-            with self.assertRaises(GatewayError):
-                gateway_checkpoint.prepare_resume(self.gateway, context, request, saved.checkpoint_id, "acceptance")
-            original = AssignedRelocalizationRequest.from_proto(self.stub.relocalization_requests[0])
-            checks = []
-            replacement = []
-
-            def another_request_after_pending_capture():
-                checks.append(True)
-                if len(checks) != 2:
-                    return
-                # An independent operation settles the old pending request, then
-                # genuinely relocalizes this same installed map before recovery.
-                self.service.recover_relocalization_receipt()
-                self.stub.lose_relocalization_reply = False
-                self.stub.terminal = None
-                session, workspace = self.service.relocalize_active_map(map_name=MAP_NAME,
-                    metadata={"business_request_id": "relocalize:independent-successor", "logical_timeout_ms": 9_000})
-                self.assertTrue(workspace.localization_ready)
-                self.assertEqual(session.status, LocalizationSessionStatus.READY)
-                replacement.append(session.relocalization_terminal_v2.request)
-
-            context.on_active = another_request_after_pending_capture
-            with self.assertRaisesRegex(ValueError, "READY"):
-                gateway_checkpoint.prepare_resume(self.gateway, context, request, saved.checkpoint_id, "acceptance")
-            self.assertEqual(len(replacement), 1)
-            self.assertTrue(replacement[0].activation_receipt.exact_replay_of(original.activation_receipt))
-            self.assertNotEqual(replacement[0].request_id, original.request_id)
-            self.assertNotEqual(replacement[0].logical_timeout_ms, original.logical_timeout_ms)
-            self.assertEqual(self.stub.calls.count("ActivateMap"), 1)
-            self.assertEqual(len(self.stub.relocalization_requests), 2)
-            retained = self.tasks.get_task_spec(context.task_id).metadata["resume_relocalization"]
-            self.assertEqual(retained["request_id"], original.request_id)
-            self.assertEqual(retained["logical_timeout_ms"], original.logical_timeout_ms)
-            self.assertTrue(self.localization.get_active_session().relocalization_terminal_v2.request.exact_replay_of(replacement[0]))
-
-    def test_asset_body_reads_and_native_rpcs_stay_outside_runtime_and_catalog_guards(self):
+    def test_asset_body_reads_and_native_rpcs_stay_outside_runtime_and_short_catalog_guards(self):
         with self.cloud_only(), ExitStack() as probes:
             for cls, names in ((MapAssetBundleRepository, ("get_map_asset_bundle",
                     "get_validated_map_asset_bundle_snapshot", "finalize_assigned_map_asset_bundle")),

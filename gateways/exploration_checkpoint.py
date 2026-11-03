@@ -5,7 +5,6 @@ import json
 import math
 import uuid
 
-from contracts.map_relocalization import AssignedRelocalizationRequest
 from contracts.runtime_views import LocalizationSessionStatus
 from services.geometry.mapping_backend_checkpoint_store import _identity_document
 from services.navigation.exploration_checkpoint import ExplorationCheckpoint, ExplorationCheckpointStore
@@ -100,42 +99,8 @@ def prepare_resume(runtime, context, request, checkpoint_id, requested_by):
     return _prepare_assigned_resume(runtime, context, request, saved, snapshot, catalog, requested_by)
 
 
-def _pending_request(catalog, saved):
-    pending = catalog.maps.get_relocalization_intent()
-    if pending is None:
-        return None, None
-    if pending.get("schema_version") != 2:
-        raise ValueError("另一个旧协议重定位请求仍待对账")
-    request = AssignedRelocalizationRequest.from_dict(pending["assigned_request_v2"])
-    if (request.asset_identity != saved.asset_identity or request.activation_receipt.map_name != saved.request.map_name
-            or request.activation_receipt.to_dict()["request"]["checkpoint_id"] != saved.mapping_checkpoint_id):
-        raise ValueError("未决重定位不属于该探索检查点")
-    return request, pending["phase"]
 
 
-def _resume_request(runtime, context, saved, pending):
-    spec = runtime.task_manager.get_task_spec(context.task_id)
-    retained = spec.metadata.get("resume_relocalization")
-    binding = {"checkpoint_id": saved.checkpoint_id, "asset_identity": saved.asset_identity.model_dump(),
-               "mapping_checkpoint_id": saved.mapping_checkpoint_id}
-    if retained is None:
-        remaining = context.timeout_remaining_sec()
-        if pending is None and remaining is not None and remaining < 0.25:
-            raise ValueError("剩余任务时间不足以提交原生重定位")
-        retained = {**binding, "request_id": pending.request_id if pending is not None else "resume-localize-" + uuid.uuid4().hex,
-            "logical_timeout_ms": pending.logical_timeout_ms if pending is not None
-                else int(min(30.0, remaining if remaining is not None else 30.0) * 1000)}
-        runtime.task_manager.update_task_metadata(context.task_id, {"resume_relocalization": retained})
-    if (not isinstance(retained, dict) or set(retained) != set(binding) | {"request_id", "logical_timeout_ms"}
-            or any(retained[key] != value for key, value in binding.items())
-            or not isinstance(retained["request_id"], str) or not retained["request_id"]
-            or type(retained["logical_timeout_ms"]) is not int or not 250 <= retained["logical_timeout_ms"] <= 30_000
-            or pending is not None and (retained["request_id"] != pending.request_id
-                or retained["logical_timeout_ms"] != pending.logical_timeout_ms)):
-        raise ValueError("探索恢复的原重定位请求绑定已改变")
-    if runtime.task_manager.get_task_spec(context.task_id).metadata.get("resume_relocalization") != retained:
-        raise ValueError("探索恢复请求在任务元数据发布期间已改变")
-    return retained
 
 
 def _require_assigned_target(saved, snapshot, target):
@@ -152,36 +117,22 @@ def _prepare_assigned_resume(runtime, context, request, saved, snapshot, catalog
     service, geometry = runtime.map_workspace_service, runtime.platform_geometry_runtime
     context.ensure_active()
     context.update(stage="resume_exploration_localization", message="恢复准确 assigned 地图并核对真实定位。")
-    pending, pending_phase = _pending_request(catalog, saved)
-    retained = _resume_request(runtime, context, saved, pending)
-    context.ensure_active()
-    if pending is not None and pending_phase != "prepared":
-        # 查询原操作，不能先激活另一个拥有方或换 UUID/timeout 重新执行。
-        recovered = service.recover_relocalization_receipt()
-        if recovered is None:
-            raise ValueError("原重定位拥有方已退役，不能继续旧探索恢复")
-        workspace = service.get_active_workspace(refresh_localization=False)
-        session = service.get_active_localization_session()
-    elif pending is None:
-        service.activate_map(map_name=request.map_name, create_if_missing=False,
-            metadata={"source": "resume_exploration", "requested_by": requested_by or "unknown"})
-        workspace = session = None
-    else:
-        workspace = session = None
+    remaining = context.timeout_remaining_sec()
+    if remaining is not None and remaining < 0.25:
+        raise ValueError("剩余任务时间不足以提交原生重定位")
+    timeout_ms = int(min(30.0, remaining if remaining is not None else 30.0) * 1000)
+    service.activate_map(map_name=request.map_name, create_if_missing=False,
+        metadata={"source": "resume_exploration", "requested_by": requested_by or "unknown"})
     context.ensure_active()
     target = geometry.capture_assigned_map_activation_target(map_name=request.map_name, asset_identity=saved.asset_identity)
     _require_assigned_target(saved, snapshot, target)
-    if pending is not None and not target.activation_receipt.exact_replay_of(pending.activation_receipt):
-        raise ValueError("已恢复重定位与当前安装不是同一拥有方")
-    if pending is None or pending_phase == "prepared":
-        metadata = {"source": "resume_exploration", "business_request_id": retained["request_id"],
-                    "logical_timeout_ms": retained["logical_timeout_ms"]}
-        if saved.pipeline == "slam_2d":
-            pose = saved.localization_seed
-            q = pose.orientation
-            metadata["planar_seed"] = [pose.position.x, pose.position.y,
-                math.atan2(2 * (q.w*q.z + q.x*q.y), 1 - 2 * (q.y*q.y + q.z*q.z))]
-        session, workspace = service.relocalize_active_map(map_name=request.map_name, metadata=metadata)
+    metadata = {"source": "resume_exploration", "logical_timeout_ms": timeout_ms}
+    if saved.pipeline == "slam_2d":
+        pose = saved.localization_seed
+        q = pose.orientation
+        metadata["planar_seed"] = [pose.position.x, pose.position.y,
+            math.atan2(2 * (q.w*q.z + q.x*q.y), 1 - 2 * (q.y*q.y + q.z*q.z))]
+    session, workspace = service.relocalize_active_map(map_name=request.map_name, metadata=metadata)
     context.ensure_active()
     token = service._localization_service.get_active_session_token()
     if (session is None or workspace is None or token[0] is not session
@@ -189,9 +140,6 @@ def _prepare_assigned_resume(runtime, context, request, saved, snapshot, catalog
             or not session.pose_available or session.asset_identity != saved.asset_identity
             or not session.activation_receipt_v2.exact_replay_of(target.activation_receipt)
             or session.relocalization_terminal_v2 is None or session.relocalization_terminal_v2.disposition not in {1, 2}
-            or session.relocalization_terminal_v2.request.request_id != retained["request_id"]
-            or session.relocalization_terminal_v2.request.logical_timeout_ms != retained["logical_timeout_ms"]
-            or pending is not None and not session.relocalization_terminal_v2.request.exact_replay_of(pending)
             or not session.relocalization_terminal_v2.request.activation_receipt.exact_replay_of(target.activation_receipt)
             or workspace.active_map_name != request.map_name or not workspace.localization_ready
             or workspace.active_localization_session is not session or workspace.map_asset is None

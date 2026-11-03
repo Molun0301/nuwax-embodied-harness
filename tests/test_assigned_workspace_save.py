@@ -117,6 +117,7 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
         self.memory = MemoryEndpoint()
         self.navigation = SimpleNamespace(
             list_forbidden_zones=lambda **kwargs: SimpleNamespace(maps={}),
+            clear_latest_exploration_context=lambda **kwargs: None,
             load_forbidden_zones_for_map=lambda **kwargs: None,
             get_latest_navigation_context=lambda: None,
             get_latest_exploration_context=lambda: None,
@@ -184,8 +185,6 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
         self.assertNotIn("content_identity", saved.snapshot.metadata)
         self.assertEqual(saved.snapshot.metadata["source_occupancy_receipt"]["occupancy_revision"], 6)
         self.assertNotEqual(workspace.active_localization_session.session_id, "source")
-        self.assertIsNone(self.service._repository.get_map_activation())
-        self.assertFalse(self.runtime.is_map_asset_activation_recovery_pending())
 
     def test_historical_contaminated_asset_loads_and_new_live_generation_remains_strict(self):
         from tests.test_map_receipt_stream_v2 import update
@@ -239,34 +238,29 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
                 source_epoch=current.source_epoch, occupancy_grid=current.occupancy_grid, metadata=wrong)
         self.assertEqual(rejected.exception.error_code, "map_snapshot_receipt_mismatch")
 
-    def test_failed_map_publication_recovers_through_public_activation_without_reinstall(self):
+    def test_failed_map_publication_restarts_public_activation(self):
         self.ingest_live_receipt()
         saved = self.save()
-        with patch.object(self.mapping, "ingest_external_snapshot", side_effect=RuntimeError("发布失败")):
-            with self.assertRaises(GatewayError):
+        error = RuntimeError("发布失败")
+        with patch.object(self.mapping, "ingest_external_snapshot", side_effect=error):
+            with self.assertRaises(RuntimeError) as raised:
                 self.service.activate_map(map_name=MAP_NAME)
-        pending = self.service._repository.get_map_activation()
-        self.assertTrue(self.runtime.is_map_asset_activation_recovery_pending())
+        self.assertIs(raised.exception, error)
         workspace = self.service.activate_map(map_name=MAP_NAME)
         self.assertTrue(workspace.map_loaded)
         self.assertEqual(workspace.map_asset.asset_identity, saved.asset_identity)
-        self.assertEqual(workspace.active_localization_session.activation_receipt_v2.to_dict()["request"],
-                         pending["activation_request"])
-        self.assertEqual(self.stub.installs, 1)
-        self.assertIsNone(self.service._repository.get_map_activation())
-        self.assertFalse(self.runtime.is_map_asset_activation_recovery_pending())
+        self.assertNotEqual(self.stub.activation_requests[0].activation_request_id,
+                            self.stub.activation_requests[1].activation_request_id)
+        self.assertEqual(self.stub.stop_requests[-1].session_id, self.stub.activation_requests[0].session_id)
 
     def test_failed_map_publication_reactivates_after_native_runtime_restart(self):
         self.ingest_live_receipt()
         saved = self.save()
         with patch.object(self.mapping, "ingest_external_snapshot", side_effect=RuntimeError("发布失败")):
-            with self.assertRaises(GatewayError):
+            with self.assertRaisesRegex(RuntimeError, "发布失败"):
                 self.service.activate_map(map_name=MAP_NAME)
-        pending = self.service._repository.get_map_activation()
-        self.assertEqual(pending["phase"], "reconciling")
-        self.assertIsNotNone(pending["backend_evidence"])
-        self.assertTrue(self.runtime.is_map_asset_activation_recovery_pending())
-        new_generation = pending["activation_request"]["expected_runtime_generation"] + 1
+        previous = self.stub.activation_requests[-1]
+        new_generation = previous.expected_runtime_generation + 1
         # 原生进程重启后只有新代次，原请求及其回执已经消失。
         self.stub.state = pb.MappingSessionState(success=True, phase="IDLE", active=False,
             runtime_generation=new_generation, mapping_backend_kind="voxel")
@@ -285,12 +279,12 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
         self.assertTrue(workspace.map_loaded)
         self.assertEqual(workspace.map_asset.asset_identity, saved.asset_identity)
         request = workspace.active_localization_session.activation_receipt_v2.to_dict()["request"]
-        self.assertNotEqual(request["activation_request_id"], pending["activation_request_id"])
+        self.assertNotEqual(request["activation_request_id"], previous.activation_request_id)
         self.assertEqual(request["activation_request_id"], self.stub.activation_requests[-1].activation_request_id)
         self.assertEqual(request["expected_runtime_generation"], new_generation)
         self.assertEqual(self.stub.installs, 2)
-        self.assertIsNone(self.service._repository.get_map_activation())
-        self.assertFalse(self.runtime.is_map_asset_activation_recovery_pending())
+        self.assertFalse(any((self.root / name).exists() for name in (
+            "map_activation.json", "map_activation_receipt.json", "map_relocalization.json", "map_relocalization_receipt.json")))
 
     def save_as_associations(self):
         from contracts.forbidden_zones import ForbiddenZone, ForbiddenZonePoint
@@ -331,18 +325,17 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
         self.ingest_live_receipt()
         libraries, zones = self.save_as_associations()
         self.stub.error = LostReply()
-        with self.assertRaises(GatewayError):
+        with self.assertRaises(provider_module.GeometryRuntimeMapActivationOutcomeUnknown):
             self.service.finalize_active_map(map_name="新办公室")
         self.assertIsNotNone(self.service._repository.get_map_asset(MAP_NAME))
         self.assertEqual(libraries, {"新办公室"})
         self.stub.error = None
         workspace = self.service.activate_map(map_name="新办公室")
         self.assertTrue(workspace.map_loaded)
-        self.assertEqual(self.stub.installs, 1)
+        self.assertNotEqual(self.stub.activation_requests[0].activation_request_id,
+                            self.stub.activation_requests[-1].activation_request_id)
         self.assertIsNone(self.service._repository.get_map_asset(MAP_NAME))
         self.assertNotIn(MAP_NAME, zones.load().maps)
-        self.assertIsNone(self.service._repository.get_map_activation())
-        self.assertFalse(self.runtime.is_map_asset_activation_recovery_pending())
 
     def test_save_as_existing_map_rejects_without_export_and_keeps_active_session(self):
         self.memory.has_memory_library = lambda name: False
@@ -402,7 +395,7 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
     def assert_unlocked(self, operation):
         for name in ("_runtime_state_lock", "_mapping_lifecycle_lock", "_provider_attach_lock"):
             self.assertFalse(getattr(self.runtime, name)._is_owned(), (operation, name))
-        for name in ("_activation_guard_state", "_activation_executor_guard_state"):
+        for name in ("_activation_guard_state",):
             state = getattr(self.service._repository, name, None)
             if state is not None:
                 self.assertFalse(state.mutex._is_owned(), (operation, name))
@@ -864,38 +857,21 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
         self.assertFalse(self.service._asset_repository.current_directory(MAP_NAME).exists())
         self.assertFalse(self.service._repository.get_map_asset(MAP_NAME).finalized)
 
-    def test_newly_saved_owner_lost_activation_reply_restores_exact_request_without_redispatch(self):
-        with self.assigned_only():
-            saved = self.save()
-            self.stub.error = LostReply()
-            with self.assertRaises(GatewayError):
-                self.service.activate_map(map_name=MAP_NAME)
-            pending = self.service._repository.get_map_activation()
-            request = deepcopy(pending["activation_request"])
-            self.assertEqual(set(request), {"activation_request_id", "session_id", "map_name",
-                "asset_identity", "checkpoint_id", "expected_runtime_generation"})
-            self.assertEqual(request["asset_identity"], saved.asset_identity.model_dump())
-            self.assertEqual(request["checkpoint_id"], self.stub.response.checkpoint_id)
-            self.assertEqual(self.stub.installs, 1)
-            self.assertEqual(self.stub.calls.count("ActivateMap"), 1)
-            self.stub.calls.clear()
-            self.runtime = self.new_runtime()
-            self.service = self.new_service()
-            self.assertEqual(self.stub.calls, [])
-            with patch.object(self.runtime, "prepare_map_asset_bundle",
-                    side_effect=AssertionError("activation recovery reexported saved map")):
-                restored = self.service.restore_active_workspace()
-        self.assertEqual(self.stub.calls, ["GetMappingState"])
-        self.assertEqual(self.stub.installs, 1)
-        self.assertEqual(self.stub.exports, [b''])
-        session = restored.active_localization_session
-        self.assertEqual(session.activation_receipt_v2.to_dict()["request"], request)
-        self.assertEqual(session.asset_identity, saved.asset_identity)
-        self.assertEqual(session.status, LocalizationSessionStatus.LOCALIZING)
-        self.assertFalse(session.pose_available)
+    def test_newly_saved_owner_lost_activation_reply_restarts_on_restore(self):
+        saved = self.save()
+        self.stub.error = LostReply()
+        with self.assertRaises(provider_module.GeometryRuntimeMapActivationOutcomeUnknown):
+            self.service.activate_map(map_name=MAP_NAME)
+        original_request = self.stub.activation_requests[-1]
+        self.stub.error = None
+        self.runtime = self.new_runtime()
+        self.service = self.new_service()
+        restored = self.service.restore_active_workspace()
+        self.assertTrue(restored.map_loaded)
         self.assertFalse(restored.localization_ready)
-        self.assertIsNone(restored.latest_localization_snapshot)
-        self.assertIsNone(self.service._repository.get_map_activation())
+        self.assertEqual(restored.map_asset.asset_identity, saved.asset_identity)
+        self.assertNotEqual(original_request.activation_request_id,
+                            self.stub.activation_requests[-1].activation_request_id)
 
     def test_existing_save_cannot_adopt_old_bundle_after_getter_replaces_same_name_owner(self):
         with self.assigned_only():
@@ -921,45 +897,60 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
         self.assertFalse(self.service._asset_repository.current_directory(MAP_NAME).exists())
         self.assertEqual(self.stub.exports, [b''])
 
-    def test_literal_schema_one_current_is_readonly_and_unsupported_save_is_explicit(self):
-        current = self.service._asset_repository.current_directory(MAP_NAME)
-        geometry = json.loads(LEGACY_BUNDLE)["geometry_asset"]
-        files = {
-            "bundle.json": LEGACY_BUNDLE,
-            "manifest.json": LEGACY_MANIFEST,
-            "geometry/test/geometry_asset.json":
-                json.dumps(geometry, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode() + b"\n",
-            "geometry/test/state.bin": b"state",
-            "geometry/test/map.yaml": b"image: map.pgm\nresolution: 0.125\n",
-            "geometry/test/map.pgm": b"P5\n2 1\n255\n\x00\x64",
-        }
-        for relative, payload in files.items():
-            write(current / relative, payload)
-        inode = current.stat().st_ino
-        self.assertEqual(hashlib.sha256(LEGACY_MANIFEST).hexdigest(), LEGACY_SHA)
-        with patch.object(self.runtime, "prepare_map_asset_bundle",
-                side_effect=AssertionError("existing schema1 map was exported again")), \
-                patch.object(self.service._asset_repository, "finalize_map_asset_bundle",
-                    side_effect=AssertionError("existing schema1 map was republished")), \
-                patch.object(self.service._asset_repository, "finalize_assigned_map_asset_bundle",
-                    side_effect=AssertionError("existing schema1 map was upgraded")):
-            reopened = self.service.get_map_asset_bundle(map_name=MAP_NAME)
-            with self.assertRaises(GatewayError) as error:
-                self.save()
-            self.assertEqual(error.exception.error_code, "map_asset_import_unsupported")
-        for bundle in (reopened,):
-            self.assertEqual(bundle.identity_schema_version, 1)
-            self.assertIsNone(bundle.asset_identity)
-            self.assertEqual(bundle.manifest_sha256, LEGACY_SHA)
-        catalog = MapCatalogRepository(str(self.root)).get_map_asset(MAP_NAME)
-        self.assertTrue(catalog.finalized)
-        self.assertEqual(catalog.identity_schema_version, 1)
-        self.assertIsNone(catalog.asset_identity)
-        self.assertEqual(catalog.asset_manifest_sha256, LEGACY_SHA)
-        self.assertEqual(current.stat().st_ino, inode)
-        self.assertEqual({relative: (current / relative).read_bytes() for relative in files}, files)
-        self.assertEqual(self.stub.exports, [])
-        self.assertEqual(self.stub.calls, [])
+
+
+    def test_lost_relocalization_reply_restarts_with_a_new_request(self):
+        from tests.test_assigned_workspace_relocalization import RelocalizationNativeStub
+        self.stub = RelocalizationNativeStub()
+        self.provider._stub = self.stub
+        self.stub.owner = self.provider
+        self.save()
+        self.service.activate_map(map_name=MAP_NAME)
+        self.stub.during = self.assert_unlocked
+        self.stub.lose_relocalization_reply = True
+        with self.assertRaises(GatewayError) as raised:
+            self.service.relocalize_active_map(map_name=MAP_NAME)
+        self.assertEqual(raised.exception.error_code, "relocalization_failed")
+        self.assertEqual(self.localization.get_active_session().status, LocalizationSessionStatus.LOCALIZING)
+        self.assertFalse(self.localization.get_active_session().pose_available)
+        self.assertIsNone(self.service.get_relocalized_pose(MAP_NAME))
+        self.stub.lose_relocalization_reply = False
+        session, workspace = self.service.relocalize_active_map(map_name=MAP_NAME)
+        self.assertEqual(session.status, LocalizationSessionStatus.READY)
+        self.assertTrue(workspace.localization_ready)
+        first, second = self.stub.relocalization_requests
+        self.assertNotEqual(first.request_id, second.request_id)
+        self.assertFalse(any((self.root / name).exists() for name in (
+            "map_relocalization.json", "map_relocalization_receipt.json")))
+        self.assertTrue(self.service.activate_map(map_name=MAP_NAME).map_loaded)
+
+
+    def test_activation_reads_show_selected_target_without_previous_pose(self):
+        from contracts.map_workspace import AssetIdentityV2
+        from tests.test_assigned_workspace_activation import AssignedWorkspaceActivationTests
+        from tests.test_assigned_workspace_relocalization import RelocalizationNativeStub
+        self.stub = RelocalizationNativeStub()
+        self.provider._stub = self.stub
+        self.stub.owner = self.provider
+        self.save()
+        self.service.activate_map(map_name=MAP_NAME)
+        self.stub.during = self.assert_unlocked
+        self.service.relocalize_active_map(map_name=MAP_NAME)
+        self.assertIsNotNone(self.service.get_relocalized_pose(MAP_NAME))
+        AssignedWorkspaceActivationTests.publish_map(self, "second-map", AssetIdentityV2(asset_id="e" * 32))
+        original = self.stub.ActivateMap
+        observed = []
+        def inspect(request, timeout):
+            self.assertIsNone(self.service.get_active_workspace())
+            self.assertIsNone(self.service.get_relocalized_pose(MAP_NAME))
+            self.assertEqual(self.service.get_active_map_name(), "second-map")
+            observed.append(True)
+            return original(request, timeout)
+        with patch.object(self.stub, "ActivateMap", side_effect=inspect):
+            workspace = self.service.activate_map(map_name="second-map")
+        self.assertEqual(observed, [True])
+        self.assertTrue(workspace.map_loaded)
+        self.assertFalse(workspace.localization_ready)
 
 
 def test_mapping_rename_preserves_records_and_index_incarnation(setup):

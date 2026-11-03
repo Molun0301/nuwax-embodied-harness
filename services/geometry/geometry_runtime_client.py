@@ -274,14 +274,10 @@ class GeometryRuntimeSubprocess:
             try:
                 stub = pb2_grpc.GeometryRuntimeStub(channel)
                 stub.GetStatus(pb2.Empty(), timeout=_ATTACHED_HEALTH_CHECK_TIMEOUT_SEC)
-                # 旧运行时没有代际字段时仍可按原协议挂接，但不允许同代复用优化。
-                try:
-                    health = stub.HealthCheck(pb2.HealthCheckRequest(), timeout=_ATTACHED_HEALTH_CHECK_TIMEOUT_SEC)
-                    generation = int(health.runtime_generation)
-                    if generation > 0:
-                        self._last_probed_runtime_generation = generation
-                except Exception as exc:
-                    LOGGER.debug("当前GetStatus可用，但未取得可复核runtime_generation：%s", exc)
+                health = stub.HealthCheck(pb2.HealthCheckRequest(), timeout=_ATTACHED_HEALTH_CHECK_TIMEOUT_SEC)
+                generation = int(health.runtime_generation)
+                if generation > 0:
+                    self._last_probed_runtime_generation = generation
                 return True
             finally:
                 channel.close()

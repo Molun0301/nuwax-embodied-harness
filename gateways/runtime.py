@@ -1357,79 +1357,7 @@ class GatewayRuntime:
                 )
             )
 
-    @staticmethod
-    def _bounded_relocalization_owner_pending(
-        pending: object,
-    ) -> Optional[Dict[str, object]]:
-        if not isinstance(pending, dict):
-            return None
-        projected: Dict[str, object] = {}
-        limits = {
-            "request_id": 128,
-            "phase": 64,
-            "recovery_state": 64,
-            "target_map_name": 256,
-        }
-        for key, limit in limits.items():
-            value = pending.get(key)
-            if value is None:
-                continue
-            if not isinstance(value, str) or not value or len(value) > limit:
-                return None
-            projected[key] = value
-        if not isinstance(projected.get("request_id"), str):
-            return None
-        if not isinstance(
-            projected.get("phase", projected.get("recovery_state")),
-            str,
-        ):
-            return None
-        return projected
 
-    def _settle_relocalization_owner_before_geometry_stop(
-        self,
-        *,
-        operation: str,
-    ) -> Dict[str, object]:
-        try:
-            outcome = self.map_workspace_service.shutdown_relocalization_owner()
-        except Exception as exc:
-            raise GatewayError(
-                "Gateway停止前重定位 durable owner 状态无效。",
-                error_code="gateway_stop_relocalization_owner_invalid",
-                http_status=503,
-                jsonrpc_code=-32010,
-                details={
-                    "operation": operation,
-                    "reason": "owner_call_failed",
-                },
-            ) from exc
-        if not isinstance(outcome, dict):
-            reason = "outcome_not_mapping"
-        elif not isinstance(outcome.get("settled"), bool):
-            reason = "settled_not_boolean"
-        elif outcome["settled"] is True and outcome.get("pending") is None:
-            return {"settled": True, "pending": None}
-        else:
-            pending = self._bounded_relocalization_owner_pending(
-                outcome.get("pending") if isinstance(outcome, dict) else None
-            )
-            if pending is not None and outcome.get("settled") is False:
-                raise GatewayError(
-                    "Gateway停止前重定位 durable owner 尚未 settled。",
-                    error_code="gateway_stop_relocalization_owner_pending",
-                    http_status=503,
-                    jsonrpc_code=-32010,
-                    details={"operation": operation, **pending},
-                )
-            reason = "pending_shape_invalid"
-        raise GatewayError(
-            "Gateway停止前重定位 durable owner 状态无效。",
-            error_code="gateway_stop_relocalization_owner_invalid",
-            http_status=503,
-            jsonrpc_code=-32010,
-            details={"operation": operation, "reason": reason},
-        )
 
     def stop(self) -> None:
         """停止宿主机运行时。
@@ -1443,8 +1371,6 @@ class GatewayRuntime:
         """
 
         stop_error: Optional[Exception] = None
-        relocalization_stop_error: Optional[GatewayError] = None
-        relocalization_pending: Dict[str, object] = {}
         with self._lifecycle_lock:
             if not self._started:
                 recorder = self.mapping_recorder
@@ -1474,28 +1400,6 @@ class GatewayRuntime:
                 )
             self.task_manager.shutdown(wait=True)
             self._join_exploration_finalizers()
-            try:
-                self._settle_relocalization_owner_before_geometry_stop(
-                    operation="gateway_stop",
-                )
-            except GatewayError as exc:
-                relocalization_stop_error = exc
-                relocalization_pending = {
-                    key: value
-                    for key, value in exc.details.items()
-                    if key not in {"operation", "reason"}
-                }
-                RUNTIME_LOGGER.error(
-                    "Gateway停止前重定位 durable owner 未收敛。",
-                    extra={
-                        "error_code": exc.error_code,
-                        "request_id": relocalization_pending.get("request_id", "-"),
-                        "phase": relocalization_pending.get(
-                            "phase",
-                            relocalization_pending.get("recovery_state", "-"),
-                        ),
-                    },
-                )
             if self._stop_runtime_input_bridge() is False and stop_error is None:
                 stop_error = RuntimeError("传感器输入桥未完成关闭。")
             cleanup_steps = (
@@ -1537,18 +1441,10 @@ class GatewayRuntime:
             self._started = False
             self._closed = True
 
-            owner_settled = relocalization_stop_error is None
             event_payload: Dict[str, object] = {
-                "success": stop_error is None and owner_settled,
+                "success": stop_error is None,
                 "memory_shutdown_complete": self._memory_shutdown_complete,
-                "relocalization_owner_settled": owner_settled,
-                "stop_error_code": (
-                    relocalization_stop_error.error_code
-                    if relocalization_stop_error is not None
-                    else None
-                ),
             }
-            event_payload.update(relocalization_pending)
             self.event_bus.publish(
                 self.event_bus.build_event(
                     "system.gateway_stopped",
@@ -1564,8 +1460,6 @@ class GatewayRuntime:
                 )
             )
             dispatch_complete = self._close_dispatch_resources()
-            if relocalization_stop_error is not None:
-                raise relocalization_stop_error
             if stop_error is not None:
                 raise stop_error
             if dispatch_complete is False:
@@ -2033,8 +1927,6 @@ class GatewayRuntime:
         if self._closed:
             raise RuntimeError("网关已关闭")
         platform = self.platform_geometry_runtime
-        if platform.is_map_asset_activation_recovery_pending():
-            raise RuntimeError("DENSE_CLOUD_SOURCE_CHANGED")
         before = self.get_pointcloud_map_snapshot()
         if expected_source_epoch and (before is None or before.source_epoch != expected_source_epoch):
             raise RuntimeError("DENSE_CLOUD_SOURCE_CHANGED")
@@ -2070,8 +1962,7 @@ class GatewayRuntime:
         def display_identity(value):
             return (value.source, value.source_epoch, value.stream_generation) if value is not None else None
         changed = before is not after if assigned is not None else display_identity(before) != display_identity(after)
-        if (self._closed or changed
-                or platform.is_map_asset_activation_recovery_pending()):
+        if self._closed or changed:
             raise RuntimeError("DENSE_CLOUD_SOURCE_CHANGED")
         metadata, payload = result
         return {**metadata, "display_source_epoch": before.source_epoch if before is not None else ""}, payload
@@ -2093,9 +1984,6 @@ class GatewayRuntime:
 
     def _require_pointcloud_source_current(self, snapshot):
         platform = self.platform_geometry_runtime
-        if platform.is_map_asset_activation_recovery_pending():
-            raise PointCloudMapSourceError("activation_recovery_pending", "地图激活期间暂停点云交付。",
-                source=snapshot.source, retryable=True)
         assigned = getattr(snapshot, "assigned_source_owner", None)
         try:
             if assigned is not None:
@@ -2864,12 +2752,6 @@ class GatewayRuntime:
                 input_schema=_schema_object(
                     {
                         "map_name": {"type": "string"},
-                        "business_request_id": {"type": "string", "minLength": 1, "maxLength": 128,
-                            "pattern": "^[A-Za-z0-9._:-]+$",
-                            "description": "新重定位的业务编号，原值持久化；相同编号重试必须保持参数一致。省略则生成一次 UUID。"},
-                        "request_id": {"type": "string", "minLength": 1, "maxLength": 128,
-                            "pattern": "^[A-Za-z0-9._:-]+$",
-                            "description": "兼容恢复入口：填写此前返回的内部编号，仅查询/恢复已有请求；不得与 business_request_id 同时提供。"},
                         "planar_seed": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3,
                             "description": "二维地图初始位置[x米, y米, 偏航弧度]；缺省使用近期位置或图中保存位置作为匹配初值。"},
                         "timeout_sec": {"type": "number", "exclusiveMinimum": 0.0},
@@ -10515,15 +10397,6 @@ class GatewayRuntime:
         descriptor = self.capability_registry.get_descriptor(capability_name)
         timeout_sec = self._resolve_async_timeout(capability_name, arguments, minimum_sec=1.0)
         payload = dict(arguments or {})
-        if capability_name == "relocalize_active_map":
-            from core.relocalization_request_id import relocalization_request_identity
-            request_id, _ = relocalization_request_identity(payload)
-            # 传输层 JSON-RPC 编号不是业务身份。省略业务编号时只为本次受理分配一次。
-            if request_id is None:
-                request_id = "relocalize:" + uuid.uuid4().hex
-                payload["business_request_id"] = request_id
-            if request_context is not None and not str(request_context.get("request_id") or "").strip():
-                request_context["request_id"] = request_id
 
         def runner(context) -> Dict[str, Any]:
             context.ensure_active()
@@ -12964,10 +12837,6 @@ class GatewayRuntime:
                             ensure_activation_deadline()
                             runtime_status = self.platform_geometry_runtime.get_runtime_status()
                             if runtime_status.get("started"):
-                                ensure_activation_deadline()
-                                self._settle_relocalization_owner_before_geometry_stop(
-                                    operation="geometry_runtime_restart",
-                                )
                                 ensure_activation_deadline()
                                 if self._stop_runtime_input_bridge() is False:
                                     raise GatewayError(

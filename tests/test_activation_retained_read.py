@@ -15,7 +15,7 @@ from services.geometry import geometry_runtime_provider as provider_module
 from services.geometry import mapping_backend_checkpoint_store as checkpoint
 from services.geometry.checkpoint_payload import FrozenPayload
 from services.mapping import asset_store
-from skills.assigned_map_activation import activate_assigned_workspace
+from skills.assigned_map_activation import activate_assigned_workspace, build_assigned_workspace
 
 
 class RetainedActivationReadTests(unittest.TestCase):
@@ -55,7 +55,6 @@ class RetainedActivationReadTests(unittest.TestCase):
             workspace = operation()
         self.h.assert_consistent(workspace)
         self.assertEqual(counts, dict(backend=1, canonical=1, fine=1, dense=1, freeze=3, load=1))
-        self.assertEqual(self.h.stub.installs, 1)
         return workspace
 
     def test_public_activation_one_owned_validation_no_borrowed_pass(self):
@@ -77,7 +76,9 @@ class RetainedActivationReadTests(unittest.TestCase):
         with patch.object(checkpoint.MappingBackendCheckpointStore,'load',side_effect=AssertionError('second load')):
             prepared=self.h.runtime.prepare_retained_assigned_map_activation(read,repository=self.repository,bundle_root=self.root)
             self.assertIs(prepared.stored_checkpoint,read.stored_checkpoint)
-            result=activate_assigned_workspace(self.h.service,read.bundle,_activation_read=read,load_memory_history=True)
+            with self.h.localization.assigned_session_publication_scope() as publication, self.h.service._repository.map_activation_executor_guard():
+                activate_assigned_workspace(self.h.service,read.bundle,publication=publication,activation_read=read,load_memory_history=True)
+            result=build_assigned_workspace(self.h.service,self.h.service._repository.get_map_asset(workspace_tests.MAP_NAME))
         self.h.assert_consistent(result)
         self.assertIn('Transfer:2',self.h.stub.calls)
         self.assertIn('Transfer:5',self.h.stub.calls)
@@ -95,7 +96,8 @@ class RetainedActivationReadTests(unittest.TestCase):
             with self.assertRaises(asset_store.MapAssetBundleValidationError):
                 self.h.runtime.prepare_retained_assigned_map_activation(read,repository=repository,bundle_root=root)
         with self.assertRaises(TypeError):
-            activate_assigned_workspace(self.h.service,read.bundle.model_copy(),_activation_read=read,load_memory_history=True)
+            with self.h.localization.assigned_session_publication_scope() as publication, self.h.service._repository.map_activation_executor_guard():
+                activate_assigned_workspace(self.h.service,read.bundle.model_copy(),publication=publication,activation_read=read,load_memory_history=True)
         with self.assertRaises(TypeError):replace(read,root=self.root.parent)
         with self.assertRaises(TypeError):pickle.dumps(read)
         self.assertEqual(self.h.stub.installs,0)
@@ -191,7 +193,7 @@ class RetainedActivationReadTests(unittest.TestCase):
         self.h.stub.calls.clear()
         return original.active_localization_session.activation_receipt_v2
 
-    def test_cold_restore_one_owned_validation_after_tree_closes_without_dispatch(self):
+    def test_cold_restore_one_owned_validation_after_tree_closes_and_dispatches(self):
         receipt = self._start_cold_restore()
         closed = []
         original_close = asset_store._StableDirectoryTree.close
@@ -215,8 +217,9 @@ class RetainedActivationReadTests(unittest.TestCase):
                 patch.object(self.h.runtime, 'prepare_retained_assigned_map_activation', prepare):
             restored = self._assert_one_owned_validation(self.h.service.restore_active_workspace)
         self.assertEqual(len(prepared_reads), 1)
-        self.assertEqual(restored.active_localization_session.activation_receipt_v2, receipt)
-        self.assertEqual(self.h.stub.calls, ['GetMappingState', 'GetMappingState'])
+        self.assertNotEqual(restored.active_localization_session.activation_receipt_v2, receipt)
+        self.assertIn('ActivateMap', self.h.stub.calls)
+        self.assertFalse(restored.localization_ready)
 
     def test_cold_restore_cancellation_after_read_does_not_cache_body_for_retry(self):
         self._start_cold_restore()
@@ -246,8 +249,8 @@ class RetainedActivationReadTests(unittest.TestCase):
             return original(read, **kwargs)
         with patch.object(self.h.runtime, 'prepare_retained_assigned_map_activation', retry):
             self.h.assert_consistent(self.h.service.restore_active_workspace())
-        self.assertEqual(self.h.stub.installs, 1)
-        self.assertTrue(all(call == 'GetMappingState' for call in self.h.stub.calls))
+        self.assertEqual(self.h.stub.installs, 2)
+        self.assertIn('ActivateMap', self.h.stub.calls)
 
     def test_cold_restore_load_cancellation_releases_tree_and_never_dispatches(self):
         self._start_cold_restore()
@@ -259,7 +262,7 @@ class RetainedActivationReadTests(unittest.TestCase):
         gc.collect();self.assertEqual(len(os.listdir('/proc/self/fd')), before)
         self.assertEqual(self.h.stub.calls, [])
         self.h.assert_consistent(self.h.service.restore_active_workspace())
-        self.assertEqual(self.h.stub.installs, 1)
+        self.assertEqual(self.h.stub.installs, 2)
 
     def test_cold_restore_member_replacement_before_load_rejected(self):
         self._start_cold_restore()

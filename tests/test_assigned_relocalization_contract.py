@@ -9,7 +9,7 @@ import subprocess
 import sys
 import unittest
 from contracts.map_activation import AssignedActivationReceipt
-from contracts.map_relocalization import AssignedRelocalizationQuery, AssignedRelocalizationRequest, AssignedRelocalizationTerminal, CORRECTION_CANDIDATE_FINGERPRINT_V3, current_assigned_relocalization_policy, _provider_fields, _recompose, _wire, _decode_candidate, _pose
+from contracts.map_relocalization import AssignedRelocalizationRequest, AssignedRelocalizationTerminal, CORRECTION_CANDIDATE_FINGERPRINT_V3, current_assigned_relocalization_policy, _provider_fields, _recompose, _wire, _decode_candidate, _pose
 
 def bits(value):
     return struct.unpack('>Q', struct.pack('>d', value))[0]
@@ -89,9 +89,6 @@ class AssignedRelocalizationContractTests(unittest.TestCase):
         request = terminal.request
         with self.assertRaisesRegex(ValueError, 'policy'):
             AssignedRelocalizationRequest.admit(request.to_dict())
-        query = AssignedRelocalizationQuery.admit({'schema_version': 2, 'request_id': request.request_id,
-            'assigned_request_v2': request.to_dict()})
-        self.assertEqual(query.validate_response(query.response(1, terminal)).to_dict(), raw)
         for change in ('version', 'bytes'):
             unknown = request.to_dict()
             if change == 'version':
@@ -227,30 +224,7 @@ class AssignedRelocalizationContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             AssignedRelocalizationTerminal.admit(raw)
 
-    def test_query_every_status_echoes_whole_normalized_request(self):
-        for status in [1, 2, 3, 4]:
-            with self.subTest(status=status):
-                query = AssignedRelocalizationQuery.admit({'schema_version': 2, 'request_id': 'reloc:exact', 'assigned_request_v2': request_dict()})
-                terminal = AssignedRelocalizationTerminal.admit(terminal_dict()) if status == 1 else None
-                response = query.response(status, terminal)
-                self.assertEqual(response['assigned_request_v2'], query.request.to_dict())
-                self.assertEqual(query.validate_response(response), terminal)
-                response['assigned_request_v2']['assigned_cloud_v2']['logical_timeout_ms'] = 250
-                with self.assertRaises(ValueError):
-                    query.validate_response(response)
 
-    def test_query_presence_and_canonical_echo_fail_closed(self):
-        query = AssignedRelocalizationQuery.admit({'schema_version': 2, 'request_id': 'reloc:exact', 'assigned_request_v2': request_dict()})
-        for status in [0, 1, 5, True]:
-            with self.assertRaises(ValueError):
-                query.response(status)
-        terminal = AssignedRelocalizationTerminal.admit(terminal_dict())
-        with self.assertRaises(ValueError):
-            query.response(2, terminal)
-        response = query.response(2)
-        response['assigned_request_v2']['assigned_cloud_v2']['logical_timeout_ms'] = 0
-        with self.assertRaises(ValueError):
-            query.validate_response(response)
 
     def test_budget_encoder_and_provider_translation_match_actual_protobuf(self):
         for phase in [1, 2, 3, 4, 5]:
@@ -289,18 +263,6 @@ class AssignedRelocalizationContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'absent'):
                 AssignedRelocalizationRequest.from_proto(message)
 
-    def test_query_proto_response_and_observation_byte_parity(self):
-        proto = load_proto()
-        query = AssignedRelocalizationQuery.admit({'schema_version': 2, 'request_id': 'reloc:exact', 'assigned_request_v2': request_dict()})
-        self.assertEqual(query.to_proto(proto.GetRelocalizationTerminalRequest).SerializeToString(deterministic=True), _wire(query.to_dict(), 'query'))
-        observation = dict(observation_schema_version=1, admitted_command_count=2, claimed_command_count=0, terminal_record_count=0, pending_record_count=1, active_waiter_count=0, observation_epoch=9)
-        for status in [1, 2, 3, 4]:
-            terminal = AssignedRelocalizationTerminal.admit(terminal_dict()) if status == 1 else None
-            raw = query.response(status, terminal, observation)
-            message = proto.GetRelocalizationTerminalResponse(**query.response_to_provider_fields(raw))
-            self.assertEqual(message.ByteSize(), len(_wire(raw, 'response')))
-            self.assertEqual(message.SerializeToString(deterministic=True), _wire(raw, 'response'))
-            self.assertEqual(query.validate_proto_response(message), terminal)
 
     def test_native_budgets_apply_to_wire_not_json_hex_and_detail_has_no_new_cap(self):
         raw = terminal_dict()

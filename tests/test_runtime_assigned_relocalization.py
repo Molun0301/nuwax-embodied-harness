@@ -81,11 +81,6 @@ def provider_terminal(phase=5):
     return result
 
 
-def provider_query(status='terminal', *, terminal=None):
-    return {'schema_version': 2, 'request_id': request_owner().request_id,
-            'status': status, 'assigned_request_v2': request_owner().to_dict(),
-            'terminal': provider_terminal() if status == 'terminal' and terminal is None else terminal,
-            'ledger_observation': None}
 
 
 class FakeProvider:
@@ -95,9 +90,7 @@ class FakeProvider:
         self.owner = owner
         self.calls = []
         self.dispatch_result = provider_terminal()
-        self.query_result = provider_query()
         self.during_dispatch = None
-        self.during_query = None
 
     def relocalize(self, **kwargs):
         if self.owner._runtime_state_lock._is_owned():
@@ -107,13 +100,6 @@ class FakeProvider:
             self.during_dispatch()
         return self.dispatch_result
 
-    def get_relocalization_terminal(self, **kwargs):
-        if self.owner._runtime_state_lock._is_owned():
-            raise AssertionError('query dispatched while runtime lock held')
-        self.calls.append(('query', kwargs))
-        if self.during_query:
-            self.during_query()
-        return self.query_result
 
 
 def runtime_owner():
@@ -277,95 +263,10 @@ class AssignedRuntimeConsumerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.owner.relocalize_assigned_active_map(assigned_request_v2=request_owner(), expected_target=target)
 
-    def test_historical_query_survives_new_missing_and_unavailable_current_owner(self):
-        install(self.owner)
-        old = capture(self.owner)
-        for replacement in ('new', 'missing', 'unavailable'):
-            if replacement == 'missing':
-                with self.owner._runtime_state_lock:
-                    self.owner._install_map_activation_snapshot_locked(bundle=None, bundle_root=None, activation_result={})
-            else:
-                install(self.owner, state=activation_state(available=replacement != 'unavailable'))
-            query_result = self.owner.get_assigned_relocalization_terminal(assigned_request_v2=request_owner())
-            self.assertEqual(query_result.status, 'terminal')
-            self.assertTrue(query_result.query.request.exact_replay_of(request_owner()))
-            self.assertEqual(query_result.query.validate_response(query_result.to_dict()).disposition, 1)
-            self.assertEqual(self.provider.calls[-1][1]['activation_state'], {})
-            with self.assertRaises(RuntimeError), self.owner._assigned_relocalization_result_guard(
-                    query_result.terminal, assigned_request_v2=request_owner(), expected_target=old):
-                self.fail('旧查询不得安装到后继激活')
 
-    def test_query_never_reads_current_target_and_keeps_durable_origin(self):
-        self.owner._map_activation_snapshot_locked = lambda: self.fail('historical query read current target')
-        result = self.owner.get_assigned_relocalization_terminal(assigned_request_v2=request_owner())
-        self.assertIsInstance(result, module._AssignedRelocalizationQueryResult)
-        with self.assertRaises(TypeError):
-            module._AssignedRelocalizationQueryResult()
-        with self.assertRaises(FrozenInstanceError):
-            result.terminal = None
-        response = result.to_dict()
-        response['assigned_request_v2']['request_id'] = 'changed'
-        self.provider.query_result['terminal']['assigned_cloud_v2']['request']['request_id'] = 'also-changed'
-        self.assertEqual(result.to_dict()['assigned_request_v2']['request_id'], 'reloc:exact')
-        self.assertEqual(result.terminal.request_id, 'reloc:exact')
 
-    def test_query_seals_exact_evidence_before_validation_alias_mutation(self):
-        observation = {'observation_schema_version': 1, 'admitted_command_count': 1,
-                       'claimed_command_count': 1, 'terminal_record_count': 1,
-                       'pending_record_count': 0, 'active_waiter_count': 0,
-                       'observation_epoch': 1}
-        self.provider.query_result['ledger_observation'] = observation
-        validate = module.AssignedRelocalizationQuery.validate_response
-        validated_terminals = []
-        def validate_then_mutate(query, response):
-            terminal = validate(query, response)
-            validated_terminals.append(terminal)
-            # Deterministically change caller-owned graphs after validation.
-            self.provider.query_result['assigned_request_v2']['request_id'] = 'reloc:mutated'
-            observation['observation_epoch'] = 999
-            return terminal
-        with patch.object(module.AssignedRelocalizationQuery, 'validate_response', new=validate_then_mutate):
-            result = self.owner.get_assigned_relocalization_terminal(assigned_request_v2=request_owner())
-        self.assertEqual(result.to_dict()['assigned_request_v2']['request_id'], 'reloc:exact')
-        self.assertEqual(result.to_dict()['ledger_observation']['observation_epoch'], 1)
-        self.assertIs(result.terminal, validated_terminals[-1])
-        self.assertTrue(result.query.validate_response(result.to_dict()).exact_replay_of(result.terminal))
 
-    def test_every_query_status_requires_exact_whole_normalized_request_echo(self):
-        for status in ('terminal', 'pending', 'not_found', 'identity_conflict'):
-            self.provider.query_result = provider_query(status)
-            result = self.owner.get_assigned_relocalization_terminal(assigned_request_v2=request_owner())
-            self.assertEqual(result.status, status)
-            self.assertEqual(result.to_dict()['assigned_request_v2'], request_owner().to_dict())
-            self.assertEqual(result.terminal is not None, status == 'terminal')
-            for change in ('absent', 'alias', 'target', 'timeout', 'schema', 'mixed'):
-                bad = provider_query(status)
-                if change == 'absent':
-                    bad.pop('assigned_request_v2')
-                elif change == 'alias':
-                    bad['assigned_request_v2']['request_id'] = 'reloc:other'
-                elif change == 'target':
-                    bad['assigned_request_v2']['assigned_cloud_v2']['target']['activation']['lifecycle_epoch'] += 1
-                elif change == 'timeout':
-                    bad['assigned_request_v2']['assigned_cloud_v2']['logical_timeout_ms'] = 0
-                elif change == 'schema':
-                    bad['schema_version'] = 1
-                else:
-                    bad['request_identity_sha256'] = ''
-                self.provider.query_result = bad
-                with self.subTest(status=status, change=change), self.assertRaises(ValueError):
-                    self.owner.get_assigned_relocalization_terminal(assigned_request_v2=request_owner())
 
-    def test_query_status_terminal_presence_and_whole_terminal_request_are_checked(self):
-        cases = [provider_query('pending', terminal=provider_terminal()),
-                 dict(provider_query(), terminal=None), provider_query('unknown')]
-        other = provider_query()
-        other['terminal']['request_id'] = other['terminal']['assigned_cloud_v2']['request']['request_id'] = 'reloc:other'
-        cases.append(other)
-        for response in cases:
-            self.provider.query_result = response
-            with self.assertRaises(ValueError):
-                self.owner.get_assigned_relocalization_terminal(assigned_request_v2=request_owner())
 
     def test_private_current_result_guard_holds_only_existing_lock_and_rechecks(self):
         install(self.owner)
@@ -381,13 +282,6 @@ class AssignedRuntimeConsumerTests(unittest.TestCase):
                     assigned_request_v2=request_owner(), expected_target=target):
                 self.fail('stale result entered current installation scope')
 
-    def test_unavailable_current_target_allows_query_but_not_current_installation(self):
-        install(self.owner, state=activation_state(available=False))
-        target = capture(self.owner)
-        evidence = self.owner.get_assigned_relocalization_terminal(assigned_request_v2=request_owner())
-        with self.assertRaisesRegex(RuntimeError, 'unavailable'), self.owner._assigned_relocalization_result_guard(
-                evidence.terminal, assigned_request_v2=request_owner(), expected_target=target):
-            self.fail('不可用目标不得安装查询结果')
 
 
 if __name__ == '__main__':

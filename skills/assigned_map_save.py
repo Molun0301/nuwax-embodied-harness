@@ -163,7 +163,6 @@ def finalize_assigned_cloud_map(owner, asset, *, context, reason, metadata, geor
             require_catalog_owner(owner, asset, captured)
             if source_asset is not asset:
                 require_catalog_owner(owner, source_asset, source_captured)
-            owner._require_no_map_activation_recovery("finalize_active_map")
             if owner._repository.get_active_map_name() != source_name:
                 raise _problem("保存准备期间活动地图已改变。", "map_asset_owner_changed")
         # 所有内容更新先完成；分配后的候选不可修改或重新生成身份。
@@ -246,8 +245,7 @@ def save_current_mapping_as(owner, source_asset, name, *, reason, metadata, geor
         entry = zones.maps[source_asset.map_name]
         if entry.zones:
             owner._navigation_service.replace_forbidden_zones(map_name=name, zones=entry.zones)
-    owner.activate_map(map_name=name)
-    return bundle
+    return bundle, name
 
 
 def reconcile_saved_map_name(owner, asset, *, completed=False):

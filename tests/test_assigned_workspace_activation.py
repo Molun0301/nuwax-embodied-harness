@@ -109,6 +109,7 @@ class AssignedWorkspaceActivationTests(unittest.TestCase):
         self.store = StateStore()
         self.memory = MemoryEndpoint()
         self.navigation = SimpleNamespace(
+            clear_latest_exploration_context=lambda **kwargs: None,
             load_forbidden_zones_for_map=lambda **kwargs: None,
             get_latest_navigation_context=lambda: None,
             get_latest_exploration_context=lambda: None,
@@ -123,7 +124,7 @@ class AssignedWorkspaceActivationTests(unittest.TestCase):
         self.localization = LocalizationService(provider_owner=SimpleNamespace(), state_store=self.store)
         self.service = self.new_service()
         self.bundle = self.publish_map(MAP_NAME, ASSET_ID)
-        self.stub.during = self.assert_unlocked
+        self.stub.during = self.assert_execution_locked
 
     def new_runtime(self):
         from contracts.geometry_runtime import PlatformGeometryConfig
@@ -180,6 +181,12 @@ class AssignedWorkspaceActivationTests(unittest.TestCase):
         for name in ("_activation_guard_state", "_activation_executor_guard_state"):
             self.assertFalse(getattr(self.service._repository, name).mutex._is_owned(), (operation, name))
 
+    def assert_execution_locked(self, operation):
+        for name in ("_runtime_state_lock", "_mapping_lifecycle_lock", "_provider_attach_lock"):
+            self.assertFalse(getattr(self.runtime, name)._is_owned(), (operation, name))
+        self.assertFalse(self.service._repository._activation_guard_state.mutex._is_owned(), operation)
+        self.assertTrue(self.service._repository._activation_executor_guard_state.mutex._is_owned(), operation)
+
     def no_legacy_or_hash(self):
         stack = ExitStack()
         for name in hashlib.algorithms_guaranteed | {"new", "file_digest"}:
@@ -193,7 +200,6 @@ class AssignedWorkspaceActivationTests(unittest.TestCase):
             )
         for name in (
             "_materialize_checkpoint_pcd_asset",
-            "_install_map_activation_snapshot_locked",
             "get_authoritative_mapping_session_state",
             "stop_mapping",
         ):
@@ -230,8 +236,6 @@ class AssignedWorkspaceActivationTests(unittest.TestCase):
         self.assertTrue(asset.active)
         self.assertIsNone(asset.asset_manifest_sha256)
         self.assertEqual(self.service._repository.get_active_map_name(), name)
-        self.assertIsNone(self.service._repository.get_map_activation())
-        self.assertFalse(self.runtime.is_map_asset_activation_recovery_pending())
         target = self.runtime.capture_assigned_map_activation_target(map_name=name, asset_identity=asset.asset_identity)
         self.assertEqual(session.activation_receipt_v2, target.activation_receipt)
         self.assertEqual(
@@ -324,139 +328,12 @@ class AssignedWorkspaceActivationTests(unittest.TestCase):
         self.assertNotIn("ActivateMap", self.stub.calls)
         self.assertNotIn("StopMapping", self.stub.calls)
 
-    def test_complete_original_request_is_durable_before_any_native_mutation(self):
-        self.stub.state = predecessor(active=True)
-        observations = []
 
-        def during(operation):
-            self.assert_unlocked(operation)
-            if operation == "StopMapping" or operation == "ActivateMap" or operation.startswith("Transfer:"):
-                pending = MapCatalogRepository(str(self.root)).get_map_activation()
-                self.assertIsNotNone(pending)
-                request = pending["activation_request"]
-                self.assertEqual(
-                    set(request),
-                    {
-                        "activation_request_id",
-                        "session_id",
-                        "map_name",
-                        "asset_identity",
-                        "checkpoint_id",
-                        "expected_runtime_generation",
-                    },
-                )
-                self.assertEqual(request["asset_identity"], ASSET_ID.model_dump())
-                self.assertEqual(request["checkpoint_id"], CHECKPOINT_ID)
-                self.assertEqual(request["expected_runtime_generation"], 7)
-                self.assertEqual(pending["predecessor"]["session_id"], "predecessor")
-                observations.append((operation, deepcopy(request)))
 
-        self.stub.during = during
-        workspace = self.activate()
-        expected = workspace.active_localization_session.activation_receipt_v2.to_dict()["request"]
-        self.assertTrue(observations)
-        self.assertTrue(all(request == expected for _, request in observations))
 
-    def test_journal_write_failure_prevents_all_native_mutations(self):
-        with patch.object(
-            self.service._repository, "begin_assigned_map_activation", side_effect=OSError("disk full")
-        ), self.assertRaises(OSError):
-            self.activate()
-        self.assertEqual(self.stub.calls, ["GetMappingState"])
-        self.assertIsNone(self.runtime._map_activation_snapshot_read().bundle)
-        self.assertIsNone(self.localization.get_active_session_token()[0])
-        self.assertIsNone(self.service._repository.get_map_activation())
 
-    def test_postdispatch_mapping_failure_keeps_exact_request_and_fence_then_reconciles_without_dispatch(self):
-        with patch.object(
-            self.mapping, "ingest_external_snapshot", side_effect=RuntimeError("map publication failed")
-        ), self.assertRaises(GatewayError):
-            self.activate()
-        pending = self.service._repository.get_map_activation()
-        self.assertEqual(pending["phase"], "reconciling")
-        self.assertTrue(self.runtime.is_map_asset_activation_recovery_pending())
-        self.assertIsNone(self.localization.get_active_session_token()[0])
-        self.assertIsNone(self.service.get_active_workspace())
-        request = deepcopy(pending["activation_request"])
-        self.stub.calls.clear()
-        with self.no_legacy_or_hash():
-            restored = self.service.restore_active_workspace()
-        self.assert_consistent(restored)
-        self.assertEqual(restored.active_localization_session.activation_receipt_v2.to_dict()["request"], request)
-        self.assertEqual(self.stub.calls, ["GetMappingState"])
-        self.assertEqual(self.stub.installs, 1)
 
-    def test_unknown_is_retained_until_explicit_exact_retry_and_never_reexecutes_in_exception(self):
-        self.stub.error = LostReply()
-        with self.assertRaises(GatewayError):
-            self.activate()
-        pending = self.service._repository.get_map_activation()
-        request = deepcopy(pending["activation_request"])
-        self.assertEqual(pending["phase"], "backend_dispatching")
-        self.assertTrue(self.runtime.is_map_asset_activation_recovery_pending())
-        self.assertEqual(self.stub.calls.count("ActivateMap"), 1)
-        self.assertIsNone(self.runtime._map_activation_snapshot_read().bundle)
-        self.assertIsNone(self.localization.get_active_session_token()[0])
-        self.stub.error = None
-        self.stub.calls.clear()
-        with self.no_legacy_or_hash():
-            retried = self.activate()
-        self.assert_consistent(retried)
-        self.assertEqual(retried.active_localization_session.activation_receipt_v2.to_dict()["request"], request)
-        self.assertEqual(self.stub.calls.count("ActivateMap"), 1)
-        self.assertNotIn("StopMapping", self.stub.calls)
-        self.assertEqual(self.stub.installs, 1)
-        self.assertEqual(
-            self.stub.activation_requests[0].SerializeToString(), self.stub.activation_requests[1].SerializeToString()
-        )
 
-    def test_sealed_actual_state_can_restore_unknown_without_native_reexecution(self):
-        self.stub.error = LostReply()
-        with self.assertRaises(GatewayError):
-            self.activate()
-        request = deepcopy(self.service._repository.get_map_activation()["activation_request"])
-        self.stub.calls.clear()
-        self.service = self.new_service()
-        self.assertEqual(self.stub.calls, [])
-        self.assertTrue(self.runtime.is_map_asset_activation_recovery_pending())
-        with self.no_legacy_or_hash():
-            restored = self.service.restore_active_workspace()
-        self.assert_consistent(restored)
-        self.assertEqual(restored.active_localization_session.activation_receipt_v2.to_dict()["request"], request)
-        self.assertEqual(self.stub.calls, ["GetMappingState"])
-        self.assertEqual(self.stub.installs, 1)
-
-    def test_restore_without_current_sealed_evidence_never_dispatches_or_rewrites_request(self):
-        self.stub.error = LostReply()
-        with self.assertRaises(GatewayError):
-            self.activate()
-        original = self.service._repository.get_map_activation()
-        self.stub.state = predecessor()
-        self.stub.calls.clear()
-        self.service = self.new_service()
-        self.assertEqual(self.stub.calls, [])
-        with self.assertRaises(GatewayError):
-            self.service.restore_active_workspace()
-        self.assertEqual(self.stub.calls, ["GetMappingState"])
-        self.assertEqual(self.service._repository.get_map_activation(), original)
-        self.assertTrue(self.runtime.is_map_asset_activation_recovery_pending())
-
-    def test_completed_restart_restore_observes_state_but_never_dispatches(self):
-        original = self.activate()
-        session, epoch = self.localization.get_active_session_token()
-        self.stub.calls.clear()
-        self.service = self.new_service()
-        self.assertEqual(self.stub.calls, [])
-        with self.no_legacy_or_hash():
-            restored = self.service.restore_active_workspace()
-        self.assert_consistent(restored)
-        self.assertIs(restored.active_localization_session, session)
-        self.assertEqual(self.localization.get_active_session_token()[1], epoch)
-        self.assertEqual(
-            restored.active_localization_session.activation_receipt_v2,
-            original.active_localization_session.activation_receipt_v2,
-        )
-        self.assertEqual(self.stub.calls, ["GetMappingState"])
 
     def test_public_getters_never_dispatch_refresh_or_use_legacy_session_cas(self):
         self.activate()
@@ -475,16 +352,16 @@ class AssignedWorkspaceActivationTests(unittest.TestCase):
         self.assertEqual(maps[0].status, MapAssetStatus.LOCALIZING)
         self.assertEqual(self.stub.calls, [])
 
-    def test_map_asset_reads_and_checkpoint_preparation_run_outside_runtime_catalog_executor_locks(self):
+    def test_map_asset_reads_and_checkpoint_preparation_hold_executor_without_catalog_or_runtime_locks(self):
         read_bundle = self.service._asset_repository.get_map_asset_bundle
         load_checkpoint = MappingBackendCheckpointStore.load
 
         def read(*args, **kwargs):
-            self.assert_unlocked("asset bundle read")
+            self.assert_execution_locked("asset bundle read")
             return read_bundle(*args, **kwargs)
 
         def load(store, *args, **kwargs):
-            self.assert_unlocked("checkpoint read")
+            self.assert_execution_locked("checkpoint read")
             return load_checkpoint(store, *args, **kwargs)
 
         with patch.object(self.service._asset_repository, "get_map_asset_bundle", side_effect=read), patch.object(
@@ -492,22 +369,20 @@ class AssignedWorkspaceActivationTests(unittest.TestCase):
         ):
             self.assert_consistent(self.activate())
 
-    def test_rpc_map_and_state_publication_callbacks_run_without_runtime_catalog_executor_guards(self):
+    def test_map_publication_holds_executor_and_localization_publication_releases_it(self):
         publications = []
         original = self.store.write
-
-        def write_unlocked(namespace, key, value, **kwargs):
-            self.assert_unlocked(("state publication", namespace, key))
+        def write(namespace, key, value, **kwargs):
+            if namespace == StateNamespace.LOCALIZATION or key == "active_workspace":
+                self.assert_unlocked((namespace, key))
+            else:
+                self.assert_execution_locked((namespace, key))
             publications.append((namespace, key))
             return original(namespace, key, value, **kwargs)
-
-        with patch.object(self.store, "write", side_effect=write_unlocked):
+        with patch.object(self.store, "write", side_effect=write):
             self.assert_consistent(self.activate())
         self.assertIn((StateNamespace.LOCALIZATION, "active_session"), publications)
         self.assertIn((StateNamespace.MAP, "active_workspace"), publications)
-        self.assertTrue(
-            any(namespace == StateNamespace.MAP and key != "active_workspace" for namespace, key in publications)
-        )
 
     def test_mapping_callback_supersession_is_detected_and_cannot_publish_success(self):
         original = self.store.write
@@ -515,19 +390,17 @@ class AssignedWorkspaceActivationTests(unittest.TestCase):
         def replace_mapping(namespace, key, value, **kwargs):
             result = original(namespace, key, value, **kwargs)
             if namespace == StateNamespace.MAP and kwargs.get("metadata", {}).get("kind") == "latest_map":
-                self.assert_unlocked("map callback")
+                self.assert_execution_locked("map callback")
                 self.mapping._latest_snapshot = value.model_copy(update={"map_name": "successor"})
             return result
 
         with patch.object(self.store, "write", side_effect=replace_mapping), self.assertRaises(GatewayError):
             self.activate()
         self.assertEqual(self.mapping.get_latest_snapshot().map_name, "successor")
-        self.assertEqual(self.service._repository.get_map_activation()["phase"], "reconciling")
-        self.assertTrue(self.runtime.is_map_asset_activation_recovery_pending())
         self.assertIsNone(self.localization.get_active_session_token()[0])
         self.assertIsNone(self.store.read(StateNamespace.MAP, "active_workspace"))
 
-    def test_localization_preparation_supersession_loses_cas_and_retains_recovery(self):
+    def test_localization_preparation_supersession_loses_cas(self):
         prepare = self.localization.prepare_assigned_session_update
 
         def replace_session(**kwargs):
@@ -543,8 +416,6 @@ class AssignedWorkspaceActivationTests(unittest.TestCase):
         ), self.assertRaises(GatewayError):
             self.activate()
         self.assertEqual(self.localization.get_active_session_token()[0].session_id, "successor")
-        self.assertEqual(self.service._repository.get_map_activation()["phase"], "reconciling")
-        self.assertTrue(self.runtime.is_map_asset_activation_recovery_pending())
         self.assertIsNone(self.service.get_active_workspace())
 
     def test_localization_callback_can_activate_successor_and_old_call_never_returns_stale_workspace(self):
@@ -566,33 +437,7 @@ class AssignedWorkspaceActivationTests(unittest.TestCase):
         self.assertEqual(self.store.read(StateNamespace.MAP, "active_workspace").value.active_map_name, "second-map")
         self.assertEqual(self.stub.installs, 2)
 
-    def test_failure_to_clear_runtime_fence_retains_durable_journal(self):
-        with patch.object(self.runtime, "complete_assigned_map_activation", return_value=False), self.assertRaises(
-            GatewayError
-        ):
-            self.activate()
-        self.assertTrue(self.runtime.is_map_asset_activation_recovery_pending())
-        self.assertIsNotNone(self.service._repository.get_map_activation())
-        self.assertIsNone(self.service.get_active_workspace())
 
-    def test_cold_restore_reconstructs_runtime_mapping_and_session_from_actual_sealed_owner_without_dispatch(self):
-        original = self.activate()
-        request = original.active_localization_session.activation_receipt_v2.to_dict()["request"]
-        self.runtime = self.new_runtime()
-        self.mapping = MappingService(provider_owner=SimpleNamespace(), state_store=self.store)
-        self.localization = LocalizationService(provider_owner=SimpleNamespace(), state_store=self.store)
-        self.memory = MemoryEndpoint()
-        self.stub.calls.clear()
-        self.service = self.new_service()
-        self.assertEqual(self.stub.calls, [])
-        self.assertIsNone(self.service.get_active_workspace())
-        with self.no_legacy_or_hash():
-            restored = self.service.restore_active_workspace()
-        self.assert_consistent(restored)
-        self.assertEqual(restored.active_localization_session.activation_receipt_v2.to_dict()["request"], request)
-        self.assertTrue(self.stub.calls)
-        self.assertTrue(all(call == "GetMappingState" for call in self.stub.calls))
-        self.assertEqual(self.stub.installs, 1)
 
     def test_active_workspace_callback_switch_cannot_make_outer_activation_return_stale_workspace(self):
         self.publish_map("second-map", AssetIdentityV2(asset_id="e" * 32))
@@ -618,6 +463,7 @@ class AssignedWorkspaceActivationTests(unittest.TestCase):
         old_snapshot = self.mapping.get_latest_snapshot()
         old_installation = self.runtime._map_activation_snapshot_read()
         self.stub.state = predecessor()
+        self.runtime.clear_active_map_asset(reason="new native installation")
         self.stub.calls.clear()
         with self.no_legacy_or_hash():
             second = self.activate()
@@ -629,101 +475,10 @@ class AssignedWorkspaceActivationTests(unittest.TestCase):
         self.assertEqual(self.stub.calls.count("ActivateMap"), 1)
         self.assertEqual(self.stub.installs, 2)
 
-    def test_sealed_unknown_reconciliation_does_not_leave_provider_attempt_blocking_next_map(self):
-        self.publish_map("second-map", AssetIdentityV2(asset_id="e" * 32))
-        self.stub.error = LostReply()
-        with self.assertRaises(GatewayError):
-            self.activate()
-        self.stub.error = None
-        restored = self.service.restore_active_workspace()
-        self.assert_consistent(restored)
-        self.stub.calls.clear()
-        with self.no_legacy_or_hash():
-            successor = self.activate("second-map")
-        self.assert_consistent(successor, "second-map")
-        self.assertEqual(self.stub.calls.count("StopMapping"), 1)
-        self.assertEqual(self.stub.calls.count("ActivateMap"), 1)
 
-    def test_durable_receipt_failure_retains_journal_fence_and_original_owner_for_restore(self):
-        with patch.object(
-            self.service._repository,
-            "complete_assigned_map_activation_durable",
-            side_effect=OSError("receipt fsync failed"),
-        ), self.assertRaises(GatewayError):
-            self.activate()
-        pending = self.service._repository.get_map_activation()
-        self.assertEqual(pending["phase"], "reconciling")
-        self.assertTrue(self.runtime.is_map_asset_activation_recovery_pending())
-        self.assertIsNone(self.localization.get_active_session_token()[0])
-        self.stub.calls.clear()
-        restored = self.service.restore_active_workspace()
-        self.assert_consistent(restored)
-        self.assertEqual(
-            restored.active_localization_session.activation_receipt_v2.to_dict()["request"],
-            pending["activation_request"],
-        )
-        self.assertTrue(all(call == "GetMappingState" for call in self.stub.calls))
 
-    def test_journal_clear_failure_retains_fence_and_releases_session_publication_outside_guards(self):
-        published = []
-        original = self.store.write
 
-        def observe(namespace, key, value, **kwargs):
-            self.assert_unlocked("publication after durable failure")
-            if namespace == StateNamespace.LOCALIZATION and key == "active_session":
-                published.append(value)
-            return original(namespace, key, value, **kwargs)
 
-        with patch.object(self.store, "write", side_effect=observe), patch.object(
-            self.service._repository, "clear_assigned_map_activation", side_effect=OSError("journal unlink failed")
-        ), self.assertRaises(GatewayError):
-            self.activate()
-        self.assertEqual(len(published), 1)
-        self.assertIs(published[0], self.localization.get_active_session_token()[0])
-        self.assertIsNotNone(self.service._repository.get_map_activation())
-        self.assertTrue(self.runtime.is_map_asset_activation_recovery_pending())
-        self.assertIsNone(self.service.get_active_workspace())
-        self.stub.calls.clear()
-        self.assert_consistent(self.service.restore_active_workspace())
-        self.assertTrue(all(call == "GetMappingState" for call in self.stub.calls))
-
-    def test_unknown_predecessor_stop_never_activates_until_explicit_retry_of_exact_journal(self):
-        self.stub.state = predecessor(active=True)
-        original = self.stub.StopMapping
-
-        def lost_stop(*args, **kwargs):
-            original(*args, **kwargs)
-            raise LostReply()
-
-        with patch.object(self.stub, "StopMapping", side_effect=lost_stop), self.assertRaises(GatewayError):
-            self.activate()
-        pending = self.service._repository.get_map_activation()
-        self.assertEqual(pending["phase"], "predecessor_stop_dispatching")
-        self.assertEqual(pending["predecessor"]["session_id"], "predecessor")
-        self.assertEqual(self.stub.calls.count("StopMapping"), 1)
-        self.assertNotIn("ActivateMap", self.stub.calls)
-        self.assertTrue(self.runtime.is_map_asset_activation_recovery_pending())
-        self.stub.calls.clear()
-        result = self.activate()
-        self.assert_consistent(result)
-        self.assertEqual(
-            result.active_localization_session.activation_receipt_v2.to_dict()["request"], pending["activation_request"]
-        )
-        self.assertNotIn("StopMapping", self.stub.calls)
-        self.assertEqual(self.stub.calls.count("ActivateMap"), 1)
-
-    def test_pending_original_map_blocks_different_target_without_dispatch(self):
-        self.publish_map("second-map", AssetIdentityV2(asset_id="e" * 32))
-        self.stub.error = LostReply()
-        with self.assertRaises(GatewayError):
-            self.activate()
-        pending = self.service._repository.get_map_activation()
-        self.stub.calls.clear()
-        with self.assertRaises(GatewayError):
-            self.activate("second-map")
-        self.assertEqual(self.service._repository.get_map_activation(), pending)
-        self.assertEqual(self.stub.calls, ["GetMappingState"])
-        self.assertTrue(self.runtime.is_map_asset_activation_recovery_pending())
 
     def test_successor_before_underlying_workspace_write_cannot_leave_stale_cache_or_return(self):
         self.publish_map("second-map", AssetIdentityV2(asset_id="e" * 32))
@@ -771,111 +526,8 @@ class AssignedWorkspaceActivationTests(unittest.TestCase):
         self.assertIsNone(self.store.read(StateNamespace.MAP, "active_workspace"))
         self.assertIsNone(self.service.get_active_workspace())
 
-    def test_constructor_preserves_assigned_relocalization_intent_without_legacy_abort_or_rpc(self):
-        workspace = self.activate()
-        owner = workspace.active_localization_session.activation_receipt_v2
-        request = AssignedRelocalizationRequest.admit(
-            {
-                "schema_version": 2,
-                "request_id": "relocalize:pending",
-                "assigned_cloud_v2": {
-                    "target": owner.to_dict()["target"],
-                    "policy": current_assigned_relocalization_policy(),
-                    "logical_timeout_ms": 0,
-                },
-            }
-        )
-        args = {"assigned_request": request, "activation_receipt": owner, "target_asset_identity": owner.asset_identity}
-        self.service._repository.begin_assigned_relocalization_durable(**args)
-        for phase in ("prepared", "backend_dispatching"):
-            with self.subTest(phase=phase):
-                if phase == "backend_dispatching":
-                    self.service._repository.mark_assigned_relocalization_backend_dispatching(**args)
-                before = self.service._repository._relocalization_intent_path.read_bytes()
-                self.stub.calls.clear()
-                self.service = self.new_service()
-                self.assertEqual(self.stub.calls, [])
-                self.assertEqual(self.service._repository._relocalization_intent_path.read_bytes(), before)
-                self.assertEqual(self.service._repository.get_relocalization_intent()["phase"], phase)
-                with self.assertRaises(GatewayError):
-                    self.activate()
-                self.assertEqual(self.stub.calls, [])
 
-    def test_dispatch_phase_rename_requires_successful_directory_fsync_on_every_explicit_retry(self):
-        for phase in ("backend_dispatching", "predecessor_stop_dispatching"):
-            with self.subTest(phase=phase):
-                self.stub.state = predecessor(active=phase == "predecessor_stop_dispatching")
-                self.stub.calls.clear()
-                original_fsync = catalog_module._fsync_directory
-                failed_phases = []
 
-                def fail_dispatch_phase_fsync(
-                    path, *, _phase=phase, _failed_phases=failed_phases, _original_fsync=original_fsync
-                ):
-                    journal_path = self.service._repository._activation_journal_path
-                    if journal_path.exists():
-                        visible = json.loads(journal_path.read_text(encoding="utf-8"))
-                        if visible["phase"] == _phase:
-                            # The real atomic writer already renamed its file; the
-                            # caller still lacks the directory durability barrier.
-                            _failed_phases.append(visible["phase"])
-                            raise OSError("directory fsync failed after dispatch-phase rename")
-                    return _original_fsync(path)
-
-                retained_request = None
-                with patch.object(catalog_module, "_fsync_directory", side_effect=fail_dispatch_phase_fsync):
-                    for attempt in (1, 2):
-                        with self.subTest(attempt=attempt), self.assertRaises(GatewayError):
-                            self.activate()
-                        pending = self.service._repository.get_map_activation()
-                        self.assertEqual(pending["phase"], phase)
-                        if retained_request is None:
-                            retained_request = deepcopy(pending["activation_request"])
-                        self.assertEqual(pending["activation_request"], retained_request)
-                        self.assertEqual(len(failed_phases), attempt)
-                        self.assertFalse(
-                            any(
-                                call == "StopMapping" or call == "ActivateMap" or call.startswith("Transfer:")
-                                for call in self.stub.calls
-                            )
-                        )
-                        self.assertTrue(self.runtime.is_map_asset_activation_recovery_pending())
-                completed = self.activate()
-                self.assert_consistent(completed)
-                self.assertEqual(
-                    completed.active_localization_session.activation_receipt_v2.to_dict()["request"], retained_request
-                )
-                self.assertEqual(self.stub.calls.count("ActivateMap"), 1)
-                self.assertEqual(self.stub.calls.count("StopMapping"), int(phase == "predecessor_stop_dispatching"))
-
-    def test_journal_clear_cancellation_rearms_retained_fence_outside_guards_and_propagates_original(self):
-        cancellation = ActivationCancelled("cancelled while clearing durable journal")
-        original_arm = self.runtime.arm_assigned_map_activation_fence
-        arm_reasons = []
-
-        def arm_outside_guards(**kwargs):
-            self.assert_unlocked("cancellation fence restoration")
-            arm_reasons.append(kwargs["reason"])
-            return original_arm(**kwargs)
-
-        with patch.object(
-            self.runtime, "arm_assigned_map_activation_fence", side_effect=arm_outside_guards
-        ), patch.object(
-            self.service._repository, "clear_assigned_map_activation", side_effect=cancellation
-        ), self.assertRaises(ActivationCancelled) as raised:
-            self.activate()
-        self.assertIs(raised.exception, cancellation)
-        self.assertIn("assigned_reconciliation_incomplete", arm_reasons)
-        self.assertIsNotNone(self.service._repository.get_map_activation())
-        self.assertTrue(self.runtime.is_map_asset_activation_recovery_pending())
-        self.assertIsNone(self.service.get_active_workspace())
-        self.assertIs(
-            self.store.read(StateNamespace.LOCALIZATION, "active_session").value,
-            self.localization.get_active_session_token()[0],
-        )
-        self.stub.calls.clear()
-        self.assert_consistent(self.service.restore_active_workspace())
-        self.assertTrue(all(call == "GetMappingState" for call in self.stub.calls))
 
     def test_workspace_write_failure_or_cancellation_discards_stale_value_and_preserves_original_error(self):
         self.publish_map("second-map", AssetIdentityV2(asset_id="e" * 32))
@@ -909,6 +561,146 @@ class AssignedWorkspaceActivationTests(unittest.TestCase):
                 cached = self.store.read(StateNamespace.MAP, "active_workspace")
                 self.assertTrue(cached is None or cached.value.active_map_name == "second-map")
                 self.assertEqual(self.service.get_active_workspace().active_map_name, "second-map")
+
+    def test_failed_activation_allows_another_map_and_mapping_mutations(self):
+        self.publish_map("second-map", AssetIdentityV2(asset_id="e" * 32))
+        failure = RuntimeError("地图发布失败")
+        with patch.object(self.mapping, "ingest_external_snapshot", side_effect=failure):
+            with self.assertRaises(RuntimeError) as raised:
+                self.activate()
+        self.assertIs(raised.exception, failure)
+        self.assert_consistent(self.activate("second-map"), "second-map")
+        self.runtime._runtime_started = True
+        def start(**kwargs):
+            return {"phase": "ACTIVE", "active": True, "session_id": kwargs["session_id"],
+                "map_name": kwargs["map_name"], "session_generation": 9}
+        def stop(**kwargs):
+            return {"phase": "STOPPED", "active": False, "session_id": kwargs["session_id"]}
+        with patch.object(self.provider, "start_mapping", side_effect=start), \
+                patch.object(self.provider, "stop_mapping", side_effect=stop), \
+                patch.object(self.provider, "get_exploration_state", return_value={"status": "IDLE"}), \
+                patch.object(self.provider, "get_mapping_diagnostics", return_value={}):
+            self.assertTrue(self.runtime.stop_mapping()["stopped"])
+            self.assertTrue(self.runtime.start_mapping(map_name="second-map")["mapping_active"])
+        self.memory.has_memory_library = lambda name: False
+        self.navigation.delete_forbidden_zones_for_map = lambda **kwargs: SimpleNamespace(maps={})
+        self.assertTrue(self.service.delete_map(map_name=MAP_NAME)["deleted"])
+
+    def test_new_service_restore_dispatches_and_returns_loaded_localizing_workspace(self):
+        self.activate()
+        original = self.stub.activation_requests[-1]
+        self.runtime = self.new_runtime()
+        self.service = self.new_service()
+        self.stub.calls.clear()
+        restored = self.service.restore_active_workspace()
+        self.assert_consistent(restored)
+        self.assertIn("ActivateMap", self.stub.calls)
+        self.assertNotEqual(original.activation_request_id, self.stub.activation_requests[-1].activation_request_id)
+
+    def test_start_mapping_waits_for_the_entire_activation(self):
+        entered, release, attempted, finished = (threading.Event() for _ in range(4))
+        errors = []
+        original = self.stub.ActivateMap
+        def blocked(request, timeout):
+            entered.set()
+            if not release.wait(3):
+                raise TimeoutError("激活阻塞未释放")
+            return original(request, timeout)
+        def activate():
+            try:
+                self.activate()
+            except BaseException as error:
+                errors.append(error)
+        def start():
+            attempted.set()
+            try:
+                self.runtime.start_mapping(map_name=MAP_NAME)
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                finished.set()
+        self.runtime._runtime_started = True
+        def native_start(**kwargs):
+            return {"phase": "ACTIVE", "active": True, "session_id": kwargs["session_id"],
+                    "map_name": kwargs["map_name"], "session_generation": 9}
+        with patch.object(self.stub, "ActivateMap", side_effect=blocked), \
+                patch.object(self.provider, "start_mapping", side_effect=native_start), \
+                patch.object(self.provider, "get_mapping_diagnostics", return_value={}):
+            first = threading.Thread(target=activate, daemon=True)
+            second = threading.Thread(target=start, daemon=True)
+            first.start()
+            try:
+                self.assertTrue(entered.wait(3))
+                second.start()
+                self.assertTrue(attempted.wait(3))
+                self.assertFalse(finished.wait(0.1))
+            finally:
+                release.set()
+            first.join(3)
+            second.join(3)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(finished.is_set())
+
+    def test_floor_mapping_and_concurrent_activation_use_the_same_lock_order(self):
+        from contextlib import contextmanager
+        from contracts.building_navigation import FloorRecord, FloorPose
+        from gateways.building_navigation import GatewayBuildingPorts
+        repository = self.service._repository
+        asset = repository.get_map_asset(MAP_NAME)
+        repository.save_map_asset(asset.model_copy(update={"metadata": {"floor_creation_request_id": "floor-op"}}))
+        context = SimpleNamespace(task_id="floor-task", ensure_active=lambda: None)
+        runtime = SimpleNamespace(map_workspace_service=self.service,
+            _get_building_catalog=lambda: SimpleNamespace(maps=repository))
+        ports = GatewayBuildingPorts(runtime, context, None)
+        floor = FloorRecord(floor_id="F1", display_name="一层", map_name=MAP_NAME, asset_identity=ASSET_ID)
+        entered, release, waiting = (threading.Event() for _ in range(3))
+        original_rpc = self.stub.ActivateMap
+        original_guard = repository.map_activation_executor_guard
+        errors, results = [], []
+        def blocked(request, timeout):
+            entered.set()
+            if not release.wait(3):
+                raise TimeoutError("激活阻塞未释放")
+            return original_rpc(request, timeout)
+        @contextmanager
+        def guard():
+            if threading.current_thread().name == "floor":
+                waiting.set()
+            with original_guard():
+                yield
+        def activate():
+            try:
+                self.activate()
+            except BaseException as error:
+                errors.append(error)
+        def start_floor():
+            try:
+                results.append(ports.start_floor_mapping(floor, SimpleNamespace(arrival_pose=FloorPose(x=0,y=0)), "floor-op"))
+            except BaseException as error:
+                errors.append(error)
+        def localize(target, seed):
+            self.service.activate_map(map_name=target.map_name)
+            return True
+        with patch.object(self.stub, "ActivateMap", side_effect=blocked), \
+                patch.object(repository, "map_activation_executor_guard", side_effect=guard), \
+                patch.object(ports, "activate_and_localize", side_effect=localize):
+            first = threading.Thread(target=activate, daemon=True)
+            second = threading.Thread(target=start_floor, name="floor", daemon=True)
+            first.start()
+            try:
+                self.assertTrue(entered.wait(3))
+                second.start()
+                self.assertTrue(waiting.wait(3))
+            finally:
+                release.set()
+            first.join(3)
+            second.join(3)
+        self.assertFalse(first.is_alive(), "激活与楼层任务发生锁等待环")
+        self.assertFalse(second.is_alive(), "楼层任务未完成")
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [ASSET_ID])
 
 
 if __name__ == "__main__":

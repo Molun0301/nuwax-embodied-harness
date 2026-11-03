@@ -247,20 +247,6 @@ class AssignedCloudExchangeTests(unittest.TestCase):
         self.assertIsNone(self.repository.get_assigned_map_asset_exchange(fixtures.MAP_NAME))
         self.assertEqual(self.repository.get_map_asset_bundle(fixtures.MAP_NAME).asset_identity, fixtures.ASSET_ID)
 
-    def test_journal_window_new_transaction_fences_exchange(self):
-        self.initial()
-        pending = False
-        def activate(phase):
-            nonlocal pending
-            if phase == "after_assigned_exchange_journal":
-                pending = True
-        self.repository._fault_injector = activate
-        with patch.object(MapCatalogRepository, "get_map_activation", lambda repository: {} if pending else None), \
-                self.assertRaisesRegex(storage.MapAssetCommitUncertainError, "fences"):
-            self.exchange()
-        self.assertFalse(self.repository.get_assigned_map_asset_exchange(fixtures.MAP_NAME).committed)
-        self.assertEqual(self.repository.get_map_asset_bundle(fixtures.MAP_NAME).asset_identity, fixtures.ASSET_ID)
-        self.settle()
 
     def test_replaced_retired_directory_is_preserved(self):
         self.initial()

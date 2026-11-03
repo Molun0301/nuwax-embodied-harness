@@ -196,16 +196,8 @@ class AssignedSavedCloudTests(unittest.TestCase):
         self.assertIsNone(summary['pcd_path'])
         self.assertEqual(SavedDenseCloudCache().read(handle)[0]['assigned_source'], handle.assigned_source)
 
-    def test_fence_missing_origin_and_stale_snapshot_never_fall_back(self):
+    def test_missing_origin_and_stale_snapshot_never_fall_back(self):
         handle = self.handle()
-        self.runtime._map_asset_activation_fence = {'map_name': self.bundle.map_name,
-            'assigned_activation_request': self.runtime._map_activation_snapshot.activation_result['activation_receipt_v2'].to_dict()['request']}
-        self.assertIsNone(self.handle())
-        self.assertIsNone(self.runtime.get_saved_dense_cloud_source())
-        self.assertFalse(self.runtime.get_live_pointcloud_map_asset_summary()['available'])
-        with self.assertRaisesRegex(RuntimeError, 'SOURCE_CHANGED'):
-            handle.require_current()
-        self.runtime._map_asset_activation_fence = None
         self.runtime._assigned_map_installation_origin = None
         self.assertTrue(self.runtime.is_assigned_saved_cloud_selected())
         self.assertIsNone(self.handle())
@@ -336,16 +328,6 @@ class AssignedSavedCloudTests(unittest.TestCase):
                     self.handle()
                 self.assertFalse(self.runtime.get_live_pointcloud_map_asset_summary()['available'])
 
-    def test_fence_installed_during_canonical_view_discards_snapshot(self):
-        source = AssignedSavedPointCloudMapSource(self.handle())
-        original = FrozenPayload.view
-        def view(payload, start=0, stop=None):
-            self.runtime._map_asset_activation_fence = {'map_name': self.bundle.map_name,
-            'assigned_activation_request': self.runtime._map_activation_snapshot.activation_result['activation_receipt_v2'].to_dict()['request']}
-            return original(payload, start, stop)
-        with patch.object(FrozenPayload, 'view', view), self.assertRaises(PointCloudMapSourceError):
-            source.read()
-        self.assertIsNone(source._snapshot)
 
     def test_source_change_during_dense_slice_rejects_returned_body(self):
         handle, cache = self.handle(), SavedDenseCloudCache()

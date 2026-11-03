@@ -207,28 +207,6 @@ class LegacyCloudImportTests(unittest.TestCase):
                 self.assertEqual(again.bundle.asset_identity, result.bundle.asset_identity)
                 self.assertEqual(again.stored_checkpoint.checkpoint.fine_reference, reference)
 
-    def test_fine_import_catalog_failure_reuses_publication_before_assigned_dispatch(self):
-        self.prepare()
-        fine = fine_archive(3)
-        self.add_fine_archive(fine)
-        before = inventory(self.current)
-        owner = self.service()
-        with patch('skills.assigned_map_save.reconcile_assigned_current', side_effect=RuntimeError('catalog interrupted')):
-            with self.assertRaisesRegex(RuntimeError, 'catalog interrupted'):
-                owner._import_legacy_cloud_for_activation('map')
-        published = list(self.repository._map_dir('map').glob('assigned-id-*'))
-        self.assertEqual(len(published), 1)
-        def dispatch(service, bundle, **kwargs):
-            self.assertEqual(getattr(owner._map_activation_execution_state, 'depth', 0), 0)
-            result = kwargs['_activation_read']
-            self.assertEqual(result.root, published[0])
-            self.assertEqual(bytes(result.stored_checkpoint.checkpoint.fine_archive), fine)
-            self.assertEqual(self.catalog.get_map_asset('map').asset_identity, bundle.asset_identity)
-            return 'assigned fine dispatch'
-        with patch.object(asset_store.uuid, 'uuid4', side_effect=AssertionError('retry allocation')), \
-             patch('skills.assigned_map_activation.activate_assigned_workspace', side_effect=dispatch):
-            self.assertEqual(owner.activate_map(map_name='map'), 'assigned fine dispatch')
-        self.assertEqual(inventory(self.current), before)
 
     def test_fine_import_ar1_requires_runtime_capability_before_allocation(self):
         self.prepare()
@@ -542,31 +520,12 @@ class LegacyCloudImportTests(unittest.TestCase):
         owner._asset_repository = self.repository
         return owner
 
-    def test_explicit_activation_adopts_then_releases_executor_before_assigned_dispatch(self):
-        self.prepare();owner=self.service()
-        def dispatch(service,bundle,**kwargs):
-            self.assertEqual(getattr(owner._map_activation_execution_state,'depth',0),0)
-            self.assertIsInstance(kwargs['_activation_read'],asset_store._AssignedActivationRead)
-            self.assertEqual(self.catalog.get_map_asset('map').asset_identity,bundle.asset_identity)
-            return 'recorded assigned dispatch'
-        with patch('skills.assigned_map_activation.activate_assigned_workspace',side_effect=dispatch):
-            self.assertEqual(owner.activate_map(map_name='map'),'recorded assigned dispatch')
 
     def restore_service(self):
         owner=self.service();self.catalog.set_active_map_name('map')
         owner._arm_map_activation_fence=Mock()
         return owner
 
-    def test_restore_imports_old_asset_before_assigned_dispatch(self):
-        self.prepare()
-        owner = self.restore_service()
-        before = inventory(self.current)
-        with patch('skills.assigned_map_activation.activate_assigned_workspace', return_value='assigned restored') as dispatch:
-            self.assertEqual(owner.restore_active_workspace(load_memory_history=False), 'assigned restored')
-        self.assertFalse(dispatch.call_args.kwargs['load_memory_history'])
-        self.assertEqual(dispatch.call_args.args[1].identity_schema_version, 2)
-        self.assertEqual(inventory(self.current), before)
-        self.assertEqual(self.catalog.get_map_asset('map').identity_schema_version, 2)
 
 
 
@@ -574,16 +533,6 @@ class LegacyCloudImportTests(unittest.TestCase):
 
 
 
-    def test_catalog_failure_leaves_published_source_for_next_explicit_retry(self):
-        self.prepare();owner=self.service()
-        with patch('skills.assigned_map_save.reconcile_assigned_current',side_effect=RuntimeError('catalog interrupted')):
-            with self.assertRaisesRegex(RuntimeError,'catalog interrupted'):owner._import_legacy_cloud_for_activation('map')
-        self.repository=asset_store.MapAssetBundleRepository(str(self.root))
-        self.catalog=catalog.MapCatalogRepository(str(self.root))
-        owner=self.service()
-        with patch.object(asset_store.uuid,'uuid4',side_effect=AssertionError('allocation after publication')):
-            result=owner._import_legacy_cloud_for_activation('map')
-        self.assertEqual(self.catalog.get_map_asset('map').asset_identity,result.bundle.asset_identity)
 
     def test_getter_has_no_new_cloud_import_side_effect(self):
         self.prepare()
@@ -595,19 +544,6 @@ class LegacyCloudImportTests(unittest.TestCase):
         with patch.object(self.repository,'_recover_planar_exchange',side_effect=RuntimeError('original exchange unresolved')), patch.object(asset_store.uuid,'uuid4',side_effect=AssertionError('allocation')):
             with self.assertRaisesRegex(RuntimeError,'original exchange unresolved'):self.import_current()
 
-    def test_catalog_creation_owner_change_is_not_overwritten_or_fallback(self):
-        self.prepare();owner=self.service()
-        def fault(phase):
-            if phase=='after_rename':
-                current=self.catalog.get_map_asset('map')
-                changed=current.model_copy(update={'created_at':datetime(2000,1,1,tzinfo=timezone.utc)})
-                self.catalog.save_map_asset(changed)
-        self.repository._fault_injector=fault
-        with self.assertRaises(Exception) as raised:
-            owner._import_legacy_cloud_for_activation('map')
-        self.assertEqual(getattr(raised.exception,'error_code',None),'map_asset_owner_changed')
-        self.assertEqual(self.catalog.get_map_asset('map').identity_schema_version,1)
-        self.assertEqual(len(list(self.repository._map_dir('map').glob('assigned-id-*'))),1)
 
     def test_discovery_reads_no_unrelated_sibling_bundle_body(self):
         self.prepare();path=self.repository._map_dir('map')/('assigned-id-'+'0'*32);path.mkdir()

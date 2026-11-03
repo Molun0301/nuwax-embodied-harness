@@ -25,7 +25,6 @@ from contracts.occupancy_cells import PackedOccupancyCells
 from core.errors import GatewayError
 from contracts.map_activation import AssignedActivationReceipt, _request as _assigned_activation_request
 from contracts.map_relocalization import (
-    AssignedRelocalizationQuery,
     AssignedRelocalizationRequest,
     AssignedRelocalizationTerminal,
 )
@@ -254,31 +253,6 @@ class _AssignedMapActivationTarget:
     def relocalization_policy(self) -> Dict[str, object]:
         # Return the actual projected native policy, detached from its owner.
         return self._snapshot.activation_result["relocalization_policy_v2"]
-
-
-_ASSIGNED_QUERY_STATUS_NAMES = {
-    1: "terminal", 2: "pending", 3: "not_found", 4: "identity_conflict",
-}
-
-
-@dataclass(frozen=True, init=False)
-class _AssignedRelocalizationQueryResult:
-    """Validated query evidence, distinct from a new dispatch's terminal reply."""
-
-    query: AssignedRelocalizationQuery
-    terminal: Optional[AssignedRelocalizationTerminal]
-    _response_json: str = field(repr=False)
-
-    def __init__(self, *args, **kwargs):
-        raise TypeError("assigned query results must come from validated retrieval")
-
-    @property
-    def status(self) -> str:
-        return _ASSIGNED_QUERY_STATUS_NAMES[self.to_dict()["status"]]
-
-    def to_dict(self) -> Dict[str, object]:
-        """Complete canonical response, including the whole durable request echo."""
-        return json.loads(self._response_json)
 
 
 @dataclass(frozen=True, init=False)
@@ -664,22 +638,15 @@ class PlatformGeometryRuntime:
         self._catalog_root = Path(catalog_root).expanduser()
         self._catalog_root.mkdir(parents=True, exist_ok=True)
         self._runtime_state_lock = threading.RLock()
-        self._map_asset_activation_fence = None
         self._workspace_map_name: Optional[str] = None
         self._assigned_map_installation_origin = None
         self._last_validated_live_map_cache: Optional[_ValidatedLiveMapCache] = None
-        self._map_asset_activation_snapshot_read_state = threading.local()
         self._map_activation_snapshot = _MapActivationSnapshot(
             bundle=None,
             bundle_root=None,
             activation_result={},
             generation=0,
         )
-        # 以下4个 Python provider 已由 Rust bridge (GeometryRuntimeProvider) 替代，保留 None 占位以兼容现有引用
-        self._live_map_provider = None
-        self._tf_localization_provider = None
-        self._odometry_publisher = None
-        self._point_cloud_publisher = None
         self._live_geometry_start_lock = threading.RLock()
         self._live_geometry_start_attempted = False
         self._pending_localization_callbacks = []
@@ -947,11 +914,6 @@ class PlatformGeometryRuntime:
                 self._retire_subscription_delivery_ticket(ticket)
             return None
         try:
-            if (
-                ticket.kind == "localization"
-                and self.is_map_asset_activation_recovery_pending()
-            ):
-                return None
             return ticket.callback(*args, **kwargs)
         finally:
             self._finish_subscription_delivery(ticket)
@@ -1118,7 +1080,7 @@ class PlatformGeometryRuntime:
         # Phase 3 目标态：cmd_vel 桥已下线，平台内建速度桥不再启动/停止
         stop_error = None
         try:
-            self.stop_platform_exploration()
+            self.providers.stop_exploration()
         except Exception as exc:
             stop_error = exc
             LOGGER.exception("停止 native exploration 失败；继续关闭几何运行时。")
@@ -2794,64 +2756,13 @@ class PlatformGeometryRuntime:
                 expected_target, request, require_available=True)
         return terminal
 
-    def get_assigned_relocalization_terminal(
-        self, *, assigned_request_v2,
-    ) -> _AssignedRelocalizationQueryResult:
-        """Retrieve durable evidence even after the target is unavailable/retired.
-
-        This method never installs a terminal into the current local session.
-        Query identity comes only from the retained normalized request, with no
-        current activation lookup and no regenerated request alias.
-        """
-        request = _retained_assigned_request(assigned_request_v2)
-        query = AssignedRelocalizationQuery.from_dict({
-            "schema_version": 2, "request_id": request.request_id,
-            "assigned_request_v2": request.to_dict(),
-        })
-        provider = self.get_geometry_runtime_provider()
-        if provider is None:
-            raise RuntimeError("Geometry runtime is disconnected during assigned terminal query")
-        result = provider.get_relocalization_terminal(
-            activation_state={}, request_id=request.request_id,
-            logical_timeout_ms=request.logical_timeout_ms, assigned_request_v2=request,
-        )
-        fields = {"schema_version", "request_id", "status", "terminal",
-                  "ledger_observation", "assigned_request_v2"}
-        if not isinstance(result, Mapping) or set(result) != fields:
-            raise ValueError("assigned query response is missing, mixed, or unsupported")
-        statuses = {name: number for number, name in _ASSIGNED_QUERY_STATUS_NAMES.items()}
-        status = result["status"]
-        if not isinstance(status, str) or status not in statuses:
-            raise ValueError("assigned query response status is unsupported")
-        terminal = (_assigned_terminal_from_result(result["terminal"], request)
-                    if result["terminal"] is not None else None)
-        canonical = dict(result, status=statuses[status],
-                         terminal=terminal.to_dict() if terminal is not None else None)
-        # Seal first, then validate that exact retained value. The provider's
-        # nested request/observation dictionaries may still have mutable aliases.
-        response_json = json.dumps(
-            canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        terminal = query.validate_response(json.loads(response_json))
-        evidence = object.__new__(_AssignedRelocalizationQueryResult)
-        object.__setattr__(evidence, "query", query)
-        object.__setattr__(evidence, "terminal", terminal)
-        object.__setattr__(evidence, "_response_json", response_json)
-        return evidence
-
-
-
-
-
-
-
-
 
     def is_relocalization_available(self) -> bool:
         if not self._is_geometry_profile_enabled() or self.get_geometry_runtime_provider() is None:
             return False
         with self._runtime_state_lock:
             snapshot = self._map_activation_snapshot_locked()
-            if self.is_map_asset_activation_recovery_pending() or snapshot.bundle is None:
+            if snapshot.bundle is None:
                 return False
             activation = snapshot.activation_result
             receipt = activation.get("activation_receipt_v2")
@@ -3177,86 +3088,6 @@ class PlatformGeometryRuntime:
                 and ticket.kind in {"map", "localization"}
             )
 
-    @staticmethod
-    def _map_asset_activation_fence_identity(fence: Mapping[str, object]) -> dict:
-        return fence["assigned_activation_request"]
-
-
-    def _map_asset_activation_fence_snapshot(self) -> Optional[Dict[str, object]]:
-        with self._runtime_state_lock:
-            fence = self._map_asset_activation_fence
-            if fence is None:
-                return None
-            request = fence["assigned_activation_request"]
-            return {**fence, "assigned_activation_request": {
-                **request, "asset_identity": dict(request["asset_identity"])}}
-
-    def is_map_asset_activation_recovery_pending(self) -> bool:
-        return self._map_asset_activation_fence_snapshot() is not None
-
-
-
-
-
-
-
-    def arm_assigned_map_activation_fence(
-        self, *, activation_request, reason: str = "activation_recovery_pending",
-    ) -> bool:
-        """Arm the existing delivery fence with the entire schema-2 request.
-
-        The caller holds no execution/catalog guard while this method drains
-        already-published deliveries. There is no parallel assigned gate.
-        """
-        request = _assigned_activation_request(activation_request)
-        fence = {"assigned_activation_request": request, "map_name": request["map_name"],
-                 "activation_request_id": request["activation_request_id"], "reason": reason}
-        identity = self._map_asset_activation_fence_identity(fence)
-        with self._mapping_lifecycle_lock:
-            with self._runtime_state_lock:
-                existing = self._map_asset_activation_fence
-                if existing is not None and self._map_asset_activation_fence_identity(existing) != identity:
-                    return False
-                self._map_asset_activation_fence = fence
-                deliveries = self._map_asset_activation_delivery_tickets_snapshot()
-        self._wait_for_subscription_deliveries(deliveries)
-        return True
-
-    def complete_assigned_map_activation(self, *, activation_request, expected_target=None) -> bool:
-        request = _assigned_activation_request(activation_request)
-        identity = self._map_asset_activation_fence_identity({"assigned_activation_request": request})
-        if expected_target is not None and expected_target.activation_receipt.to_dict()["request"] != request:
-            return False
-
-        def complete_locked():
-            fence = self._map_asset_activation_fence
-            if fence is None:
-                return True
-            if self._map_asset_activation_fence_identity(fence) != identity:
-                return False
-            self._map_asset_activation_fence = None
-            return True
-        if expected_target is not None:
-            with self.assigned_map_installation_guard(expected_target=expected_target):
-                return complete_locked()
-        with self._runtime_state_lock:
-            return complete_locked()
-
-    @contextmanager
-    def _map_asset_activation_snapshot_read_guard(self) -> Iterator[None]:
-        read_state = self._map_asset_activation_snapshot_read_state
-        depth = int(getattr(read_state, "depth", 0) or 0)
-        read_state.depth = depth + 1
-        try:
-            yield
-        finally:
-            read_state.depth = depth
-
-    def _map_asset_activation_snapshot_read_blocked(self) -> bool:
-        if not self.is_map_asset_activation_recovery_pending():
-            return False
-        read_state = self._map_asset_activation_snapshot_read_state
-        return int(getattr(read_state, "depth", 0) or 0) <= 0
 
     @staticmethod
     def _checkpoint_datetime(timestamp_ns: int) -> datetime:
@@ -4126,12 +3957,6 @@ class PlatformGeometryRuntime:
             sanitized_payload = self._attach_active_map_bundle_to_live_map_payload(
                 payload
             )
-            if self.is_map_asset_activation_recovery_pending():
-                sanitized_payload = (
-                    self._attach_active_map_bundle_to_live_map_payload(
-                        sanitized_payload
-                    )
-                )
             return callback(sanitized_payload)
 
         provider_attach_lock = self._provider_attach_lock
@@ -4322,40 +4147,13 @@ class PlatformGeometryRuntime:
         return callback is not None
 
     def _attach_active_map_bundle_to_live_map_payload(self, payload):
-        def activation_fence_payload(activation_fence):
-            metadata = {
-                "event_type": "heartbeat",
-                "activation_recovery_pending": True,
-                "suppressed_live_map_update": True,
-                "suppressed_live_map_reason": (
-                    "map_asset_activation_recovery_pending"
-                ),
-                "map_name": activation_fence.get("map_name"),
-                "active_map_name": activation_fence.get("map_name"),
-                "asset_identity": activation_fence["assigned_activation_request"]["asset_identity"],
-                "activation_request_id": activation_fence.get(
-                    "activation_request_id"
-                ),
-            }
-            return {
-                "occupancy_grid": None,
-                "cost_map": None,
-                "semantic_map": None,
-                "metadata": metadata,
-            }
 
         def finalize(candidate):
-            activation_fence = self._map_asset_activation_fence_snapshot()
-            if activation_fence is not None:
-                return activation_fence_payload(activation_fence)
             if isinstance(candidate, dict):
                 candidate = {**candidate, "metadata": {**dict(candidate.get("metadata") or {}),
                     "map_activation_generation": activation_snapshot.generation}}
             return candidate
 
-        activation_fence = self._map_asset_activation_fence_snapshot()
-        if activation_fence is not None:
-            return activation_fence_payload(activation_fence)
         if not isinstance(payload, dict):
             return finalize(payload)
         activation_snapshot = self._map_activation_snapshot_read()
@@ -4526,8 +4324,6 @@ class PlatformGeometryRuntime:
     ) -> Optional[MapSnapshot]:
         """返回当前平台几何运行时对外暴露的地图快照。"""
 
-        if self._map_asset_activation_snapshot_read_blocked():
-            return None
         activation_snapshot = self._map_activation_snapshot_read()
         bundle = (
             self._clone_contract(_seed_bundle)
@@ -4649,9 +4445,7 @@ class PlatformGeometryRuntime:
                         self._last_validated_live_map_cache = validated_cache
                 snapshot = snapshot.model_copy(update={"metadata": {**snapshot.metadata,
                     "map_activation_generation": activation_snapshot.generation}})
-                if self._map_asset_activation_snapshot_read_blocked() or not self.is_map_snapshot_source_current(
-                    map_name=snapshot.map_name, metadata=snapshot.metadata,
-                ):
+                if not self.is_map_snapshot_source_current(map_name=snapshot.map_name, metadata=snapshot.metadata):
                     return None
                 snapshot._source_owner_id = id(self)
                 return snapshot
@@ -4687,9 +4481,7 @@ class PlatformGeometryRuntime:
             )
             cached_snapshot = cached_snapshot.model_copy(update={"metadata": {**cached_snapshot.metadata,
                 "map_activation_generation": activation_snapshot.generation}})
-            if self._map_asset_activation_snapshot_read_blocked() or not self.is_map_snapshot_source_current(
-                map_name=cached_snapshot.map_name, metadata=cached_snapshot.metadata,
-            ):
+            if not self.is_map_snapshot_source_current(map_name=cached_snapshot.map_name, metadata=cached_snapshot.metadata):
                 return None
             cached_snapshot._source_owner_id = id(self)
             return cached_snapshot
@@ -4732,8 +4524,7 @@ class PlatformGeometryRuntime:
         )
         snapshot = snapshot.model_copy(update={"metadata": {**snapshot.metadata,
             "map_activation_generation": activation_snapshot.generation}})
-        if self._map_asset_activation_snapshot_read_blocked() or not self.is_map_snapshot_source_current(
-            map_name=snapshot.map_name, metadata=snapshot.metadata):
+        if not self.is_map_snapshot_source_current(map_name=snapshot.map_name, metadata=snapshot.metadata):
             return None
         snapshot._source_owner_id = id(self)
         return snapshot
@@ -4741,14 +4532,10 @@ class PlatformGeometryRuntime:
     def get_raw_occupancy_grid(self):
         """返回已连接几何提供器的物理栅格，不叠加虚拟禁行区。"""
 
-        if self._map_asset_activation_snapshot_read_blocked():
-            return None
         remote = self._remote_provider
         if remote is None or not remote.is_connected:
             return None
         grid = remote.get_raw_occupancy_grid()
-        if self._map_asset_activation_snapshot_read_blocked():
-            return None
         return self._clone_contract(grid) if grid is not None else None
 
     def _build_live_map_snapshot(
@@ -5925,8 +5712,7 @@ class PlatformGeometryRuntime:
         with self._runtime_state_lock:
             snapshot = self._map_activation_snapshot_locked()
             bundle = snapshot.bundle
-            if (bundle is None or bundle.identity_schema_version != 2
-                    or isinstance(self._map_asset_activation_fence, dict)):
+            if (bundle is None or bundle.identity_schema_version != 2):
                 return None
             origin = self._assigned_map_installation_origin
             if origin is None or origin[0] is not snapshot:
@@ -5944,53 +5730,20 @@ class PlatformGeometryRuntime:
             raise TypeError("assigned saved source requires this runtime's captured handle")
         with self._runtime_state_lock:
             origin = self._assigned_map_installation_origin
-            if (self._map_activation_snapshot_locked() is not source._snapshot
-                    or origin is None or origin[0] is not source._snapshot
-                    or origin[1] is not source._prepared
-                    or isinstance(self._map_asset_activation_fence, dict)):
+            if (self._map_activation_snapshot_locked() is not source._snapshot or origin is None or origin[0] is not source._snapshot or (origin[1] is not source._prepared)):
                 raise RuntimeError("ASSIGNED_SAVED_CLOUD_SOURCE_CHANGED")
 
     def get_saved_dense_cloud_source(self):
         """返回当前已安装地图的分配式检查点来源。"""
-        if self.is_map_asset_activation_recovery_pending():
-            return None
         return self.capture_assigned_saved_cloud_source()
 
     def get_live_pointcloud_map_asset_summary(self) -> Dict[str, object]:
         """返回活动规范点云来源摘要，不读取点云体。"""
 
-        def activation_fence_summary(activation_fence):
-            summary = {
-                "available": False,
-                "status": "unavailable",
-                "source_kind": "map_asset_activation_fence",
-                "reason": "activation_recovery_pending",
-                "pcd_path": None,
-                "path": None,
-                "map_name": activation_fence.get("map_name"),
-                "asset_identity": activation_fence["assigned_activation_request"]["asset_identity"],
-                "activation_request_id": activation_fence.get(
-                    "activation_request_id"
-                ),
-                "activation_recovery_pending": True,
-                "not_fallback_to_sensor_scan": True,
-            }
-
-            snapshot = self._map_activation_snapshot_read()
-            if snapshot.bundle is not None and snapshot.bundle.identity_schema_version == 2:
-                summary.update(identity_schema_version=2,
-                               asset_identity=snapshot.bundle.asset_identity.model_dump())
-            return summary
 
         def finalize(summary):
-            activation_fence = self._map_asset_activation_fence_snapshot()
-            if activation_fence is not None:
-                return activation_fence_summary(activation_fence)
             return summary
 
-        activation_fence = self._map_asset_activation_fence_snapshot()
-        if activation_fence is not None:
-            return activation_fence_summary(activation_fence)
         activation_snapshot = self._map_activation_snapshot_read()
         active_bundle = activation_snapshot.bundle
         if active_bundle is not None and active_bundle.identity_schema_version == 2:
@@ -6121,8 +5874,6 @@ class PlatformGeometryRuntime:
     def _locate_live_backend_state(self) -> Optional[Path]:
         """定位当前活跃的建图数据库文件。"""
 
-        if self.is_map_asset_activation_recovery_pending():
-            return None
         resolved_candidate = None
         activation_snapshot = self._map_activation_snapshot_read()
         active_bundle = activation_snapshot.bundle
@@ -6160,8 +5911,6 @@ class PlatformGeometryRuntime:
                 if candidate.exists() and candidate.is_file():
                     resolved_candidate = candidate
                     break
-        if self.is_map_asset_activation_recovery_pending():
-            return None
         return resolved_candidate
 
     def _resolve_existing_bundle_mapping_db(
@@ -6618,15 +6367,6 @@ class PlatformGeometryRuntime:
             raise RuntimeError("探索进度拥有方尚未连接")
         return remote.get_exploration_progress(request_id=request_id)
 
-    def start_platform_exploration(self, request) -> bool:
-        """兼容平台入口；实际启动统一委托 provider bundle。"""
-
-        return bool(self.providers.start_exploration(request))
-
-    def stop_platform_exploration(self) -> bool:
-        """兼容平台入口；实际停止走 correlated native RPC。"""
-
-        return bool(self.providers.stop_exploration())
 
     # ------------------------------------------------------------------
     # 导航入口（capability navigation.navigate_to_pose 调用层）
@@ -6764,143 +6504,130 @@ class PlatformGeometryRuntime:
     ) -> Dict[str, object]:
         """Start or idempotently confirm one native Rust mapping session."""
 
-        _exploration_deadline_remaining(
-            deadline_monotonic,
-            "StartMapping",
-        )
-        if self.is_map_asset_activation_recovery_pending():
-            raise RuntimeError(
-                "地图资产激活恢复尚未完成，拒绝启动新的 mapping session。"
-            )
-        if not self._is_geometry_profile_enabled():
-            raise RuntimeError("平台几何运行时或 mapping profile 已禁用。")
-        if not self._runtime_started:
-            if deadline_monotonic is not None:
-                raise GeometryRuntimeRpcError(
-                    rpc_name="StartMapping",
-                    grpc_code=grpc.StatusCode.UNAVAILABLE,
-                    grpc_details="geometry runtime is not started",
-                )
-            self.start()
-        provider = self._remote_provider
-        if provider is None or not _remote_is_connected(provider):
-            if deadline_monotonic is not None:
-                raise GeometryRuntimeRpcError(
-                    rpc_name="StartMapping",
-                    grpc_code=grpc.StatusCode.UNAVAILABLE,
-                    grpc_details="geometry runtime provider is disconnected",
-                )
-            self._start_geometry_runtime_subprocess()
-            provider = self._remote_provider
-        if provider is None or not _remote_is_connected(provider):
-            raise RuntimeError("nuwax-geometry-runtime gRPC 未连接，无法启动建图。")
+        from services.mapping.catalog import MapCatalogRepository
 
-        active_bundle = self._map_activation_snapshot_read().bundle
-        resolved_map_name = str(
-            map_name or (active_bundle.map_name if active_bundle is not None else "")
-        ).strip()
-        if not resolved_map_name:
-            raise RuntimeError("启动建图必须提供 map_name。")
-
-        with _exploration_deadline_lock(
-            self._mapping_lifecycle_lock,
-            deadline_monotonic,
-            "StartMapping",
-        ):
-            if self.is_map_asset_activation_recovery_pending():
-                raise RuntimeError(
-                    "地图资产激活恢复尚未完成，拒绝启动新的 mapping session。"
-                )
-            with self._runtime_state_lock:
-                selected_name = self._workspace_map_name
-                active_bundle = self._map_activation_snapshot_locked().bundle
-                expected_name = active_bundle.map_name if active_bundle is not None else selected_name
-            if expected_name and resolved_map_name != expected_name:
-                raise RuntimeError("建图目标与已选择工作区不一致，请先激活目标工作区。")
-            current = self._mapping_session_context
-            new_session_started = not (
-                isinstance(current, dict) and bool(current.get("active"))
+        with MapCatalogRepository(str(self._catalog_root)).map_activation_executor_guard():
+            _exploration_deadline_remaining(
+                deadline_monotonic,
+                "StartMapping",
             )
-            if isinstance(current, dict) and bool(current.get("active")):
-                if str(current.get("map_name") or "") != resolved_map_name:
-                    raise RuntimeError(
-                        "已有其它地图的建图会话处于 ACTIVE，拒绝隐式切换。"
+            if not self._is_geometry_profile_enabled():
+                raise RuntimeError("平台几何运行时或 mapping profile 已禁用。")
+            if not self._runtime_started:
+                if deadline_monotonic is not None:
+                    raise GeometryRuntimeRpcError(
+                        rpc_name="StartMapping",
+                        grpc_code=grpc.StatusCode.UNAVAILABLE,
+                        grpc_details="geometry runtime is not started",
                     )
-                session_id = str(current.get("session_id") or "")
-            else:
-                session_id = "mapping:%s" % uuid.uuid4().hex
+                self.start()
+            provider = self._remote_provider
+            if provider is None or not _remote_is_connected(provider):
+                if deadline_monotonic is not None:
+                    raise GeometryRuntimeRpcError(
+                        rpc_name="StartMapping",
+                        grpc_code=grpc.StatusCode.UNAVAILABLE,
+                        grpc_details="geometry runtime provider is disconnected",
+                    )
+                self._start_geometry_runtime_subprocess()
+                provider = self._remote_provider
+            if provider is None or not _remote_is_connected(provider):
+                raise RuntimeError("nuwax-geometry-runtime gRPC 未连接，无法启动建图。")
 
-            if self.is_map_asset_activation_recovery_pending():
-                raise RuntimeError(
-                    "地图资产激活恢复尚未完成，拒绝启动新的 mapping session。"
-                )
-            response = provider.start_mapping(
-                session_id=session_id,
-                map_name=resolved_map_name,
-                **(
-                    {"deadline_monotonic": deadline_monotonic}
-                    if deadline_monotonic is not None
-                    else {}
-                ),
-            )
-            if (
-                not isinstance(response, dict)
-                or str(response.get("phase") or "") != "ACTIVE"
-                or not bool(response.get("active"))
-                or str(response.get("session_id") or "") != session_id
-                or str(response.get("map_name") or "") != resolved_map_name
-                or int(response.get("session_generation") or 0) <= 0
+            active_bundle = self._map_activation_snapshot_read().bundle
+            resolved_map_name = str(
+                map_name or (active_bundle.map_name if active_bundle is not None else "")
+            ).strip()
+            if not resolved_map_name:
+                raise RuntimeError("启动建图必须提供 map_name。")
+
+            with _exploration_deadline_lock(
+                self._mapping_lifecycle_lock,
+                deadline_monotonic,
+                "StartMapping",
             ):
-                raise RuntimeError("StartMapping 未确认匹配的 ACTIVE Rust 会话。")
-            if response.get("planar_mode") == "mapping" and active_bundle is not None:
-                new_session_started = True
-                self.clear_active_map_asset(reason="二维图进入新的续建会话，旧激活目标已退役")
-            context = {
-                **dict(response),
-                "session_id": session_id,
-                "map_name": resolved_map_name,
-                "active": True,
-            }
-            # Local state is committed only after Rust confirms ACTIVE.
-            self._mapping_session_context = context
-            self._mapping_session_provider_attach_epoch = (
-                int(self._provider_attach_epoch)
-                if provider is self._remote_provider
-                else None
-            )
+                with self._runtime_state_lock:
+                    selected_name = self._workspace_map_name
+                    active_bundle = self._map_activation_snapshot_locked().bundle
+                    expected_name = active_bundle.map_name if active_bundle is not None else selected_name
+                if expected_name and resolved_map_name != expected_name:
+                    raise RuntimeError("建图目标与已选择工作区不一致，请先激活目标工作区。")
+                current = self._mapping_session_context
+                new_session_started = not (
+                    isinstance(current, dict) and bool(current.get("active"))
+                )
+                if isinstance(current, dict) and bool(current.get("active")):
+                    if str(current.get("map_name") or "") != resolved_map_name:
+                        raise RuntimeError(
+                            "已有其它地图的建图会话处于 ACTIVE，拒绝隐式切换。"
+                        )
+                    session_id = str(current.get("session_id") or "")
+                else:
+                    session_id = "mapping:%s" % uuid.uuid4().hex
 
-        with _exploration_deadline_lock(
-            self._exploration_loop_lock,
-            deadline_monotonic,
-            "StartMapping",
-        ):
+                response = provider.start_mapping(
+                    session_id=session_id,
+                    map_name=resolved_map_name,
+                    **(
+                        {"deadline_monotonic": deadline_monotonic}
+                        if deadline_monotonic is not None
+                        else {}
+                    ),
+                )
+                if (
+                    not isinstance(response, dict)
+                    or str(response.get("phase") or "") != "ACTIVE"
+                    or not bool(response.get("active"))
+                    or str(response.get("session_id") or "") != session_id
+                    or str(response.get("map_name") or "") != resolved_map_name
+                    or int(response.get("session_generation") or 0) <= 0
+                ):
+                    raise RuntimeError("StartMapping 未确认匹配的 ACTIVE Rust 会话。")
+                if response.get("planar_mode") == "mapping" and active_bundle is not None:
+                    new_session_started = True
+                    self.clear_active_map_asset(reason="二维图进入新的续建会话，旧激活目标已退役")
+                context = {
+                    **dict(response),
+                    "session_id": session_id,
+                    "map_name": resolved_map_name,
+                    "active": True,
+                }
+                # Local state is committed only after Rust confirms ACTIVE.
+                self._mapping_session_context = context
+                self._mapping_session_provider_attach_epoch = (
+                    int(self._provider_attach_epoch)
+                    if provider is self._remote_provider
+                    else None
+                )
+
+            with _exploration_deadline_lock(
+                self._exploration_loop_lock,
+                deadline_monotonic,
+                "StartMapping",
+            ):
+                if new_session_started:
+                    self._external_geometry_session_mode = "mapping"
+                    self._external_exploration_terminal_state = None
+                    self._external_exploration_request = None
             if new_session_started:
-                self._external_geometry_session_mode = "mapping"
-                self._external_exploration_terminal_state = None
-                self._external_exploration_request = None
-        if new_session_started:
-            self._map_stream_tracker = {}
-        diagnostics = provider.get_mapping_diagnostics() if deadline_monotonic is None else None
-        return {
-            "mapping_launch_mode": "nuwax_geometry_runtime",
-            "mapping_transport": "grpc_lcm",
-            "mapping_script": None,
-            "mapping_command": None,
-            "mapping_database_path": None,
-            "mapping_session_id": session_id,
-            "session_generation": int(context.get("session_generation") or 0),
-            "revision": int(context.get("revision") or 0),
-            "mapping_active": True,
-            "map_name": resolved_map_name,
-            "geometry_stack_running": True,
-            "sidecar_kept_alive": True,
-            "mapping_diagnostics": diagnostics,
-        }
+                self._map_stream_tracker = {}
+            diagnostics = provider.get_mapping_diagnostics() if deadline_monotonic is None else None
+            return {
+                "mapping_launch_mode": "nuwax_geometry_runtime",
+                "mapping_transport": "grpc_lcm",
+                "mapping_script": None,
+                "mapping_command": None,
+                "mapping_database_path": None,
+                "mapping_session_id": session_id,
+                "session_generation": int(context.get("session_generation") or 0),
+                "revision": int(context.get("revision") or 0),
+                "mapping_active": True,
+                "map_name": resolved_map_name,
+                "geometry_stack_running": True,
+                "sidecar_kept_alive": True,
+                "mapping_diagnostics": diagnostics,
+            }
 
-    def start_external_mapping(self, *, map_name: Optional[str] = None) -> Dict[str, object]:
-        """兼容旧 capability 名，实际委托 nuwax-geometry-runtime 建图链。"""
-
-        return self.start_mapping(map_name=map_name)
 
     def get_geometry_stack_status(self) -> Dict[str, object]:
         """返回原生几何连接和实际建图/探索会话状态。"""
@@ -6974,109 +6701,109 @@ class PlatformGeometryRuntime:
     def stop_mapping(self, *, reason: str = "stop_mapping") -> Dict[str, object]:
         """Stop the exact native mapping session without stopping the sidecar."""
 
-        provider = self._remote_provider
-        if provider is None or not bool(provider.is_connected):
-            raise RuntimeError("nuwax-geometry-runtime gRPC 未连接，无法停止建图。")
-        with self._mapping_lifecycle_lock:
-            fence = self._map_asset_activation_fence_snapshot()
-            if isinstance(fence, dict) and "assigned_activation_request" in fence:
-                raise RuntimeError("assigned map activation is pending; ordinary StopMapping is fenced")
-            context = self._mapping_session_context
-            if not isinstance(context, dict) or not str(context.get("session_id") or ""):
-                context = provider.get_mapping_state()
-            if not isinstance(context, dict) or not str(context.get("session_id") or ""):
-                raise RuntimeError("当前没有可关联的 Rust mapping session。")
-            session_id = str(context.get("session_id") or "")
+        from services.mapping.catalog import MapCatalogRepository
 
-            exploration_state = provider.get_exploration_state()
-            if not isinstance(exploration_state, dict):
-                raise RuntimeError(
-                    "停止建图前未获得 ExplorationState，mapping adapter 保持 ACTIVE。"
-                )
-            exploration_status = str(
-                exploration_state.get("status") or ""
-            ).strip().upper()
-            safe_terminal_statuses = {
-                "IDLE",
-                "STOPPED",
-                "SUCCEEDED",
-                "CANCELLED",
-            }
-            parked_exploration = None
-            # FAILED may still retain a child navigation lease. Let Rust's
-            # StopMapping ownership gate decide whether mapping can stop.
-            if (
-                exploration_status != "FAILED"
-                and exploration_status not in safe_terminal_statuses
-            ):
-                request_id = str(
-                    exploration_state.get("request_id") or ""
-                ).strip()
-                if not request_id:
+        with MapCatalogRepository(str(self._catalog_root)).map_activation_executor_guard():
+            provider = self._remote_provider
+            if provider is None or not bool(provider.is_connected):
+                raise RuntimeError("nuwax-geometry-runtime gRPC 未连接，无法停止建图。")
+            with self._mapping_lifecycle_lock:
+                context = self._mapping_session_context
+                if not isinstance(context, dict) or not str(context.get("session_id") or ""):
+                    context = provider.get_mapping_state()
+                if not isinstance(context, dict) or not str(context.get("session_id") or ""):
+                    raise RuntimeError("当前没有可关联的 Rust mapping session。")
+                session_id = str(context.get("session_id") or "")
+
+                exploration_state = provider.get_exploration_state()
+                if not isinstance(exploration_state, dict):
                     raise RuntimeError(
-                        "active exploration 缺少 exact request_id，拒绝停止 mapping。"
+                        "停止建图前未获得 ExplorationState，mapping adapter 保持 ACTIVE。"
                     )
-                parked_exploration = provider.stop_exploration(request_id=request_id)
-                if not isinstance(parked_exploration, dict):
-                    raise RuntimeError(
-                        "StopExploration 未返回 exact terminal，mapping adapter 保持 ACTIVE。"
-                    )
-                parked_status = str(
-                    parked_exploration.get("status") or ""
+                exploration_status = str(
+                    exploration_state.get("status") or ""
                 ).strip().upper()
-                parked_request_id = str(
-                    parked_exploration.get("request_id") or ""
-                ).strip()
+                safe_terminal_statuses = {
+                    "IDLE",
+                    "STOPPED",
+                    "SUCCEEDED",
+                    "CANCELLED",
+                }
+                parked_exploration = None
+                # FAILED may still retain a child navigation lease. Let Rust's
+                # StopMapping ownership gate decide whether mapping can stop.
                 if (
-                    parked_request_id != request_id
-                    or parked_status not in safe_terminal_statuses - {"IDLE"}
+                    exploration_status != "FAILED"
+                    and exploration_status not in safe_terminal_statuses
                 ):
-                    raise RuntimeError(
-                        "StopExploration 未返回 exact terminal，mapping adapter 保持 ACTIVE。"
-                    )
+                    request_id = str(
+                        exploration_state.get("request_id") or ""
+                    ).strip()
+                    if not request_id:
+                        raise RuntimeError(
+                            "active exploration 缺少 exact request_id，拒绝停止 mapping。"
+                        )
+                    parked_exploration = provider.stop_exploration(request_id=request_id)
+                    if not isinstance(parked_exploration, dict):
+                        raise RuntimeError(
+                            "StopExploration 未返回 exact terminal，mapping adapter 保持 ACTIVE。"
+                        )
+                    parked_status = str(
+                        parked_exploration.get("status") or ""
+                    ).strip().upper()
+                    parked_request_id = str(
+                        parked_exploration.get("request_id") or ""
+                    ).strip()
+                    if (
+                        parked_request_id != request_id
+                        or parked_status not in safe_terminal_statuses - {"IDLE"}
+                    ):
+                        raise RuntimeError(
+                            "StopExploration 未返回 exact terminal，mapping adapter 保持 ACTIVE。"
+                        )
 
-            response = provider.stop_mapping(
-                session_id=session_id,
-                reason=str(reason or "stop_mapping"),
+                response = provider.stop_mapping(
+                    session_id=session_id,
+                    reason=str(reason or "stop_mapping"),
+                )
+                if (
+                    not isinstance(response, dict)
+                    or str(response.get("phase") or "") != "STOPPED"
+                    or bool(response.get("active"))
+                    or str(response.get("session_id") or "") != session_id
+                ):
+                    raise RuntimeError("StopMapping 未确认匹配的 STOPPED Rust 会话。")
+                self._mapping_session_context = {
+                    **dict(context),
+                    **dict(response),
+                    "active": False,
+                }
+
+            with self._exploration_loop_lock:
+                session_mode = self._external_geometry_session_mode
+                mapping_database_path = None
+                self._external_geometry_session_mode = None
+            self._record_runtime_diagnostic(
+                "native_mapping_stopped",
+                "StopMapping 已关闭 Rust adapter ingestion reason=%s session_id=%s"
+                % (reason, session_id),
             )
-            if (
-                not isinstance(response, dict)
-                or str(response.get("phase") or "") != "STOPPED"
-                or bool(response.get("active"))
-                or str(response.get("session_id") or "") != session_id
-            ):
-                raise RuntimeError("StopMapping 未确认匹配的 STOPPED Rust 会话。")
-            self._mapping_session_context = {
-                **dict(context),
-                **dict(response),
-                "active": False,
+            return {
+                "stopped": True,
+                "reason": str(reason or "stop_mapping"),
+                "session_mode": session_mode,
+                "mapping_session_id": session_id,
+                "mapping_active": False,
+                "idempotent_replay": bool(response.get("idempotent_replay")),
+                "geometry_stack_running": True,
+                "sidecar_kept_alive": True,
+                "exploration_state": None,
+                "parked_exploration": parked_exploration,
+                "map_name": str(response.get("map_name") or "") or None,
+                "session_generation": int(response.get("session_generation") or 0),
+                "revision": int(response.get("revision") or 0),
+                "mapping_database_path": mapping_database_path,
             }
-
-        with self._exploration_loop_lock:
-            session_mode = self._external_geometry_session_mode
-            mapping_database_path = None
-            self._external_geometry_session_mode = None
-        self._record_runtime_diagnostic(
-            "native_mapping_stopped",
-            "StopMapping 已关闭 Rust adapter ingestion reason=%s session_id=%s"
-            % (reason, session_id),
-        )
-        return {
-            "stopped": True,
-            "reason": str(reason or "stop_mapping"),
-            "session_mode": session_mode,
-            "mapping_session_id": session_id,
-            "mapping_active": False,
-            "idempotent_replay": bool(response.get("idempotent_replay")),
-            "geometry_stack_running": True,
-            "sidecar_kept_alive": True,
-            "exploration_state": None,
-            "parked_exploration": parked_exploration,
-            "map_name": str(response.get("map_name") or "") or None,
-            "session_generation": int(response.get("session_generation") or 0),
-            "revision": int(response.get("revision") or 0),
-            "mapping_database_path": mapping_database_path,
-        }
 
 
     def _notify_remote_exploration_update(
@@ -7363,13 +7090,10 @@ class PlatformGeometryProviderBundle(
     def _is_geometry_profile_enabled(self) -> bool:
         return self.runtime._is_geometry_profile_enabled()
 
-    def _map_asset_activation_recovery_pending(self) -> bool:
-        return self.runtime.is_map_asset_activation_recovery_pending()
 
     def is_localization_available(self) -> bool:
         if (
             not self._is_geometry_profile_enabled()
-            or self._map_asset_activation_recovery_pending()
         ):
             return False
         backend = self.runtime._resolve_localization_backend()
@@ -7379,22 +7103,20 @@ class PlatformGeometryProviderBundle(
             available = bool(backend.is_localization_available())
         else:
             available = bool(backend.is_available())
-        return available and not self._map_asset_activation_recovery_pending()
+        return available
 
     def is_localization_active(self) -> bool:
         """由当前地图激活快照报告是否处于定位模式。"""
-        if (not self._is_geometry_profile_enabled()
-                or self._map_asset_activation_recovery_pending()):
+        if (not self._is_geometry_profile_enabled()):
             return False
         snapshot = self.runtime._map_activation_snapshot_read()
         activation = self.runtime._activation_result_from_snapshot(snapshot)
         active = activation.get("backend_mode") == "mapping_localization"
-        return active and not self._map_asset_activation_recovery_pending()
+        return active
 
     def is_map_available(self) -> bool:
         if (
             not self._is_geometry_profile_enabled()
-            or self._map_asset_activation_recovery_pending()
         ):
             return False
         snapshot = self.runtime.get_map_snapshot()
@@ -7408,12 +7130,11 @@ class PlatformGeometryProviderBundle(
                 available = bool(availability_checker())
             else:
                 available = bool(backend.is_available())
-        return available and not self._map_asset_activation_recovery_pending()
+        return available
 
     def is_navigation_available(self) -> bool:
         if (
             not self._is_geometry_profile_enabled()
-            or self._map_asset_activation_recovery_pending()
         ):
             return False
         backend = self.runtime._resolve_navigation_backend()
@@ -7423,12 +7144,11 @@ class PlatformGeometryProviderBundle(
             available = bool(backend.is_navigation_available())
         else:
             available = bool(backend.is_available())
-        return available and not self._map_asset_activation_recovery_pending()
+        return available
 
     def is_exploration_available(self) -> bool:
         if (
             not self._is_geometry_profile_enabled()
-            or self._map_asset_activation_recovery_pending()
         ):
             return False
         backend = self.runtime._resolve_exploration_backend()
@@ -7438,7 +7158,7 @@ class PlatformGeometryProviderBundle(
             available = bool(backend.is_exploration_available())
         else:
             available = _remote_is_connected(backend)
-        return available and not self._map_asset_activation_recovery_pending()
+        return available
 
     def capture_localization_sample(self):
         """Pin the backend and installation for one pose/TF sampling interval.
@@ -7452,8 +7172,7 @@ class PlatformGeometryProviderBundle(
         if backend is None:
             return None, None
         with self.runtime._runtime_state_lock:
-            if (self.runtime._provider_attach_stopping
-                    or self.runtime._map_asset_activation_fence is not None):
+            if (self.runtime._provider_attach_stopping):
                 return None, None
             attach_epoch = self.runtime._provider_attach_epoch
             snapshot = self.runtime._map_activation_snapshot_locked()
@@ -7467,24 +7186,17 @@ class PlatformGeometryProviderBundle(
         current_backend = self.runtime._resolve_localization_backend()
         enabled = self._is_geometry_profile_enabled()
         with self.runtime._runtime_state_lock:
-            if (not enabled or current_backend is not backend
-                    or self.runtime._provider_attach_stopping
-                    or self.runtime._provider_attach_epoch != attach_epoch
-                    or self.runtime._map_activation_snapshot_locked() is not snapshot
-                    or self.runtime._map_asset_activation_fence is not None):
+            if (not enabled or current_backend is not backend or self.runtime._provider_attach_stopping or (self.runtime._provider_attach_epoch != attach_epoch) or (self.runtime._map_activation_snapshot_locked() is not snapshot)):
                 return None, None
         return pose, frame_tree
 
     def get_current_pose(self):
         if (
             not self._is_geometry_profile_enabled()
-            or self._map_asset_activation_recovery_pending()
         ):
             return None
         backend = self.runtime._resolve_localization_backend()
         pose = None if backend is None else backend.get_current_pose()
-        if self._map_asset_activation_recovery_pending():
-            return None
         return pose
 
     def get_exploration_pose(self):
@@ -7497,24 +7209,18 @@ class PlatformGeometryProviderBundle(
 
         if (
             not self._is_geometry_profile_enabled()
-            or self._map_asset_activation_recovery_pending()
         ):
             return None
         pose = self.runtime._read_exploration_pose()
-        if self._map_asset_activation_recovery_pending():
-            return None
         return pose
 
     def get_frame_tree(self):
         if (
             not self._is_geometry_profile_enabled()
-            or self._map_asset_activation_recovery_pending()
         ):
             return None
         backend = self.runtime._resolve_localization_backend()
         frame_tree = None if backend is None else backend.get_frame_tree()
-        if self._map_asset_activation_recovery_pending():
-            return None
         return frame_tree
 
     def subscribe_localization(self, callback) -> Optional[int]:
@@ -7528,15 +7234,6 @@ class PlatformGeometryProviderBundle(
     def get_localization_state(self) -> dict:
         """返回后端原始定位状态，供平台定位状态机消费。"""
 
-        activation_pending_state = {
-            "tracking_state": "unavailable",
-            "map_loaded": False,
-            "quality_score": 0.0,
-            "last_error": "地图资产激活恢复尚未完成。",
-            "activation_recovery_pending": True,
-        }
-        if self._map_asset_activation_recovery_pending():
-            return activation_pending_state
         if not self._is_geometry_profile_enabled():
             return {
                 "tracking_state": "unavailable",
@@ -7563,8 +7260,6 @@ class PlatformGeometryProviderBundle(
                     "tf_localization_provider": self.runtime._clone_metadata(self.runtime._geometry_runtime_status_stub("tf_localization_provider")),
                     "map_loaded": bool(state.get("map_loaded") or self.runtime._has_live_or_seed_map()),
                 }
-                if self._map_asset_activation_recovery_pending():
-                    return activation_pending_state
                 return result
         # 回退到基于位姿可用性的简单判断
         pose = backend.get_current_pose()
@@ -7575,8 +7270,6 @@ class PlatformGeometryProviderBundle(
             "quality_score": 1.0 if pose is not None else 0.0,
             "last_error": None,
         }
-        if self._map_asset_activation_recovery_pending():
-            return activation_pending_state
         return result
 
     def get_status(self) -> dict:
@@ -7596,12 +7289,9 @@ class PlatformGeometryProviderBundle(
     def get_occupancy_grid(self):
         if (
             not self._is_geometry_profile_enabled()
-            or self._map_asset_activation_recovery_pending()
         ):
             return None
         snapshot = self.runtime.get_map_snapshot()
-        if self._map_asset_activation_recovery_pending():
-            return None
         if snapshot is not None:
             return snapshot.occupancy_grid
         # runtime.get_map_snapshot 已通过远端标准 getter 执行可靠 pull；None 表示
@@ -7611,12 +7301,9 @@ class PlatformGeometryProviderBundle(
     def get_cost_map(self):
         if (
             not self._is_geometry_profile_enabled()
-            or self._map_asset_activation_recovery_pending()
         ):
             return None
         snapshot = self.runtime.get_map_snapshot()
-        if self._map_asset_activation_recovery_pending():
-            return None
         if snapshot is not None:
             return snapshot.cost_map
         # Rust facade 暂无独立 cost-map RPC；只返回 snapshot 中实际存在的层。
@@ -7625,12 +7312,9 @@ class PlatformGeometryProviderBundle(
     def get_semantic_map(self):
         if (
             not self._is_geometry_profile_enabled()
-            or self._map_asset_activation_recovery_pending()
         ):
             return None
         snapshot = self.runtime.get_map_snapshot()
-        if self._map_asset_activation_recovery_pending():
-            return None
         if snapshot is not None:
             return snapshot.semantic_map
         # semantic layer 仅来自已激活资产包，不合成远端空层。
@@ -7646,7 +7330,6 @@ class PlatformGeometryProviderBundle(
         _exploration_deadline_remaining(deadline_monotonic, "SetNavigationGoal")
         if (
             not self._is_geometry_profile_enabled()
-            or self._map_asset_activation_recovery_pending()
         ):
             return False
         backend = self.runtime._resolve_navigation_backend()
@@ -7951,8 +7634,6 @@ class PlatformGeometryProviderBundle(
                 or int(mapping_state.get("session_generation") or 0) <= 0
             ):
                 raise RuntimeError("探索启动前未获得 ACTIVE mapping session。")
-            if self._map_asset_activation_recovery_pending():
-                return False
             _exploration_deadline_remaining(
                 deadline_monotonic,
                 "StartExploration",
@@ -7989,8 +7670,6 @@ class PlatformGeometryProviderBundle(
                 deadline_monotonic,
                 "StartExploration",
             ):
-                if self._map_asset_activation_recovery_pending():
-                    return False
                 if not _remote_operation_token_is_current_locked(
                     self.runtime,
                     remote_token,
@@ -8031,15 +7710,6 @@ class PlatformGeometryProviderBundle(
                 deadline_monotonic,
                 "StartExploration",
             )
-            if self._map_asset_activation_recovery_pending():
-                with owner_lock:
-                    current = self.runtime._external_exploration_request
-                    current_id = str(
-                        getattr(current, "request_id", "") or ""
-                    ).strip()
-                    if current_id == request_id:
-                        restore_precommit_snapshot_locked()
-                return False
             result = remote.start_exploration(
                 request_id=request_id,
                 strategy=strategy,
@@ -8226,13 +7896,9 @@ class PlatformGeometryProviderBundle(
         )
         if not self._is_geometry_profile_enabled():
             return False
-        if self._map_asset_activation_recovery_pending():
-            return False
         remote = self._resolve_remote_exploration_provider()
         if remote is None:
             LOGGER.error("Bundle.start_exploration: GeometryRuntimeProvider 未连接。")
-            return False
-        if self._map_asset_activation_recovery_pending():
             return False
         return self._start_exploration_via_remote(
             request,

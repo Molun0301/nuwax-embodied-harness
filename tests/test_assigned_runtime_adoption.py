@@ -203,76 +203,8 @@ class AssignedRuntimeAdoptionTests(unittest.TestCase):
         self.assertEqual(self.stub.calls.count("ActivateMap"), 1)
         self.assertIsNone(self.runtime._map_activation_snapshot_read().bundle)
 
-    def test_unknown_current_sealed_read_settles_pending_then_next_activation(self):
-        self.stub.error = LostReply()
-        with self.assertRaises(provider_module.GeometryRuntimeMapActivationOutcomeUnknown):
-            self.activate()
-        pending = self.provider._assigned_activation_attempt
-        self.assertIsNotNone(pending)
-        # Even a complete caller dictionary cannot retire provider uncertainty.
-        claimed = self.provider._mapping_state_payload(deepcopy(self.stub.state))
-        self.runtime.validate_prepared_assigned_map_evidence(
-            self.prepared, activation_evidence=claimed)
-        self.assertIs(self.provider._assigned_activation_attempt, pending)
-        actual = self.runtime.capture_assigned_mapping_state(self.prepared)
-        self.assertIsNone(self.provider._assigned_activation_attempt)
-        self.install(actual)
-        self.runtime.stop_assigned_mapping_predecessor(self.prepared, actual)
-        next_bundle = bundle_fixture(identity=AssetIdentityV2(asset_id="e" * 32)).model_copy(
-            update={"asset_state": "finalized"})
-        prepared = self.runtime.prepare_assigned_map_activation(next_bundle, bundle_root=self.root)
-        next_request = {**self.request, "activation_request_id": "mapload:next", "session_id": "mapload:next",
-                        "asset_identity": next_bundle.asset_identity.model_dump()}
-        self.stub.error = None
-        self.stub.installs = 0  # The fixture's replay counter is per exact request.
-        result = self.runtime.dispatch_prepared_assigned_map(prepared, next_request)
-        self.assertEqual(result["activation_receipt_v2"].to_dict()["request"], next_request)
-        self.assertEqual(self.stub.calls.count("ActivateMap"), 2)
 
-    def test_current_nonmatching_or_partial_state_never_retires_pending_attempt(self):
-        self.stub.error = LostReply()
-        with self.assertRaises(provider_module.GeometryRuntimeMapActivationOutcomeUnknown):
-            self.activate()
-        pending, original = self.provider._assigned_activation_attempt, deepcopy(self.stub.state)
-        for change in ("request", "partial"):
-            with self.subTest(change=change):
-                self.stub.state = deepcopy(original)
-                if change == "request":
-                    self.stub.state.activation_request_id = "mapload:other"
-                    receipt = self.stub.state.activation_receipt_v2
-                    for request in (receipt.request, receipt.activation.request, receipt.target.activation.request):
-                        request.activation_request_id = "mapload:other"
-                else:
-                    self.stub.state.activation_receipt_disposition = 1
-                    self.stub.state.relocalization_target_available = False
-                    self.stub.state.activation_receipt_v2.ClearField("target")
-                    self.stub.state.activation_receipt_v2.ClearField("activation")
-                self.runtime.capture_assigned_mapping_state(self.prepared)
-                self.assertIs(self.provider._assigned_activation_attempt, pending)
 
-    def test_pending_retirement_rechecks_transition_and_exact_attempt_cas(self):
-        self.stub.error = LostReply()
-        with self.assertRaises(provider_module.GeometryRuntimeMapActivationOutcomeUnknown):
-            self.activate()
-        pending = self.provider._assigned_activation_attempt
-        def during(operation):
-            self.assert_unlocked(operation)
-            if operation == "GetMappingState":
-                self.provider._mapping_transition_epoch += 1
-        self.stub.during = during
-        with self.assertRaisesRegex(RuntimeError, "ownership changed"):
-            self.runtime.capture_assigned_mapping_state(self.prepared)
-        self.assertIs(self.provider._assigned_activation_attempt, pending)
-        replacement = provider_module._AssignedActivationAttempt(
-            pending.request_key, pending.stored_checkpoint, pending.stub, pending.connection_epoch)
-        def replace_during(operation):
-            self.assert_unlocked(operation)
-            if operation == "GetMappingState":
-                self.provider._assigned_activation_attempt = replacement
-        self.stub.during = replace_during
-        with self.assertRaisesRegex(RuntimeError, "ownership changed"):
-            self.runtime.capture_assigned_mapping_state(self.prepared)
-        self.assertIs(self.provider._assigned_activation_attempt, replacement)
 
     def test_install_reconcile_preserves_token_generation_and_source_content(self):
         evidence = self.activate()
@@ -462,53 +394,15 @@ class AssignedRuntimeAdoptionTests(unittest.TestCase):
         self.assertEqual(results, [True])
         self.assertIs(runtime._remote_provider, replacement)
 
-    def test_fence_uses_whole_request_and_existing_delivery_gate(self):
-        drains = []
-        def drain(tickets):
-            self.assert_unlocked("drain")
-            drains.append(tickets)
-        with patch.object(self.runtime, "_wait_for_subscription_deliveries", side_effect=drain):
-            self.assertTrue(self.runtime.arm_assigned_map_activation_fence(activation_request=self.request))
-        self.assertEqual(len(drains), 1)
-        self.assertTrue(self.runtime.is_map_asset_activation_recovery_pending())
-        view = self.runtime._map_asset_activation_fence_snapshot()
-        view["assigned_activation_request"]["asset_identity"]["asset_id"] = "e" * 32
-        self.assertEqual(self.runtime._map_asset_activation_fence_snapshot()["assigned_activation_request"], self.request)
-        for name, changed in (("session_id", "another"), ("expected_runtime_generation", 8),
-                              ("checkpoint_id", "e" * 32), ("asset_identity", {"asset_id": "e" * 32})):
-            with self.subTest(name=name):
-                other = {**self.request, name: changed}
-                self.assertFalse(self.runtime.arm_assigned_map_activation_fence(activation_request=other))
-                self.assertFalse(self.runtime.complete_assigned_map_activation(activation_request=other))
-        target, _ = self.install()
-        self.assertTrue(self.runtime.complete_assigned_map_activation(
-            activation_request=self.request, expected_target=target))
 
-    def test_guard_and_fence_release_reject_old_installation_token(self):
+    def test_installation_guard_rejects_old_installation_token(self):
         target, _ = self.install()
-        self.runtime.arm_assigned_map_activation_fence(activation_request=self.request)
         with self.runtime._runtime_state_lock:
             self.runtime._map_activation_snapshot = module._MapActivationSnapshot(None, None, {}, 2)
         with self.assertRaisesRegex(RuntimeError, "changed"), \
                 self.runtime.assigned_map_installation_guard(expected_target=target):
             self.fail("old target entered installation guard")
-        with self.assertRaisesRegex(RuntimeError, "changed"):
-            self.runtime.complete_assigned_map_activation(activation_request=self.request, expected_target=target)
-        self.assertTrue(self.runtime.is_map_asset_activation_recovery_pending())
 
-    def test_existing_assigned_fence_blocks_ordinary_start_and_stop_only(self):
-        self.stub.state = predecessor(active=True)
-        captured = self.runtime.capture_assigned_mapping_state(self.prepared)
-        self.runtime._mapping_session_context = deepcopy(captured)
-        self.runtime.arm_assigned_map_activation_fence(activation_request=self.request)
-        with patch.object(self.provider, "get_exploration_state", side_effect=AssertionError("exploration queried")), \
-                patch.object(self.provider, "stop_mapping", side_effect=AssertionError("ordinary stop dispatched")):
-            with self.assertRaisesRegex(RuntimeError, "fenced"):
-                module.PlatformGeometryRuntime.stop_mapping(self.runtime)
-            with self.assertRaises(RuntimeError):
-                self.runtime.start_mapping(map_name=self.request["map_name"])
-        stopped = self.runtime.stop_assigned_mapping_predecessor(self.prepared, captured)
-        self.assertEqual(stopped["phase"], "STOPPED")
 
     def test_installation_guard_rejects_lost_origin_and_current_state_reconciles_token(self):
         target, _ = self.install()

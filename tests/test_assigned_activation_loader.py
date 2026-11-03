@@ -83,29 +83,21 @@ class AssignedActivationLoaderTests(unittest.TestCase):
         self.assertEqual(self.stub.calls.count('ActivateMap'), 1)
         self.assertNotIn('StopMapping', self.stub.calls)
 
-    def test_other_active_owner_requires_explicit_stop_before_upload(self):
+    def test_native_active_owner_rejection_does_not_implicitly_stop(self):
         self.stub.state = predecessor(active=True)
-        with self.assertRaisesRegex(RuntimeError, 'explicit predecessor stop'):
+        failure = RuntimeError('原生拒绝未停止的前驱')
+        def reject(request, timeout):
+            self.stub.visit('ActivateMap')
+            self.assertTrue(self.stub.state.active)
+            raise failure
+        with patch.object(self.stub, 'ActivateMap', side_effect=reject), \
+                self.assertRaises(module.GeometryRuntimeMapActivationOutcomeUnknown) as raised:
             self.activate()
-        self.assertEqual(self.stub.calls, ['GetMappingState'])
+        self.assertIs(raised.exception.__cause__, failure)
+        self.assertNotIn('StopMapping', self.stub.calls)
         self.assertTrue(self.stub.state.active)
-        self.assertEqual(self.client._mapping_identity, ('predecessor', 'previous', 3))
         self.assertFalse(self.client._mapping_transition_inflight)
 
-    def test_changed_current_owner_is_rejected_before_upload_or_stop(self):
-        self.activate()
-        for mutate in (lambda r: r.update(session_id='changed-session'),
-                       lambda r: r.update(activation_request_id='changed-request'),
-                       lambda r: r.update(map_name='changed-map'),
-                       lambda r: r['asset_identity'].update(asset_id='e'*32)):
-            self.request = request_dict()
-            mutate(self.request)
-            self.stub.calls.clear()
-            with self.subTest(request=self.request), self.assertRaises((ValueError, RuntimeError)):
-                self.activate()
-            self.assertEqual(self.stub.calls, ['GetMappingState'])
-            self.assertTrue(self.stub.state.active)
-            self.assertEqual(self.client._mapping_identity, ('loaded:retained', 'room', 6))
 
     def test_rejects_missing_extra_bad_and_changed_checkpoint_before_rpc(self):
         for mutate in (lambda r: r.pop('activation_request_id'),
@@ -120,18 +112,25 @@ class AssignedActivationLoaderTests(unittest.TestCase):
         self.assertEqual(self.stub.calls, [])
         self.assertFalse(self.client._mapping_transition_inflight)
 
-    def test_runtime_generation_mismatch_does_not_guess_current_generation(self):
+    def test_runtime_generation_mismatch_is_left_to_native_without_rewriting_request(self):
         self.stub.state.runtime_generation = 9
-        with self.assertRaisesRegex(ValueError, 'retained runtime/backend'):
+        failure = RuntimeError('原生代次拒绝')
+        def reject(request, timeout):
+            self.stub.visit('ActivateMap')
+            self.assertEqual(request.expected_runtime_generation, 7)
+            self.assertNotEqual(request.expected_runtime_generation, self.stub.state.runtime_generation)
+            raise failure
+        with patch.object(self.stub, 'ActivateMap', side_effect=reject), \
+                self.assertRaises(module.GeometryRuntimeMapActivationOutcomeUnknown) as raised:
             self.activate()
+        self.assertIs(raised.exception.__cause__, failure)
         self.assertEqual(self.request['expected_runtime_generation'], 7)
-        self.assertEqual(self.stub.calls, ['GetMappingState'])
-        self.assertEqual(self.client._mapping_identity, ('predecessor', 'previous', 3))
+        self.assertNotIn('GetMappingState', self.stub.calls)
         self.assertFalse(self.client._mapping_transition_inflight)
 
     def test_caller_request_mutation_during_io_cannot_change_wire_owner(self):
         def change(method):
-            if method == 'GetMappingState':
+            if method.startswith('Transfer:'):
                 self.request['asset_identity']['asset_id'] = 'f'*32
                 self.request['expected_runtime_generation'] = 9
         self.stub.during = change
@@ -145,7 +144,7 @@ class AssignedActivationLoaderTests(unittest.TestCase):
         self.assertEqual(caught.exception.activation_request, request_dict())
         self.assertEqual(caught.exception.backend_activation_disposition, 'unknown')
         self.assertEqual(self.stub.calls.count('ActivateMap'), 1)
-        self.assertEqual(self.stub.calls.count('GetMappingState'), 1)
+        self.assertEqual(self.stub.calls.count('GetMappingState'), 0)
         self.assertIsNone(self.client._mapping_identity)
         self.assertFalse(self.client._mapping_transition_inflight)
         self.assertEqual(self.stub.entries, {})
@@ -161,24 +160,6 @@ class AssignedActivationLoaderTests(unittest.TestCase):
         self.stub.error = None
         return caught.exception
 
-    def test_retained_exact_retry_bypasses_fenced_status_and_clears_evidence(self):
-        unknown = self.create_unresolved_attempt()
-        evidence = self.client._assigned_activation_attempt
-        self.assertIs(evidence.stored_checkpoint, self.stored)
-        self.assertEqual(unknown.backend_activation_disposition, 'unknown')
-        # 重开相同身份的实际文件也必须逐成员精确相等，比较不得占用状态锁。
-        self.stored = module.MappingBackendCheckpointStore(self.root).load('voxel', schema_version=2)
-        self.assertIsNot(self.stored, evidence.stored_checkpoint)
-        original = module._AssignedActivationAttempt.matches
-        def compare(attempt, *args):
-            self.assertFalse(self.client._map_state_lock.locked())
-            self.assertFalse(self.client._map_delivery_lock._is_owned())
-            return original(attempt, *args)
-        with patch.object(self.stub, 'GetMappingState', side_effect=AssertionError('native fence blocks state read')), \
-                patch.object(module._AssignedActivationAttempt, 'matches', compare):
-            self.assertTrue(self.activate()['idempotent_replay'])
-        self.assertIsNone(self.client._assigned_activation_attempt)
-        self.assertEqual(self.stub.installs, 1)
 
     def test_explicit_retry_can_complete_first_execution_if_original_dispatch_never_arrived(self):
         with patch.object(self.stub, 'ActivateMap', side_effect=LostReply()), \
@@ -189,122 +170,13 @@ class AssignedActivationLoaderTests(unittest.TestCase):
             result = self.activate()
         self.assertFalse(result['idempotent_replay'])
         self.assertEqual(self.stub.installs, 1)
-        self.assertIsNone(self.client._assigned_activation_attempt)
 
-    def test_fresh_provider_or_preflight_failure_cannot_bypass_status(self):
-        fresh = module.GeometryRuntimeProvider(None)
-        fresh._connected = True
-        fresh._stub = self.stub
-        self.stub.owner = fresh
-        with patch.object(self.stub, 'GetMappingState', side_effect=LostReply()):
-            with self.assertRaises(LostReply):
-                fresh.activate_assigned_platform_map(activation_request=self.request, stored_checkpoint=self.stored)
-            with self.assertRaises(LostReply):
-                fresh.activate_assigned_platform_map(activation_request=self.request, stored_checkpoint=self.stored)
-        self.assertIsNone(fresh._assigned_activation_attempt)
-        self.assertEqual(self.stub.requests, [])
-        self.assertNotIn('ActivateMap', self.stub.calls)
 
-    def test_pending_retry_rejects_each_changed_request_field_before_any_rpc(self):
-        self.create_unresolved_attempt()
-        evidence = self.client._assigned_activation_attempt
-        for key, value in (('activation_request_id', 'fresh:id'), ('session_id', 'fresh:session'),
-                           ('map_name', 'another map'), ('checkpoint_id', 'e'*32),
-                           ('expected_runtime_generation', 999), ('asset_identity', {'asset_id': 'e'*32})):
-            self.request = request_dict()
-            self.request[key] = value
-            self.stub.calls.clear()
-            with self.subTest(field=key), self.assertRaises(ValueError):
-                self.activate()
-            self.assertEqual(self.stub.calls, [])
-            self.assertIs(self.client._assigned_activation_attempt, evidence)
 
-    def test_pending_retry_rejects_changed_body_and_descriptors_under_same_ids(self):
-        self.create_unresolved_attempt()
-        evidence = self.client._assigned_activation_attempt
-        original = self.stored
-        mutations = [
-            lambda r: setattr(r.canonical_cloud_checkpoint, 'xyz_f32_le', struct.pack('<fff', 4, 5, 6)),
-            lambda r: setattr(r.canonical_occupancy_checkpoint, 'data', b'\x00\x64'),
-            lambda r: setattr(r.canonical_occupancy_checkpoint.meta, 'origin_x', 8.0),
-            lambda r: setattr(r.canonical_cloud_checkpoint, 'voxel_size', 0.25),
-        ]
-        for mutate in mutations:
-            changed = response_fixture()
-            mutate(changed)
-            bundle = module._checkpoint_export_bundle_from_proto(changed,
-                fine_payload=fine_bytes(), dense_payload=dense_bytes())
-            self.stored = replace(original, checkpoint=bundle.checkpoint,
-                occupancy_asset=bundle.occupancy_asset, cloud_asset=bundle.cloud_asset)
-            self.stub.calls.clear()
-            with self.subTest(mutate=mutate), self.assertRaisesRegex(ValueError, 'exact retained request/checkpoint'):
-                self.activate()
-            self.assertEqual(self.stub.calls, [])
-            self.assertIs(self.client._assigned_activation_attempt, evidence)
-        self.stored = original
 
-    def test_pending_retry_rejects_signed_zero_origin_bits(self):
-        zero = response_fixture()
-        zero.canonical_occupancy_checkpoint.meta.origin_x = 0.0
-        zero.canonical_occupancy_checkpoint.meta.origin_y = 0.0
-        bundle = module._checkpoint_export_bundle_from_proto(zero,
-            fine_payload=fine_bytes(), dense_payload=dense_bytes())
-        self.stored = replace(self.stored, checkpoint=bundle.checkpoint,
-            occupancy_asset=bundle.occupancy_asset, cloud_asset=bundle.cloud_asset)
-        self.create_unresolved_attempt()
-        original = self.stored
-        for field in ('origin_x', 'origin_y'):
-            changed = deepcopy(zero)
-            setattr(changed.canonical_occupancy_checkpoint.meta, field, -0.0)
-            changed_bundle = module._checkpoint_export_bundle_from_proto(changed,
-                fine_payload=fine_bytes(), dense_payload=dense_bytes())
-            self.stored = replace(original, checkpoint=changed_bundle.checkpoint,
-                occupancy_asset=changed_bundle.occupancy_asset, cloud_asset=changed_bundle.cloud_asset)
-            self.assertEqual(self.stored.occupancy_asset, original.occupancy_asset)
-            self.stub.calls.clear()
-            with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'exact retained request/checkpoint'):
-                self.activate()
-            self.assertEqual(self.stub.calls, [])
-        self.stored = original
 
-    def test_exception_request_mutation_cannot_forge_pending_dispatch_evidence(self):
-        unknown = self.create_unresolved_attempt()
-        unknown.activation_request['activation_request_id'] = 'fresh:forged'
-        unknown.activation_request['asset_identity']['asset_id'] = 'e'*32
-        self.request = unknown.activation_request
-        self.stub.calls.clear()
-        with self.assertRaisesRegex(ValueError, 'exact retained request/checkpoint'):
-            self.activate()
-        self.assertEqual(self.stub.calls, [])
-        self.request = request_dict()
-        with patch.object(self.stub, 'GetMappingState', side_effect=AssertionError('fenced')):
-            self.assertTrue(self.activate()['idempotent_replay'])
 
-    def test_disconnect_retires_retry_evidence_without_changing_unknown_outcome(self):
-        unknown = self.create_unresolved_attempt()
-        with self.client._map_state_lock:
-            retired = self.client._invalidate_map_connection_locked()
-        del retired
-        self.assertIsNone(self.client._assigned_activation_attempt)
-        self.assertEqual(unknown.backend_activation_disposition, 'unknown')
-        replacement = LoaderStub(self.export)
-        self.client._stub = replacement
-        replacement.owner = self.client
-        with patch.object(replacement, 'GetMappingState', side_effect=LostReply()), self.assertRaises(LostReply):
-            self.activate()
-        self.assertNotIn('ActivateMap', replacement.calls)
-        self.assertEqual(replacement.requests, [])
 
-    def test_disconnect_drops_retired_checkpoint_owner_outside_both_locks(self):
-        client = self.client
-        observed = []
-        class RetirementProbe:
-            def __del__(self):
-                observed.append((client._map_state_lock.locked(), client._map_delivery_lock._is_owned()))
-        client._assigned_activation_attempt = RetirementProbe()
-        client.disconnect()
-        self.assertEqual(observed, [(False, False)])
-        self.assertIsNone(client._assigned_activation_attempt)
 
     def test_untrusted_ack_is_unknown_not_applied(self):
         mutations = [
@@ -389,7 +261,6 @@ class AssignedActivationLoaderTests(unittest.TestCase):
 
     def test_exact_ack_survives_local_adoption_failure_as_applied(self):
         self.create_unresolved_attempt()
-        self.assertIsNotNone(self.client._assigned_activation_attempt)
         original = self.client._finish_mapping_transition
         def fail(*args, **kwargs):
             if kwargs.get('identity') is not None:
@@ -399,7 +270,6 @@ class AssignedActivationLoaderTests(unittest.TestCase):
                 self.assertRaises(module.GeometryRuntimeMapActivationAppliedError) as caught:
             self.activate()
         self.assertTrue(caught.exception.backend_switch_applied)
-        self.assertIsNone(self.client._assigned_activation_attempt)
         self.assertEqual(caught.exception.activation_receipt_v2.to_dict()['request'], request_dict())
         self.assertEqual(self.stub.entries, {})
         self.assertFalse(self.client._mapping_transition_inflight)

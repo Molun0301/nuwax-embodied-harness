@@ -59,9 +59,6 @@ _SCHEMA = {
     'evidence': [('schema_version', 1, 'u32'), ('phase', 2, 'enum'), ('admission_ordinal', 3, '?u64'), ('owner', 4, '?owner'), ('source_frames', 5, '*frame'), ('algorithm', 6, '?algorithm')],
     'result_body': [('request', 1, 'request'), ('disposition', 2, 'enum'), ('correction_revision', 3, 'u64'), ('detail', 4, 'str'), ('candidate_payload_v3', 5, 'hex'), ('evidence', 6, 'evidence')],
     'result': [('schema_version', 1, 'u32'), ('request_id', 2, 'str'), ('assigned_cloud_v2', 33, 'result_body')],
-    'query': [('schema_version', 1, 'u32'), ('request_id', 2, 'str'), ('assigned_request_v2', 5, 'request')],
-    'observation': [('observation_schema_version', 1, 'u32'), ('admitted_command_count', 2, 'u64'), ('claimed_command_count', 3, 'u64'), ('terminal_record_count', 4, 'u64'), ('pending_record_count', 5, 'u64'), ('active_waiter_count', 6, 'u64'), ('observation_epoch', 7, 'u64')],
-    'response': [('schema_version', 1, 'u32'), ('request_id', 2, 'str'), ('status', 5, 'enum'), ('terminal', 6, '?result'), ('ledger_observation', 7, '?observation'), ('assigned_request_v2', 8, 'request')],
 }
 
 # Planar and cloud bodies share the same immutable owners and protobuf codec.
@@ -312,8 +309,7 @@ _PROTO_NAMES = {
     'owner': 'RelocalizationOwnerReceiptV2', 'geometry': 'RelocalizationMapGeometryV2',
     'frame': 'RelocalizationSourceReceiptV2', 'algorithm': 'RelocalizationAlgorithmReceiptV2',
     'evidence': 'AssignedRelocalizationEvidenceV2', 'result_body': 'AssignedCloudRelocalizeResultV2',
-    'result': 'RelocalizeResult', 'query': 'GetRelocalizationTerminalRequest',
-    'observation': 'RelocalizationLedgerObservation', 'response': 'GetRelocalizationTerminalResponse',
+    'result': 'RelocalizeResult',
 }
 _PROTO_NAMES.update({
     'planar_member': 'CheckpointMemberIdentity', 'planar_target': 'InstalledTargetReceiptV2',
@@ -844,68 +840,3 @@ class AssignedRelocalizationTerminal(_MetadataOwner):
     def from_dict(cls, value: Any) -> 'AssignedRelocalizationTerminal':
         """Reopen retained exact bindings; this is not source-content attestation."""
         return cls.admit(value)
-
-
-@dataclass(frozen=True, init=False)
-class AssignedRelocalizationQuery(_MetadataOwner):
-    _encoded: bytes
-    request: AssignedRelocalizationRequest
-    request_id: str
-    _kind = 'query'
-
-    @classmethod
-    def admit(cls, value: Any) -> 'AssignedRelocalizationQuery':
-        value = _normalize(value, 'query')
-        if value['schema_version'] != 2:
-            raise ValueError('assigned query schema must be 2')
-        _bound(value, 'query', MAX_TERMINAL_BYTES)
-        request = AssignedRelocalizationRequest.admit_retained(value['assigned_request_v2'])
-        if value['request_id'] != request.request_id:
-            raise ValueError('query and exact request IDs differ')
-        value['assigned_request_v2'] = request.to_dict()
-        owner = object.__new__(cls)
-        for name, item in {'_encoded': _encode(value), 'request': request, 'request_id': request.request_id}.items():
-            object.__setattr__(owner, name, item)
-        return owner
-
-    @classmethod
-    def from_dict(cls, value: Any) -> 'AssignedRelocalizationQuery':
-        owner = cls.admit(value)
-        if _encode(_normalize(value, 'query')) != owner._encoded:
-            raise ValueError('durable query request must be normalized')
-        return owner
-
-    def _validate_status(self, status: int, terminal: AssignedRelocalizationTerminal | None) -> None:
-        if type(status) is not int or status not in {1, 2, 3, 4} or (status == 1) != (terminal is not None):
-            raise ValueError('query status and terminal presence differ')
-        if terminal is not None and (not isinstance(terminal, AssignedRelocalizationTerminal) or not self.request.exact_replay_of(terminal.request)):
-            raise ValueError('query terminal belongs to a different exact request')
-
-    def response(self, status: int, terminal: AssignedRelocalizationTerminal | None = None, ledger_observation: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        self._validate_status(status, terminal)
-        result = {'schema_version': 2, 'request_id': self.request_id, 'status': status,
-                  'terminal': terminal.to_dict() if terminal is not None else None,
-                  'ledger_observation': _normalize(ledger_observation, '?observation'),
-                  'assigned_request_v2': self.request.to_dict()}
-        _bound(result, 'response', MAX_TERMINAL_RECORD_BYTES)
-        return result
-
-    def validate_response(self, value: Any) -> AssignedRelocalizationTerminal | None:
-        value = _normalize(value, 'response')
-        _bound(value, 'response', MAX_TERMINAL_RECORD_BYTES)
-        if value['schema_version'] != 2 or value['request_id'] != self.request_id:
-            raise ValueError('query response schema or request ID differs')
-        request = AssignedRelocalizationRequest.from_dict(value['assigned_request_v2'])
-        if not self.request.exact_replay_of(request):
-            raise ValueError('query response does not echo the whole normalized request')
-        terminal = AssignedRelocalizationTerminal.from_dict(value['terminal']) if value['terminal'] is not None else None
-        self._validate_status(value['status'], terminal)
-        return terminal
-
-
-    def validate_proto_response(self, message: Any) -> AssignedRelocalizationTerminal | None:
-        return self.validate_response(_project_proto(message, 'response'))
-
-    def response_to_provider_fields(self, value: Any) -> dict[str, Any]:
-        self.validate_response(value)
-        return _provider_fields(_normalize(value, 'response'), 'response')

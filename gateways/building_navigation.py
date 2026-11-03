@@ -155,10 +155,10 @@ class GatewayBuildingPorts:
         self.ensure_active()
         try:
             session,workspace=self.runtime.map_workspace_service.relocalize_active_map(map_name=floor.map_name,metadata={
-                "requested_by":self.requested_by or "unknown", "business_request_id":self.runtime._build_runtime_request_id("floor_localize"),
+                "requested_by":self.requested_by or "unknown",
                 "logical_timeout_ms":int(min(30.0,self.remaining_sec())*1000),"planar_seed":[seed.x,seed.y,seed.yaw_rad]})
         except GatewayError as error:
-            if error.error_code in {"relocalization_candidate_rejected","relocalization_failed","relocalization_deadline_exceeded"}:
+            if error.error_code in {"relocalization_rejected","relocalization_failed"}:
                 return False
             raise
         self.runtime._refresh_workspace_snapshots(refresh_localization=False)
@@ -169,7 +169,7 @@ class GatewayBuildingPorts:
     def start_floor_mapping(self,floor,connection,request_id):
         self.ensure_active()
         catalog=self.runtime._get_building_catalog()
-        with catalog.maps.map_activation_guard():
+        with catalog.maps.map_activation_executor_guard(), catalog.maps.map_activation_guard():
             existing=catalog.maps.get_map_asset(floor.map_name)
             if existing is not None and existing.metadata.get("floor_creation_request_id")!=request_id:
                 raise GatewayError("新层地图名称已由其它任务使用，不能覆盖。",error_code="floor_new_map_collision")

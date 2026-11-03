@@ -109,7 +109,6 @@ def runtime_fixture(backend, catalog_root):
     runtime._runtime_state_lock = threading.RLock()
     runtime._provider_attach_epoch = 5
     runtime._provider_attach_stopping = False
-    runtime._map_asset_activation_fence = None
     runtime._remote_provider = backend
     runtime.robot = SimpleNamespace()
     runtime.config.enabled = True
@@ -373,14 +372,12 @@ class BundleCompositeCaptureTests(OfflineCaptureCase):
                     self.assertEqual(bundle.capture_localization_sample(), (None, None))
                 self.assertEqual(backend.calls, ['composite'])
 
-    def test_pending_stopping_disabled_or_no_backend_reject_before_capture(self):
-        for state in ('pending', 'stopping', 'disabled', 'no_backend'):
+    def test_stopping_disabled_or_no_backend_reject_before_capture(self):
+        for state in ('stopping', 'disabled', 'no_backend'):
             with self.subTest(state=state):
                 backend = CompositeBackend()
                 runtime, bundle = runtime_fixture(backend, self.catalog_root)
-                if state == 'pending':
-                    runtime._map_asset_activation_fence = {'reason': 'pending'}
-                elif state == 'stopping':
+                if state == 'stopping':
                     runtime._provider_attach_stopping = True
                 elif state == 'disabled':
                     runtime.config.enabled = False
@@ -422,9 +419,9 @@ class BundleCompositeCaptureTests(OfflineCaptureCase):
         self.assertEqual(original.calls, ['composite'])
         self.assertEqual(replacement.calls, [])
 
-    def test_attachment_aba_pending_stopping_and_disabled_during_capture_reject(self):
+    def test_attachment_aba_stopping_and_disabled_during_capture_reject(self):
         for stage in ('tree', 'pose', 'composite'):
-            for state in ('attachment_aba', 'pending', 'stopping', 'disabled'):
+            for state in ('attachment_aba', 'stopping', 'disabled'):
                 with self.subTest(stage=stage, state=state):
                     barrier = Barrier(stage)
                     backend = (CompositeBackend if stage == 'composite' else GenericBackend)(barrier=barrier)
@@ -437,8 +434,6 @@ class BundleCompositeCaptureTests(OfflineCaptureCase):
                                 runtime._remote_provider = GenericBackend()
                                 runtime._provider_attach_epoch += 1
                                 runtime._remote_provider = backend
-                            elif state == 'pending':
-                                runtime._map_asset_activation_fence = {'reason': 'pending'}
                             elif state == 'stopping':
                                 runtime._provider_attach_stopping = True
                             else:

@@ -46,7 +46,6 @@ from contracts.map_activation import (
 from contracts.map_relocalization import (
     AssignedRelocalizationRequest,
     AssignedRelocalizationTerminal,
-    AssignedRelocalizationQuery,
     _project_proto as _project_assigned_proto,
     _provider_fields as _assigned_proto_fields,
 )
@@ -183,35 +182,6 @@ class GeometryRuntimeMapActivationAppliedError(RuntimeError):
     backend_activation_disposition = "applied"
 
 
-@dataclass(frozen=True)
-class _AssignedActivationAttempt:
-    """同连接内的未决 dispatch 证据；只保留已接纳的不可变载荷引用。"""
-    request_key: tuple
-    stored_checkpoint: StoredMappingBackendCheckpoint
-    stub: object
-    connection_epoch: int
-
-    def matches(self, request_key, stored_checkpoint, origin):
-        if (self.request_key != request_key or self.stub is not origin[0]
-                or self.connection_epoch != origin[1]):
-            return False
-        original = self.stored_checkpoint
-        if original.checkpoint.backend_kind == "slam_toolbox":
-            # Pending planar replay stays bound to the retained immutable owner.
-            # A matching ID or a newly reopened body is not that owner.
-            return (original.checkpoint is stored_checkpoint.checkpoint
-                and original.occupancy_asset == stored_checkpoint.occupancy_asset
-                and stored_checkpoint.cloud_asset is None)
-        # 重开文件只比较原生请求的实际成员；分块精确比较在状态锁外完成，不引入摘要。
-        return original is stored_checkpoint or (
-            original.checkpoint == stored_checkpoint.checkpoint
-            and original.occupancy_asset == stored_checkpoint.occupancy_asset
-            and original.cloud_asset == stored_checkpoint.cloud_asset
-            and all(struct.pack(fmt, original.occupancy_asset[name])
-                    == struct.pack(fmt, stored_checkpoint.occupancy_asset[name])
-                    for name, fmt in (("resolution", ">f"), ("origin_x", ">d"), ("origin_y", ">d")))
-            and struct.pack(">f", original.cloud_asset["voxel_size"])
-                == struct.pack(">f", stored_checkpoint.cloud_asset["voxel_size"]))
 
 
 @dataclass(frozen=True)
@@ -856,10 +826,10 @@ def _mapping_state_document(value: Mapping[str, object]) -> Dict[str, object]:
 
 def _assigned_request_for_rpc(
     *, activation_state: Mapping[str, object], assigned_request_v2,
-    request_id: Optional[str], logical_timeout_ms: int, query_only: bool, planar_seed=None,
+    request_id: Optional[str], logical_timeout_ms: int, planar_seed=None,
 ) -> AssignedRelocalizationRequest:
-    """查询必须使用持久化精确请求；不从旧 SHA 或缺失别名重建身份。"""
-    if not query_only and activation_state.get("activation_receipt_schema_version") != 2:
+    """按当前安装与策略构造本次原生重定位请求。"""
+    if activation_state.get("activation_receipt_schema_version") != 2:
         raise ValueError("unsupported activation schema for assigned relocalization")
     if assigned_request_v2 is not None:
         request = (
@@ -870,8 +840,6 @@ def _assigned_request_for_rpc(
             raise ValueError("assigned request alias differs from durable request")
         if type(logical_timeout_ms) is not int or logical_timeout_ms != request.logical_timeout_ms:
             raise ValueError("assigned timeout differs from normalized durable request")
-    elif query_only:
-        raise ValueError("assigned terminal query requires the whole normalized durable request")
     else:
         receipt = activation_state["activation_receipt_v2"]
         policy = activation_state.get("relocalization_policy_v2")
@@ -896,20 +864,19 @@ def _assigned_request_for_rpc(
         replay[request.body_key]["seed"] = dict(zip(("x", "y", "yaw"), planar_seed))
         if not request.exact_replay_of(AssignedRelocalizationRequest.admit_retained(replay)):
             raise ValueError("assigned planar retry changed its seed")
-    if not query_only:
-        receipt = activation_state["activation_receipt_v2"]
-        if not request.activation_receipt.exact_replay_of(receipt):
-            raise ValueError("assigned request target differs from activation receipt")
-        policy = activation_state.get("relocalization_policy_v2")
-        if policy is None:
-            raise ValueError("assigned activation omitted relocalization_policy_v2")
-        # 持久化身份可读不代表旧策略可重新执行；只比较已有策略元数据。
-        if policy != request.to_dict()[request.body_key]["policy"]:
-            raise ValueError("assigned request policy differs from activation state")
-        if activation_state.get("activation_receipt_disposition") not in {2, 3}:
-            raise ValueError("assigned relocalization requires a sealed activation")
-        if activation_state.get("relocalization_target_available") is not True:
-            raise RuntimeError("当前激活地图没有可用的重定位目标回执。")
+    receipt = activation_state["activation_receipt_v2"]
+    if not request.activation_receipt.exact_replay_of(receipt):
+        raise ValueError("assigned request target differs from activation receipt")
+    policy = activation_state.get("relocalization_policy_v2")
+    if policy is None:
+        raise ValueError("assigned activation omitted relocalization_policy_v2")
+    # 持久化身份可读不代表旧策略可重新执行；只比较已有策略元数据。
+    if policy != request.to_dict()[request.body_key]["policy"]:
+        raise ValueError("assigned request policy differs from activation state")
+    if activation_state.get("activation_receipt_disposition") not in {2, 3}:
+        raise ValueError("assigned relocalization requires a sealed activation")
+    if activation_state.get("relocalization_target_available") is not True:
+        raise RuntimeError("当前激活地图没有可用的重定位目标回执。")
     return request
 
 
@@ -1668,8 +1635,6 @@ _NAV_READINESS_FIELDS = (
     "planner",
     "cmd_vel_sink",
     "profile",
-    "module_node_count",
-    "p1_native_profiles",
     "backend",
     "tf_count",
     "costmap_revision",
@@ -1784,8 +1749,6 @@ def _parse_navigation_readiness_reason(ready: bool, reason: str) -> Dict[str, An
         "planner": None,
         "cmd_vel_sink": None,
         "profile": None,
-        "module_node_count": None,
-        "p1_native_profiles": None,
     }
     marker = "; details="
     idx = reason.find(marker)
@@ -1817,8 +1780,6 @@ def _nav_readiness_disconnected_dict(message: str = "未连接") -> Dict[str, An
         "planner": None,
         "cmd_vel_sink": None,
         "profile": None,
-        "module_node_count": None,
-        "p1_native_profiles": None,
         # Phase 7 增量字段
         "backend": None,
         "tf_count": None,
@@ -2217,7 +2178,6 @@ class GeometryRuntimeProvider:
         self._map_connection_epoch = 0
         self._mapping_transition_epoch = 0
         self._mapping_transition_inflight = False
-        self._assigned_activation_attempt: Optional[_AssignedActivationAttempt] = None
         self._map_delivery_owner_thread_id: Optional[int] = None
         self._map_delivery_in_progress = False
         self._stream_handle_lock = threading.Lock()
@@ -2987,11 +2947,11 @@ class GeometryRuntimeProvider:
                 with self._map_state_lock:
                     self._channel = staged_channel
                     self._stub = staged_stub
-                    retired_attempt = self._invalidate_map_connection_locked()
+                    self._invalidate_map_connection_locked()
                     self._assigned_fine_archive_versions = frozenset(
                         resp.supported_assigned_fine_archive_versions)
                 self._invalidate_map_delivery_tickets_locked()
-            del retired_attempt
+
             self._wait_for_map_deliveries()
             self._transition_navigation_connection(
                 connected=True,
@@ -3035,9 +2995,9 @@ class GeometryRuntimeProvider:
                 channel = self._channel
                 self._channel = None
                 self._stub = None
-                retired_attempt = self._invalidate_map_connection_locked()
+                self._invalidate_map_connection_locked()
             self._invalidate_map_delivery_tickets_locked()
-        del retired_attempt
+
         if channel is not None:
             try:
                 channel.close()
@@ -3072,9 +3032,9 @@ class GeometryRuntimeProvider:
                 channel = self._channel
                 self._channel = None
                 self._stub = None
-                retired_attempt = self._invalidate_map_connection_locked()
+                self._invalidate_map_connection_locked()
             self._invalidate_map_delivery_tickets_locked()
-        del retired_attempt
+
         if channel is not None:
             channel.close()
         self._cancel_data_stream_handles()
@@ -3266,10 +3226,7 @@ class GeometryRuntimeProvider:
                 self._mapping_transition_inflight = False
                 return True
 
-    def _invalidate_map_connection_locked(self) -> Optional[_AssignedActivationAttempt]:
-        # 调用方在两个锁外释放旧载荷；断连撤销重试资格，UNKNOWN 不因此变成未执行。
-        retired_attempt = self._assigned_activation_attempt
-        self._assigned_activation_attempt = None
+    def _invalidate_map_connection_locked(self) -> None:
         self._map_connection_epoch += 1
         self._assigned_fine_archive_versions = frozenset()
         self._mapping_transition_epoch += 1
@@ -3278,7 +3235,6 @@ class GeometryRuntimeProvider:
         self._planar_input_active = False
         self._last_occupancy_grid = None
         self._last_occupancy_grid_identity = None
-        return retired_attempt
 
     def _raise_if_map_delivery_reentry_locked(self, operation: str) -> None:
         thread_id = threading.get_ident()
@@ -3657,18 +3613,12 @@ class GeometryRuntimeProvider:
         self, *, activation_request, stored_checkpoint: StoredMappingBackendCheckpoint,
         expected_origin=None,
     ) -> Dict[str, Any]:
-        """显式加载 schema-2；调用方保留原六字段请求，不改写代际或自动重执行。
-
-        仅接纳已停止/空闲后端或同会话精确重放；切换活跃地图必须由调用方先显式停止。
-        """
+        """派发本次分配式激活，由原生检查运行时代次与会话准入。"""
         self._raise_if_stopping("activate_assigned_platform_map")
         retained = _admit_assigned_activation_request(activation_request)
         if not isinstance(stored_checkpoint, StoredMappingBackendCheckpoint):
             raise TypeError("assigned activation requires a stored checkpoint owner")
         checkpoint = stored_checkpoint.checkpoint
-        request_key = tuple(retained[name] for name in (
-            "activation_request_id", "session_id", "map_name", "checkpoint_id", "expected_runtime_generation")) + (
-                retained["asset_identity"]["asset_id"],)
         if checkpoint.checkpoint_id != retained["checkpoint_id"]:
             raise ValueError("assigned activation checkpoint differs from the retained request")
         from contracts.map_identity import AssetIdentityV2
@@ -3683,7 +3633,6 @@ class GeometryRuntimeProvider:
             if expected_origin is not None and (
                     origin[0] is not expected_origin[0] or origin[1] != expected_origin[1]):
                 raise RuntimeError("assigned activation connection changed before dispatch")
-            pending = self._assigned_activation_attempt
         stub = origin[0]
         self.require_assigned_fine_archive_support(checkpoint, expected_origin=origin)
         transition = self._begin_mapping_transition()
@@ -3696,8 +3645,7 @@ class GeometryRuntimeProvider:
                 if (self._stub is not stub or self._map_connection_epoch != origin[1]
                         or not self._connected or self._stopping
                         or self._mapping_transition_epoch != transition
-                        or not self._mapping_transition_inflight
-                        or self._assigned_activation_attempt is not pending):
+                        or not self._mapping_transition_inflight):
                     raise RuntimeError("assigned activation connection or transition changed")
 
         def transfer(action, reference, **kwargs):
@@ -3724,42 +3672,6 @@ class GeometryRuntimeProvider:
 
         try:
             require_origin()
-            if pending is not None:
-                if not pending.matches(request_key, stored_checkpoint, origin):
-                    raise ValueError("unresolved assigned activation requires the exact retained request/checkpoint and connection")
-                # 只有本连接已 dispatch 的原请求允许略过状态读；原生未决 fence 可能占有状态读锁。
-                # 这是调用方本次显式重试，不是丢失回复后的自动重执行。
-            else:
-                state = self._mapping_state_payload(stub.GetMappingState(pb2.Empty(), timeout=_read_deadline_sec()))
-                require_origin()
-                if (not state["success"] or state["phase"] not in {"IDLE", "ACTIVE", "STOPPED"}
-                        or state["active"] != (state["phase"] == "ACTIVE")
-                        or state["mapping_backend_kind"] != checkpoint.backend_kind
-                        or state["runtime_generation"] != retained["expected_runtime_generation"]):
-                    raise ValueError("assigned activation preflight differs from the retained runtime/backend")
-                if state["session_id"] == retained["session_id"] and (
-                        state["phase"] == "STOPPED" or state["map_name"] != retained["map_name"]):
-                    raise GeometryRuntimeMapActivationStaleRequest(
-                        activation_request_id=retained["activation_request_id"], map_name=retained["map_name"],
-                        current_phase=state["phase"], current_map_name=state["map_name"],
-                    )
-                if state["active"]:
-                    self._mapping_identity_from_payload(state)
-                    if state["session_id"] != retained["session_id"]:
-                        raise RuntimeError("assigned activation requires an explicit predecessor stop")
-                    if state["activation_receipt_schema_version"] != 2:
-                        raise ValueError("active assigned replay requires its retained request owner")
-                    current_receipt = state["activation_receipt_v2"]
-                    current = (current_receipt.to_dict() if isinstance(current_receipt, AssignedActivationReceipt)
-                               else current_receipt)
-                    planar = checkpoint.backend_kind == "slam_toolbox"
-                    source_key = "source_graph_member" if planar else "source_cloud_member"
-                    source_identity = checkpoint.graph_reference.member_identity if planar else checkpoint.cloud_identity
-                    if (current["request"] != retained or (current["target"] is not None
-                            and current["target"][source_key] != _identity_document(source_identity))):
-                        raise ValueError("active assigned replay differs from its retained request/source owner")
-                    # STAGED 没有完整 target 时也只发送调用方原请求，由原生账本裁定显式重放。
-            require_origin()
             # 只重放原始制品身份及不可变字节；不生成摘要或替代 ID。
             for archive, reference in ((checkpoint.payload, checkpoint.graph_reference),
                                        (checkpoint.fine_archive, checkpoint.fine_reference),
@@ -3774,11 +3686,6 @@ class GeometryRuntimeProvider:
             acknowledged = _assigned_activation_ack(
                 self._mapping_state_payload(response), activation_request=retained,
             )
-            with self._map_state_lock:
-                if (self._stub is stub and self._map_connection_epoch == origin[1]
-                        and self._mapping_transition_epoch == transition
-                        and self._assigned_activation_attempt is pending):
-                    self._assigned_activation_attempt = None
             release_artifacts()
             if not self._finish_mapping_transition(
                     transition, identity=self._mapping_identity_from_payload(acknowledged),
@@ -3795,12 +3702,6 @@ class GeometryRuntimeProvider:
                     error.activation_receipt_v2 = acknowledged["activation_receipt_v2"]
                     error.activation_evidence = acknowledged
                 else:
-                    with self._map_state_lock:
-                        if (self._stub is stub and self._map_connection_epoch == origin[1]
-                                and self._mapping_transition_epoch == transition
-                                and self._assigned_activation_attempt is pending):
-                            self._assigned_activation_attempt = _AssignedActivationAttempt(
-                                request_key, stored_checkpoint, stub, origin[1])
                     error = GeometryRuntimeMapActivationOutcomeUnknown(
                         "Assigned activation dispatch or acknowledgement is unresolved: %s" % exc)
                     error.backend_activation_disposition = "unknown"
@@ -3838,7 +3739,7 @@ class GeometryRuntimeProvider:
         state = dict(activation_state)
         assigned = _assigned_request_for_rpc(
             activation_state=state, assigned_request_v2=assigned_request_v2,
-            request_id=request_id, logical_timeout_ms=logical_timeout_ms, query_only=False, planar_seed=planar_seed,
+            request_id=request_id, logical_timeout_ms=logical_timeout_ms, planar_seed=planar_seed,
         )
         request = assigned.to_proto(pb2.RelocalizeRequest)
         try:
@@ -3850,49 +3751,6 @@ class GeometryRuntimeProvider:
             raise ValueError("assigned terminal belongs to a different exact request")
         return _assigned_terminal_payload(terminal)
 
-    def get_relocalization_terminal(
-        self,
-        *,
-        activation_state: Mapping[str, object],
-        request_id: str,
-        logical_timeout_ms: int,
-        planar_seed: Optional[Tuple[float, float, float]] = None,
-        assigned_request_v2: Optional[Union[Mapping[str, object], AssignedRelocalizationRequest]] = None,
-    ) -> Dict[str, Any]:
-        """只读查询已存在 request 的权威终态，不创建或推进请求。"""
-
-        self._raise_if_stopping("get_relocalization_terminal")
-        if not self._connected or not self._stub:
-            raise RuntimeError("Geometry runtime 未连接。")
-        rpc = self._stub.GetRelocalizationTerminal
-        state = dict(activation_state)
-        assigned = _assigned_request_for_rpc(
-            activation_state=state, assigned_request_v2=assigned_request_v2,
-            request_id=request_id, logical_timeout_ms=logical_timeout_ms, query_only=True, planar_seed=planar_seed,
-        )
-        query = AssignedRelocalizationQuery.from_dict({
-            "schema_version": 2, "request_id": assigned.request_id,
-            "assigned_request_v2": assigned.to_dict(),
-        })
-        try:
-            response = rpc(query.to_proto(pb2.GetRelocalizationTerminalRequest), timeout=_read_deadline_sec())
-        except grpc.RpcError as exc:
-            raise GeometryRuntimeRpcError.from_rpc_error("GetRelocalizationTerminal", exc) from exc
-        terminal = query.validate_proto_response(response)
-        observation = None
-        if response.HasField("ledger_observation"):
-            candidate = _project_assigned_proto(response.ledger_observation, "observation")
-            if (candidate["observation_schema_version"] == 1 and candidate["observation_epoch"] != 0
-                    and candidate["terminal_record_count"] + candidate["pending_record_count"]
-                    <= candidate["admitted_command_count"]):
-                observation = candidate
-        return {
-            "schema_version": 2, "request_id": assigned.request_id,
-            "status": {1: "terminal", 2: "pending", 3: "not_found", 4: "identity_conflict"}[response.status],
-            "assigned_request_v2": assigned.to_dict(),
-            "terminal": _assigned_terminal_payload(terminal) if terminal is not None else None,
-            "ledger_observation": observation,
-        }
 
     def capture_assigned_activation_origin(self):
         with self._map_state_lock:
@@ -3933,32 +3791,12 @@ class GeometryRuntimeProvider:
         with self.assigned_activation_origin_guard(expected_origin):
             if self._mapping_transition_inflight:
                 raise RuntimeError("assigned mapping state is unavailable during a transition")
-            pending = self._assigned_activation_attempt
             transition = self._mapping_transition_epoch
         response = expected_origin[0].GetMappingState(pb2.Empty(), timeout=_read_deadline_sec())
         payload = self._mapping_state_payload(response)
-        settled = False
-        if pending is not None and (pending.stub is expected_origin[0]
-                                    and pending.connection_epoch == expected_origin[1]):
-            retained_request = dict(zip(("activation_request_id", "session_id", "map_name",
-                                        "checkpoint_id", "expected_runtime_generation"), pending.request_key[:5]))
-            retained_request["asset_identity"] = {"asset_id": pending.request_key[5]}
-            try:
-                # Only this actual pinned RPC response can settle the pending
-                # owner. Journal dictionaries and caller receipt claims cannot.
-                _assigned_activation_ack(payload, activation_request=retained_request)
-                settled = True
-            except ValueError:
-                # Partial, nonmatching, or nonsealed state remains diagnostic;
-                # it never turns an unresolved dispatch into a settled owner.
-                pass
         with self.assigned_activation_origin_guard(expected_origin):
-            if (self._mapping_transition_inflight or self._mapping_transition_epoch != transition
-                    or self._assigned_activation_attempt is not pending):
+            if self._mapping_transition_inflight or self._mapping_transition_epoch != transition:
                 raise RuntimeError("assigned mapping state ownership changed during capture")
-            if settled:
-                self._assigned_activation_attempt = None
-        # `pending` owns the retired payload references until after lock exit.
         return payload
 
     def stop_assigned_mapping_predecessor(self, *, predecessor, expected_origin) -> Dict[str, Any]:
@@ -4138,46 +3976,10 @@ class GeometryRuntimeProvider:
             payload = _parse_readiness_message(resp.message)
             payload["ready"] = bool(resp.ready)
             payload["error"] = None
-            # fallback 字段名兼容旧调用方。
-            payload.setdefault("has_occupancy_grid", payload.get("last_occupancy_revision", 0) > 0)
-            payload.setdefault("occupancy_revision", payload.get("last_occupancy_revision"))
             return payload
         except grpc.RpcError as e:
             _log_rpc_error("GetMappingReadiness", e)
-            # 兜底:旧 HealthCheck + GetOccupancyGrid 路径,保持向后兼容。
-            try:
-                health = self._stub.HealthCheck(
-                    pb2.HealthCheckRequest(), timeout=_pose_deadline_sec()
-                )
-                lcm_backend = str(health.lcm_backend)
-            except grpc.RpcError as e2:
-                _log_rpc_error("HealthCheck(get_mapping_diagnostics fallback)", e2)
-                return {
-                    "ready": False,
-                    "lcm_backend": "<unknown>",
-                    "odom_count": None,
-                    "pointcloud_count": None,
-                    "last_occupancy_revision": None,
-                    "accumulated_point_count": None,
-                    "adapter_present": None,
-                    "last_error": None,
-                    "has_occupancy_grid": False,
-                    "occupancy_revision": None,
-                    "error": "GetMappingReadiness+HealthCheck 失败: %s / %s" % (e, e2),
-                }
-            return {
-                "ready": False,
-                "lcm_backend": lcm_backend,
-                "odom_count": None,
-                "pointcloud_count": None,
-                "last_occupancy_revision": None,
-                "accumulated_point_count": None,
-                "adapter_present": None,
-                "last_error": "GetMappingReadiness 不可用: %s" % e,
-                "has_occupancy_grid": False,
-                "occupancy_revision": None,
-                "error": "GetMappingReadiness 失败: %s" % e,
-            }
+            return {"ready": False, "error": "GetMappingReadiness 失败: %s" % e}
 
     def get_navigation_diagnostics(self) -> Optional[Dict[str, Any]]:
         """返回 navigation 板块 diagnostics dict(走 `GetNavigationReadiness`)。
@@ -4187,14 +3989,13 @@ class GeometryRuntimeProvider:
           - ``lcm_backend`` (str): canonical LCM backend 名
           - ``readiness`` (dict): `GetNavigationReadiness` 解析后字段
             (ready/message/lcm_backend/tf/costmap/planner/cmd_vel_sink/profile/
-             module_node_count/p1_native_profiles)
+             当前原生就绪字段)
           - ``profile`` / ``active_profile`` (str|None): 当前 nav profile
             (Phase 7 兼容旧 `profile` + 新 `active_profile`)
           - ``backend`` (str|None): "RealLcm" 或 "Unknown"（未启动时）
           - ``tf_count`` (int|None): 累计 tf 帧数
           - ``costmap_revision`` (int|None): 当前 occupancy revision
           - ``cmd_vel_sink_ready`` (bool|None): cmd_vel consumer + watchdog 状态
-          - ``module_node_count`` / ``p1_native_profiles``: 兼容旧字段
           - ``error`` (str|None): 失败原因
 
         返回 None —— 子进程未连接。
@@ -4219,8 +4020,6 @@ class GeometryRuntimeProvider:
                 "tf_count": None,
                 "costmap_revision": None,
                 "cmd_vel_sink_ready": None,
-                "module_node_count": None,
-                "p1_native_profiles": None,
                 "error": "HealthCheck 失败: %s" % e,
             }
         readiness = self.get_navigation_readiness()
@@ -4228,12 +4027,6 @@ class GeometryRuntimeProvider:
         active_profile = (
             readiness.get("active_profile") if isinstance(readiness, dict) else None
         ) or profile
-        module_node_count = (
-            readiness.get("module_node_count") if isinstance(readiness, dict) else None
-        )
-        p1_native_profiles = (
-            readiness.get("p1_native_profiles") if isinstance(readiness, dict) else None
-        )
         backend = readiness.get("backend") if isinstance(readiness, dict) else None
         tf_count = readiness.get("tf_count") if isinstance(readiness, dict) else None
         costmap_revision = (
@@ -4254,8 +4047,6 @@ class GeometryRuntimeProvider:
             "tf_count": tf_count,
             "costmap_revision": costmap_revision,
             "cmd_vel_sink_ready": cmd_vel_sink_ready,
-            "module_node_count": module_node_count,
-            "p1_native_profiles": p1_native_profiles,
             "error": None,
         }
 
@@ -5034,8 +4825,6 @@ class GeometryRuntimeProvider:
         - ``lcm_backend`` / ``tf`` / ``costmap`` / ``planner`` /
           ``cmd_vel_sink`` (bool): 子项
         - ``profile`` (str): 当前 NUWAX_NAV_PROFILE
-        - ``module_node_count`` (int): ModuleGraph 节点数
-        - ``p1_native_profiles`` (list[str]): 本期未启用的 native profile
         """
         self._raise_if_stopping("get_navigation_readiness")
         if not self._stub:
@@ -6595,17 +6384,6 @@ class GeometryRuntimeProvider:
             )
             payload = _parse_readiness_message(resp.message)
             payload["ready"] = bool(resp.ready)
-            # 兼容旧字段(snake_case → 已有 Python 调用方)
-            payload.setdefault("backend_available", payload.get("backend_available"))
-            payload.setdefault("controller_active", payload.get("controller_active"))
-            payload.setdefault("active_source", payload.get("active_source"))
-            payload.setdefault("sources", [])
-            payload.setdefault("frontier_count", 0)
-            payload.setdefault("selected_source", payload.get("active_source", ""))
-            payload.setdefault("last_stop_reason", "")
-            payload.setdefault("revision", payload.get("costmap_input_revision"))
-            payload.setdefault("timestamp_ns", 0)
-            payload.setdefault("arbitration", payload.get("arbitration"))
             payload["error"] = None
             return payload
         except grpc.RpcError as e:
@@ -6649,8 +6427,7 @@ class GeometryRuntimeProvider:
                 return None
 
     # === 输入桥 ===
-    # Rust proto PublishOdom 接受 PublishOdomRequest（仅 pose 字段；速度由 nuwax-nav-stack
-    # 内部从 pose 增量计算，不再走 gRPC facade）。速度参数保留以兼容旧调用方签名，丢弃。
+    # 原生里程计接口接收位姿，速度由原生从位姿增量计算。
     def get_geometry_pipeline(self) -> Dict[str, Any]:
         """读取实际进程的执行链和运行代际，用于输入桥和网页能力绑定。"""
         self._raise_if_stopping("get_geometry_pipeline")

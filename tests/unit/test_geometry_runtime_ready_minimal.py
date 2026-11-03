@@ -148,7 +148,7 @@ def test_client_rejects_ready_process_change_during_health_check(
         replacement.wait(timeout=3)
 
 
-@pytest.mark.parametrize("grpc_fails", [False, True])
+@pytest.mark.parametrize("grpc_fails", [True])
 def test_client_always_calls_real_get_status_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

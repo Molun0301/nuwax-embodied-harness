@@ -12,7 +12,6 @@ from unittest.mock import patch
 import grpc
 import tests.test_assigned_localization_session as session_fixtures
 from tests.test_assigned_relocalization_contract import terminal_dict
-from tests.test_assigned_relocalization_provider import query_response
 from tests.test_runtime_assigned_relocalization import capture, install, request_owner, runtime_owner
 
 from contracts.map_relocalization import AssignedRelocalizationRequest, AssignedRelocalizationTerminal
@@ -324,27 +323,6 @@ class AssignedSampleRuntimeSessionTests(unittest.TestCase):
         self.assertEqual(self.service.get_latest_snapshot().current_pose.position.x, 5)
         self.assertEqual(len(self.harness.store.sessions), 2)
 
-    def test_lost_dispatch_reply_uses_same_queried_terminal_for_real_sample(self):
-        class LostReply(grpc.RpcError):
-            def code(self):
-                return grpc.StatusCode.UNAVAILABLE
-            def details(self):
-                return 'reply lost after apply'
-        dispatches = []
-        def dispatch(request, timeout):
-            dispatches.append(deepcopy(request))
-            raise LostReply()
-        self.stub.Relocalize = dispatch
-        self.stub.GetRelocalizationTerminal = lambda request, timeout: query_response(1, terminal=terminal_owner())
-        with self.assertRaises(provider_module.GeometryRuntimeRpcError):
-            self.runtime.relocalize_assigned_active_map(assigned_request_v2=request_owner(), expected_target=self.target)
-        evidence = self.runtime.get_assigned_relocalization_terminal(assigned_request_v2=request_owner())
-        self.assertEqual(evidence.status, 'terminal')
-        sample = self.runtime.capture_assigned_localization_sample(
-            assigned_request_v2=evidence.query.request, expected_target=self.target, expected_terminal=evidence.terminal)
-        self.assertTrue(self.commit(self.prepare(sample)).accepted)
-        self.assertEqual(len(dispatches), 1)
-        self.assertEqual(len(self.stub.calls), 1)
 
 
 if __name__ == '__main__':

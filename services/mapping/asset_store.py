@@ -965,8 +965,6 @@ class MapAssetBundleRepository:
                             or [os.fstat(previous_tree.parent_descriptor).st_dev,
                                 os.fstat(previous_tree.parent_descriptor).st_ino] != map_owner):
                         raise MapAssetBundleValidationError("assigned replacement catalog creation owner changed")
-                    if catalog.get_map_activation() is not None or catalog.get_relocalization_intent() is not None:
-                        raise MapAssetBundleValidationError("activation or relocalization fences assigned exchange")
                     candidate_tree.verify_all()
                     previous_tree.verify_all()
                     pending = self._read_assigned_exchange(map_name)
@@ -999,8 +997,6 @@ class MapAssetBundleRepository:
                     if (self._assigned_catalog_owner(catalog.get_map_asset(map_name)) != captured
                             or self._assigned_directory_owner(current.parent) != map_owner):
                         raise MapAssetBundleValidationError("assigned replacement catalog creation owner changed")
-                    if catalog.get_map_activation() is not None or catalog.get_relocalization_intent() is not None:
-                        raise MapAssetBundleValidationError("activation or relocalization fences assigned exchange")
                     _exchange_directories(candidate_tree.parent_descriptor, staging.name, current.name)
                     candidate_tree.rebind_root_after_rename(current.name)
                     previous_tree.rebind_root_after_rename(staging.name)
@@ -1293,8 +1289,6 @@ class MapAssetBundleRepository:
                 _fsync_tree(candidate_tree)
                 catalog = MapCatalogRepository(str(self._root_dir))
                 with catalog.map_activation_guard():
-                    if catalog.get_map_activation() is not None or catalog.get_relocalization_intent() is not None:
-                        raise MapAssetBundleValidationError("地图激活或重定位事务尚未收尾，不能交换二维资产")
                     with _StableDirectoryTree(current) as previous_tree:
                         previous_sha, previous = self._validate_open_directory(map_name, previous_tree)
                         if previous_sha != expected:

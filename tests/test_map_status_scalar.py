@@ -133,19 +133,10 @@ class MapStatusScalarChecks(unittest.TestCase):
     def test_schema2_delegates_without_legacy_reads(self):
         owner = self.owner(self.prepared(0))
         asset = self.asset(identity_schema_version=2)
-        with patch('skills.assigned_map_activation.assigned_asset_status', return_value=asset) as assigned, \
-                patch.object(owner, '_read_map_activation', side_effect=AssertionError('legacy read')):
+        with patch('skills.assigned_map_activation.assigned_asset_status', return_value=asset) as assigned:
             self.assertIs(owner._sync_asset(asset, is_active=True), asset)
             assigned.assert_called_once_with(owner, asset, is_active=True)
 
-    def test_recovery_status_and_no_save(self):
-        owner = self.owner(self.prepared(0))
-        pending = dict(phase='recovering', target_map_name='library', target_asset_identity={'asset_id': 'f' * 32})
-        with patch.object(owner, '_read_map_activation', return_value=pending), patch.object(owner, '_save_asset') as save:
-            result = owner._sync_asset(self.asset(), is_active=True)
-            self.assertEqual(result.status, MapAssetStatus.ACTIVATING)
-            self.assertTrue(result.metadata['activation_recovery_pending'])
-            save.assert_not_called()
 
     def test_status_does_not_repair_but_full_summary_does(self):
         memory = self.prepared()

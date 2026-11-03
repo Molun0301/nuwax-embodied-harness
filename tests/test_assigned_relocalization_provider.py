@@ -11,7 +11,7 @@ from unittest.mock import patch
 import grpc
 from contracts import map_relocalization as relocalization_contract
 from contracts.map_relocalization import (
-    AssignedRelocalizationQuery, AssignedRelocalizationRequest,
+    AssignedRelocalizationRequest,
     AssignedRelocalizationTerminal,
 )
 from services.geometry import geometry_runtime_provider as module
@@ -72,12 +72,6 @@ class FakeStub:
             raise self.error
         return deepcopy(self.response)
 
-    def GetRelocalizationTerminal(self, request, timeout):
-        assert isinstance(request, pb.GetRelocalizationTerminalRequest)
-        self.calls.append(('GetRelocalizationTerminal', deepcopy(request), timeout))
-        if self.error:
-            raise self.error
-        return deepcopy(self.response)
 
 
 def client(stub):
@@ -91,33 +85,9 @@ def state_payload(**kwargs):
     return module.GeometryRuntimeProvider._mapping_state_payload(mapping_state(**kwargs))
 
 
-def query_response(status=2, *, terminal=None, observation=None):
-    owner = request_owner()
-    query = AssignedRelocalizationQuery.admit({
-        'schema_version': 2, 'request_id': owner.request_id,
-        'assigned_request_v2': owner.to_dict(),
-    })
-    result = query.response(status, terminal, observation)
-    return pb.GetRelocalizationTerminalResponse(**query.response_to_provider_fields(result))
 
 
 class AssignedRelocalizationProviderTests(unittest.TestCase):
-    def test_retained_policy_v2_queries_exact_terminal(self):
-        raw = request_dict(30000)
-        raw['assigned_cloud_v2']['policy'] = json.loads(
-            (Path(__file__).parent / 'fixtures/relocalization_policy_algorithm2_0276.json').read_text())
-        historical = AssignedRelocalizationRequest.from_dict(raw)
-        query = AssignedRelocalizationQuery.admit({'schema_version': 2, 'request_id': historical.request_id,
-            'assigned_request_v2': historical.to_dict()})
-        terminal = terminal_dict(5)
-        terminal['assigned_cloud_v2']['request'] = historical.to_dict()
-        terminal = AssignedRelocalizationTerminal.from_dict(terminal)
-        response = pb.GetRelocalizationTerminalResponse(**query.response_to_provider_fields(query.response(1, terminal)))
-        stub = FakeStub(response)
-        result = client(stub).get_relocalization_terminal(activation_state={}, request_id=historical.request_id,
-            logical_timeout_ms=30000, assigned_request_v2=historical)
-        self.assertEqual(result['terminal']['assigned_cloud_v2']['request'], historical.to_dict())
-        self.assertEqual(stub.calls[0][0], 'GetRelocalizationTerminal')
 
     def setUp(self):
         self.guard = ExitStack()
@@ -239,99 +209,15 @@ class AssignedRelocalizationProviderTests(unittest.TestCase):
                 client(stub).relocalize(**kwargs)
             self.assertEqual(stub.calls, [])
 
-    def test_query_all_statuses_echo_the_entire_durable_request(self):
-        for status, name in ((1, 'terminal'), (2, 'pending'), (3, 'not_found'), (4, 'identity_conflict')):
-            terminal = AssignedRelocalizationTerminal.admit(terminal_dict()) if status == 1 else None
-            stub = FakeStub(query_response(status, terminal=terminal))
-            with patch.object(module, '_read_deadline_sec', return_value=4.5):
-                result = client(stub).get_relocalization_terminal(
-                    activation_state={}, request_id='reloc:exact', logical_timeout_ms=30000,
-                    assigned_request_v2=request_owner().to_dict())
-            self.assertEqual(result['status'], name)
-            self.assertEqual(result['assigned_request_v2'], request_owner().to_dict())
-            self.assertEqual(result['terminal'] is not None, status == 1)
-            self.assertEqual(stub.calls[0][0], 'GetRelocalizationTerminal')
-            self.assertEqual(stub.calls[0][2], 4.5)
-            sent = AssignedRelocalizationQuery.from_proto(stub.calls[0][1])
-            self.assertTrue(sent.request.exact_replay_of(request_owner()))
-            self.assertFalse(any('sha256' in key for key in result))
 
-    def test_query_rejects_missing_or_changed_echo_for_every_status(self):
-        for status in (1, 2, 3, 4):
-            terminal = AssignedRelocalizationTerminal.admit(terminal_dict()) if status == 1 else None
-            for mutation in ('omit', 'timeout', 'alias', 'schema'):
-                response = query_response(status, terminal=terminal)
-                if mutation == 'omit':
-                    response.ClearField('assigned_request_v2')
-                elif mutation == 'timeout':
-                    response.assigned_request_v2.assigned_cloud_v2.logical_timeout_ms = 1000
-                elif mutation == 'alias':
-                    response.assigned_request_v2.request_id = 'reloc:other'
-                elif mutation == 'schema':
-                    response.schema_version = 1
-                else:
-                    response.MergeFromString(b'\x80\x06\x01')
-                with self.subTest(status=status, mutation=mutation), self.assertRaises(ValueError):
-                    client(FakeStub(response)).get_relocalization_terminal(
-                        activation_state={}, request_id='reloc:exact', logical_timeout_ms=30000,
-                        assigned_request_v2=request_owner())
 
-    def test_historical_query_succeeds_with_current_unavailable_partial_state(self):
-        stub = FakeStub(query_response(3))
-        state = state_payload(disposition=5, target=False, activation=False, policy=False)
-        result = client(stub).get_relocalization_terminal(activation_state=state,
-            request_id='reloc:exact', logical_timeout_ms=30000, assigned_request_v2=request_owner())
-        self.assertEqual(result['status'], 'not_found')
-        self.assertEqual(result['assigned_request_v2'], request_owner().to_dict())
-        self.assertEqual(stub.calls[0][0], 'GetRelocalizationTerminal')
 
-    def test_query_alias_timeout_and_planar_mismatch_do_not_dispatch(self):
-        for overrides in ({'request_id': 'other'}, {'logical_timeout_ms': 999},
-                          {'logical_timeout_ms': True}, {'planar_seed': (0, 0, 0)}):
-            stub = FakeStub()
-            kwargs = dict(activation_state={}, request_id='reloc:exact', logical_timeout_ms=30000,
-                          assigned_request_v2=request_owner())
-            kwargs.update(overrides)
-            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
-                client(stub).get_relocalization_terminal(**kwargs)
-            self.assertEqual(stub.calls, [])
 
-    def test_query_never_rebuilds_a_durable_request_from_live_activation(self):
-        stub = FakeStub()
-        with self.assertRaisesRegex(ValueError, 'whole normalized durable request'):
-            client(stub).get_relocalization_terminal(activation_state=state_payload(),
-                request_id='reloc:exact', logical_timeout_ms=30000)
-        self.assertEqual(stub.calls, [])
 
-    def test_query_rejects_unnormalized_request_and_presence_conflicts(self):
-        stub = FakeStub()
-        with self.assertRaisesRegex(ValueError, 'not normalized'):
-            client(stub).get_relocalization_terminal(activation_state={}, request_id='reloc:exact',
-                logical_timeout_ms=30000, assigned_request_v2=request_dict(0))
-        for status in (0, 1, 2, 3, 4, 5):
-            response = query_response(2)
-            response.status = status
-            if status in (2, 3, 4):
-                response.terminal.CopyFrom(terminal_response())
-            with self.subTest(status=status), self.assertRaises(ValueError):
-                client(FakeStub(response)).get_relocalization_terminal(activation_state={},
-                    request_id='reloc:exact', logical_timeout_ms=30000,
-                    assigned_request_v2=request_owner())
 
-    def test_query_ledger_observation_retains_existing_validation(self):
-        observation = dict(observation_schema_version=1, admitted_command_count=5, claimed_command_count=2,
-            terminal_record_count=1, pending_record_count=1, active_waiter_count=1, observation_epoch=7)
-        for valid in (True, False):
-            current = dict(observation)
-            if not valid:
-                current['pending_record_count'] = 100
-            result = client(FakeStub(query_response(observation=current))).get_relocalization_terminal(
-                activation_state={}, request_id='reloc:exact', logical_timeout_ms=30000,
-                assigned_request_v2=request_owner())
-            self.assertEqual(result['ledger_observation'], observation if valid else None)
 
     def test_stop_and_disconnect_checks_precede_both_assigned_rpcs(self):
-        for name in ('relocalize', 'get_relocalization_terminal'):
+        for name in ('relocalize',):
             stub = FakeStub()
             value = client(stub)
             kwargs = dict(activation_state=state_payload(available=True), request_id='reloc:exact',
@@ -351,7 +237,7 @@ class AssignedRelocalizationProviderTests(unittest.TestCase):
                 return grpc.StatusCode.UNAVAILABLE
             def details(self):
                 return 'owner offline'
-        for name, rpc_name in (('relocalize', 'Relocalize'), ('get_relocalization_terminal', 'GetRelocalizationTerminal')):
+        for name, rpc_name in (('relocalize', 'Relocalize'),):
             with self.assertRaises(module.GeometryRuntimeRpcError) as raised:
                 getattr(client(FakeStub(error=Unavailable())), name)(activation_state=state_payload(available=True),
                     request_id='reloc:exact', logical_timeout_ms=30000, assigned_request_v2=request_owner())
@@ -416,18 +302,10 @@ class AssignedRelocalizationProviderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'unsupported activation'):
             client(stub).relocalize(activation_state={'activation_receipt_schema_version': 3},
                 request_id='reloc:exact', logical_timeout_ms=30000)
-        with self.assertRaisesRegex(ValueError, 'whole normalized durable request'):
-            client(stub).get_relocalization_terminal(activation_state={},
-                request_id='reloc:exact', logical_timeout_ms=30000)
         self.assertEqual(stub.calls, [])
 
 
 
-    def test_durable_assigned_query_ignores_unrelated_current_version(self):
-        result = client(FakeStub(query_response())).get_relocalization_terminal(
-            activation_state={'activation_receipt_schema_version': 3, 'target_kind': 'planar_graph'},
-            request_id='reloc:exact', logical_timeout_ms=30000, assigned_request_v2=request_owner())
-        self.assertEqual(result['status'], 'pending')
 
 
 

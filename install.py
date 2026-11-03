@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""统一安装入口：本机模块、设备管理与现行软件更新。"""
+"""统一安装入口：本机模块与设备管理。"""
 
 from __future__ import annotations
 
@@ -17,11 +17,8 @@ def _bootstrap_path() -> None:
 
 
 def main() -> int:
-    """默认进入模块向导，显式子命令进入设备管理或软件更新。"""
+    """默认进入模块向导，显式子命令进入设备管理。"""
     _bootstrap_path()
-    if len(sys.argv) > 1 and sys.argv[1] == "update":
-        from scripts.update_client import main as update_main
-        return int(update_main(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "product":
         from scripts.neh_bootstrap import main as product_main
         return int(product_main(sys.argv[2:]))

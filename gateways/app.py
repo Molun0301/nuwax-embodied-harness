@@ -47,8 +47,6 @@ _LOW_VALUE_HTTP_PATHS = frozenset(
         "/api/health",
         "/api/tasks",
         "/api/memory/instances",
-        # 控制台每5秒读取一次更新状态；检查、保存与安装走各自子路径，仍按常规记录。
-        "/api/updates",
         "/mcp",
         "/api/logs",
         "/console",
@@ -210,6 +208,15 @@ class RequestLoggingMiddleware:
                 await response(scope, receive, send)
 
 
+class RevalidatedStaticFiles(StaticFiles):
+    """静态资源每次使用前都向服务端复核。"""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 def create_gateway_app(
     runtime: GatewayRuntime,
     config: NuwaxRobotBridgeConfig,
@@ -222,8 +229,7 @@ def create_gateway_app(
     agent_tools = None
     agent_tools_lock = threading.Lock()
     request_log_limiter = LogRateLimiter()
-    from gateways.updates import UpdateService, build_update_router, UpdateMaintenanceMiddleware
-    updates = UpdateService(runtime)
+    from gateways.updates import build_update_router
 
     def get_agent_tools():
         nonlocal agent_tools
@@ -240,13 +246,11 @@ def create_gateway_app(
                 await run_in_threadpool(get_agent_tools)
                 APP_LOGGER.info("宿主机网关运行时准备启动。")
                 await run_in_threadpool(runtime.start)
-                updates.start()
             yield
         finally:
             source_fenced = False
             prior_error = sys.exc_info()[0] is not None
             try:
-                await updates.close()
                 if start_runtime_on_lifespan:
                     APP_LOGGER.info("宿主机网关运行时准备停止。")
                     stop_result = await run_in_threadpool(runtime.stop)
@@ -276,9 +280,7 @@ def create_gateway_app(
     app.state.config = config
     app.state.access_manager = access_manager
     app.state.agent_tools = agent_tools
-    app.state.updates = updates
-    app.add_middleware(UpdateMaintenanceMiddleware, service=updates)
-    app.include_router(build_update_router(updates))
+    app.include_router(build_update_router(runtime))
 
     app.add_middleware(RequestLoggingMiddleware, request_log_limiter=request_log_limiter)
 
@@ -351,7 +353,7 @@ def create_gateway_app(
         # 压缩仅作用于页面静态资源，避免缓冲视频和实时数据流。
         app.mount(
             "/static",
-            GZipMiddleware(StaticFiles(directory=str(static_dir)), minimum_size=1024, compresslevel=1),
+            GZipMiddleware(RevalidatedStaticFiles(directory=str(static_dir)), minimum_size=1024, compresslevel=1),
             name="static",
         )
     return app

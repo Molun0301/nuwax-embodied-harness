@@ -494,13 +494,6 @@ class AppCloseChecks(unittest.IsolatedAsyncioTestCase):
                 if close_error:
                     raise close_error
                 return {"complete": close_complete and source_fenced, "owner_closed": True}
-        class FakeUpdates:
-            def __init__(self, runtime):
-                pass
-            def start(self):
-                pass
-            async def close(self):
-                pass
         def stop():
             if stop_error:
                 raise stop_error
@@ -512,7 +505,6 @@ class AppCloseChecks(unittest.IsolatedAsyncioTestCase):
             stack.enter_context(patch("gateways.app.build_agent_router", lambda resolve: (resolve(), APIRouter())[1]))
             stack.enter_context(patch("gateways.feedback_stream.build_feedback_router", lambda *args: APIRouter()))
             stack.enter_context(patch("gateways.updates.build_update_router", lambda *args: APIRouter()))
-            stack.enter_context(patch("gateways.updates.UpdateService", FakeUpdates))
             stack.enter_context(patch("gateways.app.AgentToolService", lambda *args: FakeService()))
             app = create_gateway_app(runtime, NS(gateway=GatewayServerConfig()), start_runtime_on_lifespan=owned)
             try:

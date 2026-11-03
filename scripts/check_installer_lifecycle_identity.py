@@ -31,7 +31,6 @@ if os.environ.get("NEH_INSTALLER_SOURCE_ROOT"):
         setattr(installer_package, module_name, module)
         spec.loader.exec_module(module)
 from scripts.module_installer import lifecycle, manager
-from scripts import self_update as updater
 
 LEGACY_NAME = "neh-0123456789abcdef.service"
 ASSIGNED_NAME = "neh-install-01234567-89ab-4cde-8fab-0123456789ab.service"
@@ -247,25 +246,9 @@ class RegistrationIdentityTests(OfflineFixture):
                 with self.assertRaisesRegex(ValueError, "changed before start"):
                     lifecycle.start_current(queued)
 
-    def test_saved_names_keep_exact_cgroup_and_transient_worker_recognition(self):
-        read_text = Path.read_text
+    def test_saved_names_keep_transient_worker_recognition(self):
         for index, name in enumerate((LEGACY_NAME, ASSIGNED_NAME)):
             self.generation(str(index), name=name)
-            with patch.dict(os.environ, {"NUWAX_UPDATE_INSTALL_DIR": str(self.home)}):
-                for owner, accepted in ((name, True), (name[:-8] + "-update-" + "a" * 32 + ".service", True),
-                                        (name[:-8] + "-update-short.service", False), ("foreign.service", False)):
-                    def read(path, *args, **kwargs):
-                        if str(path) == "/proc/self/cgroup":
-                            return "0::/user.slice/user@1000.service/" + owner + "\n"
-                        return read_text(path, *args, **kwargs)
-                    with self.subTest(name=name, owner=owner), patch.object(Path, "read_text", read):
-                        if accepted:
-                            home, state = updater.install_home(self.root)
-                            self.assertEqual(home, self.home)
-                            self.assertEqual(state["deployment"]["lifecycle"]["service_name"], name)
-                        else:
-                            with self.assertRaisesRegex(RuntimeError, "systemd-user|start"):
-                                updater.install_home(self.root)
             with patch.object(subprocess, "run") as run:
                 transient = lifecycle.spawn_updater(lifecycle.inspect_installation(self.home), ["/fixture/python", "worker.py"],
                                                     environment={"PYTHONPATH": str(self.root), "SECRET": "fixture-secret"})

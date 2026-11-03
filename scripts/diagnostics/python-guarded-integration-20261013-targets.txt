@@ -10,7 +10,7 @@ scripts/check_perception_scene_dispatch.py
 scripts/check_log_index_hashfree.py
 scripts/check_log_index_sqlite_compat.py
 scripts/check_python38_runtime_compatibility.py
-scripts/check_self_update.py::ServiceTests
+scripts/check_update_readiness.py::ReadinessTests
 scripts/check_task_receipt_evidence.py
 scripts/check_task_history_cleanup.py
 scripts/check_task_call_identity.py

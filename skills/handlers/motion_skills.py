@@ -18,8 +18,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from core.errors import MotionGuardFacadeError
-from gateways.motion_guard import motion_guard_gateway_error
-from services.navigation.motion_guard_client import ModeSwitchConfirmation
+from services.navigation.motion_guard_client import ModeSwitchConfirmation, motion_guard_gateway_error
 from services.navigation.proto_gen import motion_guard_pb2 as pb
 from skills.common import params
 from skills.common.context import SkillContext

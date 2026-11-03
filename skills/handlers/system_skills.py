@@ -12,12 +12,11 @@ capture_image 归属见 §4 决策（本批暂不下放，归后续感知批 / �
 
 from __future__ import annotations
 
-from gateways.motion_guard import motion_guard_gateway_error
-
 import uuid
 from typing import Any, Dict, Optional
 
 from core.errors import GatewayError, MotionGuardFacadeError
+from services.navigation.motion_guard_client import motion_guard_gateway_error
 from skills.common import params  # noqa: F401  # 供后续下放 handler 复用参数校验
 from skills.common.context import SkillContext
 

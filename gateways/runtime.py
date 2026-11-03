@@ -67,7 +67,6 @@ from gateways.motion_guard import (
     GatewayMotionGuardError,
     GatewayMotionGuardUnavailable,
     MotionAdmission,
-    motion_guard_gateway_error,
 )
 from gateways.person_follow import (
     PERSON_FOLLOW_LOST,
@@ -117,7 +116,7 @@ from services.mapping import MappingService
 from skills.map_workspace import MapWorkspaceService
 from services.memory import MemoryService
 from services.navigation import NavigationService
-from services.navigation.motion_guard_client import MotionGuardError
+from services.navigation.motion_guard_client import MotionGuardError, motion_guard_gateway_error
 from services.observation_service import ObservationService
 from services.perception import PerceptionService, PerceptionVideoRuntime, build_platform_perception_components
 from services.perception.service import VideoFrameSource

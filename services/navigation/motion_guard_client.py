@@ -10,6 +10,8 @@ import uuid
 
 from google.protobuf.message import DecodeError, Message
 
+from core.errors import GatewayError
+
 from services.navigation.motion_safety_guard.constants import (
     ACTOR_POLL_INTERVAL_SECONDS,
     API_VERSION,
@@ -32,6 +34,42 @@ DEFAULT_TIMEOUT_SECONDS = 1.0
 _RENEW_EXECUTION_RESERVE_NS = int(
     (MAX_PRODUCTION_SDK_TIMEOUT_SECONDS + ACTOR_POLL_INTERVAL_SECONDS) * 1_000_000_000
 )
+
+
+def motion_guard_gateway_error(
+    capability_name: str,
+    error: BaseException,
+) -> GatewayError:
+    failures = []
+    pending = [error]
+    seen = set()
+    while pending and len(failures) < 8:
+        current = pending.pop(0)
+        if not isinstance(current, BaseException) or id(current) in seen:
+            continue
+        seen.add(id(current))
+        detail = {"type": type(current).__name__, "message": str(current)[:1000]}
+        for field_name in ("code", "operation", "operation_id"):
+            value = getattr(current, field_name, None)
+            if value is not None:
+                detail[field_name] = str(value)[:256]
+        failures.append(detail)
+        # finally收尾可能成为最外层错误；保留原始续租/命令与归零失败两条链。
+        pending.extend((
+            current.__cause__, current.__context__, getattr(current, "cause", None),
+            getattr(current, "prior_failure", None),
+        ))
+    return GatewayError(
+        f"motion guard rejected {capability_name}: {error}",
+        error_code=next((item["code"] for item in failures if item.get("code")), "motion_guard_unavailable"),
+        http_status=503,
+        jsonrpc_code=-32010,
+        details={
+            "capability_name": capability_name,
+            "guard_error_type": type(error).__name__,
+            "guard_failures": failures,
+        },
+    )
 
 
 class MotionGuardError(RuntimeError):
@@ -1252,5 +1290,6 @@ __all__ = [
     "StaleStopGenerationError",
     "UnsupportedApiVersionError",
     "ZeroConfirmation",
+    "motion_guard_gateway_error",
     "normalize_source",
 ]

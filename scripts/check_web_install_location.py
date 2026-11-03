@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 # ruff: noqa: E402
-import hashlib
 import http.client
 import json
 import os
@@ -381,7 +380,7 @@ class SelectedLifecycleChecks(Checks):
         (candidate / "settings.env").write_text("NUWAX_RUNTIME_DATA_DIR=" + str(self.target / "data") + "\n")
         atomic_json(candidate / "installed.json", {"complete": True, "version": "v2"})
         self.engine.runtime = FakeRuntime(fail_starts=1)
-        with patch.object(self.engine, "_prepare", return_value=candidate):
+        with patch.object(self.engine, "_prepare_source", return_value=candidate):
             result = self.run_job(self.job("update"))
         self.assertEqual(result["status"], "failed")
         self.assertEqual(self.engine.current()["prefix"], str(previous))
@@ -397,17 +396,31 @@ class SelectedLifecycleChecks(Checks):
 
     def test_manager_update_and_restart_keep_bootstrap_entry(self):
         from scripts.device_manager.self_update import apply_manager
-        archive = b"manager fixture"
-        digest = hashlib.sha256(archive).hexdigest()
-        (self.target / "cache" / (digest + ".manager.tar.gz")).write_bytes(archive)
-        job = self.job("update-manager", _manager={"version": "v2", "sha256": digest, "size": len(archive)})
+        job = self.job("update-manager", _source=dict(self.source, version="v2"))
+        checkout_root = self.root / "checkout"
+
+        @contextmanager
+        def checkout(home, repository, branch, revision, **kwargs):
+            self.assertEqual(home, self.target)
+            self.assertEqual((repository, branch, revision),
+                             (self.source["repository"], self.source["branch"], self.source["revision"]))
+            yield {"root": checkout_root}
+
+        def command(arguments, **kwargs):
+            if "scripts.device_manager.source_package" in arguments:
+                self.assertEqual(kwargs["cwd"], checkout_root)
+                archive = Path(arguments[arguments.index("--output") + 1])
+                self.assertEqual(archive.parent, self.target / "cache")
+                archive.write_bytes(b"manager fixture")
 
         def unpack(archive_path, destination):
             self.assertEqual(destination.parent, self.manager / "manager/versions")
             atomic_json(destination / "manager-manifest.json", {"version": "v2"})
             return {"version": "v2", "installation_layout": 2}
 
-        with patch("scripts.device_manager.self_update.unpack_manager", unpack), patch("scripts.device_manager.self_update.run_command"):
+        with patch("scripts.neh_source.source_checkout", checkout), \
+                patch("scripts.device_manager.self_update.unpack_manager", unpack), \
+                patch("scripts.device_manager.self_update.run_command", command):
             result = apply_manager(self.engine, job)
         self.assertTrue(result["restart_required"])
         target = (self.manager / "manager/current").resolve()
@@ -481,8 +494,10 @@ class HTTPChecks(LocationChecks):
         self.assertEqual(status, 200, result)
         self.assertEqual(self.request("GET", "install-location")[1]["install_dir"], str(self.target))
         self.assertEqual(self.request("GET", "install-directories")[1]["path"], str(self.target.parent))
-        with patch.object(Engine, "releases", return_value={"releases": []}), \
-                patch.object(Engine, "catalog", return_value={}), patch.object(Engine, "hardware", return_value={"supported": True}):
+        source = {"repository": "https://example.invalid/neh.git", "branch": "main",
+                  "revision": MANAGER_REVISION, "version": "fixture"}
+        with patch("scripts.device_manager.sources.discover", return_value=source), \
+                patch.object(Engine, "hardware", return_value={"supported": True}):
             status, result = self.request("GET", "status")
         self.assertEqual(status, 200, result)
         self.assertEqual(result["installation"]["install_dir"], str(self.target))

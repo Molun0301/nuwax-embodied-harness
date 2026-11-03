@@ -712,7 +712,7 @@ class AssignedWorkspaceActivationTests(unittest.TestCase):
         self.assertNotIn("StopMapping", self.stub.calls)
         self.assertEqual(self.stub.calls.count("ActivateMap"), 1)
 
-    def test_pending_original_map_blocks_different_target_before_any_native_rpc(self):
+    def test_pending_original_map_blocks_different_target_without_dispatch(self):
         self.publish_map("second-map", AssetIdentityV2(asset_id="e" * 32))
         self.stub.error = LostReply()
         with self.assertRaises(GatewayError):
@@ -722,7 +722,7 @@ class AssignedWorkspaceActivationTests(unittest.TestCase):
         with self.assertRaises(GatewayError):
             self.activate("second-map")
         self.assertEqual(self.service._repository.get_map_activation(), pending)
-        self.assertEqual(self.stub.calls, [])
+        self.assertEqual(self.stub.calls, ["GetMappingState"])
         self.assertTrue(self.runtime.is_map_asset_activation_recovery_pending())
 
     def test_successor_before_underlying_workspace_write_cannot_leave_stale_cache_or_return(self):

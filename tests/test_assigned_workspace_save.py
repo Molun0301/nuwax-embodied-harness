@@ -256,6 +256,42 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
         self.assertIsNone(self.service._repository.get_map_activation())
         self.assertFalse(self.runtime.is_map_asset_activation_recovery_pending())
 
+    def test_failed_map_publication_reactivates_after_native_runtime_restart(self):
+        self.ingest_live_receipt()
+        saved = self.save()
+        with patch.object(self.mapping, "ingest_external_snapshot", side_effect=RuntimeError("发布失败")):
+            with self.assertRaises(GatewayError):
+                self.service.activate_map(map_name=MAP_NAME)
+        pending = self.service._repository.get_map_activation()
+        self.assertEqual(pending["phase"], "reconciling")
+        self.assertIsNotNone(pending["backend_evidence"])
+        self.assertTrue(self.runtime.is_map_asset_activation_recovery_pending())
+        new_generation = pending["activation_request"]["expected_runtime_generation"] + 1
+        # 原生进程重启后只有新代次，原请求及其回执已经消失。
+        self.stub.state = pb.MappingSessionState(success=True, phase="IDLE", active=False,
+            runtime_generation=new_generation, mapping_backend_kind="voxel")
+        self.stub.ledger.clear()
+
+        def restarted_reply(request):
+            response = deepcopy(self.stub.state)
+            response.runtime_generation = new_generation
+            response.activation_receipt_v2.activation.runtime_generation = new_generation
+            response.activation_receipt_v2.target.activation.runtime_generation = new_generation
+            return response
+
+        self.stub.reply = restarted_reply
+        workspace = self.service.activate_map(map_name=MAP_NAME)
+
+        self.assertTrue(workspace.map_loaded)
+        self.assertEqual(workspace.map_asset.asset_identity, saved.asset_identity)
+        request = workspace.active_localization_session.activation_receipt_v2.to_dict()["request"]
+        self.assertNotEqual(request["activation_request_id"], pending["activation_request_id"])
+        self.assertEqual(request["activation_request_id"], self.stub.activation_requests[-1].activation_request_id)
+        self.assertEqual(request["expected_runtime_generation"], new_generation)
+        self.assertEqual(self.stub.installs, 2)
+        self.assertIsNone(self.service._repository.get_map_activation())
+        self.assertFalse(self.runtime.is_map_asset_activation_recovery_pending())
+
     def save_as_associations(self):
         from contracts.forbidden_zones import ForbiddenZone, ForbiddenZonePoint
         from services.navigation.forbidden_zones import ForbiddenZoneStore

@@ -195,7 +195,7 @@ def _activation_evidence(owner, prepared, request, journal, initial_state, allow
     runtime = owner._geometry_runtime
     phase = journal['phase']
     if phase in ('backend_applied', 'reconciling', 'recovering') or not allow_dispatch:
-        state = runtime.capture_assigned_mapping_state(prepared)
+        state = initial_state
         if _target_request(state, prepared) != request:
             raise _problem('当前原生状态尚未证明原激活请求已封存。', journal)
         if phase == 'prepared':
@@ -205,7 +205,7 @@ def _activation_evidence(owner, prepared, request, journal, initial_state, allow
         # 这是调用方再次显式提交；先完成原 dispatch 意图的持久化，再交给 provider。
         _advance(owner, prepared, request, 'backend_dispatching', ('backend_dispatching',))
         return runtime.dispatch_prepared_assigned_map(prepared, request)
-    state = initial_state if initial_state is not None else runtime.capture_assigned_mapping_state(prepared)
+    state = initial_state
     if _target_request(state, prepared) == request:
         _advance(owner, prepared, request, 'backend_dispatching', (phase,))
         return state
@@ -275,8 +275,16 @@ def _activate(owner, bundle, load_memory_history, metadata, allow_dispatch, publ
             raise TypeError("activation read must retain the exact admitted bundle")
         prepared = runtime.prepare_retained_assigned_map_activation(activation_read,
             repository=owner._asset_repository, bundle_root=root)
+    current_state = runtime.capture_assigned_mapping_state(prepared)
+    abandoned_request = None
     with _transaction(owner):
         journal = repository.get_map_activation()
+        if (journal is not None and journal.get('schema_version') == 3
+                and journal['activation_request']['expected_runtime_generation'] != current_state['runtime_generation']):
+            # 日志只属于原几何进程，代次变化后不能继续对账。
+            repository.abandon_assigned_map_activation(journal['activation_request_id'])
+            abandoned_request = journal['activation_request']
+            journal = None
         asset = repository.get_map_asset(bundle.map_name)
         if asset is None:
             raise _problem('分配式 finalized 地图缺少目录记录。')
@@ -285,9 +293,13 @@ def _activate(owner, bundle, load_memory_history, metadata, allow_dispatch, publ
                 or journal.get('target_asset_identity') != prepared.asset_identity.model_dump()
                 or journal.get('target_checkpoint_id') != prepared.checkpoint_id):
             raise _problem('另一个地图激活事务尚待对账。', journal)
-    initial_state = None
+    if abandoned_request is not None:
+        LOGGER.warning('几何运行时已重启，放弃未完成的地图激活事务 %s，按当前运行时重新激活',
+            abandoned_request['activation_request_id'])
+        runtime.complete_assigned_map_activation(activation_request=abandoned_request)
+        owner._map_activation_fence_arm_error = None
+    initial_state = current_state
     if journal is None:
-        initial_state = runtime.capture_assigned_mapping_state(prepared)
         request = _target_request(initial_state, prepared)
         if request is None:
             if not allow_dispatch:

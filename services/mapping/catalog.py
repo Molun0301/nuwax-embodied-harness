@@ -590,6 +590,12 @@ class MapCatalogRepository:
 
 
 
+    def abandon_assigned_map_activation(self, activation_request_id):
+        with self.map_activation_guard():
+            payload = self.get_map_activation()
+            if payload is not None and payload["activation_request_id"] == activation_request_id:
+                self._clear_current_activation_journal(payload)
+
     def clear_assigned_map_activation(self, *, target_map_name, target_asset_identity,
                                      target_checkpoint_id, activation_request_id, expected_phases,
                                      activation_request):

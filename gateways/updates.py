@@ -29,6 +29,8 @@ _MCP_MAINTENANCE_READS = frozenset({
     "get_active_tasks", "get_task_status", "get_navigation_state",
 })
 _MCP_UPDATE_OWNER = "neh.update_maintenance_owner"
+# 一键托管安装由设备管理程序更新；本模块的源码更新器只服务 ./install.sh 源码安装。
+_MANAGED_MESSAGE = "本设备由设备管理程序更新：请从设备管理页地址打开控制台更新，或在设备终端执行 neh update"
 
 
 def run_mcp_operation(request, operation, *, tool_name=None):
@@ -61,6 +63,7 @@ class UpdateService:
         self.mutators = 0
         self.freezing = False
         self.task = None
+        self.managed = bool(os.environ.get("NUWAX_MANAGED_HOME"))
         try:
             self.running_revision = updater.git(self.root, "rev-parse", "HEAD")
         except RuntimeError:
@@ -76,6 +79,9 @@ class UpdateService:
         )
 
     def status(self):
+        if self.managed:
+            return {"managed": True, "running_revision": self.running_revision, "available": False,
+                    "message": _MANAGED_MESSAGE, "install_available": False, "install_unavailable_reason": ""}
         try:
             latest = updater.read_json(self.state_root / "runtime_data/updates/check.json")
             transaction = self.transaction_status()
@@ -114,6 +120,8 @@ class UpdateService:
         }
 
     def check(self):
+        if self.managed:
+            raise RuntimeError(_MANAGED_MESSAGE)
         with self.check_mutex:
             if self.transaction_status().get("state") in updater.BUSY:
                 return self.status()
@@ -128,6 +136,8 @@ class UpdateService:
             return self.status()
 
     def configure(self, settings):
+        if self.managed:
+            raise RuntimeError(_MANAGED_MESSAGE)
         if not isinstance(settings, dict) or set(settings) - {"auto_check", "auto_install", "interval_minutes"}:
             raise ValueError("无效的更新设置")
         with self.mutex:
@@ -179,6 +189,8 @@ class UpdateService:
             self.drain.notify_all()
 
     def install(self, expected):
+        if self.managed:
+            raise RuntimeError(_MANAGED_MESSAGE)
         with self.drain:
             if self.freezing:
                 raise RuntimeError("更新维护已开始")
@@ -231,7 +243,9 @@ class UpdateService:
             await asyncio.sleep(30)
 
     def start(self):
-        self.task = asyncio.create_task(self.run())
+        # 托管安装的定时检查由设备管理程序负责，这里不再做必然失败的源码检查。
+        if not self.managed:
+            self.task = asyncio.create_task(self.run())
 
     async def close(self):
         if self.task:

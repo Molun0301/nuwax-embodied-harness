@@ -2973,15 +2973,14 @@ class GatewayRuntime:
                 "stop_exploration",
                 "停止自主探索",
                 "与 explore_area/explore_area_v2 配对：停止探索 controller，取消在途 child navigation，"
-                "等待 guard ZEROED 终态并取消父任务；不会停止建图会话。",
+                "等待 guard ZEROED 终态并取消父任务；request_id 可省略以停止当前探索。不会停止建图会话。",
                 execution_mode=CapabilityExecutionMode.SYNC,
                 risk_level=CapabilityRiskLevel.MEDIUM,
                 input_schema=_schema_object(
                     {
                         "reason": {"type": "string"},
-                        "request_id": {"type": "string", "minLength": 1},
+                        "request_id": {"type": "string", "minLength": 1, "description": "省略时停止当前探索；提供时精确停止该请求。"},
                     },
-                    required=("request_id",),
                 ),
                 output_schema=_schema_object(
                     {
@@ -4026,7 +4025,7 @@ class GatewayRuntime:
                 display_name="停止自主探索",
                 description=(
                     "与 explore_area/explore_area_v2 配对：停止探索、取消 child navigation 并等待零速终态；"
-                    "建图会话保持运行。"
+                    "request_id 可省略以停止当前探索；建图会话保持运行。"
                 ),
                 category=SkillCategory.TASK,
                 capability_name="stop_exploration",
@@ -4397,6 +4396,12 @@ class GatewayRuntime:
         project_result: bool = True,
     ) -> Dict[str, Any]:
         """调用一个网关能力。"""
+
+        if capability_name == "execute_sport_command" and (arguments or {}).get("action") == "stop_move":
+            return self.invoke_capability(
+                "stop_all_motion", requested_by=requested_by,
+                request_context=request_context, project_result=project_result,
+            )
 
         registration = self.capability_registry.get_registration(capability_name)
         descriptor = registration.descriptor
@@ -6389,15 +6394,7 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
     ) -> Dict[str, Any]:
         reason = str((arguments or {}).get("reason") or "stop_exploration").strip()
-        request_id = str((arguments or {}).get("request_id") or "").strip()
-        if not request_id:
-            raise GatewayError(
-                "停止探索必须提供当前 exploration request_id。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-                details={"required_parameter": "request_id"},
-            )
+        request_id = str((arguments or {}).get("request_id") or "").strip() or None
         # 准备中的请求尚可能没有后端会话；先取消原任务，由其拥有方完成收尾。
         # 读取阶段后若恰好进入后端提交，任务仍沿既有定向停车屏障退出。
         preparing_task_ids = []
@@ -6405,7 +6402,7 @@ class GatewayRuntime:
             preparing = status.stage in {
                 "prepare_exploration_runtime", "waiting_exploration_inputs",
             } or (status.stage == "accepted" and status.state.value == "accepted")
-            if preparing and self._task_matches_exploration_request(status.task_id, request_id):
+            if preparing and (not request_id or self._task_matches_exploration_request(status.task_id, request_id)):
                 if self.task_manager.cancel_task(status.task_id, reason):
                     preparing_task_ids.append(status.task_id)
         if preparing_task_ids:
@@ -6443,6 +6440,7 @@ class GatewayRuntime:
                 jsonrpc_code=-32010,
             ) from exc
 
+        request_id = request_id or self._exploration_state_request_id(context)
         exploration_state = getattr(context, "exploration_state", None)
         raw_status = getattr(exploration_state, "status", "")
         terminal_status = str(getattr(raw_status, "value", raw_status) or "").lower()
@@ -6823,6 +6821,7 @@ class GatewayRuntime:
             "CANCELLED": "navigation_cancelled",
         }
         if status in codes:
+            retryable = status == "BUSY" or (status == "ADMISSION_UNCONFIRMED" and result.get("retryable"))
             navigation = result.get("navigation")
             navigation = navigation if isinstance(navigation, dict) else {}
             details = {
@@ -6832,11 +6831,11 @@ class GatewayRuntime:
                 "reason_code": result.get("reason_code") or navigation.get("reason_code"),
                 "ownership_retained": result.get("ownership_retained", navigation.get("ownership_retained", False)),
                 "authority_current": result.get("authority_current", navigation.get("authority_current", False)),
-                "retryable": False,
+                "retryable": retryable,
             }
             error = GatewayError(result.get("message") or "地点导航请求未完成。",
                 error_code=codes[status], http_status=409, details=details)
-            return {**result, "ok": False, "retryable": False, "error_payload": {**error.to_payload(), "retryable": False}}
+            return {**result, "ok": False, "retryable": retryable, "error_payload": {**error.to_payload(), "retryable": retryable}}
         return result
 
     # ------------------------------------------------------------------
@@ -6854,29 +6853,16 @@ class GatewayRuntime:
 
         del request_context
         request_id = str(arguments.get("request_id") or "").strip() or None
-        cancellation_requested = True
-        if request_id is None:
-            # 未指定目标时读取当前目标；精确取消直接交后端裁决。
-            navigation_context = self.navigation_service.get_navigation_control_context()
-            state = navigation_context.navigation_state
-            cancellation_requested = state.status in {
-                NavigationStatus.ACCEPTED,
-                NavigationStatus.PLANNING,
-                NavigationStatus.RUNNING,
-                NavigationStatus.UNCONFIRMED,
-            }
-            request_id = state.current_goal_id
-        if cancellation_requested:
-            navigation_context = self.navigation_service.cancel_goal(request_id=request_id)
+        navigation_context = self.navigation_service.cancel_goal(request_id=request_id)
         state = navigation_context.navigation_state
         return {
             "ok": True,
             "alias_of": "cancel_navigation",
             "request_id": request_id,
             "navigation_state": to_jsonable(state),
-            "cancellation_requested": cancellation_requested,
-            "completed": not cancellation_requested or state.status == NavigationStatus.CANCELLED,
-            "message": state.message or ("导航取消请求已受理。" if cancellation_requested else "当前没有活动导航目标。"),
+            "cancellation_requested": True,
+            "completed": state.status == NavigationStatus.CANCELLED,
+            "message": state.message or "导航取消请求已受理。",
             "metadata": {
                 "requested_by": requested_by or "unknown",
                 "backend_name": navigation_context.backend_name,
@@ -7040,7 +7026,6 @@ class GatewayRuntime:
         camera_id = str(arguments.get("camera_id", "")).strip() or None
         verify_on_arrival = bool(arguments.get("verify_on_arrival", True))
         verify_similarity_threshold = self._float(arguments, "verify_similarity_threshold", 0.55)
-        self._ensure_workspace_memory_library_ready(map_name=map_name)
         current_localization_session_id = (
             workspace.active_localization_session.session_id
             if workspace is not None and workspace.active_localization_session is not None
@@ -7184,7 +7169,6 @@ class GatewayRuntime:
             workspace=workspace,
         )
         workspace = self.map_workspace_service.get_active_workspace() or workspace
-        self._ensure_workspace_memory_library_ready(map_name=map_name)
         query = self._require_str(arguments, "query")
         camera_id = str(arguments.get("camera_id", "")).strip() or None
         verify_similarity_threshold = self._float(arguments, "verify_similarity_threshold", 0.55)
@@ -8746,22 +8730,6 @@ class GatewayRuntime:
                 metadata={"source": "refresh_workspace_snapshots"},
             )
 
-    def _ensure_workspace_memory_library_ready(self, *, map_name: str) -> None:
-        active_library_name = self.memory_service.get_active_library_name()
-        if active_library_name == map_name:
-            return
-        raise GatewayError(
-            "地图 %s 缺少可用的同名记忆库激活态。" % map_name,
-            error_code="memory_library_missing",
-            http_status=409,
-            jsonrpc_code=-32000,
-            details={
-                "map_name": map_name,
-                "expected_library_name": map_name,
-                "active_library_name": active_library_name,
-            },
-        )
-
     def _workspace_requires_localization_before_explore(self, workspace) -> bool:
         if workspace is None or workspace.map_asset is None:
             return False
@@ -10027,7 +9995,6 @@ class GatewayRuntime:
         deadline_monotonic: Optional[float] = None,
         navigation_state_callback: Optional[Callable[[Optional[str]], None]] = None,
     ) -> Optional[Dict[str, Any]]:
-        self._ensure_workspace_memory_library_ready(map_name=map_name)
         memory_candidates = list(search_state["memory_candidates"])
         semantic_goal = search_state["semantic_goal"]
         clarification = search_state.get("clarification")
@@ -11168,10 +11135,10 @@ class GatewayRuntime:
                         try:
                             return submit_goal()
                         except GatewayError as error:
-                            if error.error_code != "navigation_goal_rejected" or error.details.get("backend_code") not in {
-                                "PLANNER_NOT_READY", "PLANNER_INPUT_UNOBSERVED", "PLANNER_INPUT_STALE",
-                                "TF_UNOBSERVED", "TF_STALE", "TF_INCOMPLETE",
-                            }:
+                            if error.error_code != "forbidden_zone_revision_pending" and (
+                                error.error_code != "navigation_goal_rejected"
+                                or not str(error.details.get("backend_code") or "").startswith("GOAL_RETRY_")
+                            ):
                                 raise
                             context.update(progress=0.02, stage="waiting_navigation_inputs",
                                 message="目标已保留，等待导航输入恢复：" + error.message,
@@ -11726,7 +11693,7 @@ class GatewayRuntime:
         self,
         context,
         *,
-        request_id: str,
+        request_id: Optional[str],
         poll_interval_sec: float,
         acknowledge_interrupt: bool = True,
         parking_deadline_monotonic: Optional[float] = None,
@@ -11785,6 +11752,7 @@ class GatewayRuntime:
                 phase="stop_rpc",
             ) from exc
 
+        request_id = request_id or self._exploration_state_request_id(last_context)
         sleep_sec = min(0.1, max(0.02, float(poll_interval_sec)))
         while True:
             state = getattr(last_context, "exploration_state", None)
@@ -12023,7 +11991,6 @@ class GatewayRuntime:
                         workspace=workspace,
                         requested_by=requested_by,
                     )
-                self._ensure_workspace_memory_library_ready(map_name=request.map_name)
                 context.ensure_active()
                 self._prepare_exploration_mapping(
                     context,

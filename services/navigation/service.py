@@ -84,10 +84,6 @@ def _exploration_deadline_lock(lock, deadline_monotonic, rpc_name):
         lock.release()
 
 
-def _exploration_owner_lock(service):
-    return getattr(service, "_exploration_ownership_lock", service._lock)
-
-
 @dataclass(frozen=True)
 class _ForbiddenZoneRuntimeAck:
     map_name: str
@@ -197,8 +193,6 @@ class NavigationService:
         self._latest_navigation_context: Optional[NavigationContext] = None
         self._latest_exploration_context: Optional[ExplorationContext] = None
         self._current_goal: Optional[NavigationGoal] = None
-        self._current_explore_request: Optional[ExploreAreaRequest] = None
-        self._pending_explore_request_id: Optional[str] = None
         self._forbidden_zone_update_lock = threading.Lock()
         self._forbidden_zone_update_active = False
         self._forbidden_zone_required_generation: Optional[int] = None
@@ -213,7 +207,6 @@ class NavigationService:
         self._last_navigation_diagnostics: Optional[NavigationDiagnostics] = None
         self._lock = threading.RLock()
         self._provider_update_log_limiter = LogRateLimiter()
-        self._exploration_ownership_lock = threading.RLock()
         self._navigation_update_subscription_id: Optional[int] = None
         self._exploration_update_subscription_id: Optional[int] = None
         # 定位会话刷新节流：避免 *_until_complete 高频轮询每轮触发完整定位刷新副作用链（P0-3）
@@ -458,11 +451,6 @@ class NavigationService:
             metadata_sources = [
                 getattr(self._current_goal, "metadata", None),
                 getattr(
-                    self._current_explore_request,
-                    "metadata",
-                    None,
-                ),
-                getattr(
                     getattr(
                         self._latest_navigation_context,
                         "navigation_state",
@@ -511,28 +499,8 @@ class NavigationService:
     ) -> ForbiddenZonesEnvelope:
         state_lock = self._forbidden_zone_state_lock()
         with state_lock:
-            pending_request_id = str(
-                self._pending_explore_request_id or ""
-            ).strip()
-            current_request_id = str(
-                getattr(
-                    self._current_explore_request,
-                    "request_id",
-                    "",
-                )
-                or ""
-            ).strip()
-            if pending_request_id and pending_request_id != current_request_id:
-                raise GatewayError(
-                    "探索任务正在启动，无法安全替换活动地图禁行区。",
-                    error_code="forbidden_zone_update_conflict",
-                    http_status=409,
-                    details={"pending_exploration_request_id": pending_request_id},
-                )
             goal_id = self._active_navigation_goal_id_locked()
-            exploration_request_id = (
-                current_request_id or self._active_exploration_request_id_locked()
-            )
+            exploration_request_id = self._active_exploration_request_id_locked()
             self._forbidden_zone_update_active = True
 
         try:
@@ -1182,7 +1150,6 @@ class NavigationService:
 
         for context in (
             self._current_goal,
-            self._current_explore_request,
         ):
             resolved = str(getattr(context, "map_name", "") or "").strip()
             if resolved:
@@ -1653,14 +1620,7 @@ class NavigationService:
                 reason_code = str(submission.get("reason_code") or "")
                 if reason_code:
                     details["reason_code"] = reason_code
-                    readiness_prefix = "GOAL_RETRY_NAVIGATION_NOT_READY_"
-                    if reason_code.startswith(readiness_prefix):
-                        backend_code = reason_code[len(readiness_prefix):]
-                    elif reason_code == "GOAL_RETRY_MAP_REVISION_ADVANCED":
-                        backend_code = "MAP_REVISION_ADVANCED"
-                    else:
-                        backend_code = reason_code
-                    details["backend_code"] = backend_code
+                    details["backend_code"] = reason_code
             with _exploration_deadline_lock(
                 self._lock, deadline_monotonic, "SetNavigationGoal",
             ):
@@ -1912,14 +1872,11 @@ class NavigationService:
             "GetExplorationState",
         ):
             previous_context = self._latest_exploration_context
-            with _exploration_deadline_lock(
-                _exploration_owner_lock(self),
-                deadline_monotonic,
-                "GetExplorationState",
-            ):
-                current_request = _without_exploration_map_identity(
-                    self._current_explore_request
-                )
+            current_request = _without_exploration_map_identity(
+                previous_context.current_request if previous_context is not None else None
+            )
+            if current_request is not None and current_request.request_id != exploration_state.current_request_id:
+                current_request = None
             idle_without_request = bool(
                 exploration_state.status == ExplorationStatus.IDLE
                 and current_request is None
@@ -1990,21 +1947,6 @@ class NavigationService:
             )
             self._latest_exploration_context = context
             self._exploration_history.append(context)
-            context_request_id = str(
-                getattr(context.current_request, "request_id", "") or ""
-            ).strip()
-            if _is_complete_exploration_terminal(
-                context.exploration_state,
-                request_id=context_request_id,
-            ):
-                with _exploration_deadline_lock(
-                    _exploration_owner_lock(self),
-                    deadline_monotonic,
-                    "GetExplorationState",
-                ):
-                    self._current_explore_request = None
-                    if self._pending_explore_request_id == context_request_id:
-                        self._pending_explore_request_id = None
             if lightweight:
                 return context
             self._state_store.write(
@@ -2108,62 +2050,23 @@ class NavigationService:
             provider = self._get_exploration_provider(
                 deadline_monotonic=deadline_monotonic,
             )
-        request_id = str(request.request_id or "").strip()
-        registered_new_owner = False
         with _exploration_deadline_lock(
             self._lock,
             deadline_monotonic,
             "StartExploration",
         ):
-            with _exploration_deadline_lock(
-                _exploration_owner_lock(self),
-                deadline_monotonic,
-                "StartExploration",
-            ):
-                self._raise_forbidden_zone_motion_start_blocked_locked()
-                current_id = str(
-                    getattr(self._current_explore_request, "request_id", "") or ""
-                ).strip()
-                if (current_id and current_id != request_id) or (
-                    self._pending_explore_request_id
-                    and self._pending_explore_request_id != request_id
-                ):
-                    raise GatewayError("已有其它探索请求正在启动或运行。")
-                registered_new_owner = not bool(current_id)
-                self._pending_explore_request_id = request_id
-                self._current_explore_request = request
-        try:
-            _exploration_deadline_remaining(
-                deadline_monotonic,
-                "StartExploration",
+            self._raise_forbidden_zone_motion_start_blocked_locked()
+        _exploration_deadline_remaining(
+            deadline_monotonic,
+            "StartExploration",
+        )
+        if deadline_monotonic is None:
+            accepted = provider.start_exploration(request)
+        else:
+            accepted = provider.start_exploration(
+                request,
+                deadline_monotonic=deadline_monotonic,
             )
-            if deadline_monotonic is None:
-                accepted = provider.start_exploration(request)
-            else:
-                accepted = provider.start_exploration(
-                    request,
-                    deadline_monotonic=deadline_monotonic,
-                )
-        except Exception as exc:
-            if getattr(exc, "exploration_rpc_dispatched", True) is False:
-                with _exploration_deadline_lock(
-                    _exploration_owner_lock(self),
-                    deadline_monotonic,
-                    "StartExploration",
-                ):
-                    if self._pending_explore_request_id == request_id:
-                        self._pending_explore_request_id = None
-                    current_id = str(
-                        getattr(
-                            self._current_explore_request,
-                            "request_id",
-                            "",
-                        )
-                        or ""
-                    ).strip()
-                    if registered_new_owner and current_id == request_id:
-                        self._current_explore_request = None
-            raise
         if not accepted:
             message = f"探索后端拒绝请求 {request.request_id}。"
             try:
@@ -2177,47 +2080,18 @@ class NavigationService:
                 exploration_state = None
             if exploration_state is not None and exploration_state.message:
                 message = exploration_state.message
-            with _exploration_deadline_lock(
-                _exploration_owner_lock(self),
-                deadline_monotonic,
-                "StartExploration",
-            ):
-                if self._pending_explore_request_id == request_id:
-                    self._pending_explore_request_id = None
-                current_id = str(
-                    getattr(self._current_explore_request, "request_id", "") or ""
-                ).strip()
-                if registered_new_owner and current_id == request_id:
-                    self._current_explore_request = None
             _exploration_deadline_remaining(
                 deadline_monotonic,
                 "StartExploration",
             )
             raise GatewayError(message)
-        with _exploration_deadline_lock(
-            self._lock,
-            deadline_monotonic,
-            "StartExploration",
-        ):
-            with _exploration_deadline_lock(
-                _exploration_owner_lock(self),
-                deadline_monotonic,
-                "StartExploration",
-            ):
-                if self._pending_explore_request_id != request_id:
-                    raise GatewayError("探索启动确认与本地 pending request 不匹配。")
-                current_id = str(
-                    getattr(self._current_explore_request, "request_id", "") or ""
-                ).strip()
-                if current_id != request_id:
-                    raise GatewayError("探索启动确认与本地 current request 不匹配。")
-                self._pending_explore_request_id = None
         if deadline_monotonic is None:
             context = self.refresh_exploration()
         else:
             context = self.refresh_exploration(
                 deadline_monotonic=deadline_monotonic,
             )
+        context = context.model_copy(update={"current_request": request}, deep=False)
         if context.exploration_state.status == ExplorationStatus.IDLE:
             context = context.model_copy(
                 update={
@@ -2233,7 +2107,7 @@ class NavigationService:
                 },
                 deep=False,
             )
-            self._latest_exploration_context = context
+        self._latest_exploration_context = context
         return context
 
     def stop_exploration(
@@ -2251,38 +2125,11 @@ class NavigationService:
             "StopExploration",
         )
         correlated_request_id = str(request_id or "").strip()
-        with _exploration_deadline_lock(
-            self._lock,
-            deadline_monotonic,
-            "StopExploration",
-        ):
-            with _exploration_deadline_lock(
-                _exploration_owner_lock(self),
-                deadline_monotonic,
-                "StopExploration",
-            ):
-                previous_request = self._current_explore_request
-                if previous_request is None and self._latest_exploration_context is not None:
-                    previous_request = self._latest_exploration_context.current_request
         if deadline_monotonic is None:
             provider = self._get_exploration_provider()
         else:
             provider = self._get_exploration_provider(
                 deadline_monotonic=deadline_monotonic,
-            )
-        if (
-            correlated_request_id
-            and previous_request is not None
-            and previous_request.request_id != correlated_request_id
-        ):
-            raise GatewayError(
-                "停止探索 request_id 与当前会话不匹配。",
-                error_code="exploration_request_mismatch",
-                http_status=409,
-                details={
-                    "request_id": correlated_request_id,
-                    "active_request_id": previous_request.request_id,
-                },
             )
         stop_options = {}
         if global_stop_confirmation is not None:
@@ -2324,32 +2171,6 @@ class NavigationService:
                 deadline_monotonic=deadline_monotonic,
             )
 
-        if previous_request is not None and context.current_request is None:
-            state_updates = {}
-            if context.exploration_state.current_request_id is None:
-                state_updates["current_request_id"] = previous_request.request_id
-            if context.exploration_state.strategy is None:
-                state_updates["strategy"] = previous_request.strategy
-            exploration_state = context.exploration_state
-            if state_updates:
-                exploration_state = exploration_state.model_copy(
-                    update=state_updates,
-                    deep=False,
-                )
-            context = context.model_copy(
-                update={
-                    "current_request": previous_request,
-                    "exploration_state": exploration_state,
-                },
-                deep=False,
-            )
-            self._latest_exploration_context = context
-
-        if previous_request is not None and _is_complete_exploration_terminal(
-            context.exploration_state,
-            request_id=previous_request.request_id,
-        ):
-            self._current_explore_request = None
         return context
 
 
@@ -2581,7 +2402,6 @@ class NavigationService:
 
         with self._lock:
             self._latest_exploration_context = None
-            self._current_explore_request = None
         if self._frontier_stream_has_active_geometry():
             self._publish_cleared_exploration_frontier(
                 reason=reason or "clear_latest_exploration_context",

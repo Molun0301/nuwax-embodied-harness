@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextvars import copy_context
 from copy import deepcopy
@@ -20,7 +20,7 @@ from contracts.naming import build_event_id, build_task_id
 from contracts.tasks import TaskEvent, TaskSpec, TaskState, TaskStatus
 from core.event_bus import EventBus
 from core.logging_utils import LogRateLimiter, correlation_context
-from core.resource_lock import ResourceLockManager
+from core.resource_lock import ResourceConflictError, ResourceLockManager, RuntimeResource
 
 TaskRunner = Callable[["TaskExecutionContext"], Any]
 TASK_LOGGER = logging.getLogger("nuwax_robot_bridge.task_manager")
@@ -412,17 +412,31 @@ class TaskManager:
             return self._run_task(task_id, runner)
 
         try:
-            if self._resource_lock_manager is not None and resources:
-                self._resource_lock_manager.acquire(
-                    task_id,
-                    resources,
-                    metadata={"capability_name": capability_name, **metadata_payload},
-                )
-                acquired_resources = True
-
-            with self._lock:
-                self._records[task_id] = record
-                self._active_records[task_id] = record
+            while True:
+                try:
+                    with self._lock:
+                        if self._resource_lock_manager is not None and resources:
+                            self._resource_lock_manager.acquire(
+                                task_id,
+                                resources,
+                                metadata={"capability_name": capability_name, **metadata_payload},
+                            )
+                            acquired_resources = True
+                        self._records[task_id] = record
+                        self._active_records[task_id] = record
+                    break
+                except ResourceConflictError as error:
+                    motion_holders = {item.holder_task_id for item in error.conflicts
+                                      if item.resource == RuntimeResource.BASE_MOTION.value}
+                    if not motion_holders:
+                        raise
+                    for holder_task_id in motion_holders:
+                        self.cancel_task(holder_task_id, "新的运动任务请求接管运动资源。")
+                        with self._lock:
+                            holder_future = self._records[holder_task_id].future
+                        # 等待原任务走完既有停车收尾；其异常不替代新任务的执行结果。
+                        if holder_future is not None and not holder_future.done():
+                            wait((holder_future,))
 
             def correlated_runner():
                 request_context = metadata_payload.get("request_context") or {}

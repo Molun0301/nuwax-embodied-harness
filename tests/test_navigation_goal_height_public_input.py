@@ -514,7 +514,7 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
             self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'owned_pose', Pose(frame_id="map", position=Vector3(z=99)), create=True))
             if len(attempts) == 1:
                 raise GatewayError("等待输入", error_code="navigation_goal_rejected",
-                    details={"backend_code": "PLANNER_INPUT_STALE"})
+                    details={"backend_code": "GOAL_RETRY_STACK_STATE_UNOBSERVED"})
             terminal.navigation_state.current_goal_id = goal.goal_id
             later.navigation_state.current_goal_id = goal.goal_id
             return self.navigation_context(goal_id=goal.goal_id)
@@ -524,13 +524,38 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
             terminal, later,
         ], create=True))
         self.mcp_call(gateway, {"frame_id": "map", "x": 4.25, "y": -1.5})
-        with patch("gateways.runtime.time.sleep"), self.assertRaises(GatewayError) as failure:
+        with patch("gateways.runtime.time.sleep") as sleep, self.assertRaises(GatewayError) as failure:
             self.run_latest(gateway)
+        sleep.assert_called_once_with(.5)
         self.assertIn("SafetyFailed", str(failure.exception))
         self.assertEqual([goal.target_pose.position.z for goal in attempts], [7.25] * 2)
         self.assertEqual([goal.model_dump(mode="json") for goal in attempts],
             [attempts[0].model_dump(mode="json")] * 2)
         gateway.map_workspace_service.get_relocalized_pose.assert_called_once()
+
+    def test_forbidden_zone_revision_pending_waits_then_accepts_original_goal(self):
+        gateway = self.configure_runner(self.gateway())
+        attempts = []
+        terminal = self.navigation_context()
+
+        def dispatch(goal, **kwargs):
+            attempts.append(goal.model_copy(deep=True))
+            if len(attempts) == 1:
+                raise GatewayError("等待禁行区修订确认", error_code="forbidden_zone_revision_pending")
+            terminal.navigation_state.current_goal_id = goal.goal_id
+            return self.navigation_context(status=NavigationStatus.RUNNING, goal_id=goal.goal_id)
+
+        gateway.navigation_service.set_goal.side_effect = dispatch
+        gateway.navigation_service.refresh_navigation.return_value = terminal
+        self.mcp_call(gateway, {"frame_id": "map", "x": 4.25, "y": -1.5})
+        _spec, runner = gateway.task_manager.submissions[-1]
+        context = _RunnerContext()
+        with patch("gateways.runtime.time.sleep") as sleep:
+            runner(context)
+        sleep.assert_called_once_with(.5)
+        self.assertEqual([goal.model_dump(mode="json") for goal in attempts],
+            [attempts[0].model_dump(mode="json")] * 2)
+        self.assertIn("waiting_navigation_inputs", [update.get("stage") for update in context.updates])
 
     def test_unresolved_height_marker_is_blocked_at_dispatch_boundary(self):
         gateway = self.configure_runner(self.gateway())

@@ -275,14 +275,14 @@ class ApplyRegistrationTests(OfflineFixture):
         prefix, state = self.generation()
         state["deployment"]["source_root"] = str(self.base / "foreign")
         self.save(prefix, state)
-        self.mock_apply()
+        patches = self.mock_apply()
         with self.assertRaisesRegex(ValueError, "source_root"):
             self.apply()
         patches["build_modules"].assert_not_called()
         self.uuid.assert_not_called()
 
     def test_failed_build_or_validation_never_allocates_service_identity(self):
-        self.mock_apply()
+        patches = self.mock_apply()
         for stage in ("build_modules", "_verify_prefix"):
             with self.subTest(stage=stage), patch.object(manager, stage, side_effect=RuntimeError("fixture failure")):
                 with self.assertRaisesRegex(RuntimeError, "fixture failure"):

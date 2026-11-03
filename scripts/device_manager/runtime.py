@@ -267,6 +267,12 @@ def system_helper(action, payload=None):
                        environment=environment, payload=json.dumps(payload or {}), timeout=1800)
 
 
+# 业务环境不随发起命令的终端变化：开机和网页启动由系统服务发起，没有终端里的代理；
+# 继承终端代理会让发往机器人局域网地址的请求也走代理（Go2视频信令因此返回502）。
+# 安装任务仍沿用调用者的代理下载源码与依赖。
+_CALLER_PROXY_KEYS = ("http_proxy", "https_proxy", "all_proxy", "no_proxy")
+
+
 class Runtime:
     def __init__(self, home, manager_home=None):
         self.home = home
@@ -371,7 +377,9 @@ class Runtime:
         descriptor = os.open(str(log_path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
         with os.fdopen(descriptor, "ab") as log:
             process = subprocess.Popen(["bash", str(prefix / "start.sh"), "start"], cwd=prefix / "source",
-                                       env={key: value for key, value in clean_environment(prefix).items() if not key.startswith("NEH_MANAGER_WORKER_")}, stdin=subprocess.DEVNULL,
+                                       env={key: value for key, value in clean_environment(prefix).items()
+                                            if not key.startswith("NEH_MANAGER_WORKER_") and key.lower() not in _CALLER_PROXY_KEYS},
+                                       stdin=subprocess.DEVNULL,
                                        stdout=log, stderr=log, start_new_session=True)
         atomic_json(self.state_path, {"process": process_identity(process.pid), "prefix": str(prefix)})
         deadline = time.monotonic() + 90

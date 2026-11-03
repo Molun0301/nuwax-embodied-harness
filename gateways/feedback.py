@@ -62,7 +62,7 @@ _RECEIPT_ERROR_CODES = frozenset({
     "agent_scope_binding_required", "agent_scope_binding_conflict", "agent_scope_identity_conflict",
     "agent_terminal_version_required", "agent_terminal_pair_conflict",
     "agent_terminal_cutover_required", "agent_terminal_store_unavailable",
-    "agent_terminal_identity_conflict", "agent_terminal_scope_conflict", "agent_terminal_legacy_conflict",
+    "agent_terminal_identity_conflict", "agent_terminal_scope_conflict",
     "agent_terminal_source_conflict", "agent_terminal_revision_conflict",
 })
 _RETRYABLE_ERROR_CODES = frozenset(

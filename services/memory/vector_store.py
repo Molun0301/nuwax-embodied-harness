@@ -30,11 +30,8 @@ def _encode_vector(vector: np.ndarray) -> bytes:
 
 
 def _decode_vector(payload: object) -> np.ndarray:
-    """解码向量，支持新 BLOB 格式和旧 JSON 格式（向后兼容）。"""
-    if isinstance(payload, (bytes, bytearray, memoryview)):
-        return np.frombuffer(payload, dtype=np.float32).copy()
-    # 旧格式：JSON 字符串，自动 fallback
-    return np.asarray(json.loads(payload), dtype=np.float32)
+    """将单精度二进制向量解码为数组。"""
+    return np.frombuffer(payload, dtype=np.float32).copy()
 
 
 def _cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
@@ -90,8 +87,7 @@ class SQLiteNamedVectorStore:
 
     backend_name = "sqlite_named_vectors"
 
-    def __init__(self, db_path: str = ":memory:", *, storage: Optional[SQLiteStorage] = None, preserve_legacy: bool = False) -> None:
-        self._preserve_legacy = bool(preserve_legacy)
+    def __init__(self, db_path: str = ":memory:", *, storage: Optional[SQLiteStorage] = None) -> None:
         self._owns_storage = storage is None
         self._storage = storage if storage is not None else SQLiteStorage(db_path)
         self._db_path = self._storage.db_path
@@ -161,7 +157,7 @@ class SQLiteNamedVectorStore:
             metadata = payload.get("metadata")
             if not library_name and isinstance(metadata, dict):
                 library_name = str(metadata.get("memory_library_name") or "").strip()
-            if library_name and library_name != "legacy_default":
+            if library_name:
                 resolved_map_name = library_name
         payload["map_name"] = resolved_map_name or None
         payload_json = json.dumps(payload, ensure_ascii=False)
@@ -309,10 +305,7 @@ class SQLiteNamedVectorStore:
                 # 旧版写入者可能保留新列 token；同时校验快照中的实际字节。
                 if cached is not None and cached[0] == token and raw == cached[1].base:
                     return cached[1]
-        # SQLite BLOB results are immutable owned bytes. JSON legacy rows use the
-        # same bytes-backed representation after decoding, without changing SQL.
-        owned_bytes = raw if isinstance(raw, bytes) else _encode_vector(_decode_vector(raw))
-        vector = np.frombuffer(owned_bytes, dtype=np.float32)
+        vector = np.frombuffer(raw, dtype=np.float32)
         if cache_allowed and token is not None:
             with self._cache_lock:
                 self._cached_vectors.setdefault(point_id, {})[name] = (str(token), vector)
@@ -729,7 +722,7 @@ class SQLiteNamedVectorStore:
                 """
                 CREATE TABLE IF NOT EXISTS memory_vector_points (
                     point_id TEXT PRIMARY KEY,
-                    collection_name TEXT NOT NULL DEFAULT 'legacy',
+                    collection_name TEXT NOT NULL DEFAULT 'place_nodes',
                     record_kind TEXT NOT NULL,
                     map_name TEXT,
                     localization_session_id TEXT,
@@ -748,8 +741,6 @@ class SQLiteNamedVectorStore:
                 """
             )
             self._ensure_point_columns()
-            if not self._preserve_legacy:
-                self._migrate_point_map_names()
             tx.execute(
                 """
                 CREATE TABLE IF NOT EXISTS memory_named_vectors (
@@ -779,8 +770,6 @@ class SQLiteNamedVectorStore:
                     UPDATE memory_named_vectors SET cache_token=NULL
                     WHERE point_id=NEW.point_id AND vector_name=NEW.vector_name;
                 END""")
-            # Legacy JSON and BLOB rows remain byte-for-byte intact. Decode both
-            # formats lazily; cache tokens are allocated only on actual writes.
             tx.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memory_vector_points_collection ON memory_vector_points(collection_name)"
             )
@@ -814,7 +803,7 @@ class SQLiteNamedVectorStore:
             rows = tx.execute("PRAGMA table_info(memory_vector_points)").fetchall()
             existing = {str(row["name"]) for row in rows}
             required_columns = {
-                "collection_name": "TEXT NOT NULL DEFAULT 'legacy'",
+                "collection_name": "TEXT NOT NULL DEFAULT 'place_nodes'",
                 "map_name": "TEXT",
                 "localization_session_id": "TEXT",
                 "linked_location_id": "TEXT",
@@ -832,71 +821,6 @@ class SQLiteNamedVectorStore:
                     continue
                 tx.execute(f"ALTER TABLE memory_vector_points ADD COLUMN {column_name} {ddl}")
 
-    def _migrate_point_map_names(self) -> None:
-        """分页规范化旧地图字段；不重写已规范化的载荷或命名向量。"""
-        with self._transaction() as tx:
-            last_rowid = None
-            while True:
-                query = "SELECT rowid, point_id, map_name, payload_json FROM memory_vector_points"
-                params: Tuple[object, ...] = ()
-                if last_rowid is not None:
-                    query += " WHERE rowid > ?"
-                    params = (last_rowid,)
-                rows = tx.execute(query + " ORDER BY rowid LIMIT 500", params).fetchall()
-                if not rows:
-                    break
-                last_rowid = rows[-1]["rowid"]
-                updates = []
-                for row in rows:
-                    try:
-                        payload = json.loads(str(row["payload_json"]))
-                    except (TypeError, ValueError):
-                        continue
-                    if not isinstance(payload, dict):
-                        continue
-                    original = dict(payload)
-                    payload.pop("map_version_id", None)
-                    resolved_map_name = str(payload.get("map_name") or row["map_name"] or "").strip()
-                    if not resolved_map_name:
-                        library_name = str(payload.get("memory_library_name") or "").strip()
-                        metadata = payload.get("metadata")
-                        if not library_name and isinstance(metadata, dict):
-                            library_name = str(metadata.get("memory_library_name") or "").strip()
-                        if library_name and library_name != "legacy_default":
-                            resolved_map_name = library_name
-                    payload["map_name"] = resolved_map_name or None
-                    if payload == original and row["map_name"] == payload["map_name"]:
-                        continue
-                    updates.append((
-                        payload["map_name"],
-                        json.dumps(payload, ensure_ascii=False) if payload != original else row["payload_json"],
-                        str(row["point_id"]),
-                    ))
-                if updates:
-                    tx.executemany(
-                        "UPDATE memory_vector_points SET map_name = ?, payload_json = ? WHERE point_id = ?",
-                        updates,
-                    )
-
-    def _migrate_vector_payload_to_blob(self) -> None:
-        """将旧 JSON 格式的 vector_payload 迁移为 BLOB 格式（仅处理仍为 TEXT 的行）。"""
-        with self._transaction() as tx:
-            rows = tx.execute("SELECT rowid, vector_payload FROM memory_named_vectors").fetchall()
-            updates = []
-            for row in rows:
-                payload = row["vector_payload"]
-                if isinstance(payload, (bytes, bytearray, memoryview)):
-                    continue  # 已是 BLOB，跳过
-                try:
-                    blob = np.asarray(json.loads(payload), dtype=np.float32).tobytes()
-                    updates.append((blob, row["rowid"]))
-                except (TypeError, ValueError, OverflowError):
-                    continue  # 无法解析的行保持原样
-            if updates:
-                tx.executemany(
-                    "UPDATE memory_named_vectors SET vector_payload = ? WHERE rowid = ?",
-                    updates,
-                )
 
     def _string_or_none(self, value: object) -> Optional[str]:
         normalized = str(value or "").strip()

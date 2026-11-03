@@ -303,7 +303,7 @@ class ServiceRegressionChecks(unittest.TestCase):
             with self.assertRaises(RuntimeError):service._repository.upsert_semantic_memory(self.memory())
         self.assertEqual(index.outbox.snapshot()['accepted'],0)
 
-    def test_shared_source_delete_removes_legacy_archive(self):
+    def test_shared_source_delete_removes_vector_point(self):
         with tempfile.TemporaryDirectory() as tmp:
             service=self.fixture(path=str(Path(tmp)/'source.db'))
             store=service._vector_store
@@ -311,9 +311,7 @@ class ServiceRegressionChecks(unittest.TestCase):
             named=NamedVector('text_dense',service._text_embedder.model_name,16,np.ones(16,dtype=np.float32))
             store.upsert_point(point_id=record.memory_id,collection_name='episodic_observations',record_kind=record.kind.value,payload=payload,vectors={'text_dense':named})
             self.accept(service,record);service._run_durable_vectorization(self.claim(service))
-            with store.storage.read_snapshot() as tx:self.assertEqual(tx.execute('SELECT count(*) FROM memory_index_legacy_archive').fetchone()[0],1)
             service._repository.delete_semantic_memories([record.memory_id])
-            with store.storage.read_snapshot() as tx:self.assertEqual(tx.execute('SELECT count(*) FROM memory_index_legacy_archive').fetchone()[0],0)
             self.assertIsNone(store.get_point(record.memory_id))
 
 
@@ -339,39 +337,6 @@ class ServiceRegressionChecks(unittest.TestCase):
         self.assertEqual(service._text_embedder.calls,1)
         self.assertEqual(index.outbox.receipt_outcome(receipt.token),'completed_fresh')
 
-    def test_default_service_preserves_original_legacy_payload_and_map_fallback(self):
-        import json
-        from contracts.memory import MemoryPayloadFilter,MemoryRecordKind
-        for library in ('library','legacy_default'):
-            with self.subTest(library=library),tempfile.TemporaryDirectory() as tmp:
-                path=str(Path(tmp)/'memory.db')
-                repo=MemoryRepository(path)
-                record=self.memory(map_name=None,metadata={'memory_library_name':library})
-                repo.upsert_semantic_memory(record)
-                store=SQLiteNamedVectorStore(path,preserve_legacy=True)
-                payload={'record_id':record.memory_id,'record_kind':'scene','retrieval_text':'Desk Synthetic','map_name':None,
-                         'title':'Desk','summary':'Synthetic','timestamp':record.timestamp.isoformat()}
-                named=NamedVector('text_dense','fixture-constant-v1',16,np.ones(16,dtype=np.float32))
-                store.upsert_point(point_id=record.memory_id,collection_name='episodic_observations',record_kind='scene',payload=payload,vectors={'text_dense':named})
-                original=json.dumps(payload,ensure_ascii=False,indent=3)
-                with store.storage.transaction() as tx:
-                    tx.execute('UPDATE memory_vector_points SET payload_json=?,map_name=NULL',(original,))
-                store.close();repo.close()
-                service=self.fixture(path=path)
-                service._active_library_name=library;service._durable_index.activate(library)
-                service._load_persisted_memory(library_name=library)
-                self.assertEqual(service._text_embedder.calls,0)
-                with service._repository.storage.read_snapshot() as tx:
-                    self.assertEqual(tx.execute('SELECT payload_json FROM memory_vector_points').fetchone()[0],original)
-                result=service._query_records('Desk',allowed_record_kinds=(MemoryRecordKind.SCENE,),similarity_threshold=.1,
-                    limit=5,payload_filter=MemoryPayloadFilter(map_name='library') if library=='library' else None)
-                self.assertTrue(result.matches);self.assertTrue(result.metadata['includes_unverified_legacy_scores'])
-                current=service._repository.load_semantic_memories(library_name=library)[0]
-                service._repository.upsert_semantic_memory(current.model_copy(update={'observation_count':1}))
-                with service._repository.storage.read_snapshot() as tx:
-                    archived=tx.execute('SELECT point_payload_json,point_row_json,vector_payload FROM memory_index_legacy_archive').fetchone()
-                    self.assertEqual(archived[0],original);self.assertEqual(bytes(archived[2]),named.vector.tobytes())
-                    self.assertEqual(json.loads(archived[1])['payload_json'],original)
 
     def test_pending_source_recovers_after_reopen_without_sync_model_work(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -548,7 +513,7 @@ class ServiceRegressionChecks(unittest.TestCase):
                 finally:release.set();document.join(3);foreground.join(3)
 
     def test_corrupt_legacy_modality_is_suppressed_without_hiding_other_evidence(self):
-        for broken in (b'x','not-json','[NaN]'):
+        for broken in (b'x',):
             with self.subTest(payload=broken):
                 service=self.fixture();service._image_embedder=service._text_embedder
                 record,_=self.accept(service,self.memory(artifact_ids=['art_image_20260101T000000Z_00000001']))
@@ -565,9 +530,6 @@ class ServiceRegressionChecks(unittest.TestCase):
                 self.assertEqual(service.get_summary().semantic_memory_count,1)
                 service._load_index_image=lambda ids:(None,None,'image_missing')
                 service._run_durable_vectorization(self.claim(service))
-                with service._repository.storage.read_snapshot() as tx:
-                    archived=tx.execute("SELECT vector_payload FROM memory_index_legacy_archive WHERE vector_name='text_dense'").fetchone()[0]
-                    self.assertEqual(archived,broken)
                 self.assertEqual(self.query(service).matches[0].metadata['vector_provenance']['text_dense']['status'],'validated_current')
 
 

@@ -373,8 +373,8 @@ class PublicUnconfirmedTests(unittest.TestCase):
         self.enterContext(patch.object(runtime, "_build_goal_from_navigation_candidate", lambda **kwargs: NavigationGoal(
             goal_id=IDENTITY["goal_id"] if kwargs["candidate"].record_id == "candidate-1" else "owned-goal-2",
             target_name=kwargs["candidate"].record_id)))
-        candidates = [NS(record_id="candidate-1", record_kind=NS(value="object")),
-                      NS(record_id="candidate-2", record_kind=NS(value="object"))]
+        candidates = [NS(record_id="candidate-1", metadata={"record_kind": "object"}),
+                      NS(record_id="candidate-2", metadata={"record_kind": "object"})]
         error = GatewayError("ordinary reject", error_code="navigation_goal_rejected") if ordinary else uncertain_error()
         terminal = navigation(NavigationStatus.SUCCEEDED, proof=True, goal_id="owned-goal-2")
         self.enterContext(patch.object(runtime, "navigation_service", NS(set_goal=Mock(side_effect=[error, terminal] if ordinary else error),

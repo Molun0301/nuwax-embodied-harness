@@ -171,80 +171,6 @@ class SceneIdentityRegistryChecks(unittest.TestCase):
         service._repository.upsert_semantic_memory(records()[1][3]);service._repository.upsert_semantic_instance(records()[2][3])
         self.admit(plan)
 
-    def test_uniquely_scoped_legacy_scene_and_anchor_are_adopted_without_rewriting(self):
-        service=self.fixture();old=self.save_scene(service)
-        before=old.model_dump_json();plan=self.plan(service)
-        self.assertEqual(plan.resolve('scene','region','region-a'),SCENE)
-        self.assertEqual(plan.resolve('anchor','region','region-a'),ANCHOR)
-        self.admit(plan)
-        self.assertEqual(service._repository.load_scene_space(SCENE).model_dump_json(),before)
-
-    def test_topology_anchor_and_coarse_scene_keep_different_natural_kinds(self):
-        service=self.fixture();topo='anc_topo_19700101T000000Z_abcdef01'
-        coarse=self.save_scene(service,source='coarse_node',anchor=topo)
-        coarse.linked_topology_node_ids=['node'];service._repository.upsert_scene_space(coarse)
-        plan=self.plan(service)
-        self.assertEqual(plan.resolve('scene','region','coarse_node'),SCENE)
-        self.assertEqual(plan.resolve('anchor','topo','node'),topo)
-        self.assertNotEqual(plan.resolve('anchor','region','coarse_node'),topo)
-
-    def test_map_name_alone_and_other_epoch_never_authorize_legacy_adoption(self):
-        service=self.fixture();self.save_scene(service,scope=False)
-        plan=self.plan(service)
-        self.assertNotEqual(plan.resolve('scene','region','region-a'),SCENE)
-        self.assertTrue(any(item['status']=='unbound' for item in plan.diagnostics))
-        changed=service._repository.load_scene_space(SCENE)
-        changed.metadata['scene_identity_scope']={**plan.scope_metadata,'source_epoch':'different'}
-        service._repository.upsert_scene_space(changed)
-        self.assertNotEqual(self.plan(service).resolve('scene','region','region-a'),SCENE)
-
-    def test_ambiguous_legacy_candidates_and_overflow_are_preserved(self):
-        service=self.fixture();self.save_scene(service)
-        self.save_scene(service,identifier=SCENE.replace('deadbeef','00000001'))
-        plan=self.plan(service);new=plan.resolve('scene','region','region-a')
-        self.assertNotIn(new,[SCENE,SCENE.replace('deadbeef','00000001')])
-        self.assertTrue(any(item['status']=='ambiguous' for item in plan.diagnostics));self.admit(plan)
-        self.assertEqual(len(service._repository.load_scene_spaces()),2)
-        with patch('services.memory.scene_identity.MAX_CANDIDATES',1):
-            bounded=self.plan(service);bounded.resolve('anchor','region','region-a')
-            self.assertTrue(any(item['status']=='overflow' for item in bounded.diagnostics))
-
-    def test_specific_adopted_witness_change_is_rejected(self):
-        service=self.fixture();old=self.save_scene(service);plan=self.plan(service)
-        plan.resolve('scene','region','region-a')
-        service._repository.upsert_scene_space(old.model_copy(update={'primary_label':'changed source'}))
-        with self.assertRaises(IdentityScopeChanged):self.admit(plan)
-
-    def test_new_relevant_legacy_witness_cannot_make_pending_adoption_ambiguous(self):
-        service=self.fixture();self.save_scene(service);plan=self.plan(service)
-        self.assertEqual(plan.resolve('scene','region','region-a'),SCENE)
-        self.save_scene(service,identifier=SCENE.replace('deadbeef','abcdef02'))
-        with self.assertRaises(IdentityScopeChanged):self.admit(plan)
-
-    def test_stored_scene_conflict_is_not_remapped_to_a_registered_id(self):
-        service=self.fixture();first=self.plan(service)
-        canonical=first.resolve('scene','region','region-a');self.admit(first)
-        self.save_scene(service)
-        conflicted=self.plan(service)
-        self.assertEqual(conflicted.resolve('scene','region','region-a'),SCENE)
-        self.admit(conflicted)
-        self.assertTrue(any(item['status']=='ambiguous' for item in conflicted.diagnostics))
-        with conflicted.storage.read_snapshot() as tx:
-            self.assertEqual(tx.execute('SELECT public_id FROM memory_scene_entity_ids').fetchone()[0],canonical)
-        self.assertIsNotNone(service._repository.load_scene_space(SCENE))
-
-    def test_adoption_reads_only_bounded_identity_fields_not_scene_geometry(self):
-        import services.memory.scene_identity as module
-        service=self.fixture();old=self.save_scene(service)
-        old.metadata['irrelevant_large_field']='x'*100000
-        service._repository.upsert_scene_space(old)
-        loads=module.json.loads
-        seen=[]
-        def capture(value,*args,**kwargs):
-            seen.append(len(value));return loads(value,*args,**kwargs)
-        with patch.object(module.json,'loads',side_effect=capture):
-            plan=self.plan(service);self.assertEqual(plan.resolve('scene','region','region-a'),SCENE);self.admit(plan)
-        self.assertTrue(seen);self.assertLess(max(seen),2000)
 
     def test_samples_seed_existing_ids_without_resolver_and_survive_selection_loss(self):
         service=self.fixture();existing=SceneObservationSample(sample_id='sample_legacy',observation_event_id=EVENT,
@@ -322,45 +248,25 @@ class SceneIdentityRegistryChecks(unittest.TestCase):
             self.assertEqual(tx.execute('SELECT public_id FROM memory_scene_sample_ids').fetchone()[0],canonical)
 
     def test_scene_deletion_cleans_scene_and_sample_aliases_but_keeps_map_anchors(self):
-        service=self.fixture();owner=self.save_scene(service)
-        plan=self.plan(service);plan.resolve('scene','region','region-a');plan.resolve('anchor','region','region-a');token=self.admit(plan)
+        service=self.fixture();plan=self.plan(service)
+        scene_id=plan.resolve('scene','region','region-a');plan.resolve('anchor','region','region-a');token=self.admit(plan)
+        owner=self.save_scene(service,identifier=scene_id)
         sample=service._repository.prepare_scene_identities('library',scene=owner);sample.resolve_sample('observation_event',EVENT);self.admit(sample)
-        service._repository.delete_scene_spaces([SCENE])
+        service._repository.delete_scene_spaces([scene_id])
         self.assertFalse(plan.is_current(token))
         with plan.storage.read_snapshot() as tx:
             self.assertEqual(tx.execute('SELECT entity_kind FROM memory_scene_entity_ids').fetchall()[0][0],'anchor')
             self.assertEqual(tx.execute('SELECT COUNT(*) FROM memory_scene_sample_ids').fetchone()[0],0)
         with self.assertRaises(IdentityScopeChanged):self.admit(sample)
 
-    def test_preserved_conflict_scene_deletion_invalidates_its_publication(self):
-        service=self.fixture();canonical=self.plan(service)
-        canonical_id=canonical.resolve('scene','region','region-a');self.admit(canonical)
-        self.save_scene(service)
-        conflict=self.plan(service)
-        self.assertEqual(conflict.resolve('scene','region','region-a'),SCENE)
-        token=self.admit(conflict)
-        self.assertTrue(conflict.is_current(token))
-        service._repository.delete_scene_spaces([SCENE])
-        self.assertFalse(conflict.is_current(token))
-        with conflict.storage.read_snapshot() as tx:
-            self.assertEqual(tx.execute('SELECT public_id FROM memory_scene_entity_ids').fetchone()[0],canonical_id)
-            self.assertEqual(tx.execute('SELECT COUNT(*) FROM memory_scene_identity_publication_scenes').fetchone()[0],0)
-
-    def test_preserved_conflict_still_fences_its_specific_legacy_witness(self):
-        service=self.fixture();canonical=self.plan(service)
-        canonical.resolve('scene','region','region-a');self.admit(canonical)
-        source=self.save_scene(service)
-        conflict=self.plan(service)
-        self.assertEqual(conflict.resolve('scene','region','region-a'),SCENE)
-        service._repository.upsert_scene_space(source.model_copy(update={'linked_semantic_region_ids':['moved']}))
-        with self.assertRaises(IdentityScopeChanged):self.admit(conflict)
 
     def test_deletion_does_not_invalidate_unrelated_map_scope_publication(self):
-        service=self.fixture();self.save_scene(service)
-        affected=self.plan(service);affected.resolve('scene','region','region-a');old=self.admit(affected)
+        service=self.fixture();affected=self.plan(service)
+        scene_id=affected.resolve('scene','region','region-a');old=self.admit(affected)
+        self.save_scene(service,identifier=scene_id)
         other=self.plan(service,snapshot=snapshot().model_copy(update={'source_epoch':'other'}))
         other.resolve('scene','region','region-a');current=self.admit(other)
-        service._repository.delete_scene_spaces([SCENE])
+        service._repository.delete_scene_spaces([scene_id])
         self.assertFalse(affected.is_current(old));self.assertTrue(other.is_current(current))
 
     def test_clear_all_retires_aliases_and_even_unadmitted_plans(self):
@@ -375,9 +281,10 @@ class SceneIdentityRegistryChecks(unittest.TestCase):
                 self.assertEqual(tx.execute('SELECT COUNT(*) FROM '+table).fetchone()[0],0)
 
     def test_retired_registered_scene_alias_cannot_be_resurrected_by_old_plan(self):
-        service=self.fixture();self.save_scene(service);a=self.plan(service);a.resolve('scene','region','region-a');self.admit(a)
+        service=self.fixture();a=self.plan(service);scene_id=a.resolve('scene','region','region-a');self.admit(a)
+        self.save_scene(service,identifier=scene_id)
         b=self.plan(service);b.resolve('scene','region','region-a')
-        service._repository.delete_scene_spaces([SCENE])
+        service._repository.delete_scene_spaces([scene_id])
         with self.assertRaises(IdentityScopeChanged):self.admit(b)
 
     def test_owner_transaction_is_required_and_refresh_is_outside_writer(self):

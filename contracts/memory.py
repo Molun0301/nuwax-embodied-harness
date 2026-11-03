@@ -276,44 +276,6 @@ class MemoryPayloadFilter(ContractModel):
         return [validate_scene_space_id(item) for item in value]
 
 
-class MemoryNavigationCandidate(TimestampedContract):
-    """记忆检索生成的导航候选。"""
-
-    record_kind: MemoryRecordKind = Field(description="来源记录类型。")
-    record_id: str = Field(description="来源记录标识。")
-    target_pose: Pose = Field(description="推荐导航目标位姿。")
-    target_name: str = Field(description="候选目标名称。")
-    linked_location_id: Optional[str] = Field(default=None, description="关联地点标识。")
-    map_name: Optional[str] = Field(default=None, description="候选所在地图名称。")
-    topo_node_id: Optional[str] = Field(default=None, description="候选拓扑节点标识。")
-    semantic_region_id: Optional[str] = Field(default=None, description="候选语义区域标识。")
-    scene_space_id: Optional[str] = Field(default=None, description="候选场景空间标识。")
-    distance_m: Optional[float] = Field(default=None, ge=0.0, description="相对当前位姿的距离。")
-    verification_query: Optional[str] = Field(default=None, description="到点后建议复核的文本查询。")
-    verification_artifact_id: Optional[str] = Field(default=None, description="到点复核参考制品。")
-    verification_memory_id: Optional[str] = Field(default=None, description="到点复核参考记忆。")
-    metadata: MetadataDict = Field(default_factory=dict, description="附加导航候选信息。")
-
-    @field_validator("record_id")
-    @classmethod
-    def _validate_navigation_record_id(cls, value: str) -> str:
-        if value.startswith("loc_"):
-            return validate_location_id(value)
-        if value.startswith("mem_"):
-            return validate_memory_id(value)
-        if value.startswith("ssp_"):
-            return validate_scene_space_id(value)
-        return value
-
-
-    @field_validator("scene_space_id")
-    @classmethod
-    def _validate_navigation_scene_space_id(cls, value: Optional[str]) -> Optional[str]:
-        if not value:
-            return value
-        return validate_scene_space_id(value)
-
-
 class MemoryArrivalVerification(TimestampedContract):
     """导航到点后的复核结果。"""
 

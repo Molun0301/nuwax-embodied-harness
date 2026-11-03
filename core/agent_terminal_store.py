@@ -97,7 +97,7 @@ class AgentTerminalStore:
         with self._connection() as db:
             return {row["task_id"]: dict(row) for row in db.execute(
                 "SELECT " + fields + " FROM agent_task_terminals WHERE task_id IN ("
-                + ",".join("?" for _ in ids) + ")", ids)}
+                + ",".join("?" for _ in ids) + ") AND receipt_source_id IS NOT NULL AND receipt_revision IS NOT NULL", ids)}
 
     def rows(self, ids, *, full=True):
         return self._target_rows(ids, full=full)
@@ -119,8 +119,6 @@ class AgentTerminalStore:
                                                  message="任务历史回执属于另一作用域。")
                 except GatewayError as error:
                     error_code = error.error_code
-                if error_code is None and (row["receipt_source_id"] is None or row["receipt_revision"] is None):
-                    error_code = "agent_terminal_legacy_conflict"
                 versions[row["task_id"]] = {"source_id": row["receipt_source_id"],
                                             "revision": row["receipt_revision"], "error_code": error_code}
         return versions
@@ -131,37 +129,6 @@ class AgentTerminalStore:
             self.authorize((row,), error_code="not_found")
         return row
 
-    def import_legacy_rows(self, source):
-        """启动时逐批搬运原列；已存在的较新目标保留，冲突保留原库并报错。"""
-        if source.execute("SELECT 1 FROM sqlite_master WHERE name='agent_task_terminals' AND type='table'").fetchone() is None:
-            return
-        cursor = source.execute("SELECT " + ",".join(TERMINAL_FIELDS) + " FROM agent_task_terminals ORDER BY task_id")
-        with self._connection() as target:
-            target.execute("BEGIN IMMEDIATE")
-            try:
-                while rows := cursor.fetchmany(64):
-                    for row in rows:
-                        current = target.execute("SELECT * FROM agent_task_terminals WHERE task_id=?", (row["task_id"],)).fetchone()
-                        if current is not None:
-                            if current["scope"] != row["scope"]:
-                                raise GatewayError("导入的历史回执作用域冲突。", error_code="agent_terminal_scope_conflict", http_status=409)
-                            if current["receipt_source_id"] != row["receipt_source_id"]:
-                                raise GatewayError("导入的历史回执源身份冲突。", error_code="agent_terminal_source_conflict", http_status=409)
-                            revision, previous = row["receipt_revision"], current["receipt_revision"]
-                            if (revision is None) != (previous is None):
-                                raise GatewayError("导入的历史回执版本冲突。", error_code="agent_terminal_legacy_conflict", http_status=409)
-                            if revision == previous:
-                                if current["snapshot_json"] != row["snapshot_json"]:
-                                    raise GatewayError("同一历史回执版本内容冲突。", error_code="agent_terminal_revision_conflict", http_status=409)
-                                continue
-                            if previous > revision:
-                                continue
-                        target.execute("INSERT OR REPLACE INTO agent_task_terminals (" + ",".join(TERMINAL_FIELDS)
-                                       + ") VALUES (?,?,?,?,?,?,?)", tuple(row[key] for key in TERMINAL_FIELDS))
-                target.commit()
-            except BaseException:
-                target.rollback()
-                raise
 
     def save(self, prepared):
         current = self._target_rows((prepared.task_id,), full=False).get(prepared.task_id)

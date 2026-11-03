@@ -36,7 +36,6 @@ from contracts.memory import (
     GoalSpec,
     NavigationCandidateResolution,
     MemoryArrivalVerification,
-    MemoryNavigationCandidate,
     MemoryPayloadFilter,
     MemoryQueryMatch,
     MemoryQueryResult,
@@ -122,7 +121,6 @@ from services.perception.deferred_pointcloud_projection import project_cone
 LOGGER = logging.getLogger(__name__)
 
 MEMORY_LIBRARY_METADATA_KEY = "memory_library_name"
-LEGACY_MEMORY_LIBRARY_NAME = "legacy_default"
 MEMORY_DISABLED_MESSAGE = "记忆库功能尚未启用，请先调用 `enable_memory_library`。"
 SCENE_SPACES_COLLECTION = "scene_spaces"
 
@@ -226,7 +224,7 @@ class MemoryService(SceneMappingMemoryMixin):
         self._artifact_store = artifact_store
         memory_db_path = str(memory_db_path).strip() or ":memory:"
         self._repository = MemoryRepository(memory_db_path)
-        self._vector_store = SQLiteNamedVectorStore(storage=self._repository.storage, preserve_legacy=True)
+        self._vector_store = SQLiteNamedVectorStore(storage=self._repository.storage)
         self._closed = False
         self._storage_closed = False
         self._memory_backends_closed = False
@@ -1149,12 +1147,7 @@ class MemoryService(SceneMappingMemoryMixin):
         )
 
     def _record_library_name(self, record: object) -> str:
-        metadata = getattr(record, "metadata", {}) or {}
-        if isinstance(metadata, dict):
-            value = str(metadata.get(MEMORY_LIBRARY_METADATA_KEY, "") or "").strip()
-            if value:
-                return value
-        return LEGACY_MEMORY_LIBRARY_NAME
+        return record.metadata[MEMORY_LIBRARY_METADATA_KEY].strip()
 
     def _delete_memory_library_records(self, library_name: str) -> Dict[str, int]:
         with self._repository.storage.transaction():
@@ -2062,7 +2055,7 @@ class MemoryService(SceneMappingMemoryMixin):
             "final_pose_source": "platform_graph_candidate_only",
         }
 
-    def _navigation_candidate_failure_evidence(self, candidate: MemoryNavigationCandidate) -> Dict[str, object]:
+    def _navigation_candidate_failure_evidence(self, candidate: NavigationCandidate) -> Dict[str, object]:
         candidate_record_id = str(candidate.record_id or "").strip()
         if not candidate_record_id:
             return {"penalty": 0.0, "failure_count": 0, "reason_codes": [], "trajectory_event_ids": []}
@@ -2109,7 +2102,7 @@ class MemoryService(SceneMappingMemoryMixin):
         if isinstance(decay_state, dict):
             decay_amount = max(
                 float(decay_state.get(candidate_record_id, 0.0) or 0.0),
-                float(decay_state.get(str(candidate.metadata.get("candidate_id") or ""), 0.0) or 0.0),
+                float(decay_state.get(candidate.candidate_id, 0.0) or 0.0),
             )
         if decay_amount > 0.0:
             penalty = min(0.85, penalty + decay_amount)
@@ -2175,7 +2168,7 @@ class MemoryService(SceneMappingMemoryMixin):
 
     def _build_candidate_score_breakdown(
         self,
-        candidate: MemoryNavigationCandidate,
+        candidate: NavigationCandidate,
         *,
         expected_map_name: Optional[str],
         expected_localization_session_id: Optional[str],
@@ -2199,7 +2192,7 @@ class MemoryService(SceneMappingMemoryMixin):
         }.get(quality_level, 1.0 if metadata.get("navigable") is True else 0.25)
         freshness_score = self._clamp_score(
             self._coerce_optional_float(metadata.get("recency_score"))
-            or (0.85 if candidate.record_kind in {MemoryRecordKind.OBSERVATION_EVENT, MemoryRecordKind.OBJECT_INSTANCE} else 0.7)
+            or (0.85 if candidate.metadata["record_kind"] in {MemoryRecordKind.OBSERVATION_EVENT, MemoryRecordKind.OBJECT_INSTANCE} else 0.7)
         )
         projection_confidence = self._coerce_optional_float(metadata.get("projection_confidence"))
         segmentation_score = self._coerce_optional_float(metadata.get("segmentation_score"))
@@ -2251,7 +2244,7 @@ class MemoryService(SceneMappingMemoryMixin):
 
     def _compute_attribute_bonus(
         self,
-        candidate: MemoryNavigationCandidate,
+        candidate: NavigationCandidate,
         goal_spec: Optional[GoalSpec],
     ) -> float:
         """计算属性匹配加成分（≤0.15），以 target_class 命中为门控。"""
@@ -2281,7 +2274,7 @@ class MemoryService(SceneMappingMemoryMixin):
 
     def _navigation_candidate_decision(
         self,
-        candidate: MemoryNavigationCandidate,
+        candidate: NavigationCandidate,
         score_breakdown: GoalCandidateScoreBreakdown,
     ) -> Tuple[str, List[str], bool]:
         metadata = dict(candidate.metadata or {})
@@ -2314,7 +2307,7 @@ class MemoryService(SceneMappingMemoryMixin):
 
     def _decorate_navigation_candidate_for_goal_resolution(
         self,
-        candidate: MemoryNavigationCandidate,
+        candidate: NavigationCandidate,
         *,
         goal_spec: GoalSpec,
         score_breakdown: GoalCandidateScoreBreakdown,
@@ -2322,7 +2315,7 @@ class MemoryService(SceneMappingMemoryMixin):
         reasons: List[str],
         allowed_for_navigation: bool,
         resolution_metadata: Dict[str, object],
-    ) -> MemoryNavigationCandidate:
+    ) -> NavigationCandidate:
         metadata = {
             **dict(candidate.metadata),
             **resolution_metadata,
@@ -2353,7 +2346,7 @@ class MemoryService(SceneMappingMemoryMixin):
         self,
         *,
         goal_spec: GoalSpec,
-        candidates: Tuple[MemoryNavigationCandidate, ...],
+        candidates: Tuple[NavigationCandidate, ...],
         resolution_metadata: Dict[str, object],
     ) -> NavigationCandidateResolution:
         direct_candidates = [item for item in candidates if dict(item.metadata).get("allowed_for_navigation") is True]
@@ -2389,7 +2382,7 @@ class MemoryService(SceneMappingMemoryMixin):
         map_name: Optional[str] = None,
         localization_session_id: Optional[str] = None,
         goal_id: Optional[str] = None,
-    ) -> Optional[MemoryNavigationCandidate]:
+    ) -> Optional[NavigationCandidate]:
         """把自由文本查询解析成可导航的记忆候选。"""
 
         candidates = self.resolve_navigation_candidates(
@@ -2425,7 +2418,7 @@ class MemoryService(SceneMappingMemoryMixin):
         localization_session_id: Optional[str] = None,
         limit: int = 5,
         goal_id: Optional[str] = None,
-    ) -> Tuple[MemoryNavigationCandidate, ...]:
+    ) -> Tuple[NavigationCandidate, ...]:
         """把自由文本查询解析成一组可导航的记忆候选。"""
 
         if not self.is_enabled():
@@ -2463,7 +2456,7 @@ class MemoryService(SceneMappingMemoryMixin):
             payload_filter.max_age_sec = max_age_sec
         if current_pose is not None:
             payload_filter.near_pose = current_pose
-        candidates: List[MemoryNavigationCandidate] = []
+        candidates: List[NavigationCandidate] = []
         seen_record_ids = set()
         query_scope = str(((grounding_plan.metadata if grounding_plan is not None else {}) or {}).get("query_scope") or "mixed").strip() or "mixed"
         observed_candidate_count = 0
@@ -2489,7 +2482,7 @@ class MemoryService(SceneMappingMemoryMixin):
             for match in result.matches:
                 if match.navigation_candidate is None:
                     continue
-                candidate = self._to_legacy_navigation_candidate(match.navigation_candidate)
+                candidate = match.navigation_candidate
                 if candidate.record_id in seen_record_ids:
                     continue
                 seen_record_ids.add(candidate.record_id)
@@ -2538,7 +2531,7 @@ class MemoryService(SceneMappingMemoryMixin):
             for match in location_result.matches:
                 if match.navigation_candidate is None:
                     continue
-                candidate = self._to_legacy_navigation_candidate(match.navigation_candidate)
+                candidate = match.navigation_candidate
                 if candidate.record_id in seen_record_ids:
                     continue
                 seen_record_ids.add(candidate.record_id)
@@ -2558,7 +2551,7 @@ class MemoryService(SceneMappingMemoryMixin):
             "localization_session_id": effective_localization_session_id or "",
             "camera_id": camera_id or "",
         }
-        decorated_pool: List[MemoryNavigationCandidate] = []
+        decorated_pool: List[NavigationCandidate] = []
         for candidate in candidates:
             score_breakdown = self._build_candidate_score_breakdown(
                 candidate,
@@ -2737,7 +2730,7 @@ class MemoryService(SceneMappingMemoryMixin):
         self,
         query: str,
         *,
-        navigation_candidate: Optional[Union[MemoryNavigationCandidate, NavigationCandidate]] = None,
+        navigation_candidate: Optional[NavigationCandidate] = None,
         camera_id: Optional[str] = None,
         similarity_threshold: float = 0.55,
         expected_map_name: Optional[str] = None,
@@ -2770,18 +2763,14 @@ class MemoryService(SceneMappingMemoryMixin):
                     },
                 )
             )
-        legacy_candidate = self._coerce_legacy_navigation_candidate(navigation_candidate)
-        candidate_id_from_metadata = str(
-            (legacy_candidate.metadata if legacy_candidate is not None else {}).get("candidate_id")
-            or ""
-        ).strip() or None
-        if resolved_goal_id is None and legacy_candidate is not None:
-            metadata_goal_id = str(legacy_candidate.metadata.get("goal_id") or "").strip()
+        candidate_id_from_metadata = navigation_candidate.candidate_id if navigation_candidate is not None else None
+        if resolved_goal_id is None and navigation_candidate is not None:
+            metadata_goal_id = str(navigation_candidate.metadata.get("goal_id") or "").strip()
             if metadata_goal_id:
                 resolved_goal_id = metadata_goal_id
         effective_map_name = str(
             expected_map_name
-            or (legacy_candidate.map_name if legacy_candidate is not None else "")
+            or (navigation_candidate.map_name if navigation_candidate is not None else "")
         ).strip() or None
         semantic_context = self.get_navigation_semantic_context()
         active_localization_session_id = str(semantic_context.localization_session_id or "").strip() or None
@@ -2838,8 +2827,8 @@ class MemoryService(SceneMappingMemoryMixin):
                 )
             )
         effective_query = (
-            legacy_candidate.verification_query
-            if legacy_candidate is not None and legacy_candidate.verification_query
+            navigation_candidate.verification_query
+            if navigation_candidate is not None and navigation_candidate.verification_query
             else query
         )
         perception_context = self._perception_service.get_latest_perception(camera_id)
@@ -2869,11 +2858,11 @@ class MemoryService(SceneMappingMemoryMixin):
             + self._collect_scene_vision_tags(perception_context.scene_summary)
         )
         target_labels = [effective_query]
-        if legacy_candidate is not None:
+        if navigation_candidate is not None:
             target_labels.extend(
                 [
-                    legacy_candidate.target_name,
-                    legacy_candidate.verification_query or "",
+                    navigation_candidate.target_name,
+                    navigation_candidate.verification_query or "",
                 ]
             )
         segmentation_evidence = self._collect_arrival_segmentation_evidence(
@@ -2883,8 +2872,8 @@ class MemoryService(SceneMappingMemoryMixin):
         )
         image_score = 0.0
         target_point = None
-        if legacy_candidate is not None:
-            target_point = self._durable_index.validated_point(legacy_candidate.record_id)
+        if navigation_candidate is not None:
+            target_point = self._durable_index.validated_point(navigation_candidate.record_id)
         if self._image_embedder is not None and perception_context.image_artifact is not None:
             current_image_bytes = self._load_image_bytes(perception_context.image_artifact.artifact_id)
             if current_image_bytes is not None:
@@ -2934,7 +2923,7 @@ class MemoryService(SceneMappingMemoryMixin):
             score=score,
             matched_labels=matched_labels,
             matched_memory_id=(
-                legacy_candidate.verification_memory_id if legacy_candidate is not None else None
+                str(navigation_candidate.metadata.get("verification_memory_id") or "") or None if navigation_candidate is not None else None
             ),
             reason=reason,
             goal_id=resolved_goal_id,
@@ -2945,8 +2934,8 @@ class MemoryService(SceneMappingMemoryMixin):
                 "camera_id": perception_context.camera_id,
                 "requested_query": query,
                 "verification_query": effective_query,
-                "record_id": legacy_candidate.record_id if legacy_candidate is not None else "",
-                "record_kind": legacy_candidate.record_kind.value if legacy_candidate is not None else "",
+                "record_id": navigation_candidate.record_id if navigation_candidate is not None else "",
+                "record_kind": navigation_candidate.metadata["record_kind"] if navigation_candidate is not None else "",
                 "candidate_id": candidate_id_from_metadata or "",
                 "goal_id": resolved_goal_id or "",
                 "map_name": effective_map_name or semantic_context.map_name,
@@ -7921,84 +7910,6 @@ class MemoryService(SceneMappingMemoryMixin):
         safe = safe.strip("_") or "anchor"
         return "anc_%s_19700101T000000Z_deadbeef" % safe[:24]
 
-    def _to_legacy_navigation_candidate(self, candidate: NavigationCandidate) -> MemoryNavigationCandidate:
-        record_kind = MemoryRecordKind(str(candidate.metadata.get("record_kind") or MemoryRecordKind.NOTE.value))
-        navigation_quality_summary = self._navigation_quality_observability_fields(
-            candidate.metadata.get("navigation_quality")
-        )
-        return MemoryNavigationCandidate(
-            record_kind=record_kind,
-            record_id=candidate.record_id,
-            target_pose=candidate.inspection_pose,
-            target_name=candidate.target_name,
-            linked_location_id=str(candidate.metadata.get("linked_location_id") or "") or None,
-            map_name=candidate.map_name,
-            topo_node_id=candidate.topo_node_id,
-            semantic_region_id=candidate.semantic_region_id,
-            scene_space_id=str(candidate.metadata.get("scene_space_id") or "") or None,
-            distance_m=candidate.distance_m,
-            verification_query=candidate.verification_query,
-            verification_artifact_id=candidate.verification_artifact_id,
-            verification_memory_id=str(candidate.metadata.get("verification_memory_id") or "") or None,
-            metadata={
-                "camera_id": str(candidate.metadata.get("camera_id") or ""),
-                "anchor_id": candidate.anchor_id,
-                "candidate_id": candidate.candidate_id,
-                "goal_id": str(candidate.metadata.get("goal_id") or ""),
-                "map_name": str(candidate.metadata.get("map_name") or ""),
-                "localization_session_id": str(candidate.metadata.get("localization_session_id") or ""),
-                "backend": str(candidate.metadata.get("backend") or "memory_service"),
-                "backend_type": str(
-                    candidate.metadata.get("backend_type")
-                    or candidate.metadata.get("backend")
-                    or "memory_service"
-                ),
-                "source_collection": str(candidate.metadata.get("source_collection") or candidate.source_collection),
-                "scene_space_id": str(candidate.metadata.get("scene_space_id") or ""),
-                "linked_object_instance_ids": list(candidate.metadata.get("linked_object_instance_ids") or []),
-                "candidate_score": candidate.score,
-                "projection_method": str(candidate.metadata.get("projection_method") or ""),
-                "projection_confidence": candidate.metadata.get("projection_confidence"),
-                "support_point_count": candidate.metadata.get("support_point_count"),
-                "navigable": candidate.metadata.get("navigable"),
-                "non_navigable_reason": str(candidate.metadata.get("non_navigable_reason") or ""),
-                "navigation_quality": candidate.metadata.get("navigation_quality"),
-                **navigation_quality_summary,
-                "projection_degradation_reason": candidate.metadata.get("projection_degradation_reason"),
-                "geometry_projection_method": candidate.metadata.get("geometry_projection_method"),
-                "geometry_projection_status": candidate.metadata.get("geometry_projection_status"),
-                "segmentation_projection_status": candidate.metadata.get("segmentation_projection_status"),
-                "has_structured_segmentation": candidate.metadata.get("has_structured_segmentation"),
-                "segmentation_score": candidate.metadata.get("segmentation_score"),
-                "predicted_iou": candidate.metadata.get("predicted_iou"),
-                "segmentation_quality_score": candidate.metadata.get("segmentation_quality_score"),
-                "stability_score": candidate.metadata.get("stability_score"),
-                "coverage": candidate.metadata.get("coverage"),
-                "map_projection_coverage": candidate.metadata.get("map_projection_coverage"),
-                "depth_coverage": candidate.metadata.get("depth_coverage"),
-                "reprojection_error": candidate.metadata.get("reprojection_error"),
-                "segmentation_support_point_count": candidate.metadata.get("segmentation_support_point_count"),
-                "segmentation_quality": candidate.metadata.get("segmentation_quality"),
-                "segmentation_review_required": candidate.metadata.get("segmentation_review_required"),
-                "segmentation_risk_factors": candidate.metadata.get("segmentation_risk_factors"),
-                "segmentation_quality_reason": candidate.metadata.get("segmentation_quality_reason"),
-                "segmentation_occlusion_flags": candidate.metadata.get("segmentation_occlusion_flags"),
-                "segmentation_truncation_flags": candidate.metadata.get("segmentation_truncation_flags"),
-            },
-        )
-
-    def _coerce_legacy_navigation_candidate(
-        self,
-        navigation_candidate: Optional[Union[MemoryNavigationCandidate, NavigationCandidate]],
-    ) -> Optional[MemoryNavigationCandidate]:
-        if navigation_candidate is None:
-            return None
-        if isinstance(navigation_candidate, MemoryNavigationCandidate):
-            if navigation_candidate.record_kind==MemoryRecordKind.OBJECT_INSTANCE:
-                resolved_id=self.resolve_instance_id(navigation_candidate.record_id)
-                return navigation_candidate.model_copy(update={"record_id":resolved_id})
-            return navigation_candidate
-        return self._to_legacy_navigation_candidate(navigation_candidate)
 
     def _write_semantic_instance_state(self, instance: SemanticInstance) -> None:
         if not self._instance_is_confirmed(instance):
@@ -8461,9 +8372,9 @@ class MemoryService(SceneMappingMemoryMixin):
             )
             self._repository.upsert_scene_space(updated)
 
-    def _record_navigation_candidate_graph(self, candidate: MemoryNavigationCandidate) -> MemoryNavigationCandidate:
+    def _record_navigation_candidate_graph(self, candidate: NavigationCandidate) -> NavigationCandidate:
         metadata = dict(candidate.metadata or {})
-        candidate_id = str(metadata.get("candidate_id") or self._build_navigation_candidate_id(candidate.record_id))
+        candidate_id = candidate.candidate_id
         trajectory_event = NavigationTrajectoryEvent(
             trajectory_event_id=self._build_navigation_trajectory_event_id(
                 NavigationTrajectoryEventKind.REACHABLE_POSE,
@@ -8472,11 +8383,11 @@ class MemoryService(SceneMappingMemoryMixin):
             ),
             event_kind=NavigationTrajectoryEventKind.REACHABLE_POSE,
             pose=self._get_current_pose(),
-            target_pose=candidate.target_pose,
+            target_pose=candidate.inspection_pose,
             map_name=candidate.map_name,
             localization_session_id=str(metadata.get("localization_session_id") or "") or None,
             navigation_candidate_id=candidate_id,
-            source_record_kind=candidate.record_kind.value,
+            source_record_kind=candidate.metadata["record_kind"],
             source_record_id=candidate.record_id,
             target_name=candidate.target_name,
             success=True if metadata.get("allowed_for_navigation") is True else None,
@@ -8486,7 +8397,7 @@ class MemoryService(SceneMappingMemoryMixin):
         stored_event = self._upsert_navigation_trajectory_event(trajectory_event)
         relation = self._record_semantic_graph_relation(
             SemanticGraphRelationKind.REACHABLE_FROM,
-            candidate.record_kind.value,
+            candidate.metadata["record_kind"],
             candidate.record_id,
             MemoryRecordKind.NAVIGATION_TRAJECTORY.value,
             stored_event.trajectory_event_id,
@@ -8761,7 +8672,7 @@ class MemoryService(SceneMappingMemoryMixin):
         self,
         *,
         query: str,
-        navigation_candidate: Optional[Union[MemoryNavigationCandidate, NavigationCandidate]],
+        navigation_candidate: Optional[NavigationCandidate],
         navigation_goal: Optional[NavigationGoal] = None,
         navigation_context: Optional[object] = None,
         arrival_verification: Optional[MemoryArrivalVerification] = None,
@@ -8773,10 +8684,9 @@ class MemoryService(SceneMappingMemoryMixin):
         next_action: Optional[Dict[str, object]] = None,
         task_trace: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
-        legacy_candidate = self._coerce_legacy_navigation_candidate(navigation_candidate)
         goal_metadata = dict(getattr(navigation_goal, "metadata", {}) or {})
-        record_id = str(legacy_candidate.record_id if legacy_candidate is not None else "").strip()
-        record_kind = str(legacy_candidate.record_kind.value if legacy_candidate is not None else MemoryRecordKind.NOTE.value)
+        record_id = str(navigation_candidate.record_id if navigation_candidate is not None else "").strip()
+        record_kind = str(navigation_candidate.metadata["record_kind"] if navigation_candidate is not None else MemoryRecordKind.NOTE.value)
         if not record_id and goal_metadata.get("resolved_scene_space_id"):
             record_id = str(goal_metadata.get("resolved_scene_space_id") or "").strip()
             record_kind = MemoryRecordKind.SCENE_SPACE.value
@@ -8786,8 +8696,8 @@ class MemoryService(SceneMappingMemoryMixin):
         if not record_id and getattr(navigation_goal, "goal_id", None):
             record_id = str(navigation_goal.goal_id)
             record_kind = "navigation_goal"
-        candidate_metadata = dict(legacy_candidate.metadata or {}) if legacy_candidate is not None else goal_metadata
-        candidate_id = str(candidate_metadata.get("candidate_id") or (self._build_navigation_candidate_id(record_id) if record_id else ""))
+        candidate_metadata = dict(navigation_candidate.metadata or {}) if navigation_candidate is not None else goal_metadata
+        candidate_id = navigation_candidate.candidate_id if navigation_candidate is not None else self._build_navigation_candidate_id(record_id) if record_id else ""
         verification = arrival_verification
         verified = bool(verification.verified) if verification is not None else str(execution_status) == "succeeded"
         reason_code = str(
@@ -8796,10 +8706,10 @@ class MemoryService(SceneMappingMemoryMixin):
             or ("arrival_verified" if verified else "navigation_failed")
         )
         current_pose = self._get_current_pose()
-        target_pose = legacy_candidate.target_pose if legacy_candidate is not None else getattr(navigation_goal, "target_pose", None)
+        target_pose = navigation_candidate.inspection_pose if navigation_candidate is not None else getattr(navigation_goal, "target_pose", None)
         map_name = str(
             (verification.metadata or {}).get("map_name") if verification is not None else ""
-        ) or (legacy_candidate.map_name if legacy_candidate is not None else None)
+        ) or (navigation_candidate.map_name if navigation_candidate is not None else None)
         localization_session_id = str(
             (verification.metadata or {}).get("localization_session_id") if verification is not None else ""
         ) or str(candidate_metadata.get("localization_session_id") or "") or None
@@ -8824,7 +8734,7 @@ class MemoryService(SceneMappingMemoryMixin):
                 navigation_candidate_id=candidate_id or None,
                 source_record_kind=record_kind,
                 source_record_id=record_id,
-                target_name=str(getattr(legacy_candidate, "target_name", "") or query),
+                target_name=str(getattr(navigation_candidate, "target_name", "") or query),
                 success=verified,
                 reason_code=reason_code,
                 metadata=self._attach_library_metadata(
@@ -8884,12 +8794,12 @@ class MemoryService(SceneMappingMemoryMixin):
                 )
                 if blocked_relation is not None:
                     relation_ids.append(blocked_relation.relation_id)
-        if verified and legacy_candidate is not None:
+        if verified and navigation_candidate is not None:
             observation_ids = self._normalize_aliases(observation_event_ids)
-            if legacy_candidate.record_kind == MemoryRecordKind.OBJECT_INSTANCE:
+            if navigation_candidate.metadata["record_kind"] == MemoryRecordKind.OBJECT_INSTANCE.value:
                 # P0-3：读改写必须整体持锁，与精化 worker 写回串行；I/O 留在锁外。
                 with self._instances_lock:
-                    instance = self._semantic_instances_by_id.get(legacy_candidate.record_id)
+                    instance = self._semantic_instances_by_id.get(navigation_candidate.record_id)
                     if instance is not None:
                         updated_instance = instance.model_copy(
                             update={
@@ -8917,8 +8827,8 @@ class MemoryService(SceneMappingMemoryMixin):
                     else:
                         self._publish_live_instance(updated_instance, expected=instance)
             scene_space_id = (
-                legacy_candidate.scene_space_id
-                or (legacy_candidate.record_id if legacy_candidate.record_kind == MemoryRecordKind.SCENE_SPACE else "")
+                navigation_candidate.scene_space_id
+                or (navigation_candidate.record_id if navigation_candidate.metadata["record_kind"] == MemoryRecordKind.SCENE_SPACE.value else "")
                 or str(candidate_metadata.get("scene_space_id") or candidate_metadata.get("resolved_scene_space_id") or "")
                 or None
             )

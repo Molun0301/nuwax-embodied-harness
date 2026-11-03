@@ -160,7 +160,7 @@ class DurableMemoryIndex:
 
     def _raw(self, tx, kind, point_id):
         table, column, _ = SOURCES[kind]
-        return tx.execute(f'SELECT payload_json, map_name, library_name FROM {table} WHERE {column}=?', (point_id,)).fetchone()
+        return tx.execute(f"SELECT payload_json, map_name, library_name FROM {table} WHERE {column}=? AND library_name IS NOT NULL AND TRIM(library_name) != ''", (point_id,)).fetchone()
 
     def load(self, kind, point_id, *, tx=None):
         if tx is None:
@@ -465,8 +465,6 @@ class DurableMemoryIndex:
 
     def _delete_derived(self, tx, point_id, incarnation):
         self.service._vector_store.delete_points([point_id])
-        if tx.execute("SELECT 1 FROM sqlite_master WHERE name='memory_index_legacy_archive'").fetchone():
-            tx.execute('DELETE FROM memory_index_legacy_archive WHERE point_id=?', (point_id,))
 
     def ensure(self, kind, record):
         """Adopt/reconcile a source without rewriting it or advancing business CAS."""
@@ -568,39 +566,11 @@ class DurableMemoryIndex:
                 'internal_id': version.key.point_id, 'record_incarnation': version.record_incarnation,
                 'input_generation': version.revision, 'proof_version': 2}
 
-    def _archive(self, tx, point_id):
-        """Copy original SQLite row representations once, before first replacement."""
-        tx.execute('''CREATE TABLE IF NOT EXISTS memory_index_legacy_archive (
-            point_id TEXT NOT NULL, vector_name TEXT NOT NULL, model_name TEXT,
-            dimension INTEGER, vector_payload BLOB, vector_updated_at TEXT,
-            point_payload_json TEXT NOT NULL, point_updated_at TEXT,
-            point_row_json TEXT, vector_row_json TEXT,
-            PRIMARY KEY(point_id,vector_name))''')
-        columns = {r[1] for r in tx.execute('PRAGMA table_info(memory_index_legacy_archive)')}
-        for column in ('point_row_json', 'vector_row_json'):
-            if column not in columns:
-                tx.execute('ALTER TABLE memory_index_legacy_archive ADD COLUMN ' + column + ' TEXT')
-        row = tx.execute('SELECT * FROM memory_vector_points WHERE point_id=?', (point_id,)).fetchone()
-        if row is None:
-            return
-        payload = json.loads(row['payload_json'])
-        proven = payload.get(INDEX_META, {}).get('vectors', {})
-        vectors = tx.execute('SELECT * FROM memory_named_vectors WHERE point_id=?', (point_id,)).fetchall()
-        for vector in vectors:
-            if vector['vector_name'] not in proven:
-                tx.execute('INSERT OR IGNORE INTO memory_index_legacy_archive VALUES (?,?,?,?,?,?,?,?,?,?)',
-                           (point_id, vector['vector_name'], vector['model_name'], vector['dimension'],
-                            vector['vector_payload'], vector['updated_at'], row['payload_json'], row['updated_at'],
-                            canonical(dict(row)), canonical({key: vector[key] for key in vector.keys() if key != 'vector_payload'})))
-        if not vectors and INDEX_META not in payload:
-            tx.execute('INSERT OR IGNORE INTO memory_index_legacy_archive VALUES (?,?,?,?,?,?,?,?,?,?)',
-                       (point_id, '', None, None, None, None, row['payload_json'], row['updated_at'], canonical(dict(row)), None))
 
     def _write_modality(self, tx, row, projection, claim, named, provenance):
         from services.memory.vector_store import _encode_vector
         # SQLite publication stays SQL-only and preserves other named modalities.
         point_id = row['external_id']
-        self._archive(tx, point_id)
         stored = tx.execute('SELECT payload_json FROM memory_vector_points WHERE point_id=?', (point_id,)).fetchone()
         old_payload = json.loads(stored[0]) if stored else {}
         metadata = dict(old_payload.get(INDEX_META, {}))
@@ -674,7 +644,7 @@ class DurableMemoryIndex:
     def _service_point(point_row, vector_rows):
         """Decode each modality independently; corrupt cache bytes cannot hide source text."""
         import numpy as np
-        from services.memory.vector_store import VectorPoint, NamedVector, _decode_vector
+        from services.memory.vector_store import VectorPoint, NamedVector
         invalid_payload = False
         try:
             payload = json.loads(point_row['payload_json'])
@@ -695,7 +665,7 @@ class DurableMemoryIndex:
             try:
                 # SQL BLOB bytes own this read-only view; cosine consumers must not mutate it.
                 raw = row['vector_payload']
-                array = np.frombuffer(raw, dtype=np.float32) if isinstance(raw, bytes) else _decode_vector(raw)
+                array = np.frombuffer(raw, dtype=np.float32)
             except (ValueError, TypeError, OverflowError):
                 array = np.empty(0, dtype=np.float32)
             try:
@@ -976,7 +946,6 @@ class DurableMemoryIndex:
         row = tx.execute('SELECT payload_json FROM memory_vector_points WHERE point_id=?', (prepared.point_id,)).fetchone()
         if row is None:
             return
-        self._archive(tx, prepared.point_id)
         payload = json.loads(row[0])
         metadata = dict(payload.get(INDEX_META, {}))
         legacy = dict(metadata.get('legacy_inputs', {}))

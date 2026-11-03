@@ -197,15 +197,15 @@ def historical_coobserved_ids(record,source_index,config=None):
     result={}
     for key,other in others.items():
         proof=cooccurrence_sources(record,other,config)
-        if proof["sources"] or proof["legacy"] or proof["known"]:
+        if proof["sources"] or proof["known"]:
             result[key]=proof["sources"]
     return result
 
 
 def cooccurrence_sources(left,right,config=None):
-    """不同身份在独立源中的明确分离证据；旧无来源伙伴仅作一次弱证据。"""
+    """不同身份在独立源中的明确分离证据。"""
     left_ids,right_ids=instance_identity_ids(left),instance_identity_ids(right)
-    result={"sources":[],"legacy":False,"known":False}
+    result={"sources":[],"known":False}
     if not left_ids or not right_ids or left_ids & right_ids:
         return result
     sources=set()
@@ -215,10 +215,8 @@ def cooccurrence_sources(left,right,config=None):
         for peer in ids:
             values=stored.get(peer) or ()
             sources.update(values)
-            if peer in (metadata.get(COOBSERVED_INSTANCE_IDS) or ()):
+            if peer in stored:
                 result["known"]=True
-                if peer not in stored:
-                    result["legacy"]=True
     if config is None:
         from core.settings import MemoryInstanceAssociationConfig
         config=MemoryInstanceAssociationConfig()
@@ -229,9 +227,6 @@ def cooccurrence_sources(left,right,config=None):
                 if item.metadata.get("source_observation_id")==source
                 and (item.metadata.get("camera_id") or "")==camera)
         a,b=sample(left),sample(right)
-        if "frame_geometry" not in a.metadata or "frame_geometry" not in b.metadata:
-            result["legacy"]=True
-            continue
         separated=False
         evaluated=False
         for ga in a.metadata["frame_geometry"] or ():

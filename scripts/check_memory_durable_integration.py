@@ -237,11 +237,6 @@ class IntegrationChecks(unittest.TestCase):
         after=index.query_snapshot([('memory',new)])[0][0][2]
         self.assertNotIn('text_dense',after.vectors)
         self.assertIn('image_dense',after.vectors)
-        with index.storage.read_snapshot() as tx:
-            archive=tx.execute('SELECT vector_payload,point_payload_json FROM memory_index_legacy_archive WHERE point_id=? AND vector_name=?',
-                               (new.memory_id,'text_dense')).fetchone()
-        self.assertEqual(bytes(archive[0]),named.vector.tobytes())
-        self.assertIn('Desk',archive[1])
 
     def test_input_change_fences_slow_result_and_source_aba(self):
         service=self.fixture();index=service._durable_index

@@ -1,19 +1,17 @@
-"""Transactional natural identities for builder entities and scene-owned samples.
+"""构建实体和场景样本的事务自然身份。
 
-Preparation reads bounded legacy evidence and allocates private provisional IDs.
-Only admission inside the source writer transaction can persist an alias.
+准备阶段读取现行别名并分配私有临时编号。
+别名只在源记录的写事务内持久化。
 """
 from __future__ import annotations
 
-import json
 import uuid
 from typing import Dict, Tuple
 
 from contracts.geometry_runtime import DEFAULT_MAP_FRAME
-from contracts.naming import build_anchor_id, build_scene_space_id, validate_anchor_id, validate_scene_space_id
+from contracts.naming import build_anchor_id, build_scene_space_id
 from contracts.spatial_memory import SceneSpace
 
-MAX_CANDIDATES = 64
 _SCOPE_FIELDS = ("map_name", "source_name", "source_epoch", "frame_id")
 
 
@@ -97,17 +95,6 @@ def _sample_key(sample):
     return None
 
 
-def _explicit_scope(payload):
-    metadata = payload.get("metadata") or {}
-    candidates = []
-    for value in (metadata.get("scene_identity_scope"), metadata.get("map_binding"),
-                  {**metadata, "map_name": payload.get("map_name") or metadata.get("map_name"),
-                   "frame_id": payload.get("frame_id") or metadata.get("frame_id")}):
-        if isinstance(value, dict) and all(isinstance(value.get(key), str) and value[key] for key in _SCOPE_FIELDS):
-            candidates.append(tuple(value[key] for key in _SCOPE_FIELDS))
-    return candidates[0] if candidates and all(value == candidates[0] for value in candidates) else None
-
-
 class SceneIdentityPlan:
     """One library/map or library/scene identity admission plan; not shared state."""
     def __init__(self, repository, library_name, *, snapshot=None, scene=None):
@@ -123,7 +110,6 @@ class SceneIdentityPlan:
         self._diagnostics = []
         self._seeded = {}
         self._origins = {}
-        self._evidence = {}
         self._registered = set()
         with self.storage.read_snapshot() as tx:
             self.library_incarnation = _library_incarnation(tx, self.library_name)
@@ -222,7 +208,7 @@ class SceneIdentityPlan:
             if _library_incarnation(tx, self.library_name) != self.library_incarnation:
                 raise IdentityScopeChanged("Scene identity library was replaced")
             canonical = self._alias(tx, key)
-            candidate = self._seeded.get(key[1:]) if key[0] == "sample" else self._legacy_candidate(tx, key)
+            candidate = self._seeded.get(key[1:]) if key[0] == "sample" else None
         if candidate is not None:
             value, origin = candidate, "adopted"
             if canonical is not None and canonical != candidate:
@@ -245,72 +231,6 @@ class SceneIdentityPlan:
         return ("sample_" + uuid.uuid4().hex if key[0] == "sample" else
                 (build_anchor_id if key[0] == "anchor" else build_scene_space_id)(key[1], suffix=uuid.uuid4().hex))
 
-    def _legacy_candidate(self, tx, key):
-        entity, kind, source = key
-        link_field = "linked_semantic_region_ids" if kind == "region" else "linked_topology_node_ids"
-        rows = tx.execute(f"""SELECT scene_space_id,graph_source_revision,
-            json_object('scene_space_id',scene_space_id,'map_name',map_name,
-                'frame_id',json_extract(payload_json,'$.frame_id'),
-                'attributes',json_object('source',json_extract(payload_json,'$.attributes.source')),
-                'metadata',json_object('scene_identity_scope',json_extract(payload_json,'$.metadata.scene_identity_scope'),
-                    'map_binding',json_extract(payload_json,'$.metadata.map_binding'),
-                    'source_name',json_extract(payload_json,'$.metadata.source_name'),
-                    'source_epoch',json_extract(payload_json,'$.metadata.source_epoch'),
-                    'source',json_extract(payload_json,'$.metadata.source')),
-                'linked_anchor_ids',json_extract(payload_json,'$.linked_anchor_ids'),
-                'linked_semantic_region_ids',json_extract(payload_json,'$.linked_semantic_region_ids'),
-                'linked_topology_node_ids',json_extract(payload_json,'$.linked_topology_node_ids')) AS identity_json
-            FROM scene_spaces WHERE library_name=? AND map_name=?
-            AND EXISTS(SELECT 1 FROM json_each(payload_json,'$.{link_field}') WHERE value=?)
-            ORDER BY scene_space_id LIMIT ?""", (self.library_name, self.scope_metadata['map_name'], source, MAX_CANDIDATES + 1)).fetchall()
-        if len(rows) > MAX_CANDIDATES:
-            self._diagnose(key, "overflow", candidate_count=len(rows))
-            return None
-        wanted_scope = tuple(self.scope_metadata[field] for field in _SCOPE_FIELDS)
-        candidates = set()
-        evidence = {}
-        for row in rows:
-            before = set(candidates)
-            payload = json.loads(row["identity_json"])
-            scope = _explicit_scope(payload)
-            if scope is None:
-                self._diagnose(key, "unbound")
-                continue
-            if scope != wanted_scope:
-                continue
-            attributes, metadata = payload.get('attributes') or {}, payload.get('metadata') or {}
-            provenance = attributes.get('source') or metadata.get('source')
-            if provenance not in ('semantic_region', 'topology_node'):
-                self._diagnose(key, 'unbound', reason='missing_builder_source')
-                continue
-            if entity == 'scene':
-                expected_source = 'semantic_region' if kind == 'region' else 'topology_node'
-                if provenance == expected_source and payload.get(link_field) == [source]:
-                    candidates.add(payload['scene_space_id'])
-                    evidence[payload['scene_space_id']] = (row['scene_space_id'], row['graph_source_revision'])
-                continue
-            anchors = payload.get('linked_anchor_ids') or []
-            if kind == 'region' and provenance == 'semantic_region' and payload.get(link_field) == [source]:
-                # Builder-generated legacy IDs encode their producer kind; the
-                # actual opaque suffix is never reconstructed or interpreted.
-                if anchors and anchors[0].startswith('anc_region_'):
-                    candidates.add(anchors[0])
-            elif kind == 'topo' and payload.get(link_field) == [source]:
-                candidates.update(value for value in anchors if value.startswith('anc_topo_'))
-            for value in candidates - before:
-                evidence[value] = (row['scene_space_id'], row['graph_source_revision'])
-        if len(candidates) == 1:
-            value = next(iter(candidates))
-            try:
-                (validate_anchor_id if entity == 'anchor' else validate_scene_space_id)(value)
-            except ValueError:
-                self._diagnose(key, 'unbound')
-                return None
-            self._evidence[key] = evidence[value]
-            return value
-        if candidates:
-            self._diagnose(key, 'ambiguous', candidate_ids=sorted(candidates))
-        return None
 
     def admit(self, tx):
         """Validate first, then insert aliases in the caller's source transaction.
@@ -346,16 +266,6 @@ class SceneIdentityPlan:
                 missing.append(key)
         if remap:
             raise IdentityPlanChanged(remap)
-        # Only actual adoption witnesses are fenced. Unrelated source writes
-        # cannot invalidate new key allocation or existing canonical aliases.
-        for key in self._values:
-            if key in self._evidence and winners[key] != self._values[key]:
-                scene_id, revision = self._evidence[key]
-                current = tx.execute("SELECT graph_source_revision,library_name FROM scene_spaces WHERE scene_space_id=?", (scene_id,)).fetchone()
-                if (current is None or current['library_name'] != self.library_name
-                        or current['graph_source_revision'] != revision
-                        or self._legacy_candidate(tx, key) != self._values[key]):
-                    raise IdentityScopeChanged("A specific legacy identity witness changed; prepare again")
         admitted = []
         for key in missing:
             if key[0] == 'sample':

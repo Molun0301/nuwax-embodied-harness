@@ -10,8 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from scripts import check_memory_provider_modes as providers
-from scripts.check_memory_builder_sample_identity import snapshot, region, event, SCENE, ANCHOR
-from scripts import check_memory_scene_identity_registry as registry
+from scripts.check_memory_builder_sample_identity import snapshot, region, event, ANCHOR
 from contracts.runtime_views import SceneSummary
 from contracts.spatial_memory import SceneObservationSample, SceneSpaceReviewStatus
 from services.memory.repository import MemoryRepository
@@ -20,12 +19,17 @@ class SceneIdentityServiceChecks(unittest.TestCase):
     def fixture(self, **kwargs):
         service=providers.ProviderModeChecks.fixture(self,**kwargs)
         service._localization_service=SimpleNamespace(get_active_session=lambda:None)
+        owner=SimpleNamespace(latest=self.source())
+        owner.get_semantic_snapshot=lambda:owner.latest
+        owner.get_latest_snapshot=lambda:owner.latest
+        service._mapping_service=owner
         service._semantic_map_builder._inspection_pose_planner=Mock(plan_for_target=lambda **kw:[])
         return service
     def source(self, **kwargs):
         return snapshot(regions=[region('r')]).model_copy(update=kwargs)
     def build(self, service, source=None):
-        return service._refresh_semantic_map_context(source or self.source())
+        service._mapping_service.latest=source or self.source()
+        return service._refresh_semantic_map_context(service._mapping_service.latest)
     def counts(self, service):
         with service._repository.storage.read_snapshot() as tx:
             return tuple(tx.execute('SELECT COUNT(*) FROM '+table).fetchone()[0] for table in
@@ -65,21 +69,6 @@ class SceneIdentityServiceChecks(unittest.TestCase):
         self.assertIn(ANCHOR,result.anchors_by_id)
         with service._repository.storage.read_snapshot() as tx:
             self.assertEqual(tx.execute("SELECT COUNT(*) FROM memory_scene_entity_ids WHERE entity_kind='anchor'").fetchone()[0],0)
-    def test_proven_legacy_adoption_keeps_id_labels_samples_and_refs(self):
-        service=self.fixture();helper=registry.SceneIdentityRegistryChecks();helper.plan=lambda s: s._repository.prepare_scene_identities('library',snapshot=self.source())
-        helper.save_scene(service,source='r')
-        stored=service._repository.load_scene_space(SCENE).model_copy(update={'primary_label':'Reviewed office','review_status':SceneSpaceReviewStatus.REVIEWED,
-            'observation_samples':[SceneObservationSample(sample_id='old_sample')],'observation_sample_ids':['old_sample'],
-            'graph_relation_ids':['rel_legacy_20260101T000000Z_deadbeef'],
-            'summary_node_ids':['sum_legacy_20260101T000000Z_deadbeef'],
-            'metadata':{**service._repository.load_scene_space(SCENE).metadata,'legacy_reference':'old-ref'}})
-        service._repository.upsert_scene_space(stored)
-        result=self.build(service).scene_spaces[0]
-        self.assertEqual(result.scene_space_id,SCENE);self.assertEqual(result.primary_label,'Reviewed office')
-        self.assertEqual(result.linked_anchor_ids,[ANCHOR]);self.assertEqual(result.observation_sample_ids,['old_sample'])
-        self.assertIn('rel_legacy_20260101T000000Z_deadbeef',result.graph_relation_ids)
-        self.assertIn('sum_legacy_20260101T000000Z_deadbeef',result.summary_node_ids)
-        self.assertEqual(result.metadata['legacy_reference'],'old-ref')
     def test_session_change_keeps_owned_identity_and_reviewed_semantics(self):
         service=self.fixture();first=self.build(service).scene_spaces[0]
         source=service._repository.load_scene_space(first.scene_space_id).model_copy(update={
@@ -92,11 +81,6 @@ class SceneIdentityServiceChecks(unittest.TestCase):
         self.assertEqual(second.primary_label,'Reviewed room')
         self.assertEqual(second.localization_session_id,'new-session')
 
-    def test_unbound_legacy_data_is_preserved_and_diagnosed(self):
-        service=self.fixture();helper=registry.SceneIdentityRegistryChecks();helper.save_scene(service,source='r',scope=False)
-        result=self.build(service).scene_spaces[0]
-        self.assertNotEqual(result.scene_space_id,SCENE);self.assertIsNotNone(service._repository.load_scene_space(SCENE))
-        self.assertTrue(any(item['status']=='unbound' for item in service._scene_identity_diagnostics['map']))
     def test_concurrent_canonical_winner_remaps_once_without_geometry_repeat(self):
         with tempfile.TemporaryDirectory() as tmp:
             path=str(Path(tmp)/'source.db');first=self.fixture(path=path);second=self.fixture(path=path)

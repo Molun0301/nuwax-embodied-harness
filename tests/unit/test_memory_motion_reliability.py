@@ -121,14 +121,12 @@ def test_legacy_dynamic_reason_is_not_restored_by_fallback_pose_preservation():
     assert 'local_retry_policy' not in obj.metadata
 
 
-def test_map_revision_conflicts_are_excluded_but_session_restart_and_legacy_are_compatible():
+def test_map_revision_conflicts_are_excluded_but_session_restart_is_compatible():
     service = InstanceAssociationService(text_embedder=None)
     now = utc_now()
     first = service._build_observation_window([], observation(), now=now, map_name='house', localization_session_id='a')
     second = service._build_observation_window(first, observation(), now=now+timedelta(seconds=1), map_name='house', localization_session_id='b')
     assert service._dynamic_window_metrics(second)['observation_count'] == 2
-    legacy = [item.model_copy(update={'metadata':{'projection_method':'support_points_map'}}) for item in first]
-    assert service._dynamic_window_metrics(legacy + second[-1:])['observation_count'] == 2
     other_frame = replace(observation(20), pose=Pose(frame_id='odom', position=Vector3(x=20)))
     third = service._build_observation_window(second, other_frame, now=now+timedelta(seconds=2), map_name='house', localization_session_id='b')
     metrics = service._dynamic_window_metrics(third)
@@ -141,22 +139,3 @@ def test_map_revision_conflicts_are_excluded_but_session_restart_and_legacy_are_
     # 最新快帧未携带地图代际时，也不能把两个已知不同代际混算。
     epochs = service._build_observation_window(epochs, observation(30, fallback=True), now=now+timedelta(seconds=2), map_name='house')
     assert service._dynamic_window_metrics(epochs)['observation_count'] == 1
-
-
-def test_legacy_dynamic_cleanup_respects_geometry_and_foreign_retry_constraints():
-    service = InstanceAssociationService(text_embedder=None)
-    metadata = {'projection_method':'current_pose_fallback', 'observation_only':True,
-                'navigable':False, 'non_navigable_reason':'dynamic_entity',
-                'navigation_exclusion_scope':'restricted_zone', 'local_retry_policy':'manual_review'}
-    clean = service._apply_dynamic_navigation_policy(metadata, InstanceDynamicState.STATIC)
-    assert clean['navigable'] is False
-    assert clean['non_navigable_reason'] == 'current_pose_fallback_no_geometry'
-    assert clean['navigation_exclusion_scope'] == 'restricted_zone'
-    assert clean['local_retry_policy'] == 'manual_review'
-
-
-def test_unmarked_legacy_samples_are_not_new_3d_motion_evidence():
-    seq = Sequence()
-    obj = seq.add(observation())
-    unknown = obj.observation_window[0].model_copy(update={'metadata':{}})
-    assert seq.service._dynamic_window_metrics([unknown])['observation_count'] == 0

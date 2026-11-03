@@ -524,7 +524,7 @@ class InstanceAssociationService:
                 peers={}
                 for other in observed_ids-{instance_id}:
                     proof=cooccurrence_sources(instances[instance_id],instances[other],self._association_config)
-                    if proof["sources"] or proof["legacy"] or proof["known"]:
+                    if proof["sources"] or proof["known"]:
                         peers[other]=proof["sources"]
                 if peers:
                     instances[instance_id]=remember_coobserved_instances(instances[instance_id],peers)
@@ -1515,12 +1515,11 @@ class InstanceAssociationService:
                 key: next((item.metadata[key] for item in reversed(observation_window) if item.metadata.get(key) is not None), None)
                 for key in ("map_name", "map_source_epoch")
             }
-            # 依实例归属兼容旧样本；只拒绝已知地图/地图代际冲突，不把定位重启当地图变化。
+            # 地图与代际相同的现行样本参与位移计算。
             reliable = [item for item in reliable if (
                 frame_ids_semantically_equal(item.pose.frame_id, reference.pose.frame_id)
                 and all(
-                    item.metadata.get(key) is None or scope[key] is None
-                    or item.metadata[key] == scope[key]
+                    item.metadata[key] == scope[key]
                     for key in ("map_name", "map_source_epoch")
                 )
             )]
@@ -1553,11 +1552,7 @@ class InstanceAssociationService:
             return False
         if not all(math.isfinite(v) for v in (sample.pose.position.x, sample.pose.position.y, sample.pose.position.z)):
             return False
-        if "projection_reliable" in metadata:
-            return bool(metadata.get("projection_reliable"))
-        # 兼容旧样本(无该标记)：按 projection_method 推断。
-        method = str(metadata.get("projection_method") or "")
-        return bool(method) and method != "current_pose_fallback"
+        return bool(metadata["projection_reliable"])
 
     def _clear_dynamic_navigation_policy(self, metadata: Dict[str, object]) -> Dict[str, object]:
         """只撤销运动分类拥有的拒绝，恢复其叠加前的导航约束。"""
@@ -1574,11 +1569,6 @@ class InstanceAssociationService:
                 for key in ("navigable", "non_navigable_reason", "navigation_exclusion_scope", "local_retry_policy"):
                     if key in previous and key not in updated:
                         updated[key] = previous[key]
-            # 兼容没有保存叠加前条件的旧记录；回退位置仍不是可导航物体坐标。
-            if updated.get("observation_only") is True or updated.get("projection_method") == "current_pose_fallback":
-                updated["navigable"] = False
-                if not updated.get("non_navigable_reason"):
-                    updated["non_navigable_reason"] = "current_pose_fallback_no_geometry"
         return updated
 
     def _apply_dynamic_navigation_policy(

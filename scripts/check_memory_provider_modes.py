@@ -182,7 +182,7 @@ class ProviderModeChecks(unittest.TestCase):
             self.assertEqual(second._durable_index.outbox.snapshot()['accepted'], before)
             self.assertEqual(second._vector_store.count_points(), 0)
 
-    def test_old_vectors_are_inert_then_archived_when_real_provider_indexes(self):
+    def test_incompatible_vectors_are_replaced_when_real_provider_indexes(self):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / 'memory.db')
             first = self.fixture('hashing-v1', path=path)
@@ -204,10 +204,6 @@ class ProviderModeChecks(unittest.TestCase):
             point = second._vector_store.get_point(record.memory_id)
             self.assertEqual(point.vectors['text_dense'].model_name, real.model_name)
             np.testing.assert_array_equal(point.vectors['text_dense'].vector, real.embed_text('desk'))
-            with second._repository.storage.read_snapshot() as tx:
-                archive = tx.execute("SELECT model_name,vector_payload FROM memory_index_legacy_archive WHERE point_id=? AND vector_name='text_dense'", (record.memory_id,)).fetchone()
-                self.assertEqual(archive['model_name'], 'hashing-v1')
-                np.testing.assert_array_equal(np.frombuffer(archive['vector_payload'], dtype=np.float32), old)
 
     def test_recovered_provider_schedules_one_bounded_new_requirement(self):
         with tempfile.TemporaryDirectory() as directory:

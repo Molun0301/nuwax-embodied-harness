@@ -452,72 +452,22 @@ class StorageChecks(unittest.TestCase):
         self.assertEqual(store.get_point("point").payload["title"], "old")
         self.assertAlmostEqual(query(store)[0].score, 1.0)
 
-    def test_repository_backfill_is_nested_and_preserves_concurrent_payload(self):
-        owner, repo, _ = self.fixture()
-        entry = records()[1][3]
-        repo.upsert_semantic_memory(entry)
-        with owner.transaction() as tx:
-            tx.execute("UPDATE semantic_memories SET library_name=NULL")
-        with self.assertRaises(ValueError), owner.transaction():
-            self.assertEqual(repo.backfill_library_names(batch_size=1), {"semantic_memories": 1})
-            self.assertEqual(len(repo.load_semantic_memories(library_name="library")), 1)
-            raise ValueError("rollback")
-        with owner.read_snapshot() as tx:
-            rows = tx.execute("SELECT memory_id AS pk, payload_json FROM semantic_memories").fetchall()
-            self.assertIsNone(tx.execute("SELECT library_name FROM semantic_memories").fetchone()[0])
-        prepared = repo._prepare_library_name_backfill(rows)
-        changed = entry.model_copy(update={"metadata": {"memory_library_name": "new_library"}}).model_dump_json()
-        with owner.transaction() as tx:
-            tx.execute("UPDATE semantic_memories SET payload_json=?", (changed,))
-            self.assertEqual(repo._backfill_library_names_batch_tx(tx, "semantic_memories", "memory_id", prepared), 0)
-        self.assertEqual(repo.backfill_library_names(batch_size=1), {"semantic_memories": 1})
-        self.assertEqual(len(repo.load_semantic_memories(library_name="new_library")), 1)
-        self.assertEqual(repo.backfill_library_names(batch_size=1), {})
 
-    def test_legacy_json_vectors_map_migration_and_reopen(self):
-        owner, _, store = self.fixture(file=True)
-        put(store, payload={"map_name": "already", "title": "canonical"})
-        canonical = '{"map_name":"already","title":"canonical"}'
-        legacy = json.dumps({"metadata": {"memory_library_name": " office "}, "map_version_id": "deprecated"})
-        with owner.transaction() as tx:
-            tx.execute("UPDATE memory_vector_points SET payload_json=? WHERE point_id='point'", (canonical,))
-            tx.execute("UPDATE memory_named_vectors SET vector_payload='[1.0, 0.0]', cache_token=NULL")
-            tx.execute("INSERT INTO memory_vector_points(point_id,record_kind,payload_json,updated_at) VALUES(?,?,?,?)",
-                       ("legacy", "semantic_memory", legacy, STAMP))
-            tx.execute("INSERT INTO memory_named_vectors(point_id,vector_name,model_name,dimension,vector_payload,updated_at)"
-                       " VALUES(?,?,?,?,?,?)", ("legacy", "text_dense", "fake2", 2, "[1, 0]", STAMP))
-        reopened = SQLiteNamedVectorStore(owner.db_path)
-        self.addCleanup(reopened.close)
-        self.assertEqual(reopened.get_point("legacy").payload["map_name"], "office")
-        self.assertNotIn("map_version_id", reopened.get_point("legacy").payload)
-        self.assertEqual([hit.point.point_id for hit in query(reopened, payload_filter=MemoryPayloadFilter(map_name="office"))],
-                         ["legacy"])
-        with owner.read_snapshot() as tx:
-            self.assertEqual(tx.execute("SELECT payload_json FROM memory_vector_points WHERE point_id='point'").fetchone()[0],
-                             canonical)
-            rows = tx.execute("SELECT vector_payload, cache_token, typeof(vector_payload) FROM memory_named_vectors"
-                              " ORDER BY point_id").fetchall()
-        self.assertEqual([tuple(row) for row in rows], [("[1, 0]", None, "text"), ("[1.0, 0.0]", None, "text")])
-        self.assertEqual(len(reopened.load_points()), 2)
-        self.assertEqual(len(reopened.get_points_batch(["legacy", "point"])), 2)
 
-    def test_schema_migrations_and_optional_blob_migration_never_commit_outer_scope(self):
+    def test_schema_initialization_never_commits_outer_scope(self):
         owner, repo, store = self.fixture()
         put(store)
-        with owner.transaction() as tx:
-            tx.execute("UPDATE memory_named_vectors SET vector_payload='[1,0]', cache_token=NULL")
         with self.assertRaises(ValueError):  # noqa: SIM117 - 显式保留被测试的外层事务边界
             with owner.transaction():
                 repo.upsert_memory_library("provisional")
                 repo._init_schema()
                 store._init_schema()
-                store._migrate_vector_payload_to_blob()
                 with owner.read_snapshot() as tx:
                     self.assertEqual(tx.execute("SELECT typeof(vector_payload) FROM memory_named_vectors").fetchone()[0], "blob")
                 raise ValueError("rollback")
         self.assertEqual(repo.load_memory_libraries(), [])
         with owner.read_snapshot() as tx:
-            self.assertEqual(tx.execute("SELECT typeof(vector_payload) FROM memory_named_vectors").fetchone()[0], "text")
+            self.assertEqual(tx.execute("SELECT typeof(vector_payload) FROM memory_named_vectors").fetchone()[0], "blob")
 
     def test_payload_filter_excludes_malformed_legacy_vector_before_decoding(self):
         owner, _, store = self.fixture()
@@ -560,69 +510,14 @@ class StorageChecks(unittest.TestCase):
             self.assertEqual(point.payload["title"], "old")
             np.testing.assert_array_equal(point.vectors["text_dense"].vector, [1, 0])
 
-    def test_old_schema_adds_columns_without_reencoding_vectors_or_source_payload(self):
-        temporary = tempfile.TemporaryDirectory(prefix="neh-legacy-")
-        self.addCleanup(temporary.cleanup)
-        path = str(Path(temporary.name) / "old.db")
-        entry = records()[1][3].model_copy(update={"map_name": None})
-        source_payload = entry.model_dump_json()
-        point_payload = json.dumps({"metadata": {"memory_library_name": "library"}})
-        with sqlite3.connect(path) as connection:
-            connection.executescript("""
-                CREATE TABLE semantic_memories(memory_id TEXT PRIMARY KEY, kind TEXT, title TEXT,
-                    linked_location_id TEXT, payload_json TEXT NOT NULL, created_at TEXT, updated_at TEXT);
-                CREATE TABLE memory_vector_points(point_id TEXT PRIMARY KEY, record_kind TEXT,
-                    payload_json TEXT NOT NULL, updated_at TEXT);
-                CREATE TABLE memory_named_vectors(point_id TEXT, vector_name TEXT, model_name TEXT,
-                    dimension INTEGER, vector_payload TEXT, updated_at TEXT, PRIMARY KEY(point_id,vector_name));
-                CREATE TRIGGER forbid_vector_migration BEFORE UPDATE OF vector_payload ON memory_named_vectors
-                    BEGIN SELECT RAISE(ABORT, 'legacy vectors must not be rewritten on open'); END;
-            """)
-            connection.execute("INSERT INTO semantic_memories VALUES(?,?,?,?,?,?,?)",
-                               (entry.memory_id, "scene", "Desk", None, source_payload, STAMP, STAMP))
-            connection.execute("INSERT INTO memory_vector_points VALUES(?,?,?,?)",
-                               ("legacy", "semantic_memory", point_payload, STAMP))
-            connection.execute("INSERT INTO memory_named_vectors VALUES(?,?,?,?,?,?)",
-                               ("legacy", "text_dense", "fake2", 2, "[1, 0]", STAMP))
-        repo = MemoryRepository(path)
-        store = SQLiteNamedVectorStore(storage=repo.storage)
-        self.addCleanup(repo.close)
-        self.addCleanup(store.close)
-        self.assertEqual(repo.load_semantic_memories(library_name="library")[0].map_name, "library")
-        self.assertAlmostEqual(query(store, payload_filter=MemoryPayloadFilter(map_name="library"))[0].score, 1.0)
-        with repo.storage.read_snapshot() as tx:
-            self.assertEqual(tx.execute("SELECT payload_json FROM semantic_memories").fetchone()[0], source_payload)
-            self.assertEqual(tuple(tx.execute("SELECT vector_payload, cache_token FROM memory_named_vectors").fetchone()),
-                             ("[1, 0]", None))
 
-    def test_map_migration_pages_and_preserves_explicit_and_legacy_default_names(self):
-        owner, _, store = self.fixture()
-        rows = [(str(i), "semantic_memory", json.dumps({"metadata": {"memory_library_name": "library"}}), STAMP)
-                for i in range(1003)]
-        rows.extend([
-            ("explicit", "semantic_memory", '{"map_name":"explicit","memory_library_name":"other"}', STAMP),
-            ("default", "semantic_memory", '{"metadata":{"memory_library_name":"legacy_default"}}', STAMP),
-        ])
-        with owner.transaction() as tx:
-            tx.executemany("INSERT INTO memory_vector_points(point_id,record_kind,payload_json,updated_at) VALUES(?,?,?,?)",
-                           rows)
-        store._migrate_point_map_names()
-        with owner.read_snapshot() as tx:
-            self.assertEqual(tx.execute("SELECT COUNT(*) FROM memory_vector_points WHERE map_name='library'").fetchone()[0],
-                             1003)
-        self.assertEqual(store.get_point("explicit").payload["map_name"], "explicit")
-        self.assertIsNone(store.get_point("default").payload["map_name"])
-        with owner.transaction() as tx:
-            tx.execute("CREATE TRIGGER forbid_point_rewrite BEFORE UPDATE ON memory_vector_points"
-                       " BEGIN SELECT RAISE(ABORT, 'normalized payload must not be rewritten'); END")
-        store._migrate_point_map_names()
 
     def test_legacy_writer_retaining_new_token_cannot_select_stale_cache(self):
         owner, _, store = self.fixture()
         put(store)
         query(store)
         old_token = store._cached_vectors["point"]["text_dense"][0]
-        for payload in (np.array([0, 1], dtype=np.float32).tobytes(), "[0, 1]"):
+        for payload in (np.array([0, 1], dtype=np.float32).tobytes(),):
             with owner.transaction() as tx:
                 tx.execute("UPDATE memory_named_vectors SET vector_payload=?", (payload,))
             self.assertAlmostEqual(query(store)[0].score, 0.0)

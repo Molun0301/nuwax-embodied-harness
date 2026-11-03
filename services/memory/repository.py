@@ -154,10 +154,10 @@ class MemoryRepository:
         extra = f", {column} AS index_record_id" if column and self._index is not None else ""
         if table_name in ("semantic_instances", "scene_spaces"):
             extra += ",graph_source_revision"
-        query = f"SELECT payload_json, map_name, library_name{extra} FROM {table_name}"
+        query = f"SELECT payload_json, map_name, library_name{extra} FROM {table_name} WHERE library_name IS NOT NULL AND TRIM(library_name) != ''"
         params = ()
         if library_name is not None:
-            query += " WHERE library_name = ?"
+            query += " AND library_name = ?"
             params = (str(library_name).strip(),)
         query += f" ORDER BY {order_by}"
         with self._read_snapshot() as transaction:
@@ -222,7 +222,7 @@ class MemoryRepository:
                 """
                 SELECT payload_json, map_name, library_name, graph_source_revision, scene_space_id AS index_record_id
                 FROM scene_spaces
-                WHERE scene_space_id = ?
+                WHERE scene_space_id = ? AND library_name IS NOT NULL AND TRIM(library_name) != ''
                 """,
                 (resolved_id,),
             ).fetchone()
@@ -240,7 +240,7 @@ class MemoryRepository:
         localization_session_id: Optional[str] = None,
         review_statuses: Optional[Sequence[object]] = None,
     ):
-        where_clauses: List[str] = []
+        where_clauses: List[str] = ["library_name IS NOT NULL AND TRIM(library_name) != ''"]
         params: List[object] = []
         if library_name is not None:
             where_clauses.append("library_name = ?")
@@ -1286,7 +1286,7 @@ class MemoryRepository:
             metadata = payload.get("metadata")
             if not library_name and isinstance(metadata, dict):
                 library_name = str(metadata.get("memory_library_name") or "").strip()
-            if library_name and library_name != "legacy_default":
+            if library_name:
                 resolved_map_name = library_name
         payload["map_name"] = resolved_map_name or None
         record = model_type.model_validate(payload)
@@ -1435,7 +1435,7 @@ class MemoryRepository:
 
     # —— speed-up-list-maps-summary ——
     # 8 张记忆表与 library_name 列 / 索引的常量映射；供 _ensure_library_name_columns /
-    # _ensure_library_name_indexes / count_records_by_library / backfill_library_names 共用。
+    # _ensure_library_name_indexes / count_records_by_library 共用。
     _LIBRARY_NAME_TABLES: Sequence[str] = (
         "tagged_locations",
         "semantic_memories",
@@ -1459,37 +1459,10 @@ class MemoryRepository:
             for table_name in self._LIBRARY_NAME_TABLES:
                 self._ensure_columns(table_name, {"map_name": "TEXT"})
 
-    def _backfill_map_names_from_library_names(self) -> None:
-        with self._transaction() as transaction:
-            for table_name in self._LIBRARY_NAME_TABLES:
-                transaction.execute(
-                    f"""
-                    UPDATE {table_name}
-                    SET map_name = TRIM(library_name)
-                    WHERE (map_name IS NULL OR TRIM(map_name) = '')
-                      AND library_name IS NOT NULL
-                      AND TRIM(library_name) != ''
-                      AND TRIM(library_name) != 'legacy_default'
-                    """
-                )
 
     @staticmethod
     def _resolve_record_library_name(record: object) -> str:
-        """从 record.metadata 提取 MEMORY_LIBRARY_METADATA_KEY；缺失则 LEGACY_DEFAULT。
-
-        与 services/memory/service.py::_record_library_name 行为保持一致：
-        - metadata[MEMORY_LIBRARY_METADATA_KEY] 非空字符串 → 用之；
-        - 否则返回 LEGACY_DEFAULT（"legacy_default"），与旧全量实现兜底语义一致。
-        """
-
-        MEMORY_LIBRARY_METADATA_KEY = "memory_library_name"
-        LEGACY_DEFAULT = "legacy_default"
-        metadata = getattr(record, "metadata", None)
-        if isinstance(metadata, dict):
-            value = metadata.get(MEMORY_LIBRARY_METADATA_KEY)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        return LEGACY_DEFAULT
+        return record.metadata["memory_library_name"].strip()
 
     def _ensure_library_name_indexes(self) -> None:
         """为每张记忆表的 library_name 列加索引（按库聚合 O(logN)）。"""
@@ -1526,16 +1499,14 @@ class MemoryRepository:
             for table_name, record_kind in table_to_kind:
                 rows = transaction.execute(
                     f"""
-                    SELECT COALESCE(library_name, '') AS library_name, COUNT(*) AS cnt
+                    SELECT library_name, COUNT(*) AS cnt
                     FROM {table_name}
+                    WHERE library_name IS NOT NULL AND TRIM(library_name) != ''
                     GROUP BY library_name
                     """
                 ).fetchall()
                 for row in rows:
                     name = str(row["library_name"] or "").strip()
-                    if not name:
-                        # 列虽存在但未回填；按 legacy_default 计入以与旧全量实现语义一致。
-                        name = "legacy_default"
                     bucket = result.setdefault(name, {})
                     bucket[record_kind] = int(row["cnt"])
         return result
@@ -1560,13 +1531,14 @@ class MemoryRepository:
             for table_name, updated_col in table_to_updated:
                 rows = transaction.execute(
                     f"""
-                    SELECT COALESCE(library_name, '') AS library_name, MAX({updated_col}) AS last_ts
+                    SELECT library_name, MAX({updated_col}) AS last_ts
                     FROM {table_name}
+                    WHERE library_name IS NOT NULL AND TRIM(library_name) != ''
                     GROUP BY library_name
                     """
                 ).fetchall()
                 for row in rows:
-                    name = str(row["library_name"] or "").strip() or "legacy_default"
+                    name = str(row["library_name"]).strip()
                     last_ts = str(row["last_ts"] or "") if row["last_ts"] is not None else ""
                     if not last_ts:
                         continue
@@ -1575,80 +1547,6 @@ class MemoryRepository:
                         merged[name] = last_ts
         return merged
 
-    def backfill_library_names(self, *, batch_size: int = 500) -> Dict[str, int]:
-        """Resume NULL library-name migration in independently committed batches.
-
-        When called inside an owner transaction (including schema setup), every
-        batch instead nests a savepoint and remains provisional until its caller
-        commits. Standalone decoding runs outside the writer lock; guarded SQL
-        leaves a concurrently changed payload/ownership for a later batch.
-        """
-        self._check_open()
-        table_to_pk = (
-            ("tagged_locations", "location_id"),
-            ("semantic_memories", "memory_id"),
-            ("semantic_instances", "instance_id"),
-            ("observation_events", "event_id"),
-            ("scene_spaces", "scene_space_id"),
-            ("navigation_trajectory_events", "trajectory_event_id"),
-            ("semantic_graph_relations", "relation_id"),
-            ("semantic_summary_nodes", "summary_id"),
-        )
-        updated_totals: Dict[str, int] = {}
-        for table_name, pk_col in table_to_pk:
-            updated = 0
-            while True:
-                with self._read_snapshot() as transaction:
-                    rows = transaction.execute(
-                        f"""
-                        SELECT {pk_col} AS pk, payload_json AS payload_json
-                        FROM {table_name}
-                        WHERE library_name IS NULL
-                        LIMIT ?
-                        """,
-                        (batch_size,),
-                    ).fetchall()
-                if not rows:
-                    break
-                updates = self._prepare_library_name_backfill(rows)
-                with self._transaction() as transaction:
-                    updated += self._backfill_library_names_batch_tx(transaction, table_name, pk_col, updates)
-            if updated:
-                updated_totals[table_name] = updated
-        return updated_totals
-
-    @staticmethod
-    def _prepare_library_name_backfill(rows: Sequence[sqlite3.Row]) -> List[tuple]:
-        updates: List[tuple] = []
-        for row in rows:
-            payload_str = str(row["payload_json"] or "")
-            library_name = "legacy_default"
-            if payload_str:
-                try:
-                    payload = json.loads(payload_str)
-                    metadata = payload.get("metadata") if isinstance(payload, dict) else None
-                    value = metadata.get("memory_library_name") if isinstance(metadata, dict) else None
-                    if isinstance(value, str) and value.strip():
-                        library_name = value.strip()
-                except (ValueError, TypeError):
-                    # Preserve the legacy fallback for damaged payloads.
-                    library_name = "legacy_default"
-            updates.append((library_name, str(row["pk"]), row["payload_json"]))
-        return updates
-
-    @staticmethod
-    def _backfill_library_names_batch_tx(
-        transaction: SQLiteTransaction,
-        table_name: str,
-        pk_col: str,
-        updates: Sequence[tuple],
-    ) -> int:
-        """Apply one prepared batch without controlling the caller's boundary."""
-        cursor = transaction.executemany(
-            f"UPDATE {table_name} SET library_name = ? WHERE {pk_col} = ? AND library_name IS NULL AND payload_json IS ?",
-            updates,
-        )
-        return int(cursor.rowcount or 0)
 
     def _init_schema(self) -> None:
         with self._transaction() as transaction:
@@ -1952,22 +1850,22 @@ class MemoryRepository:
                             f"json_extract({row}.payload_json,'$.metadata.scene_mapping_managed')=1 "
                             f"AND {row}.review_status NOT IN ('stale','rejected') THEN 1 ELSE 0 END ELSE 0 END")
                 geometry = eligible("OLD") if table == "scene_spaces" else "0"
-                changed = (f"CASE WHEN COALESCE(OLD.library_name,'legacy_default') != COALESCE(NEW.library_name,'legacy_default') "
+                changed = (f"CASE WHEN OLD.library_name != NEW.library_name "
                            f"THEN {eligible('NEW')} WHEN ({eligible('OLD')}) != ({eligible('NEW')}) THEN 1 "
                            f"WHEN ({eligible('NEW')})=1 AND OLD.graph_geometry_revision != NEW.graph_geometry_revision THEN 1 ELSE 0 END") if table == "scene_spaces" else "0"
                 for operation, row, amount in (("insert", "NEW", geometry.replace("OLD.", "NEW.")), ("delete", "OLD", geometry)):
                     transaction.execute(f"""CREATE TRIGGER IF NOT EXISTS scene_graph_{table}_{operation}
                         AFTER {operation.upper()} ON {table} BEGIN
-                        INSERT INTO memory_scene_graph_inputs VALUES(COALESCE({row}.library_name,'legacy_default'),1,{amount},{memory_change})
+                        INSERT INTO memory_scene_graph_inputs VALUES({row}.library_name,1,{amount},{memory_change})
                         ON CONFLICT(library_name) DO UPDATE SET source_generation=source_generation+1,
                             geometry_generation=geometry_generation+{amount},memory_generation=memory_generation+{memory_change}; END""")
                 transaction.execute(f"""CREATE TRIGGER IF NOT EXISTS scene_graph_{table}_update
                     AFTER UPDATE ON {table} BEGIN
-                    INSERT INTO memory_scene_graph_inputs VALUES(COALESCE(NEW.library_name,'legacy_default'),1,{changed},{memory_change})
+                    INSERT INTO memory_scene_graph_inputs VALUES(NEW.library_name,1,{changed},{memory_change})
                     ON CONFLICT(library_name) DO UPDATE SET source_generation=source_generation+1,
                         geometry_generation=geometry_generation+{changed},memory_generation=memory_generation+{memory_change};
-                    INSERT INTO memory_scene_graph_inputs SELECT COALESCE(OLD.library_name,'legacy_default'),1,{geometry},{memory_change}
-                        WHERE COALESCE(OLD.library_name,'legacy_default') != COALESCE(NEW.library_name,'legacy_default')
+                    INSERT INTO memory_scene_graph_inputs SELECT OLD.library_name,1,{geometry},{memory_change}
+                        WHERE OLD.library_name != NEW.library_name
                     ON CONFLICT(library_name) DO UPDATE SET source_generation=source_generation+1,
                         geometry_generation=geometry_generation+{geometry},memory_generation=memory_generation+{memory_change}; END""")
             for table in ("navigation_trajectory_events", "semantic_graph_relations", "semantic_summary_nodes"):
@@ -1980,8 +1878,6 @@ class MemoryRepository:
             transaction.execute("CREATE INDEX IF NOT EXISTS idx_semantic_graph_relations_natural ON semantic_graph_relations(library_name,relation_kind,source_node_kind,source_node_id,target_node_kind,target_node_id)")
             transaction.execute("CREATE INDEX IF NOT EXISTS idx_semantic_summary_nodes_natural ON semantic_summary_nodes(library_name,summary_kind,COALESCE(label,''),COALESCE(scene_space_id,''),COALESCE(semantic_region_id,''))")
             self._ensure_map_name_columns()
-            self.backfill_library_names()
-            self._backfill_map_names_from_library_names()
             self._ensure_library_name_indexes()
             for table_name in self._LIBRARY_NAME_TABLES:
                 transaction.execute(

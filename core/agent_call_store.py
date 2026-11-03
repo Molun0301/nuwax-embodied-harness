@@ -35,8 +35,7 @@ _SCHEMA = """
                 CREATE INDEX IF NOT EXISTS agent_scope_bindings_owner ON agent_scope_bindings(owner_scope);
                 CREATE TABLE IF NOT EXISTS agent_terminal_layout (
                     singleton INTEGER PRIMARY KEY CHECK(singleton=1), ledger_id TEXT NOT NULL,
-                    origin TEXT NOT NULL, layout_state TEXT NOT NULL,
-                    terminal_path TEXT NOT NULL, pair_id TEXT, import_version INTEGER NOT NULL DEFAULT 0
+                    layout_state TEXT NOT NULL, terminal_path TEXT NOT NULL, pair_id TEXT
                 );
 """
 
@@ -71,29 +70,16 @@ class AgentCallStore:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                if tables and not tables.intersection({'agent_calls', 'agent_task_terminals', 'agent_terminal_layout'}):
+                if tables and not tables.intersection({'agent_calls', 'agent_terminal_layout'}):
                     raise pair_conflict()
                 for statement in _SCHEMA.split(";"):
                     if statement.strip():
                         connection.execute(statement)
-                if 'agent_task_terminals' in tables:
-                    columns = {row["name"] for row in connection.execute("PRAGMA table_info(agent_task_terminals)")}
-                    for name, sql_type in (("receipt_source_id", "TEXT"), ("receipt_revision", "INTEGER")):
-                        if name not in columns:
-                            connection.execute(f"ALTER TABLE agent_task_terminals ADD COLUMN {name} {sql_type}")
-                columns = {row["name"] for row in connection.execute("PRAGMA table_info(agent_terminal_layout)")}
-                if "import_version" not in columns:
-                    connection.execute("ALTER TABLE agent_terminal_layout ADD COLUMN import_version INTEGER NOT NULL DEFAULT 0")
-                layout = connection.execute("SELECT * FROM agent_terminal_layout WHERE singleton=1").fetchone()
+                layout = connection.execute("SELECT ledger_id FROM agent_terminal_layout WHERE singleton=1").fetchone()
                 if layout is None:
                     connection.execute("INSERT INTO agent_terminal_layout "
-                        "(singleton,ledger_id,origin,layout_state,terminal_path,pair_id) VALUES (1,?,?,?,?,?)",
-                        (uuid4().hex, "legacy" if tables else "fresh", "split",
-                         str(self.path.with_name(self.path.stem + ".terminals.sqlite3")), uuid4().hex))
-                elif layout["layout_state"] == "combined" and Path(layout["terminal_path"]).resolve() == self.path:
-                    # 旧布局只在本次向前导入边界解释，运行期没有合库后端。
-                    connection.execute("UPDATE agent_terminal_layout SET terminal_path=?,pair_id=? WHERE singleton=1",
-                        (str(self.path.with_name(self.path.stem + ".terminals.sqlite3")), uuid4().hex))
+                        "(singleton,ledger_id,layout_state,terminal_path,pair_id) VALUES (1,?,?,?,?)",
+                        (uuid4().hex, "pending", str(self.path.with_name(self.path.stem + ".terminals.sqlite3")), uuid4().hex))
                 self.scope = self._resolve_owner(connection, scope_identity)
                 connection.commit()
             except BaseException:
@@ -103,28 +89,22 @@ class AgentCallStore:
         self._prepare_terminal_storage()
 
     def _prepare_terminal_storage(self):
-        """在接收动作前完成一次导入；目标提交后才记录完成，重启可原样重试。"""
+        """在接收动作前完成分库配对，目标提交后记录初始化完成。"""
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                layout = dict(connection.execute("SELECT * FROM agent_terminal_layout WHERE singleton=1").fetchone())
+                layout = dict(connection.execute("SELECT ledger_id,layout_state,terminal_path,pair_id FROM agent_terminal_layout WHERE singleton=1").fetchone())
                 target = Path(layout["terminal_path"]).resolve()
                 if (target == self.path or (target.exists() and os.path.samefile(target, self.path))
-                        or not layout["pair_id"] or layout["layout_state"] not in {'split', 'combined', 'pending', 'active'}
-                        or layout["import_version"] not in (0, 1)):
+                        or not layout["pair_id"] or layout["layout_state"] not in {'split', 'pending'}):
                     raise pair_conflict()
                 self._terminal_store = AgentTerminalStore(self, layout)
-                if layout["import_version"] == 1 or layout["layout_state"] == "active":
-                    # 已服务的分库丢失必须报错，不能用旧表造一个空替代库。
+                if layout["layout_state"] == "split":
                     with self._terminal_store._connection() as target_connection:
                         target_connection.execute("SELECT task_id FROM agent_task_terminals LIMIT 0")
                 else:
                     initialize_terminal_file(target, layout["ledger_id"], layout["pair_id"])
-                if layout["import_version"] == 0:
-                    self._terminal_store.import_legacy_rows(connection)
-                    for operation in ("insert", "update", "delete"):
-                        connection.execute("DROP TRIGGER IF EXISTS agent_terminal_legacy_seal_" + operation)
-                    connection.execute("UPDATE agent_terminal_layout SET layout_state='split',import_version=1 WHERE singleton=1")
+                    connection.execute("UPDATE agent_terminal_layout SET layout_state='split' WHERE singleton=1")
                 connection.commit()
             except BaseException:
                 connection.rollback()
@@ -142,16 +122,15 @@ class AgentCallStore:
 
     @classmethod
     def terminal_storage_status(cls, path):
-        """只读配对及导入版本，不创建文件或执行迁移。"""
+        """只读分库配对状态。"""
         db = sqlite3.connect(Path(path).expanduser().resolve().as_uri() + "?mode=ro", uri=True,
                              timeout=5.0, isolation_level=None)
         db.row_factory = sqlite3.Row
         try:
-            row = db.execute("SELECT * FROM agent_terminal_layout WHERE singleton=1").fetchone()
+            row = db.execute("SELECT ledger_id,layout_state,terminal_path,pair_id FROM agent_terminal_layout WHERE singleton=1").fetchone()
             if row is None:
                 raise pair_conflict()
             result = dict(row)
-            result.pop("singleton", None)
             return result
         finally:
             db.close()
@@ -183,8 +162,6 @@ class AgentCallStore:
                                  (identity_json,)).fetchone()
         if row is not None:
             return row["scope_id"]
-        has_legacy_terminals = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE name='agent_task_terminals' AND type='table'").fetchone() is not None
         for _ in range(8):
             scope = "scope_" + uuid4().hex
             occupied = connection.execute(
@@ -192,8 +169,6 @@ class AgentCallStore:
                 "SELECT scope FROM agent_scope_bindings WHERE scope=? UNION ALL "
                 "SELECT scope FROM agent_calls WHERE scope=? LIMIT 1",
                 (scope, scope, scope)).fetchone()
-            if occupied is None and has_legacy_terminals:
-                occupied = connection.execute("SELECT scope FROM agent_task_terminals WHERE scope=? LIMIT 1", (scope,)).fetchone()
             if occupied is not None:
                 continue
             connection.execute("INSERT INTO agent_scope_owners(scope_id,identity_json) VALUES (?,?)",
@@ -318,7 +293,7 @@ class AgentCallStore:
 
     def prepare_terminal(self, task_id: str, snapshot: Dict[str, Any], *,
                       source_id: Optional[str] = None, revision: Optional[int] = None) -> PreparedTerminalReceipt:
-        """同一任务源按版本单调写入；较旧快照不覆盖，旧无版本行只读保留。"""
+        """同一任务源按版本单调写入，较旧快照不覆盖。"""
         if (not isinstance(source_id, str) or not source_id or len(source_id) > 128
                 or not isinstance(revision, int) or isinstance(revision, bool) or revision < 1):
             raise GatewayError("任务回执缺少有效的源身份与版本；不得重放动作补写。",
@@ -357,9 +332,6 @@ class AgentCallStore:
                 "VALUES (?,?,?,?,?,?,?)", (task_id, self.scope, self.gateway_instance_id, encoded, now, source_id, revision))
             disposition, stored_revision = "inserted", revision
         else:
-            if row["receipt_source_id"] is None or row["receipt_revision"] is None:
-                raise GatewayError("已有旧版历史回执没有可验证的源版本，仅允许读取，不能自动认领或改写。",
-                                   error_code="agent_terminal_legacy_conflict", http_status=409)
             if row["receipt_source_id"] != source_id:
                 raise GatewayError("任务回执属于另一任务管理器源，不能重新标记历史拥有方。",
                                    error_code="agent_terminal_source_conflict", http_status=409)

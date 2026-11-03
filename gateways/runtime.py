@@ -6974,12 +6974,12 @@ class GatewayRuntime:
                 goal = NavigationGoal(
                     goal_id=self._build_runtime_request_id("nav_memory_query"),
                     map_name=map_name,
-                    target_pose=navigation_candidate.target_pose,
+                    target_pose=navigation_candidate.inspection_pose,
                     target_name=navigation_candidate.target_name,
                     metadata={
                         "resolved_from": "semantic_memory",
                         "record_id": navigation_candidate.record_id,
-                        "record_kind": navigation_candidate.record_kind.value,
+                        "record_kind": navigation_candidate.metadata["record_kind"],
                         "map_name": map_name,
                         "localization_session_id": current_localization_session_id,
                         "requested_by": requested_by or "unknown",
@@ -8801,11 +8801,9 @@ class GatewayRuntime:
         record_kind = ""
         target_name = query
         if navigation_candidate is not None:
-            cand_metadata = dict(getattr(navigation_candidate, "metadata", {}) or {})
-            candidate_id = str(cand_metadata.get("candidate_id") or "")
+            candidate_id = navigation_candidate.candidate_id
             record_id = str(getattr(navigation_candidate, "record_id", "") or "")
-            kind = getattr(navigation_candidate, "record_kind", None)
-            record_kind = kind.value if kind is not None else str(cand_metadata.get("record_kind") or "")
+            record_kind = navigation_candidate.metadata["record_kind"]
             target_name = str(getattr(navigation_candidate, "target_name", target_name) or target_name)
         if not candidate_id:
             candidate_id = str(verification_metadata.get("candidate_id") or "")
@@ -9440,8 +9438,8 @@ class GatewayRuntime:
             navigation_quality = {}
         else:
             navigation_quality = dict(navigation_quality)
-        target_pose = getattr(candidate, "target_pose", None)
-        record_kind_value = str(getattr(getattr(candidate, "record_kind", None), "value", "") or "")
+        target_pose = candidate.inspection_pose
+        record_kind_value = candidate.metadata["record_kind"]
         linked_object_instance_ids = self._coerce_optional_str_list(metadata.get("linked_object_instance_ids"))
         evidence_event_id = str(
             metadata.get("observation_event_id")
@@ -9543,9 +9541,9 @@ class GatewayRuntime:
             "camera_id": str(metadata.get("camera_id") or ""),
             "backend_type": str(metadata.get("backend_type") or metadata.get("backend") or "memory_service"),
             "backend": str(metadata.get("backend") or metadata.get("backend_type") or "memory_service"),
-            "source_collection": str(metadata.get("source_collection") or ""),
-            "candidate_id": str(metadata.get("candidate_id") or ""),
-            "anchor_id": str(metadata.get("anchor_id") or ""),
+            "source_collection": candidate.source_collection,
+            "candidate_id": candidate.candidate_id,
+            "anchor_id": candidate.anchor_id,
             "candidate_score": candidate_score,
             "has_target_evidence": has_detection_evidence,
             "target_evidence_source": target_evidence_source,
@@ -9738,12 +9736,12 @@ class GatewayRuntime:
         return NavigationGoal(
             goal_id=self._build_runtime_request_id("find_target_nav"),
             map_name=map_name,
-            target_pose=candidate.target_pose,
+            target_pose=candidate.inspection_pose,
             target_name=candidate.target_name,
             metadata={
                 "resolved_from": "memory_search",
                 "record_id": candidate.record_id,
-                "record_kind": candidate.record_kind.value,
+                "record_kind": candidate.metadata["record_kind"],
                 "query": query,
                 "localization_session_id": localization_session_id,
                 "requested_by": requested_by or "unknown",
@@ -10041,7 +10039,7 @@ class GatewayRuntime:
                 payload={
                     "query": query,
                     "candidate_record_id": candidate.record_id,
-                    "candidate_record_kind": candidate.record_kind.value,
+                    "candidate_record_kind": candidate.metadata["record_kind"],
                 },
             )
             goal = self._build_goal_from_navigation_candidate(

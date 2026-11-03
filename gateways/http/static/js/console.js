@@ -3269,7 +3269,7 @@
             item.record_id === inst.instance_id && item.map_name === requestedMap
             && item.metadata?.allowed_for_navigation === true && item.metadata?.resolution_decision === "navigate");
           if (!candidate) throw new Error("此物品当前没有可用导航候选，请补充观察或在地图中选择可达位置。");
-          const pose = candidate.target_pose;
+          const pose = candidate.inspection_pose;
           const point = pose?.position;
           if (!semanticFinitePose(point) || pose.frame_id !== navigationFrameId()) throw new Error("候选位置或坐标系无效。");
           if (requestedMap !== activeMapName() || requestedLibrary !== state.semanticMeta.library_name || state.semanticError) throw new Error("地图或记忆库已变化，请刷新后重试。");

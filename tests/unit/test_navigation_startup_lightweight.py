@@ -8,8 +8,15 @@ import shlex
 import shutil
 
 import pytest
+from tests.conftest import create_robot_profile
 
 ROOT=Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture(autouse=True)
+def isolated_startup_root(navigation_startup_root, monkeypatch):
+    monkeypatch.setattr(__name__ + ".ROOT", navigation_startup_root)
+
 
 
 def invoke(values):
@@ -125,7 +132,7 @@ def _isolated_launcher_root(tmp_path):
 def _terrain_startup(tmp_path, file_value=None):
     """在隔离仓库根运行真实导航启动器，以取值后退出的子进程核对环境和参数。"""
     root = _isolated_launcher_root(tmp_path)
-    settings = tmp_path / "settings.env"
+    settings = create_robot_profile(root)
     settings.write_text("" if file_value is None else f"{_TERRAIN_SOURCE}={file_value}\n")
     output = tmp_path / "导航子进程.json"
     binary = tmp_path / "nav-runtime"
@@ -146,11 +153,6 @@ def _terrain_startup(tmp_path, file_value=None):
         "NUWAX_NAV_PROFILE": "pct-scan-3d", "NUWAX_PYTHON_BIN": sys.executable,
         "NUWAX_NAV_STACK_BINARY": str(binary),
         "NUWAX_NAV_STACK_READY_FILE": str(tmp_path / "nav.ready"),
-        "NUWAX_BOOTSTRAP_ENV_FILE": str(settings), "NUWAX_USER_CONFIG_ENV_FILE": str(settings),
-        "GO2_DATA_PLANE_ENV_FILE": str(settings),
-        "NUWAX_GEOMETRY_WEB_CONFIG_ENV_FILE": str(settings),
-        "NUWAX_GATEWAY_WEB_CONFIG_ENV_FILE": str(settings),
-        "NUWAX_GEOMETRY_EXTRA_ENV_FILES": "",
     })
     return env, settings, output, root
 

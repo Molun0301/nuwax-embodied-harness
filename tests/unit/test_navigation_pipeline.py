@@ -6,6 +6,7 @@ import subprocess
 import sys
 
 import pytest
+from tests.conftest import create_robot_profile
 
 from contracts.navigation_pipeline import resolve_navigation_profile
 from core import config_io, config_registry
@@ -13,6 +14,12 @@ from core.config_values import read_env_values
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture(autouse=True)
+def isolated_startup_root(navigation_startup_root, monkeypatch):
+    monkeypatch.setattr(__name__ + ".ROOT", navigation_startup_root)
+
 
 
 @pytest.mark.parametrize("pipeline,profile", [("lio_3d", "pct-scan-3d"), ("slam_2d", "simple-2d")])
@@ -39,16 +46,9 @@ def test_invalid_pipeline_cannot_select_a_different_input_consumer(pipeline):
 
 @pytest.mark.parametrize("pipeline,profile", [("lio_3d", "pct-scan-3d"), ("slam_2d", "simple-2d")])
 def test_switch_saves_pipeline_and_derived_navigation_in_one_atomic_file(tmp_path, monkeypatch, pipeline, profile):
-    # 方案迁移后保存目标由机器人目录决定，测试必须隔离项目根，不能写实际活动方案。
-    bootstrap = tmp_path / ".env"
-    bootstrap.write_text("NUWAX_ACTIVE_ROBOT=go2\n")
-    monkeypatch.setattr(config_io, "_CORE_ENV", bootstrap)
-    monkeypatch.delenv("NUWAX_USER_CONFIG_ENV_FILE", raising=False)
-    settings = tmp_path / "drivers/go2/configs/默认.env"
-    settings.parent.mkdir(parents=True)
-    (settings.parent.parent / "manifest.py").touch()
-    (settings.parent.parent / "assembly.py").touch()
-    settings.write_text("NUWAX_GEOMETRY_PIPELINE=lio_3d\nNUWAX_NAV_PROFILE=replanning-astar\n")
+    monkeypatch.setattr(config_io, "_CORE_ENV", tmp_path / ".env")
+    settings = create_robot_profile(tmp_path,
+        "NUWAX_GEOMETRY_PIPELINE=lio_3d\nNUWAX_NAV_PROFILE=replanning-astar\n")
     writes = []
     original_write = config_io._atomic_write
 
@@ -136,7 +136,7 @@ def test_navigation_startup_exports_the_existing_go2_speed_limit():
     import subprocess
     import sys
     from pathlib import Path
-    script = Path(__file__).resolve().parents[2] / 'scripts/resolve_navigation_pipeline.py'
+    script = ROOT / 'scripts/resolve_navigation_pipeline.py'
     for value in ('0.35', '0.23'):
         result = subprocess.run([sys.executable, str(script), '--max-linear-speed'],
             env={**os.environ, 'NUWAX_ACTIVE_ROBOT': 'go2',
@@ -153,7 +153,7 @@ def test_navigation_startup_exports_yaw_limit_separately_from_translation():
     """设备角速度直接使用自身设置，不能跟随线速度改变单位。"""
     import os,subprocess,sys
     from pathlib import Path
-    script=Path(__file__).resolve().parents[2]/'scripts/resolve_navigation_pipeline.py'
+    script=ROOT/'scripts/resolve_navigation_pipeline.py'
     result=subprocess.run([sys.executable,str(script),'--max-yaw-rate'],env={**os.environ,
         'NUWAX_ACTIVE_ROBOT':'go2','GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS':'0.05',
         'GO2_OFFICIAL_MAX_YAW_RATE_RPS':'0.8'},capture_output=True,text=True,check=True)
@@ -172,11 +172,7 @@ _TERRAIN_SOURCE = "NUWAX_NAV_PCT_TERRAIN_SOURCE"
 def _terrain_profile(tmp_path, monkeypatch):
     """将配置保存与方案选择限定在本次测试目录。"""
     monkeypatch.setattr(config_io, "_CORE_ENV", tmp_path / ".env")
-    profile = tmp_path / "drivers/go2/configs/默认.env"
-    profile.parent.mkdir(parents=True)
-    (profile.parent.parent / "manifest.py").touch()
-    (profile.parent.parent / "assembly.py").touch()
-    profile.write_text("NUWAX_GEOMETRY_PIPELINE=lio_3d\n")
+    profile = create_robot_profile(tmp_path, "NUWAX_GEOMETRY_PIPELINE=lio_3d\n")
     return profile
 
 

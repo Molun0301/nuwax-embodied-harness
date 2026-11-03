@@ -25,6 +25,48 @@ from services.geometry.checkpoint_payload import FrozenPayload
 fixture_pb = fixture_provider.pb2
 
 
+def create_robot_profile(root, text="", *, robot="go2", name="默认"):
+    """按两种安装共用的写法准备方案、选择器与活动链接。"""
+    from scripts.module_installer.runtime import write_profile
+
+    root = Path(root)
+    directory = root / "drivers" / robot
+    directory.mkdir(parents=True, exist_ok=True)
+    for filename in ("manifest.py", "assembly.py"):
+        (directory / filename).touch()
+    prefix = root / "测试配置安装"
+    prefix.mkdir(exist_ok=True)
+    (prefix / "settings.env").write_text(text, encoding="utf-8")
+    write_profile(prefix, directory / "configs", name, root / "runtime_data/settings")
+    return directory / "configs" / (name + ".env")
+
+
+@pytest.fixture
+def navigation_startup_root(tmp_path, monkeypatch):
+    """在已安装方案的临时源码根验证真实启动解析器。"""
+    import shutil
+
+    for key in tuple(os.environ):
+        if key.startswith(("NUWAX_", "GO2_", "_NUWAX_")):
+            monkeypatch.delenv(key)
+    root = tmp_path / "启动配置"
+    for relative in (
+        "scripts/systemd/start_nav_stack.sh", "scripts/systemd/start_geometry_runtime.sh",
+        "scripts/systemd/process_identity.sh", "services/geometry/source_runtime_env.sh",
+        "scripts/lib/config_env.sh", "scripts/resolve_navigation_pipeline.py",
+        "scripts/resolve_robot_geometry.py", "contracts/navigation_pipeline.py",
+        "core/config_values.py", "core/config_catalog.json", "core/robot_geometry.py",
+        "core/settings.py", "drivers/go2/settings.py", ".env.example",
+    ):
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, target)
+    (root / "core/__init__.py").write_text("", encoding="utf-8")
+    create_robot_profile(root, robot="customrobot")
+    create_robot_profile(root, "NUWAX_ACTIVE_ROBOT=go2\n")
+    return root
+
+
 def fine_bytes(legacy=False):
     ref = dict(key=[0, 0, 0], points=1)
     if legacy:

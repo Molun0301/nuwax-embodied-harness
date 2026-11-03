@@ -450,15 +450,9 @@ def test_cleanup_close_waits_for_admitted_preview_preparation(tmp_path):
 def test_scan_settings_reject_invalid_without_writing_then_roundtrip(tmp_path, monkeypatch):
     from core import config_io
     from core.config_values import read_env_values
-    bootstrap = tmp_path / ".env"
-    bootstrap.write_text("NUWAX_ACTIVE_ROBOT=go2\n")
-    monkeypatch.setattr(config_io, "_CORE_ENV", bootstrap)
-    monkeypatch.delenv("NUWAX_USER_CONFIG_ENV_FILE", raising=False)
-    settings = tmp_path / "drivers/go2/configs/默认.env"
-    settings.parent.mkdir(parents=True)
-    (settings.parent.parent / "manifest.py").touch()
-    (settings.parent.parent / "assembly.py").touch()
-    settings.write_text("NUWAX_RAW_SCAN_MAX_MIB=1024\n")
+    from tests.conftest import create_robot_profile
+    monkeypatch.setattr(config_io, "_CORE_ENV", tmp_path / ".env")
+    settings = create_robot_profile(tmp_path, "NUWAX_RAW_SCAN_MAX_MIB=1024\n")
     invalid = {"NUWAX_RAW_SCAN_MAX_MIB": "63", "NUWAX_RAW_SCAN_TRANSLATION_M": "nan",
                "NUWAX_RAW_SCAN_ROTATION_DEG": "181", "NUWAX_RAW_SCAN_INTERVAL_S": "-1",
                "NUWAX_RAW_SCAN_QUEUE_FRAMES": "1.5"}

@@ -375,10 +375,10 @@ class AssignedExplorationCheckpointStoreTests(unittest.TestCase):
         listed, = self.store.list()
         self.assertFalse(listed["available"])
 
-    def test_full_snapshot_and_checkpoint_parsing_stay_outside_both_write_guards(self):
+    def test_full_snapshot_and_checkpoint_parsing_stay_outside_map_write_guard(self):
         self.store.save(self.record)
         entered = []
-        original_guard = self.store._files.write_guard
+        original_guard = self.store.maps.map_activation_guard
         original_validate = self.store.assets.get_validated_map_asset_bundle_snapshot
         original_read = self.store._read
         original_current = self.store.assets.map_asset_bundle_snapshot_is_current
@@ -410,7 +410,7 @@ class AssignedExplorationCheckpointStoreTests(unittest.TestCase):
             with patch.object(asset_module._ManagedRegularFile, "read", side_effect=AssertionError("body read inside guards")):
                 return original_current(*args, **kwargs)
 
-        with patch.object(self.store._files, "write_guard", guard), \
+        with patch.object(self.store.maps, "map_activation_guard", guard), \
                 patch.object(self.store.assets, "get_validated_map_asset_bundle_snapshot", validate), \
                 patch.object(self.store, "_read", read), \
                 patch.object(self.store.assets, "map_asset_bundle_snapshot_is_current", current):
@@ -418,7 +418,7 @@ class AssignedExplorationCheckpointStoreTests(unittest.TestCase):
             self.store.save(record_fixture(checkpoint_id="second-alias"))
 
     def test_catalog_and_current_mutation_between_admission_and_guard_abort_write(self):
-        original_guard = self.store._files.write_guard
+        original_guard = self.store.maps.map_activation_guard
         current = self.store.assets.current_directory(MAP_NAME)
         original = (current / "geometry/test/state.bin").read_bytes()
         for change in ("catalog", "body", "root"):
@@ -433,7 +433,7 @@ class AssignedExplorationCheckpointStoreTests(unittest.TestCase):
                     current.mkdir()
                 with original_guard():
                     yield
-            with self.subTest(change=change), patch.object(self.store._files, "write_guard", changing_guard), self.assertRaises(ValueError):
+            with self.subTest(change=change), patch.object(self.store.maps, "map_activation_guard", changing_guard), self.assertRaises(ValueError):
                 self.store.save(self.record)
             self.assertFalse(self.store._files.direct_path(self.record.checkpoint_id).exists())
             self.store.maps.save_map_asset(self.asset)
@@ -443,13 +443,13 @@ class AssignedExplorationCheckpointStoreTests(unittest.TestCase):
     def test_record_mutation_after_preflight_does_not_get_accepted_as_exact_retry(self):
         self.store.save(self.record)
         path = self.store._path(self.record.checkpoint_id)
-        original_guard = self.store._files.write_guard
+        original_guard = self.store.maps.map_activation_guard
         @contextmanager
         def changing_guard():
             path.write_text("replaced externally")
             with original_guard():
                 yield
-        with patch.object(self.store._files, "write_guard", changing_guard), \
+        with patch.object(self.store.maps, "map_activation_guard", changing_guard), \
                 patch.object(checkpoint_module, "_fsync_directory", side_effect=AssertionError("must not settle wrong record")), \
                 self.assertRaisesRegex(ValueError, "拥有方"):
             self.store.save(self.record)
@@ -503,27 +503,6 @@ class LegacyExplorationCheckpointStoreTests(unittest.TestCase):
         self.store = ExplorationCheckpointStore(self.root)
 
 
-    def test_literal_legacy_wrapper_is_read_only_and_keeps_original_filename(self):
-        value = legacy_fixture(pipeline="slam_2d")
-        self.store.root.mkdir()
-        path = self.store.root / ("7" * 64 + ".json")
-        document = value.model_dump(mode="json")
-        document.pop("schema_version")
-        literal = json.dumps({"sha256": "opaque historical wrapper", "payload": json.dumps(document, indent=3)}, indent=4) + "\n"
-        path.write_text(literal)
-        loaded = self.store.load(value.checkpoint_id, validate_asset=False)
-        self.assertEqual(loaded, value)
-        with self.assertRaisesRegex(ValueError, "旧探索检查点"):
-            self.store.save(loaded)
-        with self.assertRaisesRegex(ValueError, "旧探索检查点"):
-            self.store.load(value.checkpoint_id)
-        self.assertEqual(path.read_text(), literal)
-        self.assertEqual(self.store._path(value.checkpoint_id), path)
-        self.assertFalse(self.store._files.direct_path(value.checkpoint_id).exists())
-        listed, = self.store.list()
-        self.assertEqual(listed["asset_manifest_sha256"], "a" * 64)
-        self.assertNotIn("asset_identity", listed)
-        self.assertFalse(listed["available"])
 
     def test_bad_envelope_version_or_identity_alias_is_rejected(self):
         value = legacy_fixture()

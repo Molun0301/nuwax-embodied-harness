@@ -61,9 +61,11 @@ class SettingsApplication:
 
     def _active_location(self):
         # 活动选择属于持久配置；已经物化到本进程环境的旧机器人名不覆盖页面选择。
+        # 安装根位置不是选择，托管安装须据此找到持久配置目录。
         selector = self._root / "runtime_data" / "settings" / "active.env"
         if selector.is_symlink():
-            return configuration_location(root=self._root, environment={})
+            return configuration_location(root=self._root, environment={
+                "NUWAX_MANAGED_HOME": os.environ.get("NUWAX_MANAGED_HOME", "")})
         return configuration_location(root=self._root)
 
     def _is_active(self, location):

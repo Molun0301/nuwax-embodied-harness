@@ -17,9 +17,8 @@
 #   6. gRPC status — 部署解释器 + grpc 调用 GetStatus / HealthCheck /
 #                    GetNavigationReadiness / GetExplorationState(grpc 缺失则 NOT RUN)
 #   7. env canonical — 抓 backend/profile 关键 env
-#   8. 日志尾部 — systemd journal 最近 20 行
 #   9. LCM roundtrip — Python publisher+subscriber 跨进程互通（liblcm/udpm 不可用 → NOT RUN）
-#  10. systemd unit/profile — 核对 production env 与懒启动契约
+#  10. 部署档案 — 核对常驻与按需服务声明
 #
 # 退出码:0  evidence 全部产出(允许若干段 NOT READY)
 #
@@ -35,7 +34,6 @@ GATEWAY_RUNTIME_PORT="${NUWAX_GEOMETRY_RUNTIME_PORT:-50051}"
 GATEWAY_RUNTIME_READY_FILE="${NUWAX_GEOMETRY_RUNTIME_READY_FILE:-/run/nuwax/geometry/nuwax_geometry_runtime.ready}"
 GEOMETRY_DATA_DIR="${NUWAX_GEOMETRY_DATA_DIR:-/var/lib/nuwax_robot_bridge}"
 PROFILE_FILE="${NUWAX_DEPLOYMENT_PROFILE:-${REPO_ROOT}/deploy/profiles/go2-jetson.json}"
-ACTIVATION_SCRIPT="${REPO_ROOT}/scripts/systemd/activate_geometry_runtime.sh"
 
 PYTHON_BIN="${NUWAX_PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
 if [[ -z "${NUWAX_PYTHON_BIN:-}" && ! -x "${PYTHON_BIN}" ]]; then
@@ -173,20 +171,10 @@ bar "7. env canonical"
 for k in NUWAX_LCM_BACKEND NUWAX_LCM_URL NUWAX_NAV_PROFILE \
          NUWAX_EXPLORE_ARBITRATION NUWAX_NAV_STACK_READY_FILE \
          NUWAX_REAL_LCM_REQUIRED NUWAX_GEOMETRY_RUNTIME_PORT \
-         NUWAX_GEOMETRY_RUNTIME_READY_FILE NUWAX_GEOMETRY_EXTERNAL_ENABLED \
-         NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD \
-         NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD \
-         NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD; do
+         NUWAX_GEOMETRY_RUNTIME_READY_FILE NUWAX_GEOMETRY_EXTERNAL_ENABLED; do
   v="${!k:-<unset>}"
   printf '  %-32s = %s\n' "${k}" "${v}"
 done
-
-bar "8. systemd journal (last 20 lines)"
-if command -v journalctl >/dev/null 2>&1; then
-  journalctl -u nuwax-geometry-runtime.service -n 20 --no-pager 2>&1 | sed 's/^/  /'
-else
-  nr "journalctl 不可用"
-fi
 
 bar "9. LCM roundtrip (Phase 8 §12.6 硬约束)"
 LCM_URL="${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=0}"
@@ -260,103 +248,6 @@ PY
   rm -f "${RT_LOG}"
 fi
 
-bar "10. systemd units (production env + lazy activation contract)"
-SERVICE_FILE="${REPO_ROOT}/deploy/systemd/nuwax-geometry-runtime.service"
-GUARD_SERVICE_FILE="${REPO_ROOT}/deploy/systemd/nuwax-motion-safety-guard.service"
-GATEWAY_SERVICE_FILE="${REPO_ROOT}/deploy/systemd/nuwax-host-gateway.service"
-ACTIVATION_SERVICE_FILE="${REPO_ROOT}/deploy/systemd/nuwax-runtime-activation.service"
-ACTIVATION_PATH_FILE="${REPO_ROOT}/deploy/systemd/nuwax-runtime-activation.path"
-SYSTEMD_LIVE=false
-if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
-  SYSTEMD_LIVE=true
-  ok "检查 systemd 当前加载的 unit（包含 drop-in）"
-else
-  nr "systemd manager 不可用；仅执行源码模板离线检查"
-fi
-load_unit_source() {
-  local unit_name="$1"
-  local fallback_path="$2"
-  if [[ "${SYSTEMD_LIVE}" == "true" ]]; then
-    systemctl cat --no-pager "${unit_name}" 2>/dev/null
-  else
-    cat "${fallback_path}" 2>/dev/null
-  fi
-}
-GUARD_UNIT_TEXT="$(load_unit_source nuwax-motion-safety-guard.service "${GUARD_SERVICE_FILE}")"
-GEOMETRY_UNIT_TEXT="$(load_unit_source nuwax-geometry-runtime.service "${SERVICE_FILE}")"
-GATEWAY_UNIT_TEXT="$(load_unit_source nuwax-host-gateway.service "${GATEWAY_SERVICE_FILE}")"
-ACTIVATION_SERVICE_TEXT="$(load_unit_source nuwax-runtime-activation.service "${ACTIVATION_SERVICE_FILE}")"
-ACTIVATION_PATH_TEXT="$(load_unit_source nuwax-runtime-activation.path "${ACTIVATION_PATH_FILE}")"
-if [[ "${SYSTEMD_LIVE}" == "true" ]]; then
-  for unit_name in nuwax-motion-safety-guard.service nuwax-nav-stack.service \
-                   nuwax-geometry-runtime.service nuwax-person-follow.service \
-                   nuwax-runtime-activation.service nuwax-runtime-activation.path \
-                   nuwax-host-gateway.service nuwax-go2-video-streamer.service; do
-    unit_details="$(systemctl show -p FragmentPath -p DropInPaths -p UnitFileState "${unit_name}" 2>&1)"
-    if [[ $? -eq 0 && "${unit_details}" == *"FragmentPath="* ]]; then
-      printf '  %s\n' "${unit_name}"
-      printf '%s\n' "${unit_details}" | sed 's/^/    /'
-    else
-      miss "systemd effective unit unavailable: ${unit_name}: ${unit_details:-<empty>}"
-    fi
-  done
-  if printf '%s\n' "${GUARD_UNIT_TEXT}" "${GEOMETRY_UNIT_TEXT}" \
-      "${GATEWAY_UNIT_TEXT}" "${ACTIVATION_SERVICE_TEXT}" \
-      "${ACTIVATION_PATH_TEXT}" | grep -q '@NUWAX_'; then
-    miss "systemd effective unit 仍含未渲染 @NUWAX_* 占位符"
-  else
-    ok "systemd effective unit 不含未渲染模板占位符"
-  fi
-fi
-if [[ -n "${GUARD_UNIT_TEXT}" ]]; then
-  if grep -qE '^ExecStart=/usr/bin/env .* (@NUWAX_PYTHON_BIN@|/[^[:space:]]+) -m services\.navigation\.motion_safety_guard$' <<<"${GUARD_UNIT_TEXT}"; then
-    ok "guard unit ExecStart uses rendered deployment Python"
-  else
-    miss "guard unit production ExecStart drift: expected /usr/bin/env ... <deployment Python> -m services.navigation.motion_safety_guard"
-  fi
-  if grep -qF 'Environment=NUWAX_MOTION_GUARD_SOCKET=/run/nuwax/motion-guard.sock' <<<"${GUARD_UNIT_TEXT}"; then
-    ok "guard unit UDS path frozen"
-  else
-    miss "guard unit UDS path drift"
-  fi
-
-else
-  miss "guard effective unit unavailable"
-fi
-if [[ -n "${GEOMETRY_UNIT_TEXT}" ]]; then
-  if grep -qE '^Environment=NUWAX_LCM_BACKEND=real-lcm' <<<"${GEOMETRY_UNIT_TEXT}"; then
-    ok "service hardcode NUWAX_LCM_BACKEND=real-lcm"
-  else
-    miss "service 缺 NUWAX_LCM_BACKEND=real-lcm"
-  fi
-  if grep -qE '^Environment=NUWAX_REAL_LCM_REQUIRED=true' <<<"${GEOMETRY_UNIT_TEXT}"; then
-    ok "service hardcode NUWAX_REAL_LCM_REQUIRED=true"
-  else
-    miss "service 缺 NUWAX_REAL_LCM_REQUIRED=true"
-  fi
-  if grep -qE '^SuccessExitStatus=0 4' <<<"${GEOMETRY_UNIT_TEXT}"; then
-    miss "service 仍把 real-lcm fail-fast code(4) 当 SuccessExitStatus（违反 §13.2）"
-  else
-    ok "service SuccessExitStatus 仅 0"
-  fi
-  if grep -qF 'Requires=nuwax-motion-safety-guard.service' <<<"${GEOMETRY_UNIT_TEXT}"; then
-    miss "geometry runtime 不应 eager Requires motion guard"
-  else
-    ok "geometry runtime 保持独立生命周期"
-  fi
-else
-  nr "geometry effective unit unavailable"
-fi
-if [[ -n "${GATEWAY_UNIT_TEXT}" ]]; then
-  if grep -qE '^Requires=.*nuwax-(motion-safety-guard|nav-stack|geometry-runtime|person-follow)\.service' <<<"${GATEWAY_UNIT_TEXT}"; then
-    miss "Gateway 不应 eager Requires 按需运行时"
-  else
-    ok "Gateway 与按需运行时保持解耦"
-  fi
-else
-  miss "Gateway effective unit unavailable"
-fi
-
 PROFILE_CONTRACT_OUT="$("${PYTHON_BIN}" - "${PROFILE_FILE}" <<'PY' 2>&1
 import json
 import sys
@@ -396,33 +287,6 @@ if [[ "${PROFILE_CONTRACT_OUT}" == "PROFILE_CONTRACT_OK" ]]; then
   ok "profile 常驻/按需服务契约完整"
 else
   miss "profile 懒启动契约 drift: ${PROFILE_CONTRACT_OUT}"
-fi
-
-activation_lines=()
-for unit_name in nuwax-motion-safety-guard.service nuwax-nav-stack.service \
-                 nuwax-geometry-runtime.service nuwax-person-follow.service; do
-  activation_line="$(grep -nF "start_unit_if_needed ${unit_name}" "${ACTIVATION_SCRIPT}" 2>/dev/null | cut -d: -f1 | head -n 1)"
-  if [[ -z "${activation_line}" ]]; then
-    activation_lines=()
-    break
-  fi
-  activation_lines+=("${activation_line}")
-done
-if [[ "${#activation_lines[@]}" -eq 4 \
-      && "${activation_lines[0]}" -lt "${activation_lines[1]}" \
-      && "${activation_lines[1]}" -lt "${activation_lines[2]}" \
-      && "${activation_lines[2]}" -lt "${activation_lines[3]}" ]]; then
-  ok "activation 顺序: Guard -> Nav -> Geometry -> Person Follow"
-else
-  miss "activation 启动顺序 drift: ${activation_lines[*]:-<missing>}"
-fi
-if [[ -n "${ACTIVATION_SERVICE_TEXT}" && -n "${ACTIVATION_PATH_TEXT}" ]] \
-    && ! grep -q '^\[Install\]$' <<<"${ACTIVATION_SERVICE_TEXT}" \
-    && grep -q '^Unit=nuwax-runtime-activation.service$' <<<"${ACTIVATION_PATH_TEXT}" \
-    && grep -q '^WantedBy=multi-user.target$' <<<"${ACTIVATION_PATH_TEXT}"; then
-  ok "activation service 保持 static，path 保持可启用"
-else
-  miss "activation service/path 懒启动拓扑 drift"
 fi
 
 echo

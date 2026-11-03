@@ -34,8 +34,8 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: 检查单命令入口与目标解释器语法
         run: |
-          bash -n install.sh get-neh.sh scripts/install_motion_guard_deployment.sh scripts/systemd/check_motion_guard_python.sh
-          python3 scripts/ci/check_pep604.py scripts/neh_bootstrap.py scripts/neh_source.py scripts/neh_source_build.py scripts/device_manager scripts/module_installer scripts/go2_update install.py scripts/update_go2.py
+          bash -n install.sh get-neh.sh
+          python3 scripts/ci/check_pep604.py scripts/neh_bootstrap.py scripts/neh_source.py scripts/neh_source_build.py scripts/device_manager scripts/module_installer install.py
       - name: 仅从源码组装并导入管理程序
         run: |
           python3 - <<'PY'
@@ -74,7 +74,6 @@ jobs:
         run: |
           python3 scripts/check_installation_lifecycle.py
           python3 install.py --help
-          python3 scripts/update_go2.py --help
           python3 - <<'PY_MODULE_PLAN'
           import json, subprocess, sys
           cases = [
@@ -92,4 +91,3 @@ jobs:
               if "pointlio" in modules:
                   assert "libgoogle-glog-dev" in plan["system_packages"]
           PY_MODULE_PLAN
-          bash scripts/install_motion_guard_deployment.sh check-sources

@@ -85,7 +85,6 @@ services/geometry/nuwax_ros_bridge/Cargo.lock
 services/geometry/nuwax_ros_bridge/target/
 
 # === bootstrap 生成物（含 token，禁止入库；保留 *.example） ===
-deploy/systemd/nuwax-host-gateway.service
 deploy/nuwaclaw/*.host_gateway.json
 
 # === 未提交文档/日志/地图/杂项 忽略 (2026-06-03) ===

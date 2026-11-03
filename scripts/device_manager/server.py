@@ -348,14 +348,12 @@ class Handler(BaseHTTPRequestHandler):
             result = engine.install_directories(query.get("path", [None])[0])
         elif path == "hardware" and not mutation:
             result = engine.hardware()
-        elif path == "migration-sources" and not mutation:
-            result = engine.migration_sources()
         elif path == "modules" and not mutation:
             result = engine.modules()
         elif path == "releases" and not mutation:
             result = engine.releases(refresh=query.get("refresh") == ["1"])
         elif path == "plan" and self.command == "POST":
-            if body.get("action") in ("install", "migrate") and not engine.current():
+            if body.get("action") == "install" and not engine.current():
                 configuration = body.get("configuration", {})
                 if not isinstance(configuration, dict):
                     raise ManagerError("invalid_config", "预配置必须是对象。")

@@ -12,7 +12,7 @@ from .runtime import clean_environment
 
 def begin_update(engine, *, local_build=False, automatic=False):
     settings = engine.settings()
-    if settings.get("source_mode") == "git" and settings.get("channel") == "main":
+    if settings.get("channel") == "main":
         engine.releases(refresh=True)
         state = engine.status()
         update = state["update"]
@@ -31,9 +31,9 @@ def begin_update(engine, *, local_build=False, automatic=False):
 
 
 def adopt_manager(engine, job):
-    source = job["_plan"].get("_source")
+    source = job["_plan"]["_source"]
     from .versioning import source_tree_unchanged
-    if not source or source_tree_unchanged(engine, source, MANAGER_REVISION):
+    if source_tree_unchanged(engine, source, MANAGER_REVISION):
         job["_manager_adopted"] = True
         return
     from .self_update import apply_manager

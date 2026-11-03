@@ -304,7 +304,6 @@ def _env_example_desc() -> Dict[str, str]:
 # 避免页面再次出现 enabled / backend mode / max level 等机械英文标签。
 _ZH_NAMES: Dict[str, str] = {
     'NUWAX_ACTIVE_ROBOT': '当前激活机器人',
-    'GO2_SDK_PATH': 'Go2 SDK 路径',
     'GO2_LOW_LEVEL_INTERVAL_SEC': '低级控制周期（秒）',
     'GO2_LOW_LEVEL_KD': '低级控制 KD 增益',
     'GO2_LOW_LEVEL_KP': '低级控制 KP 增益',

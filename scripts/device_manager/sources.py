@@ -12,25 +12,11 @@ from .common import ManagerError, atomic_json, read_json
 from .runtime import clean_environment, run_command
 
 
-def is_project_default(value):
-    repository = DEFAULT_REPOSITORY.rstrip("/")
-    if repository.endswith(".git"):
-        repository = repository[:-4]
-    return not value or value in {DEFAULT_REPOSITORY, repository, repository + "/releases/latest/download/catalog.json"}
-
-
 def normalized_settings(stored):
-    result = dict(feed_url=DEFAULT_REPOSITORY, source_repository=DEFAULT_REPOSITORY,
-                  source_branch=DEFAULT_BRANCH, source_mode="git", channel="main", auto_start=True, gateway_port=8766,
+    result = dict(source_repository=DEFAULT_REPOSITORY, source_branch=DEFAULT_BRANCH,
+                  channel="main", auto_start=True, gateway_port=8766,
                   auto_update="notify", check_interval_minutes=30, maintenance_window="")
-    result.update(stored)
-    if "source_mode" not in stored:
-        result["source_mode"] = "git" if stored.get("source_repository") or is_project_default(stored.get("feed_url", "")) else "catalog"
-    if result["source_mode"] == "git":
-        result["source_repository"] = result.get("source_repository") or DEFAULT_REPOSITORY
-        result["feed_url"] = result["source_repository"]
-        if result["channel"] in ("stable", "preview") or "channel" not in stored:
-            result["channel"] = "main" if result["source_branch"] == "main" else "branch:" + result["source_branch"]
+    result.update({key: stored[key] for key in result if key in stored})
     return result
 
 

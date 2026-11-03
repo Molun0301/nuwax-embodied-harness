@@ -25,15 +25,6 @@ PACKAGES = frozenset({
     "libboost-chrono-dev", "libboost-atomic-dev", "python3-pyaudio",
     "portaudio19-dev", "patch", "patchelf", "iproute2", "util-linux", "openssl",
 })
-# 顺序对应原系统部署stop_stack，先撤销设置触发器，避免迁入期间重新拉起旧发布。
-UNITS = (
-    "nuwax-settings-apply.path", "nuwax-settings-apply.service",
-    "nuwax-go2-video-streamer.service", "nuwax-host-gateway.service",
-    "nuwax-runtime-activation.path", "nuwax-runtime-activation.service",
-    "nuwax-person-follow.service", "nuwax-geometry-runtime.service",
-    "nuwax-nav-stack.service", "nuwax-motion-safety-guard.service",
-    "nuwax-lcm-network.service",
-)
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8",
        "DEBIAN_FRONTEND": "noninteractive"}
 
@@ -196,61 +187,6 @@ def atomic_json(path, value):
             os.unlink(name)
 
 
-def legacy_state():
-    units = {}
-    for unit in UNITS:
-        result = run(["systemctl", "show", unit, "--property=LoadState,ActiveState,UnitFileState"], timeout=30)
-        fields = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
-        if fields.get("LoadState") not in {"not-found", "masked"}:
-            units[unit] = {"active": fields.get("ActiveState") in {"active", "activating", "reloading"},
-                           "enabled": fields.get("UnitFileState", "disabled")}
-    return units
-
-
-def restore_legacy():
-    snapshot = STATE / "legacy.json"
-    if not snapshot.is_file():
-        return {"restored": False, "message": "没有待恢复的迁入事务"}
-    state = json.loads(snapshot.read_text(encoding="utf-8"))
-    if not isinstance(state, dict) or set(state) - set(UNITS):
-        raise RuntimeError("旧部署恢复记录无效")
-    for unit in reversed(UNITS):
-        previous = state.get(unit)
-        if not previous:
-            continue
-        enabled = previous.get("enabled")
-        if enabled in {"enabled", "enabled-runtime"}:
-            command = ["systemctl", "enable"]
-            if enabled == "enabled-runtime":
-                command.append("--runtime")
-            run(command + [unit], timeout=60)
-        if previous.get("active"):
-            run(["systemctl", "start", unit], timeout=120)
-    snapshot.unlink()
-    return {"restored": True}
-
-
-def stop_legacy():
-    snapshot = STATE / "legacy.json"
-    if snapshot.exists():
-        # 恢复中断事务时保留第一次现场事实，不把已经停掉的状态覆盖进去。
-        state = json.loads(snapshot.read_text(encoding="utf-8"))
-    else:
-        state = legacy_state()
-        atomic_json(snapshot, state)
-    for unit in UNITS:
-        if unit not in state:
-            continue
-        run(["systemctl", "stop", unit], timeout=120)
-        enabled = state[unit].get("enabled")
-        if enabled in {"enabled", "enabled-runtime"}:
-            command = ["systemctl", "disable"]
-            if enabled == "enabled-runtime":
-                command.append("--runtime")
-            run(command + [unit], timeout=60)
-    return {"stopped": list(state), "recoverable": True}
-
-
 def dispatch(action, payload):
     if action == "install-dependencies":
         return install_dependencies(payload)
@@ -272,15 +208,6 @@ def dispatch(action, payload):
         unit = "neh-manager-%s.service" % int(value)
         run(["systemctl", "--no-block", "restart", unit], timeout=30)
         return {"scheduled": True}
-    if action == "stop-legacy":
-        return stop_legacy()
-    if action == "restore-legacy":
-        return restore_legacy()
-    if action == "commit-legacy":
-        path = STATE / "legacy.json"
-        if path.exists():
-            path.unlink()
-        return {"committed": True}
     raise ValueError("不支持的特权操作")
 
 

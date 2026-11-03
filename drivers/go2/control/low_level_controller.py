@@ -7,7 +7,6 @@ Go2 低级别控制器。
 """
 
 import logging
-import sys
 import time
 
 from core.settings import APP_CONFIG
@@ -23,10 +22,6 @@ from drivers.go2.control.joint_config import (
 )
 
 logger = logging.getLogger(__name__)
-
-SDK_PATH = APP_CONFIG.dds.sdk_path
-if SDK_PATH not in sys.path:
-    sys.path.insert(0, SDK_PATH)
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher, ChannelSubscriber
 from unitree_sdk2py.idl.default import unitree_go_msg_dds__LowCmd_, unitree_go_msg_dds__LowState_

@@ -765,7 +765,7 @@
       }
       if (installation.source) {
         show($('installSourceRow'), true);
-        text($('installSource'), ({git:'源码构建',release:'版本包',migrated:'已有安装迁入'})[installation.source] || installation.source);
+        text($('installSource'), ({git:'源码构建'})[installation.source] || installation.source);
       } else {
         show($('installSourceRow'), false);
       }
@@ -913,7 +913,6 @@
       start: '启动业务服务',
       stop: '停止业务服务',
       restart: '重启业务服务',
-      migrate: '迁移既有安装'
     };
     return map[action] || action || '任务';
   }
@@ -1108,74 +1107,6 @@
   function startSetupWizard() {
     showSetup();
     setWizardStep('hardware');
-    loadMigrationSources();
-  }
-
-  async function loadMigrationSources() {
-    try {
-      const data = await apiCall('/api/manager/migration-sources');
-      const sources = Array.isArray(data.sources) ? data.sources : [];
-
-      if (sources.length > 0) {
-        state.migrationSources = sources;
-        state.selectedMigrationSource = null;
-        renderMigrationPanel(sources);
-      } else {
-        show($('migrationPanel'), false);
-        loadHardware();
-      }
-    } catch (error) {
-      // 接口不存在或失败时直接进入硬件检测
-      show($('migrationPanel'), false);
-      loadHardware();
-    }
-  }
-
-  function renderMigrationPanel(sources) {
-    const panel = $('migrationPanel');
-    const sourcesContainer = $('migrationSources');
-    const migrateBtn = $('migrateFrom');
-
-    sourcesContainer.innerHTML = sources.map(function (src, index) {
-      const meta = [];
-      if (src.launcher) meta.push('启动器：' + src.launcher);
-      if (src.systemd) meta.push('systemd 服务');
-      if (src.running) meta.push('运行中');
-
-      return '<div class="migration-source-item" data-source-id="' + escapeHtml(src.id) + '">' +
-        '<div class="migration-source-radio"></div>' +
-        '<div class="migration-source-info">' +
-        '<div class="migration-source-label">' + escapeHtml(src.source) + '</div>' +
-        (meta.length ? '<div class="migration-source-meta">' + escapeHtml(meta.join(' · ')) + '</div>' : '') +
-        '</div>' +
-        '</div>';
-    }).join('');
-
-    sourcesContainer.querySelectorAll('.migration-source-item').forEach(function (item) {
-      item.addEventListener('click', function () {
-        sourcesContainer.querySelectorAll('.migration-source-item').forEach(function (i) {
-          i.classList.remove('selected');
-        });
-        item.classList.add('selected');
-        state.selectedMigrationSource = item.getAttribute('data-source-id');
-        migrateBtn.disabled = false;
-      });
-    });
-
-    $('migrateFresh').onclick = function () {
-      state.selectedMigrationSource = null;
-      show(panel, false);
-      loadHardware();
-    };
-
-    migrateBtn.onclick = function () {
-      if (!state.selectedMigrationSource) return;
-      show(panel, false);
-      loadHardware();
-    };
-
-    show(panel, true);
-    show($('hardwareStatus'), false);
   }
 
   async function loadHardware() {
@@ -1990,38 +1921,26 @@
 
   // ===== 公开更新来源 =====
   function applySourceSettings(settings, prefix) {
-    const channelEl = $(prefix === 'wizard' ? 'wizardChannel' : 'updateChannel');
     const feedEl = $(prefix === 'wizard' ? 'wizardFeedUrl' : 'feedUrl');
     const branchEl = $(prefix === 'wizard' ? 'wizardSourceBranch' : 'sourceBranch');
-    const sourceMode = settings.source_mode || 'git';
-    if (channelEl) {
-      channelEl.value = settings.channel || 'stable';
-      show(channelEl.closest('label'), sourceMode === 'catalog');
-    }
     if (branchEl) {
       branchEl.value = settings.source_branch || 'main';
-      show(branchEl.closest('label'), sourceMode === 'git');
     }
     if (feedEl) {
-      feedEl.value = sourceMode === 'git' ? settings.source_repository : settings.feed_url;
-      feedEl.dataset.sourceMode = sourceMode;
-      text(feedEl.closest('label').querySelector('.config-label'), sourceMode === 'git' ? '源码仓库地址' : '版本目录地址');
+      feedEl.value = settings.source_repository;
     }
     const summary = $('wizardSourceSummary');
     if (summary) {
-      text(summary, settings.feed_url ? settings.feed_url + (sourceMode === 'git' ? ' · ' + (settings.source_branch || 'main') : '') : '未配置');
+      text(summary, settings.source_repository ? settings.source_repository + ' · ' + (settings.source_branch || 'main') : '未配置');
     }
   }
 
   async function saveSourceSettings(prefix) {
-    const channelEl = $(prefix === 'wizard' ? 'wizardChannel' : 'updateChannel');
     const feedEl = $(prefix === 'wizard' ? 'wizardFeedUrl' : 'feedUrl');
     const messageEl = $(prefix === 'wizard' ? 'wizardSourceMessage' : 'updateConfigMessage');
     const button = $(prefix === 'wizard' ? 'wizardSaveSource' : 'saveUpdateConfig');
 
     const branchEl = $(prefix === 'wizard' ? 'wizardSourceBranch' : 'sourceBranch');
-    const sourceMode = feedEl ? feedEl.dataset.sourceMode || 'git' : 'git';
-    const channel = channelEl ? channelEl.value : 'stable';
     const feedUrl = feedEl ? feedEl.value.trim() : '';
 
     if (button) button.disabled = true;
@@ -2029,9 +1948,7 @@
     try {
       const settings = await apiCall('/api/manager/settings', {
         method: 'PUT',
-        body: sourceMode === 'git'
-          ? { source_mode: 'git', source_repository: feedUrl, source_branch: branchEl ? branchEl.value.trim() || 'main' : 'main' }
-          : { source_mode: 'catalog', channel: channel, feed_url: feedUrl }
+        body: { source_repository: feedUrl, source_branch: branchEl ? branchEl.value.trim() || 'main' : 'main' }
       });
 
       const refreshed = await apiCall('/api/manager/settings');
@@ -3089,7 +3006,7 @@
 
       if (!status.installation || !status.installation.installed) {
         // 重新打开页面或从命令行开始安装时，直接接回持久任务的进度。
-        if (status.active_job && ['install', 'migrate'].includes(status.active_job.action)) {
+        if (status.active_job && status.active_job.action === 'install') {
           showSetup();
           setWizardStep('install');
           initInstallStep(status.active_job);

@@ -21,9 +21,8 @@ import time
 import unittest
 
 SLEEP = 'import signal,time,sys; signal.signal(signal.SIGINT,lambda *a:sys.exit(0)); time.sleep(120)'
-FUNCTIONS = '''is_truthy geometry_runtime_managed_by_systemd nav_stack_managed_by_systemd
-person_follow_managed_by_systemd go2_video_streamer_managed_by_systemd
-person_follow_is_alive read_pid_file is_pid_alive pid_pgid process_belongs_to_instance process_managed_by_systemd
+FUNCTIONS = '''is_truthy
+person_follow_is_alive read_pid_file is_pid_alive pid_pgid process_belongs_to_instance
 send_signal_to_process_scope wait_for_pid_exit terminate_process_scope terminate_person_follow_scope
 cleanup_stale_gateway_processes cleanup_stale_geometry_runtime_processes
 cleanup_stale_person_follow_processes cleanup_stale_go2_video_streamer
@@ -70,8 +69,7 @@ class CleanupTests(unittest.TestCase):
             environment.update(markers)
         options = {'start_new_session': True} if group is None else {'preexec_fn': lambda: os.setpgid(0, group)}
         command = [sys.executable, '-c', code, name]
-        native_roles = ('nuwax-geometry-runtime', 'nuwax-lcm-runtime', 'nuwax-nav-stack',
-                        'nuwax-video-streamer', 'nuwax-person-follow', 'nuwax-go2-video-streamer')
+        native_roles = ('nuwax-geometry-runtime', 'nuwax-nav-stack', 'nuwax-person-follow', 'nuwax-go2-video-streamer')
         if name in native_roles:
             command[0] = name
         elif name == 'drivers.go2.video_streamer':
@@ -122,7 +120,7 @@ class CleanupTests(unittest.TestCase):
         self.exited(own)
 
     def test_native_and_video_residuals_respect_installation(self):
-        names = ['nuwax-geometry-runtime', 'nuwax-person-follow', 'drivers.go2.video_streamer', 'nuwax-nav-stack', 'nuwax-lcm-runtime', 'nuwax-video-streamer']
+        names = ['nuwax-geometry-runtime', 'nuwax-person-follow', 'drivers.go2.video_streamer', 'nuwax-nav-stack']
         own = [self.spawn(n) for n in names]
         other = [self.spawn(n, owner='other') for n in names]
         self.shell('cleanup_stale_geometry_runtime_processes\ncleanup_stale_person_follow_processes\ncleanup_stale_go2_video_streamer\ncleanup_external_geometry_processes')
@@ -136,11 +134,6 @@ class CleanupTests(unittest.TestCase):
         self.assertFalse(self.pidfile.exists())
         self.shell('status_gateway', expected=3)
 
-    def test_old_generation_with_and_without_install_home(self):
-        own = self.spawn('nuwax-geometry-runtime')
-        older = self.spawn('nuwax-geometry-runtime', markers={'NUWAX_BOOTSTRAP_ENV_FILE': str(self.home / 'generations/legacy/settings.env')})
-        self.shell('cleanup_stale_geometry_runtime_processes')
-        self.exited(own, older)
 
     def test_mixed_process_group_preserves_other_owner(self):
         leader = self.spawn('owned-group-leader', group=0)
@@ -166,22 +159,9 @@ class CleanupTests(unittest.TestCase):
         for p in paths:
             self.assertEqual(p.read_text(), 'other instance')
 
-    def test_mixed_same_installation_group_preserves_managed_components(self):
-        leader = self.spawn('uvicorn gateways.app:create_gateway_app_from_env', group=0)
-        own = self.spawn('ordinary-owned-child', group=leader.pid)
-        managed = [self.spawn(n, group=leader.pid) for n in (
-            'nuwax-geometry-runtime', 'nuwax-lcm-runtime', 'nuwax-nav-stack',
-            'nuwax-video-streamer', 'nuwax-person-follow', 'drivers.go2.video_streamer')]
-        env = dict(self.environment, NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD='true',
-                   NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD='true', NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD='true',
-                   NUWAX_GO2_VIDEO_STREAMER_MANAGED_BY_SYSTEMD='true')
-        self.shell('terminate_process_scope ' + str(leader.pid), environment=env)
-        self.exited(leader, own); self.alive(*managed)
 
     def test_component_words_in_path_and_arguments_do_not_block_stop(self):
-        env = dict(self.environment, NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD='true',
-                   NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD='true',
-                   NUWAX_GO2_VIDEO_STREAMER_MANAGED_BY_SYSTEMD='true')
+        env = self.environment
         for argv0, argument in (
             (str(self.home / 'nuwax-nav-stack/bin/python3'), 'ordinary-owned-process'),
             (sys.executable, '--description=nuwax-geometry-runtime'),
@@ -192,84 +172,36 @@ class CleanupTests(unittest.TestCase):
             self.exited(own)
             self.assertFalse(self.pidfile.exists())
 
-    def test_retained_live_target_keeps_pid_record(self):
-        managed = self.spawn('nuwax-nav-stack')
-        self.pidfile.write_text(str(managed.pid))
-        env = dict(self.environment, NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD='true')
-        result = self.shell('stop_existing_gateway', environment=env, expected=1)
-        self.assertIn('still running; keeping PID file', result.stderr)
-        self.alive(managed)
-        self.assertEqual(self.pidfile.read_text(), str(managed.pid))
 
-    def test_tracked_monitor_stops_preserve_other_and_managed_targets(self):
-        for role, function, variable, flag in (
-            ('nuwax-person-follow', 'stop_person_follow_monitor', 'PERSON_FOLLOW_MONITOR_PID', 'NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD'),
-            ('nuwax-geometry-runtime', 'stop_runtime_activation_monitor', 'RUNTIME_ACTIVATION_MONITOR_PID', 'NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD'),
-            ('nuwax-nav-stack', 'stop_runtime_monitors', 'NAV_STACK_MONITOR_PID', 'NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD')):
+    def test_tracked_monitor_stops_preserve_other_targets(self):
+        for role, function, variable in (
+            ('nuwax-person-follow', 'stop_person_follow_monitor', 'PERSON_FOLLOW_MONITOR_PID'),
+            ('nuwax-geometry-runtime', 'stop_runtime_activation_monitor', 'RUNTIME_ACTIVATION_MONITOR_PID'),
+            ('nuwax-nav-stack', 'stop_runtime_monitors', 'NAV_STACK_MONITOR_PID')):
             own = self.spawn('owned-monitor')
             other = self.spawn(role, owner='other')
-            managed = self.spawn(role)
             env = dict(self.environment, NAV_STACK_MONITOR_PID='', GEOMETRY_MONITOR_PID='')
             self.shell(function, environment=dict(env, **{variable: str(own.pid)}))
             self.exited(own)
-            for target in (other, managed):
-                self.shell(function, environment=dict(env, **{variable: str(target.pid), flag: 'true'}))
-            self.alive(other, managed)
+            self.shell(function, environment=dict(env, **{variable: str(other.pid)}))
+            self.alive(other)
 
-    def test_tracked_component_stops_preserve_other_and_managed_targets(self):
-        for role, function, variable, flag in (
-            ('nuwax-geometry-runtime', 'stop_geometry_runtime', 'GEOMETRY_RUNTIME_PID', 'NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD'),
-            ('nuwax-nav-stack', 'stop_nav_stack', 'NAV_STACK_PID', 'NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD'),
-            ('nuwax-person-follow', 'stop_person_follow', 'PERSON_FOLLOW_PID', 'NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD'),
-            ('drivers.go2.video_streamer', 'stop_go2_video_streamer', 'VIDEO_STREAMER_PID', 'NUWAX_GO2_VIDEO_STREAMER_MANAGED_BY_SYSTEMD')):
+    def test_tracked_component_stops_preserve_other_targets(self):
+        for role, function, variable in (
+            ('nuwax-geometry-runtime', 'stop_geometry_runtime', 'GEOMETRY_RUNTIME_PID'),
+            ('nuwax-nav-stack', 'stop_nav_stack', 'NAV_STACK_PID'),
+            ('nuwax-person-follow', 'stop_person_follow', 'PERSON_FOLLOW_PID'),
+            ('drivers.go2.video_streamer', 'stop_go2_video_streamer', 'VIDEO_STREAMER_PID')):
             own = self.spawn(role)
             other = self.spawn(role, owner='other')
             self.shell(function, environment=dict(self.environment, **{variable: str(own.pid)}))
             self.exited(own)
-            managed = self.spawn(role)
-            self.shell(function, environment=dict(self.environment, **{variable: str(other.pid), flag: 'true'}))
-            self.shell(function, environment=dict(self.environment, **{variable: str(managed.pid), flag: 'true'}))
-            self.alive(other, managed)
+            self.shell(function, environment=dict(self.environment, **{variable: str(other.pid)}))
+            self.alive(other)
 
-    def test_systemd_managed_components_survive_external_cleanup(self):
-        own = [self.spawn(n) for n in ('nuwax-geometry-runtime', 'nuwax-lcm-runtime', 'nuwax-nav-stack', 'nuwax-video-streamer', 'nuwax-person-follow', 'drivers.go2.video_streamer')]
-        env = dict(self.environment, NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD='true', NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD='true', NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD='true', NUWAX_GO2_VIDEO_STREAMER_MANAGED_BY_SYSTEMD='true')
-        self.shell('cleanup_stale_geometry_runtime_processes\ncleanup_stale_person_follow_processes\ncleanup_stale_go2_video_streamer\ncleanup_external_geometry_processes', environment=env)
-        self.alive(*own)
 
-    def test_direct_bootstrap_instances_are_distinct(self):
-        own = self.spawn('nuwax-geometry-runtime', markers={'NUWAX_BOOTSTRAP_ENV_FILE': str(self.root / '.env')})
-        other = self.spawn('nuwax-geometry-runtime', markers={'NUWAX_BOOTSTRAP_ENV_FILE': str(self.root / 'other.env')})
-        ambiguous = self.spawn('nuwax-geometry-runtime', markers={'NUWAX_BOOTSTRAP_ENV_FILE': '.env'})
-        env = dict(self.environment, ENV_FILE=str(self.root / '.env'))
-        env.pop('NUWAX_INSTALL_HOME')
-        self.shell('cleanup_stale_geometry_runtime_processes', environment=env)
-        self.exited(own); self.alive(other, ambiguous)
 
-    def test_legacy_launcher_marker_and_unknown_process(self):
-        own = self.spawn('nuwax-geometry-runtime', markers={'NUWAX_SETTINGS_LAUNCHER': str(self.root / 'scripts/start_gateway.sh')})
-        unknown = self.spawn('nuwax-geometry-runtime', owner=None)
-        env = dict(self.environment, ENV_FILE=str(self.root / '.env'))
-        env.pop('NUWAX_INSTALL_HOME')
-        self.shell('cleanup_stale_geometry_runtime_processes', environment=env)
-        self.exited(own); self.alive(unknown)
-        self.pidfile.write_text(str(unknown.pid))
-        self.shell('stop_existing_gateway', environment=env)
-        self.alive(unknown)
-        self.assertFalse(self.pidfile.exists())
 
-    def test_unmarked_legacy_supervisor_can_stop_then_retry(self):
-        legacy = self.root / 'scripts/start_gateway.sh'
-        legacy.write_text('#!/bin/bash\ntrap "exit 0" TERM\nwhile true; do sleep 0.1; done\n')
-        p = subprocess.Popen(['bash', str(legacy)], cwd=self.root, start_new_session=True)
-        self.processes.append(p)
-        self.pidfile.write_text(str(p.pid))
-        env = dict(self.environment, ENV_FILE=str(self.root / '.env'))
-        env.pop('NUWAX_INSTALL_HOME')
-        self.shell('stop_existing_gateway', environment=env)
-        self.exited(p)
-        self.assertFalse(self.pidfile.exists())
-        self.shell('stop_existing_gateway', environment=env)
 
     def prepare_supervisor(self):
         script = self.root / 'scripts/start_gateway.sh'
@@ -293,7 +225,7 @@ class CleanupTests(unittest.TestCase):
     def cli(self, script, action, expected=0):
         self.counter += 1
         result = subprocess.run(['bash', str(script), action], cwd=self.root, text=True,
-                                capture_output=True, timeout=10)
+                                capture_output=True, timeout=10, env=dict(os.environ, NUWAX_INSTALL_HOME=str(self.home)))
         (self.base / ('cli-' + str(self.counter) + '-' + action + '.log')).write_text(result.stdout + result.stderr)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return result
@@ -301,7 +233,7 @@ class CleanupTests(unittest.TestCase):
     def launch_supervisor(self, script, action, label, relative=False, bootstrap=None):
         logpath = self.base / ('supervisor-' + label + '.log')
         with logpath.open('w') as log:
-            environment = dict(os.environ)
+            environment = dict(os.environ, NUWAX_INSTALL_HOME=str(self.home))
             if relative:
                 environment['NUWAX_BOOTSTRAP_ENV_FILE'] = '.env'
             p = subprocess.Popen(['bash', str(script), action], cwd=self.root, env=environment,
@@ -315,23 +247,19 @@ class CleanupTests(unittest.TestCase):
         self.assertIn(('NUWAX_BOOTSTRAP_ENV_FILE=' + str(bootstrap or self.root / '.env')).encode(), Path('/proc', str(p.pid), 'environ').read_bytes().split(b'\0'))
         return p
 
-    def test_signal_trap_preserves_ownership_and_managed_predicates(self):
+    def test_signal_trap_preserves_ownership_predicates(self):
         own = self.spawn('ordinary-owned-child')
         other = self.spawn('ordinary-other-child', owner='other')
-        managed = self.spawn('nuwax-nav-stack')
         code = '''check_trap() {
   process_belongs_to_instance "$OWN" || exit 71
   if process_belongs_to_instance "$OTHER"; then exit 72; fi
-  process_managed_by_systemd "$MANAGED" || exit 73
-  if process_managed_by_systemd "$OWN"; then exit 74; fi
-}
+ }
 trap check_trap TERM
 (sleep 0.1; kill -TERM $$) &
 wait "$!" || true
 '''
-        self.shell(code, environment=dict(self.environment, OWN=str(own.pid), OTHER=str(other.pid),
-                                         MANAGED=str(managed.pid), NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD='true'))
-        self.alive(own, other, managed)
+        self.shell(code, environment=dict(self.environment, OWN=str(own.pid), OTHER=str(other.pid)))
+        self.alive(own, other)
 
     def test_managed_launcher_supervisor_only_term_releases_children_and_lock(self):
         self.prepare_supervisor()
@@ -393,8 +321,6 @@ wait "$!" || true
         self.root = self.base / 'nuwax-nav-stack/source'
         (self.root / 'scripts').mkdir(parents=True)
         script = self.prepare_supervisor()
-        with (self.root / '.env').open('a') as config:
-            config.write('NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD=true\n')
         old = self.launch_supervisor(script, 'start', 'old')
         old_worker = (self.root / 'worker-ready').read_text()
         (self.root / 'worker-ready').unlink()

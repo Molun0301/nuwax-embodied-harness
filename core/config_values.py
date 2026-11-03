@@ -104,7 +104,7 @@ def configuration_location(*, root: Optional[Path] = None, environment=None,
         return None
     if robot is None:
         file_keys = environment.get("_NUWAX_CONFIG_FILE_KEYS", "").split(":")
-        robot = "" if "NUWAX_ACTIVE_ROBOT" in file_keys or environment.get("NUWAX_CONFIG_FROM_SYSTEMD_FILES") == "1" else environment.get("NUWAX_ACTIVE_ROBOT", "").strip()
+        robot = "" if "NUWAX_ACTIVE_ROBOT" in file_keys else environment.get("NUWAX_ACTIVE_ROBOT", "").strip()
         if not robot and active_file.is_symlink():
             try:
                 parts = active_file.resolve().relative_to(managed_profiles or drivers.resolve()).parts
@@ -220,21 +220,6 @@ def public_configuration_keys():
     return keys
 
 
-@lru_cache(maxsize=1)
-def systemd_file_keys():
-    """识别系统服务由旧环境文件物化的业务键，切换后缺省项不能继承旧值。"""
-    environment = dict(os.environ)
-    paths = [_PROJECT_ROOT / ".env", _PROJECT_ROOT / ".config", _PROJECT_ROOT / "drivers/go2/data_plane.env"]
-    paths.extend(Path(environment[key]).expanduser() for key in (
-        "NUWAX_BOOTSTRAP_ENV_FILE", "GO2_DATA_PLANE_ENV_FILE", "NUWAX_USER_CONFIG_ENV_FILE",
-        "NUWAX_GATEWAY_WEB_CONFIG_ENV_FILE", "NUWAX_GEOMETRY_WEB_CONFIG_ENV_FILE") if environment.get(key))
-    paths.extend(Path(item.strip()) / "pointcloud3d.env" for item in environment.get("STATE_DIRECTORY", "").split(":") if item.strip())
-    keys = set()
-    for path in paths:
-        keys.update(read_env_values(path))
-    public = set(public_configuration_keys())
-    public.update(alias for aliases in config_aliases().values() for alias in aliases)
-    return keys & public
 
 
 @contextmanager
@@ -257,11 +242,6 @@ def config_aliases() -> Dict[str, tuple]:
 def raw_value(name: str, default: str, file_values: Mapping[str, str]) -> str:
     snapshot = _SNAPSHOT.get()
     files, environment = (snapshot[0], snapshot[1]) if snapshot else (file_values, os.environ)
-    if environment.get("NUWAX_CONFIG_FROM_SYSTEMD_FILES") == "1":
-        if name in public_configuration_keys() and name in files:
-            return files[name]
-        if name in systemd_file_keys():
-            return next((files[alias] for alias in config_aliases().get(name, ()) if alias in files), default)
     if name in environment:
         return environment[name]
     if name in files:
@@ -336,8 +316,6 @@ def main() -> None:
     elif sys.argv[1] == "--merged":
         values = configuration_values()
         values["_NUWAX_CONFIG_LOAD_OK"] = "1"
-    elif sys.argv[1] == "--systemd-file-keys":
-        values = dict.fromkeys(systemd_file_keys(), "1")
     elif sys.argv[1] == "--public-keys":
         values = dict.fromkeys(public_configuration_keys(), "1")
     else:

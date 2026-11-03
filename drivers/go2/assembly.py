@@ -31,15 +31,6 @@ class Go2ClientFactories:
     vui_client_factory: Callable[[], Any]
 
 
-def _prepare_go2_sdk_path(config: "NuwaxRobotBridgeConfig") -> None:
-    sdk_path = str(config.dds.sdk_path or "").strip()
-    if not sdk_path:
-        return
-    normalized = str(Path(sdk_path).expanduser())
-    if normalized not in sys.path:
-        sys.path.insert(0, normalized)
-
-
 def _load_default_factories() -> Go2ClientFactories:
     """懒加载默认 Go2 工厂。"""
 
@@ -90,7 +81,6 @@ class Go2RobotAssembly(RobotAssemblyBase):
         )
 
     def __post_init__(self) -> None:
-        _prepare_go2_sdk_path(self.config)
         self.factories = self.factories or _load_default_factories()
         self.defaults = build_go2_defaults(self.config, self.iface)
         self.manifest = build_go2_manifest(self.config)

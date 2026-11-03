@@ -252,10 +252,9 @@ class LoggingConfig:
 
 @dataclass
 class DDSConfig:
-    """DDS 与 SDK 路径配置。"""
+    """DDS 网卡配置。"""
 
     iface: str = ""
-    sdk_path: str = "/home/unitree/unitree_sdk2_python"
 
 
 @dataclass
@@ -689,7 +688,6 @@ class GatewayServerConfig:
         "gateway",
         "nuwax-geometry-runtime",
         "nuwax-nav-stack",
-        "nuwax-lcm-runtime",
         "nuwax-go2-video-streamer",
     )
     telemetry_include_process_tree: bool = True
@@ -1058,7 +1056,6 @@ def load_config() -> NuwaxRobotBridgeConfig:
 
     dds = DDSConfig(
         iface=_cfg_str("GO2_DDS_IFACE", ""),
-        sdk_path=_cfg_str("GO2_SDK_PATH", "/home/unitree/unitree_sdk2_python"),
     )
 
     low_level = LowLevelControlConfig(
@@ -1120,7 +1117,6 @@ def load_config() -> NuwaxRobotBridgeConfig:
                 "gateway",
                 "nuwax-geometry-runtime",
                 "nuwax-nav-stack",
-                "nuwax-lcm-runtime",
                 "nuwax-go2-video-streamer",
             ),
         ),

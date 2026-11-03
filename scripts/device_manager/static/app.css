@@ -773,104 +773,19 @@ textarea.field {
   gap: 20px;
 }
 
-.migration-panel {
-  padding: 20px;
-  background: var(--inset);
-  border: 1px solid var(--line);
-  border-radius: var(--r);
-}
 
-.migration-header h3 {
-  font-size: 15px;
-  font-weight: 620;
-  color: var(--ink);
-  margin: 0 0 4px 0;
-}
 
-.migration-header p {
-  font-size: 12.5px;
-  color: var(--muted);
-  margin: 0 0 16px 0;
-}
 
-.migration-sources {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  margin-bottom: 16px;
-}
 
-.migration-source-item {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 12px;
-  background: var(--surface);
-  border: 2px solid var(--line);
-  border-radius: var(--r);
-  cursor: pointer;
-  transition: all 0.15s;
-}
 
-.migration-source-item:hover {
-  border-color: var(--brand);
-  background: var(--surface-hover);
-}
 
-.migration-source-item.selected {
-  border-color: var(--brand);
-  background: var(--brand-w);
-}
 
-.migration-source-radio {
-  flex: none;
-  width: 18px;
-  height: 18px;
-  border: 2px solid var(--line-2);
-  border-radius: 99px;
-  position: relative;
-}
 
-.migration-source-item.selected .migration-source-radio {
-  border-color: var(--brand);
-}
 
-.migration-source-item.selected .migration-source-radio::after {
-  content: '';
-  position: absolute;
-  top: 3px;
-  left: 3px;
-  width: 8px;
-  height: 8px;
-  border-radius: 99px;
-  background: var(--brand);
-}
 
-.migration-source-info {
-  flex: 1;
-  min-width: 0;
-}
 
-.migration-source-label {
-  font-size: 13.5px;
-  font-weight: 580;
-  color: var(--ink);
-  margin-bottom: 2px;
-}
 
-.migration-source-meta {
-  font-size: 11.5px;
-  color: var(--muted);
-  display: flex;
-  gap: 12px;
-  flex-wrap: wrap;
-}
 
-.migration-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 10px;
-}
 
 .step-actions {
   display: flex;

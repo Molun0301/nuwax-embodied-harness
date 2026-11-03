@@ -13,8 +13,6 @@ from datetime import datetime, timezone
 import importlib
 import logging
 import math
-from pathlib import Path
-import sys
 import threading
 import time
 from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, TYPE_CHECKING, Tuple
@@ -352,12 +350,6 @@ def _point_cloud_source_time_key(message: object) -> int:
 
 
 def _prepare_go2_official_sdk_environment(config: "Go2DataPlaneConfig") -> None:
-    sdk_path = str(config.sdk_path or "").strip()
-    if sdk_path:
-        candidate = Path(sdk_path).expanduser()
-        if candidate.exists() and str(candidate) not in sys.path:
-            sys.path.insert(0, str(candidate))
-
     importlib.invalidate_caches()
 
 

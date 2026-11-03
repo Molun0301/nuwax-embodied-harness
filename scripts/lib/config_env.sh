@@ -20,12 +20,6 @@ fi
 load_platform_config() {
   local key="" value="" loaded="" file_keys=""
   local -a old_keys=()
-  if [[ "${NUWAX_CONFIG_FROM_SYSTEMD_FILES:-0}" == "1" ]]; then
-    while IFS= read -r -d '' key && IFS= read -r -d '' value; do
-      unset '_NUWAX_CONFIG_INITIAL_KEYS['"${key}"']'
-      unset "${key}"
-    done < <(python3 "${_NUWAX_CONFIG_VALUES_SCRIPT}" --systemd-file-keys)
-  fi
   IFS=':' read -ra old_keys <<< "${_NUWAX_CONFIG_FILE_KEYS:-}"
   for key in "${old_keys[@]}"; do
     if [[ -n "${key}" && -z "${_NUWAX_CONFIG_INITIAL_KEYS[${key}]+x}" ]]; then

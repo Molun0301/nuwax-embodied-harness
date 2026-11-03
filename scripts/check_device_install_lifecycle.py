@@ -90,25 +90,10 @@ class Checks(unittest.TestCase):
         self.engine._fingerprint = lambda: {}
         job["_plan"]["_fingerprint"] = {}
         atomic_json(self.engine._job_path(job["id"]), job)
-        self.engine.run_job(job["id"])
+        with patch("scripts.device_manager.update_flow.adopt_manager"):
+            self.engine.run_job(job["id"])
         return read_json(self.engine._job_path(job["id"]))
 
-    def legacy(self):
-        root = self.root / "legacy"
-        prefix = root / "runtime_data/installation/generations/one"
-        prefix.mkdir(parents=True)
-        (root / "runtime_data/installation/current").symlink_to("generations/one")
-        (root / "scripts").mkdir()
-        (root / "scripts/start_gateway.sh").write_text("#!/bin/bash\n")
-        (root / "drivers").mkdir()
-        (prefix / "start.sh").write_text("#!/bin/bash\n")
-        self.legacy_values = {"NUWAX_ACTIVE_ROBOT": "customrobot", "NUWAX_GATEWAY_PORT": "9877",
-            "NUWAX_GATEWAY_PUBLIC_BASE_URL": "https://robot.example.invalid", "NUWAX_LOG_LEVEL": "DEBUG",
-            "NUWAX_GOOGLE_MAPS_API_KEY": "fixture-placeholder", "NUWAX_RUNTIME_DATA_DIR": str(root / "runtime_data")}
-        (prefix / "settings.env").write_text("".join(key + "=" + value + "\n" for key, value in self.legacy_values.items()))
-        atomic_json(prefix / "manifest.json", {"schema": 1, "complete": True, "modules": ["core"],
-                    "robot": "customrobot", "source_root": str(root)})
-        return root, prefix
 
     @staticmethod
     def source_tree(source):
@@ -220,7 +205,7 @@ class InstallLocationChecks(Checks):
         start = self.engine.runtime.start
         self.engine.runtime.start = lambda prefix: (started.append(prefix), start(prefix))[-1]
         self.assertEqual(self.run_job(self.job("start"))["status"], "succeeded")
-        with patch.object(self.engine, "_prepare", return_value=candidate):
+        with patch.object(self.engine, "_prepare_source", return_value=candidate):
             self.assertEqual(self.run_job(self.job("update"))["status"], "succeeded")
         self.assertEqual(self.engine.current()["prefix"], str(candidate))
         with patch.object(self.engine, "_existing", return_value={}), \
@@ -291,120 +276,6 @@ class StorageHookChecks(Checks):
         cleanup.assert_not_called()
 
 
-class MigrationChecks(Checks):
-    def test_plan_resolves_generation_configuration_and_robot(self):
-        root, prefix = self.legacy()
-        with (prefix / "settings.env").open("a") as handle:
-            handle.write("NUWAX_ACTIVE_ROBOT=go2\n")
-        with patch("scripts.device_manager.engine.subprocess.run", return_value=SimpleNamespace(stdout="", returncode=1)), \
-                patch("scripts.device_manager.sources.discover", return_value=self.source), \
-                patch("scripts.neh_system_helper.dependency_plan", return_value={"packages": [], "missing": []}):
-            plan = self.engine.plan({"action": "migrate", "source_path": str(root)}, local_request=True)
-        private = read_json(self.engine.home / "plans" / (plan["id"] + ".json"))
-        self.assertEqual(plan["robot"], "go2")
-        self.assertEqual(plan["modules"], ["core"])
-        self.assertEqual(plan["blockers"], [])
-        self.assertEqual(private["_migration"]["_configuration"]["NUWAX_GOOGLE_MAPS_API_KEY"], "fixture-placeholder")
-        self.assertEqual(private["_migration"]["launcher"], str(root / "runtime_data/installation/current/start.sh"))
-
-    def test_existing_config_precedence_matches_original_installer(self):
-        root, prefix = self.legacy()
-        (root / ".env").write_text("NUWAX_LOG_LEVEL=ERROR\n")
-        self.assertEqual(self.engine._migration_configuration(root)["NUWAX_LOG_LEVEL"], "DEBUG")
-        active = root / "runtime_data/settings/active.env"
-        active.parent.mkdir()
-        driver = root / "drivers/customrobot"
-        (driver / "configs").mkdir(parents=True)
-        (driver / "manifest.py").write_text("# fixture\n")
-        (driver / "assembly.py").write_text("# fixture\n")
-        profile = driver / "configs/selected.env"
-        profile.write_text("NUWAX_ACTIVE_ROBOT=customrobot\nNUWAX_LOG_LEVEL=WARNING\n")
-        active.symlink_to(profile)
-        self.assertEqual(self.engine._migration_configuration(root), read_existing(root))
-        self.assertEqual(self.engine._migration_configuration(root)["NUWAX_LOG_LEVEL"], "WARNING")
-        active.unlink()
-        (prefix / "settings.env").unlink()
-        self.assertEqual(self.engine._migration_configuration(root)["NUWAX_LOG_LEVEL"], "ERROR")
-
-    def test_source_preparation_preserves_generation_configuration(self):
-        root, prefix = self.legacy()
-        job = self.job("migrate", _source=self.source, _migration={"source": str(root)})
-        @contextmanager
-        def checkout(*args, **kwargs):
-            yield dict(self.source, root=root, changed_files=[], previous_revision="")
-        def export(root, revision, destination):
-            self.source_tree(destination)
-        def bridge(engine, source, candidate, operation, job):
-            return {"system_packages": []} if operation == "metadata" else {}
-        with patch("scripts.neh_source.source_checkout", checkout), patch("scripts.neh_source.export_source", export), \
-                patch("scripts.device_manager.sources.bridge", bridge), patch.object(engine_module, "probe", self.local_probe), \
-                patch.object(engine_module, "system_helper", side_effect=AssertionError("No system changes")):
-            candidate = self.engine._prepare_source(job)
-        values = read_settings(candidate / "settings.env")
-        self.assertEqual(values["NUWAX_GOOGLE_MAPS_API_KEY"], "fixture-placeholder")
-        self.assertEqual(values["NUWAX_GATEWAY_PUBLIC_BASE_URL"], self.legacy_values["NUWAX_GATEWAY_PUBLIC_BASE_URL"])
-        self.assertTrue(read_json(candidate / "installed.json")["complete"])
-
-    def test_catalog_preparation_preserves_generation_configuration(self):
-        root, prefix = self.legacy()
-        artifact = {"sha256": "b" * 64, "size": 1, "platform": {"python": "{}.{}".format(*sys.version_info[:2])}}
-        (self.engine.home / "cache" / (artifact["sha256"] + ".tar.gz")).write_bytes(b"x")
-        job = self.job("migrate", _artifact=artifact, _migration={"source": str(root)})
-        def unpack(archive, candidate, artifact, **kwargs):
-            self.source_tree(candidate / "source")
-            (candidate / "requirements.txt").write_text("")
-            return {"system_packages": [], "install": {"python": []}}
-        with patch.object(engine_module, "unpack", unpack), patch.object(engine_module, "digest_file", return_value=artifact["sha256"]), \
-                patch.object(engine_module, "platform_issues", return_value=[]), patch.object(engine_module, "run_command"), \
-                patch.object(engine_module, "probe", self.local_probe), \
-                patch("scripts.device_manager.downloads.prepare_dependencies", return_value=(self.root / "wheels", {})) as dependencies, \
-                patch.object(engine_module, "download", side_effect=AssertionError("No network")), \
-                patch.object(engine_module, "system_helper", side_effect=AssertionError("No system changes")):
-            candidate = self.engine._prepare(job)
-        self.assertEqual(dependencies.call_args.args[4]["NUWAX_GOOGLE_MAPS_API_KEY"], "fixture-placeholder")
-        self.assertEqual(read_settings(candidate / "settings.env")["NUWAX_LOG_LEVEL"], "DEBUG")
-
-    def test_final_copy_rereads_generation_and_persists_profile(self):
-        root, prefix = self.legacy()
-        with (prefix / "settings.env").open("a") as handle:
-            handle.write("NUWAX_LOG_LEVEL=WARNING\n")
-        data = root / "runtime_data/maps/example.txt"
-        data.parent.mkdir()
-        data.write_text("user map")
-        candidate = self.engine.home / "releases/candidate"
-        self.source_tree(candidate / "source")
-        (candidate / "settings.env").write_text("")
-        job = self.job("migrate", _migration={"source": str(root)})
-        job["_journal"] = {"candidate": str(candidate)}
-        with patch.object(engine_module, "probe", self.local_probe):
-            self.engine._copy_migration(job)
-            self.engine._activate_profile(candidate, "customrobot")
-        active = read_settings(self.engine.home / "data/settings/active.env")
-        self.assertEqual(active["NUWAX_GOOGLE_MAPS_API_KEY"], "fixture-placeholder")
-        self.assertEqual(active["NUWAX_LOG_LEVEL"], "WARNING")
-        self.assertEqual(active["NUWAX_RUNTIME_DATA_DIR"], str(self.engine.home / "data"))
-        self.assertEqual((self.engine.home / "data/maps/example.txt").read_text(), "user map")
-        self.assertTrue((prefix / "settings.env").is_file())
-        self.assertIn("data/maps/example.txt", job["_journal"]["migration_paths"])
-
-    def test_changed_generation_configuration_stales_migration(self):
-        root, prefix = self.legacy()
-        with patch.object(engine_module.subprocess, "run", return_value=SimpleNamespace(stdout="", returncode=1)):
-            info = self.engine._migration_info(str(root))
-            with (prefix / "settings.env").open("a") as handle:
-                handle.write("NUWAX_LOG_LEVEL=ERROR\n")
-            with self.assertRaises(ManagerError) as error:
-                self.engine._stop_migration(self.job("migrate", _migration=info))
-        self.assertEqual(error.exception.code, "plan_stale")
-
-    def test_legacy_restore_probes_generation_port(self):
-        root, prefix = self.legacy()
-        with patch.object(engine_module.subprocess, "Popen") as process, \
-                patch("urllib.request.build_opener") as opener:
-            process.return_value.poll.return_value = None
-            opener.return_value.open.return_value.__enter__.return_value.status = 200
-            self.engine._start_legacy(str(prefix / "start.sh"), str(root))
-        self.assertEqual(opener.return_value.open.call_args.args[0], "http://127.0.0.1:9877/api/health")
 
 
 class SourcePreflightChecks(Checks):

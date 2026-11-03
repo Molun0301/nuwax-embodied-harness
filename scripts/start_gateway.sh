@@ -50,10 +50,6 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/config_env.sh"
 
 
 default_gateway_web_config_env_file() {
-  if [[ -n "${STATE_DIRECTORY:-}" ]]; then
-    printf '%s/%s' "${STATE_DIRECTORY%%:*}" pointcloud3d.env
-    return
-  fi
   printf '%s' "${REPO_ROOT}/.env"
 }
 
@@ -70,28 +66,8 @@ source_runtime_script() {
   fi
 }
 
-geometry_runtime_managed_by_systemd() {
-  is_truthy "${NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD:-false}"
-}
-
-nav_stack_managed_by_systemd() {
-  is_truthy "${NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD:-false}"
-}
-
-motion_guard_managed_by_systemd() {
-  is_truthy "${NUWAX_MOTION_GUARD_MANAGED_BY_SYSTEMD:-${NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD:-false}}"
-}
-
 should_start_motion_guard() {
   [[ -n "${NUWAX_MOTION_GUARD_BACKEND:-}" ]]
-}
-
-person_follow_managed_by_systemd() {
-  is_truthy "${NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD:-false}"
-}
-
-go2_video_streamer_managed_by_systemd() {
-  is_truthy "${NUWAX_GO2_VIDEO_STREAMER_MANAGED_BY_SYSTEMD:-false}"
 }
 
 person_follow_autostart_enabled() {
@@ -99,10 +75,6 @@ person_follow_autostart_enabled() {
 }
 
 default_gateway_lock_file() {
-  if [[ -d /run/nuwax/gateway ]]; then
-    printf '%s' /run/nuwax/gateway/start_gateway.lock
-    return
-  fi
   printf '%s' "${REPO_ROOT}/runtime_data/gateway/start_gateway.lock"
 }
 
@@ -264,16 +236,11 @@ pid_pgid() {
 }
 
 process_belongs_to_instance() {
-  # Explicit statuses also preserve predicate results in a signal trap. Bare
-  # return there would inherit the interrupted wait status (for example 143).
-  local pid="$1" entry="" home="" bootstrap="" launcher="" expected=""
-  local -a argv=()
+  local pid="$1" entry="" home="" expected=""
   [[ -r "/proc/${pid}/environ" ]] || return 1
   while IFS= read -r -d '' entry; do
     case "${entry}" in
       NUWAX_INSTALL_HOME=*) home="${entry#*=}" ;;
-      NUWAX_BOOTSTRAP_ENV_FILE=*) bootstrap="${entry#*=}" ;;
-      NUWAX_SETTINGS_LAUNCHER=*) launcher="${entry#*=}" ;;
     esac
   done < "/proc/${pid}/environ" 2>/dev/null
 
@@ -284,61 +251,6 @@ process_belongs_to_instance() {
       [[ "$(readlink -m -- "${home}")" == "${expected}" ]]
       return $?
     fi
-    # Older managed generations may only export their settings/launcher path.
-    for entry in "${bootstrap}" "${launcher}"; do
-      [[ "${entry}" = /* ]] || continue
-      case "$(readlink -m -- "${entry}")" in
-        "${expected}"/generations/*/settings.env|"${expected}"/generations/*/start.sh) return 0 ;;
-      esac
-    done
-    return 1
-  fi
-  [[ -z "${home}" ]] || return 1
-  if [[ -n "${bootstrap}" ]]; then
-    # Relative legacy markers cannot establish where the process loaded config.
-    [[ "${bootstrap}" = /* ]] || return 1
-    [[ "$(readlink -m -- "${bootstrap}")" == "$(readlink -m -- "${ENV_FILE}")" ]]
-    return $?
-  fi
-  # Legacy default-config children exported the launcher but not bootstrap.
-  [[ "$(readlink -m -- "${ENV_FILE}")" == "${REPO_ROOT}/.env" ]] || return 1
-  if [[ -n "${launcher}" ]]; then
-    [[ "${launcher}" = /* ]] || return 1
-    [[ "$(readlink -m -- "${launcher}")" == "${REPO_ROOT}/scripts/start_gateway.sh" ]]
-    return $?
-  fi
-  # An old unmarked supervisor can still be stopped through its own PID file,
-  # exact script invocation and working directory. Names alone never suffice.
-  [[ "${pid}" == "$(read_pid_file)" ]] || return 1
-  [[ "$(readlink -f -- "/proc/${pid}/cwd")" == "${REPO_ROOT}" ]] || return 1
-  mapfile -d '' -t argv < "/proc/${pid}/cmdline"
-  entry="${argv[0]:-}"
-  case "${entry##*/}" in bash|nuwax-gateway-supervisor) ;; *) return 1 ;; esac
-  entry="${argv[1]:-}"
-  [[ "${entry}" = /* ]] || entry="${REPO_ROOT}/${entry}"
-  [[ "$(readlink -m -- "${entry}")" == "${REPO_ROOT}/scripts/start_gateway.sh" ]]
-}
-
-process_managed_by_systemd() {
-  local executable=""
-  local -a argv=()
-  [[ -r "/proc/$1/cmdline" ]] || return 1
-  mapfile -d '' -t argv < "/proc/$1/cmdline" 2>/dev/null || return 1
-  executable="${argv[0]:-}"
-  executable="${executable##*/}"
-  # Only executable titles/basenames identify native roles; paths and ordinary
-  # arguments can contain component names without making the process a component.
-  case "${executable}" in
-    nuwax-geometry-runtime|nuwax-lcm-runtime) geometry_runtime_managed_by_systemd; return $? ;;
-    nuwax-nav-stack) nav_stack_managed_by_systemd; return $? ;;
-    nuwax-person-follow) person_follow_managed_by_systemd; return $? ;;
-    nuwax-video-streamer|nuwax-go2-video-streamer) go2_video_streamer_managed_by_systemd; return $? ;;
-  esac
-  # The Python component launcher uses: python[version] -m <module>.
-  if [[ "${executable}" =~ ^python([0-9]+([.][0-9]+)*)?$
-    && "${argv[1]:-}" == "-m" && "${argv[2]:-}" == "drivers.go2.video_streamer" ]]; then
-    go2_video_streamer_managed_by_systemd
-    return $?
   fi
   return 1
 }
@@ -354,17 +266,14 @@ send_signal_to_process_scope() {
     return 0
   fi
   process_belongs_to_instance "${pid}" || return 0
-  process_managed_by_systemd "${pid}" && return 0
 
   pgid="$(pid_pgid "${pid}")"
   self_pgid="$(pid_pgid "$$")"
   if [[ -n "${pgid}" && "${pgid}" != "${self_pgid}" ]]; then
-    # A process group can contain other instances. Keep descendant cleanup,
-    # but preserve other owners and components delegated to systemd.
+    # 进程组可能包含其它安装的进程，只清理本安装拥有的成员。
     while read -r member member_pgid; do
       if [[ "${member_pgid}" == "${pgid}" && "${member}" != "${pid}" ]] \
-        && process_belongs_to_instance "${member}" \
-        && ! process_managed_by_systemd "${member}"; then
+        && process_belongs_to_instance "${member}"; then
         kill "-${signal}" -- "${member}" >/dev/null 2>&1 || true
       fi
     done < <(ps -eo pid=,pgid=)
@@ -400,7 +309,6 @@ terminate_process_scope() {
     echo "leaving ${label} pid ${pid}: installation ownership does not match" >&2
     return 0
   fi
-  process_managed_by_systemd "${pid}" && return 0
 
   echo "stopping ${label} pid ${pid}..."
   send_signal_to_process_scope TERM "${pid}"
@@ -423,7 +331,6 @@ terminate_person_follow_scope() {
     return 0
   fi
   process_belongs_to_instance "${pid}" || return 0
-  process_managed_by_systemd "${pid}" && return 0
 
   echo "stopping nuwax-person-follow pid ${pid}..."
   # The Rust owner handles SIGINT and publishes a final typed zero during teardown.
@@ -460,9 +367,6 @@ cleanup_stale_gateway_processes() {
 }
 
 cleanup_stale_geometry_runtime_processes() {
-  if geometry_runtime_managed_by_systemd; then
-    return 0
-  fi
 
   local pid=""
   local args=""
@@ -481,9 +385,6 @@ cleanup_stale_geometry_runtime_processes() {
 }
 
 cleanup_stale_person_follow_processes() {
-  if person_follow_managed_by_systemd; then
-    return 0
-  fi
 
   local pid=""
   local args=""
@@ -498,9 +399,6 @@ cleanup_stale_person_follow_processes() {
 }
 
 cleanup_stale_go2_video_streamer() {
-  if go2_video_streamer_managed_by_systemd; then
-    return 0
-  fi
 
   # Reclaim this instance's orphan streamer, never another service's streamer.
   local pid=""
@@ -521,9 +419,7 @@ cleanup_external_geometry_processes() {
   local args=""
   local lcm_patterns=(
     "nuwax-geometry-runtime"
-    "nuwax-lcm-runtime"
     "nuwax-nav-stack"
-    "nuwax-video-streamer"
   )
 
   if ! is_truthy "${NUWAX_GATEWAY_CLEANUP_EXTERNAL_GEOMETRY:-true}"; then
@@ -537,11 +433,6 @@ cleanup_external_geometry_processes() {
     process_belongs_to_instance "${pid}" || continue
     for pattern in "${lcm_patterns[@]}"; do
       if [[ "${args}" == *"${pattern}"* ]]; then
-        case "${pattern}" in
-          nuwax-nav-stack) nav_stack_managed_by_systemd && break ;;
-          nuwax-video-streamer) go2_video_streamer_managed_by_systemd && break ;;
-          *) geometry_runtime_managed_by_systemd && break ;;
-        esac
         terminate_process_scope "${pid}" "external LCM/native geometry process (${pattern})"
         break
       fi
@@ -633,10 +524,6 @@ start_motion_guard() {
   if [[ -n "${MOTION_GUARD_PID}" ]] && is_pid_alive "${MOTION_GUARD_PID}"; then
     return 0
   fi
-  # 系统服务管理的守卫不归启动器所有，是否可用由网关和导航程序实际连接判定。
-  if motion_guard_managed_by_systemd; then
-    return 0
-  fi
   echo "正在启动运动安全守卫"
   (run_with_title "nuwax-motion-safety-guard" "${PYTHON_BIN}" -m services.navigation.motion_safety_guard) &
   MOTION_GUARD_PID="$!"
@@ -650,12 +537,8 @@ start_motion_guard() {
 }
 
 stop_motion_guard() {
-  if motion_guard_managed_by_systemd; then
-    return 0
-  fi
   if [[ -n "${MOTION_GUARD_PID}" ]] && is_pid_alive "${MOTION_GUARD_PID}" \
-    && process_belongs_to_instance "${MOTION_GUARD_PID}" \
-    && ! process_managed_by_systemd "${MOTION_GUARD_PID}"; then
+    && process_belongs_to_instance "${MOTION_GUARD_PID}"; then
     terminate_process_scope "${MOTION_GUARD_PID}" "运动安全守卫"
     wait "${MOTION_GUARD_PID}" >/dev/null 2>&1 || true
   fi
@@ -665,10 +548,6 @@ stop_motion_guard() {
 start_nav_stack() {
   if [[ -n "${NAV_STACK_PID}" ]] && is_pid_alive "${NAV_STACK_PID}"; then
     return 0
-  fi
-  if nav_stack_managed_by_systemd; then
-    wait_for_nav_stack_ready
-    return
   fi
   if ! is_truthy "${NUWAX_NAV_AUTOSTART:-true}"; then
     echo "nuwax-nav-stack disabled by NUWAX_NAV_AUTOSTART"
@@ -700,10 +579,6 @@ start_geometry_runtime() {
   # 通过通用 env 加载器启动原生几何运行时。
   if [[ -n "${GEOMETRY_RUNTIME_PID}" ]] && is_pid_alive "${GEOMETRY_RUNTIME_PID}"; then
     return 0
-  fi
-  if geometry_runtime_managed_by_systemd; then
-    wait_for_geometry_runtime_ready
-    return
   fi
   if ! is_truthy "${NUWAX_GEOMETRY_EXTERNAL_ENABLED:-true}"; then
     echo "nuwax-geometry-runtime disabled by NUWAX_GEOMETRY_EXTERNAL_ENABLED"
@@ -751,9 +626,6 @@ start_person_follow() {
   local launcher="${REPO_ROOT}/scripts/systemd/start_person_follow.sh"
 
   if [[ -n "${PERSON_FOLLOW_PID}" ]] && person_follow_is_alive "${PERSON_FOLLOW_PID}"; then
-    return 0
-  fi
-  if person_follow_managed_by_systemd; then
     return 0
   fi
   if ! person_follow_autostart_enabled; then
@@ -810,16 +682,13 @@ abort_person_follow_startup() {
 }
 
 start_go2_video_streamer() {
-  if go2_video_streamer_managed_by_systemd; then
-    return 0
-  fi
   if [[ -n "${VIDEO_STREAMER_PID}" ]] && is_pid_alive "${VIDEO_STREAMER_PID}"; then
     return 0
   fi
   if ! should_start_go2_video_streamer; then
     return 0
   fi
-  if ! geometry_runtime_managed_by_systemd && ! start_geometry_runtime; then
+  if ! start_geometry_runtime; then
     echo "nuwax-geometry-runtime is not ready; not starting the Go2 video streamer that depends on its receiver" >&2
     return 1
   fi
@@ -829,12 +698,8 @@ start_go2_video_streamer() {
 }
 
 stop_geometry_runtime() {
-  if geometry_runtime_managed_by_systemd; then
-    return 0
-  fi
   if [[ -n "${GEOMETRY_RUNTIME_PID}" ]] && is_pid_alive "${GEOMETRY_RUNTIME_PID}" \
-    && process_belongs_to_instance "${GEOMETRY_RUNTIME_PID}" \
-    && ! process_managed_by_systemd "${GEOMETRY_RUNTIME_PID}"; then
+    && process_belongs_to_instance "${GEOMETRY_RUNTIME_PID}"; then
     terminate_process_scope "${GEOMETRY_RUNTIME_PID}" "nuwax-geometry-runtime"
     wait "${GEOMETRY_RUNTIME_PID}" >/dev/null 2>&1 || true
   fi
@@ -843,12 +708,8 @@ stop_geometry_runtime() {
 }
 
 stop_nav_stack() {
-  if nav_stack_managed_by_systemd; then
-    return 0
-  fi
   if [[ -n "${NAV_STACK_PID}" ]] && is_pid_alive "${NAV_STACK_PID}" \
-    && process_belongs_to_instance "${NAV_STACK_PID}" \
-    && ! process_managed_by_systemd "${NAV_STACK_PID}"; then
+    && process_belongs_to_instance "${NAV_STACK_PID}"; then
     terminate_process_scope "${NAV_STACK_PID}" "nuwax-nav-stack"
     wait "${NAV_STACK_PID}" >/dev/null 2>&1 || true
   fi
@@ -857,13 +718,9 @@ stop_nav_stack() {
 }
 
 stop_person_follow() {
-  if person_follow_managed_by_systemd; then
-    return 0
-  fi
   if [[ -n "${PERSON_FOLLOW_PID}" ]]; then
     if person_follow_is_alive "${PERSON_FOLLOW_PID}" \
-      && process_belongs_to_instance "${PERSON_FOLLOW_PID}" \
-      && ! process_managed_by_systemd "${PERSON_FOLLOW_PID}"; then
+      && process_belongs_to_instance "${PERSON_FOLLOW_PID}"; then
       terminate_person_follow_scope "${PERSON_FOLLOW_PID}"
       wait "${PERSON_FOLLOW_PID}" >/dev/null 2>&1 || true
     fi
@@ -872,9 +729,6 @@ stop_person_follow() {
 }
 
 monitor_geometry_runtime() {
-  if geometry_runtime_managed_by_systemd; then
-    return 0
-  fi
   while [[ "${STOP_REQUESTED}" -eq 0 ]]; do
     sleep 5
     if [[ -n "${GEOMETRY_RUNTIME_PID}" ]] && ! is_pid_alive "${GEOMETRY_RUNTIME_PID}"; then
@@ -890,7 +744,7 @@ monitor_geometry_runtime() {
 }
 
 monitor_nav_stack() {
-  if nav_stack_managed_by_systemd || ! is_truthy "${NUWAX_NAV_AUTOSTART:-true}"; then
+  if ! is_truthy "${NUWAX_NAV_AUTOSTART:-true}"; then
     return 0
   fi
   while [[ "${STOP_REQUESTED}" -eq 0 ]]; do
@@ -915,7 +769,7 @@ monitor_person_follow() {
   local watched_gateway_pid="${GATEWAY_PID}"
   local interval="${NUWAX_PERSON_FOLLOW_MONITOR_INTERVAL_SEC:-0.5}"
 
-  if person_follow_managed_by_systemd || ! person_follow_autostart_enabled; then
+  if ! person_follow_autostart_enabled; then
     return 0
   fi
   if [[ -z "${watched_person_follow_pid}" ]]; then
@@ -944,8 +798,7 @@ start_person_follow_monitor() {
 
 stop_person_follow_monitor() {
   if [[ -n "${PERSON_FOLLOW_MONITOR_PID}" ]] && is_pid_alive "${PERSON_FOLLOW_MONITOR_PID}" \
-    && process_belongs_to_instance "${PERSON_FOLLOW_MONITOR_PID}" \
-    && ! process_managed_by_systemd "${PERSON_FOLLOW_MONITOR_PID}"; then
+    && process_belongs_to_instance "${PERSON_FOLLOW_MONITOR_PID}"; then
     kill -TERM "${PERSON_FOLLOW_MONITOR_PID}" >/dev/null 2>&1 || true
     wait "${PERSON_FOLLOW_MONITOR_PID}" >/dev/null 2>&1 || true
   fi
@@ -1040,22 +893,22 @@ check_runtime_activation_cancelled() {
 }
 
 start_runtime_activation_component() {
-  local component="$1" pid_variable="$2" manager="$3"
+  local component="$1" pid_variable="$2"
   local previous_pid="${!pid_variable}" result=0 registered=0
   RUNTIME_ACTIVATION_STAGE="${component}"
   check_runtime_activation_cancelled || return 1
   write_runtime_activation_result activating "${component}" "正在启动所需运行组件。"
   # 启动函数等待期间也可能收到退出信号，先登记本次将拥有的新组件。
-  if ! "${manager}" && { [[ -z "${previous_pid}" ]] || ! is_pid_alive "${previous_pid}"; }; then
+  if [[ -z "${previous_pid}" ]] || ! is_pid_alive "${previous_pid}"; then
     RUNTIME_ACTIVATION_STARTED+=("${component}")
     registered=1
   fi
   "start_${component}" || result=$?
-  if [[ "${registered}" -eq 0 ]] && ! "${manager}" && [[ -n "${!pid_variable}" && "${!pid_variable}" != "${previous_pid}" ]]; then
+  if [[ "${registered}" -eq 0 ]] && [[ -n "${!pid_variable}" && "${!pid_variable}" != "${previous_pid}" ]]; then
     RUNTIME_ACTIVATION_STARTED+=("${component}")
   fi
   check_runtime_activation_cancelled || return 1
-  if [[ "${result}" -ne 0 ]] || { ! "${manager}" && [[ -z "${!pid_variable}" ]]; }; then
+  if [[ "${result}" -ne 0 ]] || [[ -z "${!pid_variable}" ]]; then
     fail_runtime_activation failed "${component}" "所需运行组件未启动或已被禁用。" runtime_activation_failed
     return 1
   fi
@@ -1070,24 +923,20 @@ activate_requested_runtime_components() {
       || "${RUNTIME_ACTIVATION_LEVEL}" == "motion" \
       || "${RUNTIME_ACTIVATION_LEVEL}" == "person_follow" ]]; then
       if should_start_motion_guard; then
-        start_runtime_activation_component motion_guard MOTION_GUARD_PID motion_guard_managed_by_systemd || return 1
+        start_runtime_activation_component motion_guard MOTION_GUARD_PID || return 1
       fi
     fi
     if [[ "${RUNTIME_ACTIVATION_LEVEL}" == "motion" \
       || "${RUNTIME_ACTIVATION_LEVEL}" == "person_follow" ]]; then
-      start_runtime_activation_component nav_stack NAV_STACK_PID nav_stack_managed_by_systemd || return 1
+      start_runtime_activation_component nav_stack NAV_STACK_PID || return 1
     fi
     if [[ "${RUNTIME_ACTIVATION_LEVEL}" == "geometry" \
       || "${RUNTIME_ACTIVATION_LEVEL}" == "motion" \
       || "${RUNTIME_ACTIVATION_LEVEL}" == "person_follow" ]]; then
-      start_runtime_activation_component geometry_runtime GEOMETRY_RUNTIME_PID geometry_runtime_managed_by_systemd || return 1
+      start_runtime_activation_component geometry_runtime GEOMETRY_RUNTIME_PID || return 1
     fi
     if [[ "${RUNTIME_ACTIVATION_LEVEL}" == "person_follow" ]]; then
-      start_runtime_activation_component person_follow PERSON_FOLLOW_PID person_follow_managed_by_systemd || return 1
-      if person_follow_managed_by_systemd && ! wait_for_person_follow_ready; then
-        fail_runtime_activation failed person_follow "人物跟随组件未就绪。" runtime_activation_failed
-        return 1
-      fi
+      start_runtime_activation_component person_follow PERSON_FOLLOW_PID || return 1
     fi
     check_runtime_activation_cancelled || return 1
     # 就绪结果发布后，本次组件成为可复用的已启动资源。
@@ -1174,17 +1023,13 @@ monitor_runtime_activation_requests() {
 }
 
 start_runtime_activation_monitor() {
-  if geometry_runtime_managed_by_systemd && nav_stack_managed_by_systemd && motion_guard_managed_by_systemd; then
-    return 0
-  fi
   monitor_runtime_activation_requests &
   RUNTIME_ACTIVATION_MONITOR_PID="$!"
 }
 
 stop_runtime_activation_monitor() {
   if [[ -n "${RUNTIME_ACTIVATION_MONITOR_PID}" ]] && is_pid_alive "${RUNTIME_ACTIVATION_MONITOR_PID}" \
-    && process_belongs_to_instance "${RUNTIME_ACTIVATION_MONITOR_PID}" \
-    && ! process_managed_by_systemd "${RUNTIME_ACTIVATION_MONITOR_PID}"; then
+    && process_belongs_to_instance "${RUNTIME_ACTIVATION_MONITOR_PID}"; then
     kill -TERM "${RUNTIME_ACTIVATION_MONITOR_PID}" >/dev/null 2>&1 || true
     wait "${RUNTIME_ACTIVATION_MONITOR_PID}" >/dev/null 2>&1 || true
   fi
@@ -1195,8 +1040,7 @@ stop_runtime_monitors() {
   local monitor_pid=""
   for monitor_pid in "${NAV_STACK_MONITOR_PID}" "${GEOMETRY_MONITOR_PID}"; do
     if [[ -n "${monitor_pid}" ]] && is_pid_alive "${monitor_pid}" \
-      && process_belongs_to_instance "${monitor_pid}" \
-      && ! process_managed_by_systemd "${monitor_pid}"; then
+      && process_belongs_to_instance "${monitor_pid}"; then
       kill -TERM "${monitor_pid}" >/dev/null 2>&1 || true
       wait "${monitor_pid}" >/dev/null 2>&1 || true
     fi
@@ -1206,13 +1050,8 @@ stop_runtime_monitors() {
 }
 
 stop_go2_video_streamer() {
-  if go2_video_streamer_managed_by_systemd; then
-    VIDEO_STREAMER_PID=""
-    return 0
-  fi
   if [[ -n "${VIDEO_STREAMER_PID}" ]] && is_pid_alive "${VIDEO_STREAMER_PID}" \
-    && process_belongs_to_instance "${VIDEO_STREAMER_PID}" \
-    && ! process_managed_by_systemd "${VIDEO_STREAMER_PID}"; then
+    && process_belongs_to_instance "${VIDEO_STREAMER_PID}"; then
     terminate_process_scope "${VIDEO_STREAMER_PID}" "go2 video streamer"
     wait "${VIDEO_STREAMER_PID}" >/dev/null 2>&1 || true
   fi
@@ -1228,8 +1067,7 @@ stop_gateway() {
   # 客户端在重启窗口期 GetFrameTree 立即抛 UNAVAILABLE，日志刷一长串
   # "failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:50051"。
   if [[ -n "${GATEWAY_PID}" ]] && is_pid_alive "${GATEWAY_PID}" \
-    && process_belongs_to_instance "${GATEWAY_PID}" \
-    && ! process_managed_by_systemd "${GATEWAY_PID}"; then
+    && process_belongs_to_instance "${GATEWAY_PID}"; then
     terminate_process_scope "${GATEWAY_PID}" "gateway worker"
     wait "${GATEWAY_PID}" >/dev/null 2>&1 || true
   fi

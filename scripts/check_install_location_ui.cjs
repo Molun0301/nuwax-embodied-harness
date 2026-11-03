@@ -62,7 +62,7 @@ const userHome = '/home/user';
 const installDir = '/mnt/机器人 data/<literal>& "directory"';
 const newParent = '/mnt/new NEH';
 const newInstallDir = newParent + '/' + installFolder;
-const status = (overrides = {}) => ({ installation: { installed: false, install_dir: installDir, parent_dir: '/mnt/机器人 data', user_home: userHome, manager_dir: '/home/user/.local/share/neh', location_editable: true, ...overrides } });
+const status = (overrides = {}) => ({ installation: { installed: false, install_dir: installDir, parent_dir: '/mnt/机器人 data', user_home: userHome, manager_dir: '/home/user/Nuwax-embodied-harness', location_editable: true, ...overrides } });
 (async () => {
   initWizardEvents();
   state.hardwareReady = true;
@@ -224,7 +224,7 @@ const status = (overrides = {}) => ({ installation: { installed: false, install_
   await el('saveInstallDir').click();
   assert.equal(calls.length, beforeDuplicate, 'Repeated save does not duplicate the request');
   assert.equal(el('browseInstallDir').disabled, true);
-  pendingSave.resolve(json({ install_dir: newInstallDir, parent_dir: newParent, user_home: userHome, manager_dir: '/home/user/.local/share/neh', editable: true }));
+  pendingSave.resolve(json({ install_dir: newInstallDir, parent_dir: newParent, user_home: userHome, manager_dir: '/home/user/Nuwax-embodied-harness', editable: true }));
   await firstSave;
   oldHardware.resolve(json({ hardware: { free_disk_bytes: 999999 }, supported: true }));
   await oldHardwareRequest;

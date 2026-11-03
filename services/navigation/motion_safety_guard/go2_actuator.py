@@ -7,7 +7,6 @@ import importlib
 import json
 import math
 import os
-from pathlib import Path
 import sys
 import threading
 import time
@@ -85,20 +84,7 @@ _STOP_NOT_ACCEPTED_MESSAGE = "执行器未接受停车命令（返回码 -1）"
 _NONWALKING_MODES = frozenset({0, 5, 6, 7, 10})
 
 
-def _prepend_sdk_path(path_value: str) -> Path:
-    path = Path(path_value).expanduser().resolve()
-    if not path.is_dir():
-        raise ActuatorError("SDK_PATH_INVALID", f"GO2_SDK_PATH is not a directory: {path}")
-    normalized = str(path)
-    if normalized in sys.path:
-        sys.path.remove(normalized)
-    sys.path.insert(0, normalized)
-    return path
-
-
-def _load_sdk_factories(sdk_path: str) -> Go2Factories:
-    if sdk_path:
-        _prepend_sdk_path(sdk_path)
+def _load_sdk_factories() -> Go2Factories:
     try:
         channel_module = importlib.import_module("unitree_sdk2py.core.channel")
         sport_module = importlib.import_module(
@@ -352,10 +338,6 @@ class Go2Actuator:
                 "BACKEND_NOT_PRODUCTION",
                 "NUWAX_MOTION_GUARD_BACKEND must be unitree_sdk2py",
             )
-        sdk_path = (
-            runtime_value("GO2_SDK_PATH", "").strip()
-            or runtime_value("NUWAX_GO2_SDK_PATH", "").strip()
-        )
         try:
             timeout = float(runtime_value("GO2_OFFICIAL_CLIENT_TIMEOUT_SEC", "3.0"))
             max_linear = float(
@@ -404,7 +386,7 @@ class Go2Actuator:
             or None
         )
         return cls(
-            factories=_load_sdk_factories(sdk_path),
+            factories=_load_sdk_factories(),
             dds_iface=iface,
             timeout_seconds=min(timeout, MAX_PRODUCTION_SDK_TIMEOUT_SECONDS),
             max_linear_velocity_mps=max_linear,

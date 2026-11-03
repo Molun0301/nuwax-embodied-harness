@@ -98,21 +98,6 @@ class BudgetChecks(unittest.TestCase):
             self.assertEqual(json.loads(result.stdout)["plan"]["jobs"], expected)
         self.assertFalse((self.root / "installation").exists())
 
-    def test_remote_tools_bundle_imports_budget_only_after_source_sync(self):
-        tools = self.root / "tools"
-        shutil.copytree(ROOT / "scripts/go2_update", tools / "scripts/go2_update", ignore=shutil.ignore_patterns("__pycache__"))
-        selected = self.root / "source"
-        (selected / "scripts").mkdir(parents=True)
-        (selected / "scripts/__init__.py").touch()
-        shutil.copytree(ROOT / "scripts/module_installer", selected / "scripts/module_installer", ignore=shutil.ignore_patterns("__pycache__"))
-        environment = dict(os.environ, CARGO_BUILD_JOBS="3")
-        environment.pop("PYTHONPATH", None)
-        command = [sys.executable, "-m", "scripts.go2_update.build"]
-        subprocess.run(command + ["--help"], cwd=tools, env=environment, check=True, stdout=subprocess.PIPE)
-        completed = subprocess.run(command + ["--root", str(selected), "--cache", str(self.root / "cache")],
-                                   cwd=tools, env=environment, check=True, stdout=subprocess.PIPE, text=True)
-        self.assertIn("构建并行预算：3", completed.stdout)
-        self.assertEqual(json.loads((self.root / "cache/artifacts.json").read_text()), {})
 
 
 def real_jobserver(cargo, cmake, evidence):

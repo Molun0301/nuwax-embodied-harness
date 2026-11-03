@@ -1,65 +1,39 @@
 """管理程序独立更新，复用引导器的封闭归档校验，不触碰业务拥有方。"""
 from __future__ import annotations
 
-import re
 import shutil
 import sys
-import urllib.parse
 from pathlib import Path
 
-from scripts.neh_bootstrap import (MAX_MANAGER_BYTES, BootstrapError, remove_incomplete_manager, require_install_layout,
-                                   unpack_manager, switch_link, version_tuple)
+from scripts.neh_bootstrap import (BootstrapError, remove_incomplete_manager, require_install_layout,
+                                   unpack_manager, switch_link)
 
 from . import MANAGER_REVISION
 from .common import ManagerError, atomic_json, digest_file, identifier, read_json
-from .releases import download, validate_url
 from .runtime import clean_environment, run_command
-
-
-def manager_metadata(engine, catalog, local=None):
-    metadata = catalog.get("manager")
-    if not isinstance(metadata, dict):
-        raise ManagerError("manager_unavailable", "当前版本目录没有管理程序发布包。", 409)
-    metadata = dict(metadata)
-    identifier(metadata.get("version", ""))
-    if not re.fullmatch(r"[0-9a-f]{64}", str(metadata.get("sha256", ""))) or type(metadata.get("size")) is not int or not 0 < metadata["size"] <= MAX_MANAGER_BYTES:
-        raise ManagerError("manager_invalid", "管理发布包的大小或摘要声明无效。")
-    python = metadata.get("python", {})
-    try:
-        if not version_tuple(python.get("minimum")) <= sys.version_info[:2] < version_tuple(python.get("maximum_exclusive")):
-            raise ValueError()
-    except Exception as exc:
-        raise ManagerError("manager_incompatible", "管理发布包不支持当前Python解释器。") from exc
-    source = Path(local).resolve().as_uri() if local else engine.settings()["feed_url"]
-    metadata["url"] = urllib.parse.urljoin(source, metadata.get("url", ""))
-    validate_url(metadata["url"], allow_file=bool(local))
-    return metadata
 
 
 def apply_manager(engine, job):
     plan = job["_plan"]
-    source = plan.get("_source")
-    if source and source["revision"] == MANAGER_REVISION:
+    source = plan["_source"]
+    if source["revision"] == MANAGER_REVISION:
         engine._journal(job, committed=True)
         return {"manager_version": source["version"], "revision": source["revision"], "unchanged": True, "restart_required": False}
-    if source:
-        from scripts.neh_source import source_checkout
-        engine._progress(job, "manager_source", 5, "获取固定源码并在设备本地组装管理程序")
-        archive = engine.home / "cache" / ("source-manager-" + job["id"] + ".tar.gz")
-        with source_checkout(engine.home, source["repository"], source["branch"], source["revision"],
-                             run=run_command, allow_local=source.get("allow_local", False),
-                             cancelled=lambda: engine._cancelled(job["id"]),
-                             progress=lambda message: engine._progress(job, "manager_source", 25, message)) as checkout:
-            # 使用目标提交自己的打包规则，新增管理依赖不会被旧版本白名单遗漏。
-            run_command([sys.executable, "-B", "-m", "scripts.device_manager.source_package", "--root", str(checkout["root"]),
-                         "--output", str(archive), "--version", source["version"]], cwd=checkout["root"],
-                        environment=clean_environment(), timeout=180, cancelled=lambda: engine._cancelled(job["id"]))
-            manifest = read_json(archive.with_name(archive.name + ".manifest.json"), {})
-            if manifest.get("revision") != source["revision"]:
-                raise ManagerError("manager_mismatch", "本地管理程序源码修订与已确认计划不一致。")
-        metadata = {"version": source["version"], "revision": source["revision"], "sha256": digest_file(archive), "size": archive.stat().st_size}
-    else:
-        metadata = plan["_manager"]
+    from scripts.neh_source import source_checkout
+    engine._progress(job, "manager_source", 5, "获取固定源码并在设备本地组装管理程序")
+    archive = engine.home / "cache" / ("source-manager-" + job["id"] + ".tar.gz")
+    with source_checkout(engine.home, source["repository"], source["branch"], source["revision"],
+                         run=run_command, allow_local=source.get("allow_local", False),
+                         cancelled=lambda: engine._cancelled(job["id"]),
+                         progress=lambda message: engine._progress(job, "manager_source", 25, message)) as checkout:
+        # 使用目标提交自己的打包规则，新增管理依赖不会被旧版本白名单遗漏。
+        run_command([sys.executable, "-B", "-m", "scripts.device_manager.source_package", "--root", str(checkout["root"]),
+                     "--output", str(archive), "--version", source["version"]], cwd=checkout["root"],
+                    environment=clean_environment(), timeout=180, cancelled=lambda: engine._cancelled(job["id"]))
+        manifest = read_json(archive.with_name(archive.name + ".manifest.json"), {})
+        if manifest.get("revision") != source["revision"]:
+            raise ManagerError("manager_mismatch", "本地管理程序源码修订与已确认计划不一致。")
+    metadata = {"version": source["version"], "revision": source["revision"], "sha256": digest_file(archive), "size": archive.stat().st_size}
     root = engine.manager_home / "manager"
     versions = root / "versions"
     versions.mkdir(parents=True, exist_ok=True)
@@ -72,12 +46,6 @@ def apply_manager(engine, job):
     remove_incomplete_manager(target)
     if previous == target and target.exists():
         raise ManagerError("already_current", "当前管理程序已是此完整版本。", 409)
-    if not source:
-        archive = engine.home / "cache" / (metadata["sha256"] + ".manager.tar.gz")
-        engine._progress(job, "manager_download", 5, "下载管理程序发布包")
-        if not archive.is_file() or archive.stat().st_size != metadata["size"] or digest_file(archive) != metadata["sha256"]:
-            download(metadata, archive, progress=lambda n, total: engine._progress(job, "manager_download", 5 + int(45 * n / total), "正在下载管理程序"),
-                     cancelled=lambda: engine._cancelled(job["id"]), **engine._source_options(plan.get("_local_catalog")))
     engine._cancelled(job["id"])
     engine._progress(job, "manager_verify", 55, "验证管理归档和解释器入口")
     if not target.exists():
@@ -110,7 +78,6 @@ def apply_manager(engine, job):
     if previous:
         switch_link(root / "previous", previous)
     engine._journal(job, committed=True)
-    if source:
-        archive.unlink(missing_ok=True)
-        archive.with_name(archive.name + ".manifest.json").unlink(missing_ok=True)
+    archive.unlink(missing_ok=True)
+    archive.with_name(archive.name + ".manifest.json").unlink(missing_ok=True)
     return {"manager_version": metadata["version"], "revision": metadata.get("revision", ""), "restart_required": True}

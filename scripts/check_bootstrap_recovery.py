@@ -101,8 +101,7 @@ class BootstrapRecoveryChecks(unittest.TestCase):
             return SimpleNamespace(returncode=0)
         if "settings" in command:
             values = {}
-            for flag, name in (("--source-repository", "source_repository"), ("--source-branch", "source_branch"),
-                               ("--feed-url", "feed_url"), ("--channel", "channel")):
+            for flag, name in (("--source-repository", "source_repository"), ("--source-branch", "source_branch")):
                 if flag in command:
                     values[name] = command[command.index(flag) + 1]
             if values:
@@ -177,14 +176,16 @@ class BootstrapRecoveryChecks(unittest.TestCase):
     def test_incomplete_manager_is_replaced_in_place_by_self_update(self):
         from scripts.device_manager.self_update import apply_manager
         digest = bootstrap.digest_file(self.archive)
-        archive = self.home / "cache" / (digest + ".manager.tar.gz")
-        archive.write_bytes(self.archive.read_bytes())
         target = self.home / "manager/versions" / ("fixture-candidate-" + digest[:16])
         target.mkdir()
         (target / "partial").touch()
-        job = {"id": "candidate", "log": [], "_plan": {"_manager": {
-            "version": "fixture-candidate", "sha256": digest, "size": archive.stat().st_size}}}
-        with patch("scripts.device_manager.self_update.run_command"):
+        source = {"version": "fixture-candidate", "revision": "a" * 40, "repository": "https://example.invalid/neh.git", "branch": "main"}
+        job = {"id": "candidate", "log": [], "_plan": {"_source": source}}
+        archive = self.home / "cache/source-manager-candidate.tar.gz"
+        archive.write_bytes(self.archive.read_bytes())
+        archive.with_name(archive.name + ".manifest.json").write_text(json.dumps({"revision": source["revision"]}))
+        with patch("scripts.neh_source.source_checkout") as checkout, patch("scripts.device_manager.self_update.run_command"):
+            checkout.return_value.__enter__.return_value = {"root": self.home}
             result = apply_manager(self.engine, job)
         self.assertEqual(result["manager_version"], "fixture-candidate")
         self.assertEqual((self.home / "manager/current").resolve(), target)
@@ -358,7 +359,7 @@ class BootstrapRecoveryChecks(unittest.TestCase):
     def test_generated_launcher_pins_custom_location_despite_environment_and_cwd(self):
         self.fail_launch = False
         self.assertEqual(bootstrap.install(self.args), 0)
-        self.engine.save_settings({"source_mode": "catalog", "feed_url": ""})
+        self.engine.save_settings({"auto_update": "off"})
         other_home = self.home.parent / "unrelated installation"
         environment = dict(os.environ, NEH_HOME=str(other_home))
         with patch.object(subprocess, "Popen", START_PROCESS):

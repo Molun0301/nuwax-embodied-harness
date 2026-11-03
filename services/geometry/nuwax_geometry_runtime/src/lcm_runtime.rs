@@ -10432,13 +10432,7 @@ impl LegacyGlobalMapDemandConfig {
             matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
         let person_follow_ready_file = std::env::var_os("NUWAX_PERSON_FOLLOW_READY_FILE")
             .filter(|path| !path.is_empty()).map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                if truthy("NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD") {
-                    "/run/nuwax/person-follow/nuwax_person_follow.ready".into()
-                } else {
-                    "runtime_data/person-follow/nuwax_person_follow.ready".into()
-                }
-            });
+            .unwrap_or_else(|| "runtime_data/person-follow/nuwax_person_follow.ready".into());
         Self {
             explicit_full: truthy("NUWAX_GEOMETRY_LEGACY_GLOBAL_MAP_FULL"),
             person_follow_ready_file,

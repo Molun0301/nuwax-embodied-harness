@@ -15,18 +15,16 @@ from pathlib import Path
 
 from scripts.module_installer.catalog import MODULES, ModuleError, module_system_packages, resolve_modules
 from scripts.module_installer.hardware import detect_hardware, recommend_modules
-from scripts.module_installer.manager import existing_config
 from scripts.module_installer.runtime import read_settings, _VALUES
 
 from . import MANAGER_DEVELOPMENT, MANAGER_REVISION, MANAGER_VERSION, PACKAGE_ROOT
 from .config_client import ConfigurationClient
-from .common import (ManagerError, compare_versions, atomic_json, atomic_write, digest_file, file_lock,
+from .common import (ManagerError, atomic_json, atomic_write, file_lock,
                      fsync_directory, identifier, process_alive, process_identity, read_json, timestamp)
-from .releases import download, github_catalog_url, load_catalog, platform_issues, unpack, validate_url
 from .runtime import Runtime, append_job_output, clean_environment, probe, run_command, system_helper
 
 TERMINAL = {"succeeded", "failed", "cancelled", "interrupted"}
-ACTIONS = {"install", "update", "modules", "rollback", "start", "stop", "restart", "migrate", "update-manager"}
+ACTIONS = {"install", "update", "modules", "rollback", "start", "stop", "restart", "update-manager"}
 
 
 class Cancelled(ManagerError):
@@ -115,15 +113,12 @@ class Engine:
         return {key: value for key, value in settings.items() if not key.startswith("_")}
 
     def save_settings(self, values, *, allow_local_source=False):
-        from .sources import is_project_default
         from scripts.neh_source import SourceError, validate_repository
         values = dict(values)
-        if set(values) - {"feed_url", "source_repository", "source_branch", "source_mode", "channel", "auto_start", "gateway_port",
+        if set(values) - {"source_repository", "source_branch", "channel", "auto_start", "gateway_port",
                           "auto_update", "check_interval_minutes", "maintenance_window"}:
             raise ManagerError("invalid_settings", "存在未知管理设置。")
-        if "feed_url" in values and values["feed_url"]:
-            validate_url(values["feed_url"])
-        if "channel" in values and values["channel"] not in ("stable", "preview"):
+        if "channel" in values:
             from scripts.neh_source import _branch
             channel = values["channel"]
             if channel == "main":
@@ -137,7 +132,7 @@ class Engine:
                 raise ManagerError("invalid_settings", "当前通道支持main或branch:分支名称，stable尚未开放。")
             if values.get("source_branch", branch) != branch:
                 raise ManagerError("invalid_settings", "通道与源码分支不一致。")
-            values.update(source_branch=branch, source_mode="git")
+            values.update(source_branch=branch)
         elif "source_branch" in values and "channel" not in values:
             values["channel"] = "main" if values["source_branch"] == "main" else "branch:" + str(values["source_branch"])
         if "auto_update" in values and values["auto_update"] not in ("off", "notify", "idle"):
@@ -149,8 +144,6 @@ class Engine:
             if not isinstance(values["maintenance_window"], str):
                 raise ManagerError("invalid_settings", "维护窗口必须是字符串。")
             validate_window(values["maintenance_window"])
-        if "source_mode" in values and values["source_mode"] not in ("git", "catalog"):
-            raise ManagerError("invalid_settings", "源码模式只支持git或catalog。")
         if "source_branch" in values and (not isinstance(values["source_branch"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}", values["source_branch"]) or ".." in values["source_branch"]):
             raise ManagerError("invalid_settings", "源码分支名称无效。")
         if "source_repository" in values:
@@ -159,16 +152,6 @@ class Engine:
             except SourceError as exc:
                 raise ManagerError("invalid_settings", str(exc)) from exc
             values["_allow_local_source"] = bool(allow_local_source)
-            if values.get("source_mode") != "catalog":
-                values.update(source_mode="git", feed_url=values["source_repository"])
-        elif "feed_url" in values:
-            if is_project_default(values["feed_url"]) and values.get("source_mode") != "catalog":
-                from scripts.neh_source import DEFAULT_REPOSITORY
-                values.update(source_mode="git", source_repository=DEFAULT_REPOSITORY, feed_url=DEFAULT_REPOSITORY, _allow_local_source=False)
-            else:
-                values["source_mode"] = "catalog"
-        elif "source_branch" in values and "source_mode" not in values:
-            values["source_mode"] = "git"
         if "auto_start" in values and not isinstance(values["auto_start"], bool):
             raise ManagerError("invalid_settings", "auto_start必须是布尔值。")
         if "gateway_port" in values:
@@ -187,8 +170,6 @@ class Engine:
                 (self.manager_home / "config/update-check.json").unlink(missing_ok=True)
         return self.settings()
 
-    def _source_options(self, catalog=None):
-        return {"allow_file": bool(catalog)}
 
     def current(self):
         link = self.home / "current"
@@ -230,56 +211,24 @@ class Engine:
                                  requires=list(item.requires), conflicts=list(item.conflicts), installed=item.key in selected)
                             for item in MODULES.values()], "selected": selected, "robot": current.get("robot", "customrobot"), "robots": ["customrobot", "go2"], "robot_labels": {"customrobot": "标准机器人接入", "go2": "宇树Go2"}}
 
-    def catalog(self, refresh=False, local=None):
-        settings = self.settings()
-        if not local and settings["source_mode"] == "git":
-            from .sources import discover
-            source = discover(self, refresh=refresh)
-            return {"schema_version": 1, "product": "neh", "source": source, "releases": [],
-                    "manager": {"version": source["version"], "revision": source["revision"]}}
-        url = str(Path(local).resolve()) if local else settings["feed_url"]
-        if not url:
-            return {"schema_version": 1, "product": "neh", "releases": []}
-        cache = read_json(self.home / "cache/catalog.json", {})
-        if local or refresh or cache.get("url") != url or cache.get("channel") != settings["channel"]:
-            options = self._source_options(local)
-            resolved, github = (url, False) if local else github_catalog_url(url, settings["channel"])
-            catalog = load_catalog(resolved, **options)
-            catalog["_github_channel"] = github
-            if not local:
-                atomic_json(self.home / "cache/catalog.json", {"url": url, "channel": settings["channel"], "catalog": catalog})
-            return catalog
-        return cache.get("catalog", {"releases": []})
+    def catalog(self, refresh=False):
+        from .sources import discover
+        source = discover(self, refresh=refresh)
+        return {"schema_version": 1, "product": "neh", "source": source, "releases": [],
+                "manager": {"version": source["version"], "revision": source["revision"]}}
 
-    @staticmethod
-    def _ordered_releases(catalog):
-        from functools import cmp_to_key
-        def compare(first, second):
-            return compare_versions(first["version"], second["version"], first.get("published_at"), second.get("published_at")) or 0
-        return sorted(catalog["releases"], key=cmp_to_key(compare), reverse=True)
-
-    def releases(self, refresh=False, local=None):
+    def releases(self, refresh=False):
         settings = self.settings()
-        result = {"configured": bool(local or settings["feed_url"]), "channel": settings["channel"], "feed_url": settings["feed_url"], "releases": []}
+        result = {"configured": bool(settings["source_repository"]), "channel": settings["channel"], "releases": []}
         try:
-            hardware = self.hardware()["hardware"]
-            catalog = self.catalog(refresh=refresh, local=local)
-            if catalog.get("source"):
-                source = catalog["source"]
-                result.update(source_mode="git", source_repository=source["repository"], source_branch=source["branch"], source_revision=source["revision"])
-                result["releases"] = [{"version": source["version"], "revision": source["revision"], "channel": settings["channel"],
-                    "notes": "设备下载固定源码并按程序指纹复用、下载或构建", "published_at": source.get("channel_record", {}).get("published_at", ""), "compatible": self.hardware()["supported"],
-                    "display_version": source.get("channel_record", {}).get("version", source["branch"] + "@" + source["revision"][:8]),
-                    "reason": "", "modules": list(MODULES)}]
-                return result
-            for release in self._ordered_releases(catalog):
-                if release["channel"] != settings["channel"] and not (catalog.get("_github_channel") and settings["channel"] == "preview"):
-                    continue
-                artifacts = [a for a in release["artifacts"] if a.get("kind") == "runtime"]
-                compatible = [a for a in artifacts if not platform_issues(a["platform"], hardware)]
-                result["releases"].append({key: release.get(key, "") for key in ("version", "channel", "notes", "published_at")})
-                result["releases"][-1].update(compatible=bool(compatible), reason="" if compatible else "没有与当前系统匹配的运行包",
-                                              modules=sorted({m for a in compatible for m in a["modules"]}))
+            catalog = self.catalog(refresh=refresh)
+            source = catalog["source"]
+            result.update(source_repository=source["repository"], source_branch=source["branch"], source_revision=source["revision"])
+            result["releases"] = [{"version": source["version"], "revision": source["revision"], "channel": settings["channel"],
+                "notes": "设备下载固定源码并按程序指纹复用、下载或构建", "published_at": source.get("channel_record", {}).get("published_at", ""), "compatible": self.hardware()["supported"],
+                "display_version": source.get("channel_record", {}).get("version", source["branch"] + "@" + source["revision"][:8]),
+                "reason": "", "modules": list(MODULES)}]
+            return result
         except ManagerError as exc:
             if exc.code == "channel_pending":
                 result.update(pending=True, message=exc.message)
@@ -333,11 +282,9 @@ class Engine:
         history = read_json(self.home / "config/history.json", {})
         releases = self.releases()
         available = next((item for item in releases["releases"] if item["compatible"]), None)
-        current_published = current.get("published_at") or next((item.get("published_at") for item in releases["releases"] if item["version"] == current.get("version")), None)
-        relation = compare_versions(available["version"], current.get("version"), available.get("published_at"), current_published) if available and current else None
-        source_mode = self.settings()["source_mode"] == "git"
-        relation_name = {1: "newer", 0: "same", -1: "older"}.get(relation, "unknown")
-        if source_mode and available and current:
+        relation = None
+        relation_name = "unknown"
+        if available and current:
             from .versioning import revision_relation, source_tree_unchanged
             try:
                 relation_name = revision_relation(self, self.catalog()["source"], current.get("revision"))
@@ -347,13 +294,11 @@ class Engine:
                 relation_name = "unknown"
                 releases["error"] = "无法核对完整提交历史：" + str(exc)
             relation = {"newer": 1, "same": 0, "older": -1}.get(relation_name)
-        installed_manager = MANAGER_VERSION
-        try:
+        latest_manager = None
+        manager_relation = None
+        manager_relation_name = "unknown"
+        if available:
             latest_manager = self.catalog().get("manager", {}).get("version")
-        except ManagerError:
-            latest_manager = None
-        manager_relation = None if MANAGER_DEVELOPMENT else compare_versions(latest_manager, installed_manager)
-        if source_mode and available:
             from .versioning import revision_relation, source_tree_unchanged
             try:
                 manager_relation_name = revision_relation(self, self.catalog()["source"], MANAGER_REVISION)
@@ -362,9 +307,7 @@ class Engine:
             except (OSError, RuntimeError):
                 manager_relation_name = "unknown"
             manager_relation = {"newer": 1, "same": 0, "older": -1}.get(manager_relation_name)
-        else:
-            manager_relation_name = {1: "newer", 0: "same", -1: "older"}.get(manager_relation, "unknown")
-        channel_record = self.catalog().get("source", {}).get("channel_record", {}) if source_mode and available else {}
+        channel_record = self.catalog().get("source", {}).get("channel_record", {}) if available else {}
         installation = {"installed": bool(current), "install_dir": str(self.home), "version": current.get("version"), "modules": current.get("modules", []),
                         "robot": current.get("robot", "customrobot"), "previous_version": history.get("previous_version"), "source": current.get("source"), "revision": current.get("revision", "")}
         location = self.install_location()
@@ -447,22 +390,11 @@ class Engine:
         # 绑定共同拥有方的当前快照令牌及明确状态，不散列整个配置文件。
         return values
 
-    def plan(self, request, *, local_catalog=None, local_request=False):
+    def plan(self, request, *, local_request=False):
         self.recover_if_needed()
         if not isinstance(request, dict) or request.get("action") not in ACTIONS:
             raise ManagerError("invalid_action", "请选择受支持的管理操作。")
         action = request["action"]
-        if request.get("source_id") and action == "migrate" and not local_request:
-            sources = self.migration_sources()["sources"]
-            source = next((item for item in sources if item["id"] == request["source_id"]), None)
-            if not source:
-                raise ManagerError("source_missing", "未发现该受认可安装源，请刷新迁入检测。", 409)
-            request = dict(request, source_path=source["source"])
-            local_request = True
-        if (request.get("source_path") or local_catalog) and not local_request:
-            raise ManagerError("local_only", "本机路径和迁入操作只能通过设备命令行提交。", 403)
-        if action == "migrate" and not local_request:
-            raise ManagerError("local_only", "现有部署迁入需要在设备本地命令行执行。", 403)
         current, settings = self.current(), self.settings()
         hardware = self.hardware()
         try:
@@ -473,7 +405,7 @@ class Engine:
         if robot not in ("customrobot", "go2"):
             raise ManagerError("robot_unsupported", "当前完整启动器支持通用机器人和Go2；其它驱动仍待适配。")
         blockers, warnings, steps = [], [], []
-        if action in ("install", "migrate"):
+        if action == "install":
             configuration = request.get("configuration", {})
             if not isinstance(configuration, dict):
                 raise ManagerError("invalid_config", "预配置必须是对象。")
@@ -482,7 +414,7 @@ class Engine:
                 if process_alive(server.get("process")) and server.get("public_url"):
                     request = dict(request, configuration=dict(configuration, NUWAX_GATEWAY_PUBLIC_BASE_URL=server["public_url"]))
                 warnings.append("命令行首次安装请确认公开制品地址；可通过configuration.NUWAX_GATEWAY_PUBLIC_BASE_URL指定远端可达的管理台地址。")
-        if action in ("install", "migrate") and current:
+        if action == "install" and current:
             blockers.append("已有安装，请使用更新或模块调整。")
         if action in ("update", "modules", "rollback", "start", "stop", "restart") and not current:
             blockers.append("尚未安装业务版本。")
@@ -493,36 +425,11 @@ class Engine:
         plan = {"id": uuid.uuid4().hex, "action": action, "install_dir": str(self.home), "version": request.get("version"), "modules": modules, "robot": robot,
                 "steps": steps, "warnings": warnings, "blockers": blockers, "download_bytes": 0, "requires_stop": requires_stop,
                 "_fingerprint": self._fingerprint(), "_created": time.time(), "_request": request,
-                "_local_catalog": str(Path(local_catalog).resolve()) if local_catalog else None, "download_breakdown": {"application": 0, "dependencies": None, "models": None}}
-        if action == "update-manager" and not local_catalog and settings["source_mode"] == "git":
+                "download_breakdown": {"application": 0, "dependencies": None, "models": None}}
+        if action == "update-manager":
             self._plan_source(plan, request, local_request)
-        elif action == "update-manager":
-            from .self_update import manager_metadata
-            metadata = manager_metadata(self, self.catalog(refresh=True, local=local_catalog), local_catalog)
-            if request.get("version") and request["version"] != metadata["version"]:
-                blockers.append("版本目录当前没有请求的管理程序版本。")
-            if MANAGER_DEVELOPMENT:
-                warnings.append("当前运行源码开发入口，此操作将切换到选定的管理发布版本。")
-            elif compare_versions(metadata["version"], MANAGER_VERSION) == -1:
-                warnings.append("选定管理版本早于当前版本，将执行降级；业务版本保持不变。")
-            plan.update(version=metadata["version"], download_bytes=metadata["size"], _manager=metadata, download_breakdown={"application": metadata["size"], "dependencies": 0, "models": 0})
-            steps.extend([{"title": "下载并校验独立管理程序"}, {"title": "切换管理程序并重启网页进程"}])
-        elif action in ("install", "update", "modules", "migrate"):
+        elif action in ("install", "update", "modules"):
             blockers.extend(hardware["issues"])
-            if action == "migrate":
-                plan["_migration"] = self._migration_info(request.get("source_path", ""))
-                if "robot" not in request:
-                    robot = plan["_migration"].get("robot", robot)
-                    plan["robot"] = robot
-                if "modules" not in request and plan["_migration"].get("modules"):
-                    modules = list(resolve_modules(plan["_migration"]["modules"]))
-                    plan["modules"] = modules
-                if robot not in ("customrobot", "go2"):
-                    blockers.append("迁入源的机器人类型没有完整产品启动支持。")
-                warnings.append("迁入复制现有数据和配置；源安装保留，旧自动启动入口停用。")
-                if plan["_migration"]["running"] and not request.get("stop_running"):
-                    blockers.append("迁入源正在运行，请明确允许停止原拥有方。")
-                plan["requires_stop"] = plan["requires_stop"] or plan["_migration"]["running"]
             if hardware["hardware"].get("is_jetson") and set(plan["modules"]) & {"perception", "memory"}:
                 # 与源码构建前置检查使用同一探测，生成计划时就给出原因。
                 from scripts.module_installer.manager import InstallError, jetson_vendor_packages
@@ -530,42 +437,7 @@ class Engine:
                     jetson_vendor_packages(sys.executable)
                 except InstallError as exc:
                     blockers.append(str(exc))
-            if not local_catalog and settings["source_mode"] == "git":
-                self._plan_source(plan, request, local_request)
-            else:
-                catalog = self.catalog(refresh=True, local=local_catalog)
-                selected = None
-                mismatches = []
-                for release in self._ordered_releases(catalog):
-                    if (release["channel"] != settings["channel"] and not (catalog.get("_github_channel") and settings["channel"] == "preview")) or (request.get("version") and release["version"] != request["version"]):
-                        continue
-                    for artifact in release["artifacts"]:
-                        if artifact.get("kind") != "runtime" or artifact.get("robot") != robot or set(artifact.get("modules", [])) != set(modules):
-                            continue
-                        issues = platform_issues(artifact.get("platform", {}), hardware["hardware"])
-                        if issues:
-                            mismatches.extend(issues)
-                            continue
-                        selected = dict(artifact, version=release["version"], revision=release.get("revision", ""), published_at=release.get("published_at"))
-                        break
-                    if selected:
-                        break
-                if not selected:
-                    blockers.append("没有与版本、模块集合、机器人及目标环境匹配的发布包。" + "；".join(dict.fromkeys(mismatches)))
-                else:
-                    if current and compare_versions(selected["version"], current["version"], selected.get("published_at"), current.get("published_at")) == -1:
-                        warnings.append("选定业务版本早于当前版本，将执行降级；持久数据与用户配置保持。")
-                    plan.update(version=selected["version"], download_bytes=selected["size"], _artifact=selected)
-                    plan["download_breakdown"] = {"application": selected["size"], "dependencies": selected.get("dependency_bytes"), "models": selected.get("model_bytes")}
-                    if selected.get("dependency_bytes") is not None and selected.get("model_bytes") is not None:
-                        plan["download_bytes"] = selected["size"] + selected["dependency_bytes"] + selected["model_bytes"]
-                        warnings.append("下载量是首次安装的上限；已校验的依赖缓存与模型可复用。")
-                    else:
-                        plan["download_bytes"] = None
-                        warnings.append("依赖与模型下载量将在校验轻量业务包后确定；应用包大小不代表总下载量。")
-                    if hardware["hardware"]["free_disk_bytes"] < selected["size"] * 3 + 512 * 1024 ** 2:
-                        blockers.append("可用磁盘空间不足以安全准备候选版本。")
-                steps.extend([{"title": "下载并验证发布包"}, {"title": "按固定配方下载依赖与模型并准备运行环境"}, {"title": "保存配置并切换版本"}])
+            self._plan_source(plan, request, local_request)
             if robot == "go2":
                 warnings.append("Go2首次安装按官方流程编译Python接口适配并缓存；DDS原生库直接使用宇树官方预编译文件，后续安装复用已校验缓存。")
         elif action == "rollback":
@@ -711,7 +583,7 @@ class Engine:
                     failures[revision] = {"time": timestamp(), "error": error.as_dict(), "job_id": job_id}
                     atomic_json(self.manager_home / "config/failed-updates.json", failures)
                 self._progress(job, "failed", job["progress"], error.message)
-            if (job["status"] == "succeeded" and job["action"] in {"install", "update", "modules", "migrate", "rollback", "update-manager"}
+            if (job["status"] == "succeeded" and job["action"] in {"install", "update", "modules", "rollback", "update-manager"}
                     and not job["result"].get("unchanged")):
                 # 安装已经提交；存储保留失败不能触发安装回滚。
                 try:
@@ -818,17 +690,6 @@ class Engine:
                     raise ManagerError("owner_identity", "恢复时发现不属于本事务的业务拥有方，拒绝停止。", 409)
             self._restore_profiles(journal)
             self._switch(previous)
-        for relative in reversed(journal.get("migration_paths", [])):
-            original = self.home / relative
-            retained = self.home / "cache" / ("migration-" + job["id"]) / relative
-            if original.exists() or original.is_symlink():
-                retained.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(str(original), str(retained))
-        if journal.get("legacy_stopped"):
-            if journal.get("legacy_systemd"):
-                system_helper("restore-legacy")
-            elif journal.get("legacy_running"):
-                self._start_legacy(journal["legacy_launcher"], journal["legacy_source"])
         if journal.get("stop_intent") and journal.get("was_running") and previous and not self.runtime.status()["running"]:
             self.runtime.start(previous)
         if candidate and candidate != previous and candidate.name.endswith("-" + job["id"][:8]) and candidate.parent == self.home / "releases" and candidate.exists():
@@ -927,15 +788,12 @@ class Engine:
             candidate = self.home / "releases" / plan["_previous"]
             self._configure_candidate(candidate, plan, self._existing(current))
         else:
-            candidate = self._prepare(job)
+            candidate = self._prepare_source(job)
         self._cancelled(job["id"])
         if plan.get("_fingerprint") and plan["_fingerprint"] != self._fingerprint():
             raise ManagerError("plan_stale", "准备期间设备配置发生变化，保留当前版本，请重新生成计划。", 409)
         profiles = self._snapshot_profiles(plan["robot"])
         self._journal(job, candidate=str(candidate), profiles=profiles)
-        if action == "migrate":
-            self._stop_migration(job)
-            self._copy_migration(job)
         if action == "update":
             from .update_flow import wait_until_idle
             wait_until_idle(self, job)
@@ -959,127 +817,10 @@ class Engine:
             self._progress(job, "starting", 90, "启动原业务拥有方并验证网关接口")
             self.runtime.start(candidate)
         self._cancelled(job["id"])
-        if action == "migrate" and job["_journal"].get("legacy_systemd"):
-            system_helper("commit-legacy")
         atomic_json(self.home / "config/history.json", {"previous": previous.name if previous else None, "previous_version": current.get("version")})
         self._journal(job, committed=True)
         return {"version": plan["version"], "modules": plan["modules"], "robot": plan["robot"], "runtime": self.runtime.status()}
 
-    def _prepare(self, job):
-        if job["_plan"].get("_source"):
-            return self._prepare_source(job)
-        plan, job_id = job["_plan"], job["id"]
-        artifact = plan["_artifact"]
-        archive = self.home / "cache" / (artifact["sha256"] + ".tar.gz")
-        self._progress(job, "downloading", 5, "下载已固定摘要的发布包")
-        if not archive.is_file() or archive.stat().st_size != artifact["size"] or digest_file(archive) != artifact["sha256"].lower():
-            download(artifact, archive, progress=lambda count, size: self._progress(job, "downloading", 5 + int(25 * count / size), "正在下载发布包"),
-                     cancelled=lambda: self._cancelled(job_id), **self._source_options(plan.get("_local_catalog")))
-        self._cancelled(job_id)
-        if platform_issues(artifact["platform"], self.hardware()["hardware"]):
-            raise ManagerError("platform_mismatch", "执行时目标环境与发布包不匹配。")
-        candidate = self.home / "releases" / (identifier(plan["version"]) + "-" + artifact["sha256"][:12] + "-" + job_id[:8])
-        self._journal(job, candidate=str(candidate))
-        self._progress(job, "verifying", 32, "校验归档、清单和每个文件")
-        manifest = unpack(archive, candidate, artifact, cancelled=lambda: self._cancelled(job_id))
-        source = candidate / "source"
-        for required in (source / "scripts/start_gateway.sh", source / "scripts/module_installer/runtime.py", candidate / "requirements.txt"):
-            if not required.exists():
-                raise ManagerError("package_incomplete", "发布包缺少运行所需文件：" + str(required.relative_to(candidate)))
-        current = self.current()
-        existing = self._existing(current)
-        if plan.get("_migration"):
-            existing = self._migration_configuration(Path(plan["_migration"]["source"]))
-        from .downloads import MODEL_SETTINGS, prepare_dependencies, uses_default_model
-        configuration = plan["_request"].get("configuration", {})
-        if not isinstance(configuration, dict):
-            raise ManagerError("invalid_config", "预配置必须是键值对象。")
-        model_choices = dict(existing)
-        for kind in ("TEXT", "IMAGE"):
-            key = "NUWAX_MEMORY_" + kind + "_EMBEDDING_MODEL"
-            if uses_default_model(model_choices.get(key, "")):
-                remembered = existing.get("_NUWAX_INSTALLER_SAVED_" + key, "")
-                if remembered:
-                    model_choices[key] = remembered
-        model_choices.update({key: str(value) for key, value in configuration.items() if key in MODEL_SETTINGS})
-        for name in ("bin", "lib", "lib64"):
-            payload = candidate / "payload" / name
-            if payload.exists():
-                shutil.copytree(payload, candidate / name)
-        wheelhouse, model_overrides = prepare_dependencies(self, candidate, manifest, artifact, model_choices, job)
-        from .downloads import apply_model_overrides
-        existing = apply_model_overrides(existing, model_overrides)
-        packages = manifest.get("system_packages", [])
-        if not isinstance(packages, list) or any(not isinstance(item, str) for item in packages):
-            raise ManagerError("manifest_invalid", "系统依赖声明不合法。")
-        from scripts.neh_system_helper import dependency_plan
-        try:
-            dependencies = dependency_plan({"packages": packages})
-        except (ValueError, RuntimeError) as exc:
-            raise ManagerError("system_dependencies_invalid", str(exc), 409) from exc
-        missing_packages = dependencies["missing"]
-        if missing_packages:
-            self._progress(job, "system_dependencies", 63, "通过固定系统助手安装运行依赖")
-            system_helper("install-dependencies", {"packages": packages})
-        python_version = artifact["platform"]["python"]
-        python = sys.executable if python_version == "{}.{}".format(*sys.version_info[:2]) else shutil.which("python" + python_version)
-        self._progress(job, "python_environment", 66, "创建本版本Python环境并安装刚下载且已校验的依赖")
-        environment = clean_environment(candidate)
-        run_command([python, "-m", "venv", str(candidate / "venv")], environment=environment, cancelled=lambda: self._cancelled(job_id))
-        interpreter = str(candidate / "venv/bin/python")
-        # Ubuntu20自带pip不认识部分现代轮子标签，先安装配方已校验的通用pip轮子。
-        for record in manifest["install"]["python"]:
-            if record["name"] == "pip":
-                run_command([interpreter, "-m", "pip", "--isolated", "install", "--no-index", "--no-deps", str(wheelhouse / record["filename"])],
-                            environment=environment, timeout=600, cancelled=lambda: self._cancelled(job_id))
-        run_command([interpreter, "-m", "pip", "--isolated", "install", "--no-index", "--only-binary=:all:", "--find-links", str(wheelhouse), "-r", str(candidate / "requirements.txt")],
-                    environment=environment, timeout=1800, cancelled=lambda: self._cancelled(job_id))
-        if "go2" in manifest["install"]:
-            from scripts.go2_dependencies import install
-            from .downloads import cached_download
-            # 官方归档已计入下载量；共享安装器再次核验缓存，不重复累计下载统计。
-            install(candidate, self.home / "cache/go2", manifest["install"]["go2"],
-                    fetch=lambda record: cached_download(self, record, filename=record["filename"], progress=lambda *_: None,
-                                                         cancelled=lambda: self._cancelled(job_id))[0],
-                    run=run_command, environment=environment, cancelled=lambda: self._cancelled(job_id),
-                    progress=lambda message: self._progress(job, "go2_dependencies", 68, message))
-        run_command([interpreter, "-m", "pip", "check"], environment=environment, cancelled=lambda: self._cancelled(job_id))
-        self._progress(job, "runtime_files", 70, "核对原生产物并生成统一启动入口")
-        if (source / "runtime_data").exists():
-            raise ManagerError("package_private_data", "发布源码不得包含用户运行数据。")
-        (source / "runtime_data").symlink_to(self.home / "data", target_is_directory=True)
-        for driver in (source / "drivers").iterdir():
-            if driver.is_dir():
-                configs = driver / "configs"
-                if configs.exists():
-                    raise ManagerError("package_private_data", "发布源码不得包含机器人私有配置。")
-                target = self.home / "config/profiles" / driver.name
-                target.mkdir(parents=True, exist_ok=True)
-                configs.symlink_to(target, target_is_directory=True)
-        self._configure_candidate(candidate, plan, existing)
-        from scripts.module_installer.catalog import module_imports
-        imports = module_imports(plan["modules"], plan["robot"])
-        code = "import importlib,json; [importlib.import_module(x) for x in json.loads(input())]"
-        run_command([interpreter, "-c", code], cwd=source, environment=environment, payload=json.dumps(imports), timeout=180,
-                    cancelled=lambda: self._cancelled(job_id))
-        for module, binary in (("geometry", "nuwax-geometry-runtime"), ("navigation", "nuwax-nav-stack"), ("follow", "nuwax-person-follow"),
-                               ("fastlio2", "fastlio2_native"), ("pointlio", "pointlio_native"), ("slam2d", "nuwax-slam-2d-worker")):
-            path = candidate / "bin" / binary
-            if module in plan["modules"] and (not path.is_file() or not os.access(str(path), os.X_OK)):
-                raise ManagerError("native_missing", "发布包缺少所选模块的原生产物：" + binary)
-        native_paths = [path for directory in (candidate / "bin", candidate / "lib", candidate / "lib64") if directory.exists() for path in directory.rglob("*") if path.is_file()]
-        for binary in native_paths:
-            with binary.open("rb") as handle:
-                elf = handle.read(4) == b"\x7fELF"
-            if not elf:
-                continue
-            checked = subprocess.run(["ldd", str(binary)], env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30)
-            if "not found" in checked.stdout or (checked.returncode and "not a dynamic executable" not in checked.stdout and "statically linked" not in checked.stdout):
-                from .runtime import safe_diagnostic
-                raise ManagerError("native_dependency_missing", "原生产物的系统依赖检查失败：" + binary.name, 500, {"diagnostic": safe_diagnostic(checked.stdout, self.home)})
-        atomic_json(candidate / "installed.json", {"complete": True, "version": plan["version"], "modules": plan["modules"], "robot": plan["robot"],
-                                                 "data_schema": 1, "source": "release", "artifact_sha256": artifact["sha256"], "published_at": artifact.get("published_at")})
-        return candidate
 
     def _prepare_source(self, job):
         from scripts.neh_source import source_checkout, export_source
@@ -1115,7 +856,7 @@ class Engine:
                     target = self.home / "config/profiles" / driver.name
                     target.mkdir(parents=True, exist_ok=True)
                     (driver / "configs").symlink_to(target, target_is_directory=True)
-            existing = self._migration_configuration(Path(plan["_migration"]["source"])) if plan.get("_migration") else self._existing(self.current())
+            existing = self._existing(self.current())
             self._configure_candidate(candidate, plan, existing, allow_pending_models=True)
             self._progress(job, "models", 65, "准备所选模型并复用已有模型文件")
             bridge(self, source, candidate, "models", job)
@@ -1185,179 +926,11 @@ class Engine:
         text = text.replace('export PYTHONNOUSERSITE=1', 'export PYTHONNOUSERSITE=1\nexport LD_LIBRARY_PATH=' + shlex.quote(str(candidate / "lib") + ":" + str(candidate / "lib64")))
         atomic_write(launcher, text.encode(), mode=0o755)
 
-    def migration_sources(self):
-        import hashlib
-        paths = {Path("/opt/nuwax_robot_bridge"), Path("/opt/nuwax/current"), Path.home() / "nuwax_robot_bridge"}
-        try:
-            state = subprocess.run(["systemctl", "show", "nuwax-gateway.service", "--property=WorkingDirectory", "--value"], capture_output=True, text=True, timeout=5)
-            value = state.stdout.strip()
-            if value.startswith("/"):
-                paths.add(Path(value))
-        except (OSError, subprocess.SubprocessError):
-            pass
-        sources = []
-        for path in paths:
-            if not (path / "scripts/start_gateway.sh").is_file():
-                continue
-            try:
-                info = self._migration_info(str(path))
-                info["id"] = hashlib.sha256(info["source"].encode()).hexdigest()[:24]
-                sources.append({key: value for key, value in info.items() if not key.startswith("_")})
-            except (ManagerError, OSError, ValueError):
-                continue
-        return {"sources": sources, "message": "网页只迁入已识别的原安装；其它路径可在设备本地使用migrate明确指定。"}
 
-    @staticmethod
-    def _migration_configuration(source):
-        prefix = source / "runtime_data/installation/current"
-        current = {"prefix": str(prefix)} if (prefix / "settings.env").is_file() else {}
-        return existing_config(source, current)
 
-    def _migration_info(self, source_path):
-        if not source_path:
-            raise ManagerError("source_missing", "迁入需要明确指定原项目目录。")
-        source = Path(source_path).expanduser().resolve()
-        if source == self.home or self.home in source.parents or source in self.home.parents:
-            raise ManagerError("source_invalid", "迁入源与管理安装目录不能互相包含。")
-        if not (source / "scripts/start_gateway.sh").is_file():
-            raise ManagerError("source_invalid", "迁入源缺少原统一启动器。")
-        values = self._migration_configuration(source)
-        systemd = any(str(values.get(key, "")).lower() in ("true", "1") for key in ("NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD", "NUWAX_NAV_STACK_MANAGED_BY_SYSTEMD"))
-        try:
-            result = subprocess.run(["systemctl", "show", "nuwax-gateway.service", "--property=WorkingDirectory,ExecStart,ActiveState"],
-                                    capture_output=True, text=True, timeout=5)
-            if str(source) in result.stdout:
-                systemd = True
-        except (OSError, subprocess.SubprocessError):
-            pass
-        launcher = source / "runtime_data/installation/current/start.sh"
-        if not launcher.is_file():
-            launcher = source / "scripts/start_gateway.sh"
-        try:
-            pid = int((source / "runtime_data/gateway/gateway.pid").read_text().strip())
-        except (OSError, ValueError):
-            pid = 0
-        legacy = read_json(source / "runtime_data/installation/current/manifest.json", {})
-        return {"source": str(source), "launcher": str(launcher), "systemd": systemd,
-                "robot": values.get("NUWAX_ACTIVE_ROBOT", legacy.get("robot", "customrobot")), "modules": legacy.get("modules", []), "_configuration": values,
-                "running": bool(process_identity(pid)) or (systemd and "ActiveState=active" in (result.stdout if "result" in locals() else ""))}
 
-    def _stop_migration(self, job):
-        info = job["_plan"]["_migration"]
-        fresh = self._migration_info(info["source"])
-        if any(fresh.get(key) != info.get(key) for key in ("running", "systemd", "launcher", "_configuration")):
-            raise ManagerError("plan_stale", "准备期间迁入源的拥有方或配置发生变化，请重新生成计划。", 409)
-        self._journal(job, legacy_stopped=False, legacy_systemd=info["systemd"], legacy_running=info["running"], legacy_launcher=info["launcher"], legacy_source=info["source"])
-        self._progress(job, "migration_stop", 68, "停止迁入源的原拥有方")
-        if info["systemd"]:
-            self._journal(job, legacy_stopped=True)
-            system_helper("stop-legacy")
-        else:
-            source = Path(info["source"])
-            if self.runtime._foreign_owners((source,)):
-                raise ManagerError("foreign_owner", "检测到迁入源以外的业务拥有方，拒绝原脚本的全局清理。", 409)
-            try:
-                pid = int((source / "runtime_data/gateway/gateway.pid").read_text().strip())
-            except (OSError, ValueError):
-                pid = 0
-            identity = process_identity(pid)
-            if identity:
-                if Path("/proc/{}/cwd".format(pid)).resolve() != source:
-                    raise ManagerError("owner_identity", "迁入源的进程身份不符，拒绝停止未知拥有方。", 409)
-                import signal
-                self._journal(job, legacy_stopped=True)
-                os.kill(pid, signal.SIGTERM)
-                deadline = time.monotonic() + 180
-                while process_alive(identity) and time.monotonic() < deadline:
-                    time.sleep(0.2)
-                if process_alive(identity):
-                    raise ManagerError("stop_incomplete", "迁入源拥有方尚未退出。", 409)
-            self._journal(job, legacy_stopped=True)
-            run_command(["bash", info["launcher"], "stop"], cwd=source, environment=clean_environment(), timeout=180)
 
-    def _copy_migration(self, job):
-        root = Path(job["_plan"]["_migration"]["source"])
-        self._progress(job, "migration_data", 72, "迁入持久数据和全部配置方案，保留源安装")
-        candidates = []
-        source = root / "runtime_data"
-        if source.is_dir():
-            candidates.extend((child, Path("data") / child.name) for child in source.iterdir() if child.name not in ("installation", "gateway", "settings", "logs"))
-        for driver in (root / "drivers").iterdir():
-            configs = driver / "configs"
-            if configs.is_dir():
-                candidates.extend((child, Path("config/profiles") / driver.name / child.name) for child in configs.iterdir() if child.is_file() and (child.name == ".active" or child.suffix == ".env"))
-        if (root / "artifacts").is_dir():
-            candidates.append((root / "artifacts", Path("data/artifacts")))
-        expanded = []
-        for child, relative in candidates:
-            if child.is_dir():
-                if child.is_symlink() or any(item.is_symlink() for item in child.rglob("*")):
-                    raise ManagerError("migration_external", "迁入源包含符号链接数据，请先在设备本地明确迁移方式：" + child.name)
-                expanded.extend((item, relative / item.relative_to(child)) for item in child.rglob("*") if item.is_file())
-            else:
-                expanded.append((child, relative))
-        candidates = expanded
-        staging = self.home / "cache" / ("migration-" + job["id"])
-        for child, relative in candidates:
-            self._cancelled(job["id"])
-            target = self.home / relative
-            if target.exists() or target.is_symlink():
-                raise ManagerError("migration_conflict", "迁入内容与目标已有文件冲突：" + str(relative))
-            if child.is_symlink() or (child.is_dir() and any(item.is_symlink() for item in child.rglob("*"))):
-                raise ManagerError("migration_external", "迁入源包含外部或符号链接数据，请先在设备本地明确迁移方式：" + child.name)
-            temporary = staging / relative
-            temporary.parent.mkdir(parents=True, exist_ok=True)
-            def copy_file(src, dst):
-                self._cancelled(job["id"])
-                return shutil.copy2(src, dst)
-            if child.is_dir():
-                shutil.copytree(child, temporary, copy_function=copy_file)
-            else:
-                copy_file(child, temporary)
-            paths = list(job["_journal"].get("migration_paths", [])) + [str(relative)]
-            self._journal(job, migration_paths=paths)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(str(temporary), str(target))
-        # 原拥有方已停止后再次读取最终方案，避免准备期间用户的最后一次保存丢失。
-        candidate = Path(job["_journal"]["candidate"])
-        values = self._migration_configuration(root)
-        from .downloads import MODEL_SETTINGS
-        prepared = read_settings(candidate / "settings.env")
-        for key in MODEL_SETTINGS:
-            if key in prepared:
-                values[key] = prepared[key]
-        for key, value in list(values.items()):
-            path = Path(value)
-            if path.is_absolute() and (root / "runtime_data" == path or root / "runtime_data" in path.parents):
-                values[key] = str(self.home / "data" / path.relative_to(root / "runtime_data"))
-            elif path.is_absolute() and (root / "artifacts" == path or root / "artifacts" in path.parents):
-                values[key] = str(self.home / "data/artifacts" / path.relative_to(root / "artifacts"))
-        self._configure_candidate(candidate, job["_plan"], values)
 
-    def _start_legacy(self, launcher, source):
-        try:
-            pid = int((Path(source) / "runtime_data/gateway/gateway.pid").read_text().strip())
-        except (OSError, ValueError):
-            pid = 0
-        if process_identity(pid):
-            raise ManagerError("legacy_restore_pending", "迁入源拥有方仍在退出，保留其关闭流程，恢复尚未完成。", 500)
-        log = os.open(str(self.home / "logs/migration-restore.log"), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
-        with os.fdopen(log, "ab") as output:
-            process = subprocess.Popen(["bash", launcher, "start"], cwd=source, stdin=subprocess.DEVNULL, stdout=output, stderr=output,
-                                       env=clean_environment(), start_new_session=True)
-        values = self._migration_configuration(Path(source))
-        port = int(values.get("NUWAX_GATEWAY_PORT", "8766") or "8766")
-        import urllib.request
-        deadline = time.monotonic() + 90
-        while process.poll() is None and time.monotonic() < deadline:
-            try:
-                with urllib.request.build_opener(urllib.request.ProxyHandler({})).open("http://127.0.0.1:{}/api/health".format(port), timeout=2) as response:
-                    if response.status == 200:
-                        return
-            except OSError:
-                pass
-            time.sleep(0.5)
-        raise ManagerError("legacy_restore_failed", "迁入失败后原拥有方未恢复健康，请检查原服务。", 500)
 
     def config(self):
         current = self.current()

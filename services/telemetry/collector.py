@@ -41,7 +41,6 @@ _DEFAULT_PROCESS_KEYWORDS = (
     "nuwax-log-query",
     "nuwax-geometry-runtime",
     "nuwax-nav-stack",
-    "nuwax-lcm-runtime",
     "nuwax-go2-video-streamer",
 )
 _CMDLINE_SENSITIVE_KEY_RE = re.compile(

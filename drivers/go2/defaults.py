@@ -115,7 +115,6 @@ def build_go2_defaults(config: "NuwaxRobotBridgeConfig", iface: Optional[str] = 
             "robot_id": "go2",
             "robot_model": "unitree_go2",
             "dds_iface": iface or config.dds.iface,
-            "sdk_path": config.dds.sdk_path,
             "sport_timeout_sec": GO2_TIMEOUTS.sport_timeout_sec,
             "video_timeout_sec": GO2_TIMEOUTS.video_timeout_sec,
             "vui_timeout_sec": GO2_TIMEOUTS.vui_timeout_sec,

@@ -109,29 +109,3 @@ def identifier(value):
 
 def timestamp():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-def compare_versions(candidate, current, candidate_published=None, current_published=None):
-    """可识别版本按语义排序；未知格式仅在双方有发布时间时比较。"""
-    def parsed(value):
-        match = re.fullmatch(r"v?(\d+)\.(\d+)(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?", str(value or ""))
-        if not match:
-            return None
-        core = tuple(int(item or 0) for item in match.groups()[:3])
-        suffix = match.group(4)
-        pre = () if suffix is None else tuple((0, int(part)) if part.isdigit() else (1, part) for part in suffix.split("."))
-        return core, suffix is None, pre
-    first, second = parsed(candidate), parsed(current)
-    if first is not None and second is not None:
-        return (first > second) - (first < second)
-    if candidate == current:
-        return 0
-    if candidate_published and current_published:
-        import datetime
-        try:
-            first = datetime.datetime.fromisoformat(str(candidate_published).replace("Z", "+00:00"))
-            second = datetime.datetime.fromisoformat(str(current_published).replace("Z", "+00:00"))
-            return (first > second) - (first < second)
-        except (ValueError, TypeError):
-            pass
-    return None

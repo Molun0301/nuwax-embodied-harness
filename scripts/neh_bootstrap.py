@@ -20,13 +20,9 @@ import sys
 import tarfile
 import tempfile
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 import webbrowser
 
 
-DEFAULT_CATALOG = "https://github.com/Molun0301/nuwax-embodied-harness/releases/latest/download/catalog.json"
 DEFAULT_REPOSITORY = "https://github.com/Molun0301/nuwax-embodied-harness.git"
 DEFAULT_BRANCH = "main"
 INSTALL_DIRECTORY_NAME = "Nuwax-embodied-harness"
@@ -42,57 +38,6 @@ def version_tuple(value):
     if not isinstance(value, str) or not re.fullmatch(r"\d+(\.\d+){1,2}", value):
         raise BootstrapError("管理包解释器版本声明无效")
     return tuple(int(part) for part in value.split("."))
-
-
-def valid_url(value):
-    parsed = urllib.parse.urlsplit(value)
-    if parsed.username or parsed.password or parsed.fragment:
-        raise BootstrapError("下载地址不能包含凭据或片段")
-    if parsed.scheme == "https" and parsed.hostname:
-        return value
-    if parsed.scheme == "http":
-        try:
-            loopback = parsed.hostname == "localhost" or ipaddress.ip_address(parsed.hostname or "").is_loopback
-        except ValueError:
-            loopback = False
-        if loopback:
-            return value
-    raise BootstrapError("远端下载必须使用HTTPS；本地验收允许回环HTTP")
-
-
-class SafeRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        valid_url(newurl)
-        redirect = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if redirect and urllib.parse.urlsplit(req.full_url).netloc != urllib.parse.urlsplit(newurl).netloc:
-            redirect.remove_header("Authorization")
-        return redirect
-
-
-def fetch(url, target, *, limit=MAX_MANAGER_BYTES, expected_size=None):
-    valid_url(url)
-    headers = {"User-Agent": "NEH-bootstrap/1", "Accept": "application/octet-stream"}
-    request = urllib.request.Request(url, headers=headers)
-    total = 0
-    digest = hashlib.sha256()
-    try:
-        with urllib.request.build_opener(SafeRedirect()).open(request, timeout=45) as response, target.open("wb") as output:
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > limit:
-                    raise BootstrapError("下载超过管理包大小上限")
-                digest.update(chunk)
-                output.write(chunk)
-            output.flush()
-            os.fsync(output.fileno())
-    except urllib.error.HTTPError as exc:
-        raise BootstrapError("下载失败（HTTP %s）；请核对公开版本地址及网络连接" % exc.code) from exc
-    if expected_size is not None and total != expected_size:
-        raise BootstrapError("下载大小与版本清单不符")
-    return digest.hexdigest()
 
 
 def digest_file(path):
@@ -506,18 +451,7 @@ def require_install_layout(home, manifest):
 
 
 def default_install_home():
-    """Prefer the visible default, but keep a recognized older installation in place."""
-    preferred = Path.home() / INSTALL_DIRECTORY_NAME
-    legacy = Path.home() / ".local/share/neh"
-    for home in (preferred, legacy):
-        try:
-            if (home / "config/instance-id").is_file() or (home / "bin/neh").is_file():
-                return home
-            if any((home / entry).exists() or (home / entry).is_symlink() for entry in ("current", "manager/current")):
-                return home
-        except OSError:
-            continue
-    return preferred
+    return Path.home() / INSTALL_DIRECTORY_NAME
 
 
 def install_home(args):
@@ -604,36 +538,8 @@ def install(args):
         args.port = choose_manager_port(home, args.host, args.port)
         with tempfile.TemporaryDirectory(prefix=".prepare-", dir=str(versions)) as temporary:
             stage = Path(temporary)
-            metadata = None
-            if args.manager_package:
-                archive = args.manager_package.expanduser().resolve()
-                if not archive.is_file() or archive.stat().st_size > MAX_MANAGER_BYTES:
-                    raise BootstrapError("本地管理包不存在或超过大小限制")
-                digest = digest_file(archive)
-                if args.sha256 and digest != args.sha256:
-                    raise BootstrapError("本地管理包摘要不符")
-            elif args.catalog:
-                catalog_path = stage / "catalog.json"
-                if args.catalog.startswith(("https://", "http://")):
-                    fetch(args.catalog, catalog_path, limit=8 * 1024 * 1024)
-                else:
-                    shutil.copyfile(Path(args.catalog).expanduser(), catalog_path)
-                catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
-                if catalog.get("schema_version") != 1 or catalog.get("product") != "neh":
-                    raise BootstrapError("版本目录格式不受支持")
-                metadata = catalog.get("manager")
-                if not isinstance(metadata, dict) or not re.fullmatch(r"[0-9a-f]{64}", str(metadata.get("sha256", ""))):
-                    raise BootstrapError("版本目录尚未提供可校验的管理包")
-                if not isinstance(metadata.get("size"), int) or not 0 < metadata["size"] <= MAX_MANAGER_BYTES:
-                    raise BootstrapError("管理包大小声明无效")
-                archive = stage / "manager.tar.gz"
-                url = urllib.parse.urljoin(args.catalog, metadata["url"])
-                digest = fetch(url, archive, expected_size=metadata["size"])
-                if digest != metadata["sha256"]:
-                    raise BootstrapError("管理包下载完整性校验失败")
-            else:
-                archive, metadata = source_manager(args, stage)
-                digest = digest_file(archive)
+            archive, metadata = source_manager(args, stage)
+            digest = digest_file(archive)
             unpacked = stage / "unpacked"
             unpacked.mkdir()
             manifest = unpack_manager(archive, unpacked)
@@ -686,12 +592,9 @@ def install(args):
                 launcher.chmod(0o755)
                 os.replace(str(launcher), str(binary))
                 settings = cli_command(home, python, "settings")
-                if not args.catalog and not args.manager_package:
-                    settings.extend(["--source-repository", args.repository, "--source-branch", args.branch])
-                    if args.allow_local_source:
-                        settings.append("--allow-local-source")
-                elif args.catalog and args.catalog.startswith(("https://", "http://")):
-                    settings.extend(["--feed-url", args.catalog, "--channel", args.channel])
+                settings.extend(["--source-repository", args.repository, "--source-branch", args.branch])
+                if args.allow_local_source:
+                    settings.append("--allow-local-source")
                 subprocess.run(settings, cwd=str(target), env=python_environment(), check=True)
                 instance_id = (home / "config/instance-id").read_text().strip()
                 if not instance_id:
@@ -770,8 +673,6 @@ def install(args):
     print("命令行入口：" + shlex.quote(str(binary)))
     if args.configure:
         command = cli_command(home, python, "apply", "--file", str(args.configure.resolve()), "--wait")
-        if args.catalog and not args.catalog.startswith(("https://", "http://")):
-            command.extend(["--catalog", str(Path(args.catalog).resolve())])
         subprocess.run(command, cwd=str(manager / "current"), env=python_environment(), check=True)
     elif args.cli:
         subprocess.run(cli_command(home, python, "wizard"), cwd=str(manager / "current"), env=python_environment(), check=True)
@@ -784,20 +685,16 @@ def parser():
     result = argparse.ArgumentParser(description="NEH端侧安装：一条命令准备网页和命令行管理入口")
     result.add_argument("--install-dir", "--home", dest="home", type=Path,
                         default=os.environ.get("NEH_HOME") or None, metavar="PATH",
-                        help="安装根目录（兼容--home）；默认NEH_HOME或~/Nuwax-embodied-harness；已有旧安装沿用原位置")
+                        help="安装根目录（兼容--home）；默认NEH_HOME或~/Nuwax-embodied-harness")
     result.add_argument("--repository", default=DEFAULT_REPOSITORY, help="源码仓库HTTPS地址")
     result.add_argument("--branch", default=DEFAULT_BRANCH, help="跟踪的源码分支")
     result.add_argument("--revision", help="固定完整源码提交；省略时查询分支当前提交")
     result.add_argument("--allow-local-source", action="store_true", help=argparse.SUPPRESS)
-    result.add_argument("--catalog", help="显式兼容旧版本目录；默认直接从Git源码安装")
-    result.add_argument("--manager-package", type=Path, help="使用本地管理包")
-    result.add_argument("--sha256", help="本地管理包预期摘要")
     result.add_argument("--bin-dir", type=Path, default=Path.home() / ".local/bin", metavar="PATH",
                         help="用户命令链接目录；默认~/.local/bin")
     result.add_argument("--no-bin-link", action="store_true", help="跳过创建用户命令链接")
     result.add_argument("--host", default="0.0.0.0")
     result.add_argument("--port", type=int, help="管理端口；默认复用既有端口或自动选择空闲端口")
-    result.add_argument("--channel", choices=("stable", "preview"), default="stable")
     result.add_argument("--service", choices=("system", "user", "none"), default="system",
                         help="默认安装普通用户运行的系统服务；none仅启动本次后台进程")
     result.add_argument("--cli", action="store_true", help="继续进入纯命令行安装向导")

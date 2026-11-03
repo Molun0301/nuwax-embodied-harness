@@ -268,12 +268,11 @@ def _go2_env_path() -> Path:
 
 
 def _geometry_owner_env_path() -> Path:
-    """返回受 systemd 沙箱允许写入、Geometry Runtime 可读取的后端选择文件。"""
+    """返回几何运行时可读取的后端选择文件。"""
 
     explicit = os.environ.get("NUWAX_GEOMETRY_WEB_CONFIG_ENV_FILE", "").strip()
     if explicit:
         return Path(explicit).expanduser()
-    # 本地开发不经过 systemd，继续写仓库 .env，避免产生额外运行文件。
     return _core_env_path()
 
 
@@ -284,11 +283,6 @@ def _pointcloud3d_env_path() -> Path:
     if explicit:
         return Path(explicit).expanduser()
 
-    for state_directory in os.environ.get("STATE_DIRECTORY", "").split(":"):
-        if state_directory.strip():
-            return Path(state_directory.strip()) / _POINTCLOUD3D_ENV_FILENAME
-
-    # 本地开发没有 systemd StateDirectory，继续沿用仓库 .env。
     return _core_env_path()
 
 

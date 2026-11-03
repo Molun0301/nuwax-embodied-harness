@@ -85,9 +85,6 @@ def _resolve_person_follow_ready_file(
     configured = str(environ.get("NUWAX_PERSON_FOLLOW_READY_FILE") or "").strip()
     if configured:
         return Path(configured)
-    managed = _parse_enabled(environ.get("NUWAX_PERSON_FOLLOW_MANAGED_BY_SYSTEMD", "false"))
-    if managed:
-        return Path("/run/nuwax/person-follow/nuwax_person_follow.ready")
     root = repo_root or Path(__file__).resolve().parent.parent
     return root / "runtime_data/person-follow/nuwax_person_follow.ready"
 

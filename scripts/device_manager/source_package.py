@@ -23,7 +23,7 @@ SOURCE_FILES = (
     "core/config_descriptions.json", "scripts/neh_bootstrap.py", "scripts/neh_system_helper.py",
     "scripts/neh_source.py", "scripts/neh_source_build.py", "scripts/go2_dependencies.py",
     "scripts/neh_prebuilt.py",
-    "scripts/systemd/check_lcm_multicast.sh", "scripts/systemd/prepare_lcm_network.py",
+    "scripts/systemd/check_lcm_multicast.sh",
 )
 REQUIRED_FILES = (
     "scripts/device_manager/__main__.py", "scripts/device_manager/static/index.html",
@@ -32,7 +32,6 @@ REQUIRED_FILES = (
     "scripts/module_installer/manager.py", "core/config_values.py", "scripts/neh_bootstrap.py",
     "scripts/neh_system_helper.py", "scripts/neh_source.py", "scripts/neh_source_build.py",
     "scripts/go2_dependencies.py", "scripts/systemd/check_lcm_multicast.sh",
-    "scripts/systemd/prepare_lcm_network.py",
 )
 MANIFEST_NAME = "manager-manifest.json"
 

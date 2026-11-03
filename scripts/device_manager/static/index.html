@@ -92,17 +92,6 @@
                   <p id="setupManagerDirNote" class="info-text" hidden>网页管理程序保留在 <span id="setupManagerDir" class="install-path"></span>，持续管理上方选定的位置。</p>
                   <div id="installLocationMessage" class="inline-message" role="status" aria-live="polite" hidden></div>
                 </div>
-                <div id="migrationPanel" class="migration-panel" hidden>
-                  <div class="migration-header">
-                    <h3>检测到已有安装</h3>
-                    <p>可选择迁移已有配置与数据，或执行全新安装</p>
-                  </div>
-                  <div id="migrationSources" class="migration-sources"></div>
-                  <div class="migration-actions">
-                    <button id="migrateFresh" class="btn" type="button">全新安装</button>
-                    <button id="migrateFrom" class="btn primary" type="button" disabled>迁移配置</button>
-                  </div>
-                </div>
                 <div id="hardwareStatus" class="status-card checking">
                   <div class="status-icon spinner"></div>
                   <div class="status-text" id="hardwareStatusText">正在检测硬件与系统环境…</div>
@@ -138,13 +127,6 @@
                   </summary>
                   <div class="source-body">
                     <div class="config-row">
-                      <label hidden>
-                        <span class="config-label">更新通道</span>
-                        <select id="wizardChannel" class="field">
-                          <option value="stable">稳定版</option>
-                          <option value="preview">预览版</option>
-                        </select>
-                      </label>
                       <label>
                         <span class="config-label">源码分支</span>
                         <input id="wizardSourceBranch" class="field" type="text" value="main" placeholder="main">
@@ -416,13 +398,6 @@
           <div class="update-config">
             <h3>更新来源</h3>
             <div class="config-row">
-              <label hidden>
-                <span class="config-label">更新通道</span>
-                <select id="updateChannel" class="field">
-                  <option value="stable">稳定版</option>
-                  <option value="preview">预览版</option>
-                </select>
-              </label>
               <label>
                 <span class="config-label">源码分支</span>
                 <input id="sourceBranch" class="field" type="text" value="main" placeholder="main">

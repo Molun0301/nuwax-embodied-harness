@@ -48,7 +48,7 @@ def wait_job(engine, job_id):
 def request_from_args(args):
     request = load_file(args.file) if getattr(args, "file", None) else {}
     request.setdefault("action", getattr(args, "action", None) or "install")
-    for key in ("version", "robot", "source_path", "source_repository", "source_branch", "source_revision"):
+    for key in ("version", "robot", "source_repository", "source_branch", "source_revision"):
         if getattr(args, key, None):
             request[key] = getattr(args, key)
     if getattr(args, "modules", None):
@@ -58,7 +58,7 @@ def request_from_args(args):
     return request
 
 
-def wizard(engine, catalog=None):
+def wizard(engine):
     if not sys.stdin.isatty():
         raise ManagerError("terminal_required", "交互向导需要终端；无人值守请使用apply --file 配置.json --wait。")
     hardware = engine.hardware()
@@ -67,9 +67,6 @@ def wizard(engine, catalog=None):
     print("系统：{} {}，{}".format(hardware["hardware"]["os_id"], hardware["hardware"]["version_id"], hardware["hardware"]["architecture"]))
     for reason in recommendation["reasons"] + recommendation["warnings"]:
         print("  " + reason)
-    if not catalog and not engine.settings()["feed_url"]:
-        url = input("请输入HTTPS版本目录地址：").strip()
-        engine.save_settings({"feed_url": url})
     robot = input("机器人类型 [customrobot/go2，默认{}]：".format(recommendation["robot"])).strip() or recommendation["robot"]
     for module in engine.modules()["modules"]:
         print("  {} — {}：{}".format(module["key"], module["title"], module["description"]))
@@ -90,7 +87,7 @@ def wizard(engine, catalog=None):
     request = {"action": "update" if current else "install", "robot": robot, "modules": selected.split(","), "configuration": configuration}
     if engine.runtime.status()["running"]:
         request["stop_running"] = input("业务正在运行，允许安装期间停止当前任务？[y/N]：").strip().lower() == "y"
-    plan = engine.plan(request, local_catalog=catalog, local_request=True)
+    plan = engine.plan(request, local_request=True)
     output(plan)
     if plan["blockers"]:
         raise ManagerError("plan_blocked", "请处理计划中的阻塞条件后重试。", 409, plan["blockers"])
@@ -109,7 +106,7 @@ def parser():
     server = sub.add_parser("serve", help="提供独立设备网页")
     server.add_argument("--host", default="127.0.0.1")
     server.add_argument("--port", type=int, default=8765)
-    for name in ("status", "hardware", "modules", "jobs", "migration-sources"):
+    for name in ("status", "hardware", "modules", "jobs"):
         sub.add_parser(name)
     update = sub.add_parser("update", help="检查、准备候选、等待空闲并更新重启，失败自动回退")
     update.add_argument("--check", action="store_true", help="只检查更新")
@@ -123,18 +120,13 @@ def parser():
     automatic.add_argument("--window", help="设备本地维护窗口，如02:00-05:00；空字符串表示全天")
     releases = sub.add_parser("releases", help="查询或主动刷新版本目录")
     releases.add_argument("--refresh", action="store_true")
-    releases.add_argument("--catalog", help="显式本机catalog.json路径，仅供离线安装和验收")
-    for command in ("plan", "apply", "migrate"):
+    for command in ("plan", "apply"):
         item = sub.add_parser(command)
         if command == "plan":
             item.add_argument("action", choices=sorted(ACTIONS), nargs="?", default="install")
-        elif command == "migrate":
-            item.set_defaults(action="migrate")
-            item.add_argument("source_path", help="原安装源码目录")
         else:
             item.add_argument("plan_id", nargs="?")
         item.add_argument("--file", help="预配置JSON（action/version/modules/robot/configuration/stop_running）")
-        item.add_argument("--catalog", help="显式本机版本目录路径")
         item.add_argument("--version")
         item.add_argument("--modules", help="逗号分隔的模块")
         item.add_argument("--robot", choices=("customrobot", "go2"))
@@ -153,13 +145,10 @@ def parser():
     job.add_argument("--wait", action="store_true")
     job.add_argument("--cancel", action="store_true")
     settings = sub.add_parser("settings")
-    settings.add_argument("--feed-url")
     settings.add_argument("--source-repository", help="HTTPS源码仓库")
     settings.add_argument("--source-branch", help="源码分支，默认main")
-    settings.add_argument("--source-mode", choices=("git", "catalog"))
     settings.add_argument("--allow-local-source", action="store_true", help="明确允许本机Git夹具；网页不能启用此选项")
     settings.add_argument("--gateway-port", type=int, help="首次安装前设定业务端口，默认8766")
-    settings.add_argument("--channel", help="main、branch:名称；旧目录保留stable/preview选择")
     settings.add_argument("--auto-start", choices=("true", "false"))
     password = sub.add_parser("password")
     password.add_argument("--stdin", action="store_true", help="逐行读取当前密码和新密码；未设密码时只读新密码")
@@ -168,8 +157,7 @@ def parser():
     config.add_argument("--file", help="JSON对象，支持{values:{...},revision:...}")
     config.add_argument("--set", nargs=2, action="append", metavar=("KEY", "VALUE"))
     config.add_argument("--revision")
-    interactive = sub.add_parser("wizard", help="交互安装向导；全部步骤仍走共享计划与任务")
-    interactive.add_argument("--catalog")
+    sub.add_parser("wizard", help="交互安装向导；全部步骤仍走共享计划与任务")
     worker = sub.add_parser("_worker", help=argparse.SUPPRESS)
     worker.add_argument("job_id")
     return result
@@ -189,12 +177,10 @@ def main(argv=None):
         engine.recover_if_needed()
         if command in ("status", "hardware", "modules"):
             result = getattr(engine, command)()
-        elif command == "migration-sources":
-            result = engine.migration_sources()
         elif command == "jobs":
             result = {"jobs": engine.jobs()}
         elif command == "releases":
-            result = engine.releases(args.refresh, args.catalog)
+            result = engine.releases(args.refresh)
         elif command == "update":
             if args.check:
                 engine.releases(refresh=True)
@@ -214,7 +200,7 @@ def main(argv=None):
                 values["maintenance_window"] = args.window
             result = engine.save_settings(values) if values else engine.settings()
         elif command == "settings":
-            values = {key: getattr(args, key) for key in ("feed_url", "source_repository", "source_branch", "source_mode", "channel", "gateway_port") if getattr(args, key) is not None}
+            values = {key: getattr(args, key) for key in ("source_repository", "source_branch", "gateway_port") if getattr(args, key) is not None}
             if args.auto_start is not None:
                 values["auto_start"] = args.auto_start == "true"
             result = engine.save_settings(values, allow_local_source=args.allow_local_source) if values else engine.settings()
@@ -233,7 +219,7 @@ def main(argv=None):
             else:
                 result = engine.config()
         elif command == "wizard":
-            result = wizard(engine, args.catalog)
+            result = wizard(engine)
         elif command == "job":
             result = engine.cancel(args.job_id) if args.cancel else wait_job(engine, args.job_id) if args.wait else engine.job(args.job_id)
         else:
@@ -243,7 +229,7 @@ def main(argv=None):
             elif command == "apply" and args.plan_id:
                 plan = {"id": args.plan_id}
             else:
-                plan = engine.plan(request_from_args(args), local_catalog=args.catalog, local_request=True)
+                plan = engine.plan(request_from_args(args), local_request=True)
             if command == "plan":
                 result = plan
             else:

@@ -94,7 +94,6 @@ class Go2DataPlaneConfig:
     """Go2 设备侧输入流与运动执行配置。"""
 
     enabled: bool = False
-    sdk_path: str = ""
     dds_iface: str = ""
     expected_odom_frame: str = ""
     expected_imu_frame: str = ""
@@ -113,7 +112,6 @@ def load_go2_data_plane_config(
 
     return Go2DataPlaneConfig(
         enabled=_cfg_bool("GO2_DATA_PLANE_ENABLED", False),
-        sdk_path=_cfg_str("GO2_SDK_PATH", ""),
         dds_iface=_cfg_str("GO2_DATA_PLANE_DDS_IFACE", _cfg_str("GO2_DDS_IFACE", "")),
         expected_odom_frame=str(
             platform_geometry.frames.odom_frame if platform_geometry is not None else ""

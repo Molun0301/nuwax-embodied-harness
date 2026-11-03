@@ -24,22 +24,13 @@ def restart_status(root):
         status = dict(status, state="restarted", message="新网关已启动；相关功能就绪状态以控制台为准")
     if status.get("state") in {"queued", "restarting", "starting"} and time.time() - status.get("created_at", 0) > 180:
         status = dict(status, state="failed", message="重启未在期限内回报，请检查启动日志")
-    managed = os.environ.get("NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD", "").lower() in {"1", "true"}
     launcher = os.environ.get("NUWAX_SETTINGS_LAUNCHER", "")
     available = bool(launcher and Path(launcher).is_file())
     reason = ""
-    if managed:
-        try:
-            available = subprocess.run(["systemctl", "is-active", "--quiet", "nuwax-settings-apply.path"],
-                                       timeout=2, check=False).returncode == 0
-        except (OSError, subprocess.TimeoutExpired):
-            available = False
-        if not available:
-            reason = "请更新部署服务以启用设置应用入口；当前可以保存并稍后重启"
-    elif not available:
+    if not available:
         reason = "当前未由统一启动脚本管理；保存后请使用原启动方式重新启动"
     return {"restart": status, "restart_available": available, "restart_unavailable_reason": reason,
-            "restart_scope": "网关及其依赖的运行组件" if managed else "网关及其管理的子进程"}
+            "restart_scope": "网关及其管理的子进程"}
 
 
 def queue_restart(root):
@@ -56,11 +47,7 @@ def queue_restart(root):
 
 
 def dispatch_restart(root, request):
-    """响应发送后调用；本地辅助进程脱离网关，系统服务由专用路径单元接管。"""
-    managed = os.environ.get("NUWAX_GEOMETRY_RUNTIME_MANAGED_BY_SYSTEMD", "").lower() in {"1", "true"}
-    if managed:
-        _atomic_write(root / "runtime_data/settings/restart.request", request["request_id"] + "\n")
-        return
+    """响应发送后调用；本地辅助进程脱离网关。"""
     environment = dict(os.environ)
     for key in environment.get("_NUWAX_CONFIG_FILE_KEYS", "").split(":"):
         environment.pop(key, None)

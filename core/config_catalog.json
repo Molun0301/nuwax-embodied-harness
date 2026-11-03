@@ -7,7 +7,6 @@
     "target_file": "core_env",
     "consumers": [
       "gateways/person_follow.py",
-      "scripts/install_motion_guard_deployment.sh",
       "scripts/start_gateway.sh"
     ],
     "apply_scope": "重启网关后生效",
@@ -21,9 +20,7 @@
     "target_file": "core_env",
     "consumers": [
       "gateways/person_follow.py",
-      "scripts/install_motion_guard_deployment.sh",
       "scripts/start_gateway.sh",
-      "scripts/systemd/activate_geometry_runtime.sh",
       "scripts/systemd/start_person_follow.sh",
       "scripts/systemd/wait_for_person_follow_ready.sh"
     ],
@@ -37,7 +34,6 @@
     "section_id": "nav_stack",
     "target_file": "core_env",
     "consumers": [
-      "scripts/systemd/activate_geometry_runtime.sh",
       "scripts/systemd/wait_for_person_follow_ready.sh"
     ],
     "apply_scope": "重启相关服务后生效",
@@ -74,7 +70,6 @@
     "section_id": "geometry_runtime",
     "target_file": "core_env",
     "consumers": [
-      "scripts/systemd/activate_geometry_runtime.sh",
       "scripts/systemd/start_geometry_runtime.sh",
       "scripts/systemd/wait_for_geometry_runtime_ready.sh",
       "services/geometry/nuwax_geometry_runtime/src/main.rs"
@@ -162,9 +157,7 @@
     "target_file": "core_env",
     "consumers": [
       "scripts/diagnostics/check_nuwax_runtime.sh",
-      "scripts/install_motion_guard_deployment.sh",
       "scripts/start_gateway.sh",
-      "scripts/systemd/activate_geometry_runtime.sh",
       "scripts/systemd/start_nav_stack.sh",
       "scripts/systemd/wait_for_nav_stack_ready.sh"
     ],
@@ -178,7 +171,6 @@
     "section_id": "nav_stack",
     "target_file": "core_env",
     "consumers": [
-      "scripts/systemd/activate_geometry_runtime.sh",
       "scripts/systemd/wait_for_nav_stack_ready.sh"
     ],
     "apply_scope": "重启相关服务后生效",
@@ -246,7 +238,6 @@
     "target_file": "core_env",
     "consumers": [
       "drivers/go2/video_streamer.py",
-      "scripts/install_motion_guard_deployment.sh",
       "services/geometry/geometry_runtime_client.py",
       "services/geometry/nuwax_geometry_runtime/src/main.rs"
     ],
@@ -755,7 +746,6 @@
     "section_id": "nav_stack",
     "target_file": "core_env",
     "consumers": [
-      "scripts/install_motion_guard_deployment.sh",
       "scripts/start_gateway.sh",
       "scripts/systemd/start_nav_stack.sh"
     ],
@@ -781,7 +771,6 @@
     "section_id": "nav_stack",
     "target_file": "core_env",
     "consumers": [
-      "scripts/install_motion_guard_deployment.sh",
       "scripts/start_gateway.sh",
       "scripts/systemd/start_person_follow.sh"
     ],
@@ -911,11 +900,8 @@
     "consumers": [
       "gateways/motion_guard.py",
       "scripts/diagnostics/check_nuwax_runtime.sh",
-      "scripts/install_motion_guard_deployment.sh",
       "scripts/start_gateway.sh",
-      "scripts/systemd/activate_geometry_runtime.sh",
       "scripts/systemd/start_nav_stack.sh",
-      "scripts/systemd/wait_for_motion_guard_socket.sh",
       "services/geometry/nuwax_geometry_runtime/src/server.rs",
       "services/geometry/nuwax_geometry_runtime/src/vertical_v2_canary.rs",
       "services/navigation/motion_safety_guard/__main__.py",
@@ -931,9 +917,7 @@
     "section_id": "robot",
     "target_file": "core_env",
     "consumers": [
-      "scripts/start_gateway.sh",
-      "scripts/systemd/activate_geometry_runtime.sh",
-      "scripts/systemd/wait_for_motion_guard_socket.sh"
+      "scripts/start_gateway.sh"
     ],
     "apply_scope": "重启网关启动脚本后生效",
     "description": ""
@@ -1566,7 +1550,6 @@
     "section_id": "gateway",
     "target_file": "core_env",
     "consumers": [
-      "scripts/systemd/activate_geometry_runtime.sh"
     ],
     "apply_scope": "重启相关服务后生效",
     "description": ""
@@ -1578,7 +1561,6 @@
     "section_id": "gateway",
     "target_file": "core_env",
     "consumers": [
-      "scripts/systemd/activate_geometry_runtime.sh"
     ],
     "apply_scope": "重启相关服务后生效",
     "description": ""

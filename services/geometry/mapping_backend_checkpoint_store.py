@@ -2092,7 +2092,7 @@ def _read_regular_file_at(
             if maximum_bytes > MAX_MAPPING_BACKEND_CHECKPOINT_BYTES:
                 data = FrozenPayload(iter(lambda: stream.read(1024 * 1024), b""), maximum_bytes=maximum_bytes)
             else:
-                data = stream.read(maximum_bytes + 1)
+                data = stream.read(metadata.st_size + 1)
             after = os.fstat(stream.fileno())
             if (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns) != (
                 after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):

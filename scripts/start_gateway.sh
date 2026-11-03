@@ -3,12 +3,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-ENV_FILE="$(readlink -m -- "${NUWAX_BOOTSTRAP_ENV_FILE:-${REPO_ROOT}/.env}")"
 
 if [[ "${NUWAX_GATEWAY_SUPERVISOR_TITLED:-0}" != "1" && -n "${BASH:-}" ]]; then
-  # exec makes the existing configuration identity visible in /proc/environ
-  # for direct launches too; children inherit the same identity.
-  export NUWAX_BOOTSTRAP_ENV_FILE="${ENV_FILE}"
+  # 让直接启动的拥有方及其子进程携带本安装身份。
+  export NUWAX_INSTALL_HOME="${NUWAX_INSTALL_HOME:-${REPO_ROOT}}"
   export NUWAX_GATEWAY_SUPERVISOR_TITLED=1
   exec -a nuwax-gateway-supervisor "${BASH}" "$0" "$@"
 fi

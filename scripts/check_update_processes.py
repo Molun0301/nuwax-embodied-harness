@@ -16,7 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.module_installer.cli import _stop
+from scripts.module_installer.lifecycle import deployment_descriptor, inspect_installation, stop_current
 
 
 def wait_until(predicate, timeout=5):
@@ -47,6 +47,7 @@ class ProcessTests(unittest.TestCase):
         self.pid_file.parent.mkdir(parents=True)
         (self.prefix / "settings.env").write_text("NUWAX_GATEWAY_PID_FILE=" + str(self.pid_file) + "\n")
         (self.prefix / "manifest.json").write_text(json.dumps({
+            "deployment": deployment_descriptor(self.root, self.prefix.parent.parent, self.prefix, ["core"], "customrobot", service_name="neh-fixture.service"),
             "schema": 1, "complete": True, "modules": ["core"], "robot": "customrobot",
             "source_root": str(self.root),
         }))
@@ -71,9 +72,7 @@ pathlib.Path({str(self.pid_file)!r}).write_text(str(os.getpid()))
 time.sleep(60)
 """
         environment = dict(os.environ)
-        environment["NUWAX_BOOTSTRAP_ENV_FILE"] = str(
-            self.prefix / ("settings.env" if identity else "unrelated.env")
-        )
+        environment["NUWAX_INSTALL_HOME"] = str(self.prefix.parent.parent if identity else self.root / "unrelated")
         process = subprocess.Popen(
             [sys.executable, "-c", code], env=environment, start_new_session=True,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -84,7 +83,7 @@ time.sleep(60)
 
     def test_cli_stop_accepts_child_that_becomes_zombie(self):
         process = self.supervisor()
-        self.assertEqual(_stop({"prefix": str(self.prefix)}, self.root), 0)
+        self.assertEqual(stop_current(inspect_installation(self.prefix.parent.parent)), 0)
         # 先不回收子进程，确认停止操作能接受已退出、尚未回收的子进程。
         self.assertEqual(process_state(process.pid), "Z")
         process.wait(timeout=5)

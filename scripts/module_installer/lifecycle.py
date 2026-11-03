@@ -10,11 +10,11 @@ import re
 import signal
 import subprocess
 import time
-import uuid
 from pathlib import Path
 from typing import Mapping, Optional
 
 from scripts.device_manager.common import atomic_write
+from scripts.device_manager.runtime import base_environment
 
 from .runtime import effective_settings
 
@@ -60,23 +60,20 @@ def inspect_installation(home: Path, environment=None) -> dict:
     current = read_current(home)
     if not current:
         raise ValueError("No completed managed installation")
-    saved = current.get("deployment")
-    mode, name = "foreground", None
-    if "deployment" in current:
-        if not isinstance(saved, Mapping) or type(saved.get("version")) is not int or saved["version"] != 1:
-            raise ValueError("Unsupported deployment descriptor version")
-        registration = saved.get("lifecycle")
-        if not isinstance(registration, Mapping) or "service_name" not in registration:
-            raise ValueError("Invalid deployment lifecycle registration")
-        mode = registration.get("mode")
-        name = _service_name(registration["service_name"], mode)
+    saved = current["deployment"]
+    if not isinstance(saved, Mapping) or type(saved.get("version")) is not int or saved["version"] != 1:
+        raise ValueError("Unsupported deployment descriptor version")
+    registration = saved.get("lifecycle")
+    if not isinstance(registration, Mapping) or "service_name" not in registration:
+        raise ValueError("Invalid deployment lifecycle registration")
+    mode = registration.get("mode")
+    name = _service_name(registration["service_name"], mode)
     descriptor = deployment_descriptor(Path(current["source_root"]), home, Path(current["prefix"]),
                                        current["modules"], current["robot"], mode, environment,
                                        service_name=name)
-    if "deployment" in current:
-        for key in ("source_root", "install_home", "robot_adapter", "modules", "prefix"):
-            if saved.get(key) != descriptor[key]:
-                raise ValueError("Deployment metadata mismatch: " + key)
+    for key in ("source_root", "install_home", "robot_adapter", "modules", "prefix"):
+        if saved.get(key) != descriptor[key]:
+            raise ValueError("Deployment metadata mismatch: " + key)
     return descriptor
 
 
@@ -86,13 +83,10 @@ def _check(descriptor):
     mode = descriptor["lifecycle"]["mode"]
     name = _service_name(descriptor["lifecycle"]["service_name"], mode)
     current = inspect_installation(Path(descriptor["install_home"]))
-    # Queued updater descriptors retain their old generation prefix/modules.
-    # Ownership is the current manifest's home, source root and registration.
     if any(descriptor.get(key) != current[key] for key in ("install_home", "source_root")):
         raise ValueError("Invalid lifecycle installation owner")
     registered = current["lifecycle"]
-    if mode != registered["mode"] or (name != registered["service_name"]
-                                      and not (mode == "foreground" and name is None)):
+    if mode != registered["mode"] or name != registered["service_name"]:
         raise ValueError("Invalid lifecycle identity")
     return mode, name
 
@@ -141,11 +135,14 @@ def stop_current(descriptor: Mapping) -> int:
             raise ValueError("Invalid gateway PID")
         if _exited(pid):
             return 0
-        prefix = Path(descriptor["prefix"])
-        identity = ("NUWAX_BOOTSTRAP_ENV_FILE=" + str(prefix / "settings.env")).encode()
-        environment = (Path("/proc") / str(pid) / "environ").read_bytes().split(b"\0")
-        if identity not in environment:
-            raise RuntimeError("Gateway PID belongs to another installation; refusing to signal")
+        identity = ("NUWAX_INSTALL_HOME=" + descriptor["install_home"]).encode()
+        try:
+            owned = identity in (Path("/proc") / str(pid) / "environ").read_bytes().split(b"\0")
+        except OSError:
+            owned = False
+        if not owned:
+            Path(descriptor["pid_file"]).unlink(missing_ok=True)
+            return 0
         os.kill(pid, signal.SIGTERM)
         for _ in range(300):
             if _exited(pid):
@@ -164,9 +161,6 @@ def start_current(descriptor: Mapping, *, foreground=False, log=None):
     current = inspect_installation(home)
     if current["lifecycle"] != {"mode": mode, "service_name": name}:
         raise ValueError("Lifecycle registration changed before start")
-    # Preserve the effective endpoint that accepted the update, including any
-    # explicit process overrides; generation-specific paths still come from current.
-    current["listener"] = dict(descriptor["listener"])
     if mode == "systemd-user":
         unit = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "systemd/user" / name
         unit.parent.mkdir(parents=True, exist_ok=True)
@@ -175,16 +169,7 @@ def start_current(descriptor: Mapping, *, foreground=False, log=None):
         subprocess.run(["systemctl", "--user", "start", name], check=True)
         return None
     argv = ["/bin/bash", str(home / "current/start.sh")]
-    environment = dict(os.environ)
-    for key in environment.get("_NUWAX_CONFIG_FILE_KEYS", "").split(":"):
-        if key:
-            environment.pop(key, None)
-    for key in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "_NUWAX_CONFIG_FILE_KEYS",
-                "NUWAX_GATEWAY_SUPERVISOR_TITLED", "NUWAX_CONFIG_FROM_SYSTEMD_FILES",
-                "NUWAX_BOOTSTRAP_ENV_FILE", "NUWAX_SETTINGS_LAUNCHER",
-                "GO2_DATA_PLANE_ENV_FILE", "NUWAX_GEOMETRY_WEB_CONFIG_ENV_FILE",
-                "NUWAX_GATEWAY_WEB_CONFIG_ENV_FILE", "NUWAX_USER_CONFIG_ENV_FILE"):
-        environment.pop(key, None)
+    environment = base_environment()
     environment["NUWAX_INSTALL_HOME"] = str(home)
     environment["NUWAX_GATEWAY_HOST"] = current["listener"]["host"]
     environment["NUWAX_GATEWAY_PORT"] = str(current["listener"]["port"])
@@ -192,38 +177,3 @@ def start_current(descriptor: Mapping, *, foreground=False, log=None):
         os.execve(argv[0], argv, environment)
     return subprocess.Popen(argv, cwd=current["source_root"], env=environment, stdin=subprocess.DEVNULL,
                             stdout=log, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
-
-
-def spawn_updater(descriptor: Mapping, argv, *, environment=None, env=None, log=None):
-    """Launch trusted updater argv outside the gateway's owner cgroup.
-
-    User-systemd workers use the deployment account's persistent Git credentials.
-    Gateway-only SSH agents, custom PATH and credential environment variables are
-    intentionally not copied into transient unit arguments or properties.
-    """
-    _user_only()
-    mode, name = _check(descriptor)
-    argv = [str(item) for item in argv]
-    if not argv or not Path(argv[0]).is_absolute():
-        raise ValueError("Updater must use an absolute interpreter path")
-    if env is not None and environment is not None:
-        raise ValueError("Pass environment or env, not both")
-    environment = environment if environment is not None else env
-    env = dict(os.environ if environment is None else environment)
-    env.pop("PYTHONHOME", None)
-    if mode == "systemd-user":
-        unit = name[:-8] + "-update-" + uuid.uuid4().hex
-        command = ["systemd-run", "--user", "--collect", "--quiet", "--unit=" + unit,
-                   "--property=Type=exec", "--property=KillMode=control-group",
-                   "--working-directory=" + descriptor["source_root"]]
-        # Only these non-secret, updater-specific values need transmission to
-        # the user manager; do not copy the gateway's complete credential env.
-        for key in ("PYTHONPATH", "PYTHONUNBUFFERED", "NUWAX_UPDATE_INSTALL_DIR", "NUWAX_INSTALL_HOME"):
-            if key in env:
-                command.append("--setenv=" + key + "=" + env[key])
-        subprocess.run(command + ["--"] + argv, env=env, check=True,
-                       stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
-        return unit + ".service"
-    return subprocess.Popen(argv, cwd=descriptor["source_root"], env=env,
-                            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                            start_new_session=True, close_fds=True)

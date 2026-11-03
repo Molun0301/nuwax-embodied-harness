@@ -14,8 +14,6 @@ from typing import Any, Dict, Mapping, Optional
 
 # 模块加载时固定物理目录，避免高频状态查询重复遍历磁盘路径。
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
-_DEFAULT_CORE_PATH = str(_PROJECT_ROOT / ".env")
-_DEFAULT_DEVICE_PATH = str(_PROJECT_ROOT / "drivers/go2/data_plane.env")
 _KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SNAPSHOT: ContextVar = ContextVar("nuwax_config_snapshot", default=None)
 # 已由当前进程配置加载器读取的值；控制台预览不会改写该记录。
@@ -97,11 +95,6 @@ def configuration_location(*, root: Optional[Path] = None, environment=None,
     drivers = root / "drivers"
     managed_profiles = _managed_profiles_root(root, environment)
     active_file = root / "runtime_data" / "settings" / "active.env"
-    # 显式文件入口保持可用；在控制台选择机器人方案后，由活动选择接管。
-    if robot is None and profile is None and environment.get("NUWAX_ROBOT_PROFILE_MODE") != "1" and not active_file.is_symlink() and any(
-            environment.get(key, "").strip() for key in (
-                "NUWAX_USER_CONFIG_ENV_FILE", "NUWAX_BOOTSTRAP_ENV_FILE", "GO2_DATA_PLANE_ENV_FILE")):
-        return None
     if robot is None:
         file_keys = environment.get("_NUWAX_CONFIG_FILE_KEYS", "").split(":")
         robot = "" if "NUWAX_ACTIVE_ROBOT" in file_keys else environment.get("NUWAX_ACTIVE_ROBOT", "").strip()
@@ -117,10 +110,6 @@ def configuration_location(*, root: Optional[Path] = None, environment=None,
             robot = parts[0]
             if profile is None:
                 profile = Path(parts[-1]).stem
-        if not robot:
-            for path in (root / ".config", Path(environment.get("NUWAX_BOOTSTRAP_ENV_FILE") or root / ".env"),
-                         Path(environment["NUWAX_USER_CONFIG_ENV_FILE"]) if environment.get("NUWAX_USER_CONFIG_ENV_FILE") else root / ".env"):
-                robot = read_env_values(path).get("NUWAX_ACTIVE_ROBOT", robot)
     robot = str(robot or "").strip().lower()
     if not robot:
         return None
@@ -149,36 +138,11 @@ def configuration_location(*, root: Optional[Path] = None, environment=None,
 
 
 def configuration_sources(*, root: Optional[Path] = None, environment=None, robot=None, profile=None):
-    """所有入口共用文件链；存在独立方案后不再叠加其它机器人的旧配置。"""
-    root = Path(root or _PROJECT_ROOT).resolve()
-    environment = os.environ if environment is None else environment
+    """配置只从当前机器人方案读取。"""
     location = configuration_location(root=root, environment=environment, robot=robot, profile=profile)
-    if location and location["path"].is_file():
-        return [location["path"]]
-    active = root / "runtime_data/settings/active.env"
-    if location and (location["selector"].exists() or (active.is_symlink() and active.resolve() == location["path"].resolve())):
-        raise ValueError("已选择的配置文件不存在：" + str(location["path"]))
-    # 仅默认方案可以从同一机器人旧配置迁移；新方案必须显式创建。
-    if location and location["profile"] != "默认":
+    if location and not location["path"].is_file():
         raise ValueError("配置方案不存在：" + location["profile"])
-    core = Path(environment.get("NUWAX_BOOTSTRAP_ENV_FILE") or root / ".env").expanduser()
-    legacy_robot = read_env_values(core).get("NUWAX_ACTIVE_ROBOT", read_env_values(root / ".config").get("NUWAX_ACTIVE_ROBOT", ""))
-    if environment.get("NUWAX_USER_CONFIG_ENV_FILE"):
-        legacy_robot = read_env_values(Path(environment["NUWAX_USER_CONFIG_ENV_FILE"])).get("NUWAX_ACTIVE_ROBOT", legacy_robot)
-    if location and legacy_robot and legacy_robot != location["robot"]:
-        return [root / "drivers" / location["robot"] / "data_plane.env"]
-    device = location["robot"] if location else "go2"
-    paths = [Path(environment.get("GO2_DATA_PLANE_ENV_FILE") or root / "drivers" / device / "data_plane.env").expanduser(),
-             root / ".config", core]
-    paths.extend(Path(value.strip()).expanduser() for value in environment.get("NUWAX_GEOMETRY_EXTRA_ENV_FILES", "").split(",") if value.strip())
-    for key in ("NUWAX_GEOMETRY_WEB_CONFIG_ENV_FILE", "NUWAX_GATEWAY_WEB_CONFIG_ENV_FILE", "NUWAX_USER_CONFIG_ENV_FILE"):
-        if environment.get(key, "").strip():
-            paths.append(Path(environment[key]).expanduser())
-        elif key == "NUWAX_GATEWAY_WEB_CONFIG_ENV_FILE":
-            state = next((item.strip() for item in environment.get("STATE_DIRECTORY", "").split(":") if item.strip()), "")
-            if state:
-                paths.append(Path(state) / "pointcloud3d.env")
-    return list(dict.fromkeys(paths))
+    return [location["path"]] if location else []
 
 
 def configuration_values(*, root: Optional[Path] = None, environment=None, robot=None, profile=None):
@@ -186,26 +150,11 @@ def configuration_values(*, root: Optional[Path] = None, environment=None, robot
     environment = os.environ if environment is None else environment
     values = {}
     for path in configuration_sources(root=root, environment=environment, robot=robot, profile=profile):
-        values.update(configuration_file_values(path, environment=environment))
+        values.update(read_env_values(path))
     location = configuration_location(root=root, environment=environment, robot=robot, profile=profile)
     if location:
         values["NUWAX_ACTIVE_ROBOT"] = location["robot"]
     return values
-
-
-def configuration_file_values(path, *, environment=None, reader=read_env_values):
-    """旧网页专用文件只能覆盖显示项；统一方案和同路径安装文件读取完整内容。"""
-    environment = os.environ if environment is None else environment
-    result = reader(path)
-    web = environment.get("NUWAX_GATEWAY_WEB_CONFIG_ENV_FILE", "").strip()
-    if not web:
-        state = next((item.strip() for item in environment.get("STATE_DIRECTORY", "").split(":") if item.strip()), "")
-        web = str(Path(state) / "pointcloud3d.env") if state else ""
-    shared = {environment.get(key, "").strip() for key in (
-        "NUWAX_USER_CONFIG_ENV_FILE", "NUWAX_BOOTSTRAP_ENV_FILE", "GO2_DATA_PLANE_ENV_FILE", "NUWAX_GEOMETRY_WEB_CONFIG_ENV_FILE")}
-    if web and str(path) == str(Path(web).expanduser()) and web not in shared:
-        return {key: value for key, value in result.items() if key.startswith("NUWAX_GATEWAY_POINTCLOUD3D_")}
-    return result
 
 
 @lru_cache(maxsize=1)
@@ -277,35 +226,14 @@ def config_value(name: str, default: Any, kind: str, file_values: Mapping[str, s
     return record_value(name, value)
 
 
-def user_config_values() -> Dict[str, str]:
-    """用户覆盖文件最后加载；旧专用文件只作为迁移期读取来源。"""
-    values = {}
-    for name in ("NUWAX_GEOMETRY_WEB_CONFIG_ENV_FILE", "NUWAX_GATEWAY_WEB_CONFIG_ENV_FILE", "NUWAX_USER_CONFIG_ENV_FILE"):
-        path = os.environ.get(name, "").strip()
-        if path:
-            values.update(read_env_values(Path(path).expanduser()))
-    return values
-
-
-@lru_cache(maxsize=8)
-def _runtime_file_values(core_path: str, device_path: str, user_path: str) -> Dict[str, str]:
-    environment = dict(os.environ)
-    for key, path, default in (("NUWAX_BOOTSTRAP_ENV_FILE", core_path, _DEFAULT_CORE_PATH),
-                               ("GO2_DATA_PLANE_ENV_FILE", device_path, _DEFAULT_DEVICE_PATH),
-                               ("NUWAX_USER_CONFIG_ENV_FILE", user_path, "")):
-        if path != default:
-            environment[key] = path
-    return configuration_values(environment=environment)
+@lru_cache(maxsize=1)
+def _runtime_file_values() -> Dict[str, str]:
+    return configuration_values()
 
 
 def runtime_value(name: str, default=None):
     """供未使用结构化配置的进程边界读取设置；文件在进程首次读取时固定。"""
-    files = _runtime_file_values(
-        os.environ.get("NUWAX_BOOTSTRAP_ENV_FILE", _DEFAULT_CORE_PATH),
-        os.environ.get("GO2_DATA_PLANE_ENV_FILE", _DEFAULT_DEVICE_PATH),
-        os.environ.get("NUWAX_USER_CONFIG_ENV_FILE", ""),
-    )
-    return record_value(name, raw_value(name, default, files))
+    return record_value(name, raw_value(name, default, _runtime_file_values()))
 
 
 def main() -> None:

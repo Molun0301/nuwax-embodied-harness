@@ -50,7 +50,7 @@ _SOURCE_ROLES = frozenset((
     "fastlio2-algorithm", "pointlio-algorithm", "dimos-lcm", "livox-sdk2", "slam2d-onetbb", "slam2d-ceres",
 ))
 _TARGET_ROLES = {_WORKSPACE: "nuwax-workspace", _RUST_BUILDS["geometry"][0]: "geometry-runtime"}
-_LEGACY_SOURCE = re.compile(r"[0-9a-f]{12}-([0-9a-f]{40})")
+
 _ASSIGNED_SOURCE = re.compile(r"(?:" + "|".join(sorted(_SOURCE_ROLES)) + r")-[0-9a-f]{32}")
 
 
@@ -120,15 +120,12 @@ def _clean_source(destination: Path, revision: str) -> bool:
     return not dirty
 
 
-def _legacy_source(parent: Path, revision: str) -> Optional[Path]:
+def _assigned_source(parent: Path, revision: str) -> Optional[Path]:
     selected = None
-    # This is source admission, only on a missing/changed recipe binding. Keep
-    # memory bounded and never interpret an old URL digest as an owner proof.
+    # 配方绑定改变时，只复用已分配名称且版本与工作区均匹配的源码。
     with os.scandir(parent) as entries:
         for entry in entries:
-            old = _LEGACY_SOURCE.fullmatch(entry.name)
-            assigned = _ASSIGNED_SOURCE.fullmatch(entry.name)
-            if not ((old and old.group(1) == revision) or assigned):
+            if not _ASSIGNED_SOURCE.fullmatch(entry.name):
                 continue
             candidate = parent / entry.name
             if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
@@ -162,13 +159,13 @@ def _source_destination(cache: Path, role: str, source: tuple) -> tuple:
         if destination.exists() and not _clean_source(destination, revision):
             raise RuntimeError(f"源码缓存被修改，请检查该专属缓存：{destination}")
         return destination, destination.exists()
-    destination = _legacy_source(parent, revision)
+    destination = _assigned_source(parent, revision)
     admitted = destination is not None
     if destination is None:
         destination = parent / (role + "-" + uuid.uuid4().hex)
         if destination.exists() or destination.is_symlink():
             raise RuntimeError(f"新分配的源码缓存名称已存在：{destination}")
-    # url is requested provenance, never a claim about a legacy fetch origin.
+    # 记录本次请求地址，不把目录名称解释为历史下载来源。
     slots[role] = {"url": url, "revision": revision, "path": destination.name}
     _save_slots(record, slots)
     return destination, admitted

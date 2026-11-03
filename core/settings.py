@@ -6,7 +6,7 @@ nuwax_robot_bridge 统一配置解析层。
 
 说明：
 1. 用户配置保存在 drivers/<机器人>/configs/，活动方案由共同解析器读取。
-2. 首次保存迁移旧配置；显式部署文件入口仍可兼容。
+2. 安装时写入机器人方案并建立活动链接。
 3. 同名环境变量优先级高于文件配置。
 4. 这里仅负责把配置解析成结构化对象，业务逻辑不要直接散落读取环境变量。
 """
@@ -20,7 +20,7 @@ import os
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-from core.config_values import config_value, raw_value, read_env_values, record_value, user_config_values, configuration_values
+from core.config_values import config_value, raw_value, record_value, configuration_values
 from core.robot_geometry import RobotGeometryConfig
 from core.logging_utils import (
     CorrelationContextFilter,
@@ -51,7 +51,6 @@ from contracts.geometry_runtime import (
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ENV_FILE = BASE_DIR / ".env"
-LEGACY_CONFIG_FILE = BASE_DIR / ".config"
 
 
 def _default_model_dir(repo_id: str) -> str:

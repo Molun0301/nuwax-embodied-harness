@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-from core.config_values import config_value, raw_value, read_env_values, user_config_values, configuration_values
+from core.config_values import config_value, raw_value, configuration_values
 from contracts.geometry_runtime import PlatformGeometryConfig
 from drivers.go2.defaults import GO2_DEFAULT_FRAME_IDS
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]

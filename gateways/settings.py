@@ -70,7 +70,7 @@ class SettingsApplication:
 
     def _is_active(self, location):
         active = self._active_location()
-        return location is None or (active is not None and location["path"] == active["path"])
+        return active is not None and location["path"] == active["path"]
 
     def schema(self, robot=None, profile=None):
         return self._schema(robot, profile)
@@ -100,8 +100,7 @@ class SettingsApplication:
             return state
 
         schema = config_io.build_schema(robot, profile, revision_owner=owner,
-                                        location_provider=location, runtime_state_provider=runtime_state,
-                                        legacy_read_context=lambda: self._lock)
+                                        location_provider=location, runtime_state_provider=runtime_state)
         context = schema.get("profile_context")
         if context:
             active = captured["active"]
@@ -131,12 +130,9 @@ class SettingsApplication:
             result = config_io.save_values(updates, robot=robot, profile=profile, expected_revision=expected_revision,
                                            revision_owner=self.revision_owner)
             written = {key for keys in result.written.values() for key in keys}
-            values = read_env_values(location["path"]) if location else {key: config_io._current_value(key) for key in written}
+            values = read_env_values(location["path"])
             active = self._is_active(location)
-            if active and location and written and not (self._root / "runtime_data/settings/active.env").is_symlink():
-                config_profiles.activate_profile(root=self._root, robot=location["robot"], profile=location["profile"],
-                                                 revision_owner=self.revision_owner)
-            applied = self._apply_hot(values, written) if active and (location is None or location["robot"] == self.started_robot) else []
+            applied = self._apply_hot(values, written) if active and location["robot"] == self.started_robot else []
             restart_keys = sorted(key for key in written
                                   if key not in applied or apply_mode(key) == "hot_and_restart")
             effect_note = "可热加载项已应用；其它参数可立即重启或稍后生效。" if active else "方案已保存，选择应用后才改变运行设置。"

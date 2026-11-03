@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import PACKAGE_ROOT
 from .common import ManagerError, file_lock, process_alive, read_json
-from .runtime import clean_environment
+from .runtime import base_environment, clean_environment
 
 MAX_MESSAGE = 8 * 1024 * 1024
 
@@ -82,7 +82,7 @@ class ConfigurationClient:
             self._stop_locked()
             if prefix.parent != self.home / "releases" or (self.home / "current").resolve() != prefix:
                 raise ManagerError("config_conflict", "业务版本已变化，请刷新后重试。", 409)
-            environment = {key: value for key, value in clean_environment(prefix).items() if not key.startswith("NEH_MANAGER_WORKER_")}
+            environment = clean_environment(prefix, environment=base_environment())
             log_path = self.home / "logs/config-owner.log"
             descriptor = os.open(str(log_path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
             with os.fdopen(descriptor, "ab") as log:

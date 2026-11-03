@@ -24,7 +24,7 @@ from scripts.neh_system_helper import dependency_plan
 
 from .builds import build_modules, describe_builds, prune_build_cache
 from .catalog import ROBOT_REQUIREMENTS, module_imports, module_requirements, module_system_packages, resolve_modules
-from .runtime import read_existing, read_settings, write_runtime
+from .runtime import read_existing, read_settings, write_profile, write_runtime, _VALUES
 
 # Increment when dependency preparation changes without a requirements change.
 DEPENDENCY_RECIPE_VERSION = 1
@@ -76,11 +76,7 @@ def read_current(home: Path) -> dict:
 
 
 def existing_config(root: Path, current: Mapping) -> dict:
-    if (root / "runtime_data/settings/active.env").is_file():
-        return read_existing(root)
-    if not current:
-        return read_existing(root)
-    return read_settings(Path(current["prefix"]) / "settings.env")
+    return read_existing(root)
 
 
 def choose_python(requested: str = "") -> str:
@@ -114,6 +110,7 @@ def source_inputs(root: Path, home: Path) -> list:
     Metadata-only changes may conservatively request another installation.
     """
     outputs = tuple((home / name).absolute() for name in ("generations", "cache", "logs", "current", "install.lock"))
+    outputs += tuple((root / "drivers").glob("*/configs"))
     try:
         result = subprocess.run(
             ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
@@ -522,8 +519,7 @@ def apply(request: InstallRequest, hardware) -> dict:
         registration = inspect_installation(request.home)["lifecycle"] if current else None
         mode = request.service_mode or (registration["mode"] if registration else "foreground")
         service_name = registration["service_name"] if registration else None
-        migrate_lifecycle = bool(request.service_mode and service_name is None)
-        if current.get("installation_inputs") == inputs and not request.repair and not migrate_lifecycle and (not request.service_mode or request.service_mode == registration["mode"]):
+        if current.get("installation_inputs") == inputs and not request.repair and (not request.service_mode or request.service_mode == registration["mode"]):
             _verify_prefix(Path(current["prefix"]), request.modules)
             print("所选模块已经安装，无需重复处理。使用 --repair 可重新安装。")
             return current
@@ -553,13 +549,12 @@ def apply(request: InstallRequest, hardware) -> dict:
             state = {"schema": 1, "complete": True, "modules": list(request.modules),
                      "robot": request.robot, "source_root": str(request.root), "installation_inputs": inputs,
                      "python": seed, "binaries": binaries, "installed_at": identifier}
-            # Preserve descriptor-free foreground installs for old pinned readers.
-            # A real fresh install or explicit lifecycle migration assigns once.
-            if not current or "deployment" in current or request.service_mode:
-                if service_name is None and (not current or migrate_lifecycle):
-                    service_name = "neh-install-" + str(uuid.uuid4()) + ".service"
-                state["deployment"] = deployment_descriptor(request.root, request.home, prefix, request.modules,
-                                                            request.robot, mode, service_name=service_name)
+            if service_name is None:
+                service_name = "neh-install-" + str(uuid.uuid4()) + ".service"
+            location = _VALUES.configuration_location(root=request.root, environment={}, robot=request.robot)
+            write_profile(prefix, location["path"].parent, location["profile"], request.root / "runtime_data/settings")
+            state["deployment"] = deployment_descriptor(request.root, request.home, prefix, request.modules,
+                                                        request.robot, mode, service_name=service_name)
             atomic_write(prefix / "manifest.json", (json.dumps(state, ensure_ascii=False, indent=2) + "\n").encode("utf-8"), mode=0o600)
             temporary.symlink_to(prefix.relative_to(request.home))
             os.replace(str(temporary), str(request.home / "current"))

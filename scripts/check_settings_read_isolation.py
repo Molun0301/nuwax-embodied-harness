@@ -218,14 +218,6 @@ class ReadIsolationChecks(unittest.TestCase):
         self.assertNotIn(CONF, result['application']['apply_errors'])
         self.assertEqual(result['profile_context']['revision'], initial)
 
-    def test_legacy_read_requires_no_new_runtime_directory_write(self):
-        (self.root / 'runtime_data/settings/active.env').unlink()
-        self.app.started_robot = ''
-        with patch.dict(os.environ, {'NUWAX_USER_CONFIG_ENV_FILE': str(self.path)}), \
-             patch.object(Path, 'mkdir', side_effect=PermissionError('read-only source')):
-            result = self.app.schema()
-        self.assertIsNone(result['profile_context'])
-        self.assertEqual(self.fields(result)[CONF]['value'], '0.2')
 
     def test_profile_schema_never_acquires_write_sequence_lock(self):
         class ForbiddenLock:
@@ -234,31 +226,6 @@ class ReadIsolationChecks(unittest.TestCase):
         with patch.object(self.app, '_lock', ForbiddenLock()):
             self.assertEqual(self.fields(self.schema())[CONF]['effective_value'], '0.2')
 
-    def test_mode_changes_release_one_lock_domain_before_taking_another(self):
-        for to_profile in (False, True):
-            with self.subTest(to_profile=to_profile):
-                states = {'file': False, 'legacy': False}
-                calls = []
-                @contextmanager
-                def file_context(path):
-                    self.assertFalse(states['legacy'])
-                    states['file'] = True; calls.append('file')
-                    try: yield
-                    finally: states['file'] = False
-                @contextmanager
-                def legacy_context():
-                    self.assertFalse(states['file'])
-                    states['legacy'] = True; calls.append('legacy')
-                    try: yield
-                    finally: states['legacy'] = False
-                locations = iter([None, self.location, self.location, self.location] if to_profile
-                                 else [self.location, None, None, None])
-                with patch.object(config_io, '_target_lock', side_effect=file_context):
-                    result = config_io.build_schema(revision_owner=self.app.revision_owner,
-                        location_provider=lambda: next(locations), legacy_read_context=legacy_context,
-                        runtime_state_provider=self.app._runtime_state)
-                self.assertEqual(result['profile_context'] is not None, to_profile)
-                self.assertEqual(calls, ['legacy', 'file'] if to_profile else ['file', 'legacy'])
 
     def test_service_manager_status_wait_does_not_hold_adopted_state(self):
         token = self.revision()

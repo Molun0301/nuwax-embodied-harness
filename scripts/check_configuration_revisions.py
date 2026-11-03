@@ -53,6 +53,7 @@ class ConfigurationRevisionChecks(unittest.TestCase):
             (directory / 'data_plane.env').write_text('DEVICE_VALUE=synthetic\n')
         (self.root / '.env').write_text('NUWAX_ACTIVE_ROBOT=alpha\nLEGACY_VALUE=one\n')
         self.path = self.root / 'drivers/alpha/configs/main.env'
+        (self.path.parent / '.active').write_text('main\n')
         self.path.write_text('# preserved comment\nVALUE=one\nSECRET=' + SECRET + '\nUNKNOWN=keep\n')
         self.location = config_values.configuration_location(root=self.root, robot='alpha', profile='main')
         self.owner = config_profiles.ProfileRevisionOwner(); self.addCleanup(self.owner.close)
@@ -69,7 +70,7 @@ class ConfigurationRevisionChecks(unittest.TestCase):
         self.stack.enter_context(patch.object(config_io.subprocess, 'run', side_effect=AssertionError('native subprocess forbidden')))
         # schema只需此只读字段；不导入会在模块初始化读取真实.env的生产settings。
         fake_settings = ModuleType('core.settings')
-        fake_settings.LEGACY_CONFIG_FILE = self.root / '.config'; fake_settings._FILE_VALUES = {}
+        fake_settings._FILE_VALUES = {}
         self.stack.enter_context(patch.dict(sys.modules, {'core.settings': fake_settings}))
         import core
         self.stack.enter_context(patch.object(core, 'settings', fake_settings, create=True))
@@ -139,18 +140,6 @@ class ConfigurationRevisionChecks(unittest.TestCase):
                 self.owner.close()
         self.assertFalse(self.owner._closed)
 
-    def test_legacy_source_existence_path_and_order_are_part_of_cas(self):
-        location = config_values.configuration_location(root=self.root, robot='alpha', profile='默认')
-        token = self.token(location)
-        (self.root / '.config').write_bytes(b'')
-        with self.assertRaises(config_profiles.ConfigurationConflict):
-            config_profiles.check_revision(location, token, root=self.root, revision_owner=self.owner)
-        first, second = self.root / 'first.env', self.root / 'second.env'
-        first.write_text('VALUE=same\n'); second.write_bytes(first.read_bytes())
-        with patch.object(config_profiles, 'configuration_sources', return_value=[first, second]): token = self.token()
-        with patch.object(config_profiles, 'configuration_sources', return_value=[second, first]):
-            with self.assertRaises(config_profiles.ConfigurationConflict):
-                config_profiles.check_revision(self.location, token, root=self.root, revision_owner=self.owner)
 
     def test_schema_values_and_revision_share_capture_if_file_changes_during_render(self):
         def change_after_capture(values):
@@ -222,7 +211,7 @@ class ConfigurationRevisionChecks(unittest.TestCase):
         self.save({'VALUE': 'two'}, token)
         with self.assertRaises(config_profiles.ConfigurationConflict):
             config_profiles.activate_profile(root=self.root, robot='alpha', profile='main', expected_revision=token, revision_owner=self.owner)
-        self.assertFalse(self.location['selector'].exists())
+        self.assertEqual(self.location['selector'].read_text(), 'main\n')
         result = config_profiles.activate_profile(root=self.root, robot='alpha', profile='main', expected_revision=self.token(), revision_owner=self.owner)
         self.assertEqual(result['selected_profile'], 'main')
         self.assertEqual((self.root / 'runtime_data/settings/active.env').resolve(), self.path)
@@ -240,18 +229,9 @@ class ConfigurationRevisionChecks(unittest.TestCase):
         with patch.object(config_io, '_validate', side_effect=change_after_validation):
             with self.assertRaises(config_profiles.ConfigurationConflict):
                 config_profiles.activate_profile(root=self.root, robot='alpha', profile='main', expected_revision=token, revision_owner=self.owner)
-        self.assertFalse(self.location['selector'].exists())
+        self.assertEqual(self.location['selector'].read_text(), 'main\n')
         self.assertFalse((self.root / 'runtime_data/settings/active.env').is_symlink())
 
-    def test_default_profile_migration_uses_captured_sources_and_refuses_stale_migration(self):
-        location = config_values.configuration_location(root=self.root, robot='alpha', profile='默认')
-        token = self.token(location)
-        (self.root / '.env').write_text('NUWAX_ACTIVE_ROBOT=alpha\nLEGACY_VALUE=two\n')
-        with self.assertRaises(config_profiles.ConfigurationConflict):
-            config_io.save_values({'VALUE': 'new'}, robot='alpha', profile='默认', expected_revision=token, revision_owner=self.owner)
-        self.assertFalse(location['path'].exists())
-        config_io.save_values({'VALUE': 'new'}, robot='alpha', profile='默认', expected_revision=self.token(location), revision_owner=self.owner)
-        self.assertEqual(config_values.read_env_values(location['path'])['LEGACY_VALUE'], 'two')
 
     def test_bounded_baselines_spill_privately_and_expired_versions_require_refresh(self):
         owner = config_profiles.ProfileRevisionOwner(max_profiles=1); self.addCleanup(owner.close)

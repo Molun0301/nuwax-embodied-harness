@@ -80,19 +80,17 @@ function renderProfileControls(schema) {
     configState.profile = context.profile;
   }
   // 只说明所选方案与运行状态的关系，短标签放在下拉框旁，完整说明放在悬停提示里。
-  const running = context?.running_robot ? context.running_robot + ' / ' + (context.running_profile || '旧配置入口') : '';
+  const running = context?.running_robot ? context.running_robot + ' / ' + context.running_profile : '';
   const runningThis = Boolean(context && context.running_robot === context.robot && context.running_profile === context.profile);
-  const profileState = !context ? 'explicit' : !context.is_active ? 'inactive' : (!running || runningThis ? 'running' : 'restart');
+  const profileState = !context?.is_active ? 'inactive' : (!running || runningThis ? 'running' : 'restart');
   const profileStatus = document.getElementById('configProfileStatus');
-  profileStatus.textContent = { explicit: '显式配置文件', inactive: '未设为运行方案', running: '运行方案', restart: '已设为运行方案，待重启' }[profileState];
+  profileStatus.textContent = { inactive: '未设为运行方案', running: '运行方案', restart: '已设为运行方案，待重启' }[profileState];
   profileStatus.dataset.state = profileState;
   profileStatus.title = ({
-    explicit: '当前使用显式指定的配置文件，不经过机器人配置方案。',
     inactive: '所选方案不是运行方案，修改不会影响正在运行的机器人。',
     running: '所选方案就是当前运行的方案。',
     restart: '所选方案已设为运行方案，重启后生效。',
-  })[profileState] + (running ? '当前运行 ' + running + '。' : '')
-    + (context?.migration_required ? '首次保存会迁移该机器人的旧配置。' : '');
+  })[profileState] + (running ? '当前运行 ' + running + '。' : '');
   const apply = document.getElementById('configProfileApply');
   apply.disabled = !context;
   apply.dataset.active = String(Boolean(context?.is_active));

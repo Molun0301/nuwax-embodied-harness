@@ -9,7 +9,6 @@ import shlex
 import signal
 import subprocess
 import sys
-import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Optional, Sequence
@@ -138,39 +137,6 @@ def _wizard(selected: tuple, recommended: tuple) -> Optional[tuple]:
         except ValueError as exc:
             selected = original
             print("  选择未应用：" + str(exc))
-
-
-def _stop(current: dict, root: Path) -> int:
-    prefix = Path(current["prefix"])
-    values = read_settings(prefix / "settings.env")
-    pid_file = Path(values.get("NUWAX_GATEWAY_PID_FILE") or root / "runtime_data/gateway/gateway.pid")
-    try:
-        pid = int(pid_file.read_text().strip())
-        if pid <= 1:
-            raise ValueError("无效进程编号")
-        process_path = Path("/proc") / str(pid)
-        if process_path.joinpath("stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
-            return 0
-        environment = (Path("/proc") / str(pid) / "environ").read_bytes().split(b"\0")
-        identity = ("NUWAX_BOOTSTRAP_ENV_FILE=" + str(prefix / "settings.env")).encode()
-        if identity not in environment:
-            raise InstallError("进程不属于当前模块安装，未发送停止信号。")
-        os.kill(pid, signal.SIGTERM)
-        for _ in range(150):
-            process_path = Path("/proc") / str(pid)
-            # 更新器可能是父进程；僵尸已退出且不再持有锁，随后由父进程回收。
-            try:
-                exited = process_path.joinpath("stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
-            except FileNotFoundError:
-                exited = True
-            if exited:
-                print("当前安装的网关已停止。")
-                return 0
-            time.sleep(0.2)
-        raise InstallError("停止仍在收尾，请查看网关日志；安装环境已保留。")
-    except (FileNotFoundError, ProcessLookupError):
-        print("当前安装的网关没有运行。")
-        return 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

@@ -102,17 +102,17 @@ class CacheIdentityChecks(unittest.TestCase):
         self.assertEqual(self.commands, before)
         self.assertEqual(self.source_slots()["fastlio2-algorithm"], {"url": URL, "revision": PIN, "path": target.name})
 
-    def test_legacy_path_is_reused_without_renaming(self):
+    def test_old_named_source_is_ignored_and_retained(self):
         old = self.legacy()
-        before = (old / "fixture-head").read_bytes()
-        with patch.object(builds, "uuid", SimpleNamespace(uuid4=Mock(side_effect=AssertionError("allocation")))):
-            self.assertEqual(self.checkout(), old)
-        self.assertEqual((old / "fixture-head").read_bytes(), before)
-        self.assertEqual(self.commands, [])
+        before = (old / 'fixture-head').read_bytes()
+        target = self.checkout()
+        self.assertNotEqual(target, old)
+        self.assertEqual((old / 'fixture-head').read_bytes(), before)
+        self.assertEqual(self.source_slots()['fastlio2-algorithm']['path'], target.name)
 
     def test_requested_url_is_provenance_not_historic_origin(self):
-        old = self.legacy()
-        self.checkout()
+        old = self.checkout()
+        self.commands.clear()
         new_url = "https://github.com/another/source.git"
         self.assertEqual(self.checkout(url=new_url), old)
         self.assertEqual(self.source_slots()["fastlio2-algorithm"]["url"], new_url)
@@ -131,11 +131,6 @@ class CacheIdentityChecks(unittest.TestCase):
         self.assertEqual(self.checkout(OTHER_PIN), second)
         self.assertEqual(self.checkout(), first)
 
-    def test_legacy_candidates_choose_deterministic_clean_path(self):
-        second = self.legacy("ffffffffffff-" + PIN)
-        first = self.legacy("000000000000-" + PIN)
-        self.assertEqual(self.checkout(), first)
-        self.assertTrue(second.is_dir())
 
     def test_dirty_legacy_source_is_not_replaced(self):
         old = self.legacy(dirty=True)
@@ -607,7 +602,7 @@ class CacheIdentityChecks(unittest.TestCase):
         self.assertEqual(sum("fetch" in command for command in git_before), 2)
         second = self.root / "generation-2"
         with patch.object(builds, "uuid", SimpleNamespace(uuid4=Mock(side_effect=AssertionError("source reallocation")))), patch.object(
-            builds, "_legacy_source", side_effect=AssertionError("source rescan")
+            builds, "_assigned_source", side_effect=AssertionError("source rescan")
         ):
             self.build_slam_fixture(second)
         self.assertEqual(record.read_bytes(), before)

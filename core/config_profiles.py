@@ -9,13 +9,8 @@ import os
 import uuid
 from pathlib import Path
 
-from core.config_values import configuration_location, configuration_sources, configuration_file_values, parse_env_line, env_assignment
+from core.config_values import configuration_location, configuration_sources, parse_env_line, env_assignment
 
-_PATH_KEYS = frozenset({
-    "NUWAX_BOOTSTRAP_ENV_FILE", "GO2_DATA_PLANE_ENV_FILE", "NUWAX_USER_CONFIG_ENV_FILE",
-    "NUWAX_GEOMETRY_WEB_CONFIG_ENV_FILE", "NUWAX_GATEWAY_WEB_CONFIG_ENV_FILE",
-    "NUWAX_GEOMETRY_EXTRA_ENV_FILES", "NUWAX_SETTINGS_LAUNCHER",
-})
 
 
 class ConfigurationConflict(ValueError):
@@ -142,7 +137,7 @@ class CapturedProfile:
     def values(self):
         values = {}
         for path, _present, _offset, _size in self.sources:
-            values.update(configuration_file_values(path, reader=self.read_values))
+            values.update(self.read_values(path))
         values["NUWAX_ACTIVE_ROBOT"] = self.scope[1]
         return values
 
@@ -278,19 +273,8 @@ def check_revision(location, expected, *, root, revision_owner=None):
 def render_values(values):
     lines = ["# 机器人独立配置；通过控制台保存、另存或选择方案。"]
     lines.extend(env_assignment(key, str(value)) for key, value in sorted(values.items())
-                 if key not in _PATH_KEYS and not key.startswith("_NUWAX_"))
+                 if not key.startswith("_NUWAX_"))
     return "\n".join(lines) + "\n"
-
-
-def ensure_profile(location, *, root, snapshot=None):
-    from core.config_io import _atomic_write
-
-    if snapshot is not None:
-        current = location["path"].read_bytes() if location["path"].is_file() else None
-        if current != snapshot.raw(location["path"]):
-            raise _conflict()
-    if not location["path"].exists():
-        _atomic_write(location["path"], render_values(read_profile(location, root=root, snapshot=snapshot)))
 
 
 def profile_catalog(*, root, robot=None, profile=None, revision_owner=None, snapshot=None):
@@ -308,8 +292,7 @@ def profile_catalog(*, root, robot=None, profile=None, revision_owner=None, snap
     return {"robot": location["robot"], "profile": location["profile"],
             "profiles": sorted(names), "robots": robots, "selected_profile": selected["profile"],
             "selected_robot": active["robot"] if active else "",
-            "path": str(location["path"]), "revision": revision(location, root=root, revision_owner=revision_owner, snapshot=snapshot) if revision_owner else None,
-            "migration_required": not snapshot.profile_present if snapshot is not None else not location["path"].exists()}
+            "path": str(location["path"]), "revision": revision(location, root=root, revision_owner=revision_owner, snapshot=snapshot) if revision_owner else None}
 
 
 def create_profile(*, root, robot, source, name, expected_revision=None, revision_owner=None):
@@ -346,7 +329,9 @@ def activate_profile(*, root, robot, profile, expected_revision=None, revision_o
             expected = resolve_navigation_profile(values["NUWAX_GEOMETRY_PIPELINE"])
             if (values.get("NUWAX_NAV_PROFILE", "").strip() or expected) != expected:
                 raise ValueError("配置方案中的导航与建图执行链不一致")
-        ensure_profile(location, root=root, snapshot=snapshot)
+        current = location["path"].read_bytes() if location["path"].is_file() else None
+        if current != snapshot.raw(location["path"]):
+            raise _conflict()
         io._atomic_write(location["selector"], profile + "\n")
         active = root / "runtime_data" / "settings" / "active.env"
         active.parent.mkdir(parents=True, exist_ok=True)

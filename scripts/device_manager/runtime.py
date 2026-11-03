@@ -7,7 +7,6 @@ import os
 import re
 import shlex
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -63,8 +62,17 @@ print("NEH_RESULT=" + json.dumps(result, ensure_ascii=False))
 '''
 
 
-def clean_environment(prefix=None):
+def base_environment():
+    """业务只继承用户身份与语言，程序和配置由安装提供。"""
     environment = {key: value for key, value in os.environ.items()
+                   if key in ("HOME", "USER", "LOGNAME", "LANG") or key.startswith("LC_")}
+    environment["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    return environment
+
+
+def clean_environment(prefix=None, *, environment=None):
+    environment = os.environ if environment is None else environment
+    environment = {key: value for key, value in environment.items()
                    if not key.startswith(("NUWAX_", "GO2_", "PYTHON", "VIRTUAL_ENV", "CONDA")) and key not in ("LD_PRELOAD", "LD_LIBRARY_PATH")}
     environment["PYTHONNOUSERSITE"] = "1"
     if prefix:
@@ -268,12 +276,6 @@ def system_helper(action, payload=None):
                        environment=environment, payload=json.dumps(payload or {}), timeout=1800)
 
 
-# 业务环境不随发起命令的终端变化：开机和网页启动由系统服务发起，没有终端里的代理；
-# 继承终端代理会让发往机器人局域网地址的请求也走代理（Go2视频信令因此返回502）。
-# 安装任务仍沿用调用者的代理下载源码与依赖。
-_CALLER_PROXY_KEYS = ("http_proxy", "https_proxy", "all_proxy", "no_proxy")
-
-
 class Runtime:
     def __init__(self, home, manager_home=None):
         self.home = home
@@ -373,21 +375,16 @@ class Runtime:
             raise ManagerError("foreign_owner", "检测到其它安装的业务拥有方，请先迁入或通过原拥有方停止，拒绝调用全局清理。", 409)
         if self.status()["running"]:
             raise ManagerError("already_running", "业务拥有方已运行，拒绝并行创建。", 409)
-        from scripts.module_installer.runtime import read_settings
-        geometry_port = int(read_settings(prefix / "settings.env").get("NUWAX_GEOMETRY_RUNTIME_PORT", "50051") or "50051")
-        with socket.socket() as guard_socket:
-            guard_socket.settimeout(1)
-            if guard_socket.connect_ex(("127.0.0.1", geometry_port)) == 0:
-                raise ManagerError("foreign_owner", "原几何端口已有监听，拒绝启动器清理未知服务。", 409)
-        with socket.socket() as connection:
-            if connection.connect_ex(("127.0.0.1", self.port())) == 0:
-                raise ManagerError("port_in_use", "受管业务端口已被其它进程占用，拒绝接管未知服务。", 409)
+        from scripts.module_installer.runtime import _VALUES
+        values = _VALUES.configuration_values(root=prefix / "source", environment={
+            "NUWAX_MANAGED_HOME": str(self.home), "NUWAX_ROBOT_PROFILE_MODE": "1"})
+        if str(values.get("NUWAX_REAL_LCM_REQUIRED", "")).lower() in ("true", "1", "yes", "on") and Path("/usr/local/libexec/neh-system-helper").is_file():
+            system_helper("prepare-network", {"url": values.get("NUWAX_LCM_URL", "udpm://239.255.76.67:7667?ttl=0")})
         log_path = self.home / "logs/runtime.log"
         descriptor = os.open(str(log_path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
         with os.fdopen(descriptor, "ab") as log:
             process = subprocess.Popen(["bash", str(prefix / "start.sh"), "start"], cwd=prefix / "source",
-                                       env={key: value for key, value in clean_environment(prefix).items()
-                                            if not key.startswith("NEH_MANAGER_WORKER_") and key.lower() not in _CALLER_PROXY_KEYS},
+                                       env=clean_environment(prefix, environment=base_environment()),
                                        stdin=subprocess.DEVNULL,
                                        stdout=log, stderr=log, start_new_session=True)
         atomic_json(self.state_path, {"process": process_identity(process.pid), "prefix": str(prefix)})
@@ -403,8 +400,6 @@ class Runtime:
     def stop(self, prefix):
         record = read_json(self.state_path, {})
         original = record.get("process") or self._supervisor()
-        if self._foreign_owners():
-            raise ManagerError("foreign_owner", "其它安装仍有业务进程，拒绝原启动器的全局清理。", 409)
         # 兼容旧发布启动器把运行锁持有到退出的实现：先请求原supervisor执行自身关闭trap。
         # 只向已核验身份的根拥有方发信号，不直接操作算法工作进程。
         if process_alive(original):

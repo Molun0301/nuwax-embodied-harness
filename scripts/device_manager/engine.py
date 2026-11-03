@@ -15,7 +15,7 @@ from pathlib import Path
 
 from scripts.module_installer.catalog import MODULES, ModuleError, module_system_packages, resolve_modules
 from scripts.module_installer.hardware import detect_hardware, recommend_modules
-from scripts.module_installer.runtime import read_settings, _VALUES
+from scripts.module_installer.runtime import read_settings, write_profile, _VALUES
 
 from . import MANAGER_DEVELOPMENT, MANAGER_REVISION, MANAGER_VERSION, PACKAGE_ROOT
 from .config_client import ConfigurationClient
@@ -735,20 +735,8 @@ class Engine:
         return result
 
     def _activate_profile(self, candidate, robot):
-        directory = self.home / "config/profiles" / robot
-        directory.mkdir(parents=True, exist_ok=True)
-        name = self._profile_name(robot)
-        values = read_settings(candidate / "settings.env")
-        rendered = "\n".join(_VALUES.env_assignment(key, str(value)) for key, value in sorted(values.items()) if str(value).strip()) + "\n"
-        atomic_write(directory / (name + ".env"), rendered.encode())
-        atomic_write(directory / ".active", (name + "\n").encode())
-        settings = self.home / "data/settings"
-        settings.mkdir(parents=True, exist_ok=True)
-        active = settings / "active.env"
-        temporary = settings / (".active-" + uuid.uuid4().hex)
-        temporary.symlink_to(directory / (name + ".env"))
-        os.replace(str(temporary), str(active))
-        fsync_directory(settings)
+        write_profile(candidate, self.home / "config/profiles" / robot,
+                      self._profile_name(robot), self.home / "data/settings")
 
     def _execute(self, job):
         plan, action = job["_plan"], job["action"]
@@ -811,9 +799,6 @@ class Engine:
         self._cancelled(job["id"])
         should_start = was_running or self.settings()["auto_start"]
         if should_start:
-            values = read_settings(candidate / "settings.env")
-            if str(values.get("NUWAX_REAL_LCM_REQUIRED", "")).lower() in ("true", "1", "yes"):
-                system_helper("prepare-network", {"url": values.get("NUWAX_LCM_URL", "udpm://239.255.76.67:7667?ttl=0")})
             self._progress(job, "starting", 90, "启动原业务拥有方并验证网关接口")
             self.runtime.start(candidate)
         self._cancelled(job["id"])
@@ -888,10 +873,6 @@ class Engine:
             if not path.is_absolute():
                 relative = Path(*path.parts[1:]) if path.parts and path.parts[0] == "runtime_data" else path
                 existing[key] = str(self.home / "data" / relative)
-            elif self.home / "releases" in path.parents:
-                parts = path.relative_to(self.home / "releases").parts
-                if len(parts) >= 3 and parts[1:3] == ("source", "runtime_data"):
-                    existing[key] = str(self.home / "data" / Path(*parts[3:]))
         model_settings = []
         if "perception" in plan["modules"]:
             model_settings.append(("NUWAX_PERCEPTION_YOLO_WORLD_MODEL", "yolov8s-worldv2.pt"))

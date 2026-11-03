@@ -60,6 +60,10 @@ class OfflineFixture(unittest.TestCase):
         self.root = self.base / "source with spaces 模型"
         self.home = self.base / "installed"
         self.root.mkdir()
+        driver = self.root / 'drivers/customrobot'
+        driver.mkdir(parents=True)
+        (driver / 'manifest.py').write_text('')
+        (driver / 'assembly.py').write_text('')
         self.hardware = SimpleNamespace(is_jetson=False)
 
     def generation(self, label="one", *, name=LEGACY_NAME, mode="systemd-user", modules=None,
@@ -114,7 +118,6 @@ class OfflineFixture(unittest.TestCase):
         self.uuid = Mock(side_effect=assigned_uuid)
         identity_uuids = SimpleNamespace(uuid4=self.uuid)
         self.stack.enter_context(patch.object(manager, "uuid", identity_uuids))
-        self.stack.enter_context(patch.object(lifecycle, "uuid", identity_uuids))
         return patches
 
     def apply(self, **kwargs):
@@ -132,20 +135,6 @@ class RegistrationIdentityTests(OfflineFixture):
         self.assertEqual(descriptor["lifecycle"], {"mode": "foreground", "service_name": None})
         self.assertFalse(self.home.exists())
 
-    def test_legacy_inspect_and_plan_do_not_allocate_or_write(self):
-        self.generation(deployment=False)
-        before = {str(path): path.read_bytes() for path in self.base.rglob("*") if path.is_file()}
-        with patch.object(uuid, "uuid4", side_effect=forbidden):
-            for _ in range(3):
-                descriptor = lifecycle.inspect_installation(self.home)
-                self.assertIsNone(lifecycle.service_identifier(self.home))
-                request = manager.InstallRequest(self.root, self.home, ("core",), "customrobot", 1)
-                plan = manager.make_plan(request, self.hardware, manager.read_current(self.home))
-                self.assertEqual(plan["service_mode"], "foreground")
-        self.assertEqual(descriptor["lifecycle"], {"mode": "foreground", "service_name": None})
-        self.assertEqual(before, {str(path): path.read_bytes() for path in self.base.rglob("*") if path.is_file()})
-        with self.assertRaisesRegex(ValueError, "No registered"):
-            lifecycle.render_user_service(descriptor)
 
     def test_saved_names_are_opaque_and_preserved_exactly(self):
         for index, name in enumerate((LEGACY_NAME, ASSIGNED_NAME, "neh-fixture.service", "neh-Acme.Gateway:west@owner-7.service")):
@@ -213,26 +202,8 @@ class RegistrationIdentityTests(OfflineFixture):
                 with self.assertRaises(ValueError):
                     lifecycle.render_user_service(descriptor)
                 with self.assertRaises(ValueError):
-                    lifecycle.spawn_updater(descriptor, ["/fixture/python", "worker.py"])
+                    lifecycle.start_current(descriptor)
 
-    def test_queued_old_prefix_and_modules_work_across_upgrade_and_rollback(self):
-        old_prefix, state = self.generation()
-        queued = state["deployment"]
-        queued["listener"].update(host="::1", port=9919)
-        self.generation("two", modules=["core", "geometry"])
-        config = self.base / "user-config"
-        with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(config)}), patch.object(subprocess, "run") as run:
-            lifecycle.stop_current(queued)
-            lifecycle.start_current(queued)
-            self.activate(old_prefix)
-            lifecycle.start_current(queued)
-        self.assertEqual([call.args[0][2] for call in run.call_args_list],
-                         ["stop", "daemon-reload", "start", "daemon-reload", "start"])
-        unit = (config / "systemd/user" / LEGACY_NAME).read_text()
-        self.assertIn(str(self.home / "current/start.sh"), unit)
-        self.assertIn("NUWAX_GATEWAY_HOST=::1", unit)
-        self.assertIn("NUWAX_GATEWAY_PORT=9919", unit)
-        self.assertEqual(lifecycle.service_identifier(self.home), LEGACY_NAME)
 
     def test_start_rechecks_mode_and_name_before_unit_write_or_process(self):
         _, state = self.generation()
@@ -246,60 +217,33 @@ class RegistrationIdentityTests(OfflineFixture):
                 with self.assertRaisesRegex(ValueError, "changed before start"):
                     lifecycle.start_current(queued)
 
-    def test_saved_names_keep_transient_worker_recognition(self):
-        for index, name in enumerate((LEGACY_NAME, ASSIGNED_NAME)):
-            self.generation(str(index), name=name)
-            with patch.object(subprocess, "run") as run:
-                transient = lifecycle.spawn_updater(lifecycle.inspect_installation(self.home), ["/fixture/python", "worker.py"],
-                                                    environment={"PYTHONPATH": str(self.root), "SECRET": "fixture-secret"})
-            self.assertRegex(transient, "^" + name[:-8].replace(".", r"\.") + r"-update-[0-9a-f]{32}\.service$")
-            command = run.call_args.args[0]
-            self.assertIn("--setenv=PYTHONPATH=" + str(self.root), command)
-            self.assertFalse(any("SECRET" in value or "fixture-secret" in value for value in command))
 
     def test_unnamed_foreground_stop_retains_exact_settings_owner(self):
-        prefix, _ = self.generation(deployment=False)
+        prefix, _ = self.generation(mode="foreground", name=ASSIGNED_NAME)
         descriptor = lifecycle.inspect_installation(self.home)
         pid_file = Path(descriptor["pid_file"])
         pid_file.parent.mkdir(parents=True)
         pid_file.write_text("12345")
-        exact = ("NUWAX_BOOTSTRAP_ENV_FILE=" + str(prefix / "settings.env")).encode()
+        exact = ("NUWAX_INSTALL_HOME=" + str(self.home)).encode()
         with patch.object(lifecycle, "_exited", side_effect=[False, True]), \
                 patch.object(Path, "read_bytes", return_value=exact + b"\0"), patch.object(os, "kill") as kill:
             self.assertEqual(lifecycle.stop_current(descriptor), 0)
             kill.assert_called_once()
         with patch.object(lifecycle, "_exited", return_value=False), \
-                patch.object(Path, "read_bytes", return_value=b"NUWAX_BOOTSTRAP_ENV_FILE=/foreign/settings.env\0"):
-            with self.assertRaisesRegex(RuntimeError, "another installation"):
-                lifecycle.stop_current(descriptor)
+                patch.object(Path, "read_bytes", return_value=b"NUWAX_INSTALL_HOME=/foreign\0"), \
+                patch.object(os, "kill") as kill:
+            self.assertEqual(lifecycle.stop_current(descriptor), 0)
+            self.assertFalse(pid_file.exists())
+            kill.assert_not_called()
+        for error in (PermissionError(), FileNotFoundError(), OSError()):
+            with self.subTest(error=type(error).__name__), patch.object(lifecycle, "_exited", return_value=False), \
+                    patch.object(Path, "read_bytes", side_effect=error), patch.object(os, "kill") as kill:
+                pid_file.write_text("12345")
+                self.assertEqual(lifecycle.stop_current(descriptor), 0)
+                self.assertFalse(pid_file.exists())
+                kill.assert_not_called()
 
-    def test_unnamed_foreground_can_stop_after_name_assignment_but_not_start(self):
-        _, _ = self.generation(deployment=False)
-        queued = lifecycle.inspect_installation(self.home)
-        self.generation("two", mode="foreground", name=ASSIGNED_NAME)
-        self.assertEqual(lifecycle.stop_current(queued), 0)
-        with self.assertRaisesRegex(ValueError, "changed before start"):
-            lifecycle.start_current(queued)
 
-    def test_frozen_old_reader_gate_documents_assigned_name_incompatibility(self):
-        # The old reader's name derivation is a literal fixture mapping, never a hash.
-        recorded_old_names = {str(self.home): LEGACY_NAME}
-
-        def frozen_reader():
-            current = manager.read_current(self.home)
-            expected = recorded_old_names[str(self.home)]
-            saved = current.get("deployment")
-            if saved and saved["lifecycle"]["service_name"] != expected:
-                raise ValueError("Deployment service identity mismatch")
-            return expected
-
-        self.generation()
-        self.assertEqual(frozen_reader(), LEGACY_NAME)
-        self.generation("unnamed", deployment=False)
-        self.assertEqual(frozen_reader(), LEGACY_NAME)
-        self.generation("assigned", name=ASSIGNED_NAME)
-        with self.assertRaisesRegex(ValueError, "identity mismatch"):
-            frozen_reader()
 
 
 class ApplyRegistrationTests(OfflineFixture):
@@ -323,40 +267,9 @@ class ApplyRegistrationTests(OfflineFixture):
             self.assertEqual(state["deployment"]["lifecycle"]["service_name"], LEGACY_NAME)
         self.assertEqual(self.uuid.call_count, 2)
 
-    def test_descriptor_free_upgrade_preserves_registration_absence(self):
-        self.generation(deployment=False)
-        patches = self.mock_apply()
-        result = self.apply(repair=True)
-        self.assertNotIn("deployment", result)
-        self.assertIsNone(lifecycle.service_identifier(self.home))
-        self.assertEqual(self.uuid.call_count, 1)
-        self.apply()
-        self.assertEqual(self.uuid.call_count, 1)
 
-    def test_explicit_foreground_migration_bypasses_input_record_noop(self):
-        self.generation(deployment=False)
-        self.mock_apply()
-        result = self.apply(service_mode="foreground")
-        self.assertEqual(result["deployment"]["lifecycle"]["mode"], "foreground")
-        self.assertTrue(lifecycle.service_identifier(self.home).startswith("neh-install-"))
-        self.assertEqual(self.uuid.call_count, 2)
 
-    def test_explicit_systemd_migration_assigns_registration(self):
-        self.generation(deployment=False)
-        self.mock_apply()
-        result = self.apply(service_mode="systemd-user")
-        self.assertEqual(result["deployment"]["lifecycle"]["mode"], "systemd-user")
-        self.assertEqual(self.uuid.call_count, 2)
 
-    def test_saved_unnamed_foreground_stays_unnamed_unless_migrated(self):
-        self.generation(mode="foreground", name=None)
-        self.mock_apply()
-        result = self.apply(repair=True)
-        self.assertIsNone(result["deployment"]["lifecycle"]["service_name"])
-        self.assertEqual(self.uuid.call_count, 1)
-        result = self.apply(service_mode="foreground")
-        self.assertIsNotNone(result["deployment"]["lifecycle"]["service_name"])
-        self.assertEqual(self.uuid.call_count, 3)
 
     def test_corrupt_registration_fails_before_build_even_on_noop(self):
         prefix, state = self.generation()

@@ -6,8 +6,11 @@ import json
 import os
 import re
 import shlex
+import uuid
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
+
+from scripts.device_manager.common import atomic_write, fsync_directory
 
 from .catalog import ROBOT_REQUIREMENTS
 
@@ -20,13 +23,6 @@ _VALUES = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_VALUES)
 
 _MODULES = {"core", "geometry", "slam2d", "fastlio2", "pointlio", "navigation", "perception", "follow", "memory"}
-_CONFIG_PATH_KEYS = (
-    "NUWAX_BOOTSTRAP_ENV_FILE",
-    "GO2_DATA_PLANE_ENV_FILE",
-    "NUWAX_GEOMETRY_WEB_CONFIG_ENV_FILE",
-    "NUWAX_GATEWAY_WEB_CONFIG_ENV_FILE",
-    "NUWAX_USER_CONFIG_ENV_FILE",
-)
 _MEMORY_SAVED_PREFIX = "_NUWAX_INSTALLER_SAVED_"
 _MEMORY_KEYS = (
     "NUWAX_MEMORY_TEXT_EMBEDDING_MODEL",
@@ -55,41 +51,29 @@ def _config_path(root: Path, value: str) -> Path:
     return path if path.is_absolute() else root / path
 
 
-def _current_release_path(path: Path, root: Path, prefix: Path) -> Path:
-    """沿用旧配置时，其它版本目录内的项目路径改到当前版本；旧版本目录保留期满后会被清理。"""
-    try:
-        parts = path.relative_to(prefix.parent).parts
-    except ValueError:
-        return path
-    if len(parts) > 2 and parts[0] != prefix.name and parts[1] == root.name:
-        return root.joinpath(*parts[2:])
-    return path
-
-
 def read_settings(path: Path) -> dict[str, str]:
     """读取单份设置；安装器不必初始化 core 包及其运行依赖。"""
     return dict(_VALUES.read_env_values(path))
 
 
 def read_existing(root: Path) -> dict[str, str]:
-    """只读真实用户配置；示例不作为设备身份或已安装功能的证据。"""
-    root = root.resolve()
-    active = root / "runtime_data/settings/active.env"
-    if active.is_file():
-        return _VALUES.configuration_values(root=root, environment={})
-    values: dict[str, str] = {}
-    for path in (
-        root / "drivers/go2/data_plane.env",
-        root / ".config",
-        root / ".env",
-    ):
-        values.update(read_settings(path))
-    # 显式配置的来源同样参与迁移，最后读取统一用户设置。
-    for key in ("GO2_DATA_PLANE_ENV_FILE", "NUWAX_BOOTSTRAP_ENV_FILE", *_CONFIG_PATH_KEYS[2:]):
-        configured = os.environ.get(key, values.get(key, "")).strip()
-        if configured:
-            values.update(read_settings(_config_path(root, configured)))
-    return values
+    """只读取当前机器人方案。"""
+    return _VALUES.configuration_values(root=root, environment={})
+
+
+def write_profile(prefix: Path, directory: Path, name: str, settings: Path) -> None:
+    """两种安装共用方案写入与活动链接切换。"""
+    directory.mkdir(parents=True, exist_ok=True)
+    values = read_settings(prefix / "settings.env")
+    rendered = "\n".join(_VALUES.env_assignment(key, str(value)) for key, value in sorted(values.items()) if str(value).strip()) + "\n"
+    atomic_write(directory / (name + ".env"), rendered.encode())
+    atomic_write(directory / ".active", (name + "\n").encode())
+    settings.mkdir(parents=True, exist_ok=True)
+    active = settings / "active.env"
+    temporary = settings / (".active-" + uuid.uuid4().hex)
+    temporary.symlink_to(directory / (name + ".env"))
+    os.replace(str(temporary), str(active))
+    fsync_directory(settings)
 
 
 def _memory_settings(
@@ -177,8 +161,6 @@ def write_runtime(
         values.update(read_settings(root / "drivers/go2/data_plane.env.example"))
     values.update(read_settings(root / ".env.example"))
     values.update(existing)
-    # 丢弃退休布局开关，不再向运行时传播旧配置。
-    values.pop("NUWAX_AGENT_TERMINAL_FRESH_LAYOUT", None)
     # 新安装先供本机接入；已配置的监听地址与制品访问地址继续沿用。
     if not existing.get("NUWAX_GATEWAY_HOST", "").strip():
         values["NUWAX_GATEWAY_HOST"] = "127.0.0.1"
@@ -189,7 +171,7 @@ def write_runtime(
     for key in _ROOT_RELATIVE_PATH_KEYS:
         value = values.get(key, "").strip()
         if value:
-            values[key] = str(_current_release_path(_config_path(root, value), root, prefix))
+            values[key] = str(_config_path(root, value))
     settings_path = prefix / "settings.env"
     binary_dir = prefix / "bin"
     python_bin = prefix / "venv/bin/python"
@@ -211,8 +193,7 @@ def write_runtime(
     if robot == "go2" and geometry and "GO2_DIRECT_DDS_POINT_CLOUD_ENABLED" not in existing:
         values["GO2_DIRECT_DDS_POINT_CLOUD_ENABLED"] = "true"
     # 这些是安装产物与入口身份，不能继承旧安装或调用环境里的位置。
-    fixed = {key: str(settings_path) for key in _CONFIG_PATH_KEYS}
-    fixed.update({
+    fixed = {
         "NUWAX_ROBOT_PROFILE_MODE": "1",
         "NUWAX_INSTALL_HOME": str(prefix.parent.parent),
         "NUWAX_SETTINGS_LAUNCHER": str(prefix / "start.sh"),
@@ -231,11 +212,10 @@ def write_runtime(
         "NUWAX_GEOMETRY_RELEASE_MANIFEST": "",
         "NUWAX_GEOMETRY_RELEASE_NATIVE_PGO_EXECUTABLE": "",
         "NUWAX_GEOMETRY_RELEASE_GROUP_GUARDIAN_EXECUTABLE": "",
-        "NUWAX_GEOMETRY_EXTRA_ENV_FILES": "",
         # 套接字路径不能超过107字节，放在安装根而非版本目录下。
         "NUWAX_MOTION_GUARD_SOCKET": str(prefix.parent.parent / "run/motion-guard.sock"),
         "NUWAX_MOTION_GUARD_LOCK": str(prefix.parent.parent / "run/motion-guard.lock"),
-    })
+    }
     if robot == "go2":
         # SDK已安装在本版本虚拟环境，由同一解释器直接导入。
         fixed.update({
@@ -294,7 +274,7 @@ def write_runtime(
     prefix.mkdir(parents=True, exist_ok=True)
     # 先完整序列化再写入；配置含设备凭据，只允许当前用户读取。
     lines = [
-        "# 模块化安装的初始设置；控制台首次保存迁入机器人独立方案。",
+        "# 模块化安装的初始设置；安装完成时写入机器人独立方案。",
         "# 修改模块请重新运行安装器；地图、模型和其它用户数据保留原位置。",
         "# 未安装模块由启动入口强制禁用，已安装模块的业务参数仍支持显式环境覆盖。",
     ]

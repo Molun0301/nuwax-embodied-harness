@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Pure filesystem/mocked-process lifecycle checks: no device or service actions."""
+"""文件系统、替身与隔离子进程的生命周期检查；不操作设备或系统服务。"""
 from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -30,6 +31,7 @@ class LifecycleChecks(unittest.TestCase):
         self.settings.write_text("NUWAX_GATEWAY_HOST=127.0.0.7\nNUWAX_GATEWAY_PORT=9876\n")
         self.state = {"schema": 1, "complete": True, "modules": ["core"], "robot": "customrobot",
                       "source_root": str(self.root)}
+        self.state["deployment"] = lifecycle.deployment_descriptor(self.root, self.home, self.prefix, ["core"], "customrobot", service_name="neh-0123456789abcdef.service")
         self.save()
         (self.home / "current").symlink_to("generations/one")
 
@@ -48,12 +50,6 @@ class LifecycleChecks(unittest.TestCase):
         result = lifecycle.inspect_installation(self.home)
         self.assertEqual(result["pid_file"], str(self.root / "runtime_data/gateway/gateway.pid"))
 
-    def test_legacy_schema_infers_foreground(self):
-        result = lifecycle.inspect_installation(self.home)
-        self.assertEqual(result["lifecycle"]["mode"], "foreground")
-        self.assertIsNone(result["lifecycle"]["service_name"])
-        self.assertEqual(result["listener"]["port"], 9876)
-        self.assertEqual(result["prefix"], str(self.prefix))
 
     def test_roundtrip_stable_service_and_listener_override(self):
         original = self.descriptor("systemd-user")
@@ -75,6 +71,7 @@ class LifecycleChecks(unittest.TestCase):
     def test_registered_adapters_retained(self):
         for adapter in ("customrobot", "go2", "g1", "raspi_lidar_robot"):
             self.state["robot"] = adapter
+            self.state["deployment"]["robot_adapter"] = adapter
             self.save()
             self.assertEqual(lifecycle.inspect_installation(self.home)["robot_adapter"], adapter)
             self.assertEqual(build_parser().parse_args(["--robot", adapter]).robot, adapter)
@@ -87,19 +84,6 @@ class LifecycleChecks(unittest.TestCase):
         self.assertNotIn("User=root", unit)
         self.assertFalse((self.home / "systemd").exists())
 
-    @patch.object(lifecycle.os, "geteuid", return_value=1000)
-    @patch.object(lifecycle.subprocess, "run")
-    def test_systemd_worker_is_independent_unit_and_allowlisted_environment(self, run, uid):
-        descriptor = self.descriptor("systemd-user")
-        argv = ["/usr/bin/python3", str(self.root / "worker.py"), "--request", "opaque-id"]
-        result = lifecycle.spawn_updater(descriptor, argv, env={"PYTHONPATH": str(self.root), "API_SECRET": "never-in-unit"})
-        command = run.call_args.args[0]
-        self.assertIn("--user", command)
-        self.assertTrue(result.startswith(descriptor["lifecycle"]["service_name"][:-8] + "-update-"))
-        self.assertNotEqual(result, descriptor["lifecycle"]["service_name"])
-        self.assertEqual(command[command.index("--") + 1:], argv)
-        self.assertFalse(any("API_SECRET" in item or "never-in-unit" in item for item in command))
-        self.assertFalse(any("sudo" == item for item in command))
 
     @patch.object(lifecycle.os, "geteuid", return_value=1000)
     @patch.object(lifecycle.subprocess, "run")
@@ -112,7 +96,7 @@ class LifecycleChecks(unittest.TestCase):
     @patch.object(lifecycle.subprocess, "Popen")
     def test_root_never_dispatches_code(self, popen, uid):
         with self.assertRaises(RuntimeError):
-            lifecycle.spawn_updater(self.descriptor(), ["/usr/bin/python3", "x.py"])
+            lifecycle.start_current(self.descriptor())
         popen.assert_not_called()
 
     @patch.object(lifecycle.os, "geteuid", return_value=1000)
@@ -126,30 +110,37 @@ class LifecycleChecks(unittest.TestCase):
         kill.assert_not_called()
 
     @patch.object(lifecycle.os, "geteuid", return_value=1000)
-    @patch.object(lifecycle.subprocess, "Popen")
-    def test_foreground_worker_detached(self, popen, uid):
-        lifecycle.spawn_updater(self.descriptor(), ["/usr/bin/python3", "worker.py"])
-        self.assertTrue(popen.call_args.kwargs["start_new_session"])
-        self.assertTrue(popen.call_args.kwargs["close_fds"])
+    def test_foreign_live_process_leaves_only_stale_pid_record(self, uid):
+        descriptor = self.descriptor()
+        pid_file = Path(descriptor["pid_file"])
+        pid_file.parent.mkdir(parents=True)
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                   env=dict(os.environ, NUWAX_INSTALL_HOME="/foreign"),
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            pid_file.write_text(str(process.pid))
+            with patch.object(lifecycle.os, "kill") as kill:
+                self.assertEqual(lifecycle.stop_current(descriptor), 0)
+                kill.assert_not_called()
+            self.assertFalse(pid_file.exists())
+            self.assertIsNone(process.poll())
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
+
 
     @patch.object(lifecycle.os, "geteuid", return_value=1000)
     @patch.object(lifecycle.subprocess, "Popen")
-    def test_restart_preserves_effective_listener(self, popen, uid):
+    def test_foreground_start_uses_installation_listener_and_base_environment(self, popen, uid):
         descriptor = self.descriptor()
-        descriptor["listener"].update(host="::1", port=9919)
-        stale = {"_NUWAX_CONFIG_FILE_KEYS": "OLD_VALUE:NUWAX_INSTALL_HOME", "OLD_VALUE": "old",
-                 "NUWAX_BOOTSTRAP_ENV_FILE": "/old/settings.env", "VIRTUAL_ENV": "/old/venv",
-                 "NUWAX_SETTINGS_LAUNCHER": "/old/start.sh", "NUWAX_INSTALL_HOME": "/old/home"}
-        with patch.dict(os.environ, stale):
+        descriptor['listener']['port'] = 9919
+        with patch.dict(os.environ, {'OPENAI_API_KEY': 'caller', 'RUST_LOG': 'trace', 'HTTPS_PROXY': 'http://proxy', 'HOME': '/fixture'}):
             lifecycle.start_current(descriptor)
-        environment = popen.call_args.kwargs["env"]
-        for key in ("_NUWAX_CONFIG_FILE_KEYS", "OLD_VALUE", "NUWAX_BOOTSTRAP_ENV_FILE",
-                    "VIRTUAL_ENV", "NUWAX_SETTINGS_LAUNCHER"):
-            self.assertNotIn(key, environment)
-        self.assertEqual(environment["NUWAX_INSTALL_HOME"], str(self.home))
-        self.assertEqual(popen.call_args.kwargs["env"]["NUWAX_GATEWAY_HOST"], "::1")
-        self.assertEqual(popen.call_args.kwargs["env"]["NUWAX_GATEWAY_PORT"], "9919")
-        self.assertEqual(popen.call_args.args[0], ["/bin/bash", str(self.home / "current/start.sh")])
+        environment = popen.call_args.kwargs['env']
+        self.assertEqual(environment['NUWAX_GATEWAY_PORT'], '9876')
+        self.assertEqual(environment['HOME'], '/fixture')
+        self.assertEqual(environment['PATH'], '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin')
+        self.assertFalse({'OPENAI_API_KEY', 'RUST_LOG', 'HTTPS_PROXY'} & environment.keys())
 
     def test_launcher_exposes_install_home(self):
         write_runtime(self.root, self.prefix, ["core"], "customrobot", {})

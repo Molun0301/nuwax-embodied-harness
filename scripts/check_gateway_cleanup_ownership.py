@@ -62,10 +62,9 @@ class CleanupTests(unittest.TestCase):
         environment = dict(os.environ)
         if owner:
             home = self.home if owner == 'self' else self.base / 'other-installation'
-            environment.update(NUWAX_INSTALL_HOME=str(home), NUWAX_BOOTSTRAP_ENV_FILE=str(home / 'generations/old/settings.env'))
+            environment.update(NUWAX_INSTALL_HOME=str(home))
         if markers is not None:
             environment.pop('NUWAX_INSTALL_HOME', None)
-            environment.pop('NUWAX_BOOTSTRAP_ENV_FILE', None)
             environment.update(markers)
         options = {'start_new_session': True} if group is None else {'preexec_fn': lambda: os.setpgid(0, group)}
         command = [sys.executable, '-c', code, name]
@@ -219,7 +218,15 @@ class CleanupTests(unittest.TestCase):
                       GO2_VIDEO_STREAM_ENABLED='false', NUWAX_GATEWAY_PORT='18766',
                       NUWAX_GATEWAY_PID_FILE=str(self.pidfile), NUWAX_GATEWAY_LOCK_FILE=str(self.base / 'gateway.lock'),
                       NUWAX_GATEWAY_STOP_TIMEOUT_SEC='1', NUWAX_GATEWAY_KILL_TIMEOUT_SEC='1')
-        (self.root / '.env').write_text(''.join(k+'='+shlex.quote(v)+'\n' for k,v in config.items()))
+        directory = self.root / 'drivers/customrobot/configs'
+        directory.mkdir(parents=True, exist_ok=True)
+        for name in ('manifest.py', 'assembly.py'):
+            (directory.parent / name).write_text('')
+        profile = directory / 'fixture.env'
+        profile.write_text(''.join(k+'='+shlex.quote(v)+'\n' for k,v in config.items()))
+        active = self.root / 'runtime_data/settings/active.env'
+        active.parent.mkdir(parents=True, exist_ok=True)
+        active.symlink_to(profile)
         return script
 
     def cli(self, script, action, expected=0):
@@ -234,8 +241,6 @@ class CleanupTests(unittest.TestCase):
         logpath = self.base / ('supervisor-' + label + '.log')
         with logpath.open('w') as log:
             environment = dict(os.environ, NUWAX_INSTALL_HOME=str(self.home))
-            if relative:
-                environment['NUWAX_BOOTSTRAP_ENV_FILE'] = '.env'
             p = subprocess.Popen(['bash', str(script), action], cwd=self.root, env=environment,
                                  stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         self.processes.append(p)
@@ -244,7 +249,7 @@ class CleanupTests(unittest.TestCase):
             time.sleep(.02)
         self.assertTrue((self.root / 'worker-ready').exists(), logpath.read_text())
         self.assertEqual(self.pidfile.read_text().strip(), str(p.pid))
-        self.assertIn(('NUWAX_BOOTSTRAP_ENV_FILE=' + str(bootstrap or self.root / '.env')).encode(), Path('/proc', str(p.pid), 'environ').read_bytes().split(b'\0'))
+        self.assertIn(('NUWAX_INSTALL_HOME=' + str(self.home)).encode(), Path('/proc', str(p.pid), 'environ').read_bytes().split(b'\0'))
         return p
 
     def test_signal_trap_preserves_ownership_predicates(self):
@@ -263,7 +268,7 @@ wait "$!" || true
 
     def test_managed_launcher_supervisor_only_term_releases_children_and_lock(self):
         self.prepare_supervisor()
-        (self.root / 'drivers/customrobot').mkdir(parents=True)
+        (self.root / 'drivers/customrobot').mkdir(parents=True, exist_ok=True)
         for name in ('manifest.py', 'assembly.py'):
             shutil.copyfile(ROOT / 'drivers/customrobot' / name, self.root / 'drivers/customrobot' / name)
         sys.path.insert(0, str(ROOT))

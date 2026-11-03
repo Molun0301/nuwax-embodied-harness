@@ -5,15 +5,12 @@ CAS are used. Only native RPC and peripheral endpoints are simulated. These
 Python checks do not qualify the native sample's geometry or real RPC/LCM path.
 """
 
-import json
 import grpc
 import struct
 import unittest
 from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import FrozenInstanceError
-from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import tests.test_assigned_workspace_save as save_fixtures
@@ -22,7 +19,6 @@ from tests.test_assigned_asset_storage import MAP_NAME
 from tests.test_assigned_relocalization_contract import terminal_dict
 from tests.test_assigned_workspace_save import SaveNativeStub
 
-from contracts.map_activation import AssignedActivationReceipt
 from contracts.map_relocalization import (
     AssignedRelocalizationRequest,
     AssignedRelocalizationTerminal,
@@ -31,11 +27,6 @@ from contracts.runtime_views import LocalizationSessionStatus
 from core import StateNamespace
 from core.errors import GatewayError
 from services.geometry import geometry_runtime_provider as provider_module
-from services.localization.service import LocalizationService
-from services.mapping import catalog as catalog_module
-from services.mapping.catalog import MapCatalogRepository
-from services.mapping.service import MappingService
-from skills import assigned_map_relocalization as relocalization_module
 
 pb = provider_module.pb2
 REQUEST_ID = "order-000123"

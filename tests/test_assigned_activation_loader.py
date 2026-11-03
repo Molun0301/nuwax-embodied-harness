@@ -2,20 +2,16 @@
 
 from tests.conftest import (request_dict, predecessor, ack, LostReply, LoaderStub)
 import hashlib
-import struct
 import tempfile
 import threading
 import unittest
 from contextlib import ExitStack
 from copy import deepcopy
-from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-import grpc
-from tests.conftest import TransferStub, dense_bytes, fine_bytes, response_fixture
+from tests.conftest import dense_bytes, fine_bytes, response_fixture
 
-from contracts.map_relocalization import current_assigned_relocalization_policy
 from services.geometry import geometry_runtime_provider as module
 
 pb = module.pb2

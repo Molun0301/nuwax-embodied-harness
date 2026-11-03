@@ -21,7 +21,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from core.agent_call_store import AgentCallStore
 from core.agent_terminal_store import TERMINAL_FIELDS
 from core.errors import GatewayError
-import core.agent_call_store as call_module
 
 CONNECT = sqlite3.connect
 IDENTITY = {"robot_model": "offline", "robot_id": "one"}

@@ -1,4 +1,4 @@
-import { PointCloudProcessor } from './pointcloud-processing.js?v=20261014-measure-reuse';
+import { PointCloudProcessor } from './pointcloud-processing.js';
 
 // 本线程只拥有一次显示预处理，不访问设备、业务状态或图形资源。
 self.onmessage = ({ data }) => {

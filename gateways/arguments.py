@@ -43,3 +43,7 @@ def validate_arguments(arguments: Dict[str, Any], schema: Dict[str, Any]) -> Non
                            details={"path": list(exc.absolute_path), "validator": exc.validator}) from exc
     except (SchemaError, TypeError, ValueError) as exc:
         raise GatewayError("工具参数结构无效。", error_code="agent_schema_invalid", http_status=500) from exc
+
+
+def strict_json_constant(value: str) -> None:
+    raise ValueError(f"Non-standard JSON constant: {value}")

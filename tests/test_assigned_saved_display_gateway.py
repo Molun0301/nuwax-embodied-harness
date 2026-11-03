@@ -4,7 +4,6 @@ import base64
 import json
 import os
 import struct
-import threading
 import tempfile
 import unittest
 from dataclasses import replace
@@ -15,10 +14,10 @@ from unittest.mock import patch
 import tests.test_assigned_saved_cloud_sources as fixtures
 
 from contracts.streams import StreamFrame, StreamPayloadKind
-from gateways.runtime import GatewayRuntime, _GatewayObservedPointCloudMapSource, _GatewaySavedPointCloudMapSource
-from gateways.ws.data_streams import _legacy_pointcloud_frame
+from gateways.runtime import _GatewayObservedPointCloudMapSource, _GatewaySavedPointCloudMapSource
+from gateways.ws.data_streams import _pointcloud_snapshot_frame
 from gateways.ws.pointcloud_stream import PointCloudTransfer, snapshot_identity
-from services.geometry.dense_cloud import SavedDenseCloudCache, read_dense_metadata
+from services.geometry.dense_cloud import read_dense_metadata
 from services.geometry.pointcloud_map import (
     AssignedSavedPointCloudMapSource,
     PointCloudMapSourceError,
@@ -153,7 +152,7 @@ class AssignedSavedDisplayGatewayTests(unittest.TestCase):
         frame = StreamFrame(topic='pointcloud_map.snapshot', source='test', cursor=1,
             payload={'chunked': True}, metadata={'chunked': True})
         with patch('base64.b64encode', side_effect=AssertionError('full base64')):
-            value = _legacy_pointcloud_frame(frame, self.snapshot)
+            value = _pointcloud_snapshot_frame(frame, self.snapshot)
         self.assertEqual(value.status, 'unavailable')
         self.assertEqual(value.payload_kind, StreamPayloadKind.JSON)
         self.assertEqual(value.payload['reason'], 'assigned_saved_requires_page_stream')
@@ -211,7 +210,10 @@ class AssignedSavedDisplayGatewayTests(unittest.TestCase):
                 subscription = self.gateway.stream_bus.subscribe(observe,
                     topics=('pointcloud_map.snapshot', 'pointcloud_map.meta', 'pointcloud_map.chunk'))
                 try:
-                    with self.assertRaises(PointCloudMapSourceError):
+                    if change_on == 'pointcloud_map.snapshot':
+                        with self.assertRaises(PointCloudMapSourceError):
+                            self.gateway._publish_pointcloud_map_snapshot(current, reason='test')
+                    else:
                         self.gateway._publish_pointcloud_map_snapshot(current, reason='test')
                 finally:
                     self.gateway.stream_bus.unsubscribe(subscription)

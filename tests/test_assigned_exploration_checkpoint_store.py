@@ -8,7 +8,7 @@ import unittest
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import tests.test_assigned_asset_storage as asset_fixtures
 from tests.test_assigned_asset_storage import ASSET_ID, CHECKPOINT_ID, MAP_NAME, bundle_fixture, stage_fixture

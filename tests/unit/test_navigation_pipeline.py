@@ -135,7 +135,6 @@ def test_navigation_startup_exports_the_existing_go2_speed_limit():
     import os
     import subprocess
     import sys
-    from pathlib import Path
     script = ROOT / 'scripts/resolve_navigation_pipeline.py'
     for value in ('0.35', '0.23'):
         result = subprocess.run([sys.executable, str(script), '--max-linear-speed'],
@@ -152,7 +151,6 @@ def test_navigation_startup_exports_the_existing_go2_speed_limit():
 def test_navigation_startup_exports_yaw_limit_separately_from_translation():
     """设备角速度直接使用自身设置，不能跟随线速度改变单位。"""
     import os,subprocess,sys
-    from pathlib import Path
     script=ROOT/'scripts/resolve_navigation_pipeline.py'
     result=subprocess.run([sys.executable,str(script),'--max-yaw-rate'],env={**os.environ,
         'NUWAX_ACTIVE_ROBOT':'go2','GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS':'0.05',

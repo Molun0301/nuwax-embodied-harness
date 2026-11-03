@@ -68,7 +68,7 @@ _POINTCLOUD_BINARY_PREFIX = struct.Struct("<8sBI")
 _POINTCLOUD_BINARY_MAX_HEADER_BYTES = 64 * 1024
 _MAX_U64 = (1 << 64) - 1
 _POINTCLOUD_BINARY_TOPICS = frozenset(
-    {"pointcloud_map.snapshot", "pointcloud_map.live_chunk", "map.frame"}
+    {"pointcloud_map.snapshot", "map.frame"}
 )
 _WEBSOCKET_CURSOR_STATUS_FIELDS = frozenset(
     {
@@ -87,7 +87,6 @@ _LATEST_ONLY_STREAM_TOPICS = frozenset(
     {
         "map.frame",
         "pointcloud_map.snapshot",
-        "pointcloud_map.live_chunk",
         "robot.state",  # 机器人状态只需要最新帧
         "pointcloud.frame",  # 点云也只需要最新帧
         "localization.pose",  # 定位姿态只需要最新帧
@@ -902,15 +901,6 @@ def _encode_pointcloud_binary_frame(frame: StreamFrame) -> bytes:
         raise ValueError("点云二进制载荷必须是 bytes。")
     metadata = dict(frame.metadata or {})
     xyz_bytes = bytes(frame.payload)
-    if frame.topic == "pointcloud_map.live_chunk":
-        if len(xyz_bytes) < 8:
-            raise ValueError("旧 live compatibility 载荷头被截断。")
-        legacy_revision, legacy_point_count = struct.unpack("<II", xyz_bytes[:8])
-        del legacy_revision
-        xyz_bytes = xyz_bytes[8:]
-        if legacy_point_count != metadata.get("point_count"):
-            raise ValueError("旧 live compatibility 点数与统一身份不一致。")
-
     source = str(metadata.get("source") or "")
     source_epoch = str(metadata.get("source_epoch") or "")
     revision = str(metadata.get("revision") or frame.revision or "")
@@ -1080,8 +1070,8 @@ def _encode_ws_frame(frame: StreamFrame, *, map_binary_version=3) -> Union[str, 
     return _stream_json_dumps({"type": "stream.frame", "frame": frame})
 
 
-def _legacy_pointcloud_frame(frame, snapshot):
-    """只有明确订阅旧快照通道的连接要求完整兼容载荷。"""
+def _pointcloud_snapshot_frame(frame, snapshot):
+    """为快照通道生成完整载荷。"""
     if snapshot.provenance.get("assigned_source") is not None:
         # 新保存来源只走有界页面；不能在旧适配器重新拼接整图或创建摘要别名。
         return frame.model_copy(update={"payload_kind": StreamPayloadKind.JSON,
@@ -1094,28 +1084,17 @@ def _legacy_pointcloud_frame(frame, snapshot):
                 "point_count": snapshot.point_count, "format": snapshot.format,
                 "stream_generation": snapshot.stream_generation}
     raw = b"".join(chunk.xyz_bytes for chunk in snapshot.chunks) if getattr(snapshot, "chunked", False) else snapshot.xyz_bytes
-    if frame.topic == "pointcloud_map.live_chunk":
-        raw = struct.pack("<II", snapshot.revision_ordinal & 0xffffffff, snapshot.point_count) + raw
-    elif frame.topic == "pointcloud_map.chunk":
-        raw = {"revision": snapshot.revision, "frame_id": snapshot.frame_id, "lod": "preview",
-               "chunk_index": 0, "chunk_count": 1, "format": "float32-xyz", "encoding": "base64",
-               "data": base64.b64encode(raw).decode("ascii"), "point_count": snapshot.point_count,
-               "source_kind": snapshot.provenance.get("source_kind"), "metadata": dict(metadata)}
     return frame.model_copy(update={"payload_kind": StreamPayloadKind.BINARY, "payload": raw,
                                     "metadata": metadata, "frame_id": snapshot.frame_id,
                                     "revision": snapshot.revision})
 
 
 async def _send_ws_frame(websocket: WebSocket, frame: StreamFrame, *, pointcloud_encoder=None, map_binary_version=None, runtime=None, instance_encoder=None) -> None:
-    if ((frame.topic == "pointcloud_map.snapshot" and frame.metadata.get("chunked"))
-            or frame.metadata.get("legacy_pointcloud_topic")):
+    if frame.topic == "pointcloud_map.snapshot" and frame.metadata.get("chunked"):
         snapshot = runtime.get_pointcloud_map_snapshot() if runtime is not None else None
         if snapshot is None:
             return
-        if ((frame.topic == "pointcloud_map.live_chunk" and snapshot.source != "live")
-                or (frame.topic == "pointcloud_map.chunk" and snapshot.source != "saved")):
-            return
-        frame = await _run_blocking(_legacy_pointcloud_frame, frame, snapshot)
+        frame = await _run_blocking(_pointcloud_snapshot_frame, frame, snapshot)
     # 地图复制、完整栅格校验和点云编码不能占用所有连接共享的事件循环。
     # 轻量位姿直接编码，避免在工作线程繁忙时跟随地图排队。
     if (pointcloud_encoder is not None and frame.topic == "pointcloud_map.snapshot"
@@ -1134,11 +1113,10 @@ async def _send_ws_frame(websocket: WebSocket, frame: StreamFrame, *, pointcloud
 
 
 async def _format_sse_frame(frame: StreamFrame, *, runtime=None) -> str:
-    if runtime is not None and ((frame.topic == "pointcloud_map.snapshot" and frame.metadata.get("chunked"))
-            or frame.metadata.get("legacy_pointcloud_topic")):
+    if runtime is not None and frame.topic == "pointcloud_map.snapshot" and frame.metadata.get("chunked"):
         snapshot = runtime.get_pointcloud_map_snapshot()
         if snapshot is not None:
-            frame = await _run_blocking(_legacy_pointcloud_frame, frame, snapshot)
+            frame = await _run_blocking(_pointcloud_snapshot_frame, frame, snapshot)
     if frame.topic == "map.frame" or frame.payload_kind == StreamPayloadKind.BINARY:
         return await _run_blocking(_format_sse_payload, frame)
     return _format_sse_payload(frame)

@@ -1,8 +1,9 @@
 """生产请求三态与真实 protobuf 的代码级合成测试；不连接 RPC/机器人。"""
-import ast
 import importlib.util
 from pathlib import Path
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 from contracts.navigation import NavigationGoal, navigation_reverse_wire_fields
 
@@ -47,34 +48,30 @@ class NavigationReversePresenceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 navigation_reverse_wire_fields(value)
 
-    def test_real_provider_keyword_preserves_choice_without_mutating_goal(self):
-        # Evaluate the exact production kwargs expression, not a replacement adapter.
-        tree = ast.parse((ROOT / 'services/geometry/geometry_runtime_provider.py').read_text())
-        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
-                 and isinstance(node.func, ast.Attribute) and node.func.attr == 'NavigationGoal']
-        kwargs = [kw.value for call in calls for kw in call.keywords if kw.arg is None
-                  and isinstance(kw.value, ast.Call) and isinstance(kw.value.func, ast.Name)
-                  and kw.value.func.id == 'navigation_reverse_wire_fields']
-        self.assertEqual(len(kwargs), 1)
+    def test_real_provider_preserves_choice_without_mutating_goal(self):
+        from tests.unit.test_python_provider_set_goal_transaction import _configured_provider, _goal, _state
         for choice in (None, False, True):
-            goal = NavigationGoal(goal_id='provider-test', target_name='target', allow_reverse=choice)
+            goal = _goal('provider-test').model_copy(update={'allow_reverse': choice})
             before = goal.model_dump_json()
-            fields = eval(compile(ast.Expression(kwargs[0]), '<actual-provider-keyword>', 'eval'),
-                          {'goal': goal, 'navigation_reverse_wire_fields': navigation_reverse_wire_fields})
-            result = pb.NavigationGoal.FromString(pb.NavigationGoal(**fields).SerializeToString())
+            stub = SimpleNamespace(SetNavigationGoal=Mock(return_value=_state(
+                goal.goal_id, status='ACCEPTED', goal_generation=1)))
+            provider = _configured_provider(stub)
+            self.assertTrue(provider.set_goal(goal))
+            request = stub.SetNavigationGoal.call_args.args[0]
+            result = pb.NavigationGoal.FromString(request.SerializeToString())
             self.assertEqual((result.allow_reverse, result.use_profile_reverse_default),
                              (choice is True, choice is None))
             self.assertEqual(goal.model_dump_json(), before)
 
-    def test_gateway_does_not_inject_a_false_choice_when_argument_is_absent(self):
-        tree = ast.parse((ROOT / 'gateways/runtime.py').read_text())
-        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
-                 and isinstance(node.func, ast.Name) and node.func.id == 'NavigationGoal']
-        choices = [kw.value for call in calls for kw in call.keywords if kw.arg == 'allow_reverse']
-        self.assertEqual(len(choices), 1)
-        for arguments, expected in (({}, None), ({'allow_reverse': False}, False), ({'allow_reverse': True}, True)):
-            self.assertIs(eval(compile(ast.Expression(choices[0]), '<actual-gateway-keyword>', 'eval'),
-                               {'arguments': arguments}), expected)
+    def test_gateway_preserves_absent_and_explicit_reverse_choice(self):
+        from tests.test_navigation_goal_height_public_input import NavigationGoalHeightPublicInputTests
+        fixture = NavigationGoalHeightPublicInputTests()
+        self.addCleanup(fixture.doCleanups)
+        gateway = fixture.configure_runner(fixture.gateway())
+        for values, expected in (({}, None), ({'allow_reverse': False}, False), ({'allow_reverse': True}, True)):
+            fixture.mcp_call(gateway, {'frame_id': 'map', 'x': 1, 'y': 2, **values})
+            fixture.run_latest(gateway)
+            self.assertIs(gateway.dispatched[-1].allow_reverse, expected)
 
 
 if __name__ == '__main__':

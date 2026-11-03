@@ -2,8 +2,6 @@
 """Settings reads stay available while an ordered hot-apply operation waits."""
 from __future__ import annotations
 import sys
-import os
-from contextlib import contextmanager
 import threading
 from pathlib import Path
 from types import SimpleNamespace

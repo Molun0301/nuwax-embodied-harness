@@ -20,13 +20,11 @@ from tests.test_assigned_asset_storage import MAP_NAME
 from tests.test_assigned_workspace_relocalization import RelocalizationNativeStub
 from tests.conftest import dense_bytes, fine_bytes
 
-from contracts.map_relocalization import AssignedRelocalizationRequest
 from contracts.map_workspace import AssetIdentityV2
 from contracts.navigation import ExploreAreaRequest
 from contracts.runtime_views import LocalizationSessionStatus
 from core.errors import GatewayError
 from gateways import exploration_checkpoint as gateway_checkpoint
-from gateways.runtime import GatewayRuntime
 from services.geometry import geometry_runtime_provider as provider_module
 from services.mapping import catalog as catalog_module
 from services.mapping.asset_store import MapAssetBundleRepository

@@ -12,7 +12,7 @@ capture_image 归属见 §4 决策（本批暂不下放，归后续感知批 / �
 
 from __future__ import annotations
 
-from skills.handlers.motion_skills import _guard_error
+from gateways.motion_guard import motion_guard_gateway_error
 
 import uuid
 from typing import Any, Dict, Optional
@@ -83,7 +83,7 @@ def handle_stop_all_motion(
     except GatewayError:
         raise
     except MotionGuardFacadeError as exc:
-        raise _guard_error("stop_all_motion", exc) from exc
+        raise motion_guard_gateway_error("stop_all_motion", exc) from exc
     except Exception as exc:
         raise GatewayError(
             "未能确认机器人完成全局停车。",

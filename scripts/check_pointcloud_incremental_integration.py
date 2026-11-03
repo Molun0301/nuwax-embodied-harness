@@ -52,23 +52,22 @@ class Publication(unittest.TestCase):
             is_assigned_saved_cloud_selected=lambda:False,
             capture_assigned_saved_cloud_source=lambda:None)
         owner._require_pointcloud_source_current=MethodType(runtime.GatewayRuntime._require_pointcloud_source_current,owner)
-        owner._publish_pointcloud_map_compatibility=MethodType(runtime.GatewayRuntime._publish_pointcloud_map_compatibility,owner)
+        owner._publish_pointcloud_map_meta=MethodType(runtime.GatewayRuntime._publish_pointcloud_map_meta,owner)
         return owner
     def test_native_publication_has_no_full_bytes_or_compat_payload(self):
         owner=self.fake();source=snapshot()
         with patch.object(base64,'b64encode',side_effect=AssertionError('no eager base64')):
             runtime.GatewayRuntime._publish_pointcloud_map_snapshot(owner,source,reason='source_update')
-        self.assertEqual(len(owner.stream_bus.frames),2)
+        self.assertEqual([topic for topic, _ in owner.stream_bus.frames], ["pointcloud_map.snapshot"])
         topic,frame=owner.stream_bus.frames[0]
         self.assertEqual(topic,'pointcloud_map.snapshot');self.assertEqual(frame['payload_kind'],StreamPayloadKind.JSON)
         self.assertEqual(frame['payload'],{'chunked':True,'point_count':1})
-        self.assertTrue(owner.stream_bus.frames[1][1]['metadata']['legacy_pointcloud_topic'])
     def test_saved_heartbeat_does_not_make_base64(self):
         owner=self.fake();source=snapshot('saved',False)
         with patch.object(base64,'b64encode',side_effect=AssertionError('no eager base64')):
             runtime.GatewayRuntime._publish_pointcloud_map_snapshot(owner,source,reason='heartbeat')
         self.assertIs(owner.stream_bus.frames[0][1]['payload'],source.xyz_bytes)
-        self.assertEqual(owner.stream_bus.frames[-1][1]['payload'],{'legacy_pointcloud_topic':True})
+        self.assertEqual([topic for topic, _ in owner.stream_bus.frames], ['pointcloud_map.snapshot', 'pointcloud_map.meta'])
     def test_getter_returns_same_current_snapshot_without_materialization(self):
         source=snapshot();owner=self.fake();owner._pointcloud_map_current_snapshot=source
         self.assertIs(runtime.GatewayRuntime.get_pointcloud_map_snapshot(owner),source)
@@ -83,13 +82,6 @@ class Compatibility(unittest.IsolatedAsyncioTestCase):
         socket=Socket();await ws._send_ws_frame(socket,frame,runtime=owner)
         _magic,version,_size=struct.unpack_from('<8sBI',socket.data)
         self.assertEqual(version,1);self.assertEqual(socket.data[-12:],source.chunks[0].xyz_bytes)
-    async def test_real_sse_explicit_legacy_saved_has_payload(self):
-        source=snapshot('saved',False);owner=NS(get_pointcloud_map_snapshot=lambda:source)
-        frame=StreamFrame(topic='pointcloud_map.chunk',source='probe',cursor=1,payload={'legacy_pointcloud_topic':True},metadata={'legacy_pointcloud_topic':True})
-        with patch.object(ws.base64,'b64encode',wraps=ws.base64.b64encode) as encode:
-            text=await ws._format_sse_frame(frame,runtime=owner)
-        self.assertEqual(encode.call_count,1);self.assertIn('"encoding": "base64"',text)
-        self.assertIn('AACAPwAAAEAAAEBA',text)
 
 
 class ActualPipeline(unittest.TestCase):

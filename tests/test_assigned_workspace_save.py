@@ -19,10 +19,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tests.conftest import LostReply
-from tests.test_assigned_asset_storage import LEGACY_BUNDLE, LEGACY_MANIFEST, LEGACY_SHA, MAP_NAME, bundle_fixture, write
+from tests.test_assigned_asset_storage import MAP_NAME, bundle_fixture
 from tests.test_assigned_workspace_activation import MemoryEndpoint, WorkspaceNativeStub
 from tests.conftest import TransferStub, response_fixture
-from tests.unit.test_scene_mapping_service import setup, remember
+from tests.unit.test_scene_mapping_service import remember
+from tests.unit.test_scene_mapping_service import setup as setup
 
 from contracts.geometry import Pose
 from contracts.map_workspace import AssetIdentityV2, MapAssetBundle, MapAssetStatus
@@ -197,7 +198,7 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
             prepared.snapshot.metadata.update(captured_metadata)
             return prepared
         with patch.object(self.runtime, "prepare_map_asset_bundle", historical_prepare):
-            saved = self.save()
+            self.save()
         before = (self.service._asset_repository.current_directory(MAP_NAME) / "manifest.json").read_bytes()
         workspace = self.service.activate_map(map_name=MAP_NAME)
         self.assertTrue(workspace.map_loaded)

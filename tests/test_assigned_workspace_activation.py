@@ -5,7 +5,6 @@ native process, hardware, legacy hash authority or unrelated suite is needed.
 """
 
 import hashlib
-import json
 import tempfile
 import threading
 import unittest
@@ -15,10 +14,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from tests.conftest import LoaderStub, LostReply, ack, predecessor
+from tests.conftest import LoaderStub, ack, predecessor
 from tests.test_assigned_asset_storage import (
     ASSET_ID,
-    CHECKPOINT_ID,
     MAP_NAME,
     STAMP,
     bundle_fixture,
@@ -28,7 +26,6 @@ from tests.test_assigned_asset_storage import (
 from tests.conftest import response_fixture
 
 from contracts.geometry import Pose
-from contracts.map_relocalization import AssignedRelocalizationRequest, current_assigned_relocalization_policy
 from contracts.map_workspace import AssetIdentityV2, MapAsset, MapAssetBundle, MapAssetStatus
 from contracts.runtime_views import LocalizationSession, LocalizationSessionStatus, LocalizationSnapshot
 from core import StateNamespace, StateStore
@@ -37,9 +34,7 @@ from services.geometry import geometry_runtime_provider as provider_module
 from services.geometry import runtime as runtime_module
 from services.geometry.mapping_backend_checkpoint_store import MappingBackendCheckpointStore
 from services.localization.service import LocalizationService
-from services.mapping import catalog as catalog_module
 from services.mapping.asset_store import MapAssetBundleRepository
-from services.mapping.catalog import MapCatalogRepository
 from services.mapping.service import MappingService
 from skills.map_workspace import MapWorkspaceService
 

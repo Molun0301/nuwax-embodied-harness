@@ -20,12 +20,12 @@ def normalized_settings(stored):
     return result
 
 
-def discover(engine, *, refresh=False, request=None, local_request=False):
-    settings = engine.settings()
+def discover(engine, *, refresh=False, request=None, local_request=False, settings=None):
+    settings = engine._settings_snapshot() if settings is None else settings
     request = request or {}
     repository = request.get("source_repository", settings["source_repository"])
     branch = request.get("source_branch", settings["source_branch"])
-    allow_local = bool(local_request or read_json(engine.manager_home / "config/settings.json", {}).get("_allow_local_source"))
+    allow_local = bool(local_request or settings.get("_allow_local_source"))
     if request.get("source_repository") and repository != settings["source_repository"] and not local_request:
         raise ManagerError("local_only", "临时源码仓库覆盖只能从设备命令行指定；网页请先保存源码设置。", 403)
     cache_path = engine.home / "cache/source-catalog.json"

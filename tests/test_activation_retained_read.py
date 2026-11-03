@@ -6,10 +6,10 @@ import struct
 import unittest
 from dataclasses import replace
 from contextlib import ExitStack
-from pathlib import Path
 from unittest.mock import patch
 
 import tests.test_assigned_workspace_activation as workspace_tests
+from tests.test_assigned_asset_storage import CHECKPOINT_ID
 from tests.conftest import response_fixture, fine_bytes, dense_bytes
 from services.geometry import geometry_runtime_provider as provider_module
 from services.geometry import mapping_backend_checkpoint_store as checkpoint
@@ -127,7 +127,7 @@ class RetainedActivationReadTests(unittest.TestCase):
         if operation:self.assertEqual(self.h.stub.calls,[])
         # A new exact read can still take the store lock: no descriptor/lock leaked.
         reopened=checkpoint.MappingBackendCheckpointStore(self.root).load('voxel',schema_version=2)
-        self.assertEqual(reopened.checkpoint.checkpoint_id,workspace_tests.CHECKPOINT_ID)
+        self.assertEqual(reopened.checkpoint.checkpoint_id,CHECKPOINT_ID)
 
     def test_member_replacement_between_metadata_and_load_rejected(self):self._race('before','file')
     def test_member_replacement_between_load_and_verify_rejected(self):self._race('after','file')

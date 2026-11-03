@@ -14,7 +14,6 @@ from tests.conftest import LoaderStub, LostReply, predecessor
 from tests.test_assigned_asset_storage import bundle_fixture, checkpoint_fixture
 from tests.conftest import response_fixture
 
-from contracts.map_identity import AssetIdentityV2
 from contracts.geometry_runtime import PlatformGeometryConfig
 from contracts.runtime_views import MapSnapshot
 from services.geometry import geometry_runtime_provider as provider_module

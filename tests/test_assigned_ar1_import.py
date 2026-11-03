@@ -1,16 +1,14 @@
 """Capability-fenced AR1 source imports, with real stores and fake native RPCs."""
-import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import tests.test_legacy_cloud_import as legacy
-from tests.test_legacy_cloud_import import fine_archive, inventory
+from tests.test_legacy_cloud_import import fine_archive
 from tests.conftest import LoaderStub
 from tests.conftest import response_fixture
 from services.geometry import geometry_runtime_provider as provider
 from services.geometry import runtime as runtime_module
-from services.mapping import asset_store
 from contracts.geometry_runtime import PlatformGeometryConfig
 
 

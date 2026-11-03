@@ -5,13 +5,11 @@ Use the existing source-only namespace harness if unrelated optional imports are
 unavailable. The default legacy callers remain outside this component slice.
 """
 from contextlib import ExitStack
-from copy import deepcopy
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 import hashlib
 import importlib.util
 from pathlib import Path
-import threading
 import tempfile
 from types import SimpleNamespace
 from contracts.geometry_runtime import PlatformGeometryConfig

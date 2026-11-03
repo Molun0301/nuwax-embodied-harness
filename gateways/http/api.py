@@ -15,6 +15,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from contracts.forbidden_zones import ReplaceForbiddenZonesRequest
+from gateways.arguments import strict_json_constant
 from gateways.auth import GatewayAccessManager
 from gateways.errors import GatewayError, as_gateway_error
 from gateways.feedback import build_task_summary, build_mcp_tool_result
@@ -693,9 +694,15 @@ def build_http_router(runtime: GatewayRuntime, access_manager: GatewayAccessMana
     @router.post("/api/capabilities/{capability_name}/invoke")
     async def api_invoke_capability(
         capability_name: str,
-        body: CapabilityInvokeRequest,
         request: Request,
     ) -> Dict[str, Any]:
+        try:
+            body = CapabilityInvokeRequest.model_validate(
+                json.loads(await request.body(), parse_constant=strict_json_constant)
+            )
+        except ValueError as exc:
+            raise GatewayError("能力调用参数解析失败。", error_code="invalid_params",
+                               http_status=422, jsonrpc_code=-32602) from exc
         return await run_in_threadpool(_invoke_capability, request, capability_name, body.arguments)
 
     @router.get("/api/tasks")

@@ -240,12 +240,9 @@ class EncodingContracts(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(broken_owner._entries)
         self.assertEqual(broken_owner._charged_bytes, 0)
 
-    async def test_legacy_sse_and_nonbinary_paths_unchanged(self):
+    async def test_sse_and_nonbinary_paths_unchanged(self):
         owner = self.owner()
         frame = cloud()
-        legacy = frame.model_copy(update={'topic': 'pointcloud_map.live_chunk',
-                                         'payload': struct.pack('<II', 7, 1000) + frame.payload})
-        await self.equals_baseline(legacy, owner)
         nonbinary = frame.model_copy(update={'payload_kind': StreamPayloadKind.JSON, 'payload': {'x': 1}})
         await self.equals_baseline(nonbinary, owner)
         sse_before = ws._format_sse_payload(frame)

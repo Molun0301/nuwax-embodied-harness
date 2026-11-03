@@ -8,7 +8,7 @@ import time
 from typing import Protocol
 import uuid
 
-from contracts.building_navigation import BuildingExplorationRequest, BuildingExplorationState, FloorRecord
+from contracts.building_navigation import BuildingExplorationRequest, BuildingExplorationState
 from contracts.map_identity import AssetIdentityV2
 from services.mapping.catalog import _atomic_write_text
 from services.navigation.building_catalog import BuildingCatalog

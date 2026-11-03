@@ -17,7 +17,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from core.errors import GatewayError, MotionGuardFacadeError
+from core.errors import MotionGuardFacadeError
+from gateways.motion_guard import motion_guard_gateway_error
 from services.navigation.motion_guard_client import ModeSwitchConfirmation
 from services.navigation.proto_gen import motion_guard_pb2 as pb
 from skills.common import params
@@ -58,41 +59,6 @@ _CONTROL_MODES = {
     "low": pb.CONTROL_MODE_LOW_LEVEL,
 }
 MOTION_ADMISSION_ARGUMENT = "_motion_admission"
-
-
-def _guard_error(capability_name: str, error: MotionGuardFacadeError) -> GatewayError:
-    failures = []
-    pending = [error]
-    seen = set()
-    error_code = None
-    while pending and len(failures) < 8:
-        current = pending.pop(0)
-        if not isinstance(current, BaseException) or id(current) in seen:
-            continue
-        seen.add(id(current))
-        detail = {"type": type(current).__name__, "message": str(current)[:1000]}
-        for name in ("code", "operation", "operation_id"):
-            value = getattr(current, name, None)
-            if value is not None:
-                detail[name] = str(value)[:256]
-        if error_code is None and detail.get("code"):
-            error_code = detail["code"]
-        failures.append(detail)
-        pending.extend((current.__cause__, current.__context__,
-                        getattr(current, "cause", None), getattr(current, "prior_failure", None)))
-    return GatewayError(f"motion guard rejected {capability_name}: {error}",
-        error_code=error_code or "motion_guard_unavailable", http_status=503, jsonrpc_code=-32010,
-        details={"capability_name": capability_name, "guard_error_type": type(error).__name__,
-                 "guard_failures": failures})
-
-
-def _require_motion_admission(payload: Dict[str, Any], capability_name: str):
-    admission = payload.get(MOTION_ADMISSION_ARGUMENT)
-    if admission is None:
-        raise RuntimeError(f"{capability_name} requires a request-scoped motion admission")
-    return admission
-
-
 
 
 def _command_result(confirmation: Any) -> Dict[str, Any]:
@@ -140,37 +106,11 @@ def handle_execute_sport_command(
     """
 
     del requested_by
-    action = params.require_str(payload, "action")
-    action_value = _SPORT_ACTIONS.get(action)
-    if action_value is None:
-        raise GatewayError(
-            "execute_sport_command 当前只支持已公开的 Go2 高层机身动作命令。",
-            error_code="invalid_action",
-            http_status=422,
-            jsonrpc_code=-32602,
-            details={
-                "action": action,
-                "supported_actions": list(_SPORT_ACTIONS),
-                "hint": "姿态、速度档位、控制模式和低层关节控制请使用专用工具。",
-            },
-        )
-    command_params = payload.get("params") or {}
-    if not isinstance(command_params, dict):
-        raise GatewayError(
-            "params 必须为对象。",
-            error_code="invalid_params",
-            http_status=422,
-            jsonrpc_code=-32602,
-        )
+    action = payload["action"]
+    action_value = _SPORT_ACTIONS[action]
+    command_params = payload.get("params", {})
     enabled = command_params.get("flag", command_params.get("on", True))
-    if not isinstance(enabled, bool):
-        raise GatewayError(
-            "sport command flag/on 必须为布尔值。",
-            error_code="invalid_params",
-            http_status=422,
-            jsonrpc_code=-32602,
-        )
-    admission = _require_motion_admission(payload, "execute_sport_command")
+    admission = payload[MOTION_ADMISSION_ARGUMENT]
     try:
         confirmation = ctx.motion_guard.execute_sport(
                 action_value,
@@ -178,7 +118,7 @@ def handle_execute_sport_command(
                 enabled=enabled,
             )
     except MotionGuardFacadeError as exc:
-        raise _guard_error("execute_sport_command", exc) from exc
+        raise motion_guard_gateway_error("execute_sport_command", exc) from exc
     return {"code": 0, "result": _command_result(confirmation), "action": action}
 
 
@@ -197,7 +137,7 @@ def handle_set_body_pose(
     roll = params.optional_float(payload, "roll", 0.0)
     pitch = params.optional_float(payload, "pitch", 0.0)
     yaw = params.optional_float(payload, "yaw", 0.0)
-    admission = _require_motion_admission(payload, "set_body_pose")
+    admission = payload[MOTION_ADMISSION_ARGUMENT]
     try:
         confirmation = ctx.motion_guard.set_body_pose(
                 roll,
@@ -206,7 +146,7 @@ def handle_set_body_pose(
                 proof=admission.proof,
             )
     except MotionGuardFacadeError as exc:
-        raise _guard_error("set_body_pose", exc) from exc
+        raise motion_guard_gateway_error("set_body_pose", exc) from exc
     return {"code": 0, "result": _command_result(confirmation)}
 
 
@@ -222,22 +162,15 @@ def handle_set_speed_level(
     """
 
     del requested_by
-    level = params.optional_int(payload, "level", 1)
-    if not 1 <= level <= 3:
-        raise GatewayError(
-            "level 仅支持 1 到 3。",
-            error_code="invalid_params",
-            http_status=422,
-            jsonrpc_code=-32602,
-        )
-    admission = _require_motion_admission(payload, "set_speed_level")
+    level = payload["level"]
+    admission = payload[MOTION_ADMISSION_ARGUMENT]
     try:
         confirmation = ctx.motion_guard.set_speed_level(
                 level,
                 proof=admission.proof,
             )
     except MotionGuardFacadeError as exc:
-        raise _guard_error("set_speed_level", exc) from exc
+        raise motion_guard_gateway_error("set_speed_level", exc) from exc
     return {
         "code": 0,
         "result": _command_result(confirmation),
@@ -257,23 +190,16 @@ def handle_switch_control_mode(
     """
 
     del requested_by
-    mode = params.require_str(payload, "mode")
-    mode_value = _CONTROL_MODES.get(mode)
-    if mode_value is None:
-        raise GatewayError(
-            "mode 仅支持 high 或 low。",
-            error_code="invalid_params",
-            http_status=422,
-            jsonrpc_code=-32602,
-        )
-    admission = _require_motion_admission(payload, "switch_control_mode")
+    mode = payload["mode"]
+    mode_value = _CONTROL_MODES[mode]
+    admission = payload[MOTION_ADMISSION_ARGUMENT]
     try:
         confirmation = ctx.motion_guard.switch_mode(
                 mode_value,
                 proof=admission.proof,
             )
     except MotionGuardFacadeError as exc:
-        raise _guard_error("switch_control_mode", exc) from exc
+        raise motion_guard_gateway_error("switch_control_mode", exc) from exc
     return {"code": 0, "result": _mode_result(confirmation), "mode": mode}
 
 
@@ -289,22 +215,15 @@ def handle_set_obstacle_avoidance(
     """
 
     del requested_by
-    enabled = payload.get("enabled", True)
-    if not isinstance(enabled, bool):
-        raise GatewayError(
-            "enabled 必须为布尔值。",
-            error_code="invalid_params",
-            http_status=422,
-            jsonrpc_code=-32602,
-        )
-    admission = _require_motion_admission(payload, "set_obstacle_avoidance")
+    enabled = payload["enabled"]
+    admission = payload[MOTION_ADMISSION_ARGUMENT]
     try:
         confirmation = ctx.motion_guard.set_obstacle_policy(
                 enabled,
                 proof=admission.proof,
             )
     except MotionGuardFacadeError as exc:
-        raise _guard_error("set_obstacle_avoidance", exc) from exc
+        raise motion_guard_gateway_error("set_obstacle_avoidance", exc) from exc
     return {
         "code": 0,
         "result": _command_result(confirmation),

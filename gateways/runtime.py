@@ -67,6 +67,7 @@ from gateways.motion_guard import (
     GatewayMotionGuardError,
     GatewayMotionGuardUnavailable,
     MotionAdmission,
+    motion_guard_gateway_error,
 )
 from gateways.person_follow import (
     PERSON_FOLLOW_LOST,
@@ -77,6 +78,7 @@ from gateways.person_follow import (
     PersonFollowReadiness,
     build_person_follow_target,
     read_person_follow_readiness,
+    _parse_enabled as person_follow_enabled,
 )
 from gateways.request_context import categorize_gateway_error
 from gateways.serialization import to_jsonable
@@ -532,21 +534,6 @@ def _write_json_file_atomically(path: Path, payload: Dict[str, Any]) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
-
-
-def _wake_runtime_activation_request(request_path: Path, request_id: str) -> bool:
-    """调用者持网关状态锁；只唤醒同一现存请求，不续期或创建运动授权。"""
-    try:
-        payload = json.loads(request_path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, ValueError):
-        return False
-    if not isinstance(payload, dict) or payload.get("request_id") != request_id:
-        return False
-    # 旧版systemd可能漏掉原子替换；关闭可写描述符会产生IN_CLOSE_WRITE。
-    # 不写字节、不改内容、不替换文件，启动器按请求编号返回真实启动结果。
-    descriptor = os.open(request_path, os.O_WRONLY | os.O_APPEND)
-    os.close(descriptor)
-    return True
 
 
 _SERVICE_HEALTH_SEVERITY = {
@@ -1252,54 +1239,6 @@ class GatewayRuntime:
         # 仓储引用桥已由 MemoryService 装配；构造完成后才启用专属维护拥有方。
         # 启动不扫描、不主动推进过期时间；首个正常保存才提交维护触发。
         self.artifact_service.start_maintenance()
-
-    def _attach_geometry_runtime_on_start(self) -> bool:
-        """Attach and probe the systemd-owned geometry sidecar at startup.
-
-        This path only establishes the gRPC provider and sensor input bridge. It
-        does not start mapping, navigation, exploration, or a motion sink.
-        Failure remains observable through service health without preventing the
-        Gateway HTTP surface from starting.
-        """
-
-        geometry_runtime = self.platform_geometry_runtime
-        geometry_config = geometry_runtime.config
-        if not geometry_config.enabled or not geometry_config.mapping.profile_enabled:
-            RUNTIME_LOGGER.info(
-                "平台几何运行时未启用，跳过 Gateway 启动期 gRPC 挂接。"
-            )
-            return False
-        try:
-            geometry_runtime.start()
-            provider = geometry_runtime.get_geometry_runtime_provider()
-            if provider is None:
-                runtime_status = geometry_runtime.get_runtime_status()
-                RUNTIME_LOGGER.warning(
-                    "Gateway 启动期未能挂接 GeometryRuntimeProvider: phase=%s message=%s",
-                    runtime_status.get("phase"),
-                    runtime_status.get("message"),
-                )
-                return False
-            probe_ok, probe_message = geometry_runtime.probe_geometry_runtime_health()
-            if not probe_ok:
-                RUNTIME_LOGGER.warning(
-                    "Gateway 启动期 GeometryRuntimeProvider live GetStatus 探测失败: %s",
-                    probe_message,
-                )
-                return False
-            self._mark_geometry_cmd_vel_sink_unavailable()
-            # Sensor ingress readiness gates mapping capabilities, not the
-            # sidecar's idle health. Mapping remains inactive until StartMapping.
-            self._start_runtime_input_bridge()
-            RUNTIME_LOGGER.info(
-                "Gateway 启动期 GeometryRuntimeProvider gRPC 探测与挂接已完成。"
-            )
-            return True
-        except Exception:
-            RUNTIME_LOGGER.exception(
-                "Gateway 启动期 GeometryRuntimeProvider 挂接失败；健康检查将保持非就绪。"
-            )
-            return False
 
     def start(self) -> None:
         """启动宿主机运行时。"""
@@ -2327,17 +2266,15 @@ class GatewayRuntime:
         if self._pointcloud_map_stream_stop.is_set():
             return
         self._require_pointcloud_source_current(snapshot)
-        self._publish_pointcloud_map_compatibility(snapshot, identity_metadata)
+        self._publish_pointcloud_map_meta(snapshot, identity_metadata)
         with self._lock:
             self._pointcloud_map_last_publish_at = time.monotonic()
 
-    def _publish_pointcloud_map_compatibility(
+    def _publish_pointcloud_map_meta(
         self,
         snapshot: PointCloudMapSnapshot,
         identity_metadata: Dict[str, object],
     ) -> None:
-        # 历史主题只发布轻量通知。完整前缀/base64 在实际旧 WS 消费者发送时才生成。
-        metadata = {**identity_metadata, "legacy_pointcloud_topic": True}
         self._require_pointcloud_source_current(snapshot)
         if snapshot.source == "saved":
             self.stream_bus.publish(
@@ -2350,18 +2287,11 @@ class GatewayRuntime:
                          "point_count": snapshot.point_count, "format": "float32-xyz",
                          "payload_bytes": snapshot.point_count * 12,
                          "stream_generation": snapshot.stream_generation,
-                         "stream_topics": ["pointcloud_map.meta", "pointcloud_map.chunk"],
+                         "stream_topics": ["pointcloud_map.meta", "pointcloud_map.snapshot"],
                          "metadata": dict(identity_metadata)},
                 frame_id=snapshot.frame_id, sequence=snapshot.revision_ordinal,
                 revision=snapshot.revision, status="available", metadata=dict(identity_metadata),
             )
-        self._require_pointcloud_source_current(snapshot)
-        self.stream_bus.publish(
-            "pointcloud_map.live_chunk" if snapshot.source == "live" else "pointcloud_map.chunk",
-            source="pointcloud_map_source_switch", payload={"legacy_pointcloud_topic": True},
-            frame_id=snapshot.frame_id, sequence=snapshot.revision_ordinal,
-            revision=snapshot.revision, status="available", metadata=metadata,
-        )
 
     def _stop_data_frame_stream_sources(self) -> None:
         self._stop_pointcloud_map_stream()
@@ -3304,7 +3234,7 @@ class GatewayRuntime:
             _descriptor(
                 "navigate_to_pose",
                 "导航到位姿",
-                "按所选导航方案导航到目标位姿；分配式 schema 2 三维地图省略 z 时，定位准备后读取同坐标系、当前拥有方验证且新鲜的机体高度，不可用时失败。旧式 schema 1 三维及二维省略时为兼容值 0，不代表拥有方高度证据；显式 z 原样保留。",
+                "按所选导航方案导航到目标位姿；分配式 schema 2 三维地图省略 z 时，定位准备后读取同坐标系、当前拥有方已发布的机体高度，不可用时在原任务期限内等待。未定稿 schema 1 三维及二维省略时为默认值 0，不代表拥有方高度证据；显式 z 原样保留。",
                 execution_mode=CapabilityExecutionMode.ASYNC_TASK,
                 risk_level=CapabilityRiskLevel.MEDIUM,
                 input_schema=_schema_object(
@@ -3314,7 +3244,7 @@ class GatewayRuntime:
                         "frame_id": {"type": "string"},
                         "x": {"type": "number"},
                         "y": {"type": "number"},
-                        "z": {"type": "number", "description": "目标机体高度（米）；显式值（含 0）原样保留。分配式 schema 2 三维地图省略时，定位准备后读取同坐标系、当前拥有方验证且新鲜的机体高度；不可用时失败。旧式 schema 1 三维及二维省略时仍为兼容值 0，不代表拥有方高度证据。"},
+                        "z": {"type": "number", "description": "目标机体高度（米）；显式值（含 0）原样保留。分配式 schema 2 三维地图省略时，定位准备后读取同坐标系、当前拥有方已发布的机体高度；不可用时在原任务期限内等待。未定稿 schema 1 三维及二维省略时仍为默认值 0，不代表拥有方高度证据。"},
                         "yaw_rad": {"type": "number", "description": "可选最终朝向（弧度）；省略时仅要求到达位置。"},
                         "tolerance_position_m": {"type": "number", "minimum": 0.0, "default": 0.35},
                         "tolerance_yaw_rad": {"type": "number", "minimum": 0.0, "default": 0.3},
@@ -4089,7 +4019,7 @@ class GatewayRuntime:
             SkillDescriptor(
                 name="navigate_to_pose",
                 display_name="导航到位姿",
-                description="按当前建图链导航到目标位姿；分配式 schema 2 三维地图省略 z 时，在定位准备后读取同坐标系、当前拥有方验证且新鲜的机体高度，不可用时失败。旧式 schema 1 三维及二维省略时为兼容值 0，不代表拥有方高度证据；显式 z 原样保留。",
+                description="按当前建图链导航到目标位姿；分配式 schema 2 三维地图省略 z 时，在定位准备后读取同坐标系、当前拥有方已发布的机体高度，不可用时在原任务期限内等待。未定稿 schema 1 三维及二维省略时为默认值 0，不代表拥有方高度证据；显式 z 原样保留。",
                 category=SkillCategory.TASK,
                 capability_name="navigate_to_pose",
             ),
@@ -6474,7 +6404,7 @@ class GatewayRuntime:
         saved = store(self).load(self._require_str(arguments, "checkpoint_id"))
         if saved.pipeline != self.config.geometry.pipeline:
             raise GatewayError("检查点与当前二维/三维链路不一致。")
-        admission = self._require_motion_admission(arguments, "resume_exploration")
+        admission = arguments[motion_skills.MOTION_ADMISSION_ARGUMENT]
         request = saved.request.model_copy(update={"request_id": self._build_runtime_request_id("explore_resume"),
             "resume_progress_json": saved.geometry_progress_json}, deep=False)
         return self._submit_exploration_task(request=request, motion_admission=admission, poll_interval_sec=0.2,
@@ -6505,7 +6435,7 @@ class GatewayRuntime:
     def _submit_building_exploration(self,arguments,request,resume,requested_by,request_context):
         from gateways.building_exploration import GatewayBuildingExplorationPorts
         capability="resume_building_exploration" if resume else "explore_building"
-        admission=self._require_motion_admission(arguments,capability)
+        admission=arguments[motion_skills.MOTION_ADMISSION_ARGUMENT]
         service=self._get_building_exploration_service()
         descriptor=self.capability_registry.get_descriptor(capability)
         def runner(context):
@@ -6554,7 +6484,7 @@ class GatewayRuntime:
     def _submit_floor_navigation(self, arguments, request, resume, requested_by, request_context):
         from gateways.building_navigation import GatewayBuildingPorts
         capability="resume_floor_navigation" if resume else "navigate_to_floor"
-        admission=self._require_motion_admission(arguments,capability)
+        admission=arguments[motion_skills.MOTION_ADMISSION_ARGUMENT]
         service=self._get_building_navigation_service()
         descriptor=self.capability_registry.get_descriptor(capability)
         def runner(context):
@@ -6578,7 +6508,7 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
     ):
-        motion_admission = self._require_motion_admission(arguments, "navigate_to_pose")
+        motion_admission = arguments[motion_skills.MOTION_ADMISSION_ARGUMENT]
         map_name = str(arguments.get("map_name") or "").strip() or self.map_workspace_service.get_active_map_name()
         workspace = None
         if not map_name:
@@ -6605,7 +6535,7 @@ class GatewayRuntime:
             )
 
             prepared_goal = goal.model_copy(update={"map_name": map_name}, deep=False)
-            return self._resolve_navigation_goal_height(prepared_goal, workspace=workspace)
+            return self._resolve_navigation_goal_height(prepared_goal, workspace=workspace, context=context)
 
         current_localization_session_id = None
         pose = self._build_pose_from_arguments(arguments)
@@ -6666,7 +6596,7 @@ class GatewayRuntime:
             ),
         )
 
-    def _resolve_navigation_goal_height(self, goal: NavigationGoal, *, workspace) -> NavigationGoal:
+    def _resolve_navigation_goal_height(self, goal: NavigationGoal, *, workspace, context) -> NavigationGoal:
         """分配式三维资产补充拥有方高度；未定稿建图会话沿原输入高度。"""
         if not goal.metadata.get("navigation_height_pending"):
             return goal
@@ -6676,34 +6606,23 @@ class GatewayRuntime:
             metadata = dict(goal.metadata)
             metadata.pop("navigation_height_pending")
             return goal.model_copy(update={"metadata": metadata}, deep=False)
-        # 该接口核对原生终态、激活、会话和提供器身份；网关只补充选点高度的
-        # 坐标系与时间准入。此处不持有状态锁，保留 RPC 样本的原始源时间。
-        # 准备后的资产无法分类时明确失败；目录中途降级也不得回落到旧式位姿。
-        current = (self.map_workspace_service.get_relocalized_pose(goal.map_name)
-                   if schema_version == 2 else None)
-        received_at = utc_now()
-        now = utc_now()
-        reason = None
-        if current is None:
-            reason = "owned_pose_unavailable"
-        elif current.frame_id != goal.target_pose.frame_id:
-            reason = "frame_mismatch"
-        elif not all(math.isfinite(value) for value in (
-            current.position.x, current.position.y, current.position.z,
-        )):
-            reason = "position_invalid"
-        elif current.timestamp.tzinfo is None or current.timestamp.utcoffset() is None:
-            reason = "source_time_invalid"
-        # 与浏览器 currentNavigationBodyPose 的现有窗口一致，不扩展失鲜预算。
-        elif not -1.0 <= (now - current.timestamp).total_seconds() <= 2.0:
-            reason = "source_time_out_of_range"
-        elif not -1.0 <= (now - received_at).total_seconds() <= 2.0:
-            reason = "receipt_time_out_of_range"
-        if reason is not None:
+        # 高度采用拥有方当前已发布的位姿；等待沿用任务原有期限与取消检查。
+        while True:
+            context.ensure_active()
+            current = (self.map_workspace_service.get_relocalized_pose(goal.map_name)
+                       if schema_version == 2 else None)
+            if current is not None:
+                break
+            context.update(progress=0.02, stage="waiting_navigation_inputs",
+                           message="目标已保留，等待定位发布当前机体高度。")
+            remaining = context.timeout_remaining_sec()
+            time.sleep(min(.5, max(.01, remaining)) if remaining is not None else .5)
+        if current.frame_id != goal.target_pose.frame_id:
             raise GatewayError(
-                "无法获取同坐标系的当前有效机体高度，请等待定位恢复或显式填写目标 z。",
+                "无法获取同坐标系的当前机体高度。",
                 error_code="navigation_height_unavailable", http_status=409,
-                details={"map_name": goal.map_name, "frame_id": goal.target_pose.frame_id, "reason": reason},
+                details={"map_name": goal.map_name, "frame_id": goal.target_pose.frame_id,
+                         "reason": "frame_mismatch"},
             )
         position = goal.target_pose.position.model_copy(update={"z": current.position.z})
         pose = goal.target_pose.model_copy(update={"position": position})
@@ -6721,7 +6640,7 @@ class GatewayRuntime:
         del requested_by
         query_text = self._require_str(arguments, "query_text")
         query_request_id = str(arguments.get("query_request_id") or "").strip() or self._build_runtime_request_id("place")
-        admission = self._require_motion_admission(arguments, "navigate_to_place")
+        admission = arguments[motion_skills.MOTION_ADMISSION_ARGUMENT]
         self._ensure_motion_runtime_for_backend_call("navigate_to_place", admission)
         result = self.map_workspace_service.submit_mapping_cloud_goal(
                 query_request_id=query_request_id,
@@ -6853,13 +6772,6 @@ class GatewayRuntime:
                 http_status=422,
                 jsonrpc_code=-32602,
             ) from exc
-        if not all(math.isfinite(number) for number in (x, y, z, yaw)):
-            raise GatewayError(
-                "boundary_line_segments 的端点坐标必须为有限数值。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            )
         half_yaw = yaw / 2.0
         return Pose(
             frame_id=frame_id,
@@ -6874,23 +6786,9 @@ class GatewayRuntime:
         raw_segments = arguments.get("boundary_line_segments")
         if raw_segments in (None, []):
             return []
-        if not isinstance(raw_segments, (list, tuple)):
-            raise GatewayError(
-                "参数 boundary_line_segments 必须为线段数组。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            )
         default_frame_id = str(arguments.get("frame_id") or DEFAULT_MAP_FRAME)
         segments: List[Tuple[Pose, Pose]] = []
         for segment in raw_segments:
-            if not isinstance(segment, (list, tuple)) or len(segment) != 2:
-                raise GatewayError(
-                    "boundary_line_segments 的每项必须恰好包含两个端点。",
-                    error_code="invalid_params",
-                    http_status=422,
-                    jsonrpc_code=-32602,
-                )
             segments.append(
                 (
                     self._exploration_boundary_pose(
@@ -6911,10 +6809,7 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
     ):
-        motion_admission = self._require_motion_admission(
-            arguments,
-            "navigate_to_named_location",
-        )
+        motion_admission = arguments[motion_skills.MOTION_ADMISSION_ARGUMENT]
         map_name, workspace = self._resolve_map_workspace_for_request(
             arguments,
             capability_name="navigate_to_named_location",
@@ -7058,10 +6953,7 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
     ):
-        motion_admission = self._require_motion_admission(
-            arguments,
-            "find_target",
-        )
+        motion_admission = arguments[motion_skills.MOTION_ADMISSION_ARGUMENT]
         map_name, workspace = self._resolve_map_workspace_for_request(
             arguments,
             capability_name="find_target",
@@ -7227,18 +7119,7 @@ class GatewayRuntime:
         request_context: Optional[MetadataDict] = None,
         capability_name: str = "explore_area_v2",
     ):
-        removed_fields = sorted(
-            {"auto_loop_close", "extend_radius_m"}.intersection(arguments)
-        )
-        if removed_fields:
-            raise GatewayError(
-                "探索后端不支持参数：%s。" % ", ".join(removed_fields),
-                error_code="unsupported",
-                http_status=422,
-                jsonrpc_code=-32602,
-                details={"unsupported_parameters": removed_fields},
-            )
-        motion_admission = self._require_motion_admission(arguments, capability_name)
+        motion_admission = arguments[motion_skills.MOTION_ADMISSION_ARGUMENT]
         # 受理阶段只固定地图名称；创建、激活及后端等待都由任务拥有。
         map_name = str(arguments.get("map_name", "")).strip()
         if not map_name:
@@ -7272,42 +7153,8 @@ class GatewayRuntime:
             stop_conditions=stop_conditions,
             poll_interval_sec=poll_interval_sec,
         )
-        raw_retries = arguments.get("max_navigation_retries", 1)
-        try:
-            if isinstance(raw_retries, bool):
-                raise ValueError
-            max_navigation_retries = int(raw_retries)
-        except (TypeError, ValueError) as exc:
-            raise GatewayError(
-                "参数 max_navigation_retries 必须为非负整数。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            ) from exc
-        if max_navigation_retries < 0:
-            raise GatewayError(
-                "参数 max_navigation_retries 必须为非负整数。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            )
-
-        try:
-            blacklist_radius_m = float(arguments.get("blacklist_radius_m", 0.75))
-        except (TypeError, ValueError) as exc:
-            raise GatewayError(
-                "blacklist_radius_m 必须为数值。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            ) from exc
-        if not math.isfinite(blacklist_radius_m) or blacklist_radius_m < 0.0:
-            raise GatewayError(
-                "参数 blacklist_radius_m 必须为非负有限数值。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            )
+        max_navigation_retries = arguments.get("max_navigation_retries", 1)
+        blacklist_radius_m = arguments.get("blacklist_radius_m", 0.75)
         strategy = str(arguments.get("strategy") or "wavefront").strip()
         request_metadata: MetadataDict = {
             "requested_by": requested_by or "unknown",
@@ -7370,10 +7217,7 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
     ):
-        motion_admission = self._require_motion_admission(
-            arguments,
-            "explore_and_find_target",
-        )
+        motion_admission = arguments[motion_skills.MOTION_ADMISSION_ARGUMENT]
         map_name, workspace = self._resolve_map_workspace_for_request(
             arguments,
             capability_name="explore_and_find_target",
@@ -7988,10 +7832,7 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
     ):
-        motion_admission = self._require_motion_admission(
-            arguments,
-            "inspect_target",
-        )
+        motion_admission = arguments[motion_skills.MOTION_ADMISSION_ARGUMENT]
         query = self._require_str(arguments, "query")
         camera_id = str(arguments.get("camera_id", "")).strip() or None
         detector_backend = str(arguments.get("detector_backend", "")).strip() or None
@@ -8107,24 +7948,7 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
     ):
-        person_follow = self._person_follow_readiness()
-        if not person_follow.ready:
-            raise GatewayError(
-                "Person-follow 可选服务未就绪。",
-                error_code="person_follow_unavailable",
-                http_status=503,
-                jsonrpc_code=-32010,
-                details={
-                    "person_follow_enabled": person_follow.enabled,
-                    "person_follow_ready": person_follow.ready,
-                    "person_follow_reason": person_follow.reason,
-                    "person_follow_ready_file": person_follow.ready_file,
-                },
-            )
-        motion_admission = self._require_motion_admission(
-            arguments,
-            "follow_target",
-        )
+        motion_admission = arguments[motion_skills.MOTION_ADMISSION_ARGUMENT]
         query = self._require_str(arguments, "query")
         camera_id = str(arguments.get("camera_id", "")).strip() or None
         detector_backend = str(arguments.get("detector_backend", "")).strip() or None
@@ -8137,13 +7961,6 @@ class GatewayRuntime:
         )
         timeout_sec = self._resolve_async_timeout("follow_target", arguments, minimum_sec=0.1)
         descriptor = self.capability_registry.get_descriptor("follow_target")
-        if duration_sec <= 0 or interval_sec <= 0 or lost_timeout_sec <= 0:
-            raise GatewayError(
-                "duration_sec、interval_sec、lost_timeout_sec 必须大于 0。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            )
         if interval_sec > _PERSON_FOLLOW_TARGET_MAX_PERIOD_SEC:
             raise GatewayError(
                 "interval_sec 不得超过 0.2 秒。",
@@ -8400,7 +8217,7 @@ class GatewayRuntime:
                 )
             except (GatewayMotionGuardError, MotionGuardError) as exc:
                 terminate_bound_session(PERSON_FOLLOW_STOP, "PersonFollow guard failure")
-                raise self._motion_guard_gateway_error("follow_target", exc) from exc
+                raise motion_guard_gateway_error("follow_target", exc) from exc
             except BaseException:
                 terminate_bound_session(PERSON_FOLLOW_STOP, "PersonFollow task aborted")
                 raise
@@ -8470,10 +8287,7 @@ class GatewayRuntime:
         requested_by: Optional[str] = None,
         request_context: Optional[MetadataDict] = None,
     ):
-        motion_admission = self._require_motion_admission(
-            arguments,
-            "relative_move",
-        )
+        motion_admission = arguments[motion_skills.MOTION_ADMISSION_ARGUMENT]
         descriptor = self.capability_registry.get_descriptor("relative_move")
         vx = self._require_float(arguments, "vx")
         vy = self._float(arguments, "vy", 0.0)
@@ -8482,11 +8296,6 @@ class GatewayRuntime:
         interval_sec = self._float(arguments, "interval_sec", 0.05)
         timeout_override = self._float(arguments, "timeout_sec", 0.0)
 
-        if not all(math.isfinite(value) for value in (vx, vy, vyaw, duration_sec, interval_sec, timeout_override)):
-            raise GatewayError(
-                "相对移动速度、时长和间隔必须为有限数值。", error_code="invalid_params",
-                http_status=422, jsonrpc_code=-32602,
-            )
         limits = self._relative_move_limits()
         if limits is not None:
             try:
@@ -8496,14 +8305,6 @@ class GatewayRuntime:
                     str(exc), error_code="invalid_params", http_status=422, jsonrpc_code=-32602,
                     details={"motion_command_limits": limits.model_dump(mode="json")},
                 ) from exc
-
-        if duration_sec <= 0 or interval_sec <= 0:
-            raise GatewayError(
-                "duration_sec 和 interval_sec 必须大于 0。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            )
 
         timeout_sec = max(timeout_override, duration_sec + 2.0, float(descriptor.timeout_sec or 0))
 
@@ -8531,7 +8332,7 @@ class GatewayRuntime:
                 finally:
                     self.motion_guard.stop_and_fence(session)
             except (GatewayMotionGuardError, MotionGuardError) as exc:
-                raise self._motion_guard_gateway_error("relative_move", exc) from exc
+                raise motion_guard_gateway_error("relative_move", exc) from exc
 
             context.update(progress=1.0, stage="completed", message="机器人已完成相对移动。")
             return {
@@ -9275,98 +9076,7 @@ class GatewayRuntime:
         return None
 
     def _exploration_stop_conditions(self, arguments: Dict[str, Any]) -> MetadataDict:
-        raw_conditions = arguments.get("stop_conditions")
-        if raw_conditions is None:
-            return {}
-        if not isinstance(raw_conditions, dict):
-            raise GatewayError(
-                "参数 stop_conditions 必须为对象。",
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            )
-
-        validators = {"max_coverage_pct": (0.0, 100.0)}
-        stop_conditions: MetadataDict = {}
-        for key, (minimum, maximum) in validators.items():
-            if key not in raw_conditions:
-                continue
-            value = raw_conditions.get(key)
-            if value is None or value == "":
-                continue
-            if isinstance(value, bool):
-                raise GatewayError(
-                    f"参数 stop_conditions.{key} 必须为数字。",
-                    error_code="invalid_params",
-                    http_status=422,
-                    jsonrpc_code=-32602,
-                )
-            try:
-                number = float(value)
-            except (TypeError, ValueError) as exc:
-                raise GatewayError(
-                    f"参数 stop_conditions.{key} 必须为数字。",
-                    error_code="invalid_params",
-                    http_status=422,
-                    jsonrpc_code=-32602,
-                ) from exc
-            if not math.isfinite(number) or number <= minimum:
-                raise GatewayError(
-                    f"参数 stop_conditions.{key} 必须大于 {minimum}。",
-                    error_code="invalid_params",
-                    http_status=422,
-                    jsonrpc_code=-32602,
-                )
-            if maximum is not None and number > maximum:
-                raise GatewayError(
-                    f"参数 stop_conditions.{key} 必须小于等于 {maximum}。",
-                    error_code="invalid_params",
-                    http_status=422,
-                    jsonrpc_code=-32602,
-                )
-            stop_conditions[key] = number
-
-        integer_validators = {
-            "no_frontier_timeout_ms": 1,
-            "max_duration_ms": 1,
-            "max_goals": 1,
-        }
-        for key, minimum in integer_validators.items():
-            if key not in raw_conditions:
-                continue
-            value = raw_conditions.get(key)
-            if isinstance(value, bool):
-                value = None
-            try:
-                number = int(value)
-            except (TypeError, ValueError) as exc:
-                raise GatewayError(
-                    f"参数 stop_conditions.{key} 必须为整数。",
-                    error_code="invalid_params",
-                    http_status=422,
-                    jsonrpc_code=-32602,
-                ) from exc
-            if number < minimum:
-                raise GatewayError(
-                    f"参数 stop_conditions.{key} 必须大于等于 {minimum}。",
-                    error_code="invalid_params",
-                    http_status=422,
-                    jsonrpc_code=-32602,
-                )
-            stop_conditions[key] = number
-
-        supported_keys = set(validators) | set(integer_validators)
-        unsupported = sorted(
-            str(key) for key in raw_conditions if key not in supported_keys
-        )
-        if unsupported:
-            raise GatewayError(
-                "参数 stop_conditions 包含不支持的条件：%s。" % ", ".join(unsupported),
-                error_code="invalid_params",
-                http_status=422,
-                jsonrpc_code=-32602,
-            )
-        return stop_conditions
+        return dict(arguments.get("stop_conditions", {}))
 
     def _resolve_exploration_max_duration_sec(
         self,
@@ -10480,42 +10190,6 @@ class GatewayRuntime:
 
         self.platform_geometry_runtime.notify_cmd_vel_sink_ready(False)
 
-    @staticmethod
-    def _motion_guard_gateway_error(
-        capability_name: str,
-        error: BaseException,
-    ) -> GatewayError:
-        failures = []
-        pending = [error]
-        seen = set()
-        while pending and len(failures) < 8:
-            current = pending.pop(0)
-            if not isinstance(current, BaseException) or id(current) in seen:
-                continue
-            seen.add(id(current))
-            detail = {"type": type(current).__name__, "message": str(current)[:1000]}
-            for field_name in ("code", "operation", "operation_id"):
-                value = getattr(current, field_name, None)
-                if value is not None:
-                    detail[field_name] = str(value)[:256]
-            failures.append(detail)
-            # finally收尾可能成为最外层错误；保留原始续租/命令与归零失败两条链。
-            pending.extend((
-                current.__cause__, current.__context__, getattr(current, "cause", None),
-                getattr(current, "prior_failure", None),
-            ))
-        return GatewayError(
-            f"motion guard rejected {capability_name}: {error}",
-            error_code=next((item["code"] for item in failures if item.get("code")), "motion_guard_unavailable"),
-            http_status=503,
-            jsonrpc_code=-32010,
-            details={
-                "capability_name": capability_name,
-                "guard_error_type": type(error).__name__,
-                "guard_failures": failures,
-            },
-        )
-
     def _runtime_activation_state_lock(self):
         return self._geometry_runtime_lock
 
@@ -10750,31 +10424,13 @@ class GatewayRuntime:
             if check_active is not None:
                 check_active()
         except (GatewayMotionGuardError, MotionGuardError) as exc:
-            raise self._motion_guard_gateway_error(capability_name, exc) from exc
+            raise motion_guard_gateway_error(capability_name, exc) from exc
         return MotionAdmission(
             request_id=request_id or self._build_runtime_request_id("motion"),
             capability_name=capability_name,
             boot_nonce=proof.boot_nonce,
             motion_stop_generation=proof.motion_stop_generation,
         )
-
-    @staticmethod
-    def _require_motion_admission(
-        arguments: Dict[str, Any],
-        capability_name: str,
-    ) -> MotionAdmission:
-        admission = arguments.get(motion_skills.MOTION_ADMISSION_ARGUMENT)
-        if not isinstance(admission, MotionAdmission):
-            raise RuntimeError(
-                f"{capability_name} requires a request-scoped motion admission"
-            )
-        if admission.capability_name != capability_name:
-            raise RuntimeError(
-                "motion admission capability mismatch: "
-                f"expected={capability_name} actual={admission.capability_name}"
-            )
-        return admission
-
 
     @staticmethod
     def _goal_with_motion_admission(
@@ -11012,9 +10668,6 @@ class GatewayRuntime:
 
                 def submit_goal():
                     nonlocal goal_dispatched
-                    if goal.metadata.get("navigation_height_pending"):
-                        raise GatewayError("导航目标高度尚未解析，不能派发。",
-                            error_code="navigation_height_unavailable", http_status=409)
                     goal_dispatched = True
                     try:
                         last_context = self.navigation_service.set_goal(
@@ -12401,7 +12054,6 @@ class GatewayRuntime:
                 return value if isinstance(value, dict) else {}
             except (FileNotFoundError, ValueError):
                 return {}
-        next_wakeup = time.monotonic()
         while True:
             if self._closed:
                 raise GatewayError("网关运行时已关闭，不能提交组件激活请求。",
@@ -12416,9 +12068,6 @@ class GatewayRuntime:
                 )
                 if settled or (not request_path.exists() and state != "activating"):
                     return
-                if previous_id and time.monotonic() >= next_wakeup:
-                    _wake_runtime_activation_request(request_path, previous_id)
-                    next_wakeup = time.monotonic() + 1.0
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise GatewayError("等待前一次组件激活收尾超时。",
@@ -12468,15 +12117,10 @@ class GatewayRuntime:
                     "activation_level": activation_level, "requested_at": utc_now().isoformat(),
                 })
                 request_written = True
-                _wake_runtime_activation_request(request_path, context["request_id"])
-            next_wakeup = time.monotonic() + 1.0
             while time.monotonic() < deadline:
                 with self._runtime_activation_state_lock():
                     if self._closed or context.get("cancelled"):
                         raise self._runtime_activation_cancelled_error(context)
-                    if time.monotonic() >= next_wakeup:
-                        _wake_runtime_activation_request(request_path, context["request_id"])
-                        next_wakeup = time.monotonic() + 1.0
                 try:
                     result = json.loads(result_path.read_text(encoding="utf-8"))
                 except (FileNotFoundError, OSError, json.JSONDecodeError):
@@ -12529,7 +12173,7 @@ class GatewayRuntime:
                 )
                 self.motion_guard.start()
         except (GatewayMotionGuardError, MotionGuardError) as error:
-            raise self._motion_guard_gateway_error(capability_name, error) from error
+            raise motion_guard_gateway_error(capability_name, error) from error
 
     def _ensure_person_follow_bridge_started(self) -> None:
         """首次跟随才创建通信线程，与网关关闭共用既有生命周期边界。"""
@@ -12675,7 +12319,7 @@ class GatewayRuntime:
                     if activation_level != "person_follow":
                         ensure_activation_deadline()
                         return
-                    if self._person_follow_readiness().ready and self.person_follow_bridge.started:
+                    if self.person_follow_bridge.started:
                         ensure_activation_deadline()
                         return
         if should_start:
@@ -13144,7 +12788,7 @@ class GatewayRuntime:
                 "平台几何运行时已禁用。",
             ),
             "follow_target": (
-                lambda: self._person_follow_readiness().enabled,
+                lambda: person_follow_enabled(os.environ.get("NUWAX_PERSON_FOLLOW_AUTOSTART")),
                 "Person-follow 已禁用。",
             ),
             "get_joint_state": (

@@ -3,7 +3,6 @@ from contextlib import ExitStack
 from copy import deepcopy
 import hashlib
 import importlib.util
-import json
 from pathlib import Path
 import unittest
 from unittest.mock import patch

@@ -12,7 +12,6 @@ from scripts import check_memory_provider_modes as provider_modes
 from scripts.check_memory_storage_transactions import NOW
 from scripts.memory_test_vectors import ExplicitTextEmbedder
 from services.mapping.catalog import MapCatalogRepository
-from skills.map_workspace import MapWorkspaceService
 from skills.handlers.localization_skills import handle_list_maps
 
 

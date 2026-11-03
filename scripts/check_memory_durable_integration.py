@@ -16,10 +16,10 @@ from contracts.geometry import Pose, Vector3
 from contracts.memory import MemoryRecordKind, MemoryPayloadFilter
 from contracts.spatial_memory import InstanceDynamicState
 from services.memory.service import MemoryService
-from services.memory.durable_index import TOKEN, INDEX_META
+from services.memory.durable_index import TOKEN
 from scripts.memory_test_vectors import ExplicitTextEmbedder
 from services.memory.vectorization_outbox import OutboxConflict, RetryPolicy
-from services.memory.vector_store import SQLiteNamedVectorStore, NamedVector
+from services.memory.vector_store import NamedVector
 
 class FakeEmbedder(ExplicitTextEmbedder):
     def __init__(self):

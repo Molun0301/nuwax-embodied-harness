@@ -23,9 +23,6 @@ NAV_STACK_PID=""
 MOTION_GUARD_PID=""
 GEOMETRY_RUNTIME_PID=""
 PERSON_FOLLOW_PID=""
-NAV_STACK_MONITOR_PID=""
-GEOMETRY_MONITOR_PID=""
-PERSON_FOLLOW_MONITOR_PID=""
 RUNTIME_ACTIVATION_MONITOR_PID=""
 RUNTIME_ACTIVATION_LEVEL=""
 RUNTIME_ACTIVATION_CAPABILITY=""
@@ -74,18 +71,6 @@ person_follow_autostart_enabled() {
 
 default_gateway_lock_file() {
   printf '%s' "${REPO_ROOT}/runtime_data/gateway/start_gateway.lock"
-}
-
-validate_person_follow_monitor_interval() {
-  local interval="${NUWAX_PERSON_FOLLOW_MONITOR_INTERVAL_SEC:-0.5}"
-  if [[ ! "${interval}" =~ ^[0-9]+([.][0-9]+)?$ || "${interval}" =~ ^0+([.]0+)?$ ]]; then
-    echo "invalid NUWAX_PERSON_FOLLOW_MONITOR_INTERVAL_SEC=${interval}" >&2
-    return 1
-  fi
-}
-
-person_follow_binary() {
-  printf '%s' "${NUWAX_PERSON_FOLLOW_BINARY:-${REPO_ROOT}/services/nuwax-workspace/target/release/nuwax-person-follow}"
 }
 
 person_follow_is_alive() {
@@ -634,9 +619,6 @@ start_person_follow() {
     echo "nuwax-person-follow is enabled but its production binary is not executable: $(person_follow_binary)" >&2
     return 1
   fi
-  if ! validate_person_follow_monitor_interval; then
-    return 1
-  fi
   binary="$(person_follow_binary)"
   echo "starting nuwax-person-follow: ${binary}"
   (
@@ -666,17 +648,6 @@ start_person_follow() {
   echo "nuwax-person-follow failed subscription readiness with status ${status}" >&2
   PERSON_FOLLOW_PID=""
   return 1
-}
-
-abort_person_follow_startup() {
-  echo "nuwax-person-follow failed to start; refusing to start Gateway" >&2
-  STOP_REQUESTED=1
-  stop_person_follow_monitor
-  stop_runtime_monitors
-  stop_person_follow
-  stop_geometry_runtime
-  stop_nav_stack
-  exit 1
 }
 
 start_go2_video_streamer() {
@@ -724,94 +695,6 @@ stop_person_follow() {
     fi
   fi
   PERSON_FOLLOW_PID=""
-}
-
-monitor_geometry_runtime() {
-  while [[ "${STOP_REQUESTED}" -eq 0 ]]; do
-    sleep 5
-    if [[ -n "${GEOMETRY_RUNTIME_PID}" ]] && ! is_pid_alive "${GEOMETRY_RUNTIME_PID}"; then
-      echo "nuwax-geometry-runtime (pid ${GEOMETRY_RUNTIME_PID}) crashed, restarting..." >&2
-      rm -f /tmp/nuwax_video.sock /tmp/nuwax_video.shm 2>/dev/null || true
-      GEOMETRY_RUNTIME_PID=""
-      if ! start_geometry_runtime; then
-        echo "nuwax-geometry-runtime restart failed; geometry monitor stops" >&2
-        return 1
-      fi
-    fi
-  done
-}
-
-monitor_nav_stack() {
-  if ! is_truthy "${NUWAX_NAV_AUTOSTART:-true}"; then
-    return 0
-  fi
-  while [[ "${STOP_REQUESTED}" -eq 0 ]]; do
-    sleep 5
-    if [[ -n "${NAV_STACK_PID}" ]] && ! is_pid_alive "${NAV_STACK_PID}"; then
-      echo "nuwax-nav-stack launcher (pid ${NAV_STACK_PID}) crashed, restarting..." >&2
-      wait "${NAV_STACK_PID}" >/dev/null 2>&1 || true
-      NAV_STACK_PID=""
-      if ! start_nav_stack; then
-        echo "nuwax-nav-stack restart failed; stopping gateway worker" >&2
-        if [[ -n "${GATEWAY_PID}" ]] && is_pid_alive "${GATEWAY_PID}"; then
-          send_signal_to_process_scope TERM "${GATEWAY_PID}"
-        fi
-        return 1
-      fi
-    fi
-  done
-}
-
-monitor_person_follow() {
-  local watched_person_follow_pid="${PERSON_FOLLOW_PID}"
-  local watched_gateway_pid="${GATEWAY_PID}"
-  local interval="${NUWAX_PERSON_FOLLOW_MONITOR_INTERVAL_SEC:-0.5}"
-
-  if ! person_follow_autostart_enabled; then
-    return 0
-  fi
-  if [[ -z "${watched_person_follow_pid}" ]]; then
-    return 0
-  fi
-
-  while [[ "${STOP_REQUESTED}" -eq 0 ]]; do
-    sleep "${interval}"
-    if ! person_follow_is_alive "${watched_person_follow_pid}"; then
-      echo "nuwax-person-follow (pid ${watched_person_follow_pid}) crashed; stopping gateway worker" >&2
-      if [[ -n "${watched_gateway_pid}" ]] && is_pid_alive "${watched_gateway_pid}"; then
-        send_signal_to_process_scope TERM "${watched_gateway_pid}"
-      fi
-      return 1
-    fi
-  done
-}
-
-start_person_follow_monitor() {
-  if [[ -n "${PERSON_FOLLOW_MONITOR_PID}" ]] && is_pid_alive "${PERSON_FOLLOW_MONITOR_PID}"; then
-    return 0
-  fi
-  monitor_person_follow &
-  PERSON_FOLLOW_MONITOR_PID="$!"
-}
-
-stop_person_follow_monitor() {
-  if [[ -n "${PERSON_FOLLOW_MONITOR_PID}" ]] && is_pid_alive "${PERSON_FOLLOW_MONITOR_PID}" \
-    && process_belongs_to_instance "${PERSON_FOLLOW_MONITOR_PID}"; then
-    kill -TERM "${PERSON_FOLLOW_MONITOR_PID}" >/dev/null 2>&1 || true
-    wait "${PERSON_FOLLOW_MONITOR_PID}" >/dev/null 2>&1 || true
-  fi
-  PERSON_FOLLOW_MONITOR_PID=""
-}
-
-start_runtime_monitors() {
-  if [[ -z "${NAV_STACK_MONITOR_PID}" ]] || ! is_pid_alive "${NAV_STACK_MONITOR_PID}"; then
-    monitor_nav_stack &
-    NAV_STACK_MONITOR_PID="$!"
-  fi
-  if [[ -z "${GEOMETRY_MONITOR_PID}" ]] || ! is_pid_alive "${GEOMETRY_MONITOR_PID}"; then
-    monitor_geometry_runtime &
-    GEOMETRY_MONITOR_PID="$!"
-  fi
 }
 
 write_runtime_activation_result() {
@@ -893,16 +776,17 @@ check_runtime_activation_cancelled() {
 start_runtime_activation_component() {
   local component="$1" pid_variable="$2"
   local previous_pid="${!pid_variable}" result=0 registered=0
+  local initial_pid_variable="initial_${pid_variable}"
   RUNTIME_ACTIVATION_STAGE="${component}"
   check_runtime_activation_cancelled || return 1
   write_runtime_activation_result activating "${component}" "正在启动所需运行组件。"
   # 启动函数等待期间也可能收到退出信号，先登记本次将拥有的新组件。
-  if [[ -z "${previous_pid}" ]] || ! is_pid_alive "${previous_pid}"; then
+  if [[ -z "${!initial_pid_variable}" ]] && { [[ -z "${previous_pid}" ]] || ! is_pid_alive "${previous_pid}"; }; then
     RUNTIME_ACTIVATION_STARTED+=("${component}")
     registered=1
   fi
   "start_${component}" || result=$?
-  if [[ "${registered}" -eq 0 ]] && [[ -n "${!pid_variable}" && "${!pid_variable}" != "${previous_pid}" ]]; then
+  if [[ -z "${!initial_pid_variable}" && "${registered}" -eq 0 ]] && [[ -n "${!pid_variable}" && "${!pid_variable}" != "${previous_pid}" ]]; then
     RUNTIME_ACTIVATION_STARTED+=("${component}")
   fi
   check_runtime_activation_cancelled || return 1
@@ -940,9 +824,6 @@ activate_requested_runtime_components() {
     # 就绪结果发布后，本次组件成为可复用的已启动资源。
     write_runtime_activation_result ready ready "requested runtime components are ready"
     RUNTIME_ACTIVATION_STARTED=()
-    if [[ "${RUNTIME_ACTIVATION_LEVEL}" == "person_follow" ]]; then
-      start_person_follow_monitor
-    fi
     RUNTIME_ACTIVATION_REQUEST_ID=""
 }
 
@@ -952,18 +833,20 @@ cleanup_runtime_activation_owner() {
     fail_runtime_activation cancelled "${RUNTIME_ACTIVATION_STAGE:-starting}" "本机启动拥有方正在关闭。" activation_cancelled || true
   fi
   # 子 shell 创建的进程只由该拥有方回收；父启动器原有的视频/几何仍归父方。
-  stop_person_follow_monitor
-  [[ "${PERSON_FOLLOW_PID}" == "${initial_follow_pid}" ]] || stop_person_follow
-  [[ "${GEOMETRY_RUNTIME_PID}" == "${initial_geometry_pid}" ]] || stop_geometry_runtime
-  [[ "${NAV_STACK_PID}" == "${initial_nav_pid}" ]] || stop_nav_stack
-  [[ "${MOTION_GUARD_PID}" == "${initial_guard_pid}" ]] || stop_motion_guard
+
+  [[ -n "${initial_PERSON_FOLLOW_PID}" ]] || stop_person_follow
+  [[ -n "${initial_GEOMETRY_RUNTIME_PID}" ]] || stop_geometry_runtime
+  [[ -n "${initial_NAV_STACK_PID}" ]] || stop_nav_stack
+  [[ -n "${initial_MOTION_GUARD_PID}" ]] || stop_motion_guard
+  # 父方继续在原停止位置回收它启动的组件，包括看管循环重启后的进程。
+  printf '%s\n' "${MOTION_GUARD_PID}" "${NAV_STACK_PID}" "${GEOMETRY_RUNTIME_PID}" "${PERSON_FOLLOW_PID}" "${VIDEO_STREAMER_PID}" >&3
   exit 0
 }
 
 monitor_runtime_activation_requests() {
   local request_file="${NUWAX_RUNTIME_ACTIVATION_REQUEST}"
-  local initial_geometry_pid="${GEOMETRY_RUNTIME_PID}" initial_nav_pid="${NAV_STACK_PID}" initial_follow_pid="${PERSON_FOLLOW_PID}"
-  local initial_guard_pid="${MOTION_GUARD_PID}"
+  local initial_GEOMETRY_RUNTIME_PID="${GEOMETRY_RUNTIME_PID}" initial_NAV_STACK_PID="${NAV_STACK_PID}" initial_PERSON_FOLLOW_PID="${PERSON_FOLLOW_PID}"
+  local initial_MOTION_GUARD_PID="${MOTION_GUARD_PID}"
   local RUNTIME_ACTIVATION_REQUEST_ID="" RUNTIME_ACTIVATION_STAGE="request"
   local last_handled_request_id="" invalid_reported=0
   local -a RUNTIME_ACTIVATION_STARTED=()
@@ -990,7 +873,7 @@ monitor_runtime_activation_requests() {
     # 监督与启动留在同一拥有方，重启后的 PID 不再遗失在另一个后台 shell 中。
     if ((SECONDS >= next_health_check)); then
       next_health_check=$((SECONDS + 5))
-      if [[ -n "${MOTION_GUARD_PID}" && "${MOTION_GUARD_PID}" != "${initial_guard_pid}" ]] && ! is_pid_alive "${MOTION_GUARD_PID}"; then
+      if [[ -n "${MOTION_GUARD_PID}" ]] && ! is_pid_alive "${MOTION_GUARD_PID}"; then
         wait "${MOTION_GUARD_PID}" >/dev/null 2>&1 || true
         MOTION_GUARD_PID=""
         if ! start_motion_guard; then
@@ -998,7 +881,7 @@ monitor_runtime_activation_requests() {
           break
         fi
       fi
-      if [[ -n "${NAV_STACK_PID}" && "${NAV_STACK_PID}" != "${initial_nav_pid}" ]] && ! is_pid_alive "${NAV_STACK_PID}"; then
+      if [[ -n "${NAV_STACK_PID}" ]] && ! is_pid_alive "${NAV_STACK_PID}"; then
         wait "${NAV_STACK_PID}" >/dev/null 2>&1 || true
         NAV_STACK_PID=""
         if ! start_nav_stack; then
@@ -1006,10 +889,26 @@ monitor_runtime_activation_requests() {
           break
         fi
       fi
-      if [[ -n "${GEOMETRY_RUNTIME_PID}" && "${GEOMETRY_RUNTIME_PID}" != "${initial_geometry_pid}" ]] && ! is_pid_alive "${GEOMETRY_RUNTIME_PID}"; then
+      if [[ -n "${GEOMETRY_RUNTIME_PID}" ]] && ! is_pid_alive "${GEOMETRY_RUNTIME_PID}"; then
         wait "${GEOMETRY_RUNTIME_PID}" >/dev/null 2>&1 || true
         GEOMETRY_RUNTIME_PID=""
         if ! start_geometry_runtime; then
+          send_signal_to_process_scope TERM "${GATEWAY_PID}"
+          break
+        fi
+      fi
+      if [[ -n "${PERSON_FOLLOW_PID}" ]] && ! person_follow_is_alive "${PERSON_FOLLOW_PID}"; then
+        wait "${PERSON_FOLLOW_PID}" >/dev/null 2>&1 || true
+        PERSON_FOLLOW_PID=""
+        if ! start_person_follow; then
+          send_signal_to_process_scope TERM "${GATEWAY_PID}"
+          break
+        fi
+      fi
+      if [[ -n "${VIDEO_STREAMER_PID}" ]] && ! is_pid_alive "${VIDEO_STREAMER_PID}"; then
+        wait "${VIDEO_STREAMER_PID}" >/dev/null 2>&1 || true
+        VIDEO_STREAMER_PID=""
+        if ! start_go2_video_streamer; then
           send_signal_to_process_scope TERM "${GATEWAY_PID}"
           break
         fi
@@ -1021,30 +920,25 @@ monitor_runtime_activation_requests() {
 }
 
 start_runtime_activation_monitor() {
-  monitor_runtime_activation_requests &
+  exec {RUNTIME_ACTIVATION_STATE_FD}< <(monitor_runtime_activation_requests 3>&1 1>&2)
   RUNTIME_ACTIVATION_MONITOR_PID="$!"
 }
 
 stop_runtime_activation_monitor() {
-  if [[ -n "${RUNTIME_ACTIVATION_MONITOR_PID}" ]] && is_pid_alive "${RUNTIME_ACTIVATION_MONITOR_PID}" \
-    && process_belongs_to_instance "${RUNTIME_ACTIVATION_MONITOR_PID}"; then
-    kill -TERM "${RUNTIME_ACTIVATION_MONITOR_PID}" >/dev/null 2>&1 || true
+  if [[ -n "${RUNTIME_ACTIVATION_MONITOR_PID}" ]]; then
+    if is_pid_alive "${RUNTIME_ACTIVATION_MONITOR_PID}" \
+      && process_belongs_to_instance "${RUNTIME_ACTIVATION_MONITOR_PID}"; then
+      kill -TERM "${RUNTIME_ACTIVATION_MONITOR_PID}" >/dev/null 2>&1 || true
+    fi
+    read -r MOTION_GUARD_PID <&"${RUNTIME_ACTIVATION_STATE_FD}"
+    read -r NAV_STACK_PID <&"${RUNTIME_ACTIVATION_STATE_FD}"
+    read -r GEOMETRY_RUNTIME_PID <&"${RUNTIME_ACTIVATION_STATE_FD}"
+    read -r PERSON_FOLLOW_PID <&"${RUNTIME_ACTIVATION_STATE_FD}"
+    read -r VIDEO_STREAMER_PID <&"${RUNTIME_ACTIVATION_STATE_FD}"
+    exec {RUNTIME_ACTIVATION_STATE_FD}<&-
     wait "${RUNTIME_ACTIVATION_MONITOR_PID}" >/dev/null 2>&1 || true
   fi
   RUNTIME_ACTIVATION_MONITOR_PID=""
-}
-
-stop_runtime_monitors() {
-  local monitor_pid=""
-  for monitor_pid in "${NAV_STACK_MONITOR_PID}" "${GEOMETRY_MONITOR_PID}"; do
-    if [[ -n "${monitor_pid}" ]] && is_pid_alive "${monitor_pid}" \
-      && process_belongs_to_instance "${monitor_pid}"; then
-      kill -TERM "${monitor_pid}" >/dev/null 2>&1 || true
-      wait "${monitor_pid}" >/dev/null 2>&1 || true
-    fi
-  done
-  NAV_STACK_MONITOR_PID=""
-  GEOMETRY_MONITOR_PID=""
 }
 
 stop_go2_video_streamer() {
@@ -1070,8 +964,8 @@ stop_gateway() {
     wait "${GATEWAY_PID}" >/dev/null 2>&1 || true
   fi
   stop_runtime_activation_monitor
-  stop_person_follow_monitor
-  stop_runtime_monitors
+
+
   stop_person_follow
   stop_geometry_runtime
   stop_nav_stack
@@ -1174,7 +1068,7 @@ if ! is_restart_enabled "${RESTART_POLICY}"; then
   exit_code="$?"
   STOP_REQUESTED=1
   stop_runtime_activation_monitor
-  stop_runtime_monitors
+
   stop_person_follow
   stop_go2_video_streamer
   stop_geometry_runtime
@@ -1198,7 +1092,7 @@ while true; do
 
   if ! should_restart "${exit_code}"; then
     STOP_REQUESTED=1
-    stop_runtime_monitors
+
     stop_person_follow
     stop_geometry_runtime
     stop_nav_stack
@@ -1209,7 +1103,7 @@ while true; do
   if [[ "${RESTART_MAX_ATTEMPTS}" != "0" && "${attempt}" -ge "${RESTART_MAX_ATTEMPTS}" ]]; then
     echo "gateway exited with code ${exit_code}; restart attempts exhausted (${attempt})." >&2
     STOP_REQUESTED=1
-    stop_runtime_monitors
+
     stop_person_follow
     stop_geometry_runtime
     stop_nav_stack

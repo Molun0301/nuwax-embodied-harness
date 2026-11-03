@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-from core.config_values import runtime_value
 from core.source_time import SourceTimeError, source_age_ns, acquired_unix_ns
 
 from collections import deque
 from contextlib import contextmanager
 import uuid
-import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -14,7 +12,6 @@ import logging
 import math
 import heapq
 import inspect
-import os
 import re
 import threading
 import time
@@ -2428,7 +2425,7 @@ class MemoryService(SceneMappingMemoryMixin):
         candidate_pool_limit = max(requested_limit * 3, 12)
         match_limit = candidate_pool_limit
         current_pose = self._get_current_pose()
-        map_snapshot = self._get_map_snapshot()
+        self._get_map_snapshot()
         semantic_context = self.get_navigation_semantic_context()
         effective_map_name = str(map_name or semantic_context.map_name or "").strip() or None
         active_localization_session_id = str(semantic_context.localization_session_id or "").strip() or None

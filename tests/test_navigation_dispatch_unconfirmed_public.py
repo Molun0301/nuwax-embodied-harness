@@ -91,7 +91,6 @@ class PublicUnconfirmedTests(unittest.TestCase):
         runtime = create_isolated_gateway(Path(directory.name))
         self.addCleanup(runtime.stop)
         self.enterContext(patch.object(runtime, "_ensure_motion_runtime_for_backend_call", lambda *args, **kwargs: None))
-        self.enterContext(patch.object(runtime, "_require_motion_admission", lambda *args: MotionAdmission("test", "navigate_to_pose", b"x" * 16, 4)))
         return runtime
 
     def control_gateway(self):
@@ -471,7 +470,8 @@ class PublicUnconfirmedTests(unittest.TestCase):
                    accepted=status == "SUCCEEDED", ownership_retained=status == "ADMISSION_UNCONFIRMED",
                    authority_current=True, retryable=retryable)
         self.enterContext(patch.object(runtime, "map_workspace_service", NS(submit_mapping_cloud_goal=Mock(return_value=raw))))
-        result = runtime._handle_navigate_to_place({"query_text": "fixture", "query_request_id": "query-1"})
+        result = runtime._handle_navigate_to_place({"query_text": "fixture", "query_request_id": "query-1",
+            "_motion_admission": MotionAdmission("test", "navigate_to_place", b"x" * 16, 4)})
         return raw, result
 
     def test_mapping_unknown_mcp_agent_sdk_keep_error_and_navigation(self):
@@ -498,7 +498,8 @@ class PublicUnconfirmedTests(unittest.TestCase):
         runtime = self.gateway()
         self.enterContext(patch.object(runtime, "map_workspace_service", NS(submit_mapping_cloud_goal=Mock(return_value={
             "status": "ADMISSION_REJECTED", "query_request_id": "query-1", "navigation": None}))))
-        result = runtime._handle_navigate_to_place({"query_text": "fixture", "query_request_id": "query-1"})
+        result = runtime._handle_navigate_to_place({"query_text": "fixture", "query_request_id": "query-1",
+            "_motion_admission": MotionAdmission("test", "navigate_to_place", b"x" * 16, 4)})
         self.assertEqual(result["error_payload"]["code"], "navigation_goal_rejected")
         self.assertIsNone(result["error_payload"]["details"]["navigation"])
         self.assertFalse(result["error_payload"]["details"]["ownership_retained"])

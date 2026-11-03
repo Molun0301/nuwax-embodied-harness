@@ -69,7 +69,7 @@ def _parse_entry(raw: str, *, identity: str, fallback_time: str) -> Optional[dic
         data = json.loads(text)
     except ValueError:
         data = None
-    if isinstance(data, dict) and any(key in data for key in ("message", "msg", "fields")):
+    if isinstance(data, dict) and any(key in data for key in ("message", "fields")):
         fields = data.get("details") or data.get("fields") or {}
         fields = dict(fields) if isinstance(fields, dict) else {}
         rust = "fields" in data
@@ -80,23 +80,18 @@ def _parse_entry(raw: str, *, identity: str, fallback_time: str) -> Optional[dic
                         fields.setdefault(key, span[key])
         entry = {
             "id": data.get("id") or identity,
-            "timestamp": data.get("timestamp") or data.get("ts") or fallback_time,
+            "timestamp": data.get("timestamp") or fallback_time,
             "level": "warning" if str(data.get("level") or "").lower() == "warn" else str(data.get("level") or "info").lower(),
             "source": data.get("source") or ("rust" if rust else "python"),
-            "component": data.get("component") or fields.get("component") or data.get("target") or data.get("logger") or "unknown",
+            "component": data.get("component") or fields.get("component") or data.get("target") or "unknown",
             "event": data.get("event") or fields.get("event"),
-            "message": data.get("message") or data.get("msg") or fields.pop("message", ""),
+            "message": data.get("message") or fields.pop("message", ""),
             "request_id": data.get("request_id") or fields.get("request_id"),
             "task_id": data.get("task_id") or fields.get("task_id"),
             "capability_name": data.get("capability_name") or fields.get("capability_name"),
             "exception": data.get("exception"),
             "details": fields,
         }
-        # 兼容迁移前的 JSON 扩展字段，不把它们丢弃为一段消息。
-        if "details" not in data and not rust:
-            for key, value in data.items():
-                if key not in entry and key not in {"ts", "msg", "logger"}:
-                    fields.setdefault(key, value)
         return entry
     match = _TEXT_LINE.match(text)
     rust_match = _RUST_LINE.match(text)
@@ -104,7 +99,7 @@ def _parse_entry(raw: str, *, identity: str, fallback_time: str) -> Optional[dic
         entry = match.groupdict()
         entry["timestamp"] = datetime.fromisoformat(entry["timestamp"].replace(",", ".")).astimezone(timezone.utc).isoformat()
         entry["level"] = entry["level"].lower()
-        source = "native" if "go2_sh" in entry["component"] else "python"
+        source = "python"
     elif rust_match:
         entry = rust_match.groupdict()
         entry["component"] = "rust"

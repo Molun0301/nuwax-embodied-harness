@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import shutil
 import sys
-from pathlib import Path
 
 from scripts.neh_bootstrap import (BootstrapError, remove_incomplete_manager, require_install_layout,
                                    unpack_manager, switch_link)
@@ -30,9 +29,6 @@ def apply_manager(engine, job):
         run_command([sys.executable, "-B", "-m", "scripts.device_manager.source_package", "--root", str(checkout["root"]),
                      "--output", str(archive), "--version", source["version"]], cwd=checkout["root"],
                     environment=clean_environment(), timeout=180, cancelled=lambda: engine._cancelled(job["id"]))
-        manifest = read_json(archive.with_name(archive.name + ".manifest.json"), {})
-        if manifest.get("revision") != source["revision"]:
-            raise ManagerError("manager_mismatch", "本地管理程序源码修订与已确认计划不一致。")
     metadata = {"version": source["version"], "revision": source["revision"], "sha256": digest_file(archive), "size": archive.stat().st_size}
     root = engine.manager_home / "manager"
     versions = root / "versions"

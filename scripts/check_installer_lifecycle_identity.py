@@ -248,7 +248,7 @@ class RegistrationIdentityTests(OfflineFixture):
 
 class ApplyRegistrationTests(OfflineFixture):
     def test_fresh_assigns_once_and_upgrade_reuses_exact_name(self):
-        patches = self.mock_apply()
+        self.mock_apply()
         first = self.apply()
         name = first["deployment"]["lifecycle"]["service_name"]
         self.assertEqual(name, "neh-install-00000002-0000-0000-0000-000000000000.service")
@@ -261,7 +261,7 @@ class ApplyRegistrationTests(OfflineFixture):
 
     def test_legacy_name_survives_repair_and_mode_change(self):
         self.generation()
-        patches = self.mock_apply()
+        self.mock_apply()
         for kwargs in ({"repair": True}, {"service_mode": "foreground"}):
             state = self.apply(**kwargs)
             self.assertEqual(state["deployment"]["lifecycle"]["service_name"], LEGACY_NAME)
@@ -275,14 +275,14 @@ class ApplyRegistrationTests(OfflineFixture):
         prefix, state = self.generation()
         state["deployment"]["source_root"] = str(self.base / "foreign")
         self.save(prefix, state)
-        patches = self.mock_apply()
+        self.mock_apply()
         with self.assertRaisesRegex(ValueError, "source_root"):
             self.apply()
         patches["build_modules"].assert_not_called()
         self.uuid.assert_not_called()
 
     def test_failed_build_or_validation_never_allocates_service_identity(self):
-        patches = self.mock_apply()
+        self.mock_apply()
         for stage in ("build_modules", "_verify_prefix"):
             with self.subTest(stage=stage), patch.object(manager, stage, side_effect=RuntimeError("fixture failure")):
                 with self.assertRaisesRegex(RuntimeError, "fixture failure"):

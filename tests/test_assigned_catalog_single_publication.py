@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import patch
 
 import tests.test_assigned_workspace_activation as fixture
+from services.mapping import catalog as catalog_module
 
 
 class CatalogSinglePublicationTests(unittest.TestCase):
@@ -35,14 +36,14 @@ class CatalogSinglePublicationTests(unittest.TestCase):
         self.case.assert_consistent(self.case.activate())
 
     def test_visible_target_rename_requires_directory_fsync_on_each_attempt(self):
-        original = fixture.catalog_module._fsync_directory
+        original = catalog_module._fsync_directory
         failures = []
         def fail_target_directory(path):
             if path == self.case.root / fixture.MAP_NAME:
                 failures.append(self.repository.get_map_asset(fixture.MAP_NAME))
                 raise OSError('target directory fsync after rename failed')
             return original(path)
-        with patch.object(fixture.catalog_module, '_fsync_directory', side_effect=fail_target_directory):
+        with patch.object(catalog_module, '_fsync_directory', side_effect=fail_target_directory):
             for _ in range(2):
                 with self.assertRaises(OSError):
                     self.case.activate()

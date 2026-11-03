@@ -2,7 +2,6 @@
 """私有配置捕获、无摘要CAS与设置接线的隔离合成回归。"""
 from __future__ import annotations
 
-import ast
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, asynccontextmanager
@@ -16,12 +15,13 @@ import tempfile
 import threading
 from types import ModuleType, SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from core import config_io, config_profiles, config_registry, config_values
 from gateways.settings import SettingsApplication
+from gateways.http.api import _settings_lifespan
 
 WORK = Path(tempfile.gettempdir()) / 'neh-configuration-revisions-checks'
 SECRET = 'synthetic-secret-never-a-real-credential'
@@ -305,13 +305,6 @@ class ConfigurationRevisionChecks(unittest.TestCase):
         application.close(); self.assertTrue(application.revision_owner._closed)
 
 
-    def lifecycle_factory(self):
-        tree = ast.parse((ROOT / 'gateways/http/api.py').read_text())
-        node = next(item for item in tree.body if isinstance(item, ast.FunctionDef) and item.name == '_settings_lifespan')
-        namespace = {'asynccontextmanager': asynccontextmanager}
-        exec(compile(ast.Module(body=[node], type_ignores=[]), 'production-settings-lifespan', 'exec'), namespace)
-        return namespace['_settings_lifespan']
-
     async def run_lifespan(self, app, on_start):
         commands = iter([{'type': 'lifespan.startup'}, {'type': 'lifespan.shutdown'}]); messages = []
         async def receive(): return next(commands)
@@ -335,7 +328,7 @@ class ConfigurationRevisionChecks(unittest.TestCase):
         router = APIRouter()
         router.add_event_handler('startup', lambda: events.append('existing start'))
         router.add_event_handler('shutdown', lambda: events.append('existing stop'))
-        router.lifespan_context = self.lifecycle_factory()(router.lifespan_context, application)
+        router.lifespan_context = _settings_lifespan(router.lifespan_context, application)
         app = FastAPI(lifespan=outer); app.include_router(router)
         tokens, streams = [], []
         def opened():
@@ -369,7 +362,7 @@ class ConfigurationRevisionChecks(unittest.TestCase):
         from fastapi import APIRouter, FastAPI
         application = SettingsApplication(SimpleNamespace(config=SimpleNamespace(robot=SimpleNamespace(active_robot='alpha'))))
         self.addCleanup(application.close)
-        router = APIRouter(); router.lifespan_context = self.lifecycle_factory()(router.lifespan_context, application)
+        router = APIRouter(); router.lifespan_context = _settings_lifespan(router.lifespan_context, application)
         app = FastAPI(); app.include_router(router); leases = []
         def opened():
             self.token(owner=application.revision_owner)
@@ -386,7 +379,7 @@ class ConfigurationRevisionChecks(unittest.TestCase):
         router = APIRouter()
         def earlier_failure(): raise RuntimeError('original shutdown failure')
         router.add_event_handler('shutdown', earlier_failure)
-        router.lifespan_context = self.lifecycle_factory()(router.lifespan_context, application)
+        router.lifespan_context = _settings_lifespan(router.lifespan_context, application)
         app = FastAPI(); app.include_router(router); baselines = []
         def opened():
             self.token(owner=application.revision_owner)

@@ -28,7 +28,7 @@ from gateways.exploration_checkpoint import store as checkpoint_store
 from services.mapping.catalog import MapCatalogRepository
 from services.navigation.building_catalog import BuildingCatalog
 from services.navigation.exploration_checkpoint import ExplorationCheckpoint, ExplorationCheckpointStore
-from services.navigation.file_identity import MAX_RECORD_BYTES, read_record_text
+from services.navigation.file_identity import MAX_RECORD_BYTES
 
 WORK = Path(tempfile.gettempdir()) / 'neh-navigation-file-identity-checks'
 

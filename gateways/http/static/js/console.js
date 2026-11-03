@@ -5068,7 +5068,7 @@
         } catch (_) {
           return false;
         }
-        if (!header || !["pointcloud_map.snapshot", "pointcloud_map.live_chunk"].includes(header.topic)) return false;
+        if (!header || header.topic !== "pointcloud_map.snapshot") return false;
         state.pointcloudRoutedCount = (state.pointcloudRoutedCount || 0) + 1;
         state.pointcloudRoutedBytes = (state.pointcloudRoutedBytes || 0) + buffer.byteLength;
         recordPointcloudDiagnostic({ pointcloudRoutedCount: state.pointcloudRoutedCount, pointcloudRoutedBytes: state.pointcloudRoutedBytes });

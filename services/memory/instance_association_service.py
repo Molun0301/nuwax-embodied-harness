@@ -709,7 +709,6 @@ class InstanceAssociationService:
         predicted_iou = self._coerce_optional_float(metadata.get("predicted_iou"))
         segmentation_quality_score = self._coerce_optional_float(metadata.get("segmentation_quality_score"), predicted_iou)
         stability_score = self._coerce_optional_float(metadata.get("stability_score"))
-        coverage = self._coerce_optional_float(metadata.get("coverage"))
         depth_coverage = self._coerce_optional_float(metadata.get("depth_coverage"))
         map_projection_coverage = self._coerce_optional_float(metadata.get("map_projection_coverage"))
         reprojection_error = self._coerce_optional_float(metadata.get("reprojection_error"))

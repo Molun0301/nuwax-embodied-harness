@@ -6,7 +6,6 @@ import sys
 import tempfile
 import threading
 import unittest
-from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -16,9 +15,8 @@ import scripts.check_memory_durable_integration as helpers
 from scripts.check_memory_storage_transactions import records
 from contracts.geometry import Pose
 from contracts.spatial_memory import InstanceDynamicState,InstanceLifecycleState
-from services.memory.durable_index import TOKEN,INDEX_META
-from services.memory.repository import MemoryRepository
-from services.memory.vector_store import SQLiteNamedVectorStore,NamedVector
+from services.memory.durable_index import TOKEN
+from services.memory.vector_store import NamedVector
 from services.memory.vectorization_outbox import OutboxConflict
 from services.memory.vectorizer import TextEmbedder
 

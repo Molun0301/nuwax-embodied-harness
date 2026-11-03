@@ -14,7 +14,6 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -25,7 +24,7 @@ sys.path.insert(0, str(ROOT))
 from scripts.device_manager import engine as engine_module
 from scripts.device_manager.common import ManagerError, atomic_json, process_alive, process_identity, read_json
 from scripts.device_manager.engine import Engine
-from scripts.module_installer.runtime import read_existing, read_settings, write_runtime
+from scripts.module_installer.runtime import read_settings, write_runtime
 
 
 class FakeRuntime:

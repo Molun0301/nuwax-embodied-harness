@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 from tests.conftest import LoaderStub
 from tests.test_assigned_asset_storage import bundle_fixture, checkpoint_fixture
-from tests.conftest import dense_bytes, response_fixture
+from tests.conftest import response_fixture
 
 from contracts.map_identity import AssetIdentityV2
 from contracts.geometry_runtime import PlatformGeometryConfig
@@ -29,7 +29,6 @@ from services.geometry.mapping_backend_checkpoint_store import (
 )
 from services.geometry.pointcloud_map import (
     AssignedSavedPointCloudMapSource,
-    PointCloudMapSnapshot,
     PointCloudMapSourceError,
     PointCloudMapSourceSwitch,
 )

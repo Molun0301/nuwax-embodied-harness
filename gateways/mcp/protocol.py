@@ -17,6 +17,7 @@ from fastapi.responses import StreamingResponse
 
 from gateways.arguments import validate_arguments
 from gateways.auth import GatewayAccessManager
+from gateways.arguments import strict_json_constant
 from gateways.errors import GatewayError, as_gateway_error
 from gateways.feedback import (
     MCP_RESULT_MAX_BYTES,
@@ -47,9 +48,6 @@ def _jsonrpc_error(request_id: Any, *, code: int, message: str, data: Optional[D
         error["data"] = data
     return {"jsonrpc": "2.0", "id": request_id, "error": error}
 
-
-def _strict_json_constant(value: str) -> None:
-    raise ValueError(f"Non-standard JSON constant: {value}")
 
 
 def _validated_jsonrpc_id(value: Any) -> Any:
@@ -446,7 +444,7 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
                 status_code=413,
             )
         try:
-            body = json.loads(raw, parse_constant=_strict_json_constant)
+            body = json.loads(raw, parse_constant=strict_json_constant)
         except (TypeError, ValueError, json.JSONDecodeError):
             return JSONResponse(_jsonrpc_error(None, code=-32700, message="Parse error"), status_code=400)
 
@@ -496,6 +494,9 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
                     http_status=422,
                     jsonrpc_code=-32602,
                 )
+
+            if method == "ping":
+                return JSONResponse(_jsonrpc_result(request_id, {}))
 
             if method == "initialize":
                 protocol_version = _negotiate_protocol_version(params)

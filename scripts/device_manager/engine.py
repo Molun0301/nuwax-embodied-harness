@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import base64
-import json
 import os
 import platform
 import re
@@ -23,7 +22,7 @@ from .common import (ManagerError, atomic_json, atomic_write, file_lock,
                      fsync_directory, identifier, process_alive, process_identity, read_json, timestamp)
 from .runtime import Runtime, append_job_output, clean_environment, probe, run_command, system_helper
 
-TERMINAL = {"succeeded", "failed", "cancelled", "interrupted"}
+from .storage import TERMINAL
 ACTIONS = {"install", "update", "modules", "rollback", "start", "stop", "restart", "update-manager"}
 
 
@@ -107,10 +106,15 @@ class Engine:
         return browse_directories(self, path)
 
     def settings(self):
+        return {key: value for key, value in self._settings_snapshot().items() if not key.startswith("_")}
+
+    def _settings_snapshot(self):
         from .sources import normalized_settings
-        settings = normalized_settings(read_json(self.manager_home / "config/settings.json", {}))
+        stored = read_json(self.manager_home / "config/settings.json", {})
+        settings = normalized_settings(stored)
+        settings["_allow_local_source"] = bool(stored.get("_allow_local_source"))
         settings["password_enabled"] = bool(read_json(self.manager_home / "config/password.json", {}).get("digest"))
-        return {key: value for key, value in settings.items() if not key.startswith("_")}
+        return settings
 
     def save_settings(self, values, *, allow_local_source=False):
         from scripts.neh_source import SourceError, validate_repository
@@ -211,30 +215,34 @@ class Engine:
                                  requires=list(item.requires), conflicts=list(item.conflicts), installed=item.key in selected)
                             for item in MODULES.values()], "selected": selected, "robot": current.get("robot", "customrobot"), "robots": ["customrobot", "go2"], "robot_labels": {"customrobot": "标准机器人接入", "go2": "宇树Go2"}}
 
-    def catalog(self, refresh=False):
+    def catalog(self, refresh=False, *, settings=None):
         from .sources import discover
-        source = discover(self, refresh=refresh)
+        source = discover(self, refresh=refresh, settings=settings)
         return {"schema_version": 1, "product": "neh", "source": source, "releases": [],
                 "manager": {"version": source["version"], "revision": source["revision"]}}
 
     def releases(self, refresh=False):
-        settings = self.settings()
+        _, result = self._release_snapshot(refresh=refresh, settings=self._settings_snapshot(), hardware=self.hardware())
+        return result
+
+    def _release_snapshot(self, *, refresh=False, settings, hardware):
+        catalog = None
         result = {"configured": bool(settings["source_repository"]), "channel": settings["channel"], "releases": []}
         try:
-            catalog = self.catalog(refresh=refresh)
+            catalog = self.catalog(refresh=refresh, settings=settings)
             source = catalog["source"]
             result.update(source_repository=source["repository"], source_branch=source["branch"], source_revision=source["revision"])
             result["releases"] = [{"version": source["version"], "revision": source["revision"], "channel": settings["channel"],
-                "notes": "设备下载固定源码并按程序指纹复用、下载或构建", "published_at": source.get("channel_record", {}).get("published_at", ""), "compatible": self.hardware()["supported"],
+                "notes": "设备下载固定源码并按程序指纹复用、下载或构建", "published_at": source.get("channel_record", {}).get("published_at", ""), "compatible": hardware["supported"],
                 "display_version": source.get("channel_record", {}).get("version", source["branch"] + "@" + source["revision"][:8]),
                 "reason": "", "modules": list(MODULES)}]
-            return result
+            return catalog, result
         except ManagerError as exc:
             if exc.code == "channel_pending":
                 result.update(pending=True, message=exc.message)
             else:
                 result["error"] = exc.message
-        return result
+        return catalog, result
 
     def _job_path(self, job_id):
         return self.manager_home / "jobs" / (identifier(job_id) + ".json")
@@ -280,15 +288,17 @@ class Engine:
         self.recover_if_needed()
         current = self.current()
         history = read_json(self.home / "config/history.json", {})
-        releases = self.releases()
+        settings = self._settings_snapshot()
+        hardware = self.hardware()
+        catalog, releases = self._release_snapshot(settings=settings, hardware=hardware)
         available = next((item for item in releases["releases"] if item["compatible"]), None)
         relation = None
         relation_name = "unknown"
         if available and current:
             from .versioning import revision_relation, source_tree_unchanged
             try:
-                relation_name = revision_relation(self, self.catalog()["source"], current.get("revision"))
-                if relation_name == "newer" and source_tree_unchanged(self, self.catalog()["source"], current.get("revision")):
+                relation_name = revision_relation(self, catalog["source"], current.get("revision"))
+                if relation_name == "newer" and source_tree_unchanged(self, catalog["source"], current.get("revision")):
                     relation_name = "same"
             except (OSError, RuntimeError) as exc:
                 relation_name = "unknown"
@@ -298,16 +308,16 @@ class Engine:
         manager_relation = None
         manager_relation_name = "unknown"
         if available:
-            latest_manager = self.catalog().get("manager", {}).get("version")
+            latest_manager = catalog.get("manager", {}).get("version")
             from .versioning import revision_relation, source_tree_unchanged
             try:
-                manager_relation_name = revision_relation(self, self.catalog()["source"], MANAGER_REVISION)
-                if manager_relation_name == "newer" and source_tree_unchanged(self, self.catalog()["source"], MANAGER_REVISION):
+                manager_relation_name = revision_relation(self, catalog["source"], MANAGER_REVISION)
+                if manager_relation_name == "newer" and source_tree_unchanged(self, catalog["source"], MANAGER_REVISION):
                     manager_relation_name = "same"
             except (OSError, RuntimeError):
                 manager_relation_name = "unknown"
             manager_relation = {"newer": 1, "same": 0, "older": -1}.get(manager_relation_name)
-        channel_record = self.catalog().get("source", {}).get("channel_record", {}) if available else {}
+        channel_record = catalog.get("source", {}).get("channel_record", {}) if available else {}
         installation = {"installed": bool(current), "install_dir": str(self.home), "version": current.get("version"), "modules": current.get("modules", []),
                         "robot": current.get("robot", "customrobot"), "previous_version": history.get("previous_version"), "source": current.get("source"), "revision": current.get("revision", "")}
         location = self.install_location()
@@ -320,7 +330,7 @@ class Engine:
                            "requires_confirmation": channel_record.get("requires_confirmation", False), "display_version": available.get("display_version") if available else None,
                            "check": read_json(self.manager_home / "config/update-check.json", {}),
                            "version": available["version"] if available else None, "revision": available.get("revision") if available else None, "error": releases.get("error"), "manager_available": bool(latest_manager and manager_relation == 1), "manager_version": latest_manager, "manager_switch_available": bool(latest_manager and manager_relation == 1), "manager_relation": manager_relation_name, "relation": relation_name},
-                "password_enabled": self.settings()["password_enabled"], "platform_supported": self.hardware()["supported"]}
+                "password_enabled": settings["password_enabled"], "platform_supported": hardware["supported"]}
 
     def _plan_source(self, plan, request, local_request):
         from .sources import discover

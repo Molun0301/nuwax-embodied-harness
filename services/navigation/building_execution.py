@@ -5,7 +5,6 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
 import json
-from pathlib import Path
 import time
 import uuid
 from typing import Callable, Iterator, Mapping, Protocol

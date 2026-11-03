@@ -19,8 +19,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from contracts.geometry import Pose, Vector3
-from contracts.navigation import NavigationGoal, NavigationStatus
+from contracts.navigation import NavigationStatus
 from core.event_bus import EventBus
+from core.task_manager import TaskTimeoutError
 from core.settings import GatewayServerConfig
 from gateways.auth import GatewayAccessManager
 from gateways.errors import GatewayError
@@ -66,6 +67,15 @@ class _RunnerContext:
 
     def commit_success(self, proof):
         return bool(proof)
+
+
+class _WaitingTimeoutContext(_RunnerContext):
+    def ensure_active(self):
+        if any(update.get("stage") == "waiting_navigation_inputs" for update in self.updates):
+            raise TaskTimeoutError("原任务期限已到")
+
+    def timeout_remaining_sec(self):
+        return 0.0
 
 
 class NavigationGoalHeightPublicInputTests(unittest.TestCase):
@@ -184,9 +194,9 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
             navigation_state=SimpleNamespace(current_goal_id=goal_id, status=status, message=message,
                 remaining_distance_m=0, goal_reached=status == NavigationStatus.SUCCEEDED, metadata={}))
 
-    def run_latest(self, gateway):
+    def run_latest(self, gateway, context=None):
         _spec, runner = gateway.task_manager.submissions[-1]
-        return runner(_RunnerContext())
+        return runner(context or _RunnerContext())
 
     def assert_pending_target(self, gateway):
         spec, _runner = gateway.task_manager.submissions[-1]
@@ -203,10 +213,10 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
                 self.assertEqual(schema, descriptor.input_schema)
                 self.assertEqual(set(schema["required"]), {"frame_id", "x", "y"})
                 self.assertNotIn("default", schema["properties"]["z"])
-                for phrase in ("schema 2", "schema 1", "定位准备", "新鲜", "二维省略", "显式值", "不代表拥有方高度证据"):
+                for phrase in ("schema 2", "schema 1", "定位准备", "已发布", "二维省略", "显式值", "不代表拥有方高度证据"):
                     self.assertIn(phrase, schema["properties"]["z"]["description"])
                 for description in (descriptor.description, gateway.skill_registry.get_descriptor("navigate_to_pose").description):
-                    for phrase in ("schema 2", "schema 1", "定位准备", "新鲜", "不代表拥有方高度证据"):
+                    for phrase in ("schema 2", "schema 1", "定位准备", "已发布", "不代表拥有方高度证据"):
                         self.assertIn(phrase, description)
                 self.assertNotIn("pose", schema["properties"])
 
@@ -296,10 +306,10 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
                         "invalid_schema": SimpleNamespace(identity_schema_version=3),
                     }[missing], create=True))
                 self.mcp_call(gateway, {"frame_id": "map", "x": 4.25, "y": -1.5})
-                with self.assertRaises(GatewayError) as raised:
-                    self.run_latest(gateway)
-                self.assertEqual(raised.exception.error_code, "navigation_height_unavailable")
-                self.assertEqual(raised.exception.details["reason"], "owned_pose_unavailable")
+                context = _WaitingTimeoutContext()
+                with self.assertRaises(TaskTimeoutError):
+                    self.run_latest(gateway, context)
+                self.assertIn("waiting_navigation_inputs", [item.get("stage") for item in context.updates])
                 gateway.map_workspace_service.get_relocalized_pose.assert_not_called()
                 gateway.navigation_service.set_goal.assert_not_called()
 
@@ -407,44 +417,44 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
         self.assertEqual([goal.target_pose.position.z for goal in gateway.dispatched], [0.0] * 2)
         gateway.map_workspace_service.get_relocalized_pose.assert_not_called()
 
-    def test_unavailable_stale_future_wrong_frame_and_invalid_pose_never_guess_or_dispatch(self):
-        now = datetime.now(timezone.utc)
-        samples = [None,
-            Pose(timestamp=now - timedelta(seconds=2.01), frame_id="map"),
-            Pose(timestamp=now + timedelta(seconds=1.1), frame_id="map"),
-            Pose(timestamp=now, frame_id="other/map"),
-            Pose(timestamp=now, frame_id="map", position=Vector3(z=float("nan"))),
-            Pose(timestamp=now.replace(tzinfo=None), frame_id="map")]
-        for sample in samples:
-            with self.subTest(sample=sample):
-                gateway = self.configure_runner(self.gateway())
-                self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'owned_pose', sample, create=True))
-                self.mcp_call(gateway, {"frame_id": "map", "x": 4.25, "y": -1.5})
-                with patch("gateways.runtime.utc_now", return_value=now), self.assertRaises(GatewayError) as raised:
-                    self.run_latest(gateway)
-                self.assertEqual(raised.exception.error_code, "navigation_height_unavailable")
-                gateway.navigation_service.set_goal.assert_not_called()
-                gateway.localization_service.get_latest_snapshot.assert_not_called()
+    def test_missing_height_waits_then_uses_published_pose(self):
+        gateway = self.configure_runner(self.gateway())
+        getter = gateway.map_workspace_service.get_relocalized_pose
+        getter.side_effect = [None, gateway.owned_pose]
+        self.mcp_call(gateway, {"frame_id": "map", "x": 4.25, "y": -1.5})
+        context = _RunnerContext()
+        with patch("gateways.runtime.time.sleep"):
+            self.run_latest(gateway, context)
+        self.assertEqual(gateway.dispatched[-1].target_pose.position.z, 7.25)
+        self.assertIn("waiting_navigation_inputs", [item.get("stage") for item in context.updates])
 
-    def test_source_and_receipt_age_use_existing_browser_limits(self):
-        now = datetime.now(timezone.utc)
-        for source_age, receipt_age, accepted in ((2, 0, True), (-1, 0, True),
-                (2.000001, 0, False), (-1.000001, 0, False), (0, 2, True),
-                (0, 2.000001, False), (0, -1, True), (0, -1.000001, False)):
-            with self.subTest(source_age=source_age, receipt_age=receipt_age):
-                gateway = self.configure_runner(self.gateway())
-                gateway.height_events.append("localize")
-                self._gateway_overrides[gateway].enter_context(patch.object(gateway, 'owned_pose', Pose(timestamp=now - timedelta(seconds=source_age),
-                    frame_id="map", position=Vector3(z=7.25)), create=True))
-                goal = NavigationGoal(goal_id="age-goal", map_name="height_contract_map",
-                    target_pose=Pose(frame_id="map"), metadata={"navigation_height_pending": True})
-                with patch("gateways.runtime.utc_now", side_effect=[now - timedelta(seconds=receipt_age), now]):
-                    if accepted:
-                        self.assertEqual(gateway._resolve_navigation_goal_height(goal,
-                            workspace=gateway.height_workspace).target_pose.position.z, 7.25)
-                    else:
-                        with self.assertRaises(GatewayError):
-                            gateway._resolve_navigation_goal_height(goal, workspace=gateway.height_workspace)
+    def test_missing_height_waits_with_original_task_deadline(self):
+        gateway = self.configure_runner(self.gateway())
+        gateway.map_workspace_service.get_relocalized_pose.return_value = None
+        gateway.map_workspace_service.get_relocalized_pose.side_effect = None
+        self.mcp_call(gateway, {"frame_id": "map", "x": 4.25, "y": -1.5})
+        context = _WaitingTimeoutContext()
+        with self.assertRaises(TaskTimeoutError):
+            self.run_latest(gateway, context)
+        gateway.navigation_service.set_goal.assert_not_called()
+
+    def test_current_published_height_ignores_source_wall_age(self):
+        for age in (3, -2, 3600):
+            gateway = self.configure_runner(self.gateway())
+            gateway.owned_pose = gateway.owned_pose.model_copy(update={
+                "timestamp": datetime.now(timezone.utc) - timedelta(seconds=age)})
+            self.mcp_call(gateway, {"frame_id": "map", "x": 4.25, "y": -1.5})
+            self.run_latest(gateway)
+            self.assertEqual(gateway.dispatched[-1].target_pose.position.z, 7.25)
+
+    def test_published_height_requires_target_frame(self):
+        gateway = self.configure_runner(self.gateway())
+        gateway.owned_pose = gateway.owned_pose.model_copy(update={"frame_id": "other/map"})
+        self.mcp_call(gateway, {"frame_id": "map", "x": 4.25, "y": -1.5})
+        with self.assertRaises(GatewayError) as raised:
+            self.run_latest(gateway)
+        self.assertEqual(raised.exception.details["reason"], "frame_mismatch")
+        gateway.navigation_service.set_goal.assert_not_called()
 
     def test_async_preparation_can_replace_old_pose_before_height_resolution(self):
         gateway = self.configure_runner(self.gateway())
@@ -524,17 +534,6 @@ class NavigationGoalHeightPublicInputTests(unittest.TestCase):
             [attempts[0].model_dump(mode="json")] * 2)
         self.assertIn("waiting_navigation_inputs", [update.get("stage") for update in context.updates])
 
-    def test_unresolved_height_marker_is_blocked_at_dispatch_boundary(self):
-        gateway = self.configure_runner(self.gateway())
-        self._gateway_overrides[gateway].enter_context(patch.object(gateway, '_resolve_navigation_goal_height', lambda goal, *, workspace: goal, create=True))
-        self.mcp_call(gateway, {"frame_id": "map", "x": 4.25, "y": -1.5})
-        with self.assertRaises(GatewayError) as raised:
-            self.run_latest(gateway)
-        self.assertEqual(raised.exception.error_code, "navigation_height_unavailable")
-        gateway.navigation_service.set_goal.assert_not_called()
-
-
-
 class NavigationGoalHeightOwnedSampleTests(unittest.TestCase):
     gateway = NavigationGoalHeightPublicInputTests.gateway
     configure_runner = NavigationGoalHeightPublicInputTests.configure_runner
@@ -566,9 +565,9 @@ class NavigationGoalHeightOwnedSampleTests(unittest.TestCase):
         sample.pose.position.z = body_z
         sample.odom_from_body.translation.z = body_z
 
-    def invoke(self, *, frame_id="map"):
+    def invoke(self, *, frame_id="map", context=None):
         self.mcp_call(self.gateway_runtime, {"frame_id": frame_id, "x": 4.25, "y": -1.5})
-        return self.run_latest(self.gateway_runtime)
+        return self.run_latest(self.gateway_runtime, context)
 
     def test_real_assigned_owner_sample_reaches_navigation_dispatch(self):
         # 已准备会话缓存中的历史 z=.25；只有当前匹配拥有方的 RPC 样本含 z=3.75。
@@ -580,15 +579,12 @@ class NavigationGoalHeightOwnedSampleTests(unittest.TestCase):
         self.owner.assert_original_owner()
         self.assertIn("GetAssignedLocalizationSample", self.owner.stub.calls)
 
-    def test_owned_source_wall_age_is_not_refreshed_by_successful_rpc_receipt(self):
+    def test_owned_published_height_is_used_regardless_of_source_wall_age(self):
         for age in (3, -2):
             with self.subTest(age=age):
                 self.owner.stub.sample_mutation = lambda sample, age=age: self.fresh_sample(sample, age_sec=age)
-                with self.assertRaises(GatewayError) as raised:
-                    self.invoke()
-                self.assertEqual(raised.exception.error_code, "navigation_height_unavailable")
-                self.assertEqual(raised.exception.details["reason"], "source_time_out_of_range")
-                self.gateway_runtime.navigation_service.set_goal.assert_not_called()
+                self.invoke()
+                self.assertEqual(self.gateway_runtime.dispatched[-1].target_pose.position.z, 3.75)
 
     def test_owned_map_pose_cannot_supply_height_for_another_target_frame(self):
         with self.assertRaises(GatewayError) as raised:
@@ -606,10 +602,10 @@ class NavigationGoalHeightOwnedSampleTests(unittest.TestCase):
             return result
 
         self._gateway_overrides[gateway].enter_context(patch.object(gateway, '_ensure_localization_for_navigation', wrapped, create=True))
-        with self.assertRaises(GatewayError) as raised:
-            self.invoke()
-        self.assertEqual(raised.exception.error_code, "navigation_height_unavailable")
-        self.assertEqual(raised.exception.details["reason"], "owned_pose_unavailable")
+        context = _WaitingTimeoutContext()
+        with self.assertRaises(TaskTimeoutError):
+            self.invoke(context=context)
+        self.assertIn("waiting_navigation_inputs", [item.get("stage") for item in context.updates])
         gateway.navigation_service.set_goal.assert_not_called()
 
     def test_native_correction_replacement_after_preparation_cannot_dispatch(self):

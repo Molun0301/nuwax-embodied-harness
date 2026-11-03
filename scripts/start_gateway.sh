@@ -567,18 +567,7 @@ stop_existing_gateway() {
   local pid=""
 
   pid="$(read_pid_file || true)"
-  if [[ -z "${pid}" ]]; then
-    echo "gateway pid file not found: ${PID_FILE}"
-    cleanup_stale_gateway_processes
-    cleanup_stale_person_follow_processes
-    cleanup_stale_geometry_runtime_processes
-    cleanup_stale_go2_video_streamer
-    cleanup_external_geometry_processes
-    return 0
-  fi
-
-  if ! is_pid_alive "${pid}"; then
-    echo "gateway pid ${pid} is not running; removing stale pid file."
+  if [[ -z "${pid}" ]] || ! is_pid_alive "${pid}" || ! process_belongs_to_instance "${pid}"; then
     rm -f "${PID_FILE}"
     cleanup_stale_gateway_processes
     cleanup_stale_person_follow_processes
@@ -588,10 +577,6 @@ stop_existing_gateway() {
     return 0
   fi
 
-  if ! process_belongs_to_instance "${pid}"; then
-    echo "拒绝停止不属于本安装的进程 ${pid}；请先通过原拥有方处理旧安装。" >&2
-    return 1
-  fi
   # 先通知根拥有方，让其按原顺序关闭；超时后才使用原进程范围回收。
   kill -TERM "${pid}" >/dev/null 2>&1 || true
   if ! wait_for_pid_exit "${pid}" "${NUWAX_GATEWAY_STOP_TIMEOUT_SEC:-20}"; then
@@ -1283,12 +1268,9 @@ fi
 case "${ACTION}" in
   start)
     acquire_script_lock "${LOCK_FILE}"
-    if [[ -n "$(read_pid_file || true)" ]] && is_pid_alive "$(read_pid_file || true)"; then
-      if process_belongs_to_instance "$(read_pid_file)"; then
-        echo "gateway is already running pid=$(read_pid_file). Use: $0 restart" >&2
-      else
-        echo "PID file points outside this installation; resolve the stale ownership record before starting: ${PID_FILE}" >&2
-      fi
+    if [[ -n "$(read_pid_file || true)" ]] && is_pid_alive "$(read_pid_file || true)" \
+      && process_belongs_to_instance "$(read_pid_file)"; then
+      echo "gateway is already running pid=$(read_pid_file). Use: $0 restart" >&2
       exit 1
     fi
     rm -f "${PID_FILE}"

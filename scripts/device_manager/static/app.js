@@ -213,6 +213,9 @@
           ? `请求失败（HTTP ${response.status}）。服务返回了非预期内容。`
           : `请求失败（HTTP ${response.status}）。`;
       }
+      if (Array.isArray(detail.details)) {
+        message += '\n' + detail.details.join('；');
+      }
       throw new ApiError(message, response.status, detail.code, detail.details);
     }
 
@@ -834,7 +837,7 @@
       show(boxError, false);
       text($('availableVersion'), update.available ? (update.version || '--') : '仅管理程序有更新');
     } else {
-      text(updateBadge, update.pending ? '通道稍后再查' : (({older:'当前版本领先',diverged:'当前版本已分叉',unknown:'尚未确认版本关系'})[update.relation] || (update.failed ? '此版本此前更新失败' : '已是最新')));
+      text(updateBadge, update.pending ? '通道稍后再查' : (({older:'当前版本领先',diverged:'当前版本已分叉',unknown:'尚未确认版本关系'})[update.relation] || '已是最新'));
       setClass(updateBadge, 'status-badge good');
       show(boxAvailable, false);
       show(boxNone, true);
@@ -2949,11 +2952,17 @@
     if (state.submitting) return;
     state.submitting = true;
     try {
-      const job = await apiCall('/api/manager/update', {method:'POST', body:{local_build:Boolean($('updateLocalBuild') && $('updateLocalBuild').checked)}});
-      if (job.status === 'deferred') {
-        showMessage($('overviewLoadError'), job.message, 'info');
-        return;
-      }
+      const plan = await apiCall('/api/manager/plan', {method:'POST', body:{action:'update', local_build:Boolean($('updateLocalBuild') && $('updateLocalBuild').checked)}});
+      if (plan.blockers.length) throw new ApiError('更新计划存在阻塞条件。\n' + plan.blockers.join('；'));
+      const ok = await confirmDialog({
+        title: '立即更新',
+        text: '确认开始更新。',
+        items: plan.warnings,
+        confirmText: '开始更新',
+        danger: Boolean(plan.requires_stop)
+      });
+      if (!ok) return;
+      const job = await apiCall('/api/manager/jobs', {method:'POST', body:{plan_id:plan.id}});
       showView('jobs');
       trackJob(job.id);
       loadJobsView();

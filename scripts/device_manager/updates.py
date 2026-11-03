@@ -35,12 +35,9 @@ def read_channel(repository):
             raise ValueError("通道文件过大")
         value = json.loads(raw)
         if (not isinstance(value, dict) or value.get("schema") != 1 or value.get("channel") != "main"
-                or type(value.get("requires_confirmation")) is not bool
-                or not isinstance(value.get("minimum_manager_version"), str)):
+                or type(value.get("requires_confirmation")) is not bool):
             raise ValueError("通道结构错误")
         source_version(value["revision"])
-        if value["minimum_manager_version"] != source_version(value["revision"]):
-            raise ValueError("最低管理版本须对应本次通过检查的完整提交")
         datetime.fromisoformat(value["published_at"].replace("Z", "+00:00"))
         if not isinstance(value.get("version"), str) or not value["version"]:
             raise ValueError("缺少显示版本")

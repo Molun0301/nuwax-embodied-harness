@@ -364,7 +364,6 @@ class Engine:
             manager_relation = {"newer": 1, "same": 0, "older": -1}.get(manager_relation_name)
         else:
             manager_relation_name = {1: "newer", 0: "same", -1: "older"}.get(manager_relation, "unknown")
-        failed = read_json(self.manager_home / "config/failed-updates.json", {}).get(available.get("revision") if available else "", {})
         channel_record = self.catalog().get("source", {}).get("channel_record", {}) if source_mode and available else {}
         installation = {"installed": bool(current), "install_dir": str(self.home), "version": current.get("version"), "modules": current.get("modules", []),
                         "robot": current.get("robot", "customrobot"), "previous_version": history.get("previous_version"), "source": current.get("source"), "revision": current.get("revision", "")}
@@ -373,11 +372,11 @@ class Engine:
                             location_editable=location["editable"], location_reason=location["reason"])
         return {"product": "NEH", "manager_version": MANAGER_VERSION, "manager_revision": MANAGER_REVISION, "manager_development": MANAGER_DEVELOPMENT, "instance_id": self.instance_id, "installation": installation,
                 "runtime": self.runtime.status(), "active_job": self.active_job(),
-                "update": {"available": bool(available and current and relation == 1 and not failed), "failed": failed or None,
+                "update": {"available": bool(available and current and relation == 1),
                            "pending": bool(releases.get("pending")), "message": releases.get("message"),
                            "requires_confirmation": channel_record.get("requires_confirmation", False), "display_version": available.get("display_version") if available else None,
                            "check": read_json(self.manager_home / "config/update-check.json", {}),
-                           "version": available["version"] if available else None, "revision": available.get("revision") if available else None, "error": releases.get("error"), "manager_available": bool(latest_manager and manager_relation == 1 and not failed), "manager_version": latest_manager, "manager_switch_available": bool(latest_manager and manager_relation == 1 and not failed), "manager_relation": manager_relation_name, "relation": relation_name},
+                           "version": available["version"] if available else None, "revision": available.get("revision") if available else None, "error": releases.get("error"), "manager_available": bool(latest_manager and manager_relation == 1), "manager_version": latest_manager, "manager_switch_available": bool(latest_manager and manager_relation == 1), "manager_relation": manager_relation_name, "relation": relation_name},
                 "password_enabled": self.settings()["password_enabled"], "platform_supported": self.hardware()["supported"]}
 
     def _plan_source(self, plan, request, local_request):
@@ -392,10 +391,7 @@ class Engine:
         channel_record = source.get("channel_record", {})
         if request.get("automatic") and channel_record.get("requires_confirmation"):
             plan["blockers"].append("此版本需要人工确认，自动更新只提醒。")
-        if (channel_record.get("minimum_manager_version") and plan["action"] != "update-manager"
-                and not request.get("one_step") and MANAGER_VERSION != channel_record["minimum_manager_version"]):
-            plan["blockers"].append("此版本需要先更新管理程序，请执行neh update或先应用管理程序更新计划。")
-        if plan["action"] in ("update", "update-manager") and not request.get("source_revision"):
+        if plan["action"] == "update" or (plan["action"] == "update-manager" and not request.get("source_revision")):
             from .versioning import revision_relation
             installed = MANAGER_REVISION if plan["action"] == "update-manager" else current.get("revision")
             if installed:
@@ -404,16 +400,19 @@ class Engine:
                 except (OSError, RuntimeError) as exc:
                     relation = "unknown"
                     plan["warnings"].append("无法核对完整提交历史：" + str(exc))
-                if relation not in ("newer", "same"):
+                if ((request.get("automatic") and relation != "newer")
+                        or (plan["action"] == "update-manager" and relation not in ("newer", "same"))):
                     plan["blockers"].append({"older": "当前版本领先通道", "diverged": "当前版本与通道已分叉"}.get(relation, "无法确认更新方向") + "；如需切换，请显式指定完整source_revision。")
-            if read_json(self.manager_home / "config/failed-updates.json", {}).get(source["revision"]) and not request.get("retry"):
-                plan["blockers"].append("此版本此前更新失败；请等待新版本或使用--retry明确重试。")
+                elif relation in ("older", "diverged"):
+                    plan["warnings"].append("将切换到通道提交，它" + {"older": "旧于", "diverged": "分叉于"}[relation] + "当前版本")
         from .versioning import source_tree_unchanged
         try:
             same_tree = source_tree_unchanged(self, source, current.get("revision")) if current else False
         except (OSError, RuntimeError):
             same_tree = False
         unchanged = same_tree and set(current.get("modules", [])) == set(plan["modules"]) and current.get("robot") == plan["robot"] and not request.get("configuration")
+        if plan["action"] == "update" and current.get("revision") != source["revision"]:
+            unchanged = False
         plan["_source_noop"] = MANAGER_REVISION == source["revision"] if plan["action"] == "update-manager" else (plan["action"] in ("update", "modules") and unchanged)
         if plan["_source_noop"]:
             plan["requires_stop"] = False
@@ -896,7 +895,7 @@ class Engine:
             from .self_update import apply_manager
             return apply_manager(self, job)
         current = self.current()
-        if action == "update" and plan.get("_request", {}).get("one_step") and not job.get("_manager_adopted"):
+        if action == "update" and not job.get("_manager_adopted"):
             from .update_flow import adopt_manager
             adopt_manager(self, job)
         if plan.get("_source_noop"):

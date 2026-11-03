@@ -6,23 +6,25 @@ import sys
 import time
 
 from . import MANAGER_REVISION
-from .common import ManagerError, atomic_json
+from .common import ManagerError, atomic_json, read_json
 from .runtime import clean_environment
 
 
-def begin_update(engine, *, local_build=False, retry=False, automatic=False):
+def begin_update(engine, *, local_build=False, automatic=False):
     settings = engine.settings()
     if settings.get("source_mode") == "git" and settings.get("channel") == "main":
         engine.releases(refresh=True)
         state = engine.status()
         update = state["update"]
         relation = update.get("relation")
-        if update.get("pending") or (not update.get("error") and state["installation"]["installed"] and
-                (relation in ("older", "diverged", "unknown") or (relation == "same" and not update.get("manager_available")))):
+        if not update.get("error") and state["installation"]["installed"] and (
+                (automatic and relation != "newer") or (relation == "same" and not update.get("manager_available"))):
             return {"status": "deferred", "relation": relation,
                     "message": update.get("message") or "通道尚未出现可采用的新版本，保留当前安装，稍后再查。"}
     plan = engine.plan({"action": "update", "one_step": True, "local_build": local_build,
-                        "retry": retry, "automatic": automatic}, local_request=True)
+                        "automatic": automatic}, local_request=True)
+    if automatic and read_json(engine.manager_home / "config/failed-updates.json", {}).get(plan.get("source_revision")):
+        return {"status": "deferred", "message": "此版本此前更新失败，后台跳过该修订。"}
     if plan["blockers"]:
         raise ManagerError("plan_blocked", "更新计划存在阻塞条件。", 409, plan["blockers"])
     return engine.submit(plan["id"])

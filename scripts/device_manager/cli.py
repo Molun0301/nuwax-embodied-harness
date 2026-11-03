@@ -114,7 +114,6 @@ def parser():
     update = sub.add_parser("update", help="检查、准备候选、等待空闲并更新重启，失败自动回退")
     update.add_argument("--check", action="store_true", help="只检查更新")
     update.add_argument("--local-build", action="store_true", help="云端编译中时选择立即本机编译")
-    update.add_argument("--retry", action="store_true", help="明确重试此前失败的修订")
     uninstall = sub.add_parser("uninstall", help="卸载程序，默认保留配置和数据")
     uninstall.add_argument("--purge", action="store_true", help="同时删除本安装的配置、数据与构建缓存")
     channel = sub.add_parser("channel", help="选择main或branch:分支名称")
@@ -202,7 +201,7 @@ def main(argv=None):
                 result = engine.status()
             else:
                 from .update_flow import begin_update
-                job = begin_update(engine, local_build=args.local_build, retry=args.retry)
+                job = begin_update(engine, local_build=args.local_build)
                 result = job if job.get("status") == "deferred" else wait_job(engine, job["id"])
         elif command == "uninstall":
             from .uninstall import uninstall

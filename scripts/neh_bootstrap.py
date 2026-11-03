@@ -20,7 +20,6 @@ import sys
 import tarfile
 import tempfile
 import time
-import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -175,6 +174,12 @@ def unpack_manager(archive, destination):
                 if member.size != item.get("size") or digest.hexdigest() != item.get("sha256"):
                     raise BootstrapError("管理包文件校验失败：" + member.name)
     return manifest
+
+
+def remove_incomplete_manager(target):
+    """未登记安装完成的管理版本目录由下一次安装重新展开。"""
+    if target.exists() and not (target / "installed.json").is_file():
+        shutil.rmtree(target)
 
 
 def switch_link(path, target):
@@ -374,7 +379,8 @@ def stop_local_manager(home):
         if (pid <= 1 or proc.stat().st_uid != os.getuid() or b"scripts.device_manager" not in arguments
                 or b"--home" not in arguments or os.fsencode(str(home)) not in arguments
                 or home / "manager/versions" not in root.parents):
-            raise BootstrapError("既有后台进程身份不匹配，拒绝发送停止信号")
+            path.unlink(missing_ok=True)
+            return
         os.kill(pid, signal.SIGTERM)
         stopped = {"command": [os.fsdecode(value) for value in arguments if value], "cwd": root}
         deadline = time.monotonic() + 15
@@ -640,21 +646,18 @@ def install(args):
             subprocess.run([str(python), "-m", "scripts.device_manager", "--help"], cwd=str(unpacked),
                            env=python_environment(), check=True, stdout=subprocess.DEVNULL, timeout=30)
             target = versions / (manifest["version"] + "-" + digest[:16])
-            if target.exists():
-                intact = all((target / item["path"]).is_file() and not (target / item["path"]).is_symlink()
-                             and digest_file(target / item["path"]) == item["sha256"] for item in manifest["files"])
-                if not intact:
-                    target = versions / (manifest["version"] + "-" + digest[:16] + "-" + uuid.uuid4().hex[:8])
-                    os.replace(str(unpacked), str(target))
-            else:
+            remove_incomplete_manager(target)
+            if not target.exists():
                 os.replace(str(unpacked), str(target))
             previous = (manager / "current").resolve() if (manager / "current").is_symlink() else None
             previous_state = {}
             if previous:
-                state = subprocess.run(cli_command(home, python, "status"), cwd=str(previous), text=True,
-                                       env=python_environment(), capture_output=True, check=True, timeout=30)
-                previous_state = json.loads(state.stdout)
-                if previous_state.get("active_job"):
+                previous_state = {"instance_id": (home / "config/instance-id").read_text().strip(),
+                                  "manager_version": json.loads((previous / "manager-manifest.json").read_text())["version"]}
+                active_path = home / "config/active-job.json"
+                active_job = json.loads(active_path.read_text()) if active_path.is_file() else None
+                if active_job and json.loads((home / "jobs" / (active_job["id"] + ".json")).read_text())["status"] not in (
+                        "succeeded", "failed", "cancelled", "interrupted"):
                     raise BootstrapError("当前有管理任务正在执行，请完成后再更新管理程序")
             args.new_install = previous is None
             service_command = ["systemctl", "--user"] if args.service == "user" else ["systemctl"]
@@ -682,18 +685,15 @@ def install(args):
                                     + " ".join(shlex.quote(part) for part in cli_command(home, python)) + ' "$@"\n', encoding="utf-8")
                 launcher.chmod(0o755)
                 os.replace(str(launcher), str(binary))
+                settings = cli_command(home, python, "settings")
                 if not args.catalog and not args.manager_package:
-                    settings = cli_command(home, python, "settings", "--source-repository", args.repository,
-                                           "--source-branch", args.branch)
+                    settings.extend(["--source-repository", args.repository, "--source-branch", args.branch])
                     if args.allow_local_source:
                         settings.append("--allow-local-source")
-                    subprocess.run(settings, cwd=str(target), env=python_environment(), check=True)
                 elif args.catalog and args.catalog.startswith(("https://", "http://")):
-                    subprocess.run(cli_command(home, python, "settings", "--feed-url", args.catalog, "--channel", args.channel),
-                                   cwd=str(target), env=python_environment(), check=True)
-                state = subprocess.run(cli_command(home, python, "status"), cwd=str(target), text=True,
-                                       env=python_environment(), capture_output=True, check=True, timeout=30)
-                instance_id = json.loads(state.stdout).get("instance_id")
+                    settings.extend(["--feed-url", args.catalog, "--channel", args.channel])
+                subprocess.run(settings, cwd=str(target), env=python_environment(), check=True)
+                instance_id = (home / "config/instance-id").read_text().strip()
                 if not instance_id:
                     raise BootstrapError("管理包缺少受管实例身份，无法核对实际启动程序")
                 # 监听记录与设置、启动器一起提交；启动失败时恢复旧值。

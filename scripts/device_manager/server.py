@@ -337,8 +337,8 @@ class Handler(BaseHTTPRequestHandler):
             result = engine.status()
         elif path == "update" and self.command == "POST":
             from .update_flow import begin_update
-            if set(body) - {"local_build", "retry"} or any(type(value) is not bool for value in body.values()):
-                raise ManagerError("invalid_update", "更新参数必须是local_build或retry布尔值。")
+            if set(body) - {"local_build"} or any(type(value) is not bool for value in body.values()):
+                raise ManagerError("invalid_update", "更新参数必须是local_build布尔值。")
             result = begin_update(engine, **body)
         elif path == "install-location" and self.command == "PUT":
             result = engine.save_install_location(body)

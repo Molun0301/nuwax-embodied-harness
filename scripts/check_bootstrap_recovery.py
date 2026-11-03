@@ -99,10 +99,6 @@ class BootstrapRecoveryChecks(unittest.TestCase):
     def run_command(self, command, **kwargs):
         if command[-1] == "--help":
             return SimpleNamespace(returncode=0)
-        if command[-1] == "status":
-            version = "fixture-previous" if Path(kwargs["cwd"]) == self.old else "fixture-candidate"
-            return SimpleNamespace(returncode=0, stdout=json.dumps({"active_job": None,
-                "instance_id": self.engine.instance_id, "manager_version": version}))
         if "settings" in command:
             values = {}
             for flag, name in (("--source-repository", "source_repository"), ("--source-branch", "source_branch"),
@@ -167,6 +163,46 @@ class BootstrapRecoveryChecks(unittest.TestCase):
             self.assert_restored_during_recovery()
             self.events.append("verify-previous")
         return bootstrap.manager_url(host, port)
+
+    def test_incomplete_manager_is_replaced_in_place_by_bootstrap(self):
+        self.fail_launch = False
+        target = self.home / "manager/versions" / ("fixture-candidate-" + bootstrap.digest_file(self.archive)[:16])
+        target.mkdir()
+        (target / "partial").touch()
+        self.assertEqual(bootstrap.install(self.args), 0)
+        self.assertEqual((self.home / "manager/current").resolve(), target)
+        self.assertFalse((target / "partial").exists())
+        self.assertTrue(json.loads((target / "installed.json").read_text())["complete"])
+
+    def test_incomplete_manager_is_replaced_in_place_by_self_update(self):
+        from scripts.device_manager.self_update import apply_manager
+        digest = bootstrap.digest_file(self.archive)
+        archive = self.home / "cache" / (digest + ".manager.tar.gz")
+        archive.write_bytes(self.archive.read_bytes())
+        target = self.home / "manager/versions" / ("fixture-candidate-" + digest[:16])
+        target.mkdir()
+        (target / "partial").touch()
+        job = {"id": "candidate", "log": [], "_plan": {"_manager": {
+            "version": "fixture-candidate", "sha256": digest, "size": archive.stat().st_size}}}
+        with patch("scripts.device_manager.self_update.run_command"):
+            result = apply_manager(self.engine, job)
+        self.assertEqual(result["manager_version"], "fixture-candidate")
+        self.assertEqual((self.home / "manager/current").resolve(), target)
+        self.assertFalse((target / "partial").exists())
+        self.assertTrue(json.loads((target / "installed.json").read_text())["complete"])
+
+    def test_completed_job_record_allows_bootstrap_without_status(self):
+        self.fail_launch = False
+        (self.home / "config/active-job.json").write_text('{"id":"finished"}')
+        (self.home / "jobs/finished.json").write_text('{"status":"succeeded"}')
+        self.assertEqual(bootstrap.install(self.args), 0)
+
+    def test_active_job_record_blocks_bootstrap_without_status(self):
+        (self.home / "config/active-job.json").write_text('{"id":"running"}')
+        (self.home / "jobs/running.json").write_text('{"status":"running"}')
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "当前有管理任务"):
+            bootstrap.install(self.args)
+        self.assert_restored()
 
     def test_candidate_failure_restores_files_then_old_background_process(self):
         previous = self.home / "manager/versions/older"
@@ -298,8 +334,11 @@ class BootstrapRecoveryChecks(unittest.TestCase):
         self.fail_launch = False
         self.assertEqual(bootstrap.install(self.args), 0)
         current = (self.home / "manager/current").resolve()
+        local_file = current / "scripts/device_manager/static/app.js"
+        local_file.write_text("// 已登记目录复用回归\n")
         self.assertEqual(bootstrap.install(self.args), 0)
         self.assertEqual((self.home / "manager/current").resolve(), current)
+        self.assertEqual(local_file.read_text(), "// 已登记目录复用回归\n")
         self.assertEqual((self.home / "manager/previous").resolve(), self.old)
 
     def test_selected_payload_alias_reports_payload_and_stable_manager_separately(self):
@@ -372,6 +411,17 @@ class ManagerListenerChecks(unittest.TestCase):
 
 
 class LocalProcessChecks(unittest.TestCase):
+    def test_stale_pid_of_external_live_process_is_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / "manager").mkdir()
+            pid_file = home / "manager/bootstrap.pid"
+            pid_file.write_text(str(os.getpid()))
+            with patch.object(bootstrap.os, "kill") as kill:
+                self.assertIsNone(bootstrap.stop_local_manager(home))
+            kill.assert_not_called()
+            self.assertFalse(pid_file.exists())
+
     def test_stop_returns_verified_command_and_directory_for_recovery(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "home"

@@ -128,12 +128,12 @@ class CleanupTests(unittest.TestCase):
         self.shell('cleanup_stale_geometry_runtime_processes\ncleanup_stale_person_follow_processes\ncleanup_stale_go2_video_streamer\ncleanup_external_geometry_processes')
         self.exited(*own); self.alive(*other)
 
-    def test_wrong_pid_file_does_not_stop_or_remove_record(self):
+    def test_wrong_pid_file_is_removed_without_stopping_external_process(self):
         other = self.spawn('nuwax-gateway-supervisor', owner='other')
         self.pidfile.write_text(str(other.pid))
-        self.shell('stop_existing_gateway', expected=1)
+        self.shell('stop_existing_gateway')
         self.alive(other)
-        self.assertEqual(self.pidfile.read_text(), str(other.pid))
+        self.assertFalse(self.pidfile.exists())
         self.shell('status_gateway', expected=3)
 
     def test_old_generation_with_and_without_install_home(self):
@@ -254,8 +254,9 @@ class CleanupTests(unittest.TestCase):
         self.shell('cleanup_stale_geometry_runtime_processes', environment=env)
         self.exited(own); self.alive(unknown)
         self.pidfile.write_text(str(unknown.pid))
-        result = self.shell('stop_existing_gateway', environment=env, expected=1)
-        self.assertIn('stop the legacy owner explicitly', result.stderr)
+        self.shell('stop_existing_gateway', environment=env)
+        self.alive(unknown)
+        self.assertFalse(self.pidfile.exists())
 
     def test_unmarked_legacy_supervisor_can_stop_then_retry(self):
         legacy = self.root / 'scripts/start_gateway.sh'
@@ -406,16 +407,20 @@ wait "$!" || true
         self.exited(new)
         self.assertFalse(self.pidfile.exists())
 
-    def test_cli_stop_and_restart_refuse_unmarked_pid(self):
+    def test_cli_stop_and_restart_discard_unmarked_pid(self):
         script = self.prepare_supervisor()
         unknown = self.spawn('nuwax-gateway-supervisor', owner=None)
         self.pidfile.write_text(str(unknown.pid))
-        for action in ('stop', 'restart'):
-            result = self.cli(script, action, expected=1)
-            self.assertIn('stop the legacy owner explicitly', result.stderr)
-            self.alive(unknown)
-            self.assertEqual(self.pidfile.read_text(), str(unknown.pid))
-        self.assertFalse((self.root / 'worker-ready').exists())
+        self.cli(script, 'stop')
+        self.alive(unknown)
+        self.assertFalse(self.pidfile.exists())
+        self.pidfile.write_text(str(unknown.pid))
+        supervisor = self.launch_supervisor(script, 'restart', 'stale-pid')
+        self.alive(unknown)
+        self.cli(script, 'stop')
+        self.exited(supervisor)
+        self.alive(unknown)
+        self.assertFalse(self.pidfile.exists())
 
 
 def main():

@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -333,7 +334,15 @@ class Runtime:
             return {"ready": True}
         try:
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with opener.open("http://127.0.0.1:{}/api/updates/readiness".format(self.port()), timeout=3) as response:
+            try:
+                response = opener.open("http://127.0.0.1:{}/api/updates/readiness".format(self.port()), timeout=3)
+            except urllib.error.URLError as exc:
+                if isinstance(exc.reason, ConnectionRefusedError):
+                    return {"ready": True}
+                raise
+            except ConnectionRefusedError:
+                return {"ready": True}
+            with response as response:
                 result = json.loads(response.read(65537))
             if isinstance(result, dict) and type(result.get("ready")) is bool:
                 return result
@@ -394,8 +403,6 @@ class Runtime:
     def stop(self, prefix):
         record = read_json(self.state_path, {})
         original = record.get("process") or self._supervisor()
-        if process_identity(self._pid()) and not self._supervisor():
-            raise ManagerError("owner_identity", "进程记录与当前拥有方身份不符，拒绝停止未知进程。", 409)
         if self._foreign_owners():
             raise ManagerError("foreign_owner", "其它安装仍有业务进程，拒绝原启动器的全局清理。", 409)
         # 兼容旧发布启动器把运行锁持有到退出的实现：先请求原supervisor执行自身关闭trap。

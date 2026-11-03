@@ -7,7 +7,7 @@ import sys
 import urllib.parse
 from pathlib import Path
 
-from scripts.neh_bootstrap import (MAX_MANAGER_BYTES, BootstrapError, require_install_layout,
+from scripts.neh_bootstrap import (MAX_MANAGER_BYTES, BootstrapError, remove_incomplete_manager, require_install_layout,
                                    unpack_manager, switch_link, version_tuple)
 
 from . import MANAGER_REVISION
@@ -69,7 +69,8 @@ def apply_manager(engine, job):
     if previous and previous.parent != versions:
         raise ManagerError("manager_state", "管理入口不属于当前安装根。", 409)
     target = versions / (identifier(metadata["version"]) + "-" + metadata["sha256"][:16])
-    if previous == target:
+    remove_incomplete_manager(target)
+    if previous == target and target.exists():
         raise ManagerError("already_current", "当前管理程序已是此完整版本。", 409)
     if not source:
         archive = engine.home / "cache" / (metadata["sha256"] + ".manager.tar.gz")

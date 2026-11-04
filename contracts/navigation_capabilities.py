@@ -25,18 +25,10 @@ class MotionLimits(_CalibrationModel):
     minimum_turning_radius_m: float = Field(ge=0, le=100)
     can_rotate_in_place: bool
 
-    def maximum_stopping_time_sec(self) -> float:
-        """按完整平移与转动上界计算最迟停稳时间，包含已标定反应延迟。"""
-        speed = math.hypot(max(self.max_forward_mps, self.max_reverse_mps), self.max_lateral_mps)
-        return self.reaction_time_sec + max(
-            speed / self.guaranteed_braking_mps2,
-            self.max_angular_rps / self.guaranteed_angular_braking_rps2,
-        )
+
 
     @model_validator(mode="after")
     def _check_motion_model(self):
-        if self.maximum_stopping_time_sec() > 30.0:
-            raise ValueError("保证停车时间超过平台30秒确认上限")
         if self.model != "omnidirectional" and self.max_lateral_mps != 0:
             raise ValueError("非全向底盘不能声明横移速度")
         if self.model == "ackermann" and (self.can_rotate_in_place or self.minimum_turning_radius_m <= 0):
@@ -80,14 +72,9 @@ class TerrainLimits(_CalibrationModel):
     support_height_uncertainty_m: float = Field(ge=0, le=1)
     max_observation_age_sec: float = Field(gt=0, le=30)
     stairs_supported: bool
-    required_locomotion_mode: Optional[str] = Field(default=None, min_length=1, max_length=128)
-    mode_transition_timeout_sec: float = Field(default=5.0, gt=0, le=30)
 
     @model_validator(mode="after")
     def _check_stairs(self):
-        mode = self.required_locomotion_mode
-        if mode is not None and (mode.strip() != mode or any(unicodedata.category(c) == "Cc" for c in mode)):
-            raise ValueError("步态模式标识不能带边缘空白或控制字符")
         if not self.stairs_supported and (self.max_step_up_m != 0 or self.max_step_down_m != 0):
             raise ValueError("未声明上下阶能力时阶高必须为零")
         return self

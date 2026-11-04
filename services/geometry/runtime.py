@@ -152,7 +152,6 @@ _SUPPORTED_MAPPING_BACKEND_KINDS: FrozenSet[str] = frozenset(
 )
 
 if TYPE_CHECKING:
-    from services.navigation.motion_guard_client import StopAllMotionConfirmation
     from core.event_bus import EventBus
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.runtime")
@@ -508,7 +507,6 @@ def _is_complete_exploration_terminal(
         _exploration_state_request_id(state) == str(request_id or "").strip()
         and status in terminal_statuses
         and metadata.get("exploration_terminal") is True
-        and metadata.get("parking_pending") is not True
         and not _exploration_state_child_task_id(state)
         and metadata.get("child_lease") is None
     )
@@ -7314,7 +7312,6 @@ class PlatformGeometryProviderBundle(
         request_id: Optional[str] = None,
         *,
         deadline_monotonic: Optional[float] = None,
-        global_stop_confirmation: Optional[StopAllMotionConfirmation] = None,
     ) -> bool:
         """转交指定目标或空身份的当前目标取消请求。"""
         _exploration_deadline_remaining(deadline_monotonic, "CancelNavigation")
@@ -7327,8 +7324,6 @@ class PlatformGeometryProviderBundle(
         options = {"request_id": exact_goal_id}
         if deadline_monotonic is not None:
             options["deadline_monotonic"] = deadline_monotonic
-        if global_stop_confirmation is not None:
-            options["global_stop_confirmation"] = global_stop_confirmation
         return backend.cancel_goal(**options)
 
     def cancel_navigation(
@@ -7336,7 +7331,6 @@ class PlatformGeometryProviderBundle(
         *,
         request_id: Optional[str] = None,
         deadline_monotonic: Optional[float] = None,
-        global_stop_confirmation: Optional[StopAllMotionConfirmation] = None,
     ) -> bool:
         """沿既有精确取消入口转交目标和可选普通全局停车回执。"""
 
@@ -7345,7 +7339,6 @@ class PlatformGeometryProviderBundle(
         return self.cancel_goal(
             request_id=str(request_id or "").strip() or None,
             deadline_monotonic=deadline_monotonic,
-            global_stop_confirmation=global_stop_confirmation,
         )
 
     def navigate(self, goal, timeout_sec: Optional[int] = None) -> str:
@@ -7856,8 +7849,6 @@ class PlatformGeometryProviderBundle(
         request_id: Optional[str] = None,
         *,
         deadline_monotonic: Optional[float] = None,
-        global_stop_confirmation: Optional[StopAllMotionConfirmation] = None,
-        expected_exploration_generation: Optional[int] = None,
     ) -> bool:
         _exploration_deadline_remaining(
             deadline_monotonic,
@@ -7909,10 +7900,6 @@ class PlatformGeometryProviderBundle(
                 "StopExploration",
             )
             stop_options = {}
-            if global_stop_confirmation is not None:
-                stop_options["global_stop_confirmation"] = global_stop_confirmation
-            if expected_exploration_generation is not None:
-                stop_options["expected_exploration_generation"] = expected_exploration_generation
             result = remote.stop_exploration(
                 **stop_options,
                 request_id=correlated_id,
@@ -8130,7 +8117,7 @@ class PlatformGeometryProviderBundle(
             ExplorationStatus.SUCCEEDED,
             ExplorationStatus.FAILED,
             ExplorationStatus.CANCELLED,
-        } and not child_task_id and state.get("child_lease") is None and not state.get("parking_pending", False)
+        } and not child_task_id and state.get("child_lease") is None
         metadata = {
             "provider": "geometry_runtime",
             "gRPC_facade": True,
@@ -8151,7 +8138,6 @@ class PlatformGeometryProviderBundle(
                 state.get("exploration_generation") or 0
             ),
             "child_lease": state.get("child_lease"),
-            "parking_pending": bool(state.get("parking_pending", False)),
             "mission_progress": state.get("mission_progress"),
         }
         timestamp = (

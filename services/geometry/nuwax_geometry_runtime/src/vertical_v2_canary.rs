@@ -239,7 +239,7 @@ impl crate::explore_runtime::ExploreNavigationSink for FailClosedNavSink {
     async fn cancel(
         &self,
         _lease: &crate::explore_runtime::ChildNavigationLease,
-    ) -> Result<crate::explore_runtime::ChildNavigationCancelOutcome, String> {
+    ) -> Result<(), String> {
         panic!("fail-closed case must not own child navigation")
     }
 }
@@ -1782,7 +1782,6 @@ fn explore_pre_start_allows_sink_clear(
         && snapshot.exploration_generation == 0
         && snapshot.child_task_id.is_empty()
         && snapshot.child_lease.is_none()
-        && !snapshot.parking_pending
 }
 
 fn explore_stop_allows_sink_clear(
@@ -1793,7 +1792,6 @@ fn explore_stop_allows_sink_clear(
         && stopped.status == crate::explore_runtime::STATUS_CANCELLED
         && stopped.child_task_id.is_empty()
         && stopped.child_lease.is_none()
-        && !stopped.parking_pending
 }
 
 async fn cleanup_v2_canary(
@@ -2313,7 +2311,7 @@ async fn ordinary_stop_real_python_guard_rust_client_preserves_deadline_and_succ
     let applied = client.submit_twist("b5-twist", command).await.unwrap();
     assert!(!applied.limited);
     let stop = client.stop_all_motion("b5-ordinary-stop", "本机协议组合停车").await.unwrap();
-    assert!(stop.lease_revoked && stop.zero.stationary_confirmed);
+    assert!(stop.lease_revoked && !stop.zero.zero_ack_id.is_empty());
     assert!(stop.zero.applied_monotonic_ns >= applied.applied_monotonic_ns);
     assert!(client.acquire_lease("b5-stale-stop-generation", &old_admission).await.is_err());
     let ready = client.get_readiness().await.unwrap();
@@ -2325,10 +2323,10 @@ async fn ordinary_stop_real_python_guard_rust_client_preserves_deadline_and_succ
     assert!(client.acquire_lease("b5-stale-boot", &admission).await.is_err());
     admission.boot_nonce = correct_nonce;
     client.acquire_lease("b5-successor", &admission).await.unwrap();
-    let zero = client.revoke_and_zero("b5-successor-zero").await.unwrap();
-    assert!(zero.stationary_confirmed);
+    let zero = client.revoke_and_zero("b5-successor-zero").await.unwrap().unwrap();
+    assert!(!zero.zero_ack_id.is_empty());
     let next = client.stop_all_motion("b5-next-ordinary-stop", "确认新实际归零票据").await.unwrap();
-    assert!(next.zero.stationary_confirmed);
+    assert!(!next.zero.zero_ack_id.is_empty());
     assert_ne!(next.zero.zero_ack_id, stop.zero.zero_ack_id);
     assert!(next.zero.applied_monotonic_ns > stop.zero.applied_monotonic_ns);
     drop(client);
@@ -2410,7 +2408,7 @@ async fn simple_planner_canary_in_child() {
         .expect("read production Motion Guard readiness");
     assert!(guard_readiness.ready);
     assert!(guard_readiness.actuator_configured);
-    assert!(guard_readiness.startup_zero_confirmed);
+    assert!(guard_readiness.actuator_configured);
     assert_eq!(guard_readiness.boot_nonce.len(), 16);
 
     let publisher = LcmTransport::new_real(&provider).expect("real LCM publisher context");
@@ -2700,7 +2698,6 @@ async fn simple_planner_canary_in_child() {
         nav: nav.clone(),
         exploration_producer_epoch: explore.producer_epoch_projection(),
         runtime_observation_generation: Arc::new(AtomicU64::new(1)),
-        orphan_cancellations: explore.orphan_cancellation_registry(),
     });
     let readiness_handle = bridge.facade_handle();
     explore.set_navigation_sink(bridge.clone());
@@ -4048,16 +4045,12 @@ fn acceptance_test_path(
         schema_version: schema::PATH_ENVELOPE_SCHEMA_VERSION,
         session_id: goal.session_id.clone(),
 
-
         goal_generation: goal.goal_generation,
-
 
         producer_runtime_generation: goal.producer_runtime_generation,
 
-
         planner_runtime_generation: 22,
         path_revision: revision,
-
 
         path: schema::Path {
             header: schema::Header {
@@ -4097,7 +4090,6 @@ fn acceptance_test_state(path: &schema::PathEnvelope, goal: &schema::GoalEnvelop
         ..schema::NavigationState::default()
     }
 }
-
 
 #[test]
 fn accepted_path_candidate_matches_later_canonical_revision() {
@@ -4358,9 +4350,6 @@ fn canary_readiness_handle(nav: &crate::nav_runtime::NavRuntimeState) -> Geometr
         nav: nav.clone(),
         exploration_producer_epoch: Arc::new(AtomicU64::new(1)),
         runtime_observation_generation: Arc::new(AtomicU64::new(1)),
-        orphan_cancellations: Arc::new(
-            crate::explore_runtime::OrphanCancellationRegistry::default(),
-        ),
     }
     .facade_handle()
 }
@@ -6028,10 +6017,6 @@ async fn cleanup_recognizes_real_pre_start_explore_as_settled() {
     assert!(!explore_pre_start_allows_sink_clear(&retained, false));
     retained.child_lease = None;
 
-    retained.parking_pending = true;
-    assert!(!explore_pre_start_allows_sink_clear(&retained, false));
-    retained.parking_pending = false;
-
     assert!(!explore_pre_start_allows_sink_clear(&retained, true));
 }
 
@@ -6043,7 +6028,7 @@ fn cleanup_requires_exact_explore_terminal_before_sink_clear() {
     };
     assert!(explore_stop_allows_sink_clear(&stopped, false));
 
-    stopped.status = crate::explore_runtime::STATUS_STOPPING;
+    stopped.status = crate::explore_runtime::STATUS_ACTIVE;
     assert!(!explore_stop_allows_sink_clear(&stopped, false));
     stopped.status = crate::explore_runtime::STATUS_FAILED;
     assert!(!explore_stop_allows_sink_clear(&stopped, false));

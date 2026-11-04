@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextvars import copy_context
 from copy import deepcopy
@@ -182,6 +182,7 @@ class TaskRecord:
     error_payload: Optional[MetadataDict] = None
     interrupt_cause: Optional[str] = None
     cancel_requested: bool = False
+    superseded: bool = False
     timeout_triggered: bool = False
     deferred_interrupt: bool = False
     interrupt_barrier_acknowledged: bool = False
@@ -241,6 +242,11 @@ class TaskExecutionContext:
         if deadline is None:
             return None
         return max(0.0, deadline - monotonic())
+
+    def is_superseded(self) -> bool:
+        """本任务是否已被新的运动任务接管。"""
+        with self.manager._lock:
+            return self.manager._records[self.task_id].superseded
 
     def ensure_active(self) -> None:
         """确保任务仍可继续执行。"""
@@ -438,12 +444,9 @@ class TaskManager:
                     if not motion_holders:
                         raise
                     for holder_task_id in motion_holders:
-                        self.cancel_task(holder_task_id, "新的运动任务请求接管运动资源。")
-                        with self._lock:
-                            holder_future = self._records[holder_task_id].future
-                        # 等待原任务走完既有停车收尾；其异常不替代新任务的执行结果。
-                        if holder_future is not None and not holder_future.done():
-                            wait((holder_future,))
+                        self.cancel_task(holder_task_id, "新的运动任务请求接管运动资源。", superseded=True)
+                        self._resource_lock_manager.release(holder_task_id)
+
 
             def correlated_runner():
                 request_context = metadata_payload.get("request_context") or {}
@@ -853,15 +856,18 @@ class TaskManager:
 
         return self._append_task_event(task_id, event_type, state=state, message=message, payload=payload)
 
-    def cancel_task(self, task_id: str, message: Optional[str] = None) -> bool:
+    def cancel_task(self, task_id: str, message: Optional[str] = None, *, superseded: bool = False) -> bool:
         """取消任务。"""
 
         timeout_due = False
         with self._lock:
             record = self._records[task_id]
+            if superseded:
+                record.superseded = True
+                record.deferred_interrupt = False
             if record.status.state in _TERMINAL_STATES or record.completion_committed:
                 return False
-            if record.interrupt_cause == "cancel":
+            if record.interrupt_cause == "cancel" and not superseded:
                 return True
             if record.interrupt_cause == "timeout":
                 return False

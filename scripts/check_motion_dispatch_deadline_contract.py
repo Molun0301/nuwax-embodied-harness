@@ -8,7 +8,7 @@ import unittest
 
 
 # 沿用 check_facility_operation_identity.py 的包隔离方式，只跳过聚合 __init__。
-# 核心、时限校验、幂等处理、停稳确认和 protobuf 均从实际仓库源码导入。
+# 核心、时限校验、幂等处理、执行反馈和 protobuf 均从实际仓库源码导入。
 ROOT = Path(os.environ.get("NEH_SOURCE_ROOT", Path.cwd())).resolve()
 if not (ROOT / "services/navigation/motion_safety_guard/core.py").is_file():
     raise RuntimeError("请从仓库根目录运行，或设置 NEH_SOURCE_ROOT")
@@ -21,7 +21,7 @@ for name in ("contracts", "core", "services", "services.navigation"):
 from services.navigation.motion_safety_guard.constants import API_VERSION, MAX_COMMAND_DEADLINE_NS
 from services.navigation.motion_safety_guard.core import MotionGuardCore
 from services.navigation.motion_safety_guard.peer_auth import PeerCredentials
-from services.navigation.motion_safety_guard.stop_confirmation import StopConfirmation
+from services.navigation.motion_safety_guard.execution_feedback import ExecutionFeedback
 from services.navigation.proto_gen import motion_guard_pb2 as pb
 
 
@@ -57,9 +57,6 @@ class RecordingActuator:
         raise AssertionError("本测试不允许模式切换")
 
 
-def forbidden_sleep(_seconds):
-    raise AssertionError("合成时钟测试不得等待真实时间")
-
 
 class MotionDispatchDeadlineContractTests(unittest.TestCase):
     def setUp(self):
@@ -70,14 +67,12 @@ class MotionDispatchDeadlineContractTests(unittest.TestCase):
             actuator=self.actuator,
             monotonic_ns=self.clock,
             lease_id_factory=lambda: 41,
-            stop_confirmation=StopConfirmation(
-                None,
+            execution_feedback=ExecutionFeedback(
                 monotonic=self.clock.seconds,
                 unix_ns=self.clock,
-                sleep=forbidden_sleep,
             ),
         )
-        self.core.initialize_zero_fence(prepare_mode=False)
+        self.core.initialize_zero_fence()
         request = pb.MotionGuardRequest(api_version=API_VERSION, request_id="request:acquire")
         request.acquire_lease.envelope.CopyFrom(pb.RequestEnvelope(
             tuple=pb.LeaseTuple(boot_nonce=self.core.boot_nonce),

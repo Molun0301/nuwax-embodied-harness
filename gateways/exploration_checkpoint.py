@@ -30,7 +30,7 @@ def request_pause(runtime, request_id):
 
 
 def save_after_stop(runtime, context, request):
-    """调用者已沿原停车屏障确认完成，仍持有原任务资源。"""
+    """探索停止后保存暂停检查点。"""
     spec = runtime.task_manager.get_task_spec(context.task_id)
     checkpoint_id = spec.metadata.get("pause_checkpoint_id")
     if not checkpoint_id:
@@ -56,7 +56,7 @@ def save_after_stop(runtime, context, request):
         exploration_request_id=request.request_id, task_id=context.task_id)
     bundle = result.get("finalized_map_asset")
     if result.get("map_asset_finalize_error") or bundle is None:
-        raise ValueError("探索已停稳，但本次完整地图保存未成功，不能发布检查点")
+        raise ValueError("探索已停止，但本次完整地图保存未成功，不能发布检查点")
     after = json.loads(runtime.platform_geometry_runtime.get_exploration_progress(request.request_id))
     version = before.get("schema_version")
     if type(version) is not int or version != 2 or type(after.get("schema_version")) is not int:

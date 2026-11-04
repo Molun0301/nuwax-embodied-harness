@@ -25,14 +25,13 @@ class BuildingExecutionPorts(Protocol):
     def ensure_active(self) -> None: ...
     def remaining_sec(self) -> float: ...
     def navigate(self, floor: FloorRecord, pose: FloorPose, goal_id: str, invariant: Callable[[], None] | None = None) -> Mapping[str, object]: ...
-    def stop_navigation(self, goal_id: str | None) -> Mapping[str, object]: ...
+    def stop_navigation(self, goal_id: str | None) -> None: ...
     def stop_mapping(self) -> None: ...
     def activate_and_localize(self, floor: FloorRecord, seed: FloorPose) -> bool: ...
     def start_floor_mapping(self, floor: FloorRecord, connection: FloorConnection, request_id: str) -> AssetIdentityV2: ...
     def dock_to_exit(self, connection: FloorConnection, floor: FloorRecord, invariant: Callable[[], None] | None = None) -> bool: ...
     def active_map_name(self) -> str | None: ...
     def progress(self, state: FloorExecutionState) -> None: ...
-    def interrupt_barrier(self, proof: Mapping[str, object], *, reconciled: bool) -> None: ...
 
 
 class BuildingExecutionJournal:
@@ -46,10 +45,7 @@ class BuildingExecutionJournal:
     @contextmanager
     def execution_guard(self) -> Iterator[None]:
         with self.lock_path.open("a+b") as file:
-            try:
-                fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                raise RuntimeError("已有跨层任务正在执行或收尾。") from error
+            fcntl.flock(file.fileno(), fcntl.LOCK_EX)
             try:
                 yield
             finally:
@@ -199,9 +195,8 @@ class BuildingNavigationService:
         if invariant:
             invariant()
         result = ports.navigate(floor, pose, state.navigation_goal_id, invariant)
-        if result.get("reached") is not True or result.get("zeroed") is not True:
-            raise RuntimeError("层内导航没有同时确认到达与停车。")
-        state.last_zero_proof = dict(result)
+        if result.get("reached") is not True:
+            raise RuntimeError("层内导航未到达。")
         state.navigation_goal_id = None
         self._save(state, ports)
 
@@ -218,9 +213,7 @@ class BuildingNavigationService:
             state.owner_task_id = getattr(ports, "task_id", None)
             if resume:
                 try:
-                    proof = ports.stop_navigation(state.navigation_goal_id)
-                    if proof.get("zeroed") is not True:
-                        raise RuntimeError("恢复前尚未确认机器人停车。")
+                    ports.stop_navigation(state.navigation_goal_id)
                     state.navigation_goal_id = None
                     state.attempt += 1
                     state.needs_reconciliation = False
@@ -257,14 +250,12 @@ class BuildingNavigationService:
                     self._save(state, ports, "accepted", "当前连接已完成，准备下一段。")
             except Exception:
                 try:
-                    proof = ports.stop_navigation(state.navigation_goal_id)
-                    state.last_zero_proof = dict(proof)
+                    ports.stop_navigation(state.navigation_goal_id)
                     safe_outside = state.stage in {"accepted", "navigating_waiting", "navigating_final"} and state.facility_session_id is None
-                    state.needs_reconciliation = not safe_outside or proof.get("zeroed") is not True
+                    state.needs_reconciliation = not safe_outside
                 finally:
                     state.terminal = True
                     self._save(state, ports, message="执行已中断；机器人停车结果与设施未决操作已保留。")
-                ports.interrupt_barrier(proof, reconciled=not state.needs_reconciliation)
                 raise
 
     def _run_connection(self, state: FloorExecutionState, connection: FloorConnection, source: FloorRecord, target: FloorRecord, ports: BuildingExecutionPorts) -> None:
@@ -296,8 +287,7 @@ class BuildingNavigationService:
                 self._navigate(state, source, connection.boarding_pose, ports,
                                lambda: self._require_docked(state, connection, source.floor_id, ports))
             elif stage == "stopping_inside":
-                if ports.stop_navigation(state.navigation_goal_id).get("zeroed") is not True:
-                    raise RuntimeError("进梯后尚未确认机器人停车。")
+                ports.stop_navigation(state.navigation_goal_id)
             elif stage == "suspending_mapping":
                 ports.stop_mapping()
             elif stage == "transporting":

@@ -32,8 +32,6 @@ pub mod motion_feedback;
 /// 同帧注册点云原始输入，不是融合地图。
 pub mod registered_frame;
 pub use registered_frame::{RegisteredFrame, RegisteredFrameDomain, RegisteredFrameIdentity};
-mod arrival_confirmation;
-use arrival_confirmation::{ArrivalConfirmation, ArrivalKind};
 mod command_dispatch;
 pub use command_dispatch::CommandDispatchBound;
 /// Explicit elapsed-time observer seam for bounded recovery qualifications.
@@ -186,7 +184,6 @@ pub struct PathExecutionIdentity {
 impl PathExecutionIdentity {
     /// Original Geometry-assigned goal identity.
     pub fn goal_key(&self) -> GoalKey { self.goal_key }
-
 
 }
 
@@ -389,9 +386,6 @@ pub enum RuntimeError {
     /// 守卫明确没有授予本目标租约；该目标可以失败并释放尚未执行的责任。
     #[error("LEASE_NOT_GRANTED: {0}")]
     LeaseNotGranted(String),
-    /// 停止命令已隔离租约，原操作尚未取得物理停稳确认，可继续查询。
-    #[error("navigation stop confirmation pending: {0}")]
-    StopUnconfirmed(String),
     /// Planner reported a terminal failure.
     #[error("planner failed: {0}")]
     Planner(String),
@@ -423,8 +417,6 @@ pub struct MotionPortError {
     pub message: String,
     /// Whether an ambiguous result may have created or retained a lease.
     pub lease_may_be_active: bool,
-    /// 已有精确停止票据，允许保留会话等待后续确认。
-    pub stop_unconfirmed: bool,
 }
 
 impl MotionPortError {
@@ -434,7 +426,6 @@ impl MotionPortError {
         Self {
             message: message.into(),
             lease_may_be_active: true,
-            stop_unconfirmed: false,
         }
     }
 
@@ -444,13 +435,9 @@ impl MotionPortError {
         Self {
             message: message.into(),
             lease_may_be_active: false,
-            stop_unconfirmed: false,
         }
     }
 
-    fn stop_unconfirmed(message: impl Into<String>) -> Self {
-        Self { message: message.into(), lease_may_be_active: true, stop_unconfirmed: true }
-    }
 }
 
 impl From<MotionGuardClientError> for MotionPortError {
@@ -557,12 +544,12 @@ pub trait NavMotionPort: Send + 'static {
         self.submit_twist(operation_id,twist).await.map(BoundedTwistOutcome::Applied)
     }
     /// Revoke the lease, apply zero, and return terminal fence proof.
-    async fn revoke_and_zero(&mut self, operation_id: &str) -> Result<FenceProof, MotionPortError>;
+    async fn revoke_and_zero(&mut self, operation_id: &str) -> Result<Option<FenceProof>, MotionPortError>;
     /// Preempt an ordinary exchange and fence over an independent priority path.
     async fn priority_revoke_and_zero(
         &mut self,
         operation_id: &str,
-    ) -> Result<FenceProof, MotionPortError> {
+    ) -> Result<Option<FenceProof>, MotionPortError> {
         self.revoke_and_zero(operation_id).await
     }
 }
@@ -647,13 +634,13 @@ impl NavMotionPort for MotionGuardClient {
         }
     }
 
-    async fn revoke_and_zero(&mut self, operation_id: &str) -> Result<FenceProof, MotionPortError> {
+    async fn revoke_and_zero(&mut self, operation_id: &str) -> Result<Option<FenceProof>, MotionPortError> {
         let confirmation = self.revoke_and_zero(operation_id).await?;
-        Ok(FenceProof {
+        Ok(confirmation.map(|confirmation| FenceProof {
             zero_ack_id: confirmation.zero_ack_id,
             applied_monotonic_ns: confirmation.applied_monotonic_ns,
             lease: FenceLeaseState::Idle,
-        })
+        }))
     }
 }
 
@@ -662,7 +649,6 @@ struct ProductionNavMotionPort {
     normal_config: ClientConfig,
     priority_config: ClientConfig,
     lease_tuple: Option<LeaseTuple>,
-    pending_fence: Option<(String, nuwax_motion_safety_guard::ZeroConfirmation)>,
 }
 
 impl ProductionNavMotionPort {
@@ -677,7 +663,6 @@ impl ProductionNavMotionPort {
             normal_config: config,
             priority_config,
             lease_tuple: None,
-            pending_fence: None,
         })
     }
 
@@ -699,18 +684,6 @@ impl ProductionNavMotionPort {
         }
     }
 
-    async fn confirm_pending_fence(&mut self) -> Result<FenceProof, MotionPortError> {
-        let (operation, zero) = self.pending_fence.as_ref().expect("已有停车票据").clone();
-        let confirmed = MotionGuardClient::confirm_stationary_after_fence(
-            self.normal_config.clone(), &operation, zero).await.map_err(|error| {
-                if matches!(&error, MotionGuardClientError::Remote { code, .. } if code == "MOTION_STOP_UNCONFIRMED") {
-                    MotionPortError::stop_unconfirmed(error.to_string())
-                } else { MotionPortError::new(error.to_string()) }
-            })?;
-        self.pending_fence = None;
-        self.lease_tuple = None;
-        Ok(Self::fence_proof(confirmed))
-    }
 }
 
 #[async_trait]
@@ -758,17 +731,14 @@ impl NavMotionPort for ProductionNavMotionPort {
             self.normal_client().await?,operation_id,twist,bound).await
     }
 
-    async fn revoke_and_zero(&mut self, operation_id: &str) -> Result<FenceProof, MotionPortError> {
+    async fn revoke_and_zero(&mut self, operation_id: &str) -> Result<Option<FenceProof>, MotionPortError> {
         self.priority_revoke_and_zero(operation_id).await
     }
 
     async fn priority_revoke_and_zero(
         &mut self,
         operation_id: &str,
-    ) -> Result<FenceProof, MotionPortError> {
-        if self.pending_fence.is_some() {
-            return self.confirm_pending_fence().await;
-        }
+    ) -> Result<Option<FenceProof>, MotionPortError> {
         // Closing the ordinary stream cancels a delayed write/read without
         // waiting for its 250 ms request timeout.
         self.normal.take();
@@ -800,9 +770,8 @@ impl NavMotionPort for ProductionNavMotionPort {
         })
         .await
         .map_err(|_| MotionPortError::new("priority fence exceeded 300 ms hard timeout"))??;
-        // 租约和指令通道已在原硬期限内隔离；此后等待同一归零标识的物理停稳。
-        self.pending_fence = Some((operation_id, fence));
-        self.confirm_pending_fence().await
+        self.lease_tuple = None;
+        Ok(fence.map(Self::fence_proof))
     }
 }
 
@@ -824,7 +793,6 @@ pub enum PlannerStep {
 #[derive(Debug, Clone, PartialEq)]
 struct LocalExecutionCommandIntent {
     identity: Arc<PathExecutionIdentity>,
-
 
     payload: LocalExecutionPayload,
     dispatch_bound: Option<CommandDispatchBound>,
@@ -1088,7 +1056,7 @@ pub struct NavScheduler<M, P> {
     current_path: Option<(ExecutionPath, Option<Vec<f64>>)>,
     current_execution_identity: Option<Arc<PathExecutionIdentity>>,
     path_wait_started_at: Option<Instant>,
-    arrival_confirmation: Option<ArrivalConfirmation>,
+    awaiting_session_path: bool,
     latest_pose: Option<PoseStamped>,
     pose_acquired_at: Option<Instant>,
     pose_receipt: Option<PlannerInputReceipt>,
@@ -1136,7 +1104,7 @@ where
             current_path: None,
             current_execution_identity: None,
             path_wait_started_at: None,
-            arrival_confirmation: None,
+            awaiting_session_path: false,
             latest_pose: None,
             pose_acquired_at: None,
             pose_receipt: None,
@@ -1220,7 +1188,6 @@ where
             // or a replacement path admitted while computation was outstanding.
             if deferred_control.as_ref().is_some_and(|wait|
                 self.status.phase != SchedulerPhase::Controlling
-                    || self.arrival_confirmation.is_some()
                     || !self.current_execution_identity.as_ref()
                         .is_some_and(|identity| Arc::ptr_eq(identity, &wait.identity))) {
                 deferred_control = None;
@@ -1232,8 +1199,10 @@ where
             }
 
             let renewal_due = self.motion.renewal_due_at().map_or(fallback_renewal, |due| due.min(fallback_renewal));
-            let controlling=matches!(self.status.phase,SchedulerPhase::AwaitingPath|SchedulerPhase::Controlling)
-                || self.arrival_confirmation.is_some();
+            let controlling = matches!(
+                self.status.phase,
+                SchedulerPhase::AwaitingPath | SchedulerPhase::Controlling
+            );
             tokio::select! {
                 biased;
 
@@ -1260,7 +1229,6 @@ where
                             if !self.lease_active && self.session.is_none() { continue; }
                             self.status.motion_sink_ready = false;
                             self.publish_status(&status_tx);
-                            if matches!(error, RuntimeError::StopUnconfirmed(_)) { continue; }
                             return Err(error);
                         }
                         Interruptible::Urgent(Some(command)) => {
@@ -1327,8 +1295,7 @@ where
                             || Instant::now() + self.config.tick_interval, |wait| wait.deadline);
                         let finish_wait = previous.as_ref().is_some_and(|wait| wait.finish_wait)
                             || Instant::now() >= deadline;
-                        if !finish_wait && self.status.phase == SchedulerPhase::Controlling
-                            && self.arrival_confirmation.is_none() {
+                        if !finish_wait && self.status.phase == SchedulerPhase::Controlling {
                             if let Some(identity) = self.current_execution_identity.clone() {
                                 let publication = {
                                     #[cfg(feature = "surface-recovery-qualification")]
@@ -1344,20 +1311,13 @@ where
                                 }
                             }
                         }
-                    // 重新取租约期间已经确认静止；与原StartSession一样收敛有界
-                    // acquire结果，不能丢弃未知grant后再拿旧停车票据确认新租约。
-                    let outcome = if self.arrival_resume_requested() {
-                        Interruptible::Completed(self.session_tick(&status_tx).await)
-                    } else {
-                        await_interruptible(urgent_open, &mut urgent_rx, self.session_tick(&status_tx)).await
-                    };
+                    let outcome = await_interruptible(urgent_open, &mut urgent_rx, self.session_tick(&status_tx)).await;
                     match outcome {
                         Interruptible::Completed(Ok(())) => {}
                         Interruptible::Completed(Err(error)) => {
                             if !self.lease_active && self.session.is_none() { continue; }
                             self.status.motion_sink_ready = false;
                             self.publish_status(&status_tx);
-                            if matches!(error, RuntimeError::StopUnconfirmed(_)) { continue; }
                             return Err(error);
                         }
                         Interruptible::Urgent(Some(command)) => {
@@ -1488,7 +1448,7 @@ where
             InputKind::CapturePlanningActual(identity, reply) => {
                 let matching = self.session.as_ref().is_some_and(|session|
                     session.execution_identity.session_id == identity.session_id && session.execution_identity.goal_key == identity.goal_key);
-                let context = if matching && self.arrival_confirmation.is_none()
+                let context = if matching
                     && self.stale_input_reason(Instant::now()).is_none() {
                     // Worker reads only its same-version publication, including the
                     // lifecycle-only Initial commit when there is no path yet.
@@ -1703,81 +1663,51 @@ where
         session: NavSession,
     ) -> Result<(), RuntimeError> {
         validate_session(&session)?;
-        if self.lease_active || self.session.is_some() {
-            return Err(RuntimeError::Busy(
-                "active session must be fenced before replacement".into(),
-            ));
-        }
-        let session_id = session.session_id.clone();
-        let motion_admission = session.motion_admission;
-        self.planner.stop();
-        self.planner.set_goal_log_context(&session.session_id);
-        self.planner.configure_execution_goal(&session.goal,session.options)?;
-        self.planner.configure_boundary(&session.boundary);
-        self.session = Some(session);
-        self.current_path_revision = 0;
-        self.current_route_kind = RouteKind::Complete;
-
-        self.current_path = None;
-        self.current_execution_identity = None;
-
-        self.path_wait_started_at = None;
-        self.status = SchedulerStatus {
-            phase: SchedulerPhase::Acquiring,
-            session_id: Some(session_id),
-            path_revision: 0,
-            applied_commands: 0,
-            last_applied_twist: None,
-            motion_sink_ready: true,
-
-            planner_inputs_fresh: self.status.planner_inputs_fresh,
-            pose_source_timestamp_ns: self.status.pose_source_timestamp_ns,
-            costmap_source_timestamp_ns: self.status.costmap_source_timestamp_ns,
-            pose_receipt_age_ms: self.status.pose_receipt_age_ms,
-            costmap_receipt_age_ms: self.status.costmap_receipt_age_ms,
-            last_terminal: None,
-            last_zero_ack_id: None,
-            last_fence_monotonic_ns: 0,
-            message: "acquiring NAV lease".into(),
-            local_path: Vec::new(),
-            surface_replan_feedback: None,
-        };
-        self.publish_status(status_tx);
-
+        let replacing = self.session.is_some();
         let operation_id = self.next_operation_id("acquire")?;
-        match self.motion.acquire(&operation_id, &motion_admission).await {
-            Ok(_) => {
-                self.lease_active = true;
-                self.planner.observe_measured_motion(self.motion.measured_motion());
-                self.status.motion_sink_ready = true;
-                self.path_wait_started_at = Some(Instant::now());
-                self.status.phase = SchedulerPhase::AwaitingPath;
-                self.status.message = "NAV lease active; awaiting versioned path".into();
-                self.publish_status(status_tx);
-                Ok(())
-            }
-            Err(error) if error.lease_may_be_active => {
-                self.lease_active = true;
-                let error = RuntimeError::Motion(error.message);
-                Err(self.fail_closed(status_tx, error).await)
+        match self.motion.acquire(&operation_id, &session.motion_admission).await {
+            Ok(_) => {}
+            Err(error) if !error.lease_may_be_active => {
+                return Err(RuntimeError::LeaseNotGranted(error.message));
             }
             Err(error) => {
-                self.planner.stop();
-                self.session = None;
-                self.current_path_revision = 0;
-
-                self.current_path = None;
-                self.current_execution_identity = None;
-
-                self.status.phase = SchedulerPhase::Failed;
-                self.status.session_id = None;
-                self.status.path_revision = 0;
-                let rejected = RuntimeError::LeaseNotGranted(error.message);
-                self.status.message = rejected.to_string();
-                self.publish_status(status_tx);
-                Err(rejected)
+                self.lease_active = true;
+                return Err(self.fail_closed(status_tx, RuntimeError::Motion(error.message)).await);
             }
         }
+        self.lease_active = true;
+        if !replacing {
+            self.planner.stop();
+            if let Err(error) = self.planner.configure_execution_goal(&session.goal, session.options) {
+                return Err(self.fail_closed(status_tx, error).await);
+            }
+            self.current_path = None;
+            self.current_execution_identity = None;
+            self.current_route_kind = RouteKind::Complete;
+        }
+        self.planner.set_goal_log_context(&session.session_id);
+        self.planner.configure_boundary(&session.boundary);
+        self.planner.observe_measured_motion(self.motion.measured_motion());
+        self.status.applied_commands = 0;
+        self.status.session_id = Some(session.session_id.clone());
+        self.session = Some(session);
+        self.awaiting_session_path = true;
+        self.current_path_revision = 0;
+        self.path_wait_started_at = Some(Instant::now());
+        self.status.phase = if self.current_execution_identity.is_some() {
+            SchedulerPhase::Controlling
+        } else {
+            SchedulerPhase::AwaitingPath
+        };
+        self.status.path_revision = 0;
+        self.status.motion_sink_ready = true;
+        self.status.last_terminal = None;
+        self.status.last_zero_ack_id = None;
+        self.status.last_fence_monotonic_ns = 0;
+        self.status.surface_replan_feedback = None;
+        self.status.message = "导航租约已接管，等待新路径".into();
+        self.publish_status(status_tx);
+        Ok(())
     }
 
     async fn submit_path(
@@ -1838,11 +1768,15 @@ where
 
             ..
         } = path;
+        if self.awaiting_session_path {
+            self.planner.configure_execution_goal(&session.goal, session.options)?;
+        }
         self.planner.replace_typed_execution_path(
             planner_path.clone(),
             path_yaws.clone(),
             session.goal.clone(),
         )?;
+        self.awaiting_session_path = false;
         self.current_path_revision = path_revision;
         self.current_route_kind = route_kind;
 
@@ -1945,8 +1879,12 @@ where
                     self.publish_status(status_tx);
                     return self.check_path_wait_timeout(status_tx).await;
                 }
-                self.path_wait_started_at = None;
-                Ok(())
+                if self.awaiting_session_path {
+                    self.check_path_wait_timeout(status_tx).await
+                } else {
+                    self.path_wait_started_at = None;
+                    Ok(())
+                }
             }
             LocalExecutionPayload::Pending(failures) => {
                 // 只是下一结果未出时，上一指令在原许可期内继续执行；
@@ -1990,6 +1928,10 @@ where
                 self.status.message = format!("路径失效，零速已执行，等待更新路径: {reason}");
                 self.publish_status(status_tx);
                 Ok(())
+            }
+            LocalExecutionPayload::Succeeded if self.awaiting_session_path => {
+                self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
+                self.check_path_wait_timeout(status_tx).await
             }
             LocalExecutionPayload::Succeeded => {
                 self.finish_terminal(status_tx, TerminalOutcome::Succeeded, SchedulerPhase::Idle)
@@ -2118,14 +2060,10 @@ where
         })
     }
 
-
     async fn session_tick(
         &mut self,
         status_tx: &watch::Sender<SchedulerStatus>,
     ) -> Result<(), RuntimeError> {
-        if self.arrival_confirmation.is_some() {
-            return self.confirm_stopped_arrival(status_tx).await;
-        }
         if self.status.phase == SchedulerPhase::Controlling {
             return self.control_tick(status_tx).await;
         }
@@ -2232,7 +2170,6 @@ where
             RuntimeError::PathMutation { .. } => "PathMutation",
             RuntimeError::Motion(_) => "Motion",
             RuntimeError::LeaseNotGranted(_) => "LeaseNotGranted",
-            RuntimeError::StopUnconfirmed(_) => "StopUnconfirmed",
             RuntimeError::Planner(_) => "Planner",
             RuntimeError::StaleInput(_) => "StaleInput",
             RuntimeError::MapSourceInvalidated(_) => "MapSourceInvalidated",
@@ -2257,7 +2194,6 @@ where
                 original
             }
             // finish_terminal 已将首因和停车失败一并发布，不能在返回时重复拼接。
-            Err(RuntimeError::StopUnconfirmed(reason)) => RuntimeError::StopUnconfirmed(reason),
             Err(fence_error) => RuntimeError::Motion(format!(
                 "{original}; explicit fence also failed: {fence_error}"
             )),
@@ -2278,7 +2214,7 @@ where
         let failure_reason = matches!(terminal, TerminalOutcome::PlannerFailed | TerminalOutcome::SafetyFailed)
             .then(|| self.status.message.clone());
         self.status.surface_replan_feedback = None;
-        let arrived_identity = self.current_execution_identity.take();
+        self.current_execution_identity = None;
 
         {
             #[cfg(feature = "surface-recovery-qualification")]
@@ -2289,7 +2225,7 @@ where
         if terminal == TerminalOutcome::Succeeded && had_lease {
             self.path_wait_started_at.get_or_insert_with(Instant::now);
         }
-        let mut verified_fence = self.arrival_confirmation.take().map(|pending| pending.proof);
+        let mut verified_fence = None;
         if had_lease {
             if self.status.phase != SchedulerPhase::Cancelling {
                 self.status.phase = SchedulerPhase::Fencing;
@@ -2302,7 +2238,7 @@ where
             }
             let operation_id = self.next_operation_id("fence")?;
             tracing::info!(session_id = ?self.status.session_id, %operation_id, ?terminal,
-                reason = ?failure_reason, "导航开始撤租归零并等待停稳");
+                reason = ?failure_reason, "导航撤租归零");
             #[cfg(feature = "surface-recovery-qualification")]
             self.qualification_snapshot("scheduler.fence.enter", self.status.pose_source_timestamp_ns, None, 0);
             let outcome = {
@@ -2321,33 +2257,16 @@ where
                         .map_or_else(|| error.message.clone(),
                         |cause| format!("{cause}; fence failed: {}", error.message));
                     self.fail_status(status_tx, &reason);
-                    if error.stop_unconfirmed {
-                        return Err(RuntimeError::StopUnconfirmed(reason));
-                    }
                     return Err(RuntimeError::Motion(reason));
                 }
             };
             self.lease_active = false;
             // 已验证的归零证明同步到规划器命令边界，下一目标从已确认零速命令接续。
             self.planner.observe_applied_command(Twist2::ZERO);
-            verified_fence = Some(proof);
+            verified_fence = proof;
         } else if terminal == TerminalOutcome::Shutdown && self.status.last_terminal.is_some() {
             self.status.phase = SchedulerPhase::Idle;
             self.status.message = "scheduler stopped; prior verified terminal retained".into();
-            self.publish_status(status_tx);
-            return Ok(());
-        }
-
-        if terminal == TerminalOutcome::Succeeded && had_lease {
-            self.arrival_confirmation = Some(ArrivalConfirmation {
-                proof: verified_fence.take().expect("已确认真实停车"),
-                confirmed_at: Instant::now(), resume_requested: false,
-                execution_identity: arrived_identity,
-                kind: ArrivalKind::Body,
-            });
-            self.status.phase = SchedulerPhase::Fencing;
-            self.status.last_applied_twist = Some(Twist2::ZERO);
-            self.status.message = "已确认停稳，等待停车后采样的有效位姿复核目标".into();
             self.publish_status(status_tx);
             return Ok(());
         }
@@ -2500,7 +2419,6 @@ impl NavSchedulerHandle {
     ) -> Result<(), RuntimeError> {
         self.send_input(InputKind::UpdateSourceOdometry(odometry, acquired_at, max_source_age)).await
     }
-
 
     /// Update the planner costmap with its real revision and source timestamp.
     pub async fn update_costmap(
@@ -2892,7 +2810,6 @@ fn validate_session(session: &NavSession) -> Result<(), RuntimeError> {
     session.goal.validate()
 }
 
-
 fn validate_map_pose(pose: &PoseStamped, field: &'static str) -> Result<(), RuntimeError> {
     if pose.frame_id != nuwax_nav_types_messages::NavFrameId::Map
         || ![
@@ -2912,7 +2829,6 @@ fn validate_map_pose(pose: &PoseStamped, field: &'static str) -> Result<(), Runt
     Ok(())
 }
 
-
 fn path_rejected(reason: impl Into<String>) -> RuntimeError {
     RuntimeError::PathRejected {
         reason: reason.into(),
@@ -2922,7 +2838,6 @@ fn path_rejected(reason: impl Into<String>) -> RuntimeError {
 #[cfg(test)]
 mod tests {
     include!("scheduler_delivery_gap_tests.rs");
-    include!("arrival_confirmation_tests.rs");
     include!("position_zero_runtime_tests.rs");
     include!("yaw_zero_contract_tests.rs");
     include!("recent_source_health_tests.rs");
@@ -3341,7 +3256,7 @@ mod tests {
     pub(crate) struct FakeMotionState {
         calls: Vec<String>,
         fail_twist: bool,
-        unconfirmed_fences: usize,
+        rejected_generation: Option<u64>,
         // Enabled only by phase-sensitive protocol tests; ordinary fixtures do not allocate it.
         twist_probe: Option<Vec<(usize, String, Twist2)>>,
     }
@@ -3361,6 +3276,9 @@ mod tests {
                 .expect("fake motion state")
                 .calls
                 .push(format!("acquire:{operation_id}"));
+            if self.0.lock().unwrap().rejected_generation == Some(admission.motion_stop_generation) {
+                return Err(MotionPortError::definite_no_lease("STALE_STOP_GENERATION"));
+            }
             Ok(LeaseProof {
                 lease_id: 11,
 
@@ -3399,18 +3317,14 @@ mod tests {
         async fn revoke_and_zero(
             &mut self,
             operation_id: &str,
-        ) -> Result<FenceProof, MotionPortError> {
+        ) -> Result<Option<FenceProof>, MotionPortError> {
             let mut state = self.0.lock().expect("fake motion state");
             state.calls.push(format!("fence:{operation_id}"));
-            if state.unconfirmed_fences > 0 {
-                state.unconfirmed_fences -= 1;
-                return Err(MotionPortError::stop_unconfirmed("等待实际停稳"));
-            }
-            Ok(FenceProof {
+            Ok(Some(FenceProof {
                 zero_ack_id: "zero-ack".into(),
                 applied_monotonic_ns: 100,
                 lease: FenceLeaseState::Idle,
-            })
+            }))
         }
     }
 
@@ -3507,6 +3421,79 @@ mod tests {
         )
         .expect("test scheduler");
         spawn_scheduler(scheduler)
+    }
+
+    async fn takeover_scheduler_fixture() -> (
+        NavScheduler<FakeMotion, FakePlanner>, watch::Sender<SchedulerStatus>, Arc<Mutex<FakeMotionState>>,
+    ) {
+        let motion = Arc::new(Mutex::new(FakeMotionState { twist_probe: Some(Vec::new()), ..Default::default() }));
+        let mut scheduler = NavScheduler::new(FakeMotion(motion.clone()), FakePlanner::commanding(), SchedulerConfig::default()).unwrap();
+        let (status, _) = watch::channel(scheduler.status.clone());
+        scheduler.observe_odometry(&status, map_pose(), None).unwrap();
+        scheduler.observe_costmap(&status, costmap_at(1), Instant::now()).unwrap();
+        scheduler.start_session(&status, session()).await.unwrap();
+        scheduler.submit_path(&status, path()).await.unwrap();
+        scheduler.control_tick(&status).await.unwrap();
+        (scheduler, status, motion)
+    }
+
+    #[tokio::test]
+    async fn replacement_lease_rejection_keeps_old_session_and_control() {
+        let (mut scheduler, status, motion) = takeover_scheduler_fixture().await;
+        let previous = scheduler.status.clone();
+        let identity = scheduler.current_execution_identity.clone().unwrap();
+        motion.lock().unwrap().rejected_generation = Some(2);
+        let mut next = session_for("goal-2"); next.motion_admission.motion_stop_generation = 2;
+        assert!(matches!(scheduler.start_session(&status, next).await, Err(RuntimeError::LeaseNotGranted(_))));
+        assert_eq!(scheduler.status, previous);
+        assert_eq!(scheduler.session.as_ref().unwrap().session_id, "goal-1");
+        assert!(Arc::ptr_eq(&identity, scheduler.current_execution_identity.as_ref().unwrap()));
+        scheduler.control_tick(&status).await.unwrap();
+        let motion = motion.lock().unwrap();
+        assert!(!motion.calls.iter().any(|call| call.starts_with("fence:")));
+        assert!(motion.twist_probe.as_ref().unwrap().iter().all(|(_, _, twist)| *twist != Twist2::ZERO));
+    }
+
+    #[tokio::test]
+    async fn replacement_grant_continues_old_path_until_new_path_arrives_without_zero() {
+        let (mut scheduler, status, motion) = takeover_scheduler_fixture().await;
+        let old_identity = scheduler.current_execution_identity.clone().unwrap();
+        let old_stops = scheduler.planner.state.lock().unwrap().stops;
+        let mut next = session_for("goal-2"); next.motion_admission.motion_stop_generation = 2;
+        scheduler.start_session(&status, next).await.unwrap();
+        assert_eq!(scheduler.status.session_id.as_deref(), Some("goal-2"));
+        assert_eq!(scheduler.status.phase, SchedulerPhase::Controlling);
+        assert!(scheduler.status.motion_sink_ready);
+        assert!(Arc::ptr_eq(&old_identity, scheduler.current_execution_identity.as_ref().unwrap()));
+        let began = scheduler.path_wait_started_at;
+        scheduler.control_tick(&status).await.unwrap();
+        assert_eq!(scheduler.path_wait_started_at, began);
+        assert_eq!(scheduler.planner.state.lock().unwrap().stops, old_stops);
+        let mut new_path = path_for("goal-2", 1);
+        new_path.path = ExecutionPath::Planar(Path2D::stamped(NavFrameId::Map, Timestamp::default(),
+            vec![Point2::new(1., 0.), Point2::new(3., 1.)]));
+        let expected = new_path.path.clone();
+        scheduler.submit_path(&status, new_path).await.unwrap();
+        assert_eq!(scheduler.current_execution_identity.as_ref().unwrap().session_id, "goal-2");
+        assert_eq!(scheduler.current_path.as_ref().unwrap().0, expected);
+        scheduler.control_tick(&status).await.unwrap();
+        let motion = motion.lock().unwrap();
+        assert!(!motion.calls.iter().any(|call| call.starts_with("fence:")));
+        assert!(motion.twist_probe.as_ref().unwrap().iter().all(|(_, _, twist)| *twist != Twist2::ZERO));
+    }
+
+    #[tokio::test]
+    async fn replacement_planning_failure_zeroes_once_and_reports_new_goal_failure() {
+        let (mut scheduler, status, motion) = takeover_scheduler_fixture().await;
+        scheduler.start_session(&status, session_for("goal-2")).await.unwrap();
+        let (reply, received) = oneshot::channel();
+        scheduler.handle_input(&status, InputCommand { kind: InputKind::PlanningDiagnostic(
+            "goal-2".into(), execution_identity_for("goal-2", 0).goal_key(), "新目标无可行路径".into(), true), reply }).await;
+        received.await.unwrap().unwrap();
+        assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::PlannerFailed));
+        assert!(scheduler.status.message.contains("新目标无可行路径"));
+        assert!(scheduler.session.is_none());
+        assert_eq!(motion.lock().unwrap().calls.iter().filter(|call| call.starts_with("fence:")).count(), 1);
     }
 
     #[tokio::test]
@@ -3641,7 +3628,6 @@ mod tests {
         PathExecutionIdentity {
         goal_key: nuwax_nav_types_messages::GoalKey { producer_runtime_generation: (1) as u64, goal_generation: (1) as u64 },
             session_id: session_id.into(),
-
 
             planner_runtime_generation: i64::from(path_revision != 0),
             path_revision,
@@ -3787,7 +3773,6 @@ mod tests {
         assert_eq!(handle.status().path_revision, 1);
         assert_eq!(motion.lock().unwrap().calls.iter().filter(|call| call.starts_with("acquire:")).count(), 1);
         planning.lock().unwrap().step = PlannerStep::Succeeded;
-        publish_pose_after_confirmed_stop(&handle, session().goal.as_body().unwrap().clone()).await;
         wait_for_terminal(&handle, TerminalOutcome::Succeeded).await;
         handle.shutdown().await.unwrap();
         task.await.unwrap().unwrap();
@@ -3835,7 +3820,7 @@ mod tests {
             let mut applied = 0;
             loop {
                 let request = tokio::time::timeout_at(fence_at, read_guard_request(&mut stream))
-                    .await.expect("必须在325毫秒看门狗前续租");
+                    .await.expect("必须在750毫秒看门狗前续租");
                 let (operation, mut response) = scripted_guard_response(&request);
                 operations.push(operation);
                 let now = Instant::now();
@@ -3844,7 +3829,7 @@ mod tests {
                         let Some(motion_guard_request::Operation::AcquireLease(request)) = request.operation.as_ref() else { unreachable!() };
                         let issued = request.envelope.as_ref().expect("信封").issued_monotonic_ns;
                         body.owner_deadline_monotonic_ns = issued + 750_000_000;
-                        fence_at = now + Duration::from_millis(325);
+                        fence_at = now + Duration::from_millis(750);
                         // 响应传输耗时必须扣入余量，不得重新从接收时刻计算许可。
                         tokio::time::sleep(Duration::from_millis(80)).await;
                     }
@@ -3852,7 +3837,7 @@ mod tests {
                         let Some(motion_guard_request::Operation::RenewLease(request)) = request.operation.as_ref() else { unreachable!() };
                         let issued = request.envelope.as_ref().expect("信封").issued_monotonic_ns;
                         body.owner_deadline_monotonic_ns = issued + 750_000_000;
-                        fence_at = now + Duration::from_millis(325);
+                        fence_at = now + Duration::from_millis(750);
                     }
                     motion_guard_response::Outcome::SubmitMotionCommand(_) => {
                         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -3884,7 +3869,6 @@ mod tests {
         }).await.expect("地图");
         handle.update_odometry(map_pose()).await.expect("位姿");
         handle.submit_path(path()).await.expect("路径");
-        publish_pose_after_confirmed_stop(&handle, session().goal.as_body().unwrap().clone()).await;
         let mut status = handle.subscribe_status();
         tokio::time::timeout(Duration::from_secs(3), async {
             while status.borrow().last_terminal != Some(TerminalOutcome::Succeeded) {
@@ -4178,7 +4162,6 @@ mod tests {
         let mut aligned = nuwax_nav_astar::helpers::make_pose_stamped("map", 2.0, 0.0, goal_yaw);
         aligned.stamp = Timestamp::from_unix(2, 0);
         handle.update_odometry(aligned.clone()).await.expect("朝向已到");
-        publish_pose_after_confirmed_stop(&handle, aligned).await;
         let terminal = wait_for_terminal(&handle, TerminalOutcome::Succeeded).await;
         assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
         assert!(terminal.last_zero_ack_id.is_some());
@@ -4358,7 +4341,6 @@ mod tests {
             .submit_path(path_for("goal-a", 1))
             .await
             .expect("path A");
-        publish_pose_after_confirmed_stop(&handle, session().goal.as_body().unwrap().clone()).await;
         wait_for_terminal(&handle, TerminalOutcome::Succeeded).await;
         assert!(!task.is_finished(), "natural terminal must not stop owner");
 
@@ -4378,7 +4360,6 @@ mod tests {
             .submit_path(path_for("goal-b", 1))
             .await
             .expect("path B");
-        publish_pose_after_confirmed_stop(&handle, session().goal.as_body().unwrap().clone()).await;
         wait_for_terminal(&handle, TerminalOutcome::Succeeded).await;
 
         let fence_count = motion_state
@@ -4444,7 +4425,6 @@ mod tests {
             .submit_path(path_for("retry-2", 1))
             .await
             .expect("retry path");
-        publish_pose_after_confirmed_stop(&handle, session().goal.as_body().unwrap().clone()).await;
         wait_for_terminal(&handle, TerminalOutcome::Succeeded).await;
         handle.shutdown().await.expect("shutdown");
         task.await.expect("join").expect("task result");
@@ -4726,33 +4706,6 @@ mod tests {
             assert_eq!(motion.lock().unwrap().calls.iter().filter(|call| call.starts_with("fence:")).count(), 1);
             assert!(scheduler.path_wait_started_at.is_none());
         }
-    }
-
-    #[tokio::test]
-    async fn scheduler_message_timeout_stop_failure_remains_primary() {
-        let motion = Arc::new(Mutex::new(FakeMotionState {
-            unconfirmed_fences: 1, ..Default::default()
-        }));
-        let mut scheduler = NavScheduler::new(FakeMotion(motion.clone()),
-            FakePlanner::commanding(), SchedulerConfig {
-                path_wait_timeout: Duration::from_secs(1), ..SchedulerConfig::default()
-            }).unwrap();
-        scheduler.session = Some(session());
-        scheduler.lease_active = true;
-        scheduler.path_wait_started_at = Some(Instant::now() - scheduler.config.path_wait_timeout);
-        scheduler.status.message = "BudgetExhausted: finite search budget".into();
-        let (sender, observed) = watch::channel(scheduler.status.clone());
-        let error = scheduler.check_path_wait_timeout(&sender).await.unwrap_err();
-        assert!(matches!(error, RuntimeError::StopUnconfirmed(ref reason) if reason == "等待实际停稳"));
-        let status = observed.borrow();
-        assert_eq!(status.message, "等待实际停稳");
-        assert_eq!(status.phase, SchedulerPhase::Failed);
-        assert_eq!(status.last_terminal, None);
-        assert!(status.last_zero_ack_id.is_none());
-        assert!(!status.motion_sink_ready);
-        assert!(scheduler.lease_active);
-        assert!(scheduler.session.is_some());
-        assert_eq!(motion.lock().unwrap().calls.iter().filter(|call| call.starts_with("fence:")).count(), 1);
     }
 
     #[tokio::test]
@@ -5245,7 +5198,6 @@ mod tests {
             .submit_path(path_for("after-timeout", 1))
             .await
             .expect("path after timeout");
-        publish_pose_after_confirmed_stop(&handle, session().goal.as_body().unwrap().clone()).await;
         wait_for_terminal(&handle, TerminalOutcome::Succeeded).await;
 
         handle.shutdown().await.expect("shutdown");
@@ -5279,7 +5231,6 @@ mod tests {
                 .submit_path(path_for(child, 1))
                 .await
                 .expect("frontier path accepted");
-            publish_pose_after_confirmed_stop(&handle, session().goal.as_body().unwrap().clone()).await;
         wait_for_terminal(&handle, TerminalOutcome::Succeeded).await;
             if index == 0 {
                 handle
@@ -5398,61 +5349,6 @@ mod tests {
             assert!(status.last_zero_ack_id.is_some());
             assert!(status.message.contains("目标前方没有可行支撑"),"首次终态丢失原因: {}",status.message);
         }
-    }
-
-    #[tokio::test]
-    async fn failed_motion_and_unconfirmed_fence_keep_both_causes() {
-        let motion = FakeMotion(Arc::new(Mutex::new(FakeMotionState {
-            unconfirmed_fences: 1, ..Default::default()
-        })));
-        let mut scheduler = NavScheduler::new(motion, FakePlanner::commanding(),
-            SchedulerConfig::default()).unwrap();
-        scheduler.session = Some(session());
-        scheduler.lease_active = true;
-        let (sender, observed) = watch::channel(scheduler.status.clone());
-        let error = scheduler.fail_closed(&sender,
-            RuntimeError::Motion("injected APPLIED timeout".into())).await;
-        assert!(matches!(error, RuntimeError::StopUnconfirmed(_)));
-        let snapshot = observed.borrow().clone();
-        assert!(snapshot.message.contains("injected APPLIED timeout"));
-        assert!(snapshot.message.contains("等待实际停稳"));
-        assert!(snapshot.last_terminal.is_none());
-        assert!(snapshot.last_zero_ack_id.is_none());
-        assert!(!snapshot.motion_sink_ready);
-        assert!(scheduler.lease_active && scheduler.session.is_some());
-        scheduler.cancel(&sender, "goal-1").await.unwrap();
-        assert_eq!(observed.borrow().last_terminal, Some(TerminalOutcome::Cancelled));
-    }
-
-    #[tokio::test]
-    async fn stop_unconfirmed_keeps_scheduler_and_goal_until_cancel_retries() {
-        let motion = Arc::new(Mutex::new(FakeMotionState {
-            unconfirmed_fences: 1, ..Default::default()
-        }));
-        let planner = FakePlanner::commanding();
-        planner.state.lock().unwrap().step = PlannerStep::Succeeded;
-        let (handle, task) = test_scheduler(FakeMotion(motion), planner);
-        wait_for_sink(&handle).await;
-        handle.update_costmap(costmap_at(1_000_000_000)).await.unwrap();
-        handle.update_odometry(map_pose()).await.unwrap();
-        let original = session();
-        handle.start_session(original.clone()).await.unwrap();
-        handle.submit_path(path()).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while handle.status().phase != SchedulerPhase::Failed {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        }).await.unwrap();
-        assert!(!task.is_finished(), "暂时缺少停稳确认不能结束调度器");
-        assert_eq!(handle.status().session_id.as_deref(), Some(original.session_id.as_str()));
-        assert!(handle.status().last_terminal.is_none());
-        handle.cancel(&original.session_id).await.unwrap();
-        assert_eq!(handle.status().last_terminal, Some(TerminalOutcome::Cancelled));
-        assert!(handle.status().motion_sink_ready);
-        handle.start_session(session()).await.unwrap();
-        handle.cancel(&original.session_id).await.unwrap();
-        handle.shutdown().await.unwrap();
-        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -5595,7 +5491,7 @@ mod tests {
         assert_eq!(applied.applied_monotonic_ns, 101);
         let fence = NavMotionPort::revoke_and_zero(&mut client, "nav:uds:fence")
             .await
-            .expect("correlated resource fence");
+            .expect("correlated resource fence").expect("当前租约归零回执");
         assert_eq!(fence.zero_ack_id, "zero-uds-1");
         assert_eq!(fence.applied_monotonic_ns, 102);
         assert_eq!(fence.lease, FenceLeaseState::Idle);

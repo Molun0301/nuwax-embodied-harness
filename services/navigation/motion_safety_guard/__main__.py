@@ -49,12 +49,7 @@ def run() -> None:
         core = MotionGuardCore(actuator=actuator)
         if not core.startup_configured:
             raise RuntimeError(core.startup_reason)
-        try:
-            core.initialize_zero_fence(cancelled=stop_event.is_set)
-        except ActuatorError as exc:
-            if stop_event.is_set() and exc.code == "LOCOMOTION_MODE_CANCELLED":
-                return
-            raise
+        core.initialize_zero_fence()
         if stop_event.is_set():
             return
         socket_gid = os.getegid()

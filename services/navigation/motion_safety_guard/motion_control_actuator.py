@@ -6,6 +6,7 @@ from core.config_values import runtime_value
 
 from importlib import import_module
 import math
+from typing import Union
 
 from contracts.geometry import Twist, Vector3
 from contracts.naming import validate_frame_id
@@ -44,8 +45,8 @@ class MotionControlActuator:
     def is_configured(self) -> bool:
         return self._control.is_available()
 
-    def apply_motion(self, request: pb.SubmitMotionCommandRequest) -> bool:
-        command = request.WhichOneof("command")
+    def apply_motion(self, request: Union[pb.SubmitMotionCommandRequest, pb.ApplyRobotSettingRequest]) -> bool:
+        command = request.WhichOneof("setting" if isinstance(request, pb.ApplyRobotSettingRequest) else "command")
         if command == "stop":
             self.zero()
             return False
@@ -89,11 +90,7 @@ class MotionControlActuator:
         if callable(closer):
             closer()
 
-    def set_locomotion_mode(self, mode_id: str) -> None:
-        setter = getattr(self._control, "set_locomotion_mode", None)
-        if not callable(setter):
-            raise ActuatorError("LOCOMOTION_MODE_UNSUPPORTED", "执行器没有标准步态切换接口。")
-        setter(mode_id)
+
 
     def zero(self) -> None:
         try:

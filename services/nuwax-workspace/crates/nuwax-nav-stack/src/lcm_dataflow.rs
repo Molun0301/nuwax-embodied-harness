@@ -291,7 +291,6 @@ pub(crate) enum NativePlannerReadyContract {
     Far(nuwax_nav_far_planner_bridge::worker::FarReadyContract),
 }
 
-
 #[cfg(all(
     feature = "native-runner",
     any(feature = "cmu-native", feature = "explore")
@@ -811,8 +810,6 @@ fn configured_frame(key: &str, fallback: &str) -> NavStackResult<String> {
     }
 }
 
-
-
 #[cfg(feature = "guard-runtime")]
 pub(crate) fn guarded_nav_scheduler_owner(
     node: &ModuleNode, body_reference_frame_id: Arc<str>) -> NavStackResult<Box<dyn InProcessNode>> {
@@ -856,7 +853,6 @@ fn guarded_goal_execution_identity(
         goal_key: nuwax_nav_types_messages::GoalKey { producer_runtime_generation: (goal.producer_runtime_generation) as u64, goal_generation: (goal.goal_generation) as u64 },
         session_id: goal.session_id.clone(),
 
-
         planner_runtime_generation: 0,
         path_revision: 0,
     }
@@ -869,7 +865,6 @@ fn guarded_path_execution_identity(
     nuwax_nav_runtime::PathExecutionIdentity {
         goal_key: nuwax_nav_types_messages::GoalKey { producer_runtime_generation: (path.producer_runtime_generation) as u64, goal_generation: (path.goal_generation) as u64 },
         session_id: path.session_id.clone(),
-
 
         planner_runtime_generation: path.planner_runtime_generation,
         path_revision: u64::try_from(path.path_revision).expect("validated positive path revision"),
@@ -1911,25 +1906,7 @@ where
                     }
                     PlannerGoalIngress::Buffered => {
                         last_cancel_terminal = None;
-                        if preempt_guarded_active_session(
-                            node,
-                            transport,
-                            scheduler,
-                            &mut telemetry,
-                            &mut active_session,
-                        )
-                        .await?
-                        {
-                            publish_guarded_nav_observation(
-                                transport,
-                                node,
-                                scheduler.status(),
-                                &telemetry,
-                                None,
-                                &mut publications,
-                            )
-                            .await?;
-                        }
+
                         continue;
                     }
                     PlannerGoalIngress::Rejected(reason) => {
@@ -2163,9 +2140,7 @@ where
                             continue;
                         }
                     };
-                    let (goal_to_fence, goal_was_pending) = if let Some(buffered_goal) =
-                        buffered_goal
-                    {
+                    let goal_to_fence = if let Some(buffered_goal) = buffered_goal {
                         if let Err(reason) = observe_guarded_cancel_generation(
                             &mut cancel_generation_watermark,
                             &buffered_goal,
@@ -2182,7 +2157,7 @@ where
                             .await?;
                             continue;
                         }
-                        (Some(*buffered_goal), true)
+                        Some(*buffered_goal)
                     } else if let Some(terminal) = last_cancel_terminal.as_ref() {
                         if let Err(reason) =
                             validate_cancel_goal_correlation(&cancel, &terminal.goal)
@@ -2240,121 +2215,23 @@ where
                             .await?;
                             continue;
                         }
-                        (Some(terminal.goal.clone()), false)
+                        Some(terminal.goal.clone())
                     } else {
-                        (None, false)
+                        None
                     };
                     if let Some(buffered_goal) = goal_to_fence {
-                        let buffered_telemetry = guarded_buffered_cancel_telemetry(
-                            &telemetry,
-                            &buffered_goal,
-                            cancel_generation,
-                        );
-                        let session_id = buffered_goal.session_id.clone();
-                        let session = nuwax_nav_runtime::NavSession {
-            boundary: buffered_goal.boundary_points.iter().map(|p|[p[0],p[1]]).collect(),
-            options: buffered_goal.options,
-                            goal: nuwax_nav_runtime::ExecutionGoal::Body(pose_from_schema(&buffered_goal.goal)?),
-                            session_id: session_id.clone(),
-                            execution_identity: guarded_goal_execution_identity(&buffered_goal),
-
-                            motion_admission: nuwax_nav_runtime::NavMotionAdmission {
-
-                                guard_boot_nonce: buffered_goal.motion_guard_boot_nonce,
-                                motion_stop_generation: u64::try_from(
-                                    buffered_goal.motion_stop_generation,
-                                )
-                                .expect("validated non-negative motion_stop_generation"),
-                            },
-                        };
-                        if let Err(error) = scheduler.start_session(session).await {
-                            if matches!(error, nuwax_nav_runtime::RuntimeError::LeaseNotGranted(_)) {
-                                publish_guarded_nav_state(
-                                    transport, &node.outputs[1], scheduler.status(),
-                                    &buffered_telemetry, None,
-                                ).await?;
-                                goal_buffer.clear_pending_goal_for(&buffered_goal);
-                                continue;
-                            }
-                            match runtime_input_error::<()>(
-                                "guarded_nav_scheduler.buffered_cancel_acquire",
-                                error,
-                            )? {
-                                OwnerInput::Rejected(reason) => {
-                                    publish_guarded_rejection(
-                                        transport,
-                                        &node.outputs[1],
-                                        scheduler.status(),
-                                        &buffered_telemetry,
-                                        "cancel",
-                                        &reason,
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                                OwnerInput::Accepted(()) => {
-                                    unreachable!("error classifier accepted an error")
-                                }
-                            }
-                        }
-                        if goal_was_pending && !goal_buffer.clear_pending_goal_for(&buffered_goal) {
-                            return Err(NavStackError::Internal(
-                                "guarded scheduler acquired a superseded buffered cancellation goal"
-                                    .into(),
-                            ));
-                        }
-                        active_session = Some(buffered_goal.clone());
-                        telemetry = buffered_telemetry;
-                        if let Err(error) = scheduler.cancel(&session_id).await {
-                            match runtime_input_error::<()>(
-                                "guarded_nav_scheduler.buffered_cancel",
-                                error,
-                            )? {
-                                OwnerInput::Rejected(reason) => {
-                                    publish_guarded_rejection(
-                                        transport,
-                                        &node.outputs[1],
-                                        scheduler.status(),
-                                        &telemetry,
-                                        "cancel",
-                                        &reason,
-                                    )
-                                    .await?;
-                                    let snapshot = scheduler.status();
-                                    clear_terminal_session_after_publication(
-                                        &mut active_session,
-                                        &mut telemetry,
-                                        &snapshot,
-                                    );
-                                    continue;
-                                }
-                                OwnerInput::Accepted(()) => {
-                                    unreachable!("error classifier accepted an error")
-                                }
-                            }
-                        }
-                        publish_bool(transport, &node.outputs[3], true).await?;
-                        let snapshot = scheduler.status();
-                        publish_guarded_nav_observation(
-                            transport,
-                            node,
-                            snapshot.clone(),
-                            &telemetry,
-                            None,
-                            &mut publications,
-                        )
-                        .await?;
+                        let buffered_telemetry = guarded_buffered_cancel_telemetry(&telemetry, &buffered_goal, cancel_generation);
+                        goal_buffer.clear_pending_goal_for(&buffered_goal);
+                        let mut snapshot = scheduler.status();
+                        snapshot.phase = nuwax_nav_runtime::SchedulerPhase::Idle;
+                        snapshot.last_terminal = Some(nuwax_nav_runtime::TerminalOutcome::Cancelled);
+                        snapshot.last_zero_ack_id = None;
+                        snapshot.last_fence_monotonic_ns = 0;
+                        snapshot.message = "缓冲目标已取消".into();
+                        publish_guarded_nav_state(transport, &node.outputs[1], snapshot.clone(), &buffered_telemetry, None).await?;
                         last_cancel_terminal = Some(GuardedCancelTerminal {
-                            goal: buffered_goal,
-                            cancel_generation,
-                            status: snapshot.clone(),
-                            telemetry: telemetry.clone(),
+                            goal: buffered_goal, cancel_generation, status: snapshot, telemetry: buffered_telemetry,
                         });
-                        clear_terminal_session_after_publication(
-                            &mut active_session,
-                            &mut telemetry,
-                            &snapshot,
-                        );
                     } else {
                         publish_guarded_rejection(
                             transport,
@@ -2369,55 +2246,6 @@ where
                 }
             }
         }
-    }
-}
-
-#[cfg(feature = "guard-runtime")]
-async fn fence_guarded_active_session(
-    scheduler: &nuwax_nav_runtime::NavSchedulerHandle,
-    telemetry: &mut GuardedNavTelemetry,
-    active_session: &mut Option<schema::GoalEnvelope>,
-) -> Result<(), nuwax_nav_runtime::RuntimeError> {
-    let Some(active_goal) = active_session.clone() else {
-        return Ok(());
-    };
-    let session_id = active_goal.session_id;
-    let snapshot = scheduler.status();
-    if scheduler_session_is_active(&snapshot, &session_id) {
-        scheduler.cancel(&session_id).await?;
-    }
-    *active_session = None;
-    clear_guarded_session_telemetry(telemetry);
-    Ok(())
-}
-
-#[cfg(feature = "guard-runtime")]
-async fn preempt_guarded_active_session(
-    node: &ModuleNode,
-    transport: &LcmTransport,
-    scheduler: &nuwax_nav_runtime::NavSchedulerHandle,
-    telemetry: &mut GuardedNavTelemetry,
-    active_session: &mut Option<schema::GoalEnvelope>,
-) -> NavStackResult<bool> {
-    match fence_guarded_active_session(scheduler, telemetry, active_session).await {
-        Ok(()) => Ok(true),
-        Err(error) => match runtime_input_error::<()>("guarded_nav_scheduler.preempt", error)? {
-            OwnerInput::Rejected(reason) => {
-                publish_guarded_rejection(
-                    transport,
-                    &node.outputs[1],
-                    scheduler.status(),
-                    telemetry,
-                    "preempt",
-                    &reason,
-                )
-                .await?;
-                let snapshot = scheduler.status();
-                clear_terminal_session_after_publication(active_session, telemetry, &snapshot);
-                Ok(active_session.is_none())
-            }
-            OwnerInput::Accepted(()) => unreachable!("error classifier accepted an error"),
-        },
     }
 }
 
@@ -2542,12 +2370,6 @@ async fn activate_guarded_goal(
         return Ok(GuardedGoalActivation::Deferred);
     }
 
-    if !preempt_guarded_active_session(node, transport, scheduler, telemetry, active_session)
-        .await?
-    {
-        return Ok(GuardedGoalActivation::Deferred);
-    }
-
     let mut candidate_telemetry = telemetry.clone();
     candidate_telemetry.goal = [
         goal.pose.position.x,
@@ -2584,9 +2406,11 @@ async fn activate_guarded_goal(
     {
         if matches!(error, nuwax_nav_runtime::RuntimeError::LeaseNotGranted(_)) {
             // 明确未授予的拒绝属于本次候选目标，不能发布旧目标或空闲心跳。
-            publish_guarded_nav_state(
-                transport, &node.outputs[1], scheduler.status(), &candidate_telemetry, None,
-            ).await?;
+            let mut rejected = scheduler.status();
+            rejected.phase = nuwax_nav_runtime::SchedulerPhase::Failed;
+            rejected.last_terminal = None;
+            rejected.message = error.to_string();
+            publish_guarded_nav_state(transport, &node.outputs[1], rejected, &candidate_telemetry, None).await?;
             return Ok(GuardedGoalActivation::LeaseRejected);
         }
         match runtime_input_error::<()>("guarded_nav_scheduler.goal", error)? {
@@ -2607,6 +2431,7 @@ async fn activate_guarded_goal(
     }
     *telemetry = candidate_telemetry;
     *active_session = Some(goal_envelope);
+    publish_guarded_nav_state(transport, &node.outputs[1], scheduler.status(), telemetry, None).await?;
     Ok(GuardedGoalActivation::Activated)
 }
 
@@ -2662,24 +2487,6 @@ fn clear_terminal_session_after_publication(
     }
     clear_guarded_session_telemetry(telemetry);
     true
-}
-
-#[cfg(feature = "guard-runtime")]
-fn scheduler_session_is_active(
-    status: &nuwax_nav_runtime::SchedulerStatus,
-    session_id: &str,
-) -> bool {
-    use nuwax_nav_runtime::SchedulerPhase;
-
-    status.session_id.as_deref() == Some(session_id)
-        && matches!(
-            status.phase,
-            SchedulerPhase::Acquiring
-                | SchedulerPhase::AwaitingPath
-                | SchedulerPhase::Controlling
-                | SchedulerPhase::Cancelling
-                | SchedulerPhase::Fencing
-        )
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -4847,7 +4654,6 @@ fn native_path_respects_goal(path: &Path2D, goal: &schema::GoalEnvelope) -> bool
             })
 }
 
-
 #[cfg(any(feature = "cmu-native", feature = "explore"))]
 fn admit_native_adapter_goal(
     latest_goal: &mut Option<schema::GoalEnvelope>,
@@ -6706,12 +6512,9 @@ fn build_versioned_path_from_schema(
         schema_version: schema::PATH_ENVELOPE_SCHEMA_VERSION,
         session_id: goal.session_id.clone(),
 
-
         goal_generation: goal.goal_generation,
 
-
         producer_runtime_generation: goal.producer_runtime_generation,
-
 
         planner_runtime_generation: planner_runtime_generation,
         path_revision: path_revision,
@@ -8177,7 +7980,6 @@ mod guarded_tests {
         ));
     }
 
-
     fn active_goal(session_id: &str) -> schema::GoalEnvelope {
         schema::GoalEnvelope {
             body_reference_frame_id: "base_link".into(),
@@ -8231,12 +8033,9 @@ mod guarded_tests {
             schema_version: schema::PATH_ENVELOPE_SCHEMA_VERSION,
             session_id: goal.session_id.clone(),
 
-
             goal_generation: goal.goal_generation,
 
-
             producer_runtime_generation: goal.producer_runtime_generation,
-
 
             planner_runtime_generation: saturating_i64(runtime_generation()),
             path_revision: 1,
@@ -8990,28 +8789,6 @@ mod guarded_tests {
                 .expect("guarded goal was not dequeued")
                 .expect("guarded goal dequeue receipt was dropped");
             assert!(!self.loop_task.is_finished(), "guarded loop exited early");
-        }
-
-        async fn publish_stopped_goal_pose(&self, goal: &schema::GoalEnvelope) {
-            let mut status = self.scheduler.subscribe_status();
-            let source = tokio::time::timeout(Duration::from_secs(1), async {
-                loop {
-                    let snapshot = status.borrow().clone();
-                    assert_ne!(snapshot.last_terminal, Some(TerminalOutcome::Succeeded),
-                        "停车后观察尚未送达，不能提前成功");
-                    if snapshot.phase == SchedulerPhase::Fencing && snapshot.message.starts_with("已确认停稳") {
-                        assert!(snapshot.last_zero_ack_id.is_none());
-                        break snapshot.pose_source_timestamp_ns + 1;
-                    }
-                    status.changed().await.unwrap();
-                }
-            }).await.expect("真实停车证明后的复核阶段");
-            // 夹具继续通过同一位姿数据面发送停车后的目标位置，不直接改终态。
-            let mut pose = goal.goal.clone();
-            pose.header.stamp_sec = (source / 1_000_000_000) as i32;
-            pose.header.stamp_nsec = (source % 1_000_000_000) as i32;
-            send_guarded_test_body(&self.poses, "geometry_msgs.PoseStamped",
-                schema::encode_pose_stamped_body(&pose).unwrap());
         }
 
         fn send_pose(&self, stamp_sec: i32) {
@@ -9906,7 +9683,6 @@ mod guarded_tests {
         harness
             .planner_succeeds
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        harness.publish_stopped_goal_pose(goal_a).await;
         tokio::time::timeout(Duration::from_secs(1), async {
             while harness.scheduler.status().session_id.is_some()
                 || harness.scheduler.status().last_zero_ack_id.is_none()
@@ -10086,7 +9862,6 @@ mod guarded_tests {
         harness
             .planner_succeeds
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        harness.publish_stopped_goal_pose(&goal).await;
         tokio::time::timeout(Duration::from_secs(1), async {
             while harness.scheduler.status().last_terminal != Some(TerminalOutcome::Succeeded) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -12290,7 +12065,6 @@ mod native_adapter_tests {
         assert!(!far_ready_contract_matches(&expected, 12, &state));
     }
 
-
     #[cfg(any(feature = "cmu-native", feature = "explore"))]
     #[test]
     fn duplicate_goal_preserves_far_join_and_consumed_state() {
@@ -12711,7 +12485,6 @@ mod native_adapter_tests {
             .expect("join FAR adapter")
             .expect("FAR adapter shutdown");
     }
-
 
     #[test]
     fn restart_generation_is_cleared_before_a_new_ready_generation() {

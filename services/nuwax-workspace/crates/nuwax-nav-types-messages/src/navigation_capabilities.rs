@@ -131,13 +131,8 @@ pub struct TerrainLimits {
     pub max_observation_age_sec: f64,
     /// 是否有已确认的上下阶执行能力。
     pub stairs_supported: bool,
-    /// 可选的实际步态模式；不配置时不推断厂商模式。
-    pub required_locomotion_mode: Option<String>,
-    /// 守卫启动时模式切换的反馈等待上限。
-    #[serde(default = "default_mode_transition_timeout")]
-    pub mode_transition_timeout_sec: f64,
+
 }
-fn default_mode_transition_timeout()->f64 {5.0}
 /// 同一标定版本，供两条生产链共同捕获。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -171,7 +166,7 @@ impl MotionLimits {
     }
     /// 拒绝非有限、不成立或超出支持范围的标定。
     pub fn validate(&self) -> Result<(), String> {
-        if self.maximum_stopping_time_sec() > 30.0 || !range(self.max_forward_mps, 0.0, 5.0, true)
+        if !range(self.max_forward_mps, 0.0, 5.0, true)
             || !range(self.max_reverse_mps, 0.0, 5.0, false)
             || !range(self.max_lateral_mps, 0.0, 5.0, false)
             || !range(self.max_angular_rps, 0.0, 4.0 * std::f64::consts::PI, true)
@@ -190,11 +185,7 @@ impl MotionLimits {
         }
         Ok(())
     }
-    /// 全部平移/转动速度上界对应的最迟停稳时间，包含反应延迟。
-    pub fn maximum_stopping_time_sec(&self)->f64 {
-        self.reaction_time_sec + (self.max_forward_mps.max(self.max_reverse_mps).hypot(self.max_lateral_mps)/self.guaranteed_braking_mps2)
-            .max(self.max_angular_rps/self.guaranteed_angular_braking_rps2)
-    }
+
     /// 包含响应延迟的保守平移停车距离。
     pub fn stopping_distance(&self, speed: f64) -> f64 {
         speed.abs() * self.reaction_time_sec + speed.powi(2) / (2.0 * self.guaranteed_braking_mps2)
@@ -239,9 +230,7 @@ impl ObservationModel {
 impl TerrainLimits {
     /// 校验地形限制，不自动推断上下阶支持。
     pub fn validate(&self) -> Result<(), String> {
-        if self.required_locomotion_mode.as_ref().is_some_and(|mode|mode.is_empty() || mode.chars().count()>128 || mode.trim()!=mode || mode.chars().any(char::is_control))
-            || !range(self.mode_transition_timeout_sec,0.0,30.0,true)
-            || !range(self.max_step_up_m, 0.0, 1.0, false)
+        if !range(self.max_step_up_m, 0.0, 1.0, false)
             || !range(self.max_step_down_m, 0.0, 1.0, false)
             || !range(self.min_tread_depth_m, 0.0, 5.0, true)
             || !range(self.max_slope_deg, 0.0, 90.0, false)

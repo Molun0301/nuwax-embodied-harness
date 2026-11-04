@@ -167,11 +167,8 @@ message ModeSwitchCommand {
 message ZeroAck {
   string zero_ack_id = 1;
   uint64 applied_monotonic_ns = 2;
-  // 命令被接纳与实际停稳分别记录；旧执行端缺失字段时保持未知。
-  bool stationary_confirmed = 3;
-  string confirmation_kind = 4;
-  uint64 feedback_source_timestamp_ns = 5;
-  uint64 stationary_deadline_monotonic_ns = 6;
+  reserved 3, 4, 5, 6;
+  reserved "stationary_confirmed", "confirmation_kind", "feedback_source_timestamp_ns", "stationary_deadline_monotonic_ns";
 }
 
 message AcquireLeaseRequest {
@@ -183,13 +180,14 @@ message RenewLeaseRequest {
 }
 
 message SubmitMotionCommandRequest {
+  reserved 13, 14;
+  reserved "speed_level", "obstacle_policy";
   RequestEnvelope envelope = 1;
   oneof command {
     TwistCommand twist = 10;
     StopCommand stop = 11;
     BodyPoseCommand body_pose = 12;
-    SpeedLevelCommand speed_level = 13;
-    ObstaclePolicyCommand obstacle_policy = 14;
+
   }
 }
 
@@ -212,7 +210,29 @@ message StopAllMotionRequest {
   reserved "mode", "recovery_correlation", "recovery_fence_token";
   GlobalStopEnvelope envelope = 1;
   string reason = 2;
+  optional uint64 expected_motion_stop_generation = 6;
+}
 
+message AdvanceMotionGenerationRequest {
+  GuardSource source = 1;
+}
+
+message AdvanceMotionGenerationResponse {
+  GuardResult result = 1;
+  bytes boot_nonce = 2;
+  uint64 motion_stop_generation = 3;
+}
+
+message ApplyRobotSettingRequest {
+  GuardSource source = 1;
+  oneof setting {
+    SpeedLevelCommand speed_level = 10;
+    ObstaclePolicyCommand obstacle_policy = 11;
+  }
+}
+
+message ApplyRobotSettingResponse {
+  GuardResult result = 1;
 }
 
 message GetReadinessRequest {
@@ -301,7 +321,8 @@ message GetReadinessResponse {
   bool actuator_configured = 3;
   string reason = 5;
   bytes boot_nonce = 7;
-  bool startup_zero_confirmed = 8;
+  reserved 8;
+  reserved "startup_zero_confirmed";
   uint64 motion_stop_generation = 9;
   MotionCommandLimits command_limits = 11;
 
@@ -344,6 +365,8 @@ message MotionGuardRequest {
     GetOperationResultRequest get_operation_result = 20;
     StopAllMotionRequest stop_all_motion = 21;
     GetGuardStateRequest get_guard_state = 22;
+    AdvanceMotionGenerationRequest advance_motion_generation = 23;
+    ApplyRobotSettingRequest apply_robot_setting = 24;
   }
   reserved 16, 18, 19;
   reserved "latch_safety_stop", "get_safety_state", "reset_safe_stop";
@@ -378,6 +401,8 @@ message MotionGuardResponse {
     GetOperationResultResponse get_operation_result = 20;
     StopAllMotionResponse stop_all_motion = 21;
     GetGuardStateResponse get_guard_state = 22;
+    AdvanceMotionGenerationResponse advance_motion_generation = 23;
+    ApplyRobotSettingResponse apply_robot_setting = 24;
   }
   reserved 16, 18, 19;
   reserved "latch_safety_stop", "get_safety_state", "reset_safe_stop";

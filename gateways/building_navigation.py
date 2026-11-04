@@ -25,7 +25,6 @@ class GatewayBuildingPorts:
         self.admission = admission
         self.requested_by = requested_by
         self.last_goal_id = None
-        self.last_zero = None
         self.state = None
         self._last_pose_save = 0.0
 
@@ -92,7 +91,6 @@ class GatewayBuildingPorts:
             time.sleep(min(0.05,self.remaining_sec()))
         self._remember_pose(floor)
         self.last_goal_id=goal_id
-        self.last_zero=None
         initial=self.runtime.navigation_service.set_goal(goal,deadline_monotonic=deadline)
         generation=self.runtime._capture_task_generation_snapshot(navigation_context=initial)
         self.runtime._record_task_generation_snapshot(self.context,generation)
@@ -105,42 +103,20 @@ class GatewayBuildingPorts:
             current=self.runtime._capture_task_generation_snapshot(navigation_context=navigation)
             changes=self.runtime._task_generation_rollovers(generation,current)
             if changes:
-                self.runtime._handle_navigation_generation_rollover(self.context,goal_id=goal_id,expected=generation,current=current,rollovers=changes,deadline_monotonic=time.monotonic()+8.0)
+                self.runtime._handle_navigation_generation_rollover(self.context,goal_id=goal_id,expected=generation,current=current,rollovers=changes)
             proof=self.runtime._navigation_terminal_result(navigation,goal_id=goal_id,allowed_statuses={NavigationStatus.SUCCEEDED.value})
             if proof:
-                self.last_zero={"zeroed":True,**proof}
-                return {"reached":True,**self.last_zero}
+                return {"reached": True, **proof}
             if navigation.navigation_state.status in {NavigationStatus.FAILED,NavigationStatus.CANCELLED}:
                 raise GatewayError(navigation.navigation_state.message or "楼层连接导航失败。",error_code="floor_navigation_failed")
             self.context.update(stage="floor_"+self.state.stage,message=navigation.navigation_state.message or "层内导航执行中。",
                                 payload={"goal_id":goal_id,"floor_id":floor.floor_id,"remaining_distance_m":navigation.navigation_state.remaining_distance_m})
             time.sleep(min(0.1,self.remaining_sec()))
 
-    def stop_navigation(self,goal_id):
-        exact=goal_id or self.last_goal_id
-        if self.last_zero is not None and (not exact or self.last_zero.get("goal_id")==exact):
-            return self.last_zero
-        if exact:
-            try:
-                navigation=self.runtime.navigation_service.refresh_navigation(deadline_monotonic=time.monotonic()+8.0)
-                proof=self.runtime._navigation_terminal_result(navigation,goal_id=exact,allowed_statuses={"succeeded","failed","cancelled"})
-                if not proof:
-                    navigation=self.runtime._cancel_navigation_and_wait_terminal(self.context,goal_id=exact,poll_interval_sec=0.05,acknowledge_interrupt=False,parking_deadline_monotonic=time.monotonic()+8.0)
-                    proof=self.runtime._navigation_terminal_result(navigation,goal_id=exact,allowed_statuses={"succeeded","failed","cancelled"})
-                if proof:
-                    self.last_zero={"zeroed":True,**proof}
-                    return self.last_zero
-            except Exception:
-                # 未取得原目标终态时，继续由同一运动守卫执行停车。
-                pass
-        stopped=self.runtime.motion_guard.stop_all_motion("跨层任务停车对账",operation_id=self.runtime._build_runtime_request_id("floor_stop"))
-        proof={"zeroed":bool(stopped.zero.zero_ack_id and stopped.zero.applied_monotonic_ns>0),
-               "zero_ack_id":stopped.zero.zero_ack_id,"zero_applied_monotonic_ns":stopped.zero.applied_monotonic_ns,
-               "motion_stop_generation":stopped.motion_stop_generation,"goal_id":exact}
-        if not proof["zeroed"]:
-            return proof
-        self.last_zero=proof
-        return proof
+    def stop_navigation(self, goal_id) -> None:
+        exact = goal_id or self.last_goal_id
+        if exact and not self.context.is_superseded():
+            self.runtime._cancel_navigation(self.context, goal_id=exact)
 
     def stop_mapping(self):
         self.ensure_active()
@@ -208,11 +184,9 @@ class GatewayBuildingPorts:
         try:
             result=provider.execute_docking(connection,guard_session=session,ensure_active=self.ensure_active,remaining_sec=self.remaining_sec,interlock=invariant)
         finally:
-            zero=self.runtime.motion_guard.stop_and_fence(session)
-            self.last_zero={"zeroed":bool(zero.zero_ack_id and zero.applied_monotonic_ns>0),"zero_ack_id":zero.zero_ack_id,"zero_applied_monotonic_ns":zero.applied_monotonic_ns}
+            if self.context.is_superseded():
+                session.abandon()
+            else:
+                self.runtime.motion_guard.stop_and_fence(session)
         actual=float(result.get("actual_distance_m",math.inf))
-        return bool(result.get("reached") is True and math.isfinite(actual) and 0.0<=actual<=connection.docking_max_distance_m and self.last_zero["zeroed"])
-
-    def interrupt_barrier(self,proof,*,reconciled):
-        if proof.get("zeroed") is True and (self.context.is_cancel_requested() or self.context.is_timed_out()):
-            self.context.acknowledge_interrupt_barrier({**dict(proof),"building_request_id":self.state.request.request_id,"facility_reconciliation_required":not reconciled})
+        return bool(result.get("reached") is True and math.isfinite(actual) and 0.0<=actual<=connection.docking_max_distance_m)

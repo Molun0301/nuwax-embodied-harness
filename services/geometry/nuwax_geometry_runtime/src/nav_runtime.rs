@@ -25,7 +25,7 @@
 //!   必须通过 typed observation API 写入各自真实消费结果。SharedState 的
 //!   producer-side pose/map 不能替代跨进程 consumer acknowledgement。
 //! - facade 维护提交与取消安全门；`PLANNING/RUNNING/SUCCEEDED` 由 stack
-//!   state 推进，`CANCELLED` 必须由 motion guard `ZEROED` ack 推进。
+//!   state 推进；取消清目标并发布一次取消请求。
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -66,7 +66,6 @@ pub const PROFILE_EXPLORATION_NATIVE: &str = "exploration-native";
 /// 而非 "mls3d",否则 `build_nav_stack_handle_renders_for_all_profiles`
 /// 测试中 `text.contains(p)` 会失败。
 pub const PROFILE_MLS3D: &str = "pct-scan-3d";
-
 
 #[cfg(test)]
 static NEXT_NAV_RUNTIME_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -187,7 +186,6 @@ fn goal_msg_type() -> LcmMessageType {
     LcmMessageType::new("nuwax_msgs.GoalEnvelope").expect("typed nuwax_msgs.GoalEnvelope")
 }
 
-
 /// 单一目标状态机阶段。`status` 字段直接对应 gRPC `NavigationState.status`,
 /// 这样 Python 侧 `get_navigation_state` 不用再翻译。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,7 +205,6 @@ pub enum NavPhase {
     /// 用户取消，且唯一 motion guard actuator path 已确认 ZEROED。
     Cancelled,
     /// cancel 已提交，等待 motion guard ZEROED acknowledgement。
-    CancelPending,
     /// 失败(readiness 不通过 / 路径无法生成 / 等)。
     Failed,
 }
@@ -223,7 +220,6 @@ impl NavPhase {
             NavPhase::Running => "RUNNING",
             NavPhase::Succeeded => "SUCCEEDED",
             NavPhase::Cancelled => "CANCELLED",
-            NavPhase::CancelPending => "PENDING",
             NavPhase::Failed => "FAILED",
         }
     }
@@ -278,8 +274,8 @@ impl GoalLease {
 /// 当前 active goal 的内存表示。`id` 是唯一 public session id。
 #[derive(Clone)]
 pub struct ActiveGoal {
-    /// 原目标安装时的守卫单调时钟，用于限定普通全局停车的覆盖范围。
-    pub admitted_guard_clock_ns: u64,
+    /// 目标所属的运动命令。
+    pub motion_admission: MotionAdmissionProof,
     /// 目标点 ID(用户传或自动生成 UUID)。
     pub id: String,
     /// frame_id(`map` 默认)。
@@ -367,10 +363,8 @@ pub struct NavRuntimeState {
     inner: Arc<RwLock<NavRuntimeSlot>>,
     stack_observation: Arc<StdMutex<StackObservation>>,
     runtime_observations: Arc<StdMutex<RuntimeObservations>>,
-    cancel: Arc<StdMutex<CancelTracker>>,
     transaction_gate: Arc<tokio::sync::Mutex<()>>,
     publish_in_flight: Arc<StdMutex<Vec<PublishInFlight>>>,
-    publish_state_changed: Arc<tokio::sync::Notify>,
     next_publish_attempt: Arc<AtomicU64>,
     #[cfg(test)]
     transaction_after_correlation: Arc<StdMutex<Option<Arc<tokio::sync::Barrier>>>>,
@@ -388,7 +382,6 @@ pub struct NavRuntimeState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TestNavPublishKind {
     Goal,
-    Cancel,
 }
 
 #[cfg(test)]
@@ -414,7 +407,6 @@ impl NavRuntimeState {
             .map(|record| TestNavPublishInFlight {
                 kind: match record.kind {
                     PublishKind::Goal => TestNavPublishKind::Goal,
-                    PublishKind::Cancel => TestNavPublishKind::Cancel,
                 },
                 lease: record.lease.clone(),
                 generation: record.generation,
@@ -434,7 +426,6 @@ const DEFAULT_STACK_STATE_TTL: Duration = Duration::from_secs(2);
 const DEFAULT_TF_TTL: Duration = Duration::ZERO;
 const DEFAULT_PLANNER_INPUT_TTL: Duration = Duration::ZERO;
 const DEFAULT_MOTION_SINK_TTL: Duration = Duration::from_secs(1);
-const DEFAULT_CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PENDING_PATH_CANDIDATES: usize = 4096;
 
 /// One complete transform-chain observation produced by the real TF consumer.
@@ -521,90 +512,9 @@ struct RuntimeObservations {
     tf_count: u64,
 }
 
-/// Cancellation lifecycle independent from the navigation planner status.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum CancelPhase {
-    /// No cancellation is active.
-    #[default]
-    Idle,
-    /// Cancellation is submitted and awaits the actuator ZEROED acknowledgement.
-    Pending,
-    /// Motion guard acknowledged that actuator output is zero.
-    Zeroed,
-    /// Motion guard or the cancellation dispatch reported a failure.
-    Failed,
-    /// No terminal guard acknowledgement arrived before the deadline.
-    TimedOut,
-}
-
-/// Guard acknowledgement kind for a cancellation command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum MotionSinkCancelAckStatus {
-    /// The guard applied zero velocity to the actuator.
-    Zeroed,
-    /// The guard rejected or failed the zero command.
-    Failed,
-}
-
-/// Acknowledgement returned by the unique guard-backed actuator path.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MotionSinkCancelAck {
-    /// Generation returned by [`NavRuntimeState::cancel_snapshot`].
-    pub cancel_generation: u64,
-    /// Goal associated with the cancellation.
-    pub goal_id: String,
-    /// Lease owner kind returned by NavigationState.
-    pub owner_kind: i32,
-    /// Lease parent request returned by NavigationState.
-    pub parent_request_id: String,
-    /// Lease generation returned by NavigationState.
-    pub goal_generation: u64,
-    /// Guard result.
-    pub status: MotionSinkCancelAckStatus,
-    /// Stable diagnostic detail supplied by the scheduler/guard client.
-    pub message: String,
-}
-
-/// Public typed snapshot used to correlate scheduler/guard cancellation work.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CancelSnapshot {
-    /// Monotonic cancellation command generation.
-    pub generation: u64,
-    /// Goal associated with the cancellation.
-    pub goal_id: String,
-    /// Full goal lease being cancelled, retained through terminal projection.
-    pub lease: Option<GoalLease>,
-    /// Current typed cancellation phase.
-    pub phase: CancelPhase,
-    /// Whether nav-stack has already reported its cancellation terminal.
-    pub stack_terminal_observed: bool,
-    /// Stable machine-oriented diagnostic detail.
-    pub message: String,
-}
-
-#[derive(Clone)]
-struct CancelTracker {
-    generation: u64,
-    goal_id: String,
-    lease: Option<GoalLease>,
-    phase: CancelPhase,
-    requested_at: Option<Instant>,
-    stack_terminal_observed: bool,
-    message: String,
-}
-
-#[derive(Clone)]
-struct GoalAdmissionCancelFence {
-    generation: u64,
-    replacement_lease: Option<GoalLease>,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PublishKind {
     Goal,
-    Cancel,
 }
 
 #[derive(Clone)]
@@ -613,7 +523,6 @@ struct PublishInFlight {
     lease: GoalLease,
     generation: u64,
     attempt: u64,
-    started_at: Instant,
 }
 
 #[derive(Clone)]
@@ -624,37 +533,6 @@ pub(crate) enum GoalProducerEpochAuthority {
         current_session_generation: Arc<AtomicU64>,
         boundary_owner: Arc<crate::explore_runtime::ExploreStartConfig>,
     },
-}
-
-enum CancelStart {
-    Publish {
-        lease: GoalLease,
-        generation: u64,
-        goal_id: String,
-    },
-    ExistingPending {
-        lease: GoalLease,
-        generation: u64,
-        goal_id: String,
-    },
-    Rejected {
-        goal_id: String,
-        message: String,
-    },
-}
-
-impl Default for CancelTracker {
-    fn default() -> Self {
-        Self {
-            generation: 0,
-            goal_id: String::new(),
-            lease: None,
-            phase: CancelPhase::Idle,
-            requested_at: None,
-            stack_terminal_observed: false,
-            message: String::new(),
-        }
-    }
 }
 
 #[derive(Default)]
@@ -749,10 +627,8 @@ impl NavRuntimeState {
             inner: Arc::new(RwLock::new(slot)),
             stack_observation: Arc::new(StdMutex::new(StackObservation::default())),
             runtime_observations: Arc::new(StdMutex::new(RuntimeObservations::default())),
-            cancel: Arc::new(StdMutex::new(CancelTracker::default())),
             transaction_gate: Arc::new(tokio::sync::Mutex::new(())),
             publish_in_flight: Arc::new(StdMutex::new(Vec::new())),
-            publish_state_changed: Arc::new(tokio::sync::Notify::new()),
             next_publish_attempt: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             transaction_after_correlation: Arc::new(StdMutex::new(None)),
@@ -825,20 +701,6 @@ impl NavRuntimeState {
         {
             return None;
         }
-        // 规划路径可能先于租约请求返回；明确无租约终态按目标关联，不借路径生成停车凭据。
-        let mut cancel = self.cancel.lock().expect("取消状态锁中毒，不能把损坏状态当作无取消事务");
-        let same_cancel = cancel.lease.as_ref().is_some_and(|cancelled|
-            cancelled.session_id == lease.session_id
-                && cancelled.goal_generation == lease.goal_generation
-                && cancelled.producer_runtime_generation == lease.producer_runtime_generation);
-        if update.feedback.cancel_generation > 0
-            && (!same_cancel || cancel.generation != update.feedback.cancel_generation)
-        {
-            return None;
-        }
-        if same_cancel {
-            *cancel = CancelTracker::default();
-        }
         update.producer_runtime_generation = lease.producer_runtime_generation;
         update.feedback.cancel_phase = "IDLE".into();
         update.feedback.actuator_zeroed = false;
@@ -853,7 +715,6 @@ impl NavRuntimeState {
             retired_without_child_cancel: true,
         });
         while slot.terminal_receipts.len() > 32 { slot.terminal_receipts.pop_front(); }
-        drop(cancel);
         drop(slot);
         self.observe_unowned_stack_heartbeat(update.state.clone());
         Some(update)
@@ -863,8 +724,7 @@ impl NavRuntimeState {
     pub(crate) async fn retain_terminal_receipt(&self, update: &NavigationUpdate) {
         if !matches!(update.state.status.as_str(), "SUCCEEDED" | "FAILED" | "CANCELLED")
             || update.state.goal_id.is_empty() || update.feedback.goal_generation == 0
-            || update.producer_runtime_generation == 0 || !update.feedback.actuator_zeroed
-            || update.feedback.zero_ack_id.is_empty() || update.feedback.zero_applied_monotonic_ns == 0 {
+            || update.producer_runtime_generation == 0 {
             return;
         }
         let _transaction_guard = self.transaction_gate.lock().await;
@@ -881,22 +741,7 @@ impl NavRuntimeState {
                 && lease.path_revision == update.feedback.path_revision
                 && lease.planner_runtime_generation == update.feedback.planner_runtime_generation
         });
-        // Keep the existing slot -> cancel lock order. Unknown cancel state is
-        // not evidence that no transaction was admitted. This records provenance
-        // only; the original measured-ZERO retirement below remains unchanged.
-        let retired_without_child_cancel = retires_active
-            && matches!(update.state.status.as_str(), "SUCCEEDED" | "FAILED")
-            && update.feedback.cancel_generation == 0
-            && self.cancel.lock().ok().is_some_and(|cancel| {
-                cancel.phase == CancelPhase::Idle
-                    || cancel.lease.as_ref().is_some_and(|lease| {
-                        lease.session_id != update.state.goal_id
-                            || lease.owner_kind != update.feedback.owner_kind
-                            || lease.parent_request_id != update.feedback.parent_request_id
-                            || lease.goal_generation != update.feedback.goal_generation
-                            || lease.producer_runtime_generation != update.producer_runtime_generation
-                    })
-            });
+        let retired_without_child_cancel = retires_active && update.feedback.cancel_generation == 0;
         if retires_active {
             slot.goal = None;
         }
@@ -972,16 +817,6 @@ impl NavRuntimeState {
         if kind == PublishKind::Goal && !in_flight.is_empty() {
             return Err("NAV_PUBLISH_IN_FLIGHT_CONFLICT");
         }
-        if kind == PublishKind::Cancel {
-            if in_flight.iter().any(|current| {
-                current.kind == kind && current.lease == lease && current.generation == generation
-            }) {
-                return Err("NAV_PUBLISH_IN_FLIGHT_JOIN");
-            }
-            if !in_flight.is_empty() {
-                return Err("NAV_PUBLISH_IN_FLIGHT_CONFLICT");
-            }
-        }
         let attempt = self
             .reserve_publish_attempt()
             .map_err(|_| "NAV_PUBLISH_ATTEMPT_EXHAUSTED")?;
@@ -990,7 +825,6 @@ impl NavRuntimeState {
             lease,
             generation,
             attempt,
-            started_at: Instant::now(),
         });
         Ok(attempt)
     }
@@ -1015,33 +849,7 @@ impl NavRuntimeState {
         };
         in_flight.remove(index);
         drop(in_flight);
-        self.publish_state_changed.notify_waiters();
         true
-    }
-
-    fn goal_publish_in_flight(&self) -> bool {
-        self.publish_in_flight.lock().is_ok_and(|in_flight| {
-            in_flight
-                .iter()
-                .any(|current| current.kind == PublishKind::Goal)
-        })
-    }
-
-    fn publish_started_at(
-        &self,
-        kind: PublishKind,
-        lease: &GoalLease,
-        generation: u64,
-    ) -> Option<Instant> {
-        self.publish_in_flight
-            .lock()
-            .ok()?
-            .iter()
-            .filter(|current| {
-                current.kind == kind && current.lease == *lease && current.generation == generation
-            })
-            .map(|current| current.started_at)
-            .min()
     }
 
     fn reserve_goal_generation(&self, requested: u64) -> Result<u64, ()> {
@@ -1071,135 +879,6 @@ impl NavRuntimeState {
             .goal
             .as_ref()
             .map(|goal| goal.lease.clone())
-    }
-
-    /// 用同一次真实普通停车收尾原探索目标；终态明确为失败，不能表示到达。
-    pub(crate) async fn retire_exploration_after_global_stop(
-        &self,
-        parent_request_id: &str,
-        exploration_generation: u64,
-        remembered: &[crate::explore_runtime::ChildNavigationLease],
-        confirmation: &crate::proto::OrdinaryGlobalStopConfirmation,
-    ) -> Result<Option<NavigationUpdate>, String> {
-        let _transaction_guard = self.transaction_gate.lock().await;
-        let mut slot = self.inner.write().await;
-        let Some(active) = slot.goal.as_ref() else { return Ok(None); };
-        let lease = &active.lease;
-        if lease.owner_kind != schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
-            || lease.parent_request_id != parent_request_id
-        {
-            return Ok(None);
-        }
-        let remembered_child = remembered.iter().any(|old| {
-            old.session_id == lease.session_id && old.owner_kind == lease.owner_kind
-                && old.parent_request_id == lease.parent_request_id
-                && old.goal_generation == lease.goal_generation
-                && old.producer_runtime_generation == lease.producer_runtime_generation
-        });
-        // 在途派发尚未回到探索时，由原 NAV 安装点保存的生产代次限定身份。
-        if !remembered_child && u64::try_from(active.producer_epoch).ok() != Some(exploration_generation) {
-            return Err("ordinary stop does not cover the current exploration child generation".into());
-        }
-        let mut cancel = self.cancel.lock().map_err(|_| "navigation cancel state unavailable".to_string())?;
-        Self::retire_active_with_global_stop(&mut slot, &mut cancel, confirmation).map(Some)
-    }
-
-    /// 原 CancelNavigation 用完整目标身份收尾同一次普通停车覆盖的目标。
-    pub(crate) async fn retire_goal_after_global_stop(
-        &self,
-        input: &CancelGoalInput,
-        confirmation: &crate::proto::OrdinaryGlobalStopConfirmation,
-    ) -> Result<(NavigationUpdate, bool), String> {
-        let _transaction_guard = self.transaction_gate.lock().await;
-        let mut slot = self.inner.write().await;
-        let exact_active = slot.goal.as_ref().is_some_and(|active| {
-            let lease = &active.lease;
-            input.targets_current() || (lease.session_id == input.goal_id && lease.owner_kind == input.owner_kind
-                && lease.parent_request_id == input.parent_request_id
-                && lease.goal_generation == input.goal_generation
-                && lease.producer_runtime_generation == input.producer_runtime_generation)
-        });
-        if !exact_active {
-            return slot.terminal_receipts.iter().rev().find(|receipt| receipt.matches(input))
-                .map(|receipt| (receipt.update.clone(), false))
-                .ok_or_else(|| "ordinary stop navigation identity changed".to_string());
-        }
-        let mut cancel = self.cancel.lock().map_err(|_| "navigation cancel state unavailable".to_string())?;
-        Self::retire_active_with_global_stop(&mut slot, &mut cancel, confirmation).map(|update| (update, true))
-    }
-
-    fn retire_active_with_global_stop(
-        slot: &mut NavRuntimeSlot,
-        cancel: &mut CancelTracker,
-        confirmation: &crate::proto::OrdinaryGlobalStopConfirmation,
-    ) -> Result<NavigationUpdate, String> {
-        let active = slot.goal.as_ref().expect("调用者已在原事务锁内选定目标");
-        let lease = &active.lease;
-        if !confirmation.stationary_confirmed || confirmation.operation_id.is_empty()
-            || confirmation.zero_ack_id.is_empty() || confirmation.applied_monotonic_ns == 0
-        {
-            return Err("ordinary stop has no completed stationary confirmation".into());
-        }
-        if confirmation.applied_monotonic_ns < active.admitted_guard_clock_ns {
-            return Err("ordinary stop predates the current navigation goal".into());
-        }
-        let lease = lease.clone();
-        if cancel.lease.as_ref().is_some_and(|old| old.identity_matches(&lease)) {
-            *cancel = CancelTracker { generation: cancel.generation, ..CancelTracker::default() };
-        }
-        let update = NavigationUpdate {
-            state: NavState {
-                status: "FAILED".into(),
-                message: format!("GLOBAL_STOP_CONFIRMED: ordinary operation {} stopped the original goal", confirmation.operation_id),
-                goal_id: lease.session_id.clone(),
-                timestamp_ns: now_ns(),
-                ..NavState::default()
-            },
-            feedback: crate::lcm_runtime::NavigationFeedback {
-                cancel_phase: "IDLE".into(),
-                actuator_zeroed: confirmation.stationary_confirmed,
-                reason_code: "GLOBAL_STOP_CONFIRMED".into(),
-                zero_ack_id: confirmation.zero_ack_id.clone(),
-                zero_applied_monotonic_ns: confirmation.applied_monotonic_ns,
-                owner_kind: lease.owner_kind,
-                parent_request_id: lease.parent_request_id.clone(),
-                goal_generation: lease.goal_generation,
-                producer_runtime_generation: lease.producer_runtime_generation,
-                path_revision: lease.path_revision,
-                planner_runtime_generation: lease.planner_runtime_generation,
-                ..crate::lcm_runtime::NavigationFeedback::default()
-            },
-            producer_runtime_generation: lease.producer_runtime_generation,
-        };
-        slot.phase = NavPhase::Failed;
-        slot.message = update.state.message.clone();
-        slot.goal = None;
-        slot.path_candidate_goal = None;
-        slot.path_candidates.clear();
-        slot.display_path = None;
-        // 沿原有终态保存与精确孤儿消费链传递真实停车，不生成子取消票据。
-        slot.terminal_receipts.push_back(RetainedTerminalReceipt {
-            update: update.clone(), retired_without_child_cancel: true,
-        });
-        while slot.terminal_receipts.len() > 32 { slot.terminal_receipts.pop_front(); }
-        Ok(update)
-    }
-
-    /// 首次停车提交后可能已接纳后继；原事务门内核对后再更新展示和订阅。
-    pub(crate) async fn publish_global_stop_retirement(
-        &self,
-        update: &NavigationUpdate,
-        shared: &Arc<RwLock<SharedState>>,
-        updates: &tokio::sync::broadcast::Sender<NavigationUpdate>,
-    ) -> bool {
-        let _transaction_guard = self.transaction_gate.lock().await;
-        let slot = self.inner.read().await;
-        if slot.goal.is_some() || slot.last_goal_generation != update.feedback.goal_generation {
-            return false;
-        }
-        shared.write().await.nav_state = update.state.clone();
-        let _ = updates.send(update.clone());
-        true
     }
 
     /// 查询同一目标身份的完整空间目标；真正状态提交仍须通过原租约校验。
@@ -1241,14 +920,6 @@ impl NavRuntimeState {
             || key.goal.producer_runtime_generation != confirmed.producer_runtime_generation
         {
             return Err("PATH_LEASE_REJECTED: assigned goal does not match active lease".to_string());
-        }
-        let cancel = self.cancel.lock()
-            .map_err(|_| "PATH_LEASE_REJECTED: cancel state unavailable".to_string())?;
-        let cancel_freezes_lease = cancel.phase != CancelPhase::Idle
-            && cancel.lease.as_ref() == Some(&confirmed);
-        drop(cancel);
-        if cancel_freezes_lease {
-            return Err("PATH_LEASE_REJECTED[CANCEL_PENDING]: active lease is frozen".to_string());
         }
         if !slot.path_candidate_goal.as_ref().is_some_and(|goal| goal.identity_matches(&confirmed)) {
             slot.path_candidate_goal = Some(confirmed.clone());
@@ -1368,21 +1039,7 @@ impl NavRuntimeState {
         let mut slot = self.inner.write().await;
         let Some(confirmed) = slot.goal.as_ref().map(|active| active.lease.clone()) else {
             drop(slot);
-            let retained = self
-                .cancel
-                .lock()
-                .ok()
-                .and_then(|cancel| cancel.lease.clone())
-                .ok_or_else(|| "NAV_STATE_LEASE_REJECTED: no matching lease".to_string())?;
-            let fields = mismatched_fields(&retained);
-            return if fields.is_empty() {
-                Ok(Some(retained))
-            } else {
-                Err(format!(
-                    "NAV_STATE_LEASE_REJECTED: mismatched fields: {}",
-                    fields.join(",")
-                ))
-            };
+            return Err("NAV_STATE_LEASE_REJECTED: no matching lease".into());
         };
         let goal_identity_matches = session_id == confirmed.session_id
             && owner_kind == confirmed.owner_kind
@@ -1398,14 +1055,6 @@ impl NavRuntimeState {
             return Err(rejection(&confirmed));
         }
 
-        let cancel = self
-            .cancel
-            .lock()
-            .map_err(|_| "NAV_STATE_LEASE_REJECTED: cancel state unavailable".to_string())?;
-        let cancel_freezes_lease =
-            cancel.phase != CancelPhase::Idle && cancel.lease.as_ref() == Some(&confirmed);
-        drop(cancel);
-        if !cancel_freezes_lease {
             let candidate_goal_matches =
                 slot.path_candidate_goal
                     .as_ref()
@@ -1432,7 +1081,7 @@ impl NavRuntimeState {
                 }
                 return Ok(Some(promoted));
             }
-        }
+
         Err(rejection(&confirmed))
     }
 
@@ -1498,7 +1147,6 @@ impl NavRuntimeState {
     pub async fn module_nodes(&self) -> Vec<String> {
         self.inner.read().await.module_nodes.clone()
     }
-
 
     #[cfg(test)]
     /// Record one state emitted by the real stack and normalize an omitted
@@ -1566,49 +1214,7 @@ impl NavRuntimeState {
                     observed.goal_id = previous.goal_id.clone();
                 }
             }
-            let cancel_gate = if observed_phase.is_some_and(NavPhase::is_terminal) {
-                self.cancel.lock().ok().and_then(|mut cancel| {
-                    let active_lease_matches = cancel.lease.as_ref().is_some_and(|lease| {
-                        slot.goal
-                            .as_ref()
-                            .is_some_and(|active| active.lease == *lease)
-                    });
-                    let already_zeroed = cancel.phase == CancelPhase::Zeroed
-                        && slot.phase == NavPhase::Cancelled
-                        && slot.goal.is_none()
-                        && cancel.goal_id == observed.goal_id;
-                    if cancel.phase != CancelPhase::Idle && (active_lease_matches || already_zeroed)
-                    {
-                        cancel.stack_terminal_observed = true;
-                        Some(cancel.phase)
-                    } else {
-                        None
-                    }
-                })
-            } else {
-                None
-            };
-            if cancel_gate == Some(CancelPhase::Pending) {
-                slot.phase = NavPhase::CancelPending;
-                slot.message =
-                    "CANCEL_WAITING_FOR_ZERO_ACK: nav-stack terminal observed".to_string();
-                observed.status = NavPhase::CancelPending.as_str().to_string();
-                observed.message = slot.message.clone();
-            } else if matches!(
-                cancel_gate,
-                Some(CancelPhase::Failed | CancelPhase::TimedOut)
-            ) {
-                slot.phase = NavPhase::Failed;
-                slot.message = "CANCEL_NOT_ZEROED: nav-stack terminal is not actuator ack".into();
-                observed.status = NavPhase::Failed.as_str().to_string();
-                observed.message = slot.message.clone();
-            } else if cancel_gate == Some(CancelPhase::Zeroed) {
-                slot.phase = NavPhase::Cancelled;
-                slot.goal = None;
-                slot.message = "CANCEL_ZEROED: actuator acknowledgement is authoritative".into();
-                observed.status = NavPhase::Cancelled.as_str().to_string();
-                observed.message = slot.message.clone();
-            } else if let Some(phase) = observed_phase {
+            if let Some(phase) = observed_phase {
                 slot.phase = phase;
                 slot.message = observed.message.clone();
                 if phase.is_terminal() && expected_lease.is_none() {
@@ -1643,7 +1249,6 @@ impl NavRuntimeState {
             status,
         }
     }
-
 
     /// Record a real TF consumer observation.
     pub fn observe_tf_chain(
@@ -1741,216 +1346,8 @@ impl NavRuntimeState {
         self.execution_chain_blockers().is_empty()
     }
 
-    /// Return the current cancellation generation and typed state.
-    pub fn cancel_snapshot(&self) -> CancelSnapshot {
-        self.cancel
-            .lock()
-            .ok()
-            .map(|cancel| CancelSnapshot {
-                generation: cancel.generation,
-                goal_id: cancel.goal_id.clone(),
-                lease: cancel.lease.clone(),
-                phase: cancel.phase,
-                stack_terminal_observed: cancel.stack_terminal_observed,
-                message: cancel.message.clone(),
-            })
-            .unwrap_or(CancelSnapshot {
-                generation: 0,
-                goal_id: String::new(),
-                lease: None,
-                phase: CancelPhase::Failed,
-                stack_terminal_observed: false,
-                message: "CANCEL_STATE_UNAVAILABLE".to_string(),
-            })
-    }
-
-    /// Apply a cancellation result from the unique motion-safety-guard path.
-    pub async fn observe_cancel_ack(&self, ack: MotionSinkCancelAck) -> CancelOutcome {
-        let _transaction_guard = self.transaction_gate.lock().await;
-        let mut slot = self.inner.write().await;
-        let Ok(mut cancel) = self.cancel.lock() else {
-            return cancel_outcome_from_slot(
-                &slot,
-                ack.goal_id,
-                "CANCEL_STATE_UNAVAILABLE".to_string(),
-                None,
-            );
-        };
-        let goal_id = cancel.goal_id.clone();
-        let lease = cancel.lease.clone();
-        let active_lease_matches = lease.as_ref().is_some_and(|lease| {
-            slot.goal
-                .as_ref()
-                .is_some_and(|active| active.lease == *lease)
-        });
-        let phase_accepts_ack = match ack.status {
-            MotionSinkCancelAckStatus::Zeroed => matches!(
-                cancel.phase,
-                CancelPhase::Pending | CancelPhase::Failed | CancelPhase::TimedOut
-            ),
-            MotionSinkCancelAckStatus::Failed => cancel.phase == CancelPhase::Pending,
-        };
-        let ack_matches = phase_accepts_ack
-            && cancel.generation == ack.cancel_generation
-            && cancel.goal_id == ack.goal_id
-            && lease.as_ref().is_some_and(|lease| {
-                lease.owner_kind == ack.owner_kind
-                    && lease.parent_request_id == ack.parent_request_id
-                    && lease.goal_generation == ack.goal_generation
-            });
-        if !ack_matches || !active_lease_matches {
-            return cancel_outcome_from_slot(
-                &slot,
-                goal_id,
-                "CANCEL_ACK_REJECTED: generation, goal, or active lease mismatch".to_string(),
-                lease,
-            );
-        }
-
-        let message = ack.message;
-        match ack.status {
-            MotionSinkCancelAckStatus::Zeroed => {
-                slot.phase = NavPhase::Cancelled;
-                slot.goal = None;
-                slot.message = format!("CANCEL_ZEROED: {message}");
-                cancel.phase = CancelPhase::Zeroed;
-            }
-            MotionSinkCancelAckStatus::Failed => {
-                slot.phase = NavPhase::Failed;
-                slot.message = format!("CANCEL_ZERO_FAILED: {message}");
-                cancel.phase = CancelPhase::Failed;
-            }
-        }
-        cancel.message = message.clone();
-        cancel_outcome_from_slot(&slot, goal_id, message, lease)
-    }
-
-    /// Transition an overdue pending cancellation to an explicit timeout.
-    pub async fn poll_cancel_timeout(&self) -> Option<CancelOutcome> {
-        let _transaction_guard = self.transaction_gate.lock().await;
-        let mut slot = self.inner.write().await;
-        let mut cancel = self.cancel.lock().expect("取消状态锁中毒，不能把损坏状态当作无取消事务");
-        let lease = cancel.lease.clone()?;
-        let publish_started_at =
-            self.publish_started_at(PublishKind::Cancel, &lease, cancel.generation);
-        let requested_at = match (cancel.requested_at, publish_started_at) {
-            (Some(requested_at), Some(publish_started_at)) => requested_at.min(publish_started_at),
-            (Some(requested_at), None) => requested_at,
-            (None, Some(publish_started_at)) => publish_started_at,
-            (None, None) => return None,
-        };
-        if cancel.phase != CancelPhase::Pending || requested_at.elapsed() < cancel_timeout() {
-            return None;
-        }
-        if !slot
-            .goal
-            .as_ref()
-            .is_some_and(|active| active.lease == lease)
-        {
-            return None;
-        }
-        let goal_id = cancel.goal_id.clone();
-        let message = "CANCEL_ZERO_ACK_TIMEOUT".to_string();
-        slot.phase = NavPhase::Failed;
-        slot.message = message.clone();
-        cancel.phase = CancelPhase::TimedOut;
-        cancel.message = message.clone();
-        Some(cancel_outcome_from_slot(
-            &slot,
-            goal_id,
-            message,
-            Some(lease),
-        ))
-    }
-
-    async fn begin_cancel(&self, input: &CancelGoalInput) -> CancelStart {
-        let slot = self.inner.read().await;
-        let Some(active) = slot.goal.as_ref() else {
-            return CancelStart::Rejected {
-                goal_id: input.goal_id.clone(),
-                message: "CANCEL_REJECTED[GOAL_LEASE_MISSING]".to_string(),
-            };
-        };
-        let active_lease = &active.lease;
-        // 全空身份由当前拥有方在原取消事务锁内绑定；部分身份仍必须精确匹配。
-        if !input.targets_current() && (input.goal_id.trim() != active_lease.session_id
-            || input.owner_kind != active_lease.owner_kind
-            || input.parent_request_id.trim() != active_lease.parent_request_id
-            || input.goal_generation != active_lease.goal_generation
-            || input.producer_runtime_generation != active_lease.producer_runtime_generation)
-        {
-            return CancelStart::Rejected {
-                goal_id: input.goal_id.clone(),
-                message: "CANCEL_REJECTED[GOAL_LEASE_MISMATCH]".to_string(),
-            };
-        }
-        let lease = active_lease.clone();
-        let goal_id = lease.session_id.clone();
-        let Ok(mut cancel) = self.cancel.lock() else {
-            return CancelStart::Rejected {
-                goal_id,
-                message: "CANCEL_STATE_UNAVAILABLE".to_string(),
-            };
-        };
-        if matches!(cancel.phase, CancelPhase::Pending | CancelPhase::Failed | CancelPhase::TimedOut)
-            && cancel.lease.as_ref() == Some(&lease)
-        {
-            // 重试同一次停车沿用原票据，避免已持有的全局恢复围栏因代次
-            // 改变而失去对账对象。每次重试仍使用原有的有限确认期限。
-            if cancel.phase != CancelPhase::Pending {
-                cancel.phase = CancelPhase::Pending;
-                cancel.requested_at = Some(Instant::now());
-                cancel.message = "CANCEL_PENDING_ZERO_ACK".to_string();
-            }
-            return CancelStart::ExistingPending {
-                lease,
-                generation: cancel.generation,
-                goal_id,
-            };
-        }
-        if cancel.phase == CancelPhase::Pending {
-            return CancelStart::Rejected {
-                goal_id,
-                message: "CANCEL_REJECTED[CANCEL_IN_FLIGHT_CONFLICT]".to_string(),
-            };
-        }
-        let generation = match self.next_cancel_generation.fetch_update(
-            AtomicOrdering::AcqRel,
-            AtomicOrdering::Acquire,
-            |current| {
-                current
-                    .checked_add(1)
-                    .filter(|next| *next <= i64::MAX as u64)
-            },
-        ) {
-            Ok(previous) => previous + 1,
-            Err(_) => {
-                return CancelStart::Rejected {
-                    goal_id,
-                    message: "CANCEL_REJECTED[CANCEL_GENERATION_EXHAUSTED]".to_string(),
-                };
-            }
-        };
-        *cancel = CancelTracker {
-            generation,
-            goal_id: goal_id.clone(),
-            lease: Some(lease.clone()),
-            phase: CancelPhase::Pending,
-            requested_at: Some(Instant::now()),
-            stack_terminal_observed: false,
-            message: "CANCEL_PENDING_ZERO_ACK".to_string(),
-        };
-        CancelStart::Publish {
-            lease,
-            generation,
-            goal_id,
-        }
-    }
-
-    fn reset_cancel(&self) {
-        if let Ok(mut cancel) = self.cancel.lock() {
-            *cancel = CancelTracker::default();
-        }
+    pub fn cancel_generation(&self) -> u64 {
+        self.next_cancel_generation.load(AtomicOrdering::Acquire)
     }
 
     fn runtime_observation_snapshot(&self) -> RuntimeObservationSnapshot {
@@ -2000,14 +1397,6 @@ impl NavRuntimeState {
         if let Ok(mut stack) = self.stack_observation.lock() {
             stack.observed_at =
                 Instant::now().checked_sub(stack_state_ttl() + Duration::from_millis(1));
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn expire_cancel_for_test(&self) {
-        if let Ok(mut cancel) = self.cancel.lock() {
-            cancel.requested_at =
-                Instant::now().checked_sub(cancel_timeout() + Duration::from_millis(1));
         }
     }
 
@@ -2064,10 +1453,6 @@ fn planner_input_ttl() -> Duration {
 
 fn motion_sink_ttl() -> Duration {
     duration_from_env("NUWAX_NAV_MOTION_SINK_TTL_MS", DEFAULT_MOTION_SINK_TTL)
-}
-
-fn cancel_timeout() -> Duration {
-    duration_from_env("NUWAX_NAV_CANCEL_TIMEOUT_MS", DEFAULT_CANCEL_TIMEOUT)
 }
 
 fn duration_from_env(name: &str, default: Duration) -> Duration {
@@ -2556,7 +1941,6 @@ impl MotionAdmissionProof {
         })
     }
 
-
 }
 
 #[cfg(test)]
@@ -2634,10 +2018,7 @@ pub enum SetGoalRejectReason {
     GoalLeaseInvalid,
     GoalEnvelopeRange,
     GoalTimestampInvalid,
-    GoalLeaseBusy,
     GoalGenerationStale,
-    CancelStateUnavailable,
-    CancelGenerationChanged,
     GoalEnvelopeInvalid,
 }
 
@@ -2653,10 +2034,7 @@ impl SetGoalRejectReason {
             Self::GoalLeaseInvalid => "GOAL_LEASE_INVALID",
             Self::GoalEnvelopeRange => "GOAL_ENVELOPE_RANGE",
             Self::GoalTimestampInvalid => "GOAL_TIMESTAMP_INVALID",
-            Self::GoalLeaseBusy => "GOAL_LEASE_BUSY",
             Self::GoalGenerationStale => "GOAL_GENERATION_STALE",
-            Self::CancelStateUnavailable => "GOAL_CANCEL_STATE_UNAVAILABLE",
-            Self::CancelGenerationChanged => "GOAL_CANCEL_GENERATION_CHANGED",
             Self::GoalEnvelopeInvalid => "GOAL_ENVELOPE_INVALID",
         }
     }
@@ -2906,7 +2284,7 @@ async fn goal_intent_from_set_goal(
         .ok_or_else(|| "authoritative committed map is unavailable".to_string())?;
     let goal_generation = i64::try_from(input.goal_generation)
         .map_err(|_| "goal_generation exceeds i64".to_string())?;
-    let cancel_generation = i64::try_from(state.cancel_snapshot().generation)
+    let cancel_generation = i64::try_from(state.cancel_generation())
         .map_err(|_| "cancel_generation exceeds i64".to_string())?;
     let producer_epoch = i64::try_from(state.producer_runtime_generation)
         .map_err(|_| "producer epoch exceeds i64".to_string())?;
@@ -3154,41 +2532,6 @@ pub(crate) async fn admit_goal_intent(
             points: std::mem::take(&mut intent.boundary_points),
         })
     };
-    let cancel = state.cancel_snapshot();
-    let Some(intent_cancel_generation) = u64::try_from(intent.cancel_generation).ok() else {
-        return rejected_goal_intent(goal_id, "cancel generation changed before admission");
-    };
-    let cancel_fence = match cancel.phase {
-        CancelPhase::Idle if intent_cancel_generation == cancel.generation => {
-            GoalAdmissionCancelFence {
-                generation: cancel.generation,
-                replacement_lease: None,
-            }
-        }
-        CancelPhase::Zeroed
-            if intent_cancel_generation == cancel.generation && cancel.lease.is_some() =>
-        {
-            if state.inner.read().await.goal.is_some() {
-                return rejected_goal_intent(
-                    goal_id,
-                    "zeroed replacement still retains the old active lease",
-                );
-            }
-            GoalAdmissionCancelFence {
-                generation: cancel.generation,
-                replacement_lease: cancel.lease,
-            }
-        }
-        CancelPhase::Pending if state.inner.read().await.goal.is_some() => {
-            return rejected_goal_intent(
-                goal_id,
-                "GOAL_LEASE_BUSY: active goal is awaiting exact cancellation terminal",
-            );
-        }
-        _ => {
-            return rejected_goal_intent(goal_id, "cancel generation changed before admission");
-        }
-    };
     let timestamp_ns = if intent.goal.header.stamp_sec < 0 || intent.goal.header.stamp_nsec < 0 {
         return rejected_goal_intent(goal_id, "goal timestamp is negative");
     } else {
@@ -3225,7 +2568,7 @@ pub(crate) async fn admit_goal_intent(
         body_to_support_z_m: intent.body_to_support_z_m,
         boundary_owner,
     };
-    admit_goal_input(io, state, admitted, boundary, cancel_fence, admission).await
+    admit_goal_input(io, state, admitted, boundary, admission).await
 }
 
 fn pose_action_matches(left: &PoseState, right: &PoseState) -> bool {
@@ -3253,7 +2596,6 @@ async fn admit_goal_input(
     state: &NavRuntimeState,
     admitted: AdmittedGoalInput,
     boundary: Option<GoalBoundaryConstraint>,
-    cancel_fence: GoalAdmissionCancelFence,
     admission: &NavAdmissionContext,
 ) -> SetGoalOutcome {
     let AdmittedGoalInput {
@@ -3516,6 +2858,15 @@ async fn admit_goal_input(
     {
         let mut slot = state.inner.write().await;
         if let Some(active) = slot.goal.as_ref() {
+            if active.motion_admission.guard_boot_nonce == input.motion_admission.guard_boot_nonce
+                && input.motion_admission.motion_stop_generation < active.motion_admission.motion_stop_generation {
+                return SetGoalOutcome {
+                    state: NavState { status: "FAILED".into(), message: "SET_GOAL_REJECTED[GOAL_GENERATION_STALE]".into(),
+                        goal_id: lease.session_id.clone(), distance_remaining, timestamp_ns: now_ns() },
+                    lease: Some(lease), lease_origin: GoalLeaseOrigin::Attempted,
+                    reject_reason: Some(SetGoalRejectReason::GoalGenerationStale), ..SetGoalOutcome::default()
+                };
+            }
             if active.lease.identity_matches(&lease)
                 && active.frame_id == input.frame_id
                 && pose_action_matches(&active.target, &input.target)
@@ -3552,26 +2903,6 @@ async fn admit_goal_input(
                     ..SetGoalOutcome::default()
                 };
             }
-            return SetGoalOutcome {
-                state: NavState {
-                    status: NavPhase::Failed.as_str().to_string(),
-                    message: format!(
-                        "SET_GOAL_REJECTED[GOAL_LEASE_BUSY]: active={}/{}/{}/{}",
-                        active.lease.owner_kind,
-                        active.lease.parent_request_id,
-                        active.lease.session_id,
-                        active.lease.goal_generation,
-                    ),
-                    goal_id: lease.session_id.clone(),
-                    distance_remaining,
-                    timestamp_ns: now_ns(),
-                },
-                lease: Some(lease),
-                lease_origin: GoalLeaseOrigin::Attempted,
-                retry_reason: None,
-                reject_reason: Some(SetGoalRejectReason::GoalLeaseBusy),
-                ..SetGoalOutcome::default()
-            };
         }
         if goal_generation <= slot.last_goal_generation {
             return SetGoalOutcome {
@@ -3589,47 +2920,6 @@ async fn admit_goal_input(
                 lease_origin: GoalLeaseOrigin::Attempted,
                 retry_reason: None,
                 reject_reason: Some(SetGoalRejectReason::GoalGenerationStale),
-                ..SetGoalOutcome::default()
-            };
-        }
-        let Ok(mut cancel) = state.cancel.lock() else {
-            return SetGoalOutcome {
-                state: NavState {
-                    status: NavPhase::Failed.as_str().to_string(),
-                    message: "SET_GOAL_REJECTED[CANCEL_STATE_UNAVAILABLE]".to_string(),
-                    goal_id: lease.session_id.clone(),
-                    distance_remaining,
-                    timestamp_ns: now_ns(),
-                },
-                lease: Some(lease),
-                lease_origin: GoalLeaseOrigin::Attempted,
-                retry_reason: None,
-                reject_reason: Some(SetGoalRejectReason::CancelStateUnavailable),
-                ..SetGoalOutcome::default()
-            };
-        };
-        let cancel_fence_matches = cancel.generation == cancel_fence.generation
-            && match cancel_fence.replacement_lease.as_ref() {
-                None => cancel.phase == CancelPhase::Idle,
-                Some(old_lease) => {
-                    cancel.phase == CancelPhase::Zeroed
-                        && cancel.lease.as_ref() == Some(old_lease)
-                        && slot.goal.is_none()
-                }
-            };
-        if !cancel_fence_matches {
-            return SetGoalOutcome {
-                state: NavState {
-                    status: NavPhase::Failed.as_str().to_string(),
-                    message: "SET_GOAL_REJECTED[CANCEL_GENERATION_CHANGED]".to_string(),
-                    goal_id: lease.session_id.clone(),
-                    distance_remaining,
-                    timestamp_ns: now_ns(),
-                },
-                lease: Some(lease),
-                lease_origin: GoalLeaseOrigin::Attempted,
-                retry_reason: None,
-                reject_reason: Some(SetGoalRejectReason::CancelGenerationChanged),
                 ..SetGoalOutcome::default()
             };
         }
@@ -3651,7 +2941,6 @@ async fn admit_goal_input(
         };
     }
     };
-        let admitted_cancel_generation = cancel.generation;
         slot.last_goal_generation = goal_generation;
         slot.phase = NavPhase::Accepted;
         slot.message = format!(
@@ -3659,7 +2948,7 @@ async fn admit_goal_input(
             slot.profile
         );
         slot.goal = Some(ActiveGoal {
-            admitted_guard_clock_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
+            motion_admission: input.motion_admission,
             id: input.goal_id.clone(),
             frame_id: input.frame_id.clone(),
             target: input.target.clone(),
@@ -3670,10 +2959,7 @@ async fn admit_goal_input(
             boundary_owner,
             lease: lease.clone(),
         });
-        *cancel = CancelTracker {
-            generation: admitted_cancel_generation,
-            ..CancelTracker::default()
-        };
+
     }
     let publish_attempt =
         match state.begin_publish(PublishKind::Goal, lease.clone(), goal_generation) {
@@ -3775,8 +3061,6 @@ async fn project_installed_goal_completion(
             && goal.lease.planner_runtime_generation == 0 && slot.phase == NavPhase::Accepted
     });
     if provisional && allow_definite_rollback && dispatch_effect == GoalDispatchEffect::NotDispatched {
-        if let Ok(mut cancel) = state.cancel.lock() {
-            if cancel.lease.as_ref() == Some(attempted) { *cancel = CancelTracker::default(); }
             slot.goal = None;
             slot.phase = NavPhase::Failed;
             slot.message = message.clone();
@@ -3786,21 +3070,14 @@ async fn project_installed_goal_completion(
                 lease: Some(attempted.clone()), lease_origin: GoalLeaseOrigin::InstalledReleased,
                 #[cfg(test)] dispatch_effect, ..SetGoalOutcome::default()
             };
-        }
-        // A poisoned tracker is not permission to erase a physical responsibility.
+
     }
     if provisional {
         slot.phase = NavPhase::DispatchUnresolved;
         slot.message = message.clone();
     }
     let exact_active = slot.goal.as_ref().filter(|goal| goal.lease.identity_matches(attempted));
-    let exact_zeroed_lease = state.cancel.lock().ok().and_then(|cancel| {
-        (cancel.phase == CancelPhase::Zeroed).then(|| {
-            cancel.lease.as_ref().filter(|lease| lease.identity_matches(attempted)).cloned()
-        }).flatten()
-    });
-    let proof_pending = exact_active.is_some() && slot.phase.is_terminal()
-        || exact_zeroed_lease.is_some();
+    let proof_pending = exact_active.is_some() && slot.phase.is_terminal();
     let diagnostic = if proof_pending { GoalSubmissionDiagnostic::TerminalProofPending }
         else { GoalSubmissionDiagnostic::PublishUnconfirmed };
     // A candidate PathEnvelope alone cannot reach any of these slot phases.
@@ -3809,7 +3086,7 @@ async fn project_installed_goal_completion(
     // ZEROED may already have retired the active slot before the original receipt
     // is retained. Preserve its actual execution identity, never its partial ZERO body.
     let lease = exact_active.map(|goal| goal.lease.clone())
-        .or(exact_zeroed_lease).unwrap_or_else(|| attempted.clone());
+        .unwrap_or_else(|| attempted.clone());
     SetGoalOutcome {
         state: NavState {
             status: if progress { slot.phase.as_str() } else { "UNCONFIRMED" }.into(),
@@ -3824,263 +3101,40 @@ async fn project_installed_goal_completion(
     }
 }
 
-/// 请求取消当前 active goal。
-///
-/// The LCM cancellation frame only stops planning and is never an actuator
-/// command. Terminal `CANCELLED` requires a correlated guard `ZEROED` ack.
-pub async fn cancel(
-    handle: &GeometryRuntimeHandle,
-    state: &NavRuntimeState,
-    input: CancelGoalInput,
-) -> CancelOutcome {
-    let (cancel_start, publish_attempt) = loop {
-        let transaction_guard = state.transaction_gate.lock().await;
-        let map_goal_guard = handle.mapping_lifecycle_lock.lock().await;
-        if state.goal_publish_in_flight() {
-            let publish_state_changed = state.publish_state_changed.notified();
-            tokio::pin!(publish_state_changed);
-            publish_state_changed.as_mut().enable();
-            drop(map_goal_guard);
-            drop(transaction_guard);
-            publish_state_changed.await;
-            continue;
-        }
-        let cancel_start = state.begin_cancel(&input).await;
-        let publish_identity = match &cancel_start {
-            CancelStart::Publish {
-                lease, generation, ..
-            }
-            | CancelStart::ExistingPending {
-                lease, generation, ..
-            } => Some((lease.clone(), *generation)),
-            CancelStart::Rejected { .. } => None,
+/// 按精确目标清理当前目标，并发布一次取消。
+pub async fn cancel(handle: &GeometryRuntimeHandle, state: &NavRuntimeState, input: CancelGoalInput) -> CancelOutcome {
+    let (lease, generation, outcome) = {
+        let _transaction_guard = state.transaction_gate.lock().await;
+        let _map_goal_guard = handle.mapping_lifecycle_lock.lock().await;
+        let mut slot = state.inner.write().await;
+        let Some(active) = slot.goal.as_ref() else {
+            return cancel_outcome_with_phase(NavPhase::Failed, input.goal_id, "CANCEL_REJECTED[GOAL_LEASE_MISSING]".into(), None);
         };
-        let publish_attempt = match publish_identity {
-            Some((lease, generation)) => {
-                match state.begin_publish(PublishKind::Cancel, lease.clone(), generation) {
-                    Ok(attempt) => Some(attempt),
-                    Err("NAV_PUBLISH_IN_FLIGHT_JOIN")
-                        if matches!(cancel_start, CancelStart::ExistingPending { .. }) =>
-                    {
-                        drop(map_goal_guard);
-                        return cancel_outcome_with_phase(
-                            NavPhase::CancelPending,
-                            lease.session_id.clone(),
-                            "CANCEL_PENDING_PUBLISH_IN_FLIGHT_JOIN".to_string(),
-                            Some(lease),
-                        );
-                    }
-                    Err(reason) => {
-                        if matches!(cancel_start, CancelStart::Publish { .. }) {
-                            state.reset_cancel();
-                        }
-                        drop(map_goal_guard);
-                        return cancel_outcome_with_phase(
-                            NavPhase::Failed,
-                            lease.session_id.clone(),
-                            format!("CANCEL_REJECTED[{reason}]"),
-                            None,
-                        );
-                    }
-                }
-            }
-            None => None,
+        let lease = active.lease.clone();
+        if !input.targets_current() && (input.goal_id != lease.session_id || input.owner_kind != lease.owner_kind
+            || input.parent_request_id != lease.parent_request_id || input.goal_generation != lease.goal_generation
+            || input.producer_runtime_generation != lease.producer_runtime_generation) {
+            return cancel_outcome_with_phase(NavPhase::Failed, input.goal_id, "CANCEL_REJECTED[GOAL_LEASE_MISMATCH]".into(), None);
+        }
+        let generation = match state.next_cancel_generation.fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire,
+            |current| current.checked_add(1).filter(|next| *next <= i64::MAX as u64)) {
+            Ok(previous) => previous + 1,
+            Err(_) => return cancel_outcome_with_phase(NavPhase::Failed, input.goal_id,
+                "CANCEL_REJECTED[CANCEL_GENERATION_EXHAUSTED]".into(), None),
         };
-        drop(map_goal_guard);
-        drop(transaction_guard);
-        break (cancel_start, publish_attempt);
+        slot.goal = None;
+        slot.path_candidate_goal = None;
+        slot.path_candidates.clear();
+        slot.display_path = None;
+        slot.phase = NavPhase::Cancelled;
+        slot.message = "导航已取消".into();
+        let outcome = cancel_outcome_from_slot(&slot, lease.session_id.clone(), slot.message.clone(), Some(lease.clone()));
+        (lease, generation, outcome)
     };
-
-    match cancel_start {
-        CancelStart::Publish {
-            lease,
-            generation,
-            goal_id,
-        } => {
-            let cancel_result = publish_cancel_frame(handle, &lease, generation).await;
-            let _transaction_guard = state.transaction_gate.lock().await;
-            let Some(attempt) = publish_attempt else {
-                return cancel_outcome_with_phase(
-                    NavPhase::Failed,
-                    goal_id,
-                    "CANCEL_COMPLETION_SUPERSEDED".to_string(),
-                    Some(lease),
-                );
-            };
-            if !state.finish_publish(PublishKind::Cancel, &lease, generation, attempt) {
-                return cancel_outcome_with_phase(
-                    NavPhase::Failed,
-                    goal_id,
-                    "CANCEL_COMPLETION_SUPERSEDED".to_string(),
-                    Some(lease),
-                );
-            }
-            finish_cancel_request(state, lease, goal_id, generation, cancel_result).await
-        }
-        CancelStart::ExistingPending {
-            lease,
-            generation,
-            goal_id,
-            ..
-        } => {
-            let retry_result = publish_cancel_frame(handle, &lease, generation).await;
-            let _transaction_guard = state.transaction_gate.lock().await;
-            let Some(attempt) = publish_attempt else {
-                return cancel_outcome_with_phase(
-                    NavPhase::Failed,
-                    goal_id,
-                    "CANCEL_RETRY_SUPERSEDED".to_string(),
-                    Some(lease),
-                );
-            };
-            if !state.finish_publish(PublishKind::Cancel, &lease, generation, attempt) {
-                return cancel_outcome_with_phase(
-                    NavPhase::Failed,
-                    goal_id,
-                    "CANCEL_RETRY_SUPERSEDED".to_string(),
-                    Some(lease),
-                );
-            }
-            finish_existing_cancel_retry(state, lease, goal_id, generation, retry_result).await
-        }
-        CancelStart::Rejected { goal_id, message } => {
-            cancel_outcome_with_phase(NavPhase::Failed, goal_id, message, None)
-        }
+    match publish_cancel_frame(handle, &lease, generation).await {
+        Ok(()) => outcome,
+        Err(error) => cancel_outcome_with_phase(NavPhase::Failed, lease.session_id.clone(), error, Some(lease)),
     }
-}
-
-async fn finish_existing_cancel_retry(
-    state: &NavRuntimeState,
-    lease: GoalLease,
-    goal_id: String,
-    cancel_generation: u64,
-    retry_result: Result<(), String>,
-) -> CancelOutcome {
-    let slot = state.inner.read().await;
-    let Ok(cancel) = state.cancel.lock() else {
-        return cancel_outcome_with_phase(
-            NavPhase::Failed,
-            goal_id,
-            "CANCEL_STATE_UNAVAILABLE".to_string(),
-            Some(lease),
-        );
-    };
-    let tracker_matches = cancel.generation == cancel_generation
-        && cancel.goal_id == goal_id
-        && cancel.lease.as_ref() == Some(&lease);
-    if !tracker_matches {
-        return cancel_outcome_with_phase(
-            NavPhase::Failed,
-            goal_id,
-            "CANCEL_RETRY_SUPERSEDED".to_string(),
-            Some(lease),
-        );
-    }
-
-    match cancel.phase {
-        CancelPhase::Pending => {
-            let active_lease_matches = slot
-                .goal
-                .as_ref()
-                .is_some_and(|active| active.lease == lease);
-            if !active_lease_matches {
-                return cancel_outcome_with_phase(
-                    NavPhase::Failed,
-                    goal_id,
-                    "CANCEL_RETRY_SUPERSEDED".to_string(),
-                    Some(lease),
-                );
-            }
-            let message = match retry_result {
-                Ok(()) => "CANCEL_PENDING_RETRY_PUBLISHED".to_string(),
-                Err(error) => {
-                    warn!(
-                        "pending cancel retry publish failed; original transaction remains pending: {}",
-                        error
-                    );
-                    format!("{}; retry publish failed: {error}", cancel.message)
-                }
-            };
-            cancel_outcome_with_phase(NavPhase::CancelPending, goal_id, message, Some(lease))
-        }
-        CancelPhase::Zeroed => cancel_outcome_with_phase(
-            NavPhase::Cancelled,
-            goal_id,
-            cancel.message.clone(),
-            Some(lease),
-        ),
-        CancelPhase::Failed | CancelPhase::TimedOut => cancel_outcome_with_phase(
-            NavPhase::Failed,
-            goal_id,
-            cancel.message.clone(),
-            Some(lease),
-        ),
-        CancelPhase::Idle => cancel_outcome_with_phase(
-            NavPhase::Failed,
-            goal_id,
-            "CANCEL_RETRY_SUPERSEDED".to_string(),
-            Some(lease),
-        ),
-    }
-}
-
-async fn finish_cancel_request(
-    state: &NavRuntimeState,
-    lease: GoalLease,
-    goal_id: String,
-    cancel_generation: u64,
-    cancel_result: Result<(), String>,
-) -> CancelOutcome {
-    let mut slot = state.inner.write().await;
-    let Ok(mut cancel) = state.cancel.lock() else {
-        return cancel_outcome_with_phase(
-            NavPhase::Failed,
-            goal_id,
-            "CANCEL_STATE_UNAVAILABLE".to_string(),
-            Some(lease),
-        );
-    };
-    let tracker_matches = cancel.generation == cancel_generation
-        && cancel.goal_id == goal_id
-        && cancel.lease.as_ref() == Some(&lease);
-    if slot.phase == NavPhase::Cancelled && tracker_matches && cancel.phase == CancelPhase::Zeroed {
-        cancel.message = "CANCEL_ALREADY_ZEROED".to_string();
-        return cancel_outcome_from_slot(
-            &slot,
-            goal_id,
-            "CANCEL_ALREADY_ZEROED".to_string(),
-            Some(lease),
-        );
-    }
-    let active_lease_matches = slot
-        .goal
-        .as_ref()
-        .is_some_and(|active| active.lease == lease);
-    if !tracker_matches || cancel.phase != CancelPhase::Pending || !active_lease_matches {
-        return cancel_outcome_with_phase(
-            NavPhase::Failed,
-            goal_id,
-            "CANCEL_COMPLETION_SUPERSEDED".to_string(),
-            Some(lease),
-        );
-    }
-    if let Err(error) = cancel_result {
-        warn!("initial cancel publish failed: {error}");
-        let message = format!("CANCEL_PUBLISH_FAILED: {error}");
-        cancel.phase = CancelPhase::Failed;
-        cancel.message = message.clone();
-        slot.phase = NavPhase::Failed;
-        slot.message = message.clone();
-        return cancel_outcome_from_slot(&slot, goal_id, message, Some(lease));
-    }
-    slot.phase = NavPhase::CancelPending;
-    slot.message = "CANCEL_PENDING_ZERO_ACK: waiting for motion guard".into();
-    cancel_outcome_from_slot(
-        &slot,
-        goal_id,
-        "CANCEL_PENDING_ZERO_ACK".to_string(),
-        Some(lease),
-    )
 }
 
 fn cancel_outcome_with_phase(
@@ -4134,7 +3188,6 @@ async fn distance_to_target_from_state(
     };
     dx.hypot(dy).hypot(dz) as f32
 }
-
 
 /// 生成或保留 goal_id。空字符串时生成 UUID v4。
 pub fn ensure_goal_id(provided: &str) -> String {
@@ -4239,7 +3292,6 @@ pub fn path_envelope_binding() -> Result<(LcmTopic, LcmMessageType), String> {
     strict_typed_binding(&channel, "nuwax_msgs.PathEnvelope")
 }
 
-
 async fn publish_encoded_goal_frame_from_transport(
     transport: &LcmTransport,
     payload: Vec<u8>,
@@ -4250,7 +3302,6 @@ async fn publish_encoded_goal_frame_from_transport(
         typed_codec::build_typed_frame(topic, msg_type, payload, now_ns() & 0x0000_FFFF_FFFF_FFFF);
     transport.publish(frame).await
 }
-
 
 /// publish `/nav/cancel` typed frame。
 async fn publish_cancel_frame(
@@ -4771,29 +3822,6 @@ mod tests {
                 .collect()
         }
 
-        fn published_channels(&self) -> Vec<String> {
-            self.frames
-                .lock()
-                .expect("published frames")
-                .iter()
-                .map(|frame| frame.topic.fqn(frame.msg_type.fqn()))
-                .collect()
-        }
-
-        fn published_cancel_generations(&self) -> Vec<i64> {
-            self.frames
-                .lock()
-                .expect("published frames")
-                .iter()
-                .filter(|frame| frame.msg_type.fqn() == "nuwax_msgs.CancelNavigation")
-                .map(|frame| {
-                    schema::decode_cancel_navigation_body(&frame.payload)
-                        .expect("published CancelNavigation")
-                        .cancel_generation
-                })
-                .collect()
-        }
-
         fn release_one(&self) {
             self.publish_gate.add_permits(1);
         }
@@ -4843,15 +3871,6 @@ mod tests {
         (handle, backend)
     }
 
-    // Only the original rollback fixture opts into a definite source-point error.
-    // Generic string fixtures remain opaque EffectUnconfirmed errors.
-    async fn make_definite_blocking_handle(reason: &str) -> (GeometryRuntimeHandle, BlockingPublishBackend) {
-        let (handle, backend) = make_blocking_handle([]).await;
-        backend.outcomes.lock().unwrap().push_back(Some(TransportError::NotDispatched(
-            Box::new(TransportError::LcmBackend(reason.to_owned())))));
-        (handle, backend)
-    }
-
     // Explicit available external port for admission unit tests. The production
     // owner/codec still run; this fixture neither opens nor claims real LCM.
     async fn make_unit_blocking_handle(
@@ -4868,7 +3887,7 @@ mod tests {
 
     #[tokio::test]
     async fn natural_retirement_records_cancel_authority_at_commit_only() {
-        for poison_before_commit in [true, false] {
+        {
             let state = NavRuntimeState::with_profile_and_producer_runtime_generation(PROFILE_SIMPLE_2D, 1);
             let lease = test_lease("retirement-unknown-tracker", 1);
             state.replace_active_goal_for_test(test_active_goal_with_lease(lease.clone())).await;
@@ -4886,59 +3905,12 @@ mod tests {
                     zero_applied_monotonic_ns: 1, ..Default::default()
                 },
             };
-            let poison_tracker = || {
-                assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let _guard = state.cancel.lock().unwrap();
-                    panic!("test-only unavailable cancellation tracker");
-                })).is_err());
-            };
-            if poison_before_commit { poison_tracker(); }
             state.retain_terminal_receipt(&receipt).await;
-            if !poison_before_commit { poison_tracker(); }
             assert!(state.active_goal_lease().await.is_none(),
                 "retirement itself keeps the existing measured full-lease rule");
             assert!(state.terminal_receipt_for(&cancel_input(&lease)).await.is_some());
-            assert_eq!(state.settled_without_child_cancel_terminal_for(&cancel_input(&lease)).await.is_some(),
-                !poison_before_commit,
-                "unknown at commit is no proof; later tracker failure cannot erase an established fact");
+            assert!(state.settled_without_child_cancel_terminal_for(&cancel_input(&lease)).await.is_some());
         }
-    }
-
-    #[tokio::test]
-    async fn unleased_rejection_settles_pending_cancel_without_a_zero_receipt() {
-        let state = NavRuntimeState::from_env();
-        let mut lease = test_lease("cancel-before-lease", 1);
-        lease.path_revision = 3;
-        lease.planner_runtime_generation = 8;
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Planning;
-            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
-        }
-        let CancelStart::Publish { generation, .. } = state.begin_cancel(&cancel_input(&lease)).await else {
-            panic!("原目标可以进入待取消状态");
-        };
-        let update = NavigationUpdate {
-            state: NavState { status: "FAILED".into(), goal_id: lease.session_id.clone(),
-                message: "LEASE_NOT_GRANTED: STALE_STOP_GENERATION".into(), timestamp_ns: now_ns(),
-                ..NavState::default() },
-            feedback: crate::lcm_runtime::NavigationFeedback {
-                reason_code: "LEASE_NOT_GRANTED".into(), owner_kind: lease.owner_kind,
-                parent_request_id: lease.parent_request_id.clone(), goal_generation: lease.goal_generation,
-                producer_runtime_generation: lease.producer_runtime_generation,
-                cancel_generation: generation,  ..Default::default()
-            },
-            producer_runtime_generation: lease.producer_runtime_generation,
-        };
-        let result = state.retire_unleased_goal(update).await.expect("明确无租约终态结束目标和同目标取消");
-        assert!(state.active_goal_lease().await.is_none());
-        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Idle);
-        assert!(!result.feedback.actuator_zeroed);
-        assert!(result.feedback.zero_ack_id.is_empty());
-        assert_eq!(result.feedback.zero_applied_monotonic_ns, 0);
-        let retained = state.terminal_receipt_for(&cancel_input(&lease)).await.unwrap();
-        assert_eq!(retained.feedback.reason_code, "LEASE_NOT_GRANTED");
-        assert_eq!(retained.feedback.path_revision, 0, "未取得路径执行资格的拒绝不虚构路径确认");
     }
 
     fn test_goal_input(goal_id: &str) -> SetGoalInput {
@@ -4978,7 +3950,7 @@ mod tests {
 
     fn test_active_goal_with_lease(lease: GoalLease) -> ActiveGoal {
         ActiveGoal {
-            admitted_guard_clock_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
+            motion_admission: test_motion_admission(),
             options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
             body_to_support_z_m: None, boundary_owner: None,
             id: lease.session_id.clone(),
@@ -5003,38 +3975,18 @@ mod tests {
         }
     }
 
-    fn cancel_ack(
-        lease: &GoalLease,
-        cancel_generation: u64,
-        status: MotionSinkCancelAckStatus,
-    ) -> MotionSinkCancelAck {
-        MotionSinkCancelAck {
-            cancel_generation,
-            goal_id: lease.session_id.clone(),
-            owner_kind: lease.owner_kind,
-            parent_request_id: lease.parent_request_id.clone(),
-            goal_generation: lease.goal_generation,
-            status,
-            message: "test cancellation acknowledgement".to_string(),
-        }
-    }
-
     fn sealed_path(lease: &GoalLease, path_revision: u64, x: f64) -> schema::PathEnvelope {
         let path = schema::PathEnvelope {
             route_kind: 0,
             schema_version: schema::PATH_ENVELOPE_SCHEMA_VERSION,
             session_id: lease.session_id.clone(),
 
-
             goal_generation: lease.goal_generation as i64,
-
 
             producer_runtime_generation: lease.producer_runtime_generation as i64,
 
-
             planner_runtime_generation: 1,
             path_revision: path_revision as i64,
-
 
             path: schema::Path {
                 header: schema::Header {
@@ -5118,20 +4070,21 @@ mod tests {
         assert_eq!(replay.lease_origin, GoalLeaseOrigin::ExistingUnresolved);
         assert_eq!(replay.dispatch_effect, GoalDispatchEffect::NotAttempted);
         assert_eq!(replay.publication, GoalPublicationPolicy::NoPublish);
-        let mut foreign = test_goal_input("foreign-cannot-steal-unknown");
+        let mut foreign = test_goal_input("new-command-replaces-unknown");
         foreign.goal_generation = 62;
-        let busy = set_goal(&handle, &state, foreign).await;
-        assert_eq!(busy.lease_origin, GoalLeaseOrigin::Attempted);
-        assert_eq!(busy.state.status, "FAILED");
-        assert_eq!(state.active_goal_lease().await.as_ref(), Some(&lease));
-        assert_eq!(backend.publish_count(), 1);
         backend.release_one();
-        let pending = cancel(&handle, &state, cancel_input(&lease)).await;
-        assert_eq!(pending.state.status, "PENDING");
-        assert_eq!(state.cancel_snapshot().lease.as_ref(), Some(&lease));
+        let replacement = set_goal(&handle, &state, foreign).await;
+        assert!(replacement.accepted(), "{}", replacement.state.message);
+        let successor = replacement.lease.unwrap();
+        assert_eq!(state.active_goal_lease().await, Some(successor.clone()));
+        let old_cancel = cancel(&handle, &state, cancel_input(&lease)).await;
+        assert_eq!(old_cancel.state.status, "FAILED");
         assert_eq!(backend.publish_count(), 2);
+        backend.release_one();
+        assert_eq!(cancel(&handle, &state, cancel_input(&successor)).await.state.status, "CANCELLED");
+        assert!(state.active_goal_lease().await.is_none());
         assert_eq!(backend.published_message_types(), vec![
-            "nuwax_msgs.GoalEnvelope".to_string(), "nuwax_msgs.CancelNavigation".to_string(),
+            "nuwax_msgs.GoalEnvelope".to_string(), "nuwax_msgs.GoalEnvelope".to_string(), "nuwax_msgs.CancelNavigation".to_string(),
         ]);
         drop(handle);
         owner.finish().await.unwrap();
@@ -5230,7 +4183,7 @@ mod tests {
         foreign.id = foreign.lease.session_id.clone();
         let foreign_lease = foreign.lease.clone();
         state.replace_active_goal_for_test(foreign).await;
-        let cancel_before = state.cancel_snapshot();
+        let cancel_before = state.cancel_generation();
         backend.release_one();
         let outcome = submission.await;
         assert_eq!(outcome.lease_origin, GoalLeaseOrigin::InstalledUnresolved);
@@ -5239,7 +4192,7 @@ mod tests {
         assert_eq!(outcome.publication, GoalPublicationPolicy::NoPublish);
         assert_eq!(state.active_goal_lease().await.as_ref(), Some(&foreign_lease));
         assert_eq!(state.inner.read().await.phase, NavPhase::Running);
-        assert_eq!(state.cancel_snapshot(), cancel_before);
+        assert_eq!(state.cancel_generation(), cancel_before);
         assert_eq!(backend.publish_count(), 1);
         drop(handle);
         owner.finish().await.unwrap();
@@ -5254,7 +4207,6 @@ mod tests {
         assert_eq!(NavPhase::Running.as_str(), "RUNNING");
         assert_eq!(NavPhase::Succeeded.as_str(), "SUCCEEDED");
         assert_eq!(NavPhase::Cancelled.as_str(), "CANCELLED");
-        assert_eq!(NavPhase::CancelPending.as_str(), "PENDING");
         assert_eq!(NavPhase::Failed.as_str(), "FAILED");
     }
 
@@ -5432,7 +4384,7 @@ mod tests {
         let accepted = set_goal(&handle, &state, input).await;
         let lease = accepted.lease.expect("accepted lease");
         let outcome = cancel(&handle, &state, cancel_input(&lease)).await;
-        assert_eq!(outcome.state.status, "PENDING");
+        assert_eq!(outcome.state.status, "CANCELLED");
         assert_eq!(outcome.state.goal_id, "g3");
         let cancellation = tokio::time::timeout(Duration::from_secs(1), cancellations.next())
             .await
@@ -5442,7 +4394,7 @@ mod tests {
         let cancellation =
             nuwax_codec::lcm::schema::decode_cancel_navigation_body(&cancellation.payload)
                 .expect("decode cancellation");
-        let pending = state.cancel_snapshot();
+        let pending = state.cancel_generation();
         assert_eq!(cancellation.session_id, "g3");
         assert_eq!(cancellation.owner_kind, lease.owner_kind);
         assert_eq!(cancellation.parent_request_id, lease.parent_request_id);
@@ -5451,11 +4403,51 @@ mod tests {
             cancellation.producer_runtime_generation,
             lease.producer_runtime_generation as i64
         );
-        assert_eq!(cancellation.cancel_generation, pending.generation as i64);
+        assert_eq!(cancellation.cancel_generation, pending as i64);
         assert!(cancellation.cancel_generation > 0);
         let slot = state.inner.read().await;
-        assert_eq!(slot.phase, NavPhase::CancelPending);
-        assert!(slot.goal.is_some());
+        assert_eq!(slot.phase, NavPhase::Cancelled);
+        assert!(slot.goal.is_none());
+    }
+
+    #[tokio::test]
+    async fn older_motion_generation_is_rejected_and_equal_or_newer_replaces_current_goal() {
+        let handle = make_handle().await;
+        let state = NavRuntimeState::from_env();
+        observe_ready_execution_chain(&state).await;
+        let mut first = test_goal_input("latest-10"); first.motion_admission.motion_stop_generation = 10;
+        let admitted = set_goal(&handle, &state, first).await;
+        assert!(admitted.accepted(), "{}", admitted.state.message);
+        let original = state.active_goal_lease().await;
+        let mut stale = test_goal_input("stale-9"); stale.motion_admission.motion_stop_generation = 9;
+        let rejected = set_goal(&handle, &state, stale).await;
+        assert_eq!(rejected.reject_reason, Some(SetGoalRejectReason::GoalGenerationStale));
+        assert_eq!(state.active_goal_lease().await, original);
+        assert_eq!(state.inner.read().await.goal.as_ref().unwrap().motion_admission.motion_stop_generation, 10);
+        for generation in [10, 11] {
+            let mut next = test_goal_input(&format!("replacement-{generation}"));
+            next.motion_admission.motion_stop_generation = generation;
+            let result = set_goal(&handle, &state, next).await;
+            assert!(result.accepted(), "{}", result.state.message);
+            assert_eq!(state.active_goal_lease().await.unwrap().session_id, format!("replacement-{generation}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_terminal_after_one_publish_without_retry_or_zero_receipt() {
+        let (handle, backend) = make_blocking_handle([]).await;
+        let state = NavRuntimeState::from_env();
+        let lease = test_lease("one-cancel", 1);
+        state.replace_active_goal_for_test(test_active_goal_with_lease(lease.clone())).await;
+        backend.release_one();
+        let result = cancel(&handle, &state, cancel_input(&lease)).await;
+        assert_eq!(result.state.status, "CANCELLED");
+        assert!(state.active_goal_lease().await.is_none());
+        assert_eq!(backend.publish_count(), 1);
+        let repeated = cancel(&handle, &state, cancel_input(&lease)).await;
+        assert_eq!(repeated.state.status, "FAILED");
+        assert_eq!(backend.publish_count(), 1);
+        assert_eq!(state.cancel_generation(), 1);
     }
 
     #[tokio::test]
@@ -5608,7 +4600,7 @@ mod tests {
             .expect("committed map authority")
             .is_none());
         let state = NavRuntimeState::from_env();
-        let cancel_before = state.cancel_snapshot();
+        let cancel_before = state.cancel_generation();
         let next_cancel_before = state.next_cancel_generation.load(AtomicOrdering::Acquire);
 
         let outcome = set_goal(
@@ -5633,7 +4625,7 @@ mod tests {
         assert_eq!(slot.phase, NavPhase::Idle);
         drop(slot);
         assert_eq!(state.next_goal_generation.load(AtomicOrdering::Acquire), 0);
-        assert_eq!(state.cancel_snapshot(), cancel_before);
+        assert_eq!(state.cancel_generation(), cancel_before);
         assert_eq!(
             state.next_cancel_generation.load(AtomicOrdering::Acquire),
             next_cancel_before
@@ -5747,62 +4739,6 @@ mod tests {
         assert!(state.inner.read().await.goal.is_none());
         assert_eq!(state.next_goal_generation.load(AtomicOrdering::Acquire), 0);
         assert_eq!(backend.publish_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn ordinary_global_stop_retires_failed_nav_and_cannot_clear_or_publish_over_successor() {
-        let handle = make_handle().await;
-        let state = NavRuntimeState::with_profile_and_producer_runtime_generation(PROFILE_SIMPLE_2D, 1);
-        observe_ready_execution_chain(&state).await;
-        let first = set_goal(&handle, &state, test_goal_input("ordinary-old-nav")).await;
-        assert_eq!(first.state.status, "ACCEPTED", "{}", first.state.message);
-        let old = first.lease.unwrap();
-        let input = cancel_input(&old);
-        let CancelStart::Publish { generation, .. } = state.begin_cancel(&input).await else { panic!("原目标取消接纳"); };
-        let failed = state.observe_cancel_ack(cancel_ack(&old, generation, MotionSinkCancelAckStatus::Failed)).await;
-        assert_eq!(failed.state.status, "FAILED");
-        assert!(state.active_goal_lease().await.is_some());
-        // 此单元测试注入停车事实，只验证原身份和退休流程；真实守卫另有UDS组合。
-        let proof = crate::proto::OrdinaryGlobalStopConfirmation {
-            operation_id: "ordinary-stop".into(), zero_ack_id: "actual-zero-fixture".into(),
-            applied_monotonic_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
-            stationary_confirmed: true,
-        };
-        let (retired, changed) = state.retire_goal_after_global_stop(&input, &proof).await.unwrap();
-        assert!(changed);
-        assert_eq!(retired.state.status, "FAILED");
-        assert_eq!(retired.feedback.reason_code, "GLOBAL_STOP_CONFIRMED");
-        assert_eq!(retired.feedback.cancel_generation, 0);
-        assert_eq!(retired.feedback.zero_ack_id, proof.zero_ack_id);
-        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Idle);
-        observe_ready_execution_chain(&state).await;
-        let second = set_goal(&handle, &state, test_goal_input("ordinary-successor")).await;
-        assert_eq!(second.state.status, "ACCEPTED", "{}", second.state.message);
-        let successor = second.lease.unwrap();
-        handle.state.write().await.nav_state = second.state.clone();
-        assert!(!state.publish_global_stop_retirement(&retired, &handle.state, &handle.nav_state_tx).await);
-        assert_eq!(handle.state.read().await.nav_state.goal_id, successor.session_id);
-        let (_, replay_changed) = state.retire_goal_after_global_stop(&input, &proof).await.unwrap();
-        assert!(!replay_changed);
-        assert!(state.retire_goal_after_global_stop(&cancel_input(&successor), &proof).await.is_err());
-        assert_eq!(state.active_goal_lease().await, Some(successor));
-    }
-
-    #[tokio::test]
-    async fn ordinary_global_stop_requires_stationary_and_exact_goal_identity() {
-        let state = NavRuntimeState::with_profile_and_producer_runtime_generation(PROFILE_SIMPLE_2D, 1);
-        let lease = test_lease("ordinary-protected", 1);
-        state.replace_active_goal_for_test(test_active_goal_with_lease(lease.clone())).await;
-        let mut proof = crate::proto::OrdinaryGlobalStopConfirmation {
-            operation_id: "ordinary-stop".into(), zero_ack_id: "actual-zero-fixture".into(),
-            applied_monotonic_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
-            stationary_confirmed: false,
-        };
-        assert!(state.retire_goal_after_global_stop(&cancel_input(&lease), &proof).await.is_err());
-        proof.stationary_confirmed = true;
-        let mut wrong = cancel_input(&lease); wrong.goal_generation += 1;
-        assert!(state.retire_goal_after_global_stop(&wrong, &proof).await.is_err());
-        assert_eq!(state.active_goal_lease().await, Some(lease));
     }
 
     #[tokio::test]
@@ -6155,7 +5091,7 @@ mod tests {
             .map_revision_latest_tx
             .send_replace(Some(replacement));
 
-        let cancel_before = state.cancel_snapshot();
+        let cancel_before = state.cancel_generation();
         let next_cancel_before = state.next_cancel_generation.load(AtomicOrdering::Acquire);
         let outcome = admit_goal_intent(
             &admission,
@@ -6180,7 +5116,7 @@ mod tests {
         assert!(outcome.lease.is_none());
         assert!(state.inner.read().await.goal.is_none());
         assert_eq!(state.next_goal_generation.load(AtomicOrdering::Acquire), 0);
-        assert_eq!(state.cancel_snapshot(), cancel_before);
+        assert_eq!(state.cancel_generation(), cancel_before);
         assert_eq!(
             state.next_cancel_generation.load(AtomicOrdering::Acquire),
             next_cancel_before
@@ -6220,277 +5156,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn goal_lease_cas_is_idempotent_and_cross_owner_requests_are_busy() {
-        let handle = make_handle().await;
-        let public_state = NavRuntimeState::from_env();
-        observe_ready_execution_chain(&public_state).await;
-        let mut public = test_goal_input("public-1");
-        public.goal_generation = 10;
-        let first = set_goal(&handle, &public_state, public.clone()).await;
-        assert_eq!(first.state.status, "ACCEPTED");
-        let replay = set_goal(&handle, &public_state, public).await;
-        assert_eq!(replay.state.status, "ACCEPTED");
-        assert!(replay.state.message.contains("GOAL_LEASE_IDEMPOTENT"));
-        assert_eq!(first.lease, replay.lease);
-
-        let mut child = test_goal_input("child-1");
-        child.owner_kind = schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD;
-        child.parent_request_id = "explore-1".to_string();
-        child.goal_generation = 11;
-        let child_rejected =
-            set_exploration_goal_for_test(&handle, &public_state, child, None).await;
-        assert_eq!(child_rejected.state.status, "FAILED");
-        assert!(child_rejected.state.message.contains("GOAL_LEASE_BUSY"));
-        assert_eq!(
-            public_state.active_goal_lease().await.unwrap().owner_kind,
-            schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV
-        );
-
-        let child_state = NavRuntimeState::from_env();
-        observe_ready_execution_chain(&child_state).await;
-        let mut child = test_goal_input("child-2");
-        child.owner_kind = schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD;
-        child.parent_request_id = "explore-2".to_string();
-        child.goal_generation = 20;
-        assert_eq!(
-            set_exploration_goal_for_test(&handle, &child_state, child, None)
-                .await
-                .state
-                .status,
-            "ACCEPTED"
-        );
-        let mut public = test_goal_input("public-2");
-        public.goal_generation = 21;
-        let public_rejected = set_goal(&handle, &child_state, public).await;
-        assert_eq!(public_rejected.state.status, "FAILED");
-        assert!(public_rejected.state.message.contains("GOAL_LEASE_BUSY"));
-        assert_eq!(
-            child_state.active_goal_lease().await.unwrap().owner_kind,
-            schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn set_goal_publishes_slot_and_resets_cancel_in_one_critical_section() {
+    async fn goal_lease_is_idempotent_and_new_owners_replace_directly() {
         let handle = make_handle().await;
         let state = NavRuntimeState::from_env();
         observe_ready_execution_chain(&state).await;
-        let lease_a = test_lease("set-goal-window-a", 1);
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Running;
-            slot.goal = Some(test_active_goal_with_lease(lease_a.clone()));
-        }
-        let CancelStart::Publish {
-            generation: cancel_generation_a,
-            ..
-        } = state.begin_cancel(&cancel_input(&lease_a)).await
-        else {
-            panic!("cancel A must reserve one exact generation");
-        };
-        let zeroed_a = state
-            .observe_cancel_ack(MotionSinkCancelAck {
-                cancel_generation: cancel_generation_a,
-                goal_id: lease_a.session_id.clone(),
-                owner_kind: lease_a.owner_kind,
-                parent_request_id: lease_a.parent_request_id.clone(),
-                goal_generation: lease_a.goal_generation,
-                status: MotionSinkCancelAckStatus::Zeroed,
-                message: "replacement fixture zeroed old lease".to_string(),
-            })
-            .await;
-        assert_eq!(zeroed_a.state.status, "CANCELLED");
-        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Zeroed);
-        assert!(state.active_goal_lease().await.is_none());
-
-        let cancel_mutex = state.cancel.clone();
-        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let blocker = std::thread::spawn(move || {
-            let _guard = cancel_mutex.lock().expect("cancel tracker");
-            locked_tx.send(()).expect("report tracker lock");
-            release_rx.recv().expect("release tracker lock");
-        });
-        locked_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("tracker blocker started");
-        let task_handle = handle.clone();
-        let task_state = state.clone();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let set_b = tokio::spawn(async move {
-            let _ = started_tx.send(());
-            let mut input = test_goal_input("set-goal-window-b");
-            input.goal_generation = 2;
-            set_goal(&task_handle, &task_state, input).await
-        });
-        started_rx.await.expect("set-goal B task started");
-
-        let leaked_b = tokio::time::timeout(Duration::from_millis(200), async {
-            loop {
-                if let Ok(slot) = state.inner.try_read() {
-                    if slot
-                        .goal
-                        .as_ref()
-                        .is_some_and(|goal| goal.id == "set-goal-window-b")
-                    {
-                        return;
-                    }
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-        assert!(
-            leaked_b.is_err(),
-            "B must not become visible before its cancel-tracker reset commits"
-        );
-
-        release_tx.send(()).expect("release tracker blocker");
-        blocker.join().expect("tracker blocker thread");
-        let accepted = tokio::time::timeout(Duration::from_secs(1), set_b)
-            .await
-            .expect("set-goal B must finish after tracker release")
-            .expect("set-goal B task");
-        assert_eq!(accepted.state.status, "ACCEPTED");
-        let lease_b = accepted.lease.expect("B lease");
-        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Idle);
-        assert_eq!(state.active_goal_lease().await.as_ref(), Some(&lease_b));
-
-        let cancel_b = cancel(&handle, &state, cancel_input(&lease_b)).await;
-        assert_eq!(cancel_b.state.status, "PENDING");
-        assert_eq!(cancel_b.lease.as_ref(), Some(&lease_b));
+        let mut first = test_goal_input("public-1"); first.goal_generation = 10;
+        let initial = set_goal(&handle, &state, first.clone()).await;
+        assert!(initial.accepted());
+        let replay = set_goal(&handle, &state, first).await;
+        assert!(replay.accepted()); assert_eq!(replay.lease, initial.lease);
+        let mut child = test_goal_input("child-2"); child.owner_kind = schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD;
+        child.parent_request_id = "exploration-parent".into(); child.goal_generation = 11;
+        let replacement = set_exploration_goal_for_test(&handle, &state, child, None).await;
+        assert!(replacement.accepted(), "{}", replacement.state.message);
+        assert_eq!(state.active_goal_lease().await, replacement.lease);
+        let old_cancel = cancel(&handle, &state, cancel_input(initial.lease.as_ref().unwrap())).await;
+        assert_eq!(old_cancel.state.status, "FAILED");
+        assert_eq!(state.active_goal_lease().await, replacement.lease);
+        let mut next = test_goal_input("public-3"); next.goal_generation = 12;
+        let result = set_goal(&handle, &state, next).await;
+        assert!(result.accepted()); assert_eq!(state.active_goal_lease().await, result.lease);
     }
 
     #[tokio::test]
-    async fn cancel_waits_until_goal_publish_commits_and_preserves_frame_order() {
-        let (handle, backend) = make_blocking_handle([None, None]).await;
-        let state = NavRuntimeState::from_env();
+    async fn cancel_during_goal_publish_does_not_wait_or_restore_cancelled_goal() {
+        let (handle, backend, owner) = make_unit_blocking_handle([]).await;
+        backend.outcomes.lock().unwrap().push_back(Some(TransportError::NotDispatched(
+            Box::new(TransportError::LcmBackend("goal not dispatched".into())))));
+        let state = NavRuntimeState::with_profile_and_producer_runtime_generation(PROFILE_SIMPLE_2D, 1);
         observe_ready_execution_chain(&state).await;
-        let set_handle = handle.clone();
-        let set_state = state.clone();
-        let set_goal_task = tokio::spawn(async move {
-            let mut input = test_goal_input("goal-publish-order");
-            input.goal_generation = 1;
-            set_goal(&set_handle, &set_state, input).await
-        });
+        let goal = tokio::spawn({ let handle=handle.clone();let state=state.clone();
+            async move { set_goal(&handle, &state, test_goal_input("cancel-during-publish")).await } });
         backend.wait_for_publish_count(1).await;
-        let lease = state
-            .active_goal_lease()
-            .await
-            .expect("prepared goal lease is available for the exact cancel request");
-
-        let cancel_handle = handle.clone();
-        let cancel_state = state.clone();
-        let cancel_lease = lease.clone();
-        let cancel_task = tokio::spawn(async move {
-            cancel(&cancel_handle, &cancel_state, cancel_input(&cancel_lease)).await
-        });
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(100),
-                backend.wait_for_publish_count(2),
-            )
-            .await
-            .is_err(),
-            "a cancel frame must not overtake an in-flight goal frame"
-        );
-
-        backend.release_one();
-        let accepted = tokio::time::timeout(Duration::from_secs(1), set_goal_task)
-            .await
-            .expect("goal publish must finish")
-            .expect("set-goal task");
-        assert_eq!(accepted.state.status, "ACCEPTED");
+        let lease = state.active_goal_lease().await.unwrap();
+        let cancellation = tokio::spawn({ let handle=handle.clone();let state=state.clone();
+            async move { cancel(&handle, &state, cancel_input(&lease)).await } });
         backend.wait_for_publish_count(2).await;
-        assert_eq!(
-            backend.published_message_types(),
-            vec![
-                "nuwax_msgs.GoalEnvelope".to_string(),
-                "nuwax_msgs.CancelNavigation".to_string(),
-            ]
-        );
-        assert_eq!(
-            backend.published_channels(),
-            vec![
-                "/nav/goal#nuwax_msgs.GoalEnvelope".to_string(),
-                "/nav/cancel#nuwax_msgs.CancelNavigation".to_string(),
-            ]
-        );
-        backend.release_one();
-        let pending = tokio::time::timeout(Duration::from_secs(1), cancel_task)
-            .await
-            .expect("cancel publish must finish")
-            .expect("cancel task");
-        assert_eq!(pending.state.status, "PENDING");
-        assert_eq!(pending.lease.as_ref(), Some(&lease));
-        let cancel_snapshot = state.cancel_snapshot();
-        assert_eq!(cancel_snapshot.phase, CancelPhase::Pending);
-        assert_eq!(cancel_snapshot.generation, 1);
-        assert_eq!(
-            state.next_cancel_generation.load(AtomicOrdering::Acquire),
-            cancel_snapshot.generation
-        );
-        assert_eq!(backend.publish_count(), 2);
-    }
-
-    #[tokio::test]
-    async fn failed_goal_publish_rolls_back_before_exact_cancel_can_start() {
-        let (handle, backend) =
-            make_definite_blocking_handle("goal publish failed").await;
-        let state = NavRuntimeState::from_env();
-        observe_ready_execution_chain(&state).await;
-        let set_handle = handle.clone();
-        let set_state = state.clone();
-        let set_goal_task = tokio::spawn(async move {
-            let mut input = test_goal_input("goal-publish-failure");
-            input.goal_generation = 1;
-            set_goal(&set_handle, &set_state, input).await
-        });
-        backend.wait_for_publish_count(1).await;
-        let lease = state
-            .active_goal_lease()
-            .await
-            .expect("prepared goal lease");
-
-        let cancel_handle = handle.clone();
-        let cancel_state = state.clone();
-        let cancel_lease = lease.clone();
-        let cancel_task = tokio::spawn(async move {
-            cancel(&cancel_handle, &cancel_state, cancel_input(&cancel_lease)).await
-        });
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(100),
-                backend.wait_for_publish_count(2),
-            )
-            .await
-            .is_err(),
-            "a cancel frame must not be published for an uncommitted goal"
-        );
-
-        backend.release_one();
-        let failed = tokio::time::timeout(Duration::from_secs(1), set_goal_task)
-            .await
-            .expect("failed goal publish must return")
-            .expect("set-goal task");
-        let rejected_cancel = tokio::time::timeout(Duration::from_secs(1), cancel_task)
-            .await
-            .expect("cancel must reject after goal rollback")
-            .expect("cancel task");
-        assert_eq!(failed.state.status, "FAILED");
-        assert_eq!(rejected_cancel.state.status, "FAILED");
-        assert!(rejected_cancel.state.message.contains("GOAL_LEASE_MISSING"));
-        assert_eq!(backend.publish_count(), 1);
-        assert_eq!(
-            backend.published_message_types(),
-            vec!["nuwax_msgs.GoalEnvelope".to_string()]
-        );
         assert!(state.active_goal_lease().await.is_none());
-        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Idle);
-        assert_eq!(
-            state.next_cancel_generation.load(AtomicOrdering::Acquire),
-            0
-        );
+        backend.release_one();
+        let _ = goal.await.unwrap();
+        backend.release_one();
+        assert_eq!(cancellation.await.unwrap().state.status, "CANCELLED");
+        assert!(state.active_goal_lease().await.is_none());
+        drop(handle); owner.finish().await.unwrap();
     }
 
     #[tokio::test]
@@ -6694,52 +5402,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_captures_confirmed_path_and_freezes_candidate_promotion() {
-        let state = NavRuntimeState::from_env();
-        let lease = test_lease("cancel-confirmed-path", 1);
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Running;
-            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
-        }
-
-        let candidate = state
-            .observe_path_envelope(&sealed_path(&lease, 1, 1.0))
-            .await
-            .unwrap();
-        state
-            .observe_path_envelope(&sealed_path(&lease, 2, 2.0))
-            .await
-            .expect("newer planner path candidate");
-
-        let CancelStart::Publish {
-            lease: cancel_lease,
-            ..
-        } = state.begin_cancel(&cancel_input(&lease)).await
-        else {
-            panic!("cancel must capture the confirmed lease");
-        };
-        assert_eq!(cancel_lease, lease);
-        assert_eq!(state.cancel_snapshot().lease.as_ref(), Some(&lease));
-
-        let rejected = state
-            .correlate_navigation_state(
-                &lease.session_id,
-                lease.owner_kind,
-                &lease.parent_request_id,
-                lease.goal_generation,
-                2,
-                lease.producer_runtime_generation,
-                sealed_path(&lease, 2, 2.0).planner_runtime_generation as u64,
-            )
-            .await
-            .expect_err("pending cancel freezes the confirmed path lease");
-        assert!(rejected.contains("path_revision"));
-        assert_eq!(state.active_goal_lease().await.as_ref(), Some(&lease));
-        assert_eq!(candidate.path_revision, 1);
-    }
-
-    #[tokio::test]
     async fn cancel_requires_complete_matching_goal_lease() {
         let handle = make_handle().await;
         let state = NavRuntimeState::from_env();
@@ -6754,7 +5416,7 @@ mod tests {
         let rejected = cancel(&handle, &state, wrong).await;
         assert_eq!(rejected.state.status, "FAILED");
         assert!(rejected.state.message.contains("GOAL_LEASE_MISMATCH"));
-        assert_eq!(state.cancel_snapshot().generation, 0);
+        assert_eq!(state.cancel_generation(), 0);
         assert!(state.active_goal_lease().await.is_some());
     }
 
@@ -6782,7 +5444,7 @@ mod tests {
         assert_eq!(rejected.state.status, "FAILED");
         assert!(rejected.state.message.contains("GOAL_LEASE_MISMATCH"));
         assert_eq!(backend.publish_count(), 0);
-        assert_eq!(state.cancel_snapshot().generation, 0);
+        assert_eq!(state.cancel_generation(), 0);
 
         let exact_handle = handle.clone();
         let exact_state = state.clone();
@@ -6791,97 +5453,14 @@ mod tests {
             cancel(&exact_handle, &exact_state, cancel_input(&exact_lease)).await
         });
         backend.wait_for_publish_count(1).await;
-        let pending = state.cancel_snapshot();
-        assert_eq!(pending.lease.as_ref(), Some(&lease_b));
-        let zeroed = state
-            .observe_cancel_ack(MotionSinkCancelAck {
-                cancel_generation: pending.generation,
-                goal_id: lease_b.session_id.clone(),
-                owner_kind: lease_b.owner_kind,
-                parent_request_id: lease_b.parent_request_id.clone(),
-                goal_generation: lease_b.goal_generation,
-                status: MotionSinkCancelAckStatus::Zeroed,
-                message: "epoch 42 zeroed".into(),
-            })
-            .await;
-        assert_eq!(zeroed.state.status, "CANCELLED");
+        assert!(state.cancel_generation() > 0);
+        assert!(state.active_goal_lease().await.is_none());
         backend.release_one();
         assert_eq!(
             exact.await.expect("exact epoch cancel").state.status,
             "CANCELLED"
         );
         assert_eq!(backend.publish_count(), 1);
-    }
-
-    #[tokio::test]
-    async fn cancel_first_freezes_path_lease_and_keeps_retry_and_zero_correlated() {
-        let (handle, backend) = make_blocking_handle([None, None]).await;
-        let state = NavRuntimeState::from_env();
-        let lease = test_lease("cancel-first", 1);
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Running;
-            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
-        }
-
-        let first_handle = handle.clone();
-        let first_state = state.clone();
-        let first_lease = lease.clone();
-        let first = tokio::spawn(async move {
-            cancel(&first_handle, &first_state, cancel_input(&first_lease)).await
-        });
-        backend.wait_for_publish_count(1).await;
-        let pending = state.cancel_snapshot();
-
-        let rejected_path = state
-            .observe_path_envelope(&sealed_path(&lease, 1, 1.0))
-            .await
-            .expect_err("a pending cancellation must freeze the active path lease");
-        assert!(rejected_path.contains("CANCEL_PENDING"));
-        assert_eq!(state.active_goal_lease().await.as_ref(), Some(&lease));
-
-        let retry = cancel(&handle, &state, cancel_input(&lease)).await;
-        assert_eq!(retry.state.status, "PENDING");
-        assert!(retry
-            .state
-            .message
-            .contains("CANCEL_PENDING_PUBLISH_IN_FLIGHT_JOIN"));
-        assert_eq!(retry.lease.as_ref(), Some(&lease));
-        assert_eq!(state.cancel_snapshot().generation, pending.generation);
-        assert_eq!(backend.publish_count(), 1);
-        assert_eq!(
-            backend.published_cancel_generations(),
-            vec![pending.generation as i64]
-        );
-
-        let correlated = state
-            .correlate_navigation_state(
-                &lease.session_id,
-                lease.owner_kind,
-                &lease.parent_request_id,
-                lease.goal_generation,
-                lease.path_revision,
-                lease.producer_runtime_generation,
-                lease.planner_runtime_generation,
-            )
-            .await
-            .expect("the retained pre-cancel path lease must correlate")
-            .expect("active lease");
-        assert_eq!(correlated, lease);
-        let zeroed = state
-            .observe_cancel_ack(MotionSinkCancelAck {
-                cancel_generation: pending.generation,
-                goal_id: lease.session_id.clone(),
-                owner_kind: lease.owner_kind,
-                parent_request_id: lease.parent_request_id.clone(),
-                goal_generation: lease.goal_generation,
-                status: MotionSinkCancelAckStatus::Zeroed,
-                message: "cancel-first zeroed".into(),
-            })
-            .await;
-        assert_eq!(zeroed.state.status, "CANCELLED");
-        backend.release_one();
-        assert_eq!(first.await.expect("first cancel").state.status, "CANCELLED");
     }
 
     #[tokio::test]
@@ -6928,77 +5507,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn path_first_cancel_captures_confirmed_pre_path_lease_and_exact_retry() {
-        let (handle, backend) = make_blocking_handle([None, None]).await;
-        let state = NavRuntimeState::from_env();
-        let lease = test_lease("path-first", 1);
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Running;
-            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
-        }
-        let candidate = state
-            .observe_path_envelope(&sealed_path(&lease, 1, 2.0))
-            .await
-            .expect("path is retained before cancel");
-        assert_eq!(candidate.path_revision, 1);
-        assert_eq!(state.active_goal_lease().await.as_ref(), Some(&lease));
-
-        let first_handle = handle.clone();
-        let first_state = state.clone();
-        let first_lease = lease.clone();
-        let first = tokio::spawn(async move {
-            cancel(&first_handle, &first_state, cancel_input(&first_lease)).await
-        });
-        backend.wait_for_publish_count(1).await;
-        let pending = state.cancel_snapshot();
-        assert_eq!(pending.lease.as_ref(), Some(&lease));
-
-        let retry = cancel(&handle, &state, cancel_input(&lease)).await;
-        assert_eq!(retry.state.status, "PENDING");
-        assert!(retry
-            .state
-            .message
-            .contains("CANCEL_PENDING_PUBLISH_IN_FLIGHT_JOIN"));
-        assert_eq!(retry.lease.as_ref(), Some(&lease));
-        assert_eq!(state.cancel_snapshot().generation, pending.generation);
-        assert_eq!(backend.publish_count(), 1);
-        assert_eq!(
-            backend.published_cancel_generations(),
-            vec![pending.generation as i64]
-        );
-
-        let correlated = state
-            .correlate_navigation_state(
-                &lease.session_id,
-                lease.owner_kind,
-                &lease.parent_request_id,
-                lease.goal_generation,
-                lease.path_revision,
-                lease.producer_runtime_generation,
-                lease.planner_runtime_generation,
-            )
-            .await
-            .expect("confirmed pre-path lease correlation")
-            .expect("active lease");
-        assert_eq!(correlated, lease);
-        let zeroed = state
-            .observe_cancel_ack(MotionSinkCancelAck {
-                cancel_generation: pending.generation,
-                goal_id: lease.session_id.clone(),
-                owner_kind: lease.owner_kind,
-                parent_request_id: lease.parent_request_id.clone(),
-                goal_generation: lease.goal_generation,
-                status: MotionSinkCancelAckStatus::Zeroed,
-                message: "path-first retry zeroed".into(),
-            })
-            .await;
-        assert_eq!(zeroed.state.status, "CANCELLED");
-        backend.release_one();
-        assert_eq!(first.await.expect("first cancel").state.status, "CANCELLED");
-    }
-
-    #[tokio::test]
     async fn candidate_from_replaced_goal_cannot_promote_replacement_lease() {
         let state = NavRuntimeState::from_env();
         let lease_a = test_lease("candidate-a", 1);
@@ -7034,1046 +5542,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_path_retry_and_zero_ack_commit_one_cancel_generation_atomically() {
-        let (handle, backend) = make_blocking_handle([None]).await;
-        let state = NavRuntimeState::from_env();
-        let lease = test_lease("queued-zero", 1);
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Running;
-            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
-        }
-
-        let first_handle = handle.clone();
-        let first_state = state.clone();
-        let first_lease = lease.clone();
-        let first = tokio::spawn(async move {
-            cancel(&first_handle, &first_state, cancel_input(&first_lease)).await
-        });
-        backend.wait_for_publish_count(1).await;
-        let pending = state.cancel_snapshot();
-        assert_eq!(pending.phase, CancelPhase::Pending);
-
-        let slot_guard = state.inner.write().await;
-        let queued_path_frame = sealed_path(&lease, 1, 1.0);
-        let mut queued_path = Box::pin(state.observe_path_envelope(&queued_path_frame));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), queued_path.as_mut())
-                .await
-                .is_err(),
-            "path must be queued behind the held slot"
-        );
-
-        let mut queued_retry = Box::pin(cancel(&handle, &state, cancel_input(&lease)));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), queued_retry.as_mut())
-                .await
-                .is_err(),
-            "the exact retry must queue behind the path"
-        );
-        let mut second_queued_retry = Box::pin(cancel(&handle, &state, cancel_input(&lease)));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), second_queued_retry.as_mut())
-                .await
-                .is_err(),
-            "the second exact retry must queue behind the first retry"
-        );
-
-        let mut queued_ack = Box::pin(state.observe_cancel_ack(MotionSinkCancelAck {
-            cancel_generation: pending.generation,
-            goal_id: lease.session_id.clone(),
-            owner_kind: lease.owner_kind,
-            parent_request_id: lease.parent_request_id.clone(),
-            goal_generation: lease.goal_generation,
-            status: MotionSinkCancelAckStatus::Zeroed,
-            message: "queued ZEROED".into(),
-        }));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), queued_ack.as_mut())
-                .await
-                .is_err(),
-            "the acknowledgement must queue behind the retry"
-        );
-        assert_eq!(
-            state.cancel_snapshot().phase,
-            CancelPhase::Pending,
-            "the tracker must remain frozen until slot and tracker can commit together"
-        );
-
-        drop(slot_guard);
-        backend.release_one();
-        let ((path_result, retry, second_retry, ack), first_outcome) =
-            tokio::time::timeout(Duration::from_secs(1), async {
-                let queued =
-                    tokio::join!(queued_path, queued_retry, second_queued_retry, queued_ack);
-                let first_outcome = first.await.expect("first cancel task");
-                (queued, first_outcome)
-            })
-            .await
-            .expect("queued cancel transaction must complete without deadlock");
-        assert!(path_result
-            .expect_err("the queued path must observe the pending freeze")
-            .contains("CANCEL_PENDING"));
-        assert_eq!(retry.state.status, "PENDING");
-        assert!(retry
-            .state
-            .message
-            .contains("CANCEL_PENDING_PUBLISH_IN_FLIGHT_JOIN"));
-        assert_eq!(retry.lease.as_ref(), Some(&lease));
-        assert_eq!(second_retry.state.status, "PENDING");
-        assert!(second_retry
-            .state
-            .message
-            .contains("CANCEL_PENDING_PUBLISH_IN_FLIGHT_JOIN"));
-        assert_eq!(second_retry.lease.as_ref(), Some(&lease));
-        assert_eq!(state.cancel_snapshot().generation, pending.generation);
-        assert_eq!(
-            backend.published_cancel_generations(),
-            vec![pending.generation as i64]
-        );
-
-        assert_eq!(ack.state.status, "CANCELLED");
-        assert!(state.active_goal_lease().await.is_none());
-        let terminal = state.cancel_snapshot();
-        assert_eq!(terminal.generation, pending.generation);
-        assert_eq!(terminal.phase, CancelPhase::Zeroed);
-
-        assert_eq!(first_outcome.state.status, "CANCELLED");
-        assert_eq!(backend.publish_count(), 1);
-    }
-
-    #[tokio::test]
-    async fn queued_path_remains_frozen_until_failed_ack_commits_slot_and_tracker() {
-        let handle = make_handle().await;
-        let state = NavRuntimeState::from_env();
-        let lease = test_lease("queued-failed", 1);
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Running;
-            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
-        }
-        assert_eq!(
-            cancel(&handle, &state, cancel_input(&lease))
-                .await
-                .state
-                .status,
-            "PENDING"
-        );
-        let pending = state.cancel_snapshot();
-
-        let slot_guard = state.inner.write().await;
-        let queued_path_frame = sealed_path(&lease, 1, 2.0);
-        let mut queued_path = Box::pin(state.observe_path_envelope(&queued_path_frame));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), queued_path.as_mut())
-                .await
-                .is_err()
-        );
-        let mut queued_ack = Box::pin(state.observe_cancel_ack(MotionSinkCancelAck {
-            cancel_generation: pending.generation,
-            goal_id: lease.session_id.clone(),
-            owner_kind: lease.owner_kind,
-            parent_request_id: lease.parent_request_id.clone(),
-            goal_generation: lease.goal_generation,
-            status: MotionSinkCancelAckStatus::Failed,
-            message: "queued failure".into(),
-        }));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), queued_ack.as_mut())
-                .await
-                .is_err()
-        );
-        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Pending);
-
-        drop(slot_guard);
-        let (path_result, failed) = tokio::time::timeout(Duration::from_secs(1), async {
-            tokio::join!(queued_path, queued_ack)
-        })
-        .await
-        .expect("queued failed acknowledgement must complete without deadlock");
-        assert!(path_result
-            .expect_err("the queued path must remain frozen")
-            .contains("CANCEL_PENDING"));
-        assert_eq!(failed.state.status, "FAILED");
-        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Failed);
-        let slot = state.inner.read().await;
-        assert_eq!(slot.phase, NavPhase::Failed);
-        assert_eq!(slot.goal.as_ref().map(|goal| &goal.lease), Some(&lease));
-    }
-
-    #[tokio::test]
-    async fn queued_path_remains_frozen_until_timeout_commits_slot_and_tracker() {
-        let handle = make_handle().await;
-        let state = NavRuntimeState::from_env();
-        let lease = test_lease("queued-timeout", 1);
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Running;
-            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
-        }
-        assert_eq!(
-            cancel(&handle, &state, cancel_input(&lease))
-                .await
-                .state
-                .status,
-            "PENDING"
-        );
-        state.expire_cancel_for_test();
-
-        let slot_guard = state.inner.write().await;
-        let queued_path_frame = sealed_path(&lease, 1, 3.0);
-        let mut queued_path = Box::pin(state.observe_path_envelope(&queued_path_frame));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), queued_path.as_mut())
-                .await
-                .is_err()
-        );
-        let mut queued_timeout = Box::pin(state.poll_cancel_timeout());
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), queued_timeout.as_mut())
-                .await
-                .is_err()
-        );
-        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Pending);
-
-        drop(slot_guard);
-        let (path_result, timed_out) = tokio::time::timeout(Duration::from_secs(1), async {
-            tokio::join!(queued_path, queued_timeout)
-        })
-        .await
-        .expect("queued timeout transaction must complete without deadlock");
-        assert!(path_result
-            .expect_err("the queued path must remain frozen")
-            .contains("CANCEL_PENDING"));
-        let timed_out = timed_out.expect("expired cancel must time out");
-        assert_eq!(timed_out.state.status, "FAILED");
-        assert_eq!(state.cancel_snapshot().phase, CancelPhase::TimedOut);
-        let slot = state.inner.read().await;
-        assert_eq!(slot.phase, NavPhase::Failed);
-        assert_eq!(slot.goal.as_ref().map(|goal| &goal.lease), Some(&lease));
-    }
-
-    #[tokio::test]
-    async fn timed_out_cancel_retry_keeps_recovery_fence_identity() {
-        let handle = make_handle().await;
-        let state = NavRuntimeState::from_env();
-        let lease = test_lease("cancel-recovery-identity", 1);
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Running;
-            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
-        }
-        cancel(&handle, &state, cancel_input(&lease)).await;
-        let generation = state.cancel_snapshot().generation;
-        for _ in 0..3 {
-            state.expire_cancel_for_test();
-            state.poll_cancel_timeout().await.expect("停车确认应超时");
-            let retry = cancel(&handle, &state, cancel_input(&lease)).await;
-            assert_eq!(retry.state.status, "PENDING");
-            assert_eq!(state.cancel_snapshot().generation, generation,
-                "同一次停车重试不能改变全局恢复围栏身份");
-        }
-        let zero = state.observe_cancel_ack(cancel_ack(
-            &lease, generation, MotionSinkCancelAckStatus::Zeroed,
-        )).await;
-        assert_eq!(zero.state.status, "CANCELLED");
-    }
-
-    #[tokio::test]
-    async fn exact_zero_recovers_failed_and_timed_out_cancel_without_weakening_identity() {
-        for recover_from_failure in [true, false] {
-            let handle = make_handle().await;
-            let state = NavRuntimeState::from_env();
-            let lease = test_lease(
-                if recover_from_failure {
-                    "late-zero-after-failure"
-                } else {
-                    "late-zero-after-timeout"
-                },
-                1,
-            );
-            {
-                let mut slot = state.inner.write().await;
-                slot.phase = NavPhase::Running;
-                slot.goal = Some(test_active_goal_with_lease(lease.clone()));
-            }
-            assert_eq!(
-                cancel(&handle, &state, cancel_input(&lease))
-                    .await
-                    .state
-                    .status,
-                "PENDING"
-            );
-            let pending = state.cancel_snapshot();
-            if recover_from_failure {
-                let failed = state
-                    .observe_cancel_ack(cancel_ack(
-                        &lease,
-                        pending.generation,
-                        MotionSinkCancelAckStatus::Failed,
-                    ))
-                    .await;
-                assert_eq!(failed.state.status, "FAILED");
-                assert_eq!(state.cancel_snapshot().phase, CancelPhase::Failed);
-            } else {
-                state.expire_cancel_for_test();
-                assert!(state.poll_cancel_timeout().await.is_some());
-                assert_eq!(state.cancel_snapshot().phase, CancelPhase::TimedOut);
-            }
-
-            let mut wrong_generation = cancel_ack(
-                &lease,
-                pending.generation.saturating_add(1),
-                MotionSinkCancelAckStatus::Zeroed,
-            );
-            wrong_generation.message = "wrong generation".to_string();
-            assert_ne!(
-                state
-                    .observe_cancel_ack(wrong_generation)
-                    .await
-                    .state
-                    .status,
-                "CANCELLED"
-            );
-            let retained_phase = state.cancel_snapshot().phase;
-
-            let mut wrong_lease = cancel_ack(
-                &lease,
-                pending.generation,
-                MotionSinkCancelAckStatus::Zeroed,
-            );
-            wrong_lease.owner_kind += 1;
-            wrong_lease.message = "wrong lease".to_string();
-            assert_ne!(
-                state.observe_cancel_ack(wrong_lease).await.state.status,
-                "CANCELLED"
-            );
-            assert_eq!(state.cancel_snapshot().phase, retained_phase);
-
-            let zeroed = state
-                .observe_cancel_ack(cancel_ack(
-                    &lease,
-                    pending.generation,
-                    MotionSinkCancelAckStatus::Zeroed,
-                ))
-                .await;
-            assert_eq!(zeroed.state.status, "CANCELLED");
-            assert_eq!(state.cancel_snapshot().phase, CancelPhase::Zeroed);
-            assert!(state.active_goal_lease().await.is_none());
-        }
-    }
-
-    #[tokio::test]
-    async fn failed_ack_remains_rejected_after_cancel_timeout() {
-        let handle = make_handle().await;
-        let state = NavRuntimeState::from_env();
-        let lease = test_lease("failed-after-timeout", 1);
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Running;
-            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
-        }
-        cancel(&handle, &state, cancel_input(&lease)).await;
-        let pending = state.cancel_snapshot();
-        state.expire_cancel_for_test();
-        assert!(state.poll_cancel_timeout().await.is_some());
-
-        let rejected = state
-            .observe_cancel_ack(cancel_ack(
-                &lease,
-                pending.generation,
-                MotionSinkCancelAckStatus::Failed,
-            ))
-            .await;
-
-        assert_ne!(rejected.state.status, "CANCELLED");
-        assert_eq!(state.cancel_snapshot().phase, CancelPhase::TimedOut);
-        assert_eq!(state.active_goal_lease().await.as_ref(), Some(&lease));
-    }
-
-    #[tokio::test]
-    async fn timeout_and_exact_zero_race_always_finishes_zeroed() {
-        let handle = make_handle().await;
-        let state = NavRuntimeState::from_env();
-        let lease = test_lease("timeout-zero-race", 1);
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Running;
-            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
-        }
-        cancel(&handle, &state, cancel_input(&lease)).await;
-        let pending = state.cancel_snapshot();
-        state.expire_cancel_for_test();
-
-        let (timeout_result, zeroed) = tokio::join!(
-            state.poll_cancel_timeout(),
-            state.observe_cancel_ack(cancel_ack(
-                &lease,
-                pending.generation,
-                MotionSinkCancelAckStatus::Zeroed,
-            )),
-        );
-
-        if let Some(timeout_result) = timeout_result {
-            assert_eq!(timeout_result.state.status, "FAILED");
-        }
-        assert_eq!(zeroed.state.status, "CANCELLED");
-        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Zeroed);
-        assert!(state.active_goal_lease().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn retry_preserves_identity_and_rejects_foreign_zero_ack() {
-        let handle = make_handle().await;
-        let state = NavRuntimeState::from_env();
-        let lease = test_lease("retry-old-zero", 1);
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Running;
-            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
-        }
-        cancel(&handle, &state, cancel_input(&lease)).await;
-        let first = state.cancel_snapshot();
-        state.expire_cancel_for_test();
-        assert!(state.poll_cancel_timeout().await.is_some());
-
-        assert_eq!(
-            cancel(&handle, &state, cancel_input(&lease))
-                .await
-                .state
-                .status,
-            "PENDING"
-        );
-        let retry = state.cancel_snapshot();
-        assert_eq!(retry.generation, first.generation);
-
-        let stale = state
-            .observe_cancel_ack(cancel_ack(
-                &lease,
-                first.generation + 1,
-                MotionSinkCancelAckStatus::Zeroed,
-            ))
-            .await;
-        assert_ne!(stale.state.status, "CANCELLED");
-        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Pending);
-        assert_eq!(state.cancel_snapshot().generation, retry.generation);
-
-        let zeroed = state
-            .observe_cancel_ack(cancel_ack(
-                &lease,
-                retry.generation,
-                MotionSinkCancelAckStatus::Zeroed,
-            ))
-            .await;
-        assert_eq!(zeroed.state.status, "CANCELLED");
-        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Zeroed);
-    }
-
-    #[tokio::test]
-    async fn stale_zero_or_failed_ack_cannot_mutate_a_replacement_incarnation() {
-        for status in [
-            MotionSinkCancelAckStatus::Zeroed,
-            MotionSinkCancelAckStatus::Failed,
-        ] {
-            let handle = make_handle().await;
-            let state = NavRuntimeState::from_env();
-            let lease = test_lease("same-business-id", 1);
-            {
-                let mut slot = state.inner.write().await;
-                slot.phase = NavPhase::Running;
-                slot.goal = Some(test_active_goal_with_lease(lease.clone()));
-            }
-            assert_eq!(
-                cancel(&handle, &state, cancel_input(&lease))
-                    .await
-                    .state
-                    .status,
-                "PENDING"
-            );
-            let pending = state.cancel_snapshot();
-
-            let mut replacement = lease.clone();
-            replacement.path_revision = 1;
-            replacement.planner_runtime_generation = 9;
-            {
-                let mut slot = state.inner.write().await;
-                slot.phase = NavPhase::Running;
-                slot.goal = Some(test_active_goal_with_lease(replacement.clone()));
-            }
-            let stale = tokio::time::timeout(
-                Duration::from_secs(1),
-                state.observe_cancel_ack(MotionSinkCancelAck {
-                    cancel_generation: pending.generation,
-                    goal_id: lease.session_id.clone(),
-                    owner_kind: lease.owner_kind,
-                    parent_request_id: lease.parent_request_id.clone(),
-                    goal_generation: lease.goal_generation,
-                    status,
-                    message: "stale incarnation ack".into(),
-                }),
-            )
-            .await
-            .expect("stale acknowledgement must fail closed without blocking");
-
-            assert_ne!(stale.state.status, "CANCELLED");
-            assert_eq!(state.cancel_snapshot().phase, CancelPhase::Pending);
-            let slot = state.inner.read().await;
-            assert_eq!(slot.phase, NavPhase::Running);
-            assert_eq!(
-                slot.goal.as_ref().map(|goal| &goal.lease),
-                Some(&replacement)
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn replacement_and_cancel_reset_queued_before_ack_leave_new_goal_cancelable() {
-        for status in [
-            MotionSinkCancelAckStatus::Zeroed,
-            MotionSinkCancelAckStatus::Failed,
-        ] {
-            let handle = make_handle().await;
-            let state = NavRuntimeState::from_env();
-            let lease_a = test_lease("queued-replacement-a", 1);
-            let lease_b = test_lease("queued-replacement-b", 2);
-            {
-                let mut slot = state.inner.write().await;
-                slot.phase = NavPhase::Running;
-                slot.goal = Some(test_active_goal_with_lease(lease_a.clone()));
-            }
-            assert_eq!(
-                cancel(&handle, &state, cancel_input(&lease_a))
-                    .await
-                    .state
-                    .status,
-                "PENDING"
-            );
-            let pending = state.cancel_snapshot();
-
-            let slot_guard = state.inner.write().await;
-            let replacement_state = state.clone();
-            let queued_lease_b = lease_b.clone();
-            let mut queued_replacement = Box::pin(async move {
-                let mut slot = replacement_state.inner.write().await;
-                slot.phase = NavPhase::Running;
-                slot.goal = Some(test_active_goal_with_lease(queued_lease_b));
-                drop(slot);
-                replacement_state.reset_cancel();
-            });
-            assert!(
-                tokio::time::timeout(Duration::from_millis(20), queued_replacement.as_mut())
-                    .await
-                    .is_err()
-            );
-            let mut queued_ack = Box::pin(state.observe_cancel_ack(MotionSinkCancelAck {
-                cancel_generation: pending.generation,
-                goal_id: lease_a.session_id.clone(),
-                owner_kind: lease_a.owner_kind,
-                parent_request_id: lease_a.parent_request_id.clone(),
-                goal_generation: lease_a.goal_generation,
-                status,
-                message: "late ack after replacement".into(),
-            }));
-            assert!(
-                tokio::time::timeout(Duration::from_millis(20), queued_ack.as_mut())
-                    .await
-                    .is_err()
-            );
-
-            drop(slot_guard);
-            let ((), stale) = tokio::time::timeout(Duration::from_secs(1), async {
-                tokio::join!(queued_replacement, queued_ack)
-            })
-            .await
-            .expect("replacement and stale acknowledgement must not deadlock");
-            assert_ne!(stale.state.status, "CANCELLED");
-            assert_eq!(state.cancel_snapshot().phase, CancelPhase::Idle);
-            {
-                let slot = state.inner.read().await;
-                assert_eq!(slot.phase, NavPhase::Running);
-                assert_eq!(slot.goal.as_ref().map(|goal| &goal.lease), Some(&lease_b));
-            }
-
-            let cancel_b = cancel(&handle, &state, cancel_input(&lease_b)).await;
-            assert_eq!(cancel_b.state.status, "PENDING");
-            assert_eq!(cancel_b.lease.as_ref(), Some(&lease_b));
-        }
-    }
-
-    #[tokio::test]
-    async fn replacement_and_cancel_reset_queued_before_timeout_leave_new_goal_cancelable() {
-        let handle = make_handle().await;
-        let state = NavRuntimeState::from_env();
-        let lease_a = test_lease("queued-timeout-a", 1);
-        let lease_b = test_lease("queued-timeout-b", 2);
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Running;
-            slot.goal = Some(test_active_goal_with_lease(lease_a.clone()));
-        }
-        assert_eq!(
-            cancel(&handle, &state, cancel_input(&lease_a))
-                .await
-                .state
-                .status,
-            "PENDING"
-        );
-        state.expire_cancel_for_test();
-
-        let slot_guard = state.inner.write().await;
-        let replacement_state = state.clone();
-        let queued_lease_b = lease_b.clone();
-        let mut queued_replacement = Box::pin(async move {
-            let mut slot = replacement_state.inner.write().await;
-            slot.phase = NavPhase::Running;
-            slot.goal = Some(test_active_goal_with_lease(queued_lease_b));
-            drop(slot);
-            replacement_state.reset_cancel();
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), queued_replacement.as_mut())
-                .await
-                .is_err()
-        );
-        let mut queued_timeout = Box::pin(state.poll_cancel_timeout());
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), queued_timeout.as_mut())
-                .await
-                .is_err()
-        );
-
-        drop(slot_guard);
-        let ((), timeout_outcome) = tokio::time::timeout(Duration::from_secs(1), async {
-            tokio::join!(queued_replacement, queued_timeout)
-        })
-        .await
-        .expect("replacement and stale timeout must not deadlock");
-        assert!(timeout_outcome.is_none());
-        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Idle);
-        {
-            let slot = state.inner.read().await;
-            assert_eq!(slot.phase, NavPhase::Running);
-            assert_eq!(slot.goal.as_ref().map(|goal| &goal.lease), Some(&lease_b));
-        }
-
-        let cancel_b = cancel(&handle, &state, cancel_input(&lease_b)).await;
-        assert_eq!(cancel_b.state.status, "PENDING");
-        assert_eq!(cancel_b.lease.as_ref(), Some(&lease_b));
-    }
-
-    #[tokio::test]
-    async fn empty_cancel_binds_current_native_goal_and_retries_the_same_publish() {
-        let (handle, backend, owner) = make_unit_blocking_handle([None]).await;
-        let state = NavRuntimeState::from_env();
-        let lease = test_lease("native-current", 1);
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Running;
-            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
-        }
-        let empty_input = || CancelGoalInput { goal_id: String::new(), owner_kind: 0,
-            parent_request_id: String::new(), goal_generation: 0, producer_runtime_generation: 0 };
-        let first_handle = handle.clone();
-        let first_state = state.clone();
-        let input = empty_input();
-        let first = tokio::spawn(async move { cancel(&first_handle, &first_state, input).await });
-        backend.wait_for_publish_count(1).await;
-        let retry = cancel(&handle, &state, empty_input()).await;
-        assert_eq!(retry.state.status, "PENDING");
-        assert_eq!(retry.state.goal_id, lease.session_id);
-        assert_eq!(retry.lease.as_ref(), Some(&lease));
-        assert_eq!(backend.publish_count(), 1);
-        backend.publish_gate.add_permits(1);
-        let pending = first.await.unwrap();
-        assert_eq!(pending.state.status, "PENDING");
-        assert_eq!(pending.state.goal_id, lease.session_id);
-        assert_eq!(pending.lease.as_ref(), Some(&lease));
-        let frames = backend.frames.lock().unwrap();
-        let message = schema::decode_cancel_navigation_body(&frames[0].payload).unwrap();
-        assert_eq!(message.session_id, lease.session_id);
-        assert_eq!(message.goal_generation as u64, lease.goal_generation);
-        assert_eq!(message.producer_runtime_generation as u64, lease.producer_runtime_generation);
-        drop(frames);
-        drop(handle);
-        owner.finish().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn empty_cancel_rpc_recovers_real_terminal_received_during_publish() {
-        use crate::proto::geometry_runtime_server::GeometryRuntime;
-        let (handle, backend, owner) = make_unit_blocking_handle([None]).await;
-        let lease = test_lease("native-terminal-during-empty-cancel", 1);
-        handle.nav.replace_active_goal_for_test(test_active_goal_with_lease(lease.clone())).await;
-        let service = crate::server::GeometryRuntimeService::new(handle.clone());
-        let pending = tokio::spawn(async move {
-            GeometryRuntime::cancel_navigation(&service,
-                tonic::Request::new(crate::proto::CancelNavigationRequest::default())).await
-        });
-        backend.wait_for_publish_count(1).await;
-        let receipt = NavigationUpdate {
-            producer_runtime_generation: lease.producer_runtime_generation,
-            state: NavState { status: "CANCELLED".into(), goal_id: lease.session_id.clone(),
-                timestamp_ns: now_ns(), ..NavState::default() },
-            feedback: crate::lcm_runtime::NavigationFeedback {
-                actuator_zeroed: true, zero_ack_id: "actual-terminal".into(),
-                zero_applied_monotonic_ns: 37, cancel_generation: handle.nav.cancel_snapshot().generation,
-                owner_kind: lease.owner_kind, parent_request_id: lease.parent_request_id.clone(),
-                goal_generation: lease.goal_generation, producer_runtime_generation: lease.producer_runtime_generation,
-                path_revision: lease.path_revision, planner_runtime_generation: lease.planner_runtime_generation,
-                ..Default::default()
-            },
-        };
-        handle.nav.retain_terminal_receipt(&receipt).await;
-        backend.release_one();
-        let response = pending.await.unwrap().unwrap().into_inner();
-        assert_eq!(response.status, "CANCELLED");
-        assert_eq!(response.goal_id, lease.session_id);
-        assert_eq!(response.zero_ack_id, receipt.feedback.zero_ack_id);
-        assert_eq!(response.zero_applied_monotonic_ns, receipt.feedback.zero_applied_monotonic_ns);
-        drop(handle);
-        owner.finish().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn empty_cancel_rpc_with_global_stop_binds_current_and_preserves_successor() {
-        use crate::proto::geometry_runtime_server::GeometryRuntime;
-        let (handle, _, owner) = make_unit_blocking_handle([]).await;
-        let lease = test_lease("ordinary-current", 1);
-        handle.nav.replace_active_goal_for_test(test_active_goal_with_lease(lease.clone())).await;
-        let proof = crate::proto::OrdinaryGlobalStopConfirmation {
-            operation_id: "ordinary-current-stop".into(), zero_ack_id: "actual-zero-fixture".into(),
-            applied_monotonic_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
-            stationary_confirmed: true,
-        };
-        let service = crate::server::GeometryRuntimeService::new(handle.clone());
-        let request = crate::proto::CancelNavigationRequest {
-            global_stop_confirmation: Some(proof), ..Default::default()
-        };
-        let response = GeometryRuntime::cancel_navigation(&service, tonic::Request::new(request.clone()))
-            .await.unwrap().into_inner();
-        assert_eq!(response.status, "FAILED");
-        assert_eq!(response.goal_id, lease.session_id);
-        assert_eq!(response.reason_code, "GLOBAL_STOP_CONFIRMED");
-        let successor = test_lease("ordinary-successor", 2);
-        handle.nav.replace_active_goal_for_test(test_active_goal_with_lease(successor.clone())).await;
-        assert!(GeometryRuntime::cancel_navigation(&service, tonic::Request::new(request)).await.is_err());
-        assert_eq!(handle.nav.active_goal_lease().await, Some(successor));
-        drop(service);
-        drop(handle);
-        owner.finish().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn empty_cancel_without_active_goal_and_partial_identity_remain_rejected() {
+        let handle = make_handle().await;
         let state = NavRuntimeState::from_env();
-        let mut input = CancelGoalInput { goal_id: String::new(), owner_kind: 0,
-            parent_request_id: String::new(), goal_generation: 0, producer_runtime_generation: 0 };
-        let CancelStart::Rejected { message, .. } = state.begin_cancel(&input).await else {
-            panic!("无活动目标必须保留原生拒绝");
-        };
-        assert!(message.contains("GOAL_LEASE_MISSING"));
-        let lease = test_lease("native-current", 1);
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Running;
-            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
-        }
-        input.owner_kind = lease.owner_kind;
-        let CancelStart::Rejected { message, .. } = state.begin_cancel(&input).await else {
-            panic!("部分身份不能冒充取消当前目标");
-        };
-        assert!(message.contains("GOAL_LEASE_MISMATCH"));
+        let lease = test_lease("exact-cancel", 1);
+        let empty = CancelGoalInput { goal_id: String::new(), owner_kind: 0, parent_request_id: String::new(), goal_generation: 0, producer_runtime_generation: 0 };
+        assert_eq!(cancel(&handle, &state, empty.clone()).await.state.status, "FAILED");
+        state.replace_active_goal_for_test(test_active_goal_with_lease(lease.clone())).await;
+        let mut partial = empty.clone(); partial.goal_id = lease.session_id.clone();
+        assert_eq!(cancel(&handle, &state, partial).await.state.status, "FAILED");
         assert_eq!(state.active_goal_lease().await, Some(lease));
-        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Idle);
+        assert_eq!(cancel(&handle, &state, empty).await.state.status, "CANCELLED");
+        assert!(state.active_goal_lease().await.is_none());
     }
 
     #[tokio::test]
     async fn cancel_generation_rejects_int64_exhaustion_without_reuse() {
+        let handle = make_handle().await;
         let state = NavRuntimeState::from_env();
-        let lease = test_lease("cancel-generation-int64", 1);
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Running;
-            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
-        }
-        state
-            .next_cancel_generation
-            .store(i64::MAX as u64 - 1, AtomicOrdering::Release);
-
-        let CancelStart::Publish { generation, .. } =
-            state.begin_cancel(&cancel_input(&lease)).await
-        else {
-            panic!("the final positive int64 generation must be reservable");
-        };
-        assert_eq!(generation, i64::MAX as u64);
-        state.reset_cancel();
-        let CancelStart::Rejected { message, .. } = state.begin_cancel(&cancel_input(&lease)).await
-        else {
-            panic!("generation exhaustion must fail closed");
-        };
-        assert!(message.contains("CANCEL_GENERATION_EXHAUSTED"));
-        assert_eq!(
-            state.next_cancel_generation.load(AtomicOrdering::Acquire),
-            i64::MAX as u64
-        );
-        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Idle);
+        let lease = test_lease("exhausted-cancel", 1);
+        state.replace_active_goal_for_test(test_active_goal_with_lease(lease.clone())).await;
+        state.next_cancel_generation.store(i64::MAX as u64, AtomicOrdering::Release);
+        let outcome = cancel(&handle, &state, cancel_input(&lease)).await;
+        assert_eq!(outcome.state.status, "FAILED");
+        assert!(outcome.state.message.contains("CANCEL_GENERATION_EXHAUSTED"));
+        assert_eq!(state.cancel_generation(), i64::MAX as u64);
+        assert_eq!(state.active_goal_lease().await, Some(lease));
     }
 
     #[tokio::test]
     async fn cancel_generation_rejects_u64_max_without_wrapping_to_zero() {
+        let handle = make_handle().await;
         let state = NavRuntimeState::from_env();
-        let lease = test_lease("cancel-generation-u64", 1);
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Running;
-            slot.goal = Some(test_active_goal_with_lease(lease.clone()));
-        }
-        state
-            .next_cancel_generation
-            .store(u64::MAX, AtomicOrdering::Release);
-
-        let CancelStart::Rejected { message, .. } = state.begin_cancel(&cancel_input(&lease)).await
-        else {
-            panic!("u64::MAX must not be published or reused");
-        };
-        assert!(message.contains("CANCEL_GENERATION_EXHAUSTED"));
-        assert_eq!(
-            state.next_cancel_generation.load(AtomicOrdering::Acquire),
-            u64::MAX
-        );
-        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Idle);
-    }
-
-    #[tokio::test]
-    async fn exact_pending_cancel_retry_is_single_flight_then_republishes_same_generation() {
-        let (handle, backend) = make_blocking_handle([None, None]).await;
-        let state = NavRuntimeState::from_env();
-        let lease = test_lease("retry-goal", 1);
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Running;
-            slot.goal = Some(test_active_goal("retry-goal", 1));
-        }
-
-        let first_handle = handle.clone();
-        let first_state = state.clone();
-        let first_input = cancel_input(&lease);
-        let first =
-            tokio::spawn(async move { cancel(&first_handle, &first_state, first_input).await });
-        backend.wait_for_publish_count(1).await;
-        let first_snapshot = state.cancel_snapshot();
-        assert_eq!(first_snapshot.phase, CancelPhase::Pending);
-        assert_eq!(state.next_publish_attempt.load(AtomicOrdering::Acquire), 1);
-
-        let joined = cancel(&handle, &state, cancel_input(&lease)).await;
-        assert_eq!(joined.state.status, "PENDING");
-        assert_eq!(
-            joined.state.message,
-            "CANCEL_PENDING_PUBLISH_IN_FLIGHT_JOIN"
-        );
-        assert_eq!(joined.lease.as_ref(), Some(&lease));
-        assert_eq!(backend.publish_count(), 1);
-        assert_eq!(state.next_publish_attempt.load(AtomicOrdering::Acquire), 1);
-
-        backend.release_one();
-        let first_outcome = first.await.expect("first cancel task");
-        assert_eq!(first_outcome.state.status, "PENDING");
-
-        let retry_handle = handle.clone();
-        let retry_state = state.clone();
-        let retry_lease = lease.clone();
-        let retry = tokio::spawn(async move {
-            cancel(&retry_handle, &retry_state, cancel_input(&retry_lease)).await
-        });
-        backend.wait_for_publish_count(2).await;
-        assert_eq!(
-            state.cancel_snapshot().generation,
-            first_snapshot.generation
-        );
-        assert_eq!(state.next_publish_attempt.load(AtomicOrdering::Acquire), 2);
-        assert_eq!(
-            backend.published_cancel_generations(),
-            vec![
-                first_snapshot.generation as i64,
-                first_snapshot.generation as i64
-            ]
-        );
-
-        backend.release_one();
-        let retry_outcome = retry.await.expect("retry cancel task");
-        assert_eq!(retry_outcome.state.status, "PENDING");
-        assert_eq!(
-            retry_outcome.state.message,
-            "CANCEL_PENDING_RETRY_PUBLISHED"
-        );
-        assert_eq!(retry_outcome.lease.as_ref(), Some(&lease));
-
-        let zeroed = state
-            .observe_cancel_ack(MotionSinkCancelAck {
-                cancel_generation: first_snapshot.generation,
-                goal_id: lease.session_id.clone(),
-                owner_kind: lease.owner_kind,
-                parent_request_id: lease.parent_request_id.clone(),
-                goal_generation: lease.goal_generation,
-                status: MotionSinkCancelAckStatus::Zeroed,
-                message: "retry generation zeroed".into(),
-            })
-            .await;
-        assert_eq!(zeroed.state.status, "CANCELLED");
-        assert!(state.active_goal_lease().await.is_none());
-        assert_eq!(
-            state.cancel_snapshot().generation,
-            first_snapshot.generation
-        );
-        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Zeroed);
-        assert_eq!(backend.publish_count(), 2);
-    }
-
-    #[tokio::test]
-    async fn completed_cancel_retry_reports_the_current_terminal_phase() {
-        for (cancel_phase, nav_phase, expected_status) in [
-            (CancelPhase::Zeroed, NavPhase::Cancelled, "CANCELLED"),
-            (CancelPhase::Failed, NavPhase::Failed, "FAILED"),
-            (CancelPhase::TimedOut, NavPhase::Failed, "FAILED"),
-        ] {
-            let state = NavRuntimeState::from_env();
-            let lease = test_lease("completed-retry", 1);
-            let generation = 7;
-            {
-                let mut slot = state.inner.write().await;
-                slot.phase = nav_phase;
-                slot.goal = (cancel_phase != CancelPhase::Zeroed)
-                    .then(|| test_active_goal_with_lease(lease.clone()));
-            }
-            {
-                let mut cancel = state.cancel.lock().expect("cancel tracker");
-                *cancel = CancelTracker {
-                    generation,
-                    goal_id: lease.session_id.clone(),
-                    lease: Some(lease.clone()),
-                    phase: cancel_phase,
-                    requested_at: Some(Instant::now()),
-                    stack_terminal_observed: true,
-                    message: format!("terminal {cancel_phase:?}"),
-                };
-            }
-
-            let outcome = finish_existing_cancel_retry(
-                &state,
-                lease.clone(),
-                lease.session_id.clone(),
-                generation,
-                Ok(()),
-            )
-            .await;
-            assert_eq!(outcome.state.status, expected_status);
-            assert_eq!(outcome.state.message, format!("terminal {cancel_phase:?}"));
-            assert_eq!(outcome.lease.as_ref(), Some(&lease));
-        }
-    }
-
-    #[tokio::test]
-    async fn pending_cancel_for_a_different_full_lease_is_not_overwritten() {
-        let (handle, backend) = make_blocking_handle([None]).await;
-        let state = NavRuntimeState::from_env();
-        let lease_a = test_lease("lease-a", 1);
-        let lease_b = test_lease("lease-b", 2);
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Running;
-            slot.goal = Some(test_active_goal("lease-a", 1));
-        }
-
-        let first_handle = handle.clone();
-        let first_state = state.clone();
-        let first = tokio::spawn(async move {
-            cancel(&first_handle, &first_state, cancel_input(&lease_a)).await
-        });
-        backend.wait_for_publish_count(1).await;
-        let pending_a = state.cancel_snapshot();
-
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Running;
-            slot.goal = Some(test_active_goal("lease-b", 2));
-        }
-        let rejected = tokio::time::timeout(
-            Duration::from_millis(100),
-            cancel(&handle, &state, cancel_input(&lease_b)),
-        )
-        .await
-        .expect("a conflicting pending lease must be rejected without publishing");
-        assert_eq!(rejected.state.status, "FAILED");
-        assert!(rejected.state.message.contains("CANCEL_IN_FLIGHT_CONFLICT"));
-        assert_eq!(state.cancel_snapshot(), pending_a);
-        assert_eq!(backend.publish_count(), 1);
-
-        backend.release_one();
-        let late_a = first.await.expect("lease A cancel task");
-        assert!(late_a
-            .state
-            .message
-            .contains("CANCEL_COMPLETION_SUPERSEDED"));
-        let slot = state.inner.read().await;
-        assert_eq!(slot.phase, NavPhase::Running);
-        assert_eq!(slot.goal.as_ref().map(|goal| &goal.lease), Some(&lease_b));
+        let lease = test_lease("exhausted-cancel", 1);
+        state.replace_active_goal_for_test(test_active_goal_with_lease(lease.clone())).await;
+        state.next_cancel_generation.store(u64::MAX, AtomicOrdering::Release);
+        let outcome = cancel(&handle, &state, cancel_input(&lease)).await;
+        assert_eq!(outcome.state.status, "FAILED");
+        assert!(outcome.state.message.contains("CANCEL_GENERATION_EXHAUSTED"));
+        assert_eq!(state.cancel_generation(), u64::MAX);
+        assert_eq!(state.active_goal_lease().await, Some(lease));
     }
 
     #[tokio::test]
     async fn late_cancel_success_or_error_cannot_mutate_a_replacement_slot() {
-        for first_error in [None, Some("late A publish error".to_string())] {
-            let (handle, backend) = make_blocking_handle([first_error, None]).await;
+        for fail in [false, true] {
+            let (handle, backend) = make_blocking_handle([fail.then(|| "late cancel publish failed".into())]).await;
             let state = NavRuntimeState::from_env();
-            let lease_a = test_lease("late-a", 1);
-            let lease_b = test_lease("replacement-b", 2);
-            {
-                let mut slot = state.inner.write().await;
-                slot.phase = NavPhase::Running;
-                slot.goal = Some(test_active_goal("late-a", 1));
-            }
-
-            let first_handle = handle.clone();
-            let first_state = state.clone();
-            let first = tokio::spawn(async move {
-                cancel(&first_handle, &first_state, cancel_input(&lease_a)).await
-            });
+            let old = test_lease("old", 1); let new = test_lease("new", 2);
+            state.replace_active_goal_for_test(test_active_goal_with_lease(old.clone())).await;
+            let task = tokio::spawn({ let handle=handle.clone(); let state=state.clone();
+                async move { cancel(&handle, &state, cancel_input(&old)).await } });
             backend.wait_for_publish_count(1).await;
-            let generation_a = state.cancel_snapshot().generation;
-
-            {
-                let mut slot = state.inner.write().await;
-                slot.phase = NavPhase::Running;
-                slot.goal = Some(test_active_goal("replacement-b", 2));
-            }
-            state.reset_cancel();
-
+            assert!(state.active_goal_lease().await.is_none());
+            state.replace_active_goal_for_test(test_active_goal_with_lease(new.clone())).await;
             backend.release_one();
-            let late_a = first.await.expect("late A cancel task");
-            assert!(late_a
-                .state
-                .message
-                .contains("CANCEL_COMPLETION_SUPERSEDED"));
-            {
-                let slot = state.inner.read().await;
-                assert_eq!(slot.phase, NavPhase::Running);
-                assert_eq!(slot.goal.as_ref().map(|goal| &goal.lease), Some(&lease_b));
-            }
-            assert_eq!(state.cancel_snapshot().phase, CancelPhase::Idle);
-
-            let second_handle = handle.clone();
-            let second_state = state.clone();
-            let second_lease = lease_b.clone();
-            let second = tokio::spawn(async move {
-                cancel(&second_handle, &second_state, cancel_input(&second_lease)).await
-            });
-            backend.wait_for_publish_count(2).await;
-            let generation_b = state.cancel_snapshot().generation;
-            assert!(generation_b > generation_a);
-            assert_eq!(state.cancel_snapshot().lease.as_ref(), Some(&lease_b));
-            backend.release_one();
-            let pending_b = second.await.expect("replacement B cancel task");
-            assert_eq!(pending_b.state.status, "PENDING");
-            assert_eq!(pending_b.lease.as_ref(), Some(&lease_b));
+            let result = task.await.unwrap();
+            assert_eq!(result.state.status, if fail { "FAILED" } else { "CANCELLED" });
+            assert_eq!(state.active_goal_lease().await, Some(new));
+            assert_eq!(backend.publish_count(), 1);
         }
     }
 
@@ -8107,34 +5634,16 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_publish_failure_is_explicit_failed_state() {
+        let (handle, backend) = make_blocking_handle([Some("cancel publish failed".into())]).await;
         let state = NavRuntimeState::from_env();
         let lease = test_lease("cancel-me", 1);
-        {
-            let mut slot = state.inner.write().await;
-            slot.goal = Some(test_active_goal("cancel-me", 1));
-        }
-
-        let CancelStart::Publish {
-            lease: reserved_lease,
-            generation,
-            goal_id,
-        } = state.begin_cancel(&cancel_input(&lease)).await
-        else {
-            panic!("first cancellation must publish");
-        };
-        assert_eq!(reserved_lease, lease);
-        let outcome = finish_cancel_request(
-            &state,
-            lease,
-            goal_id,
-            generation,
-            Err("cancel publish failed".into()),
-        )
-        .await;
+        state.replace_active_goal_for_test(test_active_goal_with_lease(lease.clone())).await;
+        backend.release_one();
+        let outcome = cancel(&handle, &state, cancel_input(&lease)).await;
         assert_eq!(outcome.state.status, "FAILED");
         assert!(outcome.state.message.contains("cancel publish failed"));
-        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Failed);
-        assert!(state.inner.read().await.goal.is_some());
+        assert!(state.active_goal_lease().await.is_none());
+        assert_eq!(backend.publish_count(), 1);
     }
 
     #[tokio::test]
@@ -8311,124 +5820,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_waits_for_guard_zeroed_ack_after_stack_terminal() {
-        let handle = make_handle().await;
-        let state = NavRuntimeState::from_env();
-        let lease = test_lease("guard-zero", 1);
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Running;
-            slot.goal = Some(test_active_goal("guard-zero", 1));
-        }
-
-        let pending_outcome = cancel(&handle, &state, cancel_input(&lease)).await;
-        assert_eq!(pending_outcome.state.status, "PENDING");
-        let pending = state.cancel_snapshot();
-        assert_eq!(pending.phase, CancelPhase::Pending);
-        assert!(pending.generation > 0);
-
-        let stack_terminal = state
-            .observe_stack_state(NavState {
-                status: "CANCELLED".into(),
-                message: "nav-stack stopped planning".into(),
-                goal_id: "guard-zero".into(),
-                distance_remaining: 0.0,
-                timestamp_ns: now_ns(),
-            })
-            .await;
-        assert_eq!(stack_terminal.status, "PENDING");
-        assert_eq!(state.inner.read().await.phase, NavPhase::CancelPending);
-        assert!(state.inner.read().await.goal.is_some());
-
-        let terminal = state
-            .observe_cancel_ack(MotionSinkCancelAck {
-                cancel_generation: pending.generation,
-                goal_id: "guard-zero".into(),
-                owner_kind: lease.owner_kind,
-                parent_request_id: lease.parent_request_id.clone(),
-                goal_generation: lease.goal_generation,
-                status: MotionSinkCancelAckStatus::Zeroed,
-                message: "motion guard ZEROED".into(),
-            })
-            .await;
-        assert_eq!(terminal.state.status, "CANCELLED");
-        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Zeroed);
-        assert!(state.inner.read().await.goal.is_none());
-
-        let stale_stack_failure = state
-            .observe_stack_state(NavState {
-                status: "FAILED".into(),
-                message: "late planner terminal".into(),
-                goal_id: "guard-zero".into(),
-                distance_remaining: 0.0,
-                timestamp_ns: now_ns(),
-            })
-            .await;
-        assert_eq!(
-            stale_stack_failure.status, "CANCELLED",
-            "guard ZEROED remains authoritative over late planner terminal frames"
-        );
-    }
-
-    #[tokio::test]
-    async fn cancel_failure_and_timeout_are_explicit_typed_states() {
-        let handle = make_handle().await;
-        let state = NavRuntimeState::from_env();
-        let failed_lease = test_lease("cancel-failure", 1);
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Running;
-            slot.goal = Some(test_active_goal("cancel-failure", 1));
-        }
-        let _ = cancel(&handle, &state, cancel_input(&failed_lease)).await;
-        let pending = state.cancel_snapshot();
-        let failed = state
-            .observe_cancel_ack(MotionSinkCancelAck {
-                cancel_generation: pending.generation,
-                goal_id: "cancel-failure".into(),
-                owner_kind: failed_lease.owner_kind,
-                parent_request_id: failed_lease.parent_request_id.clone(),
-                goal_generation: failed_lease.goal_generation,
-                status: MotionSinkCancelAckStatus::Failed,
-                message: "guard rejected zero command".into(),
-            })
-            .await;
-        assert_eq!(failed.state.status, "FAILED");
-        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Failed);
-        let stack_after_failure = state
-            .observe_stack_state(NavState {
-                status: "CANCELLED".into(),
-                message: "planner stopped after guard failure".into(),
-                goal_id: "cancel-failure".into(),
-                distance_remaining: 0.0,
-                timestamp_ns: now_ns(),
-            })
-            .await;
-        assert_eq!(
-            stack_after_failure.status, "FAILED",
-            "planner terminal must not impersonate an actuator ZEROED ack"
-        );
-
-        let timeout_lease = test_lease("cancel-timeout", 2);
-        {
-            let mut slot = state.inner.write().await;
-            slot.phase = NavPhase::Running;
-            slot.goal = Some(test_active_goal("cancel-timeout", 2));
-        }
-        let _ = cancel(&handle, &state, cancel_input(&timeout_lease)).await;
-        let pending = state.cancel_snapshot();
-        state.expire_cancel_for_test();
-        let timed_out = state
-            .poll_cancel_timeout()
-            .await
-            .expect("pending cancellation must time out");
-        assert_eq!(timed_out.state.status, "FAILED");
-        let snapshot = state.cancel_snapshot();
-        assert_eq!(snapshot.generation, pending.generation);
-        assert_eq!(snapshot.phase, CancelPhase::TimedOut);
-    }
-
-    #[tokio::test]
     async fn cancel_never_publishes_actuator_cmd_vel() {
         use futures::StreamExt;
 
@@ -8455,8 +5846,8 @@ mod tests {
         sleep(Duration::from_millis(30)).await;
 
         let outcome = cancel(&handle, &state, cancel_input(&lease)).await;
-        assert_eq!(outcome.state.status, "PENDING");
-        assert_eq!(state.cancel_snapshot().phase, CancelPhase::Pending);
+        assert_eq!(outcome.state.status, "CANCELLED");
+        assert!(state.active_goal_lease().await.is_none());
         assert!(
             tokio::time::timeout(Duration::from_millis(150), commands.next())
                 .await
@@ -8541,14 +5932,14 @@ mod tests {
             test_goal_input("stage-a-rejections"), None).await.unwrap();
         for source in ["public-navigation", "mapping-cloud", "wavefront"] {
             for mutation in ["options-position", "options-yaw", "pose", "frame", "seconds",
-                "nanoseconds", "sequence", "producer-epoch", "map-generation", "cancel"] {
+                "nanoseconds", "sequence", "producer-epoch", "map-generation"] {
                 let mut intent = original.clone();
                 intent.producer = source.into();
                 if source == "wavefront" {
                     intent.owner_kind = schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD;
                     intent.priority = 100;
                 }
-                // Valid changed options must reach the pre-existing cancel fence.
+                // 有效目标选项进入准入，其它具名输入边界仍逐项验证。
                 intent.options.allow_reverse = true;
                 intent.options.yaw_tolerance_rad = std::f64::consts::PI;
                 let expected = match mutation {
@@ -8561,7 +5952,7 @@ mod tests {
                     "sequence" => { intent.goal.header.seq = 1; "goal header, frame, timestamp, or pose is invalid" }
                     "producer-epoch" => { intent.producer_epoch += 1; "invalid producer, owner, priority, or generation identity" }
                     "map-generation" => { intent.map_frame_generation += 1; "map session or coordinate generation changed" }
-                    _ => { intent.cancel_generation += 1; "cancel generation changed before admission" }
+                    _ => unreachable!("具名输入变体已列完")
                 };
                 let authority = match source {
                     "wavefront" => GoalProducerEpochAuthority::Wavefront {
@@ -8580,7 +5971,7 @@ mod tests {
         assert_eq!(backend.publish_count(), 0);
         assert_eq!(state.next_goal_generation.load(AtomicOrdering::Acquire), 0);
         assert!(state.inner.read().await.goal.is_none());
-        assert_eq!(state.cancel_snapshot().generation, 0);
+        assert_eq!(state.cancel_generation(), 0);
     }
     #[tokio::test]
     async fn assigned_goal_replay_uses_action_values_and_original_body_binding() {
@@ -8608,7 +5999,7 @@ mod tests {
             }
             let rejected = set_goal(&handle, &state, different).await;
             assert_eq!(rejected.state.status, "FAILED");
-            assert!(rejected.state.message.contains("GOAL_LEASE_BUSY"));
+            assert!(rejected.state.message.contains("GOAL_GENERATION_STALE"));
         }
         assert_eq!(backend.publish_count(), 1);
         let frames = backend.frames.lock().unwrap();

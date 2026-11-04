@@ -662,7 +662,7 @@ async fn run_composition(root:&Path) {
         eprintln!("ASSIGNED_COMPOSITION observation_expiry_pause source_ns={last_source} deadline_ns={maturity} paused_ns={} actual_zero_monotonic_ns={} reason={:?}",
             paused.stamp_sec as u64*1_000_000_000+paused.stamp_nsec as u64,zero_event.at,paused.message);
 
-        // 真实新云恢复后取消这个仍未终止的到期目标；取消须取得自己围栏的精确停车回执。
+        // 真实新云恢复后只发送一次取消，再核对执行端实际发出的零速回执。
         live.cloud_enabled.store(true,Ordering::Release);
         tokio::time::timeout(Duration::from_secs(5),async {
             loop {
@@ -673,8 +673,7 @@ async fn run_composition(root:&Path) {
             }
         }).await.expect("恢复后的真实点云必须完成新来源发布");
         let cancel=CancelNavigationRequest {
-global_stop_confirmation: None,
-goal_id:expiry_admitted.goal_id,
+            goal_id:expiry_admitted.goal_id,
             owner_kind:expiry_admitted.owner_kind,parent_request_id:expiry_admitted.parent_request_id,
             goal_generation:expiry_admitted.goal_generation,producer_runtime_generation:expiry_admitted.producer_runtime_generation};
         let pending=client.cancel_navigation(cancel.clone()).await.unwrap().into_inner();
@@ -691,9 +690,8 @@ goal_id:expiry_admitted.goal_id,
         assert_exact_zero(&guard.socket(),&terminal).await;
         assert_ne!(terminal.zero_ack_id,arrived.zero_ack_id,"取消必须取得其独立围栏的精确停车回执");
         let cancelled=client.cancel_navigation(cancel).await.unwrap().into_inner();
-        assert!(cancelled.actuator_zeroed,"cancel replay resolves only with actual zero: {cancelled:?}");
-        assert_eq!(cancelled.zero_ack_id,terminal.zero_ack_id,"cancel replays exact terminal fence");
-        assert_eq!(cancelled.zero_applied_monotonic_ns,terminal.zero_applied_monotonic_ns as u64);
+        assert_eq!(cancelled.status,"FAILED","已取消的目标不能再次发送取消: {cancelled:?}");
+        assert_eq!(cancelled.cancel_generation,0,"重复取消没有新的取消代次");
         eprintln!("ASSIGNED_COMPOSITION cancellation_after_fresh_cloud local_planning=true cancellation_exact_zero={}",
             terminal.zero_ack_id);
     }).catch_unwind().await;

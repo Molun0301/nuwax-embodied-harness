@@ -5,7 +5,6 @@
 //! [`ExploreSchedulerHandle`]. Mapping and navigation wiring are injected through
 //! typed interfaces so the module never silently discards a selected goal.
 
-
 #[cfg(test)]
 #[path = "explore_attribution.rs"]
 mod attribution;
@@ -17,14 +16,12 @@ mod explore_compute_service;
 use compute_backend::*;
 use explore_compute_service::*;
 
-use std::collections::{HashMap, VecDeque};
 #[cfg(unix)]
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
-use futures::stream::{FuturesUnordered, StreamExt};
 use nuwax_codec::lcm::schema;
 use nuwax_exploration::conversions::frontier_goal_to_navigation_goal;
 use nuwax_exploration::surface_adapter::{SurfaceGoalSourceAdapter, SurfaceInputReceiver};
@@ -59,7 +56,6 @@ pub const STATUS_IDLE: &str = "IDLE";
 pub const STATUS_ACCEPTED: &str = "ACCEPTED";
 pub const STATUS_REJECTED: &str = "REJECTED";
 pub const STATUS_PENDING: &str = "PENDING";
-pub const STATUS_STOPPING: &str = "STOPPING";
 pub const STATUS_ACTIVE: &str = "ACTIVE";
 pub const STATUS_SUCCEEDED: &str = "SUCCEEDED";
 pub const STATUS_CANCELLED: &str = "CANCELLED";
@@ -83,20 +79,6 @@ const SCHEDULER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const SCHEDULER_ABORT_JOIN_TIMEOUT: Duration = Duration::from_millis(250);
 #[cfg(test)]
 const SCHEDULER_ABORT_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
-#[cfg(not(test))]
-const CHILD_CANCEL_DISPATCH_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(test)]
-const CHILD_CANCEL_DISPATCH_TIMEOUT: Duration = Duration::from_millis(100);
-const ORPHAN_RECONCILE_BATCH_SIZE: usize = 32;
-#[cfg(not(test))]
-const ORPHAN_RECONCILE_PASS_TIMEOUT: Duration = Duration::from_millis(100);
-#[cfg(test)]
-const ORPHAN_RECONCILE_PASS_TIMEOUT: Duration = Duration::from_millis(50);
-#[cfg(not(test))]
-const ORPHAN_RECONCILE_ENTRY_TIMEOUT: Duration = Duration::from_millis(50);
-#[cfg(test)]
-const ORPHAN_RECONCILE_ENTRY_TIMEOUT: Duration = Duration::from_millis(10);
-
 #[cfg(test)]
 pub fn parse_arbitration_policy(s: &str) -> ExplorationArbitrationPolicy {
     try_parse_arbitration_policy(s).unwrap_or(ExplorationArbitrationPolicy::PreferWavefront)
@@ -170,7 +152,6 @@ pub fn now_monotonic_nanos() -> u64 {
         + 1
 }
 
-
 fn configured_pose_data_ttl() -> Duration {
     std::env::var("NUWAX_EXPLORE_POSE_TTL_MS").ok().and_then(|v| v.parse().ok())
         .map(Duration::from_millis).unwrap_or(DEFAULT_POSE_RECEIPT_TTL)
@@ -183,7 +164,6 @@ fn pose_input_is_fresh(pose: &ExploreRobotPose, now_monotonic_ns: u64) -> bool {
         && source_time::data_age_ns_at(pose.source_timestamp_ns, now_unix_nanos())
             .is_ok_and(|age| age <= configured_pose_data_ttl().as_nanos() as u64)
 }
-
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -422,9 +402,7 @@ pub struct ChildNavigationUnresolved {
     pub(crate) reason: String,
 }
 
-/// An already-proved result for THIS installed command. Bridge constructs it only
-/// from Nav's retained natural-retirement or exact Cancel ZEROED selection, not
-/// from an arbitrary status string. It is stack data, never another owner/cache.
+/// 桥接器按完整子目标身份保留的终态结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildNavigationResolved {
     pub(crate) result: ChildNavigationResult,
@@ -433,8 +411,7 @@ pub struct ChildNavigationResolved {
 impl ChildNavigationResolved {
     fn lease(&self) -> &ChildNavigationLease {
         match &self.result {
-            ChildNavigationResult::Reached(proof) | ChildNavigationResult::Failed { proof, .. }
-                | ChildNavigationResult::CancelFailed { proof, .. } => &proof.lease,
+            ChildNavigationResult::Reached(proof) | ChildNavigationResult::Failed { proof, .. } => &proof.lease,
             ChildNavigationResult::Cancelled(proof) => &proof.lease,
         }
     }
@@ -442,8 +419,8 @@ impl ChildNavigationResolved {
     fn reason(&self) -> &str {
         match &self.result {
             ChildNavigationResult::Reached(_) => "child navigation already reached",
-            ChildNavigationResult::Failed { reason, .. } | ChildNavigationResult::CancelFailed { reason, .. } => reason,
-            ChildNavigationResult::Cancelled(_) => "child navigation already cancelled with exact ZEROED proof",
+            ChildNavigationResult::Failed { reason, .. } => reason,
+            ChildNavigationResult::Cancelled(_) => "child navigation already cancelled",
         }
     }
 }
@@ -500,25 +477,6 @@ impl ChildNavigationSubmitError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChildNavigationCancelTicket {
-    pub lease: ChildNavigationLease,
-    pub cancel_generation: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChildNavigationCancelOutcome {
-    Pending(ChildNavigationCancelTicket),
-    /// Authoritative natural retirement, not a fabricated cancellation proof.
-    AlreadyTerminal(ChildNavigationTerminalProof),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChildNavigationCancelRecovery {
-    pub ticket: ChildNavigationCancelTicket,
-    pub failure: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildNavigationTerminalProof {
     pub lease: ChildNavigationLease,
 }
@@ -539,11 +497,6 @@ pub enum ChildNavigationResult {
         reason: String,
     },
     Cancelled(ChildNavigationZeroProof),
-    CancelFailed {
-        proof: ChildNavigationTerminalProof,
-        cancel_generation: u64,
-        reason: String,
-    },
 }
 
 /// 子导航失败是否只因输入中断且已围栏停车。导航终态只经状态消息传递，没有独立的类型化原因。
@@ -552,51 +505,6 @@ pub enum ChildNavigationResult {
 fn child_failure_is_input_interruption(reason: &str) -> bool {
     reason.starts_with("SafetyFailed cause=StaleInput:")
         || (reason.starts_with("planner path timeout after ") && reason.contains("; 等待新鲜导航输入: "))
-}
-
-const MAX_EARLY_CANCEL_TERMINALS: usize = 4;
-
-fn cancellation_result_generation(result: &ChildNavigationResult) -> Option<u64> {
-    match result {
-        ChildNavigationResult::Cancelled(proof) => Some(proof.cancel_generation),
-        ChildNavigationResult::CancelFailed {
-            cancel_generation, ..
-        } => Some(*cancel_generation),
-        ChildNavigationResult::Reached(_) | ChildNavigationResult::Failed { .. } => None,
-    }
-}
-
-fn retain_early_cancel_terminal(
-    pending: &mut PendingChildCancellation,
-    result: ChildNavigationResult,
-) {
-    if pending.early_terminals.contains(&result) {
-        return;
-    }
-    if pending.early_terminals.len() >= MAX_EARLY_CANCEL_TERMINALS {
-        pending.early_terminals.remove(0);
-    }
-    pending.early_terminals.push(result);
-}
-
-fn take_early_cancel_terminal(
-    pending: &mut PendingChildCancellation,
-    generation: u64,
-) -> Option<ChildNavigationResult> {
-    let position = pending
-        .early_terminals
-        .iter()
-        .position(|result| {
-            matches!(result, ChildNavigationResult::Cancelled(_))
-                && cancellation_result_generation(result) == Some(generation)
-        })
-        .or_else(|| {
-            pending.early_terminals.iter().position(|result| {
-                matches!(result, ChildNavigationResult::CancelFailed { .. })
-                    && cancellation_result_generation(result) == Some(generation)
-            })
-        })?;
-    Some(pending.early_terminals.remove(position))
 }
 
 /// The original tick permit and its complete navigation handoff travel together.
@@ -629,7 +537,6 @@ impl ChildNavigationDispatch {
             };
             let mut current = runtime.snapshot_cache.write();
             if current.request_id == guard.last_request_id {
-                current.parking_pending = guard.pending_child_cancellation.is_some();
             }
         }
         snapshot
@@ -664,8 +571,6 @@ impl ChildNavigationDispatchObserver {
 pub(crate) trait ChildNavigationDispatchOwner: Send + Sync {
     /// The callback runs once under the original root admission mutex, no await.
     fn with_dispatch_admission(&self, decide: &mut dyn FnMut(bool));
-    /// Return only after authority proves the exact orphan terminal.
-    async fn settle_retained_dispatch_orphan(&self, lease: ChildNavigationLease);
 }
 
 #[async_trait]
@@ -700,7 +605,7 @@ pub trait ExploreNavigationSink: Send + Sync {
     async fn cancel(
         &self,
         lease: &ChildNavigationLease,
-    ) -> Result<ChildNavigationCancelOutcome, String>;
+    ) -> Result<(), String>;
 
     /// Read only a natural terminal that authoritatively retired this exact
     /// execution. An absent active lease alone is not proof of completion.
@@ -708,25 +613,6 @@ pub trait ExploreNavigationSink: Send + Sync {
         None
     }
 
-    /// Recover an exact cancellation receipt when the async response was lost.
-    /// A receipt identifies the transaction only; ownership remains held until
-    /// a matching `ZEROED` proof is reported.
-    fn recover_cancel_receipt(
-        &self,
-        _lease: &ChildNavigationLease,
-    ) -> Option<ChildNavigationCancelRecovery> {
-        None
-    }
-
-    /// Transfer an exact stale-success lease to a retained cancellation owner.
-    fn retain_orphan_cancellation(&self, _lease: ChildNavigationLease) -> Result<(), String> {
-        Err("retained orphan cancellation is unavailable".to_string())
-    }
-
-    /// 证明精确 orphan lease 已不再持有导航状态。
-    async fn orphan_lease_is_terminal(&self, _lease: &ChildNavigationLease) -> bool {
-        false
-    }
 }
 
 #[async_trait]
@@ -737,7 +623,6 @@ pub trait ExplorePoseProvider: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct ExploreRuntimeSnapshot {
     /// 真实子取消或在途派发仍待停车，不由业务FAILED推断停稳。
-    pub parking_pending: bool,
     pub status: &'static str,
     pub message: String,
     pub request_id: String,
@@ -749,14 +634,12 @@ pub struct ExploreRuntimeSnapshot {
     pub exploration_generation: u64,
     pub child_lease: Option<ChildNavigationLease>,
 
-
     pub mission_progress_json: String,
 }
 
 impl Default for ExploreRuntimeSnapshot {
     fn default() -> Self {
         Self {
-            parking_pending: false,
             status: STATUS_IDLE,
             message: "exploration idle".to_string(),
             request_id: String::new(),
@@ -785,15 +668,6 @@ struct ActiveChildNavigation {
 struct PendingChildAction {
     reason: ExplorationStopReason,
     message: String,
-}
-
-#[derive(Debug, Clone)]
-struct PendingChildCancellation {
-    action: PendingChildAction,
-    ticket: Option<ChildNavigationCancelTicket>,
-    failure: Option<String>,
-    dispatch_in_flight: bool,
-    early_terminals: Vec<ChildNavigationResult>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -880,7 +754,6 @@ pub struct ExploreRuntimeInner {
     return_goal_id: Option<String>,
     return_failures: u32,
     next_return_route_check: Option<Instant>,
-    return_after_cancellation: bool,
     progress_stopped_ns: Option<u64>,
     progress_map_name: String,
     progress_origin: Option<(String,i64,i64)>,
@@ -889,7 +762,6 @@ pub struct ExploreRuntimeInner {
     // One accepted dispatch owns the original tick permit across all epochs.
     // Neither Stop nor Start clears this; only that operation may settle it.
     retained_child_dispatch: bool,
-    pending_child_cancellation: Option<PendingChildCancellation>,
     session_generation: u64,
     generation: u64,
     child_sequence: u64,
@@ -960,14 +832,12 @@ impl ExploreRuntimeInner {
             return_goal_id: None,
             return_failures: 0,
             next_return_route_check: None,
-            return_after_cancellation: false,
             progress_stopped_ns: None,
             progress_map_name: String::new(),
             progress_origin: None,
             active_child: None,
             pending_child_dispatch: None,
             retained_child_dispatch: false,
-            pending_child_cancellation: None,
             session_generation: 0,
             generation: 0,
             child_sequence: 0,
@@ -983,13 +853,13 @@ impl ExploreRuntimeInner {
     }
 
     fn session_in_progress(&self) -> bool {
-        self.logical_active || self.compute.start_reservation.is_some() || self.compute.control_pending() || self.pending_child_cancellation.is_some()
+        self.logical_active || self.compute.start_reservation.is_some() || self.compute.control_pending()
     }
 
     /// 待继续、换图丢弃和短暂失鲜共用同一等待期限，只有实际交付子导航才清除。
     fn selection_wait_failure(&mut self) -> Option<String> {
         if !self.logical_active || self.active_child.is_some()
-            || self.pending_child_cancellation.is_some()
+
             || (self.no_frontier_since.is_some()
                 && matches!(self.last_poll, Some(ExplorationPoll::NoFrontier))) {
             return None;
@@ -1060,7 +930,6 @@ impl ExploreRuntimeInner {
     fn snapshot(&self, status: &'static str, message: impl Into<String>) -> ExploreRuntimeSnapshot {
         let child_lease = self.active_child.as_ref().map(|child| child.lease.clone());
         ExploreRuntimeSnapshot {
-            parking_pending: self.pending_child_cancellation.is_some() || (!self.logical_active && self.retained_child_dispatch),
             status,
             message: message.into(),
             request_id: self.last_request_id.clone(),
@@ -1075,7 +944,6 @@ impl ExploreRuntimeInner {
                 .unwrap_or_default(),
             exploration_generation: self.session_generation,
             child_lease,
-
 
             mission_progress_json: self.mission.as_ref().map(|p|serde_json::to_string(p).expect("有效行程载荷")).unwrap_or_default(),
         }
@@ -1154,212 +1022,6 @@ fn build_profile_controller(
     Ok(controller)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OrphanCancellationPhase {
-    OwnerRequired,
-    OwnerRegistered,
-    CancelPending,
-    CancelPendingOwnerRegistered,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct ExactOrphanLeaseKey {
-    session_id: String,
-    owner_kind: i32,
-    parent_request_id: String,
-    goal_generation: u64,
-    producer_runtime_generation: u64,
-
-}
-
-impl From<&ChildNavigationLease> for ExactOrphanLeaseKey {
-    fn from(lease: &ChildNavigationLease) -> Self {
-        Self {
-            session_id: lease.session_id.clone(),
-            owner_kind: lease.owner_kind,
-            parent_request_id: lease.parent_request_id.clone(),
-            goal_generation: lease.goal_generation,
-            producer_runtime_generation: lease.producer_runtime_generation,
-
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct OrphanCancellationEntry {
-    lease: ChildNavigationLease,
-    // 失败业务只等待原停车，不占用后继探索的业务入口。
-    retired_business: bool,
-    cancel_generation: Option<u64>,
-    phase: OrphanCancellationPhase,
-    queue_token: u64,
-}
-
-#[derive(Clone, Debug)]
-struct OrphanCancellationQueueItem {
-    key: ExactOrphanLeaseKey,
-    token: u64,
-}
-
-#[derive(Default)]
-struct OrphanCancellationState {
-    entries: HashMap<ExactOrphanLeaseKey, OrphanCancellationEntry>,
-    queue: VecDeque<OrphanCancellationQueueItem>,
-    next_queue_token: u64,
-}
-
-#[derive(Default)]
-pub(crate) struct OrphanCancellationRegistry {
-    state: SyncMutex<OrphanCancellationState>,
-}
-
-impl OrphanCancellationRegistry {
-    pub(crate) fn register(&self, lease: ChildNavigationLease) {
-        let key = ExactOrphanLeaseKey::from(&lease);
-        let mut state = self.state.lock();
-        if state.entries.contains_key(&key) {
-            return;
-        }
-        state.next_queue_token = state
-            .next_queue_token
-            .checked_add(1)
-            .expect("orphan queue token exhausted");
-        let token = state.next_queue_token;
-        state.entries.insert(
-            key.clone(),
-            OrphanCancellationEntry {
-                lease,
-                retired_business: false,
-                cancel_generation: None,
-                phase: OrphanCancellationPhase::OwnerRequired,
-                queue_token: token,
-            },
-        );
-        state
-            .queue
-            .push_back(OrphanCancellationQueueItem { key, token });
-    }
-
-    fn retain_failed_business(&self, lease: ChildNavigationLease, cancel_generation: Option<u64>) {
-        self.register(lease.clone());
-        let mut state = self.state.lock();
-        let entry = state.entries.get_mut(&ExactOrphanLeaseKey::from(&lease))
-            .expect("刚保存的原取消身份");
-        entry.retired_business = true;
-        entry.cancel_generation = cancel_generation;
-    }
-
-    fn pending_for_parent(&self, parent: &str) -> bool {
-        self.state.lock().entries.values().any(|entry| entry.lease.parent_request_id == parent)
-    }
-
-    fn leases_for_parent(&self, parent: &str) -> Vec<ChildNavigationLease> {
-        self.state.lock().entries.values().filter(|entry| entry.lease.parent_request_id == parent)
-            .map(|entry| entry.lease.clone()).collect()
-    }
-
-    pub(crate) fn contains(&self, lease: &ChildNavigationLease) -> bool {
-        self.state.lock().entries.contains_key(&ExactOrphanLeaseKey::from(lease))
-    }
-
-    fn retired_cancellation(&self, lease: &ChildNavigationLease) -> Option<Option<u64>> {
-        self.state.lock().entries.get(&ExactOrphanLeaseKey::from(lease))
-            .filter(|entry| entry.retired_business).map(|entry| entry.cancel_generation)
-    }
-
-    pub(crate) fn mark_cancel_pending(&self, lease: &ChildNavigationLease) {
-        let key = ExactOrphanLeaseKey::from(lease);
-        if let Some(entry) = self.state.lock().entries.get_mut(&key) {
-            entry.phase = match entry.phase {
-                OrphanCancellationPhase::OwnerRequired | OrphanCancellationPhase::CancelPending => {
-                    OrphanCancellationPhase::CancelPending
-                }
-                OrphanCancellationPhase::OwnerRegistered
-                | OrphanCancellationPhase::CancelPendingOwnerRegistered => {
-                    OrphanCancellationPhase::CancelPendingOwnerRegistered
-                }
-            };
-        }
-    }
-
-    pub(crate) fn claim_owner(&self, lease: &ChildNavigationLease) -> bool {
-        let key = ExactOrphanLeaseKey::from(lease);
-        let mut state = self.state.lock();
-        let Some(entry) = state.entries.get_mut(&key) else {
-            return false;
-        };
-        entry.phase = match entry.phase {
-            OrphanCancellationPhase::OwnerRequired => OrphanCancellationPhase::OwnerRegistered,
-            OrphanCancellationPhase::CancelPending => {
-                OrphanCancellationPhase::CancelPendingOwnerRegistered
-            }
-            OrphanCancellationPhase::OwnerRegistered
-            | OrphanCancellationPhase::CancelPendingOwnerRegistered => return false,
-        };
-        true
-    }
-
-    pub(crate) fn release_owner(&self, lease: &ChildNavigationLease) {
-        let key = ExactOrphanLeaseKey::from(lease);
-        if let Some(entry) = self.state.lock().entries.get_mut(&key) {
-            entry.phase = match entry.phase {
-                OrphanCancellationPhase::OwnerRegistered => OrphanCancellationPhase::OwnerRequired,
-                OrphanCancellationPhase::CancelPendingOwnerRegistered => {
-                    OrphanCancellationPhase::CancelPending
-                }
-                phase => phase,
-            };
-        }
-    }
-
-    pub(crate) fn remove_terminal(&self, lease: &ChildNavigationLease) {
-        let retired_state = {
-            let mut state = self.state.lock();
-            state.entries.remove(&ExactOrphanLeaseKey::from(lease));
-            state
-                .entries
-                .is_empty()
-                .then(|| std::mem::take(&mut *state))
-        };
-        if let Some(retired_state) = retired_state {
-            let _cleanup = tokio::task::spawn_blocking(move || drop(retired_state));
-        }
-    }
-
-    pub(crate) fn has_entries(&self) -> bool {
-        !self.state.lock().entries.is_empty()
-    }
-
-    pub(crate) fn next_batch(&self, limit: usize) -> Vec<ChildNavigationLease> {
-        let mut state = self.state.lock();
-        let probe_limit = state.queue.len().min(limit);
-        let mut batch = Vec::with_capacity(probe_limit);
-        for _ in 0..probe_limit {
-            let Some(item) = state.queue.pop_front() else {
-                break;
-            };
-            let live = state
-                .entries
-                .get(&item.key)
-                .filter(|entry| entry.queue_token == item.token)
-                .map(|entry| entry.lease.clone());
-            if let Some(lease) = live {
-                state.queue.push_back(item);
-                batch.push(lease);
-            }
-        }
-        batch
-    }
-
-    pub(crate) fn blocks_motion_mutation(&self) -> bool {
-        self.has_entries()
-    }
-
-    fn blocks_child_dispatch(&self) -> bool {
-        self.state.lock().entries.values().any(|entry| !entry.retired_business)
-    }
-}
-
 #[derive(Clone)]
 pub struct ExploreRuntimeHandle {
     #[cfg(test)]
@@ -1377,7 +1039,6 @@ pub struct ExploreRuntimeHandle {
     navigation_sink: Arc<RwLock<Option<Arc<dyn ExploreNavigationSink>>>>,
     frontier_tx: watch::Sender<FrontierSnapshot>,
     generation: Arc<AtomicU64>,
-    orphan_cancellations: Arc<OrphanCancellationRegistry>,
 }
 
 impl ExploreRuntimeHandle {
@@ -1416,9 +1077,7 @@ impl ExploreRuntimeHandle {
             );
         }
         let mut guard = self.inner.lock().await;
-        if guard.session_in_progress() {
-            return Err("cannot reconfigure an active exploration source".into());
-        }
+
         let mode = SurfaceExplorationMode {
             config,
             receiver: SurfaceInputReceiver::new(),
@@ -1699,7 +1358,6 @@ impl ExploreRuntimeHandle {
             navigation_sink: Arc::new(RwLock::new(None)),
             frontier_tx,
             generation: Arc::new(AtomicU64::new(0)),
-            orphan_cancellations: Arc::new(OrphanCancellationRegistry::default()),
         }
     }
 
@@ -1712,81 +1370,8 @@ impl ExploreRuntimeHandle {
         self.generation.clone()
     }
 
-    pub(crate) fn orphan_cancellation_registry(&self) -> Arc<OrphanCancellationRegistry> {
-        self.orphan_cancellations.clone()
-    }
-
-    async fn reconcile_orphan_cancellation(
-        &self,
-        sink: &Arc<dyn ExploreNavigationSink>,
-        lease: ChildNavigationLease,
-    ) {
-        if sink.orphan_lease_is_terminal(&lease).await {
-            self.orphan_cancellations.remove_terminal(&lease);
-            return;
-        }
-        let recovered = sink
-            .recover_cancel_receipt(&lease)
-            .is_some_and(|recovery| recovery.failure.is_none());
-        if recovered {
-            self.orphan_cancellations.mark_cancel_pending(&lease);
-        } else {
-            match sink.cancel(&lease).await {
-                Ok(ChildNavigationCancelOutcome::Pending(_)) => {
-                    self.orphan_cancellations.mark_cancel_pending(&lease);
-                }
-                Ok(ChildNavigationCancelOutcome::AlreadyTerminal(proof))
-                    if proof.lease.matches(&lease) => {
-                    self.orphan_cancellations.remove_terminal(&lease);
-                    return;
-                }
-                Ok(_) | Err(_) => {}
-            }
-        }
-        let _ = sink.retain_orphan_cancellation(lease.clone());
-        if sink.orphan_lease_is_terminal(&lease).await {
-            self.orphan_cancellations.remove_terminal(&lease);
-        }
-    }
-
-    pub(crate) async fn reconcile_orphan_cancellations(&self) -> bool {
-        // Process Stop shares the original dispatch fence. An accepted dispatch
-        // may still be between Goal publication and registering its exact orphan.
-        let Ok(_tick_permit) = self.tick_gate.try_lock() else { return false; };
-        self.reconcile_orphan_cancellations_with_tick_permit().await
-    }
-
-    async fn reconcile_orphan_cancellations_with_tick_permit(&self) -> bool {
-        let leases = self
-            .orphan_cancellations
-            .next_batch(ORPHAN_RECONCILE_BATCH_SIZE);
-        let Some(sink) = self.navigation_sink.read().clone() else {
-            return leases.is_empty();
-        };
-        let mut pending = FuturesUnordered::new();
-        for lease in leases {
-            pending.push(tokio::time::timeout(
-                ORPHAN_RECONCILE_ENTRY_TIMEOUT,
-                self.reconcile_orphan_cancellation(&sink, lease),
-            ));
-        }
-        let _ = tokio::time::timeout(ORPHAN_RECONCILE_PASS_TIMEOUT, async {
-            while pending.next().await.is_some() {}
-        })
-        .await;
-        !self.orphan_cancellations.has_entries()
-    }
-
     pub fn set_navigation_sink(&self, sink: Arc<dyn ExploreNavigationSink>) {
         *self.navigation_sink.write() = Some(sink);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn navigation_sink_for_tests(&self) -> Arc<dyn ExploreNavigationSink> {
-        self.navigation_sink
-            .read()
-            .clone()
-            .expect("production exploration navigation sink")
     }
 
     #[cfg(test)]
@@ -1804,11 +1389,8 @@ impl ExploreRuntimeHandle {
     }
 
     pub fn snapshot(&self) -> ExploreRuntimeSnapshot {
-        let mut snapshot = self.snapshot_cache.read().clone();
-        snapshot.parking_pending |= self.orphan_cancellations.pending_for_parent(&snapshot.request_id);
-        snapshot
+        self.snapshot_cache.read().clone()
     }
-
 
     fn store_snapshot(&self, snapshot: ExploreRuntimeSnapshot) -> ExploreRuntimeSnapshot {
         // 缓存仅保存当前业务投影；原孤儿是否停车由现有拥有方实时提供。
@@ -1821,7 +1403,6 @@ impl ExploreRuntimeHandle {
             self.frontier_tx.send_replace(snapshot);
         }
     }
-
 
     #[cfg(test)]
     pub async fn start(&self, request_id: &str, arbitration: &str) -> ExploreRuntimeSnapshot {
@@ -1841,29 +1422,10 @@ impl ExploreRuntimeHandle {
         request_id: &str,
         config: ExploreStartConfig,
     ) -> ExploreRuntimeSnapshot {
+        self.end_for_navigation_takeover().await;
         let surface_mode = {
             let guard = self.inner.lock().await;
-            if guard.session_in_progress() {
-                return ExploreRuntimeSnapshot {
-            parking_pending: false,
-                    status: STATUS_REJECTED,
-                    message: format!(
-                        "exploration already active (request_id={})",
-                        guard.last_request_id
-                    ),
-                    request_id: request_id.to_string(),
-                    selected_source: guard.last_selected_source.clone(),
-                    last_stop_reason: guard.last_stop_reason.clone(),
-                    frontier_count: guard.frontiers.len() as u32,
-                    revision: guard.frontier_revision,
-                    child_task_id: String::new(),
-                    exploration_generation: guard.session_generation,
-                    child_lease: guard.active_child.as_ref().map(|child| child.lease.clone()),
 
-
-            mission_progress_json: String::new(),
-                };
-            }
             guard.surface_mode.is_some()
         };
         let policy = match config.validate(surface_mode) {
@@ -1886,30 +1448,6 @@ impl ExploreRuntimeHandle {
         }
 
         let mut guard = self.inner.lock().await;
-        if guard.session_in_progress() {
-            let snapshot = ExploreRuntimeSnapshot {
-            parking_pending: false,
-                status: STATUS_REJECTED,
-                message: format!(
-                    "exploration already active (request_id={})",
-                    guard.last_request_id
-                ),
-                request_id: request_id.to_string(),
-                selected_source: guard.last_selected_source.clone(),
-                last_stop_reason: guard.last_stop_reason.clone(),
-                frontier_count: guard.frontiers.len() as u32,
-                revision: guard.frontier_revision,
-                child_task_id: String::new(),
-                exploration_generation: guard.session_generation,
-                child_lease: guard.active_child.as_ref().map(|child| child.lease.clone()),
-
-
-            mission_progress_json: String::new(),
-            };
-            drop(guard);
-            return snapshot;
-        }
-
         let navigation_configuration = NavigationConfiguration::capture();
         let mission_calibration = if config.return_policy.enabled() {
             let surface=guard.surface_mode.as_ref().and_then(|m|m.config.as_ref().ok());
@@ -2035,11 +1573,9 @@ impl ExploreRuntimeHandle {
         guard.next_return_route_check = None;
         guard.return_goal_id = None;
         guard.return_failures = 0;
-        guard.return_after_cancellation = false;
         guard.progress_stopped_ns=None;guard.progress_map_name.clear();guard.progress_origin=None;
         guard.active_child = None;
         guard.pending_child_dispatch = None;
-        guard.pending_child_cancellation = None;
         guard.session_generation = generation;
         guard.generation = generation;
         guard.child_sequence = 0;
@@ -2084,72 +1620,6 @@ impl ExploreRuntimeHandle {
         .await
     }
 
-    /// 普通全局停车已实际完成后，只收尾回执覆盖的原探索与精确子目标。
-    pub(crate) async fn stop_after_global_confirmation(
-        &self,
-        request_id: &str,
-        expected_exploration_generation: u64,
-        confirmation: &crate::proto::OrdinaryGlobalStopConfirmation,
-        nav: &crate::nav_runtime::NavRuntimeState,
-    ) -> Result<(ExploreRuntimeSnapshot, Option<crate::lcm_runtime::NavigationUpdate>), String> {
-        let mut guard = self.inner.lock().await;
-        if request_id.is_empty() || request_id != guard.last_request_id
-            || expected_exploration_generation != guard.session_generation
-        {
-            return Err("ordinary stop exploration identity changed".into());
-        }
-        if !confirmation.stationary_confirmed || confirmation.operation_id.is_empty()
-            || confirmation.zero_ack_id.is_empty()
-            || guard.started_guard_clock_ns == 0
-            || confirmation.applied_monotonic_ns < guard.started_guard_clock_ns
-        {
-            return Err("ordinary stop does not confirm stationary output after this exploration started".into());
-        }
-        let previous = self.snapshot();
-        let preserve_failure = previous.status == STATUS_FAILED;
-        let mut remembered = self.orphan_cancellations.leases_for_parent(request_id);
-        if let Some(child) = guard.active_child.as_ref() { remembered.push(child.lease.clone()); }
-        let generation = self.next_exploration_generation(&mut guard);
-        let reason = guard.last_stop.filter(|_| preserve_failure)
-            .unwrap_or(ExplorationStopReason::UserCancelled);
-        self.record_child_action_stop_locked(&mut guard, generation, reason);
-        if preserve_failure { guard.last_stop_reason = previous.last_stop_reason.clone(); }
-        guard.return_after_cancellation = false;
-        let navigation_update = match nav.retire_exploration_after_global_stop(
-            request_id, expected_exploration_generation, &remembered, confirmation,
-        ).await {
-            Ok(update) => update,
-            Err(error) => {
-                drop(guard);
-                // 回执覆盖不了新安装的子目标时，原普通取消仍取得真实停车责任。
-                self.finish_session(Some(request_id), ExplorationStopReason::UserCancelled,
-                    format!("ordinary stop could not retire child: {error}")).await;
-                return Err(error);
-            }
-        };
-        // 原派发任务继续保有在途标志；它随后消费同一份已保存真实终态。
-        for lease in remembered { self.orphan_cancellations.remove_terminal(&lease); }
-        guard.active_child = None;
-        guard.pending_child_cancellation = None;
-        guard.progress_stopped_ns.get_or_insert_with(now_unix_nanos);
-        let status = if preserve_failure { STATUS_FAILED } else { STATUS_CANCELLED };
-        let message = if preserve_failure {
-            format!("{}; parking confirmed by ordinary global stop {}", previous.message, confirmation.operation_id)
-        } else {
-            format!("exploration cancelled; parking confirmed by ordinary global stop {}", confirmation.operation_id)
-        };
-        let frontier_update = guard.update_frontiers(Vec::new());
-        let snapshot = guard.snapshot(status, message);
-        let backend_available = self.readiness_cache.lock().backend_available;
-        let readiness = Self::compute_readiness_locked(&guard, self.expected_map_frame.as_ref(),
-            backend_available, self.navigation_sink.read().is_some());
-        drop(guard);
-        *self.readiness_cache.lock() = readiness;
-        self.publish_frontiers(frontier_update);
-        Ok((self.store_snapshot(snapshot), navigation_update))
-    }
-
-
     async fn finish_session(
         &self,
         request_id: Option<&str>,
@@ -2168,136 +1638,48 @@ impl ExploreRuntimeHandle {
         }, Some(action)).await
     }
 
-    async fn cancel_child_for_return(&self,generation:u64,reason:ExplorationStopReason)->ExploreRuntimeSnapshot {
-        let mut guard=self.inner.lock().await;
-        if generation!=guard.generation || !guard.logical_active || guard.pending_child_cancellation.is_some(){return self.snapshot();}
-        let Some(child)=guard.active_child.clone() else{return guard.snapshot(STATUS_ACTIVE,"返航等待派发");};
-        guard.return_after_cancellation=true;
-        guard.pending_child_dispatch=None;
-        guard.pending_child_cancellation=Some(PendingChildCancellation {action:PendingChildAction {reason,message:"行程条件已满足，先停车再返航".into()},ticket:None,failure:None,dispatch_in_flight:true,early_terminals:Vec::new()});
-        let snapshot=guard.snapshot(STATUS_STOPPING,"返航等待当前子目标物理停稳");self.store_snapshot(snapshot);drop(guard);
-        self.dispatch_child_cancellation(child,false).await
-    }
-
-    async fn begin_child_action(
-        &self,
-        request_id: Option<&str>,
-        action: PendingChildAction,
-        compute_action: Option<&ComputeStopAction>,
-    ) -> ExploreRuntimeSnapshot {
+    async fn begin_child_action(&self, request_id: Option<&str>, action: PendingChildAction,
+        compute_action: Option<&ComputeStopAction>) -> ExploreRuntimeSnapshot {
         let mut guard = self.inner.lock().await;
         if compute_action.is_some_and(|action| !action.matches(&guard)) { return self.snapshot(); }
         if let Some(requested_id) = request_id.map(str::trim) {
             if requested_id.is_empty() || requested_id != guard.last_request_id {
-                let mut snapshot = guard.snapshot(
-                    STATUS_REJECTED,
-                    format!(
-                        "exploration stop request_id mismatch: active={} received={}",
-                        guard.last_request_id, requested_id
-                    ),
-                );
+                let mut snapshot = guard.snapshot(STATUS_REJECTED,
+                    format!("exploration stop request_id mismatch: active={} received={}", guard.last_request_id, requested_id));
                 snapshot.request_id = requested_id.to_string();
                 return snapshot;
             }
         }
-        if guard.active_child.is_none()
-            && self.orphan_cancellations.pending_for_parent(&guard.last_request_id)
-            && self.snapshot().status == STATUS_FAILED
-        {
-            // 原停车拥有方继续重试；再次业务停止不能把未知停车改写成取消成功。
-            return self.snapshot();
-        }
-        if guard.return_after_cancellation {
-            // 用户取消、故障或关闭覆盖返航意图，共用已经在途的停车事务。
-            guard.return_after_cancellation=false;
-            if compute_action.is_none() { guard.generation=self.next_exploration_generation(&mut guard); }
-            guard.request_compute_stop(action.reason);
-            self.compute_service.wake.notify_one();
-            guard.last_stop=Some(action.reason);guard.last_stop_reason=stop_reason_str(action.reason).into();
-            if let Some(pending)=guard.pending_child_cancellation.as_mut(){pending.action=action.clone();}
-        }
-        if guard.pending_child_cancellation.is_some() {
-            let (failure, dispatch_in_flight) = guard
-                .pending_child_cancellation
-                .as_ref()
-                .map(|pending| (pending.failure.clone(), pending.dispatch_in_flight))
-                .expect("pending child cancellation checked above");
-            let retry_correlated = compute_action.is_none() && request_id.is_some() && failure.is_some() && !dispatch_in_flight;
-            if !retry_correlated {
-                let status = if failure.is_some() && !dispatch_in_flight {
-                    STATUS_FAILED
-                } else {
-                    STATUS_STOPPING
-                };
-                let message = if dispatch_in_flight && failure.is_some() {
-                    "child navigation cancellation retry is already in flight"
-                } else {
-                    "child navigation cancellation remains pending ZEROED proof"
-                };
-                let snapshot = guard.snapshot(status, message);
-                let snapshot = self.store_snapshot(snapshot);
-                drop(guard);
-                return snapshot;
-            }
-            let Some(child) = guard.active_child.clone() else {
-                let snapshot = guard.snapshot(
-                    STATUS_FAILED,
-                    "pending child cancellation lost its active safety lease",
-                );
-                drop(guard);
-                return self.store_snapshot(snapshot);
-            };
-            guard
-                .pending_child_cancellation
-                .as_mut()
-                .expect("pending child cancellation checked above")
-                .dispatch_in_flight = true;
-            let snapshot = guard.snapshot(
-                STATUS_STOPPING,
-                format!(
-                    "CANCEL_RETRY_PENDING: re-dispatching child {} cancellation",
-                    child.request_id
-                ),
-            );
-            self.store_snapshot(snapshot);
-            drop(guard);
-            return self.dispatch_child_cancellation(child, true).await;
-        }
-        if guard.last_request_id.is_empty() {
-            if let Some(request_id) = request_id.filter(|value| !value.trim().is_empty()) {
-                guard.last_request_id = request_id.to_string();
-            }
-        }
+        let child = guard.active_child.take();
         let generation = if compute_action.is_some() { guard.generation } else { self.next_exploration_generation(&mut guard) };
         self.record_child_action_stop_locked(&mut guard, generation, action.reason);
-
-        let Some(child) = guard.active_child.clone() else {
-            let (snapshot, readiness, frontier_update) =
-                self.prepare_no_child_stop_locked(&mut guard, action);
-            drop(guard);
-            *self.readiness_cache.lock() = readiness;
-            self.publish_frontiers(frontier_update);
-            return self.store_snapshot(snapshot);
-        };
-
-        guard.pending_child_cancellation = Some(PendingChildCancellation {
-            action,
-            ticket: None,
-            failure: None,
-            dispatch_in_flight: true,
-            early_terminals: Vec::new(),
-        });
-        let snapshot = guard.snapshot(
-            STATUS_STOPPING,
-            format!(
-                "CANCEL_PENDING: retaining child {} until actuator ZEROED proof",
-                child.request_id
-            ),
-        );
-        self.store_snapshot(snapshot);
+        let (snapshot, readiness, frontier_update) = self.prepare_no_child_stop_locked(&mut guard, action);
         drop(guard);
+        *self.readiness_cache.lock() = readiness;
+        self.publish_frontiers(frontier_update);
+        let snapshot = self.store_snapshot(snapshot);
+        let sink = self.navigation_sink.read().clone();
+        if let (Some(child), Some(sink)) = (child, sink) {
+            if let Err(error) = sink.cancel(&child.lease).await {
+                return self.store_snapshot(ExploreRuntimeSnapshot { status: STATUS_FAILED, message: error, ..snapshot });
+            }
+        }
+        snapshot
+    }
 
-        self.dispatch_child_cancellation(child, false).await
+    pub async fn end_for_navigation_takeover(&self) {
+        let mut guard = self.inner.lock().await;
+        if !guard.session_in_progress() { return; }
+        guard.active_child = None;
+        let generation = self.next_exploration_generation(&mut guard);
+        self.record_child_action_stop_locked(&mut guard, generation, ExplorationStopReason::UserCancelled);
+        let (snapshot, readiness, frontiers) = self.prepare_no_child_stop_locked(&mut guard, PendingChildAction {
+            reason: ExplorationStopReason::UserCancelled, message: "探索已被新运动命令接管".into(),
+        });
+        drop(guard);
+        *self.readiness_cache.lock() = readiness;
+        self.publish_frontiers(frontiers);
+        self.store_snapshot(snapshot);
     }
 
     fn record_child_action_stop_locked(
@@ -2337,275 +1719,6 @@ impl ExploreRuntimeHandle {
             self.navigation_sink.read().is_some(),
         );
         (snapshot, readiness, frontier_update)
-    }
-
-    async fn dispatch_child_cancellation(
-        &self,
-        child: ActiveChildNavigation,
-        retry: bool,
-    ) -> ExploreRuntimeSnapshot {
-        let Some(sink) = self.navigation_sink.read().clone() else {
-            return self
-                .record_child_cancel_failure(
-                    &child.lease,
-                    "navigation sink unavailable during child cancellation".to_string(),
-                    None,
-                )
-                .await;
-        };
-        let (ticket, recovered_after_timeout) =
-            match tokio::time::timeout(CHILD_CANCEL_DISPATCH_TIMEOUT, sink.cancel(&child.lease))
-                .await
-            {
-                Err(_) => match sink.recover_cancel_receipt(&child.lease) {
-                    Some(recovery)
-                        if recovery.ticket.cancel_generation > 0
-                            && recovery.ticket.lease.matches(&child.lease) =>
-                    {
-                        if let Some(failure) = recovery.failure {
-                            return self
-                                .record_child_cancel_failure(
-                                    &child.lease,
-                                    failure,
-                                    Some(recovery.ticket),
-                                )
-                                .await;
-                        }
-                        (recovery.ticket, true)
-                    }
-                    Some(_) => {
-                        return self
-                            .record_child_cancel_failure(
-                                &child.lease,
-                                "navigation sink recovered an invalid cancellation ticket"
-                                    .to_string(),
-                                None,
-                            )
-                            .await;
-                    }
-                    None => {
-                        return self
-                            .record_child_cancel_failure(
-                                &child.lease,
-                                "navigation child cancellation dispatch timed out".to_string(),
-                                None,
-                            )
-                            .await;
-                    }
-                },
-                Ok(Ok(ChildNavigationCancelOutcome::AlreadyTerminal(proof))) => {
-                    return self.finish_already_terminal_child(&child.lease, proof).await;
-                }
-                Ok(Ok(ChildNavigationCancelOutcome::Pending(ticket)))
-                    if ticket.cancel_generation > 0 && ticket.lease.matches(&child.lease) =>
-                {
-                    (ticket, false)
-                }
-                Ok(Ok(_)) => {
-                    return self
-                        .record_child_cancel_failure(
-                            &child.lease,
-                            "navigation sink returned an invalid cancellation ticket".to_string(),
-                            None,
-                        )
-                        .await;
-                }
-                Ok(Err(error)) => {
-                    let ticket = sink
-                        .recover_cancel_receipt(&child.lease)
-                        .filter(|recovery| {
-                            recovery.ticket.cancel_generation > 0
-                                && recovery.ticket.lease.matches(&child.lease)
-                        })
-                        .map(|recovery| recovery.ticket);
-                    return self
-                        .record_child_cancel_failure(&child.lease, error, ticket)
-                        .await;
-                }
-            };
-
-        let mut guard = self.inner.lock().await;
-        if guard
-            .active_child
-            .as_ref()
-            .is_none_or(|active| !active.lease.matches(&child.lease))
-        {
-            return self.snapshot();
-        }
-        let Some(pending) = guard.pending_child_cancellation.as_mut() else {
-            return self.snapshot();
-        };
-        if !pending.dispatch_in_flight {
-            return self.snapshot();
-        }
-        pending.ticket = Some(ticket.clone());
-        pending.dispatch_in_flight = false;
-        let early_terminal = take_early_cancel_terminal(pending, ticket.cancel_generation);
-        let snapshot = guard.snapshot(
-            STATUS_STOPPING,
-            format!(
-                "{}: child {} cancel_generation={} awaiting ZEROED",
-                if recovered_after_timeout {
-                    "CANCEL_RECEIPT_RECOVERED"
-                } else if retry {
-                    "CANCEL_RETRY_PENDING"
-                } else {
-                    "CANCEL_PENDING"
-                },
-                child.request_id,
-                ticket.cancel_generation
-            ),
-        );
-        let snapshot = self.store_snapshot(snapshot);
-        drop(guard);
-        if let Some(result) = early_terminal {
-            return self
-                .report_navigation_result(&child.request_id, result)
-                .await
-                .unwrap_or_else(|_| self.snapshot());
-        }
-        snapshot
-    }
-
-    async fn finish_already_terminal_child(
-        &self,
-        lease: &ChildNavigationLease,
-        proof: ChildNavigationTerminalProof,
-    ) -> ExploreRuntimeSnapshot {
-        if !proof.lease.matches(lease) {
-            return self.record_child_cancel_failure(lease,
-                "navigation sink returned an invalid natural-retirement result".into(), None).await;
-        }
-        let guard = self.inner.lock().await;
-        if guard.active_child.as_ref().is_none_or(|child| !child.lease.matches(lease))
-            || guard.pending_child_cancellation.is_none()
-        {
-            return self.snapshot();
-        }
-        if guard.pending_child_cancellation.as_ref().is_some_and(|pending| pending.ticket.is_some()) {
-            drop(guard);
-            return self.record_child_cancel_failure(lease,
-                "natural retirement cannot replace an assigned cancellation ticket".into(), None).await;
-        }
-        // Stop already closed source feedback admission. Complete only its
-        // retained logical action; preserve the original Nav natural terminal.
-        self.complete_pending_child_action(guard)
-    }
-
-    fn complete_pending_child_action(
-        &self,
-        mut guard: tokio::sync::MutexGuard<'_, ExploreRuntimeInner>,
-    ) -> ExploreRuntimeSnapshot {
-        let pending = guard
-            .pending_child_cancellation
-            .take()
-            .expect("pending child cancellation checked above");
-        guard
-            .active_child
-            .take()
-            .expect("active child checked above");
-        guard.no_frontier_since = None;
-        if guard.return_after_cancellation && pending.failure.is_none() {
-            guard.return_after_cancellation=false;
-            let snapshot=guard.snapshot(STATUS_ACTIVE,"当前子目标已物理停稳，等待返航路线与新租约");
-            drop(guard);return self.store_snapshot(snapshot);
-        }
-        guard.return_after_cancellation=false;
-        guard.progress_stopped_ns.get_or_insert_with(now_unix_nanos);
-        let (status, message, frontier_update) = if let Some(error) = pending.failure {
-            guard.request_compute_stop(ExplorationStopReason::ConsecutiveFailuresExceeded);
-            self.compute_service.wake.notify_one();
-            guard.last_stop = Some(ExplorationStopReason::ConsecutiveFailuresExceeded);
-            guard.last_stop_reason = "child_cancel_failed".to_string();
-            (
-                STATUS_FAILED,
-                format!("child cancellation failed before ownership settled: {error}"),
-                guard.update_frontiers(Vec::new()),
-            )
-        } else {
-            (
-                status_for_stop_reason(pending.action.reason),
-                pending.action.message,
-                guard.update_frontiers(Vec::new()),
-            )
-        };
-        let snapshot = guard.snapshot(status, message);
-        let backend_available = self.readiness_cache.lock().backend_available;
-        let readiness = Self::compute_readiness_locked(
-            &guard,
-            self.expected_map_frame.as_ref(),
-            backend_available,
-            self.navigation_sink.read().is_some(),
-        );
-        drop(guard);
-        *self.readiness_cache.lock() = readiness;
-        self.publish_frontiers(frontier_update);
-        self.store_snapshot(snapshot)
-    }
-
-    async fn record_child_cancel_failure(
-        &self,
-        child_lease: &ChildNavigationLease,
-        error: String,
-        ticket: Option<ChildNavigationCancelTicket>,
-    ) -> ExploreRuntimeSnapshot {
-        let mut guard = self.inner.lock().await;
-        if guard
-            .active_child
-            .as_ref()
-            .is_none_or(|child| !child.lease.matches(child_lease))
-        {
-            return self.snapshot();
-        }
-        let Some(pending) = guard.pending_child_cancellation.as_mut() else {
-            return self.snapshot();
-        };
-        pending.dispatch_in_flight = false;
-        pending.failure = Some(error.clone());
-        let early_terminal = ticket.and_then(|ticket| {
-            let cancel_generation = ticket.cancel_generation;
-            pending.ticket = Some(ticket);
-            take_early_cancel_terminal(pending, cancel_generation)
-        });
-        guard.request_compute_stop(ExplorationStopReason::ConsecutiveFailuresExceeded);
-        self.compute_service.wake.notify_one();
-        guard.last_stop = Some(ExplorationStopReason::ConsecutiveFailuresExceeded);
-        guard.last_stop_reason = "child_cancel_failed".to_string();
-        guard.last_poll = Some(ExplorationPoll::Stop(
-            ExplorationStopReason::ConsecutiveFailuresExceeded,
-        ));
-        let frontier_update = guard.update_frontiers(Vec::new());
-        let pending = guard.pending_child_cancellation.take().expect("原取消仍存在");
-        let cancellation_generation = pending.ticket.as_ref().map(|ticket| ticket.cancel_generation);
-        self.orphan_cancellations.retain_failed_business(child_lease.clone(), cancellation_generation);
-        guard.active_child = None;
-        guard.return_after_cancellation = false;
-        guard.no_frontier_since = None;
-        guard.progress_stopped_ns.get_or_insert_with(now_unix_nanos);
-        let snapshot = guard.snapshot(
-            STATUS_FAILED,
-            format!("child cancellation failed; parking unconfirmed: {error}"),
-        );
-        let backend_available = self.readiness_cache.lock().backend_available;
-        let readiness = Self::compute_readiness_locked(
-            &guard,
-            self.expected_map_frame.as_ref(),
-            backend_available,
-            self.navigation_sink.read().is_some(),
-        );
-        *self.readiness_cache.lock() = readiness;
-        let snapshot = self.store_snapshot(snapshot);
-        drop(guard);
-        self.publish_frontiers(frontier_update);
-        if let Some(sink) = self.navigation_sink.read().clone() {
-            let _ = sink.retain_orphan_cancellation(child_lease.clone());
-        }
-        if let Some(result) = early_terminal {
-            return Box::pin(self.report_navigation_result(&child_lease.session_id, result))
-                .await
-                .unwrap_or(snapshot);
-        }
-        snapshot
     }
 
     #[cfg(test)]
@@ -2695,25 +1808,6 @@ impl ExploreRuntimeHandle {
             let snapshot = guard.snapshot(
                 STATUS_PENDING,
                 "previous retained child dispatch remains unresolved",
-            );
-            drop(guard);
-            return self.store_snapshot(snapshot);
-        }
-
-        if self.orphan_cancellations.blocks_child_dispatch() {
-            let snapshot = guard.snapshot(
-                STATUS_PENDING,
-                "recovering orphan navigation ownership before child dispatch",
-            );
-            drop(guard);
-            self.reconcile_orphan_cancellations_with_tick_permit().await;
-            return self.store_snapshot(snapshot);
-        }
-
-        if guard.pending_child_cancellation.is_some() {
-            let snapshot = guard.snapshot(
-                STATUS_STOPPING,
-                "child navigation cancellation is awaiting actuator ZEROED proof",
             );
             drop(guard);
             return self.store_snapshot(snapshot);
@@ -2809,7 +1903,7 @@ impl ExploreRuntimeHandle {
                 guard.return_reason=Some(reason);
                 guard.mission.as_mut().expect("已检查进度").returning=true;
                 if guard.active_child.is_some() {
-                    drop(guard);return self.cancel_child_for_return(generation,reason).await;
+                    guard.active_child = None;
                 }
                 guard.pending_child_dispatch=None;
             } else {
@@ -3267,7 +2361,7 @@ impl ExploreRuntimeHandle {
 
     async fn record_pose_wait(&self, error: String) -> ExploreRuntimeSnapshot {
         let mut guard = self.inner.lock().await;
-        if !guard.logical_active || guard.pending_child_cancellation.is_some() { return self.snapshot(); }
+        if !guard.logical_active { return self.snapshot(); }
         let since = *guard.pose_wait_since.get_or_insert_with(Instant::now);
         if let Some(error) = guard.selection_wait_failure() {
             drop(guard);
@@ -3294,7 +2388,7 @@ impl ExploreRuntimeHandle {
         // 选择 future 可能已排队取得此锁；监视分支不能再排队后暂停轮询选择，
         // 否则锁许可留给选择、监视却一直等待，原调度任务会自等。
         let Ok(mut guard) = self.inner.try_lock() else { return; };
-        if !guard.logical_active || guard.pending_child_cancellation.is_some() { return; }
+        if !guard.logical_active { return; }
         if let Some(error) = guard.selection_wait_failure() {
             drop(guard);
             self.finish_session(None, ExplorationStopReason::PlanningResourceLimited, error).await;
@@ -3392,35 +2486,12 @@ impl ExploreRuntimeHandle {
                     ChildNavigationResult::Cancelled(_) => {
                         return self.complete_resolved_dispatch_cancellation(generation, request, resolved, owner).await;
                     }
-                    ChildNavigationResult::CancelFailed { .. } => {
-                        panic!("resolved dispatch cannot contain an unproved cancellation failure");
-                    }
                 }
                 (ChildNavigationTicket { lease: resolved.lease().clone() }, Some(resolved))
             }
             Err(ChildNavigationSubmitError::DispatchUnresolved(unresolved)) => {
-                if !child_lease_matches_request(&unresolved.lease, &request) {
-                    return self.record_dispatch_failure(generation, request,
-                        ChildNavigationSubmitError::Rejected(
-                            "navigation sink returned a mismatched unresolved child lease".into())).await;
-                }
-                {
-                    let guard = self.inner.lock().await;
-                    // Register in the EXISTING orphan registry, inside this ORIGINAL
-                    // retained continuation; root close does not revoke responsibility.
-                    self.orphan_cancellations.register(unresolved.lease.clone());
-                    if generation == guard.generation && guard.logical_active
-                        && guard.pending_child_dispatch.as_ref() == Some(&request) {
-                        self.store_snapshot(guard.snapshot(STATUS_STOPPING,
-                            format!("child goal dispatch unconfirmed; awaiting exact stop proof: {}", unresolved.reason)));
-                    }
-                }
-                let owner = owner.expect(
-                    "installed-unresolved child requires the original retained dispatch owner; inline sink contract violation");
-                // Keeps original tick permit and full frozen request throughout.
-                owner.settle_retained_dispatch_orphan(unresolved.lease.clone()).await;
-                return self.record_dispatch_failure(generation, request,
-                    ChildNavigationSubmitError::DispatchUnresolved(unresolved)).await;
+                let _ = sink.cancel(&unresolved.lease).await;
+                return self.record_dispatch_failure(generation, request, ChildNavigationSubmitError::DispatchUnresolved(unresolved)).await;
             }
             Err(error) => {
                 return self.record_dispatch_failure(generation, request, error).await;
@@ -3448,11 +2519,6 @@ impl ExploreRuntimeHandle {
                 if !admission_open || generation != guard.generation
                     || !guard.logical_active || !frozen_request_matches
                 {
-                    // Synchronous visibility before releasing either state lock.
-                    // The original tick permit excludes all batch reconcilers.
-                    if resolved.is_none() {
-                        self.orphan_cancellations.register(ticket.lease.clone());
-                    }
                     return;
                 }
                 guard.pending_child_dispatch = None;
@@ -3478,6 +2544,7 @@ impl ExploreRuntimeHandle {
                 decide(true);
             }
         }
+        let superseded = !attached && guard.session_in_progress();
         drop(guard);
         if attached {
             if let Some(resolved) = resolved.take() {
@@ -3490,23 +2557,14 @@ impl ExploreRuntimeHandle {
                         tracing::debug!(%error, "resolved child result lost business admission after attachment");
                         // Stop may win between attach and feedback. The original
                         // natural proof completes only its exact pending logical action.
-                        if let ChildNavigationResult::Reached(proof) | ChildNavigationResult::Failed { proof, .. } = result {
-                            return self.finish_already_terminal_child(&ticket.lease, proof).await;
-                        }
                         return self.snapshot();
                     }
                 }
             }
             return self.reconcile_child_terminal(&ticket.lease).await;
         }
-        if resolved.is_some() { return self.snapshot(); }
-        if let Some(owner) = owner {
-            // The task that published also owns the exact orphan continuation.
-            // No new root admission is needed, even after root close wins.
-            owner.settle_retained_dispatch_orphan(ticket.lease).await;
-        } else {
-            self.reconcile_orphan_cancellation(&sink, ticket.lease).await;
-        }
+        if resolved.is_some() || superseded { return self.snapshot(); }
+        let _ = sink.cancel(&ticket.lease).await;
         self.snapshot()
     }
 
@@ -3517,11 +2575,9 @@ impl ExploreRuntimeHandle {
         resolved: ChildNavigationResolved,
         owner: Option<&dyn ChildNavigationDispatchOwner>,
     ) -> ExploreRuntimeSnapshot {
-        let ChildNavigationResult::Cancelled(proof) = &resolved.result else {
+        let ChildNavigationResult::Cancelled(_) = &resolved.result else {
             unreachable!("only proved cancellation uses this branch");
         };
-        assert!(proof.cancel_generation > 0 && !proof.zero_ack_id.trim().is_empty()
-            && proof.zero_applied_monotonic_ns > 0, "resolved cancellation requires complete original ZERO proof");
         let mut guard = self.inner.lock().await;
         let mut admission = None;
         {
@@ -3697,51 +2753,11 @@ impl ExploreRuntimeHandle {
         self.store_snapshot(snapshot)
     }
 
-    /// 未确认停车不属于前沿失败；结束业务并由原停车拥有方保留精确租约的回收责任。
-    pub async fn report_navigation_stop_unconfirmed(
-        &self,
-        child_request_id: &str,
-        proof: ChildNavigationTerminalProof,
-        reason: String,
-    ) -> Result<ExploreRuntimeSnapshot, String> {
-        let mut guard = self.inner.lock().await;
-        let child = guard.active_child.as_ref().ok_or("no active exploration child navigation")?;
-        if child.request_id != child_request_id || !child.lease.matches(&proof.lease) {
-            return Err("unconfirmed stop does not match active child ownership".into());
-        }
-        let lease = child.lease.clone();
-        guard.pending_child_cancellation.get_or_insert_with(|| PendingChildCancellation {
-            action: PendingChildAction {
-                reason: ExplorationStopReason::ConsecutiveFailuresExceeded,
-                message: "子导航停车未确认，探索结束".into(),
-            },
-            ticket: None,
-            failure: None,
-            dispatch_in_flight: false,
-            early_terminals: Vec::new(),
-        });
-        drop(guard);
-        Ok(self.record_child_cancel_failure(&lease,
-            format!("子导航停车未确认，保留原租约停车责任：{reason}"), None).await)
-    }
-
     pub async fn report_navigation_result(
         &self,
         child_request_id: &str,
         result: ChildNavigationResult,
     ) -> Result<ExploreRuntimeSnapshot, String> {
-        if let ChildNavigationResult::Cancelled(proof) = &result {
-            if let Some(expected_generation) = self.orphan_cancellations.retired_cancellation(&proof.lease) {
-                if proof.lease.session_id != child_request_id || proof.cancel_generation == 0
-                    || proof.zero_ack_id.trim().is_empty() || proof.zero_applied_monotonic_ns == 0
-                    || expected_generation.is_some_and(|expected| expected != proof.cancel_generation)
-                {
-                    return Err("late cancellation result does not prove the original child stopped".into());
-                }
-                self.orphan_cancellations.remove_terminal(&proof.lease);
-                return Ok(self.snapshot());
-            }
-        }
         let mut guard = self.inner.lock().await;
         if let Some(ticket) = self.existing_external_feedback_locked(&guard, child_request_id, &result)? {
             drop(guard);
@@ -3759,8 +2775,7 @@ impl ExploreRuntimeHandle {
         }
         let received_lease = match &result {
             ChildNavigationResult::Reached(proof) => &proof.lease,
-            ChildNavigationResult::Failed { proof, .. }
-            | ChildNavigationResult::CancelFailed { proof, .. } => &proof.lease,
+            ChildNavigationResult::Failed { proof, .. } => &proof.lease,
             ChildNavigationResult::Cancelled(proof) => &proof.lease,
         };
         if !active_child.lease.matches(received_lease) {
@@ -3769,125 +2784,36 @@ impl ExploreRuntimeHandle {
             );
         }
 
-        if guard.pending_child_cancellation.is_some() {
-            match &result {
-                ChildNavigationResult::CancelFailed {
-                    cancel_generation,
-                    reason,
-                    ..
-                } => {
-                    let (expected_generation, dispatch_in_flight) = guard
-                        .pending_child_cancellation
-                        .as_ref()
-                        .map(|pending| {
-                            (
-                                pending
-                                    .ticket
-                                    .as_ref()
-                                    .map(|ticket| ticket.cancel_generation)
-                                    .unwrap_or(0),
-                                pending.dispatch_in_flight,
-                            )
-                        })
-                        .expect("pending child cancellation checked above");
-                    if *cancel_generation == 0 {
-                        return Err("cancel failure generation must be non-zero".to_string());
-                    }
-                    if *cancel_generation != expected_generation && dispatch_in_flight {
-                        let pending = guard
-                            .pending_child_cancellation
-                            .as_mut()
-                            .expect("pending child cancellation checked above");
-                        retain_early_cancel_terminal(pending, result.clone());
-                        let snapshot = guard.snapshot(
-                            STATUS_STOPPING,
-                            format!(
-                                "CANCEL_EARLY_TERMINAL_BUFFERED: generation={} awaiting ticket",
-                                cancel_generation
-                            ),
-                        );
-                        drop(guard);
-                        return Ok(self.store_snapshot(snapshot));
-                    }
-                    if dispatch_in_flight && *cancel_generation == expected_generation {
-                        let snapshot = guard.snapshot(
-                            STATUS_STOPPING,
-                            format!(
-                                "CANCEL_RETRY_OLD_FAILURE_IGNORED: generation={cancel_generation}"
-                            ),
-                        );
-                        drop(guard);
-                        return Ok(self.store_snapshot(snapshot));
-                    }
-                    if *cancel_generation != expected_generation {
-                        return Err(format!(
-                            "cancel failure generation mismatch: expected {expected_generation}, received {cancel_generation}"
-                        ));
-                    }
-                    let child_lease = active_child.lease.clone();
-                    let reason = reason.clone();
-                    drop(guard);
-                    return Ok(self
-                        .record_child_cancel_failure(&child_lease, reason, None)
-                        .await);
-                }
-                ChildNavigationResult::Cancelled(proof) => {
-                    if proof.cancel_generation == 0
-                        || proof.zero_ack_id.trim().is_empty()
-                        || proof.zero_applied_monotonic_ns == 0
-                    {
-                        return Err(
-                            "incomplete or mismatched child navigation ZEROED proof".to_string()
-                        );
-                    }
-                    let (expected_generation, dispatch_in_flight) = guard
-                        .pending_child_cancellation
-                        .as_ref()
-                        .map(|pending| {
-                            (
-                                pending
-                                    .ticket
-                                    .as_ref()
-                                    .map(|ticket| ticket.cancel_generation)
-                                    .unwrap_or(0),
-                                pending.dispatch_in_flight,
-                            )
-                        })
-                        .expect("pending child cancellation checked above");
-                    if proof.cancel_generation != expected_generation && dispatch_in_flight {
-                        let pending = guard
-                            .pending_child_cancellation
-                            .as_mut()
-                            .expect("pending child cancellation checked above");
-                        retain_early_cancel_terminal(pending, result.clone());
-                        let snapshot = guard.snapshot(
-                            STATUS_STOPPING,
-                            format!(
-                                "ZEROED_EARLY_BUFFERED: generation={} awaiting ticket",
-                                proof.cancel_generation
-                            ),
-                        );
-                        drop(guard);
-                        return Ok(self.store_snapshot(snapshot));
-                    }
-                    if proof.cancel_generation != expected_generation {
-                        return Err(format!(
-                            "child navigation ZEROED generation mismatch: expected {expected_generation}, received {}",
-                            proof.cancel_generation
-                        ));
-                    }
-                }
-                ChildNavigationResult::Reached(_) | ChildNavigationResult::Failed { .. } => {
-                    return Err(
-                        "child terminal cannot bypass pending actuator ZEROED proof".to_string()
-                    );
-                }
+        if let ChildNavigationResult::Failed { reason, .. } = &result {
+            if reason.contains("LEASE_NOT_GRANTED") {
+                let reason_code = if reason.contains("STALE_STOP_GENERATION") {
+                    ExplorationStopReason::UserCancelled
+                } else { ExplorationStopReason::ConsecutiveFailuresExceeded };
+                let message = reason.clone();
+                guard.active_child = None;
+                let generation = self.next_exploration_generation(&mut guard);
+                self.record_child_action_stop_locked(&mut guard, generation, reason_code);
+                let (snapshot, readiness, frontiers) = self.prepare_no_child_stop_locked(&mut guard,
+                    PendingChildAction { reason: reason_code, message });
+                drop(guard);
+                *self.readiness_cache.lock() = readiness;
+                self.publish_frontiers(frontiers);
+                return Ok(self.store_snapshot(snapshot));
             }
-
-            return Ok(self.complete_pending_child_action(guard));
         }
-
-        // 已核对原子任务租约，且自然终态沿原导航停车证明链进入。
+        if matches!(&result, ChildNavigationResult::Cancelled(_)) {
+            guard.active_child = None;
+            let generation = self.next_exploration_generation(&mut guard);
+            self.record_child_action_stop_locked(&mut guard, generation, ExplorationStopReason::UserCancelled);
+            let (snapshot, readiness, frontiers) = self.prepare_no_child_stop_locked(&mut guard, PendingChildAction {
+                reason: ExplorationStopReason::UserCancelled, message: "探索子导航已取消".into(),
+            });
+            drop(guard);
+            *self.readiness_cache.lock() = readiness;
+            self.publish_frontiers(frontiers);
+            return Ok(self.store_snapshot(snapshot));
+        }
+        // 子目标终态已核对完整租约。
         // 机体重叠恢复失败与目标位置无关；换前沿无法修复，直接结束探索。
         if let ChildNavigationResult::Failed { reason, .. } = &result {
             if reason.contains(nuwax_nav_types_messages::BODY_OVERLAP_RECOVERY_FAILED) {
@@ -3898,7 +2824,6 @@ impl ExploreRuntimeHandle {
                     message:format!("机体重叠恢复失败，原子导航已确认停车，探索结束：{reason}"),
                 };
                 guard.active_child=None;
-                guard.return_after_cancellation=false;
                 let generation=self.next_exploration_generation(&mut guard);
                 self.record_child_action_stop_locked(&mut guard,generation,action.reason);
                 let (snapshot,readiness,frontiers)=self.prepare_no_child_stop_locked(&mut guard,action);
@@ -3916,15 +2841,15 @@ impl ExploreRuntimeHandle {
             match &result {
                 ChildNavigationResult::Reached(_)=>{
                     let distance=guard.mission.as_ref().map_or(0.0,|p|p.travelled_m);
-                    drop(guard);return Ok(Box::pin(self.finish_session(None,reason,format!("返航已到达并停稳，累计行程{distance:.3}米"))).await);
+                    drop(guard);return Ok(Box::pin(self.finish_session(None,reason,format!("返航已到达，累计行程{distance:.3}米"))).await);
                 }
                 ChildNavigationResult::Failed{reason:failure,..}=>{
                     guard.return_failures=guard.return_failures.saturating_add(1);
                     if guard.return_failures>guard.active_config.as_ref().map_or(0,|c|c.max_navigation_retries){
-                        let message=format!("返航失败且已停稳：{failure}");drop(guard);
+                        let message=format!("返航失败且已停止：{failure}");drop(guard);
                         return Ok(Box::pin(self.finish_session(None,ExplorationStopReason::ConsecutiveFailuresExceeded,message)).await);
                     }
-                    let snapshot=guard.snapshot(STATUS_ACTIVE,format!("返航已停稳，重新核验路线：{failure}"));drop(guard);return Ok(self.store_snapshot(snapshot));
+                    let snapshot=guard.snapshot(STATUS_ACTIVE,format!("返航已停止，重新核验路线：{failure}"));drop(guard);return Ok(self.store_snapshot(snapshot));
                 }
                 _=>return Err("返航收到没有取消事务的取消终态".into()),
             }
@@ -3941,7 +2866,7 @@ impl ExploreRuntimeHandle {
                     ExplorationGoalFeedback::Failed(reason.clone())
                 }
             }
-            ChildNavigationResult::Cancelled(_) | ChildNavigationResult::CancelFailed { .. } => {
+            ChildNavigationResult::Cancelled(_) => {
                 return Err("unexpected cancellation terminal without a pending action".to_string())
             }
         };
@@ -3953,7 +2878,7 @@ impl ExploreRuntimeHandle {
             ChildNavigationResult::Failed { .. } => {
                 "child navigation failed; retry/blacklist policy applied"
             }
-            ChildNavigationResult::Cancelled(_) | ChildNavigationResult::CancelFailed { .. } => {
+            ChildNavigationResult::Cancelled(_) => {
                 unreachable!("cancellation variants returned above")
             }
         };
@@ -3967,7 +2892,6 @@ impl ExploreRuntimeHandle {
         self.await_feedback(&ticket).await?;
         Ok(self.snapshot())
     }
-
 
     #[cfg(test)]
     pub async fn ingest_costmap_snapshot(
@@ -4117,8 +3041,7 @@ impl ExploreRuntimeHandle {
         self.inner.lock().await.session_in_progress()
     }
 
-    /// Mapping must retain its costmap while exploration or child navigation
-    /// still owns motion-safety state, including a failed cancellation barrier.
+    /// 探索业务或已接纳的子目标派发仍在使用地图时，保持地图工作区。
     pub async fn blocks_mapping_mutation(&self) -> bool {
         let guard = self.inner.lock().await;
         // Stop may clear pending while its accepted dispatch is still running.
@@ -4126,8 +3049,7 @@ impl ExploreRuntimeHandle {
         guard.retained_child_dispatch
             || guard.logical_active
             || guard.active_child.is_some()
-            || guard.pending_child_cancellation.is_some()
-            || self.orphan_cancellations.blocks_motion_mutation()
+
     }
 
     pub async fn readiness(&self, backend_available: bool) -> ExplorationReadinessDetail {
@@ -4141,7 +3063,6 @@ impl ExploreRuntimeHandle {
         *self.readiness_cache.lock() = detail.clone();
         detail
     }
-
 
     #[cfg(test)]
     pub fn cached_readiness(&self) -> ExplorationReadinessDetail {
@@ -4228,7 +3149,7 @@ impl ExploreRuntimeHandle {
         let initial = self.inner.lock().await;
         if request_id.is_empty() || request_id != initial.last_request_id { return Err("探索进度请求身份不匹配".into()); }
         if initial.logical_active || initial.compute.start_reservation.is_some() || initial.active_child.is_some()
-            || initial.pending_child_cancellation.is_some() || initial.pending_child_dispatch.is_some() || self.orphan_cancellations.has_entries() {
+            || initial.pending_child_dispatch.is_some() {
             return Err("探索进度只可在原任务停止且导航拥有权已确认释放后保存".into());
         }
         let stopped_fence = (initial.generation, initial.committed_map.clone(), initial.progress_origin.clone(),
@@ -4243,7 +3164,7 @@ impl ExploreRuntimeHandle {
             return Err("探索停止代际或地图域在等待保存时发生变化".into());
         }
         if request_id.is_empty() || request_id!=guard.last_request_id{return Err("探索进度请求身份不匹配".into());}
-        if guard.logical_active || guard.active_child.is_some() || guard.pending_child_cancellation.is_some() || guard.pending_child_dispatch.is_some() || self.orphan_cancellations.has_entries(){
+        if guard.logical_active || guard.active_child.is_some() || guard.pending_child_dispatch.is_some(){
             return Err("探索进度只可在原任务停止且导航拥有权已确认释放后保存".into());
         }
         let config=guard.active_config.as_ref().ok_or("探索配置不存在")?;
@@ -4265,7 +3186,7 @@ impl ExploreRuntimeHandle {
         let mut guard = self.inner.lock().await;
         let unchanged = |guard: &ExploreRuntimeInner| !guard.logical_active && guard.generation == generation
             && guard.compute.history == history && guard.last_request_id == request_id
-            && guard.active_child.is_none() && guard.pending_child_cancellation.is_none() && guard.pending_child_dispatch.is_none()
+            && guard.active_child.is_none() && guard.pending_child_dispatch.is_none()
             && guard.committed_map.as_ref() == Some(&domain.0)
             && guard.surface_mode.as_ref().and_then(|mode| mode.latest.as_ref()).map_or(guard.costmap_frame_generation, |ticket| ticket.map_frame_generation) == domain.1
             && guard.progress_origin.as_ref() == Some(&domain.2);
@@ -4274,7 +3195,7 @@ impl ExploreRuntimeHandle {
         drop(guard);
         let output = self.await_lifecycle(&export).await?;
         let guard = self.inner.lock().await;
-        if !unchanged(&guard) || self.orphan_cancellations.has_entries() { return Err("探索停止代际或历史在保存时发生变化".into()); }
+        if !unchanged(&guard) { return Err("探索停止代际或历史在保存时发生变化".into()); }
         saved.sources = match output.as_ref() { ComputeLifecycleOutput::Checkpoint(sources) => sources.clone(), _ => return Err("invalid exploration checkpoint acknowledgment".into()) };
         drop(guard);
         let payload=serde_json::to_string(&saved).map_err(|e|e.to_string())?;
@@ -4877,7 +3798,6 @@ mod tests {
 
     static NEXT_RECONCILIATION_TEST_PATH: AtomicU64 = AtomicU64::new(0);
 
-
     #[derive(Default)]
     struct RecordingNavSink {
         submitted: StdMutex<Vec<ChildNavigationRequest>>,
@@ -4886,15 +3806,12 @@ mod tests {
         map_name_error: StdMutex<Option<String>>,
         cancelled: StdMutex<Vec<String>>,
         cancel_error: StdMutex<Option<String>>,
-        cancel_recovery: StdMutex<Option<ChildNavigationCancelRecovery>>,
         lease_override: StdMutex<Option<ChildNavigationLease>>,
         receipt_reads: AtomicU64,
         receipt_entered: tokio::sync::Notify,
         receipt_release: StdMutex<Option<Arc<tokio::sync::Notify>>>,
         terminal_result: StdMutex<Option<ChildNavigationResult>>,
-        cancel_outcome: StdMutex<Option<ChildNavigationCancelOutcome>>,
         next_goal_generation: AtomicU64,
-        next_cancel_generation: AtomicU64,
         submit_entered: tokio::sync::Notify,
         submit_release: StdMutex<Option<Arc<tokio::sync::Notify>>>,
         cancel_entered: tokio::sync::Notify,
@@ -4968,8 +3885,7 @@ mod tests {
         async fn cancel(
             &self,
             lease: &ChildNavigationLease,
-        ) -> Result<ChildNavigationCancelOutcome, String> {
-            if let Some(outcome) = self.cancel_outcome.lock().unwrap().clone() { return Ok(outcome); }
+        ) -> Result<(), String> {
             let cancel_release = { self.cancel_release.lock().unwrap().clone() };
             if let Some(release) = cancel_release {
                 self.cancel_entered.notify_one();
@@ -4982,22 +3898,9 @@ mod tests {
             if let Some(error) = self.cancel_error.lock().unwrap().clone() {
                 return Err(error);
             }
-            Ok(ChildNavigationCancelOutcome::Pending(ChildNavigationCancelTicket {
-                lease: lease.clone(),
-                cancel_generation: self.next_cancel_generation.fetch_add(1, Ordering::SeqCst) + 1,
-            }))
+            Ok(())
         }
 
-        fn recover_cancel_receipt(
-            &self,
-            lease: &ChildNavigationLease,
-        ) -> Option<ChildNavigationCancelRecovery> {
-            self.cancel_recovery
-                .lock()
-                .unwrap()
-                .clone()
-                .filter(|recovery| recovery.ticket.lease.matches(lease))
-        }
     }
 
     async fn receipt_test_source_history(handle: &ExploreRuntimeHandle) -> serde_json::Value {
@@ -5025,10 +3928,9 @@ mod tests {
             assert_eq!(handle.tick((2.0, 2.0)).await.child_task_id, active.child_task_id);
         }
         assert_eq!(sink.receipt_reads.load(Ordering::SeqCst), 1);
-        let lease = active_child_lease(&handle).await;
-        handle.stop("receipt-none-once").await;
-        handle.report_navigation_result(&lease.session_id,
-            ChildNavigationResult::Cancelled(zero_proof(&lease, 1))).await.unwrap();
+        let stopped = handle.stop("receipt-none-once").await;
+        assert_eq!(stopped.status, STATUS_CANCELLED);
+        assert!(stopped.child_task_id.is_empty());
     }
 
     #[tokio::test]
@@ -5166,7 +4068,6 @@ mod tests {
         let lease = active_child_lease(&handle).await;
         let result = ChildNavigationResult::Reached(terminal_proof(&lease));
         *sink.terminal_result.lock().unwrap() = Some(result.clone());
-        *sink.cancel_outcome.lock().unwrap() = Some(ChildNavigationCancelOutcome::AlreadyTerminal(terminal_proof(&lease)));
         let history = handle.inner.lock().await.compute.history;
         let stopped = handle.stop(parent).await;
         assert_eq!(stopped.status, STATUS_CANCELLED);
@@ -5187,7 +4088,6 @@ mod tests {
         let lease = active_child_lease(&handle).await;
         let result = ChildNavigationResult::Reached(terminal_proof(&lease));
         *sink.terminal_result.lock().unwrap() = Some(result.clone());
-        *sink.cancel_outcome.lock().unwrap() = Some(ChildNavigationCancelOutcome::AlreadyTerminal(terminal_proof(&lease)));
         tick.abort();
         assert!(tick.await.unwrap_err().is_cancelled());
         *sink.receipt_release.lock().unwrap() = None;
@@ -5202,31 +4102,6 @@ mod tests {
         assert_eq!(sink.receipt_reads.load(Ordering::SeqCst), 1,
             "existing stop priority precedes a resumed ordinary receipt read");
         assert_eq!(handle.inner.lock().await.reached_goals, 0);
-    }
-
-    #[tokio::test]
-    async fn already_terminal_cannot_replace_a_locally_retained_cancel_ticket() {
-        let (handle, sink) = configured_handle();
-        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1).await.unwrap();
-        handle.start("receipt-local-ticket", "prefer_wavefront").await;
-        handle.tick((2.0, 2.0)).await;
-        let lease = active_child_lease(&handle).await;
-        handle.stop("receipt-local-ticket").await;
-        let before = handle.inner.lock().await.pending_child_cancellation.as_ref().unwrap().ticket.clone();
-        assert!(before.is_some());
-        let result = handle.finish_already_terminal_child(&lease, terminal_proof(&lease)).await;
-        assert_eq!(result.status, STATUS_FAILED);
-        assert!(result.child_task_id.is_empty());
-        assert!(result.parking_pending);
-        assert_eq!(handle.orphan_cancellations.retired_cancellation(&lease), Some(before.as_ref().map(|ticket|ticket.cancel_generation)));
-        assert!(handle.blocks_mapping_mutation().await);
-        assert_eq!(sink.cancelled.lock().unwrap().len(), 1);
-        let ticket = before.expect("original retained cancel ticket");
-        let settled = handle.report_navigation_result(&lease.session_id,
-            ChildNavigationResult::Cancelled(zero_proof(&lease, ticket.cancel_generation))).await.unwrap();
-        assert_eq!(settled.status, STATUS_FAILED, "prior failure remains visible after exact ZERO");
-        assert!(settled.child_task_id.is_empty());
-        assert!(!handle.blocks_mapping_mutation().await);
     }
 
     struct StaticPoseProvider;
@@ -5590,7 +4465,6 @@ mod tests {
             .tick_with_pose(surface_pose(&snapshot, 0.0, Quaternion::IDENTITY))
             .await;
         assert_eq!(active.status, STATUS_ACTIVE, "{}", active.message);
-        let lease = active_child_lease(&handle).await;
         let mut clear = message.clone();
         clear.cleared = true;
         clear.ground_block_failed = ground_block_failed;
@@ -5615,7 +4489,7 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        assert_eq!(handle.snapshot().status, STATUS_STOPPING);
+        assert_eq!(handle.snapshot().status, STATUS_FAILED);
         assert_eq!(
             sink.cancelled.lock().unwrap().as_slice(),
             &[active.child_task_id.clone()]
@@ -5631,13 +4505,7 @@ mod tests {
             .begin_surface_map_update(&wrong_producer, now_monotonic_nanos())
             .await
             .is_err());
-        let stopped = handle
-            .report_navigation_result(
-                &active.child_task_id,
-                ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
-            )
-            .await
-            .unwrap();
+        let stopped = handle.snapshot();
         assert_eq!(stopped.status, STATUS_FAILED);
         if ground_block_failed { assert!(stopped.message.contains("mapping_ground_block_write_failed")); }
         assert_eq!(stopped.last_stop_reason, "map_revision_changed");
@@ -6046,7 +4914,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn parse_arbitration_policy_round_trip_and_fallback() {
         for policy in [
@@ -6097,23 +4964,7 @@ mod tests {
         assert!(!handle.is_active().await);
     }
 
-    #[tokio::test]
-    async fn repeated_start_does_not_replace_active_request() {
-        let (handle, _) = configured_handle();
-        assert_eq!(
-            handle.start("req-1", "prefer_wavefront").await.status,
-            STATUS_ACCEPTED
-        );
-        let rejected = handle.start("req-2", "prefer_wavefront").await;
-        assert_eq!(rejected.status, STATUS_REJECTED);
-        assert!(rejected.message.contains("req-1"));
-        assert_eq!(handle.snapshot().request_id, "req-1");
-        assert_eq!(handle.snapshot().status, STATUS_ACCEPTED);
-        let diagnostics = handle.diagnostics().await;
-        assert!(diagnostics.active);
-    }
-
-    #[tokio::test]
+#[tokio::test]
     async fn unsupported_tare_source_is_explicitly_rejected() {
         let (handle, _) = configured_handle();
         let snapshot = handle
@@ -6129,7 +4980,7 @@ mod tests {
         assert!(snapshot.message.contains("unsupported/source unavailable"));
     }
 
-    #[tokio::test]
+#[tokio::test]
     async fn explicit_costmap_input_requires_map_frame() {
         let (handle, _) = configured_handle();
         let mut odom = frontier_costmap(1);
@@ -6145,7 +4996,7 @@ mod tests {
             .unwrap());
     }
 
-    #[tokio::test]
+#[tokio::test]
     async fn configured_robot_map_frame_drives_default_costmap_and_pose() {
         let handle = ExploreRuntimeHandle::with_wavefront_map_frame("robot/map")
             .expect("configured map frame");
@@ -6674,45 +5525,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_retains_child_until_correlated_zeroed_proof() {
-        let (handle, sink) = configured_handle();
-        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
-            .await
-            .unwrap();
-        handle.start("req-stop", "prefer_wavefront").await;
-        let active = handle.tick((2.0, 2.0)).await;
-        let lease = active_child_lease(&handle).await;
-        let stopped = handle.stop("req-stop").await;
-        assert_eq!(stopped.status, STATUS_STOPPING);
-        assert_eq!(stopped.last_stop_reason, "user_cancelled");
-        assert_eq!(stopped.child_task_id, active.child_task_id);
-        assert_eq!(
-            sink.cancelled.lock().unwrap().as_slice(),
-            &[active.child_task_id.clone()]
-        );
-
-        let wrong = handle
-            .report_navigation_result(
-                &active.child_task_id,
-                ChildNavigationResult::Cancelled(zero_proof(&lease, 999)),
-            )
-            .await;
-        assert!(wrong.is_err());
-        assert_eq!(handle.snapshot().status, STATUS_STOPPING);
-        assert_eq!(handle.snapshot().child_task_id, active.child_task_id);
-
-        let cancelled = handle
-            .report_navigation_result(
-                &active.child_task_id,
-                ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
-            )
-            .await
-            .unwrap();
-        assert_eq!(cancelled.status, STATUS_CANCELLED);
-        assert!(cancelled.child_task_id.is_empty());
-    }
-
-    #[tokio::test]
     async fn stop_rejects_a_mismatched_parent_request_before_child_cancel() {
         let (handle, sink) = configured_handle();
         ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
@@ -6733,519 +5545,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_start_does_not_attach_the_active_child_to_the_new_parent() {
-        let (handle, _) = configured_handle();
-        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
-            .await
-            .unwrap();
-        handle.start("req-active-owner", "prefer_wavefront").await;
-        let active = handle.tick((2.0, 2.0)).await;
-        assert!(!active.child_task_id.is_empty());
-
-        let rejected = handle.start("req-rejected-new", "prefer_wavefront").await;
-
-        assert_eq!(rejected.status, STATUS_REJECTED);
-        assert_eq!(rejected.request_id, "req-rejected-new");
-        assert!(rejected.child_task_id.is_empty());
-        let authoritative = handle.snapshot();
-        assert_eq!(authoritative.status, STATUS_ACTIVE);
-        assert_eq!(authoritative.request_id, "req-active-owner");
-        assert_eq!(authoritative.child_task_id, active.child_task_id);
-    }
-
-    #[tokio::test]
-    async fn zeroed_proof_requires_exact_lease_generation_ack_and_time() {
-        let (handle, _) = configured_handle();
-        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
-            .await
-            .unwrap();
-        handle.start("req-proof", "prefer_wavefront").await;
-        let active = handle.tick((2.0, 2.0)).await;
-        let lease = active_child_lease(&handle).await;
-        assert_eq!(handle.stop("req-proof").await.status, STATUS_STOPPING);
-
-        let mut wrong_leases = Vec::new();
-        let mut wrong = lease.clone();
-        wrong.session_id = "other-child".to_string();
-        wrong_leases.push(wrong);
-        let mut wrong = lease.clone();
-        wrong.owner_kind += 1;
-        wrong_leases.push(wrong);
-        let mut wrong = lease.clone();
-        wrong.parent_request_id = "other-parent".to_string();
-        wrong_leases.push(wrong);
-        let mut wrong = lease.clone();
-        wrong.goal_generation += 1;
-        wrong_leases.push(wrong);
-        let mut wrong = lease.clone();
-        wrong.producer_runtime_generation += 1;
-        wrong_leases.push(wrong);
-        for wrong in wrong_leases {
-            assert!(handle
-                .report_navigation_result(
-                    &active.child_task_id,
-                    ChildNavigationResult::Cancelled(zero_proof(&wrong, 1)),
-                )
-                .await
-                .is_err());
-        }
-
-        let mut missing_ack = zero_proof(&lease, 1);
-        missing_ack.zero_ack_id.clear();
-        assert!(handle
-            .report_navigation_result(
-                &active.child_task_id,
-                ChildNavigationResult::Cancelled(missing_ack),
-            )
-            .await
-            .is_err());
-        let mut missing_time = zero_proof(&lease, 1);
-        missing_time.zero_applied_monotonic_ns = 0;
-        assert!(handle
-            .report_navigation_result(
-                &active.child_task_id,
-                ChildNavigationResult::Cancelled(missing_time),
-            )
-            .await
-            .is_err());
-        assert_eq!(handle.snapshot().child_task_id, active.child_task_id);
-    }
-
-    #[tokio::test]
-    async fn cancel_dispatch_failure_is_parent_failed_and_retains_safety_ownership() {
-        let (handle, sink) = configured_handle();
-        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
-            .await
-            .unwrap();
-        handle.start("req-cancel-fail", "prefer_wavefront").await;
-        let active = handle.tick((2.0, 2.0)).await;
-        *sink.cancel_error.lock().unwrap() = Some("guard cancel dispatch failed".to_string());
-
-        let failed = handle.stop("req-cancel-fail").await;
-
-        assert_eq!(failed.status, STATUS_FAILED);
-        assert_eq!(failed.last_stop_reason, "child_cancel_failed");
-        assert!(failed.child_task_id.is_empty());
-        assert!(failed.parking_pending);
-        assert!(!handle.inner.lock().await.logical_active);
-        assert!(handle.blocks_mapping_mutation().await);
-    }
-
-    async fn install_original_child_for_global_stop(
-        nav: &crate::nav_runtime::NavRuntimeState, child: &ChildNavigationLease, generation: u64,
-    ) {
-        nav.replace_active_goal_for_test(crate::nav_runtime::ActiveGoal {
-            admitted_guard_clock_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
-            id: child.session_id.clone(), frame_id: "map".into(), target: crate::lcm_runtime::PoseState::default(),
-            options: Default::default(), producer: "wavefront".into(), producer_epoch: generation as i64,
-            body_to_support_z_m: None, boundary_owner: None,
-            lease: crate::nav_runtime::GoalLease {
-                session_id: child.session_id.clone(), owner_kind: child.owner_kind,
-                parent_request_id: child.parent_request_id.clone(), goal_generation: child.goal_generation,
-                producer_runtime_generation: child.producer_runtime_generation, path_revision: 0,
-                planner_runtime_generation: 0,
-            },
-        }).await;
-    }
-
-    #[tokio::test]
-    async fn ordinary_global_stop_settles_failed_exploration_and_rejects_old_receipt_for_successor() {
-        let (handle, sink) = configured_handle();
-        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1).await.unwrap();
-        let start = handle.start("ordinary-old-explore", "prefer_wavefront").await;
-        let active = handle.tick((2.0, 2.0)).await;
-        let child = active.child_lease.clone().unwrap();
-        let nav = crate::nav_runtime::NavRuntimeState::from_env();
-        install_original_child_for_global_stop(&nav, &child, start.exploration_generation).await;
-        *sink.cancel_error.lock().unwrap() = Some("原NAV已退出".into());
-        let failed = handle.stop(&start.request_id).await;
-        assert!(failed.parking_pending && failed.child_task_id.is_empty());
-        let proof = crate::proto::OrdinaryGlobalStopConfirmation {
-            operation_id: "ordinary-explore-stop".into(), zero_ack_id: "actual-zero-fixture".into(),
-            applied_monotonic_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
-            stationary_confirmed: true,
-        };
-        let (settled, update) = handle.stop_after_global_confirmation(&start.request_id,
-            start.exploration_generation, &proof, &nav).await.unwrap();
-        assert_eq!(settled.status, STATUS_FAILED);
-        assert_eq!(settled.last_stop_reason, "child_cancel_failed");
-        assert!(!settled.parking_pending);
-        assert!(nav.active_goal_lease().await.is_none());
-        assert_eq!(update.unwrap().feedback.zero_ack_id, proof.zero_ack_id);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while handle.inner.lock().await.session_in_progress() { tokio::task::yield_now().await; }
-        }).await.unwrap();
-        let next = handle.start("ordinary-next-explore", "prefer_wavefront").await;
-        assert_eq!(next.status, STATUS_ACCEPTED);
-        assert!(handle.stop_after_global_confirmation(&start.request_id, start.exploration_generation,
-            &proof, &nav).await.is_err());
-        assert!(handle.stop_after_global_confirmation(&next.request_id, next.exploration_generation,
-            &proof, &nav).await.is_err());
-        assert_eq!(handle.snapshot().request_id, next.request_id);
-        assert!(handle.is_active().await);
-        handle.stop(&next.request_id).await;
-    }
-
-    #[tokio::test]
-    async fn ordinary_stop_before_child_install_returns_to_original_cancel_owner() {
-        let (handle, sink) = configured_handle();
-        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1).await.unwrap();
-        let start = handle.start("ordinary-too-early", "prefer_wavefront").await;
-        let active = handle.tick((2.0, 2.0)).await;
-        let child = active.child_lease.clone().unwrap();
-        let proof = crate::proto::OrdinaryGlobalStopConfirmation {
-            operation_id: "earlier-stop".into(), zero_ack_id: "actual-earlier-zero".into(),
-            applied_monotonic_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
-            stationary_confirmed: true,
-        };
-        let nav = crate::nav_runtime::NavRuntimeState::from_env();
-        install_original_child_for_global_stop(&nav, &child, start.exploration_generation).await;
-        assert!(handle.stop_after_global_confirmation(&start.request_id, start.exploration_generation,
-            &proof, &nav).await.is_err());
-        let pending = handle.snapshot();
-        assert_eq!(pending.status, STATUS_STOPPING);
-        assert!(pending.parking_pending);
-        assert_eq!(pending.child_task_id, child.session_id);
-        assert_eq!(*sink.cancelled.lock().unwrap(), vec![child.session_id.clone()]);
-        assert!(nav.active_goal_lease().await.is_some());
-        let settled = handle.report_navigation_result(&child.session_id,
-            ChildNavigationResult::Cancelled(zero_proof(&child, 1))).await.unwrap();
-        assert!(!settled.parking_pending);
-    }
-
-    #[tokio::test]
-    async fn cancel_error_retains_exact_receipt_for_late_zeroed_reconciliation() {
-        let (handle, sink) = configured_handle();
-        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
-            .await
-            .unwrap();
-        handle
-            .start("req-cancel-error-receipt", "prefer_wavefront")
-            .await;
-        let active = handle.tick((2.0, 2.0)).await;
-        let lease = active_child_lease(&handle).await;
-        *sink.cancel_error.lock().unwrap() = Some("uncertain cancel publish error".to_string());
-        *sink.cancel_recovery.lock().unwrap() = Some(ChildNavigationCancelRecovery {
-            ticket: ChildNavigationCancelTicket {
-                lease: lease.clone(),
-                cancel_generation: 37,
-            },
-            failure: Some("CANCEL_DISPATCH_FAILED".to_string()),
-        });
-
-        let failed = handle.stop("req-cancel-error-receipt").await;
-        assert_eq!(failed.status, STATUS_FAILED);
-        assert!(failed.message.contains("uncertain cancel publish error"));
-        assert!(failed.child_task_id.is_empty());
-        assert!(failed.parking_pending);
-        assert!(failed.parking_pending);
-        assert!(handle.blocks_mapping_mutation().await);
-
-        let released = handle
-            .report_navigation_result(
-                &active.child_task_id,
-                ChildNavigationResult::Cancelled(zero_proof(&lease, 37)),
-            )
-            .await
-            .expect("late exact ZEROED after uncertain publish error");
-        assert_eq!(released.status, STATUS_FAILED);
-        assert!(released.child_task_id.is_empty());
-        assert!(!released.parking_pending);
-        assert!(!handle.blocks_mapping_mutation().await);
-    }
-
-    #[tokio::test]
-    async fn cancel_dispatch_timeout_retires_business_and_keeps_original_parking_owner() {
-        let (handle, sink) = configured_handle();
-        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
-            .await
-            .unwrap();
-        handle
-            .start("req-cancel-timeout-retry", "prefer_wavefront")
-            .await;
-        let active = handle.tick((2.0, 2.0)).await;
-        let release = Arc::new(tokio::sync::Notify::new());
-        *sink.cancel_release.lock().unwrap() = Some(release);
-
-        let failed = handle.stop("req-cancel-timeout-retry").await;
-
-        assert_eq!(failed.status, STATUS_FAILED);
-        assert!(failed.message.contains("dispatch timed out"));
-        assert!(failed.child_task_id.is_empty());
-        assert!(failed.parking_pending);
-        assert!(handle.blocks_mapping_mutation().await);
-
-        *sink.cancel_release.lock().unwrap() = None;
-        let retried = handle.stop("req-cancel-timeout-retry").await;
-        assert_eq!(retried.status, STATUS_FAILED);
-        assert!(retried.parking_pending);
-        assert!(retried.child_task_id.is_empty());
-        assert_eq!(sink.cancelled.lock().unwrap().len(), 0);
-        assert!(handle.orphan_cancellations.contains(active.child_lease.as_ref().unwrap()));
-        assert!(handle.blocks_mapping_mutation().await);
-    }
-
-
-    #[tokio::test]
-    async fn failed_cancel_without_ticket_keeps_exact_parent_and_original_parking_owner() {
-        let (handle, sink) = configured_handle();
-        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
-            .await
-            .unwrap();
-        handle.start("req-cancel-retry", "prefer_wavefront").await;
-        let active = handle.tick((2.0, 2.0)).await;
-        let lease = active_child_lease(&handle).await;
-        *sink.cancel_error.lock().unwrap() = Some("guard unavailable".to_string());
-        assert_eq!(handle.stop("req-cancel-retry").await.status, STATUS_FAILED);
-        assert_eq!(sink.cancelled.lock().unwrap().len(), 1);
-
-        let rejected = handle.stop("other-request").await;
-        assert_eq!(rejected.status, STATUS_REJECTED);
-        assert_eq!(rejected.request_id, "other-request");
-        assert_eq!(sink.cancelled.lock().unwrap().len(), 1);
-        assert_eq!(handle.snapshot().request_id, "req-cancel-retry");
-        assert_eq!(handle.snapshot().status, STATUS_FAILED);
-
-        *sink.cancel_error.lock().unwrap() = None;
-        let retry = handle.stop("req-cancel-retry").await;
-        assert_eq!(retry.status, STATUS_FAILED);
-        assert_eq!(retry.last_stop_reason, "child_cancel_failed");
-        assert!(retry.parking_pending);
-        assert_eq!(sink.cancelled.lock().unwrap().len(), 1);
-
-        let released = handle
-            .report_navigation_result(
-                &active.child_task_id,
-                ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
-            )
-            .await
-            .unwrap();
-        assert_eq!(released.status, STATUS_FAILED);
-        assert_eq!(released.last_stop_reason, "child_cancel_failed");
-        assert!(released.child_task_id.is_empty());
-        assert!(!handle.blocks_mapping_mutation().await);
-    }
-
-    #[tokio::test]
-    async fn failed_cancel_with_ticket_retains_only_original_cancel_generation() {
-        let (handle, sink) = configured_handle();
-        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
-            .await
-            .unwrap();
-        handle.start("req-timeout-retry", "prefer_wavefront").await;
-        let active = handle.tick((2.0, 2.0)).await;
-        let lease = active_child_lease(&handle).await;
-        assert_eq!(
-            handle.stop("req-timeout-retry").await.status,
-            STATUS_STOPPING
-        );
-        let failed = handle
-            .report_navigation_result(
-                &active.child_task_id,
-                ChildNavigationResult::CancelFailed {
-                    proof: terminal_proof(&lease),
-                    cancel_generation: 1,
-                    reason: "CANCEL_ZERO_ACK_TIMEOUT".to_string(),
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(failed.status, STATUS_FAILED);
-
-        let retry = handle.stop("req-timeout-retry").await;
-        assert_eq!(retry.status, STATUS_FAILED);
-        assert!(retry.parking_pending);
-        assert_eq!(sink.cancelled.lock().unwrap().len(), 1);
-
-        assert!(handle
-            .report_navigation_result(
-                &active.child_task_id,
-                ChildNavigationResult::Cancelled(zero_proof(&lease, 999)),
-            )
-            .await
-            .is_err());
-        assert_eq!(handle.snapshot().status, STATUS_FAILED);
-        assert!(handle.snapshot().child_task_id.is_empty());
-
-        let released = handle
-            .report_navigation_result(
-                &active.child_task_id,
-                ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
-            )
-            .await
-            .unwrap();
-        assert_eq!(released.status, STATUS_FAILED);
-        assert!(released.child_task_id.is_empty());
-    }
-
-    #[tokio::test]
-    async fn duplicate_old_cancel_failure_cannot_replace_retired_parking_responsibility() {
-        let (handle, sink) = configured_handle();
-        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
-            .await
-            .unwrap();
-        handle
-            .start("req-retry-old-failure", "prefer_wavefront")
-            .await;
-        let active = handle.tick((2.0, 2.0)).await;
-        let lease = active_child_lease(&handle).await;
-        assert_eq!(
-            handle.stop("req-retry-old-failure").await.status,
-            STATUS_STOPPING
-        );
-        handle
-            .report_navigation_result(
-                &active.child_task_id,
-                ChildNavigationResult::CancelFailed {
-                    proof: terminal_proof(&lease),
-                    cancel_generation: 1,
-                    reason: "CANCEL_ZERO_ACK_TIMEOUT".to_string(),
-                },
-            )
-            .await
-            .unwrap();
-
-        let duplicate = handle
-            .report_navigation_result(
-                &active.child_task_id,
-                ChildNavigationResult::CancelFailed {
-                    proof: terminal_proof(&lease),
-                    cancel_generation: 1,
-                    reason: "duplicate old timeout".to_string(),
-                },
-            )
-            .await;
-        assert!(duplicate.is_err());
-        assert!(handle.snapshot().parking_pending);
-        assert_eq!(handle.snapshot().last_stop_reason, "child_cancel_failed");
-        assert_eq!(sink.cancelled.lock().unwrap().len(), 1);
-        let released = handle
-            .report_navigation_result(
-                &active.child_task_id,
-                ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
-            )
-            .await
-            .unwrap();
-        assert_eq!(released.status, STATUS_FAILED);
-        assert!(released.child_task_id.is_empty());
-    }
-
-    #[tokio::test]
-    async fn concurrent_repeated_stop_preserves_one_original_parking_responsibility() {
-        let (handle, sink) = configured_handle();
-        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
-            .await
-            .unwrap();
-        handle.start("req-single-retry", "prefer_wavefront").await;
-        let active = handle.tick((2.0, 2.0)).await;
-        let lease = active_child_lease(&handle).await;
-        *sink.cancel_error.lock().unwrap() = Some("guard unavailable".to_string());
-        assert_eq!(handle.stop("req-single-retry").await.status, STATUS_FAILED);
-
-        let (first, second) = tokio::join!(handle.stop("req-single-retry"), handle.stop("req-single-retry"));
-        assert_eq!(first.status, STATUS_FAILED);
-        assert_eq!(second.status, STATUS_FAILED);
-        assert!(first.parking_pending && second.parking_pending);
-        assert_eq!(sink.cancelled.lock().unwrap().len(), 1);
-
-        let released = handle
-            .report_navigation_result(
-                &active.child_task_id,
-                ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
-            )
-            .await
-            .unwrap();
-        assert_eq!(released.status, STATUS_FAILED);
-        assert!(released.child_task_id.is_empty());
-    }
-
-    #[tokio::test]
-    async fn zeroed_before_cancel_ticket_is_replayed_after_ticket_commit() {
-        let (handle, sink) = configured_handle();
-        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
-            .await
-            .unwrap();
-        handle.start("req-early-zero", "prefer_wavefront").await;
-        let active = handle.tick((2.0, 2.0)).await;
-        let lease = active_child_lease(&handle).await;
-        let release = Arc::new(tokio::sync::Notify::new());
-        *sink.cancel_release.lock().unwrap() = Some(release.clone());
-
-        let stop_task = {
-            let handle = handle.clone();
-            tokio::spawn(async move { handle.stop("req-early-zero").await })
-        };
-        tokio::time::timeout(Duration::from_secs(1), sink.cancel_entered.notified())
-            .await
-            .expect("cancel submit did not enter within one second");
-
-        let buffered = handle
-            .report_navigation_result(
-                &active.child_task_id,
-                ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
-            )
-            .await
-            .expect("exact early ZEROED must be retained");
-        assert_eq!(buffered.status, STATUS_STOPPING);
-        assert!(buffered.message.contains("ZEROED_EARLY_BUFFERED"));
-        assert_eq!(buffered.child_task_id, active.child_task_id);
-
-        release.notify_one();
-        let terminal = stop_task.await.unwrap();
-        assert_eq!(terminal.status, STATUS_CANCELLED);
-        assert!(terminal.child_task_id.is_empty());
-        assert!(!handle.blocks_mapping_mutation().await);
-    }
-
-    #[tokio::test]
-    async fn cancel_zero_ack_timeout_is_parent_failed_and_keeps_child_identity() {
-        let (handle, _) = configured_handle();
-        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
-            .await
-            .unwrap();
-        handle.start("req-cancel-timeout", "prefer_wavefront").await;
-        let active = handle.tick((2.0, 2.0)).await;
-        let lease = active_child_lease(&handle).await;
-        assert_eq!(
-            handle.stop("req-cancel-timeout").await.status,
-            STATUS_STOPPING
-        );
-
-        let failed = handle
-            .report_navigation_result(
-                &active.child_task_id,
-                ChildNavigationResult::CancelFailed {
-                    proof: terminal_proof(&lease),
-                    cancel_generation: 1,
-                    reason: "CANCEL_ZERO_ACK_TIMEOUT".to_string(),
-                },
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(failed.status, STATUS_FAILED);
-        assert_eq!(failed.last_stop_reason, "child_cancel_failed");
-        assert!(failed.child_task_id.is_empty());
-        assert!(failed.parking_pending);
-        assert!(!handle.inner.lock().await.logical_active);
-        assert!(handle.blocks_mapping_mutation().await);
-
-        let released = handle
-            .report_navigation_result(
-                &active.child_task_id,
-                ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(released.status, STATUS_FAILED);
-        assert_eq!(released.last_stop_reason, "child_cancel_failed");
-        assert!(released.child_task_id.is_empty());
-        assert!(!handle.is_active().await);
-        assert!(!handle.blocks_mapping_mutation().await);
-    }
-
-    #[tokio::test]
     async fn costmap_refresh_does_not_stop_active_exploration() {
         let (handle, _) = configured_handle();
         ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1)
@@ -7261,21 +5560,14 @@ mod tests {
             )
             .await;
         let active = handle.tick((2.0, 2.0)).await;
-        let lease = active_child_lease(&handle).await;
 
         ingest_committed_costmap_fixture(&handle, frontier_costmap(2), 2)
             .await
             .unwrap();
         assert_eq!(handle.snapshot().status, STATUS_ACTIVE);
         assert_eq!(handle.snapshot().child_task_id, active.child_task_id);
-        assert_eq!(handle.stop("req-refresh").await.status, STATUS_STOPPING);
-        let stopped = handle
-            .report_navigation_result(
-                &active.child_task_id,
-                ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
-            )
-            .await
-            .unwrap();
+        assert_eq!(handle.stop("req-refresh").await.status, STATUS_CANCELLED);
+        let stopped = handle.snapshot();
         assert_eq!(stopped.status, STATUS_CANCELLED);
         assert_eq!(stopped.last_stop_reason, "user_cancelled");
         assert!(stopped.child_task_id.is_empty());
@@ -7468,7 +5760,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_during_submit_cancels_late_ticket_and_retains_orphan() {
+    async fn new_exploration_during_submit_does_not_cancel_old_child() {
+        let (handle, sink) = configured_handle();
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1).await.unwrap();
+        handle.start("old-exploration", "prefer_wavefront").await;
+        let release = Arc::new(tokio::sync::Notify::new());
+        *sink.submit_release.lock().unwrap() = Some(release.clone());
+        let ticking = tokio::spawn({ let handle=handle.clone(); async move { handle.tick((2.0,2.0)).await } });
+        sink.submit_entered.notified().await;
+        let replacement = handle.start("new-exploration", "prefer_wavefront").await;
+        assert_eq!(replacement.status, STATUS_ACCEPTED);
+        release.notify_one();
+        ticking.await.unwrap();
+        assert!(sink.cancelled.lock().unwrap().is_empty());
+        assert_eq!(handle.snapshot().request_id, "new-exploration");
+        assert!(handle.inner.lock().await.logical_active);
+    }
+
+    #[tokio::test]
+    async fn stop_during_submit_cancels_late_ticket_once() {
         let (handle, sink) = configured_handle();
         ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1).await.unwrap();
         handle.start("req-late-ticket", "prefer_wavefront").await;
@@ -7494,8 +5804,7 @@ mod tests {
         assert!(handle.inner.lock().await.active_child.is_none());
         assert_eq!(sink.submitted.lock().unwrap()[0].intent, frozen.intent);
         assert_eq!(*sink.cancelled.lock().unwrap(), vec![frozen.request_id]);
-        assert!(handle.orphan_cancellations.has_entries());
-        assert!(handle.blocks_mapping_mutation().await);
+        assert!(!handle.blocks_mapping_mutation().await);
     }
 
     #[tokio::test]
@@ -7686,7 +5995,7 @@ mod tests {
         assert!(sink.cancelled.lock().unwrap().is_empty());
         handle.stop("req-stale-active").await;
         assert_eq!(sink.cancelled.lock().unwrap().len(), 1);
-        assert_eq!(handle.snapshot().status, STATUS_STOPPING);
+        assert_eq!(handle.snapshot().status, STATUS_CANCELLED);
         scheduler.shutdown().await.unwrap();
     }
 
@@ -7752,7 +6061,6 @@ mod tests {
 
     include!("explore_compute_runtime_tests.rs");
     include!("explore_pose_recovery_tests.rs");
-    include!("explore_stop_recovery_tests.rs");
     include!("explore_compute_surface_tests.rs");
     include!("explore_continuous_map_tests.rs");
     include!("explore_composite_map_tests.rs");
@@ -8077,7 +6385,6 @@ mod tests {
         assert!(sink.submitted.lock().unwrap().is_empty());
     }
 
-
     #[tokio::test]
     async fn checkpoint_save_uses_start_snapshot_without_environment_recapture() {
         let (handle, _) = configured_handle();
@@ -8292,7 +6599,6 @@ mod tests {
         );
     }
 
-
     #[tokio::test]
     async fn mission_return_generic_rejections_do_not_consume_definite_rejection_budget() {
         const PARENT: &str = "mission-return-rejected";
@@ -8435,7 +6741,6 @@ mod tests {
         assert_ne!(observed[1].snapshot.last_stop_reason, "consecutive_failures_exceeded");
     }
 
-
 // Review-only excerpt; NOT applied, parsed, formatted, compiled, or executed.
 // Baseline: 332237e1. Insert in explore_runtime.rs's existing #[cfg(test)]
 // mod tests, beside two-rejections-new-contract-tests.rs after implementation
@@ -8478,7 +6783,6 @@ struct SchemeARaceState {
     returning: bool,
     pending: Option<(String, String)>, // (parent_request_id, request_id)
     active_lease: Option<ChildNavigationLease>,
-    has_pending_cancellation: bool,
     retry_budget: Option<u32>,
     frame_generation: i64,
     reached_goals: u32,
@@ -8507,7 +6811,6 @@ async fn scheme_a_race_state(handle: &ExploreRuntimeHandle) -> SchemeARaceState 
         returning: guard.mission.as_ref().is_some_and(|mission| mission.returning),
         pending: guard.pending_child_dispatch.as_ref().map(scheme_a_request_ids),
         active_lease: guard.active_child.as_ref().map(|child| child.lease.clone()),
-        has_pending_cancellation: guard.pending_child_cancellation.is_some(),
         retry_budget: guard.active_config.as_ref().map(|config| config.max_navigation_retries),
         frame_generation: guard.costmap_frame_generation,
         reached_goals: guard.reached_goals,
@@ -8719,7 +7022,6 @@ fn scheme_a_assert_no_lease_side_effects(case: &SchemeARaceHarness, submitted: u
     assert_eq!(case.sink.next_goal_generation.load(Ordering::SeqCst), 0);
     assert_eq!(case.sink.receipt_reads.load(Ordering::SeqCst), 0);
     assert!(case.sink.cancelled.lock().unwrap().is_empty());
-    assert!(!case.handle.orphan_cancellations.has_entries());
 }
 
 fn scheme_a_assert_home_request(request: &ChildNavigationRequest, parent: &str, sequence: u64) {
@@ -9175,7 +7477,6 @@ async fn resolved_dispatch_consumes_original_reached_failed_and_cancelled_withou
         assert_eq!(after.compute_history, before.compute_history + 1, "one original source feedback");
         assert!(after.pending.is_none());
         assert!(after.active_lease.is_none());
-        assert!(!after.has_pending_cancellation);
         assert!(returned.child_task_id.is_empty());
         assert!(returned.child_lease.is_none());
         assert_eq!(scheme_a_submitted_ids(&case), vec![scheme_a_request_ids(&request)]);
@@ -9233,7 +7534,6 @@ async fn scheme_a_success_with_foreign_ticket_stays_generic_for_home_budget() {
     assert!(after.returning);
     assert!(after.pending.is_none());
     assert!(after.active_lease.is_none());
-    assert!(!after.has_pending_cancellation);
     assert_eq!(returned.status, STATUS_PENDING);
     assert!(returned.message.contains("mismatched child goal lease"));
     assert_ne!(returned.last_stop_reason, "consecutive_failures_exceeded");
@@ -9452,7 +7752,6 @@ async fn scheme_a_frontier_rejection_before_publish_preserves_source_failed_ack(
         assert_eq!(state.return_failures, 0, "ordinary frontier must not consume home retry budget");
         assert!(state.pending.is_none());
         assert!(state.active_lease.is_none());
-        assert!(!state.has_pending_cancellation);
         assert!(state.compute_fault.is_none());
         assert_eq!(state.frame_generation, 1);
         assert_eq!(state.reached_goals, 0);
@@ -9484,7 +7783,6 @@ async fn scheme_a_frontier_rejection_before_publish_preserves_source_failed_ack(
     assert_eq!(sink.next_goal_generation.load(Ordering::SeqCst), 0);
     assert_eq!(sink.receipt_reads.load(Ordering::SeqCst), 0);
     assert!(sink.cancelled.lock().unwrap().is_empty());
-    assert!(!handle.orphan_cancellations.has_entries());
 }
 
     async fn enable_test_mission(handle:&ExploreRuntimeHandle,limit:Option<f64>) {
@@ -9605,6 +7903,72 @@ async fn scheme_a_frontier_rejection_before_publish_preserves_source_failed_ack(
     }
 
     #[tokio::test]
+    async fn new_exploration_replaces_old_business_without_cancelling_child() {
+        let (handle, sink) = configured_handle();
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1).await.unwrap();
+        handle.start("old-exploration", "prefer_wavefront").await;
+        let old = handle.tick((2., 2.)).await;
+        assert!(!old.child_task_id.is_empty());
+        let next = handle.start("new-exploration", "prefer_wavefront").await;
+        assert_eq!(next.status, STATUS_ACCEPTED, "{}", next.message);
+        assert_eq!(next.request_id, "new-exploration");
+        assert!(next.child_task_id.is_empty());
+        assert!(sink.cancelled.lock().unwrap().is_empty());
+        let active = handle.tick((2., 2.)).await;
+        assert_eq!(active.status, STATUS_ACTIVE, "{}", active.message);
+        assert_ne!(active.child_task_id, old.child_task_id);
+        let requests = sink.submitted.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].parent_request_id, "new-exploration");
+    }
+
+    #[tokio::test]
+    async fn cancelled_child_requires_exact_lease_but_no_zero_receipt() {
+        let (handle, sink) = configured_handle();
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1).await.unwrap();
+        handle.start("cancelled-child", "prefer_wavefront").await;
+        let active = handle.tick((2., 2.)).await;
+        let lease = active_child_lease(&handle).await;
+        for field in 0..5 {
+            let mut wrong = lease.clone();
+            match field { 0 => wrong.session_id = "other".into(), 1 => wrong.owner_kind += 1,
+                2 => wrong.parent_request_id = "other".into(), 3 => wrong.goal_generation += 1,
+                _ => wrong.producer_runtime_generation += 1 }
+            assert!(handle.report_navigation_result(&active.child_task_id, ChildNavigationResult::Cancelled(
+                ChildNavigationZeroProof { lease: wrong, cancel_generation: 0, zero_ack_id: String::new(), zero_applied_monotonic_ns: 0 },
+            )).await.is_err());
+            assert_eq!(handle.snapshot().child_lease, Some(lease.clone()));
+        }
+        let stopped = handle.report_navigation_result(&active.child_task_id, ChildNavigationResult::Cancelled(
+            ChildNavigationZeroProof { lease, cancel_generation: 0, zero_ack_id: String::new(), zero_applied_monotonic_ns: 0 },
+        )).await.unwrap();
+        assert_eq!(stopped.status, STATUS_CANCELLED);
+        assert!(stopped.child_task_id.is_empty());
+        assert!(sink.cancelled.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lease_not_granted_ends_exploration_without_frontier_failure() {
+        for stale in [false, true] {
+            let (handle, _) = configured_handle();
+            ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1).await.unwrap();
+            handle.start("lease-rejection", "prefer_wavefront").await;
+            let active = handle.tick((2., 2.)).await;
+            let lease = active_child_lease(&handle).await;
+            let reason = if stale { "LEASE_NOT_GRANTED: STALE_STOP_GENERATION" } else { "LEASE_NOT_GRANTED: MOTION_SINK_NOT_READY" };
+            let stopped = handle.report_navigation_result(&active.child_task_id, ChildNavigationResult::Failed {
+                proof: terminal_proof(&lease), reason: reason.into(),
+            }).await.unwrap();
+            assert_eq!(stopped.status, if stale { STATUS_CANCELLED } else { STATUS_FAILED });
+            assert!(stopped.message.contains(reason));
+            assert!(stopped.child_task_id.is_empty());
+            let history = receipt_test_source_history(&handle).await;
+            assert_eq!(history[1]["failed_goals"], serde_json::json!([]));
+            assert_eq!(history[1]["blacklisted_goals"], serde_json::json!([]));
+        }
+    }
+
+    #[tokio::test]
     async fn mission_budget_dispatches_home_and_requires_matching_terminal() {
         let (handle,sink)=configured_handle();
         ingest_committed_costmap_fixture(&handle,frontier_costmap(1),1).await.unwrap();
@@ -9641,39 +8005,36 @@ async fn scheme_a_frontier_rejection_before_publish_preserves_source_failed_ack(
         progress.travelled_m = 1.0;
         handle.inner.lock().await.mission = Some(progress);
         let stopping = handle.tick((2.0, 2.0)).await;
-        assert_eq!(stopping.status, STATUS_STOPPING, "{}", stopping.message);
-        assert_eq!(sink.cancelled.lock().unwrap().len(), 1);
-        assert_eq!(sink.submitted.lock().unwrap().len(), 1);
+        assert_eq!(stopping.status, STATUS_ACTIVE, "{}", stopping.message);
+        assert!(sink.cancelled.lock().unwrap().is_empty());
+        assert_eq!(sink.submitted.lock().unwrap().len(), 2);
         assert_eq!(handle.inner.lock().await.return_reason, Some(ExplorationStopReason::DistanceBudgetReached));
     }
 
     #[tokio::test]
-    async fn mission_return_cancel_waits_for_zero_and_user_cancel_wins() {
-        for user_cancel in [false,true] {
-            let (handle,sink)=configured_handle();
-            ingest_committed_costmap_fixture(&handle,frontier_costmap(1),1).await.unwrap();
-            handle.start("mission-cancel","prefer_wavefront").await;
-            let active=handle.tick((2.0,2.0)).await;
-            let lease=active_child_lease(&handle).await;
-            enable_test_mission(&handle,Some(2.0)).await;
-            {let mut guard=handle.inner.lock().await;let mut p=MissionProgress::new(MissionPose {position:[2.0,2.0,0.0],orientation_xyzw:[0.0,0.0,0.0,1.0]}).unwrap();p.travelled_m=2.1;guard.mission=Some(p);}
-            assert_eq!(handle.tick((2.0,2.0)).await.status,STATUS_STOPPING);
-            assert_eq!(sink.cancelled.lock().unwrap().len(),1);
-            assert!(handle.report_navigation_result(&active.child_task_id,ChildNavigationResult::Reached(terminal_proof(&lease))).await.is_err());
-            if user_cancel {assert_eq!(handle.stop("mission-cancel").await.status,STATUS_STOPPING);}
-            let proof=zero_proof(&lease,1);
-            let after=handle.report_navigation_result(&active.child_task_id,ChildNavigationResult::Cancelled(proof)).await.unwrap();
-            if user_cancel {
-                assert_eq!(after.status,STATUS_CANCELLED);
-                handle.tick((2.0,2.0)).await;
-                assert_eq!(sink.submitted.lock().unwrap().len(),1);
-            }else{
-                assert_eq!(after.status,STATUS_ACTIVE);
-                let home=handle.tick((2.0,2.0)).await;
-                assert_eq!(home.status,STATUS_ACTIVE,"{}",home.message);
-                let requests=sink.submitted.lock().unwrap();assert_eq!(requests.len(),2);assert!(requests[1].frontier_goal_id.contains(".return."));
-            }
+    async fn mission_return_dispatches_directly_and_user_cancel_only_cancels_return_goal() {
+        let (handle, sink) = configured_handle();
+        ingest_committed_costmap_fixture(&handle, frontier_costmap(1), 1).await.unwrap();
+        handle.start("mission-direct-return", "prefer_wavefront").await;
+        let old = handle.tick((2., 2.)).await;
+        let old_lease = active_child_lease(&handle).await;
+        enable_test_mission(&handle, Some(2.)).await;
+        { let mut guard = handle.inner.lock().await;
+            let mut progress = MissionProgress::new(MissionPose { position: [2., 2., 0.], orientation_xyzw: [0., 0., 0., 1.] }).unwrap();
+            progress.travelled_m = 2.1; guard.mission = Some(progress);
         }
+        let returned = handle.tick((2., 2.)).await;
+        assert_eq!(returned.status, STATUS_ACTIVE, "{}", returned.message);
+        assert!(sink.cancelled.lock().unwrap().is_empty());
+        let requests = sink.submitted.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].frontier_goal_id.contains(".return."));
+        assert_ne!(old.child_task_id, returned.child_task_id);
+        assert!(handle.report_navigation_result(&old.child_task_id, ChildNavigationResult::Reached(terminal_proof(&old_lease))).await.is_err());
+        let stopped = handle.stop("mission-direct-return").await;
+        assert_eq!(stopped.status, STATUS_CANCELLED);
+        assert!(stopped.child_task_id.is_empty());
+        assert_eq!(*sink.cancelled.lock().unwrap(), vec![returned.child_task_id]);
     }
 
     #[tokio::test]
@@ -9816,22 +8177,15 @@ async fn scheme_a_frontier_rejection_before_publish_preserves_source_failed_ack(
             .unwrap();
         handle.start("req-stop-replan", "prefer_wavefront").await;
         let active = handle.tick((2.0, 2.0)).await;
-        let lease = active_child_lease(&handle).await;
         ingest_committed_costmap_fixture(&handle, frontier_costmap(2), 2)
             .await
             .unwrap();
         assert_eq!(handle.snapshot().status, STATUS_ACTIVE);
 
         let stopping = handle.stop("req-stop-replan").await;
-        assert_eq!(stopping.status, STATUS_STOPPING);
+        assert_eq!(stopping.status, STATUS_CANCELLED);
         assert_eq!(stopping.last_stop_reason, "user_cancelled");
-        let terminal = handle
-            .report_navigation_result(
-                &active.child_task_id,
-                ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
-            )
-            .await
-            .unwrap();
+        let terminal = handle.snapshot();
         assert_eq!(terminal.status, STATUS_CANCELLED);
         assert!(!handle.is_active().await);
     }
@@ -9842,7 +8196,6 @@ async fn scheme_a_frontier_rejection_before_publish_preserves_source_failed_ack(
             WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
         assert_eq!(adapter.source_name(), Cow::Borrowed("wavefront"));
     }
-
 
     #[tokio::test]
     async fn surface_return_keeps_captured_body_home_without_support_contract() {

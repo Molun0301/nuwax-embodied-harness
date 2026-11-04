@@ -22,9 +22,9 @@ use crate::constants::{
 use crate::wire::{
     motion_guard_request, motion_guard_response, submit_motion_command_request, AckCode,
     AcquireLeaseRequest,
-    GetOperationResultRequest,  GetReadinessRequest, GlobalStopEnvelope,
+    GetReadinessRequest, GlobalStopEnvelope,
     GuardAction, GuardResult, GuardSource, LeaseTuple,
-    MotionGuardRequest, MotionGuardResponse, OperationNamespace, RenewLeaseRequest,
+    MotionGuardRequest, MotionGuardResponse, RenewLeaseRequest,
     RequestEnvelope, RevokeAndZeroRequest, StopAllMotionRequest, StopCommand,
     SubmitMotionCommandRequest, TwistCommand, ZeroAck, API_VERSION,
 };
@@ -65,8 +65,6 @@ pub struct ReadinessStatus {
     pub reason: String,
     /// Sixteen-byte boot nonce.
     pub boot_nonce: Vec<u8>,
-    /// Whether the automatic startup zero handshake completed.
-    pub startup_zero_confirmed: bool,
     /// Guard-owned global-stop barrier sampled with this readiness result.
     pub motion_stop_generation: u64,
     /// 设备实际命令限制，缺失保持未知，不构造默认声明。
@@ -120,14 +118,6 @@ pub struct ZeroConfirmation {
     pub zero_ack_id: String,
     /// Guard-side monotonic time sampled after zero application.
     pub applied_monotonic_ns: u64,
-    /// 是否取得实际速度或保证制动的停稳证明。
-    pub stationary_confirmed: bool,
-    /// 命令确认、待确认或最终证明种类。
-    pub confirmation_kind: String,
-    /// 实测停稳反馈的来源时间，未使用反馈时为零。
-    pub feedback_source_timestamp_ns: u64,
-    /// 同机单调时钟下的确认截止，零表示没有在途确认。
-    pub stationary_deadline_monotonic_ns: u64,
 }
 
 /// Result of an ordinary global stop operation.
@@ -243,7 +233,7 @@ impl MotionGuardClient {
         config: ClientConfig,
         lease_tuple: LeaseTuple,
         operation_id: &str,
-    ) -> Result<ZeroConfirmation, MotionGuardClientError> {
+    ) -> Result<Option<ZeroConfirmation>, MotionGuardClientError> {
         let request = Self::prepare_priority_revoke_and_zero(lease_tuple, operation_id)?;
         Self::execute_priority_revoke_and_zero(config, &request).await
     }
@@ -285,15 +275,13 @@ impl MotionGuardClient {
     pub async fn execute_priority_revoke_and_zero(
         config: ClientConfig,
         request: &PriorityFenceRequest,
-    ) -> Result<ZeroConfirmation, MotionGuardClientError> {
+    ) -> Result<Option<ZeroConfirmation>, MotionGuardClientError> {
         let mut client = Self::connect_with_config(config).await?;
-        let outcome = client
-            .exchange(
-                request.request.clone(),
-                OutcomeKind::RevokeAndZero,
-                AckCode::ResourceFenced,
-            )
-            .await?;
+        let outcome = match client.exchange(request.request.clone(), OutcomeKind::RevokeAndZero, AckCode::ResourceFenced).await {
+            Ok(outcome) => outcome,
+            Err(MotionGuardClientError::Remote { code, .. }) if code == "OUTCOME_UNKNOWN" => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let motion_guard_response::Outcome::RevokeAndZero(response) = outcome else {
             unreachable!("exchange already correlated the outcome")
         };
@@ -301,37 +289,8 @@ impl MotionGuardClient {
             .zero_ack
             .ok_or_else(|| "RESOURCE_FENCED response has no ZeroAck".to_string())
             .and_then(decode_zero_ack)
+            .map(Some)
             .or_else(|message| client.protocol_error(message))
-    }
-
-    /// 紧急命令围栏完成后，在独立连接查询原操作的停稳终态；不占用300毫秒命令预算。
-    pub async fn confirm_stationary_after_fence(config:ClientConfig,operation_id:&str,zero:ZeroConfirmation)->Result<ZeroConfirmation,MotionGuardClientError> {
-        if zero.stationary_deadline_monotonic_ns==0 {
-            return Ok(zero);
-        }
-        let mut client=Self::connect_with_config(config).await?;
-        client.wait_stationary(operation_id,GuardSource::Nav,OperationNamespace::Lease,zero).await
-    }
-
-    async fn wait_stationary(&mut self,operation_id:&str,source:GuardSource,namespace:OperationNamespace,zero:ZeroConfirmation)->Result<ZeroConfirmation,MotionGuardClientError> {
-        let deadline=zero.stationary_deadline_monotonic_ns;
-        if deadline==0 {
-            return Ok(zero);
-        }
-        loop {
-            // 原等待期限结束后仍查询一次：同一停车操作可能已在后台取得迟到确认。
-            let request=MotionGuardRequest {api_version:API_VERSION,request_id:new_request_id(),operation:Some(motion_guard_request::Operation::GetOperationResult(GetOperationResultRequest {
-                source:source as i32,operation_id:operation_id.into(),operation_namespace:namespace as i32,
-            }))};
-            let outcome=self.exchange_allowing_acks(request,OutcomeKind::GetOperationResult,&[AckCode::Zeroed,AckCode::ResourceFenced]).await?;
-            let motion_guard_response::Outcome::GetOperationResult(value)=outcome else {unreachable!("已检查响应种类")};
-            let observed=value.zero_ack.ok_or_else(||"停稳查询缺少原归零标识".to_owned()).and_then(decode_zero_ack).or_else(|e|self.protocol_error(e))?;
-            if observed.stationary_confirmed {return Ok(observed);}
-            if observed.confirmation_kind=="unconfirmed" {break;}
-            if monotonic_ns()?>deadline {break;}
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        Err(MotionGuardClientError::Remote{code:"MOTION_STOP_UNCONFIRMED".into(),message:"执行器未在保证制动期限内确认停稳".into(),retryable:false,operation_id:operation_id.into()})
     }
 
     /// Returns the source identity fixed for every request from this client.
@@ -354,7 +313,7 @@ impl MotionGuardClient {
 
     fn schedule_renewal(&mut self, issued_ns: u64, owner_deadline_ns: u64) -> Result<(), MotionGuardClientError> {
         // 预留完整通信上限和守卫调度片，命令执行期间仍由同一拥有方串行续租。
-        let reserve = 425_000_000 + 25_000_000
+        let reserve = 25_000_000
             + self.config.request_timeout.min(Duration::from_millis(COMMAND_DEADLINE_MS as u64)).as_nanos() as u64;
         let due_ns = issued_ns.saturating_add(RENEW_INTERVAL_MS * NANOS_PER_MILLISECOND)
             .min(owner_deadline_ns.saturating_sub(reserve));
@@ -409,7 +368,6 @@ impl MotionGuardClient {
             actuator_configured: response.actuator_configured,
             reason: response.reason,
             boot_nonce: response.boot_nonce,
-            startup_zero_confirmed: response.startup_zero_confirmed,
             motion_stop_generation: response.motion_stop_generation,
             command_limits: response.command_limits,
         })
@@ -447,6 +405,7 @@ impl MotionGuardClient {
                         deadline_monotonic_ns: deadline,
                     }),
                     reason: reason.to_string(),
+                    expected_motion_stop_generation: None,
                 },
             )),
         };
@@ -466,7 +425,6 @@ impl MotionGuardClient {
             .and_then(decode_zero_ack)
             .or_else(|message| self.protocol_error(message))?;
         self.lease_tuple = None;
-        let zero=self.wait_stationary(&operation_id,GuardSource::GatewayManual,OperationNamespace::GlobalStop,zero).await?;
         Ok(GlobalStopConfirmation {
             zero,
             lease_revoked: response.lease_revoked,
@@ -480,11 +438,7 @@ impl MotionGuardClient {
         proof: &MotionAdmissionProof,
     ) -> Result<LeaseMetadata, MotionGuardClientError> {
         self.ensure_usable()?;
-        if self.lease_tuple.is_some() {
-            return Err(MotionGuardClientError::InvalidInput(
-                "a NAV lease is already active".into(),
-            ));
-        }
+
         let operation_id = validate_operation_id(operation_id)?;
         let lease_tuple = LeaseTuple {
             boot_nonce: proof.boot_nonce.to_vec(),
@@ -644,7 +598,7 @@ impl MotionGuardClient {
             .ok_or_else(|| "ZEROED stop response has no ZeroAck".to_string())
             .and_then(decode_zero_ack)
             .or_else(|message| self.protocol_error(message))?;
-        self.wait_stationary(&operation_id,GuardSource::Nav,OperationNamespace::Lease,zero).await
+        Ok(zero)
     }
 
     /// Atomically revokes the active lease, applies zero, and waits for fencing proof.
@@ -654,7 +608,7 @@ impl MotionGuardClient {
     pub async fn revoke_and_zero(
         &mut self,
         operation_id: &str,
-    ) -> Result<ZeroConfirmation, MotionGuardClientError> {
+    ) -> Result<Option<ZeroConfirmation>, MotionGuardClientError> {
         let operation_id = validate_operation_id(operation_id)?;
         let envelope = self.next_envelope(GuardAction::Stop, &operation_id)?;
         let request = MotionGuardRequest {
@@ -666,9 +620,15 @@ impl MotionGuardClient {
                 },
             )),
         };
-        let outcome = self
-            .exchange(request, OutcomeKind::RevokeAndZero, AckCode::ResourceFenced)
-            .await?;
+        let outcome = match self.exchange(request, OutcomeKind::RevokeAndZero, AckCode::ResourceFenced).await {
+            Ok(outcome) => outcome,
+            Err(MotionGuardClientError::Remote { code, .. }) if code == "OUTCOME_UNKNOWN" => {
+                self.lease_tuple = None;
+                self.renewal_due_at = None;
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         let motion_guard_response::Outcome::RevokeAndZero(response) = outcome else {
             unreachable!("exchange already correlated the outcome")
         };
@@ -678,9 +638,9 @@ impl MotionGuardClient {
             .and_then(decode_zero_ack)
             .or_else(|message| self.protocol_error(message))?;
         self.lease_tuple = None;
-        self.wait_stationary(&operation_id,GuardSource::Nav,OperationNamespace::Lease,zero).await
+        self.renewal_due_at = None;
+        Ok(Some(zero))
     }
-
 
     fn next_envelope(
         &mut self,
@@ -864,7 +824,6 @@ enum OutcomeKind {
 
 impl OutcomeKind {
 
-
     fn from_response(outcome: &motion_guard_response::Outcome) -> Option<Self> {
         match outcome {
             motion_guard_response::Outcome::AcquireLease(_) => Some(Self::AcquireLease),
@@ -879,10 +838,11 @@ impl OutcomeKind {
             motion_guard_response::Outcome::GetGuardState(_) => Some(Self::GetGuardState),
             motion_guard_response::Outcome::ExecuteSportCommand(_)
             | motion_guard_response::Outcome::RevokeZeroAndSwitchMode(_) => None,
+        motion_guard_response::Outcome::AdvanceMotionGeneration(_) => None,
+        motion_guard_response::Outcome::ApplyRobotSetting(_) => None,
         }
     }
 }
-
 
 fn validate_operation_id(operation_id: &str) -> Result<String, MotionGuardClientError> {
     let operation_id = operation_id.trim();
@@ -894,18 +854,12 @@ fn validate_operation_id(operation_id: &str) -> Result<String, MotionGuardClient
     Ok(operation_id.to_string())
 }
 
-
 fn decode_zero_ack(zero: ZeroAck) -> Result<ZeroConfirmation, String> {
     Ok(ZeroConfirmation {
         zero_ack_id: zero.zero_ack_id,
         applied_monotonic_ns: zero.applied_monotonic_ns,
-        stationary_confirmed: zero.stationary_confirmed,
-        confirmation_kind: zero.confirmation_kind,
-        feedback_source_timestamp_ns: zero.feedback_source_timestamp_ns,
-        stationary_deadline_monotonic_ns: zero.stationary_deadline_monotonic_ns,
     })
 }
-
 
 fn monotonic_ns() -> Result<u64, MotionGuardClientError> {
     let now = clock_gettime(ClockId::Monotonic);
@@ -1039,9 +993,10 @@ fn outcome_result(outcome: &motion_guard_response::Outcome) -> Option<&GuardResu
         motion_guard_response::Outcome::GetGuardState(body) => body.result.as_ref(),
         motion_guard_response::Outcome::ExecuteSportCommand(_)
         | motion_guard_response::Outcome::RevokeZeroAndSwitchMode(_) => None,
+        motion_guard_response::Outcome::AdvanceMotionGeneration(body) => body.result.as_ref(),
+        motion_guard_response::Outcome::ApplyRobotSetting(body) => body.result.as_ref(),
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1065,7 +1020,7 @@ mod tests {
                 let outcome=crate::wire::GetReadinessResponse {
                     result:Some(GuardResult {ack:AckCode::Received as i32,
                         lease:crate::wire::LeaseState::Idle as i32,error:None}),
-                    ready:true,actuator_configured:true,startup_zero_confirmed:true,
+                    ready:true,actuator_configured:true,
                     boot_nonce:vec![7;16],command_limits:declared,..Default::default()};
                 let response=MotionGuardResponse {api_version:API_VERSION,request_id:request.request_id,
                     outcome:Some(motion_guard_response::Outcome::GetReadiness(outcome)),..Default::default()}.encode_to_vec();
@@ -1257,6 +1212,5 @@ mod tests {
         assert!(client.poison_reason.is_none());
         client.ensure_usable().unwrap();
     }
-
 
 }

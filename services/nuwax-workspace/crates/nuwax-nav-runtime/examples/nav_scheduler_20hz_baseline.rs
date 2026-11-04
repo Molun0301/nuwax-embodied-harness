@@ -66,13 +66,13 @@ impl NavMotionPort for FakeMotion {
     async fn revoke_and_zero(
         &mut self,
         _operation_id: &str,
-    ) -> Result<FenceProof, MotionPortError> {
+    ) -> Result<Option<FenceProof>, MotionPortError> {
         self.state.lock().expect("fake motion state").fence_count += 1;
-        Ok(FenceProof {
+        Ok(Some(FenceProof {
             zero_ack_id: "nav_scheduler_20hz_baseline-zero".to_string(),
             applied_monotonic_ns: 2,
             lease: FenceLeaseState::Idle,
-        })
+        }))
     }
 }
 
@@ -116,7 +116,6 @@ fn identity(session_id: &str, path_revision: i64) -> PathExecutionIdentity {
     PathExecutionIdentity {
         goal_key: nuwax_nav_types_messages::GoalKey { producer_runtime_generation: (1) as u64, goal_generation: (1) as u64 },
         session_id: session_id.to_string(),
-
 
         planner_runtime_generation: if path_revision == 0 { 0 } else { 1 },
         path_revision: path_revision as u64,

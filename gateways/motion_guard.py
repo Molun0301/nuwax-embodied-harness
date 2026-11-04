@@ -37,7 +37,7 @@ class GatewayMotionGuardUnavailable(GatewayMotionGuardError):
 @dataclass(frozen=True)
 class GatewayCommandConfirmation:
     command: CommandConfirmation
-    zero: ZeroConfirmation
+    zero: Optional[ZeroConfirmation]
 
 
 @dataclass(frozen=True)
@@ -166,11 +166,9 @@ class GatewayMotionGuard:
                 f"motion guard state query failed: {exc}"
             ) from exc
 
-    def admission_snapshot(self) -> MotionAdmissionProof:
-        """从同一次状态回包捕获启动身份和唯一停止代次。"""
-        state = self.guard_state()
-        return MotionAdmissionProof(boot_nonce=state.boot_nonce,
-                                    motion_stop_generation=state.motion_stop_generation)
+    def begin_motion_command(self) -> MotionAdmissionProof:
+        """推进并返回本次运动命令的代次。"""
+        return self._require_client().advance_motion_generation(pb.GUARD_SOURCE_GATEWAY_MANUAL)
 
     def acquire_follow_session(
         self,
@@ -184,9 +182,7 @@ class GatewayMotionGuard:
     ) -> MotionGuardSession:
         return self._acquire(pb.GUARD_SOURCE_GATEWAY_RELATIVE, proof)
 
-    def stop_and_fence(self, session: MotionGuardSession) -> ZeroConfirmation:
-        # 终结会话直接使用原子撤租归零；先Stop并等待会持锁阻断续租，
-        # 还会在租约已过期后重复停车。close自身核对物理停止回执。
+    def stop_and_fence(self, session: MotionGuardSession) -> Optional[ZeroConfirmation]:
         return session.close()
 
     def execute_sport(
@@ -216,29 +212,10 @@ class GatewayMotionGuard:
             lambda session: session.set_body_pose(roll_rad, pitch_rad, yaw_rad),
         )
 
-    def set_speed_level(
-        self,
-        level: int,
-        *,
-        proof: MotionAdmissionProof,
-    ) -> GatewayCommandConfirmation:
-        return self._one_shot(
-            pb.GUARD_SOURCE_GATEWAY_MANUAL,
-            proof,
-            lambda session: session.set_speed_level(level),
-        )
-
-    def set_obstacle_policy(
-        self,
-        enabled: bool,
-        *,
-        proof: MotionAdmissionProof,
-    ) -> GatewayCommandConfirmation:
-        return self._one_shot(
-            pb.GUARD_SOURCE_GATEWAY_MANUAL,
-            proof,
-            lambda session: session.set_obstacle_policy(enabled),
-        )
+    def apply_setting(self, *, speed_level=None, obstacle_policy=None) -> GatewayCommandConfirmation:
+        command = self._require_client().apply_robot_setting(pb.GUARD_SOURCE_GATEWAY_MANUAL,
+            speed_level=speed_level, obstacle_policy=obstacle_policy)
+        return GatewayCommandConfirmation(command=command, zero=None)
 
     def switch_mode(
         self,
@@ -256,17 +233,18 @@ class GatewayMotionGuard:
         except MotionGuardError as exc:
             self._record_error(exc)
             raise GatewayMotionGuardError(
-                "motion guard mode switch failed without a verified fence"
+                "控制模式切换失败"
             ) from exc
 
     def stop_all_motion(
         self, reason: str, *, operation_id: Optional[str] = None,
-    ) -> StopAllMotionConfirmation:
+        expected_motion_stop_generation: Optional[int] = None,
+    ) -> Optional[StopAllMotionConfirmation]:
         operation = (operation_id.strip() if isinstance(operation_id, str) and operation_id.strip()
                      else f"stop-all-motion:{uuid.uuid4()}")
         client = self._require_client()
         try:
-            return client.stop_all_motion(reason, operation_id=operation)
+            return client.stop_all_motion(reason, operation_id=operation, expected_motion_stop_generation=expected_motion_stop_generation)
         except MotionGuardTransportError as exc:
             self._record_error(exc)
             if not exc.outcome_unknown or (exc.operation_id and exc.operation_id != operation):
@@ -279,11 +257,8 @@ class GatewayMotionGuard:
                     operation_namespace=pb.OPERATION_NAMESPACE_GLOBAL_STOP,
                 )
                 if not status.resolved:
-                    return recovery_client.stop_all_motion(reason, operation_id=operation)
-                zero = recovery_client.wait_for_stationary(
-                    pb.GUARD_SOURCE_GATEWAY_MANUAL, operation, status.zero,
-                    operation_namespace=pb.OPERATION_NAMESPACE_GLOBAL_STOP,
-                )
+                    return recovery_client.stop_all_motion(reason, operation_id=operation, expected_motion_stop_generation=expected_motion_stop_generation)
+                zero = status.zero
                 return StopAllMotionConfirmation(
                     operation_id=operation, result=status.result, zero=zero,
                     lease_revoked=status.target_ack == pb.ACK_CODE_RESOURCE_FENCED,
@@ -314,7 +289,7 @@ class GatewayMotionGuard:
         except MotionGuardError as exc:
             self._record_error(exc)
             raise GatewayMotionGuardError(
-                "motion guard one-shot command failed without a clean fence"
+                "机体命令执行失败"
             ) from exc
         return GatewayCommandConfirmation(command=command, zero=zero)
 

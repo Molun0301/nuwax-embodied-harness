@@ -673,8 +673,8 @@ message CancelNavigationRequest {
   string parent_request_id = 3;
   uint64 goal_generation = 4;
   uint64 producer_runtime_generation = 5;
-  // 复用本次已完成的普通全局停车回执，精确收尾原目标。
-  OrdinaryGlobalStopConfirmation global_stop_confirmation = 6;
+  reserved 6;
+  reserved "global_stop_confirmation";
 }
 message NavigationState {
   reserved 11;
@@ -813,17 +813,10 @@ message ExplorationReturnPolicy {
   double reserve_distance_m = 2;
   bool return_on_completion = 3;
 }
-// 复用本次普通全局停车的真实结果，不创建另一轮停车或恢复围栏。
-message OrdinaryGlobalStopConfirmation {
-  string operation_id = 1;
-  string zero_ack_id = 2;
-  uint64 applied_monotonic_ns = 3;
-  bool stationary_confirmed = 4;
-}
 message StopExplorationRequest {
   string request_id = 1;
-  OrdinaryGlobalStopConfirmation global_stop_confirmation = 2;
-  uint64 expected_exploration_generation = 3;
+  reserved 2, 3;
+  reserved "global_stop_confirmation", "expected_exploration_generation";
 }
 message ExplorationProgressRequest { string request_id = 1; }
 message ExplorationProgressResponse { string checkpoint_json = 1; }
@@ -854,8 +847,8 @@ message ExplorationState {
   ExplorationChildLease child_lease = 13;
   // 只读版本化采样行程、原起点和返航阶段；没有启用策略时为空。
   string mission_progress_json = 17;
-  // 原请求仍有真实子取消或在途派发等待停车；业务终态不表示停车完成。
-  bool parking_pending = 18;
+  reserved 18;
+  reserved "parking_pending";
 }
 message ExplorationSourceDiag {
   string source_name = 1;

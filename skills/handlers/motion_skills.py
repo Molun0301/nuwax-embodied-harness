@@ -69,9 +69,10 @@ def _command_result(confirmation: Any) -> Dict[str, Any]:
         "ack_code": result.ack,
         "lease": pb.LeaseState.Name(result.lease),
         "applied_monotonic_ns": command.applied_monotonic_ns,
-        "zero_ack_id": confirmation.zero.zero_ack_id,
-        "zero_applied_monotonic_ns": confirmation.zero.applied_monotonic_ns,
     }
+    if confirmation.zero is not None:
+        payload["zero_ack_id"] = confirmation.zero.zero_ack_id
+        payload["zero_applied_monotonic_ns"] = confirmation.zero.applied_monotonic_ns
     if command.zero is not None:
         payload["command_zero_ack_id"] = command.zero.zero_ack_id
         payload["command_zero_applied_monotonic_ns"] = (
@@ -157,17 +158,13 @@ def handle_set_speed_level(
 ) -> Dict[str, Any]:
     """设置速度档位。
 
-    参数经 facade 进入 GATEWAY_MANUAL lease。
+    直接下发设置。
     """
 
     del requested_by
     level = payload["level"]
-    admission = payload[MOTION_ADMISSION_ARGUMENT]
     try:
-        confirmation = ctx.motion_guard.set_speed_level(
-                level,
-                proof=admission.proof,
-            )
+        confirmation = ctx.motion_guard.apply_setting(speed_level=level)
     except MotionGuardFacadeError as exc:
         raise motion_guard_gateway_error("set_speed_level", exc) from exc
     return {
@@ -210,17 +207,13 @@ def handle_set_obstacle_avoidance(
 ) -> Dict[str, Any]:
     """开关实时避障。
 
-    参数经 facade 进入 GATEWAY_MANUAL lease。
+    直接下发设置。
     """
 
     del requested_by
     enabled = payload["enabled"]
-    admission = payload[MOTION_ADMISSION_ARGUMENT]
     try:
-        confirmation = ctx.motion_guard.set_obstacle_policy(
-                enabled,
-                proof=admission.proof,
-            )
+        confirmation = ctx.motion_guard.apply_setting(obstacle_policy=enabled)
     except MotionGuardFacadeError as exc:
         raise motion_guard_gateway_error("set_obstacle_avoidance", exc) from exc
     return {

@@ -20,7 +20,7 @@ impl NavMotionPort for RegisteredStreamMotion {
         if b.is_some_and(CommandDispatchBound::expired_now) {return Ok(BoundedTwistOutcome::ExpiredNotApplied);}
         self.submit_twist(id,c).await.map(BoundedTwistOutcome::Applied)
     }
-    async fn revoke_and_zero(&mut self,id:&str)->Result<FenceProof,MotionPortError> {
+    async fn revoke_and_zero(&mut self,id:&str)->Result<Option<FenceProof>,MotionPortError> {
         let proof=self.inner.revoke_and_zero(id).await?;
         self.issued.lock().unwrap().push((std::time::Instant::now(),Twist2::ZERO));Ok(proof)
     }

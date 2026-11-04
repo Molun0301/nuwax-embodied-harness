@@ -5,11 +5,6 @@ Rust 运行时是主要的平台几何交互层（替代旧 nuwax-ros-bridge）�
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from services.navigation.motion_guard_client import StopAllMotionConfirmation
-
 from services.geometry.planar_archive import read_planar_structure
 from services.geometry.checkpoint_payload import FrozenPayload, payload_chunks, MAX_PLANAR_ARCHIVE_BYTES
 from core.config_values import runtime_value
@@ -108,14 +103,7 @@ def _decode_motion_admission_proof(value: object) -> Tuple[bytes, int]:
     return boot_nonce, value["motion_stop_generation"]
 
 
-def _ordinary_global_stop_confirmation_proto(confirmation: StopAllMotionConfirmation):
-    """把同一次普通全局停车回执无损传给原生拥有方。"""
-    return pb2.OrdinaryGlobalStopConfirmation(
-        operation_id=confirmation.operation_id,
-        zero_ack_id=confirmation.zero.zero_ack_id,
-        applied_monotonic_ns=confirmation.zero.applied_monotonic_ns,
-        stationary_confirmed=confirmation.zero.stationary_confirmed,
-    )
+
 
 
 class GeometryRuntimeRpcError(RuntimeError):
@@ -1555,10 +1543,8 @@ _NAV_ADMISSION_REJECTION_REASONS = frozenset({
     "GOAL_LEASE_INVALID",
     "GOAL_ENVELOPE_RANGE",
     "GOAL_TIMESTAMP_INVALID",
-    "GOAL_LEASE_BUSY",
     "GOAL_GENERATION_STALE",
-    "GOAL_CANCEL_STATE_UNAVAILABLE",
-    "GOAL_CANCEL_GENERATION_CHANGED",
+    "GOAL_GENERATION_STALE",
     "GOAL_ENVELOPE_INVALID",
     "GOAL_RETRY_MAP_REVISION_ADVANCED",
     "GOAL_RETRY_NAVIGATION_NOT_READY_UNKNOWN",
@@ -1865,7 +1851,6 @@ def _exploration_state_to_dict(resp: Any) -> Dict[str, Any]:
         "child_task_id": str(resp.child_task_id),
         "exploration_generation": int(resp.exploration_generation),
         "child_lease": child_lease,
-        "parking_pending": bool(resp.parking_pending),
     }
 
 
@@ -5746,7 +5731,6 @@ class GeometryRuntimeProvider:
         request_id: Optional[str] = None,
         *,
         deadline_monotonic: Optional[float] = None,
-        global_stop_confirmation: Optional[StopAllMotionConfirmation] = None,
     ) -> bool:
         """转交定向取消；空身份由原生拥有方绑定当时的当前目标。"""
         self._raise_if_stopping("cancel_goal")
@@ -5767,7 +5751,7 @@ class GeometryRuntimeProvider:
                 if exact_goal_id and (
                         active_lease[0] != exact_goal_id
                         or not _is_canonical_public_navigation_lease(active_lease)
-                        or (global_stop_confirmation is None and active_status in {
+                        or (active_status in {
                             NavigationStatus.IDLE, NavigationStatus.SUCCEEDED,
                             NavigationStatus.FAILED, NavigationStatus.CANCELLED})):
                     return False
@@ -5783,9 +5767,6 @@ class GeometryRuntimeProvider:
             if exact_goal_id:
                 req.goal_id, req.owner_kind, req.parent_request_id = active_lease[:3]
                 req.goal_generation, req.producer_runtime_generation = active_lease[3:]
-            if global_stop_confirmation is not None:
-                req.global_stop_confirmation.CopyFrom(
-                    _ordinary_global_stop_confirmation_proto(global_stop_confirmation))
             resp = command_stub.CancelNavigation(
                 req, timeout=_exploration_rpc_timeout(deadline_monotonic, "CancelNavigation"))
             raw_status = str(resp.status).strip().lower()
@@ -6112,8 +6093,6 @@ class GeometryRuntimeProvider:
         *,
         request_id: str = "",
         deadline_monotonic: Optional[float] = None,
-        global_stop_confirmation: Optional[StopAllMotionConfirmation] = None,
-        expected_exploration_generation: Optional[int] = None,
     ) -> Dict[str, Any]:
         """停止探索。
 
@@ -6125,11 +6104,6 @@ class GeometryRuntimeProvider:
             raise _missing_exploration_stub_error("StopExploration")
         try:
             req = pb2.StopExplorationRequest(request_id=request_id)
-            if global_stop_confirmation is not None:
-                req.global_stop_confirmation.CopyFrom(
-                    _ordinary_global_stop_confirmation_proto(global_stop_confirmation))
-            if expected_exploration_generation is not None:
-                req.expected_exploration_generation = expected_exploration_generation
             rpc_timeout = _exploration_rpc_timeout(
                 deadline_monotonic,
                 "StopExploration",
@@ -6180,7 +6154,6 @@ class GeometryRuntimeProvider:
             state.get("child_task_id"),
             state.get("exploration_generation"),
             state.get("child_lease"),
-            state.get("parking_pending"),
         )
 
     def _ensure_exploration_poll_worker(self) -> None:

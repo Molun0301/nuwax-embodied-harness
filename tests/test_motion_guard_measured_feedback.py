@@ -13,9 +13,9 @@ from contracts.motion_feedback import MotionExecutionFeedback
 from services.navigation.proto_gen import motion_guard_pb2 as pb
 from services.navigation.motion_safety_guard.constants import API_VERSION
 from services.navigation.motion_safety_guard.core import MotionGuardCore
-from services.navigation.motion_safety_guard.go2_actuator import ActuatorError, Go2Actuator, Go2Factories
+from services.navigation.motion_safety_guard.go2_actuator import Go2Actuator, Go2Factories
 from services.navigation.motion_safety_guard.peer_auth import PeerCredentials
-from services.navigation.motion_safety_guard.stop_confirmation import StopConfirmation
+from services.navigation.motion_safety_guard.execution_feedback import ExecutionFeedback
 
 
 class Clock:
@@ -56,12 +56,12 @@ class MeasuredMotionFeedbackTests(unittest.TestCase):
         self.addCleanup(self.environment.stop)
         self.clock = Clock()
         self.device = Device()
-        self.stop = StopConfirmation(None, monotonic=lambda: self.clock.mono / 1e9,
-            unix_ns=lambda: self.clock.unix, sleep=lambda seconds:self.clock.step(round(seconds*1e9)))
+        self.stop = ExecutionFeedback( monotonic=lambda: self.clock.mono / 1e9,
+            unix_ns=lambda: self.clock.unix)
         self.device.feedback=lambda:self.sample(linear_x_mps=0.,linear_y_mps=0.,linear_z_mps=0.,
             angular_x_rps=0.,angular_y_rps=0.,angular_z_rps=0.)
         self.core = MotionGuardCore(actuator=self.device, monotonic_ns=lambda:self.clock.mono,
-            stop_confirmation=self.stop, lease_id_factory=lambda:123)
+            execution_feedback=self.stop, lease_id_factory=lambda:123)
         self.core.initialize_zero_fence()
         self.device.feedback=None
         self.peer = PeerCredentials(1, 2, 3)
@@ -271,73 +271,3 @@ class MeasuredMotionFeedbackTests(unittest.TestCase):
         self.assertFalse(self.query().HasField('measured_motion_feedback'))
         self.device.feedback = self.sample(orientation_wxyz=(0.0, 0.0, 0.0, 0.0))
         self.assertFalse(self.query().HasField('measured_motion_feedback'))
-
-    def test_legacy_stop_feedback_remains_valid(self):
-        self.device.feedback = MotionExecutionFeedback(source_timestamp_ns=self.clock.unix,
-            frame_id='base_link', linear_x_mps=0.0, linear_y_mps=0.0, angular_z_rps=0.0)
-        self.assertIs(self.stop.feedback(self.device), self.device.feedback)
-        self.assertFalse(self.query().HasField('measured_motion_feedback'))
-
-
-class LowRateStopConfirmationTests(unittest.TestCase):
-    """低频实际反馈的停车行为；固定时钟，不依赖本机负载。"""
-    def setUp(self):
-        self.environment = patch.dict(os.environ, {'NUWAX_SOURCE_TIME_FILE': ''})
-        self.environment.start()
-        self.addCleanup(self.environment.stop)
-        self.clock = Clock()
-        self.stop = StopConfirmation(None, monotonic=lambda: self.clock.mono / 1e9,
-            unix_ns=lambda: self.clock.unix)
-        self.device = Device()
-        self.progress = self.stop.start(self.device, self.stop.begin())
-
-    def poll_sample(self, interval_ns=150_000_000, speed=0.0, angular=0.0):
-        self.clock.step(interval_ns)
-        self.device.feedback = MotionExecutionFeedback(source_timestamp_ns=self.clock.unix,
-            received_monotonic_ns=self.clock.mono, frame_id='base_link', source_id='test_device',
-            linear_x_mps=speed, linear_y_mps=0.0, angular_z_rps=angular)
-        return self.stop.poll(self.device, self.progress)
-
-    def test_low_rate_feedback_requires_three_samples_and_continued_settlement(self):
-        self.assertIsNone(self.poll_sample())
-        self.assertIsNone(self.poll_sample())
-        self.assertIsNone(self.poll_sample())
-        evidence = self.poll_sample()
-        self.assertTrue(evidence.stationary_confirmed)
-        self.assertEqual(evidence.confirmation_kind, 'measured_feedback')
-        self.assertEqual(evidence.feedback_source_timestamp_ns, self.device.feedback.source_timestamp_ns)
-
-    def test_low_rate_signed_motion_never_confirms_stop(self):
-        for speed, angular in ((0.1, 0.0), (-0.1, 0.0), (0.0, 0.1), (0.0, -0.1)):
-            with self.subTest(speed=speed, angular=angular):
-                self.progress = self.stop.start(self.device, self.stop.begin())
-                for _ in range(5):
-                    self.assertIsNone(self.poll_sample(speed=speed, angular=angular))
-
-    def test_repeated_or_stale_feedback_cannot_complete_low_rate_window(self):
-        self.assertIsNone(self.poll_sample())
-        self.assertIsNone(self.poll_sample())
-        for _ in range(3):
-            self.clock.step(50_000_000)
-            self.assertIsNone(self.stop.poll(self.device, self.progress))
-        self.assertEqual(len(self.progress.samples), 2)
-        self.clock.step(150_000_000)
-        self.assertIsNone(self.stop.poll(self.device, self.progress))
-        self.assertFalse(self.progress.samples)
-        self.assertIsNone(self.poll_sample(50_000_000))
-        self.assertIsNone(self.poll_sample(50_000_000))
-        self.assertIsNone(self.poll_sample(50_000_000))
-        self.assertTrue(self.poll_sample(50_000_000).stationary_confirmed)
-
-    def test_low_rate_motion_exhausts_original_deadline(self):
-        deadline = self.progress.deadline
-        for _ in range(6):
-            self.assertIsNone(self.poll_sample(speed=0.1))
-        with self.assertRaisesRegex(ActuatorError, '速度均值') as caught:
-            self.poll_sample(speed=0.1)
-        self.assertEqual(caught.exception.code, 'MOTION_STOP_UNCONFIRMED')
-        self.assertEqual(self.progress.deadline, deadline)
-
-
-if __name__ == '__main__':
-    unittest.main()

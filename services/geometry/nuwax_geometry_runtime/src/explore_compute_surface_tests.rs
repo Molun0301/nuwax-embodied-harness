@@ -310,15 +310,7 @@ async fn publish_surface_owner_receipt(
     ticket
 }
 
-// 代表真正的新观测；与上面的同一来源重发夹具分开，重发不能刷新数据年龄。
-async fn publish_fresh_surface_observation(
-    handle: &ExploreRuntimeHandle, revision: i32, snapshot: Arc<SurfaceSnapshot>,
-) -> SurfaceMapTicket {
-    let message = surface_message("map", revision);
-    let ticket = handle.begin_surface_map_update(&message, now_monotonic_nanos()).await.unwrap().unwrap();
-    assert!(handle.finish_surface_map_update(ticket.clone(), Ok(snapshot)).await);
-    ticket
-}
+
 
 fn surface_owner_goal(poll: &ExplorationPoll) -> &FrontierGoal {
     match poll {
@@ -1050,32 +1042,20 @@ async fn watermark_owner_cleanup(
         }
     } else { Ok(()) };
     let stopped = scheme_a_race_wait("F2 original Stop", handle.stop(request_id)).await;
-    let ticket = scheme_a_race_wait("F2 original cancellation ticket", async {
-        handle.inner.lock().await.pending_child_cancellation.as_ref().and_then(|pending| pending.ticket.clone())
-    }).await;
-    let reported = match ticket.as_ref().ok().and_then(|ticket| ticket.as_ref()) {
-        Some(ticket) => Some(scheme_a_race_wait("F2 exact ZEROED", handle.report_navigation_result(
-            &ticket.lease.session_id,
-            ChildNavigationResult::Cancelled(zero_proof(&ticket.lease, ticket.cancel_generation)),
-        )).await),
-        None => None,
-    };
     let idle = scheme_a_race_wait("F2 original compute idle", handle.await_compute_idle()).await;
     let shutdown = scheme_a_race_wait("F2 original compute shutdown", handle.request_compute_shutdown()).await;
     let joined = scheme_a_race_wait("F2 original compute join", handle.compute_service.join()).await;
     let retired = scheme_a_race_wait("F2 settled child ownership", async {
         let guard = handle.inner.lock().await;
-        (guard.active_child.is_some(), guard.pending_child_cancellation.is_some(), guard.logical_active)
+        (guard.active_child.is_some(), guard.logical_active)
     }).await;
-    eprintln!("F2 cleanup: tick={tick_cleanup:?}, stopped={stopped:?}, ticket={ticket:?}, reported={reported:?}, idle={idle:?}, shutdown={shutdown:?}, joined={joined:?}, retired={retired:?}");
+    eprintln!("F2 cleanup: tick={tick_cleanup:?}, stopped={stopped:?}, idle={idle:?}, shutdown={shutdown:?}, joined={joined:?}, retired={retired:?}");
     assert!(tick_cleanup.is_ok());
     assert!(stopped.is_ok());
-    assert!(ticket.is_ok());
-    assert!(matches!(reported, None | Some(Ok(Ok(_)))));
     assert!(matches!(idle, Ok(Ok(()))));
     assert!(shutdown.is_ok());
     assert!(matches!(joined, Ok(Ok(()))));
-    assert!(matches!(retired, Ok((false, false, false))));
+    assert!(matches!(retired, Ok((false, false))));
 }
 
 async fn watermark_owner_real_publication_qualifies_prepared_selection(evidence_change: bool) {
@@ -1359,8 +1339,6 @@ async fn compute_owner_real_writer_evidence_change_keeps_prepared_query_view() {
     watermark_owner_real_publication_qualifies_prepared_selection(true).await;
 }
 
-
-
 // DRAFT ONLY: append inside the existing explore_runtime::tests inclusion via
 // explore_compute_surface_tests.rs. Reuses the real Writer, wire codec, cache,
 // compute owner, after_prepare gate and existing Stop/ZEROED/shutdown cleanup.
@@ -1526,8 +1504,6 @@ async fn compute_owner_repeated_writer_evidence_keeps_query_equivalent_selection
     if let Err(panic) = exercise { std::panic::resume_unwind(panic); }
     if let Err(panic) = cleanup { std::panic::resume_unwind(panic); }
 }
-
-
 
 // These controls first prove a truthful Writer raw-only transition qualifies,
 // then independently revoke the prepared result through an unchanged safety gate.

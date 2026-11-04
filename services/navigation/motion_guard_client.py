@@ -20,7 +20,6 @@ from services.navigation.motion_safety_guard.constants import (
     MAX_FRAME_BYTES,
     MAX_PRODUCTION_SDK_TIMEOUT_SECONDS,
     RENEW_INTERVAL_NS,
-    WATCHDOG_FENCE_LEAD_NS,
 )
 from services.navigation.motion_safety_guard.framing import (
     FramingError,
@@ -214,7 +213,6 @@ class ReadinessStatus:
     result: GuardResultSnapshot
     ready: bool
     actuator_configured: bool
-    startup_zero_confirmed: bool
     reason: str
     boot_nonce: bytes
     motion_stop_generation: int
@@ -238,10 +236,6 @@ class GuardState:
 class ZeroConfirmation:
     zero_ack_id: str
     applied_monotonic_ns: int
-    stationary_confirmed: bool = False
-    confirmation_kind: str = ""
-    feedback_source_timestamp_ns: int = 0
-    stationary_deadline_monotonic_ns: int = 0
 
 
 @dataclass(frozen=True)
@@ -614,7 +608,7 @@ class MotionGuardClient:
             get_readiness=pb.GetReadinessRequest(source=normalize_source(source)))
         outcome, result = self._exchange(request, expected_outcome="get_readiness")
         return ReadinessStatus(result=result, ready=outcome.ready, actuator_configured=outcome.actuator_configured,
-            startup_zero_confirmed=outcome.startup_zero_confirmed, reason=outcome.reason,
+            reason=outcome.reason,
             boot_nonce=bytes(outcome.boot_nonce), motion_stop_generation=outcome.motion_stop_generation)
 
     def get_guard_state(self, source: Union[int, str]) -> GuardState:
@@ -736,19 +730,36 @@ class MotionGuardClient:
 
     session = acquire_session
 
-    def stop_all_motion(self, reason: str, *, operation_id: Optional[str] = None) -> StopAllMotionConfirmation:
-        operation = self._operation_id_value(operation_id, "stop-all-motion")
+    def advance_motion_generation(self, source: Union[int, str]) -> MotionAdmissionProof:
         request = pb.MotionGuardRequest(api_version=API_VERSION, request_id=self._new_id("request"),
-            stop_all_motion=pb.StopAllMotionRequest(envelope=self._new_global_stop_envelope(operation),
-                reason=self._require_text(reason, "reason")))
+            advance_motion_generation=pb.AdvanceMotionGenerationRequest(source=normalize_source(source)))
+        outcome, _result = self._exchange(request, expected_outcome="advance_motion_generation")
+        return MotionAdmissionProof(boot_nonce=bytes(outcome.boot_nonce), motion_stop_generation=outcome.motion_stop_generation)
+
+    def apply_robot_setting(self, source: Union[int, str], *, speed_level=None, obstacle_policy=None) -> CommandConfirmation:
+        body = pb.ApplyRobotSettingRequest(source=normalize_source(source))
+        if speed_level is not None:
+            body.speed_level.CopyFrom(pb.SpeedLevelCommand(level=speed_level))
+        else:
+            body.obstacle_policy.CopyFrom(pb.ObstaclePolicyCommand(enabled=obstacle_policy))
+        request = pb.MotionGuardRequest(api_version=API_VERSION, request_id=self._new_id("request"), apply_robot_setting=body)
+        _outcome, result = self._exchange(request, expected_outcome="apply_robot_setting")
+        return CommandConfirmation(operation_id=request.request_id, result=result, applied_monotonic_ns=0)
+
+    def stop_all_motion(self, reason: str, *, operation_id: Optional[str] = None,
+                        expected_motion_stop_generation: Optional[int] = None) -> Optional[StopAllMotionConfirmation]:
+        operation = self._operation_id_value(operation_id, "stop-all-motion")
+        body = pb.StopAllMotionRequest(envelope=self._new_global_stop_envelope(operation),
+            reason=self._require_text(reason, "reason"))
+        if expected_motion_stop_generation is not None:
+            body.expected_motion_stop_generation = expected_motion_stop_generation
+        request = pb.MotionGuardRequest(api_version=API_VERSION, request_id=self._new_id("request"), stop_all_motion=body)
         outcome, result = self._exchange(request, expected_outcome="stop_all_motion")
+        if not outcome.HasField("zero_ack"):
+            return None
         return StopAllMotionConfirmation(operation_id=operation, result=result,
-            zero=self._zero_confirmation(self._require_message(outcome, "zero_ack"), operation_id=operation,
-                source=pb.GUARD_SOURCE_GATEWAY_MANUAL, namespace=pb.OPERATION_NAMESPACE_GLOBAL_STOP),
+            zero=self._parse_zero_confirmation(outcome.zero_ack),
             lease_revoked=outcome.lease_revoked, motion_stop_generation=outcome.motion_stop_generation)
-
-
-
 
     def _operation_id_value(self, value: Optional[str], label: str) -> str:
         if value is None:
@@ -767,34 +778,7 @@ class MotionGuardClient:
         return ZeroConfirmation(
             zero_ack_id=zero_ack.zero_ack_id,
             applied_monotonic_ns=zero_ack.applied_monotonic_ns,
-            stationary_confirmed=zero_ack.stationary_confirmed,
-            confirmation_kind=zero_ack.confirmation_kind,
-            feedback_source_timestamp_ns=zero_ack.feedback_source_timestamp_ns,
-            stationary_deadline_monotonic_ns=zero_ack.stationary_deadline_monotonic_ns,
         )
-
-    def _zero_confirmation(self, zero_ack: pb.ZeroAck, *, operation_id: str,
-                           source: int, namespace: int = pb.OPERATION_NAMESPACE_LEASE) -> ZeroConfirmation:
-        return self.wait_for_stationary(source, operation_id, self._parse_zero_confirmation(zero_ack), operation_namespace=namespace)
-
-    def wait_for_stationary(self, source: int, operation_id: str, zero: ZeroConfirmation,
-                            *, operation_namespace: int = pb.OPERATION_NAMESPACE_LEASE) -> ZeroConfirmation:
-        """等待原停止操作的物理终态；恢复丢失回执时也复用原账本。"""
-        namespace = operation_namespace
-        if zero.stationary_deadline_monotonic_ns:
-            deadline = zero.stationary_deadline_monotonic_ns
-            while self._now() <= deadline:
-                status = self.get_operation_result(source, operation_id, operation_namespace=namespace)
-                observed = status.zero
-                if not status.resolved or observed is None:
-                    raise MotionGuardError("原停止操作的停稳证明已不可用")
-                if observed.stationary_confirmed:
-                    return observed
-                if observed.confirmation_kind == "unconfirmed":
-                    raise MotionGuardError("执行器在保证制动期限内未确认停稳")
-                time.sleep(0.01)
-            raise MotionGuardError("等待执行器实际停稳超时，运动资源继续由守卫隔离")
-        return zero
 
 
 class MotionGuardSession:
@@ -882,7 +866,7 @@ class MotionGuardSession:
 
     def _schedule_next_renewal(self, owner_deadline_ns: int, issued_ns: int) -> None:
         # 围栏开始前预留一次既有SDK最坏占用和守卫调度周期；不延长服务端期限。
-        latest_safe_renewal = owner_deadline_ns - WATCHDOG_FENCE_LEAD_NS - _RENEW_EXECUTION_RESERVE_NS
+        latest_safe_renewal = owner_deadline_ns - _RENEW_EXECUTION_RESERVE_NS
         requested_renewal = issued_ns + int(self.renew_interval_seconds * 1_000_000_000)
         self._next_renewal_ns = min(requested_renewal, latest_safe_renewal)
 
@@ -967,7 +951,7 @@ class MotionGuardSession:
                 raise
             zero = None
             if action == pb.GUARD_ACTION_STOP:
-                zero = self._client._zero_confirmation(self._client._require_message(outcome, "zero_ack"), operation_id=envelope.operation_id, source=self.source)
+                zero = self._client._parse_zero_confirmation(self._client._require_message(outcome, "zero_ack"))
             return CommandConfirmation(
                 operation_id=operation,
                 result=result,
@@ -1024,40 +1008,6 @@ class MotionGuardSession:
 
     body_pose = set_body_pose
 
-    def set_speed_level(
-        self,
-        level: int,
-        *,
-        operation_id: Optional[str] = None,
-    ) -> CommandConfirmation:
-        if isinstance(level, bool) or not isinstance(level, int) or not 1 <= level <= 3:
-            raise MotionGuardUsageError("speed level must be an integer in [1, 3]")
-        return self._submit_motion(
-            action=pb.GUARD_ACTION_SPEED_LEVEL,
-            field="speed_level",
-            command=pb.SpeedLevelCommand(level=level),
-            operation_id=operation_id,
-        )
-
-    speed_level = set_speed_level
-
-    def set_obstacle_policy(
-        self,
-        enabled: bool,
-        *,
-        operation_id: Optional[str] = None,
-    ) -> CommandConfirmation:
-        if not isinstance(enabled, bool):
-            raise MotionGuardUsageError("obstacle policy enabled must be a boolean")
-        return self._submit_motion(
-            action=pb.GUARD_ACTION_OBSTACLE_POLICY,
-            field="obstacle_policy",
-            command=pb.ObstaclePolicyCommand(enabled=enabled),
-            operation_id=operation_id,
-        )
-
-    obstacle_policy = set_obstacle_policy
-
     def execute_sport(
         self,
         action: int,
@@ -1101,7 +1051,7 @@ class MotionGuardSession:
                 self._failure = exc
                 raise
             zero = (
-                self._client._zero_confirmation(self._client._require_message(outcome, "zero_ack"), operation_id=envelope.operation_id, source=self.source)
+                self._client._parse_zero_confirmation(self._client._require_message(outcome, "zero_ack"))
                 if action == pb.SPORT_ACTION_STOP_MOVE
                 else None
             )
@@ -1149,7 +1099,7 @@ class MotionGuardSession:
                     request,
                     expected_outcome="revoke_zero_and_switch_mode",
                 )
-                zero = self._client._zero_confirmation(self._client._require_message(outcome, "zero_ack"), operation_id=envelope.operation_id, source=self.source)
+                zero = self._client._parse_zero_confirmation(self._client._require_message(outcome, "zero_ack"))
             except MotionGuardError as exc:
                 self._failure = exc
                 raise MotionGuardFenceError(
@@ -1170,10 +1120,10 @@ class MotionGuardSession:
         self,
         *,
         operation_id: Optional[str] = None,
-    ) -> ZeroConfirmation:
+    ) -> Optional[ZeroConfirmation]:
         self._stop_and_join_renewal()
         with self._lock:
-            if self._fenced and self._zero is not None:
+            if self._fenced:
                 return self._zero
             if self._fence_error is not None:
                 raise self._fence_error
@@ -1197,7 +1147,10 @@ class MotionGuardSession:
                     request,
                     expected_outcome="revoke_and_zero",
                 )
-                zero = self._client._zero_confirmation(self._client._require_message(outcome, "zero_ack"), operation_id=envelope.operation_id, source=self.source)
+                zero = self._client._parse_zero_confirmation(self._client._require_message(outcome, "zero_ack"))
+            except OutcomeUnknownError:
+                self._mark_fenced(None)
+                return None
             except MotionGuardError as exc:
                 self._active = False
                 fence_error = MotionGuardFenceError(
@@ -1220,7 +1173,14 @@ class MotionGuardSession:
                 raise error from prior_failure
             return zero
 
-    def close(self) -> ZeroConfirmation:
+    def abandon(self) -> None:
+        """被接管后停续租并注销会话。"""
+        self._stop_and_join_renewal()
+        with self._lock:
+            self._active = False
+            self._unregister()
+
+    def close(self) -> Optional[ZeroConfirmation]:
         return self.revoke_and_zero()
 
     def _stop_and_join_renewal(self) -> None:
@@ -1242,7 +1202,7 @@ class MotionGuardSession:
             self._fence_error = fence_error
             raise fence_error from error
 
-    def _mark_fenced(self, zero: ZeroConfirmation) -> None:
+    def _mark_fenced(self, zero: Optional[ZeroConfirmation]) -> None:
         self._zero = zero
         self._fenced = True
         self._active = False

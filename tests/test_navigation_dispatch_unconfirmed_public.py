@@ -19,7 +19,7 @@ from core import StateStore
 from core.errors import GatewayError
 from core.event_bus import EventBus
 from core.resource_lock import ResourceLockManager
-from core.task_manager import TaskManager, TaskSafetyBarrierError
+from core.task_manager import TaskManager
 from gateways.agent.feedback import build_receipt, checked_json
 from gateways.feedback import build_mcp_tool_result, build_public_error_payload
 from gateways.http.api import _navigation_state_payload
@@ -172,7 +172,7 @@ class PublicUnconfirmedTests(unittest.TestCase):
     def submit(self, runtime):
         return runtime._submit_navigation_task(capability_name="navigate_to_pose",
             goal=NavigationGoal(goal_id=IDENTITY["goal_id"], target_name="fixture"),
-            motion_admission=object(), poll_interval_sec=.02, timeout_sec=2, requested_by="test")
+            motion_admission=MotionAdmission("test", "navigate_to_pose", b"x" * 16, 4), poll_interval_sec=.02, timeout_sec=2, requested_by="test")
 
     def test_typed_unknown_preserves_dispatch_and_real_finally_exact_cancel(self):
         runtime, manager, locks, error = self.task_gateway()
@@ -186,16 +186,16 @@ class PublicUnconfirmedTests(unittest.TestCase):
         self.assertEqual(runtime.navigation_service.cancel_goal.call_args.kwargs["request_id"], IDENTITY["goal_id"])
         self.assertEqual(locks.held_resources(task.task_id), ())
 
-    def test_typed_unknown_missing_zero_fails_without_inventing_confirmation(self):
-        runtime, manager, locks, _ = self.task_gateway(stopped=False)
-        with patch("gateways.runtime._EXPLORATION_STOP_BARRIER_TIMEOUT_SEC", 0):
-            task = self.submit(runtime)
-            with self.assertRaises(TaskSafetyBarrierError):
-                manager.wait_for_task(task.task_id, timeout=2)
-        self.assertEqual(manager.get_task_error_payload(task.task_id)["code"], "parking_unconfirmed")
+    def test_typed_unknown_cancels_once_without_zero_receipt_and_keeps_original_failure(self):
+        runtime, manager, locks, error = self.task_gateway(stopped=False)
+        task = self.submit(runtime)
+        with self.assertRaises(GatewayError) as raised:
+            manager.wait_for_task(task.task_id, timeout=2)
+        self.assertEqual(raised.exception.error_code, error.error_code)
         self.assertEqual(locks.held_resources(task.task_id), ())
         runtime.navigation_service.set_goal.assert_called_once()
         runtime.navigation_service.cancel_goal.assert_called_once()
+
 
     def test_definite_rejection_does_not_gain_uncertain_responsibility(self):
         runtime, manager, _, _ = self.task_gateway()
@@ -227,31 +227,17 @@ class PublicUnconfirmedTests(unittest.TestCase):
         runtime.navigation_service.set_goal.assert_called_once()
         runtime.navigation_service.cancel_goal.assert_not_called()
 
-    def test_unknown_is_cancel_intermediate_until_exact_zero(self):
+    def test_cancel_returns_first_response_without_waiting_for_zero(self):
         runtime = self.gateway()
-        pending, terminal = navigation(), navigation(NavigationStatus.CANCELLED, proof=True)
-        self.enterContext(patch.object(runtime, "navigation_service", NS(refresh_navigation=Mock(side_effect=[pending, terminal]),
-                                         cancel_goal=Mock(return_value=pending), get_latest_navigation_context=Mock(return_value=None), get_navigation_control_context=Mock(side_effect=[pending, terminal]))))
-        task_context = NS(update=Mock(), acknowledge_interrupt_barrier=Mock())
-        with patch("gateways.runtime.time.sleep", return_value=None):
-            result = runtime._cancel_navigation_and_wait_terminal(task_context,
-                goal_id=IDENTITY["goal_id"], poll_interval_sec=.02)
-        self.assertIs(result, terminal)
-        task_context.acknowledge_interrupt_barrier.assert_called_once()
-        self.assertEqual(task_context.acknowledge_interrupt_barrier.call_args.args[0]["zero_ack_id"], "zero-exact")
+        pending = navigation()
+        service = NS(cancel_goal=Mock(return_value=pending), get_navigation_control_context=Mock(), refresh_navigation=Mock())
+        self.enterContext(patch.object(runtime, "navigation_service", service))
+        result = runtime._cancel_navigation(NS(is_superseded=lambda: False), goal_id=IDENTITY["goal_id"])
+        self.assertIs(result, pending)
+        service.cancel_goal.assert_called_once_with(request_id=IDENTITY["goal_id"])
+        service.get_navigation_control_context.assert_not_called()
+        service.refresh_navigation.assert_not_called()
 
-    def test_ordinary_failed_or_cancelled_without_zero_does_not_relax_barrier(self):
-        for status in (NavigationStatus.FAILED, NavigationStatus.CANCELLED):
-            with self.subTest(status=status):
-                runtime = self.gateway()
-                unproven = navigation(status)
-                unproven.navigation_state.metadata.pop("dispatch_obligation")
-                unproven.navigation_state.metadata["ownership_retained"] = False
-                self.enterContext(patch.object(runtime, "navigation_service", NS(refresh_navigation=Mock(return_value=unproven),
-                                                 cancel_goal=Mock(return_value=unproven), get_latest_navigation_context=Mock(return_value=None), get_navigation_control_context=Mock(return_value=unproven))))
-                result = runtime._cancel_navigation_and_wait_terminal(NS(update=Mock(), acknowledge_interrupt_barrier=Mock()),
-                    goal_id=IDENTITY["goal_id"], poll_interval_sec=.02)
-                self.assertIs(result, unproven)
 
     def test_unknown_public_cancel_reports_pending_not_completed(self):
         runtime = self.gateway()
@@ -388,14 +374,14 @@ class PublicUnconfirmedTests(unittest.TestCase):
             candidate_diagnostics=[dict(record_id=c.record_id, allowed_for_navigation=True) for c in candidates])
         rejected, lifecycle = set(), []
         def invoke():
-            return runtime._run_target_navigation_candidates(task_context=NS(update=Mock(), ensure_active=Mock()),
-                capability_name="navigate_to_named_location", motion_admission=object(), map_name="map", query="fixture",
+            return runtime._run_target_navigation_candidates(task_context=NS(update=Mock(), ensure_active=Mock(), is_superseded=lambda: False),
+                capability_name="navigate_to_named_location", motion_admission=MotionAdmission("test", "navigate_to_pose", b"x" * 16, 4), map_name="map", query="fixture",
                 camera_id=None, requested_by="test", poll_interval_sec=.02, verify_similarity_threshold=.5,
                 search_state=search, rejected_record_ids=rejected, allow_not_found=True,
                 navigation_state_callback=lifecycle.append)
         return runtime, invoke, error, rejected, lifecycle
 
-    def test_memory_unknown_parks_then_rethrows_without_second_goal_or_unreachable_budget(self):
+    def test_memory_unknown_cancels_once_then_rethrows_without_second_goal_or_unreachable_budget(self):
         runtime, invoke, error, rejected, lifecycle = self.candidates()
         with self.assertRaises(GatewayError) as raised:
             invoke()

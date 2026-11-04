@@ -409,67 +409,8 @@ async fn release_child_without_motion(handle: &ExploreRuntimeHandle) -> bool {
 }
 
 async fn finish_cancel_and_check_stale_proofs(handle: &ExploreRuntimeHandle) {
-    let snapshot = handle.snapshot();
-    if snapshot.status != STATUS_STOPPING {
-        assert!(snapshot.child_task_id.is_empty());
-        return;
-    }
-    let (lease, cancel_generation) = {
-        let guard = handle.inner.lock().await;
-        (
-            guard.active_child.as_ref().unwrap().lease.clone(),
-            guard
-                .pending_child_cancellation
-                .as_ref()
-                .unwrap()
-                .ticket
-                .as_ref()
-                .unwrap()
-                .cancel_generation,
-        )
-    };
-    assert!(
-        handle.blocks_mapping_mutation().await,
-        "STOPPING acknowledgement is not a ZEROED terminal"
-    );
-    assert!(handle
-        .report_navigation_result(
-            &lease.session_id,
-            ChildNavigationResult::Reached(terminal_proof(&lease))
-        )
-        .await
-        .is_err());
-    let mut stale = lease.clone();
-    stale.goal_generation += 1;
-    assert!(handle
-        .report_navigation_result(
-            &lease.session_id,
-            ChildNavigationResult::Cancelled(zero_proof(&stale, cancel_generation))
-        )
-        .await
-        .is_err());
-    assert!(handle
-        .report_navigation_result(
-            &lease.session_id,
-            ChildNavigationResult::Cancelled(zero_proof(&lease, cancel_generation + 1))
-        )
-        .await
-        .is_err());
-    assert_eq!(handle.snapshot().status, STATUS_STOPPING);
-    let began = Instant::now();
-    let terminal = handle
-        .report_navigation_result(
-            &lease.session_id,
-            ChildNavigationResult::Cancelled(zero_proof(&lease, cancel_generation)),
-        )
-        .await
-        .unwrap();
-    eprintln!(
-        "EXPLORE_ATTRIBUTION {}",
-        serde_json::json!({"kind":"injected_matching_zero_terminal","proof_handling_ms":ms(began.elapsed()),"status":terminal.status,
-        "physical_zero_latency_measured":false})
-    );
-    assert!(terminal.child_task_id.is_empty());
+    assert!(handle.snapshot().child_task_id.is_empty());
+    assert!(handle.inner.lock().await.active_child.is_none());
     assert!(!handle.blocks_mapping_mutation().await);
 }
 
@@ -601,7 +542,7 @@ async fn run_matrix_case(fixture: Fixture, return_budget: bool) {
         );
     }
     let stop = handle.stop(&label).await;
-    assert!(matches!(stop.status, STATUS_STOPPING | STATUS_CANCELLED));
+    assert_eq!(stop.status, STATUS_CANCELLED);
     finish_cancel_and_check_stale_proofs(&handle).await;
     pose.release();
     settle_attribution_scheduler(&scheduler, &label).await;

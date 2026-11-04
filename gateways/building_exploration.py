@@ -123,36 +123,22 @@ class GatewayBuildingExplorationPorts:
                 return receipt
             time.sleep(0.1)
 
-    def stop_child(self,state):
-        spec=self._find_task(state.child_task_id)
+    def stop_child(self, state) -> None:
+        spec = self._find_task(state.child_task_id)
         if spec is not None:
-            self.runtime.task_manager.cancel_task(spec.task_id,"逐层探索父任务停止")
-            deadline=time.monotonic()+15
-            while time.monotonic()<deadline:
-                status=self.runtime.task_manager.get_task_status(spec.task_id)
-                if status.state.value in {"succeeded","failed","cancelled","timeout"}:break
-                time.sleep(0.05)
-            else:raise GatewayError("逐层探索子任务仍未完成停止。",error_code="building_child_stop_pending")
-            if status.state.value=="succeeded":state.child_succeeded=True
-            error=self.runtime.task_manager.get_task_error_payload(spec.task_id) or {}
-            details=error.get("details") or {}
-            if details.get("backend_not_started") is True and details.get("request_id")==state.child_request_id:
-                return {"request_id":state.child_request_id,"backend_not_started":True}
-            events=self.runtime.task_manager.get_task_events(spec.task_id)
-            for event in reversed(events):
-                proof=event.payload.get("interrupt_barrier_proof") or event.payload.get("completion_proof")
-                if proof:return {"child_task_id":spec.task_id,**dict(proof)}
-        if state.child_kind=="explore" and state.child_request_id:
-            self.runtime._stop_exploration_with_safety_barrier(self.context,request_id=state.child_request_id,poll_interval_sec=0.05,acknowledge_interrupt=False)
-            return {"request_id":state.child_request_id,"exploration_terminal":True}
-        if state.child_kind=="transfer":
+            self.runtime.task_manager.cancel_task(spec.task_id, "逐层探索父任务停止", superseded=self.context.is_superseded())
+            if self.runtime.task_manager.get_task_status(spec.task_id).state.value == "succeeded":
+                state.child_succeeded = True
+            return
+        if self.context.is_superseded():
+            return
+        if state.child_kind == "explore" and state.child_request_id:
+            self.runtime.navigation_service.stop_exploration(request_id=state.child_request_id)
+        elif state.child_kind == "transfer":
             from gateways.building_navigation import GatewayBuildingPorts
-            ports=GatewayBuildingPorts(self.runtime,self.context,self.admission,requested_by=self.requested_by)
-            journal=self.runtime._get_building_navigation_service().journal.load()
-            if journal is not None and journal.request.request_id==state.child_request_id and journal.last_zero_proof.get("zeroed") is True:
-                return dict(journal.last_zero_proof)
-            return ports.stop_navigation(journal.navigation_goal_id if journal is not None else None)
-        return {"backend_not_started":True}
+            ports = GatewayBuildingPorts(self.runtime, self.context, self.admission, requested_by=self.requested_by)
+            journal = self.runtime._get_building_navigation_service().journal.load()
+            ports.stop_navigation(journal.navigation_goal_id if journal is not None else None)
 
     def checkpoint(self,floor,state):
         if state.child_succeeded:
@@ -173,6 +159,3 @@ class GatewayBuildingExplorationPorts:
             if bundle is not None:return bundle.asset_identity
         asset=self.runtime._get_building_catalog().maps.get_map_asset(floor.map_name)
         return asset.asset_identity if asset is not None and asset.finalized and asset.identity_schema_version==2 else None
-
-    def interrupt_barrier(self,proof):
-        if self.context.is_cancel_requested() or self.context.is_timed_out():self.context.acknowledge_interrupt_barrier(dict(proof))

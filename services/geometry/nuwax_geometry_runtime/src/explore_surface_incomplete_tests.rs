@@ -24,16 +24,16 @@ async fn surface_map_missing_real_object_keeps_installed_source_and_child() {
         let next = input.publish_partial().await.unwrap();
         input.wait_finished(next.cloud_revision).await.unwrap();
         // Capture BEFORE shutdown: shutdown correctly clears this input itself.
-        let (ready, current, identity, receipt, logical_active, generation, lease, pending, input_error) = {
+        let (ready, current, identity, receipt, logical_active, generation, lease, input_error) = {
             let guard = handle.inner.lock().await;
             let mode = guard.surface_mode.as_ref().unwrap();
             (mode.input_ready, mode.receiver.snapshot().unwrap(), guard.committed_map.clone(),
              guard.costmap_received_monotonic_ns, guard.logical_active, guard.generation,
              guard.active_child.as_ref().map(|child| child.lease.clone()),
-             guard.pending_child_cancellation.as_ref().and_then(|p| p.ticket.clone()), mode.input_error.clone())
+             mode.input_error.clone())
         };
         let cancelled = sink.cancelled.lock().unwrap().clone();
-        eprintln!("F1 actual-entry observation: ready={ready}, same_source={}, identity={identity:?}, receipt={receipt}/{old_receipt}, active={logical_active}, generation={generation}/{old_generation}, old_lease={old_lease:?}, lease={lease:?}, pending={pending:?}, cancelled={cancelled:?}, input_error={input_error:?}",
+        eprintln!("F1 actual-entry observation: ready={ready}, same_source={}, identity={identity:?}, receipt={receipt}/{old_receipt}, active={logical_active}, generation={generation}/{old_generation}, old_lease={old_lease:?}, lease={lease:?}, cancelled={cancelled:?}, input_error={input_error:?}",
             current.as_ref().is_some_and(|source| Arc::ptr_eq(source, &old_source)));
         // These are the intended contract assertions; current code fails here.
         assert!(ready, "real missing-object RPC revoked the complete source: {input_error:?}");
@@ -43,7 +43,6 @@ async fn surface_map_missing_real_object_keeps_installed_source_and_child() {
         assert!(logical_active);
         assert_eq!(generation, old_generation);
         assert_eq!(lease.as_ref(), Some(&old_lease));
-        assert!(pending.is_none());
         assert!(cancelled.is_empty());
     }).catch_unwind().await;
     f1_finish_all_owners(&mut input, &handle, "f1-real-incomplete").await;
@@ -52,29 +51,17 @@ async fn surface_map_missing_real_object_keeps_installed_source_and_child() {
 
 async fn f1_finish_all_owners(
     input: &mut crate::lcm_runtime::mapping_feed_tests::F1RealEntryFixture,
-    handle: &ExploreRuntimeHandle,
-    parent: &str,
+    handle: &ExploreRuntimeHandle, parent: &str,
 ) {
     let geometry = input.shutdown().await;
     let stop = scheme_a_race_wait("F1 Stop", handle.stop(parent)).await;
-    let cancel = scheme_a_race_wait("F1 cancellation ticket", async {
-        handle.inner.lock().await.pending_child_cancellation.as_ref().and_then(|p| p.ticket.clone())
-    }).await;
-    let report = match cancel.as_ref().ok().and_then(|ticket| ticket.as_ref()) {
-        Some(ticket) => Some(scheme_a_race_wait("F1 exact ZEROED", handle.report_navigation_result(
-            &ticket.lease.session_id,
-            ChildNavigationResult::Cancelled(zero_proof(&ticket.lease, ticket.cancel_generation)),
-        )).await),
-        None => None,
-    };
     let idle = tokio::time::timeout(Duration::from_secs(8), handle.await_compute_idle()).await;
     let shutdown = scheme_a_race_wait("F1 compute shutdown", handle.request_compute_shutdown()).await;
     let joined = tokio::time::timeout(Duration::from_secs(8), handle.compute_service.join()).await;
-    eprintln!("F1 all-owner cleanup: geometry={geometry:?}, stop={stop:?}, cancel={cancel:?}, report={report:?}, idle={idle:?}, shutdown={shutdown:?}, joined={joined:?}");
-    assert!(geometry.is_ok()); assert!(stop.is_ok()); assert!(cancel.is_ok());
-    assert!(matches!(report, None | Some(Ok(Ok(_)))));
+    assert!(geometry.is_ok()); assert!(stop.is_ok());
     assert!(matches!(idle, Ok(Ok(())))); assert!(shutdown.is_ok());
     assert!(matches!(joined, Ok(Ok(()))));
+    assert!(handle.inner.lock().await.active_child.is_none());
 }
 
 async fn f1_wait_latest(handle: &ExploreRuntimeHandle, expected: &schema::NavigationMap3D) {
@@ -123,7 +110,6 @@ async fn surface_incomplete_newer_inline_root_does_not_inherit_old_backoff() {
             assert_eq!(guard.committed_map.as_ref(), Some(&next.committed_map));
             assert!(guard.costmap_received_monotonic_ns >= old_receipt);
             assert!(guard.surface_mode.as_ref().unwrap().input_ready);
-            assert!(guard.pending_child_cancellation.is_none());
         }).catch_unwind().await;
         f1_finish_all_owners(&mut input, &handle, "f1-newer-inline").await;
         if let Err(panic) = result { std::panic::resume_unwind(panic); }
@@ -279,10 +265,7 @@ async fn surface_incomplete_changed_mask_and_real_receiver_invalid_still_stop_or
             assert!(mode.receiver.snapshot().unwrap().is_none());
             assert!(guard.committed_map.is_none());
             assert_eq!(guard.costmap_received_monotonic_ns, 0);
-            assert!(guard.active_child.as_ref().is_some_and(|child| child.lease == original_lease),
-                "original lease remains until correlated ZEROED, never replaced");
-            assert!(guard.pending_child_cancellation.as_ref().and_then(|pending| pending.ticket.as_ref())
-                .is_some_and(|ticket| ticket.lease == original_lease));
+            assert!(guard.active_child.is_none());
             assert_eq!(*sink.cancelled.lock().unwrap(), vec![original_lease.session_id]);
         }).catch_unwind().await;
         f1_finish_all_owners(&mut input, &handle, "f1-fatal-boundary").await;
@@ -419,7 +402,6 @@ async fn surface_incomplete_supplied_missing_object_bypasses_old_deadline() {
             assert_eq!(guard.surface_mode.as_ref().unwrap().installed_revision,
                 Some((complete.cloud_revision, complete.committed_map.revision)));
             assert!(guard.surface_mode.as_ref().unwrap().input_ready);
-            assert!(guard.pending_child_cancellation.is_none());
         }
         assert!(started < deadline,
             "complete successor inherited an already repaired dependency's delay");
@@ -495,10 +477,7 @@ async fn f1_guard_assert_original_child_revoked(
     assert!(mode.receiver.snapshot().unwrap().is_none());
     assert!(guard.committed_map.is_none());
     assert_eq!(guard.costmap_received_monotonic_ns, 0);
-    assert!(guard.active_child.as_ref().is_some_and(|child| &child.lease == lease),
-        "the original lease remains owned until its correlated ZEROED proof");
-    assert!(guard.pending_child_cancellation.as_ref().and_then(|pending| pending.ticket.as_ref())
-        .is_some_and(|ticket| &ticket.lease == lease));
+    assert!(guard.active_child.is_none());
     assert_eq!(*sink.cancelled.lock().unwrap(), vec![lease.session_id.clone()]);
 }
 
@@ -689,7 +668,6 @@ async fn f1_guard_backoff_revocation(changed_mask: bool) {
             assert_eq!(guard.committed_map, identity);
             assert_eq!(mode.installed_revision, installed_revision);
             assert!(guard.active_child.as_ref().is_some_and(|child| child.lease == lease));
-            assert!(guard.pending_child_cancellation.is_none());
             assert!(sink.cancelled.lock().unwrap().is_empty());
             if let Some(other) = other_source.as_ref() {
                 // Actual receiver Arc replacement, not merely asking the defer

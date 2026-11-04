@@ -294,14 +294,8 @@ async fn compute_owner_accepted_feedback_survives_stop_and_zeroed_with_duplicate
         owner_watchdog(handle.stop("owner-feedback-stop"))
             .await
             .status,
-        STATUS_STOPPING
+        STATUS_CANCELLED
     );
-    owner_watchdog(handle.report_navigation_result(
-        &active.child_task_id,
-        ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
-    ))
-    .await
-    .unwrap();
     assert!(handle.inner.lock().await.active_child.is_none());
     gate.release();
     owner_watchdog(first).await.unwrap().unwrap();
@@ -611,19 +605,8 @@ async fn wait_owner_runtime_state(
 }
 
 async fn stop_owner_runtime_child(handle: &ExploreRuntimeHandle, request_id: &str) {
-    let child = handle.snapshot().child_task_id;
-    let lease = active_child_lease(handle).await;
-    assert_eq!(
-        owner_watchdog(handle.stop(request_id)).await.status,
-        STATUS_STOPPING
-    );
-    // Fixture acknowledgement verifies protocol matching, not physical stopping.
-    owner_watchdog(handle.report_navigation_result(
-        &child,
-        ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
-    ))
-    .await
-    .unwrap();
+    assert_eq!(owner_watchdog(handle.stop(request_id)).await.status, STATUS_CANCELLED);
+    assert!(handle.snapshot().child_task_id.is_empty());
     owner_watchdog(handle.await_compute_idle()).await.unwrap();
 }
 
@@ -848,14 +831,8 @@ async fn compute_owner_aborted_feedback_caller_duplicate_stop_and_resume_keep_hi
         owner_watchdog(handle.stop("owner-feedback-aborted"))
             .await
             .status,
-        STATUS_STOPPING
+        STATUS_CANCELLED
     );
-    owner_watchdog(handle.report_navigation_result(
-        &active.child_task_id,
-        ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
-    ))
-    .await
-    .unwrap();
     assert!(handle.inner.lock().await.active_child.is_none());
     assert_eq!(handle.inner.lock().await.reached_goals, 0);
     assert!(audit.lock().unwrap().feedback.is_empty());
@@ -938,19 +915,13 @@ async fn compute_owner_aborted_feedback_caller_duplicate_stop_and_resume_keep_hi
     assert_eq!(fresh.child_task_id, "owner-feedback-resumed.nav.1");
     assert_eq!(sink.submitted.lock().unwrap().len(), 2);
     assert_eq!(audit.lock().unwrap().feedback.len(), 1);
-    let fresh_lease = active_child_lease(&handle).await;
     assert_eq!(
         owner_watchdog(handle.stop("owner-feedback-resumed"))
             .await
             .status,
-        STATUS_STOPPING
+        STATUS_CANCELLED
     );
-    owner_watchdog(handle.report_navigation_result(
-        &fresh.child_task_id,
-        ChildNavigationResult::Cancelled(zero_proof(&fresh_lease, 2)),
-    ))
-    .await
-    .unwrap();
+    assert_eq!(sink.cancelled.lock().unwrap().len(), 2);
     handle.request_compute_shutdown().await;
     owner_watchdog(handle.compute_service.join()).await.unwrap();
 }
@@ -1214,13 +1185,6 @@ async fn owner_runtime_active_homeward_fault_cancels_exact_child(
     *sink.cancel_release.lock().unwrap() = Some(cancel_release.clone());
     if cancel_fails {
         *sink.cancel_error.lock().unwrap() = Some("owner fault cancel dispatch failed".into());
-        *sink.cancel_recovery.lock().unwrap() = Some(ChildNavigationCancelRecovery {
-            ticket: ChildNavigationCancelTicket {
-                lease: lease.clone(),
-                cancel_generation: 37,
-            },
-            failure: Some("CANCEL_DISPATCH_FAILED".into()),
-        });
     }
     let tick = tokio::spawn({
         let handle = handle.clone();
@@ -1231,7 +1195,6 @@ async fn owner_runtime_active_homeward_fault_cancels_exact_child(
         let guard = handle.inner.lock().await;
         assert_eq!(guard.compute.status().unwrap().phase, Phase::Computing);
         assert!(guard.active_child.as_ref().unwrap().lease.matches(&lease));
-        assert!(guard.pending_child_cancellation.is_none());
     }
     assert_eq!(
         audit.lock().unwrap().prepares,
@@ -1249,14 +1212,7 @@ async fn owner_runtime_active_homeward_fault_cancels_exact_child(
         let guard = handle.inner.lock().await;
         assert!(!guard.logical_active);
         assert!(guard.compute.fault.is_some());
-        assert!(guard.active_child.as_ref().unwrap().lease.matches(&lease));
-        assert!(
-            guard
-                .pending_child_cancellation
-                .as_ref()
-                .unwrap()
-                .dispatch_in_flight
-        );
+        assert!(guard.active_child.is_none());
         if panic_driver {
             // Cancellation must start before the held native worker can drain.
             let status = guard.compute.status().unwrap();
@@ -1264,7 +1220,7 @@ async fn owner_runtime_active_homeward_fault_cancels_exact_child(
             assert_eq!(status.phase, Phase::Computing);
         }
     }
-    assert!(handle.blocks_mapping_mutation().await);
+    assert!(!handle.blocks_mapping_mutation().await);
     assert!(owner_watchdog(handle.report_navigation_result(
         &active.child_task_id,
         ChildNavigationResult::Reached(terminal_proof(&lease)),
@@ -1290,71 +1246,18 @@ async fn owner_runtime_active_homeward_fault_cancels_exact_child(
         *sink.cancelled.lock().unwrap(),
         vec![active.child_task_id.clone()]
     );
-    let cancel_generation = if cancel_fails { 37 } else { 1 };
     {
         let guard = handle.inner.lock().await;
-        if cancel_fails {
-            assert!(guard.pending_child_cancellation.is_none());
-            assert!(guard.active_child.is_none());
-            assert_eq!(handle.orphan_cancellations.retired_cancellation(&lease), Some(Some(cancel_generation)));
-        } else {
-            let pending = guard.pending_child_cancellation.as_ref().unwrap();
-            assert!(!pending.dispatch_in_flight);
-            assert_eq!(pending.ticket.as_ref().unwrap().cancel_generation, cancel_generation);
-            assert!(pending.ticket.as_ref().unwrap().lease.matches(&lease));
-            assert!(guard.active_child.as_ref().unwrap().lease.matches(&lease));
-        }
+        assert!(guard.active_child.is_none());
         let status = guard.compute.status().unwrap();
         assert_eq!(status.incarnation, incarnation);
         assert!(status.closed);
         assert_eq!(status.high_water.workers, 1);
     }
-    let retained = handle.snapshot();
-    assert_eq!(retained.child_task_id, if cancel_fails { String::new() } else { active.child_task_id.clone() });
-    assert_eq!(
-        retained.status,
-        if cancel_fails {
-            STATUS_FAILED
-        } else {
-            STATUS_STOPPING
-        }
-    );
-    if cancel_fails {
-        assert_eq!(retained.last_stop_reason, "child_cancel_failed");
-        assert!(retained.parking_pending);
-    }
-    assert!(handle.blocks_mapping_mutation().await);
-    assert!(owner_watchdog(handle.report_navigation_result(
-        &active.child_task_id,
-        ChildNavigationResult::Cancelled(zero_proof(&lease, cancel_generation + 1)),
-    ))
-    .await
-    .is_err());
-    assert_eq!(handle.snapshot().child_task_id, if cancel_fails { String::new() } else { active.child_task_id.clone() });
-    // This injected acknowledgement checks exact protocol ownership only. It
-    // does not establish that any actuator or physical robot actually stopped.
-    let released = owner_watchdog(handle.report_navigation_result(
-        &active.child_task_id,
-        ChildNavigationResult::Cancelled(zero_proof(&lease, cancel_generation)),
-    ))
-    .await
-    .unwrap();
+    let released = handle.snapshot();
     assert_eq!(released.status, STATUS_FAILED);
     assert!(released.child_task_id.is_empty());
-    assert!(handle.inner.lock().await.active_child.is_none());
-    assert!(handle
-        .inner
-        .lock()
-        .await
-        .pending_child_cancellation
-        .is_none());
     assert!(!handle.blocks_mapping_mutation().await);
-    if cancel_fails {
-        assert_eq!(released.last_stop_reason, "child_cancel_failed");
-        assert!(!released.parking_pending);
-    } else {
-        assert_eq!(released.last_stop_reason, "consecutive_failures_exceeded");
-    }
     {
         let audit = audit.lock().unwrap();
         assert_eq!(
@@ -1649,7 +1552,7 @@ async fn scheduler_observes_compute_failure_while_its_blocked_pose_loop_remains_
         .await;
     let active = owner_watchdog(handle.tick((2.0, 2.0))).await;
     assert_eq!(active.status, STATUS_ACTIVE, "{}", active.message);
-    let lease = active_child_lease(&handle).await;
+    let _lease = active_child_lease(&handle).await;
     let incarnation = handle
         .inner
         .lock()
@@ -1680,13 +1583,7 @@ async fn scheduler_observes_compute_failure_while_its_blocked_pose_loop_remains_
     owner_watchdog(pose_entered.notified()).await;
     handle.inner.lock().await.compute.panic_driver = true;
     handle.compute_service.wake.notify_one();
-    wait_owner_runtime_state(&handle, |guard| {
-        guard
-            .pending_child_cancellation
-            .as_ref()
-            .is_some_and(|pending| !pending.dispatch_in_flight && pending.ticket.is_some())
-    })
-    .await;
+    wait_owner_runtime_state(&handle, |guard| !guard.logical_active && guard.active_child.is_none()).await;
     let terminal = scheduler.wait_terminal();
     tokio::pin!(terminal);
     assert!(matches!(
@@ -1702,7 +1599,7 @@ async fn scheduler_observes_compute_failure_while_its_blocked_pose_loop_remains_
             !status.closed,
             "the original held native owner is still supervised"
         );
-        assert!(guard.active_child.as_ref().unwrap().lease.matches(&lease));
+        assert!(guard.active_child.is_none());
     }
     assert!(!scheduler.shutdown_is_requested());
     assert!(!scheduler.inner.worker_abort.is_finished());
@@ -1720,22 +1617,8 @@ async fn scheduler_observes_compute_failure_while_its_blocked_pose_loop_remains_
         *sink.cancelled.lock().unwrap(),
         vec![active.child_task_id.clone()]
     );
-    assert!(handle.blocks_mapping_mutation().await);
-    assert!(owner_watchdog(handle.report_navigation_result(
-        &active.child_task_id,
-        ChildNavigationResult::Cancelled(zero_proof(&lease, 2)),
-    ))
-    .await
-    .is_err());
-    // Software acknowledgement proves exact protocol reconciliation only.
-    let released = owner_watchdog(handle.report_navigation_result(
-        &active.child_task_id,
-        ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
-    ))
-    .await
-    .unwrap();
-    assert_eq!(released.status, STATUS_FAILED);
-    assert!(released.child_task_id.is_empty());
+    assert!(!handle.blocks_mapping_mutation().await);
+    assert!(handle.snapshot().child_task_id.is_empty());
     let settled = owner_watchdog(scheduler.shutdown_with_settlement()).await;
     assert!(
         settled.producers_settled(),
@@ -1789,14 +1672,7 @@ async fn owner_runtime_exhausted_control_keeps_exact_child(
         let guard = handle.inner.lock().await;
         assert!(!guard.logical_active);
         assert!(guard.compute.fault.is_some());
-        assert!(guard.active_child.as_ref().unwrap().lease.matches(&lease));
-        assert!(
-            guard
-                .pending_child_cancellation
-                .as_ref()
-                .unwrap()
-                .dispatch_in_flight
-        );
+        assert!(guard.active_child.is_none());
         if generation_exhausted {
             assert_eq!(guard.generation, u64::MAX);
             assert_eq!(handle.generation.load(Ordering::SeqCst), u64::MAX);
@@ -1815,7 +1691,7 @@ async fn owner_runtime_exhausted_control_keeps_exact_child(
             guard.compute.lifecycle_counter_for_tests(),
         )
     };
-    assert!(handle.blocks_mapping_mutation().await);
+    assert!(!handle.blocks_mapping_mutation().await);
     // Rejoin the retained terminal token while its exact cancellation is held.
     // No second counted action, generation allocation, or cancel is permitted.
     owner_watchdog(handle.inject_compute_control_stop_for_tests(false, false))
@@ -1854,13 +1730,7 @@ async fn owner_runtime_exhausted_control_keeps_exact_child(
     assert!(failure.contains(exhausted_name), "{failure}");
     {
         let guard = handle.inner.lock().await;
-        let pending = guard.pending_child_cancellation.as_ref().unwrap();
-        assert!(!pending.dispatch_in_flight);
-        assert!(pending.failure.is_none());
-        let ticket = pending.ticket.as_ref().unwrap();
-        assert!(ticket.lease.matches(&lease));
-        assert_eq!(ticket.cancel_generation, 1);
-        assert!(guard.active_child.as_ref().unwrap().lease.matches(&lease));
+        assert!(guard.active_child.is_none());
         let status = guard.compute.status().unwrap();
         assert_eq!(status.incarnation, incarnation);
         assert!(status.closed);
@@ -1887,21 +1757,11 @@ async fn owner_runtime_exhausted_control_keeps_exact_child(
     ))
     .await
     .is_err());
-    assert_eq!(handle.snapshot().child_task_id, active.child_task_id);
-    // This is a software protocol proof, not evidence of physical stopping.
-    let released = owner_watchdog(handle.report_navigation_result(
-        &active.child_task_id,
-        ChildNavigationResult::Cancelled(zero_proof(&lease, 1)),
-    ))
-    .await
-    .unwrap();
-    assert_eq!(released.status, STATUS_FAILED);
-    assert!(released.child_task_id.is_empty());
+    assert!(handle.snapshot().child_task_id.is_empty());
     assert!(!handle.blocks_mapping_mutation().await);
     {
         let guard = handle.inner.lock().await;
         assert!(guard.active_child.is_none());
-        assert!(guard.pending_child_cancellation.is_none());
         assert!(guard.compute.fault.is_some());
         if generation_exhausted {
             assert_eq!(guard.generation, u64::MAX);

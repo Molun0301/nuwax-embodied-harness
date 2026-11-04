@@ -4,6 +4,7 @@ from core.config_values import runtime_value
 
 from dataclasses import dataclass, replace
 import math
+import logging
 import os
 from pathlib import Path
 import queue
@@ -12,6 +13,8 @@ import struct
 import threading
 from typing import Any, Callable, Mapping, Optional, Tuple
 
+
+_LOGGER = logging.getLogger(__name__)
 
 PERSON_FOLLOW_TARGET_FINGERPRINT = bytes.fromhex("49b0abee638b1fdb")
 PERSON_FOLLOW_COMMAND_FINGERPRINT = bytes.fromhex("76ad78cfd90347e8")
@@ -752,7 +755,7 @@ class GatewayPersonFollowBridge:
             self._thread = None
             self._closing = False
         if close_error is not None:
-            raise PersonFollowBridgeError("PersonFollow bridge closed without a verified motion fence") from close_error
+            _LOGGER.error("跟随桥关闭失败：%s", close_error)
 
     def prepare_session(
         self,
@@ -945,8 +948,6 @@ class GatewayPersonFollowBridge:
         target: PersonFollowTarget,
         payload: bytes,
     ) -> _Preflight:
-        if self._binding is not None:
-            raise PersonFollowBridgeError("cannot prepare while a follow session is active")
         if self._preflight is not None:
             raise PersonFollowBridgeError("a PersonFollow preflight is already pending")
         while self._lcm.handle_timeout(0):
@@ -1011,8 +1012,6 @@ class GatewayPersonFollowBridge:
             raise PersonFollowBridgeError("session_id must be non-empty")
         if self._preflight is not None:
             raise PersonFollowBridgeError("cannot bind while preflight is pending")
-        if self._binding is not None:
-            raise PersonFollowBridgeError("another PersonFollow guard session is active")
         prepared = self._prepared
         if prepared is None or prepared.session_id != session_id:
             raise PersonFollowBridgeError("cannot bind before matching preflight succeeds")
@@ -1103,9 +1102,7 @@ class GatewayPersonFollowBridge:
         except BaseException as exc:
             fence_error = exc
         if fence_error is not None:
-            raise PersonFollowBridgeError(
-                "PersonFollow lifecycle ended without a verified motion fence"
-            ) from fence_error
+            _LOGGER.error("跟随会话停止失败：%s", fence_error)
         if publish_error is not None:
             raise PersonFollowBridgeError("PersonFollow lifecycle target could not be published") from publish_error
         self._session_error = None
@@ -1119,7 +1116,7 @@ class GatewayPersonFollowBridge:
         self._assert_session_healthy(session_id)
         binding = self._binding
         if binding is None or binding.session_id != session_id:
-            raise PersonFollowBridgeError("no matching PersonFollow guard session")
+            return
         self._fence_active(reason)
         self._session_error = None
 
@@ -1233,9 +1230,7 @@ class GatewayPersonFollowBridge:
         try:
             binding.fence_session(binding.session)
         except BaseException as fence_error:
-            combined = PersonFollowBridgeError("PersonFollow command failed and the motion fence was not acknowledged")
-            combined.__cause__ = fence_error
-            error = combined
+            _LOGGER.error("跟随会话停止失败：%s", fence_error)
         self._session_error = (binding.session_id, error)
 
     def _fence_active(self, _reason: str) -> None:

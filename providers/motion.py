@@ -30,6 +30,3 @@ class MotionExecutionFeedbackProvider(Protocol):
 @runtime_checkable
 class LocomotionModeControl(Protocol):
     """由原运动守卫在停车后调用的显式步态接口。"""
-
-    def set_locomotion_mode(self, mode_id: str) -> None:
-        """有界提交命名模式请求；不等待模式完成，完成由守卫核对实际反馈。"""

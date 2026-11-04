@@ -1,10 +1,5 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from services.navigation.motion_guard_client import StopAllMotionConfirmation
-
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -129,7 +124,6 @@ def _is_complete_exploration_terminal(
             ExplorationStatus.CANCELLED,
         }
         and metadata.get("exploration_terminal") is True
-        and metadata.get("parking_pending") is not True
         and not str(metadata.get("child_task_id") or "").strip()
         and metadata.get("child_lease") is None
     )
@@ -1450,7 +1444,7 @@ class NavigationService:
             ):
                 if self._current_goal is goal:
                     if ((submission and submission.get("reason_code") == "BUSY")
-                            or details.get("backend_code") == "GOAL_LEASE_BUSY"):
+                            or details.get("backend_code") == "GOAL_GENERATION_STALE"):
                         self._current_goal = previous_goal
                         # 拒绝候选目标不替换原拥有方；在途推送可能已推进原目标终态。
                         restored_context = self._latest_navigation_context or previous_context
@@ -1499,7 +1493,6 @@ class NavigationService:
         request_id: Optional[str] = None,
         *,
         deadline_monotonic: Optional[float] = None,
-        global_stop_confirmation: Optional[StopAllMotionConfirmation] = None,
     ) -> NavigationContext:
         """请求后端取消指定目标；未指定时由后端选择当前目标。"""
 
@@ -1510,8 +1503,6 @@ class NavigationService:
         cancel_options = {}
         if deadline_monotonic is not None:
             cancel_options["deadline_monotonic"] = deadline_monotonic
-        if global_stop_confirmation is not None:
-            cancel_options["global_stop_confirmation"] = global_stop_confirmation
         accepted = provider.cancel_goal(request_id=exact_goal_id, **cancel_options)
         if not accepted:
             raise GatewayError(
@@ -1939,8 +1930,6 @@ class NavigationService:
         request_id: Optional[str] = None,
         *,
         deadline_monotonic: Optional[float] = None,
-        global_stop_confirmation: Optional[StopAllMotionConfirmation] = None,
-        expected_exploration_generation: Optional[int] = None,
     ) -> ExplorationContext:
         """停止当前探索任务。"""
 
@@ -1956,10 +1945,6 @@ class NavigationService:
                 deadline_monotonic=deadline_monotonic,
             )
         stop_options = {}
-        if global_stop_confirmation is not None:
-            stop_options["global_stop_confirmation"] = global_stop_confirmation
-        if expected_exploration_generation is not None:
-            stop_options["expected_exploration_generation"] = expected_exploration_generation
         if correlated_request_id:
             try:
                 accepted = provider.stop_exploration(

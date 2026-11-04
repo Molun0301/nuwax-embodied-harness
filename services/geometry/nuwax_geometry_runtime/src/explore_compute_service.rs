@@ -26,7 +26,6 @@ struct WeakRuntimeContext {
     navigation_sink: Weak<RwLock<Option<Arc<dyn ExploreNavigationSink>>>>,
     frontier_tx: watch::Sender<FrontierSnapshot>,
     generation: Weak<AtomicU64>,
-    orphan_cancellations: Weak<OrphanCancellationRegistry>,
     #[cfg(test)]
     attribution: Option<Arc<attribution::Attribution>>,
     #[cfg(test)]
@@ -46,7 +45,6 @@ impl WeakRuntimeContext {
             navigation_sink: Arc::downgrade(&runtime.navigation_sink),
             frontier_tx: runtime.frontier_tx.clone(),
             generation: Arc::downgrade(&runtime.generation),
-            orphan_cancellations: Arc::downgrade(&runtime.orphan_cancellations),
             #[cfg(test)]
             attribution: runtime.attribution.clone(),
             #[cfg(test)]
@@ -65,7 +63,6 @@ impl WeakRuntimeContext {
             navigation_sink: self.navigation_sink.upgrade()?,
             frontier_tx: self.frontier_tx.clone(),
             generation: self.generation.upgrade()?,
-            orphan_cancellations: self.orphan_cancellations.upgrade()?,
             #[cfg(test)]
             attribution: self.attribution.clone(),
             #[cfg(test)]
@@ -394,7 +391,6 @@ impl ComputeBasis {
         #[cfg(test)]
         if self.inspection { return None; }
         if self.frame != input_frame(inner) { return Some("map_frame_generation"); }
-        if inner.pending_child_cancellation.is_some() { return Some("child_cancellation"); }
         if inner.compute.feedback.as_ref().is_some_and(|feedback| feedback.result.is_none()) {
             return Some("feedback_pending");
         }
@@ -1019,14 +1015,7 @@ impl ExploreRuntimeHandle {
         if accepted_child != child {
             return Ok(None);
         }
-        if inner.pending_child_cancellation.is_some()
-            && matches!(
-                terminal,
-                ChildNavigationResult::Cancelled(_) | ChildNavigationResult::CancelFailed { .. }
-            )
-        {
-            return Ok(None); // Independent, exact physical-ZEROED reconciliation.
-        }
+
         if accepted_terminal != terminal {
             return Err("conflicting duplicate exploration child terminal".into());
         }
@@ -1441,33 +1430,7 @@ async fn run_control_actions(
                     .await;
                 if result.is_err() {
                     let error = "exploration retained control action panicked".to_string();
-                    if let Some(lease) = &action.child_lease {
-                        {
-                            let mut guard = runtime.inner.lock().await;
-                            if guard
-                                .active_child
-                                .as_ref()
-                                .is_some_and(|child| child.lease.matches(lease))
-                                && guard.pending_child_cancellation.is_none()
-                            {
-                                guard.pending_child_cancellation = Some(PendingChildCancellation {
-                                    action: PendingChildAction {
-                                        reason: ExplorationStopReason::ConsecutiveFailuresExceeded,
-                                        message: error.clone(),
-                                    },
-                                    ticket: None,
-                                    failure: Some(error.clone()),
-                                    dispatch_in_flight: false,
-                                    early_terminals: Vec::new(),
-                                });
-                            }
-                        }
-                        // Preserve the original exact lease and failure barrier;
-                        // never retry a partially completed cancellation here.
-                        let _ = runtime
-                            .record_child_cancel_failure(lease, error.clone(), None)
-                            .await;
-                    }
+
                     let mut guard = runtime.inner.lock().await;
                     guard.compute.fault.get_or_insert(error.clone());
                     guard.request_compute_stop(ExplorationStopReason::ConsecutiveFailuresExceeded);
@@ -1607,24 +1570,7 @@ async fn drain_owner_loop(
                     .and_then(|record| record.message)
                     .map(|message| guard.snapshot(STATUS_ACTIVE, message))
             } else if was_active && !guard.logical_active {
-                let status = if guard.active_child.is_some() {
-                    if guard
-                        .pending_child_cancellation
-                        .as_ref()
-                        .is_some_and(|pending| {
-                            pending.failure.is_some() && !pending.dispatch_in_flight
-                        })
-                    {
-                        STATUS_FAILED
-                    } else {
-                        STATUS_STOPPING
-                    }
-                } else {
-                    guard
-                        .last_stop
-                        .map(status_for_stop_reason)
-                        .unwrap_or(STATUS_FAILED)
-                };
+                let status = guard.last_stop.map(status_for_stop_reason).unwrap_or(STATUS_FAILED);
                 let message = guard
                     .compute
                     .fault
@@ -2001,9 +1947,7 @@ fn drain_locked(
                     .as_ref()
                     .is_some_and(|active| &active.request_id == child)
                 {
-                    if inner.pending_child_cancellation.is_none() {
-                        inner.active_child = None;
-                    }
+                    inner.active_child = None;
                     inner.no_frontier_since = None;
                 }
             }

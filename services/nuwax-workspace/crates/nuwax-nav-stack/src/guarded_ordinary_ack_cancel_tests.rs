@@ -115,7 +115,7 @@ impl NavMotionPort for GateMotion {
         self.inner.submit_twist(id, twist).await
             })
     }
-    fn revoke_and_zero<'life0, 'life1, 'async_trait>(&'life0 mut self, id: &'life1 str) -> Pin<Box<dyn Future<Output = Result<FenceProof, MotionPortError>> + Send + 'async_trait>>
+    fn revoke_and_zero<'life0, 'life1, 'async_trait>(&'life0 mut self, id: &'life1 str) -> Pin<Box<dyn Future<Output = Result<Option<FenceProof>, MotionPortError>> + Send + 'async_trait>>
     where 'life0: 'async_trait, 'life1: 'async_trait,  Self: 'async_trait {
         Box::pin(async move {
         self.probe.hold(Gate::Fence).await;
@@ -1020,7 +1020,6 @@ async fn guarded_ordinary_ack_unconfirmed_stop_never_publishes_cancelled() {
     assert!(first(&report, "ordinary_ack_test.unconfirmed_checkpoint") < first(&report, "ordinary_ack_test.fence_proof"));
 }
 
-
 #[tokio::test(flavor = "current_thread")]
 async fn pending_input_keeps_state_heartbeat_without_refreshing_planner_observation() {
     run(|h| Box::pin(async move {
@@ -1046,7 +1045,6 @@ async fn pending_input_keeps_state_heartbeat_without_refreshing_planner_observat
         assert!(!state.planner_pose_frame.is_empty());
     })).await;
 }
-
 
 #[tokio::test(flavor = "current_thread")]
 async fn pending_input_publishes_real_fencing_status_before_stop_proof() {

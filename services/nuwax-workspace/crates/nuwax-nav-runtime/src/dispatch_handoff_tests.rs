@@ -27,7 +27,7 @@ impl NavMotionPort for DispatchTestPort {
         }
         self.submit_twist(id,twist).await.map(BoundedTwistOutcome::Applied)
     }
-    async fn revoke_and_zero(&mut self,id:&str)->Result<FenceProof,MotionPortError> {self.inner.revoke_and_zero(id).await}
+    async fn revoke_and_zero(&mut self,id:&str)->Result<Option<FenceProof>,MotionPortError> {self.inner.revoke_and_zero(id).await}
 }
 fn handoff_bound(ns:u64)->CommandDispatchBound {
     let anchor=crate::command_dispatch::ObservationClockAnchor::capture();

@@ -163,7 +163,6 @@ class FloorExecutionState(ContractModel):
     current_floor_id: Optional[str]
     attempt: int = Field(default=0, ge=0)
     created_map_asset_identity: Optional[AssetIdentityV2] = None
-    last_zero_proof: dict = Field(default_factory=dict)
     facility_state: Optional[FacilitySnapshot] = None
     connection_index: int = Field(default=0, ge=0)
     facility_session_id: Optional[str] = None

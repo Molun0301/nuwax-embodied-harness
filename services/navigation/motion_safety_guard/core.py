@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import logging
 import math
 import secrets
@@ -17,13 +17,12 @@ from .constants import (
     RETRY_HORIZON_NS,
     MAX_COMMAND_DEADLINE_NS,
     OWNER_TIMEOUT_NS,
-    WATCHDOG_FENCE_LEAD_NS,
     ZERO_RETRY_INITIAL_NS,
     ZERO_RETRY_MAX_NS,
 )
 from .go2_actuator import ActuatorBackend, ActuatorError
 from .peer_auth import PeerCredentials
-from .stop_confirmation import StopConfirmation, StopEvidence
+from .execution_feedback import ExecutionFeedback
 from .wire import (
     WireContractError,
     operation_envelope,
@@ -62,7 +61,6 @@ class OperationRecord:
     namespace: str
     recorded_monotonic_ns: int
     acquire: bool = False
-    stationary_zero_ack_bytes: bytes = b""
 
 
 _QUERY_NAMESPACES = {
@@ -78,20 +76,16 @@ class MotionGuardCore:
     def __init__(self, *, actuator: ActuatorBackend,
                  monotonic_ns: Callable[[], int] = time.monotonic_ns,
                  lease_id_factory: Optional[Callable[[], int]] = None,
-                 stop_confirmation: Optional[StopConfirmation] = None) -> None:
+                 execution_feedback: Optional[ExecutionFeedback] = None) -> None:
         self._boot_nonce = secrets.token_bytes(16)
         self._actuator = actuator
-        self._stop_confirmation = stop_confirmation or StopConfirmation.from_environment()
-        self._pending_stop = None
+        self._execution_feedback = execution_feedback or ExecutionFeedback.from_environment()
         self._last_zero_confirmation = None
-        self._pending_zero_records = []
-        self._execution_feedback_failure = ""
         self._monotonic_ns = monotonic_ns
         self._lease_id_factory = lease_id_factory or (lambda: secrets.randbits(64) or 1)
         self._actuator_configured = bool(actuator.is_configured)
         self._actuator_reason = "OK" if self._actuator_configured else "ACTUATOR_UNCONFIGURED"
         self.lease_state = pb.LEASE_STATE_IDLE
-        self._startup_zero_confirmed = False
         self._active_lease_id = 0
         self._active_source = ""
         self._owner_deadline_ns = 0
@@ -143,38 +137,10 @@ class MotionGuardCore:
 
     def tick(self, now_ns: Optional[int] = None) -> Optional[pb.ZeroAck]:
         now = self._monotonic_ns() if now_ns is None else now_ns
-        completed = None
-        if self._pending_stop is not None:
-            try:
-                evidence = self._stop_confirmation.poll(self._actuator, self._pending_stop)
-                if evidence is None:
-                    return None
-                completed = self._finish_stop_confirmation(evidence)
-                self._startup_zero_confirmed = True
-            except ActuatorError as exc:
-                self._pending_stop = None
-                self._last_zero_confirmation.confirmation_kind = "unconfirmed"
-                self._last_zero_confirmation.stationary_deadline_monotonic_ns = 0
-                self._store_stop_confirmation()
-                self._mark_zero_unconfirmed(exc, now_ns=now)
-                return None
-        if self.lease_state == pb.LEASE_STATE_REVOKING and not self._startup_zero_confirmed:
+        if self.lease_state == pb.LEASE_STATE_REVOKING:
             return None if now < self._zero_retry_not_before_ns else self._retry_zero_fence(now)
-        if self.lease_state != pb.LEASE_STATE_ACTIVE:
-            return completed
-        if now < self._watchdog_deadline_ns:
-            if self._active_source == "NAV":
-                try:
-                    self._check_execution_mode()
-                except ActuatorError as exc:
-                    self._execution_feedback_failure = exc.code + ": " + exc.message
-                    try:
-                        zero_ack = self._zero()
-                        self._complete_lease_zero()
-                        self._reset_zero_retry()
-                    except ActuatorError as zero_error:
-                        self._mark_zero_unconfirmed(zero_error, now_ns=now)
-            return completed
+        if self.lease_state != pb.LEASE_STATE_ACTIVE or now < self._watchdog_deadline_ns:
+            return None
         self.lease_state = pb.LEASE_STATE_REVOKING
         try:
             zero_ack = self._zero()
@@ -185,25 +151,11 @@ class MotionGuardCore:
             self._mark_zero_unconfirmed(exc, now_ns=now)
             return None
 
-    def initialize_zero_fence(self, *, prepare_mode: bool = True, cancelled=lambda: False) -> pb.ZeroAck:
-        """启动或关闭时归零全部实际路径，停稳后再开放租约。"""
+    def initialize_zero_fence(self) -> pb.ZeroAck:
+        """启动或关闭时发一次零速。"""
         self.lease_state = pb.LEASE_STATE_REVOKING
-        self._startup_zero_confirmed = False
         try:
-            zero_ack = self._zero(wait=True)
-            requirement = self._stop_confirmation.locomotion
-            if requirement is not None and prepare_mode:
-                try:
-                    changed = requirement.prepare(self._actuator, self._read_execution_feedback, self._stop_confirmation.note_motion, cancelled)
-                    if changed:
-                        zero_ack = self._zero(wait=True)
-                    requirement.check(self._read_execution_feedback)
-                except ActuatorError as mode_error:
-                    try:
-                        self._zero(wait=True)
-                    except ActuatorError as stop_error:
-                        raise ActuatorError("MOTION_STOP_UNCONFIRMED", mode_error.message + "; 停止清理也失败：" + stop_error.message) from mode_error
-                    raise
+            zero_ack = self._zero()
         except ActuatorError as exc:
             self._mark_zero_unconfirmed(exc)
             raise
@@ -212,24 +164,14 @@ class MotionGuardCore:
         return zero_ack
 
     def _handle_get_readiness(self, request, _peer, _source):
-        ready = self._actuator_configured and self._startup_zero_confirmed and not self._execution_feedback_failure
-        if not self._actuator_configured:
-            reason = self._actuator_reason
-        elif self._pending_stop is not None:
-            reason = "MOTION_STOP_PENDING"
-        elif self._execution_feedback_failure:
-            reason = self._execution_feedback_failure
-        elif not self._startup_zero_confirmed:
-            reason = "STARTUP_ZERO_UNCONFIRMED"
-        else:
-            reason = "OK"
+        ready = self._actuator_configured
+        reason = self._actuator_reason
         response, outcome = self._response(request)
         outcome.result.CopyFrom(self._result(pb.ACK_CODE_RECEIVED))
         outcome.ready = bool(ready)
         outcome.actuator_configured = self._actuator_configured
         outcome.reason = reason
         outcome.boot_nonce = self._boot_nonce
-        outcome.startup_zero_confirmed = self._startup_zero_confirmed
         outcome.motion_stop_generation = self._motion_stop_generation
         getter = getattr(self._actuator, "get_motion_command_limits", None)
         try:
@@ -262,27 +204,16 @@ class MotionGuardCore:
         envelope = request.acquire_lease.envelope
         if not self._actuator_configured:
             raise GuardFailure("MOTION_SINK_NOT_READY", self._actuator_reason)
-        if not self._startup_zero_confirmed:
-            raise GuardFailure("MOTION_SINK_NOT_READY", "startup zero has not been confirmed", True)
         if envelope.motion_stop_generation != self._motion_stop_generation:
             raise GuardFailure("STALE_STOP_GENERATION", "motion stop generation is stale")
-        if self.lease_state != pb.LEASE_STATE_IDLE:
-            raise GuardFailure("RESOURCE_BUSY", "motion resource already has an owner", True)
-        if source == "NAV":
-            try:
-                self._check_execution_mode()
-            except ActuatorError as exc:
-                self._execution_feedback_failure = exc.code + ": " + exc.message
-                raise GuardFailure(exc.code, exc.message, True) from exc
         now = self._monotonic_ns()
         lease_id = int(self._lease_id_factory())
         if lease_id <= 0 or lease_id > MAX_UINT64:
             raise GuardFailure("INTERNAL", "lease_id factory returned an invalid u64")
-        self._stop_confirmation.note_motion()
         self._active_lease_id = lease_id
         self._active_source = source
         self._owner_deadline_ns = now + OWNER_TIMEOUT_NS
-        self._watchdog_deadline_ns = max(now, self._owner_deadline_ns - WATCHDOG_FENCE_LEAD_NS)
+        self._watchdog_deadline_ns = self._owner_deadline_ns
         self.lease_state = pb.LEASE_STATE_ACTIVE
         response, outcome = self._response(request)
         outcome.result.CopyFrom(self._result(pb.ACK_CODE_RECEIVED))
@@ -297,7 +228,7 @@ class MotionGuardCore:
             return cached
         now = self._validate_active(request.renew_lease.envelope, peer, source)
         self._owner_deadline_ns = now + OWNER_TIMEOUT_NS
-        self._watchdog_deadline_ns = max(now, self._owner_deadline_ns - WATCHDOG_FENCE_LEAD_NS)
+        self._watchdog_deadline_ns = self._owner_deadline_ns
         response, outcome = self._response(request)
         outcome.result.CopyFrom(self._result(pb.ACK_CODE_RECEIVED))
         outcome.owner_deadline_monotonic_ns = self._owner_deadline_ns
@@ -318,8 +249,6 @@ class MotionGuardCore:
             "twist": pb.GUARD_ACTION_TWIST,
             "stop": pb.GUARD_ACTION_STOP,
             "body_pose": pb.GUARD_ACTION_BODY_POSE,
-            "speed_level": pb.GUARD_ACTION_SPEED_LEVEL,
-            "obstacle_policy": pb.GUARD_ACTION_OBSTACLE_POLICY,
         }.get(command)
         if expected_action is None or body.envelope.action != expected_action:
             raise GuardFailure("INVALID_ARGUMENT", "command oneof/action mismatch")
@@ -329,9 +258,8 @@ class MotionGuardCore:
             if command == "stop":
                 zero_ack = self._zero()
             else:
-                if self._pending_stop is not None:
-                    raise ActuatorError("MOTION_STOP_PENDING", "等待实际停稳，不能提交新的运动。")
-                self._stop_confirmation.note_motion()
+                if command == "body_pose":
+                    self._zero()
                 limited = self._actuator.apply_motion(body)
         except ActuatorError as exc:
             if command == "stop":
@@ -367,9 +295,7 @@ class MotionGuardCore:
             if body.command.action == pb.SPORT_ACTION_STOP_MOVE:
                 zero_ack = self._zero()
             else:
-                if self._pending_stop is not None:
-                    raise ActuatorError("MOTION_STOP_PENDING", "等待实际停稳，不能提交新的机体动作。")
-                self._stop_confirmation.note_motion()
+                self._zero()
                 self._actuator.execute_sport(body.command)
         except ActuatorError as exc:
             if body.command.action == pb.SPORT_ACTION_STOP_MOVE:
@@ -393,6 +319,7 @@ class MotionGuardCore:
         peer: PeerCredentials,
         source: str,
     ) -> pb.MotionGuardResponse:
+        self._validate_active(request.revoke_and_zero.envelope, peer, source)
         return self._revoke_response(request, peer, source)
 
 
@@ -416,8 +343,7 @@ class MotionGuardCore:
         self._validate_active(body.envelope, peer, source)
         self.lease_state = pb.LEASE_STATE_PAUSING
         try:
-            zero_ack = self._zero(wait=True)
-            self._stop_confirmation.note_motion()
+            zero_ack = self._zero()
             active_mode = self._actuator.switch_mode(body.command)
             self._complete_lease_zero()
         except ActuatorError as exc:
@@ -431,7 +357,30 @@ class MotionGuardCore:
         return response
 
     def _handle_stop_all_motion(self, request, peer, source):
+        body = request.stop_all_motion
+        if body.HasField("expected_motion_stop_generation") and body.expected_motion_stop_generation != self._motion_stop_generation:
+            response, outcome = self._response(request)
+            outcome.result.CopyFrom(self._result(pb.ACK_CODE_RECEIVED))
+            outcome.motion_stop_generation = self._motion_stop_generation
+            return response
         return self._revoke_response(request, peer, source, global_stop=True)
+
+    def _handle_advance_motion_generation(self, request, _peer, _source):
+        self._motion_stop_generation = (self._motion_stop_generation + 1) & MAX_UINT64
+        response, outcome = self._response(request)
+        outcome.result.CopyFrom(self._result(pb.ACK_CODE_RECEIVED))
+        outcome.boot_nonce = self._boot_nonce
+        outcome.motion_stop_generation = self._motion_stop_generation
+        return response
+
+    def _handle_apply_robot_setting(self, request, _peer, _source):
+        try:
+            self._actuator.apply_motion(request.apply_robot_setting)
+        except ActuatorError as exc:
+            raise GuardFailure(exc.code, exc.message) from exc
+        response, outcome = self._response(request)
+        outcome.result.CopyFrom(self._result(pb.ACK_CODE_APPLIED))
+        return response
 
     def _handle_get_operation_result(
         self,
@@ -479,10 +428,7 @@ class MotionGuardCore:
         outcome.target_ack = record.ack
         outcome.resolved = True
         if record.zero_ack_id:
-            if record.stationary_zero_ack_bytes:
-                outcome.zero_ack.ParseFromString(record.stationary_zero_ack_bytes)
-            else:
-                outcome.zero_ack.CopyFrom(saved_outcome.zero_ack)
+            outcome.zero_ack.CopyFrom(saved_outcome.zero_ack)
         outcome.motion_stop_generation = record.motion_stop_generation
         return response
 
@@ -560,16 +506,11 @@ class MotionGuardCore:
             raise GuardFailure("OUTCOME_UNKNOWN", "lease liveness deadline expired")
         return now
 
-
-
-
-
     def _revoke_response(self, request, peer, source, *, global_stop=False):
-        # 显式停车优先隔离当前拥有方并发零；标识、截止和旧租约均不阻止这一步。
+        # 清当前租约并发零速。
         lease_revoked = self.lease_state == pb.LEASE_STATE_ACTIVE
         self._clear_lease()
         self.lease_state = pb.LEASE_STATE_REVOKING
-        self._startup_zero_confirmed = False
         failure = None
         try:
             zero_ack = self._zero()
@@ -604,15 +545,12 @@ class MotionGuardCore:
         return response
 
     def _mark_zero_unconfirmed(self, error: ActuatorError, *, now_ns: Optional[int] = None) -> None:
-        if error.code.startswith(("MOTION_", "LOCOMOTION_")):
-            self._execution_feedback_failure = error.code + ": " + error.message
         self.lease_state = pb.LEASE_STATE_REVOKING
-        self._startup_zero_confirmed = False
         self._schedule_zero_retry(self._monotonic_ns() if now_ns is None else now_ns)
 
     def _retry_zero_fence(self, now_ns: int) -> Optional[pb.ZeroAck]:
         try:
-            zero_ack = self._zero(retry=True)
+            zero_ack = self._zero()
             self._complete_lease_zero()
         except ActuatorError as exc:
             self._mark_zero_unconfirmed(exc, now_ns=now_ns)
@@ -632,105 +570,21 @@ class MotionGuardCore:
         self._zero_retry_delay_ns = ZERO_RETRY_INITIAL_NS
 
     def _read_execution_feedback(self):
-        return self._stop_confirmation.feedback(self._actuator)
+        return self._execution_feedback.feedback(self._actuator)
 
-    def _check_execution_mode(self) -> None:
-        requirement = self._stop_confirmation.locomotion
-        if requirement is not None:
-            requirement.check(self._read_execution_feedback)
-        self._execution_feedback_failure = ""
-
-    @property
-    def stop_confirmation_timeout_seconds(self) -> float:
-        return self._stop_confirmation.maximum_wait_seconds
-
-    def _zero(self, *, wait: bool = False, retry: bool = False) -> pb.ZeroAck:
-        retained = self._last_zero_confirmation if retry and self._last_zero_confirmation is not None and (
-            self._pending_zero_records or self._last_zero_confirmation.confirmation_kind == "unconfirmed") else None
+    def _zero(self) -> pb.ZeroAck:
         self._actuator.zero()
-        applied_ns = self._monotonic_ns()
-        started = self._stop_confirmation.begin()
-        progress = self._pending_stop
-        if progress is None:
-            progress = self._stop_confirmation.start(self._actuator, started)
-        if isinstance(progress, StopEvidence):
-            zero = self._new_zero_ack(applied_ns, progress)
-        else:
-            # 并发停车共享同一实际停稳窗口，但每次真实零速有独立应用票据。
-            self._pending_stop = progress
-            self._startup_zero_confirmed = False
-            zero = self._new_zero_ack(applied_ns,
-                StopEvidence(False, "awaiting_feedback" if progress.has_feedback else "awaiting_braking_bound"))
-            zero.stationary_deadline_monotonic_ns = self._monotonic_ns() + int(self._stop_confirmation.remaining_seconds(progress) * 1_000_000_000)
-        if retained is not None:
-            # 自动补发仍属于原未完成操作，不能把后续重试时刻写成原应用时刻。
-            zero.zero_ack_id = retained.zero_ack_id
-            zero.applied_monotonic_ns = retained.applied_monotonic_ns
+        zero = self._new_zero_ack(self._monotonic_ns())
         self._last_zero_confirmation = zero
-        if zero.stationary_confirmed:
-            self._store_stop_confirmation()
-        if wait and self._pending_stop is not None:
-            try:
-                evidence = self._stop_confirmation.wait(self._actuator, self._pending_stop)
-                self._finish_stop_confirmation(evidence)
-            except ActuatorError:
-                self._pending_stop = None
-                self._last_zero_confirmation.confirmation_kind = "unconfirmed"
-                self._last_zero_confirmation.stationary_deadline_monotonic_ns = 0
-                self._store_stop_confirmation()
-                raise
-        return pb.ZeroAck.FromString(self._last_zero_confirmation.SerializeToString())
-
-    def _finish_stop_confirmation(self, evidence: StopEvidence) -> pb.ZeroAck:
-        zero = self._last_zero_confirmation
-        zero.stationary_confirmed = evidence.stationary_confirmed
-        zero.confirmation_kind = evidence.confirmation_kind
-        zero.feedback_source_timestamp_ns = evidence.feedback_source_timestamp_ns
-        zero.stationary_deadline_monotonic_ns = 0
-        self._execution_feedback_failure = ""
-        self._pending_stop = None
-        self._store_stop_confirmation()
-        return pb.ZeroAck.FromString(zero.SerializeToString())
-
-    def _store_stop_confirmation(self) -> None:
-        # 多个原操作可等待同一停稳窗口；分别保留其零速身份、应用时刻和初始响应。
-        current = self._last_zero_confirmation
-        def supplement(zero):
-            zero.stationary_confirmed = current.stationary_confirmed
-            zero.confirmation_kind = current.confirmation_kind
-            zero.feedback_source_timestamp_ns = current.feedback_source_timestamp_ns
-            zero.stationary_deadline_monotonic_ns = current.stationary_deadline_monotonic_ns
-            return zero.SerializeToString(deterministic=True)
-        for priority, key, operation_id in self._pending_zero_records:
-            target = self._priority_records if priority else self._ordinary_records
-            record = target.get(key)
-            if record is None:
-                continue
-            saved = pb.MotionGuardResponse.FromString(record.response_bytes)
-            zero = getattr(saved, saved.WhichOneof("outcome")).zero_ack
-            updated = replace(record, stationary_zero_ack_bytes=supplement(zero),
-                recorded_monotonic_ns=self._monotonic_ns())
-            target[key] = updated
-            self._operation_index[operation_id] = [updated if item is record else item
-                for item in self._operation_index.get(operation_id, ())]
-        if current.stationary_confirmed:
-            self._pending_zero_records = []
+        return zero
 
     @staticmethod
-    def _new_zero_ack(now_ns: int, evidence: Optional[StopEvidence] = None) -> pb.ZeroAck:
-        evidence = evidence or StopEvidence(False, "actuator_command_ack")
-        return pb.ZeroAck(
-            zero_ack_id=str(uuid.uuid4()),
-            applied_monotonic_ns=now_ns,
-            stationary_confirmed=evidence.stationary_confirmed,
-            confirmation_kind=evidence.confirmation_kind,
-            feedback_source_timestamp_ns=evidence.feedback_source_timestamp_ns,
-        )
+    def _new_zero_ack(now_ns: int) -> pb.ZeroAck:
+        return pb.ZeroAck(zero_ack_id=str(uuid.uuid4()), applied_monotonic_ns=now_ns)
 
     def _complete_lease_zero(self) -> None:
-        """撤销租约，异步停稳完成前保持新运动未就绪。"""
+        """零速下发后清租约。"""
         self._clear_lease()
-        self._startup_zero_confirmed = self._pending_stop is None
 
     def _clear_lease(self) -> None:
         self._active_lease_id = 0
@@ -810,7 +664,7 @@ class MotionGuardCore:
         if envelope is None or not envelope.operation_id:
             return
         if operation in {"stop_all_motion", "revoke_and_zero"}:
-            # 每次显式停车都实际执行；该查询标识只保留最新结果及其停稳关联。
+            # 每次显式停车都实际执行；该查询标识只保留最新结果。
             for previous in tuple(self._operation_index.get(envelope.operation_id, ())):
                 if previous.source == source and previous.namespace == namespace:
                     owner = (self._priority_records if self._priority_records.get(previous.key) is previous
@@ -846,19 +700,14 @@ class MotionGuardCore:
         target = self._priority_records if priority else self._ordinary_records
         target[key] = record
         self._operation_index.setdefault(envelope.operation_id, []).append(record)
-        if self._pending_stop is not None and record.zero_ack_id == self._last_zero_confirmation.zero_ack_id:
-            self._pending_zero_records.append((priority, key, envelope.operation_id))
         self._prune_operation_records()
 
     def _prune_operation_records(self) -> None:
-        """只淘汰已完成的历史结果，停车待确认记录留给原操作查询。"""
-        pending = {(priority, key) for priority, key, _ in self._pending_zero_records}
+        """按期限与容量清理历史结果。"""
         cutoff = self._monotonic_ns() - RETRY_HORIZON_NS
         completed = []
         for priority, target in ((False, self._ordinary_records), (True, self._priority_records)):
             for key, record in tuple(target.items()):
-                if (priority, key) in pending:
-                    continue
                 if record.recorded_monotonic_ns < cutoff:
                     self._forget_operation_record(target, key, record)
                 else:
@@ -873,9 +722,6 @@ class MotionGuardCore:
     def _forget_operation_record(self, target, key, record: OperationRecord) -> None:
         del target[key]
         retained = [item for item in self._operation_index[record.operation_id] if item is not record]
-        priority = target is self._priority_records
-        self._pending_zero_records = [entry for entry in self._pending_zero_records
-                                      if entry[:2] != (priority, key)]
         if retained:
             self._operation_index[record.operation_id] = retained
         else:
@@ -894,7 +740,7 @@ class MotionGuardCore:
             orientation = feedback.orientation_wxyz
             if orientation is not None and not 0.9 <= math.sqrt(sum(v * v for v in orientation)) <= 1.1:
                 return None
-            deadline = self._stop_confirmation.feedback_valid_until_monotonic_ns(feedback)
+            deadline = self._execution_feedback.feedback_valid_until_monotonic_ns(feedback)
             if deadline is None or self._monotonic_ns() > deadline:
                 return None
             return pb.MeasuredMotionFeedback(

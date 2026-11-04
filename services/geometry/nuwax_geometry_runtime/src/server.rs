@@ -155,11 +155,6 @@ const STOP_NAVIGATION_DISPATCH_TIMEOUT: Duration = Duration::from_millis(250);
 const STOP_EXPLORATION_SCHEDULER_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(test)]
 const STOP_EXPLORATION_SCHEDULER_TIMEOUT: Duration = Duration::from_millis(500);
-#[cfg(not(test))]
-const STOP_EXPLORATION_SAFETY_TIMEOUT: Duration = Duration::from_secs(6);
-#[cfg(test)]
-const STOP_EXPLORATION_SAFETY_TIMEOUT: Duration = Duration::from_millis(250);
-const STOP_EXPLORATION_SAFETY_POLL: Duration = Duration::from_millis(20);
 const MAPPING_BACKEND_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(not(test))]
 const MAPPING_TRANSITION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -229,7 +224,6 @@ impl Drop for StartMappingRpcWaiter {
         }
     }
 }
-
 
 fn configured_base_frame() -> String {
     std::env::var("NUWAX_BASE_FRAME").ok()
@@ -494,7 +488,6 @@ impl ShutdownCoordinator {
     pub(crate) fn publish_graceful_shutdown(&self) {
         self.graceful_tx.send_replace(true);
     }
-
 
     async fn wait_for_correction_settlement(&self) {
         #[cfg(test)]
@@ -783,7 +776,6 @@ impl GeometryRuntimeService {
         state
     }
 
-
     #[allow(clippy::too_many_arguments)]
     async fn finish_started_mapping_transition(
         &self,
@@ -897,18 +889,15 @@ impl GeometryRuntimeService {
             .store(true, Ordering::Release);
     }
 
-
     #[cfg(test)]
     fn inject_start_mapping_before_cloud_clear_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
         *self.start_mapping_before_cloud_clear.lock() = Some(barrier);
     }
 
-
     #[cfg(test)]
     fn inject_stop_before_post_zero_lifecycle_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
         *self.stop_before_post_zero_lifecycle.lock() = Some(barrier);
     }
-
 
     #[cfg(test)]
     fn inject_stop_before_graceful_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
@@ -944,7 +933,6 @@ fn relocalization_command_status(
     Status::unavailable(detail)
 }
 
-
 pub(crate) fn now_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -977,15 +965,12 @@ fn mapping_session_state(
         backend_generation: 0,
         activation_request_id: String::new(),
 
-
         relocalization_target_available: false,
-
 
     }
 }
 
 type ActivationRequestIdentityClass = crate::activation_request::ActivationRequestMetadataV2;
-
 
 pub(crate) fn validate_canonical_protocol_id(value: &str, label: &str) -> Result<(), String> {
     if value.is_empty()
@@ -1015,7 +1000,6 @@ fn classify_activation_request_identity(
 ) -> Result<ActivationRequestIdentityClass, String> {
     crate::activation_request::ActivationRequestMetadataV2::from_wire(request, runtime_generation)
 }
-
 
 fn activation_failure_state(
     service: &GeometryRuntimeService,
@@ -1532,7 +1516,6 @@ async fn activate_map_r1(
         }
     };
 
-
     if let Some(writer) = &bridge.occupancy_shm {
         let begin_result = { writer.lock().begin_session(started.session_generation) };
         if let Err(error) = begin_result {
@@ -1595,7 +1578,6 @@ async fn activate_map_r1(
             "INJECTED_AFTER_OCCUPANCY_INSTALL".to_owned()
         );
     }
-
 
     let source_timestamp_ns = map.timestamp_ns;
     let cloud_commit = if let Some(target) = immutable_target.as_ref() {
@@ -1722,7 +1704,6 @@ async fn activate_map_r1(
         );
     }
 
-
     {
         let mut shared = bridge.state.write().await;
         shared.map = map;
@@ -1772,7 +1753,6 @@ async fn activate_map_r1(
         );
     }
 
-
     let target_receipt =
         if let Some((notification, committed, target_receipt)) = cloud_commit {
             let _ = bridge.cloud_map_tx.send(notification);
@@ -1805,7 +1785,6 @@ async fn activate_map_r1(
 
             target_receipt
         } else { unreachable!("编号三维检查点具有点云提交") };
-
 
     let snapshot = adapter.lock().snapshot();
     let activation_message = "map checkpoint activated";
@@ -1979,7 +1958,6 @@ async fn finish_failed_mapping_start_rollback(
     }
 }
 
-
 fn decode_checkpoint_grid_borrowed(
     checkpoint: &OccupancyGridData,
     expected_map_frame_id: &str,
@@ -2142,7 +2120,6 @@ pub(crate) fn validate_mapping_checkpoint_envelope_size(
     }
     Ok(())
 }
-
 
 fn mapping_commit_identity_proto(
     identity: crate::mapping_commit::MappingCommitId,
@@ -2430,7 +2407,6 @@ fn assemble_mapping_checkpoint_export(mut checkpoint: MappingBackendCheckpoint) 
     Ok(checkpoint)
 }
 
-
 fn validate_mapping_checkpoint_bundle(
     checkpoint: &MappingBackendCheckpoint,
 ) -> Result<(), String> {
@@ -2482,7 +2458,6 @@ fn exploration_state_from_snapshot(
 
     });
     ExplorationState {
-        parking_pending: snapshot.parking_pending,
         status: snapshot.status.to_string(),
         message: snapshot.message,
         request_id: snapshot.request_id,
@@ -2494,7 +2469,6 @@ fn exploration_state_from_snapshot(
         child_task_id: snapshot.child_task_id,
         exploration_generation: snapshot.exploration_generation,
         child_lease,
-
 
         mission_progress_json: snapshot.mission_progress_json,
     }
@@ -3173,195 +3147,33 @@ impl GeometryRuntimeService {
             fail_before_motion_terminal!(error);
         }
         // Process Stop 阶段 A 此时已成为不可逆 owner。取消 await 期间只持 P、不持 L；
-        // retained 元数据仅在下方精确运动 ownership 终态后消费。
+        // 业务取消请求发出后继续关闭原拥有方。
 
         let request_id = self.bridge.explore.snapshot().request_id;
-        let stop_snapshot = match tokio::time::timeout(
-            STOP_EXPLORATION_DISPATCH_TIMEOUT,
-            self.bridge.explore.stop(&request_id),
-        )
-        .await
-        {
+        let stopped = match tokio::time::timeout(STOP_EXPLORATION_DISPATCH_TIMEOUT,
+            self.bridge.explore.stop(&request_id)).await {
             Ok(snapshot) => snapshot,
-            Err(_) => {
-                // The scheduler can hold ExploreRuntimeInner while a navigation
-                // submit awaits transport completion. Abort it, which drops that
-                // future and releases the mutex, then make one correlated retry.
-                let scheduler_shutdown = tokio::time::timeout(
-                    STOP_EXPLORATION_SCHEDULER_TIMEOUT,
-                    self.bridge.shutdown_explore_scheduler(),
-                )
-                .await;
-                let scheduler_detail = match scheduler_shutdown {
-                    Ok(Ok(())) => "scheduler was shut down".to_owned(),
-                    Ok(Err(error)) => {
-                        let error = Status::internal(format!(
-                            "exploration scheduler shutdown failed during stop recovery: {error}"
-                        ));
-                        fail_before_motion_terminal!(error);
-                    }
-                    Err(_) => {
-                        let error = Status::deadline_exceeded(
-                            "timed out shutting down exploration scheduler during stop recovery",
-                        );
-                        fail_before_motion_terminal!(error);
-                    }
-                };
-                match tokio::time::timeout(
-                    STOP_EXPLORATION_DISPATCH_TIMEOUT,
-                    self.bridge.explore.stop(&request_id),
-                )
-                .await
-                {
-                    Ok(snapshot) => snapshot,
-                    Err(_) => {
-                        let snapshot = self.bridge.explore.snapshot();
-                        let error = Status::deadline_exceeded(format!(
-                            "timed out dispatching exploration safety stop after scheduler recovery ({scheduler_detail}): request_id={} child_task_id={} status={}",
-                            snapshot.request_id, snapshot.child_task_id, snapshot.status
-                        ));
-                        fail_before_motion_terminal!(error);
-                    }
-                }
-            }
+            Err(_) => fail_before_motion_terminal!(Status::deadline_exceeded("timed out dispatching exploration stop")),
         };
-        let safety_wait = tokio::time::timeout(STOP_EXPLORATION_SAFETY_TIMEOUT, async {
-            let mut snapshot = stop_snapshot;
-            loop {
-                self.bridge
-                    .explore
-                    .reconcile_orphan_cancellations()
-                    .await;
-                if !self.bridge.explore.blocks_mapping_mutation().await {
-                    return Ok(snapshot);
-                }
-                if matches!(
-                    snapshot.status,
-                    crate::explore_runtime::STATUS_FAILED
-                        | crate::explore_runtime::STATUS_REJECTED
-                ) {
-                    return Err(Status::failed_precondition(format!(
-                        "exploration safety ownership retained: request_id={} child_task_id={} message={}",
-                        snapshot.request_id, snapshot.child_task_id, snapshot.message
-                    )));
-                }
-                tokio::time::sleep(STOP_EXPLORATION_SAFETY_POLL).await;
-                snapshot = self.bridge.explore.snapshot();
-            }
-        })
-        .await;
-        match safety_wait {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                fail_before_motion_terminal!(error);
-            }
-            Err(_) => {
-                let snapshot = self.bridge.explore.snapshot();
-                let error = Status::deadline_exceeded(format!(
-                    "timed out waiting for exploration safety ownership release: request_id={} child_task_id={} status={}",
-                    snapshot.request_id, snapshot.child_task_id, snapshot.status
-                ));
-                fail_before_motion_terminal!(error);
-            }
+        if stopped.status == crate::explore_runtime::STATUS_FAILED {
+            fail_before_motion_terminal!(Status::failed_precondition(stopped.message));
         }
-
         if let Some(active_lease) = self.bridge.nav.active_goal_lease().await {
-            {
-                let mut state = self.state.write().await;
-                state.message = "正在等待导航执行器安全停车".into();
-            }
-            let CancelOutcome { state: nav, lease } = match tokio::time::timeout(
-                STOP_NAVIGATION_DISPATCH_TIMEOUT,
-                nav_cancel(
-                    &self.bridge,
-                    &self.bridge.nav,
-                    crate::nav_runtime::CancelGoalInput {
-                        goal_id: active_lease.session_id.clone(),
-                        owner_kind: active_lease.owner_kind,
-                        parent_request_id: active_lease.parent_request_id.clone(),
-                        goal_generation: active_lease.goal_generation,
-                        producer_runtime_generation: active_lease.producer_runtime_generation,
-                    },
-                ),
-            )
-            .await
-            {
+            let CancelOutcome { state: nav, lease } = match tokio::time::timeout(STOP_NAVIGATION_DISPATCH_TIMEOUT, nav_cancel(&self.bridge, &self.bridge.nav,
+                crate::nav_runtime::CancelGoalInput {
+                    goal_id: active_lease.session_id.clone(), owner_kind: active_lease.owner_kind,
+                    parent_request_id: active_lease.parent_request_id.clone(), goal_generation: active_lease.goal_generation,
+                    producer_runtime_generation: active_lease.producer_runtime_generation,
+                })).await {
                 Ok(outcome) => outcome,
-                Err(_) => {
-                    let cancel = self.bridge.nav.cancel_snapshot();
-                    let error = Status::deadline_exceeded(format!(
-                        "timed out dispatching navigation safety stop: goal_id={} cancel_generation={} phase={:?}",
-                        active_lease.session_id, cancel.generation, cancel.phase
-                    ));
-                    fail_before_motion_terminal!(error);
-                }
+                Err(_) => fail_before_motion_terminal!(Status::deadline_exceeded("timed out dispatching navigation safety stop")),
             };
-            {
-                let mut shared = self.bridge.state.write().await;
-                shared.nav_state = nav.clone();
+            if nav.status == "FAILED" && lease.is_some() {
+                fail_before_motion_terminal!(Status::failed_precondition(nav.message));
             }
+            self.bridge.state.write().await.nav_state = nav.clone();
             let update = NavigationUpdate::from_local(nav, &self.bridge.nav, lease).await;
             let _ = self.bridge.nav_state_tx.send(update);
-
-            let cancel_after_dispatch = self.bridge.nav.cancel_snapshot();
-            let expected_cancel_lease = cancel_after_dispatch.lease.clone();
-            if expected_cancel_lease.is_none()
-                && self.bridge.nav.active_goal_lease().await.is_some()
-            {
-                let error = Status::failed_precondition(format!(
-                    "navigation cancel did not establish an exact safety ticket: goal_id={} phase={:?} message={}",
-                    active_lease.session_id,
-                    cancel_after_dispatch.phase,
-                    cancel_after_dispatch.message
-                ));
-                fail_before_motion_terminal!(error);
-            }
-
-            let navigation_wait =
-                tokio::time::timeout(STOP_EXPLORATION_SAFETY_TIMEOUT, async {
-                    loop {
-                        let cancel = self.bridge.nav.cancel_snapshot();
-                        let active = self.bridge.nav.active_goal_lease().await;
-                        if expected_cancel_lease.is_none() && active.is_none() {
-                            return Ok(());
-                        }
-                        if active.is_none()
-                            && cancel.phase == crate::nav_runtime::CancelPhase::Zeroed
-                            && cancel.lease == expected_cancel_lease
-                        {
-                            return Ok(());
-                        }
-                        if matches!(
-                            cancel.phase,
-                            crate::nav_runtime::CancelPhase::Failed
-                                | crate::nav_runtime::CancelPhase::TimedOut
-                        ) {
-                            return Err(Status::failed_precondition(format!(
-                                "navigation safety ownership retained: goal_id={} cancel_generation={} phase={:?} message={}",
-                                active_lease.session_id,
-                                cancel.generation,
-                                cancel.phase,
-                                cancel.message
-                            )));
-                        }
-                        tokio::time::sleep(STOP_EXPLORATION_SAFETY_POLL).await;
-                    }
-                })
-                .await;
-            match navigation_wait {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    fail_before_motion_terminal!(error);
-                }
-                Err(_) => {
-                    let cancel = self.bridge.nav.cancel_snapshot();
-                    let error = Status::deadline_exceeded(format!(
-                        "timed out waiting for navigation safety ownership release: goal_id={} cancel_generation={} phase={:?}",
-                        active_lease.session_id, cancel.generation, cancel.phase
-                    ));
-                    fail_before_motion_terminal!(error);
-                }
-            }
         }
 
         #[cfg(test)]
@@ -4842,14 +4654,9 @@ impl GeometryRuntime for GeometryRuntimeService {
             target,
         };
         self.ensure_running_admission("SetNavigationGoal").await?;
-        if self.bridge.explore.blocks_mapping_mutation().await {
-            let exploration = self.bridge.explore.snapshot();
-            return Err(Status::failed_precondition(format!(
-                "public navigation cannot start while exploration owns admission: status={} request_id={} child_task_id={}",
-                exploration.status, exploration.request_id, exploration.child_task_id
-            )));
-        }
+
         let outcome = set_goal(&self.bridge, &self.bridge.nav, input).await;
+        if outcome.accepted() { self.bridge.explore.end_for_navigation_takeover().await; }
         let update = NavigationUpdate::publish_local_set_goal_outcome(
             &outcome, &self.bridge.nav, &self.bridge.state, &self.bridge.nav_state_tx,
         ).await;
@@ -5142,7 +4949,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                         parent_request_id: query_request_id.clone(),
                         goal_generation: 0,
                         cancel_generation: i64::try_from(
-                            self.bridge.nav.cancel_snapshot().generation,
+                            self.bridge.nav.cancel_generation(),
                         )
                         .map_err(|_| Status::internal("cancel generation exceeds wire range"))?,
                         committed_map,
@@ -5170,6 +4977,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                     crate::nav_runtime::GoalProducerEpochAuthority::MappingCloud,
                 )
                 .await;
+                if outcome.accepted() { self.bridge.explore.end_for_navigation_takeover().await; }
                 let update = NavigationUpdate::from_set_goal_outcome(&outcome, &self.bridge.nav).await;
                 let navigation = nav_state_to_proto(update);
                 // A resolved receipt is evaluated independently of accepted=false.
@@ -5237,16 +5045,7 @@ impl GeometryRuntime for GeometryRuntimeService {
             goal_generation: request.goal_generation,
             producer_runtime_generation: request.producer_runtime_generation,
         };
-        if let Some(confirmation) = request.global_stop_confirmation.as_ref() {
-            let (update, retired_current) = self.bridge.nav.retire_goal_after_global_stop(&input, confirmation)
-                .await.map_err(Status::failed_precondition)?;
-            if retired_current {
-                self.bridge.nav.publish_global_stop_retirement(
-                    &update, &self.bridge.state, &self.bridge.nav_state_tx,
-                ).await;
-            }
-            return Ok(Response::new(nav_state_to_proto(update)));
-        }
+
         if let Some(update)=self.bridge.nav.terminal_receipt_for(&input).await {
             return Ok(Response::new(nav_state_to_proto(update)));
         }
@@ -5574,12 +5373,7 @@ impl GeometryRuntime for GeometryRuntimeService {
                 "StartExploration requires an ACTIVE mapping session",
             ));
         }
-        if let Some(active_navigation) = self.bridge.nav.active_goal_lease().await {
-            return Err(Status::failed_precondition(format!(
-                "StartExploration cannot replace active navigation ownership: goal_id={} parent_request_id={}",
-                active_navigation.session_id, active_navigation.parent_request_id
-            )));
-        }
+
         let snapshot = self
             .bridge
             .explore
@@ -5593,27 +5387,10 @@ impl GeometryRuntime for GeometryRuntimeService {
         Ok(Response::new(ExplorationProgressResponse {checkpoint_json}))
     }
 
-    async fn stop_exploration(
-        &self,
-        req: Request<StopExplorationRequest>,
-    ) -> Result<Response<ExplorationState>, Status> {
-        let r = req.get_ref();
-        let snapshot = if let Some(confirmation) = r.global_stop_confirmation.as_ref() {
-            let (snapshot, navigation_update) = self.bridge.explore.stop_after_global_confirmation(
-                &r.request_id, r.expected_exploration_generation, confirmation, &self.bridge.nav,
-            ).await.map_err(Status::failed_precondition)?;
-            if let Some(update) = navigation_update {
-                self.bridge.nav.publish_global_stop_retirement(
-                    &update, &self.bridge.state, &self.bridge.nav_state_tx,
-                ).await;
-            }
-            snapshot
-        } else {
-            self.bridge.explore.stop(&r.request_id).await
-        };
+    async fn stop_exploration(&self, req: Request<StopExplorationRequest>) -> Result<Response<ExplorationState>, Status> {
+        let snapshot = self.bridge.explore.stop(&req.get_ref().request_id).await;
         Ok(Response::new(exploration_state_from_snapshot(snapshot)))
     }
-
 
     async fn get_exploration_state(&self, _req: Request<Empty>) -> Result<Response<ExplorationState>, Status> {
         Ok(Response::new(exploration_state_from_snapshot(self.bridge.explore.snapshot())))
@@ -6001,7 +5778,6 @@ impl GeometryRuntime for GeometryRuntimeService {
         }
     }
 }
-
 
 #[cfg(test)]
 mod health_identity_tests {
@@ -7733,11 +7509,11 @@ async fn assigned_mapping_cloud_boundary_slice(
     }
     use super::*;
     use crate::explore_runtime::{
-        now_monotonic_nanos, now_unix_nanos, ChildNavigationCancelOutcome, ChildNavigationCancelTicket, ChildNavigationLease,
-        ChildNavigationRequest, ChildNavigationResult, ChildNavigationSubmitError,
-        ChildNavigationTerminalProof, ChildNavigationTicket, ChildNavigationZeroProof,
-        ExploreCostmapSnapshot, ExploreNavigationSink, ExplorePoseProvider, ExploreRobotPose,
-        STATUS_ACCEPTED, STATUS_ACTIVE, STATUS_FAILED, STATUS_STOPPING,
+        now_monotonic_nanos, now_unix_nanos, ChildNavigationLease,
+        ChildNavigationRequest, ChildNavigationSubmitError,
+        ChildNavigationTicket,
+        ExploreCostmapSnapshot, ExploreNavigationSink, ExploreRobotPose,
+        STATUS_ACCEPTED, STATUS_ACTIVE, STATUS_FAILED,
     };
     use crate::lcm_runtime::MapState;
     use crate::pointcloud::CloudMapShmWriter;
@@ -7751,7 +7527,6 @@ use nuwax_protocol::RawLcmFrame;
     };
     use std::sync::Mutex as StdMutex;
     use tokio_stream::StreamExt;
-
 
     type RelocalizeTransformFingerprint = (String, String, [u64; 3], [u64; 4], u64);
     type RelocalizeFrontierFingerprint = ([u64; 3], [u64; 4], String, u32, u32);
@@ -8002,23 +7777,12 @@ use nuwax_protocol::RawLcmFrame;
             .is_ok());
     }
 
-
     #[derive(Default)]
     struct LifecycleExploreSink {
         last_lease: StdMutex<Option<ChildNavigationLease>>,
         cancel_error: StdMutex<Option<String>>,
         cancel_never_returns: std::sync::atomic::AtomicBool,
-        cancel_receipt_before_block: std::sync::atomic::AtomicBool,
-        retained_cancel_ticket: StdMutex<Option<ChildNavigationCancelTicket>>,
-        cancel_entered: tokio::sync::Notify,
     }
-
-    struct SubmitLeaseThenBlockSink {
-        facade: GeometryRuntimeHandle,
-        entered: tokio::sync::Notify,
-    }
-
-    struct LifecycleStaticPoseProvider;
 
     #[derive(Default)]
     struct PhaseALioSink {
@@ -8064,7 +7828,6 @@ use nuwax_protocol::RawLcmFrame;
             Ok(())
         }
     }
-
 
     static MOTION_GUARD_SOCKET_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -8202,23 +7965,8 @@ use nuwax_protocol::RawLcmFrame;
 
         async fn cancel(
             &self,
-            lease: &ChildNavigationLease,
-        ) -> Result<ChildNavigationCancelOutcome, String> {
-            let ticket = ChildNavigationCancelTicket {
-                lease: lease.clone(),
-                cancel_generation: 1,
-            };
-            if self
-                .cancel_receipt_before_block
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                *self
-                    .retained_cancel_ticket
-                    .lock()
-                    .expect("lifecycle exploration cancel ticket lock") = Some(ticket);
-                self.cancel_entered.notify_one();
-                return std::future::pending().await;
-            }
+            _lease: &ChildNavigationLease,
+        ) -> Result<(), String> {
             if self
                 .cancel_never_returns
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -8233,169 +7981,9 @@ use nuwax_protocol::RawLcmFrame;
             {
                 return Err(error);
             }
-            Ok(ChildNavigationCancelOutcome::Pending(ticket))
+            Ok(())
         }
 
-        fn recover_cancel_receipt(
-            &self,
-            lease: &ChildNavigationLease,
-        ) -> Option<crate::explore_runtime::ChildNavigationCancelRecovery> {
-            self.retained_cancel_ticket
-                .lock()
-                .expect("lifecycle exploration cancel ticket lock")
-                .clone()
-                .filter(|ticket| ticket.lease.matches(lease))
-                .map(
-                    |ticket| crate::explore_runtime::ChildNavigationCancelRecovery {
-                        ticket,
-                        failure: None,
-                    },
-                )
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ExploreNavigationSink for SubmitLeaseThenBlockSink {
-        fn retain_child_dispatch(
-            &self,
-            operation: crate::explore_runtime::ChildNavigationDispatch,
-        ) -> Result<crate::explore_runtime::ChildNavigationDispatchObserver, String> {
-            // Legacy fake-sink contract; this fixture does not prove root ownership.
-            Ok(crate::explore_runtime::ChildNavigationDispatchObserver::inline(operation))
-        }
-
-        fn current_map_name(&self) -> Result<String, String> {
-            Ok("map".to_string())
-        }
-
-        async fn submit(
-            &self,
-            request: ChildNavigationRequest,
-        ) -> Result<ChildNavigationTicket, ChildNavigationSubmitError> {
-            let target = request.goal.target;
-            let pose = target.pose;
-            let producer_epoch_projection = self.facade.explore.producer_epoch_projection();
-            let producer_epoch = producer_epoch_projection.load(Ordering::Acquire);
-            let committed_map = self
-                .facade
-                .committed_map_authority
-                .lock()
-                .expect("response-loss committed map authority")
-                .clone()
-                .ok_or_else(|| {
-                    ChildNavigationSubmitError::Rejected(
-                        "response-loss child is missing committed map authority".to_string(),
-                    )
-                })?;
-            let timestamp_ns = target.stamp.nanos.max(0) as u64;
-            let goal = schema::PoseStamped {
-                header: schema::Header {
-                    seq: 0,
-                    stamp_sec: i32::try_from(timestamp_ns / 1_000_000_000).map_err(|_| {
-                        ChildNavigationSubmitError::Rejected(
-                            "response-loss child timestamp exceeds wire range".to_string(),
-                        )
-                    })?,
-                    stamp_nsec: (timestamp_ns % 1_000_000_000) as i32,
-                    frame_id: committed_map.frame_id.clone(),
-                },
-                pose: schema::Pose {
-                    position: [pose.position.x, pose.position.y, pose.position.z],
-                    orientation_xyzw: [
-                        pose.orientation.x,
-                        pose.orientation.y,
-                        pose.orientation.z,
-                        pose.orientation.w,
-                    ],
-                },
-            };
-            let admission_context = crate::nav_runtime::NavAdmissionContext::new(
-                self.facade.mapping_lifecycle_lock.clone(),
-                self.facade.committed_map_authority.clone(),
-                self.facade.map_revision_latest_tx.subscribe(),
-            );
-            let admission_io = crate::nav_runtime::NavAdmissionIo::new(
-                self.facade.state.clone(),
-                self.facade.transport.clone(),
-                self.facade.transport_backend_name,
-                self.facade.lcm_backend_available, Arc::from("base_link"),
-);
-            let outcome = crate::nav_runtime::admit_goal_intent(
-                &admission_context,
-                &admission_io,
-                &self.facade.nav,
-                schema::GoalIntent {
-                    map_frame_generation: 0,
-                        options: Default::default(),
-                    producer: "wavefront".to_string(),
-                    producer_epoch: i64::try_from(producer_epoch).map_err(|_| {
-                        ChildNavigationSubmitError::Rejected(
-                            "response-loss producer epoch exceeds wire range".to_string(),
-                        )
-                    })?,
-                    priority: 100,
-                    session_id: request.request_id,
-                    owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
-                    parent_request_id: request.parent_request_id,
-                    goal_generation: 0,
-                    cancel_generation: i64::try_from(self.facade.nav.cancel_snapshot().generation)
-                        .map_err(|_| {
-                            ChildNavigationSubmitError::Rejected(
-                                "response-loss cancel generation exceeds wire range".to_string(),
-                            )
-                        })?,
-                    committed_map,
-                    boundary_id: String::new(),
-                    body_to_support_z_m: None,
-                    boundary_points: Vec::new(),
-
-                    motion_guard_boot_nonce: request.motion_admission.guard_boot_nonce,
-                    motion_stop_generation: request.motion_admission.motion_stop_generation as i64,
-                    goal,
-                },
-                crate::nav_runtime::GoalProducerEpochAuthority::Wavefront {
-                boundary_owner: Arc::new(crate::explore_runtime::ExploreStartConfig::default()),
-                    current_session_generation: producer_epoch_projection,
-                },
-            )
-            .await;
-            if !matches!(
-                outcome.state.status.as_str(),
-                "ACCEPTED" | "PLANNING" | "RUNNING"
-            ) {
-                return Err(ChildNavigationSubmitError::Rejected(outcome.state.message));
-            }
-            let lease = outcome.lease.ok_or_else(|| {
-                ChildNavigationSubmitError::Rejected(
-                    "accepted response-loss child is missing its lease".to_string(),
-                )
-            })?;
-            self.entered.notify_one();
-            let _retained_lease = lease;
-            std::future::pending().await
-        }
-
-        async fn cancel(
-            &self,
-            _lease: &ChildNavigationLease,
-        ) -> Result<ChildNavigationCancelOutcome, String> {
-            Err("response-loss child is cancelled through NavRuntime ownership".to_string())
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ExplorePoseProvider for LifecycleStaticPoseProvider {
-        async fn current_pose(&self) -> Result<ExploreRobotPose, String> {
-            Ok(ExploreRobotPose {
-                x: 2.0,
-                y: 2.0,
-                z: 0.0,
-                orientation: nuwax_nav_types_messages::geometry::Quaternion::IDENTITY,
-                frame_id: "map".to_string(),
-                source_timestamp_ns: now_unix_nanos(),
-                received_monotonic_ns: now_monotonic_nanos(),
-            })
-        }
     }
 
     async fn start_mapping_session(
@@ -8509,7 +8097,6 @@ use nuwax_protocol::RawLcmFrame;
             .await
             .expect("committed frontier costmap");
     }
-
 
     #[tokio::test]
     async fn process_stop_post_zero_lifecycle_reacquire_timeout_is_bounded() {
@@ -9254,13 +8841,11 @@ use nuwax_protocol::RawLcmFrame;
         assigned_export_transfer_activation(crate::mapping_backend::MappingBackendSpec::raytracing_defaults(), true).await;
     }
 
-
     fn recorded_legacy_clouds(backend: &CheckpointPublishBackend) -> Vec<RawLcmFrame> {
         backend.published.lock().unwrap().iter()
             .filter(|frame| frame.msg_type.fqn() == "sensor_msgs.PointCloud2")
             .cloned().collect()
     }
-
 
     async fn exercise_canonical_reset_retained_after_caller_cancel(cloud_activation: bool) {
         let fixture = CanonicalResetFixture::new().await;
@@ -9672,106 +9257,57 @@ use nuwax_protocol::RawLcmFrame;
         (active.child_task_id, lease)
     }
 
-
     #[tokio::test]
-    async fn process_stop_waits_for_exploration_zero_before_listener_shutdown() {
-        let handle = crate::lcm_runtime::build_handle_for_tests()
+    async fn process_stop_bounds_a_blocked_navigation_cancel_and_retains_ownership() {
+        let mut handle = crate::lcm_runtime::build_handle_for_tests()
             .await
             .expect("real-lcm test handle");
+        let backend = Arc::new(BlockingCancelPublishBackend::default());
+        handle.transport = LcmTransport::new(backend.clone());
+        prime_navigation_runtime(&handle).await;
         let (shutdown, mut listener) = crate::server::shutdown_channel();
+        let readiness = shutdown.clone();
         let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown);
-        let accepted = start_public_navigation(&service, &handle, "process-stop-zero-public").await;
-        assert_eq!(accepted.status, "ACCEPTED");
-        let public_lease = handle
+        let accepted =
+            start_public_navigation(&service, &handle, "public-stop-cancel-timeout").await;
+        assert_eq!(accepted.status, "ACCEPTED", "{}", accepted.message);
+        let _active_lease = handle
             .nav
             .active_goal_lease()
             .await
-            .expect("active public navigation lease");
-        let sink = Arc::new(LifecycleExploreSink::default());
-        let (child_task_id, lease) =
-            start_active_exploration(&handle, sink, "process-stop-zero").await;
-        let listener_requested = Arc::new(tokio::sync::Notify::new());
-        let listener_task = {
-            let listener_requested = listener_requested.clone();
-            tokio::spawn(async move {
-                listener.wait_for_request().await;
-                listener_requested.notify_one();
-                listener.mark_listener_closed();
-            })
-        };
-        let stop_task = {
-            let service = service.clone();
-            tokio::spawn(async move {
-                GeometryRuntime::stop(&service, Request::new(StopRequest {})).await
-            })
-        };
+            .expect("active public lease");
 
-        tokio::time::timeout(Duration::from_millis(100), async {
-            while handle.explore.snapshot().status != STATUS_STOPPING {
-                tokio::task::yield_now().await;
-            }
-        })
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            GeometryRuntime::stop(&service, Request::new(StopRequest {})),
+        )
         .await
-        .expect("process Stop must dispatch exploration cancellation");
+        .expect("process Stop navigation dispatch deadline")
+        .expect_err("blocked navigation cancel must fail process Stop");
+
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        assert!(error.message().contains("navigation safety stop"));
+        assert_eq!(backend.published_cancel_count(), 1);
+        assert!(handle.nav.active_goal_lease().await.is_none());
+        assert_eq!(handle.nav.cancel_generation(), 1);
+        let state = service.state.read().await;
+        assert_eq!(state.phase, "failed");
+        assert_eq!(state.message, error.message());
+        drop(state);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            readiness.wait_for_readiness_revocation(),
+        )
+        .await
+        .expect("failed Stop must revoke readiness");
+        assert!(handle.mapping_lifecycle_lock.try_lock().is_ok());
         assert!(
-            tokio::time::timeout(Duration::from_millis(40), listener_requested.notified())
+            tokio::time::timeout(Duration::from_millis(40), listener.wait_for_request())
                 .await
                 .is_err(),
-            "listener shutdown must remain gated on ZEROED proof"
+            "failed process Stop must not request listener shutdown"
         );
-
-        handle
-            .explore
-            .report_navigation_result(
-                &child_task_id,
-                ChildNavigationResult::Cancelled(ChildNavigationZeroProof {
-                    lease,
-                    cancel_generation: 1,
-                    zero_ack_id: "process-stop-zero-1".to_string(),
-                    zero_applied_monotonic_ns: now_monotonic_nanos(),
-                }),
-            )
-            .await
-            .expect("process Stop ZEROED proof");
-
-        tokio::time::timeout(Duration::from_millis(100), async {
-            while handle.nav.cancel_snapshot().phase != crate::nav_runtime::CancelPhase::Pending {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("process Stop must wait for public navigation ZERO");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(40), listener_requested.notified())
-                .await
-                .is_err(),
-            "retained receipt and listener must remain gated on public Nav ZERO"
-        );
-        let public_cancel = handle.nav.cancel_snapshot();
-        assert_eq!(public_cancel.lease.as_ref(), Some(&public_lease));
-        handle
-            .nav
-            .observe_cancel_ack(crate::nav_runtime::MotionSinkCancelAck {
-                cancel_generation: public_cancel.generation,
-                goal_id: public_lease.session_id.clone(),
-                owner_kind: public_lease.owner_kind,
-                parent_request_id: public_lease.parent_request_id.clone(),
-                goal_generation: public_lease.goal_generation,
-                status: crate::nav_runtime::MotionSinkCancelAckStatus::Zeroed,
-                message: "process Stop public navigation ZEROED".to_string(),
-            })
-            .await;
-
-        let response = stop_task
-            .await
-            .expect("process Stop task")
-            .expect("process Stop response")
-            .into_inner();
-        assert!(response.success);
-        listener_task.await.expect("listener shutdown task");
-
-        assert!(!handle.explore.blocks_mapping_mutation().await);
-        assert_eq!(service.state.read().await.phase, "stopped");
     }
 
     #[tokio::test]
@@ -9788,14 +9324,13 @@ use nuwax_protocol::RawLcmFrame;
         let (shutdown, mut listener) = crate::server::shutdown_channel();
         let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown.clone());
 
-
         let error = GeometryRuntime::stop(&service, Request::new(StopRequest {}))
             .await
             .expect_err("retained ownership must reject process Stop");
 
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-        assert!(error.message().contains("safety ownership retained"));
-        assert!(handle.explore.blocks_mapping_mutation().await);
+        assert!(error.message().contains("guard unavailable"));
+        assert!(!handle.explore.blocks_mapping_mutation().await);
         assert_eq!(service.state.read().await.phase, "failed");
 
         tokio::time::timeout(
@@ -9818,7 +9353,7 @@ use nuwax_protocol::RawLcmFrame;
             .await
             .expect("real-lcm test handle");
         let sink = Arc::new(LifecycleExploreSink::default());
-        let (_, child_lease) = start_active_exploration(&handle, sink.clone(), "process-stop-cancel-timeout").await;
+        let (_, _child_lease) = start_active_exploration(&handle, sink.clone(), "process-stop-cancel-timeout").await;
         sink.cancel_never_returns
             .store(true, std::sync::atomic::Ordering::Release);
         let (shutdown, mut listener) = crate::server::shutdown_channel();
@@ -9832,339 +9367,13 @@ use nuwax_protocol::RawLcmFrame;
         .expect("process Stop exploration deadline")
         .expect_err("blocked exploration cancel must fail process Stop");
 
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-        assert!(error.message().contains("safety ownership retained"));
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        assert!(error.message().contains("timed out dispatching exploration stop"));
         let retained = handle.explore.snapshot();
-        assert_eq!(retained.status, STATUS_FAILED);
-        assert!(retained.message.contains("dispatch timed out"));
+        assert_eq!(retained.status, crate::explore_runtime::STATUS_CANCELLED);
         assert!(retained.child_task_id.is_empty());
-        assert!(handle.explore.orphan_cancellation_registry().contains(&child_lease));
-        assert!(handle.explore.blocks_mapping_mutation().await);
-        assert_eq!(service.state.read().await.phase, "failed");
-        assert!(handle.mapping_lifecycle_lock.try_lock().is_ok());
-        assert!(
-            tokio::time::timeout(Duration::from_millis(40), listener.wait_for_request())
-                .await
-                .is_err(),
-            "failed process Stop must not request listener shutdown"
-        );
-    }
-
-    #[tokio::test]
-    async fn process_stop_recovers_cancel_receipt_after_response_loss() {
-        let handle = crate::lcm_runtime::build_handle_for_tests()
-            .await
-            .expect("real-lcm test handle");
-        let sink = Arc::new(LifecycleExploreSink::default());
-        let (child_task_id, lease) =
-            start_active_exploration(&handle, sink.clone(), "process-stop-response-loss").await;
-        sink.cancel_receipt_before_block
-            .store(true, std::sync::atomic::Ordering::Release);
-        let (shutdown, mut listener) = crate::server::shutdown_channel();
-        let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown);
-        let listener_requested = Arc::new(tokio::sync::Notify::new());
-        let listener_task = {
-            let listener_requested = listener_requested.clone();
-            tokio::spawn(async move {
-                listener.wait_for_request().await;
-                listener_requested.notify_one();
-                listener.mark_listener_closed();
-            })
-        };
-        let stop_task = {
-            let service = service.clone();
-            tokio::spawn(async move {
-                GeometryRuntime::stop(&service, Request::new(StopRequest {})).await
-            })
-        };
-
-        tokio::time::timeout(Duration::from_millis(100), sink.cancel_entered.notified())
-            .await
-            .expect("navigation cancel must record its receipt before losing the response");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(40), listener_requested.notified())
-                .await
-                .is_err(),
-            "listener shutdown must remain gated while the receipt response is lost"
-        );
-        let buffered = handle
-            .explore
-            .report_navigation_result(
-                &child_task_id,
-                ChildNavigationResult::Cancelled(ChildNavigationZeroProof {
-                    lease,
-                    cancel_generation: 1,
-                    zero_ack_id: "process-stop-response-loss-zero".to_string(),
-                    zero_applied_monotonic_ns: now_monotonic_nanos(),
-                }),
-            )
-            .await
-            .expect("early exact ZEROED must be buffered until receipt recovery");
-        assert_eq!(buffered.status, STATUS_STOPPING);
-        assert!(buffered.message.contains("ZEROED_EARLY_BUFFERED"));
-
-        let response = tokio::time::timeout(Duration::from_secs(1), stop_task)
-            .await
-            .expect("process Stop response-loss recovery deadline")
-            .expect("process Stop task")
-            .expect("process Stop must recover the exact receipt")
-            .into_inner();
-        assert!(response.success);
-        listener_task.await.expect("listener shutdown task");
         assert!(!handle.explore.blocks_mapping_mutation().await);
-        assert_eq!(service.state.read().await.phase, "stopped");
-    }
-
-    #[tokio::test]
-    async fn process_stop_recovers_submit_response_loss_through_nav_owner() {
-        let handle = crate::lcm_runtime::build_handle_for_tests()
-            .await
-            .expect("real-lcm test handle");
-        prime_navigation_runtime(&handle).await;
-        let mut facade = handle.clone();
-        facade.explore_scheduler = Arc::new(tokio::sync::Mutex::new(None));
-        let sink = Arc::new(SubmitLeaseThenBlockSink {
-            facade,
-            entered: tokio::sync::Notify::new(),
-        });
-        handle.explore.set_navigation_sink(sink.clone());
-        ingest_server_test_committed_costmap(&handle, 1).await;
-        assert_eq!(
-            handle
-                .explore
-                .start("submit-response-loss", "prefer_wavefront")
-                .await
-                .status,
-            STATUS_ACCEPTED
-        );
-        let scheduler = handle.explore.spawn_scheduler(
-            Arc::new(LifecycleStaticPoseProvider),
-            Duration::from_millis(5),
-        );
-        *handle.explore_scheduler.lock().await = Some(scheduler);
-        tokio::time::timeout(Duration::from_secs(1), sink.entered.notified())
-            .await
-            .expect("child submit must establish a nav lease before losing its response");
-        let orphaned_lease = handle
-            .nav
-            .active_goal_lease()
-            .await
-            .expect("response-loss navigation lease");
-        assert_eq!(
-            orphaned_lease.owner_kind,
-            nuwax_codec::lcm::schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD
-        );
-
-        let (shutdown, mut listener) = crate::server::shutdown_channel();
-        let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown);
-        let listener_requested = Arc::new(tokio::sync::Notify::new());
-        let listener_task = {
-            let listener_requested = listener_requested.clone();
-            tokio::spawn(async move {
-                listener.wait_for_request().await;
-                listener_requested.notify_one();
-                listener.mark_listener_closed();
-            })
-        };
-        let stop_task = {
-            let service = service.clone();
-            tokio::spawn(async move {
-                GeometryRuntime::stop(&service, Request::new(StopRequest {})).await
-            })
-        };
-
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if handle.nav.cancel_snapshot().phase == crate::nav_runtime::CancelPhase::Pending {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("Process Stop must reclaim the orphaned NavRuntime lease");
-        let pending = handle.nav.cancel_snapshot();
-        assert!(pending.generation > 0);
-        assert_eq!(pending.lease.as_ref(), Some(&orphaned_lease));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(40), listener_requested.notified())
-                .await
-                .is_err(),
-            "listener shutdown must wait for orphaned child ZEROED proof"
-        );
-        handle
-            .nav
-            .observe_cancel_ack(crate::nav_runtime::MotionSinkCancelAck {
-                cancel_generation: pending.generation,
-                goal_id: orphaned_lease.session_id.clone(),
-                owner_kind: orphaned_lease.owner_kind,
-                parent_request_id: orphaned_lease.parent_request_id.clone(),
-                goal_generation: orphaned_lease.goal_generation,
-                status: crate::nav_runtime::MotionSinkCancelAckStatus::Zeroed,
-                message: "submit response-loss process stop zeroed".to_string(),
-            })
-            .await;
-
-        let response = tokio::time::timeout(Duration::from_secs(2), stop_task)
-            .await
-            .expect("submit response-loss Process Stop deadline")
-            .expect("Process Stop task")
-            .expect("Process Stop response")
-            .into_inner();
-        assert!(response.success);
-        listener_task.await.expect("listener shutdown task");
-        assert!(handle.nav.active_goal_lease().await.is_none());
-        assert!(!handle.explore.blocks_mapping_mutation().await);
-        assert_eq!(service.state.read().await.phase, "stopped");
-    }
-
-
-    #[tokio::test]
-    async fn process_stop_timeout_does_not_request_listener_shutdown() {
-        let handle = crate::lcm_runtime::build_handle_for_tests()
-            .await
-            .expect("real-lcm test handle");
-        let sink = Arc::new(LifecycleExploreSink::default());
-        start_active_exploration(&handle, sink, "process-stop-timeout").await;
-        let (shutdown, mut listener) = crate::server::shutdown_channel();
-        let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown);
-
-        let error = GeometryRuntime::stop(&service, Request::new(StopRequest {}))
-            .await
-            .expect_err("missing ZEROED proof must time out process Stop");
-
-        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
-        assert!(error.message().contains("safety ownership release"));
-        assert!(handle.explore.blocks_mapping_mutation().await);
         assert_eq!(service.state.read().await.phase, "failed");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(40), listener.wait_for_request())
-                .await
-                .is_err(),
-            "timed-out process Stop must not request listener shutdown"
-        );
-    }
-
-    #[tokio::test]
-    async fn process_stop_waits_for_public_navigation_zero_before_listener_shutdown() {
-        let handle = crate::lcm_runtime::build_handle_for_tests()
-            .await
-            .expect("real-lcm test handle");
-        let (shutdown, mut listener) = crate::server::shutdown_channel();
-        let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown);
-        let accepted = start_public_navigation(&service, &handle, "public-stop-zero").await;
-        assert_eq!(accepted.status, "ACCEPTED");
-        let active_lease = handle
-            .nav
-            .active_goal_lease()
-            .await
-            .expect("active public lease");
-        let listener_requested = Arc::new(tokio::sync::Notify::new());
-        let listener_task = {
-            let listener_requested = listener_requested.clone();
-            tokio::spawn(async move {
-                listener.wait_for_request().await;
-                listener_requested.notify_one();
-                listener.mark_listener_closed();
-            })
-        };
-        let stop_task = {
-            let service = service.clone();
-            tokio::spawn(async move {
-                GeometryRuntime::stop(&service, Request::new(StopRequest {})).await
-            })
-        };
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while handle.nav.cancel_snapshot().phase != crate::nav_runtime::CancelPhase::Pending {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("process Stop must dispatch public navigation cancellation");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(40), listener_requested.notified())
-                .await
-                .is_err(),
-            "listener shutdown must wait for public navigation ZEROED proof"
-        );
-        let pending = handle.nav.cancel_snapshot();
-        assert_eq!(pending.lease.as_ref(), Some(&active_lease));
-        handle
-            .nav
-            .observe_cancel_ack(crate::nav_runtime::MotionSinkCancelAck {
-                cancel_generation: pending.generation,
-                goal_id: active_lease.session_id.clone(),
-                owner_kind: active_lease.owner_kind,
-                parent_request_id: active_lease.parent_request_id.clone(),
-                goal_generation: active_lease.goal_generation,
-                status: crate::nav_runtime::MotionSinkCancelAckStatus::Zeroed,
-                message: "process stop public zero".to_string(),
-            })
-            .await;
-
-        let stopped = stop_task
-            .await
-            .expect("process Stop join")
-            .expect("process Stop response")
-            .into_inner();
-        assert!(stopped.success);
-        listener_task.await.expect("listener shutdown task");
-        assert!(handle.nav.active_goal_lease().await.is_none());
-        assert_eq!(service.state.read().await.phase, "stopped");
-    }
-
-    #[tokio::test]
-    async fn process_stop_bounds_a_blocked_navigation_cancel_and_retains_ownership() {
-        let mut handle = crate::lcm_runtime::build_handle_for_tests()
-            .await
-            .expect("real-lcm test handle");
-        let backend = Arc::new(BlockingCancelPublishBackend::default());
-        handle.transport = LcmTransport::new(backend.clone());
-        prime_navigation_runtime(&handle).await;
-        let (shutdown, mut listener) = crate::server::shutdown_channel();
-        let readiness = shutdown.clone();
-        let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown);
-        let accepted =
-            start_public_navigation(&service, &handle, "public-stop-cancel-timeout").await;
-        assert_eq!(accepted.status, "ACCEPTED", "{}", accepted.message);
-        let active_lease = handle
-            .nav
-            .active_goal_lease()
-            .await
-            .expect("active public lease");
-
-
-        let error = tokio::time::timeout(
-            Duration::from_secs(1),
-            GeometryRuntime::stop(&service, Request::new(StopRequest {})),
-        )
-        .await
-        .expect("process Stop navigation dispatch deadline")
-        .expect_err("blocked navigation cancel must fail process Stop");
-
-        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
-        assert!(error.message().contains("navigation safety stop"));
-        assert_eq!(backend.published_cancel_count(), 1);
-        assert_eq!(
-            handle.nav.active_goal_lease().await.as_ref(),
-            Some(&active_lease)
-        );
-        let retained = handle.nav.cancel_snapshot();
-        assert_eq!(retained.phase, crate::nav_runtime::CancelPhase::Pending);
-        assert_eq!(retained.lease.as_ref(), Some(&active_lease));
-        assert_eq!(retained.generation, 1);
-        let state = service.state.read().await;
-        assert_eq!(state.phase, "failed");
-        assert_eq!(state.message, error.message());
-        drop(state);
-
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            readiness.wait_for_readiness_revocation(),
-        )
-        .await
-        .expect("failed Stop must revoke readiness");
         assert!(handle.mapping_lifecycle_lock.try_lock().is_ok());
         assert!(
             tokio::time::timeout(Duration::from_millis(40), listener.wait_for_request())
@@ -10439,211 +9648,6 @@ use nuwax_protocol::RawLcmFrame;
             handle.explore.snapshot().last_stop_reason,
             failed.last_stop_reason
         );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ordinary_real_guard_receipt_reaches_original_cancel_and_exploration_handlers() {
-        use crate::lcm_runtime::vertical_v2_canary::{GuardChild, ORDINARY_STOP_TEST_CAPABILITIES};
-        let guard = GuardChild::spawn_with_capabilities(&format!("b5-handlers-{}", uuid::Uuid::new_v4()),
-            Some(ORDINARY_STOP_TEST_CAPABILITIES)).await;
-        let mut client = nuwax_motion_safety_guard::MotionGuardClient::connect(&guard.socket_path).await.unwrap();
-        let handle = crate::lcm_runtime::build_handle_for_tests().await.unwrap();
-        let service = GeometryRuntimeService::new(handle.clone());
-        start_mapping_session(&service, "ordinary-handlers-map", "ordinary-handlers-map").await;
-        let request_for = |state: &NavigationState, proof: Option<OrdinaryGlobalStopConfirmation>| CancelNavigationRequest {
-            goal_id: state.goal_id.clone(), owner_kind: state.owner_kind,
-            parent_request_id: state.parent_request_id.clone(), goal_generation: state.goal_generation,
-            producer_runtime_generation: state.producer_runtime_generation, global_stop_confirmation: proof,
-        };
-        let receipt_for = |id: &str, proof: &nuwax_motion_safety_guard::GlobalStopConfirmation| OrdinaryGlobalStopConfirmation {
-            operation_id: id.into(), zero_ack_id: proof.zero.zero_ack_id.clone(),
-            applied_monotonic_ns: proof.zero.applied_monotonic_ns,
-            stationary_confirmed: proof.zero.stationary_confirmed,
-        };
-        // 隔离LCM没有NAV回执消费者；真实守卫租约由此测试客户端持有。
-        let old = start_public_navigation(&service, &handle, "ordinary-unanswered-nav").await;
-        assert_eq!(old.status, "ACCEPTED");
-        let ready = client.get_readiness().await.unwrap();
-        client.acquire_lease("ordinary-unanswered-acquire", &nuwax_motion_safety_guard::MotionAdmissionProof {
-            boot_nonce: ready.boot_nonce.try_into().unwrap(), motion_stop_generation: ready.motion_stop_generation,
-        }).await.unwrap();
-        client.submit_twist("ordinary-unanswered-motion", nuwax_motion_safety_guard::wire::TwistCommand {
-            linear_x_mps: 0.1, linear_y_mps: 0.0, angular_z_rps: 0.0,
-        }).await.unwrap();
-        let pending = GeometryRuntime::cancel_navigation(&service, Request::new(request_for(&old, None))).await.unwrap().into_inner();
-        assert_eq!(pending.cancel_phase, "PENDING");
-        handle.nav.expire_cancel_for_test();
-        assert!(handle.nav.poll_cancel_timeout().await.is_some());
-        let confirmation = client.stop_all_motion("ordinary-handlers-stop", "本机真实回执串接").await.unwrap();
-        let proof = receipt_for("ordinary-handlers-stop", &confirmation);
-        let events_after_zero = guard.actuator_events();
-        let stopped = GeometryRuntime::cancel_navigation(&service, Request::new(request_for(&old, Some(proof.clone())))).await.unwrap().into_inner();
-        assert_eq!(stopped.status, "FAILED");
-        assert_eq!(stopped.reason_code, "GLOBAL_STOP_CONFIRMED");
-        assert_eq!(stopped.zero_ack_id, confirmation.zero.zero_ack_id);
-        assert_eq!(stopped.zero_applied_monotonic_ns, confirmation.zero.applied_monotonic_ns);
-        assert_eq!(guard.actuator_events(), events_after_zero, "几何收尾不发第二次停车");
-        let successor = start_public_navigation(&service, &handle, "ordinary-handler-successor").await;
-        assert_eq!(successor.status, "ACCEPTED");
-        GeometryRuntime::cancel_navigation(&service, Request::new(request_for(&old, Some(proof.clone())))).await.unwrap();
-        assert_eq!(handle.nav.active_goal_lease().await.unwrap().session_id, successor.goal_id);
-        assert!(GeometryRuntime::cancel_navigation(&service, Request::new(request_for(&successor, Some(proof)))).await.is_err());
-        // 下一独立操作清理本测试新目标，仍只沿同次回执处理一次。
-        let cleanup = client.stop_all_motion("ordinary-handlers-next", "清理后继测试目标").await.unwrap();
-        GeometryRuntime::cancel_navigation(&service, Request::new(request_for(&successor,
-            Some(receipt_for("ordinary-handlers-next", &cleanup))))).await.unwrap();
-
-        let sink = Arc::new(LifecycleExploreSink::default());
-        let (child_id, child) = start_active_exploration(&handle, sink.clone(), "ordinary-unanswered-exploration").await;
-        let exploration = handle.explore.snapshot();
-        // 明确无响应的子入口保留与生产相同的精确NAV身份；没有声称启动或杀死NAV进程。
-        handle.nav.replace_active_goal_for_test(crate::nav_runtime::ActiveGoal {
-            admitted_guard_clock_ns: nuwax_motion_safety_guard::measured_motion::monotonic_ns(),
-            id: child_id.clone(), frame_id: "map".into(), target: PoseState::default(),
-            options: Default::default(), producer: "wavefront".into(), producer_epoch: exploration.exploration_generation as i64,
-            body_to_support_z_m: None, boundary_owner: None,
-            lease: crate::nav_runtime::GoalLease {
-                session_id: child_id, owner_kind: child.owner_kind, parent_request_id: child.parent_request_id.clone(),
-                goal_generation: child.goal_generation, producer_runtime_generation: child.producer_runtime_generation,
-                path_revision: 0, planner_runtime_generation: 0,
-            },
-        }).await;
-        *sink.cancel_error.lock().unwrap() = Some("明确无响应子导航".into());
-        assert!(handle.explore.stop(&exploration.request_id).await.parking_pending);
-        let confirmation = client.stop_all_motion("ordinary-handlers-explore", "本机探索普通停车").await.unwrap();
-        let proof = receipt_for("ordinary-handlers-explore", &confirmation);
-        let events_after_zero = guard.actuator_events();
-        GeometryRuntime::cancel_navigation(&service, Request::new(CancelNavigationRequest {
-            goal_id: child.session_id, owner_kind: child.owner_kind, parent_request_id: child.parent_request_id,
-            goal_generation: child.goal_generation, producer_runtime_generation: child.producer_runtime_generation,
-            global_stop_confirmation: Some(proof.clone()),
-        })).await.unwrap();
-        let stopped = GeometryRuntime::stop_exploration(&service, Request::new(StopExplorationRequest {
-            request_id: exploration.request_id, expected_exploration_generation: exploration.exploration_generation,
-            global_stop_confirmation: Some(proof),
-        })).await.unwrap().into_inner();
-        assert_eq!(stopped.status, "FAILED");
-        assert!(!stopped.parking_pending);
-        assert_eq!(guard.actuator_events(), events_after_zero, "两个拥有方消费同一回执不重复归零");
-        let next = GeometryRuntime::start_exploration(&service, Request::new(ExploreRequest {
-            request_id: "ordinary-explore-successor".into(), motion_guard_boot_nonce: vec![7;16],
-            ..ExploreRequest::default()
-        })).await.unwrap().into_inner();
-        assert_eq!(next.status, "ACCEPTED", "{}", next.message);
-        handle.explore.stop(&next.request_id).await;
-        drop(client);
-        guard.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn mapping_mutation_waits_for_late_zeroed_after_child_cancel_failure() {
-        let handle = crate::lcm_runtime::build_handle_for_tests()
-            .await
-            .expect("real-lcm test handle");
-        let service = GeometryRuntimeService::new(handle.clone());
-        start_mapping_session(&service, "parked-session", "warehouse-parked").await;
-        let sink = Arc::new(LifecycleExploreSink::default());
-        handle.explore.set_navigation_sink(sink.clone());
-        ingest_server_test_committed_costmap(&handle, 1).await;
-        assert_eq!(
-            handle
-                .explore
-                .start("parked-exploration", "prefer_wavefront")
-                .await
-                .status,
-            STATUS_ACCEPTED
-        );
-        let active = handle.explore.tick((2.0, 2.0)).await;
-        assert_eq!(active.status, STATUS_ACTIVE);
-        let lease = sink.last_lease();
-        assert_eq!(active.child_task_id, lease.session_id);
-        assert_eq!(
-            handle.explore.stop("parked-exploration").await.status,
-            STATUS_STOPPING
-        );
-
-        let failed = handle
-            .explore
-            .report_navigation_result(
-                &active.child_task_id,
-                ChildNavigationResult::CancelFailed {
-                    proof: ChildNavigationTerminalProof {
-                        lease: lease.clone(),
-                    },
-                    cancel_generation: 1,
-                    reason: "CANCEL_ZERO_ACK_TIMEOUT".to_string(),
-                },
-            )
-            .await
-            .expect("cancel failure terminal");
-        assert_eq!(failed.status, STATUS_FAILED);
-        assert_eq!(failed.last_stop_reason, "child_cancel_failed");
-        assert!(failed.child_task_id.is_empty());
-        assert!(failed.parking_pending);
-        assert!(handle.explore.blocks_mapping_mutation().await);
-
-        let stop_error = GeometryRuntime::stop_mapping(
-            &service,
-            Request::new(StopMappingRequest {
-                session_id: "parked-session".to_string(),
-                reason: "must remain parked".to_string(),
-            }),
-        )
-        .await
-        .expect_err("retained child ownership must block StopMapping");
-        assert_eq!(stop_error.code(), tonic::Code::FailedPrecondition);
-        let activate_error = GeometryRuntime::activate_map(
-            &service,
-            Request::new(activation_request("mapload:blocked", "warehouse-next")),
-        )
-        .await
-        .expect_err("retained child ownership must block ActivateMap");
-        assert_eq!(activate_error.code(), tonic::Code::FailedPrecondition);
-        assert!(handle
-            .mapping_adapter
-            .as_ref()
-            .expect("mapping adapter")
-            .lock()
-            .is_active());
-
-        let released = handle
-            .explore
-            .report_navigation_result(
-                &active.child_task_id,
-                ChildNavigationResult::Cancelled(ChildNavigationZeroProof {
-                    lease,
-                    cancel_generation: 1,
-                    zero_ack_id: "late-zero-1".to_string(),
-                    zero_applied_monotonic_ns: now_monotonic_nanos(),
-                }),
-            )
-            .await
-            .expect("late ZEROED proof");
-        assert_eq!(released.status, STATUS_FAILED);
-        assert_eq!(released.last_stop_reason, "child_cancel_failed");
-        assert!(released.child_task_id.is_empty());
-        assert!(!handle.explore.blocks_mapping_mutation().await);
-
-        GeometryRuntime::stop_mapping(
-            &service,
-            Request::new(StopMappingRequest {
-                session_id: "parked-session".to_string(),
-                reason: "late ZEROED released ownership".to_string(),
-            }),
-        )
-        .await
-        .expect("late ZEROED must release StopMapping");
-        let activated = GeometryRuntime::activate_map(
-            &service,
-            Request::new(activation_request("mapload:released", "warehouse-next")),
-        )
-        .await
-        .expect("late ZEROED must release ActivateMap")
-        .into_inner();
-        assert_eq!(activated.phase, "ACTIVE");
-        let final_exploration = handle.explore.snapshot();
-        assert_eq!(final_exploration.status, STATUS_FAILED);
-        assert_eq!(final_exploration.last_stop_reason, "child_cancel_failed");
     }
 
     #[tokio::test]
@@ -11857,7 +10861,6 @@ use nuwax_protocol::RawLcmFrame;
                 .boot_nonce
         );
 
-
         let mut handle = crate::lcm_runtime::build_handle_for_tests()
             .await
             .expect("restored real-lcm test handle");
@@ -13069,7 +12072,6 @@ use nuwax_protocol::RawLcmFrame;
         let _ = std::fs::remove_file(cloud_path);
     }
 
-
     #[tokio::test]
     async fn modern_activation_receipt_seals_replays_and_retires_on_first_stop() {
         let handle = crate::lcm_runtime::build_handle_for_tests()
@@ -13117,7 +12119,6 @@ use nuwax_protocol::RawLcmFrame;
             .into_inner();
         assert!(!queried.relocalization_target_available);
         assert!(queried.activation_receipt_v2.as_ref().unwrap().target.is_some());
-
 
         let replay = GeometryRuntime::activate_map(&service, Request::new(replay_request.clone()))
             .await
@@ -13173,7 +12174,6 @@ use nuwax_protocol::RawLcmFrame;
         );
         let _ = std::fs::remove_file(cloud_path);
     }
-
 
     #[tokio::test]
     async fn stop_mapping_settles_detached_backend_when_phase_a_wins_epoch_race() {
@@ -14136,7 +13136,6 @@ use nuwax_protocol::RawLcmFrame;
         }
     }
 
-
     #[tokio::test]
     async fn process_stop_holds_lifecycle_lock_until_listener_ack() {
         let handle = crate::lcm_runtime::build_handle_for_tests()
@@ -14429,7 +13428,6 @@ mod exploration_contract_tests {
     fn exploration_state_preserves_child_identity() {
         let proto =
             exploration_state_from_snapshot(crate::explore_runtime::ExploreRuntimeSnapshot {
-            parking_pending: false,
                 mission_progress_json: String::new(),
                 status: crate::explore_runtime::STATUS_ACTIVE,
                 message: "moving".into(),
@@ -14448,7 +13446,6 @@ mod exploration_contract_tests {
                     producer_runtime_generation: 5,
 
                 }),
-
 
             });
         assert_eq!(proto.child_task_id, "child-3");
@@ -14735,7 +13732,6 @@ mod navigation_feedback_contract_tests {
         let stale_cancel = GeometryRuntime::cancel_navigation(
             &service,
             Request::new(CancelNavigationRequest {
-global_stop_confirmation: None,
 
                 goal_id: goal.goal_id.clone(),
                 owner_kind: goal.owner_kind,
@@ -14749,12 +13745,11 @@ global_stop_confirmation: None,
         .into_inner();
         assert_eq!(stale_cancel.status, "FAILED");
         assert!(stale_cancel.message.contains("GOAL_LEASE_MISMATCH"));
-        assert_eq!(service.bridge.nav.cancel_snapshot().generation, 0);
+        assert_eq!(service.bridge.nav.cancel_generation(), 0);
 
         let cancelled = GeometryRuntime::cancel_navigation(
             &service,
             Request::new(CancelNavigationRequest {
-global_stop_confirmation: None,
 
                 goal_id: goal.goal_id.clone(),
                 owner_kind: goal.owner_kind,
@@ -14766,7 +13761,7 @@ global_stop_confirmation: None,
         .await
         .expect("correlated cancel")
         .into_inner();
-        assert_eq!(cancelled.status, "PENDING");
+        assert_eq!(cancelled.status, "CANCELLED");
         assert_eq!(cancelled.owner_kind, goal.owner_kind);
         assert_eq!(cancelled.parent_request_id, goal.parent_request_id);
         assert_eq!(cancelled.goal_generation, goal.goal_generation);
@@ -14899,7 +13894,6 @@ mod assigned_activation_boundary_tests {
         }
     }
 
-
 }
 
 #[cfg(test)]
@@ -14928,7 +13922,6 @@ mod planar_assigned_checkpoint_pair_tests {
     }
 }
 
-
 #[cfg(all(test, unix))]
 mod shared_nav_v8_recovery_tests {
     use super::*;
@@ -14950,6 +13943,5 @@ mod shared_nav_v8_recovery_tests {
             true, None, nuwax_transport::LcmTransport::new(Arc::new(UnusedJournalTransport)),
         ).await.unwrap()
     }
-
 
 }

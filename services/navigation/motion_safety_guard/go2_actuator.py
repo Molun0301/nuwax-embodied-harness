@@ -9,7 +9,7 @@ import math
 import sys
 import threading
 import time
-from typing import Any, Callable, List, Optional, Protocol
+from typing import Any, Callable, List, Optional, Protocol, Union
 
 from contracts.motion_feedback import MotionExecutionFeedback
 from services.navigation.proto_gen import motion_guard_pb2 as pb
@@ -28,7 +28,7 @@ class ActuatorBackend(Protocol):
     @property
     def is_configured(self) -> bool: ...
 
-    def apply_motion(self, request: pb.SubmitMotionCommandRequest) -> bool: ...
+    def apply_motion(self, request: Union[pb.SubmitMotionCommandRequest, pb.ApplyRobotSettingRequest]) -> bool: ...
 
     def execute_sport(self, command: pb.SportActionCommand) -> None: ...
 
@@ -401,8 +401,8 @@ class Go2Actuator:
     def active_mode(self) -> int:
         return self._active_mode
 
-    def apply_motion(self, request: pb.SubmitMotionCommandRequest) -> bool:
-        command = request.WhichOneof("command")
+    def apply_motion(self, request: Union[pb.SubmitMotionCommandRequest, pb.ApplyRobotSettingRequest]) -> bool:
+        command = request.WhichOneof("setting" if isinstance(request, pb.ApplyRobotSettingRequest) else "command")
         if command == "twist":
             twist = request.twist
             values = (
@@ -525,7 +525,7 @@ class Go2Actuator:
         if (self._motion_controller == "mcf" and self._low_level_controller is None
                 and not self._obstacle_policy_enabled and not self._obstacle_remote_enabled):
             # 当前控制器使用Move零速；传统StopMove在此模式返回-1。
-            # 这里只确认归零写入，确认器按真实反馈能力决定是否有物理证明。
+            # 这里只确认归零写入，反馈读取按真实反馈能力决定是否有物理证明。
             try:
                 _require_zero_success(self._emergency_sport.Move(0.0, 0.0, 0.0), "EmergencySportClient.Move(zero)")
             except Exception as exc:
@@ -575,7 +575,7 @@ class Go2Actuator:
                 errors.append(exc)
         if errors:
             # 未处于行走模式时固件可以拒绝StopMove。用新鲜设备模式判定
-            # 控制器未行走，静止速度仍交给原确认器连续验证，不能伪造命令回执。
+            # 控制器未行走，静止速度仍交给原反馈读取连续验证，不能伪造命令回执。
             with self._feedback_lock:
                 feedback = self._motion_feedback
                 inactive = (self._feedback_mode in _NONWALKING_MODES and feedback is not None

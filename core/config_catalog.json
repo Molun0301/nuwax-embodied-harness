@@ -1955,11 +1955,9 @@
     "target_file": "core_env",
     "consumers": [
       "contracts/navigation_capabilities.py",
-      "services/nuwax-workspace/crates/nuwax-nav-types-messages/src/navigation_capabilities.rs",
-      "services/navigation/motion_safety_guard/stop_confirmation.py",
-      "services/navigation/motion_safety_guard/mode_confirmation.py"
+      "services/nuwax-workspace/crates/nuwax-nav-types-messages/src/navigation_capabilities.rs"
     ],
-    "apply_scope": "重启运动守卫、几何运行时与导航栈后生效",
+    "apply_scope": "重启几何运行时与导航栈后生效",
     "description": "机器人实测运动能力的标定JSON（版本1）：速度、加减速、保证制动和转向，可附传感器视场与地形能力（台阶、坡度、踏面）。填写后导航以此为准，留空表示未标定。"
   },
   "NUWAX_FACILITY_PROVIDERS_JSON": {
@@ -2405,18 +2403,6 @@
     ],
     "apply_scope": "重启网关后生效",
     "description": "任务执行中查询设备任务状态的间隔秒数，须大于0且不超过5。"
-  },
-  "NUWAX_MOTION_STOP_FEEDBACK_TIMEOUT_SEC": {
-    "zh_name": "实测反馈停车等待上限",
-    "type": "float",
-    "default": 1.0,
-    "section_id": "nav_stack",
-    "target_file": "core_env",
-    "consumers": [
-      "services/navigation/motion_safety_guard/stop_confirmation.py"
-    ],
-    "apply_scope": "重启运动守卫后生效",
-    "description": "未填写导航能力标定时，停车后等待实测反馈确认停稳的最长时间（秒，0～30），超时按停车失败处理；填写标定后改用标定的制动时间。"
   },
   "NUWAX_GEOMETRY_DYNAMIC_BACKEND": {
     "section_id": "geometry_quality",

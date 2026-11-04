@@ -175,7 +175,6 @@ impl GeometryGoalTransport {
     /// 通过 Batch02 exact-lease cancel wire 等待零速确认后的类型化终态。
     pub fn cancel(&self, lease: &AdmittedGoalLease) -> Result<NavigationOutcome, String> {
         let request = CancelNavigationRequest {
-global_stop_confirmation: None,
 
             goal_id: lease.goal_id.clone(),
             owner_kind: PUBLIC_NAV_OWNER,

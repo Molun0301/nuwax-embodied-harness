@@ -30,7 +30,6 @@ mod tests {
                         action: GuardAction::Twist as i32,
                         operation_id: "operation-1".to_string(),
 
-
                         issued_monotonic_ns: 1_000_000,
                         deadline_monotonic_ns: 1_300_000,
                         motion_stop_generation: 0,
@@ -106,8 +105,8 @@ mod tests {
                         issued_monotonic_ns: 10,
                         deadline_monotonic_ns: 20,
                     }),
+                    expected_motion_stop_generation: None,
                     reason: "operator requested stop".to_string(),
-
 
                 },
             )),

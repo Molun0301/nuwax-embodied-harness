@@ -41,26 +41,15 @@ async fn zero_position_surface_scheduler() -> (
     (scheduler, status, motion, goal)
 }
 #[tokio::test]
-async fn zero_position_real_surface_arrival_finishes_only_after_fence_and_fresh_pose() {
-    let (mut scheduler, status, motion, goal) = zero_position_surface_scheduler().await;
+async fn zero_position_real_surface_arrival_finishes_after_one_zero() {
+    let (mut scheduler, status, motion, _goal) = zero_position_surface_scheduler().await;
     scheduler.control_tick(&status).await.unwrap();
-    assert!(scheduler.status.last_terminal.is_none());
-    assert!(!scheduler.lease_active);
-    let pending = scheduler.arrival_confirmation.as_ref().expect("real follower arrival event");
-    let confirmed_at = pending.confirmed_at;
-    assert_eq!(motion.lock().unwrap().calls.iter().filter(|c| c.starts_with("fence:")).count(), 1);
-    scheduler.session_tick(&status).await.unwrap();
-    assert!(scheduler.status.last_terminal.is_none(), "pre-stop pose cannot confirm success");
-    let mut after = goal.clone();
-    after.stamp.nanos += 1;
-    scheduler.observe_odometry(&status, after.clone(), None).unwrap();
-    assert!(scheduler.pose_acquired_at.unwrap() > confirmed_at);
-    assert_eq!(after.pose.position, goal.pose.position);
-    scheduler.session_tick(&status).await.unwrap();
     assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::Succeeded));
+    assert!(!scheduler.lease_active);
     assert_eq!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));
     assert!(scheduler.status.last_zero_ack_id.is_some());
     assert!(scheduler.session.is_none());
+    assert_eq!(motion.lock().unwrap().calls.iter().filter(|c| c.starts_with("fence:")).count(), 1);
     assert_eq!(motion.lock().unwrap().calls.iter().filter(|c| c.starts_with("acquire:")).count(), 1);
 }
 #[tokio::test]
@@ -73,25 +62,9 @@ async fn zero_position_real_surface_rejects_nearby_pose_before_arrival_event() {
     assert!(nearby.pose.position.distance(goal.pose.position) < 1e-6);
     scheduler.observe_odometry(&status, nearby, None).unwrap();
     scheduler.control_tick(&status).await.unwrap();
-    assert!(scheduler.arrival_confirmation.is_none(), "control deadband cannot issue a zero-goal arrival event");
     assert!(scheduler.status.last_terminal.is_none());
 }
-#[tokio::test]
-async fn zero_position_stopped_real_surface_arrival_rejects_nonzero_drift() {
-    let (mut scheduler, status, _motion, goal) = zero_position_surface_scheduler().await;
-    scheduler.control_tick(&status).await.unwrap();
-    let confirmed_at = scheduler.arrival_confirmation.as_ref().unwrap().confirmed_at;
-    let mut nearby = goal.clone();
-    nearby.pose.position.x += f64::EPSILON;
-    nearby.stamp.nanos += 1;
-    assert_ne!(nearby.pose.position.x, goal.pose.position.x);
-    scheduler.observe_odometry(&status, nearby, None).unwrap();
-    assert!(scheduler.pose_acquired_at.unwrap() > confirmed_at);
-    scheduler.session_tick(&status).await.unwrap();
-    assert!(scheduler.status.last_terminal.is_none());
-    assert!(scheduler.arrival_resume_requested());
-    assert!(!scheduler.lease_active, "do not reacquire or move merely to assert rejection");
-}
+
 #[test]
 fn zero_position_terminal_group_distinguishes_original_goal_from_wrong_height() {
     for wrong_height in [false, true] {

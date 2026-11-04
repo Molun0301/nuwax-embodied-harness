@@ -482,6 +482,7 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
         tool_name = ""
         function_name = ""
         tool_call_failure_logged = False
+        tool_call_valid = False
 
         try:
             if not has_request_id:
@@ -549,6 +550,7 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
                         details={"tool_name": name},
                     )
                 # 参数模式解析仍在工作线程执行，避免阻塞其它连接的事件循环。
+                tool_call_valid = True
                 function_name, function_arguments = await run_in_threadpool(
                     _resolve_tool_invocation,
                     runtime,
@@ -644,11 +646,9 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
             )
         except Exception as exc:
             gateway_error = as_gateway_error(exc)
-            if gateway_error.error_code == "update_maintenance":
-                return JSONResponse(_jsonrpc_error(
-                    request_id, code=gateway_error.jsonrpc_code, message=gateway_error.message,
-                    data={"code": gateway_error.error_code, "message": gateway_error.message},
-                ), status_code=503)
+            tool_error = tool_call_failure_logged or (
+                tool_call_valid and gateway_error.error_code == "invalid_params"
+            )
             error_category = categorize_gateway_error(gateway_error.error_code, gateway_error.http_status)
             request.state.error_category = error_category
             if not tool_call_failure_logged:
@@ -673,6 +673,29 @@ def build_mcp_router(runtime: GatewayRuntime, access_manager: GatewayAccessManag
                 task_id=str(gateway_error.details.get("task_id") or "").strip() or None,
                 error_category=error_category,
             )
+            if tool_error:
+                structured = {"error": {
+                    "code": public_error["code"],
+                    "message": public_error["message"],
+                    "details": public_error.get("details", {}),
+                }}
+                error_text = f"{public_error['message']}（错误码：{public_error['code']}）"
+                for key, label in (
+                    ("recommended_next_tool", "建议下一步调用"),
+                    ("setting_key", "相关设置"),
+                    ("hint", "提示"),
+                    ("next_step_hint", "下一步提示"),
+                ):
+                    if key in structured["error"]["details"]:
+                        error_text += f"。{label}：{structured['error']['details'][key]}"
+                return JSONResponse(
+                    _jsonrpc_result(request_id, {
+                        "isError": True,
+                        "content": [{"type": "text", "text": error_text}],
+                        "structuredContent": structured,
+                    }),
+                    status_code=200,
+                )
             return JSONResponse(
                 _jsonrpc_error(
                     request_id,

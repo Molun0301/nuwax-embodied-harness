@@ -60,7 +60,7 @@ def reconcile_assigned_current(owner, asset, bundle, *, captured, reason=None, m
             if (expected_previous_identity != current.asset_identity or proof is None or not proof.committed
                     or proof.previous_identity != current.asset_identity or proof.candidate_identity != bundle.asset_identity
                     or proof.catalog_created_at != current.created_at.isoformat()
-                    or proof.map_directory != captured[:2]):
+                    or proof.map_directory != owner._asset_repository.current_directory(asset.map_name).parent.name):
                 raise _problem("分配式目录与 current 身份不一致。", "map_asset_bundle_invalid")
         if (current.identity_schema_version == 2 and current.finalized
                 and current.asset_identity == bundle.asset_identity

@@ -10,15 +10,13 @@ import stat
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Mapping, Optional, Tuple
 
 from contracts.map_workspace import (
-    MAP_GEOREFERENCE_RELATIVE_PATH,
     AssetIdentityV2,
     MapAssetBundle,
     MapGeometryAssetBinding,
     MapGeometryAssetType,
-    MapGeoreferenceBindingV1,
     MapGeoreferenceV1,
 )
 from contracts.naming import build_safe_dir_segment
@@ -114,7 +112,7 @@ class AssignedMapAssetExchange:
     candidate_identity: AssetIdentityV2
     committed: bool
     catalog_created_at: str
-    map_directory: Tuple[int, int]
+    map_directory: str
 
 
 class MapAssetBundleRepository:
@@ -364,7 +362,7 @@ class MapAssetBundleRepository:
         metadata = path.lstat()
         if not stat.S_ISDIR(metadata.st_mode):
             raise MapAssetBundleValidationError("assigned exchange directory was replaced")
-        return [metadata.st_dev, metadata.st_ino]
+        return path.name
 
     def _read_assigned_exchange(self, map_name):
         path = self._map_dir(map_name) / _ASSIGNED_EXCHANGE_JOURNAL
@@ -380,7 +378,7 @@ class MapAssetBundleRepository:
             raise MapAssetBundleValidationError("invalid assigned exchange journal")
         for name in ("previous_directory", "candidate_directory", "map_directory"):
             value = record[name]
-            if not isinstance(value, list) or len(value) != 2 or any(type(v) is not int or v < 0 for v in value):
+            if not isinstance(value, str):
                 raise MapAssetBundleValidationError("invalid assigned exchange directory owner")
         try:
             previous = AssetIdentityV2.model_validate(record["previous_identity"])
@@ -406,13 +404,14 @@ class MapAssetBundleRepository:
         candidate = AssetIdentityV2.model_validate(record["candidate_identity"])
         current = self._current_dir(map_name)
         current_owner = self._assigned_directory_owner(current)
-        committed = current_owner == record["candidate_directory"]
-        if current_owner != record["candidate_directory" if committed else "previous_directory"]:
+        if current_owner != record["previous_directory"]:
             raise MapAssetBundleValidationError("assigned exchange current directory changed")
-        identity = candidate if committed else previous
         manifest = _parse_json_object(_read_regular_file(current / _MANIFEST_FILE_NAME,
             "assigned exchange current manifest", maximum_bytes=_MAX_MANIFEST_JSON_BYTES),
             "assigned exchange current manifest")
+        # 交换前后 current 的名字不变，清单中的资产标识决定交换是否完成。
+        committed = manifest.get("asset_identity") == candidate.model_dump()
+        identity = candidate if committed else previous
         if (type(manifest.get("schema_version")) is not int or manifest.get("schema_version") != 2
                 or manifest.get("map_name") != map_name
                 or manifest.get("asset_identity") != identity.model_dump()
@@ -422,11 +421,10 @@ class MapAssetBundleRepository:
             raise MapAssetBundleValidationError("assigned exchange catalog asset owner changed")
         staging = map_dir / record["staging"]
         if staging.exists() or staging.is_symlink():
-            retired = record["previous_directory" if committed else "candidate_directory"]
-            if self._assigned_directory_owner(staging) != retired:
+            if self._assigned_directory_owner(staging) != record["candidate_directory"]:
                 raise MapAssetBundleValidationError("assigned exchange staging directory was replaced; refusing unowned cleanup")
         return AssignedMapAssetExchange(previous, candidate, committed, record["catalog_created_at"],
-            tuple(record["map_directory"]))
+            record["map_directory"])
 
     def get_assigned_map_asset_exchange(self, map_name) -> Optional[AssignedMapAssetExchange]:
         """Read exact predecessor proof without clearing it or relaxing getters."""
@@ -461,8 +459,9 @@ class MapAssetBundleRepository:
                 os.close(descriptor)
             _fsync_directory(map_dir)
         staging = map_dir / record["staging"]
-        retired = record["previous_directory" if proof.committed else "candidate_directory"]
-        self._discard_owned_staging(map_name, staging, retired)
+        if staging.exists():
+            shutil.rmtree(staging)
+        self._staging_owners.pop(staging.absolute(), None)
         with catalog.map_activation_guard():
             latest = self._read_assigned_exchange(map_name)
             if latest is None:
@@ -550,11 +549,7 @@ class MapAssetBundleRepository:
                 previous_tree.verify_all()
                 with catalog.map_activation_guard():
                     if (self._assigned_catalog_owner(catalog.get_map_asset(map_name)) != captured
-                            or self._assigned_directory_owner(current.parent) != map_owner
-                            or [os.fstat(candidate_tree.parent_descriptor).st_dev,
-                                os.fstat(candidate_tree.parent_descriptor).st_ino] != map_owner
-                            or [os.fstat(previous_tree.parent_descriptor).st_dev,
-                                os.fstat(previous_tree.parent_descriptor).st_ino] != map_owner):
+                            or self._assigned_directory_owner(current.parent) != map_owner):
                         raise MapAssetBundleValidationError("assigned replacement catalog creation owner changed")
                     candidate_tree.verify_all()
                     previous_tree.verify_all()
@@ -572,13 +567,11 @@ class MapAssetBundleRepository:
                     if (self._assigned_catalog_owner(catalog.get_map_asset(map_name)) != captured
                             or self._assigned_directory_owner(current.parent) != map_owner):
                         raise MapAssetBundleValidationError("assigned replacement catalog creation owner changed")
-                    old_stat = os.fstat(previous_tree.root.descriptor)
-                    new_stat = os.fstat(candidate_tree.root.descriptor)
                     record = {"schema_version": 1, "map_name": map_name,
                         "previous_identity": expected_previous_identity.model_dump(),
                         "candidate_identity": asset_identity.model_dump(), "staging": staging.name,
-                        "previous_directory": [old_stat.st_dev, old_stat.st_ino],
-                        "candidate_directory": [new_stat.st_dev, new_stat.st_ino],
+                        "previous_directory": current.name,
+                        "candidate_directory": staging.name,
                         "map_directory": map_owner, "catalog_created_at": captured[1]}
                     preserve_staging = True
                     _atomic_write_relative(current.parent, _ASSIGNED_EXCHANGE_JOURNAL, _canonical_json_bytes(record))

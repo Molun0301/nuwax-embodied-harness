@@ -1,6 +1,10 @@
 """Assigned cloud current replacement retains its exact catalog predecessor."""
 
+import json
 import os
+from pathlib import Path
+import shutil
+import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -78,6 +82,11 @@ class AssignedCloudExchangeTests(unittest.TestCase):
         self.assertTrue(proof.committed)
         self.assertEqual((proof.previous_identity, proof.candidate_identity), (fixtures.ASSET_ID, NEW_ID))
         self.assertEqual(proof.catalog_created_at, self.asset.created_at.isoformat())
+        self.assertEqual(proof.map_directory, stage.parent.name)
+        record = json.loads((stage.parent / storage._ASSIGNED_EXCHANGE_JOURNAL).read_text())
+        self.assertEqual(record["map_directory"], stage.parent.name)
+        self.assertEqual(record["previous_directory"], "current")
+        self.assertEqual(record["candidate_directory"], stage.name)
         self.assertEqual(restarted.get_map_asset_bundle(fixtures.MAP_NAME,
             expected_asset_identity=NEW_ID).asset_identity, NEW_ID)
         with self.assertRaises(storage.MapAssetBundleValidationError):
@@ -248,7 +257,7 @@ class AssignedCloudExchangeTests(unittest.TestCase):
         self.assertEqual(self.repository.get_map_asset_bundle(fixtures.MAP_NAME).asset_identity, fixtures.ASSET_ID)
 
 
-    def test_replaced_retired_directory_is_preserved(self):
+    def test_retired_directory_is_settled_by_name(self):
         self.initial()
         _result, stage = self.exchange()
         old = stage.with_name(stage.name + "-owned")
@@ -256,11 +265,36 @@ class AssignedCloudExchangeTests(unittest.TestCase):
         stage.mkdir()
         (stage / "keep").write_text("new owner")
         self.adopt()
-        with self.assertRaisesRegex(storage.MapAssetBundleValidationError, "unowned cleanup"):
-            self.settle()
-        self.assertEqual((stage / "keep").read_text(), "new owner")
+        self.settle()
+        self.assertFalse(stage.exists())
         self.assertTrue(old.exists())
-        self.assertTrue((stage.parent / storage._ASSIGNED_EXCHANGE_JOURNAL).exists())
+        self.assertIsNone(self.repository.get_assigned_map_asset_exchange(fixtures.MAP_NAME))
+
+    def test_copied_data_directory_settles_exchange_by_name(self):
+        self.initial()
+        for phase in ("after_assigned_exchange_journal", "after_assigned_exchange"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temporary:
+                def fail(value):
+                    if value == phase:
+                        raise OSError("交换中断")
+                self.repository._fault_injector = fail
+                with self.assertRaises(storage.MapAssetCommitUncertainError):
+                    self.exchange()
+                copied = Path(temporary) / "迁移后的数据"
+                shutil.copytree(self.root, copied)
+                restarted = storage.MapAssetBundleRepository(str(copied))
+                proof = restarted.get_assigned_map_asset_exchange(fixtures.MAP_NAME)
+                self.assertEqual(proof.committed, phase == "after_assigned_exchange")
+                if proof.committed:
+                    self.adopt()
+                    MapCatalogRepository(str(copied)).save_map_asset(MapAsset.model_validate({
+                        **self.asset.model_dump(), "asset_identity": NEW_ID}))
+                self.settle(restarted)
+                self.assertIsNone(restarted.get_assigned_map_asset_exchange(fixtures.MAP_NAME))
+                self.assertFalse(list(restarted.current_directory(fixtures.MAP_NAME).parent.glob(".current.tmp-*")))
+                self.assertIsNotNone(self.repository.get_assigned_map_asset_exchange(fixtures.MAP_NAME))
+                self.repository._fault_injector = None
+                self.settle()
 
     def test_changed_catalog_creation_owner_cannot_adopt_or_settle(self):
         self.initial()
@@ -298,7 +332,7 @@ class AssignedCloudExchangeTests(unittest.TestCase):
         self.initial()
         state = self.catalog._activation_guard_state
         validate = self.repository._validate_open_directory
-        cleanup = self.repository._discard_owned_staging
+        cleanup = storage.shutil.rmtree
         fsync_tree = storage._fsync_tree
         def outside(function):
             def wrapped(*args, **kwargs):
@@ -306,7 +340,7 @@ class AssignedCloudExchangeTests(unittest.TestCase):
                 return function(*args, **kwargs)
             return wrapped
         with patch.object(self.repository, "_validate_open_directory", outside(validate)), \
-                patch.object(self.repository, "_discard_owned_staging", outside(cleanup)), \
+                patch.object(storage.shutil, "rmtree", outside(cleanup)), \
                 patch.object(storage, "_fsync_tree", outside(fsync_tree)):
             self.exchange()
             self.adopt()

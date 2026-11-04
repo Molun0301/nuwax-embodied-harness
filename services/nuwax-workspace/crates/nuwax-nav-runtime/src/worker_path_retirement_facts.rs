@@ -10,7 +10,7 @@ struct RetiredInputFacts {
     goal_absent: bool,
     result_absent: bool,
     requested_absent: bool,
-    control_width_absent: bool,
+    control_requested_absent: bool,
     display_empty: bool,
 }
 
@@ -22,7 +22,7 @@ fn input_facts(worker: &PlannerWorker) -> RetiredInputFacts {
         goal_absent: input.goal.is_none(),
         result_absent: input.result.is_none(),
         requested_absent: input.requested.is_none(),
-        control_width_absent: input.control_width.is_none(),
+        control_requested_absent: input.control_requested.is_none(),
         display_empty: input.display_path.is_empty(),
     }
 }
@@ -30,7 +30,7 @@ fn input_facts(worker: &PlannerWorker) -> RetiredInputFacts {
 fn assert_stopped(facts: &RetiredInputFacts, expected_epoch: u64) {
     assert_eq!(facts.epoch, expected_epoch);
     assert!(facts.path_absent && facts.goal_absent && facts.result_absent);
-    assert!(facts.requested_absent && facts.control_width_absent);
+    assert!(facts.requested_absent && facts.control_requested_absent);
     assert!(facts.display_empty);
 }
 

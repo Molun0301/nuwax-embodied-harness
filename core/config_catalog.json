@@ -1635,44 +1635,6 @@
     ],
     "apply_scope": "重启网关、几何运行时及导航后端后生效"
   },
-  "NUWAX_NAV_BODY_TO_SUPPORT_Z_M": {
-    "zh_name": "机体到支撑面距离（米）",
-    "type": "str",
-    "default": "",
-    "section_id": "nav_stack",
-    "target_file": "core_env",
-    "consumers": [
-      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs",
-      "gateways/runtime.py",
-      "gateways/http/console.py"
-    ],
-    "apply_scope": "重启网关、导航栈与几何运行时后生效；网页刷新后更新选点换算",
-    "description": "机体坐标原点到脚下支撑面的实测距离（米，沿机体向下）。三维导航必须填写，留空时不启用三维运动。"
-  },
-  "NUWAX_NAV_ROBOT_WIDTH_M": {
-    "zh_name": "导航机器人宽度（米）",
-    "type": "float",
-    "default": 0.3,
-    "section_id": "nav_stack",
-    "target_file": "core_env",
-    "consumers": [
-      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
-    ],
-    "apply_scope": "重启导航栈与几何运行时后生效",
-    "description": "三维导航与墙体保持距离时使用的机器人宽度（米）；没有外形模型且未填外包宽度时，也作为机器人外形宽度。"
-  },
-  "NUWAX_NAV_ROBOT_HEIGHT_M": {
-    "zh_name": "导航机器人净空高度（米）",
-    "type": "float",
-    "default": 0.6,
-    "section_id": "nav_stack",
-    "target_file": "core_env",
-    "consumers": [
-      "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
-    ],
-    "apply_scope": "重启导航栈与几何运行时后生效",
-    "description": "支撑面到机器人最高点的高度（米），三维导航据此判断能否从障碍物下方通过。"
-  },
   "NUWAX_NAV_SURFACE_VOXEL_SIZE_M": {
     "zh_name": "三维几何索引体素（米）",
     "type": "float",

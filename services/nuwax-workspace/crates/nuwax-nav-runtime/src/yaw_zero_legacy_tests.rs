@@ -27,7 +27,7 @@ fn zero_yaw_legacy_surface_preserves_exact_acceptance_and_positive_control_floor
         follower.replace_execution_path(ExecutionPath::Surface(Path3D {
             poses: vec![goal.clone(), goal.clone()],
         }), None, goal).unwrap();
-        let step = follower.step(0.3);
+        let step = follower.step();
         if succeeds { assert_eq!(step, PlannerStep::Succeeded); }
         else { assert!(matches!(step, PlannerStep::Command(_) | PlannerStep::ReplanRequired(_)),
             "nonzero yaw cannot become a zero-goal success: {step:?}"); }

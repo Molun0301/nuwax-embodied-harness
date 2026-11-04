@@ -302,7 +302,6 @@ async fn audit_calibration(handle: &ExploreRuntimeHandle, enabled: bool) {
     assert_eq!(captured.capabilities, Some(capabilities.clone()));
     assert_eq!(captured.geometry, Some(geometry.clone()));
     assert_eq!(captured.base_frame, "base_link");
-    assert_eq!(captured.body_to_support_z_m, Some(0.3));
     assert_eq!(guard.costmap_frame_generation, 1);
     assert_eq!(guard.mission_calibration.is_some(), enabled);
     let mission=guard.mission_calibration.as_ref().map(|calibration| {

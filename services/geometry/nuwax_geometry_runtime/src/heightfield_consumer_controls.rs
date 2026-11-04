@@ -92,7 +92,7 @@ fn fixed_model(max_step:f64) -> SurfaceBodyEnvelope {
         max_step_up_m:max_step,max_step_down_m:max_step,max_cross_slope_deg:18.0,support_uncertainty_m:0.0}
 }
 fn config(max_step:f64) -> SurfaceNavigationConfig {
-    let mut c=SurfaceNavigationConfig::new("map".into(),0.4,0.328,0.2,0.1,0.21,18.0,0.2).unwrap();
+    let mut c=SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.328)/2., -(0.328)/2.], [(0.328)/2., -(0.328)/2.], [(0.328)/2., (0.328)/2.], [-(0.328)/2., (0.328)/2.]], z_min_m: -(0.4), z_max_m: (0.2)-(0.4), source: "测试外形".into() }, 0.1, 0.21, 18.0, 0.2).unwrap();
     // Exact B scene geometry config; zero-step control changes the body limits only,
     // as does native_zero_step_relief_matrix_requires_real_rigid_contact_geometry.
     c.geometry=Config {world_frame:"map".into(),voxel_size:0.1,robot_height:0.2,
@@ -100,7 +100,7 @@ fn config(max_step:f64) -> SurfaceNavigationConfig {
         wall_buffer_m:0.2,wall_buffer_weight:2.0,max_slope_deg:18.0,
         step_threshold_m:0.21,min_step_tread_depth_m:0.2,step_penalty_weight:2.0,
         goal_tolerance:0.1,viz_publish_hz:0.0};
-    c.body_envelope=Some(fixed_model(max_step));
+    c.body_envelope=fixed_model(max_step);
     c
 }
 fn message(root:&SealedMap) -> schema::NavigationMap3D {

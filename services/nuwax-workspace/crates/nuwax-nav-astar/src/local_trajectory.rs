@@ -1,14 +1,12 @@
 //! 局部控制的完整机体与制动尾段检查，不复制整张地图。
 use super::*;
 use nuwax_nav_control::{choose_control, PlanarPose};
-use nuwax_nav_types_messages::RobotGeometry;
 use std::collections::BTreeSet;
 
 impl LocalPlanner {
     pub(super) fn choose_bounded_control(
         &self,
         preferred: Twist2,
-        robot_width: f64,
     ) -> Option<Twist2> {
         let limits = self.motion_limits.as_ref()?;
         let odom = self.current_odom.as_ref()?;
@@ -41,26 +39,7 @@ impl LocalPlanner {
                 _ => (target.y - y).atan2(target.x - x),
             }
         };
-        let geometry = if let Some(geometry) = &self.robot_geometry {
-            geometry.clone()
-        } else {
-            let radius = robot_width * 0.5 / std::f64::consts::FRAC_PI_8.cos();
-            if !radius.is_finite() || radius <= 0.0 {
-                return None;
-            }
-            RobotGeometry {
-                self_collision: None,
-                footprint_xy_m: (0..8)
-                    .map(|i| {
-                        let angle = i as f64 * std::f64::consts::FRAC_PI_4;
-                        [radius * angle.cos(), radius * angle.sin()]
-                    })
-                    .collect(),
-                z_min_m: -0.5,
-                z_max_m: 0.5,
-                source: "算法圆形外形".into(),
-            }
-        };
+        let geometry = &self.robot_geometry;
         let footprint = geometry
             .grid_footprint(
                 grid.resolution(),
@@ -142,6 +121,7 @@ impl LocalPlanner {
 
 #[cfg(test)]
 mod tests {
+    use nuwax_nav_types_messages::RobotGeometry;
     use super::*;
     use crate::helpers::{make_path2d, make_pose_stamped};
     use nuwax_nav_types_messages::{MotionLimits, MotionModel, Timestamp};
@@ -166,7 +146,7 @@ mod tests {
     }
     #[test]
     fn calibrated_controller_reaches_turning_path_without_exceeding_acceleration() {
-        let mut planner = LocalPlanner::new(0.5, 20.0, 0.2);
+        let mut planner = LocalPlanner::new(0.5, 20.0, 0.2, nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         planner.set_robot_geometry(geometry());
         planner.set_motion_limits(limits()).unwrap();
         planner.start_planning(make_path2d(vec![
@@ -187,7 +167,7 @@ mod tests {
             let mut odom = make_pose_stamped("map", pose.x, pose.y, pose.yaw);
             odom.stamp = Timestamp::from_unix(1 + tick / 20, (tick % 20 * 50_000_000) as u32);
             planner.handle_odom(odom);
-            let (command, stop) = planner.step(0.4);
+            let (command, stop) = planner.step();
             if stop == Some(StopMessage::Arrived) {
                 assert!((pose.x - 4.0).hypot(pose.y - 3.0) < 0.2);
                 return;
@@ -203,7 +183,7 @@ mod tests {
     }
     #[test]
     fn unobserved_stopping_tail_does_not_allow_motion_into_unknown() {
-        let mut planner = LocalPlanner::new(0.5, 20.0, 0.1);
+        let mut planner = LocalPlanner::new(0.5, 20.0, 0.1, nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         planner.set_robot_geometry(geometry());
         planner.set_motion_limits(limits()).unwrap();
         planner.start_planning(make_path2d(vec![
@@ -223,7 +203,7 @@ mod tests {
             angular_z: 0.0,
         };
         planner.braking_latch = false;
-        let (command, stop) = planner.step(0.4);
+        let (command, stop) = planner.step();
         assert_eq!(command, Twist2::ZERO);
         assert_eq!(stop, Some(StopMessage::ObstacleFound));
     }

@@ -72,7 +72,7 @@ fn current_surface_updates_every_one_to_three_seconds_allow_motion_and_arrival()
         worker.observe_measured_motion(Some(motion));
         let deadline = began + Duration::from_millis(50);
         let outcome = loop {
-            let outcome = worker.step(0.2);
+            let outcome = worker.step();
             if !matches!(outcome, PlannerStep::Pending(_)) || std::time::Instant::now() >= deadline
             {
                 break outcome;

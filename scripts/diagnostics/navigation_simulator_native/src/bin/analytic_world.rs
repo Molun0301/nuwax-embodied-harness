@@ -90,10 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = PathBuf::from(&args[2]);
     fs::create_dir(&out)?;
     let mut config = SurfaceNavigationConfig::from_env()?;
-    let body = config
-        .body_envelope
-        .clone()
-        .ok_or("missing calibrated body")?;
+    let body = config.body_envelope.clone();
     let d = config.follower.body_to_support_z_m;
     let start = resume.as_ref().map_or_else(||world.plane.body([0.,0.],0.,d),|value|serde_json::from_value(value["pose"].clone()).unwrap());
     let goal = world.plane.body([7., 0.], 0., d);
@@ -126,7 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     obs.mark_complete_geometry_source();
     let mut builder =
-        SurfaceMapBuilder::configured(config.geometry.clone(), config.body_envelope.clone());
+        SurfaceMapBuilder::configured(config.geometry.clone(), Some(config.body_envelope.clone()));
     let built = if points.is_empty() {builder.build_column_updates(&[],0.05,true,0)?}
         else {builder.build(&points,0.05)?};
     let mut map = Arc::new(
@@ -254,7 +251,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let step = if braking {
             PlannerStep::Command(Twist2::ZERO)
         } else {
-            follower.step(config.robot_width_m)
+            follower.step()
         };
         control_times.push(ctl.elapsed().as_secs_f64() * 1000.);
         let mut arriving = false;

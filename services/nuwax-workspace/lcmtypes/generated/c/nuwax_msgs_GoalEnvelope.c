@@ -21,7 +21,7 @@ uint64_t __nuwax_msgs_GoalEnvelope_hash_recursive(const __lcm_hash_ptr *p)
     cp.v = __nuwax_msgs_GoalEnvelope_get_hash;
     (void) cp;
 
-    uint64_t hash = (uint64_t)0x2ba3f06255e59501LL
+    uint64_t hash = (uint64_t)0x98b372406747ffddLL
          + __int32_t_hash_recursive(&cp)
          + __string_hash_recursive(&cp)
          + __int32_t_hash_recursive(&cp)
@@ -48,8 +48,6 @@ uint64_t __nuwax_msgs_GoalEnvelope_hash_recursive(const __lcm_hash_ptr *p)
          + __double_hash_recursive(&cp)
          + __double_hash_recursive(&cp)
          + __string_hash_recursive(&cp)
-         + __int8_t_hash_recursive(&cp)
-         + __double_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
          + __geometry_msgs_PoseStamped_hash_recursive(&cp)
         ;
@@ -152,12 +150,6 @@ int __nuwax_msgs_GoalEnvelope_encode_array(void *buf, int offset, int maxlen, co
         thislen = __string_encode_array(buf, offset + pos, maxlen - pos, &(p[element].body_reference_frame_id), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int8_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].has_body_to_support_z), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __double_encode_array(buf, offset + pos, maxlen - pos, &(p[element].body_to_support_z_m), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
         thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].map_frame_generation), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
@@ -238,10 +230,6 @@ int __nuwax_msgs_GoalEnvelope_encoded_array_size(const nuwax_msgs_GoalEnvelope *
         size += __double_encoded_array_size(&(p[element].yaw_tolerance_rad), 1);
 
         size += __string_encoded_array_size(&(p[element].body_reference_frame_id), 1);
-
-        size += __int8_t_encoded_array_size(&(p[element].has_body_to_support_z), 1);
-
-        size += __double_encoded_array_size(&(p[element].body_to_support_z_m), 1);
 
         size += __int64_t_encoded_array_size(&(p[element].map_frame_generation), 1);
 
@@ -341,12 +329,6 @@ int __nuwax_msgs_GoalEnvelope_decode_array(const void *buf, int offset, int maxl
         thislen = __string_decode_array(buf, offset + pos, maxlen - pos, &(p[element].body_reference_frame_id), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int8_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].has_body_to_support_z), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __double_decode_array(buf, offset + pos, maxlen - pos, &(p[element].body_to_support_z_m), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
         thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].map_frame_generation), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
@@ -415,10 +397,6 @@ int __nuwax_msgs_GoalEnvelope_decode_array_cleanup(nuwax_msgs_GoalEnvelope *p, i
         __double_decode_array_cleanup(&(p[element].yaw_tolerance_rad), 1);
 
         __string_decode_array_cleanup(&(p[element].body_reference_frame_id), 1);
-
-        __int8_t_decode_array_cleanup(&(p[element].has_body_to_support_z), 1);
-
-        __double_decode_array_cleanup(&(p[element].body_to_support_z_m), 1);
 
         __int64_t_decode_array_cleanup(&(p[element].map_frame_generation), 1);
 
@@ -506,10 +484,6 @@ int __nuwax_msgs_GoalEnvelope_clone_array(const nuwax_msgs_GoalEnvelope *p, nuwa
         __double_clone_array(&(p[element].yaw_tolerance_rad), &(q[element].yaw_tolerance_rad), 1);
 
         __string_clone_array(&(p[element].body_reference_frame_id), &(q[element].body_reference_frame_id), 1);
-
-        __int8_t_clone_array(&(p[element].has_body_to_support_z), &(q[element].has_body_to_support_z), 1);
-
-        __double_clone_array(&(p[element].body_to_support_z_m), &(q[element].body_to_support_z_m), 1);
 
         __int64_t_clone_array(&(p[element].map_frame_generation), &(q[element].map_frame_generation), 1);
 

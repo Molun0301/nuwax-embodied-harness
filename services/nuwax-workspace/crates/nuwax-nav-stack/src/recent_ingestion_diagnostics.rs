@@ -8,7 +8,7 @@ fn fixture() -> (
     Arc<SurfaceSnapshot>,
 ) {
     let config =
-        SurfaceNavigationConfig::new("map".into(), 0.4, 0.3, 0.6, 0.1, 0.2, 35.0, 0.2).unwrap();
+        SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.2, 35.0, 0.2).unwrap();
     let terrain: Vec<_> = (0..20)
         .flat_map(|x| (0..20).map(move |y| ((x as f32 + 0.5) * 0.1, (y as f32 + 0.5) * 0.1, 0.05)))
         .collect();

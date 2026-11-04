@@ -66,4 +66,3 @@ class ExecutionFeedback:
         if acquired_mono is not None:
             deadline = min(deadline, acquired_mono + _FEEDBACK_VALIDITY_NS)
         return deadline
-

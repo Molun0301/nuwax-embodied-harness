@@ -160,7 +160,7 @@ pub struct LocalPlanner {
     path_distancer: Option<PathDistancer>,
     path_clearance: Option<PathClearance>,
     costmap: Option<CostMap2D>,
-    robot_geometry: Option<nuwax_nav_types_messages::RobotGeometry>,
+    robot_geometry: nuwax_nav_types_messages::RobotGeometry,
     /// 上次 navigation_costmap 发布时间
     last_navigation_costmap_at: Option<std::time::Instant>,
     /// navigation_costmap 订阅者列表(sync stub;见 type alias 注释)
@@ -170,23 +170,23 @@ pub struct LocalPlanner {
 }
 
 impl LocalPlanner {
-    /// 简易构造(向后兼容):签名不变,内部用默认 config。
+    /// 使用统一外形和默认控制参数构造。
     ///
-    /// 推荐用 `LocalPlanner::with_config(LocalPlannerConfig { ... })` 创建。
+    /// 推荐用 `LocalPlanner::with_config(LocalPlannerConfig { ... }, nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() })` 创建。
     #[must_use]
-    pub fn new(speed: f64, control_frequency: f64, goal_tolerance: f64) -> Self {
+    pub fn new(speed: f64, control_frequency: f64, goal_tolerance: f64, geometry: nuwax_nav_types_messages::RobotGeometry) -> Self {
         let cfg = LocalPlannerConfig {
             speed,
             control_frequency,
             goal_tolerance,
             ..LocalPlannerConfig::default_config()
         };
-        Self::with_config(cfg)
+        Self::with_config(cfg, geometry)
     }
 
     /// 完整构造(对应 Python `LocalPlanner.__init__(global_config, navigation_map, goal_tolerance)`)
     #[must_use]
-    pub fn with_config(config: LocalPlannerConfig) -> Self {
+    pub fn with_config(config: LocalPlannerConfig, geometry: nuwax_nav_types_messages::RobotGeometry) -> Self {
         // H-14 nerf_speed: < 1.0 时缩放 controller 速度
         let effective_speed = if config.nerf_speed < 1.0 {
             config.speed * config.nerf_speed
@@ -225,7 +225,7 @@ impl LocalPlanner {
             path_distancer: None,
             path_clearance: None,
             costmap: None,
-            robot_geometry: None,
+            robot_geometry: geometry,
             last_navigation_costmap_at: None,
             navigation_costmap_subs: Vec::new(),
             last_goal_reached: GoalReached::default(),
@@ -275,7 +275,7 @@ impl LocalPlanner {
 
     /// 统一机体外形用于前瞻碰撞与当前位置自体区域消除。
     pub fn set_robot_geometry(&mut self, geometry: nuwax_nav_types_messages::RobotGeometry) {
-        self.robot_geometry = Some(geometry);
+        self.robot_geometry = geometry;
         self.path_clearance = None;
     }
 
@@ -462,7 +462,7 @@ impl LocalPlanner {
     ///
     /// - 若返回 `Some(StopMessage)`，全局规划器应据此触发 arrived / replan / cancel。
     /// - 若返回 `None`，表示继续按当前 twist 运动。
-    pub fn step(&mut self, robot_width: f64) -> (Twist2, Option<StopMessage>) {
+    pub fn step(&mut self) -> (Twist2, Option<StopMessage>) {
         if self.motion_limits.is_some() && self.braking_latch {
             self.last_command = make_twist2_zero();
             if self.observed_velocity_valid
@@ -488,12 +488,12 @@ impl LocalPlanner {
             self.braking_latch = false;
             self.braking_cycles = 0;
         }
-        let (preferred, stop) = self.preferred_step(robot_width);
+        let (preferred, stop) = self.preferred_step();
         if stop.is_some() || self.motion_limits.is_none() {
             self.last_command = preferred;
             return (preferred, stop);
         }
-        let Some(command) = self.choose_bounded_control(preferred, robot_width) else {
+        let Some(command) = self.choose_bounded_control(preferred) else {
             self.braking_latch = true;
             self.braking_cycles = 0;
             self.last_command = make_twist2_zero();
@@ -530,7 +530,7 @@ impl LocalPlanner {
         (command, None)
     }
 
-    fn preferred_step(&mut self, robot_width: f64) -> (Twist2, Option<StopMessage>) {
+    fn preferred_step(&mut self) -> (Twist2, Option<StopMessage>) {
         // 非法姿态或路径不能进入控制器，避免非数朝向传播成非数运动指令。
         let invalid_pose = self.current_odom.as_ref().is_some_and(|odom| {
             let position = odom.pose.position;
@@ -642,10 +642,7 @@ impl LocalPlanner {
                 obstacle_ahead = pc.is_obstacle_ahead();
             } else if let (Some(cm), Some(path)) = (self.costmap.as_ref(), self.path.as_ref()) {
                 // 第一次：构造 path_clearance
-                let mut pc = PathClearance::new(path.clone(), robot_width, 3.0);
-                if let Some(geometry) = self.robot_geometry.as_ref() {
-                    pc.set_robot_geometry(geometry.clone());
-                }
+                let mut pc = PathClearance::new(path.clone(), self.robot_geometry.clone(), 3.0);
                 if let Some(odom) = self.current_odom.as_ref() {
                     let (x, y, yaw) = pose_xy_yaw(odom);
                     pc.update_robot_pose(Point2::new(x, y), yaw);
@@ -863,7 +860,7 @@ mod tests {
 
     #[test]
     fn position_only_goal_skips_final_yaw_without_disabling_initial_turn() {
-        let mut planner=LocalPlanner::new(0.3,20.0,0.12);
+        let mut planner=LocalPlanner::new(0.3, 20.0, 0.12, nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         let goal=make_pose_stamped("map",1.5,0.5,std::f64::consts::PI);
         planner.configure_goal(goal,nuwax_nav_types_messages::GoalOptions {
             position_tolerance_m:0.12,yaw_tolerance_rad:std::f64::consts::PI,..Default::default()
@@ -871,9 +868,9 @@ mod tests {
         planner.update_costmap(CostMap2D::new_all_free("map",40,40,0.1));
         planner.handle_odom(make_pose_stamped("map",0.5,0.5,1.0));
         planner.start_planning_with_orientations(make_path2d(vec![Point2::new(0.5,0.5),Point2::new(1.5,0.5)]),Some(vec![0.0,0.0]));
-        let (turn,stop)=planner.step(0.3);assert!(turn.angular_z.abs()>0.0 && stop.is_none());
+        let (turn,stop)=planner.step();assert!(turn.angular_z.abs()>0.0 && stop.is_none());
         planner.handle_odom(make_pose_stamped("map",1.5,0.5,0.0));
-        let (command,stop)=planner.step(0.3);
+        let (command,stop)=planner.step();
         assert_eq!(command,Twist2::ZERO);assert_eq!(stop,Some(StopMessage::Arrived));
     }
 
@@ -881,7 +878,7 @@ mod tests {
     fn final_rotation_checks_actual_goal_yaw_against_external_obstacle() {
         use crate::helpers::{make_pose_stamped, Point2};
         let geometry = nuwax_nav_types_messages::RobotGeometry::from_runtime_json(r#"{"footprint_xy_m":[[-0.3,-0.1],[0.3,-0.1],[0.3,0.1],[-0.3,0.1]],"z_min_m":-0.3,"z_max_m":0.1}"#).unwrap();
-        let mut planner = LocalPlanner::new(0.3, 10.0, 0.2);
+        let mut planner = LocalPlanner::new(0.3, 10.0, 0.2, nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         planner.set_robot_geometry(geometry);
         planner.handle_odom(make_pose_stamped("map", 1.025, 1.025, 0.0));
         let mut map = CostMap2D::new_all_free("map", 80, 80, 0.05);
@@ -891,14 +888,14 @@ mod tests {
             make_path2d(vec![Point2::new(1.025, 1.025)]),
             Some(vec![std::f64::consts::FRAC_PI_2]),
         );
-        let (twist, stop) = planner.step(0.3);
+        let (twist, stop) = planner.step();
         assert_eq!(twist, Twist2::ZERO);
         assert_eq!(stop, Some(StopMessage::ObstacleFound));
     }
 
     #[test]
     fn fresh_planner_is_idle() {
-        let lp = LocalPlanner::new(0.5, 10.0, 0.2);
+        let lp = LocalPlanner::new(0.5, 10.0, 0.2, nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         assert_eq!(lp.state(), LocalPlannerState::Idle);
     }
 
@@ -907,7 +904,7 @@ mod tests {
         use nuwax_nav_types_messages::Quaternion;
 
         for invalid in 0..4 {
-            let mut planner = LocalPlanner::new(0.5, 10.0, 0.2);
+            let mut planner = LocalPlanner::new(0.5, 10.0, 0.2, nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
             let mut pose = make_pose_stamped("map", 0.5, 0.5, 0.0);
             let mut points = vec![Point2::new(0.5, 0.5), Point2::new(2.5, 0.5)];
             let mut yaws = vec![0.0, 0.0];
@@ -919,7 +916,7 @@ mod tests {
             }
             planner.handle_odom(pose);
             planner.start_planning_with_orientations(make_path2d(points), Some(yaws));
-            assert_eq!(planner.step(0.3), (Twist2::ZERO, Some(StopMessage::Error)));
+            assert_eq!(planner.step(), (Twist2::ZERO, Some(StopMessage::Error)));
             assert_eq!(planner.state(), LocalPlannerState::Idle);
             assert_eq!(planner.goal_reached(), GoalReached::NotReached);
         }
@@ -927,20 +924,20 @@ mod tests {
 
     #[test]
     fn start_then_idle_step_returns_zero_when_no_odom() {
-        let mut lp = LocalPlanner::new(0.5, 10.0, 0.2);
+        let mut lp = LocalPlanner::new(0.5, 10.0, 0.2, nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         lp.start_planning(make_path2d(vec![
             Point2::new(0.0, 0.0),
             Point2::new(1.0, 0.0),
         ]));
         // 无 odom, step 后返回 zero
-        let (t, stop) = lp.step(0.3);
+        let (t, stop) = lp.step();
         assert_eq!(t.linear.x, 0.0);
         assert!(stop.is_none());
     }
 
     #[test]
     fn aligned_odom_skips_initial_rotation() {
-        let mut lp = LocalPlanner::new(0.5, 10.0, 0.2);
+        let mut lp = LocalPlanner::new(0.5, 10.0, 0.2, nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         lp.start_planning(make_path2d(vec![
             Point2::new(0.0, 0.0),
             Point2::new(1.0, 0.0),
@@ -948,14 +945,14 @@ mod tests {
         let cm = CostMap2D::new_all_free("map", 20, 20, 0.1);
         lp.update_costmap(cm);
         lp.handle_odom(make_pose_stamped("map", 0.05, 0.0, 0.0));
-        let _ = lp.step(0.3);
+        let _ = lp.step();
         // 朝向与第一段 (1,0) 一致，应该直接进入 PathFollowing
         assert_eq!(lp.state(), LocalPlannerState::PathFollowing);
     }
 
     #[test]
     fn follows_from_exact_start_and_reaches_endpoint_with_requested_orientation() {
-        let mut lp = LocalPlanner::new(0.5, 20.0, 0.2);
+        let mut lp = LocalPlanner::new(0.5, 20.0, 0.2, nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         let goal_yaw = std::f64::consts::FRAC_PI_2;
         lp.start_planning_with_orientations(
             make_path2d(vec![Point2::new(0.5, 0.5), Point2::new(2.5, 0.5)]),
@@ -966,7 +963,7 @@ mod tests {
         let mut arrived = false;
         for tick in 0..800 {
             lp.handle_odom(make_pose_stamped("map", x, y, yaw));
-            let (twist, stop) = lp.step(0.3);
+            let (twist, stop) = lp.step();
             if tick == 0 {
                 assert!(stop.is_none());
                 assert!(twist.linear.x > 0.0);
@@ -990,7 +987,7 @@ mod tests {
 
     #[test]
     fn final_rotation_resumes_following_if_pose_leaves_goal_tolerance() {
-        let mut lp = LocalPlanner::new(0.5, 10.0, 0.2);
+        let mut lp = LocalPlanner::new(0.5, 10.0, 0.2, nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         let goal_yaw = std::f64::consts::FRAC_PI_2;
         lp.start_planning_with_orientations(
             make_path2d(vec![Point2::new(0.5, 0.5), Point2::new(2.5, 0.5)]),
@@ -998,12 +995,12 @@ mod tests {
         );
         lp.update_costmap(CostMap2D::new_all_free("map", 60, 30, 0.1));
         lp.handle_odom(make_pose_stamped("map", 2.45, 0.5, 0.0));
-        assert!(lp.step(0.3).1.is_none());
+        assert!(lp.step().1.is_none());
         assert_eq!(lp.state(), LocalPlannerState::FinalRotation);
 
         // 朝向已经达到要求，但更新后的位姿再次离开终点，不能误报到达。
         lp.handle_odom(make_pose_stamped("map", 1.5, 0.5, goal_yaw));
-        let (_, stop) = lp.step(0.3);
+        let (_, stop) = lp.step();
         assert!(stop.is_none());
         assert_eq!(lp.state(), LocalPlannerState::PathFollowing);
         assert_eq!(lp.goal_reached(), GoalReached::NotReached);
@@ -1011,11 +1008,11 @@ mod tests {
 
     #[test]
     fn empty_path_reports_error_without_claiming_arrival() {
-        let mut lp = LocalPlanner::new(0.5, 10.0, 0.2);
+        let mut lp = LocalPlanner::new(0.5, 10.0, 0.2, nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         lp.start_planning(make_path2d(Vec::new()));
         lp.handle_odom(make_pose_stamped("map", 0.5, 0.5, 0.0));
         lp.update_costmap(CostMap2D::new_all_free("map", 20, 20, 0.1));
-        let (twist, stop) = lp.step(0.3);
+        let (twist, stop) = lp.step();
         assert_eq!(twist, make_twist2_zero());
         assert_eq!(stop, Some(StopMessage::Error));
         assert_eq!(lp.goal_reached(), GoalReached::NotReached);
@@ -1023,7 +1020,7 @@ mod tests {
 
     #[test]
     fn obstacle_ahead_triggers_stop() {
-        let mut lp = LocalPlanner::new(0.5, 10.0, 0.2);
+        let mut lp = LocalPlanner::new(0.5, 10.0, 0.2, nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         lp.start_planning(make_path2d(vec![
             Point2::new(0.0, 0.0),
             Point2::new(1.0, 0.0),
@@ -1035,13 +1032,13 @@ mod tests {
         cm.set(20, 5, 100);
         lp.update_costmap(cm);
         lp.handle_odom(make_pose_stamped("map", 0.05, 0.0, 0.0));
-        let (_t, stop) = lp.step(1.2); // robot_width=1.2 让 disk 半径覆盖 y=5
+        let (_t, stop) = lp.step(); // robot_width=1.2 让 disk 半径覆盖 y=5
         assert!(matches!(stop, Some(StopMessage::ObstacleFound)));
     }
 
     #[test]
     fn stop_planning_resets_state() {
-        let mut lp = LocalPlanner::new(0.5, 10.0, 0.2);
+        let mut lp = LocalPlanner::new(0.5, 10.0, 0.2, nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         lp.start_planning(make_path2d(vec![
             Point2::new(0.0, 0.0),
             Point2::new(1.0, 0.0),
@@ -1053,7 +1050,7 @@ mod tests {
     #[test]
     fn close_to_goal_triggers_final_rotation() {
         // goal_tolerance=0.5 让 path 上靠 goal 但还没到 tol
-        let mut lp = LocalPlanner::new(0.5, 10.0, 0.5);
+        let mut lp = LocalPlanner::new(0.5, 10.0, 0.5, nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         lp.start_planning(make_path2d(vec![
             Point2::new(0.0, 0.0),
             Point2::new(1.0, 0.0),
@@ -1062,13 +1059,13 @@ mod tests {
         lp.update_costmap(cm);
         // 接近 goal（distance_to_goal = 0.05 < 0.5），yaw 偏差大 → FinalRotation
         lp.handle_odom(make_pose_stamped("map", 0.95, 0.0, 1.0));
-        let _ = lp.step(0.3);
+        let _ = lp.step();
         assert_eq!(lp.state(), LocalPlannerState::FinalRotation);
     }
 
     #[test]
     fn distance_to_path_returns_value() {
-        let mut lp = LocalPlanner::new(0.5, 10.0, 0.2);
+        let mut lp = LocalPlanner::new(0.5, 10.0, 0.2, nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         lp.start_planning(make_path2d(vec![
             Point2::new(0.0, 0.0),
             Point2::new(1.0, 0.0),
@@ -1095,7 +1092,7 @@ mod tests {
         let mut cfg = LocalPlannerConfig::default_config();
         // 提高 orientation_tolerance 让明确无效的差值能触发 rotation 而非 skip
         cfg.orientation_tolerance = 0.1;
-        let mut lp = LocalPlanner::with_config(cfg);
+        let mut lp = LocalPlanner::with_config(cfg, nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         // 路径首段是 (0,0)→(1,0),段方向 yaw=0
         lp.start_planning_with_orientations(
             make_path2d(vec![Point2::new(0.0, 0.0), Point2::new(1.0, 0.0)]),
@@ -1105,7 +1102,7 @@ mod tests {
         lp.update_costmap(cm);
         // robot 当前朝向 0
         lp.handle_odom(make_pose_stamped("map", 0.0, 0.0, 0.0));
-        let _ = lp.step(0.3);
+        let _ = lp.step();
         // yaw_error ≈ π/2 > tolerance (0.1) → 必须进入 InitialRotation
         assert_eq!(
             lp.state(),
@@ -1119,7 +1116,7 @@ mod tests {
     fn h13_falls_back_to_segment_direction_when_no_yaws() {
         let mut cfg = LocalPlannerConfig::default_config();
         cfg.orientation_tolerance = 0.1;
-        let mut lp = LocalPlanner::with_config(cfg);
+        let mut lp = LocalPlanner::with_config(cfg, nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         // 路径首段 (0,0)→(1,0) 段方向 0;无 stored yaws
         lp.start_planning(make_path2d(vec![
             Point2::new(0.0, 0.0),
@@ -1129,7 +1126,7 @@ mod tests {
         lp.update_costmap(cm);
         // robot 朝向 1.0(大偏差) → 段方向启发式算出 yaw_error ≈ 1.0 → InitialRotation
         lp.handle_odom(make_pose_stamped("map", 0.0, 0.0, 1.0));
-        let _ = lp.step(0.3);
+        let _ = lp.step();
         assert_eq!(
             lp.state(),
             LocalPlannerState::InitialRotation,
@@ -1147,7 +1144,7 @@ mod tests {
         let mut cfg = LocalPlannerConfig::default_config();
         cfg.speed = 1.0;
         cfg.nerf_speed = 0.5;
-        let mut lp = LocalPlanner::with_config(cfg);
+        let mut lp = LocalPlanner::with_config(cfg, nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         // 检查 controller 内部 speed(私有),通过对齐 step 后的 advance twist 间接验证:
         // 不能直接读字段。我们通过 controller_mut 反射检查:速度在 twist 中体现。
         // 这里只验证构造不 panic 即可;后续 integrate test 做行为校验。
@@ -1161,7 +1158,7 @@ mod tests {
     fn h14_simulation_passed_to_controller() {
         let mut cfg = LocalPlannerConfig::default_config();
         cfg.simulation = true;
-        let mut lp = LocalPlanner::with_config(cfg);
+        let mut lp = LocalPlanner::with_config(cfg, nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         // 通过 controller_mut 间接验证 simulation 标识;这里构造不 panic 即可
         let _ = lp.controller_mut();
     }
@@ -1171,7 +1168,7 @@ mod tests {
     fn h14_navigation_costmap_publish_throttled() {
         let mut cfg = LocalPlannerConfig::default_config();
         cfg.navigation_costmap_interval = 0.0; // 关闭
-        let mut lp = LocalPlanner::with_config(cfg);
+        let mut lp = LocalPlanner::with_config(cfg, nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter_for_sub = Arc::clone(&counter);
         lp.subscribe_navigation_costmap(Arc::new(move |_cm: &CostMap2D| {
@@ -1184,29 +1181,30 @@ mod tests {
             Point2::new(0.0, 0.0),
             Point2::new(1.0, 0.0),
         ]));
-        let _ = lp.step(0.3);
-        let _ = lp.step(0.3);
+        let _ = lp.step();
+        let _ = lp.step();
         // interval=0 不发布
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         // 开启 interval,第二次 step(间隔很短)应该只发 1 帧(节流)
         let mut cfg2 = LocalPlannerConfig::default_config();
         cfg2.navigation_costmap_interval = 10.0; // 10s 一次
-        let mut lp2 = LocalPlanner::with_config(cfg2);
+        let mut lp2 = LocalPlanner::with_config(cfg2, nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         let counter2 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter2_for_sub = Arc::clone(&counter2);
         lp2.subscribe_navigation_costmap(Arc::new(move |_cm: &CostMap2D| {
             counter2_for_sub.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }));
         lp2.handle_odom(make_pose_stamped("map", 0.0, 0.0, 0.0));
-        let cm2 = CostMap2D::new_all_free("map", 20, 20, 0.1);
+        let mut cm2 = CostMap2D::new_all_free("map", 30, 30, 0.1);
+        cm2.set_origin(Point2::new(-1.0, -1.0));
         lp2.update_costmap(cm2);
         lp2.start_planning(make_path2d(vec![
             Point2::new(0.0, 0.0),
             Point2::new(1.0, 0.0),
         ]));
-        let _ = lp2.step(0.3);
-        let _ = lp2.step(0.3);
+        let _ = lp2.step();
+        let _ = lp2.step();
         assert_eq!(
             counter2.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -1219,7 +1217,7 @@ mod tests {
     fn h14_orientations_length_mismatch_falls_back() {
         let mut cfg = LocalPlannerConfig::default_config();
         cfg.orientation_tolerance = 0.1;
-        let mut lp = LocalPlanner::with_config(cfg);
+        let mut lp = LocalPlanner::with_config(cfg, nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         // 路径 2 个点但给 3 个 yaw → 回退到段方向启发式
         lp.start_planning_with_orientations(
             make_path2d(vec![Point2::new(0.0, 0.0), Point2::new(1.0, 0.0)]),
@@ -1229,7 +1227,7 @@ mod tests {
         lp.update_costmap(cm);
         // robot 位于 (0.1, 0),远未到 goal,朝向=0 与段方向一致
         lp.handle_odom(make_pose_stamped("map", 0.1, 0.0, 0.0));
-        let _ = lp.step(0.3);
+        let _ = lp.step();
         // 回退到段方向=0,与 robot 朝向 0 一致,且不在 position_in_tol (dx=0.1 > 0.1)
         // → 进入 PathFollowing(若在 tolerance 内+已在 start 位置则进 FinalRotation)
         assert_eq!(lp.state(), LocalPlannerState::PathFollowing);

@@ -40,14 +40,14 @@ async fn repeated_current_path_refusals_are_rate_limited_and_cancellable() {
 }
 fn fixture() -> (Arc<SurfaceSnapshot>,PoseStamped,schema::GoalEnvelope,SurfaceNavigationConfig,SurfaceReplanFeedback) {
     let mut config=config();
-    config.apply_calibration(Some(nuwax_nav_types_messages::RobotGeometry {
+    config.apply_calibration(nuwax_nav_types_messages::RobotGeometry {
         self_collision:None,footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
         z_min_m:-0.05,z_max_m:0.2,source:"replan adapter fixture".into(),
-    }),None).unwrap();
+    }, None).unwrap();
     let points:Vec<_>=(0..30).flat_map(|x|(0..20).map(move |y|
         ((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,0.05))).collect();
     let surface=Arc::new(SurfaceSnapshot::from_points(&points,config.geometry.clone(),0.1).unwrap()
-        .with_body_envelope(config.body_envelope.clone().unwrap()).unwrap());
+        .with_body_envelope(config.body_envelope.clone()).unwrap());
     let goal=goal_for(&map_message(1,"feedback"),1,[2.,1.,0.5]);
     let mut start=pose_from_schema(&goal.goal).unwrap();start.pose.position.x=0.5;
     let actual=Arc::new(ActualExecutionContext {measured_motion:None,source:surface.clone(),odometry:start.clone(),

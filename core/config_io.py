@@ -311,7 +311,7 @@ def _default_values():
 
 def _robot_geometry_preview(file_values: Dict[str, str]) -> Dict[str, object]:
     """只在设置查询中解析一次外形；这是下次启动输入的预览，不是进程生效证明。"""
-    keys = ROBOT_GEOMETRY_SETTING_KEYS | {"NUWAX_ACTIVE_ROBOT", "NUWAX_NAV_ROBOT_WIDTH_M"}
+    keys = ROBOT_GEOMETRY_SETTING_KEYS | {"NUWAX_ACTIVE_ROBOT"}
     values = {key: file_values.get(key, "") if _PROFILE_LOCATION.get() else os.environ.get(key, file_values.get(key, "")) for key in keys}
     base = {"configuration_source": "saved_files_plus_environment", "effective_confirmed": False}
     try:
@@ -325,7 +325,7 @@ def _robot_geometry_preview(file_values: Dict[str, str]) -> Dict[str, object]:
     labels = {
         "manual": "完整手填", "urdf_collision": "指定碰撞模型", "urdf_visual": "指定显示模型后备",
         "robot_default_urdf_collision": "驱动默认碰撞模型", "robot_default_urdf_visual": "驱动默认显示模型后备",
-        "legacy_default": "兼容默认外包", "manual_override": "手填覆盖", "legacy_nav_width": "旧导航宽度",
+        "legacy_default": "兼容默认外包", "manual_override": "手填覆盖",
     }
     source_label = "＋".join(labels.get(part, part) for part in geometry.source.split("+"))
     center = geometry.center_xyz_m

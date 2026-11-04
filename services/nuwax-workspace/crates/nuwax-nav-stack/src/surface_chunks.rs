@@ -845,7 +845,7 @@ mod tests {
                         }));
                         if capture.is_some() {inputs.push((current,[applied.linear.x,applied.linear.y,applied.angular_z],time));}
                         let mut arriving=false;
-                        let command=match follower.step(0.32) {
+                        let command=match follower.step() {
                             PlannerStep::Command(command)=>command,
                             PlannerStep::Succeeded=>{arriving=true;Twist2::ZERO},
                             PlannerStep::ReplanRequired(_) if follower.execution_cycle_complete()=>{

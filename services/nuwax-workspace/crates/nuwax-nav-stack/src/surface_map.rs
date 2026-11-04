@@ -221,7 +221,7 @@ impl SurfaceMapCache {
     pub fn configured(config: &crate::surface_config::SurfaceNavigationConfig) -> Self {
         let mut cache = Self::new(config.geometry.clone());
         cache.builder =
-            SurfaceMapBuilder::configured(config.geometry.clone(), config.body_envelope.clone());
+            SurfaceMapBuilder::configured(config.geometry.clone(), Some(config.body_envelope.clone()));
         cache
     }
 

@@ -73,11 +73,11 @@ async fn held_global_owner_keeps_unchanged_mask_work_but_changed_mask_retires_it
         body_path(map, pose, goal, configured).map(SurfacePlan::complete)
     });
     let mut configured = config();
-    configured.apply_calibration(Some(nuwax_nav_types_messages::RobotGeometry {
+    configured.apply_calibration(nuwax_nav_types_messages::RobotGeometry {
         self_collision: None,
         footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
         z_min_m: -0.05, z_max_m: 0.2, source: "mask reuse owner fixture".into(),
-    }), None).unwrap();
+    }, None).unwrap();
     let mut harness = Harness::start_with_config_rate(computer, Duration::from_millis(25), configured).await;
     {
         let mut feed = harness.feed.lock().unwrap();

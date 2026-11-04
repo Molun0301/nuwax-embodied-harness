@@ -106,7 +106,7 @@ impl NavPlanner for DispatchPlanner {
     fn replace_path(&mut self,path:Path2D) {self.inner.replace_path(path);}
     fn update_odometry(&mut self,pose:PoseStamped) {self.inner.update_odometry(pose);}
     fn update_costmap(&mut self,map:CostMap2D) {self.inner.update_costmap(map);}
-    fn step(&mut self,width:f64)->PlannerStep {self.bound=Some(handoff_bound(1_000_000_000));self.inner.step(width)}
+    fn step(&mut self)->PlannerStep {self.bound=Some(handoff_bound(1_000_000_000));self.inner.step()}
     fn take_command_dispatch_bound(&mut self)->Option<CommandDispatchBound> {self.bound.take()}
     fn stop(&mut self) {self.bound=None;self.inner.stop();}
 }

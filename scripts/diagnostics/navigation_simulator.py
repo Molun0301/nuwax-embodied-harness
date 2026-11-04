@@ -73,7 +73,6 @@ def worker_environment() -> dict[str, str]:
     return {
         **os.environ,
         "NUWAX_ROBOT_GEOMETRY_JSON": geometry.to_runtime_json(),
-        "NUWAX_NAV_BODY_TO_SUPPORT_Z_M": "0.4",
         "NUWAX_NAV_CAPABILITIES_JSON": "",
         "NUWAX_MAP_FRAME": "map",
         "_NUWAX_NAV_ACTUATOR_MOTION_MODEL": "omnidirectional",

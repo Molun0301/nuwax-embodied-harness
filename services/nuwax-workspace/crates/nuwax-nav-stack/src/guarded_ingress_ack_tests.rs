@@ -584,8 +584,7 @@ async fn matrix_scheduler(
         },
         nuwax_nav_runtime::SchedulerConfig {
             tick_interval: Duration::from_millis(5), renew_interval: Duration::from_millis(100),
-            path_wait_timeout: Duration::from_secs(5), robot_width_m: 0.3,
-            pose_ttl: Duration::from_secs(5), costmap_ttl: Duration::from_secs(5),
+            path_wait_timeout: Duration::from_secs(5), pose_ttl: Duration::from_secs(5), costmap_ttl: Duration::from_secs(5),
         },
     ).expect("matrix real scheduler configuration");
     let (handle, mut task) = nuwax_nav_runtime::spawn_scheduler(scheduler);

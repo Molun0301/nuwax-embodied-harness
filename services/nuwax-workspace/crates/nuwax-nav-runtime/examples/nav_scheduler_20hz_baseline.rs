@@ -97,7 +97,7 @@ impl NavPlanner for FakePlanner {
 
     fn update_costmap(&mut self, _costmap: CostMap2D) {}
 
-    fn step(&mut self, _robot_width_m: f64) -> PlannerStep {
+    fn step(&mut self) -> PlannerStep {
         self.ticks = self.ticks.saturating_add(1);
         if self.ticks >= self.succeed_after {
             PlannerStep::Succeeded
@@ -195,7 +195,6 @@ async fn run() -> Result<(), RuntimeError> {
             tick_interval: Duration::from_millis(50),
             renew_interval: Duration::from_millis(200),
             path_wait_timeout: Duration::from_secs(1),
-            robot_width_m: 0.3,
             pose_ttl: Duration::from_millis(500),
             costmap_ttl: Duration::from_millis(500),
         },

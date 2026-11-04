@@ -738,8 +738,8 @@ fn isolated_case(name:&str) {
             ("NUWAX_OCCUPANCY_SHM_PATH",root.join("occupancy.mmap").display().to_string()),
             ("NUWAX_GEOMETRY_EXPLORATION_RECONCILIATION_JOURNAL_PATH",root.join("explore.json").display().to_string()),
             ("NUWAX_FORBIDDEN_ZONES_PATH",root.join("forbidden.json").display().to_string()),
-            ("NUWAX_NAV_BODY_TO_SUPPORT_Z_M","0.4".into()),("NUWAX_NAV_ROBOT_WIDTH_M","0.3".into()),
-            ("NUWAX_NAV_ROBOT_HEIGHT_M","0.55".into()),("NUWAX_NAV_SURFACE_VOXEL_SIZE_M","0.1".into()),
+
+            ("NUWAX_NAV_SURFACE_VOXEL_SIZE_M","0.1".into()),
             ("NUWAX_ROBOT_GEOMETRY_JSON",BODY.into()),("NUWAX_NAV_CAPABILITIES_JSON",CAPABILITIES.into())];
         for (key,value) in config {std::env::set_var(key,value);}
         let result=std::panic::catch_unwind(||tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap()

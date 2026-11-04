@@ -18,7 +18,7 @@ impl NavPlanner for DeliveryGapPlanner {
     fn update_odometry(&mut self, pose: PoseStamped) { self.blocked_pose = pose.pose.position.x > 0.5; }
     fn update_costmap(&mut self, map: CostMap2D) { self.blocked_map = map.width() != 40; }
     fn observe_applied_command(&mut self, command: Twist2) { self.applied = command; }
-    fn step(&mut self, _: f64) -> PlannerStep {
+    fn step(&mut self) -> PlannerStep {
         if !self.gated && self.applied != Twist2::ZERO {
             self.gated = true;
             self.entered.send(()).unwrap();
@@ -179,7 +179,7 @@ async fn delivery_gap_queued_sources_are_admitted_before_ready_publication() {
     for moved_pose in [false, true] {
         let (mut scheduler, _, release) = delivery_gap_fixture(DEFAULT_TICK_INTERVAL).await;
         let applied_before = scheduler.status.applied_commands;
-        let publication = scheduler.planner.prepare_control_step(0.3, false).unwrap();
+        let publication = scheduler.planner.prepare_control_step(false).unwrap();
         let (handle, task) = spawn_scheduler(scheduler);
         let mut status = handle.subscribe_status();
         tokio::time::sleep(Duration::from_millis(60)).await;

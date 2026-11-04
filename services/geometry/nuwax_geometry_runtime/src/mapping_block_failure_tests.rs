@@ -18,8 +18,7 @@ async fn ground_block_write_conflict_keeps_runtime_alive_and_new_session_recover
     handle.task_control = Some(control.clone());
     // 真实生产配置的探索来源按同一持久运行代际和提交时钟绑定。
     if handle.nav.configured_profile() == crate::nav_runtime::PROFILE_MLS3D {
-        handle.explore.configure_surface_source(Ok(nuwax_nav_stack::surface_config::SurfaceNavigationConfig::new(
-            "map".into(),0.5,0.2,0.6,0.1,0.15,18.0,0.2).unwrap()),
+        handle.explore.configure_surface_source(Ok(nuwax_nav_stack::surface_config::SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.2)/2., -(0.2)/2.], [(0.2)/2., -(0.2)/2.], [(0.2)/2., (0.2)/2.], [-(0.2)/2., (0.2)/2.]], z_min_m: -(0.5), z_max_m: (0.6)-(0.5), source: "测试外形".into() }, 0.1, 0.15, 18.0, 0.2).unwrap()),
             handle.nav.producer_runtime_generation(), fixture.context.mapping.lock().mapping_commit_boot_nonce().to_be_bytes()).await.unwrap();
     }
     // 三层现在必须正常编码；失败隔离改用实际不可变对象写入冲突，不修改编码结果。

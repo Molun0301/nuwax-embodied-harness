@@ -4954,7 +4954,6 @@ impl GeometryRuntime for GeometryRuntimeService {
                         .map_err(|_| Status::internal("cancel generation exceeds wire range"))?,
                         committed_map,
                         boundary_id: String::new(),
-                        body_to_support_z_m: None,
                         boundary_points: Vec::new(),
 
                         motion_guard_boot_nonce: request

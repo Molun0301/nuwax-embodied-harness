@@ -24,7 +24,7 @@ fn zero_position_real_arrival_requalification_preserves_exact_xyz_only() {
         harness.worker.replace_execution_path(ExecutionPath::Surface(Path3D {
             poses: vec![goal.clone(), goal.clone()],
         }), None, goal.clone()).unwrap();
-        assert!(matches!(harness.worker.step(0.3), PlannerStep::Pending(_)));
+        assert!(matches!(harness.worker.step(), PlannerStep::Pending(_)));
         let actual_computation = harness.next_computation();
         assert_eq!(actual_computation.outcome, PlannerStep::Succeeded);
         assert_eq!(actual_computation.odometry.pose.position, goal.pose.position);
@@ -62,7 +62,7 @@ fn zero_position_real_arrival_requalification_preserves_exact_xyz_only() {
         assert_eq!(observed.3, observed.4);
         assert_eq!(observed.5, observed.6);
         assert_eq!(observed.7, observed.8);
-        assert_eq!(harness.worker.step(0.3), if nearby {
+        assert_eq!(harness.worker.step(), if nearby {
             PlannerStep::Pending(Vec::new())
         } else { PlannerStep::Succeeded });
         // Any queued negative-case computation remains gated. Drop handles stop

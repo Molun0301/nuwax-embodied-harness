@@ -2845,6 +2845,60 @@ impl SurfaceSnapshot {
 
     // Same source query, with an already selected native key in this column.
     // Cross-column navigation supplies only its independent height hint.
+    /// 身体正下方地面：取轮廓内最近的有地面列，再取不高于机体的最高层。
+    pub fn ground_below(&self, footprint: &[[f64; 2]], body: [f64; 3], yaw: f64) -> Option<f64> {
+        let (sin, cos) = yaw.sin_cos();
+        let polygon: Vec<_> = footprint.iter().map(|point| [
+            body[0] + cos * point[0] - sin * point[1],
+            body[1] + sin * point[0] + cos * point[1],
+        ]).collect();
+        let query = PolygonQuery::new(&polygon);
+        let size = self.observations.as_ref().map_or(f64::from(self.config().voxel_size),
+            |observations| f64::from(observations.size_m));
+        let bounds = polygon.iter().fold([[f64::INFINITY; 2], [f64::NEG_INFINITY; 2]], |mut bounds, point| {
+            for axis in 0..2 { bounds[0][axis] = bounds[0][axis].min(point[axis]); bounds[1][axis] = bounds[1][axis].max(point[axis]); }
+            bounds
+        });
+        let mut nearest: Option<(f64, f64)> = None;
+        for x in (bounds[0][0] / size).floor() as i32..=(bounds[1][0] / size).floor() as i32 {
+            for y in (bounds[0][1] / size).floor() as i32..=(bounds[1][1] / size).floor() as i32 {
+                if !query.intersects(x, y, size) { continue; }
+                let center = [(f64::from(x) + 0.5) * size, (f64::from(y) + 0.5) * size];
+                let Some(height) = self.column_ground_heights(center).into_iter()
+                    .filter(|height| *height <= body[2]).max_by(f64::total_cmp) else { continue; };
+                let distance = (center[0] - body[0]).powi(2) + (center[1] - body[1]).powi(2);
+                if nearest.is_none_or(|(previous, _)| distance < previous) { nearest = Some((distance, height)); }
+            }
+        }
+        nearest.map(|(_, height)| height)
+    }
+
+    /// 读取同一列的各地面层，不插值、不借用其它列。
+    fn column_ground_heights(&self, xy: [f64; 2]) -> Vec<f64> {
+        if let Some(observations) = &self.observations {
+            let fine = f64::from(observations.size_m);
+            let column = xy.map(|value| (value / fine).floor() as i32);
+            if self.ground_evidence == GroundEvidence::MeasuredSurface {
+                let heights: Vec<_> = observations.ground_records(column).filter_map(|record| record.height_at(xy)).collect();
+                if !heights.is_empty() { return heights; }
+            }
+            if observations.classified_empty_ground(column) { return Vec::new(); }
+            let heights: Vec<_> = self.fine_contact_bands(column[0], column[1]).iter()
+                .map(|band| GroundLayer::from_voxel_run(band.run, fine, self.ground_evidence)
+                    .expect("有效地面带").representative_z).collect();
+            if !heights.is_empty() || observations.is_complete_geometry_source() { return heights; }
+        }
+        let size = f64::from(self.config().voxel_size);
+        let x = (xy[0] / size).floor() as i32;
+        let y = (xy[1] / size).floor() as i32;
+        self.data.physical_graph.surface_lookup.get(&(x, y)).into_iter().flatten().filter_map(|&z| {
+            let top = self.ground_cell_position((x, y, z))[2];
+            let quantum = f64::from(self.source_voxel_size_m());
+            let bottom = self.observed_support_lower_bound((x, y, z)).min(top - quantum);
+            GroundLayer::from_legacy_band([bottom, top], quantum, self.ground_evidence).map(|layer| layer.representative_z)
+        }).collect()
+    }
+
     fn direct_ground_query_selected(&self,xy:[f64;2],reference:f64,selected:Option<GroundKey>,
         native:Option<&mut Option<NativeGroundSource>>)->GroundQuery {
         if let Some(observations)=&self.observations {

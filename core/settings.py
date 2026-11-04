@@ -1155,8 +1155,6 @@ def load_config() -> NuwaxRobotBridgeConfig:
             "NUWAX_ROBOT_CENTER_X_M": _cfg_str("NUWAX_ROBOT_CENTER_X_M", ""),
             "NUWAX_ROBOT_CENTER_Y_M": _cfg_str("NUWAX_ROBOT_CENTER_Y_M", ""),
             "NUWAX_ROBOT_CENTER_Z_M": _cfg_str("NUWAX_ROBOT_CENTER_Z_M", ""),
-            # 只继承确实配置的旧宽度，不能把三维默认值写成通用外形的手填覆盖。
-            "NUWAX_NAV_ROBOT_WIDTH_M": _raw_value("NUWAX_NAV_ROBOT_WIDTH_M", ""),
         }),
     )
 

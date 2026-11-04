@@ -1218,23 +1218,7 @@ async fn run_guarded_nav_scheduler(
     let status = scheduler.subscribe_status();
     signal_ready(ready)?;
 
-    let loop_future = run_guarded_nav_loop(
-        &node,
-        &transport,
-        &scheduler,
-        shutdown,
-        goals,
-        poses,
-        paths,
-        costmaps,
-        cancels,
-        status,
-        Some(source_max_age),
-        planar_navigation_enabled(),
-        &body_reference_frame_id,
-        None,
-        None,
-    );
+    let loop_future = run_guarded_nav_loop(&node, &transport, &scheduler, shutdown, goals, poses, paths, costmaps, cancels, status, Some(source_max_age), planar_navigation_enabled(), &body_reference_frame_id, None);
     let task_future = async move {
         task.await
             .map_err(|error| NavStackError::Internal(format!("guard scheduler join: {error}")))?
@@ -1481,7 +1465,6 @@ async fn run_guarded_nav_loop<M, T>(
     source_max_age: Option<Duration>,
     planar_mode: bool,
     body_reference_frame_id: &str,
-    surface_support_z_m: Option<f64>,
     recent_source_max_age: Option<Duration>,
 ) -> NavStackResult<()>
 where
@@ -1854,7 +1837,7 @@ where
             }
             GuardedNavEvent::Goal(message) => {
                 let frame = required_frame(message, "guarded_nav_scheduler.goal")?;
-                let goal_envelope = match decode_configured_goal_envelope(&frame.payload, body_reference_frame_id, surface_support_z_m) {
+                let goal_envelope = match decode_configured_goal_envelope(&frame.payload, body_reference_frame_id) {
                     Ok(envelope) => envelope,
                     Err(error) => {
                         // 契约完整但本机配置拒绝的目标仍属于原请求。保留不可执行
@@ -4188,7 +4171,6 @@ fn planner_goal_identity_matches(
         && left.goal.header.frame_id == right.goal.header.frame_id
         && left.options == right.options
         && left.body_reference_frame_id == right.body_reference_frame_id
-        && left.body_to_support_z_m == right.body_to_support_z_m
         && left.map_frame_generation == right.map_frame_generation
         && left.motion_guard_boot_nonce == right.motion_guard_boot_nonce
         && left.motion_stop_generation == right.motion_stop_generation
@@ -4430,25 +4412,18 @@ fn validate_newer_source_timestamp(
 fn decode_configured_goal_envelope(
     payload: &[u8],
     body_reference_frame_id: &str,
-    surface_support_z_m: Option<f64>,
 ) -> nuwax_codec::CodecResult<schema::GoalEnvelope> {
     let message = schema::decode_goal_envelope_body(payload)?;
-    validate_goal_reference(&message, body_reference_frame_id, surface_support_z_m)?;
+    validate_goal_reference(&message, body_reference_frame_id)?;
     Ok(message)
 }
 
 fn validate_goal_reference(
     message: &schema::GoalEnvelope,
     body_reference_frame_id: &str,
-    surface_support_z_m: Option<f64>,
 ) -> nuwax_codec::CodecResult<()> {
     if message.body_reference_frame_id != body_reference_frame_id {
         return Err(nuwax_codec::CodecError::LcmDecode("navigation body reference differs across owners".into()));
-    }
-    if let (Some(declared), Some(expected)) = (message.body_to_support_z_m, surface_support_z_m) {
-        if declared != expected {
-            return Err(nuwax_codec::CodecError::LcmDecode("goal support conversion differs from execution owner".into()));
-        }
     }
     Ok(())
 }
@@ -4738,7 +4713,7 @@ async fn run_native_planner_path_adapter_with_transport(
             _ = &mut shutdown => break,
             frame = goals.next() => {
                 let frame = required_frame(frame, "native_planner_path_adapter.goal")?;
-                let goal = match decode_configured_goal_envelope(&frame.payload, &body_reference_frame_id, None) {
+                let goal = match decode_configured_goal_envelope(&frame.payload, &body_reference_frame_id) {
                     Ok(goal) => goal,
                     Err(_) => continue,
                 };
@@ -5043,7 +5018,7 @@ async fn run_simple_planner(
             }
             message = goal_pose.next() => {
                 let frame = required_frame(message, "simple_planner.goal_pose")?;
-                let envelope = match decode_configured_goal_envelope(&frame.payload, &body_reference_frame_id, None) {
+                let envelope = match decode_configured_goal_envelope(&frame.payload, &body_reference_frame_id) {
                     Ok(envelope) => envelope,
                     Err(error) => {
                         diagnostics.reject("simple_planner.goal_pose", &error.to_string());
@@ -5282,13 +5257,11 @@ async fn run_astar_planner_with_transport(
     let mut costmap = typed_stream(&transport, &node.inputs[1], "nav_msgs.OccupancyGrid").await?;
     let mut goal = typed_stream(&transport, &node.inputs[2], "nuwax_msgs.GoalEnvelope").await?;
     let mut stop = typed_stream(&transport, &node.inputs[3], "std_msgs.Bool").await?;
-    let robot_geometry = std::env::var("NUWAX_ROBOT_GEOMETRY_JSON").ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| nuwax_nav_types_messages::RobotGeometry::from_runtime_json(&value))
-        .transpose().map_err(NavStackError::InvalidConfig)?;
-    let config = nuwax_nav_astar::GlobalPlannerConfig {
-        robot_geometry, ..nuwax_nav_astar::GlobalPlannerConfig::default()
-    };
+    let value = std::env::var("NUWAX_ROBOT_GEOMETRY_JSON")
+        .map_err(|error| NavStackError::InvalidConfig(error.to_string()))?;
+    let robot_geometry = nuwax_nav_types_messages::RobotGeometry::from_runtime_json(&value)
+        .map_err(NavStackError::InvalidConfig)?;
+    let config = nuwax_nav_astar::GlobalPlannerConfig::new(robot_geometry);
     let mut module = ReplanningAStarPlannerModule::new(config);
     NavigationInterface::start(&mut module)
         .map_err(|error| module_error("astar_planner", error))?;
@@ -5461,7 +5434,7 @@ async fn run_astar_planner_with_transport(
             }
             message = goal.next() => {
                 let frame = required_frame(message, "astar_planner.goal")?;
-                let envelope = match decode_configured_goal_envelope(&frame.payload, &body_reference_frame_id, None) {
+                let envelope = match decode_configured_goal_envelope(&frame.payload, &body_reference_frame_id) {
                     Ok(envelope) => envelope,
                     Err(error) => {
                         diagnostics.reject("astar_planner.goal", &error.to_string());
@@ -8151,7 +8124,7 @@ mod guarded_tests {
         }
 
         async fn revoke_and_zero(&mut self, operation_id: &str)
-            -> Result<nuwax_nav_runtime::FenceProof, nuwax_nav_runtime::MotionPortError>
+            -> Result<Option<nuwax_nav_runtime::FenceProof>, nuwax_nav_runtime::MotionPortError>
         {
             self.inner.revoke_and_zero(operation_id).await
         }
@@ -8269,7 +8242,7 @@ mod guarded_tests {
             Box<
                 dyn Future<
                         Output = Result<
-                            nuwax_nav_runtime::FenceProof,
+                            Option<nuwax_nav_runtime::FenceProof>,
                             nuwax_nav_runtime::MotionPortError,
                         >,
                     > + Send
@@ -8283,11 +8256,11 @@ mod guarded_tests {
         {
             Box::pin(async move {
                 self.0.lock().unwrap().push(format!("zero:{operation_id}"));
-                Ok(nuwax_nav_runtime::FenceProof {
+                Ok(Some(nuwax_nav_runtime::FenceProof {
                     zero_ack_id: "zero-pending-goal".into(),
                     applied_monotonic_ns: 100,
                     lease: nuwax_nav_runtime::FenceLeaseState::Idle,
-                })
+                }))
             })
         }
     }
@@ -8304,7 +8277,7 @@ mod guarded_tests {
 
         fn update_costmap(&mut self, _costmap: nuwax_nav_astar::navigation_map::CostMap2D) {}
 
-        fn step(&mut self, _robot_width_m: f64) -> nuwax_nav_runtime::PlannerStep {
+        fn step(&mut self) -> nuwax_nav_runtime::PlannerStep {
             if self
                 .succeeds
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -8653,14 +8626,14 @@ mod guarded_tests {
         async fn spawn() -> Self {Self::spawn_with_planar_mode(false).await}
 
         async fn spawn_with_planar_mode(planar_mode:bool) -> Self {
-            Self::spawn_with_reference(planar_mode, "base_link", None).await
+            Self::spawn_with_reference(planar_mode, "base_link").await
         }
 
-        async fn spawn_with_reference(planar_mode:bool, body_reference: &'static str, support: Option<f64>) -> Self {
-            Self::spawn_with_first_acquire(planar_mode, body_reference, support, false).await
+        async fn spawn_with_reference(planar_mode:bool, body_reference: &'static str) -> Self {
+            Self::spawn_with_first_acquire(planar_mode, body_reference, false).await
         }
 
-        async fn spawn_with_first_acquire(planar_mode:bool, body_reference: &'static str, support: Option<f64>, reject_first: bool) -> Self {
+        async fn spawn_with_first_acquire(planar_mode:bool, body_reference: &'static str, reject_first: bool) -> Self {
             static NEXT_LOOP_ID: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             let loop_id = NEXT_LOOP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -8684,7 +8657,6 @@ mod guarded_tests {
                     tick_interval: Duration::from_millis(5),
                     renew_interval: Duration::from_millis(100),
                     path_wait_timeout: Duration::from_secs(5),
-                    robot_width_m: 0.3,
                     pose_ttl: Duration::from_secs(5),
                     costmap_ttl: Duration::from_secs(5),
                 },
@@ -8730,23 +8702,7 @@ mod guarded_tests {
             let loop_transport = transport.clone();
             let publication_probe=Arc::new(Mutex::new(PublicationProbe::default()));
             let loop_task = tokio::spawn(PUBLICATION_PROBE.scope(Arc::clone(&publication_probe),async move {
-                run_guarded_nav_loop(
-                    &node,
-                    &loop_transport,
-                    &loop_scheduler,
-                    shutdown_rx,
-                    goal_stream,
-                    pose_stream,
-                    path_stream,
-                    costmap_stream,
-                    cancel_stream,
-                    status,
-                    None,
-                    planar_mode,
-                    body_reference,
-                    support,
-                    None,
-                )
+                run_guarded_nav_loop(&node, &loop_transport, &loop_scheduler, shutdown_rx, goal_stream, pose_stream, path_stream, costmap_stream, cancel_stream, status, None, planar_mode, body_reference, None)
                 .await
             }));
 
@@ -9192,7 +9148,7 @@ mod guarded_tests {
 
     #[tokio::test]
     async fn rejected_lease_publishes_candidate_failure_and_owner_accepts_next_goal() {
-        let mut harness = GuardedLoopHarness::spawn_with_first_acquire(false, "base_link", None, true).await;
+        let mut harness = GuardedLoopHarness::spawn_with_first_acquire(false, "base_link", true).await;
         harness.send_pose(1);
         harness.wait_for_pose(1).await;
         harness.send_costmap(11);
@@ -9262,62 +9218,14 @@ mod guarded_tests {
         harness.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn support_rejected_goal_stays_cancellable_and_cannot_reactivate() {
-        let mut harness = GuardedLoopHarness::spawn_with_reference(false, "base_link", Some(0.4)).await;
-        let mut goal = sealed_goal("support-rejected");
-        goal.body_to_support_z_m = Some(0.6);
-        harness.send_goal_and_wait_dequeued(&goal).await;
-        harness.assert_no_session().await;
-        harness.send_pose(1);
-        harness.wait_for_pose(1).await;
-        harness.send_costmap(11);
-        harness.wait_for_costmap(11).await;
-        harness.assert_no_session().await;
-        assert_eq!(harness.motion_call_count("acquire:"), 0);
-        harness.send_cancel(&goal, 1);
-        let terminal = harness.wait_for_correlated_zero(&goal, 1).await;
-        assert_eq!(terminal.producer_runtime_generation, goal.producer_runtime_generation);
-        assert_eq!(terminal.planner_runtime_generation, 0);
-        assert_eq!(harness.motion_call_count("zero:"), 1);
-        let mut next = sealed_goal("support-recovered");
-        next.goal_generation = goal.goal_generation + 1;
-        next.body_to_support_z_m = Some(0.4);
-        harness.send_goal_and_wait_dequeued(&next).await;
-        harness.wait_for_session(&next.session_id).await;
-        harness.send_cancel(&next, 1);
-        harness.wait_for_correlated_zero(&next, 1).await;
-        harness.shutdown().await;
-    }
-
     #[test]
-    fn goal_reference_contract_uses_only_consumed_body_and_support_facts() {
+    fn goal_reference_contract_uses_the_consumed_body_frame() {
         let mut goal = sealed_goal("reference-contract");
-        let captured_body = Arc::<str>::from("base_link");
-        assert!(validate_goal_reference(&goal, &captured_body, None).is_ok());
-        // Explicit public body poses do not consume Geometry's support conversion.
-        assert!(validate_goal_reference(&goal, &captured_body, Some(0.2)).is_ok());
-        assert!(validate_goal_reference(&goal, &captured_body, Some(0.9)).is_ok());
+        assert!(validate_goal_reference(&goal, "base_link").is_ok());
         goal.body_reference_frame_id = "body".into();
-        assert!(validate_goal_reference(&goal, &captured_body, None).is_err());
-        goal.body_reference_frame_id = captured_body.to_string();
-        goal.owner_kind = schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD;
-        goal.producer = "wavefront".into();
-        // Mission-return home is an original body pose, not a support-derived endpoint.
-        // None is also the valid planar exploration contract.
-        assert!(validate_goal_reference(&goal, &captured_body, Some(0.4)).is_ok());
-        assert!(validate_goal_reference(&goal, &captured_body, None).is_ok());
-        goal.body_to_support_z_m = Some(0.4);
-        assert!(validate_goal_reference(&goal, &captured_body, Some(0.4)).is_ok());
-        assert!(validate_goal_reference(&goal, &captured_body, Some(0.6)).is_err());
-        // Planar owners do not consume support offsets; their existing coordinate/profile rules still apply.
-        assert!(validate_goal_reference(&goal, &captured_body, None).is_ok());
-        // The assigned contract is preserved on sloped body poses, where offset affects XY too.
-        goal.goal.pose.orientation_xyzw = [0.0, 0.3826834323650898, 0.0, 0.9238795325112867];
-        let body = schema::encode_goal_envelope_body(&goal).unwrap();
-        assert!(decode_configured_goal_envelope(&body, &captured_body, Some(0.4)).is_ok());
-        assert!(decode_configured_goal_envelope(&body, &captured_body, Some(0.6)).is_err());
-        assert!(decode_configured_goal_envelope(&body, &captured_body, None).is_ok());
+        assert!(validate_goal_reference(&goal, "base_link").is_err());
+        let encoded = schema::encode_goal_envelope_body(&goal).unwrap();
+        assert!(decode_configured_goal_envelope(&encoded, "body").is_ok());
     }
 
     #[test]
@@ -9347,7 +9255,7 @@ mod guarded_tests {
                 assert_eq!(observed.pose.pose.position, [4.0, 6.0, 0.5]);
                 let mut goal = sealed_goal("canonical-bound-goal");
                 goal.body_reference_frame_id = body.into();
-                assert!(decode_configured_goal_envelope(&schema::encode_goal_envelope_body(&goal).unwrap(), body, None).is_ok());
+                assert!(decode_configured_goal_envelope(&schema::encode_goal_envelope_body(&goal).unwrap(), body).is_ok());
                 let odom = schema::Odometry {
                     header: schema::Header { stamp_sec: 7, frame_id: "odom".into(), ..Default::default() },
                     child_frame_id: format!(" {body} "),
@@ -9938,12 +9846,6 @@ mod guarded_tests {
         assert!(clear_terminal_active_session(&mut active, &terminal));
         assert!(active.is_none());
 
-        let next = nuwax_nav_runtime::SchedulerStatus {
-            phase: SchedulerPhase::AwaitingPath,
-            session_id: Some("goal-b".into()),
-            ..nuwax_nav_runtime::SchedulerStatus::default()
-        };
-        assert!(scheduler_session_is_active(&next, "goal-b"));
     }
 
     #[test]
@@ -10163,15 +10065,6 @@ mod guarded_tests {
         };
         assert!(clear_terminal_active_session(&mut active, &terminal));
 
-        let second = nuwax_nav_runtime::SchedulerStatus {
-            phase: SchedulerPhase::Controlling,
-            session_id: Some("explore-parent:frontier-2".into()),
-            ..nuwax_nav_runtime::SchedulerStatus::default()
-        };
-        assert!(scheduler_session_is_active(
-            &second,
-            "explore-parent:frontier-2"
-        ));
     }
 
     #[test]
@@ -10395,154 +10288,6 @@ mod guarded_tests {
         assert!(!goal_buffer.has_applied_goal());
         assert_eq!(ready_a_again, goal_a_again);
         assert!(goal_buffer.mark_applied(&ready_a_again));
-    }
-
-    #[tokio::test]
-    async fn guarded_new_goal_fences_active_motion() {
-        let motion_calls = Arc::new(Mutex::new(Vec::<String>::new()));
-        let scheduler = nuwax_nav_runtime::NavScheduler::new(
-            RecordingMotion(Arc::clone(&motion_calls)),
-            CommandingPlanner {
-                succeeds: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                twist: Arc::new(Mutex::new(Twist2 {
-                    linear: Point2::new(0.2, 0.0),
-                    angular_z: 0.1,
-                })),
-            },
-            nuwax_nav_runtime::SchedulerConfig {
-                tick_interval: Duration::from_millis(5),
-                renew_interval: Duration::from_millis(100),
-                path_wait_timeout: Duration::from_secs(5),
-                robot_width_m: 0.3,
-                pose_ttl: Duration::from_secs(1),
-                costmap_ttl: Duration::from_secs(1),
-            },
-        )
-        .expect("guarded test scheduler");
-        let (handle, task) = nuwax_nav_runtime::spawn_scheduler(scheduler);
-        let mut status = handle.subscribe_status();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if status.borrow().motion_sink_ready {
-                    break;
-                }
-                status.changed().await.expect("scheduler status open");
-            }
-        })
-        .await
-        .expect("motion readiness");
-
-        let mut pose = PoseStamped::from_pose(Pose3::default(), NavFrameId::Map);
-        pose.stamp = Timestamp::from_unix(1, 0);
-        handle.update_odometry(pose).await.expect("map pose");
-        handle
-            .update_costmap(nuwax_nav_runtime::CostmapObservation {
-                costmap: nuwax_nav_runtime::ExecutionMap::Planar(
-                    nuwax_nav_astar::navigation_map::CostMap2D::new_all_free("map", 4, 4, 0.1),
-                ),
-                source_timestamp_ns: 1_000_000_000,
-            })
-            .await
-            .expect("map-a costmap");
-        let goal_a = sealed_goal("session-a");
-        let mut path_identity = guarded_goal_execution_identity(&goal_a);
-        path_identity.planner_runtime_generation = 1;
-        path_identity.path_revision = 1;
-        handle
-            .start_session(nuwax_nav_runtime::NavSession {
-            boundary: Vec::new(),
-            options: Default::default(),
-                goal: nuwax_nav_runtime::ExecutionGoal::Body(pose_from_schema(&goal_a.goal).expect("valid goal pose")),
-                session_id: goal_a.session_id.clone(),
-                execution_identity: guarded_goal_execution_identity(&goal_a),
-
-                motion_admission: nuwax_nav_runtime::NavMotionAdmission {
-
-                    guard_boot_nonce: goal_a.motion_guard_boot_nonce,
-                    motion_stop_generation: u64::try_from(goal_a.motion_stop_generation)
-                        .expect("non-negative stop generation"),
-                },
-            })
-            .await
-            .expect("map-a session");
-        handle
-            .submit_path(nuwax_nav_runtime::VersionedPath {
-                route_kind: nuwax_nav_runtime::RouteKind::Complete,
-                path_yaws: None,
-                session_id: goal_a.session_id.clone(),
-                execution_identity: path_identity,
-                path_revision: 1,
-                path: nuwax_nav_runtime::ExecutionPath::Planar(Path2D::stamped(
-                    NavFrameId::Map,
-                    Timestamp::from_unix(1, 0),
-                    vec![Point2::new(0.0, 0.0), Point2::new(1.0, 0.0)],
-                )),
-            })
-            .await
-            .expect("map-a path");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if motion_calls
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|call| call.starts_with("twist:"))
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("map-a APPLIED command");
-
-        let goal_b = rollover_goal(&goal_a, "session-b", 8, 1);
-        let mut goal_buffer = PlannerGoalBuffer::default();
-        assert!(goal_buffer.observe_costmap().is_none());
-        let ready_a = match goal_buffer.observe_goal(goal_a.clone()) {
-            PlannerGoalIngress::Ready(goal) => *goal,
-            outcome => panic!("map-a goal ready: {outcome:?}"),
-        };
-        assert!(goal_buffer.mark_applied(&ready_a));
-        let ready_b = match goal_buffer.observe_goal(goal_b.clone()) {
-            PlannerGoalIngress::Ready(goal) => *goal,
-            outcome => {
-                panic!("new goal must be ready with fresh planner inputs: {outcome:?}")
-            }
-        };
-        assert_eq!(ready_b, goal_b);
-        assert!(!goal_buffer.has_applied_goal());
-
-        let mut active_session = Some(goal_a);
-        let mut telemetry = GuardedNavTelemetry {
-            public_session_id: "session-a".into(),
-            owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
-            goal_generation: 3,
-            map_frame: "map".into(),
-            pose_frame: "map".into(),
-            path_revision: 1,
-            producer_runtime_generation: 22,
-            planner_runtime_generation: 33,
-            ..GuardedNavTelemetry::default()
-        };
-        fence_guarded_active_session(&handle, &mut telemetry, &mut active_session)
-            .await
-            .expect("pending map-b goal fences map-a");
-        assert!(active_session.is_none());
-        assert_eq!(telemetry.path_revision, 0);
-        assert_eq!(telemetry.producer_runtime_generation, 0);
-        assert_eq!(telemetry.planner_runtime_generation, 0);
-        assert!(goal_buffer.pending_goal.is_none());
-        assert!(motion_calls
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|call| call.starts_with("zero:")));
-
-        handle.shutdown().await.expect("shutdown scheduler");
-        task.await
-            .expect("scheduler task")
-            .expect("scheduler shutdown");
     }
 
     #[test]
@@ -11201,7 +10946,7 @@ mod guarded_tests {
             OCCUPIED
         );
 
-        let mut planner = LocalPlanner::with_config(LocalPlannerConfig::default_config());
+        let mut planner = LocalPlanner::with_config(LocalPlannerConfig::default_config(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         planner.update_costmap(match input.observation.costmap {
             nuwax_nav_runtime::ExecutionMap::Planar(map) => map,
             _ => panic!("expected planar map"),
@@ -11220,7 +10965,7 @@ mod guarded_tests {
             vec![Point2::new(1.0, 0.5), Point2::new(2.0, 0.5)],
         ));
 
-        let (_, stop) = planner.step(0.3);
+        let (_, stop) = planner.step();
         assert_eq!(stop, None, "未知格保留未知语义，不能冒充已观测障碍");
         let mut observed=schema::decode_occupancy_grid_body(&grid_body).unwrap();
         observed.data[5*width+15]=100;
@@ -11232,7 +10977,7 @@ mod guarded_tests {
         if let nuwax_nav_runtime::ExecutionMap::Planar(map)=input.observation.costmap {
             planner.update_costmap(map);
         } else {panic!("二维障碍被转换为其它地图");}
-        let (twist,stop)=planner.step(0.3);
+        let (twist,stop)=planner.step();
         assert_eq!(stop,Some(nuwax_nav_astar::local_planner::StopMessage::ObstacleFound));
         assert_eq!(twist,Twist2::ZERO);
     }
@@ -11595,7 +11340,7 @@ mod tests {
         assert_eq!(ready.boundary_points, expected_boundary);
 
         let mut planner =
-            ReplanningAStarPlannerModule::new(nuwax_nav_astar::GlobalPlannerConfig::default());
+            ReplanningAStarPlannerModule::new(nuwax_nav_astar::GlobalPlannerConfig::new(nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.5)/2., -(0.5)/2.], [(0.5)/2., -(0.5)/2.], [(0.5)/2., (0.5)/2.], [-(0.5)/2., (0.5)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }));
         NavigationInterface::start(&mut planner).expect("start A* planner");
         let mut robot_pose = PoseStamped::from_pose(
             Pose3 {
@@ -11630,7 +11375,7 @@ mod tests {
         };
 
         let mut planner =
-            ReplanningAStarPlannerModule::new(nuwax_nav_astar::GlobalPlannerConfig::default());
+            ReplanningAStarPlannerModule::new(nuwax_nav_astar::GlobalPlannerConfig::new(nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.5)/2., -(0.5)/2.], [(0.5)/2., -(0.5)/2.], [(0.5)/2., (0.5)/2.], [-(0.5)/2., (0.5)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }));
         NavigationInterface::start(&mut planner).expect("start A* planner");
         let mut robot_pose = PoseStamped::from_pose(
             Pose3 {
@@ -11749,7 +11494,7 @@ mod tests {
         use nuwax_nav_astar::module::{Module, NavigationInterface, ReplanningAStarPlannerModule};
 
         let mut planner =
-            ReplanningAStarPlannerModule::new(nuwax_nav_astar::GlobalPlannerConfig::default());
+            ReplanningAStarPlannerModule::new(nuwax_nav_astar::GlobalPlannerConfig::new(nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.5)/2., -(0.5)/2.], [(0.5)/2., -(0.5)/2.], [(0.5)/2., (0.5)/2.], [-(0.5)/2., (0.5)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }));
         NavigationInterface::start(&mut planner).expect("start A* planner");
         assert!(matches!(
             decode_planner_pose_input(&[0x55], "astar_planner.map_pose")

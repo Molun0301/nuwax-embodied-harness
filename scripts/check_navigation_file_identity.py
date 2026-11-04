@@ -63,7 +63,7 @@ def native_v2_progress():
             'stop_conditions': {'max_coverage_pct': None, 'no_frontier_timeout_ms': None, 'max_duration_ms': None, 'max_goals': None},
             'max_navigation_retries': 1, 'blacklist_radius_m': 3.0},
         'navigation_configuration': {'profile_version': 1, 'capabilities': None, 'geometry': None,
-            'body_to_support_z_m': None, 'base_frame': ''},
+            'base_frame': ''},
         'elapsed_ns': 500000000, 'reached_goals': 1, 'mission': None, 'return_reason': None,
         'sources': [{'name': 'wavefront', 'payload': json.dumps([1, {
             'regional_schedule': [2, [[[1, 2, 0], 2], [[3, -1, 0], 1]]],

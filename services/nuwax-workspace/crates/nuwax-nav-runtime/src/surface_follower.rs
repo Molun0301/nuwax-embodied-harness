@@ -298,7 +298,7 @@ impl SurfaceFollower {
         }
         else { PlannerStep::ReplanRequired(reason) }
     }
-    fn compute(&mut self, robot_width_m: f64) -> Result<Twist2, String> {
+    fn compute(&mut self) -> Result<Twist2, String> {
         self.update_progress();
         let map = self.map.as_ref().ok_or("等待局部感知")?;
         let pose = self.odometry.as_ref().ok_or("等待实际位姿")?;
@@ -318,13 +318,6 @@ impl SurfaceFollower {
             return Err("全局参考已结束，原业务目标未到，等待后续路线".into());
         }
         let mut config = self.config.scan;
-        config.body_width = robot_width_m;
-        config.body_length = robot_width_m;
-        config.body_height = f64::from(map.config().robot_height);
-        config.body_center_x = 0.;
-        config.body_center_y = 0.;
-        config.body_z_min = -self.config.body_to_support_z_m;
-        config.body_z_max = config.body_height - self.config.body_to_support_z_m;
         config.resolution = map.navigation_source_columns(None).0;
         config.body_to_ground = self.config.body_to_support_z_m;
         config.sample_dt = 1. / self.config.controller.control_frequency;
@@ -678,7 +671,7 @@ impl NavPlanner for SurfaceFollower {
         self.local_path.clone()
     }
     fn execution_cycle_complete(&self)->bool { self.execution_cycle_complete }
-    fn step(&mut self, robot_width_m: f64) -> PlannerStep {
+    fn step(&mut self) -> PlannerStep {
         self.execution_cycle_complete=false;
         self.execution_failed=false;
         self.motion_dispatch_bound=None;
@@ -688,7 +681,7 @@ impl NavPlanner for SurfaceFollower {
         if self.map.is_none() || self.odometry.is_none() || self.reference.is_empty() {
             return PlannerStep::Pending(Vec::new());
         }
-        match self.compute(robot_width_m) {
+        match self.compute() {
             Ok(command) => {
                 self.wait_reason = None;
                 PlannerStep::Command(command)
@@ -803,7 +796,7 @@ mod native_execution_tests {
         let mut moving=0;
         for _ in 0..40 {
             next_sample(&mut local);
-            match local.step(0.2) {
+            match local.step() {
                 PlannerStep::Command(command)=>{
                     let x=command.linear.x;
                     let y=command.linear.y+0.0256*command.angular_z;
@@ -836,7 +829,7 @@ mod native_execution_tests {
     fn advance_to_motion(follower: &mut SurfaceFollower) -> Twist2 {
         for _ in 0..20 {
             next_sample(follower);
-            let step = follower.step(0.3);
+            let step = follower.step();
             let PlannerStep::Command(command) = step else {
                 panic!("原生初始化后应交付运动：{step:?}");
             };
@@ -851,7 +844,7 @@ mod native_execution_tests {
     fn production_static_surface_does_not_impersonate_a_registered_scan() {
         let mut follower=follower(pose(0.5,1.,0.),test_snapshot(0.,false));
         follower.enable_author_static_map_fixture(false);
-        let error=follower.compute(0.3).unwrap_err();
+        let error=follower.compute().unwrap_err();
         assert!(error.contains("registered source frame"),"{error}");
         assert_eq!(follower.frame_ingestion_count,0);
     }
@@ -861,20 +854,20 @@ mod native_execution_tests {
         follower.enable_author_static_map_fixture(false);
         let frame=crate::registered_frame::test_frame(1);
         follower.observe_registered_frame(Some(frame.clone()));
-        let _=follower.compute(0.3); // This test asserts input delivery, not path feasibility.
+        let _=follower.compute(); // This test asserts input delivery, not path feasibility.
         assert_eq!(follower.frame_ingestion_count,1);
-        let _=follower.compute(0.3);
+        let _=follower.compute();
         assert_eq!(follower.frame_ingestion_count,1);
         assert_eq!(follower.registered_frame.as_ref().unwrap().points_world.as_ref(),frame.points_world.as_ref());
         let mut next=(*crate::registered_frame::test_frame(2)).clone();
         next.identity.domain.runtime_generation+=1;
         follower.observe_registered_frame(Some(Arc::new(next)));
         assert!(follower.ingested_frame.is_none());
-        let _=follower.compute(0.3);
+        let _=follower.compute();
         assert_eq!(follower.frame_ingestion_count,2);
         follower.observe_registered_frame(None);
         assert!(follower.registered_frame.is_none());
-        assert!(follower.compute(0.3).unwrap_err().contains("registered source frame"));
+        assert!(follower.compute().unwrap_err().contains("registered source frame"));
     }
     #[test]
     fn execution_goal_path_and_stop_preserve_same_frame_fusion_watermark() {
@@ -883,7 +876,7 @@ mod native_execution_tests {
         follower.enable_author_static_map_fixture(false);
         let frame=crate::registered_frame::test_frame(1);
         follower.observe_registered_frame(Some(frame.clone()));
-        let _=follower.compute(0.3);
+        let _=follower.compute();
         assert_eq!(follower.frame_ingestion_count,1);
         let key=follower.ingested_frame.clone();
         for retire in 0..3 {
@@ -898,7 +891,7 @@ mod native_execution_tests {
             }),None,goal.clone()).unwrap();
             assert_eq!(follower.ingested_frame,key);
             next_sample(&mut follower);
-            let _=follower.compute(0.3);
+            let _=follower.compute();
             assert_eq!(follower.frame_ingestion_count,1,"a new goal/path must not hit the same scan twice");
             assert!(Arc::ptr_eq(follower.registered_frame.as_ref().unwrap(),&frame));
         }
@@ -912,11 +905,11 @@ mod native_execution_tests {
         frame.dispatch_bound=Some(crate::CommandDispatchBound::from_same_host_monotonic_deadline(deadline));
         let frame=Arc::new(frame);
         follower.observe_registered_frame(Some(frame.clone()));
-        let _=follower.compute(0.3);assert_eq!(follower.frame_ingestion_count,1);
+        let _=follower.compute();assert_eq!(follower.frame_ingestion_count,1);
         // A real map geometry field, not a new observation or a new goal.
         follower.config.body_to_support_z_m+=0.01;
         next_sample(&mut follower);
-        let error=follower.compute(0.3).unwrap_err();
+        let error=follower.compute().unwrap_err();
         assert!(error.contains("unretired trajectory"),"{error}");
         assert_eq!(follower.frame_ingestion_count,1,"active curves cannot silently adopt new map geometry");
         follower.stop();
@@ -924,8 +917,8 @@ mod native_execution_tests {
         follower.replace_execution_path(ExecutionPath::Surface(Path3D {
             poses:vec![start,goal.clone()],
         }),None,goal).unwrap();
-        let _=follower.compute(0.3);assert_eq!(follower.frame_ingestion_count,2);
-        let _=follower.compute(0.3);assert_eq!(follower.frame_ingestion_count,2);
+        let _=follower.compute();assert_eq!(follower.frame_ingestion_count,2);
+        let _=follower.compute();assert_eq!(follower.frame_ingestion_count,2);
         assert!(Arc::ptr_eq(follower.registered_frame.as_ref().unwrap(),&frame));
         assert_eq!(follower.registered_frame.as_ref().unwrap().dispatch_bound,frame.dispatch_bound);
         assert_eq!(follower.ingested_frame.as_ref(),Some(&frame.identity));
@@ -944,13 +937,13 @@ mod native_execution_tests {
         let mut follower=follower(pose(0.5,1.,0.),test_snapshot(0.,false));
         follower.execution_cycle_complete=true;
         follower.update_odometry(pose(3.,1.,0.));
-        assert!(matches!(follower.step(0.3),PlannerStep::Succeeded));
+        assert!(matches!(follower.step(),PlannerStep::Succeeded));
         assert!(!follower.execution_cycle_complete());
         follower.execution_cycle_complete=true;
         follower.stop();
         assert!(!follower.execution_cycle_complete());
         follower.update_odometry(pose(0.5,1.,0.));
-        assert!(matches!(follower.step(0.3),PlannerStep::Pending(_)));
+        assert!(matches!(follower.step(),PlannerStep::Pending(_)));
     }
     #[test]
     fn author_exhausted_recovery_maps_to_terminal_failure_not_following_route() {
@@ -965,12 +958,12 @@ mod native_execution_tests {
             nuwax_nav_types_messages::BODY_OVERLAP_RECOVERY_FAILED)),PlannerStep::Failed(_)));
         follower.execution_failed=true;
         follower.update_odometry(pose(3.,1.,0.));
-        assert!(matches!(follower.step(0.3),PlannerStep::Succeeded));
+        assert!(matches!(follower.step(),PlannerStep::Succeeded));
         assert!(!follower.execution_failed);
         follower.execution_failed=true;follower.stop();
         assert!(!follower.execution_failed);
         follower.update_odometry(pose(0.5,1.,0.));
-        assert!(matches!(follower.step(0.3),PlannerStep::Pending(_)));
+        assert!(matches!(follower.step(),PlannerStep::Pending(_)));
     }
     #[test]
     fn profile_reverse_permission_never_invents_unknown_hardware_channels() {
@@ -991,13 +984,13 @@ mod native_execution_tests {
     #[test]
     fn missing_ground_advances_without_creating_odometry_or_progress() {
         let mut follower = follower(pose(0.5, 1., 0.), unknown());
-        assert!(matches!(follower.step(0.3), PlannerStep::Command(_)));
+        assert!(matches!(follower.step(), PlannerStep::Command(_)));
         assert!(advance_to_motion(&mut follower).linear.x > 0.);
         let current = follower.odometry.as_ref().unwrap().clone();
         let plans = follower.local_plans();
         let mut previous = None;
         for _ in 0..3 {
-            let PlannerStep::Command(command) = follower.step(0.3) else {
+            let PlannerStep::Command(command) = follower.step() else {
                 panic!("缺测地面应允许原生局部执行");
             };
             assert!(command.linear.x > 0.);
@@ -1030,7 +1023,7 @@ mod native_execution_tests {
         let mut follower = follower(pose(0.5,1.,0.),unknown());
         let applied=Twist2{linear:Point2::new(0.2,0.),angular_z:0.3};
         follower.observe_applied_command(applied);
-        let _=follower.step(0.3);
+        let _=follower.step();
         let boundary=follower.motion_boundary.as_ref().unwrap();
         assert_eq!(boundary.velocity,None);assert_eq!(boundary.yaw_rate,None);
         let context=follower.refresh_execution_context(applied).unwrap();
@@ -1042,12 +1035,12 @@ mod native_execution_tests {
         let mut follower=follower(pose(0.5,1.,0.),unknown());
         follower.observe_applied_command(Twist2{linear:Point2::new(0.2,0.),angular_z:0.3});
         let mut measured=crate::motion_feedback::tests::measured([0.;3],[0.;3]);
-        follower.observe_measured_motion(Some(measured.clone()));let _=follower.step(0.3);
+        follower.observe_measured_motion(Some(measured.clone()));let _=follower.step();
         assert_eq!(follower.motion_boundary.as_ref().unwrap().velocity,Some([0.;3]));
-        follower.observe_measured_motion(None);let _=follower.step(0.3);
+        follower.observe_measured_motion(None);let _=follower.step();
         assert_eq!(follower.motion_boundary.as_ref().unwrap().velocity,None);
         measured.source_timestamp_ns+=1;measured.body_linear_xyz=[0.1,0.,0.];
-        follower.observe_measured_motion(Some(measured));let _=follower.step(0.3);
+        follower.observe_measured_motion(Some(measured));let _=follower.step();
         assert_eq!(follower.motion_boundary.as_ref().unwrap().velocity,Some([0.1,0.,0.]));
     }
     #[test]
@@ -1076,9 +1069,9 @@ mod native_execution_tests {
         let progress = follower.progress_m();
         let reference = follower.reference.clone();
         assert_eq!(progress, 4., "重叠路口的实测进度不能退回首段");
-        assert!(matches!(follower.step(0.3), PlannerStep::Command(_)));
+        assert!(matches!(follower.step(), PlannerStep::Command(_)));
         next_sample(&mut follower);
-        assert!(matches!(follower.step(0.3), PlannerStep::Command(_)));
+        assert!(matches!(follower.step(), PlannerStep::Command(_)));
         assert_eq!(follower.reference, reference, "实测进度不得切尾重建作者A的完整时间参考");
         assert_eq!(
             follower.progress_m(),
@@ -1096,7 +1089,7 @@ mod native_execution_tests {
                 .unwrap(),
         );
         let mut follower = follower(pose(0.5, 1., 0.), source);
-        assert!(matches!(follower.step(0.3), PlannerStep::ReplanRequired(_)));
+        assert!(matches!(follower.step(), PlannerStep::ReplanRequired(_)));
     }
     #[test]
     fn moving_actual_pose_refreshes_the_static_window_before_entering_a_known_obstacle() {
@@ -1111,37 +1104,21 @@ mod native_execution_tests {
                 .unwrap(),
         );
         let mut follower = follower(pose(0.5, 1., 0.), map);
-        assert!(matches!(follower.step(0.3), PlannerStep::Command(_)));
+        assert!(matches!(follower.step(), PlannerStep::Command(_)));
         assert!(advance_to_motion(&mut follower).linear.x > 0.);
         let mut actual = pose(12.05, 1.05, 0.);
         actual.stamp.nanos += 30_000_000_000;
         follower.update_odometry(actual);
         assert!(
-            matches!(follower.step(0.3), PlannerStep::ReplanRequired(_)),
+            matches!(follower.step(), PlannerStep::ReplanRequired(_)),
             "地图内容不变时，真实位置进入新窗口仍须读到原有实体"
-        );
-    }
-
-    #[test]
-    fn declared_height_without_full_envelope_keeps_a_real_low_ceiling_blocking() {
-        let source = test_snapshot(0., false);
-        assert!(source.body_envelope().is_none());
-        let source = Arc::new(
-            source
-                .with_recent_obstacle_points(1, 1, 0, &[0], [(0, [0.5, 1., 0.68])])
-                .unwrap(),
-        );
-        let mut follower = follower(pose(0.5, 1., 0.), source);
-        assert!(
-            matches!(follower.step(0.3), PlannerStep::ReplanRequired(_)),
-            "原声明0.6米高度的机身顶达到0.7米，0.68米楼板不能因默认矮机身而放行"
         );
     }
 
     #[test]
     fn initial_turn_uses_native_checked_command_and_never_moves_progress_by_time() {
         let mut follower = follower(pose(0.5, 1., std::f64::consts::FRAC_PI_2), unknown());
-        assert!(matches!(follower.step(0.3), PlannerStep::Command(_)));
+        assert!(matches!(follower.step(), PlannerStep::Command(_)));
         let command = advance_to_motion(&mut follower);
         assert!(command.angular_z < 0.);
         assert!(command.linear.x >= 0.);

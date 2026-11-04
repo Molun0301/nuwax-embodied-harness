@@ -9,7 +9,7 @@ impl NavPlanner for RegisteredWorkerProbe {
     fn update_odometry(&mut self,_:PoseStamped) {}
     fn update_costmap(&mut self,_:CostMap2D) {}
     fn observe_registered_frame(&mut self,frame:Option<Arc<RegisteredFrame>>) {self.frame=frame;}
-    fn step(&mut self,_:f64)->PlannerStep {
+    fn step(&mut self)->PlannerStep {
         self.entered.send(self.frame.as_ref().map(|frame|frame.identity.clone())).unwrap();
         self.release.recv_timeout(Duration::from_secs(3)).unwrap();
         PlannerStep::Command(Twist2 {linear:nuwax_nav_types_messages::Point2::new(0.1,0.),angular_z:0.})
@@ -41,7 +41,7 @@ fn registered_generation_change_and_revocation_retire_inflight_results() {
     let (mut worker,started,release)=registered_probe();
     let original=crate::registered_frame::test_frame(1);
     worker.observe_registered_frame(Some(original.clone()));
-    worker.step(0.3);
+    worker.step();
     assert_eq!(started.recv_timeout(Duration::from_secs(1)).unwrap(),Some(original.identity.clone()));
     let mut replacement=(*crate::registered_frame::test_frame(2)).clone();
     replacement.identity.domain.runtime_generation+=1;
@@ -63,7 +63,7 @@ fn registered_generation_change_and_revocation_retire_inflight_results() {
 fn newer_scan_with_identical_points_retires_old_inflight_map_without_claiming_equal_probability() {
     let (mut worker,started,release)=registered_probe();
     let first=crate::registered_frame::test_frame(1);
-    worker.observe_registered_frame(Some(first.clone()));worker.step(0.3);
+    worker.observe_registered_frame(Some(first.clone()));worker.step();
     assert_eq!(started.recv_timeout(Duration::from_secs(1)).unwrap(),Some(first.identity.clone()));
     let initial=worker.shared.0.lock().unwrap().map_version;
     let mut last=first.clone();
@@ -79,6 +79,6 @@ fn newer_scan_with_identical_points_retires_old_inflight_map_without_claiming_eq
     assert_eq!(worker.shared.0.lock().unwrap().map_version,initial+3);
     assert!(worker.shared.0.lock().unwrap().result.is_none());
     release.send(()).unwrap();wait_for_source_result(&worker);
-    assert!(matches!(worker.step(0.3),PlannerStep::Command(_)));
+    assert!(matches!(worker.step(),PlannerStep::Command(_)));
     worker.stop();
 }

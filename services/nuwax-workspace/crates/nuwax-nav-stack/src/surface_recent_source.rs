@@ -170,7 +170,7 @@ mod tests {
             },producer_runtime_generation:17,map_frame_generation:1,cloud_revision:1,
             cloud_occupancy_revision:1,cloud_commit_sequence:1,cloud_source_timestamp_ns:1,commit_boot_nonce:[7;16],
         };
-        let config=crate::surface_config::SurfaceNavigationConfig::new("map".into(),0.4,0.3,0.6,0.1,0.2,35.0,0.2).unwrap();
+        let config=crate::surface_config::SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.2, 35.0, 0.2).unwrap();
         let points:Vec<_>=(0..40).flat_map(|x|(0..30).map(move|y|((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,0.05))).collect();
         let map=Arc::new(SurfaceSnapshot::from_points(&points,config.geometry,0.1).unwrap());
         let planner=nuwax_nav_runtime::SurfaceFollower::new(config.follower).unwrap();
@@ -229,7 +229,7 @@ mod tests {
             },producer_runtime_generation:17,map_frame_generation:1,cloud_revision:1,
             cloud_occupancy_revision:1,cloud_commit_sequence:1,cloud_source_timestamp_ns:1,commit_boot_nonce:[7;16],
         };
-        let config=crate::surface_config::SurfaceNavigationConfig::new("map".into(),0.4,0.3,0.6,0.1,0.2,35.0,0.2).unwrap();
+        let config=crate::surface_config::SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.2, 35.0, 0.2).unwrap();
         let points:Vec<_>=(0..40).flat_map(|x|(0..30).map(move|y|((x as f32+0.5)*0.1,(y as f32+0.5)*0.1,0.05))).collect();
         let map=Arc::new(SurfaceSnapshot::from_points(&points,config.geometry,0.1).unwrap());
         let planner=nuwax_nav_runtime::SurfaceFollower::new(config.follower).unwrap();

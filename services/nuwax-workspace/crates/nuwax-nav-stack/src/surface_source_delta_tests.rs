@@ -5,9 +5,9 @@ const A:[i32;3]=[71,11,47];
 const RELATED:[i32;3]=[71,25,47];
 fn configured()->SurfaceNavigationConfig {
     let mut config=config();
-    config.apply_calibration(Some(nuwax_nav_types_messages::RobotGeometry {self_collision:None,
+    config.apply_calibration(nuwax_nav_types_messages::RobotGeometry {self_collision:None,
         footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
-        z_min_m:-0.05,z_max_m:0.2,source:"原生来源变化回归".into()}),None).unwrap();config
+        z_min_m:-0.05,z_max_m:0.2,source:"原生来源变化回归".into()}, None).unwrap();config
 }
 struct FineFixture {
     repository: nuwax_map_chunks::Repository,

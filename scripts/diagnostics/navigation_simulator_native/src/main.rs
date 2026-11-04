@@ -671,7 +671,7 @@ impl Scene {
         data: &PathBuf, captured: Option<captured_source::CapturedSource>,
     ) -> Result<Self,String> {
         let offset = config.follower.body_to_support_z_m;
-        let body_model = config.body_envelope.as_ref().ok_or("模拟机体足迹缺失")?;
+        let body_model = &config.body_envelope;
         let mut terrain = Terrain::new(
             &points,
             flat,
@@ -689,7 +689,7 @@ impl Scene {
             (map, SceneSource::Publication { captured, sequence: 0 }, evidence)
         } else {
         let mut builder =
-            SurfaceMapBuilder::configured(config.geometry.clone(), config.body_envelope.clone());
+            SurfaceMapBuilder::configured(config.geometry.clone(), Some(config.body_envelope.clone()));
         let observations = Arc::new(observation_index(&points)?);
         let map = Arc::new(
             builder
@@ -740,7 +740,7 @@ impl Scene {
             .first()
             .cloned()
             .unwrap_or(json!({"start":[0.,0.,offset,0.],"goal":[7.,0.,offset,0.]}));
-        let model = config.body_envelope.as_ref().unwrap();
+        let model = &config.body_envelope;
         let mut metadata = json!({"id":id,"name":name,"description":if id=="recorded"{"指定实录三维点云，独立体素地面运动模型"}else{"已知平面环境，独立速度积分与加减速响应"},"default_start":default["start"],"default_goal":default["goal"],"point_count":points.len(),"display_point_count":bytes.len()/12,"bounds":bounds,"body_to_support_z_m":offset,"robot":{"footprint_xy":model.footprint_xy_m,"z_bounds":model.z_bounds_m},"terrain_response":{"radius_m":terrain.response_radius_m,"source_voxel_m":terrain.source_voxel_m,"weight":"(1-r²/R²)²","calibration":"declared_footprint_plus_source_voxel","domain":"nearest_observed_columns_in_eight_directions","max_step_up_m":terrain.step_m[0],"max_step_down_m":terrain.step_m[1]},"world_model":if id=="recorded"{"pointcloud_terrain"}else{"flat"}});
         metadata["terrain_response"]["reference_kind"] = json!(if terrain.physical_surface.is_some() {
             "declared_physical_surface"
@@ -786,7 +786,7 @@ impl Scene {
     }
     /// 世界响应和碰撞仅读取环境点云及实体，完全独立于规划路线和预测高度。
     fn validate_world_motion(&self, from: Body, to: Body) -> Result<(), String> {
-        let model = self.config.body_envelope.as_ref().ok_or("模拟机体尺寸缺失")?;
+        let model = &self.config.body_envelope;
         let q = self.terrain.source_voxel_m;
         let radius = model.footprint_xy_m.iter().map(|point|point[0].hypot(point[1])).fold(0.0,f64::max);
         let ground = contact_reference(from, model.body_to_support_z_m)
@@ -1152,7 +1152,7 @@ impl Simulation {
         let step = if self.braking_for_replan || self.need_plan {
             PlannerStep::Command(Twist2::ZERO)
         } else {
-            self.follower.step(scene.config.robot_width_m)
+            self.follower.step()
         };
         self.last_control_ms = began.elapsed().as_secs_f64() * 1000.;
         let mut arriving = false;

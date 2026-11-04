@@ -153,7 +153,6 @@ pub(crate) struct NavigationConfiguration {
     pub profile_version: u32,
     pub capabilities: Option<NavigationCapabilities>,
     pub geometry: Option<RobotGeometry>,
-    pub body_to_support_z_m: Option<f64>,
     pub base_frame: String,
 }
 impl NavigationConfiguration {
@@ -164,9 +163,6 @@ impl NavigationConfiguration {
             geometry: std::env::var("NUWAX_ROBOT_GEOMETRY_JSON").ok()
                 .filter(|value| !value.trim().is_empty())
                 .map(|value| RobotGeometry::from_runtime_json(&value)).transpose()?,
-            body_to_support_z_m: std::env::var("NUWAX_NAV_BODY_TO_SUPPORT_Z_M").ok()
-                .filter(|value| !value.trim().is_empty())
-                .map(|value| value.parse::<f64>().map_err(|_| "机体支撑偏移无效".to_string())).transpose()?,
             base_frame: std::env::var("NUWAX_BASE_FRAME").unwrap_or_default(),
         };
         value.validate()?;
@@ -178,9 +174,6 @@ impl NavigationConfiguration {
         }
         if let Some(capabilities) = &self.capabilities { capabilities.validate()?; }
         if let Some(geometry) = &self.geometry { geometry.validate()?; }
-        if self.body_to_support_z_m.is_some_and(|value| !value.is_finite() || value <= 0.0) {
-            return Err("机体支撑偏移必须为正值".into());
-        }
         Ok(())
     }
     fn changed_fields(&self, current: &Self) -> Vec<&'static str> {
@@ -188,7 +181,7 @@ impl NavigationConfiguration {
         macro_rules! changed {
             ($($field:ident),+ $(,)?) => {$(if self.$field != current.$field { fields.push(concat!("navigation_configuration.", stringify!($field))); })+};
         }
-        changed!(profile_version, capabilities, geometry, body_to_support_z_m, base_frame);
+        changed!(profile_version, capabilities, geometry, base_frame);
         fields
     }
 }
@@ -253,9 +246,6 @@ impl MissionCalibration {
                 .terrain
                 .as_ref()
                 .ok_or("三维返航行程需要地形运动标定")?;
-            if config.body_envelope.is_none() {
-                return Err("三维返航路线需要完整机体包络".into());
-            }
             // 计入纵横坡、踏面起伏与支撑偏移的转动速度，供拒绝坐标跳变使用。
             let gradient = terrain
                 .max_slope_deg
@@ -482,7 +472,6 @@ pub(crate) mod tests {
             profile_version: 1,
             capabilities: None,
             geometry: None,
-            body_to_support_z_m: None,
             base_frame: String::new(),
         }
     }
@@ -511,9 +500,6 @@ pub(crate) mod tests {
         config = saved.configuration.clone().unwrap();
         config.stop_conditions.max_goals = Some(5);
         assert!(parsed.validate_resume_configuration(&config, saved.navigation_configuration.as_ref().unwrap()).unwrap_err().contains("configuration.stop_conditions.max_goals"));
-        let mut navigation = saved.navigation_configuration.clone().unwrap();
-        navigation.body_to_support_z_m = Some(0.45);
-        assert!(parsed.validate_resume_configuration(saved.configuration.as_ref().unwrap(), &navigation).unwrap_err().contains("navigation_configuration.body_to_support_z_m"));
     }
     #[test]
     fn checkpoint_v2_compares_values_even_when_calibration_id_is_unchanged() {
@@ -543,9 +529,6 @@ pub(crate) mod tests {
             invalid.as_object_mut().unwrap().remove(field);
             assert!(ExplorationCheckpoint::parse(&invalid.to_string()).is_err());
         }
-        let mut invalid = value.clone();
-        invalid["navigation_configuration"]["body_to_support_z_m"] = serde_json::json!(-0.5);
-        assert!(ExplorationCheckpoint::parse(&invalid.to_string()).is_err());
         let mut invalid = value;
         invalid["configuration"]["profile_version"] = serde_json::json!(2);
         assert!(ExplorationCheckpoint::parse(&invalid.to_string()).is_err());

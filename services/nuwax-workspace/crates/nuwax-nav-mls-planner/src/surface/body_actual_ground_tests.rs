@@ -125,3 +125,32 @@ fn actual_known_reassociation_does_not_make_an_incompatible_high_body_valid() {
             Err(SurfaceError::UntraversableSegment));
     }
 }
+
+#[test]
+fn ground_below_selects_the_highest_layer_below_the_body() {
+    for measured in [false, true] {
+        let map = scene(|_| vec![0, 12], measured);
+        let map = if measured { map.with_ground_evidence(GroundEvidence::MeasuredSurface) } else { map.with_ground_evidence(GroundEvidence::OccupiedVolume) };
+        let footprint = [[-0.08,-0.06],[0.08,-0.06],[0.08,0.06],[-0.08,0.06]];
+        let lower = if measured { 0.0625 } else { 0.125 };
+        assert_eq!(map.ground_below(&footprint, [0.5625,0.4375,0.5], 0.0), Some(lower));
+        assert_eq!(map.ground_below(&footprint, [0.5625,0.4375,2.0], 0.0), Some(lower+1.5));
+        assert_eq!(map.ground_below(&footprint, [0.5625,0.4375,0.0], 0.0), None);
+    }
+}
+
+#[test]
+fn ground_below_uses_the_nearest_covered_column_with_a_layer_below() {
+    for measured in [false, true] {
+        let map = scene(|x| if x == 4 { vec![12] } else if x == 5 { vec![0] } else { vec![] }, measured);
+        let map = if measured { map.with_ground_evidence(GroundEvidence::MeasuredSurface) } else { map.with_ground_evidence(GroundEvidence::OccupiedVolume) };
+        let footprint = [[-0.2,-0.06],[0.2,-0.06],[0.2,0.06],[-0.2,0.06]];
+        assert_eq!(map.ground_below(&footprint, [0.5625,0.4375,0.5], 0.0), Some(if measured {0.0625} else {0.125}));
+        let narrow = [[-0.06,-0.2],[0.06,-0.2],[0.06,0.2],[-0.06,0.2]];
+        assert_eq!(map.ground_below(&narrow, [0.5625,0.4375,0.5], 0.0), None);
+        assert_eq!(map.ground_below(&narrow, [0.5625,0.4375,0.5], std::f64::consts::FRAC_PI_2), Some(if measured {0.0625} else {0.125}));
+        let missing = scene(|x| if x == 5 { vec![0] } else { vec![] }, measured);
+        let missing = if measured { missing.with_ground_evidence(GroundEvidence::MeasuredSurface) } else { missing.with_ground_evidence(GroundEvidence::OccupiedVolume) };
+        assert!(missing.ground_below(&footprint, [0.5625,0.4375,0.5], 0.0).is_some());
+    }
+}

@@ -285,7 +285,7 @@ pub struct ActiveGoal {
     pub options: nuwax_nav_types_messages::GoalOptions,
     pub producer: String,
     pub producer_epoch: i64,
-    pub body_to_support_z_m: Option<f64>,
+
     pub boundary_owner: Option<Arc<crate::explore_runtime::ExploreStartConfig>>,
     /// Immutable assigned identity used by goal/path/cancel CAS.
     pub lease: GoalLease,
@@ -1980,7 +1980,7 @@ struct AdmittedGoalInput {
     producer_epoch: i64,
     committed_map: schema::CommittedMapIdentity,
     boundary_id: String,
-    body_to_support_z_m: Option<f64>,
+
     boundary_owner: Option<Arc<crate::explore_runtime::ExploreStartConfig>>,
 }
 
@@ -2338,7 +2338,6 @@ async fn goal_intent_from_set_goal(
         cancel_generation,
         committed_map,
         boundary_id,
-        body_to_support_z_m: None,
         boundary_points,
 
         motion_guard_boot_nonce: input.motion_admission.guard_boot_nonce,
@@ -2565,7 +2564,6 @@ pub(crate) async fn admit_goal_intent(
         producer_epoch: intent.producer_epoch,
         committed_map: intent.committed_map,
         boundary_id: intent.boundary_id,
-        body_to_support_z_m: intent.body_to_support_z_m,
         boundary_owner,
     };
     admit_goal_input(io, state, admitted, boundary, admission).await
@@ -2605,7 +2603,6 @@ async fn admit_goal_input(
         producer_epoch,
         committed_map,
         boundary_id,
-        body_to_support_z_m,
         boundary_owner,
     } = admitted;
     input.goal_id = input.goal_id.trim().to_string();
@@ -2801,7 +2798,6 @@ async fn admit_goal_input(
     let envelope = schema::GoalEnvelope {
         map_frame_generation,
         body_reference_frame_id: io.body_reference_frame_id.to_string(),
-        body_to_support_z_m,
         options: input.options,
         schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
         session_id: input.goal_id.clone(),
@@ -2873,7 +2869,6 @@ async fn admit_goal_input(
                 && active.options == input.options
                 && active.producer == producer
                 && active.producer_epoch == producer_epoch
-                && active.body_to_support_z_m == body_to_support_z_m
                 && boundary_matches_owner(&input.frame_id, &envelope.boundary_points, active.boundary_owner.as_deref())
             {
                 let unresolved = slot.phase == NavPhase::DispatchUnresolved;
@@ -2955,7 +2950,6 @@ async fn admit_goal_input(
             options: input.options,
             producer,
             producer_epoch,
-            body_to_support_z_m,
             boundary_owner,
             lease: lease.clone(),
         });
@@ -3952,7 +3946,7 @@ mod tests {
         ActiveGoal {
             motion_admission: test_motion_admission(),
             options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
-            body_to_support_z_m: None, boundary_owner: None,
+            boundary_owner: None,
             id: lease.session_id.clone(),
             frame_id: "map".to_string(),
             target: PoseState {
@@ -6005,7 +5999,6 @@ mod tests {
         let frames = backend.frames.lock().unwrap();
         let envelope = schema::decode_goal_envelope_body(&frames[0].payload).unwrap();
         assert_eq!(envelope.body_reference_frame_id, "robot/body_a");
-        assert_eq!(envelope.body_to_support_z_m, None);
         drop(frames);
         drop(handle);
         owner.finish().await.unwrap();

@@ -109,7 +109,7 @@ mod continuous_map_transaction_tests {
             snapshot.config().clone(),
             snapshot.source_voxel_size_m(),
         )
-        .unwrap();
+        .unwrap().with_body_envelope(snapshot.body_envelope().unwrap().clone()).unwrap();
         let changed = Arc::new(
             rebuilt
                 .with_recent_obstacle_points(
@@ -163,7 +163,8 @@ mod continuous_map_transaction_tests {
                     || (f64::from(x)-middle[0]).hypot(f64::from(y)-middle[1]) < 0.15;
                 (x,y,z+if z < 1.0 && near { *revision as f32*0.001 } else { 0.0 })
             }).collect();
-            let refined = SurfaceSnapshot::from_points(&points,snapshot.config().clone(),snapshot.source_voxel_size_m()).unwrap();
+            let refined = SurfaceSnapshot::from_points(&points,snapshot.config().clone(),snapshot.source_voxel_size_m()).unwrap()
+                .with_body_envelope(snapshot.body_envelope().unwrap().clone()).unwrap();
             assert_ne!(refined.navigation_measured_points(), snapshot.navigation_measured_points(),
                 "起点和路线中段须实际细化实测高度");
             refined

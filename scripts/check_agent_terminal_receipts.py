@@ -143,8 +143,8 @@ class PublicReceiptErrorChecks(unittest.TestCase):
              "使用 request_id 在详细日志中定位根因，修正条件后再调用。"),
             ("execution_failed", 500, "capability", False, "工具执行失败，未完成请求。",
              "使用 request_id 在详细日志中定位根因，修正条件后再调用。"),
-            ("mcp_result_unavailable", 500, "internal", False, "无法完整返回MCP数据；工具可能已经执行，请勿自动重复执行操作。",
-             "先核对任务/操作状态；只读查询可缩小范围，已有完整结果或制品地址可单独读取。不要自动重复执行操作。"),
+            ("mcp_result_unavailable", 500, "internal", False, "工具已执行，但结果过大或无法编码，无法完整返回。",
+             "查询类工具可缩小范围后重新查询；会改变状态的操作不要重复执行，先查询状态。"),
         )
         for code, status, category, retryable, message, guidance in cases:
             actual = build_public_error_payload(GatewayError("原始领域消息", error_code=code, http_status=status), task_id="task-known")

@@ -2,11 +2,11 @@
 // is not a terrain acceptance result and does not modify the C report verdicts.
 use super::*;
 fn fixture() -> (Scene,Simulation,PathBuf) {
-    let mut config=SurfaceNavigationConfig::new("map".into(),0.4,0.3,0.6,0.05,0.15,18.,0.2).unwrap();
-    config.apply_calibration(Some(nuwax_nav_types_messages::RobotGeometry {
+    let mut config=SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.05, 0.15, 18., 0.2).unwrap();
+    config.apply_calibration(nuwax_nav_types_messages::RobotGeometry {
         self_collision:None,footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
         z_min_m:-0.05,z_max_m:0.2,source:"same-input sim adapter test".into(),
-    }),None).unwrap();
+    }, None).unwrap();
     let points:Vec<_>=(-10..50).flat_map(|x|(-10..10).map(move |y|
         ((x as f32+0.5)*0.05,(y as f32+0.5)*0.05,-0.025))).collect();
     let directory=std::env::temp_dir().join(format!("neh-replan-feedback-{}",std::process::id()));

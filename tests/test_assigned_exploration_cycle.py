@@ -49,7 +49,7 @@ def progress_for(request_id, checkpoint, *, elapsed_ns=500_000_000):
                 "max_duration_ms": None, "max_goals": None},
             "max_navigation_retries": 1, "blacklist_radius_m": 3.0},
         "navigation_configuration": {"profile_version": 1, "capabilities": None,
-            "geometry": None, "body_to_support_z_m": None, "base_frame": ""},
+            "geometry": None, "base_frame": ""},
         "elapsed_ns": elapsed_ns, "reached_goals": 1, "mission": None,
         "return_reason": None, "sources": [{"name": "wavefront", "payload": "[1,{}]"}],
     }, separators=(",", ":"))

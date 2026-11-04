@@ -57,8 +57,8 @@ struct Inputs {
     map_pending: bool,
     pose: Option<PoseStamped>,
     pose_version: u64,
-    requested: Option<f64>,
-    control_width: Option<f64>,
+    requested: Option<()>,
+    control_requested: Option<()>,
     control_period: Option<Duration>,
     applied: Twist2,
     measured_motion: Option<MeasuredMotion>,
@@ -176,7 +176,7 @@ impl PlannerWorker {
                         map_seq,
                         pose,
                         pose_seq,
-                        width,
+                        control,
                         control_period,
                         applied,
                         applied_seq,
@@ -246,7 +246,7 @@ impl PlannerWorker {
                     let mut inputs_consumed=false;
                     let mut admission_refusal_context=None;
                     let consumed_applied=applied;
-                    #[cfg(test)] let compute_trace=width.map(|_| {
+                    #[cfg(test)] let compute_trace=control.map(|_| {
                         result_id=result_id.checked_add(1).expect("test worker result ID exhausted");
                         crate::command_proof_trace::ComputeScope::begin(crate::command_proof_trace::ComputeInputTrace {
                             result_id,
@@ -310,10 +310,10 @@ impl PlannerWorker {
                         }
                         planner.observe_applied_command(applied);
                         inputs_consumed=true;
-                        Ok(width.map_or(PlannerStep::Pending(Vec::new()),|width|planner.step(width)))
+                        Ok(control.map_or(PlannerStep::Pending(Vec::new()),|_|planner.step()))
                     })()
                     .unwrap_or_else(|error| PlannerStep::ReplanRequired(error.to_string()));
-                    let cycle_complete=inputs_consumed && width.is_some()
+                    let cycle_complete=inputs_consumed && control.is_some()
                         && matches!(&computed,PlannerStep::ReplanRequired(_))
                         && planner.execution_cycle_complete();
                     let mut dispatch_bound=planner.take_command_dispatch_bound();
@@ -325,7 +325,7 @@ impl PlannerWorker {
                     let execution_context=if inputs_consumed {
                         planner.refresh_execution_context(consumed_applied)
                     } else {admission_refusal_context};
-                    if width.is_none() {
+                    if control.is_none() {
                         let publication=ExecutionContextPublication {
                             epoch:version,map_version:map_seq,pose_version:pose_seq,
                             applied_version:applied_seq,motion_version:motion_seq,boundary_version:boundary_seq,
@@ -451,7 +451,7 @@ impl NavPlanner for PlannerWorker {
         input.boundary_version += 1;
         input.display_path.clear();
         input.result_wait_reason = None;
-        input.requested = input.control_width;
+        input.requested = input.control_requested;
         input.lifecycle_update = true;
         self.shared.1.notify_one();
     }
@@ -523,7 +523,7 @@ impl NavPlanner for PlannerWorker {
             // This is one trajectory check; unchanged timestamp-only receipts
             // neither invalidate nor re-enumerate the selected candidate.
             if input.result.as_ref().is_some_and(|(_,step)|matches!(step,PlannerStep::Command(c) if *c!=Twist2::ZERO)) {
-                input.requested=input.control_width;
+                input.requested=input.control_requested;
             }
             input.lifecycle_update=true;
             self.shared.1.notify_one();
@@ -554,7 +554,7 @@ impl NavPlanner for PlannerWorker {
         input.map_version += 1;
         input.display_path.clear();
         input.result_wait_reason = None;
-        input.requested = input.control_width;
+        input.requested = input.control_requested;
         input.lifecycle_update = true;
         self.shared.1.notify_one();
         Ok(())
@@ -579,7 +579,7 @@ impl NavPlanner for PlannerWorker {
         }
         // 执行回执到达后计算下一拍，使用实际已下发速度；不在本拍
         // 下发前抢算下一拍，避免候选被误作真实执行状态。
-        input.requested = input.control_width;
+        input.requested = input.control_requested;
         self.shared.1.notify_one();
     }
     fn observe_measured_motion(&mut self, motion: Option<MeasuredMotion>) {
@@ -599,7 +599,7 @@ impl NavPlanner for PlannerWorker {
         if !same_boundary {
             input.motion_version+=1;
             input.lifecycle_update=true;
-            input.requested=input.control_width;
+            input.requested=input.control_requested;
             self.delivered_dispatch_bound=None;
             self.delivered_execution_context=None;
             self.shared.1.notify_one();
@@ -618,18 +618,18 @@ impl NavPlanner for PlannerWorker {
         // old computations even when persistent terrain itself did not change.
         input.map_version+=1;
         input.lifecycle_update=true;
-        input.requested=input.control_width;
+        input.requested=input.control_requested;
         self.delivered_dispatch_bound=None;
         self.delivered_execution_context=None;
         self.shared.1.notify_one();
     }
     fn take_command_dispatch_bound(&mut self)->Option<CommandDispatchBound> {self.delivered_dispatch_bound.take()}
-    fn prepare_control_step(&mut self, width: f64, continuing_wait: bool) -> Option<watch::Receiver<()>> {
+    fn prepare_control_step(&mut self, continuing_wait: bool) -> Option<watch::Receiver<()>> {
         let mut input = self.shared.0.lock().unwrap();
         if self.thread.as_ref().is_none_or(|thread| thread.is_finished()) {
             return None;
         }
-        input.control_width = Some(width);
+        input.control_requested = Some(());
         if input.result.as_ref().is_some_and(|(_,step)|recovery_stop(step)) {
             return None;
         }
@@ -660,11 +660,11 @@ impl NavPlanner for PlannerWorker {
         if !refresh_in_tick && !delivery_gap && !still_waiting {
             return None;
         }
-        input.requested = Some(width);
+        input.requested = Some(());
         self.shared.1.notify_one();
         Some(publication)
     }
-    fn step(&mut self, width: f64) -> PlannerStep {
+    fn step(&mut self) -> PlannerStep {
         self.delivered_dispatch_bound=None;
         self.delivered_execution_context=None;
         #[cfg(test)] {self.delivered_command_context=None;}
@@ -672,7 +672,7 @@ impl NavPlanner for PlannerWorker {
         if self.thread.as_ref().is_none_or(|thread| thread.is_finished()) {
             return PlannerStep::Failed("局部计算线程已退出".into());
         }
-        input.control_width = Some(width);
+        input.control_requested = Some(());
         // Retrieval never waits on geometry. The scheduler may await a current
         // publication within its own cadence while servicing input and cancel.
         let expired = input.result.as_ref().is_some_and(|(started, step)|
@@ -697,7 +697,7 @@ impl NavPlanner for PlannerWorker {
             && (input.result_map_version != input.map_version
                 || input.result_boundary_version != input.boundary_version);
         if input.result.is_none() || input.result.as_ref().is_some_and(|(_,s)|matches!(s,PlannerStep::Pending(_))) || expired || dispatch_expired || arrival_changed || terminal_changed || source_changed || command_state_changed {
-            input.requested = Some(width);
+            input.requested = Some(());
             self.shared.1.notify_one();
         }
         // A nonzero command result is consumed once. Its existing deadline still
@@ -828,7 +828,7 @@ impl NavPlanner for PlannerWorker {
         input.goal_version += 1;
         input.path_version += 1;
         input.requested = None;
-        input.control_width = None;
+        input.control_requested = None;
         input.lifecycle_stop = true;
         input.lifecycle_update = true;
         self.shared.1.notify_one();
@@ -904,7 +904,7 @@ mod tests {
             }
             context
         }
-        fn step(&mut self,_:f64)->PlannerStep {
+        fn step(&mut self)->PlannerStep {
             self.steps.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
             PlannerStep::ReplanRequired("unexpected control step after admission rejection".into())
         }
@@ -956,12 +956,12 @@ mod tests {
             self.worker.replace_execution_path(ExecutionPath::Surface(Path3D {
                 poses:vec![],
             }),None,route_pose(3.0,1)).unwrap();
-            let _=self.worker.step(0.3);
+            let _=self.worker.step();
         }
         fn take_refusal(&mut self,actual:Twist2)->Option<Arc<ActualExecutionContext>> {
             self.resume.send(()).unwrap();
             wait_for_source_result(&self.worker);
-            let result=self.worker.step(0.3);
+            let result=self.worker.step();
             assert!(matches!(result,PlannerStep::ReplanRequired(ref reason)
                 if reason.contains("参考路径为空")),"{result:?}");
             assert_eq!(self.steps.load(std::sync::atomic::Ordering::SeqCst),0);
@@ -1027,7 +1027,7 @@ mod tests {
             let _=self.contexts.send(context.clone());
             context
         }
-        fn step(&mut self, _: f64) -> PlannerStep {
+        fn step(&mut self) -> PlannerStep {
             self.steps.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
             // Model a refusal that internally begins braking before returning.
             self.inner.stop();
@@ -1102,7 +1102,7 @@ mod tests {
         assert!(actual.source.same_body_query_view(&before.source));
         assert_eq!(steps.load(std::sync::atomic::Ordering::SeqCst),0);
         let input=worker.shared.0.lock().unwrap();
-        assert!(input.result.is_none() && input.control_width.is_none());
+        assert!(input.result.is_none() && input.control_requested.is_none());
         assert!(input.execution_context.as_ref().unwrap().is_current(&input));
     }
     #[test]
@@ -1111,9 +1111,9 @@ mod tests {
         let moving=Twist2 {linear:nuwax_nav_types_messages::Point2::new(0.2,0.0),angular_z:0.1};
         worker.observe_applied_command(moving);
         wait_for_feedback(&mut worker,0.5,moving);
-        assert!(matches!(worker.step(0.3),PlannerStep::Pending(_)));
+        assert!(matches!(worker.step(),PlannerStep::Pending(_)));
         wait_for_source_result(&worker);
-        assert!(matches!(worker.step(0.3),PlannerStep::ReplanRequired(_)));
+        assert!(matches!(worker.step(),PlannerStep::ReplanRequired(_)));
         let context=worker.take_step_execution_context(moving).unwrap();
         assert!(same_applied(context.applied,moving));
         assert_eq!(context.odometry.pose,route_pose(0.5,0).pose);
@@ -1152,7 +1152,7 @@ mod tests {
         assert_eq!(steps.load(std::sync::atomic::Ordering::SeqCst),0);
         {
             let input=worker.shared.0.lock().unwrap();
-            assert!(input.result.is_none() && input.control_width.is_none());
+            assert!(input.result.is_none() && input.control_requested.is_none());
             assert_eq!(input.applied,Twist2::ZERO);
             assert!(input.execution_context.as_ref().unwrap().is_current(&input));
         }
@@ -1168,9 +1168,9 @@ mod tests {
     fn same_zero_receipt_keeps_exact_context_available_before_lifecycle_stop() {
         let (mut worker,_contexts,_steps)=feedback_worker(None);
         wait_for_feedback(&mut worker,0.5,Twist2::ZERO);
-        let _=worker.step(0.3);
+        let _=worker.step();
         wait_for_source_result(&worker);
-        assert!(matches!(worker.step(0.3),PlannerStep::ReplanRequired(_)));
+        assert!(matches!(worker.step(),PlannerStep::ReplanRequired(_)));
         let rejected=worker.take_step_execution_context(Twist2::ZERO).unwrap();
         worker.observe_applied_command(Twist2::ZERO);
         // No next tick, wait, or context publication is required for a receipt
@@ -1188,7 +1188,7 @@ mod tests {
         let (release,gate)=std::sync::mpsc::channel();
         let (mut worker,_contexts,steps)=feedback_worker(Some((entered,gate)));
         wait_for_feedback(&mut worker,0.5,Twist2::ZERO);
-        let _=worker.step(0.3);
+        let _=worker.step();
         computing.recv_timeout(Duration::from_secs(5)).unwrap();
         worker.update_odometry(route_pose(0.6,1));
         release.send(()).unwrap();
@@ -1222,7 +1222,7 @@ mod tests {
     fn selective_worker_coalesces_undelivered_related_and_far_columns() {
         use crate::surface_changes::{SurfaceGeometryChanges,SurfaceMapUpdate};
         let mut harness=RouteWorkerHarness::new();
-        let _=harness.worker.step(0.3);
+        let _=harness.worker.step();
         let _=harness.next_computation(); // Owner is now held after a real guarded step.
         let source=harness.clear.clone();
         for columns in [vec![[10,10]],vec![[100,100]],vec![[110,100]]] {
@@ -1320,14 +1320,14 @@ mod tests {
         }
         fn execution_wait_reason(&self) -> Option<String> { self.inner.execution_wait_reason() }
         fn local_path_for_display(&self) -> Vec<[f64; 3]> { self.inner.local_path_for_display() }
-        fn step(&mut self, width: f64) -> PlannerStep {
-            let mut outcome = self.inner.step(width);
+        fn step(&mut self) -> PlannerStep {
+            let mut outcome = self.inner.step();
             // This fixture gates publication, not planning latency. Await initial
             // asynchronous admission before applying its publication barrier.
             let deadline=std::time::Instant::now()+Duration::from_secs(5);
             while matches!(&outcome,PlannerStep::Pending(failures) if failures.is_empty())
                 && self.inner.local_path().is_none() && std::time::Instant::now()<deadline {
-                std::thread::sleep(Duration::from_millis(1));outcome=self.inner.step(width);
+                std::thread::sleep(Duration::from_millis(1));outcome=self.inner.step();
             }
             let _ = self.computed.send(RouteComputation {
                 outcome: outcome.clone(),
@@ -1404,7 +1404,7 @@ mod tests {
         }
         fn positive_inflight(&mut self) -> RouteComputation {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            self.worker.step(0.3);
+            self.worker.step();
             let first = self.next_computation_before(deadline);
             self.prepare_positive_inflight(first, deadline)
         }
@@ -1458,7 +1458,7 @@ mod tests {
                 if positive {
                     // Retrieval is not actuation. Retire this preparation result
                     // using the original one-shot consumption, never by clearing it.
-                    assert_eq!(self.worker.step(0.3), computed.outcome);
+                    assert_eq!(self.worker.step(), computed.outcome);
                     assert!(self.worker.shared.0.lock().unwrap().result.is_none());
                 } else {
                     assert!(startup_sample < 3,
@@ -1555,7 +1555,7 @@ mod tests {
                     // source fence, not wall-clock expiry, can make this pass.
                     input.result.as_mut().unwrap().0 = std::time::Instant::now();
                 }
-                assert_eq!(harness.worker.step(0.3), PlannerStep::Pending(Vec::new()));
+                assert_eq!(harness.worker.step(), PlannerStep::Pending(Vec::new()));
                 assert!(harness.worker.execution_wait_reason().unwrap().contains("地图或边界"));
                 assert!(harness.worker.local_path_for_display().is_empty());
             }
@@ -1581,7 +1581,7 @@ mod tests {
                 harness.release.send(()).unwrap();
                 wait_for_source_result(&harness.worker);
                 assert_eq!(harness.worker.shared.0.lock().unwrap().result.as_ref().unwrap().1, blocked.outcome);
-                assert!(!matches!(harness.worker.step(0.3), PlannerStep::Command(command) if command != Twist2::ZERO));
+                assert!(!matches!(harness.worker.step(), PlannerStep::Command(command) if command != Twist2::ZERO));
             }
         }
     }
@@ -1613,13 +1613,13 @@ mod tests {
             if !stored { assert!(input.result.is_none(), "late old-source result must retire before new publication"); }
         }
         if stored {
-            assert_eq!(harness.worker.step(0.3), PlannerStep::Pending(Vec::new()), "stored old-source motion must not be delivered");
+            assert_eq!(harness.worker.step(), PlannerStep::Pending(Vec::new()), "stored old-source motion must not be delivered");
         }
         assert_blocked_route_computation(&blocked, &harness, map_changed);
         harness.release.send(()).unwrap();
         wait_for_source_result(&harness.worker);
         assert_eq!(harness.worker.shared.0.lock().unwrap().result.as_ref().unwrap().1, blocked.outcome);
-        assert!(!matches!(harness.worker.step(0.3), PlannerStep::Command(command) if command != Twist2::ZERO));
+        assert!(!matches!(harness.worker.step(), PlannerStep::Command(command) if command != Twist2::ZERO));
         // An ordinary repeat does not publish another source event. Keep the
         // same observation and prove no extra curve is published or time advanced.
         harness.worker.observe_applied_command(Twist2::ZERO);
@@ -1657,7 +1657,7 @@ mod tests {
             {
                 let input = harness.worker.shared.0.lock().unwrap();
                 assert!(input.result.is_none() && input.path.is_none() && input.goal.is_none());
-                assert!(input.requested.is_none() && input.control_width.is_none());
+                assert!(input.requested.is_none() && input.control_requested.is_none());
                 assert!(input.display_path.is_empty());
             }
             harness.advance_stationary_observation();
@@ -1665,7 +1665,7 @@ mod tests {
             // It cannot change the goal/path epoch and therefore cannot mask a
             // broken cancellation fence with replacement-goal invalidation.
             let cancelled_epoch = harness.worker.shared.0.lock().unwrap().epoch;
-            assert_eq!(harness.worker.step(0.3), PlannerStep::Pending(Vec::new()));
+            assert_eq!(harness.worker.step(), PlannerStep::Pending(Vec::new()));
             harness.release.send(()).unwrap();
             let cancelled = harness.next_computation();
             assert!(matches!(cancelled.outcome, PlannerStep::Pending(_) | PlannerStep::ReplanRequired(_))
@@ -1693,7 +1693,7 @@ mod tests {
                 poses: vec![start, route_pose(1.5, harness.observation_tick), goal.clone()],
             }), None, goal).unwrap();
             assert!(harness.worker.shared.0.lock().unwrap().epoch > old_epoch);
-            assert_eq!(harness.worker.step(0.3), PlannerStep::Pending(Vec::new()));
+            assert_eq!(harness.worker.step(), PlannerStep::Pending(Vec::new()));
             let startup_deadline = std::time::Instant::now() + Duration::from_secs(5);
             harness.release.send(()).unwrap();
             let first_replacement = harness.next_computation_before(startup_deadline);
@@ -1731,7 +1731,7 @@ mod tests {
             harness.worker.replace_execution_path(ExecutionPath::Surface(Path3D {
                 poses:vec![start,goal.clone()]
             }),None,goal).unwrap();
-            harness.worker.step(0.3);
+            harness.worker.step();
             let startup_deadline=std::time::Instant::now()+Duration::from_secs(5);
             harness.release.send(()).unwrap();
             let first_latest=harness.next_computation_before(startup_deadline);
@@ -1763,7 +1763,7 @@ mod tests {
         fn configure_boundary(&mut self, boundary: &[[f64; 2]]) {
             self.boundary = boundary.to_vec();
         }
-        fn step(&mut self, _: f64) -> PlannerStep {
+        fn step(&mut self) -> PlannerStep {
             let _ = self.started.send((self.blocked, self.boundary.clone()));
             let _ = self.release.recv_timeout(Duration::from_secs(2));
             PlannerStep::Command(if self.blocked || !self.boundary.is_empty() {
@@ -1814,7 +1814,7 @@ mod tests {
         fn update_odometry(&mut self, pose: PoseStamped) { self.pose=Some(pose); }
         fn update_costmap(&mut self, _: CostMap2D) {}
         fn observe_applied_command(&mut self, applied: Twist2) { self.applied=applied; }
-        fn step(&mut self, _: f64) -> PlannerStep {
+        fn step(&mut self) -> PlannerStep {
             let _=self.started.send(());
             let (outcome,anchor)=self.finish.recv_timeout(Duration::from_secs(5))
                 .unwrap_or((PlannerStep::Pending(Vec::new()),None));
@@ -1840,7 +1840,7 @@ mod tests {
         let original_pose=route_pose(0.5,0);
         let command=Twist2 {linear:nuwax_nav_types_messages::Point2::new(0.05,0.0),angular_z:0.0};
         worker.update_odometry(original_pose.clone());
-        assert!(matches!(worker.step(0.3),PlannerStep::Pending(_)));
+        assert!(matches!(worker.step(),PlannerStep::Pending(_)));
         started.recv_timeout(Duration::from_secs(1)).unwrap();
         // A timestamp-only receipt preserves geometric authority and the exact
         // original computation provenance; moved-pose checks are separate.
@@ -1848,7 +1848,7 @@ mod tests {
         finish.send((PlannerStep::Command(command),Some(101))).unwrap();
         wait_for_source_result(&worker);
         let published_id=worker.shared.0.lock().unwrap().result_proof.as_ref().unwrap().proof.input.result_id;
-        assert_eq!(worker.step(0.3),PlannerStep::Command(command));
+        assert_eq!(worker.step(),PlannerStep::Command(command));
         let delivered=worker.delivered_command_context_for_test().unwrap().clone();
         assert_eq!(delivered.proof.input.result_id,published_id);
         assert_eq!(delivered.proof.input.pose,Some(crate::command_proof_trace::PoseTrace::capture(&original_pose)));
@@ -1858,19 +1858,19 @@ mod tests {
             let input=worker.shared.0.lock().unwrap();
             assert!(input.result.is_none() && input.result_proof.is_none());
         }
-        assert!(matches!(worker.step(0.3),PlannerStep::Pending(_)));
+        assert!(matches!(worker.step(),PlannerStep::Pending(_)));
         assert!(worker.delivered_command_context_for_test().is_none());
         started.recv_timeout(Duration::from_secs(1)).unwrap();
         // Same command value, no scoped proof: diagnostics must be absent.
         finish.send((PlannerStep::Command(command),None)).unwrap();
         wait_for_source_result(&worker);
-        assert_eq!(worker.step(0.3),PlannerStep::Command(command));
+        assert_eq!(worker.step(),PlannerStep::Command(command));
         assert!(worker.delivered_command_context_for_test().is_none());
-        worker.step(0.3);
+        worker.step();
         started.recv_timeout(Duration::from_secs(1)).unwrap();
         finish.send((PlannerStep::Command(command),Some(303))).unwrap();
         wait_for_source_result(&worker);
-        assert_eq!(worker.step(0.3),PlannerStep::Command(command));
+        assert_eq!(worker.step(),PlannerStep::Command(command));
         let latest=worker.delivered_command_context_for_test().unwrap();
         assert!(latest.proof.input.result_id>published_id);
         assert_eq!(latest.proof.guard.observation_anchor_ns,Some(303));
@@ -1885,7 +1885,7 @@ mod tests {
             let (mut worker,started,finish)=traced_worker();
             let command=Twist2 {linear:nuwax_nav_types_messages::Point2::new(0.05,0.0),angular_z:0.0};
             worker.update_odometry(route_pose(0.5,0));
-            worker.step(0.3);
+            worker.step();
             started.recv_timeout(Duration::from_secs(1)).unwrap();
             finish.send((PlannerStep::Command(command),Some(101))).unwrap();
             wait_for_source_result(&worker);
@@ -1895,7 +1895,7 @@ mod tests {
                 if changed_source {input.map_version+=1;}
                 else {input.result.as_mut().unwrap().0=std::time::Instant::now()-DEFAULT_CONTROL_HORIZON-Duration::from_millis(1);}
             }
-            assert!(matches!(worker.step(0.3),PlannerStep::Pending(_)));
+            assert!(matches!(worker.step(),PlannerStep::Pending(_)));
             assert!(worker.delivered_command_context_for_test().is_none());
             started.recv_timeout(Duration::from_secs(1)).unwrap();
             finish.send((PlannerStep::Command(Twist2::ZERO),Some(202))).unwrap();
@@ -1911,7 +1911,7 @@ mod tests {
                 assert!(std::time::Instant::now()<deadline,"released zero result was not published");
                 std::thread::yield_now();
             }
-            assert_eq!(worker.step(0.3),PlannerStep::Command(Twist2::ZERO));
+            assert_eq!(worker.step(),PlannerStep::Command(Twist2::ZERO));
             assert!(worker.delivered_command_context_for_test().is_none());
             assert!(worker.shared.0.lock().unwrap().result_proof.is_none());
             worker.stop();
@@ -1922,7 +1922,7 @@ mod tests {
     fn stored_positive_command_is_rejected_after_blocking_map_update() {
         let (mut worker, start, release) = source_worker();
         worker.update_costmap(CostMap2D::new_all_free("map", 1, 1, 0.1));
-        worker.step(0.3);
+        worker.step();
         assert_eq!(start.recv_timeout(Duration::from_secs(1)).unwrap(), (false, vec![]));
         release.send(()).unwrap();
         wait_for_source_result(&worker);
@@ -1939,7 +1939,7 @@ mod tests {
             assert!(matches!(input.result.as_ref().unwrap().1, PlannerStep::Command(t) if t.linear.x > 0.0));
             input.result.as_mut().unwrap().0 = std::time::Instant::now();
         }
-        assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()));
+        assert_eq!(worker.step(), PlannerStep::Pending(Vec::new()));
         assert!(worker.execution_wait_reason().unwrap().contains("地图或边界"));
         worker.stop();
         release.send(()).unwrap();
@@ -1958,7 +1958,7 @@ mod tests {
             fn update_execution_map(&mut self, map: ExecutionMap)->Result<(),RuntimeError> {
                 assert!(matches!(map,ExecutionMap::Surface(_))); Ok(())
             }
-            fn step(&mut self, _: f64)->PlannerStep {
+            fn step(&mut self)->PlannerStep {
                 let _=self.started.send(());
                 let _=self.release.recv_timeout(Duration::from_secs(3));
                 PlannerStep::Command(Twist2 {linear:nuwax_nav_types_messages::Point2::new(0.2,0.0),angular_z:0.0})
@@ -1970,7 +1970,7 @@ mod tests {
         let mut worker=PlannerWorker::new(SurfaceProbe {started,release:receive}).unwrap();
         let surface=crate::surface_follower::test_snapshot(0.0,false);
         worker.update_execution_map(ExecutionMap::Surface(surface.clone())).unwrap();
-        worker.step(0.3); start.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.step(); start.recv_timeout(Duration::from_secs(1)).unwrap();
         let old_version=worker.shared.0.lock().unwrap().map_version;
         // 原计算仍被屏障持有；重装同一Arc也必须退休它。
         worker.update_execution_map(ExecutionMap::Surface(surface.clone())).unwrap();
@@ -1985,14 +1985,14 @@ mod tests {
             assert!(matches!(input.result.as_ref().unwrap().1,PlannerStep::Command(c) if c.linear.x>0.0));
             input.result.as_mut().unwrap().0=std::time::Instant::now();
         }
-        assert_eq!(worker.step(0.3),PlannerStep::Pending(Vec::new()));
+        assert_eq!(worker.step(),PlannerStep::Pending(Vec::new()));
         worker.stop(); release.send(()).unwrap();
     }
     #[test]
     fn map_replacement_retires_inflight_result_and_wakes_without_control_tick() {
         let (mut worker, start, release) = source_worker();
         worker.update_costmap(CostMap2D::new_all_free("map", 1, 1, 0.1));
-        worker.step(0.3);
+        worker.step();
         assert_eq!(start.recv_timeout(Duration::from_secs(1)).unwrap(), (false, vec![]));
         worker.update_costmap(CostMap2D::new_all_occupied("map", 1, 1, 0.1));
         release.send(()).unwrap();
@@ -2001,24 +2001,24 @@ mod tests {
         assert!(worker.shared.0.lock().unwrap().result.is_none(), "old-map result was published");
         release.send(()).unwrap();
         wait_for_source_result(&worker);
-        assert_eq!(worker.step(0.3), PlannerStep::Command(Twist2::ZERO));
+        assert_eq!(worker.step(), PlannerStep::Command(Twist2::ZERO));
     }
     // 下一结果计算中时，上一条已执行指令只在其原许可期内继续沿用。
     #[test]
     fn executing_command_is_held_only_within_its_original_license() {
         let (mut worker, start, release) = source_worker();
         worker.update_costmap(CostMap2D::new_all_free("map", 1, 1, 0.1));
-        worker.step(0.3);
+        worker.step();
         start.recv_timeout(Duration::from_secs(1)).unwrap();
         release.send(()).unwrap();
         wait_for_source_result(&worker);
         let command = Twist2 { linear: nuwax_nav_types_messages::Point2::new(0.2, 0.0), angular_z: 0.0 };
-        assert_eq!(worker.step(0.3), PlannerStep::Command(command));
+        assert_eq!(worker.step(), PlannerStep::Command(command));
         assert_eq!(worker.held_command(), None, "尚未执行的指令不能沿用");
         worker.observe_applied_command(command);
         // 执行回执触发下一次计算；计算未完成时取不到新结果。
         start.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()));
+        assert_eq!(worker.step(), PlannerStep::Pending(Vec::new()));
         assert_eq!(worker.held_command(), Some(command));
         std::thread::sleep(DEFAULT_CONTROL_HORIZON);
         assert_eq!(worker.held_command(), None, "超出原许可期不能继续沿用");
@@ -2029,7 +2029,7 @@ mod tests {
         let (mut worker, start, release) = source_worker();
         let goal = nuwax_nav_astar::helpers::make_pose_stamped("map", 1.0, 0.0, 0.0);
         worker.configure_goal(&goal, Default::default()).unwrap();
-        worker.step(0.3);
+        worker.step();
         assert_eq!(start.recv_timeout(Duration::from_secs(1)).unwrap(), (false, vec![]));
         let goal_version = worker.shared.0.lock().unwrap().goal_version;
         let boundary = vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
@@ -2042,7 +2042,7 @@ mod tests {
         wait_for_source_result(&worker);
         // A new goal stops the planner; unchanged boundary still must be restored.
         worker.configure_goal(&goal, Default::default()).unwrap();
-        worker.step(0.3);
+        worker.step();
         assert_eq!(start.recv_timeout(Duration::from_secs(1)).unwrap(), (false, boundary));
         worker.stop();
         release.send(()).unwrap();
@@ -2050,7 +2050,7 @@ mod tests {
     #[test]
     fn stored_outcomes_require_current_map_and_boundary_at_retrieval() {
         let (mut worker, start, release) = source_worker();
-        worker.step(0.3);
+        worker.step();
         start.recv_timeout(Duration::from_secs(1)).unwrap();
         // Hold actual computation while independently exercising every cached
         // outcome and each source fence, including destructive stale replans.
@@ -2069,7 +2069,7 @@ mod tests {
                     if map_changed { input.map_version += 1; }
                     else { input.boundary_version += 1; }
                 }
-                assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()));
+                assert_eq!(worker.step(), PlannerStep::Pending(Vec::new()));
             }
         }
         worker.stop();
@@ -2086,7 +2086,7 @@ mod tests {
             fn replace_path(&mut self, _: Path2D) {}
             fn update_odometry(&mut self, _: PoseStamped) {}
             fn update_costmap(&mut self, _: CostMap2D) {}
-            fn step(&mut self, _: f64) -> PlannerStep {
+            fn step(&mut self) -> PlannerStep {
                 self.started.send(()).unwrap();
                 self.release.recv().unwrap();
                 PlannerStep::Command(Twist2::ZERO)
@@ -2097,7 +2097,7 @@ mod tests {
         let (release, receive) = std::sync::mpsc::channel();
         let (started, start) = std::sync::mpsc::channel();
         let mut worker = PlannerWorker::new(DisplayPlanner {release:receive, started}).unwrap();
-        worker.step(0.3);
+        worker.step();
         start.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(worker.local_path_for_display().is_empty());
         release.send(()).unwrap();
@@ -2122,14 +2122,14 @@ mod tests {
             fn replace_path(&mut self, _: Path2D) {}
             fn update_odometry(&mut self, _: PoseStamped) {}
             fn update_costmap(&mut self, _: CostMap2D) {}
-            fn step(&mut self, _: f64) -> PlannerStep { PlannerStep::Pending(Vec::new()) }
+            fn step(&mut self) -> PlannerStep { PlannerStep::Pending(Vec::new()) }
             fn execution_wait_reason(&self) -> Option<String> { Some("等待当前足下支撑恢复".into()) }
             fn stop(&mut self) {}
         }
         let mut worker = PlannerWorker::new(WaitingPlanner).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         loop {
-            assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()));
+            assert_eq!(worker.step(), PlannerStep::Pending(Vec::new()));
             if worker.execution_wait_reason().as_deref() == Some("等待当前足下支撑恢复") { break; }
             assert!(std::time::Instant::now() < deadline, "计算线程必须交付实际等待原因");
             std::thread::sleep(Duration::from_millis(1));
@@ -2155,13 +2155,13 @@ mod tests {
                 std::time::Instant::now() - DEFAULT_CONTROL_HORIZON - Duration::from_millis(1),
                 outcome.clone(),
             ));
-            assert_eq!(worker.step(0.3), outcome);
+            assert_eq!(worker.step(), outcome);
         }
         worker.shared.0.lock().unwrap().result = Some((
             std::time::Instant::now() - DEFAULT_CONTROL_HORIZON - Duration::from_millis(1),
             PlannerStep::Command(Twist2 { linear: nuwax_nav_types_messages::Point2::new(0.2, 0.0), angular_z: 0.0 }),
         ));
-        assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()),
+        assert_eq!(worker.step(), PlannerStep::Pending(Vec::new()),
             "传播慢查询结论不能延长速度许可");
         assert!(worker.execution_wait_reason().unwrap().contains("过期"));
     }
@@ -2175,7 +2175,7 @@ mod tests {
         fn replace_path(&mut self, _: Path2D) {}
         fn update_odometry(&mut self, _: PoseStamped) {}
         fn update_costmap(&mut self, _: CostMap2D) {}
-        fn step(&mut self, _: f64) -> PlannerStep {
+        fn step(&mut self) -> PlannerStep {
             let _ = self.started.send(());
             self.outcome.recv_timeout(Duration::from_secs(5))
                 .unwrap_or(PlannerStep::Pending(Vec::new()))
@@ -2195,29 +2195,29 @@ mod tests {
                 linear: nuwax_nav_types_messages::Point2::new(0.1, 0.0), angular_z: 0.0,
             };
             let command = PlannerStep::Command(velocity);
-            assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()));
+            assert_eq!(worker.step(), PlannerStep::Pending(Vec::new()));
             started.recv_timeout(Duration::from_secs(1)).unwrap();
             finish.send(command.clone()).unwrap();
             wait_for_source_result(&worker);
-            assert_eq!(worker.step(0.3), command);
+            assert_eq!(worker.step(), command);
             worker.observe_applied_command(velocity);
             started.recv_timeout(Duration::from_secs(1)).unwrap();
             if old_pending {
                 finish.send(PlannerStep::Pending(Vec::new())).unwrap();
                 wait_for_source_result(&worker);
-                assert!(worker.prepare_control_step(0.3, false).is_none(),
+                assert!(worker.prepare_control_step(false).is_none(),
                     "首次交付的真实等待结果必须立即保持归零语义");
-                assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()),
+                assert_eq!(worker.step(), PlannerStep::Pending(Vec::new()),
                     "首次交付的真实等待结果必须保持归零语义");
                 started.recv_timeout(Duration::from_secs(1)).unwrap();
             }
-            let mut publication = worker.prepare_control_step(0.3, false)
+            let mut publication = worker.prepare_control_step(false)
                 .expect("empty or previously delivered Pending slot may defer");
             assert!(!publication.has_changed().unwrap(), "old notification cannot wake the new wait");
             finish.send(command.clone()).unwrap();
             tokio::time::timeout(Duration::from_secs(1), publication.changed()).await.unwrap().unwrap();
-            assert!(worker.prepare_control_step(0.3, true).is_none());
-            let delivered = worker.step(0.3);
+            assert!(worker.prepare_control_step(true).is_none());
+            let delivered = worker.step();
             worker.stop();
             let _ = finish.send(PlannerStep::Pending(Vec::new()));
             assert_eq!(delivered, command, "旧等待结果={old_pending}，本拍应接收新结果");
@@ -2228,20 +2228,20 @@ mod tests {
         let (mut worker, started, finish) = terminal_worker();
         let velocity = Twist2 { linear: nuwax_nav_types_messages::Point2::new(0.1, 0.0), angular_z: 0.0 };
         worker.observe_applied_command(velocity);
-        let mut publication = worker.prepare_control_step(0.3, false).unwrap();
+        let mut publication = worker.prepare_control_step(false).unwrap();
         started.recv_timeout(Duration::from_secs(1)).unwrap();
         finish.send(PlannerStep::Pending(Vec::new())).unwrap();
         tokio::time::timeout(Duration::from_secs(1), publication.changed()).await.unwrap().unwrap();
-        assert!(worker.prepare_control_step(0.3, true).is_none(), "current new Pending ends the wait");
+        assert!(worker.prepare_control_step(true).is_none(), "current new Pending ends the wait");
         worker.update_costmap(CostMap2D::new_all_free("map", 2, 2, 0.1));
         started.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(worker.prepare_control_step(0.3, false).is_none(), "initial Pending must not acquire a new wait");
-        let mut current = worker.prepare_control_step(0.3, true).expect("existing wait retains exact source matching");
+        assert!(worker.prepare_control_step(false).is_none(), "initial Pending must not acquire a new wait");
+        let mut current = worker.prepare_control_step(true).expect("existing wait retains exact source matching");
         assert!(!current.has_changed().unwrap(), "new subscription starts after the old publication");
         finish.send(PlannerStep::Command(velocity)).unwrap();
         tokio::time::timeout(Duration::from_secs(1), current.changed()).await.unwrap().unwrap();
-        assert!(worker.prepare_control_step(0.3, true).is_none());
-        assert_eq!(worker.step(0.3), PlannerStep::Command(velocity));
+        assert!(worker.prepare_control_step(true).is_none());
+        assert_eq!(worker.step(), PlannerStep::Command(velocity));
         worker.stop();
         let _ = finish.send(PlannerStep::Pending(Vec::new()));
     }
@@ -2253,7 +2253,7 @@ mod tests {
             fn replace_path(&mut self, _: Path2D) {}
             fn update_odometry(&mut self, _: PoseStamped) {}
             fn update_costmap(&mut self, _: CostMap2D) {}
-            fn step(&mut self, _: f64) -> PlannerStep {
+            fn step(&mut self) -> PlannerStep {
                 self.release.recv_timeout(Duration::from_secs(1)).unwrap();
                 panic!("deliberate worker exit");
             }
@@ -2262,7 +2262,7 @@ mod tests {
         let (release, wait) = std::sync::mpsc::channel();
         let mut worker = PlannerWorker::new(Exit { release: wait }).unwrap();
         worker.observe_applied_command(Twist2 {linear: nuwax_nav_types_messages::Point2::new(0.1, 0.0), angular_z: 0.0});
-        let mut publication = worker.prepare_control_step(0.3, false).unwrap();
+        let mut publication = worker.prepare_control_step(false).unwrap();
         release.send(()).unwrap();
         assert!(tokio::time::timeout(Duration::from_secs(1), publication.changed()).await.unwrap().is_err());
         let until = std::time::Instant::now() + Duration::from_secs(1);
@@ -2270,24 +2270,24 @@ mod tests {
             assert!(std::time::Instant::now() < until);
             std::thread::yield_now();
         }
-        assert!(worker.prepare_control_step(0.3, true).is_none());
-        assert!(matches!(worker.step(0.3), PlannerStep::Failed(_)));
+        assert!(worker.prepare_control_step(true).is_none());
+        assert!(matches!(worker.step(), PlannerStep::Failed(_)));
     }
     #[test]
     fn pose_only_update_retires_inflight_negative_and_accepts_current_failure() {
         for negative in [PlannerStep::ReplanRequired("old pose".into()), PlannerStep::Failed("old pose".into())] {
             let (mut worker, started, finish) = terminal_worker();
             worker.update_odometry(route_pose(0.5, 0));
-            worker.step(0.3);
+            worker.step();
             started.recv_timeout(Duration::from_secs(1)).unwrap();
             worker.update_odometry(route_pose(0.500001, 1));
-            worker.step(0.3); // Queue a current-pose computation before releasing the old one.
+            worker.step(); // Queue a current-pose computation before releasing the old one.
             finish.send(negative.clone()).unwrap();
             started.recv_timeout(Duration::from_secs(1)).unwrap();
             assert!(worker.shared.0.lock().unwrap().result.is_none(), "old-pose terminal was published");
             finish.send(negative.clone()).unwrap();
             wait_for_source_result(&worker);
-            assert_eq!(worker.step(0.3), negative, "a genuine current failure must stay authoritative");
+            assert_eq!(worker.step(), negative, "a genuine current failure must stay authoritative");
             worker.stop();
         }
     }
@@ -2297,7 +2297,7 @@ mod tests {
         for retired in [false, true] {
             let (mut worker, started, finish) = terminal_worker();
             worker.update_odometry(route_pose(0.5, 0));
-            worker.step(0.3);
+            worker.step();
             started.recv_timeout(Duration::from_secs(1)).unwrap();
             worker.update_odometry(route_pose(0.500001, 1));
             worker.update_costmap(CostMap2D::new_all_free("map", 2, 2, 0.1));
@@ -2306,7 +2306,7 @@ mod tests {
             });
             let failure=PlannerStep::Failed(format!("{} escape time or distance budget exhausted",
                 nuwax_nav_types_messages::BODY_OVERLAP_RECOVERY_FAILED));
-            if retired {worker.stop();worker.step(0.3);}
+            if retired {worker.stop();worker.step();}
             finish.send(failure.clone()).unwrap();
             if retired {
                 // 退休后的生命周期通知在旧计算之后执行，不得交付旧目标失败。
@@ -2316,8 +2316,8 @@ mod tests {
             } else {
                 started.recv_timeout(Duration::from_secs(1)).unwrap();
                 worker.update_odometry(route_pose(0.500002, 2));
-                assert!(worker.prepare_control_step(0.3,true).is_none());
-                assert_eq!(worker.step(0.3),failure);
+                assert!(worker.prepare_control_step(true).is_none());
+                assert_eq!(worker.step(),failure);
                 assert!(worker.take_step_execution_context(Twist2::ZERO).is_none(),
                     "停止结论不能携带旧几何或速度凭据");
             }
@@ -2331,16 +2331,16 @@ mod tests {
             let (mut worker, started, finish) = terminal_worker();
             let mut pose = route_pose(0.0, 0);
             worker.update_odometry(pose.clone());
-            worker.step(0.3);
+            worker.step();
             started.recv_timeout(Duration::from_secs(1)).unwrap();
             finish.send(negative.clone()).unwrap();
             wait_for_source_result(&worker);
             pose.stamp.nanos += 1;
             worker.update_odometry(pose.clone());
-            assert_eq!(worker.step(0.3), negative);
+            assert_eq!(worker.step(), negative);
             pose.pose.position.x = -0.0;
             worker.update_odometry(pose);
-            assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()));
+            assert_eq!(worker.step(), PlannerStep::Pending(Vec::new()));
             worker.stop();
             let _ = finish.send(PlannerStep::Pending(Vec::new()));
         }
@@ -2350,7 +2350,7 @@ mod tests {
     fn pose_update_during_computation_keeps_command_deliverable_once() {
         let (mut worker, started, finish) = terminal_worker();
         worker.update_odometry(route_pose(0.5, 0));
-        worker.step(0.3);
+        worker.step();
         started.recv_timeout(Duration::from_secs(1)).unwrap();
         worker.update_odometry(route_pose(0.500001, 1));
         let command = PlannerStep::Command(Twist2 {
@@ -2358,9 +2358,9 @@ mod tests {
         });
         finish.send(command.clone()).unwrap();
         wait_for_source_result(&worker);
-        assert_eq!(worker.step(0.3), command, "按计算开始时位姿求得的指令在许可期内仍可交付");
+        assert_eq!(worker.step(), command, "按计算开始时位姿求得的指令在许可期内仍可交付");
         worker.update_odometry(route_pose(0.500002, 2));
-        assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()), "已交付的结果不能再次交付");
+        assert_eq!(worker.step(), PlannerStep::Pending(Vec::new()), "已交付的结果不能再次交付");
         worker.stop();
         let _ = finish.send(PlannerStep::Pending(Vec::new()));
     }
@@ -2371,18 +2371,18 @@ mod tests {
         let mut invalid = route_pose(0.0, 0);
         invalid.pose.position.x = f64::NAN;
         worker.update_odometry(invalid.clone());
-        worker.step(0.3);
+        worker.step();
         started.recv_timeout(Duration::from_secs(1)).unwrap();
         let failed = PlannerStep::Failed("invalid pose".into());
         worker.update_odometry(invalid);
         finish.send(failed.clone()).unwrap();
         wait_for_source_result(&worker);
-        assert_eq!(worker.step(0.3), failed);
+        assert_eq!(worker.step(), failed);
     }
     #[test]
     fn stored_terminal_results_require_current_applied_state_but_commands_do_not() {
         let (mut worker, started, finish) = terminal_worker();
-        worker.step(0.3);
+        worker.step();
         started.recv_timeout(Duration::from_secs(1)).unwrap();
         for outcome in [PlannerStep::Succeeded, PlannerStep::Failed("old applied".into()),
             PlannerStep::ReplanRequired("old applied".into()), PlannerStep::Command(Twist2::ZERO)] {
@@ -2395,7 +2395,7 @@ mod tests {
             if matches!(outcome, PlannerStep::Command(_)) {
                 worker.update_odometry(route_pose(0.500001, 1));
             }
-            assert_eq!(worker.step(0.3), if matches!(outcome, PlannerStep::Command(_)) {
+            assert_eq!(worker.step(), if matches!(outcome, PlannerStep::Command(_)) {
                 outcome
             } else { PlannerStep::Pending(Vec::new()) });
         }
@@ -2407,7 +2407,7 @@ mod tests {
     fn arrival_event_requalification_preserves_strict_region_and_lifecycle_fences() {
         // Keep the real compute thread gated while independently testing retrieval.
         let (mut worker, started, finish) = terminal_worker();
-        worker.step(0.3);
+        worker.step();
         started.recv_timeout(Duration::from_secs(1)).unwrap();
         let goal = route_pose(0.0, 0);
         let options = GoalOptions { position_tolerance_m: 0.25, yaw_tolerance_rad: 0.25, ..Default::default() };
@@ -2448,7 +2448,7 @@ mod tests {
                 _ => {}
             }
             worker.update_odometry(latest);
-            let result = worker.step(0.3);
+            let result = worker.step();
             assert_eq!(result, if matches!(case, "inside" | "optional_yaw") { PlannerStep::Succeeded } else { PlannerStep::Pending(Vec::new()) }, "case {case}");
         }
         worker.stop();
@@ -2458,7 +2458,7 @@ mod tests {
     #[test]
     fn real_computed_arrival_survives_in_tolerance_pose_jitter() {
         let mut harness = RouteWorkerHarness::new();
-        harness.worker.step(0.3);
+        harness.worker.step();
         harness.next_computation();
         harness.release.send(()).unwrap();
         wait_for_source_result(&harness.worker);
@@ -2474,7 +2474,7 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "computed success was not published");
             std::thread::yield_now();
         }
-        assert_eq!(harness.worker.step(0.3), PlannerStep::Succeeded,
+        assert_eq!(harness.worker.step(), PlannerStep::Succeeded,
             "an already computed arrival must survive tiny in-tolerance stationary jitter");
     }
 
@@ -2493,11 +2493,11 @@ mod tests {
         }
         pose.stamp.nanos += 50_000_000;
         worker.update_odometry(pose.clone());
-        assert_eq!(worker.step(0.3), PlannerStep::Succeeded,
+        assert_eq!(worker.step(), PlannerStep::Succeeded,
             "同位姿新时间戳不应阻断已确认的位置到达");
         pose.pose.position.x += 0.5;
         worker.update_odometry(pose);
-        assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()),
+        assert_eq!(worker.step(), PlannerStep::Pending(Vec::new()),
             "移动后不能沿旧位置报告成功");
         assert!(worker.execution_wait_reason().unwrap().contains("到达状态"));
     }
@@ -2509,7 +2509,7 @@ mod tests {
         fn replace_path(&mut self, _: Path2D) {}
         fn update_odometry(&mut self, _: PoseStamped) {}
         fn update_costmap(&mut self, _: CostMap2D) {}
-        fn step(&mut self, _: f64) -> PlannerStep {
+        fn step(&mut self) -> PlannerStep {
             self.entered.store(true, Ordering::SeqCst);
             while !self.release.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(1));
@@ -2532,7 +2532,7 @@ mod tests {
             allow_reverse:true,position_tolerance_m:0.23,yaw_tolerance_rad:0.7,
         };
         worker.configure_goal(&goal,options).unwrap();
-        worker.step(0.3);
+        worker.step();
         let deadline=std::time::Instant::now()+Duration::from_secs(1);
         while worker.shared.0.lock().unwrap().result.is_none() && std::time::Instant::now()<deadline {
             std::thread::sleep(Duration::from_millis(1));
@@ -2566,7 +2566,7 @@ mod tests {
             fn observe_applied_command(&mut self, command: Twist2) {
                 self.applied = command;
             }
-            fn step(&mut self, _: f64) -> PlannerStep {
+            fn step(&mut self) -> PlannerStep {
                 PlannerStep::Command(self.applied)
             }
             fn stop(&mut self) {
@@ -2600,10 +2600,10 @@ mod tests {
                 .replace_execution_path(route.clone(), None, goal.clone())
                 .unwrap();
             // 同拍可直接取得新结果；验证真实交付，不能要求已消费命令继续留在槽中。
-            let delivered = match worker.step(0.3) {
+            let delivered = match worker.step() {
                 PlannerStep::Pending(_) => {
                     wait_for_source_result(&worker);
-                    worker.step(0.3)
+                    worker.step()
                 }
                 result => result,
             };
@@ -2631,7 +2631,7 @@ mod tests {
             release: release.clone(),
         })
         .unwrap();
-        assert_eq!(worker.step(0.3), PlannerStep::Pending(Vec::new()));
+        assert_eq!(worker.step(), PlannerStep::Pending(Vec::new()));
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while !entered.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
@@ -2656,7 +2656,7 @@ mod tests {
             release: release.clone(),
         })
         .unwrap();
-        worker.step(0.3);
+        worker.step();
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while worker.shared.0.lock().unwrap().result.is_none()
             && std::time::Instant::now() < deadline
@@ -2664,13 +2664,13 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         release.store(false, Ordering::SeqCst);
-        let result = worker.step(0.3);
+        let result = worker.step();
         assert!(matches!(result,PlannerStep::Command(t) if t.linear.x>0.0));
         if let PlannerStep::Command(command) = result {
             worker.observe_applied_command(command);
         }
         std::thread::sleep(DEFAULT_CONTROL_HORIZON + Duration::from_millis(20));
-        let stale = worker.step(0.3);
+        let stale = worker.step();
         release.store(true, Ordering::SeqCst);
         assert_eq!(
             stale,
@@ -2685,13 +2685,13 @@ mod tests {
             fn replace_path(&mut self,_:Path2D) {}
             fn update_odometry(&mut self,_:PoseStamped) {}
             fn update_costmap(&mut self,_:CostMap2D) {}
-            fn step(&mut self,_:f64)->PlannerStep {self.steps.fetch_add(1,Ordering::SeqCst);PlannerStep::Pending(Vec::new())}
+            fn step(&mut self)->PlannerStep {self.steps.fetch_add(1,Ordering::SeqCst);PlannerStep::Pending(Vec::new())}
             fn stop(&mut self) {let _=self.stopped.send(());}
         }
         let (stopped,stops)=std::sync::mpsc::channel();
         let steps=Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut worker=PlannerWorker::new(Probe{stopped,steps:steps.clone()}).unwrap();
-        worker.step(0.3);wait_for_source_result(&worker);
+        worker.step();wait_for_source_result(&worker);
         while stops.try_recv().is_ok() {}
         worker.stop();stops.recv_timeout(Duration::from_secs(1)).unwrap();
         worker.update_costmap(CostMap2D::new_all_free("map",2,2,0.1));
@@ -2704,19 +2704,19 @@ mod tests {
     #[test]
     fn positive_result_is_consumed_once_and_fresh_same_value_requires_new_compute() {
         let (mut worker, started, release)=source_worker();
-        assert_eq!(worker.step(0.3),PlannerStep::Pending(Vec::new()));
+        assert_eq!(worker.step(),PlannerStep::Pending(Vec::new()));
         started.recv_timeout(Duration::from_secs(1)).unwrap();
         release.send(()).unwrap();wait_for_source_result(&worker);
-        let first=worker.step(0.3);
+        let first=worker.step();
         assert!(matches!(&first,PlannerStep::Command(command) if *command!=Twist2::ZERO));
         assert!(worker.delivered_command_deadline_for_test().is_some());
         assert!(worker.shared.0.lock().unwrap().result.is_none());
         // A retrieval cannot rename the old publication as a new computation.
-        assert_eq!(worker.step(0.3),PlannerStep::Pending(Vec::new()));
+        assert_eq!(worker.step(),PlannerStep::Pending(Vec::new()));
         started.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(worker.step(0.3),PlannerStep::Pending(Vec::new()));
+        assert_eq!(worker.step(),PlannerStep::Pending(Vec::new()));
         release.send(()).unwrap();wait_for_source_result(&worker);
-        assert_eq!(worker.step(0.3),first,"same numeric command is allowed after real computation");
+        assert_eq!(worker.step(),first,"same numeric command is allowed after real computation");
         worker.stop();
         assert!(worker.shared.0.lock().unwrap().result.is_none());
         // A coalesced request may already have entered the gated test planner;
@@ -2728,14 +2728,14 @@ mod tests {
     fn newer_pose_does_not_block_delivery_and_stop_stays_responsive() {
         let(mut worker,started,finish)=terminal_worker();
         worker.update_odometry(route_pose(0.5,0));
-        worker.step(0.3);started.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.step();started.recv_timeout(Duration::from_secs(1)).unwrap();
         let command=Twist2 {linear:nuwax_nav_types_messages::Point2::new(0.1,0.0),angular_z:0.0};
         finish.send(PlannerStep::Command(command)).unwrap();
         wait_for_source_result(&worker);
         worker.update_odometry(route_pose(0.6,1));
         // 新位姿触发的计算由通道挂起；控制拍在有界时间内交付按原位姿算出、仍在许可期内的指令。
         let began=std::time::Instant::now();
-        assert_eq!(worker.step(0.3),PlannerStep::Command(command));
+        assert_eq!(worker.step(),PlannerStep::Command(command));
         assert!(began.elapsed()<DEFAULT_TICK_INTERVAL*2,"等待超过一个控制拍加调度余量");
         let stopped=std::time::Instant::now();
         worker.stop();
@@ -2754,7 +2754,7 @@ mod tests {
         fn replace_path(&mut self,_:Path2D) {}
         fn update_odometry(&mut self,_:PoseStamped) {}
         fn update_costmap(&mut self,_:CostMap2D) {}
-        fn step(&mut self,_:f64)->PlannerStep {
+        fn step(&mut self)->PlannerStep {
             self.bound=None;let _=self.started.send(());
             let (step,bound)=self.finish.recv_timeout(Duration::from_secs(2)).unwrap_or((PlannerStep::Pending(Vec::new()),None));
             self.bound=bound;step
@@ -2774,14 +2774,14 @@ mod tests {
     fn dispatch_expiry_during_compute_becomes_pending_without_route_penalty() {
         let (mut worker,started,finish)=dispatch_worker();
         let command=Twist2{linear:nuwax_nav_types_messages::Point2::new(0.05,0.0),angular_z:0.0};
-        assert!(matches!(worker.step(0.3),PlannerStep::Pending(_)));
+        assert!(matches!(worker.step(),PlannerStep::Pending(_)));
         started.recv_timeout(Duration::from_secs(1)).unwrap();
         let bound=dispatch_test_bound(0);
         assert!(bound.expired_now());
         finish.send((PlannerStep::Command(command),Some(bound))).unwrap();
         wait_for_source_result(&worker);
         assert!(matches!(worker.shared.0.lock().unwrap().result.as_ref().unwrap().1,PlannerStep::Pending(_)));
-        assert!(matches!(worker.step(0.3),PlannerStep::Pending(_)));
+        assert!(matches!(worker.step(),PlannerStep::Pending(_)));
         assert!(worker.execution_wait_reason().unwrap().contains("发布前"));
         assert!(worker.take_command_dispatch_bound().is_none());
         // A genuinely new computation with the same numeric command can recover.
@@ -2790,7 +2790,7 @@ mod tests {
         let fresh=dispatch_test_bound(1_000_000_000);
         finish.send((PlannerStep::Command(command),Some(fresh))).unwrap();
         wait_for_source_result(&worker);
-        assert_eq!(worker.step(0.3),PlannerStep::Command(command));
+        assert_eq!(worker.step(),PlannerStep::Command(command));
         assert_eq!(worker.take_command_dispatch_bound(),Some(fresh));
         assert!(worker.take_command_dispatch_bound().is_none());
         worker.stop();let _=finish.send((PlannerStep::Pending(Vec::new()),None));
@@ -2799,7 +2799,7 @@ mod tests {
     fn dispatch_bound_rejects_delayed_first_retrieval_without_extending_hold_lease() {
         let (mut worker,started,finish)=dispatch_worker();
         let command=Twist2{linear:nuwax_nav_types_messages::Point2::new(0.05,0.0),angular_z:0.0};
-        worker.step(0.3);started.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.step();started.recv_timeout(Duration::from_secs(1)).unwrap();
         let fresh=dispatch_test_bound(1_000_000_000);
         finish.send((PlannerStep::Command(command),Some(fresh))).unwrap();wait_for_source_result(&worker);
         {
@@ -2808,7 +2808,7 @@ mod tests {
             input.result_dispatch_bound=Some(dispatch_test_bound(0));
             assert!(input.result.as_ref().unwrap().0.elapsed()<DEFAULT_CONTROL_HORIZON);
         }
-        assert!(matches!(worker.step(0.3),PlannerStep::Pending(_)));
+        assert!(matches!(worker.step(),PlannerStep::Pending(_)));
         assert!(worker.execution_wait_reason().unwrap().contains("交付前"));
         assert!(worker.take_command_dispatch_bound().is_none());
         worker.stop();let _=finish.send((PlannerStep::Pending(Vec::new()),None));
@@ -2818,9 +2818,9 @@ mod tests {
         let command=Twist2{linear:nuwax_nav_types_messages::Point2::new(0.05,0.0),angular_z:0.0};
         for change in 0..7 {
             let (mut worker,started,finish)=dispatch_worker();
-            worker.step(0.3);started.recv_timeout(Duration::from_secs(1)).unwrap();
+            worker.step();started.recv_timeout(Duration::from_secs(1)).unwrap();
             finish.send((PlannerStep::Command(command),Some(dispatch_test_bound(1_000_000_000)))).unwrap();
-            wait_for_source_result(&worker);assert_eq!(worker.step(0.3),PlannerStep::Command(command));
+            wait_for_source_result(&worker);assert_eq!(worker.step(),PlannerStep::Command(command));
             assert!(worker.delivered_dispatch_bound.is_some());
             let goal=route_pose(2.0,0);
             match change {

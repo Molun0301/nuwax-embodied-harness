@@ -857,7 +857,7 @@ async fn surface_owner_changed_source_qualifies_query_then_progresses(observatio
                 surface_config("map").geometry,
                 message.source_voxel_size,
             )
-            .unwrap(),
+            .unwrap().with_body_envelope(snapshot.body_envelope().unwrap().clone()).unwrap(),
         );
         // Equal numeric points, a genuinely new immutable geometry source.
         assert!(!changed.same_geometry(&snapshot));
@@ -959,12 +959,12 @@ async fn compute_owner_surface_new_immutable_source_rechecks_once_without_histor
 // inclusion; reuse its actual compute owner, gated Surface source and cleanup.
 pub(super) fn watermark_owner_config() -> SurfaceNavigationConfig {
     let mut config = surface_config("map");
-    config.apply_calibration(Some(nuwax_nav_types_messages::RobotGeometry {
+    config.apply_calibration(nuwax_nav_types_messages::RobotGeometry {
         self_collision: None,
         footprint_xy_m: vec![[-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1]],
-        z_min_m: -0.05, z_max_m: 0.2, source: "F2 real Writer owner fixture".into(),
-    }), None).unwrap();
-    assert!(config.body_envelope.is_some());
+        z_min_m: -0.5, z_max_m: 0.2, source: "F2 real Writer owner fixture".into(),
+    }, None).unwrap();
+
     config
 }
 

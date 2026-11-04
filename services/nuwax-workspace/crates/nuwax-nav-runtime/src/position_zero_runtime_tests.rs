@@ -84,7 +84,7 @@ fn zero_position_terminal_group_distinguishes_original_goal_from_wrong_height() 
             poses: vec![start, endpoint],
         }), None, goal).unwrap();
         follower.update_odometry(actual);
-        let step = follower.step(0.3);
+        let step = follower.step();
         assert_ne!(step, PlannerStep::Succeeded);
         if wrong_height {
             assert!(matches!(step, PlannerStep::ReplanRequired(_)));

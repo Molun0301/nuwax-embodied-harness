@@ -65,7 +65,7 @@ pub struct WavefrontGoalSourceAdapter {
     max_navigation_retries: u32,
     blacklist_radius_m: f64,
     max_consecutive_failures: u32,
-    robot_geometry: Option<nuwax_nav_types_messages::RobotGeometry>,
+    robot_geometry: nuwax_nav_types_messages::RobotGeometry,
 }
 
 impl WavefrontGoalSourceAdapter {
@@ -75,6 +75,7 @@ impl WavefrontGoalSourceAdapter {
         name: impl Into<Cow<'static, str>>,
         config: WavefrontConfig,
         id_source: Box<dyn FrontierGoalIdSource + Send>,
+        robot_geometry: nuwax_nav_types_messages::RobotGeometry,
     ) -> Self {
         let name = name.into();
         let blacklist_radius_m = config.safe_distance_m;
@@ -96,14 +97,14 @@ impl WavefrontGoalSourceAdapter {
             max_navigation_retries: 1,
             blacklist_radius_m,
             max_consecutive_failures,
-            robot_geometry: None,
+            robot_geometry,
         }
     }
 
     /// 构造默认 adapter(使用 `CountingIdSource`,生产可替换为 uuid v7 / 确定性 hash)
     #[must_use]
-    pub fn with_default_id(name: impl Into<Cow<'static, str>>, config: WavefrontConfig) -> Self {
-        Self::new(name, config, Box::new(CountingIdSource::default()))
+    pub fn with_default_id(name: impl Into<Cow<'static, str>>, config: WavefrontConfig, robot_geometry: nuwax_nav_types_messages::RobotGeometry) -> Self {
+        Self::new(name, config, Box::new(CountingIdSource::default()), robot_geometry)
     }
 
     /// 接入同一导航标定中的传感器观察模型。
@@ -118,15 +119,6 @@ impl WavefrontGoalSourceAdapter {
             .set_observation_model(model)
             .map_err(|error| ExploreError::SourceError(error.to_string()))
     }
-    /// 使用原拥有方捕获的机体外形。
-    pub fn set_robot_geometry(&mut self, geometry: nuwax_nav_types_messages::RobotGeometry) {
-        assert!(
-            self.prepared.is_none(),
-            "resolve prepared poll before configuration"
-        );
-        self.robot_geometry = Some(geometry);
-    }
-
     /// 替换 id source(便于上层注入 deterministic generator)
     pub fn set_id_source(&mut self, id_source: Box<dyn FrontierGoalIdSource + Send>) {
         assert!(
@@ -287,7 +279,8 @@ impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
             let mut costmap = observations.clone();
 
             let robot_pose = state.robot_position();
-            if let Some(geometry) = self.robot_geometry.as_ref() {
+            {
+                let geometry = &self.robot_geometry;
                 let footprint = geometry
                     .grid_footprint(
                         costmap.resolution,
@@ -299,8 +292,6 @@ impl ExplorationGoalSource for WavefrontGoalSourceAdapter {
                 // 当前机体已经占据这一区域，范围约束在随后施加，不写回规范地图。
                 footprint.clear_current_occupancy(&mut costmap, robot_pose);
                 self.selector.set_grid_footprint(Some(footprint));
-            } else {
-                self.selector.set_grid_footprint(None);
             }
             if let Some(boundary) = &self.boundary {
                 if !boundary.contains(Point2::new(robot_pose.x, robot_pose.y)) {
@@ -504,7 +495,7 @@ mod tests {
     #[test]
     fn input_interruption_leaves_planar_frontier_eligible_after_repeated_stops() {
         let mut source =
-            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         source.configure_constraints(None, 0, 0.75);
         source.begin().unwrap();
         let map = frontier_grid();
@@ -531,7 +522,7 @@ mod tests {
     #[test]
     fn calibrated_planar_source_uses_visible_frontier_cells_and_observation_yaw() {
         let mut source =
-            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         source
             .set_observation_model(nuwax_nav_types_messages::ObservationModel {
                 kind: nuwax_nav_types_messages::ObservationKind::Planar,
@@ -579,11 +570,7 @@ mod tests {
                 grid.set((4 + dx) as u32, (4 + dy) as u32, self_return);
             }
             let original = grid.clone();
-            let mut adapter = WavefrontGoalSourceAdapter::with_default_id(
-                "wavefront",
-                WavefrontConfig::default(),
-            );
-            adapter.set_robot_geometry(geometry.clone());
+            let mut adapter = WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default(), geometry.clone());
             adapter.begin().unwrap();
             let mut state = sample_state(Some(&grid), Timestamp::default());
             state.robot_pose.pose.position.x = position.x;
@@ -599,71 +586,18 @@ mod tests {
     #[test]
     fn missing_costmap_returns_unavailable() {
         let mut ad =
-            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         ad.begin().unwrap();
         let s = sample_state(None, Timestamp::default());
         let poll = ad.poll_goal(&s).unwrap();
         assert!(matches!(poll, ExplorationPoll::SourceUnavailable(_)));
     }
 
-    #[test]
-    fn initial_unknown_footprint_waits_then_selects_goal_after_real_observation() {
-        let mut controller =
-            crate::ExplorationController::new(crate::ExplorationArbitrationPolicy::FirstAvailable);
-        controller.add_source_boxed(Box::new(WavefrontGoalSourceAdapter::with_default_id(
-            "wavefront",
-            WavefrontConfig::default(),
-        )));
-        controller.begin_exploration().unwrap();
-        let mut incomplete = frontier_grid();
-        incomplete.set(4, 4, OccupancyCell::Unknown);
-        let mut state = sample_state(Some(&incomplete), Timestamp::default());
-        state.robot_pose.pose.position.x = 2.25;
-        state.robot_pose.pose.position.y = 2.25;
-        assert!(matches!(controller.poll_next_goal(&state).unwrap(),
-            ExplorationPoll::SourceUnavailable(reason) if reason.contains("not fully observed")));
-        assert!(controller.is_active(), "缺测不能关闭探索控制器");
-        assert!(controller.frontier_snapshot().is_empty());
-
-        let complete = frontier_grid();
-        state.global_costmap = Some(&complete);
-        assert!(
-            matches!(
-                controller.poll_next_goal(&state).unwrap(),
-                ExplorationPoll::Goal(_)
-            ),
-            "后续真实地图补齐后应直接产生前沿目标，不必重启探索"
-        );
-        controller
-            .stop_with_reason(crate::ExplorationStopReason::UserCancelled)
-            .unwrap();
-        controller.begin_exploration().unwrap();
-        state.global_costmap = Some(&incomplete);
-        assert!(matches!(
-            controller.poll_next_goal(&state).unwrap(),
-            ExplorationPoll::SourceUnavailable(_)
-        ));
-        let mut blocked = frontier_grid();
-        blocked.set(4, 4, OccupancyCell::Cost(50));
-        state.global_costmap = Some(&blocked);
-        assert!(matches!(
-            controller.poll_next_goal(&state).unwrap(),
-            ExplorationPoll::Stop(crate::ExplorationStopReason::NoReachableFreeSpace)
-        ));
-        assert!(
-            controller
-                .diagnostics()
-                .sources
-                .iter()
-                .all(|source| source.last_error.is_none()),
-            "已知障碍终态不能继续携带上一轮缺测诊断"
-        );
-    }
 
     #[test]
     fn free_grid_reports_no_frontier() {
         let mut ad =
-            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         ad.begin().unwrap();
         let grid = OccupancyGrid2D {
             origin: Point2 { x: 0.0, y: 0.0 },
@@ -680,7 +614,7 @@ mod tests {
     #[test]
     fn ingested_free_costmap_reports_no_frontier() {
         let mut ad =
-            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         ad.begin().unwrap();
         let grid = OccupancyGrid2D {
             origin: Point2 { x: 0.0, y: 0.0 },
@@ -698,7 +632,7 @@ mod tests {
     #[test]
     fn ingest_costmap_mismatched_returns_error() {
         let mut ad =
-            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         let bad = OccupancyGrid2D {
             origin: Point2 { x: 0.0, y: 0.0 },
             resolution: 0.5,
@@ -713,7 +647,7 @@ mod tests {
     #[test]
     fn facade_goal_uses_selector_id_source() {
         let mut ad =
-            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         ad.begin().unwrap();
         // free grid → Pending;我们只验证 id source 已经被 selector 使用过一次,
         // 通过 diagnostics 看不到,但 selector 会持有 id_source 的 mutable borrow;
@@ -732,7 +666,7 @@ mod tests {
     #[test]
     fn planar_regional_age_ignores_old_feedback_cancellation_and_session_restart() {
         let mut adapter =
-            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         let grid = frontier_grid();
         let mut state = sample_state(Some(&grid), Timestamp::default());
         state.robot_pose.pose.position.x = 2.25;
@@ -770,7 +704,7 @@ mod tests {
     #[test]
     fn production_planar_source_reports_shared_regional_selection() {
         let mut source =
-            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         source.begin().unwrap();
         let map = frontier_grid();
         let mut state = sample_state(Some(&map), Timestamp::default());
@@ -791,7 +725,7 @@ mod tests {
     #[test]
     fn selected_goal_stays_in_flight_until_navigation_feedback() {
         let mut ad =
-            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         ad.begin().unwrap();
         let grid = frontier_grid();
         let mut s = sample_state(Some(&grid), Timestamp::default());
@@ -819,7 +753,7 @@ mod tests {
     #[test]
     fn boundary_rejects_out_of_area_frontier() {
         let mut ad =
-            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         ad.configure_constraints(
             Some(
                 ExplorationBoundary::from_vertices(vec![
@@ -860,7 +794,7 @@ mod tests {
             }
         }
         let mut ad =
-            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         ad.configure_constraints(
             Some(
                 ExplorationBoundary::from_vertices(vec![

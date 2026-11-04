@@ -2230,10 +2230,11 @@ impl ProductionTopologyStartupFailureFixture {
 /// 生产拓扑按注册顺序列出的常驻任务槽。测试夹具使用生产默认的三维导航配置，
 /// 因此包含只在该配置下注册的 `canonical-navigation-map-revisions`。
 #[cfg(test)]
-const PRODUCTION_TOPOLOGY_PERSISTENT_SLOTS: [&str; 11] = [
+const PRODUCTION_TOPOLOGY_PERSISTENT_SLOTS: [&str; 12] = [
     "navigation-state-consumer",
     "path-envelope-consumer",
     "public-tf-observer",
+    "surface-map-consumer",
     "legacy-global-map-demand",
     "canonical-navigation-map-revisions",
 
@@ -2537,7 +2538,6 @@ fn test_wavefront_goal_intent(
         cancel_generation: i64::try_from(cancel_generation).expect("test cancel generation"),
         committed_map,
         boundary_id: String::new(),
-        body_to_support_z_m: None,
         boundary_points: Vec::new(),
 
         motion_guard_boot_nonce: motion_admission.guard_boot_nonce,
@@ -13974,16 +13974,7 @@ pub(crate) mod mapping_feed_tests {
         );
         assert!(mask.data.contains(&0) && mask.data.contains(&100));
         assert!(mask.data.iter().all(|value| matches!(value, 0 | 100)));
-        let geometry = nuwax_nav_stack::surface_config::SurfaceNavigationConfig::new(
-            "map".into(),
-            0.5,
-            0.2,
-            0.6,
-            0.1,
-            0.15,
-            18.0,
-            0.2,
-        )
+        let geometry = nuwax_nav_stack::surface_config::SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.2)/2., -(0.2)/2.], [(0.2)/2., -(0.2)/2.], [(0.2)/2., (0.2)/2.], [-(0.2)/2., (0.2)/2.]], z_min_m: -(0.5), z_max_m: (0.6)-(0.5), source: "测试外形".into() }, 0.1, 0.15, 18.0, 0.2)
         .unwrap()
         .geometry;
         let mut unmasked = message.clone();
@@ -14371,16 +14362,7 @@ pub(crate) mod mapping_feed_tests {
         let frame = build_navigation_map_3d_publication_frame(&publication, &metadata, None).unwrap();
         let message = schema::decode_navigation_map_3d_body(&frame.payload).unwrap();
         let explore = crate::explore_runtime::ExploreRuntimeHandle::default_with_wavefront();
-        let config = nuwax_nav_stack::surface_config::SurfaceNavigationConfig::new(
-            "map".into(),
-            0.5,
-            0.2,
-            0.6,
-            0.1,
-            0.15,
-            18.0,
-            0.2,
-        )
+        let config = nuwax_nav_stack::surface_config::SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.2)/2., -(0.2)/2.], [(0.2)/2., -(0.2)/2.], [(0.2)/2., (0.2)/2.], [-(0.2)/2., (0.2)/2.]], z_min_m: -(0.5), z_max_m: (0.6)-(0.5), source: "测试外形".into() }, 0.1, 0.15, 18.0, 0.2)
         .unwrap();
         explore
             .configure_surface_source(Ok(config), 37, message.commit_boot_nonce)
@@ -19732,7 +19714,7 @@ mod typed_navigation_feedback_tests {
 motion_admission: crate::nav_runtime::test_motion_admission(),
 
             options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
-            body_to_support_z_m: None, boundary_owner: None,
+            boundary_owner: None,
                 id: lease.session_id.clone(),
                 frame_id: "map".to_string(),
                 target: PoseState::default(),
@@ -19817,7 +19799,7 @@ motion_admission: crate::nav_runtime::test_motion_admission(),
 motion_admission: crate::nav_runtime::test_motion_admission(),
 
             options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
-            body_to_support_z_m: None, boundary_owner: None,
+            boundary_owner: None,
                     id: lease_b.session_id.clone(),
                     frame_id: "map".to_string(),
                     target: PoseState::default(),
@@ -19972,7 +19954,7 @@ goal_id:lease.session_id.clone(),owner_kind:lease.owner_kind,
 motion_admission: crate::nav_runtime::test_motion_admission(),
 
             options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
-            body_to_support_z_m: None, boundary_owner: None,
+            boundary_owner: None,
                 id: lease.session_id.clone(),
                 frame_id: "map".to_string(),
                 target: PoseState::default(),
@@ -20005,7 +19987,7 @@ motion_admission: crate::nav_runtime::test_motion_admission(),
 motion_admission: crate::nav_runtime::test_motion_admission(),
 
             options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
-            body_to_support_z_m: None, boundary_owner: None,
+            boundary_owner: None,
                 id: lease.session_id.clone(),
                 frame_id: "map".to_string(),
                 target: PoseState::default(),
@@ -20068,7 +20050,7 @@ motion_admission: crate::nav_runtime::test_motion_admission(),
 motion_admission: crate::nav_runtime::test_motion_admission(),
 
             options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
-            body_to_support_z_m: None, boundary_owner: None,
+            boundary_owner: None,
                 id: lease_a.session_id.clone(),
                 frame_id: "map".to_string(),
                 target: PoseState::default(),
@@ -20127,7 +20109,7 @@ motion_admission: crate::nav_runtime::test_motion_admission(),
 motion_admission: crate::nav_runtime::test_motion_admission(),
 
             options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
-            body_to_support_z_m: None, boundary_owner: None,
+            boundary_owner: None,
             id: lease_b.session_id.clone(),
             frame_id: "map".to_string(),
             target: PoseState::default(),
@@ -20185,7 +20167,7 @@ motion_admission: crate::nav_runtime::test_motion_admission(),
 motion_admission: crate::nav_runtime::test_motion_admission(),
 
             options: Default::default(), producer: "public-navigation".into(), producer_epoch: 1,
-            body_to_support_z_m: None, boundary_owner: None,
+            boundary_owner: None,
                 id: lease.session_id.clone(),
                 frame_id: "map".to_string(),
                 target: PoseState::default(),

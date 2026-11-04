@@ -11,7 +11,7 @@ impl NavPlanner for MeasuredWorkerProbe {
     fn update_costmap(&mut self,_:CostMap2D) {}
     fn observe_measured_motion(&mut self,m:Option<MeasuredMotion>) {self.measured=m;}
     fn observe_applied_command(&mut self,c:Twist2) {self.applied=c;}
-    fn step(&mut self,_:f64)->PlannerStep {
+    fn step(&mut self)->PlannerStep {
         self.entered.send((self.measured.clone(),self.applied)).unwrap();
         self.release.recv_timeout(Duration::from_secs(3)).unwrap();
         PlannerStep::Command(Twist2{linear:nuwax_nav_types_messages::Point2::new(
@@ -34,34 +34,34 @@ fn measured_change_during_computation_keeps_result_and_recomputes() {
     // 合成计算允许等待，保留原测试样本的固定有效期限。
     a.valid_until_monotonic_ns+=5_000_000_000;
     let applied=Twist2{linear:nuwax_nav_types_messages::Point2::new(0.8,0.),angular_z:0.};
-    worker.observe_applied_command(applied);worker.observe_measured_motion(Some(a.clone()));worker.step(0.3);
+    worker.observe_applied_command(applied);worker.observe_measured_motion(Some(a.clone()));worker.step();
     let first=started.recv_timeout(Duration::from_secs(1)).unwrap();
     assert_eq!(first,(Some(a.clone()),applied));
     let mut b=a.clone();b.source_timestamp_ns+=1;b.body_linear_xyz[0]=0.2;
     worker.observe_measured_motion(Some(b.clone()));release.send(()).unwrap();
     let second=started.recv_timeout(Duration::from_secs(1)).unwrap();assert_eq!(second,(Some(b),applied));
     // 按原测速求得的结果仍在许可期内，可以交付；新测速另起一次计算。
-    assert!(matches!(worker.step(0.3),PlannerStep::Command(c) if c.linear.x==0.1));
+    assert!(matches!(worker.step(),PlannerStep::Command(c) if c.linear.x==0.1));
     release.send(()).unwrap();wait_for_source_result(&worker);
-    assert!(matches!(worker.step(0.3),PlannerStep::Command(c) if c.linear.x==0.2));
+    assert!(matches!(worker.step(),PlannerStep::Command(c) if c.linear.x==0.2));
     worker.stop();
 }
 #[test]
 fn motion_loss_and_recovery_never_substitute_the_applied_command() {
     let (mut worker,started,release)=measured_probe();
     let applied=Twist2{linear:nuwax_nav_types_messages::Point2::new(0.8,0.),angular_z:0.};
-    worker.observe_applied_command(applied);worker.step(0.3);
+    worker.observe_applied_command(applied);worker.step();
     let sample=started.recv_timeout(Duration::from_secs(1)).unwrap();assert_eq!(sample,(None,applied));
-    release.send(()).unwrap();wait_for_source_result(&worker);let _=worker.step(0.3);
+    release.send(()).unwrap();wait_for_source_result(&worker);let _=worker.step();
     let mut measured=crate::motion_feedback::tests::measured([0.2,0.,0.],[0.;3]);
     measured.valid_until_monotonic_ns+=5_000_000_000;
     worker.observe_measured_motion(Some(measured.clone()));
     assert_eq!(started.recv_timeout(Duration::from_secs(1)).unwrap(),(Some(measured),applied));
-    release.send(()).unwrap();wait_for_source_result(&worker);let _=worker.step(0.3);
+    release.send(()).unwrap();wait_for_source_result(&worker);let _=worker.step();
     worker.observe_measured_motion(None);
     assert_eq!(started.recv_timeout(Duration::from_secs(1)).unwrap(),(None,applied));
     release.send(()).unwrap();wait_for_source_result(&worker);
-    assert!(matches!(worker.step(0.3),PlannerStep::Command(c) if c.linear.x==0.01));worker.stop();
+    assert!(matches!(worker.step(),PlannerStep::Command(c) if c.linear.x==0.01));worker.stop();
 }
 
 /// 生产异步时序回归：20 Hz 的同物理状态新观测不应无条件饿死
@@ -70,7 +70,7 @@ fn motion_loss_and_recovery_never_substitute_the_applied_command() {
 fn timestamp_only_measurement_refresh_during_slow_compute_must_not_starve_result() {
     let (mut worker,started,release)=measured_probe();
     let first=crate::motion_feedback::tests::measured([0.1,0.,0.],[0.;3]);
-    worker.observe_measured_motion(Some(first.clone()));worker.step(0.3);
+    worker.observe_measured_motion(Some(first.clone()));worker.step();
     assert_eq!(started.recv_timeout(Duration::from_secs(1)).unwrap().0,Some(first.clone()));
     let initial_version=worker.shared.0.lock().unwrap().motion_version;
     for index in 1..=3 {
@@ -90,7 +90,7 @@ fn timestamp_only_measurement_refresh_during_slow_compute_must_not_starve_result
     if restarted { release.send(()).unwrap(); }
     let published_first={worker.shared.0.lock().unwrap().result.is_some()};
     let latest=worker.shared.0.lock().unwrap().measured_motion.clone().unwrap();
-    let selected=if !restarted {Some(worker.step(0.3))} else {None};
+    let selected=if !restarted {Some(worker.step())} else {None};
     worker.stop();
     assert_eq!(latest.source_timestamp_ns,first.source_timestamp_ns+150_000_000);
     assert_eq!(latest.valid_until_monotonic_ns,first.valid_until_monotonic_ns);
@@ -104,7 +104,7 @@ fn fresh_same_state_cannot_renew_the_consumed_samples_deadline() {
     let (mut worker,started,release)=measured_probe();
     let mut old=crate::motion_feedback::tests::measured([0.1,0.,0.],[0.;3]);
     old.valid_until_monotonic_ns=old.received_monotonic_ns+100_000_000;
-    worker.observe_measured_motion(Some(old.clone()));worker.step(0.3);
+    worker.observe_measured_motion(Some(old.clone()));worker.step();
     assert_eq!(started.recv_timeout(Duration::from_secs(1)).unwrap().0,Some(old.clone()));
     let version=worker.shared.0.lock().unwrap().motion_version;
     std::thread::sleep(Duration::from_millis(50));

@@ -559,7 +559,10 @@ def resolve_robot_geometry(config: RobotGeometryConfig, *, robot_name: str, base
             if model is not None and not model.is_file():
                 model = None
         if model is not None:
-            result = _parse_urdf(model.resolve(), config.model_base_link, _joint_positions(config.model_joint_positions_json),
+            joint_positions = config.model_joint_positions_json
+            if not explicit and not joint_positions:
+                joint_positions = model.with_name("robot_geometry_reference.json").read_text(encoding="utf-8")
+            result = _parse_urdf(model.resolve(), config.model_base_link, _joint_positions(joint_positions),
                                  source_prefix="urdf" if explicit else "robot_default_urdf", resource_bytes=resource_bytes)
         else:
             # 通用回退沿原0.25米外包半宽与0.6米高度，来源明确，不伪称真实模型。

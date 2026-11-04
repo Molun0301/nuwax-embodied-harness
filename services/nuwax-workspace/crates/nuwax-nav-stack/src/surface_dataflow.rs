@@ -159,11 +159,8 @@ async fn run_surface_scheduler(
     let transport = lcm_transport()?;
     let socket = std::env::var("NUWAX_MOTION_GUARD_SOCKET")
         .unwrap_or_else(|_| "/run/nuwax/motion-guard.sock".into());
-    let scheduler_config = nuwax_nav_runtime::SchedulerConfig {
-        robot_width_m: config.robot_width_m,
-        ..nuwax_nav_runtime::SchedulerConfig::default()
-    };
-    run_surface_scheduler_with_transport(node, hub, transport, shutdown, ready, config.follower.body_to_support_z_m, config.follower.max_observation_age_sec.map(Duration::from_secs_f64), async move {
+    let scheduler_config = nuwax_nav_runtime::SchedulerConfig::default();
+    run_surface_scheduler_with_transport(node, hub, transport, shutdown, ready, config.follower.max_observation_age_sec.map(Duration::from_secs_f64), async move {
         nuwax_nav_runtime::spawn_production_surface_scheduler(
             socket,
             scheduler_config,
@@ -181,7 +178,6 @@ async fn run_surface_scheduler_with_transport<F>(
     transport: LcmTransport,
     shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
-    body_to_support_z_m: f64,
     recent_source_max_age: Option<Duration>,
     create_scheduler: F,
 ) -> NavStackResult<()>
@@ -235,23 +231,7 @@ where
         #[allow(unreachable_code)] Ok::<(),NavStackError>(())
     };
     signal_ready(ready)?;
-    let execution_loop = run_guarded_nav_loop(
-        &node,
-        &transport,
-        &scheduler,
-        shutdown,
-        goals,
-        poses,
-        paths,
-        maps,
-        cancels,
-        status,
-        Some(source_max_age),
-        false,
-        &hub.body_reference_frame_id,
-        Some(body_to_support_z_m),
-        recent_source_max_age,
-    );
+    let execution_loop = run_guarded_nav_loop(&node, &transport, &scheduler, shutdown, goals, poses, paths, maps, cancels, status, Some(source_max_age), false, &hub.body_reference_frame_id, recent_source_max_age);
     let loop_future=async {tokio::select! {
         result=execution_loop=>result,
         result=diagnostic_loop=>result,
@@ -546,6 +526,16 @@ fn body_path_progressive(surface: &SurfaceSnapshot, start: &PoseStamped, goal: &
         pose: Pose3 { position: Point3::new(point[0], point[1], point[2]),
             orientation: Quaternion {x:orientation[0],y:orientation[1],z:orientation[2],w:orientation[3]} },
     }).collect() } })
+}
+
+/// 全局规划起点按统一外形站立；缺测时保留原始位姿交给端点绑定。
+fn place_surface_start(surface: &SurfaceSnapshot, pose: &PoseStamped, body: &nuwax_nav_mls_planner::SurfaceBodyEnvelope) -> PoseStamped {
+    let mut start = pose.clone();
+    if let Some(ground) = surface.ground_below(&body.footprint_xy_m,
+        [pose.pose.position.x, pose.pose.position.y, pose.pose.position.z], pose.pose.orientation.yaw()) {
+        start.pose.position.z = ground + body.body_to_support_z_m;
+    }
+    start
 }
 
 fn surface_replan_input(surface: &Arc<SurfaceSnapshot>, start: &PoseStamped,
@@ -1051,7 +1041,7 @@ async fn run_surface_planner_with_computer(
             }
             frame = goals.next() => {
                 let frame = required_frame(frame, "surface planner goal")?;
-                let incoming = match decode_configured_goal_envelope(&frame.payload, &hub.body_reference_frame_id, Some(config.follower.body_to_support_z_m)) {
+                let incoming = match decode_configured_goal_envelope(&frame.payload, &hub.body_reference_frame_id) {
                     Ok(goal) => goal,
                     Err(error) => { diagnostics.reject("surface goal", &error.to_string()); continue; }
                 };
@@ -1085,7 +1075,8 @@ async fn run_surface_planner_with_computer(
                 let (Some(map), Some(pose), Some(active_goal)) = (latest_map.as_ref(), pose.as_ref(), goal.as_ref()) else { continue; };
                 if !execution_admitted || !map.authority.permits_goal(active_goal) { continue; }
                 let Ok(surface) = map.snapshot.as_ref() else { continue; };
-                let input = surface_replan_input(surface, pose, active_goal, &config, execution_feedback.as_ref())?;
+                let pose = place_surface_start(surface, pose, &config.body_envelope);
+                let input = surface_replan_input(surface, &pose, active_goal, &config, execution_feedback.as_ref())?;
                 // 复用相同输入的搜索失败；新几何、位姿、目标或实际感知都会重新计算。
                 if failed_input.as_ref().is_some_and(|old|
                     nuwax_nav_runtime::native_map::same_source_geometry(&old.source, &input.source)
@@ -1293,7 +1284,7 @@ mod tests {
                     actual.stamp.nanos += 50_000_000;
                     follower.update_odometry(actual.clone());
                     let began = Instant::now();
-                    let step = follower.step(config.robot_width_m);
+                    let step = follower.step();
                     let elapsed_ms = began.elapsed().as_secs_f64() * 1000.0;
                     frames.push(serde_json::json!({"tick":tick,"elapsed_ms":elapsed_ms,
                         "position":[actual.pose.position.x,actual.pose.position.y,actual.pose.position.z],
@@ -1355,7 +1346,7 @@ mod tests {
                 // 固定现场站姿和零速回执，量化原地重复计算及其速度候选。
                 follower.update_odometry(pose.clone());
                 follower.observe_applied_command(nuwax_nav_types_messages::Twist2::ZERO);
-                let step = follower.step(config.robot_width_m);
+                let step = follower.step();
                 let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
                 eprintln!("冻结已发布路径 tick={tick} elapsed_ms={elapsed_ms:.3} step={step:?}");
                 results.push(serde_json::json!({"tick":tick, "elapsed_ms":elapsed_ms, "step":format!("{step:?}")}));
@@ -1474,7 +1465,7 @@ mod tests {
                 for tick in 0..800 {
                     actual.stamp.nanos+=50_000_000;
                     follower.update_odometry(actual.clone());
-                    match follower.step(config.robot_width_m) {
+                    match follower.step() {
                         PlannerStep::Succeeded => { completed=true;break; }
                         PlannerStep::Command(twist) => {
                             follower.observe_applied_command(twist);
@@ -1533,7 +1524,23 @@ mod tests {
     }
 
     fn config() -> SurfaceNavigationConfig {
-        SurfaceNavigationConfig::new("map".into(), 0.4, 0.3, 0.6, 0.1, 0.2, 35.0, 0.2).unwrap()
+        SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.2, 35.0, 0.2).unwrap()
+    }
+
+    #[test]
+    fn global_start_uses_one_standing_height_and_preserves_unobserved_pose() {
+        let config = config();
+        let mut geometry = config.geometry.clone();
+        geometry.wall_buffer_m = 0.0;
+        geometry.wall_buffer_weight = 0.0;
+        let map = SurfaceSnapshot::from_points(&[(0.55,0.55,0.05)], geometry, 0.1).unwrap();
+        let standing = PoseStamped { frame_id: nuwax_nav_types_messages::NavFrameId::Map, stamp: Default::default(), pose: Pose3 { position: Point3::new(0.55, 0.55, 0.5), orientation: Quaternion::IDENTITY } };
+        let mut lying = standing.clone(); lying.pose.position.z = 0.2;
+        let placed = place_surface_start(&map, &standing, &config.body_envelope);
+        assert_eq!(place_surface_start(&map, &lying, &config.body_envelope), placed);
+        assert!((placed.pose.position.z - 0.5).abs() < 1e-6);
+        let mut missing = lying; missing.pose.position.x = 10.0;
+        assert_eq!(place_surface_start(&map, &missing, &config.body_envelope), missing);
     }
 
     fn map_message(revision: i64, session: &str) -> schema::NavigationMap3D {
@@ -1971,7 +1978,7 @@ mod tests {
         for _ in 0..20 {
             start.stamp.nanos += 50_000_000;
             follower.update_odometry(start.clone());
-            let step = follower.step(0.3);
+            let step = follower.step();
             let nuwax_nav_runtime::PlannerStep::Command(twist) = step else {
                 panic!("真实生成路径必须能启动运动: step={step:?} path={path:?}");
             };
@@ -2365,23 +2372,14 @@ mod tests {
             let mut executor = boxed_owner(
                 "surface-real-lcm-test-executor",
                 Box::new(move |shutdown, ready| {
-                    Box::pin(run_surface_scheduler_with_transport(
-                        scheduler_spec,
-                        scheduler_hub,
-                        scheduler_transport,
-                        shutdown,
-                        ready,
-                        configured.follower.body_to_support_z_m,
-                        configured.follower.max_observation_age_sec.map(Duration::from_secs_f64),
-                        async move {
+                    Box::pin(run_surface_scheduler_with_transport(scheduler_spec, scheduler_hub, scheduler_transport, shutdown, ready, configured.follower.max_observation_age_sec.map(Duration::from_secs_f64), async move {
                             // 此夹具发布完整静态地图，注册原帧接线由专门的流测试验证。
                             let local = nuwax_nav_runtime::qualification_static_surface_backend(configured.follower)?;
                             let pair=nuwax_nav_runtime::spawn_scheduler(nuwax_nav_runtime::NavScheduler::new(
                                 RecordingMotion(motion_calls),local,scheduler_config)?);
                             sender.send(pair.0.clone()).unwrap();
                             Ok(pair)
-                        },
-                    ))
+                        }))
                 }),
             );
             executor.start().unwrap();

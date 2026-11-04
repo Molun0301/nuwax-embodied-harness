@@ -360,7 +360,6 @@ pub(crate) fn build_wavefront_goal_intent(
         cancel_generation: cancel_generation as i64,
         committed_map,
         boundary_id,
-        body_to_support_z_m: None,
         boundary_points,
 
         motion_guard_boot_nonce: motion_admission.guard_boot_nonce,
@@ -805,10 +804,7 @@ impl ExploreRuntimeInner {
     fn new() -> Self {
         Self {
             logical_active: false,
-            committed: CommittedView::capture(&build_controller(
-                ExplorationArbitrationPolicy::PreferWavefront,
-                &ExploreStartConfig::default(),
-            )),
+            committed: CommittedView::capture(&ExplorationController::new(ExplorationArbitrationPolicy::PreferWavefront)),
             compute: ComputeState::default(),
             arbitration: ExplorationArbitrationPolicy::PreferWavefront,
             last_request_id: String::new(),
@@ -956,25 +952,15 @@ impl Default for ExploreRuntimeInner {
     }
 }
 
-fn build_controller(
-    policy: ExplorationArbitrationPolicy,
-    config: &ExploreStartConfig,
-) -> ExplorationController {
-    build_controller_with_geometry(policy, config, None, None).expect("无观察标定的默认控制器")
-}
-
 fn build_controller_with_geometry(
     policy: ExplorationArbitrationPolicy,
     config: &ExploreStartConfig,
-    geometry: Option<nuwax_nav_types_messages::RobotGeometry>,
+    geometry: nuwax_nav_types_messages::RobotGeometry,
     observation: Option<nuwax_nav_types_messages::ObservationModel>,
 ) -> Result<ExplorationController,String> {
     let mut controller = ExplorationController::new(policy);
     let mut adapter =
-        WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
-    if let Some(geometry) = geometry {
-        adapter.set_robot_geometry(geometry);
-    }
+        WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default(), geometry);
     if let Some(model)=observation {adapter.set_observation_model(model).map_err(|error|error.to_string())?;}
     adapter.configure_constraints(
         config.boundary.clone(),
@@ -992,11 +978,8 @@ fn build_profile_controller(
 ) -> Result<ExplorationController, String> {
     let observation=nuwax_nav_types_messages::NavigationCapabilities::from_env()?.and_then(|profile|profile.observation);
     let Some(surface) = surface else {
-        let geometry = std::env::var("NUWAX_ROBOT_GEOMETRY_JSON")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| nuwax_nav_types_messages::RobotGeometry::from_runtime_json(&value))
-            .transpose()?;
+        let value = std::env::var("NUWAX_ROBOT_GEOMETRY_JSON").map_err(|error| error.to_string())?;
+        let geometry = nuwax_nav_types_messages::RobotGeometry::from_runtime_json(&value)?;
         return build_controller_with_geometry(policy, config, geometry, observation);
     };
     if !surface.accepting {
@@ -2214,13 +2197,6 @@ impl ExploreRuntimeHandle {
                             .await;
                     }
                 };
-                if let Some(surface)=&guard.surface_mode {
-                    // Return endpoints are the captured body pose. Only ordinary surface
-                    // frontier coordinates were derived through support -> body.
-                    intent.body_to_support_z_m=if guard.return_goal_id.as_deref()==Some(goal.id.as_str()) { None } else {
-                        surface.config.as_ref().ok().map(|config|config.follower.body_to_support_z_m)
-                    };
-                }
                 intent.options = if guard.return_goal_id.as_deref() == Some(goal.id.as_str()) {
                     crate::explore_mission::home_goal_options()
                 } else {
@@ -4277,7 +4253,7 @@ mod tests {
     }
 
     fn surface_config(frame: &str) -> SurfaceNavigationConfig {
-        SurfaceNavigationConfig::new(frame.into(), 0.5, 0.2, 0.6, 0.1, 0.15, 18.0, 0.2).unwrap()
+        SurfaceNavigationConfig::new(frame.into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.2)/2., -(0.2)/2.], [(0.2)/2., -(0.2)/2.], [(0.2)/2., (0.2)/2.], [-(0.2)/2., (0.2)/2.]], z_min_m: -(0.5), z_max_m: (0.6)-(0.5), source: "测试外形".into() }, 0.1, 0.15, 18.0, 0.2).unwrap()
     }
 
     fn surface_message(frame: &str, revision: i32) -> schema::NavigationMap3D {
@@ -4371,8 +4347,9 @@ mod tests {
         SurfaceMapTicket,
         Arc<SurfaceSnapshot>,
     ) {
+        let config = surface_config(frame);
         handle
-            .configure_surface_source(Ok(surface_config(frame)), 37, [7; 16])
+            .configure_surface_source(Ok(config.clone()), 37, [7; 16])
             .await
             .unwrap();
         let message = surface_message(frame, 1);
@@ -4384,10 +4361,10 @@ mod tests {
         let snapshot = Arc::new(
             SurfaceSnapshot::from_points(
                 &schema::navigation_map_3d_points(&message).unwrap(),
-                surface_config(frame).geometry,
+                config.geometry.clone(),
                 message.source_voxel_size,
             )
-            .unwrap(),
+            .unwrap().with_body_envelope(config.body_envelope.clone()).unwrap(),
         );
         assert!(
             handle
@@ -4445,7 +4422,6 @@ mod tests {
             assert_eq!(requests[0].intent.goal.pose.orientation_xyzw,
                 [arrival.x, arrival.y, arrival.z, arrival.w]);
             assert_eq!(requests[0].intent.map_frame_generation, 1);
-            assert_eq!(requests[0].intent.body_to_support_z_m, Some(surface_config("map").follower.body_to_support_z_m));
             assert_eq!(requests[0].intent.options, nuwax_nav_types_messages::GoalOptions {
                 allow_reverse: surface_config("map").follower.kinematics()
                     .is_some_and(|motion| motion.max_reverse_mps > 0.0),
@@ -5613,84 +5589,6 @@ mod tests {
             submitted[0].motion_admission,
             crate::nav_runtime::test_motion_admission()
         );
-    }
-
-    #[tokio::test]
-    async fn no_reachable_robot_origin_is_failed_not_completed() {
-        let (handle, _) = configured_handle();
-        ingest_committed_costmap_fixture(&handle, occupied_costmap(1), 1)
-            .await
-            .unwrap();
-        handle.start("req-natural", "prefer_wavefront").await;
-
-        let completed = handle.tick((1.0, 1.0)).await;
-
-        assert_eq!(completed.status, STATUS_FAILED);
-        assert_eq!(completed.last_stop_reason, "no_reachable_free_space");
-    }
-
-    #[tokio::test]
-    async fn unobserved_origin_wait_recovers_and_preserves_cancel_and_duration_limit() {
-        for scenario in ["recover", "cancel", "duration"] {
-            let (handle, sink) = configured_handle();
-            let mut incomplete = frontier_costmap(1);
-            incomplete.grid.set(4, 4, OccupancyCell::Unknown);
-            ingest_committed_costmap_fixture(&handle, incomplete, 1)
-                .await
-                .unwrap();
-            handle
-                .start_with_config(
-                    "req-initial-observation",
-                    ExploreStartConfig {
-                        motion_admission: crate::nav_runtime::test_motion_admission(),
-                        stop_conditions: ExploreStopConditions {
-                            max_duration_ms: Some(1_000),
-                            ..ExploreStopConditions::default()
-                        },
-                        ..ExploreStartConfig::default()
-                    },
-                )
-                .await;
-            let waiting = handle.tick((2.0, 2.0)).await;
-            assert_eq!(waiting.status, STATUS_PENDING);
-            assert!(waiting.message.contains("not fully observed"));
-            assert!(sink.submitted.lock().unwrap().is_empty());
-
-            match scenario {
-                "recover" => {
-                    ingest_committed_costmap_fixture(&handle, frontier_costmap(2), 2)
-                        .await
-                        .unwrap();
-                    let active = handle.tick((2.0, 2.0)).await;
-                    assert_eq!(active.status, STATUS_ACTIVE);
-                    assert!(!active.child_task_id.is_empty());
-                    assert_eq!(sink.submitted.lock().unwrap().len(), 1);
-                    let mut guard = handle.inner.lock().await;
-                    guard.started_at_ns = now_unix_nanos() - 2_000_000_000;
-                    guard.last_poll = Some(ExplorationPoll::SourceUnavailable(
-                        "later input wait".into(),
-                    ));
-                    assert_eq!(
-                        evaluate_stop_conditions(&guard, now_unix_nanos(), None),
-                        Some(ExplorationStopReason::DurationExceeded),
-                        "已选择目标后的原限时规则保持"
-                    );
-                }
-                "cancel" => {
-                    let stopped = handle.stop("req-initial-observation").await;
-                    assert_eq!(stopped.status, STATUS_CANCELLED);
-                    assert!(sink.submitted.lock().unwrap().is_empty());
-                }
-                _ => {
-                    handle.inner.lock().await.started_at_ns = now_unix_nanos() - 2_000_000_000;
-                    let stopped = handle.tick((2.0, 2.0)).await;
-                    assert_eq!(stopped.last_stop_reason, "no_reachable_free_space");
-                    assert_eq!(stopped.status, STATUS_FAILED);
-                    assert!(stopped.message.contains("not fully observed"));
-                    assert!(sink.submitted.lock().unwrap().is_empty());
-                }
-            }
-        }
     }
 
     #[tokio::test]
@@ -7983,7 +7881,6 @@ async fn scheme_a_frontier_rejection_before_publish_preserves_source_failed_ack(
             allow_reverse:false,position_tolerance_m:0.1,yaw_tolerance_rad:0.2,
         });
         assert_eq!(requests[0].intent.goal.pose.position,[2.0,2.0,0.0]);
-        assert_eq!(requests[0].intent.body_to_support_z_m, None);
         let lease=active_child_lease(&handle).await;
         assert!(handle.report_navigation_result("old-child",ChildNavigationResult::Reached(terminal_proof(&lease))).await.is_err());
         assert_eq!(handle.snapshot().status,STATUS_ACTIVE);
@@ -8193,7 +8090,7 @@ async fn scheme_a_frontier_rejection_before_publish_preserves_source_failed_ack(
     #[test]
     fn wavefront_adapter_source_name_is_wavefront() {
         let adapter =
-            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default());
+            WavefrontGoalSourceAdapter::with_default_id("wavefront", WavefrontConfig::default(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         assert_eq!(adapter.source_name(), Cow::Borrowed("wavefront"));
     }
 
@@ -8206,17 +8103,17 @@ async fn scheme_a_frontier_rejection_before_publish_preserves_source_failed_ack(
         // Mission route queries require the real complete-body view, unlike
         // the older point-only surface-frontier fixture.
         let mut config = surface_config("map");
-        config.apply_calibration(Some(nuwax_nav_types_messages::RobotGeometry {
+        config.apply_calibration(nuwax_nav_types_messages::RobotGeometry {
             self_collision: None,
             footprint_xy_m: vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],
-            z_min_m: -0.05, z_max_m: 0.2, source: "surface return body fixture".into(),
-        }), None).unwrap();
+            z_min_m: -0.5, z_max_m: 0.2, source: "surface return body fixture".into(),
+        }, None).unwrap();
         handle.configure_surface_source(Ok(config.clone()), 37, [7;16]).await.unwrap();
         let message = surface_message("map", 1);
         let ticket = handle.begin_surface_map_update(&message, now_monotonic_nanos()).await.unwrap().unwrap();
         let snapshot = Arc::new(SurfaceSnapshot::from_points(
             &schema::navigation_map_3d_points(&message).unwrap(), config.geometry.clone(), message.source_voxel_size,
-        ).unwrap().with_body_envelope(config.body_envelope.clone().unwrap()).unwrap());
+        ).unwrap().with_body_envelope(config.body_envelope.clone()).unwrap());
         assert!(handle.finish_surface_map_update(ticket, Ok(snapshot.clone())).await);
         eprintln!("surface return: complete-body source committed");
         let started = handle.start_with_config("surface-return-body", ExploreStartConfig {
@@ -8244,7 +8141,6 @@ async fn scheme_a_frontier_rejection_before_publish_preserves_source_failed_ack(
         assert_eq!(requests.len(), 1);
         assert!(requests[0].frontier_goal_id.contains(".return."));
         assert_eq!(requests[0].intent.goal.pose.position, home);
-        assert_eq!(requests[0].intent.body_to_support_z_m, None);
     }
 
 }

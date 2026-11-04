@@ -333,8 +333,6 @@ pub struct SchedulerConfig {
     pub renew_interval: Duration,
     /// 等待路径期限；零表示等待至路径就绪或取消。
     pub path_wait_timeout: Duration,
-    /// Collision footprint width passed to the local planner.
-    pub robot_width_m: f64,
     /// 位姿接收期限；零表示不以固定接收年龄终止。
     pub pose_ttl: Duration,
     /// 地图接收期限；零表示保持至来源显式失效。
@@ -347,7 +345,6 @@ impl Default for SchedulerConfig {
             tick_interval: DEFAULT_TICK_INTERVAL,
             renew_interval: MAX_RENEW_INTERVAL,
             path_wait_timeout: DEFAULT_PATH_WAIT_TIMEOUT,
-            robot_width_m: 0.3,
             pose_ttl: DEFAULT_POSE_TTL,
             costmap_ttl: DEFAULT_COSTMAP_TTL,
         }
@@ -907,9 +904,9 @@ pub trait NavPlanner: Send + 'static {
     /// versions; it does not broaden which initial steps may defer.
     /// Synchronous backends return None and retain their immediate step behavior.
     /// Delegating adapters must forward this hook with `step` to preserve scheduling.
-    fn prepare_control_step(&mut self, _robot_width_m: f64, _continuing_wait: bool) -> Option<watch::Receiver<()>> { None }
+    fn prepare_control_step(&mut self, _continuing_wait: bool) -> Option<watch::Receiver<()>> { None }
     /// Produce one controller step without waiting for a background computation.
-    fn step(&mut self, robot_width_m: f64) -> PlannerStep;
+    fn step(&mut self) -> PlannerStep;
     /// Clear planner state after a terminal fence.
     fn stop(&mut self);
 }
@@ -926,10 +923,8 @@ pub enum LocalExecutionBackendKind {
 struct BasicInProcessLocalBackend(LocalPlanner);
 
 impl BasicInProcessLocalBackend {
-    fn production() -> Self {
-        Self(LocalPlanner::with_config(
-            LocalPlannerConfig::default_config(),
-        ))
+    fn production(geometry: nuwax_nav_types_messages::RobotGeometry) -> Self {
+        Self(LocalPlanner::with_config(LocalPlannerConfig::default_config(), geometry))
     }
 
     fn set_navigation_motion_limits(&mut self, physical: nuwax_nav_types_messages::MotionLimits) -> Result<(),RuntimeError> {
@@ -972,8 +967,8 @@ impl NavPlanner for BasicInProcessLocalBackend {
         self.0.update_costmap(costmap);
     }
 
-    fn step(&mut self, robot_width_m: f64) -> PlannerStep {
-        let (twist, stop) = self.0.step(robot_width_m);
+    fn step(&mut self) -> PlannerStep {
+        let (twist, stop) = self.0.step();
         match stop {
             None => PlannerStep::Command(twist),
             Some(StopMessage::Arrived) => PlannerStep::Succeeded,
@@ -992,26 +987,19 @@ fn production_local_backend(
 ) -> Result<BasicInProcessLocalBackend, RuntimeError> {
     match kind {
         LocalExecutionBackendKind::BasicInProcess => {
-            let mut backend = BasicInProcessLocalBackend::production();
-            if let Some(value) = std::env::var("NUWAX_ROBOT_GEOMETRY_JSON")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-            {
-                let geometry = nuwax_nav_types_messages::RobotGeometry::from_runtime_json(&value)
-                    .map_err(|reason| RuntimeError::InvalidInput {
-                    field: "robot_geometry",
-                    reason,
-                })?;
-                backend.0.set_robot_geometry(geometry);
-            }
+            let value = std::env::var("NUWAX_ROBOT_GEOMETRY_JSON")
+                .map_err(|error| RuntimeError::InvalidInput { field: "robot_geometry", reason: error.to_string() })?;
+            let geometry = nuwax_nav_types_messages::RobotGeometry::from_runtime_json(&value)
+                .map_err(|reason| RuntimeError::InvalidInput { field: "robot_geometry", reason })?;
+            let mut backend = BasicInProcessLocalBackend::production(geometry);
             if let Some(capabilities)=nuwax_nav_types_messages::NavigationCapabilities::from_env().map_err(|reason| RuntimeError::InvalidInput {field:"navigation_capabilities",reason})? {
                 backend.set_navigation_motion_limits(capabilities.motion)?;
             }
             Ok(backend)
         }
         LocalExecutionBackendKind::SurfaceInProcess => Err(RuntimeError::InvalidInput {
-            field: "body_to_support_z_m",
-            reason: "三维后端必须通过显式配置构造，缺少机体到支撑面的标定".into(),
+            field: "robot_geometry",
+            reason: "三维后端必须通过显式配置构造".into(),
         }),
     }
 }
@@ -1301,7 +1289,7 @@ where
                                     #[cfg(feature = "surface-recovery-qualification")]
                                     let _qualification_span = self.qualification_span(
                                         "scheduler.prepare_control_step", self.status.pose_source_timestamp_ns);
-                                    self.planner.prepare_control_step(self.config.robot_width_m, previous.is_some())
+                                    self.planner.prepare_control_step(previous.is_some())
                                 };
                                 if let Some(publication) = publication {
                                     deferred_control = Some(DeferredControl {
@@ -1840,7 +1828,7 @@ where
         let mut step = {
             #[cfg(feature = "surface-recovery-qualification")]
             let _qualification_span = self.qualification_span("scheduler.planner.step", self.status.pose_source_timestamp_ns);
-            self.planner.step(self.config.robot_width_m)
+            self.planner.step()
         };
         if self.current_route_kind == RouteKind::Approach {
             let near_endpoint = match (&self.current_path,&self.latest_pose) {
@@ -2748,12 +2736,6 @@ fn validate_config(config: SchedulerConfig) -> Result<(), RuntimeError> {
             reason: format!("must be in 1..={}ms", MAX_RENEW_INTERVAL.as_millis()),
         });
     }
-    if !config.robot_width_m.is_finite() || config.robot_width_m <= 0.0 {
-        return Err(RuntimeError::InvalidInput {
-            field: "robot_width_m",
-            reason: "must be finite and positive".into(),
-        });
-    }
     Ok(())
 }
 
@@ -2888,7 +2870,7 @@ mod tests {
     #[test]
     fn production_basic_old_oriented_paths_cannot_emit_sideways_or_reverse() {
         for (x,y) in [(2.0,3.0),(1.0,2.0)] {
-            let mut backend=BasicInProcessLocalBackend::production();
+            let mut backend=BasicInProcessLocalBackend::production(nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
             backend.set_navigation_motion_limits(physical_omni_limits()).unwrap();
             backend.update_costmap(CostMap2D::new_all_free("map",80,80,0.1));
             let mut pose=nuwax_nav_astar::helpers::make_pose_stamped("map",2.0,2.0,0.0);
@@ -2901,7 +2883,7 @@ mod tests {
             for tick in 0..20 {
                 pose.stamp=Timestamp::from_unix(1+tick/10,(tick%10)as u32*100_000_000);
                 backend.update_odometry(pose.clone());
-                match backend.step(0.3) {
+                match backend.step() {
                     PlannerStep::Command(command)=>{
                         assert!(command.linear.x>=0.0,"生产二维后端不能按旧授权倒退：{command:?}");
                         assert_eq!(command.linear.y,0.0,"生产二维后端不能沿旧全向路径横移：{command:?}");
@@ -2916,7 +2898,7 @@ mod tests {
     #[test]
     fn production_basic_forward_paths_turn_and_reach_side_and_rear_goals() {
         for heading in [std::f64::consts::FRAC_PI_2,std::f64::consts::PI] {
-            let mut backend=BasicInProcessLocalBackend::production();
+            let mut backend=BasicInProcessLocalBackend::production(nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
             let physical=physical_omni_limits();
             backend.set_navigation_motion_limits(physical.clone()).unwrap();
             let grid=CostMap2D::new_all_free("map",80,80,0.1);
@@ -2937,7 +2919,7 @@ mod tests {
                 backend.update_odometry(pose.clone());
                 if tick%10==0 {backend.update_costmap(grid.clone());}
                 let command=if reached {Twist2::ZERO} else {
-                    match backend.step(0.3) {
+                    match backend.step() {
                         PlannerStep::Command(command)=>command,
                         PlannerStep::Succeeded=>{reached=true;Twist2::ZERO},
                         other=>panic!("二维前向路径必须连续闭环：方向{heading}，拍{tick}，{other:?}"),
@@ -3376,7 +3358,7 @@ mod tests {
                 .costmap_updates += 1;
         }
 
-        fn step(&mut self, _robot_width_m: f64) -> PlannerStep {
+        fn step(&mut self) -> PlannerStep {
             self.state.lock().expect("fake planner state").step.clone()
         }
 
@@ -3414,8 +3396,7 @@ mod tests {
                 tick_interval: Duration::from_millis(5),
                 renew_interval: Duration::from_millis(20),
                 path_wait_timeout: Duration::from_secs(1),
-                robot_width_m: 0.3,
-                pose_ttl,
+                    pose_ttl,
                 costmap_ttl,
             },
         )
@@ -3561,7 +3542,7 @@ mod tests {
             fn replace_path(&mut self,_:Path2D) {}
             fn update_odometry(&mut self,_:PoseStamped) {}
             fn update_costmap(&mut self,_:CostMap2D) {}
-            fn step(&mut self,_:f64)->PlannerStep {
+            fn step(&mut self)->PlannerStep {
                 self.entered.store(true,Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(700));
                 PlannerStep::Command(Twist2 {linear:Point2::new(0.2,0.0),angular_z:0.0})
@@ -3598,7 +3579,7 @@ mod tests {
             fn replace_path(&mut self, _:Path2D) {}
             fn update_odometry(&mut self, _:PoseStamped) {}
             fn update_costmap(&mut self, _:CostMap2D) {}
-            fn step(&mut self, _:f64) -> PlannerStep {
+            fn step(&mut self) -> PlannerStep {
                 std::thread::sleep(DEFAULT_CONTROL_HORIZON + Duration::from_millis(50));
                 PlannerStep::ReplanRequired("完整机体扫掠受阻".into())
             }
@@ -3692,6 +3673,13 @@ mod tests {
             costmap: ExecutionMap::Planar(CostMap2D::new_all_free("map", 40, 40, 0.1)),
             source_timestamp_ns,
         }
+    }
+
+    /// 完整机体需要中心线两侧都有地图观测。
+    fn body_costmap_at(source_timestamp_ns: i64) -> CostmapObservation {
+        let mut map = CostMap2D::new_all_free("map", 40, 40, 0.1);
+        map.set_origin(Point2::new(-0.5, -0.5));
+        CostmapObservation { costmap: ExecutionMap::Planar(map), source_timestamp_ns }
     }
 
     async fn wait_for_sink(handle: &NavSchedulerHandle) -> SchedulerStatus {
@@ -4019,8 +4007,21 @@ mod tests {
         task.await.expect("join").expect("task result");
     }
 
+    /// 子进程给生产入口提供必需外形，避免并行测试共享进程环境。
+    fn run_with_robot_geometry(test: &str) -> bool {
+        if std::env::var("NUWAX_TEST_BODY_FIXTURE").as_deref() == Ok(test) { return true; }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("NUWAX_TEST_BODY_FIXTURE", test)
+            .env("NUWAX_ROBOT_GEOMETRY_JSON", r#"{"footprint_xy_m":[[-0.15,-0.15],[0.15,-0.15],[0.15,0.15],[-0.15,0.15]],"z_min_m":-0.4,"z_max_m":0.2}"#)
+            .output().unwrap();
+        assert!(output.status.success(), "外形夹具执行失败：{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        false
+    }
+
     #[tokio::test]
     async fn basic_in_process_backend_is_scheduler_owned_and_intent_gated() {
+        if !run_with_robot_geometry("tests::basic_in_process_backend_is_scheduler_owned_and_intent_gated") { return; }
         let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
         let backend = production_local_backend(LocalExecutionBackendKind::BasicInProcess).unwrap();
         assert_eq!(backend.kind(), LocalExecutionBackendKind::BasicInProcess);
@@ -4031,8 +4032,7 @@ mod tests {
                 tick_interval: Duration::from_millis(5),
                 renew_interval: Duration::from_millis(200),
                 path_wait_timeout: Duration::from_secs(1),
-                robot_width_m: 0.3,
-                pose_ttl: Duration::from_secs(1),
+                    pose_ttl: Duration::from_secs(1),
                 costmap_ttl: Duration::from_secs(1),
             },
         )
@@ -4042,7 +4042,7 @@ mod tests {
 
         handle.update_odometry(map_pose()).await.expect("map pose");
         handle
-            .update_costmap(costmap_at(1_000_000_000))
+            .update_costmap(body_costmap_at(1_000_000_000))
             .await
             .expect("costmap");
         tokio::time::sleep(Duration::from_millis(15)).await;
@@ -4116,6 +4116,7 @@ mod tests {
 
     #[tokio::test]
     async fn production_backend_waits_for_goal_yaw_and_discards_orientation_mutation() {
+        if !run_with_robot_geometry("tests::production_backend_waits_for_goal_yaw_and_discards_orientation_mutation") { return; }
         let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
         let scheduler = NavScheduler::new(
             FakeMotion(Arc::clone(&motion_state)),
@@ -4135,7 +4136,7 @@ mod tests {
         endpoint.stamp = Timestamp::from_unix(1, 0);
         handle.update_odometry(endpoint).await.expect("终点位姿");
         handle
-            .update_costmap(costmap_at(1_000_000_000))
+            .update_costmap(body_costmap_at(1_000_000_000))
             .await
             .expect("覆盖路径的地图");
         let mut requested=session();
@@ -4526,7 +4527,7 @@ mod tests {
             fn replace_path(&mut self, _: Path2D) {}
             fn update_odometry(&mut self, _: PoseStamped) {}
             fn update_costmap(&mut self, _: CostMap2D) {}
-            fn step(&mut self, _: f64) -> PlannerStep {
+            fn step(&mut self) -> PlannerStep {
                 if let Some(release) = self.release.take() { release.recv().unwrap(); }
                 PlannerStep::Pending(vec!["BudgetExhausted: finite search budget".into()])
             }
@@ -5098,7 +5099,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn surface_backend_without_calibration_is_rejected_before_connecting_motion() {
+    async fn surface_backend_requires_explicit_configuration_before_connecting_motion() {
         let result = spawn_production_scheduler_with_backend(
             "/not-a-motion-socket",
             SchedulerConfig::default(),
@@ -5108,12 +5109,12 @@ mod tests {
         assert!(matches!(
             result,
             Err(RuntimeError::InvalidInput {
-                field: "body_to_support_z_m",
+                field: "robot_geometry",
                 ..
             })
         ));
         let mut basic =
-            production_local_backend(LocalExecutionBackendKind::BasicInProcess).unwrap();
+            BasicInProcessLocalBackend::production(nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
         let surface_path = Path3D {
             poses: vec![map_pose()],
         };
@@ -5156,8 +5157,7 @@ mod tests {
                 tick_interval: Duration::from_millis(5),
                 renew_interval: Duration::from_millis(20),
                 path_wait_timeout: Duration::from_millis(30),
-                robot_width_m: 0.3,
-                pose_ttl: Duration::from_secs(1),
+                    pose_ttl: Duration::from_secs(1),
                 costmap_ttl: Duration::from_secs(1),
             },
         )
@@ -5522,7 +5522,6 @@ mod tests {
                     Duration::from_millis(250)
                 },
                 path_wait_timeout: Duration::from_secs(5),
-                robot_width_m: 0.3,
                 pose_ttl: Duration::from_secs(5),
                 costmap_ttl: Duration::from_secs(5),
             },
@@ -5623,6 +5622,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_preempts_delayed_submit_over_real_uds_with_qualified_latency() {
+        if !run_with_robot_geometry("tests::cancel_preempts_delayed_submit_over_real_uds_with_qualified_latency") { return; }
         assert_cancel_latency_distribution(
             "delayed-submit",
             collect_real_uds_cancel_latencies(DelayedOperation::Submit).await,
@@ -5631,6 +5631,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_preempts_delayed_renew_over_real_uds_with_qualified_latency() {
+        if !run_with_robot_geometry("tests::cancel_preempts_delayed_renew_over_real_uds_with_qualified_latency") { return; }
         assert_cancel_latency_distribution(
             "delayed-renew",
             collect_real_uds_cancel_latencies(DelayedOperation::Renew).await,
@@ -5639,6 +5640,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_replays_identical_fence_after_first_response_timeout() {
+        if !run_with_robot_geometry("tests::cancel_replays_identical_fence_after_first_response_timeout") { return; }
         assert_cancel_latency_distribution(
             "lost-first-fence-response",
             collect_real_uds_cancel_latencies(DelayedOperation::FenceResponse).await,

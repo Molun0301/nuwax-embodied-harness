@@ -24,7 +24,7 @@ fn zero_yaw_real_arrival_requalification_accepts_unchanged_yaw_after_translation
     harness.worker.replace_execution_path(ExecutionPath::Surface(Path3D {
         poses: vec![goal.clone(), goal.clone()],
     }), None, goal.clone()).unwrap();
-    assert!(matches!(harness.worker.step(0.3), PlannerStep::Pending(_)));
+    assert!(matches!(harness.worker.step(), PlannerStep::Pending(_)));
     let actual_computation = harness.next_computation();
     assert_eq!(actual_computation.outcome, PlannerStep::Succeeded);
     assert_eq!(actual_computation.odometry.pose, goal.pose);
@@ -62,7 +62,7 @@ fn zero_yaw_real_arrival_requalification_accepts_unchanged_yaw_after_translation
     assert_eq!(observed.5, observed.6);
     assert_eq!(observed.7, observed.8);
     eprintln!("yaw-zero worker: distance={distance:.17e} yaw_error={yaw_error:.17e} versions={observed:?}");
-    let delivered = harness.worker.step(0.3);
+    let delivered = harness.worker.step();
     eprintln!("yaw-zero worker delivered={delivered:?}");
     assert_eq!(delivered, PlannerStep::Succeeded,
         "a real geometric update within the original position region keeps exact original yaw");

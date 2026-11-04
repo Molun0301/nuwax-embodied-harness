@@ -10264,17 +10264,6 @@ class GatewayRuntime:
     ) -> MotionAdmission:
         if check_active is not None:
             check_active()
-        # 在启动导航进程前报告缺失标定，避免服务反复退出后才返回启动超时。
-        geometry = self.config.geometry
-        if _runtime_activation_level(capability_name) == "motion" and geometry.pipeline == "lio_3d":
-            from contracts.navigation_pipeline import navigation_support_distance
-            try:
-                navigation_support_distance(runtime_value("NUWAX_NAV_BODY_TO_SUPPORT_Z_M", ""))
-            except ValueError as exc:
-                raise GatewayError(
-                    str(exc), error_code="navigation_calibration_required", http_status=409,
-                    details={"setting_key": "NUWAX_NAV_BODY_TO_SUPPORT_Z_M", "pipeline": "lio_3d"},
-                ) from exc
         try:
             self._ensure_motion_guard_connected(
                 capability_name, deadline_monotonic=deadline_monotonic,

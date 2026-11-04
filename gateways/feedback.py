@@ -519,7 +519,7 @@ def _public_error_message(error_code: str, error_category: str, message: Any) ->
     if error_code in _RECEIPT_ERROR_CODES:
         return _public_text(message, PUBLIC_MESSAGE_MAX_CHARS)
     if error_code in {"mcp_result_unavailable", "mcp_response_too_large"}:
-        return "无法完整返回MCP数据；工具可能已经执行，请勿自动重复执行操作。"
+        return "工具已执行，但结果过大或无法编码，无法完整返回。"
     if _is_internal_error(error_code, error_category):
         return "工具执行失败，未完成请求。"
     return _public_text(message, PUBLIC_MESSAGE_MAX_CHARS)
@@ -539,7 +539,7 @@ def _next_action_for_error(error_code: str, *, retryable: bool) -> str:
         return ("只读核对原 task_id 的当前状态和历史回执。修复回执格式、版本或存储后，只重试读取或回执写入；"
                 "不要重发动作，也不要取消原任务来修复记录。")
     if code in {"mcp_result_unavailable", "mcp_response_too_large"}:
-        return "先核对任务/操作状态；只读查询可缩小范围，已有完整结果或制品地址可单独读取。不要自动重复执行操作。"
+        return "查询类工具可缩小范围后重新查询；会改变状态的操作不要重复执行，先查询状态。"
     if code in {"authentication_required", "invalid_token"}:
         return "补充有效认证信息后重试。"
     if code in {"access_denied", "forbidden", "capability_not_allowed"}:

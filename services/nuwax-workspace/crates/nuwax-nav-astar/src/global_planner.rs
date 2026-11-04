@@ -15,7 +15,6 @@
 //! Foundation stream 完成后由 [`crate::module`] 接入 reactive subject。
 
 use crate::controllers::angle_diff;
-use crate::goal_validator::{find_safe_goal_bfs_contiguous, GoalValidatorOptions};
 use crate::helpers::{make_path2d_empty, make_twist2_zero, pose_xy_yaw, PlannerResult};
 use crate::local_planner::{LocalPlanner, LocalPlannerState, StopMessage};
 use crate::navigation_map::{CostMap2D, GradientStrategy, NavigationMap, OCCUPIED, UNKNOWN};
@@ -49,10 +48,8 @@ pub struct GlobalPlannerConfig {
     pub speed: f64,
     /// 控制频率（Hz）
     pub control_frequency: f64,
-    /// 无模型时的机器人宽度（米），用于距离梯度膨胀与旧局部检查。
-    pub robot_width: f64,
-    /// 统一模型外形；未配置时保留独立算法调用的旧宽度参数。
-    pub robot_geometry: Option<RobotGeometry>,
+    /// 统一模型外形。
+    pub robot_geometry: RobotGeometry,
     /// robot_rotation_diameter（米），用于默认 safe_goal_clearance
     pub robot_rotation_diameter: f64,
     /// Replan limiter 配置
@@ -74,8 +71,9 @@ pub struct GlobalPlannerConfig {
     pub navigation_costmap_interval: f64,
 }
 
-impl Default for GlobalPlannerConfig {
-    fn default() -> Self {
+impl GlobalPlannerConfig {
+    /// 使用统一外形构造规划参数。
+    pub fn new(robot_geometry: RobotGeometry) -> Self {
         let robot_rotation_diameter = 0.6;
         Self {
             goal_tolerance: 0.2,
@@ -88,8 +86,7 @@ impl Default for GlobalPlannerConfig {
             safe_goal_tolerance: 4.0,
             speed: 0.55,
             control_frequency: 10.0,
-            robot_width: 0.5,
-            robot_geometry: None,
+            robot_geometry,
             robot_rotation_diameter,
             max_replan_attempts: 6,
             replan_reset_distance: 2.0,
@@ -173,17 +170,14 @@ impl GlobalPlanner {
             simulation: cfg.simulation,
             navigation_costmap_interval: cfg.navigation_costmap_interval,
         };
-        let mut local = LocalPlanner::with_config(local_cfg);
-        if let Some(geometry) = cfg.robot_geometry.as_ref() {
-            local.set_robot_geometry(geometry.clone());
-        }
+        let local = LocalPlanner::with_config(local_cfg, cfg.robot_geometry.clone());
 
         let position_tracker = PositionTracker::new(cfg.stuck_time_window, stuck_threshold);
         let replan_limiter = ReplanLimiter::new(cfg.max_replan_attempts, cfg.replan_reset_distance);
 
         Self {
-            navigation_map: NavigationMap::new(cfg.robot_width, GradientStrategy::Voronoi),
-            navigation_map_near: NavigationMap::new(cfg.robot_width, GradientStrategy::Gradient),
+            navigation_map: NavigationMap::new(0.0, GradientStrategy::Voronoi),
+            navigation_map_near: NavigationMap::new(0.0, GradientStrategy::Gradient),
             local_planner: local,
             position_tracker,
             replan_limiter,
@@ -291,12 +285,7 @@ impl GlobalPlanner {
             .into_iter()
             .chain(path.points.iter().skip(index + 1).copied())
             .collect();
-        let Some(geometry) = self.cfg.robot_geometry.as_ref() else {
-            return points.iter().all(|point| {
-                let value = map.cell_value(*point);
-                value != UNKNOWN && value < OCCUPIED
-            });
-        };
+        let geometry = &self.cfg.robot_geometry;
         let (Ok(width), Ok(height)) = (u32::try_from(map.width()), u32::try_from(map.height()))
         else {
             return false;
@@ -452,7 +441,7 @@ impl GlobalPlanner {
         }
 
         // 推进 local planner
-        let (twist, stop) = self.local_planner.step(self.cfg.robot_width);
+        let (twist, stop) = self.local_planner.step();
         if let Some(msg) = stop {
             match msg {
                 StopMessage::Arrived => {
@@ -543,30 +532,8 @@ impl GlobalPlanner {
             None => return false,
         };
 
-        let (gx, gy, _) = pose_xy_yaw(&goal);
-        let (ox, oy, _) = pose_xy_yaw(&odom);
-        let safe_goal = match if self.cfg.robot_geometry.is_some() {
-            Some(Point2::new(gx, gy))
-        } else {
-            self._find_safe_goal(Point2::new(gx, gy))
-        } {
-            Some(g) => g,
-            None => {
-                tracing::warn!("no safe goal");
-                self.cancel_goal(false);
-                self.status = NavigationStatus::Blocked;
-                return false;
-            }
-        };
-
-        let planned = if self.cfg.robot_geometry.is_some() {
-            self.navigation_map
-                .binary_costmap()
-                .ok()
-                .and_then(|map| self.path_with_geometry(&map, &odom, &goal))
-        } else {
-            self._find_wide_path(safe_goal, Point2::new(ox, oy))
-        };
+        let planned = self.navigation_map.binary_costmap().ok()
+            .and_then(|map| self.path_with_geometry(&map, &odom, &goal));
         let path = match planned {
             Some(p) => p,
             None => {
@@ -597,41 +564,6 @@ impl GlobalPlanner {
         self.local_planner.stop_planning();
     }
 
-    fn _find_safe_goal(&self, goal: Point2) -> Option<Point2> {
-        let binary = self.navigation_map.binary_costmap().ok()?;
-        self.find_safe_goal_on_map(&binary, goal)
-    }
-
-    fn find_safe_goal_on_map(&self, binary: &CostMap2D, goal: Point2) -> Option<Point2> {
-        let (x, y) = binary.world_to_cell(goal);
-        if !binary.in_bounds(x, y) {
-            return None;
-        }
-        // 正式全局规划不能把未知目标以低于障碍阈值的代价悄悄放行。
-        if binary.is_unknown(x as usize, y as usize) {
-            return None;
-        }
-        let opts = GoalValidatorOptions {
-            cost_threshold: OCCUPIED,
-            min_clearance: self.cfg.safe_goal_clearance,
-            max_search_distance: self.cfg.safe_goal_tolerance,
-            connectivity_check_radius: 3,
-        };
-        find_safe_goal_bfs_contiguous(binary, goal, &opts)
-            .ok()
-            .flatten()
-    }
-
-    fn _find_wide_path(&self, goal: Point2, robot_pos: Point2) -> Option<Path2D> {
-        let dist = ((goal.x - robot_pos.x).powi(2) + (goal.y - robot_pos.y).powi(2)).sqrt();
-        let map = if dist > 1.5 {
-            &self.navigation_map
-        } else {
-            &self.navigation_map_near
-        };
-        Self::find_path_on_map(map, goal, robot_pos)
-    }
-
     fn find_path_on_map(map: &NavigationMap, goal: Point2, robot_pos: Point2) -> Option<Path2D> {
         let costmap = map.make_gradient_costmap(1.1)?;
         let opts = crate::astar::AStarOptions {
@@ -649,7 +581,7 @@ impl GlobalPlanner {
         start: &PoseStamped,
         goal: &PoseStamped,
     ) -> Option<Path2D> {
-        let geometry = self.cfg.robot_geometry.as_ref()?;
+        let geometry = &self.cfg.robot_geometry;
         geometry.validate().ok()?;
         let width = u32::try_from(source.width()).ok()?;
         let height = u32::try_from(source.height()).ok()?;
@@ -777,36 +709,8 @@ impl GlobalPlanner {
         goal: PoseStamped,
         costmap: &CostMap2D,
     ) -> PlannerResult {
-        if self.cfg.robot_geometry.is_some() {
-            return match self.path_with_geometry(costmap, &start, &goal) {
-                Some(path) => {
-                    let length = path.length();
-                    PlannerResult::success(path, length, 0)
-                }
-                None => PlannerResult::failure(crate::helpers::PlannerFailure::NoPath, 0),
-            };
-        }
-        let (gx, gy, _) = pose_xy_yaw(&goal);
-        let (sx, sy, _) = pose_xy_yaw(&start);
-        let safe = match self.find_safe_goal_on_map(costmap, Point2::new(gx, gy)) {
-            Some(g) => g,
-            None => {
-                return PlannerResult::failure(crate::helpers::PlannerFailure::GoalBlocked, 0);
-            }
-        };
-        let strategy = if (safe.x - sx).hypot(safe.y - sy) > 1.5 {
-            GradientStrategy::Voronoi
-        } else {
-            GradientStrategy::Gradient
-        };
-        let mut map = NavigationMap::new(self.cfg.robot_width, strategy);
-        map.update(costmap.clone());
-        let path = Self::find_path_on_map(&map, safe, Point2::new(sx, sy));
-        match path {
-            Some(p) => {
-                let cost = p.length();
-                PlannerResult::success(p, cost, 0)
-            }
+        match self.path_with_geometry(costmap, &start, &goal) {
+            Some(path) => { let length = path.length(); PlannerResult::success(path, length, 0) }
             None => PlannerResult::failure(crate::helpers::PlannerFailure::NoPath, 0),
         }
     }
@@ -840,10 +744,9 @@ mod tests {
 
     fn body_planner(half_width: f64) -> GlobalPlanner {
         GlobalPlanner::new(GlobalPlannerConfig {
-            robot_geometry: Some(test_geometry(half_width)),
+            robot_geometry: test_geometry(half_width),
             // 旧宽度故意与真实外形不同，确保新路径没有继续按旧默认宽度规划。
-            robot_width: 2.0,
-            ..GlobalPlannerConfig::default()
+            ..GlobalPlannerConfig::new(nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.5)/2., -(0.5)/2.], [(0.5)/2., -(0.5)/2.], [(0.5)/2., (0.5)/2.], [-(0.5)/2., (0.5)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() })
         })
     }
 
@@ -917,7 +820,7 @@ mod tests {
                 let mut planner = if with_model {
                     body_planner(0.1)
                 } else {
-                    GlobalPlanner::new(GlobalPlannerConfig::default())
+                    GlobalPlanner::new(GlobalPlannerConfig::new(nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.5)/2., -(0.5)/2.], [(0.5)/2., -(0.5)/2.], [(0.5)/2., (0.5)/2.], [-(0.5)/2., (0.5)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }))
                 };
                 assert!(
                     planner
@@ -1014,14 +917,14 @@ mod tests {
 
     #[test]
     fn fresh_planner_is_idle() {
-        let gp = GlobalPlanner::new(GlobalPlannerConfig::default());
+        let gp = GlobalPlanner::new(GlobalPlannerConfig::new(nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.5)/2., -(0.5)/2.], [(0.5)/2., -(0.5)/2.], [(0.5)/2., (0.5)/2.], [-(0.5)/2., (0.5)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }));
         assert_eq!(gp.status(), NavigationStatus::Idle);
         assert!(!gp.is_goal_reached());
     }
 
     #[test]
     fn single_plan_uses_supplied_map_and_preserves_running_state() {
-        let mut gp = GlobalPlanner::new(GlobalPlannerConfig::default());
+        let mut gp = GlobalPlanner::new(GlobalPlannerConfig::new(nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.5)/2., -(0.5)/2.], [(0.5)/2., -(0.5)/2.], [(0.5)/2., (0.5)/2.], [-(0.5)/2., (0.5)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }));
         let free = CostMap2D::new_all_free("map", 40, 40, 0.1);
         let start = make_pose_stamped("map", 0.75, 1.75, 0.0);
         let goal = make_pose_stamped("map", 3.25, 1.75, 0.0);
@@ -1049,7 +952,7 @@ mod tests {
     fn out_of_bounds_goal_returns_failure_without_panicking() {
         let cm = CostMap2D::new_all_free("map", 30, 30, 0.1);
         for (x, y) in [(-1.0, 1.0), (4.0, 1.0), (1.0, -1.0), (1.0, 4.0)] {
-            let mut gp = GlobalPlanner::new(GlobalPlannerConfig::default());
+            let mut gp = GlobalPlanner::new(GlobalPlannerConfig::new(nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.5)/2., -(0.5)/2.], [(0.5)/2., -(0.5)/2.], [(0.5)/2., (0.5)/2.], [-(0.5)/2., (0.5)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }));
             gp.handle_global_costmap(cm.clone());
             gp.handle_odom(make_pose_stamped("map", 0.5, 0.5, 0.0));
             gp.handle_goal_request(make_pose_stamped("map", x, y, 0.0));
@@ -1059,7 +962,7 @@ mod tests {
 
     #[test]
     fn handle_goal_starts_planning() {
-        let mut gp = GlobalPlanner::new(GlobalPlannerConfig::default());
+        let mut gp = GlobalPlanner::new(GlobalPlannerConfig::new(nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.5)/2., -(0.5)/2.], [(0.5)/2., -(0.5)/2.], [(0.5)/2., (0.5)/2.], [-(0.5)/2., (0.5)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }));
         gp.handle_odom(make_pose_stamped("map", 0.5, 0.5, 0.0));
         let cm = CostMap2D::new_all_free("map", 30, 30, 0.1);
         gp.handle_global_costmap(cm.clone());
@@ -1076,7 +979,7 @@ mod tests {
     fn replan_limiter_blocks_after_max_attempts() {
         let mut gp = GlobalPlanner::new(GlobalPlannerConfig {
             max_replan_attempts: 2,
-            ..GlobalPlannerConfig::default()
+            ..GlobalPlannerConfig::new(nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.5)/2., -(0.5)/2.], [(0.5)/2., -(0.5)/2.], [(0.5)/2., (0.5)/2.], [-(0.5)/2., (0.5)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() })
         });
         gp.handle_odom(make_pose_stamped("map", 0.5, 0.5, 0.0));
         let mut cm = CostMap2D::new_all_free("map", 30, 30, 0.1);
@@ -1103,7 +1006,7 @@ mod tests {
 
     #[test]
     fn close_to_goal_marks_arrived() {
-        let mut gp = GlobalPlanner::new(GlobalPlannerConfig::default());
+        let mut gp = GlobalPlanner::new(GlobalPlannerConfig::new(nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.5)/2., -(0.5)/2.], [(0.5)/2., -(0.5)/2.], [(0.5)/2., (0.5)/2.], [-(0.5)/2., (0.5)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }));
         gp.handle_odom(make_pose_stamped("map", 0.5, 0.5, 0.0));
         let cm = CostMap2D::new_all_free("map", 30, 30, 0.1);
         gp.handle_global_costmap(cm.clone());
@@ -1120,7 +1023,7 @@ mod tests {
 
     #[test]
     fn replan_disabled_cancels_immediately() {
-        let mut gp = GlobalPlanner::new(GlobalPlannerConfig::default());
+        let mut gp = GlobalPlanner::new(GlobalPlannerConfig::new(nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.5)/2., -(0.5)/2.], [(0.5)/2., -(0.5)/2.], [(0.5)/2., (0.5)/2.], [-(0.5)/2., (0.5)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }));
         gp.set_replanning_enabled(false);
         gp.handle_odom(make_pose_stamped("map", 0.5, 0.5, 0.0));
         let mut cm = CostMap2D::new_all_free("map", 30, 30, 0.1);
@@ -1134,13 +1037,13 @@ mod tests {
 
     #[test]
     fn safe_goal_clearance_default_is_half_diameter() {
-        let gp = GlobalPlanner::new(GlobalPlannerConfig::default());
+        let gp = GlobalPlanner::new(GlobalPlannerConfig::new(nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.5)/2., -(0.5)/2.], [(0.5)/2., -(0.5)/2.], [(0.5)/2., (0.5)/2.], [-(0.5)/2., (0.5)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }));
         assert!((gp.safe_goal_clearance() - 0.3).abs() < 1e-9);
     }
 
     #[test]
     fn set_safe_goal_clearance_overrides() {
-        let mut gp = GlobalPlanner::new(GlobalPlannerConfig::default());
+        let mut gp = GlobalPlanner::new(GlobalPlannerConfig::new(nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.5)/2., -(0.5)/2.], [(0.5)/2., -(0.5)/2.], [(0.5)/2., (0.5)/2.], [-(0.5)/2., (0.5)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }));
         gp.set_safe_goal_clearance(0.5);
         assert!((gp.safe_goal_clearance() - 0.5).abs() < 1e-9);
         gp.reset_safe_goal_clearance();

@@ -31,8 +31,7 @@ impl F1RealEntryFixture {
         if !root.blocks.iter().all(|b| first.fine.as_ref().unwrap().included.contains_key(&b.object)) {
             return Err("initial fixture must fit the real inline budget; do not fill missing objects by a fake fetch".into());
         }
-        let config = nuwax_nav_stack::surface_config::SurfaceNavigationConfig::new(
-            "map".into(), 0.5, 0.2, 0.6, 0.1, 0.15, 18.0, 0.2).map_err(|e| e.to_string())?;
+        let config = nuwax_nav_stack::surface_config::SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.2)/2., -(0.2)/2.], [(0.2)/2., -(0.2)/2.], [(0.2)/2., (0.2)/2.], [-(0.2)/2., (0.2)/2.]], z_min_m: -(0.5), z_max_m: (0.6)-(0.5), source: "测试外形".into() }, 0.1, 0.15, 18.0, 0.2).map_err(|e| e.to_string())?;
         explore.configure_surface_source(Ok(config.clone()), 37, first.commit_boot_nonce).await?;
         let transport = LcmTransport::new_real("memq://").map_err(|e| e.to_string())?;
         // Same transport/context for map publish and owned subscribe. The

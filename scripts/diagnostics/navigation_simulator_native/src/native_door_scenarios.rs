@@ -117,11 +117,7 @@ fn q() -> f64 {
 /// world judge. Scene::make's legacy exposed-top response is not solid geometry.
 /// No map samples, navigation inputs, old scenes or collision math are changed.
 fn declare_solid_world(scene: &mut Scene) -> Result<(), String> {
-    let body = scene
-        .config
-        .body_envelope
-        .as_ref()
-        .ok_or("新增门场景缺少原机体标定")?;
+    let body = &scene.config.body_envelope;
     scene.terrain = Terrain::new(
         &scene.points,
         true,
@@ -142,10 +138,7 @@ pub(super) fn register(
         let mut scene = fixture.make_unmodified_scene(config, data)?;
         declare_solid_world(&mut scene)?;
         scene.cases = fixture.cases();
-        let body = config
-            .body_envelope
-            .as_ref()
-            .ok_or("新增门场景缺少原机体标定")?;
+        let body = &config.body_envelope;
         let extent = |axis: usize| {
             let values = body.footprint_xy_m.iter().map(|p| p[axis]);
             [
@@ -210,13 +203,12 @@ mod tests {
             );
         }
         let mut config =
-            SurfaceNavigationConfig::new("map".into(), 0.4, 0.328, 0.6, 0.1, 0.15, 18.0, 0.2)
+            SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.328)/2., -(0.328)/2.], [(0.328)/2., -(0.328)/2.], [(0.328)/2., (0.328)/2.], [-(0.328)/2., (0.328)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.15, 18.0, 0.2)
                 .unwrap();
         // Synthetic fixture-contract body only; runtime scenes keep the full
         // actual Go2 convex hull loaded by the unchanged launcher.
         config
-            .apply_calibration(
-                Some(nuwax_nav_types_messages::RobotGeometry {
+            .apply_calibration(nuwax_nav_types_messages::RobotGeometry {
                     self_collision: None,
                     footprint_xy_m: vec![
                         [-0.2394, -0.164],
@@ -227,9 +219,7 @@ mod tests {
                     z_min_m: -0.448,
                     z_max_m: 0.057,
                     source: "new-door-validator-contract-test-only".into(),
-                }),
-                None,
-            )
+                }, None)
             .unwrap();
         (config, "synthetic_contract_body_not_navigation_acceptance")
     }
@@ -314,7 +304,7 @@ mod tests {
                 after_door.is_ok(),
                 "same independent judge must preserve the real opening"
             );
-            let body = config.body_envelope.as_ref().unwrap();
+            let body = &config.body_envelope;
             evidence.push(json!({"fixture_id":fixture.id, "same_points_exact":scene.points==original_points,
                 "same_navigation_map_identity":std::sync::Arc::ptr_eq(&scene.map,&original_map),
                 "point_count_before":original_points.len(), "point_count_after":scene.points.len(),
@@ -337,7 +327,7 @@ mod tests {
     #[test]
     fn registered_native_doors_keep_runtime_body_and_original_simulator_contract() {
         let (config, _) = diagnostic_config();
-        let original_body = config.body_envelope.as_ref().unwrap();
+        let original_body = &config.body_envelope;
         let directory =
             std::env::temp_dir().join(format!("new-native-door-register-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -355,11 +345,11 @@ mod tests {
             assert_eq!(scene.cases, fixture.cases());
             assert_eq!(scene.points, fixture.points());
             assert_eq!(
-                scene.config.body_envelope.as_ref().unwrap().footprint_xy_m,
+                scene.config.body_envelope.footprint_xy_m,
                 original_body.footprint_xy_m
             );
             assert_eq!(
-                scene.config.body_envelope.as_ref().unwrap().z_bounds_m,
+                scene.config.body_envelope.z_bounds_m,
                 original_body.z_bounds_m
             );
             assert_eq!(scene.config.geometry.voxel_size, config.geometry.voxel_size);

@@ -358,6 +358,9 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._robotModelLayer = null;
     this._robotEnvelope = null;
     this._robotGeometry = null;
+    this._groundCloudVersion = 0;
+    this._groundCloudCache = null;
+    this._robotEnvelopeGround = null;
     this._robotEnvelopeVisible = true;
     this._frontierGroup = null;
     this._forbiddenZoneGroup = null;
@@ -451,6 +454,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._cloudSourceKey = null;
     this._incrementalCloud?.setVisible(false);
     this._incrementalActive = false;
+    this._groundCloudChanged();
     this._hasPointCloudSnapshot = false;
     this._pointCloudMapWatermark = null;
     this._pointCloudBounds = null;
@@ -523,6 +527,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._invalidatePointCloudWork(); this._cloudLoadToken++;
     this._assetCloudUrl = null;
     this._incrementalActive = true;
+    this._groundCloudChanged();
     this._cloudSourceKey = JSON.stringify([header.source, header.source_epoch, header.frame_id,
       header.stream_generation, header.layout_generation]);
     this._lastCloudMapRevision = header.revision;
@@ -535,6 +540,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._denseCloud?.setDisplaySource(header, {reset: header.reset || header.point_count === 0});
     // 旧完整缓冲只属于明确的旧协议/资产路径，新页面不重新拼装它。
     if (this._allPositions.length) this._allPositions = new Float32Array(0);
+    this._groundCloudChanged();
     if (this._pointsMesh) this._pointsMesh.visible = false;
     this._incrementalCloud.setVisible(this._visible && this._pointStyle !== 'full');
     this._applyCloudPageState();
@@ -937,7 +943,11 @@ class PointCloud3DViewer extends PointCloudProcessor {
 
   _robotTarget(pose = this._robotPose) {
     if (!pose) return null;
-    const center = this._robotGeometryCenter?.clone() || new THREE.Vector3(0, 0, FOLLOW_TARGET_HEIGHT);
+    if (this._robotGeometryCenter && this._robotEnvelopeGround !== null) {
+      return this._robotGeometryCenter.clone().applyQuaternion(this._robotEnvelope.quaternion)
+        .add(this._robotEnvelope.position);
+    }
+    const center = new THREE.Vector3(0, 0, FOLLOW_TARGET_HEIGHT);
     if (pose.quaternion) center.applyQuaternion(pose.quaternion);
     return center.add(new THREE.Vector3(pose.x, pose.y, pose.z));
   }
@@ -1376,6 +1386,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
       this._pointCloudMapWatermark = null;
       this._denseCloud?.setDisplaySource(null);
       this._allPositions = new Float32Array(buf);
+      this._groundCloudChanged();
       this._assetCloudUrl = url;
       this._assetCloudSourceKey = this._cloudSourceKey;
       this._hasPointCloudSnapshot = true;
@@ -1408,6 +1419,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     merged.set(this._allPositions);
     merged.set(float32Array, this._allPositions.length);
     this._allPositions = merged;
+    this._groundCloudChanged();
     this._hasPointCloudSnapshot = true;
     this._isLiveCloudMapSnapshot = false;
     this._pointCloudSourcePoints = Math.floor(this._allPositions.length / 3);
@@ -1429,6 +1441,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._denseCloud?.setDisplaySource(identity.header, {reset: identity.header.reset || xyzArray.length === 0});
 
     this._allPositions = xyzArray;
+    this._groundCloudChanged();
     this._rebuildPointCloud();
   }
 
@@ -1438,7 +1451,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._robotMesh.name = 'robot-base-frame';
     this._robotMesh.visible = false;
     this._scene.add(this._robotMesh);
-    this._rebuildRobotEnvelope(this._robotGeometry ?? window.__NUWAX_ROBOT_GEOMETRY__);
+    this._rebuildRobotEnvelope(this._robotGeometry);
     this._robotModelLayer = new RobotModelLayer({
       onChange: () => this._requestRender(),
       onGeometry: geometry => {
@@ -1471,9 +1484,12 @@ class PointCloud3DViewer extends PointCloudProcessor {
     const status = this._robotModelLayer?.status;
     const available = Boolean(status?.available && this._robotModelLayer?.content);
     if (this._robotEnvelope) {
-      this._robotEnvelope.visible = !available || this._robotEnvelopeVisible;
+      this._robotEnvelope.visible = Boolean(this._robotPose) && (this._robotEnvelopeGround === null || !available || this._robotEnvelopeVisible);
       this._robotEnvelope.traverse(object => {
-        if (object.name === 'robot-envelope' || object.name === 'robot-heading') object.visible = !available;
+        if (['robot-envelope', 'robot-heading', 'robot-envelope-edges'].includes(object.name)) {
+          object.visible = this._robotEnvelopeGround !== null && (object.name === 'robot-envelope-edges' || !available);
+        }
+        if (object.name === 'robot-pose-arrow') object.visible = this._robotEnvelopeGround === null;
       });
     }
     const legend = document.getElementById('robotGeometryLegend');
@@ -1489,6 +1505,74 @@ class PointCloud3DViewer extends PointCloudProcessor {
     }
   }
 
+  _groundCloudChanged() {
+    this._groundCloudVersion += 1;
+    this._syncRobotEnvelopePose();
+  }
+
+  _robotGroundBelow(pose) {
+    const geometry = this._robotGeometry;
+    let cache = this._groundCloudCache;
+    if (!cache || cache.version !== this._groundCloudVersion
+        || Math.hypot(pose.x - cache.x, pose.y - cache.y) > 1) {
+      cache = {version: this._groundCloudVersion, x: pose.x, y: pose.y, columns: new Map()};
+      const add = (array, count) => {
+        for (let i = 0; i < count * 3; i += 3) {
+          const x = array[i], y = array[i + 1], z = array[i + 2];
+          if (x < cache.x - 2 || x > cache.x + 2 || y < cache.y - 2 || y > cache.y + 2) continue;
+          const key = `${Math.floor(x / 0.1)},${Math.floor(y / 0.1)}`;
+          let heights = cache.columns.get(key);
+          if (!heights) { heights = []; cache.columns.set(key, heights); }
+          heights.push(z);
+        }
+      };
+      if (this._incrementalActive) {
+        for (const page of this._incrementalCloud.pages) {
+          const bounds = page.metadata.bounds;
+          if (!bounds || bounds[3] < cache.x - 2 || bounds[0] > cache.x + 2
+              || bounds[4] < cache.y - 2 || bounds[1] > cache.y + 2) continue;
+          add(page.array, page.count);
+        }
+      } else add(this._allPositions, this._allPositions.length / 3);
+      this._groundCloudCache = cache;
+    }
+    const cos = Math.cos(pose.yaw), sin = Math.sin(pose.yaw);
+    const polygon = geometry.footprint_xy_m.map(([x, y]) => [pose.x + cos*x - sin*y, pose.y + sin*x + cos*y]);
+    const axes = [[1, 0], [0, 1], ...polygon.map((a, index) => {
+      const b = polygon[(index + 1) % polygon.length];
+      return [b[1] - a[1], a[0] - b[0]];
+    })].map(axis => ({axis, values: polygon.map(point => point[0]*axis[0] + point[1]*axis[1])}));
+    const xs = polygon.map(point => point[0]), ys = polygon.map(point => point[1]);
+    const lower = pose.z + geometry.z_min_m - 0.15;
+    let nearest = Infinity, ground = null;
+    for (let x = Math.floor(Math.min(...xs)/0.1); x <= Math.floor(Math.max(...xs)/0.1); x++) {
+      for (let y = Math.floor(Math.min(...ys)/0.1); y <= Math.floor(Math.max(...ys)/0.1); y++) {
+        const cx = (x + 0.5)*0.1, cy = (y + 0.5)*0.1;
+        if (!axes.every(({axis, values}) => {
+          const center = cx*axis[0] + cy*axis[1], radius = (Math.abs(axis[0]) + Math.abs(axis[1]))*0.05;
+          return Math.max(...values) >= center-radius-1e-10 && center+radius >= Math.min(...values)-1e-10;
+        })) continue;
+        const heights = cache.columns.get(`${x},${y}`) || [];
+        const height = heights.reduce((low, z) => z >= lower && z <= pose.z ? Math.min(low, z) : low, Infinity);
+        const distance = (cx-pose.x)**2 + (cy-pose.y)**2;
+        if (height !== Infinity && distance < nearest) { nearest = distance; ground = height; }
+      }
+    }
+    return ground;
+  }
+
+  _syncRobotEnvelopePose() {
+    if (!this._robotEnvelope || !this._robotPose) return;
+    const pose = this._robotPose;
+    const ground = this._robotEnvelope.userData.kind === 'robot-envelope' ? this._robotGroundBelow(pose) : null;
+    this._robotEnvelopeGround = ground;
+    this._robotEnvelope.position.set(pose.x, pose.y, ground === null ? pose.z : ground);
+    this._robotEnvelope.rotation.set(0, 0, pose.yaw);
+    this._robotEnvelope.scale.z = ground === null ? 1 : pose.z + this._robotGeometry.z_max_m - ground;
+    if (ground !== null) this._robotGeometryCenter.z = this._robotEnvelope.scale.z / 2;
+    this._syncRobotModelDisplay();
+  }
+
   _rebuildRobotEnvelope(raw) {
     if (this._robotEnvelope) {
       for (const resource of this._robotEnvelope.userData.disposableResources || []) resource.dispose?.();
@@ -1497,6 +1581,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._robotGeometryCenter = null;
     const group = new THREE.Group();
     group.name = 'robot-navigation-envelope';
+    group.visible = Boolean(this._robotPose);
     const points = raw?.footprint_xy_m;
     const valid = Array.isArray(points) && points.length >= 3
       && points.every(point => Array.isArray(point) && point.length === 2 && point.every(Number.isFinite))
@@ -1504,12 +1589,11 @@ class PointCloud3DViewer extends PointCloudProcessor {
     let label = '机器人位姿（外形未提供）';
     let description = raw?.error || '请在设置中提供机器人模型或实际长宽高。';
     if (valid) {
-      // 与探索/导航共用机体坐标凸包；直接使用米制坐标，不居中、不贴地、不随缩放放大。
+      // 水平轮廓按真实米制坐标显示，高度随实测地面和机体位置更新。
       const shape = new THREE.Shape(points.map(([x, y]) => new THREE.Vector2(x, y)));
       const geometry = new THREE.ExtrudeGeometry(shape, {
-        depth: raw.z_max_m - raw.z_min_m, bevelEnabled: false, steps: 1,
+        depth: 1, bevelEnabled: false, steps: 1,
       });
-      geometry.translate(0, 0, raw.z_min_m);
       const material = new THREE.MeshBasicMaterial({
         color: COLORS.robot, transparent: true, opacity: 0.18,
         depthWrite: false, side: THREE.DoubleSide,
@@ -1519,7 +1603,9 @@ class PointCloud3DViewer extends PointCloudProcessor {
       group.add(body);
       const edges = new THREE.EdgesGeometry(geometry);
       const edgeMaterial = new THREE.LineBasicMaterial({ color: COLORS.robot, transparent: true, opacity: 0.95 });
-      group.add(new THREE.LineSegments(edges, edgeMaterial));
+      const outline = new THREE.LineSegments(edges, edgeMaterial);
+      outline.name = 'robot-envelope-edges';
+      group.add(outline);
 
       // 朝向箭头位于上表面内部，不扩大显示外形；机体正X为前方。
       const cx = points.reduce((sum, point) => sum + point[0], 0) / points.length;
@@ -1535,7 +1621,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
         new THREE.Vector2(cx - radius * 0.5, cy - radius * 0.5),
       ]);
       const arrowGeometry = new THREE.ShapeGeometry(arrow);
-      arrowGeometry.translate(0, 0, raw.z_max_m);
+      arrowGeometry.translate(0, 0, 1);
       const arrowMaterial = new THREE.MeshBasicMaterial({ color: COLORS.robot, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 });
       const heading = new THREE.Mesh(arrowGeometry, arrowMaterial);
       heading.name = 'robot-heading';
@@ -1547,17 +1633,20 @@ class PointCloud3DViewer extends PointCloudProcessor {
       this._robotGeometryCenter = new THREE.Vector3((bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2, (raw.z_min_m + raw.z_max_m) / 2);
       label = `${String(raw.source).startsWith('legacy_default') ? '默认参考外形' : '机器人外形'} · ${(bounds[2] - bounds[0]).toFixed(2)} × ${(bounds[3] - bounds[1]).toFixed(2)} × ${(raw.z_max_m - raw.z_min_m).toFixed(2)} 米`;
       description = `模型/手填外包，按真实米制尺寸显示；箭头指向机体前方。来源：${raw.source || '配置外形'}${String(raw.source).startsWith('legacy_default') ? '（未提供完整实际尺寸）' : ''}。导航外包按配置参考姿态计算；模型与配置变化后自动更新。`;
-    } else {
-      // 外形未知时只有一个位姿箭头，不把符号大小当作机器人尺寸。
+    }
+    {
+      // 没有外形或脚下地面时只显示位姿箭头。
       const geometry = new THREE.BufferGeometry().setFromPoints([
         new THREE.Vector3(-0.06, 0, 0), new THREE.Vector3(0.08, 0, 0),
         new THREE.Vector3(0.03, 0.04, 0), new THREE.Vector3(0.08, 0, 0),
         new THREE.Vector3(0.03, -0.04, 0),
       ]);
       const material = new THREE.LineBasicMaterial({ color: COLORS.robot });
-      group.add(new THREE.Line(geometry, material));
-      group.userData.kind = 'robot-pose';
-      group.userData.disposableResources = [geometry, material];
+      const poseArrow = new THREE.Line(geometry, material);
+      poseArrow.name = 'robot-pose-arrow';
+      group.add(poseArrow);
+      group.userData.kind ||= 'robot-pose';
+      group.userData.disposableResources = [...(group.userData.disposableResources || []), geometry, material];
     }
     if (typeof document !== 'undefined') {
       const legend = document.getElementById('robotGeometryLegend');
@@ -1572,7 +1661,8 @@ class PointCloud3DViewer extends PointCloudProcessor {
       object.material.depthWrite = false;
     });
     this._robotEnvelope = group;
-    this._robotMesh.add(group);
+    this._scene.add(group);
+    this._syncRobotEnvelopePose();
   }
 
   setRobotPose(x, y, z, yaw, orientation) {
@@ -1611,6 +1701,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
       this._robotMesh.position.set(pose.x, pose.y, pose.z);
       this._robotMesh.quaternion.copy(pose.quaternion);
     }
+    this._syncRobotEnvelopePose();
 
     if (!this._boundaryEditing && this._cameraMode === 'follow' && this._camera && this._controls) {
       const nextTarget = this._robotTarget(pose);
@@ -1636,6 +1727,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._lastPoseDrawnSource = null;
     this._lastFollowTarget = null;
     if (this._robotMesh) this._robotMesh.visible = false;
+    if (this._robotEnvelope) this._robotEnvelope.visible = false;
     const preset = POINT_STYLE_PRESETS[this._pointStyle] || POINT_STYLE_PRESETS[DEFAULT_POINT_STYLE];
     if (preset.floorFilter && this._floorLevelSource === this._allPositions) {
       const nextFloorZ = this._selectFloorLevel(this._floorLevelCache || []);
@@ -2561,6 +2653,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._semanticFallbackMaterial = null;
     this._semanticSelectedMaterial = null;
     this._semanticSelectedFallbackMaterial = null;
+    this._groundCloudCache = null;
     this._robotModelLayer?.dispose();
     this._robotModelLayer = null;
     this._robotEnvelopeToggle?.removeEventListener('change', this._robotEnvelopeHandler);
@@ -2568,6 +2661,7 @@ class PointCloud3DViewer extends PointCloudProcessor {
     this._robotEnvelopeHandler = null;
     if (this._robotEnvelope) {
       for (const resource of this._robotEnvelope.userData.disposableResources || []) resource.dispose?.();
+      this._robotEnvelope.removeFromParent();
       this._robotEnvelope = null;
     }
     this._frontierGroup?.traverse((object) => {

@@ -21,7 +21,7 @@ pub const BOOL_FINGERPRINT: [u8; 8] = 0x1ebe_f06a_5095_0e3e_u64.to_be_bytes();
 /// `nav_msgs.Path` fingerprint from `dimos-lcm==0.1.3`.
 pub const PATH_FINGERPRINT: [u8; 8] = 0xc3ae_62ac_b357_93e2_u64.to_be_bytes();
 /// `nuwax_msgs.GoalEnvelope` generated-C recursive fingerprint.
-pub const GOAL_ENVELOPE_FINGERPRINT: [u8; 8] = 0x894973021b295f7e_u64.to_be_bytes();
+pub const GOAL_ENVELOPE_FINGERPRINT: [u8; 8] = 0x636876be3dee3537u64.to_be_bytes();
 /// `nuwax_msgs.PathEnvelope` generated-C recursive fingerprint.
 pub const PATH_ENVELOPE_FINGERPRINT: [u8; 8] = 0x6043ce6a7625adca_u64.to_be_bytes();
 /// `nav_msgs.OccupancyGrid` fingerprint from `dimos-lcm==0.1.3`.
@@ -147,8 +147,6 @@ pub struct CommittedMapIdentity {
 pub struct GoalIntent {
     /// 目标来源的坐标代际，普通地图修订前进不能改变它。
     pub map_frame_generation: i64,
-    /// Surface producer 实际使用的 body 到 support 正有限标量；其它目标不声明。
-    pub body_to_support_z_m: Option<f64>,
     /// 随原目标封存的倒车与到达约束。
     pub options: nuwax_types::navigation::GoalOptions,
     /// 稳定 producer 名称，例如 `public-navigation` 或 `wavefront`。
@@ -194,8 +192,6 @@ pub struct GoalEnvelope {
     pub map_frame_generation: i64,
     /// 目标位姿对应的实际机体参考点，由启动绑定提供。
     pub body_reference_frame_id: String,
-    /// Surface-derived 目标实际使用的 body 到 support 正有限标量。
-    pub body_to_support_z_m: Option<f64>,
     /// 随目标保留的执行约束。
     pub options: nuwax_types::navigation::GoalOptions,
     /// 当前线格式版本为9。
@@ -1415,8 +1411,6 @@ fn encode_goal_envelope_prefix(message: &GoalEnvelope, out: &mut Vec<u8>) -> Cod
     out.extend_from_slice(&message.motion_stop_generation.to_be_bytes());
     encode_goal_options(&message.options, out);
     encode_string(&message.body_reference_frame_id, out)?;
-    out.push(u8::from(message.body_to_support_z_m.is_some()));
-    out.extend_from_slice(&message.body_to_support_z_m.unwrap_or(0.0).to_be_bytes());
     out.extend_from_slice(&message.map_frame_generation.to_be_bytes());
     Ok(())
 }
@@ -1458,13 +1452,6 @@ fn decode_goal_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<GoalEnvelop
     let allow_reverse=match cursor.read_exact(1)?[0] {0=>false,1=>true,_=>return Err(CodecError::LcmDecode("allow_reverse must be 0 or 1".into()))};
     let options=nuwax_types::navigation::GoalOptions {allow_reverse,position_tolerance_m:cursor.read_f64()?,yaw_tolerance_rad:cursor.read_f64()?};
     let body_reference_frame_id = cursor.read_string()?;
-    let has_body_to_support_z = cursor.read_u8()?;
-    let support = cursor.read_f64()?;
-    let body_to_support_z_m = match has_body_to_support_z {
-        0 => None,
-        1 => Some(support),
-        _ => return Err(CodecError::LcmDecode("has_body_to_support_z must be 0 or 1".into())),
-    };
     let map_frame_generation = cursor.read_i64()?;
     let goal = PoseStamped {
         header: decode_header(cursor)?,
@@ -1473,7 +1460,6 @@ fn decode_goal_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<GoalEnvelop
     Ok(GoalEnvelope {
         map_frame_generation,
         body_reference_frame_id,
-        body_to_support_z_m,
         options,
         schema_version,
         session_id,
@@ -1505,9 +1491,6 @@ fn validate_goal_envelope_semantics(
 ) -> Result<(), String> {
     message.options.validate()?;
     validate_navigation_frame_id(&message.body_reference_frame_id, "body reference")?;
-    if message.body_to_support_z_m.is_some_and(|value| !value.is_finite() || value <= 0.0) {
-        return Err("body_to_support_z_m must be finite and positive when present".into());
-    }
     if message.map_frame_generation < 0 { return Err("map_frame_generation must be non-negative".into()); }
     validate_navigation_identity(
         message.schema_version,
@@ -3500,7 +3483,6 @@ int main(int argc, char **argv) {
             ROUNDTRIP(nuwax_msgs_GoalEnvelope, message.schema_version == 9 &&
                 message.producer_runtime_generation == 7 && message.goal_generation == 2 &&
                 !strcmp(message.body_reference_frame_id, "robot/body") &&
-                message.has_body_to_support_z == 1 && message.body_to_support_z_m == 0.4 &&
                 message.boundary_points_length == 3);
         }
         if (!strcmp(argv[3], "PathEnvelope")) {
@@ -3597,7 +3579,6 @@ assert message.goal_generation == 2 and message.producer_runtime_generation == 7
 if name == "GoalEnvelope":
     assert message.schema_version == 9
     assert message.body_reference_frame_id == "robot/body"
-    assert message.has_body_to_support_z == 1 and message.body_to_support_z_m == 0.4
 else:
     assert message.planner_runtime_generation == 8 and message.path_revision == 1
     if name == "NavigationState":
@@ -3787,7 +3768,6 @@ mod tests {
         GoalEnvelope {
             schema_version: NAVIGATION_ENVELOPE_SCHEMA_VERSION,
             body_reference_frame_id: "robot/body".into(),
-            body_to_support_z_m: Some(0.4),
             session_id: "configured-frame-goal".into(),
             owner_kind: NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
             parent_request_id: "configured-frame-exploration".into(),
@@ -3994,7 +3974,6 @@ elif name == 'GoalEnvelope':
     assert message.committed_map_frame_id == 'robot/map'
     if name == 'GoalEnvelope':
         assert message.body_reference_frame_id == 'robot/body'
-        assert message.has_body_to_support_z == 1 and message.body_to_support_z_m == 0.4
 else:
     assert message.schema_version == 10
     assert message.route_kind == 1
@@ -4108,16 +4087,11 @@ sys.stdout.buffer.write(message.encode())
     }
 
     #[test]
-    fn coordinate_contract_is_explicit_and_optional_support_is_not_a_configuration_digest() {
+    fn coordinate_contract_is_explicit() {
         let goal = configured_frame_goal("map");
         for invalid in ["", " body ", "/robot/body", "robot//body", "body-point"] {
             let mut bad = goal.clone();
             bad.body_reference_frame_id = invalid.into();
-            assert!(encode_goal_envelope(&bad).is_err());
-        }
-        for invalid in [0.0, -0.0, -0.5, f64::NAN, f64::INFINITY] {
-            let mut bad = goal.clone();
-            bad.body_to_support_z_m = Some(invalid);
             assert!(encode_goal_envelope(&bad).is_err());
         }
         let mut public = goal.clone();
@@ -4125,23 +4099,9 @@ sys.stdout.buffer.write(message.encode())
         public.boundary_id.clear();
         public.boundary_frame_id.clear();
         public.boundary_points.clear();
-        public.body_to_support_z_m = None;
         let encoded = encode_goal_envelope(&public).unwrap();
         assert_eq!(decode_goal_envelope(&encoded).unwrap(), public);
 
-        // A profile owner, not the wire codec, decides whether support is required.
-        let mut absent = goal.clone();
-        absent.body_to_support_z_m = None;
-        let mut wire = encode_goal_envelope(&absent).unwrap();
-        let marker = b"robot/body\0";
-        let flag = wire.windows(marker.len()).position(|v| v == marker).unwrap() + marker.len();
-        wire[flag + 1..flag + 9].copy_from_slice(&123.5_f64.to_be_bytes());
-        assert_eq!(decode_goal_envelope(&wire).unwrap().body_to_support_z_m, None);
-        wire[flag] = 2;
-        assert!(decode_goal_envelope(&wire).is_err());
-        wire[flag] = 1;
-        wire[flag + 1..flag + 9].copy_from_slice(&f64::NAN.to_be_bytes());
-        assert!(decode_goal_envelope(&wire).is_err());
     }
 
     #[test]

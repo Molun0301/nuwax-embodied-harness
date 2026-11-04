@@ -96,12 +96,8 @@
   function targetHeight(frameId, selection) {
     if (state.heightInput?.validity?.badInput) throw new Error('目标机体高度必须是有限数值（米）。');
     if (selection && Number.isFinite(selection.surface_z) && !String(state.heightInput?.value || '').trim()) {
-      const distance = window.__NUWAX_NAV_SUPPORT_DISTANCE__;
-      if (typeof distance !== 'number' || !Number.isFinite(distance) || distance <= 0) {
-        throw new Error('请先在平台设置中填写机体到支撑面距离，保存并重启服务后刷新页面。');
-      }
-      // 选取的是地面点；机体目标沿地图正Z轴抬高标定距离，最终朝向不作要求。
-      return selection.surface_z + distance;
+      // 地面目标沿地图正Z轴抬高外形的站立离地高度。
+      return selection.surface_z - window.pointcloud3d._robotGeometry.z_min_m;
     }
     if (typeof window.__nuwaxResolveNavigationHeight !== 'function') {
       throw new Error('定位高度入口不可用，请刷新控制台。');

@@ -440,13 +440,16 @@ async fn surface_owner_new_commit_rechecks_changed_source(change: CompositeOwner
                         next.committed_map.source_timestamp_ns as u64,
                         0,
                         &[],
-                        [(0, [pose.x + 0.4, pose.y, pose.z + 0.2])],
+                        [(0, [pose.x + 0.4, pose.y, pose.z + {
+                            let [bottom, top] = built.body_envelope().unwrap().z_bounds_m;
+                            (bottom + top) * 0.5
+                        }])],
                     )
                     .unwrap(),
             );
             assert!(changed.same_geometry(&snapshot));
-            assert!(snapshot.validate_planar_recent_motion(from, to).is_ok());
-            assert!(changed.validate_planar_recent_motion(from, to).is_err());
+            assert!(snapshot.validate_body_motion((from, [0.,0.,0.,1.]), (to, [0.,0.,0.,1.]), &[]).is_ok());
+            assert!(changed.validate_body_motion((from, [0.,0.,0.,1.]), (to, [0.,0.,0.,1.]), &[]).is_err());
             changed
         }
     };

@@ -16,11 +16,7 @@ impl FrontierGoalIdSource for RecordedIds {
 
 fn controller() -> (ExplorationController, Arc<AtomicU64>) {
     let ids = Arc::new(AtomicU64::new(0));
-    let adapter = WavefrontGoalSourceAdapter::new(
-        "wavefront",
-        WavefrontConfig::default(),
-        Box::new(RecordedIds(ids.clone())),
-    );
+    let adapter = WavefrontGoalSourceAdapter::new("wavefront", WavefrontConfig::default(), Box::new(RecordedIds(ids.clone())), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() });
     let mut controller = ExplorationController::new(ExplorationArbitrationPolicy::PreferWavefront);
     controller.add_source(adapter);
     controller.begin_exploration().unwrap();
@@ -343,10 +339,7 @@ fn install_restore_failure_preserves_old_history_and_allows_next_start() {
         .result
         .unwrap();
     let before = checkpoint_payloads(&backend.controller);
-    let candidate = build_controller(
-        ExplorationArbitrationPolicy::PreferWavefront,
-        &ExploreStartConfig::default(),
-    );
+    let candidate = build_controller_with_geometry(ExplorationArbitrationPolicy::PreferWavefront, &ExploreStartConfig::default(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, None).unwrap();
     let failed = backend.lifecycle(ComputeLifecycle::Install {
         controller: candidate,
         begin: true,
@@ -360,10 +353,7 @@ fn install_restore_failure_preserves_old_history_and_allows_next_start() {
     assert!(failed.result.is_err());
     assert!(!failed.committed.active);
     assert_eq!(checkpoint_payloads(&backend.controller), before);
-    let candidate = build_controller(
-        ExplorationArbitrationPolicy::PreferWavefront,
-        &ExploreStartConfig::default(),
-    );
+    let candidate = build_controller_with_geometry(ExplorationArbitrationPolicy::PreferWavefront, &ExploreStartConfig::default(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, None).unwrap();
     let installed = backend.lifecycle(ComputeLifecycle::Install {
         controller: candidate,
         begin: true,
@@ -554,10 +544,7 @@ fn assert_owner_fault_blocks_reuse(handle: &ExplorationComputeClient) {
     );
     assert_eq!(
         handle.submit_lifecycle(ComputeLifecycle::Install {
-            controller: build_controller(
-                ExplorationArbitrationPolicy::PreferWavefront,
-                &ExploreStartConfig::default()
-            ),
+            controller: build_controller_with_geometry(ExplorationArbitrationPolicy::PreferWavefront, &ExploreStartConfig::default(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.3)/2., -(0.3)/2.], [(0.3)/2., -(0.3)/2.], [(0.3)/2., (0.3)/2.], [-(0.3)/2., (0.3)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, None).unwrap(),
             begin: true,
             restore: None,
         }),
@@ -685,7 +672,7 @@ fn actual_surface_backend_uses_original_input_and_pins_it_until_resolution() {
     context.robot_pose.pose.position = Point3::new(1.05, 1.05, 0.4);
     context.input = ComputeInput::Surface {
         original,
-        config: SurfaceNavigationConfig::new("map".into(), 0.3, 0.2, 0.45, 0.1, 0.2, 25.0, 0.3)
+        config: SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.2)/2., -(0.2)/2.], [(0.2)/2., -(0.2)/2.], [(0.2)/2., (0.2)/2.], [-(0.2)/2., (0.2)/2.]], z_min_m: -(0.3), z_max_m: (0.45)-(0.3), source: "测试外形".into() }, 0.1, 0.2, 25.0, 0.3)
             .unwrap(),
     };
     let sampled = ExplorationStateSnapshot::new(context.robot_pose.clone(), context.now);
@@ -938,7 +925,7 @@ fn cancellable_surface_context() -> ComputeContext {
     context.robot_pose.pose.position = Point3::new(1.05, 1.05, 0.4);
     context.input = ComputeInput::Surface {
         original: receiver.freeze().unwrap(),
-        config: SurfaceNavigationConfig::new("map".into(), 0.3, 0.2, 0.45, 0.1, 0.2, 25.0, 0.3)
+        config: SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.2)/2., -(0.2)/2.], [(0.2)/2., -(0.2)/2.], [(0.2)/2., (0.2)/2.], [-(0.2)/2., (0.2)/2.]], z_min_m: -(0.3), z_max_m: (0.45)-(0.3), source: "测试外形".into() }, 0.1, 0.2, 25.0, 0.3)
             .unwrap(),
     };
     context
@@ -1130,7 +1117,7 @@ fn mission_zero_length_surface_query_still_requires_complete_body_model() {
     let mut points = surface_fixture_points(0.0, 0.0);
     points.extend((2..=10).map(|z| (1.35, 1.05, z as f32 * 0.05)));
     let map = SurfaceSnapshot::from_points(&points, surface_fixture_config(), 0.1).unwrap();
-    let config = SurfaceNavigationConfig::new("map".into(), 0.3, 0.2, 0.45, 0.1, 0.2, 25.0, 0.3).unwrap();
+    let config = SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.2)/2., -(0.2)/2.], [(0.2)/2., -(0.2)/2.], [(0.2)/2., (0.2)/2.], [-(0.2)/2., (0.2)/2.]], z_min_m: -(0.3), z_max_m: (0.45)-(0.3), source: "测试外形".into() }, 0.1, 0.2, 25.0, 0.3).unwrap();
     let start = MissionPose { position: [1.05, 1.05, 0.4], orientation_xyzw: [0.0, 0.0, 0.0, 1.0] };
     let footprint_only = MissionRoutes::Surface {
         map: Arc::new(map.clone()), config: config.clone(), boundary: Vec::new(),
@@ -1213,7 +1200,7 @@ fn surface_reuse_context(receiver: &SurfaceInputReceiver, config: Arc<ExploreSta
     context.config = config;
     context.input = ComputeInput::Surface {
         original: receiver.freeze().unwrap(),
-        config: SurfaceNavigationConfig::new("map".into(), 0.3, 0.2, 0.45, 0.1, 0.2, 25.0, 0.3).unwrap(),
+        config: SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.2)/2., -(0.2)/2.], [(0.2)/2., -(0.2)/2.], [(0.2)/2., (0.2)/2.], [-(0.2)/2., (0.2)/2.]], z_min_m: -(0.3), z_max_m: (0.45)-(0.3), source: "测试外形".into() }, 0.1, 0.2, 25.0, 0.3).unwrap(),
     };
     context
 }

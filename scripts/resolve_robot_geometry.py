@@ -10,7 +10,7 @@ from core.robot_geometry import ROBOT_GEOMETRY_SETTING_KEYS, RobotGeometryConfig
 
 
 def main() -> int:
-    values = {key: runtime_value(key, "") for key in ROBOT_GEOMETRY_SETTING_KEYS | {"NUWAX_NAV_ROBOT_WIDTH_M"}}
+    values = {key: runtime_value(key, "") for key in ROBOT_GEOMETRY_SETTING_KEYS}
     result = resolve_robot_geometry(
         RobotGeometryConfig.from_values(values),
         robot_name=runtime_value("NUWAX_ACTIVE_ROBOT", ""),

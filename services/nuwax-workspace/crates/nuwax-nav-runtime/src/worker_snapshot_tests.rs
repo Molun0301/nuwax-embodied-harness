@@ -18,7 +18,7 @@ impl NavPlanner for SnapshotProbe {
         self.boundary = boundary.to_vec();
         self.boundaries.fetch_add(1, Ordering::SeqCst);
     }
-    fn step(&mut self, _: f64) -> PlannerStep {
+    fn step(&mut self) -> PlannerStep {
         assert_eq!(self.boundary, self.expected_boundary);
         self.steps.fetch_add(1, Ordering::SeqCst);
         PlannerStep::Command(Twist2 {
@@ -46,7 +46,7 @@ fn snapshot_probe(side: usize) -> (PlannerWorker, [Arc<AtomicUsize>; 3]) {
     (worker, counts)
 }
 fn consume_snapshot_command(worker: &mut PlannerWorker, waits: &mut Vec<u128>) {
-    match worker.step(0.3) {
+    match worker.step() {
         PlannerStep::Command(c) => {
             assert_eq!(c.linear.x, 0.2);
             return;
@@ -68,7 +68,7 @@ fn consume_snapshot_command(worker: &mut PlannerWorker, waits: &mut Vec<u128>) {
         assert!(std::time::Instant::now() < deadline);
         std::thread::yield_now();
     }
-    assert!(matches!(worker.step(0.3), PlannerStep::Command(c) if c.linear.x == 0.2));
+    assert!(matches!(worker.step(), PlannerStep::Command(c) if c.linear.x == 0.2));
 }
 #[test]
 fn worker_snapshot_installs_map_once_and_reinstalls_boundary_after_goal_reset() {
@@ -88,7 +88,7 @@ fn worker_snapshot_installs_map_once_and_reinstalls_boundary_after_goal_reset() 
     worker.update_odometry(route_pose(0.6, 2));
     worker.update_costmap(CostMap2D::new_all_free("map", 8, 8, 0.1));
     wait_for_source_result(&worker);
-    assert!(matches!(worker.step(0.3), PlannerStep::Command(c) if c.linear.x == 0.2));
+    assert!(matches!(worker.step(), PlannerStep::Command(c) if c.linear.x == 0.2));
     assert_eq!(counts[0].load(Ordering::SeqCst), 2);
     assert_eq!(counts[2].load(Ordering::SeqCst), 6);
 }

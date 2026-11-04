@@ -90,8 +90,6 @@ struct _nuwax_msgs_GoalEnvelope
      * LCM Type: string
      */
     char*      body_reference_frame_id;
-    int8_t     has_body_to_support_z;
-    double     body_to_support_z_m;
 
     /**
      * 目标产生时的规范地图坐标代际。

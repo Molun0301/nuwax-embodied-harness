@@ -515,8 +515,7 @@ mod tests {
             local_planner::{LocalPlanner, StopMessage},
             navigation_map::CostMap2D,
         };
-        let mut local = LocalPlanner::new(0.5, 20.0, options.position_tolerance_m.max(0.05));
-        local.set_robot_geometry(geometry.clone());
+        let mut local = LocalPlanner::new(0.5, 20.0, options.position_tolerance_m.max(0.05), geometry.clone());
         local.set_motion_limits(limits.clone()).unwrap();
         local
             .configure_goal(make_pose_stamped("map", goal.x, goal.y, goal.yaw), options)

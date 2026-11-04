@@ -51,9 +51,6 @@ def configure(output, calibrated_motion=False, pipeline="lio_3d", calibrated_obs
         ),
         "NUWAX_NAV_PROFILE": "pct-scan-3d",
         # 数值来自下方合成场景：地面0米、机体基准0.35米，不作为实机标定。
-        "NUWAX_NAV_BODY_TO_SUPPORT_Z_M": "0.35",
-        "NUWAX_NAV_ROBOT_WIDTH_M": "0.3",
-        "NUWAX_NAV_ROBOT_HEIGHT_M": "0.3",
         "NUWAX_NAV_SURFACE_VOXEL_SIZE_M": "0.1",
         "NUWAX_ROBOT_MODEL_PATH": "",
         "NUWAX_ROBOT_LENGTH_M": "0.3",

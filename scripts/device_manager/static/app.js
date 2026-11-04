@@ -43,9 +43,8 @@
     pollTimer: null,
     submitting: false,
 
-    // 设备身份与管理程序重启
-    instanceId: null,
-    managerRestarting: false
+    // 设备身份
+    instanceId: null
   };
 
   const POLL_INTERVAL_MS = 2000;
@@ -445,6 +444,10 @@
 
   // ===== 设备信息（平台）=====
   function applyStatus(status) {
+    if (state.status && (status.manager_version !== state.status.manager_version
+        || status.installation.version !== state.status.installation.version)) {
+      location.reload();
+    }
     const previousDir = state.status && state.status.installation && state.status.installation.install_dir;
     state.status = status;
     const update = status.update || {};
@@ -1064,6 +1067,7 @@
         if (job.status !== 'running' && job.status !== 'queued') {
           clearInterval(state.pollTimer);
           state.pollTimer = null;
+          if (job.action === 'update' && job.status === 'succeeded') location.reload();
           finalizeWizardInstall(job);
           loadOverview();
         }
@@ -2070,12 +2074,11 @@
     }
   }
 
-  // 管理程序更新后本进程会被替换，轮询必须容忍连接中断，并把重连作为正常阶段。
+  // 管理程序切换时继续轮询，任务成功后刷新页面。
   function trackManagerUpdateJob(jobId) {
     state.jobGeneration += 1;
     const generation = state.jobGeneration;
     if (state.pollTimer) clearInterval(state.pollTimer);
-    state.managerRestarting = false;
 
     const button = $('updateManagerButton');
     if (button) button.disabled = true;
@@ -2084,7 +2087,6 @@
     function failure(message) {
       clearInterval(state.pollTimer);
       state.pollTimer = null;
-      state.managerRestarting = false;
       if (button) button.disabled = false;
       text($('managerUpdateState'), '');
       showMessage($('releasesStatus'), message, 'error');
@@ -2099,16 +2101,12 @@
         const job = await apiCall('/api/manager/jobs/' + encodeURIComponent(jobId));
         if (generation !== state.jobGeneration) return;
 
-        state.managerRestarting = false;
         text($('managerUpdateState'), jobStatusText(job.status) + '：' + (job.message || job.stage || ''));
 
         if (job.status === 'succeeded') {
           clearInterval(state.pollTimer);
           state.pollTimer = null;
-          if (button) button.disabled = false;
-          text($('managerUpdateState'), '管理程序已更新');
-          // 管理服务会按计划重启；这里按重连流程恢复，不把断线记为失败。
-          await handleManagerRestart(job);
+          location.reload();
           return;
         }
 
@@ -2118,53 +2116,9 @@
         }
       } catch (error) {
         if (generation !== state.jobGeneration) return;
-        // 管理进程切换期间的连接失败属于预期，转入重连等待。
-        if (!state.managerRestarting) {
-          state.managerRestarting = true;
-          text($('managerUpdateState'), '管理服务正在重启，等待重新连接…');
-        }
-        recoverAfterManagerRestart(generation);
+        text($('managerUpdateState'), error.message + '，等待重新连接…');
       }
     }, POLL_INTERVAL_MS);
-  }
-
-  // 连接恢复：刷新会话与 CSRF，重新读取状态并保留当前页面。
-  async function recoverAfterManagerRestart(generation) {
-    const deadline = Date.now() + 120000;
-    while (Date.now() < deadline) {
-      if (generation !== state.jobGeneration) return false;
-      if (state.pollTimer) {
-        clearInterval(state.pollTimer);
-        state.pollTimer = null;
-      }
-      await new Promise(function (resolve) { setTimeout(resolve, 2000); });
-      if (generation !== state.jobGeneration) return false;
-      try {
-        await refreshSession();
-        const status = await apiCall('/api/manager/status');
-        if (generation !== state.jobGeneration) return false;
-        applyStatus(status);
-        renderOverview(status);
-        if (state.currentView === 'updates') loadUpdatesView();
-        if (state.currentView === 'jobs') loadJobsView();
-        text($('managerUpdateState'), '管理程序已更新为 ' + (status.manager_version || '--'));
-        showMessage($('releasesStatus'), '管理服务已重新连接，管理程序版本：' + (status.manager_version || '--') + '。', 'good');
-        return true;
-      } catch (error) {
-        // 管理服务尚未就绪，继续等待。
-      }
-    }
-    if (generation === state.jobGeneration) {
-      text($('managerUpdateState'), '等待重连超时');
-      showMessage($('releasesStatus'), '管理服务重启后仍未连接成功，请刷新页面确认实际状态。', 'error');
-    }
-    return false;
-  }
-
-  async function handleManagerRestart(job) {
-    const generation = state.jobGeneration;
-    text($('managerUpdateState'), '管理服务正在重启，等待重新连接…');
-    await recoverAfterManagerRestart(generation);
   }
 
   // 回退入口只在设备确实保留上一版本时出现。
@@ -2984,18 +2938,10 @@
       session = await refreshSession();
     } catch (error) {
       showBoot('无法连接到管理服务：' + error.message, true);
+      setTimeout(boot, POLL_INTERVAL_MS);
       return;
     }
     if (session.instance_id) state.instanceId = session.instance_id;
-
-    // 管理程序更新后本进程会被替换，若页面打开时正处于重启窗口，
-    // 先等待连接恢复再进入正式状态读取，不把断线当成失败。
-    try {
-      await ensureManagerReachable();
-    } catch (error) {
-      showBoot('管理服务暂时不可用：' + error.message + '。更新管理程序期间会短暂断开，请稍候重试。', true);
-      return;
-    }
 
     try {
       const [status, metadata] = await Promise.all([apiCall('/api/manager/status'), apiCall('/api/manager/modules')]);
@@ -3035,6 +2981,7 @@
       }
     } catch (error) {
       showBoot('读取设备状态失败：' + error.message, true);
+      setTimeout(boot, POLL_INTERVAL_MS);
     }
   }
 
@@ -3062,27 +3009,6 @@
       if (!state.status || document.hidden) return;
       try { applyStatus(await apiCall('/api/manager/status')); } catch (ignored) { /* 下一次刷新继续。 */ }
     }, 15000);
-  }
-
-  // 管理服务可能在更新后重启；这里最多等待一次短窗口，避免首屏直接报错。
-  async function ensureManagerReachable() {
-    const deadline = Date.now() + 30000;
-    let lastError = null;
-    while (true) {
-      try {
-        await apiCall('/api/manager/status');
-        return true;
-      } catch (error) {
-        lastError = error;
-        if (Date.now() >= deadline) throw lastError;
-        await new Promise(function (resolve) { setTimeout(resolve, 2000); });
-        try {
-          await refreshSession();
-        } catch (ignored) {
-          // 管理服务尚未就绪，继续等待。
-        }
-      }
-    }
   }
 
   if (document.readyState === 'loading') {

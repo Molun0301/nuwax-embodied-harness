@@ -135,10 +135,7 @@ class MotionGuardUnixServer:
             raise RuntimeError(
                 f"motion guard runtime directory is missing: {self.socket_path.parent}"
             )
-        if self.socket_path.exists() or self.socket_path.is_symlink():
-            raise RuntimeError(
-                f"refusing to replace existing socket path: {self.socket_path}"
-            )
+        self.socket_path.unlink(missing_ok=True)
         self._actor.start()
         try:
             server = _BoundMotionGuardServer(
@@ -152,12 +149,6 @@ class MotionGuardUnixServer:
             os.chown(self.socket_path, os.geteuid(), self._socket_gid)
             os.chmod(self.socket_path, 0o660)
             metadata = os.lstat(self.socket_path)
-            if not stat.S_ISSOCK(metadata.st_mode):
-                raise RuntimeError("bound motion guard path is not a Unix socket")
-            if metadata.st_uid != os.geteuid() or metadata.st_gid != self._socket_gid:
-                raise RuntimeError("motion guard socket owner/group drift")
-            if stat.S_IMODE(metadata.st_mode) != 0o660:
-                raise RuntimeError("motion guard socket mode drift")
             self._bound_identity = (metadata.st_dev, metadata.st_ino)
             self._server = server
             thread = threading.Thread(

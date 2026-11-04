@@ -382,19 +382,16 @@ class _RuntimeActivationEvent(threading.Event):
 
 _ASYNC_GEOMETRY_TASK_POLLING_GUIDANCE: Dict[str, Dict[str, object]] = {
     "activate_map": {
-        "initial_wait_sec": 45.0,
-        "poll_interval_sec": 12.0,
+        "poll_interval_sec": 3.0,
         "hint": (
-            "activate_map 会加载该地图唯一的 current 资产包并启动定位，通常需 45–90 秒；"
-            "同名记忆库会一并激活。提交后先等待约 45 秒，再每 12 秒轮询 get_task_status。"
+            "用 get_task_status 查询至任务终态；同名记忆库会一并激活。"
         ),
     },
     "explore_area_v2": {
-        "initial_wait_sec": 30.0,
         "poll_interval_sec": 15.0,
         "hint": (
             "explore_area_v2 受理后在后台启动服务、准备地图并等待定位与导航输入，"
-            "约 30 秒后再 get_task_status，之后每 15 秒轮询至任务终态。"
+            "用 get_task_status 查询至任务终态。"
             "准备阶段看 waiting_for 与 message；accepted 不代表已经开始移动。"
             "探索进度看 frontier_count，失败时保留具体原因。"
             "用户要求结束探索时请调用独立工具 stop_exploration；建图会话会继续运行。"
@@ -5570,7 +5567,6 @@ class GatewayRuntime:
             except (TypeError, ValueError):
                 elapsed_sec = 0.0
 
-        initial_wait_sec = float(guidance.get("initial_wait_sec") or 0.0)
         poll_interval_sec = float(guidance.get("poll_interval_sec") or 10.0)
         now_mono = time.monotonic()
         previous_poll_at = self._task_status_last_polled_at.get(task_id)
@@ -5580,24 +5576,11 @@ class GatewayRuntime:
         )
         self._task_status_last_polled_at[task_id] = now_mono
 
-        if elapsed_sec < initial_wait_sec:
-            retry_after_sec = max(1.0, initial_wait_sec - elapsed_sec)
-            next_step_hint = (
-                "任务执行中（已 %.0fs）。请等待约 %.0fs 后再调用 get_task_status，勿连续高频轮询。"
-                % (elapsed_sec, retry_after_sec)
-            )
-        elif polled_too_soon and previous_poll_at is not None:
+        if polled_too_soon and previous_poll_at is not None:
             retry_after_sec = max(1.0, poll_interval_sec - (now_mono - previous_poll_at))
-            next_step_hint = (
-                "距上次查询过近。请约 %.0fs 后再 poll；每 %.0fs 轮询一次直至 state=succeeded。"
-                % (retry_after_sec, poll_interval_sec)
-            )
         else:
             retry_after_sec = poll_interval_sec
-            next_step_hint = (
-                "任务执行中（已 %.0fs）。若仍未完成，%.0fs 后再 get_task_status。"
-                % (elapsed_sec, poll_interval_sec)
-            )
+        next_step_hint = str(guidance["hint"])
 
         advisory = {
             "polling_guidance": guidance,

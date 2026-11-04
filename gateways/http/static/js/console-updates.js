@@ -60,6 +60,10 @@
     $('updateInstall').textContent = snapshot?.active_job ? '正在更新…' : '更新并重启';
   }
   function render(data) {
+    if (snapshot && (data.manager_version !== snapshot.manager_version || data.installation.version !== snapshot.installation.version)
+        || (data.job || data.active_job)?.id === trackedJob && (data.job || data.active_job).status === 'succeeded') {
+      location.reload();
+    }
     snapshot = data;
     const update = data.update;
     const job = data.job;

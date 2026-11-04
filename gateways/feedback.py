@@ -7,6 +7,7 @@ import math
 import re
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
+from contracts.maps import CostMap, OccupancyGrid
 from core.errors import GatewayError
 from gateways.request_context import categorize_gateway_error
 
@@ -1237,6 +1238,8 @@ def _complete_tool_data(value: Any, *, max_bytes: int) -> Any:
                 if mapping is not None:
                     result = {}
                     for key, child in mapping.items():
+                        if isinstance(item, (OccupancyGrid, CostMap)) and key == "data":
+                            continue
                         public_key = str(key)
                         if public_key in result:
                             raise invalid("duplicate_json_key")

@@ -6242,7 +6242,6 @@ class PlatformGeometryRuntime:
             current = self._external_exploration_request
             current_id = str(getattr(current, "request_id", "") or "").strip()
             if not request_id:
-                LOGGER.info("忽略缺少 request_id 的 geometry exploration update。")
                 return False
             recovered_request = None
             retained_failed_child = (

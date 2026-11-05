@@ -24,17 +24,17 @@ def test_sim_entry_reuses_gateway_lifespan_and_isolated_data(tmp_path, monkeypat
         assert not config.perception.yolo_world.enabled
         assert config.runtime_data.memory_embedding_model == 'disabled'
         assert Path(config.runtime_data.map_catalog_root) == output / 'maps'
-        assert Path(config.runtime_data.memory_db_path) == output / 'memory.db'
         assert Path(config.gateway.artifact_dir) == output / 'artifacts'
         assert config.manipulation.enabled
         assert config.manipulation.base_url == 'http://127.0.0.1:9'
         async def lifecycle():
             async with app.router.lifespan_context(app):
-                assert any(item.name == 'execute_manipulation_task' for item in runtime.list_capabilities())
-                assert app.state.agent_tools.store.path.parent == output
+                assert runtime.capabilities.get('execute_manipulation_task').kind == 'task'
+                from tests.test_a2c_memory_maps import Context
+                runtime.memory.wait_for_library('default', Context())
+                assert (output / 'runtime_data/memory/default/memory.db').is_file()
         asyncio.run(lifecycle())
-        assert runtime._dispatch_shutdown_complete
-        assert runtime.manipulation_service.backend.client.is_closed
+        assert runtime.manipulation.backend.client.is_closed
     monkeypatch.setattr(uvicorn, 'run', run)
     monkeypatch.setattr(sys, 'argv', ['run_g1_sim_gateway.py', '--output', str(output),
         '--port', '18912', '--device-url', 'http://127.0.0.1:9'])

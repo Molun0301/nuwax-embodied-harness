@@ -876,7 +876,7 @@ class Engine:
         if configuration:
             existing.update(probe(candidate, "validate", values=configuration))
         defaults = read_settings(candidate / "source/.env.example")
-        persistent = {"NUWAX_GATEWAY_ARTIFACT_DIR", "NUWAX_MAP_CATALOG_ROOT", "NUWAX_MAPPING_DATABASE_ROOT", "NUWAX_MAPPING_PCD_ROOT", "NUWAX_MEMORY_DB_PATH", "NUWAX_RUNTIME_DATA_DIR", "NUWAX_LOG_DIR", "NUWAX_LOG_FILE", "NUWAX_NUWAX_WORKSPACE_DIR", "NUWAX_FORBIDDEN_ZONES_PATH"}
+        persistent = {"NUWAX_GATEWAY_ARTIFACT_DIR", "NUWAX_MAP_CATALOG_ROOT", "NUWAX_MAPPING_DATABASE_ROOT", "NUWAX_MAPPING_PCD_ROOT", "NUWAX_RUNTIME_DATA_DIR", "NUWAX_LOG_DIR", "NUWAX_LOG_FILE", "NUWAX_NUWAX_WORKSPACE_DIR", "NUWAX_FORBIDDEN_ZONES_PATH"}
         for key in persistent:
             value = existing.get(key, defaults.get(key, "")).strip()
             if not value:

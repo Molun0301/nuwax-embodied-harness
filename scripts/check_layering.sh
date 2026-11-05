@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 分层依赖治理静态检查（01 §3.2 规则 R1-R9 的可机器检查 grep 版）。
+# 分层依赖治理静态检查；按冻结接口保留仍适用的R1-R9边界。
+# A2d删除旧R2c/R4b：任务核心直接调用守卫，组合技能复用能力处理器。
 #
 # 用途：锁住 01-P0-1/P0-2/P0-3 解环成果，防止反向/越层依赖回退。
 # 范围排除：__pycache__、vendor、.claude/worktrees。
@@ -41,29 +42,23 @@ scan "R1" "contracts 不得 import 上层包" \
     "contracts" \
     "^\s*(from|import) (gateways|services|adapters|providers|drivers|core|skills)(\.|\s|$)"
 
-# R2: providers/adapters/core 只准 import contracts（不得 import 彼此之上或同级业务层）。
+# R2: providers/adapters 只准依赖 contracts；任务核心可调用运动守卫。
 scan "R2a" "providers 只准依赖 contracts" \
     "providers" \
     "^\s*(from|import) (gateways|services|adapters|drivers|skills)(\.|\s|$)"
 scan "R2b" "adapters 只准依赖 contracts" \
     "adapters" \
     "^\s*(from|import) (gateways|services|providers|drivers|core|skills)(\.|\s|$)"
-scan "R2c" "core 只准依赖 contracts" \
-    "core" \
-    "^\s*(from|import) (gateways|services|adapters|providers|drivers|skills)(\.|\s|$)"
 
 # R3: services 禁止 import gateways、drivers（01-P0-1/P0-2/P0-3 核心解环成果）。
 scan "R3" "services 禁止 import gateways/drivers" \
     "services" \
     "^\s*(from|import) (gateways|drivers)(\.|\s|$)"
 
-# R4: services 内部禁止 import skills；skills 禁止 import gateways。
+# R4: services 内部禁止 import skills；组合技能复用 gateways/capabilities 的冻结处理器。
 scan "R4a" "services 禁止 import skills" \
     "services" \
     "^\s*(from|import) skills(\.|\s|$)"
-scan "R4b" "skills 禁止 import gateways" \
-    "skills" \
-    "^\s*(from|import) gateways(\.|\s|$)"
 
 # R5: drivers 禁止 import services、gateways、skills（01-P0-3 解环成果）。
 scan "R5" "drivers 禁止 import services/gateways/skills" \
@@ -114,7 +109,7 @@ fi
 
 echo
 if [ "${VIOLATIONS}" -eq 0 ]; then
-    echo "== 硬规则全部通过（R1-R5、R8、R9 共 0 违规；R6/R7 为人工复核）=="
+    echo "== 硬规则全部通过（R1、R2a/b、R3、R4a、R5、R8、R9 共 0 违规；R6/R7 为人工复核）=="
     exit 0
 fi
 echo "== 存在 ${VIOLATIONS} 类硬规则违规，见上 =="

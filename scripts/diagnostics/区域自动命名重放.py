@@ -12,13 +12,15 @@ from types import SimpleNamespace
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
 from contracts.memory import SemanticMemoryEntry
 from contracts.runtime_views import MapSnapshot
-from core.capability_registry import CapabilityRegistry
-from core.settings import SceneMappingConfig
+from core.settings import SceneMappingConfig,load_config
 from services.artifact_store import LocalArtifactStore
 from services.memory.service import MemoryService
-from services.memory.scene_mapping import SceneMappingService
+from services.memory.semantic_map.scene_mapping import SceneMappingService
 from services.scene_decision import create_scene_decision_backend
-from gateways.scene_mapping import register_scene_mapping_capabilities
+from gateways.invoke import invoke
+from scripts.diagnostics.current_fixtures import offline_platform
+from services.geometry.state import OccupancyGrid
+import numpy as np
 
 
 def iso(value):
@@ -63,11 +65,13 @@ def main():
     (evidence/'实际采纳参数.json').write_text(json.dumps({k:v for k,v in vars(config).items() if k!='api_key'},ensure_ascii=False,indent=2))
     calls=[];events=[]
     def construct():
-        memory=MemoryService(localization_service=SimpleNamespace(get_active_session=lambda:None,get_latest_snapshot=lambda:None),
-            mapping_service=SimpleNamespace(get_latest_snapshot=lambda:snapshot,get_semantic_snapshot=lambda:snapshot),observation_service=SimpleNamespace(),perception_service=SimpleNamespace(),
-            state_store=SimpleNamespace(write=lambda *a,**k:None),memory_db_path=str(output/'memory.db'),
-            text_embedding_model="disabled",image_embedding_model="disabled",artifact_store=LocalArtifactStore(str(artifacts),'http://historical-replay.invalid'))
-        memory.activate_memory_library(library_name=map_name)
+        bridge_config=load_config();bridge_config.base_dir=output;bridge_config.robot.active_robot='customrobot'
+        bridge_config.runtime_data.map_catalog_root=str(output/'maps');bridge_config.runtime_data.memory_embedding_model='lexical-only';bridge_config.runtime_data.memory_image_embedding_model='disabled'
+        bridge_config.gateway.artifact_dir=str(artifacts);bridge_config.scene_mapping=config
+        bridge_config.perception.yolo_world.enabled=False;bridge_config.perception.openai_vision.enabled=False;bridge_config.perception.segmentation.enabled=False
+        original=snapshot.occupancy_grid
+        grid=OccupancyGrid(map_name,original.width,original.height,original.resolution_m,original.origin.position.x,original.origin.position.y,original.frame_id,round(original.timestamp.timestamp()*1e9),np.asarray(original.data,dtype=np.int8).tobytes())
+        manager=offline_platform(bridge_config,grid);platform=manager.__enter__();memory=platform.memory
         actual=create_scene_decision_backend(backend=config.backend,base_url=config.base_url,model=config.model,api_key='',timeout_sec=config.timeout_sec)
         class RecordedBackend:
             def decide(self,request):
@@ -76,41 +80,39 @@ def main():
                 (evidence/f'模型真实结果_{index}.json').write_text(result.model_dump_json(indent=2));return result
             def close(self):actual.close()
             def describe(self):return actual.describe()
-        service=SceneMappingService(memory_service=memory,config=config,backend=RecordedBackend(),
-            stream_bus=SimpleNamespace(publish=lambda topic,**values:events.append({'topic':topic,'payload':values})))
-        return memory,service
-    def close(memory,service):
-        service.close()
-        if not memory.close():raise RuntimeError('记忆关闭未完成，保留派生证据并报告失败')
-    memory,service=construct()
+        service=platform.scene_mapping;service._backend=RecordedBackend()
+        return memory,service,manager,platform
+    def close(memory,service,manager):manager.__exit__(None,None,None)
+    memory,service,manager,platform=construct()
     try:
-        for entry in selected:memory._repository.upsert_semantic_memory(entry)
-        memory._load_persisted_memory(library_name=map_name)
+        for entry in selected:
+            for artifact_id in entry.artifact_ids:
+                image=next((path for path in artifacts.glob('**/'+artifact_id+'.*') if not path.name.endswith('.meta.json')),None)
+                if image is not None:memory.save_photo(artifact_id,image.read_bytes(),map_name=map_name)
+            memory.write(lambda store,entry=entry:store.put('memory',entry))
         initial=service.run_once();automatic=service.get_map();graph=service.graph.query()
         for name,value in [('自动命名回执',initial),('自动候选与区域',automatic),('自动提交后关系图',graph)]:
             (evidence/(name+'.json')).write_text(json.dumps(value,ensure_ascii=False,indent=2,default=str))
-    finally:close(memory,service)
-    memory,service=construct()
+    finally:close(memory,service,manager)
+    memory,service,manager,platform=construct()
     try:
         cold=service.get_map();(evidence/'自动提交冷恢复.json').write_text(json.dumps(cold,ensure_ascii=False,indent=2))
         candidates=[r for r in cold['regions'] if r['metadata'].get('last_decision')]
         if candidates:
             chosen=candidates[0]
-            runtime=SimpleNamespace(scene_mapping_service=service,capability_registry=CapabilityRegistry())
-            register_scene_mapping_capabilities(runtime)
             args={'scene_space_id':chosen['scene_space_id'],'map_name':map_name,'expected_revision':chosen['metadata']['scene_revision'],
                 'label':'重放验证显式名称','request_id':'historical-replay-explicit-1'}
-            reply=runtime.capability_registry.get_registration('update_scene_space_label').handler(args,requested_by='isolated-replay-test')
+            reply=invoke(platform,'update_scene_space_label',args,'isolated-replay-test')
             (evidence/'同公开工具显式覆盖.json').write_text(json.dumps({'arguments':args,'scene_space':reply['scene_space'].model_dump(mode='json')},ensure_ascii=False,indent=2))
             before=len(calls);protected=service.run_once(background=True)
             (evidence/'自动保护回执.json').write_text(json.dumps({'response':protected,'model_calls_before':before,'model_calls_after':len(calls)},ensure_ascii=False,indent=2))
-    finally:close(memory,service)
-    memory,service=construct()
+    finally:close(memory,service,manager)
+    memory,service,manager,platform=construct()
     try:
         final=service.get_map();final_graph=service.graph.query()
         (evidence/'最终冷恢复与关系图.json').write_text(json.dumps({'map':final,'graph':final_graph},ensure_ascii=False,indent=2))
         assert not candidates or any(r['primary_label']=='重放验证显式名称' and r['metadata']['label_locked'] for r in final['regions'])
-    finally:close(memory,service)
+    finally:close(memory,service,manager)
     summary={'mode':provenance['mode'],'map_name':map_name,'source_entries':len(rows),'valid_photo_entries':len(selected),'model_calls':len(calls),
         'region_count':initial['region_count'],'processed_ids':initial['processed_ids'],'applied_ids':initial['applied_ids'],
         'decisions':[{'region_id':r['scene_space_id'],'label':r['primary_label'],'decision':r['metadata']['last_decision']} for r in automatic['regions'] if r['metadata'].get('last_decision')],

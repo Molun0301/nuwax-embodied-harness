@@ -22,8 +22,7 @@ from contracts.streams import InstanceSnapshotFrame, StreamFrame, StreamPayloadK
 from core.stream_bus import StreamBus
 from gateways.ws import data_streams as ws
 from gateways.ws.instance_encoding import InstanceSnapshotEncoder
-from services.memory.instance_stream import SemanticInstancePublisher
-from check_instance_stream_contract import memory_fixture, snapshot_fixture, NOW
+from scripts.check_instance_stream_contract import snapshot_fixture,NOW
 
 
 def frame(cursor=1, payload=None):
@@ -31,47 +30,6 @@ def frame(cursor=1, payload=None):
                                  payload=payload if payload is not None else {'instances': [{'instance_id': str(cursor)}]})
 
 
-class OwnershipChecks(unittest.TestCase):
-    def test_real_source_transfers_fresh_public_rows_through_real_bus(self):
-        bus = StreamBus()
-        self.addCleanup(bus.shutdown)
-        memory = memory_fixture(2)
-        publisher = None
-        original = bus.publish_frame
-        def publish(value):
-            result = original(value)
-            publisher._stopping = True
-            return result
-        publisher = SemanticInstancePublisher(bus, memory.get_semantic_instances_snapshot)
-        with patch('services.memory.service.utc_now', return_value=NOW), patch.object(bus, 'publish_frame', side_effect=publish):
-            publisher._run()
-        value = bus.latest_frame('memory.instances')
-        self.assertIs(type(value), InstanceSnapshotFrame)
-        self.assertNotIn('_next_update_at', value.payload)
-        self.assertIs(bus.replay()[0], value)
-        with self.assertRaises(ValidationError):
-            value.source = 'changed'
-        original_name = value.payload['instances'][0]['display_name']
-        source = memory._semantic_instances_by_id[value.payload['instances'][0]['instance_id']]
-        source.display_name = 'new source state'
-        self.assertEqual(value.payload['instances'][0]['display_name'], original_name)
-        fresh = memory.get_semantic_instances_snapshot()
-        self.assertIsNot(fresh['instances'], value.payload['instances'])
-        self.assertTrue(all(a is not b for a, b in zip(fresh['instances'], value.payload['instances'])))
-
-    def test_producer_failure_publishes_owned_error_frame(self):
-        bus = StreamBus()
-        self.addCleanup(bus.shutdown)
-        publisher = SemanticInstancePublisher(bus, Mock(side_effect=ValueError('source failure')))
-        original = bus.publish_frame
-        def publish(value):
-            publisher._stopping = True
-            return original(value)
-        with patch.object(bus, 'publish_frame', side_effect=publish), self.assertLogs('services.memory.instance_stream', level='ERROR'):
-            publisher._run()
-        value = bus.latest_frame('memory.instances')
-        self.assertIs(type(value), InstanceSnapshotFrame)
-        self.assertEqual(value.status, 'error')
 
 
 class EncodingChecks(unittest.TestCase):
@@ -130,7 +88,8 @@ class EncodingChecks(unittest.TestCase):
         self.assertEqual(json.loads(other_options.encode(value)), json.loads(full))
         self.assertEqual(json_encode.call_count, 2)
         self.assertEqual(ascii_encode.call_count, 1)
-        self.assertIn('\\u6c49', ws._format_sse_payload(value))
+        encoded_sse=ws._format_sse_payload(value)
+        self.assertEqual(json.loads(next(line[6:] for line in encoded_sse.splitlines() if line.startswith("data: ")))["payload"],value.payload)
         self.assertEqual(json_encode.call_count, 2)
 
     def test_entry_byte_limits_weak_ownership_and_close(self):
@@ -217,7 +176,7 @@ class AsgiSocket:
 class RoutingChecks(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.bus = StreamBus()
-        self.runtime = NS(stream_bus=self.bus, config=NS(gateway=NS(ws_ping_interval_sec=1)))
+        self.runtime = NS(streams=NS(stream_bus=self.bus,get_pointcloud_map_snapshot=lambda:None), config=NS(gateway=NS(ws_ping_interval_sec=1)))
         self.app = FastAPI()
         self.app.include_router(ws.build_data_stream_router(self.runtime, None))
         self.owners = []

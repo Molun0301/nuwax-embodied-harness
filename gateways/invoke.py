@@ -25,7 +25,11 @@ def invoke(platform, name: str, args: Mapping[str, Any], caller: str) -> dict:
     try:
         Draft202012Validator(cap.input_schema).validate(args)
         arguments = dict(args)
-        for key in ("map_name", "new_map_name"):
+        timeout = cap.input_schema.get("properties", {}).get("timeout_sec", {})
+        if "timeout_sec" not in arguments and "default" in timeout:
+            arguments["timeout_sec"] = timeout["default"]
+        name_keys = ("map_name", "new_map_name", "library_name") if name == "delete_memory_library" else ("map_name", "new_map_name")
+        for key in name_keys:
             if key in arguments and key in cap.input_schema.get("properties", {}):
                 arguments[key] = validate_map_name(arguments[key])
     except (ValidationError, MapNameError) as error:

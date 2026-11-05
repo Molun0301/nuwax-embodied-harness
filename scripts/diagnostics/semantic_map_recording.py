@@ -24,10 +24,9 @@ if str(ROOT) not in sys.path:
 from contracts.artifacts import ArtifactKind
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.maps import OccupancyGrid
-from contracts.runtime_views import MapSnapshot
 from scripts.diagnostics.recording_inputs import recording_artifact
 from services.artifact_store import LocalArtifactStore
-from services.memory.room_segmentation import RoomSegmentationService, pose_in_scene_space
+from services.memory.semantic_map.room_segmentation import RoomSegmentationService, pose_in_scene_space
 
 
 @contextmanager
@@ -36,23 +35,16 @@ def capture_recording_inputs(args, cloud_path):
     cloud_bytes = cloud_path.read_bytes()
     occupancy_bytes = args.occupancy.read_bytes()
     raw = json.loads(occupancy_bytes)
-    source_path = ROOT / 'services/memory/room_segmentation.py'
+    source_path = ROOT / 'services/memory/semantic_map/room_segmentation.py'
     source_bytes = source_path.read_bytes()
     store = LocalArtifactStore(str(args.artifact_dir or args.output / 'input-artifacts'), '')
-    with store.publication_scope(owner='diagnostic.recording.import') as owner:
-        refs = {}
-        for name, path, data, kind, mime, extension in (
-            ('pointcloud', cloud_path, cloud_bytes, ArtifactKind.POINTCLOUD, 'application/octet-stream', '.xyzt'),
-            ('occupancy', args.occupancy, occupancy_bytes, ArtifactKind.MAP_SNAPSHOT, 'application/json', '.json'),
-            ('segmentation_source', source_path, source_bytes, ArtifactKind.OTHER, 'text/x-python', '.py'),
-        ):
-            refs[name] = recording_artifact(store, source_path=path, kind=kind, mime_type=mime,
-                data=data, extension=extension, map_name=args.version, frame_id=raw['frame_id'], owner=owner)
-        # Transfer existing/new references before publication/read leases end;
-        # later report saves must not become part of this input owner.
-        hold = owner.retain(owner='diagnostic.recording.inputs')
-    with hold:
-        yield store, refs, cloud_bytes, raw
+    refs={}
+    for name,path,data,kind,mime,extension in (
+        ('pointcloud',cloud_path,cloud_bytes,ArtifactKind.POINTCLOUD,'application/octet-stream','.xyzt'),
+        ('occupancy',args.occupancy,occupancy_bytes,ArtifactKind.MAP_SNAPSHOT,'application/json','.json'),
+        ('segmentation_source',source_path,source_bytes,ArtifactKind.OTHER,'text/x-python','.py')):
+        refs[name]=recording_artifact(store,source_path=path,kind=kind,mime_type=mime,data=data,extension=extension,map_name=args.version,frame_id=raw['frame_id'])
+    yield store,refs,cloud_bytes,raw
 
 
 def read_trajectory(path):
@@ -264,18 +256,13 @@ def main():
             resolution_m=raw['resolution'], origin=Pose(frame_id=raw['frame_id'],
             position=Vector3(x=raw['origin'][0], y=raw['origin'][1], z=raw['origin'][2]),
             orientation=Quaternion(**dict(zip(('x', 'y', 'z', 'w'), raw['origin_orientation'])))), data=raw['data'], timestamp=timestamp)
-        snapshot = MapSnapshot(map_name=args.version, source_name='offline_recording_production_horizontal',
-            source_epoch='offline-recording:' + refs['occupancy'].artifact_id, update_sequence=pairing['frames'],
-            frame_id=grid.frame_id,
-            occupancy_grid=grid, timestamp=timestamp,
-            metadata={'offline_validation': True, 'source_occupancy': str(args.occupancy.resolve())})
         budget_error = None
         try:
-            RoomSegmentationService().segment(snapshot, map_name=snapshot.map_name)
+            RoomSegmentationService().segment(grid,map_name=args.version,map_revision=str(round(raw["ts"]*1e9)))
         except ValueError as error:
             budget_error = str(error)
         started = time.perf_counter()
-        regions = RoomSegmentationService(max_cells=args.max_cells).segment(snapshot, map_name=snapshot.map_name)
+        regions = RoomSegmentationService(max_cells=args.max_cells).segment(grid,map_name=args.version,map_revision=str(round(raw["ts"]*1e9)))
         segmentation_sec = time.perf_counter() - started
         started = time.perf_counter()
         summaries, geometry_checks, assignment = verify_regions(regions, grid, trajectory)
@@ -290,7 +277,6 @@ def main():
             'manifest_content_binding': 'not_verified_path_selection_only',
             'artifact_root': str(store.base_dir.resolve()),
             'input_artifact_ids': {name: ref.artifact_id for name, ref in refs.items()},
-            'source_epoch': snapshot.source_epoch,
             'segmentation_source_evidence': 'disk_source_bytes_at_capture_not_loaded_module_proof',
             'segmentation_parameters': {'min_area_m2': 2.0, 'doorway_width_m': 1.2, 'max_cells': args.max_cells},
             'input_kind': 'captured_offline_recording_inputs',

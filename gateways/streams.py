@@ -68,11 +68,15 @@ class Streams:
         self._running = True
         state = self.platform.geometry_state
         self._unsubscribe = [
-            state.subscribe(lambda value: self.stream_bus.publish("geometry.state", source="geometry", payload=asdict(value))),
-            state.subscribe_pose(lambda value: self.stream_bus.publish("localization.pose", source="geometry", payload=value,
-                                                                       frame_id=value.frame_id)),
+            state.subscribe(self._state_updated),
+            state.subscribe_pose(self._pose_updated),
             state.subscribe_map(self._map_updated),
         ]
+        from providers import StreamingPointCloudProvider
+        provider = self.platform.robot.providers
+        if isinstance(provider, StreamingPointCloudProvider):
+            token = provider.subscribe_point_cloud(self._pointcloud_updated)
+            self._unsubscribe.append(lambda: provider.unsubscribe_point_cloud(token))
         self._task_subscription = self.event_bus.subscribe(
             lambda event: self.stream_bus.publish("tasks.state", source="tasks", payload=event),
             event_types=("task.updated",))
@@ -121,9 +125,29 @@ class Streams:
             chunks=value.chunks, layout_generation=value.layout_generation, chunk_size_points=value.chunk_size_points,
             base_revision_ordinal=value.base_revision_ordinal, reset=value.reset)
 
+    def _pose_updated(self, value):
+        snapshot = self.platform.geometry_state.snapshot()
+        self.stream_bus.publish("localization.pose", source="geometry", payload=value,
+            frame_id=value.frame_id, metadata={"source_timestamp_ns": value.timestamp_ns,
+                "map_name": snapshot.map_name if snapshot is not None else ""})
+
+    def _pointcloud_updated(self, value):
+        snapshot = self.platform.geometry_state.snapshot()
+        self.stream_bus.publish("pointcloud.frame", source="robot", payload=value,
+            frame_id=value.frame_id, metadata={**value.metadata,
+                "map_name": snapshot.map_name if snapshot is not None else ""})
+
     def _map_updated(self, value):
-        self.stream_bus.publish("map.frame", source="geometry", payload=value, frame_id=value.grid.frame_id)
+        self.stream_bus.publish("map.frame", source="geometry", payload=value, frame_id=value.grid.frame_id,
+                                revision=str(value.grid.timestamp_ns))
         self._cloud_wake.set()
+
+    def _state_updated(self, value):
+        self.stream_bus.publish("geometry.state", source="geometry", payload=asdict(value))
+        self.stream_bus.publish("navigation.state", source="geometry",
+            payload=None if value.navigation is None else asdict(value.navigation))
+        self.stream_bus.publish("exploration.state", source="geometry",
+            payload=None if value.exploration is None else asdict(value.exploration))
 
     def _cloud_updates(self):
         while True:
@@ -134,6 +158,19 @@ class Streams:
             try:
                 value = self.get_pointcloud_map_snapshot()
                 if value is not None:
+                    import numpy as np
+                    from contracts.pointcloud import PointCloudFrame
+                    snapshot = self.platform.geometry_state.snapshot()
+                    self.stream_bus.publish("pointcloud.frame", source="geometry", frame_id=value.frame_id,
+                        payload=PointCloudFrame(frame_id=value.frame_id,
+                            timestamp=datetime.fromtimestamp(value.source_timestamp_ns / 1e9, timezone.utc),
+                            point_count=value.point_count,
+                            points_xyz_array=(np.concatenate([np.frombuffer(chunk.xyz_bytes, dtype="<f4").reshape(-1, 3)
+                                for chunk in value.chunks], axis=0) if value.chunks else
+                                np.frombuffer(value.xyz_bytes, dtype="<f4").reshape(-1, 3)),
+                            metadata={"source_timestamp_ns": value.source_timestamp_ns}),
+                        metadata={"source_timestamp_ns": value.source_timestamp_ns,
+                            "map_name": snapshot.map_name if snapshot is not None else ""})
                     metadata = {"source": value.source, "source_epoch": value.source_epoch,
                         "revision": value.revision, "revision_ordinal": value.revision_ordinal,
                         "frame_id": value.frame_id, "source_timestamp_ns": value.source_timestamp_ns,

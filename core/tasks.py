@@ -161,8 +161,8 @@ class TaskRunner:
             if cap.motion:
                 args["motion_generation"] = self._begin_motion(ctx)
             result = cap.handler(self._platform, ctx, args)
-        except Cancelled:
-            self.cancel(ctx.task_id)
+        except Cancelled as error:
+            self.cancel(ctx.task_id, str(error) or "任务已取消")
         except Exception as exc:
             error = exc
             if not isinstance(exc, GatewayError):

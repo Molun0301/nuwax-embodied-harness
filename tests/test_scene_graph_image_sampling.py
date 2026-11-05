@@ -7,8 +7,8 @@ import pytest
 from PIL import Image
 
 from contracts.occupancy_cells import PackedOccupancyCells
-from services.memory import scene_graph_image as renderer
-from services.memory.room_segmentation import _world
+from services.memory.semantic_map import scene_graph_image as renderer
+from services.memory.semantic_map.room_segmentation import _world
 
 
 def _legacy_image(occupancy, labels, size):
@@ -44,7 +44,8 @@ def _scene(height, width, packed=True):
     labels = ((rows // 19 + cols // 23) % 10).astype(np.int32)
     labels[(rows < height // 3) | (cols < width // 4)] = 0
     data = PackedOccupancyCells(occupancy.tobytes()) if packed else occupancy.ravel().tolist()
-    grid = SimpleNamespace(height=height, width=width, resolution_m=0.2, data=data)
+    grid = SimpleNamespace(height=height, width=width, resolution_m=0.2, data=data,
+        frame_id="map", timestamp=datetime(2026, 1, 2, tzinfo=timezone.utc))
     origin = [2.0, -3.0, 0.0, 0.37]
     geometry = SimpleNamespace(labels=labels, region_ids=['region-%d' % i for i in range(1, 10)],
                                origin=origin, resolution=0.2)
@@ -62,8 +63,7 @@ def _scene(height, width, packed=True):
     edges = [SimpleNamespace(kind='access', source='region-1', target='passage-1')]
     index = SimpleNamespace(geometry=geometry, nodes=nodes,
                             snapshot=SimpleNamespace(graph_revision='1234567890abcdef', edges=edges))
-    snapshot = SimpleNamespace(occupancy_grid=grid, frame_id='map', timestamp=datetime(2026, 1, 2, tzinfo=timezone.utc))
-    return index, snapshot
+    return index, grid
 
 
 @pytest.mark.parametrize('shape', [(37, 61), (701, 1301), (1201, 301), (1, 2051), (2051, 1)])

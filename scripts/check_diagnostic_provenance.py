@@ -114,7 +114,7 @@ class DiagnosticProvenanceChecks(unittest.TestCase):
         original_import = builtins.__import__
 
         class FakeService:
-            pass
+            def __init__(self,platform):self.platform=platform
 
         def import_hook(name, *args, **kwargs):
             if name in {"gateways.agent.router", "gateways.agent.service"}:
@@ -130,7 +130,8 @@ class DiagnosticProvenanceChecks(unittest.TestCase):
             self.assertEqual(agent.subprocess.check_output.call_count, 2)
             app = SimpleNamespace(include_router=Mock(), get=lambda path: lambda function: function)
             with patch.object(agent, "FastAPI", return_value=app):
-                agent.fixture()
+                _app,_service,owner=agent.fixture()
+                owner.close()
             return {"fake_case": {"summary": {"sample_count": 0}, "samples": []}}, 40, "async"
 
         report = self.run_fake_assay(fake_run, import_hook=import_hook)

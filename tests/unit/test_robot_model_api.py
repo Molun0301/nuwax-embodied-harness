@@ -1,5 +1,7 @@
 """机器人模型公开接口、数据时效和 Go2 真实关节提供链。"""
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
+from services.geometry.state import Pose as GeometryPose
 import threading
 import time
 import struct
@@ -36,12 +38,12 @@ def model_runtime(tmp_path, monkeypatch):
                        joints=[JointState(name="shoulder", position_rad=0.7)],
                        pose=Pose(timestamp=stamp, frame_id="wrong_odom", position=Vector3(x=99)))
     robot_snapshot = NS(robot_state=state)
-    localization = NS(source_name="assigned_map", current_pose=Pose(timestamp=stamp, frame_id="map"))
+    geometry = NS(value=GeometryPose(0,0,0,0,0,0,1,"map",int(stamp.timestamp()*1_000_000_000)))
     runtime = NS(config=NS(robot=NS(active_robot="fixture", geometry=RobotGeometryConfig(
         model_path=str(path), model_base_link="base"))),
-        robot_state_service=NS(get_latest_snapshot=lambda: robot_snapshot),
-        localization_service=NS(get_latest_snapshot=lambda: localization))
-    return runtime, robot_snapshot, localization
+        robot_state=NS(get_latest_snapshot=lambda: robot_snapshot),
+        geometry_state=NS(pose=lambda: geometry.value))
+    return runtime, robot_snapshot, geometry
 
 
 def view_for(runtime):
@@ -70,7 +72,7 @@ def test_live_state_matches_shared_kinematics_and_localization(model_runtime):
     ("skew", "pose_joint_time_skew"),
 ])
 def test_reference_fallback_has_reason(model_runtime, case, reason):
-    runtime, snapshot, localization = model_runtime
+    runtime, snapshot, geometry = model_runtime
     state = snapshot.robot_state
     if case == "missing":
         state.joints = []
@@ -85,9 +87,9 @@ def test_reference_fallback_has_reason(model_runtime, case, reason):
     elif case == "future":
         state.timestamp += timedelta(seconds=2)
     elif case == "pose_missing":
-        localization.current_pose = None
+        geometry.value = None
     elif case == "pose_stale":
-        localization.current_pose = localization.current_pose.model_copy(update={"timestamp": state.timestamp - timedelta(seconds=2)})
+        geometry.value = replace(geometry.value, timestamp_ns=int((state.timestamp-timedelta(seconds=2)).timestamp()*1_000_000_000))
     elif case == "skew":
         state.timestamp -= timedelta(seconds=0.35)
     view = view_for(runtime)
@@ -111,10 +113,10 @@ def test_aggregate_refresh_cannot_refresh_joint_source(model_runtime):
 
 
 def test_slow_simulation_uses_original_acquisition_clock(model_runtime, tmp_path, monkeypatch):
-    runtime, snapshot, localization = model_runtime
+    runtime, snapshot, geometry = model_runtime
     source_stamp = datetime.now(timezone.utc) - timedelta(hours=1)
     snapshot.robot_state.timestamp = source_stamp
-    localization.current_pose = localization.current_pose.model_copy(update={"timestamp": source_stamp})
+    geometry.value = replace(geometry.value, timestamp_ns=int(source_stamp.timestamp()*1_000_000_000))
     source_ns = int(source_stamp.timestamp() * 1_000_000_000)
     path = tmp_path / "source-time.bin"
     def write_record(age_sec):

@@ -124,11 +124,13 @@ def test_exploration_diagnostic_does_not_count_deadline_as_completion():
 
     for limit in [None, 1]:
         with pytest.raises(AssertionError):
-            require_completed_exploration("duration_exceeded", 1.0, limit)
-    require_completed_exploration("max_goals_reached", 0.5, 1)
-    require_completed_exploration("no_frontier_timeout", 0.99, None)
+            require_completed_exploration("duration_exceeded", 1.0, limit, 0)
+    require_completed_exploration("succeeded", 0.5, 1, 1)
+    require_completed_exploration("succeeded", 0.99, None, 0)
     with pytest.raises(AssertionError):
-        require_completed_exploration("no_frontier_timeout", 0.7, None)
+        require_completed_exploration("succeeded", 0.7, None, 0)
+    with pytest.raises(AssertionError):
+        require_completed_exploration("succeeded", 0.5, 1, 0)
 
 
 def test_navigation_startup_exports_the_existing_go2_speed_limit():

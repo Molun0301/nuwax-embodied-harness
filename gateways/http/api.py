@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import weakref
 from contextlib import asynccontextmanager
 from typing import Dict, Optional, Any
 
@@ -25,35 +24,6 @@ if TYPE_CHECKING:
 from gateways.serialization import to_jsonable, to_map_json_bytes
 from gateways.ws.client_queue import ClientQueue
 from core import config_io
-
-
-class ArtifactFileResponse(FileResponse):
-    """响应拥有读取保护；直到真正 ASGI 发送完成/取消才释放。
-
-    保留 FileResponse 的 range/条件请求行为。响应在执行前被丢弃时由
-    finalizer 释放备用句柄；正常路径均使用显式 finally，不依赖垃圾回收。
-    """
-
-    def __init__(self, store, artifact_id: str) -> None:
-        hold = store.acquire_artifacts((artifact_id,), owner="artifact.http_response")
-        try:
-            ref = store.get_ref(artifact_id)
-            path = store.get_file_path(artifact_id)
-            super().__init__(path, media_type=ref.mime_type, filename=path.name)
-        except BaseException:
-            hold.release()
-            raise
-        self._release_artifact = weakref.finalize(self, hold.release)
-
-    async def __call__(self, scope, receive, send):
-        try:
-            # pathsend 把路径交给服务器后就返回，服务器可能尚未真正打开文件。
-            # 本响应使用标准分块/range 发送，确保保护覆盖实际文件消费。
-            extensions = dict(scope.get("extensions", {}))
-            extensions.pop("http.response.pathsend", None)
-            await super().__call__({**scope, "extensions": extensions}, receive, send)
-        finally:
-            self._release_artifact()
 
 
 def _settings_lifespan(original_lifespan, settings_application):
@@ -503,12 +473,8 @@ def build_http_router(runtime: Platform, access_manager: GatewayAccessManager) -
     def api_maps_catalog_delete(
         map_name: str,
         request: Request,
-        delete_memory_library: Optional[bool] = None,
     ) -> Response:
-        arguments = {"map_name": map_name}
-        if delete_memory_library is not None:
-            arguments["delete_memory_library"] = delete_memory_library
-        return _invoke_capability(request, "delete_map", arguments, map_response=True)
+        return _invoke_capability(request, "delete_map", {"map_name": map_name}, map_response=True)
 
     @router.post("/api/maps/load", response_model=Dict[str, Any])
     async def api_maps_activate(request: Request) -> Response:
@@ -534,6 +500,10 @@ def build_http_router(runtime: Platform, access_manager: GatewayAccessManager) -
     @router.get("/api/maps/cleanup/{preview_id}")
     def api_map_cleanup_status(preview_id: str, request: Request):
         return _invoke_capability(request, "get_map_cleanup", {"preview_id": preview_id})
+
+    @router.get("/api/maps/cleanup/{preview_id}/points/{kind}")
+    def api_map_cleanup_points(preview_id: str, kind: str):
+        return FileResponse(runtime.map_cleanup.points(preview_id, kind), media_type="application/octet-stream")
 
     @router.post("/api/maps/cleanup/{preview_id}/cancel")
     def api_map_cleanup_cancel(preview_id: str, request: Request):
@@ -613,12 +583,10 @@ def build_http_router(runtime: Platform, access_manager: GatewayAccessManager) -
 
     @router.get("/api/memory/locations")
     def api_memory_locations(request: Request, limit: int = Query(20, ge=1, le=1000)) -> Dict[str, Any]:
-        # 未启用 active 库时返回空列表（避免跨库串数据），service 已默认按 active 库过滤。
         return {
             "locations": to_jsonable(
                 runtime.memory.list_tagged_locations(
                     limit=limit,
-                    library_name=runtime.memory.get_active_library_name(),
                 )
             ),
             "memory_summary": to_jsonable(runtime.memory.get_summary()),
@@ -630,7 +598,6 @@ def build_http_router(runtime: Platform, access_manager: GatewayAccessManager) -
             "entries": to_jsonable(
                 runtime.memory.list_semantic_memories(
                     limit=limit,
-                    library_name=runtime.memory.get_active_library_name(),
                 )
             ),
             "memory_summary": to_jsonable(runtime.memory.get_summary()),
@@ -699,10 +666,21 @@ def build_http_router(runtime: Platform, access_manager: GatewayAccessManager) -
         except Exception as exc:
             raise as_gateway_error(exc) from exc
 
+    @router.get("/api/memory/photos/{library_name}/{artifact_id}")
+    def api_memory_photo(library_name: str, artifact_id: str, request: Request) -> Response:
+        from io import BytesIO
+        from PIL import Image
+        data = runtime.memory.read_photo(artifact_id, library_name=library_name)
+        with Image.open(BytesIO(data)) as image:
+            media_type = image.get_format_mimetype()
+        return Response(data, media_type=media_type)
+
     @router.get("/artifacts/{artifact_id}")
     def api_artifact_raw(artifact_id: str, request: Request) -> FileResponse:
         try:
-            return ArtifactFileResponse(runtime.artifacts._store, artifact_id)
+            store = runtime.artifacts._store
+            ref = store.get_ref(artifact_id)
+            return FileResponse(store.get_file_path(artifact_id), media_type=ref.mime_type)
         except Exception as exc:
             raise as_gateway_error(exc) from exc
 

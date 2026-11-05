@@ -357,8 +357,6 @@ class PerceptionSegmentationConfig:
 class PerceptionStreamRuntimeConfig:
     """持续视频感知运行时配置。"""
 
-    enabled: bool = True
-    auto_start: bool = False
     camera_id: str = "front_camera"
     interval_sec: float = 0.5
     detector_backend_name: str = ""
@@ -370,9 +368,6 @@ class PerceptionStreamRuntimeConfig:
     remember_keyframes: bool = True
     burst_frame_count: int = 4
     burst_interval_sec: float = 0.08
-    # 定位模式(mapping_localization)下默认不联动拉起后台感知线程。
-    # 手动 start_perception_runtime MCP 入口会绕过该门控。
-    skip_when_localization: bool = True
 
 
 @dataclass
@@ -488,11 +483,8 @@ class RuntimeDataConfig:
     navigation_history_limit: int = 100
     memory_history_limit: int = 200
     map_catalog_root: str = ""
-    map_auto_create_library: bool = True
-    map_delete_also_delete_library: bool = True
-    memory_db_path: str = ""
-    memory_embedding_model: str = DEFAULT_MEMORY_ONLINE_EMBEDDING_MODEL
-    memory_embedding_dimension: int = 768
+    memory_embedding_model: str = DEFAULT_MEMORY_TEXT_EMBEDDING_MODEL
+    memory_embedding_dimension: int = 512
     memory_image_embedding_model: str = DEFAULT_MEMORY_ONLINE_EMBEDDING_MODEL
     memory_image_embedding_dimension: int = 768
     memory_embedding_api_key: str = ""
@@ -814,8 +806,6 @@ def load_config() -> NuwaxRobotBridgeConfig:
             ),
         ),
         stream_runtime=PerceptionStreamRuntimeConfig(
-            enabled=_cfg_bool("NUWAX_PERCEPTION_STREAM_ENABLED", True),
-            auto_start=_cfg_bool("NUWAX_PERCEPTION_STREAM_AUTO_START", False),
             camera_id=_cfg_str("NUWAX_PERCEPTION_STREAM_CAMERA_ID", "front_camera"),
             interval_sec=max(0.05, _cfg_float("NUWAX_PERCEPTION_STREAM_INTERVAL_SEC", 0.5)),
             detector_backend_name=_cfg_str("NUWAX_PERCEPTION_STREAM_DETECTOR_BACKEND", ""),
@@ -827,10 +817,6 @@ def load_config() -> NuwaxRobotBridgeConfig:
             remember_keyframes=_cfg_bool("NUWAX_PERCEPTION_KEYFRAME_REMEMBER_ENABLED", True),
             burst_frame_count=max(1, _cfg_int("NUWAX_PERCEPTION_BURST_FRAME_COUNT", 4)),
             burst_interval_sec=max(0.05, _cfg_float("NUWAX_PERCEPTION_BURST_INTERVAL_SEC", 0.08)),
-            # 定位模式(mapping_localization)下默认不联动后台感知；手动 start MCP 绕过该门控。
-            skip_when_localization=_cfg_bool(
-                "NUWAX_PERCEPTION_STREAM_SKIP_WHEN_LOCALIZATION", True
-            ),
         ),
         deferred_projection=_build_deferred_projection_config(),
         postprocess=PerceptionPostProcessConfig(
@@ -1108,21 +1094,15 @@ def load_config() -> NuwaxRobotBridgeConfig:
             "NUWAX_MAP_CATALOG_ROOT",
             str(BASE_DIR / "runtime_data" / "maps"),
         ),
-        map_auto_create_library=_cfg_bool("NUWAX_MAP_AUTO_CREATE_LIBRARY", True),
-        map_delete_also_delete_library=_cfg_bool("NUWAX_MAP_DELETE_ALSO_DELETE_LIBRARY", True),
-        memory_db_path=_cfg_str(
-            "NUWAX_MEMORY_DB_PATH",
-            str(BASE_DIR / "runtime_data" / "memory" / "vector_memory.db"),
-        ),
         memory_embedding_model=_cfg_str(
             "NUWAX_MEMORY_TEXT_EMBEDDING_MODEL",
-            DEFAULT_MEMORY_ONLINE_EMBEDDING_MODEL,
+            DEFAULT_MEMORY_TEXT_EMBEDDING_MODEL,
         ),
         memory_embedding_dimension=max(
             8,
             _cfg_int(
                 "NUWAX_MEMORY_TEXT_EMBEDDING_DIM",
-                768,
+                512,
             ),
         ),
         memory_image_embedding_model=_cfg_str(

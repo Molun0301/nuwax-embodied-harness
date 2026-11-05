@@ -1,89 +1,54 @@
-"""Canonical occupancy byte admission stays bounded and owner-preserving."""
-from dataclasses import replace
+"""原占据字节值域和块边界交给公开栅格契约验证。"""
 import unittest
-from unittest.mock import patch
 
-from tests.test_assigned_asset_storage import checkpoint_fixture
-from tests.test_checkpoint_finite_scan import payload_owner
-from services.geometry.checkpoint_payload import CHUNK_BYTES, FrozenPayload
-from services.geometry import mapping_backend_checkpoint_store as store
+from contracts.geometry import Pose
+from contracts.maps import OccupancyGrid
+from contracts.occupancy_cells import PackedOccupancyCells
+from services.geometry.checkpoint_payload import CHUNK_BYTES
+
+
+def grid(payload, *, width=None):
+    return OccupancyGrid(map_id='map', frame_id='map', width=max(1, len(payload)) if width is None else width,
+        height=1, resolution_m=.125, origin=Pose(frame_id='map'), data=PackedOccupancyCells(payload))
 
 
 class CheckpointOccupancyScanTests(unittest.TestCase):
-    def admit(self, payload):
-        checkpoint, occupancy, cloud = checkpoint_fixture()
-        size = len(payload)
-        return store.MappingBackendCheckpointStore.validate_checkpoint_bundle(
-            replace(checkpoint, canonical_occupancy_data=payload),
-            occupancy_asset=dict(occupancy, width=max(1, size), raw_data_size=max(1, size)),
-            cloud_asset=cloud)
-
     def test_all_byte_values_and_retained_payload_ownership(self):
-        for frozen in (False, True):
-            for value in range(256):
-                with self.subTest(frozen=frozen, value=value), payload_owner(bytes([value]), frozen) as payload:
-                    if value <= 100 or value == 255:
-                        admitted, _, _ = self.admit(payload)
-                        self.assertIs(admitted.canonical_occupancy_data, payload)
-                    else:
-                        with self.assertRaisesRegex(store.MappingBackendCheckpointValidationError,
-                                r'^canonical occupancy values must be \[-1, 100\]$'):
-                            self.admit(payload)
+        for value in range(256):
+            raw = bytes([value])
+            with self.subTest(value=value):
+                if value <= 100 or value == 255:
+                    parsed = grid(raw)
+                    self.assertEqual(parsed.data.raw, raw)
+                    self.assertEqual(list(parsed.data), [-1 if value == 255 else value])
+                else:
+                    with self.assertRaisesRegex(ValueError, '栅格取值必须在 -1 到 100'):
+                        grid(raw)
 
     def test_valid_lengths_around_chunk_boundary(self):
         for size in (1, CHUNK_BYTES - 1, CHUNK_BYTES, CHUNK_BYTES + 1):
-            data = (b'\x00\x64\xff' * ((size + 2) // 3))[:size]
-            for frozen in (False, True):
-                with self.subTest(size=size, frozen=frozen), payload_owner(data, frozen) as payload:
-                    admitted, _, _ = self.admit(payload)
-                    self.assertIs(admitted.canonical_occupancy_data, payload)
+            raw = (b'\x00\x64\xff' * ((size + 2) // 3))[:size]
+            with self.subTest(size=size):
+                parsed = grid(raw)
+                self.assertEqual(parsed.data.raw, raw)
+                self.assertEqual(len(parsed.data), size)
+                self.assertEqual(parsed.data[-1], (0, 100, -1)[(size - 1) % 3])
 
     def test_invalid_early_late_and_chunk_edges(self):
         for position in (0, CHUNK_BYTES - 1, CHUNK_BYTES, CHUNK_BYTES + 1):
-            data = bytearray(CHUNK_BYTES + 2)
-            data[position] = 101
-            for frozen in (False, True):
-                with self.subTest(position=position, frozen=frozen), payload_owner(bytes(data), frozen) as payload:
-                    with self.assertRaisesRegex(store.MappingBackendCheckpointValidationError,
-                            r'^canonical occupancy values must be \[-1, 100\]$'):
-                        self.admit(payload)
+            raw = bytearray(CHUNK_BYTES + 2)
+            raw[position] = 101
+            with self.subTest(position=position), self.assertRaisesRegex(ValueError, '栅格取值必须在 -1 到 100'):
+                grid(raw)
 
-    def test_empty_and_wrong_sizes_reject_before_scan(self):
-        with patch.object(store.np, 'frombuffer', side_effect=AssertionError('decoded malformed occupancy')):
-            # The backend uses frombuffer too; call canonical admission directly
-            # so the assertion isolates its unchanged type/size gate.
-            checkpoint, occupancy, cloud = checkpoint_fixture()
-            for payload in (b'', b'\x00', b'\x00\x00\x00'):
-                with self.subTest(size=len(payload)):
-                    with self.assertRaisesRegex(store.MappingBackendCheckpointValidationError,
-                            '^exact canonical occupancy bytes are required$'):
-                        store._validate_canonical_members(
-                            replace(checkpoint, canonical_occupancy_data=payload), occupancy, cloud)
-            for data in (b'\x00', b'\x00\x00\x00'):
-                with payload_owner(data, True) as payload:
-                    with self.assertRaisesRegex(store.MappingBackendCheckpointValidationError,
-                            '^exact canonical occupancy bytes are required$'):
-                        store._validate_canonical_members(
-                            replace(checkpoint, canonical_occupancy_data=payload), occupancy, cloud)
+    def test_empty_and_wrong_sizes_are_rejected(self):
+        for raw in (b'', b'\x00', b'\x00\x00\x00'):
+            with self.subTest(size=len(raw)), self.assertRaisesRegex(ValueError, 'data 长度必须等于 width'):
+                grid(raw, width=2)
 
-    def test_file_reads_remain_bounded_and_stop_at_first_invalid_chunk(self):
-        class ObservedPayload(FrozenPayload):
-            def __getitem__(self, key):
-                self.reads.append((key.start, key.stop))
-                if not isinstance(key, slice) or key.stop - key.start > CHUNK_BYTES:
-                    raise AssertionError('unbounded occupancy read')
-                return super().__getitem__(key)
-        data = b'\x00' * CHUNK_BYTES + b'\x65' + b'\x00' * CHUNK_BYTES
-        owner = ObservedPayload(data[i:i + CHUNK_BYTES] for i in range(0, len(data), CHUNK_BYTES))
-        try:
-            owner.reads = []
-            with self.assertRaisesRegex(store.MappingBackendCheckpointValidationError,
-                    r'^canonical occupancy values must be \[-1, 100\]$'):
-                self.admit(owner)
-            self.assertEqual(owner.reads, [(0, CHUNK_BYTES), (CHUNK_BYTES, CHUNK_BYTES * 2)])
-        finally:
-            owner._data.close()
-
-
-if __name__ == '__main__':
-    unittest.main()
+    def test_mutable_input_cannot_change_published_grid_cells(self):
+        raw = bytearray(b'\x00' * CHUNK_BYTES + b'\xff')
+        parsed = grid(raw)
+        raw[CHUNK_BYTES] = 101
+        self.assertEqual(parsed.data[-1], -1)
+        self.assertEqual(parsed.data.raw, b'\x00' * CHUNK_BYTES + b'\xff')

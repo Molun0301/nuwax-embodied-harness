@@ -154,7 +154,7 @@
                       <div id="semanticMemoryList" class="msb-chips semantic-memory-list" aria-label="记忆物品列表"></div>
                       <button id="semanticInstancesRefresh" class="msb-btn" type="button" title="手动刷新当前记忆库物品标记">刷新物品</button>
                     </div>
-                    <p class="msb-status"><span id="semanticMemoryStatus" class="semantic-memory-status" role="status">正在读取当前记忆库…</span><span id="semanticMemorySummary" class="msb-meta"></span><span class="msb-note">地图只标出有位置依据的物品；“仅观察”表示在附近见过，位置不精确。</span></p>
+                    <p class="msb-status"><span id="semanticMemoryStatus" class="semantic-memory-status" role="status">正在读取当前记忆库…</span><span id="semanticMemorySummary" class="msb-meta"></span><span class="msb-note">记忆库随当前地图自动切换；无建图功能时使用默认库。地图只标出有位置依据的物品。</span></p>
                   </div>
                   <button id="semanticMemoryClose" class="msb-close" type="button" aria-label="收起物品" title="收起（Esc）"><svg class="map-close-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg></button>
                 </section>
@@ -197,7 +197,7 @@
                           <button data-role="explore-resume" class="msb-btn" type="button" disabled>继续所选探索</button>
                         </div>
                       </div>
-                      <p class="msb-status"><span data-role="explore-status" aria-live="polite">等待操作。</span><span data-role="explore-progress" class="msb-meta"></span><span class="msb-note">暂停会先停车，再保存地图和探索进度；恢复后会重新定位。</span></p>
+                      <p class="msb-status"><span data-role="explore-status" aria-live="polite">等待操作。</span><span data-role="explore-progress" class="msb-meta"></span><span class="msb-note">暂停会停止探索后保存地图和进度；恢复后会重新定位。</span></p>
                     </details>
                     <details class="floor-navigation msb-pane" data-role="floor-navigation" data-nav-pane="floor" role="tabpanel" hidden>
                       <summary>跨楼层导航</summary>
@@ -210,9 +210,7 @@
                         <div class="msb-group">
                           <button data-role="floor-submit" class="msb-btn primary" type="button">前往目标层</button>
                           <button data-role="floor-cancel" class="msb-btn" type="button" disabled>停止任务</button>
-                          <button data-role="floor-resume" class="msb-btn" type="button" hidden>继续原请求</button>
                           <button data-role="floor-explore" class="msb-btn" type="button">逐层探索建筑</button>
-                          <button data-role="floor-resume-explore" class="msb-btn" type="button" hidden>继续逐层探索</button>
                           <label class="msb-btn floor-import">导入楼层配置<input data-role="floor-import" type="file" accept="application/json,.json"></label>
                         </div>
                       </div>
@@ -343,6 +341,13 @@
                 <div id="videoEmpty" class="empty">等待摄像头数据。</div>
               </div>
               <div class="vision-information">
+                <div class="vision-status-row">
+                  <span id="perceptionRuntimeStatus" class="pill missing">连续识别状态未知</span>
+                  <span id="perceptionRuntimeReasons" class="muted small">使用原因：未读取</span>
+                  <button id="perceptionRuntimeStart" class="btn btn-sm" type="button" disabled>开启手动识别</button>
+                  <button id="perceptionRuntimeStop" class="btn btn-sm" type="button" disabled>关闭手动识别</button>
+                </div>
+                <p id="perceptionRuntimeMessage" class="muted small" role="status">关闭手动识别只移除手动使用原因；探索、跟随和找目标仍在使用时会继续识别。</p>
                 <div class="vision-status-row">
                   <div id="visionLabels" class="vision-labels" aria-label="已识别目标"></div>
                 </div>

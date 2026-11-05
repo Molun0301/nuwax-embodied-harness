@@ -1,9 +1,10 @@
 """从已有流历史取同一采集时刻的几何输入，不用处理时刻的机体位置。"""
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import numpy as np
 
-from contracts.geometry import FrameTree, Pose, Transform
+from contracts.geometry import FrameTree, Pose, Transform, Vector3, Quaternion
 from contracts.pointcloud import PointCloudFrame
 from services.localization.frame_tree_ops import resolve_frame_transform
 
@@ -18,31 +19,52 @@ class ObservationGeometry:
 
 
 def _stamp(payload, metadata):
-    value = metadata.get("source_timestamp_ns")
+    value = metadata.get("source_timestamp_ns", getattr(payload, "timestamp_ns", None))
     return int(value) if value is not None else int(payload.timestamp.timestamp() * 1e9)
 
 
-def capture_geometry(stream_bus, image_frame):
+def contract_pose(value):
+    """把 Geometry 的位姿值转成感知算法使用的坐标契约，保留源时间。"""
+    if value is None or isinstance(value, Pose):
+        return value
+    return Pose(frame_id=value.frame_id,
+        timestamp=datetime.fromtimestamp(value.timestamp_ns / 1e9, timezone.utc),
+        position=Vector3(x=value.x, y=value.y, z=value.z),
+        orientation=Quaternion(x=value.qx, y=value.qy, z=value.qz, w=value.qw))
+
+
+def contract_frame_tree(transforms, pose):
+    if pose is None:
+        return None
+    return FrameTree(root_frame_id=pose.frame_id, timestamp=pose.timestamp, transforms=[
+        Transform(parent_frame_id=value.parent_frame, child_frame_id=value.child_frame,
+            translation=Vector3(x=value.x, y=value.y, z=value.z),
+            rotation=Quaternion(x=value.qx, y=value.qy, z=value.qz, w=value.qw),
+            timestamp=datetime.fromtimestamp(value.timestamp_ns / 1e9, timezone.utc),
+            authority="calibration_static" if value.timestamp_ns == 0 else "geometry")
+        for value in transforms])
+
+
+def capture_geometry(stream_bus, image_frame, *, transforms=(), map_name=None):
     """复用有界历史；纳秒容差仅吸收现有浮点时间序列化误差。"""
     if stream_bus is None:
         return ObservationGeometry(reason="geometry_stream_unavailable")
     stamp = _stamp(image_frame, image_frame.metadata)
     clock = image_frame.metadata.get("source_clock_id") or image_frame.metadata.get("clock_id")
-    boundary = stream_bus.replay_snapshot(limit=0).map_identity_start_cursor or 0
-    frames = stream_bus.replay(after_cursor=boundary, topics=("localization.pose", "localization.frame_tree", "pointcloud.frame"))
-    pose_frames = [f for f in frames if f.topic == "localization.pose" and isinstance(f.payload, Pose)
+    frames = stream_bus.replay(topics=("localization.pose", "pointcloud.frame"))
+    pose_frames = [f for f in frames if f.topic == "localization.pose"
+                   and (map_name is None or f.metadata.get("map_name") == map_name)
                    and abs(_stamp(f.payload, f.metadata) - stamp) <= 1000]
     if not pose_frames:
         return ObservationGeometry()
-    pose = pose_frames[-1].payload
-    # 动态 TF 的包装时间可能是发布时间，不能用于采集配对。
-    trees = [f.payload for f in frames if f.topic == "localization.frame_tree" and isinstance(f.payload, FrameTree)]
-    static = [t for t in trees[-1].transforms if t.authority == "calibration_static"] if trees else []
+    pose = contract_pose(pose_frames[-1].payload)
+    original_tree = contract_frame_tree(transforms, pose)
+    static = [t for t in original_tree.transforms if t.authority == "calibration_static"]
     camera_edge = next((t for t in static if t.child_frame_id == image_frame.frame_id), None)
     if camera_edge is None:
         return ObservationGeometry(pose=pose, reason="capture_camera_calibration_unavailable")
     base = camera_edge.parent_frame_id
-    dynamic_bodies = {t.child_frame_id for t in trees[-1].transforms if t.authority != "calibration_static"}
+    dynamic_bodies = {t.child_frame_id for t in original_tree.transforms if t.authority != "calibration_static"}
     if base not in dynamic_bodies:
         return ObservationGeometry(pose=pose, reason="capture_reference_frame_unavailable")
     tree = FrameTree(root_frame_id=pose.frame_id, timestamp=pose.timestamp, transforms=[
@@ -55,6 +77,8 @@ def capture_geometry(stream_bus, image_frame):
         if frame.topic != "pointcloud.frame" or not isinstance(cloud, PointCloudFrame):
             continue
         metadata = cloud.metadata
+        if map_name is not None and frame.metadata.get("map_name") != map_name:
+            continue
         map_cloud = cloud.frame_id == pose.frame_id and not metadata.get("canonical_lidar_frame")
         if clock and metadata.get("clock_id") != clock and not map_cloud:
             continue

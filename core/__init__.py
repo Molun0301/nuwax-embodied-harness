@@ -1,39 +1,10 @@
-"""运行时核心导出。"""
-
-from core.capability_registry import CapabilityRegistry, CapabilityRuntimeView, RegisteredCapability
+"""当前任务、状态与数据流的公共类型。"""
+from core.capability import Capability, CapabilityTable
 from core.event_bus import EventBus, EventSubscription
-from core.resource_lock import ResourceConflict, ResourceConflictError, ResourceLease, ResourceLockManager, RuntimeResource
-from core.safety_guard import SafetyGuard
 from core.state_store import StateEntry, StateNamespace, StateStore
 from core.stream_bus import StreamBus, StreamSubscription
-from core.task_manager import (
-    TaskCancelledError,
-    TaskExecutionContext,
-    TaskManager,
-    TaskRecord,
-    TaskTimeoutError,
-)
+from core.tasks import Cancelled, TaskContext, TaskRunner, TaskState, TaskStatus
 
-__all__ = [
-    "CapabilityRegistry",
-    "CapabilityRuntimeView",
-    "EventBus",
-    "EventSubscription",
-    "RegisteredCapability",
-    "ResourceConflict",
-    "ResourceConflictError",
-    "ResourceLease",
-    "ResourceLockManager",
-    "RuntimeResource",
-    "SafetyGuard",
-    "StateEntry",
-    "StateNamespace",
-    "StateStore",
-    "StreamBus",
-    "StreamSubscription",
-    "TaskCancelledError",
-    "TaskExecutionContext",
-    "TaskManager",
-    "TaskRecord",
-    "TaskTimeoutError",
-]
+__all__ = ["Capability", "CapabilityTable", "EventBus", "EventSubscription", "StateEntry",
+           "StateNamespace", "StateStore", "StreamBus", "StreamSubscription", "Cancelled",
+           "TaskContext", "TaskRunner", "TaskState", "TaskStatus"]

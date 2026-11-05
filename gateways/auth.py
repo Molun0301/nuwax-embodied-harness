@@ -4,7 +4,7 @@ from typing import Dict, Tuple
 
 from contracts.capabilities import CapabilityDescriptor
 from core.settings import GatewayServerConfig
-from gateways.errors import AccessDeniedError
+from core.errors import AccessDeniedError
 
 
 class GatewayAccessManager:

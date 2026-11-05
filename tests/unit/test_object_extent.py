@@ -7,7 +7,7 @@ import pytest
 from contracts.geometry import Pose, Vector3, Quaternion, FrameTree, Transform
 from contracts.perception import Detection3D, Observation
 from services.memory.object_extent import resolve_object_extent, merge_object_extent, object_extent_payload
-from services.memory.semantic_map_builder import SemanticMapBuildResult
+from services.memory.semantic_map.semantic_map_builder import SemanticMapBuildResult
 from services.memory.vision_to_map_projection_service import VisionToMapProjectionService, ProjectedObservation
 
 
@@ -33,7 +33,7 @@ def projected_detection(frame='map', q=None, tree=None, sizes=(2, .5, 3)):
     robot = Pose(frame_id='map', position=Vector3(x=10), orientation=Quaternion(z=math.sqrt(.5), w=math.sqrt(.5)))
     localization = SimpleNamespace(frame_tree=tree, current_pose=robot)
     map_context = SemanticMapBuildResult(map_name='house', frame_id='map', semantic_regions=(), anchors_by_id={}, topology_nodes_by_id={})
-    return VisionToMapProjectionService().project(context, current_pose=robot, map_context=map_context, localization_snapshot=localization)[0]
+    return VisionToMapProjectionService().project(context, current_pose=robot, map_context=map_context, frame_tree=localization.frame_tree)[0]
 
 
 def test_point_bounds_use_midpoint_without_changing_observed_centroid_or_floor():
@@ -154,11 +154,11 @@ def test_changing_surface_sampling_preserves_box_midpoint_through_pose_blending(
             current_pose=Pose(frame_id='map'), map_frame='map', projection_method='map_point_samples', projection_confidence=.95)
         return replace(observation(attrs,pose),source_observation_id='sample_'+str(index))
     first = measured(1.5,0)
-    current = policy._create_instance(first,map_name='house',localization_session_id='session',
+    current = policy._create_instance(first,map_name='house',
         occupancy_grid=None,cost_map=None,now=now)
     for index,extra in enumerate((2.5,1.5,2.5),1):
         incoming = measured(extra,index)
-        current = policy._merge_instance(current,incoming,map_name='house',localization_session_id='session',
+        current = policy._merge_instance(current,incoming,map_name='house',
             occupancy_grid=None,cost_map=None,now=now+timedelta(seconds=index*10))
         result = object_extent_payload(current)
         assert result['center'] == pytest.approx({'x':2.01,'y':3,'z':-.99})

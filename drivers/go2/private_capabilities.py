@@ -4,7 +4,7 @@ from typing import Optional
 
 from contracts.capabilities import CapabilityRiskLevel
 from drivers.common.private_capabilities import PrivateCapabilitySpec
-from drivers.go2.capabilities import build_go2_sport_command_description, build_go2_sport_command_input_schema
+from contracts.go2_sport import build_go2_sport_command_description, build_go2_sport_command_input_schema
 
 
 def _schema_object(

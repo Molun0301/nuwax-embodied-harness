@@ -64,8 +64,6 @@ def test_high_frequency_config_keys_have_chinese_names():
     expected = {
         "NUWAX_PERCEPTION_OPENAI_ENABLED": "启用 OpenAI 视觉分析",
         "NUWAX_PERCEPTION_SEGMENTATION_ENABLED": "启用实例分割",
-        "NUWAX_PERCEPTION_STREAM_ENABLED": "启用持续视频感知",
-        "NUWAX_PERCEPTION_STREAM_AUTO_START": "启动时自动开启视频感知",
     }
     for key, zh_name in expected.items():
         field = R.get_field(key)

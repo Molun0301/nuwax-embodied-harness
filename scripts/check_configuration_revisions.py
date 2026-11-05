@@ -27,10 +27,10 @@ WORK = Path(tempfile.gettempdir()) / 'neh-configuration-revisions-checks'
 SECRET = 'synthetic-secret-never-a-real-credential'
 
 
-def field(key, *, kind='str', sensitive=False, aliases=()):
+def field(key, *, kind='str', sensitive=False):
     return config_registry.ConfigField(key=key, zh_name=key, description='', type=kind,
         section_id='synthetic', section_title='合成配置', advanced=False, sensitive=sensitive,
-        target_file=config_registry.TARGET_CORE, default_repr="''", aliases=aliases)
+        target_file=config_registry.TARGET_CORE, default_repr="''")
 
 
 class ConfigurationRevisionChecks(unittest.TestCase):
@@ -58,7 +58,7 @@ class ConfigurationRevisionChecks(unittest.TestCase):
         self.location = config_values.configuration_location(root=self.root, robot='alpha', profile='main')
         self.owner = config_profiles.ProfileRevisionOwner(); self.addCleanup(self.owner.close)
         self.stack.enter_context(patch.object(config_io, '_CORE_ENV', self.root / '.env'))
-        fields = {item.key: item for item in (field('VALUE', aliases=('OLD_VALUE',)), field('SECRET', sensitive=True), field('COUNT', kind='int'))}
+        fields = {item.key: item for item in (field('VALUE'), field('SECRET', sensitive=True), field('COUNT', kind='int'))}
         self.stack.enter_context(patch.object(config_registry, 'get_field', side_effect=fields.get))
         self.stack.enter_context(patch.object(config_registry, 'build_registry', return_value=list(fields.values())))
         self.stack.enter_context(patch.object(config_registry, 'SECTIONS', [('synthetic', '合成配置')]))
@@ -155,14 +155,14 @@ class ConfigurationRevisionChecks(unittest.TestCase):
         with self.assertRaises(config_profiles.ConfigurationConflict): self.save({'VALUE': 'new'}, schema['profile_context']['revision'])
         self.assertIsNone(config_io._PROFILE_VALUES.get())
 
-    def test_masked_and_blank_secret_stays_unchanged_and_comments_aliases_survive(self):
+    def test_masked_and_blank_secret_stays_unchanged_and_comments_unknown_keys_survive(self):
         self.path.write_text(self.path.read_text() + 'OLD_VALUE=old\n')
         token = self.token()
         result = self.save({'VALUE': 'two', 'SECRET': '********'}, token)
         self.assertIn('SECRET', result.skipped)
         content = self.path.read_text()
         self.assertIn('# preserved comment', content); self.assertIn('UNKNOWN=keep', content)
-        self.assertIn('SECRET=' + SECRET, content); self.assertNotIn('OLD_VALUE=', content)
+        self.assertIn('SECRET=' + SECRET, content); self.assertIn('OLD_VALUE=old',content)
         self.save({'SECRET': ''}, self.token())
         self.assertEqual(config_values.read_env_values(self.path)['SECRET'], SECRET)
 

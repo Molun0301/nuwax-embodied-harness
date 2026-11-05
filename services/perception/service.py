@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
-from copy import deepcopy
 import threading
-import time
 from collections import deque
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from datetime import timezone
 from time import perf_counter
 from typing import (
@@ -34,7 +32,7 @@ from core.errors import GatewayError
 from core.logging_utils import LogRateLimiter
 from core.event_bus import PreparedEventPublication
 from core.stream_bus import PreparedStreamPublication
-from providers import LocalizationProvider, PointCloudProvider
+from providers import PointCloudProvider
 from services.artifact_service import ArtifactService
 from services.perception.base import (
     DetectionBundle,
@@ -46,7 +44,7 @@ from services.perception.base import (
 )
 from services.perception.detectors import DetectorPipeline
 from services.perception.geometry import DetectionGeometryAugmentor
-from services.perception.observation_geometry import capture_geometry
+from services.perception.observation_geometry import capture_geometry, contract_frame_tree, contract_pose
 from services.perception.scene import SimpleSceneDescriptionBackend
 from services.perception.self_body import (
     DisabledSelfBodyFilter,
@@ -82,7 +80,6 @@ class PerceptionService:
         self,
         *,
         provider_owner,
-        localization_provider_owner=None,
         artifact_service: ArtifactService,
         state_store: StateStore,
         detector_pipeline: DetectorPipeline,
@@ -95,13 +92,12 @@ class PerceptionService:
         stream_bus: Optional[StreamBus] = None,
         video_frame_sink: Optional[VideoFrameSink] = None,
         video_frame_source: Optional[VideoFrameSource] = None,
-        live_pose_provider=None,
-        spatial_context_provider=None,
+        geometry_state=None,
+        geometry_client=None,
         history_limit: int = 100,
         pipeline_name: str = "default_perception_pipeline",
     ) -> None:
         self._provider_owner = provider_owner
-        self._localization_provider_owner = localization_provider_owner or provider_owner
         self._artifact_service = artifact_service
         self._state_store = state_store
         self._detector_pipeline = detector_pipeline
@@ -114,11 +110,12 @@ class PerceptionService:
         self._stream_bus = stream_bus
         self._video_frame_sink = video_frame_sink
         self._video_frame_source = video_frame_source
-        self._live_pose_provider = live_pose_provider
-        self._spatial_context_provider = spatial_context_provider
-        self._observation_spatial_contexts = {}
+        self._geometry_state = geometry_state
+        self._geometry_client = geometry_client
+        self._frame_tree = None
         self._history: Deque[PerceptionContext] = deque(maxlen=max(1, history_limit))
         self._fast_frame_cache = {}
+        self._full_inputs = {}
         self._last_published_video_frames = {}
         self._latest_by_camera: Dict[str, PerceptionContext] = {}
         self._latest_full_by_camera: Dict[str, PerceptionContext] = {}
@@ -129,9 +126,6 @@ class PerceptionService:
         self._full_pipeline_lock = threading.Lock()
         self._latest_frame_timestamp_by_camera = {}
         self._context_condition = threading.Condition(threading.RLock())
-        self._latest_holds = {}
-        self._full_holds = {}
-        self._history_holds = deque()
         self._active_operations = 0
         self._closing = False
         self._closed = False
@@ -181,7 +175,6 @@ class PerceptionService:
         source_name: Optional[str] = None,
         detection_metadata: Optional[Dict[str, object]] = None,
         open_vocabulary_classes: Optional[Iterable[str]] = None,
-        spatial_context=None,
     ) -> PerceptionContext:
         """消费标准图像并产出检测、跟踪和场景摘要。
 
@@ -194,30 +187,16 @@ class PerceptionService:
         if image_artifact is not None and not isinstance(image_artifact, ArtifactRef):
             raise TypeError("PerceptionService.process_image 的 image_artifact 必须是 ArtifactRef。")
         with self._operation():
-            if spatial_context is None and self._spatial_context_provider is not None:
-                spatial_context = self._spatial_context_provider()
-            spatial_context = self._copy_spatial_context(spatial_context)
-            # 已存在引用的文件查验在两个推理锁之外；等待锁和慢推理期间拥有方不失效。
-            hold = self._artifact_service.acquire_artifacts(
-                [image_artifact.artifact_id], owner="perception.process",
-            ) if image_artifact is not None else None
-            try:
-                if hold is not None:
-                    hold.validate_introduced()
-                return self._run_full_pipeline(
-                    image_frame, camera_info, image_artifact=image_artifact,
-                    requested_by=requested_by, detector_backend_name=detector_backend_name,
-                    source_name=source_name, detection_metadata=detection_metadata,
-                    open_vocabulary_classes=open_vocabulary_classes, artifact_hold=hold,
-                    spatial_context=spatial_context,
-                )
-            finally:
-                if hold is not None:
-                    hold.release()
+            return self._run_full_pipeline(
+                image_frame, camera_info, image_artifact=image_artifact,
+                requested_by=requested_by, detector_backend_name=detector_backend_name,
+                source_name=source_name, detection_metadata=detection_metadata,
+                open_vocabulary_classes=open_vocabulary_classes,
+            )
 
     def _run_full_pipeline(self, image_frame, camera_info=None, **kwargs):
         requested_at = perf_counter()
-        cached_geometry_inputs = self._capture_cached_geometry_inputs() if camera_info is not None else None
+        cached_geometry_inputs = self._capture_cached_geometry_inputs(image_frame) if camera_info is not None else None
         with self._full_pipeline_lock:
             with self._context_condition:
                 self._ensure_open()
@@ -239,10 +218,16 @@ class PerceptionService:
             if self._latest_by_camera.get(context.camera_id) is context:
                 overlay_publication = self._prepare_detection_overlay_frame(context)
         # 游标在检测顺序锁内预留；此处在两个管线锁外完成同步分发。
-        # 调用方仍持有操作及制品拥有方，关闭不能提前回收正在分发的结果。
+        # 调用方的感知操作在分发结束后退出，关闭会等待该操作完成。
         if overlay_publication is not None:
             self._stream_bus.dispatch_prepared(overlay_publication)
         return context
+
+    def get_full_observation_input(self, context):
+        """返回这一完整观察的原图和同帧几何，供显式记忆动作使用。"""
+        with self._context_condition:
+            value = self._full_inputs.get(context.camera_id)
+            return value[1:] if value is not None and value[0] == context.observation.observation_id else None
 
     def _process_image_locked(
         self,
@@ -257,8 +242,6 @@ class PerceptionService:
         detection_metadata: Optional[Dict[str, object]] = None,
         open_vocabulary_classes: Optional[Iterable[str]] = None,
         lock_wait_ms: Optional[float] = None,
-        artifact_hold=None,
-        spatial_context=None,
     ) -> Tuple[PerceptionContext, Optional[PreparedEventPublication]]:
         """完整分析的实现；调用方持有完整分析锁，检测/跟踪独立加锁。"""
 
@@ -449,8 +432,7 @@ class PerceptionService:
         )
         self._publish_context(
             context, image_frame=image_frame, source=source_name or detector_spec.name,
-            kind="latest_perception", hold=artifact_hold, full=True,
-            spatial_context=spatial_context,
+            kind="latest_perception", full=True, geometry_inputs=cached_geometry_inputs,
         )
         scene_publication = None
         if self._event_bus is not None:
@@ -501,17 +483,14 @@ class PerceptionService:
         """从平台已接收的端侧推流抽取最新帧并完成完整感知。"""
 
         with self._operation():
-            scope = self._artifact_service.publication_scope(owner="perception.capture") if store_artifact else nullcontext(None)
-            with scope as hold:
-                return self._perceive_current_scene(
-                    camera_id=camera_id, requested_by=requested_by,
-                    detector_backend_name=detector_backend_name, store_artifact=store_artifact,
-                    detection_metadata=detection_metadata, open_vocabulary_classes=open_vocabulary_classes,
-                    artifact_hold=hold,
-                )
+            return self._perceive_current_scene(
+                camera_id=camera_id, requested_by=requested_by,
+                detector_backend_name=detector_backend_name, store_artifact=store_artifact,
+                detection_metadata=detection_metadata, open_vocabulary_classes=open_vocabulary_classes,
+            )
 
     def _perceive_current_scene(self, *, camera_id, requested_by, detector_backend_name,
-                                store_artifact, detection_metadata, open_vocabulary_classes, artifact_hold):
+                                store_artifact, detection_metadata, open_vocabulary_classes):
         image_frame = self._read_latest_pushed_image(camera_id)
         if image_frame is None:
             ingest_status = self._video_frame_source_status()
@@ -527,8 +506,6 @@ class PerceptionService:
                     "ingest_status": ingest_status,
                 },
             )
-        # 在取帧后、模型等待前捕获一次空间归属，不改写源时间。
-        spatial_context = self._copy_spatial_context(self._spatial_context_provider()) if self._spatial_context_provider is not None else None
         camera_info = self._camera_info_from_video_frame(image_frame)
         source_name = str((image_frame.metadata or {}).get("source_kind") or "video_ingest_receiver")
         self._publish_video_frame(
@@ -545,8 +522,6 @@ class PerceptionService:
             image_frame,
             camera_info,
             image_artifact=image_artifact,
-            artifact_hold=artifact_hold,
-            spatial_context=spatial_context,
             requested_by=requested_by,
             detector_backend_name=detector_backend_name,
             source_name=source_name,
@@ -808,7 +783,7 @@ class PerceptionService:
         )
         self._publish_context(
             context, image_frame=image_frame, source=source_name or detector_spec.name,
-            kind="latest_perception_fast", hold=None, full=False,
+            kind="latest_perception_fast", full=False,
         )
         if stage_status["detector"] in {"completed", "fallback"}:
             self._fast_frame_cache[context.camera_id] = (
@@ -826,16 +801,13 @@ class PerceptionService:
                 return cached[4], cached[5]
         return None
 
-    @contextmanager
     def complete_observation_geometry(self, context, inputs, *, store_artifact=False,
                                       wait_sec=0.0, stop_event=None):
-        """沿新版制品拥有方保活至记忆事务结束，关闭会等待本次操作退出。"""
+        """完成同帧几何与关键帧抓图，返回结果后结束感知操作。"""
         with self._operation():
-            scope = self._artifact_service.publication_scope(owner="perception.video_geometry") if store_artifact else nullcontext(None)
-            with scope:
-                yield self._complete_observation_geometry(
-                    context, inputs, store_artifact=store_artifact,
-                    wait_sec=wait_sec, stop_event=stop_event)
+            return self._complete_observation_geometry(
+                context, inputs, store_artifact=store_artifact,
+                wait_sec=wait_sec, stop_event=stop_event)
 
     def _complete_observation_geometry(self, context, inputs, *, store_artifact=False,
                                       wait_sec=0.0, stop_event=None):
@@ -844,17 +816,21 @@ class PerceptionService:
             return context, None, None
         image_frame, camera_info = inputs
         deadline = perf_counter() + wait_sec
-        geometry = capture_geometry(self._stream_bus, image_frame)
+        geometry = self._capture_geometry(image_frame)
         while geometry.reason in {"capture_pose_unavailable", "capture_pointcloud_unavailable"} and perf_counter() < deadline:
             if stop_event is None or stop_event.wait(min(0.02, max(0.0, deadline - perf_counter()))):
                 break
-            geometry = capture_geometry(self._stream_bus, image_frame)
+            geometry = self._capture_geometry(image_frame)
         if stop_event is not None and stop_event.is_set():
             return context, None, None
-        detections, metadata = self._geometry_augmentor.augment_detections(
-            tuple(context.observation.detections_2d), image_frame=image_frame, camera_info=camera_info,
-            point_cloud=geometry.point_cloud, frame_tree=geometry.frame_tree, current_pose=geometry.pose,
-            self_region=region_from_detection_metadata(context.metadata.get("detection_metadata")))
+        if camera_info is None:
+            detections = tuple(context.observation.detections_2d)
+            metadata = {"geometry_projection_degradation_reason": "camera_info_missing"}
+        else:
+            detections, metadata = self._geometry_augmentor.augment_detections(
+                tuple(context.observation.detections_2d), image_frame=image_frame, camera_info=camera_info,
+                point_cloud=geometry.point_cloud, frame_tree=geometry.frame_tree, current_pose=geometry.pose,
+                self_region=region_from_detection_metadata(context.metadata.get("detection_metadata")))
         metadata = {**metadata, "geometry_synchronization": "same_acquisition_time",
                     "geometry_input_sources": list(geometry.sources)}
         if geometry.reason:
@@ -961,39 +937,9 @@ class PerceptionService:
         return max(contexts.values(), key=lambda item: item.timestamp, default=None)
 
     def get_latest_full_perception(self, camera_id: Optional[str] = None) -> Optional[PerceptionContext]:
-        """返回最近一次完整感知结果；快速帧不会覆盖此独立拥有方。"""
+        """返回最近一次完整感知结果；快速帧不会覆盖完整结果快照。"""
         with self._context_condition:
             return self._select_latest(self._latest_full_by_camera, camera_id)
-
-    @staticmethod
-    def _copy_spatial_context(captured):
-        if captured is None:
-            return None
-        # 地图是拥有方发布的只读图层句柄，不为一次观察遍历/复制整张地图。
-        copied = deepcopy({key: value for key, value in captured.items() if key != "map_snapshot"})
-        if "map_snapshot" in captured:
-            copied["map_snapshot"] = captured["map_snapshot"]
-        return copied
-
-    def get_observation_spatial_context(self, observation_id):
-        """读取同一完整观察的空间快照；已接线但缺失时不借用当前位置。"""
-        with self._context_condition:
-            captured = self._observation_spatial_contexts.get(observation_id)
-            if captured is not None:
-                return self._copy_spatial_context(captured)
-        return {} if self._spatial_context_provider is not None else None
-
-    def acquire_latest_perception(self, camera_id=None, *, owner, full=False):
-        """在短槽位锁内选择上下文并取得独立读取拥有方。"""
-        with self._context_condition:
-            self._ensure_open()
-            contexts = self._latest_full_by_camera if full else self._latest_by_camera
-            holds = self._full_holds if full else self._latest_holds
-            context = self._select_latest(contexts, camera_id)
-            hold = holds.get(context.camera_id) if context is not None else None
-            if hold is not None:
-                hold.validate_introduced()
-            return context, hold.retain(owner=owner) if hold is not None else None
 
     def list_history(
         self,
@@ -1066,86 +1012,26 @@ class PerceptionService:
             items = sorted(self._latest_by_camera.values(), key=lambda item: (item.camera_id, item.timestamp))
         return tuple(items)
 
-    @staticmethod
-    def _context_artifact_ids(context):
-        observation = getattr(context, "observation", None)
-        ids = set(getattr(observation, "artifact_ids", ()) or ())
-        image_artifact = getattr(context, "image_artifact", None)
-        if image_artifact is not None:
-            ids.add(image_artifact.artifact_id)
-        return ids
 
-    def acquire_context_artifacts(self, context, *, owner):
-        ids = self._context_artifact_ids(context)
-        if not ids:
-            return None
-        with self._operation():
-            with self._context_condition:
-                candidates = list(zip(self._history, self._history_holds)) + [
-                    (self._latest_by_camera.get(context.camera_id), self._latest_holds.get(context.camera_id)),
-                    (self._latest_full_by_camera.get(context.camera_id), self._full_holds.get(context.camera_id)),
-                ]
-                for item, hold in candidates:
-                    if item is context and hold is not None and hold.artifact_ids == ids:
-                        hold.validate_introduced()
-                        return hold.retain(owner=owner)
-            hold = self._artifact_service.acquire_artifacts(ids, owner=owner)
-            try:
-                hold.validate_introduced()
-                return hold
-            except BaseException:
-                hold.release()
-                raise
-
-    def _publish_context(self, context, *, image_frame, source, kind, hold, full, spatial_context=None):
+    def _publish_context(self, context, *, image_frame, source, kind, full, geometry_inputs=None):
         with self._context_condition:
             self._ensure_open()
-            if hold is not None:
-                hold.validate_introduced()
             latest_time = self._latest_frame_timestamp_by_camera.get(context.camera_id)
             publish_latest = not full or latest_time is None or image_frame.timestamp >= latest_time
-            new_holds = []
-            try:
-                for slot in ("history", "latest" if publish_latest else None, "full" if full else None):
-                    new_holds.append(hold.retain(owner="perception." + slot) if hold is not None and slot else None)
-                if publish_latest:
-                    self._state_store.write(
-                        StateNamespace.PERCEPTION, context.camera_id, context, source=source,
-                        metadata={"kind": kind, "pipeline_name": self._pipeline_name},
-                    )
-            except BaseException:
-                for new_hold in new_holds:
-                    if new_hold is not None:
-                        new_hold.release()
-                raise
-            old_holds = []
-            if len(self._history) == self._history.maxlen:
-                old_holds.append(self._history_holds.popleft())
-            self._history.append(context)
-            self._history_holds.append(new_holds[0])
             if publish_latest:
-                old_holds.append(self._latest_holds.pop(context.camera_id, None))
+                self._state_store.write(
+                    StateNamespace.PERCEPTION, context.camera_id, context, source=source,
+                    metadata={"kind": kind, "pipeline_name": self._pipeline_name},
+                )
+            self._history.append(context)
+            if publish_latest:
                 self._latest_by_camera[context.camera_id] = context
                 self._latest_frame_timestamp_by_camera[context.camera_id] = image_frame.timestamp
-                if new_holds[1] is not None:
-                    self._latest_holds[context.camera_id] = new_holds[1]
             if full:
-                old_holds.append(self._full_holds.pop(context.camera_id, None))
                 self._latest_full_by_camera[context.camera_id] = context
-                if new_holds[2] is not None:
-                    self._full_holds[context.camera_id] = new_holds[2]
-            # 只在结果及制品拥有方发布成功后一起登记，随相同槽位/历史淘汰。
-            if full and spatial_context is not None:
-                self._observation_spatial_contexts[context.observation.observation_id] = spatial_context
-            retained = {item.observation.observation_id for item in self._history}
-            retained.update(item.observation.observation_id for item in self._latest_full_by_camera.values())
-            retained.update(item.observation.observation_id for item in self._latest_by_camera.values())
-            for observation_id in tuple(self._observation_spatial_contexts):
-                if observation_id not in retained:
-                    self._observation_spatial_contexts.pop(observation_id)
-            for old_hold in old_holds:
-                if old_hold is not None:
-                    old_hold.release()
+                self._full_inputs[context.camera_id] = (context.observation.observation_id, image_frame,
+                    context.camera_info, geometry_inputs[2] if geometry_inputs else None,
+                    geometry_inputs[1] if geometry_inputs else None)
 
     def _ensure_open(self):
         if self._closing:
@@ -1166,46 +1052,29 @@ class PerceptionService:
     def get_lifecycle_status(self):
         with self._context_condition:
             return {"closing": self._closing, "closed": self._closed,
-                    "active_operations": self._active_operations,
-                    "latest_holders": len(self._latest_holds), "full_holders": len(self._full_holds),
-                    "history_holders": sum(hold is not None for hold in self._history_holds)}
+                    "active_operations": self._active_operations}
 
-    def close(self, timeout=5.0):
-        """终止准入；慢推理超时仍保留其操作拥有方，禁止晚发布。"""
-        deadline = time.monotonic() + max(0.0, float(timeout))
+    def close(self, timeout=5.0) -> None:
+        """关闭检测执行者，并等待在途感知结束；真实执行者退出失败直接报错。"""
         with self._context_condition:
+            if self._closed:
+                return
             self._closing = True
-        # Signal detector lifecycle shutdown before waiting for active inference.
-        # Waiting happens outside the publication/status lock.
-        close = getattr(self._detector_pipeline, "close", None)
-        if callable(close) and not close(timeout=max(0.0, deadline - time.monotonic())):
-            return False
+        if not self._detector_pipeline.close(timeout=timeout):
+            raise GatewayError("检测执行者未能在期限内退出。", error_code="perception_close_failed", http_status=503)
         with self._context_condition:
             while self._active_operations:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._context_condition.wait(remaining)
-            if self._closed:
-                return True
+                self._context_condition.wait()
             for camera_id in self._latest_by_camera:
                 self._state_store.write(StateNamespace.PERCEPTION, camera_id, None,
                                         source="perception_service", metadata={"kind": "closed"})
-            holds = tuple(self._latest_holds.values()) + tuple(self._full_holds.values()) + tuple(self._history_holds)
             self._latest_by_camera.clear()
             self._latest_full_by_camera.clear()
-            self._observation_spatial_contexts.clear()
+            self._full_inputs.clear()
             self._latest_frame_timestamp_by_camera.clear()
             self._history.clear()
             self._fast_frame_cache.clear()
-            self._latest_holds.clear()
-            self._full_holds.clear()
-            self._history_holds.clear()
-            for hold in holds:
-                if hold is not None:
-                    hold.release()
             self._closed = True
-            return True
 
     def _attach_segmentation_results(
         self,
@@ -1633,20 +1502,9 @@ class PerceptionService:
                 return camera_info
         return None
 
-    def _get_localization_provider_optional(self) -> Optional[LocalizationProvider]:
-        providers = getattr(self._localization_provider_owner, "providers", None)
-        if providers is None or not isinstance(providers, LocalizationProvider):
-            return None
-        if not providers.is_available():
-            return None
-        return providers
-
     def _read_live_pose_and_frame_tree(self):
-        """读取提供器已解析的实时位姿和坐标树；无数据时保持空值。"""
-        provider = self._live_pose_provider
-        if provider is None:
-            return None, None
-        return provider.get_exploration_pose(), provider.get_frame_tree()
+        pose = contract_pose(None if self._geometry_state is None else self._geometry_state.pose())
+        return pose, self._frame_tree
 
     def _get_point_cloud_provider_optional(self) -> Optional[PointCloudProvider]:
         providers = getattr(self._provider_owner, "providers", None)
@@ -1678,25 +1536,25 @@ class PerceptionService:
         except (TypeError, IndexError):
             return False
 
-    def _capture_cached_geometry_inputs(self):
-        """Pin a complete cached group before model/lock waits, without provider I/O.
+    def _capture_geometry(self, image_frame):
+        snapshot = None if self._geometry_state is None else self._geometry_state.snapshot()
+        transforms = () if self._geometry_client is None or snapshot is None else self._geometry_client.get_frame_tree()
+        geometry = capture_geometry(self._stream_bus, image_frame, transforms=transforms,
+            map_name=None if snapshot is None else snapshot.map_name)
+        self._frame_tree = geometry.frame_tree
+        return geometry
 
-        This is a bus-slot snapshot, not source-time synchronization. Partial
-        groups keep the existing late-resolution path rather than mixing times.
-        Payloads are retained by reference; publishers replace frame objects.
-        """
-        if self._stream_bus is None:
-            return None
-        topics = ("pointcloud.frame", "localization.frame_tree", "localization.pose")
-        payloads = {
-            frame.topic: frame.payload
-            for frame in self._stream_bus.latest_frames(topics=topics)
-            if frame.status == "available"
-        }
-        cloud, tree, pose = (payloads.get(topic) for topic in topics)
-        if self._has_usable_point_cloud(cloud) and tree is not None and pose is not None:
-            return cloud, tree, pose
-        return None
+    def _capture_cached_geometry_inputs(self, image_frame):
+        """单次完整识别在模型等待前保留已有几何输入。"""
+        pose = contract_pose(None if self._geometry_state is None else self._geometry_state.pose())
+        snapshot = None if self._geometry_state is None else self._geometry_state.snapshot()
+        transforms = () if self._geometry_client is None or snapshot is None else self._geometry_client.get_frame_tree()
+        tree = contract_frame_tree(transforms, pose)
+        cloud = self._latest_stream_payload("pointcloud.frame")
+        if not self._has_usable_point_cloud(cloud):
+            cloud = self._get_latest_point_cloud_optional()
+        self._frame_tree = tree
+        return cloud, tree, pose
 
     def self_body_filter_status(self) -> Dict[str, Any]:
         return self._self_body_filter.status()
@@ -1741,29 +1599,8 @@ class PerceptionService:
         if cached_geometry_inputs is not None:
             point_cloud_frame, frame_tree, current_pose = cached_geometry_inputs
         else:
-            point_cloud_frame = self._latest_stream_payload("pointcloud.frame")
-            if not self._has_usable_point_cloud(point_cloud_frame):
-                point_cloud_frame = self._get_latest_point_cloud_optional()
-
-            frame_tree = self._latest_stream_payload("localization.frame_tree")
-            current_pose = self._latest_stream_payload("localization.pose")
-            if frame_tree is None or current_pose is None:
-                localization_provider = self._get_localization_provider_optional()
-                if localization_provider is not None:
-                    if frame_tree is None:
-                        frame_tree = localization_provider.get_frame_tree()
-                    if current_pose is None:
-                        current_pose = localization_provider.get_current_pose()
-            # P0-1：探索建图阶段定位会话尚未重定位就绪，上面流/会话源的 current_pose 恒 None，
-            # 导致 map_frame_id=None、support_points_map 永不生成、下游丢失最高优先级
-            # map_point_samples 投影路径。直接读取统一
-            # 实时位姿门面（导航后端 map→base 实时 TF）。frame_tree 同源缺失时一并回退。
-            if current_pose is None or frame_tree is None:
-                live_pose, live_frame_tree = self._read_live_pose_and_frame_tree()
-                if current_pose is None and live_pose is not None:
-                    current_pose = live_pose
-                if frame_tree is None and live_frame_tree is not None:
-                    frame_tree = live_frame_tree
+            geometry = self._capture_geometry(image_frame)
+            point_cloud_frame, frame_tree, current_pose = geometry.point_cloud, geometry.frame_tree, geometry.pose
 
         detections_2d, geometry_metadata = self._geometry_augmentor.augment_detections(
             detection_bundle.detections_2d,

@@ -1,183 +1,135 @@
-// 楼层连接使用独立的冻结任务；设施状态和恢复要求由后端权威回执提供。
+// 楼层与整栋任务直接展示任务执行器的快照，目录只提供楼层与设施连接。
 (function () {
   'use strict';
-  const terminal = ['succeeded', 'failed', 'cancelled', 'timeout'];
-  const stageNames = { accepted: '准备连接', navigating_waiting: '前往等候点', reserving: '预约设施', calling: '等待设施到达', waiting_entry: '确认进梯条件', boarding: '进入设施', stopping_inside: '确认停车', suspending_mapping: '暂停原楼层建图', transporting: '设施运载中', waiting_arrival: '确认目标停层', activating_target: '加载目标层并定位', exiting: '离开设施', releasing: '释放预约', navigating_final: '前往目标位姿', succeeded: '已到达并停车' };
-  let panel, elements, buildings = [], current = null, workflow = null, taskId = null, taskRunning = false, busy = false, timer = null;
+  const terminal = new Set(['succeeded', 'failed', 'cancelled', 'timed_out']);
+  const capabilities = new Set(['navigate_to_floor', 'explore_building']);
+  const states = {running: '任务运行中', cancelling: '正在取消任务', succeeded: '任务已完成',
+    failed: '任务失败', cancelled: '任务已取消', timed_out: '任务已超时'};
+  let panel, elements, buildings = [], task = null, busy = false;
 
-  async function request(url, arguments_) {
-    const response = await fetch(url, arguments_ === undefined ? {} : arguments_ === null ? { method: 'POST' } : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ arguments: arguments_ }) });
+  async function request(url, body) {
+    const response = await fetch(url, body === undefined ? {} : {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
     const payload = await response.json();
-    if (!response.ok || payload.ok === false) {
-      const error = new Error(payload.error?.message || payload.detail || '楼层请求失败');
-      error.status = response.status;
-      throw error;
-    }
+    if (!response.ok) throw new Error(payload.error?.message || payload.detail || '楼层请求失败');
     return payload;
   }
-  function invoke(name, arguments_) { return request('/api/capabilities/' + name + '/invoke', arguments_ || {}); }
-  function status(message, level) { elements.status.textContent = message; elements.status.dataset.level = level || ''; }
-  function building() { return buildings.find(item => item.building_id === elements.building.value); }
-  function floorName(id) { const scope = buildings.find(item => item.building_id === current?.request.building_id) || building(); return scope?.floors.find(item => item.floor_id === id)?.display_name || id || '待确认'; }
+  function invoke(name, args = {}) {
+    return request('/api/capabilities/' + name + '/invoke', {arguments: args});
+  }
+  function status(message, level = '') {
+    elements.status.textContent = message;
+    elements.status.dataset.level = level;
+  }
+  function building() { return buildings.find(value => value.building_id === elements.building.value); }
+  function running() { return Boolean(task && !terminal.has(task.state)); }
   function updateButtons() {
-    const pendingWorkflow = workflow && !workflow.terminal;
-    const pending = pendingWorkflow || (current && !current.terminal);
-    elements.submit.disabled = busy || pending || taskRunning || !elements.target.value;
-    elements.cancel.disabled = busy || !taskRunning || !taskId;
-    elements.resume.hidden = !pending || taskRunning || !!pendingWorkflow;
-    elements['resume-explore'].hidden = !pendingWorkflow || taskRunning;
-    elements['resume-explore'].disabled = busy;
-    elements.explore.disabled = busy || pending || taskRunning || !building();
-    elements.resume.disabled = busy;
-    elements.import.disabled = busy || pending || taskRunning;
-    [elements.building, elements.target, elements.x, elements.y, elements.yaw].forEach(element => { element.disabled = busy || pending || taskRunning; });
+    const disabled = busy || running();
+    elements.submit.disabled = disabled || !elements.target.value;
+    elements.cancel.disabled = busy || !running() || task.state === 'cancelling';
+    elements.explore.disabled = disabled || !building();
+    elements.import.disabled = disabled;
+    for (const element of [elements.building, elements.target, elements.x, elements.y, elements.yaw]) element.disabled = disabled;
   }
   function renderFloors() {
     const selected = elements.target.value;
     elements.target.replaceChildren();
     for (const floor of building()?.floors || []) {
       const option = new Option(floor.display_name + ' · ' + floor.map_name, floor.floor_id);
-      option.disabled = !floor.enabled || !floor.asset_identity;
+      option.disabled = floor.enabled === false;
       elements.target.append(option);
     }
-    if ([...elements.target.options].some(option => option.value === selected && !option.disabled)) elements.target.value = selected;
-    else elements.target.value = [...elements.target.options].find(option => !option.disabled)?.value || '';
+    elements.target.value = [...elements.target.options].find(value => value.value === selected && !value.disabled)?.value
+      || [...elements.target.options].find(value => !value.disabled)?.value || '';
     updateButtons();
   }
   async function loadBuildings() {
     const reply = await invoke('list_buildings');
-    buildings = reply.result?.buildings || [];
+    buildings = reply.buildings;
     const selected = elements.building.value;
     elements.building.replaceChildren();
-    buildings.forEach(item => elements.building.append(new Option(item.display_name, item.building_id)));
-    if (buildings.some(item => item.building_id === selected)) elements.building.value = selected;
+    for (const value of buildings) elements.building.append(new Option(value.display_name, value.building_id));
+    if (buildings.some(value => value.building_id === selected)) elements.building.value = selected;
     renderFloors();
-    if (!buildings.length) status('尚未登记建筑，请先完成楼层和设施配置。');
-    else if (!current) status('请选择目标楼层并填写坐标。');
+    if (!task) status(buildings.length ? '请选择目标楼层并填写坐标。' : '尚未登记楼栋，请导入楼层与设施配置。');
   }
-  function renderState() {
-    if (workflow && (!workflow.terminal || !current || current.terminal)) {
-      const completed = Object.keys(workflow.completed_floors || {}).length;
-      const total = workflow.request.floors.length;
-      const target = workflow.request.floors[workflow.next_floor_index];
-      const lines = ['楼层进度：' + completed + ' / ' + total, '阶段：' + ({accepted:'准备下一层', transfer:'跨层转移', exploring:'层内探索', finalizing:'保存该层地图', succeeded:'逐层任务完成'}[workflow.stage] || workflow.stage)];
-      if (target) lines.push('当前目标层：' + target.display_name);
-      if (workflow.message) lines.push(workflow.message);
-      if (workflow.needs_reconciliation) lines.push('进度已保留，请继续原逐层请求。');
-      elements.detail.textContent = lines.join('\n');
-      status(workflow.terminal ? '设定的逐层探索已完成。' : workflow.needs_reconciliation ? '逐层探索等待恢复。' : '逐层探索执行中。', workflow.needs_reconciliation ? 'error' : '');
-      updateButtons(); return;
-    }
-    if (!current) { elements.detail.textContent = ''; updateButtons(); return; }
-    const lines = ['目标楼层：' + floorName(current.request.target_floor_id), '当前楼层：' + floorName(current.current_floor_id), '阶段：' + (stageNames[current.stage] || current.stage)];
-    const facility = current.facility_state;
-    if (facility) {
-      const stale = Date.now() - Date.parse(facility.observed_at) > 2000;
-      lines.push('设施停层：' + floorName(facility.floor_id));
-      lines.push('设施：' + (stale ? '反馈已过期' : facility.moving ? '运载中' : facility.door === 'open' ? '已开门' : facility.door === 'closed' ? '门已关闭' : '门状态待确认'));
-    }
-    if (current.pending_operation && current.pending_operation.state !== 'succeeded') lines.push('设施回执：待确认');
-    if (current.needs_reconciliation) lines.push('机器人已请求停车，设施操作需继续核对。');
-    if (current.last_message) lines.push(current.last_message);
+  function renderTask() {
+    if (!task) { elements.detail.textContent = ''; status('当前进程没有楼层任务记录。'); updateButtons(); return; }
+    const data = task.data;
+    const lines = ['任务：' + task.task_id, '功能：' + task.capability, '阶段：' + task.stage,
+      '进度：' + Math.round(task.progress * 100) + '%', task.message];
+    if (data.floor_id) lines.push('楼层：' + data.floor_id);
+    if (data.completed_floors) lines.push('已保存楼层：' + data.completed_floors.join('、'));
+    if (task.error_code) lines.push('错误码：' + task.error_code);
+    if (task.result) lines.push(JSON.stringify(task.result, null, 2));
     elements.detail.textContent = lines.join('\n');
-    status(current.needs_reconciliation ? '任务等待对账，可继续原请求。' : stageNames[current.stage] || '楼层任务执行中。', current.needs_reconciliation ? 'error' : '');
+    status(states[task.state], ['failed', 'timed_out'].includes(task.state) ? 'error' : '');
     updateButtons();
   }
-  async function refreshState() {
-    const reply = await invoke('get_floor_navigation_state');
-    current = reply.result?.state || null;
-    const explorationReply = await invoke('get_building_exploration_state');
-    workflow = explorationReply.result?.state || null;
-    const owner = workflow && !workflow.terminal ? workflow.owner_task_id : current?.owner_task_id;
-    if (owner && (!taskId || !taskRunning)) taskId = owner;
-    taskRunning = false;
-    if (taskId) {
-      try {
-        const snapshot = await request('/api/tasks/' + encodeURIComponent(taskId));
-        taskRunning = !terminal.includes(snapshot.status?.state);
-      } catch (error) { if (error.status !== 404) throw error; }
-    }
-    renderState();
+  async function refreshTasks() {
+    const snapshot = await request('/api/tasks');
+    task = snapshot.active_tasks.find(value => capabilities.has(value.capability))
+      || snapshot.history_tasks.find(value => capabilities.has(value.capability)) || null;
+    renderTask();
   }
-  function schedule() {
-    clearTimeout(timer);
-    timer = setTimeout(async function () {
-      if (panel.open && document.visibilityState !== 'hidden' && !busy) {
-        try { await refreshState(); } catch (error) { status(error.message, 'error'); }
-      }
-      schedule();
-    }, 1000);
-  }
-  async function submit(resume) {
+  async function submit(explore) {
     if (busy) return;
     busy = true; updateButtons();
     try {
-      let args;
-      if (resume) {
-        if (!current || current.terminal) throw new Error('没有可继续的原请求。');
-        args = { request_id: current.request.request_id };
-      } else {
-        const values = [elements.x.value, elements.y.value, elements.yaw.value];
-        if (values.some(value => !value.trim() || !Number.isFinite(Number(value)))) throw new Error('请填写有效的目标层坐标和朝向。');
-        if (!building() || !elements.target.value) throw new Error('请选择有完整地图的目标楼层。');
-        args = { building_id: elements.building.value, floor_id: elements.target.value, x: Number(values[0]), y: Number(values[1]), yaw_rad: Number(values[2]), timeout_sec: 600 };
-      }
-      const reply = await invoke(resume ? 'resume_floor_navigation' : 'navigate_to_floor', args);
-      taskId = reply.task_id;
-      if (!taskId) throw new Error('后端没有返回任务标识。');
-      taskRunning = true; status('任务已受理，正在核对执行条件。');
-      await refreshState();
-    } catch (error) { status(error.message, 'error'); }
-    finally { busy = false; updateButtons(); }
-  }
-  async function exploreBuilding(resume) {
-    if (busy) return;
-    busy = true; updateButtons();
-    try {
-      if (!resume && !building()) throw new Error('请先选择建筑。');
-      if (resume && (!workflow || workflow.terminal)) throw new Error('没有可继续的逐层探索。');
-      const args = resume ? { request_id: workflow.request.request_id } : { building_id: elements.building.value, floor_ids: building().floors.filter(floor => floor.enabled).map(floor => floor.floor_id), timeout_sec: 7200 };
-      const reply = await invoke(resume ? 'resume_building_exploration' : 'explore_building', args);
-      if (!reply.task_id) throw new Error('后端没有返回逐层任务标识。');
-      taskId = reply.task_id; taskRunning = true;
-      status('逐层任务已受理，正在核对楼层与设施。');
-      await refreshState();
+      const args = explore ? {building_id: elements.building.value,
+        floor_ids: building().floors.filter(value => value.enabled !== false).map(value => value.floor_id), timeout_sec: 7200}
+        : {building_id: elements.building.value, floor_id: elements.target.value,
+          x: parseFloat(elements.x.value), y: parseFloat(elements.y.value), yaw_rad: parseFloat(elements.yaw.value), timeout_sec: 600};
+      const reply = await invoke(explore ? 'explore_building' : 'navigate_to_floor', args);
+      task = reply.task;
+      renderTask();
     } catch (error) { status(error.message, 'error'); }
     finally { busy = false; updateButtons(); }
   }
   function mount() {
     panel = document.querySelector('[data-role="floor-navigation"]');
-    if (!panel || window.__NUWAX_GEOMETRY_PIPELINE__ !== 'slam_2d') return;
+    if (!panel) return;
     panel.hidden = false;
     elements = {};
-    for (const key of ['building', 'target', 'x', 'y', 'yaw', 'submit', 'cancel', 'resume', 'explore', 'resume-explore', 'status', 'detail', 'import']) elements[key] = panel.querySelector('[data-role="floor-' + key + '"]');
+    for (const key of ['building', 'target', 'x', 'y', 'yaw', 'submit', 'cancel', 'explore', 'status', 'detail', 'import']) {
+      elements[key] = panel.querySelector('[data-role="floor-' + key + '"]');
+    }
     elements.building.addEventListener('change', function () { elements.x.value = ''; elements.y.value = ''; renderFloors(); });
     elements.target.addEventListener('change', function () { elements.x.value = ''; elements.y.value = ''; });
     elements.submit.addEventListener('click', () => submit(false));
-    elements.resume.addEventListener('click', () => submit(true));
-    elements.explore.addEventListener('click', () => exploreBuilding(false));
-    elements['resume-explore'].addEventListener('click', () => exploreBuilding(true));
+    elements.explore.addEventListener('click', () => submit(true));
     elements.cancel.addEventListener('click', async function () {
-      if (!taskId || busy) return;
       busy = true; updateButtons();
-      try { await request('/api/tasks/' + encodeURIComponent(taskId) + '/cancel', null); status('已请求停止，等待机器人和设施状态确认。'); }
-      catch (error) { status(error.message, 'error'); }
+      try {
+        await request('/api/tasks/' + encodeURIComponent(task.task_id) + '/cancel', {});
+        if (running()) status('取消请求已发送，等待原任务退出。');
+      } catch (error) { status(error.message, 'error'); }
       finally { busy = false; updateButtons(); }
     });
     elements.import.addEventListener('change', async function () {
-      const file = elements.import.files?.[0]; if (!file) return;
+      const file = elements.import.files?.[0];
+      if (!file) return;
       busy = true; updateButtons();
       try {
-        if (file.size > 4 * 1024 * 1024) throw new Error('楼层配置文件超过大小限制。');
-        const topology = JSON.parse(await file.text());
-        await invoke('register_building', { topology, expected_revision: topology.revision - 1 });
+        await invoke('register_building', {topology: JSON.parse(await file.text())});
         await loadBuildings(); status('楼层配置已登记。');
       } catch (error) { status(error.message, 'error'); }
       finally { elements.import.value = ''; busy = false; updateButtons(); }
     });
-    panel.addEventListener('toggle', function () { if (panel.open) Promise.all([loadBuildings(), refreshState()]).catch(error => status(error.message, 'error')); });
-    loadBuildings().catch(error => status(error.message, 'error')); schedule();
-    window.addEventListener('pagehide', () => clearTimeout(timer));
+    panel.addEventListener('toggle', async function () {
+      if (panel.open) {
+        try { await Promise.all([loadBuildings(), refreshTasks()]); }
+        catch (error) { status(error.message, 'error'); }
+      }
+    });
+    window.addEventListener('stream:tasks.state', function (event) {
+      const update = event.detail;
+      if (capabilities.has(update.capability) && (!task || update.task_id === task.task_id || terminal.has(task.state))) {
+        task = update;
+        renderTask();
+      }
+    });
+    loadBuildings().catch(error => status(error.message, 'error'));
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount); else mount();
 })();

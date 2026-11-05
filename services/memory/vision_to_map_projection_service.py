@@ -8,9 +8,9 @@ import numpy as np
 
 from contracts.frame_semantics import frame_ids_semantically_equal, infer_frame_role
 from contracts.geometry import Pose, Quaternion, Vector3
-from contracts.runtime_views import LocalizationSnapshot, PerceptionContext
+from contracts.runtime_views import PerceptionContext
 from services.localization.frame_tree_ops import transform_points_to_frame, transform_pose_to_frame
-from services.memory.semantic_map_builder import SemanticMapBuildResult
+from services.memory.semantic_map.semantic_map_builder import SemanticMapBuildResult
 from services.perception.ray_triangulation import triangulate_rays, triangulation_confidence
 from services.perception.self_body import is_self_body
 
@@ -159,15 +159,12 @@ class VisionToMapProjectionService:
         *,
         current_pose: Optional[Pose],
         map_context: SemanticMapBuildResult,
-        localization_snapshot: Optional[LocalizationSnapshot] = None,
+        frame_tree=None,
         ray_history: Optional[RayHistoryProvider] = None,
     ) -> Tuple[ProjectedObservation, ...]:
-        effective_pose = current_pose or (
-            localization_snapshot.current_pose if localization_snapshot is not None else None
-        )
+        effective_pose = current_pose
         if effective_pose is None:
             return ()
-        frame_tree = localization_snapshot.frame_tree if localization_snapshot is not None else None
         observer_body_pose = effective_pose
         if not frame_ids_semantically_equal(effective_pose.frame_id, map_context.frame_id):
             observer_body_pose = transform_pose_to_frame(

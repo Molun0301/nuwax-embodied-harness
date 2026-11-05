@@ -114,6 +114,17 @@ class MemoryService(PlacesMixin, ScenesMixin, InstancesMixin, QueryMixin, Naviga
             future = self._writer.call(function, wait=False)
         return future.result() if wait else future
 
+    def enqueue_observation(self, function, *, keyframe):
+        """观察处理交给已有写线程，调用方不等几何补全或持久化。"""
+        with self._condition:
+            if self._closed:
+                raise GatewayError("记忆服务已关闭", error_code="memory_closed", http_status=503)
+            self._writer.enqueue_observation(function, keyframe=keyframe)
+
+    def flush_observations(self):
+        """关闭感知资源前等待此前的写入任务完成。"""
+        self.write(lambda store: None)
+
     def expect_rename(self, old, new):
         return self._writer.call(lambda store: self._writer.expect_rename(old, new), transaction=False, publish=False)
 

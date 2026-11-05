@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 from concurrent.futures import Future
+from collections import deque
 import logging
 from pathlib import Path
-import queue
 import shutil
 import threading
 
@@ -22,7 +22,9 @@ class LibraryWriter:
         self.last_map_name = object()
         self._publish = publish
         self._changed = changed
-        self._queue = queue.Queue()
+        self._queue = deque()
+        self._condition = threading.Condition()
+        self._pending_observation = None
         self._thread = threading.Thread(target=self._run, name="memory-writer")
         self._thread.start()
 
@@ -30,8 +32,24 @@ class LibraryWriter:
         if threading.current_thread() is self._thread:
             return function(self.store)
         future = Future()
-        self._queue.put((function, future, transaction, publish))
+        with self._condition:
+            self._queue.append((function, future, transaction, publish))
+            self._condition.notify()
         return future.result() if wait else future
+
+    def enqueue_observation(self, function, *, keyframe):
+        """待写观察只留最新项；关键帧不会被非关键帧替换。"""
+        with self._condition:
+            pending = self._pending_observation
+            if pending is not None:
+                if pending[1] and not keyframe:
+                    return
+                self._queue.remove(pending[0])
+            item = (function, Future(), True, True)
+            self._pending_observation = (item, keyframe)
+            # 替换项排到本次入队位置，不能越过已经入队的地图切换。
+            self._queue.append(item)
+            self._condition.notify()
 
     def directory(self, name, *, default=False):
         return self.default_root if default else self.maps_root / name / "memory"
@@ -77,7 +95,12 @@ class LibraryWriter:
 
     def _run(self):
         while True:
-            item = self._queue.get()
+            with self._condition:
+                while not self._queue:
+                    self._condition.wait()
+                item = self._queue.popleft()
+                if self._pending_observation is not None and self._pending_observation[0] is item:
+                    self._pending_observation = None
             if item is None:
                 if self.store is not None:
                     self.store.close()
@@ -111,5 +134,7 @@ class LibraryWriter:
                 LOGGER.exception("记忆写入失败")
 
     def close(self):
-        self._queue.put(None)
+        with self._condition:
+            self._queue.append(None)
+            self._condition.notify()
         self._thread.join()

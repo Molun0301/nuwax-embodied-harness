@@ -207,15 +207,13 @@ class PerceptionVideoRuntime:
                     "stage_status": context.metadata.get("stage_status", {})}))
         with self._condition:
             bursts = [burst for burst in self._bursts if burst.reason in group["reasons"]]
-        if decision.should_process or bursts:
+        if bursts:
             sample = self.complete_sample(sample)
-            if decision.should_process:
-                if self._remember_keyframes:
-                    self._memory_service.remember_current_scene(map_name=sample.map_name,
-                        perception_context=sample.context, observation_pose=sample.pose,
-                        frame_tree=sample.frame_tree, image_bytes=sample.image_bytes,
-                        metadata={"source": "perception_video_runtime", "keyframe_reason": decision.reason})
-                self._selector.mark_processed(timestamp=image.timestamp, current_pose=pose)
+        if decision.should_process:
+            if self._remember_keyframes:
+                self._memory_service.enqueue_observation(
+                    lambda store: self._remember_keyframe(sample, decision.reason), keyframe=True)
+            self._selector.mark_processed(timestamp=image.timestamp, current_pose=pose)
         with self._condition:
             for burst in bursts:
                 if burst in self._bursts and frame not in burst.frames and len(burst.samples) < burst.count:
@@ -225,6 +223,13 @@ class PerceptionVideoRuntime:
             self._last_success = context.scene_summary.headline
             self._last_error = None
             self._condition.notify_all()
+
+    def _remember_keyframe(self, sample, reason):
+        sample = self.complete_sample(sample)
+        return self._memory_service.remember_current_scene(map_name=sample.map_name,
+            perception_context=sample.context, observation_pose=sample.pose,
+            frame_tree=sample.frame_tree, image_bytes=sample.image_bytes,
+            metadata={"source": "perception_video_runtime", "keyframe_reason": reason})
 
     def get_status(self):
         with self._condition:
@@ -257,13 +262,17 @@ class PerceptionVideoRuntime:
 
     def close(self):
         with self._condition:
+            if self._closed:
+                return
             self._closed = True
             self._reasons.clear()
-            self._stop.set()
             self._condition.notify_all()
             thread = self._thread
         if thread is not None:
             thread.join()
+        if self._memory_service is not None:
+            self._memory_service.flush_observations()
+        self._stop.set()
         with self._condition:
             self._samples.clear()
             self._seen_frames.clear()

@@ -164,6 +164,8 @@ class PerceptionVideoRuntime:
                 try:
                     self._process(camera, backend, group)
                 except Exception as error:
+                    if isinstance(error, GatewayError) and error.error_code == "video_ingest_not_ready":
+                        continue
                     failed = True
                     with self._condition:
                         self._failure_count += 1

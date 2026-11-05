@@ -107,6 +107,8 @@ class ScenesMixin:
                 and (pose is None or record.pose.frame_id == pose.frame_id)]
             linked_location = matches[0] if len(matches) == 1 else None
             linked_location_id = linked_location.location_id if linked_location is not None else None
+        linked_tags = ([linked_location.name, *linked_location.aliases, *linked_location.semantic_labels]
+                       if linked_location is not None else [])
         labels = self._collect_scene_visual_labels(context.scene_summary) if context is not None else []
         vision = self._collect_scene_vision_tags(context.scene_summary) if context is not None else []
         captured = self._semantic_builder.build(self.current_grid(), map_name=map_name)
@@ -114,7 +116,7 @@ class ScenesMixin:
         entry = SemanticMemoryEntry(memory_id=build_memory_id('scene'),
             kind=MemoryRecordKind.NOTE if linked_location is not None else MemoryRecordKind.SCENE,
             title=title, summary=summary_override or headline or title,
-            tags=self._normalize_tags([*(tags or []), *labels, *vision]), linked_location_id=linked_location_id,
+            tags=self._normalize_tags([*(tags or []), *linked_tags, *labels, *vision]), linked_location_id=linked_location_id,
             pose=pose, map_name=map_name, observation_id=source.observation.observation_id,
             perception_headline=headline, artifact_ids=list(source.observation.artifact_ids),
             metadata={**(self._build_scene_memory_metadata(context) if context is not None else {}),
@@ -192,8 +194,10 @@ class ScenesMixin:
         if value.linked_location_id:
             location = self._writing_record_map("location").get(value.linked_location_id)
             if location is not None:
-                store.put("location", location.model_copy(update={"memory_id": value.memory_id,
-                    "metadata": {**location.metadata, "artifact_ids": photos}}))
+                previous = self._writing_record_map("memory").get(location.memory_id)
+                if photos or previous is None or not previous.artifact_ids:
+                    store.put("location", location.model_copy(update={"memory_id": value.memory_id,
+                        "metadata": {**location.metadata, "artifact_ids": photos}}))
         self._publish_memory_event("memory.entry_created", "语义记忆已写入。",
             payload={"memory_id": value.memory_id, "title": value.title})
         return value

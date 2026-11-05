@@ -11,10 +11,8 @@ from unittest.mock import patch
 from pydantic import ValidationError
 from contracts.motion_feedback import MotionExecutionFeedback
 from services.navigation.proto_gen import motion_guard_pb2 as pb
-from services.navigation.motion_safety_guard.constants import API_VERSION
 from services.navigation.motion_safety_guard.core import MotionGuardCore
 from services.navigation.motion_safety_guard.go2_actuator import Go2Actuator, Go2Factories
-from services.navigation.motion_safety_guard.peer_auth import PeerCredentials
 from services.navigation.motion_safety_guard.execution_feedback import ExecutionFeedback
 
 
@@ -33,20 +31,22 @@ class Device:
 
     def __init__(self, feedback=None):
         self.feedback = feedback
-        self.commands = []
-        self.zeros = 0
+        self.output = (0., 0., 0.)
 
     def get_motion_execution_feedback(self):
         if isinstance(self.feedback, Exception):
             raise self.feedback
         return self.feedback() if callable(self.feedback) else self.feedback
 
-    def apply_motion(self, request):
-        self.commands.append(request.SerializeToString())
+    def velocity(self, vx, vy, wz):
+        self.output = (vx, vy, wz)
         return False
 
+    def get_motion_command_limits(self):
+        return None
+
     def zero(self):
-        self.zeros += 1
+        self.output = (0., 0., 0.)
 
 
 class MeasuredMotionFeedbackTests(unittest.TestCase):
@@ -61,10 +61,10 @@ class MeasuredMotionFeedbackTests(unittest.TestCase):
         self.device.feedback=lambda:self.sample(linear_x_mps=0.,linear_y_mps=0.,linear_z_mps=0.,
             angular_x_rps=0.,angular_y_rps=0.,angular_z_rps=0.)
         self.core = MotionGuardCore(actuator=self.device, monotonic_ns=lambda:self.clock.mono,
-            execution_feedback=self.stop, lease_id_factory=lambda:123)
-        self.core.initialize_zero_fence()
+            )
+        self.core._feedback = self.stop
+        self.core.initialize_zero()
         self.device.feedback=None
-        self.peer = PeerCredentials(1, 2, 3)
 
     def sample(self, **changes):
         values = dict(source_timestamp_ns=self.clock.unix, received_monotonic_ns=self.clock.mono,
@@ -75,43 +75,33 @@ class MeasuredMotionFeedbackTests(unittest.TestCase):
         values.update(changes)
         return MotionExecutionFeedback(**values)
 
-    def query(self, **changes):
-        request = pb.MotionGuardRequest(api_version=API_VERSION, request_id='query', **changes)
-        request.get_readiness.source = pb.GUARD_SOURCE_NAV
-        return self.core.handle(request, self.peer)
-
-    def mutation(self, operation, ordinal=0, lease_id=0, command=None):
-        request = pb.MotionGuardRequest(api_version=API_VERSION, request_id=f'{operation}-{ordinal}')
-        body = getattr(request, operation)
-        body.envelope.CopyFrom(pb.RequestEnvelope(
-            tuple=pb.LeaseTuple(boot_nonce=self.core.boot_nonce, lease_id=lease_id),
-            source=pb.GUARD_SOURCE_NAV, action=pb.GUARD_ACTION_STOP if command == 'stop' else pb.GUARD_ACTION_TWIST,
-            operation_id=request.request_id,
-            issued_monotonic_ns=self.clock.mono, deadline_monotonic_ns=self.clock.mono + 200_000_000))
-        if command == 'twist':
-            body.twist.CopyFrom(pb.TwistCommand(linear_x_mps=0.8, linear_y_mps=0.7, angular_z_rps=0.6))
-        elif command == 'stop':
-            body.stop.SetInParent()
-        return request
+    def query(self):
+        return self.core.handle(pb.GuardRequest(status=pb.StatusRequest()))
 
     def acquire(self):
-        request = self.mutation('acquire_lease')
-        response = self.core.handle(request, self.peer)
-        self.assertEqual(response.acquire_lease.result.error.code, '')
+        generation = self.core.handle(pb.GuardRequest(begin=pb.BeginRequest())).begin.generation
+        response = self.core.handle(pb.GuardRequest(acquire=pb.AcquireRequest(
+            source=pb.SOURCE_NAV, generation=generation)))
+        self.assertEqual(response.WhichOneof("result"), "acquire")
+        self.lease_id = response.acquire.lease_id
         return response
+
+    def velocity(self):
+        return self.core.handle(pb.GuardRequest(velocity=pb.VelocityRequest(
+            lease_id=self.lease_id, vx_mps=0.8, vy_mps=0.7, wz_rps=0.6)))
 
     def test_command_not_measurement(self):
         self.device.feedback = self.sample()
         self.acquire()
         self.clock.step(10_000_000)
-        response = self.core.handle(self.mutation('submit_motion_command', 1, 123, 'twist'), self.peer)
-        self.assertEqual(response.submit_motion_command.result.ack, pb.ACK_CODE_APPLIED)
-        measured = response.measured_motion_feedback
+        response = self.velocity()
+        self.assertEqual(response.WhichOneof("result"), "velocity")
+        measured = response.measured_motion
         self.assertEqual(list(measured.body_linear_xyz), [0.12, -0.23, 0.34])
         self.assertEqual(list(measured.body_angular_xyz), [-0.45, 0.56, -0.67])
         self.assertLess(measured.source_timestamp_ns, self.clock.unix)
         self.assertEqual(measured.received_monotonic_ns, self.device.feedback.received_monotonic_ns)
-        self.assertEqual(len(self.device.commands), 1)
+        self.assertEqual(self.device.output, (0.8, 0.7, 0.6))
 
     def go2(self, controller='normal'):
         client = lambda: SimpleNamespace(SetTimeout=lambda value: None, Init=lambda: 0)
@@ -146,48 +136,48 @@ class MeasuredMotionFeedbackTests(unittest.TestCase):
         self.observe(actuator, velocity=world, quaternion=q)
         self.core._actuator = actuator
         response = self.query()
-        for actual, expected in zip(response.measured_motion_feedback.body_linear_xyz, body):
+        for actual, expected in zip(response.measured_motion.body_linear_xyz, body):
             self.assertAlmostEqual(actual, expected, places=12)
-        self.assertEqual(list(response.measured_motion_feedback.body_angular_xyz), [0.1, -0.2, 0.3])
-        for actual, expected in zip(response.measured_motion_feedback.orientation_wxyz, q):
+        self.assertEqual(list(response.measured_motion.body_angular_xyz), [0.1, -0.2, 0.3])
+        for actual, expected in zip(response.measured_motion.orientation_wxyz, q):
             self.assertAlmostEqual(actual, expected, places=12)
 
     def test_missing_and_placeholder_zero_not_measured(self):
-        self.assertFalse(self.query().HasField('measured_motion_feedback'))
+        self.assertFalse(self.query().HasField('measured_motion'))
         for missing in ('source_id', 'received_monotonic_ns', 'linear_z_mps', 'angular_x_rps', 'angular_y_rps'):
             self.device.feedback = self.sample(**{missing: None})
-            self.assertFalse(self.query().HasField('measured_motion_feedback'), missing)
+            self.assertFalse(self.query().HasField('measured_motion'), missing)
         for controller in ('mcf', 'unknown'):
             actuator = self.go2(controller)
             self.observe(actuator, velocity=(0.0, 0.0, 0.0), gyro=(0.0, 0.0, 0.0))
             self.core._actuator = actuator
-            self.assertFalse(self.query().HasField('measured_motion_feedback'))
+            self.assertFalse(self.query().HasField('measured_motion'))
         # FASTLIO/里程计的 twist 占位不经过执行器反馈接口，不能冒充本来源。
-        self.core._actuator = SimpleNamespace(twist=SimpleNamespace(
-            linear=SimpleNamespace(x=0.0, y=0.0, z=0.0),
+        self.core._actuator = SimpleNamespace(is_configured=True, get_motion_command_limits=lambda: None,
+            twist=SimpleNamespace(linear=SimpleNamespace(x=0.0, y=0.0, z=0.0),
             angular=SimpleNamespace(x=0.0, y=0.0, z=0.0)))
-        self.assertFalse(self.query().HasField('measured_motion_feedback'))
+        self.assertFalse(self.query().HasField('measured_motion'))
         advanced = self.go2('advanced')
         self.observe(advanced, velocity=(0.0, 0.0, 0.0), gyro=(0.0, 0.0, 0.0))
         self.core._actuator = advanced
-        self.assertTrue(self.query().HasField('measured_motion_feedback'))
+        self.assertTrue(self.query().HasField('measured_motion'))
         self.core._actuator = self.device
         # 完整、已验证来源中的真实零速仍是合法测量，不用数值大小猜来源。
         self.device.feedback = self.sample(linear_x_mps=0.0, linear_y_mps=0.0, linear_z_mps=0.0,
                                            angular_x_rps=0.0, angular_y_rps=0.0, angular_z_rps=0.0)
-        self.assertTrue(self.query().HasField('measured_motion_feedback'))
+        self.assertTrue(self.query().HasField('measured_motion'))
 
     def test_stale_future_repeat_time(self):
         self.device.feedback = self.sample()
-        initial = self.query().measured_motion_feedback
+        initial = self.query().measured_motion
         self.clock.step(100_000_000)
-        self.assertEqual(self.query().measured_motion_feedback, initial)
+        self.assertEqual(self.query().measured_motion, initial)
         self.clock.step(150_000_001)
-        self.assertFalse(self.query().HasField('measured_motion_feedback'))
+        self.assertFalse(self.query().HasField('measured_motion'))
         self.device.feedback = self.sample(source_timestamp_ns=self.clock.unix + 50_000_001)
-        self.assertFalse(self.query().HasField('measured_motion_feedback'))
+        self.assertFalse(self.query().HasField('measured_motion'))
         self.device.feedback = self.sample(received_monotonic_ns=self.clock.mono + 1)
-        self.assertFalse(self.query().HasField('measured_motion_feedback'))
+        self.assertFalse(self.query().HasField('measured_motion'))
         actuator = self.go2()
         self.observe(actuator)
         sample = actuator.get_motion_execution_feedback()
@@ -200,52 +190,43 @@ class MeasuredMotionFeedbackTests(unittest.TestCase):
     def test_encode_provenance_and_deadline(self):
         self.device.feedback = self.sample()
         response = self.query()
-        decoded = pb.MotionGuardResponse.FromString(response.SerializeToString())
-        self.assertEqual(decoded.WhichOneof('outcome'), 'get_readiness')
-        self.assertEqual(decoded.measured_motion_feedback.source_id, self.device.feedback.source_id)
-        self.assertEqual(decoded.measured_motion_feedback.source_timestamp_ns, self.clock.unix)
-        self.assertEqual(decoded.measured_motion_feedback.valid_until_monotonic_ns, self.clock.mono + 250_000_000)
-        descriptor = pb.MotionGuardResponse.DESCRIPTOR.fields_by_name['measured_motion_feedback']
-        self.assertEqual(descriptor.number, 3)
-        self.assertIsNone(descriptor.containing_oneof)
+        decoded = pb.GuardResponse.FromString(response.SerializeToString())
+        self.assertEqual(decoded.WhichOneof('result'), 'status')
+        self.assertEqual(decoded.measured_motion.source_id, self.device.feedback.source_id)
+        self.assertEqual(decoded.measured_motion.source_timestamp_ns, self.clock.unix)
+        self.assertEqual(decoded.measured_motion.valid_until_monotonic_ns, self.clock.mono + 250_000_000)
         self.device.feedback = self.sample(orientation_wxyz=None)
-        self.assertEqual(list(self.query().measured_motion_feedback.orientation_wxyz), [])
+        self.assertEqual(list(self.query().measured_motion.orientation_wxyz), [])
 
     def test_missing_does_not_gate_command(self):
+        self.acquire()
         for value in (None, RuntimeError('读反馈失败'), {'not': 'feedback'}):
             self.device.feedback = value
-            if not self.core.active_lease_id:
-                self.acquire()
-            request = self.mutation('submit_motion_command', len(self.device.commands)+1, 123, 'twist')
-            response = self.core.handle(request, self.peer)
-            self.assertEqual(response.submit_motion_command.result.ack, pb.ACK_CODE_APPLIED)
-            self.assertFalse(response.HasField('measured_motion_feedback'))
-        self.assertEqual(len(self.device.commands), 3)
-        stop = self.core.handle(self.mutation('submit_motion_command', 4, 123, 'stop'), self.peer)
-        self.assertEqual(stop.submit_motion_command.result.ack, pb.ACK_CODE_ZEROED)
-        self.assertEqual(self.device.zeros, 2)
-        self.assertFalse(stop.HasField('measured_motion_feedback'))
+            response = self.velocity()
+            self.assertEqual(response.WhichOneof('result'), 'velocity')
+            self.assertEqual(self.device.output, (0.8, 0.7, 0.6))
+            self.assertFalse(response.HasField('measured_motion'))
+        stopped = self.core.handle(pb.GuardRequest(stop=pb.StopRequest()))
+        self.assertEqual(stopped.WhichOneof('result'), 'stop')
+        self.assertEqual(self.device.output, (0., 0., 0.))
+        self.assertFalse(stopped.HasField('measured_motion'))
 
     def test_error_response_can_carry_independent_measurement(self):
         self.device.feedback = self.sample()
-        request = pb.MotionGuardRequest(api_version=99, request_id='rejected')
-        request.get_readiness.source = pb.GUARD_SOURCE_NAV
-        response = self.core.handle(request, self.peer)
-        self.assertEqual(response.get_readiness.result.error.code, 'UNSUPPORTED_API_VERSION')
-        self.assertTrue(response.HasField('measured_motion_feedback'))
+        response = self.core.handle(pb.GuardRequest(velocity=pb.VelocityRequest(lease_id=0)))
+        self.assertEqual(response.error.code, pb.ERROR_CODE_LEASE_REVOKED)
+        self.assertTrue(response.HasField('measured_motion'))
 
-    def test_dedup_replay_preserves_original_sample(self):
+    def test_returned_measurement_is_immutable_when_device_updates(self):
         self.device.feedback = self.sample()
-        self.acquire()
-        request = self.mutation('submit_motion_command', 1, 123, 'stop')
-        original = self.core.handle(request, self.peer)
+        original = self.query()
         self.clock.step(100_000_000)
         self.device.feedback = self.sample(linear_x_mps=4.0)
-        replay = self.core.handle(request, self.peer)
-        self.assertEqual(replay.measured_motion_feedback, original.measured_motion_feedback)
-        self.assertEqual(len(self.device.commands), 0)
-        self.assertEqual(self.device.zeros, 2)
-        self.assertEqual(self.query().measured_motion_feedback.body_linear_xyz[0], 4.0)
+        latest = self.query()
+        self.assertEqual(original.measured_motion.body_linear_xyz[0], 0.12)
+        self.assertEqual(latest.measured_motion.body_linear_xyz[0], 4.0)
+        self.assertLess(original.measured_motion.source_timestamp_ns,
+                        latest.measured_motion.source_timestamp_ns)
 
     def test_acquisition_mapping_bounds_deadline(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -254,10 +235,10 @@ class MeasuredMotionFeedbackTests(unittest.TestCase):
                              self.clock.unix - 100_000_000, self.clock.mono - 100_000_000))
             self.device.feedback = self.sample()
             with patch.dict(os.environ, {'NUWAX_SOURCE_TIME_FILE': str(path)}):
-                self.assertEqual(self.query().measured_motion_feedback.valid_until_monotonic_ns,
+                self.assertEqual(self.query().measured_motion.valid_until_monotonic_ns,
                                  self.clock.mono + 150_000_000)
                 self.clock.step(150_000_001)
-                self.assertFalse(self.query().HasField('measured_motion_feedback'))
+                self.assertFalse(self.query().HasField('measured_motion'))
 
     def test_invalid_finite_frame_and_orientation(self):
         for value in (math.inf, math.nan):
@@ -268,6 +249,6 @@ class MeasuredMotionFeedbackTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             self.sample(orientation_wxyz=(1.0, 0.0, 0.0))
         self.device.feedback = self.sample(frame_id='odom')
-        self.assertFalse(self.query().HasField('measured_motion_feedback'))
+        self.assertFalse(self.query().HasField('measured_motion'))
         self.device.feedback = self.sample(orientation_wxyz=(0.0, 0.0, 0.0, 0.0))
-        self.assertFalse(self.query().HasField('measured_motion_feedback'))
+        self.assertFalse(self.query().HasField('measured_motion'))

@@ -11,25 +11,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from core import config_registry, config_values
 from gateways.settings import SettingsApplication
-from services.geometry.runtime_input_bridge import RuntimeInputBridge
-import check_configuration_revisions as fixtures
+from scripts import check_configuration_revisions as fixtures
 
 LIVE = config_registry.get_field('NUWAX_NAV_SURFACE_VOXEL_SIZE_M')
 RETIRED = 'NUWAX_GEOMETRY_POINT_CLOUD_MAX_POINTS'
 
 
-class ConfigurationTruthChecks(unittest.TestCase):
-    def test_status_reports_instance_sampling(self):
-        bridge = RuntimeInputBridge(runtime_provider=SimpleNamespace(),
-                                    max_points_before_downsample=17, max_points_after_downsample=5)
-        status = bridge.get_status()
-        self.assertFalse(status['started'])
-        sampling = status['scan_sampling']
-        self.assertEqual((sampling['trigger_points'], sampling['target_points']), (17, 5))
-        self.assertEqual(sampling['value_source'], 'input_bridge_instance')
-        self.assertEqual(sampling['legacy_frame_strategy'], 'stride')
-        self.assertIn('max_offset', sampling['native_measurement_strategy'])
-        self.assertEqual(sampling['scope'], 'per_scan_transport_not_map_voxelization')
 
 
 class SettingsTruthChecks(unittest.TestCase):

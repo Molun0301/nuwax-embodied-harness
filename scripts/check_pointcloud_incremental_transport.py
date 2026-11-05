@@ -133,7 +133,7 @@ class StreamBus:
 class SocketLifecycle(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.bus=StreamBus();self.current=snapshot(total=1024*5)
-        self.runtime=NS(stream_bus=self.bus,get_pointcloud_map_snapshot=lambda:self.current)
+        self.runtime=NS(streams=NS(stream_bus=self.bus,get_pointcloud_map_snapshot=lambda:self.current))
         self.router=Router();cloud.install_pointcloud_stream(self.router,self.runtime)
         self.socket=Socket();self.task=asyncio.create_task(self.router.endpoint(self.socket))
         self.assertEqual(await self.socket.sent.get(),{'type':'pointcloud.ready','version':2})

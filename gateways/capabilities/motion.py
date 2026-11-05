@@ -2,7 +2,7 @@
 import time
 
 from core.capability import Capability
-from drivers.go2.capabilities import build_go2_sport_command_input_schema
+from contracts.go2_sport import build_go2_sport_command_input_schema
 from gateways.capabilities.common import rpc_errors, schema
 from services.navigation.motion_client import MotionSource
 

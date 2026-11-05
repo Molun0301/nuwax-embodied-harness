@@ -1,11 +1,4 @@
-"""参数校验公共助手（P2-4 批0 脚手架）。
-
-从 gateways/runtime.py 下放的纯参数校验语义函数，供 skills 层 handler 与网关共用。
-仅依赖 core.errors.GatewayError（core 为 skills 合法下游，不构成 skills→gateways 反向依赖）。
-
-行为与抛错条件与迁移前的 GatewayRuntime._require_str/_require_float/_float/
-_optional_str/_normalize_query 完全一致。
-"""
+"""组合技能共用的参数处理与查询文本规范化。"""
 
 from __future__ import annotations
 

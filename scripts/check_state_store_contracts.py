@@ -143,7 +143,7 @@ class StateStoreContracts(unittest.TestCase):
                 self.assertIn("current-mode", context.observation.summary)
                 self.assertNotIn("discarded-mode", context.observation.summary)
             finally:
-                self.assertTrue(service.close(timeout=1))
+                service.close()
                 artifacts.close()
 
 

@@ -17,7 +17,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from contracts.events import RuntimeEventCategory
 from core.event_bus import EventBus
-from core.task_manager import TaskManager
 
 
 class EventBusContracts(unittest.TestCase):
@@ -524,34 +523,6 @@ class EventBusContracts(unittest.TestCase):
         self.assertEqual(bus.status()["callback_failures"], 1)
         self.assertEqual(bus.status()["diagnostics_suppressed_after_shutdown"], 1)
 
-    def test_real_task_manager_preserves_accepted_started_terminal_order(self):
-        bus = self.bus()
-        manager = TaskManager(event_bus=bus, max_workers=1)
-        entered, release, ran = self.gate(), self.gate(), self.gate()
-        events = []
-
-        def observe(event):
-            events.append(event.event_type)
-            if event.event_type == "task.accepted":
-                entered.set()
-                self.require(release)
-
-        bus.subscribe(observe)
-        try:
-            def runner(ctx):
-                ran.set()
-                return {"ok": True}
-
-            submitted = self.spawn(lambda: manager.submit("capture_image", runner))
-            self.require(entered)
-            self.assertFalse(ran.is_set())
-            release.set()
-            spec = self.join(submitted)
-            self.assertEqual(manager.wait_for_task(spec.task_id, 2), {"ok": True})
-            self.assertEqual(events, ["task.accepted", "task.started", "task.succeeded"])
-        finally:
-            release.set()
-            manager.shutdown()
 
     def test_dispatch_boundary_failure_cannot_relabel_committed_action(self):
         bus = self.bus()

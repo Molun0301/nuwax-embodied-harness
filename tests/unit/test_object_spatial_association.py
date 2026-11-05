@@ -29,9 +29,9 @@ class Sequence:
     def __init__(self):
         self.service = InstanceAssociationService(text_embedder=None)
         self.instances = {}
-    def add(self, *observations, seconds=0, map_name='house', session='session', asset=None):
+    def add(self, *observations, seconds=0, map_name='house', asset=None):
         self.instances, outcomes = self.service.associate(observations,
-            existing_instances=self.instances, map_name=map_name, localization_session_id=session,
+            existing_instances=self.instances, map_name=map_name,
             map_asset_id=asset, now=NOW+timedelta(seconds=seconds), admission="explicit")
         return [outcome.instance for outcome in outcomes]
 
@@ -42,7 +42,7 @@ def test_umbrella_mask_moves_across_images_and_next_day_reuses_identity():
         segmentation_score=.9, track='old'))[0]
     second = seq.add(observation(x=2.03,z=.59,label='umbrella',size=(.1,.4,1.1),
         centroid_uv=[1000,700],segmentation_score=.9,camera='rear',track='new',source='next'),
-        seconds=86400,session='restarted')[0]
+        seconds=86400)[0]
     assert len(seq.instances) == 1
     assert second.instance_id == first.instance_id
     assert second.anchor_id == first.anchor_id
@@ -79,14 +79,14 @@ def test_track_movement_updates_position_not_lifetime_mean_and_scope_blocks_reus
     assert moved.instance_id == first.instance_id
     assert moved.pose.position.x == 3
     assert moved.dynamic_state == InstanceDynamicState.DYNAMIC
-    other = seq.add(observation(x=8,track='t',source='reuse'),seconds=2,session='new')[0]
+    other = seq.add(observation(x=8,track='t',source='reuse'),seconds=2,map_name='other_house')[0]
     assert other.instance_id != moved.instance_id
 
 
 def test_map_frame_and_assigned_asset_isolation_but_runtime_session_restart_allowed():
     seq = Sequence()
     first = seq.add(observation(),asset='asset-a')[0]
-    same = seq.add(observation(source='next'),seconds=86400,session='restart',asset='asset-a')[0]
+    same = seq.add(observation(source='next'),seconds=86400,asset='asset-a')[0]
     assert same.instance_id == first.instance_id
     replaced = seq.add(observation(source='replacement'),seconds=86401,asset='asset-b')[0]
     assert replaced.instance_id != first.instance_id

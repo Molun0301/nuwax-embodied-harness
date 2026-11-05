@@ -38,7 +38,7 @@ class Platform:
     def stop(self) -> None:
         operations = [self.tasks.shutdown, self.map_cleanup.close, self.streams.stop, self.input_bridge.stop,
                       self.geometry_state.stop, self.perception.video_runtime.close,
-                      self.perception.close, self.follow.close, self.scene_mapping.close,
+                      self.perception.close, self.follow.close, self.scene_mapping.close, self.manipulation.close,
                       self.memory.close, self.observation.close, self.artifacts.close,
                       self.motion.close, self.geometry.close, self.places.close, self.buildings.close,
                       self.audio.stop, self.robot_state.stop,
@@ -75,7 +75,7 @@ class Platform:
 
 def build_platform(config) -> Platform:
     from contracts.artifacts import ArtifactRetentionPolicy
-    from gateways.capabilities import building, cleanup, exploration, follow, maps, memory, motion, navigation, perception as perception_caps, skills as skills_caps, system
+    from gateways.capabilities import building, cleanup, exploration, follow, maps, memory, manipulation, motion, navigation, perception as perception_caps, skills as skills_caps, system
     from gateways.capabilities.exploration import ExplorationControl
     from gateways.person_follow import GatewayPersonFollowBridge
     from gateways.streams import Streams, VideoSource
@@ -103,7 +103,8 @@ def build_platform(config) -> Platform:
     platform.capabilities = CapabilityTable()
     for cap in (system.CAPABILITIES + maps.CAPABILITIES + motion.CAPABILITIES + navigation.CAPABILITIES
                 + exploration.CAPABILITIES + building.CAPABILITIES + cleanup.CAPABILITIES
-                + memory.CAPABILITIES + perception_caps.CAPABILITIES + skills_caps.CAPABILITIES + follow.CAPABILITIES):
+                + memory.CAPABILITIES + perception_caps.CAPABILITIES + skills_caps.CAPABILITIES + follow.CAPABILITIES
+                + manipulation.CAPABILITIES):
         platform.capabilities.register(cap)
     platform.tasks = TaskRunner(platform)
     home = Path(os.environ.get("NUWAX_INSTALL_HOME", config.base_dir))
@@ -126,7 +127,7 @@ def build_platform(config) -> Platform:
     artifacts = ArtifactService(store, retention_policy=ArtifactRetentionPolicy(
         retention_days=config.runtime_data.artifact_retention_days, max_count=config.runtime_data.artifact_max_count,
         max_total_bytes=config.runtime_data.artifact_max_total_bytes, cleanup_batch_size=config.runtime_data.artifact_cleanup_batch_size))
-    has_geometry_input = any(isinstance(providers, protocol) for protocol in (
+    has_geometry_input = config.geometry.enabled and any(isinstance(providers, protocol) for protocol in (
         StreamingSensorSampleProvider, StreamingLocalizationProvider, StreamingPointCloudProvider))
     observation = ObservationService(provider_owner=platform.robot, artifact_service=artifacts,
                                     state_store=state_store, event_bus=platform.events,
@@ -165,7 +166,8 @@ def build_platform(config) -> Platform:
                                             event_bus=platform.events, stream_bus=stream_bus)
     platform.artifacts = artifacts
     platform.audio = AudioService(config=config, robot=platform.robot, event_bus=platform.events)
-    platform.manipulation = None
+    from services.manipulation.service import ManipulationService
+    platform.manipulation = ManipulationService(config.manipulation)
     runtime_config = asdict(config.perception.stream_runtime)
     platform.perception.video_runtime = PerceptionVideoRuntime(perception_service=platform.perception,
         state_store=state_store, geometry_state=platform.geometry_state if has_geometry_input else None,

@@ -546,7 +546,30 @@ class QueryMixin:
             selected.append(candidate)
             if len(selected) >= limit:
                 break
-        return MemoryQueryResult(query=query, similarity_threshold=similarity_threshold, matches=[self._build_query_match(query, value, current_pose, grounding_plan=grounding_plan, expected_map_name=payload_filter.map_name if payload_filter is not None else None, include_non_direct_navigation_candidate=include_non_direct_navigation_candidates, source_snapshot=snapshot) for value in selected], metadata={'library_name': snapshot.name, 'candidate_count': len(scored), 'returned_candidate_count': len(selected)})
+        return MemoryQueryResult(query=query, similarity_threshold=similarity_threshold, matches=[self._build_query_match(query, value, current_pose, grounding_plan=grounding_plan, expected_map_name=payload_filter.map_name if payload_filter is not None else None, include_non_direct_navigation_candidate=include_non_direct_navigation_candidates, source_snapshot=snapshot) for value in selected], metadata=self._query_metadata(query, query_scope, limit, snapshot.name, vectors, len(scored), len(selected), payload_filter))
+
+    def _query_metadata(self, query, scope, limit, library, vectors, candidate_count, returned_count, filters):
+        """保留实际检索范围和模型观测信息，不恢复退役索引身份。"""
+        from services.model_providers import (resolve_text_embedding_provider_spec,
+            resolve_vision_language_provider_spec, resolve_grounding_provider_spec)
+        text, image = self._embeddings.text, self._embeddings.image
+        text_provider = resolve_text_embedding_provider_spec(self._embedding_model).to_metadata()
+        image_provider = resolve_vision_language_provider_spec(self._image_embedding_model).to_metadata()
+        return {"library_name": library, "query_text_preview": self._preview_text(query),
+            "query_scope": scope, "match_limit": max(1, int(limit)),
+            "candidate_count": candidate_count, "returned_candidate_count": returned_count,
+            "query_embedding_errors": {},
+            "fallback_used": not vectors and bool(text_provider.get("fallback_used")),
+            "fallback_reason": str(text_provider.get("fallback_reason") or "") if not vectors else "",
+            "retrieval_mode": "text_recall_then_filter_then_multimodal_rerank" if vectors else "lexical_only",
+            "text_embedding_model": text.model_name if text is not None else "unavailable",
+            "text_embedding_dimension": text.dimension if text is not None else 0,
+            "text_embedding_provider": text_provider,
+            "image_embedding_model": image.model_name if image is not None else "disabled",
+            "image_embedding_dimension": image.dimension if image is not None else 0,
+            "image_embedding_provider": image_provider,
+            "grounding_provider": resolve_grounding_provider_spec().to_metadata(),
+            "filters": filters.model_dump(mode="json") if filters is not None else {}}
 
     def _filter_record(self, record, point, value):
         if value is None:

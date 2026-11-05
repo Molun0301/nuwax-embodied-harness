@@ -18,7 +18,6 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fastapi import Request
-from services.geometry import geometry_runtime_provider as geometry
 from services.scene_decision.backends import SceneDecisionError
 from services.scene_decision.local_server import create_app
 
@@ -193,49 +192,6 @@ class SceneExecutorChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controller.closed, 2)
 
 
-class TerminalNameChecks(unittest.TestCase):
-    def terminal(self, disposition):
-        return SimpleNamespace(disposition=disposition, correction_revision=37,
-                               request=SimpleNamespace(body_key='assigned_cloud_v2'),
-                               to_dict=lambda: {'assigned_cloud_v2': {'detail': 'offline detail'},
-                                                'preserved': 'unchanged'})
-
-    def test_all_actual_enum_names_have_unchanged_payload(self):
-        prefix = 'RELOCALIZE_DISPOSITION_'
-        entries = geometry.pb2.RelocalizeDisposition.items()
-        self.assertTrue(entries)
-        for name, number in entries:
-            with self.subTest(name=name):
-                self.assertTrue(name.startswith(prefix))
-                result = geometry._assigned_terminal_payload(self.terminal(number))
-                self.assertEqual(result, {
-                    'assigned_cloud_v2': {'detail': 'offline detail'},
-                    'preserved': 'unchanged',
-                    'success': number in geometry._RELOCALIZE_SUCCESS_DISPOSITIONS,
-                    'disposition': number,
-                    'disposition_name': name[len(prefix):].lower(),
-                    'correction_revision': 37,
-                    'detail': 'offline detail',
-                })
-
-    def test_prefix_removed_exactly_once_only_at_start(self):
-        cases = (
-            ('RELOCALIZE_DISPOSITION_APPLIED', 'applied'),
-            ('APPLIED', 'applied'),
-            ('XRELOCALIZE_DISPOSITION_APPLIED', 'xrelocalize_disposition_applied'),
-            ('RELOCALIZE_DISPOSITION_RELOCALIZE_DISPOSITION_APPLIED', 'relocalize_disposition_applied'),
-            ('RELOCALIZE_DISPOSITION_', ''),
-            ('relocalize_disposition_APPLIED', 'relocalize_disposition_applied'),
-            ('', ''),
-        )
-        for name, expected in cases:
-            with self.subTest(name=name), patch.object(geometry.pb2.RelocalizeDisposition, 'Name', return_value=name):
-                result = geometry._assigned_terminal_payload(self.terminal(1))
-                self.assertEqual(result['disposition_name'], expected)
-
-    def test_unknown_enum_still_rejected(self):
-        with self.assertRaises(ValueError):
-            geometry._assigned_terminal_payload(self.terminal(999999))
 
 
 if __name__ == '__main__':

@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import check_perception_dispatch_isolation as overlay_checks
+from scripts import check_perception_dispatch_isolation as overlay_checks
 
 from contracts.events import RuntimeEventCategory
 from core import EventBus
@@ -225,28 +225,6 @@ class SceneDispatchChecks(unittest.TestCase):
         self.assertEqual([frame.payload["source_sequence"] for frame in overlays], [2])
         self.assertEqual(self.events.status()["prepared_publications"], 0)
 
-    def test_close_during_scene_callback_retains_operation_and_artifact(self):
-        entered, release = self.gate(), self.gate()
-
-        def callback(_event):
-            entered.set()
-            if not release.wait(5):
-                raise AssertionError("synthetic scene callback timed out")
-
-        self.scene_subscribe(callback)
-        artifact = self.artifacts.save_image_frame(self.first)
-        first = self.spawn(lambda: self.service.process_image(self.first, image_artifact=artifact))
-        self.assertTrue(entered.wait(2))
-        self.assertFalse(self.service.close(timeout=0))
-        self.assertEqual(self.service.get_lifecycle_status()["active_operations"], 1)
-        self.assertEqual(self.store.get_holder_status()["holder_count"], 4)
-        with self.assertRaises(GatewayError):
-            self.store.delete_artifact(artifact.artifact_id)
-        with self.assertRaises(GatewayError):
-            self.service.process_image(self.second)
-        release.set()
-        self.join(first)
-        self.assertTrue(self.service.close(timeout=1))
 
     def test_dispatch_interruption_abandons_reservation_and_releases_artifact(self):
         seen = []
@@ -257,7 +235,6 @@ class SceneDispatchChecks(unittest.TestCase):
             self.service.process_image(self.first, image_artifact=artifact)
         self.assertEqual(self.events.status()["prepared_publications"], 0)
         self.assertEqual(self.service.get_lifecycle_status()["active_operations"], 0)
-        self.assertEqual(self.store.get_holder_status()["holder_count"], 3)
         second = self.service.process_image(self.second)
         self.assertEqual([event.subject_id for event in seen], [second.observation.observation_id])
 

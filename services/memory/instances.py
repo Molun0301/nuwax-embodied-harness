@@ -223,10 +223,16 @@ class InstancesMixin:
                 map_name=store.name, occupancy_grid=occupancy_grid, now=now or utc_now(), admission=admission)
             updated, merges = self._association.consolidate(updated,
                 candidate_ids={outcome.instance.instance_id for outcome in outcomes if outcome.instance is not None})
+        for identifier, record in updated.items():
+            metadata = {**record.metadata, "map_name": store.name}
+            metadata.update(self._evaluate_navigation_metadata(metadata,
+                backend_name=str(metadata.get("backend") or metadata.get("backend_type")
+                    or "memory_service.semantic_instance"), map_name=store.name))
+            updated[identifier] = record.model_copy(update={"metadata": metadata}, deep=False)
         aliases = {old: merge.survivor_id for merge in merges for old in merge.merged_ids}
+        outcomes = tuple(AssociationOutcome(updated[aliases.get(item.instance.instance_id, item.instance.instance_id)]
+            if item.instance is not None else None, item.created, item.matched_score) for item in outcomes)
         if aliases:
-            outcomes = tuple(AssociationOutcome(updated[aliases.get(item.instance.instance_id, item.instance.instance_id)]
-                if item.instance is not None else None, item.created, item.matched_score) for item in outcomes)
             for event in store.records("observation"):
                 identifiers = list(dict.fromkeys(aliases.get(identity, identity) for identity in event.linked_instance_ids))
                 if identifiers != event.linked_instance_ids:

@@ -1,50 +1,29 @@
-#!/usr/bin/env python3
-"""Offline source-time preservation checks; no runtime or robot is started."""
-from datetime import datetime, timezone
+"""当前客户端保留位姿和各静态/动态边的精确原始纳秒时间。"""
 from pathlib import Path
 import sys
-from types import SimpleNamespace
 import unittest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from services.geometry.geometry_runtime_provider import _build_frame_tree, _build_pose, pb2
-
-
-def edge(timestamp_ns, parent='odom', child='base_link'):
-    return SimpleNamespace(parent_frame=parent, child_frame=child, timestamp_ns=timestamp_ns,
-                           translation=SimpleNamespace(x=1.0, y=2.0, z=3.0),
-                           rotation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0))
-
+from types import SimpleNamespace
+from datetime import datetime,timezone
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+from services.geometry.client import GeometryClient,_pose
+from services.geometry.proto_gen import geometry_runtime_pb2 as pb
+from services.memory.semantic_map.inputs import algorithm_pose
 
 class TransformSourceTimeChecks(unittest.TestCase):
-    def test_source_timestamp_matches_pose_without_float_rounding(self):
-        ns = 1791450000123456789
-        source = pb2.Transform(parent_frame='odom', child_frame='base_link', timestamp_ns=ns,
-                               translation=pb2.Vec3(x=1, y=2, z=3), rotation=pb2.Quat(w=1))
-        transform = _build_frame_tree([source]).transforms[0]
-        pose = _build_pose(SimpleNamespace(frame_id='odom', timestamp_ns=ns,
-                                          position=source.translation, orientation=source.rotation))
-        self.assertEqual(transform.timestamp, pose.timestamp)
-        self.assertEqual(transform.timestamp, datetime(2026, 10, 8, 9, 0, 0, 123456, tzinfo=timezone.utc))
-        self.assertEqual((transform.translation.x, transform.translation.y, transform.translation.z), (1, 2, 3))
-        self.assertEqual(transform.rotation.w, 1)
+    def test_pose_timestamp_keeps_nanoseconds_and_algorithm_uses_source_time(self):
+        ns=1791450000123456789
+        pose=_pose(pb.Pose(frame_id="odom",timestamp_ns=ns,position=pb.Vec3(x=1,y=2,z=3),orientation=pb.Quat(w=1)))
+        self.assertEqual(pose.timestamp_ns,ns)
+        self.assertEqual(algorithm_pose(pose).timestamp,datetime(2026,10,8,9,0,0,123456,tzinfo=timezone.utc))
+    def test_each_transform_retains_its_own_timestamp_and_topology(self):
+        client=GeometryClient("127.0.0.1:1")
+        try:
+            client._stub=SimpleNamespace(GetFrameTree=lambda request,timeout:pb.FrameTree(transforms=[
+                pb.Transform(parent_frame="map",child_frame="base_link",timestamp_ns=1791450000123456789,rotation=pb.Quat(w=1)),
+                pb.Transform(parent_frame="base_link",child_frame="camera",timestamp_ns=0,rotation=pb.Quat(w=1))]))
+            tree=client.get_frame_tree(timeout_sec=1)
+            self.assertEqual([(edge.parent_frame,edge.child_frame,edge.timestamp_ns) for edge in tree],
+                [("map","base_link",1791450000123456789),("base_link","camera",0)])
+        finally:client.close()
 
-    def test_zero_and_missing_are_unknown_epoch_not_processing_time(self):
-        source = edge(0)
-        self.assertEqual(_build_frame_tree([source]).transforms[0].timestamp,
-                         datetime(1970, 1, 1, tzinfo=timezone.utc))
-        del source.timestamp_ns
-        self.assertEqual(_build_frame_tree([source]).transforms[0].timestamp,
-                         datetime(1970, 1, 1, tzinfo=timezone.utc))
-
-    def test_each_edge_keeps_its_own_time_and_tree_topology(self):
-        tree = _build_frame_tree([edge(1000000001, 'map', 'odom'), edge(2999999999)])
-        self.assertEqual(tree.root_frame_id, 'map')
-        self.assertEqual([x.timestamp for x in tree.transforms], [
-            datetime(1970, 1, 1, 0, 0, 1, tzinfo=timezone.utc),
-            datetime(1970, 1, 1, 0, 0, 2, 999999, tzinfo=timezone.utc)])
-        self.assertIsNone(_build_frame_tree([]))
-
-
-if __name__ == '__main__':
-    unittest.main(verbosity=2)
+if __name__=="__main__":unittest.main(verbosity=2)

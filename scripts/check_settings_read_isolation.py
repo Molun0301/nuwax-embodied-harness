@@ -48,7 +48,7 @@ class ReadIsolationChecks(unittest.TestCase):
         def consume(candidate):
             self.calls.append((candidate.confidence_threshold, candidate.iou_threshold, candidate.max_detections))
             self.apply_consumer(candidate)
-        self.app = SettingsApplication(SimpleNamespace(config=config(), perception_service=SimpleNamespace(update_detector_thresholds=consume)))
+        self.app = SettingsApplication(SimpleNamespace(config=config(), perception=SimpleNamespace(update_detector_thresholds=consume)))
         self.addCleanup(self.app.close)
         self.stack.enter_context(patch('gateways.settings_restart.restart_status', return_value={}))
         self.gates, self.workers = [], []

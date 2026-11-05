@@ -221,10 +221,6 @@ class PerceptionService:
         # 调用方的感知操作在分发结束后退出，关闭会等待该操作完成。
         if overlay_publication is not None:
             self._stream_bus.dispatch_prepared(overlay_publication)
-        with self._context_condition:
-            self._full_inputs[context.camera_id] = (context.observation.observation_id, image_frame,
-                camera_info, cached_geometry_inputs[2] if cached_geometry_inputs else None,
-                cached_geometry_inputs[1] if cached_geometry_inputs else None)
         return context
 
     def get_full_observation_input(self, context):
@@ -436,7 +432,7 @@ class PerceptionService:
         )
         self._publish_context(
             context, image_frame=image_frame, source=source_name or detector_spec.name,
-            kind="latest_perception", full=True,
+            kind="latest_perception", full=True, geometry_inputs=cached_geometry_inputs,
         )
         scene_publication = None
         if self._event_bus is not None:
@@ -1017,7 +1013,7 @@ class PerceptionService:
         return tuple(items)
 
 
-    def _publish_context(self, context, *, image_frame, source, kind, full):
+    def _publish_context(self, context, *, image_frame, source, kind, full, geometry_inputs=None):
         with self._context_condition:
             self._ensure_open()
             latest_time = self._latest_frame_timestamp_by_camera.get(context.camera_id)
@@ -1033,6 +1029,9 @@ class PerceptionService:
                 self._latest_frame_timestamp_by_camera[context.camera_id] = image_frame.timestamp
             if full:
                 self._latest_full_by_camera[context.camera_id] = context
+                self._full_inputs[context.camera_id] = (context.observation.observation_id, image_frame,
+                    context.camera_info, geometry_inputs[2] if geometry_inputs else None,
+                    geometry_inputs[1] if geometry_inputs else None)
 
     def _ensure_open(self):
         if self._closing:

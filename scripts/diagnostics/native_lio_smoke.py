@@ -24,11 +24,8 @@ if str(ROOT) not in sys.path:
 
 from contracts.sensors import CanonicalImuSample, CanonicalLidarFrame
 from drivers.customrobot.providers import CustomRobotProviderBundle
-from services.geometry.geometry_runtime_client import GeometryRuntimeSubprocess
-from services.geometry.geometry_runtime_provider import GeometryRuntimeProvider
-from services.geometry.proto_gen import geometry_runtime_pb2 as pb2
-from services.geometry.proto_gen import geometry_runtime_pb2_grpc as pb2_grpc
-from services.geometry.runtime_input_bridge import RuntimeInputBridge
+from services.geometry.client import GeometryClient
+from services.geometry.input_bridge import InputBridge
 
 
 def supervisor_command(names, home):
@@ -120,122 +117,52 @@ def _stop_process_session(process, term_timeout=20, kill_timeout=5):
 
 
 class GatewayMappingSession:
-    """通过真实 HTTP/MCP 管理建图，传感器复用网关实际装配的提供器。"""
-
-    def __init__(self, working, runtime_binary, port, ready):
+    """通过当前MCP接口建图，生命周期仍由真实装配根与监督者拥有。"""
+    def __init__(self,working,runtime_binary,port,ready):
         import httpx
         import uvicorn
         from core.settings import load_config
-        from drivers.customrobot import create_customrobot_assembly
+        from gateways.platform import build_platform
         from gateways.app import create_gateway_app
-        from gateways.runtime import GatewayRuntime
-
-        config = load_config()
-        config.robot.active_robot = "customrobot"
-        config.geometry.enabled = True
-        config.geometry.mapping.profile_enabled = True
-        config.geometry.runtime_binary = str(runtime_binary)
-        config.geometry.runtime_port = port
-        config.geometry.runtime_ready_file = str(ready)
-        config.geometry.frames.base_frame = "synthetic_body"
-        config.geometry.frames.lidar_frame = "synthetic_lidar"
-        config.geometry.frames.imu_frame = "synthetic_lidar"
-        config.geometry.frames.map_frame = "map"
-        config.geometry.frames.odom_frame = "odom"
-        config.runtime_data.map_catalog_root = str(working / "maps")
-        config.runtime_data.memory_db_path = str(working / "memory.db")
-        config.runtime_data.memory_embedding_model = "lexical-only"
-        config.runtime_data.memory_embedding_dimension = 128
-        config.runtime_data.memory_image_embedding_model = "disabled"
-        config.gateway.artifact_dir = str(working / "artifacts")
-        config.perception.yolo_world.enabled = False
-        config.perception.openai_vision.enabled = False
-        config.perception.segmentation.enabled = False
-        config.perception.stream_runtime.enabled = False
-        config.perception.stream_runtime.auto_start = False
-        self.listener = socket.socket()
-        self.listener.bind(("127.0.0.1", 0))
-        self.listener.listen(128)
-        config.gateway.public_base_url = "http://127.0.0.1:%d" % self.listener.getsockname()[1]
-        self.robot = create_customrobot_assembly(config)
-        self.runtime = GatewayRuntime(config=config, robot=self.robot)
-        app = create_gateway_app(self.runtime, config)
-        self.server = uvicorn.Server(uvicorn.Config(app, log_level="error", access_log=False))
-        self.thread = threading.Thread(target=lambda: self.server.run(sockets=[self.listener]), name="native-mcp-gateway")
-        self.client = httpx.Client(base_url=config.gateway.public_base_url, timeout=20, trust_env=False)
-        self.calls = []
-        self.collections = {}
-
+        config=load_config();config.base_dir=working
+        config.robot.active_robot="customrobot"
+        config.geometry.external.binary_path=str(runtime_binary);config.geometry.external.port=port
+        config.runtime_data.map_catalog_root=str(working/"maps")
+        config.runtime_data.memory_embedding_model="lexical-only";config.runtime_data.memory_image_embedding_model="disabled"
+        config.gateway.artifact_dir=str(working/"artifacts")
+        config.perception.yolo_world.enabled=False;config.perception.openai_vision.enabled=False;config.perception.segmentation.enabled=False
+        self.listener=socket.socket();self.listener.bind(("127.0.0.1",0));self.listener.listen(128)
+        config.gateway.public_base_url="http://127.0.0.1:%d"%self.listener.getsockname()[1]
+        self.platform=build_platform(config);self.robot=self.platform.robot
+        self.server=uvicorn.Server(uvicorn.Config(create_gateway_app(self.platform,config),log_level="warning",lifespan="on"))
+        self.thread=threading.Thread(target=lambda:self.server.run(sockets=[self.listener]),name="原生诊断网关")
+        self.client=httpx.Client(base_url=config.gateway.public_base_url,timeout=30);self.calls=[]
     def start(self):
-        self.thread.start()
-        deadline = time.monotonic() + 15
+        self.thread.start();deadline=time.monotonic()+15
         while not self.server.started:
-            if not self.thread.is_alive() or time.monotonic() >= deadline:
-                raise RuntimeError("MCP建图网关启动失败")
+            if not self.thread.is_alive() or time.monotonic()>=deadline:raise RuntimeError("MCP建图网关启动失败")
             time.sleep(.03)
-        self.rpc("initialize", {})
-        catalog = self.rpc("tools/list", {})
-        self.collections = {
-            function: tool["name"] for tool in catalog["tools"]
-            for function in tool.get("inputSchema", {}).get("properties", {}).get("function", {}).get("enum", [])
-        }
-
-    def rpc(self, method, params):
-        response = self.client.post("/mcp", json={"jsonrpc": "2.0", "id": len(self.calls) + 1,
-            "method": method, "params": params})
-        response.raise_for_status()
-        payload = response.json()
-        if "error" in payload or payload.get("result", {}).get("isError"):
-            raise RuntimeError(json.dumps(payload, ensure_ascii=False))
-        self.calls.append({"method": method, "function": params.get("arguments", {}).get("function"), "passed": True})
+        self.rpc("initialize",{});self.rpc("tools/list",{})
+    def rpc(self,method,params):
+        response=self.client.post("/mcp",json={"jsonrpc":"2.0","id":len(self.calls)+1,"method":method,"params":params})
+        response.raise_for_status();payload=response.json()
+        if "error" in payload or payload.get("result",{}).get("isError"):raise RuntimeError(json.dumps(payload,ensure_ascii=False))
+        self.calls.append({"method":method,"function":params.get("name"),"passed":True})
         return payload["result"]
-
-    def call(self, name, arguments):
-        result = self.rpc("tools/call", {"name": self.collections[name],
-            "arguments": {"function": name, "parameters": arguments}})
-        content = result["structuredContent"]
-        return content.get("result", content)
-
-    def activate(self, map_name):
-        result = self.call("activate_map", {"map_name": map_name})
-        task_id = result.get("task_id") or result.get("task", {}).get("task_id")
-        assert task_id, "activate_map未返回异步任务标识：%s" % result
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline:
-            snapshot = self.call("get_task_status", {"task_id": task_id})
-            state = snapshot.get("status", {}).get("state")
-            if state == "succeeded":
-                return snapshot
-            if state in {"failed", "cancelled", "timed_out"}:
-                raise RuntimeError(json.dumps(snapshot, ensure_ascii=False))
-            time.sleep(.05)
-        raise RuntimeError("MCP地图激活任务超时：%s" % snapshot)
-
+    def call(self,name,arguments):return self.rpc("tools/call",{"name":name,"arguments":arguments})["structuredContent"]
     def map_snapshot(self):
-        # 普通MCP返回工作区摘要，地图完整帧通过现行HTTP事件流读取。
-        with self.client.stream("GET", "/streams/sse", params={"topics": "map.frame", "max_frames": 1}) as response:
-            response.raise_for_status()
-            for line in response.iter_lines():
-                if line.startswith("data: "):
-                    frame = json.loads(line[6:])
-                    if frame.get("topic") == "map.frame":
-                        self.calls.append({"method": "GET", "function": "/streams/sse?topics=map.frame", "passed": True})
-                        return frame["payload"]
-        raise RuntimeError("网关地图事件流没有输出建图帧")
-
+        update=self.platform.geometry_state.latest_map()
+        assert update is not None,"原生地图流没有输出"
+        grid=update.grid
+        return {"map_name":grid.map_name,"grid":{"width":grid.width,"height":grid.height,"data":list(grid.data)},"source_timestamp_ns":grid.timestamp_ns}
     def close(self):
-        self.server.should_exit = True
+        self.server.should_exit=True
         if self.thread.ident is not None:
             self.thread.join(timeout=20)
-            if self.thread.is_alive():
-                raise RuntimeError("MCP建图网关未正常退出")
-        self.client.close()
-        self.listener.close()
-        assert not self.runtime.motion_guard.has_connected, "纯建图意外建立运动连接"
-        assert not self.runtime._started
-        assert not self.runtime.event_bus._consumer_thread.is_alive()
-        assert not self.runtime.stream_bus._consumer_thread.is_alive()
-        assert self.runtime._log_stream_handler not in logging.getLogger().handlers
+            if self.thread.is_alive():raise RuntimeError("MCP建图网关未正常退出")
+        self.client.close();self.listener.close()
+
+
 
 
 def closed_motion_state(seconds):
@@ -307,8 +234,8 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
         "NUWAX_LCM_BACKEND": "real-lcm",
         "NUWAX_REAL_LCM_REQUIRED": "true",
         "NUWAX_LCM_URL": "udpm://239.255.76.67:%d?ttl=0" % (20000 + port % 20000),
-        "NUWAX_GEOMETRY_SEQUENCE_STATE_PATH": str(working / "sequence.json"),
-        "NUWAX_GEOMETRY_EXPLORATION_RECONCILIATION_JOURNAL_PATH": str(working / "exploration.json"),
+        "NUWAX_INSTALL_HOME": str(working / "supervision"),
+        "NUWAX_MAP_CATALOG_ROOT":str(working/"maps"),
         "NUWAX_CLOUDMAP_SHM_PATH": str(working / "cloud.shm"),
         "NUWAX_OCCUPANCY_SHM_PATH": str(working / "occupancy.shm"),
         "NUWAX_VIDEO_SHM_PATH": str(working / "video.shm"),
@@ -329,30 +256,22 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
             assert process.poll() is None, "真实原生进程启动失败"
             assert time.monotonic() < deadline, "真实原生进程启动超时"
             time.sleep(.03)
-        channel = grpc.insecure_channel("127.0.0.1:%d" % port)
-        stub = pb2_grpc.GeometryRuntimeStub(channel)
-        assert stub.HealthCheck(pb2.HealthCheckRequest(), timeout=2).healthy
-        assert not stub.GetMappingReadiness(pb2.Empty(), timeout=2).ready
+        remote=GeometryClient("127.0.0.1:%d"%port)
+        assert remote.get_state(timeout_sec=2).pose is None
         map_name = "真实算法合成输入"
         if gateway_mode:
             gateway = GatewayMappingSession(working, runtime_binary, port, ready)
             gateway.start()
             sensors = gateway.robot.providers
-            gateway.call("create_map", {"map_name": map_name})
-            gateway.activate(map_name)
             start = gateway.call("start_mapping", {"map_name": map_name})
-            assert start.get("mapping_active"), start
-            bridge = gateway.runtime._input_bridge
+            assert start["phase"]=="mapping",start
+            bridge = gateway.platform.input_bridge
             assert bridge is not None, "按需建图启动后未接入标准传感器流"
         else:
-            attachment = GeometryRuntimeSubprocess(port=port)
-            assert attachment.start()
-            remote = GeometryRuntimeProvider(attachment)
-            assert remote.connect()
             sensors.start()
-            bridge = RuntimeInputBridge(runtime_provider=remote, point_cloud_provider=sensors)
-            assert bridge.start()
-            stub.StartMapping(pb2.StartMappingRequest(session_id="offline-real", map_name=map_name), timeout=3)
+            remote.start_mapping(map_name,timeout_sec=3)
+            bridge=InputBridge(client=remote,info=remote.get_state(timeout_sec=2).info,sensor_sample_provider=sensors)
+            bridge.start()
         values = np.linspace(-4, 4, 41) if motion_loop else np.linspace(-3, 3, 20)
         wall = 4.0 if motion_loop else 3.0
         heights = np.linspace(-1, 2, 16 if motion_loop else 10)
@@ -408,12 +327,12 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
                 transform_provenance="原始合成传感器坐标", **common))
             publish_latencies.append((time.monotonic() - publish_started) * 1000)
             assert process.poll() is None, "真实原生处理过程退出"
-            observed_pose = stub.GetCurrentPose(pb2.PoseRequest(), timeout=2)
-            if observed_pose.timestamp_ns >= first_stamp:
-                pose_samples.append([observed_pose.position.x, observed_pose.position.y, observed_pose.position.z])
+            observed_pose = remote.get_state(timeout_sec=2).pose
+            if observed_pose is not None and observed_pose.timestamp_ns >= first_stamp:
+                pose_samples.append([observed_pose.x, observed_pose.y, observed_pose.z])
                 pose_timestamps.append(observed_pose.timestamp_ns)
-                pose_quaternions.append([observed_pose.orientation.x, observed_pose.orientation.y,
-                    observed_pose.orientation.z, observed_pose.orientation.w])
+                pose_quaternions.append([observed_pose.qx, observed_pose.qy,
+                    observed_pose.qz, observed_pose.qw])
             if motion_loop or realtime_source:
                 time.sleep(max(0, input_started + (frame_index + 1) * scan_period_s - time.monotonic()))
             else:
@@ -423,29 +342,29 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
         minimum_final_stamp = first_stamp + max(1, frame_count - 5) * scan_period_ns
         # 就绪可能早于最后一批发布/计算，沿原期限等待发布线程排空和源时间推进。
         while True:
-            readiness = stub.GetMappingReadiness(pb2.Empty(), timeout=2)
-            pose = stub.GetCurrentPose(pb2.PoseRequest(), timeout=2)
-            if pose.timestamp_ns >= first_stamp:
-                pose_samples.append([pose.position.x, pose.position.y, pose.position.z])
+            pose=remote.get_state(timeout_sec=2).pose
+            mapping_ready=pose is not None
+            if pose is not None and pose.timestamp_ns >= first_stamp:
+                pose_samples.append([pose.x, pose.y, pose.z])
                 pose_timestamps.append(pose.timestamp_ns)
-                pose_quaternions.append([pose.orientation.x, pose.orientation.y,
-                    pose.orientation.z, pose.orientation.w])
-            if (readiness.ready and pose.timestamp_ns >= minimum_final_stamp
-                    and bridge.counters.emitted_lio_measurement_count == frame_count) or time.monotonic() >= deadline:
+                pose_quaternions.append([pose.qx, pose.qy,
+                    pose.qz, pose.qw])
+            if (mapping_ready and pose.timestamp_ns >= minimum_final_stamp
+                    and bridge.status()["published"] == frame_count) or time.monotonic() >= deadline:
                 break
             time.sleep(.05)
-        assert readiness.ready, readiness.message
+        assert mapping_ready,"Geometry未发布原生位姿"
         assert pose.timestamp_ns > first_stamp
-        assert bridge.counters.emitted_lio_measurement_count == frame_count
-        assert bridge.counters.dropped_pointcloud_count == 0
+        assert bridge.status()["published"] == frame_count
+        assert bridge.status()["dropped"] == 0
         finite_pose = bool(np.all(np.isfinite([
-            pose.position.x, pose.position.y, pose.position.z,
-            pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w,
+            pose.x, pose.y, pose.z,
+            pose.qx, pose.qy, pose.qz, pose.qw,
         ])))
         assert finite_pose, "真实算法输出包含非有限位姿"
-        pose_samples.append([pose.position.x, pose.position.y, pose.position.z])
+        pose_samples.append([pose.x, pose.y, pose.z])
         pose_timestamps.append(pose.timestamp_ns)
-        pose_quaternions.append([pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w])
+        pose_quaternions.append([pose.qx, pose.qy, pose.qz, pose.qw])
         positions = np.asarray(pose_samples)
         max_position_m = float(np.linalg.norm(positions, axis=1).max())
         max_drift_m = float(np.linalg.norm(positions - positions[0], axis=1).max())
@@ -489,28 +408,27 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
         if gateway is not None:
             snapshot = gateway.map_snapshot()
             assert snapshot.get("map_name") == map_name, snapshot
-            assert snapshot.get("update_sequence", 0) > 0, snapshot
-            grid = snapshot["occupancy_grid"]
+            assert snapshot["source_timestamp_ns"]>0,snapshot
+            grid = snapshot["grid"]
             assert grid["width"] > 0 and grid["height"] > 0
             assert len(grid["data"]) == grid["width"] * grid["height"]
             active = gateway.call("get_active_map", {})
-            assert active.get("active_workspace", {}).get("mapping_runtime_enabled"), active
-            stopped = gateway.call("stop_mapping", {"reason": "合成输入验收完成"})
-            assert stopped.get("stopped") is True and stopped.get("mapping_active") is False, stopped
-            assert stopped.get("sidecar_kept_alive") is True, stopped
+            assert active["phase"]=="mapping",active
+            stopped = gateway.call("end_map_session", {"reason": "合成输入验收完成"})
+            assert stopped["phase"]=="idle",stopped
             (evidence / (backend + "MCP建图结果.json")).write_text(json.dumps({
                 "synthetic": True, "backend": backend, "correction_backend": correction_backend, "map_snapshot": snapshot,
-                "active_map": active, "stop_mapping": stopped, "checks": gateway.calls,
+                "active_map": active, "end_map_session": stopped, "checks": gateway.calls,
             }, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps({"synthetic": True, "backend": backend, "correction_backend": correction_backend,
             "control_plane": "http_mcp" if gateway_mode else "grpc",
-            "sent_frames": bridge.counters.emitted_lio_measurement_count,
+            "sent_frames": bridge.status()["published"],
             "input_elapsed_s": input_elapsed_s,
             "scan_period_ms": scan_period_ns / 1e6,
             "source_timing": "synthetic_completed_scan" if realtime_source else "synthetic_offset_10s",
             "publish_mean_ms": float(np.mean(publish_latencies)),
             "publish_p95_ms": float(np.percentile(publish_latencies, 95)),
-            "mapping_ready": readiness.ready, "pose_timestamp_ns": pose.timestamp_ns,
+            "mapping_ready": mapping_ready, "pose_timestamp_ns": pose.timestamp_ns,
             "finite_pose": finite_pose, "max_position_m": max_position_m,
             ("max_displacement_m" if motion_loop else "max_drift_m"): max_drift_m,
             "motion_loop": motion_loop, **motion_metrics}, ensure_ascii=False))
@@ -520,7 +438,7 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
         else:
             bridge.stop()
         bridge = None
-        assert stub.Stop(pb2.StopRequest(), timeout=8).success
+        process.terminate()
         assert process.wait(timeout=10) == 0
         assert not ready.exists()
         assert not _stop_process_session(process), "正常退出后仍有诊断子进程需要强制回收"
@@ -533,7 +451,7 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
                 gateway.close if gateway is not None else None,
                 bridge.stop if bridge is not None else None,
                 sensors.stop if sensors is not None else None,
-                remote.disconnect if remote is not None else None,
+                remote.close if remote is not None else None,
                 channel.close if channel is not None else None,
                 gateway.client.close if gateway is not None else None,
                 gateway.listener.close if gateway is not None else None,

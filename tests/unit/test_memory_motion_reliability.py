@@ -30,11 +30,11 @@ class Sequence:
         self.instances = {}
         self.now = utc_now()
         self.index = 0
-    def add(self, item, *, session='session'):
+    def add(self, item):
         self.index += 1
         self.instances, outcomes = self.service.associate(
             [replace(item, source_observation_id=f'obs_{self.index}')],
-            existing_instances=self.instances, map_name='house', localization_session_id=session,
+            existing_instances=self.instances, map_name='house',
             now=self.now + timedelta(seconds=self.index),
          admission="explicit")
         if not self.instances:
@@ -121,21 +121,14 @@ def test_legacy_dynamic_reason_is_not_restored_by_fallback_pose_preservation():
     assert 'local_retry_policy' not in obj.metadata
 
 
-def test_map_revision_conflicts_are_excluded_but_session_restart_is_compatible():
+def test_dynamic_window_keeps_repeated_observations_and_excludes_other_frames():
     service = InstanceAssociationService(text_embedder=None)
     now = utc_now()
-    first = service._build_observation_window([], observation(), now=now, map_name='house', localization_session_id='a')
-    second = service._build_observation_window(first, observation(), now=now+timedelta(seconds=1), map_name='house', localization_session_id='b')
+    first = service._build_observation_window([], observation(), now=now, map_name='house')
+    second = service._build_observation_window(first, observation(), now=now+timedelta(seconds=1), map_name='house')
     assert service._dynamic_window_metrics(second)['observation_count'] == 2
     other_frame = replace(observation(20), pose=Pose(frame_id='odom', position=Vector3(x=20)))
-    third = service._build_observation_window(second, other_frame, now=now+timedelta(seconds=2), map_name='house', localization_session_id='b')
+    third = service._build_observation_window(second, other_frame, now=now+timedelta(seconds=2), map_name='house')
     metrics = service._dynamic_window_metrics(third)
     assert metrics['observation_count'] == 1
     assert metrics['max_displacement_m'] == 0
-
-    epochs = service._build_observation_window([], observation(map_source_epoch=1), now=now, map_name='house')
-    epochs = service._build_observation_window(epochs, observation(0, map_source_epoch=2), now=now+timedelta(seconds=1), map_name='house')
-    assert service._dynamic_window_metrics(epochs)['observation_count'] == 1
-    # 最新快帧未携带地图代际时，也不能把两个已知不同代际混算。
-    epochs = service._build_observation_window(epochs, observation(30, fallback=True), now=now+timedelta(seconds=2), map_name='house')
-    assert service._dynamic_window_metrics(epochs)['observation_count'] == 1

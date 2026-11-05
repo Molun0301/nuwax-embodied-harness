@@ -15,8 +15,7 @@ def main():
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     from core.settings import load_config, ManipulationConfig
-    from drivers.customrobot import create_customrobot_assembly
-    from gateways.runtime import GatewayRuntime
+    from gateways.platform import build_platform
     from gateways.app import create_gateway_app
     import uvicorn
 
@@ -24,7 +23,6 @@ def main():
     config.robot.active_robot = "customrobot"
     config.geometry.enabled = False
     config.runtime_data.map_catalog_root = str(args.output / "maps")
-    config.runtime_data.memory_db_path = str(args.output / "memory.db")
     config.runtime_data.memory_embedding_model = "disabled"
     config.runtime_data.memory_embedding_dimension = 128
     config.runtime_data.memory_image_embedding_model = "disabled"
@@ -35,17 +33,16 @@ def main():
     config.perception.yolo_world.enabled = False
     config.perception.openai_vision.enabled = False
     config.perception.segmentation.enabled = False
-    config.perception.stream_runtime.enabled = False
-    config.perception.stream_runtime.auto_start = False
     config.scene_mapping.enabled = False
     config.manipulation = ManipulationConfig(enabled=True, base_url=args.device_url)
-    robot = create_customrobot_assembly(config)
+    config.base_dir = args.output.resolve()
+    platform = build_platform(config)
+    robot = platform.robot
     robot.manifest = replace(robot.manifest, robot_name="g1_sim", robot_model="G1 · 三指手动作仿真",
         robot_profile=replace(robot.manifest.robot_profile, robot_name="g1_sim"),
         capability_matrix=robot.manifest.capability_matrix.model_copy(update={"robot_model": "G1 · 三指手动作仿真"}),
         description="由独立物理平台提供实际操作任务，未接入机体导航和雷达。")
-    runtime = GatewayRuntime(config=config, robot=robot)
-    uvicorn.run(create_gateway_app(runtime, config), host="127.0.0.1", port=args.port)
+    uvicorn.run(create_gateway_app(platform, config), host="127.0.0.1", port=args.port)
 
 
 if __name__ == "__main__":

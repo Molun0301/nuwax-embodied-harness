@@ -18,7 +18,7 @@ from starlette.requests import Request
 from gateways.auth import GatewayAccessManager
 from gateways.agent.router import build_agent_router
 from gateways.agent.service import AgentToolService
-from gateways.errors import GatewayError
+from core.errors import GatewayError
 from gateways.feedback import build_public_error_payload
 from gateways.request_context import (
     REQUEST_ID_HEADER,

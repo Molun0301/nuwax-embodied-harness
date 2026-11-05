@@ -18,6 +18,7 @@ import numpy as np
 
 from contracts.image import ImageEncoding, ImageFrame
 from core import StateStore
+from core.errors import GatewayError
 from services.perception.detectors import DetectorPipeline, YoloWorldDetectorBackend
 from services.perception.inference_owner import InferenceProcessOwner
 from services.perception.service import PerceptionService
@@ -309,11 +310,11 @@ class RecoveryChecks(unittest.TestCase):
             state_store=StateStore(),
             detector_pipeline=pipeline,
         )
-        self.assertFalse(service.close(0))
+        with self.assertRaisesRegex(GatewayError,"检测执行者未能"):service.close(0)
         self.assertTrue(service.get_lifecycle_status()["closing"])
         self.assertFalse(service.get_lifecycle_status()["closed"])
         gate.set()
-        self.assertTrue(service.close(2))
+        service.close(2)
         self.assertFalse(worker.has_pending_resources)
 
 

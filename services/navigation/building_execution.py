@@ -34,13 +34,12 @@ def current_floor(platform, topology):
     raise GatewayError("当前地图不属于该楼栋的可用楼层。", error_code="current_floor_unknown", http_status=409)
 
 
-def _navigate(platform, ctx, pose: FloorPose, motion_generation, observed_pose=None):
-    from gateways.capabilities.navigation import navigate_to_pose
+def _navigate(platform, ctx, pose: FloorPose, motion_generation, observed_pose=None, *, navigate):
     ctx.check()
     args = {"x": pose.x, "y": pose.y, "yaw_rad": pose.yaw_rad, "motion_generation": motion_generation}
     if observed_pose is not None:
         args["z"] = observed_pose.z
-    return navigate_to_pose(platform, ctx, args)
+    return navigate(platform, ctx, args)
 
 
 def load_floor(platform, ctx, record, seed=None):
@@ -82,7 +81,7 @@ def _await_docked(provider, connection, floor_id, ctx):
         ctx.wait(0.1)
 
 
-def transfer(platform, ctx, topology, target, motion_generation, *, create_target=False):
+def transfer(platform, ctx, topology, target, motion_generation, *, navigate, create_target=False):
     """跨每条连接后加载对应楼层；未知目标楼层由探索处理器开始新图。"""
     source = current_floor(platform, topology)
     route = route_connections(topology, source.floor_id, target.floor_id, platform.buildings.providers)
@@ -93,7 +92,7 @@ def transfer(platform, ctx, topology, target, motion_generation, *, create_targe
         provider = platform.buildings.providers[connection.provider_id]
         ctx.progress(0.0, "navigating_waiting", "前往设施等待位置。", floor_id=source.floor_id,
                      connection_id=connection.connection_id)
-        _navigate(platform, ctx, connection.waiting_pose, motion_generation)
+        _navigate(platform, ctx, connection.waiting_pose, motion_generation, navigate=navigate)
         ctx.check()
         _operate(provider, connection, "reserve", None, ctx)
         exited = False
@@ -102,7 +101,7 @@ def transfer(platform, ctx, topology, target, motion_generation, *, create_targe
             _operate(provider, connection, "call", source.floor_id, ctx)
             _await_docked(provider, connection, source.floor_id, ctx)
             _operate(provider, connection, "hold_door", source.floor_id, ctx)
-            _navigate(platform, ctx, connection.boarding_pose, motion_generation)
+            _navigate(platform, ctx, connection.boarding_pose, motion_generation, navigate=navigate)
             ctx.check()
             platform.geometry.stop_session(timeout_sec=ctx.remaining())
             ctx.check()
@@ -117,7 +116,7 @@ def transfer(platform, ctx, topology, target, motion_generation, *, create_targe
                 ctx.progress(0.0, "localizing", "加载目标楼层地图并重定位。", map_name=destination.map_name)
                 observed = load_floor(platform, ctx, destination, connection.arrival_pose)
             ctx.check()
-            _navigate(platform, ctx, connection.exit_pose, motion_generation, observed.pose)
+            _navigate(platform, ctx, connection.exit_pose, motion_generation, observed.pose, navigate=navigate)
             completed.append(connection.connection_id)
             source = destination
             exited = True
@@ -132,14 +131,14 @@ def transfer(platform, ctx, topology, target, motion_generation, *, create_targe
     return tuple(completed)
 
 
-def navigate_to_floor(platform, ctx, args):
+def navigate_to_floor(platform, ctx, args, *, navigate):
     topology = building(platform, args["building_id"])
     source = current_floor(platform, topology)
     target = floor(topology, args.get("floor_id", source.floor_id))
-    route = transfer(platform, ctx, topology, target, args["motion_generation"])
+    route = transfer(platform, ctx, topology, target, args["motion_generation"], navigate=navigate)
     localized = load_floor(platform, ctx, target) if not route else None
     ctx.progress(0.0, "navigating_final", "前往目标楼层内的目标位姿。", floor_id=target.floor_id)
     result = _navigate(platform, ctx, FloorPose(args["x"], args["y"], args.get("yaw_rad", 0.0)),
-                       args["motion_generation"], localized.pose if localized is not None else None)
+                       args["motion_generation"], localized.pose if localized is not None else None, navigate=navigate)
     return {"building_id": topology.building_id, "floor_id": target.floor_id,
             "map_name": target.map_name, "route": list(route), "navigation": result}

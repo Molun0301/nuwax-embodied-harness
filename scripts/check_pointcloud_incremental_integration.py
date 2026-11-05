@@ -1,103 +1,13 @@
-"""校验实际网关发布/兼容边界，保持检查独立于原生编译和设备。"""
-from __future__ import annotations
-
-import base64
-import importlib.util
-import json
-import os
-import struct
-import sys
-import tempfile
-import threading
-import unittest
+"""真实mmap采集与分页网页字节协议的端到端离线检查。"""
+import base64,json,os,struct,sys,tempfile,unittest
 from dataclasses import replace
 from pathlib import Path
-from types import MethodType
-from types import SimpleNamespace as NS
-from unittest.mock import patch
-
-STAGE=Path(__file__).resolve().parents[1]
-REPO=Path(sys.argv.pop(1)) if len(sys.argv)>1 and not sys.argv[1].startswith('-') else Path.cwd()
-sys.path.insert(0,str(REPO))
-import gateways.ws
-
-# Only this process changes package lookup; no live checkout edits.
-gateways.ws.__path__.insert(0,str(STAGE/'gateways/ws'))
-ws_spec=importlib.util.spec_from_file_location('gateways.ws.data_streams',STAGE/'gateways/ws/data_streams.py')
-ws=importlib.util.module_from_spec(ws_spec);sys.modules[ws_spec.name]=ws;ws_spec.loader.exec_module(ws)
-gateways.ws.data_streams=ws
-assert Path(ws.__file__).resolve()==(STAGE/'gateways/ws/data_streams.py').resolve()
-from contracts.streams import StreamFrame, StreamPayloadKind
-
-spec=importlib.util.spec_from_file_location('staged_runtime',STAGE/'gateways/runtime.py')
-runtime=importlib.util.module_from_spec(spec);sys.modules[spec.name]=runtime;spec.loader.exec_module(runtime)
-
-
-def snapshot(source='live',chunked=True):
-    raw=struct.pack('<fff',1.,2.,3.)
-    return NS(source=source,source_epoch='epoch',revision='cloud:7',revision_ordinal=7,
-              frame_id='map',source_timestamp_ns=8,point_count=1,format='float32-xyz-le',
-              stream_generation=3,provenance={},chunked=chunked,layout_generation=2,
-              chunk_size_points=1024 if chunked else 0,
-              chunks=(NS(xyz_bytes=raw),),xyz_bytes=b'' if chunked else raw)
-
-class Sink:
-    def __init__(self):self.frames=[]
-    def publish(self,topic,**kwargs):self.frames.append((topic,kwargs))
-
-class Publication(unittest.TestCase):
-    def fake(self):
-        owner=NS(_pointcloud_map_stream_stop=threading.Event(),_lock=threading.RLock(),stream_bus=Sink())
-        owner.platform_geometry_runtime=NS(is_map_asset_activation_recovery_pending=lambda:False,
-            is_assigned_saved_cloud_selected=lambda:False,
-            capture_assigned_saved_cloud_source=lambda:None)
-        owner._require_pointcloud_source_current=MethodType(runtime.GatewayRuntime._require_pointcloud_source_current,owner)
-        owner._publish_pointcloud_map_meta=MethodType(runtime.GatewayRuntime._publish_pointcloud_map_meta,owner)
-        return owner
-    def test_native_publication_has_no_full_bytes_or_compat_payload(self):
-        owner=self.fake();source=snapshot()
-        with patch.object(base64,'b64encode',side_effect=AssertionError('no eager base64')):
-            runtime.GatewayRuntime._publish_pointcloud_map_snapshot(owner,source,reason='source_update')
-        self.assertEqual([topic for topic, _ in owner.stream_bus.frames], ["pointcloud_map.snapshot"])
-        topic,frame=owner.stream_bus.frames[0]
-        self.assertEqual(topic,'pointcloud_map.snapshot');self.assertEqual(frame['payload_kind'],StreamPayloadKind.JSON)
-        self.assertEqual(frame['payload'],{'chunked':True,'point_count':1})
-    def test_saved_heartbeat_does_not_make_base64(self):
-        owner=self.fake();source=snapshot('saved',False)
-        with patch.object(base64,'b64encode',side_effect=AssertionError('no eager base64')):
-            runtime.GatewayRuntime._publish_pointcloud_map_snapshot(owner,source,reason='heartbeat')
-        self.assertIs(owner.stream_bus.frames[0][1]['payload'],source.xyz_bytes)
-        self.assertEqual([topic for topic, _ in owner.stream_bus.frames], ['pointcloud_map.snapshot', 'pointcloud_map.meta'])
-    def test_getter_returns_same_current_snapshot_without_materialization(self):
-        source=snapshot();owner=self.fake();owner._pointcloud_map_current_snapshot=source
-        self.assertIs(runtime.GatewayRuntime.get_pointcloud_map_snapshot(owner),source)
-
-class Compatibility(unittest.IsolatedAsyncioTestCase):
-    async def test_real_ws_legacy_native_materializes_only_on_send(self):
-        source=snapshot();owner=NS(get_pointcloud_map_snapshot=lambda:source)
-        frame=StreamFrame(topic='pointcloud_map.snapshot',source='probe',cursor=1,payload={'chunked':True},metadata={'chunked':True})
-        class Socket:
-            async def send_bytes(self,value):self.data=value
-            async def send_text(self,value):self.data=value
-        socket=Socket();await ws._send_ws_frame(socket,frame,runtime=owner)
-        _magic,version,_size=struct.unpack_from('<8sBI',socket.data)
-        self.assertEqual(version,1);self.assertEqual(socket.data[-12:],source.chunks[0].xyz_bytes)
-
-
+ROOT=Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(ROOT))
 class ActualPipeline(unittest.TestCase):
     def test_real_mmap_source_to_pinned_ws_page_protocol(self):
-        checkpoint=Path(os.environ.get('NEH_PIPELINE_CHECKPOINT',str(STAGE if (STAGE/'services/geometry/pointcloud_map.py').exists() else STAGE.parent/'checkpoint')))
-        source_path=checkpoint/'services/geometry/pointcloud_map.py'
-        old=os.environ.get('NEH_POINTCLOUD_MODULE_PATH')
-        os.environ['NEH_POINTCLOUD_MODULE_PATH']=str(source_path)
-        fixture_spec=importlib.util.spec_from_file_location('pipeline_mmap_fixture',checkpoint/'scripts/check_pointcloud_incremental_pages.py')
-        fixture=importlib.util.module_from_spec(fixture_spec);sys.modules[fixture_spec.name]=fixture
-        try: fixture_spec.loader.exec_module(fixture)
-        finally:
-            if old is None: os.environ.pop('NEH_POINTCLOUD_MODULE_PATH',None)
-            else: os.environ['NEH_POINTCLOUD_MODULE_PATH']=old
+        from scripts import check_pointcloud_incremental_pages as fixture
         cloud=fixture.cloud
-        self.assertEqual(Path(cloud.__file__).resolve(),source_path.resolve())
         import numpy as np
 
         from gateways.ws.pointcloud_stream import PointCloudTransfer, snapshot_identity

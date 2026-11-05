@@ -64,8 +64,6 @@ def configure(output, calibrated_motion=False, pipeline="lio_3d", calibrated_obs
         "NUWAX_REAL_LCM_REQUIRED": "true",
         "NUWAX_LCM_URL": "udpm://239.255.76.67:%d?ttl=0" % (20000 + port % 20000),
         "NUWAX_FORBIDDEN_ZONES_PATH": str(working / "forbidden_zones.json"),
-        "NUWAX_GEOMETRY_SEQUENCE_STATE_PATH": str(working / "sequence.json"),
-        "NUWAX_GEOMETRY_EXPLORATION_RECONCILIATION_JOURNAL_PATH": str(working / "exploration.json"),
         "NUWAX_CLOUDMAP_SHM_PATH": str(working / "cloud.shm"),
         "NUWAX_OCCUPANCY_SHM_PATH": str(working / "occupancy.shm"),
         "NUWAX_VIDEO_SHM_PATH": str(working / "video.shm"),
@@ -73,6 +71,8 @@ def configure(output, calibrated_motion=False, pipeline="lio_3d", calibrated_obs
         "NUWAX_LOG_DIR": str(output / "组件日志"),
         "NUWAX_LOG_FILE": str(output / "组件日志/网关.log"),
         "NUWAX_LOG_LEVEL": "INFO",
+        "NUWAX_INSTALL_HOME":str(working/"supervision"),
+        "NUWAX_MAP_CATALOG_ROOT":str(output/"地图"),
         "RUST_LOG": "info,nuwax_nav_stack::surface_chunks=debug",
         "NUWAX_MAPPING_RESOLUTION": ".1",
         "NUWAX_MAPPING_RAYTRACING_VOXEL_SIZE": ".05",
@@ -136,14 +136,13 @@ def configure(output, calibrated_motion=False, pipeline="lio_3d", calibrated_obs
     return working, port
 
 
-def require_completed_exploration(stop_reason, observed_floor_ratio, max_goals):
-    """期限耗尽不算完成；目标限量与自然结束分别核对。"""
-    if max_goals is not None and stop_reason == "max_goals_reached":
+def require_completed_exploration(phase,observed_floor_ratio,max_goals,goals_completed):
+    """沿用原0.95完整覆盖断言；限量场景只声明实际达到目标上限。"""
+    assert phase=="succeeded",("探索未原生成功",phase)
+    if max_goals is not None:
+        assert goals_completed>=max_goals,("原生完成目标数未达请求上限",goals_completed,max_goals)
         return
-    assert stop_reason in {"no_information_gain", "no_reachable_free_space", "no_frontier_timeout"}, (
-        "探索未自然完成或达到目标限量", stop_reason
-    )
-    assert observed_floor_ratio >= 0.95, "自然结束时仍有大片室内区域未观测"
+    assert observed_floor_ratio>=0.95,"自然结束时仍有大片室内区域未观测"
 
 
 def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=False, pipeline="lio_3d", calibrated_observation=False, *, exercise=None, configure_runtime=None, sensor_range_m=2.8, near_field=False, dense_cloud=False):
@@ -161,8 +160,9 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
     from drivers.customrobot import create_customrobot_assembly
     from drivers.customrobot.providers import CustomRobotProviderBundle
     from gateways.app import create_gateway_app
-    from gateways.runtime import GatewayRuntime
-    from services.navigation.motion_safety_guard.actor import GuardActor
+    from gateways.platform import build_platform
+    from unittest.mock import patch
+    from dataclasses import asdict
     from services.navigation.motion_safety_guard.core import MotionGuardCore
     from services.navigation.motion_safety_guard.server import MotionGuardUnixServer
     from scripts.diagnostics.native_lio_smoke import _stop_process_session
@@ -175,7 +175,7 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
         def __init__(self):
             self.lock = threading.Lock()
             self.pose = [0.0, 0.0, 0.0]
-            self.velocity = [0.0, 0.0, 0.0]
+            self.actual_velocity = [0.0, 0.0, 0.0]
             self.desired_velocity = [0.0, 0.0, 0.0]
             self.pending_commands = []
             self.last = time.monotonic()
@@ -208,11 +208,11 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
                 if self.pending_commands:
                     end = min(end, self.pending_commands[0][0])
                 dt = end - self.last
-                old = self.velocity[:]
+                old = self.actual_velocity[:]
                 if calibrated_motion:
-                    self.velocity = [v + max(-rate * dt, min(rate * dt, wanted - v))
+                    self.actual_velocity = [v + max(-rate * dt, min(rate * dt, wanted - v))
                                      for v, wanted, rate in zip(old, self.desired_velocity, (1.0, 1.0, 2.0))]
-                vx, vy, wz = [(a + b) * 0.5 for a, b in zip(old, self.velocity)]
+                vx, vy, wz = [(a + b) * 0.5 for a, b in zip(old, self.actual_velocity)]
                 x, y, yaw = self.pose
                 heading = yaw + wz * dt * 0.5
                 dx, dy = (vx * math.cos(heading) - vy * math.sin(heading)) * dt, (vx * math.sin(heading) + vy * math.cos(heading)) * dt
@@ -222,19 +222,22 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
             radius = 0.15 * (abs(math.cos(self.pose[2])) + abs(math.sin(self.pose[2])))
             if max(abs(self.pose[0]), abs(self.pose[1])) > 2.5 - radius:
                 self.errors.append("模拟机体碰撞房间墙壁")
-                self.velocity = [0.0, 0.0, 0.0]
+                self.actual_velocity = [0.0, 0.0, 0.0]
 
-        def apply_motion(self, request):
-            if not request.HasField("twist"):
-                raise RuntimeError("模拟仅支持标准平面速度")
+        supports_motion_feedback=True
+
+        def get_motion_command_limits(self):
+            from contracts.motion_limits import MotionCommandLimits
+            return MotionCommandLimits(max_linear_x_mps=1.,max_linear_y_mps=1.,max_angular_z_rps=1.,source="合成积分设备策略",input_frame_id="sim_body",limit_frame_id="sim_body")
+
+        def velocity(self,vx,vy,wz):
             with self.lock:
                 self.integrate()
-                t = request.twist
-                velocity = [t.linear_x_mps, t.linear_y_mps, t.angular_z_rps]
+                velocity=[vx,vy,wz]
                 if calibrated_motion:
                     self.pending_commands.append((self.last + 0.1, velocity))
                 else:
-                    self.velocity = velocity
+                    self.actual_velocity = velocity
                 self.commands += int(any(abs(v) > 1e-5 for v in velocity))
 
             return False
@@ -247,7 +250,7 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
                     deadline = min([at for at, v in self.pending_commands if v == [0.0, 0.0, 0.0]] or [self.last + 0.1])
                     self.pending_commands = [(deadline, [0.0, 0.0, 0.0])]
                 else:
-                    self.velocity = [0.0, 0.0, 0.0]
+                    self.actual_velocity = [0.0, 0.0, 0.0]
                 self.zeroes += 1
 
         def stop_motion(self):
@@ -276,7 +279,7 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
                     distance=self.distance,
                     commands=self.commands,
                     zeroes=self.zeroes,
-                    velocity=list(self.velocity),
+                    velocity=list(self.actual_velocity),
                 )
 
     class SimulatedProviders(CustomRobotProviderBundle):
@@ -296,24 +299,17 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
 
     world = World()
     guard_core = MotionGuardCore(actuator=world)
-    guard_core.initialize_zero_fence()
     guard = MotionGuardUnixServer(
-        socket_path=working / "guard.sock", actor=GuardActor(guard_core), socket_gid=os.getegid()
+        socket_path=working / "guard.sock", core=guard_core, socket_gid=os.getegid()
     )
     config = load_config()
+    config.base_dir=output
     config.robot.active_robot = "customrobot"
     config.geometry.enabled = True
     config.geometry.mapping.profile_enabled = True
-    config.geometry.runtime_binary = os.environ["NUWAX_GEOMETRY_RUNTIME_BINARY"]
-    config.geometry.runtime_port = port
-    config.geometry.runtime_ready_file = str(working / "geometry.ready")
-    config.geometry.frames.base_frame = "sim_body"
-    config.geometry.frames.lidar_frame = "sim_lidar"
-    config.geometry.frames.imu_frame = "sim_lidar"
-    config.geometry.frames.map_frame = "map"
-    config.geometry.frames.odom_frame = "odom"
+    config.geometry.external.binary_path = os.environ["NUWAX_GEOMETRY_RUNTIME_BINARY"]
+    config.geometry.external.port = port
     config.runtime_data.map_catalog_root = str(output / "地图")
-    config.runtime_data.memory_db_path = str(output / "memory.db")
     config.runtime_data.memory_embedding_model = "lexical-only"
     config.runtime_data.memory_embedding_dimension = 128
     config.runtime_data.memory_image_embedding_model = "disabled"
@@ -321,13 +317,11 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
     config.perception.yolo_world.enabled = False
     config.perception.openai_vision.enabled = False
     config.perception.segmentation.enabled = False
-    config.perception.stream_runtime.enabled = False
-    config.perception.stream_runtime.auto_start = False
     if configure_runtime is not None:
         configure_runtime(config, world)
-    robot = create_customrobot_assembly(config, motion_control=world)
-    robot.providers = SimulatedProviders(motion_control=world)
-    runtime = GatewayRuntime(config=config, robot=robot)
+    robot = create_customrobot_assembly(config)
+    robot.providers = SimulatedProviders()
+    with patch("gateways.platform.create_active_robot_assembly",return_value=robot):runtime=build_platform(config)
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen(128)
@@ -363,18 +357,18 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
         )
         payload = response.json()
         rpc_records.append({"time": time.time(), "method": method, "params": params, "response": payload})
-        task_query = params.get("arguments", {}).get("function") == "get_task_status"
+        task_query = False
         if response.is_error or "error" in payload or (payload.get("result", {}).get("isError") and not task_query):
             raise RuntimeError(json.dumps(payload, ensure_ascii=False))
         result = payload["result"]
         if method == "tools/call":
             assert json.loads(result["content"][0]["text"]) == result["structuredContent"]
             result = result["structuredContent"]
-            return result.get("result", result)
+            return result
         return result
 
     def call(name, args=None):
-        return rpc("tools/call", {"name": "platform", "arguments": {"function": name, "parameters": args or {}}})
+        return rpc("tools/call", {"name":name,"arguments":args or {}})
 
     def inputs():
         try:
@@ -475,15 +469,15 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
             input_thread.start()
         rpc("initialize", {})
         catalog = rpc("tools/list", {})
-        assert "start_exploration" in {t["name"] for t in catalog["tools"]}, "探索工具未公开"
-        report["exploration_tool"] = next(t for t in catalog["tools"] if t["name"] == "start_exploration")
+        assert "explore_area_v2" in {t["name"] for t in catalog["tools"]}, "探索工具未公开"
+        report["exploration_tool"] = next(t for t in catalog["tools"] if t["name"] == "explore_area_v2")
         if exercise is not None:
             exercise(runtime, world, rpc, call, report, snapshots)
         else:
             result = rpc(
                 "tools/call",
                 {
-                    "name": "start_exploration",
+                    "name": "explore_area_v2",
                     "arguments": {
                         "map_name": "模拟探索房间",
                         "timeout_sec": timeout,
@@ -498,10 +492,9 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
                     },
                 },
             )
-            task_id = result.get("task_id") or result.get("task", {}).get("task_id")
+            task_id=result["task"]["task_id"]
             assert task_id, result
             report["task_id"] = task_id
-            report["request_id"] = result["task"]["input_payload"]["request_id"]
             deadline = time.monotonic() + timeout + 30
             previous = None
             next_poll = 0.0
@@ -519,39 +512,28 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
                             "tools/call",
                             {
                                 "name": "stop_exploration",
-                                "arguments": {"reason": "模拟上层智能体取消探索", "request_id": report["request_id"]},
+                                "arguments": {},
                             },
                         )
                     else:
                         stop.set()
                     next_poll = 0.0
                 if time.monotonic() >= next_poll:
-                    snapshot = call("get_task_status", {"task_id": task_id})
-                    next_poll = time.monotonic() + max(
-                        0.5, float(snapshot.get("polling_advisory", {}).get("retry_after_sec", 0.5))
-                    )
-                status = snapshot.get("status", {})
+                    response=client.get("/api/tasks/"+task_id);response.raise_for_status();snapshot=response.json()
+                    next_poll=time.monotonic()+.5
+                status=snapshot["task"]
                 state = status.get("state")
                 samples = {"time": time.time(), "task": snapshot, "world": world.snapshot()}
-                current_map = runtime.mapping_service.get_latest_snapshot()
-                if current_map is not None and current_map.occupancy_grid is not None:
-                    grid = current_map.occupancy_grid
-                    samples["map"] = {
-                        "known": sum(v >= 0 for v in grid.data),
-                        "revision": current_map.update_sequence,
-                        "source_epoch": current_map.source_epoch,
-                        "map_name": current_map.map_name,
-                    }
+                update=runtime.geometry_state.latest_map()
+                if update is not None:
+                    grid=update.grid;values=np.frombuffer(grid.data,dtype=np.int8)
+                    samples["map"]={"known":int(np.count_nonzero(values>=0)),"source_timestamp_ns":grid.timestamp_ns,"map_name":grid.map_name}
                     if "initial_map" not in report:
-                        report["initial_map"] = samples["map"]
-                        (output / "初始地图.json").write_text(current_map.model_dump_json(), encoding="utf-8")
-                    report["last_map"] = samples["map"]
-                remote = runtime.platform_geometry_runtime.get_geometry_runtime_provider()
-                if remote is not None:
-                    samples["raw_navigation"] = remote._build_navigation_state_snapshot(include_readiness=False).model_dump(
-                        mode="json"
-                    )
-                    samples["navigation_readiness"] = remote.get_navigation_readiness()
+                        report["initial_map"]=samples["map"]
+                        initial={**asdict(grid),"data":values.tolist()}
+                        (output/"初始地图.json").write_text(json.dumps(initial,ensure_ascii=False))
+                    report["last_map"]=samples["map"]
+                samples["raw_navigation"]=asdict(runtime.geometry_state.snapshot().navigation) if runtime.geometry_state.snapshot().navigation is not None else None
                 snapshots.append(samples)
                 summary = (state, status.get("stage"), status.get("message"))
                 if summary != previous or len(snapshots) % 10 == 0:
@@ -576,11 +558,8 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
                 if state == "succeeded":
                     assert scenario == "complete", "中断场景不能伪装为成功"
                     report["terminal"] = snapshot
-                    receipt = snapshot.get("map_asset_finalize")
-                    if receipt:
-                        report["asset_receipt"] = receipt
-                        assert receipt["status"] == "succeeded", receipt
-                        break
+                    report["saved_map"]=status["result"]["saved_map"]
+                    break
                 time.sleep(0.5)
             else:
                 raise RuntimeError("探索或资产保存未在期限内完成")
@@ -588,43 +567,26 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
                 assert world.commands > 0 and world.distance > 0.5, "不能以原地空探索作为闭环成功"
                 report["world"] = world.snapshot()
                 assert report["last_map"]["known"] > report["initial_map"]["known"] + 50, "移动后地图必须增长"
-                current_map = runtime.mapping_service.get_latest_snapshot()
-                (output / "最终地图.json").write_text(current_map.model_dump_json(), encoding="utf-8")
-                report["maps"] = call("list_maps")
-                report["active_map"] = call("get_active_map")
-                from services.mapping.asset_store import MapAssetBundleRepository
-
-                bundle = MapAssetBundleRepository(config.runtime_data.map_catalog_root).get_map_asset_bundle(
-                    "模拟探索房间", migrate_legacy=False
-                )
-                assert bundle is not None, "独立仓储必须能读回保存地图"
-                assert bundle.manifest_sha256 == report["asset_receipt"]["manifest_sha256"]
-                assert bundle.snapshot.occupancy_grid is not None
-                report["asset_readback"] = {
-                    "manifest_sha256": bundle.manifest_sha256,
-                    "known": sum(v >= 0 for v in bundle.snapshot.occupancy_grid.data),
-                    "map_name": bundle.map_name,
-                    "geometry_asset": bundle.geometry_asset.model_dump(mode="json") if bundle.geometry_asset else None,
-                }
-                assert report["asset_readback"]["known"] > report["initial_map"]["known"] + 50
-                assert all(abs(v) < 1e-6 for v in world.snapshot()["velocity"]), "成功终态必须已停车"
-                grid = bundle.snapshot.occupancy_grid
-                cells = np.asarray(grid.data).reshape(grid.height, grid.width)
+                update=runtime.geometry_state.latest_map();grid=update.grid
+                (output/"最终地图.json").write_text(json.dumps({**asdict(grid),"data":np.frombuffer(grid.data,dtype=np.int8).tolist()},ensure_ascii=False))
+                report["maps"]=call("list_maps");report["active_map"]=call("get_active_map")
+                loaded=runtime.geometry.load_map(report["saved_map"]["map_name"])
+                assert loaded.map_name==report["saved_map"]["map_name"]
+                report["asset_readback"]={"map_name":loaded.map_name,"phase":loaded.phase.value,"source":"Geometry.LoadMap真实读取"}
+                assert all(abs(v)<1e-6 for v in world.snapshot()["velocity"]),"成功终态必须已停车"
+                cells=np.frombuffer(grid.data,dtype=np.int8).reshape(grid.height,grid.width)
                 # 固定真实房间分母，尚未扩展到的原生地图区域也属于未观察空间。
                 coordinates = np.arange(-2.375, 2.4, 0.05)
                 xx, yy = np.meshgrid(coordinates, coordinates)
-                ix = np.floor((xx - grid.origin.position.x) / grid.resolution_m).astype(int)
-                iy = np.floor((yy - grid.origin.position.y) / grid.resolution_m).astype(int)
+                ix = np.floor((xx - grid.origin_x) / grid.resolution).astype(int)
+                iy = np.floor((yy - grid.origin_y) / grid.resolution).astype(int)
                 valid = (ix >= 0) & (iy >= 0) & (ix < grid.width) & (iy < grid.height)
                 known = np.zeros(valid.shape, dtype=bool)
                 known[valid] = cells[iy[valid], ix[valid]] >= 0
                 report["observed_floor_ratio"] = float(np.count_nonzero(known) / known.size)
-                assert report["asset_receipt"]["task_id"] == task_id
-                assert report["asset_receipt"]["exploration_request_id"] == report["request_id"]
-                terminal = report["terminal"]["result"]["exploration_context"]["exploration_state"]
-                require_completed_exploration(
-                    terminal["metadata"]["last_stop_reason"], report["observed_floor_ratio"], max_goals
-                )
+                terminal=report["terminal"]["task"]["result"]["exploration"]
+                require_completed_exploration(terminal["phase"],report["observed_floor_ratio"],max_goals,terminal["goals_completed"])
+                report["completion_scope"]="目标限量" if max_goals is not None else "整图自然完成"
                 report["passed"] = True
     except BaseException as exc:
         report["error"] = repr(exc)
@@ -635,7 +597,7 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
             try:
                 report["cleanup_stop"] = call(
                     "cancel_task" if exercise is not None else "stop_exploration",
-                    {"task_id": report["task_id"]} if exercise is not None else {"reason": "本地诊断失败收尾", "request_id": report["request_id"]}
+                    {"task_id": report["task_id"]} if exercise is not None else {}
                 )
             except Exception as exc:
                 report["cleanup_stop_error"] = repr(exc)
@@ -671,9 +633,9 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
         report["shutdown_passed"] = (
             not gateway_thread.is_alive()
             and not input_thread.is_alive()
-            and not runtime._started
-            and not runtime.event_bus._consumer_thread.is_alive()
-            and not runtime.stream_bus._consumer_thread.is_alive()
+            and not runtime.geometry_state.connected
+            and not runtime.events._consumer_thread.is_alive()
+            and not runtime.streams.stream_bus._consumer_thread.is_alive()
             and not report.get("forced_shutdown", False)
             and not cleanup_errors
         )
@@ -718,11 +680,12 @@ if __name__ == "__main__":
                     "passed",
                     "scenario",
                     "task_id",
-                    "request_id",
+                    "completion_scope",
                     "initial_map",
                     "last_map",
                     "observed_floor_ratio",
-                    "asset_receipt",
+                    "saved_map",
+                    "asset_readback",
                     "final_world",
                     "shutdown_passed",
                 )

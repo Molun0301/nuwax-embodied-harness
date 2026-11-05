@@ -8,10 +8,8 @@ import json
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
 
-from contracts.map_workspace import MapAssetBundle, MapWorkspace
 from contracts.maps import CostMap, OccupancyGrid
 from contracts.occupancy_cells import PackedOccupancyCells
-from contracts.runtime_views import MapSnapshot
 
 
 def to_jsonable(value: Any) -> Any:
@@ -42,11 +40,8 @@ def to_json_text(value: Any) -> str:
 def to_map_json_bytes(value: Any) -> bytes:
     """在工作线程编码完整地图响应，限制单次栅格展开与编码的工作量。"""
 
-    # 其它字段仍由正式模型转换时间、枚举等类型；仅延后地图嵌套字段和栅格数据。
+    # 其它字段仍由正式模型转换时间、枚举等类型；栅格数据完整分段编码。
     deferred_fields = {
-        MapWorkspace: {"latest_map_snapshot"},
-        MapAssetBundle: {"snapshot"},
-        MapSnapshot: {"occupancy_grid", "cost_map"},
         OccupancyGrid: {"data"},
         CostMap: {"data"},
     }

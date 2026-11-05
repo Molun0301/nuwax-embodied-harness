@@ -8,11 +8,11 @@ import pytest
 from contracts.geometry import FrameTree, Pose, Transform, Vector3
 from contracts.perception import Observation
 from contracts.spatial_memory import InstanceDynamicState
-from scripts.diagnostics import object_memory_integration_20261014 as integration
+from tests import test_a2d_memory_inputs as integration
 from services.memory.inspection_pose_planner import InspectionPosePlanner
 from services.memory.instance_association_service import InstanceAssociationService
 from services.memory.object_extent import object_extent_payload
-from services.memory.semantic_map_builder import SemanticMapBuildResult
+from services.memory.semantic_map.semantic_map_builder import SemanticMapBuildResult
 from services.memory.vision_to_map_projection_service import ProjectedObservation, VisionToMapProjectionService
 
 NOW = datetime(2026, 10, 14, 4, tzinfo=timezone.utc)
@@ -37,7 +37,7 @@ class Sequence:
 
     def add(self, item, *, seconds=0):
         self.instances, outcomes = self.service.associate([item], existing_instances=self.instances,
-            map_name='house', localization_session_id='session', now=NOW+timedelta(seconds=seconds))
+            map_name='house',  now=NOW+timedelta(seconds=seconds))
         return outcomes[0].instance
 
 
@@ -49,7 +49,7 @@ def project(robot, *, tree=None, frame='map'):
     map_context = SemanticMapBuildResult(map_name='house', frame_id=frame,
         semantic_regions=(), anchors_by_id={}, topology_nodes_by_id={})
     return VisionToMapProjectionService().project(context, current_pose=robot, map_context=map_context,
-        localization_snapshot=SimpleNamespace(frame_tree=tree, current_pose=robot))
+        frame_tree=tree)
 
 
 def test_projection_keeps_observer_height_and_capture_time_separate_from_object_extent():
@@ -131,21 +131,18 @@ def test_observerless_fallback_retains_previous_observer_extent_and_inspection_p
     assert fallback.attributes['observer_body_pose'] == robot.model_dump(mode='json')
 
 
-def test_real_ingest_sqlite_reopen_retains_latest_observer_and_original_object_identity():
-    case = integration.ObjectMemoryIntegration()
-    case.setUp()
-    try:
-        service = case.service()
-        first_robot = integration.position(.5,.5,-.25)
-        case.settle(service, [integration.detection3d()], pose=first_robot)
-        before = case.stored(service)[0]
+def test_real_ingest_sqlite_reopen_retains_latest_observer_and_original_object_identity(tmp_path):
+    first_robot = integration.position(.5,.5,-.25)
+    with integration.memory_at(tmp_path) as (service, _):
+        for second in range(3):
+            integration.ingest(service,[integration.detection3d()],pose=first_robot,now=NOW+timedelta(seconds=second))
+        before = service.records('instance')[0]
         assert before.attributes['observer_body_pose'] == first_robot.model_dump(mode='json')
         assert before.inspection_poses[0] == first_robot
-        service.close()
-        reopened = case.service()
-        next_robot = integration.position(1,1,-.4)
-        case.ingest(reopened,[integration.detection3d()],second=86400,pose=next_robot,session='next_day')
-        stored = case.stored(reopened)
+    next_robot = integration.position(1,1,-.4)
+    with integration.memory_at(tmp_path) as (reopened, _):
+        integration.ingest(reopened,[integration.detection3d()],pose=next_robot,now=NOW+timedelta(seconds=86400))
+        stored = reopened.records('instance')
         assert len(stored) == 1
         after = stored[0]
         assert after.instance_id == before.instance_id
@@ -155,14 +152,11 @@ def test_real_ingest_sqlite_reopen_retains_latest_observer_and_original_object_i
         assert all(p.position.z == -.4 for p in after.inspection_poses)
         assert object_extent_payload(after)['center']['z'] == pytest.approx(.7)
         assert object_extent_payload(after)['size_m'] == {'x':.9,'y':.9,'z':1.1}
-        reopened.close()
-        twice = case.service()
-        final = case.stored(twice)[0]
+    with integration.memory_at(tmp_path) as (twice, _):
+        final = twice.records('instance')[0]
         assert final.instance_id == before.instance_id
         assert final.attributes['observer_body_pose'] == next_robot.model_dump(mode='json')
         assert final.inspection_poses[0] == next_robot
-    finally:
-        case.doCleanups()
 
 
 def test_planner_rejects_mismatched_observer_frame():

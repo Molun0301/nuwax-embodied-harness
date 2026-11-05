@@ -9,82 +9,9 @@ from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from gateways.runtime import GatewayRuntime
 from services.audio.service import AudioService
-from skills.handlers import audio_skills
 
 
-class Health(unittest.TestCase):
-    def test_health_summary_never_waits_for_explicit_audio_device_read(self):
-        entered, resume, finished = threading.Event(), threading.Event(), threading.Event()
-        results = []
-        errors = []
-
-        def volume():
-            entered.set()
-            assert resume.wait(2)
-            return {"volume": 0.4}
-
-        robot = NS(
-            get_vui_volume_info=volume,
-            manifest=NS(robot_name="generic", robot_model="generated"),
-            get_status=dict,
-        )
-        snap = NS(get_latest_snapshot=lambda: None, get_active_session=lambda: None)
-        health = NS(model_dump=lambda **k: {})
-        r = NS(
-            robot=robot,
-            robot_state_service=snap,
-            localization_service=snap,
-            mapping_service=snap,
-            navigation_service=NS(
-                get_latest_navigation_context=lambda: None, get_latest_exploration_context=lambda: None
-            ),
-            perception_video_runtime=NS(get_status=lambda: None),
-            map_workspace_service=NS(get_active_workspace_identity=lambda: None),
-            artifact_service=NS(get_cached_summary=lambda: None, get_maintenance_status=dict),
-            platform_geometry_runtime=NS(get_runtime_status=dict),
-            _runtime_geometry_asset_summary=lambda *a: None,
-            _build_service_health_summary=lambda **k: health,
-            _started=True,
-            _serialize=lambda x: x,
-            audio_service=AudioService(config=NS(), robot=robot),
-            task_manager=NS(count_active_tasks=lambda: 0),
-            event_bus=NS(latest_cursor=lambda: 0),
-            stream_bus=NS(latest_cursor=lambda: 0, status=dict),
-            artifact_store=NS(base_dir="test-owned"),
-            config=NS(gateway=NS(public_base_url="http://synthetic.invalid")),
-            resource_lock_manager=NS(snapshot=list),
-            get_event_log_status=dict,
-        )
-        for name in ("robot_state", "localization", "map", "navigation", "exploration", "perception", "workspace"):
-            setattr(r, "_health_" + name + "_summary", lambda *a: {})
-
-        def run():
-            try:
-                results.append(GatewayRuntime.get_health_summary(r))
-            except BaseException as e:  # noqa: BLE001 - Forward every test-thread failure.
-                errors.append(e)
-            finally:
-                finished.set()
-
-        reader = threading.Thread(target=r.audio_service.get_volume_state)
-        reader.start()
-        t = threading.Thread(target=run)
-        try:
-            self.assertTrue(entered.wait(1))
-            t.start()
-            self.assertTrue(finished.wait(1))
-            self.assertEqual(errors, [])
-            self.assertIsNone(results[0]["audio_state"]["volume"])
-            self.assertTrue(results[0]["audio_state"]["refresh_in_progress"])
-        finally:
-            resume.set()
-            reader.join(2)
-            t.join(2)
-        self.assertFalse(reader.is_alive())
-        self.assertFalse(t.is_alive())
-        self.assertEqual(r.audio_service.get_cached_volume_state()["volume"], 0.4)
 
 
 class AudioCache(unittest.TestCase):
@@ -104,18 +31,6 @@ class AudioCache(unittest.TestCase):
         self.assertEqual(service.set_volume(-1)["volume"], 0.0)
         self.assertIsNotNone(service.get_cached_volume_state()["observed_at"])
 
-    def test_explicit_get_and_set_handlers_remain_live(self):
-        robot = NS(
-            get_vui_volume_info=Mock(return_value={"volume": 0.3}),
-            set_vui_volume_ratio=Mock(return_value={"volume": 0.6}),
-        )
-        service = self.service(robot)
-        ctx = NS(audio_service=service)
-        self.assertEqual(audio_skills.handle_get_volume(ctx, {})["volume_state"]["volume"], 0.3)
-        self.assertEqual(audio_skills.handle_set_volume(ctx, {"volume": 0.8})["volume_state"]["volume"], 0.6)
-        robot.get_vui_volume_info.assert_called_once_with()
-        robot.set_vui_volume_ratio.assert_called_once_with(0.8, False)
-        self.assertEqual(service.get_cached_volume_state()["volume"], 0.6)
 
     def test_cache_and_explicit_results_own_nested_device_data(self):
         raw = {"volume": 0.3, "details": {"level": 3}}

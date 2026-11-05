@@ -22,12 +22,15 @@ def register_building(platform, args):
 
 @rpc_errors
 def navigate_to_floor(platform, ctx, args):
-    return _navigate_to_floor(platform, ctx, args)
+    from gateways.capabilities.navigation import navigate_to_pose
+    return _navigate_to_floor(platform, ctx, args, navigate=navigate_to_pose)
 
 
 @rpc_errors
 def explore_building(platform, ctx, args):
-    return _explore_building(platform, ctx, args)
+    from gateways.capabilities.navigation import navigate_to_pose
+    from gateways.capabilities.exploration import explore_area
+    return _explore_building(platform, ctx, args, navigate=navigate_to_pose, explore=explore_area)
 
 
 TEXT = {"type": "string", "minLength": 1}

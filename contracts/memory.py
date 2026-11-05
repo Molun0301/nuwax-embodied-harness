@@ -41,7 +41,6 @@ class TaggedLocation(TimestampedContract):
     aliases: List[str] = Field(default_factory=list, description="地点别名列表。")
     pose: Pose = Field(description="记录时的机器人位姿。")
     map_name: Optional[str] = Field(default=None, description="关联地图名称。")
-    localization_session_id: Optional[str] = Field(default=None, description="关联定位会话。")
     localization_source_name: Optional[str] = Field(default=None, description="定位来源名称。")
     topo_node_id: Optional[str] = Field(default=None, description="关联拓扑节点标识。")
     semantic_region_id: Optional[str] = Field(default=None, description="关联语义区域标识。")
@@ -91,7 +90,6 @@ class SemanticMemoryEntry(TimestampedContract):
     )
     observation_count: int = Field(default=0, ge=0, description="累计观测次数。")
     map_name: Optional[str] = Field(default=None, description="关联地图名称。")
-    localization_session_id: Optional[str] = Field(default=None, description="关联定位会话。")
     topo_node_id: Optional[str] = Field(default=None, description="关联拓扑节点标识。")
     semantic_region_id: Optional[str] = Field(default=None, description="关联语义区域标识。")
     scene_space_id: Optional[str] = Field(default=None, description="关联场景空间标识。")
@@ -250,7 +248,6 @@ class MemoryPayloadFilter(ContractModel):
 
     record_kinds: List[MemoryRecordKind] = Field(default_factory=list, description="限制检索的记录类型。")
     map_name: Optional[str] = Field(default=None, description="限定地图名称。")
-    localization_session_id: Optional[str] = Field(default=None, description="限定定位会话。")
     linked_location_id: Optional[str] = Field(default=None, description="限定关联地点标识。")
     camera_ids: List[str] = Field(default_factory=list, description="限定相机标识列表。")
     semantic_labels_any: List[str] = Field(default_factory=list, description="要求命中任一语义标签。")

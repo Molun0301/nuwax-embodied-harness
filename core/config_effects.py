@@ -21,7 +21,6 @@ HOT_FIELDS = {
         ("BURST_FRAME_COUNT", "burst_frame_count"), ("BURST_INTERVAL_SEC", "burst_interval_sec"))},
     **{"NUWAX_PERCEPTION_YOLO_WORLD_" + key: "perception.yolo_world." + attribute for key, attribute in (
         ("CONFIDENCE", "confidence_threshold"), ("IOU", "iou_threshold"), ("MAX_DETECTIONS", "max_detections"))},
-    "NUWAX_MAP_DELETE_ALSO_DELETE_LIBRARY": "runtime_data.map_delete_also_delete_library",
 }
 
 # 通用日志设置也传递给外部进程，因此本进程可立即应用，外部进程仍需重启。

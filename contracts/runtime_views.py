@@ -413,7 +413,6 @@ class NavigationSemanticContext(TimestampedContract):
     """平台当前激活地图的语义导航上下文。"""
 
     map_name: Optional[str] = Field(default=None, description="当前地图名称。")
-    localization_session_id: Optional[str] = Field(default=None, description="当前绑定的定位会话。")
     localization_ready: bool = Field(default=False, description="当前平台定位是否已就绪。")
     semantic_regions: List[SpatialSemanticRegion] = Field(default_factory=list, description="当前语义区域集合。")
     scene_spaces: List[SpatialSceneSpace] = Field(default_factory=list, description="当前场景空间集合。")

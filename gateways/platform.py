@@ -33,7 +33,6 @@ class Platform:
     def start(self) -> None:
         self.robot.start()
         self.robot_state.start()
-        self.memory.start_instance_stream()
         self.streams.start()
         if self.perception.video_runtime.should_auto_start():
             self.perception.video_runtime.start()
@@ -41,7 +40,8 @@ class Platform:
     def stop(self) -> None:
         operations = [self.tasks.shutdown, self.map_cleanup.close, self.streams.stop, self.input_bridge.stop,
                       self.geometry_state.stop, self.perception.video_runtime.close,
-                      self.perception.close, self.follow.close, self.memory.close, self.artifacts.close,
+                      self.perception.close, self.follow.close, self.scene_mapping.close,
+                      self.memory.close, self.artifacts.close,
                       self.motion.close, self.geometry.close, self.places.close, self.buildings.close,
                       self.audio.stop, self.robot_state.stop,
                       self.robot.stop, self.streams.close, self.events.shutdown]
@@ -85,6 +85,7 @@ def build_platform(config) -> Platform:
     from services.artifact_store import LocalArtifactStore
     from services.audio.service import AudioService
     from services.memory.service import MemoryService
+    from services.memory.semantic_map.scene_mapping import SceneMappingService
     from services.navigation.building_catalog import BuildingCatalog
     from services.navigation.facilities.http_provider import load_facility_providers
     from services.navigation.exploration_checkpoint import ExplorationCheckpoints
@@ -137,21 +138,27 @@ def build_platform(config) -> Platform:
             os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm"),
             providers if isinstance(providers, ImageProvider) else None,
             platform.robot.defaults.frame_ids.get("camera_front", "camera_front")))
-    platform.memory = MemoryService(localization_service=platform.geometry_state, mapping_service=platform.geometry_state,
+    has_geometry_input = any(isinstance(providers, protocol) for protocol in (
+        StreamingSensorSampleProvider, StreamingLocalizationProvider, StreamingPointCloudProvider))
+    platform.memory = MemoryService(geometry_state=platform.geometry_state if has_geometry_input else None,
+        maps_root=platform.maps.root,
+        default_root=Path(config.base_dir) / "runtime_data" / "memory" / "default",
         observation_service=observation, perception_service=platform.perception, state_store=state_store,
         event_bus=platform.events, artifact_store=store, stream_bus=stream_bus,
-        memory_db_path=config.runtime_data.memory_db_path, embedding_model=config.runtime_data.memory_embedding_model,
+        embedding_model=config.runtime_data.memory_embedding_model,
         embedding_dimension=config.runtime_data.memory_embedding_dimension,
         image_embedding_model=config.runtime_data.memory_image_embedding_model,
         image_embedding_dimension=config.runtime_data.memory_image_embedding_dimension,
         embedding_api_key=config.runtime_data.memory_embedding_api_key, embedding_base_url=config.runtime_data.memory_embedding_base_url,
         embedding_timeout_sec=config.runtime_data.memory_embedding_timeout_sec,
         deferred_projection_config=config.perception.deferred_projection, association_config=config.perception.instance_association)
+    platform.scene_mapping = SceneMappingService(memory_service=platform.memory,
+        geometry_state=platform.geometry_state, config=config.scene_mapping, stream_bus=stream_bus)
     platform.follow = GatewayPersonFollowBridge()
     platform.buildings = BuildingCatalog(platform.maps, providers=load_facility_providers(
         config.geometry.navigation.facility_providers_json))
     platform.places = PlaceLookup()
-    platform.navigation_memory = NavigationMemory(platform.memory, platform.geometry_state, platform.perception)
+    platform.navigation_memory = NavigationMemory(platform.memory, platform.geometry_state, platform.perception, artifacts)
     platform.robot_state = RobotStateService(platform.robot, state_store=state_store,
                                             event_bus=platform.events, stream_bus=stream_bus)
     platform.artifacts = artifacts

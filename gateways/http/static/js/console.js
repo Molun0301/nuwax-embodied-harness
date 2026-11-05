@@ -1729,7 +1729,9 @@
       };
       window.__nuwaxMapBinding = function () {
         return {map_name: state.mapGrid?.map_id || activeMapName(),
-          frame_id: state.mapGrid?.frame_id || null, available: Boolean(state.mapGrid)};
+          frame_id: state.mapGrid?.frame_id || null,
+          map_revision: state.mapGrid ? state.lastMapEnvelope?.revision : null,
+          available: Boolean(state.mapGrid)};
       };
       function formatPoseMetric(value) {
         const number = Number(value);

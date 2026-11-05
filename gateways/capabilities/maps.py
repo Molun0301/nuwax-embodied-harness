@@ -2,6 +2,7 @@
 from dataclasses import asdict
 from datetime import datetime, timezone
 import math
+import threading
 from contracts.forbidden_zones import ForbiddenZone
 from contracts.map_workspace import (
     MAP_GEOREFERENCE_SCHEMA_VERSION, MAP_GEOREFERENCE_SOURCE_CRS, MAP_GEOREFERENCE_PROJECTED_CRS,
@@ -34,7 +35,6 @@ def start_mapping(platform, args):
         now = datetime.now(timezone.utc).isoformat()
         platform.maps.write_meta(args["map_name"], {**meta, "display_name": meta.get("display_name", args["map_name"]),
                                   "created_at": meta.get("created_at", now), "updated_at": now})
-        platform.memory.ensure_memory_library(library_name=args["map_name"])
     return asdict(snap)
 
 
@@ -54,16 +54,22 @@ def save_map(platform, ctx, args):
     zones = platform.maps.read_forbidden_zones(source_name) if source_name else []
     name = args.get("map_name", "") or source_name
     ctx.progress(0.1, "saving", f"正在保存地图 {name}")
-    saved = platform.geometry.save_map(name, timeout_sec=ctx.remaining())
+    migrating = bool(source_name and name != source_name and not (source is not None and source.saved))
+    if migrating:
+        platform.memory.expect_rename(source_name, name)
+    try:
+        saved = platform.geometry.save_map(name, timeout_sec=ctx.remaining())
+    except BaseException:
+        if migrating:
+            platform.memory.clear_expected_rename()
+        raise
     ctx.check()
     renamed = bool(source_name and source_name != saved.map_name)
     if renamed:
         platform.maps.write_forbidden_zones(saved.map_name, zones)
-        if source is not None and not source.saved:
-            platform.memory.rename_memory_library(library_name=source_name, new_library_name=saved.map_name)
+        if migrating:
+            platform.memory.wait_for_library(saved.map_name, ctx)
             platform.maps.delete(source_name)
-        else:
-            platform.memory.ensure_memory_library(library_name=saved.map_name)
     now = datetime.now(timezone.utc).isoformat()
     meta.update(display_name=meta.get("display_name", saved.map_name),
                 created_at=meta.get("created_at", now), updated_at=now)
@@ -89,8 +95,6 @@ def load_map(platform, ctx, args):
     platform.geometry.load_map(args["map_name"], timeout_sec=ctx.remaining())
     ctx.check()
     result = relocalize(platform, ctx, args)
-    platform.memory.activate_memory_library(library_name=args["map_name"],
-                    load_history=args.get("load_memory_history", True), reset_library=args.get("reset_memory_library", False))
     return result
 
 
@@ -99,10 +103,20 @@ def delete_map(platform, args):
     name = args["map_name"]
     snap = platform.geometry_state.snapshot()
     if snap is not None and snap.map_name == name and components.status().get("geometry", {}).get("state") == "running":
-        platform.geometry.stop_session()
+        exited = threading.Event()
+        unsubscribe = platform.geometry_state.subscribe(
+            lambda state: exited.set() if state.map_name != name else None)
+        try:
+            platform.geometry.stop_session()
+            current = platform.geometry_state.snapshot()
+            if current is None or current.map_name != name:
+                exited.set()
+            # 等订阅退出旧图，避免旧状态迟到时重新打开刚删除的目录。
+            exited.wait()
+        finally:
+            unsubscribe()
+    platform.memory.delete_library(name)
     platform.maps.delete(name)
-    if args.get("delete_memory_library", False):
-        platform.memory.delete_memory_library(library_name=name)
     return {"map_name": name, "deleted": True}
 
 
@@ -204,14 +218,13 @@ CAPABILITIES = [
                schema({"map_name": TEXT, "reason": TEXT, "georeference": georeference_schema()}),
                "task", save_map, needs=("geometry",), timeout_sec=120),
     Capability("load_map", "加载地图并执行重定位。",
-               schema({"map_name": TEXT, "load_memory_history": {"type": "boolean"},
-                       "reset_memory_library": {"type": "boolean"}, "timeout_sec": TIMEOUT}, ("map_name",)),
+               schema({"map_name": TEXT, "timeout_sec": TIMEOUT}, ("map_name",)),
                "task", load_map, needs=("geometry",), timeout_sec=120),
     Capability("relocalize_active_map", "在已加载地图上重定位。",
                schema({"planar_seed": SEED, "timeout_sec": TIMEOUT}),
                "task", relocalize, needs=("geometry",), timeout_sec=120),
-    Capability("delete_map", "删除地图并按参数删除同名记忆库。",
-               schema({"map_name": TEXT, "delete_memory_library": {"type": "boolean"}}, ("map_name",)), "action", delete_map),
+    Capability("delete_map", "删除地图及同目录的记忆库。",
+               schema({"map_name": TEXT}, ("map_name",)), "action", delete_map),
     Capability("list_forbidden_zones", "读取地图禁行区。", schema({"map_name": TEXT}, ("map_name",)), "query",
                lambda p, a: {"map_name": a["map_name"], "zones": p.maps.read_forbidden_zones(a["map_name"])}),
     Capability("replace_forbidden_zones", "整体替换禁行区，下次规划生效。",

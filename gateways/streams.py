@@ -122,7 +122,8 @@ class Streams:
             base_revision_ordinal=value.base_revision_ordinal, reset=value.reset)
 
     def _map_updated(self, value):
-        self.stream_bus.publish("map.frame", source="geometry", payload=value, frame_id=value.grid.frame_id)
+        self.stream_bus.publish("map.frame", source="geometry", payload=value, frame_id=value.grid.frame_id,
+                                revision=str(value.grid.timestamp_ns))
         self._cloud_wake.set()
 
     def _state_updated(self, value):

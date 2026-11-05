@@ -34,21 +34,18 @@ class SceneSpaceSampler:
         observation_events: Iterable[ObservationEvent] = (),
         semantic_instances: Iterable[SemanticInstance] = (),
         max_samples: int = 8,
-        identity_resolver: Optional[SampleIdentityResolver] = None,
     ) -> SceneSpaceSamplingResult:
         existing_ids = {}
         for existing in scene_space.observation_samples:
             key = self._sample_source_key(existing)
             if key is not None:
                 existing_ids.setdefault(key, set()).add(existing.sample_id)
-        # Keep only unique evidence-based identities. Conflicting historical
-        # samples stay untouched; no arbitrary alias is selected for new input.
+        # 沿用已有样本的业务编号；重复编号不改变已有证据。
         identities = {key: next(iter(values)) for key, values in existing_ids.items() if len(values) == 1}
         def resolve_identity(source_kind, source_key):
             key = (source_kind, source_key)
             if key not in identities:
-                identities[key] = (identity_resolver(*key) if identity_resolver is not None
-                                   else "sample_" + uuid.uuid4().hex)
+                identities[key] = "sample_" + uuid.uuid4().hex
             return identities[key]
 
         scored_samples: List[Tuple[float, SceneObservationSample]] = []
@@ -245,8 +242,7 @@ class SceneSpaceSampler:
         seen_keys = set()
         seen_ids = set()
         for _, sample in scored_samples:
-            # Evidence selection deliberately retains its historical event-first
-            # suppression policy, independently of typed durable sample identity.
+            # 证据选择沿用观察事件优先的去重规则，同源样本编号单独复用。
             key = sample.observation_event_id or sample.metadata.get("source_instance_id") or sample.sample_id
             if key in seen_keys or sample.sample_id in seen_ids:
                 continue
@@ -284,7 +280,7 @@ class SceneSpaceSampler:
     def _sample_source_key(self, sample: SceneObservationSample) -> Optional[Tuple[str, str]]:
         source_kind = sample.metadata.get("source_record_kind")
         instance_id = self._coerce_optional_string(sample.metadata.get("source_instance_id"))
-        # A semantic instance's last event is evidence, never its identity.
+        # 实例的最近观察事件是证据，不作为实例编号。
         if source_kind == "semantic_instance" or (source_kind is None and instance_id):
             return ("semantic_instance", instance_id) if instance_id else None
         if source_kind in (None, "observation_event") and sample.observation_event_id:

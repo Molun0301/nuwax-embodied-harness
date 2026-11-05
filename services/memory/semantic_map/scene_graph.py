@@ -11,9 +11,9 @@ from typing import Any, Dict, List, Optional
 from contracts.base import utc_now
 from contracts.scene_graph import SceneGraphEdge, SceneGraphNode, SceneGraphSnapshot
 from core.errors import GatewayError
-from services.memory.scene_graph_geometry import build_scene_graph_geometry
-from services.memory.scene_mapping_state import same_scope
-from services.memory.scene_revisions import binding_value
+from services.memory.semantic_map.scene_graph_geometry import build_scene_graph_geometry
+from services.memory.semantic_map.scene_mapping_state import same_scope
+from services.memory.semantic_map.scene_revisions import binding_value
 
 _LIMITATIONS = ["连接依据当前二维已知自由格；门状态、真实净高和机体通行尚未检查。",
                 "高度范围沿现有地图切片归属，不表示已建立多楼层连接。",
@@ -51,65 +51,51 @@ class SceneGraphService:
             self._geometry_key = self._index_key = None
 
     def _capture(self):
-        # Serialize graph publication only. The memory APIs own their short
-        # capture transactions; geometry/index construction runs after release.
         with self._lock:
-            stamp = self.memory.capture_scene_graph_stamp()
-            transactional = stamp.get("transactional", False)
-            if (not transactional and self._index is not None and stamp["stamp_key"] == self._index_key
-                    and self._within_deadline(self._index.valid_until)):
-                stamp["valid_until"] = self._index.valid_until
-                self._assert_capture(stamp)
-                return stamp, self._index
-            capture = self.memory.capture_scene_graph_state(stamp=stamp)
+            capture = self.memory.capture_scene_graph_state()
             binding = capture["binding"]
+            records = capture["memory_snapshot"].records
+            source_key = (binding_value(binding), *(records[kind] for kind in ("scene_space", "memory", "instance")))
+            if self._index is not None and source_key == self._index_key and self._within_deadline(self._index.valid_until):
+                self._assert_capture(capture)
+                return capture, self._index
             spaces = sorted((space for space in capture["spaces"]
-                             if same_scope(space.metadata.get("map_binding", {}), binding)
-                             and str(space.metadata["map_binding"].get("update_sequence", "")) == binding["update_sequence"]
-                             and str(space.review_status.value) not in ("stale", "rejected")),
-                            key=lambda space: space.scene_space_id)
-            geometry_key = (capture["library_incarnation"], capture["generation"],
-                            capture.get("load_history", True),
-                            capture.get("geometry_visibility_generation", 0) if not capture.get("load_history", True) else 0,
-                            capture["geometry_generation"], *binding_value(binding))
+                if same_scope(space.metadata.get("map_binding", {}), binding)
+                and space.metadata["map_binding"].get("map_revision") == binding["map_revision"]
+                and str(space.review_status.value) not in ("stale", "rejected")), key=lambda value: value.scene_space_id)
+            from services.memory.semantic_map.scene_revisions import graph_geometry_value
+            geometry_key = (binding_value(binding), tuple(graph_geometry_value(space) for space in spaces))
             geometry = self._geometry
-            if transactional or geometry is None or geometry_key != self._geometry_key:
-                geometry = build_scene_graph_geometry(capture["snapshot"], spaces, max_cells=self.max_cells)
+            if geometry is None or geometry_key != self._geometry_key:
+                geometry = build_scene_graph_geometry(capture["grid"], spaces, max_cells=self.max_cells)
             sequence = self._publication_sequence + 1
-            revision = (f"graph_v2_{self._graph_epoch}_tx_{uuid.uuid4().hex}" if transactional
-                        else f"graph_v2_{self._graph_epoch}_{sequence}")
+            revision = f"graph_v2_{self._graph_epoch}_{sequence}"
             index = self._build(capture, spaces, geometry, graph_revision=revision)
-            # A failed or obsolete build changes neither cached state nor the
-            # public sequence, including lifecycle expiry during construction.
             self._assert_capture(capture)
-            if not transactional:
-                self._geometry, self._geometry_key = geometry, geometry_key
-                self._index, self._index_key = index, capture["stamp_key"]
-                self._publication_sequence = sequence
-            stamp["valid_until"] = index.valid_until
-            return stamp, index
+            self._geometry, self._geometry_key = geometry, geometry_key
+            self._index, self._index_key = index, source_key
+            self._publication_sequence = sequence
+            return capture, index
 
     @staticmethod
     def _within_deadline(valid_until):
         return valid_until is None or utc_now().timestamp() < valid_until
 
     def _assert_capture(self, capture):
-        self.memory.assert_scene_graph_capture(capture)
+        self.memory._assert_scene_mapping_capture(capture)
         if not self._within_deadline(capture.get("valid_until")):
             raise GatewayError("物品状态在图查询期间已过期，请重新读取。", error_code="scene_graph_changed", http_status=409)
 
     @staticmethod
     def _public_identity(index):
         snapshot = index.snapshot
-        return {"schema_version": getattr(snapshot, "schema_version", 1),
-                "graph_epoch": getattr(snapshot, "graph_epoch", None),
+        return {"schema_version": snapshot.schema_version,
+                "graph_epoch": snapshot.graph_epoch,
                 "map_binding": snapshot.map_binding, "graph_revision": snapshot.graph_revision}
 
     @staticmethod
     def _same_source(row, binding):
-        return (row.get("map_name") == binding["map_name"]
-                and row.get("map_source_name") == binding["source_name"]
-                and row.get("map_source_epoch") == binding["source_epoch"])
+        return row.get("map_name") == binding["map_name"]
 
     def _build(self, capture, spaces, geometry, *, graph_revision):
         binding = capture["binding"]
@@ -146,8 +132,6 @@ class SceneGraphService:
             row = {**entry.metadata, "map_name": entry.map_name}
             if not self._same_source(row, binding) or entry.pose is None or entry.pose.frame_id != binding["frame_id"]:
                 continue
-            if str(entry.metadata.get("map_update_sequence", "")) != binding["update_sequence"]:
-                continue
             try:
                 observed_at = datetime.fromisoformat(str(entry.metadata.get("frame_timestamp", "")).replace("Z", "+00:00"))
                 if observed_at.tzinfo is None or abs((entry.pose.timestamp - observed_at).total_seconds()) > 1:
@@ -179,7 +163,6 @@ class SceneGraphService:
                 continue
             position_valid = (not row["is_fallback"] and not row["observation_only"]
                               and row["frame_id"] == binding["frame_id"]
-                              and str(row["map_update_sequence"]) == binding["update_sequence"]
                               and row["lifecycle_state"] in ("active", "uncertain"))
             position = row["pose"] if position_valid else None
             region_id = geometry.region_at(position) if position else None
@@ -286,14 +269,12 @@ class SceneGraphService:
             raise GatewayError("当前关系图没有该节点。", error_code="scene_graph_node_not_found", http_status=404)
         node = index.nodes[node_id]
         images = []
-        store = self.memory._artifact_store
         for artifact_id in node.artifact_ids:
             try:
-                ref = store.get_ref(artifact_id) if store else None
-                if ref and ref.mime_type.startswith("image/"):
-                    images.append({"artifact_id": artifact_id, "available": store.get_file_path(artifact_id).is_file(),
-                                   "url": "/artifacts/" + artifact_id, "mime_type": ref.mime_type,
-                                   "metadata": {key: ref.metadata.get(key) for key in ("camera_id", "frame_timestamp")}})
+                ref = self.memory.core.photo_ref(artifact_id, library_name=capture["library_name"])
+                if ref.mime_type.startswith("image/"):
+                    images.append({"artifact_id": artifact_id, "available": True, "url": ref.uri,
+                                   "mime_type": ref.mime_type, "metadata": ref.metadata})
             except (OSError, KeyError, GatewayError):
                 images.append({"artifact_id": artifact_id, "available": False})
         self._assert_capture(capture)
@@ -352,22 +333,19 @@ class SceneGraphService:
         return result
 
     def image(self, *, node_id: Optional[str] = None, expected_graph_revision: Optional[str] = None, width: int = 1280):
-        from services.memory.scene_graph_image import render_scene_graph_image
+        from services.memory.semantic_map.scene_graph_image import render_scene_graph_image
         capture, index = self._capture()
         self._check_revision(index, expected_graph_revision)
         if node_id and node_id not in index.nodes:
             raise GatewayError("当前关系图没有该节点。", error_code="scene_graph_node_not_found", http_status=404)
-        store = self.memory._artifact_store
-        if store is None:
-            raise GatewayError("制品存储不可用。", error_code="artifact_store_unavailable", http_status=409)
-        rendered = render_scene_graph_image(index, capture["snapshot"], node_id=node_id, width=width)
+        rendered = render_scene_graph_image(index, capture["grid"], node_id=node_id, width=width)
         self._assert_capture(capture)
-        from contracts.artifacts import ArtifactKind
-        with store.publication_scope(owner="memory.scene_graph.image"):
-            artifact = store.save_bytes(kind=ArtifactKind.IMAGE, mime_type="image/png", data=rendered.pop("png"), extension=".png",
-                metadata={"source": "semantic_scene_graph", **self._public_identity(index),
-                          "node_id": node_id, **rendered})
-            self._assert_capture(capture)
-            return {**self._public_identity(index),
-                    "artifact": artifact.model_dump(mode="json"), **rendered,
-                    "navigation_checked": False, "image_is_new_observation": False}
+        from contracts.naming import build_artifact_id
+        artifact = self.memory.core.save_photo(build_artifact_id("image"), rendered.pop("png"),
+            map_name=capture["library_name"], mime_type="image/png")
+        if artifact is None:
+            raise GatewayError("记忆库已切换，关系图图片未保存。", error_code="memory_library_changed", http_status=409)
+        artifact = artifact.model_copy(update={"metadata": {**artifact.metadata, "source": "semantic_scene_graph",
+            **self._public_identity(index), "node_id": node_id, **rendered}})
+        return {**self._public_identity(index), "artifact": artifact.model_dump(mode="json"), **rendered,
+                "navigation_checked": False, "image_is_new_observation": False}

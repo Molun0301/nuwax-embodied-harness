@@ -1,5 +1,11 @@
-"""记忆服务导出。"""
+"""记忆业务包；算法模块可独立导入。"""
 
-from services.memory.service import MemoryService
+
+def __getattr__(name):
+    if name == "MemoryService":
+        from services.memory.service import MemoryService
+        return MemoryService
+    raise AttributeError(name)
+
 
 __all__ = ["MemoryService"]

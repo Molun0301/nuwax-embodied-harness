@@ -9,7 +9,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from contracts.occupancy_cells import PackedOccupancyCells
 from core.errors import GatewayError
-from services.memory.room_segmentation import _local
+from services.memory.semantic_map.room_segmentation import _local
 
 
 def _font(size):
@@ -21,25 +21,25 @@ def _font(size):
 
 
 def _display_cells(occupancy, labels, size):
-    """Sample only presentation pixels, using Pillow's exact nearest-neighbor choices."""
+    """只采样显示像素，保持Pillow（图像库）的最近邻选点完全一致。"""
     height, width = occupancy.shape
     if size[0] >= width and size[1] >= height:
         return occupancy, labels
-    # Let Pillow choose indices: hand-written ratios can differ at rounding boundaries.
+    # 使用图像库选择索引，手写比例在取整边界处可能不同。
     cols = np.asarray(Image.fromarray(np.arange(width, dtype=np.int32)[None, :]).resize(
         (size[0], 1), Image.Resampling.NEAREST))[0]
     rows = np.asarray(Image.fromarray(np.arange(height, dtype=np.int32)[:, None]).resize(
         (1, size[1]), Image.Resampling.NEAREST))[:, 0]
-    # The renderer flips vertically after colorization; sample in that same orientation.
+    # 渲染在着色后上下翻转，采样沿用相同方向。
     rows = height - 1 - rows[::-1]
     selection = np.ix_(rows, cols)
     return occupancy[selection], labels[selection]
 
 
-def render_scene_graph_image(index, snapshot, *, node_id=None, width=1280):
+def render_scene_graph_image(index, grid, *, node_id=None, width=1280):
     if not isinstance(width, int) or isinstance(width, bool) or not 512 <= width <= 2048:
         raise GatewayError("图像宽度应为512至2048像素。", error_code="invalid_params", http_status=422)
-    grid, geometry = snapshot.occupancy_grid, index.geometry
+    geometry = index.geometry
     height = max(512, min(1536, round(width * grid.height / grid.width) + 140))
     left, bottom, right, top = 0, 0, grid.width, grid.height
     focus = index.nodes.get(node_id)
@@ -82,7 +82,7 @@ def render_scene_graph_image(index, snapshot, *, node_id=None, width=1280):
     title_font, _ = _font(22)
     title = "空间语义地图" if chinese else "Spatial semantic map"
     draw.text((24, 16), title, fill="#172027", font=title_font)
-    draw.text((24, 45), "Graph " + index.snapshot.graph_revision[:16] + "  |  " + snapshot.frame_id, fill="#56616b", font=font)
+    draw.text((24, 45), "Graph " + index.snapshot.graph_revision[:16] + "  |  " + grid.frame_id, fill="#56616b", font=font)
 
     def project(position):
         gx, gy = _local(position.x, position.y, geometry.origin, geometry.resolution)
@@ -134,7 +134,7 @@ def render_scene_graph_image(index, snapshot, *, node_id=None, width=1280):
     stream = io.BytesIO()
     canvas.save(stream, format="PNG")
     return {"png": stream.getvalue(), "width": width, "height": height, "legend": legend,
-            "coordinate_mapping": {"frame_id": snapshot.frame_id, "grid_origin": geometry.origin,
+            "coordinate_mapping": {"frame_id": grid.frame_id, "grid_origin": geometry.origin,
                                    "resolution_m": geometry.resolution, "crop_cells": [left, bottom, right, top],
                                    "pixel_origin": [x0, y0], "pixels_per_cell": [scale_x, scale_y], "image_y_points_down": True},
-            "map_snapshot_timestamp": snapshot.timestamp.isoformat(), "navigation_checked": False}
+            "map_snapshot_timestamp": grid.timestamp.isoformat(), "navigation_checked": False}

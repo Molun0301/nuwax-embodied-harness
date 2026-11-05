@@ -2,10 +2,9 @@
 from __future__ import annotations
 
 import base64
-from datetime import datetime, timezone
+from datetime import datetime
 import math
 import threading
-import time
 from typing import Any, Dict, List, Optional
 
 from contracts.base import utc_now
@@ -13,9 +12,10 @@ from contracts.scene_decision import SceneDecisionRequest
 from contracts.spatial_memory import SceneCandidateLabel, SceneObservationSample, SceneSpaceReviewStatus
 from core.errors import GatewayError
 from core.source_time import SourceTimeError, source_age_ns
-from services.memory.room_segmentation import RoomSegmentationService, pose_in_scene_space
-from services.memory.scene_mapping_state import MANAGED_KEY, same_scope, snapshot_binding
-from services.memory.scene_graph import SceneGraphService
+from services.memory.semantic_map.room_segmentation import RoomSegmentationService, pose_in_scene_space
+from services.memory.semantic_map.scene_mapping_state import MANAGED_KEY, SemanticMapState
+from services.memory.semantic_map.inputs import same_scope
+from services.memory.semantic_map.scene_graph import SceneGraphService
 from services.scene_decision import create_scene_decision_backend
 
 
@@ -55,21 +55,21 @@ def _view_is_new(pose, entries) -> bool:
 class SceneMappingService:
     """拥有一个周期线程和最多一个在途处理，网络等待不持记忆锁。"""
 
-    def __init__(self, *, memory_service, config, stream_bus=None, backend=None) -> None:
-        self.memory = memory_service
+    def __init__(self, *, memory_service, geometry_state, config, stream_bus=None, backend=None) -> None:
+        self.memory = SemanticMapState(memory_service, geometry_state)
         self.config = config
         self.stream_bus = stream_bus
         self._backend = backend
         self._segmenter = RoomSegmentationService(min_area_m2=config.min_area_m2,
                                                  doorway_width_m=config.doorway_width_m,
                                                  max_cells=config.max_cells)
-        self.graph = SceneGraphService(memory_service=memory_service, max_cells=config.max_cells)
+        self.graph = SceneGraphService(memory_service=self.memory, max_cells=config.max_cells)
         self._lock = threading.RLock()
         self._run_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
         self._closed = False
-        self._cancel_generation = 0
+        self._cancellations = set()
         self._backend_closed = False
         self._active_jobs = 0
         self._last_result = None
@@ -120,7 +120,8 @@ class SceneMappingService:
     def stop(self, *, wait_sec: float = 2.0) -> Dict[str, Any]:
         self._stop.set()
         with self._lock:
-            self._cancel_generation += 1
+            for cancellation in self._cancellations:
+                cancellation.set()
             thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=wait_sec)
@@ -131,17 +132,14 @@ class SceneMappingService:
     def close(self) -> None:
         with self._lock:
             self._closed = True
-        self.stop(wait_sec=self.config.timeout_sec + 5.0)
-        # 同步显式任务也可能在处理；不在关闭客户端后让旧任务继续提交。
-        if not self._run_lock.acquire(timeout=self.config.timeout_sec + 5.0):
-            raise RuntimeError("语义任务尚未退出，保留资源并报告关闭失败。")
-        try:
+        self.stop(wait_sec=0)
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+        with self._run_lock:
             if self._backend is not None and not self._backend_closed:
                 self._backend.close()
                 self._backend_closed = True
-        finally:
-            self._run_lock.release()
-
         self.graph.close()
 
     def _loop(self) -> None:
@@ -175,7 +173,7 @@ class SceneMappingService:
             metadata.pop("geometry_digest", None)
             metadata.pop("decision_evidence_key", None)
             if not unchanged:
-                metadata.pop("decision_inputs_v2", None)
+                metadata.pop("decision_inputs", None)
                 metadata.pop("last_decision", None)
                 metadata.pop("adopted_label_evidence", None)
             updates = {"metadata": metadata}
@@ -187,46 +185,29 @@ class SceneMappingService:
                                 "candidate_labels": old.candidate_labels if unchanged else [],
                                 "review_status": old.review_status if keep_label and old.review_status != SceneSpaceReviewStatus.STALE else SceneSpaceReviewStatus.CANDIDATE})
             prepared = region.model_copy(update=updates, deep=False)
-            object.__setattr__(prepared, "_scene_graph_source_revision", getattr(old, "_scene_graph_source_revision", None) if old is not None else None)
             bound.append(prepared)
         return bound
 
     def _refresh_regions(self, ensure_active, expected_capture=None):
-        # 地图在分割期间更新时只重试一次，避免抢占持续建图资源。
-        for attempt in range(2):
-            capture = self.memory.capture_scene_mapping_state()
-            if expected_capture is not None and (
-                capture["generation"] != expected_capture["generation"]
-                or capture["library_name"] != expected_capture["library_name"]
-                or not same_scope(capture["binding"], expected_capture["binding"])
-            ):
-                raise GatewayError("受理后的地图作用域已改变，原任务不能跨图执行。", error_code="scene_scope_changed", http_status=409)
-            regions = self._segmenter.segment(capture["snapshot"], map_name=capture["library_name"],
-                                               existing_spaces=capture["spaces"])
-            regions = self._bind_regions(capture, regions)
-            ensure_active()
-            revisions = {space.scene_space_id: int(space.metadata.get("scene_revision", 0)) for space in capture["spaces"]}
-            try:
-                old_by_id = {space.scene_space_id: space for space in capture["spaces"]}
-                unchanged = len(old_by_id) == len(regions) and all(
-                    region.scene_space_id in old_by_id
-                    and old_by_id[region.scene_space_id].review_status != SceneSpaceReviewStatus.STALE
-                    and old_by_id[region.scene_space_id].metadata.get("geometry_revision") == region.metadata.get("geometry_revision")
-                    and str(old_by_id[region.scene_space_id].metadata.get("map_binding", {}).get("update_sequence", "")) == capture["binding"]["update_sequence"]
-                    for region in regions
-                )
-                with self._lock:
-                    ensure_active()
-                    if unchanged:
-                        with self.memory._instances_lock:
-                            self.memory._assert_scene_mapping_capture(capture)
-                        return capture, [old_by_id[region.scene_space_id] for region in regions]
-                    written = self.memory.commit_scene_mapping_spaces(capture, regions, expected_revisions=revisions, retire_missing=True)
-                return capture, written
-            except GatewayError as exc:
-                if exc.error_code != "scene_map_changed" or attempt:
-                    raise
-        raise RuntimeError("地图分割重试未返回。")
+        capture = self.memory.capture_scene_mapping_state()
+        if expected_capture is not None and not same_scope(capture["binding"], expected_capture["binding"]):
+            raise GatewayError("受理后的地图已改变。", error_code="scene_scope_changed", http_status=409)
+        regions = self._segmenter.segment(capture["grid"], map_name=capture["library_name"],
+            map_revision=capture["binding"]["map_revision"], existing_spaces=capture["spaces"])
+        regions = self._bind_regions(capture, regions)
+        ensure_active()
+        old_by_id = {space.scene_space_id: space for space in capture["spaces"]}
+        unchanged = len(old_by_id) == len(regions) and all(
+            region.scene_space_id in old_by_id
+            and old_by_id[region.scene_space_id].review_status != SceneSpaceReviewStatus.STALE
+            and old_by_id[region.scene_space_id].metadata.get("geometry_revision") == region.metadata.get("geometry_revision")
+            and old_by_id[region.scene_space_id].metadata.get("map_binding", {}).get("map_revision") == capture["binding"]["map_revision"]
+            for region in regions)
+        if unchanged:
+            return capture, [old_by_id[region.scene_space_id] for region in regions]
+        revisions = {space.scene_space_id: int(space.metadata.get("scene_revision", 0)) for space in capture["spaces"]}
+        written = self.memory.commit_scene_mapping_spaces(capture, regions, expected_revisions=revisions, retire_missing=True)
+        return capture, written
 
     def _evidence(self, space, capture):
         now = utc_now()
@@ -234,11 +215,8 @@ class SceneMappingService:
         for entry in capture["entries"]:
             if entry.map_name != space.map_name or entry.pose is None:
                 continue
-            entry_binding = {"map_name": entry.map_name, "frame_id": entry.pose.frame_id,
-                             "source_epoch": entry.metadata.get("map_source_epoch"),
-                             "source_name": entry.metadata.get("map_source_name")}
-            if not any(same_scope(entry_binding, binding) for binding in
-                       capture.get("evidence_bindings", (capture["binding"],))):
+            entry_binding = {"map_name": entry.map_name, "frame_id": entry.pose.frame_id}
+            if not same_scope(entry_binding, capture["binding"]):
                 continue
             if not pose_in_scene_space(entry.pose, space):
                 continue
@@ -283,34 +261,18 @@ class SceneMappingService:
         if self.config.backend == "jev_api" or not self.config.max_images:
             return []
         images, seen = [], set()
-        store = self.memory._artifact_store
-        if store is None:
-            return images
         for entry in entries:
             for artifact_id in entry.artifact_ids:
                 if artifact_id in seen:
                     continue
                 seen.add(artifact_id)
                 try:
-                    with store.read_artifact(artifact_id) as (ref, stream):
-                        if not ref.metadata.get("camera_id") or ref.metadata.get("camera_id") != entry.metadata.get("camera_id"):
-                            continue
-                        frame_time = ref.metadata.get("frame_timestamp")
-                        entry_time = entry.metadata.get("frame_timestamp")
-                        if not frame_time or not entry_time:
-                            continue
-                        try:
-                            image_time = datetime.fromisoformat(str(frame_time).replace("Z", "+00:00"))
-                            evidence_time = datetime.fromisoformat(str(entry_time).replace("Z", "+00:00"))
-                            if image_time.tzinfo is None or evidence_time.tzinfo is None or abs((image_time - evidence_time).total_seconds()) > .001:
-                                continue
-                        except (TypeError, ValueError):
-                            continue
-                        if ref.mime_type not in ("image/jpeg", "image/png", "image/webp") or ref.size_bytes > 2 * 1024 ** 2:
-                            continue
-                        data = stream.read(2 * 1024 ** 2 + 1)
-                        if len(data) > 2 * 1024 ** 2 or len(data) != ref.size_bytes:
-                            continue
+                    ref = self.memory.core.photo_ref(artifact_id, library_name=entry.map_name)
+                    if ref.mime_type not in ("image/jpeg", "image/png", "image/webp") or ref.size_bytes > 2 * 1024 ** 2:
+                        continue
+                    data = self.memory.core.read_photo(artifact_id, library_name=entry.map_name)
+                    if len(data) > 2 * 1024 ** 2 or len(data) != ref.size_bytes:
+                        continue
                     images.append("data:%s;base64,%s" % (ref.mime_type, base64.b64encode(data).decode("ascii")))
                 except (OSError, KeyError, GatewayError):
                     continue
@@ -373,7 +335,7 @@ class SceneMappingService:
                 confidence=value, source_model=result.model_id,
                 evidence_observation_sample_ids=[sample.sample_id for sample in samples],
                 metadata={"score_kind": result.score_kind, "calibrated": False}) for key, value in ranked],
-            "metadata": {**space.metadata, "last_decision": raw, "decision_inputs_v2": evidence_key,
+            "metadata": {**space.metadata, "last_decision": raw, "decision_inputs": evidence_key,
                          "category": winner},
         }, deep=False)
 
@@ -393,29 +355,37 @@ class SceneMappingService:
 
     def update_label(self, **arguments):
         """网页和智能体显式命名与模型提交共享通知出口。"""
-        return self.memory.update_scene_mapping_label(**arguments, on_committed=self._publish_map)
+        result = self.memory.update_scene_mapping_label(**arguments)
+        self._publish_map()
+        return result
 
 
     def run_once(self, *, apply_labels: Optional[bool] = None, cancel_check=None, background=False, expected_capture=None) -> Dict[str, Any]:
         if not self.config.enabled:
             raise GatewayError("语义建图未启用。", error_code="scene_mapping_disabled", http_status=409)
         with self._lock:
-            cancellation_generation = self._cancel_generation
+            cancellation = threading.Event()
+            self._cancellations.add(cancellation)
 
         def ensure():
             self._ensure_active(cancel_check, background=background)
-            if cancellation_generation != self._cancel_generation:
+            if cancellation.is_set():
                 raise GatewayError("语义处理已被停止，拒绝迟到结果。", error_code="scene_mapping_stopped", http_status=409)
 
         # 已受理的显式任务沿原取消/期限等待；周期轮询和同步调用仍忙时返回。
-        # 停止代次在等待之前捕获，停止后不能把排队请求当作新一轮执行。
-        if cancel_check is not None and not background:
-            while True:
-                ensure()
-                if self._run_lock.acquire(timeout=0.05):
-                    break
-        elif not self._run_lock.acquire(blocking=False):
-            raise GatewayError("已有语义处理在执行。", error_code="scene_mapping_busy", http_status=409)
+        # 每个等待者保留自己的取消标志，停止后的新任务不会复活旧任务。
+        try:
+            if cancel_check is not None and not background:
+                while True:
+                    ensure()
+                    if self._run_lock.acquire(timeout=0.05):
+                        break
+            elif not self._run_lock.acquire(blocking=False):
+                raise GatewayError("已有语义处理在执行。", error_code="scene_mapping_busy", http_status=409)
+        except BaseException:
+            with self._lock:
+                self._cancellations.discard(cancellation)
+            raise
         with self._lock:
             self._active_jobs += 1
         try:
@@ -433,8 +403,7 @@ class SceneMappingService:
                 if not entries:
                     skipped.append({"id": space.scene_space_id, "reason": "no_valid_observation_evidence"})
                     continue
-                if background and all(getattr(entry, "_scene_decision_source_revision", None) is not None
-                                      or (getattr(entry, "_memory_business_token", None) or (None,))[0] == "business" for entry in entries) and space.metadata.get("decision_inputs_v2") == _evidence_inputs(entries, self.config.model) and space.metadata.get("decision_policy_inputs") == policy_inputs:
+                if background and space.metadata.get("decision_inputs") == _evidence_inputs(entries, self.config.model) and space.metadata.get("decision_policy_inputs") == policy_inputs:
                     skipped.append({"id": space.scene_space_id, "reason": "evidence_unchanged"})
                     continue
                 if len(processed) + len(failures) >= self.config.max_regions_per_cycle:
@@ -445,12 +414,17 @@ class SceneMappingService:
                     result = self._get_backend().decide(request)
                     ensure()
                     # 内容变化时重新提取当前候选；不使用旧轮廓给新地图贴标签。
-                    current_capture = self.memory.capture_scene_mapping_state()
-                    if not same_scope(current_capture["binding"], capture["binding"]) or current_capture["generation"] != capture["generation"]:
+                    try:
+                        current_capture = self.memory.capture_scene_mapping_state()
+                    except GatewayError as error:
+                        if error.error_code == "scene_map_library_mismatch":
+                            raise GatewayError("模型返回时地图作用域已改变。", error_code="scene_scope_changed", http_status=409) from error
+                        raise
+                    if not same_scope(current_capture["binding"], capture["binding"]):
                         raise GatewayError("模型返回时地图作用域已改变。", error_code="scene_scope_changed", http_status=409)
-                    if current_capture["binding"]["update_sequence"] != capture["binding"]["update_sequence"]:
-                        candidates = self._segmenter.segment(current_capture["snapshot"], map_name=current_capture["library_name"],
-                                                              existing_spaces=current_capture["spaces"])
+                    if current_capture["binding"]["map_revision"] != capture["binding"]["map_revision"]:
+                        candidates = self._segmenter.segment(current_capture["grid"], map_name=current_capture["library_name"],
+                            map_revision=current_capture["binding"]["map_revision"], existing_spaces=current_capture["spaces"])
                         matching = next((candidate for candidate in candidates if candidate.scene_space_id == space.scene_space_id), None)
                         if matching is None or not getattr(matching, "_geometry_unchanged", False):
                             raise GatewayError("模型返回时区域边界已变化。", error_code="scene_geometry_changed", http_status=409)
@@ -487,19 +461,25 @@ class SceneMappingService:
         finally:
             with self._lock:
                 self._active_jobs -= 1
+                self._cancellations.discard(cancellation)
             self._run_lock.release()
+
+    def current_spaces(self):
+        if self.memory.geometry.snapshot() is None or self.memory.geometry.latest_map() is None:
+            return ()
+        capture = self.memory.capture_scene_mapping_state(include_decision_inputs=False)
+        return tuple(self.memory.current_managed_scene_spaces(capture))
 
     def get_map(self) -> Dict[str, Any]:
         capture = self.memory.capture_scene_mapping_state(include_decision_inputs=False)
-        spaces = sorted(self.memory.current_managed_scene_spaces(capture["snapshot"], include_stale=True, copy_records=False),
+        spaces = sorted(self.memory.current_managed_scene_spaces(capture, include_stale=True),
                         key=lambda space: space.scene_space_id)
         return {"map_binding": capture["binding"], "regions": [_public_space(space) for space in spaces],
                 "region_count": len(spaces), "navigation_checked": False}
 
     def locate(self) -> Dict[str, Any]:
         capture = self.memory.capture_scene_mapping_state()
-        localization = self.memory._localization_service.get_latest_snapshot()
-        pose = localization.current_pose if localization is not None else None
+        pose = self.memory.current_pose()
         if pose is None:
             raise GatewayError("当前没有定位位姿。", error_code="scene_pose_unavailable", http_status=409)
         try:
@@ -508,12 +488,7 @@ class SceneMappingService:
             raise GatewayError(str(exc), error_code="scene_pose_stale", http_status=409) from exc
         if age is None or not -1 <= age <= 2:
             raise GatewayError("当前位姿已过期，不能判断实时区域归属。", error_code="scene_pose_stale", http_status=409)
-        active = self.memory._localization_service.get_active_session()
-        if active is None or not active.pose_available:
-            raise GatewayError("当前位姿尚未确认绑定到地图。", error_code="scene_pose_map_unverified", http_status=409)
-        if active.map_name != capture["library_name"]:
-            raise GatewayError("当前位姿不属于此地图。", error_code="scene_pose_map_mismatch", http_status=409)
-        spaces = self.memory.current_managed_scene_spaces(capture["snapshot"])
+        spaces = self.memory.current_managed_scene_spaces(capture)
         matches = [space for space in spaces if pose_in_scene_space(pose, space)]
         return {"map_binding": capture["binding"], "pose": pose.model_dump(mode="json"),
                 "scene_spaces": [_public_space(space) for space in matches],
@@ -521,14 +496,9 @@ class SceneMappingService:
 
 
 def _evidence_inputs(entries, model):
-    # A small declared input list, not a digest or a whole-library comparison.
-    values = []
-    for entry in entries:
-        token = getattr(entry, "_memory_business_token", None)
-        owned_revision = getattr(entry, "_scene_decision_source_revision", None)
-        revision = list(owned_revision) if owned_revision is not None else list(token) if token and token[0] == "business" else None
-        values.append({"memory_id": entry.memory_id, "source_revision": revision})
-    return {"version": 2, "model": model, "categories": dict(CATEGORIES), "entries": values}
+    """比较实际业务证据内容，不存业务令牌、请求号或哈希。"""
+    return {"model": model, "categories": dict(CATEGORIES),
+            "entries": [entry.model_dump(mode="json") for entry in entries]}
 
 
 def _distance_to_boundary(point, polygon) -> float:

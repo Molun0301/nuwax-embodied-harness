@@ -1796,7 +1796,7 @@
     "target_file": "core_env",
     "consumers": [
       "core/settings.py",
-      "services/memory/scene_mapping.py"
+      "services/memory/semantic_map/scene_mapping.py"
     ],
     "apply_scope": "重启网关后生效",
     "description": "开启语义地图（区域划分与命名）；保存设置不会启动模型服务。",
@@ -1810,7 +1810,7 @@
     "target_file": "core_env",
     "consumers": [
       "core/settings.py",
-      "services/memory/scene_mapping.py"
+      "services/memory/semantic_map/scene_mapping.py"
     ],
     "apply_scope": "重启网关后生效",
     "description": "网关启动后自动开始后台语义处理；需同时开启语义地图。",
@@ -1824,7 +1824,7 @@
     "target_file": "core_env",
     "consumers": [
       "core/settings.py",
-      "services/memory/scene_mapping.py"
+      "services/memory/semantic_map/scene_mapping.py"
     ],
     "apply_scope": "重启网关后生效",
     "description": "选择本地 OpenJev 服务或 Jev 远程接口。",
@@ -1846,7 +1846,7 @@
     "target_file": "core_env",
     "consumers": [
       "core/settings.py",
-      "services/memory/scene_mapping.py"
+      "services/memory/semantic_map/scene_mapping.py"
     ],
     "apply_scope": "重启网关后生效",
     "description": "语义服务地址，填写服务根地址或以 /v1 结尾的地址。留空时按后端取默认：本地 http://127.0.0.1:8791，Jev 为 https://api.typesafe.ai/v1。",
@@ -1860,7 +1860,7 @@
     "target_file": "core_env",
     "consumers": [
       "core/settings.py",
-      "services/memory/scene_mapping.py"
+      "services/memory/semantic_map/scene_mapping.py"
     ],
     "apply_scope": "重启网关后生效",
     "description": "语义决策使用的模型；留空时本地后端用 AlexWortega/openjev:qwen3.5-4b-nli-v2，Jev 用 jev-1.13.0。",
@@ -1874,7 +1874,7 @@
     "target_file": "core_env",
     "consumers": [
       "core/settings.py",
-      "services/memory/scene_mapping.py"
+      "services/memory/semantic_map/scene_mapping.py"
     ],
     "apply_scope": "重启网关后生效",
     "description": "Jev 远程接口的访问密钥，本地后端不需要。页面不显示已保存的值，留空保存会保留原值。",
@@ -1889,7 +1889,7 @@
     "target_file": "core_env",
     "consumers": [
       "core/settings.py",
-      "services/memory/scene_mapping.py"
+      "services/memory/semantic_map/scene_mapping.py"
     ],
     "apply_scope": "重启网关后生效",
     "description": "单次模型请求的最长等待时间（秒）。",
@@ -1905,7 +1905,7 @@
     "target_file": "core_env",
     "consumers": [
       "core/settings.py",
-      "services/memory/scene_mapping.py"
+      "services/memory/semantic_map/scene_mapping.py"
     ],
     "apply_scope": "重启网关后生效",
     "description": "后台语义处理两轮之间的等待时间（秒）。",
@@ -1921,7 +1921,7 @@
     "target_file": "core_env",
     "consumers": [
       "core/settings.py",
-      "services/memory/scene_mapping.py"
+      "services/memory/semantic_map/scene_mapping.py"
     ],
     "apply_scope": "重启网关后生效",
     "description": "面积小于此值的空间不划为房间（平方米）。",
@@ -1937,7 +1937,7 @@
     "target_file": "core_env",
     "consumers": [
       "core/settings.py",
-      "services/memory/scene_mapping.py"
+      "services/memory/semantic_map/scene_mapping.py"
     ],
     "apply_scope": "重启网关后生效",
     "description": "宽度小于此值的通道视为门口，用来把相连空间分成不同房间（米）。",
@@ -1953,7 +1953,7 @@
     "target_file": "core_env",
     "consumers": [
       "core/settings.py",
-      "services/memory/scene_mapping.py"
+      "services/memory/semantic_map/scene_mapping.py"
     ],
     "apply_scope": "重启网关后生效",
     "description": "单次房间划分允许的最大地图栅格数；地图更大时不划分（不会自动降采样）。",
@@ -1969,7 +1969,7 @@
     "target_file": "core_env",
     "consumers": [
       "core/settings.py",
-      "services/memory/scene_mapping.py"
+      "services/memory/semantic_map/scene_mapping.py"
     ],
     "apply_scope": "重启网关后生效",
     "description": "自动采纳名称至少需要的有效观察视角数。",
@@ -1985,7 +1985,7 @@
     "target_file": "core_env",
     "consumers": [
       "core/settings.py",
-      "services/memory/scene_mapping.py"
+      "services/memory/semantic_map/scene_mapping.py"
     ],
     "apply_scope": "重启网关后生效",
     "description": "自动采纳名称所需的最低支持分数（0～1）；这是采纳门槛，不代表准确率。",
@@ -2001,7 +2001,7 @@
     "target_file": "core_env",
     "consumers": [
       "core/settings.py",
-      "services/memory/scene_mapping.py"
+      "services/memory/semantic_map/scene_mapping.py"
     ],
     "apply_scope": "重启网关后生效",
     "description": "首选名称与次选名称的分数至少相差多少才自动采纳（0～1）。",
@@ -2017,7 +2017,7 @@
     "target_file": "core_env",
     "consumers": [
       "core/settings.py",
-      "services/memory/scene_mapping.py"
+      "services/memory/semantic_map/scene_mapping.py"
     ],
     "apply_scope": "重启网关后生效",
     "description": "每轮后台处理最多分析的区域数，其余留到下一轮。",
@@ -2033,7 +2033,7 @@
     "target_file": "core_env",
     "consumers": [
       "core/settings.py",
-      "services/memory/scene_mapping.py"
+      "services/memory/semantic_map/scene_mapping.py"
     ],
     "apply_scope": "重启网关后生效",
     "description": "早于这个时间的观察证据不参与命名判断（秒）。",
@@ -2049,7 +2049,7 @@
     "target_file": "core_env",
     "consumers": [
       "core/settings.py",
-      "services/memory/scene_mapping.py"
+      "services/memory/semantic_map/scene_mapping.py"
     ],
     "apply_scope": "重启网关后生效",
     "description": "本地模型每次请求最多附带的证据图片数（1～3）；Jev 远程接口不发送图片。",
@@ -2065,7 +2065,7 @@
     "target_file": "core_env",
     "consumers": [
       "core/settings.py",
-      "services/memory/scene_mapping.py"
+      "services/memory/semantic_map/scene_mapping.py"
     ],
     "apply_scope": "重启网关后生效",
     "description": "候选名称达到分数、分数差和视角数门槛时自动写入区域；关闭后只保留为候选。手动命名优先。",

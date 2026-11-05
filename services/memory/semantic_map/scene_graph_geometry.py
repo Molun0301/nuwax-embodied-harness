@@ -12,7 +12,7 @@ import numpy as np
 
 from contracts.occupancy_cells import PackedOccupancyCells
 from core.errors import GatewayError
-from services.memory.room_segmentation import _local, _planar_origin, _world
+from services.memory.semantic_map.room_segmentation import _local, _planar_origin, _world
 
 
 @dataclass
@@ -39,8 +39,7 @@ class SceneGraphGeometry:
         return self.region_ids[label - 1] if label else None
 
 
-def build_scene_graph_geometry(snapshot, spaces, *, max_cells: int) -> SceneGraphGeometry:
-    grid = snapshot.occupancy_grid
+def build_scene_graph_geometry(grid, spaces, *, max_cells: int) -> SceneGraphGeometry:
     if grid is None or grid.width * grid.height > max_cells:
         raise GatewayError("地图超出关系图处理预算。", error_code="scene_graph_budget_exceeded", http_status=422)
     if len(spaces) > 512:
@@ -54,7 +53,7 @@ def build_scene_graph_geometry(snapshot, spaces, *, max_cells: int) -> SceneGrap
     for index, space in enumerate(spaces, 1):
         boundary = space.boundary
         geometry = boundary.metadata.get("room_geometry", {}) if boundary else {}
-        if (space.frame_id != snapshot.frame_id or boundary is None or boundary.frame_id != snapshot.frame_id
+        if (space.frame_id != grid.frame_id or boundary is None or boundary.frame_id != grid.frame_id
                 or geometry.get("origin") != origin or geometry.get("resolution_m") != grid.resolution_m):
             raise GatewayError("区域没有当前地图的精确格归属，请刷新语义地图。", error_code="scene_graph_geometry_invalid", http_status=409)
         runs = geometry.get("row_runs", [])
@@ -120,8 +119,7 @@ def build_scene_graph_geometry(snapshot, spaces, *, max_cells: int) -> SceneGrap
             mx, my = (start[0] + end[0]) / 2, (start[1] + end[1]) / 2
             x, y = _world(mx, my, origin, grid.resolution_m)
             region_ids = [ids[a - 1], ids[b - 1]]
-            # A passage is an ephemeral handle owned by this geometry build.
-            # Reusing cached geometry retains it; a new build gets new handles.
+            # 连接口编号属于本轮几何结果；复用几何时沿用，重新构建时使用新编号。
             identifier = "passage_" + uuid.uuid4().hex
             entrances = []
             for region_id, (row, col) in zip(region_ids, cells):

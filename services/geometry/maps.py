@@ -59,7 +59,7 @@ class MapStore:
         with self._lock:
             path = self._root / name
             saved = (path / "geometry").is_dir()
-            if not saved and not (path / "meta.json").is_file():
+            if not saved and not (path / "meta.json").is_file() and not (path / "memory").is_dir():
                 return None
             meta = self.read_meta(name)
             size = sum(file.stat().st_size for file in path.rglob("*") if file.is_file())

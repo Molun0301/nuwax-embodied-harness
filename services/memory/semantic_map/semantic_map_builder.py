@@ -6,9 +6,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from contracts.geometry import Pose, Quaternion, Vector3
 from contracts.geometry_runtime import DEFAULT_MAP_FRAME
-from contracts.maps import SemanticMap
+from contracts.maps import SemanticMap, OccupancyGrid
 from contracts.naming import build_anchor_id, build_scene_space_id
-from contracts.runtime_views import MapSnapshot
 from contracts.spatial_memory import (
     SceneSpace,
     SceneSpaceBoundary,
@@ -42,13 +41,14 @@ class SemanticMapBuilder:
 
     def build(
         self,
-        snapshot: Optional[MapSnapshot],
+        occupancy_grid: Optional[OccupancyGrid],
         *,
         map_name: Optional[str] = None,
-        identity_resolver: Optional[MapIdentityResolver] = None,
+        semantic_map: Optional[SemanticMap] = None,
+        metadata: Optional[dict] = None,
     ) -> SemanticMapBuildResult:
         resolved_map_name = str(map_name or "").strip() or None
-        if snapshot is None:
+        if occupancy_grid is None:
             return SemanticMapBuildResult(
                 map_name=resolved_map_name,
                 frame_id=DEFAULT_MAP_FRAME,
@@ -58,30 +58,26 @@ class SemanticMapBuilder:
                 topology_nodes_by_id={},
             )
 
-        # This local resolver also memoizes injected callbacks: a repeated key
-        # must have one identity throughout a build, including concurrent builds.
+        # 同一轮构建中的业务区域和锚点复用编号，不建立持久身份登记表。
         identities = {}
         def resolve_identity(entity_kind, source_kind, source_key):
             key = (entity_kind, source_kind, source_key)
             if key not in identities:
-                if identity_resolver is not None:
-                    identities[key] = identity_resolver(*key)
-                else:
-                    factory = build_anchor_id if entity_kind == "anchor" else build_scene_space_id
-                    identities[key] = factory(source_kind, suffix=uuid.uuid4().hex)
+                factory = build_anchor_id if entity_kind == "anchor" else build_scene_space_id
+                identities[key] = factory(source_kind, suffix=uuid.uuid4().hex)
             return identities[key]
 
-        frame_id = self._resolve_frame_id(snapshot)
-        topology_nodes_by_id = self._extract_topology_nodes(snapshot.metadata, frame_id=frame_id,
+        frame_id = self._resolve_frame_id(occupancy_grid)
+        topology_nodes_by_id = self._extract_topology_nodes(metadata or {}, frame_id=frame_id,
                                                            identity_resolver=resolve_identity)
         anchors_by_id: Dict[str, SpatialAnchor] = {}
         semantic_regions: List[SemanticRegion] = []
 
-        if snapshot.semantic_map is not None:
+        if semantic_map is not None:
             semantic_regions.extend(
                 self._build_from_semantic_map(
-                    snapshot.semantic_map,
-                    snapshot=snapshot,
+                    semantic_map,
+                    occupancy_grid=occupancy_grid,
                     map_name=resolved_map_name,
                     topology_nodes_by_id=topology_nodes_by_id,
                     anchors_by_id=anchors_by_id,
@@ -91,7 +87,7 @@ class SemanticMapBuilder:
         else:
             semantic_regions.extend(
                 self._build_coarse_regions_from_topology(
-                    snapshot=snapshot,
+                    occupancy_grid=occupancy_grid,
                     map_name=resolved_map_name,
                     topology_nodes_by_id=topology_nodes_by_id,
                     anchors_by_id=anchors_by_id,
@@ -108,8 +104,8 @@ class SemanticMapBuilder:
                 continue
             inspection_poses = self._inspection_pose_planner.plan_for_target(
                 target_pose=node_pose,
-                occupancy_grid=snapshot.occupancy_grid,
-                cost_map=snapshot.cost_map,
+                occupancy_grid=occupancy_grid,
+                cost_map=None,
             )
             label = str(node.get("label") or node.get("name") or node_id)
             anchors_by_id[anchor_id] = SpatialAnchor(
@@ -131,7 +127,7 @@ class SemanticMapBuilder:
 
         scene_spaces = self._build_scene_spaces(
             semantic_regions=semantic_regions,
-            snapshot=snapshot,
+            occupancy_grid=occupancy_grid,
             map_name=resolved_map_name,
             topology_nodes_by_id=topology_nodes_by_id,
             anchors_by_id=anchors_by_id,
@@ -152,7 +148,7 @@ class SemanticMapBuilder:
         self,
         semantic_map: SemanticMap,
         *,
-        snapshot: MapSnapshot,
+        occupancy_grid: Optional[OccupancyGrid],
         map_name: Optional[str],
         topology_nodes_by_id: Dict[str, Dict[str, object]],
         anchors_by_id: Dict[str, SpatialAnchor],
@@ -173,8 +169,8 @@ class SemanticMapBuilder:
             inspection_poses = (
                 self._inspection_pose_planner.plan_for_target(
                     target_pose=centroid,
-                    occupancy_grid=snapshot.occupancy_grid,
-                    cost_map=snapshot.cost_map,
+                    occupancy_grid=occupancy_grid,
+                    cost_map=None,
                 )
                 if centroid is not None
                 else []
@@ -212,7 +208,7 @@ class SemanticMapBuilder:
     def _build_coarse_regions_from_topology(
         self,
         *,
-        snapshot: MapSnapshot,
+        occupancy_grid: Optional[OccupancyGrid],
         map_name: Optional[str],
         topology_nodes_by_id: Dict[str, Dict[str, object]],
         anchors_by_id: Dict[str, SpatialAnchor],
@@ -230,8 +226,8 @@ class SemanticMapBuilder:
             aliases = self._normalize_labels([*(node.get("aliases") or []), *(node.get("labels") or [])])
             inspection_poses = self._inspection_pose_planner.plan_for_target(
                 target_pose=node_pose,
-                occupancy_grid=snapshot.occupancy_grid,
-                cost_map=snapshot.cost_map,
+                occupancy_grid=occupancy_grid,
+                cost_map=None,
             )
             region_id = f"coarse_{node_id}"
             regions.append(
@@ -267,7 +263,7 @@ class SemanticMapBuilder:
         self,
         *,
         semantic_regions: List[SemanticRegion],
-        snapshot: MapSnapshot,
+        occupancy_grid: Optional[OccupancyGrid],
         map_name: Optional[str],
         topology_nodes_by_id: Dict[str, Dict[str, object]],
         anchors_by_id: Dict[str, SpatialAnchor],
@@ -281,7 +277,7 @@ class SemanticMapBuilder:
                 continue
             scene_space = self._scene_space_from_region(
                 region,
-                snapshot=snapshot,
+                occupancy_grid=occupancy_grid,
                 map_name=map_name,
                 topology_nodes_by_id=topology_nodes_by_id,
                 anchors_by_id=anchors_by_id,
@@ -307,7 +303,7 @@ class SemanticMapBuilder:
                 node_id,
                 node,
                 node_pose=node_pose,
-                snapshot=snapshot,
+                occupancy_grid=occupancy_grid,
                 map_name=map_name,
                 anchors_by_id=anchors_by_id,
                 identity_resolver=identity_resolver,
@@ -322,7 +318,7 @@ class SemanticMapBuilder:
         self,
         region: SemanticRegion,
         *,
-        snapshot: MapSnapshot,
+        occupancy_grid: Optional[OccupancyGrid],
         map_name: Optional[str],
         topology_nodes_by_id: Dict[str, Dict[str, object]],
         anchors_by_id: Dict[str, SpatialAnchor],
@@ -344,13 +340,13 @@ class SemanticMapBuilder:
         entry_poses = self._entry_poses_for_boundary(
             boundary,
             fallback_poses=region.inspection_poses,
-            snapshot=snapshot,
+            occupancy_grid=occupancy_grid,
         )
         inspection_poses = region.inspection_poses or (
             self._inspection_pose_planner.plan_for_target(
                 target_pose=region.centroid,
-                occupancy_grid=snapshot.occupancy_grid,
-                cost_map=snapshot.cost_map,
+                occupancy_grid=occupancy_grid,
+                cost_map=None,
             )
             if region.centroid is not None
             else []
@@ -388,7 +384,7 @@ class SemanticMapBuilder:
         node: Dict[str, object],
         *,
         node_pose: Pose,
-        snapshot: MapSnapshot,
+        occupancy_grid: Optional[OccupancyGrid],
         map_name: Optional[str],
         anchors_by_id: Dict[str, SpatialAnchor],
         identity_resolver: MapIdentityResolver,
@@ -406,13 +402,13 @@ class SemanticMapBuilder:
         )
         inspection_poses = self._inspection_pose_planner.plan_for_target(
             target_pose=node_pose,
-            occupancy_grid=snapshot.occupancy_grid,
-            cost_map=snapshot.cost_map,
+            occupancy_grid=occupancy_grid,
+            cost_map=None,
         )
         entry_poses = self._entry_poses_for_boundary(
             boundary,
             fallback_poses=inspection_poses,
-            snapshot=snapshot,
+            occupancy_grid=occupancy_grid,
         )
         return SceneSpace(
             scene_space_id=identity_resolver("scene", "topo", node_id),
@@ -472,14 +468,14 @@ class SemanticMapBuilder:
         boundary: SceneSpaceBoundary,
         *,
         fallback_poses: List[Pose],
-        snapshot: MapSnapshot,
+        occupancy_grid: Optional[OccupancyGrid],
     ) -> List[Pose]:
         if boundary.centroid is None:
             return fallback_poses[:2]
         return self._inspection_pose_planner.plan_for_target(
             target_pose=boundary.centroid,
-            occupancy_grid=snapshot.occupancy_grid,
-            cost_map=snapshot.cost_map,
+            occupancy_grid=occupancy_grid,
+            cost_map=None,
             existing_poses=fallback_poses,
             max_candidates=2,
         )
@@ -638,16 +634,8 @@ class SemanticMapBuilder:
             orientation=Quaternion(w=1.0),
         )
 
-    def _resolve_frame_id(self, snapshot: MapSnapshot) -> str:
-        if snapshot.frame_id:
-            return snapshot.frame_id
-        if snapshot.semantic_map is not None:
-            return snapshot.semantic_map.frame_id
-        if snapshot.occupancy_grid is not None:
-            return snapshot.occupancy_grid.frame_id
-        if snapshot.cost_map is not None:
-            return snapshot.cost_map.frame_id
-        return DEFAULT_MAP_FRAME
+    def _resolve_frame_id(self, grid: Optional[OccupancyGrid]) -> str:
+        return grid.frame_id if grid is not None else DEFAULT_MAP_FRAME
 
     def _extract_aliases(self, attributes: Dict[str, object]) -> List[str]:
         aliases: List[str] = []

@@ -11,9 +11,9 @@ import numpy as np
 
 from contracts.geometry import Pose, Vector3
 from contracts.naming import build_scene_space_id
-from services.memory.scene_revisions import geometry_value, semantic_geometry_value
+from services.memory.semantic_map.scene_revisions import geometry_value, semantic_geometry_value
 from contracts.occupancy_cells import PackedOccupancyCells
-from contracts.runtime_views import MapSnapshot
+from contracts.maps import OccupancyGrid
 from contracts.spatial_memory import SceneSpace, SceneSpaceBoundary, SceneSpaceReviewStatus
 
 
@@ -170,15 +170,14 @@ class RoomSegmentationService:
         self.doorway_width_m = doorway_width_m
         self.max_cells = max_cells
 
-    def segment(self, snapshot: MapSnapshot, *, map_name: str, existing_spaces: Sequence[SceneSpace] = ()) -> List[SceneSpace]:
-        if not map_name or map_name != snapshot.map_name:
+    def segment(self, grid: OccupancyGrid, *, map_name: str, map_revision: str, existing_spaces: Sequence[SceneSpace] = ()) -> List[SceneSpace]:
+        if not map_name or map_name != grid.map_id:
             raise ValueError("区域生成的地图名称必须与快照一致。")
-        grid = snapshot.occupancy_grid
         if grid is None:
             raise ValueError("区域生成需要占据栅格。")
         if grid.width * grid.height > self.max_cells:
             raise ValueError("地图超过区域生成最大单元数，未执行降采样。")
-        if grid.frame_id != snapshot.frame_id or grid.origin.frame_id != grid.frame_id:
+        if grid.origin.frame_id != grid.frame_id:
             raise ValueError("区域生成要求快照、栅格与原点坐标系一致。")
         if not math.isfinite(grid.resolution_m):
             raise ValueError("栅格分辨率必须有限。")
@@ -220,7 +219,7 @@ class RoomSegmentationService:
         added = replacement[components]
         labels[added > 0] = added[added > 0]
         labels = self._expand(labels, free)
-        return self._spaces(labels, distance, grid.resolution_m, origin, snapshot, minimum_cells, existing_spaces)
+        return self._spaces(labels, distance, grid.resolution_m, origin, grid, map_name, map_revision, minimum_cells, existing_spaces)
 
     @staticmethod
     def _expand(labels, free):
@@ -247,11 +246,11 @@ class RoomSegmentationService:
                     tail += 1
         return padded[1:-1, 1:-1].copy()
 
-    def _spaces(self, labels, distance, resolution, origin, snapshot, minimum_cells, existing_spaces):
+    def _spaces(self, labels, distance, resolution, origin, grid, map_name, map_revision, minimum_cells, existing_spaces):
         flat = labels.ravel()
         order = np.argsort(flat, kind="stable")
         values, starts, sizes = np.unique(flat[order], return_index=True, return_counts=True)
-        scope = {"map_name": snapshot.map_name, "frame_id": snapshot.frame_id, "source_epoch": snapshot.source_epoch, "source_name": snapshot.source_name}
+        scope = {"map_name": map_name, "frame_id": grid.frame_id}
         spaces = []
         label_to_space = {}
         boundary_work_cells = 0
@@ -272,22 +271,21 @@ class RoomSegmentationService:
             # 最大净空格是代表点，几何重心落进障碍或凹区时不拿它当采样位置。
             best = int(np.argmax(distance[ys, xs]))
             px, py = _world(float(xs[best]) + 0.5, float(ys[best]) + 0.5, origin, resolution)
-            representative = Pose(frame_id=snapshot.frame_id, position=Vector3(x=px, y=py, z=origin[2]))
+            representative = Pose(frame_id=grid.frame_id, position=Vector3(x=px, y=py, z=origin[2]))
             runs = _row_runs(mask, left, bottom)
             geometry = {"version": 1, "origin": origin, "resolution_m": resolution,
                         "row_runs": runs, "height_range_m": [origin[2] - 0.5, origin[2] + 0.5]}
             space = SceneSpace(
-                scene_space_id=build_scene_space_id("geometry", timestamp=snapshot.timestamp, suffix=uuid.uuid4().hex),
-                map_name=snapshot.map_name, frame_id=snapshot.frame_id,
-                boundary=SceneSpaceBoundary(frame_id=snapshot.frame_id, centroid=representative, polygon_points=polygon,
+                scene_space_id=build_scene_space_id("geometry", timestamp=grid.timestamp, suffix=uuid.uuid4().hex),
+                map_name=map_name, frame_id=grid.frame_id,
+                boundary=SceneSpaceBoundary(frame_id=grid.frame_id, centroid=representative, polygon_points=polygon,
                     min_corner=Vector3(x=min(p.x for p in polygon), y=min(p.y for p in polygon), z=origin[2] - 0.5),
                     max_corner=Vector3(x=max(p.x for p in polygon), y=max(p.y for p in polygon), z=origin[2] + 0.5),
                     area_m2=int(size) * resolution ** 2, confidence=0.0,
                     metadata={_GEOMETRY_KEY: geometry, "holes": [ring for ring, local in zip(world_rings, rings) if _signed_area(local) < 0],
                               "centroid_kind": "free_cell_representative", "height_range_source": "slice_association_tolerance"}),
                 inspection_poses=[representative], primary_label=None, review_status=SceneSpaceReviewStatus.CANDIDATE,
-                metadata={**scope, "source": "room_segmentation", "source_name": snapshot.source_name, "update_sequence": snapshot.update_sequence,
-                          "geometry_update_sequence": snapshot.update_sequence,
+                metadata={**scope, "source": "room_segmentation", "map_revision": map_revision,
                           "geometry_only": True,
                           "navigation_reachability": "unverified", "inspection_pose_kind": "geometric_candidate",
                           "semantic_reidentification_required": True, "segmentation_method": "clearance_seeds_free_space_growth"})
@@ -298,7 +296,7 @@ class RoomSegmentationService:
         for space in spaces:
             old = previous.get(space.scene_space_id)
             unchanged = old is not None and geometry_value(old) == geometry_value(space)
-            space.metadata["geometry_revision"] = (old.metadata.get("geometry_revision") if unchanged else None) or uuid.uuid4().hex
+            space.metadata["geometry_revision"] = (old.metadata.get("geometry_revision") if unchanged else None) or map_revision
             object.__setattr__(space, "_geometry_unchanged", old is not None and semantic_geometry_value(old) == semantic_geometry_value(space))
         return spaces
 
@@ -308,7 +306,7 @@ class RoomSegmentationService:
         old_links = defaultdict(list)
         work_cells = 0
         for old in existing_spaces:
-            if old.map_name != scope["map_name"] or old.frame_id != scope["frame_id"] or old.metadata.get("source_epoch") != scope["source_epoch"] or old.metadata.get("source_name") != scope["source_name"] or old.boundary is None:
+            if old.map_name != scope["map_name"] or old.frame_id != scope["frame_id"] or old.boundary is None:
                 continue
             geometry = old.boundary.metadata.get(_GEOMETRY_KEY)
             if not isinstance(geometry, dict) or geometry.get("version") != 1 or not geometry.get("row_runs"):

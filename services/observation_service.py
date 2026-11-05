@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import threading
-import time
 from collections import deque
 from contextlib import contextmanager
 from typing import Deque, Dict, Optional, Tuple
@@ -35,8 +34,6 @@ class ObservationService:
         self._history: Deque[ObservationContext] = deque(maxlen=max(1, history_limit))
         self._latest_by_camera: Dict[str, ObservationContext] = {}
         self._context_condition = threading.Condition(threading.RLock())
-        self._latest_holds = {}
-        self._history_holds = deque()
         self._active_operations = 0
         self._closing = False
         self._closed = False
@@ -49,10 +46,10 @@ class ObservationService:
     ) -> ObservationContext:
         """抓取当前观察结果。"""
 
-        with self._operation(), self._artifact_service.publication_scope(owner="observation.capture") as hold:
-            return self._capture_observation(camera_id=camera_id, requested_by=requested_by, hold=hold)
+        with self._operation():
+            return self._capture_observation(camera_id=camera_id, requested_by=requested_by)
 
-    def _capture_observation(self, *, camera_id, requested_by, hold):
+    def _capture_observation(self, *, camera_id, requested_by):
         image_provider = self._get_image_provider()
         image_frame = image_provider.capture_image(camera_id)
         resolved_camera_id = image_frame.camera_id
@@ -97,29 +94,12 @@ class ObservationService:
         )
         with self._context_condition:
             self._ensure_open()
-            hold.validate_introduced()
-            latest_hold = history_hold = None
-            try:
-                latest_hold = hold.retain(owner="observation.latest")
-                history_hold = hold.retain(owner="observation.history")
-                self._state_store.write(
-                    StateNamespace.OBSERVATION, resolved_camera_id, context,
-                    source=image_provider.provider_name, metadata={"kind": "latest_observation"},
-                )
-            except BaseException:
-                for new_hold in (latest_hold, history_hold):
-                    if new_hold is not None:
-                        new_hold.release()
-                raise
-            old_latest = self._latest_holds.get(resolved_camera_id)
-            old_history = self._history_holds.popleft() if len(self._history) == self._history.maxlen else None
+            self._state_store.write(
+                StateNamespace.OBSERVATION, resolved_camera_id, context,
+                source=image_provider.provider_name, metadata={"kind": "latest_observation"},
+            )
             self._latest_by_camera[resolved_camera_id] = context
-            self._latest_holds[resolved_camera_id] = latest_hold
             self._history.append(context)
-            self._history_holds.append(history_hold)
-            for old in (old_latest, old_history):
-                if old is not None:
-                    old.release()
 
         if self._event_bus is not None:
             self._event_bus.publish(
@@ -148,15 +128,6 @@ class ObservationService:
             return self._latest_by_camera.get(camera_id)
         return max(self._latest_by_camera.values(), key=lambda item: item.timestamp, default=None)
 
-    def acquire_latest_observation(self, camera_id=None, *, owner):
-        """在槽位替换锁内同时选择上下文并取得独立读取拥有方。"""
-        with self._context_condition:
-            self._ensure_open()
-            context = self._select_latest(camera_id)
-            hold = self._latest_holds.get(context.camera_id) if context is not None else None
-            if hold is not None:
-                hold.validate_introduced()
-            return context, hold.retain(owner=owner) if hold is not None else None
 
     def list_history(
         self,
@@ -181,35 +152,6 @@ class ObservationService:
             items = sorted(self._latest_by_camera.values(), key=lambda item: (item.camera_id, item.timestamp))
         return tuple(items)
 
-    @staticmethod
-    def _context_artifact_ids(context):
-        observation = getattr(context, "observation", None)
-        ids = set(getattr(observation, "artifact_ids", ()) or ())
-        image_artifact = getattr(context, "image_artifact", None)
-        if image_artifact is not None:
-            ids.add(image_artifact.artifact_id)
-        return ids
-
-    def acquire_context_artifacts(self, context, *, owner):
-        """副本不隐式复制拥有权；短内存证明转交，外部上下文在锁外查验。"""
-        ids = self._context_artifact_ids(context)
-        if not ids:
-            return None
-        with self._operation():
-            with self._context_condition:
-                for item, hold in list(zip(self._history, self._history_holds)) + [
-                    (self._latest_by_camera.get(context.camera_id), self._latest_holds.get(context.camera_id))
-                ]:
-                    if item is context and hold is not None and hold.artifact_ids == ids:
-                        hold.validate_introduced()
-                        return hold.retain(owner=owner)
-            hold = self._artifact_service.acquire_artifacts(ids, owner=owner)
-            try:
-                hold.validate_introduced()
-                return hold
-            except BaseException:
-                hold.release()
-                raise
 
     def _ensure_open(self):
         if self._closing:
@@ -230,34 +172,22 @@ class ObservationService:
     def get_lifecycle_status(self):
         with self._context_condition:
             return {"closing": self._closing, "closed": self._closed,
-                    "active_operations": self._active_operations,
-                    "latest_holders": len(self._latest_holds), "history_holders": len(self._history_holds)}
+                    "active_operations": self._active_operations}
 
-    def close(self, timeout=5.0):
-        """终止准入；超时保留仍运行操作和可见槽位的拥有权。"""
-        deadline = time.monotonic() + max(0.0, float(timeout))
+    def close(self) -> None:
+        """结束新抓图准入，等待在途抓图退出后清空可见快照。"""
         with self._context_condition:
             self._closing = True
             while self._active_operations:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._context_condition.wait(remaining)
+                self._context_condition.wait()
             if self._closed:
-                return True
+                return
             for camera_id in self._latest_by_camera:
                 self._state_store.write(StateNamespace.OBSERVATION, camera_id, None,
                                         source="observation_service", metadata={"kind": "closed"})
-            holds = tuple(self._latest_holds.values()) + tuple(self._history_holds)
             self._latest_by_camera.clear()
             self._history.clear()
-            self._latest_holds.clear()
-            self._history_holds.clear()
-            for hold in holds:
-                if hold is not None:
-                    hold.release()
             self._closed = True
-            return True
 
     def _get_image_provider(self) -> ImageProvider:
         providers = getattr(self._provider_owner, "providers", None)

@@ -1,11 +1,17 @@
 package nuwax_msgs;
 
-struct NavigationState {
+struct NavigationStatus {
     string session_id;
     string robot_frame;
     int64_t stamp_sec;
     int32_t stamp_nsec;
     int32_t state;
+    // Geometry目标状态：0无目标、1等待输入、2规划、3执行、4到达、5失败、6取消、7被替换、8停止。
+    int32_t goal_status;
+    string reason;
+    double remaining_distance_m;
+    boolean input_ready;
+    boolean no_feasible_path;
     double goal_x;
     double goal_y;
     double goal_yaw;

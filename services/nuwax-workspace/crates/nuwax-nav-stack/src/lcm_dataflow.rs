@@ -298,7 +298,7 @@ pub(crate) enum NativePlannerReadyContract {
 fn far_ready_contract_matches(
     expected: &nuwax_nav_far_planner_bridge::worker::FarReadyContract,
     generation: i64,
-    state: &schema::NavigationState,
+    state: &schema::NavigationStatus,
 ) -> bool {
     let mut expected = expected.clone();
     expected.generation = generation;
@@ -337,7 +337,7 @@ pub(crate) fn native_planner_readiness(
             .map_err(|error| SupervisedReadyError::Transport(error.to_string()))?;
         let topic = protocol_topic(&event_channel)
             .map_err(|error| SupervisedReadyError::Protocol(error.to_string()))?;
-        let message_type = LcmMessageType::new("nuwax_msgs.NavigationState")
+        let message_type = LcmMessageType::new("nuwax_msgs.NavigationStatus")
             .map_err(|error| SupervisedReadyError::Protocol(error.to_string()))?;
         let mut events = transport
             .subscribe_owned(topic, Some(message_type))
@@ -353,7 +353,7 @@ pub(crate) fn native_planner_readiness(
 
                 #[cfg(any(feature = "cmu-native", feature = "explore"))]
                 NativePlannerReadyContract::Far(expected_contract) => {
-                    let state = match schema::decode_navigation_state_body(&frame.payload) {
+                    let state = match schema::decode_navigation_status_body(&frame.payload) {
                         Ok(state) => state,
                         Err(_) => continue,
                     };
@@ -844,7 +844,7 @@ struct GuardedNavTelemetry {
 
 #[cfg(feature = "guard-runtime")]
 fn guarded_goal_execution_identity(
-    goal: &schema::GoalEnvelope,
+    goal: &schema::NavigationGoal,
 ) -> nuwax_nav_runtime::PathExecutionIdentity {
     nuwax_nav_runtime::PathExecutionIdentity { goal_key: goal.goal_key(), session_id: goal.session_id.clone(), planner_runtime_generation: 0, path_revision: 0 }
 }
@@ -1147,7 +1147,7 @@ async fn run_guarded_nav_scheduler(
 ) -> NavStackResult<()> {
     let source_max_age = configured_pose_source_max_age()?;
     let transport = lcm_transport()?;
-    let goals = typed_stream(&transport, &node.inputs[0], "nuwax_msgs.GoalEnvelope").await?;
+    let goals = typed_stream(&transport, &node.inputs[0], "nuwax_msgs.NavigationGoal").await?;
     let poses = typed_stream(&transport, &node.inputs[1], "geometry_msgs.PoseStamped").await?;
     let paths = typed_stream(&transport, &node.inputs[2], "nuwax_msgs.PathEnvelope").await?;
     let costmap_type = if planar_navigation_enabled() {nuwax_codec::lcm::planar_navigation::TYPE_NAME} else {"nav_msgs.OccupancyGrid"};
@@ -1257,7 +1257,7 @@ impl GuardedMapAuthority {
             && self.commit_boot_nonce == other.commit_boot_nonce
     }
 
-    fn permits_goal(&self, goal: &schema::GoalEnvelope) -> bool {
+    fn permits_goal(&self, goal: &schema::NavigationGoal) -> bool {
     self.committed_map.frame_id == goal.goal.header.frame_id
 }
 }
@@ -1416,7 +1416,7 @@ where
         surface_navigation: node.id == "surface_nav_scheduler",
         ..GuardedNavTelemetry::default()
     };
-    let mut active_session: Option<schema::GoalEnvelope> = None;
+    let mut active_session: Option<schema::NavigationGoal> = None;
     let mut accepted_planner_generation: Option<(GoalKey, i64)> = None;
     let mut goal_buffer = PlannerGoalBuffer::default();
     let mut surface_authority: Option<GuardedMapAuthority> = None;
@@ -1740,14 +1740,14 @@ where
             }
             GuardedNavEvent::Goal(message) => {
                 let frame = required_frame(message, "guarded_nav_scheduler.goal")?;
-                let goal_envelope = match schema::decode_goal_envelope_body(&frame.payload) {
+                let navigation_goal = match schema::decode_navigation_goal_body(&frame.payload) {
                     Ok(envelope) => envelope,
                     Err(error) => {
                         // 契约完整但本机配置拒绝的目标仍属于原请求。保留不可执行
                         // 的取消身份，避免上层已受理后永远得不到对应的归零回执。
                         let mut rejected_telemetry = telemetry.clone();
                         if active_session.is_none() {
-                            if let Ok(goal) = schema::decode_goal_envelope_body(&frame.payload) {
+                            if let Ok(goal) = schema::decode_navigation_goal_body(&frame.payload) {
                                 if pose_from_schema(&goal.goal)
                                     .and_then(|pose| require_map_pose(&pose, "rejected goal")).is_ok()
                                     && !matches!(goal_buffer.observe_goal(goal.clone()), PlannerGoalIngress::Rejected(_))
@@ -1765,13 +1765,13 @@ where
                             scheduler.status(),
                             &rejected_telemetry,
                             "goal",
-                            &format!("GoalEnvelope rejected: {error}"),
+                            &format!("NavigationGoal rejected: {error}"),
                         )
                         .await?;
                         continue;
                     }
                 };
-                if let Err(error) = pose_from_schema(&goal_envelope.goal)
+                if let Err(error) = pose_from_schema(&navigation_goal.goal)
                     .and_then(|goal| require_map_pose(&goal, "guarded_nav_scheduler.goal"))
                 {
                     publish_guarded_rejection(
@@ -1785,7 +1785,7 @@ where
                     .await?;
                     continue;
                 }
-                let goal_envelope = match goal_buffer.observe_goal(goal_envelope) {
+                let navigation_goal = match goal_buffer.observe_goal(navigation_goal) {
                     PlannerGoalIngress::Ready(goal) => {
 
                         *goal
@@ -1802,7 +1802,7 @@ where
                             scheduler.status(),
                             &telemetry,
                             "goal",
-                            &format!("GoalEnvelope lease rejected: {reason:?}"),
+                            &format!("NavigationGoal lease rejected: {reason:?}"),
                         )
                         .await?;
                         continue;
@@ -1815,7 +1815,7 @@ where
                     &mut telemetry,
                     &mut active_session,
                     &mut goal_buffer,
-                    goal_envelope,
+                    navigation_goal,
                     surface_authority.as_ref(),
                     planar_mode,
                 )
@@ -2017,50 +2017,50 @@ async fn activate_or_defer_guarded_goal(
     transport: &LcmTransport,
     scheduler: &nuwax_nav_runtime::NavSchedulerHandle,
     telemetry: &mut GuardedNavTelemetry,
-    active_session: &mut Option<schema::GoalEnvelope>,
+    active_session: &mut Option<schema::NavigationGoal>,
     goal_buffer: &mut PlannerGoalBuffer,
-    goal_envelope: schema::GoalEnvelope,
+    navigation_goal: schema::NavigationGoal,
     surface_authority: Option<&GuardedMapAuthority>,
     planar_mode:bool,
 ) -> NavStackResult<()> {
     if (node.id == "surface_nav_scheduler" || planar_mode)
-        && !surface_authority.is_some_and(|map| map.permits_goal(&goal_envelope))
+        && !surface_authority.is_some_and(|map| map.permits_goal(&navigation_goal))
     {
         goal_buffer.costmap_observed = false;
-        goal_buffer.defer_ready_goal(goal_envelope);
+        goal_buffer.defer_ready_goal(navigation_goal);
         return Ok(());
     }
 
-    if !guarded_goal_inputs_ready(telemetry, scheduler, &goal_envelope) {
-        if !goal_buffer.defer_ready_goal(goal_envelope) {
+    if !guarded_goal_inputs_ready(telemetry, scheduler, &navigation_goal) {
+        if !goal_buffer.defer_ready_goal(navigation_goal) {
             return Err(NavStackError::Internal(
-                "guarded scheduler could not retain a not-yet-ready GoalEnvelope".into(),
+                "guarded scheduler could not retain a not-yet-ready NavigationGoal".into(),
             ));
         }
         return Ok(());
     }
 
-    let applied_goal = goal_envelope.clone();
+    let applied_goal = navigation_goal.clone();
     match activate_guarded_goal(
         node,
         transport,
         scheduler,
         telemetry,
         active_session,
-        goal_envelope,
+        navigation_goal,
     )
     .await? {
         GuardedGoalActivation::Activated => {
             if !goal_buffer.mark_applied(&applied_goal) {
                 return Err(NavStackError::Internal(
-                    "guarded scheduler applied a superseded GoalEnvelope".into(),
+                    "guarded scheduler applied a superseded NavigationGoal".into(),
                 ));
             }
         }
         GuardedGoalActivation::Deferred => {
             if !goal_buffer.defer_ready_goal(applied_goal) {
                 return Err(NavStackError::Internal(
-                    "guarded scheduler lost a GoalEnvelope after deferred activation".into(),
+                    "guarded scheduler lost a NavigationGoal after deferred activation".into(),
                 ));
             }
         }
@@ -2075,7 +2075,7 @@ async fn activate_or_defer_guarded_goal(
 fn guarded_goal_inputs_ready(
     telemetry: &GuardedNavTelemetry,
     scheduler: &nuwax_nav_runtime::NavSchedulerHandle,
-    _goal_envelope: &schema::GoalEnvelope,
+    _navigation_goal: &schema::NavigationGoal,
 ) -> bool {
     !telemetry.map_frame.is_empty()
         && telemetry.pose_frame == telemetry.map_frame
@@ -2095,10 +2095,10 @@ async fn activate_guarded_goal(
     transport: &LcmTransport,
     scheduler: &nuwax_nav_runtime::NavSchedulerHandle,
     telemetry: &mut GuardedNavTelemetry,
-    active_session: &mut Option<schema::GoalEnvelope>,
-    goal_envelope: schema::GoalEnvelope,
+    active_session: &mut Option<schema::NavigationGoal>,
+    navigation_goal: schema::NavigationGoal,
 ) -> NavStackResult<GuardedGoalActivation> {
-    let goal = match pose_from_schema(&goal_envelope.goal).and_then(|goal| {
+    let goal = match pose_from_schema(&navigation_goal.goal).and_then(|goal| {
         require_map_pose(&goal, "guarded_nav_scheduler.goal")?;
         Ok(goal)
     }) {
@@ -2139,10 +2139,10 @@ async fn activate_guarded_goal(
         goal.pose.orientation.yaw(),
     ];
     candidate_telemetry.goal_z = goal.pose.position.z;
-    candidate_telemetry.public_session_id = goal_envelope.session_id.clone();
+    candidate_telemetry.public_session_id = navigation_goal.session_id.clone();
     candidate_telemetry.owner_kind = schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV;
     candidate_telemetry.parent_request_id = String::new();
-    candidate_telemetry.goal_generation = goal_envelope.motion_generation as i64;
+    candidate_telemetry.goal_generation = navigation_goal.motion_generation as i64;
     candidate_telemetry.producer_runtime_generation = 0;
     candidate_telemetry.cancel_generation = 0;
     candidate_telemetry.path_revision = 0;
@@ -2151,13 +2151,13 @@ async fn activate_guarded_goal(
     candidate_telemetry.progress = 0.0;
     if let Err(error) = scheduler
         .start_session(nuwax_nav_runtime::NavSession {
-            boundary: goal_envelope.boundary_points.iter().map(|p|[p[0],p[1]]).collect(),
-            options: goal_envelope.options(),
-            goal: nuwax_nav_runtime::ExecutionGoal::Body(pose_from_schema(&goal_envelope.goal)?),
-            session_id: goal_envelope.session_id.clone(),
-            execution_identity: guarded_goal_execution_identity(&goal_envelope),
+            boundary: navigation_goal.boundary_points.iter().map(|p|[p[0],p[1]]).collect(),
+            options: navigation_goal.options(),
+            goal: nuwax_nav_runtime::ExecutionGoal::Body(pose_from_schema(&navigation_goal.goal)?),
+            session_id: navigation_goal.session_id.clone(),
+            execution_identity: guarded_goal_execution_identity(&navigation_goal),
 
-            motion_generation: goal_envelope.motion_generation,
+            motion_generation: navigation_goal.motion_generation,
         })
         .await
     {
@@ -2165,8 +2165,8 @@ async fn activate_guarded_goal(
             // 明确未授予的拒绝属于本次候选目标，不能发布旧目标或空闲心跳。
             let mut rejected = scheduler.status();
             rejected.phase = nuwax_nav_runtime::SchedulerPhase::Failed;
-            rejected.last_terminal = None;
-            rejected.message = format!("LEASE_NOT_GRANTED: {error}");
+            rejected.last_terminal = Some(nuwax_nav_runtime::TerminalOutcome::Stopped);
+            rejected.message = error.to_string();
             publish_guarded_nav_state(transport, &node.outputs[1], rejected, &candidate_telemetry, None).await?;
             return Ok(GuardedGoalActivation::LeaseRejected);
         }
@@ -2187,7 +2187,7 @@ async fn activate_guarded_goal(
         }
     }
     *telemetry = candidate_telemetry;
-    *active_session = Some(goal_envelope);
+    *active_session = Some(navigation_goal);
     publish_guarded_nav_state(transport, &node.outputs[1], scheduler.status(), telemetry, None).await?;
     Ok(GuardedGoalActivation::Activated)
 }
@@ -2206,7 +2206,7 @@ fn runtime_generation() -> u64 {
 
 #[cfg(feature = "guard-runtime")]
 fn clear_terminal_active_session(
-    active_session: &mut Option<schema::GoalEnvelope>,
+    active_session: &mut Option<schema::NavigationGoal>,
     status: &nuwax_nav_runtime::SchedulerStatus,
 ) -> bool {
     if active_session.is_some() && status.last_terminal.is_some() {
@@ -2235,7 +2235,7 @@ fn clear_guarded_session_telemetry(telemetry: &mut GuardedNavTelemetry) {
 
 #[cfg(feature = "guard-runtime")]
 fn clear_terminal_session_after_publication(
-    active_session: &mut Option<schema::GoalEnvelope>,
+    active_session: &mut Option<schema::NavigationGoal>,
     telemetry: &mut GuardedNavTelemetry,
     status: &nuwax_nav_runtime::SchedulerStatus,
 ) -> bool {
@@ -2263,12 +2263,12 @@ fn planner_generation_is_stale(
 }
 
 #[cfg(feature = "guard-runtime")]
-fn validate_path_goal_correlation(path: &schema::PathEnvelope, goal: &schema::GoalEnvelope) -> Result<(), String> {
+fn validate_path_goal_correlation(path: &schema::PathEnvelope, goal: &schema::NavigationGoal) -> Result<(), String> {
     if path.session_id != goal.session_id || path.motion_generation != goal.motion_generation {
-        return Err("PathEnvelope goal identity does not match the active GoalEnvelope".into());
+        return Err("PathEnvelope goal identity does not match the active NavigationGoal".into());
     }
     if path.path.header.frame_id != goal.goal.header.frame_id {
-        return Err("PathEnvelope frame does not match the active GoalEnvelope".into());
+        return Err("PathEnvelope frame does not match the active NavigationGoal".into());
     }
     Ok(())
 }
@@ -2276,7 +2276,7 @@ fn validate_path_goal_correlation(path: &schema::PathEnvelope, goal: &schema::Go
 #[cfg(feature = "guard-runtime")]
 fn validate_cancel_goal_correlation(
     cancel: &schema::CancelNavigation,
-    goal: &schema::GoalEnvelope,
+    goal: &schema::NavigationGoal,
 ) -> Result<(), String> {
     if cancel.session_id.is_empty() || cancel.session_id == goal.session_id { Ok(()) }
     else { Err("取消目标号不匹配".into()) }
@@ -2285,7 +2285,7 @@ fn validate_cancel_goal_correlation(
 #[cfg(feature = "guard-runtime")]
 fn guarded_buffered_cancel_telemetry(
     telemetry: &GuardedNavTelemetry,
-    goal: &schema::GoalEnvelope,
+    goal: &schema::NavigationGoal,
     cancel_generation: u64,
 ) -> GuardedNavTelemetry {
     let goal_pose =
@@ -2414,7 +2414,7 @@ impl GuardedStatusPublications {
 async fn publish_guarded_tail_observation(
     transport: &LcmTransport, node: &ModuleNode, snapshot: nuwax_nav_runtime::SchedulerStatus,
     telemetry: &mut GuardedNavTelemetry, planner_observation: Option<bool>,
-    publications: &mut GuardedStatusPublications, active_session: &mut Option<schema::GoalEnvelope>,
+    publications: &mut GuardedStatusPublications, active_session: &mut Option<schema::NavigationGoal>,
 ) -> NavStackResult<()> {
     publish_guarded_nav_observation(transport, node, snapshot.clone(), telemetry, planner_observation, publications).await?;
     clear_terminal_session_after_publication(active_session, telemetry, &snapshot);
@@ -2484,7 +2484,7 @@ fn build_guarded_nav_state_frame(
     telemetry: &GuardedNavTelemetry,
     planner_observation: Option<bool>,
 ) -> NavStackResult<RawLcmFrame> {
-    let message = build_guarded_navigation_state(
+    let message = build_guarded_navigation_status(
         &status,
         telemetry,
         planner_observation,
@@ -2492,18 +2492,18 @@ fn build_guarded_nav_state_frame(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default(),
     );
-    let body = schema::encode_navigation_state_body(&message)
-        .map_err(|error| NavStackError::Internal(format!("NavigationState encode: {error}")))?;
-    build_body_frame(channel, "nuwax_msgs.NavigationState", body)
+    let body = schema::encode_navigation_status_body(&message)
+        .map_err(|error| NavStackError::Internal(format!("NavigationStatus encode: {error}")))?;
+    build_body_frame(channel, "nuwax_msgs.NavigationStatus", body)
 }
 
 #[cfg(feature = "guard-runtime")]
-fn build_guarded_navigation_state(
+fn build_guarded_navigation_status(
     status: &nuwax_nav_runtime::SchedulerStatus,
     telemetry: &GuardedNavTelemetry,
     planner_observation: Option<bool>,
     now: Duration,
-) -> schema::NavigationState {
+) -> schema::NavigationStatus {
     use nuwax_nav_runtime::{SchedulerPhase, TerminalOutcome};
 
     let has_public_session = !telemetry.public_session_id.is_empty();
@@ -2520,22 +2520,33 @@ fn build_guarded_navigation_state(
             _ => 0,
         }
     };
-    let message = if !has_public_session && !status.message.starts_with("REJECTED ") {
-        "IDLE: guard client heartbeat".to_string()
+    let goal_status = if !has_public_session {
+        schema::NAVIGATION_GOAL_STATUS_NONE
     } else {
-        match status.last_terminal {
-            Some(TerminalOutcome::Stopped) => "STOPPED: 已被停止".into(),
-            Some(TerminalOutcome::Cancelled) => format!("CANCELLED: {}", status.message),
-            _ => status.message.clone(),
+        match (status.phase, status.last_terminal) {
+            (_, Some(TerminalOutcome::Stopped)) => schema::NAVIGATION_GOAL_STATUS_STOPPED,
+            (_, Some(TerminalOutcome::Succeeded)) => schema::NAVIGATION_GOAL_STATUS_SUCCEEDED,
+            (_, Some(TerminalOutcome::Cancelled | TerminalOutcome::Shutdown)) => schema::NAVIGATION_GOAL_STATUS_CANCELLED,
+            (SchedulerPhase::Failed, _) => schema::NAVIGATION_GOAL_STATUS_FAILED,
+            (SchedulerPhase::Controlling, _) => schema::NAVIGATION_GOAL_STATUS_EXECUTING,
+            (SchedulerPhase::Acquiring | SchedulerPhase::AwaitingPath, _) => schema::NAVIGATION_GOAL_STATUS_PLANNING,
+            _ => schema::NAVIGATION_GOAL_STATUS_NONE,
         }
     };
+    let message = if has_public_session { status.message.clone() } else { "导航栈空闲".into() };
     let include_planner_fields = planner_observation == Some(true);
-    schema::NavigationState {
+    schema::NavigationStatus {
         session_id: telemetry.public_session_id.clone(),
         robot_frame: "base_link".into(),
         stamp_sec: now.as_secs().min(i64::MAX as u64) as i64,
         stamp_nsec: now.subsec_nanos() as i32,
         state,
+        goal_status,
+        reason: message.clone(),
+        remaining_distance_m: status.remaining_distance_m,
+        input_ready: status.motion_sink_ready && status.planner_inputs_fresh
+            && !telemetry.map_frame.is_empty() && telemetry.map_frame == telemetry.pose_frame,
+        no_feasible_path: status.no_feasible_path && goal_status == schema::NAVIGATION_GOAL_STATUS_PLANNING,
         goal: telemetry.goal,
         current: telemetry.current,
         progress: telemetry.progress,
@@ -3256,7 +3267,7 @@ impl NavigationBoundary {
     feature = "mls"
 ))]
 fn navigation_boundary_from_goal(
-    goal: &schema::GoalEnvelope,
+    goal: &schema::NavigationGoal,
 ) -> NavStackResult<Option<NavigationBoundary>> {
     if goal.boundary_points.is_empty() { return Ok(None); }
     let boundary = NavigationBoundary::new(&goal.boundary_points)?;
@@ -3284,7 +3295,7 @@ enum PlannerGoalRejectReason {
 ))]
 #[derive(Debug)]
 enum PlannerGoalIngress {
-    Ready(Box<schema::GoalEnvelope>),
+    Ready(Box<schema::NavigationGoal>),
     Buffered,
     Rejected(PlannerGoalRejectReason),
 }
@@ -3298,8 +3309,8 @@ enum PlannerGoalIngress {
 struct PlannerGoalBuffer {
     costmap_observed: bool,
     pending_invalidated: bool,
-    pending_goal: Option<schema::GoalEnvelope>,
-    newest_goal: Option<schema::GoalEnvelope>,
+    pending_goal: Option<schema::NavigationGoal>,
+    newest_goal: Option<schema::NavigationGoal>,
     active_goal_applied: bool,
 }
 
@@ -3309,9 +3320,9 @@ struct PlannerGoalBuffer {
     feature = "replanning-astar"
 ))]
 impl PlannerGoalBuffer {
-    fn observe_goal(&mut self, goal: schema::GoalEnvelope) -> PlannerGoalIngress {
+    fn observe_goal(&mut self, goal: schema::NavigationGoal) -> PlannerGoalIngress {
         if let Some(newest) = self.newest_goal.as_ref() {
-            if let Err(reason) = validate_goal_envelope_order(&goal, newest) {
+            if let Err(reason) = validate_navigation_goal_order(&goal, newest) {
                 return PlannerGoalIngress::Rejected(reason);
             }
         }
@@ -3327,7 +3338,7 @@ impl PlannerGoalBuffer {
         }
     }
 
-    fn observe_costmap(&mut self) -> Option<Box<schema::GoalEnvelope>> {
+    fn observe_costmap(&mut self) -> Option<Box<schema::NavigationGoal>> {
         self.costmap_observed = true;
         // Occupancy header.seq is compatibility telemetry, not a planner
         // synchronization primitive. Timestamp validation and receipt TTL own
@@ -3335,7 +3346,7 @@ impl PlannerGoalBuffer {
         self.take_ready_goal()
     }
 
-    fn mark_applied(&mut self, goal: &schema::GoalEnvelope) -> bool {
+    fn mark_applied(&mut self, goal: &schema::NavigationGoal) -> bool {
         let is_current = self.is_newest_goal(goal);
         if is_current {
             self.active_goal_applied = true;
@@ -3348,13 +3359,13 @@ impl PlannerGoalBuffer {
         is_current
     }
 
-    fn is_newest_goal(&self, goal: &schema::GoalEnvelope) -> bool {
+    fn is_newest_goal(&self, goal: &schema::NavigationGoal) -> bool {
         self.newest_goal.as_ref().is_some_and(|newest| {
             planner_goal_identity_matches(goal, newest)
         })
     }
 
-    fn defer_ready_goal(&mut self, goal: schema::GoalEnvelope) -> bool {
+    fn defer_ready_goal(&mut self, goal: schema::NavigationGoal) -> bool {
         let is_current = self.newest_goal.as_ref().is_some_and(|newest| {
             planner_goal_identity_matches(&goal, newest)
         });
@@ -3365,7 +3376,7 @@ impl PlannerGoalBuffer {
         is_current
     }
 
-    fn take_ready_goal(&mut self) -> Option<Box<schema::GoalEnvelope>> {
+    fn take_ready_goal(&mut self) -> Option<Box<schema::NavigationGoal>> {
         if self.costmap_observed && !self.pending_invalidated {
             self.pending_goal.take().map(Box::new)
         } else {
@@ -3385,7 +3396,7 @@ impl PlannerGoalBuffer {
     fn cancelled_pending_goal(
         &self,
         cancel: &schema::CancelNavigation,
-    ) -> Result<Option<Box<schema::GoalEnvelope>>, String> {
+    ) -> Result<Option<Box<schema::NavigationGoal>>, String> {
         let Some(pending) = self.pending_goal.as_ref() else {
             return Ok(None);
         };
@@ -3393,7 +3404,7 @@ impl PlannerGoalBuffer {
         Ok(Some(Box::new(pending.clone())))
     }
 
-    fn clear_pending_goal_for(&mut self, goal: &schema::GoalEnvelope) -> bool {
+    fn clear_pending_goal_for(&mut self, goal: &schema::NavigationGoal) -> bool {
         let matches = self.pending_goal.as_ref().is_some_and(|pending| {
             planner_goal_identity_matches(pending, goal)
         });
@@ -3408,7 +3419,7 @@ impl PlannerGoalBuffer {
 #[cfg(feature = "simple-2d")]
 fn clear_simple_planner_active_projection(
     goal_buffer: &mut PlannerGoalBuffer,
-    active_goal: &mut Option<schema::GoalEnvelope>,
+    active_goal: &mut Option<schema::NavigationGoal>,
     active_boundary: &mut Option<NavigationBoundary>,
     path_revision: &mut i64,
     published_path_is_boundary_safe: &mut bool,
@@ -3422,7 +3433,7 @@ fn clear_simple_planner_active_projection(
 
 #[cfg(any(feature = "simple-2d", feature = "replanning-astar"))]
 fn clear_planner_goal_for_costmap_advance(
-    active_goal: &mut Option<schema::GoalEnvelope>,
+    active_goal: &mut Option<schema::NavigationGoal>,
     active_boundary: &mut Option<NavigationBoundary>,
     path_revision: &mut i64,
 ) {
@@ -3447,8 +3458,8 @@ fn clear_planner_goal_for_costmap_advance(
     feature = "mls"
 ))]
 fn planner_goal_identity_matches(
-    left: &schema::GoalEnvelope,
-    right: &schema::GoalEnvelope,
+    left: &schema::NavigationGoal,
+    right: &schema::NavigationGoal,
 ) -> bool {
     left == right
 }
@@ -3458,9 +3469,9 @@ fn planner_goal_identity_matches(
     feature = "simple-2d",
     feature = "replanning-astar"
 ))]
-fn validate_goal_envelope_order(
-    candidate: &schema::GoalEnvelope,
-    newest: &schema::GoalEnvelope,
+fn validate_navigation_goal_order(
+    candidate: &schema::NavigationGoal,
+    newest: &schema::NavigationGoal,
 ) -> Result<(), PlannerGoalRejectReason> {
     if candidate.session_id == newest.session_id {
         if candidate == newest { Err(PlannerGoalRejectReason::DuplicateLease) }
@@ -3697,9 +3708,9 @@ pub(crate) fn captured_body_reference(body: &Result<Arc<str>, String>) -> NavSta
 #[cfg(feature = "simple-2d")]
 fn apply_simple_planner_goal(
     module: &mut nuwax_nav_simple_planner::module::SimplePlannerModule,
-    envelope: schema::GoalEnvelope,
+    envelope: schema::NavigationGoal,
     occupancy_body: &[u8],
-) -> OwnerInputResult<(schema::GoalEnvelope, Option<NavigationBoundary>)> {
+) -> OwnerInputResult<(schema::NavigationGoal, Option<NavigationBoundary>)> {
     use nuwax_nav_simple_planner::module::Module;
 
     let boundary = match navigation_boundary_from_goal(&envelope) {
@@ -3746,9 +3757,9 @@ fn apply_simple_planner_goal(
 #[cfg(feature = "replanning-astar")]
 fn apply_astar_planner_goal(
     module: &mut nuwax_nav_astar::module::ReplanningAStarPlannerModule,
-    envelope: schema::GoalEnvelope,
+    envelope: schema::NavigationGoal,
     costmap_body: &[u8],
-) -> OwnerInputResult<(schema::GoalEnvelope, Option<NavigationBoundary>, f64)> {
+) -> OwnerInputResult<(schema::NavigationGoal, Option<NavigationBoundary>, f64)> {
     use nuwax_nav_astar::module::Module;
 
     let boundary = match navigation_boundary_from_goal(&envelope) {
@@ -3797,7 +3808,7 @@ struct FarJoinKey {
 }
 
 #[cfg(any(feature = "cmu-native", feature = "explore"))]
-fn far_join_key(state: &schema::NavigationState) -> Option<FarJoinKey> {
+fn far_join_key(state: &schema::NavigationStatus) -> Option<FarJoinKey> {
     if state.state != nuwax_nav_far_planner_bridge::worker::FAR_EVENT_SUCCEEDED
         || state.runtime_generation <= 0
         || state.path_revision <= 0
@@ -3818,7 +3829,7 @@ fn far_join_key(state: &schema::NavigationState) -> Option<FarJoinKey> {
 #[cfg(any(feature = "cmu-native", feature = "explore"))]
 fn far_key_matches_goal(
     key: &FarJoinKey,
-    goal: &schema::GoalEnvelope,
+    goal: &schema::NavigationGoal,
     accepted_generation: i64,
 ) -> bool {
     accepted_generation > 0
@@ -3831,8 +3842,8 @@ fn far_key_matches_goal(
 
 #[cfg(all(any(feature = "cmu-native", feature = "explore"), test))]
 fn far_terminal_matches_goal(
-    state: &schema::NavigationState,
-    goal: &schema::GoalEnvelope,
+    state: &schema::NavigationStatus,
+    goal: &schema::NavigationGoal,
     accepted_generation: i64,
 ) -> bool {
     far_join_key(state)
@@ -3860,7 +3871,7 @@ fn take_far_join(
 }
 
 #[cfg(any(feature = "cmu-native", feature = "explore"))]
-fn native_path_respects_goal(path: &Path2D, goal: &schema::GoalEnvelope) -> bool {
+fn native_path_respects_goal(path: &Path2D, goal: &schema::NavigationGoal) -> bool {
     goal.goal.header.frame_id == "map"
         && path.frame_id.as_str() == goal.goal.header.frame_id
         && navigation_boundary_from_goal(goal)
@@ -3872,8 +3883,8 @@ fn native_path_respects_goal(path: &Path2D, goal: &schema::GoalEnvelope) -> bool
 
 #[cfg(any(feature = "cmu-native", feature = "explore"))]
 fn admit_native_adapter_goal(
-    latest_goal: &mut Option<schema::GoalEnvelope>,
-    candidate: schema::GoalEnvelope,
+    latest_goal: &mut Option<schema::NavigationGoal>,
+    candidate: schema::NavigationGoal,
 ) -> bool {
     let Some(current) = latest_goal.as_ref() else {
         *latest_goal = Some(candidate);
@@ -3922,15 +3933,15 @@ async fn run_native_planner_path_adapter_with_transport(
     mut shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
 ) -> NavStackResult<()> {
-    let mut goals = typed_stream(&transport, &node.inputs[0], "nuwax_msgs.GoalEnvelope").await?;
+    let mut goals = typed_stream(&transport, &node.inputs[0], "nuwax_msgs.NavigationGoal").await?;
     let mut events =
-        typed_stream(&transport, &node.inputs[1], "nuwax_msgs.NavigationState").await?;
+        typed_stream(&transport, &node.inputs[1], "nuwax_msgs.NavigationStatus").await?;
     let mut far_results = if node.inputs.len() == 3 {
-        Some(typed_stream(&transport, &node.inputs[2], "nuwax_msgs.NavigationState").await?)
+        Some(typed_stream(&transport, &node.inputs[2], "nuwax_msgs.NavigationStatus").await?)
     } else {
         None
     };
-    let mut latest_goal: Option<schema::GoalEnvelope> = None;
+    let mut latest_goal: Option<schema::NavigationGoal> = None;
     #[cfg(any(feature = "cmu-native", feature = "explore"))]
     let mut pending_results: HashMap<FarJoinKey, Path2D> = HashMap::new();
     #[cfg(any(feature = "cmu-native", feature = "explore"))]
@@ -3947,7 +3958,7 @@ async fn run_native_planner_path_adapter_with_transport(
             _ = &mut shutdown => break,
             frame = goals.next() => {
                 let frame = required_frame(frame, "native_planner_path_adapter.goal")?;
-                let goal = match schema::decode_goal_envelope_body(&frame.payload) {
+                let goal = match schema::decode_navigation_goal_body(&frame.payload) {
                     Ok(goal) => goal,
                     Err(_) => continue,
                 };
@@ -3977,7 +3988,7 @@ async fn run_native_planner_path_adapter_with_transport(
                         consumed_far_results.clear();
                         observed_far_generation = accepted_generation;
                     }
-                    let state = match schema::decode_navigation_state_body(&frame.payload) {
+                    let state = match schema::decode_navigation_status_body(&frame.payload) {
                         Ok(state) => state,
                         Err(_) => continue,
                     };
@@ -4029,7 +4040,7 @@ async fn run_native_planner_path_adapter_with_transport(
                 if far_results.is_some() {
                     #[cfg(any(feature = "cmu-native", feature = "explore"))]
                     {
-                        let state = match schema::decode_navigation_state_body(&frame.payload) {
+                        let state = match schema::decode_navigation_status_body(&frame.payload) {
                             Ok(state) => state,
                             Err(_) => continue,
                         };
@@ -4105,7 +4116,7 @@ async fn run_simple_planner(
     let mut map_pose =
         typed_stream(&transport, &node.inputs[1], "geometry_msgs.PoseStamped").await?;
     let mut goal_pose =
-        typed_stream(&transport, &node.inputs[2], "nuwax_msgs.GoalEnvelope").await?;
+        typed_stream(&transport, &node.inputs[2], "nuwax_msgs.NavigationGoal").await?;
     let mut stop = typed_stream(&transport, &node.inputs[3], "std_msgs.Bool").await?;
     let robot_geometry = std::env::var("NUWAX_ROBOT_GEOMETRY_JSON").ok()
         .filter(|value| !value.trim().is_empty())
@@ -4127,7 +4138,7 @@ async fn run_simple_planner(
     let planner_runtime_generation = saturating_i64(runtime_generation());
     let mut goal_buffer = PlannerGoalBuffer::default();
     let mut latest_occupancy_body: Option<Vec<u8>> = None;
-    let mut active_goal: Option<schema::GoalEnvelope> = None;
+    let mut active_goal: Option<schema::NavigationGoal> = None;
     let mut active_boundary: Option<NavigationBoundary> = None;
     let mut active_map_resolution = 0.05_f64;
     let mut published_path_is_boundary_safe = false;
@@ -4175,7 +4186,7 @@ async fn run_simple_planner(
                         OwnerInput::Accepted((envelope, boundary)) => {
                             if !goal_buffer.mark_applied(&envelope) {
                                 return Err(NavStackError::Internal(
-                                    "simple planner applied a superseded GoalEnvelope".into(),
+                                    "simple planner applied a superseded NavigationGoal".into(),
                                 ));
                             }
                             path_revision = 0;
@@ -4248,7 +4259,7 @@ async fn run_simple_planner(
             }
             message = goal_pose.next() => {
                 let frame = required_frame(message, "simple_planner.goal_pose")?;
-                let envelope = match schema::decode_goal_envelope_body(&frame.payload) {
+                let envelope = match schema::decode_navigation_goal_body(&frame.payload) {
                     Ok(envelope) => envelope,
                     Err(error) => {
                         diagnostics.reject("simple_planner.goal_pose", &error.to_string());
@@ -4261,7 +4272,7 @@ async fn run_simple_planner(
                     PlannerGoalIngress::Rejected(reason) => {
                         diagnostics.reject(
                             "simple_planner.goal_pose",
-                            &format!("GoalEnvelope rejected: {reason:?}"),
+                            &format!("NavigationGoal rejected: {reason:?}"),
                         );
                         continue;
                     }
@@ -4282,7 +4293,7 @@ async fn run_simple_planner(
                 };
                 if !goal_buffer.mark_applied(&envelope) {
                     return Err(NavStackError::Internal(
-                        "simple planner applied a superseded GoalEnvelope".into(),
+                        "simple planner applied a superseded NavigationGoal".into(),
                     ));
                 }
                 path_revision = 0;
@@ -4349,7 +4360,7 @@ async fn run_simple_planner(
 #[cfg(feature = "simple-2d")]
 struct SimpleOutputPublication<'a> {
     path_yaws: Option<&'a [f64]>,
-    active_goal: Option<&'a schema::GoalEnvelope>,
+    active_goal: Option<&'a schema::NavigationGoal>,
     active_boundary: Option<&'a NavigationBoundary>,
     map_resolution: f64,
     planner_runtime_generation: i64,
@@ -4382,7 +4393,7 @@ async fn publish_simple_output(
                 VersionedPathPublication {
                     path_yaws: publication.path_yaws,                    goal: publication.active_goal.ok_or_else(|| {
                         NavStackError::Internal(
-                            "simple planner path has no active GoalEnvelope".into(),
+                            "simple planner path has no active NavigationGoal".into(),
                         )
                     })?,
                     planner_runtime_generation: publication.planner_runtime_generation,
@@ -4425,7 +4436,7 @@ async fn publish_simple_output(
                 VersionedPathPublication {
                     path_yaws: None,                    goal: publication.active_goal.ok_or_else(|| {
                         NavStackError::Internal(
-                            "simple planner hold has no active GoalEnvelope".into(),
+                            "simple planner hold has no active NavigationGoal".into(),
                         )
                     })?,
                     planner_runtime_generation: publication.planner_runtime_generation,
@@ -4485,7 +4496,7 @@ async fn run_astar_planner_with_transport(
     let mut map_pose =
         typed_stream(&transport, &node.inputs[0], "geometry_msgs.PoseStamped").await?;
     let mut costmap = typed_stream(&transport, &node.inputs[1], "nav_msgs.OccupancyGrid").await?;
-    let mut goal = typed_stream(&transport, &node.inputs[2], "nuwax_msgs.GoalEnvelope").await?;
+    let mut goal = typed_stream(&transport, &node.inputs[2], "nuwax_msgs.NavigationGoal").await?;
     let mut stop = typed_stream(&transport, &node.inputs[3], "std_msgs.Bool").await?;
     let value = std::env::var("NUWAX_ROBOT_GEOMETRY_JSON")
         .map_err(|error| NavStackError::InvalidConfig(error.to_string()))?;
@@ -4500,7 +4511,7 @@ async fn run_astar_planner_with_transport(
     let planner_runtime_generation = saturating_i64(runtime_generation());
     let mut goal_buffer = PlannerGoalBuffer::default();
     let mut latest_costmap_body: Option<Vec<u8>> = None;
-    let mut active_goal: Option<schema::GoalEnvelope> = None;
+    let mut active_goal: Option<schema::NavigationGoal> = None;
     let mut active_boundary: Option<NavigationBoundary> = None;
     let mut active_map_resolution = 0.05_f64;
     let mut path_revision = 0_i64;
@@ -4567,7 +4578,7 @@ async fn run_astar_planner_with_transport(
                             };
                         if !goal_buffer.mark_applied(&envelope) {
                             return Err(NavStackError::Internal(
-                                "A* planner applied a superseded GoalEnvelope".into(),
+                                "A* planner applied a superseded NavigationGoal".into(),
                             ));
                         }
                         active_map_resolution = map_resolution;
@@ -4610,7 +4621,7 @@ async fn run_astar_planner_with_transport(
                         active_map_resolution = raw_resolution;
                         if !goal_buffer.defer_ready_goal(*envelope) {
                             return Err(NavStackError::Internal(
-                                "A* planner lost a GoalEnvelope while waiting for odometry"
+                                "A* planner lost a NavigationGoal while waiting for odometry"
                                     .into(),
                             ));
                         }
@@ -4619,7 +4630,7 @@ async fn run_astar_planner_with_transport(
                         OwnerInput::Accepted((envelope, boundary, map_resolution)) => {
                             if !goal_buffer.mark_applied(&envelope) {
                                 return Err(NavStackError::Internal(
-                                    "A* planner applied a superseded GoalEnvelope".into(),
+                                    "A* planner applied a superseded NavigationGoal".into(),
                                 ));
                             }
                             active_map_resolution = map_resolution;
@@ -4664,7 +4675,7 @@ async fn run_astar_planner_with_transport(
             }
             message = goal.next() => {
                 let frame = required_frame(message, "astar_planner.goal")?;
-                let envelope = match schema::decode_goal_envelope_body(&frame.payload) {
+                let envelope = match schema::decode_navigation_goal_body(&frame.payload) {
                     Ok(envelope) => envelope,
                     Err(error) => {
                         diagnostics.reject("astar_planner.goal", &error.to_string());
@@ -4677,7 +4688,7 @@ async fn run_astar_planner_with_transport(
                     PlannerGoalIngress::Rejected(reason) => {
                         diagnostics.reject(
                             "astar_planner.goal",
-                            &format!("GoalEnvelope rejected: {reason:?}"),
+                            &format!("NavigationGoal rejected: {reason:?}"),
                         );
                         continue;
                     }
@@ -4685,7 +4696,7 @@ async fn run_astar_planner_with_transport(
                 if !has_odometry {
                     if !goal_buffer.defer_ready_goal(envelope) {
                         return Err(NavStackError::Internal(
-                            "A* planner lost a GoalEnvelope while waiting for odometry".into(),
+                            "A* planner lost a NavigationGoal while waiting for odometry".into(),
                         ));
                     }
                     continue;
@@ -4693,7 +4704,7 @@ async fn run_astar_planner_with_transport(
                 let Some(costmap_body) = latest_costmap_body.as_ref() else {
                     if !goal_buffer.defer_ready_goal(envelope) {
                         return Err(NavStackError::Internal(
-                            "A* planner lost a GoalEnvelope while waiting for its costmap body"
+                            "A* planner lost a NavigationGoal while waiting for its costmap body"
                                 .into(),
                         ));
                     }
@@ -4712,7 +4723,7 @@ async fn run_astar_planner_with_transport(
                 };
                 if !goal_buffer.mark_applied(&envelope) {
                     return Err(NavStackError::Internal(
-                        "A* planner applied a superseded GoalEnvelope".into(),
+                        "A* planner applied a superseded NavigationGoal".into(),
                     ));
                 }
                 active_map_resolution = map_resolution;
@@ -4766,7 +4777,7 @@ async fn run_astar_planner_with_transport(
                         VersionedPathPublication {
                     path_yaws: None,                            goal: active_goal.as_ref().ok_or_else(|| {
                                 NavStackError::Internal(
-                                    "A* path has no active GoalEnvelope".into(),
+                                    "A* path has no active NavigationGoal".into(),
                                 )
                             })?,
                             planner_runtime_generation,
@@ -5628,7 +5639,7 @@ async fn publish_point(
 ))]
 struct VersionedPathPublication<'a> {
     path_yaws: Option<&'a [f64]>,
-    goal: &'a schema::GoalEnvelope,
+    goal: &'a schema::NavigationGoal,
     planner_runtime_generation: i64,
     path_revision: i64,
     path: &'a Path2D,
@@ -5704,7 +5715,7 @@ fn build_versioned_path_envelope(
     feature = "mls"
 ))]
 fn build_versioned_path_from_schema(
-    goal: &schema::GoalEnvelope,
+    goal: &schema::NavigationGoal,
     planner_runtime_generation: i64,
     path_revision: i64,
     source_timestamp_ns: i64,
@@ -5876,8 +5887,8 @@ fn prefixed(fingerprint: [u8; 8], body: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(all(test, any(feature = "simple-2d", feature = "replanning-astar")))]
-fn planner_test_goal(session_id: &str, goal_generation: i64) -> schema::GoalEnvelope {
-    let mut goal = schema::GoalEnvelope {
+fn planner_test_goal(session_id: &str, goal_generation: i64) -> schema::NavigationGoal {
+    let mut goal = schema::NavigationGoal {
 session_id: session_id.into(),
 boundary_points: vec![
             [0.0, 0.0, 0.0],
@@ -5899,10 +5910,10 @@ goal: schema::PoseStamped {
                 orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
             },
         },
-..schema::GoalEnvelope::default()
+..schema::NavigationGoal::default()
 };
 
-    schema::validate_goal_envelope(&goal).expect("seal planner test goal");
+    schema::validate_navigation_goal(&goal).expect("seal planner test goal");
     goal
 }
 
@@ -6085,7 +6096,7 @@ mod simple_tests {
         goal.goal.pose.position[2] = 3.0;
         let half_yaw = std::f64::consts::FRAC_PI_4;
         goal.goal.pose.orientation_xyzw = [0.0, 0.0, half_yaw.sin(), half_yaw.cos()];
-        schema::validate_goal_envelope(&goal).unwrap();
+        schema::validate_navigation_goal(&goal).unwrap();
         let path = Path2D::stamped(
             NavFrameId::Map,
             Timestamp::from_unix(12, 0),
@@ -6744,8 +6755,8 @@ mod guarded_tests {
                     .await
                     .expect("state stream open")
                     .expect("state frame");
-                let state = schema::decode_navigation_state_body(&frame.payload)
-                    .expect("real status NavigationState");
+                let state = schema::decode_navigation_status_body(&frame.payload)
+                    .expect("real status NavigationStatus");
                 if state.session_id == goal.session_id
                     && state.state == 3
                 {
@@ -6754,8 +6765,8 @@ mod guarded_tests {
             }
         })
         .await
-        .expect("bounded terminal NavigationState publication");
-        feeder.assert_ready_evidence("terminal NavigationState");
+        .expect("bounded terminal NavigationStatus publication");
+        feeder.assert_ready_evidence("terminal NavigationStatus");
         feeder.assert_status_dispatch_bound(terminal_ready_dispatch,harness.publication_dispatches(&receipt).await);
         assert_eq!(
             harness.scheduler.status().last_terminal,
@@ -6880,7 +6891,7 @@ mod guarded_tests {
                     })
                     .expect("status receiver"),
                 GuardedNavSource::Goal => {
-                    send_guarded_test_body(&goals_tx, "nuwax_msgs.GoalEnvelope", payload.clone())
+                    send_guarded_test_body(&goals_tx, "nuwax_msgs.NavigationGoal", payload.clone())
                 }
                 GuardedNavSource::Path => {
                     send_guarded_test_body(&paths_tx, "nuwax_msgs.PathEnvelope", payload.clone())
@@ -7063,15 +7074,15 @@ mod guarded_tests {
         ));
     }
 
-    fn active_goal(session_id: &str) -> schema::GoalEnvelope {
-        schema::GoalEnvelope {
+    fn active_goal(session_id: &str) -> schema::NavigationGoal {
+        schema::NavigationGoal {
 session_id: session_id.into(),
-..schema::GoalEnvelope::default()
+..schema::NavigationGoal::default()
 }
     }
 
-    fn sealed_goal(session_id: &str) -> schema::GoalEnvelope {
-        let mut goal = schema::GoalEnvelope {
+    fn sealed_goal(session_id: &str) -> schema::NavigationGoal {
+        let mut goal = schema::NavigationGoal {
 session_id: session_id.into(),
 motion_generation: 1,
 goal: schema::PoseStamped {
@@ -7085,13 +7096,13 @@ goal: schema::PoseStamped {
                     orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
                 },
             },
-..schema::GoalEnvelope::default()
+..schema::NavigationGoal::default()
 };
-        schema::validate_goal_envelope(&goal).expect("seal goal");
+        schema::validate_navigation_goal(&goal).expect("seal goal");
         goal
     }
 
-    fn sealed_path(goal: &schema::GoalEnvelope) -> schema::PathEnvelope {
+    fn sealed_path(goal: &schema::NavigationGoal) -> schema::PathEnvelope {
         let mut path = schema::PathEnvelope {
 route_kind: 0,
 schema_version: schema::PATH_ENVELOPE_SCHEMA_VERSION,
@@ -7121,17 +7132,17 @@ path: schema::Path {
     }
 
     fn rollover_goal(
-        previous: &schema::GoalEnvelope,
+        previous: &schema::NavigationGoal,
         session_id: &str,
         producer_runtime_generation: i64,
         goal_generation: i64,
-    ) -> schema::GoalEnvelope {
+    ) -> schema::NavigationGoal {
         let mut goal = previous.clone();
         goal.session_id = session_id.into();
         let _ = producer_runtime_generation;
         goal.motion_generation = goal_generation as u64;
 
-        schema::validate_goal_envelope(&goal).expect("seal rollover goal");
+        schema::validate_navigation_goal(&goal).expect("seal rollover goal");
         goal
     }
 
@@ -7646,7 +7657,7 @@ path: schema::Path {
             let commands = typed_stream(&transport, &node.outputs[0], "geometry_msgs.Twist")
                 .await
                 .expect("guarded command test stream");
-            let states = typed_stream(&transport, &node.outputs[1], "nuwax_msgs.NavigationState")
+            let states = typed_stream(&transport, &node.outputs[1], "nuwax_msgs.NavigationStatus")
                 .await
                 .expect("guarded state test stream");
             let reached = typed_stream(&transport, &node.outputs[2], "std_msgs.Bool")
@@ -7679,19 +7690,19 @@ path: schema::Path {
             }
         }
 
-        fn send_goal(&self, goal: &schema::GoalEnvelope) {
+        fn send_goal(&self, goal: &schema::NavigationGoal) {
             send_guarded_test_body(
                 &self.goals,
-                "nuwax_msgs.GoalEnvelope",
-                schema::encode_goal_envelope_body(goal).expect("encode guarded test goal"),
+                "nuwax_msgs.NavigationGoal",
+                schema::encode_navigation_goal_body(goal).expect("encode guarded test goal"),
             );
         }
 
-        async fn send_goal_and_wait_dequeued(&self, goal: &schema::GoalEnvelope) {
+        async fn send_goal_and_wait_dequeued(&self, goal: &schema::NavigationGoal) {
             let dequeued = send_guarded_test_body_observed(
                 &self.goals,
-                "nuwax_msgs.GoalEnvelope",
-                schema::encode_goal_envelope_body(goal).expect("encode guarded test goal"),
+                "nuwax_msgs.NavigationGoal",
+                schema::encode_navigation_goal_body(goal).expect("encode guarded test goal"),
             );
             tokio::time::timeout(Duration::from_secs(1), dequeued)
                 .await
@@ -7724,7 +7735,7 @@ path: schema::Path {
             );
         }
 
-        fn send_cancel(&self, goal: &schema::GoalEnvelope, cancel_generation: i64) {
+        fn send_cancel(&self, goal: &schema::NavigationGoal, cancel_generation: i64) {
             send_guarded_test_body(
                 &self.cancels,
                 "nuwax_msgs.CancelNavigation",
@@ -7734,7 +7745,7 @@ path: schema::Path {
 
         async fn send_cancel_and_wait_dequeued(
             &self,
-            goal: &schema::GoalEnvelope,
+            goal: &schema::NavigationGoal,
             cancel_generation: i64,
         ) {
             let dequeued = send_guarded_test_body_observed(
@@ -7749,7 +7760,7 @@ path: schema::Path {
             assert!(!self.loop_task.is_finished(), "guarded loop exited early");
         }
 
-        fn cancel_body(goal: &schema::GoalEnvelope, cancel_generation: i64) -> Vec<u8> {
+        fn cancel_body(goal: &schema::NavigationGoal, cancel_generation: i64) -> Vec<u8> {
             schema::encode_cancel_navigation_body(&schema::CancelNavigation {
                 session_id: goal.session_id.clone(),
                 reason: 1,
@@ -7842,9 +7853,9 @@ path: schema::Path {
 
         async fn wait_for_correlated_zero(
             &mut self,
-            goal: &schema::GoalEnvelope,
+            goal: &schema::NavigationGoal,
             _cancel_generation: i64,
-        ) -> schema::NavigationState {
+        ) -> schema::NavigationStatus {
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
                     let frame = self
@@ -7853,20 +7864,20 @@ path: schema::Path {
                         .await
                         .expect("guarded state stream open")
                         .expect("guarded state transport frame");
-                    let state = schema::decode_navigation_state_body(&frame.payload)
-                        .expect("guarded NavigationState body");
+                    let state = schema::decode_navigation_status_body(&frame.payload)
+                        .expect("guarded NavigationStatus body");
                     if state.session_id == goal.session_id
                         && state.owner_kind == schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV
                         && state.session_id == goal.session_id
                         && state.goal_generation == goal.motion_generation as i64
-                        && state.state == 0 && state.message.starts_with("CANCELLED:")
+                        && state.goal_status == schema::NAVIGATION_GOAL_STATUS_CANCELLED
                     {
                         return state;
                     }
                 }
             })
             .await
-            .expect("correlated ZEROED NavigationState")
+            .expect("correlated ZEROED NavigationStatus")
         }
 
         async fn assert_no_session(&self) {
@@ -8107,11 +8118,11 @@ path: schema::Path {
         let failure = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let frame = harness.states.next().await.unwrap().unwrap();
-                let state = schema::decode_navigation_state_body(&frame.payload).unwrap();
+                let state = schema::decode_navigation_status_body(&frame.payload).unwrap();
                 if state.session_id == rejected.session_id && state.state == 4 { break state; }
             }
         }).await.expect("必须实际发布被拒绝候选目标的失败");
-        assert!(failure.message.starts_with("LEASE_NOT_GRANTED:"));
+        assert_eq!(failure.goal_status, schema::NAVIGATION_GOAL_STATUS_STOPPED);
 
 
         assert_eq!(failure.goal_generation, rejected.motion_generation as i64);
@@ -8210,7 +8221,7 @@ path: schema::Path {
 
 
 
-    async fn activate_map_a(harness: &GuardedLoopHarness) -> schema::GoalEnvelope {
+    async fn activate_map_a(harness: &GuardedLoopHarness) -> schema::NavigationGoal {
         let goal_a = sealed_goal("session-a");
         harness.send_pose(1);
         harness.wait_for_pose(1).await;
@@ -8223,7 +8234,7 @@ path: schema::Path {
 
     async fn finish_map_a_after_verified_zero(
         harness: &GuardedLoopHarness,
-        goal_a: &schema::GoalEnvelope,
+        goal_a: &schema::NavigationGoal,
     ) {
         harness.send_path(&sealed_path(goal_a));
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -8459,7 +8470,7 @@ path: schema::Path {
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let frame = harness.states.next().await.unwrap().unwrap();
-                let state = schema::decode_navigation_state_body(&frame.payload).unwrap();
+                let state = schema::decode_navigation_status_body(&frame.payload).unwrap();
                 if state.message.contains("versioned path mutation detected") { break; }
             }
         }).await.expect("同修订变化须通过真实状态流发布拒绝诊断");
@@ -8495,22 +8506,22 @@ path: schema::Path {
             ..Default::default()
         };
         for observation in [None, Some(false), Some(true)] {
-            let wire = build_guarded_navigation_state(&status, &telemetry, observation, Duration::from_secs(1));
-            let decoded = schema::decode_navigation_state(&schema::encode_navigation_state(&wire).unwrap()).unwrap();
+            let wire = build_guarded_navigation_status(&status, &telemetry, observation, Duration::from_secs(1));
+            let decoded = schema::decode_navigation_status(&schema::encode_navigation_status(&wire).unwrap()).unwrap();
             assert_eq!(decoded.local_path, status.local_path);
         }
         status.last_terminal = Some(nuwax_nav_runtime::TerminalOutcome::Succeeded);
-        assert!(build_guarded_navigation_state(&status, &telemetry, None, Duration::from_secs(2)).local_path.is_empty());
+        assert!(build_guarded_navigation_status(&status, &telemetry, None, Duration::from_secs(2)).local_path.is_empty());
         status.last_terminal = None;
         status.session_id = Some("old-goal".into());
-        assert!(build_guarded_navigation_state(&status, &telemetry, None, Duration::from_secs(3)).local_path.is_empty());
+        assert!(build_guarded_navigation_status(&status, &telemetry, None, Duration::from_secs(3)).local_path.is_empty());
         status.session_id = Some("display-goal".into());
         status.path_revision = 1;
-        assert!(build_guarded_navigation_state(&status, &telemetry, None, Duration::from_secs(4)).local_path.is_empty());
+        assert!(build_guarded_navigation_status(&status, &telemetry, None, Duration::from_secs(4)).local_path.is_empty());
     }
 
     #[test]
-    fn guarded_navigation_state_receipt_projection_is_read_only() {
+    fn guarded_navigation_status_receipt_projection_is_read_only() {
         let telemetry = GuardedNavTelemetry {
             public_session_id: "goal-a".into(),
             ..GuardedNavTelemetry::default()
@@ -8520,7 +8531,7 @@ path: schema::Path {
             session_id: Some("goal-a".into()),
             ..nuwax_nav_runtime::SchedulerStatus::default()
         };
-        let baseline = build_guarded_navigation_state(
+        let baseline = build_guarded_navigation_status(
             &baseline_status,
             &telemetry,
             None,
@@ -8535,11 +8546,11 @@ path: schema::Path {
             ..baseline_status
         };
         let projected =
-            build_guarded_navigation_state(&status, &telemetry, None, Duration::from_secs(1));
+            build_guarded_navigation_status(&status, &telemetry, None, Duration::from_secs(1));
         assert_eq!(projected.pose_source_timestamp_ns, 11);
         assert_eq!(projected.costmap_source_timestamp_ns, 17);
         assert_eq!(
-            build_guarded_navigation_state(&status, &telemetry, None, Duration::from_secs(1)),
+            build_guarded_navigation_status(&status, &telemetry, None, Duration::from_secs(1)),
             projected,
             "replaying the same scheduler snapshot must not advance receipt identity",
         );
@@ -8573,7 +8584,7 @@ path: schema::Path {
             ..GuardedNavTelemetry::default()
         };
         let published =
-            build_guarded_navigation_state(&rejected, &telemetry, None, Duration::from_secs(1));
+            build_guarded_navigation_status(&rejected, &telemetry, None, Duration::from_secs(1));
         assert_eq!(published.state, 1, "rejection must not fabricate FAILED");
     }
 
@@ -8628,7 +8639,7 @@ path: schema::Path {
         };
 
         let terminal_message =
-            build_guarded_navigation_state(&terminal, &telemetry, None, Duration::from_secs(1));
+            build_guarded_navigation_status(&terminal, &telemetry, None, Duration::from_secs(1));
         assert_eq!(terminal_message.session_id, "goal-a");
         assert_eq!(terminal_message.producer_runtime_generation, 11);
         assert_eq!(terminal_message.planner_runtime_generation, 22);
@@ -8644,7 +8655,7 @@ path: schema::Path {
         ));
         assert!(active.is_none());
 
-        let heartbeat = build_guarded_navigation_state(
+        let heartbeat = build_guarded_navigation_status(
             &terminal,
             &telemetry,
             Some(true),
@@ -8652,7 +8663,8 @@ path: schema::Path {
         );
         assert!(heartbeat.session_id.is_empty());
         assert_eq!(heartbeat.state, 0);
-        assert_eq!(heartbeat.message, "IDLE: guard client heartbeat");
+        assert_eq!(heartbeat.goal_status, schema::NAVIGATION_GOAL_STATUS_NONE);
+        assert_eq!(heartbeat.reason, "导航栈空闲");
         assert_eq!(heartbeat.sink_ready, 1);
         assert_eq!(heartbeat.cancel_generation, 0);
         assert!(heartbeat.zero_ack_id.is_empty());
@@ -9651,8 +9663,8 @@ mod tests {
         publish_body(
             &transport,
             &node.inputs[2],
-            "nuwax_msgs.GoalEnvelope",
-            schema::encode_goal_envelope_body(&goal).expect("encode goal"),
+            "nuwax_msgs.NavigationGoal",
+            schema::encode_navigation_goal_body(&goal).expect("encode goal"),
         )
         .await
         .expect("publish goal first");
@@ -10036,8 +10048,8 @@ mod boundary_tests {
         ]
     }
 
-    fn goal(owner_kind: i32, boundary_points: Vec<[f64; 3]>) -> schema::GoalEnvelope {
-        schema::GoalEnvelope {
+    fn goal(owner_kind: i32, boundary_points: Vec<[f64; 3]>) -> schema::NavigationGoal {
+        schema::NavigationGoal {
 boundary_points: boundary_points,
 goal: schema::PoseStamped {
                 header: schema::Header {
@@ -10049,7 +10061,7 @@ goal: schema::PoseStamped {
                     orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
                 },
             },
-..schema::GoalEnvelope::default()
+..schema::NavigationGoal::default()
 }
     }
 
@@ -10142,8 +10154,8 @@ mod native_adapter_tests {
     static NATIVE_GENERATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use super::*;
 
-    fn goal() -> schema::GoalEnvelope {
-        let mut goal = schema::GoalEnvelope {
+    fn goal() -> schema::NavigationGoal {
+        let mut goal = schema::NavigationGoal {
 session_id: "native-session".into(),
 boundary_points: vec![
                 [0.0, 0.0, 0.0],
@@ -10165,10 +10177,10 @@ goal: schema::PoseStamped {
                     orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
                 },
             },
-..schema::GoalEnvelope::default()
+..schema::NavigationGoal::default()
 };
 
-        schema::validate_goal_envelope(&goal).expect("seal native goal");
+        schema::validate_navigation_goal(&goal).expect("seal native goal");
         goal
     }
 
@@ -10177,17 +10189,17 @@ goal: schema::PoseStamped {
     }
 
     #[cfg(any(feature = "cmu-native", feature = "explore"))]
-    fn goal_generation(generation: i64) -> schema::GoalEnvelope {
+    fn goal_generation(generation: i64) -> schema::NavigationGoal {
         let mut value = goal();
         value.motion_generation = generation as u64;
         value.goal.header.seq = i32::try_from(generation).expect("test generation fits i32");
         value.goal.header.stamp_sec = i32::try_from(generation).expect("test generation fits i32");
-        schema::validate_goal_envelope(&value).expect("reseal native goal generation");
+        schema::validate_navigation_goal(&value).expect("reseal native goal generation");
         value
     }
 
     #[cfg(any(feature = "cmu-native", feature = "explore"))]
-    fn far_key(goal: &schema::GoalEnvelope) -> FarJoinKey {
+    fn far_key(goal: &schema::NavigationGoal) -> FarJoinKey {
         FarJoinKey {
             backend: "far-visibility-graph".into(),
             runtime_generation: 12,
@@ -10219,13 +10231,13 @@ goal: schema::PoseStamped {
         };
         let mut published = expected.clone();
         published.generation = 12;
-        let mut state = schema::NavigationState {
+        let mut state = schema::NavigationStatus {
             robot_frame: expected.backend.clone(),
             state: nuwax_nav_far_planner_bridge::worker::FAR_EVENT_READY,
             runtime_generation: 12,
             sink_ready: 1,
             message: published.encode_v2(),
-            ..schema::NavigationState::default()
+            ..schema::NavigationStatus::default()
         };
         assert!(far_ready_contract_matches(&expected, 12, &state));
         published.result_contract = "far-private-result-v2".into();
@@ -10321,7 +10333,7 @@ goal: schema::PoseStamped {
     #[test]
     fn far_terminal_gate_rejects_old_future_and_wrong_goal_identity() {
         let goal = goal();
-        let state = schema::NavigationState {
+        let state = schema::NavigationStatus {
             session_id: goal.session_id.clone(),
             robot_frame: "far-visibility-graph".into(),
             state: nuwax_nav_far_planner_bridge::worker::FAR_EVENT_SUCCEEDED,
@@ -10332,7 +10344,7 @@ goal: schema::PoseStamped {
             path_revision: 4,
             producer_runtime_generation: 0,
             planner_runtime_generation: 12,
-            ..schema::NavigationState::default()
+            ..schema::NavigationStatus::default()
         };
         assert!(far_terminal_matches_goal(&state, &goal, 12));
         assert!(!far_terminal_matches_goal(&state, &goal, 11));
@@ -10340,7 +10352,7 @@ goal: schema::PoseStamped {
 
         let mut wrong_goal = goal;
         wrong_goal.motion_generation += 1;
-        schema::validate_goal_envelope(&wrong_goal).expect("reseal wrong goal");
+        schema::validate_navigation_goal(&wrong_goal).expect("reseal wrong goal");
         assert!(!far_terminal_matches_goal(&state, &wrong_goal, 12));
     }
 
@@ -10455,14 +10467,14 @@ goal: schema::PoseStamped {
         publish_body(
             &transport,
             &node.inputs[0],
-            "nuwax_msgs.GoalEnvelope",
-            schema::encode_goal_envelope_body(&goal).expect("encode FAR goal"),
+            "nuwax_msgs.NavigationGoal",
+            schema::encode_navigation_goal_body(&goal).expect("encode FAR goal"),
         )
         .await
         .expect("publish FAR goal");
         FAR_READY_GENERATION.store(12, Ordering::Release);
 
-        let state = |revision| schema::NavigationState {
+        let state = |revision| schema::NavigationStatus {
             session_id: goal.session_id.clone(),
             robot_frame: "far-visibility-graph".into(),
             state: nuwax_nav_far_planner_bridge::worker::FAR_EVENT_SUCCEEDED,
@@ -10475,7 +10487,7 @@ goal: schema::PoseStamped {
             path_revision: revision,
             planner_runtime_generation: 12,
             producer_runtime_generation: 0,
-            ..schema::NavigationState::default()
+            ..schema::NavigationStatus::default()
         };
 
         publish_body(
@@ -10515,16 +10527,16 @@ goal: schema::PoseStamped {
         publish_body(
             &transport,
             &node.inputs[2],
-            "nuwax_msgs.NavigationState",
-            schema::encode_navigation_state_body(&wrong_result).expect("encode wrong FAR result"),
+            "nuwax_msgs.NavigationStatus",
+            schema::encode_navigation_status_body(&wrong_result).expect("encode wrong FAR result"),
         )
         .await
         .expect("publish wrong FAR result");
         publish_body(
             &transport,
             &node.inputs[1],
-            "nuwax_msgs.NavigationState",
-            schema::encode_navigation_state_body(&wrong_terminal)
+            "nuwax_msgs.NavigationStatus",
+            schema::encode_navigation_status_body(&wrong_terminal)
                 .expect("encode wrong FAR terminal"),
         )
         .await
@@ -10549,8 +10561,8 @@ goal: schema::PoseStamped {
         publish_body(
             &transport,
             &node.inputs[1],
-            "nuwax_msgs.NavigationState",
-            schema::encode_navigation_state_body(&accepted_terminal)
+            "nuwax_msgs.NavigationStatus",
+            schema::encode_navigation_status_body(&accepted_terminal)
                 .expect("encode accepted FAR terminal"),
         )
         .await
@@ -10558,8 +10570,8 @@ goal: schema::PoseStamped {
         publish_body(
             &transport,
             &node.inputs[2],
-            "nuwax_msgs.NavigationState",
-            schema::encode_navigation_state_body(&accepted_result)
+            "nuwax_msgs.NavigationStatus",
+            schema::encode_navigation_status_body(&accepted_result)
                 .expect("encode accepted FAR result"),
         )
         .await
@@ -10588,8 +10600,8 @@ goal: schema::PoseStamped {
         publish_body(
             &transport,
             &node.inputs[2],
-            "nuwax_msgs.NavigationState",
-            schema::encode_navigation_state_body(&result_first)
+            "nuwax_msgs.NavigationStatus",
+            schema::encode_navigation_status_body(&result_first)
                 .expect("encode result-first FAR result"),
         )
         .await
@@ -10597,8 +10609,8 @@ goal: schema::PoseStamped {
         publish_body(
             &transport,
             &node.inputs[1],
-            "nuwax_msgs.NavigationState",
-            schema::encode_navigation_state_body(&terminal_second)
+            "nuwax_msgs.NavigationStatus",
+            schema::encode_navigation_status_body(&terminal_second)
                 .expect("encode terminal-second FAR event"),
         )
         .await
@@ -10615,16 +10627,16 @@ goal: schema::PoseStamped {
         publish_body(
             &transport,
             &node.inputs[2],
-            "nuwax_msgs.NavigationState",
-            schema::encode_navigation_state_body(&result_first).expect("encode replay FAR result"),
+            "nuwax_msgs.NavigationStatus",
+            schema::encode_navigation_status_body(&result_first).expect("encode replay FAR result"),
         )
         .await
         .expect("publish replay FAR result");
         publish_body(
             &transport,
             &node.inputs[1],
-            "nuwax_msgs.NavigationState",
-            schema::encode_navigation_state_body(&terminal_second)
+            "nuwax_msgs.NavigationStatus",
+            schema::encode_navigation_status_body(&terminal_second)
                 .expect("encode replay FAR terminal"),
         )
         .await
@@ -10657,4 +10669,26 @@ goal: schema::PoseStamped {
         }
 
     }
+}
+
+#[cfg(all(test, feature = "guard-runtime"))]
+#[test]
+fn navigation_status_reports_one_input_ready_signal_and_typed_goal_reason() {
+    let mut status = nuwax_nav_runtime::SchedulerStatus {
+        phase: nuwax_nav_runtime::SchedulerPhase::AwaitingPath,
+        motion_sink_ready: true, planner_inputs_fresh: true,
+        message: "正在等待可通行路线".into(), no_feasible_path: true,
+        remaining_distance_m: 8.0, ..Default::default()
+    };
+    let telemetry = GuardedNavTelemetry { public_session_id: "目标".into(), map_frame: "map".into(), pose_frame: "map".into(), ..Default::default() };
+    let ready = build_guarded_navigation_status(&status, &telemetry, None, Duration::ZERO);
+    assert!(ready.input_ready);
+    assert_eq!(ready.goal_status, schema::NAVIGATION_GOAL_STATUS_PLANNING);
+    assert_eq!(ready.reason, "正在等待可通行路线");
+    assert!(ready.no_feasible_path);
+    assert_eq!(ready.remaining_distance_m, 8.0);
+    status.planner_inputs_fresh = false;
+    assert!(!build_guarded_navigation_status(&status, &telemetry, None, Duration::ZERO).input_ready);
+    status.last_terminal = Some(nuwax_nav_runtime::TerminalOutcome::Stopped);
+    assert_eq!(build_guarded_navigation_status(&status, &telemetry, None, Duration::ZERO).goal_status, schema::NAVIGATION_GOAL_STATUS_STOPPED);
 }

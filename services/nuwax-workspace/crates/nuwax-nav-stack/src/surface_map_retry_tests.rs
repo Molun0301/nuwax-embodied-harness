@@ -76,7 +76,7 @@ async fn wait(condition: impl Fn() -> bool) {
 async fn active(
     probe: &Arc<Probe>,
     ttl: Duration,
-) -> (Harness, schema::NavigationMap3D, schema::GoalEnvelope, i64) {
+) -> (Harness, schema::NavigationMap3D, schema::NavigationGoal, i64) {
     let mut harness = Harness::start_with_components(
         Arc::new(|m,p,g,c|body_path(m,p,g,c).map(SurfacePlan::complete)),
         Duration::from_millis(25),

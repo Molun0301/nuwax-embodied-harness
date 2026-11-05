@@ -160,3 +160,104 @@ fn final_pose_transforms_body_returns_and_sensor_origin_together() {
     let (uncorrected, _) = scan_points(&scan, &HashMap::new()).unwrap();
     assert_eq!(uncorrected, scan.points);
 }
+
+#[tokio::test]
+async fn preview_and_apply_keep_review_files_and_install_only_new_geometry() {
+    use crate::{
+        map_store::MapStore,
+        mapper::{Mapper, MapperConfig},
+    };
+    let folder = std::env::temp_dir().join(format!("neh-cleanup-command-{}", uuid::Uuid::new_v4()));
+    let _guard = CleanupDirectory(folder.clone());
+    let store = MapStore::new(folder.join("maps"));
+    let mapper = Mapper::start(
+        211,
+        MapperConfig {
+            compute: crate::mapping_backend::MappingBackendComputeConfig {
+                window_capacity: 32_768,
+                ..MapperConfig::default().compute
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    mapper.feed(crate::mapper::tests::room_frame(211, 1_000_000_000));
+    let snapshot = mapper.snapshot().await.unwrap();
+    store.save("源图", None, snapshot).unwrap();
+    mapper.shutdown().await.unwrap();
+    let source = store.root().join("源图/geometry");
+    let source_fine = std::fs::read(source.join("fine.map")).unwrap();
+    let source_occupancy = std::fs::read(source.join("occupancy.pb")).unwrap();
+    let work = folder.join("预览");
+    let args: Vec<_> = [
+        "preview".into(),
+        "--map".into(),
+        "源图".into(),
+        "--strength".into(),
+        "77".into(),
+        "--out".into(),
+        work.as_os_str().to_owned(),
+    ]
+    .into();
+    run_command(&args, &store).unwrap();
+    for member in [
+        "preview.json",
+        "source.xyzf32",
+        "candidates.xyzf32",
+        "result.xyzf32",
+        "candidate/geometry/map.json",
+    ] {
+        assert!(
+            work.join(member).is_file(),
+            "必须保留供网关审阅的文件：{member}"
+        );
+    }
+    let report: Report =
+        serde_json::from_slice(&std::fs::read(work.join("preview.json")).unwrap()).unwrap();
+    assert_eq!(report.preview.settings.strength_percent, 77);
+    assert_eq!(std::fs::read(source.join("fine.map")).unwrap(), source_fine);
+    assert_eq!(
+        std::fs::read(source.join("occupancy.pb")).unwrap(),
+        source_occupancy
+    );
+    assert!(!store.exists("目标图"));
+    let apply: Vec<_> = [
+        "apply".into(),
+        "--work".into(),
+        work.as_os_str().to_owned(),
+        "--map".into(),
+        "目标图".into(),
+    ]
+    .into();
+    run_command(&apply, &store).unwrap();
+    let installed = store.load("目标图").unwrap();
+    let fine = nuwax_map_chunks::ArchiveReader::open(
+        installed
+            .cloud
+            .fine_archive
+            .as_ref()
+            .unwrap()
+            .try_clone()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(installed.cloud.revision, fine.root().revision());
+    assert_eq!(
+        installed.cloud.display.as_ref(),
+        std::fs::read(work.join("result.xyzf32")).unwrap()
+    );
+    assert!(
+        run_command(&apply, &store).is_err(),
+        "已有目标地图必须拒绝覆盖"
+    );
+    assert!(work.join("preview.json").exists());
+    assert!(work.join("candidate/geometry/map.json").exists());
+    assert!(!store.root().join("目标图/meta.json").exists());
+    assert!(std::fs::read_dir(store.root().join("目标图"))
+        .unwrap()
+        .all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with('.')));
+}

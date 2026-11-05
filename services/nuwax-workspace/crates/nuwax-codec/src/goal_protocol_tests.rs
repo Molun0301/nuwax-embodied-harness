@@ -7,7 +7,7 @@ fn geometry_b2_goal_payload_matches_navigation_codec() {
         .chunks_exact(2)
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect::<Vec<_>>();
-    let goal = decode_goal_envelope_body(&payload).unwrap();
+    let goal = decode_navigation_goal_body(&payload).unwrap();
     assert_eq!(goal.session_id, "g-1");
     assert_eq!(goal.motion_generation, 0xfedcba9876543210);
     assert_eq!(goal.goal.header.stamp_sec, 1);
@@ -19,5 +19,5 @@ fn geometry_b2_goal_payload_matches_navigation_codec() {
     assert_eq!(goal.position_tolerance_m, None);
     assert_eq!(goal.yaw_tolerance_rad, Some(0.15));
     assert_eq!(goal.boundary_points, vec![[-1.5, 2., 0.], [3., 4., 0.]]);
-    assert_eq!(encode_goal_envelope_body(&goal).unwrap(), payload);
+    assert_eq!(encode_navigation_goal_body(&goal).unwrap(), payload);
 }

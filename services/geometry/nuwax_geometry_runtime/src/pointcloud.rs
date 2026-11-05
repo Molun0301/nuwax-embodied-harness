@@ -165,6 +165,11 @@ impl CloudMap {
         value.publish()?;
         Ok(value)
     }
+    pub fn attach_shared(&mut self, path: &Path) -> Result<(), String> {
+        self.shm = Some(CloudMapShmWriter::new(path).map_err(|e| e.to_string())?);
+        self.pages.invalidate();
+        self.publish()
+    }
     pub fn accumulate(
         &mut self,
         sequence: u64,
@@ -675,13 +680,6 @@ pub(crate) fn voxel_key(point: [f64; 3], size: f32) -> Option<VoxelKey> {
         key[i] = value as i32;
     }
     Some((key[0], key[1], key[2]))
-}
-pub(crate) fn overlay_forbidden(
-    path: &Path,
-    grid: &nuwax_mapping::OccupancyGrid,
-    data: &mut [u8],
-) -> Result<(), String> {
-    crate::forbidden_zones::overlay(path, grid, data)
 }
 
 impl Drop for CloudMap {

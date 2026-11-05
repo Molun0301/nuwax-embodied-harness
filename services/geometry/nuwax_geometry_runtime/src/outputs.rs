@@ -3,10 +3,7 @@ use crate::{proto, session::SessionHandle};
 use nuwax_codec::lcm::schema;
 use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrameBuilder};
 use nuwax_transport::LcmTransport;
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::sync::Arc;
 use tokio::sync::oneshot;
 #[path = "navigation_map_transfer.rs"]
 mod navigation_map_transfer;
@@ -50,15 +47,13 @@ impl Outputs {
             let mut poses = session.pose_rx();
             let mut maps = session.map_rx();
             let mut prior: Option<Arc<nuwax_map_chunks::Manifest>> = None;
-            let mut follow_sent: Option<Instant> = None;
+            let mut follow_sent: Option<(u64, u64)> = None;
             let follow = std::env::var("NUWAX_PERSON_FOLLOW_AUTOSTART").map_or(true, |v| {
                 matches!(
                     v.trim().to_ascii_lowercase().as_str(),
                     "1" | "true" | "yes" | "on"
                 )
             });
-            let mut pending_follow: Option<Arc<nuwax_map_chunks::SealedMap>> = None;
-            let mut timer = tokio::time::interval(Duration::from_secs(1));
             loop {
                 let result: Result<(), String> = tokio::select! {
                     _=&mut stopped=>break,
@@ -76,18 +71,10 @@ impl Outputs {
                         let map=maps.borrow_and_update().clone();
                         if let Some(map)=map {
                             match publish_map(&transport,&session,&map,prior.as_deref()).await {
-                                Ok(sealed)=>{if let Some(sealed)=sealed {let changed=prior.as_ref().is_none_or(|old|old.identity()!=sealed.manifest().identity());prior=Some(sealed.manifest().clone());if follow&&changed{pending_follow=Some(sealed);}}Ok(())},
+                                Ok(sealed)=>{if let Some(sealed)=sealed {let changed=prior.as_ref().is_none_or(|old|old.identity()!=sealed.manifest().identity());prior=Some(sealed.manifest().clone());if follow&&changed{publish_follow(&transport,&session,&sealed,&mut follow_sent).await}else{Ok(())}}else{Ok(())}},
                                 Err(error)=>Err(error),
                             }
-                        }else{prior=None;pending_follow=None;Ok(())}
-                    },
-                    _=timer.tick()=>{
-                        if follow_sent.is_none_or(|time|time.elapsed()>=Duration::from_secs(1)) {
-                            if let Some(sealed)=pending_follow.take(){
-                                follow_sent=Some(Instant::now());
-                                publish_follow(&transport,&session,&sealed).await
-                            }else{Ok(())}
-                        }else{Ok(())}
+                        }else{prior=None;follow_sent=None;Ok(())}
                     },
                 };
                 if let Err(reason) = result {
@@ -248,6 +235,7 @@ async fn publish_follow(
     transport: &LcmTransport,
     session: &SessionHandle,
     sealed: &nuwax_map_chunks::SealedMap,
+    sent: &mut Option<(u64, u64)>,
 ) -> Result<(), String> {
     let mapper = match session.mapper() {
         Ok(mapper) => mapper,
@@ -267,9 +255,23 @@ async fn publish_follow(
     }
     let snapshot = snapshot?;
     let frame = session.state().info.unwrap().map_frame_id;
+    publish_follow_cloud(transport, &frame, id, snapshot, sent).await
+}
+
+async fn publish_follow_cloud(
+    transport: &LcmTransport,
+    frame: &str,
+    session_id: u64,
+    snapshot: crate::pointcloud::CloudSnapshot,
+    sent: &mut Option<(u64, u64)>,
+) -> Result<(), String> {
+    let revision = (session_id, snapshot.revision);
+    if *sent == Some(revision) {
+        return Ok(());
+    }
     let message = cloud(
         snapshot.display.to_vec(),
-        &frame,
+        frame,
         snapshot.source_timestamp_ns,
         snapshot.revision,
     );
@@ -278,10 +280,13 @@ async fn publish_follow(
         "NUWAX_PERSON_FOLLOW_POINTCLOUD_CHANNEL",
         "/global_map",
         "sensor_msgs.PointCloud2",
-        schema::encode_point_cloud2_body(&message).map_err(|e| e.to_string())?,
+        schema::encode_point_cloud2_body(&message).map_err(|error| error.to_string())?,
     )
-    .await
+    .await?;
+    *sent = Some(revision);
+    Ok(())
 }
+
 async fn publish(
     transport: &LcmTransport,
     env: &str,
@@ -299,3 +304,7 @@ async fn publish(
     .build();
     transport.publish(frame).await.map_err(|e| e.to_string())
 }
+
+#[cfg(test)]
+#[path = "outputs_tests.rs"]
+mod tests;

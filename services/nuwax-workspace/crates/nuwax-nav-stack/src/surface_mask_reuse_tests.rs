@@ -65,7 +65,7 @@ fn next_occupancy(previous: &schema::NavigationMap3D) -> schema::NavigationMap3D
 }
 
 fn route_request(message: &schema::NavigationMap3D, wide: bool, height: f64)
-    -> (PoseStamped, schema::GoalEnvelope)
+    -> (PoseStamped, schema::NavigationGoal)
 {
     let (from_x, to_x, y) = if wide { (1.0, 7.0, 3.0) } else { (0.8, 3.2, 1.5) };
     let mut goal = goal_for(message, 1, [to_x, y, height]);
@@ -83,7 +83,7 @@ fn route_request(message: &schema::NavigationMap3D, wide: bool, height: f64)
 
     let (width,height)=if wide {(8.,6.)} else {(4.,3.)};
     goal.boundary_points=vec![[0.,0.,0.],[width,0.,0.],[width,height,0.],[0.,height,0.]];
-    schema::validate_goal_envelope(&goal).unwrap();
+    schema::validate_navigation_goal(&goal).unwrap();
     let mut start = pose_from_schema(&goal.goal).unwrap();
     start.pose.position.x = from_x;
     (start, goal)

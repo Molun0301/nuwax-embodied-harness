@@ -198,7 +198,7 @@ fn build_simple2d(g: &mut ModuleGraph, topics: &NavTopicConfig) {
 
     // Planner-consumed occupancy + real map pose -> versioned path. Public
     // clicks must enter through the Geometry goal-lease owner; this process may
-    // not fabricate GoalEnvelope identity/generation fields.
+    // not fabricate NavigationGoal identity/generation fields.
     g.push_node(
         ModuleNode::new(
             "simple_planner",
@@ -775,7 +775,7 @@ mod tests {
         assert!(g.find("guarded_nav_scheduler").is_some());
         assert!(g.find("basic_path_follower").is_none());
         assert!(g.find("movement_manager").is_none());
-        assert!(g.find("navigation_state_reporter").is_none());
+        assert!(g.find("navigation_status_reporter").is_none());
         let planner = g.find("simple_planner").expect("simple planner");
         assert_eq!(planner.inputs[0], "/map/occupancy");
         assert_eq!(planner.inputs.len(), 4);
@@ -825,7 +825,7 @@ mod tests {
         assert!(g.find("guarded_nav_scheduler").is_some());
         assert!(g.find("basic_path_follower").is_none());
         assert!(g.find("movement_manager").is_none());
-        assert!(g.find("navigation_state_reporter").is_none());
+        assert!(g.find("navigation_status_reporter").is_none());
         assert_eq!(g.find("astar_planner").unwrap().inputs[0], "map_pose");
         assert_eq!(g.find("astar_planner").unwrap().inputs[1], "/map/occupancy");
         assert!(g.find("click_goal_router").is_none());

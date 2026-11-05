@@ -16,6 +16,9 @@ struct Fixture {
 }
 impl Fixture {
     async fn start(native: bool, pgo: bool) -> Self {
+        Self::start_with_missing_lio(native, pgo, false).await
+    }
+    async fn start_with_missing_lio(native: bool, pgo: bool, missing: bool) -> Self {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target/B2行为测试")
             .join(uuid::Uuid::new_v4().to_string());
@@ -52,7 +55,14 @@ impl Fixture {
             .unwrap();
             fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
             command
-                .env("NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE", script)
+                .env(
+                    "NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE",
+                    if missing {
+                        root.join("待恢复原生进程")
+                    } else {
+                        script
+                    },
+                )
                 .env("B2_CHILD_PID_FILE", root.join("native.pid"))
                 .env(
                     "NUWAX_GEOMETRY_LIO_BODY_FROM_SENSOR",
@@ -538,6 +548,13 @@ async fn native_child_kill_faults_session_without_exiting_process() {
     }
     assert!(f.child.try_wait().unwrap().is_none());
     assert_eq!(f.child.id(), parent);
+    let fault = f.state().await;
+    assert_eq!(fault.map_name, "故障前");
+    f.client.save_map(SaveMapRequest::default()).await.unwrap();
+    assert_eq!(f.state().await.phase, SessionPhase::Fault as i32);
+    assert!(f.root.join("maps/故障前/geometry/map.json").exists());
+    f.client.stop_session(Empty {}).await.unwrap();
+    assert_eq!(f.state().await.phase, SessionPhase::Idle as i32);
     assert_eq!(
         f.mapping("故障后").await.phase,
         SessionPhase::Mapping as i32
@@ -559,6 +576,29 @@ async fn native_child_kill_faults_session_without_exiting_process() {
     .await
     .expect("恢复后应观察到新的原生子进程");
     assert_ne!(pid, replacement);
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(replacement),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while f.state().await.phase != SessionPhase::Fault as i32 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.client.stop_session(Empty {}).await.unwrap();
+    let loaded = f
+        .client
+        .load_map(LoadMapRequest {
+            map_name: "故障前".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loaded.phase, SessionPhase::Loaded as i32);
+    assert_eq!(loaded.map_name, "故障前");
 }
 
 #[tokio::test]
@@ -646,4 +686,155 @@ async fn shutdown_closes_live_subscriptions_and_removes_ready_file() {
     assert!(!f.root.join("ready").exists());
     assert!(states.message().await.unwrap().is_none());
     assert!(poses.message().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn failed_start_and_load_preserve_current_unsaved_map() {
+    let mut f = Fixture::start(false, false).await;
+    f.saved_map("已存在").await;
+    f.mapping("未保存").await;
+    f.frame(now()).await;
+    f.map_ready().await;
+    let before = f
+        .client
+        .get_occupancy_grid(GetOccupancyGridRequest {
+            include_forbidden: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let state = f.state().await;
+    assert_eq!(
+        f.client
+            .start_mapping(StartMappingRequest {
+                map_name: "已存在".into(),
+                continue_saved: false
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    assert_eq!(f.state().await, state);
+    assert_eq!(
+        f.client
+            .load_map(LoadMapRequest {
+                map_name: "不存在".into()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    assert_eq!(f.state().await, state);
+    let corrupt = f.root.join("maps/损坏/geometry");
+    fs::create_dir_all(&corrupt).unwrap();
+    fs::write(corrupt.join("map.json"), "{坏文件").unwrap();
+    assert_eq!(
+        f.client
+            .load_map(LoadMapRequest {
+                map_name: "损坏".into()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::DataLoss
+    );
+    assert_eq!(f.state().await, state);
+    assert_eq!(
+        f.client
+            .get_occupancy_grid(GetOccupancyGridRequest {
+                include_forbidden: false
+            })
+            .await
+            .unwrap()
+            .into_inner(),
+        before
+    );
+    fs::write(
+        f.root.join("maps/已存在/geometry/backend.bin"),
+        "损坏检查点".as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        f.client
+            .load_map(LoadMapRequest {
+                map_name: "已存在".into()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::DataLoss
+    );
+    assert_eq!(f.state().await, state);
+    f.client.save_map(SaveMapRequest::default()).await.unwrap();
+    assert!(f.root.join("maps/未保存/geometry/map.json").exists());
+}
+
+#[tokio::test]
+async fn invalid_goal_intent_finishes_without_stranded_child() {
+    let mut f = Fixture::start(false, false).await;
+    f.saved_map("无效目标").await;
+    let mut invalid = goal(2.);
+    invalid.pose.as_mut().unwrap().position.as_mut().unwrap().x = f64::NAN;
+    assert_eq!(
+        f.client.set_goal(invalid).await.unwrap_err().code(),
+        Code::InvalidArgument
+    );
+    let state = f.state().await;
+    assert!(state.navigation.is_none());
+    assert_eq!(state.phase, SessionPhase::Mapping as i32);
+    f.client.save_map(SaveMapRequest::default()).await.unwrap();
+}
+
+#[tokio::test]
+async fn malformed_forbidden_file_fails_exploration_without_faulting_session() {
+    let mut f = Fixture::start(false, false).await;
+    f.saved_map("禁区错误").await;
+    fs::write(f.root.join("maps/禁区错误/forbidden_zones.json"), "{错误").unwrap();
+    f.client
+        .start_exploration(ExplorationRequest {
+            motion_generation: 7,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let start = tokio::time::Instant::now();
+    loop {
+        let state = f.state().await;
+        assert_ne!(state.phase, SessionPhase::Fault as i32, "{state:?}");
+        if state
+            .exploration
+            .as_ref()
+            .is_some_and(|s| s.phase == ExplorationPhase::Failed as i32)
+        {
+            assert_eq!(state.phase, SessionPhase::Mapping as i32);
+            assert!(!state.exploration.unwrap().message.is_empty());
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(3));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    f.client.save_map(SaveMapRequest::default()).await.unwrap();
+    f.frame(now()).await;
+}
+
+#[tokio::test]
+async fn initial_lio_start_failure_can_stop_then_start_after_executable_is_restored() {
+    let mut f = Fixture::start_with_missing_lio(true, false, true).await;
+    assert_eq!(f.state().await.phase, SessionPhase::Fault as i32);
+    f.client.stop_session(Empty {}).await.unwrap();
+    fs::rename(f.root.join("原生进程夹具"), f.root.join("待恢复原生进程")).unwrap();
+    assert_eq!(
+        f.mapping("恢复启动").await.phase,
+        SessionPhase::Mapping as i32
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !f.root.join("native.pid").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(f.child.try_wait().unwrap().is_none());
 }

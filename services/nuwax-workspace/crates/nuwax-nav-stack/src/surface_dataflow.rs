@@ -35,7 +35,7 @@ struct SurfaceMapHub {
     body_reference_frame_id: Arc<str>,
     latest: Arc<Mutex<Option<PreparedSurfaceMap>>>,
     events: tokio::sync::broadcast::Sender<PreparedSurfaceMap>,
-    planning: tokio::sync::watch::Sender<Option<(String,GoalKey,String,bool)>>,
+    planning: tokio::sync::watch::Sender<Option<(String,GoalKey,String,bool,bool)>>,
     // Same in-process scheduler owner; no new wire fields or inferred ground.
     execution_feedback: tokio::sync::watch::Sender<Option<SurfaceReplanFeedback>>,
     #[cfg(test)] map_computer: Option<SurfaceMapComputer>,
@@ -197,7 +197,7 @@ where
         nuwax_codec::lcm::recent_cloud::TYPE_NAME).await?;
     let maps=Box::pin(futures::stream::select(hub.stream(),recent.map(|frame|
         frame.map(GuardedMapFrame::RecentCloud))));
-    let goals = typed_stream(&transport, &node.inputs[0], "nuwax_msgs.GoalEnvelope").await?;
+    let goals = typed_stream(&transport, &node.inputs[0], "nuwax_msgs.NavigationGoal").await?;
     let poses = typed_stream(&transport, &node.inputs[1], "geometry_msgs.PoseStamped").await?;
     let paths = typed_stream(&transport, &node.inputs[2], "nuwax_msgs.PathEnvelope").await?;
     let cancels = typed_stream(&transport, &node.inputs[4], "nuwax_msgs.CancelNavigation").await?;
@@ -222,9 +222,9 @@ where
         loop {
             planning.changed().await.map_err(|error|module_error("planning diagnostics",error))?;
             let update=planning.borrow_and_update().clone();
-            if let Some((id,hash,message,failed))=update {
+            if let Some((id,hash,message,failed,no_feasible_path))=update {
                 if failed { scheduler.report_planning_failure(id,hash,message).await }
-                else { scheduler.report_planning_diagnostic(id,hash,message).await }
+                else { scheduler.report_planning_diagnostic(id,hash,message,no_feasible_path).await }
                     .map_err(|error|module_error("planning diagnostics",error))?;
             }
         }
@@ -496,7 +496,7 @@ impl SurfacePlan {
 }
 
 #[cfg(test)]
-fn body_path(surface: &SurfaceSnapshot, start: &PoseStamped, goal: &schema::GoalEnvelope,
+fn body_path(surface: &SurfaceSnapshot, start: &PoseStamped, goal: &schema::NavigationGoal,
     config: &SurfaceNavigationConfig) -> NavStackResult<Path3D> {
     let p = start.pose.position;
     let q = start.pose.orientation;
@@ -512,7 +512,7 @@ fn body_path(surface: &SurfaceSnapshot, start: &PoseStamped, goal: &schema::Goal
     }).collect() })
 }
 
-fn body_path_progressive(surface: &SurfaceSnapshot, start: &PoseStamped, goal: &schema::GoalEnvelope,
+fn body_path_progressive(surface: &SurfaceSnapshot, start: &PoseStamped, goal: &schema::NavigationGoal,
     config: &SurfaceNavigationConfig) -> NavStackResult<SurfacePlan> {
     let p = start.pose.position;
     let q = start.pose.orientation;
@@ -539,7 +539,7 @@ fn place_surface_start(surface: &SurfaceSnapshot, pose: &PoseStamped, body: &nuw
 }
 
 fn surface_replan_input(surface: &Arc<SurfaceSnapshot>, start: &PoseStamped,
-    goal: &schema::GoalEnvelope, config: &SurfaceNavigationConfig,
+    goal: &schema::NavigationGoal, config: &SurfaceNavigationConfig,
     feedback: Option<&SurfaceReplanFeedback>) -> NavStackResult<SurfaceReplanInput> {
     let matching = feedback.filter(|feedback| (feedback.path_identity.session_id == goal.session_id && feedback.path_identity.goal_key == goal.goal_key()));
     Ok(SurfaceReplanInput {
@@ -555,7 +555,7 @@ fn surface_replan_input(surface: &Arc<SurfaceSnapshot>, start: &PoseStamped,
 // Keep the actual refusing observation attached to its original path key.
 // The shared memo, not either adapter, compares it with the current input.
 fn surface_replan_rejection<'a>(
-    feedback: Option<&'a SurfaceReplanFeedback>, goal: &schema::GoalEnvelope,
+    feedback: Option<&'a SurfaceReplanFeedback>, goal: &schema::NavigationGoal,
 ) -> Option<(&'a nuwax_nav_runtime::PathExecutionIdentity, &'a ActualExecutionContext)> {
     feedback.filter(|feedback| feedback.zero_confirmed_rejection
         && (feedback.path_identity.session_id == goal.session_id && feedback.path_identity.goal_key == goal.goal_key()))
@@ -565,7 +565,7 @@ fn surface_replan_rejection<'a>(
 
 /// 原局部拒绝与后续全局进度分开记录；另一目标不能继承该原因。
 fn surface_planning_diagnostic(feedback: Option<&SurfaceReplanFeedback>,
-    goal: &schema::GoalEnvelope, progress: &str) -> String {
+    goal: &schema::NavigationGoal, progress: &str) -> String {
     match feedback.filter(|feedback| feedback.zero_confirmed_rejection
         && feedback.path_identity.session_id == goal.session_id
         && feedback.path_identity.goal_key == goal.goal_key()) {
@@ -575,7 +575,7 @@ fn surface_planning_diagnostic(feedback: Option<&SurfaceReplanFeedback>,
     }
 }
 
-fn published_surface_identity(goal: &schema::GoalEnvelope, generation: i64, revision: i64)
+fn published_surface_identity(goal: &schema::NavigationGoal, generation: i64, revision: i64)
     -> nuwax_nav_runtime::PathExecutionIdentity {
     let mut identity=guarded_goal_execution_identity(goal);
     identity.planner_runtime_generation=generation;
@@ -586,7 +586,7 @@ fn published_surface_identity(goal: &schema::GoalEnvelope, generation: i64, revi
 async fn publish_surface_path(
     transport: &LcmTransport,
     channel: &str,
-    goal: &schema::GoalEnvelope,
+    goal: &schema::NavigationGoal,
     generation: i64,
     revision: i64,
     path: &Path3D,
@@ -630,11 +630,11 @@ async fn run_surface_planner(
     run_surface_planner_with_transport(node, hub, config, transport, shutdown, ready).await
 }
 
-fn state_matches_goal(state: &schema::NavigationState, goal: &schema::GoalEnvelope) -> bool {
+fn state_matches_goal(state: &schema::NavigationStatus, goal: &schema::NavigationGoal) -> bool {
     state.session_id == goal.session_id
 }
 
-fn retire_goal(goal: &mut Option<schema::GoalEnvelope>, retired: &mut VecDeque<String>) {
+fn retire_goal(goal: &mut Option<schema::NavigationGoal>, retired: &mut VecDeque<String>) {
     if let Some(goal) = goal.take() {
         retired.push_back(goal.session_id);
         if retired.len() > 32 {
@@ -675,7 +675,7 @@ struct SurfaceJobTicket {
 }
 
 /// 联验可注入真实但隔离的LCM连接，生产包装仍执行同一循环。
-type SurfacePathComputer = Arc<dyn Fn(&SurfaceSnapshot, &PoseStamped, &schema::GoalEnvelope,
+type SurfacePathComputer = Arc<dyn Fn(&SurfaceSnapshot, &PoseStamped, &schema::NavigationGoal,
     &SurfaceNavigationConfig) -> NavStackResult<SurfacePlan> + Send + Sync>;
 #[cfg(test)]
 type SurfaceMapComputer = Arc<dyn Fn(Arc<schema::NavigationMap3D>, Instant,
@@ -703,11 +703,11 @@ async fn run_surface_planner_with_computer(
 ) -> NavStackResult<()> {
     let mut maps = typed_stream(&transport, &node.inputs[0], "nuwax_msgs.NavigationMap3D").await?;
     let mut poses = typed_stream(&transport, &node.inputs[1], "geometry_msgs.PoseStamped").await?;
-    let mut goals = typed_stream(&transport, &node.inputs[2], "nuwax_msgs.GoalEnvelope").await?;
+    let mut goals = typed_stream(&transport, &node.inputs[2], "nuwax_msgs.NavigationGoal").await?;
     let mut cancels =
         typed_stream(&transport, &node.inputs[3], "nuwax_msgs.CancelNavigation").await?;
     let mut states =
-        typed_stream(&transport, &node.inputs[4], "nuwax_msgs.NavigationState").await?;
+        typed_stream(&transport, &node.inputs[4], "nuwax_msgs.NavigationStatus").await?;
     let mut feedback_events = hub.execution_feedback.subscribe();
     let mut execution_feedback = feedback_events.borrow_and_update().clone();
     let mut successful = SuccessfulReplanMemo::default();
@@ -729,8 +729,8 @@ async fn run_surface_planner_with_computer(
     let mut latest_map: Option<PreparedSurfaceMap> = None;
     let mut complete_map_source: Option<Arc<schema::NavigationMap3D>> = None;
     let mut pose: Option<PoseStamped> = None;
-    let mut goal: Option<schema::GoalEnvelope> = None;
-    let mut newest_goal: Option<schema::GoalEnvelope> = None;
+    let mut goal: Option<schema::NavigationGoal> = None;
+    let mut newest_goal: Option<schema::NavigationGoal> = None;
     let mut retired_goals = VecDeque::<String>::new();
     let generation = saturating_i64(runtime_generation());
     let mut path_revision = 0_i64;
@@ -803,7 +803,7 @@ async fn run_surface_planner_with_computer(
             }
             frame = states.next() => {
                 let frame = required_frame(frame, "surface execution state")?;
-                let state = match schema::decode_navigation_state_body(&frame.payload) {
+                let state = match schema::decode_navigation_status_body(&frame.payload) {
                     Ok(state) => state,
                     Err(error) => { diagnostics.reject("surface state", &error.to_string()); continue; }
                 };
@@ -830,7 +830,7 @@ async fn run_surface_planner_with_computer(
                         && feedback.path_identity.path_revision==path_revision as u64 {
                         needs_plan=true;
                         hub.planning.send_replace(Some((active.session_id.clone(),active.goal_key(),
-                            surface_planning_diagnostic(Some(feedback),active,"按一秒间隔等待全局重规划"),false)));
+                            surface_planning_diagnostic(Some(feedback),active,"按一秒间隔等待全局重规划"),false,false)));
                     }
                 }
             }
@@ -900,7 +900,7 @@ async fn run_surface_planner_with_computer(
             }
             computed = path_computations.join_next(), if !path_computations.is_empty() => {
                 let ticket = path_cancellation.take();
-                let (epoch, planned_goal, input, result): (u64, schema::GoalEnvelope, SurfaceReplanInput, NavStackResult<SurfacePlan>) =
+                let (epoch, planned_goal, input, result): (u64, schema::NavigationGoal, SurfaceReplanInput, NavStackResult<SurfacePlan>) =
                     computed.expect("已有PCT任务").map_err(|error| module_error("PCT规划任务", error))?;
                 if ticket.as_ref().is_some_and(|ticket| ticket.cancelled.load(std::sync::atomic::Ordering::Relaxed))
                     || epoch != map_epoch || !execution_admitted
@@ -933,7 +933,7 @@ async fn run_surface_planner_with_computer(
                                     state.stagnant+=1;
                                     if !state.best_distance.is_finite() || state.stagnant>=3 {
                                         let reason=approach_failure(end,target,state.stagnant);
-                                        hub.planning.send_replace(Some((planned_goal.session_id.clone(),planned_goal.goal_key(),reason,true)));
+                                        hub.planning.send_replace(Some((planned_goal.session_id.clone(),planned_goal.goal_key(),reason,true,false)));
                                         needs_plan=false;approach_failure_pending=true;
                                         continue;
                                     }
@@ -960,7 +960,7 @@ async fn run_surface_planner_with_computer(
                         retry_after = Instant::now() + Duration::from_secs(1);
                         failed_input = Some(input);
                         hub.planning.send_replace(Some((planned_goal.session_id.clone(), planned_goal.goal_key(),
-                            format!("PCT原生全局规划：{error}"),false)));
+                            format!("PCT原生全局规划：{error}"),false,matches!(error, NavStackError::Planning(_)))));
                     }
                 }
             }
@@ -1038,13 +1038,13 @@ async fn run_surface_planner_with_computer(
             }
             frame = goals.next() => {
                 let frame = required_frame(frame, "surface planner goal")?;
-                let incoming = match schema::decode_goal_envelope_body(&frame.payload) {
+                let incoming = match schema::decode_navigation_goal_body(&frame.payload) {
                     Ok(goal) => goal,
                     Err(error) => { diagnostics.reject("surface goal", &error.to_string()); continue; }
                 };
                 if retired_goals.contains(&incoming.session_id) { continue; }
                 if goal.as_ref().is_some_and(|active|active == &incoming) { continue; }
-                if newest_goal.as_ref().is_some_and(|current| validate_goal_envelope_order(&incoming, current).is_err()) { continue; }
+                if newest_goal.as_ref().is_some_and(|current| validate_navigation_goal_order(&incoming, current).is_err()) { continue; }
                 if let Err(error) = navigation_boundary_from_goal(&incoming) { diagnostics.reject("surface goal boundary",&error.to_string());continue; }
                 successful.clear();
                 approach = None;
@@ -1098,7 +1098,7 @@ async fn run_surface_planner_with_computer(
                     retire_on_geometry: !geometry_retired,
                 });
                 let computer = Arc::clone(&computer);
-                hub.planning.send_replace(Some((planned_goal.session_id.clone(), planned_goal.goal_key(), surface_planning_diagnostic(execution_feedback.as_ref(),&planned_goal,"正在计算PCT全局路线"),false)));
+                hub.planning.send_replace(Some((planned_goal.session_id.clone(), planned_goal.goal_key(), surface_planning_diagnostic(execution_feedback.as_ref(),&planned_goal,"正在计算PCT全局路线"),false,false)));
                 path_computations.spawn_blocking(move || {
                     let started = Instant::now();
                     let result = computer(&surface, &pose, &planned_goal, &config);
@@ -1605,7 +1605,7 @@ mod tests {
         map: &schema::NavigationMap3D,
         generation: i64,
         position: [f64; 3],
-    ) -> schema::GoalEnvelope {
+    ) -> schema::NavigationGoal {
         goal_for_with_options(map, generation, position, nuwax_nav_types_messages::GoalOptions::default())
     }
 
@@ -1614,9 +1614,9 @@ mod tests {
         generation: i64,
         position: [f64; 3],
         options: nuwax_nav_types_messages::GoalOptions,
-    ) -> schema::GoalEnvelope {
+    ) -> schema::NavigationGoal {
         let stamp = current_unix_timestamp_ns().unwrap();
-        let mut goal = schema::GoalEnvelope {
+        let mut goal = schema::NavigationGoal {
 allow_reverse: Some((options).allow_reverse),
 position_tolerance_m: Some((options).position_tolerance_m),
 yaw_tolerance_rad: Some((options).yaw_tolerance_rad),
@@ -1634,13 +1634,13 @@ goal: schema::PoseStamped {
                     orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
                 },
             },
-..schema::GoalEnvelope::default()
+..schema::NavigationGoal::default()
 };
-        schema::validate_goal_envelope(&goal).unwrap();
+        schema::validate_navigation_goal(&goal).unwrap();
         goal
     }
 
-    fn cancel_for(goal: &schema::GoalEnvelope) -> schema::CancelNavigation {
+    fn cancel_for(goal: &schema::NavigationGoal) -> schema::CancelNavigation {
         schema::CancelNavigation {
             session_id: goal.session_id.clone(),
             reason: 1,
@@ -2514,12 +2514,12 @@ goal: schema::PoseStamped {
             .unwrap_or_else(|_| panic!("等待{expected:?}失败: {:?}", self.scheduler.status()));
         }
 
-        async fn goal(&self, goal: &schema::GoalEnvelope) {
+        async fn goal(&self, goal: &schema::NavigationGoal) {
             publish_body(
                 &self.transport,
                 &self.planner_node.inputs[2],
-                "nuwax_msgs.GoalEnvelope",
-                schema::encode_goal_envelope_body(goal).unwrap(),
+                "nuwax_msgs.NavigationGoal",
+                schema::encode_navigation_goal_body(goal).unwrap(),
             )
             .await
             .unwrap();
@@ -2534,7 +2534,7 @@ goal: schema::PoseStamped {
             .await
             .unwrap();
         }
-        async fn cancel(&self, goal: &schema::GoalEnvelope) {
+        async fn cancel(&self, goal: &schema::NavigationGoal) {
             publish_body(
                 &self.transport,
                 &self.planner_node.inputs[3],
@@ -2544,7 +2544,7 @@ goal: schema::PoseStamped {
             .await
             .unwrap();
         }
-        async fn path_for(&mut self, goal: &schema::GoalEnvelope) -> schema::PathEnvelope {
+        async fn path_for(&mut self, goal: &schema::NavigationGoal) -> schema::PathEnvelope {
             tokio::time::timeout(Duration::from_secs(4), async {
                 loop {
                     let frame = self.paths.next().await.unwrap().unwrap();
@@ -2933,7 +2933,7 @@ goal: schema::PoseStamped {
         let mut states = typed_stream(
             &harness.transport,
             &harness.planner_node.inputs[4],
-            "nuwax_msgs.NavigationState",
+            "nuwax_msgs.NavigationStatus",
         )
         .await
         .unwrap();
@@ -2959,21 +2959,21 @@ goal: schema::PoseStamped {
         let mut old_wait = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let frame=states.next().await.unwrap().unwrap();
-                let state=schema::decode_navigation_state_body(&frame.payload).unwrap();
+                let state=schema::decode_navigation_status_body(&frame.payload).unwrap();
                 if state_matches_goal(&state,&first) && state.state==2 {break state;}
             }
         }).await.unwrap();
         old_wait.state=1;
         old_wait.message="当前路径请求重规划".into();
         publish_body(&harness.transport,&harness.planner_node.inputs[4],
-            "nuwax_msgs.NavigationState",schema::encode_navigation_state_body(&old_wait).unwrap()).await.unwrap();
+            "nuwax_msgs.NavigationStatus",schema::encode_navigation_status_body(&old_wait).unwrap()).await.unwrap();
         let replacement=harness.path_for(&first).await;
         assert!(replacement.path_revision>path.path_revision);
         harness.wait_controlling().await;
         old_wait.path_revision=path.path_revision;
         old_wait.message="迟到的旧路径等待".into();
         publish_body(&harness.transport,&harness.planner_node.inputs[4],
-            "nuwax_msgs.NavigationState",schema::encode_navigation_state_body(&old_wait).unwrap()).await.unwrap();
+            "nuwax_msgs.NavigationStatus",schema::encode_navigation_status_body(&old_wait).unwrap()).await.unwrap();
         assert!(tokio::time::timeout(Duration::from_millis(250),harness.paths.next()).await.is_err(),
             "旧版等待不得打断最新路径");
         harness.feed.lock().unwrap().integrate = true;
@@ -2982,7 +2982,7 @@ goal: schema::PoseStamped {
         let published_terminal = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let frame = states.next().await.unwrap().unwrap();
-                let state = schema::decode_navigation_state_body(&frame.payload).unwrap();
+                let state = schema::decode_navigation_status_body(&frame.payload).unwrap();
                 if state_matches_goal(&state, &first) && state.state == 3 {
                     assert!(state.zero_ack_id.is_empty());
                     assert_eq!(state.zero_applied_monotonic_ns,0);
@@ -3074,13 +3074,13 @@ goal: schema::PoseStamped {
             tokio::time::sleep(Duration::from_millis(120)).await;
             assert!(harness.calls.lock().unwrap().is_empty(), "已撤销目标不能随有效地图恢复执行");
         }
-        let mut states=typed_stream(&harness.transport,&harness.planner_node.inputs[4],"nuwax_msgs.NavigationState").await.unwrap();
+        let mut states=typed_stream(&harness.transport,&harness.planner_node.inputs[4],"nuwax_msgs.NavigationStatus").await.unwrap();
         harness.cancel(&goal).await;
         tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 let frame=states.next().await.unwrap().unwrap();
-                let state=schema::decode_navigation_state_body(&frame.payload).unwrap();
-                if state.session_id==goal.session_id && state.message.starts_with("CANCELLED:") {
+                let state=schema::decode_navigation_status_body(&frame.payload).unwrap();
+                if state.session_id==goal.session_id && state.goal_status==schema::NAVIGATION_GOAL_STATUS_CANCELLED {
                     assert_eq!(state.state,0);
                     break;
                 }

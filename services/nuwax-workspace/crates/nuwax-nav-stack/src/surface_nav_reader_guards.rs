@@ -271,7 +271,7 @@ async fn start_reader_harness() -> Harness {
         nuwax_nav_runtime::SchedulerConfig { costmap_ttl: Duration::ZERO, ..Default::default() }).await
 }
 
-async fn active(harness: &mut Harness) -> (FineSeries, PreparedSurfaceMap, schema::GoalEnvelope, i64) {
+async fn active(harness: &mut Harness) -> (FineSeries, PreparedSurfaceMap, schema::NavigationGoal, i64) {
     assert!(harness.hub.map_computer.is_none());
     harness.wait_ready().await;
     let seed = harness.freeze_map().await;

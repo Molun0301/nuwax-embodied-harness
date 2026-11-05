@@ -6,7 +6,7 @@ use nuwax_nav_types_messages::Twist2;
 async fn repeated_current_path_refusals_are_rate_limited_and_cancellable() {
     let mut harness=Harness::start().await;
     let mut states=typed_stream(&harness.transport,&harness.planner_node.inputs[4],
-        "nuwax_msgs.NavigationState").await.unwrap();
+        "nuwax_msgs.NavigationStatus").await.unwrap();
     harness.wait_ready().await;
     let goal=goal_for(&harness.feed.lock().unwrap().map,1,[3.2,1.55,2.5]);
     harness.goal(&goal).await;
@@ -15,7 +15,7 @@ async fn repeated_current_path_refusals_are_rate_limited_and_cancellable() {
     let mut waiting=tokio::time::timeout(Duration::from_secs(2),async {
         loop {
             let frame=states.next().await.unwrap().unwrap();
-            let state=schema::decode_navigation_state_body(&frame.payload).unwrap();
+            let state=schema::decode_navigation_status_body(&frame.payload).unwrap();
             if state_matches_goal(&state,&goal) && state.state==2 {break state;}
         }
     }).await.unwrap();
@@ -24,7 +24,7 @@ async fn repeated_current_path_refusals_are_rate_limited_and_cancellable() {
         waiting.path_revision=previous.path_revision;
         for _ in 0..15 {
             publish_body(&harness.transport,&harness.planner_node.inputs[4],
-                "nuwax_msgs.NavigationState",schema::encode_navigation_state_body(&waiting).unwrap()).await.unwrap();
+                "nuwax_msgs.NavigationStatus",schema::encode_navigation_status_body(&waiting).unwrap()).await.unwrap();
         }
         let next=harness.path_for(&goal).await;
         let stamp=|path:&schema::PathEnvelope| i64::from(path.path.header.stamp_sec)*1_000_000_000
@@ -38,7 +38,7 @@ async fn repeated_current_path_refusals_are_rate_limited_and_cancellable() {
     harness.terminal(TerminalOutcome::Cancelled).await;
     harness.shutdown().await;
 }
-fn fixture() -> (Arc<SurfaceSnapshot>,PoseStamped,schema::GoalEnvelope,SurfaceNavigationConfig,SurfaceReplanFeedback) {
+fn fixture() -> (Arc<SurfaceSnapshot>,PoseStamped,schema::NavigationGoal,SurfaceNavigationConfig,SurfaceReplanFeedback) {
     let mut config=config();
     config.apply_calibration(nuwax_nav_types_messages::RobotGeometry {
         self_collision:None,footprint_xy_m:vec![[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],

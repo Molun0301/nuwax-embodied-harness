@@ -168,8 +168,8 @@ mod guard_protocol {
         harness.wait_for_costmap(1).await;
         (guard, harness)
     }
-    fn goal(id: &str, generation: u64) -> schema::GoalEnvelope {
-        schema::GoalEnvelope {
+    fn goal(id: &str, generation: u64) -> schema::NavigationGoal {
+        schema::NavigationGoal {
             session_id: id.into(),
             motion_generation: generation,
             ..sealed_goal(id)
@@ -179,11 +179,11 @@ mod guard_protocol {
         harness: &mut GuardedLoopHarness,
         id: &str,
         wanted: i32,
-    ) -> schema::NavigationState {
+    ) -> schema::NavigationStatus {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let frame = harness.states.next().await.unwrap().unwrap();
-                let state = schema::decode_navigation_state_body(&frame.payload).unwrap();
+                let state = schema::decode_navigation_status_body(&frame.payload).unwrap();
                 if state.session_id == id && state.state == wanted {
                     return state;
                 }
@@ -192,7 +192,7 @@ mod guard_protocol {
         .await
         .expect("原状态通道没有回报目标终态")
     }
-    async fn execute(harness: &GuardedLoopHarness, goal: &schema::GoalEnvelope) {
+    async fn execute(harness: &GuardedLoopHarness, goal: &schema::NavigationGoal) {
         harness.send_goal_and_wait_dequeued(goal).await;
         harness.wait_for_session(&goal.session_id).await;
         let mut path = sealed_path(goal);
@@ -205,7 +205,8 @@ mod guard_protocol {
         h.send_goal_and_wait_dequeued(&goal("过期目标", u64::MAX - 1))
             .await;
         let stopped = state(&mut h, "过期目标", 4).await;
-        assert!(stopped.message.starts_with("LEASE_NOT_GRANTED:"));
+        assert_eq!(stopped.goal_status, schema::NAVIGATION_GOAL_STATUS_STOPPED);
+        assert!(!stopped.reason.is_empty());
         assert_eq!(
             h.scheduler.status().last_terminal,
             Some(nuwax_nav_runtime::TerminalOutcome::Stopped)
@@ -222,7 +223,8 @@ mod guard_protocol {
         guard.moving().await;
         guard.stop();
         let stopped = state(&mut h, "执行中目标", 4).await;
-        assert!(stopped.message.starts_with("STOPPED:"));
+        assert_eq!(stopped.goal_status, schema::NAVIGATION_GOAL_STATUS_STOPPED);
+        assert_eq!(stopped.reason, "已被停止");
         assert_eq!(
             h.scheduler.status().last_terminal,
             Some(nuwax_nav_runtime::TerminalOutcome::Stopped)
@@ -297,7 +299,7 @@ mod guard_protocol {
             schema::encode_cancel_navigation_body(&schema::CancelNavigation::default()).unwrap(),
         );
         let cancelled = state(&mut h, "待取消目标", 0).await;
-        assert!(cancelled.message.starts_with("CANCELLED:"));
+        assert_eq!(cancelled.goal_status, schema::NAVIGATION_GOAL_STATUS_CANCELLED);
         let state = guard.state.lock().unwrap();
         assert_eq!(state.lease, 0);
         assert_eq!(state.velocity, 0.);
@@ -321,7 +323,7 @@ mod guard_protocol {
             schema::encode_cancel_navigation_body(&schema::CancelNavigation::default()).unwrap(),
         );
         let cancelled = self::state(&mut h, "缓冲目标", 0).await;
-        assert!(cancelled.message.starts_with("CANCELLED:"));
+        assert_eq!(cancelled.goal_status, schema::NAVIGATION_GOAL_STATUS_CANCELLED);
         assert!(guard.state.lock().unwrap().events.is_empty());
         h.send_pose(2);
         h.wait_for_pose(2).await;

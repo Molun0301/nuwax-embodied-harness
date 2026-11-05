@@ -1,14 +1,14 @@
 //! FAR 规划器的真实 liblcm typed worker。
 //!
-//! worker 只消费版本化 `GoalEnvelope` 和精确关联的 `CancelNavigation`。
-//! 算法结果通过 FAR 私有 `NavigationState` v3 合同发布，由后续唯一 adapter
+//! worker 只消费版本化 `NavigationGoal` 和精确关联的 `CancelNavigation`。
+//! 算法结果通过 FAR 私有 `NavigationStatus` v3 合同发布，由后续唯一 adapter
 //! 封装 canonical `PathEnvelope`；本模块绝不发布 canonical path topic。
 
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nuwax_codec::lcm::schema::{
-    self, CancelNavigation, GoalEnvelope, NavigationState, Odometry, Path, PointCloud2, Pose,
+    self, CancelNavigation, NavigationGoal, NavigationStatus, Odometry, Path, PointCloud2, Pose,
     PoseStamped,
 };
 use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrameBuilder};
@@ -17,12 +17,12 @@ use tokio::sync::mpsc;
 
 use crate::core::{plan, CircleObstacle, FarCoreConfig, Point2};
 
-const GOAL_TYPE: &str = "nuwax_msgs.GoalEnvelope";
+const GOAL_TYPE: &str = "nuwax_msgs.NavigationGoal";
 const CANCEL_TYPE: &str = "nuwax_msgs.CancelNavigation";
 const ODOMETRY_TYPE: &str = "nav_msgs.Odometry";
 const POINT_CLOUD_TYPE: &str = "sensor_msgs.PointCloud2";
-const RESULT_TYPE: &str = "nuwax_msgs.NavigationState";
-const EVENT_TYPE: &str = "nuwax_msgs.NavigationState";
+const RESULT_TYPE: &str = "nuwax_msgs.NavigationStatus";
+const EVENT_TYPE: &str = "nuwax_msgs.NavigationStatus";
 const PRIVATE_RESULT_MAGIC: &[u8; 4] = b"FAR3";
 const PRIVATE_RESULT_VERSION: u8 = 3;
 const PRIVATE_RESULT_KIND_PATH: u8 = 1;
@@ -87,7 +87,7 @@ pub struct FarReadyContract {
     pub backend: String,
     /// supervisor 分配的单调 generation。
     pub generation: i64,
-    /// GoalEnvelope 输入通道。
+    /// NavigationGoal 输入通道。
     pub goal: String,
     /// CancelNavigation 输入通道。
     pub cancel: String,
@@ -241,7 +241,7 @@ pub enum WorkerError {
 }
 
 /// 严格解码 FAR 私有 result v3，并验证原代际与 Path 结构。
-pub fn decode_private_result_v3(state: &NavigationState) -> Result<Path, WorkerError> {
+pub fn decode_private_result_v3(state: &NavigationStatus) -> Result<Path, WorkerError> {
     if state.state != FAR_EVENT_SUCCEEDED
         || state.runtime_generation <= 0
         || state.path_revision <= 0
@@ -278,11 +278,11 @@ pub fn decode_private_result_v3(state: &NavigationState) -> Result<Path, WorkerE
         .map_err(|error| WorkerError::Codec(format!("private result path codec:{error}")))
 }
 
-/// 将 Path 严格封入 FAR 私有 result v3 `NavigationState`。
+/// 将 Path 严格封入 FAR 私有 result v3 `NavigationStatus`。
 pub fn seal_private_result_v3(
-    mut state: NavigationState,
+    mut state: NavigationStatus,
     path: &Path,
-) -> Result<NavigationState, WorkerError> {
+) -> Result<NavigationStatus, WorkerError> {
     if state.state != FAR_EVENT_SUCCEEDED
         || state.runtime_generation <= 0
         || state.path_revision <= 0
@@ -316,7 +316,7 @@ struct PathCorrelation {
 
 #[derive(Debug)]
 struct PlanCompletion {
-    goal: GoalEnvelope,
+    goal: NavigationGoal,
     start: [f64; 3],
     outcome: PlanOutcome,
 }
@@ -330,7 +330,7 @@ enum PlanOutcome {
 }
 
 struct ActivePlan {
-    goal: GoalEnvelope,
+    goal: NavigationGoal,
     start: [f64; 3],
     task: tokio::task::JoinHandle<()>,
 }
@@ -346,8 +346,8 @@ struct GoalIdentity {
     motion_generation: u64,
 }
 
-impl From<&GoalEnvelope> for GoalIdentity {
-    fn from(goal: &GoalEnvelope) -> Self {
+impl From<&NavigationGoal> for GoalIdentity {
+    fn from(goal: &NavigationGoal) -> Self {
         Self {
             session_id: goal.session_id.clone(),
             motion_generation: goal.motion_generation,
@@ -445,7 +445,7 @@ pub async fn run_with_transport(
             }
             frame = goal.recv() => {
                 let frame = frame.map_err(|error| WorkerError::Transport(format!("goal stream: {error}")))?;
-                let value = match schema::decode_goal_envelope_body(&frame.payload) {
+                let value = match schema::decode_navigation_goal_body(&frame.payload) {
                     Ok(value) => value,
                     Err(error) => {
                         publish_rejected(&transport, &options, &format!("goal-codec:{error}")).await?;
@@ -613,7 +613,7 @@ pub async fn run_with_transport(
             }
             frame = commit_fence.recv(), if pending_completion.is_some() => {
                 let frame = frame.map_err(|error| WorkerError::Transport(format!("commit fence stream: {error}")))?;
-                let fence = schema::decode_navigation_state_body(&frame.payload)
+                let fence = schema::decode_navigation_status_body(&frame.payload)
                     .map_err(|error| WorkerError::Codec(format!("commit-fence-codec:{error}")))?;
                 let Some(completion) = pending_completion.as_ref() else {
                     continue;
@@ -748,7 +748,7 @@ fn validate_options(options: &WorkerOptions) -> Result<(), WorkerError> {
 }
 
 fn spawn_plan(
-    goal: GoalEnvelope,
+    goal: NavigationGoal,
     start: [f64; 3],
     obstacles: Vec<CircleObstacle>,
     options: &WorkerOptions,
@@ -782,7 +782,7 @@ fn spawn_plan(
 }
 
 fn plan_goal(
-    goal: &GoalEnvelope,
+    goal: &NavigationGoal,
     start: [f64; 3],
     obstacles: &[CircleObstacle],
     config: FarCoreConfig,
@@ -860,7 +860,7 @@ fn inside_boundary(point: Point2, boundary: &[[f64; 3]]) -> bool {
 }
 
 fn validate_goal_against_odometry(
-    goal: &GoalEnvelope,
+    goal: &NavigationGoal,
     odometry: &Odometry,
 ) -> Result<[f64; 3], String> {
     if odometry.header.frame_id != goal.goal.header.frame_id {
@@ -888,15 +888,15 @@ fn validate_goal_against_odometry(
     Ok(start)
 }
 
-fn record_terminal(terminal_goals: &mut HashSet<GoalIdentity>, goal: &GoalEnvelope) {
+fn record_terminal(terminal_goals: &mut HashSet<GoalIdentity>, goal: &NavigationGoal) {
     terminal_goals.insert(GoalIdentity::from(goal));
 }
 
-fn same_goal(left: &GoalEnvelope, right: &GoalEnvelope) -> bool {
+fn same_goal(left: &NavigationGoal, right: &NavigationGoal) -> bool {
     left.session_id == right.session_id && left.motion_generation == right.motion_generation
 }
 
-fn cancel_matches(cancel: &CancelNavigation, goal: &GoalEnvelope) -> bool {
+fn cancel_matches(cancel: &CancelNavigation, goal: &NavigationGoal) -> bool {
     cancel.session_id.is_empty() || cancel.session_id == goal.session_id
 }
 
@@ -1026,18 +1026,18 @@ async fn publish_commit_fence(
     transport: &LcmTransport,
     channel: &str,
     options: &WorkerOptions,
-    goal: &GoalEnvelope,
+    goal: &NavigationGoal,
 ) -> Result<(), WorkerError> {
-    let fence = NavigationState {
+    let fence = NavigationStatus {
         session_id: goal.session_id.clone(),
         robot_frame: options.backend_id.clone(),
         state: FAR_EVENT_READY,
         message: "far-private-commit-fence".into(),
         runtime_generation: options.planner_generation,
         goal_generation: goal.motion_generation as i64,
-        ..NavigationState::default()
+        ..NavigationStatus::default()
     };
-    let body = schema::encode_navigation_state_body(&fence)
+    let body = schema::encode_navigation_status_body(&fence)
         .map_err(|error| WorkerError::Codec(format!("commit-fence-codec:{error}")))?;
     publish(transport, channel, EVENT_TYPE, body).await
 }
@@ -1062,12 +1062,12 @@ async fn publish_rejected(
 async fn publish_private_result_v3(
     transport: &LcmTransport,
     options: &WorkerOptions,
-    goal: &GoalEnvelope,
+    goal: &NavigationGoal,
     current: [f64; 3],
     path_revision: i64,
     path: Path,
 ) -> Result<PathCorrelation, WorkerError> {
-    let state = navigation_state(
+    let state = navigation_status(
         options,
         FAR_EVENT_SUCCEEDED,
         Some(goal),
@@ -1082,7 +1082,7 @@ async fn publish_private_result_v3(
     let correlation = PathCorrelation {
         revision: state.path_revision,
     };
-    let body = schema::encode_navigation_state_body(&state)
+    let body = schema::encode_navigation_status_body(&state)
         .map_err(|error| WorkerError::Codec(error.to_string()))?;
     publish(transport, &options.topics.planner_result, RESULT_TYPE, body).await?;
     Ok(correlation)
@@ -1091,11 +1091,11 @@ async fn publish_private_result_v3(
 async fn publish_success_event(
     transport: &LcmTransport,
     options: &WorkerOptions,
-    goal: &GoalEnvelope,
+    goal: &NavigationGoal,
     current: [f64; 3],
     correlation: PathCorrelation,
 ) -> Result<(), WorkerError> {
-    let state = navigation_state(
+    let state = navigation_status(
         options,
         FAR_EVENT_SUCCEEDED,
         Some(goal),
@@ -1104,25 +1104,25 @@ async fn publish_success_event(
         correlation,
         "succeeded:private-result-v3-published".into(),
     );
-    let body = schema::encode_navigation_state_body(&state)
+    let body = schema::encode_navigation_status_body(&state)
         .map_err(|error| WorkerError::Codec(error.to_string()))?;
     publish(transport, &options.topics.worker_event, EVENT_TYPE, body).await
 }
 
 #[allow(clippy::too_many_arguments)]
-fn navigation_state(
+fn navigation_status(
     options: &WorkerOptions,
     state: i32,
-    goal: Option<&GoalEnvelope>,
+    goal: Option<&NavigationGoal>,
     current: Option<[f64; 3]>,
     cancel_generation: i64,
     correlation: PathCorrelation,
     message: String,
-) -> NavigationState {
+) -> NavigationStatus {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    NavigationState {
+    NavigationStatus {
         session_id: goal.map_or_else(String::new, |value| value.session_id.clone()),
         robot_frame: options.backend_id.clone(),
         stamp_sec: i64::try_from(now.as_secs()).unwrap_or(i64::MAX),
@@ -1156,6 +1156,7 @@ fn navigation_state(
         } else {
             0
         },
+        ..Default::default()
     }
 }
 
@@ -1164,7 +1165,7 @@ async fn publish_event(
     transport: &LcmTransport,
     options: &WorkerOptions,
     state: i32,
-    goal: Option<&GoalEnvelope>,
+    goal: Option<&NavigationGoal>,
     current: Option<[f64; 3]>,
     cancel_generation: i64,
     detail: &str,
@@ -1195,7 +1196,7 @@ async fn publish_event(
             EVENT_TYPE,
         )
     };
-    let message = navigation_state(
+    let message = navigation_status(
         options,
         state,
         goal,
@@ -1204,7 +1205,7 @@ async fn publish_event(
         PathCorrelation { revision: 0 },
         message,
     );
-    let body = schema::encode_navigation_state_body(&message)
+    let body = schema::encode_navigation_status_body(&message)
         .map_err(|error| WorkerError::Codec(error.to_string()))?;
     publish(transport, &options.topics.worker_event, EVENT_TYPE, body).await
 }
@@ -1286,10 +1287,10 @@ mod tests {
 
     #[test]
     fn cancel_matches_goal_id_and_empty_id_cancels_all() {
-        let goal = GoalEnvelope {
+        let goal = NavigationGoal {
             session_id: "session".into(),
             motion_generation: u64::MAX,
-            ..GoalEnvelope::default()
+            ..NavigationGoal::default()
         };
         let cancel = CancelNavigation {
             session_id: "session".into(),
@@ -1319,14 +1320,14 @@ mod tests {
             format!("{encoded};trailing=value"),
             encoded.replace(
                 ";cancel=",
-                ";goal=/duplicate#nuwax_msgs.GoalEnvelope;cancel=",
+                ";goal=/duplicate#nuwax_msgs.NavigationGoal;cancel=",
             ),
             encoded.replace("generation=1", "generation=01"),
             encoded.replace(";goal=", ";cancel_alias="),
             encoded.replace(";goal=", ";cancel="),
             encoded.replace(
-                ";goal=/nav/far/goal#nuwax_msgs.GoalEnvelope;cancel=/nav/far/cancel#nuwax_msgs.CancelNavigation",
-                ";cancel=/nav/far/cancel#nuwax_msgs.CancelNavigation;goal=/nav/far/goal#nuwax_msgs.GoalEnvelope",
+                ";goal=/nav/far/goal#nuwax_msgs.NavigationGoal;cancel=/nav/far/cancel#nuwax_msgs.CancelNavigation",
+                ";cancel=/nav/far/cancel#nuwax_msgs.CancelNavigation;goal=/nav/far/goal#nuwax_msgs.NavigationGoal",
             ),
         ];
         for message in invalid {
@@ -1365,7 +1366,7 @@ mod tests {
             },
             poses: Vec::new(),
         };
-        let state = NavigationState {
+        let state = NavigationStatus {
             session_id: "session".into(),
             robot_frame: "far-visibility-graph".into(),
             state: FAR_EVENT_SUCCEEDED,
@@ -1373,7 +1374,7 @@ mod tests {
             goal_generation: u64::MAX as i64,
             path_revision: 2,
             planner_runtime_generation: 7,
-            ..NavigationState::default()
+            ..NavigationStatus::default()
         };
         let sealed = seal_private_result_v3(state, &path).expect("seal private result v3");
         assert_eq!(
@@ -1382,7 +1383,7 @@ mod tests {
         );
 
         assert_eq!(sealed.goal_generation as u64, u64::MAX);
-        let zero_generation = NavigationState {
+        let zero_generation = NavigationStatus {
             goal_generation: 0,
             ..sealed.clone()
         };

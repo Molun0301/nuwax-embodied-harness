@@ -74,6 +74,7 @@ struct Child {
 }
 
 /// 调度结果交给 Session 更新唯一公开状态并派发或取消子导航。
+#[derive(Clone)]
 pub struct ExplorerTick {
     pub status: proto::ExplorationStatus,
     pub goal: Option<(String, proto::NavigationGoal)>,
@@ -658,6 +659,10 @@ impl Explorer {
         }
     }
 
+    pub(crate) fn failed(&mut self, message: &str) -> Result<ExplorerTick, String> {
+        self.fail_exploration(ExplorationStopReason::ConsecutiveFailuresExceeded, message)
+    }
+
     fn fail_exploration(
         &mut self,
         reason: ExplorationStopReason,
@@ -695,6 +700,7 @@ impl Explorer {
         true
     }
     fn wait_input(&mut self, message: &str) -> Result<ExplorerTick, String> {
+        self.no_frontier_since = None;
         if self
             .input_wait_since
             .get_or_insert_with(Instant::now)
@@ -961,4 +967,4 @@ pub fn apply_forbidden(
 
 #[cfg(test)]
 #[path = "explorer_tests.rs"]
-mod tests;
+pub(crate) mod tests;

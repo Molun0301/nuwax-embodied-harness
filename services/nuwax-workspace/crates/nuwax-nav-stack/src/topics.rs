@@ -325,7 +325,7 @@ mod tests {
     #[test]
     fn geometry_runtime_channel_strips_typed_suffix() {
         assert_eq!(
-            configured_channel(&[], "/nav/goal#nuwax_msgs.GoalEnvelope"),
+            configured_channel(&[], "/nav/goal#nuwax_msgs.NavigationGoal"),
             "/nav/goal"
         );
     }

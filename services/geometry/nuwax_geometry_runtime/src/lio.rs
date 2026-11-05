@@ -27,14 +27,18 @@ struct AuxiliaryFrame {
     origin: [f64; 3],
     sensor_id: String,
 }
-struct Runtime {
+#[derive(Clone)]
+struct InputRuntime {
     transport: LcmTransport,
     native: Option<BoundNativeLioRuntime>,
     planar: Option<Arc<crate::slam2d_owner::Owner>>,
-    shutdown: watch::Sender<bool>,
-    tasks: Vec<JoinHandle<()>>,
     odometry_input: mpsc::UnboundedSender<proto::Pose>,
     cloud_input: mpsc::UnboundedSender<(u64, schema::PointCloud2)>,
+}
+struct Runtime {
+    planar: Option<Arc<crate::slam2d_owner::Owner>>,
+    shutdown: watch::Sender<bool>,
+    tasks: Vec<JoinHandle<()>>,
 }
 
 pub(crate) struct Lio {
@@ -43,6 +47,7 @@ pub(crate) struct Lio {
     native: Option<BoundNativeLioRuntime>,
     planar: Option<crate::slam2d_owner::Settings>,
     runtime: Mutex<Option<Runtime>>,
+    input_runtime: parking_lot::RwLock<Option<InputRuntime>>,
     input: Mutex<NativeInputDelivery>,
     native_self_filter: Option<crate::self_cloud::NativeSelfFilter>,
     sensor_frame: String,
@@ -114,6 +119,7 @@ impl Lio {
             body_from_sensor,
             planar,
             runtime: Mutex::new(None),
+            input_runtime: parking_lot::RwLock::new(None),
             input: Mutex::new(NativeInputDelivery::default()),
             auxiliary: Arc::new(parking_lot::Mutex::new(VecDeque::new())),
         };
@@ -170,7 +176,26 @@ impl Lio {
         }]
     }
 
+    pub(crate) async fn is_running(&self) -> bool {
+        let planar = {
+            let runtime = self.runtime.lock().await;
+            let Some(runtime) = runtime.as_ref() else {
+                return false;
+            };
+            if *runtime.shutdown.borrow() || runtime.tasks.iter().any(JoinHandle::is_finished) {
+                return false;
+            }
+            runtime.planar.clone()
+        };
+        if let Some(planar) = planar {
+            return planar.is_running().await;
+        }
+        !self.input.lock().await.has_failed()
+    }
     pub(crate) async fn recover(&self) -> Result<(), String> {
+        if self.is_running().await {
+            return Ok(());
+        }
         self.shutdown().await;
         *self.input.lock().await = NativeInputDelivery::default();
         self.auxiliary.lock().clear();
@@ -235,27 +260,36 @@ impl Lio {
             if let Some(native) = &self.native {
                 let process = NativeProcessOwner::spawn(&native.runtime)?;
                 let router = self.router.clone();
+                let stopped = shutdown.clone();
                 tasks.push(tokio::spawn(crate::lio_owner::supervise_native(
                     process,
                     rx,
-                    move |reason| router.fault(reason),
+                    move |reason| {
+                        stopped.send_replace(true);
+                        router.fault(reason);
+                    },
                 )));
             }
             None
         };
-        *self.runtime.lock().await = Some(Runtime {
+        *self.input_runtime.write() = Some(InputRuntime {
             transport,
             native: self.native.clone(),
+            planar: planar.clone(),
+            odometry_input,
+            cloud_input,
+        });
+        *self.runtime.lock().await = Some(Runtime {
             planar,
             shutdown,
             tasks,
-            odometry_input,
-            cloud_input,
         });
         Ok(())
     }
     pub(crate) async fn shutdown(&self) {
-        if let Some(runtime) = self.runtime.lock().await.take() {
+        *self.input_runtime.write() = None;
+        let runtime = self.runtime.lock().await.take();
+        if let Some(runtime) = runtime {
             runtime.shutdown.send_replace(true);
             if let Some(planar) = runtime.planar {
                 if let Err(error) = planar.shutdown().await {
@@ -279,9 +313,10 @@ impl Lio {
         if request.mapping_only {
             return self.publish_auxiliary(request);
         }
-        let runtime = self.runtime.lock().await;
-        let runtime = runtime
-            .as_ref()
+        let runtime = self
+            .input_runtime
+            .read()
+            .clone()
             .ok_or_else(|| Status::unavailable("LIO拥有方已关闭"))?;
         if runtime.planar.is_some() {
             return Err(Status::failed_precondition("二维执行链不接收三维点云"));
@@ -303,14 +338,13 @@ impl Lio {
                     .map_err(Status::invalid_argument)?,
                 None => request,
             };
-            let result = self
-                .input
-                .lock()
-                .await
+            let mut input = self.input.lock().await;
+            let failed_before = input.has_failed();
+            let result = input
                 .publish(&runtime.transport, &native.channels, &request)
                 .await;
             if let Err(error) = &result {
-                if error.code() != tonic::Code::InvalidArgument {
+                if !failed_before && error.code() != tonic::Code::InvalidArgument {
                     self.router.fault(error.to_string());
                 }
             }
@@ -369,9 +403,10 @@ impl Lio {
             .clone()
             .ok_or_else(|| Status::invalid_argument("缺少里程计位姿"))?;
         pose_isometry(&pose).map_err(Status::invalid_argument)?;
-        let runtime = self.runtime.lock().await;
-        let runtime = runtime
-            .as_ref()
+        let runtime = self
+            .input_runtime
+            .read()
+            .clone()
             .ok_or_else(|| Status::unavailable("LIO拥有方已关闭"))?;
         if let Some(planar) = &runtime.planar {
             if self.planar.as_ref().is_some_and(|settings| {
@@ -403,12 +438,12 @@ impl Lio {
         &self,
         request: proto::PublishLaserScanRequest,
     ) -> Result<(), Status> {
-        let runtime = self.runtime.lock().await;
-        let planar = runtime
+        let planar = self
+            .input_runtime
+            .read()
             .as_ref()
             .and_then(|runtime| runtime.planar.clone())
             .ok_or_else(|| Status::failed_precondition("当前不是二维执行链"))?;
-        drop(runtime);
         planar
             .publish_scan(&request.payload)
             .await
@@ -422,13 +457,13 @@ impl Lio {
         localization: bool,
         seed: Option<proto::Pose>,
     ) -> Result<(), String> {
-        if let Some(planar) = self
+        let planar = self
             .runtime
             .lock()
             .await
             .as_ref()
-            .and_then(|r| r.planar.clone())
-        {
+            .and_then(|r| r.planar.clone());
+        if let Some(planar) = planar {
             planar
                 .start_session(id, name, checkpoint, localization, seed)
                 .await?;
@@ -436,25 +471,25 @@ impl Lio {
         Ok(())
     }
     pub(crate) async fn stop_session(&self) -> Result<(), String> {
-        if let Some(planar) = self
+        let planar = self
             .runtime
             .lock()
             .await
             .as_ref()
-            .and_then(|r| r.planar.clone())
-        {
+            .and_then(|r| r.planar.clone());
+        if let Some(planar) = planar {
             planar.stop_session().await?;
         }
         Ok(())
     }
     pub(crate) async fn planar_checkpoint(&self) -> Result<Option<Vec<u8>>, String> {
-        match self
+        let planar = self
             .runtime
             .lock()
             .await
             .as_ref()
-            .and_then(|r| r.planar.clone())
-        {
+            .and_then(|r| r.planar.clone());
+        match planar {
             Some(planar) => planar.checkpoint().await.map(Some),
             None => Ok(None),
         }
@@ -534,28 +569,11 @@ impl Ingress {
                         while clouds.len()>16{clouds.pop_front();}
                     },
                 }
-                while let Some((_, stamp, _)) = clouds.front() {
-                    let stamp = *stamp;
-                    let pose = poses
-                        .iter()
-                        .rev()
-                        .find(|pose| pose.timestamp_ns <= stamp)
-                        .cloned();
-                    if poses.is_empty() {
-                        break;
-                    }
-                    if self.native.is_some()
-                        && poses.back().is_none_or(|pose| pose.timestamp_ns < stamp)
-                    {
-                        break;
-                    }
-                    let (session, _, cloud) = clouds.pop_front().unwrap();
-                    let Some(pose) = pose else { continue };
-                    if self.native.as_ref().is_some_and(|native| {
-                        stamp - pose.timestamp_ns > native.pair_max_skew.as_nanos() as u64
-                    }) {
-                        continue;
-                    }
+                while let Some((session, pose, cloud)) = take_pair(
+                    &poses,
+                    &mut clouds,
+                    self.native.as_ref().map(|native| native.pair_max_skew),
+                ) {
                     self.deliver(session, pose, cloud).await?;
                 }
             }
@@ -714,6 +732,35 @@ impl Ingress {
             .await
             .map_err(|e| e.to_string())
     }
+}
+
+fn take_pair(
+    poses: &VecDeque<proto::Pose>,
+    clouds: &mut VecDeque<(u64, u64, schema::PointCloud2)>,
+    native_skew: Option<std::time::Duration>,
+) -> Option<(u64, proto::Pose, schema::PointCloud2)> {
+    while let Some((_, stamp, _)) = clouds.front() {
+        let stamp = *stamp;
+        let pose = poses
+            .iter()
+            .rev()
+            .find(|pose| pose.timestamp_ns <= stamp)
+            .cloned();
+        if poses.is_empty()
+            || (native_skew.is_some() && poses.back().is_none_or(|pose| pose.timestamp_ns < stamp))
+        {
+            return None;
+        }
+        let (session, _, cloud) = clouds.pop_front().unwrap();
+        let Some(pose) = pose else {
+            continue;
+        };
+        if native_skew.is_some_and(|skew| stamp - pose.timestamp_ns > skew.as_nanos() as u64) {
+            continue;
+        }
+        return Some((session, pose, cloud));
+    }
+    None
 }
 
 fn capture_pose(

@@ -120,8 +120,17 @@ pub(crate) struct Owner {
     state: watch::Receiver<nuwax_slam_2d_runtime::protocol::Status>,
     shutdown: watch::Sender<bool>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    navigation: Arc<crate::planar_navigation::Owner>,
+    transport: nuwax_transport::LcmTransport,
 }
 impl Owner {
+    pub(crate) async fn is_running(&self) -> bool {
+        self.task
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+    }
     pub(crate) async fn start(
         settings: Settings,
         transport: nuwax_transport::LcmTransport,
@@ -138,6 +147,7 @@ impl Owner {
         let (shutdown, mut stop) = watch::channel(false);
         let (states, state) = watch::channel(Default::default());
         let session = Arc::new(parking_lot::RwLock::new(None::<Session>));
+        let navigation = Arc::new(crate::planar_navigation::Owner::default());
         let owner = Arc::new(Self {
             settings: settings.clone(),
             client: client.clone(),
@@ -147,6 +157,8 @@ impl Owner {
             state,
             shutdown,
             task: Mutex::new(None),
+            navigation: navigation.clone(),
+            transport: transport.clone(),
         });
         let task = tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -234,6 +246,20 @@ impl Owner {
                             last_revision = Some((id, estimate.graph_revision));
                         }
                     }
+                    if let Some(mapper) = router.mapper() {
+                        let navigation = navigation.clone();
+                        let settings = settings.clone();
+                        let current = current.clone();
+                        let estimate = estimate.clone();
+                        let observation = tokio::task::spawn_blocking(move || {
+                            navigation.compose(&mapper, &settings, &current, &estimate)
+                        })
+                        .await
+                        .map_err(|e| e.to_string())??;
+                        if let Some(observation) = observation {
+                            crate::planar_navigation::publish(&transport, &observation).await?;
+                        }
+                    }
                 }
             }
             .await;
@@ -293,12 +319,19 @@ impl Owner {
             }
         };
         let response = execute(&self.client, operation).await?;
+        self.navigation.clear();
         *self.session.write() = Some(session);
         Ok(response)
     }
     pub(crate) async fn stop_session(&self) -> Result<(), String> {
         let session = self.session.write().take();
         if let Some(session) = session {
+            let revoked = crate::planar_navigation::publish(
+                &self.transport,
+                &self.navigation.revoke(&session),
+            )
+            .await;
+            self.navigation.clear();
             execute(
                 &self.client,
                 Operation::Stop {
@@ -307,6 +340,7 @@ impl Owner {
                 },
             )
             .await?;
+            revoked?;
         }
         Ok(())
     }
@@ -323,6 +357,7 @@ impl Owner {
             self.router.fault(error.clone());
             return Err(error);
         }
+        self.navigation.capture(scan);
         Ok(())
     }
     pub(crate) async fn publish_odom(
@@ -344,7 +379,14 @@ impl Owner {
         if self.session.read().is_none() {
             return Ok(());
         }
-        execute(&self.client, Operation::Odometry { sample }).await?;
+        execute(
+            &self.client,
+            Operation::Odometry {
+                sample: sample.clone(),
+            },
+        )
+        .await?;
+        self.navigation.odometry(sample)?;
         Ok(())
     }
     pub(crate) async fn checkpoint(&self) -> Result<Vec<u8>, String> {

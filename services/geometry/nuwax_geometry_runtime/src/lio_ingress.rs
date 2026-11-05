@@ -72,9 +72,14 @@ pub(crate) fn pose_isometry(pose: &crate::proto::Pose) -> Result<Isometry3<f64>,
 pub(crate) fn cloud_points(cloud: &schema::PointCloud2) -> Result<Vec<Point3<f64>>, String> {
     if cloud.is_bigendian
         || cloud.point_step < 12
+        || cloud.point_step as u32 > crate::pointcloud::POINTCLOUD_MAX_POINT_STEP_BYTES
         || cloud.data.len() % cloud.point_step as usize != 0
     {
         return Err("点云必须是完整的小端规范布局".into());
+    }
+    if cloud.data.len() / cloud.point_step as usize > crate::pointcloud::POINTCLOUD_MAX_FRAME_POINTS
+    {
+        return Err("点云超过单帧点数上限".into());
     }
     for (name, offset) in [("x", 0), ("y", 4), ("z", 8)] {
         if !cloud
@@ -268,7 +273,10 @@ pub(crate) fn encode_pointcloud_request_payload_with_sequence(
     }
     let point_step = usize::try_from(request.point_step)
         .map_err(|_| CodecError::LcmEncode("point_step exceeds usize".into()))?;
-    if point_step < 12 || request.points.len() % point_step != 0 {
+    if point_step < 12
+        || request.point_step > crate::pointcloud::POINTCLOUD_MAX_POINT_STEP_BYTES
+        || request.points.len() % point_step != 0
+    {
         return Err(CodecError::LcmEncode(format!(
             "point cloud data length {} is not aligned to point_step {}",
             request.points.len(),
@@ -277,6 +285,9 @@ pub(crate) fn encode_pointcloud_request_payload_with_sequence(
     }
 
     let derived_point_count = request.points.len() / point_step;
+    if derived_point_count > crate::pointcloud::POINTCLOUD_MAX_FRAME_POINTS {
+        return Err(CodecError::LcmEncode("点云超过单帧点数上限".into()));
+    }
     if request.point_count != 0 && request.point_count as usize != derived_point_count {
         return Err(CodecError::LcmEncode(format!(
             "point_count {} does not match data-derived count {}",

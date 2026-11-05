@@ -1,7 +1,7 @@
 //! 唯一会话状态拥有方。控制命令顺序执行，传感器帧直接进入当前地图对象。
 use crate::{
     corrector,
-    explorer::{apply_forbidden, build_surface_input, Explorer},
+    explorer::{Explorer, ExplorerTick},
     lio::Lio,
     map_store::MapStore,
     mapper::{pose_from_isometry, pose_isometry, Mapper, MapperConfig, MappingFrame},
@@ -12,11 +12,16 @@ use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, watch};
 use tonic::Status;
 
+#[path = "explorer_worker.rs"]
+mod explorer_worker;
+use explorer_worker::ExplorerWorker;
+
 #[derive(Clone)]
 pub(crate) struct Route {
     pub(crate) id: u64,
     pub(crate) mapper: Arc<Mapper>,
     map_pose: bool,
+    accept_frames: bool,
 }
 
 /// 此处只有当前对象与输出投影；会话阶段只在 Session 中改变。
@@ -28,6 +33,12 @@ pub struct FrameRouter {
     faults: mpsc::UnboundedSender<(u64, String)>,
 }
 impl FrameRouter {
+    pub(crate) fn mapper(&self) -> Option<Arc<Mapper>> {
+        self.route
+            .borrow()
+            .as_ref()
+            .map(|route| route.mapper.clone())
+    }
     pub fn session_id(&self) -> u64 {
         self.route.borrow().as_ref().map_or(0, |route| route.id)
     }
@@ -66,7 +77,9 @@ impl FrameRouter {
     }
     pub fn publish_frame(&self, frame: MappingFrame) {
         let route = self.route.borrow().clone();
-        if let Some(route) = route.filter(|route| route.id == frame.session_id) {
+        if let Some(route) =
+            route.filter(|route| route.id == frame.session_id && route.accept_frames)
+        {
             route.mapper.feed(frame);
         }
     }
@@ -75,7 +88,7 @@ impl FrameRouter {
             .route
             .borrow()
             .as_ref()
-            .filter(|route| route.id == session_id)
+            .filter(|route| route.id == session_id && route.accept_frames)
         {
             route.mapper.feed_grid(session_id, grid);
         }
@@ -85,6 +98,8 @@ impl FrameRouter {
         if let Some(route) = route.filter(|route| route.id == session_id) {
             if let Err(reason) = route.mapper.set_map_from_odom(pose_isometry(&pose)).await {
                 let _ = self.faults.send((session_id, reason));
+            } else {
+                self.refresh_transform();
             }
         }
     }
@@ -179,8 +194,6 @@ impl SessionHandle {
             lio: lio_tx,
             nav,
             explorer: None,
-            surface_cache: None,
-            masked_surface_cache: None,
         };
         tokio::spawn(actor.run(command_rx, fault_rx, nav_rx));
         Ok(Self {
@@ -350,15 +363,7 @@ struct Session {
     next_session: u64,
     lio: watch::Sender<Option<Arc<Lio>>>,
     nav: NavBridge,
-    explorer: Option<Explorer>,
-    surface_cache: Option<(
-        Arc<nuwax_map_chunks::SealedMap>,
-        Arc<nuwax_nav_mls_planner::SurfaceSnapshot>,
-    )>,
-    masked_surface_cache: Option<(
-        Option<OccupancyGrid>,
-        Arc<nuwax_nav_mls_planner::SurfaceSnapshot>,
-    )>,
+    explorer: Option<ExplorerWorker>,
 }
 impl Session {
     async fn run(
@@ -384,7 +389,7 @@ impl Session {
                         let result = if request.exploration_id.is_empty() || self.state.exploration.as_ref().is_some_and(|e| e.exploration_id == request.exploration_id) { self.stop_explorer().await } else { Ok(()) };
                         self.publish(); let _ = reply.send(result);
                     },
-                    Some(Command::Progress(request, reply)) => { let _ = reply.send(self.progress(request)); },
+                    Some(Command::Progress(request, reply)) => self.progress(request, reply),
                     Some(Command::Shutdown(reply)) => { commands.close(); let _ = self.end_current().await; let lio = self.lio.borrow().clone(); if let Some(lio) = lio { lio.shutdown().await; } self.nav.shutdown().await; let _ = reply.send(()); return; },
                     None => break,
                 },
@@ -392,7 +397,21 @@ impl Session {
                     if id == self.router.session_id() { self.fail(reason).await; self.publish(); }
                 },
                 Some(status) = navigation.recv() => { self.navigation(status).await; self.publish(); },
-                _ = tick.tick() => { if let Err(error) = self.tick().await { self.fail(error).await; } self.publish(); },
+                update = async {
+                    match &mut self.explorer {
+                        Some(explorer) => explorer.next().await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.state.phase == SessionPhase::Exploring as i32 => {
+                    if let Some(update) = update {
+                        match update {
+                            Ok(update) => self.exploration_update(update).await,
+                            Err(reason) => self.fail_exploration(reason).await,
+                        }
+                        self.publish();
+                    }
+                },
+                _ = tick.tick() => { self.refresh_navigation_input(); self.publish(); },
             }
         }
         let _ = self.end_current().await;
@@ -442,6 +461,7 @@ impl Session {
         self.state.phase = phase as i32;
         self.route.send_replace(Some(Route {
             id: mapper.session_id(),
+            accept_frames: true,
             mapper,
             map_pose: matches!(
                 phase,
@@ -454,9 +474,6 @@ impl Session {
         }
     }
     async fn recover(&mut self) -> Result<(), Status> {
-        if self.phase() != SessionPhase::Fault {
-            return Ok(());
-        }
         let existing = self.lio.borrow().clone();
         let result = match existing {
             Some(lio) => lio.recover().await.map(|_| lio),
@@ -469,14 +486,14 @@ impl Session {
                 Ok(())
             }
             Err(reason) => {
-                self.state.reason = reason.clone();
+                self.fail(reason.clone()).await;
                 Err(Status::unavailable(reason))
             }
         }
     }
     async fn end_current(&mut self) -> Result<(), Status> {
-        let explore_result = self.stop_explorer().await;
-        let cancel_result = self.cancel("", GoalStatus::Cancelled).await;
+        self.stop_explorer().await?;
+        self.cancel("", GoalStatus::Cancelled).await?;
         let old = self.route.send_replace(None);
         self.nav.set_input_ready(false);
         let map_result = if let Some(route) = old {
@@ -492,8 +509,6 @@ impl Session {
         };
         self.save_sources.clear();
         self.explorer = None;
-        self.surface_cache = None;
-        self.masked_surface_cache = None;
         self.state.phase = SessionPhase::Idle as i32;
         self.state.map_name.clear();
         self.state.reason.clear();
@@ -503,10 +518,7 @@ impl Session {
         if let Some(pose) = latest_odom {
             self.router.publish_pose(0, pose);
         }
-        explore_result
-            .and(cancel_result)
-            .and(map_result)
-            .and(input_result)
+        map_result.and(input_result)
     }
     async fn start_mapping(&mut self, request: StartMappingRequest) -> Result<(), Status> {
         if matches!(
@@ -542,11 +554,11 @@ impl Session {
         } else {
             None
         };
-        self.recover().await?;
-        self.end_current().await?;
         if !request.continue_saved && self.store.exists(&request.map_name) {
             return Err(Status::already_exists("地图已存在"));
         }
+        self.recover().await?;
+        self.end_current().await?;
         self.next_session += 1;
         let mut config = self.config.clone();
         config.map_name = request.map_name.clone();
@@ -590,8 +602,6 @@ impl Session {
         Ok(())
     }
     async fn load(&mut self, request: LoadMapRequest) -> Result<(), Status> {
-        self.recover().await?;
-        self.end_current().await?;
         let store = self.store.clone();
         let name = request.map_name.clone();
         let snapshot = tokio::task::spawn_blocking(move || store.load(&name))
@@ -599,15 +609,18 @@ impl Session {
             .map_err(|e| Status::internal(e.to_string()))??;
         let checkpoint = snapshot.planar_checkpoint.clone();
         let seed = snapshot.last_pose.clone();
-        self.next_session += 1;
+        let id = self.next_session + 1;
         let mut config = self.config.clone();
         config.map_name = request.map_name.clone();
-        let mapper = self
-            .subsystem(Mapper::load(self.next_session, config, snapshot, true))
-            .await?;
+        let mapper =
+            Mapper::prepare_load(id, config, snapshot, true).map_err(Status::unavailable)?;
+        self.recover().await?;
+        self.end_current().await?;
+        self.next_session = id;
         self.state.map_name = request.map_name.clone();
         self.save_sources.insert(request.map_name.clone());
         self.install(mapper.clone(), SessionPhase::Loaded);
+        self.subsystem(mapper.activate_shared_cloud().await).await?;
         self.subsystem(
             self.lio()?
                 .start_session(self.next_session, &request.map_name, checkpoint, true, seed)
@@ -630,7 +643,7 @@ impl Session {
     async fn save(&mut self, request: SaveMapRequest) -> Result<SaveMapResponse, Status> {
         if !matches!(
             self.phase(),
-            SessionPhase::Mapping | SessionPhase::Exploring
+            SessionPhase::Mapping | SessionPhase::Exploring | SessionPhase::Fault
         ) {
             return Err(Status::failed_precondition("当前没有正在建的地图"));
         }
@@ -641,9 +654,10 @@ impl Session {
         };
         let mapper = self.mapper()?;
         let mut snapshot = self.subsystem(mapper.snapshot().await).await?;
-        snapshot.planar_checkpoint = self
-            .subsystem(self.lio()?.planar_checkpoint().await)
-            .await?;
+        let lio = self.lio.borrow().clone();
+        if let Some(lio) = lio {
+            snapshot.planar_checkpoint = self.subsystem(lio.planar_checkpoint().await).await?;
+        }
         let store = self.store.clone();
         let source = self.save_sources.contains(&name).then(|| name.clone());
         let saved_name = name.clone();
@@ -653,12 +667,12 @@ impl Session {
         .await
         .map_err(|e| Status::internal(e.to_string()))??;
         mapper.set_map_name(name.clone());
-        self.subsystem(
-            mapper
-                .set_forbidden_zones(self.store.root().join(&name).join("forbidden_zones.json"))
-                .await,
-        )
-        .await?;
+        if let Err(reason) = mapper
+            .set_forbidden_zones(self.store.root().join(&name).join("forbidden_zones.json"))
+            .await
+        {
+            self.navigation_input_error(reason);
+        }
         if let Some(explorer) = &mut self.explorer {
             explorer.set_map_name(name.clone());
         }
@@ -683,9 +697,6 @@ impl Session {
             return Err(Status::failed_precondition("PGO 配置下不能重定位"));
         }
         let planar = self.state.info.as_ref().unwrap().pipeline == "slam_2d";
-        if !planar && request.seed.is_some() {
-            return Err(Status::invalid_argument("三维重定位不接受初值"));
-        }
         let mapper = self.mapper()?;
         let result = if planar {
             let seed = request.seed.map(|seed| {
@@ -716,7 +727,7 @@ impl Session {
             result.finished_at_ns = now_ns();
             result
         } else {
-            corrector::Corrector::relocalize(&mapper, None).await?
+            corrector::Corrector::relocalize(&mapper).await?
         };
         self.state.reason = if result.succeeded {
             String::new()
@@ -764,7 +775,9 @@ impl Session {
         if let Err(reason) = &refreshed {
             self.state.navigation.as_mut().unwrap().message = reason.clone();
         }
-        self.nav.submit(id.clone(), goal, false).await?;
+        if let Err(error) = self.nav.submit(id.clone(), goal, false).await {
+            self.navigation_failed(error.message().into());
+        }
         self.nav.set_input_ready(
             refreshed.is_ok()
                 && mapper.occupancy(true).is_some()
@@ -773,14 +786,13 @@ impl Session {
         Ok(SetGoalResponse { goal_id: id })
     }
     async fn replace_navigation(&mut self) -> Result<(), Status> {
-        if let Some(old) = self.state.navigation.as_mut() {
+        if let Some(old) = self.state.navigation.as_ref() {
             if !terminal(old.status) {
-                self.nav.cancel(&old.goal_id).await?;
-                old.status = GoalStatus::Replaced as i32;
-                old.message = "被新目标替换".into();
-                old.planned_path.clear();
+                let id = old.goal_id.clone();
+                self.cancel(&id, GoalStatus::Replaced).await?;
+                self.state.navigation.as_mut().unwrap().message = "被新目标替换".into();
             }
-            self.state.previous_navigation = Some(old.clone());
+            self.state.previous_navigation = self.state.navigation.clone();
         }
         Ok(())
     }
@@ -790,11 +802,15 @@ impl Session {
                 (id.is_empty() || current.goal_id == id) && !terminal(current.status)
             })
         {
-            self.nav.cancel(&current.goal_id).await?;
+            if let Err(error) = self.nav.cancel(&current.goal_id).await {
+                current.status = GoalStatus::Failed as i32;
+                current.message = error.message().into();
+                current.planned_path.clear();
+                return Err(error);
+            }
             current.status = status as i32;
             current.message = "导航已取消".into();
             current.planned_path.clear();
-            self.state.previous_navigation = Some(current.clone());
         }
         Ok(())
     }
@@ -817,14 +833,22 @@ impl Session {
         )?;
         let id = uuid::Uuid::new_v4().to_string();
         self.state.exploration = Some(explorer.start(id.clone(), request)?);
-        self.explorer = Some(explorer);
+        self.explorer = Some(ExplorerWorker::start(
+            explorer,
+            self.mapper()?,
+            self.router.pose.subscribe(),
+        ));
         self.state.phase = SessionPhase::Exploring as i32;
         Ok(StartExplorationResponse { exploration_id: id })
     }
     async fn stop_explorer(&mut self) -> Result<(), Status> {
         if self.phase() == SessionPhase::Exploring {
             if let Some(explorer) = &mut self.explorer {
-                self.state.exploration = Some(explorer.stop().map_err(Status::unavailable)?);
+                explorer.stop();
+            }
+            if let Some(status) = &mut self.state.exploration {
+                status.phase = ExplorationPhase::Stopped as i32;
+                status.message = "探索已停止".into();
             }
             if self
                 .state
@@ -832,13 +856,15 @@ impl Session {
                 .as_ref()
                 .is_some_and(|goal| goal.exploration_child)
             {
-                self.cancel("", GoalStatus::Cancelled).await?;
+                let result = self.cancel("", GoalStatus::Cancelled).await;
+                self.state.phase = SessionPhase::Mapping as i32;
+                return result;
             }
             self.state.phase = SessionPhase::Mapping as i32;
         }
         Ok(())
     }
-    fn progress(&self, request: ExplorationProgressRequest) -> Result<ExplorationProgress, Status> {
+    fn progress(&self, request: ExplorationProgressRequest, reply: Reply<ExplorationProgress>) {
         if !matches!(
             self.phase(),
             SessionPhase::Mapping | SessionPhase::Exploring
@@ -850,9 +876,10 @@ impl Session {
                     .as_ref()
                     .is_none_or(|e| e.exploration_id != request.exploration_id))
         {
-            return Err(Status::failed_precondition("本会话没有该探索进度"));
+            let _ = reply.send(Err(Status::failed_precondition("本会话没有该探索进度")));
+            return;
         }
-        self.explorer.as_ref().unwrap().progress()
+        self.explorer.as_ref().unwrap().progress(reply);
     }
     async fn navigation(&mut self, mut status: NavigationStatus) {
         let Some(current) = self
@@ -865,90 +892,49 @@ impl Session {
         };
         status.target = current.target.clone();
         status.exploration_child = current.exploration_child;
-        if let Some(explorer) = &mut self.explorer {
-            if let Err(reason) = explorer.navigation_feedback(&status) {
-                self.fail(reason).await;
-                return;
+        if self.phase() == SessionPhase::Exploring {
+            if let Some(explorer) = &self.explorer {
+                explorer.feedback(status.clone());
             }
-        }
-        if terminal(status.status) {
-            self.state.previous_navigation = Some(status.clone());
         }
         self.state.navigation = Some(status);
     }
-    async fn tick(&mut self) -> Result<(), String> {
+    fn navigation_input_error(&mut self, reason: String) {
+        if let Some(goal) = self
+            .state
+            .navigation
+            .as_mut()
+            .filter(|goal| !terminal(goal.status))
+        {
+            goal.message = reason;
+        }
+    }
+    fn refresh_navigation_input(&mut self) {
+        if self.phase() == SessionPhase::Fault {
+            return;
+        }
         let Some(route) = self.route.borrow().clone() else {
-            return Ok(());
+            return;
         };
-        // 禁区文件的下一次规划采用当前内容；替换文件不停车。
-        let refreshed = route
-            .mapper
-            .set_forbidden_zones(
-                self.store
-                    .root()
-                    .join(&self.state.map_name)
-                    .join("forbidden_zones.json"),
-            )
-            .await;
-        let ready = refreshed.is_ok()
-            && route.mapper.occupancy(true).is_some()
-            && self.router.pose.borrow().is_some();
-        self.nav.set_input_ready(ready);
+        let refreshed = route.mapper.forbidden_status();
+        self.nav.set_input_ready(
+            refreshed.is_ok()
+                && route.mapper.occupancy(true).is_some()
+                && self.router.pose.borrow().is_some(),
+        );
         if let Err(reason) = refreshed {
-            if let Some(goal) = self
-                .state
-                .navigation
-                .as_mut()
-                .filter(|goal| goal.status == GoalStatus::WaitingInput as i32)
-            {
-                goal.message = reason;
-            }
-            return Ok(());
+            self.navigation_input_error(reason);
         }
-        if self.phase() != SessionPhase::Exploring {
-            return Ok(());
-        }
-        let sealed = route.mapper.surface_map().await?;
-        let surface = if let Some(sealed) = sealed.filter(|map| {
-            now_ns().saturating_sub(map.manifest().source_timestamp_ns) <= 2_000_000_000
-        }) {
-            if self
-                .surface_cache
-                .as_ref()
-                .is_none_or(|(current, _)| !Arc::ptr_eq(current, &sealed))
-            {
-                let input = sealed.clone();
-                let built = tokio::task::spawn_blocking(move || build_surface_input(input))
-                    .await
-                    .map_err(|error| error.to_string())??;
-                self.surface_cache = Some((sealed, built));
-                self.masked_surface_cache = None;
-            }
-            let mask = route.mapper.forbidden_mask();
-            if self
-                .masked_surface_cache
-                .as_ref()
-                .is_none_or(|(current, _)| *current != mask)
-            {
-                let physical = self.surface_cache.as_ref().unwrap().1.clone();
-                self.masked_surface_cache = Some((mask.clone(), apply_forbidden(physical, mask)?));
-            }
-            Some(self.masked_surface_cache.as_ref().unwrap().1.clone())
-        } else {
-            None
-        };
-        let update = self.explorer.as_mut().unwrap().tick(
-            self.router.pose.borrow().clone(),
-            route.mapper.occupancy(true),
-            surface,
-        )?;
+    }
+    async fn exploration_update(&mut self, update: ExplorerTick) {
         if let Some(id) = update.cancel_goal {
-            self.cancel(&id, GoalStatus::Cancelled)
-                .await
-                .map_err(|e| e.to_string())?;
+            let _ = self.cancel(&id, GoalStatus::Cancelled).await;
         }
         if let Some((id, goal)) = update.goal {
-            self.replace_navigation().await.map_err(|e| e.to_string())?;
+            if let Err(error) = self.replace_navigation().await {
+                self.fail_exploration(error.message().into()).await;
+                return;
+            }
             self.state.navigation = Some(NavigationStatus {
                 goal_id: id.clone(),
                 status: GoalStatus::WaitingInput as i32,
@@ -956,10 +942,17 @@ impl Session {
                 exploration_child: true,
                 ..Default::default()
             });
-            self.nav
+            if let Err(error) = self
+                .nav
                 .submit_with_boundary(id, goal, true, update.boundary)
                 .await
-                .map_err(|e| e.to_string())?;
+            {
+                self.navigation_failed(error.message().into());
+                if let (Some(explorer), Some(status)) = (&self.explorer, &self.state.navigation) {
+                    explorer.feedback(status.clone());
+                }
+                return;
+            }
         }
         let finished = update.status.phase != ExplorationPhase::Running as i32;
         self.state.exploration = Some(update.status);
@@ -971,12 +964,34 @@ impl Session {
                 .as_ref()
                 .is_some_and(|goal| goal.exploration_child)
             {
-                self.cancel("", GoalStatus::Cancelled)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let _ = self.cancel("", GoalStatus::Cancelled).await;
             }
         }
-        Ok(())
+    }
+    fn navigation_failed(&mut self, reason: String) {
+        if let Some(goal) = &mut self.state.navigation {
+            goal.status = GoalStatus::Failed as i32;
+            goal.message = reason;
+            goal.planned_path.clear();
+        }
+    }
+    async fn fail_exploration(&mut self, reason: String) {
+        if let Some(explorer) = &self.explorer {
+            explorer.fail(reason.clone());
+        }
+        if let Some(status) = &mut self.state.exploration {
+            status.phase = ExplorationPhase::Failed as i32;
+            status.message = reason;
+        }
+        self.state.phase = SessionPhase::Mapping as i32;
+        if self
+            .state
+            .navigation
+            .as_ref()
+            .is_some_and(|goal| goal.exploration_child)
+        {
+            let _ = self.cancel("", GoalStatus::Cancelled).await;
+        }
     }
     async fn subsystem<T>(&mut self, result: Result<T, String>) -> Result<T, Status> {
         match result {
@@ -989,10 +1004,18 @@ impl Session {
     }
     async fn fail(&mut self, reason: String) {
         tracing::error!(%reason, "Geometry 会话进入故障");
-        let _ = self.end_current().await;
+        let _ = self.stop_explorer().await;
+        let _ = self.cancel("", GoalStatus::Cancelled).await;
+        self.route.send_if_modified(|route| {
+            if let Some(route) = route.as_mut().filter(|route| route.accept_frames) {
+                route.accept_frames = false;
+                return true;
+            }
+            false
+        });
+        self.nav.set_input_ready(false);
         self.state.phase = SessionPhase::Fault as i32;
         self.state.reason = reason;
-        self.state.map_name.clear();
     }
 }
 fn terminal(status: i32) -> bool {
@@ -1067,3 +1090,36 @@ async fn forward_maps(
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) fn test_router(
+    mapper: Arc<Mapper>,
+) -> (
+    FrameRouter,
+    watch::Receiver<Option<Pose>>,
+    mpsc::UnboundedReceiver<(u64, String)>,
+) {
+    let (_, route) = watch::channel(Some(Route {
+        id: mapper.session_id(),
+        mapper,
+        map_pose: true,
+        accept_frames: true,
+    }));
+    let (pose, pose_rx) = watch::channel(None);
+    let (odom, _) = watch::channel(None);
+    let (faults, fault_rx) = mpsc::unbounded_channel();
+    (
+        FrameRouter {
+            route,
+            pose,
+            odom,
+            faults,
+        },
+        pose_rx,
+        fault_rx,
+    )
+}
+
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod tests;

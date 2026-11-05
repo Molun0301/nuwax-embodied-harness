@@ -20,8 +20,8 @@ pub const TWIST_FINGERPRINT: [u8; 8] = 0x2e7c_07d7_cdf7_e027_u64.to_be_bytes();
 pub const BOOL_FINGERPRINT: [u8; 8] = 0x1ebe_f06a_5095_0e3e_u64.to_be_bytes();
 /// `nav_msgs.Path` fingerprint from `dimos-lcm==0.1.3`.
 pub const PATH_FINGERPRINT: [u8; 8] = 0xc3ae_62ac_b357_93e2_u64.to_be_bytes();
-/// `nuwax_msgs.GoalEnvelope` generated-C recursive fingerprint.
-pub const GOAL_ENVELOPE_FINGERPRINT: [u8; 8] = 0xe118711fe03d6439u64.to_be_bytes();
+/// `nuwax_msgs.NavigationGoal` generated-C recursive fingerprint.
+pub const NAVIGATION_GOAL_FINGERPRINT: [u8; 8] = 0xe118711fe03d6439u64.to_be_bytes();
 /// `nuwax_msgs.PathEnvelope` generated-C recursive fingerprint.
 pub const PATH_ENVELOPE_FINGERPRINT: [u8; 8] = 0x26a8c13af1a3ab9b_u64.to_be_bytes();
 /// `nav_msgs.OccupancyGrid` fingerprint from `dimos-lcm==0.1.3`.
@@ -48,8 +48,8 @@ pub const TF_MESSAGE_FINGERPRINT: [u8; 8] = 0xc2b8_a1c3_3a89_23ec_u64.to_be_byte
 
 /// `geometry_msgs.Transform` fingerprint generated from the repository IDL.
 pub const GEOMETRY_TRANSFORM_FINGERPRINT: [u8; 8] = 0xee5f_f426_47bf_3f91_u64.to_be_bytes();
-/// `nuwax_msgs.NavigationState` generated-C fingerprint.
-pub const NAVIGATION_STATE_FINGERPRINT: [u8; 8] = 0x9f146a1b54a1b25d_u64.to_be_bytes();
+/// `nuwax_msgs.NavigationStatus` generated-C fingerprint.
+pub const NAVIGATION_STATUS_FINGERPRINT: [u8; 8] = 0xcf4636092c4c0e30_u64.to_be_bytes();
 /// `nuwax_msgs.CancelNavigation` generated-C fingerprint.
 pub const CANCEL_NAVIGATION_FINGERPRINT: [u8; 8] = 0x9704_4b28_e9c5_dd22_u64.to_be_bytes();
 /// `nuwax_msgs.Frontier` generated-C fingerprint.
@@ -66,6 +66,16 @@ pub const PATH_ENVELOPE_SCHEMA_VERSION: i32 = 10;
 pub const NAVIGATION_OWNER_KIND_PUBLIC_NAV: i32 = 1;
 /// An exploration parent owns the child navigation goal lease.
 pub const NAVIGATION_OWNER_KIND_EXPLORATION_CHILD: i32 = 2;
+
+/// 目标状态与Geometry公开枚举一致。
+pub const NAVIGATION_GOAL_STATUS_NONE: i32 = 0;
+pub const NAVIGATION_GOAL_STATUS_WAITING_INPUT: i32 = 1;
+pub const NAVIGATION_GOAL_STATUS_PLANNING: i32 = 2;
+pub const NAVIGATION_GOAL_STATUS_EXECUTING: i32 = 3;
+pub const NAVIGATION_GOAL_STATUS_SUCCEEDED: i32 = 4;
+pub const NAVIGATION_GOAL_STATUS_FAILED: i32 = 5;
+pub const NAVIGATION_GOAL_STATUS_CANCELLED: i32 = 6;
+pub const NAVIGATION_GOAL_STATUS_STOPPED: i32 = 8;
 
 /// LCM representation of `std_msgs.Header`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -144,7 +154,7 @@ pub struct CommittedMapIdentity {
 
 /// Geometry 发布的目标：目标号、运动代次、位姿与可选执行约束。
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct GoalEnvelope {
+pub struct NavigationGoal {
     /// Geometry 分配的目标号。
     pub session_id: String,
     /// 运动命令受理时的守卫代次。
@@ -160,7 +170,7 @@ pub struct GoalEnvelope {
     /// 探索范围；传输只带平面坐标。
     pub boundary_points: Vec<[f64; 3]>,
 }
-impl GoalEnvelope {
+impl NavigationGoal {
     /// 导航内部路径关联继续使用原类型；Geometry 启动取消全部替代进程代次。
     pub fn goal_key(&self) -> GoalKey {
         GoalKey { producer_runtime_generation: 0, goal_generation: self.motion_generation }
@@ -271,7 +281,7 @@ pub struct TfMessage {
 
 /// Repository-native navigation state bridge message.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct NavigationState {
+pub struct NavigationStatus {
     /// Navigation session identifier.
     pub session_id: String,
     /// Robot frame identifier.
@@ -282,6 +292,16 @@ pub struct NavigationState {
     pub stamp_nsec: i32,
     /// Native state enum value.
     pub state: i32,
+    /// Geometry目标状态，使用 NAVIGATION_GOAL_STATUS_* 常量。
+    pub goal_status: i32,
+    /// 当前目标状态的可读原因。
+    pub reason: String,
+    /// 沿当前已接受路线的剩余距离，单位米。
+    pub remaining_distance_m: f64,
+    /// 导航栈汇总的单一输入就绪信号。
+    pub input_ready: bool,
+    /// 规划器当前明确报告无可行路径。
+    pub no_feasible_path: bool,
     /// Goal `(x, y, yaw)`.
     pub goal: [f64; 3],
     /// Current `(x, y, yaw)`.
@@ -325,7 +345,7 @@ pub struct NavigationState {
 
 }
 
-impl NavigationState {
+impl NavigationStatus {
     /// The reported goal, or no goal for an empty heartbeat.
     pub fn goal_key(&self) -> Option<GoalKey> {
         (self.producer_runtime_generation > 0 && self.goal_generation > 0).then_some(GoalKey {
@@ -1267,19 +1287,19 @@ fn decode_path_from(cursor: &mut Cursor<'_>) -> CodecResult<Path> {
 }
 
 /// Validate goal version, ownership, authority, boundary and coordinate contract.
-pub fn validate_goal_envelope(message: &GoalEnvelope) -> CodecResult<()> {
-    validate_goal_envelope_semantics(message).map_err(CodecError::LcmDecode)
+pub fn validate_navigation_goal(message: &NavigationGoal) -> CodecResult<()> {
+    validate_navigation_goal_semantics(message).map_err(CodecError::LcmDecode)
 }
 
-/// Encode a top-level `nuwax_msgs.GoalEnvelope` generated message.
-pub fn encode_goal_envelope(message: &GoalEnvelope) -> CodecResult<Vec<u8>> {
-    let body = encode_goal_envelope_body(message)?;
-    Ok(with_fingerprint(GOAL_ENVELOPE_FINGERPRINT, body))
+/// Encode a top-level `nuwax_msgs.NavigationGoal` generated message.
+pub fn encode_navigation_goal(message: &NavigationGoal) -> CodecResult<Vec<u8>> {
+    let body = encode_navigation_goal_body(message)?;
+    Ok(with_fingerprint(NAVIGATION_GOAL_FINGERPRINT, body))
 }
 
-/// Encode only the generated-C `GoalEnvelope` body.
-pub fn encode_goal_envelope_body(message: &GoalEnvelope) -> CodecResult<Vec<u8>> {
-    validate_goal_envelope_semantics(message).map_err(CodecError::LcmEncode)?;
+/// Encode only the generated-C `NavigationGoal` body.
+pub fn encode_navigation_goal_body(message: &NavigationGoal) -> CodecResult<Vec<u8>> {
+    validate_navigation_goal_semantics(message).map_err(CodecError::LcmEncode)?;
     let mut out = Vec::new();
     encode_string(&message.session_id, &mut out)?;
     out.extend_from_slice(&message.motion_generation.to_be_bytes());
@@ -1298,26 +1318,26 @@ pub fn encode_goal_envelope_body(message: &GoalEnvelope) -> CodecResult<Vec<u8>>
     Ok(out)
 }
 
-/// Decode and validate a top-level `nuwax_msgs.GoalEnvelope` message.
-pub fn decode_goal_envelope(encoded: &[u8]) -> CodecResult<GoalEnvelope> {
+/// Decode and validate a top-level `nuwax_msgs.NavigationGoal` message.
+pub fn decode_navigation_goal(encoded: &[u8]) -> CodecResult<NavigationGoal> {
     let mut cursor = Cursor::new(encoded);
-    cursor.expect_fingerprint(GOAL_ENVELOPE_FINGERPRINT, "nuwax_msgs.GoalEnvelope")?;
-    let message = decode_goal_envelope_from(&mut cursor)?;
-    cursor.finish("nuwax_msgs.GoalEnvelope")?;
-    validate_goal_envelope(&message)?;
+    cursor.expect_fingerprint(NAVIGATION_GOAL_FINGERPRINT, "nuwax_msgs.NavigationGoal")?;
+    let message = decode_navigation_goal_from(&mut cursor)?;
+    cursor.finish("nuwax_msgs.NavigationGoal")?;
+    validate_navigation_goal(&message)?;
     Ok(message)
 }
 
-/// Decode and validate only a generated-C `GoalEnvelope` body.
-pub fn decode_goal_envelope_body(encoded: &[u8]) -> CodecResult<GoalEnvelope> {
+/// Decode and validate only a generated-C `NavigationGoal` body.
+pub fn decode_navigation_goal_body(encoded: &[u8]) -> CodecResult<NavigationGoal> {
     let mut cursor = Cursor::new(encoded);
-    let message = decode_goal_envelope_from(&mut cursor)?;
-    cursor.finish("nuwax_msgs.GoalEnvelope body")?;
-    validate_goal_envelope(&message)?;
+    let message = decode_navigation_goal_from(&mut cursor)?;
+    cursor.finish("nuwax_msgs.NavigationGoal body")?;
+    validate_navigation_goal(&message)?;
     Ok(message)
 }
 
-fn decode_goal_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<GoalEnvelope> {
+fn decode_navigation_goal_from(cursor: &mut Cursor<'_>) -> CodecResult<NavigationGoal> {
     let session_id = cursor.read_string()?;
     let motion_generation = u64::from_be_bytes(cursor.read_exact(8)?.try_into().unwrap());
     let goal = PoseStamped { header: decode_header(cursor)?, pose: decode_pose_body(cursor)? };
@@ -1329,7 +1349,7 @@ fn decode_goal_envelope_from(cursor: &mut Cursor<'_>) -> CodecResult<GoalEnvelop
     let count = count as usize;
     let mut boundary_points = Vec::with_capacity(count);
     for _ in 0..count { boundary_points.push([cursor.read_f64()?, cursor.read_f64()?, 0.0]); }
-    Ok(GoalEnvelope {
+    Ok(NavigationGoal {
 session_id: session_id,
 motion_generation: motion_generation,
 goal: goal,
@@ -1339,7 +1359,7 @@ yaw_tolerance_rad: yaw_tolerance_rad,
 boundary_points: boundary_points
 })
 }
-fn validate_goal_envelope_semantics(message: &GoalEnvelope) -> Result<(), String> {
+fn validate_navigation_goal_semantics(message: &NavigationGoal) -> Result<(), String> {
     message.options().validate()?;
     validate_navigation_frame_id(&message.goal.header.frame_id, "目标位姿")?;
     if message.session_id.trim().is_empty() { return Err("目标号为空".into()); }
@@ -1824,20 +1844,25 @@ fn decode_geometry_transform_from(cursor: &mut Cursor<'_>) -> CodecResult<Transf
     })
 }
 
-/// Encode a top-level repository-native `nuwax_msgs.NavigationState` message.
-pub fn encode_navigation_state(message: &NavigationState) -> CodecResult<Vec<u8>> {
-    let body = encode_navigation_state_body(message)?;
-    Ok(with_fingerprint(NAVIGATION_STATE_FINGERPRINT, body))
+/// Encode a top-level repository-native `nuwax_msgs.NavigationStatus` message.
+pub fn encode_navigation_status(message: &NavigationStatus) -> CodecResult<Vec<u8>> {
+    let body = encode_navigation_status_body(message)?;
+    Ok(with_fingerprint(NAVIGATION_STATUS_FINGERPRINT, body))
 }
 
-/// Encode only the generated-C `NavigationState` body.
-pub fn encode_navigation_state_body(message: &NavigationState) -> CodecResult<Vec<u8>> {
+/// Encode only the generated-C `NavigationStatus` body.
+pub fn encode_navigation_status_body(message: &NavigationStatus) -> CodecResult<Vec<u8>> {
     let mut out = Vec::new();
     encode_string(&message.session_id, &mut out)?;
     encode_string(&message.robot_frame, &mut out)?;
     out.extend_from_slice(&message.stamp_sec.to_be_bytes());
     out.extend_from_slice(&message.stamp_nsec.to_be_bytes());
     out.extend_from_slice(&message.state.to_be_bytes());
+    out.extend_from_slice(&message.goal_status.to_be_bytes());
+    encode_string(&message.reason, &mut out)?;
+    out.extend_from_slice(&message.remaining_distance_m.to_be_bytes());
+    out.push(u8::from(message.input_ready));
+    out.push(u8::from(message.no_feasible_path));
     encode_f64_array(&message.goal, &mut out);
     encode_f64_array(&message.current, &mut out);
     out.extend_from_slice(&message.progress.to_be_bytes());
@@ -1865,30 +1890,35 @@ pub fn encode_navigation_state_body(message: &NavigationState) -> CodecResult<Ve
     Ok(out)
 }
 
-/// Decode a top-level repository-native `nuwax_msgs.NavigationState` message.
-pub fn decode_navigation_state(encoded: &[u8]) -> CodecResult<NavigationState> {
+/// Decode a top-level repository-native `nuwax_msgs.NavigationStatus` message.
+pub fn decode_navigation_status(encoded: &[u8]) -> CodecResult<NavigationStatus> {
     let mut cursor = Cursor::new(encoded);
-    cursor.expect_fingerprint(NAVIGATION_STATE_FINGERPRINT, "nuwax_msgs.NavigationState")?;
-    let message = decode_navigation_state_from(&mut cursor)?;
-    cursor.finish("nuwax_msgs.NavigationState")?;
+    cursor.expect_fingerprint(NAVIGATION_STATUS_FINGERPRINT, "nuwax_msgs.NavigationStatus")?;
+    let message = decode_navigation_status_from(&mut cursor)?;
+    cursor.finish("nuwax_msgs.NavigationStatus")?;
     Ok(message)
 }
 
-/// Decode only a generated-C `NavigationState` body.
-pub fn decode_navigation_state_body(encoded: &[u8]) -> CodecResult<NavigationState> {
+/// Decode only a generated-C `NavigationStatus` body.
+pub fn decode_navigation_status_body(encoded: &[u8]) -> CodecResult<NavigationStatus> {
     let mut cursor = Cursor::new(encoded);
-    let message = decode_navigation_state_from(&mut cursor)?;
-    cursor.finish("nuwax_msgs.NavigationState body")?;
+    let message = decode_navigation_status_from(&mut cursor)?;
+    cursor.finish("nuwax_msgs.NavigationStatus body")?;
     Ok(message)
 }
 
-fn decode_navigation_state_from(cursor: &mut Cursor<'_>) -> CodecResult<NavigationState> {
-    Ok(NavigationState {
+fn decode_navigation_status_from(cursor: &mut Cursor<'_>) -> CodecResult<NavigationStatus> {
+    Ok(NavigationStatus {
         session_id: cursor.read_string()?,
         robot_frame: cursor.read_string()?,
         stamp_sec: cursor.read_i64()?,
         stamp_nsec: cursor.read_i32()?,
         state: cursor.read_i32()?,
+        goal_status: cursor.read_i32()?,
+        reason: cursor.read_string()?,
+        remaining_distance_m: cursor.read_f64()?,
+        input_ready: cursor.read_u8()? != 0,
+        no_feasible_path: cursor.read_u8()? != 0,
         goal: cursor.read_f64_array()?,
         current: cursor.read_f64_array()?,
         progress: cursor.read_f64()?,
@@ -3122,9 +3152,9 @@ mod navigation_map_3d_tests {
             "sensor_msgs/PointCloud2",
             "nuwax_msgs/NavigationMapBlock",
             "nuwax_msgs/NavigationMap3D",
-            "nuwax_msgs/GoalEnvelope",
+            "nuwax_msgs/NavigationGoal",
             "nuwax_msgs/PathEnvelope",
-            "nuwax_msgs/NavigationState",
+            "nuwax_msgs/NavigationStatus",
             "nuwax_msgs/PlanarNavigationMap",
         ];
         for python in [false, true] {
@@ -3146,12 +3176,12 @@ mod navigation_map_3d_tests {
             "nuwax_msgs_NavigationMapBlock.h",
             "nuwax_msgs_NavigationMap3D.c",
             "nuwax_msgs_NavigationMap3D.h",
-            "nuwax_msgs_GoalEnvelope.c",
-            "nuwax_msgs_GoalEnvelope.h",
+            "nuwax_msgs_NavigationGoal.c",
+            "nuwax_msgs_NavigationGoal.h",
             "nuwax_msgs_PathEnvelope.c",
             "nuwax_msgs_PathEnvelope.h",
-            "nuwax_msgs_NavigationState.c",
-            "nuwax_msgs_NavigationState.h",
+            "nuwax_msgs_NavigationStatus.c",
+            "nuwax_msgs_NavigationStatus.h",
             "nuwax_msgs_PlanarNavigationMap.c",
             "nuwax_msgs_PlanarNavigationMap.h",
         ] {
@@ -3160,7 +3190,7 @@ mod navigation_map_3d_tests {
                 fs::read(root.join("generated/c").join(file)).unwrap()
             );
         }
-        for file in ["NavigationMap3D.py", "NavigationMapBlock.py", "NavigationState.py", "PlanarNavigationMap.py"] {
+        for file in ["NavigationMap3D.py", "NavigationMapBlock.py", "PlanarNavigationMap.py"] {
             assert_eq!(
                 fs::read(py_dir.join("nuwax_msgs").join(file)).unwrap(),
                 fs::read(root.join("generated/python/nuwax_msgs").join(file)).unwrap()
@@ -3173,9 +3203,9 @@ mod navigation_map_3d_tests {
 #include <stdlib.h>
 #include <string.h>
 #include "nuwax_msgs_NavigationMap3D.h"
-#include "nuwax_msgs_GoalEnvelope.h"
+#include "nuwax_msgs_NavigationGoal.h"
 #include "nuwax_msgs_PathEnvelope.h"
-#include "nuwax_msgs_NavigationState.h"
+#include "nuwax_msgs_NavigationStatus.h"
 #define ROUNDTRIP(TYPE, CHECK) do { \
     TYPE message; \
     if (TYPE##_decode(data, 0, (int)size, &message) != size) return 20; \
@@ -3196,8 +3226,8 @@ int main(int argc, char **argv) {
     if (!data || fread(data, 1, (size_t)size, input) != (size_t)size) return 3;
     fclose(input);
     if (argc == 4) {
-        if (!strcmp(argv[3], "GoalEnvelope")) {
-            ROUNDTRIP(nuwax_msgs_GoalEnvelope, message.motion_generation == 4 &&
+        if (!strcmp(argv[3], "NavigationGoal")) {
+            ROUNDTRIP(nuwax_msgs_NavigationGoal, message.motion_generation == 4 &&
                 !strcmp(message.goal.header.frame_id, "robot/map") &&
                 message.boundary_points_length == 3);
         }
@@ -3207,11 +3237,13 @@ int main(int argc, char **argv) {
                 message.planner_runtime_generation == 8 && message.path_revision == 1 &&
                 message.path.poses_length == 1);
         }
-        if (!strcmp(argv[3], "NavigationState")) {
-            ROUNDTRIP(nuwax_msgs_NavigationState, message.runtime_generation == 99 &&
+        if (!strcmp(argv[3], "NavigationStatus")) {
+            ROUNDTRIP(nuwax_msgs_NavigationStatus, message.runtime_generation == 99 &&
                 message.producer_runtime_generation == 0 && message.goal_generation == 4 &&
                 message.planner_runtime_generation == 8 && message.path_revision == 1 &&
-                message.local_path_count == 1);
+                message.local_path_count == 1 && message.goal_status == 3 &&
+                !strcmp(message.reason, "route ready") && message.remaining_distance_m == 4.75 &&
+                message.input_ready && message.no_feasible_path);
         }
         return 24;
     }
@@ -3262,16 +3294,19 @@ int main(int argc, char **argv) {
         run(compile);
         let goal = super::tests::configured_frame_goal("robot/map");
         let path = super::tests::configured_frame_path(&goal, "robot/map");
-        let state = NavigationState {
+        let state = NavigationStatus {
             session_id: goal.session_id.clone(), owner_kind: NAVIGATION_OWNER_KIND_PUBLIC_NAV,
             goal_generation: goal.motion_generation as i64,
             planner_runtime_generation: path.planner_runtime_generation, path_revision: path.path_revision,
-            runtime_generation: 99, local_path: vec![[1.0, 2.0, 0.4]], ..NavigationState::default()
+            runtime_generation: 99, local_path: vec![[1.0, 2.0, 0.4]],
+            goal_status: NAVIGATION_GOAL_STATUS_EXECUTING, reason: "route ready".into(),
+            remaining_distance_m: 4.75, input_ready: true, no_feasible_path: true,
+            ..NavigationStatus::default()
         };
         for (name, wire) in [
-            ("GoalEnvelope", encode_goal_envelope(&goal).unwrap()),
+            ("NavigationGoal", encode_navigation_goal(&goal).unwrap()),
             ("PathEnvelope", encode_path_envelope(&path).unwrap()),
-            ("NavigationState", encode_navigation_state(&state).unwrap()),
+            ("NavigationStatus", encode_navigation_status(&state).unwrap()),
         ] {
             let input = temp.0.join(format!("{name}.bin"));
             let c_output = temp.0.join(format!("{name}-c.bin"));
@@ -3290,7 +3325,7 @@ import nuwax_msgs
 name = sys.argv[4]
 raw = Path(sys.argv[2]).read_bytes()
 message = getattr(nuwax_msgs, name).decode(raw)
-if name == "GoalEnvelope":
+if name == "NavigationGoal":
     assert message.motion_generation == 4
     assert message.goal.header.frame_id == "robot/map"
 elif name == "PathEnvelope":
@@ -3299,15 +3334,17 @@ elif name == "PathEnvelope":
 else:
     assert message.goal_generation == 4 and message.producer_runtime_generation == 0
     assert message.runtime_generation == 99 and message.local_path_count == 1
+    assert message.goal_status == 3 and message.reason == "route ready"
+    assert message.remaining_distance_m == 4.75 and message.input_ready and message.no_feasible_path
 assert message.encode() == raw
 Path(sys.argv[3]).write_bytes(message.encode())
 "#]).arg(&py_dir).arg(&input).arg(&py_output).arg(name);
             run(python);
             assert_eq!(fs::read(py_output).unwrap(), wire);
             match name {
-                "GoalEnvelope" => assert_eq!(decode_goal_envelope(&wire).unwrap(), goal),
+                "NavigationGoal" => assert_eq!(decode_navigation_goal(&wire).unwrap(), goal),
                 "PathEnvelope" => assert_eq!(decode_path_envelope(&wire).unwrap(), path),
-                _ => assert_eq!(decode_navigation_state(&wire).unwrap(), state),
+                _ => assert_eq!(decode_navigation_status(&wire).unwrap(), state),
             }
         }
         for (name, message) in [
@@ -3477,10 +3514,10 @@ mod tests {
         assert_eq!(decode_path(&encoded).unwrap(), message);
     }
 
-    pub(super) fn configured_frame_goal(frame_id: &str) -> GoalEnvelope {
+    pub(super) fn configured_frame_goal(frame_id: &str) -> NavigationGoal {
         let boundary_id = "configured-frame-exploration:boundary".to_string();
         let boundary_points = vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
-        GoalEnvelope {
+        NavigationGoal {
 session_id: "configured-frame-goal".into(),
 boundary_points: boundary_points,
 motion_generation: 4,
@@ -3496,11 +3533,11 @@ goal: PoseStamped {
                     orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
                 },
             },
-..GoalEnvelope::default()
+..NavigationGoal::default()
 }
     }
 
-    pub(super) fn configured_frame_path(goal: &GoalEnvelope, frame_id: &str) -> PathEnvelope {
+    pub(super) fn configured_frame_path(goal: &NavigationGoal, frame_id: &str) -> PathEnvelope {
         PathEnvelope {
 route_kind: 0,
 schema_version: PATH_ENVELOPE_SCHEMA_VERSION,
@@ -3531,11 +3568,11 @@ path: Path {
             let goal = configured_frame_goal(frame_id);
             let goal_key = goal.goal_key();
             assert_eq!(goal.goal_key(), goal_key);
-            let goal_body = encode_goal_envelope_body(&goal).unwrap();
-            assert_eq!(decode_goal_envelope_body(&goal_body).unwrap(), goal);
-            let encoded_goal = encode_goal_envelope(&goal).unwrap();
-            assert_eq!(&encoded_goal[..8], &GOAL_ENVELOPE_FINGERPRINT);
-            assert_eq!(decode_goal_envelope(&encoded_goal).unwrap(), goal);
+            let goal_body = encode_navigation_goal_body(&goal).unwrap();
+            assert_eq!(decode_navigation_goal_body(&goal_body).unwrap(), goal);
+            let encoded_goal = encode_navigation_goal(&goal).unwrap();
+            assert_eq!(&encoded_goal[..8], &NAVIGATION_GOAL_FINGERPRINT);
+            assert_eq!(decode_navigation_goal(&encoded_goal).unwrap(), goal);
 
             let path = configured_frame_path(&goal, frame_id);
             assert_eq!(path.goal_key(), goal_key);
@@ -3556,7 +3593,7 @@ path: Path {
     fn envelope_authority_is_structurally_validated_and_old_wire_is_rejected() {
         let mut goal = configured_frame_goal("map");
         goal.position_tolerance_m=Some(f64::NAN);
-        assert!(encode_goal_envelope(&goal).is_err());
+        assert!(encode_navigation_goal(&goal).is_err());
         let mut path = configured_frame_path(&configured_frame_goal("map"),"map");
         path.planner_runtime_generation=0;
         assert!(encode_path_envelope(&path).is_err());
@@ -3566,7 +3603,7 @@ path: Path {
     fn generated_python_preserves_goal_path_and_planar_occupancy_receipts() {
         let mut goal = configured_frame_goal("robot/map");
         // An epoch-zero source timestamp is legitimate receipt data.
-        validate_goal_envelope(&goal).unwrap();
+        validate_navigation_goal(&goal).unwrap();
         let mut path = configured_frame_path(&goal, "robot/map");
         path.route_kind=1;
         validate_path_envelope(&path).unwrap();
@@ -3602,13 +3639,13 @@ if name == 'PlanarNavigationMap':
     assert bytes(message.map_boot_nonce) == bytes([0x31] * 16)
     assert message.map_commit_sequence == 29 and message.map_source_timestamp_ns == 0
     assert message.source_timestamp_ns == 1_000_000_001
-elif name == 'GoalEnvelope':
+elif name == 'NavigationGoal':
     assert message.schema_version == 9
     assert bytes(message.committed_map_boot_nonce) == bytes([0x31] * 16)
     assert message.committed_map_commit_sequence == 29
     assert message.committed_map_source_timestamp_ns == 0
     assert message.committed_map_frame_id == 'robot/map'
-    if name == 'GoalEnvelope':
+    if name == 'NavigationGoal':
         assert message.body_reference_frame_id == 'robot/body'
 else:
     assert message.schema_version == 10
@@ -3627,15 +3664,15 @@ sys.stdout.buffer.write(message.encode())
     fn configured_public_goal_without_boundary_remains_valid() {
         let mut goal=configured_frame_goal("robot/map");
         goal.boundary_points.clear();
-        let encoded=encode_goal_envelope(&goal).unwrap();
-        assert_eq!(decode_goal_envelope(&encoded).unwrap(),goal);
+        let encoded=encode_navigation_goal(&goal).unwrap();
+        assert_eq!(decode_navigation_goal(&encoded).unwrap(),goal);
 }
 
     #[test]
     fn configured_navigation_frames_reject_empty_mismatched_or_non_finite_geometry() {
         for invalid_frame_id in ["", " robot/map ", "/robot/map"] {
             let mut goal = configured_frame_goal(invalid_frame_id);
-            assert!(validate_goal_envelope(&goal)
+            assert!(validate_navigation_goal(&goal)
                 .unwrap_err()
                 .to_string()
                 .contains("frame_id is invalid"));
@@ -3643,20 +3680,20 @@ sys.stdout.buffer.write(message.encode())
 
         let mut non_finite_goal = configured_frame_goal("robot/map");
         non_finite_goal.goal.pose.position[0] = f64::NAN;
-        assert!(validate_goal_envelope(&non_finite_goal)
+        assert!(validate_navigation_goal(&non_finite_goal)
             .unwrap_err()
             .to_string()
             .contains("不是有限数"));
 
         let mut non_finite_boundary = configured_frame_goal("robot/map");
         non_finite_boundary.boundary_points[0][0] = f64::INFINITY;
-        assert!(validate_goal_envelope(&non_finite_boundary)
+        assert!(validate_navigation_goal(&non_finite_boundary)
             .unwrap_err()
             .to_string()
             .contains("不是有限数"));
 
         let mut goal = configured_frame_goal("robot/map");
-        validate_goal_envelope(&goal).unwrap();
+        validate_navigation_goal(&goal).unwrap();
 
         let mut empty_path_frame = configured_frame_path(&goal, "");
         assert!(validate_path_envelope(&empty_path_frame)
@@ -3682,7 +3719,7 @@ sys.stdout.buffer.write(message.encode())
     #[test]
     fn envelope_decoders_reject_negative_or_impossible_collection_lengths() {
         let goal = configured_frame_goal("robot/map");
-        let goal_wire = encode_goal_envelope(&goal).unwrap();
+        let goal_wire = encode_navigation_goal(&goal).unwrap();
         let boundary_count_at = goal_wire.len() - goal.boundary_points.len()*16 - 4;
         let path = configured_frame_path(&goal, "robot/map");
         let path_wire = encode_path_envelope(&path).unwrap();
@@ -3691,7 +3728,7 @@ sys.stdout.buffer.write(message.encode())
         for count in [-1_i32, i32::MAX] {
             let mut invalid_goal = goal_wire.clone();
             invalid_goal[boundary_count_at..boundary_count_at + 4].copy_from_slice(&count.to_be_bytes());
-            assert!(decode_goal_envelope(&invalid_goal).is_err());
+            assert!(decode_navigation_goal(&invalid_goal).is_err());
             let mut invalid_path = path_wire.clone();
             invalid_path[path_count_at..path_count_at + 4].copy_from_slice(&count.to_be_bytes());
             assert!(decode_path_envelope(&invalid_path).is_err());
@@ -3707,7 +3744,7 @@ sys.stdout.buffer.write(message.encode())
         changed.motion_generation=u64::MAX;
         changed.allow_reverse=Some(true);
         changed.position_tolerance_m=Some(0.04);
-        assert_eq!(decode_goal_envelope(&encode_goal_envelope(&changed).unwrap()).unwrap(),changed);
+        assert_eq!(decode_navigation_goal(&encode_navigation_goal(&changed).unwrap()).unwrap(),changed);
         let path=configured_frame_path(&changed,"map");
         assert_eq!(path.motion_generation,u64::MAX);
         assert_eq!(decode_path_envelope(&encode_path_envelope(&path).unwrap()).unwrap(),path);
@@ -3917,13 +3954,13 @@ sys.stdout.buffer.write(message.encode())
     }
 
     #[test]
-    fn navigation_state_projects_actual_goal_and_path_domains() {
-        let mut state = NavigationState::default();
+    fn navigation_status_projects_actual_goal_and_path_domains() {
+        let mut state = NavigationStatus::default();
         assert_eq!(state.goal_key(), None);
         assert_eq!(state.path_key(), None);
         // Backend diagnostics can have a named session without an assigned goal.
         state.session_id = "mls-backend".into();
-        assert_eq!(decode_navigation_state(&encode_navigation_state(&state).unwrap()).unwrap(), state);
+        assert_eq!(decode_navigation_status(&encode_navigation_status(&state).unwrap()).unwrap(), state);
         assert_eq!(state.goal_key(), None);
         state.goal_generation = 2;
         state.producer_runtime_generation = 7;
@@ -3934,23 +3971,23 @@ sys.stdout.buffer.write(message.encode())
         state.planner_runtime_generation = 8;
         state.path_revision = 1;
         assert_eq!(state.path_key(), Some(PathKey { goal, planner_runtime_generation: 8, path_revision: 1 }));
-        assert_eq!(decode_navigation_state(&encode_navigation_state(&state).unwrap()).unwrap(), state);
+        assert_eq!(decode_navigation_status(&encode_navigation_status(&state).unwrap()).unwrap(), state);
     }
 
     #[test]
     fn navigation_local_display_rejects_corrupt_sizes_and_coordinates() {
-        let mut message = NavigationState { local_path: vec![[0.0, 1.0, 0.4]], ..Default::default() };
-        let encoded = encode_navigation_state_body(&message).unwrap();
+        let mut message = NavigationStatus { local_path: vec![[0.0, 1.0, 0.4]], ..Default::default() };
+        let encoded = encode_navigation_status_body(&message).unwrap();
         let count_at = encoded.len() - 28;
         let mut bad_count = encoded.clone();
         bad_count[count_at..count_at + 4].copy_from_slice(&65537_i32.to_be_bytes());
-        assert!(decode_navigation_state_body(&bad_count).is_err());
-        assert!(decode_navigation_state_body(&encoded[..encoded.len() - 1]).is_err());
+        assert!(decode_navigation_status_body(&bad_count).is_err());
+        assert!(decode_navigation_status_body(&encoded[..encoded.len() - 1]).is_err());
         let mut bad_coordinate = encoded;
         bad_coordinate[count_at + 4..count_at + 12].copy_from_slice(&f64::NAN.to_be_bytes());
-        assert!(decode_navigation_state_body(&bad_coordinate).is_err());
+        assert!(decode_navigation_status_body(&bad_coordinate).is_err());
         message.local_path[0][0] = f64::INFINITY;
-        assert!(encode_navigation_state_body(&message).is_err());
+        assert!(encode_navigation_status_body(&message).is_err());
     }
 
     #[test]
@@ -3967,12 +4004,17 @@ sys.stdout.buffer.write(message.encode())
             transform
         );
 
-        let navigation = NavigationState {
+        let navigation = NavigationStatus {
             session_id: "session-1".into(),
             robot_frame: "base_link".into(),
             stamp_sec: 123,
             stamp_nsec: 456,
             state: 2,
+            goal_status: NAVIGATION_GOAL_STATUS_EXECUTING,
+            reason: "正在执行".into(),
+            remaining_distance_m: 3.75,
+            input_ready: true,
+            no_feasible_path: false,
             goal: [1.0, 2.0, 0.5],
             current: [0.5, 1.0, 0.25],
             progress: 0.75,
@@ -3995,20 +4037,20 @@ sys.stdout.buffer.write(message.encode())
             planner_runtime_generation: 13,
             local_path: vec![[0.5, 1.0, 0.4], [1.0, 2.0, 0.6]],
         };
-        let encoded = encode_navigation_state(&navigation).unwrap();
-        assert_eq!(&encoded[..8], &NAVIGATION_STATE_FINGERPRINT);
-        assert_eq!(decode_navigation_state(&encoded).unwrap(), navigation);
+        let encoded = encode_navigation_status(&navigation).unwrap();
+        assert_eq!(&encoded[..8], &NAVIGATION_STATUS_FINGERPRINT);
+        assert_eq!(decode_navigation_status(&encoded).unwrap(), navigation);
         assert_eq!(
-            decode_navigation_state_body(&encode_navigation_state_body(&navigation).unwrap())
+            decode_navigation_status_body(&encode_navigation_status_body(&navigation).unwrap())
                 .unwrap(),
             navigation
         );
 
         let mut legacy_fingerprint = encoded.clone();
         legacy_fingerprint[..8].copy_from_slice(&0x9ea3_f3f5_fd5a_fbda_u64.to_be_bytes());
-        assert!(decode_navigation_state(&legacy_fingerprint).is_err());
+        assert!(decode_navigation_status(&legacy_fingerprint).is_err());
 
-        let mut legacy_body = encode_navigation_state_body(&navigation).unwrap();
+        let mut legacy_body = encode_navigation_status_body(&navigation).unwrap();
         let receipt_bytes = [
             navigation.pose_source_timestamp_ns.to_be_bytes(),
             navigation.costmap_source_timestamp_ns.to_be_bytes(),
@@ -4017,9 +4059,9 @@ sys.stdout.buffer.write(message.encode())
         let receipt_offset = legacy_body
             .windows(receipt_bytes.len())
             .position(|window| window == receipt_bytes)
-            .expect("receipt fields in NavigationState body");
+            .expect("receipt fields in NavigationStatus body");
         legacy_body.drain(receipt_offset..receipt_offset + receipt_bytes.len());
-        assert!(decode_navigation_state_body(&legacy_body).is_err());
+        assert!(decode_navigation_status_body(&legacy_body).is_err());
 
         let cancel = CancelNavigation {
             session_id: "session-1".into(),

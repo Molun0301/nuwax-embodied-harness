@@ -92,12 +92,11 @@ pub fn read(path: &Path) -> Result<Vec<ForbiddenZone>, String> {
     }
     Ok(document.zones)
 }
-pub fn overlay(
-    path: &Path,
+pub(crate) fn overlay_zones(
+    zones: &[ForbiddenZone],
     grid: &nuwax_mapping::OccupancyGrid,
     data: &mut [u8],
 ) -> Result<(), String> {
-    let zones = read(path)?;
     let raw = MapState {
         width: grid.width as u32,
         height: grid.height as u32,
@@ -107,7 +106,12 @@ pub fn overlay(
         data: data.iter().map(|v| *v as i8).collect(),
     };
     validate_map_layout(&raw)?;
-    let effective = rasterize_effective_map(raw, &LoadedForbiddenZones { zones });
+    let effective = rasterize_effective_map(
+        raw,
+        &LoadedForbiddenZones {
+            zones: zones.to_vec(),
+        },
+    );
     for (out, value) in data.iter_mut().zip(effective.data) {
         *out = value as u8;
     }

@@ -85,6 +85,11 @@ impl GeometryRuntime for GeometryApi {
         request: Request<RelocalizeRequest>,
     ) -> Result<Response<RelocalizationResult>, Status> {
         let request = request.into_inner();
+        if request.seed.is_some()
+            && self.session.state().info.as_ref().unwrap().pipeline != "slam_2d"
+        {
+            return Err(Status::invalid_argument("三维重定位不接受初值"));
+        }
         if let Some(seed) = &request.seed {
             if ![seed.x, seed.y, seed.yaw].iter().all(|v| v.is_finite()) {
                 return Err(Status::invalid_argument("重定位初值必须为有限数值"));
@@ -279,3 +284,7 @@ fn validate_pose(pose: &Pose) -> Result<(), Status> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "api_behavior_tests.rs"]
+mod behavior_tests;

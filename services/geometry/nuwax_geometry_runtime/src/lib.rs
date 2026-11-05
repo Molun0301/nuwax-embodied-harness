@@ -24,6 +24,7 @@ mod native_lio_owner;
 mod nav_bridge;
 mod outputs;
 mod persistent_occupancy;
+mod planar_navigation;
 mod pointcloud;
 mod rpc_runtime;
 mod self_cloud;
@@ -109,6 +110,27 @@ async fn shutdown_signal() {
 }
 
 pub fn main() -> ExitCode {
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new("--print-release-artifacts"))
+    {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema_version": "nuwax.geometry.embedded-artifacts.v1",
+                "artifacts": [
+                    {
+                        "role": "native_pgo_payload",
+                        "path": nuwax_nav_pgo_bridge::discovery_native_executable(),
+                    },
+                    {
+                        "role": "group_guardian",
+                        "path": nuwax_nav_pgo_bridge::discovery_group_guardian_executable(),
+                    },
+                ],
+            })
+        );
+        return ExitCode::SUCCESS;
+    }
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),

@@ -1,6 +1,6 @@
 //! FAR Planner typed native bridge
 //!
-//! 生产 worker 使用真实 liblcm 消费 `GoalEnvelope`/`CancelNavigation`，
+//! 生产 worker 使用真实 liblcm 消费 `NavigationGoal`/`CancelNavigation`，
 //! 仅向 FAR 私有 topic 发布算法结果和 typed worker event。canonical
 //! `PathEnvelope` 由 nav-stack 的唯一 integration owner 统一封装。
 //!

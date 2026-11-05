@@ -107,9 +107,9 @@ fn goal_pose_registry_is_the_versioned_goal_envelope_contract() {
     assert_eq!(platform, "NUWAX_LCM_CHANNEL_GOAL_POSE");
     assert_eq!(
         format!("{default_channel}#{expected_type}"),
-        "/nav/goal#nuwax_msgs.GoalEnvelope"
+        "/nav/goal#nuwax_msgs.NavigationGoal"
     );
-    assert_eq!(expected_type, "nuwax_msgs.GoalEnvelope");
+    assert_eq!(expected_type, "nuwax_msgs.NavigationGoal");
     assert_eq!(CHANNEL_KEY_TABLE.len(), ChannelKey::ALL.len());
     let keys: std::collections::HashSet<_> = CHANNEL_KEY_TABLE.iter().map(|row| row.0).collect();
     assert_eq!(keys.len(), ChannelKey::ALL.len());

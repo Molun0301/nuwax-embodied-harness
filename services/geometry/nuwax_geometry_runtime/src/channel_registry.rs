@@ -124,13 +124,13 @@ const CHANNEL_KEY_TABLE: &[(ChannelKey, &str, &str, &str)] = &[
         ChannelKey::GoalPose,
         "NUWAX_LCM_CHANNEL_GOAL_POSE",
         "/nav/goal",
-        "nuwax_msgs.GoalEnvelope",
+        "nuwax_msgs.NavigationGoal",
     ),
     (
         ChannelKey::NavState,
         "NUWAX_LCM_CHANNEL_NAV_STATE",
         "/nav/state",
-        "nuwax_msgs.NavigationState",
+        "nuwax_msgs.NavigationStatus",
     ),
     (
         ChannelKey::Frontiers,

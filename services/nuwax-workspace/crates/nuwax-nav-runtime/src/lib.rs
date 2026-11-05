@@ -262,6 +262,10 @@ pub struct SchedulerStatus {
     pub message: String,
     /// 当前目标的局部规划轨迹，仅用于显示。
     pub local_path: Vec<[f64; 3]>,
+    /// 沿已接受路线，从当前位姿到末端的剩余距离。
+    pub remaining_distance_m: f64,
+    /// 当前规划结果明确没有可行路线。
+    pub no_feasible_path: bool,
     /// In-process execution evidence; never grants motion or extends a wait.
     pub surface_replan_feedback: Option<SurfaceReplanFeedback>,
 }
@@ -284,6 +288,8 @@ impl Default for SchedulerStatus {
             last_terminal: None,
             message: "idle".into(),
             local_path: Vec::new(),
+            remaining_distance_m: 0.0,
+            no_feasible_path: false,
             surface_replan_feedback: None,
         }
     }
@@ -343,7 +349,7 @@ pub enum RuntimeError {
     #[error("motion guard operation failed: {0}")]
     Motion(String),
     /// 守卫明确没有授予本目标租约；该目标可以失败并释放尚未执行的责任。
-    #[error("LEASE_NOT_GRANTED: {0}")]
+    #[error("{0}")]
     LeaseNotGranted(String),
     /// Planner reported a terminal failure.
     #[error("planner failed: {0}")]
@@ -994,7 +1000,7 @@ where
                 InputKind::UpdateCostmap(map, _) => ("scheduler.input.map", map.source_timestamp_ns),
                 // Runtime owns no recent source timestamp; record its actual incoming bound.
                 InputKind::UpdateObstacleSource(_, _, _, _) => ("scheduler.input.recent", 0),
-                InputKind::PlanningDiagnostic(_, _, _, _) => ("scheduler.input.planning_diagnostic", 0),
+                InputKind::PlanningDiagnostic(_, _, _, _, _) => ("scheduler.input.planning_diagnostic", 0),
                 InputKind::CapturePlanningActual(_, _) => ("scheduler.input.capture_actual", 0),
             };
             sink.mark("scheduler.input.dequeue", source);
@@ -1046,10 +1052,11 @@ where
                 let _ = reply.send(context);
                 Ok(())
             }
-            InputKind::PlanningDiagnostic(goal_id, key, message, failed) => {
+            InputKind::PlanningDiagnostic(goal_id, key, message, failed, no_feasible_path) => {
                 if matches!(self.status.phase,SchedulerPhase::AwaitingPath | SchedulerPhase::Controlling)
                     && self.session.as_ref().is_some_and(|session|
                         session.session_id == goal_id && session.execution_identity.goal_key() == key) {
+                    self.status.no_feasible_path = no_feasible_path;
                     if failed {
                         self.status.message=message.clone();self.publish_status(status_tx);
                         let result=self.finish_terminal(status_tx,TerminalOutcome::PlannerFailed,SchedulerPhase::Failed).await;
@@ -1272,6 +1279,7 @@ where
         self.planner.set_goal_log_context(&session.session_id);
         self.planner.configure_boundary(&session.boundary);
         self.planner.observe_measured_motion(self.motion.measured_motion());
+        self.status.no_feasible_path = false;
         self.status.applied_commands = 0;
         self.status.session_id = Some(session.session_id.clone());
         self.session = Some(session);
@@ -1368,6 +1376,7 @@ where
         // 等待预算在真正执行有效控制步骤后清除，不能靠反复投递无效新路径续期。
         self.status.phase = SchedulerPhase::Controlling;
         self.status.path_revision = self.current_path_revision;
+        self.status.no_feasible_path = false;
         self.status.message = "versioned path accepted".into();
         self.publish_status(status_tx);
         Ok(())
@@ -1828,7 +1837,7 @@ where
         self.status.path_revision = 0;
         self.status.last_terminal = Some(terminal);
         self.status.message = if terminal == TerminalOutcome::Stopped {
-            "STOPPED: 已被停止".into()
+            "已被停止".into()
         } else { format!("{terminal:?}，租约已释放") };
         if let Some(reason) = failure_reason {
             self.status.message = format!("{reason}; {}", self.status.message);
@@ -1860,8 +1869,44 @@ where
         } else {
             status.local_path.clear();
         }
+        status.remaining_distance_m = match (&self.current_path, &self.latest_pose) {
+            (Some((path, _)), Some(pose)) => {
+                let points: Vec<[f64; 3]> = match path {
+                    ExecutionPath::Planar(path) => path.points.iter().map(|p| [p.x, p.y, 0.0]).collect(),
+                    ExecutionPath::Surface(path) => path.poses.iter().map(|p| [p.pose.position.x, p.pose.position.y, p.pose.position.z]).collect(),
+                };
+                let z = if matches!(path, ExecutionPath::Surface(_)) { pose.pose.position.z } else { 0.0 };
+                remaining_route_distance(&points, [pose.pose.position.x, pose.pose.position.y, z])
+            }
+            _ => 0.0,
+        };
         status_tx.send_replace(status);
     }
+}
+
+/// 从路线中离当前位姿最近的投影点开始累计，保留弯折与三维高度。
+fn remaining_route_distance(points: &[[f64; 3]], position: [f64; 3]) -> f64 {
+    let distance = |a: [f64; 3], b: [f64; 3]| a.iter().zip(b).map(|(a, b)| (a-b).powi(2)).sum::<f64>().sqrt();
+    let mut best = f64::INFINITY;
+    let mut remaining = 0.0;
+    let mut tail = 0.0;
+    for segment in points.windows(2).rev() {
+        let start = segment[0];
+        let end = segment[1];
+        let delta = [end[0]-start[0], end[1]-start[1], end[2]-start[2]];
+        let length = distance(start, end);
+        let fraction = if length > 0.0 {
+            ((0..3).map(|i| (position[i]-start[i])*delta[i]).sum::<f64>() / length.powi(2)).clamp(0.0, 1.0)
+        } else { 0.0 };
+        let projected = [start[0]+fraction*delta[0], start[1]+fraction*delta[1], start[2]+fraction*delta[2]];
+        let deviation = distance(position, projected);
+        if deviation < best {
+            best = deviation;
+            remaining = tail + length*(1.0-fraction);
+        }
+        tail += length;
+    }
+    remaining
 }
 
 /// Cloneable command handle for a spawned scheduler.
@@ -2022,11 +2067,11 @@ impl NavSchedulerHandle {
 
     /// 全局拥有方确认无法继续逼近时沿当前会话的原停车围栏结束。
     pub async fn report_planning_failure(&self,goal_id:String,key:GoalKey,message:String)->Result<(),RuntimeError> {
-        self.send_input(InputKind::PlanningDiagnostic(goal_id,key,message,true)).await
+        self.send_input(InputKind::PlanningDiagnostic(goal_id,key,message,true,false)).await
     }
     /// 规划诊断按原目标身份关联，仅更新等待路径阶段，不能覆盖执行或终态。
-    pub async fn report_planning_diagnostic(&self,goal_id:String,key:GoalKey,message:String)->Result<(),RuntimeError> {
-        self.send_input(InputKind::PlanningDiagnostic(goal_id,key,message,false)).await
+    pub async fn report_planning_diagnostic(&self,goal_id:String,key:GoalKey,message:String,no_feasible_path:bool)->Result<(),RuntimeError> {
+        self.send_input(InputKind::PlanningDiagnostic(goal_id,key,message,false,no_feasible_path)).await
     }
 
     /// Read the latest scheduler status.
@@ -2050,7 +2095,7 @@ impl NavSchedulerHandle {
                 InputKind::UpdateOdometry(pose, _, _) | InputKind::UpdateSourceOdometry(pose, _, _) => ("scheduler.send.pose", pose.stamp.nanos),
                 InputKind::UpdateCostmap(map, _) => ("scheduler.send.map", map.source_timestamp_ns),
                 InputKind::UpdateObstacleSource(_, _, _, _) => ("scheduler.send.recent", 0),
-                InputKind::PlanningDiagnostic(_, _, _, _) => ("scheduler.send.planning_diagnostic", 0),
+                InputKind::PlanningDiagnostic(_, _, _, _, _) => ("scheduler.send.planning_diagnostic", 0),
                 InputKind::CapturePlanningActual(_, _) => ("scheduler.send.capture_actual", 0),
             };
             if let InputKind::UpdateObstacleSource(_, _, bound, _) = &kind {
@@ -2225,7 +2270,7 @@ enum InputKind {
     UpdateSourceOdometry(PoseStamped, Instant, Duration),
     UpdateCostmap(CostmapObservation, Instant),
     UpdateObstacleSource(Option<ExecutionMap>,bool,Option<CommandDispatchBound>,Option<Option<Arc<RegisteredFrame>>>),
-    PlanningDiagnostic(String, GoalKey, String, bool),
+    PlanningDiagnostic(String, GoalKey, String, bool, bool),
     CapturePlanningActual(PathExecutionIdentity, oneshot::Sender<Option<Arc<ActualExecutionContext>>>),
 }
 
@@ -2648,7 +2693,7 @@ mod tests {
         scheduler.start_session(&status, session_for("goal-2")).await.unwrap();
         let (reply, received) = oneshot::channel();
         scheduler.handle_input(&status, InputCommand { kind: InputKind::PlanningDiagnostic(
-            "goal-2".into(), execution_identity_for("goal-2", 0).goal_key(), "新目标无可行路径".into(), true), reply }).await;
+            "goal-2".into(), execution_identity_for("goal-2", 0).goal_key(), "新目标无可行路径".into(), true, false), reply }).await;
         received.await.unwrap().unwrap();
         assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::PlannerFailed));
         assert!(scheduler.status.message.contains("新目标无可行路径"));
@@ -2662,12 +2707,12 @@ mod tests {
         let (handle,task)=spawn_scheduler(NavScheduler::new(motion,FakePlanner::commanding(),SchedulerConfig::default()).unwrap());
         handle.update_odometry(map_pose()).await.unwrap();handle.update_costmap(costmap_at(1)).await.unwrap();
         handle.start_session(session()).await.unwrap();
-        handle.report_planning_diagnostic("goal-1".into(),execution_identity_for("goal-1",0).goal_key(),"等待路径：起点支撑不足".into()).await.unwrap();
+        handle.report_planning_diagnostic("goal-1".into(),execution_identity_for("goal-1",0).goal_key(),"等待路径：起点支撑不足".into(),false).await.unwrap();
         handle.update_odometry(map_pose_at(2)).await.unwrap();
-        handle.report_planning_diagnostic("goal-1".into(),GoalKey {producer_runtime_generation:9,goal_generation:1},"旧目标的错误".into()).await.unwrap();
+        handle.report_planning_diagnostic("goal-1".into(),GoalKey {producer_runtime_generation:9,goal_generation:1},"旧目标的错误".into(),false).await.unwrap();
         assert_eq!(handle.status().message,"等待路径：起点支撑不足");
         handle.cancel("goal-1").await.unwrap();
-        handle.report_planning_diagnostic("goal-1".into(),execution_identity_for("goal-1",0).goal_key(),"晚到报告".into()).await.unwrap();
+        handle.report_planning_diagnostic("goal-1".into(),execution_identity_for("goal-1",0).goal_key(),"晚到报告".into(),false).await.unwrap();
         assert_eq!(handle.status().last_terminal,Some(TerminalOutcome::Cancelled));
         handle.shutdown().await.unwrap();task.await.unwrap().unwrap();
     }
@@ -4492,4 +4537,13 @@ mod tests {
 
     include!("dispatch_handoff_tests.rs");
 
+}
+
+#[cfg(test)]
+#[test]
+fn remaining_route_distance_preserves_bends_and_height() {
+    let route = [[0.0, 0.0, 0.0], [3.0, 0.0, 0.0], [3.0, 4.0, 0.0], [3.0, 4.0, 2.0]];
+    assert!((remaining_route_distance(&route, [1.0, 0.0, 0.0])-8.0).abs()<1e-12);
+    assert!((remaining_route_distance(&route, [3.0, 2.0, 0.0])-4.0).abs()<1e-12);
+    assert_eq!(remaining_route_distance(&route, [3.0, 4.0, 2.0]), 0.0);
 }

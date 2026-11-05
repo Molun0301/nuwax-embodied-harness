@@ -540,40 +540,76 @@ pub(crate) fn run_requested() -> Option<Result<(), String>> {
     {
         return None;
     }
-    Some((|| {
-        if args.len() != 4 {
-            return Err("用法：--cleanup-completed-cloud <源地图名> <目标地图名>".into());
-        }
-        let source = args[2].to_str().ok_or("源地图名不是有效文本")?;
-        let target = args[3].to_str().ok_or("目标地图名不是有效文本")?;
-        cleanup_maps(source, target)
-    })())
+    Some(run_command(
+        &args[2..],
+        &crate::map_store::MapStore::from_env(),
+    ))
 }
-pub(crate) fn cleanup_maps(source: &str, target: &str) -> Result<(), String> {
-    fn name(value: &str) -> Result<(), String> {
-        if value.is_empty()
-            || value.chars().count() > 64
-            || value.starts_with('.')
-            || value
-                .chars()
-                .any(|c| c == '/' || c == '\0' || c.is_control())
-        {
-            Err("地图名无效".into())
-        } else {
+fn run_command(
+    args: &[std::ffi::OsString],
+    store: &crate::map_store::MapStore,
+) -> Result<(), String> {
+    let usage = "用法：--cleanup-completed-cloud preview --map <源地图名> --strength <0-100> --out <工作目录>；apply --work <工作目录> --map <目标地图名>";
+    let mut map = None;
+    let mut strength = None;
+    let mut work = None;
+    let operation = args.first().and_then(|arg| arg.to_str()).ok_or(usage)?;
+    for pair in args.get(1..).unwrap_or_default().chunks(2) {
+        let [flag, value] = pair else {
+            return Err(usage.into());
+        };
+        match flag.to_str() {
+            Some("--map") => map = Some(value.to_str().ok_or("地图名不是有效文本")?),
+            Some("--strength") if operation == "preview" => {
+                let value: u8 = value.to_str().ok_or(usage)?.parse().map_err(err)?;
+                if value > 100 {
+                    return Err("清理力度必须在0至100之间".into());
+                }
+                strength = Some(value);
+            }
+            Some("--out") if operation == "preview" => work = Some(Path::new(value)),
+            Some("--work") if operation == "apply" => work = Some(Path::new(value)),
+            _ => return Err(usage.into()),
+        }
+    }
+    let map = map.ok_or(usage)?;
+    map_name(map)?;
+    let work = work.ok_or(usage)?;
+    match operation {
+        "preview" => preview_map(store, map, strength.ok_or(usage)?, work),
+        "apply" => {
+            let snapshot = crate::map_store::MapStore::new(work.to_path_buf())
+                .load("candidate")
+                .map_err(err)?;
+            store.save(map, None, snapshot).map_err(err)?;
             Ok(())
         }
+        _ => Err(usage.into()),
     }
-    name(source)?;
-    name(target)?;
-    let store = crate::map_store::MapStore::from_env();
-    if store.exists(target) {
-        return Err(format!("目标地图已存在：{target}"));
+}
+fn map_name(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.chars().count() > 64
+        || value.starts_with('.')
+        || value
+            .chars()
+            .any(|c| c == '/' || c == '\0' || c.is_control())
+    {
+        Err("地图名无效".into())
+    } else {
+        Ok(())
     }
+}
+fn preview_map(
+    store: &crate::map_store::MapStore,
+    source: &str,
+    strength_percent: u8,
+    work: &Path,
+) -> Result<(), String> {
     let mut snapshot = store.load(source).map_err(err)?;
     let source_dir = store.root().join(source).join("geometry");
-    let scratch = store
-        .root()
-        .join(format!(".cleanup-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(work).map_err(err)?;
+    let scratch = work.join(".cleanup-input");
     std::fs::create_dir(&scratch).map_err(err)?;
     let _guard = CleanupDirectory(scratch.clone());
     let grid = snapshot.occupancy.as_ref().ok_or("源地图没有占据栅格")?;
@@ -597,12 +633,13 @@ pub(crate) fn cleanup_maps(source: &str, target: &str) -> Result<(), String> {
     };
     let poses_path = scratch.join("final-poses.json");
     serde_json::to_writer(File::create(&poses_path).map_err(err)?, &poses).map_err(err)?;
-    let output = scratch.join("result");
+    let output = work.join(".cleanup-result");
+    let _output_guard = CleanupDirectory(output.clone());
     let request = Request {
         fine: fine_file,
         dense: source_dir.join("dense.bin"),
         output: output.clone(),
-        strength_percent: 50,
+        strength_percent,
         scan_log: None,
         scan_logs: snapshot
             .scans
@@ -631,6 +668,7 @@ pub(crate) fn cleanup_maps(source: &str, target: &str) -> Result<(), String> {
         metadata.cloud_revision,
         &metadata.session_id,
     );
+    snapshot.cloud.revision = metadata.cloud_revision;
     snapshot.cloud.display = std::fs::read(output.join("cloud.xyzf32"))
         .map_err(err)?
         .into();
@@ -640,7 +678,17 @@ pub(crate) fn cleanup_maps(source: &str, target: &str) -> Result<(), String> {
             grid.data = std::fs::read(output.join("occupancy.bin")).map_err(err)?;
         }
     }
-    store.save(target, None, snapshot).map_err(err)?;
+    for (source, target) in [
+        ("preview.json", "preview.json"),
+        ("source.xyzf32", "source.xyzf32"),
+        ("candidates.xyzf32", "candidates.xyzf32"),
+        ("cloud.xyzf32", "result.xyzf32"),
+    ] {
+        std::fs::copy(output.join(source), work.join(target)).map_err(err)?;
+    }
+    crate::map_store::MapStore::new(work.to_path_buf())
+        .save("candidate", None, snapshot)
+        .map_err(err)?;
     Ok(())
 }
 struct CleanupDirectory(PathBuf);

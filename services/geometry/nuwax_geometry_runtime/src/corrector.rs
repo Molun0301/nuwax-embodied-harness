@@ -123,13 +123,7 @@ impl Corrector {
             Mode::Relocalization => Ok(None),
         }
     }
-    pub async fn relocalize(
-        mapper: &Mapper,
-        seed: Option<proto::PlanarSeed>,
-    ) -> Result<proto::RelocalizationResult, tonic::Status> {
-        if seed.is_some() {
-            return Err(tonic::Status::invalid_argument("三维重定位不接受初值"));
-        }
+    pub async fn relocalize(mapper: &Mapper) -> Result<proto::RelocalizationResult, tonic::Status> {
         let backend = mapper.correction_backend();
         if matches!(backend, "library_pgo" | "native_pgo") {
             return Err(tonic::Status::failed_precondition(
@@ -187,35 +181,8 @@ impl Corrector {
                         .map(move |p| odom * Point3::from(*p))
                 })
                 .collect();
-            let config = RelocalizationConfig::default();
-            let seeded: Vec<_> = source.iter().map(|point| initial * point).collect();
-            let local = IcpSolver::new(IcpConfig {
-                max_correspondence_distance: config.voxel_sizes.into_iter().fold(0., f64::max),
-                ..config.icp
-            })
-            .align(&seeded, &target_points);
-            let local_transform = local.transformation * initial;
-            let score = evaluate_alignment(
-                &source,
-                &target_points,
-                local_transform,
-                config.fine_correspondence_distance,
-            );
-            let (transform, fitness, succeeded) = if local.mse.is_finite()
-                && score.inlier_count >= config.min_final_inliers
-                && score.fitness >= config.min_final_fitness
-                && score.rmse.is_finite()
-                && is_upright(&local_transform, GRAVITY_TILT_MAX_DEG)
-            {
-                (local_transform, score.rmse * score.rmse, true)
-            } else {
-                let global = relocation_pipeline_with_config(&source, &target_points, config);
-                (
-                    global.registration.transformation,
-                    global.registration.mse,
-                    global.registration.converged,
-                )
-            };
+            let (transform, fitness, succeeded) =
+                compute_relocalization(&source, &target_points, initial);
             let last = frames.last().unwrap();
             let result = proto::RelocalizationResult {
                 succeeded,
@@ -253,6 +220,45 @@ impl Corrector {
         Ok(result)
     }
 }
+fn compute_relocalization(
+    source: &[Point3<f64>],
+    target: &[Point3<f64>],
+    initial: Isometry3<f64>,
+) -> (Isometry3<f64>, f64, bool) {
+    let config = RelocalizationConfig::default();
+    let seeded: Vec<_> = source.iter().map(|point| initial * point).collect();
+    let local = IcpSolver::new(IcpConfig {
+        max_correspondence_distance: config.voxel_sizes.into_iter().fold(0., f64::max),
+        ..config.icp
+    })
+    .align(&seeded, target);
+    let local_transform = local.transformation * initial;
+    let score = evaluate_alignment(
+        source,
+        target,
+        local_transform,
+        config.fine_correspondence_distance,
+    );
+    if local.mse.is_finite()
+        && score.inlier_count >= config.min_final_inliers
+        && score.fitness >= config.min_final_fitness
+        && score.rmse.is_finite()
+        && is_upright(&local_transform, GRAVITY_TILT_MAX_DEG)
+    {
+        (local_transform, score.rmse * score.rmse, true)
+    } else {
+        let global = relocation_pipeline_with_config(source, target, config);
+        (
+            global.registration.transformation,
+            global.registration.mse,
+            global.registration.converged,
+        )
+    }
+}
+
+#[cfg(test)]
+#[path = "corrector_tests.rs"]
+mod tests;
 fn failed(message: &str, frames_used: u32) -> proto::RelocalizationResult {
     proto::RelocalizationResult {
         succeeded: false,

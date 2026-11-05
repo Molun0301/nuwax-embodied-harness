@@ -14,14 +14,21 @@ use tonic::Status;
 pub(crate) struct NativeInputDelivery {
     sequence: i32,
     last_imu_timestamp_ns: Option<u64>,
+    failure: Option<Status>,
 }
 impl NativeInputDelivery {
+    pub(crate) fn has_failed(&self) -> bool {
+        self.failure.is_some()
+    }
     pub(crate) async fn publish(
         &mut self,
         transport: &LcmTransport,
         channels: &NativePrivateChannels,
         request: &PublishPointCloudRequest,
     ) -> Result<(), Status> {
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
         validate_native_raw_pointcloud_fields(request)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         if request.imu_samples.is_empty() {
@@ -38,10 +45,12 @@ impl NativeInputDelivery {
             if let Some(previous) = latest {
                 // 与原生前端 scan_imu_buffer.hpp 的既有物理缺测上限一致。
                 if sample.timestamp_ns > previous && sample.timestamp_ns - previous > 500_000_000 {
-                    return Err(Status::failed_precondition(format!(
+                    let error = Status::failed_precondition(format!(
                         "惯性源时间断档：{}纳秒",
                         sample.timestamp_ns - previous
-                    )));
+                    ));
+                    self.failure = Some(error.clone());
+                    return Err(error);
                 }
             }
             latest = Some(latest.map_or(sample.timestamp_ns, |last| last.max(sample.timestamp_ns)));

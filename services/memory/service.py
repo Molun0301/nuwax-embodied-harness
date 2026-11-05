@@ -22,7 +22,7 @@ from services.memory.navigation import NavigationMixin
 from services.memory.places import PlacesMixin
 from services.memory.query import QueryMixin
 from services.memory.scenes import ScenesMixin
-from services.memory.store import MemorySnapshot, MODELS
+from services.memory.store import MemorySnapshot, MemoryStore, MODELS
 from services.memory.instance_association_service import InstanceAssociationService
 from services.memory.inspection_pose_planner import InspectionPosePlanner
 from services.memory.vision_to_map_projection_service import VisionToMapProjectionService
@@ -126,15 +126,31 @@ class MemoryService(PlacesMixin, ScenesMixin, InstancesMixin, QueryMixin, Naviga
     def delete_library(self, name):
         import shutil
         def delete(store):
-            if store is not None and store.name == name:
+            was_active = store is not None and store.name == name
+            directory = store.directory if was_active else self._directory(name)
+            snapshot = (store.snapshot(name) if was_active else
+                        MemorySnapshot.from_directory(directory, name=name))
+            fields = {"location": "tagged_location_count", "memory": "semantic_memory_count",
+                "instance": "semantic_instance_count", "observation": "observation_event_count",
+                "scene_space": "scene_space_count", "trajectory": "navigation_trajectory_count",
+                "relation": "semantic_graph_relation_count", "summary": "semantic_summary_count"}
+            counts = {field: len(snapshot.records[kind]) for kind, field in fields.items()}
+            counts["artifact_count"] = sum(path.is_file() for path in (directory / "photos").glob("*"))
+            if was_active:
                 store.close()
                 self._writer.store = None
-            directory = self._directory(name)
             existed = directory.is_dir()
             if existed:
                 shutil.rmtree(directory)
-            return {"library_name": name, "deleted": existed}
-        return self._writer.call(delete, transaction=False)
+            # 清空当前库后继续使用同名库，默认库也沿用其真实目录。
+            if was_active:
+                self._writer.store = MemoryStore(directory, name=name)
+            return {"library_name": name, "deleted": existed, "was_active": was_active,
+                    "deleted_counts": counts, "recreated": was_active}
+        result = self._writer.call(delete, transaction=False)
+        self._publish_memory_event("memory.library_deleted", f"记忆库 {name} 的删除处理已完成。",
+            payload={**result, "summary": self.get_summary().model_dump(mode="json")})
+        return result
 
     def wait_for_library(self, name, ctx):
         with self._condition:

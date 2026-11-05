@@ -222,7 +222,6 @@ def write_runtime(
         "NUWAX_NAV_AUTOSTART": "navigation" in selected,
         "NUWAX_PERSON_FOLLOW_AUTOSTART": "follow" in selected,
         "NUWAX_PERCEPTION_YOLO_WORLD_ENABLED": perception,
-        "NUWAX_PERCEPTION_STREAM_ENABLED": perception,
         "NUWAX_PERCEPTION_KEYFRAME_REMEMBER_ENABLED": perception and memory,
         "GO2_DATA_PLANE_ENABLED": robot == "go2",
         "GO2_DIRECT_DDS_ENABLED": robot == "go2",
@@ -238,7 +237,6 @@ def write_runtime(
     local_only = {
         "NUWAX_PERCEPTION_OPENAI_ENABLED": "false",
         "NUWAX_PERCEPTION_SEGMENTATION_ENABLED": "false",
-        "NUWAX_PERCEPTION_STREAM_AUTO_START": "false",
         "NUWAX_PERCEPTION_DEFAULT_DETECTOR_BACKEND": "yolo_world" if perception else "metadata_detector",
         "NUWAX_PERCEPTION_STREAM_DETECTOR_BACKEND": "yolo_world" if perception else "metadata_detector",
         "NUWAX_PERCEPTION_DEFAULT_SCENE_BACKEND": "simple_scene",

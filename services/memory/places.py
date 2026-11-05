@@ -6,6 +6,9 @@ from core.errors import GatewayError
 from services.memory.semantic_map.room_segmentation import pose_in_scene_space
 
 
+CURRENT_POSE = object()
+
+
 class PlacesMixin:
     def list_tagged_locations(self, *, limit=None, library_name=None):
         records = self.library_snapshot(library_name).read("location")
@@ -13,15 +16,16 @@ class PlacesMixin:
 
     def tag_location(self, name, *, map_name, aliases=None, description=None, camera_id=None,
                      attach_latest_observation=True, attach_latest_perception=True, auto_create_memory=True,
-                     metadata=None, perception_context=None, observation_pose=None, frame_tree=None,
+                     metadata=None, perception_context=None, observation_context=None, observation_pose=CURRENT_POSE, frame_tree=None,
                      image_bytes=None):
-        pose = self._as_memory_pose(observation_pose if observation_pose is not None else self.current_pose())
+        pose = self._as_memory_pose(self.current_pose() if observation_pose is CURRENT_POSE else observation_pose)
         if pose is None:
             raise GatewayError("当前没有可用定位结果，无法标记地点", error_code="pose_unavailable", http_status=409)
         perception = ((perception_context if perception_context is not None
+                       else None if observation_context is not None
                        else self._perception_service.get_latest_full_perception(camera_id))
                       if attach_latest_perception else None)
-        observation = ((perception_context if perception_context is not None
+        observation = ((observation_context if observation_context is not None
                         else self._observation_service.get_latest_observation(camera_id))
                        if attach_latest_observation and perception is None else None)
         source = perception if perception is not None else observation

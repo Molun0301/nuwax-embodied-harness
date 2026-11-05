@@ -1,5 +1,6 @@
 """关键帧场景记忆和场景空间业务操作。"""
 from __future__ import annotations
+from services.memory.places import CURRENT_POSE
 from datetime import timedelta
 from contracts.base import utc_now
 from contracts.memory import SemanticMemoryEntry
@@ -85,12 +86,14 @@ class ScenesMixin:
         records.sort(key=lambda record: record.semantic_updated_at or record.timestamp, reverse=True)
         return tuple(records if limit is None or limit <= 0 else records[:limit])
 
-    def remember_current_scene(self, *, map_name, title=None, camera_id=None, summary_override=None, tags=None, linked_location_id=None, metadata=None, perception_context=None, observation_pose=None, image_bytes=None, frame_tree=None):
-        context = perception_context or self._perception_service.get_latest_full_perception(camera_id)
-        observation = None if context is not None else self._observation_service.get_latest_observation(camera_id)
+    def remember_current_scene(self, *, map_name, title=None, camera_id=None, summary_override=None, tags=None, linked_location_id=None, metadata=None, perception_context=None, observation_context=None, observation_pose=CURRENT_POSE, image_bytes=None, frame_tree=None):
+        context = (perception_context if perception_context is not None else
+            None if observation_context is not None else self._perception_service.get_latest_full_perception(camera_id))
+        observation = (observation_context if observation_context is not None else
+            None if context is not None else self._observation_service.get_latest_observation(camera_id))
         if context is None and observation is None:
             raise GatewayError('当前没有可写入记忆的观察或感知结果', error_code='observation_unavailable', http_status=409)
-        pose = self._as_memory_pose(observation_pose or self.current_pose())
+        pose = self._as_memory_pose(self.current_pose() if observation_pose is CURRENT_POSE else observation_pose)
         source = context if context is not None else observation
         headline = context.scene_summary.headline if context is not None else observation.observation.summary
         title = title if title is not None else (headline if context is not None else "观察记录：%s" % source.camera_id)

@@ -30,7 +30,6 @@
   "NUWAX_PERCEPTION_DEFERRED_XVAL_THRESHOLD_M": "三角化位置与点云位置相差超过此距离（米）时，降低该物品位置的置信度。",
   "NUWAX_PERCEPTION_DELAYED_PC_MIN_POINTS": "用延迟点云估计物品位置时至少需要的点数，不足时不采用点云结果。",
   "NUWAX_PERCEPTION_KEYFRAME_MIN_INTERVAL_SEC": "持续视频感知保存两个关键帧之间的最短时间（秒）。",
-  "NUWAX_PERCEPTION_STREAM_ENABLED": "允许运行持续视频感知（后台定时检测画面中的物品）；关闭后无法启动。",
   "NUWAX_PERCEPTION_TRIANGULATION_MIN_RAYS": "多视角三角化估计物品位置所需的最少观察射线数，至少2。",
   "NUWAX_PERCEPTION_YOLO_WORLD_ALIASES": "为检测类别补充同义词，格式“类别=别名1|别名2”，多组用逗号分隔，例如 cup=mug|水杯。",
   "NUWAX_PERCEPTION_YOLO_WORLD_MODEL": "检测模型文件路径：.pt 为 PyTorch 模型，可随时更换检测类别；.engine 为 TensorRT（推理加速）引擎，类别在导出时已固定。",
@@ -40,7 +39,6 @@
   "NUWAX_LCM_CHANNEL_POSE_STAMPED": "带时间戳的定位位姿消息通道，格式“/话题#消息类型”。",
   "NUWAX_GEOMETRY_EXTERNAL_PROVIDES_NAV": "在几何状态和元数据中声明几何运行时是否提供导航，仅作展示，不改变导航实际由谁运行。",
   "NUWAX_GEOMETRY_EXTERNAL_PROVIDES_TF": "在几何状态和元数据中声明几何运行时是否提供TF（坐标变换，如odom到base_link），仅作展示，不改变实际发布。",
-  "NUWAX_PERCEPTION_STREAM_SKIP_WHEN_LOCALIZATION": "定位模式下不自动启动持续视频感知；手动启动不受影响。",
   "NUWAX_GEOMETRY_EXTERNAL_ENABLED": "非系统服务托管时，网关启动脚本是否拉起几何运行进程并在退出后重启，关闭后需自行启动；系统服务托管时不起作用。",
   "NUWAX_GEOMETRY_RUNTIME_BINARY": "几何运行程序的可执行文件路径；留空时使用源码构建目录中的程序，安装部署时由安装程序写为发布目录bin下的程序。",
   "NUWAX_GEOMETRY_RUNTIME_PORT": "几何运行进程在本机监听的远程调用端口（1–65535）；启动器、就绪检查和网关连接都使用此端口。",
@@ -70,7 +68,6 @@
   "NUWAX_PERCEPTION_YOLO_WORLD_ENABLED": "启用 YOLO-World（开放词汇目标检测模型）识别画面中的物品。",
   "NUWAX_PERCEPTION_OPENAI_ENABLED": "启用兼容 OpenAI 接口的云端视觉模型分析画面；需同时配置服务地址、密钥和模型。",
   "NUWAX_PERCEPTION_SEGMENTATION_ENABLED": "启用实例分割，为检测到的物品生成轮廓；需先准备分割模型。",
-  "NUWAX_PERCEPTION_STREAM_AUTO_START": "网关启动时自动开启持续视频感知；需同时启用持续视频感知。",
   "NUWAX_PERCEPTION_STREAM_INTERVAL_SEC": "持续视频感知两次检测之间的间隔（秒，至少0.05）；越小越及时，计算负担越大。",
   "NUWAX_MAP_CATALOG_ROOT": "保存地图的目录，地图列表、激活和删除都在此目录下进行。",
   "DASHSCOPE_API_KEY": "DashScope（阿里云模型服务）向量模型的访问密钥。"

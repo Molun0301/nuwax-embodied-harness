@@ -5,11 +5,12 @@ from core.config_values import runtime_value
 from dataclasses import dataclass, replace
 import math
 import logging
-import os
 import queue
 import struct
 import threading
-from typing import Any, Callable, Mapping, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
+
+from services.navigation.motion_client import MotionLease
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -37,8 +38,6 @@ PERSON_FOLLOW_FAILED = 4
 _MAX_IDENTIFIER_BYTES = 255
 _MAX_QUERY_BYTES = 255
 _MAX_REASON_BYTES = 1024
-_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
-_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 
 
 class PersonFollowBridgeError(RuntimeError):
@@ -47,36 +46,6 @@ class PersonFollowBridgeError(RuntimeError):
 
 class PersonFollowBridgeUnavailable(PersonFollowBridgeError):
     pass
-
-
-class PersonFollowBridgeTimeout(PersonFollowBridgeError):
-    pass
-
-
-@dataclass(frozen=True)
-class PersonFollowReadiness:
-    enabled: bool
-    ready: bool
-    reason: str
-
-
-def _parse_enabled(value: Optional[str]) -> Optional[bool]:
-    normalized = str(value or "true").strip().lower()
-    if normalized in _TRUE_VALUES:
-        return True
-    if normalized in _FALSE_VALUES:
-        return False
-    return None
-
-
-def read_person_follow_readiness(
-    *, ready: bool = False, environ: Optional[Mapping[str, str]] = None,
-) -> PersonFollowReadiness:
-    """组件由监督者确保就绪，网关通信桥启动后即可使用。"""
-    source = os.environ if environ is None else environ
-    enabled = _parse_enabled(source.get("NUWAX_PERSON_FOLLOW_AUTOSTART"))
-    reason = "disabled" if enabled is False else "invalid_autostart_config" if enabled is None else "ready" if ready else "not_started"
-    return PersonFollowReadiness(enabled=enabled is not False, ready=enabled is True and ready, reason=reason)
 
 
 @dataclass(frozen=True)
@@ -137,38 +106,6 @@ class _ControlRequest:
     completed: threading.Event
     result: Any = None
     error: Optional[BaseException] = None
-
-
-@dataclass
-class _Preflight:
-    completed: threading.Event
-    target: PersonFollowTarget
-    phase: str = "tracked"
-    last_command_seq: int = 0
-    error: Optional[PersonFollowBridgeError] = None
-
-
-@dataclass(frozen=True)
-class _PreparedSession:
-    session_id: str
-    last_target_seq: int
-    cloud_revision: int
-    source_stamp: Tuple[int, int]
-    last_command_seq: int
-
-
-@dataclass
-class _SessionBinding:
-    session_id: str
-    session: Any
-    fence_session: Callable[[Any], Any]
-    next_target_seq: int
-    cloud_revision: int
-    last_source_stamp: Tuple[int, int]
-    last_command_seq: int
-    allow_preflight_stamp_once: bool = True
-    current_target: Optional[PersonFollowTarget] = None
-    last_accepted_target: Optional[PersonFollowTarget] = None
 
 
 def _typed_channel(channel: str, message_type: str) -> str:
@@ -509,630 +446,197 @@ def _default_lcm_factory(provider: str):
     return lcm.LCM(provider)
 
 
-class GatewayPersonFollowBridge:
-    """Single-threaded LCM bridge into one source-scoped motion-guard lease."""
+@dataclass
+class _Binding:
+    session_id: str
+    lease: MotionLease
+    target: Optional[PersonFollowTarget] = None
+    command: Optional[PersonFollowCommand] = None
+    error: Optional[BaseException] = None
 
-    def __init__(
-        self,
-        *,
-        lcm_url: Optional[str] = None,
-        target_channel: Optional[str] = None,
-        command_channel: Optional[str] = None,
-        lcm_factory: Callable[[str], Any] = _default_lcm_factory,
-        operation_timeout_sec: float = 1.0,
-        barrier_timeout_sec: float = 1.0,
-        poll_timeout_ms: int = 20,
-    ) -> None:
-        self.lcm_url = str(lcm_url or runtime_value("NUWAX_LCM_URL") or DEFAULT_LCM_URL)
-        self.target_channel = str(
-            target_channel or runtime_value("NUWAX_PERSON_FOLLOW_TARGET_CHANNEL") or DEFAULT_PERSON_FOLLOW_TARGET_CHANNEL
-        )
-        self.command_channel = str(
-            command_channel or runtime_value("NUWAX_PERSON_FOLLOW_COMMAND_CHANNEL") or DEFAULT_PERSON_FOLLOW_COMMAND_CHANNEL
-        )
+
+class GatewayPersonFollowBridge:
+    """一个线程拥有 LCM 连接，将原生跟随速度直接写入当前运动租约。"""
+
+    def __init__(self, *, lcm_url: Optional[str] = None, target_channel: Optional[str] = None,
+                 command_channel: Optional[str] = None, lcm_factory=_default_lcm_factory,
+                 poll_timeout_ms: int = 20) -> None:
+        self.lcm_url = lcm_url or runtime_value("NUWAX_LCM_URL") or DEFAULT_LCM_URL
+        self.target_channel = target_channel or runtime_value("NUWAX_PERSON_FOLLOW_TARGET_CHANNEL") or DEFAULT_PERSON_FOLLOW_TARGET_CHANNEL
+        self.command_channel = command_channel or runtime_value("NUWAX_PERSON_FOLLOW_COMMAND_CHANNEL") or DEFAULT_PERSON_FOLLOW_COMMAND_CHANNEL
         if self.command_channel in _FORBIDDEN_COMMAND_CHANNELS:
-            raise PersonFollowBridgeError(
-                "PersonFollow command output requires a dedicated channel; "
-                "/cmd_vel, /nav_cmd_vel, and /nav/cmd_vel are forbidden"
-            )
-        self._typed_target_channel = _typed_channel(self.target_channel, _TARGET_TYPE)
-        self._typed_command_channel = _typed_channel(self.command_channel, _COMMAND_TYPE)
-        if self._typed_target_channel == self._typed_command_channel:
-            raise PersonFollowBridgeError("target and command channels must be distinct")
-        if not math.isfinite(operation_timeout_sec) or operation_timeout_sec <= 0.0:
-            raise PersonFollowBridgeError("operation_timeout_sec must be positive")
-        if not math.isfinite(barrier_timeout_sec) or barrier_timeout_sec <= 0.0:
-            raise PersonFollowBridgeError("barrier_timeout_sec must be positive")
-        if isinstance(poll_timeout_ms, bool) or not 1 <= int(poll_timeout_ms) <= 1000:
-            raise PersonFollowBridgeError("poll_timeout_ms must be in [1, 1000]")
+            raise PersonFollowBridgeError("跟随速度必须使用独立 LCM 通道。")
+        self._target_channel = _typed_channel(self.target_channel, _TARGET_TYPE)
+        self._command_channel = _typed_channel(self.command_channel, _COMMAND_TYPE)
         self._lcm_factory = lcm_factory
-        self._operation_timeout_sec = float(operation_timeout_sec)
-        self._barrier_timeout_sec = float(barrier_timeout_sec)
-        self._poll_timeout_ms = int(poll_timeout_ms)
-        self._requests: queue.Queue[_ControlRequest] = queue.Queue()
+        self._poll_timeout_ms = poll_timeout_ms
+        self._requests = queue.Queue()
         self._ready = threading.Event()
-        self._stop_requested = threading.Event()
-        self._state_lock = threading.RLock()
-        self._thread: Optional[threading.Thread] = None
-        self._owner_thread_id: Optional[int] = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread = None
+        self._closed = False
         self._started = False
-        self._closing = False
-        self._fatal_error: Optional[PersonFollowBridgeError] = None
+        self._failure = None
         self._lcm = None
-        self._subscription = None
-        self._preflight: Optional[_Preflight] = None
-        self._prepared: Optional[_PreparedSession] = None
-        self._binding: Optional[_SessionBinding] = None
-        self._session_error: Optional[Tuple[str, PersonFollowBridgeError]] = None
+        self._binding = None
 
     @property
     def started(self) -> bool:
-        with self._state_lock:
+        with self._lock:
             return self._started
 
     def start(self) -> None:
-        with self._state_lock:
-            if self._started:
-                return
-            if self._thread is not None and self._thread.is_alive():
-                raise PersonFollowBridgeUnavailable("PersonFollow bridge is still starting")
-            self._ready.clear()
-            self._stop_requested.clear()
-            self._closing = False
-            self._fatal_error = None
-            thread = threading.Thread(
-                target=self._run,
-                name="gateway-person-follow-lcm",
-                daemon=True,
-            )
-            self._thread = thread
-            thread.start()
-        if not self._ready.wait(self._operation_timeout_sec):
-            self._stop_requested.set()
-            thread.join(timeout=self._operation_timeout_sec)
-            raise PersonFollowBridgeTimeout("PersonFollow LCM bridge startup timed out")
-        with self._state_lock:
-            error = self._fatal_error
-            started = self._started
-        if error is not None:
-            raise error
-        if not started:
-            raise PersonFollowBridgeUnavailable("PersonFollow LCM bridge did not start")
+        with self._lock:
+            if self._closed:
+                raise PersonFollowBridgeUnavailable("跟随通信桥已关闭。")
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._run, name="gateway-person-follow-lcm", daemon=True)
+                self._thread.start()
+        self._ready.wait()
+        with self._lock:
+            if self._failure is not None:
+                raise self._failure
 
-    def close(self) -> None:
-        with self._state_lock:
-            thread = self._thread
-            started = self._started
-            if thread is None:
-                return
-            self._closing = True
-        close_error: Optional[BaseException] = None
-        if started and thread.is_alive():
-            try:
-                self._call(self._shutdown, allow_closing=True)
-            except BaseException as exc:
-                close_error = exc
-                self._stop_requested.set()
-        else:
-            self._stop_requested.set()
-        thread.join(timeout=self._operation_timeout_sec + 1.0)
-        if thread.is_alive():
-            raise PersonFollowBridgeTimeout("PersonFollow LCM bridge thread did not stop")
-        with self._state_lock:
-            self._thread = None
-            self._closing = False
-        if close_error is not None:
-            _LOGGER.error("跟随桥关闭失败：%s", close_error)
-
-    def prepare_session(
-        self,
-        tracked_target: PersonFollowTarget,
-        *,
-        timeout_sec: Optional[float] = None,
-    ) -> PersonFollowTarget:
-        if tracked_target.tracking_state != PERSON_FOLLOW_TRACKED:
-            raise PersonFollowBridgeError("preflight requires a TRACKED target")
-        payload = encode_person_follow_target(tracked_target)
-        timeout = self._barrier_timeout_sec if timeout_sec is None else float(timeout_sec)
-        if not math.isfinite(timeout) or timeout <= 0.0:
-            raise PersonFollowBridgeError("preflight timeout must be positive")
-        preflight = self._call(lambda: self._begin_preflight(tracked_target, payload))
-        self._wait_preflight(preflight, timeout, "TRACKING")
-        stop_target = replace(
-            tracked_target,
-            target_seq=tracked_target.target_seq + 1,
-            tracking_state=PERSON_FOLLOW_STOP,
-        )
-        stop_payload = encode_person_follow_target(stop_target)
-        self._call(lambda: self._advance_preflight(preflight, stop_target, stop_payload))
-        self._wait_preflight(preflight, timeout, "STOPPED")
-        return self._call(lambda: self._complete_preflight(preflight))
-
-    def bind_session(
-        self,
-        session_id: str,
-        session: Any,
-        *,
-        fence_session: Callable[[Any], Any],
-    ) -> None:
-        self._call(
-            lambda: self._bind_session(
-                str(session_id).strip(),
-                session,
-                fence_session,
-            )
-        )
-
-    def publish_tracked(self, target: PersonFollowTarget) -> Optional[PersonFollowTarget]:
-        if target.tracking_state != PERSON_FOLLOW_TRACKED:
-            raise PersonFollowBridgeError("publish_tracked requires a TRACKED target")
-        return self._call(lambda: self._publish_tracked(target))
-
-    def publish_lost(self, target: PersonFollowTarget) -> Optional[PersonFollowTarget]:
-        if target.tracking_state != PERSON_FOLLOW_LOST:
-            raise PersonFollowBridgeError("publish_lost requires a LOST target")
-        return self._call(lambda: self._publish_lost(target))
-
-    def end_session(self, target: PersonFollowTarget, *, reason: str) -> Optional[PersonFollowTarget]:
-        if target.tracking_state not in {PERSON_FOLLOW_LOST, PERSON_FOLLOW_STOP}:
-            raise PersonFollowBridgeError("end_session requires LOST or STOP")
-        return self._call(lambda: self._end_session(target, str(reason)))
-
-    def fence_session(self, session_id: str, *, reason: str) -> None:
-        self._call(
-            lambda: self._fence_matching_session(
-                str(session_id).strip(),
-                str(reason),
-            )
-        )
-
-    def assert_session_healthy(self, session_id: str) -> None:
-        self._call(lambda: self._assert_session_healthy(str(session_id).strip()))
-
-    def has_active_session(self, session_id: str) -> bool:
-        return bool(
-            self._call(lambda: self._binding is not None and self._binding.session_id == str(session_id).strip())
-        )
-
-    def _call(self, operation: Callable[[], Any], *, allow_closing: bool = False) -> Any:
-        if threading.get_ident() == self._owner_thread_id:
-            return operation()
-        with self._state_lock:
-            error = self._fatal_error
-            thread = self._thread
-            started = self._started
-            closing = self._closing
-        if error is not None:
-            raise error
-        if not started or thread is None or not thread.is_alive():
-            raise PersonFollowBridgeUnavailable("PersonFollow LCM bridge is not running")
-        if closing and not allow_closing:
-            raise PersonFollowBridgeUnavailable("PersonFollow LCM bridge is closing")
+    def _call(self, operation):
         request = _ControlRequest(operation=operation, completed=threading.Event())
-        self._requests.put(request)
-        if not request.completed.wait(self._operation_timeout_sec):
-            self._stop_requested.set()
-            raise PersonFollowBridgeTimeout("PersonFollow LCM owner thread did not respond")
+        with self._lock:
+            if not self._started or self._closed:
+                raise self._failure or PersonFollowBridgeUnavailable("跟随通信桥未运行。")
+            self._requests.put(request)
+        request.completed.wait()
         if request.error is not None:
-            if isinstance(request.error, PersonFollowBridgeError):
-                raise request.error
-            raise PersonFollowBridgeError("PersonFollow LCM operation failed") from request.error
+            raise request.error
         return request.result
 
-    def _run(self) -> None:
-        self._owner_thread_id = threading.get_ident()
-        try:
-            lcm_context = self._lcm_factory(self.lcm_url)
-            subscription = lcm_context.subscribe(
-                self._typed_command_channel,
-                self._on_command,
-            )
-            self._lcm = lcm_context
-            self._subscription = subscription
-            with self._state_lock:
-                self._started = True
-            self._ready.set()
-            while not self._stop_requested.is_set():
-                self._drain_requests()
-                if self._stop_requested.is_set():
-                    break
-                lcm_context.handle_timeout(self._poll_timeout_ms)
-        except BaseException as exc:
-            self._set_fatal(exc)
-        finally:
-            self._ready.set()
-            try:
-                self._fence_active("PersonFollow LCM owner stopped")
-            except BaseException as exc:
-                self._set_fatal(exc)
-            self._fail_pending_requests()
-            if self._lcm is not None and self._subscription is not None:
-                try:
-                    self._lcm.unsubscribe(self._subscription)
-                except BaseException as exc:
-                    self._set_fatal(exc)
-            self._subscription = None
-            self._lcm = None
-            self._preflight = None
-            self._prepared = None
-            self._owner_thread_id = None
-            with self._state_lock:
-                self._started = False
+    def bind(self, session_id: str, lease: MotionLease, *, check: Callable[[], None]) -> None:
+        def operation():
+            # 检查实际排队执行点，避免旧线程暂停后覆盖新任务的绑定。
+            check()
+            self._bind(session_id, lease)
+        self._call(operation)
 
-    def _drain_requests(self) -> None:
-        while True:
-            try:
-                request = self._requests.get_nowait()
-            except queue.Empty:
-                return
-            try:
-                request.result = request.operation()
-            except BaseException as exc:
-                request.error = exc
-            finally:
-                request.completed.set()
+    def _bind(self, session_id, lease) -> None:
+        self._end_current()
+        self._binding = _Binding(session_id, lease)
 
-    def _fail_pending_requests(self) -> None:
-        with self._state_lock:
-            error = self._fatal_error or PersonFollowBridgeUnavailable("PersonFollow LCM owner thread stopped")
-        while True:
-            try:
-                request = self._requests.get_nowait()
-            except queue.Empty:
-                return
-            request.error = error
-            request.completed.set()
+    def publish(self, target: PersonFollowTarget, *, check: Callable[[], None]) -> None:
+        def operation():
+            check()
+            self._publish(target)
+        self._call(operation)
 
-    def _set_fatal(self, error: BaseException) -> None:
-        if isinstance(error, PersonFollowBridgeError):
-            bridge_error = error
-        else:
-            bridge_error = PersonFollowBridgeUnavailable(f"PersonFollow LCM owner failed: {error}")
-            bridge_error.__cause__ = error
-        with self._state_lock:
-            if self._fatal_error is None:
-                self._fatal_error = bridge_error
-        self._stop_requested.set()
+    def _publish(self, target) -> None:
+        binding = self._matching(target.session_id)
+        payload = encode_person_follow_target(target)
+        binding.target = target
+        self._lcm.publish(self._target_channel, payload)
 
-    def _wait_preflight(
-        self,
-        preflight: _Preflight,
-        timeout: float,
-        expected_state: str,
-    ) -> None:
-        if not preflight.completed.wait(timeout):
-            try:
-                self._call(lambda: self._cancel_preflight(preflight))
-            except PersonFollowBridgeError:
-                pass
-            raise PersonFollowBridgeTimeout(f"PersonFollow preflight timed out waiting for {expected_state}")
-        if preflight.error is not None:
-            self._call(lambda: self._cancel_preflight(preflight))
-            raise preflight.error
-
-    def _begin_preflight(
-        self,
-        target: PersonFollowTarget,
-        payload: bytes,
-    ) -> _Preflight:
-        if self._preflight is not None:
-            raise PersonFollowBridgeError("a PersonFollow preflight is already pending")
-        while self._lcm.handle_timeout(0):
-            pass
-        preflight = _Preflight(completed=threading.Event(), target=target)
-        self._preflight = preflight
-        self._prepared = None
-        self._session_error = None
-        try:
-            self._lcm.publish(self._typed_target_channel, payload)
-        except BaseException:
-            self._preflight = None
-            raise
-        return preflight
-
-    def _advance_preflight(
-        self,
-        preflight: _Preflight,
-        target: PersonFollowTarget,
-        payload: bytes,
-    ) -> None:
-        if self._preflight is not preflight or preflight.error is not None:
-            raise preflight.error or PersonFollowBridgeError("preflight is no longer active")
-        if preflight.phase != "tracked":
-            raise PersonFollowBridgeError("preflight TRACKED phase is incomplete")
-        preflight.phase = "stop"
-        preflight.target = target
-        preflight.completed.clear()
-        try:
-            self._lcm.publish(self._typed_target_channel, payload)
-        except BaseException:
-            self._preflight = None
-            raise
-
-    def _complete_preflight(self, preflight: _Preflight) -> PersonFollowTarget:
-        if self._preflight is not preflight or preflight.error is not None:
-            raise preflight.error or PersonFollowBridgeError("preflight is no longer active")
-        if preflight.phase != "stop" or not preflight.completed.is_set():
-            raise PersonFollowBridgeError("preflight STOP phase is incomplete")
-        target = preflight.target
-        self._prepared = _PreparedSession(
-            session_id=target.session_id,
-            last_target_seq=target.target_seq,
-            cloud_revision=target.required_cloud_revision,
-            source_stamp=(target.stamp_sec, target.stamp_nsec),
-            last_command_seq=preflight.last_command_seq,
-        )
-        self._preflight = None
-        return target
-
-    def _cancel_preflight(self, preflight: _Preflight) -> None:
-        if self._preflight is preflight:
-            self._preflight = None
-
-    def _bind_session(
-        self,
-        session_id: str,
-        session: Any,
-        fence_session: Callable[[Any], Any],
-    ) -> None:
-        if not session_id:
-            raise PersonFollowBridgeError("session_id must be non-empty")
-        if self._preflight is not None:
-            raise PersonFollowBridgeError("cannot bind while preflight is pending")
-        prepared = self._prepared
-        if prepared is None or prepared.session_id != session_id:
-            raise PersonFollowBridgeError("cannot bind before matching preflight succeeds")
-        if getattr(session, "fenced", False):
-            raise PersonFollowBridgeError("cannot bind an already fenced motion session")
-        self._binding = _SessionBinding(
-            session_id=session_id,
-            session=session,
-            fence_session=fence_session,
-            next_target_seq=prepared.last_target_seq + 1,
-            cloud_revision=prepared.cloud_revision,
-            last_source_stamp=prepared.source_stamp,
-            last_command_seq=prepared.last_command_seq,
-        )
-        self._prepared = None
-        self._session_error = None
-
-    def _publish_tracked(self, target: PersonFollowTarget) -> Optional[PersonFollowTarget]:
-        self._assert_session_healthy(target.session_id)
-        binding = self._binding
-        if binding is None or binding.session_id != target.session_id:
-            raise PersonFollowBridgeError("TRACKED target has no matching guard session")
-        source_stamp = (target.stamp_sec, target.stamp_nsec)
-        if source_stamp == binding.last_source_stamp and binding.allow_preflight_stamp_once:
-            binding.allow_preflight_stamp_once = False
-        elif source_stamp <= binding.last_source_stamp:
-            return binding.current_target
-        else:
-            binding.allow_preflight_stamp_once = False
-        correlated = replace(
-            target,
-            target_seq=binding.next_target_seq,
-            required_cloud_revision=binding.cloud_revision,
-        )
-        payload = encode_person_follow_target(correlated)
-        self._lcm.publish(self._typed_target_channel, payload)
-        binding.current_target = correlated
-        binding.next_target_seq += 1
-        binding.last_source_stamp = source_stamp
-        return correlated
-
-    def _publish_lost(self, target: PersonFollowTarget) -> Optional[PersonFollowTarget]:
-        self._assert_session_healthy(target.session_id)
-        binding = self._binding
-        if binding is None or binding.session_id != target.session_id:
-            raise PersonFollowBridgeError("LOST target has no matching guard session")
-        source_stamp = (target.stamp_sec, target.stamp_nsec)
-        if source_stamp <= binding.last_source_stamp:
-            return binding.current_target
-        correlated = replace(
-            target,
-            target_seq=binding.next_target_seq,
-            required_cloud_revision=binding.cloud_revision,
-        )
-        payload = encode_person_follow_target(correlated)
-        self._lcm.publish(self._typed_target_channel, payload)
-        binding.current_target = correlated
-        binding.next_target_seq += 1
-        binding.last_source_stamp = source_stamp
-        binding.allow_preflight_stamp_once = False
-        return correlated
-
-    def _end_session(
-        self,
-        target: PersonFollowTarget,
-        reason: str,
-    ) -> Optional[PersonFollowTarget]:
-        self._assert_session_healthy(target.session_id)
-        binding = self._binding
-        if binding is None or binding.session_id != target.session_id:
-            raise PersonFollowBridgeError("lifecycle target has no matching guard session")
-        correlated: Optional[PersonFollowTarget] = None
-        publish_error: Optional[BaseException] = None
-        if (target.stamp_sec, target.stamp_nsec) > binding.last_source_stamp:
-            correlated = replace(
-                target,
-                target_seq=binding.next_target_seq,
-                required_cloud_revision=binding.cloud_revision,
-            )
-            payload = encode_person_follow_target(correlated)
-            try:
-                self._lcm.publish(self._typed_target_channel, payload)
-            except BaseException as exc:
-                publish_error = exc
-        fence_error: Optional[BaseException] = None
-        try:
-            self._fence_active(reason)
-        except BaseException as exc:
-            fence_error = exc
-        if fence_error is not None:
-            _LOGGER.error("跟随会话停止失败：%s", fence_error)
-        if publish_error is not None:
-            raise PersonFollowBridgeError("PersonFollow lifecycle target could not be published") from publish_error
-        self._session_error = None
-        return correlated
-
-    def _assert_session_healthy(self, session_id: str) -> None:
-        if self._session_error is not None and self._session_error[0] == session_id:
-            raise self._session_error[1]
-
-    def _fence_matching_session(self, session_id: str, reason: str) -> None:
-        self._assert_session_healthy(session_id)
+    def _matching(self, session_id):
         binding = self._binding
         if binding is None or binding.session_id != session_id:
-            return
-        self._fence_active(reason)
-        self._session_error = None
+            raise PersonFollowBridgeError("跟随任务已被更新的任务替换。")
+        if binding.error is not None:
+            raise binding.error
+        return binding
 
-    def _on_command(self, _channel: str, encoded: bytes) -> None:
-        try:
-            command = decode_person_follow_command(encoded)
-        except PersonFollowBridgeError as exc:
-            if self._preflight is not None:
-                self._abort_preflight(exc)
-            elif self._binding is not None:
-                self._fail_active_session(exc)
+    def latest_command(self, session_id: str) -> Optional[PersonFollowCommand]:
+        return self._call(lambda: self._matching(session_id).command)
+
+    def end(self, session_id: str) -> None:
+        def operation():
+            if self._binding is not None and self._binding.session_id == session_id:
+                self._end_current()
+        self._call(operation)
+
+    def _end_current(self) -> None:
+        binding, self._binding = self._binding, None
+        if binding is not None and binding.target is not None:
+            # 原协议允许 TRACKED→STOP 复用最后一次真实图像时间，不伪造新采样。
+            target = replace(binding.target, target_seq=binding.target.target_seq + 1, tracking_state=PERSON_FOLLOW_STOP)
+            self._lcm.publish(self._target_channel, encode_person_follow_target(target))
+
+    def _on_command(self, _channel, payload) -> None:
+        binding = self._binding
+        if binding is None or binding.target is None or binding.error is not None:
             return
-        preflight = self._preflight
-        if preflight is not None:
+        try:
+            command = decode_person_follow_command(payload)
+            target = binding.target
+            if command.session_id != binding.session_id or command.target_seq < target.target_seq:
+                return
+            if binding.command is not None and command.command_seq <= binding.command.command_seq:
+                return
+            if (command.target_seq != target.target_seq or command.target_stamp_sec != target.stamp_sec
+                    or command.target_stamp_nsec != target.stamp_nsec
+                    or (command.cloud_revision < target.required_cloud_revision
+                        and command.state not in {PERSON_FOLLOW_WAITING_DATA, PERSON_FOLLOW_FAILED})):
+                raise PersonFollowBridgeError("跟随速度与当前图像目标不匹配。")
+            if command.state == PERSON_FOLLOW_FAILED:
+                raise PersonFollowBridgeError(command.reason)
+            expected = {
+                PERSON_FOLLOW_TRACKED: {PERSON_FOLLOW_TRACKING, PERSON_FOLLOW_COMMAND_LOST, PERSON_FOLLOW_WAITING_DATA},
+                PERSON_FOLLOW_LOST: {PERSON_FOLLOW_COMMAND_LOST},
+                PERSON_FOLLOW_STOP: {PERSON_FOLLOW_STOPPED},
+            }[target.tracking_state]
+            if command.state not in expected:
+                raise PersonFollowBridgeError("跟随速度状态与当前目标不匹配。")
+            binding.lease.velocity(command.linear_x, command.linear_y, command.angular_z)
+            binding.command = command
+        except BaseException as error:
+            binding.error = error
             try:
-                if not self._validate_command(command, preflight.target, preflight.last_command_seq, preflight=True):
-                    return
-            except PersonFollowBridgeError as exc:
-                self._abort_preflight(exc)
-                return
-            preflight.last_command_seq = command.command_seq
-            if command.state == PERSON_FOLLOW_WAITING_DATA:
-                return
-            preflight.completed.set()
-            return
-        binding = self._binding
-        if binding is None:
-            return
-        target = binding.current_target
-        if target is None:
-            return
+                binding.lease.velocity(0.0, 0.0, 0.0)
+            except Exception:
+                _LOGGER.exception("跟随错误后的零速指令失败。")
+
+    def _run(self) -> None:
+        subscription = None
         try:
-            if not self._validate_command(command, target, binding.last_command_seq, preflight=False):
-                return
-        except PersonFollowBridgeError as exc:
-            self._fail_active_session(exc)
-            return
-        try:
-            if command.state in {PERSON_FOLLOW_COMMAND_LOST, PERSON_FOLLOW_STOPPED, PERSON_FOLLOW_WAITING_DATA}:
-                binding.session.stop()
-            else:
-                binding.session.twist(
-                    command.linear_x,
-                    command.linear_y,
-                    command.angular_z,
-                )
-            binding.last_command_seq = command.command_seq
-            binding.last_accepted_target = target
-        except BaseException as exc:
-            self._fail_active_session(
-                PersonFollowBridgeError("motion guard rejected a PersonFollow command"),
-                cause=exc,
-            )
+            self._lcm = self._lcm_factory(self.lcm_url)
+            subscription = self._lcm.subscribe(self._command_channel, self._on_command)
+            with self._lock:
+                self._started = True
+            self._ready.set()
+            while not self._stop.is_set():
+                while True:
+                    try:
+                        request = self._requests.get_nowait()
+                    except queue.Empty:
+                        break
+                    try:
+                        request.result = request.operation()
+                    except BaseException as error:
+                        request.error = error
+                    finally:
+                        request.completed.set()
+                self._lcm.handle_timeout(self._poll_timeout_ms)
+        except BaseException as error:
+            with self._lock:
+                self._failure = PersonFollowBridgeUnavailable(f"跟随 LCM 连接失败：{error}")
+        finally:
+            self._ready.set()
+            with self._lock:
+                self._started = False
+            try:
+                self._end_current()
+            except Exception:
+                _LOGGER.exception("跟随通信关闭时发布 STOP 失败。")
+            while True:
+                try:
+                    request = self._requests.get_nowait()
+                except queue.Empty:
+                    break
+                request.error = self._failure or PersonFollowBridgeUnavailable("跟随通信桥已停止。")
+                request.completed.set()
+            if subscription is not None:
+                self._lcm.unsubscribe(subscription)
+            self._lcm = None
 
-    def _validate_command(
-        self,
-        command: PersonFollowCommand,
-        target: PersonFollowTarget,
-        last_command_seq: int,
-        *,
-        preflight: bool,
-    ) -> bool:
-        if (command.session_id != target.session_id or command.target_seq < target.target_seq
-                or command.command_seq <= last_command_seq):
-            return False
-        if (
-            command.target_seq != target.target_seq
-            or command.target_stamp_sec != target.stamp_sec
-            or command.target_stamp_nsec != target.stamp_nsec
-        ):
-            raise PersonFollowBridgeError("PersonFollow command correlation mismatch")
-        if command.state == PERSON_FOLLOW_WAITING_DATA:
-            if preflight or target.tracking_state == PERSON_FOLLOW_TRACKED:
-                return True
-            raise PersonFollowBridgeError("PersonFollow command state does not match target")
-        if command.state == PERSON_FOLLOW_FAILED:
-            raise PersonFollowBridgeError(f"PersonFollow owner reported FAILED: {command.reason}")
-        if command.cloud_revision < target.required_cloud_revision:
-            raise PersonFollowBridgeError("PersonFollow command correlation mismatch")
-        if not preflight and target.tracking_state == PERSON_FOLLOW_TRACKED and command.state == PERSON_FOLLOW_COMMAND_LOST:
-            return True
-        expected = {
-            PERSON_FOLLOW_TRACKED: PERSON_FOLLOW_TRACKING,
-            PERSON_FOLLOW_LOST: PERSON_FOLLOW_COMMAND_LOST,
-            PERSON_FOLLOW_STOP: PERSON_FOLLOW_STOPPED,
-        }[target.tracking_state]
-        if command.state != expected:
-            raise PersonFollowBridgeError("PersonFollow command state does not match target")
-        return True
-
-    def _abort_preflight(self, error: PersonFollowBridgeError) -> None:
-        preflight = self._preflight
-        if preflight is None:
-            return
-        self._preflight = None
-        preflight.error = error
-        preflight.completed.set()
-
-    def _fail_active_session(
-        self,
-        error: PersonFollowBridgeError,
-        *,
-        cause: Optional[BaseException] = None,
-    ) -> None:
-        binding = self._binding
-        if binding is None:
-            return
-        self._binding = None
-        if cause is not None:
-            error.__cause__ = cause
-        try:
-            binding.fence_session(binding.session)
-        except BaseException as fence_error:
-            _LOGGER.error("跟随会话停止失败：%s", fence_error)
-        self._session_error = (binding.session_id, error)
-
-    def _fence_active(self, _reason: str) -> None:
-        binding = self._binding
-        if binding is None:
-            return
-        self._binding = None
-        binding.fence_session(binding.session)
-
-    def _shutdown(self) -> None:
-        self._fence_active("PersonFollow bridge shutdown")
-        self._stop_requested.set()
-
-
-__all__ = [
-    "DEFAULT_PERSON_FOLLOW_COMMAND_CHANNEL",
-    "DEFAULT_PERSON_FOLLOW_TARGET_CHANNEL",
-    "GatewayPersonFollowBridge",
-    "PERSON_FOLLOW_COMMAND_FINGERPRINT",
-    "PERSON_FOLLOW_COMMAND_LOST",
-    "PERSON_FOLLOW_FAILED",
-    "PERSON_FOLLOW_LOST",
-    "PERSON_FOLLOW_STOP",
-    "PERSON_FOLLOW_STOPPED",
-    "PERSON_FOLLOW_TRACKED",
-    "PERSON_FOLLOW_TRACKING",
-    "PERSON_FOLLOW_WAITING_DATA",
-    "PersonFollowBridgeError",
-    "PersonFollowBridgeTimeout",
-    "PersonFollowBridgeUnavailable",
-    "PersonFollowReadiness",
-    "PersonFollowCommand",
-    "PersonFollowTarget",
-    "build_person_follow_target",
-    "decode_person_follow_command",
-    "encode_person_follow_target",
-    "read_person_follow_readiness",
-]
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            self._stop.set()
+            thread = self._thread
+        if thread is not None:
+            thread.join()

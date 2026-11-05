@@ -26,7 +26,9 @@ class ObservationService:
         state_store: StateStore,
         event_bus: Optional[EventBus] = None,
         history_limit: int = 100,
+        geometry_state=None,
     ) -> None:
+        self._geometry_state = geometry_state
         self._provider_owner = provider_owner
         self._artifact_service = artifact_service
         self._state_store = state_store
@@ -50,6 +52,10 @@ class ObservationService:
             return self._capture_observation(camera_id=camera_id, requested_by=requested_by)
 
     def _capture_observation(self, *, camera_id, requested_by):
+        from services.perception.observation_geometry import contract_pose
+        snapshot = None if self._geometry_state is None else self._geometry_state.snapshot()
+        map_name = "default" if self._geometry_state is None else snapshot.map_name if snapshot is not None else ""
+        pose = contract_pose(None if self._geometry_state is None else self._geometry_state.pose())
         image_provider = self._get_image_provider()
         image_frame = image_provider.capture_image(camera_id)
         resolved_camera_id = image_frame.camera_id
@@ -90,6 +96,8 @@ class ObservationService:
             metadata={
                 "frame_id": image_frame.frame_id,
                 "size_bytes": len(image_frame.data or b""),
+                "map_name": map_name,
+                "observation_pose": pose.model_dump(mode="json") if pose is not None else None,
             },
         )
         with self._context_condition:

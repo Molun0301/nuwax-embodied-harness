@@ -114,6 +114,16 @@ def _pause_and_save(platform, ctx, args, run):
 
 @rpc_errors
 def explore_area(platform, ctx, args):
+    reason = f"exploration:{ctx.task_id}"
+    runtime = platform.perception.video_runtime
+    runtime.acquire(reason)
+    try:
+        return _explore_area(platform, ctx, args)
+    finally:
+        runtime.release(reason)
+
+
+def _explore_area(platform, ctx, args):
     ctx.check()
     snapshot = platform.geometry_state.snapshot()
     name = args.get("map_name") or (snapshot.map_name if snapshot is not None else "")

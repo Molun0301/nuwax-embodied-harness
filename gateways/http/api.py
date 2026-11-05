@@ -583,12 +583,10 @@ def build_http_router(runtime: Platform, access_manager: GatewayAccessManager) -
 
     @router.get("/api/memory/locations")
     def api_memory_locations(request: Request, limit: int = Query(20, ge=1, le=1000)) -> Dict[str, Any]:
-        # 未启用 active 库时返回空列表（避免跨库串数据），service 已默认按 active 库过滤。
         return {
             "locations": to_jsonable(
                 runtime.memory.list_tagged_locations(
                     limit=limit,
-                    library_name=runtime.memory.get_active_library_name(),
                 )
             ),
             "memory_summary": to_jsonable(runtime.memory.get_summary()),
@@ -600,7 +598,6 @@ def build_http_router(runtime: Platform, access_manager: GatewayAccessManager) -
             "entries": to_jsonable(
                 runtime.memory.list_semantic_memories(
                     limit=limit,
-                    library_name=runtime.memory.get_active_library_name(),
                 )
             ),
             "memory_summary": to_jsonable(runtime.memory.get_summary()),

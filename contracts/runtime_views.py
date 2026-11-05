@@ -114,11 +114,10 @@ class PerceptionContext(TimestampedContract):
 class PerceptionRuntimeStatus(TimestampedContract):
     """持续视频感知运行时状态。"""
 
-    enabled: bool = Field(default=False, description="当前是否启用持续感知功能。")
-    auto_start: bool = Field(default=False, description="运行时启动时是否自动拉起。")
+    reasons: List[str] = Field(default_factory=list, description="当前使用连续识别的原因集合。")
     running: bool = Field(default=False, description="后台感知线程是否正在运行。")
     camera_id: str = Field(default="front_camera", description="当前持续处理的相机标识。")
-    interval_sec: float = Field(default=0.5, ge=0.05, description="连续抓帧周期。")
+    interval_sec: float = Field(default=0.5, gt=0, description="当前原因要求的最小识别间隔。")
     detector_backend: str = Field(default="", description="当前持续感知使用的检测后端。")
     source_name: str = Field(default="", description="当前图像来源名称。")
     processed_frames: int = Field(default=0, ge=0, description="累计处理帧数。")

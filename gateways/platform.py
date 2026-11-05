@@ -34,14 +34,12 @@ class Platform:
         self.robot.start()
         self.robot_state.start()
         self.streams.start()
-        if self.perception.video_runtime.should_auto_start():
-            self.perception.video_runtime.start()
 
     def stop(self) -> None:
         operations = [self.tasks.shutdown, self.map_cleanup.close, self.streams.stop, self.input_bridge.stop,
                       self.geometry_state.stop, self.perception.video_runtime.close,
                       self.perception.close, self.follow.close, self.scene_mapping.close,
-                      self.memory.close, self.artifacts.close,
+                      self.memory.close, self.observation.close, self.artifacts.close,
                       self.motion.close, self.geometry.close, self.places.close, self.buildings.close,
                       self.audio.stop, self.robot_state.stop,
                       self.robot.stop, self.streams.close, self.events.shutdown]
@@ -77,7 +75,7 @@ class Platform:
 
 def build_platform(config) -> Platform:
     from contracts.artifacts import ArtifactRetentionPolicy
-    from gateways.capabilities import building, cleanup, exploration, maps, motion, navigation, system
+    from gateways.capabilities import building, cleanup, exploration, follow, maps, memory, motion, navigation, perception as perception_caps, skills as skills_caps, system
     from gateways.capabilities.exploration import ExplorationControl
     from gateways.person_follow import GatewayPersonFollowBridge
     from gateways.streams import Streams, VideoSource
@@ -104,7 +102,8 @@ def build_platform(config) -> Platform:
     platform.robot = create_active_robot_assembly(config)
     platform.capabilities = CapabilityTable()
     for cap in (system.CAPABILITIES + maps.CAPABILITIES + motion.CAPABILITIES + navigation.CAPABILITIES
-                + exploration.CAPABILITIES + building.CAPABILITIES + cleanup.CAPABILITIES):
+                + exploration.CAPABILITIES + building.CAPABILITIES + cleanup.CAPABILITIES
+                + memory.CAPABILITIES + perception_caps.CAPABILITIES + skills_caps.CAPABILITIES + follow.CAPABILITIES):
         platform.capabilities.register(cap)
     platform.tasks = TaskRunner(platform)
     home = Path(os.environ.get("NUWAX_INSTALL_HOME", config.base_dir))
@@ -127,19 +126,22 @@ def build_platform(config) -> Platform:
     artifacts = ArtifactService(store, retention_policy=ArtifactRetentionPolicy(
         retention_days=config.runtime_data.artifact_retention_days, max_count=config.runtime_data.artifact_max_count,
         max_total_bytes=config.runtime_data.artifact_max_total_bytes, cleanup_batch_size=config.runtime_data.artifact_cleanup_batch_size))
+    has_geometry_input = any(isinstance(providers, protocol) for protocol in (
+        StreamingSensorSampleProvider, StreamingLocalizationProvider, StreamingPointCloudProvider))
     observation = ObservationService(provider_owner=platform.robot, artifact_service=artifacts,
-                                    state_store=state_store, event_bus=platform.events)
+                                    state_store=state_store, event_bus=platform.events,
+                                    geometry_state=platform.geometry_state if has_geometry_input else None)
+    platform.observation = observation
     perception = build_platform_perception_components(config)
     platform.perception = PerceptionService(provider_owner=platform.robot, artifact_service=artifacts,
         state_store=state_store, detector_pipeline=perception["detector_pipeline"], tracker_backend=perception["tracker_backend"],
         segmentation_backend=perception["segmentation_backend"], scene_description_backend=perception["scene_description_backend"],
         event_bus=platform.events, stream_bus=stream_bus,
+        geometry_state=platform.geometry_state, geometry_client=platform.geometry,
         video_frame_source=providers if isinstance(providers, VideoFrameSource) else VideoSource(
             os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm"),
             providers if isinstance(providers, ImageProvider) else None,
             platform.robot.defaults.frame_ids.get("camera_front", "camera_front")))
-    has_geometry_input = any(isinstance(providers, protocol) for protocol in (
-        StreamingSensorSampleProvider, StreamingLocalizationProvider, StreamingPointCloudProvider))
     platform.memory = MemoryService(geometry_state=platform.geometry_state if has_geometry_input else None,
         maps_root=platform.maps.root,
         default_root=Path(config.base_dir) / "runtime_data" / "memory" / "default",
@@ -166,7 +168,7 @@ def build_platform(config) -> Platform:
     platform.manipulation = None
     runtime_config = asdict(config.perception.stream_runtime)
     platform.perception.video_runtime = PerceptionVideoRuntime(perception_service=platform.perception,
-        state_store=state_store, localization_service=platform.geometry_state, live_pose_provider=platform.geometry_state,
-        mapping_service=platform.geometry_state, memory_service=platform.memory, event_bus=platform.events, **runtime_config)
+        state_store=state_store, geometry_state=platform.geometry_state if has_geometry_input else None,
+        memory_service=platform.memory, event_bus=platform.events, **runtime_config)
     platform.streams = Streams(platform, stream_bus)
     return platform

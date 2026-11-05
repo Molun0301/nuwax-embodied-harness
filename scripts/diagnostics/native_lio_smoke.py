@@ -289,7 +289,6 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
         "NUWAX_CLOUDMAP_SHM_PATH": str(working / "cloud.shm"),
         "NUWAX_OCCUPANCY_SHM_PATH": str(working / "occupancy.shm"),
         "NUWAX_VIDEO_SHM_PATH": str(working / "video.shm"),
-        "NUWAX_VIDEO_UDS_PATH": str(working / "video.sock"),
     })
     resolved_executable = executable or root / (
         "services/nuwax-workspace/crates/nuwax-lio-backends/native/%s/cpp/result/bin/%s_native" % (backend, backend)

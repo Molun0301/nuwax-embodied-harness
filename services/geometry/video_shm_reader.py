@@ -1,6 +1,6 @@
-"""从 Rust 视频中转进程的共享内存读取 JPEG 帧。
+"""从 Go2 视频推流进程的共享内存读取 JPEG 帧。
 
-共享内存布局（与 Rust video_relay.rs 对应）：
+共享内存布局（与 drivers/common/video_shm_writer.py 对应）：
   Header (64 bytes):
     0-7:   magic (u64 LE) = 0x4E55_5741_5856_4944
     8-11:  version (u32 LE) = 1

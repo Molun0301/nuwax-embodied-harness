@@ -219,10 +219,6 @@ async fn run_case(backend_id: i32, case: Case) {
                 let lifecycle = handle.mapping_lifecycle_lock.lock().await;
                 assert!(ingress.common.state.lock().accepted_odometry_poses
                     .contains_key(&(correlated.source_sequence, correlated.source_timestamp_ns)));
-                let mut readiness_rx = shutdown_rx.clone();
-                assert_eq!(ingress.common.wait_for_public_odometry(correlated, &mut readiness_rx)
-                    .now_or_never(), Some(true), "real public wait is already Ready before polling process_pair");
-                drop(readiness_rx);
                 let mut process = Box::pin(ingress.process_pair(pair, &mut shutdown_rx));
                 assert!(futures::poll!(process.as_mut()).is_pending(), "original lifecycle lock must suspend actual process_pair");
                 assert!(*ingress.source_pair_ready_rx.borrow());

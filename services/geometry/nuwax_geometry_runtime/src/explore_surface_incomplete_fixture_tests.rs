@@ -1,3 +1,34 @@
+// 只读观测仅存在于测试模块；不改变任务注册、终态或生产结构。
+#[derive(Default)]
+pub(crate) struct SurfaceMapTestObservations {
+    clock: std::sync::OnceLock<tokio::time::Instant>,
+    events: parking_lot::Mutex<Vec<String>>,
+}
+
+impl SurfaceMapTestObservations {
+    pub(crate) fn events(&self) -> Vec<String> { self.events.lock().clone() }
+
+    fn record(&self, event: impl Into<String>) { self.events.lock().push(event.into()); }
+
+    pub(crate) fn record_surface_clock(&self, kind: &str, revision: i64, at: tokio::time::Instant) {
+        let origin = *self.clock.get_or_init(|| at);
+        self.record(format!("surface-clock:{kind}:{revision}:{}",
+            at.saturating_duration_since(origin).as_nanos()));
+    }
+}
+
+tokio::task_local! {
+    static SURFACE_MAP_TEST_OBSERVATIONS: Arc<SurfaceMapTestObservations>;
+}
+
+pub(crate) fn current_surface_observations() -> Option<Arc<SurfaceMapTestObservations>> {
+    SURFACE_MAP_TEST_OBSERVATIONS.try_with(Arc::clone).ok()
+}
+
+pub(crate) fn record_surface_event(event: impl Into<String>) {
+    if let Some(observations) = current_surface_observations() { observations.record(event); }
+}
+
 // Tests-only actual-entry qualification. Included inside lcm_runtime::mapping_feed_tests.
 // This module must be pub(crate) under its existing #[cfg(test)] only.
 // Uses the real canonical Writer/seal/publication codec and original consumer.
@@ -5,8 +36,7 @@ pub(crate) struct F1RealEntryFixture {
     fixture: NavigationMap3DFixture,
     transport: LcmTransport,
     owner: GeometryRuntimeTaskOwner,
-    _installation: GeometryTopologyTestInstallation,
-    pub(crate) probe: Arc<GeometryTopologyTestControl>,
+    pub(crate) probe: Arc<SurfaceMapTestObservations>,
     pub(crate) first: schema::NavigationMap3D,
     points: Vec<Point3<f64>>,
     stamp: u64,
@@ -41,20 +71,19 @@ impl F1RealEntryFixture {
             LcmTopic::new("/nav/map3d").map_err(|e| e.to_string())?,
             Some(LcmMessageType::new("nuwax_msgs.NavigationMap3D").map_err(|e| e.to_string())?),
         ).await.map_err(|e| e.to_string())?;
-        let probe = GeometryTopologyTestControl::new();
-        let installation = probe.install();
-        let (control, registrations) = GeometryRuntimeTaskControl::channel_with_topology_control(Some(probe.clone()));
+        let probe = Arc::new(SurfaceMapTestObservations::default());
+        let (control, registrations) = GeometryRuntimeTaskControl::channel();
         let mut owner = GeometryRuntimeTaskOwner::start(control.clone(), registrations);
-        if let Err(error) = control.register_persistent("surface-map-consumer", run_owned_surface_map_consumer(
+        if let Err(error) = control.register_persistent("surface-map-consumer", SURFACE_MAP_TEST_OBSERVATIONS.scope(probe.clone(), run_owned_surface_map_consumer(
             subscription, explore,
             nuwax_nav_stack::surface_map::SurfaceMapCache::configured_with_lcm_url(&config, "memq://"),
-            control.clone(), control.shutdown_request_receiver())) {
+            control.clone(), control.shutdown_request_receiver()))) {
             let _ = owner.shutdown().await;
             return Err(error);
         }
         let result = transport.publish(frame).await.map_err(|e| e.to_string());
         if let Err(error) = result { let _ = owner.shutdown().await; return Err(error); }
-        Ok(Self { fixture, transport, owner, _installation: installation, probe, first, points, stamp })
+        Ok(Self { fixture, transport, owner, probe, first, points, stamp })
     }
 
     pub(crate) async fn publish_partial(&mut self) -> Result<schema::NavigationMap3D, String> {

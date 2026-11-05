@@ -395,10 +395,8 @@ impl LioOwnerSpec {
     }
 }
 
-/// The ingress methods invoked by the four acknowledged subscription workers.
-///
-/// A returned error rejects only the current source frame. Transport closure,
-/// unsubscribe failure, or worker panic is what fails the generation owner.
+/// 由已确认订阅的输入工作者调用；原生模式不订阅公共位姿。
+/// 返回错误仅拒绝当前帧，传输关闭、取消订阅失败或工作者崩溃由拥有方收尾。
 #[async_trait]
 pub(crate) trait LioIngressSink: Send + Sync + 'static {
     /// Close the generation fence synchronously before shutdown fanout.
@@ -573,13 +571,11 @@ impl LioOwnerHandle {
             return Err(error);
         }
 
-        let mut subscription_specs = vec![
-            (
-                WorkerKind::PublicOdometry,
-                spec.shared().public_odometry.clone(),
-            ),
-            (WorkerKind::PublicCloud, spec.shared().public_cloud.clone()),
-        ];
+        let mut subscription_specs = Vec::new();
+        if matches!(&spec, LioOwnerSpec::Device(_)) {
+            subscription_specs.push((WorkerKind::PublicOdometry, spec.shared().public_odometry.clone()));
+        }
+        subscription_specs.push((WorkerKind::PublicCloud, spec.shared().public_cloud.clone()));
         subscription_specs.extend(spec.source_subscriptions());
         let mut subscriptions = Vec::with_capacity(subscription_specs.len());
         for (kind, (topic, message_type)) in subscription_specs {

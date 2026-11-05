@@ -279,7 +279,7 @@ async fn surface_incomplete_changed_mask_and_real_receiver_invalid_still_stop_or
 // shortened retry, injected build error, or sleep-based arrival assumption.
 
 fn f1_surface_clock_events(
-    probe: &crate::lcm_runtime::GeometryTopologyTestControl,
+    probe: &crate::lcm_runtime::mapping_feed_tests::SurfaceMapTestObservations,
     kind: &str,
 ) -> Vec<(i64, u128)> {
     let prefix = format!("surface-clock:{kind}:");

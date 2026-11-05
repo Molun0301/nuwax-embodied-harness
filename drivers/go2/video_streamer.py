@@ -12,7 +12,7 @@ import re
 import threading
 from typing import Any, Callable, Optional, Tuple, TypeVar
 
-from drivers.common.video_uds_sender import VideoUdsSender
+from drivers.common.video_shm_writer import VideoShmWriter
 from drivers.go2.settings import Go2DataPlaneConfig, load_go2_data_plane_config
 
 
@@ -84,7 +84,7 @@ def _create_webrtc_connection(
     return connection, fatal_auth_errors
 
 
-def _encode_jpeg_frame(frame: Any) -> bytes:
+def _encode_jpeg_frame(frame: Any) -> Tuple[bytes, int, int]:
     try:
         cv2 = importlib.import_module("cv2")
         image = frame.to_ndarray(format="bgr24")
@@ -105,7 +105,7 @@ def _encode_jpeg_frame(frame: Any) -> bytes:
                 if not payload.startswith(b"\xff\xd8") or not payload.endswith(b"\xff\xd9"):
                     raise RuntimeError("WebRTC 视频帧编码结果不是完整 JPEG。")
                 if len(payload) <= _MAX_JPEG_PAYLOAD_BYTES:
-                    return payload
+                    return payload, int(image.shape[1]), int(image.shape[0])
                 if smallest_payload is None or len(payload) < len(smallest_payload):
                     smallest_payload = payload
 
@@ -115,7 +115,7 @@ def _encode_jpeg_frame(frame: Any) -> bytes:
             height, width = int(image.shape[0]), int(image.shape[1])
             if height <= 1 and width <= 1:
                 raise RuntimeError(
-                    "WebRTC 视频帧无法编码到 512 KiB UDS 载荷上限以内。"
+                    "WebRTC 视频帧无法编码到 512 KiB 共享内存帧上限以内。"
                 )
             ratio = math.sqrt(_MAX_JPEG_PAYLOAD_BYTES / float(len(smallest_payload)))
             scale = min(0.85, max(0.10, ratio * 0.90))
@@ -147,24 +147,25 @@ async def _run_blocking(callable_obj: Callable[..., T], *args: object, **kwargs:
     return await loop.run_in_executor(None, lambda: callable_obj(*args, **kwargs))
 
 
-def _encode_and_send_frame(
+def _encode_and_write_frame(
     frame: Any,
-    uds_sender: VideoUdsSender,
+    shm_writer: VideoShmWriter,
     cancel_requested: threading.Event,
 ) -> Optional[bool]:
-    """在线程池中连续完成单帧编码和发送，避免两次 executor 边界。"""
+    """在线程池中连续完成单帧编码和写入，避免两次 executor 边界。"""
 
-    payload = _encode_jpeg_frame(frame)
+    payload, width, height = _encode_jpeg_frame(frame)
     if cancel_requested.is_set():
         return None
     if len(payload) > _MAX_JPEG_PAYLOAD_BYTES:
-        raise RuntimeError("JPEG 帧超过 512 KiB UDS 载荷上限。")
-    return uds_sender.send_frame(payload)
+        raise RuntimeError("JPEG 帧超过 512 KiB 共享内存帧上限。")
+    shm_writer.write_frame(payload, width, height)
+    return True
 
 
 async def _consume_video_track(
     track: Any,
-    uds_sender: VideoUdsSender,
+    shm_writer: VideoShmWriter,
     first_frame: asyncio.Event,
     cancel_requested: threading.Event,
 ) -> None:
@@ -188,18 +189,16 @@ async def _consume_video_track(
             frame = await frames.get()
             if isinstance(frame, Exception):
                 raise frame
-            # 取消时线程池任务无法中断，由 _encode_and_send_frame 在编码结束、
-            # 发送开始之前检查 cancel_requested，跳过这一帧即可。
+            # 取消时线程池任务无法中断，由 _encode_and_write_frame 在编码结束、
+            # 写入开始之前检查 cancel_requested，跳过这一帧即可。
             sent = await _run_blocking(
-                _encode_and_send_frame,
+                _encode_and_write_frame,
                 frame,
-                uds_sender,
+                shm_writer,
                 cancel_requested,
             )
             if sent is None:
                 raise asyncio.CancelledError
-            if not sent:
-                raise RuntimeError("UDS 发送失败，Rust 视频中转连接已断开。")
             first_frame.set()
     except asyncio.CancelledError:
         raise
@@ -233,11 +232,8 @@ async def _cancel_and_wait_consumer(
 
 async def _stream_once(config: Go2DataPlaneConfig) -> None:
     stream_config = config.video_stream
-    uds_path = runtime_value("NUWAX_VIDEO_UDS_PATH", "/tmp/nuwax_video.sock")
-    uds_sender = VideoUdsSender(
-        uds_path,
-        reconnect_interval=max(0.1, float(stream_config.reconnect_sec)),
-    )
+    shm_path = runtime_value("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
+    shm_writer = VideoShmWriter(shm_path)
     connection = None
     video_channel = None
     channel_enabled = False
@@ -249,9 +245,7 @@ async def _stream_once(config: Go2DataPlaneConfig) -> None:
 
     try:
         connection, fatal_auth_errors = _create_webrtc_connection(config)
-        if not await _run_blocking(uds_sender.connect):
-            raise RuntimeError(f"无法连接 Rust 视频中转 UDS: {uds_path}")
-        LOGGER.info("视频推流已连接 Rust UDS: %s", uds_path)
+        LOGGER.info("视频推流直接写共享内存: %s", shm_path)
 
         try:
             await connection.connect()
@@ -284,7 +278,7 @@ async def _stream_once(config: Go2DataPlaneConfig) -> None:
             consumer_task = asyncio.create_task(
                 _consume_video_track(
                     track,
-                    uds_sender,
+                    shm_writer,
                     first_frame,
                     consumer_cancel_requested,
                 ),
@@ -353,7 +347,7 @@ async def _stream_once(config: Go2DataPlaneConfig) -> None:
                     await disconnect()
                 except Exception:
                     LOGGER.warning("断开 Go2 WebRTC 连接失败。", exc_info=True)
-        uds_sender.close()
+        shm_writer.close()
         if not consumer_stopped and consumer_task is not None:
             done, _ = await asyncio.wait(
                 (consumer_task,),
@@ -362,7 +356,7 @@ async def _stream_once(config: Go2DataPlaneConfig) -> None:
             if consumer_task in done:
                 await asyncio.gather(consumer_task, return_exceptions=True)
             else:
-                LOGGER.error("关闭 UDS 后 Go2 WebRTC consumer Task 仍未停止。")
+                LOGGER.error("关闭共享内存写端后 Go2 WebRTC consumer Task 仍未停止。")
 
 
 async def run_forever(config: Go2DataPlaneConfig) -> None:

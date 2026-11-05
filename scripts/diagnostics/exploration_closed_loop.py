@@ -69,7 +69,6 @@ def configure(output, calibrated_motion=False, pipeline="lio_3d", calibrated_obs
         "NUWAX_CLOUDMAP_SHM_PATH": str(working / "cloud.shm"),
         "NUWAX_OCCUPANCY_SHM_PATH": str(working / "occupancy.shm"),
         "NUWAX_VIDEO_SHM_PATH": str(working / "video.shm"),
-        "NUWAX_VIDEO_UDS_PATH": str(working / "video.sock"),
         "NUWAX_LOG_DIR": str(output / "组件日志"),
         "NUWAX_LOG_FILE": str(output / "组件日志/网关.log"),
         "NUWAX_LOG_LEVEL": "INFO",

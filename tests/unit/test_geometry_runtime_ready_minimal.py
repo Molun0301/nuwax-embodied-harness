@@ -65,7 +65,6 @@ def test_client_minimal_ready_then_grpc_status_gate(
         "_verify_attached_runtime_locked",
         lambda: grpc_checks.append(True) or True,
     )
-    monkeypatch.setattr(client, "_warn_if_video_relay_missing", lambda: None)
 
     assert client._verify_ready_locked() is True
     assert client.start() is True
@@ -90,7 +89,6 @@ def test_client_detects_changed_live_ready_pid_before_cached_health(
     monkeypatch.setattr(
         client, "_verify_attached_runtime_locked", lambda: health_calls.append(True) or True
     )
-    monkeypatch.setattr(client, "_warn_if_video_relay_missing", lambda: None)
     assert client.start() is True
     assert client.is_running is True
     assert len(health_calls) == 1
@@ -123,7 +121,6 @@ def test_client_rejects_ready_process_change_during_health_check(
     client = GeometryRuntimeSubprocess(port=50123)
     monkeypatch.setattr(client, "_is_port_open", lambda: True)
     monkeypatch.setattr(client, "_verify_attached_runtime_locked", lambda: True)
-    monkeypatch.setattr(client, "_warn_if_video_relay_missing", lambda: None)
     if already_attached:
         assert client.start() is True
         client._attached_health_check_at = 0.0
@@ -196,7 +193,6 @@ def test_client_always_calls_real_get_status_gate(
 
     client = GeometryRuntimeSubprocess(port=50123)
     monkeypatch.setattr(client, "_is_port_open", lambda: True)
-    monkeypatch.setattr(client, "_warn_if_video_relay_missing", lambda: None)
 
     assert client.start() is (not grpc_fails)
     assert "127.0.0.1:50123" in calls

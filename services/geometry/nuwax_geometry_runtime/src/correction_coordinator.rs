@@ -4,7 +4,7 @@
 //! fail-closed candidate boundary and adds the Geometry-owned canonical apply
 //! transaction plus the retained production transport lifecycle.
 
-mod preflight_only_contract {
+mod correction_runtime {
 
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::sync::{
@@ -13664,7 +13664,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
                 (r#"{"not_wired":1}"#, "rejected"),
             ] {
                 let output = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact", "correction_coordinator::preflight_only_contract::tests::pgo_environment_preflight_probe", "--nocapture"])
+                    .args(["--exact", "correction_coordinator::correction_runtime::tests::pgo_environment_preflight_probe", "--nocapture"])
                     .env(PGO_OPTIONS_ENV, raw)
                     .env("NUWAX_PGO_PREFLIGHT_EXPECTED", expected)
                     .env("NUWAX_MAP_FRAME", "map")
@@ -17497,7 +17497,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
             let status = Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
                 .arg(
-                    "correction_coordinator::preflight_only_contract::tests::canonical_production_fail_stop_exits_with_7",
+                    "correction_coordinator::correction_runtime::tests::canonical_production_fail_stop_exits_with_7",
                 )
                 .arg("--nocapture")
                 .env(CHILD_ENV, "1")
@@ -17537,7 +17537,7 @@ assert candidate.occupancy_revision != candidate.cloud_revision
     }
 }
 
-pub(crate) use preflight_only_contract::{
+pub(crate) use correction_runtime::{
     RELOCALIZATION_MAX_TERMINAL_BYTES, RELOCALIZATION_MAX_CANDIDATE_PREIMAGE_BYTES, validate_relocalization_request_id,
     relocalization_source_policy_preimage_v1, relocalization_deadline_policy_preimage_v1,
     relocalization_algorithm_options_preimage_v1, retained_algorithm_options_v2, normalize_relocalization_logical_timeout_ms,
@@ -17556,9 +17556,9 @@ pub(crate) use preflight_only_contract::{
 };
 
 #[cfg(test)]
-pub(crate) use preflight_only_contract::{
+pub(crate) use correction_runtime::{
     CorrectionCandidateIdentity, CorrectionTransform, CorrectionTransformSemantics, CorrectionCandidateSink, CorrectionDisposition,
 };
 
 #[cfg(test)]
-pub(crate) use preflight_only_contract::{CorrelatedOdomProof,RegisteredCloudProof};
+pub(crate) use correction_runtime::{CorrelatedOdomProof,RegisteredCloudProof};

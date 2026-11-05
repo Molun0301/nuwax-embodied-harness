@@ -72,7 +72,7 @@
     "consumers": [
       "scripts/systemd/start_geometry_runtime.sh",
       "scripts/systemd/wait_for_geometry_runtime_ready.sh",
-      "services/geometry/nuwax_geometry_runtime/src/main.rs"
+      "services/geometry/nuwax_geometry_runtime/src/lib.rs"
     ],
     "apply_scope": "重启几何运行时后生效",
     "description": "启动几何运行进程后，等待其通过健康检查并写出就绪文件的最长时间，单位秒，填正整数；超时视为启动失败。"
@@ -224,25 +224,10 @@
     "consumers": [
       "gateways/runtime.py",
       "gateways/ws/data_streams.py",
-      "services/geometry/geometry_runtime_client.py",
-      "services/geometry/nuwax_geometry_runtime/src/main.rs"
+      "drivers/go2/video_streamer.py"
     ],
-    "apply_scope": "重启网关、几何运行时后生效",
-    "description": "几何运行时把收到的视频帧写入此共享内存文件，网关从中读取画面供网页视频和视觉感知使用。"
-  },
-  "NUWAX_VIDEO_UDS_PATH": {
-    "zh_name": "视频本地套接字路径",
-    "type": "str",
-    "default": "/tmp/nuwax_video.sock",
-    "section_id": "shm_uds",
-    "target_file": "core_env",
-    "consumers": [
-      "drivers/go2/video_streamer.py",
-      "services/geometry/geometry_runtime_client.py",
-      "services/geometry/nuwax_geometry_runtime/src/main.rs"
-    ],
-    "apply_scope": "重启网关、几何运行时、Go2 视频进程后生效",
-    "description": "视频推流进程向几何运行时发送画面所用的本地套接字路径。"
+    "apply_scope": "重启网关、Go2 视频进程后生效",
+    "description": "Go2 视频推流进程直接将视频帧写入此共享内存文件，网关从中读取画面供网页视频和视觉感知使用。"
   },
   "NUWAX_OSM_TILE_URL_TEMPLATE": {
     "zh_name": "OpenStreetMap 瓦片地址模板",
@@ -1464,7 +1449,7 @@
     "section_id": "logging",
     "target_file": "core_env",
     "consumers": [
-      "services/geometry/nuwax_geometry_runtime/src/main.rs",
+      "services/geometry/nuwax_geometry_runtime/src/lib.rs",
       "services/nuwax-workspace/crates/nuwax-nav-stack/src/bin_support.rs"
     ],
     "apply_scope": "重启几何运行时、导航后端后生效",
@@ -1477,7 +1462,7 @@
     "section_id": "runtime_data",
     "target_file": "core_env",
     "consumers": [
-      "services/geometry/nuwax_geometry_runtime/src/main.rs"
+      "services/geometry/nuwax_geometry_runtime/src/lib.rs"
     ],
     "apply_scope": "重启几何运行时后生效",
     "description": ""
@@ -2372,7 +2357,7 @@
     "advanced": false,
     "consumers": [
       "services/geometry/source_runtime_env.sh",
-      "services/geometry/nuwax_geometry_runtime/src/main.rs",
+      "services/geometry/nuwax_geometry_runtime/src/lib.rs",
       "services/geometry/nuwax_geometry_runtime/src/dynamic_backend.rs"
     ],
     "apply_scope": "重启几何运行时后生效，无需重新构建",
@@ -2393,7 +2378,7 @@
     "target_file": "core_env",
     "advanced": false,
     "consumers": [
-      "services/geometry/nuwax_geometry_runtime/src/main.rs",
+      "services/geometry/nuwax_geometry_runtime/src/lib.rs",
       "services/geometry/nuwax_geometry_runtime/src/fine_cloud.rs"
     ],
     "apply_scope": "重启几何运行时后生效，无需重新构建",
@@ -2410,7 +2395,7 @@
     "target_file": "core_env",
     "advanced": false,
     "consumers": [
-      "services/geometry/nuwax_geometry_runtime/src/main.rs",
+      "services/geometry/nuwax_geometry_runtime/src/lib.rs",
       "services/geometry/nuwax_geometry_runtime/src/fine_cloud.rs"
     ],
     "apply_scope": "重启几何运行时后生效，无需重新构建",
@@ -2443,7 +2428,7 @@
     "target_file": "core_env",
     "advanced": true,
     "consumers": [
-      "services/geometry/nuwax_geometry_runtime/src/main.rs",
+      "services/geometry/nuwax_geometry_runtime/src/lib.rs",
       "services/nuwax-workspace/crates/nuwax-cloud-cleanup/src/scan_log.rs"
     ],
     "apply_scope": "重启几何运行时后生效",

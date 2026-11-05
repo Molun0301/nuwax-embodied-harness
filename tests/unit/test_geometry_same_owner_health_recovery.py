@@ -22,7 +22,6 @@ def attached(monkeypatch):
         return source['healthy']
     monkeypatch.setattr(client, '_verify_ready_locked', ready)
     monkeypatch.setattr(client, '_verify_attached_runtime_locked', probe)
-    monkeypatch.setattr(client, '_warn_if_video_relay_missing', lambda: None)
     assert client.start()
     return client, source
 

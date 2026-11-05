@@ -70,9 +70,6 @@ const POINT_CLOUD2_MESSAGE_TYPE: &str = "sensor_msgs.PointCloud2";
 use crate::channel_registry;
 use crate::channel_registry::ChannelKey;
 
-#[cfg(test)]
-#[path = "vertical_v2_canary.rs"]
-pub(crate) mod vertical_v2_canary;
 #[path = "mapping_observation.rs"]
 pub(crate) mod mapping_observation;
 
@@ -875,284 +872,11 @@ enum GeometryTaskClass {
     Retained,
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum GeometryTopologyInjectedTerminal {
-    Eof,
-    TransportError,
-    Panic,
-    JoinFailure,
-}
-
-#[cfg(test)]
-#[derive(Default)]
-pub(crate) struct GeometryTopologyTestControl {
-    surface_retry_clock: std::sync::OnceLock<tokio::time::Instant>,
-    events: parking_lot::Mutex<Vec<String>>,
-    task_control: parking_lot::Mutex<Option<GeometryRuntimeTaskControl>>,
-    startup_shutdown_emitter:
-        parking_lot::Mutex<Option<crate::lio_owner::GeometryShutdownEventEmitter>>,
-    startup_shutdown_recorder:
-        parking_lot::Mutex<Option<crate::lio_owner::GeometryShutdownEventRecorder>>,
-    startup_shutdown_emitted: parking_lot::Mutex<Vec<crate::lio_owner::GeometryShutdownStage>>,
-    rejected_registration: parking_lot::Mutex<Option<&'static str>>,
-    injected_terminal: parking_lot::Mutex<Option<(&'static str, GeometryTopologyInjectedTerminal)>>,
-    terminal_released: std::sync::atomic::AtomicBool,
-    terminal_release: tokio::sync::Notify,
-    revision_prepare_enabled: std::sync::atomic::AtomicBool,
-    revision_prepare_entered: std::sync::atomic::AtomicBool,
-    revision_prepare_released: std::sync::atomic::AtomicBool,
-    scheduler_block_enabled: std::sync::atomic::AtomicBool,
-    scheduler_block_entered: std::sync::atomic::AtomicBool,
-    scheduler_block_released: std::sync::atomic::AtomicBool,
-}
-
-#[cfg(test)]
-impl GeometryTopologyTestControl {
-    pub(crate) fn new() -> Arc<Self> {
-        let control = Arc::new(Self::default());
-        let (emitter, recorder) = crate::lio_owner::GeometryShutdownEventEmitter::recording(0);
-        *control.startup_shutdown_emitter.lock() = Some(emitter);
-        *control.startup_shutdown_recorder.lock() = Some(recorder);
-        control
-    }
-
-    pub(crate) fn install(self: &Arc<Self>) -> GeometryTopologyTestInstallation {
-        GeometryTopologyTestInstallation {
-            control: self.clone(),
-        }
-    }
-
-    pub(crate) fn reject_registration(&self, name: &'static str) {
-        *self.rejected_registration.lock() = Some(name);
-    }
-
-    pub(crate) fn inject_terminal(
-        &self,
-        name: &'static str,
-        terminal: GeometryTopologyInjectedTerminal,
-    ) {
-        *self.injected_terminal.lock() = Some((name, terminal));
-    }
-
-    pub(crate) fn release_terminal(&self) {
-        self.terminal_released
-            .store(true, std::sync::atomic::Ordering::Release);
-        self.terminal_release.notify_waiters();
-    }
-
-    pub(crate) fn events(&self) -> Vec<String> {
-        self.events.lock().clone()
-    }
-
-    pub(crate) fn task_control(&self) -> GeometryRuntimeTaskControl {
-        self.task_control
-            .lock()
-            .as_ref()
-            .cloned()
-            .expect("production topology task admission control")
-    }
-
-    pub(crate) fn startup_shutdown_stages(&self) -> Vec<crate::lio_owner::GeometryShutdownStage> {
-        self.startup_shutdown_recorder
-            .lock()
-            .as_ref()
-            .expect("production startup shutdown recorder")
-            .stages()
-    }
-
-    pub(crate) fn enable_revision_prepare_probe(&self) {
-        self.revision_prepare_enabled
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    pub(crate) fn revision_prepare_entered(&self) -> bool {
-        self.revision_prepare_entered
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    pub(crate) fn release_revision_prepare(&self) {
-        self.revision_prepare_released
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    pub(crate) fn enable_scheduler_block(&self) {
-        self.scheduler_block_enabled
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    pub(crate) fn scheduler_block_entered(&self) -> bool {
-        self.scheduler_block_entered
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    pub(crate) fn release_scheduler_block(&self) {
-        self.scheduler_block_released
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    fn release_all(&self) {
-        self.release_terminal();
-        self.release_revision_prepare();
-        self.release_scheduler_block();
-    }
-
-    fn attach_task_control(&self, control: GeometryRuntimeTaskControl) {
-        *self.task_control.lock() = Some(control);
-    }
-
-    fn clear_task_control(&self) {
-        self.task_control.lock().take();
-    }
-
-    fn emit_startup_shutdown_stage(&self, stage: crate::lio_owner::GeometryShutdownStage) {
-        let should_emit = {
-            let mut emitted = self.startup_shutdown_emitted.lock();
-            if emitted.contains(&stage) {
-                false
-            } else {
-                emitted.push(stage);
-                true
-            }
-        };
-        if should_emit {
-            self.startup_shutdown_emitter
-                .lock()
-                .as_ref()
-                .expect("production startup shutdown emitter")
-                .emit_completed(stage);
-        }
-    }
-
-    fn record_surface_clock(&self, kind: &str, revision: i64, at: tokio::time::Instant) {
-        let origin = *self.surface_retry_clock.get_or_init(|| at);
-        self.record(format!("surface-clock:{kind}:{revision}:{}",
-            at.saturating_duration_since(origin).as_nanos()));
-    }
-
-    fn record(&self, event: impl Into<String>) {
-        self.events.lock().push(event.into());
-    }
-
-    fn should_reject_registration(&self, name: &'static str) -> bool {
-        self.rejected_registration.lock().as_ref() == Some(&name)
-    }
-
-    fn injected_terminal_for(
-        &self,
-        name: &'static str,
-    ) -> Option<GeometryTopologyInjectedTerminal> {
-        self.injected_terminal
-            .lock()
-            .as_ref()
-            .and_then(|(registered, terminal)| (*registered == name).then_some(*terminal))
-    }
-}
-
-#[cfg(test)]
-tokio::task_local! {
-    static TEST_GEOMETRY_TOPOLOGY_CONTROL: Arc<GeometryTopologyTestControl>;
-}
-
-#[cfg(test)]
-pub(crate) struct GeometryTopologyTestInstallation {
-    control: Arc<GeometryTopologyTestControl>,
-}
-
-#[cfg(test)]
-impl Drop for GeometryTopologyTestInstallation {
-    fn drop(&mut self) {
-        self.control.release_all();
-        self.control.clear_task_control();
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn topology_test_control() -> Option<Arc<GeometryTopologyTestControl>> {
-    TEST_GEOMETRY_TOPOLOGY_CONTROL.try_with(Arc::clone).ok()
-}
-
-#[cfg(test)]
-fn record_topology_event(event: impl Into<String>) {
-    if let Some(control) = topology_test_control() {
-        control.record(event);
-    }
-}
-
-#[cfg(test)]
-async fn wait_for_topology_terminal_release() {
-    let Some(control) = topology_test_control() else {
-        return;
-    };
-    loop {
-        let released = control.terminal_release.notified();
-        if control
-            .terminal_released
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return;
-        }
-        released.await;
-    }
-}
-
-#[cfg(test)]
-fn wait_for_topology_revision_prepare_release() {
-    let Some(control) = topology_test_control() else {
-        return;
-    };
-    if !control
-        .revision_prepare_enabled
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
-        return;
-    }
-    control
-        .revision_prepare_entered
-        .store(true, std::sync::atomic::Ordering::Release);
-    control.record("revision-prepare-entered");
-    while !control
-        .revision_prepare_released
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
-        std::thread::yield_now();
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn wait_for_topology_scheduler_release(
-    control: Option<Arc<GeometryTopologyTestControl>>,
-) {
-    let Some(control) = control else {
-        return;
-    };
-    if !control
-        .scheduler_block_enabled
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
-        return;
-    }
-    control
-        .scheduler_block_entered
-        .store(true, std::sync::atomic::Ordering::Release);
-    control.record("scheduler-block-entered");
-    while !control
-        .scheduler_block_released
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
-        std::thread::yield_now();
-    }
-}
-
 struct GeometryTaskRegistration {
     name: &'static str,
     class: GeometryTaskClass,
     future: GeometryTaskFuture,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    #[cfg(test)]
-    injected_terminal: Option<GeometryTopologyInjectedTerminal>,
-    #[cfg(test)]
-    topology_control: Option<Arc<GeometryTopologyTestControl>>,
 }
 
 struct GeometryTaskAdmission {
@@ -1164,8 +888,6 @@ struct GeometryRuntimeTaskControlInner {
     admission: parking_lot::Mutex<GeometryTaskAdmission>,
     shutdown_request_tx: watch::Sender<bool>,
     persistent_stop_tx: watch::Sender<bool>,
-    #[cfg(test)]
-    topology_control: Option<Arc<GeometryTopologyTestControl>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1205,54 +927,24 @@ pub(crate) struct GeometryRuntimeTaskControl {
 
 impl GeometryRuntimeTaskControl {
     fn channel() -> (Self, mpsc::UnboundedReceiver<GeometryTaskRegistration>) {
-        #[cfg(test)]
-        return Self::channel_with_topology_control(None);
-
-        #[cfg(not(test))]
-        {
-            let (registration_tx, registration_rx) = mpsc::unbounded_channel();
-            let (shutdown_request_tx, _) = watch::channel(false);
-            let (persistent_stop_tx, _) = watch::channel(false);
-            (
-                Self {
-                    inner: Arc::new(GeometryRuntimeTaskControlInner {
-                        admission: parking_lot::Mutex::new(GeometryTaskAdmission {
-                            open: true,
-                            registration_tx,
-                        }),
-                        shutdown_request_tx,
-                        persistent_stop_tx,
-                    }),
-                },
-                registration_rx,
-            )
-        }
-    }
-
-    #[cfg(test)]
-    fn channel_with_topology_control(
-        topology_control: Option<Arc<GeometryTopologyTestControl>>,
-    ) -> (Self, mpsc::UnboundedReceiver<GeometryTaskRegistration>) {
         let (registration_tx, registration_rx) = mpsc::unbounded_channel();
         let (shutdown_request_tx, _) = watch::channel(false);
         let (persistent_stop_tx, _) = watch::channel(false);
-        let attached_topology_control = topology_control.clone();
-        let control = Self {
-            inner: Arc::new(GeometryRuntimeTaskControlInner {
-                admission: parking_lot::Mutex::new(GeometryTaskAdmission {
-                    open: true,
-                    registration_tx,
+        (
+            Self {
+                inner: Arc::new(GeometryRuntimeTaskControlInner {
+                    admission: parking_lot::Mutex::new(GeometryTaskAdmission {
+                        open: true,
+                        registration_tx,
+                    }),
+                    shutdown_request_tx,
+                    persistent_stop_tx,
                 }),
-                shutdown_request_tx,
-                persistent_stop_tx,
-                topology_control,
-            }),
-        };
-        if let Some(topology_control) = attached_topology_control {
-            topology_control.attach_task_control(control.clone());
-        }
-        (control, registration_rx)
+            },
+            registration_rx,
+        )
     }
+
 
     pub(crate) fn close_admission(&self) {
         self.inner.admission.lock().open = false;
@@ -1289,10 +981,6 @@ impl GeometryRuntimeTaskControl {
             class,
             future: Box::pin(future),
             started_tx: None,
-            #[cfg(test)]
-            injected_terminal: None,
-            #[cfg(test)]
-            topology_control: None,
         }
     }
 
@@ -1308,10 +996,6 @@ impl GeometryRuntimeTaskControl {
                 class,
                 future: Box::pin(future),
                 started_tx: Some(started_tx),
-                #[cfg(test)]
-                injected_terminal: None,
-                #[cfg(test)]
-                topology_control: None,
             },
             started_rx,
         )
@@ -1321,34 +1005,12 @@ impl GeometryRuntimeTaskControl {
         &self,
         registration: GeometryTaskRegistration,
     ) -> Result<(), RejectedGeometryTaskRegistration> {
-        #[cfg(test)]
-        let mut registration = registration;
-        #[cfg(test)]
-        let topology_control = self.inner.topology_control.as_ref();
-        #[cfg(test)]
-        if let Some(control) = topology_control {
-            if control.should_reject_registration(registration.name) {
-                control.record(format!("rejected:{}", registration.name));
-                return Err(RejectedGeometryTaskRegistration {
-                    kind: GeometryTaskRegistrationFailureKind::AdmissionClosed,
-                    registration,
-                });
-            }
-            if registration.injected_terminal.is_none() {
-                registration.injected_terminal = control.injected_terminal_for(registration.name);
-            }
-            registration.topology_control = Some(Arc::clone(control));
-        }
         let admission = self.inner.admission.lock();
         if !admission.open {
             return Err(RejectedGeometryTaskRegistration {
                 kind: GeometryTaskRegistrationFailureKind::AdmissionClosed,
                 registration,
             });
-        }
-        #[cfg(test)]
-        if let Some(control) = topology_control {
-            control.record(format!("registered:{}", registration.name));
         }
         admission
             .registration_tx
@@ -1386,18 +1048,6 @@ impl GeometryRuntimeTaskControl {
         self.register(name, GeometryTaskClass::Retained, future)
     }
 
-    #[cfg(test)]
-    fn register_injected_terminal(
-        &self,
-        name: &'static str,
-        terminal: GeometryTopologyInjectedTerminal,
-    ) -> Result<(), String> {
-        let mut registration =
-            Self::registration(name, GeometryTaskClass::Persistent, std::future::pending());
-        registration.injected_terminal = Some(terminal);
-        self.try_register(registration)
-            .map_err(|error| error.detail())
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1649,21 +1299,13 @@ fn spawn_registered_geometry_task(
         *retained_tasks = (*retained_tasks).saturating_add(1);
     }
     tasks.spawn(async move {
-        #[cfg(test)]
-        let topology_control = registration.topology_control.clone();
         let run = async move {
             let GeometryTaskRegistration {
                 name,
                 class,
                 future,
                 started_tx,
-                #[cfg(test)]
-                injected_terminal,
-                #[cfg(test)]
-                    topology_control: _,
             } = registration;
-            #[cfg(test)]
-            record_topology_event(format!("started:{name}"));
             if let Some(started_tx) = started_tx {
                 let _ = started_tx.send(());
             }
@@ -1671,29 +1313,9 @@ fn spawn_registered_geometry_task(
                 .catch_unwind()
                 .await
                 .unwrap_or_else(|_| Err(format!("Geometry task {name} panicked")));
-            #[cfg(test)]
-            if injected_terminal == Some(GeometryTopologyInjectedTerminal::JoinFailure) {
-                panic!("injected join failure for {name}");
-            }
-            // Test-only lifecycle evidence for the retained-dispatch controls.
-            // Existing task event streams are otherwise unchanged.
-            #[cfg(test)]
-            if name == "exploration-child-dispatch" {
-                record_topology_event(format!("completed:{name}"));
-            }
             (name, class, result)
         };
-        #[cfg(test)]
-        {
-            match topology_control {
-                Some(control) => TEST_GEOMETRY_TOPOLOGY_CONTROL.scope(control, run).await,
-                None => run.await,
-            }
-        }
-        #[cfg(not(test))]
-        {
-            run.await
-        }
+        run.await
     });
 }
 
@@ -1796,7 +1418,6 @@ impl GeometryRuntimeStartupRejectedWorkOwner {
         rejected_future: Option<GeometryTaskFuture>,
         pending_subscriptions: Vec<(&'static str, nuwax_transport::OwnedLcmSubscription)>,
         pending_children: Vec<(&'static str, JoinHandle<()>)>,
-        #[cfg(test)] topology_control: Option<Arc<GeometryTopologyTestControl>>,
     ) -> Self {
         let rollback_inner = async move {
             let rejected_settlement = async {
@@ -1828,18 +1449,6 @@ impl GeometryRuntimeStartupRejectedWorkOwner {
             };
             GeometryTaskShutdownOutcome::new(result, subscriptions_settled)
         };
-        #[cfg(test)]
-        let rollback = async move {
-            match topology_control {
-                Some(control) => {
-                    TEST_GEOMETRY_TOPOLOGY_CONTROL
-                        .scope(control, rollback_inner)
-                        .await
-                }
-                None => rollback_inner.await,
-            }
-        };
-        #[cfg(not(test))]
         let rollback = rollback_inner;
         Self {
             name,
@@ -1914,8 +1523,6 @@ impl GeometryRuntimeStartupRollbackFailure {
 
 impl GeometryRuntimeStartupRollbackOwner {
     pub(crate) async fn shutdown(mut self) -> Result<(), GeometryRuntimeStartupRollbackFailure> {
-        #[cfg(test)]
-        let topology_control = self.task_owner.control.inner.topology_control.clone();
         let task_shutdown = self.task_owner.shutdown();
         let rejected_shutdown = async {
             match self.rejected_work.as_mut() {
@@ -1945,12 +1552,6 @@ impl GeometryRuntimeStartupRollbackOwner {
                 pending_owner: Some(Box::new(self)),
             });
         }
-        #[cfg(test)]
-        if let Some(control) = &topology_control {
-            control.emit_startup_shutdown_stage(
-                crate::lio_owner::GeometryShutdownStage::GeometryTasksSettled,
-            );
-        }
         let cleanup = cleanup_geometry_startup_files(&self.handle);
         if let Err(error) = cleanup {
             let mut details = self.sticky_error.iter().cloned().collect::<Vec<_>>();
@@ -1960,12 +1561,6 @@ impl GeometryRuntimeStartupRollbackOwner {
                 detail: details.join("; "),
                 pending_owner: Some(Box::new(self)),
             });
-        }
-        #[cfg(test)]
-        if let Some(control) = &topology_control {
-            control.emit_startup_shutdown_stage(
-                crate::lio_owner::GeometryShutdownStage::ResourceCleanupComplete,
-            );
         }
         let mut details = self.sticky_error.into_iter().collect::<Vec<_>>();
         details.extend(rollback_errors);
@@ -2071,34 +1666,25 @@ impl Drop for ProductionTopologyTestEnv {
 #[cfg(test)]
 pub(crate) struct ProductionTopologyTestSetup {
     env: ProductionTopologyTestEnv,
-    pub(crate) control: Arc<GeometryTopologyTestControl>,
-    _installation: GeometryTopologyTestInstallation,
     prepared: Option<PreparedGeometryRuntime>,
 }
 
 #[cfg(test)]
 pub(crate) struct ProductionTopologyTestFixture {
     env: ProductionTopologyTestEnv,
-    pub(crate) control: Arc<GeometryTopologyTestControl>,
-    _installation: GeometryTopologyTestInstallation,
     spawned: Option<SpawnedGeometryRuntime>,
 }
 
 #[cfg(test)]
 pub(crate) struct ProductionTopologyStartupFailureFixture {
     env: ProductionTopologyTestEnv,
-    pub(crate) control: Arc<GeometryTopologyTestControl>,
-    _installation: GeometryTopologyTestInstallation,
     failure: Option<GeometryRuntimeStartupFailure>,
 }
 
 #[cfg(test)]
 impl ProductionTopologyTestSetup {
-    pub(crate) async fn prepare(configure: impl FnOnce(&Arc<GeometryTopologyTestControl>)) -> Self {
+    pub(crate) async fn prepare() -> Self {
         let env = ProductionTopologyTestEnv::install().await;
-        let control = GeometryTopologyTestControl::new();
-        configure(&control);
-        let installation = control.install();
         let sequence_store = Arc::new(
             SequenceStateStore::open(env.root.join("sequence-state.json"))
                 .expect("production topology sequence state"),
@@ -2113,12 +1699,9 @@ impl ProductionTopologyTestSetup {
             transport: LcmTransport::new_real(&test_lcm_url())
                 .expect("production topology real LCM transport"),
             backend_available: true,
-            topology_control: Some(control.clone()),
         };
         Self {
             env,
-            control,
-            _installation: installation,
             prepared: Some(prepared),
         }
     }
@@ -2158,14 +1741,10 @@ impl ProductionTopologyTestSetup {
         match result {
             Ok(spawned) => Ok(ProductionTopologyTestFixture {
                 env: self.env,
-                control: self.control,
-                _installation: self._installation,
                 spawned: Some(spawned),
             }),
             Err(failure) => Err(ProductionTopologyStartupFailureFixture {
                 env: self.env,
-                control: self.control,
-                _installation: self._installation,
                 failure: Some(failure),
             }),
         }
@@ -2175,16 +1754,15 @@ impl ProductionTopologyTestSetup {
 #[cfg(test)]
 impl ProductionTopologyTestFixture {
     async fn try_start(
-        configure: impl FnOnce(&Arc<GeometryTopologyTestControl>),
     ) -> Result<Self, ProductionTopologyStartupFailureFixture> {
-        ProductionTopologyTestSetup::prepare(configure)
+        ProductionTopologyTestSetup::prepare()
             .await
             .spawn()
             .await
     }
 
-    pub(crate) async fn start(configure: impl FnOnce(&Arc<GeometryTopologyTestControl>)) -> Self {
-        match Self::try_start(configure).await {
+    pub(crate) async fn start() -> Self {
+        match Self::try_start().await {
             Ok(fixture) => fixture,
             Err(failure) => {
                 let detail = failure
@@ -2227,72 +1805,9 @@ impl ProductionTopologyStartupFailureFixture {
     }
 }
 
-/// 生产拓扑按注册顺序列出的常驻任务槽。测试夹具使用生产默认的三维导航配置，
-/// 因此包含只在该配置下注册的 `canonical-navigation-map-revisions`。
-#[cfg(test)]
-const PRODUCTION_TOPOLOGY_PERSISTENT_SLOTS: [&str; 12] = [
-    "navigation-state-consumer",
-    "path-envelope-consumer",
-    "public-tf-observer",
-    "surface-map-consumer",
-    "legacy-global-map-demand",
-    "canonical-navigation-map-revisions",
 
-    "frontier-fanout",
-    "exploration-scheduler",
-    "map-revision-coalescer",
-    "occupancy-lcm-fanout",
-    "exploration-costmap-fanout",
-    "forbidden-zone-watcher",
-];
 
-#[cfg(test)]
-const PRODUCTION_TOPOLOGY_OWNED_CONSUMERS: [&str; 3] = [
-    "navigation-state-consumer",
-    "path-envelope-consumer",
-    "public-tf-observer",
-];
 
-#[cfg(test)]
-fn assert_production_topology_started(events: &[String]) {
-    let expected = PRODUCTION_TOPOLOGY_PERSISTENT_SLOTS
-        .into_iter()
-        .flat_map(|name| [format!("registered:{name}"), format!("started:{name}")])
-        .collect::<Vec<_>>();
-    let actual = events
-        .iter()
-        .filter(|event| event.starts_with("registered:") || event.starts_with("started:"))
-        .cloned()
-        .collect::<Vec<_>>();
-    assert_eq!(actual, expected, "production topology slot order drifted");
-    for name in PRODUCTION_TOPOLOGY_PERSISTENT_SLOTS {
-        let registered = format!("registered:{name}");
-        let started = format!("started:{name}");
-        let registered_at = events
-            .iter()
-            .position(|event| event == &registered)
-            .unwrap_or_else(|| panic!("missing production registration event {registered}"));
-        let started_at = events
-            .iter()
-            .position(|event| event == &started)
-            .unwrap_or_else(|| panic!("missing production start ACK event {started}"));
-        assert!(
-            registered_at < started_at,
-            "{name} started before registration"
-        );
-    }
-}
-
-#[cfg(test)]
-async fn wait_for_topology_condition(label: &str, condition: impl Fn() -> bool) {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while !condition() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
-}
 
 #[cfg(test)]
 fn assert_product_paths(paths: &(std::path::PathBuf, std::path::PathBuf), exist: bool) {
@@ -2300,138 +1815,10 @@ fn assert_product_paths(paths: &(std::path::PathBuf, std::path::PathBuf), exist:
     assert_eq!(paths.1.exists(), exist, "occupancy product path mismatch");
 }
 
-#[cfg(test)]
-fn cleanup_settled_topology_spawn(
-    spawned: &SpawnedGeometryRuntime,
-    outcome: &GeometryTaskShutdownOutcome,
-) {
-    assert!(outcome.producers_settled());
-    cleanup_geometry_startup_files(&spawned.handle)
-        .expect("settled production topology product cleanup");
-}
 
-#[cfg(test)]
-fn assert_owned_consumers_unsubscribed_once(events: &[String]) {
-    for name in PRODUCTION_TOPOLOGY_OWNED_CONSUMERS {
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event.as_str() == format!("unsubscribed:{name}"))
-                .count(),
-            1,
-            "{name} must acknowledge exactly one owned unsubscribe"
-        );
-    }
-}
 
-#[cfg(test)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn geometry_runtime_tasks_subscribe_before_ready_and_join_on_shutdown() {
-    let mut fixture = lifecycle_fixture_with_topology_control(79, "subscription", |_| {}).await;
-    let topology_control = fixture.topology_control();
-    let events_at_constructor_return = topology_control.events();
-    assert_production_topology_started(&events_at_constructor_return);
-    assert_eq!(
-        events_at_constructor_return
-            .iter()
-            .filter(|event| event.starts_with("registered:"))
-            .count(),
-        PRODUCTION_TOPOLOGY_PERSISTENT_SLOTS.len()
-    );
-    assert_eq!(
-        events_at_constructor_return
-            .iter()
-            .filter(|event| event.starts_with("started:"))
-            .count(),
-        PRODUCTION_TOPOLOGY_PERSISTENT_SLOTS.len()
-    );
 
-    let paths = fixture.product_paths();
-    assert_product_paths(&paths, true);
-    let control = fixture
-        .handle()
-        .task_control()
-        .expect("production root task control");
-    let owner = fixture.take_owner();
-    owner.close_ingress();
-    assert!(!control.admission_is_open());
-    let phase_a_rejection = control
-        .register_retained("post-phase-a-probe", async { Ok(()) })
-        .expect_err("Phase A must reject new retained work immediately");
-    assert!(phase_a_rejection.contains("admission is closed"));
-    assert!(!topology_control
-        .events()
-        .iter()
-        .any(|event| event == "registered:post-phase-a-probe"));
-    fixture.assert_downstream_held_before_task_settlement();
-    finish_clean_production_shutdown(Box::new(owner), &fixture, "subscription").await;
-    let events = topology_control.events();
-    assert_owned_consumers_unsubscribed_once(&events);
-    assert_product_paths(&paths, false);
-}
 
-#[cfg(test)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn geometry_runtime_task_failure_is_sticky_and_reaches_root_terminal() {
-    for (index, (terminal_kind, expected)) in [
-        (
-            GeometryTopologyInjectedTerminal::Eof,
-            "persistent Geometry task exited unexpectedly: public-tf-observer",
-        ),
-        (
-            GeometryTopologyInjectedTerminal::TransportError,
-            "Geometry task public-tf-observer failed: public TF receive failed: injected transport error",
-        ),
-        (
-            GeometryTopologyInjectedTerminal::Panic,
-            "Geometry task public-tf-observer panicked",
-        ),
-        (
-            GeometryTopologyInjectedTerminal::JoinFailure,
-            "Geometry task join failed:",
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let mut fixture = lifecycle_fixture_with_topology_control(
-            80 + index as u64,
-            "terminal",
-            |control| {
-                control.inject_terminal("public-tf-observer", terminal_kind);
-            },
-        )
-        .await;
-        let control = fixture.topology_control();
-        assert_production_topology_started(&control.events());
-        control.release_terminal();
-        fixture
-            .assert_geometry_terminal_reaches_main_arbitration(expected)
-            .await;
-        assert_owned_consumers_unsubscribed_once(&control.events());
-        let owner = Box::new(fixture.take_owner());
-        finish_fatal_production_shutdown(owner, &fixture, "terminal", expected).await;
-    }
-}
-
-#[cfg(test)]
-fn start_topology_mapping(
-    handle: &GeometryRuntimeHandle,
-    tag: &str,
-) -> crate::mapping_adapter::MappingSessionSnapshot {
-    let snapshot = handle
-        .mapping_adapter
-        .as_ref()
-        .expect("production topology mapping adapter")
-        .lock()
-        .start_session(
-            &format!("production-topology-session-{tag}"),
-            &format!("production-topology-map-{tag}"),
-        )
-        .expect("production topology Mapping start");
-    assert!(snapshot.active);
-    snapshot
-}
 
 #[cfg(test)]
 fn test_committed_map_identity(revision: u64) -> schema::CommittedMapIdentity {
@@ -2547,12 +1934,11 @@ fn test_wavefront_goal_intent(
 }
 
 #[cfg(test)]
-async fn lifecycle_fixture_with_topology_control(
+async fn lifecycle_fixture(
     generation: u64,
     tag: &str,
-    configure: impl FnOnce(&Arc<GeometryTopologyTestControl>),
 ) -> crate::lifecycle_tests::LifecycleProductionFixture {
-    let setup = ProductionTopologyTestSetup::prepare(configure).await;
+    let setup = ProductionTopologyTestSetup::prepare().await;
     crate::lifecycle_tests::lifecycle_production_fixture_with_setup(generation, tag, false, setup)
         .await
 }
@@ -2624,7 +2010,7 @@ async fn finish_fatal_production_shutdown(
 #[cfg(test)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn planar_preparation_remains_root_owned_after_waiter_drop_and_before_mapping_retirement() {
-    let mut fixture=lifecycle_fixture_with_topology_control(65,"planar-prepare",|_|{}).await;
+    let mut fixture=lifecycle_fixture(65,"planar-prepare").await;
     let handle=fixture.handle();
     let (entered_tx,entered_rx)=oneshot::channel();
     let (release_tx,release_rx)=std::sync::mpsc::channel();
@@ -2642,297 +2028,40 @@ async fn planar_preparation_remains_root_owned_after_waiter_drop_and_before_mapp
     finish_clean_production_shutdown(pending,&fixture,"planar-prepare").await;
 }
 
-#[cfg(test)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn geometry_runtime_retained_tasks_settle_before_mapping_and_shm_cleanup() {
-    // Real retained cloud-map clear, blocked at its canonical publication fence.
-    {
-        let mut fixture = lifecycle_fixture_with_topology_control(61, "cloud-clear", |_| {}).await;
-        let handle = fixture.handle();
-        let mapping = handle
-            .mapping_adapter
-            .as_ref()
-            .expect("production cloud-clear Mapping")
-            .lock()
-            .snapshot();
-        let lifecycle_guard = handle.mapping_lifecycle_lock.lock().await;
-        let admission = handle
-            .begin_cloud_map_session(mapping.session_generation)
-            .await;
-        assert!(matches!(admission, CloudMapSessionAdmission::Registered(_)));
-        wait_for_topology_condition("production cloud-map clear start", || {
-            fixture
-                .topology_control()
-                .events()
-                .iter()
-                .any(|event| event == "started:cloud-map-clear")
-        })
-        .await;
 
-        let pending = first_blocked_production_shutdown(&mut fixture, "cloud-clear").await;
-        drop(lifecycle_guard);
-        finish_clean_production_shutdown(pending, &fixture, "cloud-clear").await;
-    }
 
-    // A cancelled caller drops only its waiter; the real mapping-ingest task stays owned.
-    {
-        let mut fixture = lifecycle_fixture_with_topology_control(63, "ingest", |_| {}).await;
-        let handle = fixture.handle();
-        let lifecycle_guard = handle.mapping_lifecycle_lock.lock().await;
-        let mapping = handle
-            .mapping_adapter
-            .as_ref()
-            .expect("production mapping adapter")
-            .clone();
-        let mapping_lifecycle_lock = handle.mapping_lifecycle_lock.clone();
-        let explore_projection_gate = handle.explore_projection_gate.clone();
-        let committed_map_authority = handle.committed_map_authority.clone();
-        let map_revision_latest_tx = handle.map_revision_latest_tx.clone();
-        let cloud_map_writer = handle.cloud_map_writer.clone();
-        let state = handle.state.clone();
-        let task_control = handle
-            .task_control()
-            .expect("production mapping-ingest task control");
-        let caller = tokio::spawn(async move {
-            ingest_mapping_points_with_backend(
-                &mapping,
-                &mapping_lifecycle_lock,
-                &explore_projection_gate,
-                &committed_map_authority,
-                &map_revision_latest_tx,
-                &cloud_map_writer,
-                &[],
-                16,
-                1,
-                "map",
-                1,
-                &state,
-                MappingCloudSource::Legacy,
-                None,
-                None,
-                None,
-                Some(&task_control),
-                None,
-                None,
-                None,
-            )
-            .await
-        });
-        wait_for_topology_condition("production mapping-ingest start", || {
-            let events = fixture.topology_control().events();
-            events
-                .iter()
-                .any(|event| event == "registered:mapping-ingest")
-                && events.iter().any(|event| event == "started:mapping-ingest")
-        })
-        .await;
-        caller.abort();
-        let caller_error = match caller.await {
-            Err(error) => error,
-            Ok(_) => panic!("mapping-ingest caller unexpectedly completed"),
-        };
-        assert!(caller_error.is_cancelled());
 
-        let pending =
-            first_blocked_production_shutdown(&mut fixture, "caller-cancelled-ingest").await;
-        drop(lifecycle_guard);
-        finish_clean_production_shutdown(pending, &fixture, "caller-cancelled-ingest").await;
-    }
-}
 
 #[cfg(test)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn geometry_runtime_startup_registration_failure_never_detaches_pre_spawned_child() {
-    for (index, rejected_name) in PRODUCTION_TOPOLOGY_PERSISTENT_SLOTS.into_iter().enumerate() {
-        let blocks_pre_spawned_scheduler = rejected_name == "map-revision-coalescer";
-        let setup = ProductionTopologyTestSetup::prepare(|control| {
-            control.reject_registration(rejected_name);
-            if blocks_pre_spawned_scheduler {
-                control.enable_scheduler_block();
-            }
-        })
-        .await;
-        let paths = setup.product_paths();
-        let control = setup.control.clone();
-        let (lio, lio_shutdown) = crate::lifecycle_tests::start_lio_before_geometry_for_tests(
-            setup.transport(),
-            70 + index as u64,
-            &format!("r{index}"),
-        )
-        .await;
-        assert!(!lio_shutdown.is_shutdown_requested());
-        let attempt = setup.spawn().await;
-        let mut failed = match attempt {
-            Ok(mut fixture) => {
-                let spawned = fixture.take_spawned();
-                let _ = crate::lio_owner::GeometryRuntimeOwner::new(spawned, lio)
-                    .shutdown()
-                    .await;
-                panic!("production registration {rejected_name} unexpectedly succeeded");
-            }
-            Err(failed) => failed,
-        };
-        assert_eq!(failed.product_paths(), paths);
-        let events = control.events();
-        assert!(events
-            .iter()
-            .any(|event| event == &format!("rejected:{rejected_name}")));
-        let failure = failed.take_failure();
-        let registration_error = failure.to_string();
-        assert!(
-            registration_error.contains(rejected_name),
-            "registration_error={registration_error}"
-        );
-        let task_control = control.task_control();
-        assert!(
-            !task_control.admission_is_open(),
-            "{rejected_name} left public task admission open after Phase A"
-        );
-        let phase_a_rejection = task_control
-            .register_retained("post-startup-rejection-probe", async { Ok(()) })
-            .expect_err("startup Phase A must reject retained registration");
-        assert!(
-            phase_a_rejection.contains("admission is closed"),
-            "{rejected_name} probe rejection={phase_a_rejection:?}"
-        );
-        assert!(!control
-            .events()
-            .iter()
-            .any(|event| event == "registered:post-startup-rejection-probe"));
-
-        if blocks_pre_spawned_scheduler {
-            wait_for_topology_condition("pre-spawned scheduler worker", || {
-                control.scheduler_block_entered()
-            })
-            .await;
-            assert!(failure.has_rollback_owner_for_tests());
-            assert_product_paths(&paths, true);
-            assert!(!lio_shutdown.is_shutdown_requested());
-            let pending = tokio::time::timeout(
-                GEOMETRY_TASK_SHUTDOWN_TIMEOUT + Duration::from_secs(1),
-                crate::lifecycle_tests::first_geometry_startup_and_lio_rollback_attempt_for_tests(
-                    failure, lio,
-                ),
-            )
-            .await
-            .expect("combined Geometry/LIO rollback attempt deadline")
-            .expect("blocked startup rollback must retain the combined owner pair");
-            assert_product_paths(&paths, true);
-            assert!(!lio_shutdown.is_shutdown_requested());
-            assert!(control.startup_shutdown_stages().is_empty());
-            control.release_scheduler_block();
-            tokio::time::timeout(Duration::from_secs(5), pending.final_join())
-                .await
-                .expect("same combined owner pair final-join deadline");
-            assert!(lio_shutdown.is_shutdown_requested());
-            assert_product_paths(&paths, false);
-            assert_eq!(
-                control.startup_shutdown_stages(),
-                vec![
-                    crate::lio_owner::GeometryShutdownStage::GeometryTasksSettled,
-                    crate::lio_owner::GeometryShutdownStage::ResourceCleanupComplete,
-                ]
-            );
-        } else {
-            assert_eq!(
-                control.startup_shutdown_stages(),
-                vec![
-                    crate::lio_owner::GeometryShutdownStage::GeometryTasksSettled,
-                    crate::lio_owner::GeometryShutdownStage::ResourceCleanupComplete,
-                ],
-                "{rejected_name} startup cleanup recorder was not connected"
-            );
-            let pending =
-                crate::lifecycle_tests::first_geometry_startup_and_lio_rollback_attempt_for_tests(
-                    failure, lio,
-                )
-                .await;
-            assert!(
-                pending.is_none(),
-                "settled rejection retained an owner pair"
-            );
-            assert!(lio_shutdown.is_shutdown_requested());
-            assert_product_paths(&paths, false);
-        }
-        assert_owned_consumers_unsubscribed_once(&control.events());
-    }
-}
-
-#[cfg(test)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn geometry_runtime_blocking_revision_prepare_settles_before_resource_cleanup() {
-    let mut fixture = lifecycle_fixture_with_topology_control(64, "revision-prepare", |control| {
-        control.enable_revision_prepare_probe();
-    })
-    .await;
-    let handle = fixture.handle();
-    let event = test_owner_map_revision(
-        &mut handle.mapping_adapter.as_ref().expect("production revision Mapping").lock(),
-        &MapState {
-            width: 1,
-            height: 1,
-            resolution: 0.25,
-            frame_id: "map".to_owned(),
-            revision: 1,
-            timestamp_ns: crate::explore_runtime::now_unix_nanos(),
-            data: vec![0],
-            ..MapState::default()
-        },
-    );
-    handle
-        .map_revision_tx
-        .send(event)
-        .expect("production map-revision coalescer receiver");
-    wait_for_topology_condition("real occupancy prepare boundary", || {
-        fixture.topology_control().revision_prepare_entered()
-    })
-    .await;
-    assert!(fixture
-        .topology_control()
-        .events()
-        .iter()
-        .any(|event| event == "started:map-revision-coalescer"));
-
-    let pending = first_blocked_production_shutdown(&mut fixture, "revision-prepare").await;
-    fixture.topology_control().release_revision_prepare();
-    wait_for_topology_condition("occupancy preparation actually returned", || {
-        fixture
-            .topology_control()
-            .events()
-            .iter()
-            .any(|event| event == "revision-prepare-finished")
-    })
-    .await;
+async fn geometry_runtime_tasks_close_admission_and_join_on_shutdown() {
+    let mut fixture = lifecycle_fixture(79, "subscription").await;
+    let paths = fixture.product_paths();
+    assert_product_paths(&paths, true);
+    let control = fixture.handle().task_control().unwrap();
+    let owner = fixture.take_owner();
+    owner.close_ingress();
+    assert!(!control.admission_is_open());
+    assert!(control.register_retained("post-phase-a-probe", async { Ok(()) })
+        .unwrap_err().contains("admission is closed"));
     fixture.assert_downstream_held_before_task_settlement();
-    finish_clean_production_shutdown(pending, &fixture, "revision-prepare").await;
+    finish_clean_production_shutdown(Box::new(owner), &fixture, "subscription").await;
+    assert_product_paths(&paths, false);
 }
 
 #[cfg(test)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn geometry_runtime_scheduler_abort_join_timeout_blocks_resource_cleanup() {
-    let mut fixture = lifecycle_fixture_with_topology_control(65, "scheduler-timeout", |control| {
-        control.enable_scheduler_block();
-    })
-    .await;
-    wait_for_topology_condition("real exploration scheduler worker", || {
-        fixture.topology_control().scheduler_block_entered()
-    })
-    .await;
-    assert!(fixture
-        .topology_control()
-        .events()
-        .iter()
-        .any(|event| event == "started:exploration-scheduler"));
-
-    let pending = first_blocked_production_shutdown(&mut fixture, "scheduler-timeout").await;
-    fixture.topology_control().release_scheduler_block();
-    finish_fatal_production_shutdown(
-        pending,
-        &fixture,
-        "scheduler-timeout",
-        "abort join timed out",
-    )
-    .await;
+#[tokio::test]
+async fn geometry_runtime_task_failure_remains_sticky_without_injection() {
+    let (control, registrations) = GeometryRuntimeTaskControl::channel();
+    let mut owner = GeometryRuntimeTaskOwner::start(control.clone(), registrations);
+    control.register_persistent("failed-worker", async { Err("工作任务失败".into()) }).unwrap();
+    let first = owner.wait_terminal().await.unwrap_err();
+    assert!(first.contains("工作任务失败"));
+    assert_eq!(owner.wait_terminal().await.unwrap_err(), first);
+    let outcome = owner.shutdown().await;
+    assert!(outcome.producers_settled());
+    assert_eq!(outcome.result.unwrap_err(), first);
+    assert!(!control.admission_is_open());
 }
 
 /// 几何 runtime 句柄。`server.rs` 通过此句柄读 SharedState、订阅 cloud_map_tx
@@ -5967,17 +5096,9 @@ fn map_revision_coalescer_future_in_frame(
                             let prepare_result = {
                                 let mut writer = writer.lock();
                                 writer.begin_session(session_generation).and_then(|()| {
-                                    #[cfg(test)]
-                                    wait_for_topology_revision_prepare_release();
                                     writer.prepare_occupancy(&event)
                                 })
                             };
-                            #[cfg(test)]
-                            if let Some(control) = topology_test_control() {
-                                if control.revision_prepare_entered() {
-                                    control.record("revision-prepare-finished");
-                                }
-                            }
                             match prepare_result {
                                 Ok(prepared) => Some(prepared),
                                 Err(error) => {
@@ -6770,15 +5891,6 @@ async fn register_geometry_startup_persistent(
 
     control.request_stop();
     control.request_persistent_stop();
-    #[cfg(test)]
-    let mut rejected_work = Some(GeometryRuntimeStartupRejectedWorkOwner::spawn(
-        name,
-        rejected_future,
-        std::mem::take(pending_subscriptions),
-        std::mem::take(pending_children),
-        control.inner.topology_control.clone(),
-    ));
-    #[cfg(not(test))]
     let mut rejected_work = Some(GeometryRuntimeStartupRejectedWorkOwner::spawn(
         name,
         rejected_future,
@@ -6806,12 +5918,6 @@ async fn register_geometry_startup_persistent(
     let owner_settled = owner_outcome.producers_settled();
     let rejected_settled = rejected_outcome.producers_settled();
     let cleanup_result = if owner_settled && rejected_settled {
-        #[cfg(test)]
-        if let Some(topology_control) = &control.inner.topology_control {
-            topology_control.emit_startup_shutdown_stage(
-                crate::lio_owner::GeometryShutdownStage::GeometryTasksSettled,
-            );
-        }
         cleanup_geometry_startup_files(handle)
     } else {
         Err(
@@ -6828,14 +5934,6 @@ async fn register_geometry_startup_persistent(
         rollback_errors.push(format!("task-owner rollback failed: {error}"));
     }
     let cleanup_settled = cleanup_result.is_ok();
-    #[cfg(test)]
-    if cleanup_settled {
-        if let Some(topology_control) = &control.inner.topology_control {
-            topology_control.emit_startup_shutdown_stage(
-                crate::lio_owner::GeometryShutdownStage::ResourceCleanupComplete,
-            );
-        }
-    }
     if let Err(error) = cleanup_result {
         rollback_errors.push(error);
     }
@@ -6945,10 +6043,6 @@ async fn unsubscribe_owned_geometry_subscription(
         .unsubscribe()
         .await
         .map_err(|error| format!("{name} unsubscribe failed: {error}"));
-    #[cfg(test)]
-    if unsubscribe.is_ok() {
-        record_topology_event(format!("unsubscribed:{name}"));
-    }
     match (terminal, unsubscribe) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -6966,28 +6060,6 @@ async fn run_owned_public_tf_observer(
 ) -> Result<(), String> {
     let mut tf_generation = 0_u64;
     let mut history = PublicTfHistory::default();
-    #[cfg(test)]
-    let injected_terminal = topology_test_control()
-        .and_then(|control| control.injected_terminal_for("public-tf-observer"));
-    #[cfg(test)]
-    if let Some(injected_terminal) = injected_terminal {
-        wait_for_topology_terminal_release().await;
-        let terminal = match injected_terminal {
-            GeometryTopologyInjectedTerminal::Eof
-            | GeometryTopologyInjectedTerminal::Panic
-            | GeometryTopologyInjectedTerminal::JoinFailure => Ok(()),
-            GeometryTopologyInjectedTerminal::TransportError => {
-                Err("public TF receive failed: injected transport error".to_owned())
-            }
-        };
-        let result =
-            unsubscribe_owned_geometry_subscription("public-tf-observer", subscription, terminal)
-                .await;
-        if injected_terminal == GeometryTopologyInjectedTerminal::Panic {
-            panic!("injected panic in public-tf-observer after unsubscribe acknowledgement");
-        }
-        return result;
-    }
     let terminal = loop {
         tokio::select! {
             biased;
@@ -7135,11 +6207,13 @@ fn register_surface_map_build(
         + Send
         + 'static,
 ) -> Result<(), String> {
+    #[cfg(test)]
+    let observations = mapping_feed_tests::current_surface_observations();
     control.register_retained("surface-map-build", async move {
         // 注册接纳后才启动实际计算；保留任务始终等待阻塞工作句柄结束。
         #[cfg(test)]
         let compute = {
-            let probe = topology_test_control();
+            let probe = observations;
             let revision = ticket.cloud_revision_for_test();
             move || {
                 if let Some(probe) = probe {
@@ -7228,11 +6302,11 @@ async fn run_owned_surface_map_consumer(
                     Err(error) => { explore.finish_surface_map_update(ticket, Err(error)).await; }
                     Ok(SurfaceMapBuildAttempt { message, parsed_root, result, retained_source }) => match result {
                         Ok(snapshot) => {
-                            #[cfg(test)] record_topology_event(format!("surface-map-install-pending-cloud:{finished_revision}"));
+                            #[cfg(test)] mapping_feed_tests::record_surface_event(format!("surface-map-install-pending-cloud:{finished_revision}"));
                             let explore = explore.clone();
                             installing = Some(Box::pin(async move {
                                 explore.finish_surface_map_update(ticket, Ok(snapshot)).await;
-                                #[cfg(test)] record_topology_event(format!("surface-map-finish-cloud:{finished_revision}"));
+                                #[cfg(test)] mapping_feed_tests::record_surface_event(format!("surface-map-finish-cloud:{finished_revision}"));
                             }));
                         }
                         Err(error) => {
@@ -7259,7 +6333,7 @@ async fn run_owned_surface_map_consumer(
                                 if still_blocked {
                                     retry_after = tokio::time::Instant::now() + Duration::from_secs(1);
                                     #[cfg(test)]
-                                    if let Some(probe) = topology_test_control() {
+                                    if let Some(probe) = mapping_feed_tests::current_surface_observations() {
                                         probe.record_surface_clock("backoff", finished_revision, retry_after);
                                     }
                                 } else { retry_dependency = None; }
@@ -7271,7 +6345,7 @@ async fn run_owned_surface_map_consumer(
                         }
                     },
                 }
-                #[cfg(test)] if installing.is_none() { record_topology_event(format!("surface-map-finish-cloud:{finished_revision}")); }
+                #[cfg(test)] if installing.is_none() { mapping_feed_tests::record_surface_event(format!("surface-map-finish-cloud:{finished_revision}")); }
             }
             frame = subscription.recv() => {
                 // 接收时刻先于解码和MLS构建，计算耗时不能使旧图重新变新鲜。
@@ -7296,7 +6370,7 @@ async fn run_owned_surface_map_consumer(
                             retry_dependency = None;
                         }
                         #[cfg(test)]
-                        if let Some(probe) = topology_test_control() {
+                        if let Some(probe) = mapping_feed_tests::current_surface_observations() {
                             probe.record_surface_clock("ingress", admitted_revision, tokio::time::Instant::now());
                         }
                     },
@@ -7321,8 +6395,6 @@ async fn rollback_owned_geometry_subscriptions(
     while let Some((name, subscription)) = subscriptions.pop() {
         match subscription.unsubscribe().await {
             Ok(()) => {
-                #[cfg(test)]
-                record_topology_event(format!("unsubscribed:{name}"));
             }
             Err(error) => {
                 errors.push(format!("{name} startup unsubscribe failed: {error}"));
@@ -7350,8 +6422,6 @@ pub(crate) struct PreparedGeometryRuntime {
     nav_runtime: crate::nav_runtime::NavRuntimeState,
     transport: LcmTransport,
     backend_available: bool,
-    #[cfg(test)]
-    topology_control: Option<Arc<GeometryTopologyTestControl>>,
 }
 
 impl PreparedGeometryRuntime {
@@ -7429,8 +6499,6 @@ pub(crate) fn prepare_geometry_runtime_for_pipeline(
         nav_runtime,
         transport,
         backend_available,
-        #[cfg(test)]
-        topology_control: None,
     })
 }
 
@@ -7447,8 +6515,6 @@ pub async fn spawn_geometry_runtime(
         nav_runtime,
         transport,
         backend_available,
-        #[cfg(test)]
-        topology_control,
     } = prepared;
     let (occ_topic, occ_msg_type) = channel_bindings.binding(ChannelKey::Occupancy);
     let (tf_topic, tf_msg_type) = channel_bindings.binding(ChannelKey::Tf);
@@ -7467,10 +6533,6 @@ pub async fn spawn_geometry_runtime(
     let committed_map_authority = Arc::new(std::sync::Mutex::new(None));
     let explore_projection_gate =
         Arc::new(tokio::sync::Mutex::new(ExploreProjectionGate::default()));
-    #[cfg(test)]
-    let (task_control, task_registration_rx) =
-        GeometryRuntimeTaskControl::channel_with_topology_control(topology_control);
-    #[cfg(not(test))]
     let (task_control, task_registration_rx) = GeometryRuntimeTaskControl::channel();
     // Register the production fanout receiver before mapping can commit. A
     // tokio broadcast sender drops events when it has no receivers.
@@ -12511,6 +11573,7 @@ mod public_tf_ownership_tests {
 
 #[cfg(test)]
 pub(crate) mod mapping_feed_tests {
+    include!("explore_surface_incomplete_fixture_tests.rs");
     use super::*;
     use crate::mapping_adapter::MappingReadiness;
     use crate::mapping_backend::MappingBackendTestGate;
@@ -12519,7 +11582,6 @@ pub(crate) mod mapping_feed_tests {
     use nuwax_protocol::RawLcmFrame;
     use nuwax_transport::{LcmBackend, LcmFrameStream, TransportResult};
 
-    include!("explore_surface_incomplete_fixture_tests.rs");
 
     // F2 shares F1's existing cfg(test) mapping_feed_tests module visibility.
     // Keep this helper inside that test module; do not expose production APIs.
@@ -20362,8 +19424,7 @@ mod exploration_cancellation_tests {
             let (mut bridge, backend) = configured_bridge().await;
             let explore = ExploreRuntimeHandle::default_with_wavefront();
             bridge.exploration_producer_epoch = explore.producer_epoch_projection();
-            let topology = Arc::new(GeometryTopologyTestControl::default());
-            let (control, registrations) = GeometryRuntimeTaskControl::channel_with_topology_control(Some(topology.clone()));
+            let (control, registrations) = GeometryRuntimeTaskControl::channel();
             let mut root = GeometryRuntimeTaskOwner::start(control.clone(), registrations);
             bridge.set_geometry_task_control_for_tests(Some(control.clone()));
             explore.set_navigation_sink(Arc::new(bridge.clone()));
@@ -20383,7 +19444,6 @@ mod exploration_cancellation_tests {
             scheduler.shutdown().await.unwrap();
             assert_eq!(bridge.nav.publish_in_flight_for_test().unwrap(), flights);
             assert!(explore.blocks_mapping_mutation().await);
-            assert!(!topology.events().iter().any(|event| event == "completed:exploration-child-dispatch"));
             if close_root {
                 let result = tokio::time::timeout(STEP, root.shutdown()).await.unwrap();
                 assert!(!result.producers_settled());
@@ -20402,9 +19462,7 @@ mod exploration_cancellation_tests {
             assert_eq!(cancel.parent_request_id, lease.parent_request_id);
             assert_eq!(cancel.goal_generation as u64, lease.goal_generation);
             assert_eq!(cancel.producer_runtime_generation as u64, lease.producer_runtime_generation);
-            assert!(topology.events().iter().any(|event| event == "completed:exploration-child-dispatch"));
             bridge.set_geometry_task_control_for_tests(None);
-            topology.task_control.lock().take();
         }
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn scheduler_shutdown_must_not_strand_original_goal_publish_fence() { run_case(false).await; }
@@ -20498,8 +19556,7 @@ mod exploration_cancellation_tests {
             let mut subscription = bridge.transport.subscribe_owned(topic, Some(kind)).await.unwrap();
             let explore = ExploreRuntimeHandle::default_with_wavefront();
             bridge.exploration_producer_epoch = explore.producer_epoch_projection();
-            let topology = Arc::new(GeometryTopologyTestControl::default());
-            let (control, registrations) = GeometryRuntimeTaskControl::channel_with_topology_control(Some(topology.clone()));
+            let (control, registrations) = GeometryRuntimeTaskControl::channel();
             let mut root = GeometryRuntimeTaskOwner::start(control.clone(), registrations);
             bridge.set_geometry_task_control_for_tests(Some(control.clone()));
             explore.set_navigation_sink(Arc::new(bridge.clone()));
@@ -20520,7 +19577,6 @@ mod exploration_cancellation_tests {
             scheduler.shutdown().await.unwrap();
             assert!(explore.blocks_mapping_mutation().await);
             assert!(bridge.nav.active_goal_lease().await.is_some());
-            assert!(!topology.events().iter().any(|event| event == "completed:exploration-child-dispatch"));
             backend.return_gate.add_permits(1);
             let result = tokio::time::timeout(STEP, root.shutdown()).await.unwrap();
             assert!(result.producers_settled());
@@ -20528,10 +19584,8 @@ mod exploration_cancellation_tests {
             assert_eq!(backend.successful_cancels.load(Ordering::Acquire), 1);
             assert!(bridge.nav.active_goal_lease().await.is_none());
             assert!(explore.snapshot().child_task_id.is_empty());
-            assert!(topology.events().iter().any(|event| event == "completed:exploration-child-dispatch"));
             drop(subscription);
             bridge.set_geometry_task_control_for_tests(None);
-            topology.task_control.lock().take();
         }
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn emitted_goal_error_must_keep_original_retained_owner() { run_case(true).await; }

@@ -134,26 +134,6 @@ class GeometryRuntimeSubprocess:
         except (OSError, UnicodeError):
             return False
 
-    def _warn_if_video_relay_missing(self) -> None:
-        """挂接已有 runtime 时探测视频中转产物，缺失则告警（不阻断 geometry）。
-
-        若挂接到的旧 runtime 未启用 video_relay，则 /tmp/nuwax_video.sock 与
-        .shm 不存在，感知视频源将永远 available=False 且静默失败，故显式告警。
-        """
-        shm_path = runtime_value("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
-        uds_path = runtime_value("NUWAX_VIDEO_UDS_PATH", "/tmp/nuwax_video.sock")
-        shm_ok = os.path.exists(shm_path)
-        uds_ok = os.path.exists(uds_path)
-        if not (shm_ok and uds_ok):
-            LOGGER.warning(
-                "挂接现有 nuwax-geometry-runtime，但视频中转产物缺失 (shm=%s exists=%s, uds=%s exists=%s)；"
-                "该 runtime 可能未启用 video_relay，持续视频感知将不可用。"
-                "请重启 runtime 或确认 video_streamer 已连接。",
-                shm_path,
-                shm_ok,
-                uds_ok,
-            )
-
     def start(self) -> bool:
         """挂接由 canonical launcher 启动且能响应 GetStatus 的 runtime。"""
 
@@ -202,7 +182,6 @@ class GeometryRuntimeSubprocess:
                 "nuwax-geometry-runtime 已在端口 %d 运行，gRPC 验活通过，Python 只挂接",
                 self._port,
             )
-            self._warn_if_video_relay_missing()
             return True
 
     def stop(self) -> None:

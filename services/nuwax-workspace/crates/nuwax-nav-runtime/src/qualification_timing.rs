@@ -23,7 +23,6 @@ pub struct SchedulerSnapshot {
     /// Existing cached status bit, copied without recomputation.
     pub planner_inputs_fresh: bool,
     /// Existing operation sequence at observation.
-    pub operation_sequence: u64,
     /// Accepted path revision.
     pub path_revision: u64,
     /// Existing receipt identities, absent if not admitted.

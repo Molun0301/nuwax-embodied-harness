@@ -71,7 +71,7 @@ async fn yaw_zero_observe_after_real_stop(
     scheduler.control_tick(status).await.unwrap();
     assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::Succeeded));
     assert!(!scheduler.lease_active);
-    assert_eq!(motion.lock().unwrap().calls.iter().filter(|c| c.starts_with("fence:")).count(), 1);
+    assert_eq!(motion.lock().unwrap().calls.iter().filter(|c| c.starts_with("release:")).count(), 1);
     assert_eq!(motion.lock().unwrap().calls.iter().filter(|c| c.starts_with("acquire:")).count(), 1);
 }
 #[tokio::test]
@@ -87,7 +87,7 @@ async fn zero_yaw_antipode_real_surface_stopped_arrival_control() {
     yaw_zero_observe_after_real_stop(&mut scheduler, &status, &motion, pose).await;
     assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::Succeeded));
     assert_eq!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));
-    assert!(scheduler.status.last_zero_ack_id.is_some());
+
     assert!(scheduler.session.is_none());
 }
 #[tokio::test]

@@ -2,7 +2,6 @@
 // remain the same. No sockets, devices, or optimistic APPLIED acknowledgements.
 struct DispatchTestPort {
     inner:FakeMotion,
-    renewal_delay:Option<Duration>,
     expire_first:bool,
     fail_bounded:bool,
     bounded_attempts:usize,
@@ -10,24 +9,20 @@ struct DispatchTestPort {
 }
 #[async_trait]
 impl NavMotionPort for DispatchTestPort {
-    fn renewal_due_at(&self)->Option<Instant> {self.renewal_delay.map(|_|Instant::now())}
-    async fn acquire(&mut self,id:&str,admission:&NavMotionAdmission)->Result<LeaseProof,MotionPortError> {self.inner.acquire(id,admission).await}
-    async fn renew(&mut self,id:&str)->Result<(),MotionPortError> {
-        if let Some(delay)=self.renewal_delay.take() {tokio::time::sleep(delay).await;}
-        self.inner.renew(id).await
+    async fn acquire(&mut self, generation:u64) -> Result<u64,MotionPortError> { self.inner.acquire(generation).await }
+    async fn velocity(&mut self, command:Twist2) -> Result<(),MotionPortError> {
+        self.inner.velocity(command).await?; self.applied.push(command); Ok(())
     }
-    async fn submit_twist(&mut self,id:&str,twist:Twist2)->Result<AppliedProof,MotionPortError> {
-        let proof=self.inner.submit_twist(id,twist).await?;self.applied.push(twist);Ok(proof)
-    }
-    async fn submit_twist_bounded(&mut self,id:&str,twist:Twist2,bound:Option<CommandDispatchBound>)->Result<BoundedTwistOutcome,MotionPortError> {
+    async fn velocity_bounded(&mut self, command:Twist2, bound:Option<CommandDispatchBound>) -> Result<BoundedTwistOutcome,MotionPortError> {
         if let Some(bound)=bound {
             self.bounded_attempts+=1;
-            if self.fail_bounded {return Err(MotionPortError::new("injected ambiguous timeout/transport/protocol outcome"));}
-            if self.expire_first || bound.expired_now() {self.expire_first=false;return Ok(BoundedTwistOutcome::ExpiredNotApplied);}
+            if self.fail_bounded { return Err(MotionPortError::new("注入传输失败")); }
+            if self.expire_first || bound.expired_now() { self.expire_first=false; return Ok(BoundedTwistOutcome::ExpiredNotApplied); }
         }
-        self.submit_twist(id,twist).await.map(BoundedTwistOutcome::Applied)
+        self.velocity(command).await?; Ok(BoundedTwistOutcome::Applied)
     }
-    async fn revoke_and_zero(&mut self,id:&str)->Result<Option<FenceProof>,MotionPortError> {self.inner.revoke_and_zero(id).await}
+    async fn release(&mut self) -> Result<(),MotionPortError> { self.inner.release().await }
+
 }
 fn handoff_bound(ns:u64)->CommandDispatchBound {
     let anchor=crate::command_dispatch::ObservationClockAnchor::capture();
@@ -35,31 +30,13 @@ fn handoff_bound(ns:u64)->CommandDispatchBound {
 }
 fn dispatch_scheduler()->NavScheduler<DispatchTestPort,FakePlanner> {
     let port=DispatchTestPort{inner:FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))),
-        renewal_delay:None,expire_first:false,fail_bounded:false,bounded_attempts:0,applied:Vec::new()};
+        expire_first:false,fail_bounded:false,bounded_attempts:0,applied:Vec::new()};
     let mut scheduler=NavScheduler::new(port,FakePlanner::commanding(),SchedulerConfig::default()).unwrap();
     scheduler.session=Some(session());scheduler.lease_active=true;scheduler.status.phase=SchedulerPhase::Controlling;
     scheduler
 }
-#[tokio::test]
-async fn dispatch_legacy_port_cannot_ignore_finite_bound() {
-    let mut port=FakeMotion(Arc::new(Mutex::new(FakeMotionState::default())));
-    assert!(port.submit_twist_bounded("finite",Twist2::ZERO,Some(handoff_bound(1_000_000_000))).await.is_err());
-    assert!(port.0.lock().unwrap().calls.is_empty());
-    assert!(matches!(port.submit_twist_bounded("ordinary",Twist2::ZERO,None).await.unwrap(),BoundedTwistOutcome::Applied(_)));
-}
-#[tokio::test]
-async fn dispatch_renewal_delay_expires_original_bound_then_confirms_only_zero() {
-    let mut scheduler=dispatch_scheduler();scheduler.motion.renewal_delay=Some(Duration::from_millis(25));
-    let wait_start=Instant::now();scheduler.path_wait_started_at=Some(wait_start);
-    let (status,_)=watch::channel(scheduler.status.clone());
-    let command=Twist2{linear:Point2::new(0.1,0.0),angular_z:0.0};
-    assert!(!scheduler.apply_controller_twist_with_bound(&status,command,Some(handoff_bound(10_000_000))).await.unwrap());
-    assert_eq!(scheduler.motion.bounded_attempts,1);
-    assert_eq!(scheduler.motion.applied,vec![Twist2::ZERO]);
-    assert_eq!(scheduler.status.last_applied_twist,Some(Twist2::ZERO));
-    assert_eq!(scheduler.path_wait_started_at,Some(wait_start));
-    assert_eq!(scheduler.status.phase,SchedulerPhase::Controlling);
-}
+
+
 #[tokio::test]
 async fn dispatch_receiver_expiry_applies_exactly_one_zero_and_fresh_command_recovers() {
     let mut scheduler=dispatch_scheduler();scheduler.motion.expire_first=true;
@@ -77,7 +54,7 @@ async fn dispatch_ambiguous_failure_keeps_fail_closed_fence() {
     let command=Twist2{linear:Point2::new(0.1,0.0),angular_z:0.0};
     assert!(scheduler.apply_controller_twist_with_bound(&status,command,Some(handoff_bound(1_000_000_000))).await.is_err());
     assert!(scheduler.motion.applied.is_empty());
-    assert!(scheduler.motion.inner.0.lock().unwrap().calls.iter().any(|call|call.starts_with("fence:")));
+    assert!(scheduler.motion.inner.0.lock().unwrap().calls.iter().any(|call|call.starts_with("release:")));
 }
 
 pub(super) async fn assert_real_source_bound_reaches_scheduler(
@@ -141,7 +118,7 @@ async fn dispatch_control_tick_expiry_preserves_wait_goal_route_until_recovery_o
             scheduler.path_wait_started_at=Some(Instant::now()-Duration::from_secs(3));
             scheduler.motion.expire_first=true;scheduler.control_tick(&status).await.unwrap();
             assert_eq!(scheduler.status.last_terminal,Some(TerminalOutcome::PlannerFailed));
-            assert!(scheduler.status.last_zero_ack_id.is_some());
+
         }
     }
 }

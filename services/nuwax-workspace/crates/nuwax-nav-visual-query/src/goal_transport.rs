@@ -8,12 +8,11 @@ use tokio::runtime::Runtime;
 use tonic::transport::Endpoint;
 
 use crate::geometry_proto::{
-    geometry_runtime_client::GeometryRuntimeClient, CancelNavigationRequest, Empty, NavigationGoal,
-    NavigationState, Pose, Quat, Vec3,
+    geometry_runtime_client::GeometryRuntimeClient, CancelGoalRequest, NavigationGoal,
+    Pose, Quat, Vec3,
 };
 use crate::session::{TargetObservation, TargetObservationState};
 
-const PUBLIC_NAV_OWNER: i32 = 1;
 
 /// 调用者随视觉帧冻结的相机到规划坐标系外参。
 #[derive(Debug, Clone, Deserialize)]
@@ -37,12 +36,8 @@ pub struct FrozenGoalTransform {
 pub struct NavigationAdmission {
     /// 相机到权威规划坐标系的冻结外参。
     pub transform: FrozenGoalTransform,
-    /// Motion Guard（运动保护器）准入代次。
-
-    /// Motion Guard 启动 nonce，十六进制 16 字节。
-    pub motion_guard_boot_nonce_hex: String,
-    /// 调用者观察到的全局停止代次。
-    pub motion_stop_generation: u64,
+    /// 运动命令受理时的守卫代次。
+    pub motion_generation: u64,
     /// 显式倒退选择；缺省交 Geometry 的实际 profile，不能在视觉入口伪装为用户禁止。
     #[serde(default)]
     pub allow_reverse: Option<bool>,
@@ -55,10 +50,7 @@ pub struct AdmittedGoalLease {
     pub goal_id: String,
     /// Geometry 返回的父请求身份。
     pub parent_request_id: String,
-    /// 唯一仲裁器分配的目标代次。
-    pub goal_generation: u64,
-    /// Geometry 生产运行时代次。
-    pub producer_runtime_generation: u64,
+
 }
 
 /// 对外输出的类型化导航准入/终态。
@@ -74,31 +66,8 @@ pub struct NavigationOutcome {
     pub goal_id: String,
     /// 终态对应的父请求身份。
     pub parent_request_id: String,
-    /// 终态对应的目标代次。
-    pub goal_generation: u64,
-    /// 终态对应的 Geometry 运行时代次。
-    pub producer_runtime_generation: u64,
-    /// 取消链当前阶段。
-    pub cancel_phase: String,
-    /// 执行器是否已取得零速证明。
-    pub actuator_zeroed: bool,
 }
 
-impl NavigationOutcome {
-    fn from_state(state: NavigationState) -> Self {
-        Self {
-            status: state.status,
-            reason_code: state.reason_code,
-            message: state.message,
-            goal_id: state.goal_id,
-            parent_request_id: state.parent_request_id,
-            goal_generation: state.goal_generation,
-            producer_runtime_generation: state.producer_runtime_generation,
-            cancel_phase: state.cancel_phase,
-            actuator_zeroed: state.actuator_zeroed,
-        }
-    }
-}
 
 /// 真实 Geometry gRPC（远程过程调用）transport 配置。
 #[derive(Debug, Clone)]
@@ -142,114 +111,32 @@ impl GeometryGoalTransport {
         let goal = adapt_observation(observation, admission, tracker_swaps_axes)?;
         let endpoint = self.config.endpoint.clone();
         let timeout = self.config.rpc_timeout;
-        let state = self.runtime.block_on(async move {
-            let mut client =
-                tokio::time::timeout(timeout, GeometryRuntimeClient::connect(endpoint))
-                    .await
-                    .map_err(|_| "Geometry transport connect timed out".to_string())?
-                    .map_err(|error| format!("Geometry transport connect failed: {error}"))?;
-            tokio::time::timeout(timeout, client.set_navigation_goal(goal))
-                .await
-                .map_err(|_| "SetNavigationGoal timed out".to_string())?
-                .map_err(|error| format!("SetNavigationGoal failed: {error}"))
-                .map(|response| response.into_inner())
+        let parent_request_id = observation.session_id.clone();
+        let response = self.runtime.block_on(async move {
+            let mut client = tokio::time::timeout(timeout, GeometryRuntimeClient::connect(endpoint))
+                .await.map_err(|_| "Geometry 连接超时".to_string())?
+                .map_err(|error| error.to_string())?;
+            tokio::time::timeout(timeout, client.set_goal(goal)).await
+                .map_err(|_| "SetGoal 超时".to_string())?
+                .map_err(|error| error.to_string()).map(|response| response.into_inner())
         })?;
-        if state.status != "ACCEPTED" {
-            return Err(format!(
-                "GoalIntent admission rejected: status={} reason_code={} message={}",
-                state.status, state.reason_code, state.message
-            ));
-        }
-        if state.goal_generation == 0 || state.producer_runtime_generation == 0 {
-            return Err("ACCEPTED navigation state has invalid assigned goal identity".into());
-        }
-        let lease = AdmittedGoalLease {
-            goal_id: state.goal_id.clone(),
-            parent_request_id: state.parent_request_id.clone(),
-            goal_generation: state.goal_generation,
-            producer_runtime_generation: state.producer_runtime_generation,
-        };
-        Ok((lease, NavigationOutcome::from_state(state)))
+        let lease = AdmittedGoalLease { goal_id: response.goal_id.clone(), parent_request_id: parent_request_id.clone() };
+        Ok((lease, NavigationOutcome { status: "ACCEPTED".into(), reason_code: String::new(), message: String::new(), goal_id: response.goal_id, parent_request_id }))
     }
 
-    /// 通过 Batch02 exact-lease cancel wire 等待零速确认后的类型化终态。
+    /// 按 Geometry 返回的目标号取消；协议不提供停车回执。
     pub fn cancel(&self, lease: &AdmittedGoalLease) -> Result<NavigationOutcome, String> {
-        let request = CancelNavigationRequest {
-
-            goal_id: lease.goal_id.clone(),
-            owner_kind: PUBLIC_NAV_OWNER,
-            parent_request_id: lease.parent_request_id.clone(),
-            goal_generation: lease.goal_generation,
-            producer_runtime_generation: lease.producer_runtime_generation,
-        };
-        let endpoint = self.config.endpoint.clone();
-        let timeout = self.config.rpc_timeout;
-        let expected = lease.clone();
-        let state = self.runtime.block_on(async move {
-            let mut client =
-                tokio::time::timeout(timeout, GeometryRuntimeClient::connect(endpoint))
-                    .await
-                    .map_err(|_| "Geometry transport connect timed out".to_string())?
-                    .map_err(|error| format!("Geometry transport connect failed: {error}"))?;
-            let mut updates =
-                tokio::time::timeout(timeout, client.subscribe_navigation_state(Empty {}))
-                    .await
-                    .map_err(|_| "SubscribeNavigationState timed out".to_string())?
-                    .map_err(|error| format!("SubscribeNavigationState failed: {error}"))?
-                    .into_inner();
-            let initial = tokio::time::timeout(timeout, client.cancel_navigation(request))
-                .await
-                .map_err(|_| "CancelNavigation timed out".to_string())?
-                .map_err(|error| format!("CancelNavigation failed: {error}"))?
-                .into_inner();
-            if initial.status != "CANCELLED" && initial.status != "CANCEL_PENDING" {
-                return Err(cancel_rejected(&initial));
-            }
-            if !matches_lease(&initial, &expected) {
-                return Err("CancelNavigation response does not match exact lease".to_string());
-            }
-            if initial.status == "CANCELLED" {
-                return Ok(initial);
-            }
-            tokio::time::timeout(timeout, async {
-                loop {
-                    let update = updates
-                        .message()
-                        .await
-                        .map_err(|error| format!("navigation state stream failed: {error}"))?
-                        .ok_or_else(|| {
-                            "navigation state stream ended before cancel terminal".to_string()
-                        })?;
-                    if !matches_lease(&update, &expected) {
-                        continue;
-                    }
-                    match update.status.as_str() {
-                        "CANCELLED" => return Ok(update),
-                        "FAILED" => return Err(cancel_rejected(&update)),
-                        _ => {}
-                    }
-                }
-            })
-            .await
-            .map_err(|_| "CancelNavigation terminal wait timed out".to_string())?
+        let endpoint=self.config.endpoint.clone(); let timeout=self.config.rpc_timeout;
+        let goal_id=lease.goal_id.clone();
+        self.runtime.block_on(async move {
+            let mut client=tokio::time::timeout(timeout,GeometryRuntimeClient::connect(endpoint)).await
+                .map_err(|_|"Geometry 连接超时".to_string())?.map_err(|error|error.to_string())?;
+            tokio::time::timeout(timeout,client.cancel_goal(CancelGoalRequest {goal_id})).await
+                .map_err(|_|"CancelGoal 超时".to_string())?.map_err(|error|error.to_string())?;
+            Ok::<_,String>(())
         })?;
-        Ok(NavigationOutcome::from_state(state))
+        Ok(NavigationOutcome {status:"CANCELLED".into(),reason_code:String::new(),message:String::new(),goal_id:lease.goal_id.clone(),parent_request_id:lease.parent_request_id.clone()})
     }
-}
-
-fn matches_lease(state: &NavigationState, lease: &AdmittedGoalLease) -> bool {
-    state.owner_kind == PUBLIC_NAV_OWNER
-        && state.goal_id == lease.goal_id
-        && state.parent_request_id == lease.parent_request_id
-        && state.goal_generation == lease.goal_generation
-        && state.producer_runtime_generation == lease.producer_runtime_generation
-}
-
-fn cancel_rejected(state: &NavigationState) -> String {
-    format!(
-        "CancelNavigation rejected: status={} reason_code={} message={}",
-        state.status, state.reason_code, state.message
-    )
 }
 
 fn adapt_observation(
@@ -291,7 +178,6 @@ fn adapt_observation(
     {
         return Err("target pose identity does not match observation".into());
     }
-    let nonce = decode_nonce(&admission.motion_guard_boot_nonce_hex)?;
     let rotation = normalized_quaternion(transform.rotation_xyzw)?;
     let mut point = pose.pose.position;
     if tracker_swaps_axes {
@@ -332,32 +218,13 @@ fn adapt_observation(
             frame_id: transform.target_frame_id.clone(),
             timestamp_ns: observation.source_timestamp_ns,
         }),
-        frame_id: transform.target_frame_id.clone(),
-        goal_id: observation.request_id.clone(),
-        parent_request_id: observation.session_id.clone(),
-        goal_generation: 0,
-        owner_kind: PUBLIC_NAV_OWNER,
-
-        motion_guard_boot_nonce: nonce.to_vec(),
-        motion_stop_generation: admission.motion_stop_generation,
-        allow_reverse: admission.allow_reverse.unwrap_or(false),
-        use_profile_reverse_default: admission.allow_reverse.is_none(),
+        motion_generation: admission.motion_generation,
+        allow_reverse: admission.allow_reverse,
         position_tolerance_m: None,
         yaw_tolerance_rad: None,
     })
 }
 
-fn decode_nonce(value: &str) -> Result<[u8; 16], String> {
-    if value.len() != 32 {
-        return Err("motion guard boot nonce must contain 32 hex characters".into());
-    }
-    let mut output = [0u8; 16];
-    for (index, byte) in output.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .map_err(|_| "motion guard boot nonce is not hexadecimal".to_string())?;
-    }
-    Ok(output)
-}
 
 fn normalized_quaternion(values: [f64; 4]) -> Result<Quaternion, String> {
     if !values.iter().all(|value| value.is_finite()) {
@@ -451,8 +318,7 @@ mod tests {
                 rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
             },
 
-            motion_guard_boot_nonce_hex: "00112233445566778899aabbccddeeff".into(),
-            motion_stop_generation: 4,
+            motion_generation: 4,
             allow_reverse: None,
         }
     }
@@ -465,21 +331,15 @@ mod tests {
                 "transform": {"source_frame_id":"camera_optical_frame", "target_frame_id":"map",
                     "source_timestamp_ns":1000000000_u64, "calibration_id":"calibration-1",
                     "translation_xyz":[2.,3.,0.], "rotation_xyzw":[0.,0.,0.,1.]},
-                "motion_guard_boot_nonce_hex":"00112233445566778899aabbccddeeff",
-                "motion_stop_generation":4
+                "motion_generation":4
             });
             if let Some(value) = choice { request["allow_reverse"] = value.into(); }
             let input: NavigationAdmission = serde_json::from_value(request).unwrap();
             assert_eq!(input.allow_reverse, choice);
             let goal = adapt_observation(&observation(TargetObservationState::Tracked), &input, false).unwrap();
             let decoded = NavigationGoal::decode(goal.encode_to_vec().as_slice()).unwrap();
-            assert_eq!(decoded.allow_reverse, choice.unwrap_or(false));
-            assert_eq!(decoded.use_profile_reverse_default, choice.is_none());
-            for profile_default in [false, true] {
-                assert_eq!(nuwax_nav_types_messages::GoalOptions::resolve_reverse_request(
-                    decoded.allow_reverse, decoded.use_profile_reverse_default, profile_default).unwrap(),
-                    choice.unwrap_or(profile_default));
-            }
+            assert_eq!(decoded.allow_reverse, choice);
+            assert_eq!(decoded.motion_generation,4);
         }
     }
 
@@ -491,10 +351,8 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(goal.goal_id, "request-1");
-        assert_eq!(goal.parent_request_id, "session-1");
-        assert_eq!(goal.frame_id, "map");
-        assert_eq!(goal.owner_kind, PUBLIC_NAV_OWNER);
+        assert_eq!(goal.motion_generation,4);
+        assert_eq!(goal.pose.as_ref().unwrap().frame_id,"map");
         assert_eq!(goal.pose.unwrap().position.unwrap().x, 2.0);
     }
 
@@ -541,27 +399,5 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cancel_terminal_requires_public_owner_and_exact_lease() {
-        let lease = AdmittedGoalLease {
-            goal_id: "request-1".into(),
-            parent_request_id: "session-1".into(),
-            goal_generation: 7,
-            producer_runtime_generation: 8,
-        };
-        let mut state = NavigationState {
-            owner_kind: PUBLIC_NAV_OWNER,
-            goal_id: lease.goal_id.clone(),
-            parent_request_id: lease.parent_request_id.clone(),
-            goal_generation: lease.goal_generation,
-            producer_runtime_generation: lease.producer_runtime_generation,
-            ..NavigationState::default()
-        };
-        assert!(matches_lease(&state, &lease));
-        state.owner_kind = 2;
-        assert!(!matches_lease(&state, &lease));
-        state.owner_kind = PUBLIC_NAV_OWNER;
-        state.producer_runtime_generation += 1;
-        assert!(!matches_lease(&state, &lease));
-    }
+
 }

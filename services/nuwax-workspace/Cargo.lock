@@ -1829,7 +1829,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tonic-build",
- "uuid",
 ]
 
 [[package]]
@@ -2110,6 +2109,7 @@ dependencies = [
  "nuwax-explore-terrain-bridge",
  "nuwax-explore-wavefront",
  "nuwax-map-chunks",
+ "nuwax-motion-safety-guard",
  "nuwax-nav-astar",
  "nuwax-nav-base",
  "nuwax-nav-basic-path-follower",
@@ -2136,6 +2136,7 @@ dependencies = [
  "nuwax-rpc",
  "nuwax-transport",
  "pretty_assertions",
+ "prost",
  "serde",
  "serde_json",
  "sha2",

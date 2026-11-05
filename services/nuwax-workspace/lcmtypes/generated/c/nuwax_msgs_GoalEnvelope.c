@@ -21,35 +21,18 @@ uint64_t __nuwax_msgs_GoalEnvelope_hash_recursive(const __lcm_hash_ptr *p)
     cp.v = __nuwax_msgs_GoalEnvelope_get_hash;
     (void) cp;
 
-    uint64_t hash = (uint64_t)0x98b372406747ffddLL
-         + __int32_t_hash_recursive(&cp)
-         + __string_hash_recursive(&cp)
-         + __int32_t_hash_recursive(&cp)
-         + __string_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
-         + __string_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
-         + __string_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
-         + __byte_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
-         + __string_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
-         + __string_hash_recursive(&cp)
-         + __string_hash_recursive(&cp)
-         + __int32_t_hash_recursive(&cp)
-         + __geometry_msgs_Point_hash_recursive(&cp)
-         + __byte_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
-         + __int8_t_hash_recursive(&cp)
-         + __double_hash_recursive(&cp)
-         + __double_hash_recursive(&cp)
+    uint64_t hash = (uint64_t)0x8609cf2b975c387cLL
          + __string_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
          + __geometry_msgs_PoseStamped_hash_recursive(&cp)
+         + __int8_t_hash_recursive(&cp)
+         + __int8_t_hash_recursive(&cp)
+         + __int8_t_hash_recursive(&cp)
+         + __double_hash_recursive(&cp)
+         + __int8_t_hash_recursive(&cp)
+         + __double_hash_recursive(&cp)
+         + __int32_t_hash_recursive(&cp)
+         + __double_hash_recursive(&cp)
         ;
 
     return (hash<<1) + ((hash>>63)&1);
@@ -72,89 +55,42 @@ int __nuwax_msgs_GoalEnvelope_encode_array(void *buf, int offset, int maxlen, co
 
     for (element = 0; element < elements; element++) {
 
-        thislen = __int32_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].schema_version), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
         thislen = __string_encode_array(buf, offset + pos, maxlen - pos, &(p[element].session_id), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int32_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].owner_kind), 1);
+        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].motion_generation), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __string_encode_array(buf, offset + pos, maxlen - pos, &(p[element].parent_request_id), 1);
+        thislen = __geometry_msgs_PoseStamped_encode_array(buf, offset + pos, maxlen - pos, &(p[element].goal), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].goal_generation), 1);
+        thislen = __int8_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].allow_reverse_length), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __string_encode_array(buf, offset + pos, maxlen - pos, &(p[element].producer), 1);
+        thislen = __int8_t_encode_array(buf, offset + pos, maxlen - pos, p[element].allow_reverse, p[element].allow_reverse_length);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].producer_epoch), 1);
+        thislen = __int8_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].position_tolerance_length), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].producer_runtime_generation), 1);
+        thislen = __double_encode_array(buf, offset + pos, maxlen - pos, p[element].position_tolerance_m, p[element].position_tolerance_length);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __string_encode_array(buf, offset + pos, maxlen - pos, &(p[element].committed_map_session_id), 1);
+        thislen = __int8_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].yaw_tolerance_length), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].committed_map_session_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].committed_map_revision), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __byte_encode_array(buf, offset + pos, maxlen - pos, p[element].committed_map_boot_nonce, 16);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].committed_map_commit_sequence), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].committed_map_source_timestamp_ns), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __string_encode_array(buf, offset + pos, maxlen - pos, &(p[element].committed_map_frame_id), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].source_timestamp_ns), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __string_encode_array(buf, offset + pos, maxlen - pos, &(p[element].boundary_id), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __string_encode_array(buf, offset + pos, maxlen - pos, &(p[element].boundary_frame_id), 1);
+        thislen = __double_encode_array(buf, offset + pos, maxlen - pos, p[element].yaw_tolerance_rad, p[element].yaw_tolerance_length);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int32_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].boundary_points_length), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __geometry_msgs_Point_encode_array(buf, offset + pos, maxlen - pos, p[element].boundary_points, p[element].boundary_points_length);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __byte_encode_array(buf, offset + pos, maxlen - pos, p[element].motion_guard_boot_nonce, 16);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].motion_stop_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int8_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].allow_reverse), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __double_encode_array(buf, offset + pos, maxlen - pos, &(p[element].position_tolerance_m), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __double_encode_array(buf, offset + pos, maxlen - pos, &(p[element].yaw_tolerance_rad), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __string_encode_array(buf, offset + pos, maxlen - pos, &(p[element].body_reference_frame_id), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].map_frame_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __geometry_msgs_PoseStamped_encode_array(buf, offset + pos, maxlen - pos, &(p[element].goal), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
+        { int a;
+        for (a = 0; a < p[element].boundary_points_length; a++) {
+            thislen = __double_encode_array(buf, offset + pos, maxlen - pos, p[element].boundary_points[a], 2);
+            if (thislen < 0) return thislen; else pos += thislen;
+        }
+        }
 
     }
     return pos;
@@ -179,61 +115,31 @@ int __nuwax_msgs_GoalEnvelope_encoded_array_size(const nuwax_msgs_GoalEnvelope *
     int size = 0, element;
     for (element = 0; element < elements; element++) {
 
-        size += __int32_t_encoded_array_size(&(p[element].schema_version), 1);
-
         size += __string_encoded_array_size(&(p[element].session_id), 1);
 
-        size += __int32_t_encoded_array_size(&(p[element].owner_kind), 1);
+        size += __int64_t_encoded_array_size(&(p[element].motion_generation), 1);
 
-        size += __string_encoded_array_size(&(p[element].parent_request_id), 1);
+        size += __geometry_msgs_PoseStamped_encoded_array_size(&(p[element].goal), 1);
 
-        size += __int64_t_encoded_array_size(&(p[element].goal_generation), 1);
+        size += __int8_t_encoded_array_size(&(p[element].allow_reverse_length), 1);
 
-        size += __string_encoded_array_size(&(p[element].producer), 1);
+        size += __int8_t_encoded_array_size(p[element].allow_reverse, p[element].allow_reverse_length);
 
-        size += __int64_t_encoded_array_size(&(p[element].producer_epoch), 1);
+        size += __int8_t_encoded_array_size(&(p[element].position_tolerance_length), 1);
 
-        size += __int64_t_encoded_array_size(&(p[element].producer_runtime_generation), 1);
+        size += __double_encoded_array_size(p[element].position_tolerance_m, p[element].position_tolerance_length);
 
-        size += __string_encoded_array_size(&(p[element].committed_map_session_id), 1);
+        size += __int8_t_encoded_array_size(&(p[element].yaw_tolerance_length), 1);
 
-        size += __int64_t_encoded_array_size(&(p[element].committed_map_session_generation), 1);
-
-        size += __int64_t_encoded_array_size(&(p[element].committed_map_revision), 1);
-
-        size += __byte_encoded_array_size(p[element].committed_map_boot_nonce, 16);
-
-        size += __int64_t_encoded_array_size(&(p[element].committed_map_commit_sequence), 1);
-
-        size += __int64_t_encoded_array_size(&(p[element].committed_map_source_timestamp_ns), 1);
-
-        size += __string_encoded_array_size(&(p[element].committed_map_frame_id), 1);
-
-        size += __int64_t_encoded_array_size(&(p[element].source_timestamp_ns), 1);
-
-        size += __string_encoded_array_size(&(p[element].boundary_id), 1);
-
-        size += __string_encoded_array_size(&(p[element].boundary_frame_id), 1);
+        size += __double_encoded_array_size(p[element].yaw_tolerance_rad, p[element].yaw_tolerance_length);
 
         size += __int32_t_encoded_array_size(&(p[element].boundary_points_length), 1);
 
-        size += __geometry_msgs_Point_encoded_array_size(p[element].boundary_points, p[element].boundary_points_length);
-
-        size += __byte_encoded_array_size(p[element].motion_guard_boot_nonce, 16);
-
-        size += __int64_t_encoded_array_size(&(p[element].motion_stop_generation), 1);
-
-        size += __int8_t_encoded_array_size(&(p[element].allow_reverse), 1);
-
-        size += __double_encoded_array_size(&(p[element].position_tolerance_m), 1);
-
-        size += __double_encoded_array_size(&(p[element].yaw_tolerance_rad), 1);
-
-        size += __string_encoded_array_size(&(p[element].body_reference_frame_id), 1);
-
-        size += __int64_t_encoded_array_size(&(p[element].map_frame_generation), 1);
-
-        size += __geometry_msgs_PoseStamped_encoded_array_size(&(p[element].goal), 1);
+        { int a;
+        for (a = 0; a < p[element].boundary_points_length; a++) {
+            size += __double_encoded_array_size(p[element].boundary_points[a], 2);
+        }
+        }
 
     }
     return size;
@@ -250,90 +156,47 @@ int __nuwax_msgs_GoalEnvelope_decode_array(const void *buf, int offset, int maxl
 
     for (element = 0; element < elements; element++) {
 
-        thislen = __int32_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].schema_version), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
         thislen = __string_decode_array(buf, offset + pos, maxlen - pos, &(p[element].session_id), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int32_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].owner_kind), 1);
+        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].motion_generation), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __string_decode_array(buf, offset + pos, maxlen - pos, &(p[element].parent_request_id), 1);
+        thislen = __geometry_msgs_PoseStamped_decode_array(buf, offset + pos, maxlen - pos, &(p[element].goal), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].goal_generation), 1);
+        thislen = __int8_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].allow_reverse_length), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __string_decode_array(buf, offset + pos, maxlen - pos, &(p[element].producer), 1);
+        p[element].allow_reverse = (int8_t*) lcm_malloc(sizeof(int8_t) * p[element].allow_reverse_length);
+        thislen = __int8_t_decode_array(buf, offset + pos, maxlen - pos, p[element].allow_reverse, p[element].allow_reverse_length);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].producer_epoch), 1);
+        thislen = __int8_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].position_tolerance_length), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].producer_runtime_generation), 1);
+        p[element].position_tolerance_m = (double*) lcm_malloc(sizeof(double) * p[element].position_tolerance_length);
+        thislen = __double_decode_array(buf, offset + pos, maxlen - pos, p[element].position_tolerance_m, p[element].position_tolerance_length);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __string_decode_array(buf, offset + pos, maxlen - pos, &(p[element].committed_map_session_id), 1);
+        thislen = __int8_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].yaw_tolerance_length), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].committed_map_session_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].committed_map_revision), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __byte_decode_array(buf, offset + pos, maxlen - pos, p[element].committed_map_boot_nonce, 16);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].committed_map_commit_sequence), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].committed_map_source_timestamp_ns), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __string_decode_array(buf, offset + pos, maxlen - pos, &(p[element].committed_map_frame_id), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].source_timestamp_ns), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __string_decode_array(buf, offset + pos, maxlen - pos, &(p[element].boundary_id), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __string_decode_array(buf, offset + pos, maxlen - pos, &(p[element].boundary_frame_id), 1);
+        p[element].yaw_tolerance_rad = (double*) lcm_malloc(sizeof(double) * p[element].yaw_tolerance_length);
+        thislen = __double_decode_array(buf, offset + pos, maxlen - pos, p[element].yaw_tolerance_rad, p[element].yaw_tolerance_length);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int32_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].boundary_points_length), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        p[element].boundary_points = (geometry_msgs_Point*) lcm_malloc(sizeof(geometry_msgs_Point) * p[element].boundary_points_length);
-        thislen = __geometry_msgs_Point_decode_array(buf, offset + pos, maxlen - pos, p[element].boundary_points, p[element].boundary_points_length);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __byte_decode_array(buf, offset + pos, maxlen - pos, p[element].motion_guard_boot_nonce, 16);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].motion_stop_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int8_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].allow_reverse), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __double_decode_array(buf, offset + pos, maxlen - pos, &(p[element].position_tolerance_m), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __double_decode_array(buf, offset + pos, maxlen - pos, &(p[element].yaw_tolerance_rad), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __string_decode_array(buf, offset + pos, maxlen - pos, &(p[element].body_reference_frame_id), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].map_frame_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __geometry_msgs_PoseStamped_decode_array(buf, offset + pos, maxlen - pos, &(p[element].goal), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
+        p[element].boundary_points = (double**) lcm_malloc(sizeof(double*) * p[element].boundary_points_length);
+        { int a;
+        for (a = 0; a < p[element].boundary_points_length; a++) {
+            p[element].boundary_points[a] = (double*) lcm_malloc(sizeof(double) * 2);
+            thislen = __double_decode_array(buf, offset + pos, maxlen - pos, p[element].boundary_points[a], 2);
+            if (thislen < 0) return thislen; else pos += thislen;
+        }
+        }
 
     }
     return pos;
@@ -345,62 +208,36 @@ int __nuwax_msgs_GoalEnvelope_decode_array_cleanup(nuwax_msgs_GoalEnvelope *p, i
     int element;
     for (element = 0; element < elements; element++) {
 
-        __int32_t_decode_array_cleanup(&(p[element].schema_version), 1);
-
         __string_decode_array_cleanup(&(p[element].session_id), 1);
 
-        __int32_t_decode_array_cleanup(&(p[element].owner_kind), 1);
+        __int64_t_decode_array_cleanup(&(p[element].motion_generation), 1);
 
-        __string_decode_array_cleanup(&(p[element].parent_request_id), 1);
+        __geometry_msgs_PoseStamped_decode_array_cleanup(&(p[element].goal), 1);
 
-        __int64_t_decode_array_cleanup(&(p[element].goal_generation), 1);
+        __int8_t_decode_array_cleanup(&(p[element].allow_reverse_length), 1);
 
-        __string_decode_array_cleanup(&(p[element].producer), 1);
+        __int8_t_decode_array_cleanup(p[element].allow_reverse, p[element].allow_reverse_length);
+        if (p[element].allow_reverse) free(p[element].allow_reverse);
 
-        __int64_t_decode_array_cleanup(&(p[element].producer_epoch), 1);
+        __int8_t_decode_array_cleanup(&(p[element].position_tolerance_length), 1);
 
-        __int64_t_decode_array_cleanup(&(p[element].producer_runtime_generation), 1);
+        __double_decode_array_cleanup(p[element].position_tolerance_m, p[element].position_tolerance_length);
+        if (p[element].position_tolerance_m) free(p[element].position_tolerance_m);
 
-        __string_decode_array_cleanup(&(p[element].committed_map_session_id), 1);
+        __int8_t_decode_array_cleanup(&(p[element].yaw_tolerance_length), 1);
 
-        __int64_t_decode_array_cleanup(&(p[element].committed_map_session_generation), 1);
-
-        __int64_t_decode_array_cleanup(&(p[element].committed_map_revision), 1);
-
-        __byte_decode_array_cleanup(p[element].committed_map_boot_nonce, 16);
-
-        __int64_t_decode_array_cleanup(&(p[element].committed_map_commit_sequence), 1);
-
-        __int64_t_decode_array_cleanup(&(p[element].committed_map_source_timestamp_ns), 1);
-
-        __string_decode_array_cleanup(&(p[element].committed_map_frame_id), 1);
-
-        __int64_t_decode_array_cleanup(&(p[element].source_timestamp_ns), 1);
-
-        __string_decode_array_cleanup(&(p[element].boundary_id), 1);
-
-        __string_decode_array_cleanup(&(p[element].boundary_frame_id), 1);
+        __double_decode_array_cleanup(p[element].yaw_tolerance_rad, p[element].yaw_tolerance_length);
+        if (p[element].yaw_tolerance_rad) free(p[element].yaw_tolerance_rad);
 
         __int32_t_decode_array_cleanup(&(p[element].boundary_points_length), 1);
 
-        __geometry_msgs_Point_decode_array_cleanup(p[element].boundary_points, p[element].boundary_points_length);
+        { int a;
+        for (a = 0; a < p[element].boundary_points_length; a++) {
+            __double_decode_array_cleanup(p[element].boundary_points[a], 2);
+            if (p[element].boundary_points[a]) free(p[element].boundary_points[a]);
+        }
+        }
         if (p[element].boundary_points) free(p[element].boundary_points);
-
-        __byte_decode_array_cleanup(p[element].motion_guard_boot_nonce, 16);
-
-        __int64_t_decode_array_cleanup(&(p[element].motion_stop_generation), 1);
-
-        __int8_t_decode_array_cleanup(&(p[element].allow_reverse), 1);
-
-        __double_decode_array_cleanup(&(p[element].position_tolerance_m), 1);
-
-        __double_decode_array_cleanup(&(p[element].yaw_tolerance_rad), 1);
-
-        __string_decode_array_cleanup(&(p[element].body_reference_frame_id), 1);
-
-        __int64_t_decode_array_cleanup(&(p[element].map_frame_generation), 1);
-
-        __geometry_msgs_PoseStamped_decode_array_cleanup(&(p[element].goal), 1);
 
     }
     return 0;
@@ -432,62 +269,36 @@ int __nuwax_msgs_GoalEnvelope_clone_array(const nuwax_msgs_GoalEnvelope *p, nuwa
     int element;
     for (element = 0; element < elements; element++) {
 
-        __int32_t_clone_array(&(p[element].schema_version), &(q[element].schema_version), 1);
-
         __string_clone_array(&(p[element].session_id), &(q[element].session_id), 1);
 
-        __int32_t_clone_array(&(p[element].owner_kind), &(q[element].owner_kind), 1);
+        __int64_t_clone_array(&(p[element].motion_generation), &(q[element].motion_generation), 1);
 
-        __string_clone_array(&(p[element].parent_request_id), &(q[element].parent_request_id), 1);
+        __geometry_msgs_PoseStamped_clone_array(&(p[element].goal), &(q[element].goal), 1);
 
-        __int64_t_clone_array(&(p[element].goal_generation), &(q[element].goal_generation), 1);
+        __int8_t_clone_array(&(p[element].allow_reverse_length), &(q[element].allow_reverse_length), 1);
 
-        __string_clone_array(&(p[element].producer), &(q[element].producer), 1);
+        q[element].allow_reverse = (int8_t*) lcm_malloc(sizeof(int8_t) * q[element].allow_reverse_length);
+        __int8_t_clone_array(p[element].allow_reverse, q[element].allow_reverse, p[element].allow_reverse_length);
 
-        __int64_t_clone_array(&(p[element].producer_epoch), &(q[element].producer_epoch), 1);
+        __int8_t_clone_array(&(p[element].position_tolerance_length), &(q[element].position_tolerance_length), 1);
 
-        __int64_t_clone_array(&(p[element].producer_runtime_generation), &(q[element].producer_runtime_generation), 1);
+        q[element].position_tolerance_m = (double*) lcm_malloc(sizeof(double) * q[element].position_tolerance_length);
+        __double_clone_array(p[element].position_tolerance_m, q[element].position_tolerance_m, p[element].position_tolerance_length);
 
-        __string_clone_array(&(p[element].committed_map_session_id), &(q[element].committed_map_session_id), 1);
+        __int8_t_clone_array(&(p[element].yaw_tolerance_length), &(q[element].yaw_tolerance_length), 1);
 
-        __int64_t_clone_array(&(p[element].committed_map_session_generation), &(q[element].committed_map_session_generation), 1);
-
-        __int64_t_clone_array(&(p[element].committed_map_revision), &(q[element].committed_map_revision), 1);
-
-        __byte_clone_array(p[element].committed_map_boot_nonce, q[element].committed_map_boot_nonce, 16);
-
-        __int64_t_clone_array(&(p[element].committed_map_commit_sequence), &(q[element].committed_map_commit_sequence), 1);
-
-        __int64_t_clone_array(&(p[element].committed_map_source_timestamp_ns), &(q[element].committed_map_source_timestamp_ns), 1);
-
-        __string_clone_array(&(p[element].committed_map_frame_id), &(q[element].committed_map_frame_id), 1);
-
-        __int64_t_clone_array(&(p[element].source_timestamp_ns), &(q[element].source_timestamp_ns), 1);
-
-        __string_clone_array(&(p[element].boundary_id), &(q[element].boundary_id), 1);
-
-        __string_clone_array(&(p[element].boundary_frame_id), &(q[element].boundary_frame_id), 1);
+        q[element].yaw_tolerance_rad = (double*) lcm_malloc(sizeof(double) * q[element].yaw_tolerance_length);
+        __double_clone_array(p[element].yaw_tolerance_rad, q[element].yaw_tolerance_rad, p[element].yaw_tolerance_length);
 
         __int32_t_clone_array(&(p[element].boundary_points_length), &(q[element].boundary_points_length), 1);
 
-        q[element].boundary_points = (geometry_msgs_Point*) lcm_malloc(sizeof(geometry_msgs_Point) * q[element].boundary_points_length);
-        __geometry_msgs_Point_clone_array(p[element].boundary_points, q[element].boundary_points, p[element].boundary_points_length);
-
-        __byte_clone_array(p[element].motion_guard_boot_nonce, q[element].motion_guard_boot_nonce, 16);
-
-        __int64_t_clone_array(&(p[element].motion_stop_generation), &(q[element].motion_stop_generation), 1);
-
-        __int8_t_clone_array(&(p[element].allow_reverse), &(q[element].allow_reverse), 1);
-
-        __double_clone_array(&(p[element].position_tolerance_m), &(q[element].position_tolerance_m), 1);
-
-        __double_clone_array(&(p[element].yaw_tolerance_rad), &(q[element].yaw_tolerance_rad), 1);
-
-        __string_clone_array(&(p[element].body_reference_frame_id), &(q[element].body_reference_frame_id), 1);
-
-        __int64_t_clone_array(&(p[element].map_frame_generation), &(q[element].map_frame_generation), 1);
-
-        __geometry_msgs_PoseStamped_clone_array(&(p[element].goal), &(q[element].goal), 1);
+        q[element].boundary_points = (double**) lcm_malloc(sizeof(double*) * q[element].boundary_points_length);
+        { int a;
+        for (a = 0; a < p[element].boundary_points_length; a++) {
+            q[element].boundary_points[a] = (double*) lcm_malloc(sizeof(double) * 2);
+            __double_clone_array(p[element].boundary_points[a], q[element].boundary_points[a], 2);
+        }
+        }
 
     }
     return 0;

@@ -63,7 +63,7 @@ fn revisions_are_correlation_not_search_input_and_foreign_goal_context_is_not_us
     feedback.path_identity=Arc::new(published_surface_identity(&goal,31,8));
     let next=surface_replan_input(&source,&start,&goal,&config,Some(&feedback)).unwrap();
     assert!(original.same_complete_input(&next),"output revision is not a work input");
-    let mut foreign=goal.clone();foreign.goal_generation+=1;
+    let mut foreign=goal.clone();foreign.motion_generation+=1;
     let next=surface_replan_input(&source,&start,&foreign,&config,Some(&feedback)).unwrap();
     assert!(next.actual.is_none(),"do not borrow another goal's live context");
     assert!(!original.same_complete_input(&next));
@@ -100,7 +100,7 @@ fn adapter_preserves_rejected_b_when_current_and_published_inputs_return_to_a() 
     assert!(!memo.should_reuse(surface_replan_rejection(Some(&feedback),&goal),&restored));
     feedback.zero_confirmed_rejection=true;
     assert!(memo.should_reuse(surface_replan_rejection(Some(&feedback),&goal),&restored));
-    let mut foreign=goal.clone(); foreign.goal_generation+=1;
+    let mut foreign=goal.clone(); foreign.motion_generation+=1;
     assert!(!memo.should_reuse(surface_replan_rejection(Some(&feedback),&foreign),&restored));
 }
 
@@ -114,7 +114,7 @@ fn recomputation_progress_keeps_original_refusal_without_borrowing_another_goal(
     assert!(message.contains("Current body pose is occupied or outside the local map"));
     assert!(message.contains("正在计算PCT全局路线"));
     assert!(message.contains("已归零"));
-    let mut replacement=goal.clone();replacement.goal_generation+=1;
+    let mut replacement=goal.clone();replacement.motion_generation+=1;
     assert_eq!(surface_planning_diagnostic(Some(&feedback),&replacement,"正在计算PCT全局路线"),
         "正在计算PCT全局路线");
     feedback.zero_confirmed_rejection=false;

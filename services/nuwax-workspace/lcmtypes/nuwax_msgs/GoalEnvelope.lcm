@@ -1,33 +1,17 @@
 package nuwax_msgs;
 
+// 与 Geometry 的目标载荷一致；可选值用零或一项的数组表示。
 struct GoalEnvelope {
-    int32_t schema_version;
     string session_id;
-    int32_t owner_kind;
-    string parent_request_id;
-    int64_t goal_generation;
-    string producer;
-    int64_t producer_epoch;
-    int64_t producer_runtime_generation;
-    string committed_map_session_id;
-    int64_t committed_map_session_generation;
-    int64_t committed_map_revision;
-    byte committed_map_boot_nonce[16];
-    int64_t committed_map_commit_sequence;
-    int64_t committed_map_source_timestamp_ns;
-    string committed_map_frame_id;
-    int64_t source_timestamp_ns;
-    string boundary_id;
-    string boundary_frame_id;
-    int32_t boundary_points_length;
-    geometry_msgs.Point boundary_points[boundary_points_length];
-    byte motion_guard_boot_nonce[16];
-    int64_t motion_stop_generation;
-    int8_t allow_reverse;
-    double position_tolerance_m;
-    double yaw_tolerance_rad;
-    string body_reference_frame_id;
-    // 目标产生时的规范地图坐标代际。
-    int64_t map_frame_generation;
+    // 原样承载 uint64 运动代次的八个字节。
+    int64_t motion_generation;
     geometry_msgs.PoseStamped goal;
+    int8_t allow_reverse_length;
+    int8_t allow_reverse[allow_reverse_length];
+    int8_t position_tolerance_length;
+    double position_tolerance_m[position_tolerance_length];
+    int8_t yaw_tolerance_length;
+    double yaw_tolerance_rad[yaw_tolerance_length];
+    int32_t boundary_points_length;
+    double boundary_points[boundary_points_length][2];
 }

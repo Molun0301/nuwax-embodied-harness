@@ -25,7 +25,7 @@ pub mod subprocess;
 
 #[doc(hidden)]
 pub mod geometry_proto {
-    tonic::include_proto!("nuwax.geometry");
+    tonic::include_proto!("nuwax.geometry.v3");
 }
 
 // Foundation 协议面：BoundingBox2D / ImageEncoding 等强类型

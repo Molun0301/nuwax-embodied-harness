@@ -8,15 +8,14 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use nuwax_motion_safety_guard::wire::{LeaseTuple, TwistCommand};
+use nuwax_motion_safety_guard::wire::{ErrorCode, Source};
 use nuwax_motion_safety_guard::{
-    ClientConfig, MotionAdmissionProof, MotionGuardClient, MotionGuardClientError, MAX_FRAME_BYTES,
+    ClientConfig, MotionGuardClient, MotionGuardClientError,
 };
 use nuwax_nav_astar::local_planner::{LocalPlanner, LocalPlannerConfig, StopMessage};
 use nuwax_nav_astar::navigation_map::CostMap2D;
@@ -119,10 +118,6 @@ impl std::fmt::Debug for ExecutionMap {
 
 /// Production controller cadence: 20 Hz.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_millis(50);
-/// Maximum scheduler-owned lease renewal interval.
-pub const MAX_RENEW_INTERVAL: Duration = Duration::from_millis(250);
-/// Qualified upper bound for one production NAV guard exchange.
-pub const MAX_NAV_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
 /// 零表示不按固定接收年龄终止导航，来源失效仍由拥有方显式撤销。
 pub const DEFAULT_POSE_TTL: Duration = Duration::ZERO;
 /// 地图在同一来源内持续有效，直到更新、清空或来源失效。
@@ -131,36 +126,12 @@ pub const DEFAULT_COSTMAP_TTL: Duration = Duration::ZERO;
 pub const DEFAULT_PATH_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// 局部运动预测长度，与输入过期门槛独立。
 pub const DEFAULT_CONTROL_HORIZON: Duration = Duration::from_millis(250);
-/// Hard upper bound from cancel admission to a terminal fence attempt.
-pub const MAX_CANCEL_FENCE_TIMEOUT: Duration = Duration::from_millis(300);
-
-const PRIORITY_FENCE_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(75);
-const PRIORITY_FENCE_ATTEMPTS: usize = 2;
-
 const INPUT_CAPACITY: usize = 32;
 const URGENT_CAPACITY: usize = 8;
 
-/// Build the fail-closed client configuration used by the future Geometry owner.
-///
-/// The generic guard client keeps a broader diagnostic default. Navigation uses
-/// this tighter timeout so a delayed request cannot consume the guard's entire
-/// early-fence budget.
-#[must_use]
+/// 生产导航只配置守卫连接位置。
 pub fn production_client_config(socket_path: impl Into<PathBuf>) -> ClientConfig {
-    ClientConfig {
-        socket_path: socket_path.into(),
-        request_timeout: MAX_NAV_REQUEST_TIMEOUT,
-        max_frame_bytes: MAX_FRAME_BYTES,
-    }
-}
-
-/// Immutable motion admission carried by one accepted navigation request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NavMotionAdmission {
-    /// 同一次请求准入采样的16字节守卫启动随机数。
-    pub guard_boot_nonce: [u8; 16],
-    /// Global motion-stop generation observed by the same admission check.
-    pub motion_stop_generation: u64,
+    ClientConfig { socket_path: socket_path.into() }
 }
 
 /// Complete in-process execution identity correlated from sealed goal and path envelopes.
@@ -199,7 +170,7 @@ pub struct NavSession {
     /// Complete sealed goal identity expected on every admitted path.
     pub execution_identity: PathExecutionIdentity,
     /// Request-level motion admission proof transported with the goal.
-    pub motion_admission: NavMotionAdmission,
+    pub motion_generation: u64,
     /// One authoritative typed request; wire callers explicitly choose Body.
     pub goal: ExecutionGoal,
 }
@@ -234,12 +205,10 @@ pub enum SchedulerPhase {
     Acquiring,
     /// 租约已取得，等待首次有效路径或已确认零速后的更新路径。
     AwaitingPath,
-    /// Running the 20 Hz controller and waiting for every APPLIED proof.
+    /// 以20赫兹运行控制器并发送速度。
     Controlling,
     /// Cancel accepted; no more twist is issued while fence proof is pending.
     Cancelling,
-    /// 非取消收尾正在等待停车证明，或复核停车后的目标位置。
-    Fencing,
     /// Fail-closed state. No twist or renewal is issued.
     Failed,
 }
@@ -247,6 +216,8 @@ pub enum SchedulerPhase {
 /// Verified terminal outcome from the most recent session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalOutcome {
+    /// 申请被拒或租约已作废。
+    Stopped,
     /// Cancel completed after a valid resource fence.
     Cancelled,
     /// 规划到达、租约已围栏，停车后采样仍满足原目标。
@@ -268,9 +239,9 @@ pub struct SchedulerStatus {
     pub session_id: Option<String>,
     /// Latest accepted path revision.
     pub path_revision: u64,
-    /// Commands whose correlated APPLIED proof was validated.
+    /// 守卫已接受的速度请求数。
     pub applied_commands: u64,
-    /// Last controller command with a correlated APPLIED proof.
+    /// 最近一次被守卫接受的速度，不代表实测运动。
     pub last_applied_twist: Option<Twist2>,
     /// Whether the scheduler's motion transport is currently usable.
     pub motion_sink_ready: bool,
@@ -287,10 +258,6 @@ pub struct SchedulerStatus {
     pub costmap_receipt_age_ms: u64,
     /// Most recent verified terminal outcome.
     pub last_terminal: Option<TerminalOutcome>,
-    /// Most recent verified guard ZeroAck identifier.
-    pub last_zero_ack_id: Option<String>,
-    /// Monotonic timestamp carried by the most recent verified fence.
-    pub last_fence_monotonic_ns: u64,
     /// Diagnostic message for operators and tests.
     pub message: String,
     /// 当前目标的局部规划轨迹，仅用于显示。
@@ -315,8 +282,6 @@ impl Default for SchedulerStatus {
             pose_receipt_age_ms: u64::MAX,
             costmap_receipt_age_ms: u64::MAX,
             last_terminal: None,
-            last_zero_ack_id: None,
-            last_fence_monotonic_ns: 0,
             message: "idle".into(),
             local_path: Vec::new(),
             surface_replan_feedback: None,
@@ -329,8 +294,6 @@ impl Default for SchedulerStatus {
 pub struct SchedulerConfig {
     /// Controller tick interval.
     pub tick_interval: Duration,
-    /// Idle/awaiting-path lease renewal interval.
-    pub renew_interval: Duration,
     /// 等待路径期限；零表示等待至路径就绪或取消。
     pub path_wait_timeout: Duration,
     /// 位姿接收期限；零表示不以固定接收年龄终止。
@@ -343,7 +306,6 @@ impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             tick_interval: DEFAULT_TICK_INTERVAL,
-            renew_interval: MAX_RENEW_INTERVAL,
             path_wait_timeout: DEFAULT_PATH_WAIT_TIMEOUT,
             pose_ttl: DEFAULT_POSE_TTL,
             costmap_ttl: DEFAULT_COSTMAP_TTL,
@@ -392,63 +354,30 @@ pub enum RuntimeError {
     /// 地图已明确清空、换域或失去完整性，原目标不能由新输入自动恢复。
     #[error("navigation map source invalidated: {0}")]
     MapSourceInvalidated(String),
-    /// APPLIED proof did not correlate to the submitted twist.
-    #[error("invalid APPLIED proof: {0}")]
-    InvalidApplied(String),
-    /// Fence proof was incomplete or not IDLE.
-    #[error("invalid fence proof: {0}")]
-    InvalidFence(String),
     /// The scheduler task is no longer accepting requests.
     #[error("navigation scheduler task is stopped")]
     SchedulerStopped,
-    /// Operation-id sequence exhausted.
-    #[error("navigation operation sequence exhausted")]
-    SequenceExhausted,
+
 }
 
-/// Motion-port error before scheduler policy is applied.
+/// 运动边界的失败原因，保留守卫原错误码。
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[error("{message}")]
 pub struct MotionPortError {
-    /// Stable diagnostic message.
+    /// 失败原因。
     pub message: String,
-    /// Whether an ambiguous result may have created or retained a lease.
-    pub lease_may_be_active: bool,
+    /// 守卫原错误码；传输失败没有协议错误码。
+    pub code: Option<ErrorCode>,
 }
-
 impl MotionPortError {
-    /// Construct a motion-port error.
-    #[must_use]
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            lease_may_be_active: true,
-        }
-    }
-
-    /// Construct an error known to have occurred before lease acquisition.
-    #[must_use]
-    pub fn definite_no_lease(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            lease_may_be_active: false,
-        }
-    }
-
+    /// 非协议失败。
+    pub fn new(message: impl Into<String>) -> Self { Self { message: message.into(), code: None } }
 }
-
 impl From<MotionGuardClientError> for MotionPortError {
     fn from(error: MotionGuardClientError) -> Self {
-        Self::new(error.to_string())
+        let code = match &error { MotionGuardClientError::Remote { code, .. } => Some(*code), _ => None };
+        Self { message: error.to_string(), code }
     }
-}
-
-/// Proof that a source-scoped lease was acquired.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LeaseProof {
-    /// Non-zero guard lease identifier.
-    pub lease_id: u64,
-
 }
 
 /// One planner-consumed occupancy snapshot with immutable source metadata.
@@ -460,43 +389,12 @@ pub struct CostmapObservation {
     pub source_timestamp_ns: i64,
 }
 
-/// Correlated proof that one twist reached APPLIED.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppliedProof {
-    /// Operation identifier echoed by the port contract.
-    pub operation_id: String,
-    /// Guard-side monotonic application timestamp.
-    pub applied_monotonic_ns: u64,
-}
-
-/// Lease state carried by a fence proof.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FenceLeaseState {
-    /// No active owner remains.
-    Idle,
-    /// A source still owns the resource.
-    Active,
-    /// Revocation has not reached a terminal state.
-    Revoking,
-}
-
-/// Proof required before publishing a navigation terminal state.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FenceProof {
-    /// Non-empty guard-generated acknowledgement identifier.
-    pub zero_ack_id: String,
-    /// Guard-side monotonic zero application timestamp.
-    pub applied_monotonic_ns: u64,
-    /// Terminal lease state.
-    pub lease: FenceLeaseState,
-}
-
-/// Result of bounded receiving admission; expiry never claims the lease is gone.
+/// 本地来源期限检查后的速度发送结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoundedTwistOutcome {
-    /// The exact request was acknowledged as applied.
-    Applied(AppliedProof),
-    /// No new command was applied because its observation issue bound expired.
+    /// 守卫接受了速度请求；不代表实测运动。
+    Applied,
+    /// 发送前来源期限已到。
     ExpiredNotApplied,
 }
 
@@ -509,267 +407,35 @@ pub enum MapInvalidationKind {
     Invalidated,
 }
 
-/// Mutable motion boundary owned by exactly one scheduler task.
+/// 由单个调度任务拥有的运动连接。
 #[async_trait]
 pub trait NavMotionPort: Send + 'static {
-    /// 最新原期限内的真实测速；None 不等于已停车，不得由命令回执构造。
+    /// 来源期限内的真实测速，缺失不代表已停车。
     fn measured_motion(&self) -> Option<MeasuredMotion> { None }
-    /// 服务端截止推导出的提前续租时刻；模拟或外部实现可使用配置周期。
-    fn renewal_due_at(&self) -> Option<Instant> { None }
-    /// Acquire the NAV lease directly from the request's admission proof.
-    async fn acquire(
-        &mut self,
-        operation_id: &str,
-        admission: &NavMotionAdmission,
-    ) -> Result<LeaseProof, MotionPortError>;
-    /// Renew the active lease.
-    async fn renew(&mut self, operation_id: &str) -> Result<(), MotionPortError>;
-    /// Submit one twist and return only after APPLIED.
-    async fn submit_twist(
-        &mut self,
-        operation_id: &str,
-        twist: Twist2,
-    ) -> Result<AppliedProof, MotionPortError>;
-    /// Submit with the original observation issue bound enforced at receiving admission.
-    /// Legacy ports must explicitly implement finite bounds rather than ignoring them.
-    async fn submit_twist_bounded(
-        &mut self, operation_id: &str, twist: Twist2, bound: Option<CommandDispatchBound>,
-    ) -> Result<BoundedTwistOutcome, MotionPortError> {
-        if bound.is_some() {
-            return Err(MotionPortError::new("motion port does not support observation dispatch deadlines"));
-        }
-        self.submit_twist(operation_id,twist).await.map(BoundedTwistOutcome::Applied)
+    /// 用目标携带的代次申请导航租约。
+    async fn acquire(&mut self, generation: u64) -> Result<u64, MotionPortError>;
+    /// 用当前租约发送速度并续租。
+    async fn velocity(&mut self, twist: Twist2) -> Result<(), MotionPortError>;
+    /// 发送前保留规划器来源期限检查，不把期限写入守卫协议。
+    async fn velocity_bounded(&mut self, twist: Twist2, bound: Option<CommandDispatchBound>) -> Result<BoundedTwistOutcome, MotionPortError> {
+        if bound.is_some_and(CommandDispatchBound::expired_now) { return Ok(BoundedTwistOutcome::ExpiredNotApplied); }
+        self.velocity(twist).await?;
+        Ok(BoundedTwistOutcome::Applied)
     }
-    /// Revoke the lease, apply zero, and return terminal fence proof.
-    async fn revoke_and_zero(&mut self, operation_id: &str) -> Result<Option<FenceProof>, MotionPortError>;
-    /// Preempt an ordinary exchange and fence over an independent priority path.
-    async fn priority_revoke_and_zero(
-        &mut self,
-        operation_id: &str,
-    ) -> Result<Option<FenceProof>, MotionPortError> {
-        self.revoke_and_zero(operation_id).await
-    }
+    /// 目标结束时释放租约。
+    async fn release(&mut self) -> Result<(), MotionPortError>;
 }
-
 #[async_trait]
 impl NavMotionPort for MotionGuardClient {
-    fn measured_motion(&self) -> Option<MeasuredMotion> { MotionGuardClient::measured_motion(self) }
-    fn renewal_due_at(&self) -> Option<Instant> { self.renewal_due_at() }
-    async fn acquire(
-        &mut self,
-        operation_id: &str,
-        admission: &NavMotionAdmission,
-    ) -> Result<LeaseProof, MotionPortError> {
-        let proof = MotionAdmissionProof {
-            boot_nonce: admission.guard_boot_nonce,
-            motion_stop_generation: admission.motion_stop_generation,
-        };
-        let metadata = match self.acquire_lease(operation_id, &proof).await {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                let definite_no_lease = matches!(
-                    &error,
-                    MotionGuardClientError::InvalidInput(_) | MotionGuardClientError::Remote { .. }
-                );
-                let message = error.to_string();
-                return Err(if definite_no_lease {
-                    MotionPortError::definite_no_lease(message)
-                } else {
-                    MotionPortError::new(message)
-                });
-            }
-        };
-        Ok(LeaseProof {
-            lease_id: metadata.lease_tuple.lease_id,
-
-        })
+    fn measured_motion(&self) -> Option<MeasuredMotion> { self.measured_motion() }
+    async fn acquire(&mut self, generation: u64) -> Result<u64, MotionPortError> {
+        Ok(self.acquire(Source::Nav, generation).await?)
     }
-
-    async fn renew(&mut self, operation_id: &str) -> Result<(), MotionPortError> {
-        self.renew_lease(operation_id).await?;
+    async fn velocity(&mut self, twist: Twist2) -> Result<(), MotionPortError> {
+        self.velocity(twist.linear.x, twist.linear.y, twist.angular_z).await?;
         Ok(())
     }
-
-    async fn submit_twist(
-        &mut self,
-        operation_id: &str,
-        twist: Twist2,
-    ) -> Result<AppliedProof, MotionPortError> {
-        let confirmation = self
-            .submit_twist(
-                operation_id,
-                TwistCommand {
-                    linear_x_mps: twist.linear.x,
-                    linear_y_mps: twist.linear.y,
-                    angular_z_rps: twist.angular_z,
-                },
-            )
-            .await?;
-        Ok(AppliedProof {
-            operation_id: confirmation.operation_id,
-            applied_monotonic_ns: confirmation.applied_monotonic_ns,
-        })
-    }
-
-    async fn submit_twist_bounded(
-        &mut self, operation_id:&str, twist:Twist2, bound:Option<CommandDispatchBound>,
-    )->Result<BoundedTwistOutcome,MotionPortError> {
-        let Some(bound)=bound else {
-            return <Self as NavMotionPort>::submit_twist(self,operation_id,twist).await.map(BoundedTwistOutcome::Applied);
-        };
-        let Some(deadline)=bound.monotonic_deadline() else {return Ok(BoundedTwistOutcome::ExpiredNotApplied);};
-        let result=self.submit_twist_before(operation_id,TwistCommand {
-            linear_x_mps:twist.linear.x,linear_y_mps:twist.linear.y,angular_z_rps:twist.angular_z,
-        },deadline).await;
-        match result {
-            Ok(proof)=>Ok(BoundedTwistOutcome::Applied(AppliedProof {
-                operation_id:proof.operation_id,applied_monotonic_ns:proof.applied_monotonic_ns,
-            })),
-            Err(MotionGuardClientError::DispatchExpired{..})=>Ok(BoundedTwistOutcome::ExpiredNotApplied),
-            Err(MotionGuardClientError::Remote{code,..}) if code=="DEADLINE_EXCEEDED"=>Ok(BoundedTwistOutcome::ExpiredNotApplied),
-            Err(error)=>Err(error.into()),
-        }
-    }
-
-    async fn revoke_and_zero(&mut self, operation_id: &str) -> Result<Option<FenceProof>, MotionPortError> {
-        let confirmation = self.revoke_and_zero(operation_id).await?;
-        Ok(confirmation.map(|confirmation| FenceProof {
-            zero_ack_id: confirmation.zero_ack_id,
-            applied_monotonic_ns: confirmation.applied_monotonic_ns,
-            lease: FenceLeaseState::Idle,
-        }))
-    }
-}
-
-struct ProductionNavMotionPort {
-    normal: Option<MotionGuardClient>,
-    normal_config: ClientConfig,
-    priority_config: ClientConfig,
-    lease_tuple: Option<LeaseTuple>,
-}
-
-impl ProductionNavMotionPort {
-    async fn connect(config: ClientConfig) -> Result<Self, MotionPortError> {
-        let normal = MotionGuardClient::connect_with_config(config.clone())
-            .await
-            .map_err(|error| MotionPortError::definite_no_lease(error.to_string()))?;
-        let mut priority_config = config.clone();
-        priority_config.request_timeout = PRIORITY_FENCE_ATTEMPT_TIMEOUT;
-        Ok(Self {
-            normal: Some(normal),
-            normal_config: config,
-            priority_config,
-            lease_tuple: None,
-        })
-    }
-
-    async fn normal_client(&mut self) -> Result<&mut MotionGuardClient, MotionPortError> {
-        if self.normal.is_none() {
-            let client = MotionGuardClient::connect_with_config(self.normal_config.clone())
-                .await
-                .map_err(|error| MotionPortError::definite_no_lease(error.to_string()))?;
-            self.normal = Some(client);
-        }
-        Ok(self.normal.as_mut().expect("normal client was restored"))
-    }
-
-    fn fence_proof(confirmation: nuwax_motion_safety_guard::ZeroConfirmation) -> FenceProof {
-        FenceProof {
-            zero_ack_id: confirmation.zero_ack_id,
-            applied_monotonic_ns: confirmation.applied_monotonic_ns,
-            lease: FenceLeaseState::Idle,
-        }
-    }
-
-}
-
-#[async_trait]
-impl NavMotionPort for ProductionNavMotionPort {
-    fn measured_motion(&self) -> Option<MeasuredMotion> {
-        self.normal.as_ref().and_then(MotionGuardClient::measured_motion)
-    }
-    fn renewal_due_at(&self) -> Option<Instant> {
-        self.normal.as_ref().and_then(MotionGuardClient::renewal_due_at)
-    }
-    async fn acquire(
-        &mut self,
-        operation_id: &str,
-        admission: &NavMotionAdmission,
-    ) -> Result<LeaseProof, MotionPortError> {
-        let client = self.normal_client().await?;
-        let proof =
-            <MotionGuardClient as NavMotionPort>::acquire(client, operation_id, admission).await?;
-        self.lease_tuple = client.active_lease().cloned();
-        Ok(proof)
-    }
-
-    async fn renew(&mut self, operation_id: &str) -> Result<(), MotionPortError> {
-        <MotionGuardClient as NavMotionPort>::renew(self.normal_client().await?, operation_id).await
-    }
-
-    async fn submit_twist(
-        &mut self,
-        operation_id: &str,
-        twist: Twist2,
-    ) -> Result<AppliedProof, MotionPortError> {
-        <MotionGuardClient as NavMotionPort>::submit_twist(
-            self.normal_client().await?,
-            operation_id,
-            twist,
-        )
-        .await
-    }
-
-    async fn submit_twist_bounded(
-        &mut self, operation_id:&str, twist:Twist2, bound:Option<CommandDispatchBound>,
-    )->Result<BoundedTwistOutcome,MotionPortError> {
-        // Preserve the absolute bound across a possible connection await.
-        <MotionGuardClient as NavMotionPort>::submit_twist_bounded(
-            self.normal_client().await?,operation_id,twist,bound).await
-    }
-
-    async fn revoke_and_zero(&mut self, operation_id: &str) -> Result<Option<FenceProof>, MotionPortError> {
-        self.priority_revoke_and_zero(operation_id).await
-    }
-
-    async fn priority_revoke_and_zero(
-        &mut self,
-        operation_id: &str,
-    ) -> Result<Option<FenceProof>, MotionPortError> {
-        // Closing the ordinary stream cancels a delayed write/read without
-        // waiting for its 250 ms request timeout.
-        self.normal.take();
-        let lease_tuple = self
-            .lease_tuple
-            .clone()
-            .ok_or_else(|| MotionPortError::new("priority fence has no active lease tuple"))?;
-        let priority_config = self.priority_config.clone();
-        let operation_id = operation_id.to_string();
-        let priority_request =
-            MotionGuardClient::prepare_priority_revoke_and_zero(lease_tuple, &operation_id)
-                .map_err(|error| MotionPortError::new(error.to_string()))?;
-        let fence = tokio::time::timeout(MAX_CANCEL_FENCE_TIMEOUT, async {
-            let mut last_error = None;
-            for _ in 0..PRIORITY_FENCE_ATTEMPTS {
-                match MotionGuardClient::execute_priority_revoke_and_zero(
-                    priority_config.clone(),
-                    &priority_request,
-                )
-                .await
-                {
-                    Ok(confirmation) => return Ok(confirmation),
-                    Err(error) => last_error = Some(error.to_string()),
-                }
-            }
-            Err(MotionPortError::new(last_error.unwrap_or_else(|| {
-                "priority fence exhausted without an attempt".into()
-            })))
-        })
-        .await
-        .map_err(|_| MotionPortError::new("priority fence exceeded 300 ms hard timeout"))??;
-        self.lease_tuple = None;
-        Ok(fence.map(Self::fence_proof))
-    }
+    async fn release(&mut self) -> Result<(), MotionPortError> { Ok(self.release().await?) }
 }
 
 /// Result of one deterministic local-planner step.
@@ -1004,34 +670,10 @@ fn production_local_backend(
     }
 }
 
-enum Interruptible<T> {
-    Completed(T),
-    Urgent(Option<UrgentCommand>),
-}
-
-async fn await_interruptible<T, F>(
-    urgent_open: bool,
-    urgent_rx: &mut mpsc::Receiver<UrgentCommand>,
-    future: F,
-) -> Interruptible<T>
-where
-    F: Future<Output = T>,
-{
-    if !urgent_open {
-        return Interruptible::Completed(future.await);
-    }
-    tokio::pin!(future);
-    tokio::select! {
-        biased;
-        command = urgent_rx.recv() => Interruptible::Urgent(command),
-        result = &mut future => Interruptible::Completed(result),
-    }
-}
-
 /// Single-task navigation scheduler.
 ///
 /// The motion port is stored by value and is only accessed through `&mut self`,
-/// making renew, twist, and fence mutually exclusive by construction.
+/// 申请、速度和释放在同一连接上按序执行。
 pub struct NavScheduler<M, P> {
     motion: M,
     planner: P,
@@ -1054,7 +696,6 @@ pub struct NavScheduler<M, P> {
     obstacle_source_bound: Option<CommandDispatchBound>,
     costmap_receipt: Option<PlannerInputReceipt>,
     map_invalidated_at: Option<Instant>,
-    operation_sequence: u64,
     status: SchedulerStatus,
     #[cfg(feature = "surface-recovery-qualification")]
     qualification_timing: Option<qualification_timing::TraceSink>,
@@ -1102,7 +743,6 @@ where
             obstacle_source_bound: None,
             costmap_receipt: None,
             map_invalidated_at: None,
-            operation_sequence: 0,
             status,
             #[cfg(feature = "surface-recovery-qualification")]
             qualification_timing: None,
@@ -1133,7 +773,6 @@ where
         sink.snapshot_at(phase, source, now.into_std(), qualification_timing::SchedulerSnapshot {
             phase: self.status.phase, lease_active: self.lease_active,
             session_active: self.session.is_some(), planner_inputs_fresh: self.status.planner_inputs_fresh,
-            operation_sequence: self.operation_sequence,
             path_revision: self.current_path_revision,
             pose_source_ns: self.pose_receipt.map(|receipt| receipt.source_timestamp_ns),
             map_source_ns: self.costmap_receipt.map(|receipt| receipt.source_timestamp_ns),
@@ -1166,7 +805,6 @@ where
             self.config.tick_interval,
         );
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut fallback_renewal = Instant::now() + self.config.renew_interval;
         let mut input_open = true;
         let mut urgent_open = true;
         let mut deferred_control: Option<DeferredControl> = None;
@@ -1186,7 +824,6 @@ where
                     .await;
             }
 
-            let renewal_due = self.motion.renewal_due_at().map_or(fallback_renewal, |due| due.min(fallback_renewal));
             let controlling = matches!(
                 self.status.phase,
                 SchedulerPhase::AwaitingPath | SchedulerPhase::Controlling
@@ -1205,38 +842,6 @@ where
                     }
                 }
 
-                _ = tokio::time::sleep_until(renewal_due), if self.should_renew() => {
-                    match await_interruptible(urgent_open, &mut urgent_rx, self.renew()).await {
-                        Interruptible::Completed(Ok(())) => {
-                            fallback_renewal = Instant::now() + self.config.renew_interval;
-                        }
-                        Interruptible::Completed(Err(error)) => {
-                            let error = self.fail_closed(&status_tx, error).await;
-                            // 单个目标被外部停车撤租后，精确围栏已确认便退休目标。
-                            // 进程继续拥有输入与下一目标，不能靠重启完成业务取消。
-                            if !self.lease_active && self.session.is_none() { continue; }
-                            self.status.motion_sink_ready = false;
-                            self.publish_status(&status_tx);
-                            return Err(error);
-                        }
-                        Interruptible::Urgent(Some(command)) => {
-                            if let Some(result) = self.handle_urgent(&status_tx, command).await {
-                                return result;
-                            }
-                        }
-                        Interruptible::Urgent(None) => {
-                            urgent_open = false;
-                            if self.lease_active {
-                                return self.finish_terminal(
-                                    &status_tx,
-                                    TerminalOutcome::Shutdown,
-                                    SchedulerPhase::Idle,
-                                ).await;
-                            }
-                        }
-                    }
-                }
-
                 event = async {
                     if let Some(wait) = deferred_control.as_mut() {
                         match wait.queued_inputs {
@@ -1245,6 +850,7 @@ where
                             None => tokio::select! {
                                 biased;
                                 finish = wait.ready() => SchedulerEvent::Publication(finish),
+                                _ = tick.tick() => SchedulerEvent::Heartbeat,
                                 command = input_rx.recv(), if input_open => SchedulerEvent::Input(command),
                             },
                         }
@@ -1276,6 +882,14 @@ where
                             wait.finish_wait = finish_wait;
                         }
                     }
+                    SchedulerEvent::Heartbeat => {
+                        let command = if self.stale_input_reason(Instant::now()).is_some() { Twist2::ZERO }
+                            else { self.planner.held_command().unwrap_or(Twist2::ZERO) };
+                        if let Err(error) = self.send_controller_twist_with_bound(&status_tx, command, None, false).await {
+                            if self.session.is_none() { continue; }
+                            return Err(error);
+                        }
+                    }
                     SchedulerEvent::Tick | SchedulerEvent::ControlReady => {
                         self.planner.observe_measured_motion(self.motion.measured_motion());
                         let previous = deferred_control.take();
@@ -1299,27 +913,11 @@ where
                                 }
                             }
                         }
-                    let outcome = await_interruptible(urgent_open, &mut urgent_rx, self.session_tick(&status_tx)).await;
-                    match outcome {
-                        Interruptible::Completed(Ok(())) => {}
-                        Interruptible::Completed(Err(error)) => {
-                            if !self.lease_active && self.session.is_none() { continue; }
-                            self.status.motion_sink_ready = false;
-                            self.publish_status(&status_tx);
-                            return Err(error);
-                        }
-                        Interruptible::Urgent(Some(command)) => {
-                            if let Some(result) = self.handle_urgent(&status_tx, command).await {
-                                return result;
-                            }
-                        }
-                        Interruptible::Urgent(None) => {
-                            return self.finish_terminal(
-                                &status_tx,
-                                TerminalOutcome::Shutdown,
-                                SchedulerPhase::Idle,
-                            ).await;
-                        }
+                    if let Err(error) = self.session_tick(&status_tx).await {
+                        if !self.lease_active && self.session.is_none() { continue; }
+                        self.status.motion_sink_ready = false;
+                        self.publish_status(&status_tx);
+                        return Err(error);
                     }
                     }
                 }
@@ -1652,16 +1250,14 @@ where
     ) -> Result<(), RuntimeError> {
         validate_session(&session)?;
         let replacing = self.session.is_some();
-        let operation_id = self.next_operation_id("acquire")?;
-        match self.motion.acquire(&operation_id, &session.motion_admission).await {
-            Ok(_) => {}
-            Err(error) if !error.lease_may_be_active => {
-                return Err(RuntimeError::LeaseNotGranted(error.message));
+        if let Err(error) = self.motion.acquire(session.motion_generation).await {
+            if error.code.is_none() {
+                self.status.motion_sink_ready=false;
+                return Err(self.fail_closed(status_tx,RuntimeError::Motion(error.message)).await);
             }
-            Err(error) => {
-                self.lease_active = true;
-                return Err(self.fail_closed(status_tx, RuntimeError::Motion(error.message)).await);
-            }
+            self.status.message = error.message.clone();
+            self.finish_terminal(status_tx, TerminalOutcome::Stopped, SchedulerPhase::Idle).await?;
+            return Err(RuntimeError::LeaseNotGranted(error.message));
         }
         self.lease_active = true;
         if !replacing {
@@ -1690,8 +1286,6 @@ where
         self.status.path_revision = 0;
         self.status.motion_sink_ready = true;
         self.status.last_terminal = None;
-        self.status.last_zero_ack_id = None;
-        self.status.last_fence_monotonic_ns = 0;
         self.status.surface_replan_feedback = None;
         self.status.message = "导航租约已接管，等待新路径".into();
         self.publish_status(status_tx);
@@ -1785,9 +1379,9 @@ where
         session_id: &str,
     ) -> Result<(), RuntimeError> {
         let Some(session) = self.session.as_ref() else {
-            return Err(RuntimeError::Busy("no active session to cancel".into()));
+            return Ok(());
         };
-        if session_id.trim() != session.session_id {
+        if !session_id.is_empty() && session_id.trim() != session.session_id {
             return Err(RuntimeError::Busy(format!(
                 "cancel session {} does not match active {}",
                 session_id.trim(),
@@ -1796,7 +1390,7 @@ where
         }
         self.status.phase = SchedulerPhase::Cancelling;
         self.status.surface_replan_feedback = None;
-        self.status.message = "cancel accepted; waiting for guard fence".into();
+        self.status.message = "取消目标，释放租约".into();
         self.publish_status(status_tx);
         self.finish_terminal(status_tx, TerminalOutcome::Cancelled, SchedulerPhase::Idle)
             .await
@@ -1952,7 +1546,14 @@ where
     // False means the selected command expired and an ordinary zero was confirmed.
     async fn apply_controller_twist_with_bound(
         &mut self, status_tx:&watch::Sender<SchedulerStatus>, twist:Twist2,
-        mut bound:Option<CommandDispatchBound>,
+        bound:Option<CommandDispatchBound>,
+    )->Result<bool,RuntimeError> {
+        self.send_controller_twist_with_bound(status_tx,twist,bound,true).await
+    }
+
+    async fn send_controller_twist_with_bound(
+        &mut self, status_tx:&watch::Sender<SchedulerStatus>, twist:Twist2,
+        mut bound:Option<CommandDispatchBound>, publish_message:bool,
     )->Result<bool,RuntimeError> {
         #[cfg(feature = "surface-recovery-qualification")]
         let _qualification_span = self.qualification_span("scheduler.apply_controller_twist", self.status.pose_source_timestamp_ns);
@@ -1966,13 +1567,9 @@ where
                 bound=Some(bound.map_or(source,|candidate|candidate.earliest(source)));
             }
         }
-        if self.motion.renewal_due_at().is_some_and(|due|Instant::now()>=due) {
-            if let Err(error)=self.renew().await {return Err(self.fail_closed(status_tx,error).await);}
-        }
         let mut applied_twist=twist;
         let mut expired=false;
         loop {
-            let operation_id=self.next_operation_id("twist")?;
             #[cfg(feature = "surface-recovery-qualification")]
             self.qualification_snapshot("scheduler.motion.submit.enter", self.status.pose_source_timestamp_ns, None, 0);
             let outcome = {
@@ -1984,25 +1581,25 @@ where
                         [applied_twist.linear.x, applied_twist.linear.y, applied_twist.angular_z]);
                     sink.bound("scheduler.motion.submit.bound", self.status.pose_source_timestamp_ns, bound);
                 }
-                self.motion.submit_twist_bounded(&operation_id,applied_twist,bound).await
+                self.motion.velocity_bounded(applied_twist,bound).await
             };
             #[cfg(feature = "surface-recovery-qualification")]
             if let Some(sink) = &self.qualification_timing {
                 sink.mark(match &outcome {
-                    Ok(BoundedTwistOutcome::Applied(_)) => "scheduler.motion.submit.return.applied",
+                    Ok(BoundedTwistOutcome::Applied) => "scheduler.motion.submit.return.applied",
                     Ok(BoundedTwistOutcome::ExpiredNotApplied) => "scheduler.motion.submit.return.expired",
                     Err(_) => "scheduler.motion.submit.return.error",
                 }, self.status.pose_source_timestamp_ns);
             }
             match outcome {
-                Ok(BoundedTwistOutcome::Applied(_))=>{},
+                Ok(BoundedTwistOutcome::Applied)=>{},
                 Ok(BoundedTwistOutcome::ExpiredNotApplied) if bound.is_some()=>{
                     applied_twist=Twist2::ZERO;bound=None;expired=true;continue;
                 },
                 Ok(BoundedTwistOutcome::ExpiredNotApplied)=>{
                     return Err(self.fail_closed(status_tx,RuntimeError::Motion("unbounded zero submission reported observation expiry".into())).await);
                 },
-                Err(error)=>return Err(self.fail_closed(status_tx,RuntimeError::Motion(error.message)).await),
+                Err(error)=>return Err(self.motion_failed(status_tx,error).await),
             };
             self.status.applied_commands=self.status.applied_commands.saturating_add(1);
             self.status.last_applied_twist=Some(applied_twist);
@@ -2015,7 +1612,7 @@ where
                     feedback.current_context=None;
                 }
             }
-            self.status.message=if expired {"执行来源凭据在下发前已过期，零速已执行，等待重新计算".into()}else{"twist APPLIED".into()};
+            if publish_message { self.status.message=if expired {"执行来源凭据在下发前已过期，零速已执行，等待重新计算".into()}else{"速度请求已接受".into()}; }
             self.publish_status(status_tx);
             return Ok(!expired);
         }
@@ -2063,6 +1660,7 @@ where
                 return self.wait_for_fresh_input(status_tx, reason).await;
             }
         }
+        self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
         self.check_path_wait_timeout(status_tx).await?;
         if self.status.phase == SchedulerPhase::AwaitingPath {
             // Preserve the original stale/deadline checks and their ordering.
@@ -2129,21 +1727,13 @@ where
         .await
     }
 
-    async fn renew(&mut self) -> Result<(), RuntimeError> {
-        let operation_id = self.next_operation_id("renew")?;
-        #[cfg(feature = "surface-recovery-qualification")]
-        self.qualification_snapshot("scheduler.renew.enter", self.status.pose_source_timestamp_ns, None, 0);
-        #[cfg(feature = "surface-recovery-qualification")]
-        let _qualification_span = self.qualification_span("scheduler.renew", self.status.pose_source_timestamp_ns);
-        let result = self.motion
-            .renew(&operation_id)
-            .await
-            .map_err(|error| RuntimeError::Motion(error.message));
-        self.planner.observe_measured_motion(self.motion.measured_motion());
-        #[cfg(feature = "surface-recovery-qualification")]
-        self.qualification_snapshot(if result.is_ok() { "scheduler.renew.ok" }
-            else { "scheduler.renew.error" }, self.status.pose_source_timestamp_ns, None, 0);
-        result
+    async fn motion_failed(&mut self, status_tx: &watch::Sender<SchedulerStatus>, error: MotionPortError) -> RuntimeError {
+        if error.code == Some(ErrorCode::LeaseRevoked) {
+            self.lease_active = false;
+            self.status.message = error.message.clone();
+            let _ = self.finish_terminal(status_tx, TerminalOutcome::Stopped, SchedulerPhase::Idle).await;
+            RuntimeError::Motion(error.message)
+        } else { self.fail_closed(status_tx, RuntimeError::Motion(error.message)).await }
     }
 
     async fn fail_closed(
@@ -2161,10 +1751,7 @@ where
             RuntimeError::Planner(_) => "Planner",
             RuntimeError::StaleInput(_) => "StaleInput",
             RuntimeError::MapSourceInvalidated(_) => "MapSourceInvalidated",
-            RuntimeError::InvalidApplied(_) => "InvalidApplied",
-            RuntimeError::InvalidFence(_) => "InvalidFence",
             RuntimeError::SchedulerStopped => "SchedulerStopped",
-            RuntimeError::SequenceExhausted => "SequenceExhausted",
         };
         let qualified_cause = format!("SafetyFailed cause={cause_kind}: {original}");
         self.status.message = qualified_cause.clone();
@@ -2201,6 +1788,11 @@ where
         // 上层可能只消费首次终态；先保留真实原因，不能等围栏完成后再补发。
         let failure_reason = matches!(terminal, TerminalOutcome::PlannerFailed | TerminalOutcome::SafetyFailed)
             .then(|| self.status.message.clone());
+        if terminal == TerminalOutcome::Shutdown && !self.lease_active && self.session.is_none() && self.status.last_terminal.is_some() {
+            self.status.motion_sink_ready=false;
+            self.publish_status(status_tx);
+            return Ok(());
+        }
         self.status.surface_replan_feedback = None;
         self.current_execution_identity = None;
 
@@ -2209,54 +1801,14 @@ where
             let _qualification_span = self.qualification_span("scheduler.finish_terminal.planner_stop", self.status.pose_source_timestamp_ns);
             self.planner.stop();
         }
-        let had_lease = self.lease_active;
-        if terminal == TerminalOutcome::Succeeded && had_lease {
-            self.path_wait_started_at.get_or_insert_with(Instant::now);
-        }
-        let mut verified_fence = None;
-        if had_lease {
-            if self.status.phase != SchedulerPhase::Cancelling {
-                self.status.phase = SchedulerPhase::Fencing;
-                self.status.message = format!("waiting for {terminal:?} fence proof");
-                if let Some(reason) = &failure_reason {
-                    self.status.message.push_str("; ");
-                    self.status.message.push_str(reason);
-                }
-                self.publish_status(status_tx);
+        if self.lease_active {
+            if let Err(error) = self.motion.release().await {
+                self.fail_status(status_tx, &error.message);
+                return Err(RuntimeError::Motion(error.message));
             }
-            let operation_id = self.next_operation_id("fence")?;
-            tracing::info!(session_id = ?self.status.session_id, %operation_id, ?terminal,
-                reason = ?failure_reason, "导航撤租归零");
-            #[cfg(feature = "surface-recovery-qualification")]
-            self.qualification_snapshot("scheduler.fence.enter", self.status.pose_source_timestamp_ns, None, 0);
-            let outcome = {
-                #[cfg(feature = "surface-recovery-qualification")]
-                let _qualification_span = self.qualification_span("scheduler.priority_revoke_and_zero", self.status.pose_source_timestamp_ns);
-                self.motion.priority_revoke_and_zero(&operation_id).await
-            };
-            #[cfg(feature = "surface-recovery-qualification")]
-            self.qualification_snapshot(if outcome.is_ok() { "scheduler.fence.return.ok" }
-                else { "scheduler.fence.return.error" }, self.status.pose_source_timestamp_ns, None, 0);
-            let proof = match outcome {
-                Ok(proof) => proof,
-                Err(error) => {
-                    // 通信/执行失败的首因须留在同一安全失败中；规划失败仍以原停车错误为主。
-                    let reason = failure_reason.as_ref().filter(|_| terminal == TerminalOutcome::SafetyFailed)
-                        .map_or_else(|| error.message.clone(),
-                        |cause| format!("{cause}; fence failed: {}", error.message));
-                    self.fail_status(status_tx, &reason);
-                    return Err(RuntimeError::Motion(reason));
-                }
-            };
             self.lease_active = false;
-            // 已验证的归零证明同步到规划器命令边界，下一目标从已确认零速命令接续。
             self.planner.observe_applied_command(Twist2::ZERO);
-            verified_fence = proof;
-        } else if terminal == TerminalOutcome::Shutdown && self.status.last_terminal.is_some() {
-            self.status.phase = SchedulerPhase::Idle;
-            self.status.message = "scheduler stopped; prior verified terminal retained".into();
-            self.publish_status(status_tx);
-            return Ok(());
+            self.status.last_applied_twist = Some(Twist2::ZERO);
         }
 
         {
@@ -2275,15 +1827,9 @@ where
         self.status.session_id = None;
         self.status.path_revision = 0;
         self.status.last_terminal = Some(terminal);
-        if let Some(proof) = verified_fence {
-            self.status.motion_sink_ready = terminal != TerminalOutcome::Shutdown;
-            self.status.last_zero_ack_id = Some(proof.zero_ack_id);
-            self.status.last_fence_monotonic_ns = proof.applied_monotonic_ns;
-            self.status.last_applied_twist = Some(Twist2::ZERO);
-            self.status.message = format!("{terminal:?} after verified fence");
-        } else {
-            self.status.message = format!("{terminal:?} with no active lease");
-        }
+        self.status.message = if terminal == TerminalOutcome::Stopped {
+            "STOPPED: 已被停止".into()
+        } else { format!("{terminal:?}，租约已释放") };
         if let Some(reason) = failure_reason {
             self.status.message = format!("{reason}; {}", self.status.message);
         }
@@ -2292,30 +1838,6 @@ where
         }
         self.publish_status(status_tx);
         Ok(())
-    }
-
-    fn should_renew(&self) -> bool {
-        self.lease_active
-            && matches!(
-                self.status.phase,
-                SchedulerPhase::AwaitingPath | SchedulerPhase::Controlling
-            )
-    }
-
-    fn next_operation_id(&mut self, operation: &str) -> Result<String, RuntimeError> {
-        self.operation_sequence = self
-            .operation_sequence
-            .checked_add(1)
-            .ok_or(RuntimeError::SequenceExhausted)?;
-        let session_id = self
-            .session
-            .as_ref()
-            .map(|session| session.session_id.as_str())
-            .unwrap_or("idle");
-        Ok(format!(
-            "nav:{session_id}:{operation}:{}",
-            self.operation_sequence
-        ))
     }
 
     fn fail_status(&mut self, status_tx: &watch::Sender<SchedulerStatus>, reason: &str) {
@@ -2609,9 +2131,9 @@ pub async fn spawn_production_scheduler_with_backend(
 ) -> Result<(NavSchedulerHandle, JoinHandle<Result<(), RuntimeError>>), RuntimeError> {
     validate_config(config)?;
     let backend = production_local_backend(backend_kind)?;
-    let motion = ProductionNavMotionPort::connect(production_client_config(socket_path))
+    let motion = MotionGuardClient::connect_with_config(production_client_config(socket_path))
         .await
-        .map_err(|error| RuntimeError::Motion(error.message))?;
+        .map_err(|error| RuntimeError::Motion(error.to_string()))?;
     let scheduler = NavScheduler::new(motion, backend, config)?;
     Ok(spawn_scheduler(scheduler))
 }
@@ -2625,11 +2147,10 @@ pub async fn spawn_production_surface_scheduler(
     validate_config(config)?;
     // 先校验标定，再连接原守卫查询真实设备限制，不创建第二个设备执行器。
     let _ = SurfaceFollower::new(surface_config.clone())?;
-    let mut motion = ProductionNavMotionPort::connect(production_client_config(socket_path))
+    let mut motion = MotionGuardClient::connect_with_config(production_client_config(socket_path))
         .await
-        .map_err(|error| RuntimeError::Motion(error.message))?;
-    let readiness=motion.normal_client().await.map_err(|error|RuntimeError::Motion(error.message))?
-        .get_readiness().await.map_err(|error|RuntimeError::Motion(error.to_string()))?;
+        .map_err(|error| RuntimeError::Motion(error.to_string()))?;
+    let readiness=motion.status().await.map_err(|error|RuntimeError::Motion(error.to_string()))?;
     surface_config.command_limits=readiness.command_limits;
     let backend = production_surface_backend(surface_config)?;
     Ok(spawn_scheduler(NavScheduler::new(motion, backend, config)?))
@@ -2677,7 +2198,8 @@ impl DeferredControl {
     }
 }
 
-enum SchedulerEvent { Input(Option<InputCommand>), Tick, Publication(bool), ControlReady }
+enum SchedulerEvent {
+    Heartbeat, Input(Option<InputCommand>), Tick, Publication(bool), ControlReady }
 
 fn check_pose_data_age(source_ns: i64, maximum: Duration) -> Result<(), RuntimeError> {
     let source = u64::try_from(source_ns).ok().filter(|v| *v > 0)
@@ -2728,12 +2250,6 @@ fn validate_config(config: SchedulerConfig) -> Result<(), RuntimeError> {
         return Err(RuntimeError::InvalidInput {
             field: "tick_interval",
             reason: "must be positive".into(),
-        });
-    }
-    if config.renew_interval.is_zero() || config.renew_interval > MAX_RENEW_INTERVAL {
-        return Err(RuntimeError::InvalidInput {
-            field: "renew_interval",
-            reason: format!("must be in 1..={}ms", MAX_RENEW_INTERVAL.as_millis()),
         });
     }
     Ok(())
@@ -2824,22 +2340,11 @@ mod tests {
     include!("yaw_zero_contract_tests.rs");
     include!("recent_source_health_tests.rs");
     include!("registered_frame_stream_tests.rs");
-    use std::collections::HashMap;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::sync::atomic::Ordering;
 
-    use nuwax_motion_safety_guard::wire::{
-        motion_guard_request, motion_guard_response, AckCode, AcquireLeaseResponse, GuardResult,
-        LeaseState, LeaseTuple, MotionGuardRequest, MotionGuardResponse, RenewLeaseResponse,
-        RevokeAndZeroResponse, SubmitMotionCommandResponse, ZeroAck, API_VERSION,
-    };
     use nuwax_nav_astar::navigation_map::CostMap2D;
     use nuwax_nav_types_messages::{NavFrameId, Point2, Pose3, Timestamp};
-    use prost::Message;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{UnixListener, UnixStream};
-    use tokio::sync::mpsc as tokio_mpsc;
 
     use super::*;
 
@@ -2953,287 +2458,6 @@ mod tests {
         }
     }
 
-    static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(1);
-
-    struct GuardFixture {
-        path: PathBuf,
-        task: Option<JoinHandle<Vec<&'static str>>>,
-    }
-
-    impl GuardFixture {
-        async fn finish(mut self) -> Vec<&'static str> {
-            let operations = self
-                .task
-                .take()
-                .expect("guard fixture task handle")
-                .await
-                .expect("guard fixture task");
-            let _ = std::fs::remove_file(&self.path);
-            operations
-        }
-    }
-
-    impl Drop for GuardFixture {
-        fn drop(&mut self) {
-            if let Some(task) = self.task.as_ref() {
-                task.abort();
-            }
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum DelayedOperation {
-        Submit,
-        Renew,
-        FenceResponse,
-    }
-
-    struct PriorityGuardFixture {
-        path: PathBuf,
-        task: JoinHandle<()>,
-        delayed_rx: tokio_mpsc::UnboundedReceiver<&'static str>,
-    }
-
-    impl Drop for PriorityGuardFixture {
-        fn drop(&mut self) {
-            self.task.abort();
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-
-    fn socket_path(label: &str) -> PathBuf {
-        let id = NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "nuwax-nav-runtime-{label}-{}-{id}.sock",
-            std::process::id()
-        ))
-    }
-
-    async fn spawn_scripted_guard(label: &str) -> GuardFixture {
-        let path = socket_path(label);
-        let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path).expect("bind guard fixture UDS");
-        let task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept guard client");
-            let mut operations = Vec::new();
-            for _ in 0..3 {
-                let request = read_guard_request(&mut stream).await;
-                let (operation, response) = scripted_guard_response(&request);
-                operations.push(operation);
-                write_guard_response(&mut stream, response).await;
-            }
-            operations
-        });
-        GuardFixture {
-            path,
-            task: Some(task),
-        }
-    }
-
-    async fn spawn_priority_guard(label: &str, delayed: DelayedOperation) -> PriorityGuardFixture {
-        let path = socket_path(label);
-        let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path).expect("bind priority guard fixture UDS");
-        let (delayed_tx, delayed_rx) = tokio_mpsc::unbounded_channel();
-        let seen_fences = Arc::new(Mutex::new(HashMap::new()));
-        let task = tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let delayed_tx = delayed_tx.clone();
-                let seen_fences = Arc::clone(&seen_fences);
-                tokio::spawn(handle_priority_guard_connection(
-                    stream,
-                    delayed,
-                    delayed_tx,
-                    seen_fences,
-                ));
-            }
-        });
-        PriorityGuardFixture {
-            path,
-            task,
-            delayed_rx,
-        }
-    }
-
-    async fn handle_priority_guard_connection(
-        mut stream: UnixStream,
-        delayed: DelayedOperation,
-        delayed_tx: tokio_mpsc::UnboundedSender<&'static str>,
-        seen_fences: Arc<Mutex<HashMap<String, Vec<u8>>>>,
-    ) {
-        while let Some(request) = try_read_guard_request(&mut stream).await {
-            let (operation, response) = scripted_guard_response(&request);
-            let must_delay = matches!(
-                (delayed, operation),
-                (DelayedOperation::Submit, "applied") | (DelayedOperation::Renew, "renew")
-            );
-            if must_delay {
-                let _ = delayed_tx.send(operation);
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            if delayed == DelayedOperation::FenceResponse && operation == "fence" {
-                let operation_id = match request.operation.as_ref() {
-                    Some(motion_guard_request::Operation::RevokeAndZero(body)) => body
-                        .envelope
-                        .as_ref()
-                        .map(|envelope| envelope.operation_id.clone())
-                        .unwrap_or_default(),
-                    _ => String::new(),
-                };
-                let request_bytes = request.encode_to_vec();
-                let first_attempt = {
-                    let mut seen = seen_fences.lock().expect("seen fence operations");
-                    if let Some(first_bytes) = seen.get(&operation_id) {
-                        assert_eq!(
-                            first_bytes, &request_bytes,
-                            "priority fence retry must replay identical sealed bytes"
-                        );
-                        false
-                    } else {
-                        seen.insert(operation_id, request_bytes);
-                        true
-                    }
-                };
-                if first_attempt {
-                    let _ = delayed_tx.send("fence");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    return;
-                }
-            }
-            if !try_write_guard_response(&mut stream, response).await {
-                return;
-            }
-        }
-    }
-
-    async fn try_read_guard_request(stream: &mut UnixStream) -> Option<MotionGuardRequest> {
-        let mut prefix = [0_u8; 4];
-        stream.read_exact(&mut prefix).await.ok()?;
-        let length = u32::from_be_bytes(prefix) as usize;
-        if length == 0 || length > MAX_FRAME_BYTES {
-            return None;
-        }
-        let mut payload = vec![0_u8; length];
-        stream.read_exact(&mut payload).await.ok()?;
-        MotionGuardRequest::decode(payload.as_slice()).ok()
-    }
-
-    async fn try_write_guard_response(
-        stream: &mut UnixStream,
-        response: MotionGuardResponse,
-    ) -> bool {
-        let payload = response.encode_to_vec();
-        stream
-            .write_all(&(payload.len() as u32).to_be_bytes())
-            .await
-            .is_ok()
-            && stream.write_all(&payload).await.is_ok()
-            && stream.flush().await.is_ok()
-    }
-
-    async fn read_guard_request(stream: &mut UnixStream) -> MotionGuardRequest {
-        let mut prefix = [0_u8; 4];
-        stream
-            .read_exact(&mut prefix)
-            .await
-            .expect("read guard request prefix");
-        let length = u32::from_be_bytes(prefix) as usize;
-        assert!(length > 0 && length <= MAX_FRAME_BYTES);
-        let mut payload = vec![0_u8; length];
-        stream
-            .read_exact(&mut payload)
-            .await
-            .expect("read guard request body");
-        MotionGuardRequest::decode(payload.as_slice()).expect("decode guard request")
-    }
-
-    async fn write_guard_response(stream: &mut UnixStream, response: MotionGuardResponse) {
-        let payload = response.encode_to_vec();
-        stream
-            .write_all(&(payload.len() as u32).to_be_bytes())
-            .await
-            .expect("write guard response prefix");
-        stream
-            .write_all(&payload)
-            .await
-            .expect("write guard response body");
-        stream.flush().await.expect("flush guard response");
-    }
-
-    fn guard_result(ack: AckCode, lease: LeaseState) -> GuardResult {
-        GuardResult {
-            ack: ack as i32,
-            lease: lease as i32,
-            error: None,
-        }
-    }
-
-    fn scripted_guard_response(
-        request: &MotionGuardRequest,
-    ) -> (&'static str, MotionGuardResponse) {
-        let (operation, outcome) = match request.operation.as_ref().expect("request operation") {
-            motion_guard_request::Operation::AcquireLease(body) => {
-                let envelope = body.envelope.as_ref().expect("acquire envelope");
-                assert_eq!(envelope.motion_stop_generation, 1);
-                let admitted = envelope.tuple.as_ref().expect("acquire admission tuple");
-                (
-                    "acquire",
-                    motion_guard_response::Outcome::AcquireLease(AcquireLeaseResponse {
-                        result: Some(guard_result(AckCode::Received, LeaseState::Active)),
-                        lease_tuple: Some(LeaseTuple {
-
-                            boot_nonce: admitted.boot_nonce.clone(),
-                            lease_id: 41,
-                        }),
-
-                        owner_deadline_monotonic_ns: u64::MAX - 1,
-                    }),
-                )
-            }
-            motion_guard_request::Operation::RenewLease(_) => (
-                "renew",
-                motion_guard_response::Outcome::RenewLease(RenewLeaseResponse {
-                    result: Some(guard_result(AckCode::Received, LeaseState::Active)),
-
-                    owner_deadline_monotonic_ns: u64::MAX - 1,
-                }),
-            ),
-            motion_guard_request::Operation::SubmitMotionCommand(_) => (
-                "applied",
-                motion_guard_response::Outcome::SubmitMotionCommand(SubmitMotionCommandResponse { limited: false,
-                    result: Some(guard_result(AckCode::Applied, LeaseState::Active)),
-                    applied_monotonic_ns: 101,
-                    zero_ack: None,
-                }),
-            ),
-            motion_guard_request::Operation::RevokeAndZero(_) => (
-                "fence",
-                motion_guard_response::Outcome::RevokeAndZero(RevokeAndZeroResponse {
-                    result: Some(guard_result(AckCode::ResourceFenced, LeaseState::Idle)),
-                    zero_ack: Some(ZeroAck {
-                        zero_ack_id: "zero-uds-1".into(),
-                        applied_monotonic_ns: 102,
-                        ..Default::default()
-                    }),
-                }),
-            ),
-            operation => panic!("unexpected guard operation: {operation:?}"),
-        };
-        (
-            operation,
-            MotionGuardResponse {
-                measured_motion_feedback: None,
-            api_version: API_VERSION,
-                request_id: request.request_id.clone(),
-                outcome: Some(outcome),
-            },
-        )
-    }
-
     #[derive(Debug, Default)]
     pub(crate) struct FakeMotionState {
         calls: Vec<String>,
@@ -3248,67 +2472,27 @@ mod tests {
 
     #[async_trait]
     impl NavMotionPort for FakeMotion {
-        async fn acquire(
-            &mut self,
-            operation_id: &str,
-            admission: &NavMotionAdmission,
-        ) -> Result<LeaseProof, MotionPortError> {
-            self.0
-                .lock()
-                .expect("fake motion state")
-                .calls
-                .push(format!("acquire:{operation_id}"));
-            if self.0.lock().unwrap().rejected_generation == Some(admission.motion_stop_generation) {
-                return Err(MotionPortError::definite_no_lease("STALE_STOP_GENERATION"));
+        async fn acquire(&mut self, generation: u64) -> Result<u64, MotionPortError> {
+            let mut state = self.0.lock().unwrap();
+            state.calls.push("acquire:".into());
+            if state.rejected_generation == Some(generation) {
+                return Err(MotionPortError { message: "代次已过期".into(), code: Some(ErrorCode::StaleGeneration) });
             }
-            Ok(LeaseProof {
-                lease_id: 11,
-
-            })
+            Ok(11)
         }
-
-        async fn renew(&mut self, operation_id: &str) -> Result<(), MotionPortError> {
-            self.0
-                .lock()
-                .expect("fake motion state")
-                .calls
-                .push(format!("renew:{operation_id}"));
+        async fn velocity(&mut self, twist: Twist2) -> Result<(), MotionPortError> {
+            let mut state = self.0.lock().unwrap();
+            let index = state.calls.len();
+            if let Some(probe) = &mut state.twist_probe { probe.push((index, String::new(), twist)); }
+            state.calls.push("twist:".into());
+            if state.fail_twist { return Err(MotionPortError::new("注入速度发送失败")); }
             Ok(())
         }
-
-        async fn submit_twist(
-            &mut self,
-            operation_id: &str,
-            twist: Twist2,
-        ) -> Result<AppliedProof, MotionPortError> {
-            let mut state = self.0.lock().expect("fake motion state");
-            let call_index = state.calls.len();
-            if let Some(probe) = &mut state.twist_probe {
-                probe.push((call_index, operation_id.to_owned(), twist));
-            }
-            state.calls.push(format!("twist:{operation_id}"));
-            if state.fail_twist {
-                return Err(MotionPortError::new("injected APPLIED timeout"));
-            }
-            Ok(AppliedProof {
-                operation_id: operation_id.into(),
-                applied_monotonic_ns: 99,
-            })
+        async fn release(&mut self) -> Result<(), MotionPortError> {
+            self.0.lock().unwrap().calls.push("release:".into());
+            Ok(())
         }
-
-        async fn revoke_and_zero(
-            &mut self,
-            operation_id: &str,
-        ) -> Result<Option<FenceProof>, MotionPortError> {
-            let mut state = self.0.lock().expect("fake motion state");
-            state.calls.push(format!("fence:{operation_id}"));
-            Ok(Some(FenceProof {
-                zero_ack_id: "zero-ack".into(),
-                applied_monotonic_ns: 100,
-                lease: FenceLeaseState::Idle,
-            }))
-        }
-    }
+}
 
     #[derive(Clone)]
     struct FakePlanner {
@@ -3394,7 +2578,7 @@ mod tests {
             planner,
             SchedulerConfig {
                 tick_interval: Duration::from_millis(5),
-                renew_interval: Duration::from_millis(20),
+
                 path_wait_timeout: Duration::from_secs(1),
                     pose_ttl,
                 costmap_ttl,
@@ -3419,20 +2603,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_lease_rejection_keeps_old_session_and_control() {
-        let (mut scheduler, status, motion) = takeover_scheduler_fixture().await;
-        let previous = scheduler.status.clone();
-        let identity = scheduler.current_execution_identity.clone().unwrap();
-        motion.lock().unwrap().rejected_generation = Some(2);
-        let mut next = session_for("goal-2"); next.motion_admission.motion_stop_generation = 2;
-        assert!(matches!(scheduler.start_session(&status, next).await, Err(RuntimeError::LeaseNotGranted(_))));
-        assert_eq!(scheduler.status, previous);
-        assert_eq!(scheduler.session.as_ref().unwrap().session_id, "goal-1");
-        assert!(Arc::ptr_eq(&identity, scheduler.current_execution_identity.as_ref().unwrap()));
-        scheduler.control_tick(&status).await.unwrap();
-        let motion = motion.lock().unwrap();
-        assert!(!motion.calls.iter().any(|call| call.starts_with("fence:")));
-        assert!(motion.twist_probe.as_ref().unwrap().iter().all(|(_, _, twist)| *twist != Twist2::ZERO));
+    async fn replacement_lease_rejection_stops_execution_and_releases_previous_lease() {
+        let (mut scheduler,status,motion)=takeover_scheduler_fixture().await;
+        motion.lock().unwrap().rejected_generation=Some(2);
+        let mut next=session_for("goal-2");next.motion_generation=2;
+        assert!(matches!(scheduler.start_session(&status,next).await,Err(RuntimeError::LeaseNotGranted(_))));
+        assert!(scheduler.session.is_none());
+        assert_eq!(scheduler.status.last_terminal,Some(TerminalOutcome::Stopped));
+        assert!(scheduler.current_execution_identity.is_none());
+        assert_eq!(motion.lock().unwrap().calls.iter().filter(|call|call.starts_with("release:")).count(),1);
     }
 
     #[tokio::test]
@@ -3440,7 +2619,7 @@ mod tests {
         let (mut scheduler, status, motion) = takeover_scheduler_fixture().await;
         let old_identity = scheduler.current_execution_identity.clone().unwrap();
         let old_stops = scheduler.planner.state.lock().unwrap().stops;
-        let mut next = session_for("goal-2"); next.motion_admission.motion_stop_generation = 2;
+        let mut next = session_for("goal-2"); next.motion_generation = 2;
         scheduler.start_session(&status, next).await.unwrap();
         assert_eq!(scheduler.status.session_id.as_deref(), Some("goal-2"));
         assert_eq!(scheduler.status.phase, SchedulerPhase::Controlling);
@@ -3459,7 +2638,7 @@ mod tests {
         assert_eq!(scheduler.current_path.as_ref().unwrap().0, expected);
         scheduler.control_tick(&status).await.unwrap();
         let motion = motion.lock().unwrap();
-        assert!(!motion.calls.iter().any(|call| call.starts_with("fence:")));
+        assert!(!motion.calls.iter().any(|call| call.starts_with("release:")));
         assert!(motion.twist_probe.as_ref().unwrap().iter().all(|(_, _, twist)| *twist != Twist2::ZERO));
     }
 
@@ -3474,7 +2653,7 @@ mod tests {
         assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::PlannerFailed));
         assert!(scheduler.status.message.contains("新目标无可行路径"));
         assert!(scheduler.session.is_none());
-        assert_eq!(motion.lock().unwrap().calls.iter().filter(|call| call.starts_with("fence:")).count(), 1);
+        assert_eq!(motion.lock().unwrap().calls.iter().filter(|call| call.starts_with("release:")).count(), 1);
     }
 
     #[tokio::test]
@@ -3561,7 +2740,7 @@ mod tests {
             while !entered.load(Ordering::SeqCst) {tokio::time::sleep(Duration::from_millis(5)).await;}
         }).await.unwrap();
         tokio::time::sleep(Duration::from_millis(520)).await;
-        assert!(calls.lock().unwrap().calls.iter().filter(|call|call.starts_with("renew:")).count()>=2);
+        assert!(calls.lock().unwrap().calls.iter().filter(|call|call.starts_with("twist:")).count()>=2);
         assert!(handle.status().message.contains("局部轨迹正在计算"),
             "零速执行回执不能掩盖仍在等待局部计算的阶段");
         assert_eq!(handle.status().last_applied_twist, Some(Twist2::ZERO));
@@ -3623,11 +2802,7 @@ mod tests {
             session_id: session_id.into(),
             execution_identity: execution_identity_for(session_id, 0),
 
-            motion_admission: NavMotionAdmission {
-
-                guard_boot_nonce: [7; 16],
-                motion_stop_generation: 1,
-            },
+            motion_generation: 1,
             goal: ExecutionGoal::Body(nuwax_nav_astar::helpers::make_pose_stamped("map", 2.0, 0.0, 0.0)),
         }
     }
@@ -3751,7 +2926,7 @@ mod tests {
         let paused = wait_for_input_pause(&handle).await;
         assert_eq!(paused.path_revision, 1);
         assert_eq!(paused.session_id.as_deref(), Some("goal-1"));
-        assert!(paused.last_zero_ack_id.is_none());
+
         handle.update_odometry_with_deadline(map_pose_at(2), Instant::now() + Duration::from_millis(500)).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while !handle.status().last_applied_twist.is_some_and(|twist| twist != Twist2::ZERO) {
@@ -3791,171 +2966,15 @@ mod tests {
         scheduler.control_tick(&status).await.unwrap();
         assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::PlannerFailed));
         assert!(scheduler.status.message.contains("pose source deadline"));
-        assert_eq!(scheduler.status.last_zero_ack_id.as_deref(), Some("zero-ack"));
-        assert_eq!(motion.lock().unwrap().calls.iter().filter(|call| call.starts_with("fence:")).count(), 1);
+
+        assert_eq!(motion.lock().unwrap().calls.iter().filter(|call| call.starts_with("release:")).count(), 1);
     }
 
-    #[tokio::test]
-    async fn server_deadline_renewal_keeps_legal_slow_commands_alive() {
-        let socket = socket_path("renew-slow-commands");
-        let listener = UnixListener::bind(&socket).expect("测试守卫套接字");
-        let planner = FakePlanner::commanding();
-        let planner_state = planner.state.clone();
-        let task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("接入客户端");
-            let mut operations = Vec::new();
-            let mut fence_at = Instant::now() + Duration::from_secs(1);
-            let mut applied = 0;
-            loop {
-                let request = tokio::time::timeout_at(fence_at, read_guard_request(&mut stream))
-                    .await.expect("必须在750毫秒看门狗前续租");
-                let (operation, mut response) = scripted_guard_response(&request);
-                operations.push(operation);
-                let now = Instant::now();
-                match response.outcome.as_mut().expect("响应") {
-                    motion_guard_response::Outcome::AcquireLease(body) => {
-                        let Some(motion_guard_request::Operation::AcquireLease(request)) = request.operation.as_ref() else { unreachable!() };
-                        let issued = request.envelope.as_ref().expect("信封").issued_monotonic_ns;
-                        body.owner_deadline_monotonic_ns = issued + 750_000_000;
-                        fence_at = now + Duration::from_millis(750);
-                        // 响应传输耗时必须扣入余量，不得重新从接收时刻计算许可。
-                        tokio::time::sleep(Duration::from_millis(80)).await;
-                    }
-                    motion_guard_response::Outcome::RenewLease(body) => {
-                        let Some(motion_guard_request::Operation::RenewLease(request)) = request.operation.as_ref() else { unreachable!() };
-                        let issued = request.envelope.as_ref().expect("信封").issued_monotonic_ns;
-                        body.owner_deadline_monotonic_ns = issued + 750_000_000;
-                        fence_at = now + Duration::from_millis(750);
-                    }
-                    motion_guard_response::Outcome::SubmitMotionCommand(_) => {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                        assert!(Instant::now() < fence_at, "合法慢SDK不能触发失联停车");
-                        applied += 1;
-                        if applied == 3 {
-                            planner_state.lock().expect("规划器").step = PlannerStep::Succeeded;
-                        }
-                    }
-                    _ => {}
-                }
-                write_guard_response(&mut stream, response).await;
-                if operation == "fence" { break; }
-            }
-            operations
-        });
-        let fixture = GuardFixture { path: socket.clone(), task: Some(task) };
-        let client = MotionGuardClient::connect_with_config(production_client_config(socket)).await.expect("客户端");
-        let scheduler = NavScheduler::new(client, planner, SchedulerConfig {
-            tick_interval: Duration::from_millis(150), ..SchedulerConfig::default()
-        }).expect("调度器");
-        let (handle, task) = spawn_scheduler(scheduler);
-        handle.start_session(session()).await.expect("会话");
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        assert_eq!(handle.status().phase, SchedulerPhase::AwaitingPath);
-        handle.update_costmap(CostmapObservation {
-            costmap: ExecutionMap::Planar(CostMap2D::new_all_free("map", 4, 4, 0.1)),
-            source_timestamp_ns: 1_000_000_000,
-        }).await.expect("地图");
-        handle.update_odometry(map_pose()).await.expect("位姿");
-        handle.submit_path(path()).await.expect("路径");
-        let mut status = handle.subscribe_status();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while status.borrow().last_terminal != Some(TerminalOutcome::Succeeded) {
-                status.changed().await.expect("状态流");
-            }
-        }).await.expect("三次慢动作完成后真实停车");
-        handle.shutdown().await.expect("关闭");
-        task.await.expect("调度拥有方").expect("调度结果");
-        let operations = fixture.finish().await;
-        assert_eq!(operations.iter().filter(|operation| **operation == "applied").count(), 3);
-        assert!(operations.iter().filter(|operation| **operation == "renew").count() >= 4);
-    }
 
-    #[tokio::test]
-    async fn rejected_acquire_keeps_sink_ready_and_next_goal_acquires() {
-        let socket = socket_path("acquire-recovery");
-        let listener = UnixListener::bind(&socket).expect("测试守卫套接字");
-        let guard_task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("接入导航客户端");
-            let first = read_guard_request(&mut stream).await;
-            let Some(motion_guard_request::Operation::AcquireLease(body)) = first.operation.as_ref() else {
-                panic!("首个操作应为取得租约");
-            };
-            assert_eq!(body.envelope.as_ref().unwrap().motion_stop_generation, 0);
-            write_guard_response(&mut stream, MotionGuardResponse {
-                api_version: API_VERSION,
-                request_id: first.request_id,
-                measured_motion_feedback: None,
-                outcome: Some(motion_guard_response::Outcome::AcquireLease(AcquireLeaseResponse {
-                    result: Some(GuardResult {
-                        ack: AckCode::Unspecified as i32,
-                        lease: LeaseState::Idle as i32,
-                        error: Some(nuwax_motion_safety_guard::wire::ErrorDetail {
-                            code: "STALE_STOP_GENERATION".into(),
-                            message: "测试：旧停止代次被拒绝".into(),
-                            retryable: false,
-                        }),
-                    }),
-                    ..Default::default()
-                })),
-            }).await;
-            let mut operations = vec!["rejected_acquire"];
-            loop {
-                let request = read_guard_request(&mut stream).await;
-                let (operation, response) = scripted_guard_response(&request);
-                operations.push(operation);
-                write_guard_response(&mut stream, response).await;
-                if operation == "fence" { break; }
-            }
-            operations
-        });
-        let guard = GuardFixture { path: socket.clone(), task: Some(guard_task) };
-        let client = MotionGuardClient::connect_with_config(production_client_config(socket))
-            .await.expect("连接真实测试守卫");
-        let (handle, task) = spawn_scheduler(NavScheduler::new(
-            client, FakePlanner::commanding(), SchedulerConfig::default(),
-        ).unwrap());
-        let mut first = session_for("rejected-goal");
-        first.motion_admission.motion_stop_generation = 0;
-        let rejected = handle.start_session(first).await.expect_err("首目标应被守卫拒绝");
-        assert!(rejected.to_string().contains("STALE_STOP_GENERATION"));
-        assert!(handle.status().motion_sink_ready, "一次明确拒绝不能污染后续目标的执行端就绪");
-        assert!(handle.status().session_id.is_none());
-        assert!(handle.status().last_zero_ack_id.is_none(), "没有取得租约不能伪造停车回执");
-        handle.start_session(session_for("accepted-goal")).await.expect("第二目标应取得租约");
-        assert_eq!(handle.status().phase, SchedulerPhase::AwaitingPath);
-        handle.cancel("accepted-goal").await.unwrap();
-        handle.shutdown().await.unwrap();
-        task.await.unwrap().unwrap();
-        let operations = guard.finish().await;
-        assert_eq!(operations.iter().filter(|operation| **operation == "acquire").count(), 1);
-        assert_eq!(operations.iter().filter(|operation| **operation == "fence").count(), 1);
-    }
 
-    #[tokio::test]
-    async fn scheduler_acquires_directly_from_request_admission_without_readiness_query() {
-        let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
-        let (handle, task) =
-            test_scheduler(FakeMotion(motion_state.clone()), FakePlanner::commanding());
 
-        let ready = wait_for_sink(&handle).await;
-        assert!(ready.motion_sink_ready);
 
-        handle
-            .start_session(session())
-            .await
-            .expect("admitted request accepts session");
-        let calls = motion_state.lock().expect("motion state").calls.clone();
-        assert_eq!(calls.len(), 1);
-        assert!(calls[0].starts_with("acquire:"));
-        handle
-            .cancel("goal-1")
-            .await
-            .expect("verified cancel fence");
-        handle.shutdown().await.expect("scheduler shutdown");
-        task.await
-            .expect("scheduler task join")
-            .expect("scheduler task result");
-    }
+
 
     #[tokio::test]
     async fn controller_consumes_map_inputs_and_only_reports_applied_motion() {
@@ -3994,14 +3013,14 @@ mod tests {
         handle.cancel("goal-1").await.expect("cancel waits ZEROED");
         let terminal = handle.status();
         assert_eq!(terminal.last_terminal, Some(TerminalOutcome::Cancelled));
-        assert_eq!(terminal.last_zero_ack_id.as_deref(), Some("zero-ack"));
+
         assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
         assert_eq!(terminal.session_id, None);
         assert_eq!(terminal.path_revision, 0);
         assert_eq!(planner_state.lock().expect("planner").stops, 3);
         let calls = motion_state.lock().expect("motion").calls.clone();
         assert!(calls.iter().any(|call| call.starts_with("twist:")));
-        assert!(calls.iter().any(|call| call.starts_with("fence:")));
+        assert!(calls.iter().any(|call| call.starts_with("release:")));
 
         handle.shutdown().await.expect("shutdown");
         task.await.expect("join").expect("task result");
@@ -4030,7 +3049,7 @@ mod tests {
             backend,
             SchedulerConfig {
                 tick_interval: Duration::from_millis(5),
-                renew_interval: Duration::from_millis(200),
+
                 path_wait_timeout: Duration::from_secs(1),
                     pose_ttl: Duration::from_secs(1),
                 costmap_ttl: Duration::from_secs(1),
@@ -4060,7 +3079,7 @@ mod tests {
         handle.submit_path(path()).await.expect("qualified path");
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if handle.status().applied_commands > 0 {
+                if handle.status().last_applied_twist.is_some_and(|twist|twist!=Twist2::ZERO) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -4165,7 +3184,7 @@ mod tests {
         handle.update_odometry(aligned.clone()).await.expect("朝向已到");
         let terminal = wait_for_terminal(&handle, TerminalOutcome::Succeeded).await;
         assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
-        assert!(terminal.last_zero_ack_id.is_some());
+
 
         handle
             .start_session(session_for("goal-2"))
@@ -4256,7 +3275,7 @@ mod tests {
         assert_eq!(retained.session_id.as_deref(), Some("goal-1"));
         assert_eq!(retained.path_revision, 2);
         assert!(retained.message.contains("同修订路径变化已丢弃"));
-        assert!(!motion_state.lock().unwrap().calls.iter().any(|call| call.starts_with("fence:")));
+        assert!(!motion_state.lock().unwrap().calls.iter().any(|call| call.starts_with("release:")));
         assert_eq!(planner_state.lock().unwrap().stops, stops_before_mutation);
         handle.submit_path(path_for("goal-1", 2)).await.expect("原路径仍能重放");
 
@@ -4368,7 +3387,7 @@ mod tests {
             .expect("motion")
             .calls
             .iter()
-            .filter(|call| call.starts_with("fence:"))
+            .filter(|call| call.starts_with("release:"))
             .count();
         assert_eq!(fence_count, 2);
         handle.shutdown().await.expect("shutdown");
@@ -4404,7 +3423,7 @@ mod tests {
             terminal.message,
             "PlannerFailed cause=LocalPlanner: blocked"
         );
-        assert_eq!(terminal.last_zero_ack_id.as_deref(), Some("zero-ack"));
+
         assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
         assert!(!task.is_finished(), "planner failure must not stop owner");
 
@@ -4484,7 +3503,7 @@ mod tests {
             handle.status().last_terminal,
             Some(TerminalOutcome::Cancelled)
         );
-        assert!(handle.status().last_zero_ack_id.is_some());
+
         handle.shutdown().await.unwrap();
         task.await.unwrap().unwrap();
     }
@@ -4573,7 +3592,7 @@ mod tests {
         scheduler.path_wait_started_at = Some(Instant::now() - Duration::from_secs(3));
         scheduler.control_tick(&sender).await.unwrap();
         assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::PlannerFailed));
-        assert!(scheduler.status.last_zero_ack_id.is_some());
+
     }
 
     #[tokio::test]
@@ -4658,7 +3677,7 @@ mod tests {
                     assert_ne!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));
                 } else {
                     assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::PlannerFailed));
-                    assert!(scheduler.status.last_zero_ack_id.is_some());
+
                     if let Some(reason) = reason.filter(|s|!s.is_empty()) {
                         assert!(scheduler.status.message.contains(reason));
                     }
@@ -4676,7 +3695,7 @@ mod tests {
         scheduler.path_wait_started_at = Some(Instant::now() - Duration::from_secs(31));
         scheduler.check_path_wait_timeout(&sender).await.unwrap();
         assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::PlannerFailed));
-        assert!(scheduler.status.last_zero_ack_id.is_some());
+
     }
 
     #[tokio::test]
@@ -4701,10 +3720,10 @@ mod tests {
             assert!(status.message.contains("ms; fencing"));
             if !cause.trim().is_empty() { assert!(status.message.contains(cause)); }
             else { assert!(!status.message.contains("; ;")); }
-            assert!(status.message.ends_with("PlannerFailed after verified fence"));
-            assert_eq!(status.last_zero_ack_id.as_deref(), Some("zero-ack"));
+            assert!(status.message.ends_with("PlannerFailed，租约已释放"));
+
             assert_eq!(status.last_applied_twist, Some(Twist2::ZERO));
-            assert_eq!(motion.lock().unwrap().calls.iter().filter(|call| call.starts_with("fence:")).count(), 1);
+            assert_eq!(motion.lock().unwrap().calls.iter().filter(|call| call.starts_with("release:")).count(), 1);
             assert!(scheduler.path_wait_started_at.is_none());
         }
     }
@@ -4718,7 +3737,7 @@ mod tests {
             planner,
             SchedulerConfig {
                 tick_interval: Duration::from_millis(2),
-                renew_interval: Duration::from_millis(20),
+
                 path_wait_timeout: Duration::from_millis(60),
                 pose_ttl: Duration::from_secs(1),
                 costmap_ttl: Duration::from_secs(1),
@@ -4750,7 +3769,7 @@ mod tests {
             handle.status().last_terminal,
             Some(TerminalOutcome::PlannerFailed)
         );
-        assert!(handle.status().last_zero_ack_id.is_some());
+
         handle.shutdown().await.unwrap();
         task.await.unwrap().unwrap();
     }
@@ -4797,7 +3816,7 @@ mod tests {
         );
         assert!(terminal.message.contains("pose source deadline"));
         assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
-        assert!(terminal.last_zero_ack_id.is_none());
+
         handle.shutdown().await.unwrap();
         task.await.unwrap().unwrap();
     }
@@ -5002,7 +4021,7 @@ mod tests {
         let paused = wait_for_input_pause(&handle).await;
         assert_eq!(paused.session_id.as_deref(), Some("goal-1"));
         assert_eq!(paused.path_revision, 1);
-        assert!(paused.last_terminal.is_none() && paused.last_zero_ack_id.is_none());
+
         assert_eq!(planning.lock().unwrap().stops, stopped_planner_count, "同域暂缺不能删除现有路径");
         assert!(matches!(handle.update_costmap_received(costmap_at(2), old_receipt).await, Err(RuntimeError::StaleInput(_))));
         handle.update_costmap(costmap_at(3)).await.unwrap();
@@ -5071,7 +4090,7 @@ mod tests {
         assert!(stopped.message.starts_with("SafetyFailed cause=MapSourceInvalidated:"));
         assert_ne!(stopped.last_terminal, Some(TerminalOutcome::Cancelled));
         assert_eq!(stopped.last_applied_twist, Some(Twist2::ZERO));
-        assert!(stopped.last_zero_ack_id.is_some());
+
         assert!(!stopped.planner_inputs_fresh);
         assert!(!task.is_finished());
 
@@ -5155,7 +4174,7 @@ mod tests {
             planner,
             SchedulerConfig {
                 tick_interval: Duration::from_millis(5),
-                renew_interval: Duration::from_millis(20),
+
                 path_wait_timeout: Duration::from_millis(30),
                     pose_ttl: Duration::from_secs(1),
                 costmap_ttl: Duration::from_secs(1),
@@ -5171,14 +4190,14 @@ mod tests {
             .expect("first session");
         let terminal = wait_for_terminal(&handle, TerminalOutcome::PlannerFailed).await;
         assert_eq!(terminal.phase, SchedulerPhase::Failed);
-        assert_eq!(terminal.last_zero_ack_id.as_deref(), Some("zero-ack"));
+
         assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
         assert!(motion_state
             .lock()
             .expect("motion")
             .calls
             .iter()
-            .any(|call| call.starts_with("fence:")));
+            .any(|call| call.starts_with("release:")));
         assert!(!task.is_finished(), "path timeout must not stop the owner");
 
         planner_state.lock().expect("planner").step = PlannerStep::Succeeded;
@@ -5317,7 +4336,7 @@ mod tests {
             "pose loss must park within TTL + one tick + fence"
         );
         assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
-        assert!(terminal.last_zero_ack_id.is_none());
+
         assert!(terminal
             .message
             .starts_with("等待新鲜导航输入:"));
@@ -5328,7 +4347,7 @@ mod tests {
             .expect("motion")
             .calls
             .iter()
-            .all(|call| !call.starts_with("fence:")));
+            .all(|call| !call.starts_with("release:")));
         handle.shutdown().await.expect("shutdown");
         task.await.expect("join").expect("task result");
     }
@@ -5346,7 +4365,7 @@ mod tests {
             scheduler.finish_terminal(&sender,terminal,SchedulerPhase::Failed).await.unwrap();
             let status=observed.borrow();
             assert_eq!(status.last_terminal,Some(terminal));
-            assert!(status.last_zero_ack_id.is_some());
+
             assert!(status.message.contains("目标前方没有可行支撑"),"首次终态丢失原因: {}",status.message);
         }
     }
@@ -5438,7 +4457,7 @@ mod tests {
             .expect("twist call");
         let fence = calls
             .iter()
-            .position(|call| call.starts_with("fence:"))
+            .position(|call| call.starts_with("release:"))
             .expect("fence call");
         assert!(
             fence > twist,
@@ -5447,11 +4466,11 @@ mod tests {
         assert!(handle.status().motion_sink_ready);
         let terminal = handle.status();
         assert_eq!(terminal.last_terminal, Some(TerminalOutcome::SafetyFailed));
-        assert_eq!(terminal.last_zero_ack_id.as_deref(), Some("zero-ack"));
+
         assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
         assert_eq!(
             terminal.message,
-            "SafetyFailed cause=Motion: motion guard operation failed: injected APPLIED timeout"
+            "SafetyFailed cause=Motion: motion guard operation failed: 注入速度发送失败"
         );
         motion_state.lock().unwrap().fail_twist = false;
         handle.start_session(session()).await.expect("停车后仍可接纳后续目标");
@@ -5460,192 +4479,17 @@ mod tests {
         task.await.unwrap().unwrap();
     }
 
-    #[tokio::test]
-    async fn real_uds_adapter_requires_correlated_applied_and_fence_proofs() {
-        let guard = spawn_scripted_guard("proofs").await;
-        let mut client =
-            MotionGuardClient::connect_with_config(production_client_config(guard.path.clone()))
-                .await
-                .expect("connect real guard fixture UDS");
 
-        let admission = NavMotionAdmission {
 
-            guard_boot_nonce: [7; 16],
-            motion_stop_generation: 1,
-        };
-        let lease = NavMotionPort::acquire(&mut client, "nav:uds:acquire", &admission)
-            .await
-            .expect("real lease proof");
-        assert_eq!(lease.lease_id, 41);
-        let applied = NavMotionPort::submit_twist(
-            &mut client,
-            "nav:uds:twist",
-            Twist2 {
-                linear: Point2::new(0.2, 0.0),
-                angular_z: 0.1,
-            },
-        )
-        .await
-        .expect("correlated APPLIED proof");
-        assert_eq!(applied.operation_id, "nav:uds:twist");
-        assert_eq!(applied.applied_monotonic_ns, 101);
-        let fence = NavMotionPort::revoke_and_zero(&mut client, "nav:uds:fence")
-            .await
-            .expect("correlated resource fence").expect("当前租约归零回执");
-        assert_eq!(fence.zero_ack_id, "zero-uds-1");
-        assert_eq!(fence.applied_monotonic_ns, 102);
-        assert_eq!(fence.lease, FenceLeaseState::Idle);
 
-        assert_eq!(guard.finish().await, vec!["acquire", "applied", "fence"]);
-    }
 
-    async fn collect_real_uds_cancel_latencies(delayed: DelayedOperation) -> Vec<Duration> {
-        const SAMPLES: usize = 20;
 
-        let label = match delayed {
-            DelayedOperation::Submit => "delayed-submit",
-            DelayedOperation::Renew => "delayed-renew",
-            DelayedOperation::FenceResponse => "lost-first-fence-response",
-        };
-        let mut guard = spawn_priority_guard(label, delayed).await;
-        let (handle, task) = spawn_production_scheduler(
-            guard.path.clone(),
-            SchedulerConfig {
-                tick_interval: if delayed == DelayedOperation::Submit {
-                    Duration::from_millis(5)
-                } else {
-                    Duration::from_secs(1)
-                },
-                renew_interval: if delayed == DelayedOperation::Renew {
-                    Duration::from_millis(5)
-                } else {
-                    Duration::from_millis(250)
-                },
-                path_wait_timeout: Duration::from_secs(5),
-                pose_ttl: Duration::from_secs(5),
-                costmap_ttl: Duration::from_secs(5),
-            },
-        )
-        .await
-        .expect("connect priority guard fixture");
-        wait_for_sink(&handle).await;
 
-        let mut latencies = Vec::with_capacity(SAMPLES);
-        for sample in 0..SAMPLES {
-            let session_id = format!("latency-{label}-{sample}");
-            if delayed == DelayedOperation::Submit {
-                let seconds = i64::try_from(sample + 1).expect("sample seconds");
-                handle
-                    .update_odometry(map_pose_at(seconds))
-                    .await
-                    .expect("fresh map pose");
-                handle
-                    .update_costmap(costmap_at(seconds * 1_000_000_000))
-                    .await
-                    .expect("fresh costmap");
-            }
-            handle
-                .start_session(session_for(&session_id))
-                .await
-                .expect("latency session");
-            if delayed == DelayedOperation::Submit {
-                handle
-                    .submit_path(path_for(&session_id, 1))
-                    .await
-                    .expect("latency path");
-            }
-            let expected_observation = match delayed {
-                DelayedOperation::Submit => "applied",
-                DelayedOperation::Renew => "renew",
-                DelayedOperation::FenceResponse => "fence",
-            };
-            if delayed != DelayedOperation::FenceResponse {
-                let observed =
-                    match tokio::time::timeout(Duration::from_secs(1), guard.delayed_rx.recv())
-                        .await
-                    {
-                        Ok(Some(observed)) => observed,
-                        Ok(None) => panic!("priority guard observation channel closed"),
-                        Err(_) => panic!(
-                            "delayed operation observation timeout; scheduler status={:?}",
-                            handle.status()
-                        ),
-                    };
-                assert_eq!(observed, expected_observation);
-            }
 
-            let started = std::time::Instant::now();
-            handle.cancel(&session_id).await.expect("priority fence");
-            let elapsed = started.elapsed();
-            if delayed == DelayedOperation::FenceResponse {
-                let observed =
-                    tokio::time::timeout(Duration::from_secs(1), guard.delayed_rx.recv())
-                        .await
-                        .expect("first fence attempt observation timeout")
-                        .expect("priority guard observation channel");
-                assert_eq!(observed, expected_observation);
-            }
-            assert!(
-                elapsed <= MAX_CANCEL_FENCE_TIMEOUT,
-                "cancel hard max exceeded: {elapsed:?}"
-            );
-            latencies.push(elapsed);
-        }
 
-        handle.shutdown().await.expect("scheduler shutdown");
-        task.await
-            .expect("scheduler task join")
-            .expect("scheduler task result");
-        latencies
-    }
 
-    fn assert_cancel_latency_distribution(label: &str, mut latencies: Vec<Duration>) {
-        latencies.sort_unstable();
-        let p95_index = (latencies.len() * 95).div_ceil(100).saturating_sub(1);
-        let p95 = latencies[p95_index];
-        let hard_max = *latencies.last().expect("latency samples");
-        eprintln!(
-            "cancel latency kind={label} samples={} p95_us={} hard_max_us={}",
-            latencies.len(),
-            p95.as_micros(),
-            hard_max.as_micros(),
-        );
-        assert!(
-            p95 <= Duration::from_millis(150),
-            "cancel p95 exceeded 150ms: {p95:?}"
-        );
-        assert!(
-            hard_max <= MAX_CANCEL_FENCE_TIMEOUT,
-            "cancel hard max exceeded 300ms: {hard_max:?}"
-        );
-    }
 
-    #[tokio::test]
-    async fn cancel_preempts_delayed_submit_over_real_uds_with_qualified_latency() {
-        if !run_with_robot_geometry("tests::cancel_preempts_delayed_submit_over_real_uds_with_qualified_latency") { return; }
-        assert_cancel_latency_distribution(
-            "delayed-submit",
-            collect_real_uds_cancel_latencies(DelayedOperation::Submit).await,
-        );
-    }
 
-    #[tokio::test]
-    async fn cancel_preempts_delayed_renew_over_real_uds_with_qualified_latency() {
-        if !run_with_robot_geometry("tests::cancel_preempts_delayed_renew_over_real_uds_with_qualified_latency") { return; }
-        assert_cancel_latency_distribution(
-            "delayed-renew",
-            collect_real_uds_cancel_latencies(DelayedOperation::Renew).await,
-        );
-    }
-
-    #[tokio::test]
-    async fn cancel_replays_identical_fence_after_first_response_timeout() {
-        if !run_with_robot_geometry("tests::cancel_replays_identical_fence_after_first_response_timeout") { return; }
-        assert_cancel_latency_distribution(
-            "lost-first-fence-response",
-            collect_real_uds_cancel_latencies(DelayedOperation::FenceResponse).await,
-        );
-    }
     include!("dispatch_handoff_tests.rs");
 
 }

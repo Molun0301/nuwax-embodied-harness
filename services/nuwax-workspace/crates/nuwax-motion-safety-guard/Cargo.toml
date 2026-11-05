@@ -15,7 +15,6 @@ prost = { workspace = true }
 rustix = { version = "1.1.4", features = ["time"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "macros", "sync", "net", "io-util"] }
-uuid = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }

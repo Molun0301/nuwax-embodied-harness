@@ -25,8 +25,11 @@ struct _nuwax_msgs_PathEnvelope
      * LCM Type: string
      */
     char*      session_id;
-    int64_t    producer_runtime_generation;
-    int64_t    goal_generation;
+
+    /**
+     * 原目标的 uint64 运动代次，保持相同的八个字节。
+     */
+    int64_t    motion_generation;
     int64_t    planner_runtime_generation;
     int64_t    path_revision;
 

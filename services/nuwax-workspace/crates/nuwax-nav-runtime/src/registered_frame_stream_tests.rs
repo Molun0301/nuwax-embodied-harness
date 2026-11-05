@@ -9,20 +9,15 @@ struct RegisteredStreamMotion {
 }
 #[async_trait]
 impl NavMotionPort for RegisteredStreamMotion {
-    fn measured_motion(&self)->Option<MeasuredMotion> {Some(self.measured.lock().unwrap().clone())}
-    async fn acquire(&mut self,id:&str,a:&NavMotionAdmission)->Result<LeaseProof,MotionPortError> {self.inner.acquire(id,a).await}
-    async fn renew(&mut self,id:&str)->Result<(),MotionPortError> {self.inner.renew(id).await}
-    async fn submit_twist(&mut self,id:&str,c:Twist2)->Result<AppliedProof,MotionPortError> {
-        let proof=self.inner.submit_twist(id,c).await?;
-        self.issued.lock().unwrap().push((std::time::Instant::now(),c));Ok(proof)
+    fn measured_motion(&self) -> Option<MeasuredMotion> { Some(self.measured.lock().unwrap().clone()) }
+    async fn acquire(&mut self, generation:u64) -> Result<u64,MotionPortError> { self.inner.acquire(generation).await }
+    async fn velocity(&mut self, command:Twist2) -> Result<(),MotionPortError> {
+        self.inner.velocity(command).await?;
+        self.issued.lock().unwrap().push((std::time::Instant::now(),command)); Ok(())
     }
-    async fn submit_twist_bounded(&mut self,id:&str,c:Twist2,b:Option<CommandDispatchBound>)->Result<BoundedTwistOutcome,MotionPortError> {
-        if b.is_some_and(CommandDispatchBound::expired_now) {return Ok(BoundedTwistOutcome::ExpiredNotApplied);}
-        self.submit_twist(id,c).await.map(BoundedTwistOutcome::Applied)
-    }
-    async fn revoke_and_zero(&mut self,id:&str)->Result<Option<FenceProof>,MotionPortError> {
-        let proof=self.inner.revoke_and_zero(id).await?;
-        self.issued.lock().unwrap().push((std::time::Instant::now(),Twist2::ZERO));Ok(proof)
+    async fn release(&mut self) -> Result<(),MotionPortError> {
+        self.inner.release().await?;
+        self.issued.lock().unwrap().push((std::time::Instant::now(),Twist2::ZERO)); Ok(())
     }
 }
 #[tokio::test]
@@ -103,9 +98,9 @@ async fn registered_stream_diagnostic(occlusion_consistent:bool) {
     handle.update_registered_obstacle_source(None,false,None,None).await.unwrap();
     let terminal=wait_for_input_pause(&handle).await;
     assert_eq!(terminal.last_applied_twist,Some(Twist2::ZERO));
-    assert!(terminal.last_zero_ack_id.is_none());
+
     handle.cancel("goal-1").await.unwrap();
-    assert!(handle.status().last_zero_ack_id.is_some());
+
     handle.shutdown().await.unwrap();task.await.unwrap().unwrap();
     let samples=issued.lock().unwrap();
     let positive:Vec<_>=samples.iter().filter(|(_,c)|*c!=Twist2::ZERO).collect();

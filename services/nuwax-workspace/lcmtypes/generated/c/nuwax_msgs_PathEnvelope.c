@@ -21,10 +21,9 @@ uint64_t __nuwax_msgs_PathEnvelope_hash_recursive(const __lcm_hash_ptr *p)
     cp.v = __nuwax_msgs_PathEnvelope_get_hash;
     (void) cp;
 
-    uint64_t hash = (uint64_t)0x6c73848887bb4303LL
+    uint64_t hash = (uint64_t)0xcfa5fdf0c57a41ebLL
          + __int32_t_hash_recursive(&cp)
          + __string_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
@@ -58,10 +57,7 @@ int __nuwax_msgs_PathEnvelope_encode_array(void *buf, int offset, int maxlen, co
         thislen = __string_encode_array(buf, offset + pos, maxlen - pos, &(p[element].session_id), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].producer_runtime_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].goal_generation), 1);
+        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].motion_generation), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].planner_runtime_generation), 1);
@@ -103,9 +99,7 @@ int __nuwax_msgs_PathEnvelope_encoded_array_size(const nuwax_msgs_PathEnvelope *
 
         size += __string_encoded_array_size(&(p[element].session_id), 1);
 
-        size += __int64_t_encoded_array_size(&(p[element].producer_runtime_generation), 1);
-
-        size += __int64_t_encoded_array_size(&(p[element].goal_generation), 1);
+        size += __int64_t_encoded_array_size(&(p[element].motion_generation), 1);
 
         size += __int64_t_encoded_array_size(&(p[element].planner_runtime_generation), 1);
 
@@ -136,10 +130,7 @@ int __nuwax_msgs_PathEnvelope_decode_array(const void *buf, int offset, int maxl
         thislen = __string_decode_array(buf, offset + pos, maxlen - pos, &(p[element].session_id), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].producer_runtime_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].goal_generation), 1);
+        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].motion_generation), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].planner_runtime_generation), 1);
@@ -168,9 +159,7 @@ int __nuwax_msgs_PathEnvelope_decode_array_cleanup(nuwax_msgs_PathEnvelope *p, i
 
         __string_decode_array_cleanup(&(p[element].session_id), 1);
 
-        __int64_t_decode_array_cleanup(&(p[element].producer_runtime_generation), 1);
-
-        __int64_t_decode_array_cleanup(&(p[element].goal_generation), 1);
+        __int64_t_decode_array_cleanup(&(p[element].motion_generation), 1);
 
         __int64_t_decode_array_cleanup(&(p[element].planner_runtime_generation), 1);
 
@@ -214,9 +203,7 @@ int __nuwax_msgs_PathEnvelope_clone_array(const nuwax_msgs_PathEnvelope *p, nuwa
 
         __string_clone_array(&(p[element].session_id), &(q[element].session_id), 1);
 
-        __int64_t_clone_array(&(p[element].producer_runtime_generation), &(q[element].producer_runtime_generation), 1);
-
-        __int64_t_clone_array(&(p[element].goal_generation), &(q[element].goal_generation), 1);
+        __int64_t_clone_array(&(p[element].motion_generation), &(q[element].motion_generation), 1);
 
         __int64_t_clone_array(&(p[element].planner_runtime_generation), &(q[element].planner_runtime_generation), 1);
 

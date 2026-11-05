@@ -502,7 +502,7 @@ fn body_path(surface: &SurfaceSnapshot, start: &PoseStamped, goal: &schema::Goal
     let q = start.pose.orientation;
     let boundary: Vec<_> = goal.boundary_points.iter().map(|point| [point[0], point[1]]).collect();
     let route = config.planner.route(surface, ([p.x, p.y, p.z], [q.x, q.y, q.z, q.w]),
-        (goal.goal.pose.position, goal.goal.pose.orientation_xyzw), goal.options, &boundary,
+        (goal.goal.pose.position, goal.goal.pose.orientation_xyzw), goal.options(), &boundary,
         config.follower.body_to_support_z_m, config.planning_cancelled.as_deref())
         .map_err(NavStackError::Planning)?;
     Ok(Path3D { poses: route.into_iter().map(|(point, orientation)| PoseStamped {
@@ -518,7 +518,7 @@ fn body_path_progressive(surface: &SurfaceSnapshot, start: &PoseStamped, goal: &
     let q = start.pose.orientation;
     let boundary: Vec<_> = goal.boundary_points.iter().map(|point| [point[0], point[1]]).collect();
     let route = config.planner.route_progressive(surface, ([p.x, p.y, p.z], [q.x, q.y, q.z, q.w]),
-        (goal.goal.pose.position, goal.goal.pose.orientation_xyzw), goal.options, &boundary,
+        (goal.goal.pose.position, goal.goal.pose.orientation_xyzw), goal.options(), &boundary,
         config.follower.body_to_support_z_m, config.planning_cancelled.as_deref())
         .map_err(NavStackError::Planning)?;
     Ok(SurfacePlan { kind: route.kind, resolution: route.resolution, path: Path3D { poses: route.poses.into_iter().map(|(point, orientation)| PoseStamped {
@@ -545,7 +545,7 @@ fn surface_replan_input(surface: &Arc<SurfaceSnapshot>, start: &PoseStamped,
     Ok(SurfaceReplanInput {
         source: Arc::clone(surface), start: start.clone(),
         goal: nuwax_nav_runtime::ExecutionGoal::Body(pose_from_schema(&goal.goal)?),
-        options: goal.options,
+        options: goal.options(),
         boundary: Arc::new(goal.boundary_points.iter().map(|point| [point[0],point[1]]).collect()),
         actual: matching.and_then(|feedback| feedback.current_context.clone()),
         offset: config.follower.body_to_support_z_m,
@@ -595,7 +595,7 @@ async fn publish_surface_path(
     let stamp = current_unix_timestamp_ns()?;
     let header = schema_header(
         Timestamp::from_unix(stamp / 1_000_000_000, (stamp % 1_000_000_000) as u32),
-        goal.committed_map_frame_id.as_str(),
+        goal.goal.header.frame_id.as_str(),
     )?;
     let poses = path
         .poses
@@ -632,15 +632,11 @@ async fn run_surface_planner(
 
 fn state_matches_goal(state: &schema::NavigationState, goal: &schema::GoalEnvelope) -> bool {
     state.session_id == goal.session_id
-        && state.owner_kind == goal.owner_kind
-        && state.parent_request_id == goal.parent_request_id
-        && state.goal_generation == goal.goal_generation
-        && state.producer_runtime_generation == goal.producer_runtime_generation
 }
 
-fn retire_goal(goal: &mut Option<schema::GoalEnvelope>, retired: &mut VecDeque<GoalKey>) {
+fn retire_goal(goal: &mut Option<schema::GoalEnvelope>, retired: &mut VecDeque<String>) {
     if let Some(goal) = goal.take() {
-        retired.push_back(goal.goal_key());
+        retired.push_back(goal.session_id);
         if retired.len() > 32 {
             retired.pop_front();
         }
@@ -671,7 +667,7 @@ fn approach_map_relevant(changes:&SurfaceGeometryChanges,start:Point3,end:Point3
 
 struct SurfaceJobTicket {
     epoch: u64,
-    goal_key: GoalKey,
+    session_id: String,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     source: Arc<SurfaceSnapshot>,
     /// 同域几何更新能否退休这次搜索；上一次搜索已被新几何退休时，本次必须算完。
@@ -735,7 +731,7 @@ async fn run_surface_planner_with_computer(
     let mut pose: Option<PoseStamped> = None;
     let mut goal: Option<schema::GoalEnvelope> = None;
     let mut newest_goal: Option<schema::GoalEnvelope> = None;
-    let mut retired_goals = VecDeque::<GoalKey>::new();
+    let mut retired_goals = VecDeque::<String>::new();
     let generation = saturating_i64(runtime_generation());
     let mut path_revision = 0_i64;
     let mut last_path: Option<Path3D> = None;
@@ -750,7 +746,7 @@ async fn run_surface_planner_with_computer(
     loop {
         for ticket in path_cancellation.iter() {
             if ticket.epoch != map_epoch || !execution_admitted
-                || goal.as_ref().is_none_or(|active|active.goal_key() != ticket.goal_key) {
+                || goal.as_ref().is_none_or(|active|active.session_id != ticket.session_id) {
                 ticket.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
@@ -797,6 +793,8 @@ async fn run_surface_planner_with_computer(
                 };
                 if goal.as_ref().is_some_and(|active| validate_cancel_goal_correlation(&cancel, active).is_ok()) {
                     retire_goal(&mut goal, &mut retired_goals);
+                    newest_goal = None;
+                    if cancel.session_id.is_empty() { retired_goals.clear(); }
                     successful.clear();
                     approach = None;
                     failed_input = None;
@@ -810,8 +808,7 @@ async fn run_surface_planner_with_computer(
                     Err(error) => { diagnostics.reject("surface state", &error.to_string()); continue; }
                 };
                 if !goal.as_ref().is_some_and(|active| state_matches_goal(&state, active)) { continue; }
-                let zero_proven = !state.zero_ack_id.is_empty() && state.zero_applied_monotonic_ns > 0;
-                if state.state == 4 || (matches!(state.state, 0 | 3) && zero_proven) {
+                if matches!(state.state, 0 | 3 | 4) {
                     retire_goal(&mut goal, &mut retired_goals);
                     successful.clear();
                     last_path = None; needs_plan = false; execution_admitted = false;
@@ -907,7 +904,7 @@ async fn run_surface_planner_with_computer(
                     computed.expect("已有PCT任务").map_err(|error| module_error("PCT规划任务", error))?;
                 if ticket.as_ref().is_some_and(|ticket| ticket.cancelled.load(std::sync::atomic::Ordering::Relaxed))
                     || epoch != map_epoch || !execution_admitted
-                    || goal.as_ref().is_none_or(|active| active.goal_key() != planned_goal.goal_key()) {
+                    || goal.as_ref().is_none_or(|active| active.session_id != planned_goal.session_id || active.motion_generation != planned_goal.motion_generation) {
                     continue;
                 }
                 geometry_retired = false;
@@ -1041,11 +1038,11 @@ async fn run_surface_planner_with_computer(
             }
             frame = goals.next() => {
                 let frame = required_frame(frame, "surface planner goal")?;
-                let incoming = match decode_configured_goal_envelope(&frame.payload, &hub.body_reference_frame_id) {
+                let incoming = match schema::decode_goal_envelope_body(&frame.payload) {
                     Ok(goal) => goal,
                     Err(error) => { diagnostics.reject("surface goal", &error.to_string()); continue; }
                 };
-                if retired_goals.contains(&incoming.goal_key()) { continue; }
+                if retired_goals.contains(&incoming.session_id) { continue; }
                 if goal.as_ref().is_some_and(|active|active == &incoming) { continue; }
                 if newest_goal.as_ref().is_some_and(|current| validate_goal_envelope_order(&incoming, current).is_err()) { continue; }
                 if let Err(error) = navigation_boundary_from_goal(&incoming) { diagnostics.reject("surface goal boundary",&error.to_string());continue; }
@@ -1097,7 +1094,7 @@ async fn run_surface_planner_with_computer(
                 let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 config.planning_cancelled = Some(Arc::clone(&cancelled));
                 path_cancellation = Some(SurfaceJobTicket {
-                    epoch, goal_key: planned_goal.goal_key(), cancelled, source: Arc::clone(&surface),
+                    epoch, session_id: planned_goal.session_id.clone(), cancelled, source: Arc::clone(&surface),
                     retire_on_geometry: !geometry_retired,
                 });
                 let computer = Arc::clone(&computer);
@@ -1318,9 +1315,9 @@ mod tests {
                             // 同一目标保留PCT收到的局部阻塞代价，不重新配置目标清空反馈。
                             let p=goal.pose.position;
                             let mut envelope=goal_for(&message,1,[p.x,p.y,p.z]);
-                            envelope.options.allow_reverse=false;
-                            envelope.options.yaw_tolerance_rad=std::f64::consts::PI;
-                            envelope.options.position_tolerance_m=0.2;
+                            envelope.allow_reverse=Some(false);
+                            envelope.yaw_tolerance_rad=Some(std::f64::consts::PI);
+                            envelope.position_tolerance_m=Some(0.2);
                             let q=goal.pose.orientation;
                             envelope.goal.pose.orientation_xyzw=[q.x,q.y,q.z,q.w];
                             match body_path(&map,&actual,&envelope,&config) {
@@ -1380,13 +1377,13 @@ mod tests {
                 goal.goal.pose.position=serde_json::from_str(&target).unwrap();
             }
             if std::env::var_os("NUWAX_NAV_DIAGNOSTIC_POSITION_ONLY").is_some() {
-                goal.options.yaw_tolerance_rad=std::f64::consts::PI;
+                goal.yaw_tolerance_rad=Some(std::f64::consts::PI);
             }
             if std::env::var_os("NUWAX_NAV_DIAGNOSTIC_REVERSE").is_some() {
-                goal.options.allow_reverse=true;
+                goal.allow_reverse=Some(true);
             }
             if let Ok(tolerance)=std::env::var("NUWAX_NAV_DIAGNOSTIC_POSITION_TOLERANCE") {
-                goal.options.position_tolerance_m=tolerance.parse().unwrap();
+                goal.position_tolerance_m=Some(tolerance.parse().unwrap());
             }
             let timer=std::env::var("NUWAX_NAV_DIAGNOSTIC_CASE_TIMEOUT_SEC").ok().map(|value| {
                 let seconds=value.parse::<f64>().unwrap();
@@ -1439,23 +1436,23 @@ mod tests {
             for (index, distance) in distances.into_iter().enumerate() {
                 let mut goal=goal_for(&message,100+index as i64,[position[0]+distance,position[1],position[2]]);
                 goal.goal.pose.orientation_xyzw=quaternion;
-                goal.options.position_tolerance_m=0.04;
-                goal.options.yaw_tolerance_rad=0.15;
+                goal.position_tolerance_m=Some(0.04);
+                goal.yaw_tolerance_rad=Some(0.15);
                 if let Ok(value)=std::env::var("NUWAX_NAV_DIAGNOSTIC_TARGET") {
                     goal.goal.pose.position=serde_json::from_str(&value).unwrap();
                 }
                 if std::env::var_os("NUWAX_NAV_DIAGNOSTIC_POSITION_ONLY").is_some() {
-                    goal.options.yaw_tolerance_rad=std::f64::consts::PI;
+                    goal.yaw_tolerance_rad=Some(std::f64::consts::PI);
                 }
                 if std::env::var_os("NUWAX_NAV_DIAGNOSTIC_REVERSE").is_some() {
-                    goal.options.allow_reverse=true;
+                    goal.allow_reverse=Some(true);
                 }
                 if let Ok(value)=std::env::var("NUWAX_NAV_DIAGNOSTIC_POSITION_TOLERANCE") {
-                    goal.options.position_tolerance_m=value.parse().unwrap();
+                    goal.position_tolerance_m=Some(value.parse().unwrap());
                 }
                 let target=pose_from_schema(&goal.goal).unwrap();
                 follower.stop();
-                follower.configure_goal(&target,goal.options).unwrap();
+                follower.configure_goal(&target,goal.options()).unwrap();
                 follower.update_odometry(actual.clone());
                 let path=body_path(&map,&actual,&goal,&config).expect("实录闭环目标可规划");
                 follower.replace_execution_path(ExecutionPath::Surface(path),None,target.clone()).unwrap();
@@ -1493,7 +1490,7 @@ mod tests {
                         PlannerStep::ReplanRequired(reason)=>{
                             replans+=1;assert!(replans<=8,"实录局部重规划不能无限循环: {reason}");
                             // 独立运动学中归零立即生效；不把该模型当作实机制动证明。
-                            follower.stop();follower.configure_goal(&target,goal.options).unwrap();
+                            follower.stop();follower.configure_goal(&target,goal.options()).unwrap();
                             follower.update_odometry(actual.clone());
                             let started=Instant::now();
                             let replacement=body_path(&map,&actual,&goal,&config).expect("实录实际位姿可重规划");
@@ -1505,7 +1502,7 @@ mod tests {
                 }
                 let error=(actual.pose.position.x-target.pose.position.x).hypot(actual.pose.position.y-target.pose.position.y);
                 eprintln!("实录运动学闭环：目标{distance}米，非零指令{nonzero}，局部接续{replans}，最终位置{:?}，水平误差{error}",actual.pose.position);
-                assert!(completed && nonzero>0 && error<goal.options.position_tolerance_m,"实录闭环不能停留在路径受理或零速循环");
+                assert!(completed && nonzero>0 && error<goal.options().position_tolerance_m,"实录闭环不能停留在路径受理或零速循环");
                 follower.stop();
             }
         }
@@ -1513,14 +1510,14 @@ mod tests {
     }
 
     #[test]
-    fn old_source_revision_is_usable_but_a_goal_from_old_coordinates_is_not() {
+    fn old_source_revision_is_usable_and_goal_frame_must_match() {
         let first = map_message(1, "map");
         let goal = goal_for(&first, 1, [1.5, 1.5, 2.5]);
         let mut next = first.clone(); next.cloud_revision += 1;
         next.committed_map.revision += 1; next.committed_map.commit_sequence += 1;
         assert!(map_authority(&next).permits_goal(&goal));
-        next.map_frame_generation += 1;
-        assert!(!map_authority(&next).permits_goal(&goal));
+        let mut foreign=goal.clone();foreign.goal.header.frame_id="robot/map".into();
+        assert!(!map_authority(&next).permits_goal(&foreign));
     }
 
     fn config() -> SurfaceNavigationConfig {
@@ -1620,29 +1617,12 @@ mod tests {
     ) -> schema::GoalEnvelope {
         let stamp = current_unix_timestamp_ns().unwrap();
         let mut goal = schema::GoalEnvelope {
-            body_reference_frame_id: "base_link".into(),
-            options,
-            map_frame_generation: map.map_frame_generation,
-            schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
-            session_id: format!("surface-goal-{generation}"),
-            owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
-            parent_request_id: format!("surface-request-{generation}"),
-            goal_generation: generation,
-            producer: "surface-integration".into(),
-            producer_epoch: 1,
-            producer_runtime_generation: map.producer_runtime_generation,
-            committed_map_session_id: map.committed_map.session_id.clone(),
-            committed_map_session_generation: map.committed_map.session_generation,
-            committed_map_revision: map.committed_map.revision,
-            committed_map_boot_nonce: map.committed_map.commit_boot_nonce,
-            committed_map_commit_sequence: map.committed_map.commit_sequence,
-            committed_map_source_timestamp_ns: map.committed_map.source_timestamp_ns,
-            committed_map_frame_id: "map".into(),
-            source_timestamp_ns: stamp,
-
-            motion_guard_boot_nonce: [7; 16],
-            motion_stop_generation: 1,
-            goal: schema::PoseStamped {
+allow_reverse: Some((options).allow_reverse),
+position_tolerance_m: Some((options).position_tolerance_m),
+yaw_tolerance_rad: Some((options).yaw_tolerance_rad),
+session_id: format!("surface-goal-{generation}"),
+motion_generation: 1,
+goal: schema::PoseStamped {
                 header: schema::Header {
                     stamp_sec: (stamp / 1_000_000_000) as i32,
                     stamp_nsec: (stamp % 1_000_000_000) as i32,
@@ -1654,8 +1634,8 @@ mod tests {
                     orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
                 },
             },
-            ..schema::GoalEnvelope::default()
-        };
+..schema::GoalEnvelope::default()
+};
         schema::validate_goal_envelope(&goal).unwrap();
         goal
     }
@@ -1664,11 +1644,11 @@ mod tests {
         schema::CancelNavigation {
             session_id: goal.session_id.clone(),
             reason: 1,
-            cancel_generation: goal.goal_generation,
-            owner_kind: goal.owner_kind,
-            parent_request_id: goal.parent_request_id.clone(),
-            goal_generation: goal.goal_generation,
-            producer_runtime_generation: goal.producer_runtime_generation,
+            cancel_generation: 0,
+            owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
+            parent_request_id: String::new(),
+            goal_generation: goal.motion_generation as i64,
+            producer_runtime_generation: 0,
         }
     }
 
@@ -2569,7 +2549,7 @@ mod tests {
                 loop {
                     let frame = self.paths.next().await.unwrap().unwrap();
                     let path = schema::decode_path_envelope_body(&frame.payload).unwrap();
-                    if path.goal_key() == goal.goal_key() {
+                    if path.session_id == goal.session_id && path.motion_generation == goal.motion_generation {
                         return path;
                     }
                 }
@@ -2577,8 +2557,8 @@ mod tests {
             .await
             .unwrap_or_else(|_| {
                 panic!(
-                    "真实planner没有发布路径 goal_key={:?} map_session={} frame_generation={} status={:?}",
-                    goal.goal_key(), goal.committed_map_session_id, goal.map_frame_generation,
+                    "真实planner没有发布路径 goal_key={:?} status={:?}",
+                    goal.goal_key(),
                     self.scheduler.status()
                 )
             })
@@ -2588,7 +2568,7 @@ mod tests {
             let mut fencing=None;
             tokio::time::timeout(Duration::from_secs(8), async {
                 while self.scheduler.status().last_terminal != Some(expected) {
-                    if fencing.is_none() && self.scheduler.status().phase==SchedulerPhase::Fencing {
+                    if fencing.is_none() && self.scheduler.status().phase==SchedulerPhase::Cancelling {
                         fencing=Some(started.elapsed());
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2678,7 +2658,7 @@ mod tests {
         assert_eq!(stopped.pose_source_timestamp_ns, frozen);
         assert!(!stopped.planner_inputs_fresh);
         assert_eq!(stopped.last_applied_twist, Some(Twist2::ZERO));
-        assert!(stopped.last_zero_ack_id.is_none() && stopped.last_terminal.is_none());
+
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert_eq!(harness.scheduler.status().last_applied_twist, Some(Twist2::ZERO),
             "持续新地图不能替代被冻结的位姿");
@@ -2843,7 +2823,7 @@ mod tests {
         assert!(state.message.contains("最近可达点="),"{state:?}");
         assert!(state.message.contains("距目标三维距离="));
         assert!(state.message.contains("无进展重规划3次"));
-        assert!(state.last_zero_ack_id.is_some());
+
         assert_eq!(state.last_applied_twist,Some(Twist2::ZERO));
         harness.shutdown().await;
     }
@@ -2868,7 +2848,7 @@ mod tests {
         harness.goal(&next).await;
         assert_eq!(harness.path_for(&next).await.route_kind,1);
         harness.cancel(&next).await;harness.terminal(TerminalOutcome::Cancelled).await;
-        assert!(harness.scheduler.status().last_zero_ack_id.is_some());
+
         harness.shutdown().await;
     }
 
@@ -2968,7 +2948,7 @@ mod tests {
             .all(|pose| (pose.pose.position[2] - 2.5).abs() < 0.11));
         let end=&path.path.poses.last().unwrap().pose;
         assert_eq!(&end.position[..2],&first.goal.pose.position[..2]);
-        assert!((end.position[2]-first.goal.pose.position[2]).abs()<first.options.position_tolerance_m);
+        assert!((end.position[2]-first.goal.pose.position[2]).abs()<first.options().position_tolerance_m);
         assert_eq!(end.orientation_xyzw,first.goal.pose.orientation_xyzw);
         harness.goal(&first).await;
         harness.wait_controlling().await;
@@ -3004,8 +2984,8 @@ mod tests {
                 let frame = states.next().await.unwrap().unwrap();
                 let state = schema::decode_navigation_state_body(&frame.payload).unwrap();
                 if state_matches_goal(&state, &first) && state.state == 3 {
-                    assert!(!state.zero_ack_id.is_empty());
-                    assert!(state.zero_applied_monotonic_ns > 0);
+                    assert!(state.zero_ack_id.is_empty());
+                    assert_eq!(state.zero_applied_monotonic_ns,0);
                     break state;
                 }
             }
@@ -3014,7 +2994,7 @@ mod tests {
         .expect("真实执行拥有方必须发布原目标的成功及停车证明");
         let terminal_observed_ns =
             published_terminal.stamp_sec * 1_000_000_000 + i64::from(published_terminal.stamp_nsec);
-        assert!(harness.scheduler.status().last_zero_ack_id.is_some());
+
         while harness.paths.next().now_or_never().is_some() {}
         harness.goal(&first).await;
         if let Ok(Some(frame)) =
@@ -3040,7 +3020,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .any(|call| call.starts_with("zero:")));
+            .any(|call| call.starts_with("release:")));
         harness.shutdown().await;
     }
 
@@ -3083,7 +3063,7 @@ mod tests {
         }
         harness.cancel(&goal).await;
         harness.terminal(TerminalOutcome::Cancelled).await;
-        assert!(harness.calls.lock().unwrap().iter().any(|call| call.starts_with("zero:")));
+        assert!(harness.calls.lock().unwrap().iter().any(|call| call.starts_with("release:")));
         harness.feed.lock().unwrap().map_enabled = true;
         harness.wait_ready().await;
         let next = goal_for(&harness.feed.lock().unwrap().map, 2, [1.55, 1.55, 2.5]);
@@ -3243,7 +3223,7 @@ mod tests {
         harness.terminal(TerminalOutcome::SafetyFailed).await;
         assert!(harness.scheduler.status().message.contains("mapping_ground_block_write_failed"));
         assert_eq!(harness.scheduler.status().last_applied_twist, Some(Twist2::ZERO));
-        assert!(harness.calls.lock().unwrap().iter().any(|call|call.starts_with("zero:")));
+        assert!(harness.calls.lock().unwrap().iter().any(|call|call.starts_with("release:")));
         harness.calls.lock().unwrap().clear();
         harness.map(&old).await;
         tokio::time::sleep(Duration::from_millis(120)).await;
@@ -3253,7 +3233,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_lcm_future_map_goal_clear_and_owner_shutdown_remain_isolated() {
+    async fn real_lcm_map_goal_clear_and_owner_shutdown_remain_isolated() {
         use nuwax_nav_runtime::{SchedulerPhase, TerminalOutcome};
         let mut first = Harness::start().await;
         first.wait_ready().await;
@@ -3264,25 +3244,10 @@ mod tests {
         second.path_for(&other_goal).await;
         second.wait_controlling().await;
 
-        // 新域目标可先于体积较大的地图消息抵达，必须等待对应地图而不是丢弃。
-        let old = first.freeze_map().await;
-        let mut next_map = old.clone();
-        next_map.committed_map.session_id = "next-map".into();
-        // A new mapping session advances its original owner generation as well as its name.
-        next_map.committed_map.session_generation += 1;
-        next_map.map_frame_generation += 1;
-        let pending = goal_for(&next_map, 1, [3.1, 1.55, 2.5]);
+        // 目标协议不再携带地图提交身份；两套拥有方分别执行各自目标，随后验证清图与关闭隔离。
+        let map=first.feed.lock().unwrap().map.clone();
+        let pending=goal_for(&map,1,[3.1,1.55,2.5]);
         first.goal(&pending).await;
-        tokio::time::sleep(Duration::from_millis(40)).await;
-        assert!(
-            first.calls.lock().unwrap().is_empty(),
-            "未来域目标不能提前借用旧地图取得租约"
-        );
-        {
-            let mut feed = first.feed.lock().unwrap();
-            feed.map = next_map;
-            feed.map_enabled = true;
-        }
         first.path_for(&pending).await;
         first.wait_controlling().await;
 
@@ -3382,7 +3347,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|call| call.starts_with("zero:"))
+                .filter(|call| call.starts_with("release:"))
                 .count(),
             0,
             "一个拥有方的回收不能停止另一个拥有方"

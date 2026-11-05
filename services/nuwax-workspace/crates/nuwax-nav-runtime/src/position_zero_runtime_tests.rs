@@ -47,9 +47,9 @@ async fn zero_position_real_surface_arrival_finishes_after_one_zero() {
     assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::Succeeded));
     assert!(!scheduler.lease_active);
     assert_eq!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));
-    assert!(scheduler.status.last_zero_ack_id.is_some());
+
     assert!(scheduler.session.is_none());
-    assert_eq!(motion.lock().unwrap().calls.iter().filter(|c| c.starts_with("fence:")).count(), 1);
+    assert_eq!(motion.lock().unwrap().calls.iter().filter(|c| c.starts_with("release:")).count(), 1);
     assert_eq!(motion.lock().unwrap().calls.iter().filter(|c| c.starts_with("acquire:")).count(), 1);
 }
 #[tokio::test]

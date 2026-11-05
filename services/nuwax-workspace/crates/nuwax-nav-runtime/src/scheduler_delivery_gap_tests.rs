@@ -289,17 +289,21 @@ async fn delivery_gap_cancelled_window_cannot_control_replacement_session() {
 #[tokio::test]
 async fn delivery_gap_renewal_runs_while_publication_is_pending() {
     let (mut scheduler, _, release) = delivery_gap_fixture(DEFAULT_TICK_INTERVAL).await;
-    scheduler.config.renew_interval = Duration::from_millis(60);
     let applied_before = scheduler.status.applied_commands;
     let calls = scheduler.motion.0.clone();
     let (handle, task) = spawn_scheduler(scheduler);
-    tokio::time::sleep(Duration::from_millis(75)).await;
-    let pending = handle.status();
-    let renewed = calls.lock().unwrap().calls.iter().any(|call| call.starts_with("renew:"));
+    let pending=tokio::time::timeout(Duration::from_secs(1),async {
+        loop {
+            let status=handle.status();
+            if status.applied_commands>applied_before {break status;}
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("速度续租被计算等待阻塞");
     release.send(()).unwrap();
     handle.shutdown().await.unwrap(); task.await.unwrap().unwrap();
-    assert!(renewed, "renewal waited behind geometry");
-    assert_eq!(pending.applied_commands, applied_before, "test must observe the open publication window");
+    assert!(calls.lock().unwrap().calls.iter().any(|call|call.starts_with("twist:")));
+    assert!(matches!(pending.last_applied_twist,Some(command) if command==Twist2::ZERO || command==delivery_gap_command()),
+        "计算等待期间只能延续原已准入命令或发送零速");
 }
 
 

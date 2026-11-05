@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use nuwax_nav_astar::navigation_map::CostMap2D;
 use nuwax_nav_runtime::{
-    spawn_scheduler, AppliedProof, CostmapObservation, ExecutionGoal, ExecutionMap, ExecutionPath,
-    FenceLeaseState, FenceProof, LeaseProof, MotionPortError, NavMotionAdmission, NavMotionPort,
+    spawn_scheduler, CostmapObservation, ExecutionGoal, ExecutionMap, ExecutionPath,
+    MotionPortError, NavMotionPort,
     NavPlanner, NavScheduler, NavSession, PathExecutionIdentity, PlannerStep, RuntimeError,
     SchedulerConfig, SchedulerStatus, VersionedPath,
 };
@@ -34,45 +34,14 @@ struct FakeMotion {
 
 #[async_trait]
 impl NavMotionPort for FakeMotion {
-    async fn acquire(
-        &mut self,
-        _operation_id: &str,
-        admission: &NavMotionAdmission,
-    ) -> Result<LeaseProof, MotionPortError> {
-        self.state.lock().expect("fake motion state").acquire_count += 1;
-        Ok(LeaseProof {
-            lease_id: 1,
-
-        })
+    async fn acquire(&mut self, _generation:u64) -> Result<u64,MotionPortError> {
+        self.state.lock().unwrap().acquire_count+=1; Ok(1)
     }
-
-    async fn renew(&mut self, _operation_id: &str) -> Result<(), MotionPortError> {
-        self.state.lock().expect("fake motion state").renew_count += 1;
-        Ok(())
+    async fn velocity(&mut self, _twist:Twist2) -> Result<(),MotionPortError> {
+        self.state.lock().unwrap().applied_count+=1; Ok(())
     }
-
-    async fn submit_twist(
-        &mut self,
-        operation_id: &str,
-        _twist: Twist2,
-    ) -> Result<AppliedProof, MotionPortError> {
-        self.state.lock().expect("fake motion state").applied_count += 1;
-        Ok(AppliedProof {
-            operation_id: operation_id.to_string(),
-            applied_monotonic_ns: 1,
-        })
-    }
-
-    async fn revoke_and_zero(
-        &mut self,
-        _operation_id: &str,
-    ) -> Result<Option<FenceProof>, MotionPortError> {
-        self.state.lock().expect("fake motion state").fence_count += 1;
-        Ok(Some(FenceProof {
-            zero_ack_id: "nav_scheduler_20hz_baseline-zero".to_string(),
-            applied_monotonic_ns: 2,
-            lease: FenceLeaseState::Idle,
-        }))
+    async fn release(&mut self) -> Result<(),MotionPortError> {
+        self.state.lock().unwrap().fence_count+=1; Ok(())
     }
 }
 
@@ -130,11 +99,7 @@ fn session() -> NavSession {
         session_id: "nav_scheduler_20hz_baseline-nav".to_string(),
         execution_identity: identity("nav_scheduler_20hz_baseline-nav", 0),
 
-        motion_admission: NavMotionAdmission {
-
-            guard_boot_nonce: [7; 16],
-            motion_stop_generation: 1,
-        },
+        motion_generation: 1,
     }
 }
 
@@ -193,7 +158,7 @@ async fn run() -> Result<(), RuntimeError> {
         FakePlanner::new(3),
         SchedulerConfig {
             tick_interval: Duration::from_millis(50),
-            renew_interval: Duration::from_millis(200),
+
             path_wait_timeout: Duration::from_secs(1),
             pose_ttl: Duration::from_millis(500),
             costmap_ttl: Duration::from_millis(500),

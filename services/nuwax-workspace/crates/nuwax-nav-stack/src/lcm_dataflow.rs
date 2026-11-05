@@ -455,10 +455,7 @@ fn runtime_input_error<T>(
     let fatal = matches!(
         &error,
         RuntimeError::Motion(_)
-            | RuntimeError::InvalidApplied(_)
-            | RuntimeError::InvalidFence(_)
             | RuntimeError::SchedulerStopped
-            | RuntimeError::SequenceExhausted
     );
     if fatal {
         Err(module_error(component, error))
@@ -849,13 +846,7 @@ struct GuardedNavTelemetry {
 fn guarded_goal_execution_identity(
     goal: &schema::GoalEnvelope,
 ) -> nuwax_nav_runtime::PathExecutionIdentity {
-    nuwax_nav_runtime::PathExecutionIdentity {
-        goal_key: nuwax_nav_types_messages::GoalKey { producer_runtime_generation: (goal.producer_runtime_generation) as u64, goal_generation: (goal.goal_generation) as u64 },
-        session_id: goal.session_id.clone(),
-
-        planner_runtime_generation: 0,
-        path_revision: 0,
-    }
+    nuwax_nav_runtime::PathExecutionIdentity { goal_key: goal.goal_key(), session_id: goal.session_id.clone(), planner_runtime_generation: 0, path_revision: 0 }
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -863,53 +854,12 @@ fn guarded_path_execution_identity(
     path: &schema::PathEnvelope,
 ) -> nuwax_nav_runtime::PathExecutionIdentity {
     nuwax_nav_runtime::PathExecutionIdentity {
-        goal_key: nuwax_nav_types_messages::GoalKey { producer_runtime_generation: (path.producer_runtime_generation) as u64, goal_generation: (path.goal_generation) as u64 },
+        goal_key: path.goal_key(),
         session_id: path.session_id.clone(),
 
         planner_runtime_generation: path.planner_runtime_generation,
         path_revision: u64::try_from(path.path_revision).expect("validated positive path revision"),
     }
-}
-
-#[cfg(feature = "guard-runtime")]
-#[derive(Clone)]
-struct GuardedCancelTerminal {
-    goal: schema::GoalEnvelope,
-    cancel_generation: u64,
-    status: nuwax_nav_runtime::SchedulerStatus,
-    telemetry: GuardedNavTelemetry,
-}
-
-#[cfg(feature = "guard-runtime")]
-#[derive(Clone)]
-struct GuardedCancelGenerationWatermark {
-    goal: schema::GoalEnvelope,
-    generation: u64,
-}
-
-#[cfg(feature = "guard-runtime")]
-fn observe_guarded_cancel_generation(
-    watermark: &mut Option<GuardedCancelGenerationWatermark>,
-    goal: &schema::GoalEnvelope,
-    generation: u64,
-) -> Result<(), String> {
-    if let Some(observed) = watermark.as_mut().filter(|observed| {
-        planner_goal_identity_matches(&observed.goal, goal)
-    }) {
-        if generation < observed.generation {
-            return Err(format!(
-                "stale cancel generation {generation}; highest observed generation is {}",
-                observed.generation
-            ));
-        }
-        observed.generation = observed.generation.max(generation);
-        return Ok(());
-    }
-    *watermark = Some(GuardedCancelGenerationWatermark {
-        goal: goal.clone(),
-        generation,
-    });
-    Ok(())
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -1308,20 +1258,8 @@ impl GuardedMapAuthority {
     }
 
     fn permits_goal(&self, goal: &schema::GoalEnvelope) -> bool {
-        self.producer_runtime_generation == goal.producer_runtime_generation
-            && self.map_frame_generation == goal.map_frame_generation
-            && self.committed_map.session_id == goal.committed_map_session_id
-            && self.committed_map.session_generation == goal.committed_map_session_generation
-            && self.committed_map.frame_id == goal.committed_map_frame_id
-            && self.committed_map.commit_boot_nonce == goal.committed_map_boot_nonce
-            && self.committed_map.revision >= goal.committed_map_revision
-            && if self.committed_map.revision == goal.committed_map_revision {
-                self.committed_map.commit_sequence == goal.committed_map_commit_sequence
-                    && self.committed_map.source_timestamp_ns == goal.committed_map_source_timestamp_ns
-            } else {
-                self.committed_map.commit_sequence > goal.committed_map_commit_sequence
-            }
-    }
+    self.committed_map.frame_id == goal.goal.header.frame_id
+}
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -1464,7 +1402,7 @@ async fn run_guarded_nav_loop<M, T>(
     mut status: tokio::sync::watch::Receiver<nuwax_nav_runtime::SchedulerStatus>,
     source_max_age: Option<Duration>,
     planar_mode: bool,
-    body_reference_frame_id: &str,
+    _body_reference_frame_id: &str,
     recent_source_max_age: Option<Duration>,
 ) -> NavStackResult<()>
 where
@@ -1493,11 +1431,7 @@ where
     #[cfg(all(test,feature="surface-recovery-qualification"))]
     { publications.qualification_timing=scheduler.qualification_timing().cloned(); }
     let mut diagnostics = InputDiagnosticLimiter::default();
-    let mut last_cancel_terminal: Option<GuardedCancelTerminal> = None;
-    // This watermark rejects generation rollback but never grants replay or
-    // reacquisition eligibility; those remain owned by the active, pending,
-    // and terminal goal records.
-    let mut cancel_generation_watermark: Option<GuardedCancelGenerationWatermark> = None;
+
     let initial_status = status.borrow().clone();
     publish_guarded_nav_observation(
         transport,
@@ -1546,11 +1480,7 @@ where
                     NavStackError::Internal("guard scheduler status stream closed".into())
                 })?;
                 let snapshot = status.borrow().clone();
-                publish_guarded_tail_observation(
-                    transport, node, scheduler, snapshot, &mut telemetry, None, &mut publications,
-                    &mut cancels, &mut active_session, &mut goal_buffer, &mut last_cancel_terminal,
-                    &mut cancel_generation_watermark, &mut arbiter,
-                ).await?;
+                publish_guarded_tail_observation(transport, node, snapshot, &mut telemetry, None, &mut publications, &mut active_session).await?;
             }
             GuardedNavEvent::Pose(message) => {
                 #[cfg(all(test,feature="surface-recovery-qualification"))]
@@ -1571,18 +1501,17 @@ where
                 commit_guarded_pose_telemetry(&mut candidate_telemetry, &input);
                 #[cfg(all(test,feature="surface-recovery-qualification"))]
                 let pose_ack=scheduler.qualification_timing().map(|t|t.span("bridge.pose.scheduler_ack",input.pose.stamp.nanos));
-                let settlement = await_guarded_active_input(async {
+                let settlement = (async {
                     match source_age_limit {
                         Some(maximum) => scheduler
                             .update_odometry_with_source_age(input.pose, input.acquired_at, maximum).await,
                         None => scheduler.update_odometry(input.pose).await,
                     }
-                }, node, transport, scheduler, &mut cancels, active_session.as_ref(),
-                    &mut cancel_generation_watermark, &mut arbiter, &telemetry).await;
+                }).await;
                 #[cfg(all(test,feature="surface-recovery-qualification"))]
                 drop(pose_ack);
-                let accepted = settlement.input.is_ok();
-                let ordinary = match settlement.input {
+                let accepted = settlement.is_ok();
+                let ordinary = match settlement {
                     Ok(()) => { telemetry = candidate_telemetry; Ok(()) }
                     Err(error) => match runtime_input_error::<()>("guarded_nav_scheduler.map_pose", error) {
                         Ok(OwnerInput::Rejected(reason)) => {
@@ -1592,10 +1521,8 @@ where
                         Err(error) => Err(error),
                     },
                 };
-                let cancelled = settle_guarded_input_cancel(ordinary, settlement.cancel,
-                    transport, node, scheduler, &mut telemetry, &mut active_session,
-                    &mut goal_buffer, &mut last_cancel_terminal, &mut publications).await?;
-                if !accepted || cancelled { continue; }
+                ordinary?;
+                if !accepted { continue; }
                 if let Some(goal) = goal_buffer.take_ready_goal() {
                     activate_or_defer_guarded_goal(
                         node,
@@ -1612,11 +1539,7 @@ where
                 }
                 let snapshot = scheduler.status();
                 let planner_inputs_fresh = snapshot.planner_inputs_fresh;
-                publish_guarded_tail_observation(
-                    transport, node, scheduler, snapshot, &mut telemetry, Some(planner_inputs_fresh),
-                    &mut publications, &mut cancels, &mut active_session, &mut goal_buffer,
-                    &mut last_cancel_terminal, &mut cancel_generation_watermark, &mut arbiter,
-                ).await?;
+                publish_guarded_tail_observation(transport, node, snapshot, &mut telemetry, Some(planner_inputs_fresh), &mut publications, &mut active_session).await?;
             }
             GuardedNavEvent::Costmap(message) => {
                 let frame = message
@@ -1625,17 +1548,11 @@ where
                 let (decoded, received_at) = match frame {
                     #[cfg(feature="mls")]
                     GuardedMapFrame::RecentCloud(frame) => {
-                        let settlement = await_guarded_active_input(
-                            recent_source.consume(&frame.payload, surface_authority.as_ref(), scheduler),
-                            node, transport, scheduler, &mut cancels, active_session.as_ref(),
-                            &mut cancel_generation_watermark, &mut arbiter, &telemetry,
-                        ).await;
-                        if let Err(reason) = settlement.input {
+                        let settlement = (recent_source.consume(&frame.payload, surface_authority.as_ref(), scheduler)).await;
+                        if let Err(reason) = settlement {
                             diagnostics.reject("recent obstacle source", &reason);
                         }
-                        settle_guarded_input_cancel(Ok(()), settlement.cancel,
-                            transport, node, scheduler, &mut telemetry, &mut active_session,
-                            &mut goal_buffer, &mut last_cancel_terminal, &mut publications).await?;
+
                         continue;
                     }
                     GuardedMapFrame::Planar(frame) => {
@@ -1740,13 +1657,9 @@ where
                             );
                         }
                         if changed_domain || update.snapshot.is_err() {
-                            let settlement = await_guarded_active_input(recent_source.reset(scheduler),
-                                node, transport, scheduler, &mut cancels, active_session.as_ref(),
-                                &mut cancel_generation_watermark, &mut arbiter, &telemetry).await;
-                            let ordinary = settlement.input.map_err(|error|module_error("recent source domain reset",error));
-                            settle_guarded_input_cancel(ordinary, settlement.cancel,
-                                transport, node, scheduler, &mut telemetry, &mut active_session,
-                                &mut goal_buffer, &mut last_cancel_terminal, &mut publications).await?;
+                            let settlement = (recent_source.reset(scheduler)).await;
+                            let ordinary = settlement.map_err(|error|module_error("recent source domain reset",error));
+                            ordinary?;
                         }
                         surface_authority = Some(update.authority.clone());
                         let surface = match update.snapshot {
@@ -1783,16 +1696,12 @@ where
                 commit_guarded_costmap_telemetry(&mut candidate_telemetry, &input);
                 #[cfg(all(test,feature="surface-recovery-qualification"))]
                 let map_ack=scheduler.qualification_timing().map(|t|t.span("bridge.map.scheduler_ack",input.observation.source_timestamp_ns));
-                let settlement = await_guarded_active_input(
-                    scheduler.update_costmap_received(input.observation,
-                        tokio::time::Instant::from_std(received_at.unwrap_or_else(Instant::now))),
-                    node, transport, scheduler, &mut cancels, active_session.as_ref(),
-                    &mut cancel_generation_watermark, &mut arbiter, &telemetry,
-                ).await;
+                let settlement = (scheduler.update_costmap_received(input.observation,
+                        tokio::time::Instant::from_std(received_at.unwrap_or_else(Instant::now)))).await;
                 #[cfg(all(test,feature="surface-recovery-qualification"))]
                 drop(map_ack);
-                let accepted = settlement.input.is_ok();
-                let ordinary = match settlement.input {
+                let accepted = settlement.is_ok();
+                let ordinary = match settlement {
                     Ok(()) => {
                         telemetry = candidate_telemetry;
                         // Observe the accepted map without taking/activating a
@@ -1808,10 +1717,8 @@ where
                         Err(error) => Err(error),
                     },
                 };
-                let cancelled = settle_guarded_input_cancel(ordinary, settlement.cancel,
-                    transport, node, scheduler, &mut telemetry, &mut active_session,
-                    &mut goal_buffer, &mut last_cancel_terminal, &mut publications).await?;
-                if !accepted || cancelled { continue; }
+                ordinary?;
+                if !accepted { continue; }
                 let ready_goal = goal_buffer.take_ready_goal();
                 if let Some(goal) = ready_goal {
                     activate_or_defer_guarded_goal(
@@ -1829,15 +1736,11 @@ where
                 }
                 let snapshot = scheduler.status();
                 let planner_inputs_fresh = snapshot.planner_inputs_fresh;
-                publish_guarded_tail_observation(
-                    transport, node, scheduler, snapshot, &mut telemetry, Some(planner_inputs_fresh),
-                    &mut publications, &mut cancels, &mut active_session, &mut goal_buffer,
-                    &mut last_cancel_terminal, &mut cancel_generation_watermark, &mut arbiter,
-                ).await?;
+                publish_guarded_tail_observation(transport, node, snapshot, &mut telemetry, Some(planner_inputs_fresh), &mut publications, &mut active_session).await?;
             }
             GuardedNavEvent::Goal(message) => {
                 let frame = required_frame(message, "guarded_nav_scheduler.goal")?;
-                let goal_envelope = match decode_configured_goal_envelope(&frame.payload, body_reference_frame_id) {
+                let goal_envelope = match schema::decode_goal_envelope_body(&frame.payload) {
                     Ok(envelope) => envelope,
                     Err(error) => {
                         // 契约完整但本机配置拒绝的目标仍属于原请求。保留不可执行
@@ -1851,7 +1754,7 @@ where
                                 {
                                     goal_buffer.pending_goal = Some(goal.clone());
                                     goal_buffer.pending_invalidated = true;
-                                    last_cancel_terminal = None;
+
                                     rejected_telemetry = guarded_buffered_cancel_telemetry(&telemetry, &goal, 0);
                                 }
                             }
@@ -1884,11 +1787,11 @@ where
                 }
                 let goal_envelope = match goal_buffer.observe_goal(goal_envelope) {
                     PlannerGoalIngress::Ready(goal) => {
-                        last_cancel_terminal = None;
+
                         *goal
                     }
                     PlannerGoalIngress::Buffered => {
-                        last_cancel_terminal = None;
+
 
                         continue;
                     }
@@ -2021,8 +1924,7 @@ where
                     }
                 };
                 let active_goal_key = active_goal.goal_key();
-                let settlement = await_guarded_active_input(
-                    scheduler
+                let settlement = (scheduler
                     .submit_path(nuwax_nav_runtime::VersionedPath {
                         route_kind: if path_envelope.route_kind == 1 {nuwax_nav_runtime::RouteKind::Approach}
                             else {nuwax_nav_runtime::RouteKind::Complete},
@@ -2046,12 +1948,9 @@ where
                             )
                         },
                         path,
-                    }),
-                    node, transport, scheduler, &mut cancels, Some(active_goal),
-                    &mut cancel_generation_watermark, &mut arbiter, &telemetry,
-                ).await;
-                let rejected = settlement.input.is_err();
-                let ordinary = match settlement.input {
+                    })).await;
+                let rejected = settlement.is_err();
+                let ordinary = match settlement {
                     Err(error) => match runtime_input_error::<()>("guarded_nav_scheduler.path", error) {
                         Ok(OwnerInput::Rejected(reason)) => publish_guarded_rejection(
                             transport, &node.outputs[1], scheduler.status(), &telemetry, "path", &reason,
@@ -2060,7 +1959,7 @@ where
                         Err(error) => Err(error),
                     },
                     Ok(()) => {
-                        if matches!(&settlement.cancel, Ok(None)) {
+                        {
                             accepted_planner_generation = Some((active_goal_key,
                                 path_envelope.planner_runtime_generation));
                             telemetry.path_revision = path_envelope.path_revision;
@@ -2069,10 +1968,8 @@ where
                         Ok(())
                     }
                 };
-                let cancelled = settle_guarded_input_cancel(ordinary, settlement.cancel,
-                    transport, node, scheduler, &mut telemetry, &mut active_session,
-                    &mut goal_buffer, &mut last_cancel_terminal, &mut publications).await?;
-                if rejected && !cancelled {
+                ordinary?;
+                if rejected {
                     let snapshot = scheduler.status();
                     clear_terminal_session_after_publication(
                         &mut active_session, &mut telemetry, &snapshot,
@@ -2080,152 +1977,23 @@ where
                 }
             }
             GuardedNavEvent::Cancel(message) => {
-                let (cancel, cancel_generation) = match decode_guarded_cancel(message)? {
-                    OwnerInput::Accepted(value) => value,
-                    OwnerInput::Rejected(reason) => {
-                        publish_guarded_rejection(
-                            transport, &node.outputs[1], scheduler.status(), &telemetry,
-                            "cancel", &reason,
-                        ).await?;
-                        continue;
-                    }
+                let frame = required_frame(message, "导航取消")?;
+                let cancel = match schema::decode_cancel_navigation_body(&frame.payload) {
+                    Ok(cancel) => cancel,
+                    Err(error) => { diagnostics.reject("导航取消", &error.to_string()); continue; }
                 };
-                if let Some(active_goal) = active_session.clone() {
-                    if let Err(reason) = admit_guarded_active_cancel(
-                        &cancel, cancel_generation, &active_goal, &mut cancel_generation_watermark,
-                    ) {
-                        publish_guarded_rejection(
-                            transport, &node.outputs[1], scheduler.status(), &telemetry,
-                            "cancel", &reason,
-                        ).await?;
-                        continue;
-                    }
-                    let result = execute_guarded_active_cancel(scheduler, &cancel).await;
-                    finish_guarded_active_cancel(
-                        transport, node, scheduler,
-                        GuardedActiveCancelCompletion { active_goal, cancel, cancel_generation, result },
-                        &mut telemetry, &mut active_session, &mut goal_buffer,
-                        &mut last_cancel_terminal, &mut publications,
-                    ).await?;
-                } else {
-                    let buffered_goal = match goal_buffer.cancelled_pending_goal(&cancel) {
-                        Ok(goal) => goal,
-                        Err(reason) => {
-                            publish_guarded_rejection(
-                                transport,
-                                &node.outputs[1],
-                                scheduler.status(),
-                                &telemetry,
-                                "cancel",
-                                &reason,
-                            )
-                            .await?;
-                            continue;
-                        }
-                    };
-                    let goal_to_fence = if let Some(buffered_goal) = buffered_goal {
-                        if let Err(reason) = observe_guarded_cancel_generation(
-                            &mut cancel_generation_watermark,
-                            &buffered_goal,
-                            cancel_generation,
-                        ) {
-                            publish_guarded_rejection(
-                                transport,
-                                &node.outputs[1],
-                                scheduler.status(),
-                                &telemetry,
-                                "cancel",
-                                &reason,
-                            )
-                            .await?;
-                            continue;
-                        }
-                        Some(*buffered_goal)
-                    } else if let Some(terminal) = last_cancel_terminal.as_ref() {
-                        if let Err(reason) =
-                            validate_cancel_goal_correlation(&cancel, &terminal.goal)
-                        {
-                            publish_guarded_rejection(
-                                transport,
-                                &node.outputs[1],
-                                scheduler.status(),
-                                &telemetry,
-                                "cancel",
-                                &reason,
-                            )
-                            .await?;
-                            continue;
-                        }
-                        if cancel_generation < terminal.cancel_generation {
-                            publish_guarded_rejection(
-                                transport,
-                                &node.outputs[1],
-                                scheduler.status(),
-                                &telemetry,
-                                "cancel",
-                                &format!(
-                                    "stale cancel generation {cancel_generation}; latest terminal generation is {}",
-                                    terminal.cancel_generation
-                                ),
-                            ).await?;
-                            continue;
-                        }
-                        if let Err(reason) = observe_guarded_cancel_generation(
-                            &mut cancel_generation_watermark,
-                            &terminal.goal,
-                            cancel_generation,
-                        ) {
-                            publish_guarded_rejection(
-                                transport,
-                                &node.outputs[1],
-                                scheduler.status(),
-                                &telemetry,
-                                "cancel",
-                                &reason,
-                            )
-                            .await?;
-                            continue;
-                        }
-                        if cancel_generation == terminal.cancel_generation {
-                            publish_bool(transport, &node.outputs[3], true).await?;
-                            publish_guarded_nav_state(
-                                transport,
-                                &node.outputs[1],
-                                terminal.status.clone(),
-                                &terminal.telemetry,
-                                None,
-                            )
-                            .await?;
-                            continue;
-                        }
-                        Some(terminal.goal.clone())
-                    } else {
-                        None
-                    };
-                    if let Some(buffered_goal) = goal_to_fence {
-                        let buffered_telemetry = guarded_buffered_cancel_telemetry(&telemetry, &buffered_goal, cancel_generation);
-                        goal_buffer.clear_pending_goal_for(&buffered_goal);
-                        let mut snapshot = scheduler.status();
-                        snapshot.phase = nuwax_nav_runtime::SchedulerPhase::Idle;
-                        snapshot.last_terminal = Some(nuwax_nav_runtime::TerminalOutcome::Cancelled);
-                        snapshot.last_zero_ack_id = None;
-                        snapshot.last_fence_monotonic_ns = 0;
-                        snapshot.message = "缓冲目标已取消".into();
-                        publish_guarded_nav_state(transport, &node.outputs[1], snapshot.clone(), &buffered_telemetry, None).await?;
-                        last_cancel_terminal = Some(GuardedCancelTerminal {
-                            goal: buffered_goal, cancel_generation, status: snapshot, telemetry: buffered_telemetry,
-                        });
-                    } else {
-                        publish_guarded_rejection(
-                            transport,
-                            &node.outputs[1],
-                            scheduler.status(),
-                            &telemetry,
-                            "cancel",
-                            "no active or buffered scheduler session",
-                        )
-                        .await?;
-                    }
+                if active_session.as_ref().is_some_and(|goal| validate_cancel_goal_correlation(&cancel, goal).is_ok()) {
+                    scheduler.cancel(&cancel.session_id).await.map_err(|error| module_error("导航取消", error))?;
+                    let snapshot = scheduler.status();
+                    publish_guarded_nav_observation(transport, node, snapshot.clone(), &telemetry, None, &mut publications).await?;
+                    clear_terminal_session_after_publication(&mut active_session, &mut telemetry, &snapshot);
+                }
+                if cancel.session_id.is_empty() {
+                    goal_buffer = PlannerGoalBuffer::default();
+                    goal_buffer.costmap_observed = surface_authority.is_some();
+                    accepted_planner_generation = None;
+                } else if let Some(goal) = goal_buffer.pending_goal.clone().filter(|goal| goal.session_id == cancel.session_id) {
+                    goal_buffer.clear_pending_goal_for(&goal);
                 }
             }
         }
@@ -2361,10 +2129,10 @@ async fn activate_guarded_goal(
     ];
     candidate_telemetry.goal_z = goal.pose.position.z;
     candidate_telemetry.public_session_id = goal_envelope.session_id.clone();
-    candidate_telemetry.owner_kind = goal_envelope.owner_kind;
-    candidate_telemetry.parent_request_id = goal_envelope.parent_request_id.clone();
-    candidate_telemetry.goal_generation = goal_envelope.goal_generation;
-    candidate_telemetry.producer_runtime_generation = goal_envelope.producer_runtime_generation;
+    candidate_telemetry.owner_kind = schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV;
+    candidate_telemetry.parent_request_id = String::new();
+    candidate_telemetry.goal_generation = goal_envelope.motion_generation as i64;
+    candidate_telemetry.producer_runtime_generation = 0;
     candidate_telemetry.cancel_generation = 0;
     candidate_telemetry.path_revision = 0;
     candidate_telemetry.planner_runtime_generation = 0;
@@ -2373,17 +2141,12 @@ async fn activate_guarded_goal(
     if let Err(error) = scheduler
         .start_session(nuwax_nav_runtime::NavSession {
             boundary: goal_envelope.boundary_points.iter().map(|p|[p[0],p[1]]).collect(),
-            options: goal_envelope.options,
+            options: goal_envelope.options(),
             goal: nuwax_nav_runtime::ExecutionGoal::Body(pose_from_schema(&goal_envelope.goal)?),
             session_id: goal_envelope.session_id.clone(),
             execution_identity: guarded_goal_execution_identity(&goal_envelope),
 
-            motion_admission: nuwax_nav_runtime::NavMotionAdmission {
-
-                guard_boot_nonce: goal_envelope.motion_guard_boot_nonce,
-                motion_stop_generation: u64::try_from(goal_envelope.motion_stop_generation)
-                    .expect("validated non-negative motion_stop_generation"),
-            },
+            motion_generation: goal_envelope.motion_generation,
         })
         .await
     {
@@ -2392,7 +2155,7 @@ async fn activate_guarded_goal(
             let mut rejected = scheduler.status();
             rejected.phase = nuwax_nav_runtime::SchedulerPhase::Failed;
             rejected.last_terminal = None;
-            rejected.message = error.to_string();
+            rejected.message = format!("LEASE_NOT_GRANTED: {error}");
             publish_guarded_nav_state(transport, &node.outputs[1], rejected, &candidate_telemetry, None).await?;
             return Ok(GuardedGoalActivation::LeaseRejected);
         }
@@ -2490,7 +2253,7 @@ fn planner_generation_is_stale(
 
 #[cfg(feature = "guard-runtime")]
 fn validate_path_goal_correlation(path: &schema::PathEnvelope, goal: &schema::GoalEnvelope) -> Result<(), String> {
-    if path.session_id != goal.session_id || path.goal_key() != goal.goal_key() {
+    if path.session_id != goal.session_id || path.motion_generation != goal.motion_generation {
         return Err("PathEnvelope goal identity does not match the active GoalEnvelope".into());
     }
     if path.path.header.frame_id != goal.goal.header.frame_id {
@@ -2504,15 +2267,8 @@ fn validate_cancel_goal_correlation(
     cancel: &schema::CancelNavigation,
     goal: &schema::GoalEnvelope,
 ) -> Result<(), String> {
-    if cancel.session_id != goal.session_id
-        || cancel.owner_kind != goal.owner_kind
-        || cancel.parent_request_id != goal.parent_request_id
-        || cancel.goal_generation != goal.goal_generation
-        || cancel.producer_runtime_generation != goal.producer_runtime_generation
-    {
-        return Err("CancelNavigation identity does not match the active GoalEnvelope".into());
-    }
-    Ok(())
+    if cancel.session_id.is_empty() || cancel.session_id == goal.session_id { Ok(()) }
+    else { Err("取消目标号不匹配".into()) }
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -2525,16 +2281,16 @@ fn guarded_buffered_cancel_telemetry(
         pose_from_schema(&goal.goal).expect("buffered goal pose was validated on ingress");
     let mut candidate = telemetry.clone();
     candidate.public_session_id = goal.session_id.clone();
-    candidate.owner_kind = goal.owner_kind;
-    candidate.parent_request_id = goal.parent_request_id.clone();
-    candidate.goal_generation = goal.goal_generation;
+    candidate.owner_kind = schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV;
+    candidate.parent_request_id = String::new();
+    candidate.goal_generation = goal.motion_generation as i64;
     candidate.cancel_generation = cancel_generation;
     candidate.goal = [
         goal_pose.pose.position.x,
         goal_pose.pose.position.y,
         goal_pose.pose.orientation.yaw(),
     ];
-    candidate.producer_runtime_generation = goal.producer_runtime_generation;
+    candidate.producer_runtime_generation = 0;
     candidate.path_revision = 0;
     candidate.planner_runtime_generation = 0;
     candidate.goal_z = goal_pose.pose.position.z;
@@ -2584,7 +2340,7 @@ struct GuardedStatusPublications {
     qualification_timing: Option<nuwax_nav_runtime::qualification_timing::TraceSink>,
     goal: Option<(String, i32, String, i64, i64)>,
     applied_commands: u64,
-    last_zero_ack_id: Option<String>,
+    last_terminal: Option<nuwax_nav_runtime::TerminalOutcome>,
     reached_published: bool,
 }
 
@@ -2609,7 +2365,7 @@ impl GuardedStatusPublications {
             if self.goal.as_ref() != Some(&goal) {
                 self.goal = Some(goal);
                 self.applied_commands = 0;
-                self.last_zero_ack_id = None;
+                self.last_terminal = None;
                 self.reached_published = false;
             }
             if status.applied_commands > self.applied_commands {
@@ -2618,12 +2374,10 @@ impl GuardedStatusPublications {
                 }
                 self.applied_commands = status.applied_commands;
             }
-            if status.last_zero_ack_id != self.last_zero_ack_id {
-                if status.last_zero_ack_id.is_some() {
-                    frames.push(build_twist2_frame(&node.outputs[0], Twist2::ZERO)?);
-                }
-                self.last_zero_ack_id = status.last_zero_ack_id.clone();
+            if status.last_terminal.is_some() && status.last_terminal != self.last_terminal {
+                frames.push(build_twist2_frame(&node.outputs[0], Twist2::ZERO)?);
             }
+            self.last_terminal = status.last_terminal;
             if status.last_terminal == Some(nuwax_nav_runtime::TerminalOutcome::Succeeded)
                 && !self.reached_published
             {
@@ -2646,432 +2400,13 @@ impl GuardedStatusPublications {
 }
 
 #[cfg(feature = "guard-runtime")]
-fn decode_guarded_cancel(
-    message: Option<TransportResult<RawLcmFrame>>,
-) -> OwnerInputResult<(schema::CancelNavigation, u64)> {
-    let frame = required_frame(message, "guarded_nav_scheduler.cancel")?;
-    let cancel = match schema::decode_cancel_navigation_body(&frame.payload) {
-        Ok(cancel) => cancel,
-        Err(error) => return Ok(OwnerInput::Rejected(format!("CancelNavigation rejected: {error}"))),
-    };
-    #[cfg(all(test, feature = "surface-recovery-qualification"))]
-    guarded_tests::record_ack_return_cancel("bridge_ack_test.cancel_decoded", &cancel);
-    let Some(generation) = u64::try_from(cancel.cancel_generation).ok().filter(|value| *value > 0) else {
-        return Ok(OwnerInput::Rejected("CancelNavigation.cancel_generation must be positive".into()));
-    };
-    Ok(OwnerInput::Accepted((cancel, generation)))
-}
-
-#[cfg(feature = "guard-runtime")]
-fn admit_guarded_active_cancel(
-    cancel: &schema::CancelNavigation,
-    generation: u64,
-    active_goal: &schema::GoalEnvelope,
-    watermark: &mut Option<GuardedCancelGenerationWatermark>,
-) -> Result<(), String> {
-    validate_cancel_goal_correlation(cancel, active_goal)?;
-    observe_guarded_cancel_generation(watermark, active_goal, generation)
-}
-
-#[cfg(feature = "guard-runtime")]
-async fn execute_guarded_active_cancel(
-    scheduler: &nuwax_nav_runtime::NavSchedulerHandle,
-    cancel: &schema::CancelNavigation,
-) -> Result<(), nuwax_nav_runtime::RuntimeError> {
-    #[cfg(all(test, feature = "surface-recovery-qualification"))]
-    guarded_tests::record_ack_return_cancel("bridge_ack_test.cancel_api_begin", cancel);
-    let result = scheduler.cancel(&cancel.session_id).await;
-    #[cfg(all(test, feature = "surface-recovery-qualification"))]
-    guarded_tests::record_ack_return_cancel("bridge_ack_test.cancel_api_done", cancel);
-    #[cfg(all(test, feature = "surface-recovery-qualification"))]
-    if result.is_ok() {
-        guarded_tests::record_ack_return_cancel("bridge_ack_test.cancel_api_ok", cancel);
-    }
-    result
-}
-
-#[cfg(feature = "guard-runtime")]
-struct GuardedActiveCancelCompletion {
-    active_goal: schema::GoalEnvelope,
-    cancel: schema::CancelNavigation,
-    cancel_generation: u64,
-    result: Result<(), nuwax_nav_runtime::RuntimeError>,
-}
-
-#[cfg(feature = "guard-runtime")]
-struct GuardedInputSettlement<T> {
-    input: T,
-    cancel: NavStackResult<Option<GuardedActiveCancelCompletion>>,
-}
-
-// One ordinary request remains owned from its bounded send through its ACK.
-// Only an already-active goal is eligible: a queued StartSession could acquire
-// after a cancellation and must never be passed to this helper.
-#[cfg(feature = "guard-runtime")]
-#[allow(clippy::too_many_arguments)]
-async fn await_guarded_active_input<P, T>(
-    input: P,
-    node: &ModuleNode,
-    transport: &LcmTransport,
-    scheduler: &nuwax_nav_runtime::NavSchedulerHandle,
-    cancels: &mut LcmFrameStream,
-    active_goal: Option<&schema::GoalEnvelope>,
-    watermark: &mut Option<GuardedCancelGenerationWatermark>,
-    arbiter: &mut GuardedNavArbiter,
-    telemetry: &GuardedNavTelemetry,
-) -> GuardedInputSettlement<T>
-where
-    P: Future<Output = T>,
-{
-    let eligible = {
-        // Borrow the existing watch value; a pose ACK must not clone local_path
-        // merely to inspect these two scalar/session fields.
-        let status = scheduler.subscribe_status();
-        let snapshot = status.borrow();
-        active_goal.filter(|goal| snapshot.last_terminal.is_none()
-            && snapshot.session_id.as_deref() == Some(goal.session_id.as_str()))
-    };
-    let Some(active_goal) = eligible else {
-        return GuardedInputSettlement { input: input.await, cancel: Ok(None) };
-    };
-    let mut status = scheduler.subscribe_status();
-    let mut heartbeat = tokio::time::interval(Duration::from_millis(500));
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    tokio::pin!(input);
-    loop {
-        // 输入确认可能等待原停车证明；等待期间继续发布实际状态，
-        // 不发布规划输入观察，不把尚未消费的位姿或地图标成新鲜。
-        let mut observed_status = false;
-        let message = tokio::select! {
-            biased;
-            result = &mut input => return GuardedInputSettlement { input: result, cancel: Ok(None) },
-            message = cancels.next() => message,
-            changed = status.changed() => {
-                if changed.is_ok() { observed_status = true; }
-                None
-            },
-            _ = heartbeat.tick() => { observed_status = true; None },
-        };
-        let mut publication_error = None;
-        if observed_status {
-            let snapshot = status.borrow_and_update().clone();
-            let publication = publish_guarded_nav_state(transport, &node.outputs[1], snapshot, telemetry, None);
-            // 状态回执的背压同样沿现有发布/取消协作收敛，不能挡住守卫归零。
-            match await_guarded_tail_publication(publication, scheduler, cancels,
-                Some(active_goal), watermark, arbiter).await {
-                Ok(None) => continue,
-                Ok(Some(OwnerInput::Accepted(completion))) => {
-                    return GuardedInputSettlement { input: input.await, cancel: Ok(Some(completion)) };
-                }
-                Ok(Some(OwnerInput::Rejected(reason))) => {
-                    match publish_guarded_rejection(transport, &node.outputs[1], scheduler.status(),
-                        telemetry, "cancel", &reason).await {
-                        Ok(()) => continue,
-                        Err(error) => publication_error = Some(error),
-                    }
-                }
-                Err(error) => publication_error = Some(error),
-            }
-            // 发布失败沿已有关闭清理收敛在途输入，不能遗失已入队的请求。
-        }
-        if !observed_status { arbiter.record_dispatch(GuardedNavSource::Cancel); }
-        let decoded = publication_error.map_or_else(|| decode_guarded_cancel(message), Err).map(|decoded| match decoded {
-            OwnerInput::Accepted((cancel, generation)) => {
-                match admit_guarded_active_cancel(&cancel, generation, active_goal, watermark) {
-                    Ok(()) => OwnerInput::Accepted((cancel, generation)),
-                    Err(reason) => OwnerInput::Rejected(reason),
-                }
-            }
-            OwnerInput::Rejected(reason) => OwnerInput::Rejected(reason),
-        });
-        let fatal = match decoded {
-            Ok(OwnerInput::Accepted((cancel, cancel_generation))) => {
-                let (input, result) = tokio::join!(
-                    &mut input, execute_guarded_active_cancel(scheduler, &cancel),
-                );
-                return GuardedInputSettlement {
-                    input,
-                    cancel: Ok(Some(GuardedActiveCancelCompletion {
-                        active_goal: active_goal.clone(), cancel, cancel_generation, result,
-                    })),
-                };
-            }
-            Ok(OwnerInput::Rejected(reason)) => {
-                // Preserve the original diagnostic and its transport backpressure.
-                // A rejected head must not leave a later valid Cancel waiting
-                // for the blocked ordinary ACK.
-                publish_guarded_rejection(
-                    transport, &node.outputs[1], scheduler.status(), telemetry, "cancel", &reason,
-                ).await.err()
-            }
-            Err(error) => Some(error),
-        };
-        if let Some(error) = fatal {
-            // Returning early would discard a possibly-enqueued request; merely
-            // awaiting it could prevent outer cleanup behind a pending renew.
-            // The original urgent shutdown closes the actor and its input queue.
-            let (input, shutdown) = tokio::join!(&mut input, scheduler.shutdown());
-            if let Err(shutdown_error) = shutdown {
-                tracing::warn!(ingress_error = %error, shutdown_error = %shutdown_error,
-                    "guarded input cancellation error during shutdown settlement");
-            }
-            return GuardedInputSettlement { input, cancel: Err(error) };
-        }
-    }
-}
-
-// Input bookkeeping/diagnostics have completed, but no goal has been activated
-// and no terminal identity has been cleared. Keep both completed results even
-// when the ordinary input failed; never let an early `?` discard cancellation.
-#[cfg(feature = "guard-runtime")]
-#[allow(clippy::too_many_arguments)]
-async fn settle_guarded_input_cancel(
-    ordinary: NavStackResult<()>,
-    cancel: NavStackResult<Option<GuardedActiveCancelCompletion>>,
-    transport: &LcmTransport,
-    node: &ModuleNode,
-    scheduler: &nuwax_nav_runtime::NavSchedulerHandle,
-    telemetry: &mut GuardedNavTelemetry,
-    active_session: &mut Option<schema::GoalEnvelope>,
-    goal_buffer: &mut PlannerGoalBuffer,
-    last_cancel_terminal: &mut Option<GuardedCancelTerminal>,
-    publications: &mut GuardedStatusPublications,
-) -> NavStackResult<bool> {
-    let completion = match cancel {
-        Ok(completion) => completion,
-        Err(error) => {
-            if let Err(input_error) = ordinary {
-                tracing::warn!(ingress_error = %error, input_error = %input_error,
-                    "guarded input also failed during fatal ingress settlement");
-            }
-            return Err(error);
-        }
-    };
-    let interrupted = completion.is_some();
-    let cancelled = match completion {
-        Some(completion) => finish_guarded_active_cancel(
-            transport, node, scheduler, completion, telemetry, active_session,
-            goal_buffer, last_cancel_terminal, publications,
-        ).await,
-        None => Ok(()),
-    };
-    if let Err(error) = ordinary {
-        if let Err(cancel_error) = cancelled {
-            tracing::warn!(input_error = %error, cancel_error = %cancel_error,
-                "ordinary guarded input failed with cancellation settlement failure");
-        }
-        return Err(error);
-    }
-    cancelled?;
-    Ok(interrupted)
-}
-
-// This is one publication tail, not a second ingress owner. An eligible active
-// goal is borrowed until a Cancel is actually read; the no-Cancel path clones none.
-#[cfg(feature = "guard-runtime")]
-async fn await_guarded_tail_publication<P>(
-    publication: P,
-    scheduler: &nuwax_nav_runtime::NavSchedulerHandle,
-    cancels: &mut LcmFrameStream,
-    active_goal: Option<&schema::GoalEnvelope>,
-    watermark: &mut Option<GuardedCancelGenerationWatermark>,
-    arbiter: &mut GuardedNavArbiter,
-) -> NavStackResult<Option<OwnerInput<GuardedActiveCancelCompletion>>>
-where
-    P: Future<Output = NavStackResult<()>>,
-{
-    tokio::pin!(publication);
-    let (publication_result, pending) = if let Some(active_goal) = active_goal {
-        tokio::select! {
-            biased;
-            result = &mut publication => (result, None),
-            message = cancels.next() => {
-                arbiter.record_dispatch(GuardedNavSource::Cancel);
-                match decode_guarded_cancel(message) {
-                    Err(error) => (publication.await, Some(Err(error))),
-                    Ok(OwnerInput::Rejected(reason)) => (
-                        publication.await, Some(Ok(OwnerInput::Rejected(reason))),
-                    ),
-                    Ok(OwnerInput::Accepted((cancel, cancel_generation))) => {
-                        if let Err(reason) = admit_guarded_active_cancel(
-                            &cancel, cancel_generation, active_goal, watermark,
-                        ) {
-                            (publication.await, Some(Ok(OwnerInput::Rejected(reason))))
-                        } else {
-                            // Preserve both futures and both Results, whichever completes first.
-                            // No shutdown branch may discard an already admitted cancellation.
-                            let (published, result) = tokio::join!(
-                                &mut publication,
-                                execute_guarded_active_cancel(scheduler, &cancel),
-                            );
-                            (published, Some(Ok(OwnerInput::Accepted(GuardedActiveCancelCompletion {
-                                active_goal: active_goal.clone(), cancel, cancel_generation, result,
-                            }))))
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        (publication.await, None)
-    };
-    if let Err(error) = publication_result {
-        match &pending {
-            Some(Ok(OwnerInput::Accepted(completion))) => {
-                // One failure event, never the rate-limited rejection diagnostic.
-                // The unchanged outer coordinator still owns shutdown/task error precedence.
-                tracing::warn!(
-                    publication_error = %error, cancel_result = ?completion.result,
-                    session_id = %completion.cancel.session_id,
-                    owner_kind = completion.cancel.owner_kind,
-                    parent_request_id = %completion.cancel.parent_request_id,
-                    goal_generation = completion.cancel.goal_generation,
-                    producer_runtime_generation = completion.cancel.producer_runtime_generation,
-                    cancel_generation = completion.cancel_generation,
-                    "ordinary publication failed after early active cancellation",
-                );
-            }
-            Some(Ok(OwnerInput::Rejected(reason))) => {
-                tracing::warn!(
-                    publication_error = %error, cancel_rejection = %reason,
-                    "ordinary publication failed after consuming rejected cancellation input",
-                );
-            }
-            Some(Err(input_error)) => {
-                tracing::warn!(
-                    publication_error = %error, cancel_input_error = %input_error,
-                    "ordinary publication failed after consuming failed cancellation input",
-                );
-            }
-            None => {}
-        }
-        return Err(error);
-    }
-    pending.transpose()
-}
-
-#[cfg(feature = "guard-runtime")]
-#[allow(clippy::too_many_arguments)]
 async fn publish_guarded_tail_observation(
-    transport: &LcmTransport,
-    node: &ModuleNode,
-    scheduler: &nuwax_nav_runtime::NavSchedulerHandle,
-    snapshot: nuwax_nav_runtime::SchedulerStatus,
-    telemetry: &mut GuardedNavTelemetry,
-    planner_observation: Option<bool>,
-    publications: &mut GuardedStatusPublications,
-    cancels: &mut LcmFrameStream,
-    active_session: &mut Option<schema::GoalEnvelope>,
-    goal_buffer: &mut PlannerGoalBuffer,
-    last_cancel_terminal: &mut Option<GuardedCancelTerminal>,
-    watermark: &mut Option<GuardedCancelGenerationWatermark>,
-    arbiter: &mut GuardedNavArbiter,
+    transport: &LcmTransport, node: &ModuleNode, snapshot: nuwax_nav_runtime::SchedulerStatus,
+    telemetry: &mut GuardedNavTelemetry, planner_observation: Option<bool>,
+    publications: &mut GuardedStatusPublications, active_session: &mut Option<schema::GoalEnvelope>,
 ) -> NavStackResult<()> {
-    let pending = {
-        let eligible = active_session.as_ref().filter(|goal| {
-            snapshot.last_terminal.is_none()
-                && snapshot.session_id.as_deref() == Some(goal.session_id.as_str())
-        });
-        let publication = publish_guarded_nav_observation(
-            transport, node, snapshot.clone(), telemetry, planner_observation, publications,
-        );
-        await_guarded_tail_publication(
-            publication, scheduler, cancels, eligible, watermark, arbiter,
-        ).await?
-    };
-    // Keep the original snapshot. An early C may have made the scheduler terminal,
-    // but clearing with that newer status here would erase the Cancel's identity.
+    publish_guarded_nav_observation(transport, node, snapshot.clone(), telemetry, planner_observation, publications).await?;
     clear_terminal_session_after_publication(active_session, telemetry, &snapshot);
-    match pending {
-        None => Ok(()),
-        Some(OwnerInput::Rejected(reason)) => {
-            publish_guarded_rejection(
-                transport, &node.outputs[1], scheduler.status(), telemetry, "cancel", &reason,
-            ).await
-        }
-        Some(OwnerInput::Accepted(completion)) => {
-            finish_guarded_active_cancel(
-                transport, node, scheduler, completion, telemetry, active_session,
-                goal_buffer, last_cancel_terminal, publications,
-            ).await
-        }
-    }
-}
-
-#[cfg(feature = "guard-runtime")]
-#[allow(clippy::too_many_arguments)]
-async fn finish_guarded_active_cancel(
-    transport: &LcmTransport,
-    node: &ModuleNode,
-    scheduler: &nuwax_nav_runtime::NavSchedulerHandle,
-    completion: GuardedActiveCancelCompletion,
-    telemetry: &mut GuardedNavTelemetry,
-    active_session: &mut Option<schema::GoalEnvelope>,
-    goal_buffer: &mut PlannerGoalBuffer,
-    last_cancel_terminal: &mut Option<GuardedCancelTerminal>,
-    publications: &mut GuardedStatusPublications,
-) -> NavStackResult<()> {
-    let GuardedActiveCancelCompletion { active_goal, cancel, cancel_generation, result } = completion;
-    let mut candidate_telemetry = telemetry.clone();
-    candidate_telemetry.cancel_generation = cancel_generation;
-    candidate_telemetry.public_session_id = cancel.session_id.clone();
-    candidate_telemetry.owner_kind = cancel.owner_kind;
-    candidate_telemetry.parent_request_id = cancel.parent_request_id.clone();
-    candidate_telemetry.goal_generation = cancel.goal_generation;
-    candidate_telemetry.path_revision = 0;
-    candidate_telemetry.planner_runtime_generation = 0;
-    if let Err(error) = result {
-        match runtime_input_error::<()>("guarded_nav_scheduler.cancel", error)? {
-            OwnerInput::Rejected(reason) => {
-                publish_guarded_rejection(
-                    transport,
-                    &node.outputs[1],
-                    scheduler.status(),
-                    telemetry,
-                    "cancel",
-                    &reason,
-                )
-                .await?;
-                let snapshot = scheduler.status();
-                clear_terminal_session_after_publication(
-                    active_session,
-                    telemetry,
-                    &snapshot,
-                );
-                return Ok(());
-            }
-            OwnerInput::Accepted(()) => {
-                unreachable!("error classifier accepted an error")
-            }
-        }
-    }
-    *telemetry = candidate_telemetry;
-    publish_bool(transport, &node.outputs[3], true).await?;
-    let snapshot = scheduler.status();
-    publish_guarded_nav_observation(
-        transport,
-        node,
-        snapshot.clone(),
-        telemetry,
-        None,
-        publications,
-    )
-    .await?;
-    goal_buffer.clear_pending_goal_for(&active_goal);
-    *last_cancel_terminal =
-        goal_buffer
-            .is_newest_goal(&active_goal)
-            .then(|| GuardedCancelTerminal {
-                goal: active_goal,
-                cancel_generation,
-                status: snapshot.clone(),
-                telemetry: telemetry.clone(),
-            });
-    clear_terminal_session_after_publication(
-        active_session,
-        telemetry,
-        &snapshot,
-    );
     Ok(())
 }
 
@@ -3097,10 +2432,7 @@ async fn publish_guarded_nav_observation(
     let receipts=frames.iter().map(|frame|frame.payload.to_vec()).collect::<Vec<_>>();
     #[cfg(all(test,feature="surface-recovery-qualification"))]
     drop(fixture_copy);
-    #[cfg(all(test, feature = "surface-recovery-qualification"))]
-    guarded_tests::hold_test_publication_before_delegate(
-        &status, telemetry, planner_observation, &frames,
-    ).await;
+
     #[cfg(all(test,feature="surface-recovery-qualification"))]
     let publish=publications.qualification_timing.as_ref().map(|t|t.span("bridge.observation.publish_ack",status.costmap_source_timestamp_ns));
     transport
@@ -3109,8 +2441,7 @@ async fn publish_guarded_nav_observation(
         .map_err(|error| NavStackError::Internal(format!("publish guard status batch: {error}")))?;
     #[cfg(all(test,feature="surface-recovery-qualification"))]
     drop(publish);
-    #[cfg(all(test, feature = "surface-recovery-qualification"))]
-    guarded_tests::hold_test_publication_ack(&status, telemetry, planner_observation).await;
+
     #[cfg(test)]
     guarded_tests::record_test_publication(&receipts);
     Ok(())
@@ -3169,6 +2500,7 @@ fn build_guarded_navigation_state(
         0
     } else {
         match (status.phase, status.last_terminal) {
+            (_, Some(TerminalOutcome::Stopped)) => 4,
             (_, Some(TerminalOutcome::Succeeded)) => 3,
             (_, Some(TerminalOutcome::Cancelled | TerminalOutcome::Shutdown)) => 0,
             (SchedulerPhase::Failed, _) => 4,
@@ -3181,6 +2513,7 @@ fn build_guarded_navigation_state(
         "IDLE: guard client heartbeat".to_string()
     } else {
         match status.last_terminal {
+            Some(TerminalOutcome::Stopped) => "STOPPED: 已被停止".into(),
             Some(TerminalOutcome::Cancelled) => format!("CANCELLED: {}", status.message),
             _ => status.message.clone(),
         }
@@ -3213,16 +2546,8 @@ fn build_guarded_navigation_state(
             String::new()
         },
         cancel_generation: saturating_i64(telemetry.cancel_generation),
-        zero_ack_id: if has_public_session {
-            status.last_zero_ack_id.clone().unwrap_or_default()
-        } else {
-            String::new()
-        },
-        zero_applied_monotonic_ns: if has_public_session {
-            saturating_i64(status.last_fence_monotonic_ns)
-        } else {
-            0
-        },
+        zero_ack_id: String::new(),
+        zero_applied_monotonic_ns: 0,
         owner_kind: telemetry.owner_kind,
         parent_request_id: telemetry.parent_request_id.clone(),
         goal_generation: telemetry.goal_generation,
@@ -3258,7 +2583,7 @@ fn guarded_rejection_status(
 ) -> nuwax_nav_runtime::SchedulerStatus {
     // 停车中的原因和已确认终态不能被迟到路径的协议拒绝覆盖。
     if input=="path" && (status.last_terminal.is_some() || matches!(status.phase,
-        nuwax_nav_runtime::SchedulerPhase::Cancelling|nuwax_nav_runtime::SchedulerPhase::Fencing|nuwax_nav_runtime::SchedulerPhase::Failed)) {
+        nuwax_nav_runtime::SchedulerPhase::Cancelling|nuwax_nav_runtime::SchedulerPhase::Failed)) {
         tracing::debug!(reason,session_id=?status.session_id,"迟到路径被拒绝，保留原停车或终态原因");
         return status;
     }
@@ -3922,44 +3247,11 @@ impl NavigationBoundary {
 fn navigation_boundary_from_goal(
     goal: &schema::GoalEnvelope,
 ) -> NavStackResult<Option<NavigationBoundary>> {
-    match goal.owner_kind {
-        schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV => {
-            if goal.boundary_frame_id.is_empty() && goal.boundary_points.is_empty() {
-                Ok(None)
-            } else {
-                Err(NavStackError::InvalidConfig(
-                    "PUBLIC_NAV goal must not carry a navigation boundary".into(),
-                ))
-            }
-        }
-        schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD => {
-            if goal.boundary_points.is_empty() {
-                return if goal.boundary_frame_id.is_empty() {
-                    Ok(None)
-                } else {
-                    Err(NavStackError::InvalidConfig(
-                        "empty exploration boundary must not carry a frame".into(),
-                    ))
-                };
-            }
-            if goal.boundary_frame_id != "map" {
-                return Err(NavStackError::InvalidConfig(
-                    "exploration navigation boundary frame must be map".into(),
-                ));
-            }
-            let boundary = NavigationBoundary::new(&goal.boundary_points)?;
-            let goal_point = Point2::new(goal.goal.pose.position[0], goal.goal.pose.position[1]);
-            if !boundary.contains(goal_point) {
-                return Err(NavStackError::InvalidConfig(
-                    "exploration goal must lie inside its navigation boundary".into(),
-                ));
-            }
-            Ok(Some(boundary))
-        }
-        owner => Err(NavStackError::InvalidConfig(format!(
-            "unsupported navigation boundary owner kind {owner}"
-        ))),
-    }
+    if goal.boundary_points.is_empty() { return Ok(None); }
+    let boundary = NavigationBoundary::new(&goal.boundary_points)?;
+    let point = Point2::new(goal.goal.pose.position[0], goal.goal.pose.position[1]);
+    if !boundary.contains(point) { return Err(NavStackError::InvalidConfig("探索目标不在边界内".into())); }
+    Ok(Some(boundary))
 }
 
 #[cfg(any(
@@ -3971,7 +3263,6 @@ fn navigation_boundary_from_goal(
 #[allow(clippy::enum_variant_names)]
 enum PlannerGoalRejectReason {
     DuplicateLease,
-    SupersededLease,
     ConflictingLease,
 }
 
@@ -4134,9 +3425,7 @@ fn clear_planner_goal_for_costmap_advance(
     feature = "simple-2d",
     feature = "replanning-astar"
 ))]
-fn planner_goal_order(goal: &schema::GoalEnvelope) -> (i64, i64) {
-    (goal.producer_runtime_generation, goal.goal_generation)
-}
+
 
 #[cfg(any(
     feature = "guard-runtime",
@@ -4150,30 +3439,7 @@ fn planner_goal_identity_matches(
     left: &schema::GoalEnvelope,
     right: &schema::GoalEnvelope,
 ) -> bool {
-    left.session_id == right.session_id
-        && left.owner_kind == right.owner_kind
-        && left.parent_request_id == right.parent_request_id
-        && left.goal_generation == right.goal_generation
-        && left.producer == right.producer
-        && left.producer_epoch == right.producer_epoch
-        && left.producer_runtime_generation == right.producer_runtime_generation
-        && left.committed_map_session_id == right.committed_map_session_id
-        && left.committed_map_session_generation == right.committed_map_session_generation
-        && left.committed_map_revision == right.committed_map_revision
-        && left.committed_map_boot_nonce == right.committed_map_boot_nonce
-        && left.committed_map_commit_sequence == right.committed_map_commit_sequence
-        && left.committed_map_source_timestamp_ns == right.committed_map_source_timestamp_ns
-        && left.committed_map_frame_id == right.committed_map_frame_id
-        && left.boundary_id == right.boundary_id
-        && left.boundary_frame_id == right.boundary_frame_id
-        && left.boundary_points == right.boundary_points
-        && left.goal.pose == right.goal.pose
-        && left.goal.header.frame_id == right.goal.header.frame_id
-        && left.options == right.options
-        && left.body_reference_frame_id == right.body_reference_frame_id
-        && left.map_frame_generation == right.map_frame_generation
-        && left.motion_guard_boot_nonce == right.motion_guard_boot_nonce
-        && left.motion_stop_generation == right.motion_stop_generation
+    left == right
 }
 
 #[cfg(any(
@@ -4185,19 +3451,10 @@ fn validate_goal_envelope_order(
     candidate: &schema::GoalEnvelope,
     newest: &schema::GoalEnvelope,
 ) -> Result<(), PlannerGoalRejectReason> {
-    match planner_goal_order(candidate).cmp(&planner_goal_order(newest)) {
-        std::cmp::Ordering::Less => Err(PlannerGoalRejectReason::SupersededLease),
-        std::cmp::Ordering::Equal => {
-            if planner_goal_identity_matches(candidate, newest)
-
-            {
-                Err(PlannerGoalRejectReason::DuplicateLease)
-            } else {
-                Err(PlannerGoalRejectReason::ConflictingLease)
-            }
-        }
-        std::cmp::Ordering::Greater => Ok(()),
-    }
+    if candidate.session_id == newest.session_id {
+        if candidate == newest { Err(PlannerGoalRejectReason::DuplicateLease) }
+        else { Err(PlannerGoalRejectReason::ConflictingLease) }
+    } else { Ok(()) }
 }
 
 #[cfg(any(
@@ -4409,24 +3666,9 @@ fn validate_newer_source_timestamp(
     }
 }
 
-fn decode_configured_goal_envelope(
-    payload: &[u8],
-    body_reference_frame_id: &str,
-) -> nuwax_codec::CodecResult<schema::GoalEnvelope> {
-    let message = schema::decode_goal_envelope_body(payload)?;
-    validate_goal_reference(&message, body_reference_frame_id)?;
-    Ok(message)
-}
 
-fn validate_goal_reference(
-    message: &schema::GoalEnvelope,
-    body_reference_frame_id: &str,
-) -> nuwax_codec::CodecResult<()> {
-    if message.body_reference_frame_id != body_reference_frame_id {
-        return Err(nuwax_codec::CodecError::LcmDecode("navigation body reference differs across owners".into()));
-    }
-    Ok(())
-}
+
+
 
 pub(crate) fn capture_body_reference() -> Result<Arc<str>, String> {
     let body = configured_frame("NUWAX_BASE_FRAME", "base_link")
@@ -4485,7 +3727,7 @@ fn apply_simple_planner_goal(
     }
     module.set_goal_yaw(pose.pose.orientation.yaw());
     // 目标身份保留原信封，自主导航只收窄其允许的运动方向。
-    module.set_goal_options(nuwax_nav_types_messages::GoalOptions {allow_reverse:false,..envelope.options})
+    module.set_goal_options(nuwax_nav_types_messages::GoalOptions {allow_reverse:false,..envelope.options()})
         .map_err(|error|module_error("simple_planner.goal_options",error))?;
     Ok(OwnerInput::Accepted((envelope, boundary)))
 }
@@ -4580,10 +3822,10 @@ fn far_key_matches_goal(
         && key.backend == "far-visibility-graph"
         && key.runtime_generation == accepted_generation
         && key.session_id == goal.session_id
-        && key.owner_kind == goal.owner_kind
+        && key.owner_kind == schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV
         && key.parent_request_id == goal.parent_request_id
-        && key.goal_generation == goal.goal_generation
-        && key.producer_runtime_generation == goal.producer_runtime_generation
+        && key.goal_generation == goal.motion_generation as i64
+        && key.producer_runtime_generation == 0
         && key.planner_runtime_generation == accepted_generation
 }
 
@@ -4619,9 +3861,8 @@ fn take_far_join(
 
 #[cfg(any(feature = "cmu-native", feature = "explore"))]
 fn native_path_respects_goal(path: &Path2D, goal: &schema::GoalEnvelope) -> bool {
-    goal.committed_map_frame_id == "map"
-        && goal.goal.header.frame_id == goal.committed_map_frame_id
-        && path.frame_id.as_str() == goal.committed_map_frame_id
+    goal.goal.header.frame_id == "map"
+        && path.frame_id.as_str() == goal.goal.header.frame_id
         && navigation_boundary_from_goal(goal)
             .ok()
             .is_some_and(|boundary| {
@@ -4638,14 +3879,7 @@ fn admit_native_adapter_goal(
         *latest_goal = Some(candidate);
         return true;
     };
-    let current_order = (current.producer_runtime_generation, current.goal_generation);
-    let candidate_order = (
-        candidate.producer_runtime_generation,
-        candidate.goal_generation,
-    );
-    if candidate_order <= current_order {
-        return false;
-    }
+    if candidate.session_id == current.session_id { return false; }
     *latest_goal = Some(candidate);
     true
 }
@@ -4713,7 +3947,7 @@ async fn run_native_planner_path_adapter_with_transport(
             _ = &mut shutdown => break,
             frame = goals.next() => {
                 let frame = required_frame(frame, "native_planner_path_adapter.goal")?;
-                let goal = match decode_configured_goal_envelope(&frame.payload, &body_reference_frame_id) {
+                let goal = match schema::decode_goal_envelope_body(&frame.payload) {
                     Ok(goal) => goal,
                     Err(_) => continue,
                 };
@@ -4754,7 +3988,7 @@ async fn run_native_planner_path_adapter_with_transport(
                     let Some(goal) = latest_goal.as_ref() else { continue; };
                     let Some(key) = far_join_key(&state) else { continue; };
                     if !far_key_matches_goal(&key, goal, accepted_generation)
-                        || state.planner_map_frame != goal.committed_map_frame_id
+                        || state.planner_map_frame != goal.goal.header.frame_id
                         || state.planner_pose_frame != goal.goal.header.frame_id
                         || consumed_far_results.contains(&key)
                     {
@@ -4816,7 +4050,7 @@ async fn run_native_planner_path_adapter_with_transport(
                         let Some(goal) = latest_goal.as_ref() else { continue; };
                         let Some(key) = far_join_key(&state) else { continue; };
                         if !far_key_matches_goal(&key, goal, accepted_generation)
-                            || state.planner_map_frame != goal.committed_map_frame_id
+                            || state.planner_map_frame != goal.goal.header.frame_id
                             || state.planner_pose_frame != goal.goal.header.frame_id
                             || consumed_far_results.contains(&key)
                         {
@@ -5018,7 +4252,7 @@ async fn run_simple_planner(
             }
             message = goal_pose.next() => {
                 let frame = required_frame(message, "simple_planner.goal_pose")?;
-                let envelope = match decode_configured_goal_envelope(&frame.payload, &body_reference_frame_id) {
+                let envelope = match schema::decode_goal_envelope_body(&frame.payload) {
                     Ok(envelope) => envelope,
                     Err(error) => {
                         diagnostics.reject("simple_planner.goal_pose", &error.to_string());
@@ -5434,7 +4668,7 @@ async fn run_astar_planner_with_transport(
             }
             message = goal.next() => {
                 let frame = required_frame(message, "astar_planner.goal")?;
-                let envelope = match decode_configured_goal_envelope(&frame.payload, &body_reference_frame_id) {
+                let envelope = match schema::decode_goal_envelope_body(&frame.payload) {
                     Ok(envelope) => envelope,
                     Err(error) => {
                         diagnostics.reject("astar_planner.goal", &error.to_string());
@@ -6426,7 +5660,7 @@ fn build_versioned_path_envelope(
         source_timestamp_ns / 1_000_000_000,
         (source_timestamp_ns % 1_000_000_000) as u32,
     );
-    let header = schema_header(stamp, publication.goal.committed_map_frame_id.as_str())?;
+    let header = schema_header(stamp, publication.goal.goal.header.frame_id.as_str())?;
     let path = schema::Path {
         header: header.clone(),
         poses: publication
@@ -6481,19 +5715,14 @@ fn build_versioned_path_from_schema(
     path: schema::Path,
 ) -> NavStackResult<schema::PathEnvelope> {
     let envelope = schema::PathEnvelope {
-        route_kind: 0,
-        schema_version: schema::PATH_ENVELOPE_SCHEMA_VERSION,
-        session_id: goal.session_id.clone(),
-
-        goal_generation: goal.goal_generation,
-
-        producer_runtime_generation: goal.producer_runtime_generation,
-
-        planner_runtime_generation: planner_runtime_generation,
-        path_revision: path_revision,
-
-        path,
-    };
+route_kind: 0,
+schema_version: schema::PATH_ENVELOPE_SCHEMA_VERSION,
+session_id: goal.session_id.clone(),
+motion_generation: goal.motion_generation,
+planner_runtime_generation: planner_runtime_generation,
+path_revision: path_revision,
+path: path
+};
     Ok(envelope)
 }
 
@@ -6653,36 +5882,16 @@ fn prefixed(fingerprint: [u8; 8], body: &[u8]) -> Vec<u8> {
 #[cfg(all(test, any(feature = "simple-2d", feature = "replanning-astar")))]
 fn planner_test_goal(session_id: &str, goal_generation: i64) -> schema::GoalEnvelope {
     let mut goal = schema::GoalEnvelope {
-            body_reference_frame_id: "base_link".into(),
-        schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
-        session_id: session_id.into(),
-        owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
-        parent_request_id: "explore-parent".into(),
-        goal_generation,
-        producer: "wavefront".into(),
-        producer_epoch: 13,
-        producer_runtime_generation: 17,
-        committed_map_session_id: "planner-test-map".into(),
-        committed_map_session_generation: 3,
-        committed_map_revision: 5,
-        committed_map_boot_nonce: [0x31; 16],
-        committed_map_commit_sequence: 1,
-        committed_map_source_timestamp_ns: 1,
-        committed_map_frame_id: "map".into(),
-        source_timestamp_ns: goal_generation * 1_000_000_000,
-        boundary_id: "explore-parent:boundary".into(),
-        boundary_frame_id: "map".into(),
-        boundary_points: vec![
+session_id: session_id.into(),
+boundary_points: vec![
             [0.0, 0.0, 0.0],
             [5.0, 0.0, 0.0],
             [5.0, 5.0, 0.0],
             [0.0, 5.0, 0.0],
             [0.0, 0.0, 0.0],
         ],
-
-        motion_guard_boot_nonce: [7; 16],
-        motion_stop_generation: 1,
-        goal: schema::PoseStamped {
+motion_generation: 1,
+goal: schema::PoseStamped {
             header: schema::Header {
                 seq: i32::try_from(goal_generation).expect("test generation fits i32"),
                 stamp_sec: i32::try_from(goal_generation).expect("test generation fits i32"),
@@ -6694,8 +5903,8 @@ fn planner_test_goal(session_id: &str, goal_generation: i64) -> schema::GoalEnve
                 orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
             },
         },
-        ..schema::GoalEnvelope::default()
-    };
+..schema::GoalEnvelope::default()
+};
 
     schema::validate_goal_envelope(&goal).expect("seal planner test goal");
     goal
@@ -6729,59 +5938,8 @@ fn planner_test_grid_body(revision: i32) -> Vec<u8> {
 mod planner_goal_buffer_tests {
     use super::*;
 
-    struct GeometryProducerFixture {
-        producer_runtime_generation: i64,
-    }
-
-    impl GeometryProducerFixture {
-        fn goal(&self, session_id: &str, goal_generation: i64) -> schema::GoalEnvelope {
-            let mut goal = planner_test_goal(session_id, goal_generation);
-            goal.producer_runtime_generation = self.producer_runtime_generation;
-            schema::validate_goal_envelope(&goal).expect("seal producer fixture goal");
-            goal
-        }
-    }
-
     #[test]
-    fn retained_nav_owner_accepts_new_goal_after_geometry_producer_restart() {
-        let mut nav_owner = PlannerGoalBuffer::default();
-        let first_goal = {
-            let first_geometry = GeometryProducerFixture {
-                producer_runtime_generation: 41,
-            };
-            assert!(nav_owner.observe_costmap().is_none());
-            let first_goal = first_geometry.goal("before-restart", 7);
-            let ready_first = match nav_owner.observe_goal(first_goal.clone()) {
-                PlannerGoalIngress::Ready(goal) => *goal,
-                outcome => panic!("first producer goal must be ready: {outcome:?}"),
-            };
-            assert!(nav_owner.mark_applied(&ready_first));
-            first_goal
-        };
-
-        // The nav owner and its ordering memory remain alive while the geometry
-        // producer is recreated. Goal generation may restart at one because the
-        // durably allocated producer epoch is strictly newer.
-        let restarted_geometry = GeometryProducerFixture {
-            producer_runtime_generation: 42,
-        };
-        let restarted_goal = restarted_geometry.goal("after-restart", 1);
-        let ready_restarted = match nav_owner.observe_goal(restarted_goal.clone()) {
-            PlannerGoalIngress::Ready(goal) => *goal,
-            outcome => panic!("restarted producer goal must activate: {outcome:?}"),
-        };
-        assert!(!nav_owner.has_applied_goal());
-        assert_eq!(ready_restarted, restarted_goal);
-        assert!(nav_owner.mark_applied(&ready_restarted));
-        assert!(nav_owner.has_applied_goal());
-        assert!(matches!(
-            nav_owner.observe_goal(first_goal),
-            PlannerGoalIngress::Rejected(PlannerGoalRejectReason::SupersededLease)
-        ));
-    }
-
-    #[test]
-    fn goal_generation_orders_the_newest_goal_lease() {
+    fn arrival_order_keeps_the_newest_goal_and_rejects_duplicate_goal() {
         let mut buffer = PlannerGoalBuffer::default();
         assert!(buffer.observe_costmap().is_none());
 
@@ -6800,8 +5958,8 @@ mod planner_goal_buffer_tests {
         assert!(!buffer.has_applied_goal());
         assert!(buffer.mark_applied(&ready_second));
         assert!(matches!(
-            buffer.observe_goal(first),
-            PlannerGoalIngress::Rejected(PlannerGoalRejectReason::SupersededLease)
+            buffer.observe_goal(second),
+            PlannerGoalIngress::Rejected(PlannerGoalRejectReason::DuplicateLease)
         ));
         assert!(buffer.observe_costmap().is_none());
         assert!(buffer.observe_costmap().is_none());
@@ -7356,11 +6514,6 @@ mod simple_tests {
             active_goal.as_ref().unwrap().goal_key()
         );
         assert!(matches!(
-            buffer.observe_goal(goal_12),
-            PlannerGoalIngress::Rejected(PlannerGoalRejectReason::SupersededLease)
-        ));
-        assert!(buffer.observe_costmap().is_none());
-        assert!(matches!(
             buffer.observe_goal(goal_13),
             PlannerGoalIngress::Rejected(PlannerGoalRejectReason::DuplicateLease)
         ));
@@ -7416,6 +6569,7 @@ mod simple_tests {
 
 #[cfg(all(test, feature = "guard-runtime"))]
 mod guarded_tests {
+    include!("guard_protocol_tests.rs");
     fn planar_test_costmap(
         observation: &nuwax_nav_runtime::CostmapObservation,
     ) -> &nuwax_nav_astar::navigation_map::CostMap2D {
@@ -7429,44 +6583,6 @@ mod guarded_tests {
     use futures::channel::mpsc::{unbounded, UnboundedSender};
     use nuwax_nav_runtime::{NavMotionPort, NavSchedulerHandle, RuntimeError, SchedulerPhase, TerminalOutcome};
     use tokio::task::JoinHandle;
-
-    #[cfg(feature = "surface-recovery-qualification")]
-    mod ordinary_ack_cancel_tests {
-        use super::*;
-        include!("guarded_ordinary_ack_cancel_tests.rs");
-    }
-
-    #[cfg(feature = "surface-recovery-qualification")]
-    mod ingress_ack_tests {
-        use super::*;
-        include!("guarded_ingress_ack_tests.rs");
-    }
-
-    #[cfg(feature = "surface-recovery-qualification")]
-    pub(super) async fn hold_test_publication_ack(
-        status: &nuwax_nav_runtime::SchedulerStatus,
-        telemetry: &GuardedNavTelemetry,
-        planner_observation: Option<bool>,
-    ) {
-        ingress_ack_tests::hold_publication_ack(status, telemetry, planner_observation).await;
-    }
-
-    #[cfg(feature = "surface-recovery-qualification")]
-    pub(super) async fn hold_test_publication_before_delegate(
-        status: &nuwax_nav_runtime::SchedulerStatus,
-        telemetry: &GuardedNavTelemetry,
-        planner_observation: Option<bool>,
-        frames: &[RawLcmFrame],
-    ) {
-        ingress_ack_tests::hold_publication_before_delegate(
-            status, telemetry, planner_observation, frames,
-        ).await;
-    }
-
-    #[cfg(feature = "surface-recovery-qualification")]
-    pub(super) fn record_ack_return_cancel(phase: &'static str, cancel: &schema::CancelNavigation) {
-        ingress_ack_tests::record_cancel(phase, cancel);
-    }
 
     #[test]
     fn arbiter_rotates_all_simultaneously_ready_sources() {
@@ -7635,8 +6751,7 @@ mod guarded_tests {
                 let state = schema::decode_navigation_state_body(&frame.payload)
                     .expect("real status NavigationState");
                 if state.session_id == goal.session_id
-                    && !state.zero_ack_id.is_empty()
-                    && state.zero_applied_monotonic_ns > 0
+                    && state.state == 3
                 {
                     return (state,frame.payload.to_vec());
                 }
@@ -7650,7 +6765,7 @@ mod guarded_tests {
             harness.scheduler.status().last_terminal,
             Some(TerminalOutcome::Succeeded)
         );
-        assert!(!terminal.zero_ack_id.is_empty());
+        assert!(terminal.zero_ack_id.is_empty());
         assert!(
             !harness.loop_task.is_finished(),
             "single owner loop remains live"
@@ -7939,8 +7054,7 @@ mod guarded_tests {
             OwnerInput::Rejected(_)
         ));
         assert!(runtime_input_error::<()>(
-            "guarded arbitration",
-            RuntimeError::InvalidFence("missing zero proof".into()),
+            "guarded arbitration", RuntimeError::Motion("传输失败".into()),
         )
         .is_err());
         assert!(matches!(
@@ -7955,35 +7069,16 @@ mod guarded_tests {
 
     fn active_goal(session_id: &str) -> schema::GoalEnvelope {
         schema::GoalEnvelope {
-            body_reference_frame_id: "base_link".into(),
-            session_id: session_id.into(),
-            ..schema::GoalEnvelope::default()
-        }
+session_id: session_id.into(),
+..schema::GoalEnvelope::default()
+}
     }
 
     fn sealed_goal(session_id: &str) -> schema::GoalEnvelope {
         let mut goal = schema::GoalEnvelope {
-            body_reference_frame_id: "base_link".into(),
-            schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
-            session_id: session_id.into(),
-            owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
-            parent_request_id: "public-api-request-1".into(),
-            goal_generation: 3,
-            producer: "public-navigation".into(),
-            producer_epoch: 7,
-            producer_runtime_generation: 7,
-            committed_map_session_id: "guarded-test-map".into(),
-            committed_map_session_generation: 2,
-            committed_map_revision: 4,
-            committed_map_boot_nonce: [0x42; 16],
-            committed_map_commit_sequence: 1,
-            committed_map_source_timestamp_ns: 1,
-            committed_map_frame_id: "map".into(),
-            source_timestamp_ns: 1_000_000_000,
-
-            motion_guard_boot_nonce: [7; 16],
-            motion_stop_generation: 1,
-            goal: schema::PoseStamped {
+session_id: session_id.into(),
+motion_generation: 1,
+goal: schema::PoseStamped {
                 header: schema::Header {
                     stamp_sec: 1,
                     frame_id: "map".into(),
@@ -7994,26 +7089,21 @@ mod guarded_tests {
                     orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
                 },
             },
-            ..schema::GoalEnvelope::default()
-        };
+..schema::GoalEnvelope::default()
+};
         schema::validate_goal_envelope(&goal).expect("seal goal");
         goal
     }
 
     fn sealed_path(goal: &schema::GoalEnvelope) -> schema::PathEnvelope {
         let mut path = schema::PathEnvelope {
-            route_kind: 0,
-            schema_version: schema::PATH_ENVELOPE_SCHEMA_VERSION,
-            session_id: goal.session_id.clone(),
-
-            goal_generation: goal.goal_generation,
-
-            producer_runtime_generation: goal.producer_runtime_generation,
-
-            planner_runtime_generation: saturating_i64(runtime_generation()),
-            path_revision: 1,
-
-                path: schema::Path {
+route_kind: 0,
+schema_version: schema::PATH_ENVELOPE_SCHEMA_VERSION,
+session_id: goal.session_id.clone(),
+motion_generation: goal.motion_generation as u64,
+planner_runtime_generation: saturating_i64(runtime_generation()),
+path_revision: 1,
+path: schema::Path {
                 header: schema::Header {
                     stamp_sec: 2,
                     frame_id: "map".into(),
@@ -8028,8 +7118,8 @@ mod guarded_tests {
                     pose: goal.goal.pose.clone(),
                 }],
             },
-            ..schema::PathEnvelope::default()
-        };
+..schema::PathEnvelope::default()
+};
         schema::validate_path_envelope(&path).expect("seal path");
         path
     }
@@ -8042,9 +7132,9 @@ mod guarded_tests {
     ) -> schema::GoalEnvelope {
         let mut goal = previous.clone();
         goal.session_id = session_id.into();
-        goal.producer_runtime_generation = producer_runtime_generation;
-        goal.goal_generation = goal_generation;
-        goal.source_timestamp_ns = goal.source_timestamp_ns.saturating_add(1_000_000_000);
+        let _ = producer_runtime_generation;
+        goal.motion_generation = goal_generation as u64;
+
         schema::validate_goal_envelope(&goal).expect("seal rollover goal");
         goal
     }
@@ -8102,168 +7192,32 @@ mod guarded_tests {
 
     #[async_trait::async_trait]
     impl nuwax_nav_runtime::NavMotionPort for FirstAcquireMotion {
-        async fn acquire(&mut self, operation_id: &str, admission: &nuwax_nav_runtime::NavMotionAdmission)
-            -> Result<nuwax_nav_runtime::LeaseProof, nuwax_nav_runtime::MotionPortError>
-        {
+        async fn acquire(&mut self,generation:u64)->Result<u64,nuwax_nav_runtime::MotionPortError> {
             if self.reject_first {
-                self.reject_first = false;
-                self.inner.0.lock().unwrap().push(format!("rejected_acquire:{operation_id}"));
-                return Err(nuwax_nav_runtime::MotionPortError::definite_no_lease("STALE_STOP_GENERATION"));
+                self.reject_first=false;
+                self.inner.0.lock().unwrap().push("rejected_acquire:".into());
+                return Err(nuwax_nav_runtime::MotionPortError {message:"代次过期".into(),code:Some(nuwax_motion_safety_guard::wire::ErrorCode::StaleGeneration)});
             }
-            self.inner.acquire(operation_id, admission).await
+            self.inner.acquire(generation).await
         }
+        async fn velocity(&mut self,twist:Twist2)->Result<(),nuwax_nav_runtime::MotionPortError> { self.inner.velocity(twist).await }
+        async fn release(&mut self)->Result<(),nuwax_nav_runtime::MotionPortError> { self.inner.release().await }
 
-        async fn renew(&mut self, operation_id: &str) -> Result<(), nuwax_nav_runtime::MotionPortError> {
-            self.inner.renew(operation_id).await
-        }
+}
 
-        async fn submit_twist(&mut self, operation_id: &str, twist: Twist2)
-            -> Result<nuwax_nav_runtime::AppliedProof, nuwax_nav_runtime::MotionPortError>
-        {
-            self.inner.submit_twist(operation_id, twist).await
-        }
-
-        async fn revoke_and_zero(&mut self, operation_id: &str)
-            -> Result<Option<nuwax_nav_runtime::FenceProof>, nuwax_nav_runtime::MotionPortError>
-        {
-            self.inner.revoke_and_zero(operation_id).await
-        }
-    }
-
+    #[async_trait::async_trait]
     impl nuwax_nav_runtime::NavMotionPort for RecordingMotion {
-        fn acquire<'life0, 'life1, 'life2, 'async_trait>(
-            &'life0 mut self,
-            operation_id: &'life1 str,
-            admission: &'life2 nuwax_nav_runtime::NavMotionAdmission,
-        ) -> Pin<
-            Box<
-                dyn Future<
-                        Output = Result<
-                            nuwax_nav_runtime::LeaseProof,
-                            nuwax_nav_runtime::MotionPortError,
-                        >,
-                    > + Send
-                    + 'async_trait,
-            >,
-        >
-        where
-            'life0: 'async_trait,
-            'life1: 'async_trait,
-            'life2: 'async_trait,
-            Self: 'async_trait,
-        {
-            Box::pin(async move {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .push(format!("acquire:{operation_id}"));
-                Ok(nuwax_nav_runtime::LeaseProof {
-                    lease_id: 11,
-
-                })
-            })
+        async fn acquire(&mut self,generation:u64)->Result<u64,nuwax_nav_runtime::MotionPortError> {
+            self.0.lock().unwrap().push(format!("acquire:{generation}")); Ok(generation)
+        }
+        async fn velocity(&mut self,_twist:Twist2)->Result<(),nuwax_nav_runtime::MotionPortError> {
+            self.0.lock().unwrap().push("twist:".into()); Ok(())
+        }
+        async fn release(&mut self)->Result<(),nuwax_nav_runtime::MotionPortError> {
+            self.0.lock().unwrap().push("release:".into()); Ok(())
         }
 
-        fn renew<'life0, 'life1, 'async_trait>(
-            &'life0 mut self,
-            operation_id: &'life1 str,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<(), nuwax_nav_runtime::MotionPortError>>
-                    + Send
-                    + 'async_trait,
-            >,
-        >
-        where
-            'life0: 'async_trait,
-            'life1: 'async_trait,
-            Self: 'async_trait,
-        {
-            Box::pin(async move {
-                self.0.lock().unwrap().push(format!("renew:{operation_id}"));
-                Ok(())
-            })
-        }
-
-        fn submit_twist<'life0, 'life1, 'async_trait>(
-            &'life0 mut self,
-            operation_id: &'life1 str,
-            _twist: Twist2,
-        ) -> Pin<
-            Box<
-                dyn Future<
-                        Output = Result<
-                            nuwax_nav_runtime::AppliedProof,
-                            nuwax_nav_runtime::MotionPortError,
-                        >,
-                    > + Send
-                    + 'async_trait,
-            >,
-        >
-        where
-            'life0: 'async_trait,
-            'life1: 'async_trait,
-            Self: 'async_trait,
-        {
-            Box::pin(async move {
-                self.0.lock().unwrap().push(format!("twist:{operation_id}"));
-                Ok(nuwax_nav_runtime::AppliedProof {
-                    operation_id: operation_id.into(),
-                    applied_monotonic_ns: 99,
-                })
-            })
-        }
-
-        fn submit_twist_bounded<'life0, 'life1, 'async_trait>(
-            &'life0 mut self,
-            operation_id: &'life1 str,
-            twist: Twist2,
-            bound: Option<nuwax_nav_runtime::CommandDispatchBound>,
-        ) -> Pin<Box<dyn Future<Output = Result<nuwax_nav_runtime::BoundedTwistOutcome,
-            nuwax_nav_runtime::MotionPortError>> + Send + 'async_trait>>
-        where
-            'life0: 'async_trait,
-            'life1: 'async_trait,
-            Self: 'async_trait,
-        {
-            Box::pin(async move {
-                // 夹具实现真实接口语义，过期命令不得进入记录端或获得已执行回执。
-                if bound.is_some_and(nuwax_nav_runtime::CommandDispatchBound::expired_now) {
-                    return Ok(nuwax_nav_runtime::BoundedTwistOutcome::ExpiredNotApplied);
-                }
-                self.submit_twist(operation_id, twist).await.map(nuwax_nav_runtime::BoundedTwistOutcome::Applied)
-            })
-        }
-
-        fn revoke_and_zero<'life0, 'life1, 'async_trait>(
-            &'life0 mut self,
-            operation_id: &'life1 str,
-        ) -> Pin<
-            Box<
-                dyn Future<
-                        Output = Result<
-                            Option<nuwax_nav_runtime::FenceProof>,
-                            nuwax_nav_runtime::MotionPortError,
-                        >,
-                    > + Send
-                    + 'async_trait,
-            >,
-        >
-        where
-            'life0: 'async_trait,
-            'life1: 'async_trait,
-            Self: 'async_trait,
-        {
-            Box::pin(async move {
-                self.0.lock().unwrap().push(format!("zero:{operation_id}"));
-                Ok(Some(nuwax_nav_runtime::FenceProof {
-                    zero_ack_id: "zero-pending-goal".into(),
-                    applied_monotonic_ns: 100,
-                    lease: nuwax_nav_runtime::FenceLeaseState::Idle,
-                }))
-            })
-        }
-    }
+}
 
     struct CommandingPlanner {
         succeeds: Arc<std::sync::atomic::AtomicBool>,
@@ -8578,9 +7532,7 @@ mod guarded_tests {
 
     #[derive(Default)]
     struct PublicationProbe {
-        #[cfg(feature = "surface-recovery-qualification")]
-        ack_return_probe: Option<ingress_ack_tests::AckReturnProbe>,
-        ledgers:Option<(Arc<GuardedDequeueLedger>,Arc<GuardedDequeueLedger>)>,
+            ledgers:Option<(Arc<GuardedDequeueLedger>,Arc<GuardedDequeueLedger>)>,
         entries:std::collections::BTreeMap<Vec<u8>,(usize,usize)>,
     }
     tokio::task_local! {static PUBLICATION_PROBE:Arc<Mutex<PublicationProbe>>;}
@@ -8634,6 +7586,12 @@ mod guarded_tests {
         }
 
         async fn spawn_with_first_acquire(planar_mode:bool, body_reference: &'static str, reject_first: bool) -> Self {
+            let calls=Arc::new(Mutex::new(Vec::new()));
+            Self::spawn_with_motion(planar_mode,body_reference,
+                FirstAcquireMotion {inner:RecordingMotion(calls.clone()),reject_first},calls).await
+        }
+
+        async fn spawn_with_motion<M:nuwax_nav_runtime::NavMotionPort>(planar_mode:bool, body_reference: &'static str, motion:M, motion_calls:Arc<Mutex<Vec<String>>>) -> Self {
             static NEXT_LOOP_ID: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             let loop_id = NEXT_LOOP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -8641,21 +7599,20 @@ mod guarded_tests {
             // Functional owner/codec checks do not require a host multicast route.
             let transport = LcmTransport::new_real("memq://")
                 .expect("guarded loop test LCM memq");
-            let motion_calls = Arc::new(Mutex::new(Vec::<String>::new()));
             let planner_succeeds = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let planner_twist = Arc::new(Mutex::new(Twist2 {
                 linear: Point2::new(0.2, 0.0),
                 angular_z: 0.1,
             }));
             let scheduler = nuwax_nav_runtime::NavScheduler::new(
-                FirstAcquireMotion { inner: RecordingMotion(Arc::clone(&motion_calls)), reject_first },
+                motion,
                 CommandingPlanner {
                     succeeds: Arc::clone(&planner_succeeds),
                     twist: Arc::clone(&planner_twist),
                 },
                 nuwax_nav_runtime::SchedulerConfig {
                     tick_interval: Duration::from_millis(5),
-                    renew_interval: Duration::from_millis(100),
+
                     path_wait_timeout: Duration::from_secs(5),
                     pose_ttl: Duration::from_secs(5),
                     costmap_ttl: Duration::from_secs(5),
@@ -8801,10 +7758,10 @@ mod guarded_tests {
                 session_id: goal.session_id.clone(),
                 reason: 1,
                 cancel_generation,
-                owner_kind: goal.owner_kind,
-                parent_request_id: goal.parent_request_id.clone(),
-                goal_generation: goal.goal_generation,
-                producer_runtime_generation: goal.producer_runtime_generation,
+                owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
+                parent_request_id: String::new(),
+                goal_generation: goal.motion_generation as i64,
+                producer_runtime_generation: 0,
             })
             .expect("encode guarded test cancellation")
         }
@@ -8869,7 +7826,7 @@ mod guarded_tests {
                         .lock()
                         .unwrap()
                         .iter()
-                        .any(|call| call.starts_with("zero:"))
+                        .any(|call| call.starts_with("release:"))
                     {
                         break;
                     }
@@ -8890,7 +7847,7 @@ mod guarded_tests {
         async fn wait_for_correlated_zero(
             &mut self,
             goal: &schema::GoalEnvelope,
-            cancel_generation: i64,
+            _cancel_generation: i64,
         ) -> schema::NavigationState {
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
@@ -8903,12 +7860,10 @@ mod guarded_tests {
                     let state = schema::decode_navigation_state_body(&frame.payload)
                         .expect("guarded NavigationState body");
                     if state.session_id == goal.session_id
-                        && state.owner_kind == goal.owner_kind
-                        && state.parent_request_id == goal.parent_request_id
-                        && state.goal_generation == goal.goal_generation
-                        && state.cancel_generation == cancel_generation
-                        && !state.zero_ack_id.is_empty()
-                        && state.zero_applied_monotonic_ns > 0
+                        && state.owner_kind == schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV
+                        && state.session_id == goal.session_id
+                        && state.goal_generation == goal.motion_generation as i64
+                        && state.state == 0 && state.message.starts_with("CANCELLED:")
                     {
                         return state;
                     }
@@ -9008,8 +7963,6 @@ mod guarded_tests {
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
             if let Some(dequeued) = dequeued {
-                #[cfg(feature = "surface-recovery-qualification")]
-                ingress_ack_tests::record_observed_dequeue(&frame);
                 let _ = dequeued.send(());
             }
             frame
@@ -9113,11 +8066,11 @@ mod guarded_tests {
         grid.header.stamp_sec=(timestamp/1_000_000_000) as i32;
         grid.header.stamp_nsec=(timestamp%1_000_000_000) as i32;
         let value=PlanarNavigationMap {
-            map_frame_generation: goal.map_frame_generation,
-            runtime_generation:goal.producer_runtime_generation,session_id:goal.committed_map_session_id.clone(),
-            session_generation:goal.committed_map_session_generation,map_revision:goal.committed_map_revision,
-            map_boot_nonce:goal.committed_map_boot_nonce,map_commit_sequence:goal.committed_map_commit_sequence,
-            map_source_timestamp_ns:goal.committed_map_source_timestamp_ns,observation_revision:1,source_sequence:0,
+            map_frame_generation: 0,
+            runtime_generation:7,session_id:"guarded-test-map".into(),
+            session_generation:2,map_revision:4,
+            map_boot_nonce:[0x42;16],map_commit_sequence:1,
+            map_source_timestamp_ns:1,observation_revision:1,source_sequence:0,
             source_timestamp_ns:timestamp,cleared:false,grid,
         };
         let body=planar_navigation::encode_body(&value).unwrap();
@@ -9162,11 +8115,11 @@ mod guarded_tests {
                 if state.session_id == rejected.session_id && state.state == 4 { break state; }
             }
         }).await.expect("必须实际发布被拒绝候选目标的失败");
-        assert_eq!(failure.message, "LEASE_NOT_GRANTED: STALE_STOP_GENERATION");
-        assert_eq!(failure.owner_kind, rejected.owner_kind);
-        assert_eq!(failure.parent_request_id, rejected.parent_request_id);
-        assert_eq!(failure.goal_generation, rejected.goal_generation);
-        assert_eq!(failure.producer_runtime_generation, rejected.producer_runtime_generation);
+        assert!(failure.message.starts_with("LEASE_NOT_GRANTED:"));
+
+
+        assert_eq!(failure.goal_generation, rejected.motion_generation as i64);
+
         assert_eq!(failure.path_revision, 0);
         assert_eq!(failure.planner_runtime_generation, 0);
         assert!(failure.zero_ack_id.is_empty());
@@ -9179,10 +8132,10 @@ mod guarded_tests {
         harness.assert_no_session().await;
         assert_eq!(harness.motion_call_count("rejected_acquire:"), 1);
         assert_eq!(harness.motion_call_count("acquire:"), 0, "失败目标不能被新输入自动复活");
-        assert_eq!(harness.motion_call_count("zero:"), 0, "未取得租约不能伪造归零");
+        assert_eq!(harness.motion_call_count("release:"), 0, "未取得租约不能伪造归零");
         let mut next = sealed_goal("lease-recovered");
-        next.goal_generation = rejected.goal_generation + 1;
-        next.motion_stop_generation = rejected.motion_stop_generation + 1;
+        next.motion_generation = rejected.motion_generation + 1;
+
         harness.send_goal_and_wait_dequeued(&next).await;
         harness.wait_for_session(&next.session_id).await;
         assert_eq!(harness.motion_call_count("acquire:"), 1);
@@ -9191,277 +8144,21 @@ mod guarded_tests {
         harness.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn configuration_rejected_goal_stays_cancellable_and_cannot_reactivate() {
-        let mut harness = GuardedLoopHarness::spawn().await;
-        let mut goal = sealed_goal("configuration-rejected");
-        goal.body_reference_frame_id = "other/body".into();
-        schema::validate_goal_envelope(&goal).unwrap();
-        harness.send_goal_and_wait_dequeued(&goal).await;
-        harness.assert_no_session().await;
-        harness.send_pose(1);
-        harness.wait_for_pose(1).await;
-        harness.send_costmap(11);
-        harness.wait_for_costmap(11).await;
-        harness.assert_no_session().await;
-        assert_eq!(harness.motion_call_count("acquire:"), 0);
-        harness.send_cancel(&goal, 1);
-        harness.wait_for_correlated_zero(&goal, 1).await;
-        assert_eq!(harness.motion_call_count("zero:"), 1);
-        let mut next = sealed_goal("configuration-recovered");
-        next.goal_generation = goal.goal_generation + 1;
-        schema::validate_goal_envelope(&next).unwrap();
-        harness.send_goal_and_wait_dequeued(&next).await;
-        harness.wait_for_session(&next.session_id).await;
-        harness.send_cancel(&next, 1);
-        harness.wait_for_correlated_zero(&next, 1).await;
-        harness.shutdown().await;
-    }
 
-    #[test]
-    fn goal_reference_contract_uses_the_consumed_body_frame() {
-        let mut goal = sealed_goal("reference-contract");
-        assert!(validate_goal_reference(&goal, "base_link").is_ok());
-        goal.body_reference_frame_id = "body".into();
-        assert!(validate_goal_reference(&goal, "base_link").is_err());
-        let encoded = schema::encode_goal_envelope_body(&goal).unwrap();
-        assert!(decode_configured_goal_envelope(&encoded, "body").is_ok());
-    }
 
-    #[test]
-    fn all_goal_bound_profiles_accept_their_canonical_body_tf_and_goal_reference() {
-        use crate::{NavFeatureFlags, NavStackProfile, NavTopicConfig};
-        for profile in [NavStackProfile::Simple2D, NavStackProfile::ReplanningAStar, NavStackProfile::Mls3D] {
-            let graph = crate::profiles::build_graph(profile, &NavTopicConfig::default(), NavFeatureFlags::default());
-            assert!(graph.find("map_pose_adapter").is_some());
-            for body in ["base_link", "body", "robot/body_a"] {
-                let mut adapter = bound_map_pose_adapter("map".into(), "odom".into(), body).unwrap();
-                let tf = schema::TfMessage { transforms: vec![
-                    schema::TransformStamped {
-                        header: schema::Header { stamp_sec: 7, frame_id: "map".into(), ..Default::default() },
-                        child_frame_id: "odom".into(),
-                        transform: schema::Transform { translation: [1.0, 2.0, 0.0], rotation_xyzw: [0.0, 0.0, 0.0, 1.0] },
-                    },
-                    schema::TransformStamped {
-                        header: schema::Header { stamp_sec: 7, frame_id: "odom".into(), ..Default::default() },
-                        child_frame_id: body.into(),
-                        transform: schema::Transform { translation: [3.0, 4.0, 0.5], rotation_xyzw: [0.0, 0.0, 0.0, 1.0] },
-                    },
-                ] };
-                let wire = schema::encode_tf_message_body(&tf).unwrap();
-                let OwnerInput::Accepted(Some(observed)) = ingest_map_pose_tf(&mut adapter, &wire).unwrap() else {
-                    panic!("canonical bound TF must produce the actual body pose");
-                };
-                assert_eq!(observed.pose.pose.position, [4.0, 6.0, 0.5]);
-                let mut goal = sealed_goal("canonical-bound-goal");
-                goal.body_reference_frame_id = body.into();
-                assert!(decode_configured_goal_envelope(&schema::encode_goal_envelope_body(&goal).unwrap(), body).is_ok());
-                let odom = schema::Odometry {
-                    header: schema::Header { stamp_sec: 7, frame_id: "odom".into(), ..Default::default() },
-                    child_frame_id: format!(" {body} "),
-                    pose: schema::Pose { position: [3.0, 4.0, 0.5], orientation_xyzw: [0.0, 0.0, 0.0, 1.0] },
-                    ..Default::default()
-                };
-                assert!(adapter.transform_odometry(&odom).unwrap().is_some(), "existing whitespace normalization is retained");
-            }
-        }
-    }
 
-    #[test]
-    fn retained_goal_replay_ignores_send_time_and_signed_zero_but_keeps_actions() {
-        let mut accepted = sealed_goal("assigned-replay");
-        accepted.goal.pose.position[1] = 0.0;
-        let mut replay = accepted.clone();
-        replay.source_timestamp_ns += 1;
-        replay.goal.header.stamp_nsec += 1;
-        replay.goal.header.seq += 1;
-        replay.goal.pose.position[1] = -0.0;
-        assert_eq!(validate_goal_envelope_order(&replay, &accepted), Err(PlannerGoalRejectReason::DuplicateLease));
-        replay.goal.pose.position[0] += 0.1;
-        assert_eq!(validate_goal_envelope_order(&replay, &accepted), Err(PlannerGoalRejectReason::ConflictingLease));
-        replay = accepted.clone();
-        replay.options.allow_reverse = !replay.options.allow_reverse;
-        assert_eq!(validate_goal_envelope_order(&replay, &accepted), Err(PlannerGoalRejectReason::ConflictingLease));
-        replay = accepted.clone();
-        replay.producer_epoch += 1;
-        assert_eq!(validate_goal_envelope_order(&replay, &accepted), Err(PlannerGoalRejectReason::ConflictingLease));
-    }
 
-    #[tokio::test]
-    async fn guarded_cancel_acquires_and_fences_a_buffered_goal() {
-        let mut harness = GuardedLoopHarness::spawn().await;
-        let goal = sealed_goal("buffered-cancel-goal");
-        harness.send_goal_and_wait_dequeued(&goal).await;
-        harness.assert_no_session().await;
 
-        harness.send_cancel(&goal, 1);
-        harness.wait_for_zero().await;
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while harness.scheduler.status().last_terminal
-                != Some(nuwax_nav_runtime::TerminalOutcome::Cancelled)
-            {
-                assert!(
-                    !harness.loop_task.is_finished(),
-                    "guarded loop exited early"
-                );
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("buffered goal cancellation did not become terminal");
-        let terminal = harness.wait_for_correlated_zero(&goal, 1).await;
-        assert_eq!(terminal.path_revision, 0);
-        assert_eq!(terminal.planner_runtime_generation, 0);
-        assert!(harness.scheduler.status().session_id.is_none());
-        assert!(harness
-            .motion_calls
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|call| call.starts_with("acquire:")));
 
-        let motion_call_count = harness.motion_calls.lock().unwrap().len();
-        harness.send_cancel(&goal, 1);
-        let replay = harness.wait_for_correlated_zero(&goal, 1).await;
-        assert_eq!(replay.zero_ack_id, terminal.zero_ack_id);
-        assert_eq!(
-            replay.zero_applied_monotonic_ns,
-            terminal.zero_applied_monotonic_ns
-        );
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        assert_eq!(
-            harness.motion_calls.lock().unwrap().len(),
-            motion_call_count,
-            "exact cancel retry must replay proof without reacquiring motion"
-        );
 
-        harness.send_pose(1);
-        harness.wait_for_pose(1).await;
-        harness.send_costmap(11);
-        harness.wait_for_costmap(11).await;
-        harness.assert_no_session().await;
-        harness.shutdown().await;
-    }
 
-    #[tokio::test]
-    async fn guarded_new_cancel_generation_reacquires_before_exact_replay() {
-        let mut harness = GuardedLoopHarness::spawn().await;
-        let goal = sealed_goal("buffered-cancel-new-generation");
-        harness.send_goal_and_wait_dequeued(&goal).await;
 
-        harness.send_cancel(&goal, 1);
-        let first = harness.wait_for_correlated_zero(&goal, 1).await;
-        assert_eq!(harness.motion_call_count("acquire:"), 1);
-        assert_eq!(harness.motion_call_count("zero:"), 1);
 
-        harness.send_cancel(&goal, 2);
-        let second = harness.wait_for_correlated_zero(&goal, 2).await;
-        assert_eq!(harness.motion_call_count("acquire:"), 2);
-        assert_eq!(harness.motion_call_count("zero:"), 2);
 
-        harness.send_cancel(&goal, 2);
-        let replay = harness.wait_for_correlated_zero(&goal, 2).await;
-        assert_eq!(replay.zero_ack_id, second.zero_ack_id);
-        assert_eq!(
-            replay.zero_applied_monotonic_ns,
-            second.zero_applied_monotonic_ns
-        );
-        assert_eq!(harness.motion_call_count("acquire:"), 2);
-        assert_eq!(harness.motion_call_count("zero:"), 2);
 
-        harness.send_cancel_and_wait_dequeued(&goal, 1).await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(harness.motion_call_count("acquire:"), 2);
-        assert_eq!(harness.motion_call_count("zero:"), 2);
-        assert!(!first.zero_ack_id.is_empty());
-        harness.shutdown().await;
-    }
 
-    #[tokio::test]
-    async fn guarded_busy_buffered_cancel_retains_the_goal_for_retry() {
-        let mut harness = GuardedLoopHarness::spawn().await;
-        let buffered_goal = sealed_goal("buffered-cancel-busy-retry");
-        let blocker = sealed_goal("direct-scheduler-blocker");
-        harness
-            .scheduler
-            .start_session(nuwax_nav_runtime::NavSession {
-            boundary: Vec::new(),
-            options: Default::default(),
-                goal: nuwax_nav_runtime::ExecutionGoal::Body(pose_from_schema(&blocker.goal).expect("valid goal pose")),
-                session_id: blocker.session_id.clone(),
-                execution_identity: guarded_goal_execution_identity(&blocker),
 
-                motion_admission: nuwax_nav_runtime::NavMotionAdmission {
 
-                    guard_boot_nonce: blocker.motion_guard_boot_nonce,
-                    motion_stop_generation: u64::try_from(blocker.motion_stop_generation)
-                        .expect("non-negative blocker stop generation"),
-                },
-            })
-            .await
-            .expect("install direct scheduler blocker");
-        harness.send_goal_and_wait_dequeued(&buffered_goal).await;
-
-        harness
-            .send_cancel_and_wait_dequeued(&buffered_goal, 2)
-            .await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(
-            harness.scheduler.status().session_id.as_deref(),
-            Some(blocker.session_id.as_str())
-        );
-        assert_eq!(harness.motion_call_count("acquire:"), 1);
-        assert_eq!(harness.motion_call_count("zero:"), 0);
-
-        harness
-            .scheduler
-            .cancel(&blocker.session_id)
-            .await
-            .expect("remove direct scheduler blocker");
-        harness
-            .send_cancel_and_wait_dequeued(&buffered_goal, 1)
-            .await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(harness.motion_call_count("acquire:"), 1);
-        assert_eq!(harness.motion_call_count("zero:"), 1);
-
-        harness.send_cancel(&buffered_goal, 2);
-        let terminal = harness.wait_for_correlated_zero(&buffered_goal, 2).await;
-        assert!(!terminal.zero_ack_id.is_empty());
-        assert_eq!(harness.motion_call_count("acquire:"), 2);
-        assert_eq!(harness.motion_call_count("zero:"), 2);
-        harness.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn guarded_replacement_clears_cancel_reacquire_eligibility() {
-        let mut harness = GuardedLoopHarness::spawn().await;
-        let goal_a = sealed_goal("cancelled-before-replacement");
-        harness.send_goal_and_wait_dequeued(&goal_a).await;
-        harness.send_cancel(&goal_a, 1);
-        harness.wait_for_correlated_zero(&goal_a, 1).await;
-
-        let goal_b = rollover_goal(
-            &goal_a,
-            "buffered-replacement",
-            goal_a.producer_runtime_generation,
-            goal_a.goal_generation + 1,
-        );
-        harness.send_goal_and_wait_dequeued(&goal_b).await;
-        let acquire_count = harness.motion_call_count("acquire:");
-        let zero_count = harness.motion_call_count("zero:");
-
-        harness.send_cancel_and_wait_dequeued(&goal_a, 2).await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(harness.motion_call_count("acquire:"), acquire_count);
-        assert_eq!(harness.motion_call_count("zero:"), zero_count);
-
-        harness.send_cancel(&goal_b, 1);
-        harness.wait_for_correlated_zero(&goal_b, 1).await;
-        assert_eq!(harness.motion_call_count("acquire:"), acquire_count + 1);
-        assert_eq!(harness.motion_call_count("zero:"), zero_count + 1);
-        harness.shutdown().await;
-    }
 
     #[tokio::test]
     async fn guarded_loop_rejects_old_planner_generation_as_the_first_path() {
@@ -9513,53 +8210,9 @@ mod guarded_tests {
         harness.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn guarded_active_cancel_projects_pre_path_sentinel_with_zero_proof() {
-        let mut harness = GuardedLoopHarness::spawn().await;
-        let goal = activate_map_a(&harness).await;
-        harness.send_path(&sealed_path(&goal));
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while harness.scheduler.status().path_revision != 1 {
-                assert!(
-                    !harness.loop_task.is_finished(),
-                    "guarded loop exited early"
-                );
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("active path was not accepted");
 
-        harness.send_cancel(&goal, 2);
-        harness.wait_for_zero().await;
-        let terminal = harness.wait_for_correlated_zero(&goal, 2).await;
-        assert_eq!(terminal.path_revision, 0);
-        assert_eq!(terminal.planner_runtime_generation, 0);
-        harness.shutdown().await;
-    }
 
-    #[tokio::test]
-    async fn guarded_active_cancel_same_generation_replays_terminal_without_refencing() {
-        let mut harness = GuardedLoopHarness::spawn().await;
-        let goal = activate_map_a(&harness).await;
 
-        harness.send_cancel(&goal, 3);
-        harness.wait_for_zero().await;
-        let terminal = harness.wait_for_correlated_zero(&goal, 3).await;
-        let acquire_count = harness.motion_call_count("acquire:");
-        let zero_count = harness.motion_call_count("zero:");
-
-        harness.send_cancel(&goal, 3);
-        let replay = harness.wait_for_correlated_zero(&goal, 3).await;
-        assert_eq!(replay.zero_ack_id, terminal.zero_ack_id);
-        assert_eq!(
-            replay.zero_applied_monotonic_ns,
-            terminal.zero_applied_monotonic_ns
-        );
-        assert_eq!(harness.motion_call_count("acquire:"), acquire_count);
-        assert_eq!(harness.motion_call_count("zero:"), zero_count);
-        harness.shutdown().await;
-    }
 
     async fn activate_map_a(harness: &GuardedLoopHarness) -> schema::GoalEnvelope {
         let goal_a = sealed_goal("session-a");
@@ -9593,7 +8246,7 @@ mod guarded_tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         tokio::time::timeout(Duration::from_secs(1), async {
             while harness.scheduler.status().session_id.is_some()
-                || harness.scheduler.status().last_zero_ack_id.is_none()
+
             {
                 assert!(
                     !harness.loop_task.is_finished(),
@@ -9686,12 +8339,8 @@ mod guarded_tests {
         let harness = GuardedLoopHarness::spawn().await;
         let goal_a = activate_map_a(&harness).await;
 
-        let conflicting = rollover_goal(
-            &goal_a,
-            "conflicting-session",
-            goal_a.producer_runtime_generation,
-            goal_a.goal_generation,
-        );
+        let mut conflicting=goal_a.clone();
+        conflicting.goal.pose.position[0]+=0.5;
         harness.send_goal(&conflicting);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
@@ -9705,20 +8354,19 @@ mod guarded_tests {
 
         let goal_b = rollover_goal(&goal_a, "session-b", 8, 1);
         harness.send_goal_and_wait_dequeued(&goal_b).await;
-        harness.wait_for_zero().await;
         harness.wait_for_session("session-b").await;
         harness.shutdown().await;
     }
 
     #[tokio::test]
-    async fn guarded_goal_replacement_waits_for_zero() {
+    async fn guarded_goal_replacement_acquires_without_releasing_previous() {
         let harness = GuardedLoopHarness::spawn().await;
         let goal_a = activate_map_a(&harness).await;
         let goal_b = rollover_goal(&goal_a, "session-b", 8, 1);
 
         harness.send_goal_and_wait_dequeued(&goal_b).await;
-        harness.wait_for_zero().await;
         harness.wait_for_session("session-b").await;
+        assert_eq!(harness.motion_call_count("release:"),0);
         harness.shutdown().await;
     }
 
@@ -9743,13 +8391,13 @@ mod guarded_tests {
             Some("session-a")
         );
         assert_eq!(harness.scheduler.status().path_revision, 1);
-        assert!(harness.scheduler.status().last_zero_ack_id.is_none());
+
         assert!(!harness
             .motion_calls
             .lock()
             .unwrap()
             .iter()
-            .any(|call| call.starts_with("zero:")));
+            .any(|call| call.starts_with("release:")));
         harness.shutdown().await;
     }
 
@@ -9779,11 +8427,7 @@ mod guarded_tests {
         .expect("scheduler success terminal");
         let terminal = harness.scheduler.status();
         assert_eq!(terminal.phase, SchedulerPhase::Idle);
-        let zero_ack = terminal
-            .last_zero_ack_id
-            .clone()
-            .expect("Succeeded terminal ZeroAck");
-        assert!(!zero_ack.is_empty());
+
 
         harness.send_path(&path);
         let mut wrong_identity = path.clone();
@@ -9794,10 +8438,7 @@ mod guarded_tests {
         let after_late = harness.scheduler.status();
         assert_eq!(after_late.phase, SchedulerPhase::Idle);
         assert_eq!(after_late.last_terminal, Some(TerminalOutcome::Succeeded));
-        assert_eq!(
-            after_late.last_zero_ack_id.as_deref(),
-            Some(zero_ack.as_str())
-        );
+
         harness.shutdown().await;
     }
 
@@ -9831,7 +8472,7 @@ mod guarded_tests {
         assert_eq!(retained.last_terminal, None);
         assert_eq!(retained.session_id.as_deref(), Some(goal.session_id.as_str()));
         assert_eq!(retained.path_revision, 1);
-        assert!(retained.last_zero_ack_id.is_none());
+
         harness.shutdown().await;
     }
 
@@ -9943,7 +8584,7 @@ mod guarded_tests {
     #[test]
     fn late_path_rejection_keeps_parking_and_terminal_cause_and_receipts() {
         for (phase,terminal) in [
-            (SchedulerPhase::Fencing,None),(SchedulerPhase::Cancelling,None),
+            (SchedulerPhase::Cancelling,None),(SchedulerPhase::Cancelling,None),
             (SchedulerPhase::Failed,Some(nuwax_nav_runtime::TerminalOutcome::SafetyFailed)),
             (SchedulerPhase::Idle,Some(nuwax_nav_runtime::TerminalOutcome::Succeeded)),
             (SchedulerPhase::Idle,Some(nuwax_nav_runtime::TerminalOutcome::Cancelled)),
@@ -9955,29 +8596,7 @@ mod guarded_tests {
         }
     }
 
-    #[test]
-    fn terminal_cleanup_preserves_every_qualified_outcome() {
-        for (outcome, phase) in [
-            (TerminalOutcome::Cancelled, SchedulerPhase::Idle),
-            (TerminalOutcome::PlannerFailed, SchedulerPhase::Failed),
-            (TerminalOutcome::SafetyFailed, SchedulerPhase::Failed),
-            (TerminalOutcome::Shutdown, SchedulerPhase::Idle),
-        ] {
-            let mut active = Some(active_goal("terminal-matrix"));
-            let status = nuwax_nav_runtime::SchedulerStatus {
-                phase,
-                last_terminal: Some(outcome),
-                last_zero_ack_id: Some("matrix-zero-ack".into()),
-                last_fence_monotonic_ns: 42,
-                ..nuwax_nav_runtime::SchedulerStatus::default()
-            };
-            assert!(clear_terminal_active_session(&mut active, &status));
-            assert!(active.is_none());
-            assert_eq!(status.last_terminal, Some(outcome));
-            assert_eq!(status.last_zero_ack_id.as_deref(), Some("matrix-zero-ack"));
-            assert_eq!(status.last_fence_monotonic_ns, 42);
-        }
-    }
+
 
     #[test]
     fn terminal_publication_transitions_to_unowned_guard_heartbeat() {
@@ -9987,8 +8606,7 @@ mod guarded_tests {
             motion_sink_ready: true,
 
             last_terminal: Some(TerminalOutcome::Cancelled),
-            last_zero_ack_id: Some("zero-ack-a".into()),
-            last_fence_monotonic_ns: 123,
+
             message: "verified fence".into(),
             ..nuwax_nav_runtime::SchedulerStatus::default()
         };
@@ -10020,8 +8638,8 @@ mod guarded_tests {
         assert_eq!(terminal_message.planner_runtime_generation, 22);
         assert_eq!(terminal_message.runtime_generation, 0);
         assert_eq!(terminal_message.cancel_generation, 2);
-        assert_eq!(terminal_message.zero_ack_id, "zero-ack-a");
-        assert_eq!(terminal_message.zero_applied_monotonic_ns, 123);
+        assert!(terminal_message.zero_ack_id.is_empty());
+        assert_eq!(terminal_message.zero_applied_monotonic_ns, 0);
 
         assert!(clear_terminal_session_after_publication(
             &mut active,
@@ -10074,11 +8692,11 @@ mod guarded_tests {
         validate_path_goal_correlation(&path, &goal).expect("correlated path");
 
         let mut foreign_path = path.clone();
-        foreign_path.goal_generation += 1;
+        foreign_path.motion_generation += 1;
         assert!(validate_path_goal_correlation(&foreign_path, &goal).is_err());
 
         let mut wrong_producer_generation = path.clone();
-        wrong_producer_generation.producer_runtime_generation += 1;
+        wrong_producer_generation.motion_generation += 1;
         assert!(validate_path_goal_correlation(&wrong_producer_generation, &goal).is_err());
 
         let authoritative = saturating_i64(runtime_generation());
@@ -10134,173 +8752,24 @@ mod guarded_tests {
             session_id: goal.session_id.clone(),
             reason: 1,
             cancel_generation: 5,
-            owner_kind: goal.owner_kind,
-            parent_request_id: goal.parent_request_id.clone(),
-            goal_generation: goal.goal_generation,
-            producer_runtime_generation: goal.producer_runtime_generation,
+            owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
+            parent_request_id: String::new(),
+            goal_generation: goal.motion_generation as i64,
+            producer_runtime_generation: 0,
         };
         validate_cancel_goal_correlation(&cancel, &goal).expect("correlated cancel");
         let mut foreign_cancel = cancel;
-        foreign_cancel.goal_generation += 1;
+        foreign_cancel.session_id.push_str("-other");
         assert!(validate_cancel_goal_correlation(&foreign_cancel, &goal).is_err());
     }
 
-    #[test]
-    fn delayed_cancel_cannot_cross_a_geometry_producer_restart() {
-        let mut goal_a = sealed_goal("same-public-goal");
-        goal_a.goal_generation = 1;
-        goal_a.producer_runtime_generation = 41;
-        schema::validate_goal_envelope(&goal_a).expect("seal producer 41 goal");
 
-        let mut goal_b = goal_a.clone();
-        goal_b.producer_runtime_generation = 42;
-        goal_b.source_timestamp_ns += 1_000_000_000;
-        schema::validate_goal_envelope(&goal_b).expect("seal producer 42 goal");
 
-        let delayed_a = schema::CancelNavigation {
-            session_id: goal_a.session_id.clone(),
-            reason: 1,
-            cancel_generation: 7,
-            owner_kind: goal_a.owner_kind,
-            parent_request_id: goal_a.parent_request_id.clone(),
-            goal_generation: goal_a.goal_generation,
-            producer_runtime_generation: goal_a.producer_runtime_generation,
-        };
-        validate_cancel_goal_correlation(&delayed_a, &goal_a).expect("exact A cancel");
-        assert!(
-            validate_cancel_goal_correlation(&delayed_a, &goal_b).is_err(),
-            "producer-41 cancellation must not match producer-42 goal generation 1"
-        );
-        let exact_b = schema::CancelNavigation {
-            producer_runtime_generation: goal_b.producer_runtime_generation,
-            ..delayed_a
-        };
-        validate_cancel_goal_correlation(&exact_b, &goal_b).expect("exact B cancel");
-    }
 
-    #[tokio::test]
-    async fn delayed_cancel_does_not_cancel_or_zero_the_new_producer_session() {
-        let harness = GuardedLoopHarness::spawn().await;
-        let mut goal_a = sealed_goal("same-public-goal");
-        goal_a.goal_generation = 1;
-        goal_a.producer_runtime_generation = 41;
-        schema::validate_goal_envelope(&goal_a).expect("seal producer 41 goal");
-        harness.send_pose(1);
-        harness.wait_for_pose(1).await;
-        harness.send_costmap(11);
-        harness.wait_for_costmap(11).await;
-        harness.send_goal(&goal_a);
-        harness.wait_for_session(&goal_a.session_id).await;
 
-        let mut goal_b = goal_a.clone();
-        goal_b.producer_runtime_generation = 42;
-        goal_b.source_timestamp_ns += 1_000_000_000;
-        schema::validate_goal_envelope(&goal_b).expect("seal producer 42 goal");
-        harness.send_goal(&goal_b);
-        harness.wait_for_zero().await;
-        harness.send_costmap(12);
-        harness.wait_for_costmap(12).await;
-        harness.send_pose(2);
-        harness.wait_for_pose(2).await;
-        harness.wait_for_session(&goal_b.session_id).await;
-        let zero_count = harness
-            .motion_calls
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|call| call.starts_with("zero:"))
-            .count();
 
-        harness.send_cancel(&goal_a, 2);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(
-            harness.scheduler.status().session_id.as_deref(),
-            Some(goal_b.session_id.as_str()),
-            "producer-41 cancellation must leave producer-42 session active"
-        );
-        assert_eq!(
-            harness
-                .motion_calls
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|call| call.starts_with("zero:"))
-                .count(),
-            zero_count,
-            "rejected delayed cancellation must not request another ZERO"
-        );
 
-        harness.send_cancel(&goal_b, 3);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while harness.scheduler.status().session_id.is_some()
-                || harness
-                    .motion_calls
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|call| call.starts_with("zero:"))
-                    .count()
-                    == zero_count
-            {
-                assert!(
-                    !harness.loop_task.is_finished(),
-                    "guarded loop exited early"
-                );
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("exact producer-42 cancellation did not reach verified ZERO");
-        harness.shutdown().await;
-    }
 
-    #[test]
-    fn guarded_owner_orders_leases_by_producer_and_goal_generation() {
-        let goal_a = sealed_goal("session-a");
-        let mut goal_buffer = PlannerGoalBuffer::default();
-        assert!(goal_buffer.observe_costmap().is_none());
-        let ready_a = match goal_buffer.observe_goal(goal_a.clone()) {
-            PlannerGoalIngress::Ready(goal) => *goal,
-            outcome => panic!("first goal must be ready: {outcome:?}"),
-        };
-        assert!(goal_buffer.mark_applied(&ready_a));
-
-        let goal_b = rollover_goal(&goal_a, "session-b", 8, 1);
-        let ready_b = match goal_buffer.observe_goal(goal_b.clone()) {
-            PlannerGoalIngress::Ready(goal) => *goal,
-            outcome => panic!("newer lease must be ready: {outcome:?}"),
-        };
-        assert!(!goal_buffer.has_applied_goal());
-        assert!(matches!(
-            goal_buffer.observe_goal(goal_a.clone()),
-            PlannerGoalIngress::Rejected(PlannerGoalRejectReason::SupersededLease)
-        ));
-        assert!(goal_buffer.mark_applied(&ready_b));
-        validate_path_goal_correlation(&sealed_path(&ready_b), &ready_b)
-            .expect("new lease path remains correlated");
-        assert!(goal_buffer.observe_costmap().is_none());
-
-        let goal_a_again = rollover_goal(&goal_b, "session-a2", 9, 1);
-        let ready_a_again = match goal_buffer.observe_goal(goal_a_again.clone()) {
-            PlannerGoalIngress::Ready(goal) => *goal,
-            outcome => panic!("new producer lease must activate: {outcome:?}"),
-        };
-        assert!(!goal_buffer.has_applied_goal());
-        assert_eq!(ready_a_again, goal_a_again);
-        assert!(goal_buffer.mark_applied(&ready_a_again));
-    }
-
-    #[test]
-    fn legacy_raw_goal_and_path_bodies_are_rejected_by_versioned_decoders() {
-        let raw_goal =
-            schema::encode_pose_stamped_body(&sealed_goal("goal").goal).expect("legacy goal body");
-        assert!(schema::decode_goal_envelope_body(&raw_goal).is_err());
-
-        let goal = sealed_goal("goal");
-        let raw_path =
-            schema::encode_path_body(&sealed_path(&goal).path).expect("legacy path body");
-        assert!(schema::decode_path_envelope_body(&raw_path).is_err());
-    }
 
     #[test]
     fn map_pose_owner_drops_bad_tf_and_processes_following_valid_odometry() {
@@ -10471,7 +8940,6 @@ mod guarded_tests {
             2
         );
         status.last_terminal = Some(TerminalOutcome::Succeeded);
-        status.last_zero_ack_id = Some("zero-a".into());
         let terminal = publications
             .frames(&node, &status, &telemetry, Some(true))
             .unwrap();
@@ -10495,7 +8963,7 @@ mod guarded_tests {
         telemetry.public_session_id = "goal-b".into();
         telemetry.goal_generation = 2;
         status.last_terminal = None;
-        status.last_zero_ack_id = None;
+
         status.applied_commands = 1;
         let next = publications
             .frames(&node, &status, &telemetry, None)
@@ -11099,10 +9567,9 @@ mod guarded_tests {
 
         for error in [
             RuntimeError::Motion("guard unavailable".into()),
-            RuntimeError::InvalidApplied("wrong operation".into()),
-            RuntimeError::InvalidFence("missing zero proof".into()),
+
+
             RuntimeError::SchedulerStopped,
-            RuntimeError::SequenceExhausted,
         ] {
             assert!(runtime_input_error::<()>("guarded-test", error).is_err());
         }
@@ -11478,11 +9945,6 @@ mod tests {
             active_goal.as_ref().unwrap().goal_key()
         );
         assert!(matches!(
-            buffer.observe_goal(goal_12),
-            PlannerGoalIngress::Rejected(PlannerGoalRejectReason::SupersededLease)
-        ));
-        assert!(buffer.observe_costmap().is_none());
-        assert!(matches!(
             buffer.observe_goal(goal_13),
             PlannerGoalIngress::Rejected(PlannerGoalRejectReason::DuplicateLease)
         ));
@@ -11580,15 +10042,8 @@ mod boundary_tests {
 
     fn goal(owner_kind: i32, boundary_points: Vec<[f64; 3]>) -> schema::GoalEnvelope {
         schema::GoalEnvelope {
-            body_reference_frame_id: "base_link".into(),
-            owner_kind,
-            boundary_frame_id: if boundary_points.is_empty() {
-                String::new()
-            } else {
-                "map".into()
-            },
-            boundary_points,
-            goal: schema::PoseStamped {
+boundary_points: boundary_points,
+goal: schema::PoseStamped {
                 header: schema::Header {
                     frame_id: "map".into(),
                     ..schema::Header::default()
@@ -11598,8 +10053,8 @@ mod boundary_tests {
                     orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
                 },
             },
-            ..schema::GoalEnvelope::default()
-        }
+..schema::GoalEnvelope::default()
+}
     }
 
     #[test]
@@ -11693,36 +10148,16 @@ mod native_adapter_tests {
 
     fn goal() -> schema::GoalEnvelope {
         let mut goal = schema::GoalEnvelope {
-            body_reference_frame_id: "base_link".into(),
-            schema_version: schema::NAVIGATION_ENVELOPE_SCHEMA_VERSION,
-            session_id: "native-session".into(),
-            owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
-            parent_request_id: "native-parent".into(),
-            goal_generation: 9,
-            producer: "wavefront".into(),
-            producer_epoch: 3,
-            producer_runtime_generation: 4,
-            committed_map_session_id: "map-session".into(),
-            committed_map_session_generation: 5,
-            committed_map_revision: 6,
-            committed_map_boot_nonce: [0x21; 16],
-            committed_map_commit_sequence: 1,
-            committed_map_source_timestamp_ns: 1,
-            committed_map_frame_id: "map".into(),
-            source_timestamp_ns: 7_000_000_000,
-            boundary_id: "native-boundary".into(),
-            boundary_frame_id: "map".into(),
-            boundary_points: vec![
+session_id: "native-session".into(),
+boundary_points: vec![
                 [0.0, 0.0, 0.0],
                 [5.0, 0.0, 0.0],
                 [5.0, 5.0, 0.0],
                 [0.0, 5.0, 0.0],
                 [0.0, 0.0, 0.0],
             ],
-
-            motion_guard_boot_nonce: [0x31; 16],
-            motion_stop_generation: 8,
-            goal: schema::PoseStamped {
+motion_generation: 8,
+goal: schema::PoseStamped {
                 header: schema::Header {
                     seq: 9,
                     stamp_sec: 7,
@@ -11734,8 +10169,8 @@ mod native_adapter_tests {
                     orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
                 },
             },
-            ..schema::GoalEnvelope::default()
-        };
+..schema::GoalEnvelope::default()
+};
 
         schema::validate_goal_envelope(&goal).expect("seal native goal");
         goal
@@ -11748,8 +10183,7 @@ mod native_adapter_tests {
     #[cfg(any(feature = "cmu-native", feature = "explore"))]
     fn goal_generation(generation: i64) -> schema::GoalEnvelope {
         let mut value = goal();
-        value.goal_generation = generation;
-        value.source_timestamp_ns = generation * 1_000_000_000;
+        value.motion_generation = generation as u64;
         value.goal.header.seq = i32::try_from(generation).expect("test generation fits i32");
         value.goal.header.stamp_sec = i32::try_from(generation).expect("test generation fits i32");
         schema::validate_goal_envelope(&value).expect("reseal native goal generation");
@@ -11762,10 +10196,10 @@ mod native_adapter_tests {
             backend: "far-visibility-graph".into(),
             runtime_generation: 12,
             session_id: goal.session_id.clone(),
-            owner_kind: goal.owner_kind,
-            parent_request_id: goal.parent_request_id.clone(),
-            goal_generation: goal.goal_generation,
-            producer_runtime_generation: goal.producer_runtime_generation,
+            owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
+            parent_request_id: String::new(),
+            goal_generation: goal.motion_generation as i64,
+            producer_runtime_generation: 0,
             path_revision: 4,
             planner_runtime_generation: 12,
         }
@@ -11912,11 +10346,11 @@ mod native_adapter_tests {
             robot_frame: "far-visibility-graph".into(),
             state: nuwax_nav_far_planner_bridge::worker::FAR_EVENT_SUCCEEDED,
             runtime_generation: 12,
-            owner_kind: goal.owner_kind,
-            parent_request_id: goal.parent_request_id.clone(),
-            goal_generation: goal.goal_generation,
+            owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
+            parent_request_id: String::new(),
+            goal_generation: goal.motion_generation as i64,
             path_revision: 4,
-            producer_runtime_generation: goal.producer_runtime_generation,
+            producer_runtime_generation: 0,
             planner_runtime_generation: 12,
             ..schema::NavigationState::default()
         };
@@ -11938,10 +10372,10 @@ mod native_adapter_tests {
             backend: "far-visibility-graph".into(),
             runtime_generation: 12,
             session_id: goal.session_id.clone(),
-            owner_kind: goal.owner_kind,
-            parent_request_id: goal.parent_request_id.clone(),
-            goal_generation: goal.goal_generation,
-            producer_runtime_generation: goal.producer_runtime_generation,
+            owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
+            parent_request_id: String::new(),
+            goal_generation: goal.motion_generation as i64,
+            producer_runtime_generation: 0,
             path_revision: 4,
             planner_runtime_generation: 12,
         };
@@ -12057,12 +10491,12 @@ mod native_adapter_tests {
             runtime_generation: 12,
             planner_map_frame: goal.committed_map_frame_id.clone(),
             planner_pose_frame: goal.goal.header.frame_id.clone(),
-            owner_kind: goal.owner_kind,
-            parent_request_id: goal.parent_request_id.clone(),
-            goal_generation: goal.goal_generation,
+            owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
+            parent_request_id: String::new(),
+            goal_generation: goal.motion_generation as i64,
             path_revision: revision,
             planner_runtime_generation: 12,
-            producer_runtime_generation: goal.producer_runtime_generation,
+            producer_runtime_generation: 0,
             ..schema::NavigationState::default()
         };
 

@@ -12,13 +12,6 @@ pub mod constants;
 pub mod measured_motion;
 pub mod wire;
 
-pub use client::{
-    ClientConfig, CommandConfirmation, GlobalStopConfirmation,
-    LeaseMetadata, MotionAdmissionProof, MotionGuardClient, MotionGuardClientError,
-    PriorityFenceRequest, ReadinessStatus, RenewalMetadata, ZeroConfirmation,
-};
-pub use constants::{
-    COMMAND_DEADLINE_MS, DEFAULT_REQUEST_TIMEOUT_MS, DEFAULT_UDS_PATH, MAX_FRAME_BYTES,
-    RENEW_INTERVAL_MS,
-};
+pub use client::{ClientConfig, MotionGuardClient, MotionGuardClientError};
+pub use constants::{DEFAULT_UDS_PATH, MAX_FRAME_BYTES};
 pub use measured_motion::MeasuredMotion;

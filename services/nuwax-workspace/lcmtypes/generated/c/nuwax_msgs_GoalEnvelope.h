@@ -15,87 +15,46 @@
 extern "C" {
 #endif
 
-#include "geometry_msgs_Point.h"
 #include "geometry_msgs_PoseStamped.h"
+/// 与 Geometry 的目标载荷一致；可选值用零或一项的数组表示。
 typedef struct _nuwax_msgs_GoalEnvelope nuwax_msgs_GoalEnvelope;
 struct _nuwax_msgs_GoalEnvelope
 {
-    int32_t    schema_version;
 
     /**
      * LCM Type: string
      */
     char*      session_id;
-    int32_t    owner_kind;
 
     /**
-     * LCM Type: string
+     * 原样承载 uint64 运动代次的八个字节。
      */
-    char*      parent_request_id;
-    int64_t    goal_generation;
+    int64_t    motion_generation;
+    geometry_msgs_PoseStamped goal;
+    int8_t     allow_reverse_length;
 
     /**
-     * LCM Type: string
+     * LCM Type: int8_t[allow_reverse_length]
      */
-    char*      producer;
-    int64_t    producer_epoch;
-    int64_t    producer_runtime_generation;
+    int8_t     *allow_reverse;
+    int8_t     position_tolerance_length;
 
     /**
-     * LCM Type: string
+     * LCM Type: double[position_tolerance_length]
      */
-    char*      committed_map_session_id;
-    int64_t    committed_map_session_generation;
-    int64_t    committed_map_revision;
+    double     *position_tolerance_m;
+    int8_t     yaw_tolerance_length;
 
     /**
-     * LCM Type: byte[16]
+     * LCM Type: double[yaw_tolerance_length]
      */
-    uint8_t    committed_map_boot_nonce[16];
-    int64_t    committed_map_commit_sequence;
-    int64_t    committed_map_source_timestamp_ns;
-
-    /**
-     * LCM Type: string
-     */
-    char*      committed_map_frame_id;
-    int64_t    source_timestamp_ns;
-
-    /**
-     * LCM Type: string
-     */
-    char*      boundary_id;
-
-    /**
-     * LCM Type: string
-     */
-    char*      boundary_frame_id;
+    double     *yaw_tolerance_rad;
     int32_t    boundary_points_length;
 
     /**
-     * LCM Type: geometry_msgs.Point[boundary_points_length]
+     * LCM Type: double[boundary_points_length][2]
      */
-    geometry_msgs_Point *boundary_points;
-
-    /**
-     * LCM Type: byte[16]
-     */
-    uint8_t    motion_guard_boot_nonce[16];
-    int64_t    motion_stop_generation;
-    int8_t     allow_reverse;
-    double     position_tolerance_m;
-    double     yaw_tolerance_rad;
-
-    /**
-     * LCM Type: string
-     */
-    char*      body_reference_frame_id;
-
-    /**
-     * 目标产生时的规范地图坐标代际。
-     */
-    int64_t    map_frame_generation;
-    geometry_msgs_PoseStamped goal;
+    double     **boundary_points;
 };
 
 /**

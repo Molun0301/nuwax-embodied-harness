@@ -151,17 +151,15 @@ mod tests {
     #[test]
     fn optional_snapshot_roundtrips_independently_on_error_response() {
         use prost::Message;
-        use crate::wire::{MotionGuardResponse,motion_guard_response,GetReadinessResponse,GuardResult,ErrorDetail};
-        let response=MotionGuardResponse {api_version:crate::wire::API_VERSION,request_id:"rejected-command".into(),
-            measured_motion_feedback:Some(wire()),
-            outcome:Some(motion_guard_response::Outcome::GetReadiness(GetReadinessResponse {
-                result:Some(GuardResult{error:Some(ErrorDetail{code:"REJECTED".into(),message:"not applied".into(),retryable:false}),..Default::default()}),
-                ..Default::default()}))};
-        let decoded=MotionGuardResponse::decode(response.encode_to_vec().as_slice()).unwrap();
-        let mut cache=MeasurementCache::default();cache.update(decoded.measured_motion_feedback,150);
+        use crate::wire::{GuardResponse, Error, ErrorCode};
+        let response=GuardResponse { measured_motion:Some(wire()), error:Some(Error {
+            code:ErrorCode::LeaseRevoked as i32,message:"租约已作废".into(),
+        }),result:None };
+        let decoded=GuardResponse::decode(response.encode_to_vec().as_slice()).unwrap();
+        let mut cache=MeasurementCache::default();cache.update(decoded.measured_motion,150);
         assert_eq!(cache.value.unwrap().body_linear_xyz,[0.;3]);
-        let old=MotionGuardResponse{measured_motion_feedback:None,..response};
-        assert!(MotionGuardResponse::decode(old.encode_to_vec().as_slice()).unwrap().measured_motion_feedback.is_none());
+        let absent=GuardResponse{measured_motion:None,..response};
+        assert!(GuardResponse::decode(absent.encode_to_vec().as_slice()).unwrap().measured_motion.is_none());
     }
 
 }

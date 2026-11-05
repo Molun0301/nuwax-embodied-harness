@@ -69,15 +69,18 @@ fn route_request(message: &schema::NavigationMap3D, wide: bool, height: f64)
 {
     let (from_x, to_x, y) = if wide { (1.0, 7.0, 3.0) } else { (0.8, 3.2, 1.5) };
     let mut goal = goal_for(message, 1, [to_x, y, height]);
-    goal.options = nuwax_nav_types_messages::GoalOptions {
+    let options = nuwax_nav_types_messages::GoalOptions {
         allow_reverse: false, position_tolerance_m: 0.12, yaw_tolerance_rad: 0.15,
     };
-    goal.source_timestamp_ns = SOURCE_NS;
+    goal.allow_reverse=Some(options.allow_reverse);
+    goal.position_tolerance_m=Some(options.position_tolerance_m);
+    goal.yaw_tolerance_rad=Some(options.yaw_tolerance_rad);
+
     goal.goal.header.stamp_sec = (SOURCE_NS / 1_000_000_000) as i32;
     goal.goal.header.stamp_nsec = 0;
-    goal.owner_kind=schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD;
-    goal.boundary_frame_id="map".into();
-    goal.boundary_id="mask-test".into();
+
+
+
     let (width,height)=if wide {(8.,6.)} else {(4.,3.)};
     goal.boundary_points=vec![[0.,0.,0.],[width,0.,0.],[width,height,0.],[0.,height,0.]];
     schema::validate_goal_envelope(&goal).unwrap();

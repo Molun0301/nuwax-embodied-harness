@@ -45,10 +45,6 @@ class LifecycleChecks(unittest.TestCase):
         self.save()
         return result
 
-    def test_profile_cannot_override_launcher_pid_ownership(self):
-        self.settings.write_text("NUWAX_GATEWAY_PID_FILE=/tmp/unrelated.pid\n")
-        result = lifecycle.inspect_installation(self.home)
-        self.assertEqual(result["pid_file"], str(self.root / "runtime_data/gateway/gateway.pid"))
 
 
     def test_roundtrip_stable_service_and_listener_override(self):
@@ -79,7 +75,7 @@ class LifecycleChecks(unittest.TestCase):
     def test_service_render_only_uses_current_and_no_privilege(self):
         unit = lifecycle.render_user_service(self.descriptor("systemd-user"))
         self.assertIn(str(self.home / "current/start.sh"), unit)
-        self.assertIn("KillMode=control-group", unit)
+        self.assertIn("KillMode=process", unit)
         self.assertNotIn("sudo", unit)
         self.assertNotIn("User=root", unit)
         self.assertFalse((self.home / "systemd").exists())
@@ -99,39 +95,13 @@ class LifecycleChecks(unittest.TestCase):
             lifecycle.start_current(self.descriptor())
         popen.assert_not_called()
 
-    @patch.object(lifecycle.os, "geteuid", return_value=1000)
-    @patch.object(lifecycle.os, "kill")
-    def test_zombie_is_already_stopped(self, kill, uid):
-        descriptor = self.descriptor()
-        descriptor["pid_file"] = str(self.root / "gateway.pid")
-        Path(descriptor["pid_file"]).write_text("12345")
-        with patch.object(lifecycle, "_exited", return_value=True):
-            self.assertEqual(lifecycle.stop_current(descriptor), 0)
-        kill.assert_not_called()
 
-    @patch.object(lifecycle.os, "geteuid", return_value=1000)
-    def test_foreign_live_process_leaves_only_stale_pid_record(self, uid):
-        descriptor = self.descriptor()
-        pid_file = Path(descriptor["pid_file"])
-        pid_file.parent.mkdir(parents=True)
-        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
-                                   env=dict(os.environ, NUWAX_INSTALL_HOME="/foreign"),
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        try:
-            pid_file.write_text(str(process.pid))
-            with patch.object(lifecycle.os, "kill") as kill:
-                self.assertEqual(lifecycle.stop_current(descriptor), 0)
-                kill.assert_not_called()
-            self.assertFalse(pid_file.exists())
-            self.assertIsNone(process.poll())
-        finally:
-            process.terminate()
-            process.wait(timeout=5)
 
 
     @patch.object(lifecycle.os, "geteuid", return_value=1000)
     @patch.object(lifecycle.subprocess, "Popen")
     def test_foreground_start_uses_installation_listener_and_base_environment(self, popen, uid):
+        popen.return_value.pid = 424242
         descriptor = self.descriptor()
         descriptor['listener']['port'] = 9919
         with patch.dict(os.environ, {'OPENAI_API_KEY': 'caller', 'RUST_LOG': 'trace', 'HTTPS_PROXY': 'http://proxy', 'HOME': '/fixture'}):

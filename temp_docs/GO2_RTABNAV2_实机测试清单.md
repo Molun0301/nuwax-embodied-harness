@@ -18,7 +18,7 @@
 | 1 | Bootstrap 检查 | `python3 scripts/bootstrap.py check --robot go2 --geometry` → Go2SLAM 全 OK | ☐ |
 | 2 | 工作区包前缀 | `cd services/geometry/ros2_ws/src/GO2_RTABNAV2/ws && source source_go2.bash && ros2 pkg prefix go2_slam_nav` | ☐ |
 | 3 | Rust bridge 已编译 | `services/geometry/nuwax_ros_bridge/target/release/nuwax-ros-bridge` 存在 | ☐ |
-| 4 | 启动 gateway | `bash scripts/start_gateway.sh` 无报错 | ☐ |
+| 4 | 启动 gateway | `python -m scripts.supervisor` 无报错 | ☐ |
 | 5 | 健康检查 | `curl http://127.0.0.1:8766/api/health` 正常 | ☐ |
 
 ---

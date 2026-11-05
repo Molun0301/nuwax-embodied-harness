@@ -2444,7 +2444,7 @@ class NavigationService:
         deadline_monotonic: Optional[float] = None,
     ) -> ExplorationProvider:
         # v1.1 改造：GatewayError 追加 details={"capability", ...} hint，
-        # 让前端 / debug_panel / start_gateway.sh log scrubber 能直接拿到
+        # 让前端 / debug_panel / 业务日志 能直接拿到
         # runtime_status（或 provider_available / exploration_available）而无需
         # 再翻 runtime context；上游错误体字段兼容（details dict 可增 key）。
         _exploration_deadline_remaining(

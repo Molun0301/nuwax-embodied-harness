@@ -51,8 +51,7 @@ def dispatch_restart(root, request):
     environment = dict(os.environ)
     for key in environment.get("_NUWAX_CONFIG_FILE_KEYS", "").split(":"):
         environment.pop(key, None)
-    for key in ("_NUWAX_CONFIG_FILE_KEYS", "NUWAX_GATEWAY_SUPERVISOR_TITLED"):
-        environment.pop(key, None)
+    environment.pop("_NUWAX_CONFIG_FILE_KEYS", None)
     path = root / "runtime_data/settings/restart.log"
     try:
         with path.open("ab") as output:

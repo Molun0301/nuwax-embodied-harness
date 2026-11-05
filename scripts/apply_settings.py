@@ -40,9 +40,14 @@ def main(argv=None):
     request.update(state="restarting", message="正在沿原生命周期入口停止并重新启动相关进程")
     write_state(request)
     try:
-        # restart 会先关闭旧拥有方，随后成为新的长期运行拥有方。
-        process = subprocess.Popen(["bash", args.local, "restart"], cwd=str(ROOT),
+        from scripts.device_manager.common import atomic_json
+        from scripts.device_manager.runtime import Runtime
+        home = Path(os.environ["NUWAX_INSTALL_HOME"])
+        prefix = Path(args.local).parent
+        Runtime(home).stop(prefix)
+        process = subprocess.Popen(["bash", args.local], cwd=str(ROOT),
                                    stdin=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+        atomic_json(home / "config/runtime.json", {"pid": process.pid, "prefix": str(prefix)})
         request.update(state="starting", launcher_pid=process.pid,
                        message="已启动重启入口，等待新网关回报")
         write_state(request)

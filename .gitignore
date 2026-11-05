@@ -121,7 +121,7 @@ feedback_rework*.md
 
 # === installer 运行时产物（plan 4.2 / RK11 / RK18 / D4） ===
 # 状态文件 + installer 隔离 venv 入仓均不入仓；lock 由 _lock.py 共享
-# scripts/start_gateway.sh:86-96 flock 协议，统一走 runtime_data/gateway/start_gateway.lock，
+# 业务监督者与模块安装共享安装根 run/business.lock，
 # 不再单独列 .installer.lock（D4 已废弃 .installer.lock 路径）。
 runtime_data/installer_state.json
 runtime_data/.venv-installer/

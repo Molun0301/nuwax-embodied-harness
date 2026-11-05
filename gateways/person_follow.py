@@ -6,9 +6,7 @@ from dataclasses import dataclass, replace
 import math
 import logging
 import os
-from pathlib import Path
 import queue
-import re
 import struct
 import threading
 from typing import Any, Callable, Mapping, Optional, Tuple
@@ -39,11 +37,6 @@ PERSON_FOLLOW_FAILED = 4
 _MAX_IDENTIFIER_BYTES = 255
 _MAX_QUERY_BYTES = 255
 _MAX_REASON_BYTES = 1024
-_READY_KEYS = frozenset({"pid", "boot_id", "starttime", "subscriptions_ready"})
-_BOOT_ID_PATTERN = re.compile(
-    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
-)
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 
@@ -64,12 +57,7 @@ class PersonFollowBridgeTimeout(PersonFollowBridgeError):
 class PersonFollowReadiness:
     enabled: bool
     ready: bool
-    ready_file: str
     reason: str
-    pid: Optional[int] = None
-    boot_id: Optional[str] = None
-    starttime: Optional[str] = None
-    subscriptions_ready: bool = False
 
 
 def _parse_enabled(value: Optional[str]) -> Optional[bool]:
@@ -81,135 +69,14 @@ def _parse_enabled(value: Optional[str]) -> Optional[bool]:
     return None
 
 
-def _resolve_person_follow_ready_file(
-    environ: Mapping[str, str],
-    repo_root: Optional[Path],
-) -> Path:
-    configured = str(environ.get("NUWAX_PERSON_FOLLOW_READY_FILE") or "").strip()
-    if configured:
-        return Path(configured)
-    root = repo_root or Path(__file__).resolve().parent.parent
-    return root / "runtime_data/person-follow/nuwax_person_follow.ready"
-
-
-def _read_process_starttime(proc_root: Path, pid: int) -> Optional[str]:
-    try:
-        stat_line = (proc_root / str(pid) / "stat").read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
-        return None
-    if ") " not in stat_line:
-        return None
-    fields = stat_line.rsplit(") ", 1)[1].split()
-    if len(fields) <= 19:
-        return None
-    starttime = fields[19]
-    if not starttime.isdigit() or int(starttime) <= 0:
-        return None
-    return starttime
-
-
 def read_person_follow_readiness(
-    *,
-    environ: Optional[Mapping[str, str]] = None,
-    repo_root: Optional[Path] = None,
-    proc_root: Path = Path("/proc"),
+    *, ready: bool = False, environ: Optional[Mapping[str, str]] = None,
 ) -> PersonFollowReadiness:
-    """严格验证 person-follow ready marker 与当前进程身份。"""
-
+    """组件由监督者确保就绪，网关通信桥启动后即可使用。"""
     source = os.environ if environ is None else environ
     enabled = _parse_enabled(source.get("NUWAX_PERSON_FOLLOW_AUTOSTART"))
-    ready_file = _resolve_person_follow_ready_file(source, repo_root)
-    if enabled is False:
-        return PersonFollowReadiness(
-            enabled=False,
-            ready=False,
-            ready_file=str(ready_file),
-            reason="disabled",
-        )
-    if enabled is None:
-        return PersonFollowReadiness(
-            enabled=True,
-            ready=False,
-            ready_file=str(ready_file),
-            reason="invalid_autostart_config",
-        )
-    if ready_file.is_symlink() or not ready_file.is_file():
-        return PersonFollowReadiness(
-            enabled=True,
-            ready=False,
-            ready_file=str(ready_file),
-            reason="ready_file_missing",
-        )
-    try:
-        lines = ready_file.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        return PersonFollowReadiness(
-            enabled=True,
-            ready=False,
-            ready_file=str(ready_file),
-            reason="ready_file_unreadable",
-        )
-    values = {}
-    for line in lines:
-        if "=" not in line:
-            values = {}
-            break
-        key, value = line.split("=", 1)
-        if key not in _READY_KEYS or key in values:
-            values = {}
-            break
-        values[key] = value
-    if set(values) != set(_READY_KEYS):
-        return PersonFollowReadiness(
-            enabled=True,
-            ready=False,
-            ready_file=str(ready_file),
-            reason="invalid_ready_marker",
-        )
-    pid_text = values["pid"]
-    starttime = values["starttime"]
-    boot_id = values["boot_id"].lower()
-    if (
-        not pid_text.isdigit()
-        or int(pid_text) <= 0
-        or not starttime.isdigit()
-        or int(starttime) <= 0
-        or values["subscriptions_ready"] != "1"
-        or _BOOT_ID_PATTERN.fullmatch(boot_id) is None
-    ):
-        return PersonFollowReadiness(
-            enabled=True,
-            ready=False,
-            ready_file=str(ready_file),
-            reason="invalid_ready_marker",
-        )
-    pid = int(pid_text)
-    try:
-        current_boot_id = (proc_root / "sys/kernel/random/boot_id").read_text(encoding="utf-8").strip().lower()
-    except (OSError, UnicodeError):
-        current_boot_id = ""
-    current_starttime = _read_process_starttime(proc_root, pid)
-    if boot_id != current_boot_id or starttime != current_starttime:
-        return PersonFollowReadiness(
-            enabled=True,
-            ready=False,
-            ready_file=str(ready_file),
-            reason="stale_process_identity",
-            pid=pid,
-            boot_id=boot_id,
-            starttime=starttime,
-            subscriptions_ready=True,
-        )
-    return PersonFollowReadiness(
-        enabled=True,
-        ready=True,
-        ready_file=str(ready_file),
-        reason="ready",
-        pid=pid,
-        boot_id=boot_id,
-        starttime=starttime,
-        subscriptions_ready=True,
-    )
+    reason = "disabled" if enabled is False else "invalid_autostart_config" if enabled is None else "ready" if ready else "not_started"
+    return PersonFollowReadiness(enabled=enabled is not False, ready=enabled is True and ready, reason=reason)
 
 
 @dataclass(frozen=True)

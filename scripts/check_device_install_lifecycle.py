@@ -98,7 +98,7 @@ class Checks(unittest.TestCase):
     def source_tree(source):
         (source / "scripts/module_installer").mkdir(parents=True)
         (source / "scripts/module_installer/runtime.py").write_text("# fixture\n")
-        (source / "scripts/start_gateway.sh").write_text("#!/bin/bash\n")
+        (source / "scripts/supervisor.py").write_text("# 测试监督者\n")
         (source / "drivers").mkdir()
         (source / ".env.example").write_text("NUWAX_LOG_LEVEL=INFO\n")
 
@@ -113,32 +113,6 @@ class Checks(unittest.TestCase):
 
 
 class OwnerChecks(Checks):
-    def test_double_start_keeps_existing_live_process(self):
-        prefix = self.install_current()
-        from scripts.device_manager.runtime import Runtime
-        self.engine.runtime = Runtime(self.engine.home)
-        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
-                                   cwd=str(prefix / "source"), start_new_session=True)
-        def cleanup():
-            if process.poll() is None:
-                process.terminate()
-            process.wait(timeout=5)
-        self.addCleanup(cleanup)
-        identity = process_identity(process.pid)
-        atomic_json(self.engine.runtime.state_path, {"prefix": str(prefix), "process": identity})
-        with patch("scripts.device_manager.runtime.urllib.request.build_opener") as opener, \
-                patch.object(self.engine.runtime, "stop", side_effect=AssertionError("Must not stop existing owner")) as stop:
-            response = opener.return_value.open.return_value.__enter__.return_value
-            response.status = 200
-            response.read.return_value = b"{}"
-            result = self.run_job(self.job("start"))
-        self.assertEqual(result["status"], "succeeded")
-        self.assertTrue(result["result"]["unchanged"])
-        self.assertTrue(process_alive(identity))
-        self.assertIsNone(process.poll())
-        self.assertNotIn("switch_intent", result["_journal"])
-        stop.assert_not_called()
-        self.assertEqual(self.engine.current()["prefix"], str(prefix))
 
     def test_double_start_keeps_unhealthy_owner_without_claiming_success(self):
         self.install_current()

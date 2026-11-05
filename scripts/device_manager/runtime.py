@@ -1,4 +1,4 @@
-"""沿原网关拥有方管理进程；配置通过当前版本的共同实现读写。"""
+"""通过业务监督者管理启停；配置通过当前版本的共同实现读写。"""
 from __future__ import annotations
 
 import ast
@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -286,49 +287,22 @@ class Runtime:
         return read_json(self.manager_home / "config/settings.json", {}).get("gateway_port", 8766)
 
     def _pid(self):
-        try:
-            return int((self.home / "data/gateway/gateway.pid").read_text().strip())
-        except (OSError, ValueError):
-            return 0
+        return read_json(self.state_path, {}).get("pid", 0)
 
-    def _supervisor(self):
-        pid = self._pid()
-        identity = process_identity(pid)
-        if not identity:
-            return None
-        record = read_json(self.state_path, {})
-        if (record.get("process") or {}).get("pid") == pid:
-            return identity if record["process"] == identity else None
-        prefix = Path(record["prefix"]) if record.get("prefix") else (self.home / "current").resolve()
-        try:
-            if Path("/proc/{}/cwd".format(pid)).resolve() == prefix / "source":
-                return identity
-        except OSError:
-            pass
-        return None
-
-    def _foreign_owners(self, allowed_roots=()):
-        markers = (b"nuwax-geometry-runtime", b"nuwax-nav-stack", b"nuwax-person-follow", b"drivers.go2.video_streamer")
-        for directory in Path("/proc").iterdir():
-            if not directory.name.isdigit() or int(directory.name) == os.getpid():
-                continue
-            try:
-                command = (directory / "cmdline").read_bytes().split(b"\0")
-                arguments = [part for part in command if part]
-                # 只匹配可执行文件及Python模块参数，避免把终端中的检索命令当作拥有方。
-                relevant = arguments[:1] + [arguments[index + 1] for index, item in enumerate(arguments[:-1]) if item == b"-m"]
-                if not any(marker in item for marker in markers for item in relevant):
-                    continue
-                source = (directory / "cwd").resolve()
-                if self.home not in source.parents and not any(source == root or root in source.parents for root in allowed_roots):
-                    return True
-            except (OSError, PermissionError):
-                continue
-        return False
+    def _components(self):
+        with socket.socket(socket.AF_UNIX) as connection:
+            connection.settimeout(2)
+            connection.connect(str(self.home / "run/supervisor.sock"))
+            connection.sendall(b'{"op":"status"}\n')
+            with connection.makefile("rb") as response:
+                return json.loads(response.readline())
 
     def has_owner(self):
-        record = read_json(self.state_path, {})
-        return process_alive(record.get("process")) or bool(self._supervisor())
+        try:
+            self._components()
+            return True
+        except OSError:
+            return False
 
     def update_readiness(self):
         if not self.has_owner():
@@ -353,10 +327,7 @@ class Runtime:
         return {"ready": False, "reason": "无法读取新鲜的网关空闲状态，稍后重查"}
 
     def status(self):
-        record = read_json(self.state_path, {})
-        owned = process_alive(record.get("process"))
-        supervisor = self._supervisor()
-        running = owned or bool(supervisor)
+        running = self.has_owner()
         healthy = False
         if running:
             try:
@@ -371,8 +342,6 @@ class Runtime:
         return result
 
     def start(self, prefix):
-        if self._foreign_owners():
-            raise ManagerError("foreign_owner", "检测到其它安装的业务拥有方，请先迁入或通过原拥有方停止，拒绝调用全局清理。", 409)
         if self.status()["running"]:
             raise ManagerError("already_running", "业务拥有方已运行，拒绝并行创建。", 409)
         from scripts.module_installer.runtime import _VALUES
@@ -383,40 +352,37 @@ class Runtime:
         log_path = self.home / "logs/runtime.log"
         descriptor = os.open(str(log_path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
         with os.fdopen(descriptor, "ab") as log:
-            process = subprocess.Popen(["bash", str(prefix / "start.sh"), "start"], cwd=prefix / "source",
-                                       env=clean_environment(prefix, environment=base_environment()),
+            process = subprocess.Popen([str(prefix / "venv/bin/python"), "-m", "scripts.supervisor"], cwd=prefix / "source",
+                                       env=dict(clean_environment(prefix, environment=base_environment()),
+                                                NUWAX_INSTALL_HOME=str(self.home)),
                                        stdin=subprocess.DEVNULL,
                                        stdout=log, stderr=log, start_new_session=True)
-        atomic_json(self.state_path, {"process": process_identity(process.pid), "prefix": str(prefix)})
+        atomic_json(self.state_path, {"pid": process.pid, "prefix": str(prefix)})
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
             if process.poll() is not None:
-                raise ManagerError("start_failed", "原网关拥有方提前退出。", 500, runtime_diagnostic(self.home))
+                raise ManagerError("start_failed", "业务监督者提前退出。", 500, runtime_diagnostic(self.home))
             if self.status()["healthy"]:
                 return
             time.sleep(0.4)
         raise ManagerError("health_timeout", "网关健康接口未在启动预算内响应。", 500, runtime_diagnostic(self.home))
 
     def stop(self, prefix):
-        record = read_json(self.state_path, {})
-        original = record.get("process") or self._supervisor()
-        # 兼容旧发布启动器把运行锁持有到退出的实现：先请求原supervisor执行自身关闭trap。
-        # 只向已核验身份的根拥有方发信号，不直接操作算法工作进程。
-        if process_alive(original):
+        pid = self._pid()
+        if pid:
             try:
-                os.kill(original["pid"], signal.SIGTERM)
+                os.kill(pid, signal.SIGTERM)
+                deadline = time.monotonic() + 60
+                while time.monotonic() < deadline:
+                    try:
+                        state = (Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[0]
+                    except FileNotFoundError:
+                        break
+                    if state == "Z":
+                        break
+                    time.sleep(0.2)
+                else:
+                    os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            deadline = time.monotonic() + 180
-            while process_alive(original) and time.monotonic() < deadline:
-                time.sleep(0.2)
-            if process_alive(original):
-                raise ManagerError("stop_incomplete", "原拥有方未在关闭预算内退出，拒绝切换版本。", 500)
-        run_command(["bash", str(prefix / "start.sh"), "stop"], cwd=prefix / "source",
-                    environment=clean_environment(prefix), timeout=180)
-        deadline = time.monotonic() + 20
-        while process_alive(original) and time.monotonic() < deadline:
-            time.sleep(0.2)
-        if process_alive(original) or process_identity(self._pid()):
-            raise ManagerError("stop_incomplete", "原拥有方尚未完全退出，拒绝切换版本。", 500)
-        atomic_json(self.state_path, {})
+        self.state_path.unlink(missing_ok=True)

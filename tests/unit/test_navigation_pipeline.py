@@ -82,8 +82,9 @@ def test_launchers_reject_mismatch_before_creating_runtime(tmp_path, pipeline, p
            "NUWAX_BOOTSTRAP_ENV_FILE": str(empty), "NUWAX_USER_CONFIG_ENV_FILE": str(empty),
            "NUWAX_GEOMETRY_EXTRA_ENV_FILES": "", "NUWAX_GEOMETRY_WEB_CONFIG_ENV_FILE": str(empty),
            "NUWAX_GATEWAY_WEB_CONFIG_ENV_FILE": str(empty), "NUWAX_PYTHON_BIN": sys.executable}
-    for launcher in ["start_nav_stack.sh", "start_geometry_runtime.sh"]:
-        result = subprocess.run(["bash", str(ROOT / "scripts/systemd" / launcher)], env=env,
+    from tests.startup_helpers import component_command
+    for launcher in ["nav_stack", "geometry"]:
+        result = subprocess.run(component_command(launcher), env=env,
                                 capture_output=True, text=True, timeout=10)
         assert result.returncode != 0
         assert "与执行链冲突" in result.stderr

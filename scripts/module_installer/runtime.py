@@ -37,8 +37,7 @@ _ROOT_RELATIVE_PATH_KEYS = (
     "NUWAX_CLOUDMAP_SHM_PATH", "NUWAX_OCCUPANCY_SHM_PATH",
     "NUWAX_VIDEO_SHM_PATH", "NUWAX_VIDEO_UDS_PATH", "NUWAX_FORBIDDEN_ZONES_PATH",
     "NUWAX_GEOMETRY_RUNTIME_READY_FILE", "NUWAX_NAV_STACK_READY_FILE",
-    "NUWAX_PERSON_FOLLOW_READY_FILE", "NUWAX_GATEWAY_PID_FILE", "NUWAX_GATEWAY_LOCK_FILE",
-    "NUWAX_RUNTIME_ACTIVATION_REQUEST", "NUWAX_RUNTIME_ACTIVATION_RESULT",
+    "NUWAX_PERSON_FOLLOW_READY_FILE",
     "NUWAX_GEOMETRY_SEQUENCE_STATE_PATH",
     "NUWAX_GEOMETRY_EXPLORATION_RECONCILIATION_JOURNAL_PATH",
     "NUWAX_NUWAX_WORKSPACE_DIR", "NUWAX_MOTION_GUARD_SOCKET",
@@ -188,8 +187,6 @@ def write_runtime(
         "NUWAX_INSTALL_HOME": str(prefix.parent.parent),
         "NUWAX_SETTINGS_LAUNCHER": str(prefix / "start.sh"),
         "NUWAX_ACTIVE_ROBOT": robot,
-        "NUWAX_GATEWAY_LOCK_FILE": str(root / "runtime_data/gateway/start_gateway.lock"),
-        "NUWAX_GATEWAY_PID_FILE": str(root / "runtime_data/gateway/gateway.pid"),
         "PYTHONHOME": "",
         "PYTHONPATH": str(root),
         "NUWAX_PYTHON_BIN": str(python_bin),
@@ -276,7 +273,7 @@ def write_runtime(
 
     launcher = [
         "#!/usr/bin/env bash",
-        "# 沿统一网关拥有方启动、停止与查询；安装操作本身不启动机器人。",
+        "# 在前台运行唯一业务监督者；安装操作本身不启动机器人。",
         "set -euo pipefail",
         "# 清理调用终端的解释器环境，避免其它虚拟环境污染本代安装。",
         "unset PYTHONHOME PYTHONPATH",
@@ -287,7 +284,7 @@ def write_runtime(
     launcher.extend(f"export {key}={shlex.quote(value)}" for key, value in sorted(fixed.items()))
     launcher.extend([
         f"cd {shlex.quote(str(root))}",
-        f'exec bash {shlex.quote(str(root / "scripts/start_gateway.sh"))} "$@"',
+        f'exec {shlex.quote(str(python_bin))} -m scripts.supervisor',
         "",
     ])
     start_path = prefix / "start.sh"

@@ -13,14 +13,9 @@ def attached(monkeypatch):
     client = GeometryRuntimeSubprocess(port=50123)
     source = {'pid':12345, 'generation':71, 'healthy':True}
     monkeypatch.setattr(client, '_is_port_open', lambda: True)
-    def ready():
-        if client._attached_ready_pid not in (None, source['pid']):return False
-        client._attached_ready_pid = source['pid']
-        return True
     def probe():
         client._last_probed_runtime_generation = source['generation'] if source['healthy'] else None
         return source['healthy']
-    monkeypatch.setattr(client, '_verify_ready_locked', ready)
     monkeypatch.setattr(client, '_verify_attached_runtime_locked', probe)
     monkeypatch.setattr(client, '_warn_if_video_relay_missing', lambda: None)
     assert client.start()
@@ -65,7 +60,7 @@ def test_transient_probe_reuses_provider_bound_to_existing_input_bridge(geometry
     assert provider.outputs == [100, 200]
 
 
-@pytest.mark.parametrize('change', ['generation', 'pid', 'unavailable_generation'])
+@pytest.mark.parametrize('change', ['generation', 'unavailable_generation'])
 def test_recovery_requires_confirmed_same_owner_not_just_same_numeric_pid(monkeypatch, change):
     client, source = attached(monkeypatch)
     source['healthy'] = False
@@ -97,17 +92,6 @@ def test_failed_probe_stays_unhealthy_without_replacing_identity(monkeypatch):
     assert client._bound_runtime_generation == 71
 
 
-def test_owner_change_during_recovery_probe_is_rejected(monkeypatch):
-    client, source = attached(monkeypatch)
-    source['healthy'] = False
-    client._attached_health_check_at = 0
-    assert not client.is_running
-    def changed_during_rpc():
-        client._last_probed_runtime_generation = 71
-        source['pid'] += 1
-        return True
-    monkeypatch.setattr(client, '_verify_attached_runtime_locked', changed_during_rpc)
-    assert not client.recover_same_runtime()
 
 
 def test_rpc_identity_comes_from_runtime_health_response(monkeypatch):

@@ -235,9 +235,9 @@ def installation_lock(home: Path):
 
 
 @contextmanager
-def idle_gateway(root: Path):
+def idle_gateway(home: Path):
     """与真实启动器共用锁，整个安装过程禁止旧环境开始运行。"""
-    path = root / "runtime_data/gateway/start_gateway.lock"
+    path = home / "run/business.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as lock:
         try:
@@ -511,7 +511,7 @@ def apply(request: InstallRequest, hardware) -> dict:
     from .lifecycle import MODES, deployment_descriptor, inspect_installation
     if request.service_mode and request.service_mode not in MODES:
         raise InstallError("未知生命周期模式")
-    with installation_lock(request.home), idle_gateway(request.root):
+    with installation_lock(request.home), idle_gateway(request.home):
         current = read_current(request.home)
         if current and current.get("source_root") != str(request.root):
             raise InstallError("此安装目录属于另一个源码工作区，请使用独立 --install-dir。")

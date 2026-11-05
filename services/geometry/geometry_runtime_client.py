@@ -1,7 +1,6 @@
 """nuwax_geometry_runtime attach-only 客户端生命周期管理。
 
-进程唯一 owner 是 ``scripts/systemd/start_geometry_runtime.sh``（由 systemd 或
-``scripts/start_gateway.sh`` 调用）。Python 只挂接并健康检查现有 gRPC runtime，
+进程由 ``python -m scripts.supervisor`` 管理。Python 只挂接并健康检查现有 gRPC runtime，
 不 spawn、不重启、也不终止外部进程。
 
 调用方统一通过本文件连接 `nuwax-geometry-runtime`。
@@ -20,13 +19,12 @@ import os
 import socket
 import threading
 import time
-from pathlib import Path
 from typing import Optional
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.geometry.geometry_runtime_client")
 
 _DEFAULT_PORT = 50051
-_CANONICAL_LAUNCHER = "scripts/systemd/start_geometry_runtime.sh"
+_CANONICAL_LAUNCHER = "python -m scripts.supervisor"
 # attach 状态下端口探测到 listen 后，做一次 gRPC 健康检查（GetStatus）的缓存 TTL（秒）。
 # Runtime monitor 轮询 is_running 时复用 TTL，避免每次状态读取都发 RPC。
 _ATTACHED_HEALTH_CHECK_TTL_SEC = 1.0
@@ -53,14 +51,11 @@ class GeometryRuntimeSubprocess:
         self._lock = threading.RLock()
         self._started = False
         self._attached = False
-        # 保存启动器已确认的进程号，避免相同端口的新进程复用旧挂接。
-        self._attached_ready_pid: Optional[int] = None
         self._last_error: Optional[str] = None
         # attach 状态下 gRPC 健康检查缓存（runtime monitor / is_running 复用）
         self._attached_health_check_at = 0.0
         self._attached_health_check_ok = False
         # 健康探测失败不能丢掉已确认的拥有方身份；显式关闭才撤销复用资格。
-        self._bound_ready_pid: Optional[int] = None
         self._bound_runtime_generation: Optional[int] = None
         self._last_probed_runtime_generation: Optional[int] = None
 
@@ -76,63 +71,11 @@ class GeometryRuntimeSubprocess:
             if not self._is_port_open():
                 self._reset_attached_state_locked()
                 return False
-            if not self._verify_ready_locked():
-                self._last_error = "Geometry ready marker changed or became stale"
-                self._reset_attached_state_locked()
-                return False
             return self._check_attached_health_locked()
 
     @property
     def last_error(self) -> Optional[str]:
         return self._last_error
-
-    def _verify_ready_locked(self) -> bool:
-        """校验启动器最小就绪标记，并保持本次挂接对应的进程号。"""
-        ready_path = Path(
-            runtime_value(
-                "NUWAX_GEOMETRY_RUNTIME_READY_FILE",
-                str(
-                    Path(__file__).resolve().parents[2]
-                    / "runtime_data"
-                    / "geometry"
-                    / "nuwax_geometry_runtime.ready"
-                ),
-            )
-        )
-        try:
-            if ready_path.is_symlink() or not ready_path.is_file():
-                return False
-            fields = {}
-            for line in ready_path.read_text(encoding="utf-8").splitlines():
-                key, separator, value = line.partition("=")
-                if separator != "=" or key not in {"pid", "port"} or key in fields:
-                    return False
-                fields[key] = value
-            if set(fields) != {"pid", "port"}:
-                return False
-            pid = fields["pid"]
-            port = fields["port"]
-            if not (
-                pid.isascii()
-                and pid.isdecimal()
-                and not pid.startswith("0")
-                and port.isascii()
-                and port.isdecimal()
-                and not port.startswith("0")
-            ):
-                return False
-            if int(port) != self._port or not Path("/proc", pid).is_dir():
-                return False
-            ready_pid = int(pid)
-            if (
-                self._attached_ready_pid is not None
-                and self._attached_ready_pid != ready_pid
-            ):
-                return False
-            self._attached_ready_pid = ready_pid
-            return True
-        except (OSError, UnicodeError):
-            return False
 
     def _warn_if_video_relay_missing(self) -> None:
         """挂接已有 runtime 时探测视频中转产物，缺失则告警（不阻断 geometry）。
@@ -161,7 +104,6 @@ class GeometryRuntimeSubprocess:
             if self._started:
                 if (
                     self._attached
-                    and self._verify_ready_locked()
                     and self._check_attached_health_locked(force=True)
                 ):
                     return True
@@ -174,10 +116,6 @@ class GeometryRuntimeSubprocess:
                 )
                 LOGGER.error(self._last_error)
                 return False
-            if not self._verify_ready_locked():
-                self._last_error = "Geometry ready marker verification failed"
-                self._reset_attached_state_locked()
-                return False
             if not self._verify_attached_runtime_locked():
                 self._last_error = (
                     "127.0.0.1:%d 已监听但 geometry GetStatus 验活失败；"
@@ -186,17 +124,11 @@ class GeometryRuntimeSubprocess:
                 LOGGER.error(self._last_error)
                 self._reset_attached_state_locked()
                 return False
-            # 验活可能跨越重启；不能把旧就绪进程与新服务的响应拼成成功挂接。
-            if not self._verify_ready_locked():
-                self._last_error = "Geometry 就绪进程在 GetStatus 验活期间发生变化"
-                self._reset_attached_state_locked()
-                return False
             self._attached = True
             self._started = True
             self._attached_health_check_at = time.monotonic()
             self._attached_health_check_ok = True
             self._last_error = None
-            self._bound_ready_pid = self._attached_ready_pid
             self._bound_runtime_generation = self._last_probed_runtime_generation
             LOGGER.info(
                 "nuwax-geometry-runtime 已在端口 %d 运行，gRPC 验活通过，Python 只挂接",
@@ -209,7 +141,6 @@ class GeometryRuntimeSubprocess:
         """释放 Python 本地挂接；外部 runtime 生命周期归 canonical owner。"""
 
         with self._lock:
-            self._bound_ready_pid = None
             self._bound_runtime_generation = None
             self._started = False
             self._reset_attached_state_locked()
@@ -221,7 +152,6 @@ class GeometryRuntimeSubprocess:
         重新执行端口 + gRPC 双门验活；不向外部 owner 发送信号。
         """
         with self._lock:
-            self._bound_ready_pid = None
             self._bound_runtime_generation = None
             self._reset_attached_state_locked()
             self._started = False
@@ -229,17 +159,16 @@ class GeometryRuntimeSubprocess:
     def recover_same_runtime(self) -> bool:
         """完整复核短暂失联的同一Rust启动代际，不创建或替换provider。"""
         with self._lock:
-            pid, generation = self._bound_ready_pid, self._bound_runtime_generation
-            if pid is None or generation is None:
+            generation = self._bound_runtime_generation
+            if generation is None:
                 return False
-            if not self._is_port_open() or not self._verify_ready_locked():
+            if not self._is_port_open():
                 self._reset_attached_state_locked()
                 return False
-            if self._attached_ready_pid != pid or not self._verify_attached_runtime_locked():
+            if not self._verify_attached_runtime_locked():
                 self._reset_attached_state_locked()
                 return False
-            if (self._last_probed_runtime_generation != generation
-                    or not self._verify_ready_locked() or self._attached_ready_pid != pid):
+            if self._last_probed_runtime_generation != generation:
                 self._reset_attached_state_locked()
                 return False
             self._attached = self._started = True
@@ -297,7 +226,7 @@ class GeometryRuntimeSubprocess:
             now - self._attached_health_check_at
         ) < _ATTACHED_HEALTH_CHECK_TTL_SEC:
             return True
-        ok = self._verify_attached_runtime_locked() and self._verify_ready_locked()
+        ok = self._verify_attached_runtime_locked()
         if (self._bound_runtime_generation is not None and self._last_probed_runtime_generation is not None
                 and self._last_probed_runtime_generation != self._bound_runtime_generation):
             ok = False
@@ -312,6 +241,5 @@ class GeometryRuntimeSubprocess:
         """调用方必须已持有 self._lock。清空 attach 状态与健康检查缓存。"""
         self._started = False
         self._attached = False
-        self._attached_ready_pid = None
         self._attached_health_check_at = 0.0
         self._attached_health_check_ok = False

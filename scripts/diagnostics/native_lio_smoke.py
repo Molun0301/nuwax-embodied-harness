@@ -31,6 +31,32 @@ from services.geometry.proto_gen import geometry_runtime_pb2_grpc as pb2_grpc
 from services.geometry.runtime_input_bridge import RuntimeInputBridge
 
 
+def supervisor_command(names, home):
+    """诊断夹具通过监督者拥有原生组件；未列入的依赖由夹具提供。"""
+    program = """import asyncio, json, sys
+from pathlib import Path
+from scripts.supervisor import Supervisor, load_environment
+root=Path.cwd()
+env=load_environment(root)
+env['NUWAX_INSTALL_HOME']=sys.argv[2]
+owner=Supervisor(root, env)
+names=json.loads(sys.argv[1])
+owner.components={name: owner.components[name] for name in names}
+for item in owner.components.values():
+    item.dependencies=tuple(name for name in item.dependencies if name in owner.components)
+async def run():
+    task=asyncio.create_task(owner.run())
+    result=await owner.ensure(names)
+    if not result['ok']:
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+        owner.stopping.set()
+    code=await task
+    return code if result['ok'] else 1
+raise SystemExit(asyncio.run(run()))
+"""
+    return [sys.executable, "-c", program, json.dumps(names), str(home)]
+
+
 def _stop_process_session(process, term_timeout=20, kill_timeout=5):
     """先等拥有方正常关闭，再回收同一诊断会话内的全部进程组。"""
     session_id = process.pid
@@ -104,9 +130,6 @@ class GatewayMappingSession:
         from gateways.app import create_gateway_app
         from gateways.runtime import GatewayRuntime
 
-        for key in ("NUWAX_RUNTIME_ACTIVATION_REQUEST", "NUWAX_RUNTIME_ACTIVATION_RESULT",
-                    "NUWAX_RUNTIME_ACTIVATION_CANCEL", "NUWAX_RUNTIME_ACTIVATION_ACK"):
-            os.environ.pop(key, None)
         config = load_config()
         config.robot.active_robot = "customrobot"
         config.geometry.enabled = True
@@ -298,11 +321,11 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
     log = (evidence / (backend + "真实原生进程.log")).open("w")
     process = sensors = bridge = remote = channel = gateway = None
     try:
-        process = subprocess.Popen(["bash", str(root / "scripts/systemd/start_geometry_runtime.sh")],
+        process = subprocess.Popen(supervisor_command(["geometry"], working / "supervision"), cwd=root,
             stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         sensors = CustomRobotProviderBundle()
         deadline = time.monotonic() + 10
-        while not ready.exists():
+        while not Path(str(ready) + ".runtime").exists():
             assert process.poll() is None, "真实原生进程启动失败"
             assert time.monotonic() < deadline, "真实原生进程启动超时"
             time.sleep(.03)

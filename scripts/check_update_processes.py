@@ -41,10 +41,11 @@ class ProcessTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.prefix = self.root / "installation/generations/test"
         self.prefix.mkdir(parents=True)
-        self.pid_file = self.root / "runtime_data/gateway/gateway.pid"
-        self.lock_file = self.pid_file.parent / "start_gateway.lock"
+        self.pid_file = self.prefix.parent.parent / "config/runtime.json"
+        self.lock_file = self.prefix.parent.parent / "run/business.lock"
         self.pid_file.parent.mkdir(parents=True)
-        (self.prefix / "settings.env").write_text("NUWAX_GATEWAY_PID_FILE=" + str(self.pid_file) + "\n")
+        self.lock_file.parent.mkdir(parents=True)
+        (self.prefix / "settings.env").write_text("")
         (self.prefix / "manifest.json").write_text(json.dumps({
             "deployment": deployment_descriptor(self.root, self.prefix.parent.parent, self.prefix, ["core"], "customrobot", service_name="neh-fixture.service"),
             "schema": 1, "complete": True, "modules": ["core"], "robot": "customrobot",
@@ -67,7 +68,7 @@ class ProcessTests(unittest.TestCase):
         code = f"""import fcntl, os, pathlib, time
 lock = open({str(self.lock_file)!r}, 'a')
 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-pathlib.Path({str(self.pid_file)!r}).write_text(str(os.getpid()))
+pathlib.Path({str(self.pid_file)!r}).write_text(__import__("json").dumps({{"pid":os.getpid()}}))
 time.sleep(60)
 """
         environment = dict(os.environ)

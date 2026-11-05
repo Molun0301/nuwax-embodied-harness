@@ -8,6 +8,7 @@ import shlex
 import shutil
 
 import pytest
+from tests.startup_helpers import component_command
 from tests.conftest import create_robot_profile
 
 ROOT=Path(__file__).resolve().parents[2]
@@ -45,14 +46,14 @@ def test_bad_assembly_never_exports_partial_values(values):
 
 
 def test_actual_source_script_exports_combined_device_limits():
-    result=subprocess.run(['bash','-c',
-        'source services/geometry/source_runtime_env.sh && printf "%s,%s,%s,%s" "$NUWAX_NAV_PROFILE" "$_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS" "$_NUWAX_NAV_ACTUATOR_MAX_YAW_RPS" "$_NUWAX_NAV_ACTUATOR_MOTION_MODEL"'],
-        cwd=ROOT,env={**os.environ,'NUWAX_ACTIVE_ROBOT':'go2','NUWAX_PYTHON_BIN':sys.executable,
-        'NUWAX_GEOMETRY_PIPELINE':'lio_3d','NUWAX_NAV_PROFILE':'mls-3d',
-        'GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS':'0.05','GO2_OFFICIAL_MAX_YAW_RATE_RPS':'0.7'},
-        capture_output=True,text=True)
-    assert result.returncode==0,result.stderr
-    assert result.stdout=='pct-scan-3d,0.05,0.7,omnidirectional'
+    from scripts.supervisor import load_environment
+    from unittest.mock import patch
+    with patch.dict(os.environ, {'NUWAX_ACTIVE_ROBOT':'go2', 'NUWAX_GEOMETRY_PIPELINE':'lio_3d',
+        'NUWAX_NAV_PROFILE':'pct-scan-3d','GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS':'0.05',
+        'GO2_OFFICIAL_MAX_YAW_RATE_RPS':'0.7'}):
+        env = load_environment(ROOT)
+    assert [env[k] for k in ['NUWAX_NAV_PROFILE','_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS',
+        '_NUWAX_NAV_ACTUATOR_MAX_YAW_RPS','_NUWAX_NAV_ACTUATOR_MOTION_MODEL']] == ['pct-scan-3d','0.05','0.7','omnidirectional']
 
 
 @pytest.mark.parametrize('values',[{'NUWAX_ACTIVE_ROBOT':'customrobot'}, {'NUWAX_GEOMETRY_PIPELINE':'slam_2d','NUWAX_NAV_PROFILE':'simple-2d'}])
@@ -95,23 +96,20 @@ def test_incomplete_or_unsupported_generic_motion_exports_nothing(override):
 
 
 def test_actual_startup_exports_generic_declared_motion():
-    result = subprocess.run(['bash', '-c',
-        'source services/geometry/source_runtime_env.sh && printf "%s,%s,%s" '
-        '"$_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS" "$_NUWAX_NAV_ACTUATOR_MAX_YAW_RPS" '
-        '"$_NUWAX_NAV_ACTUATOR_MOTION_MODEL"'], cwd=ROOT,
-        env={**os.environ, **EXPLICIT_MOTION, 'NUWAX_PYTHON_BIN': sys.executable,
-             'NUWAX_GEOMETRY_PIPELINE': 'lio_3d', 'NUWAX_NAV_PROFILE': 'pct-scan-3d'},
-        capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout == '0.3,0.3,omnidirectional'
+    from scripts.supervisor import load_environment
+    from unittest.mock import patch
+    with patch.dict(os.environ, dict(EXPLICIT_MOTION, NUWAX_GEOMETRY_PIPELINE='lio_3d', NUWAX_NAV_PROFILE='pct-scan-3d')):
+        env = load_environment(ROOT)
+    assert [env[k] for k in ['_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS','_NUWAX_NAV_ACTUATOR_MAX_YAW_RPS',
+        '_NUWAX_NAV_ACTUATOR_MOTION_MODEL']] == ['0.3','0.3','omnidirectional']
 
 
 _TERRAIN_SOURCE = "NUWAX_NAV_PCT_TERRAIN_SOURCE"
 # 启动链实际读取的文件。复制到临时仓库根运行，避免开发机 runtime_data/settings/active.env
 # 指向的已选机器人方案接管显式配置文件，使测试结果依赖本机状态。
 _LAUNCHER_FILES = (
-    "scripts/systemd/start_nav_stack.sh", "scripts/systemd/process_identity.sh",
-    "services/geometry/source_runtime_env.sh", "scripts/lib/config_env.sh",
+    "scripts/supervisor.py",
+    "scripts/lib/config_env.sh",
     "scripts/resolve_navigation_pipeline.py", "scripts/resolve_robot_geometry.py",
     "contracts/navigation_pipeline.py", "core/config_values.py", "core/config_catalog.json",
     "core/robot_geometry.py", ".env.example",
@@ -158,11 +156,11 @@ def _terrain_startup(tmp_path, file_value=None):
 
 
 def _run_terrain_launcher(env, output, root, command=None):
-    result = subprocess.run(command or ["bash", str(root / "scripts/systemd/start_nav_stack.sh")],
+    result = subprocess.run(command or component_command("nav_stack"),
                             cwd=root, env=env, capture_output=True, text=True, timeout=10)
     # 子进程取值完成后按约定退出；启动器必须保留此失败，不能伪造就绪。
     assert result.returncode != 0
-    assert "runtime exited during ownership/health warmup with status 23" in result.stderr
+    assert "进程退出，退出码 23" in result.stdout
     assert not Path(env["NUWAX_NAV_STACK_READY_FILE"]).exists()
     captured = json.loads(output.read_text())
     assert captured["argv"] == ["--profile=pct-scan-3d"]
@@ -182,13 +180,3 @@ def test_navigation_child_receives_pct_terrain_source(tmp_path, file_value, envi
     if environment_value is not None:
         env[_TERRAIN_SOURCE] = environment_value
     assert _run_terrain_launcher(env, output, root) == expected
-
-
-def test_inherited_pct_terrain_default_does_not_hide_later_saved_value(tmp_path):
-    env, settings, output, root = _terrain_startup(tmp_path)
-    # 父启动器先补默认，文件随后修改；子启动器必须重读新值。
-    command = ["bash", "-c",
-               "source services/geometry/source_runtime_env.sh && "
-               f"printf '%s\\n' '{_TERRAIN_SOURCE}=mls' > {shlex.quote(str(settings))} && "
-               "exec bash scripts/systemd/start_nav_stack.sh"]
-    assert _run_terrain_launcher(env, output, root, command) == "mls"

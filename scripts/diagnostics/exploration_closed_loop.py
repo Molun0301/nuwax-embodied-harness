@@ -132,13 +132,6 @@ def configure(output, calibrated_motion=False, pipeline="lio_3d", calibrated_obs
             }),
             "LD_LIBRARY_PATH": str(ROOT / "runtime_data/build_dependencies/slam_toolbox/sysroot/usr/lib/x86_64-linux-gnu") + ":" + os.environ.get("LD_LIBRARY_PATH", ""),
         })
-    for key in (
-        "NUWAX_RUNTIME_ACTIVATION_REQUEST",
-        "NUWAX_RUNTIME_ACTIVATION_RESULT",
-        "NUWAX_RUNTIME_ACTIVATION_CANCEL",
-        "NUWAX_RUNTIME_ACTIVATION_ACK",
-    ):
-        os.environ.pop(key, None)
     os.environ.update(env)
     return working, port
 
@@ -462,24 +455,17 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
     input_thread = threading.Thread(target=inputs, name="模拟狗传感器")
     try:
         guard.start()
-        for name, script, ready in [
-            ("几何", "start_geometry_runtime.sh", "geometry.ready"),
-            ("导航", "start_nav_stack.sh", "nav.ready"),
-        ]:
-            log = (output / (name + "进程.log")).open("w")
-            logs.append(log)
-            process = subprocess.Popen(
-                ["bash", str(ROOT / "scripts/systemd" / script)],
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            processes.append(process)
-            deadline = time.monotonic() + 25
-            while not (working / ready).exists():
-                if process.poll() is not None or time.monotonic() > deadline:
-                    raise RuntimeError(name + "启动失败，请查看进程日志")
-                time.sleep(0.05)
+        from scripts.diagnostics.native_lio_smoke import supervisor_command
+        log = (output / "业务监督者.log").open("w")
+        logs.append(log)
+        process = subprocess.Popen(supervisor_command(["geometry", "nav_stack"], working / "supervision"),
+            cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        processes.append(process)
+        deadline = time.monotonic() + 60
+        while not all((working / name).exists() for name in ("geometry.ready.runtime", "nav.ready.runtime")):
+            if process.poll() is not None or time.monotonic() > deadline:
+                raise RuntimeError("组件启动失败，请查看业务监督者日志")
+            time.sleep(0.05)
         gateway_thread.start()
         deadline = time.monotonic() + 20
         while not server.started:

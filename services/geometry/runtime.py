@@ -1329,7 +1329,7 @@ class PlatformGeometryRuntime:
         else:
             LOGGER.info(
                 "nuwax-geometry-runtime binary 未配置（NUWAX_GEOMETRY_RUNTIME_BINARY）；"
-                "Python 只挂接由 scripts/systemd/start_geometry_runtime.sh 管理的进程。"
+                "Python 只挂接由 python -m scripts.supervisor 管理的进程。"
             )
         runtime_port = int(
             getattr(self.config, "runtime_port", 0)
@@ -1464,7 +1464,7 @@ class PlatformGeometryRuntime:
         """挂接 canonical Rust geometry runtime 并建立 gRPC 连接。
 
         兼容旧方法名，但本方法不创建进程。进程唯一 owner 是
-        ``scripts/systemd/start_geometry_runtime.sh``；失联时清理本地 handle 并
+        ``python -m scripts.supervisor``；失联时清理本地 handle 并
         fail-closed，等待外部 owner 恢复。
         """
         if self._geometry_runtime_subprocess is not None:
@@ -2429,12 +2429,6 @@ class PlatformGeometryRuntime:
                 "tf_localization_provider": self._geometry_runtime_status_stub("tf_localization_provider"),
             "diagnostics": diagnostics,
             "mapping_stack": {
-                "script": str(
-                    self._repo_root()
-                    / "scripts"
-                    / "systemd"
-                    / "start_geometry_runtime.sh"
-                ),
                 "starts_external_geometry_by_default": False,
                 "message": "GO2 几何栈由共享 nuwax-geometry-runtime 承载。",
             },

@@ -1,10 +1,12 @@
+> 历史证据：本专项的旧脚本与身份清理机制已由 A1 业务监督者替代。
+
 # C1 启动清理按实例归属修复
 
-本专项仅修改 `scripts/start_gateway.sh`、直接回归 `scripts/check_gateway_cleanup_ownership.py` 和本文档。未修改共享 `scripts/systemd/process_identity.sh`、安装协议或此前已发布的四文件。没有 Git 暂存、提交、推送操作。
+本专项仅修改 `已退休的 Bash 业务启动器`、直接回归 `已退休的清理拥有方检查` 和本文档。未修改共享 `已退休的进程身份脚本`、安装协议或此前已发布的四文件。没有 Git 暂存、提交、推送操作。
 
 ## 问题与调用链
 
-模块生成的 `generations/<id>/start.sh` → `scripts/start_gateway.sh` → 启动前清理 / stop_existing_gateway / stop_gateway → 各组件清理函数 → terminate_* / send_signal_to_process_scope。
+模块生成的 `generations/<id>/start.sh` → `已退休的 Bash 业务启动器` → 启动前清理 / stop_existing_gateway / stop_gateway → 各组件清理函数 → terminate_* / send_signal_to_process_scope。
 
 修复前，网关残留通过命令名称和端口子串匹配；几何、跟随、视频和 external cleanup 通过全局名称匹配。PID 文件没有安装归属核对；PGID 不等于自身便发送整个进程组信号。几何兜底还能按端口调用 fuser/lsof 杀进程并无条件删除公共 `/tmp/nuwax_video.sock`、`/tmp/nuwax_video.shm`。这些入口不全受 core 模块关闭配置约束。独立安装目录和端口不足以保护用户其他实例。
 
@@ -29,7 +31,7 @@
 执行方式：
 
 ```sh
-python3 -B scripts/check_gateway_cleanup_ownership.py \
+python3 -B 已退休的清理拥有方检查 \
   --evidence-dir /home/ml/Documents/Codex/2026-10-08/task-2/startup-review-final
 ```
 
@@ -56,7 +58,7 @@ python3 -B scripts/check_gateway_cleanup_ownership.py \
 
 对保存的修复前脚本运行同一最终回归：2 通过、7 断言失败、3 错误。错误分别是批量旧清理超时、旧端口 worker 未退出、公共视频文件被删除；其余失败包括真实跨实例误停、混合组误停、托管组件误停、错误 PID 目标被停等。原始对照日志：`/home/ml/Documents/Codex/2026-10-08/task-2/startup-owner-before.log`；各用例详情保存在 `startup-owner-before/`。对照也仅在私有 namespace 内运行。
 
-`bash -n scripts/start_gateway.sh`、`git diff --check` 通过。回归脚本的 Python 3.8 语法解析通过；实际执行解释器为 Python 3.12.3，没有精确 3.8.10 运行证明。该轮没有运行原生编译或完整 core 安装。
+`bash -n 已退休的 Bash 业务启动器`、`git diff --check` 通过。回归脚本的 Python 3.8 语法解析通过；实际执行解释器为 Python 3.12.3，没有精确 3.8.10 运行证明。该轮没有运行原生编译或完整 core 安装。
 
 ## core 后续离线依赖准备
 

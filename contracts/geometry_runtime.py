@@ -76,17 +76,6 @@ def build_default_mapping_pcd_root() -> str:
     return str(Path(__file__).resolve().parents[1] / "runtime_data" / "geometry" / "pcd")
 
 
-def build_default_geometry_runtime_start_script() -> str:
-    """返回 nuwax-geometry-runtime 受监督启动器路径。"""
-
-    return str(
-        Path(__file__).resolve().parents[1]
-        / "scripts"
-        / "systemd"
-        / "start_geometry_runtime.sh"
-    )
-
-
 @dataclass
 class GeometryTopicsConfig:
     """平台几何侧车统一话题配置。"""
@@ -327,7 +316,6 @@ class PlatformGeometryConfig:
     runtime_binary: str = field(default_factory=build_default_geometry_runtime_binary)
     runtime_port: int = field(default_factory=build_default_geometry_runtime_port)
     runtime_ready_file: str = field(default_factory=build_default_geometry_runtime_ready_file)
-    runtime_start_script: str = field(default_factory=build_default_geometry_runtime_start_script)
     lcm_url: str = field(default_factory=build_default_lcm_url)
     lcm_backend: str = "real-lcm"
     # Geometry Runtime owner profile 三个正交选择轴；Rust 启动预检会再次严格校验。

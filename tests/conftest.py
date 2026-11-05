@@ -51,8 +51,7 @@ def navigation_startup_root(tmp_path, monkeypatch):
             monkeypatch.delenv(key)
     root = tmp_path / "启动配置"
     for relative in (
-        "scripts/systemd/start_nav_stack.sh", "scripts/systemd/start_geometry_runtime.sh",
-        "scripts/systemd/process_identity.sh", "services/geometry/source_runtime_env.sh",
+        "scripts/supervisor.py",
         "scripts/lib/config_env.sh", "scripts/resolve_navigation_pipeline.py",
         "scripts/resolve_robot_geometry.py", "contracts/navigation_pipeline.py",
         "core/config_values.py", "core/config_catalog.json", "core/robot_geometry.py",

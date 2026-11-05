@@ -45,8 +45,8 @@
 - [x] `scripts/bootstrap.py`：运行时包检查改为 `go2_slam_nav`、`explore_lite` 等
 - [x] `scripts/bootstrap.py`：默认生成 `NUWAX_GEOMETRY_EXTERNAL_SCRIPT` 指向顶层 `go2.sh`
 - [x] `scripts/bootstrap.py`：默认 `NUWAX_GEOMETRY_OCCUPANCY_TOPIC=/map_obstacles`
-- [x] `scripts/start_gateway.sh`：`geometry_root` → `GO2_RTABNAV2`
-- [x] `scripts/start_gateway.sh`：进程清理模式对齐 `go2_slam_nav` / `explore_node`
+- [x] `旧业务启动器（已退休）`：`geometry_root` → `GO2_RTABNAV2`
+- [x] `旧业务启动器（已退休）`：进程清理模式对齐 `go2_slam_nav` / `explore_node`
 - [x] `python3 scripts/bootstrap.py check --robot go2 --geometry` 通过（Go2SLAM 项全 OK）
 - [ ] `python3 scripts/bootstrap.py apply` 后配置一致（**可选复验**）
 
@@ -86,7 +86,7 @@
 - [x] `GO2_RTABNAV2/scripts/env.sh` + `load_platform_geometry_env.sh`
 - [x] `go2.sh`：定位直读传入 `.db`；DB 根目录对齐 `NUWAX_RTABMAP_DATABASE_ROOT`
 - [x] `ros_bridge_client.py`：`env.sh` 回退路径可用
-- [x] `nuwax_ros_bridge` + `start_gateway.sh`：默认 `/map_obstacles`
+- [x] `nuwax_ros_bridge` + `旧业务启动器（已退休）`：默认 `/map_obstacles`
 
 ### 2.5 其他 P1/P2
 
@@ -389,7 +389,7 @@
 
 ### 部署与启动
 
-- [ ] `bash scripts/start_gateway.sh` 启动无报错
+- [ ] `python -m scripts.supervisor` 启动无报错
 - [ ] 网关健康：`curl /api/health` 正常
 - [ ] `bootstrap check` 识别 `GO2_RTABNAV2/ws/install/setup.bash`
 

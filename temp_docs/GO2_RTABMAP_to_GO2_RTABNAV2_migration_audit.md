@@ -140,7 +140,7 @@ GO2_RTABNAV2 **没有** 等价脚本；Nav2 参数在包内 `config/nav2_params_
 | 3 | `scripts/bootstrap.py` | `GO2SLAM_WS_DIR = .../src/go2slam` | 改为 `.../src/GO2_RTABNAV2/ws`；重命名 `go2slam_*` → `go2_rtabnav2_*` |
 | 4 | `scripts/bootstrap.py` | `GO2SLAM_RUNTIME_REQUIRED_PACKAGES = (go2_navigation2, go2_slam, ...)` | 改为 `(go2_slam_nav, go2_cmd_processor, explore_lite, rtabmap_slam, ...)` |
 | 5 | `scripts/bootstrap.py` | `build_go2slam` CLI / check 文案 `src/go2slam` | 更新路径与包名；默认 `NUWAX_GEOMETRY_EXTERNAL_SCRIPT` 指向 `GO2_RTABNAV2/go2.sh` |
-| 6 | `scripts/start_gateway.sh` | `geometry_root=.../go2slam`；清理模式 `go2_nav/*` | 改为 `GO2_RTABNAV2`；清理模式对齐 `go2_slam_nav`（参考 `GO2_RTABNAV2/go2.sh` `kill_stale`） |
+| 6 | `旧业务启动器（已退休）` | `geometry_root=.../go2slam`；清理模式 `go2_nav/*` | 改为 `GO2_RTABNAV2`；清理模式对齐 `go2_slam_nav`（参考 `GO2_RTABNAV2/go2.sh` `kill_stale`） |
 
 ### P1 — 平台运行时行为正确性
 
@@ -226,7 +226,7 @@ GO2_RTABNAV2_RUNTIME_REQUIRED_PACKAGES = (
 
 ---
 
-## 5. start_gateway.sh 进程清理改动
+## 5. 旧业务启动器（已退休） 进程清理改动
 
 当前 `cleanup_external_geometry_processes()`：
 
@@ -318,7 +318,7 @@ Phase 0 — GO2_RTABNAV2 自洽
   └─ 手工 ./go2.sh --mapping|--localization|--explore 验收
 
 Phase 1 — 配置与部署入口（P0）
-  ├─ .env / bootstrap.py / start_gateway.sh
+  ├─ .env / bootstrap.py / 旧业务启动器（已退休）
   └─ bootstrap check + apply 无报错
 
 Phase 2 — 平台运行时适配（P1）
@@ -338,7 +338,7 @@ Phase 3 — 文档与清理（P2/P4）
 | # | 场景 | 通过条件 |
 |---|------|----------|
 | 1 | `bootstrap.py check --robot go2 --geometry` | 识别 `GO2_RTABNAV2/ws/install/setup.bash` 与 `go2_slam_nav` 包 |
-| 2 | `start_gateway.sh` 启动 | 无残留 `go2_nav` 误杀/漏杀 |
+| 2 | `旧业务启动器（已退休）` 启动 | 无残留 `go2_nav` 误杀/漏杀 |
 | 3 | `activate_map` + `start_mapping` | `go2.sh --mapping` 拉起，`/map`、`/tf` 就绪 |
 | 4 | `explore_area` | 探索任务终态事件 `task.succeeded`，非超时 |
 | 5 | `stop_mapping` | 几何栈进程全部退出 |
@@ -482,7 +482,7 @@ NUWAX_GEOMETRY_EXTERNAL_FRONTIER_TOPIC=explore/frontiers   # 新增配置键（�
 ### 11.2 脚本 & 入口
 
 - `scripts/bootstrap.py`（全文 `go2slam` / `GO2SLAM_*`）
-- `scripts/start_gateway.sh`（L242-258）
+- `旧业务启动器（已退休）`（L242-258）
 
 ### 11.3 平台服务
 

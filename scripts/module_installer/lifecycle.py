@@ -7,14 +7,12 @@ from __future__ import annotations
 
 import os
 import re
-import signal
 import subprocess
-import time
 from pathlib import Path
 from typing import Mapping, Optional
 
-from scripts.device_manager.common import atomic_write
-from scripts.device_manager.runtime import base_environment
+from scripts.device_manager.common import atomic_json, atomic_write
+from scripts.device_manager.runtime import Runtime, base_environment
 
 from .runtime import effective_settings
 
@@ -50,8 +48,7 @@ def deployment_descriptor(root: Path, home: Path, prefix: Path, modules, robot: 
     return {"version": 1, "source_root": str(root), "install_home": str(home),
             "robot_adapter": robot, "modules": list(modules), "prefix": str(prefix),
             "lifecycle": {"mode": mode, "service_name": service_name},
-            "listener": {"host": host, "port": port, "settings_path": str(settings_path)},
-            "pid_file": str(root / "runtime_data/gateway/gateway.pid")}
+            "listener": {"host": host, "port": port, "settings_path": str(settings_path)}}
 
 
 def inspect_installation(home: Path, environment=None) -> dict:
@@ -112,15 +109,8 @@ def render_user_service(descriptor: Mapping) -> str:
             + "ExecStart=/bin/bash " + _unit_quote(home / "current/start.sh", executable=True) + "\n"
             + "Environment=" + _unit_quote("NUWAX_GATEWAY_HOST=" + descriptor["listener"]["host"]) + "\n"
             + "Environment=" + _unit_quote("NUWAX_GATEWAY_PORT=" + str(descriptor["listener"]["port"])) + "\n"
-            + "KillMode=control-group\nTimeoutStopSec=60\nRestart=on-failure\nRestartSec=3\n"
+            + "KillMode=process\nTimeoutStopSec=60\nRestart=on-failure\nRestartSec=3\n"
             + "\n[Install]\nWantedBy=default.target\n")
-
-
-def _exited(pid):
-    try:
-        return (Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
-    except FileNotFoundError:
-        return True
 
 
 def stop_current(descriptor: Mapping) -> int:
@@ -129,28 +119,8 @@ def stop_current(descriptor: Mapping) -> int:
     if mode == "systemd-user":
         subprocess.run(["systemctl", "--user", "stop", name], check=True)
         return 0
-    try:
-        pid = int(Path(descriptor["pid_file"]).read_text().strip())
-        if pid <= 1:
-            raise ValueError("Invalid gateway PID")
-        if _exited(pid):
-            return 0
-        identity = ("NUWAX_INSTALL_HOME=" + descriptor["install_home"]).encode()
-        try:
-            owned = identity in (Path("/proc") / str(pid) / "environ").read_bytes().split(b"\0")
-        except OSError:
-            owned = False
-        if not owned:
-            Path(descriptor["pid_file"]).unlink(missing_ok=True)
-            return 0
-        os.kill(pid, signal.SIGTERM)
-        for _ in range(300):
-            if _exited(pid):
-                return 0
-            time.sleep(0.2)
-        raise RuntimeError("Gateway shutdown is still pending; installation retained")
-    except (FileNotFoundError, ProcessLookupError):
-        return 0
+    Runtime(Path(descriptor["install_home"])).stop(Path(descriptor["prefix"]))
+    return 0
 
 
 def start_current(descriptor: Mapping, *, foreground=False, log=None):
@@ -173,7 +143,11 @@ def start_current(descriptor: Mapping, *, foreground=False, log=None):
     environment["NUWAX_INSTALL_HOME"] = str(home)
     environment["NUWAX_GATEWAY_HOST"] = current["listener"]["host"]
     environment["NUWAX_GATEWAY_PORT"] = str(current["listener"]["port"])
+    state = home / "config/runtime.json"
     if foreground:
+        atomic_json(state, {"pid": os.getpid(), "prefix": current["prefix"]})
         os.execve(argv[0], argv, environment)
-    return subprocess.Popen(argv, cwd=current["source_root"], env=environment, stdin=subprocess.DEVNULL,
-                            stdout=log, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
+    process = subprocess.Popen(argv, cwd=current["source_root"], env=environment, stdin=subprocess.DEVNULL,
+                               stdout=log, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
+    atomic_json(state, {"pid": process.pid, "prefix": current["prefix"]})
+    return process

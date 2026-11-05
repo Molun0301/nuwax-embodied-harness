@@ -48,7 +48,7 @@ Current chain:
 - `scripts/module_installer/manager.py:409–441`: creates/builds a generation, records its manifest and switches `current`
 - `scripts/module_installer/builds.py:32–35,458–475`: navigation uses `cargo build --locked --release --jobs <jobs> --manifest-path services/nuwax-workspace/Cargo.toml --target-dir <managed cache> --package nuwax-nav-stack --bin nuwax-nav-stack --features simple-2d,replanning-astar,mls`; it copies `target/release/nuwax-nav-stack` to the generation's `bin`
 - `scripts/module_installer/runtime.py:190–216,314–317`, `lifecycle.py:118,177`: launch paths bind binary variables to the selected generation's `bin` and use its `current/start.sh`
-- `scripts/start_gateway.sh:506–507,533–542`, `scripts/systemd/start_nav_stack.sh:17,127–140`: require and execute the selected binary. The standalone launcher's default is the repository release binary; missing binaries fail instead of silently falling back to debug
+- 旧 Bash 启动链（已由 `scripts/supervisor.py` 替代）: require and execute the selected binary. The standalone launcher's default is the repository release binary; missing binaries fail instead of silently falling back to debug
 
 Workspace release settings are thin LTO, one codegen unit and stripped symbols (`services/nuwax-workspace/Cargo.toml:137–140`), without a tracked opt-level override. Standalone geometry release explicitly uses opt-level 3, LTO and one codegen unit (`services/geometry/nuwax_geometry_runtime/Cargo.toml:120–125`). No tracked package-specific dev/test/release overrides were found in the audited tree.
 

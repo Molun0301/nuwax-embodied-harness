@@ -7,7 +7,7 @@
     "target_file": "core_env",
     "consumers": [
       "gateways/person_follow.py",
-      "scripts/start_gateway.sh"
+      "scripts/supervisor.py"
     ],
     "apply_scope": "重启网关后生效",
     "description": "网关启动时一并启动人物跟随进程；关闭后人物跟随显示为未启用。"
@@ -20,36 +20,10 @@
     "target_file": "core_env",
     "consumers": [
       "gateways/person_follow.py",
-      "scripts/start_gateway.sh",
-      "scripts/systemd/start_person_follow.sh",
-      "scripts/systemd/wait_for_person_follow_ready.sh"
+      "scripts/supervisor.py"
     ],
     "apply_scope": "重启网关、人物跟随后端后生效",
     "description": "人物跟随进程就绪后写入的标记文件，网关据此确认进程可用；留空时按部署方式使用默认位置。"
-  },
-  "NUWAX_PERSON_FOLLOW_START_TIMEOUT_SEC": {
-    "zh_name": "person-follow 启动超时（秒）",
-    "type": "int",
-    "default": 15,
-    "section_id": "nav_stack",
-    "target_file": "core_env",
-    "consumers": [
-      "scripts/systemd/wait_for_person_follow_ready.sh"
-    ],
-    "apply_scope": "重启相关服务后生效",
-    "description": "等待人物跟随进程就绪的最长时间（秒），超时按启动失败处理。"
-  },
-  "NUWAX_PERSON_FOLLOW_WARMUP_STEPS": {
-    "zh_name": "人物跟随订阅准备检查次数",
-    "type": "int",
-    "default": 150,
-    "section_id": "nav_stack",
-    "target_file": "core_env",
-    "consumers": [
-      "scripts/systemd/start_person_follow.sh"
-    ],
-    "apply_scope": "重启人物跟随后端后生效",
-    "description": "人物跟随进程启动后检查订阅是否就绪的次数，每次间隔0.1秒，用完仍未就绪则启动失败。"
   },
   "NUWAX_GEOMETRY_POSE_TOPIC": {
     "zh_name": "几何位姿话题",
@@ -62,20 +36,6 @@
     ],
     "apply_scope": "重启相关服务后生效",
     "description": ""
-  },
-  "NUWAX_GEOMETRY_RUNTIME_HEALTH_TIMEOUT": {
-    "zh_name": "几何健康检查超时（秒）",
-    "type": "int",
-    "default": 30,
-    "section_id": "geometry_runtime",
-    "target_file": "core_env",
-    "consumers": [
-      "scripts/systemd/start_geometry_runtime.sh",
-      "scripts/systemd/wait_for_geometry_runtime_ready.sh",
-      "services/geometry/nuwax_geometry_runtime/src/main.rs"
-    ],
-    "apply_scope": "重启几何运行时后生效",
-    "description": "启动几何运行进程后，等待其通过健康检查并写出就绪文件的最长时间，单位秒，填正整数；超时视为启动失败。"
   },
   "NUWAX_MAPPING_HEIGHT_CELLS": {
     "zh_name": "栅格高度（格）",
@@ -157,23 +117,9 @@
     "target_file": "core_env",
     "consumers": [
       "scripts/diagnostics/check_nuwax_runtime.sh",
-      "scripts/start_gateway.sh",
-      "scripts/systemd/start_nav_stack.sh",
-      "scripts/systemd/wait_for_nav_stack_ready.sh"
+      "scripts/supervisor.py"
     ],
     "apply_scope": "重启导航后端后生效",
-    "description": ""
-  },
-  "NUWAX_NAV_STACK_START_TIMEOUT_SEC": {
-    "zh_name": "导航栈启动超时（秒）",
-    "type": "int",
-    "default": 15,
-    "section_id": "nav_stack",
-    "target_file": "core_env",
-    "consumers": [
-      "scripts/systemd/wait_for_nav_stack_ready.sh"
-    ],
-    "apply_scope": "重启相关服务后生效",
     "description": ""
   },
   "NUWAX_NAV_PCT_TERRAIN_SOURCE": {
@@ -184,7 +130,7 @@
     "target_file": "core_env",
     "advanced": false,
     "consumers": [
-      "services/geometry/source_runtime_env.sh",
+      "scripts/supervisor.py",
       "services/nuwax-workspace/crates/nuwax-nav-runtime/src/native_map.rs",
       "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_oriented.rs",
       "services/nuwax-workspace/crates/nuwax-exploration/src/surface_adapter.rs"
@@ -715,20 +661,7 @@
     "section_id": "nav_stack",
     "target_file": "core_env",
     "consumers": [
-      "scripts/start_gateway.sh",
-      "scripts/systemd/start_nav_stack.sh"
-    ],
-    "apply_scope": "重启导航后端后生效",
-    "description": ""
-  },
-  "NUWAX_NAV_STACK_WARMUP_STEPS": {
-    "zh_name": "导航订阅准备检查次数",
-    "type": "int",
-    "default": 150,
-    "section_id": "nav_stack",
-    "target_file": "core_env",
-    "consumers": [
-      "scripts/systemd/start_nav_stack.sh"
+      "scripts/supervisor.py"
     ],
     "apply_scope": "重启导航后端后生效",
     "description": ""
@@ -740,8 +673,7 @@
     "section_id": "nav_stack",
     "target_file": "core_env",
     "consumers": [
-      "scripts/start_gateway.sh",
-      "scripts/systemd/start_person_follow.sh"
+      "scripts/supervisor.py"
     ],
     "apply_scope": "重启人物跟随后端后生效",
     "description": ""
@@ -753,7 +685,7 @@
     "section_id": "nav_stack",
     "target_file": "core_env",
     "consumers": [
-      "scripts/start_gateway.sh"
+      "scripts/supervisor.py"
     ],
     "apply_scope": "重启网关启动脚本后生效",
     "description": ""
@@ -766,7 +698,7 @@
     "target_file": "core_env",
     "consumers": [
       "gateways/person_follow.py",
-      "scripts/start_gateway.sh",
+      "scripts/supervisor.py",
       "services/nuwax-workspace/crates/nuwax-nav-visual-servoing/src/bin/nuwax-person-follow.rs"
     ],
     "apply_scope": "重启网关、人物跟随后端后生效",
@@ -779,7 +711,7 @@
     "section_id": "nav_stack",
     "target_file": "core_env",
     "consumers": [
-      "scripts/start_gateway.sh",
+      "scripts/supervisor.py",
       "services/nuwax-workspace/crates/nuwax-nav-visual-servoing/src/bin/nuwax-person-follow.rs"
     ],
     "apply_scope": "重启人物跟随后端后生效",
@@ -792,7 +724,7 @@
     "section_id": "nav_stack",
     "target_file": "core_env",
     "consumers": [
-      "scripts/start_gateway.sh",
+      "scripts/supervisor.py",
       "services/nuwax-workspace/crates/nuwax-nav-visual-servoing/src/bin/nuwax-person-follow.rs"
     ],
     "apply_scope": "重启人物跟随后端后生效",
@@ -806,7 +738,7 @@
     "target_file": "core_env",
     "consumers": [
       "gateways/person_follow.py",
-      "scripts/start_gateway.sh",
+      "scripts/supervisor.py",
       "services/nuwax-workspace/crates/nuwax-nav-visual-servoing/src/bin/nuwax-person-follow.rs"
     ],
     "apply_scope": "重启网关、人物跟随后端后生效",
@@ -869,8 +801,7 @@
     "consumers": [
       "gateways/motion_guard.py",
       "scripts/diagnostics/check_nuwax_runtime.sh",
-      "scripts/start_gateway.sh",
-      "scripts/systemd/start_nav_stack.sh",
+      "scripts/supervisor.py",
       "services/geometry/nuwax_geometry_runtime/src/server.rs",
       "services/geometry/nuwax_geometry_runtime/src/vertical_v2_canary.rs",
       "services/navigation/motion_safety_guard/__main__.py",
@@ -878,90 +809,6 @@
     ],
     "apply_scope": "重启网关、几何运行时、导航后端、运动控制进程后生效",
     "description": "运动控制进程监听的本地套接字路径，网关、几何运行时和导航通过它下发运动指令，各进程须使用同一路径。"
-  },
-  "NUWAX_MOTION_GUARD_START_TIMEOUT_SEC": {
-    "zh_name": "运动控制启动等待时间（秒）",
-    "type": "int",
-    "default": 15,
-    "section_id": "robot",
-    "target_file": "core_env",
-    "consumers": [
-      "scripts/start_gateway.sh"
-    ],
-    "apply_scope": "重启网关启动脚本后生效",
-    "description": ""
-  },
-  "NUWAX_GATEWAY_RESTART": {
-    "zh_name": "网关自动重启策略",
-    "type": "str",
-    "default": "on-failure",
-    "section_id": "gateway",
-    "target_file": "core_env",
-    "consumers": [
-      "scripts/start_gateway.sh"
-    ],
-    "apply_scope": "重启网关启动脚本后生效",
-    "description": ""
-  },
-  "NUWAX_GATEWAY_RESTART_SEC": {
-    "zh_name": "网关重启间隔（秒）",
-    "type": "int",
-    "default": 3,
-    "section_id": "gateway",
-    "target_file": "core_env",
-    "consumers": [
-      "scripts/start_gateway.sh"
-    ],
-    "apply_scope": "重启网关启动脚本后生效",
-    "description": ""
-  },
-  "NUWAX_GATEWAY_RESTART_MAX_ATTEMPTS": {
-    "zh_name": "网关重启次数上限（零为不限）",
-    "type": "int",
-    "default": 0,
-    "section_id": "gateway",
-    "target_file": "core_env",
-    "consumers": [
-      "scripts/start_gateway.sh"
-    ],
-    "apply_scope": "重启网关启动脚本后生效",
-    "description": ""
-  },
-  "NUWAX_GATEWAY_STOP_TIMEOUT_SEC": {
-    "zh_name": "网关正常退出等待时间（秒）",
-    "type": "int",
-    "default": 20,
-    "section_id": "gateway",
-    "target_file": "core_env",
-    "consumers": [
-      "scripts/start_gateway.sh"
-    ],
-    "apply_scope": "重启网关启动脚本后生效",
-    "description": ""
-  },
-  "NUWAX_GATEWAY_KILL_TIMEOUT_SEC": {
-    "zh_name": "网关退出补充等待时间（秒）",
-    "type": "int",
-    "default": 5,
-    "section_id": "gateway",
-    "target_file": "core_env",
-    "consumers": [
-      "scripts/start_gateway.sh"
-    ],
-    "apply_scope": "重启网关启动脚本后生效",
-    "description": ""
-  },
-  "NUWAX_RUNTIME_ACTIVATION_TIMEOUT_SEC": {
-    "zh_name": "运行时激活等待时间（秒）",
-    "type": "float",
-    "default": 95.0,
-    "section_id": "gateway",
-    "target_file": "core_env",
-    "consumers": [
-      "gateways/runtime.py"
-    ],
-    "apply_scope": "重启网关后生效",
-    "description": ""
   },
   "NUWAX_LOG_FORMAT": {
     "zh_name": "终端日志格式",
@@ -1482,28 +1329,6 @@
     "apply_scope": "重启几何运行时后生效",
     "description": ""
   },
-  "NUWAX_RUNTIME_ACTIVATION_ACK_TIMEOUT_SEC": {
-    "zh_name": "运行时激活确认等待时间（秒）",
-    "type": "int",
-    "default": 10,
-    "section_id": "gateway",
-    "target_file": "core_env",
-    "consumers": [
-    ],
-    "apply_scope": "重启相关服务后生效",
-    "description": ""
-  },
-  "NUWAX_RUNTIME_ACTIVATION_COMMIT_TIMEOUT_SEC": {
-    "zh_name": "运行时激活提交等待时间（秒）",
-    "type": "int",
-    "default": 10,
-    "section_id": "gateway",
-    "target_file": "core_env",
-    "consumers": [
-    ],
-    "apply_scope": "重启相关服务后生效",
-    "description": ""
-  },
   "NUWAX_LCM_CHANNEL_GOAL_POSE": {
     "zh_name": "导航目标通道",
     "type": "str",
@@ -1889,7 +1714,7 @@
     "section_id": "geometry_runtime",
     "target_file": "core_env",
     "consumers": [
-      "scripts/systemd/start_geometry_runtime.sh",
+      "scripts/supervisor.py",
       "services/geometry/nuwax_geometry_runtime/src/slam2d_owner.rs"
     ],
     "apply_scope": "重启Geometry与网关后生效",
@@ -2253,7 +2078,7 @@
     "target_file": "core_env",
     "consumers": [
       "scripts/resolve_navigation_pipeline.py",
-      "services/geometry/source_runtime_env.sh",
+      "scripts/supervisor.py",
       "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
     ],
     "apply_scope": "重启网关、几何运行时及导航栈后生效",
@@ -2275,7 +2100,7 @@
     "target_file": "core_env",
     "consumers": [
       "scripts/resolve_navigation_pipeline.py",
-      "services/geometry/source_runtime_env.sh",
+      "scripts/supervisor.py",
       "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
     ],
     "apply_scope": "重启网关、几何运行时及导航栈后生效",
@@ -2289,7 +2114,7 @@
     "target_file": "core_env",
     "consumers": [
       "scripts/resolve_navigation_pipeline.py",
-      "services/geometry/source_runtime_env.sh",
+      "scripts/supervisor.py",
       "services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs"
     ],
     "apply_scope": "重启网关、几何运行时及导航栈后生效",
@@ -2371,7 +2196,7 @@
     "target_file": "core_env",
     "advanced": false,
     "consumers": [
-      "services/geometry/source_runtime_env.sh",
+      "scripts/supervisor.py",
       "services/geometry/nuwax_geometry_runtime/src/main.rs",
       "services/geometry/nuwax_geometry_runtime/src/dynamic_backend.rs"
     ],

@@ -465,8 +465,14 @@ async fn goals_replace_wait_and_end_exploration() {
 
 #[tokio::test]
 async fn relocalization_failure_then_success_and_continue() {
+    let mut source = Fixture::start(false, false).await;
+    source.saved_map("重定位图").await;
+    let saved_map = source.root.join("maps/重定位图");
+    drop(source);
     let mut f = Fixture::start(false, false).await;
-    f.saved_map("重定位图").await;
+    // 新输入拥有方确实没有近期雷达帧，不再依赖加载地图清空持续输入。
+    fs::create_dir_all(f.root.join("maps")).unwrap();
+    fs::rename(saved_map, f.root.join("maps/重定位图")).unwrap();
     f.client
         .load_map(LoadMapRequest {
             map_name: "重定位图".into(),

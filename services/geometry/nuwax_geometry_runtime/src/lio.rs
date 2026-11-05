@@ -199,6 +199,7 @@ impl Lio {
         self.shutdown().await;
         *self.input.lock().await = NativeInputDelivery::default();
         self.auxiliary.lock().clear();
+        self.router.clear_recent_frames();
         let transport =
             LcmTransport::new_real(&env("NUWAX_LCM_URL", "udpm://239.255.76.67:7667?ttl=0"))
                 .map_err(|e| e.to_string())?;

@@ -25,19 +25,6 @@
     "apply_scope": "重启网关、人物跟随后端后生效",
     "description": "人物跟随进程就绪后写入的标记文件，网关据此确认进程可用；留空时按部署方式使用默认位置。"
   },
-  "NUWAX_GEOMETRY_POSE_TOPIC": {
-    "zh_name": "几何位姿话题",
-    "type": "str",
-    "default": "/go2/pose_map",
-    "section_id": "geometry_topics",
-    "target_file": "core_env",
-    "consumers": [
-      "services/geometry/external_debug_observer.py"
-    ],
-    "apply_scope": "重启相关服务后生效",
-    "description": ""
-  },
-
   "NUWAX_MAPPING_HEIGHT_CELLS": {
     "zh_name": "栅格高度（格）",
     "type": "int",

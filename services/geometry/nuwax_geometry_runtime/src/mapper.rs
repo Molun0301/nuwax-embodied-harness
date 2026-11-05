@@ -11,7 +11,6 @@ use crate::{
 };
 use nalgebra::{Isometry3, Point3, Quaternion, Translation3, UnitQuaternion};
 use std::{
-    collections::VecDeque,
     io::Read,
     os::{
         fd::{AsRawFd, FromRawFd},
@@ -19,7 +18,7 @@ use std::{
     },
     path::PathBuf,
     sync::{mpsc, Arc},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::sync::{oneshot, watch};
 
@@ -157,7 +156,6 @@ enum Command {
         proto::DenseCloudChunkRequest,
         oneshot::Sender<Result<proto::DenseCloudChunk, String>>,
     ),
-    Recent(oneshot::Sender<Vec<MappingFrame>>),
     Transform(Isometry3<f64>, oneshot::Sender<Result<(), String>>),
     Name(String),
     Shutdown,
@@ -409,13 +407,6 @@ impl Mapper {
             .map_err(|_| "建图任务已结束")?;
         rx.await.map_err(|_| "建图任务已结束")?
     }
-    pub async fn recent_frames(&self) -> Result<Vec<MappingFrame>, String> {
-        let (tx, rx) = oneshot::channel();
-        self.sender
-            .send(Command::Recent(tx))
-            .map_err(|_| "建图任务已结束")?;
-        rx.await.map_err(|_| "建图任务已结束".into())
-    }
     pub async fn navigation_map_block(
         &self,
         root: nuwax_map_chunks::RootIdentity,
@@ -447,7 +438,6 @@ struct Worker {
     poses: watch::Sender<Option<proto::Pose>>,
     maps: watch::Sender<Option<proto::MapUpdate>>,
     transform: watch::Sender<Isometry3<f64>>,
-    recent: VecDeque<(Instant, MappingFrame)>,
     corrector: Corrector,
     sequence: u64,
     forbidden_path: Option<PathBuf>,
@@ -532,7 +522,6 @@ impl Worker {
             poses,
             maps,
             transform,
-            recent: VecDeque::new(),
             corrector,
             sequence: 0,
             forbidden_path: None,
@@ -612,11 +601,6 @@ impl Worker {
                 let _ = reply.send(self.cloud.dense_chunk(request, &self.config.map_frame_id));
                 Ok(())
             }
-            Command::Recent(reply) => {
-                self.trim_recent();
-                let _ = reply.send(self.recent.iter().map(|(_, frame)| frame.clone()).collect());
-                Ok(())
-            }
             Command::Transform(transform, reply) => {
                 self.map_from_odom = transform;
                 self.transform.send_replace(transform);
@@ -692,24 +676,9 @@ impl Worker {
             self.maps.send_replace(None);
         }
     }
-    fn trim_recent(&mut self) {
-        while self.recent.len() > 8
-            || self
-                .recent
-                .front()
-                .is_some_and(|(time, _)| time.elapsed() > Duration::from_secs(2))
-        {
-            self.recent.pop_front();
-        }
-    }
     fn frame(&mut self, frame: MappingFrame) -> Result<(), String> {
         if frame.session_id != self.session_id {
             return Ok(());
-        }
-        if !frame.mapping_only {
-            self.trim_recent();
-            self.recent.push_back((Instant::now(), frame.clone()));
-            self.trim_recent();
         }
         if !self.anchored && !self.read_only {
             let odom = pose_isometry(&frame.odom_pose);

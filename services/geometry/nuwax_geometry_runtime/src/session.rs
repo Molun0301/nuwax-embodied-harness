@@ -8,13 +8,26 @@ use crate::{
     nav_bridge::NavBridge,
     proto::*,
 };
-use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{HashSet, VecDeque},
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::{mpsc, oneshot, watch};
 use tonic::Status;
 
 #[path = "explorer_worker.rs"]
 mod explorer_worker;
 use explorer_worker::ExplorerWorker;
+
+fn trim_recent(recent: &mut VecDeque<(Instant, MappingFrame)>) {
+    while recent.len() > 8
+        || recent.front().is_some_and(|(time, _)| time.elapsed() > Duration::from_secs(2))
+    {
+        recent.pop_front();
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct Route {
@@ -31,6 +44,8 @@ pub struct FrameRouter {
     pose: watch::Sender<Option<Pose>>,
     odom: watch::Sender<Option<Pose>>,
     faults: mpsc::UnboundedSender<(u64, String)>,
+    // 近期主雷达输入归持续输入拥有方，不随地图会话替换。
+    recent: Arc<parking_lot::Mutex<VecDeque<(Instant, MappingFrame)>>>,
 }
 impl FrameRouter {
     pub(crate) fn mapper(&self) -> Option<Arc<Mapper>> {
@@ -76,12 +91,25 @@ impl FrameRouter {
         }
     }
     pub fn publish_frame(&self, frame: MappingFrame) {
+        if !frame.mapping_only {
+            let mut recent = self.recent.lock();
+            recent.push_back((Instant::now(), frame.clone()));
+            trim_recent(&mut recent);
+        }
         let route = self.route.borrow().clone();
         if let Some(route) =
             route.filter(|route| route.id == frame.session_id && route.accept_frames)
         {
             route.mapper.feed(frame);
         }
+    }
+    pub(crate) fn recent_frames(&self) -> Vec<MappingFrame> {
+        let mut recent = self.recent.lock();
+        trim_recent(&mut recent);
+        recent.iter().map(|(_, frame)| frame.clone()).collect()
+    }
+    pub(crate) fn clear_recent_frames(&self) {
+        self.recent.lock().clear();
     }
     pub fn publish_planar(&self, session_id: u64, grid: OccupancyGrid) {
         if let Some(route) = self
@@ -149,6 +177,7 @@ impl SessionHandle {
             pose: pose_tx,
             odom,
             faults: faults.clone(),
+            recent: Default::default(),
         };
         let (maps_tx, maps) = watch::channel(None);
         tokio::spawn(forward_maps(
@@ -744,7 +773,7 @@ impl Session {
             result.finished_at_ns = now_ns();
             result
         } else {
-            corrector::Corrector::relocalize(&mapper).await?
+            corrector::Corrector::relocalize(&mapper, self.router.recent_frames()).await?
         };
         self.state.reason = if result.succeeded {
             String::new()
@@ -1131,6 +1160,7 @@ pub(crate) fn test_router(
             pose,
             odom,
             faults,
+            recent: Default::default(),
         },
         pose_rx,
         fault_rx,

@@ -126,12 +126,14 @@ impl FineCloud {
             last_revoke_ms: 0.,
         })
     }
-    pub(crate) fn from_archive(file: std::fs::File) -> Result<Self, String> {
+    pub(crate) fn from_archive(
+        file: std::fs::File,
+    ) -> Result<(Self, nuwax_map_chunks::RootIdentity), String> {
         let mut archive = nuwax_map_chunks::ArchiveReader::open(file)?;
         let mut value = Self::new(archive.root().voxel_size_m())?;
         let root = archive.import(value.writer.repository())?;
         value.writer.restore_archived(&root)?;
-        Ok(value)
+        Ok((value, root.identity()))
     }
     pub(crate) fn removed_keys(&self) -> &[(i32, i32, i32)] {
         self.dynamic.removed_keys()

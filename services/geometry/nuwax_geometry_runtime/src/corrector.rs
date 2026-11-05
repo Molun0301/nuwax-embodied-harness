@@ -123,17 +123,16 @@ impl Corrector {
             Mode::Relocalization => Ok(None),
         }
     }
-    pub async fn relocalize(mapper: &Mapper) -> Result<proto::RelocalizationResult, tonic::Status> {
+    pub async fn relocalize(
+        mapper: &Mapper,
+        frames: Vec<MappingFrame>,
+    ) -> Result<proto::RelocalizationResult, tonic::Status> {
         let backend = mapper.correction_backend();
         if matches!(backend, "library_pgo" | "native_pgo") {
             return Err(tonic::Status::failed_precondition(
                 "当前配置使用回环校正，不能执行重定位",
             ));
         }
-        let frames = mapper
-            .recent_frames()
-            .await
-            .map_err(tonic::Status::unavailable)?;
         let target = mapper
             .surface_map()
             .await

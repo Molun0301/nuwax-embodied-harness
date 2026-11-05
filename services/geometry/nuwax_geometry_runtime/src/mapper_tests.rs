@@ -119,18 +119,35 @@ async fn loaded_map_stays_read_only_while_pose_and_recent_obstacles_continue() {
 }
 
 #[tokio::test]
+async fn cold_load_republishes_the_same_domain_with_an_advanced_revision() {
+    let source = Mapper::start(73, config()).unwrap();
+    source.feed(room_frame(73, 1_000_000_000));
+    let baseline = source.snapshot().await.unwrap();
+    source.shutdown().await.unwrap();
+    let loaded = Mapper::load(73, config(), baseline.clone(), true).unwrap();
+    let restored = loaded.snapshot().await.unwrap();
+    assert_eq!(restored.cloud.display, baseline.cloud.display);
+    assert_eq!(restored.occupancy, baseline.occupancy);
+    assert!(restored.cloud.revision > baseline.cloud.revision);
+    let fine = loaded.surface_map().await.unwrap().unwrap();
+    assert_eq!(fine.manifest().revision, restored.cloud.revision);
+    loaded.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn relocalization_reports_real_success_and_failure_and_rejects_pgo() {
     let source = Mapper::start(25, config()).unwrap();
     source.feed(room_frame(25, 1_000_000_000));
     let baseline = source.snapshot().await.unwrap();
     source.shutdown().await.unwrap();
     let loaded = Mapper::load(26, config(), baseline.clone(), true).unwrap();
-    let missing = Corrector::relocalize(&loaded).await.unwrap();
+    let (router, _, _) = crate::session::test_router(loaded.clone());
+    let missing = Corrector::relocalize(&loaded, router.recent_frames()).await.unwrap();
     assert!(!missing.succeeded);
     assert_eq!(missing.frames_used, 0);
-    loaded.feed(room_frame(26, 2_000_000_000));
+    router.publish_frame(room_frame(26, 2_000_000_000));
     loaded.snapshot().await.unwrap();
-    let matched = Corrector::relocalize(&loaded).await.unwrap();
+    let matched = Corrector::relocalize(&loaded, router.recent_frames()).await.unwrap();
     assert!(matched.succeeded, "真实同场景匹配失败：{}", matched.message);
     assert_eq!(matched.frames_used, 1);
     assert_eq!(matched.pose.unwrap().frame_id, "map");
@@ -139,7 +156,7 @@ async fn relocalization_reports_real_success_and_failure_and_rejects_pgo() {
     pgo.correction_backend = "library_pgo".into();
     let loaded = Mapper::load(27, pgo, baseline, true).unwrap();
     assert_eq!(
-        Corrector::relocalize(&loaded).await.unwrap_err().code(),
+        Corrector::relocalize(&loaded, router.recent_frames()).await.unwrap_err().code(),
         tonic::Code::FailedPrecondition
     );
     loaded.shutdown().await.unwrap();
@@ -148,12 +165,13 @@ async fn relocalization_reports_real_success_and_failure_and_rejects_pgo() {
 #[tokio::test]
 async fn auxiliary_scans_do_not_enter_relocalization_and_keep_their_source_log() {
     let mapper = Mapper::start(28, config()).unwrap();
-    mapper.feed(room_frame(28, 1_000_000_000));
+    let (router, _, _) = crate::session::test_router(mapper.clone());
+    router.publish_frame(room_frame(28, 1_000_000_000));
     mapper.snapshot().await.unwrap();
     let mut auxiliary = room_frame(28, 1_000_000_000);
     auxiliary.mapping_only = true;
     auxiliary.sensor_id = "rear_lidar".into();
-    mapper.feed(auxiliary);
+    router.publish_frame(auxiliary);
     let snapshot = mapper.snapshot().await.unwrap();
     assert!(
         mapper.error_rx().borrow().is_none(),
@@ -161,7 +179,7 @@ async fn auxiliary_scans_do_not_enter_relocalization_and_keep_their_source_log()
         *mapper.error_rx().borrow()
     );
     assert_eq!(snapshot.scans.len(), 2);
-    assert_eq!(mapper.recent_frames().await.unwrap().len(), 1);
+    assert_eq!(router.recent_frames().len(), 1);
     mapper.shutdown().await.unwrap();
 }
 
@@ -447,7 +465,6 @@ async fn slow_worker_coalesces_frames_before_save_without_a_frame_backlog() {
     refresh.await.unwrap().unwrap();
     let snapshot = saved.await.unwrap().unwrap();
     assert_eq!(snapshot.last_pose.unwrap().timestamp_ns, 1_000_001_000);
-    assert_eq!(mapper.recent_frames().await.unwrap().len(), 1);
     assert_eq!(snapshot.scans.len(), 1);
     mapper.shutdown().await.unwrap();
 }

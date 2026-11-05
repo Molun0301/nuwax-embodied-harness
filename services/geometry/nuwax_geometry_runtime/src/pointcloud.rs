@@ -89,11 +89,20 @@ impl CloudMap {
             size = snapshot.voxel_size;
             revision = snapshot.revision;
             stamp = snapshot.source_timestamp_ns;
-            if let Some(file) = snapshot.fine_archive {
-                fine = FineCloud::from_archive(file.try_clone().map_err(|e| e.to_string())?)?;
+            let archive = if let Some(file) = snapshot.fine_archive {
+                Some(file.try_clone().map_err(|e| e.to_string())?)
             } else if let Some(root) = snapshot.fine {
                 let (file, _) = nuwax_map_chunks::archive_file(root.manifest(), &root.repository)?;
-                fine = FineCloud::from_archive(file)?;
+                Some(file)
+            } else {
+                None
+            };
+            if let Some(file) = archive {
+                let (restored, publication) = FineCloud::from_archive(file)?;
+                fine = restored;
+                if publication.domain == domain(session_id) {
+                    revision = revision.max(publication.revision) + 1;
+                }
             }
             if let Some(source) = snapshot.dense {
                 let (file, _) = source.archive("map")?;
@@ -384,7 +393,7 @@ impl CloudMap {
         if self.readonly_classifier.is_none() {
             let classifier = if let Some(root) = &self.surface {
                 let (file, _) = nuwax_map_chunks::archive_file(root.manifest(), &root.repository)?;
-                FineCloud::from_archive(file)?
+                FineCloud::from_archive(file)?.0
             } else {
                 FineCloud::new(VOXEL_SIZE)?
             };

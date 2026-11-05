@@ -1,5 +1,43 @@
 use super::*;
 
+#[tokio::test]
+async fn recent_input_survives_end_and_load_for_immediate_relocalization() {
+    let mapper = Mapper::start(711, MapperConfig::default()).unwrap();
+    let mut session = actor(mapper.clone(), PathBuf::new()).await;
+    let points_body = (-10..=10).flat_map(|a| (-10..=10).flat_map(move |b| {
+        let u = a as f64 * 0.1;
+        let v = b as f64 * 0.1;
+        [[3., u, v], [u, 2., v], [u, v, -0.5]]
+    })).collect();
+    let frame = MappingFrame {
+        session_id: 711,
+        odom_pose: pose_from_isometry(nalgebra::Isometry3::translation(4., 0., 0.), "odom", 1_000_000_000),
+        points_body,
+        ray_origin_body: [0.; 3],
+        mapping_only: false,
+        sensor_id: "lidar".into(),
+        registered_cloud: None,
+    };
+    session.router.publish_frame(frame.clone());
+    let snapshot = mapper.snapshot().await.unwrap();
+    session.end_current().await.unwrap();
+    let mut idle_frame = frame.clone();
+    idle_frame.session_id = 0;
+    idle_frame.odom_pose.timestamp_ns += 1;
+    session.router.publish_frame(idle_frame);
+    let loaded = Mapper::load(712, MapperConfig::default(), snapshot, true).unwrap();
+    session.install(loaded, SessionPhase::Loaded);
+    let frames = session.router.recent_frames();
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[0].odom_pose, frame.odom_pose, "输入缓冲保留原始里程计坐标");
+    let result = session.relocalize(RelocalizeRequest::default()).await.unwrap();
+    assert!(result.succeeded, "{}", result.message);
+    assert_eq!(result.frames_used, 2);
+    assert_eq!(session.phase(), SessionPhase::Localized);
+    session.end_current().await.unwrap();
+    session.nav.shutdown().await;
+}
+
 async fn actor(mapper: Arc<Mapper>, root: PathBuf) -> Session {
     let (router, _, _) = test_router(mapper.clone());
     let (route, _) = watch::channel(router.route.borrow().clone());

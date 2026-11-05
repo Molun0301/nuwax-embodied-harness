@@ -333,9 +333,9 @@ async fn unknown_sensor_frame_is_rejected_without_map_mutation() {
             );
         }
         assert!(faults.try_recv().is_err());
+        assert!(lio.router.recent_frames().is_empty());
     }
     assert!(mapper.snapshot().await.unwrap().occupancy.is_none());
-    assert!(mapper.recent_frames().await.unwrap().is_empty());
     mapper.shutdown().await.unwrap();
 }
 
@@ -390,7 +390,7 @@ async fn odom_pointcloud_before_pose_is_rejected_without_mutation() {
     let (stop, stopped) = watch::channel(false);
     let task = tokio::spawn(
         Ingress {
-            router,
+            router: router.clone(),
             native: None,
             self_filter: None,
             transport,
@@ -423,7 +423,7 @@ async fn odom_pointcloud_before_pose_is_rejected_without_mutation() {
             .timestamp_ns,
         200
     );
-    let frames = mapper.recent_frames().await.unwrap();
+    let frames = router.recent_frames();
     assert_eq!(frames.len(), 1);
     assert_eq!(frames[0].odom_pose.timestamp_ns, 200);
     assert!(faults.try_recv().is_err());

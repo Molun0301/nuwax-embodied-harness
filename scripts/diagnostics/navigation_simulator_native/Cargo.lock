@@ -1119,25 +1119,22 @@ version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
  "libc",
+ "rayon",
  "serde",
  "serde_json",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
 name = "nuwax-motion-safety-guard"
 version = "0.1.0"
 dependencies = [
- "chrono",
  "prost",
  "rustix",
- "serde",
- "serde_json",
  "thiserror",
  "tokio",
  "tonic-build",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -1222,6 +1219,7 @@ dependencies = [
  "nuwax-nav-pct-native",
  "nuwax-nav-scan-native",
  "nuwax-nav-types-messages",
+ "nuwax-pct-tomography",
  "thiserror",
  "tokio",
  "tracing",
@@ -1307,6 +1305,14 @@ dependencies = [
  "rayon",
  "serde",
  "thiserror",
+]
+
+[[package]]
+name = "nuwax-pct-tomography"
+version = "0.1.0"
+dependencies = [
+ "nuwax-nav-pct-native",
+ "rayon",
 ]
 
 [[package]]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the checked-in geometry Python protobuf bindings deterministically."""
+"""从唯一协议源确定性生成 Geometry 与运动守卫的 Python 绑定。"""
 
 from __future__ import annotations
 
@@ -25,6 +25,8 @@ PROTO = (
 )
 CHECKED_IN_DIR = ROOT / "services" / "geometry" / "proto_gen"
 GENERATED_FILES = ("geometry_runtime_pb2.py", "geometry_runtime_pb2_grpc.py")
+GUARD_PROTO = ROOT / "services" / "navigation" / "proto" / "motion_guard.proto"
+GUARD_DIR = ROOT / "services" / "navigation" / "proto_gen"
 GRPC_TOOLS_VERSION = "1.70.0"
 ABSOLUTE_PB2_IMPORT = "import geometry_runtime_pb2 as geometry__runtime__pb2"
 RELATIVE_PB2_IMPORT = "from . import geometry_runtime_pb2 as geometry__runtime__pb2"
@@ -81,19 +83,30 @@ def _generate(output_dir: Path) -> None:
         .replace(STATIC_RUNTIME_MESSAGE, LINTED_STATIC_RUNTIME_MESSAGE),
         encoding="utf-8",
     )
+    result = protoc.main([
+        "grpc_tools.protoc", "-I{}".format(GUARD_PROTO.parent),
+        "--python_out={}".format(output_dir), str(GUARD_PROTO),
+    ])
+    if result != 0:
+        raise RuntimeError("grpc_tools.protoc failed with exit code {}".format(result))
+
+
+def _destinations():
+    return [(name, CHECKED_IN_DIR / name) for name in GENERATED_FILES] + [
+        ("motion_guard_pb2.py", GUARD_DIR / "motion_guard_pb2.py")
+    ]
 
 
 def _changed_files(generated_dir: Path) -> List[str]:
     return [
         name
-        for name in GENERATED_FILES
-        if (generated_dir / name).read_bytes() != (CHECKED_IN_DIR / name).read_bytes()
+        for name, destination in _destinations()
+        if (generated_dir / name).read_bytes() != destination.read_bytes()
     ]
 
 
 def _install(generated_dir: Path) -> None:
-    for name in GENERATED_FILES:
-        destination = CHECKED_IN_DIR / name
+    for name, destination in _destinations():
         temporary = destination.with_name(destination.name + ".tmp")
         shutil.copyfile(generated_dir / name, temporary)
         os.replace(str(temporary), str(destination))
@@ -115,7 +128,7 @@ def main() -> int:
             changed = _changed_files(generated_dir)
             if changed:
                 parser.error(
-                    "checked-in geometry bindings are stale: {}".format(", ".join(changed))
+                    "checked-in protocol bindings are stale: {}".format(", ".join(changed))
                 )
         else:
             _install(generated_dir)

@@ -4,10 +4,13 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 import enum
 import math
+import logging
 import threading
 
 from contracts.events import RuntimeEventCategory
-from typing import Any, Callable, Iterator, Optional, TYPE_CHECKING
+from typing import Any, Callable, Iterator, Optional, Tuple, TYPE_CHECKING
+
+LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from core.tasks import TaskContext
@@ -75,7 +78,7 @@ class NavigationStatus:
     remaining_distance_m: float
     target: Optional[Pose]
     no_feasible_path: bool
-    planned_path: tuple[tuple[float, float, float], ...]
+    planned_path: Tuple[Tuple[float, float, float], ...]
     exploration_child: bool
 
 
@@ -162,6 +165,7 @@ class GeometryStateView:
         self._threads = []
         self._streams = {}
         self._callbacks = {"state": [], "pose": [], "map": []}
+        self._last_session_event = None
 
     def start(self) -> None:
         with self._condition:
@@ -236,16 +240,16 @@ class GeometryStateView:
         return self._subscribe("map", callback)
 
     def _receive(self, kind):
-        from services.geometry.client import GeometryError
         while not self._stopped.is_set():
-            stream = getattr(self._client, f"subscribe_{kind}")()
-            with self._condition:
-                if self._stopped.is_set():
-                    stream.cancel()
-                    return
-                self._streams[kind] = stream
+            stream = None
             try:
+                stream = getattr(self._client, f"subscribe_{kind}")()
+                with self._condition:
+                    if self._stopped.is_set():
+                        return
+                    self._streams[kind] = stream
                 for value in stream:
+                    session_event = None
                     with self._condition:
                         if self._stopped.is_set():
                             return
@@ -255,21 +259,35 @@ class GeometryStateView:
                             if (value.phase in {SessionPhase.IDLE, SessionPhase.FAULT}
                                     or (self._map is not None and self._map.grid.map_name != value.map_name)):
                                 self._map = None
+                            payload = {"phase": value.phase.value, "map_name": value.map_name,
+                                       "reason": value.reason, "info": asdict(value.info)}
+                            if payload != self._last_session_event:
+                                session_event = payload
+                                self._last_session_event = payload
                         elif kind == "pose":
                             self._pose = value
                         else:
                             self._map = value
                         callbacks = tuple(self._callbacks[kind])
                         self._condition.notify_all()
-                    self._events.publish(self._events.build_event(
-                        f"geometry.{kind}", category=RuntimeEventCategory.SYSTEM,
-                        source="geometry", payload=asdict(value)))
+                    if session_event is not None:
+                        self._events.publish(self._events.build_event(
+                            "geometry.state", category=RuntimeEventCategory.SYSTEM,
+                            source="geometry", payload=session_event))
                     for callback in callbacks:
-                        callback(value)
-            except GeometryError:
-                pass
+                        try:
+                            callback(value)
+                        except BaseException:
+                            LOGGER.exception("Geometry %s 订阅回调失败", kind)
+            except BaseException:
+                if not self._stopped.is_set():
+                    LOGGER.exception("Geometry %s 订阅中断，稍后重新订阅", kind)
             finally:
-                stream.cancel()
+                if stream is not None:
+                    try:
+                        stream.cancel()
+                    except BaseException:
+                        LOGGER.exception("关闭 Geometry %s 订阅失败", kind)
                 with self._condition:
                     self._streams.pop(kind, None)
                     if kind == "state":

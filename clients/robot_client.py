@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from http.client import HTTPException
 import json
 import os
 from pathlib import Path
@@ -42,12 +43,15 @@ class RobotClient:
                 payload = json.load(error)
             detail = payload["error"]
             raise RobotClientError(detail["code"], detail["message"], details=detail.get("details")) from error
-        except (URLError, OSError) as error:
+        except (URLError, OSError, HTTPException) as error:
             raise RobotClientError("transport_error", str(error)) from error
 
     def _request(self, path, **kwargs):
-        with self._open(path, **kwargs) as response:
-            return json.load(response)
+        try:
+            with self._open(path, **kwargs) as response:
+                return json.load(response)
+        except (OSError, HTTPException) as error:
+            raise RobotClientError("transport_error", str(error)) from error
 
     def info(self):
         return self._request("/api/agent")
@@ -84,9 +88,12 @@ class RobotClient:
     def download_artifact(self, artifact_id, output: Path):
         path = "/artifacts/" + quote(artifact_id, safe="")
         metadata = self._request(path + "/meta")
-        with self._open(path) as response, Path(output).open("xb") as target:
-            while data := response.read(1024 * 1024):
-                target.write(data)
+        try:
+            with self._open(path) as response, Path(output).open("xb") as target:
+                while data := response.read(1024 * 1024):
+                    target.write(data)
+        except HTTPException as error:
+            raise RobotClientError("transport_error", str(error)) from error
         return {"artifact": metadata, "path": str(output)}
 
 

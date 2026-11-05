@@ -21,7 +21,7 @@ CAPABILITIES = [
         schema({"query": {"type": "string", "minLength": 1}, "camera_id": {"type": "string"},
                 "detector_backend": {"type": "string"},
                 "duration_sec": {"type": "number", "exclusiveMinimum": 0, "default": 2.0},
-                "interval_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 0.2, "default": 0.1},
+                "interval_sec": {"type": "number", "exclusiveMinimum": 0, "default": 0.1},
                 "lost_timeout_sec": {"type": "number", "exclusiveMinimum": 0, "default": 0.8},
                 "timeout_sec": {"type": "number", "exclusiveMinimum": 0}}, ("query",)),
         "task", follow_target, needs=("geometry", "person_follow"), motion=True, timeout_sec=900.0),

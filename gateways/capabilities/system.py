@@ -56,7 +56,7 @@ CAPABILITIES = [
     Capability("get_active_tasks", "读取活动任务与最近终态任务。",
                schema({"history_limit": {"type": "integer", "minimum": 0}}), "query", active_tasks),
     Capability("list_capabilities", "列出当前机器人支持的能力。",
-               schema({"include_unsupported": {"type": "boolean"}}), "query", list_capabilities),
+               schema(), "query", list_capabilities),
     Capability("get_task_status", "读取任务快照。", schema({"task_id": {"type": "string"}}, ("task_id",)),
                "query", task_status),
     Capability("cancel_task", "请求取消任务，处理器退出后结束。",

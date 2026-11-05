@@ -35,6 +35,8 @@ class ExecutionFeedback:
             feedback = MotionExecutionFeedback.model_validate(value)
         except Exception as exc:
             raise ActuatorError("MOTION_FEEDBACK_INVALID", "执行器反馈格式无效。") from exc
+        if feedback.orientation_wxyz is not None and not any(feedback.orientation_wxyz):
+            raise ActuatorError("MOTION_FEEDBACK_INVALID", "执行器朝向四元数不能全为零。")
         now = self._unix_ns()
         if feedback.frame_id != self.frame_id:
             raise ActuatorError("MOTION_FEEDBACK_INVALID", "执行器速度未使用受控机体坐标。")

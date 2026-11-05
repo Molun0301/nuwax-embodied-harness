@@ -11,8 +11,10 @@ CURRENT_POSE = object()
 
 class PlacesMixin:
     def list_tagged_locations(self, *, limit=None, library_name=None):
-        records = self.library_snapshot(library_name).read("location")
-        return records if limit is None else records[-limit:]
+        reader = self.reader(library_name)
+        if limit is None or limit == 0:
+            return reader.read("location")
+        return tuple(reversed(reader.read("location", order="rowid DESC", limit=limit)))
 
     def tag_location(self, name, *, map_name, aliases=None, description=None, camera_id=None,
                      attach_latest_observation=True, attach_latest_perception=True, auto_create_memory=True,
@@ -25,11 +27,11 @@ class PlacesMixin:
                        else None if observation_context is not None
                        else self._perception_service.get_latest_full_perception(camera_id))
                       if attach_latest_perception else None)
-        observation = ((observation_context if observation_context is not None
-                        else self._observation_service.get_latest_observation(camera_id))
-                       if attach_latest_observation and perception is None else None)
+        observation = (observation_context if observation_context is not None else
+            self._observation_service.get_latest_observation(camera_id)
+            if attach_latest_observation and perception is None else None)
         source = perception if perception is not None else observation
-        spaces = [space for space in self.records("scene_space")
+        spaces = [space for space in self._record_map("scene_space").values()
                   if space.map_name == map_name and pose_in_scene_space(pose, space)]
         space = spaces[0] if spaces else None
         labels = self._scene_space_semantic_labels(space) if space is not None else []
@@ -67,8 +69,7 @@ class PlacesMixin:
         if image_bytes is None and source is not None and source.image_artifact is not None:
             image_bytes = self._artifact_store.read_bytes(source.image_artifact.artifact_id)
         def save(store):
-            if store is None or store.name != map_name:
-                return None, None
+            self._require_library(store, map_name)
             photos = self._copy_photos(store, source, image_bytes) if source is not None else []
             photo_refs = [self.photo_ref(identity, library_name=map_name).model_dump(mode="json") for identity in photos]
             value = location.model_copy(update={"metadata": {**location.metadata,

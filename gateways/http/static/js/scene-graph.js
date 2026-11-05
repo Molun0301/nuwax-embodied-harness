@@ -179,7 +179,7 @@
   async function exportImage(id){
     if(!state.graph)return;const version=state.graph.graph_revision;
     try{const result=await invoke('render_scene_graph_image',{...(id?{node_id:id}:{}),expected_graph_revision:version,width:1280});
-      if(version!==state.graph?.graph_revision)return;message('地图图像已生成。');const link=element('a','打开地图图像');link.href='/artifacts/'+encodeURIComponent(result.artifact.artifact_id);link.target='_blank';link.rel='noopener noreferrer';$('sceneGraphStatus').append(' ',link);
+      if(version!==state.graph?.graph_revision)return;message('地图图像已生成。');const link=element('a','打开地图图像');link.href=result.artifact.uri;link.target='_blank';link.rel='noopener noreferrer';$('sceneGraphStatus').append(' ',link);
     }catch(error){message(error.message,true);if(error.status===409)schedule();}
   }
   function contextChanged(){

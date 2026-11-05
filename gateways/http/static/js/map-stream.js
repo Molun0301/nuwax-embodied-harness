@@ -6,10 +6,12 @@
         const magic = [0x4e, 0x55, 0x57, 0x41, 0x58, 0x4d, 0x41, 0x50];
         if (bytes.byteLength < 13 || !magic.every((value, index) => bytes[index] === value) || bytes[8] !== 4) return null;
         const headerLength = new DataView(buffer, 9, 4).getUint32(0, true);
+        if (13 + headerLength > bytes.byteLength) return null;
         const message = JSON.parse(new TextDecoder().decode(bytes.subarray(13, 13 + headerLength)));
         const frame = message.frame;
         const grid = frame.payload.grid;
         const cells = grid.width * grid.height;
+        if (13 + headerLength + cells + frame.payload.raw_data_length > bytes.byteLength) return null;
         grid.data = new Int8Array(buffer, 13 + headerLength, cells);
         frame.payload.raw_data = new Int8Array(buffer, 13 + headerLength + cells, frame.payload.raw_data_length);
         delete frame.payload.raw_data_length;

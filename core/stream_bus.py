@@ -394,17 +394,23 @@ class StreamBus:
                 self._latest_by_topic[stored_diagnostic.topic] = stored_diagnostic
 
     def _retain_frame_locked(self, frame: StreamFrame) -> None:
-        evicted_frame = (
-            self._frames[0] if len(self._frames) == self._retention_limit else None
-        )
+        # 大幅栅格与点云只保留最新快照，游标仍记录被替换的范围。
+        evicted = []
+        if frame.topic in {"map.frame", "pointcloud.frame", "pointcloud_map.snapshot"}:
+            retained = []
+            for old in self._frames:
+                if old.topic == frame.topic:
+                    evicted.append(old)
+                else:
+                    retained.append(old)
+            self._frames = collections.deque(retained, maxlen=self._retention_limit)
+        if len(self._frames) == self._retention_limit:
+            evicted.append(self._frames[0])
         self._frames.append(frame)
-        if evicted_frame is None or evicted_frame.cursor is None:
-            return
-        previous = self._evicted_through_by_topic.get(evicted_frame.topic, 0)
-        self._evicted_through_by_topic[evicted_frame.topic] = max(
-            previous,
-            int(evicted_frame.cursor),
-        )
+        for old in evicted:
+            if old.cursor is not None:
+                previous = self._evicted_through_by_topic.get(old.topic, 0)
+                self._evicted_through_by_topic[old.topic] = max(previous, int(old.cursor))
 
     def publish_dropped(self, topic: str, *, source: str, dropped_count: int = 1) -> StreamFrame:
         with self._lock:

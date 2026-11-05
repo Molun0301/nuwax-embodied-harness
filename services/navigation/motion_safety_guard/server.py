@@ -107,6 +107,7 @@ class MotionGuardUnixServer:
 
     def start(self) -> None:
         self._core.initialize_zero()
+        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         self.socket_path.unlink(missing_ok=True)
         server = _Server(str(self.socket_path), _Handler)
         server.core = self._core

@@ -108,6 +108,8 @@ class _TargetSearch:
             result = result.model_copy(update={"verified": False,
                 "reason": "当前场景缺少目标检测证据，已拒绝开放词汇找物命中。",
                 "metadata": {**result.metadata, "target_detection_required": True, "target_detection_evidence": evidence}})
+        if goal_id is not None:
+            result = self.platform.memory.record_arrival_verification(result, map_name=self.map_name)
         return result
 
     def search_state(self, sample):
@@ -158,9 +160,9 @@ class _TargetSearch:
         return metadata["excluded_reason"] or metadata["resolution_decision"]
 
     def writeback(self, sample, verification, candidate, goal_id):
-        candidate_id = candidate.candidate_id if candidate is not None else ""
-        record_id = candidate.record_id if candidate is not None else ""
-        record_kind = candidate.metadata["record_kind"] if candidate is not None else ""
+        candidate_id = candidate.candidate_id if candidate is not None else verification.candidate_id or ""
+        record_id = candidate.record_id if candidate is not None else verification.metadata.get("record_id", "")
+        record_kind = candidate.metadata["record_kind"] if candidate is not None else verification.metadata.get("record_kind", "")
         target_name = candidate.target_name if candidate is not None else self.query
         outcome = {"memory_written": False, "skipped_reason": "", "candidate_confidence_decay": 0.0}
         try:
@@ -762,3 +764,37 @@ def explore_and_find_target(platform, ctx, args):
                     details={"map_name": search.map_name, "query": search.query,
                         "candidate_diagnostics": state["candidate_diagnostics"],
                         "rejected_candidate_ids": sorted(search.rejected)})
+
+
+def navigate_to_named_location(platform, ctx, args):
+    """命名地点沿用普通导航，并共享连拍复核、记录、写回和失败降权。"""
+    from contracts.spatial_memory import NavigationCandidate
+    target = platform.navigation_memory.resolve(args["target_name"], camera_id=args.get("camera_id"))
+    pose = target.pose
+    navigation = navigate_to_pose(platform, ctx, {"x": pose.x, "y": pose.y, "z": pose.z,
+        "yaw_rad": pose.yaw, "frame_id": pose.frame_id, "motion_generation": args["motion_generation"]},
+        region=target.region)
+    if not args.get("verify_on_arrival", True):
+        return {**navigation, "target_name": target.target_name}
+    search = _TargetSearch(platform, ctx, {**args, "query": target.target_name}, "navigate_to_named_location")
+    with search.acquired():
+        try:
+            sample, refresh = search.refresh(frame_count=3, remember=False, source="named_arrival_verify")
+            save_sample_photo(platform, sample)
+            candidate = target.candidate if isinstance(target.candidate, NavigationCandidate) else None
+            verification = platform.memory.verify_arrival_observation(target.target_name,
+                perception_context=sample.context, current_pose=sample.pose,
+                target_record=target.candidate, navigation_candidate=candidate,
+                similarity_threshold=args.get("verify_similarity_threshold", .55),
+                expected_map_name=search.map_name, goal_id=navigation["goal_id"])
+            verification = platform.memory.record_arrival_verification(verification, map_name=search.map_name)
+            writeback = search.writeback(sample, verification, candidate, navigation["goal_id"])
+        except GatewayError as error:
+            raise GatewayError(error.message, error_code="arrival_verification_failed", http_status=409,
+                               details={"cause": error.to_payload()}) from error
+        if not verification.verified:
+            raise GatewayError(verification.reason or "到达核对失败", error_code="arrival_verification_failed",
+                http_status=409, details=verification.model_dump(mode="json"))
+        return {**navigation, "target_name": target.target_name,
+                "verification": verification.model_dump(mode="json"),
+                "observation_writeback": writeback, "perception_refresh": refresh}

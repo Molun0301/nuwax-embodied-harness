@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 from collections import deque
-from datetime import timezone
+from datetime import datetime, timezone
 import json
+import logging
 import threading
 from typing import Any
 
@@ -18,10 +19,12 @@ from services.geometry.planar_wire import encode_planar_scan
 from services.geometry.proto_gen import geometry_runtime_pb2 as pb
 from services.geometry.state import Pose
 
+LOGGER = logging.getLogger(__name__)
+
 
 class InputBridge:
     def __init__(self, *, client, info, sensor_sample_provider=None, localization_provider=None,
-                 point_cloud_provider=None, sensor_source_owner=None, recording_sink=None):
+                 point_cloud_provider=None, sensor_source_owner=None, recording_sink=None, input_executor=None):
         self._client = client
         self._info = info
         self._sensor_provider = sensor_sample_provider
@@ -29,6 +32,10 @@ class InputBridge:
         self._point_cloud_provider = point_cloud_provider
         self._source_owner = sensor_source_owner
         self._recording = recording_sink
+        self._input_executor = input_executor
+        self._executor = None
+        self._sender = None
+        self._source_started = False
         self._condition = threading.Condition()
         self._lifecycle = threading.RLock()
         self._started = False
@@ -47,28 +54,46 @@ class InputBridge:
         with self._lifecycle:
             if self._started:
                 return
-            self._runtime_info = self._info() if callable(self._info) else self._info
-            self._settings = json.loads(self._runtime_info.planar_input_config_json or "{}")
-            self._running = True
-            self._worker = threading.Thread(target=self._publish, name="geometry-input", daemon=True)
-            self._worker.start()
             try:
-                if self._sensor_provider is not None:
-                    subscription = self._sensor_provider.subscribe_sensor_sample(self._on_sample)
-                    self._subscriptions.append((self._sensor_provider, "unsubscribe_sensor_sample", subscription))
-                if (self._runtime_info.pipeline == "slam_2d"
-                        and self._settings.get("odometry_source") == "device"
-                        and self._localization_provider is not None):
-                    subscription = self._localization_provider.subscribe_localization(self._on_odometry)
-                    self._subscriptions.append((self._localization_provider, "unsubscribe_localization", subscription))
-                if self._runtime_info.pipeline == "lio_3d" and self._point_cloud_provider is not None:
-                    subscription = self._point_cloud_provider.subscribe_point_cloud(self._on_point_cloud)
-                    self._subscriptions.append((self._point_cloud_provider, "unsubscribe_point_cloud", subscription))
-                if self._source_owner is not None:
-                    self._source_owner.start()
+                self._runtime_info = self._info() if callable(self._info) else self._info
+                self._settings = json.loads(self._runtime_info.planar_input_config_json or "{}")
+                self._assembler = LioMeasurementAssembler()
+                self._last_error = None
+                self._running = True
+                self._executor = self._input_executor() if callable(self._input_executor) else self._input_executor
+                if self._executor is not None:
+                    self._executor.start_input_delivery(_ProcessDelivery, {
+                        "target": self._client.target, "info": self._runtime_info,
+                        "recording": self._recording is not None,
+                    }, self._recording)
+                else:
+                    self._sender = self._client.input_sender()
+                    worker = threading.Thread(target=self._publish, args=(self._sender,),
+                                              name="geometry-input", daemon=True)
+                    worker.start()
+                    self._worker = worker
+                    if self._recording is not None:
+                        self._recording.record_event("input_bridge.started", {"pipeline": self._runtime_info.pipeline})
+                    if self._sensor_provider is not None:
+                        subscription = self._sensor_provider.subscribe_sensor_sample(self._on_sample)
+                        self._subscriptions.append((self._sensor_provider, "unsubscribe_sensor_sample", subscription))
+                    if (self._runtime_info.pipeline == "slam_2d"
+                            and self._settings.get("odometry_source") == "device"
+                            and self._localization_provider is not None):
+                        subscription = self._localization_provider.subscribe_localization(self._on_odometry)
+                        self._subscriptions.append((self._localization_provider, "unsubscribe_localization", subscription))
+                    if self._runtime_info.pipeline == "lio_3d" and self._point_cloud_provider is not None:
+                        subscription = self._point_cloud_provider.subscribe_point_cloud(self._on_point_cloud)
+                        self._subscriptions.append((self._point_cloud_provider, "unsubscribe_point_cloud", subscription))
+                    if self._source_owner is not None:
+                        self._source_started = True
+                        self._source_owner.start()
                 self._started = True
             except BaseException:
-                self.stop()
+                try:
+                    self.stop()
+                except BaseException:
+                    LOGGER.exception("清理未启动的 Geometry 输入桥失败")
                 raise
 
     def stop(self):
@@ -77,22 +102,51 @@ class InputBridge:
                 self._running = False
                 self._queue.clear()
                 self._condition.notify_all()
-            self._client._close_inputs()
-            try:
-                for provider, method, subscription in self._subscriptions:
+            errors = []
+            if self._sender is not None:
+                self._sender.cancel()
+            if self._executor is not None:
+                try:
+                    self._executor.stop_input_delivery()
+                    status = self._executor.input_delivery_status()
+                    self._published = status.get("published", self._published)
+                    self._dropped = status.get("dropped", self._dropped)
+                    self._last_error = status.get("last_error")
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    self._executor = None
+            for provider, method, subscription in self._subscriptions:
+                try:
                     getattr(provider, method)(subscription)
-                self._subscriptions.clear()
-                if self._source_owner is not None:
+                except BaseException as error:
+                    errors.append(error)
+            self._subscriptions.clear()
+            if self._source_started:
+                try:
                     self._source_owner.stop()
-            finally:
-                if self._worker is not None and self._worker is not threading.current_thread():
-                    self._worker.join()
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    self._source_started = False
+            if self._worker is not None and self._worker is not threading.current_thread():
+                self._worker.join()
+            self._worker = self._sender = None
+            self._started = False
+            if errors:
+                raise errors[0]
 
     def status(self):
         with self._condition:
-            return {"started": self._started, "ready": self._running,
-                    "pipeline": None if self._runtime_info is None else self._runtime_info.pipeline,
-                    "published": self._published, "dropped": self._dropped, "last_error": self._last_error}
+            result = {"started": self._started, "ready": self._running,
+                      "pipeline": None if self._runtime_info is None else self._runtime_info.pipeline,
+                      "published": self._published, "dropped": self._dropped, "last_error": self._last_error}
+        executor = self._executor
+        if executor is not None:
+            result.update(executor.input_delivery_status())
+            result["started"] = self._started
+            result["ready"] = self._running and result.get("ready", False)
+        return result
 
     def _enqueue(self, kind, value):
         with self._condition:
@@ -106,12 +160,15 @@ class InputBridge:
             self._condition.notify_all()
 
     def _on_sample(self, sample):
-        if isinstance(sample, SensorStreamFailure):
-            with self._condition:
+        with self._condition:
+            if not self._running:
+                return
+            if isinstance(sample, SensorStreamFailure):
                 self._last_error = sample.reason
-            return
-        if self._recording is not None:
-            self._recording.record_sensor(sample)
+                return
+            # 原文入队与停止共用运行状态锁，停止返回后不会再追加记录尾部。
+            if self._recording is not None:
+                self._recording.record_sensor(sample)
         if isinstance(sample, CanonicalLaserScan):
             self._enqueue("scan", encode_planar_scan(sample))
         elif isinstance(sample, CanonicalLioMeasurement):
@@ -159,7 +216,11 @@ class InputBridge:
             values.append(("offset_ns", "<u4", metadata["offset_ns_array"]))
         request = self._pack_cloud(values, cloud.point_count)
         request.frame_id = cloud.frame_id
-        request.timestamp_ns = round(cloud.timestamp.astimezone(timezone.utc).timestamp() * 1e9)
+        if "source_timestamp_ns" in metadata:
+            request.timestamp_ns = metadata["source_timestamp_ns"]
+        else:
+            delta = cloud.timestamp.astimezone(timezone.utc) - datetime(1970, 1, 1, tzinfo=timezone.utc)
+            request.timestamp_ns = (delta.days * 86400 + delta.seconds) * 1_000_000_000 + delta.microseconds * 1000
         request.is_dense = cloud.is_dense
         request.mapping_only = cloud.mapping_only
         request.sensor_origin_xyz.extend((cloud.sensor_origin.x, cloud.sensor_origin.y, cloud.sensor_origin.z))
@@ -205,7 +266,7 @@ class InputBridge:
                 gyro_rps_x=sample.gyro_rps[0], gyro_rps_y=sample.gyro_rps[1], gyro_rps_z=sample.gyro_rps[2])
         return request
 
-    def _publish(self):
+    def _publish(self, sender):
         while True:
             with self._condition:
                 while self._running and not self._queue:
@@ -214,12 +275,12 @@ class InputBridge:
                     return
                 kind, value = self._queue.popleft()
             if kind == "cloud":
-                accepted = self._client.publish_point_cloud(value)
+                accepted = sender.publish_point_cloud(value)
             elif kind == "scan":
-                accepted = self._client.publish_laser_scan(value)
+                accepted = sender.publish_laser_scan(value)
             else:
                 pose, domain, clock_id = value
-                accepted = self._client.publish_odom(pose, clock_domain=domain, clock_id=clock_id)
+                accepted = sender.publish_odom(pose, clock_domain=domain, clock_id=clock_id)
             with self._condition:
                 if accepted:
                     self._published += 1
@@ -227,3 +288,43 @@ class InputBridge:
                 else:
                     self._dropped += 1
                     self._last_error = "Geometry 输入发送失败"
+
+
+class _RecordingRelay:
+    """采集进程只移交原始记录，SQLite写入者仍由网关唯一拥有。"""
+
+    def __init__(self, emit):
+        self._emit = emit
+
+    def record_sensor(self, sample):
+        return self._emit("sensor", sample)
+
+    def record_event(self, kind, metadata, *, source_ns=0):
+        return self._emit("event", (kind, metadata, source_ns))
+
+
+class _ProcessDelivery:
+    """在已有Go2采集进程里组合相同输入桥，不建立第二套配组或投递算法。"""
+
+    def __init__(self, spec, record, source):
+        from services.geometry.client import GeometryClient
+        self._client = GeometryClient(spec["target"])
+        self._bridge = InputBridge(client=self._client, info=spec["info"],
+            sensor_sample_provider=source,
+            localization_provider=source if hasattr(source, "subscribe_localization") else None,
+            point_cloud_provider=source if hasattr(source, "subscribe_point_cloud") else None,
+            recording_sink=_RecordingRelay(record) if spec["recording"] else None)
+        try:
+            self._bridge.start()
+        except BaseException:
+            self._client.close()
+            raise
+
+    def status(self):
+        return self._bridge.status()
+
+    def stop(self):
+        try:
+            self._bridge.stop()
+        finally:
+            self._client.close()

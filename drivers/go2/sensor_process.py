@@ -86,10 +86,7 @@ def _sensor_process_main(config, data, status, commands, stop, source_factory, f
     def receive(sample):
         nonlocal queued_bytes
         with delivery_lock:
-            if delivery is not None:
-                delivery.receive(sample)
-                return
-            if local_delivery_selected or not forward_samples:
+            if delivery is not None or local_delivery_selected or not forward_samples:
                 return
         size = _sample_size(sample)
         with condition:
@@ -147,18 +144,21 @@ def _sensor_process_main(config, data, status, commands, stop, source_factory, f
                             if delivery is not None:
                                 raise RuntimeError("输入交付已启动")
                         # 连接期间尚未订阅输入，不能持锁阻塞DDS读取并积累旧样本。
-                        candidate = factory(spec, record)
+                        candidate = factory(spec, record, source)
                         with delivery_lock:
                             delivery = candidate
                             local_delivery_selected = True
-                        result = delivery.get_status()
+                        result = delivery.status()
                         delivery_sequence = command_id
                     elif operation == "stop":
                         with delivery_lock:
                             if delivery is not None:
                                 delivery.stop()
+                                result = delivery.status()
                                 delivery = None
-                        result = {"started": False, "ready": False, "recording_transport_dropped": recording_dropped}
+                            else:
+                                result = {"started": False, "ready": False}
+                        result["recording_transport_dropped"] = recording_dropped
                         delivery_sequence = command_id
                         # 排空标记不能因记录满队列而丢失；不占用传感器交付锁。
                         with condition:
@@ -188,7 +188,7 @@ def _sensor_process_main(config, data, status, commands, stop, source_factory, f
                 "joint_snapshot": joint_getter() if callable(joint_getter) else None,
                 "status": source.get_status(), "pending_samples": depth, "pending_bytes": size,
                 "pose_metadata": latest_pose_metadata,
-                "input_delivery": delivery.get_status() if delivery is not None else None,
+                "input_delivery": delivery.status() if delivery is not None else None,
                 "delivery_sequence": delivery_sequence,
                 "recording_dropped": recording_dropped,
             }

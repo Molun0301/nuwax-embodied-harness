@@ -490,13 +490,22 @@ class GatewayPersonFollowBridge:
         with self._lock:
             if self._closed:
                 raise PersonFollowBridgeUnavailable("跟随通信桥已关闭。")
-            if self._thread is None:
+            failed_thread = self._thread if self._failure is not None else None
+        if failed_thread is not None:
+            failed_thread.join()
+        with self._lock:
+            if self._thread is None or not self._thread.is_alive():
+                self._failure = None
+                self._ready.clear()
                 self._thread = threading.Thread(target=self._run, name="gateway-person-follow-lcm", daemon=True)
                 self._thread.start()
+            thread = self._thread
         self._ready.wait()
         with self._lock:
-            if self._failure is not None:
-                raise self._failure
+            failure = self._failure
+        if failure is not None:
+            thread.join()
+            raise failure
 
     def _call(self, operation):
         request = _ControlRequest(operation=operation, completed=threading.Event())

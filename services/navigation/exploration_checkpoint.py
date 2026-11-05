@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import os
+import logging
 from pathlib import Path
 import tempfile
 import threading
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
+
+LOGGER = logging.getLogger(__name__)
 
 
 class ExplorationCheckpoint(BaseModel):
@@ -16,9 +19,9 @@ class ExplorationCheckpoint(BaseModel):
     checkpoint_id: str
     map_name: str
     created_at: str
-    request: dict
+    request: Dict[str, Any]
     progress_json: str
-    planar_seed: Optional[tuple[float, float, float]] = None
+    planar_seed: Optional[Tuple[float, float, float]] = None
 
 
 class ExplorationCheckpoints:
@@ -36,6 +39,7 @@ class ExplorationCheckpoints:
                 try:
                     stream.write(value.model_dump_json())
                     stream.flush()
+                    os.fsync(stream.fileno())
                     os.replace(temporary, self.root / f"{value.checkpoint_id}.json")
                 finally:
                     temporary.unlink(missing_ok=True)
@@ -47,8 +51,12 @@ class ExplorationCheckpoints:
 
     def list(self, limit: int = 50) -> list[dict]:
         with self._lock:
-            values = [ExplorationCheckpoint.model_validate_json(path.read_text(encoding="utf-8"))
-                      for path in self.root.glob("*.json")]
+            values = []
+            for path in self.root.glob("*.json"):
+                try:
+                    values.append(ExplorationCheckpoint.model_validate_json(path.read_text(encoding="utf-8")))
+                except (OSError, UnicodeError, ValidationError):
+                    LOGGER.exception("跳过无法读取的探索检查点：%s", path)
         values.sort(key=lambda value: value.created_at, reverse=True)
         return [{"checkpoint_id": value.checkpoint_id, "map_name": value.map_name,
                  "created_at": value.created_at,

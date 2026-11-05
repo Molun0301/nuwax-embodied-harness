@@ -3,7 +3,7 @@ from dataclasses import asdict
 import logging
 import os
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
 from core.stream_bus import StreamBus
@@ -29,12 +29,13 @@ class VideoSource:
         if value is None:
             return None
         data, sequence, timestamp_ns = value
+        seconds, nanoseconds = divmod(timestamp_ns, 1_000_000_000)
         info = self.get_camera_info(camera_id)
         with Image.open(BytesIO(data)) as image:
             width, height = image.size
         return ImageFrame(camera_id=info.camera_id if info is not None else "front_camera",
             frame_id=info.frame_id if info is not None else self.frame_id,
-            timestamp=datetime.fromtimestamp(timestamp_ns / 1e9, timezone.utc),
+            timestamp=datetime.fromtimestamp(seconds, timezone.utc) + timedelta(microseconds=nanoseconds // 1000),
             width_px=width, height_px=height, encoding=ImageEncoding.JPEG, data=data,
             metadata={"source_kind": "video_shared_memory", "source_timestamp_ns": timestamp_ns,
                       "ingest_sequence": sequence, "camera_info": info})
@@ -158,19 +159,6 @@ class Streams:
             try:
                 value = self.get_pointcloud_map_snapshot()
                 if value is not None:
-                    import numpy as np
-                    from contracts.pointcloud import PointCloudFrame
-                    snapshot = self.platform.geometry_state.snapshot()
-                    self.stream_bus.publish("pointcloud.frame", source="geometry", frame_id=value.frame_id,
-                        payload=PointCloudFrame(frame_id=value.frame_id,
-                            timestamp=datetime.fromtimestamp(value.source_timestamp_ns / 1e9, timezone.utc),
-                            point_count=value.point_count,
-                            points_xyz_array=(np.concatenate([np.frombuffer(chunk.xyz_bytes, dtype="<f4").reshape(-1, 3)
-                                for chunk in value.chunks], axis=0) if value.chunks else
-                                np.frombuffer(value.xyz_bytes, dtype="<f4").reshape(-1, 3)),
-                            metadata={"source_timestamp_ns": value.source_timestamp_ns}),
-                        metadata={"source_timestamp_ns": value.source_timestamp_ns,
-                            "map_name": snapshot.map_name if snapshot is not None else ""})
                     metadata = {"source": value.source, "source_epoch": value.source_epoch,
                         "revision": value.revision, "revision_ordinal": value.revision_ordinal,
                         "frame_id": value.frame_id, "source_timestamp_ns": value.source_timestamp_ns,

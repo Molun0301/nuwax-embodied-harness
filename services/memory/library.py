@@ -14,12 +14,15 @@ LOGGER = logging.getLogger(__name__)
 
 
 class LibraryWriter:
-    def __init__(self, maps_root, default_root, *, publish, changed):
+    def __init__(self, maps_root, default_root, *, publish, changed, indexer=None, opened=None, failed=None):
         self.maps_root = Path(maps_root)
         self.default_root = Path(default_root)
         self.store = None
         self.expected_rename = None
-        self.last_map_name = object()
+        self.last_map_name = None
+        self.requested_library = object()
+        self.error = None
+        self._indexer, self._opened, self._failed = indexer, opened, failed
         self._publish = publish
         self._changed = changed
         self._queue = deque()
@@ -54,38 +57,69 @@ class LibraryWriter:
     def directory(self, name, *, default=False):
         return self.default_root if default else self.maps_root / name / "memory"
 
+    def open_store(self, directory, name):
+        return MemoryStore(directory, name=name, indexer=self._indexer)
+
     def switch(self, name, *, default=False):
-        if self.last_map_name == name:
+        if self.requested_library == name:
             return False
-        self.last_map_name = name
+        self.requested_library = name
         old = self.store.name if self.store is not None else None
-        if self.expected_rename == (old, name):
-            self.rename(old, name)
-            self.expected_rename = None
+        try:
+            if self.expected_rename == (old, name):
+                try:
+                    self.rename(old, name)
+                finally:
+                    self.expected_rename = None
+            else:
+                if self.store is not None:
+                    self.store.close()
+                    self.store = None
+                if name:
+                    self.store = self.open_store(self.directory(name, default=default), name)
+            self.last_map_name = name
+            self.error = None
+            if self._opened is not None:
+                self._opened(self.store)
             return True
-        if self.store is not None:
-            self.store.close()
-            self.store = None
-        if name:
-            self.store = MemoryStore(self.directory(name, default=default), name=name)
-        return True
+        except Exception as error:
+            self.error = {'operation': 'rename' if self.store is not None and self.store.name == old else 'open',
+                          'library_name': name, 'reason': str(error)}
+            raise
 
     def rename(self, old, new):
         current = self.store is not None and self.store.name == old
-        instances = self.store.records("instance") if current else None
+        instances = self.store.records('instance') if current else None
+        source, destination = self.directory(old), self.directory(new)
         if current:
             self.store.close()
             self.store = None
-        destination = self.directory(new)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        self.directory(old).rename(destination)
-        renamed = MemoryStore(destination, name=new)
-        renamed.rename_records(old, new, instances=instances)
-        if current:
-            self.store = renamed
-            self.last_map_name = new
-        else:
-            renamed.close()
+        moved, renamed = False, None
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            source.rename(destination)
+            moved = True
+            renamed = self.open_store(destination, new)
+            renamed.rename_records(old, new, instances=instances)
+            if current:
+                self.store = renamed
+                self.last_map_name = new
+            else:
+                renamed.close()
+        except Exception as error:
+            if renamed is not None:
+                renamed.close()
+            if moved:
+                destination.rename(source)
+            if current:
+                self.store = self.open_store(source, old)
+                # 未确认实例只属于当前库内存，恢复原库时一并保留。
+                for record in instances:
+                    if not self.store.has('instance', record.instance_id):
+                        self.store.put_live_instance(record, persist=False)
+                self.store.commit_cache()
+            self.error = {'operation': 'rename', 'library_name': new, 'reason': str(error)}
+            raise
 
     def expect_rename(self, old, new):
         self.expected_rename = (old, new)
@@ -108,30 +142,45 @@ class LibraryWriter:
                 return
             function, future, transaction, publish = item
             previous_store = self.store
-            previous_instances = dict(self.store._instances) if self.store is not None else None
             try:
                 if transaction and self.store is not None:
                     with self.store.connection:
                         result = function(self.store)
+                    self.store.commit_cache()
                 else:
                     result = function(self.store)
-                if not publish or (not transaction and result is False):
-                    future.set_result(result)
-                    continue
-                snapshot = self.store.snapshot(self.store.name) if self.store is not None else MemorySnapshot.empty()
+                    if self.store is not None:
+                        self.store.commit_cache()
+            except BaseException as error:
+                if self.store is not None and self.store is previous_store:
+                    self.store.rollback_cache()
+                if self.error is not None and self._failed is not None:
+                    try:
+                        self._failed(self.error)
+                    except Exception:
+                        LOGGER.exception("记忆库失败状态发布失败")
+                future.set_exception(error)
+                LOGGER.exception('记忆写入失败')
+                function = previous_store = item = None
+                continue
+            if publish and not (not transaction and result is False):
+                snapshot = self.store.snapshot() if self.store is not None else MemorySnapshot.empty()
                 changed = tuple(self.store.changed) if self.store is not None else ()
                 if self.store is not None:
                     self.store.changed.clear()
-                self._publish(snapshot)
+                # SQL已经提交；发布失败只能记录，不能回滚已提交缓存或伪报业务失败。
+                try:
+                    self._publish(snapshot)
+                except Exception:
+                    LOGGER.exception('记忆提交后的快照发布失败')
                 if changed:
-                    self._changed(snapshot.name, changed)
-                future.set_result(result)
-            except BaseException as error:
-                if self.store is not None and self.store is previous_store:
-                    self.store._instances = previous_instances
-                    self.store.changed.clear()
-                future.set_exception(error)
-                LOGGER.exception("记忆写入失败")
+                    try:
+                        self._changed(snapshot.name, changed)
+                    except Exception:
+                        LOGGER.exception('记忆提交后的向量排队失败')
+            future.set_result(result)
+            # 阻塞等待下一项前释放已切换库的局部引用。
+            function = previous_store = snapshot = result = item = None
 
     def close(self):
         with self._condition:

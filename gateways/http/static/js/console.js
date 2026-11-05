@@ -3379,12 +3379,19 @@
           clearMapDisplay("等待地图栅格。", status, {}, {}, envelope, null);
           return;
         }
+        const nextIdentity = JSON.stringify([data.map_name, grid.frame_id]);
+        const mapChanged = state.appliedMapIdentity && state.appliedMapIdentity.key !== nextIdentity;
         const nextContentKey = mapGridContentKey(grid, envelope);
         const baseDirty = state.mapGridContentKey !== nextContentKey;
         state.mapGrid = grid;
         state.mapGridContentKey = nextContentKey;
         state.mapStream = {diagnostics: {}, timestamp: envelope.source_timestamp};
-        state.appliedMapIdentity = {key: JSON.stringify([data.map_name, grid.frame_id]), cleared: false};
+        state.appliedMapIdentity = {key: nextIdentity, cleared: false};
+        if (mapChanged) {
+          resetFreeMapView();
+          state.pointcloud3dCameraMode = "follow";
+          state.pointcloud3dDistance = 12;
+        }
         setPill(els.mapStatus, status, "地图");
         els.mapEmpty.hidden = true;
         recordMediaFrame("map2d", videoSourceTime(envelope.source_timestamp), envelope.cursor, data.map_name);
@@ -4615,6 +4622,7 @@
       const DEFAULT_VIDEO_STREAM_URL = "/streams/video.mjpeg";
       const STREAM_TOPICS = [
         "robot.state",
+        "geometry.state",
         "map.frame",
         "map.heartbeat",
         "localization.frame_tree",
@@ -5200,10 +5208,11 @@
           } else requestMapDraw(false);
         } else if (frame.topic === "navigation.state") {
           const nav = frame.payload;
-          const target = nav?.target;
+          const terminal = ["succeeded", "failed", "cancelled", "replaced", "stopped"].includes(nav?.status);
+          const target = terminal ? null : nav?.target;
           state.goalPose = target ? {position: {x: target.x, y: target.y, z: target.z},
             orientation: {x: target.qx, y: target.qy, z: target.qz, w: target.qw}} : null;
-          state.navigationPath = (nav?.planned_path || []).map(([x, y, z]) => ({x, y, z}));
+          state.navigationPath = (terminal ? [] : nav?.planned_path || []).map(([x, y, z]) => ({x, y, z}));
           state.navigationLocalPath = [];
           state.navigationDisplay = {mode: state.navigationPath.length ? "live" : "none",
             isPublic: navigationContextIsPublic(nav), status: nav?.status};
@@ -5387,6 +5396,8 @@
       function updateTaskFrameImpl(frame) {
         const receiveSequence = frame.__taskSequence || ++state.taskEventSequence;
         const event = frame.payload;
+        const previous = state.taskHistoryById.get(event.payload.task_id);
+        if (previous && isTerminalTaskState(previous.state) && !isTerminalTaskState(event.payload.state)) return;
         window.dispatchEvent(new CustomEvent("stream:tasks.state", {detail: event.payload}));
         const task = {...event.payload, __streamSequence: receiveSequence};
         const key = task.task_id;

@@ -119,8 +119,6 @@ class MotionClient:
         measured = None
         if response.HasField("measured_motion"):
             value = response.measured_motion
-            if len(value.body_linear_xyz) != 3 or len(value.body_angular_xyz) != 3 or len(value.orientation_wxyz) not in {0, 4}:
-                raise MotionError(MotionErrorCode.UNAVAILABLE, "运动反馈向量长度无效")
             measured = MeasuredMotion(value.source_id, value.source_timestamp_ns, value.received_monotonic_ns,
                 value.valid_until_monotonic_ns, value.frame_id, tuple(value.body_linear_xyz), tuple(value.body_angular_xyz),
                 tuple(value.orientation_wxyz) if value.orientation_wxyz else None)

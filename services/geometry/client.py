@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import threading
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, Optional, Tuple
 
 import grpc
 
@@ -44,7 +44,7 @@ class BoundarySegment:
 @dataclass(frozen=True)
 class ExplorationRequest:
     motion_generation: int
-    boundary: tuple[BoundarySegment, ...] = ()
+    boundary: Tuple[BoundarySegment, ...] = ()
     max_coverage_pct: Optional[float] = None
     no_frontier_timeout_ms: Optional[int] = None
     max_duration_ms: Optional[int] = None
@@ -71,11 +71,11 @@ class DenseCloudChunk:
     total_points: int
     offset_points: int
     xyz_f32_le: bytes
-    bounds_min: tuple[float, float, float]
-    bounds_max: tuple[float, float, float]
+    bounds_min: Tuple[float, float, float]
+    bounds_max: Tuple[float, float, float]
     base_epoch: str
     base_offset_points: int
-    removed_ranges: tuple[int, ...]
+    removed_ranges: Tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -105,7 +105,7 @@ def _pose_message(value: Pose):
 
 
 def _navigation(value) -> NavigationStatus:
-    return NavigationStatus(value.goal_id, GoalStatus(pb.GoalStatus.Name(value.status).removeprefix("GOAL_STATUS_").lower()),
+    return NavigationStatus(value.goal_id, GoalStatus(pb.GoalStatus.Name(value.status)[len("GOAL_STATUS_"):].lower()),
                             value.message, value.remaining_distance_m,
                             _pose(value.target) if value.HasField("target") else None,
                             value.no_feasible_path, tuple((p.x, p.y, p.z) for p in value.planned_path),
@@ -114,7 +114,7 @@ def _navigation(value) -> NavigationStatus:
 
 def _exploration(value) -> ExplorationStatus:
     return ExplorationStatus(value.exploration_id,
-                             ExplorationPhase(pb.ExplorationPhase.Name(value.phase).removeprefix("EXPLORATION_PHASE_").lower()),
+                             ExplorationPhase(pb.ExplorationPhase.Name(value.phase)[len("EXPLORATION_PHASE_"):].lower()),
                              value.message, value.frontier_count, value.goals_completed,
                              value.returning, value.traveled_distance_m)
 
@@ -128,7 +128,7 @@ def _relocalization(value) -> RelocalizationResult:
 def _snapshot(value) -> GeometrySnapshot:
     info = value.info
     return GeometrySnapshot(
-        SessionPhase(pb.SessionPhase.Name(value.phase).removeprefix("SESSION_PHASE_").lower()),
+        SessionPhase(pb.SessionPhase.Name(value.phase)[len("SESSION_PHASE_"):].lower()),
         value.reason, value.map_name, _pose(value.pose) if value.HasField("pose") else None,
         _navigation(value.navigation) if value.HasField("navigation") else None,
         _exploration(value.exploration) if value.HasField("exploration") else None,
@@ -172,6 +172,7 @@ class _Subscription:
 
 class GeometryClient:
     def __init__(self, target: str) -> None:
+        self._target = target
         message_limit = int(runtime_value("NUWAX_GEOMETRY_GRPC_MAX_MESSAGE_BYTES", "134217728"))
         self._channel = grpc.insecure_channel(target, options=[
             ("grpc.enable_retries", 0), ("grpc.max_receive_message_length", message_limit),
@@ -182,15 +183,28 @@ class GeometryClient:
         self._input_calls = set()
         self._inputs_closed = False
 
-    def _close_inputs(self) -> None:
+    @property
+    def target(self) -> str:
+        """采集进程使用相同的真实远端，不另设输入配置。"""
+        return self._target
+
+    def input_sender(self):
+        """一个输入拥有方的在途调用集合；关闭它不关闭共享通道。"""
+        return _InputSender(self)
+
+    def _cancel_inputs(self, sender=None) -> None:
         with self._input_lock:
-            self._inputs_closed = True
-            calls = tuple(self._input_calls)
+            if sender is None:
+                self._inputs_closed = True
+                calls = tuple(self._input_calls)
+            else:
+                sender._closed = True
+                calls = tuple(sender._calls)
         for call in calls:
             call.cancel()
 
     def close(self) -> None:
-        self._close_inputs()
+        self._cancel_inputs()
         self._channel.close()
 
     def _call(self, name, request, timeout_sec):
@@ -214,7 +228,7 @@ class GeometryClient:
     def load_map(self, map_name: str, *, timeout_sec: Optional[float] = None) -> GeometrySnapshot:
         return _snapshot(self._call("LoadMap", pb.LoadMapRequest(map_name=map_name), timeout_sec))
 
-    def relocalize(self, seed: Optional[tuple[float, float, float]] = None, *,
+    def relocalize(self, seed: Optional[Tuple[float, float, float]] = None, *,
                    timeout_sec: Optional[float] = None) -> RelocalizationResult:
         request = pb.RelocalizeRequest()
         if seed is not None:
@@ -285,19 +299,21 @@ class GeometryClient:
             value.total_points, value.offset_points, value.xyz_f32_le, tuple(value.bounds_min),
             tuple(value.bounds_max), value.base_epoch, value.base_offset_points, tuple(value.removed_ranges))
 
-    def get_frame_tree(self, *, timeout_sec: Optional[float] = None) -> tuple[Transform, ...]:
+    def get_frame_tree(self, *, timeout_sec: Optional[float] = None) -> Tuple[Transform, ...]:
         value = self._call("GetFrameTree", pb.Empty(), timeout_sec)
         return tuple(Transform(t.parent_frame, t.child_frame, t.translation.x, t.translation.y,
             t.translation.z, t.rotation.x, t.rotation.y, t.rotation.z, t.rotation.w,
             t.timestamp_ns) for t in value.transforms)
 
-    def _publish_input(self, method, request) -> bool:
+    def _publish_input(self, method, request, sender=None) -> bool:
         # 领取发送与关闭共用一把锁，关闭后不再创建新的输入调用。
         with self._input_lock:
-            if self._inputs_closed:
+            if self._inputs_closed or (sender is not None and sender._closed):
                 return False
             call = getattr(self._stub, method).future(request)
             self._input_calls.add(call)
+            if sender is not None:
+                sender._calls.add(call)
         try:
             return call.result().success
         except (grpc.RpcError, grpc.FutureCancelledError):
@@ -305,6 +321,8 @@ class GeometryClient:
         finally:
             with self._input_lock:
                 self._input_calls.discard(call)
+                if sender is not None:
+                    sender._calls.discard(call)
 
     def publish_point_cloud(self, request: Any) -> bool:
         return self._publish_input("PublishPointCloud", request)
@@ -315,3 +333,25 @@ class GeometryClient:
 
     def publish_laser_scan(self, payload: bytes) -> bool:
         return self._publish_input("PublishLaserScan", pb.PublishLaserScanRequest(payload=payload))
+
+
+class _InputSender:
+    """只取消当前桥领取的调用，下一次启动可以领取新的发送者。"""
+
+    def __init__(self, client):
+        self._client = client
+        self._calls = set()
+        self._closed = False
+
+    def cancel(self):
+        self._client._cancel_inputs(self)
+
+    def publish_point_cloud(self, request):
+        return self._client._publish_input("PublishPointCloud", request, self)
+
+    def publish_odom(self, pose, *, clock_domain, clock_id):
+        return self._client._publish_input("PublishOdom", pb.PublishOdomRequest(
+            pose=_pose_message(pose), clock_domain=clock_domain, clock_id=clock_id), self)
+
+    def publish_laser_scan(self, payload):
+        return self._client._publish_input("PublishLaserScan", pb.PublishLaserScanRequest(payload=payload), self)

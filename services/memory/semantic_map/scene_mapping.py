@@ -85,6 +85,9 @@ class SceneMappingService:
                     api_key=self.config.api_key, timeout_sec=self.config.timeout_sec)
             return self._backend
 
+    def capture(self):
+        return self.memory.capture_scene_mapping_state()
+
     def status(self) -> Dict[str, Any]:
         with self._lock:
             return {"enabled": self.config.enabled,
@@ -189,6 +192,16 @@ class SceneMappingService:
         return bound
 
     def _refresh_regions(self, ensure_active, expected_capture=None):
+        try:
+            return self._refresh_regions_once(ensure_active, expected_capture)
+        except GatewayError as error:
+            if error.error_code != "scene_map_changed":
+                raise
+            # 分割期间地图内容变化，仅重新捕获并分割一次。
+            ensure_active()
+            return self._refresh_regions_once(ensure_active, expected_capture)
+
+    def _refresh_regions_once(self, ensure_active, expected_capture=None):
         capture = self.memory.capture_scene_mapping_state()
         if expected_capture is not None and not same_scope(capture["binding"], expected_capture["binding"]):
             raise GatewayError("受理后的地图已改变。", error_code="scene_scope_changed", http_status=409)
@@ -204,6 +217,7 @@ class SceneMappingService:
             and old_by_id[region.scene_space_id].metadata.get("map_binding", {}).get("map_revision") == capture["binding"]["map_revision"]
             for region in regions)
         if unchanged:
+            self.memory._assert_scene_mapping_capture(capture)
             return capture, [old_by_id[region.scene_space_id] for region in regions]
         revisions = {space.scene_space_id: int(space.metadata.get("scene_revision", 0)) for space in capture["spaces"]}
         written = self.memory.commit_scene_mapping_spaces(capture, regions, expected_revisions=revisions, retire_missing=True)
@@ -474,8 +488,22 @@ class SceneMappingService:
         capture = self.memory.capture_scene_mapping_state(include_decision_inputs=False)
         spaces = sorted(self.memory.current_managed_scene_spaces(capture, include_stale=True),
                         key=lambda space: space.scene_space_id)
-        return {"map_binding": capture["binding"], "regions": [_public_space(space) for space in spaces],
+        return {"map_binding": capture["binding"], "regions": [self._public_space(space,capture["library_name"]) for space in spaces],
                 "region_count": len(spaces), "navigation_checked": False}
+
+    def _public_space(self, space, library_name):
+        value = _public_space(space)
+        for sample in value["observation_samples"]:
+            images = []
+            for artifact_id in sample["artifact_ids"]:
+                try:
+                    ref = self.memory.core.photo_ref(artifact_id,library_name=library_name)
+                except FileNotFoundError:
+                    images.append({"artifact_id":artifact_id,"available":False})
+                else:
+                    images.append({"artifact_id":artifact_id,"url":ref.uri,"available":True})
+            sample["images"] = images
+        return value
 
     def locate(self) -> Dict[str, Any]:
         capture = self.memory.capture_scene_mapping_state()
@@ -498,7 +526,8 @@ class SceneMappingService:
 def _evidence_inputs(entries, model):
     """比较实际业务证据内容，不存业务令牌、请求号或哈希。"""
     return {"model": model, "categories": dict(CATEGORIES),
-            "entries": [entry.model_dump(mode="json") for entry in entries]}
+            "entries": [{"memory_id": entry.memory_id, "timestamp": entry.timestamp.isoformat(),
+                "observation_id": entry.observation_id, "artifact_ids": list(entry.artifact_ids)} for entry in entries]}
 
 
 def _distance_to_boundary(point, polygon) -> float:

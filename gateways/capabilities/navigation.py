@@ -34,8 +34,9 @@ def navigate_to_pose(platform, ctx, args, *, region=None):
                 args.get("frame_id", snapshot.info.map_frame_id), time.time_ns())
     try:
         goal_id = platform.geometry.set_goal(NavigationGoal(pose, args["motion_generation"],
-            allow_reverse=args.get("allow_reverse"), position_tolerance_m=args.get("tolerance_position_m"),
-            yaw_tolerance_rad=args.get("tolerance_yaw_rad")), timeout_sec=ctx.remaining())
+            allow_reverse=args.get("allow_reverse"), position_tolerance_m=args.get("tolerance_position_m", 0.35),
+            yaw_tolerance_rad=args.get("tolerance_yaw_rad", 0.3) if "yaw_rad" in args else math.pi),
+            timeout_sec=ctx.remaining())
     except GeometryError as error:
         if error.code == "FAILED_PRECONDITION":
             raise GatewayError(error.message, error_code="not_localized", http_status=409) from error
@@ -78,16 +79,8 @@ def navigate_to_pose(platform, ctx, args, *, region=None):
 
 @rpc_errors
 def navigate_to_named_location(platform, ctx, args):
-    target = platform.navigation_memory.resolve(args["target_name"], camera_id=args.get("camera_id"))
-    pose = target.pose
-    result = navigate_to_pose(platform, ctx, {"x": pose.x, "y": pose.y, "z": pose.z,
-        "yaw_rad": pose.yaw, "frame_id": pose.frame_id, "motion_generation": args["motion_generation"]},
-        region=target.region)
-    result["target_name"] = target.target_name
-    if args.get("verify_on_arrival", True):
-        result["verification"] = platform.navigation_memory.verify(target, camera_id=args.get("camera_id"),
-            similarity_threshold=args.get("verify_similarity_threshold", 0.55), goal_id=result["goal_id"])
-    return result
+    from skills.target_search import navigate_to_named_location as navigate_named
+    return navigate_named(platform, ctx, args)
 
 
 @rpc_errors
@@ -124,19 +117,19 @@ CAPABILITIES = [
     Capability("navigate_to_pose", "导航到当前地图坐标中的位姿。",
         schema({"x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"},
                 "yaw_rad": {"type": "number"}, "frame_id": {"type": "string"},
-                "tolerance_position_m": {"type": "number", "minimum": 0},
-                "tolerance_yaw_rad": {"type": "number", "minimum": 0},
+                "tolerance_position_m": {"type": "number", "exclusiveMinimum": 0, "default": 0.35},
+                "tolerance_yaw_rad": {"type": "number", "exclusiveMinimum": 0, "default": 0.3},
                 "allow_reverse": {"type": "boolean"}, "timeout_sec": TIMEOUT}, ("x", "y")),
-        "task", navigate_to_pose, needs=("nav_stack", "geometry"), motion=True, timeout_sec=600),
+        "task", navigate_to_pose, needs=("nav_stack", "geometry"), motion=True),
     Capability("navigate_to_place", "通过开放街道地图地名查找并导航。",
         schema({"query_text": {"type": "string", "minLength": 1}, "timeout_sec": TIMEOUT}, ("query_text",)),
-        "task", navigate_to_place, needs=("nav_stack", "geometry"), motion=True, timeout_sec=600),
+        "task", navigate_to_place, needs=("nav_stack", "geometry"), motion=True),
     Capability("navigate_to_named_location", "导航到记忆中的命名地点或区域，可在到达后核对。",
         schema({"target_name": {"type": "string"}, "camera_id": {"type": "string"},
                 "verify_on_arrival": {"type": "boolean"},
                 "verify_similarity_threshold": {"type": "number", "minimum": 0, "maximum": 1},
                 "timeout_sec": TIMEOUT}, ("target_name",)),
-        "task", navigate_to_named_location, needs=("nav_stack", "geometry"), motion=True, timeout_sec=600),
+        "task", navigate_to_named_location, needs=("nav_stack", "geometry"), motion=True, timeout_sec=900),
     Capability("cancel_navigation", "取消指定目标或当前目标，不等待停稳。",
         schema({"goal_id": {"type": "string"}}), "action", cancel_navigation),
     Capability("get_navigation_state", "读取 Geometry 导航与探索状态。", schema(), "query", navigation_state),

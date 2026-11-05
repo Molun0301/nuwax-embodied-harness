@@ -113,7 +113,10 @@ class TaskRunner:
 
     def _update(self, task_id: str, **changes) -> TaskStatus:
         with self._lock:
-            status = replace(self._statuses[task_id], **changes)
+            current = self._statuses[task_id]
+            if all(getattr(current, key) == value for key, value in changes.items()):
+                return current
+            status = replace(current, **changes)
             self._statuses[task_id] = status
             publication = self._prepare(status)
         self._publish(publication)
@@ -127,8 +130,7 @@ class TaskRunner:
             if cap.motion:
                 previous = self._cancel_locked(self._motion_task, "新运动命令接管")
             task_id = "task_" + uuid4().hex
-            limits = [v for v in (cap.timeout_sec, args.get("timeout_sec")) if v is not None]
-            duration = min(limits) if limits else None
+            duration = args.get("timeout_sec", cap.timeout_sec)
             ctx = TaskContext(task_id, threading.Event(),
                               None if duration is None else time.monotonic() + duration, self)
             status = TaskStatus(task_id, cap.name, caller, TaskState.RUNNING, cap.motion, 0.0,
@@ -156,7 +158,7 @@ class TaskRunner:
         result, error = None, None
         try:
             ctx.check()
-            self._platform.ensure(cap.needs, ctx.remaining())
+            self._platform.ensure(cap.needs, ctx.remaining(), ctx=ctx)
             ctx.check()
             if cap.motion:
                 args["motion_generation"] = self._begin_motion(ctx)
@@ -172,8 +174,8 @@ class TaskRunner:
                 timer.cancel()
         with self._lock:
             current = self._statuses[ctx.task_id]
-            timed_out = ctx.deadline is not None and time.monotonic() >= ctx.deadline
-            if timed_out or ctx.cancelled.is_set():
+            timed_out = current.cancel_reason == "期限"
+            if ctx.cancelled.is_set():
                 state = TaskState.TIMED_OUT if timed_out else TaskState.CANCELLED
                 message = "任务已超时。" if timed_out else current.cancel_reason or "任务已取消。"
                 code = None

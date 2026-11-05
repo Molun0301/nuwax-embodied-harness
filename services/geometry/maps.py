@@ -8,7 +8,7 @@ from pathlib import Path
 import shutil
 import tempfile
 import threading
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, List, Mapping, Optional, Sequence
 import unicodedata
 
 from core.errors import GatewayError
@@ -47,7 +47,7 @@ class MapStore:
     def root(self) -> Path:
         return self._root
 
-    def list(self) -> list[MapInfo]:
+    def list(self) -> List[MapInfo]:
         with self._lock:
             if not self._root.exists():
                 return []
@@ -90,6 +90,7 @@ class MapStore:
             try:
                 json.dump(value, stream, ensure_ascii=False)
                 stream.flush()
+                os.fsync(stream.fileno())
                 os.replace(temporary, directory / filename)
             finally:
                 if os.path.exists(temporary):
@@ -106,7 +107,7 @@ class MapStore:
             except FileNotFoundError as error:
                 raise GatewayError("地图不存在", error_code="map_not_found", http_status=404) from error
 
-    def read_forbidden_zones(self, name: str) -> list[dict]:
+    def read_forbidden_zones(self, name: str) -> List[dict]:
         with self._lock:
             return self._read_json(name, "forbidden_zones.json", list, [])
 

@@ -30,11 +30,13 @@ def navigate_to_floor(platform, ctx, args):
 def explore_building(platform, ctx, args):
     from gateways.capabilities.navigation import navigate_to_pose
     from gateways.capabilities.exploration import explore_area
-    return _explore_building(platform, ctx, args, navigate=navigate_to_pose, explore=explore_area)
+    from gateways.capabilities.maps import start_mapping_session
+    return _explore_building(platform, ctx, args, navigate=navigate_to_pose, explore=explore_area,
+                             start_mapping=start_mapping_session)
 
 
 TEXT = {"type": "string", "minLength": 1}
-TIMEOUT = {"type": "number", "exclusiveMinimum": 0}
+TIMEOUT = {"type": "number", "exclusiveMinimum": 0, "maximum": 7200, "default": 600}
 CAPABILITIES = [
     Capability("list_buildings", "列出楼栋楼层和设施连接。", schema(), "query", list_buildings),
     Capability("register_building", "登记楼栋楼层及设施连接。",
@@ -47,8 +49,8 @@ CAPABILITIES = [
     Capability("explore_building", "按楼层顺序跨层、探索并保存地图。",
                schema({"building_id": TEXT, "floor_ids": {"type": "array", "items": TEXT},
                        "stop_conditions": CONDITIONS,
-                       "per_floor_timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 3600},
-                       "timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 43200}},
+                       "per_floor_timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 3600, "default": 300},
+                       "timeout_sec": {"type": "number", "exclusiveMinimum": 0, "maximum": 43200, "default": 7200}},
                       ("building_id",)),
                "task", explore_building, needs=("nav_stack", "geometry"), motion=True, timeout_sec=7200),
 ]

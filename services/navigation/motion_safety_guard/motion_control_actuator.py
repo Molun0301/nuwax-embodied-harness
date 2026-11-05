@@ -5,8 +5,6 @@ from __future__ import annotations
 from core.config_values import runtime_value
 
 from importlib import import_module
-import math
-from typing import Union
 
 from contracts.geometry import Twist, Vector3
 from contracts.naming import validate_frame_id
@@ -45,29 +43,21 @@ class MotionControlActuator:
     def is_configured(self) -> bool:
         return self._control.is_available()
 
-    def apply_motion(self, request: Union[pb.SubmitMotionCommandRequest, pb.ApplyRobotSettingRequest]) -> bool:
-        command = request.WhichOneof("setting" if isinstance(request, pb.ApplyRobotSettingRequest) else "command")
-        if command == "stop":
-            self.zero()
-            return False
-        if command != "twist":
-            raise ActuatorError("UNSUPPORTED_OPERATION", "标准运动接口不支持指令：%s" % command)
-        values = (request.twist.linear_x_mps, request.twist.linear_y_mps, request.twist.angular_z_rps)
-        if not all(math.isfinite(value) for value in values):
-            raise ActuatorError("INVALID_ARGUMENT", "速度必须为有限值。")
+    def velocity(self, vx: float, vy: float, wz: float) -> bool:
         try:
-            if not self._control.is_available():
-                raise ActuatorError("ACTUATOR_UNAVAILABLE", "运动执行器当前不可用。")
             self._control.send_twist(Twist(
                 frame_id=self._frame_id,
-                linear=Vector3(x=values[0], y=values[1]),
-                angular=Vector3(z=values[2]),
+                linear=Vector3(x=vx, y=vy), angular=Vector3(z=wz),
             ))
-        except ActuatorError:
-            raise
         except Exception as exc:
             raise ActuatorError("ACTUATOR_COMMAND_FAILED", str(exc)) from exc
         return False
+
+    def body_pose(self, roll: float, pitch: float, yaw: float) -> None:
+        raise ActuatorError("UNSUPPORTED_OPERATION", "标准运动接口不提供厂商机身姿态。")
+
+    def setting(self, request: pb.SettingRequest) -> None:
+        raise ActuatorError("UNSUPPORTED_OPERATION", "标准运动接口不提供厂商设置。")
 
     @property
     def supports_motion_feedback(self) -> bool:
@@ -104,7 +94,7 @@ class MotionControlActuator:
             return
         raise ActuatorError("UNSUPPORTED_OPERATION", "标准运动接口不提供厂商机身动作。")
 
-    def switch_mode(self, command: pb.ModeSwitchCommand) -> int:
+    def switch_mode(self, target: int) -> int:
         raise ActuatorError("UNSUPPORTED_OPERATION", "标准运动接口不提供厂商控制模式切换。")
 
 

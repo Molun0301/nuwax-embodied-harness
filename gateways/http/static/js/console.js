@@ -20,8 +20,8 @@
       const overviewLabels = { health: "健康", state: "状态", localization: "定位", map: "地图", navigation: "导航", exploration: "探索", runtime_governance: "服务状态", pointcloud_map: "3D点云地图", pointcloud: "扫描点云", video: "视频", perception_nms: "感知 NMS", logs: "日志" };
       const OVERVIEW_RENDER_INTERVAL_MS = 100;
       const TASK_EVENT_QUEUE_LIMIT = 200;
-      const STREAM_FLUSH_ORDER = ["robot.state", "map.frame", "map.heartbeat", "localization.trajectory", "localization.pose", "navigation.state", "navigation.forbidden_zones", "exploration.frontier", "exploration.state", "runtime.governance", "pointcloud_map.meta", "video.frame", "video.detections", "memory.instances", "memory.scene_spaces", "tasks.state", "system.metrics", "settings.display"];
-      const POSE_STREAM_TOPICS = ["localization.pose", "map.frame"];
+      const STREAM_FLUSH_ORDER = ["robot.state", "geometry.state", "map.frame", "map.heartbeat", "localization.trajectory", "localization.pose", "navigation.state", "navigation.forbidden_zones", "exploration.frontier", "exploration.state", "runtime.governance", "pointcloud_map.meta", "video.frame", "video.detections", "memory.instances", "memory.scene_spaces", "tasks.state", "system.metrics", "settings.display"];
+      const POSE_STREAM_TOPICS = ["localization.pose"];
       const LOG_STREAM_TOPICS = ["logs.entry"];
       const VIDEO_STREAM_INITIAL_RECONNECT_MS = 500;
       const VIDEO_STREAM_MAX_RECONNECT_MS = 5000;
@@ -41,7 +41,7 @@
         "find_target",
         "inspect_target",
         "relocalize_active_map",
-        "activate_map",
+        "load_map",
       ]);
       const ACTIVE_LOCALIZATION_STATUSES = new Set([
         "accepted",
@@ -84,7 +84,6 @@
         latestStreamCursor: "0",
         poseStream: {
           topics: POSE_STREAM_TOPICS,
-          mapPayload: "identity",
           streamSocket: null,
           streamConnectionEpoch: 0,
           streamReconnectTimer: null,
@@ -92,7 +91,6 @@
           streamReconnectAttempt: 0,
           latestStreamCursor: "0",
         },
-        poseMapIdentity: null,
         logStream: {
           topics: LOG_STREAM_TOPICS,
           streamSocket: null,
@@ -103,9 +101,7 @@
           latestStreamCursor: "0",
         },
         mapStreamReady: false,
-        receivedMapIdentity: null,
         appliedMapIdentity: null,
-        pendingMapPose: null,
         latestStreamFrames: {},
         pendingStreamFrames: {},
         pendingLogFrames: [],
@@ -388,7 +384,8 @@
         succeeded: "已完成",
         failed: "失败",
         cancelled: "已取消",
-        timeout: "超时",
+        cancelling: "取消中",
+        timed_out: "超时",
         missing: "未上报",
         idle: "空闲",
       };
@@ -976,6 +973,14 @@
       }
       function renderServiceStatus() {
         if (!els.governanceMeta) return;
+        const processes = state.latestHealth?.processes;
+        if (processes) {
+          setText(els.connectionText, "网关已连接");
+          setPill(els.governanceStatus, "available", "进程");
+          setKv(els.governanceMeta, Object.entries(processes).map(([name, value]) =>
+            [name, `${value.state}${value.pid ? ` · PID ${value.pid}` : ""}${value.error ? ` · ${value.error}` : ""}`]));
+          return;
+        }
         state.serviceCardNodes ||= new Map();
         const scrollHost = els.governanceMeta.parentElement;
         const scrollTop = scrollHost.scrollTop;
@@ -1099,10 +1104,11 @@
         const changes = Object.fromEntries(Object.entries(payload || {}).filter(([, value]) => value !== undefined));
         const health = { ...(state.latestHealth || {}), ...changes };
         state.latestHealth = health;
-        setText(els.robotName, health.robot_name || "机器人未命名");
-        setText(els.robotModel, `型号：${safeText(health.robot_model)}`);
+        if (health.geometry?.state) state.latestGeometryState = health.geometry.state;
+        setText(els.robotName, health.robot?.robot_name || "机器人未命名");
+        setText(els.robotModel, `型号：${safeText(health.robot?.robot_model)}`);
         const robot = health.latest_robot_snapshot || {};
-        const status = health.assembly_status || {};
+        const status = health.robot || {};
         const safety = robot.safety || {};
         const battery = robot.battery || {};
         const controlMode = status.control_mode || robot.mode || "unknown";
@@ -1133,12 +1139,10 @@
         return stateValue;
       }
       function isTerminalTaskState(value) {
-        return ["succeeded", "failed", "cancelled", "timeout"].includes(normalizeTaskState(value));
+        return ["succeeded", "failed", "cancelled", "timed_out"].includes(normalizeTaskState(value));
       }
       function taskUpdatedMs(task) {
-        const value = task && (task.updated_at || task.completed_at || task.started_at || task.timestamp || task.created_at);
-        const parsed = value ? Date.parse(value) : 0;
-        return Number.isFinite(parsed) ? parsed : 0;
+        return Number(task?.finished_at || task?.created_at || 0) * 1000;
       }
       function taskListFromMap(map, limit) {
         const items = Array.from(map.values()).sort((a, b) => taskUpdatedMs(b) - taskUpdatedMs(a));
@@ -1200,7 +1204,7 @@
         state.latestTasks = payload || {};
         const existingRows = new Map(Array.from(els.taskSummary.querySelectorAll("article[data-task-id]"), node => [node.dataset.taskId, node]));
         setPill(els.taskStatus, active.length ? "available" : "idle", active.length ? `${active.length} 个任务` : "空闲");
-        const recentFailures = history.filter((task) => ["failed", "timeout"].includes(normalizeTaskState(task.state || task.status))).slice(0, 2);
+        const recentFailures = history.filter((task) => ["failed", "timed_out"].includes(normalizeTaskState(task.state))).slice(0, 2);
         const items = active.length
           ? [...active.slice(0, 4), ...recentFailures.filter((task) => !active.some((item) => String(item.task_id) === String(task.task_id)))]
           : history.slice(0, 4);
@@ -1225,12 +1229,12 @@
           const title = left.querySelector(".mono") || document.createElement("div");
           title.className = "mono";
           const taskId = safeText(task.task_id || task.id);
-          title.textContent = task.feedback?.source?.display_name || task.capability_name || taskId;
+          title.textContent = task.feedback?.source?.display_name || task.capability || taskId;
           title.title = taskId;
           const meta = left.querySelector(":scope > .meta") || document.createElement("div");
           meta.className = "meta";
           const taskState = normalizeTaskState(task.state || task.status);
-          const reason = task.failure_reason || task.waiting_for || task.message || task.error || (["failed", "timeout", "cancelled"].includes(taskState) ? "未上报原因" : "");
+          const reason = task.failure_reason || task.waiting_for || task.message || task.error || (["failed", "timed_out", "cancelled"].includes(taskState) ? "未上报原因" : "");
           const progressNumber = Number(task.progress);
           const progressPercent = Number.isFinite(Number(task.progress_percent))
             ? Math.round(Number(task.progress_percent))
@@ -1238,11 +1242,9 @@
               ? Math.round((progressNumber >= 0 && progressNumber <= 1 ? progressNumber * 100 : progressNumber))
               : null;
           const progressText = progressPercent === null ? "进度未上报" : `进度 ${progressPercent}%`;
-          const timeText = task.updated_at || task.completed_at || task.started_at
-            ? `更新 ${shortTime(task.updated_at || task.completed_at || task.started_at)}`
-            : "时间未上报";
+          const timeText = taskUpdatedMs(task) ? `更新 ${shortTime(new Date(taskUpdatedMs(task)).toISOString())}` : "时间未上报";
           const nextAction = task.next_action ? ` · 下一步 ${safeText(task.next_action)}` : "";
-          const retryText = task.retryable === true ? " · 可重试" : task.retryable === false && ["failed", "timeout"].includes(taskState) ? " · 不建议原样重试" : "";
+          const retryText = task.retryable === true ? " · 可重试" : task.retryable === false && ["failed", "timed_out"].includes(taskState) ? " · 不建议原样重试" : "";
           meta.textContent = task.feedback?.message || task.summary || `阶段 ${safeText(task.stage || taskState)} · ${progressText} · ${timeText}${reason ? " · " + reason : ""}${retryText}${nextAction}`;
           if (!heading.parentElement) left.prepend(heading);
           if (title.parentElement !== heading) heading.append(title);
@@ -1253,7 +1255,7 @@
             else left.append(window.nuwaxFeedback.details(task.feedback));
           }
           const pill = heading.querySelector(".pill") || row.querySelector(":scope > .pill") || document.createElement("span");
-          pill.className = `pill ${taskState === "failed" || taskState === "timeout" ? "error" : taskState === "running" || taskState === "accepted" ? "available" : taskState === "succeeded" ? "available" : "stale"}`;
+          pill.className = `pill ${taskState === "failed" || taskState === "timed_out" ? "error" : taskState === "running" || taskState === "cancelling" ? "available" : taskState === "succeeded" ? "available" : "stale"}`;
           pill.textContent = displayValue(taskState, "task_state");
           pill.title = taskState;
           if (!left.parentElement) row.append(left);
@@ -1718,36 +1720,7 @@
         return { frame, payload, metadata };
       }
       function activeMapName() {
-        const diagnostics = state.mapStream && state.mapStream.diagnostics ? state.mapStream.diagnostics : {};
-        const governance = state.latestGovernance || {};
-        const localizationSession = governance.localization_session || {};
-        const governanceMetadata = governance.metadata || {};
-        const liveDiagnostics = governanceMetadata.live_mapping_diagnostics || {};
-        const workspace = governance.active_workspace || {};
-        const healthWorkspace = state.latestHealth?.active_map_workspace || {};
-        const pointcloud = pointcloudMapSummary().payload;
-        const exploration = state.latestStreamFrames["exploration.state"]?.payload || {};
-        const explorationRequest = exploration.current_request || exploration.exploration_request || {};
-        const navigation = state.latestStreamFrames["navigation.state"]?.payload || {};
-        const navigationGoal = navigation.current_goal || {};
-        const mapData = state.lastMapEnvelope?.data || {};
-        return firstNonBlank(
-          mapData.map_name,
-          mapData.map_snapshot?.map_name,
-          diagnostics.active_map_name,
-          diagnostics.map_name,
-          governanceMetadata.map_name,
-          pointcloud.map_name,
-          localizationSession.map_name,
-          liveDiagnostics.active_map_name,
-          liveDiagnostics.map_name,
-          workspace.active_map_name,
-          governance.active_map_name,
-          governance.map_name,
-          explorationRequest.map_name,
-          navigationGoal.map_name,
-          healthWorkspace.map_name,
-        );
+        return state.latestGeometryState?.map_name || state.mapGrid?.map_id || null;
       }
       window.__nuwaxActiveMapName = activeMapName;
       window.__nuwaxMapRevision = function (value) {
@@ -1755,21 +1728,8 @@
         return revision && revision !== "0" ? revision : null;
       };
       window.__nuwaxMapBinding = function () {
-        const data = state.lastMapEnvelope?.data || {};
-        const source = data.map_snapshot || data;
-        const diagnostics = source.metadata || data.diagnostics || {};
-        const semantic = diagnostics.semantic_map_binding;
-        return {
-          map_name: source.map_name || activeMapName(),
-          source_name: source.source_name || diagnostics.source_name || null,
-          source_epoch: source.source_epoch || diagnostics.source_epoch || null,
-          schema_version: source.schema_version || 2,
-          update_sequence: window.__nuwaxMapRevision(source.update_sequence ?? diagnostics.update_sequence),
-          frame_id: state.mapGrid?.frame_id || source.frame_id || state.lastMapEnvelope?.frame_id || null,
-          ...(semantic && semantic.map_name === (source.map_name || activeMapName())
-            && semantic.frame_id === (state.mapGrid?.frame_id || source.frame_id || state.lastMapEnvelope?.frame_id) ? semantic : {}),
-          available: Boolean(state.mapGrid),
-        };
+        return {map_name: state.mapGrid?.map_id || activeMapName(),
+          frame_id: state.mapGrid?.frame_id || null, available: Boolean(state.mapGrid)};
       };
       function formatPoseMetric(value) {
         const number = Number(value);
@@ -1949,26 +1909,8 @@
           if (state.mapViewMode !== "3d") drawMap();
         });
       }
-      function mapGridContentKey(grid, envelope, diagnostics) {
-        if (!grid) return "missing";
-        const data = envelope.data || {};
-        const source = data.map_snapshot || data;
-        const metadata = grid.metadata || {};
-        diagnostics = diagnostics || {};
-        const origin = originPosition(grid);
-        const sourceName = source.source_name || diagnostics.source_name || metadata.source_name || envelope.source;
-        const sourceEpoch = source.source_epoch || diagnostics.source_epoch || metadata.source_epoch;
-        const revision = diagnostics.occupancy_content_revision ?? metadata.occupancy_content_revision
-          ?? diagnostics.content_revision ?? metadata.content_revision ?? source.update_sequence
-          ?? diagnostics.update_sequence ?? metadata.update_sequence ?? diagnostics.revision
-          ?? metadata.revision ?? envelope.revision ?? grid.revision;
-        // 只复用同一拥有者生命周期内的修订；旧消息缺少身份时，每次应用都重绘。
-        const identity = sourceName && sourceEpoch && revision !== undefined && revision !== null && revision !== ""
-          ? [sourceName, sourceEpoch, revision]
-          : ["legacy-message", ++state.mapLegacyFrameSequence];
-        return JSON.stringify([source.map_name || diagnostics.map_name || grid.map_id || "",
-          grid.frame_id || source.frame_id || envelope.frame_id || "", grid.width, grid.height,
-          gridResolution(grid), Number(origin.x || 0), Number(origin.y || 0), originYaw(grid), identity]);
+      function mapGridContentKey(grid, envelope) {
+        return JSON.stringify([grid.map_id, grid.frame_id, envelope.cursor]);
       }
       function normalizeStatusValue(value) {
         const raw = value && typeof value === "object" && "value" in value ? value.value : value;
@@ -1993,7 +1935,7 @@
       }
       function activeSpatialTaskReason() {
         for (const task of state.taskActiveById.values()) {
-          const capability = String(task.capability_name || task.name || "").trim();
+          const capability = String(task.capability || "").trim();
           const taskState = normalizeStatusValue(task.state || task.status);
           if (!capability || isTerminalSpatialStatus(taskState)) continue;
           if (ACTIVE_SPATIAL_CAPABILITIES.has(capability) || capability.startsWith("navigate_") || capability.includes("explore")) {
@@ -2131,22 +2073,9 @@
         return count === null || count > 0;
       }
       function shouldDisplayMapFrame(envelope, diagnostics, streamBridge, grid, status, cleared) {
-        if (cleared) return { display: false, status: "cleared", message: mapClearedMessage(diagnostics) };
-        if (!grid || !(Array.isArray(grid.data) || grid.data instanceof Int8Array) || !grid.width || !grid.height) {
-          return { display: false, status: status === "error" ? "error" : "missing", message: errorReason(envelope, "无 occupancy_grid，占据栅格不可用。") };
-        }
-        const activeReason = activeSpatialContextReason();
-        if (activeReason) return { display: true, reason: activeReason };
-        if (status === "available" && loadedMapAssetShouldDisplay(diagnostics, (envelope.data?.map_snapshot || envelope.data)?.map_name)) {
-          return { display: true, reason: "loaded_map_asset" };
-        }
-        if (status !== "available") {
-          return { display: false, status: status || "stale", message: status === "stale" ? "地图数据已过期，已隐藏缓存帧。" : errorReason(envelope, MAP_DISPLAY_IDLE_MESSAGE) };
-        }
-        if (hasLiveMapFlag(diagnostics, streamBridge) && hasPositiveMapCount(diagnostics) && diagnosticsAgeIsFresh(envelope, diagnostics || {})) {
-          return { display: true, reason: "live_map_stream" };
-        }
-        return { display: false, status: "missing", message: MAP_DISPLAY_IDLE_MESSAGE };
+        if (cleared) return {display: false, status: "cleared", message: "地图会话已结束。"};
+        return grid && grid.data && status === "available"
+          ? {display: true} : {display: false, status: status || "missing", message: "等待地图栅格。"};
       }
       function computeMapDisplayDecision(envelope) {
         if (!envelope) return { display: false, status: "missing", message: MAP_DISPLAY_IDLE_MESSAGE };
@@ -2159,8 +2088,7 @@
         return shouldDisplayMapFrame(envelope, diagnostics, streamBridge, grid, status, cleared);
       }
       function shouldDisplaySpatialPose() {
-        if (activeSpatialContextReason()) return true;
-        return computeMapDisplayDecision(state.lastMapEnvelope).display === true;
+        return Boolean(state.latestPose && state.lastLocalizationEnvelope?.status === "available");
       }
       function clearLocalizationDisplay(message, status) {
         state.pose = null;
@@ -3440,62 +3368,29 @@
         openSemanticDialog(dialog);
       }
       function updateMap(envelope) {
-        if (!acceptAppliedMapIdentity(envelope)) return false;
         state.lastMapEnvelope = envelope;
-        const status = statusOf(envelope);
         const data = envelope.data || {};
-        const grid = data.occupancy_grid || (data.map_snapshot && data.map_snapshot.occupancy_grid) || null;
-        const diagnostics = data.diagnostics || data.metadata || (data.map_snapshot && data.map_snapshot.metadata) || {};
-        const streamBridge = diagnostics.stream_bridge || {};
-        const cleared = isMapClearedEnvelope(envelope, diagnostics, status);
-        state.mapStream = { diagnostics, streamBridge, revision: envelope.revision, sequence: envelope.sequence, timestamp: envelope.source_timestamp, cleared };
-        let displayDecision = shouldDisplayMapFrame(envelope, diagnostics, streamBridge, grid, status, cleared);
-        if (!displayDecision.display && !cleared && status === "available"
-            && grid && (Array.isArray(grid.data) || grid.data instanceof Int8Array) && grid.width && grid.height
-            && state.pendingMapPose?.frame.status === "available"
-            && pendingMapPoseMatches(state.receivedMapIdentity)) {
-          displayDecision = { display: true, reason: "localization_pose_stream" };
-        }
-        if (!displayDecision.display) {
-          clearMapDisplay(displayDecision.message, displayDecision.status || (cleared ? "cleared" : status), diagnostics, streamBridge, envelope, grid);
-          releasePendingMapPose();
+        const grid = data.occupancy_grid;
+        const status = statusOf(envelope);
+        if (!grid || status !== "available") {
+          state.mapGrid = null;
+          state.appliedMapIdentity = null;
+          clearMapDisplay("等待地图栅格。", status, {}, {}, envelope, null);
           return;
         }
+        const nextContentKey = mapGridContentKey(grid, envelope);
+        const baseDirty = state.mapGridContentKey !== nextContentKey;
+        state.mapGrid = grid;
+        state.mapGridContentKey = nextContentKey;
+        state.mapStream = {diagnostics: {}, timestamp: envelope.source_timestamp};
+        state.appliedMapIdentity = {key: JSON.stringify([data.map_name, grid.frame_id]), cleared: false};
         setPill(els.mapStatus, status, "地图");
-        const pinCheckpoint = shouldPinLocalizationCheckpointDisplay(diagnostics);
-        const incomingIsLive = !mapSnapshotIsOffline(diagnostics);
-        const keepCheckpointGrid = pinCheckpoint && incomingIsLive && state.mapGrid && (Array.isArray(state.mapGrid.data) || state.mapGrid.data instanceof Int8Array);
-        if (grid && (Array.isArray(grid.data) || grid.data instanceof Int8Array) && !keepCheckpointGrid) {
-          const nextContentKey = mapGridContentKey(grid, envelope, diagnostics);
-          const baseDirty = state.mapGridContentKey !== nextContentKey;
-          state.mapGrid = grid;
-          state.appliedMapIdentity = state.receivedMapIdentity;
-          state.mapGridContentKey = nextContentKey;
-          const source = data.map_snapshot || data;
-          recordMediaFrame("map2d", mapSnapshotIsOffline(diagnostics) ? null : videoSourceTime(envelope.source_timestamp),
-            nextContentKey,
-            JSON.stringify([source.map_name, source.source_name, source.source_epoch, grid.frame_id]));
-          const freeViewIdentity = JSON.stringify([
-            source.map_name || diagnostics.map_name || "", source.source_name || "", source.source_epoch || "",
-            grid.frame_id || source.frame_id || envelope.frame_id || "",
-          ]);
-          if (state.mapFreeViewIdentity !== freeViewIdentity) {
-            state.mapFreeViewIdentity = freeViewIdentity;
-            state.mapFreeView = { center: null, zoom: 1, fitSpan: null };
-            if (state.map2dCameraMode === "free") resetFreeMapView();
-          }
-          els.mapEmpty.hidden = status === "available";
-          els.mapEmpty.textContent = status === "stale" ? "地图数据已过期，保留最后一帧。" : "";
-          requestMapDraw(baseDirty);
-        } else if (keepCheckpointGrid) {
-          els.mapEmpty.hidden = true;
-          els.mapEmpty.textContent = "";
-          requestMapDraw(false);
-        }
-        window.dispatchEvent?.(new CustomEvent("map:context-changed", { detail: window.__nuwaxMapBinding?.() }));
-        renderMapSummary({ grid, diagnostics, envelope });
-        updateMapStreamChip(cleared ? "cleared" : status, diagnostics, streamBridge, envelope.source_timestamp);
-        releasePendingMapPose();
+        els.mapEmpty.hidden = true;
+        recordMediaFrame("map2d", videoSourceTime(envelope.source_timestamp), envelope.cursor, data.map_name);
+        requestMapDraw(baseDirty);
+        window.dispatchEvent(new CustomEvent("map:context-changed", {detail: window.__nuwaxMapBinding()}));
+        renderMapSummary({grid, diagnostics: {}, envelope});
+        updateMapStreamChip();
       }
       function isMapClearedEnvelope(envelope, diagnostics, status) {
         const cleared = status === "cleared"
@@ -3530,8 +3425,6 @@
       function displayedMapPoseAllowed(kind, pose) {
         if (!pose || pose !== state.pose || state.mapStreamReady !== true || state.lastLocalizationEnvelope?.status !== "available") return false;
         if (kind !== (state.mapViewMode === "3d" ? "map3d" : "map2d")) return false;
-        const barrier = state.poseMapIdentity, applied = state.appliedMapIdentity;
-        if (!barrier?.key || barrier.cleared || !applied || applied.cleared || barrier.key !== applied.key) return false;
         if (state.lastLocalizationEnvelope?.stale === true) return false;
         if (typeof document !== "undefined") {
           if (document.hidden) return false;
@@ -3557,7 +3450,7 @@
       function recordDisplayedMapPose(kind, pose, displayedAt = Date.now()) {
         if (!displayedMapPoseAllowed(kind, pose)) return;
         state.displayedPoseMetrics ||= {};
-        const mapKey = state.appliedMapIdentity.key;
+        const mapKey = state.appliedMapIdentity?.key || pose.frame_id;
         const previous = state.displayedPoseMetrics[kind];
         if (previous && previous.mapKey === mapKey && previous.pose?.timestamp === pose.timestamp
             && previous.pose?.frame_id === pose.frame_id) {
@@ -3565,7 +3458,7 @@
           return;
         }
         // 总线信封时间是发布时间；这里只使用实际显示的位姿自身源时间。
-        const receiptKey = JSON.stringify([state.poseMapIdentity?.key, pose.frame_id, pose.timestamp]);
+        const receiptKey = JSON.stringify([state.appliedMapIdentity?.key, pose.frame_id, pose.timestamp]);
         const acquired = state.poseAcquisitions?.get(receiptKey);
         const sourceTime = state.poseAcquisitions?.has(receiptKey)
           ? (typeof acquired === "number" ? acquired / 1e6 : NaN)
@@ -3614,7 +3507,7 @@
       }
       function updateMapHeartbeat(envelope) {
         const cursor = normalizedStreamCursor(envelope.cursor);
-        const mapCursor = normalizedStreamCursor(state.receivedMapIdentity?.cursor);
+        const mapCursor = normalizedStreamCursor(state.lastMapEnvelope?.cursor);
         const previousCursor = state.lastMapHeartbeatEpoch === state.streamConnectionEpoch
           ? normalizedStreamCursor(state.lastMapHeartbeatEnvelope?.cursor) : null;
         // 主题分别合并后，旧清空心跳可能排在新地图之后执行，必须按原总线游标核对。
@@ -3683,13 +3576,13 @@
         else if (envelope.type === "localization.pose") state.latestPose = null;
         if (incomingPose && Object.hasOwn(envelope.metadata || {}, "source_acquired_unix_ns")) {
           state.poseAcquisitions ||= new Map();
-          const key = JSON.stringify([state.poseMapIdentity?.key, incomingPose.frame_id, incomingPose.timestamp]);
+          const key = JSON.stringify([state.appliedMapIdentity?.key, incomingPose.frame_id, incomingPose.timestamp]);
           state.poseAcquisitions.set(key, envelope.metadata.source_acquired_unix_ns);
           if (state.poseAcquisitions.size > 256) state.poseAcquisitions.delete(state.poseAcquisitions.keys().next().value);
         }
         if (incomingPose && envelope.metadata?.scan_received_unix_ns) {
           state.poseReceipts ||= new Map();
-          const key = JSON.stringify([state.poseMapIdentity?.key, incomingPose.frame_id, incomingPose.timestamp]);
+          const key = JSON.stringify([state.appliedMapIdentity?.key, incomingPose.frame_id, incomingPose.timestamp]);
           state.poseReceipts.set(key, envelope.metadata.scan_received_unix_ns);
           if (state.poseReceipts.size > 256) state.poseReceipts.delete(state.poseReceipts.keys().next().value);
         }
@@ -3965,7 +3858,7 @@
         const status = statusOf(envelope);
         const data = mergeLatestFrontierStream(envelope.data || {});
         const goalMapName = data.navigation_context?.current_goal?.map_name;
-        const mapName = state.receivedMapIdentity?.key ? JSON.parse(state.receivedMapIdentity.key)[0] : null;
+        const mapName = activeMapName();
         if (goalMapName && mapName && goalMapName !== mapName) return;
         const frontierCache = state.latestFrontierStream;
         const explorationFrame = state.latestStreamFrames["exploration.state"];
@@ -4857,7 +4750,7 @@
           !window.__NUWAX_INCREMENTAL_POINTCLOUD_READY__ || topic !== "pointcloud_map.snapshot");
         url.searchParams.set("topics", topics.join(","));
         if (stream.mapPayload) url.searchParams.set("map_payload", stream.mapPayload);
-        url.searchParams.set("map_binary_version", "3");
+        url.searchParams.set("map_binary_version", "4");
         if (stream === state && !PLANAR_PIPELINE) url.searchParams.set("pointcloud_transport", "pages");
         if (stream.latestStreamCursor) url.searchParams.set("after_cursor", String(stream.latestStreamCursor));
         return url.toString();
@@ -4895,81 +4788,12 @@
         if (left === right) return 0;
         return left < right ? -1 : 1;
       }
-      function mapIdentityKey(identity) {
-        const fields = [identity?.map_name, identity?.source_name, identity?.source_epoch, identity?.frame_id];
-        return fields.every((field) => typeof field === "string" && field.length > 0)
-          ? JSON.stringify(fields) : null;
-      }
       function hideMapPose() {
         state.lastLocalizationEnvelope = null;
         state.latestPose = null;
-        clearLocalizationDisplay("等待当前地图与定位同步。", "missing");
+        clearLocalizationDisplay("等待定位位姿。", "missing");
         requestMapDraw(false);
-        window.dispatchEvent(new CustomEvent("stream:localization.pose", { detail: null }));
-      }
-      function acceptPoseMapIdentity(message) {
-        const cursor = normalizedStreamCursor(message.cursor);
-        const cleared = message.cleared === true;
-        const key = cleared ? null : mapIdentityKey(message);
-        if (cursor === null || (!cleared && key === null)) return;
-        const current = state.poseMapIdentity;
-        if (current && compareCanonicalInteger(cursor, current.cursor) <= 0) return;
-        const changed = !current || current.key !== key || current.cleared !== cleared;
-        const startCursor = normalizedStreamCursor(message.start_cursor) || cursor;
-        if (compareCanonicalInteger(startCursor, cursor) > 0) return;
-        state.poseMapIdentity = { key, cursor, cleared, startCursor: changed ? startCursor : current.startCursor };
-        if (cleared) state.appliedMapIdentity = null;
-        if (changed) {
-          state.pendingMapPose = null;
-          hideMapPose();
-        }
-        // 主连接重启后的低游标地图可能先被旧屏障挡住，新屏障到达后重试该候选。
-        if (!cleared && (!state.appliedMapIdentity || state.appliedMapIdentity.key !== key)) {
-          const mapFrame = state.latestStreamFrames["map.frame"];
-          const source = mapFrame?.payload?.map_snapshot || mapFrame?.payload;
-          const mapCursor = normalizedStreamCursor(mapFrame?.cursor);
-          if (mapCursor !== null && compareCanonicalInteger(mapCursor, state.poseMapIdentity.startCursor) >= 0
-              && mapIdentityKey({ ...source, frame_id: source?.frame_id || mapFrame?.frame_id }) === key) {
-            state.pendingStreamFrames["map.frame"] = mapFrame;
-            scheduleStreamFlush();
-          }
-        }
-        releasePendingMapPose();
-      }
-      function acceptAppliedMapIdentity(envelope) {
-        const cursor = normalizedStreamCursor(envelope.cursor);
-        if (cursor === null) return false;
-        const source = envelope.data?.map_snapshot || envelope.data;
-        const cleared = envelope.status === "cleared" || source === null;
-        const key = cleared ? null : mapIdentityKey({ ...source, frame_id: source?.frame_id || envelope.frame_id });
-        if (!cleared && key === null) return false;
-        const received = state.receivedMapIdentity;
-        const barrier = state.poseMapIdentity;
-        if (received && compareCanonicalInteger(cursor, received.cursor) < 0) return false;
-        if (barrier && key !== barrier.key && compareCanonicalInteger(cursor, barrier.startCursor) <= 0) return false;
-        if (!state.appliedMapIdentity && barrier && !cleared && compareCanonicalInteger(cursor, barrier.startCursor) < 0) return false;
-        if (!received || received.key !== key || received.cleared !== cleared) hideMapPose();
-        if (cleared || (received && received.key !== key)) resetExplorationOverlayConsumer("map_identity_changed", false);
-        state.receivedMapIdentity = { key, cursor, cleared };
-        return true;
-      }
-      function pendingMapPoseMatches(applied = state.appliedMapIdentity) {
-        const pending = state.pendingMapPose;
-        const barrier = state.poseMapIdentity;
-        if (!pending || !barrier || barrier.cleared || !applied || applied.cleared || state.mapStreamReady === false) return false;
-        if (pending.mapKey !== barrier.key || applied.key !== barrier.key) return false;
-        const cursor = normalizedStreamCursor(pending.frame.cursor);
-        return cursor !== null && compareCanonicalInteger(cursor, barrier.startCursor) > 0;
-      }
-      function releasePendingMapPose(reevaluateMap = false) {
-        if (!pendingMapPoseMatches()) {
-          if (reevaluateMap && !state.appliedMapIdentity && state.lastMapEnvelope?.status === "available"
-              && pendingMapPoseMatches(state.receivedMapIdentity)) updateMap(state.lastMapEnvelope);
-          return;
-        }
-        const pending = state.pendingMapPose;
-        state.pendingMapPose = null;
-        processStreamFrame(pending.frame);
+        window.dispatchEvent(new CustomEvent("stream:localization.pose", {detail: null}));
       }
       function isCanonicalExplorationFrame(frame) {
         const exploration = frame && frame.payload && frame.payload.exploration_state;
@@ -5025,28 +4849,7 @@
         state.frontiers = [];
         return true;
       }
-      function decodeMapBinaryFrame(buffer) {
-        const bytes = new Uint8Array(buffer);
-        const magic = [0x4e, 0x55, 0x57, 0x41, 0x58, 0x4d, 0x41, 0x50];
-        if (bytes.byteLength < 13 || !magic.every((value, index) => bytes[index] === value) || ![2, 3].includes(bytes[8])) return null;
-        const headerLength = new DataView(buffer, 9, 4).getUint32(0, true);
-        if (headerLength <= 0 || headerLength > 64 * 1024 || 13 + headerLength > bytes.byteLength) return null;
-        try {
-          const message = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(13, 13 + headerLength)));
-          const frame = message.frame;
-          const payload = frame.payload;
-          const grid = payload.occupancy_grid;
-          // 版本2只作为旧格式读取，不重新计算或传播其旧摘要。
-          delete payload.content_sha256;
-          payload.schema_version = 2;
-          const cells = grid.width * grid.height;
-          if (bytes.byteLength - 13 - headerLength !== cells) return null;
-          grid.data = new Int8Array(buffer, 13 + headerLength, cells);
-          return frame;
-        } catch (_) {
-          return null;
-        }
-      }
+      const {decodeMapBinaryFrame, mapForCanvas, poseForCanvas} = window.nuwaxMapStream;
       function routePointCloudMapBinary(buffer) {
         state.binaryReceivedCount = (state.binaryReceivedCount || 0) + 1;
         state.binaryReceivedBytes = (state.binaryReceivedBytes || 0) + buffer.byteLength;
@@ -5179,11 +4982,6 @@
             acceptConnectionPong(message);
             return;
           }
-          if (message.type === "stream.map_identity" && stream === state.poseStream) {
-            updateLatestStreamCursor(message.cursor, false, stream);
-            acceptPoseMapIdentity(message);
-            return;
-          }
           if (message.type === "keepalive") {
             updateLatestStreamCursor(message.cursor, false, stream);
             return;
@@ -5205,7 +5003,6 @@
             if (stream === state) {
               state.mapStreamReady = true;
               if (message.gap_reason === "cursor_ahead_of_stream") {
-                state.receivedMapIdentity = null;
                 state.appliedMapIdentity = null;
                 const mapFrame = state.latestStreamFrames["map.frame"];
                 const mapCursor = normalizedStreamCursor(mapFrame?.cursor);
@@ -5215,7 +5012,6 @@
                   scheduleStreamFlush();
                 }
               }
-              releasePendingMapPose(true);
             }
             return;
           }
@@ -5227,8 +5023,6 @@
             }
             if (stream === state.poseStream) {
               acceptsMessages = false;
-              state.poseMapIdentity = null;
-              state.pendingMapPose = null;
               hideMapPose();
               socket.close();
               return;
@@ -5255,11 +5049,8 @@
             resetExplorationOverlayConsumer("disconnect");
             state.mapStreamReady = false;
             delete state.pendingStreamFrames["map.frame"];
-          } else if (stream === state.poseStream) {
-            state.poseMapIdentity = null;
           }
           if (stream !== state.logStream) {
-            state.pendingMapPose = null;
             hideMapPose();
           }
           stream.streamReconnectAttempt += 1;
@@ -5344,14 +5135,7 @@
         if (frame.topic === "tasks.state") frame = { ...frame, __taskSequence: ++state.taskEventSequence };
         state.latestStreamFrames[frame.topic] = frame;
         if (frame.topic === "localization.pose") {
-          // 状态立即应用，二维与三维各自合并到下一动画帧，不先等待通用面板刷新。
-          if (!frame.payload || frame.status === "missing") {
-            state.pendingMapPose = null;
-            processStreamFrame(frame);
-          } else {
-            state.pendingMapPose = { frame, mapKey: state.poseMapIdentity?.key || null };
-            releasePendingMapPose(true);
-          }
+          processStreamFrame(frame);
           return;
         }
         if (frame.topic === "logs.entry") {
@@ -5398,12 +5182,18 @@
         let updateOverviewForFrame = true;
         if (frame.topic === "robot.state") {
           updateOverviewForFrame = updateRobotStateFrame(frame);
+        } else if (frame.topic === "geometry.state") {
+          state.latestGeometryState = frame.payload;
+          if (frame.payload.phase === "idle") {
+            updateMap({...envelopeFromFrame(frame, {}), status: "cleared"});
+            hideMapPose();
+          }
         } else if (frame.topic === "map.frame") {
-          if (updateMap(envelopeFromFrame(frame)) === false) return;
+          if (updateMap(envelopeFromFrame(frame, mapForCanvas(frame.payload))) === false) return;
         } else if (frame.topic === "map.heartbeat") {
           if (updateMapHeartbeat(envelopeFromFrame(frame)) === false) return;
         } else if (frame.topic === "localization.pose") {
-          updateLocalization(envelopeFromFrame(frame, { pose: frame.payload, trajectory: state.trajectory }));
+          updateLocalization(envelopeFromFrame(frame, { pose: poseForCanvas(frame.payload), trajectory: state.trajectory }));
         } else if (frame.topic === "localization.trajectory") {
           const trajectory = frame.payload && Array.isArray(frame.payload.trajectory) ? frame.payload.trajectory : [];
           state.trajectory = trajectory;
@@ -5621,55 +5411,12 @@
       }
       function updateTaskFrameImpl(frame) {
         const receiveSequence = frame.__taskSequence || ++state.taskEventSequence;
-        const framePayload = frame.payload || {};
-        if (Array.isArray(framePayload.active_tasks) || Array.isArray(framePayload.history_tasks)) {
-          if (receiveSequence <= state.taskSnapshotSequence) return;
-          replaceTaskStore(framePayload, receiveSequence);
-          return;
-        }
-        const event = framePayload.event || framePayload;
-        const payload = event.payload || {};
-        const requestContext = payload.request_context || {};
-        const taskId = event.task_id || payload.task_id || requestContext.task_id;
-        if (!taskId) return;
-        const key = String(taskId);
-        const existing = state.taskActiveById.get(key) || state.taskHistoryById.get(key) || {};
-        // 任务 3.2.1：state 字段回退链移除 event.event_type 兜底（避免 "task.progress" 字面量进入 state）
-        const derivedStage = event.event_type ? String(event.event_type).replace(/^task\./, "") : null;
-        const task = {
-          ...existing,
-          feedback: frame.metadata?.feedback || payload.feedback || existing.feedback,
-          task_id: taskId,
-          capability_name: payload.capability_name || requestContext.capability_name || existing.capability_name,
-          state: payload.state || event.state || (isTerminalTaskState(derivedStage) || ["accepted", "running"].includes(derivedStage) ? derivedStage : null) || existing.state || null,
-          stage: payload.stage || existing.stage || derivedStage,
-          message: payload.message || event.message || existing.message,
-          progress: payload.progress !== undefined ? payload.progress : existing.progress,
-          progress_percent: payload.progress_percent !== undefined ? payload.progress_percent : existing.progress_percent,
-          error_code: payload.error_code || (payload.error_payload && payload.error_payload.code) || existing.error_code,
-          error_category: payload.error_category || (payload.error_payload && payload.error_payload.error_category) || existing.error_category,
-          retryable: payload.retryable !== undefined ? payload.retryable : payload.error_payload && payload.error_payload.retryable !== undefined ? payload.error_payload.retryable : existing.retryable,
-          next_action: payload.next_action || (payload.error_payload && payload.error_payload.next_action) || existing.next_action,
-          updated_at: payload.updated_at || event.timestamp || frame.timestamp || existing.updated_at,
-          completed_at: payload.completed_at || existing.completed_at,
-          __streamSequence: receiveSequence,
-        };
-        // 历史HTTP只有有限窗口，仍保留已收到的终态；旧活动事件不能复活快照已结束任务。
-        if (receiveSequence <= state.taskSnapshotSequence && !isTerminalTaskState(task.state)) return;
-        if ((existing.__streamSequence || 0) > receiveSequence) return;
-        if (isTerminalTaskState(existing.state || existing.status) && !isTerminalTaskState(task.state)) return;
-        if (taskUpdatedMs(task) && taskUpdatedMs(existing) > taskUpdatedMs(task)) return;
-        // 任务 3.2.3：终态时强制 progress=1.0（如果 state 是 SUCCEEDED 且 payload.progress 为 null/undefined）
-        if (isTerminalTaskState(task.state) && task.state === "succeeded" && task.progress === undefined) {
-          task.progress = 1.0;
-        }
+        const event = frame.payload;
+        const task = {...event.payload, __streamSequence: receiveSequence};
+        const key = task.task_id;
         if (isTerminalTaskState(task.state)) {
           state.taskActiveById.delete(key);
-          // 任务 3.3：history 幂等守卫 —— 已存在且更新版本不晚于新值时跳过覆盖
-          const existingHistory = state.taskHistoryById.get(key);
-          if (!existingHistory || taskUpdatedMs(task) > taskUpdatedMs(existingHistory)) {
-            state.taskHistoryById.set(key, task);
-          }
+          state.taskHistoryById.set(key, task);
         } else {
           state.taskHistoryById.delete(key);
           state.taskActiveById.set(key, task);

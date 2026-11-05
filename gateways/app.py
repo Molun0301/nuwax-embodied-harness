@@ -15,7 +15,6 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import Request
 
-from drivers.entry import create_active_robot_assembly
 from gateways.auth import GatewayAccessManager
 from gateways.agent.router import build_agent_router
 from gateways.agent.service import AgentToolService
@@ -32,7 +31,7 @@ from gateways.http.console import build_console_router
 from gateways.http.logs import build_logs_router
 from gateways.mcp.protocol import build_mcp_router
 from gateways.relay.server import create_relay_app
-from gateways.runtime import GatewayRuntime, create_default_gateway_runtime
+from gateways.platform import Platform, build_platform
 from gateways.ws.data_streams import build_data_stream_router
 from gateways.ws.events import build_event_router
 from core.logging_utils import LogRateLimiter, correlation_context
@@ -218,7 +217,7 @@ class RevalidatedStaticFiles(StaticFiles):
 
 
 def create_gateway_app(
-    runtime: GatewayRuntime,
+    runtime: Platform,
     config: NuwaxRobotBridgeConfig,
     *,
     start_runtime_on_lifespan: bool = True,
@@ -248,32 +247,10 @@ def create_gateway_app(
                 await run_in_threadpool(runtime.start)
             yield
         finally:
-            source_fenced = False
-            prior_error = sys.exc_info()[0] is not None
-            try:
-                if start_runtime_on_lifespan:
-                    APP_LOGGER.info("宿主机网关运行时准备停止。")
-                    stop_result = await run_in_threadpool(runtime.stop)
-                    source_fenced = stop_result is not False
-            except BaseException:
-                prior_error = True
-                raise
-            finally:
-                if agent_tools is not None:
-                    try:
-                        result = await run_in_threadpool(agent_tools.close, source_fenced=source_fenced)
-                        app.state.agent_terminal_persistence_close = result
-                        if not result["complete"]:
-                            APP_LOGGER.error("智能体终态回执关闭未完成", extra={"terminal_persistence": result})
-                            if not prior_error:
-                                raise RuntimeError("智能体终态回执仍未完成关闭或缺少源静止证明；原任务不会重执行。")
-                    except BaseException:
-                        if not hasattr(app.state, "agent_terminal_persistence_close"):
-                            app.state.agent_terminal_persistence_close = {
-                                "complete": False, "owner_closed": None, "last_error_code": "receipt_close_failed"}
-                        if not prior_error:
-                            raise
-                        APP_LOGGER.exception("回执关闭未完成；保留原始运行时关闭异常。")
+            if start_runtime_on_lifespan:
+                await run_in_threadpool(runtime.stop)
+            if agent_tools is not None:
+                await run_in_threadpool(agent_tools.close)
 
     app = FastAPI(title="Nuwax Embodied Harness（NEH）网关", lifespan=lifespan)
     app.state.runtime = runtime
@@ -372,15 +349,8 @@ def create_gateway_app_from_env() -> FastAPI:
         config.logging.log_file,
         config.logging.level,
     )
-    robot = create_active_robot_assembly(config)
-    runtime = create_default_gateway_runtime(config, robot)
-    APP_LOGGER.info(
-        "宿主机网关应用已创建 robot=%s model=%s artifact_dir=%s memory_db=%s",
-        robot.manifest.robot_name,
-        robot.manifest.robot_model,
-        config.gateway.artifact_dir,
-        config.runtime_data.memory_db_path,
-    )
+    runtime = build_platform(config)
+    APP_LOGGER.info("宿主机网关已装配 robot=%s", runtime.robot.manifest.robot_name)
     return create_gateway_app(runtime, config)
 
 

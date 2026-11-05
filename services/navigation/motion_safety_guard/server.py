@@ -1,203 +1,149 @@
+"""Unix（本机）套接字边界：解码一次并校验协议输入。"""
 from __future__ import annotations
 
-from pathlib import Path
+import math
 import os
+from pathlib import Path
 import socket
 import socketserver
-import stat
 import threading
-from typing import Optional, Tuple
 
 from google.protobuf.message import DecodeError
 
 from services.navigation.proto_gen import motion_guard_pb2 as pb
-
-from .actor import GuardActor
-from .constants import MAX_FRAME_BYTES
+from .constants import WATCHDOG_INTERVAL_SECONDS
+from .core import MotionGuardCore
 from .framing import FramingError, recv_frame, send_frame
-from .peer_auth import get_peer_credentials
+from .go2_actuator import _ONE_SHOT_SPORT_METHODS, _TOGGLE_SPORT_METHODS
 
 
-class _ThreadingUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
-    daemon_threads = True
-    block_on_close = True
-    allow_reuse_address = False
+def decode_request(payload: bytes) -> pb.GuardRequest:
+    request = pb.GuardRequest.FromString(payload)
+    operation = request.WhichOneof("op")
+    if operation is None:
+        raise ValueError("缺少运动操作")
+    if operation == "acquire" and request.acquire.source not in {
+        pb.SOURCE_NAV, pb.SOURCE_GATEWAY_FOLLOW, pb.SOURCE_GATEWAY_RELATIVE,
+    }:
+        raise ValueError("租约来源无效")
+    if operation == "velocity" and not all(math.isfinite(v) for v in (
+        request.velocity.vx_mps, request.velocity.vy_mps, request.velocity.wz_rps,
+    )):
+        raise ValueError("速度必须是有限数值")
+    if operation == "sport":
+        sport = request.sport
+        command = sport.WhichOneof("command")
+        if command == "action":
+            action = sport.action.action
+            if action not in _ONE_SHOT_SPORT_METHODS and action not in _TOGGLE_SPORT_METHODS and action != pb.SPORT_ACTION_STOP_MOVE:
+                raise ValueError("机体动作无效")
+            if action not in _TOGGLE_SPORT_METHODS and not sport.action.enabled:
+                raise ValueError("一次性机体动作必须 enabled=true")
+        elif command == "body_pose":
+            if not all(math.isfinite(v) for v in (sport.body_pose.roll_rad, sport.body_pose.pitch_rad, sport.body_pose.yaw_rad)):
+                raise ValueError("机身姿态必须是有限数值")
+        elif command != "control_mode" or sport.control_mode not in {pb.CONTROL_MODE_HIGH_LEVEL, pb.CONTROL_MODE_LOW_LEVEL}:
+            raise ValueError("机体动作或控制模式无效")
+    if operation == "setting":
+        setting = request.setting
+        if not setting.HasField("speed_level") and not setting.HasField("obstacle_avoidance"):
+            raise ValueError("至少提供一项机器人设置")
+        if setting.HasField("speed_level") and setting.speed_level not in {1, 2, 3}:
+            raise ValueError("速度档位必须在 [1, 3] 内")
+    return request
 
-    def __init__(self, *args, max_connections: int, **kwargs) -> None:
-        self._connection_slots = threading.BoundedSemaphore(max_connections)
-        super().__init__(*args, **kwargs)
 
-    def process_request(self, request, client_address) -> None:
-        if not self._connection_slots.acquire(blocking=False):
-            self.shutdown_request(request)
-            return
-        try:
-            super().process_request(request, client_address)
-        except BaseException:
-            self._connection_slots.release()
-            raise
-
-    def process_request_thread(self, request, client_address) -> None:
-        try:
-            super().process_request_thread(request, client_address)
-        finally:
-            self._connection_slots.release()
-
-
-class _MotionGuardHandler(socketserver.BaseRequestHandler):
-    server: "_BoundMotionGuardServer"
+class _Handler(socketserver.BaseRequestHandler):
+    def finish(self) -> None:
+        with self.server.connections_lock:
+            self.server.connections.discard(self.request)
 
     def handle(self) -> None:
-        connection: socket.socket = self.request
-        connection.settimeout(None)
-        peer = get_peer_credentials(connection)
         while True:
             try:
-                payload = recv_frame(
-                    connection,
-                    max_frame_bytes=self.server.max_frame_bytes,
-                )
-                request = pb.MotionGuardRequest()
-                request.ParseFromString(payload)
-                response = self.server.actor.call(
-                    request,
-                    peer,
-                    timeout_seconds=self.server.actor_timeout_seconds,
-                )
-                send_frame(
-                    connection,
-                    response.SerializeToString(deterministic=True),
-                    max_frame_bytes=self.server.max_frame_bytes,
-                )
-            except (
-                DecodeError,
-                FramingError,
-                OSError,
-                RuntimeError,
-                TimeoutError,
-                ValueError,
-            ):
+                payload = recv_frame(self.request)
+            except (FramingError, OSError):
+                return
+            try:
+                request = decode_request(payload)
+            except (DecodeError, ValueError) as exc:
+                response = pb.GuardResponse(error=pb.Error(code=pb.ERROR_CODE_INVALID_ARGUMENT, message=str(exc)))
+            else:
+                response = self.server.core.handle(request)
+            try:
+                send_frame(self.request, response.SerializeToString())
+            except (FramingError, OSError):
                 return
 
 
-class _BoundMotionGuardServer(_ThreadingUnixServer):
-    def __init__(
-        self,
-        socket_path: Path,
-        actor: GuardActor,
-        *,
-        max_frame_bytes: int,
-        connection_timeout_seconds: float,
-        actor_timeout_seconds: float,
-        max_connections: int,
-    ) -> None:
-        self.actor = actor
-        self.max_frame_bytes = max_frame_bytes
-        self.connection_timeout_seconds = connection_timeout_seconds
-        self.actor_timeout_seconds = actor_timeout_seconds
-        super().__init__(
-            str(socket_path),
-            _MotionGuardHandler,
-            bind_and_activate=True,
-            max_connections=max_connections,
-        )
+class _Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = False
+
+    def __init__(self, path, handler):
+        self.connections = set()
+        self.connections_lock = threading.Lock()
+        super().__init__(path, handler)
+
+    def process_request(self, request, address) -> None:
+        with self.connections_lock:
+            self.connections.add(request)
+        try:
+            super().process_request(request, address)
+        except BaseException:
+            with self.connections_lock:
+                self.connections.discard(request)
+            raise
 
 
 class MotionGuardUnixServer:
-    def __init__(
-        self,
-        *,
-        socket_path: Path,
-        actor: GuardActor,
-        socket_gid: int,
-        max_frame_bytes: int = MAX_FRAME_BYTES,
-        connection_timeout_seconds: float = 1.0,
-        actor_timeout_seconds: float = 2.0,
-        max_connections: int = 32,
-    ) -> None:
-        if max_connections <= 0:
-            raise ValueError("max_connections must be positive")
+    def __init__(self, *, socket_path: Path, core: MotionGuardCore, socket_gid: int) -> None:
         self.socket_path = Path(socket_path)
-        self._actor = actor
+        self._core = core
         self._socket_gid = socket_gid
-        self._max_frame_bytes = max_frame_bytes
-        self._connection_timeout_seconds = connection_timeout_seconds
-        self._actor_timeout_seconds = actor_timeout_seconds
-        self._max_connections = max_connections
-        self._server: Optional[_BoundMotionGuardServer] = None
-        self._thread: Optional[threading.Thread] = None
-        self._bound_identity: Optional[Tuple[int, int]] = None
+        self._server = None
+        self._thread = None
+        self._watchdog = None
+        self._stopping = threading.Event()
 
     def start(self) -> None:
-        if self._server is not None:
-            return
-        if not self.socket_path.parent.is_dir():
-            raise RuntimeError(
-                f"motion guard runtime directory is missing: {self.socket_path.parent}"
-            )
+        self._core.initialize_zero()
         self.socket_path.unlink(missing_ok=True)
-        self._actor.start()
+        server = _Server(str(self.socket_path), _Handler)
+        server.core = self._core
         try:
-            server = _BoundMotionGuardServer(
-                self.socket_path,
-                self._actor,
-                max_frame_bytes=self._max_frame_bytes,
-                connection_timeout_seconds=self._connection_timeout_seconds,
-                actor_timeout_seconds=self._actor_timeout_seconds,
-                max_connections=self._max_connections,
-            )
             os.chown(self.socket_path, os.geteuid(), self._socket_gid)
             os.chmod(self.socket_path, 0o660)
-            metadata = os.lstat(self.socket_path)
-            self._bound_identity = (metadata.st_dev, metadata.st_ino)
-            self._server = server
-            thread = threading.Thread(
-                target=server.serve_forever,
-                kwargs={"poll_interval": 0.05},
-                name="nuwax-motion-guard-uds",
-                daemon=True,
-            )
-            self._thread = thread
-            thread.start()
         except BaseException:
-            self._safe_unlink_bound_socket()
-            self._actor.stop()
+            server.server_close()
+            self.socket_path.unlink(missing_ok=True)
             raise
+        self._server = server
+        self._stopping.clear()
+        self._thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        self._watchdog = threading.Thread(target=self._watch, name="motion-guard-watchdog", daemon=True)
+        self._thread.start()
+        self._watchdog.start()
+
+    def _watch(self) -> None:
+        while not self._stopping.wait(WATCHDOG_INTERVAL_SECONDS):
+            self._core.tick()
 
     def stop(self) -> None:
-        server, self._server = self._server, None
-        thread, self._thread = self._thread, None
-        if server is not None:
-            server.shutdown()
-            server.server_close()
-        if thread is not None:
-            thread.join(timeout=2.0)
-            if thread.is_alive():
-                raise RuntimeError("motion guard UDS server did not stop")
-        fence_error: Optional[BaseException] = None
-        if server is not None:
+        self._stopping.set()
+        if self._server is not None:
+            self._server.shutdown()
+            with self._server.connections_lock:
+                connections = tuple(self._server.connections)
+            for connection in connections:
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            self._server.server_close()
+            self._thread.join()
+            self._watchdog.join()
+            self._server = None
             try:
-                self._actor.fence()
-            except BaseException as exc:
-                fence_error = exc
-        try:
-            self._actor.stop()
-        finally:
-            self._safe_unlink_bound_socket()
-        if fence_error is not None:
-            raise fence_error
-
-    def _safe_unlink_bound_socket(self) -> None:
-        identity, self._bound_identity = self._bound_identity, None
-        if identity is None:
-            return
-        try:
-            metadata = os.lstat(self.socket_path)
-        except FileNotFoundError:
-            return
-        if (
-            stat.S_ISSOCK(metadata.st_mode)
-            and (metadata.st_dev, metadata.st_ino) == identity
-            and metadata.st_uid == os.geteuid()
-        ):
-            self.socket_path.unlink()
+                self._core.initialize_zero()
+            finally:
+                self.socket_path.unlink(missing_ok=True)

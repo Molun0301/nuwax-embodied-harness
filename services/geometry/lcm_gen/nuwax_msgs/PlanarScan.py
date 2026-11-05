@@ -10,17 +10,15 @@ import struct
 class PlanarScan(object):
     """ 规范二维扫描；数组中的距离、角度、状态和时间使用同一束索引。 """
 
-    __slots__ = ["schema_version", "runtime_generation", "sensor_id", "source_sequence", "timestamp_ns", "clock_domain", "clock_id", "frame_id", "calibration_ref", "beam_count", "angular_layout", "angle_min_rad", "angle_increment_rad", "range_min_m", "range_max_m", "scan_duration_ns", "timestamp_quality", "time_offsets_quality", "timing_uncertainty_ns", "motion_compensated", "ranges_size", "ranges_f32_le", "angles_size", "angles_f32_le", "states_size", "beam_states_u8", "intensities_size", "intensities_f32_le", "offsets_size", "time_offsets_ns_le"]
+    __slots__ = ["schema_version", "sensor_id", "source_sequence", "timestamp_ns", "clock_domain", "clock_id", "frame_id", "calibration_ref", "beam_count", "angular_layout", "angle_min_rad", "angle_increment_rad", "range_min_m", "range_max_m", "scan_duration_ns", "timestamp_quality", "time_offsets_quality", "timing_uncertainty_ns", "motion_compensated", "ranges_size", "ranges_f32_le", "angles_size", "angles_f32_le", "states_size", "beam_states_u8", "intensities_size", "intensities_f32_le", "offsets_size", "time_offsets_ns_le"]
 
-    __typenames__ = ["int32_t", "int64_t", "string", "int64_t", "int64_t", "string", "string", "string", "string", "int32_t", "int8_t", "double", "double", "double", "double", "int64_t", "int8_t", "int8_t", "int64_t", "int8_t", "int32_t", "byte", "int32_t", "byte", "int32_t", "byte", "int32_t", "byte", "int32_t", "byte"]
+    __typenames__ = ["int32_t", "string", "int64_t", "int64_t", "string", "string", "string", "string", "int32_t", "int8_t", "double", "double", "double", "double", "int64_t", "int8_t", "int8_t", "int64_t", "int8_t", "int32_t", "byte", "int32_t", "byte", "int32_t", "byte", "int32_t", "byte", "int32_t", "byte"]
 
-    __dimensions__ = [None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, ["ranges_size"], None, ["angles_size"], None, ["states_size"], None, ["intensities_size"], None, ["offsets_size"]]
+    __dimensions__ = [None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, ["ranges_size"], None, ["angles_size"], None, ["states_size"], None, ["intensities_size"], None, ["offsets_size"]]
 
     def __init__(self):
         self.schema_version = 0
         """ LCM Type: int32_t """
-        self.runtime_generation = 0
-        """ LCM Type: int64_t """
         self.sensor_id = ""
         """ LCM Type: string """
         self.source_sequence = 0
@@ -93,7 +91,7 @@ class PlanarScan(object):
         return buf.getvalue()
 
     def _encode_one(self, buf):
-        buf.write(struct.pack(">iq", self.schema_version, self.runtime_generation))
+        buf.write(struct.pack(">i", self.schema_version))
         __sensor_id_encoded = self.sensor_id.encode('utf-8')
         buf.write(struct.pack('>I', len(__sensor_id_encoded)+1))
         buf.write(__sensor_id_encoded)
@@ -139,7 +137,7 @@ class PlanarScan(object):
     @staticmethod
     def _decode_one(buf):
         self = PlanarScan()
-        self.schema_version, self.runtime_generation = struct.unpack(">iq", buf.read(12))
+        self.schema_version = struct.unpack(">i", buf.read(4))[0]
         __sensor_id_len = struct.unpack('>I', buf.read(4))[0]
         self.sensor_id = buf.read(__sensor_id_len)[:-1].decode('utf-8', 'replace')
         self.source_sequence, self.timestamp_ns = struct.unpack(">qq", buf.read(16))
@@ -166,7 +164,7 @@ class PlanarScan(object):
     @staticmethod
     def _get_hash_recursive(parents):
         if PlanarScan in parents: return 0
-        tmphash = (0x14c1fbf59745c1cb) & 0xffffffffffffffff
+        tmphash = (0xef620081a58c6dda) & 0xffffffffffffffff
         tmphash  = (((tmphash<<1)&0xffffffffffffffff) + (tmphash>>63)) & 0xffffffffffffffff
         return tmphash
     _packed_fingerprint = None

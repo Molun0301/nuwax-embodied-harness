@@ -42,7 +42,6 @@ def load_environment(root):
         "NUWAX_GEOMETRY_LIO_BACKEND": "device", "NUWAX_GEOMETRY_MAPPING_BACKEND": "voxel",
         "NUWAX_GEOMETRY_CORRECTION_BACKEND": "none",
         "NUWAX_GEOMETRY_SEQUENCE_STATE_PATH": str(root / "runtime_data/geometry/sequence_state.json"),
-        "NUWAX_GEOMETRY_EXPLORATION_RECONCILIATION_JOURNAL_PATH": str(root / "runtime_data/geometry/exploration_ownership_journal.json"),
         "NUWAX_NAV_STACK_READY_FILE": str(root / "runtime_data/navigation/nuwax_nav_stack.ready"),
         "NUWAX_GEOMETRY_RUNTIME_READY_FILE": str(root / "runtime_data/geometry/nuwax_geometry_runtime.ready"),
         "NUWAX_PERSON_FOLLOW_READY_FILE": str(root / "runtime_data/person-follow/nuwax_person_follow.ready"),
@@ -201,8 +200,10 @@ class Supervisor:
             item.state, item.exit_code = "exited", code
 
     def status(self):
-        return {name: {"state": item.state, "pid": item.process.pid if item.process else None,
-            "exit_code": item.exit_code, "error": item.error} for name, item in self.components.items()}
+        return {"pid": os.getpid(), "components": {
+            name: {"state": item.state, "pid": item.process.pid if item.process else None,
+                   "exit_code": item.exit_code, "error": item.error}
+            for name, item in self.components.items()}}
 
     async def business_component(self, name):
         delay = RESTART_DELAY

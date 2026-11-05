@@ -286,9 +286,6 @@ class Runtime:
     def port(self):
         return read_json(self.manager_home / "config/settings.json", {}).get("gateway_port", 8766)
 
-    def _pid(self):
-        return read_json(self.state_path, {}).get("pid", 0)
-
     def _components(self):
         with socket.socket(socket.AF_UNIX) as connection:
             connection.settimeout(2)
@@ -357,7 +354,7 @@ class Runtime:
                                                 NUWAX_INSTALL_HOME=str(self.home)),
                                        stdin=subprocess.DEVNULL,
                                        stdout=log, stderr=log, start_new_session=True)
-        atomic_json(self.state_path, {"pid": process.pid, "prefix": str(prefix)})
+        atomic_json(self.state_path, {"prefix": str(prefix)})
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
             if process.poll() is not None:
@@ -368,7 +365,11 @@ class Runtime:
         raise ManagerError("health_timeout", "网关健康接口未在启动预算内响应。", 500, runtime_diagnostic(self.home))
 
     def stop(self, prefix):
-        pid = self._pid()
+        try:
+            pid = self._components()["pid"]
+        except OSError:
+            self.state_path.unlink(missing_ok=True)
+            return
         if pid:
             try:
                 os.kill(pid, signal.SIGTERM)

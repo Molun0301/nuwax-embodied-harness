@@ -13,20 +13,14 @@ from starlette.websockets import WebSocketDisconnect
 
 from contracts.events import RuntimeEventCategory
 from gateways.auth import GatewayAccessManager
-from gateways.errors import GatewayError
+from core.errors import GatewayError
 from gateways.feedback import build_public_runtime_event
-from gateways.runtime import GatewayRuntime
+from gateways.feedback_messages import is_terminal_event
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from gateways.platform import Platform
 from gateways.ws.client_queue import ClientQueue
-
-
-_TERMINAL_EVENT_TYPES = frozenset(
-    {
-        "task.succeeded",
-        "task.failed",
-        "task.cancelled",
-        "task.timeout",
-        }
-)
 
 
 def _parse_categories(values: Optional[str]) -> Optional[Tuple[RuntimeEventCategory, ...]]:
@@ -48,11 +42,7 @@ def _parse_event_types(values: Optional[str]) -> Optional[Tuple[str, ...]]:
     return event_types if event_types else None
 
 
-def _is_terminal_event(event) -> bool:
-    return str(event.event_type or "") in _TERMINAL_EVENT_TYPES
-
-
-def _take_queue_gap_notice(queue: ClientQueue, runtime: GatewayRuntime) -> Optional[Dict[str, object]]:
+def _take_queue_gap_notice(queue: ClientQueue, runtime: Platform) -> Optional[Dict[str, object]]:
     state = queue.take_drops()
     if not isinstance(state, dict) or not state.get("dropped_count"):
         return None
@@ -62,7 +52,7 @@ def _take_queue_gap_notice(queue: ClientQueue, runtime: GatewayRuntime) -> Optio
         if isinstance(first_dropped_cursor, int) and not isinstance(first_dropped_cursor, bool)
         else 0
     )
-    latest_cursor = runtime.event_bus.latest_cursor()
+    latest_cursor = runtime.events.latest_cursor()
     notice = {
         "cursor": effective_after_cursor,
         "latest_cursor": latest_cursor,
@@ -93,7 +83,7 @@ def _replay_gap_notice(snapshot) -> Optional[Dict[str, object]]:
     }
 
 
-def build_event_router(runtime: GatewayRuntime, access_manager: GatewayAccessManager) -> APIRouter:
+def build_event_router(runtime: Platform, access_manager: GatewayAccessManager) -> APIRouter:
     """构造事件流路由。"""
 
     router = APIRouter()
@@ -111,10 +101,10 @@ def build_event_router(runtime: GatewayRuntime, access_manager: GatewayAccessMan
 
         async def event_generator():
             loop = asyncio.get_running_loop()
-            queue = ClientQueue(loop, maxsize=200, is_terminal=_is_terminal_event)
+            queue = ClientQueue(loop, maxsize=200, is_terminal=is_terminal_event)
             emitted = 0
 
-            subscription_id, replay_snapshot = runtime.event_bus.subscribe_with_replay(
+            subscription_id, replay_snapshot = runtime.events.subscribe_with_replay(
                 queue.put,
                 after_cursor=after_cursor,
                 categories=category_filter,
@@ -155,12 +145,12 @@ def build_event_router(runtime: GatewayRuntime, access_manager: GatewayAccessMan
                     except asyncio.TimeoutError:
                         yield _format_sse_payload(
                             "keepalive",
-                            {"cursor": runtime.event_bus.latest_cursor()},
-                            cursor=runtime.event_bus.latest_cursor(),
+                            {"cursor": runtime.events.latest_cursor()},
+                            cursor=runtime.events.latest_cursor(),
                         )
             finally:
                 queue.close()
-                runtime.event_bus.unsubscribe(subscription_id)
+                runtime.events.unsubscribe(subscription_id)
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -177,9 +167,9 @@ def build_event_router(runtime: GatewayRuntime, access_manager: GatewayAccessMan
 
         await websocket.accept()
         loop = asyncio.get_running_loop()
-        queue = ClientQueue(loop, maxsize=200, is_terminal=_is_terminal_event)
+        queue = ClientQueue(loop, maxsize=200, is_terminal=is_terminal_event)
 
-        subscription_id, replay_snapshot = runtime.event_bus.subscribe_with_replay(
+        subscription_id, replay_snapshot = runtime.events.subscribe_with_replay(
             queue.put,
             after_cursor=after_cursor,
             categories=category_filter,
@@ -203,13 +193,13 @@ def build_event_router(runtime: GatewayRuntime, access_manager: GatewayAccessMan
                     await websocket.send_json({"type": "event", "event": payload})
                 except asyncio.TimeoutError:
                     await websocket.send_json(
-                        {"type": "keepalive", "cursor": runtime.event_bus.latest_cursor()}
+                        {"type": "keepalive", "cursor": runtime.events.latest_cursor()}
                     )
         except WebSocketDisconnect:
             return
         finally:
             queue.close()
-            runtime.event_bus.unsubscribe(subscription_id)
+            runtime.events.unsubscribe(subscription_id)
 
     return router
 

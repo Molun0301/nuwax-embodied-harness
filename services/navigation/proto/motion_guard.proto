@@ -1,56 +1,184 @@
 syntax = "proto3";
+package nuwax.motion_guard.v3;
 
-package nuwax.motion_guard.v2;
+// ============================================================================
+// 运动守卫协议 v3（F0 草案）
+//
+// 对应：目标架构第 5 节（三条底线 + 运动代次）。替代 services/navigation/proto/motion_guard.proto（v2）。
+// 服务端：Python 守卫进程 services/navigation/motion_safety_guard（python -m services.navigation.motion_safety_guard），
+//         由业务监督者按需启动（ensure(["motion_guard"])）。
+// 客户端：网关 services/navigation/motion_client.py（Python）；导航栈 crates/nuwax-motion-safety-guard（Rust）。
+//
+// 传输（沿用 v2）：Unix 流式套接字 ${NUWAX_MOTION_GUARD_SOCKET}（安装根 run/motion-guard.sock，文件权限 0660）。
+//   每帧 = 4 字节大端无符号长度 + 一条 protobuf 消息；长度为 0 或超过 16 MiB 时服务端断开连接。
+//   请求帧是 GuardRequest，应答帧是 GuardResponse。一条连接上严格一问一答、按序处理；客户端可保持长连接，
+//   连接断开后重连即可（服务端不保存任何按连接或按请求的记录）。
+//
+// 三条底线（服务端行为，目标架构 5.1）：
+//   1. 急停（Stop）立即发零速并作废当前租约，代次加一。
+//   2. 租约持有者最后一次 Velocity 之后 0.75 秒未再发 Velocity，守卫发零速（租约仍有效，再发 Velocity 即恢复）。
+//   3. 只接受当前租约的 Velocity / Release；Acquire 只接受当前代次。旧租约、旧代次一律拒收。
+//
+// 运动代次：一个 uint64。守卫启动时取随机初值；Begin、Stop、Sport 各使其加一。
+//   每条新的运动命令受理时由网关 Begin 取得代次，随任务参数 → 导航目标/探索请求 → Geometry → 导航栈传给执行者；
+//   执行者凭它 Acquire。代次过期说明有更新的命令或急停，执行者停止并上报“已被停止”。
+//
+// 已删除（相对 v2，目标架构 5.3）：boot_nonce 与租约元组、操作号与幂等重放（GetOperationResult）、
+//   普通/优先两套操作记录、零速回执与重试退避、请求期限（issued/deadline）、对端凭据校验、api_version、
+//   守卫自带单实例锁、Renew（由 Velocity 续租）、RevokeAndZero（即 Release）、
+//   RevokeZeroAndSwitchMode 与 BodyPose（并入 Sport，见待决问题 Q8）。
+// ============================================================================
 
-// Authoritative command/control contract for the private motion-guard UDS.
-// The socket transport is a four-byte big-endian length followed by exactly
-// one MotionGuardRequest or MotionGuardResponse protobuf message.
-
-enum AckCode {
-  ACK_CODE_UNSPECIFIED = 0;
-  ACK_CODE_RECEIVED = 1;
-  ACK_CODE_APPLIED = 2;
-  ACK_CODE_ZEROED = 3;
-  ACK_CODE_RESOURCE_FENCED = 4;
-  reserved 5;
-  reserved "ACK_CODE_SAFETY_LATCHED";
+// 租约申请方，用于状态显示与日志。机体动作与设置不需要租约，没有对应来源。
+enum Source {
+  SOURCE_UNSPECIFIED = 0;
+  SOURCE_NAV = 1;                // 导航栈（导航目标、探索子目标）
+  SOURCE_GATEWAY_FOLLOW = 2;     // 网关人物跟随
+  SOURCE_GATEWAY_RELATIVE = 3;   // 网关相对移动、楼层设施内移动
 }
 
-enum LeaseState {
-  LEASE_STATE_UNSPECIFIED = 0;
-  LEASE_STATE_IDLE = 1;
-  LEASE_STATE_ACTIVE = 2;
-  LEASE_STATE_PAUSING = 3;
-  LEASE_STATE_REVOKING = 4;
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_STALE_GENERATION = 1;  // Acquire 携带的代次不是当前代次（有更新的命令或急停）
+  ERROR_CODE_LEASE_REVOKED = 2;     // 租约不是当前租约（已被更新的租约、急停、机体动作或释放作废）
+  ERROR_CODE_NOT_READY = 3;         // 执行器未配置或未连接，message 写原因
+  ERROR_CODE_ACTUATOR_FAILED = 4;   // 执行器执行失败，message 写原因
+  ERROR_CODE_INVALID_ARGUMENT = 5;  // 请求内容不合法（解码处唯一一次校验）
 }
 
-enum GuardSource {
-  GUARD_SOURCE_UNSPECIFIED = 0;
-  GUARD_SOURCE_NAV = 1;
-  GUARD_SOURCE_GATEWAY_MANUAL = 2;
-  GUARD_SOURCE_GATEWAY_FOLLOW = 3;
-  GUARD_SOURCE_GATEWAY_RELATIVE = 4;
-  GUARD_SOURCE_GATEWAY_SPORT = 5;
-  reserved 6;
-  reserved "GUARD_SOURCE_ADMIN";
+message Error {
+  ErrorCode code = 1;
+  string message = 2;
 }
 
-enum GuardAction {
-  GUARD_ACTION_UNSPECIFIED = 0;
-  GUARD_ACTION_TWIST = 1;
-  GUARD_ACTION_STOP = 2;
-  GUARD_ACTION_BODY_POSE = 3;
-  GUARD_ACTION_SPEED_LEVEL = 4;
-  GUARD_ACTION_OBSTACLE_POLICY = 5;
-  GUARD_ACTION_MODE_SWITCH = 6;
-  GUARD_ACTION_SPORT_ACTION = 7;
+// ---------------- 请求 ----------------
+
+// 受理一条新的运动命令：代次加一，返回新代次。当前租约不变，直到新命令的执行者 Acquire
+// （或 Stop / Sport）时才作废，因此换手时不会先停一下（沿用 2cdde220 的行为）。
+// 调用方：网关 invoke 处理运动类能力时调用一次。
+message BeginRequest {}
+
+// 带当前代次申请租约。成功即作废上一个租约（上一持有者此后收到 LEASE_REVOKED），返回新租约号。
+// 错误：STALE_GENERATION、NOT_READY。
+message AcquireRequest {
+  Source source = 1;
+  uint64 generation = 2;
 }
+
+// 发送速度（机体坐标系），同时续租。只接受当前租约。
+// 错误：LEASE_REVOKED、NOT_READY、ACTUATOR_FAILED。速度超限时按执行器限幅执行，应答 limited=true。
+message VelocityRequest {
+  uint64 lease_id = 1;
+  double vx_mps = 2;
+  double vy_mps = 3;
+  double wz_rps = 4;
+}
+
+// 持有者释放租约：发零速，租约作废。只接受当前租约（LEASE_REVOKED 表示早已作废，调用方可忽略）。
+message ReleaseRequest {
+  uint64 lease_id = 1;
+}
+
+// 急停：立即零速，作废当前租约，代次加一。任何时候都接受，不需要租约或代次。
+message StopRequest {
+  string reason = 1;   // 记日志用
+}
+
+// 机体动作：收到即作废当前租约、发零速、代次加一（之前的命令及其执行者全部失效），然后执行动作。
+// 不需要租约或代次；网关调用前先取消当前运动任务。
+message SportRequest {
+  oneof command {
+    SportActionCommand action = 10;   // 站立、坐下、打招呼等
+    BodyPoseCommand body_pose = 11;   // 机身姿态
+    ControlMode control_mode = 12;    // 切换高层/低层控制模式
+  }
+}
+
+// 机器人设置。不需要租约与代次，不改变代次。至少设置一项，否则 INVALID_ARGUMENT。
+message SettingRequest {
+  optional uint32 speed_level = 1;          // 速度档位，闭区间 [1, 3]
+  optional bool obstacle_avoidance = 2;     // 实时避障开关
+}
+
+// 读取守卫状态。任何时候都接受。
+message StatusRequest {}
+
+message GuardRequest {
+  oneof op {
+    BeginRequest begin = 1;
+    AcquireRequest acquire = 2;
+    VelocityRequest velocity = 3;
+    ReleaseRequest release = 4;
+    StopRequest stop = 5;
+    SportRequest sport = 6;
+    SettingRequest setting = 7;
+    StatusRequest status = 8;
+  }
+}
+
+// ---------------- 应答 ----------------
+
+message BeginResponse {
+  uint64 generation = 1;
+}
+
+message AcquireResponse {
+  uint64 lease_id = 1;
+}
+
+message VelocityResponse {
+  bool limited = 1;   // 执行器按配置限幅；不是实测速度
+}
+
+message ReleaseResponse {}
+
+message StopResponse {
+  uint64 generation = 1;   // 急停后的新代次
+  bool lease_revoked = 2;  // 急停时确有租约被作废
+}
+
+message SportResponse {
+  uint64 generation = 1;       // 动作完成后的新代次
+  ControlMode active_mode = 2; // 仅 control_mode 命令：切换后的模式
+}
+
+message SettingResponse {}
+
+message StatusResponse {
+  uint64 generation = 1;
+  uint64 lease_id = 2;            // 当前租约，0 表示无
+  Source lease_source = 3;        // 当前租约的申请方
+  bool zeroed = 4;                // 当前输出为零速（无租约、已释放或 0.75 秒未续）
+  bool ready = 5;                 // 执行器已配置并连接
+  string reason = 6;              // ready=false 的原因
+  MotionCommandLimits command_limits = 7;  // 导航栈表面跟随器用（照抄 v2）
+}
+
+message GuardResponse {
+  // 设置时请求失败，下面的 result 不设置。
+  Error error = 1;
+  // 执行器实测运动（照抄 v2 的旁路测量）：有有效样本时附在任何应答上；导航栈规划器读取。
+  // 不代表命令已执行，也不参与任何准入。
+  MeasuredMotionFeedback measured_motion = 2;
+  oneof result {
+    BeginResponse begin = 10;
+    AcquireResponse acquire = 11;
+    VelocityResponse velocity = 12;
+    ReleaseResponse release = 13;
+    StopResponse stop = 14;
+    SportResponse sport = 15;
+    SettingResponse setting = 16;
+    StatusResponse status = 17;
+  }
+}
+
+// ---------------- 机体动作与设置（照抄 v2 枚举） ----------------
 
 enum SportAction {
   SPORT_ACTION_UNSPECIFIED = 0;
   SPORT_ACTION_DAMP = 1;
   SPORT_ACTION_BALANCE_STAND = 2;
-  SPORT_ACTION_STOP_MOVE = 3;
+  SPORT_ACTION_STOP_MOVE = 3;      // 只零速（等价于急停中的零速部分，同样作废租约、代次加一）
   SPORT_ACTION_STAND_UP = 4;
   SPORT_ACTION_STAND_DOWN = 5;
   SPORT_ACTION_RECOVERY_STAND = 6;
@@ -76,69 +204,11 @@ enum SportAction {
   SPORT_ACTION_CLASSIC_WALK = 26;
 }
 
-enum ControlMode {
-  CONTROL_MODE_UNSPECIFIED = 0;
-  CONTROL_MODE_HIGH_LEVEL = 1;
-  CONTROL_MODE_LOW_LEVEL = 2;
+message SportActionCommand {
+  SportAction action = 1;
+  // 只用于开关类动作；一次性动作收到 false → INVALID_ARGUMENT。
+  bool enabled = 2;
 }
-
-enum OperationNamespace {
-  OPERATION_NAMESPACE_UNSPECIFIED = 0;
-  OPERATION_NAMESPACE_ACQUIRE = 1;
-  OPERATION_NAMESPACE_LEASE = 2;
-  OPERATION_NAMESPACE_GLOBAL_STOP = 3;
-}
-
-message LeaseTuple {
-  reserved 1;
-  reserved "generation";
-  bytes boot_nonce = 2; // Exactly 16 bytes.
-  uint64 lease_id = 3;  // Zero only before AcquireLease.
-}
-
-message RequestEnvelope {
-  reserved 5, 6;
-  reserved "payload_sha256", "sequence";
-  LeaseTuple tuple = 1;
-  GuardSource source = 2;
-  GuardAction action = 3;
-  string operation_id = 4;
-  uint64 issued_monotonic_ns = 7;
-  uint64 deadline_monotonic_ns = 8;
-  // Guard-owned barrier sampled by readiness and checked atomically on acquire.
-  uint64 motion_stop_generation = 9;
-}
-
-message GlobalStopEnvelope {
-  reserved 3;
-  reserved "payload_sha256";
-  GuardSource source = 1;
-  string operation_id = 2;
-  uint64 issued_monotonic_ns = 4;
-  uint64 deadline_monotonic_ns = 5;
-}
-
-message ErrorDetail {
-  string code = 1;
-  string message = 2;
-  bool retryable = 3;
-}
-
-message GuardResult {
-  AckCode ack = 1;
-  reserved 2;
-  reserved "gate";
-  LeaseState lease = 3;
-  ErrorDetail error = 4;
-}
-
-message TwistCommand {
-  double linear_x_mps = 1;
-  double linear_y_mps = 2;
-  double angular_z_rps = 3;
-}
-
-message StopCommand {}
 
 message BodyPoseCommand {
   double roll_rad = 1;
@@ -146,160 +216,15 @@ message BodyPoseCommand {
   double yaw_rad = 3;
 }
 
-message SpeedLevelCommand {
-  uint32 level = 1; // Closed interval [1, 3].
+enum ControlMode {
+  CONTROL_MODE_UNSPECIFIED = 0;
+  CONTROL_MODE_HIGH_LEVEL = 1;
+  CONTROL_MODE_LOW_LEVEL = 2;
 }
 
-message ObstaclePolicyCommand {
-  bool enabled = 1;
-}
+// ---------------- 执行反馈与限幅（照抄 v2） ----------------
 
-message SportActionCommand {
-  SportAction action = 1;
-  // Used only by toggle actions. Receivers reject false for one-shot actions.
-  bool enabled = 2;
-}
-
-message ModeSwitchCommand {
-  ControlMode target_mode = 1;
-}
-
-message ZeroAck {
-  string zero_ack_id = 1;
-  uint64 applied_monotonic_ns = 2;
-  reserved 3, 4, 5, 6;
-  reserved "stationary_confirmed", "confirmation_kind", "feedback_source_timestamp_ns", "stationary_deadline_monotonic_ns";
-}
-
-message AcquireLeaseRequest {
-  RequestEnvelope envelope = 1;
-}
-
-message RenewLeaseRequest {
-  RequestEnvelope envelope = 1;
-}
-
-message SubmitMotionCommandRequest {
-  reserved 13, 14;
-  reserved "speed_level", "obstacle_policy";
-  RequestEnvelope envelope = 1;
-  oneof command {
-    TwistCommand twist = 10;
-    StopCommand stop = 11;
-    BodyPoseCommand body_pose = 12;
-
-  }
-}
-
-message ExecuteSportCommandRequest {
-  RequestEnvelope envelope = 1;
-  SportActionCommand command = 2;
-}
-
-message RevokeZeroAndSwitchModeRequest {
-  RequestEnvelope envelope = 1;
-  ModeSwitchCommand command = 2;
-}
-
-message RevokeAndZeroRequest {
-  RequestEnvelope envelope = 1;
-}
-
-message StopAllMotionRequest {
-  reserved 3, 4, 5;
-  reserved "mode", "recovery_correlation", "recovery_fence_token";
-  GlobalStopEnvelope envelope = 1;
-  string reason = 2;
-  optional uint64 expected_motion_stop_generation = 6;
-}
-
-message AdvanceMotionGenerationRequest {
-  GuardSource source = 1;
-}
-
-message AdvanceMotionGenerationResponse {
-  GuardResult result = 1;
-  bytes boot_nonce = 2;
-  uint64 motion_stop_generation = 3;
-}
-
-message ApplyRobotSettingRequest {
-  GuardSource source = 1;
-  oneof setting {
-    SpeedLevelCommand speed_level = 10;
-    ObstaclePolicyCommand obstacle_policy = 11;
-  }
-}
-
-message ApplyRobotSettingResponse {
-  GuardResult result = 1;
-}
-
-message GetReadinessRequest {
-  GuardSource source = 1;
-}
-
-message GetGuardStateRequest {
-  GuardSource source = 1;
-}
-
-message GetOperationResultRequest {
-  GuardSource source = 1;
-  string operation_id = 2;
-  OperationNamespace operation_namespace = 3;
-}
-
-message AcquireLeaseResponse {
-  reserved 3;
-  reserved "lease_deadline_monotonic_ns";
-  GuardResult result = 1;
-  LeaseTuple lease_tuple = 2;
-  uint64 owner_deadline_monotonic_ns = 4;
-}
-
-message RenewLeaseResponse {
-  reserved 2;
-  reserved "lease_deadline_monotonic_ns";
-  GuardResult result = 1;
-  uint64 owner_deadline_monotonic_ns = 3;
-}
-
-message SubmitMotionCommandResponse {
-  GuardResult result = 1;
-  uint64 applied_monotonic_ns = 2;
-  ZeroAck zero_ack = 3; // Present only for StopCommand.
-  // 执行器按配置进行了限幅；不是实测速度。
-  bool limited = 4;
-}
-
-message ExecuteSportCommandResponse {
-  GuardResult result = 1;
-  uint64 applied_monotonic_ns = 2;
-  ZeroAck zero_ack = 3; // Present only for SPORT_ACTION_STOP_MOVE.
-}
-
-message RevokeZeroAndSwitchModeResponse {
-  GuardResult result = 1;
-  ZeroAck zero_ack = 2;
-  ControlMode active_mode = 3;
-}
-
-message RevokeAndZeroResponse {
-  GuardResult result = 1;
-  ZeroAck zero_ack = 2;
-}
-
-message StopAllMotionResponse {
-  reserved 5, 6;
-  reserved "recovery_fence_token", "recovery_fence_held";
-  GuardResult result = 1;
-  ZeroAck zero_ack = 2;
-  bool lease_revoked = 3;
-  uint64 motion_stop_generation = 4;
-
-}
-
-// 设备命令帧的实际策略；平面变换与 Python MotionCommandLimits 使用同一系数。
+// 设备命令帧的实际限幅策略；平面变换与 Python MotionCommandLimits 使用同一系数。
 message MotionCommandLimits {
   double max_linear_x_mps = 1;
   double max_linear_y_mps = 2;
@@ -308,102 +233,20 @@ message MotionCommandLimits {
   string source = 5;
   string input_frame_id = 6;
   string limit_frame_id = 7;
-  repeated double command_from_input_rotation = 8; // 按行排列的2×2矩阵。
+  repeated double command_from_input_rotation = 8; // 按行排列的 2×2 矩阵
   double input_origin_in_command_x_m = 9;
   double input_origin_in_command_y_m = 10;
 }
 
-message GetReadinessResponse {
-  reserved 4, 6, 10;
-  reserved "epoch_durable", "generation", "recovery_fence_held";
-  GuardResult result = 1;
-  bool ready = 2;
-  bool actuator_configured = 3;
-  string reason = 5;
-  bytes boot_nonce = 7;
-  reserved 8;
-  reserved "startup_zero_confirmed";
-  uint64 motion_stop_generation = 9;
-  MotionCommandLimits command_limits = 11;
-
-}
-
-message GetGuardStateResponse {
-  reserved 2, 4, 5, 8, 9, 10;
-  reserved "generation", "last_zero_ack_id", "fenced", "recovery_fence_held", "recovery_fence_token_sha256", "recovery_fence_correlation_sha256";
-  GuardResult result = 1;
-  bytes boot_nonce = 3;
-  uint64 active_lease_id = 6;
-  uint64 motion_stop_generation = 7;
-  ZeroAck last_zero_confirmation = 11;
-}
-
-message GetOperationResultResponse {
-  reserved 7, 8;
-  reserved "recovery_fence_token", "recovery_fence_held";
-  GuardResult result = 1;
-  string target_operation_id = 2;
-  AckCode target_ack = 3;
-  bool resolved = 4;
-  ZeroAck zero_ack = 5;
-  // Exact guard barrier associated with a resolved global-stop operation.
-  uint64 motion_stop_generation = 6;
-
-}
-
-message MotionGuardRequest {
-  uint32 api_version = 1;
-  string request_id = 2;
-  oneof operation {
-    AcquireLeaseRequest acquire_lease = 10;
-    RenewLeaseRequest renew_lease = 11;
-    SubmitMotionCommandRequest submit_motion_command = 12;
-    ExecuteSportCommandRequest execute_sport_command = 13;
-    RevokeZeroAndSwitchModeRequest revoke_zero_and_switch_mode = 14;
-    RevokeAndZeroRequest revoke_and_zero = 15;
-    GetReadinessRequest get_readiness = 17;
-    GetOperationResultRequest get_operation_result = 20;
-    StopAllMotionRequest stop_all_motion = 21;
-    GetGuardStateRequest get_guard_state = 22;
-    AdvanceMotionGenerationRequest advance_motion_generation = 23;
-    ApplyRobotSettingRequest apply_robot_setting = 24;
-  }
-  reserved 16, 18, 19;
-  reserved "latch_safety_stop", "get_safety_state", "reset_safe_stop";
-}
-
-// 同一真实设备样本；速度属于 frame_id 机体参考点，不能由命令回执构造。
-// 接收/到期时间属于守卫主机的单调时钟，读取缓存或去重重放不能刷新它们。
+// 同一真实设备样本；速度属于 frame_id 机体参考点，不由命令回执构造。
+// 接收/到期时间属于守卫主机的单调时钟。
 message MeasuredMotionFeedback {
   string source_id = 1;
   uint64 source_timestamp_ns = 2;
   uint64 received_monotonic_ns = 3;
   uint64 valid_until_monotonic_ns = 4;
   string frame_id = 5;
-  repeated double body_linear_xyz = 6; // 必须恰好3项，单位米/秒。
-  repeated double body_angular_xyz = 7; // 必须恰好3项，单位弧度/秒。
-  repeated double orientation_wxyz = 8; // 可缺失；提供时必须恰好4项。
-}
-
-message MotionGuardResponse {
-  uint32 api_version = 1;
-  string request_id = 2;
-  // 可选旁路测量，不属于 outcome，也不代表 APPLIED 或任何准入条件。
-  MeasuredMotionFeedback measured_motion_feedback = 3;
-  oneof outcome {
-    AcquireLeaseResponse acquire_lease = 10;
-    RenewLeaseResponse renew_lease = 11;
-    SubmitMotionCommandResponse submit_motion_command = 12;
-    ExecuteSportCommandResponse execute_sport_command = 13;
-    RevokeZeroAndSwitchModeResponse revoke_zero_and_switch_mode = 14;
-    RevokeAndZeroResponse revoke_and_zero = 15;
-    GetReadinessResponse get_readiness = 17;
-    GetOperationResultResponse get_operation_result = 20;
-    StopAllMotionResponse stop_all_motion = 21;
-    GetGuardStateResponse get_guard_state = 22;
-    AdvanceMotionGenerationResponse advance_motion_generation = 23;
-    ApplyRobotSettingResponse apply_robot_setting = 24;
-  }
-  reserved 16, 18, 19;
-  reserved "latch_safety_stop", "get_safety_state", "reset_safe_stop";
+  repeated double body_linear_xyz = 6;   // 恰好 3 项，米/秒
+  repeated double body_angular_xyz = 7;  // 恰好 3 项，弧度/秒
+  repeated double orientation_wxyz = 8;  // 可缺失；提供时恰好 4 项
 }

@@ -639,7 +639,6 @@ class MemoryService(SceneMappingMemoryMixin):
                 "记忆库名称不能为空。",
                 error_code="invalid_params",
                 http_status=422,
-                jsonrpc_code=-32602,
             )
         return self.create_memory_library(library_name=resolved_name)
 
@@ -680,7 +679,6 @@ class MemoryService(SceneMappingMemoryMixin):
                 "记忆库名称不能为空。",
                 error_code="invalid_params",
                 http_status=422,
-                jsonrpc_code=-32602,
             )
 
         if expected_library_name is not None:
@@ -691,7 +689,6 @@ class MemoryService(SceneMappingMemoryMixin):
                     % (resolved_name, expected),
                     error_code="memory_library_map_mismatch",
                     http_status=409,
-                    jsonrpc_code=-32000,
                     details={
                         "expected_library_name": expected,
                         "requested_library_name": resolved_name,
@@ -740,7 +737,6 @@ class MemoryService(SceneMappingMemoryMixin):
                 "记忆库名称不能为空。",
                 error_code="invalid_params",
                 http_status=422,
-                jsonrpc_code=-32602,
             )
 
         existed_before = any(item["library_name"] == resolved_name for item in self.list_memory_libraries())
@@ -909,7 +905,6 @@ class MemoryService(SceneMappingMemoryMixin):
                 "记忆库名称不能为空。",
                 error_code="invalid_params",
                 http_status=422,
-                jsonrpc_code=-32602,
             )
 
         was_active = resolved_name == self._active_library_name
@@ -1056,7 +1051,6 @@ class MemoryService(SceneMappingMemoryMixin):
                 MEMORY_DISABLED_MESSAGE,
                 error_code="memory_disabled",
                 http_status=409,
-                jsonrpc_code=-32000,
             )
         if initialize_embedders:
             self._ensure_embedders_initialized()
@@ -1375,7 +1369,6 @@ class MemoryService(SceneMappingMemoryMixin):
                 "地点名称不能为空。",
                 error_code="invalid_params",
                 http_status=422,
-                jsonrpc_code=-32602,
             )
 
         localization_snapshot = self._get_or_refresh_localization(prefer_live=True)
@@ -3516,7 +3509,6 @@ class MemoryService(SceneMappingMemoryMixin):
                 "场景空间标识不能为空。",
                 error_code="invalid_params",
                 http_status=422,
-                jsonrpc_code=-32602,
             )
         current = self._scene_spaces_by_id.get(resolved_id) or self._repository.load_scene_space(resolved_id)
         if current is None or self._record_library_name(current) != active_library:
@@ -3541,7 +3533,6 @@ class MemoryService(SceneMappingMemoryMixin):
                     "未知场景空间审核状态：%s" % review_status,
                     error_code="invalid_scene_space_review_status",
                     http_status=422,
-                    jsonrpc_code=-32602,
                 ) from exc
         if attributes is not None:
             updates["attributes"] = {**dict(current.attributes), **dict(attributes)}
@@ -3776,7 +3767,6 @@ class MemoryService(SceneMappingMemoryMixin):
                 "查询文本不能为空。",
                 error_code="invalid_params",
                 http_status=422,
-                jsonrpc_code=-32602,
             )
         current_pose = self._get_current_pose()
         self._ensure_embedders_initialized(nonblocking=True)

@@ -1,6 +1,5 @@
 """二维扫描LCM编码；使用生成的类型指纹，解码后重新校验公共物理契约。"""
 from __future__ import annotations
-from typing import Tuple
 from contracts.sensors import CanonicalLaserScan, RegistrationState, SensorClockDomain
 from services.geometry.lcm_gen.nuwax_msgs.PlanarScan import PlanarScan
 
@@ -9,14 +8,11 @@ TIMESTAMP_QUALITY = {"hardware": 1, "estimated": 2, "receipt": 3}
 OFFSET_QUALITY = {"unavailable": 0, "hardware": 1, "estimated": 2}
 
 
-def encode_planar_scan(scan: CanonicalLaserScan, runtime_generation: int) -> bytes:
-    if not 1 <= runtime_generation <= (1 << 63) - 1:
-        raise ValueError("二维运行代际无效")
+def encode_planar_scan(scan: CanonicalLaserScan) -> bytes:
     if scan.schema_version != 1:
         raise ValueError("不支持的二维扫描版本")
     message = PlanarScan()
     message.schema_version = 1
-    message.runtime_generation = runtime_generation
     for name in ("sensor_id", "source_sequence", "timestamp_ns", "frame_id", "beam_count", "scan_duration_ns", "range_min_m", "range_max_m"):
         setattr(message, name, getattr(scan, name))
     message.clock_domain = scan.clock_domain.value
@@ -45,7 +41,7 @@ def encode_planar_scan(scan: CanonicalLaserScan, runtime_generation: int) -> byt
     return encoded
 
 
-def decode_planar_scan(data: bytes) -> Tuple[int, CanonicalLaserScan]:
+def decode_planar_scan(data: bytes) -> CanonicalLaserScan:
     if not 8 <= len(data) <= MAX_PLANAR_FRAME_BYTES:
         raise ValueError("二维扫描传输长度无效")
     try:
@@ -72,8 +68,8 @@ def decode_planar_scan(data: bytes) -> Tuple[int, CanonicalLaserScan]:
             timing_uncertainty_ns=None if message.timing_uncertainty_ns == -1 else message.timing_uncertainty_ns,
             motion_compensated=bool(message.motion_compensated),
         )
-        if encode_planar_scan(scan, message.runtime_generation) != data:
+        if encode_planar_scan(scan) != data:
             raise ValueError("二维扫描包含尾随数据或非规范字段")
-        return message.runtime_generation, scan
+        return scan
     except Exception as exc:
         raise ValueError("无效二维扫描消息：%s" % exc) from exc

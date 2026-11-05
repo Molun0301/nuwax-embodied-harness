@@ -8,26 +8,15 @@ import signal
 from typing import Optional
 import threading
 
-from .actor import GuardActor
-from .constants import (
-    DEFAULT_LOCK_PATH,
-    DEFAULT_SOCKET_PATH,
-)
+from .constants import DEFAULT_SOCKET_PATH
 from .core import MotionGuardCore
-from .single_instance import SingleInstanceLock
 from .go2_actuator import ActuatorError, Go2Actuator
 from .motion_control_actuator import MotionControlActuator
 from .server import MotionGuardUnixServer
 
 
-def _path_from_env(name: str, default: str) -> Path:
-    value = runtime_value(name, default) if name == "NUWAX_MOTION_GUARD_SOCKET" else os.environ.get(name, default)
-    return Path(value).expanduser().resolve()
-
-
 def run() -> None:
-    socket_path = _path_from_env("NUWAX_MOTION_GUARD_SOCKET", DEFAULT_SOCKET_PATH)
-    lock_path = _path_from_env("NUWAX_MOTION_GUARD_LOCK", DEFAULT_LOCK_PATH)
+    socket_path = Path(runtime_value("NUWAX_MOTION_GUARD_SOCKET", DEFAULT_SOCKET_PATH)).expanduser().resolve()
     stop_event = threading.Event()
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -37,25 +26,20 @@ def run() -> None:
         signum: signal.signal(signum, request_stop)
         for signum in (signal.SIGINT, signal.SIGTERM)
     }
-    lock = SingleInstanceLock(lock_path)
     server: Optional[MotionGuardUnixServer] = None
     actuator = None
     try:
-        lock.acquire()
         if runtime_value("NUWAX_MOTION_GUARD_BACKEND", "").strip() == "motion_control":
             actuator = MotionControlActuator.from_environment()
         else:
             actuator = Go2Actuator.from_environment()
         core = MotionGuardCore(actuator=actuator)
-        if not core.startup_configured:
-            raise RuntimeError(core.startup_reason)
-        core.initialize_zero_fence()
         if stop_event.is_set():
             return
         socket_gid = os.getegid()
         server = MotionGuardUnixServer(
             socket_path=socket_path,
-            actor=GuardActor(core),
+            core=core,
             socket_gid=socket_gid,
         )
         server.start()
@@ -71,7 +55,6 @@ def run() -> None:
                 if callable(closer):
                     closer()
             finally:
-                lock.release()
                 for signum, handler in previous_handlers.items():
                     signal.signal(signum, handler)
 

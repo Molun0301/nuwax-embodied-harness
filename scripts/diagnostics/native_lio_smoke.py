@@ -119,7 +119,6 @@ class GatewayMappingSession:
         config.geometry.frames.imu_frame = "synthetic_lidar"
         config.geometry.frames.map_frame = "map"
         config.geometry.frames.odom_frame = "odom"
-        config.runtime_data.map_active_restore_on_start = False
         config.runtime_data.map_catalog_root = str(working / "maps")
         config.runtime_data.memory_db_path = str(working / "memory.db")
         config.runtime_data.memory_embedding_model = "lexical-only"

@@ -1250,6 +1250,7 @@ class GatewayRuntime:
                 self.robot.manifest.robot_name,
                 self.robot.manifest.robot_model,
             )
+            self.map_workspace_service.clear_active_map_name()
             self._mark_geometry_cmd_vel_sink_unavailable()
             self.robot.start()
             self._started = True
@@ -1259,17 +1260,7 @@ class GatewayRuntime:
             except Exception:
                 RUNTIME_LOGGER.exception("自动启动持续视频感知运行时失败。")
             self._start_data_frame_stream_sources()
-            # 按启动配置恢复地图工作区。
-            if self.config.runtime_data.map_active_restore_on_start:
-                try:
-                    self.map_workspace_service.restore_active_workspace(load_memory_history=True)
-                except Exception:
-                    RUNTIME_LOGGER.exception("恢复激活地图工作区失败。")
-            else:
-                RUNTIME_LOGGER.info(
-                    "启动时跳过自动恢复地图工作区（NUWAX_ACTIVE_MAP_RESTORE_ON_START=false）。"
-                )
-            self._publish_pointcloud_map_stream_frame(reason="runtime_start_post_restore")
+            self._publish_pointcloud_map_stream_frame(reason="runtime_start")
             self._refresh_dynamic_capability_matrix()
 
             self.event_bus.publish(

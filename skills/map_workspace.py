@@ -413,6 +413,9 @@ class MapWorkspaceService:
         """返回当前选择的地图名称。"""
         return self._repository.get_active_map_name()
 
+    def clear_active_map_name(self) -> None:
+        self._repository.clear_active_map_name()
+
 
     def _reconcile_catalog_active_flags(
         self,
@@ -666,11 +669,6 @@ class MapWorkspaceService:
             metadata={"kind": "active_workspace", "map_name": active_map_name},
         )
         return cleared_asset
-
-    def restore_active_workspace(self, *, load_memory_history: bool = True) -> Optional[MapWorkspace]:
-        name = self._repository.get_active_map_name()
-        return self.activate_map(map_name=name, load_memory_history=load_memory_history) if name else None
-
 
     @_serialized_map_activation_execution
     @_serialized_map_activation

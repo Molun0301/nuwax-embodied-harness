@@ -586,7 +586,7 @@ class AssignedWorkspaceActivationTests(unittest.TestCase):
         self.runtime = self.new_runtime()
         self.service = self.new_service()
         self.stub.calls.clear()
-        restored = self.service.restore_active_workspace()
+        restored = self.service.activate_map(map_name=MAP_NAME)
         self.assert_consistent(restored)
         self.assertIn("ActivateMap", self.stub.calls)
         self.assertNotEqual(original.activation_request_id, self.stub.activation_requests[-1].activation_request_id)

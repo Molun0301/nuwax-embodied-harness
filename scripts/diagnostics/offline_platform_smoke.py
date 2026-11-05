@@ -38,7 +38,6 @@ def run(output_dir: Path) -> dict:
     config = load_config()
     config.robot.active_robot = "customrobot"
     config.geometry.enabled = False
-    config.runtime_data.map_active_restore_on_start = False
     config.runtime_data.map_catalog_root = str(output_dir / "maps")
     config.runtime_data.memory_db_path = str(output_dir / "memory.db")
     config.runtime_data.memory_embedding_model = "lexical-only"

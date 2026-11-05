@@ -209,10 +209,10 @@ class Handler(BaseHTTPRequestHandler):
         self._new_cookie = key
         return session
 
-    def _authorize(self, mutation=False, public=False, business=False):
+    def _authorize(self, mutation=False, public=False):
         self._same_origin()
         key, session = self._session(create=public)
-        if not public and not (business and not self.server.authentication.enabled()) and (not session or (self.server.authentication.enabled() and not session["authenticated"])):
+        if not public and self.server.authentication.enabled() and (not session or not session["authenticated"]):
             raise ManagerError("authentication_required", "请先登录设备管理台。", 401)
         if mutation:
             self._same_origin(required=True)
@@ -290,7 +290,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ManagerError("not_found", "页面资源不存在。", 404)
                 self._send(200, target.read_bytes(), mimetypes.guess_type(str(target))[0] or "application/octet-stream")
             else:
-                self._authorize(business=True)
+                self._authorize()
                 if not self.server.engine.runtime.has_owner():
                     raise ManagerError("gateway_unavailable", "本安装的业务拥有方未运行，请从管理台启动。", 503)
                 if self.command not in ("GET", "HEAD"):

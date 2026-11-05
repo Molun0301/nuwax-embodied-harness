@@ -456,7 +456,6 @@ _ZH_NAMES: Dict[str, str] = {
     'NUWAX_PERCEPTION_TRIANGULATION_MIN_RAYS': '三角化最少射线数',
     'NUWAX_MAP_CATALOG_ROOT': '地图目录',
     'DASHSCOPE_API_KEY': 'DashScope API 密钥',
-    'NUWAX_ACTIVE_MAP_RESTORE_ON_START': '启动时恢复激活地图',
     'NUWAX_ARTIFACT_CLEANUP_BATCH_SIZE': '制品清理批量大小',
     'NUWAX_ARTIFACT_MAX_COUNT': '制品最大数量',
     'NUWAX_ARTIFACT_MAX_TOTAL_BYTES': '制品总大小上限（字节）',

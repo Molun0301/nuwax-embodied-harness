@@ -292,6 +292,7 @@ class Engine:
         hardware = self.hardware()
         catalog, releases = self._release_snapshot(settings=settings, hardware=hardware)
         available = next((item for item in releases["releases"] if item["compatible"]), None)
+        failure = read_json(self.manager_home / "config/failed-updates.json", {}).get(available.get("revision")) if available else None
         relation = None
         relation_name = "unknown"
         if available and current:
@@ -329,6 +330,7 @@ class Engine:
                            "pending": bool(releases.get("pending")), "message": releases.get("message"),
                            "requires_confirmation": channel_record.get("requires_confirmation", False), "display_version": available.get("display_version") if available else None,
                            "check": read_json(self.manager_home / "config/update-check.json", {}),
+                           "last_failure": {"time": failure["time"], "message": failure["error"]["message"]} if failure else None,
                            "version": available["version"] if available else None, "revision": available.get("revision") if available else None, "error": releases.get("error"), "manager_available": bool(latest_manager and manager_relation == 1), "manager_version": latest_manager, "manager_switch_available": bool(latest_manager and manager_relation == 1), "manager_relation": manager_relation_name, "relation": relation_name},
                 "password_enabled": settings["password_enabled"], "platform_supported": hardware["supported"]}
 

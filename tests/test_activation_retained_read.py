@@ -215,7 +215,7 @@ class RetainedActivationReadTests(unittest.TestCase):
             return prepared
         with patch.object(asset_store._StableDirectoryTree, 'close', close), \
                 patch.object(self.h.runtime, 'prepare_retained_assigned_map_activation', prepare):
-            restored = self._assert_one_owned_validation(self.h.service.restore_active_workspace)
+            restored = self._assert_one_owned_validation(lambda: self.h.service.activate_map(map_name=workspace_tests.MAP_NAME))
         self.assertEqual(len(prepared_reads), 1)
         self.assertNotEqual(restored.active_localization_session.activation_receipt_v2, receipt)
         self.assertIn('ActivateMap', self.h.stub.calls)
@@ -230,7 +230,7 @@ class RetainedActivationReadTests(unittest.TestCase):
             raise workspace_tests.ActivationCancelled('after stable read')
         with patch.object(self.h.runtime, 'prepare_retained_assigned_map_activation', cancel):
             with self.assertRaises(workspace_tests.ActivationCancelled):
-                self.h.service.restore_active_workspace()
+                self.h.service.activate_map(map_name=workspace_tests.MAP_NAME)
         self.assertEqual(self.h.stub.calls, [])
         self.assertIsNone(self.h.runtime._map_activation_snapshot_read().bundle)
         path = next((self.root / 'mapping_backend/voxel/objects').glob('*-backend.bin'))
@@ -238,7 +238,7 @@ class RetainedActivationReadTests(unittest.TestCase):
         corrupt = bytearray(body);corrupt[-8:] = struct.pack('<d', float('nan'))
         path.write_bytes(corrupt)
         with self.assertRaises(workspace_tests.GatewayError) as rejected:
-            self.h.service.restore_active_workspace()
+            self.h.service.activate_map(map_name=workspace_tests.MAP_NAME)
         self.assertEqual(rejected.exception.error_code, 'map_asset_bundle_invalid')
         self.assertIsInstance(rejected.exception.__cause__, asset_store.MapAssetBundleValidationError)
         self.assertEqual(self.h.stub.calls, [])
@@ -248,7 +248,7 @@ class RetainedActivationReadTests(unittest.TestCase):
             self.assertIsNot(read.stored_checkpoint, reads[0].stored_checkpoint)
             return original(read, **kwargs)
         with patch.object(self.h.runtime, 'prepare_retained_assigned_map_activation', retry):
-            self.h.assert_consistent(self.h.service.restore_active_workspace())
+            self.h.assert_consistent(self.h.service.activate_map(map_name=workspace_tests.MAP_NAME))
         self.assertEqual(self.h.stub.installs, 2)
         self.assertIn('ActivateMap', self.h.stub.calls)
 
@@ -258,24 +258,24 @@ class RetainedActivationReadTests(unittest.TestCase):
         with patch.object(checkpoint.MappingBackendCheckpointStore, 'load',
                           side_effect=workspace_tests.ActivationCancelled('during load')):
             with self.assertRaises(workspace_tests.ActivationCancelled):
-                self.h.service.restore_active_workspace()
+                self.h.service.activate_map(map_name=workspace_tests.MAP_NAME)
         gc.collect();self.assertEqual(len(os.listdir('/proc/self/fd')), before)
         self.assertEqual(self.h.stub.calls, [])
-        self.h.assert_consistent(self.h.service.restore_active_workspace())
+        self.h.assert_consistent(self.h.service.activate_map(map_name=workspace_tests.MAP_NAME))
         self.assertEqual(self.h.stub.installs, 2)
 
     def test_cold_restore_member_replacement_before_load_rejected(self):
         self._start_cold_restore()
-        self._race('before', 'file', self.h.service.restore_active_workspace)
+        self._race('before', 'file', lambda: self.h.service.activate_map(map_name=workspace_tests.MAP_NAME))
 
     def test_cold_restore_member_replacement_after_load_rejected(self):
         self._start_cold_restore()
-        self._race('after', 'file', self.h.service.restore_active_workspace)
+        self._race('after', 'file', lambda: self.h.service.activate_map(map_name=workspace_tests.MAP_NAME))
 
     def test_cold_restore_directory_replacement_before_load_rejected(self):
         self._start_cold_restore()
-        self._race('before', 'directory', self.h.service.restore_active_workspace)
+        self._race('before', 'directory', lambda: self.h.service.activate_map(map_name=workspace_tests.MAP_NAME))
 
     def test_cold_restore_directory_replacement_after_load_rejected(self):
         self._start_cold_restore()
-        self._race('after', 'directory', self.h.service.restore_active_workspace)
+        self._race('after', 'directory', lambda: self.h.service.activate_map(map_name=workspace_tests.MAP_NAME))

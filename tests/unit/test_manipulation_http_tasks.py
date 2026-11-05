@@ -172,7 +172,6 @@ def build_gateway(device, tmp_path):
     from drivers.customrobot import create_customrobot_assembly
     from gateways.runtime import GatewayRuntime
     config=load_config();config.robot.active_robot='customrobot';config.geometry.enabled=False
-    config.runtime_data.map_active_restore_on_start=False
     config.runtime_data.map_catalog_root=str(tmp_path/'maps');config.runtime_data.memory_db_path=str(tmp_path/'memory.db')
     config.runtime_data.memory_embedding_model='disabled';config.runtime_data.memory_embedding_dimension=128
     config.runtime_data.memory_image_embedding_model='disabled';config.gateway.artifact_dir=str(tmp_path/'artifacts')

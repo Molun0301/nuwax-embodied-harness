@@ -36,7 +36,7 @@
     if (path === '/check') {
       await manager('releases?refresh=1', 'GET', undefined, 120000);
     } else if (path === '/install') {
-      const job = await manager('update', 'POST', {});
+      const job = await manager('update', 'POST', {}, 120000);
       if (job.status === 'deferred') {
         const data = await managerSnapshot();
         data.message = job.message;
@@ -75,6 +75,10 @@
       ? '正在更新：' + activeJob.message + '（' + activeJob.progress + '%）'
       : (data.message || (job ? (job.status === 'succeeded' ? '更新完成' : job.message) : (update.error || update.message || (update.available ? '发现新版本，可以更新' : (update.check.checked_at ? '当前已是检测到的最新版本' : '点击检查更新，或等待自动检测')))));
     $('updateMessage').dataset.state = activeJob ? activeJob.status : (job?.status || (update.error ? 'failed' : 'idle'));
+    if (!activeJob && !job && !data.message && update.available && update.last_failure) {
+      $('updateMessage').textContent = '上次更新到此版本失败：' + update.last_failure.message;
+      $('updateMessage').dataset.state = 'failed';
+    }
     $('updateUnavailable').textContent = '';
     renderControls();
     if (!settingsDirty) {

@@ -7,7 +7,6 @@
   "GO2_VIDEO_STREAM_ENABLED": "机器人为Go2时启动视频推流，经WebRTC（网页实时通信）接收机身摄像头画面并交给几何运行时。网页视频和视觉感知依赖此画面。",
   "GO2_VIDEO_STREAM_RECONNECT_SEC": "视频连接中断或本地套接字断开后，等待多少秒再重连，最小0.1。",
   "GO2_WEBRTC_AES_128_KEY": "新版Go2固件要求的每台设备专属密钥，填32位十六进制字符，旧固件不需要时留空；格式不对时视频推流不会启动。",
-  "NUWAX_ACTIVE_MAP_RESTORE_ON_START": "网关启动时自动重新加载上次激活的地图；关闭时需手动或由智能体激活地图。",
   "NUWAX_ARTIFACT_RETENTION_DAYS": "图片等制品保存超过此天数后自动清理（至少1天）；数量和总容量上限另行控制。",
   "NUWAX_GATEWAY_POINTCLOUD3D_COLOR": "“单色”样式下所有点，以及“单层”“地面”样式中非地面点的颜色，格式 #RRGGBB。",
   "NUWAX_GATEWAY_POINTCLOUD3D_GROUND_COLOR": "“单层”“地面”“结构”样式中地面点的颜色，格式 #RRGGBB。",

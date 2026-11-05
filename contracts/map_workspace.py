@@ -210,6 +210,9 @@ class MapAssetStatus(StrEnum):
 class MapAsset(TimestampedContract):
     """命名地图资产元数据。"""
 
+    # 地图元数据是持久文件，版本删除的字段读取时直接忽略，下次写回即去掉。
+    model_config = ConfigDict(extra="ignore")
+
     map_name: str = Field(description="地图名称，作为地图资产主键。")
     display_name: str = Field(description="地图展示名称。")
     bound_memory_library_name: str = Field(description="绑定的同名记忆库名称。")

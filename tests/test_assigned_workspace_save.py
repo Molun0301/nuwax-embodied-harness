@@ -833,7 +833,7 @@ class AssignedWorkspaceSaveTests(unittest.TestCase):
         self.stub.error = None
         self.runtime = self.new_runtime()
         self.service = self.new_service()
-        restored = self.service.restore_active_workspace()
+        restored = self.service.activate_map(map_name=MAP_NAME)
         self.assertTrue(restored.map_loaded)
         self.assertFalse(restored.localization_ready)
         self.assertEqual(restored.map_asset.asset_identity, saved.asset_identity)

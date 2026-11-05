@@ -319,7 +319,6 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
     config.geometry.frames.imu_frame = "sim_lidar"
     config.geometry.frames.map_frame = "map"
     config.geometry.frames.odom_frame = "odom"
-    config.runtime_data.map_active_restore_on_start = False
     config.runtime_data.map_catalog_root = str(output / "地图")
     config.runtime_data.memory_db_path = str(output / "memory.db")
     config.runtime_data.memory_embedding_model = "lexical-only"

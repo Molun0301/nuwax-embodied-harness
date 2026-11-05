@@ -23,7 +23,6 @@ def main():
     config = load_config()
     config.robot.active_robot = "customrobot"
     config.geometry.enabled = False
-    config.runtime_data.map_active_restore_on_start = False
     config.runtime_data.map_catalog_root = str(args.output / "maps")
     config.runtime_data.memory_db_path = str(args.output / "memory.db")
     config.runtime_data.memory_embedding_model = "disabled"

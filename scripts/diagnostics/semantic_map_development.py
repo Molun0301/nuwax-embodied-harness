@@ -39,7 +39,6 @@ def main():
     config = load_config()
     config.robot.active_robot = "customrobot"
     config.geometry.enabled = False
-    config.runtime_data.map_active_restore_on_start = False
     config.runtime_data.mapping_recording_enabled = False
     config.runtime_data.map_catalog_root = str(args.output_dir / "maps")
     config.runtime_data.memory_db_path = str(args.output_dir / "memory.sqlite")

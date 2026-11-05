@@ -300,7 +300,6 @@ def isolated_gateway_config(tmp_path):
     config.robot.active_robot = "customrobot"
     config.geometry.enabled = False
     config.relay.enabled = False
-    config.runtime_data.map_active_restore_on_start = False
     config.runtime_data.map_catalog_root = str(tmp_path / "maps")
     config.runtime_data.memory_db_path = str(tmp_path / "memory.db")
     config.runtime_data.memory_embedding_model = "disabled"

@@ -64,11 +64,11 @@ class ProviderSelectionChecks(unittest.TestCase):
         self.assertIsNone(self.vectorizer.build_text_embedder("hashing-v1", -7))
 
     def test_real_local_provider_constructor_and_declared_capability_remain(self):
-        model = "sentence-transformers:BAAI/bge-m3"
+        model = "sentence-transformers:BAAI/bge-small-zh-v1.5"
         sentinel = object()
         with patch.object(self.vectorizer, "SentenceTransformerTextEmbedder", return_value=sentinel) as build:
-            self.assertIs(self.vectorizer.build_text_embedder(model, 1024), sentinel)
-        build.assert_called_once_with(model_name=model, dimension=1024)
+            self.assertIs(self.vectorizer.build_text_embedder(model, 512), sentinel)
+        build.assert_called_once_with(model_name=model, dimension=512)
         self.assertTrue(resolve_text_embedding_provider_spec(model).to_metadata()["capabilities"]["embedText"])
 
     def test_real_cloud_provider_constructor_arguments_remain(self):
@@ -120,9 +120,9 @@ class GeneratedMemorySettingsChecks(unittest.TestCase):
 
     def test_enabled_fresh_module_keeps_existing_local_model_defaults(self):
         result = self.settings({})
-        self.assertEqual(result[TEXT_MODEL], str(self.root / "runtime_data/models/BAAI__bge-m3"))
+        self.assertEqual(result[TEXT_MODEL], str(self.root / "runtime_data/models/BAAI__bge-small-zh-v1.5"))
         self.assertEqual(result[IMAGE_MODEL], str(self.root / "runtime_data/models/openai__clip-vit-base-patch32"))
-        self.assertEqual(result[TEXT_DIM], "1024")
+        self.assertEqual(result[TEXT_DIM], "512")
         self.assertEqual(result[IMAGE_DIM], "512")
 
     def test_real_cloud_models_are_not_replaced_by_local_defaults(self):

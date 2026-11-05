@@ -3,7 +3,7 @@
 # 使用场景：
 # 1. 当前主线默认走百炼在线多模态向量，不依赖本文件。
 # 2. 当部署环境需要改回本地模型时，
-#    文本目录默认可使用 runtime_data/models/BAAI__bge-m3，
+#    文本目录默认可使用 runtime_data/models/BAAI__bge-small-zh-v1.5，
 #    图像目录默认可使用 runtime_data/models/openai__clip-vit-base-patch32。
 #
 # 注意：

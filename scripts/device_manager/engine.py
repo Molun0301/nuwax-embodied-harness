@@ -889,7 +889,7 @@ class Engine:
         if "perception" in plan["modules"]:
             model_settings.append(("NUWAX_PERCEPTION_YOLO_WORLD_MODEL", "yolov8s-worldv2.pt"))
         if "memory" in plan["modules"]:
-            model_settings.extend((("NUWAX_MEMORY_TEXT_EMBEDDING_MODEL", "BAAI__bge-m3"), ("NUWAX_MEMORY_IMAGE_EMBEDDING_MODEL", "openai__clip-vit-base-patch32")))
+            model_settings.extend((("NUWAX_MEMORY_TEXT_EMBEDDING_MODEL", "BAAI__bge-small-zh-v1.5"), ("NUWAX_MEMORY_IMAGE_EMBEDDING_MODEL", "openai__clip-vit-base-patch32")))
         from .downloads import apply_model_overrides, uses_default_model
         model_overrides = {}
         for key, name in model_settings:

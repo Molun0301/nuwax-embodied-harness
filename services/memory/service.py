@@ -243,9 +243,9 @@ class MemoryService(SceneMappingMemoryMixin):
         self._configured_text_model = (
             text_embedding_model
             or embedding_model
-            or "sentence-transformers:BAAI/bge-m3"
+            or "sentence-transformers:BAAI/bge-small-zh-v1.5"
         )
-        self._configured_text_dimension = int(text_embedding_dimension or embedding_dimension or 1024)
+        self._configured_text_dimension = int(text_embedding_dimension or embedding_dimension or 512)
         self._configured_image_model = str(image_embedding_model or "disabled").strip() or "disabled"
         self._configured_image_dimension = int(image_embedding_dimension or 512)
         self._text_embedder = text_embedder

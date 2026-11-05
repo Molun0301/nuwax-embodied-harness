@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Dict, Iterable, Sequence, Tuple
 
 
-DEFAULT_TEXT_MODEL_ID = "BAAI/bge-m3"
+DEFAULT_TEXT_MODEL_ID = "BAAI/bge-small-zh-v1.5"
 DEFAULT_IMAGE_MODEL_ID = "openai/clip-vit-base-patch32"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "runtime_data" / "models"
@@ -29,7 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--text-model-id",
         default=DEFAULT_TEXT_MODEL_ID,
-        help="文本向量模型仓库 ID，默认使用 BAAI/bge-m3。",
+        help="文本向量模型仓库 ID，默认使用 BAAI/bge-small-zh-v1.5。",
     )
     parser.add_argument(
         "--image-model-id",

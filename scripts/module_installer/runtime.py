@@ -107,7 +107,7 @@ def _memory_settings(
 
     result: dict[str, str] = {}
     defaults = (
-        ("TEXT", "BAAI__bge-m3", "1024"),
+        ("TEXT", "BAAI__bge-small-zh-v1.5", "512"),
         ("IMAGE", "openai__clip-vit-base-patch32", "512"),
     )
     for kind, directory, dimension in defaults:

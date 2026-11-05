@@ -59,7 +59,7 @@ def _default_model_dir(repo_id: str) -> str:
     return str(BASE_DIR / "runtime_data" / "models" / repo_id.replace("/", "__"))
 
 
-DEFAULT_MEMORY_TEXT_EMBEDDING_MODEL = _default_model_dir("BAAI/bge-m3")
+DEFAULT_MEMORY_TEXT_EMBEDDING_MODEL = _default_model_dir("BAAI/bge-small-zh-v1.5")
 DEFAULT_MEMORY_IMAGE_EMBEDDING_MODEL = _default_model_dir("openai/clip-vit-base-patch32")
 DEFAULT_MEMORY_ONLINE_EMBEDDING_MODEL = "tongyi-embedding-vision-flash-2026-03-06"
 DEFAULT_MEMORY_EMBEDDING_BASE_URL = "https://dashscope.aliyuncs.com/api/v1"

@@ -319,7 +319,7 @@ class ModelPreparationChecks(unittest.TestCase):
         prefix = self.base / "candidate"
         prefix.mkdir()
         request = manager.InstallRequest(root=root, home=self.base, modules=("core", "memory"), robot="customrobot", jobs=1)
-        text = self.base / "custom text" if custom else root / "runtime_data/models/BAAI__bge-m3"
+        text = self.base / "custom text" if custom else root / "runtime_data/models/BAAI__bge-small-zh-v1.5"
         image = self.base / "custom image" if custom else root / "runtime_data/models/openai__clip-vit-base-patch32"
         (prefix / "settings.env").write_text("NUWAX_MEMORY_TEXT_EMBEDDING_MODEL=" + str(text) + "\nNUWAX_MEMORY_IMAGE_EMBEDDING_MODEL=" + str(image) + "\n")
         return request, prefix, text, image

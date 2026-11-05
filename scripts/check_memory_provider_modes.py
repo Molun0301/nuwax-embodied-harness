@@ -265,7 +265,8 @@ class ProviderModeChecks(unittest.TestCase):
             service = MemoryService(localization_service=None, mapping_service=None, observation_service=None,
                 perception_service=None, state_store=SimpleNamespace(write=lambda *a, **kw: None))
             self.addCleanup(service.close)
-        self.assertEqual(service._configured_text_model, 'sentence-transformers:BAAI/bge-m3')
+        self.assertEqual(service._configured_text_model, 'sentence-transformers:BAAI/bge-small-zh-v1.5')
+        self.assertEqual(service._configured_text_dimension, 512)
         self.assertEqual(service._configured_image_model, 'disabled')
         self.assertFalse(service._text_embedder_ready)
 

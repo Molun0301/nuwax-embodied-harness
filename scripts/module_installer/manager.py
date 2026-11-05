@@ -441,7 +441,7 @@ def _prepare_models(request: InstallRequest, prefix: Path, run) -> None:
              "_download(_MODELS['ViT-B/32'], os.path.expanduser('~/.cache/clip'))"])
     if "memory" in request.modules:
         arguments = []
-        for kind, directory in (("text", "BAAI__bge-m3"), ("image", "openai__clip-vit-base-patch32")):
+        for kind, directory in (("text", "BAAI__bge-small-zh-v1.5"), ("image", "openai__clip-vit-base-patch32")):
             configured = Path(values[f"NUWAX_MEMORY_{kind.upper()}_EMBEDDING_MODEL"])
             target = configured if configured.is_absolute() else request.root / configured
             if target.resolve() != (output / directory).resolve():

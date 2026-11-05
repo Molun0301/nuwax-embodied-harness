@@ -10797,35 +10797,6 @@ class GatewayRuntime:
             return self.navigation_service.get_latest_exploration_context()
         return self.navigation_service.stop_exploration(request_id=request_id)
 
-    def _handle_exploration_generation_rollover(
-        self,
-        context,
-        *,
-        request_id: str,
-        poll_interval_sec: float,
-        expected: MetadataDict,
-        current: MetadataDict,
-        rollovers: MetadataDict,
-    ) -> None:
-        details = {
-            "request_id": request_id,
-            "generation_snapshot": dict(expected),
-            "current_generations": dict(current),
-            "generation_rollovers": dict(rollovers),
-        }
-        context.publish_event(
-            "task.generation_rollover_detected",
-            message="探索任务检测到运行时代际切换。",
-            payload=details,
-        )
-        terminal = self._stop_exploration(context, request_id=request_id)
-        details["terminal_status"] = terminal.exploration_state.status.value
-        raise GatewayError(
-            "探索运行时代际已切换，旧任务已结束。",
-            error_code="task_generation_rollover", http_status=503,
-            jsonrpc_code=-32010, details=details,
-        )
-
     def _prepare_exploration_mapping(
         self,
         context,
@@ -10892,6 +10863,7 @@ class GatewayRuntime:
             perception_attached = False
             finalized = False
             backend_cancelled = False
+            backend_terminal = False
             try:
                 context.update(
                     progress=0.02,
@@ -10941,24 +10913,13 @@ class GatewayRuntime:
                         request,
                         deadline_monotonic=parent_deadline,
                     )
-                    generation_snapshot = (
-                        self._capture_task_generation_snapshot(
-                            deadline_monotonic=parent_deadline,
-                        )
-                    )
-                    return last_context, generation_snapshot
+                    return last_context
 
                 exploration_start_attempted = True
-                last_context, generation_snapshot = (
-                    start_exploration()
-                )
+                last_context = start_exploration()
                 backend_started = True
                 self._attach_perception_to_exploration(context.task_id)
                 perception_attached = True
-                self._record_task_generation_snapshot(
-                    context,
-                    generation_snapshot,
-                )
                 exploration_metadata = dict(
                     getattr(last_context.exploration_state, "metadata", {}) or {}
                 )
@@ -10977,56 +10938,31 @@ class GatewayRuntime:
                 )
                 while True:
                     context.ensure_active()
-                    last_context = self.navigation_service.refresh_exploration(
-                        deadline_monotonic=parent_deadline,
-                    )
-                    current_generations = self._capture_task_generation_snapshot(
-                        deadline_monotonic=parent_deadline,
-                    )
-                    rollovers = self._task_generation_rollovers(
-                        generation_snapshot,
-                        current_generations,
-                    )
-                    if rollovers:
-                        self._handle_exploration_generation_rollover(
-                            context,
-                            request_id=request.request_id,
-                            poll_interval_sec=poll_interval_sec,
-                            expected=generation_snapshot,
-                            current=current_generations,
-                            rollovers=rollovers,
-                        )
-                    status = last_context.exploration_state.status
-                    exploration_metadata = dict(getattr(last_context.exploration_state, "metadata", {}) or {})
-                    if self._exploration_metadata_indicates_done(exploration_metadata):
+                    try:
                         last_context = self.navigation_service.refresh_exploration(
                             deadline_monotonic=parent_deadline,
                         )
-                        current_generations = self._capture_task_generation_snapshot(
-                            deadline_monotonic=parent_deadline,
-                        )
-                        rollovers = self._task_generation_rollovers(
-                            generation_snapshot,
-                            current_generations,
-                        )
-                        if rollovers:
-                            self._handle_exploration_generation_rollover(
-                                context,
-                                request_id=request.request_id,
-                                poll_interval_sec=poll_interval_sec,
-                                expected=generation_snapshot,
-                                current=current_generations,
-                                rollovers=rollovers,
-                            )
-                        status = last_context.exploration_state.status
                         exploration_metadata = dict(getattr(last_context.exploration_state, "metadata", {}) or {})
-                    progress = self._estimate_exploration_progress(last_context)
-                    stage = f"exploration_{status.value}"
-                    message = last_context.exploration_state.message or "探索执行中。"
-                    complete_terminal = self._is_complete_exploration_terminal(
+                        if self._exploration_metadata_indicates_done(exploration_metadata):
+                            last_context = self.navigation_service.refresh_exploration(
+                                deadline_monotonic=parent_deadline,
+                            )
+                            exploration_metadata = dict(getattr(last_context.exploration_state, "metadata", {}) or {})
+                    except GeometryRuntimeRpcError as exc:
+                        RUNTIME_LOGGER.warning(
+                            "探索状态轮询调用失败，等待下一轮 rpc=%s request_id=%s：%s",
+                            exc.rpc_name, request.request_id, exc,
+                        )
+                        time.sleep(poll_interval_sec)
+                        continue
+                    status = last_context.exploration_state.status
+                    backend_terminal = complete_terminal = self._is_complete_exploration_terminal(
                         last_context,
                         request_id=request.request_id,
                     )
+                    progress = self._estimate_exploration_progress(last_context)
+                    stage = f"exploration_{status.value}"
+                    message = last_context.exploration_state.message or "探索执行中。"
                     child_task_id = str(
                         exploration_metadata.get("child_task_id") or ""
                     ).strip()
@@ -11102,19 +11038,6 @@ class GatewayRuntime:
                             context.ensure_active()
                         sleep_sec = min(sleep_sec, remaining_sec)
                     time.sleep(sleep_sec)
-            except GeometryRuntimeRpcError as exc:
-                if not exploration_start_attempted or getattr(exc,"exploration_rpc_dispatched",True) is False:
-                    exploration_start_attempted=False
-                    if context.is_cancel_requested() or context.is_timed_out():
-
-                        context.ensure_active()
-                    raise GatewayError(
-                        "探索启动准备失败：%s" % exc,
-                        error_code="exploration_preparation_failed",
-                        http_status=503,
-                        details={**self._geometry_runtime_rpc_details(exc),"request_id":request.request_id,"backend_not_started":True},
-                    ) from exc
-                self._raise_exploration_rpc_failure(context, error=exc, request_id=request.request_id)
             except (TaskCancelledError, TaskTimeoutError):
                 if backend_started and not backend_cancelled:
                     self._stop_exploration(context, request_id=request.request_id)
@@ -11127,6 +11050,26 @@ class GatewayRuntime:
                         RUNTIME_LOGGER.exception("探索已停止，但检查点保存失败 request_id=%s", request.request_id)
                 elif context.is_cancel_requested() and self.task_manager.get_task_spec(context.task_id).metadata.get("pause_checkpoint_id"):
                     self.task_manager.update_task_metadata(context.task_id, {"exploration_checkpoint": {"status": "failed", "message": "探索尚未建立可保存的地图和进度"}})
+                raise
+            except Exception as exc:
+                if isinstance(exc, GeometryRuntimeRpcError) and not backend_started:
+                    if not exploration_start_attempted or getattr(exc,"exploration_rpc_dispatched",True) is False:
+                        exploration_start_attempted=False
+                        if context.is_cancel_requested() or context.is_timed_out():
+
+                            context.ensure_active()
+                        raise GatewayError(
+                            "探索启动准备失败：%s" % exc,
+                            error_code="exploration_preparation_failed",
+                            http_status=503,
+                            details={**self._geometry_runtime_rpc_details(exc),"request_id":request.request_id,"backend_not_started":True},
+                        ) from exc
+                    self._raise_exploration_rpc_failure(context, error=exc, request_id=request.request_id)
+                if backend_started and not backend_terminal:
+                    try:
+                        self._stop_exploration(context, request_id=request.request_id)
+                    finally:
+                        raise exc
                 raise
             finally:
                 interrupted = context.is_cancel_requested() or context.is_timed_out()

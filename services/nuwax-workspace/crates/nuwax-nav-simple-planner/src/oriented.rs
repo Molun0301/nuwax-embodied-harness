@@ -570,7 +570,7 @@ mod tests {
             let (command, stop) = if replan {
                 (Twist2::ZERO, None)
             } else {
-                local.step(0.3)
+                local.step()
             };
             if stop == Some(StopMessage::Arrived) {
                 assert!(

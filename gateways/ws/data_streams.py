@@ -5,7 +5,7 @@ import base64
 import collections
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
-from dataclasses import fields as dataclass_fields, is_dataclass
+from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
@@ -30,14 +30,17 @@ from pydantic_core import to_json as _model_json_bytes
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from contracts.streams import StreamFrame, StreamPayloadKind
-from contracts.runtime_views import MapSnapshot
 from contracts.occupancy_cells import PackedOccupancyCells
 from core.logging_utils import LogRateLimiter
 from core.stream_coalescing import stream_replacement_key
 from gateways.auth import GatewayAccessManager
-from gateways.errors import GatewayError
+from core.errors import GatewayError
 from gateways.feedback import build_public_runtime_event
-from gateways.runtime import GatewayRuntime
+from gateways.agent.feedback import TERMINAL_STATES
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from gateways.platform import Platform
 from gateways.ws.console_projection import console_payload, field_value, selected_fields
 from gateways.ws.instance_encoding import InstanceSnapshotEncoder
 from gateways.ws.pointcloud_encoding import CanonicalPointCloudEncoder
@@ -53,14 +56,6 @@ _STREAM_QUEUE_MAXSIZE = 200
 _DIAGNOSTIC_LOG_LIMITER = LogRateLimiter()
 _DIAGNOSTIC_LOG_INTERVAL_SEC = 5.0
 _STREAM_REPLAY_MAX_FRAMES = 200
-_STREAM_JSON_MAX_DEPTH = 12
-_STREAM_JSON_MAX_NODES = 2048
-_STREAM_JSON_MAX_ENTRIES = 4096
-_STREAM_JSON_MAX_CONTAINER_ITEMS = 256
-_STREAM_JSON_MAX_STRING_CHARS = 8192
-_STREAM_JSON_MAX_TOTAL_STRING_CHARS = 64 * 1024
-_STREAM_JSON_MAX_BYTES = 16 * 1024
-_STREAM_JSON_MAX_INTEGER_BITS = 256
 _STREAM_JSON_MAX_OCCUPANCY_CELLS = 2_000_000
 _POINTCLOUD_BINARY_MAGIC = b"NUWAXPC\x00"
 _POINTCLOUD_BINARY_VERSION = 1
@@ -101,99 +96,6 @@ _LATEST_ONLY_STREAM_TOPICS = frozenset(
 _REPLAY_SNAPSHOT_TOPICS = _LATEST_ONLY_STREAM_TOPICS | frozenset({
     "runtime.governance", "pointcloud_map.meta", "exploration.state", "system.metrics", "settings.display",
 })
-_TERMINAL_TASK_EVENT_TYPES = frozenset(
-    {
-        "task.succeeded",
-        "task.failed",
-        "task.cancelled",
-        "task.timeout",
-        }
-)
-
-
-class _JsonProjectionBudget:
-    def __init__(self) -> None:
-        self.nodes_remaining = _STREAM_JSON_MAX_NODES
-        self.entries_remaining = _STREAM_JSON_MAX_ENTRIES
-        self.text_chars_remaining = _STREAM_JSON_MAX_TOTAL_STRING_CHARS
-        self.bytes_remaining = _STREAM_JSON_MAX_BYTES
-
-    def take_node(self) -> bool:
-        if self.nodes_remaining <= 0:
-            return False
-        self.nodes_remaining -= 1
-        return True
-
-    def take_entry(self) -> bool:
-        if self.entries_remaining <= 0:
-            return False
-        self.entries_remaining -= 1
-        return True
-
-
-def _bounded_json_text(
-    value: str,
-    budget: _JsonProjectionBudget,
-    *,
-    max_chars: int = _STREAM_JSON_MAX_STRING_CHARS,
-) -> str:
-    available = min(max(0, int(max_chars)), budget.text_chars_remaining)
-    if available <= 0:
-        return ""
-    truncated = len(value) > available
-    content_limit = max(0, available - 1) if truncated else available
-    fragment = value[:content_limit].encode("utf-8", errors="replace").decode("utf-8")
-    result = f"{fragment}…" if truncated else fragment
-    budget.text_chars_remaining -= len(result)
-    return result
-
-
-def _safe_type_name(value: object, budget: _JsonProjectionBudget) -> str:
-    value_type = type(value)
-    module = getattr(value_type, "__module__", "")
-    name = getattr(value_type, "__qualname__", getattr(value_type, "__name__", "object"))
-    type_name = f"{module}.{name}" if module and module != "builtins" else str(name)
-    return _bounded_json_text(type_name, budget, max_chars=256)
-
-
-def _project_json_key(key: object, budget: _JsonProjectionBudget, index: int) -> str:
-    if isinstance(key, str):
-        raw_key = key
-    elif key is None:
-        raw_key = "null"
-    elif isinstance(key, bool):
-        raw_key = "true" if key else "false"
-    elif isinstance(key, int):
-        raw_key = str(key) if key.bit_length() <= _STREAM_JSON_MAX_INTEGER_BITS else f"<integer:{key.bit_length()}bits>"
-    elif isinstance(key, float):
-        if math.isnan(key):
-            raw_key = "NaN"
-        elif math.isinf(key):
-            raw_key = "Infinity" if key > 0 else "-Infinity"
-        else:
-            raw_key = str(key)
-    elif isinstance(key, Enum) and isinstance(key.value, (str, int, float, bool)):
-        raw_key = str(key.value)
-    else:
-        raw_key = f"<{type(key).__name__}:{index}>"
-    return _bounded_json_text(raw_key, budget, max_chars=256) or f"item_{index}"
-
-
-def _project_json_bytes(value: object, budget: _JsonProjectionBudget) -> Dict[str, object]:
-    size = len(value)  # type: ignore[arg-type]
-    included = min(size, budget.bytes_remaining)
-    budget.bytes_remaining -= included
-    chunk = bytes(value[:included])  # type: ignore[index]
-    encoded = base64.b64encode(chunk).decode("ascii")
-    return {
-        "$type": "bytes",
-        "encoding": "base64",
-        "data": _bounded_json_text(encoded, budget),
-        "size": size,
-        "truncated": included < size,
-    }
-
-
 def _stream_frame_values(frame: StreamFrame) -> Dict[str, object]:
     model_fields = getattr(type(frame), "model_fields", {})
     values = {
@@ -209,257 +111,26 @@ def _stream_frame_values(frame: StreamFrame) -> Dict[str, object]:
         if frame.topic == "tasks.state"
         else console_payload(frame.topic, frame.payload)
     )
-    if frame.topic == "map.frame" and type(values["payload"]) is MapSnapshot:
-        snapshot = values["payload"]
-        values["payload"] = selected_fields(snapshot, MapSnapshot.model_fields)
-        values["payload"]["update_sequence"] = _pointcloud_identity_integer(snapshot.update_sequence, "update_sequence")
     values["metadata"] = frame.metadata
     return values
 
 
-def _complete_map_occupancy_data(frame: StreamFrame, *, grid=None,
-                                max_cells: int = _STREAM_JSON_MAX_OCCUPANCY_CELLS) -> Optional[object]:
-    """共享已验证的规范栅格；原始字典输入仍在编码边界验证。"""
-
-    if frame.topic != "map.frame":
-        return None
-    occupancy_grid = grid if grid is not None else field_value(frame.payload, "occupancy_grid")
-    if occupancy_grid is None:
-        return None
-    from contracts.maps import OccupancyGrid
-    if isinstance(occupancy_grid, OccupancyGrid):
-        return occupancy_grid.data
-    width = (
-        occupancy_grid.get("width")
-        if isinstance(occupancy_grid, Mapping)
-        else getattr(occupancy_grid, "width", None)
-    )
-    height = (
-        occupancy_grid.get("height")
-        if isinstance(occupancy_grid, Mapping)
-        else getattr(occupancy_grid, "height", None)
-    )
-    data = (
-        occupancy_grid.get("data")
-        if isinstance(occupancy_grid, Mapping)
-        else getattr(occupancy_grid, "data", None)
-    )
-    if (
-        isinstance(width, bool)
-        or isinstance(height, bool)
-        or not isinstance(width, int)
-        or not isinstance(height, int)
-    ):
-        return None
-    cell_count = width * height
-    if (
-        cell_count <= 0
-        or cell_count > max_cells
-        or not isinstance(data, (list, tuple))
-        or len(data) != cell_count
-    ):
-        return None
-    if any(
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or value < -1
-        or value > 100
-        for value in data
-    ):
-        return None
-    return data
-
-
-def _project_json_value(
-    value: object,
-    budget: _JsonProjectionBudget,
-    active_ids: set[int],
-    *,
-    depth: int,
-) -> object:
-    if not budget.take_node():
-        return "<truncated:node_budget>"
-    if value is None or isinstance(value, bool):
-        return value
-    if isinstance(value, int):
-        if value.bit_length() <= _STREAM_JSON_MAX_INTEGER_BITS:
-            return value
-        return f"<integer:{value.bit_length()}bits>"
-    if isinstance(value, float):
-        if math.isnan(value):
-            return "NaN"
-        if math.isinf(value):
-            return "Infinity" if value > 0 else "-Infinity"
-        return value
-    if isinstance(value, str):
-        return _bounded_json_text(value, budget)
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        return _project_json_bytes(value, budget)
-    if isinstance(value, Enum):
-        enum_value = value.value
-        if isinstance(enum_value, (str, int, float, bool)) or enum_value is None:
-            return _project_json_value(enum_value, budget, active_ids, depth=depth + 1)
-        return _safe_type_name(value, budget)
-    if isinstance(value, Decimal):
-        if not value.is_finite():
-            return str(value)
-        return _bounded_json_text(str(value), budget)
-    if isinstance(value, (datetime, date)):
-        try:
-            return _bounded_json_text(value.isoformat(), budget, max_chars=160)
-        except Exception:
-            return _safe_type_name(value, budget)
-    if isinstance(value, (Path, UUID)):
-        return _bounded_json_text(str(value), budget)
-    if depth >= _STREAM_JSON_MAX_DEPTH:
-        return "<truncated:max_depth>"
-
-    value_id = id(value)
-    if value_id in active_ids:
-        return "<truncated:cycle>"
-    active_ids.add(value_id)
-    try:
-        if isinstance(value, StreamFrame):
-            frame_values = _stream_frame_values(value)
-            if value.topic == "map.frame":
-                payload = frame_values["payload"]
-                # 仅优化正式快照；子类和通用模型继续保留逐字段异常与预算保护。
-                if type(payload) is MapSnapshot:
-                    # 保留合同的防御读取，每个图层仅取一份，编码和完整性校验共用。
-                    frame_values["payload"] = selected_fields(payload, MapSnapshot.model_fields)
-                    frame_values["payload"]["update_sequence"] = _pointcloud_identity_integer(payload.update_sequence, "update_sequence")
-            projected_frame = _project_json_value(
-                frame_values,
-                budget,
-                active_ids,
-                depth=depth + 1,
-            )
-            # 平台日志已在写入时脱敏；不要再次把异常栈截成 8KB 的消息片段。
-            if value.topic == "logs.entry" and isinstance(value.payload, dict) and isinstance(projected_frame, dict):
-                projected_payload = projected_frame.get("payload")
-                if isinstance(projected_payload, dict):
-                    for key in ("message", "exception"):
-                        if isinstance(value.payload.get(key), str):
-                            projected_payload[key] = value.payload[key]
-            occupancy_data = _complete_map_occupancy_data(
-                value,
-                grid=field_value(frame_values["payload"], "occupancy_grid") if value.topic == "map.frame" else None,
-            )
-            if occupancy_data is not None and isinstance(projected_frame, dict):
-                projected_payload = projected_frame.get("payload")
-                if isinstance(projected_payload, dict):
-                    projected_grid = projected_payload.get("occupancy_grid")
-                    if isinstance(projected_grid, dict):
-                        projected_grid["data"] = occupancy_data.to_list() if type(occupancy_data) is PackedOccupancyCells else occupancy_data
-            return projected_frame
-
-        if isinstance(value, Mapping):
-            projected: Dict[str, object] = {}
-            try:
-                for index, (key, item) in enumerate(value.items()):
-                    if index >= _STREAM_JSON_MAX_CONTAINER_ITEMS:
-                        projected["$truncated"] = "item_limit"
-                        break
-                    if not budget.take_entry():
-                        projected["$truncated"] = "entry_budget"
-                        break
-                    projected_key = _project_json_key(key, budget, index)
-                    while projected_key in projected:
-                        projected_key = f"{projected_key}_{index}"
-                    projected[projected_key] = _project_json_value(
-                        item,
-                        budget,
-                        active_ids,
-                        depth=depth + 1,
-                    )
-            except Exception as exc:
-                projected["$projection_error"] = type(exc).__name__
-            return projected
-
-        if isinstance(value, (list, tuple, set, frozenset)):
-            projected_items = []
-            try:
-                for index, item in enumerate(value):
-                    if index >= _STREAM_JSON_MAX_CONTAINER_ITEMS:
-                        projected_items.append("<truncated:item_limit>")
-                        break
-                    if not budget.take_entry():
-                        projected_items.append("<truncated:entry_budget>")
-                        break
-                    projected_items.append(
-                        _project_json_value(
-                            item,
-                            budget,
-                            active_ids,
-                            depth=depth + 1,
-                        )
-                    )
-            except Exception as exc:
-                projected_items.append(f"<projection_error:{type(exc).__name__}>")
-            return projected_items
-
-        model_fields = getattr(type(value), "model_fields", None)
-        if isinstance(model_fields, Mapping):
-            field_values: Dict[str, object] = {}
-            for index, field_name in enumerate(model_fields):
-                if index >= _STREAM_JSON_MAX_CONTAINER_ITEMS or not budget.take_entry():
-                    field_values["$truncated"] = "field_budget"
-                    break
-                try:
-                    field_values[str(field_name)] = getattr(value, field_name)
-                except Exception as exc:
-                    field_values[str(field_name)] = f"<projection_error:{type(exc).__name__}>"
-            return _project_json_value(field_values, budget, active_ids, depth=depth + 1)
-
-        if is_dataclass(value) and not isinstance(value, type):
-            field_values = {}
-            for index, field in enumerate(dataclass_fields(value)):
-                if index >= _STREAM_JSON_MAX_CONTAINER_ITEMS or not budget.take_entry():
-                    field_values["$truncated"] = "field_budget"
-                    break
-                try:
-                    field_values[field.name] = getattr(value, field.name)
-                except Exception as exc:
-                    field_values[field.name] = f"<projection_error:{type(exc).__name__}>"
-            return _project_json_value(field_values, budget, active_ids, depth=depth + 1)
-
-        try:
-            attributes = vars(value)
-        except (TypeError, ValueError):
-            attributes = None
-        projected_object: Dict[str, object] = {"$type": _safe_type_name(value, budget)}
-        if isinstance(attributes, Mapping) and attributes:
-            projected_object["attributes"] = _project_json_value(
-                attributes,
-                budget,
-                active_ids,
-                depth=depth + 1,
-            )
-        return projected_object
-    finally:
-        active_ids.discard(value_id)
-
-
 def _strict_json_dumps(value: object, *, compact: bool = False) -> str:
-    projected = _project_json_value(
-        value,
-        _JsonProjectionBudget(),
-        set(),
-        depth=0,
-    )
-
-    return json.dumps(
-        projected,
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(",", ":") if compact else None,
-    )
+    """完整编码网页载荷，不建立独立结果投影。"""
+    return json.dumps(value, default=_stream_json_default, ensure_ascii=False,
+                      allow_nan=False, separators=(",", ":") if compact else None)
 
 
 def _stream_json_default(value):
     """规范实时载荷直接使用模型序列化，不逐字段重复做预算、反射与字符串编码。"""
     if isinstance(value, StreamFrame):
         return _stream_frame_values(value)
+    if is_dataclass(value):
+        return asdict(value)
+    if isinstance(value, PackedOccupancyCells):
+        return value.to_list()
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {"$type": "bytes", "encoding": "base64", "data": base64.b64encode(value).decode("ascii")}
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
     if isinstance(value, (datetime, date)):
@@ -472,12 +143,8 @@ def _stream_json_default(value):
 
 
 def _stream_json_dumps(value, *, ensure_ascii: bool = False) -> str:
-    try:
-        return json.dumps(value, default=_stream_json_default, ensure_ascii=ensure_ascii,
-                          allow_nan=False, separators=(",", ":"))
-    except (TypeError, ValueError):
-        # 非规范诊断对象仍可展示；正常消息不经过整棵对象树的防御投影。
-        return _strict_json_dumps(value, compact=True)
+    return json.dumps(value, default=_stream_json_default, ensure_ascii=ensure_ascii,
+                      allow_nan=False, separators=(",", ":"))
 
 
 async def _send_ws_json(websocket: WebSocket, payload: object) -> None:
@@ -500,7 +167,7 @@ def _normalize_after_cursor(after_cursor: int, latest_cursor: int) -> int:
 
 
 def _build_replay_batch(
-    runtime: GatewayRuntime,
+    runtime: Platform,
     *,
     after_cursor: int,
     topics: Optional[Iterable[str]],
@@ -509,7 +176,7 @@ def _build_replay_batch(
 ) -> Tuple[Dict[str, Any], Tuple[StreamFrame, ...]]:
     topic_filter = tuple(str(topic) for topic in topics) if topics is not None else None
     if snapshot is None:
-        snapshot = runtime.stream_bus.replay_snapshot(
+        snapshot = runtime.streams.stream_bus.replay_snapshot(
             after_cursor=after_cursor,
             topics=topic_filter,
         )
@@ -599,7 +266,9 @@ def _frame_event_type(frame: StreamFrame) -> str:
 
 def _frame_priority(frame: StreamFrame) -> int:
     event_type = _frame_event_type(frame)
-    if frame.topic == "tasks.state" and event_type in _TERMINAL_TASK_EVENT_TYPES:
+    payload = frame.payload
+    status = field_value(payload, "payload", payload)
+    if frame.topic == "tasks.state" and field_value(status, "state") in TERMINAL_STATES:
         return 100
     if frame.topic == "logs.entry":
         payload = frame.payload if isinstance(frame.payload, dict) else {}
@@ -672,14 +341,14 @@ class _ClientStreamQueue:
         priority = min(self._keys_by_priority)
         return next(iter(self._keys_by_priority[priority])), priority
 
-    def put(self, frame: StreamFrame, runtime: GatewayRuntime) -> None:
+    def put(self, frame: StreamFrame, runtime: Platform) -> None:
         with self._lock:
             if self._closed:
                 return
             self._put_locked(frame, runtime)
         self._wake_waiter()
 
-    def put_threadsafe(self, loop: asyncio.AbstractEventLoop, frame: StreamFrame, runtime: GatewayRuntime) -> None:
+    def put_threadsafe(self, loop: asyncio.AbstractEventLoop, frame: StreamFrame, runtime: Platform) -> None:
         """先在有界槽位中合并，再向事件循环合并发送一次唤醒。"""
         with self._lock:
             if self._closed:
@@ -717,7 +386,7 @@ class _ClientStreamQueue:
         if waiter is not None and not waiter.done():
             waiter.set_result(None)
 
-    def _put_locked(self, frame: StreamFrame, runtime: GatewayRuntime) -> None:
+    def _put_locked(self, frame: StreamFrame, runtime: Platform) -> None:
         priority = _frame_priority(frame)
         key = self._slot_key(frame)
         if key is None:
@@ -808,7 +477,7 @@ def _record_queue_drop(queue: _ClientStreamQueue, frame: StreamFrame) -> None:
     })
 
 
-def _take_queue_gap_notice(queue: _ClientStreamQueue, runtime: GatewayRuntime) -> Optional[Dict[str, Any]]:
+def _take_queue_gap_notice(queue: _ClientStreamQueue, runtime: Platform) -> Optional[Dict[str, Any]]:
     with queue._lock:
         state = getattr(queue, "_nuwax_drop_state", None)
         setattr(queue, "_nuwax_drop_state", None)
@@ -820,7 +489,7 @@ def _take_queue_gap_notice(queue: _ClientStreamQueue, runtime: GatewayRuntime) -
         "first_dropped_cursor": state.get("first_dropped_cursor"),
         "last_dropped_cursor": state.get("last_dropped_cursor"),
         "topics": sorted(state.get("topics") or ()),
-        "latest_cursor": runtime.stream_bus.latest_cursor(),
+        "latest_cursor": runtime.streams.stream_bus.latest_cursor(),
         "resync_required": True,
         "next_action": "重新获取任务快照；日志等增量数据从最新游标继续。",
     }
@@ -851,7 +520,7 @@ def _safe_enqueue(
     loop: asyncio.AbstractEventLoop,
     queue: _ClientStreamQueue,
     frame: StreamFrame,
-    runtime: GatewayRuntime,
+    runtime: Platform,
 ) -> None:
     _log_frame_delay(frame, stage="入队", threshold_ms=50)
 
@@ -964,78 +633,22 @@ def _encode_pointcloud_binary_frame(frame: StreamFrame) -> bytes:
 
 
 _MAP_BINARY_MAGIC = b"NUWAXMAP"
-_MAP_BINARY_VERSION = 3
-_MAP_BINARY_MAX_CELLS = 16 * 1024 * 1024
-_MAP_ENCODE_CACHE_BYTES = 32 * 1024 * 1024
-_MAP_ENCODE_CACHE = collections.OrderedDict()
-_MAP_ENCODE_LOCK = threading.Lock()
-_MAP_ENCODE_RETAINED_BYTES = 0
-
-
-def _pack_map_envelope(header: bytes, raw: bytes) -> bytes:
-    """相同只读载荷和完整帧头只拼接一次；强引用避免对象编号复用。"""
-    global _MAP_ENCODE_RETAINED_BYTES
-    key = (header, id(raw))
-    size = len(raw) * 2 + len(header) * 2 + 13
-    if size > _MAP_ENCODE_CACHE_BYTES:
-        return struct.pack("<8sBI", _MAP_BINARY_MAGIC, _MAP_BINARY_VERSION, len(header)) + header + raw
-    with _MAP_ENCODE_LOCK:
-        cached = _MAP_ENCODE_CACHE.get(key)
-        if cached is not None:
-            _MAP_ENCODE_CACHE.move_to_end(key)
-            return cached[1]
-        encoded = struct.pack("<8sBI", _MAP_BINARY_MAGIC, _MAP_BINARY_VERSION, len(header)) + header + raw
-        while _MAP_ENCODE_CACHE and (_MAP_ENCODE_RETAINED_BYTES + size > _MAP_ENCODE_CACHE_BYTES or len(_MAP_ENCODE_CACHE) >= 8):
-            _, (_, _, retired_size) = _MAP_ENCODE_CACHE.popitem(last=False)
-            _MAP_ENCODE_RETAINED_BYTES -= retired_size
-        _MAP_ENCODE_CACHE[key] = (raw, encoded, size)
-        _MAP_ENCODE_RETAINED_BYTES += size
-        return encoded
+_MAP_BINARY_VERSION = 4
 
 
 def _encode_map_binary_frame(frame: StreamFrame) -> bytes:
-    """版本3：明确来源代际与修订，不再要求或输出地图内容摘要。"""
-    import numpy as np
-
-    # 已发布快照按只读共享；帧头与栅格共享同一份输入。
-    occupancy_grid = field_value(frame.payload, "occupancy_grid")
-    data = _complete_map_occupancy_data(frame, grid=occupancy_grid, max_cells=_MAP_BINARY_MAX_CELLS)
-    if data is None:
-        raise ValueError("地图栅格尺寸、数量或取值无效")
-    if len(data) > _MAP_BINARY_MAX_CELLS:
-        raise ValueError("二进制地图超过16MiB栅格容量")
-    payload = selected_fields(frame.payload, (
-        "map_name", "source_name", "source_epoch", "update_sequence", "schema_version",
-        "frame_id", "timestamp", "metadata",
-    ))
-    grid = selected_fields(occupancy_grid, (
-        "map_id", "frame_id", "width", "height", "resolution_m", "origin", "timestamp",
-    ))
-    if not payload.get("map_name") or not grid.get("origin") or not grid.get("frame_id"):
-        raise ValueError("二进制地图缺少地图身份、坐标系或原点")
-    if not payload.get("source_name") or not payload.get("source_epoch"):
-        raise ValueError("二进制地图缺少来源代际")
-    if payload.get("schema_version") != 2:
-        raise ValueError("二进制地图只接受显式修订快照版本2")
-    if grid.get("map_id") != payload["map_name"] or grid.get("frame_id") != payload.get("frame_id"):
-        raise ValueError("二进制地图图层与来源作用域不一致")
-    payload["update_sequence"] = _pointcloud_identity_integer(payload.get("update_sequence"), "update_sequence")
-    if payload["update_sequence"] == "0":
-        raise ValueError("地图更新修订必须为正数")
-    # 栅格先于可变诊断，保持头部字段和显示坐标不被诊断耗尽预算。
-    metadata = payload.pop("metadata", {})
-    payload["occupancy_grid"] = grid
-    payload["metadata"] = metadata
+    """版本4直接编码新地图流：栅格元数据、有效栅格、物理栅格。"""
+    update = frame.payload
+    grid = asdict(update.grid)
+    effective = grid.pop("data")
+    payload = {"grid": grid, "raw_data_length": len(update.raw_data)}
     header_frame = frame.model_copy(update={"payload": payload})
     header = _stream_json_dumps({"type": "stream.frame", "frame": header_frame}).encode("utf-8")
-    if len(header) > 64 * 1024:
-        raise ValueError("二进制地图头超过64KiB")
-    if type(data) is PackedOccupancyCells:
-        return _pack_map_envelope(header, data.raw)
-    return struct.pack("<8sBI", _MAP_BINARY_MAGIC, _MAP_BINARY_VERSION, len(header)) + header + np.asarray(data, dtype=np.int8).tobytes()
+    return (struct.pack("<8sBI", _MAP_BINARY_MAGIC, _MAP_BINARY_VERSION, len(header))
+            + header + effective + update.raw_data)
 
 
-def _encode_ws_frame(frame: StreamFrame, *, map_binary_version=3) -> Union[str, bytes]:
+def _encode_ws_frame(frame: StreamFrame, *, map_binary_version=4) -> Union[str, bytes]:
     """回放与实时发送使用同一编码；大载荷的降级也留在编码线程内。"""
     if frame.payload_kind == StreamPayloadKind.BINARY and isinstance(frame.payload, (bytes, bytearray)):
         if frame.topic not in _POINTCLOUD_BINARY_TOPICS:
@@ -1048,11 +661,8 @@ def _encode_ws_frame(frame: StreamFrame, *, map_binary_version=3) -> Union[str, 
                 "cursor": _pointcloud_identity_integer(frame.cursor, "cursor"),
                 "reason": str(exc),
             }, compact=True)
-    if frame.topic == "map.frame" and frame.payload is not None and map_binary_version == 3:
-        try:
-            return _encode_map_binary_frame(frame)
-        except (TypeError, ValueError, AttributeError):
-            pass
+    if frame.topic == "map.frame" and frame.payload is not None and map_binary_version == 4:
+        return _encode_map_binary_frame(frame)
     if frame.topic in {"localization.pose", "localization.trajectory", "localization.frame_tree"}:
         # 规范定位对象由原生序列化器直接编码，避免每个轨迹点先转字典再走 Python JSON。
         # 外部诊断和非有限值继续走原有严格投影，不改变其错误显示语义。
@@ -1091,7 +701,7 @@ def _pointcloud_snapshot_frame(frame, snapshot):
 
 async def _send_ws_frame(websocket: WebSocket, frame: StreamFrame, *, pointcloud_encoder=None, map_binary_version=None, runtime=None, instance_encoder=None) -> None:
     if frame.topic == "pointcloud_map.snapshot" and frame.metadata.get("chunked"):
-        snapshot = runtime.get_pointcloud_map_snapshot() if runtime is not None else None
+        snapshot = runtime.streams.get_pointcloud_map_snapshot() if runtime is not None else None
         if snapshot is None:
             return
         frame = await _run_blocking(_pointcloud_snapshot_frame, frame, snapshot)
@@ -1114,7 +724,7 @@ async def _send_ws_frame(websocket: WebSocket, frame: StreamFrame, *, pointcloud
 
 async def _format_sse_frame(frame: StreamFrame, *, runtime=None) -> str:
     if runtime is not None and frame.topic == "pointcloud_map.snapshot" and frame.metadata.get("chunked"):
-        snapshot = runtime.get_pointcloud_map_snapshot()
+        snapshot = runtime.streams.get_pointcloud_map_snapshot()
         if snapshot is not None:
             frame = await _run_blocking(_pointcloud_snapshot_frame, frame, snapshot)
     if frame.topic == "map.frame" or frame.payload_kind == StreamPayloadKind.BINARY:
@@ -1122,26 +732,7 @@ async def _format_sse_frame(frame: StreamFrame, *, runtime=None) -> str:
     return _format_sse_payload(frame)
 
 
-def _map_identity_message(frame: Optional[StreamFrame], *, empty_cursor: int = 0,
-                          start_cursor: Optional[int] = None) -> Dict[str, object]:
-    """只投影既有地图身份，不读取栅格或为传输创建另一套来源代际。"""
-    cleared = frame is None or frame.status == "cleared" or frame.payload is None
-    identity = selected_fields(frame.payload, (
-        "map_name", "source_name", "source_epoch", "frame_id",
-    )) if frame is not None and not cleared else {}
-    if frame is not None and not cleared and not identity.get("frame_id"):
-        identity["frame_id"] = frame.frame_id
-    return {
-        "type": "stream.map_identity",
-        "cursor": _pointcloud_identity_integer(frame.cursor if frame is not None else empty_cursor, "cursor"),
-        "start_cursor": _pointcloud_identity_integer(
-            start_cursor if start_cursor is not None else (frame.cursor if frame is not None else empty_cursor), "start_cursor"),
-        **{name: identity.get(name) for name in ("map_name", "source_name", "source_epoch", "frame_id")},
-        "cleared": cleared,
-    }
-
-
-def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAccessManager) -> APIRouter:
+def build_data_stream_router(runtime: Platform, access_manager: GatewayAccessManager) -> APIRouter:
     """构造实时数据流路由。"""
 
     pointcloud_encoder = None
@@ -1179,7 +770,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
             loop = asyncio.get_running_loop()
             queue = _ClientStreamQueue(maxsize=_STREAM_QUEUE_MAXSIZE)
             emitted = 0
-            subscription_id, replay_snapshot = runtime.stream_bus.subscribe_with_replay(
+            subscription_id, replay_snapshot = runtime.streams.stream_bus.subscribe_with_replay(
                 lambda frame: _safe_enqueue(loop, queue, frame, runtime),
                 after_cursor=resume_after_cursor,
                 topics=topic_filter,
@@ -1228,10 +819,10 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                     except _ClientStreamClosed:
                         return
                     except asyncio.TimeoutError:
-                        yield _format_sse_keepalive(runtime.stream_bus.latest_cursor())
+                        yield _format_sse_keepalive(runtime.streams.stream_bus.latest_cursor())
             finally:
                 queue.close()
-                runtime.stream_bus.unsubscribe(subscription_id)
+                runtime.streams.stream_bus.unsubscribe(subscription_id)
 
         return StreamingResponse(frame_generator(), media_type="text/event-stream")
 
@@ -1241,7 +832,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         camera_id: Optional[str] = None,
         fps: Optional[float] = None,
     ):
-        source_status = runtime.perception_service.video_frame_source_status()
+        source_status = runtime.perception.video_frame_source_status()
         source_camera_id = str(source_status.get("camera_id") or "front_camera")
         if camera_id is not None and camera_id != source_camera_id:
             return JSONResponse(status_code=404, content={
@@ -1308,10 +899,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         try:
             topic_filter = _parse_topics(websocket.query_params.get("topics"))
             after_cursor = int(websocket.query_params.get("after_cursor", "0"))
-            map_identity_only = websocket.query_params.get("map_payload") == "identity"
-            map_binary_version = 3 if websocket.query_params.get("map_binary_version") == "3" else None
-            if map_identity_only and set(topic_filter or ()) != {"localization.pose", "map.frame"}:
-                raise ValueError("地图身份模式须仅订阅 localization.pose 与 map.frame。")
+            map_binary_version = 4 if websocket.query_params.get("map_binary_version") == "4" else None
         except Exception as exc:
             error = exc if isinstance(exc, GatewayError) else GatewayError(f"数据流订阅初始化失败: {exc}")
             await websocket.close(code=4403, reason=error.message)
@@ -1321,7 +909,6 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         loop = asyncio.get_running_loop()
         queue = _ClientStreamQueue(
             maxsize=_STREAM_QUEUE_MAXSIZE,
-            preserve_topics=("map.frame",) if map_identity_only else (),
         )
         subscription_id: Optional[str] = None
         receive_task = None
@@ -1329,16 +916,13 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         pointcloud_detached = websocket.query_params.get("pointcloud_transport") == "pages"
 
         try:
-            subscription_id, replay_snapshot = runtime.stream_bus.subscribe_with_replay(
+            subscription_id, replay_snapshot = runtime.streams.stream_bus.subscribe_with_replay(
                 lambda frame: _safe_enqueue(loop, queue, frame, runtime),
                 # 身份通道只有可替代状态，每次连接从同一原子边界重建地图与位姿。
-                after_cursor=0 if map_identity_only else after_cursor,
+                after_cursor=after_cursor,
                 topics=topic_filter,
                 async_dispatch=True,
-                latest_only_topics=(
-                    _LATEST_ONLY_STREAM_TOPICS - {"map.frame"}
-                    if map_identity_only else _LATEST_ONLY_STREAM_TOPICS
-                ),
+                latest_only_topics=_LATEST_ONLY_STREAM_TOPICS,
                 on_gap=lambda notice: queue.note_gap_threadsafe(loop, notice),
             )
             replay_status, replay_frames = _build_replay_batch(
@@ -1348,16 +932,6 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                 snapshot=replay_snapshot,
             )
             replay_latest_cursor = replay_status["latest_cursor"]
-            if map_identity_only:
-                map_frame = next((frame for frame in replay_frames if frame.topic == "map.frame"), None)
-                barrier_cursor = int(replay_snapshot.map_identity_start_cursor or map_frame.cursor or 0) if map_frame is not None else replay_latest_cursor
-                # 新地图之后不能重放可能属于旧图的缓存位姿，也不再重放旧地图屏障。
-                replay_frames = tuple(
-                    frame for frame in replay_frames
-                    if frame.topic == "localization.pose" and int(frame.cursor or 0) > barrier_cursor
-                )
-                replay_status["frame_count"] = len(replay_frames)
-                await _send_ws_json(websocket, _map_identity_message(map_frame, empty_cursor=barrier_cursor, start_cursor=barrier_cursor))
             for frame in replay_frames:
                 if pointcloud_detached and frame.topic == "pointcloud_map.snapshot":
                     continue
@@ -1416,10 +990,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                         )
                     if pointcloud_detached and frame.topic == "pointcloud_map.snapshot":
                         continue
-                    if map_identity_only and frame.topic == "map.frame":
-                        await _send_ws_json(websocket, _map_identity_message(frame))
-                    else:
-                        await _send_ws_frame(websocket, frame, pointcloud_encoder=pointcloud_encoder, map_binary_version=map_binary_version, runtime=runtime, instance_encoder=instance_encoder)
+                    await _send_ws_frame(websocket, frame, pointcloud_encoder=pointcloud_encoder, map_binary_version=map_binary_version, runtime=runtime, instance_encoder=instance_encoder)
                 except _ClientStreamGap:
                     gap_notice = _take_queue_gap_notice(queue, runtime)
                     if gap_notice is not None:
@@ -1432,7 +1003,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
                         {
                             "type": "keepalive",
                             "cursor": _pointcloud_identity_integer(
-                                runtime.stream_bus.latest_cursor(),
+                                runtime.streams.stream_bus.latest_cursor(),
                                 "cursor",
                             ),
                         },
@@ -1442,7 +1013,7 @@ def build_data_stream_router(runtime: GatewayRuntime, access_manager: GatewayAcc
         finally:
             queue.close()
             if subscription_id is not None:
-                runtime.stream_bus.unsubscribe(subscription_id)
+                runtime.streams.stream_bus.unsubscribe(subscription_id)
             pending_tasks = [task for task in (receive_task, frame_task) if task is not None]
             for task in pending_tasks:
                 task.cancel()
@@ -1627,16 +1198,7 @@ def _format_sse(event_name: str, payload: object, *, cursor: Optional[object] = 
             "id: %s" % _pointcloud_identity_integer(cursor, "cursor")
         )
     lines.append(f"event: {event_name}")
-    # 实例主题沿用 WS 的公开视图编码；源端 limit 只限制行数，不限制总字节。
-    if isinstance(payload, StreamFrame) and payload.topic == "memory.instances":
-        try:
-            # JSON 转义保证 SSE 文本可编码为 UTF-8，不预扫描或截断公开名称。
-            encoded = _stream_json_dumps(payload, ensure_ascii=True)
-        except Exception:
-            # 沿用旧 SSE 的诊断投影，避免异常对象中断已经开始的响应。
-            encoded = _strict_json_dumps(payload)
-    else:
-        encoded = _strict_json_dumps(payload)
+    encoded = _strict_json_dumps(payload)
     lines.append(f"data: {encoded}")
     lines.append("")
     return "\n".join(lines) + "\n"

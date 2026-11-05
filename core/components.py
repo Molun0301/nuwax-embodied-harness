@@ -25,9 +25,12 @@ def ensure(names: Sequence[str], timeout_sec: float) -> None:
         result = {"component": ",".join(names), "error": str(error), "ok": False}
     if not result["ok"]:
         raise GatewayError("组件不可用：%s：%s" % (result["component"], result["error"]),
-            error_code="component_unavailable", http_status=503, jsonrpc_code=-32010,
-            details={"component": result["component"], "error": result["error"]})
+            error_code="component_unavailable", http_status=503,
+            details={"component": result["component"], "reason": result["error"]})
 
 
 def status() -> dict:
-    return request({"op": "status"}, 2)
+    try:
+        return request({"op": "status"}, 2)["components"]
+    except OSError:
+        return {}

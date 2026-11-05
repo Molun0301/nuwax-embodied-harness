@@ -37,6 +37,20 @@ class RobotStateService:
         self._last_web_state_signature: Optional[str] = None
         self._web_state_source_epoch = uuid4().hex
         self._web_state_revision = 0
+        self._subscription = None
+
+    def start(self) -> None:
+        """在驱动启动后订阅遥测，采样状态仍由本服务拥有。"""
+        from providers import StreamingStateProvider
+        provider = self._robot.providers
+        if isinstance(provider, StreamingStateProvider):
+            self._subscription = provider.subscribe_robot_state(
+                lambda state: self.ingest_robot_state(state, source_name=provider.provider_name))
+
+    def stop(self) -> None:
+        if self._subscription is not None:
+            self._robot.providers.unsubscribe_robot_state(self._subscription)
+            self._subscription = None
 
     def refresh(self) -> RobotStatusSnapshot:
         """采样并写入最新机器人状态。"""

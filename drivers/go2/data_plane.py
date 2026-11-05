@@ -988,7 +988,7 @@ class Go2DirectDdsBridge:
             from drivers.go2.sensor_process import Go2SensorProcess
             worker = Go2SensorProcess(self.config,
                 calibration_profile=self._calibration_profile,
-                forward_samples=False,
+                forward_samples=True,
                 on_sample=lambda sample: self._publish_sensor_sample(sample, generation),
                 on_snapshot=lambda snapshot: self._install_process_snapshot(snapshot, generation),
                 on_error=lambda message, stamp: self._fail_sensor_process(message, stamp, generation))

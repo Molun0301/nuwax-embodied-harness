@@ -13,7 +13,7 @@ from gateways.serialization import to_jsonable
 from gateways.http.robot_model import build_robot_model_router
 
 if TYPE_CHECKING:
-    from gateways.runtime import GatewayRuntime
+    from gateways.platform import Platform
 
 _CONSOLE_HTML = Path(__file__).resolve().parent / "static" / "console.html"
 
@@ -30,7 +30,7 @@ def render_console_page(pointcloud3d_config: Any = None, geometry_pipeline: str 
             .replace('"__POINTCLOUD3D_CONFIG__"', encoded))
 
 
-def build_console_router(runtime: GatewayRuntime) -> APIRouter:
+def build_console_router(runtime: Platform) -> APIRouter:
     router = APIRouter()
     router.include_router(build_robot_model_router(runtime))
 

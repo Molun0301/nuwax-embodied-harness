@@ -180,7 +180,7 @@ def install_pointcloud_stream(router, runtime):
         await websocket.accept()
         await websocket.send_json({'type': 'pointcloud.ready', 'version': 2})
         wake = _LatestWake(asyncio.get_running_loop())
-        subscription = runtime.stream_bus.subscribe(wake.notify, topics=('pointcloud_map.snapshot',))
+        subscription = runtime.streams.stream_bus.subscribe(wake.notify, topics=('pointcloud_map.snapshot',))
         receive = asyncio.create_task(websocket.receive())
         wake_task = None
         base = None
@@ -221,7 +221,7 @@ def install_pointcloud_stream(router, runtime):
                         return
                     receive = asyncio.create_task(websocket.receive())
                 if initialized and ready and transfer is None:
-                    snapshot = runtime.get_pointcloud_map_snapshot()
+                    snapshot = runtime.streams.get_pointcloud_map_snapshot()
                     ready = False
                     source_map = '' if snapshot is None else str(snapshot.provenance.get('mapping_source_epoch') or '')
                     assigned = snapshot is not None and snapshot.provenance.get('assigned_source') is not None
@@ -231,11 +231,11 @@ def install_pointcloud_stream(router, runtime):
                         serial += 1
                         transfer = PointCloudTransfer(snapshot, base, serial)
                 if transfer is not None and not transfer.complete:
-                    if transfer.assigned_source is not None and runtime.get_pointcloud_map_snapshot() is not transfer.snapshot:
+                    if transfer.assigned_source is not None and runtime.streams.get_pointcloud_map_snapshot() is not transfer.snapshot:
                         transfer, ready = None, True
                         continue
                     packet = transfer.next_packet()
-                    if transfer.assigned_source is not None and runtime.get_pointcloud_map_snapshot() is not transfer.snapshot:
+                    if transfer.assigned_source is not None and runtime.streams.get_pointcloud_map_snapshot() is not transfer.snapshot:
                         transfer, ready = None, True
                         continue
                     await websocket.send_bytes(packet)
@@ -255,7 +255,7 @@ def install_pointcloud_stream(router, runtime):
             return
         finally:
             wake.close()
-            runtime.stream_bus.unsubscribe(subscription)
+            runtime.streams.stream_bus.unsubscribe(subscription)
             transfer = None
             pending = [task for task in (receive, wake_task) if task is not None]
             for task in pending:

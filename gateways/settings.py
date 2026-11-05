@@ -247,22 +247,22 @@ class SettingsApplication:
                 raise
         if groups.get("display") and set(groups["display"]) <= set(applied):
             payload = asdict(self.runtime.config.gateway.pointcloud3d)
-            self.runtime.stream_bus.publish("settings.display", source="gateway", payload=payload)
+            self.runtime.streams.stream_bus.publish("settings.display", source="gateway", payload=payload)
         return sorted(applied)
 
     def _apply_group(self, group, keys, candidate, values):
         if group == "telemetry":
-            self.runtime.apply_telemetry_settings(candidate.gateway)
+            self.runtime.streams.apply_telemetry_settings(candidate.gateway)
         elif group == "artifacts":
             from contracts.artifacts import ArtifactRetentionPolicy
             data = candidate.runtime_data
-            self.runtime.artifact_service.update_retention_policy(ArtifactRetentionPolicy(
+            self.runtime.artifacts.update_retention_policy(ArtifactRetentionPolicy(
                 retention_days=data.artifact_retention_days, max_count=data.artifact_max_count,
                 max_total_bytes=data.artifact_max_total_bytes, cleanup_batch_size=data.artifact_cleanup_batch_size))
         elif group == "stream":
-            self.runtime.perception_video_runtime.apply_tuning(candidate.perception.stream_runtime)
+            self.runtime.perception.video_runtime.apply_tuning(candidate.perception.stream_runtime)
         elif group == "detector":
-            self.runtime.perception_service.update_detector_thresholds(candidate.perception.yolo_world)
+            self.runtime.perception.update_detector_thresholds(candidate.perception.yolo_world)
         elif group == "logging":
             from core.logging_utils import JsonLineFormatter, build_default_formatter
             from core.settings import _SUBSYSTEM_LOGGERS

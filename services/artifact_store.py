@@ -647,7 +647,7 @@ class LocalArtifactStore:
             if ref.artifact_id in reference_index:
                 raise GatewayError(
                     f"制品 {ref.artifact_id} 仍被引用，拒绝删除。", error_code="artifact_in_use",
-                    http_status=409, jsonrpc_code=-32009,
+                    http_status=409,
                     details={"artifact_id": ref.artifact_id, "references": reference_index[ref.artifact_id]},
                 )
         registered_permit = None

@@ -20,7 +20,7 @@ from core.source_time import acquired_times, SourceTimeError
 from gateways.serialization import to_jsonable
 
 if TYPE_CHECKING:
-    from gateways.runtime import GatewayRuntime
+    from gateways.platform import Platform
 
 _BASE_DIR = Path(__file__).resolve().parents[2]
 _MAX_AGE_SEC = 0.5
@@ -127,14 +127,18 @@ class RobotModelView:
         if asset is None:
             return {"available": False, "asset_id": None, "mode": "unavailable", **problem,
                     "link_transforms": {}, "valid_for_sec": 0.0}
-        snapshot = self.runtime.robot_state_service.get_latest_snapshot()
+        snapshot = self.runtime.robot_state.get_latest_snapshot()
         state = getattr(snapshot, "robot_state", None)
         metadata = getattr(state, "metadata", {}) or {}
         # 设备聚合时钟不能续命底层关节；驱动提供独立采样时间时必须优先使用。
         source_stamp = _timestamp(metadata.get("joint_source_timestamp", getattr(state, "timestamp", None)))
-        localization = self.runtime.localization_service.get_latest_snapshot()
-        pose = getattr(localization, "current_pose", None)
-        pose_stamp = _timestamp(getattr(pose, "timestamp", None))
+        pose = self.runtime.geometry_state.pose()
+        pose_stamp = (datetime.fromtimestamp(pose.timestamp_ns / 1_000_000_000, timezone.utc)
+                      if pose is not None else None)
+        pose_payload = ({"position": {"x": pose.x, "y": pose.y, "z": pose.z},
+                         "orientation": {"x": pose.qx, "y": pose.qy, "z": pose.qz, "w": pose.qw},
+                         "frame_id": pose.frame_id, "timestamp": pose_stamp.isoformat()}
+                        if pose is not None else None)
         joint_clock_error = pose_clock_error = None
         try:
             joint_acquired = _acquired(source_stamp, metadata)
@@ -160,7 +164,7 @@ class RobotModelView:
             "joint_source_sequence": metadata.get("joint_source_sequence"),
             "joint_acquired_unix_ns": joint_acquired[0],
             "joint_age_sec": age, "max_age_sec": _MAX_AGE_SEC, "valid_for_sec": 0.0,
-            "pose": to_jsonable(pose), "pose_source": getattr(localization, "source_name", None),
+            "pose": pose_payload, "pose_source": "geometry",
             "pose_timestamp": pose_stamp.isoformat() if pose_stamp else None,
             "pose_frame_id": getattr(pose, "frame_id", None), "pose_age_sec": pose_age,
             "pose_acquired_unix_ns": pose_acquired[0], "pose_joint_source_skew_sec": source_skew,
@@ -215,7 +219,7 @@ class RobotModelView:
         return response
 
 
-def build_robot_model_router(runtime: GatewayRuntime) -> APIRouter:
+def build_robot_model_router(runtime: Platform) -> APIRouter:
     router = APIRouter()
     view = RobotModelView(runtime)
 

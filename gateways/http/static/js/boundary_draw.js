@@ -51,9 +51,6 @@
     mapName: null,
     observedMapName: null,
     mapNameInitialized: false,
-    generation: 0,
-    signature: null,
-    updatedAt: null,
     requestSerial: 0,
     previousDrawTick: null,
     resizeObserver: null,
@@ -151,56 +148,12 @@
     };
   }
 
-  function unwrapEnvelope(raw) {
-    let current = raw;
-    for (let index = 0; index < 3; index += 1) {
-      if (!current || typeof current !== 'object') break;
-      if (current.maps || current.zones || current.map_name) break;
-      const next = current.data || current.result || current.payload;
-      if (!next || next === current) break;
-      current = next;
-    }
-    return current && typeof current === 'object' ? current : {};
-  }
-
-  function entryFromEnvelope(raw, preferredMapName) {
-    const root = unwrapEnvelope(raw);
-    let entry = root;
-    let mapName = String(root.map_name || '').trim() || null;
-    if (root.maps && typeof root.maps === 'object') {
-      const keys = Object.keys(root.maps);
-      const preferred = String(preferredMapName || '').trim();
-      const selectedKey = preferred
-        ? Object.prototype.hasOwnProperty.call(root.maps, preferred)
-          ? preferred
-          : keys.find((key) => String(root.maps[key] && root.maps[key].map_name || '').trim() === preferred) || null
-        : keys.length === 1 ? keys[0] : null;
-      if (!selectedKey) return null;
-      entry = root.maps[selectedKey] || {};
-      mapName = String(entry.map_name || selectedKey).trim() || null;
-    }
-    if (!entry || !Array.isArray(entry.zones)) return null;
-    return {
-      mapName,
-      generation: Math.max(0, Number(entry.generation) || 0),
-      signature: String(entry.signature || '').trim() || null,
-      updatedAt: entry.updated_at || null,
-      zones: entry.zones.map(normalizeZone).filter(Boolean),
-    };
+  function entryFromEnvelope(raw) {
+    return {mapName: raw.map_name, zones: raw.zones.map(normalizeZone).filter(Boolean)};
   }
 
   function currentEnvelope() {
-    const maps = {};
-    if (state.mapName) {
-      maps[state.mapName] = {
-        map_name: state.mapName,
-        generation: state.generation,
-        signature: state.signature || '',
-        updated_at: state.updatedAt,
-        zones: state.zones.map(canonicalZone),
-      };
-    }
-    return { schema_version: 1, maps };
+    return {map_name: state.mapName, zones: state.zones.map(canonicalZone)};
   }
 
   function firstNonBlank() {
@@ -263,7 +216,7 @@
       setStatus('请先选择地图，再查看或编辑禁行区。', 'warning');
       return;
     }
-    setStatus(state.mapName + ' · ' + state.zones.length + ' 个 · G' + state.generation, 'ready');
+    setStatus(state.mapName + ' · ' + state.zones.length + ' 个', 'ready');
   }
 
   function setBusy(busy, message) {
@@ -285,9 +238,6 @@
   function applyEntry(entry) {
     if (!entry) return false;
     state.mapName = entry.mapName || state.mapName;
-    state.generation = entry.generation;
-    state.signature = entry.signature;
-    state.updatedAt = entry.updatedAt;
     state.zones = entry.zones.slice();
     renderList();
     redrawOverlay();
@@ -326,9 +276,6 @@
     const requestedMapName = String(mapName || '').trim() || null;
     if (!requestedMapName) {
       state.mapName = null;
-      state.generation = 0;
-      state.signature = null;
-      state.updatedAt = null;
       state.zones = [];
       clearDraft();
       setBusy(false);
@@ -340,9 +287,6 @@
     const preservingCurrentSnapshot = requestedMapName === state.mapName;
     state.mapName = requestedMapName;
     if (!preservingCurrentSnapshot) {
-      state.generation = 0;
-      state.signature = null;
-      state.updatedAt = null;
       state.zones = [];
     }
     clearDraft();
@@ -360,7 +304,7 @@
         throw new Error('服务端返回了错误的 map_name');
       }
       applyEntry(entry);
-      setStatus(entry.mapName + ' · ' + entry.zones.length + ' 个 · G' + entry.generation, 'ready');
+      setStatus(entry.mapName + ' · ' + entry.zones.length + ' 个', 'ready');
     } catch (error) {
       if (serial !== state.requestSerial) return;
       const suffix = preservingCurrentSnapshot
@@ -386,7 +330,6 @@
         headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
         body: JSON.stringify({
           map_name: mapName,
-          expected_generation: state.generation,
           zones: nextZones.map(canonicalZone),
         }),
       });
@@ -394,10 +337,6 @@
       const entry = entryFromEnvelope(raw, mapName);
       if (!entry || entry.mapName !== mapName) {
         throw new Error('服务端保存响应缺少当前地图的禁行区条目');
-      }
-      if (entry.generation < state.generation) {
-        setStatus('保存完成；已保留更新的服务端禁行区快照', 'ready');
-        return true;
       }
       applyEntry(entry);
       setStatus(successMessage || '已保存', 'ready');
@@ -1045,7 +984,6 @@
     const entry = entryFromEnvelope(event.detail, preferred);
     if (!entry) return;
     if (preferred && entry.mapName && entry.mapName !== preferred) return;
-    if (entry.mapName === state.mapName && entry.generation <= state.generation) return;
     applyEntry(entry);
   }
 

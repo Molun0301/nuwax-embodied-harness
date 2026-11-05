@@ -9,7 +9,7 @@ import math
 import sys
 import threading
 import time
-from typing import Any, Callable, List, Optional, Protocol, Union
+from typing import Any, Callable, List, Optional, Protocol
 
 from contracts.motion_feedback import MotionExecutionFeedback
 from services.navigation.proto_gen import motion_guard_pb2 as pb
@@ -28,13 +28,21 @@ class ActuatorBackend(Protocol):
     @property
     def is_configured(self) -> bool: ...
 
-    def apply_motion(self, request: Union[pb.SubmitMotionCommandRequest, pb.ApplyRobotSettingRequest]) -> bool: ...
+    def velocity(self, vx: float, vy: float, wz: float) -> bool: ...
+
+    def body_pose(self, roll: float, pitch: float, yaw: float) -> None: ...
+
+    def setting(self, request: pb.SettingRequest) -> None: ...
+
+    def get_motion_command_limits(self): ...
+
+    def get_motion_execution_feedback(self): ...
 
     def execute_sport(self, command: pb.SportActionCommand) -> None: ...
 
     def zero(self) -> None: ...
 
-    def switch_mode(self, command: pb.ModeSwitchCommand) -> int: ...
+    def switch_mode(self, target: int) -> int: ...
 
 
 @dataclass(frozen=True)
@@ -401,101 +409,66 @@ class Go2Actuator:
     def active_mode(self) -> int:
         return self._active_mode
 
-    def apply_motion(self, request: Union[pb.SubmitMotionCommandRequest, pb.ApplyRobotSettingRequest]) -> bool:
-        command = request.WhichOneof("setting" if isinstance(request, pb.ApplyRobotSettingRequest) else "command")
-        if command == "twist":
-            twist = request.twist
-            values = (
-                float(twist.linear_x_mps),
-                float(twist.linear_y_mps),
-                float(twist.angular_z_rps),
-            )
-            if not all(math.isfinite(value) for value in values):
-                raise ActuatorError("INVALID_ARGUMENT", "twist values must be finite")
-            limited = False
-            if math.hypot(values[0], values[1]) > self._max_linear_velocity_mps:
-                # 原范数即便溢出也只用于比较；归一化后计算实际缩放，避免inf乘零。
-                largest = max(abs(values[0]), abs(values[1]))
-                nx, ny = values[0] / largest, values[1] / largest
-                magnitude = (self._max_linear_velocity_mps / math.hypot(nx, ny)) * (1 - 8 * sys.float_info.epsilon)
-                values = (nx * magnitude, ny * magnitude, values[2])
-                limited = True
-            if abs(values[2]) > self._max_yaw_rate_rps:
-                values = (values[0], values[1], math.copysign(self._max_yaw_rate_rps, values[2]))
-                limited = True
-            move_values = (
-                values[0],
-                values[1],
-                0.0 if abs(values[2]) <= self._yaw_rate_deadband_rps else values[2],
-            )
-            if not self._motion_route_ready:
-                # 设备重启或遥控器可改变避障开关，不能用进程默认值选择通道。
-                # 每次归零后的首条速度重新查询；连续速度不增加同步查询负载。
-                try:
-                    code, enabled = self._obstacle.SwitchGet()
-                    _require_success(code, "ObstaclesAvoidClient.SwitchGet")
-                    if not isinstance(enabled, bool):
-                        raise ValueError("避障开关不是布尔值")
-                except Exception as exc:
-                    raise ActuatorError("OBSTACLE_POLICY_UNAVAILABLE", str(exc)) from exc
-                self._obstacle_policy_enabled = enabled
-                if enabled:
-                    # 请求超时也可能已经获得控制权，收尾仍须尝试释放。
-                    self._obstacle_remote_enabled = True
-                    _require_success(
-                        self._obstacle.UseRemoteCommandFromApi(True),
-                        "ObstaclesAvoidClient.UseRemoteCommandFromApi(true)",
-                    )
-                self._motion_route_ready = True
-            client = self._obstacle if self._obstacle_policy_enabled else self._sport
-            _require_success(
-                client.Move(*move_values),
-                f"{client.__class__.__name__}.Move",
-            )
-            return limited
-        if command == "stop":
-            self.zero()
-            return False
-        if command == "body_pose":
-            pose = request.body_pose
-            values = (
-                float(pose.roll_rad),
-                float(pose.pitch_rad),
-                float(pose.yaw_rad),
-            )
-            if not all(math.isfinite(value) for value in values) or any(
-                abs(value) > self._max_body_pose_rad for value in values
-            ):
-                raise ActuatorError(
-                    "INVALID_ARGUMENT",
-                    "body pose must be finite and within configured limit",
+    def velocity(self, vx: float, vy: float, wz: float) -> bool:
+        values = (vx, vy, wz)
+        limited = False
+        if math.hypot(values[0], values[1]) > self._max_linear_velocity_mps:
+            # 原范数即便溢出也只用于比较；归一化后计算实际缩放，避免inf乘零。
+            largest = max(abs(values[0]), abs(values[1]))
+            nx, ny = values[0] / largest, values[1] / largest
+            magnitude = (self._max_linear_velocity_mps / math.hypot(nx, ny)) * (1 - 8 * sys.float_info.epsilon)
+            values = (nx * magnitude, ny * magnitude, values[2])
+            limited = True
+        if abs(values[2]) > self._max_yaw_rate_rps:
+            values = (values[0], values[1], math.copysign(self._max_yaw_rate_rps, values[2]))
+            limited = True
+        move_values = (
+            values[0],
+            values[1],
+            0.0 if abs(values[2]) <= self._yaw_rate_deadband_rps else values[2],
+        )
+        if not self._motion_route_ready:
+            # 设备重启或遥控器可改变避障开关，不能用进程默认值选择通道。
+            # 每次归零后的首条速度重新查询；连续速度不增加同步查询负载。
+            try:
+                code, enabled = self._obstacle.SwitchGet()
+                _require_success(code, "ObstaclesAvoidClient.SwitchGet")
+                if not isinstance(enabled, bool):
+                    raise ValueError("避障开关不是布尔值")
+            except Exception as exc:
+                raise ActuatorError("OBSTACLE_POLICY_UNAVAILABLE", str(exc)) from exc
+            self._obstacle_policy_enabled = enabled
+            if enabled:
+                # 请求超时也可能已经获得控制权，收尾仍须尝试释放。
+                self._obstacle_remote_enabled = True
+                _require_success(
+                    self._obstacle.UseRemoteCommandFromApi(True),
+                    "ObstaclesAvoidClient.UseRemoteCommandFromApi(true)",
                 )
-            _require_success(
-                self._sport.Euler(*values),
-                "SportClient.Euler",
-            )
-            return False
-        if command == "speed_level":
-            level = int(request.speed_level.level)
-            if level not in {1, 2, 3}:
-                raise ActuatorError("INVALID_ARGUMENT", "speed level must be in [1, 3]")
-            _require_success(self._sport.SpeedLevel(level), "SportClient.SpeedLevel")
-            return False
-        if command == "obstacle_policy":
-            enabled = bool(request.obstacle_policy.enabled)
-            _require_success(
-                self._obstacle.SwitchSet(enabled),
-                "ObstaclesAvoidClient.SwitchSet",
-            )
-            _require_success(
-                self._obstacle.UseRemoteCommandFromApi(enabled),
-                "ObstaclesAvoidClient.UseRemoteCommandFromApi",
-            )
+            self._motion_route_ready = True
+        client = self._obstacle if self._obstacle_policy_enabled else self._sport
+        _require_success(
+            client.Move(*move_values),
+            f"{client.__class__.__name__}.Move",
+        )
+        return limited
+
+    def body_pose(self, roll: float, pitch: float, yaw: float) -> None:
+        values = (roll, pitch, yaw)
+        if any(abs(value) > self._max_body_pose_rad for value in values):
+            raise ActuatorError("ACTUATOR_COMMAND_FAILED", "机身姿态超过执行器限制")
+        _require_success(self._sport.Euler(*values), "SportClient.Euler")
+
+    def setting(self, request: pb.SettingRequest) -> None:
+        if request.HasField("speed_level"):
+            _require_success(self._sport.SpeedLevel(request.speed_level), "SportClient.SpeedLevel")
+        if request.HasField("obstacle_avoidance"):
+            enabled = request.obstacle_avoidance
+            _require_success(self._obstacle.SwitchSet(enabled), "ObstaclesAvoidClient.SwitchSet")
+            _require_success(self._obstacle.UseRemoteCommandFromApi(enabled), "ObstaclesAvoidClient.UseRemoteCommandFromApi")
             self._obstacle_policy_enabled = enabled
             self._obstacle_remote_enabled = enabled
             self._motion_route_ready = False
-            return False
-        raise ActuatorError("INVALID_ARGUMENT", "motion command oneof is missing")
 
     def execute_sport(self, command: pb.SportActionCommand) -> None:
         action = command.action
@@ -504,11 +477,6 @@ class Go2Actuator:
             return
         method_name = _ONE_SHOT_SPORT_METHODS.get(action)
         if method_name is not None:
-            if not command.enabled:
-                raise ActuatorError(
-                    "INVALID_ARGUMENT",
-                    "one-shot sport actions require enabled=true",
-                )
             _require_success(getattr(self._sport, method_name)(), f"SportClient.{method_name}")
             return
         method_name = _TOGGLE_SPORT_METHODS.get(action)
@@ -587,8 +555,7 @@ class Go2Actuator:
                 return
             raise ActuatorError("ZERO_FAILED", "; ".join(dict.fromkeys(str(error) for error in errors)))
 
-    def switch_mode(self, command: pb.ModeSwitchCommand) -> int:
-        target = command.target_mode
+    def switch_mode(self, target: int) -> int:
         if target == pb.CONTROL_MODE_LOW_LEVEL:
             if self._low_level_controller is None:
                 controller = self._factories.low_level_controller(self._dds_iface)

@@ -10,7 +10,7 @@ from fastapi.responses import StreamingResponse
 from typing import Optional
 
 from core.errors import GatewayError
-from gateways.feedback_messages import TERMINAL_EVENTS, build_feedback_message, is_feedback_event
+from gateways.feedback_messages import build_feedback_message, is_feedback_event, is_terminal_event
 from gateways.ws.client_queue import ClientQueue
 
 
@@ -21,13 +21,13 @@ def feedback_cursor(runtime, value):
     if not re.fullmatch(r"[a-f0-9]{32}:[0-9]{1,20}", value):
         raise GatewayError("反馈续传标识无效。", error_code="invalid_params", http_status=422)
     instance, cursor = value.split(":")
-    if instance != runtime.event_bus.instance_id:
+    if instance != runtime.events.instance_id:
         return 0, "stream_restarted"
     return int(cursor), None
 
 
 def feedback_id(runtime, cursor):
-    return "%s:%s" % (runtime.event_bus.instance_id, cursor)
+    return "%s:%s" % (runtime.events.instance_id, cursor)
 
 
 def format_feedback_sse(kind, payload, event_id=None):
@@ -37,23 +37,21 @@ def format_feedback_sse(kind, payload, event_id=None):
 
 
 async def feedback_events(runtime, request, *, after_cursor=0, reset_reason=None,
-                          request_id=None, task_id=None, capability_name=None, queue_size=200):
+                          task_id=None, capability_name=None, queue_size=200):
     """仅事件到达时取消息；保活不读取任务状态，也不推进已交付游标。"""
     queue = ClientQueue(asyncio.get_running_loop(), maxsize=queue_size,
-                        is_terminal=lambda event: event.event_type in TERMINAL_EVENTS)
+                        is_terminal=is_terminal_event)
 
     def receive(event):
         if is_feedback_event(event):
             queue.put(event)
 
-    subscription, replay = runtime.event_bus.subscribe_with_replay(receive, after_cursor=after_cursor)
+    subscription, replay = runtime.events.subscribe_with_replay(receive, after_cursor=after_cursor)
     cursor = after_cursor
 
     def project(event):
         message = build_feedback_message(runtime, event)
         if message is None:
-            return None
-        if request_id and message.get("request_id") != request_id:
             return None
         if task_id and message.get("task_id") != task_id:
             return None
@@ -72,7 +70,7 @@ async def feedback_events(runtime, request, *, after_cursor=0, reset_reason=None
                 "message": "反馈历史不完整，请核对相关任务与日志；不要重新执行动作。",
                 "oldest_cursor": replay.oldest_cursor, "latest_cursor": replay.latest_cursor,
             }, feedback_id(runtime, cursor)
-        yield "feedback.ready", {"stream_id": runtime.event_bus.instance_id,
+        yield "feedback.ready", {"stream_id": runtime.events.instance_id,
                                  "latest_cursor": replay.latest_cursor}, None
         for event in replay.events:
             message = await run_in_threadpool(project, event)
@@ -83,7 +81,7 @@ async def feedback_events(runtime, request, *, after_cursor=0, reset_reason=None
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=runtime.config.gateway.sse_keepalive_sec)
             except asyncio.TimeoutError:
-                yield "keepalive", {"stream_id": runtime.event_bus.instance_id}, None
+                yield "keepalive", {"stream_id": runtime.events.instance_id}, None
                 continue
             drops = queue.take_drops()
             if drops:
@@ -100,7 +98,7 @@ async def feedback_events(runtime, request, *, after_cursor=0, reset_reason=None
                 yield "feedback.message", message, feedback_id(runtime, cursor)
     finally:
         queue.close()
-        runtime.event_bus.unsubscribe(subscription)
+        runtime.events.unsubscribe(subscription)
 
 
 def build_feedback_router(runtime):
@@ -108,14 +106,14 @@ def build_feedback_router(runtime):
 
     @router.get("/api/feedback/stream")
     async def stream(request: Request, after: Optional[str] = None,
-                     request_id: Optional[str] = None, task_id: Optional[str] = None,
+                     task_id: Optional[str] = None,
                      capability_name: Optional[str] = None):
         cursor, reason = feedback_cursor(runtime, request.headers.get("last-event-id") or after)
 
         async def generate():
             async for kind, payload, identity in feedback_events(
                     runtime, request, after_cursor=cursor, reset_reason=reason,
-                    request_id=request_id, task_id=task_id, capability_name=capability_name):
+                    task_id=task_id, capability_name=capability_name):
                 yield format_feedback_sse(kind, payload, identity)
 
         return StreamingResponse(generate(), media_type="text/event-stream",

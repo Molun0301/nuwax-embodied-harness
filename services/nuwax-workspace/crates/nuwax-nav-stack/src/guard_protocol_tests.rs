@@ -311,7 +311,7 @@ mod guard_protocol {
         );
         drop(state);
         h.shutdown().await;
-        let (_guard, h) = harness(19).await;
+        let (guard, mut h) = harness(19).await;
         // 撤销规划输入，使目标只进入待执行槽；启动取消后再给输入也不能执行它。
         h.scheduler.invalidate_map("测试输入暂缺").await.unwrap();
         h.send_goal_and_wait_dequeued(&goal("缓冲目标", 19)).await;
@@ -320,6 +320,9 @@ mod guard_protocol {
             "nuwax_msgs.CancelNavigation",
             schema::encode_cancel_navigation_body(&schema::CancelNavigation::default()).unwrap(),
         );
+        let cancelled = self::state(&mut h, "缓冲目标", 0).await;
+        assert!(cancelled.message.starts_with("CANCELLED:"));
+        assert!(guard.state.lock().unwrap().events.is_empty());
         h.send_pose(2);
         h.wait_for_pose(2).await;
         h.send_costmap(2);

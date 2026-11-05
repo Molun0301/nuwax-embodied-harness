@@ -1632,8 +1632,8 @@ where
                                 .map_err(|error| module_error("surface map invalidation", error))?;
                             goal_buffer.costmap_observed = false;
                             goal_buffer.active_goal_applied = false;
-                            // 精细源失败或换域时仍保留待执行目标；否则之后的取消
-                            // 找不到原目标，几何拥有方会永久等待无法关联的停车回执。
+                            // 精细源失败或换域时保留待执行目标，之后的取消仍须
+                            // 通过原状态通道回报该目标。
                             if (update.snapshot.is_err() && !update.awaiting_build)
                                 || (changed_domain && !goal_buffer.pending_goal.as_ref()
                                     .is_some_and(|pending| update.authority.permits_goal(pending)))
@@ -1982,18 +1982,29 @@ where
                     Ok(cancel) => cancel,
                     Err(error) => { diagnostics.reject("导航取消", &error.to_string()); continue; }
                 };
+                let buffered_goal = goal_buffer.pending_goal.as_ref()
+                    .filter(|goal| validate_cancel_goal_correlation(&cancel, goal).is_ok()).cloned();
                 if active_session.as_ref().is_some_and(|goal| validate_cancel_goal_correlation(&cancel, goal).is_ok()) {
                     scheduler.cancel(&cancel.session_id).await.map_err(|error| module_error("导航取消", error))?;
                     let snapshot = scheduler.status();
                     publish_guarded_nav_observation(transport, node, snapshot.clone(), &telemetry, None, &mut publications).await?;
                     clear_terminal_session_after_publication(&mut active_session, &mut telemetry, &snapshot);
                 }
+                if let Some(goal) = buffered_goal {
+                    let candidate = guarded_buffered_cancel_telemetry(&telemetry, &goal, 0);
+                    let mut snapshot = scheduler.status();
+                    snapshot.phase = nuwax_nav_runtime::SchedulerPhase::Idle;
+                    snapshot.session_id = None;
+                    snapshot.last_terminal = Some(nuwax_nav_runtime::TerminalOutcome::Cancelled);
+                    snapshot.message = "缓冲目标已取消".into();
+                    // 尚未申请租约的目标只回报状态，不发布速度或虚构释放回执。
+                    publish_guarded_nav_state(transport, &node.outputs[1], snapshot, &candidate, None).await?;
+                    goal_buffer.clear_pending_goal_for(&goal);
+                }
                 if cancel.session_id.is_empty() {
                     goal_buffer = PlannerGoalBuffer::default();
                     goal_buffer.costmap_observed = surface_authority.is_some();
                     accepted_planner_generation = None;
-                } else if let Some(goal) = goal_buffer.pending_goal.clone().filter(|goal| goal.session_id == cancel.session_id) {
-                    goal_buffer.clear_pending_goal_for(&goal);
                 }
             }
         }
@@ -3780,10 +3791,7 @@ struct FarJoinKey {
     backend: String,
     runtime_generation: i64,
     session_id: String,
-    owner_kind: i32,
-    parent_request_id: String,
-    goal_generation: i64,
-    producer_runtime_generation: i64,
+    motion_generation: u64,
     path_revision: i64,
     planner_runtime_generation: i64,
 }
@@ -3793,8 +3801,6 @@ fn far_join_key(state: &schema::NavigationState) -> Option<FarJoinKey> {
     if state.state != nuwax_nav_far_planner_bridge::worker::FAR_EVENT_SUCCEEDED
         || state.runtime_generation <= 0
         || state.path_revision <= 0
-        || state.producer_runtime_generation <= 0
-        || state.goal_generation <= 0
         || state.planner_runtime_generation != state.runtime_generation
     {
         return None;
@@ -3803,10 +3809,7 @@ fn far_join_key(state: &schema::NavigationState) -> Option<FarJoinKey> {
         backend: state.robot_frame.clone(),
         runtime_generation: state.runtime_generation,
         session_id: state.session_id.clone(),
-        owner_kind: state.owner_kind,
-        parent_request_id: state.parent_request_id.clone(),
-        goal_generation: state.goal_generation,
-        producer_runtime_generation: state.producer_runtime_generation,
+        motion_generation: state.goal_generation as u64,
         path_revision: state.path_revision,
         planner_runtime_generation: state.planner_runtime_generation,
     })
@@ -3822,10 +3825,7 @@ fn far_key_matches_goal(
         && key.backend == "far-visibility-graph"
         && key.runtime_generation == accepted_generation
         && key.session_id == goal.session_id
-        && key.owner_kind == schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV
-        && key.parent_request_id == goal.parent_request_id
-        && key.goal_generation == goal.motion_generation as i64
-        && key.producer_runtime_generation == 0
+        && key.motion_generation == goal.motion_generation
         && key.planner_runtime_generation == accepted_generation
 }
 
@@ -3953,10 +3953,6 @@ async fn run_native_planner_path_adapter_with_transport(
                 };
                 if !admit_native_adapter_goal(&mut latest_goal, goal) {
                     continue;
-                }
-                #[cfg(feature = "mls")]
-                {
-                    path_revision = 0;
                 }
                 #[cfg(any(feature = "cmu-native", feature = "explore"))]
                 {
@@ -10196,10 +10192,7 @@ goal: schema::PoseStamped {
             backend: "far-visibility-graph".into(),
             runtime_generation: 12,
             session_id: goal.session_id.clone(),
-            owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
-            parent_request_id: String::new(),
-            goal_generation: goal.motion_generation as i64,
-            producer_runtime_generation: 0,
+            motion_generation: goal.motion_generation,
             path_revision: 4,
             planner_runtime_generation: 12,
         }
@@ -10285,31 +10278,21 @@ goal: schema::PoseStamped {
 
     #[cfg(any(feature = "cmu-native", feature = "explore"))]
     #[test]
-    fn stale_goal_preserves_newer_far_result_until_terminal() {
-        let stale = goal_generation(9);
-        let current = goal_generation(10);
-        let key = far_key(&current);
-        let mut latest = None;
-        assert!(admit_native_adapter_goal(&mut latest, stale.clone()));
-        assert!(admit_native_adapter_goal(&mut latest, current.clone()));
-        let mut pending_results = HashMap::from([(
-            key.clone(),
-            path(vec![Point2::new(1.0, 1.0), Point2::new(4.0, 4.0)]),
-        )]);
-        let mut pending_terminals = HashSet::new();
-        let mut consumed = HashSet::new();
-
-        assert!(!admit_native_adapter_goal(&mut latest, stale));
-        assert_eq!(latest.as_ref(), Some(&current));
-        pending_terminals.insert(key.clone());
-        assert!(take_far_join(
-            &key,
-            &mut pending_results,
-            &mut pending_terminals,
-            &mut consumed,
-        )
-        .is_some());
-        assert!(consumed.contains(&key));
+    fn same_motion_generation_keeps_distinct_far_goal_identity() {
+        let first=goal_generation(9);
+        let mut current=first.clone();current.session_id="next-child".into();
+        let old_key=far_key(&first);let key=far_key(&current);
+        let mut latest=None;
+        assert!(admit_native_adapter_goal(&mut latest,first));
+        assert!(admit_native_adapter_goal(&mut latest,current.clone()));
+        assert!(!far_key_matches_goal(&old_key,&current,12));
+        assert!(far_key_matches_goal(&key,&current,12));
+        let mut results=HashMap::from([(key.clone(),path(vec![Point2::new(1.,1.),Point2::new(4.,4.)]))]);
+        let mut terminals=HashSet::from([old_key.clone()]);let mut consumed=HashSet::new();
+        assert!(take_far_join(&old_key,&mut results,&mut terminals,&mut consumed).is_none());
+        terminals.insert(key.clone());
+        assert!(take_far_join(&key,&mut results,&mut terminals,&mut consumed).is_some());
+        assert_eq!(latest,Some(current));
     }
 
     #[test]
@@ -10329,12 +10312,9 @@ goal: schema::PoseStamped {
         assert!(!native_path_respects_goal(&wrong_path_frame, &goal));
 
         let mut wrong_map = goal.clone();
-        wrong_map.committed_map_frame_id = "odom".into();
+        wrong_map.goal.header.frame_id = "odom".into();
         assert!(!native_path_respects_goal(&inside, &wrong_map));
 
-        let mut wrong_boundary = goal;
-        wrong_boundary.boundary_frame_id = "odom".into();
-        assert!(!native_path_respects_goal(&inside, &wrong_boundary));
     }
 
     #[cfg(any(feature = "cmu-native", feature = "explore"))]
@@ -10359,7 +10339,7 @@ goal: schema::PoseStamped {
         assert!(!far_terminal_matches_goal(&state, &goal, 13));
 
         let mut wrong_goal = goal;
-        wrong_goal.producer_runtime_generation += 1;
+        wrong_goal.motion_generation += 1;
         schema::validate_goal_envelope(&wrong_goal).expect("reseal wrong goal");
         assert!(!far_terminal_matches_goal(&state, &wrong_goal, 12));
     }
@@ -10372,10 +10352,7 @@ goal: schema::PoseStamped {
             backend: "far-visibility-graph".into(),
             runtime_generation: 12,
             session_id: goal.session_id.clone(),
-            owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
-            parent_request_id: String::new(),
-            goal_generation: goal.motion_generation as i64,
-            producer_runtime_generation: 0,
+            motion_generation: goal.motion_generation,
             path_revision: 4,
             planner_runtime_generation: 12,
         };
@@ -10473,7 +10450,8 @@ goal: schema::PoseStamped {
         .await
         .expect("FAR adapter readiness timeout");
 
-        let goal = goal();
+        let mut goal = goal();
+        goal.motion_generation=u64::MAX;
         publish_body(
             &transport,
             &node.inputs[0],
@@ -10489,7 +10467,7 @@ goal: schema::PoseStamped {
             robot_frame: "far-visibility-graph".into(),
             state: nuwax_nav_far_planner_bridge::worker::FAR_EVENT_SUCCEEDED,
             runtime_generation: 12,
-            planner_map_frame: goal.committed_map_frame_id.clone(),
+            planner_map_frame: goal.goal.header.frame_id.clone(),
             planner_pose_frame: goal.goal.header.frame_id.clone(),
             owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
             parent_request_id: String::new(),

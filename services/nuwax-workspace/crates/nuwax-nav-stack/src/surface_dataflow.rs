@@ -3035,6 +3035,19 @@ goal: schema::PoseStamped {
         future_map.commit_sequence = future_map.committed_map.commit_sequence;
         future_map.cloud_occupancy_revision = future_map.committed_map.revision;
         future_map.cloud_revision += 100;
+        // 新目标信封不携带地图提交身份；由真实输入来源的构建状态建立等待。
+        harness.hub.publish(PreparedSurfaceMap {
+            authority: map_authority(&future_map),
+            source_timestamp_ns: future_map.source_timestamp_ns,
+            received_at: Instant::now(),
+            awaiting_build: true,
+            snapshot: Err("等待精细地图构建".into()),
+            change_basis: None, geometry_changes: Arc::new(SurfaceGeometryChanges::Unknown),
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut status=harness.scheduler.subscribe_status();
+            while status.borrow().planner_inputs_fresh { status.changed().await.unwrap(); }
+        }).await.expect("地图来源暂缺必须进入等待输入");
         let goal = goal_for(&future_map, 1, [1.55, 1.55, 2.5]);
         harness.goal(&goal).await;
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -3061,9 +3074,24 @@ goal: schema::PoseStamped {
             tokio::time::sleep(Duration::from_millis(120)).await;
             assert!(harness.calls.lock().unwrap().is_empty(), "已撤销目标不能随有效地图恢复执行");
         }
+        let mut states=typed_stream(&harness.transport,&harness.planner_node.inputs[4],"nuwax_msgs.NavigationState").await.unwrap();
         harness.cancel(&goal).await;
-        harness.terminal(TerminalOutcome::Cancelled).await;
-        assert!(harness.calls.lock().unwrap().iter().any(|call| call.starts_with("release:")));
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let frame=states.next().await.unwrap().unwrap();
+                let state=schema::decode_navigation_state_body(&frame.payload).unwrap();
+                if state.session_id==goal.session_id && state.message.starts_with("CANCELLED:") {
+                    assert_eq!(state.state,0);
+                    break;
+                }
+            }
+        }).await.expect("原状态通道必须回报已取消的目标");
+        if awaiting_build {
+            harness.terminal(TerminalOutcome::Cancelled).await;
+            assert!(harness.calls.lock().unwrap().iter().any(|call| call.starts_with("release:")));
+        } else {
+            assert!(harness.calls.lock().unwrap().is_empty(),"缓冲取消不得申请或释放运动租约");
+        }
         harness.feed.lock().unwrap().map_enabled = true;
         harness.wait_ready().await;
         let next = goal_for(&harness.feed.lock().unwrap().map, 2, [1.55, 1.55, 2.5]);

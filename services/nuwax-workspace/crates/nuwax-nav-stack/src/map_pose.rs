@@ -1,5 +1,3 @@
-#![cfg(any(feature = "guard-runtime", test))]
-
 use std::time::{Duration, Instant};
 
 use nuwax_codec::lcm::schema;

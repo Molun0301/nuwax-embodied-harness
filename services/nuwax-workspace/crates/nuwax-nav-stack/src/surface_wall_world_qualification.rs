@@ -225,8 +225,7 @@ fn explicit_mask_wire_cache_full_footprint_preflight() {
     assert!(built.validate_body_pose(footprint_outside.0,footprint_outside.1).is_err());
     let goal=goal_for_with_options(&decoded,1,[3.5,1.5,0.5],
         nuwax_nav_types_messages::GoalOptions{allow_reverse:false,position_tolerance_m:0.1,yaw_tolerance_rad:0.15});
-    assert_eq!(goal.owner_kind,schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV);
-    assert!(goal.boundary_id.is_empty()&&goal.boundary_frame_id.is_empty()&&goal.boundary_points.is_empty());
+    assert!(goal.boundary_points.is_empty());
     schema::validate_goal_envelope(&goal).unwrap();
     assert!(navigation_boundary_from_goal(&goal).unwrap().is_none());
     eprintln!("WALL_WORLD_PREFLIGHT mask=wire_roundtrip_and_actual_cache_verified full_footprint=true public_nav_unchanged=true");

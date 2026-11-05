@@ -4,7 +4,7 @@
 //! 算法结果通过 FAR 私有 `NavigationState` v3 合同发布，由后续唯一 adapter
 //! 封装 canonical `PathEnvelope`；本模块绝不发布 canonical path topic。
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nuwax_codec::lcm::schema::{
@@ -245,8 +245,6 @@ pub fn decode_private_result_v3(state: &NavigationState) -> Result<Path, WorkerE
     if state.state != FAR_EVENT_SUCCEEDED
         || state.runtime_generation <= 0
         || state.path_revision <= 0
-        || state.producer_runtime_generation <= 0
-        || state.goal_generation <= 0
         || state.planner_runtime_generation != state.runtime_generation
     {
         return Err(WorkerError::Codec(
@@ -288,8 +286,6 @@ pub fn seal_private_result_v3(
     if state.state != FAR_EVENT_SUCCEEDED
         || state.runtime_generation <= 0
         || state.path_revision <= 0
-        || state.producer_runtime_generation <= 0
-        || state.goal_generation <= 0
         || state.planner_runtime_generation != state.runtime_generation
     {
         return Err(WorkerError::Codec(
@@ -345,53 +341,16 @@ struct ObstacleCloud {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct GoalOwner {
-    session_id: String,
-    owner_kind: i32,
-    parent_request_id: String,
-    producer_runtime_generation: i64,
-}
-
-impl From<&GoalEnvelope> for GoalOwner {
-    fn from(goal: &GoalEnvelope) -> Self {
-        Self {
-            session_id: goal.session_id.clone(),
-            owner_kind: goal.owner_kind,
-            parent_request_id: goal.parent_request_id.clone(),
-            producer_runtime_generation: goal.producer_runtime_generation,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct GoalIdentity {
     session_id: String,
-    owner_kind: i32,
-    parent_request_id: String,
-    goal_generation: i64,
-    producer_runtime_generation: i64,
+    motion_generation: u64,
 }
 
 impl From<&GoalEnvelope> for GoalIdentity {
     fn from(goal: &GoalEnvelope) -> Self {
         Self {
             session_id: goal.session_id.clone(),
-            owner_kind: goal.owner_kind,
-            parent_request_id: goal.parent_request_id.clone(),
-            goal_generation: goal.goal_generation,
-            producer_runtime_generation: goal.producer_runtime_generation,
-        }
-    }
-}
-
-impl From<&CancelNavigation> for GoalIdentity {
-    fn from(cancel: &CancelNavigation) -> Self {
-        Self {
-            session_id: cancel.session_id.clone(),
-            owner_kind: cancel.owner_kind,
-            parent_request_id: cancel.parent_request_id.clone(),
-            goal_generation: cancel.goal_generation,
-            producer_runtime_generation: cancel.producer_runtime_generation,
+            motion_generation: goal.motion_generation,
         }
     }
 }
@@ -449,8 +408,8 @@ pub async fn run_with_transport(
     let mut scan_obstacles: Option<ObstacleCloud> = None;
     let mut active: Option<ActivePlan> = None;
     let mut pending_completion: Option<PlanCompletion> = None;
-    let mut cancelled: HashMap<GoalIdentity, i64> = HashMap::new();
-    let mut terminal_watermarks: HashMap<GoalOwner, i64> = HashMap::new();
+    let mut cancelled: HashSet<String> = HashSet::new();
+    let mut terminal_goals: HashSet<GoalIdentity> = HashSet::new();
     let mut next_path_revision = 1_i64;
 
     loop {
@@ -461,15 +420,9 @@ pub async fn run_with_transport(
             frame = cancel.recv() => {
                 let frame = frame.map_err(|error| WorkerError::Transport(format!("cancel stream: {error}")))?;
                 let value = decode_cancel(&frame.payload)?;
-                if value.cancel_generation <= 0 {
-                    publish_rejected(&transport, &options, "cancel-generation-must-be-positive").await?;
-                    continue;
+                if !value.session_id.is_empty() {
+                    cancelled.insert(value.session_id.clone());
                 }
-                let identity = GoalIdentity::from(&value);
-                cancelled
-                    .entry(identity)
-                    .and_modify(|generation| *generation = (*generation).max(value.cancel_generation))
-                    .or_insert(value.cancel_generation);
                 if active
                     .as_ref()
                     .is_some_and(|current| cancel_matches(&value, &current.goal))
@@ -477,14 +430,14 @@ pub async fn run_with_transport(
                     let current = active.take().expect("matching active plan checked");
                     current.task.abort();
                     pending_completion = None;
-                    record_terminal(&mut terminal_watermarks, &current.goal);
+                    record_terminal(&mut terminal_goals, &current.goal);
                     publish_event(
                         &transport,
                         &options,
                         FAR_EVENT_CANCELLED,
                         Some(&current.goal),
                         Some(current.start),
-                        value.cancel_generation,
+                        0,
                         "cancelled:correlated",
                     )
                     .await?;
@@ -499,11 +452,7 @@ pub async fn run_with_transport(
                         continue;
                     }
                 };
-                let owner = GoalOwner::from(&value);
-                if terminal_watermarks
-                    .get(&owner)
-                    .is_some_and(|generation| *generation >= value.goal_generation)
-                {
+                if terminal_goals.contains(&GoalIdentity::from(&value)) {
                     publish_event(
                         &transport,
                         &options,
@@ -511,20 +460,20 @@ pub async fn run_with_transport(
                         Some(&value),
                         None,
                         0,
-                        "rejected:stale-terminal-goal-generation",
+                        "rejected:terminal-goal",
                     )
                     .await?;
                     continue;
                 }
-                if let Some(cancel_generation) = cancelled.get(&GoalIdentity::from(&value)).copied() {
-                    record_terminal(&mut terminal_watermarks, &value);
+                if cancelled.contains(&value.session_id) {
+                    record_terminal(&mut terminal_goals, &value);
                     publish_event(
                         &transport,
                         &options,
                         FAR_EVENT_CANCELLED,
                         Some(&value),
                         None,
-                        cancel_generation,
+                        0,
                         "cancelled:correlated-pre-dispatch",
                     )
                     .await?;
@@ -598,11 +547,11 @@ pub async fn run_with_transport(
                     .await?;
                     continue;
                 };
-                if terrain_ext.frame_id != value.committed_map_frame_id
-                    || terrain.frame_id != value.committed_map_frame_id
+                if terrain_ext.frame_id != value.goal.header.frame_id
+                    || terrain.frame_id != value.goal.header.frame_id
                     || scan_obstacles
                         .as_ref()
-                        .is_some_and(|scan| scan.frame_id != value.committed_map_frame_id)
+                        .is_some_and(|scan| scan.frame_id != value.goal.header.frame_id)
                 {
                     publish_event(
                         &transport,
@@ -670,31 +619,28 @@ pub async fn run_with_transport(
                     continue;
                 };
                 if fence.runtime_generation != options.planner_generation
-                    || fence.goal_generation != completion.goal.goal_generation
-                    || fence.parent_request_id != completion.goal.parent_request_id
-                    || fence.producer_runtime_generation != completion.goal.producer_runtime_generation
+                    || fence.goal_generation as u64 != completion.goal.motion_generation
                     || fence.session_id != completion.goal.session_id
-                    || fence.owner_kind != completion.goal.owner_kind
                 {
                     continue;
                 }
                 let completion = pending_completion.take().expect("matching fence checked");
                 let current = active.take().expect("active plan retained through fence");
-                if let Some(cancel_generation) = cancelled.get(&GoalIdentity::from(&current.goal)).copied() {
-                    record_terminal(&mut terminal_watermarks, &current.goal);
+                if cancelled.contains(&current.goal.session_id) {
+                    record_terminal(&mut terminal_goals, &current.goal);
                     publish_event(
                         &transport,
                         &options,
                         FAR_EVENT_CANCELLED,
                         Some(&current.goal),
                         Some(completion.start),
-                        cancel_generation,
+                        0,
                         "cancelled:correlated-commit-fence",
                     )
                     .await?;
                     continue;
                 }
-                record_terminal(&mut terminal_watermarks, &current.goal);
+                record_terminal(&mut terminal_goals, &current.goal);
                 match completion.outcome {
                     PlanOutcome::Path(path) => {
                         let correlation = publish_private_result_v3(
@@ -917,9 +863,7 @@ fn validate_goal_against_odometry(
     goal: &GoalEnvelope,
     odometry: &Odometry,
 ) -> Result<[f64; 3], String> {
-    if odometry.header.frame_id != goal.committed_map_frame_id
-        || goal.goal.header.frame_id != goal.committed_map_frame_id
-    {
+    if odometry.header.frame_id != goal.goal.header.frame_id {
         return Err("frame-mismatch".into());
     }
     let start = odometry.pose.position;
@@ -944,28 +888,16 @@ fn validate_goal_against_odometry(
     Ok(start)
 }
 
-fn record_terminal(watermarks: &mut HashMap<GoalOwner, i64>, goal: &GoalEnvelope) {
-    watermarks
-        .entry(GoalOwner::from(goal))
-        .and_modify(|generation| *generation = (*generation).max(goal.goal_generation))
-        .or_insert(goal.goal_generation);
+fn record_terminal(terminal_goals: &mut HashSet<GoalIdentity>, goal: &GoalEnvelope) {
+    terminal_goals.insert(GoalIdentity::from(goal));
 }
 
 fn same_goal(left: &GoalEnvelope, right: &GoalEnvelope) -> bool {
-    left.session_id == right.session_id
-        && left.owner_kind == right.owner_kind
-        && left.parent_request_id == right.parent_request_id
-        && left.goal_generation == right.goal_generation
-        && left.producer_runtime_generation == right.producer_runtime_generation
+    left.session_id == right.session_id && left.motion_generation == right.motion_generation
 }
 
 fn cancel_matches(cancel: &CancelNavigation, goal: &GoalEnvelope) -> bool {
-    cancel.cancel_generation > 0
-        && cancel.session_id == goal.session_id
-        && cancel.owner_kind == goal.owner_kind
-        && cancel.parent_request_id == goal.parent_request_id
-        && cancel.goal_generation == goal.goal_generation
-        && cancel.producer_runtime_generation == goal.producer_runtime_generation
+    cancel.session_id.is_empty() || cancel.session_id == goal.session_id
 }
 
 async fn subscribe(
@@ -1102,10 +1034,7 @@ async fn publish_commit_fence(
         state: FAR_EVENT_READY,
         message: "far-private-commit-fence".into(),
         runtime_generation: options.planner_generation,
-        owner_kind: goal.owner_kind,
-        parent_request_id: goal.parent_request_id.clone(),
-        goal_generation: goal.goal_generation,
-        producer_runtime_generation: goal.producer_runtime_generation,
+        goal_generation: goal.motion_generation as i64,
         ..NavigationState::default()
     };
     let body = schema::encode_navigation_state_body(&fence)
@@ -1209,19 +1138,24 @@ fn navigation_state(
         costmap_source_timestamp_ns: 0,
         sink_ready: i8::from(state == FAR_EVENT_READY),
         planner_map_frame: goal
-            .map_or_else(String::new, |value| value.committed_map_frame_id.clone()),
+            .map_or_else(String::new, |value| value.goal.header.frame_id.clone()),
         planner_pose_frame: goal
             .map_or_else(String::new, |value| value.goal.header.frame_id.clone()),
         cancel_generation,
         zero_ack_id: String::new(),
         zero_applied_monotonic_ns: 0,
-        owner_kind: goal.map_or(0, |value| value.owner_kind),
-        parent_request_id: goal.map_or_else(String::new, |value| value.parent_request_id.clone()),
-        goal_generation: goal.map_or(0, |value| value.goal_generation),
+        owner_kind: 0,
+        parent_request_id: String::new(),
+        // 状态通道沿用既有整数槽位，保留完整无符号运动代次的位模式。
+        goal_generation: goal.map_or(0, |value| value.motion_generation as i64),
         path_revision: correlation.revision,
         local_path: Vec::new(),
-        producer_runtime_generation: goal.map_or(0, |value| value.producer_runtime_generation),
-        planner_runtime_generation: if correlation.revision > 0 { options.planner_generation } else { 0 },
+        producer_runtime_generation: 0,
+        planner_runtime_generation: if correlation.revision > 0 {
+            options.planner_generation
+        } else {
+            0
+        },
     }
 }
 
@@ -1267,9 +1201,7 @@ async fn publish_event(
         goal,
         current,
         cancel_generation,
-        PathCorrelation {
-            revision: 0,
-        },
+        PathCorrelation { revision: 0 },
         message,
     );
     let body = schema::encode_navigation_state_body(&message)
@@ -1353,33 +1285,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cancel_requires_exact_goal_identity() {
+    fn cancel_matches_goal_id_and_empty_id_cancels_all() {
         let goal = GoalEnvelope {
-            body_reference_frame_id: "base_link".into(),
             session_id: "session".into(),
-            owner_kind: 1,
-            parent_request_id: "request".into(),
-            goal_generation: 7,
-            producer_runtime_generation: 9,
+            motion_generation: u64::MAX,
             ..GoalEnvelope::default()
         };
         let cancel = CancelNavigation {
             session_id: "session".into(),
-            cancel_generation: 1,
-            owner_kind: 1,
-            parent_request_id: "request".into(),
-            goal_generation: 7,
-            producer_runtime_generation: 9,
             ..CancelNavigation::default()
         };
         assert!(cancel_matches(&cancel, &goal));
         assert!(!cancel_matches(
             &CancelNavigation {
-                goal_generation: 8,
+                session_id: "other".into(),
                 ..cancel
             },
             &goal
         ));
+        assert!(cancel_matches(&CancelNavigation::default(), &goal));
     }
 
     #[test]
@@ -1446,17 +1370,25 @@ mod tests {
             robot_frame: "far-visibility-graph".into(),
             state: FAR_EVENT_SUCCEEDED,
             runtime_generation: 7,
-            owner_kind: 1,
-            parent_request_id: "request".into(),
-            goal_generation: 9,
+            goal_generation: u64::MAX as i64,
             path_revision: 2,
-            producer_runtime_generation: 11,
             planner_runtime_generation: 7,
             ..NavigationState::default()
         };
         let sealed = seal_private_result_v3(state, &path).expect("seal private result v3");
         assert_eq!(
             decode_private_result_v3(&sealed).expect("decode private result v3"),
+            path
+        );
+
+        assert_eq!(sealed.goal_generation as u64, u64::MAX);
+        let zero_generation = NavigationState {
+            goal_generation: 0,
+            ..sealed.clone()
+        };
+        assert_eq!(
+            decode_private_result_v3(&seal_private_result_v3(zero_generation, &path).unwrap())
+                .unwrap(),
             path
         );
 

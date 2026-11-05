@@ -3457,8 +3457,6 @@ impl ExploreSchedulerHandle {
         period: Duration,
     ) -> Self {
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-        #[cfg(test)]
-        let topology_control = crate::lcm_runtime::topology_test_control();
         let period = if period.is_zero() {
             DEFAULT_SCHEDULER_PERIOD
         } else {
@@ -3466,8 +3464,6 @@ impl ExploreSchedulerHandle {
         };
         let compute_runtime = runtime.clone();
         let worker = tokio::spawn(async move {
-            #[cfg(test)]
-            crate::lcm_runtime::wait_for_topology_scheduler_release(topology_control);
             let mut interval = tokio::time::interval(period);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -5957,12 +5953,12 @@ mod tests {
         assert_ne!(next.child_task_id, active.child_task_id);
     }
 
+    include!("explore_surface_incomplete_tests.rs");
     include!("explore_compute_runtime_tests.rs");
     include!("explore_pose_recovery_tests.rs");
     include!("explore_compute_surface_tests.rs");
     include!("explore_continuous_map_tests.rs");
     include!("explore_composite_map_tests.rs");
-    include!("explore_surface_incomplete_tests.rs");
 
     #[tokio::test]
     async fn compute_owner_surface_slow_prepare_accepts_live_unbuilt_publication() {

@@ -37,9 +37,6 @@ def _write_executable(path: Path, body: str) -> None:
 
 
 
-
-
-
 @pytest.mark.parametrize("grpc_fails", [True])
 def test_client_always_calls_real_get_status_gate(
     tmp_path: Path,
@@ -93,7 +90,6 @@ def test_client_always_calls_real_get_status_gate(
 
     client = GeometryRuntimeSubprocess(port=50123)
     monkeypatch.setattr(client, "_is_port_open", lambda: True)
-    monkeypatch.setattr(client, "_warn_if_video_relay_missing", lambda: None)
 
     assert client.start() is (not grpc_fails)
     assert "127.0.0.1:50123" in calls

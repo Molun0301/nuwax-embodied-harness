@@ -10,7 +10,6 @@ pub(crate) const CORRECTION_BACKEND_ENV: &str = "NUWAX_GEOMETRY_CORRECTION_BACKE
 pub(crate) const MAP_WRITER_ENV: &str = "NUWAX_GEOMETRY_CANONICAL_MAP_WRITER";
 pub(crate) const CORRECTION_WRITER_ENV: &str = "NUWAX_GEOMETRY_CANONICAL_CORRECTION_WRITER";
 pub(crate) const GEOMETRY_CANONICAL_WRITER: &str = "geometry";
-pub(crate) const OWNER_BACKEND_NOT_IMPLEMENTED: &str = "OWNER_BACKEND_NOT_IMPLEMENTED";
 
 const DEFAULT_LIO_BACKEND: &str = "device";
 const DEFAULT_MAPPING_BACKEND: &str = "voxel";
@@ -315,31 +314,10 @@ impl OwnerProfile {
         self.correction
     }
 
-    /// Admits profiles whose concrete owners are currently wired into the
-    /// production runtime. Checks stay in startup order so a profile with
-    /// multiple unsupported selections always reports the same first slot.
-    pub(crate) fn admit_production(&self) -> Result<(), OwnerBackendNotImplemented> {
-        Ok(())
-    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct OwnerBackendNotImplemented {
-    pub(crate) slot: CoreOwnerSlot,
-    pub(crate) backend: &'static str,
-}
 
-impl fmt::Display for OwnerBackendNotImplemented {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{OWNER_BACKEND_NOT_IMPLEMENTED} slot={} backend={}",
-            self.slot, self.backend
-        )
-    }
-}
 
-impl Error for OwnerBackendNotImplemented {}
 
 fn validate_writer(
     output: CanonicalOutput,
@@ -429,31 +407,6 @@ mod tests {
         assert_eq!(count, 24);
     }
 
-    #[test]
-    fn production_admission_is_exhaustive_and_deterministic() {
-        let lio = ["device", "fastlio2", "pointlio"];
-        let mapping = ["voxel", "raytracing"];
-        let correction = ["none", "library_pgo", "native_pgo", "relocalization"];
-
-        let mut admitted = 0;
-        for lio_name in lio {
-            for mapping_name in mapping {
-                for correction_name in correction {
-                    let profile = OwnerProfile::validate(OwnerProfileInput::new(
-                        [lio_name],
-                        [mapping_name],
-                        [correction_name],
-                    ))
-                    .expect("combination must be structurally valid");
-                    profile
-                        .admit_production()
-                        .expect("every structurally valid combination must be admitted");
-                    admitted += 1;
-                }
-            }
-        }
-        assert_eq!(admitted, 24);
-    }
 
     #[test]
     fn missing_env_values_use_safe_defaults() {

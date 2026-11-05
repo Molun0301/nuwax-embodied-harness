@@ -35,7 +35,6 @@ def test_python_geometry_client_attaches_only_to_healthy_runtime(monkeypatch) ->
     client = GeometryRuntimeSubprocess(port=50123)
     monkeypatch.setattr(client, "_is_port_open", lambda: True)
     monkeypatch.setattr(client, "_verify_attached_runtime_locked", lambda: True)
-    monkeypatch.setattr(client, "_warn_if_video_relay_missing", lambda: None)
 
     assert client.start() is True
     assert client.is_running is True

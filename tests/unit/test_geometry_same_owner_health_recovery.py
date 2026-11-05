@@ -17,7 +17,6 @@ def attached(monkeypatch):
         client._last_probed_runtime_generation = source['generation'] if source['healthy'] else None
         return source['healthy']
     monkeypatch.setattr(client, '_verify_attached_runtime_locked', probe)
-    monkeypatch.setattr(client, '_warn_if_video_relay_missing', lambda: None)
     assert client.start()
     return client, source
 

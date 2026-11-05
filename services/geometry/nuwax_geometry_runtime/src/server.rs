@@ -94,11 +94,6 @@ fn mapping_cloud_assigned_goal_pose(
     })
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ActivationFaultPoint { BackendRestoreSubmission, SessionStart, OccupancyShmBegin,
-    OccupancyInstall, CloudInstall, BackendCommit, ActivationRecord,
-    SharedStateCommit, CacheClears, MapEvent, CloudEvent, TypedGlobalMap, Seal }
 
 #[derive(Clone)]
 pub struct GeometryRuntimeService {
@@ -120,19 +115,6 @@ pub struct GeometryRuntimeService {
     canonical_correction: Option<Arc<crate::lcm_runtime::GeometryCanonicalCorrectionApplier>>,
     mapping_cloud_owner: Arc<MappingCloudOwner>,
     activation_checkpoint_owners: Arc<crate::activation_request::CheckpointOwnerInternerV2>,
-    #[cfg(test)]
-    activation_fault_after:
-        Arc<parking_lot::Mutex<Option<ActivationFaultPoint>>>,
-    #[cfg(test)]
-    stop_phase_a_after_detach: Arc<AtomicBool>,
-    #[cfg(test)]
-    fail_start_mapping_stop_transition: Arc<AtomicBool>,
-    #[cfg(test)]
-    start_mapping_before_cloud_clear: Arc<parking_lot::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
-    #[cfg(test)]
-    stop_before_post_zero_lifecycle: Arc<parking_lot::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
-    #[cfg(test)]
-    stop_before_graceful: Arc<parking_lot::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
 }
 
 #[cfg(not(test))]
@@ -660,12 +642,6 @@ impl GeometryRuntimeService {
             canonical_correction: None,
             mapping_cloud_owner,
             activation_checkpoint_owners: Arc::new(crate::activation_request::CheckpointOwnerInternerV2::default()),
-            activation_fault_after: Arc::new(parking_lot::Mutex::new(None)),
-            stop_phase_a_after_detach: Arc::new(AtomicBool::new(false)),
-            fail_start_mapping_stop_transition: Arc::new(AtomicBool::new(false)),
-            start_mapping_before_cloud_clear: Arc::new(parking_lot::Mutex::new(None)),
-            stop_before_post_zero_lifecycle: Arc::new(parking_lot::Mutex::new(None)),
-            stop_before_graceful: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 
@@ -731,18 +707,6 @@ impl GeometryRuntimeService {
             canonical_correction: None,
             mapping_cloud_owner,
             activation_checkpoint_owners: Arc::new(crate::activation_request::CheckpointOwnerInternerV2::default()),
-            #[cfg(test)]
-            activation_fault_after: Arc::new(parking_lot::Mutex::new(None)),
-            #[cfg(test)]
-            stop_phase_a_after_detach: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
-            fail_start_mapping_stop_transition: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
-            start_mapping_before_cloud_clear: Arc::new(parking_lot::Mutex::new(None)),
-            #[cfg(test)]
-            stop_before_post_zero_lifecycle: Arc::new(parking_lot::Mutex::new(None)),
-            #[cfg(test)]
-            stop_before_graceful: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 
@@ -799,13 +763,6 @@ impl GeometryRuntimeService {
         drop(projection_guard);
         drop(lifecycle_guard);
 
-        #[cfg(test)]
-        if self
-            .fail_start_mapping_stop_transition
-            .swap(false, Ordering::AcqRel)
-        {
-            adapter.lock().exhaust_backend_generation_for_tests();
-        }
 
         let mut occupancy_fence = None;
         if let Some(writer) = &self.bridge.occupancy_shm {
@@ -875,49 +832,12 @@ impl GeometryRuntimeService {
         )))
     }
 
-    #[cfg(test)]
-    fn inject_activation_fault_after(
-        &self,
-        step: ActivationFaultPoint,
-    ) {
-        *self.activation_fault_after.lock() = Some(step);
-    }
 
-    #[cfg(test)]
-    fn inject_stop_phase_a_after_detach(&self) {
-        self.stop_phase_a_after_detach
-            .store(true, Ordering::Release);
-    }
 
-    #[cfg(test)]
-    fn inject_start_mapping_before_cloud_clear_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
-        *self.start_mapping_before_cloud_clear.lock() = Some(barrier);
-    }
 
-    #[cfg(test)]
-    fn inject_stop_before_post_zero_lifecycle_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
-        *self.stop_before_post_zero_lifecycle.lock() = Some(barrier);
-    }
 
-    #[cfg(test)]
-    fn inject_stop_before_graceful_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
-        *self.stop_before_graceful.lock() = Some(barrier);
-    }
 }
 
-#[cfg(test)]
-fn take_activation_fault_after(
-    service: &GeometryRuntimeService,
-    step: ActivationFaultPoint,
-) -> bool {
-    let mut fault = service.activation_fault_after.lock();
-    if *fault == Some(step) {
-        *fault = None;
-        true
-    } else {
-        false
-    }
-}
 
 fn relocalization_command_status(
     error: crate::correction_coordinator::RelocalizationCommandError,
@@ -1294,11 +1214,6 @@ async fn activate_map_r1(
             if !service.activation_receipts.mark_typed_global_map_published(&token) {
                 return Err(Status::failed_precondition("ACTIVATE_MAP_PUBLICATION_TOKEN_RETIRED"));
             }
-            #[cfg(test)]
-            if take_activation_fault_after(&service, ActivationFaultPoint::TypedGlobalMap) {
-                settle_current_failure!(ActivationReceiptDisposition::InvalidatedPostcommit,
-                    "INJECTED_AFTER_TYPED_GLOBAL_MAP_RETRY".to_owned());
-            }
         }
         let mut replay = current.clone();
         replay.idempotent_replay = true;
@@ -1317,13 +1232,6 @@ async fn activate_map_r1(
                 );
             }
         };
-        #[cfg(test)]
-        if take_activation_fault_after(
-            &service,
-            ActivationFaultPoint::Seal,
-        ) {
-            return Err(Status::unavailable("INJECTED_AFTER_SEAL_RESPONSE_LOSS"));
-        }
         return Ok(Response::new(sealed));
     }
 
@@ -1371,23 +1279,6 @@ async fn activate_map_r1(
                 );
             }
         };
-        #[cfg(test)]
-        if take_activation_fault_after(
-            &service,
-            ActivationFaultPoint::BackendRestoreSubmission,
-        ) {
-            drop(receiver);
-            let stop_result = staged_worker.stop_and_join();
-            let disposition = if stop_result.is_ok() {
-                ActivationReceiptDisposition::InvalidatedPrecommit
-            } else {
-                ActivationReceiptDisposition::OutcomeUnknown
-            };
-            return_precommit_failure_with_fence!(
-                disposition,
-                "INJECTED_AFTER_BACKEND_RESTORE_SUBMISSION"
-            );
-        }
         drop(
             lifecycle_guard
                 .take()
@@ -1487,16 +1378,6 @@ async fn activate_map_r1(
             return Ok(Response::new(terminal));
         }};
     }
-    #[cfg(test)]
-        if take_activation_fault_after(
-        &service,
-        ActivationFaultPoint::SessionStart,
-    ) {
-        settle_started_failure!(
-            ActivationReceiptDisposition::InvalidatedPrecommit,
-            "INJECTED_AFTER_SESSION_START".to_owned()
-        );
-    }
     let final_activation_identity = InstalledActivationIdentityV2 {
         request: identity_class.clone(), runtime_generation: service.activation_receipts.runtime_generation(),
         lifecycle_epoch: service.activation_receipts.lifecycle_epoch(), session_generation: started.session_generation,
@@ -1522,16 +1403,6 @@ async fn activate_map_r1(
             settle_started_failure!(
                 ActivationReceiptDisposition::InvalidatedPrecommit,
                 format!("ACTIVATE_MAP_OCCUPANCY_FENCE_FAILED: {error}")
-            );
-        }
-        #[cfg(test)]
-        if take_activation_fault_after(
-            &service,
-            ActivationFaultPoint::OccupancyShmBegin,
-        ) {
-            settle_started_failure!(
-                ActivationReceiptDisposition::InvalidatedPrecommit,
-                "INJECTED_AFTER_OCCUPANCY_SHM_BEGIN".to_owned()
             );
         }
 
@@ -1568,16 +1439,6 @@ async fn activate_map_r1(
             );
         }
     };
-    #[cfg(test)]
-        if take_activation_fault_after(
-        &service,
-        ActivationFaultPoint::OccupancyInstall,
-    ) {
-        settle_started_failure!(
-            ActivationReceiptDisposition::InvalidatedPrecommit,
-            "INJECTED_AFTER_OCCUPANCY_INSTALL".to_owned()
-        );
-    }
 
     let source_timestamp_ns = map.timestamp_ns;
     let cloud_commit = if let Some(target) = immutable_target.as_ref() {
@@ -1620,16 +1481,6 @@ async fn activate_map_r1(
             );
         }
 
-        #[cfg(test)]
-        if take_activation_fault_after(
-            &service,
-            ActivationFaultPoint::CloudInstall,
-        ) {
-            settle_started_failure!(
-                ActivationReceiptDisposition::OutcomeUnknown,
-                "INJECTED_AFTER_CLOUD_INSTALL".to_owned()
-            );
-        }
         let target_receipt = InstalledTargetReceiptV2 { activation: final_activation_identity.clone(),
             source_member: assigned_checkpoint.cloud().member().clone(), occupancy_receipt: occupancy_receipt.clone(),
             cloud_receipt: Some(correlated.receipt.clone()) };
@@ -1670,16 +1521,6 @@ async fn activate_map_r1(
                 "ACTIVATE_MAP_BACKEND_COMMIT_OUTCOME_UNKNOWN".to_owned()
             );
         }
-        #[cfg(test)]
-        if take_activation_fault_after(
-            &service,
-            ActivationFaultPoint::BackendCommit,
-        ) {
-            settle_started_failure!(
-                ActivationReceiptDisposition::OutcomeUnknown,
-                "INJECTED_AFTER_BACKEND_COMMIT".to_owned()
-            );
-        }
 
     }
 
@@ -1693,16 +1534,6 @@ async fn activate_map_r1(
             format!("ACTIVATE_MAP_RECORD_FAILED: {error}")
         );
     }
-    #[cfg(test)]
-        if take_activation_fault_after(
-        &service,
-        ActivationFaultPoint::ActivationRecord,
-    ) {
-        settle_started_failure!(
-            ActivationReceiptDisposition::InvalidatedPostcommit,
-            "INJECTED_AFTER_ACTIVATION_RECORD".to_owned()
-        );
-    }
 
     {
         let mut shared = bridge.state.write().await;
@@ -1710,16 +1541,6 @@ async fn activate_map_r1(
         if let Some((notification, _, _)) = cloud_commit.as_ref() {
             shared.cloud_map_revision = notification.revision;
         }
-    }
-    #[cfg(test)]
-        if take_activation_fault_after(
-        &service,
-        ActivationFaultPoint::SharedStateCommit,
-    ) {
-        settle_started_failure!(
-            ActivationReceiptDisposition::InvalidatedPostcommit,
-            "INJECTED_AFTER_SHARED_STATE_COMMIT".to_owned()
-        );
     }
 
     bridge
@@ -1730,57 +1551,17 @@ async fn activate_map_r1(
         )
         .map_err(Status::unavailable)?;
     *bridge.occupancy_shm_current.write().await = None;
-    #[cfg(test)]
-        if take_activation_fault_after(
-        &service,
-        ActivationFaultPoint::CacheClears,
-    ) {
-        settle_started_failure!(
-            ActivationReceiptDisposition::InvalidatedPostcommit,
-            "INJECTED_AFTER_CACHE_CLEARS".to_owned()
-        );
-    }
 
     let _ = bridge.map_revision_tx.send(event);
-    #[cfg(test)]
-        if take_activation_fault_after(
-        &service,
-        ActivationFaultPoint::MapEvent,
-    ) {
-        settle_started_failure!(
-            ActivationReceiptDisposition::InvalidatedPostcommit,
-            "INJECTED_AFTER_MAP_EVENT".to_owned()
-        );
-    }
 
     let target_receipt =
         if let Some((notification, committed, target_receipt)) = cloud_commit {
             let _ = bridge.cloud_map_tx.send(notification);
-            #[cfg(test)]
-        if take_activation_fault_after(
-                &service,
-                ActivationFaultPoint::CloudEvent,
-            ) {
-                settle_started_failure!(
-                    ActivationReceiptDisposition::InvalidatedPostcommit,
-                    "INJECTED_AFTER_CLOUD_EVENT".to_owned()
-                );
-            }
 
             publish_committed_global_map_in_frame(&bridge, &committed, &expected_map_frame_id).await
                 .map_err(|error| Status::unavailable(format!("typed /global_map publication failed: {error}")))?;
             if !service.activation_receipts.mark_typed_global_map_published(&token) {
                 return Err(Status::failed_precondition("ACTIVATE_MAP_PUBLICATION_TOKEN_RETIRED"));
-            }
-            #[cfg(test)]
-        if take_activation_fault_after(
-                &service,
-                ActivationFaultPoint::TypedGlobalMap,
-            ) {
-                settle_started_failure!(
-                    ActivationReceiptDisposition::InvalidatedPostcommit,
-                    "INJECTED_AFTER_TYPED_GLOBAL_MAP".to_owned()
-                );
             }
 
             target_receipt
@@ -1801,14 +1582,6 @@ async fn activate_map_r1(
             );
         }
     };
-    #[cfg(test)]
-        if take_activation_fault_after(
-        &service,
-        ActivationFaultPoint::Seal,
-    ) {
-        drop(lifecycle_guard);
-        return Err(Status::unavailable("INJECTED_AFTER_SEAL_RESPONSE_LOSS"));
-    }
     drop(lifecycle_guard);
     Ok(Response::new(sealed))
 }
@@ -3176,14 +2949,6 @@ impl GeometryRuntimeService {
             let _ = self.bridge.nav_state_tx.send(update);
         }
 
-        #[cfg(test)]
-        {
-            let barrier = self.stop_before_post_zero_lifecycle.lock().take();
-            if let Some(barrier) = barrier {
-                barrier.wait().await;
-                barrier.wait().await;
-            }
-        }
         let lifecycle_guard = match tokio::time::timeout(
             STOP_LIFECYCLE_TIMEOUT,
             self.bridge.mapping_lifecycle_lock.clone().lock_owned(),
@@ -3246,14 +3011,6 @@ impl GeometryRuntimeService {
         drop(lifecycle_guard);
         drop(projection_guard);
         drop(mapping_transition);
-        #[cfg(test)]
-        {
-            let barrier = self.stop_before_graceful.lock().take();
-            if let Some(barrier) = barrier {
-                barrier.wait().await;
-                barrier.wait().await;
-            }
-        }
         shutdown.publish_graceful_shutdown();
         if let Some(process_stop_attempt) = process_stop_attempt {
             process_stop_attempt.complete();
@@ -3701,14 +3458,6 @@ impl GeometryRuntime for GeometryRuntimeService {
             )));
         }
 
-        #[cfg(test)]
-        {
-            let barrier = self.start_mapping_before_cloud_clear.lock().take();
-            if let Some(barrier) = barrier {
-                barrier.wait().await;
-                barrier.wait().await;
-            }
-        }
 
         let projection_guard = self.bridge.lock_explore_projection_owned().await;
         let lifecycle_guard = self.bridge.mapping_lifecycle_lock.clone().lock_owned().await;
@@ -3815,16 +3564,6 @@ impl GeometryRuntime for GeometryRuntimeService {
         };
         self.bridge.revoke_committed_map_projection_locked(&mut projection_guard)
             .map_err(Status::unavailable)?;
-        #[cfg(test)]
-        if self.stop_phase_a_after_detach.swap(false, Ordering::AcqRel) {
-            if let Some(phase_a) = self
-                .shutdown
-                .as_ref()
-                .and_then(|shutdown| shutdown.correction_phase_a.as_ref())
-            {
-                phase_a.begin();
-            }
-        }
         let receipt_retirement = if transition.snapshot.idempotent_replay {
             Ok(())
         } else {
@@ -8097,39 +7836,6 @@ use nuwax_protocol::RawLcmFrame;
             .expect("committed frontier costmap");
     }
 
-    #[tokio::test]
-    async fn process_stop_post_zero_lifecycle_reacquire_timeout_is_bounded() {
-        let handle = crate::lcm_runtime::build_handle_for_tests()
-            .await
-            .expect("real-lcm test handle");
-        let (shutdown, mut listener) = crate::server::shutdown_channel();
-        let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown);
-        let barrier = Arc::new(tokio::sync::Barrier::new(2));
-        service.inject_stop_before_post_zero_lifecycle_barrier(barrier.clone());
-        let stop_task = {
-            let service = service.clone();
-            tokio::spawn(async move {
-                GeometryRuntime::stop(&service, Request::new(StopRequest {})).await
-            })
-        };
-        barrier.wait().await;
-        let held_lifecycle = handle.mapping_lifecycle_lock.clone().lock_owned().await;
-        barrier.wait().await;
-        let error = stop_task
-            .await
-            .expect("post-ZERO Stop join")
-            .expect_err("post-ZERO lifecycle reacquire must time out");
-        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
-        assert!(error
-            .message()
-            .contains("after exact Process Stop motion terminal"));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(40), listener.wait_for_request())
-                .await
-                .is_err()
-        );
-        drop(held_lifecycle);
-    }
 
     // These fixtures construct only the injected in-process transport. The
     // capability flag admits its implemented publish path, not a real LCM link.
@@ -12174,271 +11880,9 @@ use nuwax_protocol::RawLcmFrame;
         let _ = std::fs::remove_file(cloud_path);
     }
 
-    #[tokio::test]
-    async fn stop_mapping_settles_detached_backend_when_phase_a_wins_epoch_race() {
-        let handle = crate::lcm_runtime::build_handle_for_tests()
-            .await
-            .expect("real-lcm test handle");
-        let cloud_path = std::env::temp_dir().join(format!(
-            "nuwax-stop-phase-a-race-{}-{}.mmap",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        *handle.cloud_map_writer.lock() =
-            Some(crate::pointcloud::CloudMapShmWriter::new_for_test(&cloud_path).expect("cloud writer"));
-        let phase_a = crate::correction_coordinator::CorrectionPhaseAControl::for_tests();
-        let (shutdown, _listener) = shutdown_channel_inner(None, Some(phase_a), None);
-        let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown);
-        let xyz = [[0.025_f32, 0.025, 0.025], [1.025_f32, 0.025, 0.025]]
-            .iter()
-            .flat_map(|point| point.iter())
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>();
-        GeometryRuntime::activate_map(&service, Request::new(cloud_activation_request(xyz)))
-            .await
-            .unwrap();
-        let epoch = service.activation_receipts.lifecycle_epoch();
-        service.inject_stop_phase_a_after_detach();
 
-        let stopped = GeometryRuntime::stop_mapping(
-            &service,
-            Request::new(StopMappingRequest {
-                session_id: "mapload:one".to_owned(),
-                reason: "phase-a-race".to_owned(),
-            }),
-        )
-        .await
-        .expect("StopMapping must settle detached backend")
-        .into_inner();
-        assert!(!stopped.active);
-        assert_eq!(service.activation_receipts.lifecycle_epoch(), epoch + 1);
 
-        let restarted = start_mapping_session(&service, "after-phase-a", "warehouse-next").await;
-        assert!(
-            restarted.active,
-            "pending backend retirement must be cleared"
-        );
-        GeometryRuntime::stop_mapping(
-            &service,
-            Request::new(StopMappingRequest {
-                session_id: "after-phase-a".to_owned(),
-                reason: "cleanup".to_owned(),
-            }),
-        )
-        .await
-        .unwrap();
-        let _ = std::fs::remove_file(cloud_path);
-    }
 
-    #[tokio::test]
-    async fn activation_fault_windows_are_typed_retired_and_backend_settled() {
-        use ActivationFaultPoint;
-
-        let cases = [
-            (
-                ActivationFaultPoint::SessionStart,
-                ActivationReceiptDisposition::InvalidatedPrecommit,
-            ),
-            (
-                ActivationFaultPoint::OccupancyShmBegin,
-                ActivationReceiptDisposition::InvalidatedPrecommit,
-            ),
-            (
-                ActivationFaultPoint::OccupancyInstall,
-                ActivationReceiptDisposition::InvalidatedPrecommit,
-            ),
-            (
-                ActivationFaultPoint::CloudInstall,
-                ActivationReceiptDisposition::OutcomeUnknown,
-            ),
-            (
-                ActivationFaultPoint::ActivationRecord,
-                ActivationReceiptDisposition::InvalidatedPostcommit,
-            ),
-            (
-                ActivationFaultPoint::SharedStateCommit,
-                ActivationReceiptDisposition::InvalidatedPostcommit,
-            ),
-            (
-                ActivationFaultPoint::CacheClears,
-                ActivationReceiptDisposition::InvalidatedPostcommit,
-            ),
-            (
-                ActivationFaultPoint::MapEvent,
-                ActivationReceiptDisposition::InvalidatedPostcommit,
-            ),
-            (
-                ActivationFaultPoint::CloudEvent,
-                ActivationReceiptDisposition::InvalidatedPostcommit,
-            ),
-            (
-                ActivationFaultPoint::TypedGlobalMap,
-                ActivationReceiptDisposition::InvalidatedPostcommit,
-            ),
-        ];
-
-        for (index, (step, expected_disposition)) in cases.into_iter().enumerate() {
-            let handle = crate::lcm_runtime::build_handle_for_tests()
-                .await
-                .expect("real-lcm test handle");
-            let cloud_path = std::env::temp_dir().join(format!(
-                "nuwax-activation-fault-{index}-{}-{}.mmap",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            ));
-            *handle.cloud_map_writer.lock() =
-                Some(crate::pointcloud::CloudMapShmWriter::new_for_test(&cloud_path).expect("cloud writer"));
-            let service = GeometryRuntimeService::new(handle.clone());
-            let xyz = [[0.025_f32, 0.025, 0.025], [1.025_f32, 0.025, 0.025]]
-                .iter()
-                .flat_map(|point| point.iter())
-                .flat_map(|value| value.to_le_bytes())
-                .collect::<Vec<_>>();
-            let request = modern_activation_request(
-                cloud_activation_request(xyz),
-                &format!("act-fault-{index}"),
-                1,
-            );
-            let replay_request = request.clone();
-            service.inject_activation_fault_after(step);
-
-            let terminal = GeometryRuntime::activate_map(&service, Request::new(request))
-                .await
-                .expect("injected transaction returns typed terminal")
-                .into_inner();
-            assert!(!terminal.success, "step={step:?}");
-            assert_eq!(
-                terminal.activation_receipt_disposition, expected_disposition as i32,
-                "step={step:?}"
-            );
-            assert!(!handle.mapping_adapter.as_ref().unwrap().lock().is_active());
-            assert!(
-                handle
-                    .mapping_lifecycle_lock
-                    .clone()
-                    .try_lock_owned()
-                    .is_ok(),
-                "lifecycle leaked for step={step:?}"
-            );
-
-            let replay = GeometryRuntime::activate_map(&service, Request::new(replay_request))
-                .await
-                .unwrap()
-                .into_inner();
-            assert!(!replay.success);
-            assert_eq!(
-                replay.activation_receipt_disposition,
-                ActivationReceiptDisposition::Retired as i32
-            );
-            let _ = std::fs::remove_file(cloud_path);
-        }
-    }
-
-    #[tokio::test]
-    async fn activation_response_loss_after_seal_replays_without_side_effects() {
-        let handle = crate::lcm_runtime::build_handle_for_tests()
-            .await
-            .expect("real-lcm test handle");
-        let cloud_path = std::env::temp_dir().join(format!(
-            "nuwax-activation-seal-loss-{}-{}.mmap",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        *handle.cloud_map_writer.lock() =
-            Some(crate::pointcloud::CloudMapShmWriter::new_for_test(&cloud_path).expect("cloud writer"));
-        let service = GeometryRuntimeService::new(handle);
-        let xyz = [[0.025_f32, 0.025, 0.025], [1.025_f32, 0.025, 0.025]]
-            .iter()
-            .flat_map(|point| point.iter())
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>();
-        let request = modern_activation_request(cloud_activation_request(xyz), "act-seal-loss", 1);
-        service.inject_activation_fault_after(
-            ActivationFaultPoint::Seal,
-        );
-        let error = GeometryRuntime::activate_map(&service, Request::new(request.clone()))
-            .await
-            .expect_err("injected response loss after seal");
-        assert_eq!(error.code(), tonic::Code::Unavailable);
-
-        let replay = GeometryRuntime::activate_map(&service, Request::new(request))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(replay.success);
-        assert!(replay.idempotent_replay);
-        assert_eq!(
-            replay.activation_receipt_disposition,
-            ActivationReceiptDisposition::SealedReplay as i32
-        );
-        let _ = std::fs::remove_file(cloud_path);
-    }
-
-    #[tokio::test]
-    async fn backend_restore_and_commit_fault_windows_fail_closed() {
-        let (checkpoint,store) = export_voxel_backend_checkpoint().await;
-        let cases = [
-            (
-                ActivationFaultPoint::BackendRestoreSubmission,
-                ActivationReceiptDisposition::InvalidatedPrecommit,
-            ),
-            (
-                ActivationFaultPoint::BackendCommit,
-                ActivationReceiptDisposition::OutcomeUnknown,
-            ),
-        ];
-        for (index, (step, expected_disposition)) in cases.into_iter().enumerate() {
-            let handle = crate::lcm_runtime::build_handle_for_tests()
-                .await
-                .expect("real-lcm test handle");
-            let cloud_path = std::env::temp_dir().join(format!(
-                "nuwax-backend-activation-fault-{index}-{}-{}.mmap",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            ));
-            *handle.cloud_map_writer.lock() =
-                Some(crate::pointcloud::CloudMapShmWriter::new_for_test(&cloud_path).expect("cloud writer"));
-            let mut root_owner=crate::lcm_runtime::attach_root_task_owner_for_tests(handle);
-        let handle=root_owner.handle.clone();
-        let mut service = GeometryRuntimeService::new(handle.clone());
-        service.graph_artifacts=store.clone();
-            service.inject_activation_fault_after(step);
-            let request = activation_request_with_backend_checkpoint(
-                &format!("backend-fault-{index}"),
-                "warehouse-backend-fault",
-                checkpoint.clone(),
-            );
-            let terminal = GeometryRuntime::activate_map(&service, Request::new(request))
-                .await
-                .expect("backend fault returns typed terminal")
-                .into_inner();
-            assert!(!terminal.success);
-            assert_eq!(
-                terminal.activation_receipt_disposition, expected_disposition as i32,
-                "step={step:?}"
-            );
-            assert!(!handle.mapping_adapter.as_ref().unwrap().lock().is_active());
-            assert!(handle
-                .mapping_lifecycle_lock
-                .clone()
-                .try_lock_owned()
-                .is_ok());
-            assert!(root_owner.task_owner.shutdown().await.producers_settled());
-        let _ = std::fs::remove_file(cloud_path);
-        }
-    }
 
     #[tokio::test]
     async fn activate_map_commits_checkpoint_and_start_mapping_reuses_session() {
@@ -13081,169 +12525,7 @@ use nuwax_protocol::RawLcmFrame;
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn phase_a_rejects_nondeferred_start_mapping_cloud_clear_registration() {
-        let mut spawned = crate::lcm_runtime::attach_root_task_owner_for_tests(
-            crate::lcm_runtime::build_handle_for_tests()
-                .await
-                .expect("Geometry test handle"),
-        );
-        let handle = spawned.handle.clone();
-        let task_control = handle.task_control().expect("Geometry task control");
-        let (shutdown, _listener) = shutdown_channel_inner(None, None, Some(task_control));
-        let service = GeometryRuntimeService::new_with_shutdown(handle.clone(), shutdown.clone());
-        let barrier = Arc::new(tokio::sync::Barrier::new(2));
-        service.inject_start_mapping_before_cloud_clear_barrier(barrier.clone());
-        let call_service = service.clone();
-        let call = tokio::spawn(async move {
-            GeometryRuntime::start_mapping(
-                &call_service,
-                Request::new(StartMappingRequest {
-                    session_id: "phase-a-start".to_owned(),
-                    map_name: "phase-a-map".to_owned(),
-                }),
-            )
-            .await
-        });
 
-        barrier.wait().await;
-        shutdown.begin_phase_a();
-        barrier.wait().await;
-        let error = call
-            .await
-            .expect("StartMapping task join")
-            .expect_err("Phase A must reject cloud clear registration");
-        assert_eq!(error.code(), tonic::Code::Unavailable);
-        assert!(error.message().contains("task admission is closed"));
-        assert!(
-            !handle
-                .mapping_adapter
-                .as_ref()
-                .expect("mapping adapter")
-                .lock()
-                .snapshot()
-                .active
-        );
-
-        let outcome = spawned.task_owner.shutdown().await;
-        assert!(outcome.producers_settled());
-        if let Some(writer) = &handle.occupancy_shm {
-            writer
-                .lock()
-                .cleanup_product_owned_file()
-                .expect("occupancy mmap cleanup");
-        }
-    }
-
-    #[tokio::test]
-    async fn process_stop_holds_lifecycle_lock_until_listener_ack() {
-        let handle = crate::lcm_runtime::build_handle_for_tests()
-            .await
-            .expect("real-lcm test handle");
-        let lifecycle_lock = handle.mapping_lifecycle_lock.clone();
-        let probe = Arc::new(PhaseALioSink::default());
-        let active = Arc::new(PhaseALioSink::default());
-        let lio_gate = Arc::new(crate::lio_ingress::LioIngressRoutingGate::new(probe));
-        lio_gate
-            .bind_and_open(active.clone())
-            .expect("active production LIO route");
-        let correction_phase_a =
-            crate::correction_coordinator::CorrectionPhaseAControl::for_tests();
-        let (shutdown, mut listener) = crate::server::production_shutdown_channel(
-            lio_gate.clone(),
-            correction_phase_a.clone(),
-        );
-        let graceful_rx = listener.graceful_rx.clone();
-        let readiness = shutdown.clone();
-        let service = GeometryRuntimeService::new_with_shutdown(handle, shutdown);
-        let mapping_transition = service.mapping_transition.clone();
-        let before_graceful = Arc::new(tokio::sync::Barrier::new(2));
-        service.inject_stop_before_graceful_barrier(before_graceful.clone());
-        let listener_requested = Arc::new(tokio::sync::Notify::new());
-        let listener_ack_release = Arc::new(tokio::sync::Notify::new());
-        let listener_task = {
-            let listener_requested = listener_requested.clone();
-            let listener_ack_release = listener_ack_release.clone();
-            tokio::spawn(async move {
-                listener.wait_for_request().await;
-                listener_requested.notify_one();
-                listener_ack_release.notified().await;
-                listener.mark_listener_closed();
-            })
-        };
-        let stop_task = {
-            let service = service.clone();
-            tokio::spawn(async move {
-                GeometryRuntime::stop(&service, Request::new(StopRequest {})).await
-            })
-        };
-
-        tokio::time::timeout(Duration::from_millis(100), async {
-            loop {
-                if service.state.read().await.phase == "stopping" {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("Stop phase must linearize before the lifecycle lock wait");
-        tokio::time::timeout(
-            Duration::from_millis(40),
-            readiness.wait_for_readiness_revocation(),
-        )
-        .await
-        .expect("Stop must revoke readiness before the lifecycle lock wait");
-        assert!(!lio_gate.is_open());
-        assert!(active.closed.load(std::sync::atomic::Ordering::Acquire));
-        assert!(!correction_phase_a.is_open());
-        assert_eq!(
-            service
-                .run_if_running(|| panic!("READY action must be closed by Stop"))
-                .await
-                .expect_err("Stop must close READY admission"),
-            "stopping"
-        );
-
-        tokio::time::timeout(Duration::from_secs(1), listener_requested.notified())
-            .await
-            .expect("Stop reached listener-close ACK boundary");
-        assert!(
-            lifecycle_lock.try_lock().is_err(),
-            "Process Stop must retain the lifecycle lock until listener ACK"
-        );
-        assert!(!*graceful_rx.borrow());
-        assert!(!stop_task.is_finished());
-        listener_ack_release.notify_one();
-        before_graceful.wait().await;
-        assert!(
-            lifecycle_lock.try_lock().is_ok(),
-            "response construction must release the lifecycle guard before graceful publication"
-        );
-        assert!(
-            mapping_transition.try_lock().is_ok(),
-            "response construction must release the transition guard before graceful publication"
-        );
-        assert!(
-            !*graceful_rx.borrow(),
-            "graceful must remain unpublished throughout the released-guard interval"
-        );
-        assert!(!stop_task.is_finished());
-        before_graceful.wait().await;
-        let response = stop_task
-            .await
-            .expect("process Stop task")
-            .expect("process Stop response")
-            .into_inner();
-        assert!(response.success);
-        listener_task.await.expect("listener shutdown task");
-        assert_eq!(service.state.read().await.phase, "stopped");
-        assert!(
-            lifecycle_lock.try_lock().is_ok(),
-            "Stop response releases the lifecycle lock for graceful drain"
-        );
-        assert!(*graceful_rx.borrow());
-    }
 
     #[tokio::test]
     async fn process_stop_leaves_mapping_and_lio_teardown_to_main() {

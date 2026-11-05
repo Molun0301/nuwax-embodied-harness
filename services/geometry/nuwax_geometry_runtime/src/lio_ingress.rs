@@ -27,7 +27,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tokio::sync::{watch, Notify};
+use tokio::sync::watch;
 
 const POINT_FIELD_FLOAT32: u8 = 7;
 const XYZ_POINT_STEP: i32 = 12;
@@ -654,7 +654,6 @@ pub(crate) struct CommonLioIngress {
     self_cloud_filter: Result<Option<crate::self_cloud::RobotSelfFilter>, String>,
     state: Mutex<CommonLioIngressState>,
     runtime: Option<CommonLioRuntime>,
-    odometry_admission: Notify,
     // Correction-aware construction binds the one fence whose epoch must be
     // captured when a source frame receives its immutable registration permit.
     relocalization_mode_fence:
@@ -846,7 +845,6 @@ impl CommonLioIngress {
             sensor_origin_body: None,
             self_cloud_filter,
             runtime: None,
-            odometry_admission: Notify::new(),
             relocalization_mode_fence: OnceLock::new(),
         }
     }
@@ -870,7 +868,6 @@ impl CommonLioIngress {
                 public_cloud,
                 tf,
             }),
-            odometry_admission: Notify::new(),
             relocalization_mode_fence: OnceLock::new(),
         }
     }
@@ -1098,38 +1095,12 @@ impl CommonLioIngress {
         }
         state.latest_adapter_timestamp_ns = Some(adapter_timestamp_ns);
         drop(state);
-        self.odometry_admission.notify_waiters();
         Ok(AcceptedOdometry {
             envelope,
             adapter_timestamp_ns,
         })
     }
 
-    pub(crate) async fn wait_for_public_odometry(
-        &self,
-        identity: CorrelatedOdometry,
-        shutdown_rx: &mut watch::Receiver<bool>,
-    ) -> bool {
-        loop {
-            if *shutdown_rx.borrow() {
-                return false;
-            }
-            let notified = self.odometry_admission.notified();
-            if self
-                .state
-                .lock()
-                .accepted_odometry_identities
-                .contains(&identity)
-            {
-                return true;
-            }
-            tokio::select! {
-                biased;
-                _ = shutdown_rx.changed() => return false,
-                _ = notified => {}
-            }
-        }
-    }
 
     #[cfg(test)]
     pub(crate) fn register_cloud(
@@ -1752,14 +1723,7 @@ impl NativeLioIngress {
             source_sequence: pair.odometry.identity.source_sequence,
             source_timestamp_ns: pair.odometry.identity.source_timestamp_ns,
         };
-        let odometry_admitted = tokio::time::timeout(
-            LIO_GENERATED_PUBLISH_TIMEOUT,
-            self.common
-                .wait_for_public_odometry(correlated_odometry, shutdown_rx),
-        )
-        .await
-        .map_err(|_| "native LIO public odometry admission timed out".to_string())?;
-        if !odometry_admitted {
+        if *shutdown_rx.borrow() {
             return Ok(());
         }
 
@@ -1806,6 +1770,51 @@ impl NativeLioIngress {
         publish_result
     }
 
+}
+
+impl NativeLioIngress {
+    async fn accept_source_odometry(
+        &self,
+        frame: RawLcmFrame,
+        shutdown_rx: &mut watch::Receiver<bool>,
+        correction: Option<&GeometryCanonicalCorrectionApplier>,
+    ) -> Result<(), String> {
+        let odometry = decode_body(
+            nuwax_codec::lcm::schema::ODOMETRY_FINGERPRINT,
+            &frame.payload,
+            nuwax_codec::lcm::schema::decode_odometry,
+        )?;
+        let source_timestamp_ns = header_timestamp_ns(&odometry.header)?;
+        let envelope = self
+            .common
+            .prepare_legacy_odometry(source_timestamp_ns, odometry)
+            .map_err(|error| error.to_string())?;
+        let identity = SourceIdentity::from_odometry(&envelope);
+        let sample = NativeOdometrySample {
+            identity,
+            odometry: envelope.odometry.clone(),
+        };
+        if self.common.runtime.is_some() {
+            self.common.handoff_odometry_envelope(envelope.clone(), shutdown_rx, correction).await?;
+        }
+        let publication = if let Some(runtime) = self.common.runtime.as_ref() {
+            let encoded =
+                encode_lio_odometry_envelope(&envelope).map_err(|error| error.to_string())?;
+            publish_generated_body(
+                &runtime.handle,
+                &runtime.public_odometry,
+                envelope.source_sequence,
+                encoded,
+            )
+            .await
+        } else {
+            Ok(())
+        };
+        if let Some(pair) = self.insert_odometry(sample) {
+            self.process_pair(pair, shutdown_rx).await?;
+        }
+        publication
+    }
 }
 
 #[async_trait]
@@ -1873,40 +1882,9 @@ impl LioIngressSink for NativeLioIngress {
     }
 
     async fn accept_legacy_odometry(
-        &self,
-        frame: RawLcmFrame,
-        shutdown_rx: &mut watch::Receiver<bool>,
+        &self, frame: RawLcmFrame, shutdown_rx: &mut watch::Receiver<bool>,
     ) -> Result<(), String> {
-        let odometry = decode_body(
-            nuwax_codec::lcm::schema::ODOMETRY_FINGERPRINT,
-            &frame.payload,
-            nuwax_codec::lcm::schema::decode_odometry,
-        )?;
-        let source_timestamp_ns = header_timestamp_ns(&odometry.header)?;
-        let envelope = self
-            .common
-            .prepare_legacy_odometry(source_timestamp_ns, odometry)
-            .map_err(|error| error.to_string())?;
-        let identity = SourceIdentity::from_odometry(&envelope);
-        let sample = NativeOdometrySample {
-            identity,
-            odometry: envelope.odometry.clone(),
-        };
-        if let Some(runtime) = self.common.runtime.as_ref() {
-            let encoded =
-                encode_lio_odometry_envelope(&envelope).map_err(|error| error.to_string())?;
-            publish_generated_body(
-                &runtime.handle,
-                &runtime.public_odometry,
-                envelope.source_sequence,
-                encoded,
-            )
-            .await?;
-        }
-        if let Some(pair) = self.insert_odometry(sample) {
-            self.process_pair(pair, shutdown_rx).await?;
-        }
-        Ok(())
+        self.accept_source_odometry(frame, shutdown_rx, None).await
     }
 
     async fn accept_legacy_cloud(
@@ -2109,23 +2087,14 @@ impl SourceIdentity {
     }
 }
 
-#[async_trait]
-impl LioIngressSink for CommonLioIngress {
-    fn close(&self) {
-        CommonLioIngress::close(self);
-    }
-
-    async fn accept_public_odometry(
+impl CommonLioIngress {
+    async fn handoff_odometry_envelope(
         &self,
-        frame: RawLcmFrame,
+        envelope: LioOdometryEnvelope,
         shutdown_rx: &mut watch::Receiver<bool>,
+        correction: Option<&GeometryCanonicalCorrectionApplier>,
     ) -> Result<(), String> {
         let runtime = self.runtime.as_ref().ok_or_else(runtime_not_bound)?;
-        let envelope = decode_body(
-            nuwax_codec::lcm::lio::LIO_ODOMETRY_ENVELOPE_FINGERPRINT_V1,
-            &frame.payload,
-            nuwax_codec::lcm::lio::decode_lio_odometry_envelope,
-        )?;
         let Some(_lifecycle_guard) = mapping_admission_guard(runtime, shutdown_rx).await else {
             return Ok(());
         };
@@ -2144,13 +2113,14 @@ impl LioIngressSink for CommonLioIngress {
             timestamp_ns: u64::try_from(accepted.envelope.source_timestamp_ns)
                 .map_err(|_| "source timestamp is negative".to_string())?,
         };
-        let committed = handoff_lio_odometry(
-            &runtime.handle,
-            &pose,
-            &accepted.envelope.body_frame_id,
-            &runtime.tf,
-        )
-        .await?;
+        let committed = match correction {
+            Some(correction) => handoff_lio_odometry_with_correction(
+                &runtime.handle, &pose, &accepted.envelope.body_frame_id, &runtime.tf, correction,
+            ).await?,
+            None => handoff_lio_odometry(
+                &runtime.handle, &pose, &accepted.envelope.body_frame_id, &runtime.tf,
+            ).await?,
+        };
         if !committed {
             tracing::debug!(
                 event = "lio.odometry.waiting_for_mapping",
@@ -2161,6 +2131,26 @@ impl LioIngressSink for CommonLioIngress {
             );
         }
         Ok(())
+    }
+}
+
+#[async_trait]
+impl LioIngressSink for CommonLioIngress {
+    fn close(&self) {
+        CommonLioIngress::close(self);
+    }
+
+    async fn accept_public_odometry(
+        &self,
+        frame: RawLcmFrame,
+        shutdown_rx: &mut watch::Receiver<bool>,
+    ) -> Result<(), String> {
+        let envelope = decode_body(
+            nuwax_codec::lcm::lio::LIO_ODOMETRY_ENVELOPE_FINGERPRINT_V1,
+            &frame.payload,
+            nuwax_codec::lcm::lio::decode_lio_odometry_envelope,
+        )?;
+        self.handoff_odometry_envelope(envelope, shutdown_rx, None).await
     }
 
     async fn accept_public_cloud(
@@ -2366,7 +2356,7 @@ impl LioIngressSink for CorrectionAwareLioIngress {
                 LioIngressSink::accept_legacy_odometry(inner.as_ref(), frame, shutdown_rx).await
             }
             CorrectionAwareLioIngressInner::Native(inner) => {
-                LioIngressSink::accept_legacy_odometry(inner.as_ref(), frame, shutdown_rx).await
+                inner.accept_source_odometry(frame, shutdown_rx, Some(self.correction_applier.as_ref())).await
             }
         }
     }
@@ -2471,48 +2461,12 @@ async fn accept_public_odometry_with_correction(
     shutdown_rx: &mut watch::Receiver<bool>,
     correction: &GeometryCanonicalCorrectionApplier,
 ) -> Result<(), String> {
-    let runtime = ingress.runtime.as_ref().ok_or_else(runtime_not_bound)?;
     let envelope = decode_body(
         nuwax_codec::lcm::lio::LIO_ODOMETRY_ENVELOPE_FINGERPRINT_V1,
         &frame.payload,
         nuwax_codec::lcm::lio::decode_lio_odometry_envelope,
     )?;
-    let Some(_lifecycle_guard) = mapping_admission_guard(runtime, shutdown_rx).await else {
-        return Ok(());
-    };
-    let accepted = CommonLioIngress::accept_public_odometry(ingress, envelope, wall_clock_ns()?)
-        .map_err(|error| error.to_string())?;
-    let odometry = &accepted.envelope.odometry;
-    let pose = PoseState {
-        x: odometry.pose.position[0],
-        y: odometry.pose.position[1],
-        z: odometry.pose.position[2],
-        qx: odometry.pose.orientation_xyzw[0],
-        qy: odometry.pose.orientation_xyzw[1],
-        qz: odometry.pose.orientation_xyzw[2],
-        qw: odometry.pose.orientation_xyzw[3],
-        frame_id: accepted.envelope.odom_frame_id.clone(),
-        timestamp_ns: u64::try_from(accepted.envelope.source_timestamp_ns)
-            .map_err(|_| "source timestamp is negative".to_owned())?,
-    };
-    let committed = handoff_lio_odometry_with_correction(
-        &runtime.handle,
-        &pose,
-        &accepted.envelope.body_frame_id,
-        &runtime.tf,
-        correction,
-    )
-    .await?;
-    if !committed {
-        tracing::debug!(
-            event = "lio.odometry.waiting_for_mapping",
-            reason = "mapping_session_inactive",
-            source_sequence = accepted.envelope.source_sequence,
-            source_timestamp_ns = accepted.envelope.source_timestamp_ns,
-            "实时里程计等待活跃建图会话"
-        );
-    }
-    Ok(())
+    ingress.handoff_odometry_envelope(envelope, shutdown_rx, Some(correction)).await
 }
 
 async fn accept_public_cloud_with_correction(
@@ -5145,6 +5099,68 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn native_odometry_reaches_handoff_without_public_lcm_loop() {
+        for (backend_id, with_correction) in [LIO_BACKEND_FASTLIO2, LIO_BACKEND_POINTLIO]
+            .into_iter().flat_map(|id| [(id, false), (id, true)]) {
+            let mut handle = crate::lcm_runtime::build_handle_for_tests().await.unwrap();
+            let backend = RecordingBackend::default();
+            handle.transport = LcmTransport::new(Arc::new(backend.clone()));
+            let mapping = Arc::new(Mutex::new(active_adapter("map")));
+            handle.mapping_adapter = Some(mapping.clone());
+            let public_odometry = binding("/test/direct/odom", "nuwax_msgs.LioOdometryEnvelope");
+            let ingress = NativeLioIngress::with_runtime(
+                DeviceLioIngressSpec::new_for_backend(
+                    backend_id, 7, "lidar", "base_link", "odom", "map",
+                ).unwrap(),
+                handle.clone(), public_odometry.clone(),
+                binding("/test/direct/cloud", "nuwax_msgs.LioCloudEnvelope"),
+                binding("/test/direct/tf", "tf2_msgs.TFMessage"),
+                BodyFromSensorTransform::from_json(
+                    r#"{"translation_m":[0,0,0],"rotation_row_major":[1,0,0,0,1,0,0,0,1]}"#,
+                ).unwrap(),
+                Duration::from_millis(1),
+            ).unwrap();
+            let correction = GeometryCanonicalCorrectionApplier::new(
+                crate::correction_coordinator::CorrectionOwnerRuntimeIdentity {
+                    runtime_generation: 7, backend_generation: 7,
+                    correction_lease: crate::correction_coordinator::CorrectionLeaseId {
+                        boot_nonce: 42, generation: 7,
+                    },
+                },
+                "map", "odom", "base_link", handle.state.clone(), handle.transport.clone(),
+                binding("/test/direct/tf", "tf2_msgs.TFMessage"),
+            ).unwrap();
+            let mut odometry = valid_odometry();
+            odometry.pose.position = [1.0, 2.0, 0.0];
+            let raw_binding = binding("/test/direct/source", "nav_msgs.Odometry");
+            let frame = crate::typed_codec::build_typed_frame(
+                raw_binding.0, raw_binding.1,
+                nuwax_codec::lcm::schema::encode_odometry_body(&odometry).unwrap(), 1,
+            );
+            let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+            // 记录后端只收集输出，不回送任何公共消息。
+            if with_correction {
+                ingress.accept_source_odometry(frame, &mut shutdown_rx, Some(&correction)).await.unwrap();
+            } else {
+                LioIngressSink::accept_legacy_odometry(&ingress, frame, &mut shutdown_rx).await.unwrap();
+            }
+            assert_eq!(mapping.lock().odom_count(), 2);
+            let pose = handle.state.read().await.pose.clone();
+            // 夹具已把里程计 [1, 2, 0] 设为地图原点；公共输出仍保存原里程计坐标。
+            assert_eq!((pose.x, pose.y, pose.z), (0.0, 0.0, 0.0));
+            let frames = backend.published.lock().unwrap();
+            let public = frames.iter().find(|frame| frame.topic == public_odometry.0).unwrap();
+            let mut encoded = nuwax_codec::lcm::lio::LIO_ODOMETRY_ENVELOPE_FINGERPRINT_V1.to_vec();
+            encoded.extend_from_slice(&public.payload);
+            let envelope = nuwax_codec::lcm::lio::decode_lio_odometry_envelope(&encoded).unwrap();
+            assert_eq!(envelope.backend, backend_id);
+            assert_eq!(envelope.runtime_generation, 7);
+            assert_eq!(envelope.source_sequence, 1);
+            assert_eq!(envelope.odometry.pose.position, [1.0, 2.0, 0.0]);
+        }
+    }
+
     #[test]
     fn native_pairing_is_order_independent() {
         let make_ingress = || {
@@ -5964,7 +5980,7 @@ mod tests {
         ingress
             .process_pair(pair, &mut pair_shutdown_rx)
             .await
-            .expect("valid pair reaches READY before stopped public admission");
+            .expect("有效配对先标记就绪，停止状态不进入运行时交接");
         tokio::time::timeout(Duration::from_secs(1), waiter)
             .await
             .expect("READY wait timeout")

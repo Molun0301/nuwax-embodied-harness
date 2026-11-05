@@ -44,12 +44,10 @@ const DEFAULT_CLOUD_MAP_SHM_PATH: &str = "/tmp/nuwax_cloudmap.mmap";
 const DEFAULT_OCCUPANCY_SHM_PATH: &str = "/tmp/nuwax_occupancy.mmap";
 const PRODUCTION_LCM_PROVIDER: &str = "udpm://239.255.76.67:7667?ttl=1";
 const INVALID_PREFLIGHT_LCM_PROVIDER: &str = "invalid://preflight-must-win";
-const SIDE_EFFECT_ARTIFACTS: [&str; 7] = [
+const SIDE_EFFECT_ARTIFACTS: [&str; 5] = [
     "geometry.ready",
     "sequence-state.json",
     "exploration-ownership-journal.json",
-    "video.shm",
-    "video.sock",
     "occupancy.mmap",
     "cloud-map.mmap",
 ];
@@ -618,8 +616,6 @@ fn runtime_command(backend: &str, probe: &ProbeDir) -> Command {
             "NUWAX_GEOMETRY_EXPLORATION_RECONCILIATION_JOURNAL_PATH",
             probe.path().join("exploration-ownership-journal.json"),
         )
-        .env("NUWAX_VIDEO_SHM_PATH", probe.path().join("video.shm"))
-        .env("NUWAX_VIDEO_UDS_PATH", probe.path().join("video.sock"))
         .env(
             "NUWAX_OCCUPANCY_SHM_PATH",
             probe.path().join("occupancy.mmap"),
@@ -781,9 +777,7 @@ fn wait_for_startup_artifacts(
         let required_artifacts_ready = ready_file_matches
             && probe.path().join("sequence-state.json").exists()
             && probe.path().join("cloud-map.mmap").exists()
-            && probe.path().join("occupancy.mmap").exists()
-            && probe.path().join("video.shm").exists()
-            && probe.path().join("video.sock").exists();
+            && probe.path().join("occupancy.mmap").exists();
         if required_artifacts_ready {
             return Ok(());
         }
@@ -1319,133 +1313,7 @@ fn real_lcm_backend_passes_preflight_and_enters_runtime_startup() {
     );
 }
 
-#[cfg(target_os = "linux")]
-#[test]
-fn video_helper_failure_revokes_ready_and_stops_runtime() {
-    let scenario = "video-helper-terminal";
-    let probe = ProbeDir::new(scenario);
-    let ready_path = probe.path().join("geometry.ready");
-    let video_shm_path = probe.path().join("video.shm");
-    let video_uds_path = probe.path().join("video.sock");
-    let mut child = ChildGuard::new(
-        runtime_command("real-lcm", &probe)
-            .spawn()
-            .expect("spawn geometry runtime for video terminal probe"),
-    );
 
-    if let Err(reason) =
-        wait_for_startup_artifacts(child.child_mut(), &probe, &ready_path, EXIT_TIMEOUT)
-    {
-        let output = child.terminate_and_collect();
-        panic!(
-            "{scenario}: runtime did not become ready; reason={reason}, stdout={}, stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    let helper_pid = wait_for_video_relay_helper(child.child_mut().id(), scenario);
-    let signal_status = Command::new("kill")
-        .arg("-KILL")
-        .arg(helper_pid.to_string())
-        .status()
-        .expect("SIGKILL video relay helper");
-    assert!(signal_status.success(), "{scenario}: SIGKILL failed");
-
-    if wait_until(child.child_mut(), Duration::from_secs(8)).is_none() {
-        let output = child.terminate_and_collect();
-        panic!(
-            "{scenario}: runtime remained alive after video terminal; stdout={}, stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let output = child.collect();
-    assert_eq!(
-        output.status.code(),
-        Some(7),
-        "{scenario}: stdout={}, stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(!ready_path.exists(), "{scenario}: ready file remained");
-    assert!(!video_shm_path.exists(), "{scenario}: video SHM remained");
-    assert!(!video_uds_path.exists(), "{scenario}: video UDS remained");
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn video_helper_failure_before_ready_stops_runtime_without_publication() {
-    let scenario = "video-helper-pre-ready-terminal";
-    let probe = ProbeDir::new(scenario);
-    let ready_path = probe.path().join("geometry.ready");
-    let video_shm_path = probe.path().join("video.shm");
-    let video_uds_path = probe.path().join("video.sock");
-    let mut child = ChildGuard::new(
-        runtime_command("real-lcm", &probe)
-            .spawn()
-            .expect("spawn geometry runtime for pre-ready video terminal probe"),
-    );
-    let geometry_pid = child.child_mut().id();
-    let geometry_pid =
-        nix::unistd::Pid::from_raw(i32::try_from(geometry_pid).expect("geometry pid fits pid_t"));
-    nix::sys::signal::kill(geometry_pid, nix::sys::signal::Signal::SIGSTOP)
-        .expect("initial SIGSTOP geometry runtime");
-
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let helper_pid = loop {
-        assert!(
-            !ready_path.exists(),
-            "{scenario}: ready was published before video terminal injection"
-        );
-        let helpers = direct_child_pids(u32::try_from(geometry_pid.as_raw()).unwrap())
-            .into_iter()
-            .filter(|pid| is_video_relay_helper(*pid))
-            .collect::<Vec<_>>();
-        match helpers.as_slice() {
-            [pid] => break *pid,
-            [] => {}
-            _ => panic!("{scenario}: expected one video relay helper, got {helpers:?}"),
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{scenario}: video relay helper did not start before deadline"
-        );
-        nix::sys::signal::kill(geometry_pid, nix::sys::signal::Signal::SIGCONT)
-            .expect("SIGCONT geometry startup slice");
-        std::thread::sleep(Duration::from_micros(500));
-        nix::sys::signal::kill(geometry_pid, nix::sys::signal::Signal::SIGSTOP)
-            .expect("SIGSTOP geometry startup slice");
-    };
-
-    nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(i32::try_from(helper_pid).expect("helper pid fits pid_t")),
-        nix::sys::signal::Signal::SIGKILL,
-    )
-    .expect("SIGKILL pre-ready video relay helper");
-    nix::sys::signal::kill(geometry_pid, nix::sys::signal::Signal::SIGCONT)
-        .expect("resume geometry after video terminal injection");
-
-    if wait_until(child.child_mut(), Duration::from_secs(8)).is_none() {
-        let output = child.terminate_and_collect();
-        panic!(
-            "{scenario}: runtime remained alive after pre-ready video terminal; stdout={}, stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let output = child.collect();
-    assert_eq!(
-        output.status.code(),
-        Some(3),
-        "{scenario}: stdout={}, stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(!ready_path.exists(), "{scenario}: ready file appeared");
-    assert!(!video_shm_path.exists(), "{scenario}: video SHM remained");
-    assert!(!video_uds_path.exists(), "{scenario}: video UDS remained");
-}
 
 #[cfg(feature = "nuwax-lio-test-child")]
 fn wait_for_file_contents(path: &Path, timeout: Duration) -> Result<String, String> {
@@ -1885,46 +1753,8 @@ fn direct_child_pids(parent_pid: u32) -> Vec<u32> {
         .unwrap_or_else(|error| panic!("observe direct children of pid={parent_pid}: {error}"))
 }
 
-#[cfg(target_os = "linux")]
-fn process_has_environment_key(pid: u32, key: &str) -> bool {
-    let path = format!("/proc/{pid}/environ");
-    let environment = match fs::read(&path) {
-        Ok(environment) => environment,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
-        Err(error) => panic!("read {path}: {error}"),
-    };
-    environment.split(|byte| *byte == 0).any(|entry| {
-        entry
-            .strip_prefix(key.as_bytes())
-            .is_some_and(|suffix| suffix.first() == Some(&b'='))
-    })
-}
 
-#[cfg(target_os = "linux")]
-fn is_video_relay_helper(pid: u32) -> bool {
-    process_has_environment_key(pid, "NUWAX_VIDEO_RELAY_HELPER_REQUEST_V1")
-}
 
-#[cfg(target_os = "linux")]
-fn wait_for_video_relay_helper(parent_pid: u32, scenario: &str) -> u32 {
-    let deadline = Instant::now() + EXIT_TIMEOUT;
-    loop {
-        let helpers = direct_child_pids(parent_pid)
-            .into_iter()
-            .filter(|pid| is_video_relay_helper(*pid))
-            .collect::<Vec<_>>();
-        match helpers.as_slice() {
-            [pid] => return *pid,
-            [] => {}
-            _ => panic!("{scenario}: expected one video relay helper, got {helpers:?}"),
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{scenario}: video relay helper did not start"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
 
 #[cfg(all(feature = "nuwax-lio-test-child", target_os = "linux"))]
 fn observe_process_start_time(pid: u32) -> Result<Option<u64>, String> {
@@ -2110,22 +1940,13 @@ fn wait_for_native_pgo_child(
                     == Some(std::ffi::OsStr::new("nuwax-group-guardian"))
             })
             .collect::<Vec<_>>();
-        let video_helpers = candidates
-            .iter()
-            .copied()
-            .filter(|pid| is_video_relay_helper(*pid))
-            .collect::<Vec<_>>();
-        match (
-            native.as_slice(),
-            guardians.as_slice(),
-            video_helpers.as_slice(),
-        ) {
-            ([pid], [guardian_pid], [video_pid]) => {
+        match (native.as_slice(), guardians.as_slice()) {
+            ([pid], [guardian_pid]) => {
                 let start_time = process_start_time(*pid)
                     .unwrap_or_else(|| panic!("{scenario}: native PGO child disappeared"));
                 let guardian_start_time = process_start_time(*guardian_pid)
                     .unwrap_or_else(|| panic!("{scenario}: native PGO guardian disappeared"));
-                let mut expected_children = vec![native_lio_pid, *pid, *guardian_pid, *video_pid];
+                let mut expected_children = vec![native_lio_pid, *pid, *guardian_pid];
                 expected_children.sort_unstable();
                 assert_eq!(
                     children, expected_children,
@@ -2133,12 +1954,7 @@ fn wait_for_native_pgo_child(
                 );
                 return (*pid, start_time, *guardian_pid, guardian_start_time);
             }
-            ([], [], [])
-            | ([], [], [_])
-            | ([], [_], [])
-            | ([], [_], [_])
-            | ([_], [], [])
-            | ([_], [], [_]) => {}
+            ([], []) | ([], [_]) | ([_], []) => {}
             _ => {
                 let observed = candidates
                     .iter()
@@ -2187,7 +2003,7 @@ fn wait_for_mapping_sidecar(parent_pid: u32, native_lio_pid: u32, scenario: &str
     loop {
         let candidates = direct_child_pids(parent_pid)
             .into_iter()
-            .filter(|pid| *pid != native_lio_pid && !is_video_relay_helper(*pid))
+            .filter(|pid| *pid != native_lio_pid)
             .collect::<Vec<_>>();
         match candidates.as_slice() {
             [sidecar_pid] => {
@@ -7997,8 +7813,6 @@ fn finish_matrix_cycle(
     }
     for artifact in [
         "geometry.ready",
-        "video.shm",
-        "video.sock",
         "occupancy.mmap",
         "cloud-map.mmap",
     ] {

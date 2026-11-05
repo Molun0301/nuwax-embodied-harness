@@ -114,6 +114,7 @@ pub struct MapSnapshot {
     pub occupancy: Option<proto::OccupancyGrid>,
     pub backend_checkpoint: Vec<u8>,
     pub planar_checkpoint: Option<Vec<u8>>,
+    pub planar_resume_unavailable_reason: Option<String>,
     pub map_from_odom: [f64; 16],
     pub last_pose: Option<proto::Pose>,
     pub(crate) cloud: crate::pointcloud::CloudSnapshot,
@@ -462,6 +463,7 @@ struct Worker {
     raw_grid: watch::Sender<Option<proto::OccupancyGrid>>,
     grid_stamp: u64,
     latest_odometry: Option<proto::Pose>,
+    planar_resume_unavailable_reason: Option<String>,
 }
 impl Worker {
     fn new(
@@ -554,6 +556,9 @@ impl Worker {
                         pose.timestamp_ns,
                     )
                 }),
+            planar_resume_unavailable_reason: snapshot
+                .as_ref()
+                .and_then(|saved| saved.planar_resume_unavailable_reason.clone()),
             grid_stamp: snapshot
                 .as_ref()
                 .and_then(|s| s.occupancy.as_ref())
@@ -915,6 +920,7 @@ impl Worker {
                 .transpose()?
                 .unwrap_or_default(),
             planar_checkpoint: None,
+            planar_resume_unavailable_reason: self.planar_resume_unavailable_reason.clone(),
             map_from_odom: isometry_matrix(&self.map_from_odom),
             last_pose: self.poses.borrow().clone(),
             cloud: self.cloud.snapshot(),

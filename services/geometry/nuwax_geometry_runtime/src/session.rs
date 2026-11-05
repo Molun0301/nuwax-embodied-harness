@@ -118,6 +118,7 @@ pub struct SessionHandle {
     lio: watch::Receiver<Option<Arc<Lio>>>,
     faults: mpsc::UnboundedSender<(u64, String)>,
 }
+const PLANAR_RESUME_UNAVAILABLE: &str = "无完整二维 SLAM 图，不能用于二维续建";
 type Reply<T> = oneshot::Sender<Result<T, Status>>;
 enum Command {
     Start(StartMappingRequest, Reply<GeometryState>),
@@ -529,12 +530,21 @@ impl Session {
             return Ok(());
         }
         let continued = if request.continue_saved {
+            let exists = self.store.exists(&request.map_name);
+            if exists && self.state.info.as_ref().unwrap().pipeline == "slam_2d" {
+                if let Some(reason) = self
+                    .store
+                    .planar_resume_unavailable_reason(&request.map_name)?
+                {
+                    return Err(Status::failed_precondition(reason));
+                }
+            }
             if self.config.correction_backend == "library_pgo"
                 || self.config.correction_backend == "native_pgo"
             {
                 return Err(Status::failed_precondition("PGO 配置不支持续建"));
             }
-            if !self.store.exists(&request.map_name) {
+            if !exists {
                 return Err(Status::not_found("地图不存在"));
             }
             if self.phase() != SessionPhase::Localized || self.state.map_name != request.map_name {
@@ -654,9 +664,16 @@ impl Session {
         };
         let mapper = self.mapper()?;
         let mut snapshot = self.subsystem(mapper.snapshot().await).await?;
-        let lio = self.lio.borrow().clone();
-        if let Some(lio) = lio {
-            snapshot.planar_checkpoint = self.subsystem(lio.planar_checkpoint().await).await?;
+        if self.phase() == SessionPhase::Fault
+            && self.state.info.as_ref().unwrap().pipeline == "slam_2d"
+        {
+            snapshot.planar_checkpoint = None;
+            snapshot.planar_resume_unavailable_reason = Some(PLANAR_RESUME_UNAVAILABLE.into());
+        } else {
+            let lio = self.lio.borrow().clone();
+            if let Some(lio) = lio {
+                snapshot.planar_checkpoint = self.subsystem(lio.planar_checkpoint().await).await?;
+            }
         }
         let store = self.store.clone();
         let source = self.save_sources.contains(&name).then(|| name.clone());

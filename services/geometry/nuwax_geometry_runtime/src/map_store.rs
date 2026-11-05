@@ -22,6 +22,8 @@ struct Descriptor {
     occupancy: bool,
     backend: bool,
     planar: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    planar_resume_unavailable_reason: Option<String>,
     fine: bool,
     dense: bool,
     scans: usize,
@@ -177,6 +179,7 @@ impl MapStore {
             occupancy: snapshot.occupancy.is_some(),
             backend: !snapshot.backend_checkpoint.is_empty(),
             planar: snapshot.planar_checkpoint.is_some(),
+            planar_resume_unavailable_reason: snapshot.planar_resume_unavailable_reason.clone(),
             fine,
             dense: snapshot.cloud.dense.is_some(),
             scans: snapshot.scans.len(),
@@ -190,13 +193,21 @@ impl MapStore {
             &serde_json::to_vec(&descriptor).map_err(|e| Status::internal(e.to_string()))?,
         )
     }
-    pub fn load(&self, name: &str) -> Result<MapSnapshot, Status> {
+    fn read_descriptor(&self, name: &str) -> Result<Descriptor, Status> {
         let path = self.root.join(name).join("geometry");
         if !path.exists() {
             return Err(Status::not_found(format!("地图不存在：{name}")));
         }
-        let descriptor: Descriptor = serde_json::from_slice(&read_file(&path.join("map.json"))?)
-            .map_err(|e| data_error(&path.join("map.json"), e))?;
+        serde_json::from_slice(&read_file(&path.join("map.json"))?)
+            .map_err(|e| data_error(&path.join("map.json"), e))
+    }
+    pub fn planar_resume_unavailable_reason(&self, name: &str) -> Result<Option<String>, Status> {
+        self.read_descriptor(name)
+            .map(|saved| saved.planar_resume_unavailable_reason)
+    }
+    pub fn load(&self, name: &str) -> Result<MapSnapshot, Status> {
+        let path = self.root.join(name).join("geometry");
+        let descriptor = self.read_descriptor(name)?;
         let occupancy = if descriptor.occupancy {
             Some(
                 crate::proto::OccupancyGrid::decode(
@@ -307,6 +318,7 @@ impl MapStore {
             occupancy,
             backend_checkpoint,
             planar_checkpoint,
+            planar_resume_unavailable_reason: descriptor.planar_resume_unavailable_reason,
             map_from_odom: descriptor.map_from_odom,
             last_pose,
             cloud: CloudSnapshot {

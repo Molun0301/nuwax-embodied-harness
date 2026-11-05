@@ -52,6 +52,7 @@ service GeometryRuntime {
   // continue_saved=false：新建空图 map_name；目录下已有 geometry/ → ALREADY_EXISTS。
   // continue_saved=true：在已保存地图 map_name 上续建；要求当前为“已定位”且已加载的就是 map_name，
   //   否则 FAILED_PRECONDITION；地图不存在 → NOT_FOUND。
+  // 二维故障保存的地图若标明无完整 SLAM 图 → FAILED_PRECONDITION（原因写明不能用于二维续建）。
   // 当前已在建同名地图（建图中/探索中，map_name 相同）→ 不做任何事，直接返回当前状态。
   // 其它任何状态：先结束当前状态（取消导航目标、结束探索、丢弃未保存的建图），再开始。
   // 成功后阶段 = 建图中。
@@ -62,7 +63,9 @@ service GeometryRuntime {
   rpc StopSession(Empty) returns (GeometryState);
 
   // 把当前建图会话保存为地图目录 <地图根>/<map_name>/geometry/（原子替换）。
-  // 允许状态：建图中、探索中；保存期间与保存后阶段不变，实时帧继续进入建图。
+  // 允许状态：建图中、探索中、故障态且仍持有地图；保存前后阶段不变。
+  // 建图中/探索中实时帧继续进入建图；故障态保存已持有的数据。
+  // 二维故障态只保存当前栅格与点云，在 geometry/ 内标明无完整 SLAM 图、不能用于二维续建。
   // map_name 为空表示用当前会话的地图名。
   // map_name 已存在：若它是本会话的来源（续建时加载的图，或本会话已成功保存过的名字）→ 原子覆盖；
   //   否则 → ALREADY_EXISTS。

@@ -50,7 +50,7 @@ impl Fixture {
             let script = root.join("原生进程夹具");
             fs::write(
                 &script,
-                "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$B2_CHILD_PID_FILE\"\nexec /bin/sleep 60\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$B2_CHILD_PID_FILE.tmp\"\nmv \"$B2_CHILD_PID_FILE.tmp\" \"$B2_CHILD_PID_FILE\"\nexec /bin/sleep 60\n",
             )
             .unwrap();
             fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();

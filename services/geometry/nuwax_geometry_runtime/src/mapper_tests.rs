@@ -400,16 +400,31 @@ async fn slow_worker_coalesces_frames_before_save_without_a_frame_backlog() {
     assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
     let mapper = Mapper::start(67, config()).unwrap();
     let blocked_mapper = mapper.clone();
-    let refresh = tokio::spawn(async move { blocked_mapper.set_forbidden_zones(fifo).await });
+    let mut refresh = tokio::spawn(async move { blocked_mapper.set_forbidden_zones(fifo).await });
     let fifo_path = directory.0.join("forbidden_zones.json");
-    let writer = tokio::task::spawn_blocking(move || {
+    let mut opening_writer = tokio::task::spawn_blocking(move || {
         std::fs::OpenOptions::new()
             .write(true)
             .open(fifo_path)
             .unwrap()
-    })
-    .await
-    .unwrap();
+    });
+    let writer = tokio::select! {
+        opened = &mut opening_writer => opened.unwrap(),
+        refreshed = &mut refresh => {
+            use std::os::unix::fs::OpenOptionsExt;
+            // 刷新前置失败时收回阻塞的写端，随后仍按原始错误使测试失败。
+            let reader = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(directory.0.join("forbidden_zones.json"))
+                .unwrap();
+            let writer = opening_writer.await.unwrap();
+            drop(writer);
+            drop(reader);
+            refreshed.unwrap().unwrap();
+            panic!("禁行区刷新未经过阻塞夹具即结束");
+        }
+    };
     // 写端打开证明真实文件读取已进入工作线程；保持打开让它停在读取，模拟后端跟不上。
     for stamp in 1..=1000 {
         mapper.feed(room_frame(67, 1_000_000_000 + stamp));

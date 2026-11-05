@@ -481,3 +481,107 @@ async fn one_mapping_error_does_not_repeat_route_changes_after_fault() {
     running.await.unwrap();
     forwarding.abort();
 }
+
+#[tokio::test]
+async fn faulted_planar_session_saves_owned_grid_and_cloud_and_rejects_resume_after_restart() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/B2会话测试")
+        .join(uuid::Uuid::new_v4().to_string());
+    let source = Mapper::start(709, MapperConfig::default()).unwrap();
+    source.feed(crate::mapper::tests::room_frame(709, 1_000_000_000));
+    let snapshot = source.snapshot().await.unwrap();
+    assert!(!snapshot.cloud.display.is_empty());
+    let config = MapperConfig {
+        map_name: "未保存图".into(),
+        backend: crate::mapping_backend::MappingBackendSpec::SlamToolbox,
+        ..Default::default()
+    };
+    let mapper = Mapper::load(710, config.clone(), snapshot, false).unwrap();
+    let held_grid = OccupancyGrid {
+        map_name: "未保存图".into(),
+        meta: Some(OccupancyGridMeta {
+            width: 3,
+            height: 2,
+            resolution: 0.1,
+            frame_id: "map".into(),
+            timestamp_ns: 2_000_000_000,
+            ..Default::default()
+        }),
+        data: vec![0, 100, 255, 0, 0, 100],
+    };
+    mapper.feed_grid(710, held_grid.clone());
+    let held = mapper.snapshot().await.unwrap();
+    let mut session = actor(mapper.clone(), root.clone()).await;
+    session.config = config.clone();
+    session.state.info.as_mut().unwrap().pipeline = "slam_2d".into();
+    session.fail("二维工作进程退出".into()).await;
+    session.save(SaveMapRequest::default()).await.unwrap();
+    assert_eq!(session.phase(), SessionPhase::Fault);
+    assert_eq!(session.state.reason, "二维工作进程退出");
+    let saved = session.store.load("未保存图").unwrap();
+    assert_eq!(saved.occupancy, Some(held_grid));
+    assert_eq!(saved.cloud.display, held.cloud.display);
+    assert_eq!(saved.cloud.revision, held.cloud.revision);
+    assert!(saved.planar_checkpoint.is_none());
+    assert_eq!(
+        saved.planar_resume_unavailable_reason.as_deref(),
+        Some(PLANAR_RESUME_UNAVAILABLE)
+    );
+    let descriptor: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("未保存图/geometry/map.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        descriptor["planar_resume_unavailable_reason"],
+        PLANAR_RESUME_UNAVAILABLE
+    );
+    assert_eq!(descriptor["planar"], false);
+    assert!(!root.join("未保存图/geometry/planar.bin").exists());
+    assert!(!root.join("未保存图/meta.json").exists());
+    session.end_current().await.unwrap();
+    session.nav.shutdown().await;
+
+    // 新的会话拥有方直接从地图目录读取原因，不要求先加载或定位到这个残缺地图。
+    let reloaded = Mapper::load(711, config.clone(), saved, true).unwrap();
+    let mut restarted = actor(reloaded.clone(), root.clone()).await;
+    restarted.config = config;
+    restarted.state.info.as_mut().unwrap().pipeline = "slam_2d".into();
+    for phase in [
+        SessionPhase::Idle,
+        SessionPhase::Loaded,
+        SessionPhase::Localized,
+        SessionPhase::Fault,
+    ] {
+        if phase == SessionPhase::Idle {
+            restarted.route.send_replace(None);
+            restarted.state.phase = phase as i32;
+            restarted.state.map_name.clear();
+        } else {
+            restarted.install(reloaded.clone(), SessionPhase::Loaded);
+            restarted.state.map_name = "未保存图".into();
+            if phase == SessionPhase::Fault {
+                restarted.fail("二维工作进程退出".into()).await;
+            } else {
+                restarted.state.phase = phase as i32;
+            }
+        }
+        let before = restarted.state.clone();
+        let error = restarted
+            .start_mapping(StartMappingRequest {
+                map_name: "未保存图".into(),
+                continue_saved: true,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(error.message(), PLANAR_RESUME_UNAVAILABLE);
+        assert_eq!(restarted.state, before);
+    }
+    assert_eq!(
+        reloaded.snapshot().await.unwrap().cloud.display,
+        held.cloud.display
+    );
+    restarted.end_current().await.unwrap();
+    restarted.nav.shutdown().await;
+    source.shutdown().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}

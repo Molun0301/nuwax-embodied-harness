@@ -15,13 +15,19 @@ struct Summary {
 
 impl Default for Summary {
     fn default() -> Self {
-        Self { count: 0, low: [f32::INFINITY; 3], high: [f32::NEG_INFINITY; 3] }
+        Self {
+            count: 0,
+            low: [f32::INFINITY; 3],
+            high: [f32::NEG_INFINITY; 3],
+        }
     }
 }
 
 impl Summary {
     fn include(&mut self, count: u64, low: [f32; 3], high: [f32; 3]) {
-        if count == 0 { return; }
+        if count == 0 {
+            return;
+        }
         self.count += count;
         for axis in 0..3 {
             self.low[axis] = self.low[axis].min(low[axis]);
@@ -45,8 +51,11 @@ struct Node {
 impl Node {
     fn empty(level: u32) -> Self {
         Self {
-            children: if level == 0 { Children::Pages(std::array::from_fn(|_| None)) }
-                else { Children::Nodes(std::array::from_fn(|_| None)) },
+            children: if level == 0 {
+                Children::Pages(std::array::from_fn(|_| None))
+            } else {
+                Children::Nodes(std::array::from_fn(|_| None))
+            },
             summary: Summary::default(),
         }
     }
@@ -55,7 +64,8 @@ impl Node {
         match &self.children {
             Children::Pages(pages) => pages[index % FANOUT].as_ref(),
             Children::Nodes(nodes) => nodes[index / FANOUT.pow(level) % FANOUT]
-                .as_ref()?.get(index, level - 1),
+                .as_ref()?
+                .get(index, level - 1),
         }
     }
 
@@ -64,7 +74,9 @@ impl Node {
         match &mut self.children {
             Children::Pages(pages) => {
                 pages[index % FANOUT] = Some(page);
-                for page in pages.iter().flatten() { summary.include(page.count, page.low, page.high); }
+                for page in pages.iter().flatten() {
+                    summary.include(page.count, page.low, page.high);
+                }
             }
             Children::Nodes(nodes) => {
                 let node = nodes[index / FANOUT.pow(level) % FANOUT]
@@ -82,14 +94,20 @@ impl Node {
         match &self.children {
             Children::Pages(pages) => {
                 for (index, page) in pages.iter().enumerate() {
-                    let Some(page) = page else { continue; };
-                    if offset < page.count { return Some((base + index, offset)); }
+                    let Some(page) = page else {
+                        continue;
+                    };
+                    if offset < page.count {
+                        return Some((base + index, offset));
+                    }
                     offset -= page.count;
                 }
             }
             Children::Nodes(nodes) => {
                 for (index, node) in nodes.iter().enumerate() {
-                    let Some(node) = node else { continue; };
+                    let Some(node) = node else {
+                        continue;
+                    };
                     if offset < node.summary.count {
                         return node.locate(offset, level - 1, base + index * FANOUT.pow(level));
                     }
@@ -99,7 +117,6 @@ impl Node {
         }
         None
     }
-
 }
 
 #[derive(Clone)]
@@ -109,28 +126,44 @@ pub(super) struct PageTable {
 }
 
 impl Default for PageTable {
-    fn default() -> Self { Self { root: Arc::new(Node::empty(ROOT_LEVEL)), length: 0 } }
+    fn default() -> Self {
+        Self {
+            root: Arc::new(Node::empty(ROOT_LEVEL)),
+            length: 0,
+        }
+    }
 }
 
 impl PageTable {
-    pub(super) fn len(&self) -> usize { self.length }
+    pub(super) fn len(&self) -> usize {
+        self.length
+    }
     pub(super) fn get(&self, index: usize) -> Option<&Arc<Page>> {
-        (index < self.length).then(|| self.root.get(index, ROOT_LEVEL)).flatten()
+        (index < self.length)
+            .then(|| self.root.get(index, ROOT_LEVEL))
+            .flatten()
     }
     pub(super) fn set(&mut self, index: usize, page: Arc<Page>) {
         assert!(index < self.length, "完整点云页号越界");
         Arc::make_mut(&mut self.root).set(index, ROOT_LEVEL, page);
     }
     pub(super) fn push(&mut self, page: Arc<Page>) {
-        assert!(self.length < CAPACITY, "完整点云页表容量小于已限定的归档上限");
+        assert!(
+            self.length < CAPACITY,
+            "完整点云页表容量小于已限定的归档上限"
+        );
         Arc::make_mut(&mut self.root).set(self.length, ROOT_LEVEL, page);
         self.length += 1;
     }
     pub(super) fn iter(&self) -> impl Iterator<Item = &Arc<Page>> {
         (0..self.length).map(|index| &self[index])
     }
-    pub(super) fn bounds(&self) -> ([f32; 3], [f32; 3]) { (self.root.summary.low, self.root.summary.high) }
-    pub(super) fn locate(&self, offset: u64) -> Option<(usize, u64)> { self.root.locate(offset, ROOT_LEVEL, 0) }
+    pub(super) fn bounds(&self) -> ([f32; 3], [f32; 3]) {
+        (self.root.summary.low, self.root.summary.high)
+    }
+    pub(super) fn locate(&self, offset: u64) -> Option<(usize, u64)> {
+        self.root.locate(offset, ROOT_LEVEL, 0)
+    }
     #[cfg(test)]
     pub(super) fn memory_bytes(&self) -> usize {
         // 目录只随连续页号追加、从不删除；节点数可直接由长度求出，统计不能另扫整张页表。
@@ -147,5 +180,7 @@ impl PageTable {
 
 impl Index<usize> for PageTable {
     type Output = Arc<Page>;
-    fn index(&self, index: usize) -> &Self::Output { self.get(index).expect("完整点云页号越界") }
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("完整点云页号越界")
+    }
 }

@@ -1,70 +1,166 @@
 syntax = "proto3";
-package nuwax.geometry;
+package nuwax.geometry.v3;
 
 // ============================================================================
-// 目标态 GeometryRuntime gRPC facade
-// - 内部数据协议走 nuwax-workspace LCM typed channels；
-// - 该 proto 仅作为 Python 网关 ↔ Rust runtime 之间的 gRPC 控制面兼容边界；
-// - 数据面依赖保持在 LCM 边界内。
+// Geometry（几何运行时）对外接口契约 v3（F0 草案，冻结后由车道 B2 实现 Rust、车道 Python 实现 client.py）
+//
+// 对应：目标架构 6.2（会话状态机）、6.3（地图目录）、6.4（远程接口）、6.5（导航目标）。
+// 传输：gRPC，127.0.0.1:${NUWAX_GEOMETRY_RUNTIME_PORT}（默认 50051）。
+// 进程就绪：Rust 只写一个就绪文件（${NUWAX_GEOMETRY_RUNTIME_READY_FILE}），gRPC 能接受连接后写入，
+//          进程退出时删除；业务监督者 ensure(["geometry"]) 以它为准。本接口没有健康检查 RPC。
+//
+// 通用规则
+// 1. 唯一状态拥有方：会话阶段、当前地图、位姿、当前导航目标、探索任务都只在 Geometry；
+//    调用方读 GetState/SubscribeState，不保存副本，不比对代际或修订号。
+// 2. 控制命令（Start/Stop/Save/Load/Relocalize/SetGoal/CancelGoal/StartExploration/StopExploration）
+//    由 Geometry 内一个命令队列按到达顺序执行；RPC 在命令执行完、新状态已发布之后返回。
+//    实时传感器帧不进命令队列。
+// 3. 人的命令优先：新的 StartMapping / LoadMap 直接结束当前状态，不要求先停；
+//    新的 SetGoal 替换旧目标并结束探索。
+// 4. 错误只用 gRPC 状态码表达，原因写在 status message（中文，可直接展示给用户）：
+//      FAILED_PRECONDITION  当前会话状态不允许该命令（例如未定位时 SetGoal）
+//      NOT_FOUND            地图不存在
+//      ALREADY_EXISTS       保存或新建时地图名已被占用
+//      INVALID_ARGUMENT     消息内容不合法（解码处唯一一次校验）
+//      DATA_LOSS            地图目录内的文件损坏或不完整（原因写明文件）
+//      UNAVAILABLE          所需子系统故障或未运行（原生 LIO、建图后端、PGO、导航栈）
+//      INTERNAL             程序缺陷
+//    “重定位没有匹配上”“导航失败”等业务结果不是 RPC 错误，写在状态与返回消息里。
+// 5. 地图名：调用方（网关入口）已按命名规则校验，直接作为目录名使用：
+//    1–64 个字符；不含 '/'、'\0'、控制字符；不以 '.' 开头。Geometry 解码处再拒绝一次（INVALID_ARGUMENT）。
+// 6. 地图目录 ${NUWAX_MAP_CATALOG_ROOT}/<地图名>/：
+//      geometry/              只由 Geometry 写（检查点、占据栅格、点云、精细/稠密云），先写临时目录再整体替换
+//      meta.json              只由网关写（显示名、地理参考、创建/更新时间）
+//      forbidden_zones.json   只由网关写；Geometry 读取并监视变化（见待决问题 Q4）
+// 7. 坐标：位姿与目标都用地图坐标系（GetState.info.map_frame_id）；未定位时位姿为里程计坐标系，
+//    frame_id 字段如实给出。
+// 8. 本文件之外保留不变的接口：导航栈用的 LCM RPC `GeometryRuntimeService/get_navigation_map_block`；
+//    三维累积点云共享内存 ${NUWAX_CLOUDMAP_SHM_PATH}（网页直接读取，见待决问题 Q6）。
+//
+// 已删除（相对 v2，目标架构 6.4）：Start、Stop、HealthCheck、Get*Readiness、GetMappingState、
+// StopMapping（并入 StopSession）、ActivateMap、ExportMappingBackendCheckpoint、TransferGraphArtifact、
+// GetAssignedLocalizationSample、GetOccupancyGridShm、GetRawOccupancyGridData（并入 GetOccupancyGrid）、
+// SubscribeCloudMapUpdates、GetFrontiers、SubscribeFrontiers、SetCmdVelSinkReady、
+// GetMappingCloudAuthority、SubmitMappingCloudGoal、SubscribeNavigationState 与 GetExplorationState
+// （并入 SubscribeState）、GetExplorationDiagnostics、ReportNativeInputFailure（见待决问题 Q3）。
+// ============================================================================
+
+service GeometryRuntime {
+  // ---------------- 控制 ----------------
+
+  // 开始建图会话。
+  // continue_saved=false：新建空图 map_name；目录下已有 geometry/ → ALREADY_EXISTS。
+  // continue_saved=true：在已保存地图 map_name 上续建；要求当前为“已定位”且已加载的就是 map_name，
+  //   否则 FAILED_PRECONDITION；地图不存在 → NOT_FOUND。
+  // 当前已在建同名地图（建图中/探索中，map_name 相同）→ 不做任何事，直接返回当前状态。
+  // 其它任何状态：先结束当前状态（取消导航目标、结束探索、丢弃未保存的建图），再开始。
+  // 成功后阶段 = 建图中。
+  rpc StartMapping(StartMappingRequest) returns (GeometryState);
+
+  // 结束当前会话回到“空闲”：取消导航目标与探索，丢弃未保存的建图，卸载已加载地图。
+  // 任何状态都允许；已是空闲时不做任何事。替代 v2 的 StopMapping 与“清除当前地图”。
+  rpc StopSession(Empty) returns (GeometryState);
+
+  // 把当前建图会话保存为地图目录 <地图根>/<map_name>/geometry/（原子替换）。
+  // 允许状态：建图中、探索中；保存期间与保存后阶段不变，实时帧继续进入建图。
+  // map_name 为空表示用当前会话的地图名。
+  // map_name 已存在：若它是本会话的来源（续建时加载的图，或本会话已成功保存过的名字）→ 原子覆盖；
+  //   否则 → ALREADY_EXISTS。
+  // 保存成功后，本会话的地图名与来源都变为 map_name（另存为即改名），之后不带名字的 SaveMap 覆盖它。
+  // 其它状态 → FAILED_PRECONDITION（“当前没有正在建的地图”）。
+  rpc SaveMap(SaveMapRequest) returns (SaveMapResponse);
+
+  // 加载已保存地图作为定位基准，阶段 = 已加载未定位；之后调用 Relocalize。
+  // 任何状态都允许，先结束当前状态。地图不存在 → NOT_FOUND；文件损坏 → DATA_LOSS（原因写明文件）。
+  rpc LoadMap(LoadMapRequest) returns (GeometryState);
+
+  // 在已加载地图上重定位，阻塞到得出结果（用最近帧匹配，最多 8 帧或 2 秒）。
+  // 允许状态：已加载未定位、已定位；其它 → FAILED_PRECONDITION。
+  // Geometry 配置为回环校正（library_pgo/native_pgo）时 → FAILED_PRECONDITION（原因写明）。
+  // 匹配失败不是 RPC 错误：返回 succeeded=false，阶段保持/回到“已加载未定位”，原因写进状态。
+  // 匹配成功：校正 map→odom，阶段 = 已定位。结果同时写进 GeometryState.relocalization。
+  rpc Relocalize(RelocalizeRequest) returns (RelocalizationResult);
+
+  // 下发导航目标，Geometry 持有为唯一当前目标；旧目标状态变为“被替换”；探索中则结束探索（回到建图中）。
+  // 允许状态：建图中、探索中、已定位；其它 → FAILED_PRECONDITION（“未定位”）。
+  // 导航栈输入未就绪或禁行区未刷新时目标进入“等待输入”，不拒绝，调用方不重提。
+  rpc SetGoal(NavigationGoal) returns (SetGoalResponse);
+
+  // 取消导航目标。goal_id 为空表示当前目标。目标不是当前目标或已结束时不做任何事，返回成功。
+  // 任何状态都允许。被取消的目标状态 = 已取消。
+  rpc CancelGoal(CancelGoalRequest) returns (Empty);
+
+  // 开始探索，返回 exploration_id。允许状态：建图中；探索中时新探索替换旧探索（旧探索 = 已停止）。
+  // 其它状态 → FAILED_PRECONDITION（“需要先开始建图”）。网关的探索任务先调用 StartMapping 再调用本接口。
+  rpc StartExploration(ExplorationRequest) returns (StartExplorationResponse);
+
+  // 停止探索，阶段回到建图中。exploration_id 为空表示当前探索。
+  // 没有进行中的探索或 id 不是当前探索时不做任何事，返回成功。任何状态都允许。
+  rpc StopExploration(StopExplorationRequest) returns (Empty);
+
+  // 导出本会话最近一次探索的进度（用于暂停后恢复：StartExploration.resume_progress_json）。
+  // 允许状态：建图中、探索中，且本会话内开始过探索；否则 FAILED_PRECONDITION。会话结束后进度清空。
+  rpc GetExplorationProgress(ExplorationProgressRequest) returns (ExplorationProgress);
+
+  // ---------------- 读取 ----------------
+
+  // 读取完整状态快照。任何状态都允许。
+  rpc GetState(Empty) returns (GeometryState);
+
+  // 状态流：首条为当前完整快照；之后状态变化（阶段、原因、地图名、导航、探索、重定位结果）时推送最新完整快照，
+  // 订阅者慢时只拿到最新值（中间值可能被跳过）。位姿变化本身不触发推送（位姿用 SubscribePose）。
+  // 等待某个目标的调用方按 GeometryState.navigation 与 previous_navigation 判断结果。
+  rpc SubscribeState(Empty) returns (stream GeometryState);
+
+  // 位姿流：只推最新位姿，订阅者慢时丢弃中间值。首条为当前位姿（尚无位姿时等第一帧）。
+  rpc SubscribePose(Empty) returns (stream Pose);
+
+  // 地图流：占据栅格每次更新推一条，只推最新，订阅者慢时丢弃中间值。
+  // 首条为当前栅格（尚无栅格时等第一次更新）。会话切换后推送新会话的第一张栅格。
+  rpc SubscribeMap(Empty) returns (stream MapUpdate);
+
+  // 读取当前占据栅格。include_forbidden=true 叠加禁行区（导航用的有效栅格），false 为物理栅格。
+  // 没有栅格（空闲或尚未建出）→ FAILED_PRECONDITION。
+  rpc GetOccupancyGrid(GetOccupancyGridRequest) returns (OccupancyGrid);
+
+  // 分块读取当前会话（建图中为实时，已加载为该地图）的完整稠密扫描点，网页三维显示用。
+  // 没有点云 → FAILED_PRECONDITION。
+  rpc GetDenseCloudChunk(DenseCloudChunkRequest) returns (DenseCloudChunk);
+
+  // 读取坐标树最新边（map→odom、odom→base、base→传感器）。任何状态都允许。
+  rpc GetFrameTree(Empty) returns (FrameTree);
+
+  // ---------------- 输入（保持 v2 语义） ----------------
+  // 输入桥在 Geometry 首次就绪后启动一次，之后一直发送。
+  // 三维：点云与 IMU 始终交给 LIO（任何会话阶段都运行，输出位姿）；配准后的点云在建图中/探索中进入当前
+  //   会话的建图对象，在已加载/已定位时供重定位取最近帧，空闲时不再往下交。
+  // 二维：只有建图中/探索中/已加载/已定位时交给二维工作进程，空闲时丢弃。
+  // 丢弃不是错误，返回 success=true。消息格式不合法 → INVALID_ARGUMENT。
+
+  // 雷达点云（可附带 IMU 样本）。三维执行链用。
+  rpc PublishPointCloud(PublishPointCloudRequest) returns (PublishResult);
+  // 设备里程计。二维执行链用。
+  rpc PublishOdom(PublishOdomRequest) returns (PublishResult);
+  // 二维激光扫描。二维执行链用。
+  rpc PublishLaserScan(PublishLaserScanRequest) returns (PublishResult);
+}
+
+// ============================================================================
+// 通用几何消息（照抄 v2）
 // ============================================================================
 
 message Empty {}
-// C1 reliable recovery is scoped to a retained root and an exact member reference.
-message NavigationMapDomain {
-  string session = 1;
-  uint64 generation = 2;
-  uint64 frame_generation = 3;
-  uint64 producer_generation = 4;
-}
-message NavigationMapRootIdentity {
-  NavigationMapDomain domain = 1;
-  uint64 revision = 2;
-}
-message NavigationMapObjectIdentity {
-  // 分配式对象身份为16字节。
-  uint32 kind = 1;
-  bytes object_id = 2;
-  reserved 3;
-  reserved "legacy_alias";
-}
-message NavigationMapBlockRef {
-  // Exactly three coordinates in X, Y, Z order.
-  repeated sint32 key = 1;
-  NavigationMapObjectIdentity object = 2;
-  uint64 block_revision = 3;
-  uint64 geometry_revision = 4;
-  uint32 points = 5;
-}
-message NavigationMapBlockRequest {
-  reserved 1;
-  reserved "sha256_hex";
-  // 版本2读取整块；版本3按偏移读取最多256KiB，LCM RPC使用Base64段编码。
-  // 无版本或仅哈希请求继续拒绝，版本3须配套支持分段的服务与客户端。
-  uint32 schema_version = 2;
-  NavigationMapRootIdentity root = 3;
-  NavigationMapBlockRef block = 4;
-  uint32 offset = 5;
-  uint32 max_bytes = 6;
-}
-message NavigationMapBlockResponse {
-  reserved 1;
-  reserved "data_hex";
-  uint32 schema_version = 2;
-  // Echo the admitted request binding; clients compare both before consuming data.
-  NavigationMapRootIdentity root = 3;
-  NavigationMapBlockRef block = 4;
-  bytes data = 5;
-  uint32 offset = 6;
-  uint32 total_bytes = 7;
-}
+
 message Vec3 { double x = 1; double y = 2; double z = 3; }
 message Quat { double x = 1; double y = 2; double z = 3; double w = 4; }
+
 message Pose {
   Vec3 position = 1;
   Quat orientation = 2;
   string frame_id = 3;
-  uint64 timestamp_ns = 4;
+  uint64 timestamp_ns = 4;   // 产生该位姿的传感器源时间（Unix 纳秒）
 }
+
 message Transform {
   string parent_frame = 1;
   string child_frame = 2;
@@ -72,699 +168,112 @@ message Transform {
   Quat rotation = 4;
   uint64 timestamp_ns = 5;
 }
+
 message FrameTree { repeated Transform transforms = 1; }
-message ShmRef {
-  string key = 1;
-  uint64 size = 2;
-  uint64 revision = 3;
-  uint32 layout_version = 4;
-  uint32 payload_schema_version = 5;
-  uint64 generation = 6;
-  uint32 active_slot = 7;
-  uint64 payload_size = 8;
+
+// ============================================================================
+// 状态
+// ============================================================================
+
+// 会话阶段（目标架构 6.2 状态机）。
+enum SessionPhase {
+  SESSION_PHASE_UNSPECIFIED = 0;
+  SESSION_PHASE_IDLE = 1;        // 空闲：没有建图、没有加载地图
+  SESSION_PHASE_MAPPING = 2;     // 建图中：可导航、可保存
+  SESSION_PHASE_EXPLORING = 3;   // 探索中：建图中的一种
+  SESSION_PHASE_LOADED = 4;      // 已加载未定位：等待或刚失败重定位，原因在 reason
+  SESSION_PHASE_LOCALIZED = 5;   // 已定位：可导航；可同名续建
+  SESSION_PHASE_FAULT = 6;       // 故障：子系统出错，原因在 reason；StartMapping / LoadMap 重建子系统后恢复
 }
 
-// === 控制面 ===
-message StartRequest { string config_json = 1; }
-message StartResult { bool success = 1; string message = 2; }
-message StopRequest {}
-message StopResult { bool success = 1; }
-message RuntimeStatus {
-  string phase = 1;
-  string message = 2;
-  uint64 uptime_ms = 3;
-  uint32 rss_kb = 4;
-  string lcm_backend = 5;
-  reserved 6;
-  reserved "supported_assigned_fine_archive_versions";
-}
-
-// === 定位 ===
-message PoseRequest { string target_frame = 1; string source_frame = 2; }
-message PoseUpdate { Pose pose = 1; uint64 sequence = 2; }
-
-// === 地图 ===
-message OccupancyGridMeta {
-  uint32 width = 1;
-  uint32 height = 2;
-  float resolution = 3;
-  double origin_x = 4;
-  double origin_y = 5;
-  string frame_id = 6;
-  uint64 revision = 7;
-  uint64 timestamp_ns = 8;
-}
-enum RawMapRepresentation {
-  RAW_MAP_REPRESENTATION_UNSPECIFIED = 0;
-  RAW_MAP_REPRESENTATION_SAME_AS_EFFECTIVE = 1;
-  RAW_MAP_REPRESENTATION_SEPARATE_RAW = 2;
-  RAW_MAP_REPRESENTATION_EFFECTIVE_FALLBACK = 3;
-}
-message MapUpdateNotification {
-  reserved 6, 12;
-  reserved "checksum", "raw_checksum";
-  reserved 9;
-  reserved "map_version_id";
-  OccupancyGridMeta meta = 1;
-  ShmRef shm_ref = 2;
-  bytes data = 3;
-  uint64 size = 4;
-  uint32 schema_version = 5;
-  int64 last_seen_ms = 7;
-  string session_id = 8;
-  uint64 session_generation = 10;
-  // Physical occupancy from the same committed revision. The explicit
-  // representation distinguishes shared data from unavailable raw occupancy.
-  bytes raw_data = 11;
-  string map_name = 13;
-  CanonicalOccupancyCommitReceipt occupancy_receipt = 14;
-  RawMapRepresentation raw_representation = 15;
-}
-message OccupancyGridData {
-  OccupancyGridMeta meta = 1;
-  bytes data = 2;
-}
-
-message StartMappingRequest {
-  reserved 3;
-  reserved "map_version_id";
-  string session_id = 1;
-  string map_name = 2;
-}
-
-message StopMappingRequest {
-  string session_id = 1;
+message GeometryState {
+  SessionPhase phase = 1;
+  // 原因文本：故障原因、最近一次重定位失败原因；正常时为空。
   string reason = 2;
-}
-
-enum ActivationReceiptDisposition {
-  ACTIVATION_RECEIPT_DISPOSITION_UNSPECIFIED = 0;
-  ACTIVATION_RECEIPT_DISPOSITION_STAGED = 1;
-  ACTIVATION_RECEIPT_DISPOSITION_SEALED = 2;
-  ACTIVATION_RECEIPT_DISPOSITION_SEALED_REPLAY = 3;
-  reserved 4;
-  reserved "ACTIVATION_RECEIPT_DISPOSITION_LEGACY_UNBOUND";
-  ACTIVATION_RECEIPT_DISPOSITION_RETIRED = 5;
-  ACTIVATION_RECEIPT_DISPOSITION_CONFLICT = 6;
-  ACTIVATION_RECEIPT_DISPOSITION_INVALIDATED_PRECOMMIT = 7;
-  ACTIVATION_RECEIPT_DISPOSITION_INVALIDATED_POSTCOMMIT = 8;
-  ACTIVATION_RECEIPT_DISPOSITION_OUTCOME_UNKNOWN = 9;
-}
-
-message MappingSessionState {
-  reserved 11, 18, 19, 20, 21, 22, 24, 25, 26, 27, 28, 29, 31;
-  reserved "legacy_checkpoint_reconstructed", "activation_request_identity_sha256", "activation_identity_sha256", "target_receipt_sha256", "asset_manifest_sha256", "asset_bundle_sha256", "source_policy_version", "source_policy_sha256", "deadline_policy_version", "deadline_policy_sha256", "algorithm_options_version", "algorithm_options_sha256", "target_graph_sha256";
-  reserved 6;
-  reserved "map_version_id";
-  bool success = 1;
-  string phase = 2;
-  string message = 3;
-  string session_id = 4;
-  string map_name = 5;
-  uint64 session_generation = 7;
-  uint64 revision = 8;
-  bool active = 9;
-  bool idempotent_replay = 10;
-  string mapping_backend_kind = 12;
-  uint32 activation_receipt_schema_version = 13;
-  ActivationReceiptDisposition activation_receipt_disposition = 14;
-  uint64 runtime_generation = 15;
-  uint64 backend_generation = 16;
-  string activation_request_id = 17;
-  bool relocalization_target_available = 23;
-  string target_kind = 30;
-  string planar_mode = 32;
-  ActivationReceiptV2 activation_receipt_v2 = 33;
-  RelocalizationPolicyDescriptorV2 relocalization_policy_v2 = 34;
-}
-
-message CloudMapCheckpoint {
-  reserved 6;
-  reserved "xyz_sha256";
-  string frame_id = 1;
-  uint64 source_revision = 2;
-  uint32 point_count = 3;
-  float voxel_size = 4;
-  bytes xyz_f32_le = 5;
-  uint32 payload_schema_version = 7;
-  CheckpointMemberIdentity member_identity = 8;
-}
-
-message MappingCommitIdentity {
-  bytes boot_nonce = 1;
-  uint64 sequence = 2;
-}
-
-message CanonicalOccupancyCommitReceipt {
-  MappingCommitIdentity commit_id = 1;
-  string session_id = 2;
-  uint64 session_generation = 3;
-  uint64 occupancy_revision = 4;
-  uint64 source_timestamp_ns = 5;
-  string backend_kind = 6;
-  uint64 backend_generation = 7;
-}
-
-message CanonicalCloudCommitReceipt {
-  MappingCommitIdentity commit_id = 1;
-  uint64 session_generation = 2;
-  uint64 occupancy_revision = 3;
-  uint64 cloud_revision = 4;
-  uint64 source_timestamp_ns = 5;
-  uint32 point_count = 6;
-}
-
-// Assigned identity of one immutable member of a frozen checkpoint export.
-enum CheckpointMemberRole {
-  CHECKPOINT_MEMBER_ROLE_UNSPECIFIED = 0;
-  CHECKPOINT_MEMBER_ROLE_BACKEND_STATE = 1;
-  CHECKPOINT_MEMBER_ROLE_CANONICAL_OCCUPANCY = 2;
-  CHECKPOINT_MEMBER_ROLE_CANONICAL_CLOUD = 3;
-  CHECKPOINT_MEMBER_ROLE_FINE_MAP = 4;
-  CHECKPOINT_MEMBER_ROLE_DENSE_CLOUD = 5;
-  CHECKPOINT_MEMBER_ROLE_PLANAR_GRAPH = 6;
-}
-message CheckpointMemberIdentity {
-  string checkpoint_id = 1;
-  CheckpointMemberRole role = 2;
-  CanonicalOccupancyCommitReceipt occupancy_receipt = 3;
-  CanonicalCloudCommitReceipt cloud_receipt = 4;
-  string frame_id = 5;
-  uint64 frame_generation = 6;
-  uint64 producer_generation = 7;
-}
-message ExportMappingBackendCheckpointRequest {
-  reserved 1;
-  reserved "checkpoint_schema_version";
-}
-message GraphArtifactRef {
-  reserved 3;
-  reserved "sha256";
-  string id = 1;
-  uint64 size = 2;
-  uint32 identity_schema_version = 4;
-  CheckpointMemberIdentity member_identity = 5;
-}
-
-message GraphArtifactTransferRequest {
-  // 1初始化，2写入，3封存，4读取，5释放；初始化身份由上传方随机生成。
-  uint32 action = 1;
-  GraphArtifactRef artifact = 2;
-  uint64 offset = 3;
-  bytes data = 4;
-}
-message GraphArtifactTransferResponse {
-  GraphArtifactRef artifact = 1;
-  uint64 offset = 2;
-  bool sealed = 3;
-  bytes data = 4;
-}
-
-// One assigned ID owns one immutable finalized asset; replacement assigns a new ID.
-message AssetIdentityV2 { string asset_id = 1; }
-
-message ActivationRequestMetadataV2 {
-  string activation_request_id = 1;
-  string session_id = 2;
+  // 建图中/探索中：正在建的地图名；已加载/已定位：加载的地图名；空闲、故障为空。
   string map_name = 3;
-  AssetIdentityV2 asset_identity = 4;
-  string checkpoint_id = 5;
-  uint64 expected_runtime_generation = 6;
-}
-message InstalledActivationIdentityV2 {
-  ActivationRequestMetadataV2 request = 1;
-  uint64 runtime_generation = 2;
-  uint64 lifecycle_epoch = 3;
-  uint64 session_generation = 4;
-  string backend_kind = 5;
-  uint64 backend_generation = 6;
-}
-message InstalledTargetReceiptV2 {
-  InstalledActivationIdentityV2 activation = 1;
-  CheckpointMemberIdentity source_cloud_member = 2;
-  CanonicalOccupancyCommitReceipt occupancy_receipt = 3;
-  CanonicalCloudCommitReceipt cloud_receipt = 4;
-  CheckpointMemberIdentity source_graph_member = 5;
-}
-message ActivationReceiptV2 {
-  ActivationRequestMetadataV2 request = 1;
-  InstalledActivationIdentityV2 activation = 2;
-  InstalledTargetReceiptV2 target = 3;
+  // 最新机体位姿：LIO（或二维工作进程）有输出即给，尚无输出时不设置。建图中/探索中/已定位为地图坐标，
+  // 其余阶段为里程计坐标（见 frame_id）。状态流里的位姿只是推送时刻的值，实时位姿用 SubscribePose。
+  Pose pose = 4;
+  // 当前（或最近一个）导航目标；从未下发过目标时不设置。终态保留到下一个目标。
+  NavigationStatus navigation = 5;
+  // 当前（或本会话最近一次）探索；本会话未探索过时不设置。终态保留到会话结束或下一次探索。
+  ExplorationStatus exploration = 6;
+  // 本会话最近一次重定位结果；未重定位过时不设置。
+  RelocalizationResult relocalization = 7;
+  // 进程启动时确定、运行期间不变的信息。
+  RuntimeInfo info = 8;
+  // 上一个已结束的导航目标（成功、失败、已取消、被替换、已被停止之一），新目标替换旧目标时由旧目标填入。
+  // 等待目标的规则：自己的 goal_id 是 navigation.goal_id → 看它的状态；是 previous_navigation.goal_id → 用它的终态；
+  // 两者都不是 → 视为被替换（已被更新的命令取代）。
+  NavigationStatus previous_navigation = 9;
 }
 
-message MappingBackendCheckpoint {
-  reserved 4;
-  reserved "content_sha256";
-  uint32 schema_version = 1;
-  string backend_kind = 2;
-  uint64 source_session_generation = 3;
-  uint64 payload_size = 5;
-  uint64 created_at_ns = 6;
-  bytes payload = 7;
-  string source_session_id = 8;
-  CanonicalOccupancyCommitReceipt occupancy_receipt = 9;
-  CanonicalCloudCommitReceipt cloud_receipt = 10;
-  OccupancyGridData canonical_occupancy_checkpoint = 11;
-  CloudMapCheckpoint canonical_cloud_checkpoint = 12;
-  GraphArtifactRef graph_artifact = 13;
-  string target_kind = 14;
-  GraphArtifactRef fine_map_artifact = 15;
-  GraphArtifactRef dense_cloud_artifact = 16;
-  string checkpoint_id = 17;
-  uint32 backend_payload_schema_version = 18;
-  CheckpointMemberIdentity backend_identity = 19;
-  CheckpointMemberIdentity occupancy_identity = 20;
+// 静态信息。替代 v2 HealthCheck 中输入桥与显示需要的字段（见待决问题 Q2）。
+message RuntimeInfo {
+  string pipeline = 1;                    // "lio_3d" 或 "slam_2d"
+  string map_frame_id = 2;
+  string odom_frame_id = 3;
+  string base_frame_id = 4;
+  // 二维执行链：激光输入模板（JSON，v2 HealthCheck.planar_input_config）与单调时钟到 Unix 时间的偏移；
+  // 二维输入桥构造设备源与换算时间戳用。三维执行链为空/0。
+  string planar_input_config_json = 5;
+  int64 planar_unix_offset_ns = 6;
 }
 
-message ActivateMapRequest {
-  reserved 4, 5, 8, 9;
-  reserved "checkpoint", "cloud_checkpoint", "asset_manifest_sha256", "asset_bundle_sha256";
-  reserved 3;
-  reserved "map_version_id";
-  string session_id = 1;
-  string map_name = 2;
-  MappingBackendCheckpoint mapping_backend_checkpoint = 6;
-  string activation_request_id = 7;
-  uint64 expected_runtime_generation = 10;
-  uint32 activation_contract_version = 11;
-  // 只接受第二版请求；规范成员载荷由mapping_backend_checkpoint承载。
-  AssetIdentityV2 asset_identity = 12;
-}
+// ============================================================================
+// 导航目标（目标架构 6.5）
+// ============================================================================
 
-enum RelocalizeDisposition {
-  RELOCALIZE_DISPOSITION_UNSPECIFIED = 0;
-  RELOCALIZE_DISPOSITION_APPLIED = 1;
-  RELOCALIZE_DISPOSITION_ALREADY_APPLIED = 2;
-  RELOCALIZE_DISPOSITION_REJECTED = 3;
-  RELOCALIZE_DISPOSITION_TARGET_UNAVAILABLE = 4;
-  RELOCALIZE_DISPOSITION_STALE_SESSION = 5;
-  RELOCALIZE_DISPOSITION_SESSION_INVALIDATED = 6;
-  RELOCALIZE_DISPOSITION_TARGET_INVALIDATED = 7;
-  RELOCALIZE_DISPOSITION_REPLAY_CONFLICT = 8;
-  RELOCALIZE_DISPOSITION_BUSY = 9;
-  RELOCALIZE_DISPOSITION_CANCELLED = 10;
-  RELOCALIZE_DISPOSITION_DEADLINE_EXCEEDED = 11;
-  RELOCALIZE_DISPOSITION_INSUFFICIENT_SOURCE = 12;
-  RELOCALIZE_DISPOSITION_ALGORITHM_REJECTED = 13;
-  RELOCALIZE_DISPOSITION_OWNER_FAILED = 14;
-  RELOCALIZE_DISPOSITION_OWNER_STOPPED = 15;
-}
-
-message PlanarSeed { double x = 1; double y = 2; double yaw = 3; }
-
-// Exact small canonical policy parameters, not a hash or content-derived ID.
-// Policy versions and limits retain the existing production definitions.
-message RelocalizationPolicyDescriptorV2 {
-  uint32 schema_version = 1;
-  uint32 source_policy_version = 2;
-  bytes source_parameters = 3;
-  uint32 deadline_policy_version = 4;
-  bytes deadline_parameters = 5;
-  uint32 algorithm_options_version = 6;
-  bytes algorithm_parameters = 7;
-}
-
-// Cloud-specific assigned target. Planar activation requires its own genuine
-// target branch; it cannot populate an invented cloud receipt.
-message AssignedCloudRelocalizeRequestV2 {
-  InstalledTargetReceiptV2 target = 1;
-  RelocalizationPolicyDescriptorV2 policy = 2;
-  uint64 logical_timeout_ms = 3;
-}
-
-message AssignedPlanarRelocalizeRequestV2 {
-  InstalledTargetReceiptV2 target = 1;
-  RelocalizationPolicyDescriptorV2 policy = 2;
-  uint64 logical_timeout_ms = 3;
-  PlanarSeed seed = 4;
-}
-
-message RelocalizeRequest {
-  reserved 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23;
-  reserved "runtime_generation", "session_id", "map_name", "session_generation", "backend_generation", "activation_identity_sha256", "target_receipt_sha256", "target_cloud_revision", "target_cloud_sha256", "asset_manifest_sha256", "asset_bundle_sha256", "source_policy_version", "source_policy_sha256", "deadline_policy_version", "deadline_policy_sha256", "logical_timeout_ms", "algorithm_options_version", "algorithm_options_sha256", "target_kind", "target_graph_sha256", "planar_seed";
-  uint32 schema_version = 1;
-  string request_id = 2;
-  // 第二版请求只携带已有分配目标，不再接收摘要执行身份。
-  oneof assigned_target {
-    AssignedCloudRelocalizeRequestV2 assigned_cloud_v2 = 24;
-    AssignedPlanarRelocalizeRequestV2 assigned_planar_v2 = 25;
-  }
-}
-
-// IEEE-754 bits, not numeric protobuf equality: signed zero is significant.
-message RelocalizationPoseBitsV2 {
-  repeated fixed64 translation_m_bits = 1; // exactly 3
-  repeated fixed64 rotation_xyzw_bits = 2; // exactly 4
-}
-
-// Existing correction-owner identity. No new generation or lease is allocated.
-message RelocalizationOwnerReceiptV2 {
-  uint64 runtime_generation = 1;
-  uint64 correction_backend_generation = 2;
-  bytes correction_lease_boot_nonce = 3; // exactly 16 bytes
-  uint64 correction_lease_generation = 4;
-  string map_frame_id = 5;
-  string odom_frame_id = 6;
-  string body_frame_id = 7;
-  optional uint64 relocalization_epoch = 8;
-}
-
-message RelocalizationMapGeometryV2 {
-  uint64 width = 1;
-  uint64 height = 2;
-  fixed64 resolution_m_bits = 3;
-  fixed64 origin_x_m_bits = 4;
-  fixed64 origin_y_m_bits = 5;
-}
-
-// Lineage of an actually admitted frame. This is not content attestation:
-// source XYZ and occupancy bytes have been released and are not reproduced.
-// The actual cloud receipt can lag the occupancy receipt. Do not fabricate a
-// same-commit cloud receipt or require installed-target same-commit coupling.
-message RelocalizationSourceReceiptV2 {
-  CanonicalOccupancyCommitReceipt occupancy_receipt = 1;
-  uint64 cloud_revision = 2;
-  uint64 map_frame_generation = 3;
-  int32 lio_backend = 4;
-  uint64 runtime_generation = 5;
-  uint64 source_sequence = 6;
-  uint64 source_timestamp_ns = 7;
-  uint64 admitted_point_count = 8;
-  uint64 correlated_odom_source_sequence = 9;
-  uint64 correlated_odom_source_timestamp_ns = 10;
-  RelocalizationPoseBitsV2 odom_from_body = 11;
-  RelocalizationMapGeometryV2 map_geometry = 12;
-  RelocalizationPoseBitsV2 base_anchor_map_from_odom = 13;
-  string map_frame_id = 14;
-  string odom_frame_id = 15;
-  string body_frame_id = 16;
-  string points_frame_id = 17;
-  uint64 registration_correction_revision = 18;
-  uint64 frame_capture_relocalization_epoch = 19;
-  optional uint64 relocalization_mode_epoch = 20;
-  CanonicalCloudCommitReceipt cloud_receipt = 21;
-  RelocalizationPoseBitsV2 registration_map_from_odom = 22;
-}
-
-message RelocalizationAlgorithmReceiptV2 {
-  bool converged = 1;
-  bool accepted = 2;
-  fixed64 mse_bits = 3;
-  fixed64 fitness_bits = 4;
-  uint64 iterations = 5;
-  uint64 feature_matches = 6;
-  uint64 ransac_inliers = 7;
-  RelocalizationPoseBitsV2 estimated_transform = 8;
-  RelocalizationPoseBitsV2 proposed_correction = 9;
-}
-
-enum AssignedRelocalizationEvidencePhaseV2 {
-  ASSIGNED_RELOCALIZATION_EVIDENCE_PHASE_V2_UNSPECIFIED = 0;
-  ASSIGNED_RELOCALIZATION_EVIDENCE_PHASE_V2_PRE_ADMISSION = 1;
-  ASSIGNED_RELOCALIZATION_EVIDENCE_PHASE_V2_ADMITTED = 2;
-  ASSIGNED_RELOCALIZATION_EVIDENCE_PHASE_V2_SOURCE_SELECTED = 3;
-  ASSIGNED_RELOCALIZATION_EVIDENCE_PHASE_V2_ALGORITHM_COMPLETED = 4;
-  ASSIGNED_RELOCALIZATION_EVIDENCE_PHASE_V2_FINALIZED = 5;
-}
-
-// Bounded typed lineage/outcome only, never a proof of source-elided content.
-// Production capture validates these fields against retained source owners;
-// durable reopening validates canonical shape and all retained exact bindings.
-message AssignedRelocalizationEvidenceV2 {
-  uint32 schema_version = 1;
-  AssignedRelocalizationEvidencePhaseV2 phase = 2;
-  optional uint64 admission_ordinal = 3;
-  RelocalizationOwnerReceiptV2 owner = 4;
-  repeated RelocalizationSourceReceiptV2 source_frames = 5;
-  RelocalizationAlgorithmReceiptV2 algorithm = 6;
-}
-
-message AssignedCloudRelocalizeResultV2 {
-  RelocalizeRequest request = 1;
-  RelocalizeDisposition disposition = 2;
-  uint64 correction_revision = 3;
-  string detail = 4;
-  // Full canonical V3 LCM body without its fingerprint; bounded at 4096 bytes.
-  // A real V3 candidate validator must bind it to the request and evidence.
-  bytes candidate_payload_v3 = 5;
-  AssignedRelocalizationEvidenceV2 evidence = 6;
-}
-
-// Existing armed process/session/epoch and input sequence, never a new scan ticket.
-message PlanarRelocalizationScanV2 {
-  string process_owner = 1;
-  uint64 session_generation = 2;
-  uint64 mode_epoch = 3;
-  uint64 source_sequence = 4;
-  uint64 source_timestamp_ns = 5;
-  uint64 source_unix_ns = 6;
-  fixed64 matching_response_bits = 7;
-}
-message PlanarRelocalizationEstimateV2 {
-  uint64 source_timestamp_ns = 1;
-  string clock_domain = 2;
-  string clock_id = 3;
-  uint64 source_sequence = 4;
-  uint64 graph_revision = 5;
-  uint64 optimizations = 6;
-  repeated fixed64 anchor_odom_from_base_bits = 7;
-  repeated fixed64 odom_from_base_bits = 8;
-  repeated fixed64 map_from_base_bits = 9;
-  repeated fixed64 map_from_odom_bits = 10;
-  repeated fixed64 covariance_bits = 11;
-  fixed64 matching_response_bits = 12;
-  fixed64 local_response_bits = 13;
-  string disposition = 14;
-  uint32 node_count = 15;
-  uint32 edge_count = 16;
-}
-message AssignedPlanarRelocalizationEvidenceV2 {
-  uint32 schema_version = 1;
-  AssignedRelocalizationEvidencePhaseV2 phase = 2;
-  optional uint64 admission_ordinal = 3;
-  RelocalizationOwnerReceiptV2 owner = 4;
-  string previous_process = 5;
-  string committed_process = 6;
-  uint64 mode_epoch = 7;
-  repeated PlanarRelocalizationScanV2 accepted_scans = 8;
-  PlanarRelocalizationEstimateV2 estimate = 9;
-  uint64 frame_generation = 10;
-  uint64 source_unix_ns = 11;
-  uint64 committed_unix_ns = 12;
-}
-message AssignedPlanarRelocalizeResultV2 {
-  RelocalizeRequest request = 1;
-  RelocalizeDisposition disposition = 2;
-  uint64 correction_revision = 3;
-  string detail = 4;
-  AssignedPlanarRelocalizationEvidenceV2 evidence = 5;
-}
-
-message RelocalizeResult {
-  reserved 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32;
-  reserved "request_identity_sha256", "runtime_generation", "session_id", "map_name", "session_generation", "backend_generation", "activation_identity_sha256", "target_receipt_sha256", "target_cloud_revision", "target_cloud_sha256", "asset_manifest_sha256", "asset_bundle_sha256", "source_policy_version", "source_policy_sha256", "deadline_policy_version", "deadline_policy_sha256", "logical_timeout_ms", "algorithm_options_version", "algorithm_options_sha256", "disposition", "candidate_sequence", "candidate_payload_sha256", "evidence_sha256", "correction_revision", "terminal_proof_sha256", "detail", "candidate_payload_preimage_v1", "evidence_disclosure_v1", "target_kind", "target_graph_sha256";
-  uint32 schema_version = 1;
-  string request_id = 2;
-  AssignedCloudRelocalizeResultV2 assigned_cloud_v2 = 33;
-  AssignedPlanarRelocalizeResultV2 assigned_planar_v2 = 34;
-}
-
-// A live canonical observation bound to the exact retained applied command.
-// All three timestamps come from the same current odometry observation; source
-// payloads and new identity domains are deliberately absent.
-message AssignedLocalizationSampleV2 {
-  uint32 schema_version = 1;
-  RelocalizeResult terminal = 2;
-  Pose pose = 3;
-  Transform map_from_odom = 4;
-  Transform odom_from_body = 5;
-  RelocalizationOwnerReceiptV2 correction_owner = 6;
-  uint64 correction_revision = 7;
-  uint64 map_frame_generation = 8;
-}
-
-// === 视频帧共享内存 ===
-message VideoFrameShmRef {
-  string shm_path = 1;
-  string uds_path = 2;
-  uint64 sequence = 3;
-  uint32 frame_size = 4;
-  uint64 timestamp_ns = 5;
-}
-
-// === 健康检查 ===
-message HealthCheckRequest {}
-message HealthCheckResponse {
-  bool healthy = 1;
-  string phase = 2;
-  uint64 uptime_ms = 3;
-  uint32 rss_kb = 4;
-  uint64 video_frame_sequence = 5;
-  uint32 video_fps_estimate = 6;
-  string lcm_backend = 7;
-  string geometry_pipeline = 8;
-  uint64 runtime_generation = 9;
-  string planar_input_config = 10;
-  int64 planar_unix_offset_ns = 11;
-}
-
-// === 累积地图共享内存引用 ===
-message CloudMapShmRef {
-  ShmRef shm_ref = 1;
-  uint32 point_count = 2;
-  float voxel_size = 3;
-}
-
-// 全部有效扫描点按原坐标分块读取；epoch变化时旧偏移不可续传。
-message DenseCloudChunkRequest {
-  string expected_epoch = 1;
-  uint64 offset_points = 2;
-  uint32 max_points = 3;
-  bool allow_delta = 4;
-}
-message DenseCloudChunk {
-  string epoch = 1;
-  uint64 revision = 2;
-  uint64 source_timestamp_ns = 3;
-  string frame_id = 4;
-  string session_id = 5;
-  uint64 session_generation = 6;
-  uint64 total_points = 7;
-  uint64 offset_points = 8;
-  bytes xyz_f32_le = 9;
-  repeated float bounds_min = 10;
-  repeated float bounds_max = 11;
-  // 增量基于请求已安装前缀；删除区间为旧前缀中的起点和长度。
-  string base_epoch = 12;
-  uint64 base_offset_points = 13;
-  repeated uint64 removed_ranges = 14;
-}
-
-// === 导航兼容 ===
-enum NavigationOwnerKind {
-  NAVIGATION_OWNER_KIND_UNSPECIFIED = 0;
-  NAVIGATION_OWNER_KIND_PUBLIC_NAV = 1;
-  NAVIGATION_OWNER_KIND_EXPLORATION_CHILD = 2;
+enum GoalStatus {
+  GOAL_STATUS_UNSPECIFIED = 0;
+  GOAL_STATUS_WAITING_INPUT = 1;  // 等待输入：导航栈输入未就绪或禁行区未刷新，就绪后自动继续
+  GOAL_STATUS_PLANNING = 2;       // 规划中（含暂无可行路径、导航栈继续重试的情况，见 no_feasible_path）
+  GOAL_STATUS_EXECUTING = 3;      // 执行中
+  GOAL_STATUS_SUCCEEDED = 4;      // 成功：已到达
+  GOAL_STATUS_FAILED = 5;         // 失败：原因在 message
+  GOAL_STATUS_CANCELLED = 6;      // 已取消：CancelGoal 或会话切换
+  GOAL_STATUS_REPLACED = 7;       // 被替换：新的 SetGoal 到达
+  GOAL_STATUS_STOPPED = 8;        // 已被停止：导航栈申请租约被拒或租约被收回（急停或更新的运动命令）
 }
 
 message NavigationGoal {
-  reserved 9;
-  reserved "motion_guard_generation";
-  reserved 4, 5;
-  reserved "map_revision", "map_version_id";
+  // 目标位姿，地图坐标系；frame_id 为空视为地图坐标系，其它坐标系 → INVALID_ARGUMENT。
+  // 三维地图未给高度时由网关用当前位姿高度填入（Geometry 不猜）。
   Pose pose = 1;
-  string frame_id = 2;
-  string goal_id = 3;
-  string parent_request_id = 6;
-  uint64 goal_generation = 7;
-  NavigationOwnerKind owner_kind = 8;
-  bytes motion_guard_boot_nonce = 10;
-  uint64 motion_stop_generation = 11;
-  bool allow_reverse = 12;
-  optional double position_tolerance_m = 13;
-  optional double yaw_tolerance_rad = 14;
-  // New producers opt in to the authoritative profile default only for an omitted choice.
-  // Legacy messages retain allow_reverse; true+true is contradictory and rejected.
-  bool use_profile_reverse_default = 15;
+  // 受理该运动命令时守卫 Begin 返回的运动代次。Geometry 原样交给导航栈，导航栈用它 Acquire 租约。
+  uint64 motion_generation = 2;
+  // 不设置时按导航配置的默认值。
+  optional bool allow_reverse = 3;
+  optional double position_tolerance_m = 4;
+  optional double yaw_tolerance_rad = 5;
 }
-message CancelNavigationRequest {
+
+message SetGoalResponse {
+  string goal_id = 1;   // Geometry 生成；调用方用它在状态里找到自己的目标、取消目标
+}
+
+message CancelGoalRequest {
+  string goal_id = 1;   // 空 = 当前目标
+}
+
+message NavigationStatus {
   string goal_id = 1;
-  NavigationOwnerKind owner_kind = 2;
-  string parent_request_id = 3;
-  uint64 goal_generation = 4;
-  uint64 producer_runtime_generation = 5;
-  reserved 6;
-  reserved "global_stop_confirmation";
-}
-message NavigationState {
-  reserved 11;
-  reserved "guard_generation";
-  reserved 13, 22, 23, 24;
-  reserved "planner_map_revision", "map_version_id", "goal_payload_sha256", "path_payload_sha256";
-  string status = 1;
-  string message = 2;
-  string goal_id = 3;
-  float distance_remaining = 4;
-  uint64 timestamp_ns = 5;
-  string cancel_phase = 6;
-  uint64 cancel_generation = 7;
-  bool actuator_zeroed = 8;
-  string reason_code = 9;
-  uint64 runtime_generation = 10;
-  bool sink_ready = 12;
-  string planner_map_frame = 14;
-  string planner_pose_frame = 15;
-  string zero_ack_id = 16;
-  uint64 zero_applied_monotonic_ns = 17;
-  NavigationOwnerKind owner_kind = 18;
-  string parent_request_id = 19;
-  uint64 goal_generation = 20;
-  uint64 path_revision = 21;
-  uint64 producer_runtime_generation = 25;
-  // 当前目标已计算路径；终态为空，点采用planner_map_frame坐标。
-  repeated Vec3 planned_path = 26;
-  // 同一目标与全局路径修订下的局部规划展示；缺失或终态为空。
-  repeated Vec3 local_path = 27;
-  uint64 planner_runtime_generation = 28;
-}
-message NavigationReadiness {
-  reserved 10;
-  reserved "forbidden_zone_map_version_id";
-  bool ready = 1;
-  string reason = 2;
-  string reason_code = 3;
-  repeated string blockers = 4;
-  uint64 tf_generation = 5;
-  uint64 planner_generation = 6;
-  uint64 motion_sink_generation = 7;
-  string map_frame = 8;
-  string pose_frame = 9;
-  uint64 forbidden_zone_generation = 11;
-  string forbidden_zone_signature = 12;
-  uint64 forbidden_zone_applied_revision = 13;
-  uint64 planner_costmap_revision = 14;
-  string forbidden_zone_map_name = 15;
+  GoalStatus status = 2;
+  string message = 3;                 // 当前情况或终态原因
+  double remaining_distance_m = 4;    // 沿规划路径的剩余距离；未知为 0
+  Pose target = 5;                    // 目标位姿（显示用）
+  // 规划中且当前找不到到达目标的完整可行路径（导航栈继续重试）。
+  // 网关的区域目标任务据此判断“已在区域内即结束”（总体架构图 flow_nav N7）。
+  bool no_feasible_path = 6;
+  repeated Vec3 planned_path = 7;     // 当前规划路径（地图坐标）；终态为空
+  // 本目标由探索派发（不是 SetGoal）。导航任务只看自己的 goal_id，网页据此区分显示。
+  bool exploration_child = 8;
 }
 
-// Phase 7: 三套 readiness 字段打包 message(JSON 字符串给 Python 解析)。
-// 与 `NavigationReadiness.reason` 同模式:把综合判定 + 各子项字段 JSON 化
-// 塞进 message,Python 端用 dict 解码对应字段。
-message MappingReadiness {
-  bool ready = 1;
-  string message = 2;  // JSON: {lcm_backend, adapter_present, odom_count,
-                       //      pointcloud_count, last_occupancy_revision,
-                       //      accumulated_point_count, last_error}
-}
-message ExplorationReadiness {
-  bool ready = 1;
-  string message = 2;  // JSON: {backend_available, controller_active,
-                        //      source_count, frontier_source_ready,
-                        //      costmap_input_ready, active_source, arbitration}
-}
-
-// === legacy cmd_vel sink readiness compatibility ===
-// Motion guard UDS owner 的 typed generation/ack 是 authoritative source。
-// 本兼容请求的 ready=true 只有在 generation 非零且匹配当前 sink generation
-// 时才可接受；不得由无 generation 的旧调用方制造 ready。
-message CmdVelSinkReadyRequest {
-  option deprecated = true;
-  bool ready = 1;
-  uint64 generation = 2;
-}
-message CmdVelSinkReadyResponse { bool success = 1; }
-
-// === 探索 ===
-message Frontier {
-  Pose pose = 1;
-  uint32 size_cells = 2;
-  float heading = 3;
-}
-message FrontierList {
-  reserved 3, 4;
-  reserved "map_revision", "map_version_id";
-  repeated Frontier frontiers = 1;
-  uint64 revision = 2;       // frontier snapshot revision
-}
+// ============================================================================
+// 探索
+// ============================================================================
 
 message ExplorationBoundarySegment {
   double start_x = 1;
@@ -774,119 +283,181 @@ message ExplorationBoundarySegment {
 }
 
 message ExplorationStopConditions {
-  reserved 5;
-  reserved "stop_on_map_revision_change";
   optional double max_coverage_pct = 1;
   optional uint64 no_frontier_timeout_ms = 2;
   optional uint64 max_duration_ms = 3;
   optional uint32 max_goals = 4;
 }
 
-// 探索启动/停止/状态/诊断 — Phase 5 additive
-// 字段命名与执行方案 §3 Phase 5 + dimos `nuwax-exploration` facade 对齐。
-// strategy 取值:`"wavefront"` / `"tare"` / `"highest_score"` / `"first_available"`
-// （与 dimos `ExplorationArbitrationPolicy` enum 字符串名一致）。
-message ExploreRequest {
-  reserved 11;
-  reserved "motion_guard_generation";
-  reserved 3, 5;
-  reserved "map_version_id", "map_revision";
-  string strategy = 1;
-  string arbitration = 2;
-  string request_id = 4;
-  // Ordered, continuous, closed polygon edges. The server validates topology.
-  repeated ExplorationBoundarySegment boundary_line_segments = 6;
-  ExplorationStopConditions stop_conditions = 7;
-  uint32 max_navigation_retries = 8;
-  double blacklist_radius_m = 9;
-  // A request has one authoritative boundary frame; production accepts map.
-  string boundary_frame_id = 10;
-  bytes motion_guard_boot_nonce = 12;
-  uint64 motion_stop_generation = 13;
-  // 总行程是路径预算，不能换算为未标定电池能耗；缺省保持原探索行为。
-  ExplorationReturnPolicy return_policy = 14;
-  // 只接入已由地图资产拥有方核对、激活并定位的冻结进度；空值表示新任务。
-  string resume_progress_json = 15;
-}
+// 总行程是路径预算，不换算为电池能耗；不设置表示不返航。
 message ExplorationReturnPolicy {
   optional double maximum_distance_m = 1;
   double reserve_distance_m = 2;
   bool return_on_completion = 3;
 }
-message StopExplorationRequest {
-  string request_id = 1;
-  reserved 2, 3;
-  reserved "global_stop_confirmation", "expected_exploration_generation";
-}
-message ExplorationProgressRequest { string request_id = 1; }
-message ExplorationProgressResponse { string checkpoint_json = 1; }
-message ExplorationChildLease {
-  string session_id = 1;
-  NavigationOwnerKind owner_kind = 2;
-  string parent_request_id = 3;
-  uint64 goal_generation = 4;
-  uint64 producer_runtime_generation = 5;
-  reserved 6;
-  reserved "goal_payload_sha256";
-}
-message ExplorationState {
-  reserved 14, 15, 16;
-  reserved "rollover_recovery_eligible", "global_stop_reconciliation", "ownership_reconciliation_receipt";
-  reserved 10, 11;
-  reserved "map_version_id", "map_revision";
-  string status = 1;
-  string message = 2;
-  string request_id = 3;
-  string selected_source = 4;
-  string last_stop_reason = 5;
-  uint32 frontier_count = 6;
-  uint64 revision = 7;
-  uint64 timestamp_ns = 8;
-  string child_task_id = 9;
-  uint64 exploration_generation = 12;
-  ExplorationChildLease child_lease = 13;
-  // 只读版本化采样行程、原起点和返航阶段；没有启用策略时为空。
-  string mission_progress_json = 17;
-  reserved 18;
-  reserved "parking_pending";
-}
-message ExplorationSourceDiag {
-  string source_name = 1;
-  bool is_active = 2;
-  string last_goal_id = 3;
-  string last_error = 4;
-}
-message ExplorationDiagnostics {
-  bool active = 1;
-  string arbitration = 2;
-  string selected_source = 3;
-  string last_stop_reason = 4;
-  repeated ExplorationSourceDiag sources = 5;
-  uint32 frontier_count = 6;
-  uint64 revision = 7;
-  uint64 timestamp_ns = 8;
+
+message ExplorationRequest {
+  // 受理该运动命令时守卫 Begin 返回的运动代次；子导航目标都用它申请租约。
+  uint64 motion_generation = 1;
+  // 有序、首尾相接的闭合多边形边（地图坐标）；为空表示不限范围。拓扑不合法 → INVALID_ARGUMENT。
+  repeated ExplorationBoundarySegment boundary = 2;
+  ExplorationStopConditions stop_conditions = 3;
+  uint32 max_navigation_retries = 4;
+  double blacklist_radius_m = 5;
+  ExplorationReturnPolicy return_policy = 6;
+  // GetExplorationProgress 导出的进度，用于恢复；空表示新任务。地图名与当前会话不符 → FAILED_PRECONDITION。
+  string resume_progress_json = 7;
 }
 
-// === 输入发布兼容（用于调试/自检/preview，区别于 nav2_action_provider）===
+message StartExplorationResponse {
+  string exploration_id = 1;   // Geometry 生成
+}
+
+message StopExplorationRequest {
+  string exploration_id = 1;   // 空 = 当前探索
+}
+
+message ExplorationProgressRequest {
+  string exploration_id = 1;   // 空 = 本会话最近一次探索
+}
+
+message ExplorationProgress {
+  string exploration_id = 1;
+  string progress_json = 2;    // 原样交回 StartExploration.resume_progress_json
+}
+
+enum ExplorationPhase {
+  EXPLORATION_PHASE_UNSPECIFIED = 0;
+  EXPLORATION_PHASE_RUNNING = 1;     // 进行中（含返航）
+  EXPLORATION_PHASE_SUCCEEDED = 2;   // 完成：满足停止条件或没有可达前沿
+  EXPLORATION_PHASE_FAILED = 3;      // 失败：原因在 message
+  EXPLORATION_PHASE_STOPPED = 4;     // 已停止：StopExploration、新导航目标、新探索、会话切换、子目标被急停
+}
+
+message ExplorationStatus {
+  string exploration_id = 1;
+  ExplorationPhase phase = 2;
+  string message = 3;               // 当前在做什么，或结束原因
+  uint32 frontier_count = 4;        // 剩余前沿数
+  uint32 goals_completed = 5;       // 已到达的子目标数
+  bool returning = 6;               // 正在返航（启用返航策略时）
+  double traveled_distance_m = 7;   // 已行驶路程（启用行程预算时）
+}
+
+// ============================================================================
+// 地图
+// ============================================================================
+
+message StartMappingRequest {
+  string map_name = 1;
+  bool continue_saved = 2;
+}
+
+message SaveMapRequest {
+  string map_name = 1;   // 空 = 当前会话地图名
+}
+
+message SaveMapResponse {
+  string map_name = 1;   // 实际保存的地图名
+  bool replaced = 2;     // true：覆盖了已有目录（本会话的来源）；false：新建目录
+}
+
+message LoadMapRequest {
+  string map_name = 1;
+}
+
+// 二维初值：地图坐标 x、y、朝向。
+message PlanarSeed { double x = 1; double y = 2; double yaw = 3; }
+
+message RelocalizeRequest {
+  // 可选初值。二维执行链按初值局部匹配，不给则用地图保存时的位姿；
+  // 三维执行链不接受初值（给了 → INVALID_ARGUMENT），做全局匹配。
+  PlanarSeed seed = 1;
+}
+
+message RelocalizationResult {
+  bool succeeded = 1;
+  string message = 2;            // 失败原因或成功摘要
+  Pose pose = 3;                 // 成功时：校正后的机体位姿（地图坐标）
+  double fitness = 4;            // 匹配得分（算法原值，越小越好）；失败且未算出时为 0
+  uint32 frames_used = 5;        // 参与匹配的帧数
+  uint64 finished_at_ns = 6;     // 结束时间（Unix 纳秒）
+}
+
+message OccupancyGridMeta {
+  uint32 width = 1;
+  uint32 height = 2;
+  float resolution = 3;          // 米/格
+  double origin_x = 4;           // 栅格 (0,0) 角点在地图坐标中的位置
+  double origin_y = 5;
+  string frame_id = 6;
+  uint64 timestamp_ns = 7;       // 本栅格最后一次更新的源时间
+}
+
+// 每格一个 int8：-1 未知，0 空闲，1–100 占据概率（照抄 v2）。按行优先，行数 = height。
+message OccupancyGrid {
+  string map_name = 1;
+  OccupancyGridMeta meta = 2;
+  bytes data = 3;
+}
+
+message GetOccupancyGridRequest {
+  bool include_forbidden = 1;
+}
+
+message MapUpdate {
+  string map_name = 1;
+  OccupancyGridMeta meta = 2;
+  bytes data = 3;        // 叠加禁行区的有效栅格（导航、记忆规划用）
+  bytes raw_data = 4;    // 物理栅格（网页显示后另画禁行区用）；两者布局相同
+}
+
+// 全部有效扫描点按原坐标分块读取。
+message DenseCloudChunkRequest {
+  string expected_epoch = 1;   // 上次读到的 epoch；空表示从头读
+  uint64 offset_points = 2;
+  uint32 max_points = 3;
+  bool allow_delta = 4;        // 允许返回相对已读前缀的增量
+}
+
+message DenseCloudChunk {
+  // 点云内容来源标识：会话切换、加载地图、点云整体重建时改变。网页据此判断能否从 offset 续读
+  // （这是本接口唯一的“身份”字段，调用方为网页稠密点云流）。
+  string epoch = 1;
+  uint64 source_timestamp_ns = 2;
+  string frame_id = 3;
+  uint64 total_points = 4;
+  uint64 offset_points = 5;
+  bytes xyz_f32_le = 6;
+  repeated float bounds_min = 7;
+  repeated float bounds_max = 8;
+  // 增量：基于 base_epoch 已安装前缀；removed_ranges 为旧前缀中的（起点, 长度）对。
+  string base_epoch = 9;
+  uint64 base_offset_points = 10;
+  repeated uint64 removed_ranges = 11;
+}
+
+// ============================================================================
+// 输入（照抄 v2；删去会话号/运行代际字段，见待决问题 Q1）
+// ============================================================================
+
 message PublishOdomRequest {
   Pose pose = 1;
-  string clock_domain = 2;
+  string clock_domain = 2;   // "unix_ns" 或 "monotonic_ns"
   string clock_id = 3;
-  string session_id = 4;
-  uint64 session_generation = 5;
-  uint64 runtime_generation = 6;
 }
+
 message PublishLaserScanRequest {
-  bytes payload = 1;
-  string session_id = 2;
-  uint64 session_generation = 3;
+  bytes payload = 1;         // services/geometry/planar_wire.py 编码的规范二维扫描
 }
+
 message PointCloudField {
   string name = 1;
   uint32 offset = 2;
-  uint32 datatype = 3;      // sensor_msgs/PointField numeric datatype
+  uint32 datatype = 3;      // sensor_msgs/PointField 数值类型
   uint32 count = 4;
 }
+
 message LioImuSample {
   uint64 timestamp_ns = 1;
   string frame_id = 2;
@@ -896,15 +467,16 @@ message LioImuSample {
   double gyro_rps_x = 6;
   double gyro_rps_y = 7;
   double gyro_rps_z = 8;
-  // 姿态不是所有 IMU 源都提供；false 时必须按 unknown 处理，禁止伪造单位四元数。
+  // 姿态不是所有 IMU 源都提供；false 时按未知处理。
   bool orientation_valid = 9;
   double orientation_x = 10;
   double orientation_y = 11;
   double orientation_z = 12;
   double orientation_w = 13;
 }
+
 message PublishPointCloudRequest {
-  bytes points = 1;          // canonical PointCloud2 data bytes（保留 field tag 兼容旧 client）
+  bytes points = 1;          // 规范 PointCloud2 数据字节
   uint32 point_step = 2;
   string frame_id = 3;
   uint64 timestamp_ns = 4;
@@ -912,7 +484,7 @@ message PublishPointCloudRequest {
   uint32 point_count = 6;
   bool is_dense = 7;
   repeated LioImuSample imu_samples = 8;
-  // 辅助观测使用已估计位姿更新同一地图，不进入激光惯性前端。
+  // 辅助观测：用已估计位姿更新同一地图，不进入激光惯性前端。
   bool mapping_only = 9;
   repeated double sensor_origin_xyz = 10;
   string sensor_id = 11;
@@ -920,144 +492,8 @@ message PublishPointCloudRequest {
   string clock_id = 13;
   string calibration_ref = 14;
 }
-message PublishResult { bool success = 1; string message = 2; }
-// 生产者报告已经破坏本代输入连续性；几何重启前禁止接纳更晚扫描。
-message NativeInputFailureRequest {
-  string reason = 1;
-  uint64 first_missing_source_timestamp_ns = 2;
-}
 
-message MappingCloudAuthority {
-  reserved 3, 4, 6, 7, 8;
-  reserved "asset_manifest_sha256", "asset_bundle_sha256", "activation_request_identity_sha256", "activation_identity_sha256", "target_receipt_sha256";
-  string map_name = 1;
-  string map_frame_id = 2;
-  string activation_request_id = 5;
-  uint64 runtime_generation = 9;
-  uint64 lifecycle_epoch = 10;
-  string mapping_session_id = 11;
-  uint64 mapping_session_generation = 12;
-  string backend_kind = 13;
-  uint64 backend_generation = 14;
-  uint64 committed_occupancy_revision = 15;
-  reserved 16;
-  reserved "committed_occupancy_sha256";
-  uint64 owner_epoch = 17;
-  uint32 schema_version = 18;
-  MappingCommitIdentity committed_occupancy_commit_id = 19;
-  uint64 committed_occupancy_source_timestamp_ns = 20;
-  // Schema 3: the original assigned activation receipt is the sole asset authority.
-  ActivationReceiptV2 activation_receipt_v2 = 21;
-}
-
-message MappingCloudGoalRequest {
-  reserved 16;
-  reserved "motion_guard_generation";
-  reserved 7, 8, 10;
-  reserved "asset_manifest_sha256", "asset_bundle_sha256", "activation_identity_sha256";
-  string query_request_id = 1;
-  string query_text = 2;
-  uint64 caller_timeout_ms = 3;
-  uint64 provider_timeout_ms = 4;
-  string map_name = 5;
-  string map_frame_id = 6;
-  bytes georeference_json = 9;
-  uint64 runtime_generation = 11;
-  string mapping_session_id = 12;
-  uint64 mapping_session_generation = 13;
-  uint64 committed_occupancy_revision = 14;
-  reserved 15;
-  reserved "committed_occupancy_sha256";
-  bytes motion_guard_boot_nonce = 17;
-  uint64 motion_stop_generation = 18;
-  uint32 schema_version = 19;
-  MappingCommitIdentity committed_occupancy_commit_id = 20;
-  uint64 committed_occupancy_source_timestamp_ns = 21;
-  // Schema 3: copied from the original assigned authority response.
-  ActivationReceiptV2 activation_receipt_v2 = 22;
-}
-
-message MappingCloudGoalTerminal {
-  string status = 1;
+message PublishResult {
+  bool success = 1;
   string message = 2;
-  string query_request_id = 3;
-  NavigationState navigation = 4;
-}
-
-// ============================================================================
-// 服务定义：GeometryRuntime gRPC facade
-// ============================================================================
-service GeometryRuntime {
-  // 控制面
-  rpc Start(StartRequest) returns (StartResult);
-  rpc Stop(StopRequest) returns (StopResult);
-  rpc GetStatus(Empty) returns (RuntimeStatus);
-  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
-
-  // 定位
-  rpc GetCurrentPose(PoseRequest) returns (Pose);
-  rpc SubscribePose(PoseRequest) returns (stream PoseUpdate);
-  rpc GetFrameTree(Empty) returns (FrameTree);
-
-  // 地图
-  rpc GetOccupancyGrid(Empty) returns (OccupancyGridMeta);
-  rpc GetOccupancyGridData(Empty) returns (OccupancyGridData);
-  // Physical occupancy before virtual forbidden zones are composed.  Map
-  // asset persistence must use this getter to avoid baking keepouts into a
-  // checkpoint permanently.
-  rpc GetRawOccupancyGridData(Empty) returns (OccupancyGridData);
-  rpc GetOccupancyGridShm(Empty) returns (ShmRef);
-  rpc SubscribeMapUpdates(Empty) returns (stream MapUpdateNotification);
-  rpc SubscribeCloudMapUpdates(Empty) returns (stream CloudMapShmRef);
-  rpc GetDenseCloudChunk(DenseCloudChunkRequest) returns (DenseCloudChunk);
-  rpc StartMapping(StartMappingRequest) returns (MappingSessionState);
-  rpc StopMapping(StopMappingRequest) returns (MappingSessionState);
-  rpc GetMappingState(Empty) returns (MappingSessionState);
-  rpc TransferGraphArtifact(GraphArtifactTransferRequest) returns (GraphArtifactTransferResponse);
-  rpc ExportMappingBackendCheckpoint(ExportMappingBackendCheckpointRequest) returns (MappingBackendCheckpoint);
-  rpc ActivateMap(ActivateMapRequest) returns (MappingSessionState);
-  rpc Relocalize(RelocalizeRequest) returns (RelocalizeResult);
-  rpc GetAssignedLocalizationSample(RelocalizeRequest) returns (AssignedLocalizationSampleV2);
-
-  // 导航兼容（与 nuwax-nav-stack LCM channel 接口对应）
-  rpc SetNavigationGoal(NavigationGoal) returns (NavigationState);
-  rpc GetMappingCloudAuthority(Empty) returns (MappingCloudAuthority);
-  rpc GetNavigationMapBlock(NavigationMapBlockRequest) returns (NavigationMapBlockResponse);
-  rpc SubmitMappingCloudGoal(MappingCloudGoalRequest) returns (MappingCloudGoalTerminal);
-  rpc CancelNavigation(CancelNavigationRequest) returns (NavigationState);
-  rpc SubscribeNavigationState(Empty) returns (stream NavigationState);
-  rpc GetNavigationReadiness(Empty) returns (NavigationReadiness);
-
-  // Phase 7: mapping + exploration readiness(各板块独立 RPC,message JSON 解析)。
-  // 详见 `mapping_adapter::MappingReadiness` / `explore_runtime::ExplorationReadinessDetail`。
-  rpc GetMappingReadiness(Empty) returns (MappingReadiness);
-  rpc GetExplorationReadiness(Empty) returns (ExplorationReadiness);
-
-  // Legacy compatibility only; authoritative readiness comes from the
-  // generation-fenced motion guard owner.
-  rpc SetCmdVelSinkReady(CmdVelSinkReadyRequest) returns (CmdVelSinkReadyResponse) {
-    option deprecated = true;
-  }
-
-  // 探索（与 nuwax-exploration LCM channel 接口对应）
-  rpc GetFrontiers(Empty) returns (FrontierList);
-  rpc SubscribeFrontiers(Empty) returns (stream FrontierList);
-  // Phase 5 additive: 探索 start/stop/state/diagnostics。
-  // 返回 ExplorationState.status 取值：
-  //   "ACCEPTED"   — controller 已 begin，调用方进入 active 状态
-  //   "REJECTED"   — request 被拒绝（NoSources / AlreadyActive / etc.）
-  //   "PENDING"    — controller 暂时没有可用 goal（wavefront / source pending）
-  //   "STOPPED"    — 已 stop，message 含 stop reason
-  //   "UNIMPLEMENTED" — Phase 5 stub 暂未接通 nuwax-exploration crate
-  rpc StartExploration(ExploreRequest) returns (ExplorationState);
-  rpc StopExploration(StopExplorationRequest) returns (ExplorationState);
-  rpc GetExplorationState(Empty) returns (ExplorationState);
-  rpc GetExplorationProgress(ExplorationProgressRequest) returns (ExplorationProgressResponse);
-  rpc GetExplorationDiagnostics(Empty) returns (ExplorationDiagnostics);
-
-  // 输入发布兼容
-  rpc PublishLaserScan(PublishLaserScanRequest) returns (PublishResult);
-  rpc PublishOdom(PublishOdomRequest) returns (PublishResult);
-  rpc PublishPointCloud(PublishPointCloudRequest) returns (PublishResult);
-  rpc ReportNativeInputFailure(NativeInputFailureRequest) returns (PublishResult);
 }

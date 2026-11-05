@@ -8,7 +8,7 @@ use nuwax_cloud_cleanup::{
 };
 use nuwax_dufomap_native::DufoMap;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+
 use std::{
     fs::File,
     io::{BufReader, BufWriter, Read, Write},
@@ -22,6 +22,7 @@ pub(crate) struct Request {
     pub output: PathBuf,
     pub strength_percent: u8,
     pub scan_log: Option<PathBuf>,
+    pub scan_logs: Vec<PathBuf>,
     pub final_poses: Option<PathBuf>,
     pub source_timestamp_ns: u64,
     pub backend: Option<PathBuf>,
@@ -31,8 +32,6 @@ pub(crate) struct Request {
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Report {
-    pub source_fine_sha256: String,
-    pub source_dense_sha256: String,
     pub preview: CleanupPreview,
     pub offline_frames: usize,
     pub offline_points: usize,
@@ -48,19 +47,6 @@ pub(crate) struct Report {
 }
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
-}
-fn digest(path: &Path) -> Result<String, String> {
-    let mut f = File::open(path).map_err(err)?;
-    let mut h = Sha256::new();
-    let mut b = [0; 65536];
-    loop {
-        let n = f.read(&mut b).map_err(err)?;
-        if n == 0 {
-            break;
-        }
-        h.update(&b[..n]);
-    }
-    Ok(format!("{:x}", h.finalize()))
 }
 fn transform(m: &Matrix4<f64>, p: [f32; 3]) -> [f32; 3] {
     let p = m * Vector4::new(p[0] as f64, p[1] as f64, p[2] as f64, 1.);
@@ -115,55 +101,55 @@ fn replay(request: &Request, cancelled: &impl Fn() -> bool) -> Result<Replay, St
             "{reason}；仅执行半径离群兜底，离线判定不完整"
         )))
     };
-    let Some(path) = &request.scan_log else {
+    let paths: Vec<_> = request
+        .scan_log
+        .iter()
+        .chain(request.scan_logs.iter())
+        .collect();
+    if paths.is_empty() {
         return unavailable("原始扫描日志缺失");
-    };
-    if path.with_extension("incomplete").exists() {
-        return unavailable("原始扫描记录中断或丢帧");
     }
     let archive = nuwax_map_chunks::ArchiveReader::open(File::open(&request.fine).map_err(err)?)?;
     let root = archive.root();
-    let mut scans = match ScanReader::open(path) {
-        Ok(s) => s,
-        Err(e) if e.contains("v1") => return unavailable(&e),
-        Err(e) => return Err(e),
-    };
-    if scans.session.session_id != root.domain().session
-        || scans.session.generation != root.domain().generation
-    {
-        return Err("原始扫描不属于此保存地图".into());
+    let mut readers = Vec::new();
+    for path in paths {
+        if path.with_extension("incomplete").exists() {
+            return unavailable("原始扫描记录中断或丢帧");
+        };
+        let reader = ScanReader::open(path)?;
+        if reader.session.session_id != root.domain().session {
+            return Err("原始扫描不属于此保存地图".into());
+        }
+        readers.push(reader);
     }
     let mut poses = HashMap::new();
     if let Some(path) = &request.final_poses {
         let saved: FinalPoses =
             serde_json::from_reader(BufReader::new(File::open(path).map_err(err)?)).map_err(err)?;
-        if saved.session != scans.session || saved.cloud_revision > root.revision() {
+        if saved.session.session_id != root.domain().session
+            || saved.cloud_revision > root.revision()
+        {
             return Err("最终位姿与保存地图不匹配".into());
         }
-        let generation = root.domain().frame_generation;
-        if !saved
-            .frame_generation
-            .map_or(generation == 0, |g| g == generation)
-        {
-            return unavailable("最终位姿的地图坐标代际与保存地图不一致");
-        }
         poses.extend(saved.poses);
-    } else if root.domain().frame_generation > 0 {
-        return unavailable("保存地图已做坐标校正，但缺少对应最终位姿");
     }
     let pose_cut = poses.keys().copied().max().unwrap_or(0);
     let mut dufo = DufoMap::new(&offline_dufomap::params(request.strength_percent)?)?;
-    let (mut frames, mut points, mut last) = (0, 0, 0);
-    while let Some(scan) = scans.next_scan()? {
+    let (mut frames, mut points) = (0, 0);
+    let mut all_scans = Vec::new();
+    for reader in &mut readers {
+        while let Some(scan) = reader.next_scan()? {
+            all_scans.push(scan);
+        }
+    }
+    all_scans.sort_by_key(|scan| scan.metadata.source_timestamp_ns);
+    for scan in all_scans {
         if cancelled() {
             return Err("清理已取消，原图未改变".into());
         }
         let stamp = scan.metadata.source_timestamp_ns;
         if stamp > request.source_timestamp_ns {
             break;
-        }
-        if stamp <= last {
-            return Err("原始扫描时间未严格前进".into());
         }
         if stamp <= pose_cut && !poses.contains_key(&stamp) {
             return unavailable("最终位姿未覆盖选中的原始扫描");
@@ -175,7 +161,6 @@ fn replay(request: &Request, cancelled: &impl Fn() -> bool) -> Result<Replay, St
         dufo.insert(&world, origin, false)?;
         frames += 1;
         points += world.len();
-        last = stamp;
     }
     if frames == 0 {
         return unavailable("原始扫描日志没有覆盖保存快照");
@@ -185,9 +170,14 @@ fn replay(request: &Request, cancelled: &impl Fn() -> bool) -> Result<Replay, St
         map: dufo,
         frames,
         points,
-        complete: !scans.truncated
-            && scans.dropped_frames == 0
-            && scans.observed_until_ns >= request.source_timestamp_ns,
+        complete: !readers
+            .iter()
+            .any(|reader| reader.truncated || reader.dropped_frames != 0)
+            && readers
+                .iter()
+                .map(|reader| reader.observed_until_ns)
+                .max()
+                .is_some_and(|stamp| stamp >= request.source_timestamp_ns),
     }))
 }
 fn read_dense(path: &Path) -> Result<(serde_json::Value, Vec<[f64; 3]>), String> {
@@ -277,7 +267,6 @@ pub(crate) fn prepare(request: &Request) -> Result<Report, String> {
     let map = CompletedMap::read(&request.fine)?;
     let (metadata, dense) = read_dense(&request.dense)?;
     if metadata["session_id"].as_str() != Some(root.domain().session.as_str())
-        || metadata["session_generation"].as_u64() != Some(root.domain().generation)
         || metadata["cloud_revision"].as_u64() != Some(root.revision())
         || metadata["source_timestamp_ns"].as_u64() != Some(root.source_timestamp_ns())
         || request.source_timestamp_ns != root.source_timestamp_ns()
@@ -400,8 +389,6 @@ pub(crate) fn prepare(request: &Request) -> Result<Report, String> {
     xyz.flush().map_err(err)?;
     xyz.get_ref().sync_all().map_err(err)?;
     let report = Report {
-        source_fine_sha256: digest(&request.fine)?,
-        source_dense_sha256: digest(&request.dense)?,
         preview,
         offline_frames: offline.as_ref().map_or(0, |e| e.frames),
         offline_points: offline.as_ref().map_or(0, |e| e.points),
@@ -547,278 +534,122 @@ fn write_other_members(
 
 pub(crate) fn run_requested() -> Option<Result<(), String>> {
     let args: Vec<_> = std::env::args_os().collect();
-    if args.get(1).is_none_or(|a| a != "--cleanup-completed-cloud") {
+    if args
+        .get(1)
+        .is_none_or(|arg| arg != "--cleanup-completed-cloud")
+    {
         return None;
     }
     Some((|| {
-        let path = args.get(2).ok_or("缺少清理请求文件")?;
-        let request: Request =
-            serde_json::from_reader(File::open(path).map_err(err)?).map_err(err)?;
-        prepare(&request)?;
-        Ok(())
+        if args.len() != 4 {
+            return Err("用法：--cleanup-completed-cloud <源地图名> <目标地图名>".into());
+        }
+        let source = args[2].to_str().ok_or("源地图名不是有效文本")?;
+        let target = args[3].to_str().ok_or("目标地图名不是有效文本")?;
+        cleanup_maps(source, target)
     })())
+}
+pub(crate) fn cleanup_maps(source: &str, target: &str) -> Result<(), String> {
+    fn name(value: &str) -> Result<(), String> {
+        if value.is_empty()
+            || value.chars().count() > 64
+            || value.starts_with('.')
+            || value
+                .chars()
+                .any(|c| c == '/' || c == '\0' || c.is_control())
+        {
+            Err("地图名无效".into())
+        } else {
+            Ok(())
+        }
+    }
+    name(source)?;
+    name(target)?;
+    let store = crate::map_store::MapStore::from_env();
+    if store.exists(target) {
+        return Err(format!("目标地图已存在：{target}"));
+    }
+    let mut snapshot = store.load(source).map_err(err)?;
+    let source_dir = store.root().join(source).join("geometry");
+    let scratch = store
+        .root()
+        .join(format!(".cleanup-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&scratch).map_err(err)?;
+    let _guard = CleanupDirectory(scratch.clone());
+    let grid = snapshot.occupancy.as_ref().ok_or("源地图没有占据栅格")?;
+    let meta = grid.meta.as_ref().ok_or("源地图占据栅格没有元数据")?;
+    std::fs::write(scratch.join("source-occupancy.bin"), &grid.data).map_err(err)?;
+    let fine_file = source_dir.join("fine.map");
+    if !fine_file.exists() || !source_dir.join("dense.bin").exists() {
+        return Err("源地图没有完整精细/稠密点云".into());
+    }
+    let root = nuwax_map_chunks::ArchiveReader::open(File::open(&fine_file).map_err(err)?)?
+        .root()
+        .clone();
+    let poses = nuwax_cloud_cleanup::scan_log::FinalPoses {
+        session: nuwax_cloud_cleanup::scan_log::Session {
+            session_id: root.domain().session.clone(),
+            generation: root.domain().generation,
+        },
+        cloud_revision: root.revision(),
+        frame_generation: None,
+        poses: snapshot.final_poses.clone(),
+    };
+    let poses_path = scratch.join("final-poses.json");
+    serde_json::to_writer(File::create(&poses_path).map_err(err)?, &poses).map_err(err)?;
+    let output = scratch.join("result");
+    let request = Request {
+        fine: fine_file,
+        dense: source_dir.join("dense.bin"),
+        output: output.clone(),
+        strength_percent: 50,
+        scan_log: None,
+        scan_logs: snapshot
+            .scans
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect(),
+        final_poses: Some(poses_path),
+        source_timestamp_ns: snapshot.cloud.source_timestamp_ns,
+        backend: (!snapshot.backend_checkpoint.is_empty()).then(|| source_dir.join("backend.bin")),
+        occupancy: Some(scratch.join("source-occupancy.bin")),
+        occupancy_descriptor: Some(
+            serde_json::json!({"width":meta.width,"height":meta.height,"resolution":meta.resolution,"origin_x":meta.origin_x,"origin_y":meta.origin_y,"frame_id":meta.frame_id,"timestamp_ns":meta.timestamp_ns}),
+        ),
+        cancel_file: None,
+    };
+    prepare(&request)?;
+    snapshot.cloud.fine = None;
+    snapshot.cloud.fine_archive = Some(std::sync::Arc::new(
+        File::open(output.join("fine.bin")).map_err(err)?,
+    ));
+    let mut dense_file = File::open(output.join("dense.bin")).map_err(err)?;
+    let (metadata, _) = crate::dense_cloud::read_metadata(&mut dense_file)?;
+    let dense = crate::dense_cloud::DenseCloud::from_archive(dense_file, &metadata)?;
+    snapshot.cloud.dense = dense.snapshot(
+        metadata.source_timestamp_ns,
+        metadata.cloud_revision,
+        &metadata.session_id,
+    );
+    snapshot.cloud.display = std::fs::read(output.join("cloud.xyzf32"))
+        .map_err(err)?
+        .into();
+    if !snapshot.backend_checkpoint.is_empty() {
+        snapshot.backend_checkpoint = std::fs::read(output.join("backend.bin")).map_err(err)?;
+        if let Some(grid) = snapshot.occupancy.as_mut() {
+            grid.data = std::fs::read(output.join("occupancy.bin")).map_err(err)?;
+        }
+    }
+    store.save(target, None, snapshot).map_err(err)?;
+    Ok(())
+}
+struct CleanupDirectory(PathBuf);
+impl Drop for CleanupDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn offline_cleanup_removes_person_from_unfiltered_saved_assets_and_keeps_static() {
-        use crate::dynamic_scene::tests::{corridor, ORIGIN};
-        use nuwax_cloud_cleanup::scan_log::{ScanLog, ScanMetadata, Session};
-        let folder =
-            std::env::temp_dir().join(format!("neh-dufo-saved-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&folder).unwrap();
-        let session = Session {
-            session_id: "unfiltered".into(),
-            generation: 1,
-        };
-        let mut log = ScanLog::open(&folder.join("scans"), session.clone()).unwrap();
-        let identity = Matrix4::identity().as_slice().try_into().unwrap();
-        let mut dense = Vec::new();
-        let mut human = HashSet::new();
-        let mut static_keys = HashSet::new();
-        for frame in 0..60 {
-            let (points, truth) = corridor(
-                (frame < 30).then_some(-1.0 + frame as f64 * 2.0 / 29.0),
-                (frame % 3) as f64,
-            );
-            let stamp = (frame + 1) * 100_000_000;
-            let metadata = ScanMetadata {
-                source_timestamp_ns: stamp,
-                source_sequence: frame + 1,
-                sensor: "lidar".into(),
-                source_generation: 1,
-                odom_from_body: identity,
-                map_from_odom: identity,
-                sensor_origin_body: Some(ORIGIN.map(|v| v as f32)),
-                observation_minimum_range_m: None,
-                point_count: points.len(),
-            };
-            log.append(
-                &metadata,
-                points.iter().map(|p| [p.x as f32, p.y as f32, p.z as f32]),
-                None,
-            )
-            .unwrap();
-            log.progress(stamp, 0).unwrap();
-            for (p, on_person) in points.iter().zip(truth) {
-                let p = [p.x, p.y, p.z];
-                let key = asset_key(p, 0.05);
-                if on_person {
-                    if p[2] > 0.35 {
-                        human.insert(key);
-                    }
-                } else {
-                    static_keys.insert(key);
-                }
-                dense.push(p);
-            }
-        }
-        log.sync().unwrap();
-        let original: HashSet<_> = dense.iter().map(|&p| asset_key(p, 0.05)).collect();
-        let mut writer = nuwax_map_chunks::Writer::new(
-            nuwax_map_chunks::Repository::temporary().unwrap(),
-            0.05,
-            4 * 1024 * 1024,
-        )
-        .unwrap();
-        writer.seed_unknown(original.iter().copied()).unwrap();
-        let sealed = writer
-            .seal(
-                nuwax_map_chunks::Domain {
-                    session: session.session_id.clone(),
-                    generation: 1,
-                    frame_generation: 0,
-                    producer_generation: 1,
-                },
-                1,
-                6_000_000_000,
-            )
-            .unwrap();
-        let fine = folder.join("fine.bin");
-        let (mut archive, _) =
-            nuwax_map_chunks::archive_file(sealed.manifest(), &sealed.repository).unwrap();
-        std::io::copy(&mut archive, &mut File::create(&fine).unwrap()).unwrap();
-        let dense_path = folder.join("dense.bin");
-        write_dense(&dense_path,serde_json::json!({"session_id":session.session_id,"session_generation":1,"cloud_revision":0,"source_timestamp_ns":6_000_000_000u64}),&dense).unwrap();
-        let request = Request {
-            fine,
-            dense: dense_path,
-            output: folder.join("cleaned"),
-            strength_percent: 50,
-            scan_log: Some(log.path.clone()),
-            final_poses: None,
-            source_timestamp_ns: 6_000_000_000,
-            backend: None,
-            occupancy: None,
-            occupancy_descriptor: None,
-            cancel_file: None,
-        };
-        let report = prepare(&request).unwrap();
-        assert!(report.offline_complete);
-        assert_eq!(report.offline_frames, 60);
-        let after: HashSet<_> = CompletedMap::read(&request.output.join("fine.bin"))
-            .unwrap()
-            .keys
-            .into_iter()
-            .collect();
-        let human: HashSet<_> = human.difference(&static_keys).copied().collect();
-        assert!(!human.is_empty());
-        let removed = human.difference(&after).count();
-        assert!(
-            removed as f64 / human.len() as f64 > 0.95,
-            "未过滤保存地图的行人身体应被后续射线移除：{removed}/{}",
-            human.len()
-        );
-        assert!(static_keys.is_subset(&after), "墙与地面应完整保留");
-        assert!(after.is_subset(&original));
-        assert_eq!(
-            report.preview.candidate_points,
-            original.difference(&after).count()
-        );
-        assert!(report.dense_after < report.dense_before);
-        drop(log);
-        std::fs::remove_dir_all(folder).unwrap();
-    }
-    #[test]
-    fn final_pose_transforms_body_returns_and_sensor_origin_together() {
-        use nuwax_cloud_cleanup::scan_log::ScanMetadata;
-        let identity = Matrix4::identity().as_slice().try_into().unwrap();
-        let metadata = ScanMetadata {
-            source_timestamp_ns: 10,
-            source_sequence: 1,
-            sensor: "lidar".into(),
-            source_generation: 1,
-            odom_from_body: identity,
-            map_from_odom: identity,
-            sensor_origin_body: Some([0.28945, 0., -0.046825]),
-            observation_minimum_range_m: None,
-            point_count: 1,
-        };
-        let scan = LoggedScan {
-            metadata,
-            points: vec![[-2., 1., 3.]],
-            intensities: None,
-        };
-        let corrected = nalgebra::Isometry3::new(
-            nalgebra::Vector3::new(-5., 2., 1.),
-            nalgebra::Vector3::new(0., 0., std::f64::consts::FRAC_PI_2),
-        );
-        let poses = HashMap::from([(
-            10,
-            corrected.to_homogeneous().as_slice().try_into().unwrap(),
-        )]);
-        let (points, origin) = scan_points(&scan, &poses).unwrap();
-        for (&actual, expected) in points[0].iter().zip([-6., 0., 4.]) {
-            assert!(
-                (actual - expected).abs() < 1e-6,
-                "单精度地图坐标应保持最终三维变换精度"
-            );
-        }
-        for (actual, expected) in origin.into_iter().zip([-5., 2.28945, 0.953175]) {
-            assert!((actual - expected).abs() < 1e-6);
-        }
-        let (uncorrected, _) = scan_points(&scan, &HashMap::new()).unwrap();
-        assert_eq!(uncorrected, scan.points);
-    }
-    #[test]
-    fn final_poses_require_the_saved_map_frame_generation() {
-        use nuwax_cloud_cleanup::scan_log::{ScanLog, ScanMetadata, Session};
-        let folder = std::env::temp_dir().join(format!(
-            "neh-cleanup-final-poses-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&folder).unwrap();
-        let session = Session {
-            session_id: "位姿代际验证".into(),
-            generation: 1,
-        };
-        let identity: [f64; 16] = nalgebra::Matrix4::identity().as_slice().try_into().unwrap();
-        let mut log = ScanLog::open(&folder.join("scans"), session.clone()).unwrap();
-        log.append(
-            &ScanMetadata {
-                source_timestamp_ns: 100,
-                source_sequence: 1,
-                sensor: "lidar".into(),
-                source_generation: 1,
-                odom_from_body: identity,
-                map_from_odom: identity,
-                sensor_origin_body: Some([0.; 3]),
-                observation_minimum_range_m: None,
-                point_count: 1,
-            },
-            [[0.025, 0.025, 0.025]].into_iter(),
-            None,
-        )
-        .unwrap();
-        log.progress(100, 0).unwrap();
-        log.sync().unwrap();
-        for generation in [0, 2] {
-            let mut writer = nuwax_map_chunks::Writer::new(
-                nuwax_map_chunks::Repository::temporary().unwrap(),
-                0.05,
-                4 * 1024 * 1024,
-            )
-            .unwrap();
-            writer.seed_unknown([[0, 0, 0]]).unwrap();
-            let sealed = writer
-                .seal(
-                    nuwax_map_chunks::Domain {
-                        session: session.session_id.clone(),
-                        generation: 1,
-                        frame_generation: generation,
-                        producer_generation: 1,
-                    },
-                    1,
-                    100,
-                )
-                .unwrap();
-            let fine = folder.join(format!("fine-{generation}.bin"));
-            let (mut archive, _) =
-                nuwax_map_chunks::archive_file(sealed.manifest(), &sealed.repository).unwrap();
-            std::io::copy(&mut archive, &mut File::create(&fine).unwrap()).unwrap();
-
-            for supplied in [Some(generation), Some(1), None] {
-                let poses = folder.join(format!("poses-{generation}-{supplied:?}.json"));
-                let mut value = serde_json::json!({ "session": session, "cloud_revision": 1,
-                    "poses": [[100, identity]] });
-                if let Some(supplied) = supplied {
-                    value["frame_generation"] = supplied.into();
-                }
-                std::fs::write(&poses, serde_json::to_vec(&value).unwrap()).unwrap();
-                let output = folder.join(format!("output-{generation}-{supplied:?}"));
-                std::fs::create_dir_all(&output).unwrap();
-                let request = Request {
-                    fine: fine.clone(),
-                    dense: PathBuf::new(),
-                    output,
-                    strength_percent: 50,
-                    scan_log: Some(log.path.clone()),
-                    final_poses: Some(poses),
-                    source_timestamp_ns: 100,
-                    backend: None,
-                    occupancy: None,
-                    occupancy_descriptor: None,
-                    cancel_file: None,
-                };
-                let outcome = replay(&request, &|| false).unwrap();
-                let expected =
-                    supplied == Some(generation) || (supplied.is_none() && generation == 0);
-                match outcome {
-                    Replay::Available(result) => {
-                        assert!(expected);
-                        assert!(result.complete);
-                        assert_eq!(result.frames, 1);
-                    }
-                    Replay::Unavailable(reason) => {
-                        assert!(!expected);
-                        assert!(reason.contains("代际"));
-                    }
-                }
-            }
-        }
-        drop(log);
-        std::fs::remove_dir_all(folder).unwrap();
-    }
-}
+#[path = "completed_cleanup_tests.rs"]
+mod tests;

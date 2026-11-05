@@ -41,7 +41,8 @@ const fn row_bits(dy: usize) -> u128 {
 /// 3×3 膨胀后仍在窗口且坐标可表示的位置。左右移一位跨行的部分被清除；
 /// 第80位左移出的第81位也要先清掉，否则再右移9位会落到第72位。
 fn dilate(window: u128, input: u128) -> u128 {
-    let row = (input | ((input << 1) & !row_bits(0)) | ((input >> 1) & !row_bits(8))) & ((1 << 81) - 1);
+    let row =
+        (input | ((input << 1) & !row_bits(0)) | ((input >> 1) & !row_bits(8))) & ((1 << 81) - 1);
     (row | (row << 9) | (row >> 9)) & window
 }
 fn edge(upper: u128, lower: u128) -> bool {
@@ -82,7 +83,8 @@ fn vertical(bins: &[Bin]) -> bool {
 }
 fn upright(local: &Local, lower: u128) -> bool {
     let columns = local.vertical;
-    if columns == 0 || (columns & lower).count_ones() as usize * 3 < lower.count_ones() as usize * 2 {
+    if columns == 0 || (columns & lower).count_ones() as usize * 3 < lower.count_ones() as usize * 2
+    {
         return false;
     }
     let n = columns.count_ones() as f64;
@@ -138,11 +140,10 @@ fn compare_masks(local: &Local, lower: u128, upper: u128) -> Shape {
     }
 }
 
-
 use nuwax_map_chunks::heightfield_observations::HeightfieldColumn;
 use nuwax_map_chunks::{
-    ColumnGroundRecords, HeightfieldSurface, Key, LayerSample, LayerSource,
-    Writer, MAX_LAYER_SAMPLES,
+    ColumnGroundRecords, HeightfieldSurface, Key, LayerSample, LayerSource, Writer,
+    MAX_LAYER_SAMPLES,
 };
 use rayon::prelude::*;
 use std::sync::{Arc, OnceLock};
@@ -191,21 +192,16 @@ impl Old<'_> {
     fn contains(self, z: i32) -> bool {
         match self {
             Self::Heightfield(v) => v.column.members().any(|(key, _)| key == z),
-
         }
     }
     fn members(self) -> Vec<i32> {
         match self {
             Self::Heightfield(v) => v.column.members().map(|(z, _)| z).collect(),
-
         }
     }
 }
 fn old_records(column: &ColumnGroundRecords) -> impl Iterator<Item = Old<'_>> {
-    column
-        .heightfields
-        .iter()
-        .map(Old::Heightfield)
+    column.heightfields.iter().map(Old::Heightfield)
 }
 /// 列集合的切比雪夫邻域，以 `(x, y最小, y最大)` 行区间表示。坐标越出 i32 的列
 /// 与逐列 `checked_add` 展开一样被丢弃；区间按行排序，同行重叠或相邻者已合并。
@@ -252,10 +248,20 @@ impl<'a> Columns<'a> {
     fn with_capacity(count: usize) -> Self {
         let mut starts = Vec::with_capacity(count + 1);
         starts.push(0);
-        Self { xy: Vec::with_capacity(count), starts, values: Vec::new(), old: Vec::with_capacity(count) }
+        Self {
+            xy: Vec::with_capacity(count),
+            starts,
+            values: Vec::new(),
+            old: Vec::with_capacity(count),
+        }
     }
     /// 按 `(x, y)` 升序追加一列。
-    fn push(&mut self, xy: Xy, values: impl IntoIterator<Item = Bin>, old: Option<&'a ColumnGroundRecords>) {
+    fn push(
+        &mut self,
+        xy: Xy,
+        values: impl IntoIterator<Item = Bin>,
+        old: Option<&'a ColumnGroundRecords>,
+    ) {
         let start = self.values.len();
         self.values.extend(values);
         self.values[start..].sort_unstable();
@@ -272,18 +278,35 @@ impl<'a> Columns<'a> {
         self.old.push(old);
     }
     /// 本帧几何：有回波的列取非动态回波子格，其余读取列取历史高度场的正质量子格。
-    fn frame(old: &'a BTreeMap<Xy, ColumnGroundRecords>, current: &BTreeMap<Xy, Vec<&Return>>) -> Self {
+    fn frame(
+        old: &'a BTreeMap<Xy, ColumnGroundRecords>,
+        current: &BTreeMap<Xy, Vec<&Return>>,
+    ) -> Self {
         let mut columns = Self::with_capacity(old.len() + current.len());
         let mut olds = old.iter().peekable();
         for (&xy, points) in current {
             while let Some((&key, record)) = olds.next_if(|(key, _)| **key < xy) {
-                columns.push(key, record.heightfields.iter().flat_map(positive), Some(record));
+                columns.push(
+                    key,
+                    record.heightfields.iter().flat_map(positive),
+                    Some(record),
+                );
             }
-            let record = olds.next_if(|(key, _)| **key == xy).map(|(_, record)| record);
-            columns.push(xy, points.iter().filter(|p| !p.dynamic).map(|p| p.bin), record);
+            let record = olds
+                .next_if(|(key, _)| **key == xy)
+                .map(|(_, record)| record);
+            columns.push(
+                xy,
+                points.iter().filter(|p| !p.dynamic).map(|p| p.bin),
+                record,
+            );
         }
         for (&key, record) in olds {
-            columns.push(key, record.heightfields.iter().flat_map(positive), Some(record));
+            columns.push(
+                key,
+                record.heightfields.iter().flat_map(positive),
+                Some(record),
+            );
         }
         columns
     }
@@ -291,7 +314,11 @@ impl<'a> Columns<'a> {
     fn history(old: &'a BTreeMap<Xy, ColumnGroundRecords>) -> Self {
         let mut columns = Self::with_capacity(old.len());
         for (&xy, record) in old {
-            columns.push(xy, record.heightfields.iter().flat_map(positive), Some(record));
+            columns.push(
+                xy,
+                record.heightfields.iter().flat_map(positive),
+                Some(record),
+            );
         }
         columns
     }
@@ -314,7 +341,8 @@ impl<'a> Columns<'a> {
             let mut index = self.xy.partition_point(|xy| *xy < [x, low]);
             while let Some(&xy) = self.xy.get(index).filter(|xy| xy[0] == x && xy[1] <= high) {
                 let dy = i64::from(xy[1]) - i64::from(c[1]);
-                cells[(i64::from(dx + r) * i64::from(2 * r + 1) + dy + i64::from(r)) as usize] = Some(index);
+                cells[(i64::from(dx + r) * i64::from(2 * r + 1) + dy + i64::from(r)) as usize] =
+                    Some(index);
                 index += 1;
             }
         }
@@ -350,7 +378,9 @@ fn select_seed<I: IntoIterator<Item = usize>>(
     for n in window() {
         let other = columns.bins(n);
         // 邻列子格全在本列子格 ±4 之外时不贡献覆盖度。
-        if other.first().is_none_or(|&first| first > high) || other.last().is_some_and(|&last| last < low) {
+        if other.first().is_none_or(|&first| first > high)
+            || other.last().is_some_and(|&last| last < low)
+        {
             continue;
         }
         let mut j = 0;
@@ -378,10 +408,19 @@ fn select_seed<I: IntoIterator<Item = usize>>(
                 referenced = true;
                 if let Some(h) = v.height(xy, q) {
                     let d = ((z as f64 + 0.5) * q / 8.0 - h).abs();
-                    distance = Some(distance.filter(|best| best.total_cmp(&d).is_le()).unwrap_or(d));
+                    distance = Some(
+                        distance
+                            .filter(|best| best.total_cmp(&d).is_le())
+                            .unwrap_or(d),
+                    );
                 }
             }
-            (z, !referenced, std::cmp::Reverse(coverage), distance.unwrap_or(f64::INFINITY))
+            (
+                z,
+                !referenced,
+                std::cmp::Reverse(coverage),
+                distance.unwrap_or(f64::INFINITY),
+            )
         })
         .min_by(|a, b| {
             a.1.cmp(&b.1)
@@ -414,7 +453,9 @@ impl<'a> Context<'a> {
     fn seed(&self, index: usize) -> Option<Bin> {
         *self.seeds[index].get_or_init(|| {
             let xy = self.columns.xy[index];
-            select_seed(&self.columns, index, self.q, || self.columns.around(xy).into_iter().flatten())
+            select_seed(&self.columns, index, self.q, || {
+                self.columns.around(xy).into_iter().flatten()
+            })
         })
     }
     fn vertical(&self, index: usize) -> bool {
@@ -517,7 +558,12 @@ struct Group {
     seed: Bin,
     bins: BTreeSet<Bin>,
 }
-fn groups(local: &mut Local, columns: &Columns, old: Option<&ColumnGroundRecords>, q: f64) -> Vec<Group> {
+fn groups(
+    local: &mut Local,
+    columns: &Columns,
+    old: Option<&ColumnGroundRecords>,
+    q: f64,
+) -> Vec<Group> {
     let xy = local.c;
     let (Some(index), Some(first)) = (local.cells[CENTER], local.seeds[CENTER]) else {
         return vec![];
@@ -583,7 +629,12 @@ fn groups(local: &mut Local, columns: &Columns, old: Option<&ColumnGroundRecords
 
 /// CR-L1: old geometry is only a reference coordinate, never new bin mass.
 /// A missing/ambiguous reference is not evidence of a changed surface.
-fn legacy_shape(local: &mut Local, context: &Context, candidate: Bin, central: Old<'_>) -> Option<Shape> {
+fn legacy_shape(
+    local: &mut Local,
+    context: &Context,
+    candidate: Bin,
+    central: Old<'_>,
+) -> Option<Shape> {
     let (xy, q) = (local.c, context.q);
     let centre = central.height(xy, q)?;
     let delta = (candidate as f64 + 0.5) * q / 8.0 - centre;
@@ -607,7 +658,11 @@ fn legacy_shape(local: &mut Local, context: &Context, candidate: Bin, central: O
         if cell.is_none() {
             continue;
         }
-        refs[bit] = if bit == CENTER { Some(centre) } else { references[bit] };
+        refs[bit] = if bit == CENTER {
+            Some(centre)
+        } else {
+            references[bit]
+        };
     }
     let keys = refs
         .iter()
@@ -738,7 +793,9 @@ fn classify(
     // 原写入集为本帧触及列外扩4列、读取集再外扩8列；切比雪夫邻域半径可相加，
     // 读取集即触及列外扩12列。按行区间交给Writer，不再逐列展开成集合。诊断样本
     // 只在有回波的列合并时使用，其余列只取几何。
-    let old = writer.ground_columns_in_rows(&neighborhood_rows(&touched, 4 + 8), |xy| current.contains_key(&xy))?;
+    let old = writer.ground_columns_in_rows(&neighborhood_rows(&touched, 4 + 8), |xy| {
+        current.contains_key(&xy)
+    })?;
     let context = Context::new(Columns::frame(&old, &current), q);
     let historical = OnceLock::new();
     let voxel = writer.voxel_size_m();
@@ -746,8 +803,20 @@ fn classify(
     // 各列只读本帧固定输入，按列并行计算后按升序合并；遇错返回列序上第一个错误，
     // 与串行遍历遇错即停的结果相同。
     let columns: Vec<_> = current.iter().collect();
-    let frame = Frame { context: &context, old: &old, historical: &historical, q, voxel, source: &source, sequence, timestamp_ns };
-    let results: Vec<_> = columns.par_iter().map(|&(&xy, points)| frame.column(xy, points)).collect();
+    let frame = Frame {
+        context: &context,
+        old: &old,
+        historical: &historical,
+        q,
+        voxel,
+        source: &source,
+        sequence,
+        timestamp_ns,
+    };
+    let results: Vec<_> = columns
+        .par_iter()
+        .map(|&(&xy, points)| frame.column(xy, points))
+        .collect();
     let mut updates = BTreeMap::new();
     let mut indices = Vec::new();
     for (&(&xy, _), result) in columns.iter().zip(results) {
@@ -774,8 +843,21 @@ struct Frame<'f, 'a> {
 }
 impl Frame<'_, '_> {
     /// 一个本帧回波列：返回变化后的列记录（无变化为 `None`）和归入地面的点索引。
-    fn column(&self, xy: Xy, points: &[&Return]) -> Result<(Option<ColumnGroundRecords>, Vec<u32>), String> {
-        let Self { context, old, historical, q, voxel, source, sequence, timestamp_ns } = *self;
+    fn column(
+        &self,
+        xy: Xy,
+        points: &[&Return],
+    ) -> Result<(Option<ColumnGroundRecords>, Vec<u32>), String> {
+        let Self {
+            context,
+            old,
+            historical,
+            q,
+            voxel,
+            source,
+            sequence,
+            timestamp_ns,
+        } = *self;
         let mut indices = Vec::new();
         // Absence of a return is not counter-evidence. Original Writer::remove
         // already retracts removed occupancy. Halo participates in geometry only.
@@ -854,8 +936,7 @@ impl Frame<'_, '_> {
                     point_index: p.index,
                 });
             }
-            if let Some(frame) = HeightfieldColumn::from_counts(xy, voxel, counts)?
-            {
+            if let Some(frame) = HeightfieldColumn::from_counts(xy, voxel, counts)? {
                 frames.insert(g, (group, frame, samples));
             }
         }
@@ -908,7 +989,6 @@ impl Frame<'_, '_> {
                                 .cloned(),
                         );
                     }
-
                 }
             }
             // Two independently normalized old fields do not encode their
@@ -926,7 +1006,12 @@ impl Frame<'_, '_> {
         // This actual XY was classified, even when mixed/dynamic returns leave
         // no ground declaration. Preserve that distinction beside occupancy.
         next.classified_empty = next.heightfields.is_empty();
-        Ok((previous.is_none_or(|before| before != &next).then_some(next), indices))
+        Ok((
+            previous
+                .is_none_or(|before| before != &next)
+                .then_some(next),
+            indices,
+        ))
     }
 }
 fn sample_member(sample: &LayerSample, q: f64) -> Option<i32> {
@@ -947,7 +1032,6 @@ fn retain_old(out: &mut ColumnGroundRecords, old: Old<'_>, keep: &BTreeSet<i32>,
                 });
             }
         }
-
     }
 }
 fn retain_samples(samples: &mut Vec<LayerSample>, current: &LayerSource) {

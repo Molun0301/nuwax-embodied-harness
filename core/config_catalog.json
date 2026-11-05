@@ -320,18 +320,6 @@
     "apply_scope": "重启网关后生效",
     "description": ""
   },
-  "NUWAX_GEOMETRY_NATIVE_LIO_FIRST_PAIR_TIMEOUT_MS": {
-    "zh_name": "原生定位首对数据等待时间（毫秒）",
-    "type": "int",
-    "default": 10000,
-    "section_id": "geometry_runtime",
-    "target_file": "core_env",
-    "consumers": [
-      "services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs"
-    ],
-    "apply_scope": "重启几何运行时后生效",
-    "description": ""
-  },
   "NUWAX_GEOMETRY_NATIVE_LIO_PAIR_MAX_SKEW_MS": {
     "zh_name": "原生定位输出位姿与点云配对时间差（毫秒）",
     "type": "int",

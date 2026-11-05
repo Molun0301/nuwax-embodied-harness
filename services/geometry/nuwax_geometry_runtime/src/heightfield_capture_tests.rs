@@ -13,7 +13,13 @@ fn dilation_bits_match_geometric_neighborhood_at_coordinate_limits() {
             let input: BTreeSet<_> = columns
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| if phase < 32 { (i * 17 + phase * 11) % 31 < phase } else { *i == phase - 32 })
+                .filter(|(i, _)| {
+                    if phase < 32 {
+                        (i * 17 + phase * 11) % 31 < phase
+                    } else {
+                        *i == phase - 32
+                    }
+                })
                 .map(|(_, &xy)| xy)
                 .collect();
             let expected: BTreeSet<_> = columns
@@ -313,7 +319,6 @@ fn heightfield_capture_temporal_mass_missing_and_actual_deletion_are_distinct() 
         vec![0]
     );
 }
-
 
 #[test]
 fn heightfield_capture_only_middle_frame_preserves_independent_old_distributions() {

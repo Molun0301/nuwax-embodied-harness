@@ -90,7 +90,6 @@ nalgebra = { version = "0.33", features = ["serde-serialize"] }
 [dev-dependencies]
 # Tests transfer real captured objects through Receiver and Store before Reader build.
 nuwax-nav-stack = { path = "../../nuwax-workspace/crates/nuwax-nav-stack", default-features = false, features = ["surface-source-qualification"] }
-nuwax-nav-visual-servoing = { path = "../../nuwax-workspace/crates/nuwax-nav-visual-servoing" }
 
 # Phase 4 `[features]`(2026-07-07 codex rework lane-2):
 #   - `real-lcm-bridge`: runtime binary 的二次断言开关,
@@ -109,7 +108,6 @@ nuwax-nav-visual-servoing = { path = "../../nuwax-workspace/crates/nuwax-nav-vis
 [features]
 default = ["real-lcm-bridge"]
 real-lcm-bridge = ["nuwax-transport/real-lcm"]
-nuwax-lio-test-child = []
 
 [build-dependencies]
 tonic-build = "0.12"
@@ -117,13 +115,6 @@ tonic-build = "0.12"
 [[bin]]
 name = "nuwax-geometry-runtime"
 path = "src/main.rs"
-
-[[bin]]
-name = "nuwax-lio-test-child"
-path = "src/bin/nuwax-lio-test-child.rs"
-required-features = ["nuwax-lio-test-child"]
-test = false
-bench = false
 
 [profile.release]
 # 几何内核需要实时吞吐，不能用体积优先优化压低重建与在线输入处理速度。

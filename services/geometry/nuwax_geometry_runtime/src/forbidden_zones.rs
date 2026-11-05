@@ -1,36 +1,9 @@
-//! Persistent map-scoped forbidden-zone loading and conservative rasterization.
-//!
-//! The physical occupancy grid remains authoritative.  This module only composes an
-//! effective grid for navigation/exploration consumers.  A malformed configured file
-//! fails closed; a missing file or a map without an entry means that no virtual zones
-//! have been configured for that map yet.
-
-use std::collections::{BTreeMap, HashSet};
-use std::io::Read;
-use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
-
+//! 每张地图的禁行区文件与原保守栅格化算法。
 use serde::{Deserialize, Serialize};
-
-use crate::lcm_runtime::MapState;
-
-pub const FORBIDDEN_ZONES_ENV: &str = "NUWAX_FORBIDDEN_ZONES_PATH";
-pub const DEFAULT_FORBIDDEN_ZONES_PATH: &str = "runtime_data/navigation/forbidden_zones.json";
-
-const SUPPORTED_SCHEMA_VERSION: u32 = 1;
+use std::{collections::HashSet, path::Path};
 const MAX_ZONES: usize = 256;
 const MAX_VERTICES: usize = 256;
-const GEOMETRY_EPSILON: f64 = 1.0e-9;
-
-pub fn path_from_env() -> PathBuf {
-    std::env::var(FORBIDDEN_ZONES_ENV)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_FORBIDDEN_ZONES_PATH))
-}
-
+const GEOMETRY_EPSILON: f64 = 1e-9;
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 pub struct ZonePoint {
     pub x: f64,
@@ -75,272 +48,71 @@ pub struct ForbiddenZone {
     pub metadata: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-pub struct ForbiddenZoneSet {
+#[derive(Deserialize)]
+struct Document {
     #[serde(default)]
-    pub map_name: String,
-    pub generation: u64,
-    #[serde(default)]
-    pub signature: String,
-    #[serde(default)]
-    pub updated_at: String,
-    #[serde(default)]
-    pub zones: Vec<ForbiddenZone>,
+    zones: Vec<ForbiddenZone>,
 }
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct ForbiddenZoneDocument {
-    schema_version: u32,
-    #[serde(default)]
-    maps: BTreeMap<String, ForbiddenZoneSet>,
+#[derive(Clone)]
+struct MapState {
+    width: u32,
+    height: u32,
+    resolution: f32,
+    origin_x: f64,
+    origin_y: f64,
+    data: Vec<i8>,
 }
-
+#[derive(Clone)]
+struct LoadedForbiddenZones {
+    zones: Vec<ForbiddenZone>,
+}
 fn default_frame_id() -> String {
-    "map".to_string()
+    "map".into()
 }
-
 const fn default_enabled() -> bool {
     true
 }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ZoneLoadStatus {
-    Empty,
-    Valid,
-    FailClosed(String),
-}
-
-#[derive(Debug, Clone)]
-pub struct LoadedForbiddenZones {
-    pub signature: String,
-    pub generation: u64,
-    pub zones: Vec<ForbiddenZone>,
-    pub status: ZoneLoadStatus,
-}
-
-impl LoadedForbiddenZones {
-    fn empty(signature: String) -> Self {
-        Self {
-            signature,
-            generation: 0,
-            zones: Vec::new(),
-            status: ZoneLoadStatus::Empty,
-        }
-    }
-
-    fn fail_closed(signature: String, reason: impl Into<String>) -> Self {
-        Self {
-            signature,
-            generation: 0,
-            zones: Vec::new(),
-            status: ZoneLoadStatus::FailClosed(reason.into()),
-        }
-    }
-}
-
-/// 由建图适配器拥有的单项解析缓存；每次重新打开文件，删除和权限错误不复用旧结果。
-#[derive(Default, Clone)]
-pub(crate) struct ForbiddenZoneCache {
-    entry: Option<std::sync::Arc<(PathBuf, String, FileStamp, LoadedForbiddenZones)>>,
-    latest_result: Option<(String, String)>,
-}
-
-type FileStamp = (u64, u64, u64, i64, i64, i64, i64);
-
-fn file_stamp(meta: &std::fs::Metadata) -> FileStamp {
-    (
-        meta.dev(),
-        meta.ino(),
-        meta.len(),
-        meta.mtime(),
-        meta.mtime_nsec(),
-        meta.ctime(),
-        meta.ctime_nsec(),
-    )
-}
-
-impl ForbiddenZoneCache {
-    pub(crate) fn load(&mut self, path: &Path, map_name: &str) -> LoadedForbiddenZones {
-        let loaded = self.load_inner(path, map_name.trim());
-        self.latest_result = Some((map_name.trim().to_owned(), loaded.signature.clone()));
-        loaded
-    }
-
-    pub(crate) fn same_source_version(&self, other: &Self) -> bool {
-        self.latest_result == other.latest_result
-            && match (&self.entry, &other.entry) {
-                (None, None) => true,
-                (Some(left), Some(right)) => {
-                    left.0 == right.0 && left.1 == right.1 && left.2 == right.2
-                }
-                _ => false,
-            }
-    }
-
-    fn load_inner(&mut self, path: &Path, map_name: &str) -> LoadedForbiddenZones {
-        self.load_inner_with_reader(path, map_name, |file, bytes| file.read_to_end(bytes))
-    }
-
-    fn load_inner_with_reader(
-        &mut self,
-        path: &Path,
-        map_name: &str,
-        read: impl FnOnce(&mut std::fs::File, &mut Vec<u8>) -> std::io::Result<usize>,
-    ) -> LoadedForbiddenZones {
-        let map_name = map_name.trim();
-        let mut file = match std::fs::File::open(path) {
-            Ok(file) => file,
-            Err(_) => {
-                self.entry = None;
-                return load_for_map(path, map_name);
-            }
-        };
-        let before = file.metadata().ok().map(|meta| file_stamp(&meta));
-        if let (Some(stamp), Some((cached_path, cached_map, cached_stamp, loaded))) =
-            (before, self.entry.as_deref())
-        {
-            if path == cached_path && map_name == cached_map && stamp == *cached_stamp {
-                return loaded.clone();
-            }
-        }
-        let mut bytes = Vec::new();
-        if let Err(error) = read(&mut file, &mut bytes) {
-            self.entry = None;
-            return LoadedForbiddenZones::fail_closed(
-                format!("io-error:{map_name}:{error}"),
-                format!("cannot read {}: {error}", path.display()),
-            );
-        }
-        let loaded = parse_for_map(&bytes, map_name);
-        // 原地写入期间的结果不缓存；下一次必须重新读取并验证。
-        let after = file.metadata().ok().map(|meta| file_stamp(&meta));
-        self.entry = before.filter(|stamp| Some(*stamp) == after).map(|stamp| {
-            std::sync::Arc::new((
-                path.to_path_buf(),
-                map_name.to_owned(),
-                stamp,
-                loaded.clone(),
-            ))
-        });
-        loaded
-    }
-}
-
-pub fn load_for_map(path: &Path, map_name: &str) -> LoadedForbiddenZones {
-    let map_name = map_name.trim();
-    if map_name.is_empty() {
-        return LoadedForbiddenZones::fail_closed(
-            "invalid:empty-map-binding".to_string(),
-            "active map_name is empty",
-        );
-    }
-
+pub fn read(path: &Path) -> Result<Vec<ForbiddenZone>, String> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return LoadedForbiddenZones::empty(format!("missing:{map_name}"));
-        }
-        Err(error) => {
-            return LoadedForbiddenZones::fail_closed(
-                format!("io-error:{map_name}:{error}"),
-                format!("cannot read {}: {error}", path.display()),
-            );
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("禁行区读取失败：{error}")),
     };
-    parse_for_map(&bytes, map_name)
-}
-
-fn parse_for_map(bytes: &[u8], map_name: &str) -> LoadedForbiddenZones {
-    if map_name.is_empty() {
-        return LoadedForbiddenZones::fail_closed(
-            "invalid:empty-map-binding".to_owned(),
-            "active map_name is empty",
-        );
+    let document: Document =
+        serde_json::from_slice(&bytes).map_err(|e| format!("禁行区格式无效：{e}"))?;
+    if document.zones.len() > MAX_ZONES {
+        return Err("禁行区数量超过上限".into());
     }
-    // A legacy/error identity belongs to this observation, not to its contents.
-    // Stable source snapshots retain it in ForbiddenZoneCache; cache misses must
-    // receive a fresh identity even when generation and byte length are unchanged.
-    let observation_id = || uuid::Uuid::new_v4().simple().to_string();
-    let document: ForbiddenZoneDocument = match serde_json::from_slice(bytes) {
-        Ok(document) => document,
-        Err(error) => {
-            return LoadedForbiddenZones::fail_closed(
-                format!("invalid-json:{}", observation_id()),
-                format!("invalid forbidden-zone JSON: {error}"),
-            );
-        }
-    };
-    if document.schema_version != SUPPORTED_SCHEMA_VERSION {
-        return LoadedForbiddenZones::fail_closed(
-            format!("unsupported-schema:{}", observation_id()),
-            format!(
-                "unsupported forbidden-zone schema_version {}; expected {}",
-                document.schema_version, SUPPORTED_SCHEMA_VERSION
-            ),
-        );
-    }
-    let Some(zone_set) = document.maps.get(map_name) else {
-        return LoadedForbiddenZones::empty(format!("absent:{map_name}"));
-    };
-    let stored_map_name = zone_set.map_name.trim();
-    if stored_map_name != map_name {
-        return LoadedForbiddenZones::fail_closed(
-            format!("map-name-mismatch:{}:{map_name}", observation_id()),
-            format!(
-                "forbidden-zone key {map_name:?} contains map_name {:?}",
-                zone_set.map_name
-            ),
-        );
-    }
-    if let Err(error) = validate_zone_set(zone_set) {
-        return LoadedForbiddenZones::fail_closed(
-            format!("invalid-zone-set:{}:{map_name}", observation_id()),
-            error,
-        );
-    }
-    let signature = if zone_set.signature.trim().is_empty() {
-        format!("observed:{map_name}:{}", observation_id())
-    } else {
-        zone_set.signature.trim().to_ascii_lowercase()
-    };
-    LoadedForbiddenZones {
-        signature,
-        generation: zone_set.generation,
-        zones: zone_set.zones.clone(),
-        status: if zone_set.zones.iter().any(|zone| zone.enabled) {
-            ZoneLoadStatus::Valid
-        } else {
-            ZoneLoadStatus::Empty
-        },
-    }
-}
-
-fn validate_zone_set(zone_set: &ForbiddenZoneSet) -> Result<(), String> {
-    if zone_set.generation == 0 {
-        return Err("forbidden-zone generation must be positive".to_string());
-    }
-    if zone_set.zones.len() > MAX_ZONES {
-        return Err(format!(
-            "forbidden-zone count {} exceeds limit {MAX_ZONES}",
-            zone_set.zones.len()
-        ));
-    }
-    let signature = zone_set.signature.trim();
-    if !signature.is_empty()
-        && (signature.len() != 64 || !signature.bytes().all(|byte| byte.is_ascii_hexdigit()))
-    {
-        return Err("forbidden-zone signature must be 64 hexadecimal characters".to_string());
-    }
-    let mut ids = HashSet::with_capacity(zone_set.zones.len());
-    for zone in &zone_set.zones {
+    let mut ids = HashSet::new();
+    for zone in &document.zones {
         validate_zone(zone)?;
-        if !ids.insert(zone.id.trim()) {
-            return Err(format!("duplicate forbidden-zone id {:?}", zone.id));
+        if !ids.insert(&zone.id) {
+            return Err("禁行区编号重复".into());
         }
+    }
+    Ok(document.zones)
+}
+pub fn overlay(
+    path: &Path,
+    grid: &nuwax_mapping::OccupancyGrid,
+    data: &mut [u8],
+) -> Result<(), String> {
+    let zones = read(path)?;
+    let raw = MapState {
+        width: grid.width as u32,
+        height: grid.height as u32,
+        resolution: grid.resolution as f32,
+        origin_x: grid.origin[0],
+        origin_y: grid.origin[1],
+        data: data.iter().map(|v| *v as i8).collect(),
+    };
+    validate_map_layout(&raw)?;
+    let effective = rasterize_effective_map(raw, &LoadedForbiddenZones { zones });
+    for (out, value) in data.iter_mut().zip(effective.data) {
+        *out = value as u8;
     }
     Ok(())
 }
-
 fn validate_zone(zone: &ForbiddenZone) -> Result<(), String> {
     if zone.id.trim().is_empty() {
         return Err("forbidden-zone id must not be empty".to_string());
@@ -455,14 +227,6 @@ fn validate_zone(zone: &ForbiddenZone) -> Result<(), String> {
     Ok(())
 }
 
-pub fn compose_effective_map(
-    raw: &MapState,
-    loaded: &LoadedForbiddenZones,
-) -> Result<MapState, String> {
-    validate_map_layout(raw)?;
-    Ok(rasterize_effective_map(raw.clone(), loaded))
-}
-
 pub(crate) fn validate_map_layout(raw: &MapState) -> Result<(), String> {
     let expected = raw.width as usize * raw.height as usize;
     if raw.width == 0
@@ -480,10 +244,6 @@ pub(crate) fn rasterize_effective_map(
     mut effective: MapState,
     loaded: &LoadedForbiddenZones,
 ) -> MapState {
-    if matches!(loaded.status, ZoneLoadStatus::FailClosed(_)) {
-        effective.data.fill(100);
-        return effective;
-    }
     let enabled: Vec<&ForbiddenZone> = loaded.zones.iter().filter(|zone| zone.enabled).collect();
     if enabled.is_empty() {
         return effective;
@@ -500,9 +260,9 @@ pub(crate) fn rasterize_effective_map(
         for row in 0..effective.height {
             for col in 0..effective.width {
                 let rect = cell_rect(&effective, col, row);
-                let allowed = outside_zones
-                    .iter()
-                    .all(|zone| cell_fully_inside_closed_shape(rect, zone, effective.resolution as f64));
+                let allowed = outside_zones.iter().all(|zone| {
+                    cell_fully_inside_closed_shape(rect, zone, effective.resolution as f64)
+                });
                 if !allowed {
                     forbidden[cell_index(&effective, col, row)] = true;
                 }
@@ -888,277 +648,21 @@ fn squared_distance(a: ZonePoint, b: ZonePoint) -> f64 {
     dx * dx + dy * dy
 }
 
+fn compose_effective_map(
+    raw: &MapState,
+    loaded: &LoadedForbiddenZones,
+) -> Result<MapState, String> {
+    validate_map_layout(raw)?;
+    Ok(rasterize_effective_map(raw.clone(), loaded))
+}
+
+#[cfg(test)]
+#[path = "forbidden_zones_tests.rs"]
+mod tests;
+
 #[cfg(test)]
 #[path = "forbidden_zones_copy_trial_reference.rs"]
-pub(crate) mod copy_trial_reference;
-
+mod copy_trial_reference;
 #[cfg(test)]
 #[path = "forbidden_zones_rectangle_scan_tests.rs"]
-pub(crate) mod rectangle_scan_tests;
-
-#[cfg(test)]
-#[path = "forbidden_zones_observation_tests.rs"]
-mod observation_tests;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn free_map(width: u32, height: u32) -> MapState {
-        MapState {
-            width,
-            height,
-            resolution: 1.0,
-            origin_x: 0.0,
-            origin_y: 0.0,
-            frame_id: "map".to_string(),
-            revision: 7,
-            timestamp_ns: 11,
-            data: vec![0; width as usize * height as usize],
-        }
-    }
-
-    fn loaded(zones: Vec<ForbiddenZone>) -> LoadedForbiddenZones {
-        LoadedForbiddenZones {
-            signature: "test".to_string(),
-            generation: 1,
-            status: ZoneLoadStatus::Valid,
-            zones,
-        }
-    }
-
-    fn zone(shape: ZoneShape, mode: ZoneMode, vertices: Vec<ZonePoint>) -> ForbiddenZone {
-        ForbiddenZone {
-            id: "zone".to_string(),
-            shape,
-            mode,
-            frame_id: "map".to_string(),
-            vertices,
-            center: None,
-            radius_m: None,
-            stroke_width_m: None,
-            enabled: true,
-            metadata: serde_json::json!({}),
-        }
-    }
-
-    #[test]
-    fn diagonal_line_uses_conservative_supercover_cells() {
-        let mut line = zone(
-            ZoneShape::Line,
-            ZoneMode::Inside,
-            vec![ZonePoint { x: 0.1, y: 0.1 }, ZonePoint { x: 3.9, y: 3.9 }],
-        );
-        line.stroke_width_m = Some(0.2);
-        let map = compose_effective_map(&free_map(4, 4), &loaded(vec![line])).unwrap();
-        for index in [0_usize, 5, 10, 15] {
-            assert_eq!(map.data[index], 100);
-        }
-    }
-
-    #[test]
-    fn rectangle_inside_marks_interior_and_boundary() {
-        let rectangle = zone(
-            ZoneShape::Rectangle,
-            ZoneMode::Inside,
-            vec![ZonePoint { x: 2.0, y: 2.0 }, ZonePoint { x: 4.0, y: 4.0 }],
-        );
-        let map = compose_effective_map(&free_map(6, 6), &loaded(vec![rectangle])).unwrap();
-        assert_eq!(map.data[3 + 3 * 6], 100);
-        assert_eq!(map.data[0], 0);
-    }
-
-    #[test]
-    fn outside_zones_intersect_their_allowed_interiors() {
-        let left = zone(
-            ZoneShape::Rectangle,
-            ZoneMode::Outside,
-            vec![ZonePoint { x: 0.0, y: 0.0 }, ZonePoint { x: 5.0, y: 5.0 }],
-        );
-        let right = zone(
-            ZoneShape::Rectangle,
-            ZoneMode::Outside,
-            vec![ZonePoint { x: 2.0, y: 0.0 }, ZonePoint { x: 7.0, y: 5.0 }],
-        );
-        let map = compose_effective_map(&free_map(7, 5), &loaded(vec![left, right])).unwrap();
-        assert_eq!(map.data[3 + 2 * 7], 0);
-        assert_eq!(map.data[0], 100);
-        assert_eq!(map.data[6], 100);
-    }
-
-    #[test]
-    fn circle_outside_keeps_only_cells_fully_inside() {
-        let mut circle = zone(ZoneShape::Circle, ZoneMode::Outside, Vec::new());
-        circle.center = Some(ZonePoint { x: 2.5, y: 2.5 });
-        circle.radius_m = Some(2.25);
-        let map = compose_effective_map(&free_map(5, 5), &loaded(vec![circle])).unwrap();
-        assert_eq!(map.data[2 + 2 * 5], 0);
-        assert_eq!(map.data[0], 100);
-    }
-
-    #[test]
-    fn concave_polygon_inside_is_rasterized_without_filling_the_notch() {
-        let polygon = zone(
-            ZoneShape::Polygon,
-            ZoneMode::Inside,
-            vec![
-                ZonePoint { x: 0.0, y: 0.0 },
-                ZonePoint { x: 4.0, y: 0.0 },
-                ZonePoint { x: 4.0, y: 1.0 },
-                ZonePoint { x: 1.0, y: 1.0 },
-                ZonePoint { x: 1.0, y: 4.0 },
-                ZonePoint { x: 0.0, y: 4.0 },
-            ],
-        );
-        let map = compose_effective_map(&free_map(5, 5), &loaded(vec![polygon])).unwrap();
-        assert_eq!(map.data[0], 100);
-        assert_eq!(map.data[3 + 3 * 5], 0);
-    }
-
-    #[test]
-    fn malformed_document_fails_closed() {
-        let path = std::env::temp_dir().join(format!(
-            "nuwax-forbidden-zones-{}.json",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::write(&path, b"{not-json").unwrap();
-        let loaded = load_for_map(&path, "map-v1");
-        assert!(matches!(loaded.status, ZoneLoadStatus::FailClosed(_)));
-        let map = compose_effective_map(&free_map(3, 2), &loaded).unwrap();
-        assert!(map.data.iter().all(|value| *value == 100));
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn cached_document_detects_replacement_same_mtime_and_removal() {
-        let path = std::env::temp_dir().join(format!("nuwax-zone-cache-{}", uuid::Uuid::new_v4()));
-        std::fs::write(&path, br#"{"schema_version":1,"maps":{}}"#).unwrap();
-        let mut cache = ForbiddenZoneCache::default();
-        let first = cache.load(&path, "map-a");
-        let entry = cache.entry.clone().unwrap();
-        assert_eq!(cache.load(&path, "map-a").signature, first.signature);
-        assert!(std::sync::Arc::ptr_eq(
-            &entry,
-            cache.entry.as_ref().unwrap()
-        ));
-        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-        let next = path.with_extension("next");
-        std::fs::write(&next, br#"{"schema_version":9,"maps":{}}"#).unwrap();
-        std::fs::File::open(&next)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(modified))
-            .unwrap();
-        std::fs::rename(&next, &path).unwrap();
-        assert!(matches!(
-            cache.load(&path, "map-a").status,
-            ZoneLoadStatus::FailClosed(_)
-        ));
-        std::fs::write(&path, br#"{"schema_version":1,"maps":{}}"#).unwrap();
-        std::fs::File::open(&path)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(modified))
-            .unwrap();
-        assert!(matches!(
-            cache.load(&path, "map-a").status,
-            ZoneLoadStatus::Empty
-        ));
-        std::fs::remove_file(&path).unwrap();
-        assert!(matches!(
-            cache.load(&path, "map-a").status,
-            ZoneLoadStatus::Empty
-        ));
-        assert!(cache.entry.is_none());
-    }
-
-    #[test]
-    fn persisted_signature_is_the_runtime_ack_identity() {
-        let path = std::env::temp_dir().join(format!(
-            "nuwax-forbidden-zone-signature-{}-{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        let expected = "0123456789abcdef".repeat(4);
-        std::fs::write(
-            &path,
-            format!(
-                r#"{{"schema_version":1,"maps":{{"map-v1":{{"map_name":"map-v1","generation":7,"signature":"{expected}","updated_at":"2026-07-20T00:00:00Z","zones":[]}}}}}}"#
-            ),
-        )
-        .expect("write signed forbidden-zone document");
-
-        let loaded = load_for_map(&path, "map-v1");
-
-        assert_eq!(loaded.generation, 7);
-        assert_eq!(loaded.signature, expected);
-        assert_eq!(loaded.status, ZoneLoadStatus::Empty);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn map_name_separates_forbidden_zone_sets() {
-        let path = std::env::temp_dir().join(format!(
-            "nuwax-forbidden-zone-map-binding-{}-{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        let warehouse_signature = "a".repeat(64);
-        let office_signature = "b".repeat(64);
-        std::fs::write(
-            &path,
-            format!(
-                r#"{{"schema_version":1,"maps":{{"warehouse":{{"map_name":"warehouse","generation":1,"signature":"{warehouse_signature}","updated_at":"2026-07-20T00:00:00Z","zones":[]}},"office":{{"map_name":"office","generation":1,"signature":"{office_signature}","updated_at":"2026-07-20T00:00:00Z","zones":[]}}}}}}"#
-            ),
-        )
-        .expect("write map-bound forbidden-zone document");
-
-        let warehouse = load_for_map(&path, "warehouse");
-        let office = load_for_map(&path, "office");
-
-        assert_eq!(warehouse.signature, warehouse_signature);
-        assert_eq!(office.signature, office_signature);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn invalid_persisted_signature_fails_closed() {
-        let path = std::env::temp_dir().join(format!(
-            "nuwax-forbidden-zone-bad-signature-{}-{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::write(
-            &path,
-            br#"{"schema_version":1,"maps":{"map-v1":{"map_name":"map-v1","generation":7,"signature":"wrong-content","updated_at":"2026-07-20T00:00:00Z","zones":[]}}}"#,
-        )
-        .expect("write invalid signed forbidden-zone document");
-
-        let loaded = load_for_map(&path, "map-v1");
-
-        assert!(matches!(loaded.status, ZoneLoadStatus::FailClosed(_)));
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn self_intersecting_polygon_is_rejected() {
-        let polygon = zone(
-            ZoneShape::Polygon,
-            ZoneMode::Inside,
-            vec![
-                ZonePoint { x: 0.0, y: 0.0 },
-                ZonePoint { x: 2.0, y: 2.0 },
-                ZonePoint { x: 0.0, y: 2.0 },
-                ZonePoint { x: 2.0, y: 0.0 },
-            ],
-        );
-        assert!(validate_zone(&polygon).is_err());
-    }
-}
+mod rectangle_scan_tests;

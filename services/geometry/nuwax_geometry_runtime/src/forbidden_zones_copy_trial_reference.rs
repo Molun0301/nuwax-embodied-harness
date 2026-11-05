@@ -17,10 +17,6 @@ pub(crate) fn compose_effective_map(
         return Err("raw occupancy layout is invalid".to_string());
     }
     let mut effective = raw.clone();
-    if matches!(loaded.status, ZoneLoadStatus::FailClosed(_)) {
-        effective.data.fill(100);
-        return Ok(effective);
-    }
     let enabled: Vec<&ForbiddenZone> = loaded.zones.iter().filter(|zone| zone.enabled).collect();
     if enabled.is_empty() {
         return Ok(effective);

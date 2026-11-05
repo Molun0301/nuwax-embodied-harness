@@ -1,41 +1,15 @@
-//! Geometry-owned mapping kernels selected by the validated owner profile.
-
-
-#[path = "mapping_backend_sidecar.rs"]
-mod sidecar;
-
-use std::cell::RefCell;
-use std::collections::VecDeque;
-use std::env;
-use std::fmt::Display;
-use std::mem::size_of;
-use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
-use std::thread;
-use std::time::Duration;
-use std::time::Instant;
-
+//! 当前地图的体素与射线数值内核；输入与检查点由 Mapper 串行拥有。
 use nalgebra::Point3;
 use nuwax_mapping::cost_mapper::{CostMapper, OccupancyConfig, PointCloud2Like};
 use nuwax_mapping::OccupancyGrid;
-use nuwax_mapping_raytracing::voxel_ray_tracer::{
-    append_voxel_map_checkpoint, decode_voxel_map_checkpoint_for_config,
-    try_update_map, voxel_map_checkpoint_encoded_len, Config, PreparedRayUpdate, VoxelMap,
-    VOXEL_MAP_CHECKPOINT_ENTRY_BYTES, VOXEL_MAP_CHECKPOINT_HEADER_BYTES,
-};
 #[cfg(test)]
 use nuwax_mapping_raytracing::voxel_ray_tracer::iter_global_points;
-
-const WORKER_QUEUE_CAPACITY: usize = 1;
-const WORKER_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(15);
-const WORKER_RESOLUTION_STOP_POLL_INTERVAL: Duration = Duration::from_millis(1);
-#[cfg(not(test))]
-const PREINSTALL_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
-#[cfg(test)]
-const PREINSTALL_WORKER_JOIN_TIMEOUT: Duration = Duration::from_millis(50);
-const PREINSTALL_WORKER_JOIN_POLL_INTERVAL: Duration = Duration::from_millis(1);
-// 在线最多30次/秒，仍只消费真实新输入；历史回放逐帧累积水平观测。
+use nuwax_mapping_raytracing::voxel_ray_tracer::{
+    append_voxel_map_checkpoint, decode_voxel_map_checkpoint_for_config, try_update_map,
+    voxel_map_checkpoint_encoded_len, Config, PreparedRayUpdate, VoxelMap,
+    VOXEL_MAP_CHECKPOINT_ENTRY_BYTES, VOXEL_MAP_CHECKPOINT_HEADER_BYTES,
+};
+use std::{collections::VecDeque, env, fmt::Display, mem::size_of, str::FromStr, time::Instant};
 pub(crate) const MAPPING_CANDIDATE_INTERVAL_NS: u64 = 33_333_333;
 pub(crate) const MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const MAX_MAPPING_BACKEND_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
@@ -62,15 +36,6 @@ const MAPPING_BACKEND_OCCUPANCY_FIXED_BYTES: usize = 2 * size_of::<u32>()
     + size_of::<u64>();
 const MAPPING_BACKEND_KIND_VOXEL: u8 = 0;
 const MAPPING_BACKEND_KIND_RAYTRACING: u8 = 1;
-
-thread_local! {
-    static MAPPING_BACKEND_WORKER_STOPPED: RefCell<Option<Arc<AtomicBool>>> =
-        const { RefCell::new(None) };
-}
-
-pub(crate) fn run_requested_sidecar() -> Option<Result<(), String>> {
-    sidecar::run_requested_sidecar()
-}
 
 #[derive(Clone, Copy, PartialEq)]
 struct RayConfigCheckpoint {
@@ -274,895 +239,31 @@ impl MappingBackendKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MappingComputeToken {
-    pub(crate) token_id: u128,
-    pub(crate) session_id: String,
-    pub(crate) session_generation: u64,
-    pub(crate) backend_generation: u64,
-    pub(crate) source_frame_sequence: u64,
-    pub(crate) source_timestamp_ns: u64,
-    pub(crate) prepared_at_ns: u64,
-    pub(crate) base_occupancy_revision: u64,
-}
-
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct MappingBackendInput {
-    pub(crate) session_id: String,
-    pub(crate) session_generation: u64,
-    pub(crate) backend_generation: u64,
-    pub(crate) frame_sequence: u64,
-    pub(crate) source_timestamp_ns: u64,
-    pub(crate) received_at_ns: u64,
-    pub(crate) registered_frame_id: String,
-    pub(crate) sensor_origin_map: [f64; 3],
-    pub(crate) dynamic_frame: Option<crate::dynamic_backend::MappedFrame>,
-    pub(crate) registered_points_map: Vec<Point3<f64>>,
+    pub source_timestamp_ns: u64,
+    pub received_at_ns: u64,
+    pub registered_frame_id: String,
+    pub sensor_origin_map: [f64; 3],
+    pub dynamic_frame: Option<crate::dynamic_backend::MappedFrame>,
+    pub registered_points_map: Vec<Point3<f64>>,
 }
-
 #[derive(Debug)]
 pub(crate) struct MappingBackendCandidate {
-    pub(crate) session_id: String,
-    pub(crate) session_generation: u64,
-    pub(crate) backend_generation: u64,
-    pub(crate) source_frame_sequence: u64,
-    pub(crate) source_timestamp_ns: u64,
-    pub(crate) received_at_ns: u64,
-    pub(crate) backend_kind: MappingBackendKind,
-    pub(crate) live_window_occupancy: OccupancyGrid,
-    pub(crate) latest_frame_occupancy: OccupancyGrid,
-    pub(crate) accepted_points_map: Vec<Point3<f64>>,
-    pub(crate) compute_elapsed_us: u64,
+    pub source_timestamp_ns: u64,
+    pub received_at_ns: u64,
+    pub backend_kind: MappingBackendKind,
+    pub live_window_occupancy: OccupancyGrid,
+    pub latest_frame_occupancy: OccupancyGrid,
+    pub accepted_points_map: Vec<Point3<f64>>,
+    pub compute_elapsed_us: u64,
 }
-
 #[derive(Clone, Copy, Debug)]
-#[doc(hidden)]
 pub struct MappingBackendComputeConfig {
     pub resolution: f64,
     pub initial_safe_radius_meters: f32,
     pub window_capacity: usize,
 }
-
-#[derive(Debug)]
-pub(crate) struct MappingBackendCompletion {
-    pub(crate) token: MappingComputeToken,
-    pub(crate) accepted_points_map: Vec<Point3<f64>>,
-    pub(crate) result: Result<Option<MappingBackendCandidate>, String>,
-    pub(crate) resolution: MappingBackendCommitHandle,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MappingBackendDecisionKind {
-    Commit,
-    Abort,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct MappingBackendDecision {
-    transaction_id: u128,
-    kind: MappingBackendDecisionKind,
-}
-
-pub(crate) struct MappingBackendCommitHandle {
-    transaction_id: u128,
-    sender: Option<mpsc::SyncSender<MappingBackendDecision>>,
-}
-
-impl std::fmt::Debug for MappingBackendCommitHandle {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("MappingBackendCommitHandle")
-            .field("transaction_id", &self.transaction_id)
-            .field("resolved", &self.sender.is_none())
-            .finish()
-    }
-}
-
-impl MappingBackendCommitHandle {
-    fn new(transaction_id: u128, sender: mpsc::SyncSender<MappingBackendDecision>) -> Self {
-        Self {
-            transaction_id,
-            sender: Some(sender),
-        }
-    }
-
-    pub(crate) const fn transaction_id(&self) -> u128 {
-        self.transaction_id
-    }
-
-    pub(crate) fn commit(mut self) -> Result<(), String> {
-        self.resolve(MappingBackendDecisionKind::Commit)
-    }
-
-    pub(crate) fn abort(mut self) -> Result<(), String> {
-        self.resolve(MappingBackendDecisionKind::Abort)
-    }
-
-    fn resolve(&mut self, kind: MappingBackendDecisionKind) -> Result<(), String> {
-        let sender = self
-            .sender
-            .as_ref()
-            .ok_or_else(|| "mapping backend completion was already resolved".to_owned())?;
-        let decision = MappingBackendDecision {
-            transaction_id: self.transaction_id,
-            kind,
-        };
-        match sender.send(decision) {
-            Ok(()) => {
-                self.sender.take();
-                Ok(())
-            }
-            Err(_) => {
-                // Keep the sender pending.  Returning the error consumes the
-                // commit handle, whose Drop implementation performs the only
-                // available best-effort Abort delivery.  If the receiver is
-                // already closed, that abort is unavailable and the caller
-                // receives a terminal decision-unavailable error; no commit or
-                // abort is claimed to have been delivered.
-                Err("mapping backend worker closed before completion resolution; abort decision unavailable".to_owned())
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn detached_for_tests(transaction_id: u128) -> Self {
-        let (sender, receiver) = mpsc::sync_channel(1);
-        drop(receiver);
-        Self::new(transaction_id, sender)
-    }
-}
-
-impl Drop for MappingBackendCommitHandle {
-    fn drop(&mut self) {
-        let Some(sender) = self.sender.take() else {
-            return;
-        };
-        let _ = sender.try_send(MappingBackendDecision {
-            transaction_id: self.transaction_id,
-            kind: MappingBackendDecisionKind::Abort,
-        });
-    }
-}
-
-fn mapping_backend_resolution_channel(
-    transaction_id: u128,
-) -> (
-    MappingBackendCommitHandle,
-    mpsc::Receiver<MappingBackendDecision>,
-) {
-    let (sender, receiver) = mpsc::sync_channel(1);
-    (
-        MappingBackendCommitHandle::new(transaction_id, sender),
-        receiver,
-    )
-}
-
-fn mapping_backend_resolution_commits(
-    transaction_id: u128,
-    receiver: &mpsc::Receiver<MappingBackendDecision>,
-) -> bool {
-    let deadline = Instant::now() + WORKER_RESOLUTION_TIMEOUT;
-    loop {
-        let stopped = MAPPING_BACKEND_WORKER_STOPPED.with(|worker_stopped| {
-            worker_stopped
-                .borrow()
-                .as_ref()
-                .is_some_and(|stopped| stopped.load(Ordering::Acquire))
-        });
-        if stopped {
-            return false;
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return false;
-        }
-        match receiver.recv_timeout(WORKER_RESOLUTION_STOP_POLL_INTERVAL.min(remaining)) {
-            Ok(MappingBackendDecision {
-                transaction_id: resolved_id,
-                kind: MappingBackendDecisionKind::Commit,
-            }) => return resolved_id == transaction_id,
-            Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => return false,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum MappingBackendSubmitError {
-    QueueFull,
-    WorkerStopped,
-}
-
-struct MappingBackendJob {
-    token: MappingComputeToken,
-    input: MappingBackendInput,
-    completion: tokio::sync::oneshot::Sender<MappingBackendCompletion>,
-}
-
-struct MappingBackendExportJob {
-    completion: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>,
-}
-
-struct MappingBackendRestoreJob {
-    transaction_id: u128,
-    input: MappingBackendRestoreInput,
-    completion: tokio::sync::oneshot::Sender<Result<MappingBackendCommitHandle, String>>,
-}
-
-/// Immutable encoded checkpoint storage owned by a queued restore operation.
-/// Kept independent of the RPC binary so the reusable offline library uses the same worker.
-pub(crate) trait MappingBackendEncodedOwner: Send + Sync {
-    fn checkpoint_bytes(&self) -> &[u8];
-}
-
-enum MappingBackendRestoreInput {
-    Encoded(Vec<u8>),
-    OwnedEncoded(Arc<dyn MappingBackendEncodedOwner>),
-    Prepared(PreparedMappingBackendRestore),
-}
-
-/// 已在后台完整解码验证的内核；跨入提交区时只转移拥有权。
-pub(crate) struct PreparedMappingBackendRestore {
-    kernel: MappingKernel,
-    encoded: Vec<u8>,
-    spec: MappingBackendSpec,
-    config: MappingBackendComputeConfig,
-}
-
-/// 私有重放已经逐帧验证并完成物化，同进程提交直接转移内核。
-/// 射线隔离进程仍需要原协议字节，但无需在发送端再次解码同一内核。
-pub(crate) fn prepare_computed_mapping_backend_restore(
-    spec: MappingBackendSpec,
-    config: MappingBackendComputeConfig,
-    kernel: MappingKernel,
-) -> Result<PreparedMappingBackendRestore, String> {
-    let encoded = match (spec, &kernel) {
-        (MappingBackendSpec::Voxel, MappingKernel::Voxel(voxel)) => {
-            // 省去编码不代表绕过原检查点的容量界限；仍须能被正式保存和恢复。
-            let length = mapping_backend_voxel_checkpoint_encoded_len(voxel)?;
-            if length > MAX_MAPPING_BACKEND_CHECKPOINT_BYTES {
-                return Err("私有体素内核超过可保存的检查点容量".into());
-            }
-            Vec::new()
-        }
-        (MappingBackendSpec::Raytracing(_), MappingKernel::Raytracing(_)) => {
-            export_mapping_kernel_checkpoint(&kernel)?
-        }
-        _ => return Err("私有重放内核与地图后端类型不匹配".into()),
-    };
-    Ok(PreparedMappingBackendRestore {
-        kernel,
-        encoded,
-        spec,
-        config,
-    })
-}
-
-struct MappingBackendFlushJob {
-    token: MappingComputeToken,
-    completion: tokio::sync::oneshot::Sender<MappingBackendCompletion>,
-}
-
-enum MappingBackendCommand {
-    Compute(MappingBackendJob),
-    Flush(MappingBackendFlushJob),
-    ExportCheckpoint(MappingBackendExportJob),
-    RestoreCheckpoint(MappingBackendRestoreJob),
-    Stop,
-}
-
-#[derive(Clone)]
-pub(crate) struct MappingBackendClient {
-    backend_generation: u64,
-    backend_kind: MappingBackendKind,
-    sender: mpsc::SyncSender<MappingBackendCommand>,
-    stopped: Arc<AtomicBool>,
-}
-
-impl std::fmt::Debug for MappingBackendClient {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("MappingBackendClient")
-            .field("backend_generation", &self.backend_generation)
-            .field("backend_kind", &self.backend_kind)
-            .field("stopped", &self.stopped.load(Ordering::Acquire))
-            .finish_non_exhaustive()
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct MappingBackendWorker {
-    client: MappingBackendClient,
-    join: Option<thread::JoinHandle<()>>,
-}
-
-#[derive(Debug)]
-pub(crate) struct MappingBackendJoinHandle {
-    join: Option<thread::JoinHandle<()>>,
-}
-
-fn mapping_backend_process_exit_retention() -> &'static Mutex<Vec<thread::JoinHandle<()>>> {
-    static RETAINED: OnceLock<Mutex<Vec<thread::JoinHandle<()>>>> = OnceLock::new();
-    RETAINED.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-fn retain_mapping_backend_join_until_process_exit(join: thread::JoinHandle<()>) {
-    mapping_backend_process_exit_retention()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(join);
-}
-
-#[cfg(test)]
-pub(crate) fn mapping_backend_process_exit_retains_thread_for_tests(
-    thread_id: thread::ThreadId,
-) -> bool {
-    mapping_backend_process_exit_retention()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .any(|join| join.thread().id() == thread_id)
-}
-
-#[cfg(test)]
-pub(crate) fn join_retained_mapping_backend_thread_for_tests(
-    thread_id: thread::ThreadId,
-) -> Result<(), String> {
-    let join = {
-        let mut retained = mapping_backend_process_exit_retention()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let index = retained
-            .iter()
-            .position(|join| join.thread().id() == thread_id)
-            .ok_or_else(|| format!("retained Mapping backend thread {thread_id:?} is missing"))?;
-        retained.swap_remove(index)
-    };
-    join.join()
-        .map_err(|_| "retained mapping backend worker panicked during shutdown".to_owned())
-}
-
-impl MappingBackendJoinHandle {
-    pub(crate) fn is_finished(&self) -> bool {
-        self.join.as_ref().is_none_or(|join| join.is_finished())
-    }
-
-    pub(crate) fn join(mut self) -> Result<(), String> {
-        self.join
-            .take()
-            .expect("Mapping backend final join handle is present")
-            .join()
-            .map_err(|_| "mapping backend worker panicked during shutdown".to_owned())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn thread_id(&self) -> thread::ThreadId {
-        self.join
-            .as_ref()
-            .expect("Mapping backend final join handle is present")
-            .thread()
-            .id()
-    }
-}
-
-impl Drop for MappingBackendJoinHandle {
-    fn drop(&mut self) {
-        if let Some(join) = self.join.take() {
-            retain_mapping_backend_join_until_process_exit(join);
-        }
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Default)]
-pub(crate) struct MappingBackendTestGate {
-    entered: Arc<AtomicBool>,
-    released: Arc<AtomicBool>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug)]
-pub(crate) struct MappingBackendRetirementTestGate {
-    entered: Arc<AtomicBool>,
-    released: Arc<AtomicBool>,
-    panic_after_release: bool,
-}
-
-#[cfg(test)]
-impl MappingBackendRetirementTestGate {
-    pub(crate) fn blocked() -> Self {
-        Self {
-            entered: Arc::new(AtomicBool::new(false)),
-            released: Arc::new(AtomicBool::new(false)),
-            panic_after_release: false,
-        }
-    }
-
-    pub(crate) fn failing() -> Self {
-        Self {
-            entered: Arc::new(AtomicBool::new(false)),
-            released: Arc::new(AtomicBool::new(true)),
-            panic_after_release: true,
-        }
-    }
-
-    pub(crate) fn entered(&self) -> bool {
-        self.entered.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn release(&self) {
-        self.released.store(true, Ordering::Release);
-    }
-}
-
-#[cfg(test)]
-impl MappingBackendTestGate {
-    pub(crate) fn entered(&self) -> bool {
-        self.entered.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn release(&self) {
-        self.released.store(true, Ordering::Release);
-    }
-}
-
-impl MappingBackendWorker {
-    pub(crate) fn start(
-        spec: MappingBackendSpec,
-        backend_generation: u64,
-        compute_config: MappingBackendComputeConfig,
-    ) -> Result<Self, String> {
-        if matches!(spec, MappingBackendSpec::SlamToolbox) {
-            return Err("二维算法由Geometry独立进程拥有方管理".into());
-        }
-        Self::start_inner(spec, backend_generation, compute_config, None)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn start_with_test_gate(
-        spec: MappingBackendSpec,
-        backend_generation: u64,
-        compute_config: MappingBackendComputeConfig,
-        gate: MappingBackendTestGate,
-    ) -> Result<Self, String> {
-        Self::start_inner(spec, backend_generation, compute_config, Some(gate))
-    }
-
-    fn start_inner(
-        spec: MappingBackendSpec,
-        backend_generation: u64,
-        compute_config: MappingBackendComputeConfig,
-        #[cfg(test)] gate: Option<MappingBackendTestGate>,
-        #[cfg(not(test))] _gate: Option<()>,
-    ) -> Result<Self, String> {
-        if backend_generation == 0 {
-            return Err("mapping backend generation must be positive".to_owned());
-        }
-        let backend_kind = spec.kind();
-        let supervised_sidecar = if sidecar::requires_supervision(spec) {
-            let MappingBackendSpec::Raytracing(ray_spec) = spec else {
-                return Err("only raytracing may use the mapping sidecar".to_owned());
-            };
-            Some(sidecar::SupervisedRaySidecar::start(
-                ray_spec,
-                compute_config,
-            )?)
-        } else {
-            None
-        };
-        let (sender, receiver) = mpsc::sync_channel(WORKER_QUEUE_CAPACITY);
-        let stopped = Arc::new(AtomicBool::new(false));
-        let worker_stopped = stopped.clone();
-        let join = thread::Builder::new()
-            .name(format!(
-                "mapping-{}-{backend_generation}",
-                backend_kind.stable_name()
-            ))
-            .spawn(move || {
-                MAPPING_BACKEND_WORKER_STOPPED.with(|worker_stopped_slot| {
-                    *worker_stopped_slot.borrow_mut() = Some(Arc::clone(&worker_stopped));
-                });
-                if let Some(sidecar) = supervised_sidecar {
-                    sidecar::run_worker_loop(sidecar, receiver, worker_stopped);
-                    return;
-                }
-                let mut kernel = spec.into_kernel(compute_config.window_capacity);
-                let mut last_input = None;
-                while let Ok(command) = receiver.recv() {
-                    if worker_stopped.load(Ordering::Acquire) {
-                        break;
-                    }
-                    match command {
-                        MappingBackendCommand::Compute(job) => {
-                            #[cfg(test)]
-                            if let Some(gate) = gate.as_ref() {
-                                gate.entered.store(true, Ordering::Release);
-                                while !gate.released.load(Ordering::Acquire)
-                                    && !worker_stopped.load(Ordering::Acquire)
-                                {
-                                    thread::park_timeout(Duration::from_millis(1));
-                                }
-                                if worker_stopped.load(Ordering::Acquire) {
-                                    break;
-                                }
-                            }
-                            let result =
-                                validate_backend_input(&kernel, &job.input).and_then(|()| {
-                                    compute_candidate_in_place(
-                                        &mut kernel,
-                                        &job.input,
-                                        compute_config,
-                                    )
-                                });
-                            if result.is_ok() && !job.input.registered_points_map.is_empty() {
-                                last_input = Some(job.input.clone());
-                            }
-                            let can_commit = result.is_ok();
-                            let transaction_id = job.token.token_id;
-                            let (resolution, resolution_rx) =
-                                mapping_backend_resolution_channel(transaction_id);
-                            let delivered = job
-                                .completion
-                                .send(MappingBackendCompletion {
-                                    token: job.token,
-                                    accepted_points_map: job.input.registered_points_map.clone(),
-                                    result,
-                                    resolution,
-                                })
-                                .is_ok();
-                            let committed = delivered
-                                && can_commit
-                                && mapping_backend_resolution_commits(
-                                    transaction_id,
-                                    &resolution_rx,
-                                );
-                            if !committed || worker_stopped.load(Ordering::Acquire) {
-                                break;
-                            }
-                        }
-                        MappingBackendCommand::Flush(job) => {
-                            let result = match last_input.as_ref() {
-                                Some(input) => {
-                                    flush_candidate(&mut kernel, input, &job.token, compute_config)
-                                }
-                                None => Ok(None),
-                            };
-                            let can_commit = result.is_ok();
-                            let transaction_id = job.token.token_id;
-                            let (resolution, resolution_rx) =
-                                mapping_backend_resolution_channel(transaction_id);
-                            let delivered = job
-                                .completion
-                                .send(MappingBackendCompletion {
-                                    token: job.token,
-                                    accepted_points_map: Vec::new(),
-                                    result,
-                                    resolution,
-                                })
-                                .is_ok();
-                            let committed = delivered
-                                && can_commit
-                                && mapping_backend_resolution_commits(
-                                    transaction_id,
-                                    &resolution_rx,
-                                );
-                            if !committed || worker_stopped.load(Ordering::Acquire) {
-                                break;
-                            }
-                        }
-                        MappingBackendCommand::ExportCheckpoint(job) => {
-                            let _ = job
-                                .completion
-                                .send(export_mapping_kernel_checkpoint(&kernel));
-                        }
-                        MappingBackendCommand::RestoreCheckpoint(job) => {
-                            let result = match job.input {
-                                MappingBackendRestoreInput::Encoded(payload) => {
-                                    restore_mapping_kernel_checkpoint(
-                                        spec,
-                                        compute_config,
-                                        &payload,
-                                    )
-                                }
-                                MappingBackendRestoreInput::OwnedEncoded(owner) => {
-                                    restore_mapping_kernel_checkpoint(
-                                        spec,
-                                        compute_config,
-                                        owner.checkpoint_bytes(),
-                                    )
-                                }
-                                MappingBackendRestoreInput::Prepared(prepared) => {
-                                    if prepared.spec == spec
-                                        && prepared.config.window_capacity
-                                            == compute_config.window_capacity
-                                        && prepared.config.resolution.to_bits()
-                                            == compute_config.resolution.to_bits()
-                                        && prepared.config.initial_safe_radius_meters.to_bits()
-                                            == compute_config.initial_safe_radius_meters.to_bits()
-                                    {
-                                        Ok(prepared.kernel)
-                                    } else {
-                                        Err("预解码地图后端与当前配置不匹配".into())
-                                    }
-                                }
-                            };
-                            match result {
-                                Ok(restored) => {
-                                    let (resolution, resolution_rx) =
-                                        mapping_backend_resolution_channel(job.transaction_id);
-                                    let delivered = job.completion.send(Ok(resolution)).is_ok();
-                                    if delivered
-                                        && mapping_backend_resolution_commits(
-                                            job.transaction_id,
-                                            &resolution_rx,
-                                        )
-                                    {
-                                        kernel = restored;
-                                        last_input = None;
-                                    }
-                                }
-                                Err(error) => {
-                                    let _ = job.completion.send(Err(error));
-                                }
-                            }
-                        }
-                        MappingBackendCommand::Stop => break,
-                    }
-                }
-                worker_stopped.store(true, Ordering::Release);
-            })
-            .map_err(|error| format!("mapping backend worker spawn failed: {error}"))?;
-        let client = MappingBackendClient {
-            backend_generation,
-            backend_kind,
-            sender,
-            stopped,
-        };
-        Ok(Self {
-            client,
-            join: Some(join),
-        })
-    }
-
-    pub(crate) fn into_stop_join_handle(mut self) -> Result<MappingBackendJoinHandle, String> {
-        self.client.request_stop();
-        self.join
-            .take()
-            .map(|join| MappingBackendJoinHandle { join: Some(join) })
-            .ok_or_else(|| "mapping backend worker final join handle is missing".to_owned())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn start_with_retirement_test_gate(
-        spec: MappingBackendSpec,
-        backend_generation: u64,
-        gate: MappingBackendRetirementTestGate,
-    ) -> Result<Self, String> {
-        if backend_generation == 0 {
-            return Err("mapping backend generation must be positive".to_owned());
-        }
-        let backend_kind = spec.kind();
-        let (sender, receiver) = mpsc::sync_channel(WORKER_QUEUE_CAPACITY);
-        let stopped = Arc::new(AtomicBool::new(false));
-        let worker_stopped = Arc::clone(&stopped);
-        let join = thread::Builder::new()
-            .name(format!(
-                "mapping-{}-{backend_generation}-retirement-test",
-                backend_kind.stable_name()
-            ))
-            .spawn(move || {
-                let _receiver = receiver;
-                while !worker_stopped.load(Ordering::Acquire) {
-                    thread::park_timeout(Duration::from_millis(1));
-                }
-                gate.entered.store(true, Ordering::Release);
-                while !gate.released.load(Ordering::Acquire) {
-                    thread::park_timeout(Duration::from_millis(1));
-                }
-                if gate.panic_after_release {
-                    panic!("injected mapping backend retirement failure");
-                }
-            })
-            .map_err(|error| format!("mapping backend worker spawn failed: {error}"))?;
-        Ok(Self {
-            client: MappingBackendClient {
-                backend_generation,
-                backend_kind,
-                sender,
-                stopped,
-            },
-            join: Some(join),
-        })
-    }
-
-    pub(crate) fn client(&self) -> MappingBackendClient {
-        self.client.clone()
-    }
-
-    pub(crate) fn backend_generation(&self) -> u64 {
-        self.client.backend_generation()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn thread_id_for_tests(&self) -> thread::ThreadId {
-        self.join
-            .as_ref()
-            .expect("Mapping backend worker join handle is present")
-            .thread()
-            .id()
-    }
-
-    pub(crate) fn stop_and_join(mut self) -> Result<(), String> {
-        self.client.request_stop();
-        let Some(join) = self.join.take() else {
-            return Ok(());
-        };
-        let generation = self.client.backend_generation();
-        let join_handle = MappingBackendJoinHandle { join: Some(join) };
-        let deadline = Instant::now() + PREINSTALL_WORKER_JOIN_TIMEOUT;
-        while !join_handle.is_finished() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                drop(join_handle);
-                return Err(format!(
-                    "mapping backend generation {generation} pre-install stop remained pending after {} ms; exact join owner retained until process exit",
-                    PREINSTALL_WORKER_JOIN_TIMEOUT.as_millis()
-                ));
-            }
-            thread::sleep(PREINSTALL_WORKER_JOIN_POLL_INTERVAL.min(remaining));
-        }
-        join_handle.join()
-    }
-}
-
-impl MappingBackendClient {
-    pub(crate) const fn backend_generation(&self) -> u64 {
-        self.backend_generation
-    }
-
-    pub(crate) const fn backend_kind(&self) -> MappingBackendKind {
-        self.backend_kind
-    }
-
-    pub(crate) fn submit(
-        &self,
-        token: MappingComputeToken,
-        input: MappingBackendInput,
-    ) -> Result<tokio::sync::oneshot::Receiver<MappingBackendCompletion>, MappingBackendSubmitError>
-    {
-        if self.stopped.load(Ordering::Acquire) {
-            return Err(MappingBackendSubmitError::WorkerStopped);
-        }
-        let (completion, receiver) = tokio::sync::oneshot::channel();
-        match self
-            .sender
-            .try_send(MappingBackendCommand::Compute(MappingBackendJob {
-                token,
-                input,
-                completion,
-            })) {
-            Ok(()) => Ok(receiver),
-            Err(mpsc::TrySendError::Full(_)) => Err(MappingBackendSubmitError::QueueFull),
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                self.stopped.store(true, Ordering::Release);
-                Err(MappingBackendSubmitError::WorkerStopped)
-            }
-        }
-    }
-
-    pub(crate) fn export_checkpoint(
-        &self,
-    ) -> Result<tokio::sync::oneshot::Receiver<Result<Vec<u8>, String>>, MappingBackendSubmitError>
-    {
-        if self.stopped.load(Ordering::Acquire) {
-            return Err(MappingBackendSubmitError::WorkerStopped);
-        }
-        let (completion, receiver) = tokio::sync::oneshot::channel();
-        match self
-            .sender
-            .try_send(MappingBackendCommand::ExportCheckpoint(
-                MappingBackendExportJob { completion },
-            )) {
-            Ok(()) => Ok(receiver),
-            Err(mpsc::TrySendError::Full(_)) => Err(MappingBackendSubmitError::QueueFull),
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                self.stopped.store(true, Ordering::Release);
-                Err(MappingBackendSubmitError::WorkerStopped)
-            }
-        }
-    }
-
-    pub(crate) fn flush(
-        &self,
-        token: MappingComputeToken,
-    ) -> Result<tokio::sync::oneshot::Receiver<MappingBackendCompletion>, MappingBackendSubmitError>
-    {
-        if self.stopped.load(Ordering::Acquire) {
-            return Err(MappingBackendSubmitError::WorkerStopped);
-        }
-        let (completion, receiver) = tokio::sync::oneshot::channel();
-        match self
-            .sender
-            .try_send(MappingBackendCommand::Flush(MappingBackendFlushJob {
-                token,
-                completion,
-            })) {
-            Ok(()) => Ok(receiver),
-            Err(mpsc::TrySendError::Full(_)) => Err(MappingBackendSubmitError::QueueFull),
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                self.stopped.store(true, Ordering::Release);
-                Err(MappingBackendSubmitError::WorkerStopped)
-            }
-        }
-    }
-
-    pub(crate) fn restore_checkpoint(
-        &self,
-        payload: Vec<u8>,
-    ) -> Result<
-        tokio::sync::oneshot::Receiver<Result<MappingBackendCommitHandle, String>>,
-        MappingBackendSubmitError,
-    > {
-        self.restore_input(MappingBackendRestoreInput::Encoded(payload))
-    }
-
-    /// Share admitted immutable bytes with the queued job; no encoded checkpoint clone.
-    pub(crate) fn restore_owned_checkpoint<T: MappingBackendEncodedOwner + 'static>(
-        &self,
-        owner: T,
-    ) -> Result<
-        tokio::sync::oneshot::Receiver<Result<MappingBackendCommitHandle, String>>,
-        MappingBackendSubmitError,
-    > {
-        self.restore_input(MappingBackendRestoreInput::OwnedEncoded(Arc::new(owner)))
-    }
-
-    pub(crate) fn restore_prepared_checkpoint(
-        &self,
-        prepared: PreparedMappingBackendRestore,
-    ) -> Result<
-        tokio::sync::oneshot::Receiver<Result<MappingBackendCommitHandle, String>>,
-        MappingBackendSubmitError,
-    > {
-        self.restore_input(MappingBackendRestoreInput::Prepared(prepared))
-    }
-
-    fn restore_input(
-        &self,
-        input: MappingBackendRestoreInput,
-    ) -> Result<
-        tokio::sync::oneshot::Receiver<Result<MappingBackendCommitHandle, String>>,
-        MappingBackendSubmitError,
-    > {
-        if self.stopped.load(Ordering::Acquire) {
-            return Err(MappingBackendSubmitError::WorkerStopped);
-        }
-        let (completion, receiver) = tokio::sync::oneshot::channel();
-        match self
-            .sender
-            .try_send(MappingBackendCommand::RestoreCheckpoint(
-                MappingBackendRestoreJob {
-                    transaction_id: uuid::Uuid::new_v4().as_u128(),
-                    input,
-                    completion,
-                },
-            )) {
-            Ok(()) => Ok(receiver),
-            Err(mpsc::TrySendError::Full(_)) => Err(MappingBackendSubmitError::QueueFull),
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                self.stopped.store(true, Ordering::Release);
-                Err(MappingBackendSubmitError::WorkerStopped)
-            }
-        }
-    }
-
-    fn request_stop(&self) {
-        if !self.stopped.swap(true, Ordering::AcqRel) {
-            let _ = self.sender.try_send(MappingBackendCommand::Stop);
-        }
-    }
-}
-
 impl MappingBackendSpec {
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
@@ -1314,7 +415,8 @@ impl MappingKernel {
                     .map(|(x, y, z)| Point3::new(f64::from(x), f64::from(y), f64::from(z)))
                     .collect::<Vec<_>>();
                 points.sort_unstable_by(|left, right| {
-                    left.x.total_cmp(&right.x)
+                    left.x
+                        .total_cmp(&right.x)
                         .then_with(|| left.y.total_cmp(&right.y))
                         .then_with(|| left.z.total_cmp(&right.z))
                 });
@@ -1352,19 +454,37 @@ struct VoxelWindow {
 }
 impl Default for VoxelWindow {
     fn default() -> Self {
-        Self { slots: Vec::new(), free: Vec::new(), first: NO_WINDOW_SLOT,
-            last: NO_WINDOW_SLOT, len: 0 }
+        Self {
+            slots: Vec::new(),
+            free: Vec::new(),
+            first: NO_WINDOW_SLOT,
+            last: NO_WINDOW_SLOT,
+            len: 0,
+        }
     }
 }
 impl VoxelWindow {
-    fn len(&self) -> usize { self.len }
-    fn is_empty(&self) -> bool { self.len == 0 }
-    fn try_reserve_exact(&mut self, additional: usize) -> Result<(), std::collections::TryReserveError> {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    fn try_reserve_exact(
+        &mut self,
+        additional: usize,
+    ) -> Result<(), std::collections::TryReserveError> {
         self.slots.try_reserve_exact(additional)
     }
-    fn point(&self, slot: u32) -> &Point3<f64> { &self.slots[slot as usize].point }
+    fn point(&self, slot: u32) -> &Point3<f64> {
+        &self.slots[slot as usize].point
+    }
     fn push_back(&mut self, point: Point3<f64>) -> u32 {
-        let node = VoxelWindowNode { point, previous: self.last, next: NO_WINDOW_SLOT };
+        let node = VoxelWindowNode {
+            point,
+            previous: self.last,
+            next: NO_WINDOW_SLOT,
+        };
         let slot = if let Some(slot) = self.free.pop() {
             self.slots[slot as usize] = node;
             slot
@@ -1373,24 +493,41 @@ impl VoxelWindow {
             self.slots.push(node);
             slot
         };
-        if self.last == NO_WINDOW_SLOT { self.first = slot; }
-        else { self.slots[self.last as usize].next = slot; }
+        if self.last == NO_WINDOW_SLOT {
+            self.first = slot;
+        } else {
+            self.slots[self.last as usize].next = slot;
+        }
         self.last = slot;
         self.len += 1;
         slot
     }
     fn remove(&mut self, slot: u32) -> Point3<f64> {
-        let VoxelWindowNode { point, previous, next } = self.slots[slot as usize];
-        if previous == NO_WINDOW_SLOT { self.first = next; }
-        else { self.slots[previous as usize].next = next; }
-        if next == NO_WINDOW_SLOT { self.last = previous; }
-        else { self.slots[next as usize].previous = previous; }
+        let VoxelWindowNode {
+            point,
+            previous,
+            next,
+        } = self.slots[slot as usize];
+        if previous == NO_WINDOW_SLOT {
+            self.first = next;
+        } else {
+            self.slots[previous as usize].next = next;
+        }
+        if next == NO_WINDOW_SLOT {
+            self.last = previous;
+        } else {
+            self.slots[next as usize].previous = previous;
+        }
         self.len -= 1;
         self.free.push(slot);
         point
     }
     fn indexed_iter(&self) -> VoxelWindowIter<'_> {
-        VoxelWindowIter { window: self, next: self.first, remaining: self.len }
+        VoxelWindowIter {
+            window: self,
+            next: self.first,
+            remaining: self.len,
+        }
     }
     fn iter(&self) -> impl ExactSizeIterator<Item = &Point3<f64>> {
         self.indexed_iter().map(|(_, point)| point)
@@ -1399,34 +536,48 @@ impl VoxelWindow {
         let mut slot = self.first;
         while slot != NO_WINDOW_SLOT {
             let next = self.slots[slot as usize].next;
-            if !keep(self.point(slot)) { self.remove(slot); }
+            if !keep(self.point(slot)) {
+                self.remove(slot);
+            }
             slot = next;
         }
     }
 }
-struct VoxelWindowIter<'a> { window: &'a VoxelWindow, next: u32, remaining: usize }
+struct VoxelWindowIter<'a> {
+    window: &'a VoxelWindow,
+    next: u32,
+    remaining: usize,
+}
 impl<'a> Iterator for VoxelWindowIter<'a> {
     type Item = (u32, &'a Point3<f64>);
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next == NO_WINDOW_SLOT { return None; }
+        if self.next == NO_WINDOW_SLOT {
+            return None;
+        }
         let slot = self.next;
         let node = &self.window.slots[slot as usize];
         self.next = node.next;
         self.remaining -= 1;
         Some((slot, &node.point))
     }
-    fn size_hint(&self) -> (usize, Option<usize>) { (self.remaining, Some(self.remaining)) }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
 }
 impl ExactSizeIterator for VoxelWindowIter<'_> {}
 impl FromIterator<Point3<f64>> for VoxelWindow {
-    fn from_iter<T: IntoIterator<Item=Point3<f64>>>(points: T) -> Self {
+    fn from_iter<T: IntoIterator<Item = Point3<f64>>>(points: T) -> Self {
         let mut window = Self::default();
-        for point in points { window.push_back(point); }
+        for point in points {
+            window.push_back(point);
+        }
         window
     }
 }
 impl PartialEq<VecDeque<Point3<f64>>> for VoxelWindow {
-    fn eq(&self, other: &VecDeque<Point3<f64>>) -> bool { self.iter().eq(other.iter()) }
+    fn eq(&self, other: &VecDeque<Point3<f64>>) -> bool {
+        self.iter().eq(other.iter())
+    }
 }
 
 #[derive(Clone)]
@@ -1456,12 +607,17 @@ impl VoxelKernel {
             let key = window_cell(&point);
             let indices = self.window_point_indices.get_mut(&key).unwrap();
             indices.pop_front();
-            if indices.is_empty() { self.window_point_indices.remove(&key); }
+            if indices.is_empty() {
+                self.window_point_indices.remove(&key);
+            }
         }
         for &point in &points[retained_start..] {
             let slot = self.current_window.push_back(point);
             count_window_cell(&mut self.window_cells, &point);
-            self.window_point_indices.entry(window_cell(&point)).or_default().push_back(slot);
+            self.window_point_indices
+                .entry(window_cell(&point))
+                .or_default()
+                .push_back(slot);
         }
     }
 
@@ -1479,8 +635,11 @@ impl VoxelKernel {
         let candidates = if force_full {
             None
         } else if let Some(frame) = frame {
-            if frame.has_clears() && self.window_cells.contains_key(&UNINDEXED_WINDOW_CELL) { None }
-            else { frame.potential_window_clear_cells(&self.window_cells) }
+            if frame.has_clears() && self.window_cells.contains_key(&UNINDEXED_WINDOW_CELL) {
+                None
+            } else {
+                frame.potential_window_clear_cells(&self.window_cells)
+            }
         } else {
             Some(ahash::AHashSet::new())
         };
@@ -1493,17 +652,27 @@ impl VoxelKernel {
             for key in &candidates {
                 for &index in &self.window_point_indices[key] {
                     #[cfg(test)]
-                    { checked += 1; }
+                    {
+                        checked += 1;
+                    }
                     let point = self.current_window.point(index);
                     let p = [point.x, point.y, point.z];
-                    if frame.is_some_and(|f| f.clears(p)) { removed.insert(index); }
+                    if frame.is_some_and(|f| f.clears(p)) {
+                        removed.insert(index);
+                    }
                 }
             }
             #[cfg(test)]
             if std::env::var_os("NUWAX_PGO_WINDOW_SHADOW").is_some() {
-                let expected: ahash::AHashSet<_> = self.current_window.indexed_iter().filter_map(|(i,p)|
-                    frame.is_some_and(|f| f.clears([p.x,p.y,p.z]))
-                        .then_some(i)).collect();
+                let expected: ahash::AHashSet<_> = self
+                    .current_window
+                    .indexed_iter()
+                    .filter_map(|(i, p)| {
+                        frame
+                            .is_some_and(|f| f.clears([p.x, p.y, p.z]))
+                            .then_some(i)
+                    })
+                    .collect();
                 assert_eq!(removed, expected, "窗口索引不得漏掉或误报任何待删点");
             }
             #[cfg(test)]
@@ -1511,13 +680,17 @@ impl VoxelKernel {
                 eprintln!("WINDOW_INDEX points={} candidate_cells={candidate_count} checked={checked} removed={} lookup_ms={:.3}",
                     self.current_window.len(), removed.len(), indexed_started.elapsed().as_secs_f64() * 1e3);
             }
-            if removed.is_empty() { return; }
+            if removed.is_empty() {
+                return;
+            }
             #[cfg(test)]
             let rebuilding = Instant::now();
             for key in candidates {
                 let indices = self.window_point_indices.get_mut(&key).unwrap();
                 indices.retain(|slot| !removed.contains(slot));
-                if indices.is_empty() { self.window_point_indices.remove(&key); }
+                if indices.is_empty() {
+                    self.window_point_indices.remove(&key);
+                }
             }
             for slot in removed {
                 let point = self.current_window.remove(slot);
@@ -1525,7 +698,11 @@ impl VoxelKernel {
             }
             #[cfg(test)]
             if std::env::var_os("NUWAX_PGO_WINDOW_DIAGNOSTIC").is_some() {
-                eprintln!("WINDOW_REMOVE points={} ms={:.3}", self.current_window.len(), rebuilding.elapsed().as_secs_f64()*1e3);
+                eprintln!(
+                    "WINDOW_REMOVE points={} ms={:.3}",
+                    self.current_window.len(),
+                    rebuilding.elapsed().as_secs_f64() * 1e3
+                );
             }
         } else {
             let before = self.current_window.len();
@@ -1533,7 +710,9 @@ impl VoxelKernel {
                 let p = [point.x, point.y, point.z];
                 !frame.is_some_and(|f| f.clears(p))
             });
-            if self.current_window.len() != before { self.rebuild_window_index(); }
+            if self.current_window.len() != before {
+                self.rebuild_window_index();
+            }
         }
     }
 }
@@ -1542,20 +721,37 @@ const UNINDEXED_WINDOW_CELL: crate::dynamic_scene::Cell = (i32::MIN, i32::MIN, i
 fn window_cell(point: &Point3<f64>) -> crate::dynamic_scene::Cell {
     crate::dynamic_scene::cell([point.x, point.y, point.z]).unwrap_or(UNINDEXED_WINDOW_CELL)
 }
-fn window_point_indices(window: &VoxelWindow) -> ahash::AHashMap<crate::dynamic_scene::Cell, VecDeque<u32>> {
+fn window_point_indices(
+    window: &VoxelWindow,
+) -> ahash::AHashMap<crate::dynamic_scene::Cell, VecDeque<u32>> {
     let mut indices: ahash::AHashMap<_, VecDeque<u32>> = Default::default();
-    for (index, point) in window.indexed_iter() { indices.entry(window_cell(point)).or_default().push_back(index); }
+    for (index, point) in window.indexed_iter() {
+        indices
+            .entry(window_cell(point))
+            .or_default()
+            .push_back(index);
+    }
     indices
 }
-fn count_window_cell(cells: &mut ahash::AHashMap<crate::dynamic_scene::Cell, u32>, point: &Point3<f64>) {
-    let key = crate::dynamic_scene::cell([point.x, point.y, point.z]).unwrap_or(UNINDEXED_WINDOW_CELL);
+fn count_window_cell(
+    cells: &mut ahash::AHashMap<crate::dynamic_scene::Cell, u32>,
+    point: &Point3<f64>,
+) {
+    let key =
+        crate::dynamic_scene::cell([point.x, point.y, point.z]).unwrap_or(UNINDEXED_WINDOW_CELL);
     *cells.entry(key).or_default() += 1;
 }
-fn uncount_window_cell(cells: &mut ahash::AHashMap<crate::dynamic_scene::Cell, u32>, point: &Point3<f64>) {
-    let key = crate::dynamic_scene::cell([point.x, point.y, point.z]).unwrap_or(UNINDEXED_WINDOW_CELL);
+fn uncount_window_cell(
+    cells: &mut ahash::AHashMap<crate::dynamic_scene::Cell, u32>,
+    point: &Point3<f64>,
+) {
+    let key =
+        crate::dynamic_scene::cell([point.x, point.y, point.z]).unwrap_or(UNINDEXED_WINDOW_CELL);
     if let std::collections::hash_map::Entry::Occupied(mut entry) = cells.entry(key) {
         *entry.get_mut() -= 1;
-        if *entry.get() == 0 { entry.remove(); }
+        if *entry.get() == 0 {
+            entry.remove();
+        }
     }
 }
 fn window_cells(window: &VoxelWindow) -> ahash::AHashMap<crate::dynamic_scene::Cell, u32> {
@@ -2031,7 +1227,7 @@ fn decode_checkpoint_occupancy(payload: &[u8]) -> Result<OccupancyGrid, String> 
     Ok(occupancy)
 }
 
-fn restore_mapping_kernel_checkpoint(
+pub(crate) fn restore_mapping_kernel_checkpoint(
     spec: MappingBackendSpec,
     compute_config: MappingBackendComputeConfig,
     payload: &[u8],
@@ -2256,8 +1452,17 @@ fn build_occupancy(
     config: MappingBackendComputeConfig,
 ) -> Result<OccupancyGrid, String> {
     // 水平扫描必须与本帧雷达原点配对，不能从当前原点向历史点云发射射线。
-    let retained:Vec<_>=input.registered_points_map.iter().filter(|p|
-        !input.dynamic_frame.as_ref().is_some_and(|f|f.is_dynamic([p.x,p.y,p.z]))).copied().collect();
+    let retained: Vec<_> = input
+        .registered_points_map
+        .iter()
+        .filter(|p| {
+            !input
+                .dynamic_frame
+                .as_ref()
+                .is_some_and(|f| f.is_dynamic([p.x, p.y, p.z]))
+        })
+        .copied()
+        .collect();
     let cloud = BorrowedBackendCloud {
         points: &retained,
         sensor_origin: nalgebra::point![
@@ -2274,94 +1479,6 @@ fn build_occupancy(
 
 fn candidate_due(last_received_at_ns: u64, received_at_ns: u64, interval_ns: u64) -> bool {
     last_received_at_ns == 0 || received_at_ns.saturating_sub(last_received_at_ns) >= interval_ns
-}
-
-pub(crate) fn flush_candidate(
-    kernel: &mut MappingKernel,
-    input: &MappingBackendInput,
-    token: &MappingComputeToken,
-    config: MappingBackendComputeConfig,
-) -> Result<Option<MappingBackendCandidate>, String> {
-    if token.session_id != input.session_id
-        || token.session_generation != input.session_generation
-        || token.backend_generation != input.backend_generation
-        || token.source_frame_sequence != input.frame_sequence
-        || token.source_timestamp_ns != input.source_timestamp_ns
-    {
-        return Err("MAPPING_BACKEND_FLUSH_REJECTED: token does not match latest input".to_owned());
-    }
-    let started = Instant::now();
-    let (backend_kind, live_window_occupancy, latest_frame_occupancy) = match kernel {
-        MappingKernel::Voxel(voxel) => {
-            if !voxel.dirty_since_candidate {
-                return Ok(None);
-            }
-            if voxel.current_window.is_empty() {
-                voxel.dirty_since_candidate = false;
-                return Ok(None);
-            }
-            let latest = build_occupancy(input, config)?;
-            voxel.last_candidate_received_at_ns = input.received_at_ns;
-            voxel.last_candidate_point_count = voxel.current_window.len();
-            voxel.dirty_since_candidate = false;
-            (MappingBackendKind::Voxel, latest.clone(), latest)
-        }
-        MappingKernel::Raytracing(ray) => {
-            if !ray.dirty_since_candidate {
-                return Ok(None);
-            }
-            let live = build_occupancy(input, config)?;
-            ray.last_occupancy = Some(live.clone());
-            ray.last_candidate_received_at_ns = input.received_at_ns;
-            ray.last_candidate_point_count = ray.map.healthy_count();
-            ray.dirty_since_candidate = false;
-            (MappingBackendKind::Raytracing, live.clone(), live)
-        }
-    };
-    Ok(Some(MappingBackendCandidate {
-        session_id: input.session_id.clone(),
-        session_generation: input.session_generation,
-        backend_generation: input.backend_generation,
-        source_frame_sequence: input.frame_sequence,
-        source_timestamp_ns: input.source_timestamp_ns,
-        received_at_ns: input.received_at_ns,
-        backend_kind,
-        live_window_occupancy,
-        latest_frame_occupancy,
-        accepted_points_map: Vec::new(),
-        compute_elapsed_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-    }))
-}
-
-#[cfg(test)]
-fn compute_candidate(
-    kernel: &mut MappingKernel,
-    input: &MappingBackendInput,
-    config: MappingBackendComputeConfig,
-) -> Result<Option<MappingBackendCandidate>, String> {
-    validate_backend_input(kernel, input)?;
-    let mut staged = kernel.clone();
-    let result = compute_candidate_in_place(&mut staged, input, config)?;
-    *kernel = staged;
-    Ok(result)
-}
-
-pub(crate) fn validate_backend_input(
-    _kernel: &MappingKernel,
-    input: &MappingBackendInput,
-) -> Result<(), String> {
-    if input.registered_points_map.is_empty() {
-        return Ok(());
-    }
-    if input.session_id.trim().is_empty()
-        || input.session_generation == 0
-        || input.backend_generation == 0
-        || input.frame_sequence == 0
-        || input.registered_frame_id.trim().is_empty()
-    {
-        return Err("MAPPING_BACKEND_COMPUTE_REJECTED: invalid input identity".to_owned());
-    }
-    Ok(())
 }
 
 pub(crate) fn compute_candidate_in_place(
@@ -2394,12 +1511,27 @@ fn compute_candidate_with_parallelism(
     }
 
     if input.dynamic_frame.is_none() {
-        let dufo = match kernel { MappingKernel::Voxel(k) => &mut k.dufo, MappingKernel::Raytracing(k) => &mut k.dufo };
-        let frame = dufo.observe(&input.registered_points_map, input.sensor_origin_map,
-            input.source_timestamp_ns, nalgebra::Isometry3::identity())?.0;
+        let dufo = match kernel {
+            MappingKernel::Voxel(k) => &mut k.dufo,
+            MappingKernel::Raytracing(k) => &mut k.dufo,
+        };
+        let frame = dufo
+            .observe(
+                &input.registered_points_map,
+                input.sensor_origin_map,
+                input.source_timestamp_ns,
+                nalgebra::Isometry3::identity(),
+            )?
+            .0;
         let mut classified = input.clone();
         classified.dynamic_frame = Some(frame);
-        return compute_candidate_with_parallelism(kernel, &classified, config, candidate_interval_ns, parallel);
+        return compute_candidate_with_parallelism(
+            kernel,
+            &classified,
+            config,
+            candidate_interval_ns,
+            parallel,
+        );
     }
     let started = Instant::now();
     #[cfg(test)]
@@ -2407,7 +1539,17 @@ fn compute_candidate_with_parallelism(
     let backend_kind = match kernel {
         MappingKernel::Voxel(voxel) => {
             voxel.retain_uncleared(input.dynamic_frame.as_ref());
-            let retained=input.registered_points_map.iter().filter(|p|!input.dynamic_frame.as_ref().is_some_and(|f|f.is_dynamic([p.x,p.y,p.z]))).copied().collect::<Vec<_>>();
+            let retained = input
+                .registered_points_map
+                .iter()
+                .filter(|p| {
+                    !input
+                        .dynamic_frame
+                        .as_ref()
+                        .is_some_and(|f| f.is_dynamic([p.x, p.y, p.z]))
+                })
+                .copied()
+                .collect::<Vec<_>>();
             voxel.append_frame(&retained);
             voxel.dirty_since_candidate = true;
             MappingBackendKind::Voxel
@@ -2415,7 +1557,17 @@ fn compute_candidate_with_parallelism(
         MappingKernel::Raytracing(ray) => {
             #[cfg(test)]
             let phase = Instant::now();
-            let retained=input.registered_points_map.iter().filter(|p|!input.dynamic_frame.as_ref().is_some_and(|f|f.is_dynamic([p.x,p.y,p.z]))).copied().collect::<Vec<_>>();
+            let retained = input
+                .registered_points_map
+                .iter()
+                .filter(|p| {
+                    !input
+                        .dynamic_frame
+                        .as_ref()
+                        .is_some_and(|f| f.is_dynamic([p.x, p.y, p.z]))
+                })
+                .copied()
+                .collect::<Vec<_>>();
             // 本地 9e719718 已删除 validate_retained_state_bound（重复的保留体素上限校验），这里不再调用。
             ray.prepare_map_frame(input.sensor_origin_map, &retained)?;
             #[cfg(test)]
@@ -2444,29 +1596,44 @@ fn compute_candidate_with_parallelism(
                     })
                     .collect();
                 let candidates = (!crate::dynamic_backend::reference_revoke())
-                    .then(|| input.dynamic_frame.as_ref().and_then(|frame|
-                        frame.candidate_grid_keys(size, |key|
-                            !hits.contains(&key) && ray.map.voxels.contains_key(&key))))
+                    .then(|| {
+                        input.dynamic_frame.as_ref().and_then(|frame| {
+                            frame.candidate_grid_keys(size, |key| {
+                                !hits.contains(&key) && ray.map.voxels.contains_key(&key)
+                            })
+                        })
+                    })
                     .flatten();
                 if let Some(candidates) = candidates {
                     let frame = input.dynamic_frame.as_ref().unwrap();
                     for key in candidates {
-                        let point = [(key.0 as f64 + 0.5) * size,
-                            (key.1 as f64 + 0.5) * size, (key.2 as f64 + 0.5) * size];
-                        if frame.clears(point) { ray.map.voxels.remove(&key); }
+                        let point = [
+                            (key.0 as f64 + 0.5) * size,
+                            (key.1 as f64 + 0.5) * size,
+                            (key.2 as f64 + 0.5) * size,
+                        ];
+                        if frame.clears(point) {
+                            ray.map.voxels.remove(&key);
+                        }
                     }
                 } else {
                     // 测试参考路径保留原来的整表复核和本帧命中保护。
                     ray.map.voxels.retain(|key, _| {
                         hits.contains(key)
-                            || !{let p=[(key.0 as f64+0.5)*size,(key.1 as f64+0.5)*size,(key.2 as f64+0.5)*size];
-                                input.dynamic_frame.as_ref().is_some_and(|f|f.clears(p))}
+                            || !{
+                                let p = [
+                                    (key.0 as f64 + 0.5) * size,
+                                    (key.1 as f64 + 0.5) * size,
+                                    (key.2 as f64 + 0.5) * size,
+                                ];
+                                input.dynamic_frame.as_ref().is_some_and(|f| f.clears(p))
+                            }
                     });
                 }
             }
             #[cfg(test)]
             if diagnostic {
-                eprintln!("PGO_RAY_PHASE frame={} points={} voxels={} prepare_us={prepare_us} update_us={update_us} dynamic_us={}", input.frame_sequence, input.registered_points_map.len(), ray.map.voxels.len(), phase.elapsed().as_micros());
+                eprintln!("PGO_RAY_PHASE frame={} points={} voxels={} prepare_us={prepare_us} update_us={update_us} dynamic_us={}", input.source_timestamp_ns, input.registered_points_map.len(), ray.map.voxels.len(), phase.elapsed().as_micros());
             }
             ray.dirty_since_candidate = true;
             // 每帧更新体素；构图只读本帧扫描，历史体素无需物化成点云。
@@ -2517,10 +1684,6 @@ fn compute_candidate_with_parallelism(
     };
 
     Ok(Some(MappingBackendCandidate {
-        session_id: input.session_id.clone(),
-        session_generation: input.session_generation,
-        backend_generation: input.backend_generation,
-        source_frame_sequence: input.frame_sequence,
         source_timestamp_ns: input.source_timestamp_ns,
         received_at_ns: input.received_at_ns,
         backend_kind,
@@ -2531,935 +1694,220 @@ fn compute_candidate_with_parallelism(
     }))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn voxel_point_index_matches_full_filter_through_eviction_protection_and_restore() {
-        let config = MappingBackendComputeConfig { resolution: 0.05,
-            initial_safe_radius_meters: 0.0, window_capacity: 7 };
-        let MappingKernel::Voxel(mut indexed) = MappingBackendSpec::Voxel.into_kernel(7) else { unreachable!() };
-        let mut expected = VecDeque::new();
-        for frame in 0..30 {
-            let mut points: Vec<_> = (0..3).map(|i| Point3::new(frame as f64 * 0.031 + i as f64 * 0.099,
-                (i - 1) as f64 * 0.1, 0.15)).collect();
-            if frame == 7 { points.push(Point3::new(1e12, 0.0, 0.0)); }
-            indexed.append_frame(&points);
-            expected.extend(points);
-            while expected.len() > 7 { expected.pop_front(); }
-            let map_from_odom = if frame == 8 { nalgebra::Isometry3::translation(1e12, 0.0, 0.0) }
-                else { nalgebra::Isometry3::from_parts(nalgebra::Translation3::new(0.013, -0.2, 0.03),
-                    nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, frame as f64 * 0.037)) };
-            let odom_from_map = map_from_odom.inverse();
-            let odom: Vec<_> = expected.iter().map(|p| odom_from_map * p).collect();
-            let keys: Vec<_> = if frame == 8 { odom.iter().filter_map(|p| crate::dynamic_scene::cell([p.x,p.y,p.z])).collect() }
-                else if frame % 4 == 0 { vec![(1000,1000,1000)] }
-                else { odom.iter().step_by(3).filter_map(|p| crate::dynamic_scene::cell([p.x,p.y,p.z])).collect() };
-            let decision = crate::dynamic_backend::test_free_cells(crate::dynamic_scene::CELL_SIZE,
-                keys.into_iter().map(|(x,y,z)| ([x,y,z], 0)), map_from_odom);
-            expected.retain(|p| !decision.clears([p.x,p.y,p.z]));
-            indexed.retain_uncleared(Some(&decision));
-            assert_eq!(indexed.current_window, expected, "第{frame}帧与原逐点结果不一致");
-            assert_eq!(indexed.window_point_indices.values().map(VecDeque::len).sum::<usize>(), expected.len());
-            assert!(indexed.current_window.slots.len() <= 7, "回收槽必须复用，不能累积超过窗口容量");
-            for (key, positions) in &indexed.window_point_indices {
-                assert_eq!(indexed.window_cells[key] as usize, positions.len());
-                for &position in positions {
-                    assert_eq!(&window_cell(indexed.current_window.point(position)), key);
+pub(crate) fn cleanup_completed_checkpoint(
+    payload: &[u8],
+    q: f32,
+    removed: &ahash::AHashSet<[i32; 3]>,
+    retained: &[[i32; 3]],
+    occupancy: OccupancyGrid,
+) -> Result<Vec<u8>, String> {
+    use nuwax_cloud_cleanup::offline_residual_cleanup::asset_key;
+    if payload.len() < MAPPING_BACKEND_CHECKPOINT_HEADER_BYTES {
+        return Err("建图后端存档不完整".into());
+    }
+    let mut reader = MappingCheckpointReader::new(payload);
+    let spec = match payload[12] {
+        0 => MappingBackendSpec::Voxel,
+        1 => MappingBackendSpec::Raytracing(Default::default()),
+        _ => return Err("该地图没有点云建图后端".into()),
+    };
+    decode_mapping_checkpoint_header(&mut reader, spec)?;
+    let kernel = match spec {
+        MappingBackendSpec::Voxel => {
+            let capacity = reader.read_u64()? as usize;
+            let count = reader.read_u64()? as usize;
+            let _old_count = reader.read_u64()?;
+            let stamp = reader.read_u64()?;
+            let mut points = VecDeque::new();
+            for _ in 0..count {
+                let p = Point3::new(reader.read_f64()?, reader.read_f64()?, reader.read_f64()?);
+                if !removed.contains(&asset_key([p.x, p.y, p.z], q)) {
+                    points.push_back(p);
                 }
             }
-            if matches!(frame, 5 | 17) {
-                let payload = export_mapping_kernel_checkpoint(&MappingKernel::Voxel(indexed.clone())).unwrap();
-                let MappingKernel::Voxel(restored) = restore_mapping_kernel_checkpoint(MappingBackendSpec::Voxel, config, &payload).unwrap() else { unreachable!() };
-                indexed = restored;
-                assert_eq!(indexed.current_window, expected);
-            }
+            reader.finish()?;
+            // 窗口格计数与恢复检查点时相同，按清理后保留的窗口点重建。
+            let points: VoxelWindow = points.into_iter().collect();
+            let window_cells = window_cells(&points);
+            MappingKernel::Voxel(VoxelKernel {
+                last_candidate_point_count: points.len(),
+                window_cells,
+                window_point_indices: window_point_indices(&points),
+                current_window: points,
+                capacity,
+                last_candidate_received_at_ns: stamp,
+                dirty_since_candidate: false,
+                dufo: Default::default(),
+            })
         }
-    }
-
-
-    #[test]
-    fn dufomap_private_kernels_revoke_history_with_the_final_native_verdict() {
-
-        use crate::dynamic_scene::tests::{corridor, ORIGIN};
-        let config = MappingBackendComputeConfig { window_capacity: 1_000_000, ..compute_config() };
-        let mut kernels = [MappingBackendSpec::Voxel.into_kernel(config.window_capacity),
-            MappingBackendSpec::raytracing_defaults().into_kernel(config.window_capacity)];
-        let mut native = nuwax_dufomap_native::DufoMap::new(&crate::dynamic_backend::online_params()).unwrap();
-        let mut original = Vec::new();
-        for frame in 1..=22 {
-            let person = (7..=16).contains(&frame).then(|| -0.5 + (frame-7) as f64 * 0.12);
-            let (points, _) = corridor(person, (frame%3) as f64);
-            let xyz: Vec<_> = points.iter().map(|p| [p.x as f32,p.y as f32,p.z as f32]).collect();
-            native.insert(&xyz, ORIGIN.map(|v|v as f32), true).unwrap();
-            original.extend(points.iter().copied());
-            let input = MappingBackendInput { session_id: "DUFOMap私有重算".into(), session_generation: 1,
-                backend_generation: 1, frame_sequence: frame, source_timestamp_ns: frame*100_000_000,
-                received_at_ns: frame*100_000_000, registered_frame_id: "map".into(), sensor_origin_map: ORIGIN,
-                dynamic_frame: None, registered_points_map: points };
-            for kernel in &mut kernels { compute_candidate_in_place_with_interval(kernel, &input, config, 0).unwrap(); }
-        }
-        let xyz: Vec<_> = original.iter().map(|p| [p.x as f32,p.y as f32,p.z as f32]).collect();
-        let flags = native.seen_free(&xyz).unwrap();
-        assert!(flags.iter().any(|v| *v));
-        let expected: Vec<_> = original.iter().zip(&flags).filter_map(|(p, free)| (!free).then_some(*p)).collect();
-        let MappingKernel::Voxel(voxel) = &kernels[0] else { unreachable!() };
-        assert_eq!(voxel.current_window.len(), expected.len());
-        assert!(voxel.current_window.iter().eq(expected.iter()), "体素窗口历史必须逐点符合结束时判定，不能回用旧算法");
-        let ray = kernels[1].accumulated_points(&[]);
-        let xyz: Vec<_> = ray.iter().map(|p| [p.x as f32,p.y as f32,p.z as f32]).collect();
-        assert!(!xyz.is_empty());
-        assert!(native.seen_free(&xyz).unwrap().iter().all(|v| !v), "射线健康历史不能残留已判为空的单元");
-    }
-
-    #[test]
-    fn final_join_handle_drop_is_nonblocking_and_retains_blocked_thread() {
-        let gate = MappingBackendRetirementTestGate::blocked();
-        let worker = MappingBackendWorker::start_with_retirement_test_gate(
-            MappingBackendSpec::Voxel,
-            1,
-            gate.clone(),
-        )
-        .expect("start blocked retirement worker");
-        let join_handle = worker
-            .into_stop_join_handle()
-            .expect("extract final backend join handle");
-        for _ in 0..1_000 {
-            if gate.entered() {
-                break;
-            }
-            std::thread::yield_now();
-        }
-        assert!(
-            gate.entered(),
-            "retirement worker reached the blocking gate"
-        );
-        let retained_before = mapping_backend_process_exit_retention()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len();
-        let (dropped_tx, dropped_rx) = mpsc::channel();
-        let dropper = thread::spawn(move || {
-            drop(join_handle);
-            dropped_tx
-                .send(())
-                .expect("report nonblocking join-handle destruction");
-        });
-        dropped_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("Drop must not join the blocked backend thread");
-        dropper.join().expect("join Drop observer");
-        let retained_after = mapping_backend_process_exit_retention()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len();
-        assert_eq!(retained_after, retained_before + 1);
-        gate.release();
-    }
-
-    #[test]
-    fn stop_interrupts_pending_resolution_before_worker_join() {
-        let worker = MappingBackendWorker::start(MappingBackendSpec::Voxel, 1, compute_config())
-            .expect("start backend worker");
-        let completion = worker
-            .client()
-            .submit(token(1), input(1))
-            .expect("submit unresolved compute")
-            .blocking_recv()
-            .expect("receive unresolved completion");
-        let started = Instant::now();
-        worker
-            .stop_and_join()
-            .expect("stop flag interrupts resolution wait and joins worker");
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "worker join must not wait for the 15-second resolution deadline"
-        );
-        drop(completion);
-    }
-
-    fn compute_config() -> MappingBackendComputeConfig {
-        MappingBackendComputeConfig {
-            resolution: 0.1,
-            initial_safe_radius_meters: 0.0,
-            window_capacity: 1024,
-        }
-    }
-
-    fn token(sequence: u64) -> MappingComputeToken {
-        MappingComputeToken {
-            token_id: u128::from(sequence),
-            session_id: "worker-test".to_owned(),
-            session_generation: 1,
-            backend_generation: 1,
-            source_frame_sequence: sequence,
-            source_timestamp_ns: sequence,
-            prepared_at_ns: sequence,
-            base_occupancy_revision: 0,
-        }
-    }
-
-    fn input(sequence: u64) -> MappingBackendInput {
-        let timestamp_ns = sequence.saturating_mul(1_000_000_000);
-        MappingBackendInput {
-            session_id: "worker-test".to_owned(),
-            session_generation: 1,
-            backend_generation: 1,
-            frame_sequence: sequence,
-            source_timestamp_ns: timestamp_ns,
-            received_at_ns: timestamp_ns,
-            registered_frame_id: "map".to_owned(),
-            sensor_origin_map: [0.0; 3],
-            dynamic_frame: None,
-            registered_points_map: vec![Point3::new(1.0, 0.0, 1.0)],
-        }
-    }
-
-    #[test]
-    fn planar_scan_backends_use_current_frame_origin_and_survive_restore() {
-        let config = MappingBackendComputeConfig { ..compute_config() };
-        for spec in [
-            MappingBackendSpec::Voxel,
-            MappingBackendSpec::raytracing_defaults(),
-        ] {
-            let mut kernel = spec.into_kernel(config.window_capacity);
-            let mut first = input(1);
-            first.registered_points_map = vec![Point3::new(2.05, 0.05, 0.0)];
-            compute_candidate(&mut kernel, &first, config)
-                .unwrap()
-                .unwrap();
-            let mut next = input(2);
-            next.sensor_origin_map = [10.05, 0.05, 0.0];
-            next.registered_points_map = vec![Point3::new(12.05, 0.05, 0.0)];
-            let candidate = compute_candidate(&mut kernel, &next, config)
-                .unwrap()
-                .unwrap();
-            assert!(candidate.live_window_occupancy.origin[0] >= 9.0);
-            assert_eq!(
-                candidate.live_window_occupancy.data,
-                candidate.latest_frame_occupancy.data
-            );
-            assert!(candidate.latest_frame_occupancy.data.contains(&100));
-            let checkpoint = export_mapping_kernel_checkpoint(&kernel).unwrap();
-            let mut restored =
-                restore_mapping_kernel_checkpoint(spec, config, &checkpoint).unwrap();
-            next.frame_sequence = 3;
-            next.source_timestamp_ns += 1_000_000_000;
-            next.received_at_ns += 1_000_000_000;
-            let expected = compute_candidate(&mut kernel, &next, config)
-                .unwrap()
-                .unwrap();
-            let actual = compute_candidate(&mut restored, &next, config)
-                .unwrap()
-                .unwrap();
-            assert_eq!(
-                actual.live_window_occupancy.data,
-                expected.live_window_occupancy.data
-            );
-            next.frame_sequence = 4;
-            next.source_timestamp_ns += 1_000_000_000;
-            next.received_at_ns += 1_000_000_000;
-            next.registered_points_map = vec![Point3::new(12.05, 0.05, -0.4)];
-            let slanted = compute_candidate(&mut restored, &next, config)
-                .unwrap()
-                .unwrap();
-            assert!(slanted.latest_frame_occupancy.data.contains(&0));
-            assert!(!slanted.latest_frame_occupancy.data.contains(&100));
-            // 斜射线离开高度带前不足最小观测距离时，仍没有可用二维证据。
-            next.frame_sequence = 5;
-            next.source_timestamp_ns += 1_000_000_000;
-            next.received_at_ns += 1_000_000_000;
-            next.registered_points_map = vec![Point3::new(10.15, 0.05, -0.4)];
-            let missing = compute_candidate(&mut restored, &next, config)
-                .unwrap()
-                .unwrap();
-            assert!(missing.latest_frame_occupancy.data.iter().all(|&v| v < 0));
-        }
-    }
-
-    fn commit_completion(
-        completion: MappingBackendCompletion,
-    ) -> Result<Option<MappingBackendCandidate>, String> {
-        let MappingBackendCompletion {
-            result, resolution, ..
-        } = completion;
-        resolution.commit().expect("commit worker completion");
-        result
-    }
-
-    #[test]
-    fn voxel_selection_does_not_parse_raytracing_environment() {
-        let spec = MappingBackendSpec::from_lookup(MappingBackendKind::Voxel, |_| {
-            Some("invalid".to_owned())
-        })
-        .expect("inactive raytracing config must not affect voxel startup");
-        assert_eq!(spec, MappingBackendSpec::Voxel);
-    }
-
-    #[test]
-    fn raytracing_defaults_are_valid_and_deterministic() {
-        let spec = MappingBackendSpec::from_lookup(MappingBackendKind::Raytracing, |_| None)
-            .expect("defaults must pass standalone validation");
-        assert_eq!(spec.stable_name(), "raytracing");
-        let mut kernel = spec.into_kernel(1024);
-        let points = [
-            Point3::new(2.0, 1.0, 0.0),
-            Point3::new(1.0, 1.0, 0.0),
-            Point3::new(3.0, 1.0, 0.0),
-        ];
-        for _ in 0..3 {
-            kernel
-                .prepare_map_frame([0.0; 3], &points)
-                .expect("valid map-frame points");
-            kernel
-                .commit_prepared_map_frame()
-                .expect("prepared frame must commit");
-        }
-        let output = kernel.accumulated_points(&[]);
-        assert!(!output.is_empty());
-        assert!(output.windows(2).all(|pair| {
-            (pair[0].x, pair[0].y, pair[0].z) <= (pair[1].x, pair[1].y, pair[1].z)
-        }));
-    }
-
-    #[test]
-    fn invalid_selected_config_fails_closed_with_key() {
-        let error = MappingBackendSpec::from_lookup(MappingBackendKind::Raytracing, |key| {
-            (key == RAY_SUBSAMPLE_ENV).then(|| "0".to_owned())
-        })
-        .expect_err("zero ray subsample must fail startup");
-        assert!(error.contains("RAYTRACING_CONFIG_INVALID"));
-        assert!(error.contains("ray_subsample"));
-    }
-
-    #[test]
-    fn rejected_frame_does_not_mutate_ray_snapshot() {
-        let mut kernel = MappingBackendSpec::raytracing_defaults().into_kernel(1024);
-        let valid = [Point3::new(1.0, 0.0, 0.0)];
-        for _ in 0..3 {
-            kernel
-                .prepare_map_frame([0.0; 3], &valid)
-                .expect("valid frame");
-            kernel
-                .commit_prepared_map_frame()
-                .expect("prepared frame must commit");
-        }
-        let before = kernel.accumulated_points(&[]).to_vec();
-        let error = kernel
-            .prepare_map_frame([0.0; 3], &[Point3::new(f64::MAX, 0.0, 0.0)])
-            .expect_err("out-of-range point must be rejected");
-        assert!(error.contains("RAYTRACING_UPDATE_REJECTED"));
-        assert_eq!(kernel.accumulated_points(&[]), before);
-    }
-
-    #[test]
-    fn aggregate_frame_work_is_bounded_before_map_mutation() {
-        let mut kernel = MappingBackendSpec::raytracing_defaults().into_kernel(1024);
-        let points = vec![Point3::new(49.0, 0.0, 0.0); 60_000];
-        let error = kernel
-            .prepare_map_frame([0.0; 3], &points)
-            .expect_err("aggregate ray work must be bounded");
-        assert!(error.contains("more than 50000000 ray steps"));
-        assert!(!kernel.ready_to_build());
-    }
-
-    #[test]
-    fn ray_candidate_and_flush_preserve_healthy_count_without_history_points() {
-        let mut kernel = MappingBackendSpec::raytracing_defaults().into_kernel(1024);
-        for sequence in 1..=3 {
-            compute_candidate_in_place(&mut kernel, &input(sequence), compute_config()).unwrap();
-        }
-        let mut skipped = input(4);
-        skipped.received_at_ns = 3_000_000_000 + MAPPING_CANDIDATE_INTERVAL_NS / 2;
-        skipped.source_timestamp_ns = skipped.received_at_ns;
-        assert!(
-            compute_candidate_in_place(&mut kernel, &skipped, compute_config())
-                .unwrap()
-                .is_none()
-        );
-        let MappingKernel::Raytracing(ray) = &kernel else {
-            panic!("射线后端");
-        };
-        assert!(ray.dirty_since_candidate);
-        let mut flush_token = token(4);
-        flush_token.source_timestamp_ns = skipped.source_timestamp_ns;
-        assert!(
-            flush_candidate(&mut kernel, &skipped, &flush_token, compute_config())
-                .unwrap()
-                .is_some()
-        );
-        let MappingKernel::Raytracing(ray) = &kernel else {
-            panic!("射线后端");
-        };
-        assert!(!ray.dirty_since_candidate);
-        assert_eq!(ray.last_candidate_point_count, ray.map.healthy_count());
-    }
-
-    #[test]
-    fn worker_queue_capacity_is_exactly_one() {
-        let gate = MappingBackendTestGate::default();
-        let worker = MappingBackendWorker::start_with_test_gate(
-            MappingBackendSpec::Voxel,
-            1,
-            compute_config(),
-            gate.clone(),
-        )
-        .expect("start gated worker");
-        let client = worker.client();
-        let first = client.submit(token(1), input(1)).expect("first job");
-        for _ in 0..1_000 {
-            if gate.entered() {
-                break;
-            }
-            std::thread::yield_now();
-        }
-        assert!(gate.entered(), "worker must dequeue and enter first job");
-        let second = client.submit(token(2), input(2)).expect("one queued job");
-        assert!(matches!(
-            client.submit(token(3), input(3)),
-            Err(MappingBackendSubmitError::QueueFull)
-        ));
-        gate.release();
-        commit_completion(first.blocking_recv().expect("first completion")).expect("first compute");
-        commit_completion(second.blocking_recv().expect("second completion"))
-            .expect("second compute");
-        worker.stop_and_join().expect("join worker");
-    }
-
-    #[test]
-    fn aborted_compute_retires_mutated_worker_generation() {
-        let worker = MappingBackendWorker::start(MappingBackendSpec::Voxel, 1, compute_config())
-            .expect("start worker");
-        let client = worker.client();
-        let completion = client
-            .submit(token(1), input(1))
-            .expect("submit compute")
-            .blocking_recv()
-            .expect("compute completion");
-        completion
-            .resolution
-            .abort()
-            .expect("abort staged generation");
-        // abort 只投递决策；等待后台实际退出，不用调度次数代替完成条件。
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !worker.join.as_ref().expect("worker join owner").is_finished() {
-            assert!(Instant::now() < deadline,
-                "aborted generation must stop before accepting another compute");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert!(matches!(client.submit(token(2), input(2)),
-            Err(MappingBackendSubmitError::WorkerStopped)));
-        worker.stop_and_join().expect("join retired worker");
-    }
-
-    #[test]
-    fn worker_checkpoint_round_trip_preserves_voxel_and_ray_continuation() {
-        for spec in [
-            MappingBackendSpec::Voxel,
-            MappingBackendSpec::raytracing_defaults(),
-        ] {
-            let original = MappingBackendWorker::start(spec, 1, compute_config())
-                .expect("start original worker");
-            let original_client = original.client();
-            for sequence in 1..=3 {
-                let completion = original_client
-                    .submit(token(sequence), input(sequence))
-                    .expect("submit seed frame")
-                    .blocking_recv()
-                    .expect("seed completion");
-                commit_completion(completion).expect("seed compute");
-            }
-            let payload = original_client
-                .export_checkpoint()
-                .expect("submit export")
-                .blocking_recv()
-                .expect("export response")
-                .expect("export checkpoint");
-
-            let restored = MappingBackendWorker::start(spec, 2, compute_config())
-                .expect("start restored worker");
-            let restored_client = restored.client();
-            let restore = restored_client
-                .restore_checkpoint(payload.clone())
-                .expect("submit restore")
-                .blocking_recv()
-                .expect("restore response")
-                .expect("restore checkpoint");
-            restore.commit().expect("commit restored checkpoint");
-            let restored_payload = restored_client
-                .export_checkpoint()
-                .expect("submit restored export")
-                .blocking_recv()
-                .expect("restored export response")
-                .expect("restored export checkpoint");
-            assert_eq!(restored_payload, payload);
-
-            let original_completion = original_client
-                .submit(token(4), input(4))
-                .expect("submit original continuation")
-                .blocking_recv()
-                .expect("original continuation response");
-            commit_completion(original_completion).expect("original continuation compute");
-            let restored_completion = restored_client
-                .submit(token(4), input(4))
-                .expect("submit restored continuation")
-                .blocking_recv()
-                .expect("restored continuation response");
-            commit_completion(restored_completion).expect("restored continuation compute");
-            let original_continued = original_client
-                .export_checkpoint()
-                .expect("submit original continued export")
-                .blocking_recv()
-                .expect("original continued export response")
-                .expect("original continued checkpoint");
-            let restored_continued = restored_client
-                .export_checkpoint()
-                .expect("submit restored continued export")
-                .blocking_recv()
-                .expect("restored continued export response")
-                .expect("restored continued checkpoint");
-            assert_eq!(restored_continued, original_continued);
-
-            original.stop_and_join().expect("join original worker");
-            restored.stop_and_join().expect("join restored worker");
-        }
-    }
-
-    #[test]
-    fn steady_small_maps_publish_real_candidates_before_navigation_receipt_expires() {
-        for spec in [
-            MappingBackendSpec::Voxel,
-            MappingBackendSpec::raytracing_defaults(),
-        ] {
-            let mut config = compute_config();
-            config.window_capacity = 1;
-            let worker = MappingBackendWorker::start(spec, 1, config).expect("真实后端线程");
-            let client = worker.client();
-            let mut last_candidate_received = None;
-            let mut candidate_count = 0;
-            for sequence in 1_u64..=16 {
-                let mut observation = input(sequence);
-                observation.received_at_ns = 1_000_000_000 + (sequence - 1) * 100_000_000;
-                observation.source_timestamp_ns = 77_000_000_000 + (sequence - 1) * 100_000_000;
-                let received_at_ns = observation.received_at_ns;
-                let source_timestamp_ns = observation.source_timestamp_ns;
-                let mut request = token(sequence);
-                request.prepared_at_ns = received_at_ns;
-                request.source_timestamp_ns = source_timestamp_ns;
-                let completion = client
-                    .submit(request, observation)
-                    .expect("持续真实点输入")
-                    .blocking_recv()
-                    .expect("后端回执");
-                if let Some(candidate) = commit_completion(completion).expect("提交真实候选")
-                {
-                    assert_eq!(candidate.source_timestamp_ns, source_timestamp_ns);
-                    assert_eq!(candidate.received_at_ns, received_at_ns);
-                    last_candidate_received = Some(received_at_ns);
-                    candidate_count += 1;
-                }
-                if let Some(last) = last_candidate_received {
-                    assert!(
-                        received_at_ns - last <= 500_000_000,
-                        "低增长真实输入不应跨过导航500毫秒地图接收期限：{}",
-                        spec.stable_name()
-                    );
-                }
-            }
-            assert!(
-                candidate_count >= 14,
-                "100毫秒真实输入在完成后端初始化后应逐次交付，不再被250毫秒门槛丢弃"
-            );
-            let mut empty = input(17);
-            empty.registered_points_map.clear();
-            empty.source_timestamp_ns = 79_000_000_000;
-            empty.received_at_ns = 3_000_000_000;
-            let mut request = token(17);
-            request.source_timestamp_ns = empty.source_timestamp_ns;
-            assert!(
-                commit_completion(
-                    client
-                        .submit(request, empty)
-                        .unwrap()
-                        .blocking_recv()
-                        .unwrap()
+        MappingBackendSpec::Raytracing(_) => {
+            let c = decode_ray_config(&mut reader)?;
+            let config = Config {
+                voxel_size: c.voxel_size,
+                max_range: c.max_range,
+                ray_subsample: c.ray_subsample,
+                shadow_depth: c.shadow_depth,
+                grace_depth: c.grace_depth,
+                min_health: c.min_health,
+                max_health: c.max_health,
+                graze_cos: c.graze_cos,
+                recency_window: c.recency_window,
+                emit_every: c.emit_every,
+                global_emit_every: c.global_emit_every,
+                region_percentile: c.region_percentile,
+            };
+            let _old_count = reader.read_u64()?;
+            let stamp = reader.read_u64()?;
+            let map_len = reader.read_u64()? as usize;
+            let occ_len = reader.read_u64()? as usize;
+            let mut map = decode_voxel_map_checkpoint_for_config(
+                reader.read_bytes(map_len)?,
+                MAX_MAPPING_BACKEND_CHECKPOINT_BYTES / VOXEL_MAP_CHECKPOINT_ENTRY_BYTES,
+                &config,
+            )?;
+            reader.read_bytes(occ_len)?;
+            reader.finish()?;
+            let inv = 1.0f32 / config.voxel_size;
+            let ray_key = |k: &[i32; 3]| {
+                let p = k.map(|v| ((v as f64 + 0.5) * f64::from(q)) as f32);
+                (
+                    (p[0] * inv).floor() as i32,
+                    (p[1] * inv).floor() as i32,
+                    (p[2] * inv).floor() as i32,
                 )
-                .unwrap()
-                .is_none(),
-                "空输入不得从缓存生成保活候选"
-            );
-            worker.stop_and_join().expect("停止并等待真实后端线程");
-            assert!(
-                client.submit(token(18), input(18)).is_err(),
-                "已停止后端不能续发地图"
-            );
-        }
-    }
-
-    #[test]
-    fn worker_flush_forces_one_cadence_candidate_before_export() {
-        let worker = MappingBackendWorker::start(MappingBackendSpec::Voxel, 1, compute_config())
-            .expect("start worker");
-        let client = worker.client();
-        let first_input = input(1);
-        let mut first_token = token(1);
-        first_token.source_timestamp_ns = first_input.source_timestamp_ns;
-        let first = client
-            .submit(first_token, first_input)
-            .expect("submit first frame")
-            .blocking_recv()
-            .expect("first response");
-        assert!(commit_completion(first).expect("first compute").is_some());
-
-        let mut skipped_input = input(2);
-        skipped_input.source_timestamp_ns = 1_000_000_000 + MAPPING_CANDIDATE_INTERVAL_NS / 2;
-        skipped_input.received_at_ns = skipped_input.source_timestamp_ns;
-        let mut skipped_token = token(2);
-        skipped_token.source_timestamp_ns = skipped_input.source_timestamp_ns;
-        let skipped = client
-            .submit(skipped_token.clone(), skipped_input)
-            .expect("submit cadence frame")
-            .blocking_recv()
-            .expect("cadence response");
-        assert!(commit_completion(skipped)
-            .expect("cadence compute")
-            .is_none());
-        assert!(client
-            .export_checkpoint()
-            .expect("submit dirty export")
-            .blocking_recv()
-            .expect("dirty export response")
-            .expect_err("dirty state must require flush")
-            .contains("must be flushed"));
-
-        let flushed = client
-            .flush(skipped_token.clone())
-            .expect("submit flush")
-            .blocking_recv()
-            .expect("flush response");
-        let candidate = commit_completion(flushed)
-            .expect("flush compute")
-            .expect("forced candidate");
-        assert!(candidate.accepted_points_map.is_empty());
-        let repeated = client
-            .flush(skipped_token)
-            .expect("submit repeated flush")
-            .blocking_recv()
-            .expect("repeated flush response");
-        assert!(commit_completion(repeated)
-            .expect("repeated flush compute")
-            .is_none());
-        client
-            .export_checkpoint()
-            .expect("submit clean export")
-            .blocking_recv()
-            .expect("clean export response")
-            .expect("clean checkpoint");
-        worker.stop_and_join().expect("join worker");
-    }
-
-    #[test]
-    fn voxel_checkpoint_point_budget_is_the_exact_64_mib_boundary() {
-        assert_eq!(MAX_RETAINED_VOXEL_POINTS, 2_796_200);
-        let maximum = MAPPING_BACKEND_VOXEL_HEADER_BYTES
-            + MAX_RETAINED_VOXEL_POINTS * MAPPING_BACKEND_VOXEL_POINT_BYTES;
-        let first_rejected = maximum + MAPPING_BACKEND_VOXEL_POINT_BYTES;
-        assert!(maximum <= MAX_MAPPING_BACKEND_CHECKPOINT_BYTES);
-        assert!(first_rejected > MAX_MAPPING_BACKEND_CHECKPOINT_BYTES);
-    }
-
-    #[test]
-    fn binary_voxel_checkpoint_rejects_noncanonical_and_unbounded_inputs() {
-        let config = compute_config();
-        let empty = MappingBackendSpec::Voxel.into_kernel(config.window_capacity);
-        let payload = export_mapping_kernel_checkpoint(&empty).expect("encode empty checkpoint");
-        assert_eq!(payload.len(), MAPPING_BACKEND_VOXEL_HEADER_BYTES);
-
-        let mut trailing = payload.clone();
-        trailing.push(0);
-        assert!(
-            restore_mapping_kernel_checkpoint(MappingBackendSpec::Voxel, config, &trailing)
-                .err()
-                .expect("trailing byte must fail")
-                .contains("length mismatch")
-        );
-
-        let mut unknown_flags = payload.clone();
-        unknown_flags[13] = 1;
-        assert!(restore_mapping_kernel_checkpoint(
-            MappingBackendSpec::Voxel,
-            config,
-            &unknown_flags
-        )
-        .err()
-        .expect("unknown flag must fail")
-        .contains("flags/reserved"));
-
-        let mut oversized_count = payload;
-        oversized_count[MAPPING_BACKEND_CHECKPOINT_HEADER_BYTES + size_of::<u64>()
-            ..MAPPING_BACKEND_CHECKPOINT_HEADER_BYTES + 2 * size_of::<u64>()]
-            .copy_from_slice(&u64::MAX.to_le_bytes());
-        assert!(restore_mapping_kernel_checkpoint(
-            MappingBackendSpec::Voxel,
-            config,
-            &oversized_count,
-        )
-        .err()
-        .expect("oversized point count must fail before allocation")
-        .contains("voxel window contains"));
-
-        let one_point = MappingKernel::Voxel(VoxelKernel {
-            current_window: [Point3::new(1.0, 2.0, 3.0)].into_iter().collect(),
-            window_cells: window_cells(&[Point3::new(1.0, 2.0, 3.0)].into_iter().collect()),
-            window_point_indices: window_point_indices(&[Point3::new(1.0, 2.0, 3.0)].into_iter().collect()),
-            capacity: config.window_capacity,
-            last_candidate_point_count: 1,
-            last_candidate_received_at_ns: 7,
-            dirty_since_candidate: false,
-            dufo: Default::default(),
-        });
-        let mut non_finite =
-            export_mapping_kernel_checkpoint(&one_point).expect("encode one point");
-        non_finite[MAPPING_BACKEND_VOXEL_HEADER_BYTES
-            ..MAPPING_BACKEND_VOXEL_HEADER_BYTES + size_of::<f64>()]
-            .copy_from_slice(&f64::NAN.to_bits().to_le_bytes());
-        assert!(
-            restore_mapping_kernel_checkpoint(MappingBackendSpec::Voxel, config, &non_finite)
-                .err()
-                .expect("non-finite point must fail")
-                .contains("non-finite")
-        );
-    }
-
-    #[test]
-    fn ray_cadence_skipped_state_remains_within_checkpoint_budget_before_ack() {
-        let worker = MappingBackendWorker::start(
-            MappingBackendSpec::raytracing_defaults(),
-            1,
-            compute_config(),
-        )
-        .expect("start ray worker");
-        let client = worker.client();
-        for sequence in 1..=3 {
-            let seeded = client
-                .submit(token(sequence), input(sequence))
-                .expect("submit ray seed frame")
-                .blocking_recv()
-                .expect("ray seed response");
-            commit_completion(seeded).expect("ray seed compute");
-        }
-
-        let mut skipped_input = input(4);
-        skipped_input.source_timestamp_ns = 3_000_000_000 + MAPPING_CANDIDATE_INTERVAL_NS / 2;
-        skipped_input.received_at_ns = skipped_input.source_timestamp_ns;
-        let mut skipped_token = token(4);
-        skipped_token.source_timestamp_ns = skipped_input.source_timestamp_ns;
-        let skipped = client
-            .submit(skipped_token.clone(), skipped_input)
-            .expect("submit cadence-skipped ray frame")
-            .blocking_recv()
-            .expect("cadence-skipped ray response");
-        assert!(commit_completion(skipped)
-            .expect("cadence-skipped ray compute")
-            .is_none());
-
-        let flushed = client
-            .flush(skipped_token)
-            .expect("submit ray flush")
-            .blocking_recv()
-            .expect("ray flush response");
-        assert!(commit_completion(flushed).expect("ray flush").is_some());
-        let payload = client
-            .export_checkpoint()
-            .expect("submit ray export")
-            .blocking_recv()
-            .expect("ray export response")
-            .expect("ray checkpoint");
-        assert!(payload.len() <= MAX_MAPPING_BACKEND_CHECKPOINT_BYTES);
-        worker.stop_and_join().expect("join ray worker");
-    }
-
-    #[test]
-    fn ray_worker_exceeds_real_checkpoint_limit_and_keeps_mapping_after_export_failure() {
-        let worker = MappingBackendWorker::start(
-            MappingBackendSpec::raytracing_defaults(),
-            1,
-            compute_config(),
-        )
-        .expect("启动默认射线工作线程");
-        let client = worker.client();
-        // 92 个互不相交的水平面，每面 92×92 个有限实点；每束射线仍在默认量程内。
-        // 所有状态均由正常输入接纳及射线更新产生，不改预算、计数或检查点数据。
-        for sequence in 1..=92 {
-            let mut frame = input(sequence);
-            let height = sequence as f64 + 0.05;
-            frame.sensor_origin_map = [0.0, 0.0, height];
-            frame.registered_points_map = (0..92)
-                .flat_map(|x| (0..92).map(move |y| {
-                    Point3::new(x as f64 * 0.1 - 4.55, y as f64 * 0.1 - 4.55, height)
-                }))
+            };
+            let keep: ahash::AHashSet<_> = retained.iter().map(ray_key).collect();
+            let cut: ahash::AHashSet<_> = removed
+                .iter()
+                .map(ray_key)
+                .filter(|k| !keep.contains(k))
                 .collect();
-            let mut frame_token = token(sequence);
-            frame_token.source_timestamp_ns = frame.source_timestamp_ns;
-            let result = client.submit(frame_token, frame).unwrap().blocking_recv().unwrap();
-            assert!(commit_completion(result).expect("合法在线帧不能被未来导出大小拒绝").is_some());
+            map.voxels.retain(|k, _| !cut.contains(k));
+            MappingKernel::Raytracing(RaytracingKernel {
+                last_candidate_point_count: map.healthy_count(),
+                map,
+                config,
+                prepared_update: None,
+                input: Vec::new(),
+                last_occupancy: Some(occupancy),
+                last_candidate_received_at_ns: stamp,
+                dirty_since_candidate: false,
+                dufo: Default::default(),
+            })
         }
+        _ => unreachable!(),
+    };
+    export_mapping_kernel_checkpoint(&kernel)
+}
 
-        let mut skipped = input(93);
-        skipped.sensor_origin_map = [0.0, 0.0, 92.05];
-        skipped.registered_points_map = vec![Point3::new(6.05, 6.05, 92.05)];
-        skipped.source_timestamp_ns = 92_000_000_001;
-        skipped.received_at_ns = skipped.source_timestamp_ns;
-        let mut skipped_token = token(93);
-        skipped_token.source_timestamp_ns = skipped.source_timestamp_ns;
-        let completion = client.submit(skipped_token.clone(), skipped).unwrap().blocking_recv().unwrap();
-        assert!(commit_completion(completion).expect("超限后仍按节拍接纳新帧").is_none());
-        let flush = client.flush(skipped_token.clone()).unwrap().blocking_recv().unwrap();
-        assert!(commit_completion(flush).expect("超限后的脏状态仍可刷新").is_some());
-        let flush = client.flush(skipped_token).unwrap().blocking_recv().unwrap();
-        assert!(commit_completion(flush).expect("超限后的已刷新状态不被再次拒绝").is_none());
+#[cfg(test)]
+fn compute_candidate(
+    kernel: &mut MappingKernel,
+    input: &MappingBackendInput,
+    config: MappingBackendComputeConfig,
+) -> Result<Option<MappingBackendCandidate>, String> {
+    let mut staged = kernel.clone();
+    let result = compute_candidate_in_place(&mut staged, input, config)?;
+    *kernel = staged;
+    Ok(result)
+}
+#[cfg(test)]
+#[path = "mapping_backend_tests.rs"]
+mod tests;
 
-        let export_error = client.export_checkpoint().unwrap().blocking_recv().unwrap()
-            .expect_err("实际检查点必须超过原 64MiB 上限");
-        assert!(export_error.contains("payload size"), "{export_error}");
-        assert!(export_error.contains(&format!("1..={MAX_MAPPING_BACKEND_CHECKPOINT_BYTES}")), "{export_error}");
-        eprintln!("真实射线超限导出: {export_error}");
-
-        let mut next = input(94);
-        next.sensor_origin_map = [0.0, 0.0, 93.05];
-        next.registered_points_map = vec![Point3::new(1.05, 1.05, 93.05)];
-        let mut next_token = token(94);
-        next_token.source_timestamp_ns = next.source_timestamp_ns;
-        let completion = client.submit(next_token, next).unwrap().blocking_recv().unwrap();
-        let candidate = commit_completion(completion).expect("导出失败后工作线程仍可推进")
-            .expect("新帧达到构图节拍");
-        assert_eq!(candidate.source_frame_sequence, 94);
-        assert_eq!(candidate.source_timestamp_ns, 94_000_000_000);
-        assert_eq!(candidate.accepted_points_map, vec![Point3::new(1.05, 1.05, 93.05)]);
-        assert!(client.export_checkpoint().unwrap().blocking_recv().unwrap().unwrap_err()
-            .contains("payload size"));
-        worker.into_stop_join_handle().expect("请求超限工作线程停止")
-            .join().expect("超限工作线程实际回收");
-    }
-
-    #[test]
-    fn failed_worker_checkpoint_restore_is_transactional() {
-        let worker = MappingBackendWorker::start(MappingBackendSpec::Voxel, 1, compute_config())
-            .expect("start worker");
-        let client = worker.client();
-        let seed = client
-            .submit(token(1), input(1))
-            .expect("submit seed frame")
-            .blocking_recv()
-            .expect("seed response");
-        commit_completion(seed).expect("seed compute");
-        let before = client
-            .export_checkpoint()
-            .expect("submit export")
-            .blocking_recv()
-            .expect("export response")
-            .expect("export checkpoint");
-        let mut invalid = before.clone();
-        invalid[MAPPING_BACKEND_CHECKPOINT_HEADER_BYTES
-            ..MAPPING_BACKEND_CHECKPOINT_HEADER_BYTES + size_of::<u64>()]
-            .copy_from_slice(
-                &u64::try_from(compute_config().window_capacity + 1)
-                    .expect("test capacity fits u64")
-                    .to_le_bytes(),
-            );
-        let error = client
-            .restore_checkpoint(invalid)
-            .expect("submit invalid restore")
-            .blocking_recv()
-            .expect("invalid restore response")
-            .expect_err("capacity mismatch must fail");
-        assert!(error.contains("capacity mismatch"));
-        let after = client
-            .export_checkpoint()
-            .expect("submit post-failure export")
-            .blocking_recv()
-            .expect("post-failure export response")
-            .expect("post-failure checkpoint");
-        assert_eq!(after, before);
-        worker.stop_and_join().expect("join worker");
-    }
-
-    #[test]
-    fn failed_candidate_construction_does_not_mutate_backend_state() {
-        let mut kernel = MappingBackendSpec::raytracing_defaults().into_kernel(1024);
-        for sequence in 1..=3 {
-            compute_candidate(&mut kernel, &input(sequence), compute_config())
-                .expect("seed ray state");
+pub(crate) fn flush_candidate(
+    kernel: &mut MappingKernel,
+    input: &MappingBackendInput,
+    config: MappingBackendComputeConfig,
+) -> Result<Option<MappingBackendCandidate>, String> {
+    let started = Instant::now();
+    let (backend_kind, live_window_occupancy, latest_frame_occupancy) = match kernel {
+        MappingKernel::Voxel(voxel) => {
+            if !voxel.dirty_since_candidate {
+                return Ok(None);
+            }
+            if voxel.current_window.is_empty() {
+                voxel.dirty_since_candidate = false;
+                return Ok(None);
+            }
+            let latest = build_occupancy(input, config)?;
+            voxel.last_candidate_received_at_ns = input.received_at_ns;
+            voxel.last_candidate_point_count = voxel.current_window.len();
+            voxel.dirty_since_candidate = false;
+            (MappingBackendKind::Voxel, latest.clone(), latest)
         }
-        let MappingKernel::Raytracing(before) = &kernel else {
-            panic!("ray kernel expected");
-        };
-        let voxel_count = before.map.voxels.len();
-        let stable_points = kernel.accumulated_points(&[]);
-        let last_candidate_point_count = before.last_candidate_point_count;
-        let last_candidate_received_at_ns = before.last_candidate_received_at_ns;
-        let mut invalid_config = compute_config();
-        invalid_config.resolution = 0.0;
-        let result = compute_candidate(&mut kernel, &input(4), invalid_config);
-        assert!(result.is_err());
-        let MappingKernel::Raytracing(ray) = &kernel else {
-            panic!("ray kernel expected");
-        };
-        assert_eq!(ray.map.voxels.len(), voxel_count);
-        assert_eq!(kernel.accumulated_points(&[]), stable_points);
-        assert_eq!(ray.last_candidate_point_count, last_candidate_point_count);
-        assert_eq!(
-            ray.last_candidate_received_at_ns,
-            last_candidate_received_at_ns
-        );
-    }
-
-
+        MappingKernel::Raytracing(ray) => {
+            if !ray.dirty_since_candidate {
+                return Ok(None);
+            }
+            let live = build_occupancy(input, config)?;
+            ray.last_occupancy = Some(live.clone());
+            ray.last_candidate_received_at_ns = input.received_at_ns;
+            ray.last_candidate_point_count = ray.map.healthy_count();
+            ray.dirty_since_candidate = false;
+            (MappingBackendKind::Raytracing, live.clone(), live)
+        }
+    };
+    Ok(Some(MappingBackendCandidate {
+        source_timestamp_ns: input.source_timestamp_ns,
+        received_at_ns: input.received_at_ns,
+        backend_kind,
+        live_window_occupancy,
+        latest_frame_occupancy,
+        accepted_points_map: Vec::new(),
+        compute_elapsed_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+    }))
 }
 
 #[cfg(test)]
 #[path = "mapping_backend_ray_count_equivalence_tests.rs"]
 pub(crate) mod ray_count_equivalence_tests;
 
-/// Offline copy only: retain the original backend configuration and update its
-/// persisted members from the same exact fine-voxel removal set as the preview.
-pub(crate) fn cleanup_completed_checkpoint(payload:&[u8], q:f32,
-    removed:&ahash::AHashSet<[i32;3]>, retained:&[[i32;3]], occupancy:OccupancyGrid)->Result<Vec<u8>,String>{
-    use nuwax_cloud_cleanup::offline_residual_cleanup::asset_key;
-    if payload.len()<MAPPING_BACKEND_CHECKPOINT_HEADER_BYTES{return Err("建图后端存档不完整".into());}
-    let mut reader=MappingCheckpointReader::new(payload);
-    let spec=match payload[12]{0=>MappingBackendSpec::Voxel,1=>MappingBackendSpec::Raytracing(Default::default()),_=>return Err("该地图没有点云建图后端".into())};
-    decode_mapping_checkpoint_header(&mut reader,spec)?;
-    let kernel=match spec {
-        MappingBackendSpec::Voxel=>{
-            let capacity=reader.read_u64()? as usize;let count=reader.read_u64()? as usize;
-            let _old_count=reader.read_u64()?;let stamp=reader.read_u64()?;
-            let mut points=VecDeque::new();for _ in 0..count{
-                let p=Point3::new(reader.read_f64()?,reader.read_f64()?,reader.read_f64()?);
-                if !removed.contains(&asset_key([p.x,p.y,p.z],q)){points.push_back(p);}
-            }reader.finish()?;
-            // 窗口格计数与恢复检查点时相同，按清理后保留的窗口点重建。
-            let points: VoxelWindow = points.into_iter().collect();
-            let window_cells=window_cells(&points);
-            MappingKernel::Voxel(VoxelKernel{last_candidate_point_count:points.len(),window_cells,window_point_indices:window_point_indices(&points),current_window:points,capacity,last_candidate_received_at_ns:stamp,dirty_since_candidate:false,dufo:Default::default()})
-        },
-        MappingBackendSpec::Raytracing(_)=>{
-            let c=decode_ray_config(&mut reader)?;
-            let config=Config{voxel_size:c.voxel_size,max_range:c.max_range,ray_subsample:c.ray_subsample,
-                shadow_depth:c.shadow_depth,grace_depth:c.grace_depth,min_health:c.min_health,max_health:c.max_health,
-                graze_cos:c.graze_cos,recency_window:c.recency_window,emit_every:c.emit_every,global_emit_every:c.global_emit_every,region_percentile:c.region_percentile};
-            let _old_count=reader.read_u64()?;let stamp=reader.read_u64()?;
-            let map_len=reader.read_u64()? as usize;let occ_len=reader.read_u64()? as usize;
-            let mut map=decode_voxel_map_checkpoint_for_config(reader.read_bytes(map_len)?,MAX_MAPPING_BACKEND_CHECKPOINT_BYTES/VOXEL_MAP_CHECKPOINT_ENTRY_BYTES,&config)?;
-            reader.read_bytes(occ_len)?;reader.finish()?;
-            let inv=1.0f32/config.voxel_size;
-            let ray_key=|k:&[i32;3]|{let p=k.map(|v|((v as f64+0.5)*f64::from(q)) as f32);((p[0]*inv).floor() as i32,(p[1]*inv).floor() as i32,(p[2]*inv).floor() as i32)};
-            let keep:ahash::AHashSet<_>=retained.iter().map(ray_key).collect();
-            let cut:ahash::AHashSet<_>=removed.iter().map(ray_key).filter(|k|!keep.contains(k)).collect();
-            map.voxels.retain(|k,_|!cut.contains(k));
-            MappingKernel::Raytracing(RaytracingKernel{last_candidate_point_count:map.healthy_count(),map,config,prepared_update:None,input:Vec::new(),last_occupancy:Some(occupancy),last_candidate_received_at_ns:stamp,dirty_since_candidate:false,dufo:Default::default()})
-        },_=>unreachable!()
+/// 目录读取边界用资产内的原配置校验结构；运行后端选择仍由启动配置决定。
+pub(crate) fn validate_saved_checkpoint(payload: &[u8]) -> Result<(), String> {
+    if payload.len() < MAPPING_BACKEND_CHECKPOINT_HEADER_BYTES {
+        return Err("建图后端检查点截断".into());
+    }
+    let mut reader = MappingCheckpointReader::new(payload);
+    let (spec, capacity) = match payload[12] {
+        MAPPING_BACKEND_KIND_VOXEL => {
+            decode_mapping_checkpoint_header(&mut reader, MappingBackendSpec::Voxel)?;
+            (
+                MappingBackendSpec::Voxel,
+                usize::try_from(reader.read_u64()?).map_err(|_| "后端窗口大小溢出")?,
+            )
+        }
+        MAPPING_BACKEND_KIND_RAYTRACING => {
+            decode_mapping_checkpoint_header(
+                &mut reader,
+                MappingBackendSpec::Raytracing(Default::default()),
+            )?;
+            let c = decode_ray_config(&mut reader)?;
+            (
+                MappingBackendSpec::raytracing(
+                    c.voxel_size,
+                    c.max_range,
+                    c.ray_subsample,
+                    c.shadow_depth,
+                    c.grace_depth,
+                    c.min_health,
+                    c.max_health,
+                    c.graze_cos,
+                    c.recency_window,
+                ),
+                0,
+            )
+        }
+        _ => return Err("未知建图后端检查点类型".into()),
     };
-    export_mapping_kernel_checkpoint(&kernel)
+    restore_mapping_kernel_checkpoint(
+        spec,
+        MappingBackendComputeConfig {
+            resolution: 0.05,
+            initial_safe_radius_meters: 0.,
+            window_capacity: capacity,
+        },
+        payload,
+    )
+    .map(|_| ())
 }

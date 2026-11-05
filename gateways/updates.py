@@ -11,9 +11,9 @@ from gateways.motion_guard import GatewayMotionGuardError
 def require_idle(runtime):
     if runtime.task_manager.has_active_tasks():
         raise RuntimeError("有任务正在运行，请先完成或取消任务")
-    recorder = runtime.mapping_recorder
-    if recorder is not None and recorder.status()["recording"]:
-        raise RuntimeError("正在录制建图，请先保存或停止建图")
+    mapping_session = runtime.platform_geometry_runtime.get_mapping_session_context()
+    if mapping_session and mapping_session.get("active"):
+        raise RuntimeError("正在建图，请先保存或停止建图")
     # 更新只重启本系统软件，要确认的是此刻没有在控制运动，与电机是否上电无关。
     # 所有运动都须持有运动守卫租约，撤销租约要等到零速确认才完成；本次运行未接入守卫则未发出过运动。
     guard = runtime.motion_guard

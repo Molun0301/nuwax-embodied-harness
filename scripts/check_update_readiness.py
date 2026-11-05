@@ -16,9 +16,12 @@ from gateways.updates import build_update_router, require_idle
 class ReadinessTests(unittest.TestCase):
     def setUp(self):
         self.lease = 0
+        self.mapping_session = None
         self.runtime = SimpleNamespace(
             task_manager=SimpleNamespace(has_active_tasks=lambda: False),
             mapping_recorder=SimpleNamespace(status=lambda: {"recording": False}),
+            platform_geometry_runtime=SimpleNamespace(
+                get_mapping_session_context=lambda: self.mapping_session),
             config=SimpleNamespace(robot=SimpleNamespace(active_robot="customrobot")),
             motion_guard=SimpleNamespace(has_connected=False,
                                          guard_state=lambda: SimpleNamespace(active_lease_id=self.lease)),
@@ -38,15 +41,21 @@ class ReadinessTests(unittest.TestCase):
             self.runtime.config.robot.active_robot = adapter
             require_idle(self.runtime)
 
-    def test_mapping_recording_blocks_readiness_until_stopped(self):
-        recording = {"recording": True}
-        self.runtime.mapping_recorder.status = lambda: recording
+    def test_active_mapping_session_blocks_readiness_until_stopped(self):
+        self.mapping_session = {"active": True}
         response = self.client.get("/api/updates/readiness")
         self.assertEqual(response.json(), {
-            "ready": False, "reason": "正在录制建图，请先保存或停止建图",
+            "ready": False, "reason": "正在建图，请先保存或停止建图",
         })
-        recording["recording"] = False
+        self.mapping_session["active"] = False
         self.assertEqual(self.client.get("/api/updates/readiness").json(), {"ready": True})
+
+    def test_recording_without_active_mapping_session_is_ready(self):
+        self.runtime.mapping_recorder.status = lambda: {"recording": True}
+        for session in (None, {"active": False}):
+            with self.subTest(mapping_session=session):
+                self.mapping_session = session
+                self.assertEqual(self.client.get("/api/updates/readiness").json(), {"ready": True})
 
     def test_active_motion_lease_blocks(self):
         self.runtime.motion_guard.has_connected = True

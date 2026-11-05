@@ -2816,11 +2816,6 @@ class MemoryService(SceneMappingMemoryMixin):
                     },
                 )
             )
-        effective_query = (
-            navigation_candidate.verification_query
-            if navigation_candidate is not None and navigation_candidate.verification_query
-            else query
-        )
         perception_context = self._perception_service.get_latest_perception(camera_id)
         if perception_context is None or (utc_now() - perception_context.timestamp) > timedelta(seconds=2):
             perception_context = self._perception_service.describe_current_scene(
@@ -2828,6 +2823,49 @@ class MemoryService(SceneMappingMemoryMixin):
                 refresh=True,
                 requested_by="memory_arrival_verify",
             )
+        result = self.verify_arrival_observation(
+            query, perception_context=perception_context, current_pose=None,
+            navigation_candidate=navigation_candidate, similarity_threshold=similarity_threshold,
+            expected_map_name=effective_map_name, goal_id=resolved_goal_id,
+        )
+        result.metadata.update(
+            map_name=effective_map_name or semantic_context.map_name,
+            localization_session_id=localization_session_id or active_localization_session_id,
+        )
+        return self._record_arrival_verification(result)
+
+    def verify_arrival_observation(
+        self,
+        query: str,
+        *,
+        perception_context: PerceptionContext,
+        current_pose: Optional[Pose],
+        target_record=None,
+        navigation_candidate: Optional[NavigationCandidate] = None,
+        similarity_threshold: float = 0.55,
+        expected_map_name: Optional[str] = None,
+        goal_id: Optional[str] = None,
+    ) -> MemoryArrivalVerification:
+        """对显式观察与位姿核对目标；不读取旧地图、定位会话或发起感知。"""
+
+        resolved_goal_id = goal_id or None
+        candidate_id_from_metadata = navigation_candidate.candidate_id if navigation_candidate is not None else None
+        if navigation_candidate is not None:
+            record_id = navigation_candidate.record_id
+            record_kind = navigation_candidate.metadata["record_kind"]
+        elif isinstance(target_record, TaggedLocation):
+            record_id, record_kind = target_record.location_id, MemoryRecordKind.TAGGED_LOCATION.value
+        elif isinstance(target_record, SemanticMemoryEntry):
+            record_id, record_kind = target_record.memory_id, target_record.kind.value
+        elif isinstance(target_record, SceneSpace):
+            record_id, record_kind = target_record.scene_space_id, MemoryRecordKind.SCENE_SPACE.value
+        else:
+            record_id, record_kind = "", ""
+        effective_query = (
+            navigation_candidate.verification_query
+            if navigation_candidate is not None and navigation_candidate.verification_query
+            else query
+        )
         scene_text = " ".join(
             [
                 perception_context.scene_summary.headline,
@@ -2861,9 +2899,7 @@ class MemoryService(SceneMappingMemoryMixin):
             target_labels=target_labels,
         )
         image_score = 0.0
-        target_point = None
-        if navigation_candidate is not None:
-            target_point = self._durable_index.validated_point(navigation_candidate.record_id)
+        target_point = self._durable_index.validated_point(record_id) if record_id else None
         if self._image_embedder is not None and perception_context.image_artifact is not None:
             current_image_bytes = self._load_image_bytes(perception_context.image_artifact.artifact_id)
             if current_image_bytes is not None:
@@ -2913,7 +2949,7 @@ class MemoryService(SceneMappingMemoryMixin):
             score=score,
             matched_labels=matched_labels,
             matched_memory_id=(
-                str(navigation_candidate.metadata.get("verification_memory_id") or "") or None if navigation_candidate is not None else None
+                str(navigation_candidate.metadata.get("verification_memory_id") or "") or None if navigation_candidate is not None else (target_record.memory_id if isinstance(target_record, SemanticMemoryEntry) else None)
             ),
             reason=reason,
             goal_id=resolved_goal_id,
@@ -2924,19 +2960,20 @@ class MemoryService(SceneMappingMemoryMixin):
                 "camera_id": perception_context.camera_id,
                 "requested_query": query,
                 "verification_query": effective_query,
-                "record_id": navigation_candidate.record_id if navigation_candidate is not None else "",
-                "record_kind": navigation_candidate.metadata["record_kind"] if navigation_candidate is not None else "",
+                "record_id": record_id,
+                "record_kind": record_kind,
                 "candidate_id": candidate_id_from_metadata or "",
                 "goal_id": resolved_goal_id or "",
-                "map_name": effective_map_name or semantic_context.map_name,
-                "localization_session_id": localization_session_id or active_localization_session_id,
+                "map_name": expected_map_name or "",
+                "pose": current_pose.model_dump(mode="json") if current_pose is not None else None,
+                "localization_session_id": "",
                 "arrival_verified": verified,
                 "arrival_score": round(score, 6),
                 "arrival_reason_code": arrival_reason_code,
                 **segmentation_evidence,
             },
         )
-        return self._record_arrival_verification(result)
+        return result
 
     def get_summary(self) -> MemoryStoreSummary:
         """返回记忆摘要。"""
@@ -3195,11 +3232,10 @@ class MemoryService(SceneMappingMemoryMixin):
         target_library = library_name if library_name is not None else self._active_library_name
         if not target_library:
             return tuple()
-        items = [
-            item
-            for item in self._tagged_location_history
-            if self._record_library_name(item) == target_library
-        ]
+        items = (self._repository.load_tagged_locations(library_name=target_library)
+                 if library_name is not None else
+                 [item for item in self._tagged_location_history
+                  if self._record_library_name(item) == target_library])
         if limit is not None:
             items = items[-max(0, limit) :]
         return tuple(items)
@@ -3221,11 +3257,10 @@ class MemoryService(SceneMappingMemoryMixin):
         target_library = library_name if library_name is not None else self._active_library_name
         if not target_library:
             return tuple()
-        items = [
-            item
-            for item in self._semantic_history
-            if self._record_library_name(item) == target_library
-        ]
+        items = (self._repository.load_semantic_memories(library_name=target_library)
+                 if library_name is not None else
+                 [item for item in self._semantic_history
+                  if self._record_library_name(item) == target_library])
         if limit is not None:
             items = items[-max(0, limit) :]
         return tuple(items)
@@ -3388,13 +3423,15 @@ class MemoryService(SceneMappingMemoryMixin):
         limit: Optional[int] = None,
         payload_filter: Optional[MemoryPayloadFilter] = None,
         scene_space_ids: Optional[List[str]] = None,
+        library_name: Optional[str] = None,
         map_name: Optional[str] = None,
         localization_session_id: Optional[str] = None,
         review_statuses: Optional[List[Union[SceneSpaceReviewStatus, str]]] = None,
     ) -> Tuple[SceneSpace, ...]:
         """列出当前记忆库内的场景空间。"""
 
-        active_library = self._require_memory_enabled(initialize_embedders=False)
+        active_library = (library_name if library_name is not None
+                          else self._require_memory_enabled(initialize_embedders=False))
         if payload_filter is None:
             spaces = self._repository.list_scene_spaces(
                 library_name=active_library,

@@ -2678,50 +2678,18 @@
       function syncPointcloud3dState() {
         if (PLANAR_PIPELINE) return;
         window.pointcloud3d?.setMapContext(state.lastMapEnvelope?.data);
-        const navigationFrame = state.latestStreamFrames["navigation.state"];
-        const navigationContext = navigationFrame && navigationFrame.payload;
-        const navigationExplorationValidated = navigationGoalMatchesExploration(
-          navigationContext,
-          state.latestExplorationOverlayIdentity
-        );
         window.dispatchEvent(new CustomEvent("stream:localization.pose", { detail: state.latestPose || null }));
         window.dispatchEvent(new CustomEvent("stream:localization.trajectory", {
           detail: { trajectory: state.trajectory || [] },
         }));
-        window.dispatchEvent(new CustomEvent("stream:exploration.frontier", {
-          detail: {
-            frontiers: state.frontiers || [],
-            planned_path: state.navigationPath || [],
-            local_path: state.navigationLocalPath || [],
-            navigation_path_state: state.navigationDisplay?.mode || (state.navigationPath.length ? "retained" : "none"),
-            current_goal: state.goalPose || null,
-            navigation_is_public: navigationContextIsPublic(state.latestStreamFrames["navigation.state"]?.payload),
-            navigation_exploration_validated: navigationExplorationValidated,
-            ...currentExplorationOverlayDetail(),
-          },
-        }));
-        window.dispatchEvent(new CustomEvent("stream:exploration.state", {
-          detail: {
-            planned_path: state.navigationPath || [],
-            local_path: state.navigationLocalPath || [],
-            navigation_path_state: state.navigationDisplay?.mode || (state.navigationPath.length ? "retained" : "none"),
-            current_goal: state.goalPose || null,
-            navigation_is_public: navigationContextIsPublic(state.latestStreamFrames["navigation.state"]?.payload),
-            navigation_exploration_validated: navigationExplorationValidated,
-            ...currentExplorationOverlayDetail(),
-          },
-        }));
-        window.dispatchEvent(new CustomEvent("stream:navigation.state", {
-          detail: {
-            planned_path: state.navigationPath || [],
-            local_path: state.navigationLocalPath || [],
-            navigation_path_state: state.navigationDisplay?.mode || (state.navigationPath.length ? "retained" : "none"),
-            current_goal: state.goalPose || null,
-            navigation_is_public: navigationContextIsPublic(state.latestStreamFrames["navigation.state"]?.payload),
-            navigation_exploration_validated: navigationExplorationValidated,
-            ...currentExplorationOverlayDetail(),
-          },
-        }));
+        const navigation = state.latestStreamFrames["navigation.state"]?.payload;
+        const exploration = state.latestStreamFrames["exploration.state"]?.payload;
+        const overlays = {planned_path: state.navigationPath, local_path: [], current_goal: state.goalPose,
+          navigation_is_public: navigationContextIsPublic(navigation),
+          navigation_exploration_validated: navigation?.exploration_child === true};
+        window.dispatchEvent(new CustomEvent("stream:exploration.frontier", {detail: {frontiers: [], ...overlays}}));
+        window.dispatchEvent(new CustomEvent("stream:exploration.state", {detail: {...exploration, ...overlays}}));
+        window.dispatchEvent(new CustomEvent("stream:navigation.state", {detail: {...navigation, ...overlays}}));
         window.dispatchEvent(new CustomEvent("pointcloud3d:semantic-instances", {
           detail: { instances: semanticMapInstances(), selectedId: state.semanticSelectedId },
         }));
@@ -3641,11 +3609,7 @@
         return pointFromFrontier(value);
       }
       function navigationContextIsPublic(context) {
-        const nav = context && context.navigation_state || {};
-        const owner = Number(nav.metadata?.owner_kind || 0);
-        if (owner) return owner === 1;
-        const goalId = nav.current_goal_id || nav.metadata?.observed_goal_id || context?.current_goal?.goal_id;
-        return state.navigationDisplay?.isPublic === true && (!goalId || goalId === state.navigationDisplay.goalId);
+        return Boolean(context && !context.exploration_child);
       }
       function goalPoseFromValue(value) {
         if (!value) return null;
@@ -5131,7 +5095,6 @@
           frame.topic === "exploration.frontier"
           && state.explorationOverlayRequiresCanonical
         ) return;
-        if (frame.topic === "exploration.state" && !acceptCanonicalExplorationFrame(frame)) return;
         if (frame.topic === "tasks.state") frame = { ...frame, __taskSequence: ++state.taskEventSequence };
         state.latestStreamFrames[frame.topic] = frame;
         if (frame.topic === "localization.pose") {
@@ -5203,43 +5166,22 @@
             applyLocalizationDisplay({ ...localization, data: { ...localization.data, trajectory } }, { reevaluateMap: false });
           } else requestMapDraw(false);
         } else if (frame.topic === "navigation.state") {
-          updateNavigation(envelopeFromFrame(frame, {
-            navigation_context: frame.payload,
-            exploration_context: state.latestStreamFrames["exploration.state"] && state.latestStreamFrames["exploration.state"].payload,
-            navigation_update_frame: true,
-          }));
-          const navCtx = frame.payload || {};
-          const goal = navCtx.current_goal || null;
-          const navStatus = String((navCtx.status && (navCtx.status.value || navCtx.status)) || "").toLowerCase();
-          const terminal = ["succeeded", "failed", "cancelled", "timeout"].includes(navStatus);
-          const explorationIdentity = state.latestExplorationOverlayIdentity;
-          const canonicalGoalAllowed = navigationContextIsPublic(navCtx) || !explorationIdentity
-            || navigationGoalMatchesExploration(navCtx, explorationIdentity);
-          if (goal && !terminal && canonicalGoalAllowed) {
-            state.highlightTarget = {
-              record_id: goal.metadata && goal.metadata.record_id || null,
-              record_kind: goal.metadata && goal.metadata.record_kind || null,
-              target_pose: goalPoseFromValue(goal),
-              target_name: goal.target_name || null,
-            };
-          } else if (!explorationIdentity && terminal) {
-            state.highlightTarget = null;
-          }
+          const nav = frame.payload;
+          const target = nav?.target;
+          state.goalPose = target ? {position: {x: target.x, y: target.y, z: target.z},
+            orientation: {x: target.qx, y: target.qy, z: target.qz, w: target.qw}} : null;
+          state.navigationPath = (nav?.planned_path || []).map(([x, y, z]) => ({x, y, z}));
+          state.navigationLocalPath = [];
+          state.navigationDisplay = {mode: state.navigationPath.length ? "live" : "none",
+            isPublic: navigationContextIsPublic(nav), status: nav?.status};
+          state.highlightTarget = target && !["succeeded", "failed", "cancelled", "replaced", "stopped"].includes(nav.status)
+            ? {target_pose: state.goalPose} : null;
+          window.dispatchEvent(new CustomEvent("stream:navigation.state", {detail: nav}));
           requestMapDraw(false);
         } else if (frame.topic === "exploration.state") {
-          const navigationContext = state.latestStreamFrames["navigation.state"] && state.latestStreamFrames["navigation.state"].payload;
-          updateNavigation(envelopeFromFrame(frame, { navigation_context: navigationContext, exploration_context: frame.payload }));
-          const explorationIdentity = state.latestExplorationOverlayIdentity;
-          if (
-            !navigationContextIsPublic(navigationContext)
-            && explorationIdentity
-            && (
-              explorationIdentity.terminal
-              || explorationIdentity.status === "idle"
-              || explorationIdentity.frontierCount === 0
-              || !navigationGoalMatchesExploration(navigationContext, explorationIdentity)
-            )
-          ) state.highlightTarget = null;
+          state.frontiers = [];
+          window.dispatchEvent(new CustomEvent("stream:exploration.state", {detail: frame.payload}));
+          requestMapDraw(false);
         } else if (frame.topic === "exploration.frontier") {
           updateFrontierFrame(frame);
         } else if (frame.topic === "runtime.governance") {
@@ -5412,6 +5354,7 @@
       function updateTaskFrameImpl(frame) {
         const receiveSequence = frame.__taskSequence || ++state.taskEventSequence;
         const event = frame.payload;
+        window.dispatchEvent(new CustomEvent("stream:tasks.state", {detail: event.payload}));
         const task = {...event.payload, __streamSequence: receiveSequence};
         const key = task.task_id;
         if (isTerminalTaskState(task.state)) {

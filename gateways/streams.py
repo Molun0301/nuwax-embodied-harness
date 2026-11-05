@@ -68,7 +68,7 @@ class Streams:
         self._running = True
         state = self.platform.geometry_state
         self._unsubscribe = [
-            state.subscribe(lambda value: self.stream_bus.publish("geometry.state", source="geometry", payload=asdict(value))),
+            state.subscribe(self._state_updated),
             state.subscribe_pose(lambda value: self.stream_bus.publish("localization.pose", source="geometry", payload=value,
                                                                        frame_id=value.frame_id)),
             state.subscribe_map(self._map_updated),
@@ -124,6 +124,13 @@ class Streams:
     def _map_updated(self, value):
         self.stream_bus.publish("map.frame", source="geometry", payload=value, frame_id=value.grid.frame_id)
         self._cloud_wake.set()
+
+    def _state_updated(self, value):
+        self.stream_bus.publish("geometry.state", source="geometry", payload=asdict(value))
+        self.stream_bus.publish("navigation.state", source="geometry",
+            payload=None if value.navigation is None else asdict(value.navigation))
+        self.stream_bus.publish("exploration.state", source="geometry",
+            payload=None if value.exploration is None else asdict(value.exploration))
 
     def _cloud_updates(self):
         while True:

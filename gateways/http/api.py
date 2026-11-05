@@ -535,6 +535,10 @@ def build_http_router(runtime: Platform, access_manager: GatewayAccessManager) -
     def api_map_cleanup_status(preview_id: str, request: Request):
         return _invoke_capability(request, "get_map_cleanup", {"preview_id": preview_id})
 
+    @router.get("/api/maps/cleanup/{preview_id}/points/{kind}")
+    def api_map_cleanup_points(preview_id: str, kind: str):
+        return FileResponse(runtime.map_cleanup.points(preview_id, kind), media_type="application/octet-stream")
+
     @router.post("/api/maps/cleanup/{preview_id}/cancel")
     def api_map_cleanup_cancel(preview_id: str, request: Request):
         return _invoke_capability(request, "cancel_map_cleanup", {"preview_id": preview_id})

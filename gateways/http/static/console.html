@@ -197,7 +197,7 @@
                           <button data-role="explore-resume" class="msb-btn" type="button" disabled>继续所选探索</button>
                         </div>
                       </div>
-                      <p class="msb-status"><span data-role="explore-status" aria-live="polite">等待操作。</span><span data-role="explore-progress" class="msb-meta"></span><span class="msb-note">暂停会先停车，再保存地图和探索进度；恢复后会重新定位。</span></p>
+                      <p class="msb-status"><span data-role="explore-status" aria-live="polite">等待操作。</span><span data-role="explore-progress" class="msb-meta"></span><span class="msb-note">暂停会停止探索后保存地图和进度；恢复后会重新定位。</span></p>
                     </details>
                     <details class="floor-navigation msb-pane" data-role="floor-navigation" data-nav-pane="floor" role="tabpanel" hidden>
                       <summary>跨楼层导航</summary>
@@ -210,9 +210,7 @@
                         <div class="msb-group">
                           <button data-role="floor-submit" class="msb-btn primary" type="button">前往目标层</button>
                           <button data-role="floor-cancel" class="msb-btn" type="button" disabled>停止任务</button>
-                          <button data-role="floor-resume" class="msb-btn" type="button" hidden>继续原请求</button>
                           <button data-role="floor-explore" class="msb-btn" type="button">逐层探索建筑</button>
-                          <button data-role="floor-resume-explore" class="msb-btn" type="button" hidden>继续逐层探索</button>
                           <label class="msb-btn floor-import">导入楼层配置<input data-role="floor-import" type="file" accept="application/json,.json"></label>
                         </div>
                       </div>

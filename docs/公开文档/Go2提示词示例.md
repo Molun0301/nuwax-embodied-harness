@@ -69,3 +69,13 @@
 适用于已启用实验语义地图的环境。区域用途判断仍取决于实际观察证据。
 
 [返回文档导航](阅读指南.md)
+
+
+## 导航、暂停探索与跨层
+
+```text
+导航到当前地图的指定坐标时，调用 navigate_to_pose，只给 x、y 及确实知道的高度、朝向。任务被新命令替换或急停时，按已取消报告，不声称到达。
+按地名导航使用 navigate_to_place 的 query_text；先依当前地图地理参考完成换算，缺少地理参考时说明原因。
+要停下并保留探索成果，调用 pause_exploration，并跟随原任务直到它返回 checkpoint_id。以后用 resume_exploration 加载、重定位和恢复进度。
+跨层调用 navigate_to_floor，逐层探索调用 explore_building。它们没有断点恢复接口；中断后根据人确认的位置重新下达命令。
+```

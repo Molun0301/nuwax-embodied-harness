@@ -39,10 +39,11 @@ class Platform:
             self.perception.video_runtime.start()
 
     def stop(self) -> None:
-        operations = [self.tasks.shutdown, self.streams.stop, self.input_bridge.stop,
+        operations = [self.tasks.shutdown, self.map_cleanup.close, self.streams.stop, self.input_bridge.stop,
                       self.geometry_state.stop, self.perception.video_runtime.close,
                       self.perception.close, self.follow.close, self.memory.close, self.artifacts.close,
-                      self.motion.close, self.geometry.close, self.audio.stop, self.robot_state.stop,
+                      self.motion.close, self.geometry.close, self.places.close, self.buildings.close,
+                      self.audio.stop, self.robot_state.stop,
                       self.robot.stop, self.streams.close, self.events.shutdown]
         for operation in operations:
             try:
@@ -76,7 +77,8 @@ class Platform:
 
 def build_platform(config) -> Platform:
     from contracts.artifacts import ArtifactRetentionPolicy
-    from gateways.capabilities import maps, motion, system
+    from gateways.capabilities import building, cleanup, exploration, maps, motion, navigation, system
+    from gateways.capabilities.exploration import ExplorationControl
     from gateways.person_follow import GatewayPersonFollowBridge
     from gateways.streams import Streams, VideoSource
     from services.artifact_service import ArtifactService
@@ -84,7 +86,11 @@ def build_platform(config) -> Platform:
     from services.audio.service import AudioService
     from services.memory.service import MemoryService
     from services.navigation.building_catalog import BuildingCatalog
-    from services.mapping.catalog import MapCatalogRepository
+    from services.navigation.facilities.http_provider import load_facility_providers
+    from services.navigation.exploration_checkpoint import ExplorationCheckpoints
+    from services.navigation.memory_targets import NavigationMemory
+    from services.navigation.places import PlaceLookup
+    from services.geometry.cleanup import MapCleanupService
     from services.observation_service import ObservationService
     from services.perception import PerceptionService, PerceptionVideoRuntime, build_platform_perception_components
     from services.perception.service import VideoFrameSource
@@ -96,7 +102,8 @@ def build_platform(config) -> Platform:
     platform.events = EventBus()
     platform.robot = create_active_robot_assembly(config)
     platform.capabilities = CapabilityTable()
-    for cap in system.CAPABILITIES + maps.CAPABILITIES + motion.CAPABILITIES:
+    for cap in (system.CAPABILITIES + maps.CAPABILITIES + motion.CAPABILITIES + navigation.CAPABILITIES
+                + exploration.CAPABILITIES + building.CAPABILITIES + cleanup.CAPABILITIES):
         platform.capabilities.register(cap)
     platform.tasks = TaskRunner(platform)
     home = Path(os.environ.get("NUWAX_INSTALL_HOME", config.base_dir))
@@ -104,6 +111,9 @@ def build_platform(config) -> Platform:
     platform.geometry = GeometryClient(f"127.0.0.1:{config.geometry.external.port}")
     platform.geometry_state = GeometryStateView(platform.geometry, platform.events)
     platform.maps = MapStore(config.runtime_data.map_catalog_root)
+    platform.map_cleanup = MapCleanupService(config, platform.maps)
+    platform.exploration_control = ExplorationControl()
+    platform.exploration_checkpoints = ExplorationCheckpoints(platform.maps.root)
     from providers import StreamingSensorSampleProvider, StreamingLocalizationProvider, StreamingPointCloudProvider
     providers = platform.robot.providers
     platform.input_bridge = InputBridge(client=platform.geometry,
@@ -138,7 +148,10 @@ def build_platform(config) -> Platform:
         embedding_timeout_sec=config.runtime_data.memory_embedding_timeout_sec,
         deferred_projection_config=config.perception.deferred_projection, association_config=config.perception.instance_association)
     platform.follow = GatewayPersonFollowBridge()
-    platform.buildings = BuildingCatalog(MapCatalogRepository(config.runtime_data.map_catalog_root))
+    platform.buildings = BuildingCatalog(platform.maps, providers=load_facility_providers(
+        config.geometry.navigation.facility_providers_json))
+    platform.places = PlaceLookup()
+    platform.navigation_memory = NavigationMemory(platform.memory, platform.geometry_state, platform.perception)
     platform.robot_state = RobotStateService(platform.robot, state_store=state_store,
                                             event_bus=platform.events, stream_bus=stream_bus)
     platform.artifacts = artifacts

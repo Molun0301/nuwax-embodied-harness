@@ -200,6 +200,19 @@ class GeometryStateView:
         with self._condition:
             return self._pose
 
+    def wait_for_pose(self, ctx: TaskContext) -> Pose:
+        """等真实位姿流，供三维目标补用当前机体高度。"""
+        from services.geometry.client import GeometryError
+        with self._condition:
+            while self._pose is None:
+                ctx.check()
+                if self._stopped.is_set() or not self._connected:
+                    raise GeometryError("UNAVAILABLE", "Geometry 状态流中断")
+                remaining = ctx.remaining()
+                self._condition.wait(0.05 if remaining is None else min(0.05, remaining))
+            ctx.check()
+            return self._pose
+
     def latest_map(self) -> Optional[MapUpdate]:
         with self._condition:
             return self._map

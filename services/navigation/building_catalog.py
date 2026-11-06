@@ -10,10 +10,7 @@ from pathlib import Path
 import tempfile
 import threading
 
-from jsonschema import Draft202012Validator
-from jsonschema.exceptions import ValidationError
-
-from contracts.building_navigation import BuildingTopology, TOPOLOGY_SCHEMA, topology_from_dict
+from contracts.building_navigation import BuildingTopology, topology_from_dict
 from core.errors import GatewayError
 from services.geometry.maps import MapStore
 
@@ -30,11 +27,10 @@ class BuildingCatalog:
         try:
             with path.open(encoding="utf-8") as stream:
                 value = json.load(stream)
-            Draft202012Validator({"type": "array", "items": TOPOLOGY_SCHEMA}).validate(value)
-        except (json.JSONDecodeError, ValidationError) as error:
+            return tuple(topology_from_dict(item) for item in value)
+        except (json.JSONDecodeError, AttributeError, KeyError, TypeError) as error:
             raise GatewayError(f"楼栋目录无法读取：{path.name}：{error}",
                                error_code="building_catalog_invalid", http_status=500) from error
-        return tuple(topology_from_dict(item) for item in value)
 
     def get(self, building_id: str) -> BuildingTopology | None:
         return next((value for value in self.list() if value.building_id == building_id), None)
@@ -53,6 +49,7 @@ class BuildingCatalog:
                 try:
                     json.dump([asdict(value) for value in records.values()], stream, ensure_ascii=False)
                     stream.flush()
+                    os.fsync(stream.fileno())
                     os.replace(temporary, self.path)
                 finally:
                     temporary.unlink(missing_ok=True)

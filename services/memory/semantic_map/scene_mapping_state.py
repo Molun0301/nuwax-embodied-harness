@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import heapq
 from datetime import timezone
 
 from contracts.base import utc_now
@@ -29,14 +30,12 @@ class SemanticMapState:
             raise GatewayError("当前地图与记忆库名称不一致。", error_code="scene_map_library_mismatch", http_status=409)
         capture = {"grid": algorithm_grid(value), "binding": map_binding(value), "library_name": snapshot.name,
                    "memory_snapshot": snapshot, "spaces": tuple(sorted(
-                       (space for space in snapshot.read("scene_space") if space.metadata.get(MANAGED_KEY)),
+                       (space for space in snapshot.model_map("scene_space").values() if space.metadata.get(MANAGED_KEY)),
                        key=lambda value: value.scene_space_id))}
         if include_decision_inputs:
-            records = snapshot.read("memory")
-            ordered = sorted(records, key=lambda value: value.memory_id)
-            capture["entries"] = tuple(sorted(ordered, key=lambda value: (
-                value.timestamp if value.timestamp.tzinfo else value.timestamp.replace(tzinfo=timezone.utc)), reverse=True)[:2000])
-            capture["entry_total"] = len(records)
+            reader = self.core.reader(snapshot.name)
+            capture["entries"] = reader.read("memory", order="julianday(json_extract(filter_json,'$.timestamp')) DESC,id ASC", limit=2000)
+            capture["entry_total"] = len(snapshot.model_map("memory"))
         return capture
 
     def _assert_scene_mapping_capture(self, capture, *, require_content=True):
@@ -64,7 +63,7 @@ class SemanticMapState:
 
     def commit_scene_mapping_spaces(self, capture, spaces, *, expected_revisions, retire_missing=False):
         def write(store):
-            current = {space.scene_space_id: space for space in store.records("scene_space")}
+            current = store.model_map("scene_space")
             result = []
             retired = []
             for space in spaces:
@@ -103,7 +102,7 @@ class SemanticMapState:
     def commit_scene_mapping_label(self, capture, space, *, label, source, expected_revision, requested_by=None):
         explicit = source == "explicit_tool_update"
         def write(store):
-            current = next((value for value in store.records("scene_space") if value.scene_space_id == space.scene_space_id), None)
+            current = store.get("scene_space",space.scene_space_id)
             revision = int(current.metadata.get("scene_revision", 0)) if current else 0
             if revision != expected_revision:
                 raise GatewayError("区域在处理期间已修改，拒绝覆盖。", error_code="scene_revision_conflict", http_status=409)
@@ -152,10 +151,10 @@ class SemanticMapState:
     def capture_scene_graph_state(self):
         capture = self.capture_scene_mapping_state()
         snapshot = capture["memory_snapshot"]
-        instances = sorted(snapshot.read("instance"), key=lambda value: (
-            value.last_seen_ts if value.last_seen_ts.tzinfo else value.last_seen_ts.replace(tzinfo=utc_now().tzinfo), value.instance_id), reverse=True)
+        instances = snapshot.model_map("instance")
         entries = capture["entries"]
-        selected = instances[:1000]
+        selected = heapq.nlargest(1000,instances.values(),key=lambda value: (
+            value.last_seen_ts if value.last_seen_ts.tzinfo else value.last_seen_ts.replace(tzinfo=utc_now().tzinfo),value.instance_id))
         rows = self.core.instance_rows(selected, library_name=capture["library_name"], now=utc_now())
         by_id = {value.instance_id: value for value in selected}
         capture["instances"] = [{**row, "artifact_ids": list(by_id[row["instance_id"]].artifact_ids),

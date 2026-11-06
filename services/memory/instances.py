@@ -171,21 +171,28 @@ class InstancesMixin:
     def list_semantic_instances(self, *, library_name=None, label=None):
         snapshot = self.library_snapshot(library_name)
         name = snapshot.name
-        records = sorted(snapshot.read("instance"), key=self._instance_view_order, reverse=True)
+        records = sorted((snapshot.model_map("instance").values() if snapshot.name == self.current_library
+                          and hasattr(snapshot,"model_map") else self.reader(library_name).read("instance",
+                          where="lower(json_extract(payload,'$.label'))=?" if label else "",
+                          params=(str(label).lower().strip(),) if label else ())), key=self._instance_view_order, reverse=True)
         return self._semantic_instance_rows(records, name or "", utc_now(), label=label)
 
     def get_semantic_instances_snapshot(self, *, limit=500):
-        records = [record for record in self.records("instance") if self._instance_is_confirmed(record)]
+        records = [record for record in self.snapshot().model_map("instance").values() if self._instance_is_confirmed(record)]
         selected = heapq.nlargest(limit, records, key=self._instance_view_order)
         return {"instances": self.instance_rows(selected), "library_name": self.current_library,
                 "active_library_name": self.current_library, "total": len(records), "limit": limit,
                 "truncated": len(records) > limit}
 
     def get_semantic_instance(self, instance_id, *, library_name=None):
-        for record in self.library_snapshot(library_name).read("instance"):
-            if instance_id == record.instance_id or instance_id in record.merged_instance_ids:
-                return record
-        return None
+        record = self.get_record("instance",instance_id,library_name=library_name)
+        if record is not None:
+            return record
+        if library_name is None or library_name == self.current_library:
+            return next((record.model_copy(deep=True) for record in self.snapshot().model_map("instance").values()
+                         if instance_id in record.merged_instance_ids),None)
+        values = self.reader(library_name).read("instance", where="EXISTS (SELECT 1 FROM json_each(payload,'$.merged_instance_ids') WHERE value=?)",params=(instance_id,),limit=1)
+        return values[0] if values else None
 
     def resolve_instance_id(self, instance_id):
         record = self.get_semantic_instance(instance_id)
@@ -200,7 +207,7 @@ class InstancesMixin:
         if pose is None:
             return (), (), []
         context = self._semantic_builder.build(self.current_grid(), map_name=map_name)
-        ray_history = (InstanceCacheRayHistoryProvider(self.records("instance"))
+        ray_history = (InstanceCacheRayHistoryProvider(self._record_map("instance").values())
                        if self._deferred_projection_config is not None
                        and self._deferred_projection_config.triangulation_enabled else None)
         # 投影在进入写线程之前完成，查询不等待投影或关联。
@@ -208,7 +215,9 @@ class InstancesMixin:
                                              frame_tree=frame_tree, ray_history=ray_history)
         def ingest(store):
             if store is None or store.name != map_name:
-                return (), (), []
+                if admission == ADMISSION_AUTOMATIC:
+                    return (), (), []
+                self._require_library(store, map_name)
             from dataclasses import replace
             photos = self._copy_photos(store, perception_context, image_bytes) if projected else ()
             values = tuple(replace(item, source_artifact_ids=tuple(photos)) for item in projected)
@@ -217,7 +226,7 @@ class InstancesMixin:
         return self.write(ingest)
 
     def _associate_observations(self, store, projected, *, admission, occupancy_grid=None, now=None):
-        before = {record.instance_id: record for record in store.records("instance")}
+        before = store.model_map("instance")
         with self._embeddings._model_lock:
             updated, outcomes = self._association.associate(projected, existing_instances=before,
                 map_name=store.name, occupancy_grid=occupancy_grid, now=now or utc_now(), admission=admission)
@@ -233,12 +242,13 @@ class InstancesMixin:
         outcomes = tuple(AssociationOutcome(updated[aliases.get(item.instance.instance_id, item.instance.instance_id)]
             if item.instance is not None else None, item.created, item.matched_score) for item in outcomes)
         if aliases:
-            for event in store.records("observation"):
+            for event in store.model_map("observation").values():
                 identifiers = list(dict.fromkeys(aliases.get(identity, identity) for identity in event.linked_instance_ids))
                 if identifiers != event.linked_instance_ids:
                     store.put("observation", event.model_copy(update={"linked_instance_ids": identifiers}))
         for identifier in before.keys() - updated.keys():
             store.delete("instance", identifier)
-        for record in updated.values():
-            store.put_live_instance(record, persist=self._is_long_term_static_instance(record))
+        for identifier, record in updated.items():
+            if before.get(identifier) != record:
+                store.put_live_instance(record, persist=self._is_long_term_static_instance(record))
         return projected, outcomes, [item.instance.instance_id for item in outcomes if item.instance is not None]

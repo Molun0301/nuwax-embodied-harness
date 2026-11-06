@@ -4,7 +4,7 @@ from __future__ import annotations
 from services.navigation.building_execution import building, floor, load_floor, transfer
 
 
-def explore_building(platform, ctx, args, *, navigate, explore):
+def explore_building(platform, ctx, args, *, navigate, explore, start_mapping):
 
     topology = building(platform, args["building_id"])
     floor_ids = args.get("floor_ids") or [value.floor_id for value in topology.floors if value.enabled]
@@ -15,7 +15,8 @@ def explore_building(platform, ctx, args, *, navigate, explore):
         saved = platform.maps.get(target.map_name)
         continuing = saved is not None and saved.saved
         # 目录只选择产品操作；加载失败原样结束，不把缺图错误改写为新建。
-        route = transfer(platform, ctx, topology, target, args["motion_generation"], create_target=not continuing, navigate=navigate)
+        route = transfer(platform, ctx, topology, target, args["motion_generation"], create_target=not continuing,
+                         navigate=navigate, start_mapping=start_mapping)
         if not route and continuing:
             load_floor(platform, ctx, target)
         ctx.progress(index / len(floor_ids), "exploring_floor", f"正在探索 {target.display_name}。",
@@ -25,7 +26,8 @@ def explore_building(platform, ctx, args, *, navigate, explore):
         conditions["max_duration_ms"] = min(conditions.get("max_duration_ms", per_floor_ms), per_floor_ms)
         result = explore(platform, ctx, {"map_name": target.map_name,
             "continue_saved": continuing, "motion_generation": args["motion_generation"],
-            "stop_conditions": conditions, "save_map": True})
+            "stop_conditions": conditions, "save_map": True,
+            "max_navigation_retries": 1, "blacklist_radius_m": 0.75})
         completed.append({"floor_id": floor_id, "map_name": target.map_name, "exploration": result})
         ctx.progress((index + 1) / len(floor_ids), "floor_saved", f"{target.display_name} 已探索并保存。",
                      completed_floors=[value["floor_id"] for value in completed])

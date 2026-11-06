@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
-from typing import Optional
+from typing import Dict, List, Optional
 from uuid import uuid4
 
 from core.errors import GatewayError
@@ -47,8 +47,10 @@ class MapCleanupService:
         self._maps = maps
         self._map_root = maps.root.resolve()
         self._root = self._map_root / ".cleanup"
+        if self._root.exists():
+            shutil.rmtree(self._root)
         self._lock = threading.RLock()
-        self._jobs: dict[str, _Job] = {}
+        self._jobs: Dict[str, _Job] = {}
         self._closed = False
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="map-cleanup")
 
@@ -80,7 +82,7 @@ class MapCleanupService:
         if job.cancelled.is_set():
             raise Cancelled()
 
-    def _tool(self, job: _Job, arguments: list[str], ctx: Optional[TaskContext] = None) -> None:
+    def _tool(self, job: _Job, arguments: List[str], ctx: Optional[TaskContext] = None) -> None:
         self._check_cancelled(job, ctx)
         environment = dict(os.environ, NUWAX_MAP_CATALOG_ROOT=str(self._map_root))
         process = None
@@ -194,7 +196,7 @@ class MapCleanupService:
             raise GatewayError("未知清理预览图层。", error_code="invalid_params", http_status=400) from None
         with self._lock:
             job = self._job(preview_id)
-            if job.state not in {"ready", "applying", "applied"}:
+            if job.state not in {"ready", "applying"}:
                 raise _failure("清理预览尚未完成或已取消。")
             return job.directory / filename
 
@@ -219,6 +221,7 @@ class MapCleanupService:
             if job.state != "ready":
                 raise _failure("请先完成清理预览，再另存新地图。")
             job.state = "applying"
+            job.error = None
             job.completed.clear()
         try:
             ctx.progress(0.1, "applying", "正在另存清理后的新地图。")
@@ -229,6 +232,7 @@ class MapCleanupService:
             self._write_meta(job, new_map_name)
             with self._lock:
                 job.state = "applied"
+            self._remove_directory(job)
             return self.status(preview_id)
         except Cancelled:
             with self._lock:
@@ -238,7 +242,8 @@ class MapCleanupService:
             raise
         except Exception as error:
             with self._lock:
-                job.state, job.error = "failed", str(error)
+                job.state = "ready" if job.result_map is None and (self._map_root / new_map_name).exists() else "failed"
+                job.error = str(error)
             raise
         finally:
             job.completed.set()

@@ -1,4 +1,4 @@
-"""按当前地图的真实记忆记录解析命名目标，并核对一次到达观察。"""
+"""按当前地图的真实记忆记录解析命名目标与区域。"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -35,11 +35,9 @@ def _memory_pose(pose: Pose) -> MemoryPose:
 
 
 class NavigationMemory:
-    def __init__(self, memory, state, perception, artifacts):
+    def __init__(self, memory, state):
         self._memory = memory
         self._state = state
-        self._perception = perception
-        self._artifacts = artifacts
 
     def resolve(self, target_name, *, camera_id=None) -> MemoryTarget:
         snapshot = self._state.snapshot()
@@ -86,30 +84,3 @@ class NavigationMemory:
         if pose is None:
             return False
         return pose_in_scene_space(_memory_pose(pose), region)
-
-    def verify(self, target, *, camera_id=None, similarity_threshold=0.55, goal_id="") -> dict:
-        snapshot = self._state.snapshot()
-        map_name = "" if snapshot is None else snapshot.map_name
-        current_pose = self._state.pose()
-        try:
-            observed = self._perception.describe_current_scene(
-                camera_id=camera_id, refresh=True, requested_by="navigation_arrival_verify")
-            if observed.image_artifact is not None:
-                artifact_id = observed.image_artifact.artifact_id
-                self._memory.save_photo(artifact_id, self._artifacts.read_bytes(artifact_id),
-                                        map_name=map_name)
-            result = self._memory.verify_arrival_observation(
-                target.target_name, perception_context=observed,
-                current_pose=None if current_pose is None else _memory_pose(current_pose),
-                target_record=target.candidate,
-                navigation_candidate=target.candidate if isinstance(target.candidate, NavigationCandidate) else None,
-                similarity_threshold=similarity_threshold,
-                expected_map_name=map_name, goal_id=goal_id,
-            )
-        except GatewayError as error:
-            raise GatewayError(error.message, error_code="arrival_verification_failed", http_status=409,
-                               details={"cause": error.to_payload()}) from error
-        if not result.verified:
-            raise GatewayError(result.reason or "到达核对失败", error_code="arrival_verification_failed",
-                               http_status=409, details=result.model_dump(mode="json"))
-        return result.model_dump(mode="json")

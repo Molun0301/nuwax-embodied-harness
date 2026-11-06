@@ -386,16 +386,6 @@ class NavigationMixin:
         result = MemoryArrivalVerification(query=effective_query, verified=verified, score=score, matched_labels=matched_labels, matched_memory_id=str(navigation_candidate.metadata.get('verification_memory_id') or '') or None if navigation_candidate is not None else target_record.memory_id if isinstance(target_record, SemanticMemoryEntry) else None, reason=reason, goal_id=resolved_goal_id, candidate_id=candidate_id_from_metadata, metadata={'lexical_score': round(lexical_score, 6), 'image_score': round(image_score, 6), 'camera_id': perception_context.camera_id, 'requested_query': query, 'verification_query': effective_query, 'record_id': record_id, 'record_kind': record_kind, 'candidate_id': candidate_id_from_metadata or '', 'goal_id': resolved_goal_id or '', 'map_name': expected_map_name or '', 'pose': current_pose.model_dump(mode='json') if current_pose is not None else None, 'arrival_verified': verified, 'arrival_score': round(score, 6), 'arrival_reason_code': arrival_reason_code, **segmentation_evidence})
         return result
 
-    def resolve_navigation_candidate(self, query, **kwargs):
-        for candidate in self.resolve_navigation_candidates(query, limit=1, **kwargs):
-            metadata = dict(candidate.metadata)
-            quality = dict(metadata.get('navigation_quality') or {})
-            if metadata.get('allowed_for_navigation') is True and metadata.get('resolution_decision') == 'navigate':
-                return candidate
-            if (metadata.get('allowed_for_navigation') is not False and quality.get('level') == 'direct_navigation') or (not quality and metadata.get('navigable') is True):
-                return candidate
-        return None
-
     def apply_candidate_confidence_decay(self, *, map_name, record_id, candidate_id, record_kind,
                                          decay_amount, reason_code):
         amount = max(0.0, min(0.5, float(decay_amount or 0.0)))
@@ -405,8 +395,7 @@ class NavigationMixin:
                  MemoryRecordKind.NOTE.value: 'memory', MemoryRecordKind.OBJECT_INSTANCE.value: 'instance',
                  MemoryRecordKind.OBSERVATION_EVENT.value: 'observation', MemoryRecordKind.SCENE_SPACE.value: 'scene_space'}
         def save(store):
-            if store is None or store.name != map_name:
-                return None
+            self._require_library(store,map_name)
             kind = kinds.get(record_kind)
             record = self._writing_record_map(kind).get(record_id) if kind is not None else None
             if record is None:
@@ -433,21 +422,22 @@ class NavigationMixin:
         result = self.verify_arrival_observation(query, perception_context=context,
             current_pose=self._as_memory_pose(self.current_pose()), navigation_candidate=navigation_candidate,
             similarity_threshold=similarity_threshold, expected_map_name=name, goal_id=goal_id)
-        return self._record_arrival_verification(result)
+        return self.record_arrival_verification(result,map_name=name)
 
-    def _record_arrival_verification(self, result):
+    def record_arrival_verification(self, result, *, map_name):
+        result = result.model_copy(update={"metadata": {**result.metadata,"map_name":map_name}})
         def record(store):
-            if store is None or store.name != result.metadata.get('map_name'):
-                return result
-            self._state_store.write(StateNamespace.MEMORY, 'last_arrival_verification', result,
-                source='memory_service', metadata={'kind': 'arrival_verification'})
+            self._require_library(store,map_name)
             self._record_arrival_trajectory_graph(result)
-            self._publish_memory_event('memory.arrival_verification_completed', '记忆到点复核已完成。',
-                payload={'arrival_verified': result.verified, 'arrival_score': round(result.score, 6),
-                         'arrival_reason_code': result.metadata.get('arrival_reason_code') or 'unknown',
-                         'camera_id': result.metadata.get('camera_id') or '', 'map_name': result.metadata.get('map_name') or ''})
             return result
-        return self.write(record)
+        self.write(record)
+        self._state_store.write(StateNamespace.MEMORY,'last_arrival_verification',result,
+            source='memory_service',metadata={'kind':'arrival_verification'})
+        self._publish_memory_event('memory.arrival_verification_completed','记忆到点复核已完成。',
+            payload={'arrival_verified':result.verified,'arrival_score':round(result.score,6),
+                'arrival_reason_code':result.metadata.get('arrival_reason_code') or 'unknown',
+                'camera_id':result.metadata.get('camera_id') or '', 'map_name':map_name})
+        return result
 
     def _build_goal_spec_from_grounding_plan(self, grounding_plan: GroundingQueryPlan) -> GoalSpec:
         metadata = dict(grounding_plan.metadata or {})
@@ -466,8 +456,10 @@ class NavigationMixin:
         candidate_record_id = str(candidate.record_id or '').strip()
         if not candidate_record_id:
             return {'penalty': 0.0, 'failure_count': 0, 'reason_codes': [], 'trajectory_event_ids': []}
-        failed_events = [item for item in self._record_map('trajectory').values() if item.source_record_id == candidate_record_id and item.success is False]
-        success_events = [item for item in self._record_map('trajectory').values() if item.source_record_id == candidate_record_id and item.success is True]
+        events = self.reader().read('trajectory',
+            where="json_extract(filter_json,'$.source_record_id')=?", params=(candidate_record_id,))
+        failed_events = [item for item in events if item.success is False]
+        success_events = [item for item in events if item.success is True]
         latest_success_ts = max((item.timestamp for item in success_events), default=None)
         if latest_success_ts is not None:
             failed_events = [item for item in failed_events if item.timestamp > latest_success_ts]
@@ -488,7 +480,12 @@ class NavigationMixin:
                 reason_code = str(metadata.get('arrival_reason_code') or '')
                 if reason_code:
                     reason_codes = self._normalize_aliases([*reason_codes, reason_code])
-        decay_state = {getattr(record, MODELS[kind][1]): float(record.metadata.get('arrival_failure_decay') or 0.0) for kind in ('location', 'memory', 'instance', 'observation', 'scene_space') for record in self.records(kind)}
+        decay_state = {}
+        for identity in (candidate_record_id, candidate.candidate_id):
+            for kind in ('location','memory','instance','observation','scene_space'):
+                record = self.get_record(kind,identity)
+                if record is not None:
+                    decay_state[identity] = float(record.metadata.get('arrival_failure_decay') or 0.0)
         decay_amount = 0.0
         if isinstance(decay_state, dict):
             decay_amount = max(float(decay_state.get(candidate_record_id, 0.0) or 0.0), float(decay_state.get(candidate.candidate_id, 0.0) or 0.0))
@@ -823,8 +820,7 @@ class NavigationMixin:
     def record_navigation_task_outcome(self, *, map_name, query: str, navigation_candidate: Optional[NavigationCandidate], navigation_goal: Optional[NavigationGoal]=None, navigation_context: Optional[object]=None, arrival_verification: Optional[MemoryArrivalVerification]=None, verification_policy: Optional[Dict[str, object]]=None, perception_refresh: Optional[Dict[str, object]]=None, memory_ingest: Optional[Dict[str, object]]=None, execution_status: str='unknown', failure_reason_code: Optional[str]=None, next_action: Optional[Dict[str, object]]=None, task_trace: Optional[Dict[str, object]]=None) -> Dict[str, object]:
 
         def save(store):
-            if store is None or store.name != map_name:
-                return None
+            self._require_library(store,map_name)
             goal_metadata = dict(getattr(navigation_goal, 'metadata', {}) or {})
             record_id = str(navigation_candidate.record_id if navigation_candidate is not None else '').strip()
             record_kind = str(navigation_candidate.metadata['record_kind'] if navigation_candidate is not None else MemoryRecordKind.NOTE.value)
@@ -888,7 +884,7 @@ class NavigationMixin:
             for anchor in self.get_navigation_semantic_context().anchors:
                 if anchor.anchor_id == anchor_id and anchor.inspection_poses:
                     return anchor.inspection_poses[0]
-            for instance in self.records('instance'):
+            for instance in self._record_map('instance').values():
                 if self._instance_is_confirmed(instance) and instance.anchor_id == anchor_id and instance.inspection_poses:
                     return instance.inspection_poses[0]
         return fallback_pose
@@ -902,7 +898,7 @@ class NavigationMixin:
         candidate_id = str(metadata.get('candidate_id') or self._build_navigation_candidate_id(record_id))
         reason_code = str(metadata.get('arrival_reason_code') or 'arrival_verification')
         event_kind = NavigationTrajectoryEventKind.VISITED_POSE if result.verified else NavigationTrajectoryEventKind.FAILED_POSE
-        trajectory_event = NavigationTrajectoryEvent(trajectory_event_id=self._build_navigation_trajectory_event_id(event_kind, candidate_id, record_id, reason_code), event_kind=event_kind, pose=self._as_memory_pose(self.current_pose()), target_pose=None, map_name=str(metadata.get('map_name') or metadata.get('active_map_name') or '') or None, navigation_candidate_id=candidate_id, source_record_kind=record_kind, source_record_id=record_id, target_name=str(metadata.get('verification_query') or result.query), success=result.verified, reason_code=reason_code, metadata={'source': 'arrival_verification', 'score': result.score, 'reason': result.reason or ''})
+        trajectory_event = NavigationTrajectoryEvent(trajectory_event_id=self._build_navigation_trajectory_event_id(event_kind, candidate_id, record_id, reason_code), event_kind=event_kind, pose=Pose.model_validate(metadata['pose']) if metadata.get('pose') else None, target_pose=None, map_name=str(metadata.get('map_name') or metadata.get('active_map_name') or '') or None, navigation_candidate_id=candidate_id, source_record_kind=record_kind, source_record_id=record_id, target_name=str(metadata.get('verification_query') or result.query), success=result.verified, reason_code=reason_code, metadata={'source': 'arrival_verification', 'score': result.score, 'reason': result.reason or ''})
         stored_event = self._upsert_navigation_trajectory_event(trajectory_event)
         if result.verified:
             self._record_semantic_graph_relation(SemanticGraphRelationKind.REACHABLE_FROM, record_kind, record_id, MemoryRecordKind.NAVIGATION_TRAJECTORY.value, stored_event.trajectory_event_id, map_name=stored_event.map_name, evidence_trajectory_event_ids=[stored_event.trajectory_event_id], metadata={'source': 'arrival_verification', 'candidate_id': candidate_id})

@@ -22,7 +22,8 @@ from services.memory.semantic_map.observations import refresh_scene_spaces
 class ScenesMixin:
 
     def observation_event_ids_for_memory(self, memory_id):
-        return tuple(event.event_id for event in self.records("observation") if event.source_memory_id == memory_id)
+        return tuple(event.event_id for event in self.reader().read("observation",
+            where="json_extract(filter_json,'$.source_memory_id')=?", params=(memory_id,)))
 
     def record_semantic_exploration_negative_observation(self, *, map_name, query, camera_id=None, pose=None,
             reason="target_not_found_after_exploration", frontier_metadata=None, candidate_diagnostics=None,
@@ -41,8 +42,7 @@ class ScenesMixin:
         projected = (self._projector.project(perception_context, current_pose=pose, map_context=captured,
                     frame_tree=frame_tree) if perception_context is not None and pose is not None else ())
         def save(store):
-            if store is None or store.name != map_name:
-                return None
+            self._require_library(store, map_name)
             photos = self._copy_photos(store, perception_context, image_bytes)
             value = entry.model_copy(update={"artifact_ids": photos})
             value = self._save_scene_record(store, value, source=perception_context, context=perception_context,
@@ -61,30 +61,35 @@ class ScenesMixin:
         return self.write(save)
 
     def list_semantic_memories(self, *, limit=None, library_name=None):
-        records = self.library_snapshot(library_name).read('memory')
-        return records if limit is None else records[-limit:]
+        reader = self.reader(library_name)
+        if limit is None or limit == 0:
+            return reader.read("memory")
+        return tuple(reversed(reader.read("memory", order="rowid DESC", limit=limit)))
 
     def get_scene_space(self, scene_space_id):
-        record = self._record_map("scene_space").get(scene_space_id)
+        record = self.get_record("scene_space", scene_space_id)
         if record is None:
             raise GatewayError(f"未找到场景空间：{scene_space_id}", error_code="scene_space_not_found", http_status=404)
         return record
 
     def list_scene_spaces(self, *, limit=None, payload_filter=None, scene_space_ids=None, library_name=None, map_name=None, review_statuses=None):
-        records = [record for record in self.library_snapshot(library_name).read('scene_space') if (map_name is None or record.map_name == map_name) and (scene_space_ids is None or record.scene_space_id in scene_space_ids) and (review_statuses is None or record.review_status in review_statuses)]
-        if payload_filter is not None:
-            from types import SimpleNamespace
-            payload_filter = payload_filter.model_copy(update={
-                "record_kinds": [MemoryRecordKind.SCENE_SPACE],
-                **({"scene_space_ids": list(scene_space_ids)} if scene_space_ids is not None else {}),
-                **({"map_name": map_name} if map_name is not None else {}),
-                **({"review_statuses": list(review_statuses)} if review_statuses is not None else {})})
-            records = [record for record in records if self._filter_record(record,
-                SimpleNamespace(record_kind=MemoryRecordKind.SCENE_SPACE.value,
-                                payload=self._build_scene_space_payload(record)), payload_filter)]
-        records.sort(key=lambda record: record.scene_space_id)
-        records.sort(key=lambda record: record.semantic_updated_at or record.timestamp, reverse=True)
-        return tuple(records if limit is None or limit <= 0 else records[:limit])
+        from contracts.memory import MemoryPayloadFilter
+        from services.memory.reader import filter_sql
+        from types import SimpleNamespace
+        value = (payload_filter or MemoryPayloadFilter()).model_copy(update={
+            "record_kinds": [MemoryRecordKind.SCENE_SPACE],
+            **({"scene_space_ids": list(scene_space_ids)} if scene_space_ids is not None else {}),
+            **({"map_name": map_name} if map_name is not None else {}),
+            **({"review_statuses": list(review_statuses)} if review_statuses is not None else {})})
+        if scene_space_ids is not None and not scene_space_ids:
+            return ()
+        where,params = filter_sql(value)
+        records = self.reader(library_name).read("scene_space", where=where.replace("r.",""), params=params,
+            order="julianday(COALESCE(json_extract(filter_json,'$.semantic_updated_at'),json_extract(filter_json,'$.timestamp'))) DESC,id ASC",
+            limit=limit if limit is not None and limit > 0 else None)
+        return tuple(record for record in records if self._filter_record(record,
+            SimpleNamespace(record_kind=MemoryRecordKind.SCENE_SPACE.value,
+                            payload=self._build_scene_space_payload(record)),value))
 
     def remember_current_scene(self, *, map_name, title=None, camera_id=None, summary_override=None, tags=None, linked_location_id=None, metadata=None, perception_context=None, observation_context=None, observation_pose=CURRENT_POSE, image_bytes=None, frame_tree=None):
         context = (perception_context if perception_context is not None else
@@ -123,8 +128,9 @@ class ScenesMixin:
                 'camera_id': source.camera_id, 'visual_labels': labels, 'vision_tags': vision, **dict(metadata or {})})
 
         def save(store):
-            if store is None or store.name != map_name:
+            if (store is None or store.name != map_name) and entry.metadata.get("source") == "perception_video_runtime":
                 return None
+            self._require_library(store, map_name)
             photos = self._copy_photos(store, source, image_bytes)
             value = entry.model_copy(update={'artifact_ids': photos, 'metadata': {**entry.metadata, 'photo_refs': [self.photo_ref(identity, library_name=map_name).model_dump(mode='json') for identity in photos]}})
             return self._save_scene_record(store, value, source=source, context=context,
@@ -188,7 +194,7 @@ class ScenesMixin:
         self._observation_event_write_count += len(events)
         if self._observation_event_write_count >= 100:
             self._observation_event_write_count = 0
-            for event in store.records("observation"):
+            for event in tuple(store.model_map("observation").values()):
                 if (utc_now()-event.timestamp).total_seconds() > 604800:
                     store.delete("observation", event.event_id)
         if value.linked_location_id:
@@ -205,8 +211,7 @@ class ScenesMixin:
     def upsert_scene_space(self, scene_space, *, map_name):
         record = SceneSpace.model_validate(scene_space) if isinstance(scene_space, dict) else scene_space
         def save(store):
-            if store is None or store.name != map_name:
-                return None
+            self._require_library(store, map_name)
             if record.metadata.get("scene_mapping_managed"):
                 from services.memory.semantic_map.scene_mapping_state import SemanticMapState
                 state = SemanticMapState(self, self.geometry_state)
@@ -223,8 +228,7 @@ class ScenesMixin:
     def review_scene_space(self, scene_space_id, *, map_name, primary_label=None, human_aliases=None,
                            review_status=None, attributes=None, metadata=None):
         def update(store):
-            if store is None or store.name != map_name:
-                return None
+            self._require_library(store, map_name)
             current = self._writing_record_map("scene_space").get(scene_space_id)
             if current is None:
                 raise GatewayError(f"未找到场景空间：{scene_space_id}", error_code="scene_space_not_found", http_status=404)
@@ -244,8 +248,7 @@ class ScenesMixin:
 
     def delete_scene_spaces(self, scene_space_ids, *, map_name):
         def delete(store):
-            if store is None or store.name != map_name:
-                return 0
+            self._require_library(store, map_name)
             current = self._writing_record_map("scene_space")
             selected = {identity for identity in scene_space_ids if identity in current}
             for identity in selected:
@@ -321,16 +324,15 @@ class ScenesMixin:
 
     def _writing_record_map(self, kind):
         from services.memory.store import MODELS
-        return {getattr(record, MODELS[kind][1]): record for record in self._writer.store.records(kind)}
+        return self._writer.store.model_map(kind)
 
     def record_scene_space_graphs(self, spaces, *, map_name):
         values = tuple(spaces)
         def record(store):
-            if store is None or store.name != map_name:
-                return ()
+            self._require_library(store, map_name)
             for value in values:
                 self._record_scene_space_graph(value)
-            current = {value.scene_space_id: value for value in store.records("scene_space")}
+            current = store.model_map("scene_space")
             return tuple(current[value.scene_space_id] for value in values)
         return self.write(record)
 

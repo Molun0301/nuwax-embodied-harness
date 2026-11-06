@@ -10,7 +10,7 @@ from core.errors import GatewayError
 from core.tasks import Cancelled
 from contracts.exploration_mission import ExplorationReturnPolicy
 from gateways.capabilities.common import rpc_errors, schema
-from gateways.capabilities.maps import save_map
+from gateways.capabilities.maps import save_map, start_mapping_session
 from services.geometry.client import BoundarySegment, ExplorationRequest
 from services.geometry.state import ExplorationPhase
 from services.navigation.exploration_checkpoint import ExplorationCheckpoint
@@ -21,7 +21,6 @@ class _ExplorationRun:
     task_id: str
     exploration_id: str
     pause: threading.Event = field(default_factory=threading.Event)
-    stop_sent: bool = False
 
 
 class ExplorationControl:
@@ -65,13 +64,15 @@ class _FollowingContext:
         return self._context.remaining()
 
 
-def _request(args, progress_json=""):
+def _request(args, progress_json="", *, remaining_sec=900.0):
     conditions = args.get("stop_conditions", {})
     returning = args.get("return_policy", {})
     duration = conditions.get("max_duration_ms")
-    if args.get("max_duration_sec") is not None:
-        seconds_ms = round(args["max_duration_sec"] * 1000)
-        duration = seconds_ms if duration is None else min(duration, seconds_ms)
+    if duration is None:
+        seconds = args.get("max_duration_sec")
+        if seconds is None:
+            seconds = max(0.1, (remaining_sec if remaining_sec is not None else 900.0) - 1.0)
+        duration = round(seconds * 1000)
     return ExplorationRequest(
         motion_generation=args["motion_generation"],
         boundary=tuple(BoundarySegment(a["x"], a["y"], b["x"], b["y"])
@@ -79,8 +80,8 @@ def _request(args, progress_json=""):
         max_coverage_pct=conditions.get("max_coverage_pct"),
         no_frontier_timeout_ms=conditions.get("no_frontier_timeout_ms"),
         max_duration_ms=duration, max_goals=conditions.get("max_goals"),
-        max_navigation_retries=args.get("max_navigation_retries", 0),
-        blacklist_radius_m=args.get("blacklist_radius_m", 0.0),
+        max_navigation_retries=args.get("max_navigation_retries", 1),
+        blacklist_radius_m=args.get("blacklist_radius_m", 0.75),
         return_maximum_distance_m=returning.get("maximum_distance_m"),
         return_reserve_distance_m=returning.get("reserve_distance_m", 0.0),
         return_on_completion=returning.get("return_on_completion", False),
@@ -89,7 +90,6 @@ def _request(args, progress_json=""):
 
 
 def _stop(platform, run, timeout_sec):
-    run.stop_sent = True
     platform.geometry.stop_exploration(run.exploration_id, timeout_sec=timeout_sec)
 
 
@@ -130,10 +130,10 @@ def _explore_area(platform, ctx, args):
     args = {**args, "map_name": name}
     saved = platform.maps.get(name)
     continuing = args.get("continue_saved", saved is not None and saved.saved)
-    platform.geometry.start_mapping(name, continue_saved=continuing, timeout_sec=ctx.remaining())
+    start_mapping_session(platform, name, continue_saved=continuing, timeout_sec=ctx.remaining())
     ctx.check()
     exploration_id = platform.geometry.start_exploration(
-        _request(args, args.get("_resume_progress_json", "")), timeout_sec=ctx.remaining())
+        _request(args, args.get("_resume_progress_json", ""), remaining_sec=ctx.remaining()), timeout_sec=ctx.remaining())
     run = _ExplorationRun(ctx.task_id, exploration_id)
     platform.exploration_control.add(run)
     terminal = False
@@ -159,7 +159,7 @@ def _explore_area(platform, ctx, args):
                                 ) from error
                         raise GatewayError(status.message, error_code="exploration_failed", http_status=409)
                     if status.phase is ExplorationPhase.STOPPED:
-                        raise Cancelled()
+                        raise Cancelled(status.message or "探索已被停止")
                     result = {"exploration_id": exploration_id, "map_name": name, "exploration": asdict(status)}
                     if args.get("save_map", True):
                         result["saved_map"] = save_map(platform, ctx, {"map_name": name})
@@ -168,7 +168,7 @@ def _explore_area(platform, ctx, args):
             return _pause_and_save(platform, ctx, args, run)
     finally:
         try:
-            if not terminal and not run.stop_sent:
+            if not terminal:
                 _stop(platform, run, None)
         finally:
             platform.exploration_control.remove(run)
@@ -233,12 +233,12 @@ RETURN_POLICY = ExplorationReturnPolicy.model_json_schema()
 EXPLORE_SCHEMA = schema({"map_name": TEXT,
     "boundary_line_segments": {"type": "array", "items": {"type": "array", "minItems": 2, "maxItems": 2, "items": POINT}},
     "stop_conditions": CONDITIONS, "return_policy": RETURN_POLICY,
-    "max_navigation_retries": {"type": "integer", "minimum": 0},
-    "blacklist_radius_m": {"type": "number", "minimum": 0},
+    "max_navigation_retries": {"type": "integer", "minimum": 0, "default": 1},
+    "blacklist_radius_m": {"type": "number", "minimum": 0, "default": 0.75},
     "max_duration_sec": TIMEOUT, "timeout_sec": TIMEOUT, "save_map": {"type": "boolean"}})
 CAPABILITIES = [
     Capability("explore_area_v2", "探索区域并按请求保存地图。", EXPLORE_SCHEMA, "task", explore_area,
-               needs=("nav_stack", "geometry"), motion=True),
+               needs=("nav_stack", "geometry"), motion=True, timeout_sec=900, normalize_names=("map_name",)),
     Capability("stop_exploration", "停止探索并取消对应任务，保留建图会话。",
                schema({"exploration_id": TEXT}), "action", stop_exploration),
     Capability("pause_exploration", "由原探索任务保存地图与恢复进度后暂停。",
@@ -247,5 +247,5 @@ CAPABILITIES = [
                schema({"limit": {"type": "integer", "minimum": 1}}), "query", list_exploration_checkpoints),
     Capability("resume_exploration", "加载检查点地图、重定位并恢复探索。",
                schema({"checkpoint_id": CHECKPOINT, "timeout_sec": TIMEOUT}, ("checkpoint_id",)),
-               "task", resume_exploration, needs=("nav_stack", "geometry"), motion=True),
+               "task", resume_exploration, needs=("nav_stack", "geometry"), motion=True, timeout_sec=900),
 ]

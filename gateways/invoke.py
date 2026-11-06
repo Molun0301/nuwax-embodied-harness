@@ -25,22 +25,21 @@ def invoke(platform, name: str, args: Mapping[str, Any], caller: str) -> dict:
     try:
         Draft202012Validator(cap.input_schema).validate(args)
         arguments = dict(args)
-        timeout = cap.input_schema.get("properties", {}).get("timeout_sec", {})
-        if "timeout_sec" not in arguments and "default" in timeout:
-            arguments["timeout_sec"] = timeout["default"]
-        name_keys = ("map_name", "new_map_name", "library_name") if name == "delete_memory_library" else ("map_name", "new_map_name")
-        for key in name_keys:
-            if key in arguments and key in cap.input_schema.get("properties", {}):
+        properties = cap.input_schema.get("properties", {})
+        if "timeout_sec" not in arguments and "timeout_sec" in properties and cap.timeout_sec is not None:
+            arguments["timeout_sec"] = cap.timeout_sec
+        for key in cap.normalize_names:
+            if key in arguments and arguments[key] != "":
                 arguments[key] = validate_map_name(arguments[key])
     except (ValidationError, MapNameError) as error:
         raise GatewayError(str(error), error_code="invalid_params", http_status=400) from error
+    if cap.before_submit is not None:
+        cap.before_submit(platform, arguments)
     if cap.kind == "task":
         return {"task": asdict(platform.tasks.submit(cap, arguments, caller))}
     if cap.motion:
         platform.tasks.take_over_motion()
-    platform.ensure(cap.needs, cap.timeout_sec)
-    if cap.motion:
-        arguments["motion_generation"] = platform.tasks._begin_motion()
+    platform.ensure(cap.needs, arguments.get("timeout_sec", cap.timeout_sec))
     return cap.handler(platform, arguments)
 
 

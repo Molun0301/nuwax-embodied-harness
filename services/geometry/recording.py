@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter, deque
+from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 import fcntl
 import json
@@ -169,6 +170,18 @@ class MappingRecorder:
             return False
         return self._enqueue(kind, source_ns, payload, len(payload) + 512)
 
+    def record_pose(self, pose, *, metadata=None, status=None, cursor=None) -> None:
+        """直接订阅Geometry真实位姿；不用网页数据流或事件总线保存来源。"""
+        metadata = dict(metadata or {})
+        payload = (asdict(pose) if is_dataclass(pose) else
+                   pose.model_dump(mode="json") if hasattr(pose, "model_dump") else pose)
+        source_ns = getattr(pose, "timestamp_ns", None)
+        if source_ns is None:
+            source_ns = metadata.get("source_timestamp_ns", _pose_stamp(pose))
+        self.record_event("localization.pose", {
+            "pose": payload, "status": status, "cursor": cursor, "metadata": metadata,
+        }, source_ns=source_ns)
+
     def record_stream_frame(self, frame) -> None:
         """端侧总线监听只记录小型状态，不复制完整地图或整段轨迹。"""
         with self._condition:
@@ -176,11 +189,7 @@ class MappingRecorder:
                 return
         payload = frame.payload
         if frame.topic == "localization.pose":
-            pose = payload.model_dump(mode="json") if hasattr(payload, "model_dump") else payload
-            self.record_event("localization.pose", {
-                "pose": pose, "status": frame.status, "cursor": str(frame.cursor),
-                "metadata": dict(frame.metadata),
-            }, source_ns=int(frame.metadata.get("source_timestamp_ns") or _pose_stamp(payload)))
+            self.record_pose(payload, status=frame.status, cursor=str(frame.cursor), metadata=frame.metadata)
         elif frame.topic == "map.frame":
             self.record_event("mapping.state", {
                 "status": frame.status, "cursor": str(frame.cursor),

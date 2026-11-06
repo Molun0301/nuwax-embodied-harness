@@ -117,8 +117,7 @@ def _stream_frame_values(frame: StreamFrame) -> Dict[str, object]:
 
 def _strict_json_dumps(value: object, *, compact: bool = False) -> str:
     """完整编码网页载荷，不建立独立结果投影。"""
-    return json.dumps(value, default=_stream_json_default, ensure_ascii=False,
-                      allow_nan=False, separators=(",", ":") if compact else None)
+    return _stream_json_dumps(value)
 
 
 def _stream_json_default(value):
@@ -142,9 +141,31 @@ def _stream_json_default(value):
     raise TypeError(type(value).__name__)
 
 
+class _DiagnosticJSONEncoder(json.JSONEncoder):
+    """非有限诊断值沿用旧字符串表示，完整保留消息字段。"""
+
+    def iterencode(self, value, _one_shot=False):
+        def float_value(number):
+            if math.isnan(number):
+                return '"NaN"'
+            if math.isinf(number):
+                return '"Infinity"' if number > 0 else '"-Infinity"'
+            return float.__repr__(number)
+        encoder = json.encoder.encode_basestring_ascii if self.ensure_ascii else json.encoder.encode_basestring
+        encode = json.encoder._make_iterencode({} if self.check_circular else None,
+            self.default, encoder, self.indent, float_value, self.key_separator,
+            self.item_separator, self.sort_keys, self.skipkeys, False)
+        return encode(value, 0)
+
+
 def _stream_json_dumps(value, *, ensure_ascii: bool = False) -> str:
-    return json.dumps(value, default=_stream_json_default, ensure_ascii=ensure_ascii,
-                      allow_nan=False, separators=(",", ":"))
+    try:
+        return json.dumps(value, default=_stream_json_default, ensure_ascii=ensure_ascii,
+                          allow_nan=False, separators=(",", ":"))
+    except ValueError:
+        # 正常消息保留原生快速编码，诊断消息仅转换非有限数，不恢复旧预算投影。
+        return json.dumps(value, default=_stream_json_default, ensure_ascii=ensure_ascii,
+            allow_nan=False, separators=(",", ":"), cls=_DiagnosticJSONEncoder)
 
 
 async def _send_ws_json(websocket: WebSocket, payload: object) -> None:

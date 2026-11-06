@@ -335,7 +335,7 @@ def test_public_refresh_deadline_while_waiting_does_not_adopt_later(setup):
     setup.service.start()
     events=EventBus()
     platform=SimpleNamespace(scene_mapping=setup.service,memory=setup.memory,events=events,
-        ensure=lambda *_:None,capabilities=CapabilityTable(),robot=SimpleNamespace(manifest=SimpleNamespace(robot_name='test')))
+        ensure=lambda *_, **kwargs:None,capabilities=CapabilityTable(),robot=SimpleNamespace(manifest=SimpleNamespace(robot_name='test')))
     for cap in CAPABILITIES:platform.capabilities.register(cap)
     platform.tasks=TaskRunner(platform)
     try:

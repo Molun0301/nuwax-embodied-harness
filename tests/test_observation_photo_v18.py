@@ -2,6 +2,7 @@
 from datetime import timedelta
 from types import SimpleNamespace
 import pytest
+from core.errors import GatewayError
 
 from contracts.artifacts import ArtifactRef
 from contracts.naming import build_artifact_id, build_observation_id
@@ -95,10 +96,14 @@ def test_old_map_observation_does_not_write_the_new_library(scene):
     memory, geometry, full, original, current = scene
     geometry.change('other-map')
     memory.write(lambda store: None)
-    assert memory.remember_current_scene(map_name='unit_test_library', perception_context=full,
-        observation_pose=original, image_bytes=png()) is None
-    assert memory.tag_location('旧观察', map_name='unit_test_library', perception_context=full,
-        observation_pose=current, image_bytes=png()) == (None, None)
+    with pytest.raises(GatewayError) as error:
+        memory.remember_current_scene(map_name='unit_test_library', perception_context=full,
+            observation_pose=original, image_bytes=png())
+    assert error.value.error_code == 'memory_library_changed'
+    with pytest.raises(GatewayError) as error:
+        memory.tag_location('旧观察', map_name='unit_test_library', perception_context=full,
+            observation_pose=current, image_bytes=png())
+    assert error.value.error_code == 'memory_library_changed'
     assert memory.list_tagged_locations() == () and memory.list_semantic_memories() == ()
 
 

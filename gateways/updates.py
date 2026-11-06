@@ -10,7 +10,7 @@ def require_idle(platform):
     if platform.tasks.active():
         raise RuntimeError("有任务正在运行，请先完成或取消任务")
     state = platform.geometry_state.snapshot()
-    if state is not None and state.phase in {SessionPhase.MAPPING, SessionPhase.EXPLORING}:
+    if platform.geometry_state.connected and state is not None and state.phase in {SessionPhase.MAPPING, SessionPhase.EXPLORING}:
         raise RuntimeError("正在建图，请先保存或结束地图会话")
     if components.status().get("motion_guard", {}).get("state") == "running":
         try:

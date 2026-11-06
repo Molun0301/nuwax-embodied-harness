@@ -10,6 +10,7 @@ import time
 
 from core import components
 from core.capability import CapabilityTable
+from core.config_values import runtime_value
 from core.errors import GatewayError
 from core.event_bus import EventBus
 from core.state_store import StateStore
@@ -19,6 +20,7 @@ from drivers.entry import create_active_robot_assembly
 from services.geometry.client import GeometryClient
 from services.geometry.input_bridge import InputBridge
 from services.geometry.maps import MapStore
+from services.geometry.recording import MappingRecorder
 from services.geometry.state import GeometryStateView
 from services.navigation.motion_client import MotionClient
 
@@ -27,17 +29,19 @@ LOGGER = logging.getLogger(__name__)
 
 class Platform:
     def __init__(self):
-        self._geometry_lock = threading.Lock()
         self._geometry_started = False
 
     def start(self) -> None:
         self.robot.start()
         self.robot_state.start()
         self.streams.start()
+        if self.config.scene_mapping.enabled and self.config.scene_mapping.auto_start:
+            self.scene_mapping.start()
 
     def stop(self) -> None:
         operations = [self.tasks.shutdown, self.map_cleanup.close, self.streams.stop, self.input_bridge.stop,
-                      self.geometry_state.stop, self.perception.video_runtime.close,
+                      self.geometry_state.stop, self._recording_unsubscribe, self.mapping_recorder.close,
+                      self.perception.video_runtime.close,
                       self.perception.close, self.follow.close, self.scene_mapping.close, self.manipulation.close,
                       self.memory.close, self.observation.close, self.artifacts.close,
                       self.motion.close, self.geometry.close, self.places.close, self.buildings.close,
@@ -49,28 +53,34 @@ class Platform:
             except Exception:
                 LOGGER.exception("关闭服务失败：%s", operation)
 
-    def ensure(self, names, timeout_sec) -> None:
+    def ensure(self, names, timeout_sec, *, ctx=None) -> None:
         if not names:
             return
+        budget = 60 if timeout_sec is None else timeout_sec
         deadline = None if timeout_sec is None else time.monotonic() + timeout_sec
-        components.ensure(names, 60 if timeout_sec is None else timeout_sec)
-        if "geometry" in names:
-            with self._geometry_lock:
-                if not self._geometry_started:
-                    ready = threading.Event()
-                    unsubscribe = self.geometry_state.subscribe(lambda value: ready.set())
-                    self.geometry_state.start()
-                    if self.geometry_state.snapshot() is not None:
-                        ready.set()
-                    remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-                    try:
-                        if not ready.wait(remaining):
-                            raise GatewayError("Geometry 状态订阅未在任务期限内返回。",
-                                               error_code="geometry_deadline_exceeded", http_status=503)
-                        self.input_bridge.start()
-                        self._geometry_started = True
-                    finally:
-                        unsubscribe()
+        components.ensure(names, budget)
+        if "geometry" in names and not self._geometry_started:
+            ready = threading.Event()
+            unsubscribe = self.geometry_state.subscribe(lambda value: ready.set())
+            self.mapping_recorder.start(self._recording_configuration)
+            self.geometry_state.start()
+            if self.geometry_state.connected and self.geometry_state.snapshot() is not None:
+                ready.set()
+            try:
+                while True:
+                    if ctx is not None:
+                        ctx.check()
+                    remaining = None if deadline is None else deadline - time.monotonic()
+                    if remaining is not None and remaining <= 0:
+                        raise GatewayError("Geometry 状态订阅未在调用期限内返回。",
+                                           error_code="geometry_deadline_exceeded", http_status=503)
+                    if ready.is_set():
+                        break
+                    ready.wait(.05 if remaining is None else min(.05, remaining))
+                self.input_bridge.start()
+                self._geometry_started = True
+            finally:
+                unsubscribe()
 
 
 def build_platform(config) -> Platform:
@@ -112,6 +122,21 @@ def build_platform(config) -> Platform:
     platform.geometry = GeometryClient(f"127.0.0.1:{config.geometry.external.port}")
     platform.geometry_state = GeometryStateView(platform.geometry, platform.events)
     platform.maps = MapStore(config.runtime_data.map_catalog_root)
+    recording = config.runtime_data
+    recording_root = recording.mapping_recording_dir or str(platform.maps.root.parent / "mapping_recordings")
+    platform.mapping_recorder = MappingRecorder(Path(recording_root), enabled=recording.mapping_recording_enabled,
+                                               max_bytes=recording.mapping_recording_max_bytes)
+    platform._recording_configuration = {
+        "geometry": config.geometry.build_metadata(),
+        "robot_name": platform.robot.manifest.robot_name,
+        "body_from_sensor": runtime_value("NUWAX_GEOMETRY_LIO_BODY_FROM_SENSOR", ""),
+        "body_from_imu": runtime_value("NUWAX_GEOMETRY_LIO_BODY_FROM_IMU", ""),
+        "native_lio_settings": {key: runtime_value(key, "") for key in (
+            "NUWAX_GEOMETRY_LIO_SCAN_VOXEL_SIZE_M", "NUWAX_GEOMETRY_LIO_MAP_VOXEL_SIZE_M",
+            "NUWAX_GEOMETRY_LIO_INITIAL_MAP_FRAMES", "NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE",
+            "NUWAX_GEOMETRY_NATIVE_LIO_PAIR_MAX_SKEW_MS", "NUWAX_GEOMETRY_POINTLIO_OPTIONS")},
+    }
+    platform._recording_unsubscribe = platform.geometry_state.subscribe_pose(platform.mapping_recorder.record_pose)
     platform.map_cleanup = MapCleanupService(config, platform.maps)
     platform.exploration_control = ExplorationControl()
     platform.exploration_checkpoints = ExplorationCheckpoints(platform.maps.root)
@@ -121,7 +146,9 @@ def build_platform(config) -> Platform:
         info=lambda: platform.geometry_state.snapshot().info,
         sensor_sample_provider=providers if isinstance(providers, StreamingSensorSampleProvider) else None,
         localization_provider=providers if isinstance(providers, StreamingLocalizationProvider) else None,
-        point_cloud_provider=providers if isinstance(providers, StreamingPointCloudProvider) else None)
+        point_cloud_provider=providers if isinstance(providers, StreamingPointCloudProvider) else None,
+        recording_sink=platform.mapping_recorder if recording.mapping_recording_enabled else None,
+        input_executor=getattr(providers, "get_sensor_input_executor", None))
     stream_bus, state_store = StreamBus(), StateStore()
     store = LocalArtifactStore(config.gateway.artifact_dir, config.gateway.public_base_url)
     artifacts = ArtifactService(store, retention_policy=ArtifactRetentionPolicy(
@@ -161,7 +188,7 @@ def build_platform(config) -> Platform:
     platform.buildings = BuildingCatalog(platform.maps, providers=load_facility_providers(
         config.geometry.navigation.facility_providers_json))
     platform.places = PlaceLookup()
-    platform.navigation_memory = NavigationMemory(platform.memory, platform.geometry_state, platform.perception, artifacts)
+    platform.navigation_memory = NavigationMemory(platform.memory, platform.geometry_state)
     platform.robot_state = RobotStateService(platform.robot, state_store=state_store,
                                             event_bus=platform.events, stream_bus=stream_bus)
     platform.artifacts = artifacts

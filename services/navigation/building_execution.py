@@ -1,6 +1,7 @@
 """同一任务线程中顺序执行跨层导航，不保存中断进度。"""
 from __future__ import annotations
 
+from dataclasses import asdict
 import logging
 
 from contracts.building_navigation import FloorPose
@@ -9,6 +10,7 @@ from providers.facilities import FacilityUnavailable
 from services.navigation.building_catalog import route_connections
 
 LOGGER = logging.getLogger(__name__)
+FACILITY_RELEASE_TIMEOUT_SEC = 3.0
 
 
 def building(platform, building_id):
@@ -34,9 +36,27 @@ def current_floor(platform, topology):
     raise GatewayError("当前地图不属于该楼栋的可用楼层。", error_code="current_floor_unknown", http_status=409)
 
 
-def _navigate(platform, ctx, pose: FloorPose, motion_generation, observed_pose=None, *, navigate):
+class _DockedContext:
+    """导航等待期间继续核对进出设施的物理前提。"""
+
+    def __init__(self, ctx, invariant):
+        self._ctx = ctx
+        self._invariant = invariant
+
+    def __getattr__(self, name):
+        return getattr(self._ctx, name)
+
+    def check(self):
+        self._ctx.check()
+        self._invariant()
+
+
+def _navigate(platform, ctx, pose: FloorPose, motion_generation, observed_pose=None, *, navigate, invariant=None):
+    if invariant is not None:
+        ctx = _DockedContext(ctx, invariant)
     ctx.check()
-    args = {"x": pose.x, "y": pose.y, "yaw_rad": pose.yaw_rad, "motion_generation": motion_generation}
+    args = {"x": pose.x, "y": pose.y, "yaw_rad": pose.yaw_rad, "motion_generation": motion_generation,
+            "tolerance_position_m": 0.1, "tolerance_yaw_rad": 0.1}
     if observed_pose is not None:
         args["z"] = observed_pose.z
     return navigate(platform, ctx, args)
@@ -45,6 +65,9 @@ def _navigate(platform, ctx, pose: FloorPose, motion_generation, observed_pose=N
 def load_floor(platform, ctx, record, seed=None):
     """加载与重定位都由Geometry给出真实结果，不读取地图内部文件。"""
     ctx.check()
+    current = platform.geometry_state.snapshot()
+    if current is not None and current.map_name == record.map_name and current.can_navigate:
+        return current
     snapshot = platform.geometry.load_map(record.map_name, timeout_sec=ctx.remaining())
     ctx.check()
     planar_seed = ((seed.x, seed.y, seed.yaw_rad)
@@ -59,29 +82,48 @@ def load_floor(platform, ctx, record, seed=None):
 def _operate(provider, connection, action, target_floor_id, ctx):
     try:
         return provider.operate(connection.facility_id, action, target_floor_id=target_floor_id,
-                                timeout_sec=ctx.remaining())
+                                timeout_sec=FACILITY_RELEASE_TIMEOUT_SEC if action == "release" else ctx.remaining())
     except FacilityUnavailable as error:
         raise GatewayError(str(error), error_code="facility_unavailable", http_status=503) from error
 
 
+def _facility_snapshot(provider, connection, ctx):
+    try:
+        snapshot = provider.snapshot(connection.facility_id, timeout_sec=ctx.remaining())
+    except FacilityUnavailable as error:
+        raise GatewayError(str(error), error_code="facility_unavailable", http_status=503) from error
+    if not snapshot.available or snapshot.fault or snapshot.occupied_by_other:
+        raise GatewayError(snapshot.fault or "设施不可用或被其他使用者占用。",
+                           error_code="facility_unavailable", http_status=409)
+    return snapshot
+
+
+def _docked(snapshot, connection, floor_id):
+    return (snapshot.floor_id == floor_id and snapshot.door == "open" and not snapshot.moving
+            and snapshot.docking_verified and snapshot.docking_calibration_ref == connection.docking_calibration_ref)
+
+
+def _require_docked(provider, connection, floor_id, ctx):
+    if not _docked(_facility_snapshot(provider, connection, ctx), connection, floor_id):
+        raise GatewayError("设施不再满足当前进出连接所需的停靠和开门条件。",
+                           error_code="facility_unavailable", http_status=409)
+
+
 def _await_docked(provider, connection, floor_id, ctx):
+    last = None
     while True:
         ctx.check()
-        try:
-            snapshot = provider.snapshot(connection.facility_id, timeout_sec=ctx.remaining())
-        except FacilityUnavailable as error:
-            raise GatewayError(str(error), error_code="facility_unavailable", http_status=503) from error
-        if not snapshot.available or snapshot.fault or snapshot.occupied_by_other:
-            raise GatewayError(snapshot.fault or "设施不可用或被其他使用者占用。",
-                               error_code="facility_unavailable", http_status=409)
-        if (snapshot.floor_id == floor_id and snapshot.door == "open" and not snapshot.moving
-                and snapshot.docking_verified and snapshot.docking_calibration_ref == connection.docking_calibration_ref):
+        snapshot = _facility_snapshot(provider, connection, ctx)
+        if _docked(snapshot, connection, floor_id):
             return snapshot
-        ctx.progress(0.0, "waiting_facility", "等待设施停层、开门与停靠反馈。", floor_id=floor_id)
-        ctx.wait(0.1)
+        if snapshot != last:
+            ctx.progress(0.0, "waiting_facility", "等待设施停层、开门与停靠反馈。",
+                         floor_id=floor_id, facility=asdict(snapshot))
+            last = snapshot
+        ctx.wait(0.5)
 
 
-def transfer(platform, ctx, topology, target, motion_generation, *, navigate, create_target=False):
+def transfer(platform, ctx, topology, target, motion_generation, *, navigate, start_mapping=None, create_target=False):
     """跨每条连接后加载对应楼层；未知目标楼层由探索处理器开始新图。"""
     source = current_floor(platform, topology)
     route = route_connections(topology, source.floor_id, target.floor_id, platform.buildings.providers)
@@ -101,7 +143,8 @@ def transfer(platform, ctx, topology, target, motion_generation, *, navigate, cr
             _operate(provider, connection, "call", source.floor_id, ctx)
             _await_docked(provider, connection, source.floor_id, ctx)
             _operate(provider, connection, "hold_door", source.floor_id, ctx)
-            _navigate(platform, ctx, connection.boarding_pose, motion_generation, navigate=navigate)
+            _navigate(platform, ctx, connection.boarding_pose, motion_generation, navigate=navigate,
+                      invariant=lambda: _require_docked(provider, connection, source.floor_id, ctx))
             ctx.check()
             platform.geometry.stop_session(timeout_sec=ctx.remaining())
             ctx.check()
@@ -111,12 +154,13 @@ def transfer(platform, ctx, topology, target, motion_generation, *, navigate, cr
             _operate(provider, connection, "hold_door", destination.floor_id, ctx)
             if create_target and destination.floor_id == target.floor_id:
                 # 首次建图的原点由Geometry在接收处建立，不伪造目标地图或定位结果。
-                observed = platform.geometry.start_mapping(destination.map_name, timeout_sec=ctx.remaining())
+                observed = start_mapping(platform, destination.map_name, timeout_sec=ctx.remaining())
             else:
                 ctx.progress(0.0, "localizing", "加载目标楼层地图并重定位。", map_name=destination.map_name)
                 observed = load_floor(platform, ctx, destination, connection.arrival_pose)
             ctx.check()
-            _navigate(platform, ctx, connection.exit_pose, motion_generation, observed.pose, navigate=navigate)
+            _navigate(platform, ctx, connection.exit_pose, motion_generation, observed.pose, navigate=navigate,
+                      invariant=lambda: _require_docked(provider, connection, destination.floor_id, ctx))
             completed.append(connection.connection_id)
             source = destination
             exited = True

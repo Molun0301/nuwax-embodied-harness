@@ -148,7 +148,7 @@
     const samples=r.observation_samples || [];
     if(!samples.length)target.append(node('p','暂无已关联图像和观察。','muted small'));
     samples.forEach(sample=>{const box=node('div',undefined,'map-semantic-evidence');box.append(node('span',sample.camera_id || '来源相机未提供'));
-      (sample.artifact_ids || []).forEach(id=>{const link=node('a','查看图像');link.href='/artifacts/'+encodeURIComponent(id);link.target='_blank';link.rel='noopener noreferrer';box.append(link);});
+      (sample.images || []).filter(image=>image.available).forEach(image=>{const link=node('a','查看图像');link.href=image.url;link.target='_blank';link.rel='noopener noreferrer';box.append(link);});
       box.append(node('code',sample.sample_id));target.append(box);
     });
     const details=node('details');details.append(node('summary','来源与版本'),node('pre',JSON.stringify({map_binding:r.metadata?.map_binding,scene_space_id:r.scene_space_id,decision:r.metadata?.last_decision},null,2)));target.append(details);

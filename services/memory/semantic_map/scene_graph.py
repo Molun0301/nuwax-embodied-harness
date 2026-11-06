@@ -44,8 +44,19 @@ class SceneGraphService:
         self._index = None
         self._graph_epoch = uuid.uuid4().hex
         self._publication_sequence = 0
+        self._library_name = None
+        self._unsubscribe = self.memory.geometry.subscribe(self._geometry_changed)
+
+    def _geometry_changed(self, state):
+        with self._lock:
+            if state.map_name != self._library_name:
+                self._geometry = self._index = None
+                self._geometry_key = self._index_key = None
 
     def close(self):
+        if self._unsubscribe is not None:
+            self._unsubscribe()
+            self._unsubscribe = None
         with self._lock:
             self._geometry = self._index = None
             self._geometry_key = self._index_key = None
@@ -54,6 +65,7 @@ class SceneGraphService:
         with self._lock:
             capture = self.memory.capture_scene_graph_state()
             binding = capture["binding"]
+            self._library_name = capture["library_name"]
             records = capture["memory_snapshot"].records
             source_key = (binding_value(binding), *(records[kind] for kind in ("scene_space", "memory", "instance")))
             if self._index is not None and source_key == self._index_key and self._within_deadline(self._index.valid_until):
@@ -341,8 +353,8 @@ class SceneGraphService:
         rendered = render_scene_graph_image(index, capture["grid"], node_id=node_id, width=width)
         self._assert_capture(capture)
         from contracts.naming import build_artifact_id
-        artifact = self.memory.core.save_photo(build_artifact_id("image"), rendered.pop("png"),
-            map_name=capture["library_name"], mime_type="image/png")
+        artifact = self.memory.core.save_photo(build_artifact_id("scene_graph"), rendered.pop("png"),
+            map_name=capture["library_name"], mime_type="image/png", replace_scene_graph=True)
         if artifact is None:
             raise GatewayError("记忆库已切换，关系图图片未保存。", error_code="memory_library_changed", http_status=409)
         artifact = artifact.model_copy(update={"metadata": {**artifact.metadata, "source": "semantic_scene_graph",

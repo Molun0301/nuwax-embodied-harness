@@ -337,9 +337,17 @@ def stop_scene_mapping(platform, args):
 def refresh_semantic_map(platform, ctx, args):
     ctx.check()
     ctx.progress(0, "semantic_mapping", "正在提取区域及核对观察证据。")
-    result = platform.scene_mapping.run_once(apply_labels=args.get("apply_labels"), cancel_check=ctx.check)
+    result = platform.scene_mapping.run_once(apply_labels=args.get("apply_labels"), cancel_check=ctx.check,
+                                            expected_capture=args["_scene_mapping_capture"])
     ctx.check()
     return result
+
+
+def prepare_semantic_map(platform, args):
+    if not platform.scene_mapping.config.enabled:
+        from core.errors import GatewayError
+        raise GatewayError("请先在设置中启用语义建图。", error_code="scene_mapping_disabled", http_status=409)
+    args["_scene_mapping_capture"] = platform.scene_mapping.capture()
 
 
 def get_semantic_map(platform, args):
@@ -395,6 +403,8 @@ CAPABILITIES = [
                             "start_scene_mapping", "stop_scene_mapping", "render_scene_graph_image",
                             "update_scene_space_label"} else "query",
         globals()[name], agent_tool=name not in {"review_scene_space", "list_semantic_instances"},
-        timeout_sec=1800 if name == "refresh_semantic_map" else None)
+        timeout_sec=300 if name == "refresh_semantic_map" else None,
+        normalize_names=tuple(key for key in ("map_name", "library_name") if key in input_schema["properties"]),
+        before_submit=prepare_semantic_map if name == "refresh_semantic_map" else None)
     for name, input_schema in SCHEMAS.items()
 ]

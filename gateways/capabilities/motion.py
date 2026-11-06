@@ -64,7 +64,7 @@ CAPABILITIES = [
                        "duration_sec": {"type": "number", "exclusiveMinimum": 0},
                        "interval_sec": {"type": "number", "exclusiveMinimum": 0},
                        "timeout_sec": {"type": "number", "exclusiveMinimum": 0}}, ("vx", "duration_sec")),
-               "task", relative_move, needs=("motion_guard",), motion=True),
+               "task", relative_move, needs=("motion_guard",), motion=True, timeout_sec=900),
     Capability("execute_sport_command", "执行机体动作。", build_go2_sport_command_input_schema(),
                "action", sport, needs=("motion_guard",), motion=True, timeout_sec=15, robots=GO2),
     Capability("set_body_pose", "设置机身欧拉角。",

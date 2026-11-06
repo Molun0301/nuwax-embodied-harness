@@ -21,4 +21,4 @@ CAPABILITIES = [Capability("execute_manipulation_task", "把操作指令交给�
         "timeout_sec": {"type": "number", "minimum": 1, "maximum": 1800, "default": 120},
         "max_steps": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 1440}},
      "required": ["instruction"], "additionalProperties": False}, "task", execute_manipulation_task,
-     motion=False, timeout_sec=1800)]
+     motion=False, timeout_sec=120)]

@@ -14,6 +14,7 @@ from contracts.spatial_memory import NavigationCandidate, ObservationEvent, Scen
 from core.errors import GatewayError
 from core.source_time import acquired_unix_ns, SourceTimeError
 from services.memory.semantic_map.scene_mapping_state import MANAGED_KEY
+from services.memory.store import EmbeddingVector
 IMAGE_VECTOR_NAME = 'image'
 
 @dataclass
@@ -129,7 +130,7 @@ class QueryMixin:
         supplied_linked_name = linked_location_name
         linked_location_name = linked_location_name or ''
         if supplied_linked_name is None and entry.linked_location_id:
-            linked_location = self._record_map('location').get(entry.linked_location_id)
+            linked_location = self.get_record('location',entry.linked_location_id)
             if linked_location is not None:
                 linked_location_name = linked_location.name
         segments = [entry.title, entry.summary, ' '.join(entry.tags), entry.perception_headline or '', linked_location_name, ' '.join(entry.semantic_labels), ' '.join(self._normalize_tags(entry.metadata.get('visual_labels'))), ' '.join(self._normalize_tags(entry.metadata.get('vision_tags'))), entry.semantic_region_id or '', entry.topo_node_id or '']
@@ -495,43 +496,125 @@ class QueryMixin:
         snapshot = self.snapshot()
         current_pose = self._as_memory_pose(self.current_pose())
         vectors = self._embeddings.query(query)
-        scored, vector_recall, lexical = ({}, {name: [] for name in vectors}, set())
-        locations = {item.location_id: item for item in snapshot.read('location')}
-        mapping = {'location': 'location', 'memory': 'memory', 'instance': 'instance', 'observation': 'event', 'scene_space': 'scene'}
-        for kind in kinds:
-            for record in snapshot.read(kind):
-                identity = getattr(record, MODELS[kind][1])
-                record_kind = record.kind if kind == 'memory' else {'location': MemoryRecordKind.TAGGED_LOCATION, 'instance': MemoryRecordKind.OBJECT_INSTANCE, 'observation': MemoryRecordKind.OBSERVATION_EVENT, 'scene_space': MemoryRecordKind.SCENE_SPACE}[kind]
-                if record_kind not in allowed:
-                    continue
-                linked = locations.get(record.linked_location_id) if kind == 'memory' else None
-                payload = {**dict(record.metadata), **self._record_payload(kind, record,
-                    linked_location_name=linked.name if linked is not None else '')}
-                pose = getattr(record, 'pose', None)
-                if pose is not None:
-                    payload.update(pose_x=pose.position.x, pose_y=pose.position.y, pose_z=pose.position.z)
-                point_vectors = {name: vector for (item_kind, item_id, name), vector in snapshot.vectors.items() if item_kind == kind and item_id == identity}
-                point = SimpleNamespace(point_id=identity, record_kind=record_kind.value, payload=payload, vectors=point_vectors)
-                if not self._filter_record(record, point, payload_filter):
-                    continue
-                contributions = {}
-                for name, (provider, query_vector) in vectors.items():
-                    value = point_vectors.get(name)
-                    if value is not None and value.model == provider.model_name and (value.dimension == query_vector.size):
-                        contributions[name] = provider.cosine_similarity(query_vector, value.array())
-                point.payload['query_vector_contributions'] = {name: round(value, 6) for name, value in contributions.items()}
-                candidate = self._score_candidate(query=query, normalized_query=normalized, point=point, allowed_record_kinds=(record_kind,), current_pose=current_pose, text_recall_score=max(contributions.values(), default=0.0), query_image_vector=vectors['image'][1] if 'image' in vectors else None, query_scope=query_scope, source_snapshot=(mapping[kind], record), semantic_available=bool(contributions))
-                if candidate is None or candidate.final_score < similarity_threshold:
-                    continue
-                scored[kind, identity] = candidate
-                if candidate.lexical_score >= max(0.18, similarity_threshold * 0.5):
-                    lexical.add((kind, identity))
-                for name, value in contributions.items():
-                    vector_recall[name].append((value, (kind, identity)))
+        scalar, scored = {}, {}
+        vector_recall, lexical = {name:[] for name in vectors}, set()
+        from services.memory.reader import read_connection, filter_sql
+        import json
+        if snapshot.directory is not None:
+            with read_connection(snapshot.directory) as connection:
+                condition, params = filter_sql(payload_filter)
+                allowed_values = tuple(item.value for item in allowed)
+                for kind in kinds:
+                    table = MODELS[kind][2]
+                    expressions, vector_params = [], []
+                    for name,(provider,_) in vectors.items():
+                        expressions.append('(SELECT data FROM vectors v WHERE v.kind=? AND v.record_id=r.id AND v.name=? AND v.model=? AND v.dimension=?)')
+                        vector_params.extend((kind,name,provider.model_name,provider.dimension))
+                    sql = 'SELECT r.id,r.filter_json,r.lexical_json,r.exact_json'+''.join(','+value for value in expressions)+' FROM '+table+' r WHERE '
+                    sql += "json_extract(r.filter_json,'$.record_kind') IN ("+','.join('?' for _ in allowed_values)+')'
+                    if condition:
+                        sql += ' AND '+condition
+                    for row in connection.execute(sql,(*vector_params,*allowed_values,*params)):
+                        identity,raw,raw_lexical,raw_exact = row[:4]
+                        fields = json.loads(raw)
+                        if kind == 'instance' and not fields.get('confirmed',True):
+                            continue
+                        texts,exact = json.loads(raw_lexical),json.loads(raw_exact)
+                        lexical_score,lexical_reason = self._indexed_lexical_score(kind,normalized,texts,exact)
+                        contributions = {name:provider.cosine_similarity(query_vector,np.frombuffer(value,dtype='<f4'))
+                            for (name,(provider,query_vector)),value in zip(vectors.items(),row[4:]) if value is not None}
+                        target_pose = Pose.model_validate(fields['score_pose']) if fields.get('score_pose') else None
+                        spatial_score,_ = self._compute_spatial_score(current_pose,target_pose)
+                        timestamp = datetime.fromisoformat(fields['score_timestamp'].replace('Z','+00:00'))
+                        recency_score = self._compute_recency_score(timestamp)
+                        score = self._combine_candidate_scores(record_kind=MemoryRecordKind(fields['record_kind']),
+                            lexical_score=lexical_score,text_recall_score=max(contributions.values(),default=0.0),
+                            image_score=max(0.0,contributions.get('image',0.0)),spatial_score=spatial_score,
+                            recency_score=recency_score,query_scope=query_scope)
+                        if not contributions:
+                            score = max(score,lexical_score)
+                        if score < similarity_threshold:
+                            continue
+                        key = (kind,identity)
+                        scalar[key] = (score,lexical_score,lexical_reason,contributions)
+                        if lexical_score >= max(.18,similarity_threshold*.5):
+                            lexical.add(key)
+                        for name,value in contributions.items():
+                            vector_recall[name].append((value,key))
+                # 未确认/动态的当前库实例不落盘，沿用当前不可变快照中的实际记录。
+                for identity,record in (snapshot.transient or {}).items():
+                    if 'instance' not in kinds or not self._instance_is_confirmed(record):
+                        continue
+                    payload = {**record.metadata,**self._record_payload('instance',record)}
+                    point = SimpleNamespace(point_id=identity,record_kind=MemoryRecordKind.OBJECT_INSTANCE.value,payload=payload,vectors={})
+                    if not self._filter_record(record,point,payload_filter):
+                        continue
+                    candidate = self._score_candidate(query=query,normalized_query=normalized,point=point,
+                        allowed_record_kinds=allowed_record_kinds,current_pose=current_pose,text_recall_score=0.,
+                        query_image_vector=None,query_scope=query_scope,source_snapshot=('instance',record),semantic_available=False)
+                    if candidate is not None and candidate.final_score >= similarity_threshold:
+                        key = ('instance',identity)
+                        scored[key] = candidate
+                        scalar[key] = (candidate.final_score,candidate.lexical_score,candidate.lexical_reason,{})
+                        if candidate.lexical_score >= max(.18,similarity_threshold*.5):
+                            lexical.add(key)
+                chosen = set(lexical)
+                for values in vector_recall.values():
+                    chosen.update(key for _,key in sorted(values,reverse=True)[:max(limit*12,20)])
+                # SQL只读取过滤/评分字段；完整领域记录仅在实际召回后逐条读取。
+                recalled, recalled_seen, recalled_instances = [], set(), set()
+                def accept(candidate):
+                    key = self._candidate_dedup_key(candidate)
+                    instance = candidate.semantic_instance.anchor_id or candidate.semantic_instance.instance_id if candidate.semantic_instance is not None else None
+                    linked = candidate.observation_event.linked_instance_ids if candidate.observation_event is not None else []
+                    if key in recalled_seen or (instance and instance in recalled_instances) or (linked and recalled_instances.intersection(linked)):
+                        return
+                    recalled_seen.add(key)
+                    if instance:
+                        recalled_instances.add(instance)
+                    recalled_instances.update(linked)
+                    recalled.append(candidate)
+                for kind,identity in sorted(chosen,key=lambda key:(-scalar[key][0],key[1])):
+                    if (kind,identity) in scored:
+                        accept(scored[kind,identity])
+                        if len(recalled) >= limit:
+                            break
+                        continue
+                    row = connection.execute('SELECT payload FROM '+MODELS[kind][2]+' WHERE id=?',(identity,)).fetchone()
+                    if row is None:
+                        continue
+                    record = MODELS[kind][0].model_validate_json(row[0])
+                    linked = snapshot.get('location',record.linked_location_id) if kind == 'memory' and record.linked_location_id else None
+                    payload = {**record.metadata,**self._record_payload(kind,record,
+                        linked_location_name=linked.name if linked is not None else '')}
+                    pose = getattr(record,'pose',None)
+                    if pose is not None:
+                        payload.update(pose_x=pose.position.x,pose_y=pose.position.y,pose_z=pose.position.z)
+                    stored_vectors = {name:EmbeddingVector(model,dimension,bytes(data)) for name,model,dimension,data in
+                        connection.execute('SELECT name,model,dimension,data FROM vectors WHERE kind=? AND record_id=?',(kind,identity))}
+                    record_kind = record.kind if kind == 'memory' else {
+                        'location':MemoryRecordKind.TAGGED_LOCATION,'instance':MemoryRecordKind.OBJECT_INSTANCE,
+                        'observation':MemoryRecordKind.OBSERVATION_EVENT,'scene_space':MemoryRecordKind.SCENE_SPACE}[kind]
+                    contributions = scalar[kind,identity][3]
+                    payload['query_vector_contributions'] = {name:round(value,6) for name,value in contributions.items()}
+                    point = SimpleNamespace(point_id=identity,record_kind=record_kind.value,payload=payload,vectors=stored_vectors)
+                    if not self._filter_record(record,point,payload_filter):
+                        continue
+                    candidate = self._score_candidate(query=query,normalized_query=normalized,point=point,
+                        allowed_record_kinds=(record_kind,),current_pose=current_pose,
+                        text_recall_score=max(contributions.values(),default=0.),
+                        query_image_vector=vectors['image'][1] if 'image' in vectors else None,query_scope=query_scope,
+                        source_snapshot=({'location':'location','memory':'memory','instance':'instance','observation':'event','scene_space':'scene'}[kind],record),
+                        lexical_override=(scalar[kind,identity][1],scalar[kind,identity][2]),semantic_available=bool(contributions))
+                    if candidate is not None:
+                        scored[kind,identity] = candidate
+                        accept(candidate)
+                        if len(recalled) >= limit:
+                            break
         chosen = set(lexical)
         for values in vector_recall.values():
             chosen.update((key for _, key in sorted(values, reverse=True)[:max(limit * 12, 20)]))
-        candidates = sorted((scored[key] for key in chosen), key=lambda item: (-item.final_score, item.point.point_id))
+        candidates = sorted((scored[key] for key in chosen if key in scored), key=lambda item: (-item.final_score, item.point.point_id))
         selected, seen, instances = ([], set(), set())
         for candidate in candidates:
             key = self._candidate_dedup_key(candidate)
@@ -546,7 +629,14 @@ class QueryMixin:
             selected.append(candidate)
             if len(selected) >= limit:
                 break
-        return MemoryQueryResult(query=query, similarity_threshold=similarity_threshold, matches=[self._build_query_match(query, value, current_pose, grounding_plan=grounding_plan, expected_map_name=payload_filter.map_name if payload_filter is not None else None, include_non_direct_navigation_candidate=include_non_direct_navigation_candidates, source_snapshot=snapshot) for value in selected], metadata=self._query_metadata(query, query_scope, limit, snapshot.name, vectors, len(scored), len(selected), payload_filter))
+        return MemoryQueryResult(query=query, similarity_threshold=similarity_threshold, matches=[self._build_query_match(query, value, current_pose, grounding_plan=grounding_plan, expected_map_name=payload_filter.map_name if payload_filter is not None else None, include_non_direct_navigation_candidate=include_non_direct_navigation_candidates, source_snapshot=snapshot) for value in selected], metadata=self._query_metadata(query, query_scope, limit, snapshot.name, vectors, len(scalar), len(selected), payload_filter))
+
+    def _indexed_lexical_score(self, kind, normalized_query, texts, exact):
+        if kind in {'location','instance'} and normalized_query in {self._normalize_text(value) for value in exact if value}:
+            return 1., '命中地点名称、别名或区域语义。' if kind == 'location' else '命中实例标识或合并别名。'
+        reasons = {'location':'与地点描述或空间标签相似。','memory':'与语义记忆内容相似。',
+            'instance':'与空间语义实例相似。','observation':'与观察事件内容相似。','scene_space':'与场景空间标签、摘要或证据相似。'}
+        return self._score_text_candidates(normalized_query,texts,fallback_reason=reasons[kind])
 
     def _query_metadata(self, query, scope, limit, library, vectors, candidate_count, returned_count, filters):
         """保留实际检索范围和模型观测信息，不恢复退役索引身份。"""
@@ -558,7 +648,8 @@ class QueryMixin:
         return {"library_name": library, "query_text_preview": self._preview_text(query),
             "query_scope": scope, "match_limit": max(1, int(limit)),
             "candidate_count": candidate_count, "returned_candidate_count": returned_count,
-            "query_embedding_errors": {},
+            "query_embedding_errors": ({"initialization": self._embeddings.error}
+                if self._embeddings._initialization_error is not None else {}),
             "fallback_used": not vectors and bool(text_provider.get("fallback_used")),
             "fallback_reason": str(text_provider.get("fallback_reason") or "") if not vectors else "",
             "retrieval_mode": "text_recall_then_filter_then_multimodal_rerank" if vectors else "lexical_only",
@@ -621,7 +712,7 @@ class QueryMixin:
         navigation_metadata = self._evaluate_navigation_metadata(dict(candidate.point.payload), backend_name=str(candidate.point.payload.get('backend') or candidate.point.payload.get('backend_type') or 'memory_service'), candidate_score=candidate.final_score, grounding_plan=grounding_plan, map_name=str(candidate.point.payload.get('map_name') or '').strip() or None, expected_map_name=expected_map_name)
         if candidate.tagged_location is not None:
             location = candidate.tagged_location
-            photo = {item.memory_id: item for item in source_snapshot.read('memory')}.get(location.memory_id) if location.memory_id else None
+            photo = source_snapshot.get('memory',location.memory_id) if location.memory_id else None
             if photo is not None and photo.artifact_ids and (photo.linked_location_id == location.location_id) and (photo.map_name == location.map_name):
                 linked_photo = {'memory_id': photo.memory_id, 'artifact_ids': list(photo.artifact_ids), 'observation_id': photo.observation_id, 'camera_id': photo.metadata.get('camera_id'), 'frame_timestamp': photo.metadata.get('frame_timestamp'), 'observation_pose': photo.pose.model_dump(mode='json') if photo.pose is not None else None}
             source_metadata = {**dict(candidate.tagged_location.metadata), **dict(candidate.point.payload)}
@@ -699,7 +790,7 @@ class QueryMixin:
         supplied_linked_name = linked_location_name
         linked_location_name = linked_location_name or ''
         if supplied_linked_name is None and entry.linked_location_id:
-            linked_location = self._record_map('location').get(entry.linked_location_id)
+            linked_location = self.get_record('location',entry.linked_location_id)
             if linked_location is not None:
                 linked_location_name = linked_location.name
         camera_id = str(entry.metadata.get('camera_id', '') or '')

@@ -977,8 +977,7 @@ fn distant_classified_empty_column_preserves_real_legacy_cross_slope() {
         writer.observe([key],20).unwrap();
         writer.replace_ground_column([key[0],key[1]],&ColumnGroundRecords {
             classified_empty:true,heightfields:vec![]}).unwrap();
-        let root=writer.snapshot(Domain {session:"distant-empty-cross-slope".into(),generation:1,
-            frame_generation:0,producer_generation:1},1,20).unwrap();
+        let root=writer.snapshot(Domain {session:"distant-empty-cross-slope".into(),},1,20).unwrap();
         let mut receiver=Receiver::new(Repository::temporary().unwrap());
         receiver.receive(&Transfer {root:root.encode().unwrap(),included:BTreeMap::new()},&root.domain,
             |_,r|writer.repository().read_object(r.object,nuwax_map_chunks::MAX_BLOCK_BYTES)).unwrap();

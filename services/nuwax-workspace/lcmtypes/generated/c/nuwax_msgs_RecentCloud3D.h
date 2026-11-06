@@ -8,37 +8,26 @@
 
 #include <stdint.h>
 #include <stdlib.h>
-#include <lcm/lcm_coretypes.h>
-#include <lcm/lcm.h>
+#include "lcm/lcm_coretypes.h"
+#include "lcm/lcm.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #include "nuwax_msgs_RegisteredCloudPose.h"
-/// Independent live admitted observations; never a persistent map revision.
+#include "sensor_msgs_PointCloud2.h"
+/// 当前会话的即时观测，不更新持久地图。
 typedef struct _nuwax_msgs_RecentCloud3D nuwax_msgs_RecentCloud3D;
 struct _nuwax_msgs_RecentCloud3D
 {
-    int32_t    schema_version;
-    int64_t    producer_runtime_generation;
 
     /**
      * LCM Type: string
      */
     char*      session_id;
-    int64_t    session_generation;
-    int64_t    map_frame_generation;
-
-    /**
-     * LCM Type: byte[16]
-     */
-    uint8_t    commit_boot_nonce[16];
+    int64_t    sequence;
     int8_t     cleared;
-
-    /**
-     * v2: 0 表示原点未知或撤销；1 表示同帧真实配对，禁止补零。
-     */
     int32_t    registration_count;
 
     /**
@@ -51,12 +40,7 @@ struct _nuwax_msgs_RecentCloud3D
      * LCM Type: int32_t[ground_point_count]
      */
     int32_t    *ground_point_indices;
-    int32_t    cloud_bytes_count;
-
-    /**
-     * LCM Type: byte[cloud_bytes_count]
-     */
-    uint8_t    *cloud_bytes;
+    sensor_msgs_PointCloud2 cloud;
 };
 
 /**

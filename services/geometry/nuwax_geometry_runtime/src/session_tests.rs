@@ -675,6 +675,7 @@ async fn fault_saved_planar_map_loads_its_grid_without_publishing_map_transform(
     let (mut session, root, grid) = load_fault_saved_planar_map().await;
     assert_eq!(session.phase(), SessionPhase::Loaded);
     assert_eq!(session.state.reason, "缺少二维定位图，只能查看");
+    assert!(session.snapshot().view_only);
     assert_eq!(session.mapper().unwrap().occupancy(false), Some(grid.clone()));
     assert_eq!(session.mapper().unwrap().occupancy(true), Some(grid));
     session.router.publish_pose(

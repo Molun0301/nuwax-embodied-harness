@@ -5,22 +5,8 @@ use std::sync::Arc;
 /// Source domain. A change must retire the previous native occupancy history.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegisteredFrameDomain {
-    /// Geometry owner incarnation.
-    pub producer_runtime_generation: i64,
-    /// Original mapping session.
+    /// Geometry 当前地图会话。
     pub session_id: String,
-    /// Original mapping session incarnation.
-    pub session_generation: i64,
-    /// Original registered map frame incarnation.
-    pub map_frame_generation: i64,
-    /// Original mapping owner boot identity.
-    pub commit_boot_nonce: [u8; 16],
-    /// Original registration correction incarnation; changed coordinates cannot share old occupancy.
-    pub registration_correction_revision:i64,
-    /// Original LiDAR backend identity.
-    pub backend: i32,
-    /// Original LiDAR runtime incarnation.
-    pub runtime_generation: i64,
 }
 
 /// One source observation, not the current pose or a fused map revision.
@@ -50,7 +36,6 @@ pub struct RegisteredFrame {
     /// Same-frame body quaternion for provenance; not sensor orientation.
     pub body_orientation_xyzw: [f64; 4],
     /// The odometry sample actually paired by the registration owner.
-    pub paired_odometry_sequence: i64,
     /// Paired odometry acquisition time, distinct from cloud time.
     pub paired_odometry_timestamp_ns: i64,
     /// Existing source-owner deadline, not renewed by forwarding or replay.
@@ -67,14 +52,13 @@ impl RegisteredFrame {
 pub(crate) fn test_frame(sequence:i64) -> Arc<RegisteredFrame> {
     Arc::new(RegisteredFrame {
         identity:RegisteredFrameIdentity {
-            domain:RegisteredFrameDomain {producer_runtime_generation:1,session_id:"registered-test".into(),
-                session_generation:1,map_frame_generation:1,commit_boot_nonce:[1;16],registration_correction_revision:0,backend:1,runtime_generation:1},
+            domain:RegisteredFrameDomain {session_id:"registered-test".into()},
             sequence,timestamp_ns:1_000_000_000+sequence,
         },
         points_world:vec![[0.0,0.0,0.0],[1.0,0.0,0.0]].into(),
         ground_point_indices:Arc::from([]),
         sensor_origin_world:[0.5,1.0,0.5],body_position_world:[0.5,1.0,0.5],
-        body_orientation_xyzw:[0.0,0.0,0.0,1.0],paired_odometry_sequence:sequence,
+        body_orientation_xyzw:[0.0,0.0,0.0,1.0],
         paired_odometry_timestamp_ns:900_000_000+sequence,dispatch_bound:None,
     })
 }

@@ -754,6 +754,7 @@ impl Worker {
             )?;
             if !frame.mapping_only {
                 self.recent_cloud.send_replace(Some(encode_recent_cloud(
+                    self.sequence,
                     &frame,
                     &points,
                     &ground,
@@ -773,6 +774,7 @@ impl Worker {
         )?;
         if !frame.mapping_only {
             self.recent_cloud.send_replace(Some(encode_recent_cloud(
+                self.sequence,
                 &frame,
                 &points,
                 &ground,
@@ -1041,6 +1043,7 @@ pub(crate) fn proto_grid_to_kernel(
     })
 }
 fn encode_recent_cloud(
+    sequence: u64,
     frame: &MappingFrame,
     points: &[Point3<f64>],
     ground: &[u32],
@@ -1049,7 +1052,6 @@ fn encode_recent_cloud(
     config: &MapperConfig,
 ) -> Result<Vec<u8>, String> {
     use nuwax_codec::lcm::{
-        lio::{LioCloudEnvelope, LIO_REGISTRATION_REGISTERED_MAP, LIO_SCHEMA_VERSION_V1},
         recent_cloud::{self, RegisteredCloudPose},
         schema::{Header, PointCloud2, PointField},
     };
@@ -1085,42 +1087,17 @@ fn encode_recent_cloud(
             .collect(),
         is_dense: true,
     };
-    // B3 删除旧结构前，这些线上必填字段只在编码边界填常量，不形成核心身份。
-    let envelope = LioCloudEnvelope {
-        schema_version: LIO_SCHEMA_VERSION_V1,
-        backend: match std::env::var("NUWAX_GEOMETRY_LIO_BACKEND").ok().as_deref() {
-            Some("pointlio") => 3,
-            Some("fastlio2") => 2,
-            _ => 1,
-        },
-        runtime_generation: 1,
-        source_sequence: 1,
-        source_timestamp_ns: frame.odom_pose.timestamp_ns as i64,
-        correlated_odometry_source_sequence: 1,
-        correlated_odometry_source_timestamp_ns: frame.odom_pose.timestamp_ns as i64,
-        sensor_frame_id: frame.sensor_id.clone(),
-        body_frame_id: config.base_frame_id.clone(),
-        odom_frame_id: config.odom_frame_id.clone(),
-        map_frame_id: config.map_frame_id.clone(),
-        registration_state: LIO_REGISTRATION_REGISTERED_MAP,
-        source_point_count: points.len() as i64,
-        emitted_point_count: points.len() as i64,
-        cloud,
-    };
     let q = map_from_body.rotation.quaternion();
     let registration = RegisteredCloudPose {
         sensor_origin_map: origin,
         body_position_map: map_from_body.translation.vector.into(),
         body_orientation_xyzw: [q.i, q.j, q.k, q.w],
-        registration_correction_revision: 0,
+        paired_odometry_timestamp_ns: frame.odom_pose.timestamp_ns as i64,
     };
     recent_cloud::encode_borrowed(
-        1,
         &frame.session_id.to_string(),
-        1,
-        0,
-        [1; 16],
-        Some(&envelope),
+        sequence as i64,
+        Some(&cloud),
         Some(&registration),
         ground,
     )

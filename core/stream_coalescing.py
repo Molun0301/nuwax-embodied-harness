@@ -49,17 +49,15 @@ def stream_replacement_key(frame: StreamFrame, latest_only_topics):
                 return None
             if values.get("owner_kind") not in (None, "", 0, "0"):
                 return None
-        # 只在同一来源与运行代际内替换，代际元数据矛盾时保守保留事件。
-        generations = []
-        for key in ("producer_runtime_generation", "runtime_generation"):
-            values = {str(layer[key]) for layer in (metadata, context_metadata, frame.metadata) if layer.get(key) is not None}
-            if len(values) > 1:
-                return None
-            generations.append(next(iter(values), ""))
+        # 导航栈进程变化时保留该状态事件。
+        generations = {str(layer["runtime_generation"]) for layer in
+                       (metadata, context_metadata, frame.metadata) if layer.get("runtime_generation") is not None}
+        if len(generations) > 1:
+            return None
         identity = metadata.get("map_snapshot_identity") or {}
         if not isinstance(identity, Mapping):
             return None
-        return ("idle-navigation", frame.source, frame.frame_id, *generations,
+        return ("idle-navigation", frame.source, frame.frame_id, next(iter(generations), ""),
                 *(str(metadata.get(key, "")) for key in ("sink_ready", "planner_map_frame", "planner_pose_frame", "map_name")),
                 str(identity.get("source_name", "")), str(identity.get("source_epoch", "")))
     if frame.topic == "exploration.state":

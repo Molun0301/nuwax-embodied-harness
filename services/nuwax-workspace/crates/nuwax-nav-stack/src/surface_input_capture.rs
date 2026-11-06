@@ -26,10 +26,9 @@ mod input_capture {
         Ok(copied)
     }
 
-    fn committed_identity(value: &schema::CommittedMapIdentity) -> serde_json::Value {
-        serde_json::json!({"session_id":value.session_id,"session_generation":value.session_generation,
-            "frame_id":value.frame_id,"revision":value.revision,"commit_boot_nonce":value.commit_boot_nonce,
-            "commit_sequence":value.commit_sequence,"source_timestamp_ns":value.source_timestamp_ns})
+    fn map_identity(value: &schema::NavigationMap3D) -> serde_json::Value {
+        serde_json::json!({"session_id":value.session_id, "revision":value.revision,
+            "frame_id":value.frame_id, "source_timestamp_ns":value.source_timestamp_ns})
     }
     fn claim(total: &std::sync::atomic::AtomicU64, amount: usize) -> Result<(), String> {
         total
@@ -108,7 +107,7 @@ mod input_capture {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "显式提供同一受管会话的LCM地址、主题、运行代次和启动nonce，只读取证"]
+    #[ignore = "显式提供同一受管会话的LCM地址、主题、地图会话号，只读取证"]
     async fn capture_live_surface_messages_and_frozen_objects() {
         use nuwax_protocol::{LcmMessageType, LcmTopic};
         use nuwax_transport::LcmTransport;
@@ -119,12 +118,7 @@ mod input_capture {
         let map_topic = required("NUWAX_SURFACE_CAPTURE_MAP_TOPIC");
         let pose_topic = required("NUWAX_SURFACE_CAPTURE_POSE_TOPIC");
         let directory = std::path::PathBuf::from(required("NUWAX_SURFACE_CAPTURE_DIRECTORY"));
-        let nonce: [u8; 16] =
-            serde_json::from_str(&required("NUWAX_SURFACE_CAPTURE_NONCE_JSON")).unwrap();
-        let producer: i64 = required("NUWAX_SURFACE_CAPTURE_GENERATION")
-            .parse()
-            .unwrap();
-        assert!(nonce != [0; 16] && producer > 0);
+        let session_id = required("NUWAX_SURFACE_CAPTURE_SESSION");
         let seconds: u64 = std::env::var("NUWAX_SURFACE_CAPTURE_SECONDS")
             .unwrap_or_else(|_| "120".into())
             .parse()
@@ -185,8 +179,8 @@ mod input_capture {
                 if result.is_ok() && !message.cleared {
                     complete_active += 1;
                 }
-                let row = serde_json::json!({"ordinal":ordinal,"cloud_revision":message.cloud_revision,
-                    "committed_map":committed_identity(&message.committed_map),"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,
+                let row = serde_json::json!({"ordinal":ordinal,"revision":message.revision,
+                    "committed_map":map_identity(&message),"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,
                     "complete":result.is_ok(),"result":result.as_ref().ok(),"error":result.err()});
                 writeln!(log, "{row}").unwrap();
                 log.flush().unwrap();
@@ -202,7 +196,7 @@ mod input_capture {
         let mut bound = false;
         let mut skipped_unbound_poses = 0;
         std::fs::write(directory.join("只读采集已就绪.json"),serde_json::to_vec(&serde_json::json!({
-            "wall_ns":wall_ns(),"url":url,"nonce":nonce,"producer":producer,"map_topic":map_topic,"pose_topic":pose_topic,
+            "wall_ns":wall_ns(),"url":url,"session_id":session_id,"map_topic":map_topic,"pose_topic":pose_topic,
             "scope":"只读消息与原可靠块接口；读到流时刻不冒充物理采集或发布时刻"})).unwrap()).unwrap();
         while let Ok(Some((kind, frame))) = tokio::time::timeout_at(deadline, inputs.next()).await {
             let received = wall_ns();
@@ -221,9 +215,7 @@ mod input_capture {
                         break;
                     }
                 };
-                if message.commit_boot_nonce != nonce
-                    || message.producer_runtime_generation != producer
-                {
+                if message.session_id != session_id {
                     failure = Some("出现不属于指定受管运行的表面生产者，停止取证".into());
                     break;
                 }
@@ -247,8 +239,8 @@ mod input_capture {
             }
             let mut row = serde_json::json!({"ordinal":count,"kind":kind,"capture_read_wall_ns":received,"bytes":frame.payload.len()});
             if let Some(message) = message {
-                row["cloud_revision"] = serde_json::json!(message.cloud_revision);
-                row["committed_map"] = committed_identity(&message.committed_map);
+                row["revision"] = serde_json::json!(message.revision);
+                row["committed_map"] = map_identity(&message);
                 row["cleared"] = serde_json::json!(message.cleared);
                 row["objects_queued"] =
                     serde_json::json!(sender.try_send((count, message)).is_ok());

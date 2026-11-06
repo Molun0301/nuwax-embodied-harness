@@ -445,8 +445,7 @@ mod tests {
         }
         writer.observe(cells.iter().copied(), revision).unwrap();
         writer.snapshot(Domain {
-            session: "test".into(), generation: 1, frame_generation: 1, producer_generation: 1,
-        }, revision, revision).unwrap().as_ref().clone()
+            session: "test".into(), }, revision, revision).unwrap().as_ref().clone()
     }
     fn reader(repository: Repository) -> FineMapReader {
         FineMapReader {
@@ -458,13 +457,8 @@ mod tests {
     }
     fn transfer_message(repository: &Repository, root: &Manifest) -> schema::NavigationMap3D {
         schema::NavigationMap3D {
-            producer_runtime_generation: root.domain.producer_generation as i64,
-            map_frame_generation: root.domain.frame_generation as i64,
-            committed_map: schema::CommittedMapIdentity {
-                session_id: root.domain.session.clone(),
-                session_generation: root.domain.generation as i64,
-                ..Default::default()
-            },
+            session_id: root.domain.session.clone(),
+
             fine: Some(Transfer {
                 root: root.encode().unwrap(),
                 included: root.blocks.iter().map(|block| (block.object,
@@ -622,7 +616,7 @@ mod tests {
         wrong["block"]["key"] = serde_json::json!([1, 0, 0]);
         assert!(block_response(&request, &wrong).is_err());
         wrong = response.clone();
-        wrong["root"]["domain"]["producer_generation"] = serde_json::json!(99);
+        wrong["root"]["domain"]["session"] = serde_json::json!("其它会话");
         assert!(block_response(&request, &wrong).is_err());
         wrong = response.clone();
         wrong["block"]["object"]["object_id"][0] = serde_json::json!(256);

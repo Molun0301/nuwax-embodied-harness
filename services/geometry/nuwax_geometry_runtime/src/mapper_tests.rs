@@ -114,7 +114,8 @@ async fn loaded_map_stays_read_only_while_pose_and_recent_obstacles_continue() {
     assert_eq!(pose.borrow().as_ref().unwrap().timestamp_ns, 2_000_000_000);
     let recent =
         nuwax_codec::lcm::recent_cloud::decode_body(recent.borrow().as_ref().unwrap()).unwrap();
-    assert_eq!(recent.cloud.unwrap().source_timestamp_ns, 2_000_000_000);
+    let header = recent.cloud.unwrap().header;
+    assert_eq!(i64::from(header.stamp_sec) * 1_000_000_000 + i64::from(header.stamp_nsec), 2_000_000_000);
     assert!(recent.registration.is_some());
     loaded.shutdown().await.unwrap();
 }
@@ -298,7 +299,7 @@ async fn nonzero_map_odom_anchor_transforms_points_and_pose_before_publish() {
         loaded.recent_cloud_rx().borrow().as_ref().unwrap(),
     )
     .unwrap();
-    let raw = recent.cloud.unwrap().cloud.data;
+    let raw = recent.cloud.unwrap().data;
     let xyz = [0, 4, 8]
         .map(|offset| f32::from_le_bytes(raw[offset..offset + 4].try_into().unwrap()) as f64);
     assert!((Point3::from(xyz) - expected_point).norm() < 1e-5);

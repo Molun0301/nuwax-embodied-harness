@@ -12,6 +12,34 @@ pub struct Outputs {
     stop: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
 }
+#[derive(Default)]
+struct MapOutput {
+    session_id: u64,
+    frame_id: String,
+    revision: i64,
+    prior: Option<Arc<nuwax_map_chunks::Manifest>>,
+}
+
+impl MapOutput {
+    async fn clear(&mut self, transport: &LcmTransport) -> Result<(), String> {
+        if self.prior.take().is_none() {
+            return Ok(());
+        }
+        self.revision += 1;
+        send_navigation_map(transport, &schema::NavigationMap3D {
+            session_id: self.session_id.to_string(),
+            revision: self.revision,
+            frame_id: self.frame_id.clone(),
+            cleared: true,
+            cloud: schema::PointCloud2 {
+                header: header(0, &self.frame_id, 0),
+                ..Default::default()
+            },
+            ..Default::default()
+        }).await
+    }
+}
+
 impl Outputs {
     pub fn start(session: SessionHandle) -> Result<Self, String> {
         let url = std::env::var("NUWAX_LCM_URL")
@@ -33,7 +61,8 @@ impl Outputs {
                                 if changed.is_err(){break;}
                                 let bytes=recent.borrow_and_update().clone();
                                 if routes.borrow().as_ref().is_some_and(|current|current.id==route.id) {
-                                    if let Some(bytes)=bytes {if let Err(reason)=publish(&recent_transport,"","/nav/recent_cloud",nuwax_codec::lcm::recent_cloud::TYPE_NAME,bytes).await {recent_session.report_output_error(route.id, reason);}}
+                                    if let Some(bytes)=bytes {if let Err(reason)=publish(&recent_transport, "", nuwax_codec::lcm::recent_cloud::DEFAULT_TOPIC,
+                                        nuwax_codec::lcm::recent_cloud::TYPE_NAME, bytes).await {recent_session.report_output_error(route.id, reason);}}
                                 }
                             },
                         }
@@ -47,7 +76,7 @@ impl Outputs {
             let routes = session.route_rx();
             let mut poses = session.pose_rx();
             let mut maps = session.map_rx();
-            let mut prior: Option<Arc<nuwax_map_chunks::Manifest>> = None;
+            let mut output = MapOutput::default();
             let mut follow_sent: Option<(u64, u64)> = None;
             let follow = std::env::var("NUWAX_PERSON_FOLLOW_AUTOSTART").map_or(true, |v| {
                 matches!(
@@ -74,11 +103,17 @@ impl Outputs {
                         let id = routes.borrow().as_ref().map_or(0, |route| route.id);
                         let map=maps.borrow_and_update().clone();
                         let result = if let Some(map)=map {
-                            match publish_map(&transport,&session,&map,prior.as_deref()).await {
-                                Ok(sealed)=>{if let Some(sealed)=sealed {let changed=prior.as_ref().is_none_or(|old|old.identity()!=sealed.manifest().identity());prior=Some(sealed.manifest().clone());if follow&&changed{publish_follow(&transport,&session,&sealed,&mut follow_sent).await}else{Ok(())}}else{Ok(())}},
-                                Err(error)=>Err(error),
+                            match publish_map(&transport, &session, &map, &mut output).await {
+                                Ok(Some((sealed, changed))) if follow && changed => {
+                                    publish_follow(&transport, &session, &sealed, &mut follow_sent).await
+                                }
+                                Ok(_) => Ok(()),
+                                Err(reason) => Err(reason),
                             }
-                        }else{prior=None;follow_sent=None;Ok(())};
+                        } else {
+                            follow_sent = None;
+                            output.clear(&transport).await
+                        };
                         (id, result)
                     },
                 };
@@ -100,8 +135,8 @@ async fn publish_map(
     transport: &LcmTransport,
     session: &SessionHandle,
     _map: &proto::MapUpdate,
-    prior: Option<&nuwax_map_chunks::Manifest>,
-) -> Result<Option<Arc<nuwax_map_chunks::SealedMap>>, String> {
+    output: &mut MapOutput,
+) -> Result<Option<(Arc<nuwax_map_chunks::SealedMap>, bool)>, String> {
     let mapper = match session.mapper() {
         Ok(mapper) => mapper,
         Err(_) => return Ok(None),
@@ -133,7 +168,7 @@ async fn publish_map(
     };
     let root = sealed.manifest();
     let stamp = root.source_timestamp_ns;
-    let revision = root.revision as i64;
+    let revision = if output.session_id == id { output.revision + 1 } else { 1 };
     let mut virtual_obstacles = publication
         .forbidden
         .map(|mask| {
@@ -151,31 +186,28 @@ async fn publish_map(
     if let Some(mask) = &mut virtual_obstacles {
         mask.header = header(stamp, &effective.header.frame_id, root.revision);
     }
-    // 导航栈线上格式由 B3 统一删减；这些常量只满足现有编码器必填布局，不参与本运行时准入。
     let message = schema::NavigationMap3D {
-        producer_runtime_generation: root.domain.producer_generation as i64,
-        committed_map: schema::CommittedMapIdentity {
-            session_id: root.domain.session.clone(),
-            session_generation: root.domain.generation as i64,
-            revision,
-            commit_boot_nonce: [1; 16],
-            commit_sequence: revision,
-            source_timestamp_ns: stamp as i64,
-            frame_id: effective.header.frame_id.clone(),
-        },
-        map_frame_generation: root.domain.frame_generation as i64,
-        cloud_revision: revision,
-        cloud_occupancy_revision: revision,
+        session_id: root.domain.session.clone(),
+        revision,
+        frame_id: effective.header.frame_id.clone(),
         source_timestamp_ns: stamp as i64,
         source_voxel_size: root.voxel_size_m,
-        commit_boot_nonce: [1; 16],
-        commit_sequence: revision,
         virtual_obstacles,
-        fine: Some(navigation_map_transfer::prepare(&sealed, prior)?),
-        cloud: cloud(Vec::new(), &effective.header.frame_id, stamp, root.revision),
+        fine: Some(navigation_map_transfer::prepare(&sealed, output.prior.as_deref())?),
+        cloud: cloud(Vec::new(), &effective.header.frame_id, stamp, 0),
         ..Default::default()
     };
-    let bytes = schema::encode_navigation_map_3d_body(&message).map_err(|e| e.to_string())?;
+    send_navigation_map(transport, &message).await?;
+    let changed = output.prior.as_ref().is_none_or(|old| old.identity() != root.identity());
+    output.session_id = id;
+    output.frame_id = message.frame_id;
+    output.revision = revision;
+    output.prior = Some(root.clone());
+    Ok(Some((sealed, changed)))
+}
+
+async fn send_navigation_map(transport: &LcmTransport, message: &schema::NavigationMap3D) -> Result<(), String> {
+    let bytes = schema::encode_navigation_map_3d_body(message).map_err(|e| e.to_string())?;
     publish(
         transport,
         "NUWAX_LCM_CHANNEL_NAV_MAP3D",
@@ -183,8 +215,7 @@ async fn publish_map(
         "nuwax_msgs.NavigationMap3D",
         bytes,
     )
-    .await?;
-    Ok(Some(sealed))
+    .await
 }
 fn header(stamp: u64, frame: &str, revision: u64) -> schema::Header {
     schema::Header {

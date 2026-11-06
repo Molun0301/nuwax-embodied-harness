@@ -230,7 +230,7 @@ impl SessionHandle {
             config,
             store: Arc::new(store),
             save_sources: HashSet::new(),
-            next_session: 0,
+            next_session: now_ns(),
             lio: lio_tx,
             nav,
             explorer: None,
@@ -510,9 +510,10 @@ impl Session {
     }
     fn install(&mut self, mapper: Arc<Mapper>, phase: SessionPhase) {
         self.state.phase = phase as i32;
+        self.state.view_only = mapper.planar_view_only();
         self.route.send_replace(Some(Route {
             id: mapper.session_id(),
-            accept_frames: !mapper.planar_view_only(),
+            accept_frames: !self.state.view_only,
             mapper,
             map_pose: matches!(
                 phase,
@@ -562,6 +563,7 @@ impl Session {
         self.explorer = None;
         self.state.phase = SessionPhase::Idle as i32;
         self.state.map_name.clear();
+        self.state.view_only = false;
         self.state.reason.clear();
         self.state.exploration = None;
         self.state.relocalization = None;

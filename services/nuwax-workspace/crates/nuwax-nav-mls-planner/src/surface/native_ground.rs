@@ -363,10 +363,7 @@ mod tests {
         w.snapshot(
             Domain {
                 session: "native-ground-api".into(),
-                generation: 1,
-                frame_generation: 0,
-                producer_generation: 1,
-            },
+                },
             revision,
             20,
         )

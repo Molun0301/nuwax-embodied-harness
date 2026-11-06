@@ -28,8 +28,8 @@ impl Probe {
                 .attempts
                 .lock()
                 .unwrap()
-                .push((message.cloud_revision, received_at));
-            if message.cloud_revision == probe.failing_revision.load(Ordering::Acquire)
+                .push((message.revision, received_at));
+            if message.revision == probe.failing_revision.load(Ordering::Acquire)
                 && !probe.recover.load(Ordering::Acquire)
             {
                 let deadline = Instant::now() + Duration::from_secs(5);
@@ -103,8 +103,8 @@ async fn incomplete_refresh_retains_route_and_source_then_retries_atomically() {
     let probe = Probe::new();
     let (mut harness, initial, goal, revision) = active(&probe, Duration::ZERO).await;
     let mut first = map_message(
-        initial.cloud_revision + 1,
-        &initial.committed_map.session_id,
+        initial.revision + 1,
+        &initial.session_id,
     );
     first.virtual_obstacles = Some(virtual_mask(&first, false));
     harness.map(&first).await;
@@ -117,18 +117,18 @@ async fn incomplete_refresh_retains_route_and_source_then_retries_atomically() {
             .as_ref()
             .unwrap()
             .authority
-            .cloud_revision
-            == first.cloud_revision
+            .revision
+            == first.revision
     })
     .await;
     let retained = harness.hub.latest.lock().unwrap().as_ref().unwrap().clone();
-    let mut next = map_message(first.cloud_revision + 1, &first.committed_map.session_id);
+    let mut next = map_message(first.revision + 1, &first.session_id);
     next.virtual_obstacles = Some(virtual_mask(&next, false));
     probe
         .failing_revision
-        .store(next.cloud_revision, Ordering::Release);
+        .store(next.revision, Ordering::Release);
     harness.map(&next).await;
-    wait(|| probe.count(next.cloud_revision) == 1).await;
+    wait(|| probe.count(next.revision) == 1).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     let current = harness.hub.latest.lock().unwrap().as_ref().unwrap().clone();
     assert_eq!(current.authority, retained.authority);
@@ -149,7 +149,7 @@ async fn incomplete_refresh_retains_route_and_source_then_retries_atomically() {
     );
     assert!(harness.scheduler.status().costmap_receipt_age_ms >= 100);
     assert_eq!(
-        probe.count(next.cloud_revision),
+        probe.count(next.revision),
         1,
         "10ms owner tick must not busy-retry"
     );
@@ -163,8 +163,8 @@ async fn incomplete_refresh_retains_route_and_source_then_retries_atomically() {
             .as_ref()
             .unwrap()
             .authority
-            .cloud_revision
-            == next.cloud_revision
+            .revision
+            == next.revision
     })
     .await;
     let installed = harness.hub.latest.lock().unwrap().as_ref().unwrap().clone();
@@ -173,7 +173,7 @@ async fn incomplete_refresh_retains_route_and_source_then_retries_atomically() {
         .lock()
         .unwrap()
         .iter()
-        .filter(|(r, _)| *r == next.cloud_revision)
+        .filter(|(r, _)| *r == next.revision)
         .map(|(_, receipt)| *receipt)
         .collect();
     assert_eq!(receipts.len(), 2);
@@ -199,15 +199,15 @@ async fn incomplete_refresh_retains_route_and_source_then_retries_atomically() {
 async fn incomplete_refresh_retry_never_replaces_a_newer_pending_root() {
     let probe = Probe::new();
     let (mut harness, first, goal, _) = active(&probe, Duration::ZERO).await;
-    let incomplete = map_message(first.cloud_revision + 1, &first.committed_map.session_id);
+    let incomplete = map_message(first.revision + 1, &first.session_id);
     probe
         .failing_revision
-        .store(incomplete.cloud_revision, Ordering::Release);
+        .store(incomplete.revision, Ordering::Release);
     harness.map(&incomplete).await;
-    wait(|| probe.count(incomplete.cloud_revision) == 1).await;
+    wait(|| probe.count(incomplete.revision) == 1).await;
     let newer = map_message(
-        incomplete.cloud_revision + 1,
-        &first.committed_map.session_id,
+        incomplete.revision + 1,
+        &first.session_id,
     );
     harness.map(&newer).await;
     wait(|| {
@@ -219,13 +219,13 @@ async fn incomplete_refresh_retry_never_replaces_a_newer_pending_root() {
             .as_ref()
             .unwrap()
             .authority
-            .cloud_revision
-            == newer.cloud_revision
+            .revision
+            == newer.revision
     })
     .await;
     tokio::time::sleep(Duration::from_millis(1100)).await;
-    assert_eq!(probe.count(incomplete.cloud_revision), 1);
-    assert_eq!(probe.count(newer.cloud_revision), 1);
+    assert_eq!(probe.count(incomplete.revision), 1);
+    assert_eq!(probe.count(newer.revision), 1);
     assert_eq!(
         harness.scheduler.status().costmap_source_timestamp_ns,
         newer.source_timestamp_ns
@@ -239,12 +239,12 @@ async fn incomplete_refresh_retry_never_replaces_a_newer_pending_root() {
 async fn incomplete_refresh_does_not_launder_configured_source_expiry() {
     let probe = Probe::new();
     let (mut harness, first, _, _) = active(&probe, Duration::from_millis(500)).await;
-    let next = map_message(first.cloud_revision + 1, &first.committed_map.session_id);
+    let next = map_message(first.revision + 1, &first.session_id);
     probe
         .failing_revision
-        .store(next.cloud_revision, Ordering::Release);
+        .store(next.revision, Ordering::Release);
     harness.map(&next).await;
-    wait(|| probe.count(next.cloud_revision) >= 2).await;
+    wait(|| probe.count(next.revision) >= 2).await;
     let status = harness.scheduler.status();
     assert!(!status.planner_inputs_fresh);
     assert!(status.last_terminal.is_none() && status.session_id.is_some());
@@ -262,12 +262,12 @@ async fn incomplete_refresh_does_not_launder_configured_source_expiry() {
 async fn incomplete_refresh_recovery_does_not_resurrect_cancelled_goal() {
     let probe = Probe::new();
     let (mut harness, first, goal, _) = active(&probe, Duration::ZERO).await;
-    let next = map_message(first.cloud_revision + 1, &first.committed_map.session_id);
+    let next = map_message(first.revision + 1, &first.session_id);
     probe
         .failing_revision
-        .store(next.cloud_revision, Ordering::Release);
+        .store(next.revision, Ordering::Release);
     harness.map(&next).await;
-    wait(|| probe.count(next.cloud_revision) == 1).await;
+    wait(|| probe.count(next.revision) == 1).await;
     harness.cancel(&goal).await;
     harness.terminal(TerminalOutcome::Cancelled).await;
     let applied = harness.scheduler.status().applied_commands;
@@ -281,8 +281,8 @@ async fn incomplete_refresh_recovery_does_not_resurrect_cancelled_goal() {
             .as_ref()
             .unwrap()
             .authority
-            .cloud_revision
-            == next.cloud_revision
+            .revision
+            == next.revision
     })
     .await;
     assert!(
@@ -303,21 +303,21 @@ async fn incomplete_refresh_late_completion_cannot_cross_clear_or_domain_fence()
     for clear in [false, true] {
         let probe = Probe::new();
         let (mut harness, first, _, _) = active(&probe, Duration::ZERO).await;
-        let next = map_message(first.cloud_revision + 1, &first.committed_map.session_id);
+        let next = map_message(first.revision + 1, &first.session_id);
         probe
             .failing_revision
-            .store(next.cloud_revision, Ordering::Release);
+            .store(next.revision, Ordering::Release);
         probe.hold.store(true, Ordering::Release);
         harness.map(&next).await;
-        wait(|| probe.count(next.cloud_revision) == 1).await;
-        let mut fence = map_message(next.cloud_revision + 1, &first.committed_map.session_id);
+        wait(|| probe.count(next.revision) == 1).await;
+        let mut fence = map_message(next.revision + 1, &first.session_id);
         if clear {
             fence.cleared = true;
             fence.cloud.width = 0;
             fence.cloud.row_step = 0;
             fence.cloud.data.clear();
         } else {
-            fence.map_frame_generation += 1;
+            fence.session_id = "新地图会话".into();
         }
         harness.map(&fence).await;
         wait(|| {
@@ -329,8 +329,8 @@ async fn incomplete_refresh_late_completion_cannot_cross_clear_or_domain_fence()
                 .as_ref()
                 .unwrap()
                 .authority
-                .cloud_revision
-                == fence.cloud_revision
+                .revision
+                == fence.revision
         })
         .await;
         assert!(harness
@@ -343,9 +343,12 @@ async fn incomplete_refresh_late_completion_cannot_cross_clear_or_domain_fence()
             .snapshot
             .is_err());
         probe.hold.store(false, Ordering::Release);
-        wait(|| probe.count(fence.cloud_revision) == 1).await;
+        if !clear {
+            wait(|| probe.count(fence.revision) == 1).await;
+        }
         tokio::time::sleep(Duration::from_millis(1100)).await;
-        assert_eq!(probe.count(next.cloud_revision), 1);
+        assert_eq!(probe.count(fence.revision), usize::from(!clear));
+        assert_eq!(probe.count(next.revision), 1);
         assert_eq!(
             harness
                 .hub
@@ -355,8 +358,8 @@ async fn incomplete_refresh_late_completion_cannot_cross_clear_or_domain_fence()
                 .as_ref()
                 .unwrap()
                 .authority
-                .cloud_revision,
-            fence.cloud_revision
+                .revision,
+            fence.revision
         );
         assert_ne!(
             harness.scheduler.status().phase,
@@ -372,13 +375,13 @@ async fn incomplete_refresh_pauses_while_invalid_source_retires_route() {
     for invalid in [false, true] {
         let probe = Probe::new();
         let (mut harness, first, _, _) = active(&probe, Duration::ZERO).await;
-        let mut next = map_message(first.cloud_revision + 1, &first.committed_map.session_id);
+        let mut next = map_message(first.revision + 1, &first.session_id);
         if !invalid {
             next.virtual_obstacles = Some(virtual_mask(&next, true));
         }
         probe
             .failing_revision
-            .store(next.cloud_revision, Ordering::Release);
+            .store(next.revision, Ordering::Release);
         probe.invalid.store(invalid, Ordering::Release);
         harness.map(&next).await;
         wait(|| {
@@ -417,7 +420,7 @@ async fn incomplete_refresh_pauses_while_invalid_source_retires_route() {
         if invalid {
             tokio::time::sleep(Duration::from_millis(1100)).await;
             assert_eq!(
-                probe.count(next.cloud_revision),
+                probe.count(next.revision),
                 1,
                 "invalid input must not be retried"
             );
@@ -462,12 +465,12 @@ async fn incomplete_refresh_keeps_pose_and_recent_source_deadlines_independent()
     for recent in [false, true] {
         let probe = Probe::new();
         let (mut harness, first, _, _) = active(&probe, Duration::ZERO).await;
-        let next = map_message(first.cloud_revision + 1, &first.committed_map.session_id);
+        let next = map_message(first.revision + 1, &first.session_id);
         probe
             .failing_revision
-            .store(next.cloud_revision, Ordering::Release);
+            .store(next.revision, Ordering::Release);
         harness.map(&next).await;
-        wait(|| probe.count(next.cloud_revision) == 1).await;
+        wait(|| probe.count(next.revision) == 1).await;
         let now = current_unix_timestamp_ns().unwrap();
         if recent {
             // Same scheduler command bound installed by RecentSourceState;
@@ -498,7 +501,7 @@ async fn incomplete_refresh_keeps_pose_and_recent_source_deadlines_independent()
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         }).await.unwrap_or_else(|_| panic!("独立输入期限未保持 recent={recent}: {:?}", harness.scheduler.status()));
-        wait(|| probe.count(next.cloud_revision) >= 2).await;
+        wait(|| probe.count(next.revision) >= 2).await;
         assert_eq!(
             harness.scheduler.status().costmap_source_timestamp_ns,
             first.source_timestamp_ns

@@ -21,23 +21,12 @@ uint64_t __nuwax_msgs_NavigationMap3D_hash_recursive(const __lcm_hash_ptr *p)
     cp.v = __nuwax_msgs_NavigationMap3D_get_hash;
     (void) cp;
 
-    uint64_t hash = (uint64_t)0x467d85c9ae5bfda7LL
-         + __int32_t_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
+    uint64_t hash = (uint64_t)0xe54ec3305fbad7c1LL
          + __string_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
-         + __byte_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
          + __string_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
          + __float_hash_recursive(&cp)
-         + __byte_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
          + __int8_t_hash_recursive(&cp)
          + __int8_t_hash_recursive(&cp)
          + __nav_msgs_OccupancyGrid_hash_recursive(&cp)
@@ -69,52 +58,19 @@ int __nuwax_msgs_NavigationMap3D_encode_array(void *buf, int offset, int maxlen,
 
     for (element = 0; element < elements; element++) {
 
-        thislen = __int32_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].schema_version), 1);
+        thislen = __string_encode_array(buf, offset + pos, maxlen - pos, &(p[element].session_id), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].producer_runtime_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __string_encode_array(buf, offset + pos, maxlen - pos, &(p[element].map_session_id), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].map_session_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].occupancy_revision), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __byte_encode_array(buf, offset + pos, maxlen - pos, p[element].occupancy_commit_boot_nonce, 16);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].occupancy_commit_sequence), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].occupancy_source_timestamp_ns), 1);
+        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].revision), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __string_encode_array(buf, offset + pos, maxlen - pos, &(p[element].frame_id), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].map_frame_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].cloud_revision), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].cloud_occupancy_revision), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].source_timestamp_ns), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __float_encode_array(buf, offset + pos, maxlen - pos, &(p[element].source_voxel_size), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __byte_encode_array(buf, offset + pos, maxlen - pos, p[element].commit_boot_nonce, 16);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].commit_sequence), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int8_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].cleared), 1);
@@ -167,37 +123,15 @@ int __nuwax_msgs_NavigationMap3D_encoded_array_size(const nuwax_msgs_NavigationM
     int size = 0, element;
     for (element = 0; element < elements; element++) {
 
-        size += __int32_t_encoded_array_size(&(p[element].schema_version), 1);
+        size += __string_encoded_array_size(&(p[element].session_id), 1);
 
-        size += __int64_t_encoded_array_size(&(p[element].producer_runtime_generation), 1);
-
-        size += __string_encoded_array_size(&(p[element].map_session_id), 1);
-
-        size += __int64_t_encoded_array_size(&(p[element].map_session_generation), 1);
-
-        size += __int64_t_encoded_array_size(&(p[element].occupancy_revision), 1);
-
-        size += __byte_encoded_array_size(p[element].occupancy_commit_boot_nonce, 16);
-
-        size += __int64_t_encoded_array_size(&(p[element].occupancy_commit_sequence), 1);
-
-        size += __int64_t_encoded_array_size(&(p[element].occupancy_source_timestamp_ns), 1);
+        size += __int64_t_encoded_array_size(&(p[element].revision), 1);
 
         size += __string_encoded_array_size(&(p[element].frame_id), 1);
-
-        size += __int64_t_encoded_array_size(&(p[element].map_frame_generation), 1);
-
-        size += __int64_t_encoded_array_size(&(p[element].cloud_revision), 1);
-
-        size += __int64_t_encoded_array_size(&(p[element].cloud_occupancy_revision), 1);
 
         size += __int64_t_encoded_array_size(&(p[element].source_timestamp_ns), 1);
 
         size += __float_encoded_array_size(&(p[element].source_voxel_size), 1);
-
-        size += __byte_encoded_array_size(p[element].commit_boot_nonce, 16);
-
-        size += __int64_t_encoded_array_size(&(p[element].commit_sequence), 1);
 
         size += __int8_t_encoded_array_size(&(p[element].cleared), 1);
 
@@ -232,52 +166,19 @@ int __nuwax_msgs_NavigationMap3D_decode_array(const void *buf, int offset, int m
 
     for (element = 0; element < elements; element++) {
 
-        thislen = __int32_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].schema_version), 1);
+        thislen = __string_decode_array(buf, offset + pos, maxlen - pos, &(p[element].session_id), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].producer_runtime_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __string_decode_array(buf, offset + pos, maxlen - pos, &(p[element].map_session_id), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].map_session_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].occupancy_revision), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __byte_decode_array(buf, offset + pos, maxlen - pos, p[element].occupancy_commit_boot_nonce, 16);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].occupancy_commit_sequence), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].occupancy_source_timestamp_ns), 1);
+        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].revision), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __string_decode_array(buf, offset + pos, maxlen - pos, &(p[element].frame_id), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].map_frame_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].cloud_revision), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].cloud_occupancy_revision), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].source_timestamp_ns), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __float_decode_array(buf, offset + pos, maxlen - pos, &(p[element].source_voxel_size), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __byte_decode_array(buf, offset + pos, maxlen - pos, p[element].commit_boot_nonce, 16);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].commit_sequence), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int8_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].cleared), 1);
@@ -319,37 +220,15 @@ int __nuwax_msgs_NavigationMap3D_decode_array_cleanup(nuwax_msgs_NavigationMap3D
     int element;
     for (element = 0; element < elements; element++) {
 
-        __int32_t_decode_array_cleanup(&(p[element].schema_version), 1);
+        __string_decode_array_cleanup(&(p[element].session_id), 1);
 
-        __int64_t_decode_array_cleanup(&(p[element].producer_runtime_generation), 1);
-
-        __string_decode_array_cleanup(&(p[element].map_session_id), 1);
-
-        __int64_t_decode_array_cleanup(&(p[element].map_session_generation), 1);
-
-        __int64_t_decode_array_cleanup(&(p[element].occupancy_revision), 1);
-
-        __byte_decode_array_cleanup(p[element].occupancy_commit_boot_nonce, 16);
-
-        __int64_t_decode_array_cleanup(&(p[element].occupancy_commit_sequence), 1);
-
-        __int64_t_decode_array_cleanup(&(p[element].occupancy_source_timestamp_ns), 1);
+        __int64_t_decode_array_cleanup(&(p[element].revision), 1);
 
         __string_decode_array_cleanup(&(p[element].frame_id), 1);
-
-        __int64_t_decode_array_cleanup(&(p[element].map_frame_generation), 1);
-
-        __int64_t_decode_array_cleanup(&(p[element].cloud_revision), 1);
-
-        __int64_t_decode_array_cleanup(&(p[element].cloud_occupancy_revision), 1);
 
         __int64_t_decode_array_cleanup(&(p[element].source_timestamp_ns), 1);
 
         __float_decode_array_cleanup(&(p[element].source_voxel_size), 1);
-
-        __byte_decode_array_cleanup(p[element].commit_boot_nonce, 16);
-
-        __int64_t_decode_array_cleanup(&(p[element].commit_sequence), 1);
 
         __int8_t_decode_array_cleanup(&(p[element].cleared), 1);
 
@@ -401,37 +280,15 @@ int __nuwax_msgs_NavigationMap3D_clone_array(const nuwax_msgs_NavigationMap3D *p
     int element;
     for (element = 0; element < elements; element++) {
 
-        __int32_t_clone_array(&(p[element].schema_version), &(q[element].schema_version), 1);
+        __string_clone_array(&(p[element].session_id), &(q[element].session_id), 1);
 
-        __int64_t_clone_array(&(p[element].producer_runtime_generation), &(q[element].producer_runtime_generation), 1);
-
-        __string_clone_array(&(p[element].map_session_id), &(q[element].map_session_id), 1);
-
-        __int64_t_clone_array(&(p[element].map_session_generation), &(q[element].map_session_generation), 1);
-
-        __int64_t_clone_array(&(p[element].occupancy_revision), &(q[element].occupancy_revision), 1);
-
-        __byte_clone_array(p[element].occupancy_commit_boot_nonce, q[element].occupancy_commit_boot_nonce, 16);
-
-        __int64_t_clone_array(&(p[element].occupancy_commit_sequence), &(q[element].occupancy_commit_sequence), 1);
-
-        __int64_t_clone_array(&(p[element].occupancy_source_timestamp_ns), &(q[element].occupancy_source_timestamp_ns), 1);
+        __int64_t_clone_array(&(p[element].revision), &(q[element].revision), 1);
 
         __string_clone_array(&(p[element].frame_id), &(q[element].frame_id), 1);
-
-        __int64_t_clone_array(&(p[element].map_frame_generation), &(q[element].map_frame_generation), 1);
-
-        __int64_t_clone_array(&(p[element].cloud_revision), &(q[element].cloud_revision), 1);
-
-        __int64_t_clone_array(&(p[element].cloud_occupancy_revision), &(q[element].cloud_occupancy_revision), 1);
 
         __int64_t_clone_array(&(p[element].source_timestamp_ns), &(q[element].source_timestamp_ns), 1);
 
         __float_clone_array(&(p[element].source_voxel_size), &(q[element].source_voxel_size), 1);
-
-        __byte_clone_array(p[element].commit_boot_nonce, q[element].commit_boot_nonce, 16);
-
-        __int64_t_clone_array(&(p[element].commit_sequence), &(q[element].commit_sequence), 1);
 
         __int8_t_clone_array(&(p[element].cleared), &(q[element].cleared), 1);
 

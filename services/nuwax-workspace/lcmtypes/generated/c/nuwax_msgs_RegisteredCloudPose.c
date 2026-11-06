@@ -21,7 +21,7 @@ uint64_t __nuwax_msgs_RegisteredCloudPose_hash_recursive(const __lcm_hash_ptr *p
     cp.v = __nuwax_msgs_RegisteredCloudPose_get_hash;
     (void) cp;
 
-    uint64_t hash = (uint64_t)0xe3ddcc934b4bbe3eLL
+    uint64_t hash = (uint64_t)0x05d27ef473c5ed21LL
          + __double_hash_recursive(&cp)
          + __double_hash_recursive(&cp)
          + __double_hash_recursive(&cp)
@@ -57,7 +57,7 @@ int __nuwax_msgs_RegisteredCloudPose_encode_array(void *buf, int offset, int max
         thislen = __double_encode_array(buf, offset + pos, maxlen - pos, p[element].body_orientation_xyzw, 4);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].registration_correction_revision), 1);
+        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].paired_odometry_timestamp_ns), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
     }
@@ -89,7 +89,7 @@ int __nuwax_msgs_RegisteredCloudPose_encoded_array_size(const nuwax_msgs_Registe
 
         size += __double_encoded_array_size(p[element].body_orientation_xyzw, 4);
 
-        size += __int64_t_encoded_array_size(&(p[element].registration_correction_revision), 1);
+        size += __int64_t_encoded_array_size(&(p[element].paired_odometry_timestamp_ns), 1);
 
     }
     return size;
@@ -115,7 +115,7 @@ int __nuwax_msgs_RegisteredCloudPose_decode_array(const void *buf, int offset, i
         thislen = __double_decode_array(buf, offset + pos, maxlen - pos, p[element].body_orientation_xyzw, 4);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].registration_correction_revision), 1);
+        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].paired_odometry_timestamp_ns), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
     }
@@ -134,7 +134,7 @@ int __nuwax_msgs_RegisteredCloudPose_decode_array_cleanup(nuwax_msgs_RegisteredC
 
         __double_decode_array_cleanup(p[element].body_orientation_xyzw, 4);
 
-        __int64_t_decode_array_cleanup(&(p[element].registration_correction_revision), 1);
+        __int64_t_decode_array_cleanup(&(p[element].paired_odometry_timestamp_ns), 1);
 
     }
     return 0;
@@ -172,7 +172,7 @@ int __nuwax_msgs_RegisteredCloudPose_clone_array(const nuwax_msgs_RegisteredClou
 
         __double_clone_array(p[element].body_orientation_xyzw, q[element].body_orientation_xyzw, 4);
 
-        __int64_t_clone_array(&(p[element].registration_correction_revision), &(q[element].registration_correction_revision), 1);
+        __int64_t_clone_array(&(p[element].paired_odometry_timestamp_ns), &(q[element].paired_odometry_timestamp_ns), 1);
 
     }
     return 0;

@@ -4,6 +4,6 @@ struct RegisteredCloudPose {
     double sensor_origin_map[3];
     double body_position_map[3];
     double body_orientation_xyzw[4];
-    // 同帧注册绑定携带的修正代次，不从当前状态推算。
-    int64_t registration_correction_revision;
+    // 与本帧配对的原始里程计时间。
+    int64_t paired_odometry_timestamp_ns;
 }

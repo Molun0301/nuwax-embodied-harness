@@ -6,8 +6,7 @@ fn source_watermark_only_transfer_preserves_blocks_and_geometry() {
     let repository = Repository::temporary().unwrap();
     let mut writer = Writer::new(repository.clone(), 0.05, 4 * 1024 * 1024).unwrap();
     let mut reader = FineMapReader::new(String::new()).unwrap();
-    let domain = Domain { session: "watermark-only".into(), generation: 1,
-        frame_generation: 1, producer_generation: 1 };
+    let domain = Domain { session: "watermark-only".into(), };
     let source = Arc::new(LayerSource::Auxiliary { sensor_id: "depth-front".into(),
         clock_id: "camera-clock".into(), runtime_generation: 7, session_generation: 1 });
     let other_clock = Arc::new(LayerSource::Auxiliary { sensor_id: "depth-front".into(),
@@ -57,8 +56,7 @@ fn root_header_only_reuses_complete_observations() {
     let repository = Repository::temporary().unwrap();
     let mut writer = Writer::new(repository.clone(), 0.05, 4 * 1024 * 1024).unwrap();
     let mut reader = FineMapReader::new(String::new()).unwrap();
-    let domain = Domain { session: "header-only".into(), generation: 1,
-        frame_generation: 1, producer_generation: 1 };
+    let domain = Domain { session: "header-only".into(), };
     writer.observe([[0, 0, 0]], 90).unwrap();
     let first = writer.snapshot(domain.clone(), 1, 100).unwrap();
     let first = reader.receive(&transfer_message(&repository, &first)).unwrap();
@@ -84,8 +82,7 @@ fn root_header_no_block_mutation_still_completes_an_incomplete_baseline() {
     let repository = Repository::temporary().unwrap();
     let mut writer = Writer::new(repository.clone(), 0.05, 4 * 1024 * 1024).unwrap();
     let mut reader = FineMapReader::new(String::new()).unwrap();
-    let domain = Domain { session: "empty-header-completeness".into(), generation: 1,
-        frame_generation: 1, producer_generation: 1 };
+    let domain = Domain { session: "empty-header-completeness".into(), };
     let first = writer.snapshot(domain.clone(), 1, 100).unwrap();
     let first = reader.receive(&transfer_message(&repository, &first)).unwrap();
     // Intentional narrow API guard: the previous empty index has not been marked
@@ -119,7 +116,7 @@ fn heightfield_reader_native_members_metadata_withdrawal_and_retirement() {
         let mut writer=Writer::new(repo.clone(),0.05,4*1024*1024).unwrap();
         let mut reader=FineMapReader {receiver:Receiver::with_cache_budget(Repository::temporary().unwrap(),budget),
             client:None,compress_parts:true,lcm_url:String::new()};
-        let domain=Domain {session:"hf-reader".into(),generation:1,frame_generation:1,producer_generation:1};
+        let domain=Domain {session:"hf-reader".into(),};
         let mut previous:Option<(Arc<Manifest>,Arc<nuwax_nav_mls_planner::SurfaceObservations>)>=None;
         let mut pinned=None;
         for revision in 1..=5 {
@@ -168,7 +165,7 @@ fn heightfield_reader_preserves_cross_block_height_and_reanchor() {
         [(-1,[1,0,0,0,0,0,0,0]),(32,[1,0,0,0,0,0,0,0])].into()).unwrap().unwrap();
     let h=column.height();writer.replace_ground_column([0,0],&ColumnGroundRecords {classified_empty: false,
         heightfields:vec![HeightfieldSurface {column,samples:vec![]}]}).unwrap();
-    let root=writer.snapshot(Domain {session:"mixed-reader".into(),generation:1,frame_generation:1,producer_generation:1},1,20).unwrap();
+    let root=writer.snapshot(Domain {session:"mixed-reader".into(),},1,20).unwrap();
     let mut reader=FineMapReader::new(String::new()).unwrap();let root=reader.receive(&transfer_message(&repo,&root)).unwrap();
     let source=reader.observations(&root,None).unwrap();
     let native=source.ground_record(GroundKey::HeightfieldV1([0,0,-1])).unwrap();
@@ -189,7 +186,7 @@ fn heightfield_reader_duplicate_and_header_only_keep_observation_owner() {
     let repo=Repository::temporary().unwrap();let mut writer=Writer::new(repo.clone(),0.05,4*1024*1024).unwrap();
     writer.observe([[0,0,0],[0,0,32],[0,0,64]],20).unwrap();
     writer.replace_ground_column([0,0],&hf_test_column([0,0],[0.75,0.25,0.,0.,0.,0.,0.,0.],true)).unwrap();
-    let domain=Domain {session:"hf-header".into(),generation:1,frame_generation:1,producer_generation:1};
+    let domain=Domain {session:"hf-header".into(),};
     let root=writer.snapshot(domain.clone(),1,20).unwrap();let mut reader=FineMapReader::new(String::new()).unwrap();
     let first=reader.receive(&transfer_message(&repo,&root)).unwrap();let source=reader.observations(&first,None).unwrap();
     let (same,delta)=reader.observations_with_changes(&first,Some((&first,&source))).unwrap();
@@ -210,8 +207,7 @@ fn heightfield_reader_accepts_same_block_fragments_without_losing_members() {
         (0..4).map(|z| (z, [1,0,0,0,0,0,0,0])).collect()).unwrap().unwrap();
     writer.replace_ground_column([0,0], &ColumnGroundRecords { classified_empty: false,
         heightfields: vec![HeightfieldSurface { column, samples: vec![] }] }).unwrap();
-    let root = writer.snapshot(Domain { session: "same-block-fragments".into(), generation: 1,
-        frame_generation: 1, producer_generation: 1 }, 1, 20).unwrap();
+    let root = writer.snapshot(Domain { session: "same-block-fragments".into(), }, 1, 20).unwrap();
     let mut region = RegionReader::new(repo.clone(), 0);
     let (block, records) = region.ground_parts(&root.blocks[0]).unwrap();
     let GroundRecordRef::HeightfieldV1(original) = records.get(0).unwrap() else { panic!("native fixture"); };
@@ -251,7 +247,7 @@ fn heightfield_reader_accepts_same_block_fragments_without_losing_members() {
 fn classified_empty_reader_delta_survives_last_claim_and_cold_restore() {
     let repo=Repository::temporary().unwrap();let mut writer=Writer::new(repo.clone(),0.05,4*1024*1024).unwrap();
     writer.observe([[0,0,0],[1,0,0]],20).unwrap();
-    let domain=Domain{session:"empty-column-reader".into(),generation:1,frame_generation:0,producer_generation:1};
+    let domain=Domain{session:"empty-column-reader".into(),};
     let root=writer.snapshot(domain.clone(),1,20).unwrap();
     let mut reader=FineMapReader::new(String::new()).unwrap();
     let before=reader.receive(&transfer_message(&repo,&root)).unwrap();

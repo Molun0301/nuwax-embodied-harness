@@ -71,7 +71,7 @@ fn bl5_rejects_truncation_counts_tags_trailing_and_invalid_float_without_panicki
 fn failed_block_preserves_previous_root_and_retry_clears_typed_failure() {
     let repo = Repository::temporary().unwrap();
     let mut writer = Writer::new(repo.clone(), 0.05, MAX_BLOCK_BYTES).unwrap();
-    let domain = Domain { session: "failure".into(), generation: 1, frame_generation: 0, producer_generation: 1 };
+    let domain = Domain { session: "failure".into(), };
     writer.observe([[0,0,0]], 1).unwrap();
     let before = writer.snapshot(domain.clone(), 1, 1).unwrap();
     let old = repo.read_object(before.blocks[0].object, MAX_BLOCK_BYTES).unwrap();

@@ -85,7 +85,7 @@ async fn registered_stream_diagnostic(occlusion_consistent:bool) {
         let bound=CommandDispatchBound::from_source_timestamp(stamp,Duration::from_millis(250));
         let mut frame=(*crate::registered_frame::test_frame(tick+1)).clone();
         frame.identity.timestamp_ns=stamp as i64;frame.points_world=points.into();
-        frame.paired_odometry_timestamp_ns=stamp as i64;frame.paired_odometry_sequence=tick+1;
+        frame.paired_odometry_timestamp_ns=stamp as i64;
         frame.dispatch_bound=Some(bound);
         handle.update_registered_obstacle_source(Some(ExecutionMap::SurfaceUpdate(crate::surface_changes::SurfaceMapUpdate {
             snapshot:next.clone(),change_basis:Some(snapshot),changes:Arc::new(crate::surface_changes::SurfaceGeometryChanges::Empty),

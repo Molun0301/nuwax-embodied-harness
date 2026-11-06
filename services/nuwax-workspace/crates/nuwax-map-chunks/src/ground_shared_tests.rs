@@ -24,7 +24,7 @@ fn dense(layers: u16) -> (Block, GroundRecords, Arc<LayerSource>) {
     (block,GroundRecords::Versioned(Arc::new(records)),source)
 }
 fn root(object:ObjectIdentity, points:usize, sources:Vec<Arc<LayerSource>>) -> Manifest {
-    Manifest {version:5,domain:Domain{session:"worst-ground".into(),generation:1,frame_generation:0,producer_generation:1},
+    Manifest {version:5,domain:Domain{session:"worst-ground".into(),},
         revision:1,geometry_revision:1,source_timestamp_ns:STAMP,voxel_size_m:Q,
         blocks:vec![BlockRef {key:[0,0,0],object,points:points as u32,block_revision:1,geometry_revision:1}],
         source_watermarks:sources.into_iter().map(|source|SourceWatermark {source,source_sequence:32,source_timestamp_ns:STAMP}).collect()}

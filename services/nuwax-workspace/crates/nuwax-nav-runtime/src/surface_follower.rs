@@ -433,7 +433,6 @@ impl SurfaceFollower {
                 self.native_planner.ingest_registered_frame_with_ground(&config,&frame.points_world,&frame.ground_point_indices,
                     frame.sensor_origin_world,frame.body_position_world,frame.identity.timestamp_ns)?;
                 tracing::debug!(target:"navigation.registered_frame", source=?frame.identity,
-                    paired_odometry_sequence=frame.paired_odometry_sequence,
                     paired_odometry_timestamp_ns=frame.paired_odometry_timestamp_ns,
                     body_orientation_xyzw=?frame.body_orientation_xyzw,
                     "原始world注册点仅注入一次；同帧sensor origin和body pose，不二次变换");
@@ -860,7 +859,7 @@ mod native_execution_tests {
         assert_eq!(follower.frame_ingestion_count,1);
         assert_eq!(follower.registered_frame.as_ref().unwrap().points_world.as_ref(),frame.points_world.as_ref());
         let mut next=(*crate::registered_frame::test_frame(2)).clone();
-        next.identity.domain.runtime_generation+=1;
+        next.identity.domain.session_id.push_str("-new");
         follower.observe_registered_frame(Some(Arc::new(next)));
         assert!(follower.ingested_frame.is_none());
         let _=follower.compute();

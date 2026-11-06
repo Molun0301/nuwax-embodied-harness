@@ -136,6 +136,7 @@ def _snapshot(value) -> GeometrySnapshot:
         RuntimeInfo(info.pipeline, info.map_frame_id, info.odom_frame_id, info.base_frame_id,
                     info.planar_input_config_json, info.planar_unix_offset_ns),
         _navigation(value.previous_navigation) if value.HasField("previous_navigation") else None,
+        view_only=value.view_only,
     )
 
 

@@ -7,8 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let repository = Repository::temporary()?;
         let mut writer = Writer::new(repository.clone(), 0.025, 4 * 1024 * 1024)?;
         writer.observe([[-1, -1, -1], [0, 0, 6], [4000, 4000, 6]], 1_000_008)?;
-        let root = writer.snapshot(Domain { session: "mapping-session-a".into(), generation: 4,
-            frame_generation: 2, producer_generation: 19 }, 70, 1_000_008)?;
+        let root = writer.snapshot(Domain { session: "mapping-session-a".into(), }, 70, 1_000_008)?;
         let (mut source, _) = archive_file(&root, &repository)?;
         let mut output = std::fs::File::create(path)?;
         std::io::copy(&mut source, &mut output)?;

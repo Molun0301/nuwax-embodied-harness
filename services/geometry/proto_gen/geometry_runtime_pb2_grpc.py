@@ -266,7 +266,7 @@ class GeometryRuntimeServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def LoadMap(self, request, context):
-        """加载已保存地图作为定位基准，阶段 = 已加载未定位；之后调用 Relocalize。
+        """加载已保存地图，阶段 = 已加载未定位。view_only 为真时只可查看，其余地图可调用 Relocalize。
         任何状态都允许，先结束当前状态。地图不存在 → NOT_FOUND；文件损坏 → DATA_LOSS（原因写明文件）。
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)

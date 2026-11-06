@@ -9,46 +9,34 @@ import struct
 
 import nuwax_msgs
 
+import sensor_msgs
+
 class RecentCloud3D(object):
-    """ Independent live admitted observations; never a persistent map revision. """
+    """ 当前会话的即时观测，不更新持久地图。 """
 
-    __slots__ = ["schema_version", "producer_runtime_generation", "session_id", "session_generation", "map_frame_generation", "commit_boot_nonce", "cleared", "registration_count", "registration", "ground_point_count", "ground_point_indices", "cloud_bytes_count", "cloud_bytes"]
+    __slots__ = ["session_id", "sequence", "cleared", "registration_count", "registration", "ground_point_count", "ground_point_indices", "cloud"]
 
-    __typenames__ = ["int32_t", "int64_t", "string", "int64_t", "int64_t", "byte", "int8_t", "int32_t", "nuwax_msgs.RegisteredCloudPose", "int32_t", "int32_t", "int32_t", "byte"]
+    __typenames__ = ["string", "int64_t", "int8_t", "int32_t", "nuwax_msgs.RegisteredCloudPose", "int32_t", "int32_t", "sensor_msgs.PointCloud2"]
 
-    __dimensions__ = [None, None, None, None, None, [16], None, None, ["registration_count"], None, ["ground_point_count"], None, ["cloud_bytes_count"]]
+    __dimensions__ = [None, None, None, None, ["registration_count"], None, ["ground_point_count"], None]
 
     def __init__(self):
-        self.schema_version = 0
-        """ LCM Type: int32_t """
-        self.producer_runtime_generation = 0
-        """ LCM Type: int64_t """
         self.session_id = ""
         """ LCM Type: string """
-        self.session_generation = 0
+        self.sequence = 0
         """ LCM Type: int64_t """
-        self.map_frame_generation = 0
-        """ LCM Type: int64_t """
-        self.commit_boot_nonce = b""
-        """ LCM Type: byte[16] """
         self.cleared = 0
         """ LCM Type: int8_t """
         self.registration_count = 0
-        """
-        v2: 0 表示原点未知或撤销；1 表示同帧真实配对，禁止补零。
-        LCM Type: int32_t
-        """
-
+        """ LCM Type: int32_t """
         self.registration = []
         """ LCM Type: nuwax_msgs.RegisteredCloudPose[registration_count] """
         self.ground_point_count = 0
         """ LCM Type: int32_t """
         self.ground_point_indices = []
         """ LCM Type: int32_t[ground_point_count] """
-        self.cloud_bytes_count = 0
-        """ LCM Type: int32_t """
-        self.cloud_bytes = b""
-        """ LCM Type: byte[cloud_bytes_count] """
+        self.cloud = sensor_msgs.PointCloud2()
+        """ LCM Type: sensor_msgs.PointCloud2 """
 
     def encode(self):
         buf = BytesIO()
@@ -57,21 +45,18 @@ class RecentCloud3D(object):
         return buf.getvalue()
 
     def _encode_one(self, buf):
-        buf.write(struct.pack(">iq", self.schema_version, self.producer_runtime_generation))
         __session_id_encoded = self.session_id.encode('utf-8')
         buf.write(struct.pack('>I', len(__session_id_encoded)+1))
         buf.write(__session_id_encoded)
         buf.write(b"\0")
-        buf.write(struct.pack(">qq", self.session_generation, self.map_frame_generation))
-        buf.write(bytearray(self.commit_boot_nonce[:16]))
-        buf.write(struct.pack(">bi", self.cleared, self.registration_count))
+        buf.write(struct.pack(">qbi", self.sequence, self.cleared, self.registration_count))
         for i0 in range(self.registration_count):
             assert self.registration[i0]._get_packed_fingerprint() == nuwax_msgs.RegisteredCloudPose._get_packed_fingerprint()
             self.registration[i0]._encode_one(buf)
         buf.write(struct.pack(">i", self.ground_point_count))
         buf.write(struct.pack('>%di' % self.ground_point_count, *self.ground_point_indices[:self.ground_point_count]))
-        buf.write(struct.pack(">i", self.cloud_bytes_count))
-        buf.write(bytearray(self.cloud_bytes[:self.cloud_bytes_count]))
+        assert self.cloud._get_packed_fingerprint() == sensor_msgs.PointCloud2._get_packed_fingerprint()
+        self.cloud._encode_one(buf)
 
     @staticmethod
     def decode(data: bytes):
@@ -86,26 +71,22 @@ class RecentCloud3D(object):
     @staticmethod
     def _decode_one(buf):
         self = RecentCloud3D()
-        self.schema_version, self.producer_runtime_generation = struct.unpack(">iq", buf.read(12))
         __session_id_len = struct.unpack('>I', buf.read(4))[0]
         self.session_id = buf.read(__session_id_len)[:-1].decode('utf-8', 'replace')
-        self.session_generation, self.map_frame_generation = struct.unpack(">qq", buf.read(16))
-        self.commit_boot_nonce = buf.read(16)
-        self.cleared, self.registration_count = struct.unpack(">bi", buf.read(5))
+        self.sequence, self.cleared, self.registration_count = struct.unpack(">qbi", buf.read(13))
         self.registration = []
         for i0 in range(self.registration_count):
             self.registration.append(nuwax_msgs.RegisteredCloudPose._decode_one(buf))
         self.ground_point_count = struct.unpack(">i", buf.read(4))[0]
         self.ground_point_indices = struct.unpack('>%di' % self.ground_point_count, buf.read(self.ground_point_count * 4))
-        self.cloud_bytes_count = struct.unpack(">i", buf.read(4))[0]
-        self.cloud_bytes = buf.read(self.cloud_bytes_count)
+        self.cloud = sensor_msgs.PointCloud2._decode_one(buf)
         return self
 
     @staticmethod
     def _get_hash_recursive(parents):
         if RecentCloud3D in parents: return 0
         newparents = parents + [RecentCloud3D]
-        tmphash = (0x7fb76b6a7b9abea7+ nuwax_msgs.RegisteredCloudPose._get_hash_recursive(newparents)) & 0xffffffffffffffff
+        tmphash = (0x2f6848a33e798931+ nuwax_msgs.RegisteredCloudPose._get_hash_recursive(newparents)+ sensor_msgs.PointCloud2._get_hash_recursive(newparents)) & 0xffffffffffffffff
         tmphash  = (((tmphash<<1)&0xffffffffffffffff) + (tmphash>>63)) & 0xffffffffffffffff
         return tmphash
     _packed_fingerprint = None

@@ -10,7 +10,7 @@ import struct
 class RegisteredCloudPose(object):
     """ 与同一帧已注册点云冻结配对；四元数是机体姿态，不是传感器姿态。 """
 
-    __slots__ = ["sensor_origin_map", "body_position_map", "body_orientation_xyzw", "registration_correction_revision"]
+    __slots__ = ["sensor_origin_map", "body_position_map", "body_orientation_xyzw", "paired_odometry_timestamp_ns"]
 
     __typenames__ = ["double", "double", "double", "int64_t"]
 
@@ -23,9 +23,9 @@ class RegisteredCloudPose(object):
         """ LCM Type: double[3] """
         self.body_orientation_xyzw = [ 0.0 for dim0 in range(4) ]
         """ LCM Type: double[4] """
-        self.registration_correction_revision = 0
+        self.paired_odometry_timestamp_ns = 0
         """
-        同帧注册绑定携带的修正代次，不从当前状态推算。
+        与本帧配对的原始里程计时间。
         LCM Type: int64_t
         """
 
@@ -40,7 +40,7 @@ class RegisteredCloudPose(object):
         buf.write(struct.pack('>3d', *self.sensor_origin_map[:3]))
         buf.write(struct.pack('>3d', *self.body_position_map[:3]))
         buf.write(struct.pack('>4d', *self.body_orientation_xyzw[:4]))
-        buf.write(struct.pack(">q", self.registration_correction_revision))
+        buf.write(struct.pack(">q", self.paired_odometry_timestamp_ns))
 
     @staticmethod
     def decode(data: bytes):
@@ -58,13 +58,13 @@ class RegisteredCloudPose(object):
         self.sensor_origin_map = struct.unpack('>3d', buf.read(24))
         self.body_position_map = struct.unpack('>3d', buf.read(24))
         self.body_orientation_xyzw = struct.unpack('>4d', buf.read(32))
-        self.registration_correction_revision = struct.unpack(">q", buf.read(8))[0]
+        self.paired_odometry_timestamp_ns = struct.unpack(">q", buf.read(8))[0]
         return self
 
     @staticmethod
     def _get_hash_recursive(parents):
         if RegisteredCloudPose in parents: return 0
-        tmphash = (0xe3ddcc934b4bbe3e) & 0xffffffffffffffff
+        tmphash = (0x5d27ef473c5ed21) & 0xffffffffffffffff
         tmphash  = (((tmphash<<1)&0xffffffffffffffff) + (tmphash>>63)) & 0xffffffffffffffff
         return tmphash
     _packed_fingerprint = None

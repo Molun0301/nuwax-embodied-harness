@@ -1,18 +1,12 @@
 package nuwax_msgs;
-// Independent live admitted observations; never a persistent map revision.
+// 当前会话的即时观测，不更新持久地图。
 struct RecentCloud3D {
-    int32_t schema_version;
-    int64_t producer_runtime_generation;
     string session_id;
-    int64_t session_generation;
-    int64_t map_frame_generation;
-    byte commit_boot_nonce[16];
+    int64_t sequence;
     int8_t cleared;
-    // v2: 0 表示原点未知或撤销；1 表示同帧真实配对，禁止补零。
     int32_t registration_count;
     RegisteredCloudPose registration[registration_count];
     int32_t ground_point_count;
     int32_t ground_point_indices[ground_point_count];
-    int32_t cloud_bytes_count;
-    byte cloud_bytes[cloud_bytes_count];
+    sensor_msgs.PointCloud2 cloud;
 }

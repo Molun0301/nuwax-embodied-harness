@@ -28,6 +28,8 @@ pub(crate) use fine_cloud::{
 use paged_voxel_snapshot::{PagedVoxelSnapshot, CHUNK_POINTS};
 
 pub const VOXEL_SIZE: f32 = 0.05;
+// 录制文件格式保留已有会话字段；导航地图无需依赖它。
+pub(crate) const SCAN_LOG_GENERATION: u64 = 1;
 const DEFAULT_CLOUDMAP_SHM_PATH: &str = include_str!("../proto/cloudmap_shm_path.txt");
 pub const POINTCLOUD_MAX_FRAME_POINTS: usize = 100_000;
 pub const POINTCLOUD_MAX_POINT_STEP_BYTES: u32 = 256;
@@ -293,7 +295,7 @@ impl CloudMap {
                     &root,
                     Session {
                         session_id: self.session_id.to_string(),
-                        generation: 1,
+                        generation: SCAN_LOG_GENERATION,
                     },
                 )?,
             );
@@ -573,10 +575,7 @@ impl CloudMap {
 fn domain(session_id: u64) -> nuwax_map_chunks::Domain {
     nuwax_map_chunks::Domain {
         session: session_id.to_string(),
-        generation: 1,
-        frame_generation: 0,
-        producer_generation: 1,
-    }
+        }
 }
 pub fn cloud_map_shm_path() -> PathBuf {
     std::env::var_os("NUWAX_CLOUDMAP_SHM_PATH")

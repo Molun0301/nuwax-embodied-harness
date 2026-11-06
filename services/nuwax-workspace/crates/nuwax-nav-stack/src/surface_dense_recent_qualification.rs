@@ -1,7 +1,7 @@
 // Separate opt-in load case: the original scene and all original motion oracles
 // remain unchanged. Only newly acquired recent ground-return density increases.
 use super::*;
-use nuwax_codec::lcm::{lio,recent_cloud};
+use nuwax_codec::lcm::recent_cloud;
 
 const GROUND_RETURNS: usize = 96_000;
 const INSERTED_RETURNS: usize = GROUND_RETURNS + 1_824;
@@ -12,7 +12,7 @@ pub(super) struct PublishedDenseScan {
     encode_publish_ms:f64,
 }
 
-fn packet(map:&schema::NavigationMap3D,sequence:i32,stamp:i64,pose_stamp:i64,
+fn packet(map:&schema::NavigationMap3D,sequence:i32,stamp:i64,_pose_stamp:i64,
     scene:Scene,stage:Stage)->recent_cloud::RecentCloud3D {
     assert_eq!(scene,Scene::Box,"this new load is defined only for the original box");
     let count=if stage==Stage::Clear {GROUND_RETURNS}else{INSERTED_RETURNS};
@@ -45,19 +45,8 @@ fn packet(map:&schema::NavigationMap3D,sequence:i32,stamp:i64,pose_stamp:i64,
     };
     recent_cloud::RecentCloud3D {
         registration:None,
-        producer_runtime_generation:map.producer_runtime_generation,
-        session_id:map.committed_map.session_id.clone(),
-        session_generation:map.committed_map.session_generation,
-        map_frame_generation:map.map_frame_generation,commit_boot_nonce:map.committed_map.commit_boot_nonce,
-        ground_point_indices,cloud:Some(lio::LioCloudEnvelope {
-            schema_version:1,backend:lio::LIO_BACKEND_DEVICE,runtime_generation:17,
-            source_sequence:i64::from(sequence),source_timestamp_ns:stamp,
-            correlated_odometry_source_sequence:i64::from(sequence),correlated_odometry_source_timestamp_ns:pose_stamp,
-            sensor_frame_id:"synthetic_sensor".into(),body_frame_id:"base_link".into(),
-            odom_frame_id:"odom".into(),map_frame_id:"map".into(),
-            registration_state:lio::LIO_REGISTRATION_REGISTERED_MAP,
-            source_point_count:count as i64,emitted_point_count:count as i64,cloud,
-        }),
+        session_id:map.session_id.clone(),
+        ground_point_indices,sequence: i64::from(sequence), cloud: Some(cloud),
     }
 }
 
@@ -65,7 +54,7 @@ pub(super) async fn publish(transport:&LcmTransport,map:&schema::NavigationMap3D
     sequence:i32,stamp:i64,pose_stamp:i64,scene:Scene,stage:Stage)->PublishedDenseScan {
     let started=Instant::now();
     let packet=packet(map,sequence,stamp,pose_stamp,scene,stage);
-    let points=packet.cloud.as_ref().unwrap().emitted_point_count as usize;
+    let points=packet.cloud.as_ref().unwrap().width as usize;
     let ground=packet.ground_point_indices.len();
     let body=recent_cloud::encode_body(&packet).unwrap();
     let bytes=body.len();
@@ -88,8 +77,7 @@ fn dense_box_scene_wire_preflight() {
         let stamp=current_unix_timestamp_ns().unwrap();
         let keys=scene_keys(Scene::Box,stage);
         writer.observe(keys.iter().copied(),stamp as u64).unwrap();
-        let root=writer.snapshot(Domain {session:"dense-box-preflight".into(),generation:1,
-            frame_generation:1,producer_generation:17},index as u64+1,stamp as u64).unwrap();
+        let root=writer.snapshot(Domain {session:"dense-box-preflight".into(),},index as u64+1,stamp as u64).unwrap();
         let map=map_from_fine(&root,&repository);
         let packet=packet(&map,index as i32+1,stamp,stamp,Scene::Box,stage);
         let body=recent_cloud::encode_body(&packet).unwrap();
@@ -98,11 +86,10 @@ fn dense_box_scene_wire_preflight() {
         assert_eq!(decoded,packet);
         let cloud=decoded.cloud.as_ref().unwrap();
         let expected=if stage==Stage::Clear {GROUND_RETURNS}else{INSERTED_RETURNS};
-        assert_eq!(cloud.emitted_point_count,expected as i64);
-        assert_eq!(cloud.source_point_count,expected as i64);
-        assert!(cloud.emitted_point_count<=lio::MAX_LIO_EMITTED_POINT_COUNT);
+        assert_eq!(i64::from(cloud.width),expected as i64);
+        assert!(i64::from(cloud.width)<=nuwax_codec::lcm::lio::MAX_LIO_EMITTED_POINT_COUNT);
         assert_eq!(decoded.ground_point_indices,(0..GROUND_RETURNS as u32).collect::<Vec<_>>());
-        let materialized=point_cloud_from_schema(cloud.cloud.clone()).unwrap();
+        let materialized=point_cloud_from_schema(cloud.clone()).unwrap();
         assert_eq!(materialized.points.len(),expected);
         let mut actual=BTreeSet::new();let mut ground_cells=BTreeMap::<[i32;3],usize>::new();
         let mut unique=BTreeSet::new();

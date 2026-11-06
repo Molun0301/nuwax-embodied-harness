@@ -16,10 +16,7 @@ fn repeated_dense_observations_keep_ground_records_bounded() {
         });
         let domain = Domain {
             session: "dense-ground-budget".into(),
-            generation: 1,
-            frame_generation: 0,
-            producer_generation: 1,
-        };
+            };
         let mut plateau_bytes = None;
         let mut exceeded_old = false;
         for frame in 1..=160_u64 {

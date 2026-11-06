@@ -184,12 +184,11 @@ impl ObjectIdentity {
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Domain { pub session: String, pub generation: u64, pub frame_generation: u64, pub producer_generation: u64 }
+pub struct Domain { pub session: String }
 impl Domain {
     pub fn validate(&self) -> Result<(), String> {
         if self.session.is_empty() || self.session.len() > 1024 || self.session.trim() != self.session
-            || self.session.chars().any(char::is_control) || self.generation == 0 || self.producer_generation == 0 {
+            || self.session.chars().any(char::is_control) {
             Err("invalid root domain".into())
         } else { Ok(()) }
     }
@@ -265,24 +264,7 @@ pub struct SealedMap { root: Arc<Manifest>, pub repository: Repository }
 impl SealedMap {
     pub fn manifest(&self) -> &Arc<Manifest> { &self.root }
 
-    /// Rebind an immutable publication to the immediately following frame.
-    /// Only domain-local revision metadata changes; object bytes and the source
-    /// evidence bound are retained without reading, encoding or writing objects.
-    pub fn rehome_frame(&self, expected: &RootIdentity, new_frame: u64) -> Result<Self, String> {
-        if self.root.identity() != *expected { return Err("frame rehome root identity is stale".into()); }
-        let next_frame = self.root.domain.frame_generation.checked_add(1)
-            .ok_or("frame generation overflow")?;
-        if new_frame != next_frame { return Err("frame rehome requires the next generation".into()); }
-        self.root.validate()?;
-        let mut root = (*self.root).clone();
-        root.domain.frame_generation = new_frame;
-        root.geometry_revision = root.revision;
-        for block in &mut root.blocks {
-            block.block_revision = root.revision;
-            block.geometry_revision = root.revision;
-        }
-        Ok(Self { root: Arc::new(root), repository: self.repository.clone() })
-    }
+
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transfer { pub root: Vec<u8>, pub included: BTreeMap<ObjectIdentity, Vec<u8>> }

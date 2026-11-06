@@ -11,7 +11,6 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'services/nuwax-workspace/lcmtypes/generated/python'))
 from nuwax_msgs.RecentCloud3D import RecentCloud3D
-from nuwax_msgs.LioCloudEnvelope import LioCloudEnvelope
 import lcm
 
 
@@ -41,8 +40,7 @@ def main():
             recent = RecentCloud3D.decode(payload)
             if recent.cleared:
                 return
-            cloud = LioCloudEnvelope.decode(bytes(recent.cloud_bytes))
-            packet = cloud.cloud
+            packet = recent.cloud
             offsets = {field.name: field.offset for field in packet.fields}
             indices = []
             points = []
@@ -59,16 +57,15 @@ def main():
                     points.append(point)
                 if key == target:
                     target_indices.append(index)
-            frame = {'sequence': cloud.source_sequence, 'timestamp_ns': cloud.source_timestamp_ns,
-                     'source': {'kind': 'lidar', 'backend': cloud.backend,
-                                'runtime_generation': cloud.runtime_generation, 'sensor_frame_id': cloud.sensor_frame_id},
-                     'session_id': recent.session_id, 'map_frame_generation': recent.map_frame_generation,
+            frame = {'sequence': recent.sequence, 'timestamp_ns': packet.header.stamp.sec * 10**9 + packet.header.stamp.nsec,
+                     'source': {'kind': 'lidar', 'frame_id': packet.header.frame_id},
+                     'session_id': recent.session_id,
                      'points': points, 'indices': indices, 'published_ground_indices': list(recent.ground_point_indices),
                      'target_indices': target_indices,
                      'unclassified_target_indices': [index for index in target_indices if index not in ground]}
             frames.write(json.dumps(frame, ensure_ascii=False) + '\n')
             frames.flush()
-            (args.output / f'{len(records):04d}_{cloud.source_sequence}.lcm').write_bytes(payload)
+            (args.output / f'{len(records):04d}_{recent.sequence}.lcm').write_bytes(payload)
             summary = {key: frame[key] for key in ('sequence', 'timestamp_ns', 'target_indices', 'unclassified_target_indices')}
             summary.update(channel=channel, emitted_points=cloud.emitted_point_count,
                            ground_points=len(ground), patch_points=len(points))

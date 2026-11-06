@@ -5,10 +5,7 @@ use std::io::{Read, Seek, SeekFrom};
 fn domain() -> Domain {
     Domain {
         session: "source-provenance".into(),
-        generation: 1,
-        frame_generation: 0,
-        producer_generation: 1,
-    }
+        }
 }
 
 fn lidar() -> Arc<LayerSource> {

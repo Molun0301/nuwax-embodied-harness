@@ -18,47 +18,22 @@ extern "C" {
 #include "nav_msgs_OccupancyGrid.h"
 #include "nuwax_msgs_NavigationMapBlock.h"
 #include "sensor_msgs_PointCloud2.h"
-#define NUWAX_MSGS_NAVIGATIONMAP3D_SCHEMA_VERSION_V4 4
-
 typedef struct _nuwax_msgs_NavigationMap3D nuwax_msgs_NavigationMap3D;
 struct _nuwax_msgs_NavigationMap3D
 {
-    int32_t    schema_version;
-    int64_t    producer_runtime_generation;
 
     /**
      * LCM Type: string
      */
-    char*      map_session_id;
-    int64_t    map_session_generation;
-    int64_t    occupancy_revision;
-
-    /**
-     * LCM Type: byte[16]
-     */
-    uint8_t    occupancy_commit_boot_nonce[16];
-    int64_t    occupancy_commit_sequence;
-    int64_t    occupancy_source_timestamp_ns;
+    char*      session_id;
+    int64_t    revision;
 
     /**
      * LCM Type: string
      */
     char*      frame_id;
-    int64_t    map_frame_generation;
-    int64_t    cloud_revision;
-
-    /**
-     * The occupancy baseline retained in the original cloud receipt.
-     */
-    int64_t    cloud_occupancy_revision;
     int64_t    source_timestamp_ns;
     float      source_voxel_size;
-
-    /**
-     * LCM Type: byte[16]
-     */
-    uint8_t    commit_boot_nonce[16];
-    int64_t    commit_sequence;
 
     /**
      * 0为生效地图，1为显式清空，2为建图地面块提交失败后的来源撤销。

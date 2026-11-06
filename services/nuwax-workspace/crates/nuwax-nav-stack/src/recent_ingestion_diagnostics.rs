@@ -1,6 +1,6 @@
 //! Baseline-only recent-source attribution. No transport or physical motion.
 use super::*;
-use nuwax_codec::lcm::{lio, recent_cloud};
+use nuwax_codec::lcm::recent_cloud;
 
 fn fixture() -> (
     SurfaceNavigationConfig,
@@ -29,22 +29,7 @@ fn fixture() -> (
             .unwrap(),
     );
     let authority = GuardedMapAuthority {
-        committed_map: schema::CommittedMapIdentity {
-            session_id: "recent-ingestion-diagnostic".into(),
-            session_generation: 1,
-            revision: 1,
-            commit_boot_nonce: [7; 16],
-            commit_sequence: 1,
-            source_timestamp_ns: 1,
-            frame_id: "map".into(),
-        },
-        producer_runtime_generation: 17,
-        map_frame_generation: 1,
-        cloud_revision: 1,
-        cloud_occupancy_revision: 1,
-        cloud_commit_sequence: 1,
-        cloud_source_timestamp_ns: 1,
-        commit_boot_nonce: [7; 16],
+        session_id: "recent-ingestion-diagnostic".into(), revision: 1, frame_id: "map".into(),
     };
     (config, authority, map)
 }
@@ -113,31 +98,12 @@ fn packet(
     }
     recent_cloud::RecentCloud3D {
         registration:None,
-        producer_runtime_generation: 17,
         session_id: "recent-ingestion-diagnostic".into(),
-        session_generation: 1,
-        map_frame_generation: 1,
-        commit_boot_nonce: [7; 16],
         ground_point_indices: (0..points.len())
             .filter(|i| i % 4 == 0)
             .map(|i| i as u32)
             .collect(),
-        cloud: Some(lio::LioCloudEnvelope {
-            schema_version: 1,
-            backend: lio::LIO_BACKEND_DEVICE,
-            runtime_generation: 2,
-            source_sequence: sequence,
-            source_timestamp_ns: now,
-            correlated_odometry_source_sequence: sequence,
-            correlated_odometry_source_timestamp_ns: now,
-            sensor_frame_id: "sensor".into(),
-            body_frame_id: "body".into(),
-            odom_frame_id: "odom".into(),
-            map_frame_id: "map".into(),
-            registration_state: lio::LIO_REGISTRATION_REGISTERED_MAP,
-            source_point_count: points.len() as i64,
-            emitted_point_count: points.len() as i64,
-            cloud: schema::PointCloud2 {
+        sequence: sequence, cloud: Some(schema::PointCloud2 {
                 header: schema::Header {
                     seq: sequence as i32,
                     stamp_sec: (now / 1_000_000_000) as i32,
@@ -160,9 +126,12 @@ fn packet(
                 row_step: (points.len() * step) as i32,
                 data,
                 is_dense: true,
-            },
-        }),
+            }),
     }
+}
+
+fn timestamp(cloud: &schema::PointCloud2) -> u64 {
+    cloud.header.stamp_sec as u64 * 1_000_000_000 + cloud.header.stamp_nsec as u64
 }
 
 fn hints(map: &SurfaceSnapshot) -> Vec<([f64; 3], [f64; 3])> {
@@ -181,7 +150,7 @@ async fn reject_unchanged(
     expected: &str,
 ) {
     let before = state.snapshot.as_ref().unwrap().clone();
-    let watermark = state.watermark;
+    let watermark = state.latest.clone();
     let enabled = state.enabled;
     let error = state
         .consume(wire, Some(authority), handle)
@@ -192,7 +161,7 @@ async fn reject_unchanged(
         "expected {expected:?}, got {error:?}"
     );
     assert!(Arc::ptr_eq(&before, state.snapshot.as_ref().unwrap()));
-    assert_eq!(state.watermark, watermark);
+    assert_eq!(state.latest, watermark);
     assert_eq!(state.enabled, enabled);
 }
 
@@ -211,7 +180,7 @@ async fn baseline_layouts_and_original_member_indices() {
         let mut p = packet(&points, index as i64 + 1, mixed, big);
         p.ground_point_indices = vec![0, 2];
         if mixed {
-            let cloud = &mut p.cloud.as_mut().unwrap().cloud;
+            let cloud = &mut p.cloud.as_mut().unwrap();
             cloud.height = 3;
             cloud.width = 1;
             cloud.row_step = cloud.point_step;
@@ -219,7 +188,7 @@ async fn baseline_layouts_and_original_member_indices() {
         // Ground point 0 shares its cell with obstacle 1, so the cell stays a volume.
         let wire = recent_cloud::encode_body(&p).unwrap();
         let decoded = recent_cloud::decode_body(&wire).unwrap();
-        let cloud = point_cloud_from_schema(decoded.cloud.unwrap().cloud).unwrap();
+        let cloud = point_cloud_from_schema(decoded.cloud.unwrap()).unwrap();
         assert_eq!(cloud.points.len(), points.len());
         state
             .consume(&wire, Some(&authority), &handle)
@@ -240,7 +209,7 @@ async fn baseline_layouts_and_original_member_indices() {
         let expected = terrain
             .with_recent_obstacle_points(
                 index as u64 + 1,
-                p.cloud.as_ref().unwrap().source_timestamp_ns as u64,
+                timestamp(p.cloud.as_ref().unwrap()),
                 0,
                 &[0, 2],
                 cloud
@@ -276,12 +245,12 @@ async fn baseline_rejection_precedence_and_atomic_state() {
         .consume(&accepted, Some(&authority), &handle)
         .await
         .unwrap();
-    reject_unchanged(&mut state, &accepted, &authority, &handle, "replay").await;
+    state.consume(&accepted, Some(&authority), &handle).await.unwrap();
 
     // 当前发送边界也验证XYZ，因此先编码合法包，再模拟线上相同长度载荷损坏。
     fn corrupt_cloud(packet: &recent_cloud::RecentCloud3D, change: impl FnOnce(&mut schema::PointCloud2)) -> Vec<u8> {
         let mut wire = recent_cloud::encode_body(packet).unwrap();
-        let mut cloud = packet.cloud.as_ref().unwrap().cloud.clone();
+        let mut cloud = packet.cloud.as_ref().unwrap().clone();
         let old = schema::encode_point_cloud2_body(&cloud).unwrap();
         assert!(wire.ends_with(&old));
         change(&mut cloud);
@@ -297,10 +266,10 @@ async fn baseline_rejection_precedence_and_atomic_state() {
         cloud.fields[2].name = "q".into();
     });
     reject_unchanged(&mut state, &invalid_type_and_axis, &authority, &handle,
-        "XYZ fields must be unique scalar floats").await;
+        "XYZ fields must be scalar float32 or float64").await;
     let missing_axis = corrupt_cloud(&p, |cloud| cloud.fields[2].name = "q".into());
     reject_unchanged(&mut state, &missing_axis, &authority, &handle,
-        "must declare XYZ coordinates").await;
+        "requires unique x, y and z fields").await;
 
     for points in [
         vec![[1e12, 0.5, 0.55], [0.5, f64::NAN, 0.55]],
@@ -310,9 +279,9 @@ async fn baseline_rejection_precedence_and_atomic_state() {
         let damaged = packet(&points, 3, true, false);
         let finite: Vec<_> = points.iter().map(|p| p.map(|v| if v.is_finite() { v } else { 0. })).collect();
         let valid = packet(&finite, 3, true, false);
-        let wire = corrupt_cloud(&valid, |cloud| cloud.data = damaged.cloud.as_ref().unwrap().cloud.data.clone());
+        let wire = corrupt_cloud(&valid, |cloud| cloud.data = damaged.cloud.as_ref().unwrap().data.clone());
         reject_unchanged(&mut state, &wire, &authority, &handle,
-            "world coordinates must be finite").await;
+            "cloud XYZ must be finite").await;
     }
     let p = packet(&[[1e12, 0.5, 0.55]], 4, true, false);
     reject_unchanged(
@@ -327,28 +296,17 @@ async fn baseline_rejection_precedence_and_atomic_state() {
     let p = packet(&[[0.5, 0.5, 0.55]], 5, false, false);
     let good = recent_cloud::encode_body(&p).unwrap();
     reject_unchanged(&mut state, &good[..good.len() - 1], &authority, &handle, "").await;
-    let cloud_body = schema::encode_point_cloud2_body(&p.cloud.as_ref().unwrap().cloud).unwrap();
+    let cloud_body = schema::encode_point_cloud2_body(&p.cloud.as_ref().unwrap()).unwrap();
     assert!(good.ends_with(&cloud_body));
     let cloud_start = good.len() - cloud_body.len();
-    let mut wrong_count = good.clone();
-    wrong_count[cloud_start - 16..cloud_start - 8].copy_from_slice(&2_i64.to_be_bytes());
-    wrong_count[cloud_start - 8..cloud_start].copy_from_slice(&2_i64.to_be_bytes());
-    reject_unchanged(
-        &mut state,
-        &wrong_count,
-        &authority,
-        &handle,
-        "emitted_point_count",
-    )
-    .await;
     // This generated schema puts data length at the start. Its tail is row_step,
     // data bytes and is_dense; no guessed conventional ROS wire layout here.
-    let row_offset = good.len() - 1 - p.cloud.as_ref().unwrap().cloud.data.len() - 4;
+    let row_offset = good.len() - 1 - p.cloud.as_ref().unwrap().data.len() - 4;
     assert_eq!(&good[row_offset..row_offset + 4], &12_i32.to_be_bytes());
     let mut padded_row = good.clone();
     padded_row[row_offset..row_offset + 4].copy_from_slice(&16_i32.to_be_bytes());
     reject_unchanged(&mut state, &padded_row, &authority, &handle, "row_step").await;
-    let mut invalid_cloud = p.cloud.as_ref().unwrap().cloud.clone();
+    let mut invalid_cloud = p.cloud.as_ref().unwrap().clone();
     invalid_cloud.fields[0].offset = 12;
     let invalid_body = schema::encode_point_cloud2_body(&invalid_cloud).unwrap();
     assert_eq!(invalid_body.len(), cloud_body.len());
@@ -359,41 +317,19 @@ async fn baseline_rejection_precedence_and_atomic_state() {
         &bad_field,
         &authority,
         &handle,
-        "layout exceeds",
+        "field exceeds point_step",
     )
     .await;
-    for change in 0..3 {
-        let mut p = packet(&[[0.5, 0.5, 0.55]], 6, false, false);
-        match change {
-            0 => p.commit_boot_nonce = [8; 16],
-            1 => {
-                let c = p.cloud.as_mut().unwrap();
-                c.map_frame_id = "other".into();
-                c.cloud.header.frame_id = "other".into();
-            }
-            _ => p.cloud.as_mut().unwrap().runtime_generation = 1,
-        }
-        let expected = match change {
-            0 => "different navigation domain",
-            1 => "frame or source time",
-            _ => "replay",
-        };
-        reject_unchanged(
-            &mut state,
-            &recent_cloud::encode_body(&p).unwrap(),
-            &authority,
-            &handle,
-            expected,
-        )
-        .await;
-    }
+    let wrong_frame = corrupt_cloud(&p, |cloud| cloud.header.frame_id = "xyz".into());
+    reject_unchanged(&mut state, &wrong_frame, &authority, &handle, "different map session or frame").await;
+
     assert!(calls.lock().unwrap().is_empty());
     handle.shutdown().await.unwrap();
     task.await.unwrap().unwrap();
 }
 
 #[tokio::test]
-async fn baseline_retention_and_generation_reset() {
+async fn baseline_retention_and_session_reset() {
     let (config, authority, terrain) = fixture();
     let (handle, task, calls) = scheduler(&config);
     for retain in [false, true] {
@@ -420,12 +356,15 @@ async fn baseline_retention_and_generation_reset() {
             );
         }
         let mut p = packet(&[[0.5, 0.5, 0.55]], 1, false, false);
-        p.cloud.as_mut().unwrap().runtime_generation = 3;
+        let replacement = GuardedMapAuthority {
+            session_id: "recent-next-session".into(), ..authority.clone()
+        };
+        p.session_id.clone_from(&replacement.session_id);
         p.ground_point_indices.clear();
         state
             .consume(
                 &recent_cloud::encode_body(&p).unwrap(),
-                Some(&authority),
+                Some(&replacement),
                 &handle,
             )
             .await
@@ -452,11 +391,11 @@ fn staged(
     let packet = recent_cloud::decode_body(wire).unwrap();
     let decode = micros(start);
     let cloud = packet.cloud.unwrap();
-    let sequence = cloud.source_sequence as u64;
-    let timestamp = cloud.source_timestamp_ns as u64;
-    let count = cloud.emitted_point_count as usize;
+    let sequence = packet.sequence as u64;
+    let timestamp = timestamp(&cloud);
+    let count = (cloud.width * cloud.height) as usize;
     let start = Instant::now();
-    let points = point_cloud_from_schema(cloud.cloud).unwrap();
+    let points = point_cloud_from_schema(cloud).unwrap();
     let xyz = micros(start);
     let start = Instant::now();
     assert_eq!(points.points.len(), count);
@@ -512,7 +451,7 @@ async fn baseline_complete_recent_ingestion_cost() {
                 let mut first_time = 0;
                 for sequence in 1..=15 {
                     let p = packet(&points, sequence, false, false);
-                    let source = p.cloud.as_ref().unwrap().source_timestamp_ns;
+                    let source = timestamp(p.cloud.as_ref().unwrap());
                     if sequence == 1 {
                         first_time = source;
                     }
@@ -542,7 +481,7 @@ async fn baseline_complete_recent_ingestion_cost() {
                         stage_map = next;
                         (elapsed, stage)
                     };
-                    assert_eq!(state.watermark, Some((2, sequence, source)));
+                    assert_eq!(state.latest, Some((authority.session_id.clone(), sequence)));
                     assert!(nuwax_nav_runtime::native_map::same_source_geometry(
                         &terrain,
                         state.snapshot.as_ref().unwrap()

@@ -203,8 +203,7 @@ fn explicit_mask_wire_cache_full_footprint_preflight() {
     let mut writer=Writer::new(repository.clone(),RESOLUTION,4*1024*1024).unwrap();
     let stamp=current_unix_timestamp_ns().unwrap();
     writer.observe(ground_keys(),stamp as u64).unwrap();
-    let root=writer.snapshot(Domain {session:"wall-world-mask-preflight".into(),generation:1,
-        frame_generation:1,producer_generation:17},1,stamp as u64).unwrap();
+    let root=writer.snapshot(Domain {session:"wall-world-mask-preflight".into(),},1,stamp as u64).unwrap();
     let mut map=map_from_fine(&root,&repository);
     let mut cache=SurfaceGeometryCache::configured(&calibrated_config(true));
     let plain=cache.build(&map).unwrap();

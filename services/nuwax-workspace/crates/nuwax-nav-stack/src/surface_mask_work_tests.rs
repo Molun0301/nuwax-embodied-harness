@@ -101,7 +101,7 @@ async fn held_global_owner_keeps_unchanged_mask_work_but_changed_mask_retires_it
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let current = harness.hub.latest.lock().unwrap().as_ref().unwrap().clone();
-            if current.authority.committed_map.revision >= initial.authority.committed_map.revision + 3 {
+            if current.authority.revision >= initial.authority.revision + 3 {
                 assert!(initial.snapshot.as_ref().unwrap().same_geometry(current.snapshot.as_ref().unwrap()));
                 assert!(current.received_at > initial.received_at);
                 break;
@@ -131,29 +131,21 @@ async fn held_global_owner_keeps_unchanged_mask_work_but_changed_mask_retires_it
 
 #[test]
 fn new_physical_updates_reapply_only_cell_proven_retained_masks() {
-    for variant in ["same_cells", "changed_cells", "layout", "domain", "boot", "equal_revision"] {
+    for variant in ["same_cells", "changed_cells", "layout", "domain"] {
         let mut message = map_message(1, "retained-mask-update");
         message.virtual_obstacles = Some(virtual_mask(&message, true));
         let mut cache = SurfaceGeometryCache::new(config().geometry);
         let previous = cache.build(&message).unwrap();
         let old_physical = cache.physical_snapshot().unwrap();
-        if variant != "equal_revision" { advance_mask(&mut message, true); }
+        advance_mask(&mut message, true);
         advance_scan(&mut message);
         // Replace a real physical floor support with a higher obstacle column.
         let z_offset = (20 * 30 + 15) * 12 + 8;
         message.cloud.data[z_offset..z_offset + 4].copy_from_slice(&2.85_f32.to_le_bytes());
         match variant {
-            "changed_cells" | "equal_revision" => {
-                // Equal revision deliberately does not prove content equality for
-                // every direct cache caller; its previous reconstruction must remain.
-                message.virtual_obstacles.as_mut().unwrap().data[0] = 100;
-            }
+            "changed_cells" => message.virtual_obstacles.as_mut().unwrap().data[0] = 100,
             "layout" => message.virtual_obstacles.as_mut().unwrap().info.origin.position[0] = -0.1,
-            "domain" => message.committed_map.session_id = "retained-mask-new-domain".into(),
-            "boot" => {
-                message.commit_boot_nonce = [0x55; 16];
-                message.committed_map.commit_boot_nonce = [0x55; 16];
-            }
+            "domain" => message.session_id = "retained-mask-new-domain".into(),
             _ => {}
         }
         let actual = cache.build(&message).unwrap();

@@ -1,7 +1,7 @@
 use super::*;
 use std::io::{Cursor, Read};
 const BUDGET: usize = 4 * 1024 * 1024;
-fn domain() -> Domain { Domain { session: "robot-owner".into(), generation: 1, frame_generation: 0, producer_generation: 2 } }
+fn domain() -> Domain { Domain { session: "robot-owner".into(), } }
 fn writer() -> (Repository, Writer) { let r = Repository::temporary().unwrap(); let w = Writer::new(r.clone(), 0.125, BUDGET).unwrap(); (r,w) }
 fn one() -> (Repository, Writer, Arc<Manifest>) { let (r,mut w)=writer(); w.observe([[0,0,0]],1).unwrap(); let m=w.snapshot(domain(),1,1).unwrap(); (r,w,m) }
 fn transfer(root: &Manifest, source: &Repository) -> Transfer {
@@ -201,7 +201,7 @@ fn successful_retry_preserves_all_pending_ids() {
 fn restore_same_domain_preserves_revisions_new_domain_restamps() {
     let (r,_,m)=one();let mut w=Writer::new(r.clone(),0.125,BUDGET).unwrap();w.restore(&m).unwrap();assert!(w.snapshot(domain(),1,1).is_err());
     let next=w.snapshot(domain(),2,1).unwrap();assert_eq!(m.blocks,next.blocks);assert_eq!(next.geometry_revision,1);
-    let mut other=domain();other.frame_generation=1;let moved=w.snapshot(other,1,1).unwrap();assert_eq!(m.blocks[0].object,moved.blocks[0].object);assert_eq!(moved.geometry_revision,1);
+    let mut other=domain();other.session="另一会话".into();let moved=w.snapshot(other,1,1).unwrap();assert_eq!(m.blocks[0].object,moved.blocks[0].object);assert_eq!(moved.geometry_revision,1);
 }
 #[test]
 fn source_bound_can_decrease_but_cannot_precede_evidence() {
@@ -446,7 +446,7 @@ fn receiver_removal_needs_geometry_advance_and_resolution_change_is_allowed() {
 #[test]
 fn receiver_rejects_future_evidence_domain_mismatch_and_extra_inclusions() {
     let (src,mut w,_)=one();w.observe([[0,0,0]],3).unwrap();let m=w.snapshot(domain(),2,3).unwrap();let mut bad=(*m).clone();bad.source_timestamp_ns=2;
-    let mut recv=Receiver::new(Repository::temporary().unwrap());assert!(receive(&mut recv,&bad,&src).is_err());let mut other=domain();other.frame_generation=1;assert!(recv.receive(&transfer(&m,&src),&other,|_,_|panic!()).is_err());
+    let mut recv=Receiver::new(Repository::temporary().unwrap());assert!(receive(&mut recv,&bad,&src).is_err());let mut other=domain();other.session="另一会话".into();assert!(recv.receive(&transfer(&m,&src),&other,|_,_|panic!()).is_err());
     let mut t=transfer(&m,&src);t.included.insert(ObjectIdentity::Assigned(ObjectId([9;16])),body(0,1,1));assert!(recv.receive(&t,&domain(),|_,_|panic!()).is_err());
 }
 #[test]
@@ -564,7 +564,7 @@ fn domain_only_reseal_reuses_objects_without_io_or_clock_advancement() {
     assert!(!writer.has_unpublished_changes());
     let counts = repository.counts();
     let mut next_domain = root.domain.clone();
-    next_domain.frame_generation += 1;
+    next_domain.session = "下一会话".into();
     let next = writer.seal(next_domain.clone(), root.revision, root.source_timestamp_ns).unwrap();
     assert_eq!(repository.counts(), counts);
     assert_eq!(next.manifest().domain, next_domain);
@@ -574,253 +574,6 @@ fn domain_only_reseal_reuses_objects_without_io_or_clock_advancement() {
         root.blocks.iter().map(|block| block.object).collect::<Vec<_>>());
     writer.observe([[0, 0, 0]], 2).unwrap();
     assert!(writer.has_unpublished_changes());
-}
-
-#[test]
-fn sealed_frame_rehome_is_metadata_only_and_preserves_old_readers() {
-    let (repository, mut writer) = writer();
-    writer.observe([[0, 0, 0], [32, 0, 0]], 2).unwrap();
-    writer.seal(domain(), 3, 10).unwrap();
-    let sealed = writer.seal(domain(), 9, 10).unwrap();
-    let old = sealed.manifest().clone();
-    let before = (*old).clone();
-    assert_eq!(old.geometry_revision, 3);
-    let mut reader = RegionReader::new(repository.clone(), BUDGET);
-    let cached = reader.block(&old.blocks[0]).unwrap();
-    let counts = repository.counts();
-    let encoded = writer.encoded_blocks;
-    let rehomed = sealed.rehome_frame(&old.identity(), 1).unwrap();
-    assert_eq!(repository.counts(), counts);
-    assert_eq!(writer.encoded_blocks, encoded);
-    let mut expected = before.clone();
-    expected.domain.frame_generation = 1;
-    expected.geometry_revision = expected.revision;
-    for block in &mut expected.blocks {
-        block.block_revision = expected.revision;
-        block.geometry_revision = expected.revision;
-    }
-    assert_eq!(**rehomed.manifest(), expected);
-    assert_eq!(rehomed.repository.path(), repository.path());
-    assert!(!Arc::ptr_eq(&old, rehomed.manifest()));
-    assert!(Arc::ptr_eq(&old, sealed.manifest()));
-    assert_eq!(*old, before);
-    let reused = reader.block(&rehomed.manifest().blocks[0]).unwrap();
-    assert!(Arc::ptr_eq(&cached, &reused));
-    assert_eq!(repository.counts(), counts);
-}
-
-#[test]
-fn writer_frame_rehome_retains_dirty_future_evidence_and_restamps_untouched_refs() {
-    let repository = Repository::temporary().unwrap();
-    let mut writer = Writer::new(repository.clone(), 0.125, BUDGET * 2).unwrap();
-    writer.observe([[0, 0, 0], [32, 0, 0]], 1).unwrap();
-    writer.seal(domain(), 3, 10).unwrap();
-    let old = writer.seal(domain(), 8, 10).unwrap();
-    writer.observe([[0, 0, 0]], 20).unwrap();
-    let counts = repository.counts();
-    let encoded = writer.encoded_blocks;
-    let resident = writer.resident_bytes();
-    let retained = writer.retained_objects();
-    let moved = writer.rehome_published_frame(&old.manifest().identity(), 1).unwrap();
-    assert_eq!(repository.counts(), counts);
-    assert_eq!(writer.encoded_blocks, encoded);
-    assert_eq!(writer.resident_bytes(), resident);
-    assert_eq!(writer.retained_objects(), retained);
-    assert!(writer.has_unpublished_changes());
-    assert_eq!(moved.manifest().revision, 8);
-    assert_eq!(moved.manifest().source_timestamp_ns, 10);
-    assert_eq!(moved.manifest().geometry_revision, 8);
-    assert_eq!(moved.manifest().blocks.iter().map(|b| b.object).collect::<Vec<_>>(),
-        old.manifest().blocks.iter().map(|b| b.object).collect::<Vec<_>>());
-    assert_eq!(old.manifest().domain.frame_generation, 0);
-    assert_eq!(old.manifest().blocks[1].block_revision, 3);
-    let next_domain = moved.manifest().domain.clone();
-    // Rehoming must not reset the pending maximum source-evidence timestamp.
-    assert!(writer.seal(next_domain.clone(), 9, 19).is_err());
-    assert_eq!(repository.counts(), counts);
-    assert!(writer.has_unpublished_changes());
-    let next = writer.seal(next_domain, 9, 20).unwrap();
-    assert_eq!(next.manifest().geometry_revision, 8);
-    assert_eq!(next.manifest().blocks[0].block_revision, 9);
-    assert_eq!(next.manifest().blocks[0].geometry_revision, 8);
-    assert_ne!(next.manifest().blocks[0].object, moved.manifest().blocks[0].object);
-    assert_eq!(next.manifest().blocks[1], moved.manifest().blocks[1]);
-    let mut reader = RegionReader::new(repository.clone(), BUDGET);
-    assert_eq!(reader.block(&moved.manifest().blocks[0]).unwrap()[&0], Evidence { observed_ns: 1, hits: 1 });
-    assert_eq!(reader.block(&next.manifest().blocks[0]).unwrap()[&0], Evidence { observed_ns: 20, hits: 2 });
-    assert!(!writer.has_unpublished_changes());
-}
-
-#[test]
-fn writer_frame_rehome_preserves_pressure_flushed_membership_deltas() {
-    let (repository, mut writer) = writer();
-    writer.observe([[0, 0, 0], [32, 0, 0], [64, 0, 0], [96, 0, 0]], 1).unwrap();
-    writer.seal(domain(), 2, 1).unwrap();
-    let old = writer.seal(domain(), 7, 1).unwrap();
-    writer.remove([[0, 0, 0]]).unwrap();
-    writer.flush().unwrap();
-    writer.observe([[0, 0, 0]], 2).unwrap();
-    let encoded = writer.encoded_blocks;
-    // Loading another block pressure-flushes the remove/re-add block.
-    writer.observe([[33, 0, 0]], 2).unwrap();
-    assert_eq!(writer.encoded_blocks, encoded + 1);
-    writer.remove([[64, 0, 0]]).unwrap();
-    assert_eq!(writer.encoded_blocks, encoded + 2);
-    writer.observe([[128, 0, 0]], 2).unwrap();
-    let counts = repository.counts();
-    let encoded = writer.encoded_blocks;
-    let resident = writer.resident_bytes();
-    let retained = writer.retained_objects();
-    let moved = writer.rehome_published_frame(&old.manifest().identity(), 1).unwrap();
-    assert_eq!(repository.counts(), counts);
-    assert_eq!(writer.encoded_blocks, encoded);
-    assert_eq!(writer.resident_bytes(), resident);
-    assert_eq!(writer.retained_objects(), retained);
-    assert_eq!(moved.manifest().points(), 4);
-    assert_eq!(moved.manifest().blocks.iter().map(|b| b.object).collect::<Vec<_>>(),
-        old.manifest().blocks.iter().map(|b| b.object).collect::<Vec<_>>());
-    let next = writer.seal(moved.manifest().domain.clone(), 8, 2).unwrap();
-    let refs: BTreeMap<_, _> = next.manifest().blocks.iter().map(|b| (b.key, b)).collect();
-    assert_eq!(refs.keys().copied().collect::<Vec<_>>(), vec![[0, 0, 0], [1, 0, 0], [3, 0, 0], [4, 0, 0]]);
-    assert_eq!(next.manifest().points(), 5);
-    assert_eq!(next.manifest().geometry_revision, 8);
-    // Net remove/re-add preserves geometry in the new domain despite a new object.
-    assert_eq!(refs[&[0, 0, 0]].block_revision, 8);
-    assert_eq!(refs[&[0, 0, 0]].geometry_revision, 7);
-    assert_ne!(refs[&[0, 0, 0]].object, moved.manifest().blocks[0].object);
-    assert_eq!(refs[&[1, 0, 0]].block_revision, 8);
-    assert_eq!(refs[&[1, 0, 0]].geometry_revision, 8);
-    assert_eq!(*refs[&[3, 0, 0]], moved.manifest().blocks[3]);
-    assert_eq!(refs[&[4, 0, 0]].block_revision, 8);
-    assert_eq!(refs[&[4, 0, 0]].geometry_revision, 8);
-    assert_eq!(writer.region([0, 0, 0], [128, 0, 0], 5).unwrap().iter().map(|p| p.0).collect::<Vec<_>>(),
-        vec![[0, 0, 0], [32, 0, 0], [33, 0, 0], [96, 0, 0], [128, 0, 0]]);
-    assert!(!writer.has_unpublished_changes());
-}
-
-#[test]
-fn writer_frame_rehome_preserves_frozen_ids_after_partial_flush() {
-    let repository = Repository::temporary().unwrap();
-    let mut writer = Writer::new(repository.clone(), 0.125, BUDGET * 2).unwrap();
-    writer.observe([[0, 0, 0], [32, 0, 0], [64, 0, 0]], 1).unwrap();
-    writer.seal(domain(), 2, 1).unwrap();
-    let old = writer.seal(domain(), 7, 1).unwrap();
-    writer.observe([[0, 0, 0], [32, 0, 0]], 2).unwrap();
-    repository.fail_put_after(Some(1));
-    assert!(writer.flush().is_err());
-    let ids = writer.pending_ids();
-    assert_eq!(ids.len(), 2);
-    let counts = repository.counts();
-    let encoded = writer.encoded_blocks;
-    let resident = writer.resident_bytes();
-    let retained = writer.retained_objects();
-    let moved = writer.rehome_published_frame(&old.manifest().identity(), 1).unwrap();
-    assert_eq!(repository.counts(), counts);
-    assert_eq!(writer.encoded_blocks, encoded);
-    assert_eq!(writer.pending_ids(), ids);
-    assert_eq!(writer.resident_bytes(), resident);
-    assert_eq!(writer.retained_objects(), retained);
-    assert!(writer.has_unpublished_changes());
-    assert_eq!(moved.manifest().blocks.iter().map(|b| b.object).collect::<Vec<_>>(),
-        old.manifest().blocks.iter().map(|b| b.object).collect::<Vec<_>>());
-    repository.fail_put_after(None);
-    let next = writer.seal(moved.manifest().domain.clone(), 8, 2).unwrap();
-    assert_eq!(writer.encoded_blocks, encoded);
-    assert_eq!(repository.counts().1, counts.1 + 1);
-    assert_eq!(next.manifest().blocks[..2].iter().map(|b| b.object).collect::<Vec<_>>(), ids);
-    assert_eq!(next.manifest().blocks[2], moved.manifest().blocks[2]);
-    assert_eq!(next.manifest().geometry_revision, 7);
-    for block in &next.manifest().blocks[..2] {
-        assert_eq!(block.block_revision, 8);
-        assert_eq!(block.geometry_revision, 7);
-        let block = decode_block(&repository.read_object(block.object, MAX_BLOCK_BYTES).unwrap()).unwrap();
-        assert_eq!(block[&0], Evidence { observed_ns: 2, hits: 2 });
-    }
-    assert!(!writer.has_unpublished_changes());
-}
-
-#[test]
-fn frame_rehome_rejects_stale_roots_and_nonconsecutive_frames_without_mutation() {
-    let (repository, mut writer) = writer();
-    writer.observe([[0, 0, 0]], 1).unwrap();
-    let mut first_domain = domain();
-    first_domain.frame_generation = 4;
-    let old = writer.seal(first_domain, 7, 1).unwrap();
-    writer.observe([[0, 0, 0]], 2).unwrap();
-    repository.fail_put_after(Some(0));
-    assert!(writer.flush().is_err());
-    let expected = old.manifest().identity();
-    let before = (**old.manifest()).clone();
-    let ids = writer.pending_ids();
-    let counts = repository.counts();
-    let encoded = writer.encoded_blocks;
-    let resident = writer.resident_bytes();
-    let retained = writer.retained_objects();
-    let mut stale = expected.clone();
-    stale.revision -= 1;
-    let mut wrong_session = expected.clone();
-    wrong_session.domain.session.push_str("-other");
-    let mut wrong_generation = expected.clone();
-    wrong_generation.domain.generation += 1;
-    let mut wrong_producer = expected.clone();
-    wrong_producer.domain.producer_generation += 1;
-    let mut wrong_frame = expected.clone();
-    wrong_frame.domain.frame_generation -= 1;
-    for identity in [stale, wrong_session, wrong_generation, wrong_producer, wrong_frame] {
-        assert!(old.rehome_frame(&identity, 5).is_err());
-        assert!(writer.rehome_published_frame(&identity, 5).is_err());
-    }
-    for frame in [0, 3, 4, 6, u64::MAX] {
-        assert!(old.rehome_frame(&expected, frame).is_err());
-        assert!(writer.rehome_published_frame(&expected, frame).is_err());
-    }
-    assert_eq!(**old.manifest(), before);
-    assert_eq!(repository.counts(), counts);
-    assert_eq!(writer.encoded_blocks, encoded);
-    assert_eq!(writer.pending_ids(), ids);
-    assert_eq!(writer.resident_bytes(), resident);
-    assert_eq!(writer.retained_objects(), retained);
-    assert!(writer.has_unpublished_changes());
-    let moved = writer.rehome_published_frame(&expected, 5).unwrap();
-    assert!(writer.rehome_published_frame(&expected, 5).is_err());
-    assert_eq!(writer.pending_ids(), ids);
-    assert_eq!(repository.counts(), counts);
-    repository.fail_put_after(None);
-    let next = writer.seal(moved.manifest().domain.clone(), 8, 2).unwrap();
-    assert_eq!(next.manifest().blocks[0].object, ids[0]);
-    assert_eq!(next.manifest().blocks[0].geometry_revision, 7);
-}
-
-#[test]
-fn frame_rehome_rejects_missing_baseline_and_frame_overflow() {
-    let (repository, mut writer) = writer();
-    writer.observe([[0, 0, 0]], 1).unwrap();
-    let expected = RootIdentity { domain: domain(), revision: 1 };
-    let counts = repository.counts();
-    let resident = writer.resident_bytes();
-    assert!(writer.rehome_published_frame(&expected, 1).is_err());
-    assert_eq!(repository.counts(), counts);
-    assert_eq!(writer.encoded_blocks, 0);
-    assert_eq!(writer.resident_bytes(), resident);
-    assert!(writer.has_unpublished_changes());
-    let mut last_domain = domain();
-    last_domain.frame_generation = u64::MAX;
-    let old = writer.seal(last_domain.clone(), 1, 1).unwrap();
-    writer.observe([[0, 0, 0]], 2).unwrap();
-    let counts = repository.counts();
-    let encoded = writer.encoded_blocks;
-    let resident = writer.resident_bytes();
-    for frame in [0, 1, u64::MAX] {
-        assert!(old.rehome_frame(&old.manifest().identity(), frame).is_err());
-        assert!(writer.rehome_published_frame(&old.manifest().identity(), frame).is_err());
-    }
-    assert_eq!(repository.counts(), counts);
-    assert_eq!(writer.encoded_blocks, encoded);
-    assert_eq!(writer.resident_bytes(), resident);
-    assert_eq!(old.manifest().domain, last_domain);
-    let next = writer.seal(last_domain, 2, 2).unwrap();
-    assert_eq!(next.manifest().blocks[0].block_revision, 2);
-    assert_eq!(next.manifest().blocks[0].geometry_revision, 1);
 }
 
 fn archive_with_version(version: u32, stamp: u64, bodies: &[Vec<u8>], shared: bool) -> Vec<u8> {

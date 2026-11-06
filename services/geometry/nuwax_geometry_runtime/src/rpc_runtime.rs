@@ -2,7 +2,7 @@
 use crate::session::SessionHandle;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use nuwax_map_chunks::{BlockRef, Domain, ObjectId, ObjectIdentity, ObjectRangeRead, RootIdentity};
+use nuwax_map_chunks::{BlockRef, ObjectId, ObjectIdentity, ObjectRangeRead, RootIdentity};
 use nuwax_rpc::{
     RpcArgs, RpcBroker, RpcHandler, RpcRequest, RpcResponse, RpcResult, RpcServerGroup,
     RpcTransport,
@@ -19,7 +19,7 @@ const RPC_NAME: &str = "GeometryRuntimeService/get_navigation_map_block";
 #[serde(default, deny_unknown_fields)]
 struct BlockRequest {
     schema_version: u32,
-    root: Option<WireRoot>,
+    root: Option<RootIdentity>,
     block: Option<WireBlock>,
     offset: u32,
     max_bytes: u32,
@@ -36,18 +36,6 @@ impl Default for BlockRequest {
             part_encoding: None,
         }
     }
-}
-#[derive(Clone, serde::Serialize, Deserialize)]
-struct WireDomain {
-    session: String,
-    generation: u64,
-    frame_generation: u64,
-    producer_generation: u64,
-}
-#[derive(Clone, serde::Serialize, Deserialize)]
-struct WireRoot {
-    domain: WireDomain,
-    revision: u64,
 }
 #[derive(Clone, serde::Serialize, Deserialize)]
 struct WireObject {
@@ -115,21 +103,12 @@ impl Handler {
             geometry_revision: block.geometry_revision,
             points: block.points,
         };
-        let identity = RootIdentity {
-            domain: Domain {
-                session: root.domain.session.clone(),
-                generation: root.domain.generation,
-                frame_generation: root.domain.frame_generation,
-                producer_generation: root.domain.producer_generation,
-            },
-            revision: root.revision,
-        };
         let range = (request.schema_version == 3)
             .then_some((request.offset as usize, request.max_bytes as usize));
         let read = self
             .0
             .mapper()?
-            .navigation_map_block(identity, reference, range)
+            .navigation_map_block(root.clone(), reference, range)
             .await
             .map_err(Status::not_found)?;
         let ObjectRangeRead::Data { bytes, total_bytes } = read else {

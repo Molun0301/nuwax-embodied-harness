@@ -4,10 +4,7 @@ use nuwax_map_chunks::{Domain, Receiver, Repository, Writer};
 fn domain() -> Domain {
     Domain {
         session: "incremental-transfer".into(),
-        generation: 1,
-        frame_generation: 1,
-        producer_generation: 1,
-    }
+        }
 }
 
 #[test]
@@ -109,12 +106,12 @@ fn unchanged_roots_do_not_read_objects_and_new_domains_bootstrap_normally() {
     let repeated = prepare(&first, Some(first.manifest()));
     std::fs::rename(&moved, repository.path()).unwrap();
     assert!(repeated.unwrap().included.is_empty());
-    let rehomed = first.rehome_frame(&first.manifest().identity(), 2).unwrap();
+    let rehomed = writer.seal(Domain { session: "下一会话".into() }, 1, 1).unwrap();
     let transfer = prepare(&rehomed, Some(first.manifest())).unwrap();
     assert_eq!(
         transfer.included.len(),
         1,
-        "new frame has no transfer baseline"
+        "新会话不复用旧的传输基线"
     );
     assert_eq!(
         Manifest::decode(&transfer.root).unwrap(),

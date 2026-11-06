@@ -1230,30 +1230,20 @@ impl From<RawLcmFrame> for GuardedMapFrame {
 #[cfg(feature = "guard-runtime")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GuardedMapAuthority {
-    committed_map: schema::CommittedMapIdentity,
-    producer_runtime_generation: i64,
-    map_frame_generation: i64,
-    cloud_revision: i64,
-    cloud_occupancy_revision: i64,
-    cloud_commit_sequence: i64,
-    cloud_source_timestamp_ns: i64,
-    commit_boot_nonce: [u8; 16],
+    session_id: String,
+    revision: i64,
+    frame_id: String,
 }
 
 #[cfg(feature = "guard-runtime")]
 impl GuardedMapAuthority {
     fn same_domain(&self, other: &Self) -> bool {
-        self.producer_runtime_generation == other.producer_runtime_generation
-            && self.committed_map.session_id == other.committed_map.session_id
-            && self.committed_map.session_generation == other.committed_map.session_generation
-            && self.committed_map.frame_id == other.committed_map.frame_id
-            && self.map_frame_generation == other.map_frame_generation
-            && self.commit_boot_nonce == other.commit_boot_nonce
+        self.session_id == other.session_id
     }
 
     fn permits_goal(&self, goal: &schema::NavigationGoal) -> bool {
-    self.committed_map.frame_id == goal.goal.header.frame_id
-}
+        self.frame_id == goal.goal.header.frame_id
+    }
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -1563,17 +1553,10 @@ where
                                 Err(error)=>{diagnostics.reject("planar_navigation",&error);continue;}
                             };
                             source_received_at = Instant::now().checked_sub(Duration::from_nanos(now.saturating_sub(value.source_timestamp_ns).max(0) as u64));
-                            let authority=GuardedMapAuthority {
-                                committed_map:schema::CommittedMapIdentity {
-                                    session_id:value.session_id.clone(),session_generation:value.session_generation,
-                                    revision:value.map_revision,commit_boot_nonce:value.map_boot_nonce,
-                                    commit_sequence:value.map_commit_sequence,source_timestamp_ns:value.map_source_timestamp_ns,
-                                    frame_id:value.grid.header.frame_id.clone(),
-                                },
-                                producer_runtime_generation:value.runtime_generation,
-                                map_frame_generation:value.map_frame_generation,cloud_revision:0,
-                                cloud_occupancy_revision:0,cloud_commit_sequence:0,cloud_source_timestamp_ns:0,
-                                commit_boot_nonce:value.map_boot_nonce,
+                            let authority = GuardedMapAuthority {
+                                session_id: value.session_id.clone(),
+                                revision: value.map_revision,
+                                frame_id: value.grid.header.frame_id.clone(),
                             };
                             if changed || value.cleared {
                                 // 切域的同一输入共享来源时间基准，避免首帧被自己的处理时刻拒绝。
@@ -1666,7 +1649,7 @@ where
                         let surface=recent_source.attach_terrain(surface);
                         (
                             OwnerInput::Accepted(GuardedCostmapInput {
-                                map_frame: update.authority.committed_map.frame_id.clone(),
+                                map_frame: update.authority.frame_id.clone(),
                                 observation: nuwax_nav_runtime::CostmapObservation {
                                     costmap: nuwax_nav_runtime::ExecutionMap::SurfaceUpdate(nuwax_nav_runtime::surface_changes::SurfaceMapUpdate {
                                         snapshot: surface, change_basis: update.change_basis, changes: update.geometry_changes,
@@ -2515,8 +2498,7 @@ fn build_guarded_navigation_status(
         current: telemetry.current,
         progress: telemetry.progress,
         message,
-        runtime_generation: planner_observation
-            .map_or(0, |_| saturating_i64(telemetry.runtime_generation)),
+        runtime_generation: saturating_i64(telemetry.runtime_generation),
 
         pose_source_timestamp_ns: status.pose_source_timestamp_ns,
         costmap_source_timestamp_ns: status.costmap_source_timestamp_ns,
@@ -8585,7 +8567,7 @@ path: schema::Path {
             build_guarded_navigation_status(&terminal, &telemetry, None, Duration::from_secs(1));
         assert_eq!(terminal_message.session_id, "goal-a");
         assert_eq!(terminal_message.planner_runtime_generation, 22);
-        assert_eq!(terminal_message.runtime_generation, 0);
+        assert_eq!(terminal_message.runtime_generation, 42);
 
         assert!(clear_terminal_session_after_publication(
             &mut active,

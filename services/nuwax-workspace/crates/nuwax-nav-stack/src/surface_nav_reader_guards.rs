@@ -145,7 +145,7 @@ async fn observed<T>(mut read: impl FnMut() -> Option<T>) -> T {
 async fn ingress(harness: &Harness, message: &schema::NavigationMap3D) -> Ingress {
     harness.map(message).await;
     observed(|| harness.hub.reader_guard.events.lock().unwrap().ingress.iter()
-        .find(|e| e.revision == message.cloud_revision).copied()).await
+        .find(|e| e.revision == message.revision).copied()).await
 }
 async fn finished(probe: &ReaderGuardProbe, revision: i64) -> Finished {
     observed(|| probe.events.lock().unwrap().finished.iter()
@@ -164,7 +164,7 @@ fn installed(harness: &Harness) -> PreparedSurfaceMap {
 }
 async fn installed_revision(harness: &Harness, revision: i64) -> PreparedSurfaceMap {
     observed(|| harness.hub.latest.lock().unwrap().as_ref()
-        .filter(|m| m.authority.cloud_revision == revision && m.snapshot.is_ok()).cloned()).await
+        .filter(|m| m.authority.revision == revision && m.snapshot.is_ok()).cloned()).await
 }
 
 struct FineSeries {
@@ -178,7 +178,7 @@ impl FineSeries {
     fn new(seed: &schema::NavigationMap3D) -> Self {
         let repository = Repository::temporary().unwrap();
         let mut writer = Writer::new(repository.clone(), 0.05, 4 * 1024 * 1024).unwrap();
-        let mut basis = map_message(seed.cloud_revision + 1, &seed.committed_map.session_id);
+        let mut basis = map_message(seed.revision + 1, &seed.session_id);
         basis.source_voxel_size = 0.05;
         basis.cloud.width = 0;
         basis.cloud.row_step = 0;
@@ -187,7 +187,7 @@ impl FineSeries {
         writer.observe((0..80).flat_map(|x| (0..60).map(move |y| [x, y, 40])),
             basis.source_timestamp_ns as u64).unwrap();
         let root = writer.snapshot(schema::navigation_map_3d_domain(&basis),
-            basis.cloud_revision as u64, basis.source_timestamp_ns as u64).unwrap();
+            basis.revision as u64, basis.source_timestamp_ns as u64).unwrap();
         let first = Self::message(&basis, &repository, &root, true);
         assert!(root.blocks.iter().all(|b| first.fine.as_ref().unwrap().included.contains_key(&b.object)));
 
@@ -225,8 +225,8 @@ impl FineSeries {
             // precisely the same uncached object O unavailable to the Reader.
             let message = Self::message(&partial, &repository, &next, false);
             assert!(message.fine.as_ref().unwrap().included.is_empty());
-            assert_eq!(message.committed_map, partial.committed_map);
-            assert_eq!(message.commit_sequence, partial.commit_sequence);
+            assert_eq!(message.session_id, partial.session_id);
+            assert_eq!(message.revision, partial.revision);
             assert_eq!(message.source_timestamp_ns, partial.source_timestamp_ns);
             assert_eq!(message.virtual_obstacles, partial.virtual_obstacles);
             watermarks.push(message);
@@ -249,7 +249,7 @@ impl FineSeries {
     fn message(basis: &schema::NavigationMap3D, repository: &Repository,
         root: &Manifest, all_inline: bool) -> schema::NavigationMap3D {
         let mut message = basis.clone();
-        message.cloud_revision = i64::try_from(root.revision).unwrap();
+        message.revision = i64::try_from(root.revision).unwrap();
         message.cloud.header.seq = i32::try_from(root.revision).unwrap();
         let included = root.blocks.iter().filter(|_| all_inline).map(|block|
             (block.object, repository.read_object(block.object, MAX_BLOCK_BYTES).unwrap())).collect();
@@ -279,9 +279,9 @@ async fn active(harness: &mut Harness) -> (FineSeries, PreparedSurfaceMap, schem
     // Prepare every Writer publication before any failed-input retry deadline.
     let series = FineSeries::new(&seed);
     let received = ingress(&harness, &series.first).await;
-    let retained = installed_revision(&harness, series.first.cloud_revision).await;
+    let retained = installed_revision(&harness, series.first.revision).await;
     assert_eq!(retained.received_at, received.received_at);
-    let built = finished(&harness.hub.reader_guard, series.first.cloud_revision).await;
+    let built = finished(&harness.hub.reader_guard, series.first.revision).await;
     assert!(built.success && !built.awaiting && built.missing.is_none());
     let goal = goal_for(&series.first, 1, [3.2, 1.55, 2.5]);
     harness.goal(&goal).await;
@@ -414,11 +414,11 @@ async fn same_missing_watermarks(queued_while_inflight: bool) {
         let (series, retained, goal, path_revision) = active(&mut harness).await;
         let probe = Arc::clone(&harness.hub.reader_guard);
         // This gate drops before catch_unwind completes, before explicit cleanup.
-        let gate = queued_while_inflight.then(|| ReturnGate::arm(&probe, series.partial.cloud_revision));
+        let gate = queued_while_inflight.then(|| ReturnGate::arm(&probe, series.partial.revision));
         let receipt = ingress(&harness, &series.partial).await;
-        assert_real_failure(finished(&probe, series.partial.cloud_revision).await, receipt, series.missing);
+        assert_real_failure(finished(&probe, series.partial.revision).await, receipt, series.missing);
         let before = if queued_while_inflight { None }
-            else { Some(decision(&probe, series.partial.cloud_revision).await) };
+            else { Some(decision(&probe, series.partial.revision).await) };
         for watermark in &series.watermarks {
             let admitted = ingress(&harness, watermark).await;
             if let Some(backoff) = before {
@@ -432,28 +432,28 @@ async fn same_missing_watermarks(queued_while_inflight: bool) {
             }
         }
         drop(gate);
-        let backoff = decision(&probe, series.partial.cloud_revision).await;
+        let backoff = decision(&probe, series.partial.revision).await;
         assert_eq!(backoff.received_at, receipt.received_at);
         assert_eq!(backoff.missing, Some(series.missing));
         assert!(backoff.retained && backoff.dependency_present);
         assert_eq!(backoff.effective_deadline, backoff.original_deadline);
         if queued_while_inflight {
-            assert_eq!(backoff.pending_revision, Some(series.watermarks.last().unwrap().cloud_revision));
+            assert_eq!(backoff.pending_revision, Some(series.watermarks.last().unwrap().revision));
         } else {
-            assert_eq!(backoff.pending_revision, Some(series.partial.cloud_revision));
+            assert_eq!(backoff.pending_revision, Some(series.partial.revision));
         }
         assert_retained(&harness, &retained, path_revision);
         let latest = series.watermarks.last().unwrap();
-        let retry = started(&probe, latest.cloud_revision).await;
+        let retry = started(&probe, latest.revision).await;
         assert!(retry.at >= backoff.original_deadline,
             "same O watermark worker started before the exact established deadline");
         let latest_ingress = probe.events.lock().unwrap().ingress.iter()
-            .find(|e| e.revision == latest.cloud_revision).copied().unwrap();
+            .find(|e| e.revision == latest.revision).copied().unwrap();
         assert_eq!(retry.received_at, latest_ingress.received_at);
-        assert_eq!(probe.count(series.partial.cloud_revision), 1);
-        assert_eq!(probe.count(latest.cloud_revision), 1, "latest pending must eventually start");
+        assert_eq!(probe.count(series.partial.revision), 1);
+        assert_eq!(probe.count(latest.revision), 1, "latest pending must eventually start");
         for skipped in &series.watermarks[..series.watermarks.len() - 1] {
-            assert_eq!(probe.count(skipped.cloud_revision), 0, "older pending root must not be resurrected");
+            assert_eq!(probe.count(skipped.revision), 0, "older pending root must not be resurrected");
         }
         assert_retained(&harness, &retained, path_revision);
         harness.cancel(&goal).await;
@@ -467,11 +467,11 @@ async fn complete_successor(queued_while_inflight: bool) {
     let business = std::panic::AssertUnwindSafe(async {
         let (series, retained, goal, path_revision) = active(&mut harness).await;
         let probe = Arc::clone(&harness.hub.reader_guard);
-        let gate = queued_while_inflight.then(|| ReturnGate::arm(&probe, series.partial.cloud_revision));
+        let gate = queued_while_inflight.then(|| ReturnGate::arm(&probe, series.partial.revision));
         let receipt = ingress(&harness, &series.partial).await;
-        assert_real_failure(finished(&probe, series.partial.cloud_revision).await, receipt, series.missing);
+        assert_real_failure(finished(&probe, series.partial.revision).await, receipt, series.missing);
         let before = if queued_while_inflight { None }
-            else { Some(decision(&probe, series.partial.cloud_revision).await) };
+            else { Some(decision(&probe, series.partial.revision).await) };
         assert_retained(&harness, &retained, path_revision);
         let successor_receipt = ingress(&harness, &series.complete).await;
         if let Some(backoff) = before {
@@ -482,30 +482,30 @@ async fn complete_successor(queued_while_inflight: bool) {
             assert!(successor_receipt.in_flight);
         }
         drop(gate);
-        let backoff = decision(&probe, series.partial.cloud_revision).await;
+        let backoff = decision(&probe, series.partial.revision).await;
         assert_eq!(backoff.received_at, receipt.received_at);
         assert_eq!(backoff.missing, Some(series.missing));
         assert!(backoff.retained);
         if queued_while_inflight {
-            assert_eq!(backoff.pending_revision, Some(series.complete.cloud_revision));
+            assert_eq!(backoff.pending_revision, Some(series.complete.revision));
             assert!(backoff.effective_deadline < backoff.original_deadline);
             assert!(!backoff.dependency_present);
         } else {
             assert_eq!(backoff.effective_deadline, backoff.original_deadline);
             assert!(backoff.dependency_present);
         }
-        let attempt = started(&probe, series.complete.cloud_revision).await;
+        let attempt = started(&probe, series.complete.revision).await;
         assert!(attempt.at < backoff.original_deadline,
             "complete successor inherited the failed root's exact one-second deadline");
         assert_eq!(attempt.received_at, successor_receipt.received_at);
-        let current = installed_revision(&harness, series.complete.cloud_revision).await;
-        let built = finished(&probe, series.complete.cloud_revision).await;
+        let current = installed_revision(&harness, series.complete.revision).await;
+        let built = finished(&probe, series.complete.revision).await;
         assert!(built.success && !built.awaiting && built.missing.is_none());
         assert_eq!(current.received_at, successor_receipt.received_at);
         assert_eq!(current.source_timestamp_ns, series.complete.source_timestamp_ns);
         assert_eq!(current.authority, map_authority(&series.complete));
-        assert_eq!(probe.count(series.partial.cloud_revision), 1);
-        assert_eq!(probe.count(series.complete.cloud_revision), 1);
+        assert_eq!(probe.count(series.partial.revision), 1);
+        assert_eq!(probe.count(series.complete.revision), 1);
         harness.cancel(&goal).await;
         harness.terminal(TerminalOutcome::Cancelled).await;
     }).catch_unwind().await;

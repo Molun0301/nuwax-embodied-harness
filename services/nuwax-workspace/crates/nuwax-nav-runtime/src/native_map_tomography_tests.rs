@@ -193,7 +193,7 @@ fn heightfield_floor(height: impl Fn(f64) -> f64, extra: &[[i32; 3]], max_step: 
     }
     writer.observe(extra.iter().copied(), 20).unwrap();
     points.extend(extra.iter().map(|&[x, y, z]| ((x as f32 + 0.5) * Q, (y as f32 + 0.5) * Q, (z as f32 + 0.5) * Q)));
-    let domain = Domain { session: "tomography-ground".into(), generation: 1, frame_generation: 0, producer_generation: 1 };
+    let domain = Domain { session: "tomography-ground".into(), };
     let root = writer.snapshot(domain, 1, 20).unwrap();
     let mut receiver = Receiver::new(Repository::temporary().unwrap());
     receiver.receive(&Transfer { root: root.encode().unwrap(), included: BTreeMap::new() }, &root.domain,

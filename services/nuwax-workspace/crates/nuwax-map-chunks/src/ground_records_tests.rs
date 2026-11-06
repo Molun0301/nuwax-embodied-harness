@@ -4,7 +4,7 @@ use heightfield_observations::HeightfieldColumn;
 use std::io::{Cursor, Read};
 const BUDGET: usize = 4 * 1024 * 1024;
 const Q: f32 = 0.05;
-fn domain() -> Domain { Domain { session: "heightfield-storage".into(), generation: 1, frame_generation: 0, producer_generation: 1 } }
+fn domain() -> Domain { Domain { session: "heightfield-storage".into(), } }
 fn writer() -> Writer { Writer::new(Repository::temporary().unwrap(), Q, BUDGET).unwrap() }
 fn surface(xy: [i32; 2], zs: &[i32]) -> HeightfieldSurface {
     HeightfieldSurface { column: HeightfieldColumn::from_counts(xy, Q,

@@ -911,10 +911,7 @@ mod tests {
             .seal(
                 nuwax_map_chunks::Domain {
                     session: "清理缓存验证".into(),
-                    generation: 1,
-                    frame_generation: 0,
-                    producer_generation: 1,
-                },
+                    },
                 1,
                 100,
             )

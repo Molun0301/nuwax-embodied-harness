@@ -44,7 +44,7 @@ fn registered_generation_change_and_revocation_retire_inflight_results() {
     worker.step();
     assert_eq!(started.recv_timeout(Duration::from_secs(1)).unwrap(),Some(original.identity.clone()));
     let mut replacement=(*crate::registered_frame::test_frame(2)).clone();
-    replacement.identity.domain.runtime_generation+=1;
+    replacement.identity.domain.session_id.push_str("-new");
     let identity=replacement.identity.clone();
     worker.observe_registered_frame(Some(Arc::new(replacement)));
     release.send(()).unwrap();

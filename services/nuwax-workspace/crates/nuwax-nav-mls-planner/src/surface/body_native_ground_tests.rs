@@ -131,8 +131,7 @@ fn scene_with_native_columns(columns:impl Fn(i32,i32)->Vec<HeightfieldColumn>,
     }}
     writer.observe(extra.iter().copied(),20).unwrap();
     points.extend(extra.iter().map(|&[x,y,z]|((x as f32+0.5)*Q,(y as f32+0.5)*Q,(z as f32+0.5)*Q)));
-    let root=writer.snapshot(Domain {session:"body-native-contract".into(),generation:1,
-        frame_generation:0,producer_generation:1},1,20).unwrap();
+    let root=writer.snapshot(Domain {session:"body-native-contract".into(),},1,20).unwrap();
     let mut receiver=Receiver::new(Repository::temporary().unwrap());
     receiver.receive(&Transfer {root:root.encode().unwrap(),included:BTreeMap::new()},&root.domain,
         |_,r|writer.repository().read_object(r.object,nuwax_map_chunks::MAX_BLOCK_BYTES)).unwrap();

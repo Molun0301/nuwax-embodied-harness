@@ -73,7 +73,7 @@ service GeometryRuntime {
   // 其它状态 → FAILED_PRECONDITION（“当前没有正在建的地图”）。
   rpc SaveMap(SaveMapRequest) returns (SaveMapResponse);
 
-  // 加载已保存地图作为定位基准，阶段 = 已加载未定位；之后调用 Relocalize。
+  // 加载已保存地图，阶段 = 已加载未定位。view_only 为真时只可查看，其余地图可调用 Relocalize。
   // 任何状态都允许，先结束当前状态。地图不存在 → NOT_FOUND；文件损坏 → DATA_LOSS（原因写明文件）。
   rpc LoadMap(LoadMapRequest) returns (GeometryState);
 
@@ -210,6 +210,8 @@ message GeometryState {
   // 等待目标的规则：自己的 goal_id 是 navigation.goal_id → 看它的状态；是 previous_navigation.goal_id → 用它的终态；
   // 两者都不是 → 视为被替换（已被更新的命令取代）。
   NavigationStatus previous_navigation = 9;
+  // 已加载的故障保存图缺少二维定位图，仅可查看。
+  bool view_only = 10;
 }
 
 // 静态信息。替代 v2 HealthCheck 中输入桥与显示需要的字段（见待决问题 Q2）。

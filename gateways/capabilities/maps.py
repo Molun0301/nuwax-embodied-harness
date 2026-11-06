@@ -103,10 +103,11 @@ def relocalize(platform, ctx, args):
 
 @rpc_errors
 def load_map(platform, ctx, args):
-    platform.geometry.load_map(args["map_name"], timeout_sec=ctx.remaining())
+    loaded = platform.geometry.load_map(args["map_name"], timeout_sec=ctx.remaining())
     ctx.check()
-    result = relocalize(platform, ctx, args)
-    return result
+    if loaded.view_only:
+        return {"map_name": loaded.map_name, "localized": False, "reason": loaded.reason}
+    return relocalize(platform, ctx, args)
 
 
 @rpc_errors

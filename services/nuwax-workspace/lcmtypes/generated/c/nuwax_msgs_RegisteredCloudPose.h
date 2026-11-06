@@ -8,8 +8,8 @@
 
 #include <stdint.h>
 #include <stdlib.h>
-#include <lcm/lcm_coretypes.h>
-#include <lcm/lcm.h>
+#include "lcm/lcm_coretypes.h"
+#include "lcm/lcm.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,9 +36,9 @@ struct _nuwax_msgs_RegisteredCloudPose
     double     body_orientation_xyzw[4];
 
     /**
-     * 同帧注册绑定携带的修正代次，不从当前状态推算。
+     * 与本帧配对的原始里程计时间。
      */
-    int64_t    registration_correction_revision;
+    int64_t    paired_odometry_timestamp_ns;
 };
 
 /**

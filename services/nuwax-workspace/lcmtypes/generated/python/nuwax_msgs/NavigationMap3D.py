@@ -15,51 +15,23 @@ import sensor_msgs
 
 class NavigationMap3D(object):
 
-    __slots__ = ["schema_version", "producer_runtime_generation", "map_session_id", "map_session_generation", "occupancy_revision", "occupancy_commit_boot_nonce", "occupancy_commit_sequence", "occupancy_source_timestamp_ns", "frame_id", "map_frame_generation", "cloud_revision", "cloud_occupancy_revision", "source_timestamp_ns", "source_voxel_size", "commit_boot_nonce", "commit_sequence", "cleared", "has_virtual_obstacles", "virtual_obstacles", "has_fine_map", "fine_manifest_length", "fine_manifest", "fine_blocks_length", "fine_blocks", "cloud"]
+    __slots__ = ["session_id", "revision", "frame_id", "source_timestamp_ns", "source_voxel_size", "cleared", "has_virtual_obstacles", "virtual_obstacles", "has_fine_map", "fine_manifest_length", "fine_manifest", "fine_blocks_length", "fine_blocks", "cloud"]
 
-    __typenames__ = ["int32_t", "int64_t", "string", "int64_t", "int64_t", "byte", "int64_t", "int64_t", "string", "int64_t", "int64_t", "int64_t", "int64_t", "float", "byte", "int64_t", "int8_t", "int8_t", "nav_msgs.OccupancyGrid", "int8_t", "int32_t", "byte", "int32_t", "nuwax_msgs.NavigationMapBlock", "sensor_msgs.PointCloud2"]
+    __typenames__ = ["string", "int64_t", "string", "int64_t", "float", "int8_t", "int8_t", "nav_msgs.OccupancyGrid", "int8_t", "int32_t", "byte", "int32_t", "nuwax_msgs.NavigationMapBlock", "sensor_msgs.PointCloud2"]
 
-    __dimensions__ = [None, None, None, None, None, [16], None, None, None, None, None, None, None, None, [16], None, None, None, None, None, None, ["fine_manifest_length"], None, ["fine_blocks_length"], None]
-
-    SCHEMA_VERSION_V4 = 4
+    __dimensions__ = [None, None, None, None, None, None, None, None, None, None, ["fine_manifest_length"], None, ["fine_blocks_length"], None]
 
     def __init__(self):
-        self.schema_version = 0
-        """ LCM Type: int32_t """
-        self.producer_runtime_generation = 0
-        """ LCM Type: int64_t """
-        self.map_session_id = ""
+        self.session_id = ""
         """ LCM Type: string """
-        self.map_session_generation = 0
-        """ LCM Type: int64_t """
-        self.occupancy_revision = 0
-        """ LCM Type: int64_t """
-        self.occupancy_commit_boot_nonce = b""
-        """ LCM Type: byte[16] """
-        self.occupancy_commit_sequence = 0
-        """ LCM Type: int64_t """
-        self.occupancy_source_timestamp_ns = 0
+        self.revision = 0
         """ LCM Type: int64_t """
         self.frame_id = ""
         """ LCM Type: string """
-        self.map_frame_generation = 0
-        """ LCM Type: int64_t """
-        self.cloud_revision = 0
-        """ LCM Type: int64_t """
-        self.cloud_occupancy_revision = 0
-        """
-        The occupancy baseline retained in the original cloud receipt.
-        LCM Type: int64_t
-        """
-
         self.source_timestamp_ns = 0
         """ LCM Type: int64_t """
         self.source_voxel_size = 0.0
         """ LCM Type: float """
-        self.commit_boot_nonce = b""
-        """ LCM Type: byte[16] """
-        self.commit_sequence = 0
-        """ LCM Type: int64_t """
         self.cleared = 0
         """
         0为生效地图，1为显式清空，2为建图地面块提交失败后的来源撤销。
@@ -99,21 +71,16 @@ class NavigationMap3D(object):
         return buf.getvalue()
 
     def _encode_one(self, buf):
-        buf.write(struct.pack(">iq", self.schema_version, self.producer_runtime_generation))
-        __map_session_id_encoded = self.map_session_id.encode('utf-8')
-        buf.write(struct.pack('>I', len(__map_session_id_encoded)+1))
-        buf.write(__map_session_id_encoded)
+        __session_id_encoded = self.session_id.encode('utf-8')
+        buf.write(struct.pack('>I', len(__session_id_encoded)+1))
+        buf.write(__session_id_encoded)
         buf.write(b"\0")
-        buf.write(struct.pack(">qq", self.map_session_generation, self.occupancy_revision))
-        buf.write(bytearray(self.occupancy_commit_boot_nonce[:16]))
-        buf.write(struct.pack(">qq", self.occupancy_commit_sequence, self.occupancy_source_timestamp_ns))
+        buf.write(struct.pack(">q", self.revision))
         __frame_id_encoded = self.frame_id.encode('utf-8')
         buf.write(struct.pack('>I', len(__frame_id_encoded)+1))
         buf.write(__frame_id_encoded)
         buf.write(b"\0")
-        buf.write(struct.pack(">qqqqf", self.map_frame_generation, self.cloud_revision, self.cloud_occupancy_revision, self.source_timestamp_ns, self.source_voxel_size))
-        buf.write(bytearray(self.commit_boot_nonce[:16]))
-        buf.write(struct.pack(">qbb", self.commit_sequence, self.cleared, self.has_virtual_obstacles))
+        buf.write(struct.pack(">qfbb", self.source_timestamp_ns, self.source_voxel_size, self.cleared, self.has_virtual_obstacles))
         assert self.virtual_obstacles._get_packed_fingerprint() == nav_msgs.OccupancyGrid._get_packed_fingerprint()
         self.virtual_obstacles._encode_one(buf)
         buf.write(struct.pack(">bi", self.has_fine_map, self.fine_manifest_length))
@@ -138,17 +105,12 @@ class NavigationMap3D(object):
     @staticmethod
     def _decode_one(buf):
         self = NavigationMap3D()
-        self.schema_version, self.producer_runtime_generation = struct.unpack(">iq", buf.read(12))
-        __map_session_id_len = struct.unpack('>I', buf.read(4))[0]
-        self.map_session_id = buf.read(__map_session_id_len)[:-1].decode('utf-8', 'replace')
-        self.map_session_generation, self.occupancy_revision = struct.unpack(">qq", buf.read(16))
-        self.occupancy_commit_boot_nonce = buf.read(16)
-        self.occupancy_commit_sequence, self.occupancy_source_timestamp_ns = struct.unpack(">qq", buf.read(16))
+        __session_id_len = struct.unpack('>I', buf.read(4))[0]
+        self.session_id = buf.read(__session_id_len)[:-1].decode('utf-8', 'replace')
+        self.revision = struct.unpack(">q", buf.read(8))[0]
         __frame_id_len = struct.unpack('>I', buf.read(4))[0]
         self.frame_id = buf.read(__frame_id_len)[:-1].decode('utf-8', 'replace')
-        self.map_frame_generation, self.cloud_revision, self.cloud_occupancy_revision, self.source_timestamp_ns, self.source_voxel_size = struct.unpack(">qqqqf", buf.read(36))
-        self.commit_boot_nonce = buf.read(16)
-        self.commit_sequence, self.cleared, self.has_virtual_obstacles = struct.unpack(">qbb", buf.read(10))
+        self.source_timestamp_ns, self.source_voxel_size, self.cleared, self.has_virtual_obstacles = struct.unpack(">qfbb", buf.read(14))
         self.virtual_obstacles = nav_msgs.OccupancyGrid._decode_one(buf)
         self.has_fine_map, self.fine_manifest_length = struct.unpack(">bi", buf.read(5))
         self.fine_manifest = buf.read(self.fine_manifest_length)
@@ -163,7 +125,7 @@ class NavigationMap3D(object):
     def _get_hash_recursive(parents):
         if NavigationMap3D in parents: return 0
         newparents = parents + [NavigationMap3D]
-        tmphash = (0x467d85c9ae5bfda7+ nav_msgs.OccupancyGrid._get_hash_recursive(newparents)+ nuwax_msgs.NavigationMapBlock._get_hash_recursive(newparents)+ sensor_msgs.PointCloud2._get_hash_recursive(newparents)) & 0xffffffffffffffff
+        tmphash = (0xe54ec3305fbad7c1+ nav_msgs.OccupancyGrid._get_hash_recursive(newparents)+ nuwax_msgs.NavigationMapBlock._get_hash_recursive(newparents)+ sensor_msgs.PointCloud2._get_hash_recursive(newparents)) & 0xffffffffffffffff
         tmphash  = (((tmphash<<1)&0xffffffffffffffff) + (tmphash>>63)) & 0xffffffffffffffff
         return tmphash
     _packed_fingerprint = None

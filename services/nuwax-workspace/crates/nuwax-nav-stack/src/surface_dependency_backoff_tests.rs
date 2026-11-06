@@ -30,7 +30,7 @@ impl DependencyFixture {
         let mut cache = SurfaceGeometryCache::configured(&config());
         let source = cache.build(&first).unwrap();
         let mut failed = first.clone();
-        failed.cloud_revision = 2;
+        failed.revision = 2;
         failed.cloud.header.seq = 2;
         // A new authentic observation changes immutable IDs while geometry is
         // retained. All fixture mutation happens outside any timing assertion.
@@ -38,7 +38,7 @@ impl DependencyFixture {
         writer.observe(cells, stamp as u64).unwrap();
         let root = writer.snapshot(schema::navigation_map_3d_domain(&failed), 2, stamp as u64).unwrap();
         failed.source_timestamp_ns = stamp;
-        failed.committed_map.source_timestamp_ns = stamp;
+
         failed.cloud.header.stamp_sec = (stamp / 1_000_000_000) as i32;
         failed.cloud.header.stamp_nsec = (stamp % 1_000_000_000) as i32;
         if let Some(mask) = failed.virtual_obstacles.as_mut() {
@@ -58,7 +58,7 @@ impl DependencyFixture {
     }
     fn candidate(&self, root: &Manifest) -> schema::NavigationMap3D {
         let mut message = self.failed.clone();
-        message.cloud_revision = root.revision as i64;
+        message.revision = root.revision as i64;
         message.cloud.header.seq = root.revision as i32;
         message.fine = Some(Transfer { root: root.encode().unwrap(), included: Default::default() });
         schema::validate_navigation_map_3d(&message).unwrap();
@@ -147,8 +147,8 @@ fn dependency_present_mask_requires_actual_layout_and_cells() {
     let dependency = fixture.dependency();
     assert!(dependency.still_blocked(&fixture.failed, Some(&fixture.root)));
     let mut clock_only = fixture.failed.clone();
-    clock_only.committed_map.revision += 1;
-    clock_only.committed_map.commit_sequence += 1;
+    clock_only.revision += 1;
+
     clock_only.virtual_obstacles.as_mut().unwrap().header.seq += 1;
     clock_only.virtual_obstacles.as_mut().unwrap().info.map_load_time_sec += 1;
     schema::validate_navigation_map_3d(&clock_only).unwrap();

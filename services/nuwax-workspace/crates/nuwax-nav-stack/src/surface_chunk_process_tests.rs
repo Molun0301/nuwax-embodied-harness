@@ -133,7 +133,7 @@ fn message(repository:&Repository,revision:u64,variant:u16)->schema::NavigationM
 }
 fn message_with_points(repository:&Repository,revision:u64,variant:u16,point_count:u16)->schema::NavigationMap3D {
     let stamp=1_700_000_000_000_000_000+revision;
-    let domain=Domain{session:"remote-fine".into(),generation:1,frame_generation:1,producer_generation:17};
+    let domain=Domain{session:"remote-fine".into(),};
     let mut references=Vec::new();
     for x in 0..3 {
         let block=Block::from_iter((0..point_count).map(|id|(id,Evidence{observed_ns:stamp,hits:variant})));
@@ -147,10 +147,10 @@ fn message_with_points(repository:&Repository,revision:u64,variant:u16,point_cou
         source_timestamp_ns:stamp,voxel_size_m:0.05,blocks:references}.encode().unwrap();
     std::fs::write(repository.path().join(format!("manifest-{revision}.json")), &root).unwrap();
     schema::NavigationMap3D {
-        schema_version:schema::NAVIGATION_MAP_3D_SCHEMA_VERSION,producer_runtime_generation:17,
-        committed_map:schema::CommittedMapIdentity{session_id:"remote-fine".into(),session_generation:1,revision:revision as i64,commit_boot_nonce:[4;16],commit_sequence:revision as i64,source_timestamp_ns:stamp as i64,frame_id:"map".into()},
-        map_frame_generation:1,cloud_revision:revision as i64,cloud_occupancy_revision:revision as i64,source_timestamp_ns:stamp as i64,source_voxel_size:0.05,
-        commit_boot_nonce:[4;16],commit_sequence:revision as i64,cleared:false,ground_block_failed:false,virtual_obstacles:None,
+        session_id: "remote-fine".into(), frame_id: "map".into(),
+
+        revision:revision as i64,source_timestamp_ns:stamp as i64,source_voxel_size:0.05,
+        cleared:false,ground_block_failed:false,virtual_obstacles:None,
         fine:Some(Transfer{root,included:BTreeMap::new()}),
         cloud:schema::PointCloud2{header:schema::Header{seq:revision as i32,stamp_sec:(stamp/1_000_000_000) as i32,stamp_nsec:(stamp%1_000_000_000) as i32,frame_id:"map".into()},height:1,width:0,fields:["x","y","z"].iter().enumerate().map(|(i,name)|schema::PointField{name:(*name).into(),offset:(i*4) as i32,datatype:7,count:1}).collect(),is_bigendian:false,point_step:12,row_step:0,data:Vec::new(),is_dense:true},
     }
@@ -304,7 +304,7 @@ async fn recorded_large_block_crosses_real_process_rpc_with_original_deadlines()
     std::fs::write(root.join("manifest-1.json"),&encoded).unwrap();
     input.fine.as_mut().unwrap().root=encoded;
     input.source_timestamp_ns=manifest.source_timestamp_ns as i64;
-    input.committed_map.source_timestamp_ns=input.source_timestamp_ns;
+
     input.cloud.header.stamp_sec=(latest/1_000_000_000) as i32;
     input.cloud.header.stamp_nsec=(latest%1_000_000_000) as i32;
     let (url,rpc_name)=test_endpoint();

@@ -4,10 +4,7 @@ use nuwax_map_chunks::{block_key, Key, RegionReader};
 fn domain() -> nuwax_map_chunks::Domain {
     nuwax_map_chunks::Domain {
         session: "fine-revoke-locality".into(),
-        generation: 1,
-        frame_generation: 1,
-        producer_generation: 1,
-    }
+        }
 }
 
 #[test]

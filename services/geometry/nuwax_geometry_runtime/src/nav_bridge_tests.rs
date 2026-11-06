@@ -26,9 +26,13 @@ impl Capture {
         self.inject_ready_named("");
     }
     fn inject_ready_named(&self, id: &str) {
+        self.inject_ready_generation(id, 17);
+    }
+    fn inject_ready_generation(&self, id: &str, runtime_generation: i64) {
         let now = unix_ns() as i64;
         let state = schema::NavigationStatus {
             session_id: id.into(),
+            runtime_generation,
             state: 1,
             goal_status: schema::NAVIGATION_GOAL_STATUS_PLANNING,
             input_ready: true,
@@ -481,5 +485,34 @@ async fn disconnected_sent_goal_reports_reason_and_cancel_rebuilds_channel() {
         proto::GoalStatus::Planning as i32
     );
     assert_eq!(capture.goals().len(), 2);
+    bridge.shutdown().await;
+}
+
+
+#[tokio::test]
+async fn restart_fails_dispatched_goal_and_does_not_resend_it() {
+    let capture = Arc::new(Capture::new());
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let bridge = NavBridge::with_transport(LcmTransport::new(capture.clone()), tx)
+        .await
+        .unwrap();
+    bridge.set_input_ready(true);
+    capture.inject_ready_generation("", 42);
+    bridge.submit("在途目标".into(), goal(), false).await.unwrap();
+    assert_eq!(rx.recv().await.unwrap().status, proto::GoalStatus::WaitingInput as i32);
+    assert_eq!(rx.recv().await.unwrap().status, proto::GoalStatus::Planning as i32);
+    assert_eq!(capture.goals().len(), 1);
+
+    // 同一进程的目标编号可变化；启动标识即使变小，也表示进程变了。
+    capture.inject_ready_generation("另一个目标", 42);
+    let unrelated = rx.recv().await.unwrap();
+    assert_eq!(unrelated.goal_id, "另一个目标");
+    capture.inject_ready_generation("", 9);
+    let failed = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await.unwrap().unwrap();
+    assert_eq!(failed.goal_id, "在途目标");
+    assert_eq!(failed.status, proto::GoalStatus::Failed as i32);
+    assert_eq!(failed.message, "导航栈已重启，目标中断");
+    assert_eq!(capture.goals().len(), 1);
     bridge.shutdown().await;
 }

@@ -73,6 +73,7 @@ impl NavBridge {
             let mut active: Option<proto::NavigationStatus> = None;
             let mut input_ready = false;
             let mut stack_ready = false;
+            let mut stack_generation = None;
             loop {
                 tokio::select! {
                     command = rx.recv() => {
@@ -139,6 +140,15 @@ impl NavBridge {
                         };
                         let Ok(state) = schema::decode_navigation_status_body(&frame.payload) else { continue; };
                         stack_ready = state.input_ready;
+                        let restarted = stack_generation.replace(state.runtime_generation)
+                            .is_some_and(|previous| previous != state.runtime_generation);
+                        if restarted && pending.is_none() {
+                            if let Some(mut goal) = active.take() {
+                                goal.status = proto::GoalStatus::Failed as i32;
+                                goal.message = "导航栈已重启，目标中断".into();
+                                let _ = status_tx.send(goal);
+                            }
+                        }
                         if !state.session_id.is_empty() {
                             if let Some(update) = state_update(state) {
                                 if active.as_ref().is_some_and(|goal| goal.goal_id == update.goal_id)

@@ -625,7 +625,7 @@ fn preview_map(
     let poses = nuwax_cloud_cleanup::scan_log::FinalPoses {
         session: nuwax_cloud_cleanup::scan_log::Session {
             session_id: root.domain().session.clone(),
-            generation: root.domain().generation,
+            generation: crate::pointcloud::SCAN_LOG_GENERATION,
         },
         cloud_revision: root.revision(),
         frame_generation: None,

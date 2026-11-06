@@ -65,10 +65,7 @@ fn offline_cleanup_removes_person_from_unfiltered_saved_assets_and_keeps_static(
         .seal(
             nuwax_map_chunks::Domain {
                 session: session.session_id.clone(),
-                generation: 1,
-                frame_generation: 0,
-                producer_generation: 1,
-            },
+                },
             1,
             6_000_000_000,
         )

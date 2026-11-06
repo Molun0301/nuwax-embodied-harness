@@ -22,7 +22,7 @@ fn calibrated_config() -> SurfaceNavigationConfig {
 
 fn set_source_clock(message: &mut schema::NavigationMap3D, timestamp_ns: i64) {
     message.source_timestamp_ns = timestamp_ns;
-    message.committed_map.source_timestamp_ns = timestamp_ns;
+
     message.cloud.header.stamp_sec = (timestamp_ns / 1_000_000_000) as i32;
     message.cloud.header.stamp_nsec = (timestamp_ns % 1_000_000_000) as i32;
 }
@@ -53,13 +53,13 @@ fn flat_message(width: i32, height: i32, session: &str) -> schema::NavigationMap
 // authority advances; cloning the fixture occurs before any measured work.
 fn next_occupancy(previous: &schema::NavigationMap3D) -> schema::NavigationMap3D {
     let mut next = previous.clone();
-    next.committed_map.revision += 1;
-    next.committed_map.commit_sequence += 1;
-    next.committed_map.source_timestamp_ns += 10;
+    next.revision += 1;
+
+
     if let Some(mask) = next.virtual_obstacles.as_mut() {
-        mask.header.seq = next.committed_map.revision as i32;
-        mask.header.stamp_sec = (next.committed_map.source_timestamp_ns / 1_000_000_000) as i32;
-        mask.header.stamp_nsec = (next.committed_map.source_timestamp_ns % 1_000_000_000) as i32;
+        mask.header.seq = next.revision as i32;
+        mask.header.stamp_sec = (next.source_timestamp_ns / 1_000_000_000) as i32;
+        mask.header.stamp_nsec = (next.source_timestamp_ns % 1_000_000_000) as i32;
     }
     next
 }
@@ -147,7 +147,8 @@ fn assert_current_message_oracle(
 fn occupancy_only_same_mask_reuses_surface_and_pct_with_current_receipt() {
     let configured = calibrated_config();
     let mut cache = SurfaceGeometryCache::configured(&configured);
-    let first_message = flat_message(40, 30, "same-mask");
+    let mut fixture = FineFixture::new();
+    let first_message = fixture.message(&fine_ground(), 1);
     let first_received = Instant::now() - Duration::from_secs(2);
     let first = prepare_surface_map(first_message.clone(), first_received, &configured, &mut cache);
     let old = first.snapshot.as_ref().unwrap();
@@ -163,9 +164,7 @@ fn occupancy_only_same_mask_reuses_surface_and_pct_with_current_receipt() {
     assert_ne!(next.authority, first.authority);
     assert_eq!(next.received_at, next_received);
     assert_eq!(first.received_at, first_received);
-    assert_eq!(next.source_timestamp_ns, SOURCE_NS);
-    assert_eq!(next.authority.cloud_source_timestamp_ns, SOURCE_NS);
-    assert_eq!(next.authority.committed_map.source_timestamp_ns, SOURCE_NS + 10);
+    assert_eq!(next.source_timestamp_ns, first_message.source_timestamp_ns);
     assert_eq!(cache.last_build_stats().unwrap().input_points, 0);
     assert_current_message_oracle(current, &next_message, &configured, true);
 
@@ -361,7 +360,7 @@ fn fine_geometry_change_inside_one_coarse_cell_invalidates_pct_despite_mask_reus
 
 #[test]
 fn reset_clear_and_domain_changes_discard_derived_mask_reuse() {
-    for variant in ["reset", "clear", "session", "session_generation", "runtime", "frame_generation", "boot_nonce"] {
+    for variant in ["reset", "clear", "session"] {
         let configured = calibrated_config();
         let mut cache = SurfaceGeometryCache::configured(&configured);
         let first_message = flat_message(40, 30, "mask-reset");
@@ -381,14 +380,7 @@ fn reset_clear_and_domain_changes_discard_derived_mask_reuse() {
                 assert!(cache.physical_snapshot().is_none());
                 next_message = next_occupancy(&next_message);
             },
-            "session" => next_message.committed_map.session_id = "replacement-domain".into(),
-            "session_generation" => next_message.committed_map.session_generation += 1,
-            "runtime" => next_message.producer_runtime_generation += 1,
-            "frame_generation" => next_message.map_frame_generation += 1,
-            "boot_nonce" => {
-                next_message.commit_boot_nonce = [0x55; 16];
-                next_message.committed_map.commit_boot_nonce = [0x55; 16];
-            },
+            "session" => next_message.session_id = "replacement-domain".into(),
             _ => unreachable!(),
         }
         schema::validate_navigation_map_3d(&next_message).unwrap();
@@ -424,18 +416,18 @@ async fn incomplete_fine_retains_present_mask_only_for_same_contents_and_domain(
             (first_mask.info.map_load_time_sec, first_mask.info.map_load_time_nsec),
             (next_mask.info.map_load_time_sec, next_mask.info.map_load_time_nsec),
         );
-        assert!(candidate.committed_map.revision > first.committed_map.revision);
+        assert!(candidate.revision > first.revision);
         match variant {
             "same_mask_new_receipt" => {},
             "cell" => candidate.virtual_obstacles.as_mut().unwrap().data[1] = 100,
             "layout" => candidate.virtual_obstacles.as_mut().unwrap().info.origin.position[0] = 0.25,
             "domain" => {
-                candidate.committed_map.session_id = "f1-present-mask-new-domain".into();
+                candidate.session_id = "f1-present-mask-new-domain".into();
                 // The replacement domain is sealed by the same real Writer,
                 // rather than forging a root header that admission would reject.
                 let root = fixture.writer.snapshot(
                     schema::navigation_map_3d_domain(&candidate),
-                    candidate.cloud_revision as u64,
+                    candidate.revision as u64,
                     candidate.source_timestamp_ns as u64,
                 ).unwrap();
                 let included = root.blocks.iter().map(|block| (block.object,

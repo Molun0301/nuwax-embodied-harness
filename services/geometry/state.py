@@ -124,6 +124,7 @@ class GeometrySnapshot:
     relocalization: Optional[RelocalizationResult]
     info: RuntimeInfo
     previous_navigation: Optional[NavigationStatus] = None
+    view_only: bool = False
 
     @property
     def can_navigate(self) -> bool:

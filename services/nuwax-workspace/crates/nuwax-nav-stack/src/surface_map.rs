@@ -61,8 +61,7 @@ enum GeometryRevision {
 #[derive(Clone, PartialEq, Eq)]
 struct MaskRevision {
     domain: nuwax_map_chunks::Domain,
-    commit_boot_nonce: [u8; 16],
-    occupancy_revision: i64,
+    revision: i64,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -93,7 +92,6 @@ pub struct SurfaceMapRetryDependency {
     object: nuwax_map_chunks::ObjectIdentity,
     key: nuwax_map_chunks::Key,
     domain: nuwax_map_chunks::Domain,
-    commit_boot_nonce: [u8; 16],
     source: Option<Arc<SurfaceSnapshot>>,
     mask: Option<MaskLayout>,
 }
@@ -110,7 +108,7 @@ impl SurfaceMapRetryDependency {
         message: &schema::NavigationMap3D,
         source: Option<Arc<SurfaceSnapshot>>,
     ) -> Self {
-        Self { object, key, domain: root.domain.clone(), commit_boot_nonce: message.commit_boot_nonce,
+        Self { object, key, domain: root.domain.clone(),
             source, mask: message.virtual_obstacles.as_ref().map(MaskLayout::new) }
     }
 
@@ -126,7 +124,6 @@ impl SurfaceMapRetryDependency {
     ) -> bool {
         let (Some(root), Some(fine)) = (root, message.fine.as_ref()) else { return false; };
         if message.cleared || self.domain != root.domain
-            || self.commit_boot_nonce != message.commit_boot_nonce
             || fine.included.contains_key(&self.object) {
             return false;
         }
@@ -322,7 +319,6 @@ impl SurfaceMapCache {
         let same_mask = match (&previous.mask_revision, &message.virtual_obstacles) {
             (None, None) => true,
             (Some(old), Some(mask)) => old.domain == *domain
-                && old.commit_boot_nonce == message.commit_boot_nonce
                 // Incomplete retention uses actual borrowed contents, including
                 // same-receipt input; no new trust in an identity-only shortcut.
                 && previous.mask_layout.as_ref() == Some(&MaskLayout::new(mask))
@@ -347,7 +343,7 @@ impl SurfaceMapCache {
             self.reset();
             return Err(schema::navigation_map_clear_reason(message).into());
         }
-        if message.committed_map.frame_id != self.config.world_frame {
+        if message.frame_id != self.config.world_frame {
             return Err("surface map frame differs from configured map frame".into());
         }
         let fine_root = if message.fine.is_some() {
@@ -381,13 +377,12 @@ impl SurfaceMapCache {
             None => GeometryRevision::FullCloud {
                 domain: domain.clone(),
                 resolution: message.source_voxel_size.to_bits(),
-                publication_revision: message.cloud_revision,
+                publication_revision: message.revision,
             },
         };
         let mask_revision = message.virtual_obstacles.as_ref().map(|_| MaskRevision {
             domain,
-            commit_boot_nonce: message.commit_boot_nonce,
-            occupancy_revision: message.committed_map.revision,
+            revision: message.revision,
         });
         let mask_layout = message.virtual_obstacles.as_ref().map(MaskLayout::new);
         let mut frontier_changes = None;
@@ -440,7 +435,7 @@ impl SurfaceMapCache {
         // existing exact column comparison on each new publication revision.
         self.fine_built_root = fine_root.clone();
         tracing::debug!(target: "navigation.surface.build", event="surface.build.stages",
-            cloud_revision=message.cloud_revision, receive_ms, observations_ms,
+            cloud_revision=message.revision, receive_ms, observations_ms,
             geometry_ms=started.elapsed().as_secs_f64()*1000.0-receive_ms-observations_ms,
             stats=?self.last_stats, "表面构建阶段耗时");
         #[cfg(test)]
@@ -450,9 +445,7 @@ impl SurfaceMapCache {
             let (Some(old), Some(next), Some(mask)) =
                 (&previous.mask_revision, &mask_revision, &message.virtual_obstacles)
                 else { return false; };
-            if old.domain != next.domain || old.commit_boot_nonce != next.commit_boot_nonce
-                || old.occupancy_revision >= next.occupancy_revision
-                || previous.mask_layout != mask_layout
+            if old.domain != next.domain || previous.mask_layout != mask_layout
             { return false; }
             // 比较借用完整输入与已有积分图，不保留或复制另一份遮罩。
             previous.matches_mask_contents(mask, || {

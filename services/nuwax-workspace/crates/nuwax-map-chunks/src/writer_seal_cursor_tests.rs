@@ -2,7 +2,7 @@ use super::*;
 
 const BUDGET: usize = 4 * 1024 * 1024;
 fn domain() -> Domain {
-    Domain { session: "seal-cursor-oracle".into(), generation: 1, frame_generation: 0, producer_generation: 1 }
+    Domain { session: "seal-cursor-oracle".into(), }
 }
 fn deterministic_writer(budget: usize) -> Writer {
     let mut sequence = 0_u64;
@@ -32,14 +32,6 @@ impl Pair {
         assert_eq!(actual, expected); // Complete Manifest, not only revision counters.
         self.assert_state();
         actual
-    }
-    fn rehome(&mut self, frame: u64) -> Arc<Manifest> {
-        let expected = self.actual.published.as_ref().unwrap().identity();
-        let actual = self.actual.rehome_published_frame(&expected, frame).map(|sealed| sealed.root);
-        let oracle = self.oracle.rehome_published_frame(&expected, frame).map(|sealed| sealed.root);
-        assert_eq!(actual, oracle);
-        self.assert_state();
-        actual.unwrap()
     }
     fn assert_state(&self) {
         let a = &self.actual;
@@ -246,32 +238,6 @@ fn seal_cursor_net_remove_readd_survives_real_pressure_flush() {
 }
 
 #[test]
-fn seal_cursor_rehome_preserves_pressure_flushed_and_dirty_net_geometry() {
-    let mut pair = Pair::new(BUDGET);
-    pair.edit(|w| w.observe([[0, 0, 0], [32, 0, 0], [64, 0, 0]], 1)).unwrap();
-    pair.seal(domain(), 3, 1).unwrap();
-    pair.seal(domain(), 7, 1).unwrap();
-    let mut readers = OldReaders::capture(&pair);
-    pair.edit(|w| w.remove([[0, 0, 0]])).unwrap();
-    pair.edit(Writer::flush).unwrap();
-    pair.edit(|w| w.observe([[0, 0, 0]], 2)).unwrap();
-    let encoded = pair.actual.encoded_blocks;
-    pair.edit(|w| w.observe([[32, 0, 0]], 2)).unwrap();
-    assert_eq!(pair.actual.encoded_blocks, encoded + 1);
-    let counts = pair.actual.repository.counts();
-    let moved = pair.rehome(1);
-    assert_eq!(pair.actual.repository.counts(), counts);
-    assert_eq!(geometry(&moved), vec![7; 3]);
-    let next = pair.seal(moved.domain.clone(), 8, 2).unwrap();
-    assert_eq!(geometry(&next), vec![7; 3]);
-    assert_eq!(next.geometry_revision, 7);
-    assert_eq!(next.blocks[0].block_revision, 8);
-    assert_eq!(next.blocks[1].block_revision, 8);
-    assert_eq!(next.blocks[2], moved.blocks[2]);
-    readers.verify(&pair);
-}
-
-#[test]
 fn seal_cursor_same_count_key_swap_and_sparse_inheritance_keep_fallback_results() {
     let mut pair = Pair::new(BUDGET * 2);
     pair.edit(|w| w.observe([[0, 0, 0], [32, 0, 0], [64, 0, 0], [96, 0, 0]], 1)).unwrap();
@@ -307,32 +273,6 @@ fn seal_cursor_same_count_key_swap_and_sparse_inheritance_keep_fallback_results(
 
 
 
-
-#[test]
-fn seal_cursor_failed_install_rehome_and_retry_preserve_frozen_ids() {
-    let mut pair = Pair::new(BUDGET * 2);
-    pair.edit(|w| w.observe([[0, 0, 0], [32, 0, 0], [64, 0, 0]], 1)).unwrap();
-    pair.seal(domain(), 2, 1).unwrap();
-    pair.seal(domain(), 7, 1).unwrap();
-    let mut readers = OldReaders::capture(&pair);
-    pair.edit(|w| w.observe([[0, 0, 0], [32, 0, 0]], 2)).unwrap();
-    pair.edit(|w| { w.repository.fail_put_after(Some(1)); Ok(()) }).unwrap();
-    assert_eq!(pair.seal(domain(), 8, 2).unwrap_err(), "injected object write failure");
-    let ids = pair.actual.pending_ids();
-    assert_eq!(ids.len(), 2);
-    let encoded = pair.actual.encoded_blocks;
-    assert!(Arc::ptr_eq(pair.actual.published.as_ref().unwrap(), &readers.actual.root));
-    let moved = pair.rehome(1);
-    assert_eq!(pair.actual.pending_ids(), ids);
-    assert_eq!(pair.seal(moved.domain.clone(), 8, 2).unwrap_err(), "injected object write failure");
-    assert_eq!(pair.actual.encoded_blocks, encoded);
-    pair.edit(|w| { w.repository.fail_put_after(None); Ok(()) }).unwrap();
-    let next = pair.seal(moved.domain.clone(), 8, 2).unwrap();
-    assert_eq!(next.blocks[..2].iter().map(|b| b.object).collect::<Vec<_>>(), ids);
-    assert_eq!(pair.actual.encoded_blocks, encoded);
-    assert_eq!(geometry(&next), vec![7; 3]);
-    readers.verify(&pair);
-}
 
 #[test]
 fn seal_cursor_error_precedence_and_final_validation_keep_original_state() {

@@ -21,20 +21,15 @@ uint64_t __nuwax_msgs_RecentCloud3D_hash_recursive(const __lcm_hash_ptr *p)
     cp.v = __nuwax_msgs_RecentCloud3D_get_hash;
     (void) cp;
 
-    uint64_t hash = (uint64_t)0x7fb76b6a7b9abea7LL
-         + __int32_t_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
+    uint64_t hash = (uint64_t)0x2f6848a33e798931LL
          + __string_hash_recursive(&cp)
          + __int64_t_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
-         + __byte_hash_recursive(&cp)
          + __int8_t_hash_recursive(&cp)
          + __int32_t_hash_recursive(&cp)
          + __nuwax_msgs_RegisteredCloudPose_hash_recursive(&cp)
          + __int32_t_hash_recursive(&cp)
          + __int32_t_hash_recursive(&cp)
-         + __int32_t_hash_recursive(&cp)
-         + __byte_hash_recursive(&cp)
+         + __sensor_msgs_PointCloud2_hash_recursive(&cp)
         ;
 
     return (hash<<1) + ((hash>>63)&1);
@@ -57,22 +52,10 @@ int __nuwax_msgs_RecentCloud3D_encode_array(void *buf, int offset, int maxlen, c
 
     for (element = 0; element < elements; element++) {
 
-        thislen = __int32_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].schema_version), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].producer_runtime_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
         thislen = __string_encode_array(buf, offset + pos, maxlen - pos, &(p[element].session_id), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].session_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].map_frame_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __byte_encode_array(buf, offset + pos, maxlen - pos, p[element].commit_boot_nonce, 16);
+        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].sequence), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int8_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].cleared), 1);
@@ -90,10 +73,7 @@ int __nuwax_msgs_RecentCloud3D_encode_array(void *buf, int offset, int maxlen, c
         thislen = __int32_t_encode_array(buf, offset + pos, maxlen - pos, p[element].ground_point_indices, p[element].ground_point_count);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int32_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].cloud_bytes_count), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __byte_encode_array(buf, offset + pos, maxlen - pos, p[element].cloud_bytes, p[element].cloud_bytes_count);
+        thislen = __sensor_msgs_PointCloud2_encode_array(buf, offset + pos, maxlen - pos, &(p[element].cloud), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
     }
@@ -119,17 +99,9 @@ int __nuwax_msgs_RecentCloud3D_encoded_array_size(const nuwax_msgs_RecentCloud3D
     int size = 0, element;
     for (element = 0; element < elements; element++) {
 
-        size += __int32_t_encoded_array_size(&(p[element].schema_version), 1);
-
-        size += __int64_t_encoded_array_size(&(p[element].producer_runtime_generation), 1);
-
         size += __string_encoded_array_size(&(p[element].session_id), 1);
 
-        size += __int64_t_encoded_array_size(&(p[element].session_generation), 1);
-
-        size += __int64_t_encoded_array_size(&(p[element].map_frame_generation), 1);
-
-        size += __byte_encoded_array_size(p[element].commit_boot_nonce, 16);
+        size += __int64_t_encoded_array_size(&(p[element].sequence), 1);
 
         size += __int8_t_encoded_array_size(&(p[element].cleared), 1);
 
@@ -141,9 +113,7 @@ int __nuwax_msgs_RecentCloud3D_encoded_array_size(const nuwax_msgs_RecentCloud3D
 
         size += __int32_t_encoded_array_size(p[element].ground_point_indices, p[element].ground_point_count);
 
-        size += __int32_t_encoded_array_size(&(p[element].cloud_bytes_count), 1);
-
-        size += __byte_encoded_array_size(p[element].cloud_bytes, p[element].cloud_bytes_count);
+        size += __sensor_msgs_PointCloud2_encoded_array_size(&(p[element].cloud), 1);
 
     }
     return size;
@@ -160,22 +130,10 @@ int __nuwax_msgs_RecentCloud3D_decode_array(const void *buf, int offset, int max
 
     for (element = 0; element < elements; element++) {
 
-        thislen = __int32_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].schema_version), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].producer_runtime_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
         thislen = __string_decode_array(buf, offset + pos, maxlen - pos, &(p[element].session_id), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].session_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].map_frame_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __byte_decode_array(buf, offset + pos, maxlen - pos, p[element].commit_boot_nonce, 16);
+        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].sequence), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int8_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].cleared), 1);
@@ -195,11 +153,7 @@ int __nuwax_msgs_RecentCloud3D_decode_array(const void *buf, int offset, int max
         thislen = __int32_t_decode_array(buf, offset + pos, maxlen - pos, p[element].ground_point_indices, p[element].ground_point_count);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int32_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].cloud_bytes_count), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        p[element].cloud_bytes = (uint8_t*) lcm_malloc(sizeof(uint8_t) * p[element].cloud_bytes_count);
-        thislen = __byte_decode_array(buf, offset + pos, maxlen - pos, p[element].cloud_bytes, p[element].cloud_bytes_count);
+        thislen = __sensor_msgs_PointCloud2_decode_array(buf, offset + pos, maxlen - pos, &(p[element].cloud), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
     }
@@ -212,17 +166,9 @@ int __nuwax_msgs_RecentCloud3D_decode_array_cleanup(nuwax_msgs_RecentCloud3D *p,
     int element;
     for (element = 0; element < elements; element++) {
 
-        __int32_t_decode_array_cleanup(&(p[element].schema_version), 1);
-
-        __int64_t_decode_array_cleanup(&(p[element].producer_runtime_generation), 1);
-
         __string_decode_array_cleanup(&(p[element].session_id), 1);
 
-        __int64_t_decode_array_cleanup(&(p[element].session_generation), 1);
-
-        __int64_t_decode_array_cleanup(&(p[element].map_frame_generation), 1);
-
-        __byte_decode_array_cleanup(p[element].commit_boot_nonce, 16);
+        __int64_t_decode_array_cleanup(&(p[element].sequence), 1);
 
         __int8_t_decode_array_cleanup(&(p[element].cleared), 1);
 
@@ -236,10 +182,7 @@ int __nuwax_msgs_RecentCloud3D_decode_array_cleanup(nuwax_msgs_RecentCloud3D *p,
         __int32_t_decode_array_cleanup(p[element].ground_point_indices, p[element].ground_point_count);
         if (p[element].ground_point_indices) free(p[element].ground_point_indices);
 
-        __int32_t_decode_array_cleanup(&(p[element].cloud_bytes_count), 1);
-
-        __byte_decode_array_cleanup(p[element].cloud_bytes, p[element].cloud_bytes_count);
-        if (p[element].cloud_bytes) free(p[element].cloud_bytes);
+        __sensor_msgs_PointCloud2_decode_array_cleanup(&(p[element].cloud), 1);
 
     }
     return 0;
@@ -271,17 +214,9 @@ int __nuwax_msgs_RecentCloud3D_clone_array(const nuwax_msgs_RecentCloud3D *p, nu
     int element;
     for (element = 0; element < elements; element++) {
 
-        __int32_t_clone_array(&(p[element].schema_version), &(q[element].schema_version), 1);
-
-        __int64_t_clone_array(&(p[element].producer_runtime_generation), &(q[element].producer_runtime_generation), 1);
-
         __string_clone_array(&(p[element].session_id), &(q[element].session_id), 1);
 
-        __int64_t_clone_array(&(p[element].session_generation), &(q[element].session_generation), 1);
-
-        __int64_t_clone_array(&(p[element].map_frame_generation), &(q[element].map_frame_generation), 1);
-
-        __byte_clone_array(p[element].commit_boot_nonce, q[element].commit_boot_nonce, 16);
+        __int64_t_clone_array(&(p[element].sequence), &(q[element].sequence), 1);
 
         __int8_t_clone_array(&(p[element].cleared), &(q[element].cleared), 1);
 
@@ -295,10 +230,7 @@ int __nuwax_msgs_RecentCloud3D_clone_array(const nuwax_msgs_RecentCloud3D *p, nu
         q[element].ground_point_indices = (int32_t*) lcm_malloc(sizeof(int32_t) * q[element].ground_point_count);
         __int32_t_clone_array(p[element].ground_point_indices, q[element].ground_point_indices, p[element].ground_point_count);
 
-        __int32_t_clone_array(&(p[element].cloud_bytes_count), &(q[element].cloud_bytes_count), 1);
-
-        q[element].cloud_bytes = (uint8_t*) lcm_malloc(sizeof(uint8_t) * q[element].cloud_bytes_count);
-        __byte_clone_array(p[element].cloud_bytes, q[element].cloud_bytes, p[element].cloud_bytes_count);
+        __sensor_msgs_PointCloud2_clone_array(&(p[element].cloud), &(q[element].cloud), 1);
 
     }
     return 0;

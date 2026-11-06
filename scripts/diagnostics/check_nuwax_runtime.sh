@@ -48,7 +48,8 @@ bar "1. 诊断输入"
 
 bar "2. motion guard:module / UDS / 单实例锁"
 GUARD_MODULE="${REPO_ROOT}/services/navigation/motion_safety_guard/__main__.py"
-GUARD_SOCKET="${NUWAX_MOTION_GUARD_SOCKET:-/run/nuwax/motion-guard.sock}"
+GUARD_SOCKET_RELATIVE="$(<"${REPO_ROOT}/services/navigation/proto/motion_guard_socket_relative.txt")"
+GUARD_SOCKET="${NUWAX_MOTION_GUARD_SOCKET:-${NUWAX_INSTALL_HOME:-${REPO_ROOT}}/${GUARD_SOCKET_RELATIVE}}"
 GUARD_LOCK="${NUWAX_MOTION_GUARD_LOCK:-/run/nuwax/motion-guard.lock}"
 if [[ -f "${GUARD_MODULE}" ]]; then
   ok "production module: services.navigation.motion_safety_guard"

@@ -13,5 +13,5 @@ pub mod measured_motion;
 pub mod wire;
 
 pub use client::{ClientConfig, MotionGuardClient, MotionGuardClientError};
-pub use constants::{DEFAULT_UDS_PATH, MAX_FRAME_BYTES};
+pub use constants::{motion_guard_socket_path, MAX_FRAME_BYTES};
 pub use measured_motion::MeasuredMotion;

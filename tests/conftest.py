@@ -38,6 +38,7 @@ def navigation_startup_root(tmp_path, monkeypatch):
     root = tmp_path / "启动配置"
     for relative in (
         "scripts/supervisor.py",
+        "services/navigation/proto/motion_guard_socket_relative.txt",
         "scripts/lib/config_env.sh", "scripts/resolve_navigation_pipeline.py",
         "scripts/resolve_robot_geometry.py", "contracts/navigation_pipeline.py",
         "core/config_values.py", "core/config_catalog.json", "core/robot_geometry.py",

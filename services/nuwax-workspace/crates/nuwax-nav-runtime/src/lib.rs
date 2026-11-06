@@ -25,7 +25,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{interval_at, Instant, MissedTickBehavior};
 
-pub use nuwax_motion_safety_guard::MeasuredMotion;
+pub use nuwax_motion_safety_guard::{motion_guard_socket_path, MeasuredMotion};
 /// 保留来源时点的实测运动边界转换。
 pub mod motion_feedback;
 /// 同帧注册点云原始输入，不是融合地图。

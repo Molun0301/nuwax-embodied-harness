@@ -109,6 +109,7 @@ _TERRAIN_SOURCE = "NUWAX_NAV_PCT_TERRAIN_SOURCE"
 # 指向的已选机器人方案接管显式配置文件，使测试结果依赖本机状态。
 _LAUNCHER_FILES = (
     "scripts/supervisor.py",
+    "services/navigation/proto/motion_guard_socket_relative.txt",
     "scripts/lib/config_env.sh",
     "scripts/resolve_navigation_pipeline.py", "scripts/resolve_robot_geometry.py",
     "contracts/navigation_pipeline.py", "core/config_values.py", "core/config_catalog.json",

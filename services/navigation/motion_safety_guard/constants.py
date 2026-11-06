@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-DEFAULT_SOCKET_PATH = "/run/nuwax/motion-guard.sock"
-
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 OWNER_TIMEOUT_NS = 750 * 1_000_000
 WATCHDOG_INTERVAL_SECONDS = 0.025

@@ -1148,14 +1148,13 @@ async fn run_guarded_nav_scheduler(
     let costmap_type = if planar_navigation_enabled() {nuwax_codec::lcm::planar_navigation::TYPE_NAME} else {"nav_msgs.OccupancyGrid"};
     let costmaps = typed_stream(&transport, &node.inputs[3], costmap_type).await?;
     let cancels = typed_stream(&transport, &node.inputs[4], "nuwax_msgs.CancelNavigation").await?;
-    let socket_path = std::env::var("NUWAX_MOTION_GUARD_SOCKET")
-        .unwrap_or_else(|_| "/run/nuwax/motion-guard.sock".to_string());
+    let socket_path = nuwax_nav_runtime::motion_guard_socket_path();
     let mut scheduler_config = nuwax_nav_runtime::SchedulerConfig::default();
     if planar_navigation_enabled() {
         scheduler_config.costmap_ttl = Duration::from_nanos(nuwax_codec::lcm::planar_navigation::MAX_SOURCE_AGE_NS as u64);
     }
     let (scheduler, task) = nuwax_nav_runtime::spawn_production_scheduler(
-        std::path::PathBuf::from(socket_path),
+        socket_path,
         scheduler_config,
     )
     .await

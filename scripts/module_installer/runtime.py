@@ -197,7 +197,7 @@ def write_runtime(
         "NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE": "",
         "NUWAX_GEOMETRY_SLAM2D_BINARY": str(binary_dir / "nuwax-slam-2d-worker") if "slam2d" in selected else "",
         # 套接字路径不能超过107字节，放在安装根而非版本目录下。
-        "NUWAX_MOTION_GUARD_SOCKET": str(prefix.parent.parent / "run/motion-guard.sock"),
+        "NUWAX_MOTION_GUARD_SOCKET": _VALUES.motion_guard_socket(prefix.parent.parent),
         "NUWAX_MOTION_GUARD_LOCK": str(prefix.parent.parent / "run/motion-guard.lock"),
     }
     if robot == "go2":

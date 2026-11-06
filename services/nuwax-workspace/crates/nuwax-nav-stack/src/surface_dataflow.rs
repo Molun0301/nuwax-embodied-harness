@@ -157,8 +157,7 @@ async fn run_surface_scheduler(
     ready: ReadySender,
 ) -> NavStackResult<()> {
     let transport = lcm_transport()?;
-    let socket = std::env::var("NUWAX_MOTION_GUARD_SOCKET")
-        .unwrap_or_else(|_| "/run/nuwax/motion-guard.sock".into());
+    let socket = nuwax_nav_runtime::motion_guard_socket_path();
     let scheduler_config = nuwax_nav_runtime::SchedulerConfig::default();
     run_surface_scheduler_with_transport(node, hub, transport, shutdown, ready, config.follower.max_observation_age_sec.map(Duration::from_secs_f64), async move {
         nuwax_nav_runtime::spawn_production_surface_scheduler(

@@ -14,6 +14,7 @@ from typing import Any, Dict, Mapping, Optional
 
 # 模块加载时固定物理目录，避免高频状态查询重复遍历磁盘路径。
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_MOTION_GUARD_SOCKET_DEFINITION = _PROJECT_ROOT / "services/navigation/proto/motion_guard_socket_relative.txt"
 _KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SNAPSHOT: ContextVar = ContextVar("nuwax_config_snapshot", default=None)
 # 已由当前进程配置加载器读取的值；控制台预览不会改写该记录。
@@ -223,6 +224,14 @@ def _runtime_file_values() -> Dict[str, str]:
 def runtime_value(name: str, default=None):
     """供未使用结构化配置的进程边界读取设置；文件在进程首次读取时固定。"""
     return record_value(name, raw_value(name, default, _runtime_file_values()))
+
+
+def motion_guard_socket(install_home=None, configured=None):
+    """从共同路径定义解析安装根下的守卫地址。"""
+    if configured:
+        return configured
+    relative_path = _MOTION_GUARD_SOCKET_DEFINITION.read_text(encoding="utf-8").strip()
+    return str(Path(install_home or _PROJECT_ROOT) / relative_path)
 
 
 def main() -> None:

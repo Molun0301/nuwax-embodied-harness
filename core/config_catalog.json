@@ -659,7 +659,7 @@
   "NUWAX_MOTION_GUARD_SOCKET": {
     "zh_name": "运动控制通信套接字",
     "type": "str",
-    "default": "/run/nuwax/motion-guard.sock",
+    "default": "",
     "section_id": "robot",
     "target_file": "core_env",
     "consumers": [
@@ -668,7 +668,7 @@
       "services/navigation/motion_safety_guard/__main__.py"
     ],
     "apply_scope": "重启网关、几何运行时、导航后端、运动控制进程后生效",
-    "description": "运动控制进程监听的本地套接字路径，网关、几何运行时和导航通过它下发运动指令，各进程须使用同一路径。"
+    "description": "运动控制进程监听的本地套接字路径。默认位于安装根的 run/motion-guard.sock，所有使用方共用。"
   },
   "NUWAX_LOG_FORMAT": {
     "zh_name": "终端日志格式",
@@ -1005,11 +1005,12 @@
   "NUWAX_CLOUDMAP_SHM_PATH": {
     "zh_name": "点云地图共享内存文件",
     "type": "str",
-    "default": "/tmp/nuwax_cloudmap.mmap",
+    "default": "/dev/shm/nuwax_cloudmap",
     "section_id": "shm_uds",
     "target_file": "core_env",
     "consumers": [
-      "services/geometry/nuwax_geometry_runtime/src/lcm_runtime.rs"
+      "services/geometry/nuwax_geometry_runtime/src/pointcloud.rs",
+      "gateways/streams.py"
     ],
     "apply_scope": "重启网关和几何运行时后生效",
     "description": "几何运行时写出三维点云地图的共享内存文件，网关从中读取用于网页显示和保存地图。"

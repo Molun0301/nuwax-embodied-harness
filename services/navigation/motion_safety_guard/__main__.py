@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import os
 import logging
-from core.config_values import runtime_value
+from core.config_values import motion_guard_socket, runtime_value
 from pathlib import Path
 import signal
 from typing import Optional
 import threading
 
-from .constants import DEFAULT_SOCKET_PATH
 from .core import MotionGuardCore
 from .go2_actuator import ActuatorError, Go2Actuator
 from .motion_control_actuator import MotionControlActuator
@@ -16,7 +15,9 @@ from .server import MotionGuardUnixServer
 
 
 def run() -> None:
-    socket_path = Path(runtime_value("NUWAX_MOTION_GUARD_SOCKET", DEFAULT_SOCKET_PATH)).expanduser().resolve()
+    socket_path = Path(motion_guard_socket(
+        os.environ.get("NUWAX_INSTALL_HOME"), runtime_value("NUWAX_MOTION_GUARD_SOCKET", "")
+    )).expanduser().resolve()
     stop_event = threading.Event()
 
     def request_stop(_signum: int, _frame: object) -> None:

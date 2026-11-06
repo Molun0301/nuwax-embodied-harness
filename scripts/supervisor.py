@@ -29,6 +29,8 @@ def parent_death_signal():
 
 def load_environment(root):
     """沿共同解析器读取一次配置，再物化原启动脚本的参数。"""
+    from core.config_values import motion_guard_socket
+
     raw = subprocess.check_output(
         ["bash", "-ec", 'source scripts/lib/config_env.sh; load_platform_config; env -0'], cwd=root,
         env=dict(os.environ, PATH=str(Path(sys.executable).parent) + ":" + os.environ["PATH"]))
@@ -53,6 +55,9 @@ def load_environment(root):
     for key, value in defaults.items():
         if not env.get(key, "").strip():
             env[key] = value
+    env["NUWAX_MOTION_GUARD_SOCKET"] = motion_guard_socket(
+        env["NUWAX_INSTALL_HOME"], env.get("NUWAX_MOTION_GUARD_SOCKET")
+    )
     output = subprocess.check_output([sys.executable, str(root / "scripts/resolve_navigation_pipeline.py"), "--runtime-env"], env=env, text=True)
     env.update(dict(line.split("=", 1) for line in output.splitlines()))
     backend = env["NUWAX_GEOMETRY_LIO_BACKEND"]
@@ -108,7 +113,7 @@ def component_table(root, env):
     follow_ready = Path(env["NUWAX_PERSON_FOLLOW_READY_FILE"] + ".runtime")
     return {
         "motion_guard": Component([python, "-m", "services.navigation.motion_safety_guard"],
-            ready=lambda: socket_ready(env.get("NUWAX_MOTION_GUARD_SOCKET", "/run/nuwax/motion-guard.sock")),
+            ready=lambda: socket_ready(env["NUWAX_MOTION_GUARD_SOCKET"]),
             enabled=bool(env.get("NUWAX_MOTION_GUARD_BACKEND"))),
         "nav_stack": Component([env.get("NUWAX_NAV_STACK_BINARY", str(native / "nuwax-nav-stack")), "--profile=" + env["NUWAX_NAV_PROFILE"]],
             {"NUWAX_NAV_STACK_INTERNAL_READY_FILE": str(nav_ready)}, ("motion_guard",), nav_ready,
@@ -285,4 +290,6 @@ async def main():
 
 
 if __name__ == "__main__":
+    if not __package__:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     raise SystemExit(asyncio.run(main()))

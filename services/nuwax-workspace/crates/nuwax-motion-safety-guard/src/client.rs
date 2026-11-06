@@ -1,6 +1,6 @@
 //! 新守卫协议的有序 Unix 套接字客户端；导航调度器独占连接与租约。
 
-use crate::constants::{DEFAULT_UDS_PATH, MAX_FRAME_BYTES};
+use crate::constants::{motion_guard_socket_path, MAX_FRAME_BYTES};
 use crate::wire::{
     guard_request, guard_response, AcquireRequest, ErrorCode, GuardRequest, GuardResponse,
     ReleaseRequest, Source, StatusRequest, StatusResponse, VelocityRequest, VelocityResponse,
@@ -20,7 +20,7 @@ pub struct ClientConfig {
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
-            socket_path: DEFAULT_UDS_PATH.into(),
+            socket_path: motion_guard_socket_path(),
         }
     }
 }

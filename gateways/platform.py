@@ -10,7 +10,7 @@ import time
 
 from core import components
 from core.capability import CapabilityTable
-from core.config_values import runtime_value
+from core.config_values import motion_guard_socket, runtime_value
 from core.errors import GatewayError
 from core.event_bus import EventBus
 from core.state_store import StateStore
@@ -117,8 +117,8 @@ def build_platform(config) -> Platform:
                 + manipulation.CAPABILITIES):
         platform.capabilities.register(cap)
     platform.tasks = TaskRunner(platform)
-    home = Path(os.environ.get("NUWAX_INSTALL_HOME", config.base_dir))
-    platform.motion = MotionClient(os.environ.get("NUWAX_MOTION_GUARD_SOCKET", str(home / "run/motion-guard.sock")))
+    home = os.environ.get("NUWAX_INSTALL_HOME", config.base_dir)
+    platform.motion = MotionClient(motion_guard_socket(home, os.environ.get("NUWAX_MOTION_GUARD_SOCKET")))
     platform.geometry = GeometryClient(f"127.0.0.1:{config.geometry.external.port}")
     platform.geometry_state = GeometryStateView(platform.geometry, platform.events)
     platform.maps = MapStore(config.runtime_data.map_catalog_root)

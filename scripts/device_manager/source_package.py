@@ -20,6 +20,7 @@ from .common import atomic_json, digest_file
 SOURCE_DIRECTORIES = ("scripts/device_manager", "scripts/module_installer")
 SOURCE_FILES = (
     "scripts/__init__.py", "core/config_values.py", "core/config_catalog.json",
+    "services/navigation/proto/motion_guard_socket_relative.txt",
     "core/config_descriptions.json", "scripts/neh_bootstrap.py", "scripts/neh_system_helper.py",
     "scripts/neh_source.py", "scripts/neh_source_build.py", "scripts/go2_dependencies.py",
     "scripts/neh_prebuilt.py",

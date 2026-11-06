@@ -28,6 +28,7 @@ pub(crate) use fine_cloud::{
 use paged_voxel_snapshot::{PagedVoxelSnapshot, CHUNK_POINTS};
 
 pub const VOXEL_SIZE: f32 = 0.05;
+const DEFAULT_CLOUDMAP_SHM_PATH: &str = include_str!("../proto/cloudmap_shm_path.txt");
 pub const POINTCLOUD_MAX_FRAME_POINTS: usize = 100_000;
 pub const POINTCLOUD_MAX_POINT_STEP_BYTES: u32 = 256;
 pub(crate) const MAX_VOXEL_SIZE: f32 = 1_048_576.;
@@ -580,7 +581,7 @@ fn domain(session_id: u64) -> nuwax_map_chunks::Domain {
 pub fn cloud_map_shm_path() -> PathBuf {
     std::env::var_os("NUWAX_CLOUDMAP_SHM_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/dev/shm/nuwax_cloudmap"))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CLOUDMAP_SHM_PATH.trim()))
 }
 struct CloudMapShmWriter {
     mmap: MmapMut,

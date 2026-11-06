@@ -21,6 +21,11 @@ import numpy as np
 from contracts.geometry_runtime import DEFAULT_MAP_FRAME
 
 
+DEFAULT_CLOUDMAP_SHM_PATH = (
+    Path(__file__).resolve().parent / "nuwax_geometry_runtime/proto/cloudmap_shm_path.txt"
+).read_text(encoding="utf-8").strip()
+
+
 _PCD_NUMPY_TYPES = {
     ("F", 4): "<f4",
     ("F", 8): "<f8",
@@ -720,8 +725,8 @@ class CloudMapMmapReader:
     PAGED_HEADER_SIZE = 512
     CHUNK_SIZE_POINTS = 1024
 
-    def __init__(self, shm_path: str = "/tmp/nuwax_cloudmap.mmap"):
-        self._path = Path(shm_path)
+    def __init__(self, shm_path: Optional[str] = None):
+        self._path = Path(DEFAULT_CLOUDMAP_SHM_PATH if shm_path is None else shm_path)
         self._mm: Optional[mmap.mmap] = None
         self._fd = None
         self._opened_identity: Optional[_FileIdentity] = None

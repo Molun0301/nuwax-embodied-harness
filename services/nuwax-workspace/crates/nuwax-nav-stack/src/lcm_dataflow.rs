@@ -454,8 +454,7 @@ fn runtime_input_error<T>(
 
     let fatal = matches!(
         &error,
-        RuntimeError::Motion(_)
-            | RuntimeError::SchedulerStopped
+        RuntimeError::SchedulerStopped
     );
     if fatal {
         Err(module_error(component, error))
@@ -823,10 +822,7 @@ pub(crate) fn guarded_nav_scheduler_owner(
 struct GuardedNavTelemetry {
     runtime_generation: u64,
     public_session_id: String,
-    owner_kind: i32,
-    parent_request_id: String,
-    goal_generation: i64,
-    cancel_generation: u64,
+    motion_generation: i64,
     map_frame: String,
     pose_frame: String,
     goal: [f64; 3],
@@ -838,7 +834,6 @@ struct GuardedNavTelemetry {
     initial_distance: f64,
     progress: f64,
     path_revision: i64,
-    producer_runtime_generation: i64,
     planner_runtime_generation: i64,
 }
 
@@ -1743,27 +1738,11 @@ where
                 let navigation_goal = match schema::decode_navigation_goal_body(&frame.payload) {
                     Ok(envelope) => envelope,
                     Err(error) => {
-                        // 契约完整但本机配置拒绝的目标仍属于原请求。保留不可执行
-                        // 的取消身份，避免上层已受理后永远得不到对应的归零回执。
-                        let mut rejected_telemetry = telemetry.clone();
-                        if active_session.is_none() {
-                            if let Ok(goal) = schema::decode_navigation_goal_body(&frame.payload) {
-                                if pose_from_schema(&goal.goal)
-                                    .and_then(|pose| require_map_pose(&pose, "rejected goal")).is_ok()
-                                    && !matches!(goal_buffer.observe_goal(goal.clone()), PlannerGoalIngress::Rejected(_))
-                                {
-                                    goal_buffer.pending_goal = Some(goal.clone());
-                                    goal_buffer.pending_invalidated = true;
-
-                                    rejected_telemetry = guarded_buffered_cancel_telemetry(&telemetry, &goal, 0);
-                                }
-                            }
-                        }
                         publish_guarded_rejection(
                             transport,
                             &node.outputs[1],
                             scheduler.status(),
-                            &rejected_telemetry,
+                            &telemetry,
                             "goal",
                             &format!("NavigationGoal rejected: {error}"),
                         )
@@ -1985,13 +1964,17 @@ where
                 let buffered_goal = goal_buffer.pending_goal.as_ref()
                     .filter(|goal| validate_cancel_goal_correlation(&cancel, goal).is_ok()).cloned();
                 if active_session.as_ref().is_some_and(|goal| validate_cancel_goal_correlation(&cancel, goal).is_ok()) {
-                    scheduler.cancel(&cancel.session_id).await.map_err(|error| module_error("导航取消", error))?;
+                    if let Err(error) = scheduler.cancel(&cancel.session_id).await {
+                        if let OwnerInput::Rejected(reason) = runtime_input_error::<()>("导航取消", error)? {
+                            diagnostics.reject("导航取消", &reason);
+                        }
+                    }
                     let snapshot = scheduler.status();
                     publish_guarded_nav_observation(transport, node, snapshot.clone(), &telemetry, None, &mut publications).await?;
                     clear_terminal_session_after_publication(&mut active_session, &mut telemetry, &snapshot);
                 }
                 if let Some(goal) = buffered_goal {
-                    let candidate = guarded_buffered_cancel_telemetry(&telemetry, &goal, 0);
+                    let candidate = guarded_buffered_cancel_telemetry(&telemetry, &goal,);
                     let mut snapshot = scheduler.status();
                     snapshot.phase = nuwax_nav_runtime::SchedulerPhase::Idle;
                     snapshot.session_id = None;
@@ -2140,11 +2123,7 @@ async fn activate_guarded_goal(
     ];
     candidate_telemetry.goal_z = goal.pose.position.z;
     candidate_telemetry.public_session_id = navigation_goal.session_id.clone();
-    candidate_telemetry.owner_kind = schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV;
-    candidate_telemetry.parent_request_id = String::new();
-    candidate_telemetry.goal_generation = navigation_goal.motion_generation as i64;
-    candidate_telemetry.producer_runtime_generation = 0;
-    candidate_telemetry.cancel_generation = 0;
+    candidate_telemetry.motion_generation = navigation_goal.motion_generation as i64;
     candidate_telemetry.path_revision = 0;
     candidate_telemetry.planner_runtime_generation = 0;
     candidate_telemetry.initial_distance = telemetry_distance(&candidate_telemetry);
@@ -2164,8 +2143,6 @@ async fn activate_guarded_goal(
         if matches!(error, nuwax_nav_runtime::RuntimeError::LeaseNotGranted(_)) {
             // 明确未授予的拒绝属于本次候选目标，不能发布旧目标或空闲心跳。
             let mut rejected = scheduler.status();
-            rejected.phase = nuwax_nav_runtime::SchedulerPhase::Failed;
-            rejected.last_terminal = Some(nuwax_nav_runtime::TerminalOutcome::Stopped);
             rejected.message = error.to_string();
             publish_guarded_nav_state(transport, &node.outputs[1], rejected, &candidate_telemetry, None).await?;
             return Ok(GuardedGoalActivation::LeaseRejected);
@@ -2220,13 +2197,9 @@ fn clear_terminal_active_session(
 #[cfg(feature = "guard-runtime")]
 fn clear_guarded_session_telemetry(telemetry: &mut GuardedNavTelemetry) {
     telemetry.public_session_id.clear();
-    telemetry.owner_kind = 0;
-    telemetry.parent_request_id.clear();
-    telemetry.goal_generation = 0;
-    telemetry.cancel_generation = 0;
+    telemetry.motion_generation = 0;
     telemetry.goal = [0.0; 3];
     telemetry.goal_z = 0.0;
-    telemetry.producer_runtime_generation = 0;
     telemetry.path_revision = 0;
     telemetry.planner_runtime_generation = 0;
     telemetry.initial_distance = 0.0;
@@ -2286,22 +2259,17 @@ fn validate_cancel_goal_correlation(
 fn guarded_buffered_cancel_telemetry(
     telemetry: &GuardedNavTelemetry,
     goal: &schema::NavigationGoal,
-    cancel_generation: u64,
 ) -> GuardedNavTelemetry {
     let goal_pose =
         pose_from_schema(&goal.goal).expect("buffered goal pose was validated on ingress");
     let mut candidate = telemetry.clone();
     candidate.public_session_id = goal.session_id.clone();
-    candidate.owner_kind = schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV;
-    candidate.parent_request_id = String::new();
-    candidate.goal_generation = goal.motion_generation as i64;
-    candidate.cancel_generation = cancel_generation;
+    candidate.motion_generation = goal.motion_generation as i64;
     candidate.goal = [
         goal_pose.pose.position.x,
         goal_pose.pose.position.y,
         goal_pose.pose.orientation.yaw(),
     ];
-    candidate.producer_runtime_generation = 0;
     candidate.path_revision = 0;
     candidate.planner_runtime_generation = 0;
     candidate.goal_z = goal_pose.pose.position.z;
@@ -2349,7 +2317,7 @@ fn update_progress(telemetry: &mut GuardedNavTelemetry) {
 struct GuardedStatusPublications {
     #[cfg(all(test,feature="surface-recovery-qualification"))]
     qualification_timing: Option<nuwax_nav_runtime::qualification_timing::TraceSink>,
-    goal: Option<(String, i32, String, i64, i64)>,
+    goal: Option<(String, i64)>,
     applied_commands: u64,
     last_terminal: Option<nuwax_nav_runtime::TerminalOutcome>,
     reached_published: bool,
@@ -2368,10 +2336,7 @@ impl GuardedStatusPublications {
         if !telemetry.public_session_id.is_empty() {
             let goal = (
                 telemetry.public_session_id.clone(),
-                telemetry.owner_kind,
-                telemetry.parent_request_id.clone(),
-                telemetry.goal_generation,
-                telemetry.producer_runtime_generation,
+                telemetry.motion_generation,
             );
             if self.goal.as_ref() != Some(&goal) {
                 self.goal = Some(goal);
@@ -2567,14 +2532,8 @@ fn build_guarded_navigation_status(
         } else {
             String::new()
         },
-        cancel_generation: saturating_i64(telemetry.cancel_generation),
-        zero_ack_id: String::new(),
-        zero_applied_monotonic_ns: 0,
-        owner_kind: telemetry.owner_kind,
-        parent_request_id: telemetry.parent_request_id.clone(),
-        goal_generation: telemetry.goal_generation,
+        motion_generation: telemetry.motion_generation,
         path_revision: telemetry.path_revision,
-        producer_runtime_generation: telemetry.producer_runtime_generation,
         planner_runtime_generation: telemetry.planner_runtime_generation,
         local_path: if state == 2
             && status.session_id.as_deref() == Some(telemetry.public_session_id.as_str())
@@ -3820,7 +3779,7 @@ fn far_join_key(state: &schema::NavigationStatus) -> Option<FarJoinKey> {
         backend: state.robot_frame.clone(),
         runtime_generation: state.runtime_generation,
         session_id: state.session_id.clone(),
-        motion_generation: state.goal_generation as u64,
+        motion_generation: state.motion_generation as u64,
         path_revision: state.path_revision,
         planner_runtime_generation: state.planner_runtime_generation,
     })
@@ -6772,7 +6731,6 @@ mod guarded_tests {
             harness.scheduler.status().last_terminal,
             Some(TerminalOutcome::Succeeded)
         );
-        assert!(terminal.zero_ack_id.is_empty());
         assert!(
             !harness.loop_task.is_finished(),
             "single owner loop remains live"
@@ -7060,10 +7018,9 @@ mod guarded_tests {
             .expect("stale external input remains rejectable"),
             OwnerInput::Rejected(_)
         ));
-        assert!(runtime_input_error::<()>(
+        assert!(matches!(runtime_input_error::<()>(
             "guarded arbitration", RuntimeError::Motion("传输失败".into()),
-        )
-        .is_err());
+        ).unwrap(), OwnerInput::Rejected(reason) if reason.contains("传输失败")));
         assert!(matches!(
             decode_guarded_pose_input(&[0xff]).expect("bad pose remains external input"),
             OwnerInput::Rejected(_)
@@ -7134,12 +7091,10 @@ path: schema::Path {
     fn rollover_goal(
         previous: &schema::NavigationGoal,
         session_id: &str,
-        producer_runtime_generation: i64,
         goal_generation: i64,
     ) -> schema::NavigationGoal {
         let mut goal = previous.clone();
         goal.session_id = session_id.into();
-        let _ = producer_runtime_generation;
         goal.motion_generation = goal_generation as u64;
 
         schema::validate_navigation_goal(&goal).expect("seal rollover goal");
@@ -7735,23 +7690,22 @@ path: schema::Path {
             );
         }
 
-        fn send_cancel(&self, goal: &schema::NavigationGoal, cancel_generation: i64) {
+        fn send_cancel(&self, goal: &schema::NavigationGoal) {
             send_guarded_test_body(
                 &self.cancels,
                 "nuwax_msgs.CancelNavigation",
-                Self::cancel_body(goal, cancel_generation),
+                Self::cancel_body(goal),
             );
         }
 
         async fn send_cancel_and_wait_dequeued(
             &self,
             goal: &schema::NavigationGoal,
-            cancel_generation: i64,
         ) {
             let dequeued = send_guarded_test_body_observed(
                 &self.cancels,
                 "nuwax_msgs.CancelNavigation",
-                Self::cancel_body(goal, cancel_generation),
+                Self::cancel_body(goal),
             );
             tokio::time::timeout(Duration::from_secs(1), dequeued)
                 .await
@@ -7760,15 +7714,10 @@ path: schema::Path {
             assert!(!self.loop_task.is_finished(), "guarded loop exited early");
         }
 
-        fn cancel_body(goal: &schema::NavigationGoal, cancel_generation: i64) -> Vec<u8> {
+        fn cancel_body(goal: &schema::NavigationGoal) -> Vec<u8> {
             schema::encode_cancel_navigation_body(&schema::CancelNavigation {
                 session_id: goal.session_id.clone(),
                 reason: 1,
-                cancel_generation,
-                owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
-                parent_request_id: String::new(),
-                goal_generation: goal.motion_generation as i64,
-                producer_runtime_generation: 0,
             })
             .expect("encode guarded test cancellation")
         }
@@ -7854,7 +7803,6 @@ path: schema::Path {
         async fn wait_for_correlated_zero(
             &mut self,
             goal: &schema::NavigationGoal,
-            _cancel_generation: i64,
         ) -> schema::NavigationStatus {
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
@@ -7867,9 +7815,8 @@ path: schema::Path {
                     let state = schema::decode_navigation_status_body(&frame.payload)
                         .expect("guarded NavigationStatus body");
                     if state.session_id == goal.session_id
-                        && state.owner_kind == schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV
                         && state.session_id == goal.session_id
-                        && state.goal_generation == goal.motion_generation as i64
+                        && state.motion_generation == goal.motion_generation as i64
                         && state.goal_status == schema::NAVIGATION_GOAL_STATUS_CANCELLED
                     {
                         return state;
@@ -8125,12 +8072,10 @@ path: schema::Path {
         assert_eq!(failure.goal_status, schema::NAVIGATION_GOAL_STATUS_STOPPED);
 
 
-        assert_eq!(failure.goal_generation, rejected.motion_generation as i64);
+        assert_eq!(failure.motion_generation, rejected.motion_generation as i64);
 
         assert_eq!(failure.path_revision, 0);
         assert_eq!(failure.planner_runtime_generation, 0);
-        assert!(failure.zero_ack_id.is_empty());
-        assert_eq!(failure.zero_applied_monotonic_ns, 0);
         assert_ne!(failure.sink_ready, 0);
         harness.send_pose(2);
         harness.wait_for_pose(2).await;
@@ -8146,8 +8091,8 @@ path: schema::Path {
         harness.send_goal_and_wait_dequeued(&next).await;
         harness.wait_for_session(&next.session_id).await;
         assert_eq!(harness.motion_call_count("acquire:"), 1);
-        harness.send_cancel(&next, 1);
-        harness.wait_for_correlated_zero(&next, 1).await;
+        harness.send_cancel(&next);
+        harness.wait_for_correlated_zero(&next).await;
         harness.shutdown().await;
     }
 
@@ -8264,7 +8209,6 @@ path: schema::Path {
         })
         .await
         .expect("verified ZERO did not make map-a terminal");
-        tokio::time::sleep(Duration::from_millis(30)).await;
     }
 
     #[tokio::test]
@@ -8274,8 +8218,7 @@ path: schema::Path {
         finish_map_a_after_verified_zero(&harness, &goal_a).await;
         harness.send_pose(2);
         harness.wait_for_pose(2).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let goal_b = rollover_goal(&goal_a, "session-b", 8, 1);
+        let goal_b = rollover_goal(&goal_a, "session-b", 1);
 
         harness.send_goal_and_wait_dequeued(&goal_b).await;
         harness.wait_for_session("session-b").await;
@@ -8295,8 +8238,7 @@ path: schema::Path {
         finish_map_a_after_verified_zero(&harness, &goal_a).await;
         harness.send_pose(2);
         harness.wait_for_pose(2).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let goal_b = rollover_goal(&goal_a, "session-b", 8, 1);
+        let goal_b = rollover_goal(&goal_a, "session-b", 1);
 
         harness.send_costmap(12);
         harness.wait_for_costmap(12).await;
@@ -8312,7 +8254,7 @@ path: schema::Path {
         finish_map_a_after_verified_zero(&harness, &goal_a).await;
         harness.send_pose(2);
         harness.wait_for_pose(2).await;
-        let goal_b = rollover_goal(&goal_a, "session-b", 8, 1);
+        let goal_b = rollover_goal(&goal_a, "session-b", 1);
 
         harness.send_goal_and_wait_dequeued(&goal_b).await;
         harness.wait_for_session("session-b").await;
@@ -8335,7 +8277,7 @@ path: schema::Path {
 
         harness.send_pose(2);
         harness.wait_for_pose(2).await;
-        let goal_b = rollover_goal(&goal_a, "session-b", 8, 1);
+        let goal_b = rollover_goal(&goal_a, "session-b", 1);
         harness.send_goal_and_wait_dequeued(&goal_b).await;
         harness.wait_for_session("session-b").await;
         harness.shutdown().await;
@@ -8343,13 +8285,19 @@ path: schema::Path {
 
     #[tokio::test]
     async fn guarded_conflicting_goal_does_not_block_a_later_valid_lease() {
-        let harness = GuardedLoopHarness::spawn().await;
+        let mut harness = GuardedLoopHarness::spawn().await;
         let goal_a = activate_map_a(&harness).await;
 
         let mut conflicting=goal_a.clone();
         conflicting.goal.pose.position[0]+=0.5;
         harness.send_goal(&conflicting);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(Duration::from_millis(50), async {
+            loop {
+                let frame = harness.states.next().await.unwrap().unwrap();
+                let state = schema::decode_navigation_status_body(&frame.payload).unwrap();
+                if state.reason.contains("REJECTED") { break; }
+            }
+        }).await.expect("冲突目标未在原50毫秒窗口回报拒绝");
         assert_eq!(
             harness.scheduler.status().session_id.as_deref(),
             Some("session-a"),
@@ -8359,7 +8307,7 @@ path: schema::Path {
         harness.send_pose(2);
         harness.wait_for_pose(2).await;
 
-        let goal_b = rollover_goal(&goal_a, "session-b", 8, 1);
+        let goal_b = rollover_goal(&goal_a, "session-b", 1);
         harness.send_goal_and_wait_dequeued(&goal_b).await;
         harness.wait_for_session("session-b").await;
         harness.shutdown().await;
@@ -8369,7 +8317,7 @@ path: schema::Path {
     async fn guarded_goal_replacement_acquires_without_releasing_previous() {
         let harness = GuardedLoopHarness::spawn().await;
         let goal_a = activate_map_a(&harness).await;
-        let goal_b = rollover_goal(&goal_a, "session-b", 8, 1);
+        let goal_b = rollover_goal(&goal_a, "session-b", 1);
 
         harness.send_goal_and_wait_dequeued(&goal_b).await;
         harness.wait_for_session("session-b").await;
@@ -8620,10 +8568,7 @@ path: schema::Path {
         let mut telemetry = GuardedNavTelemetry {
             runtime_generation: 42,
             public_session_id: "goal-a".into(),
-            owner_kind: schema::NAVIGATION_OWNER_KIND_EXPLORATION_CHILD,
-            parent_request_id: "explore-a".into(),
-            goal_generation: 1,
-            cancel_generation: 2,
+            motion_generation: 1,
             map_frame: "map".into(),
             pose_frame: "map".into(),
             goal: [1.0, 2.0, 0.0],
@@ -8634,19 +8579,14 @@ path: schema::Path {
             initial_distance: 3.0,
             progress: 0.5,
             path_revision: 3,
-            producer_runtime_generation: 11,
             planner_runtime_generation: 22,
         };
 
         let terminal_message =
             build_guarded_navigation_status(&terminal, &telemetry, None, Duration::from_secs(1));
         assert_eq!(terminal_message.session_id, "goal-a");
-        assert_eq!(terminal_message.producer_runtime_generation, 11);
         assert_eq!(terminal_message.planner_runtime_generation, 22);
         assert_eq!(terminal_message.runtime_generation, 0);
-        assert_eq!(terminal_message.cancel_generation, 2);
-        assert!(terminal_message.zero_ack_id.is_empty());
-        assert_eq!(terminal_message.zero_applied_monotonic_ns, 0);
 
         assert!(clear_terminal_session_after_publication(
             &mut active,
@@ -8666,14 +8606,8 @@ path: schema::Path {
         assert_eq!(heartbeat.goal_status, schema::NAVIGATION_GOAL_STATUS_NONE);
         assert_eq!(heartbeat.reason, "导航栈空闲");
         assert_eq!(heartbeat.sink_ready, 1);
-        assert_eq!(heartbeat.cancel_generation, 0);
-        assert!(heartbeat.zero_ack_id.is_empty());
-        assert_eq!(heartbeat.zero_applied_monotonic_ns, 0);
-        assert_eq!(heartbeat.owner_kind, 0);
-        assert!(heartbeat.parent_request_id.is_empty());
-        assert_eq!(heartbeat.goal_generation, 0);
+        assert_eq!(heartbeat.motion_generation, 0);
         assert_eq!(heartbeat.path_revision, 0);
-        assert_eq!(heartbeat.producer_runtime_generation, 0);
         assert_eq!(heartbeat.planner_runtime_generation, 0);
         assert_eq!(heartbeat.runtime_generation, 42);
         assert_eq!(heartbeat.planner_map_frame, "map");
@@ -8759,11 +8693,6 @@ path: schema::Path {
         let cancel = schema::CancelNavigation {
             session_id: goal.session_id.clone(),
             reason: 1,
-            cancel_generation: 5,
-            owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
-            parent_request_id: String::new(),
-            goal_generation: goal.motion_generation as i64,
-            producer_runtime_generation: 0,
         };
         validate_cancel_goal_correlation(&cancel, &goal).expect("correlated cancel");
         let mut foreign_cancel = cancel;
@@ -8929,7 +8858,7 @@ path: schema::Path {
         let mut publications = GuardedStatusPublications::default();
         let mut telemetry = GuardedNavTelemetry {
             public_session_id: "goal-a".into(),
-            goal_generation: 1,
+            motion_generation: 1,
             ..Default::default()
         };
         let mut status = nuwax_nav_runtime::SchedulerStatus {
@@ -8969,7 +8898,7 @@ path: schema::Path {
             1
         );
         telemetry.public_session_id = "goal-b".into();
-        telemetry.goal_generation = 2;
+        telemetry.motion_generation = 2;
         status.last_terminal = None;
 
         status.applied_commands = 1;
@@ -9570,17 +9499,14 @@ path: schema::Path {
     }
 
     #[test]
-    fn safety_runtime_errors_and_stream_closure_remain_fatal() {
+    fn retired_motion_failures_are_recoverable_but_scheduler_closure_is_fatal() {
         use nuwax_nav_runtime::RuntimeError;
 
-        for error in [
-            RuntimeError::Motion("guard unavailable".into()),
-
-
-            RuntimeError::SchedulerStopped,
-        ] {
+        for error in [RuntimeError::SchedulerStopped] {
             assert!(runtime_input_error::<()>("guarded-test", error).is_err());
         }
+        assert!(matches!(runtime_input_error::<()>("guarded-test", RuntimeError::Motion("guard unavailable".into())).unwrap(),
+            OwnerInput::Rejected(reason) if reason.contains("guard unavailable")));
         assert!(matches!(
             runtime_input_error::<()>("guarded-test", RuntimeError::StaleInput("old pose".into()),)
                 .expect("stale external input is recoverable"),
@@ -10338,11 +10264,8 @@ goal: schema::PoseStamped {
             robot_frame: "far-visibility-graph".into(),
             state: nuwax_nav_far_planner_bridge::worker::FAR_EVENT_SUCCEEDED,
             runtime_generation: 12,
-            owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
-            parent_request_id: String::new(),
-            goal_generation: goal.motion_generation as i64,
+            motion_generation: goal.motion_generation as i64,
             path_revision: 4,
-            producer_runtime_generation: 0,
             planner_runtime_generation: 12,
             ..schema::NavigationStatus::default()
         };
@@ -10481,12 +10404,9 @@ goal: schema::PoseStamped {
             runtime_generation: 12,
             planner_map_frame: goal.goal.header.frame_id.clone(),
             planner_pose_frame: goal.goal.header.frame_id.clone(),
-            owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
-            parent_request_id: String::new(),
-            goal_generation: goal.motion_generation as i64,
+            motion_generation: goal.motion_generation as i64,
             path_revision: revision,
             planner_runtime_generation: 12,
-            producer_runtime_generation: 0,
             ..schema::NavigationStatus::default()
         };
 

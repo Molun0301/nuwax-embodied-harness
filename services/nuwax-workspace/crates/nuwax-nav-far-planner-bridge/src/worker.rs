@@ -4,7 +4,6 @@
 //! 算法结果通过 FAR 私有 `NavigationStatus` v3 合同发布，由后续唯一 adapter
 //! 封装 canonical `PathEnvelope`；本模块绝不发布 canonical path topic。
 
-use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nuwax_codec::lcm::schema::{
@@ -396,7 +395,6 @@ pub async fn run_with_transport(
         FAR_EVENT_READY,
         None,
         None,
-        0,
         "ready:all-input-subscriptions-acknowledged",
     )
     .await?;
@@ -408,8 +406,8 @@ pub async fn run_with_transport(
     let mut scan_obstacles: Option<ObstacleCloud> = None;
     let mut active: Option<ActivePlan> = None;
     let mut pending_completion: Option<PlanCompletion> = None;
-    let mut cancelled: HashSet<String> = HashSet::new();
-    let mut terminal_goals: HashSet<GoalIdentity> = HashSet::new();
+    let mut cancelled: Option<String> = None;
+    let mut terminal_goal: Option<GoalIdentity> = None;
     let mut next_path_revision = 1_i64;
 
     loop {
@@ -420,8 +418,11 @@ pub async fn run_with_transport(
             frame = cancel.recv() => {
                 let frame = frame.map_err(|error| WorkerError::Transport(format!("cancel stream: {error}")))?;
                 let value = decode_cancel(&frame.payload)?;
-                if !value.session_id.is_empty() {
-                    cancelled.insert(value.session_id.clone());
+                if value.session_id.is_empty() {
+                    cancelled = None;
+                    terminal_goal = None;
+                } else {
+                    cancelled = Some(value.session_id.clone());
                 }
                 if active
                     .as_ref()
@@ -430,14 +431,14 @@ pub async fn run_with_transport(
                     let current = active.take().expect("matching active plan checked");
                     current.task.abort();
                     pending_completion = None;
-                    record_terminal(&mut terminal_goals, &current.goal);
+                    if cancelled.as_deref() == Some(current.goal.session_id.as_str()) { cancelled = None; }
+                    record_terminal(&mut terminal_goal, &current.goal);
                     publish_event(
                         &transport,
                         &options,
                         FAR_EVENT_CANCELLED,
                         Some(&current.goal),
                         Some(current.start),
-                        0,
                         "cancelled:correlated",
                     )
                     .await?;
@@ -452,28 +453,27 @@ pub async fn run_with_transport(
                         continue;
                     }
                 };
-                if terminal_goals.contains(&GoalIdentity::from(&value)) {
+                if terminal_goal.as_ref() == Some(&GoalIdentity::from(&value)) {
                     publish_event(
                         &transport,
                         &options,
                         FAR_EVENT_REJECTED,
                         Some(&value),
                         None,
-                        0,
                         "rejected:terminal-goal",
                     )
                     .await?;
                     continue;
                 }
-                if cancelled.contains(&value.session_id) {
-                    record_terminal(&mut terminal_goals, &value);
+                if cancelled.as_deref() == Some(value.session_id.as_str()) {
+                    cancelled = None;
+                    record_terminal(&mut terminal_goal, &value);
                     publish_event(
                         &transport,
                         &options,
                         FAR_EVENT_CANCELLED,
                         Some(&value),
                         None,
-                        0,
                         "cancelled:correlated-pre-dispatch",
                     )
                     .await?;
@@ -486,7 +486,6 @@ pub async fn run_with_transport(
                         FAR_EVENT_REJECTED,
                         Some(&value),
                         None,
-                        0,
                         "rejected:planner-busy",
                     )
                     .await?;
@@ -499,7 +498,6 @@ pub async fn run_with_transport(
                         FAR_EVENT_REJECTED,
                         Some(&value),
                         None,
-                        0,
                         "rejected:odometry-unavailable",
                     )
                     .await?;
@@ -514,7 +512,6 @@ pub async fn run_with_transport(
                             FAR_EVENT_REJECTED,
                             Some(&value),
                             None,
-                            0,
                             &format!("rejected:{reason}"),
                         )
                         .await?;
@@ -528,7 +525,6 @@ pub async fn run_with_transport(
                         FAR_EVENT_REJECTED,
                         Some(&value),
                         Some(start),
-                        0,
                         "rejected:terrain-map-ext-unavailable",
                     )
                     .await?;
@@ -541,7 +537,6 @@ pub async fn run_with_transport(
                         FAR_EVENT_REJECTED,
                         Some(&value),
                         Some(start),
-                        0,
                         "rejected:terrain-map-unavailable",
                     )
                     .await?;
@@ -559,7 +554,6 @@ pub async fn run_with_transport(
                         FAR_EVENT_REJECTED,
                         Some(&value),
                         Some(start),
-                        0,
                         "rejected:obstacle-frame-mismatch",
                     )
                     .await?;
@@ -577,6 +571,8 @@ pub async fn run_with_transport(
                     &options,
                     completion_tx.clone(),
                 );
+                cancelled = None;
+                terminal_goal = None;
                 active = Some(ActivePlan { goal: value, start, task });
             }
             frame = odometry.recv() => {
@@ -619,28 +615,28 @@ pub async fn run_with_transport(
                     continue;
                 };
                 if fence.runtime_generation != options.planner_generation
-                    || fence.goal_generation as u64 != completion.goal.motion_generation
+                    || fence.motion_generation as u64 != completion.goal.motion_generation
                     || fence.session_id != completion.goal.session_id
                 {
                     continue;
                 }
                 let completion = pending_completion.take().expect("matching fence checked");
                 let current = active.take().expect("active plan retained through fence");
-                if cancelled.contains(&current.goal.session_id) {
-                    record_terminal(&mut terminal_goals, &current.goal);
+                if cancelled.as_deref() == Some(current.goal.session_id.as_str()) {
+                    cancelled = None;
+                    record_terminal(&mut terminal_goal, &current.goal);
                     publish_event(
                         &transport,
                         &options,
                         FAR_EVENT_CANCELLED,
                         Some(&current.goal),
                         Some(completion.start),
-                        0,
                         "cancelled:correlated-commit-fence",
                     )
                     .await?;
                     continue;
                 }
-                record_terminal(&mut terminal_goals, &current.goal);
+                record_terminal(&mut terminal_goal, &current.goal);
                 match completion.outcome {
                     PlanOutcome::Path(path) => {
                         let correlation = publish_private_result_v3(
@@ -669,7 +665,6 @@ pub async fn run_with_transport(
                             FAR_EVENT_TIMEOUT,
                             Some(&current.goal),
                             Some(completion.start),
-                            0,
                             "timeout:terminal",
                         )
                         .await?;
@@ -681,7 +676,6 @@ pub async fn run_with_transport(
                             FAR_EVENT_CRASHED,
                             Some(&current.goal),
                             Some(completion.start),
-                            0,
                             &format!("crashed:{reason}"),
                         )
                         .await?;
@@ -693,7 +687,6 @@ pub async fn run_with_transport(
                             FAR_EVENT_REJECTED,
                             Some(&current.goal),
                             Some(completion.start),
-                            0,
                             &format!("rejected:{reason}"),
                         )
                         .await?;
@@ -888,8 +881,8 @@ fn validate_goal_against_odometry(
     Ok(start)
 }
 
-fn record_terminal(terminal_goals: &mut HashSet<GoalIdentity>, goal: &NavigationGoal) {
-    terminal_goals.insert(GoalIdentity::from(goal));
+fn record_terminal(terminal_goal: &mut Option<GoalIdentity>, goal: &NavigationGoal) {
+    *terminal_goal = Some(GoalIdentity::from(goal));
 }
 
 fn same_goal(left: &NavigationGoal, right: &NavigationGoal) -> bool {
@@ -1034,7 +1027,7 @@ async fn publish_commit_fence(
         state: FAR_EVENT_READY,
         message: "far-private-commit-fence".into(),
         runtime_generation: options.planner_generation,
-        goal_generation: goal.motion_generation as i64,
+        motion_generation: goal.motion_generation as i64,
         ..NavigationStatus::default()
     };
     let body = schema::encode_navigation_status_body(&fence)
@@ -1053,7 +1046,6 @@ async fn publish_rejected(
         FAR_EVENT_REJECTED,
         None,
         None,
-        0,
         &format!("rejected:{reason}"),
     )
     .await
@@ -1072,7 +1064,6 @@ async fn publish_private_result_v3(
         FAR_EVENT_SUCCEEDED,
         Some(goal),
         Some(current),
-        0,
         PathCorrelation {
             revision: path_revision,
         },
@@ -1100,7 +1091,6 @@ async fn publish_success_event(
         FAR_EVENT_SUCCEEDED,
         Some(goal),
         Some(current),
-        0,
         correlation,
         "succeeded:private-result-v3-published".into(),
     );
@@ -1115,7 +1105,6 @@ fn navigation_status(
     state: i32,
     goal: Option<&NavigationGoal>,
     current: Option<[f64; 3]>,
-    cancel_generation: i64,
     correlation: PathCorrelation,
     message: String,
 ) -> NavigationStatus {
@@ -1141,16 +1130,10 @@ fn navigation_status(
             .map_or_else(String::new, |value| value.goal.header.frame_id.clone()),
         planner_pose_frame: goal
             .map_or_else(String::new, |value| value.goal.header.frame_id.clone()),
-        cancel_generation,
-        zero_ack_id: String::new(),
-        zero_applied_monotonic_ns: 0,
-        owner_kind: 0,
-        parent_request_id: String::new(),
         // 状态通道沿用既有整数槽位，保留完整无符号运动代次的位模式。
-        goal_generation: goal.map_or(0, |value| value.motion_generation as i64),
+        motion_generation: goal.map_or(0, |value| value.motion_generation as i64),
         path_revision: correlation.revision,
         local_path: Vec::new(),
-        producer_runtime_generation: 0,
         planner_runtime_generation: if correlation.revision > 0 {
             options.planner_generation
         } else {
@@ -1167,7 +1150,6 @@ async fn publish_event(
     state: i32,
     goal: Option<&NavigationGoal>,
     current: Option<[f64; 3]>,
-    cancel_generation: i64,
     detail: &str,
 ) -> Result<(), WorkerError> {
     let message = if state == FAR_EVENT_READY {
@@ -1201,7 +1183,6 @@ async fn publish_event(
         state,
         goal,
         current,
-        cancel_generation,
         PathCorrelation { revision: 0 },
         message,
     );
@@ -1371,7 +1352,7 @@ mod tests {
             robot_frame: "far-visibility-graph".into(),
             state: FAR_EVENT_SUCCEEDED,
             runtime_generation: 7,
-            goal_generation: u64::MAX as i64,
+            motion_generation: u64::MAX as i64,
             path_revision: 2,
             planner_runtime_generation: 7,
             ..NavigationStatus::default()
@@ -1382,9 +1363,9 @@ mod tests {
             path
         );
 
-        assert_eq!(sealed.goal_generation as u64, u64::MAX);
+        assert_eq!(sealed.motion_generation as u64, u64::MAX);
         let zero_generation = NavigationStatus {
-            goal_generation: 0,
+            motion_generation: 0,
             ..sealed.clone()
         };
         assert_eq!(

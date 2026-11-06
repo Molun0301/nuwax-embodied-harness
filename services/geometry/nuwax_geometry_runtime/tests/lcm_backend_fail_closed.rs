@@ -826,6 +826,86 @@ async fn malformed_forbidden_file_fails_exploration_without_faulting_session() {
 }
 
 #[tokio::test]
+async fn forbidden_file_errors_reach_the_goal_and_recover_on_the_next_check() {
+    let mut f = Fixture::start(false, false).await;
+    f.saved_map("禁区目标").await;
+    let raw = f
+        .client
+        .get_occupancy_grid(GetOccupancyGridRequest {
+            include_forbidden: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut states = f
+        .client
+        .subscribe_state(Empty {})
+        .await
+        .unwrap()
+        .into_inner();
+    let goal_id = f
+        .client
+        .set_goal(goal(2.))
+        .await
+        .unwrap()
+        .into_inner()
+        .goal_id;
+    let path = f.root.join("maps/禁区目标/forbidden_zones.json");
+    fs::write(&path, "{错误").unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let state = states.message().await.unwrap().unwrap();
+            assert_eq!(state.phase, SessionPhase::Mapping as i32);
+            if state.navigation.as_ref().is_some_and(|goal| {
+                goal.goal_id == goal_id && goal.message.contains("禁行区格式无效")
+            }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let state = states.message().await.unwrap().unwrap();
+            assert_eq!(state.phase, SessionPhase::Mapping as i32);
+            if state.navigation.as_ref().is_some_and(|goal| {
+                goal.goal_id == goal_id && goal.message.contains("禁行区读取失败")
+            }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let mut maps = f.client.subscribe_map(Empty {}).await.unwrap().into_inner();
+    fs::remove_dir(&path).unwrap();
+    let replacement = path.with_extension("tmp");
+    fs::write(&replacement, br#"{"zones":[]}"#).unwrap();
+    fs::rename(replacement, path).unwrap();
+    let restored = tokio::time::timeout(Duration::from_secs(3), maps.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.raw_data, raw.data);
+    assert_eq!(restored.data, raw.data);
+    assert_eq!(
+        f.client
+            .get_occupancy_grid(GetOccupancyGridRequest {
+                include_forbidden: false
+            })
+            .await
+            .unwrap()
+            .into_inner(),
+        raw
+    );
+    f.client.save_map(SaveMapRequest::default()).await.unwrap();
+}
+
+#[tokio::test]
 async fn initial_lio_start_failure_can_stop_then_start_after_executable_is_restored() {
     let mut f = Fixture::start_with_missing_lio(true, false, true).await;
     assert_eq!(f.state().await.phase, SessionPhase::Fault as i32);

@@ -21,14 +21,9 @@ uint64_t __nuwax_msgs_CancelNavigation_hash_recursive(const __lcm_hash_ptr *p)
     cp.v = __nuwax_msgs_CancelNavigation_get_hash;
     (void) cp;
 
-    uint64_t hash = (uint64_t)0x4b82259474e2ee91LL
+    uint64_t hash = (uint64_t)0x57dde487b0da9283LL
          + __string_hash_recursive(&cp)
          + __int32_t_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
-         + __int32_t_hash_recursive(&cp)
-         + __string_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
-         + __int64_t_hash_recursive(&cp)
         ;
 
     return (hash<<1) + ((hash>>63)&1);
@@ -55,21 +50,6 @@ int __nuwax_msgs_CancelNavigation_encode_array(void *buf, int offset, int maxlen
         if (thislen < 0) return thislen; else pos += thislen;
 
         thislen = __int32_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].reason), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].cancel_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int32_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].owner_kind), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __string_encode_array(buf, offset + pos, maxlen - pos, &(p[element].parent_request_id), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].goal_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_encode_array(buf, offset + pos, maxlen - pos, &(p[element].producer_runtime_generation), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
     }
@@ -99,16 +79,6 @@ int __nuwax_msgs_CancelNavigation_encoded_array_size(const nuwax_msgs_CancelNavi
 
         size += __int32_t_encoded_array_size(&(p[element].reason), 1);
 
-        size += __int64_t_encoded_array_size(&(p[element].cancel_generation), 1);
-
-        size += __int32_t_encoded_array_size(&(p[element].owner_kind), 1);
-
-        size += __string_encoded_array_size(&(p[element].parent_request_id), 1);
-
-        size += __int64_t_encoded_array_size(&(p[element].goal_generation), 1);
-
-        size += __int64_t_encoded_array_size(&(p[element].producer_runtime_generation), 1);
-
     }
     return size;
 }
@@ -130,21 +100,6 @@ int __nuwax_msgs_CancelNavigation_decode_array(const void *buf, int offset, int 
         thislen = __int32_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].reason), 1);
         if (thislen < 0) return thislen; else pos += thislen;
 
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].cancel_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int32_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].owner_kind), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __string_decode_array(buf, offset + pos, maxlen - pos, &(p[element].parent_request_id), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].goal_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
-        thislen = __int64_t_decode_array(buf, offset + pos, maxlen - pos, &(p[element].producer_runtime_generation), 1);
-        if (thislen < 0) return thislen; else pos += thislen;
-
     }
     return pos;
 }
@@ -158,16 +113,6 @@ int __nuwax_msgs_CancelNavigation_decode_array_cleanup(nuwax_msgs_CancelNavigati
         __string_decode_array_cleanup(&(p[element].session_id), 1);
 
         __int32_t_decode_array_cleanup(&(p[element].reason), 1);
-
-        __int64_t_decode_array_cleanup(&(p[element].cancel_generation), 1);
-
-        __int32_t_decode_array_cleanup(&(p[element].owner_kind), 1);
-
-        __string_decode_array_cleanup(&(p[element].parent_request_id), 1);
-
-        __int64_t_decode_array_cleanup(&(p[element].goal_generation), 1);
-
-        __int64_t_decode_array_cleanup(&(p[element].producer_runtime_generation), 1);
 
     }
     return 0;
@@ -202,16 +147,6 @@ int __nuwax_msgs_CancelNavigation_clone_array(const nuwax_msgs_CancelNavigation 
         __string_clone_array(&(p[element].session_id), &(q[element].session_id), 1);
 
         __int32_t_clone_array(&(p[element].reason), &(q[element].reason), 1);
-
-        __int64_t_clone_array(&(p[element].cancel_generation), &(q[element].cancel_generation), 1);
-
-        __int32_t_clone_array(&(p[element].owner_kind), &(q[element].owner_kind), 1);
-
-        __string_clone_array(&(p[element].parent_request_id), &(q[element].parent_request_id), 1);
-
-        __int64_t_clone_array(&(p[element].goal_generation), &(q[element].goal_generation), 1);
-
-        __int64_t_clone_array(&(p[element].producer_runtime_generation), &(q[element].producer_runtime_generation), 1);
 
     }
     return 0;

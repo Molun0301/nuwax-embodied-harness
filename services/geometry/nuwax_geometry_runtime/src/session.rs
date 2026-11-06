@@ -809,7 +809,7 @@ impl Session {
             target: goal.pose.clone(),
             ..Default::default()
         });
-        // 受理时刷新当前文件；刷新完成前目标仍被本会话持有。
+        // 当前地图的禁区缓存由地图任务按秒刷新，目标采用它发布的读取结果。
         let refreshed = mapper
             .set_forbidden_zones(
                 self.store

@@ -23,6 +23,8 @@ from services.geometry.maps import MapStore
 from services.geometry.recording import MappingRecorder
 from services.geometry.state import GeometryStateView
 from services.navigation.motion_client import MotionClient
+from services.perception.geometry import DetectionGeometryAugmentor
+from services.perception.self_body import build_self_body_filter, robot_joint_state_source
 
 LOGGER = logging.getLogger(__name__)
 
@@ -161,9 +163,22 @@ def build_platform(config) -> Platform:
                                     geometry_state=platform.geometry_state if has_geometry_input else None)
     platform.observation = observation
     perception = build_platform_perception_components(config)
+    self_filter = build_self_body_filter(
+        config.perception.self_filter,
+        robot_geometry=config.robot.geometry,
+        base_dir=config.base_dir,
+        joint_state_source=robot_joint_state_source(platform.robot),
+    )
+    association = config.perception.instance_association
     platform.perception = PerceptionService(provider_owner=platform.robot, artifact_service=artifacts,
         state_store=state_store, detector_pipeline=perception["detector_pipeline"], tracker_backend=perception["tracker_backend"],
         segmentation_backend=perception["segmentation_backend"], scene_description_backend=perception["scene_description_backend"],
+        self_body_filter=self_filter,
+        geometry_augmentor=DetectionGeometryAugmentor(
+            support_voxel_size_m=association.support_voxel_size_m,
+            support_max_voxels=association.support_max_voxels,
+            min_support_points=association.min_support_points,
+            ground_tolerance_m=config.perception.self_filter.ground_tolerance_m),
         event_bus=platform.events, stream_bus=stream_bus,
         geometry_state=platform.geometry_state, geometry_client=platform.geometry,
         video_frame_source=providers if isinstance(providers, VideoFrameSource) else VideoSource(

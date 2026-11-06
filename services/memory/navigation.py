@@ -18,6 +18,7 @@ from contracts.spatial_memory import SemanticRegion, InstanceDynamicState
 from contracts.memory import GoalSpec, GoalConstraint, GoalSpatialRelation, GoalCandidateScoreBreakdown, NavigationCandidateResolution
 from contracts.spatial_memory import SpatialAnchor, SpatialAnchorKind, NavigationTrajectoryEvent, NavigationTrajectoryEventKind, SemanticGraphRelation, SemanticGraphRelationKind
 from core.state_store import StateNamespace
+from core.target_query import target_label_matches_query
 from services.memory.store import MODELS
 import uuid
 import logging
@@ -28,6 +29,7 @@ PLACE_NODES_COLLECTION = 'place_nodes'
 OBJECT_INSTANCES_COLLECTION = 'object_instances'
 EPISODIC_OBSERVATIONS_COLLECTION = 'episodic_observations'
 SCENE_SPACES_COLLECTION = 'scene_spaces'
+
 
 class NavigationMixin:
     _SEGMENTATION_LOW_SIGNAL_THRESHOLD = 0.25
@@ -553,6 +555,36 @@ class NavigationMixin:
             return ('explore', reasons or ['evidence_insufficient'], False)
         return ('reject', reasons or ['candidate_not_safe_for_navigation'], False)
 
+    @staticmethod
+    def _object_target_evidence(
+        candidate: NavigationCandidate, query: str, map_frame_id: str,
+    ) -> Dict[str, object]:
+        labels = candidate.metadata["visual_labels"]
+        return {
+            "visual_labels": labels,
+            "target_frame_id": candidate.inspection_pose.frame_id,
+            "map_frame_id": map_frame_id,
+            "has_target_evidence": any(target_label_matches_query(query, label) for label in labels),
+        }
+
+    @staticmethod
+    def _object_target_rejection(candidate: NavigationCandidate, evidence: Dict[str, object]) -> Optional[str]:
+        metadata = candidate.metadata
+        if metadata["record_kind"] not in {MemoryRecordKind.OBJECT_INSTANCE.value, MemoryRecordKind.OBSERVATION_EVENT.value}:
+            return "target_navigation_source_not_object_evidence"
+        if not evidence["has_target_evidence"]:
+            return "target_evidence_missing"
+        if evidence["target_frame_id"] != evidence["map_frame_id"]:
+            return "target_pose_not_map_frame"
+        if metadata["support_point_count"] <= 0:
+            return "support_point_count_below_threshold"
+        if not metadata["projection_method"]:
+            return "projection_evidence_missing"
+        confidence = metadata["projection_confidence"]
+        if confidence is None or not math.isfinite(confidence):
+            return "projection_confidence_invalid"
+        return None
+
     def _decorate_navigation_candidate_for_goal_resolution(self, candidate: NavigationCandidate, *, goal_spec: GoalSpec, score_breakdown: GoalCandidateScoreBreakdown, decision: str, reasons: List[str], allowed_for_navigation: bool, resolution_metadata: Dict[str, object]) -> NavigationCandidate:
         metadata = {**dict(candidate.metadata), **resolution_metadata, 'goal_spec': goal_spec.model_dump(mode='json'), 'score_breakdown': score_breakdown.model_dump(mode='json'), 'semantic_score': score_breakdown.semantic_score, 'spatial_score': score_breakdown.spatial_score, 'reachability_score': score_breakdown.reachability_score, 'freshness_score': score_breakdown.freshness_score, 'verification_score': score_breakdown.verification_score, 'failure_penalty': score_breakdown.failure_penalty, 'failure_reason_codes': score_breakdown.metadata.get('failure_reason_codes') or [], 'failure_count_since_success': score_breakdown.metadata.get('failure_count_since_success') or 0, 'failure_trajectory_event_ids': score_breakdown.metadata.get('failure_trajectory_event_ids') or [], 'safety_score': score_breakdown.safety_score, 'candidate_score': score_breakdown.total_score, 'ranking_total_score': score_breakdown.total_score, 'resolution_decision': decision, 'allowed_for_navigation': allowed_for_navigation, 'excluded_reason': reasons[0] if not allowed_for_navigation and reasons else '', 'exclusion_reasons': reasons, 'llm_boundary': self._navigation_llm_boundary(), 'coordinate_source': 'platform_graph_candidate'}
         return candidate.model_copy(update={'metadata': metadata}, deep=False)
@@ -618,17 +650,25 @@ class NavigationMixin:
             anchors.append(SpatialAnchor(anchor_id=instance.anchor_id, anchor_kind=SpatialAnchorKind.OBJECT_INSTANCE, name=instance.display_name or instance.label, pose=instance.pose, map_name=instance.map_name, topo_node_id=instance.topo_node_id, semantic_region_id=instance.semantic_region_id, semantic_labels=self._normalize_tags([instance.label, *instance.semantic_labels, *instance.visual_labels, *instance.vision_tags]), inspection_poses=list(instance.inspection_poses), metadata=dict({'instance_id': instance.instance_id, 'instance_type': instance.instance_type, 'movability': instance.movability.value, 'dynamic_state': self._instance_dynamic_state(instance).value, 'dynamic_state_reason': str(instance.metadata.get('dynamic_state_reason') or ''), 'long_term_static_target_eligible': True, 'lifecycle_state': instance.lifecycle_state.value, 'observation_count': instance.observation_count, 'last_seen_ts': instance.last_seen_ts.isoformat()})))
         return anchors
 
-    def _record_navigation_candidate_graph(self, candidate: NavigationCandidate) -> NavigationCandidate:
+    def _record_navigation_candidate_graph(self, candidate: NavigationCandidate, reachability_decision: str) -> NavigationCandidate:
         def record(store):
             if store is None or store.name != candidate.map_name:
                 return candidate
-            return self._write_navigation_candidate_graph(candidate)
+            return self._write_navigation_candidate_graph(candidate, reachability_decision)
         return self.write(record)
 
-    def _write_navigation_candidate_graph(self, candidate: NavigationCandidate) -> NavigationCandidate:
+    def _write_navigation_candidate_graph(self, candidate: NavigationCandidate, reachability_decision: str) -> NavigationCandidate:
         metadata = dict(candidate.metadata or {})
         candidate_id = candidate.candidate_id
-        trajectory_event = NavigationTrajectoryEvent(trajectory_event_id=self._build_navigation_trajectory_event_id(NavigationTrajectoryEventKind.REACHABLE_POSE, candidate_id, candidate.record_id), event_kind=NavigationTrajectoryEventKind.REACHABLE_POSE, pose=self._as_memory_pose(self.current_pose()), target_pose=candidate.inspection_pose, map_name=candidate.map_name, navigation_candidate_id=candidate_id, source_record_kind=candidate.metadata['record_kind'], source_record_id=candidate.record_id, target_name=candidate.target_name, success=True if metadata.get('allowed_for_navigation') is True else None, reason_code=str(metadata.get('resolution_decision') or 'candidate_resolved'), metadata={'source': 'navigation_candidate_resolution', 'distance_m': candidate.distance_m})
+        trajectory_event = NavigationTrajectoryEvent(
+            trajectory_event_id=self._build_navigation_trajectory_event_id(
+                NavigationTrajectoryEventKind.REACHABLE_POSE, candidate_id, candidate.record_id),
+            event_kind=NavigationTrajectoryEventKind.REACHABLE_POSE, pose=self._as_memory_pose(self.current_pose()),
+            target_pose=candidate.inspection_pose, map_name=candidate.map_name, navigation_candidate_id=candidate_id,
+            source_record_kind=metadata['record_kind'], source_record_id=candidate.record_id, target_name=candidate.target_name,
+            success=True if reachability_decision == 'navigate' else None, reason_code=reachability_decision,
+            metadata={'source': 'navigation_candidate_resolution', 'distance_m': candidate.distance_m},
+        )
         stored_event = self._upsert_navigation_trajectory_event(trajectory_event)
         relation = self._record_semantic_graph_relation(SemanticGraphRelationKind.REACHABLE_FROM, candidate.metadata['record_kind'], candidate.record_id, MemoryRecordKind.NAVIGATION_TRAJECTORY.value, stored_event.trajectory_event_id, map_name=candidate.map_name, evidence_trajectory_event_ids=[stored_event.trajectory_event_id], metadata={'source': 'navigation_candidate_resolution', 'candidate_id': candidate_id})
         relation_ids = [str(item) for item in metadata.get('semantic_graph_relation_ids') or [] if str(item)]
@@ -646,10 +686,15 @@ class NavigationMixin:
         safe_source = re.sub('[^0-9a-z]+', '_', str(candidate_id or source_record_id or 'trajectory').lower()).strip('_') or 'trajectory'
         return 'nte_%s_%s_%s' % (event_kind.value, safe_source[:24], uuid.uuid4().hex)
 
-    def resolve_navigation_candidates(self, query: str, *, camera_id: Optional[str]=None, similarity_threshold: float=0.25, max_age_sec: Optional[float]=None, map_name: Optional[str]=None, limit: int=5, goal_id: Optional[str]=None) -> Tuple[NavigationCandidate, ...]:
-        """把自由文本查询解析成一组可导航的记忆候选。"""
+    def resolve_navigation_candidates(
+        self, query: str, *, camera_id: Optional[str] = None, similarity_threshold: float = 0.25,
+        max_age_sec: Optional[float] = None, map_name: Optional[str] = None, limit: int = 5,
+        goal_id: Optional[str] = None, object_target: bool = False,
+    ) -> Tuple[NavigationCandidate, ...]:
+        """解析记忆导航候选。找物候选须有匹配的检测标签和同一地图坐标系。"""
         if not self.is_enabled():
             return ()
+        object_query = query
         started_at = time.perf_counter()
         requested_limit = max(1, int(limit))
         candidate_pool_limit = max(requested_limit * 3, 12)
@@ -726,9 +771,29 @@ class NavigationMixin:
         for candidate in candidates:
             score_breakdown = self._build_candidate_score_breakdown(candidate, expected_map_name=effective_map_name, goal_spec=goal_spec)
             decision, reasons, allowed_for_navigation = self._navigation_candidate_decision(candidate, score_breakdown)
-            decorated_pool.append(self._decorate_navigation_candidate_for_goal_resolution(candidate, goal_spec=goal_spec, score_breakdown=score_breakdown, decision=decision, reasons=reasons, allowed_for_navigation=allowed_for_navigation, resolution_metadata=observability_metadata))
+            decorated_pool.append(self._decorate_navigation_candidate_for_goal_resolution(
+                candidate, goal_spec=goal_spec, score_breakdown=score_breakdown, decision=decision,
+                reasons=reasons, allowed_for_navigation=allowed_for_navigation,
+                resolution_metadata=observability_metadata,
+            ))
         decorated_pool.sort(key=lambda item: float(dict(item.metadata).get('ranking_total_score') or 0.0), reverse=True)
         decorated_candidates = tuple(decorated_pool[:requested_limit])
+        # 可达位姿记录沿用通用判定，找物查询的证据要求只作用于本次选择。
+        reachability_decisions = tuple(candidate.metadata["resolution_decision"] for candidate in decorated_candidates)
+        if object_target:
+            map_frame_id = semantic_context.metadata["frame_id"]
+            target_candidates = []
+            for candidate in decorated_candidates:
+                evidence = self._object_target_evidence(candidate, object_query, map_frame_id)
+                rejection = self._object_target_rejection(candidate, evidence)
+                metadata = {**candidate.metadata, "target_navigation_evidence": evidence}
+                if rejection is not None:
+                    metadata.update(
+                        resolution_decision="reject", allowed_for_navigation=False, excluded_reason=rejection,
+                        exclusion_reasons=[rejection, *metadata["exclusion_reasons"]],
+                    )
+                target_candidates.append(candidate.model_copy(update={"metadata": metadata}))
+            decorated_candidates = tuple(target_candidates)
         observability_metadata['returned_candidate_count'] = len(decorated_candidates)
         resolution = self._build_navigation_candidate_resolution(goal_spec=goal_spec, candidates=decorated_candidates, resolution_metadata=observability_metadata)
         evaluation_trace = None
@@ -741,7 +806,10 @@ class NavigationMixin:
         resolution_payload = resolution.model_dump(mode='json')
         resolved_goal_id = str(goal_id or '').strip() or None
         decorated_candidates = tuple((candidate.model_copy(update={'metadata': {**dict(candidate.metadata), 'resolution_summary': resolution_payload, 'evaluation_trace_id': evaluation_trace.trace_id if evaluation_trace is not None else dict(candidate.metadata).get('evaluation_trace_id', ''), 'goal_id': resolved_goal_id or str(dict(candidate.metadata).get('goal_id') or '')}}, deep=False) for candidate in decorated_candidates))
-        decorated_candidates = tuple((self._record_navigation_candidate_graph(candidate) for candidate in decorated_candidates))
+        decorated_candidates = tuple(
+            self._record_navigation_candidate_graph(candidate, decision)
+            for candidate, decision in zip(decorated_candidates, reachability_decisions)
+        )
         self._state_store.write(StateNamespace.MEMORY, 'last_navigation_candidate_resolution', resolution, source='memory_service', metadata={'kind': 'navigation_candidate_resolution'})
         self._publish_memory_event('memory.navigation_candidates_resolved', '记忆导航候选已解析。', payload={**observability_metadata, 'top_decision': resolution.top_decision, 'direct_candidate_count': resolution.direct_candidate_count, 'resolution_confidence': resolution.confidence})
         return decorated_candidates

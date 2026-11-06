@@ -1,8 +1,8 @@
-"""组合任务的参数表；步骤由skills在原任务线程内顺序执行。"""
+"""组合能力的参数表，处理器在同一个任务线程内顺序执行各步骤。"""
 from core.capability import Capability
 from gateways.capabilities.common import schema
 from gateways.capabilities.exploration import EXPLORE_SCHEMA
-from skills.target_search import explore_and_find_target, find_target, inspect_target
+from gateways.capabilities.navigation import explore_and_find_target, find_target, inspect_target
 
 TEXT = {"type": "string"}
 TIMEOUT = {"type": "number", "exclusiveMinimum": 0}

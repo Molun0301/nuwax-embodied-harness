@@ -12,11 +12,13 @@ def summary(platform) -> dict:
                  else {"running": False})
     except MotionError as error:
         guard = {"running": True, "error": error.message}
+    perception = platform.perception.video_runtime.get_status().model_dump(mode="json")
+    perception["self_body_filter"] = platform.perception.self_body_filter_status()
     return {"processes": processes, "robot": asdict(platform.robot.get_status()),
             "motion_guard": guard, "geometry": {"connected": platform.geometry_state.connected,
                 "state": platform.geometry_state.snapshot()}, "tasks": {"active": platform.tasks.active()},
             "input_bridge": platform.input_bridge.status(),
-            "perception": platform.perception.video_runtime.get_status(),
+            "perception": perception,
             "memory": platform.memory.get_summary(), "artifacts": platform.artifacts.get_cached_summary(),
             "audio": platform.audio.get_cached_volume_state(), "follow": {"started": platform.follow.started},
             "streams": platform.streams.stream_bus.status(), "events": platform.events.status()}

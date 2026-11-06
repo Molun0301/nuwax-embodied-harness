@@ -117,13 +117,6 @@ consumers = [
 ]
 apply = "restart"
 
-[robot.imu_frame]
-type = "string"
-default = "utlidar_imu"
-description = "惯性测量单元坐标系名，写入录制的几何配置元数据。Go2 采样帧按驱动契约提供。"
-consumers = ["网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata"]
-apply = "restart"
-
 [robot.length_m]
 type = "float"
 min = 0.0
@@ -556,6 +549,14 @@ description = "控制记忆位置估计的三角化分支。现行读取方把 t
 consumers = ["网关 · services/memory/service.py:MemoryService.__init__"]
 apply = "restart"
 
+[perception.ground_tolerance_m]
+type = "float"
+min = 0.0
+default = 0.04
+description = "水平地面支持点剔除容差（米）。在直立机器人和局部水平地面条件下，剔除与模型估计地面高度差不超过此值的点。"
+consumers = ["网关 · gateways/platform.py:build_platform", "网关 · services/perception/geometry.py:DetectionGeometryAugmentor.__init__"]
+apply = "restart"
+
 [perception.keyframe_min_interval_sec]
 type = "float"
 min = 0.05
@@ -819,6 +820,54 @@ max = 1.0
 default = 0.5
 description = "分割稳定分数阈值，当前由感知工厂写入分割提供者元数据。"
 consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+apply = "restart"
+
+[perception.self_filter_bbox_iou]
+type = "float"
+min = 0.0
+max = 1.0
+default = 0.5
+description = "检测框与投影到画面内的机器人部件外接框的交并比阈值。与自体覆盖率条件任一满足即判为自体。"
+consumers = ["网关 · gateways/platform.py:build_platform", "网关 · services/perception/self_body.py:build_self_body_filter"]
+apply = "restart"
+
+[perception.self_filter_coverage]
+type = "float"
+min = 0.05
+max = 1.0
+default = 0.5
+description = "检测掩膜被机器人部件凸包并集覆盖的比例阈值。没有掩膜时按检测框计算覆盖率。"
+consumers = ["网关 · gateways/platform.py:build_platform", "网关 · services/perception/self_body.py:build_self_body_filter"]
+apply = "restart"
+
+[perception.self_filter_dilation_px]
+type = "float"
+min = 0.0
+default = 6.0
+description = "运动学投影区域向外扩展的像素数，用于补偿投影和标定误差。"
+consumers = ["网关 · gateways/platform.py:build_platform", "网关 · services/perception/self_body.py:build_self_body_filter"]
+apply = "restart"
+
+[perception.self_filter_enabled]
+type = "boolean"
+default = true
+description = "是否启用机器人自体检测过滤。过滤器根据机器人模型、关节状态和相机配置判定自体并公开过滤状态。"
+consumers = ["网关 · gateways/platform.py:build_platform", "网关 · services/perception/self_body.py:build_self_body_filter"]
+apply = "restart"
+
+[perception.self_filter_max_joint_age_sec]
+type = "float"
+min = 0.01
+default = 0.5
+description = "关节源时间与图像源时间允许的最大绝对差（秒）。超出后本帧停用运动学区域并报告关节数据过旧。"
+consumers = ["网关 · gateways/platform.py:build_platform", "网关 · services/perception/self_body.py:build_self_body_filter"]
+apply = "restart"
+
+[perception.self_filter_static_regions_json]
+type = "string"
+default = ""
+description = "相机标识到静态忽略多边形列表的 JSON（结构化文本）对象。顶点坐标在 0 至 1 之间。留空时不配置静态区域。"
+consumers = ["网关 · gateways/platform.py:build_platform", "网关 · services/perception/self_body.py:build_self_body_filter"]
 apply = "restart"
 
 [perception.stream_camera_id]
@@ -1320,13 +1369,6 @@ consumers = [
 ]
 apply = "restart"
 
-[geometry.cost_map_topic]
-type = "string"
-default = "/nav/costmap"
-description = "代价地图来源标识，写入录制的几何配置元数据。"
-consumers = ["网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata"]
-apply = "restart"
-
 [geometry.enabled]
 type = "boolean"
 default = true
@@ -1339,27 +1381,6 @@ type = "boolean"
 default = true
 description = "监督者是否允许按需启动几何运行时。"
 consumers = ["监督者 · scripts/supervisor.py:component_table"]
-apply = "restart"
-
-[geometry.external_provides_map]
-type = "boolean"
-default = true
-description = "录制的几何配置元数据中是否声明外部几何栈提供地图。"
-consumers = ["网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata"]
-apply = "restart"
-
-[geometry.external_provides_nav]
-type = "boolean"
-default = true
-description = "录制的几何配置元数据中是否声明外部几何栈提供导航。"
-consumers = ["网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata"]
-apply = "restart"
-
-[geometry.external_provides_tf]
-type = "boolean"
-default = true
-description = "录制的几何配置元数据中是否声明外部几何栈提供坐标变换。"
-consumers = ["网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata"]
 apply = "restart"
 
 [geometry.fine_cloud_cache_auto_max_mib]
@@ -1381,13 +1402,6 @@ description = "精细点云写入器的缓存预算（MiB，二进制兆字节�
 consumers = ["几何运行时 · services/geometry/nuwax_geometry_runtime/src/lib.rs:main"]
 apply = "restart"
 
-[geometry.imu_topic]
-type = "string"
-default = "/utlidar/imu"
-description = "惯性数据来源标识，写入录制的几何配置元数据。"
-consumers = ["网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata"]
-apply = "restart"
-
 [geometry.lio_backend]
 type = "string"
 choices = ["device", "fastlio2", "pointlio"]
@@ -1401,8 +1415,8 @@ apply = "restart"
 
 [geometry.lio_body_from_imu]
 type = "string"
-default = "{\"translation_m\":[-0.02557,0.0,0.04232],\"rotation_row_major\":[1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0]}"
-description = "惯性测量单元坐标系到机体的刚体外参，填写平移（米）与行优先旋转矩阵的 JSON（结构化文本）对象。当前安装模板值为 Go2 标定，其它硬件应填写对应外参。"
+default = ""
+description = "惯性测量单元坐标系到机体的刚体外参，填写平移（米）与行优先旋转矩阵的 JSON（结构化文本）对象。Go2 安装时把设备标定写入方案。原生定位预检要求提供对应硬件的外参。"
 consumers = [
     "几何运行时 · services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs:NativeLioPreflight::from_env",
     "网关内 Go2 驱动 · drivers/go2/settings.py:load_go2_data_plane_config",
@@ -1412,8 +1426,8 @@ apply = "restart"
 
 [geometry.lio_body_from_sensor]
 type = "string"
-default = "{\"translation_m\":[0.28945,0.0,-0.046825],\"rotation_row_major\":[0.5258556508403229,-0.8097466927529278,0.2603576925212619,-0.8386705679454239,-0.5446390350150271,0.0,0.14180096241351925,-0.21835433385576677,-0.9655122329338992]}"
-description = "雷达坐标系到机体的刚体外参，填写平移（米）与行优先旋转矩阵的 JSON（结构化文本）对象。当前安装模板值为 Go2 标定，其它硬件应填写对应外参。"
+default = ""
+description = "雷达坐标系到机体的刚体外参，填写平移（米）与行优先旋转矩阵的 JSON（结构化文本）对象。Go2 安装时把设备标定写入方案。原生定位预检要求提供对应硬件的外参。"
 consumers = [
     "几何运行时 · services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs:NativeLioPreflight::from_env",
     "网关内 Go2 驱动 · drivers/go2/settings.py:load_go2_data_plane_config",
@@ -1479,33 +1493,12 @@ description = "三维链的建图后端，使用体素窗口或射线追踪。�
 consumers = ["几何运行时 · services/geometry/nuwax_geometry_runtime/src/mapper.rs:MapperConfig::from_env"]
 apply = "restart"
 
-[geometry.mapping_default_profile]
-type = "boolean"
-default = true
-description = "录制元数据中是否标记此建图配置为默认。"
-consumers = ["网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata"]
-apply = "restart"
-
 [geometry.mapping_initial_safe_radius_meters]
 type = "float"
 min = 0.0
 default = 0.0
 description = "建立占据栅格时，将机器人初始位置周围此半径内作为安全区域（米）。零表示不启用。"
 consumers = ["几何运行时 · services/geometry/nuwax_geometry_runtime/src/mapper.rs:MapperConfig::from_env"]
-apply = "restart"
-
-[geometry.mapping_profile_enabled]
-type = "boolean"
-default = true
-description = "录制元数据中的建图配置启用标记。"
-consumers = ["网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata"]
-apply = "restart"
-
-[geometry.mapping_profile_name]
-type = "string"
-default = "nuwax_geometry_runtime"
-description = "录制时记下的建图配置名称。"
-consumers = ["网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata"]
 apply = "restart"
 
 [geometry.mapping_raytracing_grace_depth]
@@ -1616,14 +1609,6 @@ description = "三维链实时生成的占据栅格分辨率（米/格），二�
 consumers = ["几何运行时 · services/geometry/nuwax_geometry_runtime/src/mapper.rs:MapperConfig::from_env"]
 apply = "restart"
 
-[geometry.max_sensor_skew_sec]
-type = "float"
-min = 0.0
-default = 0.2
-description = "跨传感器期望最大时间差（秒），写入录制的几何配置元数据。"
-consumers = ["网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata"]
-apply = "restart"
-
 [geometry.native_lio_pair_max_skew_ms]
 type = "integer"
 min = 1
@@ -1636,13 +1621,6 @@ consumers = [
 ]
 apply = "restart"
 
-[geometry.occupancy_topic]
-type = "string"
-default = "/map_obstacles"
-description = "占据栅格来源标识，写入录制的几何配置元数据。"
-consumers = ["网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata"]
-apply = "restart"
-
 [geometry.odom_max_age_sec]
 type = "float"
 min = 0.0
@@ -1652,13 +1630,6 @@ consumers = [
     "导航栈 · services/nuwax-workspace/crates/nuwax-nav-stack/src/lcm_dataflow.rs:configured_pose_source_max_age",
     "网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata",
 ]
-apply = "restart"
-
-[geometry.odom_topic]
-type = "string"
-default = "/utlidar/robot_odom"
-description = "主里程计来源标识，写入录制的几何配置元数据。"
-consumers = ["网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata"]
 apply = "restart"
 
 [geometry.pgo_options]
@@ -1678,21 +1649,6 @@ consumers = [
     "导航栈 · services/nuwax-workspace/crates/nuwax-nav-stack/src/production_pipeline.rs:ProductionPipeline::from_env",
     "网关 · services/geometry/client.py:_snapshot",
 ]
-apply = "restart"
-
-[geometry.point_cloud_max_age_sec]
-type = "float"
-min = 0.0
-default = 0.5
-description = "点云期望最大年龄（秒），写入录制的几何配置元数据。"
-consumers = ["网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata"]
-apply = "restart"
-
-[geometry.point_cloud_topic]
-type = "string"
-default = "/utlidar/cloud_deskewed"
-description = "点云来源标识，写入录制的几何配置元数据。"
-consumers = ["网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata"]
 apply = "restart"
 
 [geometry.pointlio_options]
@@ -1779,55 +1735,11 @@ consumers = [
 ]
 apply = "restart"
 
-[geometry.secondary_odom_topics]
-type = "array"
-items = "string"
-default = []
-description = "备用里程计来源标识列表，写入录制的几何配置元数据。"
-consumers = ["网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata"]
-apply = "restart"
-
 [geometry.slam2d_config]
 type = "string"
 default = ""
 description = "二维执行链的传感器、机体坐标、时钟和标定配置，使用现行二维会话的 JSON（结构化文本）对象。二维链必须提供完整配置。"
 consumers = ["几何运行时 · services/geometry/nuwax_geometry_runtime/src/slam2d_owner.rs:Settings::from_env"]
-apply = "restart"
-
-[geometry.tf_max_age_sec]
-type = "float"
-min = 0.0
-default = 0.5
-description = "坐标变换期望最大年龄（秒），写入录制的几何配置元数据。"
-consumers = ["网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata"]
-apply = "restart"
-
-[geometry.tf_static_topic]
-type = "string"
-default = "/tf_static"
-description = "静态坐标变换来源标识，写入录制的几何配置元数据。"
-consumers = ["网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata"]
-apply = "restart"
-
-[geometry.tf_topic]
-type = "string"
-default = "/tf"
-description = "动态坐标变换来源标识，写入录制的几何配置元数据。"
-consumers = ["网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata"]
-apply = "restart"
-
-[geometry.timestamp_require_monotonic]
-type = "boolean"
-default = true
-description = "是否声明采样时间戳应单调递增，写入录制的几何配置元数据。"
-consumers = ["网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata"]
-apply = "restart"
-
-[geometry.timestamp_source]
-type = "string"
-default = "sensor_header"
-description = "点云时间戳来源说明，写入录制的几何配置元数据。"
-consumers = ["网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata"]
 apply = "restart"
 
 [navigation.autostart]
@@ -2399,13 +2311,6 @@ description = "容器中继的启用状态标记，在中继健康接口中显�
 consumers = ["容器中继 · gateways/relay/server.py:create_relay_app.relay_health"]
 apply = "restart"
 
-[relay.host]
-type = "string"
-default = "127.0.0.1"
-description = "容器中继监听地址的启动日志值，实际绑定由容器启动命令指定。"
-consumers = ["容器中继 · gateways/app.py:create_relay_app_from_env"]
-apply = "restart"
-
 [relay.incoming_tokens]
 type = "array"
 items = "string"
@@ -2413,15 +2318,6 @@ default = []
 description = "允许接入容器中继的令牌列表。"
 sensitive = true
 consumers = ["容器中继 · gateways/relay/server.py:_assert_incoming_token"]
-apply = "restart"
-
-[relay.port]
-type = "integer"
-min = 1
-max = 65535
-default = 9766
-description = "容器中继端口的启动日志值，实际绑定由容器启动命令指定。"
-consumers = ["容器中继 · gateways/app.py:create_relay_app_from_env"]
 apply = "restart"
 
 [relay.upstream_base_url]
@@ -2467,41 +2363,9 @@ description = "查询同一设备任务状态的间隔秒数。"
 consumers = ["网关 · services/manipulation/service.py:ManipulationService._run_task"]
 apply = "restart"
 
-[map_cloud.google_maps_api_key]
-type = "string"
-default = ""
-description = "地图云服务库调用谷歌地图时使用的密钥。网关当前地名检索使用 Nominatim。"
-sensitive = true
-consumers = ["地图云服务库 · services/nuwax-workspace/crates/nuwax-mapping-cloud/src/google_maps.rs:GoogleMapsClient::from_env"]
-apply = "restart"
-
-[map_cloud.google_maps_base_url]
-type = "string"
-default = "https://maps.googleapis.com/maps/api"
-description = "地图云服务库调用谷歌地图的基础地址。"
-consumers = ["地图云服务库 · services/nuwax-workspace/crates/nuwax-mapping-cloud/src/google_maps.rs:GoogleMapsClient::from_env"]
-apply = "restart"
-
 [map_cloud.nominatim_url]
 type = "string"
 default = "https://nominatim.openstreetmap.org/search"
 description = "按地名查询经纬度时使用的OpenStreetMap Nominatim（地名检索服务）搜索地址，可改为自建或代理服务。"
-consumers = [
-    "网关 · services/navigation/places.py:PlaceLookup.__init__",
-    "地图云服务库 · services/nuwax-workspace/crates/nuwax-mapping-cloud/src/osm.rs:OsmClient::new",
-]
-apply = "restart"
-
-[map_cloud.osm_tile_url_template]
-type = "string"
-default = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
-description = "地图云服务库的 OpenStreetMap（开放街道地图）瓦片地址模板，须包含 {z}、{x} 和 {y}。"
-consumers = ["地图云服务库 · services/nuwax-workspace/crates/nuwax-mapping-cloud/src/osm.rs:OsmClient::new"]
-apply = "restart"
-
-[map_cloud.osm_user_agent]
-type = "string"
-default = "nuwax-mapping-cloud/0.1"
-description = "地图云服务库请求开放街道地图服务时发送的客户端标识。"
-consumers = ["地图云服务库 · services/nuwax-workspace/crates/nuwax-mapping-cloud/src/osm.rs:OsmClient::new"]
+consumers = ["网关 · services/navigation/places.py:PlaceLookup.__init__"]
 apply = "restart"

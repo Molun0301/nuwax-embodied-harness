@@ -249,12 +249,16 @@ impl TerrainLimits {
 }
 impl NavigationCapabilities {
     /// 从启动环境捕获；空值明确表示无标定。
-    pub fn from_env() -> Result<Option<Self>, String> {
-        let value = std::env::var("NUWAX_NAV_CAPABILITIES_JSON").unwrap_or_default();
-        if value.trim().is_empty() {
-            return Ok(None);
+    pub fn from_runtime() -> Result<Option<Self>, String> {
+        Self::from_config(&nuwax_config::navigation()?.capabilities_json)
+    }
+
+    pub fn from_config(value: &str) -> Result<Option<Self>, String> {
+        if value.is_empty() {
+            Ok(None)
+        } else {
+            Self::from_json(value).map(Some)
         }
-        Self::from_json(&value).map(Some)
     }
     /// 读取跨语言统一结构并完整校验。
     pub fn from_json(value: &str) -> Result<Self, String> {

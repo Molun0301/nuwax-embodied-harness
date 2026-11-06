@@ -192,14 +192,7 @@ pub(crate) async fn publish(
     value: &PlanarNavigationMap,
 ) -> Result<(), String> {
     use nuwax_protocol::{LcmMessageType, LcmTopic, RawLcmFrameBuilder};
-    let channel = std::env::var("NUWAX_LCM_CHANNEL_PLANAR_NAVIGATION").unwrap_or_else(|_| {
-        format!(
-            "{}#{}",
-            planar_navigation::DEFAULT_TOPIC,
-            planar_navigation::TYPE_NAME
-        )
-    });
-    let topic = channel.split('#').next().unwrap();
+    let topic = planar_navigation::DEFAULT_TOPIC;
     let bytes = planar_navigation::encode_body(value).map_err(|e| e.to_string())?;
     transport
         .publish(

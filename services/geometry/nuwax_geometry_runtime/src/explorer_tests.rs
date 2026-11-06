@@ -1,25 +1,21 @@
 use super::*;
 
-// 进度行为测试复用真正的波前源，固定外形只在这一组串行测试中安装。
-static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-struct GeometryEnv(Option<String>);
-impl GeometryEnv {
-    fn install() -> Self {
-        let old = std::env::var("NUWAX_ROBOT_GEOMETRY_JSON").ok();
-        std::env::set_var(
-            "NUWAX_ROBOT_GEOMETRY_JSON",
-            r#"{"footprint_xy_m":[[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],"z_min_m":-0.2,"z_max_m":0.2,"source":"探索行为测试"}"#,
-        );
-        Self(old)
-    }
-}
-impl Drop for GeometryEnv {
-    fn drop(&mut self) {
-        match &self.0 {
-            Some(value) => std::env::set_var("NUWAX_ROBOT_GEOMETRY_JSON", value),
-            None => std::env::remove_var("NUWAX_ROBOT_GEOMETRY_JSON"),
-        }
-    }
+const TEST_GEOMETRY:&str=r#"{"footprint_xy_m":[[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],"z_min_m":-0.2,"z_max_m":0.2,"source":"探索行为测试"}"#;
+fn make_explorer(
+    map_name: String,
+    map_frame: String,
+    surface_mode: bool,
+) -> Result<Explorer, Status> {
+    let n = nuwax_config::test_support::section("navigation");
+    let r = nuwax_config::test_support::section("robot");
+    let d = nuwax_config::sections::Derived {
+        nav_profile: "pct-scan-3d".into(),
+        actuator_max_linear_mps: 0.0,
+        actuator_max_yaw_rps: 0.0,
+        actuator_motion_model: String::new(),
+        robot_geometry_json: TEST_GEOMETRY.into(),
+    };
+    Explorer::from_config(map_name, map_frame, surface_mode, &n, &r, &d)
 }
 fn request() -> proto::ExplorationRequest {
     proto::ExplorationRequest {
@@ -61,9 +57,7 @@ fn grid() -> proto::OccupancyGrid {
 }
 #[test]
 fn paused_progress_restores_source_history_and_counts_in_same_map() {
-    let _lock = ENV.lock().unwrap();
-    let _env = GeometryEnv::install();
-    let mut explorer = Explorer::new("住宅".into(), "map".into(), false).unwrap();
+    let mut explorer = make_explorer("住宅".into(), "map".into(), false).unwrap();
     explorer.start("first".into(), request()).unwrap();
     let tick = explorer.tick(Some(pose()), Some(grid()), None).unwrap();
     let (goal_id, _) = tick.goal.expect("实际波前选择应产生探索目标");
@@ -79,7 +73,7 @@ fn paused_progress_restores_source_history_and_counts_in_same_map() {
     let saved: Progress = serde_json::from_str(&progress.progress_json).unwrap();
     assert_eq!(saved.reached_goals, 1);
     assert!(!saved.sources.is_empty());
-    let mut resumed = Explorer::new("住宅".into(), "map".into(), false).unwrap();
+    let mut resumed = make_explorer("住宅".into(), "map".into(), false).unwrap();
     let mut next = request();
     next.resume_progress_json = progress.progress_json.clone();
     let status = resumed.start("second".into(), next).unwrap();
@@ -87,7 +81,7 @@ fn paused_progress_restores_source_history_and_counts_in_same_map() {
     let restored: Progress =
         serde_json::from_str(&resumed.progress().unwrap().progress_json).unwrap();
     assert_eq!(restored.sources[0].payload, saved.sources[0].payload);
-    let mut wrong_map = Explorer::new("其它地图".into(), "map".into(), false).unwrap();
+    let mut wrong_map = make_explorer("其它地图".into(), "map".into(), false).unwrap();
     let mut next = request();
     next.resume_progress_json = progress.progress_json.clone();
     assert_eq!(
@@ -97,9 +91,7 @@ fn paused_progress_restores_source_history_and_counts_in_same_map() {
 }
 #[test]
 fn stopped_child_ends_exploration_and_duration_completion_cancels_child() {
-    let _lock = ENV.lock().unwrap();
-    let _env = GeometryEnv::install();
-    let mut explorer = Explorer::new("住宅".into(), "map".into(), false).unwrap();
+    let mut explorer = make_explorer("住宅".into(), "map".into(), false).unwrap();
     explorer.start("mission".into(), request()).unwrap();
     let tick = explorer.tick(Some(pose()), Some(grid()), None).unwrap();
     let (id, _) = tick.goal.unwrap();
@@ -132,9 +124,7 @@ fn stopped_child_ends_exploration_and_duration_completion_cancels_child() {
 
 #[test]
 fn stale_pose_waits_and_fresh_pose_resumes_without_new_start() {
-    let _lock = ENV.lock().unwrap();
-    let _env = GeometryEnv::install();
-    let mut explorer = Explorer::new("住宅".into(), "map".into(), false).unwrap();
+    let mut explorer = make_explorer("住宅".into(), "map".into(), false).unwrap();
     explorer.start("recovery".into(), request()).unwrap();
     let mut old = pose();
     old.timestamp_ns = unix_ns() - 2_000_000_000;
@@ -197,7 +187,7 @@ fn forbidden_mask_changes_surface_input_without_changing_physical_snapshot() {
 }
 
 fn started_with_max_goals(max: u32) -> Explorer {
-    let mut explorer = Explorer::new("住宅".into(), "map".into(), false).unwrap();
+    let mut explorer = make_explorer("住宅".into(), "map".into(), false).unwrap();
     let mut start = request();
     start.stop_conditions = Some(proto::ExplorationStopConditions {
         max_goals: Some(max),
@@ -218,8 +208,6 @@ fn feedback(explorer: &mut Explorer, id: String, status: proto::GoalStatus) {
 }
 #[test]
 fn max_goals_waits_for_active_child_terminal_before_stopping() {
-    let _lock = ENV.lock().unwrap();
-    let _env = GeometryEnv::install();
     let mut explorer = started_with_max_goals(1);
     let first = explorer.tick(Some(pose()), Some(grid()), None).unwrap();
     let (id, _) = first.goal.unwrap();
@@ -241,8 +229,6 @@ fn max_goals_waits_for_active_child_terminal_before_stopping() {
 }
 #[test]
 fn max_goals_does_not_count_failed_child_as_reached() {
-    let _lock = ENV.lock().unwrap();
-    let _env = GeometryEnv::install();
     let mut explorer = started_with_max_goals(1);
     let (id, _) = explorer
         .tick(Some(pose()), Some(grid()), None)
@@ -260,10 +246,8 @@ fn max_goals_does_not_count_failed_child_as_reached() {
 }
 #[test]
 fn coverage_stop_counts_only_cells_inside_requested_boundary() {
-    let _lock = ENV.lock().unwrap();
-    let _env = GeometryEnv::install();
     for inside_known in [false, true] {
-        let mut explorer = Explorer::new("住宅".into(), "map".into(), false).unwrap();
+        let mut explorer = make_explorer("住宅".into(), "map".into(), false).unwrap();
         let mut request = request();
         request.boundary = [[0., 0.], [2., 0.], [2., 2.], [0., 2.]]
             .into_iter()
@@ -301,8 +285,6 @@ fn coverage_stop_counts_only_cells_inside_requested_boundary() {
 }
 #[test]
 fn default_no_frontier_stability_window_finishes_with_fresh_map_input() {
-    let _lock = ENV.lock().unwrap();
-    let _env = GeometryEnv::install();
     let mut explorer = started_with_max_goals(10);
     let mut complete = grid();
     complete.data.fill(0);
@@ -322,8 +304,6 @@ fn default_no_frontier_stability_window_finishes_with_fresh_map_input() {
 }
 #[test]
 fn unavailable_or_stale_map_never_completes_no_frontier_window() {
-    let _lock = ENV.lock().unwrap();
-    let _env = GeometryEnv::install();
     let mut explorer = started_with_max_goals(10);
     let mut complete = grid();
     complete.data.fill(0);
@@ -344,8 +324,6 @@ fn unavailable_or_stale_map_never_completes_no_frontier_window() {
 }
 #[test]
 fn costmap_refresh_keeps_active_child_and_next_goal_progresses() {
-    let _lock = ENV.lock().unwrap();
-    let _env = GeometryEnv::install();
     let mut explorer = started_with_max_goals(2);
     let (first, _) = explorer
         .tick(Some(pose()), Some(grid()), None)
@@ -371,20 +349,13 @@ fn enable_mission(explorer: &mut Explorer, maximum: Option<f64>) {
     explorer.calibration = Some(MissionCalibration {
         maximum_sample_speed_mps: 2.0,
         planar: nuwax_nav_simple_planner::SimplePlannerConfig {
-            robot_geometry: Some(
-                RobotGeometry::from_runtime_json(
-                    &std::env::var("NUWAX_ROBOT_GEOMETRY_JSON").unwrap(),
-                )
-                .unwrap(),
-            ),
+            robot_geometry: Some(RobotGeometry::from_runtime_json(TEST_GEOMETRY).unwrap()),
             ..Default::default()
         },
     });
 }
 #[test]
 fn mission_budget_dispatches_home_and_requires_matching_terminal() {
-    let _lock = ENV.lock().unwrap();
-    let _env = GeometryEnv::install();
     let mut explorer = started_with_max_goals(10);
     enable_mission(&mut explorer, Some(0.01));
     let selected = explorer.tick(Some(pose()), Some(grid()), None).unwrap();
@@ -413,8 +384,6 @@ fn mission_budget_dispatches_home_and_requires_matching_terminal() {
 }
 #[test]
 fn mission_active_goal_reserves_current_return_route_before_limit() {
-    let _lock = ENV.lock().unwrap();
-    let _env = GeometryEnv::install();
     let mut explorer = started_with_max_goals(10);
     let (old, _) = explorer
         .tick(Some(pose()), Some(grid()), None)
@@ -439,8 +408,6 @@ fn mission_active_goal_reserves_current_return_route_before_limit() {
 }
 #[test]
 fn mission_unreachable_home_fails_without_return_dispatch() {
-    let _lock = ENV.lock().unwrap();
-    let _env = GeometryEnv::install();
     let mut explorer = started_with_max_goals(10);
     enable_mission(&mut explorer, None);
     explorer.mission = Some(
@@ -456,8 +423,6 @@ fn mission_unreachable_home_fails_without_return_dispatch() {
 }
 #[test]
 fn mission_return_failures_exhaust_original_retry_budget() {
-    let _lock = ENV.lock().unwrap();
-    let _env = GeometryEnv::install();
     let mut explorer = started_with_max_goals(10);
     enable_mission(&mut explorer, Some(0.01));
     explorer.tick(Some(pose()), Some(grid()), None).unwrap();
@@ -477,8 +442,6 @@ fn mission_return_failures_exhaust_original_retry_budget() {
 }
 #[test]
 fn user_stop_after_costmap_update_clears_active_child_and_keeps_progress() {
-    let _lock = ENV.lock().unwrap();
-    let _env = GeometryEnv::install();
     let mut explorer = started_with_max_goals(10);
     explorer
         .tick(Some(pose()), Some(grid()), None)
@@ -497,8 +460,6 @@ fn user_stop_after_costmap_update_clears_active_child_and_keeps_progress() {
 }
 #[test]
 fn permanent_dispatch_rejection_still_applies_goal_failure_policy() {
-    let _lock = ENV.lock().unwrap();
-    let _env = GeometryEnv::install();
     let mut explorer = started_with_max_goals(1);
     let (id, _) = explorer
         .tick(Some(pose()), Some(grid()), None)
@@ -556,7 +517,7 @@ pub(crate) fn blocking_fixture(
             }
         }
     }
-    let mut explorer = Explorer::new("未保存图".into(), "map".into(), false).unwrap();
+    let mut explorer = make_explorer("未保存图".into(), "map".into(), false).unwrap();
     explorer.id = "阻塞计算".into();
     explorer.started = Some(Instant::now());
     explorer.config = Some(ExploreStartConfig::default());
@@ -570,8 +531,6 @@ pub(crate) fn blocking_fixture(
 
 #[test]
 fn mission_unreachable_candidate_is_not_budget_exhaustion() {
-    let _lock = ENV.lock().unwrap();
-    let _env = GeometryEnv::install();
     struct Candidate {
         failures: Arc<std::sync::Mutex<Vec<ExplorationGoalFeedback>>>,
     }
@@ -637,8 +596,6 @@ fn mission_unreachable_candidate_is_not_budget_exhaustion() {
 }
 #[test]
 fn surface_goals_preserve_real_floor_height_arrival_heading_and_source() {
-    let _lock = ENV.lock().unwrap();
-    let _env = GeometryEnv::install();
     let config = SurfaceNavigationConfig::new(
         "map".into(),
         RobotGeometry {

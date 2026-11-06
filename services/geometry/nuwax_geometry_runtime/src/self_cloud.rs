@@ -39,13 +39,21 @@ pub(crate) struct RobotSelfFilter {
 }
 
 impl RobotSelfFilter {
-    pub(crate) fn from_env(runtime_body_frame: &str) -> Result<Option<Self>, String> {
-        let geometry = std::env::var("NUWAX_ROBOT_GEOMETRY_JSON").ok();
-        let result = Self::from_config(geometry.as_deref())?;
+    pub(crate) fn from_runtime(runtime_body_frame: &str) -> Result<Option<Self>, String> {
+        Self::from_runtime_geometry(
+            runtime_body_frame,
+            &nuwax_config::derived()?.robot_geometry_json,
+        )
+    }
+    pub(crate) fn from_runtime_geometry(
+        runtime_body_frame: &str,
+        geometry: &str,
+    ) -> Result<Option<Self>, String> {
+        let result = Self::from_config(Some(geometry))?;
         if let Some(filter) = &result {
             // 配置已声明选定模型连杆是机体基准；名称绑定不是物理标定验证。
             eprintln!("固定自体过滤：模型基准 {} 按几何配置对应运行时 body {}，实体 {}，排除活动几何 {}，未支持 {}；动态腿足未覆盖",
-                filter.model_base_link, runtime_body_frame, filter.primitives.len(), filter.excluded_moving, filter.unsupported);
+                            filter.model_base_link, runtime_body_frame, filter.primitives.len(), filter.excluded_moving, filter.unsupported);
         } else {
             eprintln!("固定自体过滤未启用：配置没有可用固定碰撞实体；不使用导航外包替代");
         }
@@ -181,13 +189,13 @@ pub(crate) struct NativeSelfFilter {
 }
 
 impl NativeSelfFilter {
-    pub(crate) fn from_env(runtime_body_frame: &str) -> Result<Option<Self>, String> {
-        let Some(filter) = RobotSelfFilter::from_env(runtime_body_frame)? else {
+    pub(crate) fn from_runtime(runtime_body_frame: &str) -> Result<Option<Self>, String> {
+        let Some(filter) = RobotSelfFilter::from_runtime(runtime_body_frame)? else {
             return Ok(None);
         };
         Ok(Some(Self {
             filter,
-            body_from_sensor: crate::native_lio_owner::BodyFromSensorTransform::from_env()?,
+            body_from_sensor: crate::native_lio_owner::BodyFromSensorTransform::from_runtime()?,
         }))
     }
 

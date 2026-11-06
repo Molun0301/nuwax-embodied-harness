@@ -212,20 +212,24 @@ impl NativeFrontierCache {
         if nuwax_nav_pct_native::planning_cancelled() {
             return Err("PCT规划已取消".into());
         }
-        let terrain_source = nuwax_nav_runtime::native_map::PctTerrainSource::from_env()?;
+        let terrain_source = nuwax_nav_runtime::native_map::PctTerrainSource::from_runtime()?;
         let mut state = self
             .state
             .lock()
             .map_err(|_| "前沿原生地图缓存锁已失效".to_string())?;
-        if let Some(cached) = state
-            .as_ref()
-            .filter(|cached| cached.offset == offset && cached.boundary == boundary
-                && cached.terrain_source == terrain_source)
-        {
+        if let Some(cached) = state.as_ref().filter(|cached| {
+            cached.offset == offset
+                && cached.boundary == boundary
+                && cached.terrain_source == terrain_source
+        }) {
             return Ok(cached.clone());
         }
-        let (config, cells, bands) =
-            nuwax_nav_runtime::native_map::pct_input_for_source(snapshot, offset, boundary, terrain_source)?;
+        let (config, cells, bands) = nuwax_nav_runtime::native_map::pct_input_for_source(
+            snapshot,
+            offset,
+            boundary,
+            terrain_source,
+        )?;
         let started = std::time::Instant::now();
         tracing::debug!(target: "navigation.exploration.compute", cells = cells.len(), bands = bands.len(), "开始构建前沿原生规划器");
         let mut measured = std::collections::BTreeMap::<[i32; 2], Vec<f64>>::new();
@@ -239,7 +243,7 @@ impl NativeFrontierCache {
         let planner = nuwax_nav_pct_native::Planner::from_cells(config.clone(), &cells, &bands)?;
         tracing::debug!(target: "navigation.exploration.compute", elapsed_ms = started.elapsed().as_secs_f64() * 1000.0, "前沿原生规划器构建完成");
         tracing::debug!(target:"navigation.pct",event="navigation.pct.map",cells=cells.len(),
-            occupied_bands=bands.len(),"探索PCT原生输入构建完成");
+                occupied_bands=bands.len(),"探索PCT原生输入构建完成");
         let cached = CachedFrontierPlanner {
             terrain_source,
             offset,

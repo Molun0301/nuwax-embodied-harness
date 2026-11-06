@@ -1,21 +1,4 @@
-// TESTS-ONLY CANDIDATE, NOT COMPILED OR RUN by its author.
-// Install as src/surface_nav_reader_guards.rs and apply nav-reader-hooks.patch
-// AFTER dependency-backoff.candidate.patch. The hook diff is candidate-relative.
-// Run in the validator's existing liblcm-enabled build, with the environment
-// supplied externally: NUWAX_LCM_URL=memq://. No RPC server is registered.
-// Selector prefix: lcm_dataflow::surface_dataflow::tests::nav_reader_guards::
-//   real_reader_same_missing_watermark_after_failure_keeps_original_deadline
-//   real_reader_same_missing_watermark_pending_inflight_keeps_original_deadline
-//   real_reader_complete_successor_after_failure_starts_before_original_deadline
-//   real_reader_complete_successor_pending_inflight_starts_before_original_deadline
-// Example (from services/nuwax-workspace, using the validator's existing target):
-// NUWAX_LCM_URL=memq:// cargo test -p nuwax-nav-stack --features mls --lib \
-//   lcm_dataflow::surface_dataflow::tests::nav_reader_guards:: -- --test-threads=1
-// For one full selector, append --exact to the libtest arguments instead.
-// This qualifies real Nav consumer ingress, FineMapReader, owner scheduling,
-// source retention and cleanup. It does not qualify sensor-to-commit lineage.
-// costmap_ttl remains ZERO: these are owner-backoff/retained-identity guards,
-// not source-TTL qualification. No source or receipt clock is refreshed.
+// 独立曲面地图读取行为测试，传输由测试拥有方明确构造。
 use super::*;
 use futures::FutureExt;
 use nuwax_map_chunks::{Key, Manifest, ObjectIdentity, Repository, Transfer, Writer, MAX_BLOCK_BYTES};
@@ -264,11 +247,19 @@ async fn start_reader_harness() -> Harness {
     // injection or map_computer override. Each Reader owns its real memq context.
     // This prerequisite precedes resource creation. Once construction returns,
     // ALL fixture setup, preconditions and business assertions are caught below.
-    assert_eq!(std::env::var("NUWAX_LCM_URL").ok().as_deref(), Some("memq://"),
-        "invoke the selected tests with NUWAX_LCM_URL=memq:// externally");
-    Harness::start_with_components(Arc::new(|m,p,g,c|body_path(m,p,g,c).map(SurfacePlan::complete)),
-        Duration::from_millis(25), config(), true, None,
-        nuwax_nav_runtime::SchedulerConfig { costmap_ttl: Duration::ZERO, ..Default::default() }).await
+
+    Harness::start_with_components(
+        Arc::new(|m, p, g, c| body_path(m, p, g, c).map(SurfacePlan::complete)),
+        Duration::from_millis(25),
+        config(),
+        true,
+        None,
+        nuwax_nav_runtime::SchedulerConfig {
+            costmap_ttl: Duration::ZERO,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 async fn active(harness: &mut Harness) -> (FineSeries, PreparedSurfaceMap, schema::NavigationGoal, i64) {
@@ -513,22 +504,22 @@ async fn complete_successor(queued_while_inflight: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "需外部设置NUWAX_LCM_URL=memq://以验证真实缺块通信；见任务E反馈中的独立命令"]
+#[ignore = "显式运行原有缺块通信专项；测试使用自己的 memq 通信上下文"]
 async fn real_reader_same_missing_watermark_after_failure_keeps_original_deadline() {
     same_missing_watermarks(false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "需外部设置NUWAX_LCM_URL=memq://以验证真实缺块通信；见任务E反馈中的独立命令"]
+#[ignore = "显式运行原有缺块通信专项；测试使用自己的 memq 通信上下文"]
 async fn real_reader_same_missing_watermark_pending_inflight_keeps_original_deadline() {
     same_missing_watermarks(true).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "需外部设置NUWAX_LCM_URL=memq://以验证真实缺块通信；见任务E反馈中的独立命令"]
+#[ignore = "显式运行原有缺块通信专项；测试使用自己的 memq 通信上下文"]
 async fn real_reader_complete_successor_after_failure_starts_before_original_deadline() {
     complete_successor(false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "需外部设置NUWAX_LCM_URL=memq://以验证真实缺块通信；见任务E反馈中的独立命令"]
+#[ignore = "显式运行原有缺块通信专项；测试使用自己的 memq 通信上下文"]
 async fn real_reader_complete_successor_pending_inflight_starts_before_original_deadline() {
     complete_successor(true).await;
 }

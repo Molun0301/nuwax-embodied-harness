@@ -57,7 +57,7 @@ fn main() {
             interval_s: 0.,
         }
     } else {
-        SavePolicy::default()
+        SavePolicy::from_runtime().expect("读取扫描保存配置")
     };
     let mut last = None;
     let (mut frames, mut saved, mut count, mut first, mut last_stamp) = (0, 0, 0, 0, 0);

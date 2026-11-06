@@ -83,7 +83,6 @@ use crate::error::{NavStackError, NavStackResult};
 use crate::graph::ModuleNode;
 use crate::runner::InProcessNode;
 
-const DEFAULT_LCM_URL: &str = "udpm://239.255.76.67:7667?ttl=0";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(any(feature = "cmu-native", feature = "explore"))]
 static FAR_READY_GENERATION: AtomicI64 = AtomicI64::new(0);
@@ -213,7 +212,10 @@ fn boxed_owner(label: &'static str, run: OwnerRun) -> Box<dyn InProcessNode> {
 }
 
 fn lcm_transport() -> NavStackResult<LcmTransport> {
-    let provider = std::env::var("NUWAX_LCM_URL").unwrap_or_else(|_| DEFAULT_LCM_URL.into());
+    let provider = nuwax_config::transport()
+        .map_err(NavStackError::InvalidConfig)?
+        .lcm_url
+        .clone();
     LcmTransport::new_real(&provider)
         .map_err(|error| NavStackError::Internal(format!("real LCM startup failed: {error}")))
 }
@@ -233,8 +235,11 @@ async fn typed_stream(
     Ok(transport.subscribe(topic, Some(message_type)).await)
 }
 
-fn planar_navigation_enabled()->bool {
-    std::env::var("NUWAX_GEOMETRY_PIPELINE").as_deref()==Ok("slam_2d")
+fn planar_navigation_enabled() -> bool {
+    nuwax_config::geometry()
+        .expect("启动已捕获 geometry 配置")
+        .pipeline
+        == "slam_2d"
 }
 
 /// 每个消费者独立核对运行、会话和观测顺序，清空与切域先向执行者交付撤销。
@@ -330,9 +335,11 @@ pub(crate) fn native_planner_readiness(
                 FAR_READY_GENERATION.store(0, Ordering::Release);
                 contract.worker_event.clone()
             }
-
         };
-        let provider = std::env::var("NUWAX_LCM_URL").unwrap_or_else(|_| DEFAULT_LCM_URL.into());
+        let provider = nuwax_config::transport()
+            .map_err(SupervisedReadyError::Protocol)?
+            .lcm_url
+            .clone();
         let transport = LcmTransport::new_real(&provider)
             .map_err(|error| SupervisedReadyError::Transport(error.to_string()))?;
         let topic = protocol_topic(&event_channel)
@@ -350,7 +357,6 @@ pub(crate) fn native_planner_readiness(
                 .await
                 .map_err(|error| SupervisedReadyError::Transport(error.to_string()))?;
             match &expected {
-
                 #[cfg(any(feature = "cmu-native", feature = "explore"))]
                 NativePlannerReadyContract::Far(expected_contract) => {
                     let state = match schema::decode_navigation_status_body(&frame.payload) {
@@ -704,8 +710,14 @@ async fn run_map_pose_adapter(
     let mut odometry = typed_stream(&transport, &node.inputs[0], "nav_msgs.Odometry").await?;
     let mut transforms = typed_stream(&transport, &node.inputs[1], "tf2_msgs.TFMessage").await?;
     let mut adapter = bound_map_pose_adapter(
-        configured_frame("NUWAX_MAP_FRAME", "map")?,
-        configured_frame("NUWAX_GEOMETRY_ODOM_FRAME", "odom")?,
+        nuwax_config::robot()
+            .map_err(NavStackError::InvalidConfig)?
+            .map_frame
+            .clone(),
+        nuwax_config::robot()
+            .map_err(NavStackError::InvalidConfig)?
+            .odom_frame
+            .clone(),
         &body_reference_frame_id,
     )?;
     let mut diagnostics = InputDiagnosticLimiter::default();
@@ -794,17 +806,7 @@ async fn run_map_pose_adapter(
     }
 }
 
-fn configured_frame(key: &str, fallback: &str) -> NavStackResult<String> {
-    let value = std::env::var(key).unwrap_or_else(|_| fallback.to_string());
-    let value = value.trim();
-    if value.is_empty() {
-        Err(NavStackError::InvalidConfig(format!(
-            "{key} must not be empty"
-        )))
-    } else {
-        Ok(value.to_string())
-    }
-}
+
 
 #[cfg(feature = "guard-runtime")]
 pub(crate) fn guarded_nav_scheduler_owner(
@@ -923,10 +925,9 @@ fn drain_guarded_pose_input(
 
 #[cfg(feature = "guard-runtime")]
 fn configured_pose_source_max_age() -> NavStackResult<Duration> {
-    let raw = std::env::var("NUWAX_GEOMETRY_ODOM_MAX_AGE_SEC").unwrap_or_else(|_| "0.5".into());
-    let seconds: f64 = raw.parse().map_err(|_| {
-        NavStackError::InvalidConfig("NUWAX_GEOMETRY_ODOM_MAX_AGE_SEC必须为正有限秒数".into())
-    })?;
+    let seconds = nuwax_config::geometry()
+        .map_err(NavStackError::InvalidConfig)?
+        .odom_max_age_sec;
     Duration::try_from_secs_f64(seconds)
         .ok()
         .filter(|value| !value.is_zero())
@@ -2655,7 +2656,7 @@ async fn run_wavefront(
     let mut failed = typed_stream(&transport, &node.inputs[3], "std_msgs.Bool").await?;
     let mut stop = typed_stream(&transport, &node.inputs[4], "std_msgs.Bool").await?;
 
-    let config = wavefront_config_from_env()?;
+    let config = wavefront_config_from_runtime()?;
     let mut runtime = WavefrontExplorerRuntime::new(
         WavefrontGoalSelector::new(config.clone()),
         LcmWavefrontGoalSink,
@@ -2751,21 +2752,13 @@ async fn run_wavefront(
 }
 
 #[cfg(feature = "explore")]
-fn wavefront_config_from_env() -> NavStackResult<nuwax_explore_wavefront::WavefrontConfig> {
-    let mut config = nuwax_explore_wavefront::WavefrontConfig::default();
-    if let Ok(value) = std::env::var("NUWAX_WAVEFRONT_GOAL_TIMEOUT_MS") {
-        config.goal_timeout_ms = value.parse::<u64>().map_err(|error| {
-            NavStackError::InvalidConfig(format!(
-                "NUWAX_WAVEFRONT_GOAL_TIMEOUT_MS must be an unsigned integer: {error}"
-            ))
-        })?;
-        if config.goal_timeout_ms == 0 {
-            return Err(NavStackError::InvalidConfig(
-                "NUWAX_WAVEFRONT_GOAL_TIMEOUT_MS must be greater than zero".into(),
-            ));
-        }
-    }
-    Ok(config)
+fn wavefront_config_from_runtime() -> NavStackResult<nuwax_explore_wavefront::WavefrontConfig> {
+    Ok(nuwax_explore_wavefront::WavefrontConfig {
+        goal_timeout_ms: nuwax_config::navigation()
+            .map_err(NavStackError::InvalidConfig)?
+            .wavefront_goal_timeout_ms as u64,
+        ..Default::default()
+    })
 }
 
 #[cfg(feature = "explore")]
@@ -3633,7 +3626,9 @@ fn validate_newer_source_timestamp(
 
 
 pub(crate) fn capture_body_reference() -> Result<Arc<str>, String> {
-    let body = configured_frame("NUWAX_BASE_FRAME", "base_link")
+    let body = nuwax_config::robot()
+        .map(|r| r.base_frame.clone())
+        .map_err(NavStackError::InvalidConfig)
         .map_err(|error| error.to_string())?;
     if !crate::map_pose::valid_body_reference(&body) {
         return Err("navigation body reference must be a valid frame ID".into());
@@ -4058,11 +4053,11 @@ async fn run_simple_planner(
     let mut goal_pose =
         typed_stream(&transport, &node.inputs[2], "nuwax_msgs.NavigationGoal").await?;
     let mut stop = typed_stream(&transport, &node.inputs[3], "std_msgs.Bool").await?;
-    let robot_geometry = std::env::var("NUWAX_ROBOT_GEOMETRY_JSON").ok()
+    let robot_geometry = Some(nuwax_config::derived().map_err(NavStackError::InvalidConfig)?.robot_geometry_json.clone())
         .filter(|value| !value.trim().is_empty())
         .map(|value| nuwax_nav_types_messages::RobotGeometry::from_runtime_json(&value))
         .transpose().map_err(NavStackError::InvalidConfig)?;
-    let motion_limits=nuwax_nav_types_messages::NavigationCapabilities::from_env()
+    let motion_limits=nuwax_nav_types_messages::NavigationCapabilities::from_runtime()
         .map_err(NavStackError::InvalidConfig)?.map(|profile| {
             let mut limits=profile.motion;
             let navigation=nuwax_nav_runtime::surface_follower::forward_navigation_kinematics(limits.kinematics());
@@ -4438,8 +4433,7 @@ async fn run_astar_planner_with_transport(
     let mut costmap = typed_stream(&transport, &node.inputs[1], "nav_msgs.OccupancyGrid").await?;
     let mut goal = typed_stream(&transport, &node.inputs[2], "nuwax_msgs.NavigationGoal").await?;
     let mut stop = typed_stream(&transport, &node.inputs[3], "std_msgs.Bool").await?;
-    let value = std::env::var("NUWAX_ROBOT_GEOMETRY_JSON")
-        .map_err(|error| NavStackError::InvalidConfig(error.to_string()))?;
+    let value = nuwax_config::derived().map_err(NavStackError::InvalidConfig)?.robot_geometry_json.clone();
     let robot_geometry = nuwax_nav_types_messages::RobotGeometry::from_runtime_json(&value)
         .map_err(NavStackError::InvalidConfig)?;
     let config = nuwax_nav_astar::GlobalPlannerConfig::new(robot_geometry);

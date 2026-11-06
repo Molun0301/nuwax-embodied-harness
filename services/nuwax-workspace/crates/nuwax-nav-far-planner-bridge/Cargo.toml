@@ -9,6 +9,7 @@ publish.workspace = true
 description = "FAR Planner typed liblcm worker and native bridge"
 
 [dependencies]
+nuwax-config = { path = "../nuwax-config" }
 nuwax-nav-native-runner = { path = "../nuwax-nav-native-runner" }
 nuwax-nav-base = { path = "../nuwax-nav-base" }
 nuwax-nav-types-messages = { path = "../nuwax-nav-types-messages" }

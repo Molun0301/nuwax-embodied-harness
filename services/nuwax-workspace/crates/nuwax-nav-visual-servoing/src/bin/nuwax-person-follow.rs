@@ -1,5 +1,6 @@
 //! Standalone production process for typed 3D person following.
 
+#[cfg(test)]
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -9,19 +10,21 @@ use nuwax_nav_visual_servoing::lcm_owner::{
 };
 use nuwax_transport::LcmTransport;
 
-const DEFAULT_LCM_URL: &str = "udpm://239.255.76.67:7667?ttl=0";
-const INTERNAL_READY_FILE_ENV: &str = "NUWAX_PERSON_FOLLOW_INTERNAL_READY_FILE";
+
 
 struct InternalReadyMarker {
     path: PathBuf,
 }
 
 impl InternalReadyMarker {
-    fn from_env() -> io::Result<Option<Self>> {
-        Self::from_env_value(std::env::var_os(INTERNAL_READY_FILE_ENV))
+    fn from_runtime() -> io::Result<Option<Self>> {
+        let path = nuwax_config::resolve_path(nuwax_config::FOLLOW_READY);
+        std::fs::create_dir_all(path.parent().expect("就绪文件目录"))?;
+        Self::from_path(path).map(Some)
     }
 
-    fn from_env_value(value: Option<OsString>) -> io::Result<Option<Self>> {
+    #[cfg(test)]
+    fn from_optional_path(value: Option<OsString>) -> io::Result<Option<Self>> {
         value.map(PathBuf::from).map(Self::from_path).transpose()
     }
 
@@ -29,7 +32,7 @@ impl InternalReadyMarker {
         if path.as_os_str().is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("{INTERNAL_READY_FILE_ENV} must not be empty"),
+                format!("就绪路径不能为空"),
             ));
         }
         remove_file_if_exists(&path)?;
@@ -75,10 +78,11 @@ async fn main() {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let ready_marker = InternalReadyMarker::from_env()?;
-    let provider = std::env::var("NUWAX_LCM_URL").unwrap_or_else(|_| DEFAULT_LCM_URL.to_string());
+    let ready_marker = InternalReadyMarker::from_runtime()?;
+    let provider = nuwax_config::transport()?.lcm_url.clone();
+    nuwax_config::person_follow()?;
     let transport = LcmTransport::new_real(&provider)?;
-    let config = config_from_env();
+    let config = config_from_runtime();
     let owner = PersonFollowLcmOwner::new(transport, config)?;
     owner
         .run_until_with_ready(
@@ -98,29 +102,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn config_from_env() -> PersonFollowLcmConfig {
-    let mut config = PersonFollowLcmConfig::default();
-    override_string(
-        "NUWAX_PERSON_FOLLOW_TARGET_CHANNEL",
-        &mut config.target_channel,
-    );
-    override_string(
-        "NUWAX_PERSON_FOLLOW_POINTCLOUD_CHANNEL",
-        &mut config.pointcloud_channel,
-    );
-    override_string("NUWAX_PERSON_FOLLOW_TF_CHANNEL", &mut config.tf_channel);
-    override_string(
-        "NUWAX_PERSON_FOLLOW_COMMAND_CHANNEL",
-        &mut config.command_channel,
-    );
-    config
+fn config_from_runtime() -> PersonFollowLcmConfig {
+    PersonFollowLcmConfig::default()
 }
 
-fn override_string(name: &str, target: &mut String) {
-    if let Ok(value) = std::env::var(name) {
-        *target = value;
-    }
-}
+
 
 #[cfg(test)]
 mod tests {
@@ -164,14 +150,14 @@ mod tests {
 
     #[test]
     fn missing_internal_ready_env_keeps_direct_run_compatible() {
-        assert!(InternalReadyMarker::from_env_value(None)
+        assert!(InternalReadyMarker::from_optional_path(None)
             .expect("missing env is supported")
             .is_none());
     }
 
     #[test]
     fn explicitly_empty_internal_ready_env_is_rejected() {
-        let error = InternalReadyMarker::from_env_value(Some(OsString::new()))
+        let error = InternalReadyMarker::from_optional_path(Some(OsString::new()))
             .err()
             .expect("empty env must fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);

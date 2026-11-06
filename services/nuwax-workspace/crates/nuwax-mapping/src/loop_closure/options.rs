@@ -6,8 +6,6 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use std::{collections::BTreeMap, fmt, sync::OnceLock};
 
-/// 由共同配置文件加载器导出的库内PGO参数。
-pub const PGO_OPTIONS_ENV: &str = "NUWAX_GEOMETRY_PGO_OPTIONS";
 const SCHEMA: &str = include_str!("../../../../../../contracts/pgo_options.json");
 
 /// 仅包含显式覆盖项；缺少的字段保留调用方选择的前端默认配置。

@@ -13,6 +13,7 @@ path = "src/lib.rs"
 # MSRV 1.88；目标机 aarch64 + Ubuntu 20.04；仅使用 LCM 数据面。
 
 [dependencies]
+nuwax-config = { path = "../../nuwax-workspace/crates/nuwax-config" }
 nuwax-dufomap-native = { path = "../../nuwax-workspace/crates/nuwax-dufomap-native" }
 base64 = "0.22.1"
 nuwax-cloud-cleanup = { path = "../../nuwax-workspace/crates/nuwax-cloud-cleanup" }
@@ -88,6 +89,7 @@ async-trait = "0.1"
 nalgebra = { version = "0.33", features = ["serde-serialize"] }
 
 [dev-dependencies]
+nuwax-config = { path = "../../nuwax-workspace/crates/nuwax-config", features = ["test-support"] }
 # Tests transfer real captured objects through Receiver and Store before Reader build.
 nuwax-nav-stack = { path = "../../nuwax-workspace/crates/nuwax-nav-stack", default-features = false, features = ["surface-source-qualification"] }
 

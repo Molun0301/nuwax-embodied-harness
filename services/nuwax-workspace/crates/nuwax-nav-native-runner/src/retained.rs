@@ -19,8 +19,8 @@ use crate::supervised::{
     SupervisedStartError, SupervisedTerminal,
 };
 
-/// 当前 planner child 与类型化 READY 共用的重启代际环境变量。
-pub const PLANNER_RESTART_GENERATION_ENV: &str = "NUWAX_PLANNER_GENERATION";
+/// 当前规划子进程与类型化就绪协议共用的重启代次参数。
+pub const PLANNER_RESTART_GENERATION_ARG: &str = "--planner-generation";
 
 /// 类型化 READY 边界返回的 future。
 pub type TypedReadyFuture =
@@ -72,8 +72,8 @@ pub struct RetainedNativeConfig {
     pub startup_timeout: Duration,
     /// 正常 shutdown 的 TERM grace。
     pub shutdown_grace: Duration,
-    /// 每次 spawn 都覆盖写入当代值的环境变量名。
-    pub restart_generation_env: String,
+    /// 每次启动都传入当前代次的命令行参数名。
+    pub restart_generation_arg: String,
     /// crash 后重启策略。
     pub restart: RestartPolicy,
 }
@@ -85,11 +85,9 @@ impl RetainedNativeConfig {
                 "startup_timeout must be positive".to_string(),
             ));
         }
-        if self.restart_generation_env.is_empty()
-            || self.restart_generation_env.contains(['=', '\0'])
-        {
+        if self.restart_generation_arg.is_empty() || self.restart_generation_arg.contains(['=', '\0']) {
             return Err(RetainedNativeError::InvalidConfig(
-                "restart_generation_env must be a non-empty environment key".to_string(),
+                "restart_generation_arg 必须是非空命令行参数名".to_string(),
             ));
         }
         if Instant::now().checked_add(self.startup_timeout).is_none()
@@ -334,7 +332,9 @@ impl RetainedNativeOwner {
             })?;
         let readiness = self.readiness.clone();
         let mut command = self.config.command.clone();
-        command.env(&self.config.restart_generation_env, generation.to_string());
+        command
+            .arg(&self.config.restart_generation_arg)
+            .arg(generation.to_string());
         let started = spawn_supervised(
             command,
             self.config.supervisor.clone(),
@@ -410,7 +410,7 @@ mod tests {
             },
             startup_timeout: Duration::from_millis(200),
             shutdown_grace: Duration::from_millis(100),
-            restart_generation_env: PLANNER_RESTART_GENERATION_ENV.to_string(),
+            restart_generation_arg: PLANNER_RESTART_GENERATION_ARG.to_string(),
             restart,
         }
     }
@@ -515,13 +515,13 @@ mod tests {
         let ready_path = directory.path().join("typed-ready-generation");
         let ready_temporary = directory.path().join("typed-ready-generation.tmp");
         let script = format!(
-            "printf '%s' \"${PLANNER_RESTART_GENERATION_ENV}\" > '{}'; mv '{}' '{}'; if [ -e '{}' ]; then exec sleep 30; else touch '{}'; sleep 0.05; exit 7; fi",
-            ready_temporary.display(),
-            ready_temporary.display(),
-            ready_path.display(),
-            marker.display(),
-            marker.display()
-        );
+                "printf '%s' \"$1\" > '{}'; mv '{}' '{}'; if [ -e '{}' ]; then exec sleep 30; else touch '{}'; sleep 0.05; exit 7; fi",
+                ready_temporary.display(),
+                ready_temporary.display(),
+                ready_path.display(),
+                marker.display(),
+                marker.display()
+            );
         let generations = Arc::new(Mutex::new(Vec::new()));
         let generations_by_ready = generations.clone();
         let ready_path_by_callback = ready_path.clone();
@@ -544,8 +544,8 @@ mod tests {
                                 }
                                 if child_generation > generation {
                                     return Err(SupervisedReadyError::Protocol(format!(
-                                        "future child generation {child_generation} exceeds owner generation {generation}"
-                                    )));
+                                            "future child generation {child_generation} exceeds owner generation {generation}"
+                                        )));
                                 }
                             }
                         }

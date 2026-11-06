@@ -4,6 +4,7 @@ resolver = "2"
 # 算法与原生依赖是否启用由各组件的特性配置决定；成员存在不代表部署已启用。
 members = [
     # 共享消息、编码、传输与运行基础
+    "crates/nuwax-config",
     "crates/nuwax-types",
     "crates/nuwax-numeric",
     "crates/nuwax-codec",

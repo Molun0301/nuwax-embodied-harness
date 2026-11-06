@@ -6,14 +6,5 @@ const DEFAULT_UDS_RELATIVE_PATH: &str =
 
 /// 读取显式守卫地址，缺省时使用安装根下的套接字。
 pub fn motion_guard_socket_path() -> std::path::PathBuf {
-    use std::{env, path::PathBuf};
-
-    env::var_os("NUWAX_MOTION_GUARD_SOCKET")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            env::var_os("NUWAX_INSTALL_HOME")
-                .map_or_else(|| PathBuf::from("."), PathBuf::from)
-                .join(DEFAULT_UDS_RELATIVE_PATH.trim())
-        })
+    nuwax_config::resolve_path(DEFAULT_UDS_RELATIVE_PATH.trim())
 }

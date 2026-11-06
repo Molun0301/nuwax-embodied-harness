@@ -89,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let out = PathBuf::from(&args[2]);
     fs::create_dir(&out)?;
-    let mut config = SurfaceNavigationConfig::from_env()?;
+    let mut config = SurfaceNavigationConfig::from_runtime()?;
     let body = config.body_envelope.clone();
     let d = config.follower.body_to_support_z_m;
     let start = resume.as_ref().map_or_else(||world.plane.body([0.,0.],0.,d),|value|serde_json::from_value(value["pose"].clone()).unwrap());

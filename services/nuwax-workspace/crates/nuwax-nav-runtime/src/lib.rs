@@ -659,12 +659,27 @@ fn production_local_backend(
 ) -> Result<BasicInProcessLocalBackend, RuntimeError> {
     match kind {
         LocalExecutionBackendKind::BasicInProcess => {
-            let value = std::env::var("NUWAX_ROBOT_GEOMETRY_JSON")
-                .map_err(|error| RuntimeError::InvalidInput { field: "robot_geometry", reason: error.to_string() })?;
+            let value = nuwax_config::derived()
+                .map_err(|reason| RuntimeError::InvalidInput {
+                    field: "robot_geometry",
+                    reason,
+                })?
+                .robot_geometry_json
+                .clone();
             let geometry = nuwax_nav_types_messages::RobotGeometry::from_runtime_json(&value)
-                .map_err(|reason| RuntimeError::InvalidInput { field: "robot_geometry", reason })?;
+                .map_err(|reason| RuntimeError::InvalidInput {
+                    field: "robot_geometry",
+                    reason,
+                })?;
             let mut backend = BasicInProcessLocalBackend::production(geometry);
-            if let Some(capabilities)=nuwax_nav_types_messages::NavigationCapabilities::from_env().map_err(|reason| RuntimeError::InvalidInput {field:"navigation_capabilities",reason})? {
+            if let Some(capabilities) =
+                nuwax_nav_types_messages::NavigationCapabilities::from_runtime().map_err(
+                    |reason| RuntimeError::InvalidInput {
+                        field: "navigation_capabilities",
+                        reason,
+                    },
+                )?
+            {
                 backend.set_navigation_motion_limits(capabilities.motion)?;
             }
             Ok(backend)
@@ -3079,13 +3094,36 @@ mod tests {
 
     /// 子进程给生产入口提供必需外形，避免并行测试共享进程环境。
     fn run_with_robot_geometry(test: &str) -> bool {
-        if std::env::var("NUWAX_TEST_BODY_FIXTURE").as_deref() == Ok(test) { return true; }
+        if std::env::var("NUWAX_TEST_BODY_FIXTURE").as_deref() == Ok(test) {
+            return true;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "nuwax-body-fixture-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut config = nuwax_config::test_support::defaults();
+        config.set("derived","robot_geometry_json",r#"{"footprint_xy_m":[[-0.15,-0.15],[0.15,-0.15],[0.15,0.15],[-0.15,0.15]],"z_min_m":-0.4,"z_max_m":0.2}"#);
+        config.set("derived","nav_profile","pct-scan-3d");
+        config.set("derived","actuator_max_linear_mps",0.0);
+        config.set("derived","actuator_max_yaw_rps",0.0);
+        config.set("derived","actuator_motion_model","");
+        config.write_install(&root);
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test, "--nocapture"])
             .env("NUWAX_TEST_BODY_FIXTURE", test)
-            .env("NUWAX_ROBOT_GEOMETRY_JSON", r#"{"footprint_xy_m":[[-0.15,-0.15],[0.15,-0.15],[0.15,0.15],[-0.15,0.15]],"z_min_m":-0.4,"z_max_m":0.2}"#)
-            .output().unwrap();
-        assert!(output.status.success(), "外形夹具执行失败：{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            .env("NUWAX_INSTALL_HOME", &root)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            output.status.success(),
+            "外形夹具执行失败：{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         false
     }
 

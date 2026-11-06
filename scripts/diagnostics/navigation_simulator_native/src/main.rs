@@ -1309,7 +1309,7 @@ fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args().collect();
     let data = PathBuf::from(args.get(1).ok_or("需要模拟数据目录")?);
     fs::create_dir_all(&data).map_err(|e| e.to_string())?;
-    let config = SurfaceNavigationConfig::from_env().map_err(|e| e.to_string())?;
+    let config = SurfaceNavigationConfig::from_runtime().map_err(|e| e.to_string())?;
     let mut scenes = HashMap::new();
     let catalog = if args.get(2).is_some_and(|arg|arg=="--captured-source") {
         let world_fixture = captured_world_fixture(args.get(6..).unwrap_or_default())?;

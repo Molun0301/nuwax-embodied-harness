@@ -205,11 +205,7 @@ impl Default for FarPlannerBridgeConfig {
         Self {
             executable: PathBuf::from("nuwax-far-planner-worker"),
             cwd: None,
-            env: BTreeMap::from([
-                ("NUWAX_PLANNER_GENERATION".into(), "1".into()),
-                ("NUWAX_FAR_BACKEND_ID".into(), "far-visibility-graph".into()),
-                ("NUWAX_FAR_PLAN_TIMEOUT_MS".into(), "2000".into()),
-            ]),
+            env: BTreeMap::new(),
             build_command: None,
             restart_policy: FarPlannerRestartPolicy::Never,
 

@@ -11,7 +11,7 @@ use nuwax_mapping_raytracing::voxel_ray_tracer::{
 };
 #[cfg(test)]
 use std::time::Instant;
-use std::{collections::VecDeque, env, fmt::Display, mem::size_of, str::FromStr};
+use std::{collections::VecDeque, mem::size_of};
 pub(crate) const MAPPING_CANDIDATE_INTERVAL_NS: u64 = 33_333_333;
 pub(crate) const MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const MAX_MAPPING_BACKEND_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
@@ -55,16 +55,6 @@ struct RayConfigCheckpoint {
     region_percentile: f32,
 }
 
-pub(crate) const RAY_VOXEL_SIZE_ENV: &str = "NUWAX_MAPPING_RAYTRACING_VOXEL_SIZE";
-pub(crate) const RAY_MAX_RANGE_ENV: &str = "NUWAX_MAPPING_RAYTRACING_MAX_RANGE";
-pub(crate) const RAY_SUBSAMPLE_ENV: &str = "NUWAX_MAPPING_RAYTRACING_RAY_SUBSAMPLE";
-pub(crate) const RAY_SHADOW_DEPTH_ENV: &str = "NUWAX_MAPPING_RAYTRACING_SHADOW_DEPTH";
-pub(crate) const RAY_GRACE_DEPTH_ENV: &str = "NUWAX_MAPPING_RAYTRACING_GRACE_DEPTH";
-pub(crate) const RAY_MIN_HEALTH_ENV: &str = "NUWAX_MAPPING_RAYTRACING_MIN_HEALTH";
-pub(crate) const RAY_MAX_HEALTH_ENV: &str = "NUWAX_MAPPING_RAYTRACING_MAX_HEALTH";
-pub(crate) const RAY_GRAZE_COS_ENV: &str = "NUWAX_MAPPING_RAYTRACING_GRAZE_COS";
-pub(crate) const RAY_RECENCY_WINDOW_ENV: &str = "NUWAX_MAPPING_RAYTRACING_RECENCY_WINDOW";
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RaytracingBackendSpec {
     voxel_size: f32,
@@ -78,60 +68,32 @@ pub struct RaytracingBackendSpec {
     recency_window: u32,
 }
 
+#[cfg(test)]
 impl Default for RaytracingBackendSpec {
     fn default() -> Self {
-        Self {
-            voxel_size: 0.1,
-            max_range: 50.0,
-            ray_subsample: 1,
-            shadow_depth: 0.2,
-            grace_depth: 0.2,
-            min_health: -2,
-            max_health: 1,
-            graze_cos: 0.7,
-            recency_window: 15,
-        }
+        Self::from_config(&nuwax_config::test_support::section("geometry")).unwrap()
     }
 }
 
 impl RaytracingBackendSpec {
-    fn from_env() -> Result<Self, String> {
-        Self::from_fallible_lookup(|key| match env::var(key) {
-            Ok(value) => Ok(Some(value)),
-            Err(env::VarError::NotPresent) => Ok(None),
-            Err(env::VarError::NotUnicode(_)) => Err(format!(
-                "RAYTRACING_CONFIG_INVALID: {key} must contain valid Unicode"
-            )),
-        })
-    }
-
-    #[cfg(test)]
-    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self, String> {
-        Self::from_fallible_lookup(|key| Ok(lookup(key)))
-    }
-
-    fn from_fallible_lookup(
-        mut lookup: impl FnMut(&str) -> Result<Option<String>, String>,
-    ) -> Result<Self, String> {
-        let defaults = Self::default();
+    fn from_config(g: &nuwax_config::sections::Geometry) -> Result<Self, String> {
         let spec = Self {
-            voxel_size: parse_value(&mut lookup, RAY_VOXEL_SIZE_ENV, defaults.voxel_size)?,
-            max_range: parse_value(&mut lookup, RAY_MAX_RANGE_ENV, defaults.max_range)?,
-            ray_subsample: parse_value(&mut lookup, RAY_SUBSAMPLE_ENV, defaults.ray_subsample)?,
-            shadow_depth: parse_value(&mut lookup, RAY_SHADOW_DEPTH_ENV, defaults.shadow_depth)?,
-            grace_depth: parse_value(&mut lookup, RAY_GRACE_DEPTH_ENV, defaults.grace_depth)?,
-            min_health: parse_value(&mut lookup, RAY_MIN_HEALTH_ENV, defaults.min_health)?,
-            max_health: parse_value(&mut lookup, RAY_MAX_HEALTH_ENV, defaults.max_health)?,
-            graze_cos: parse_value(&mut lookup, RAY_GRAZE_COS_ENV, defaults.graze_cos)?,
-            recency_window: parse_value(
-                &mut lookup,
-                RAY_RECENCY_WINDOW_ENV,
-                defaults.recency_window,
-            )?,
+            voxel_size: g.mapping_raytracing_voxel_size as f32,
+            max_range: g.mapping_raytracing_max_range as f32,
+            ray_subsample: g.mapping_raytracing_ray_subsample as u32,
+            shadow_depth: g.mapping_raytracing_shadow_depth as f32,
+            grace_depth: g.mapping_raytracing_grace_depth as f32,
+            min_health: g.mapping_raytracing_min_health as i32,
+            max_health: g.mapping_raytracing_max_health as i32,
+            graze_cos: g.mapping_raytracing_graze_cos as f32,
+            recency_window: g.mapping_raytracing_recency_window as u32,
         };
         spec.validate()?;
         Ok(spec)
     }
+
+
+
 
     fn validate(self) -> Result<(), String> {
         let mut empty = VoxelMap::default();
@@ -158,28 +120,7 @@ impl RaytracingBackendSpec {
     }
 }
 
-fn parse_value<T>(
-    lookup: &mut impl FnMut(&str) -> Result<Option<String>, String>,
-    key: &str,
-    default: T,
-) -> Result<T, String>
-where
-    T: Copy + Display + FromStr,
-    T::Err: Display,
-{
-    let Some(raw) = lookup(key)? else {
-        return Ok(default);
-    };
-    let value = raw.trim();
-    if value.is_empty() {
-        return Err(format!(
-            "RAYTRACING_CONFIG_INVALID: {key} must not be empty"
-        ));
-    }
-    value.parse::<T>().map_err(|error| {
-        format!("RAYTRACING_CONFIG_INVALID: {key}={raw:?} cannot be parsed: {error}")
-    })
-}
+
 
 impl From<&Config> for RayConfigCheckpoint {
     fn from(config: &Config) -> Self {
@@ -299,29 +240,19 @@ impl MappingBackendSpec {
     }
 
     #[doc(hidden)]
-    pub fn from_env(selected: MappingBackendKind) -> Result<Self, String> {
-        match selected {
-            MappingBackendKind::SlamToolbox => Ok(Self::SlamToolbox),
-            MappingBackendKind::Voxel => Ok(Self::Voxel),
-            MappingBackendKind::Raytracing => {
-                Ok(Self::Raytracing(RaytracingBackendSpec::from_env()?))
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn from_lookup(
+    pub fn from_config(
         selected: MappingBackendKind,
-        lookup: impl FnMut(&str) -> Option<String>,
+        g: &nuwax_config::sections::Geometry,
     ) -> Result<Self, String> {
         match selected {
             MappingBackendKind::SlamToolbox => Ok(Self::SlamToolbox),
             MappingBackendKind::Voxel => Ok(Self::Voxel),
-            MappingBackendKind::Raytracing => Ok(Self::Raytracing(
-                RaytracingBackendSpec::from_lookup(lookup)?,
-            )),
+            MappingBackendKind::Raytracing => {
+                Ok(Self::Raytracing(RaytracingBackendSpec::from_config(g)?))
+            }
         }
     }
+
 
     pub(crate) const fn stable_name(self) -> &'static str {
         match self {
@@ -1713,7 +1644,17 @@ pub(crate) fn cleanup_completed_checkpoint(
     let mut reader = MappingCheckpointReader::new(payload);
     let spec = match payload[12] {
         0 => MappingBackendSpec::Voxel,
-        1 => MappingBackendSpec::Raytracing(Default::default()),
+        1 => MappingBackendSpec::Raytracing(RaytracingBackendSpec {
+            voxel_size: 0.,
+            max_range: 0.,
+            ray_subsample: 0,
+            shadow_depth: 0.,
+            grace_depth: 0.,
+            min_health: 0,
+            max_health: 0,
+            graze_cos: 0.,
+            recency_window: 0,
+        }),
         _ => return Err("该地图没有点云建图后端".into()),
     };
     decode_mapping_checkpoint_header(&mut reader, spec)?;
@@ -1890,7 +1831,17 @@ pub(crate) fn validate_saved_checkpoint(payload: &[u8]) -> Result<(), String> {
         MAPPING_BACKEND_KIND_RAYTRACING => {
             decode_mapping_checkpoint_header(
                 &mut reader,
-                MappingBackendSpec::Raytracing(Default::default()),
+                MappingBackendSpec::Raytracing(RaytracingBackendSpec {
+                    voxel_size: 0.,
+                    max_range: 0.,
+                    ray_subsample: 0,
+                    shadow_depth: 0.,
+                    grace_depth: 0.,
+                    min_health: 0,
+                    max_health: 0,
+                    graze_cos: 0.,
+                    recency_window: 0,
+                }),
             )?;
             let c = decode_ray_config(&mut reader)?;
             (

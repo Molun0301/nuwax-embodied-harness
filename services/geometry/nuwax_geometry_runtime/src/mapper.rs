@@ -39,6 +39,7 @@ pub struct MapperConfig {
     pub correction_backend: String,
     pub cloudmap_shm_path: Option<PathBuf>,
 }
+#[cfg(test)]
 impl Default for MapperConfig {
     fn default() -> Self {
         Self {
@@ -58,50 +59,42 @@ impl Default for MapperConfig {
     }
 }
 impl MapperConfig {
-    pub fn from_env() -> Result<Self, String> {
-        let mut config = Self::default();
-        for (key, target) in [
-            ("NUWAX_MAP_FRAME", &mut config.map_frame_id),
-            ("NUWAX_GEOMETRY_ODOM_FRAME", &mut config.odom_frame_id),
-            ("NUWAX_BASE_FRAME", &mut config.base_frame_id),
-            (
-                "NUWAX_GEOMETRY_CORRECTION_BACKEND",
-                &mut config.correction_backend,
-            ),
-        ] {
-            if let Ok(value) = std::env::var(key) {
-                *target = value;
-            }
-        }
-        let kind = match std::env::var("NUWAX_GEOMETRY_MAPPING_BACKEND")
-            .unwrap_or_else(|_| "voxel".into())
-            .as_str()
-        {
+    pub fn from_runtime() -> Result<Self, String> {
+        Self::from_config(nuwax_config::geometry()?, nuwax_config::robot()?)
+    }
+    pub fn from_config(
+        g: &nuwax_config::sections::Geometry,
+        r: &nuwax_config::sections::Robot,
+    ) -> Result<Self, String> {
+        let kind = match g.mapping_backend.as_str() {
             "voxel" => MappingBackendKind::Voxel,
             "raytracing" => MappingBackendKind::Raytracing,
             "slam_toolbox" => MappingBackendKind::SlamToolbox,
-            value => return Err(format!("未知建图后端：{value}")),
+            v => return Err(format!("未知建图后端：{v}")),
         };
-        config.backend =
-            if std::env::var("NUWAX_GEOMETRY_PIPELINE").ok().as_deref() == Some("slam_2d") {
-                config.correction_backend = "none".into();
+        let planar = g.pipeline == "slam_2d";
+        Ok(Self {
+            map_name: String::new(),
+            map_frame_id: r.map_frame.clone(),
+            odom_frame_id: r.odom_frame.clone(),
+            base_frame_id: r.base_frame.clone(),
+            backend: if planar {
                 MappingBackendSpec::SlamToolbox
             } else {
-                MappingBackendSpec::from_env(kind)?
-            };
-        config.compute.resolution = std::env::var("NUWAX_MAPPING_RESOLUTION")
-            .ok()
-            .and_then(|value| value.trim().parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v > 0.)
-            .unwrap_or(0.05);
-        config.compute.initial_safe_radius_meters =
-            std::env::var("NUWAX_MAPPING_INITIAL_SAFE_RADIUS_METERS")
-                .ok()
-                .and_then(|value| value.trim().parse::<f32>().ok())
-                .filter(|v| v.is_finite() && *v >= 0.)
-                .unwrap_or(0.);
-        config.cloudmap_shm_path = Some(crate::pointcloud::cloud_map_shm_path());
-        Ok(config)
+                MappingBackendSpec::from_config(kind, g)?
+            },
+            compute: MappingBackendComputeConfig {
+                resolution: g.mapping_resolution,
+                initial_safe_radius_meters: g.mapping_initial_safe_radius_meters as f32,
+                window_capacity: 8_000_000,
+            },
+            correction_backend: if planar {
+                "none".into()
+            } else {
+                g.correction_backend.clone()
+            },
+            cloudmap_shm_path: Some(crate::pointcloud::cloud_map_shm_path()),
+        })
     }
 }
 #[derive(Clone)]

@@ -110,41 +110,15 @@ pub fn session_path(root: &Path, session: &Session) -> PathBuf {
     root.join(format!("{:x}.scan", id))
 }
 pub fn scan_directory() -> PathBuf {
-    std::env::var_os("NUWAX_RAW_SCAN_DIRECTORY")
-        .filter(|v| !v.to_string_lossy().trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(
-                std::env::var_os("NUWAX_RUNTIME_DATA_DIR")
-                    .filter(|v| !v.is_empty())
-                    .unwrap_or_else(|| "runtime_data".into()),
-            )
-            .join("scan_logs")
-        })
+    let g = nuwax_config::geometry().expect("启动已捕获 geometry 配置");
+    if g.raw_scan_directory.is_empty() {
+        nuwax_config::resolve_path(&g.runtime_data_dir).join("scan_logs")
+    } else {
+        nuwax_config::resolve_path(&g.raw_scan_directory)
+    }
 }
 pub fn storage_budget_bytes() -> Result<u64, String> {
-    let value = std::env::var("NUWAX_RAW_SCAN_MAX_MIB").map_err(|e| match e {
-        std::env::VarError::NotPresent => String::new(),
-        _ => "NUWAX_RAW_SCAN_MAX_MIB 必须是有效文本".into(),
-    });
-    let value = match value {
-        Ok(v) => v,
-        Err(v) if v.is_empty() => "1024".into(),
-        Err(e) => return Err(e),
-    };
-    let v = if value.trim().is_empty() {
-        "1024"
-    } else {
-        value.trim()
-    };
-    let mib = v
-        .bytes()
-        .all(|b| b.is_ascii_digit())
-        .then(|| v.parse::<u64>().ok())
-        .flatten()
-        .filter(|n| (64..=1_048_576).contains(n))
-        .ok_or("NUWAX_RAW_SCAN_MAX_MIB 必须是64～1048576的整数（MiB）")?;
-    Ok(mib * 1024 * 1024)
+    Ok(nuwax_config::geometry()?.raw_scan_max_mib as u64 * 1024 * 1024)
 }
 fn lock(file: &File, flags: i32) -> Result<(), String> {
     // 锁随文件描述符释放；异常退出不会遗留伪活动会话。

@@ -577,10 +577,8 @@ fn domain(session_id: u64) -> nuwax_map_chunks::Domain {
         session: session_id.to_string(),
         }
 }
-pub fn cloud_map_shm_path() -> PathBuf {
-    std::env::var_os("NUWAX_CLOUDMAP_SHM_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_CLOUDMAP_SHM_PATH.trim()))
+pub(crate) fn cloud_map_shm_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(DEFAULT_CLOUDMAP_SHM_PATH.trim())
 }
 struct CloudMapShmWriter {
     mmap: MmapMut,

@@ -42,8 +42,7 @@ impl MapOutput {
 
 impl Outputs {
     pub fn start(session: SessionHandle) -> Result<Self, String> {
-        let url = std::env::var("NUWAX_LCM_URL")
-            .unwrap_or_else(|_| "udpm://239.255.76.67:7667?ttl=0".into());
+        let url = nuwax_config::transport()?.lcm_url.clone();
         let transport = LcmTransport::new_real(&url).map_err(|e| e.to_string())?;
         let (stop, mut stopped) = oneshot::channel();
         let recent_transport = transport.clone();
@@ -61,7 +60,7 @@ impl Outputs {
                                 if changed.is_err(){break;}
                                 let bytes=recent.borrow_and_update().clone();
                                 if routes.borrow().as_ref().is_some_and(|current|current.id==route.id) {
-                                    if let Some(bytes)=bytes {if let Err(reason)=publish(&recent_transport, "", nuwax_codec::lcm::recent_cloud::DEFAULT_TOPIC,
+                                    if let Some(bytes)=bytes {if let Err(reason)=publish(&recent_transport, nuwax_codec::lcm::recent_cloud::DEFAULT_TOPIC,
                                         nuwax_codec::lcm::recent_cloud::TYPE_NAME, bytes).await {recent_session.report_output_error(route.id, reason);}}
                                 }
                             },
@@ -72,18 +71,13 @@ impl Outputs {
                 }
             }
         });
+        let follow = nuwax_config::person_follow()?.autostart;
         let task = tokio::spawn(async move {
             let routes = session.route_rx();
             let mut poses = session.pose_rx();
             let mut maps = session.map_rx();
             let mut output = MapOutput::default();
             let mut follow_sent: Option<(u64, u64)> = None;
-            let follow = std::env::var("NUWAX_PERSON_FOLLOW_AUTOSTART").map_or(true, |v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            });
             loop {
                 let (id, result) = tokio::select! {
                     _=&mut stopped=>break,
@@ -95,7 +89,7 @@ impl Outputs {
                             let p=edge.translation.clone().unwrap_or_default();let q=edge.rotation.clone().unwrap_or_default();
                             schema::TransformStamped{header:header(edge.timestamp_ns,&edge.parent_frame,0),child_frame_id:edge.child_frame.clone(),transform:schema::Transform{translation:[p.x,p.y,p.z],rotation_xyzw:[q.x,q.y,q.z,q.w]}}
                         }).collect()};
-                        let result = match schema::encode_tf_message_body(&message){Ok(bytes)=>publish(&transport,"NUWAX_LCM_CHANNEL_TF","/tf","tf2_msgs.TFMessage",bytes).await,Err(e)=>Err(e.to_string())};
+                        let result = match schema::encode_tf_message_body(&message){Ok(bytes)=>publish(&transport,"/tf","tf2_msgs.TFMessage",bytes).await,Err(e)=>Err(e.to_string())};
                         (id, result)
                     },
                     changed=maps.changed()=>{
@@ -157,7 +151,6 @@ async fn publish_map(
     let effective = grid(&map, true)?;
     publish(
         transport,
-        "NUWAX_LCM_CHANNEL_OCCUPANCY",
         "/map/occupancy",
         "nav_msgs.OccupancyGrid",
         schema::encode_occupancy_grid_body(&effective).map_err(|e| e.to_string())?,
@@ -168,7 +161,11 @@ async fn publish_map(
     };
     let root = sealed.manifest();
     let stamp = root.source_timestamp_ns;
-    let revision = if output.session_id == id { output.revision + 1 } else { 1 };
+    let revision = if output.session_id == id {
+        output.revision + 1
+    } else {
+        1
+    };
     let mut virtual_obstacles = publication
         .forbidden
         .map(|mask| {
@@ -193,12 +190,18 @@ async fn publish_map(
         source_timestamp_ns: stamp as i64,
         source_voxel_size: root.voxel_size_m,
         virtual_obstacles,
-        fine: Some(navigation_map_transfer::prepare(&sealed, output.prior.as_deref())?),
+        fine: Some(navigation_map_transfer::prepare(
+            &sealed,
+            output.prior.as_deref(),
+        )?),
         cloud: cloud(Vec::new(), &effective.header.frame_id, stamp, 0),
         ..Default::default()
     };
     send_navigation_map(transport, &message).await?;
-    let changed = output.prior.as_ref().is_none_or(|old| old.identity() != root.identity());
+    let changed = output
+        .prior
+        .as_ref()
+        .is_none_or(|old| old.identity() != root.identity());
     output.session_id = id;
     output.frame_id = message.frame_id;
     output.revision = revision;
@@ -206,16 +209,12 @@ async fn publish_map(
     Ok(Some((sealed, changed)))
 }
 
-async fn send_navigation_map(transport: &LcmTransport, message: &schema::NavigationMap3D) -> Result<(), String> {
+async fn send_navigation_map(
+    transport: &LcmTransport,
+    message: &schema::NavigationMap3D,
+) -> Result<(), String> {
     let bytes = schema::encode_navigation_map_3d_body(message).map_err(|e| e.to_string())?;
-    publish(
-        transport,
-        "NUWAX_LCM_CHANNEL_NAV_MAP3D",
-        "/nav/map3d",
-        "nuwax_msgs.NavigationMap3D",
-        bytes,
-    )
-    .await
+    publish(transport, "/nav/map3d", "nuwax_msgs.NavigationMap3D", bytes).await
 }
 fn header(stamp: u64, frame: &str, revision: u64) -> schema::Header {
     schema::Header {
@@ -313,7 +312,6 @@ async fn publish_follow_cloud(
     );
     publish(
         transport,
-        "NUWAX_PERSON_FOLLOW_POINTCLOUD_CHANNEL",
         "/global_map",
         "sensor_msgs.PointCloud2",
         schema::encode_point_cloud2_body(&message).map_err(|error| error.to_string())?,
@@ -325,12 +323,10 @@ async fn publish_follow_cloud(
 
 async fn publish(
     transport: &LcmTransport,
-    env: &str,
-    default: &str,
+    topic: &str,
     kind: &str,
     bytes: Vec<u8>,
 ) -> Result<(), String> {
-    let topic = std::env::var(env).unwrap_or_else(|_| default.into());
     let topic = topic.split('#').next().unwrap();
     let frame = RawLcmFrameBuilder::new(
         LcmTopic::new(topic).map_err(|e| e.to_string())?,

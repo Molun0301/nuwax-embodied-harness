@@ -11,6 +11,7 @@ publish = false
 # 生产套接字和执行器由Python守卫进程拥有；本包提供协议绑定及导航客户端。
 
 [dependencies]
+nuwax-config = { path = "../nuwax-config" }
 prost = { workspace = true }
 rustix = { version = "1.1.4", features = ["time"] }
 thiserror = { workspace = true }

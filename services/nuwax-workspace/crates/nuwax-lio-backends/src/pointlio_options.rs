@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::OnceLock;
 
-pub const POINTLIO_OPTIONS_ENV: &str = "NUWAX_GEOMETRY_POINTLIO_OPTIONS";
 const SCHEMA: &str = include_str!("../../../../../contracts/pointlio_options.json");
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]

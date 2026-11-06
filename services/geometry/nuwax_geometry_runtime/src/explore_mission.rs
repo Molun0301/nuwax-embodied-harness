@@ -26,13 +26,12 @@ pub(crate) struct MissionCalibration {
     pub maximum_sample_speed_mps: f64,
 }
 impl MissionCalibration {
-    pub fn capture(surface: Option<&SurfaceNavigationConfig>) -> Result<Self, String> {
-        let caps = NavigationCapabilities::from_env()?.ok_or("返航行程统计需要导航运动标定")?;
-        let geometry = std::env::var("NUWAX_ROBOT_GEOMETRY_JSON")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| "返航路线需要机体外形标定".to_string())
-            .and_then(|s| RobotGeometry::from_runtime_json(&s))?;
+    pub fn capture(
+        surface: Option<&SurfaceNavigationConfig>,
+        caps: Option<&NavigationCapabilities>,
+        geometry: &RobotGeometry,
+    ) -> Result<Self, String> {
+        let caps = caps.ok_or("返航行程统计需要导航运动标定")?;
         let planar_speed = caps
             .motion
             .max_forward_mps
@@ -59,8 +58,8 @@ impl MissionCalibration {
         }
         Ok(Self {
             planar: SimplePlannerConfig {
-                robot_geometry: Some(geometry),
-                motion_limits: Some(caps.motion),
+                robot_geometry: Some(geometry.clone()),
+                motion_limits: Some(caps.motion.clone()),
                 ..Default::default()
             },
             maximum_sample_speed_mps,

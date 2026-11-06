@@ -1,6 +1,6 @@
 //! 谷歌地图网络客户端。
 //!
-//! [`CloudMode::Live`] 显式发起网络请求，密钥只读取 `NUWAX_GOOGLE_MAPS_API_KEY`。
+//! [`CloudMode::Live`] 显式发起网络请求，密钥由调用方显式提供。
 //! [`CloudMode::Offline`] 与 [`CloudMode::Mock`] 返回 [`CloudError::Offline`]。
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -12,7 +12,7 @@ const GOOGLE_MAPS_BASE_URL: &str = "https://maps.googleapis.com/maps/api";
 #[derive(Debug, Error)]
 pub enum CloudError {
     /// A Google Maps live request was selected without an API key.
-    #[error("missing API key (set NUWAX_GOOGLE_MAPS_API_KEY)")]
+    #[error("缺少显式提供的地图服务密钥")]
     ApiKeyMissing,
     /// The caller selected an explicit no-network mode.
     #[error("operation is unavailable in offline mode")]
@@ -103,9 +103,13 @@ pub type GoogleMapsError = CloudError;
 /// # Errors
 /// Returns [`CloudError::Offline`] in offline mode, or propagates API,
 /// transport, and decoding errors from the live client.
-pub async fn geocode(address: &str, mode: CloudMode) -> Result<GeocodeResult, CloudError> {
+pub async fn geocode(
+    address: &str,
+    mode: CloudMode,
+    client: &GoogleMapsClient,
+) -> Result<GeocodeResult, CloudError> {
     match mode {
-        CloudMode::Live => GoogleMapsClient::from_env()?.geocode(address).await,
+        CloudMode::Live => client.geocode(address).await,
         CloudMode::Offline | CloudMode::Mock => Err(CloudError::Offline),
     }
 }
@@ -119,13 +123,10 @@ pub async fn places_nearby(
     center: LatLng,
     radius_m: u32,
     mode: CloudMode,
+    client: &GoogleMapsClient,
 ) -> Result<Vec<Place>, CloudError> {
     match mode {
-        CloudMode::Live => {
-            GoogleMapsClient::from_env()?
-                .places_nearby(center, radius_m)
-                .await
-        }
+        CloudMode::Live => client.places_nearby(center, radius_m).await,
         CloudMode::Offline | CloudMode::Mock => Err(CloudError::Offline),
     }
 }
@@ -138,22 +139,6 @@ pub struct GoogleMapsClient {
 }
 
 impl GoogleMapsClient {
-    /// 从规范密钥配置构造；请求地址可由下一项指定：
-    /// `NUWAX_GOOGLE_MAPS_BASE_URL`.
-    ///
-    /// # Errors
-    /// 规范密钥配置不存在或为空时返回 [`CloudError::ApiKeyMissing`]。
-    pub fn from_env() -> Result<Self, CloudError> {
-        let api_key = std::env::var("NUWAX_GOOGLE_MAPS_API_KEY")
-            .map_err(|_| CloudError::ApiKeyMissing)?;
-        if api_key.trim().is_empty() {
-            return Err(CloudError::ApiKeyMissing);
-        }
-        let base_url = std::env::var("NUWAX_GOOGLE_MAPS_BASE_URL")
-            .unwrap_or_else(|_| GOOGLE_MAPS_BASE_URL.to_string());
-        Ok(Self::with_base_url(api_key, base_url))
-    }
-
     /// Construct a client against the public Google Maps endpoint.
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
@@ -411,11 +396,17 @@ mod tests {
     #[tokio::test]
     async fn offline_mode_does_not_fabricate_results() {
         assert!(matches!(
-            geocode("Tokyo", CloudMode::Offline).await,
+            geocode("Tokyo", CloudMode::Offline, &GoogleMapsClient::new("")).await,
             Err(CloudError::Offline)
         ));
         assert!(matches!(
-            places_nearby(LatLng { lat: 0.0, lng: 0.0 }, 100, CloudMode::Mock).await,
+            places_nearby(
+                LatLng { lat: 0.0, lng: 0.0 },
+                100,
+                CloudMode::Mock,
+                &GoogleMapsClient::new("")
+            )
+            .await,
             Err(CloudError::Offline)
         ));
     }

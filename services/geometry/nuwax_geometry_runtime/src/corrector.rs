@@ -4,7 +4,7 @@ use crate::{
     proto,
 };
 use nalgebra::{Isometry3, Point3, Quaternion, Translation3, UnitQuaternion};
-use nuwax_mapping::loop_closure::options::{PgoOptions, PGO_OPTIONS_ENV};
+use nuwax_mapping::loop_closure::options::{PgoOptions};
 use nuwax_mapping::loop_closure::{
     CorrectionKeyframe, CorrectionTimeline, LoopClosureCoordinator, LoopClosurePipelineConfig,
     ProcessFrameResult,
@@ -28,6 +28,7 @@ struct Native {
     owner: Option<nuwax_nav_pgo_bridge::OnlinePgoOwner>,
     ingress: Option<nuwax_nav_pgo_bridge::OnlinePgoIngress>,
     local_poses: std::collections::BTreeMap<u64, Isometry3<f64>>,
+    lcm_url:String, mapping_backend:String,lio_backend:String,base_frame:String,
 }
 #[derive(Clone)]
 pub(crate) struct PgoUpdate {
@@ -44,17 +45,35 @@ impl PgoUpdate {
 }
 impl Corrector {
     pub fn new(backend: &str) -> Result<Self, String> {
+        if matches!(backend, "none" | "relocalization") {
+            return Ok(Self {
+                mode: Mode::Relocalization,
+                first_stamp: None,
+                sequence: 0,
+            });
+        }
+        Self::from_config(
+            backend,
+            nuwax_config::geometry()?,
+            nuwax_config::robot()?,
+            nuwax_config::transport()?,
+        )
+    }
+    pub fn from_config(
+        backend: &str,
+        g: &nuwax_config::sections::Geometry,
+        r: &nuwax_config::sections::Robot,
+        transport: &nuwax_config::sections::Transport,
+    ) -> Result<Self, String> {
         let mode = match backend {
             "none" | "relocalization" => Mode::Relocalization,
             "library_pgo" => {
-                let base = if std::env::var("NUWAX_GEOMETRY_LIO_BACKEND").ok().as_deref()
-                    == Some("pointlio")
-                {
+                let base = if g.lio_backend == "pointlio" {
                     LoopClosurePipelineConfig::for_point_lio()
                 } else {
                     LoopClosurePipelineConfig::default()
                 };
-                let raw = std::env::var(PGO_OPTIONS_ENV).unwrap_or_default();
+                let raw = &g.pgo_options;
                 let config = PgoOptions::from_json(&raw)?.apply_to(base)?;
                 Mode::Library(LoopClosureCoordinator::new(config).map_err(|e| e.to_string())?)
             }
@@ -63,6 +82,10 @@ impl Corrector {
                 owner: None,
                 ingress: None,
                 local_poses: Default::default(),
+                lcm_url: transport.lcm_url.clone(),
+                mapping_backend: g.mapping_backend.clone(),
+                lio_backend: g.lio_backend.clone(),
+                base_frame: r.base_frame.clone(),
             }),
             value => return Err(format!("未知校正后端：{value}")),
         };
@@ -294,8 +317,7 @@ impl Native {
                     .map_err(|e| e.to_string())?,
             );
             let config = nuwax_nav_pgo_bridge::OnlinePgoConfig::new(
-                std::env::var("NUWAX_LCM_URL")
-                    .unwrap_or_else(|_| "udpm://239.255.76.67:7667?ttl=0".into()),
+                self.lcm_url.clone(),
                 frame.session_id as i64,
                 1,
             );
@@ -320,8 +342,7 @@ impl Native {
             request_sequence: 0,
             mapping_session_id: frame.session_id.to_string(),
             mapping_session_generation: 1,
-            mapping_backend_kind: std::env::var("NUWAX_GEOMETRY_MAPPING_BACKEND")
-                .unwrap_or_else(|_| "voxel".into()),
+            mapping_backend_kind: self.mapping_backend.clone(),
             mapping_backend_generation: 1,
             map_frame_generation: 1,
             mapping_commit_id: wire::NativePgoMappingCommitId {
@@ -331,9 +352,9 @@ impl Native {
             occupancy_revision: sequence as i64,
             cloud_revision: sequence as i64,
             registered_cloud: wire::NativePgoRegisteredCloudProof {
-                backend: match std::env::var("NUWAX_GEOMETRY_LIO_BACKEND").ok().as_deref() {
-                    Some("pointlio") => 3,
-                    Some("fastlio2") => 2,
+                backend: match self.lio_backend.as_str() {
+                    "pointlio" => 3,
+                    "fastlio2" => 2,
                     _ => 1,
                 },
                 runtime_generation: frame.session_id as i64,
@@ -359,9 +380,8 @@ impl Native {
             source_timestamp_ns: frame.odom_pose.timestamp_ns as i64,
             map_frame_id: grid.frame_id.clone(),
             odom_frame_id: frame.odom_pose.frame_id.clone(),
-            body_frame_id: std::env::var("NUWAX_BASE_FRAME").unwrap_or_else(|_| "base_link".into()),
-            points_frame_id: std::env::var("NUWAX_BASE_FRAME")
-                .unwrap_or_else(|_| "base_link".into()),
+            body_frame_id: self.base_frame.clone(),
+            points_frame_id: self.base_frame.clone(),
             correction_lease: wire::NativePgoCorrectionLeaseId {
                 boot_nonce: nonce,
                 generation: 1,

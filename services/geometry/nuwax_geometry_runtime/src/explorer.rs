@@ -86,6 +86,9 @@ pub struct Explorer {
     map_name: String,
     map_frame: String,
     surface_config: Option<SurfaceNavigationConfig>,
+    robot_geometry:RobotGeometry,
+    capabilities:Option<NavigationCapabilities>,
+    pose_ttl_ns:u64,
     surface_input: SurfaceInputReceiver,
     controller: ExplorationController,
     config: Option<ExploreStartConfig>,
@@ -106,14 +109,38 @@ pub struct Explorer {
 
 impl Explorer {
     pub fn new(map_name: String, map_frame: String, surface_mode: bool) -> Result<Self, Status> {
+        Self::from_config(
+            map_name,
+            map_frame,
+            surface_mode,
+            nuwax_config::navigation().map_err(Status::failed_precondition)?,
+            nuwax_config::robot().map_err(Status::failed_precondition)?,
+            nuwax_config::derived().map_err(Status::failed_precondition)?,
+        )
+    }
+    pub fn from_config(
+        map_name: String,
+        map_frame: String,
+        surface_mode: bool,
+        n: &nuwax_config::sections::Navigation,
+        r: &nuwax_config::sections::Robot,
+        d: &nuwax_config::sections::Derived,
+    ) -> Result<Self, Status> {
         let surface_config = surface_mode
-            .then(SurfaceNavigationConfig::from_env)
+            .then(|| SurfaceNavigationConfig::from_config(n, r, d))
             .transpose()
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        let robot_geometry = RobotGeometry::from_runtime_json(&d.robot_geometry_json)
+            .map_err(Status::failed_precondition)?;
+        let capabilities = NavigationCapabilities::from_config(&n.capabilities_json)
+            .map_err(Status::failed_precondition)?;
         Ok(Self {
             map_name,
             map_frame,
             surface_config,
+            robot_geometry,
+            capabilities,
+            pose_ttl_ns: (n.explore_pose_ttl_ms as u64).saturating_mul(1_000_000),
             surface_input: SurfaceInputReceiver::new(),
             controller: ExplorationController::new(ExplorationArbitrationPolicy::PreferWavefront),
             config: None,
@@ -207,7 +234,7 @@ impl Explorer {
             }
             Some(value)
         };
-        let observation = NavigationCapabilities::from_env()
+        let observation = NavigationCapabilities::from_runtime()
             .map_err(Status::failed_precondition)?
             .and_then(|c| c.observation);
         let mut controller =
@@ -233,11 +260,7 @@ impl Explorer {
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
             controller.add_source(source);
         } else {
-            let geometry = std::env::var("NUWAX_ROBOT_GEOMETRY_JSON")
-                .map_err(|e| Status::failed_precondition(e.to_string()))
-                .and_then(|v| {
-                    RobotGeometry::from_runtime_json(&v).map_err(Status::failed_precondition)
-                })?;
+            let geometry = self.robot_geometry.clone();
             let mut source = WavefrontGoalSourceAdapter::with_default_id(
                 "wavefront",
                 WavefrontConfig::default(),
@@ -266,7 +289,7 @@ impl Explorer {
         let calibration = config
             .return_policy
             .enabled()
-            .then(|| MissionCalibration::capture(self.surface_config.as_ref()))
+            .then(|| MissionCalibration::capture(self.surface_config.as_ref(),self.capabilities.as_ref(),&self.robot_geometry))
             .transpose()
             .map_err(Status::failed_precondition)?;
         self.controller = controller;
@@ -431,7 +454,7 @@ impl Explorer {
             return Ok(self.output("达到探索停止条件", None, cancel));
         }
         let Some(pose) =
-            pose.filter(|p| p.frame_id == self.map_frame && fresh(p.timestamp_ns, pose_ttl_ns()))
+            pose.filter(|p| p.frame_id == self.map_frame && fresh(p.timestamp_ns, self.pose_ttl_ns))
         else {
             return self.wait_input("等待新鲜地图位姿");
         };
@@ -789,13 +812,6 @@ fn unix_ns() -> u64 {
         .unwrap_or_default()
         .as_nanos() as u64
 }
-fn pose_ttl_ns() -> u64 {
-    std::env::var("NUWAX_EXPLORE_POSE_TTL_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(|value| value.saturating_mul(1_000_000))
-        .unwrap_or(1_000_000_000)
-}
 
 fn fresh(timestamp: u64, limit: u64) -> bool {
     nuwax_nav_types_messages::source_time::data_age_ns_at(timestamp, unix_ns())
@@ -897,7 +913,7 @@ pub fn build_surface_input(
     map: Arc<nuwax_map_chunks::SealedMap>,
 ) -> Result<Arc<SurfaceSnapshot>, String> {
     use std::collections::BTreeMap;
-    let config = SurfaceNavigationConfig::from_env().map_err(|e| e.to_string())?;
+    let config = SurfaceNavigationConfig::from_runtime().map_err(|e| e.to_string())?;
     let root = map.manifest();
     let mut reader = nuwax_map_chunks::Receiver::new(map.repository.clone());
     let mut observations =

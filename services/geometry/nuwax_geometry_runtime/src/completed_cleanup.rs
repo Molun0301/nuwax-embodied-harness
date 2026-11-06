@@ -542,7 +542,7 @@ pub(crate) fn run_requested() -> Option<Result<(), String>> {
     }
     Some(run_command(
         &args[2..],
-        &crate::map_store::MapStore::from_env(),
+        &crate::map_store::MapStore::from_runtime(),
     ))
 }
 fn run_command(

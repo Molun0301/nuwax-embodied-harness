@@ -20,16 +20,14 @@ pub(crate) struct Settings {
     pub base_from_laser: [f64; 3],
 }
 impl Settings {
-    pub fn from_env() -> Result<Option<Self>, String> {
+    pub fn from_runtime() -> Result<Option<Self>, String> {
         let pipeline =
-            nuwax_nav_stack::ProductionPipeline::from_env().map_err(|error| error.to_string())?;
+            nuwax_nav_stack::ProductionPipeline::from_runtime().map_err(|error| error.to_string())?;
         if pipeline == nuwax_nav_stack::ProductionPipeline::Lio3D {
             return Ok(None);
         }
-        let text = std::env::var("NUWAX_GEOMETRY_SLAM2D_CONFIG")
-            .map_err(|_| "二维链缺少明确传感器、坐标、时钟与标定配置")?;
-        let mut value: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        let text = nuwax_config::geometry()?.slam2d_config.clone();
+        let mut value: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
         let object = value.as_object_mut().ok_or("二维配置必须为JSON对象")?;
         for (key, value_) in [
             ("session_id", serde_json::json!("preflight")),
@@ -50,9 +48,8 @@ impl Settings {
         }
         let template: Session = serde_json::from_value(value).map_err(|e| e.to_string())?;
         template.validate()?;
-        let base_from_laser =
-            serde_json::from_value(template.core_config["base_from_laser"].clone())
-                .map_err(|error| error.to_string())?;
+        let base_from_laser = serde_json::from_value(template.core_config["base_from_laser"].clone())
+            .map_err(|error| error.to_string())?;
         let unix_offset_ns = match template.clock_domain.as_str() {
             "unix_ns" => 0,
             "monotonic_ns" => {
@@ -81,27 +78,12 @@ impl Settings {
                 )
             }
         };
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
-        let binary = std::env::var_os("NUWAX_GEOMETRY_SLAM2D_BINARY")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                root.join("services/nuwax-workspace/target/release/nuwax-slam-2d-worker")
-            });
+        let binary = nuwax_config::sibling_binary("nuwax-slam-2d-worker")?;
         if !binary.is_file() {
             return Err(format!("二维工作程序不存在：{}", binary.display()));
         }
-        let data_root = std::env::var("STATE_DIRECTORY")
-            .ok()
-            .and_then(|value| value.split(':').next().map(PathBuf::from))
-            .filter(|path| path.is_absolute())
-            .map(|path| path.join("slam2d"))
-            .or_else(|| {
-                std::env::var_os("NUWAX_RUNTIME_DATA_DIR")
-                    .filter(|v| !v.is_empty())
-                    .map(|path| PathBuf::from(path).join("geometry/slam2d"))
-            })
-            .unwrap_or_else(|| root.join("runtime_data/geometry/slam2d"));
+        let data_root = nuwax_config::resolve_path(&nuwax_config::geometry()?.runtime_data_dir)
+            .join("geometry/slam2d");
         Ok(Some(Self {
             template,
             binary,

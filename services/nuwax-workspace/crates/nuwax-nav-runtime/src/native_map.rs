@@ -20,12 +20,8 @@ impl PctTerrainSource {
         }
     }
 
-    pub fn from_env() -> Result<Self, String> {
-        match std::env::var("NUWAX_NAV_PCT_TERRAIN_SOURCE") {
-            Ok(value) => Self::parse(&value),
-            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
-            Err(error) => Err(format!("无法读取 PCT 地形来源：{error}")),
-        }
+    pub fn from_runtime() -> Result<Self, String> {
+        Self::parse(&nuwax_config::navigation()?.pct_terrain_source)
     }
 }
 

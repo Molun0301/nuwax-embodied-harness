@@ -23,7 +23,7 @@ use tokio::process::{Child, Command};
 use nuwax_nav_native_runner::{
     prelude::RestartPolicy, RetainedNativeConfig, RetainedNativeOwner, RetainedNativeState,
     SupervisedNativeCommand, SupervisedNativeConfig, SupervisedProcessIdentity,
-    TypedNativeReadiness, TypedReadyFuture, PLANNER_RESTART_GENERATION_ENV,
+    TypedNativeReadiness, TypedReadyFuture, PLANNER_RESTART_GENERATION_ARG,
 };
 
 use crate::error::{NavStackError, NavStackResult};
@@ -349,10 +349,9 @@ impl StackRunner {
                         reason,
                     }
                 })?;
-                let launch =
-                    launch_for(&node).ok_or_else(|| NavStackError::MissingRuntimeOwners {
-                        nodes: vec![format!("{} (native bridge has no executable)", node.id)],
-                    })?;
+                let launch = launch_for(&node).ok_or_else(|| NavStackError::MissingRuntimeOwners {
+                    nodes: vec![format!("{} (native bridge has no executable)", node.id)],
+                })?;
 
                 #[cfg(feature = "native-runner")]
                 {
@@ -376,13 +375,15 @@ impl StackRunner {
                         supervisor: registration.options.supervisor,
                         startup_timeout: registration.options.startup_timeout,
                         shutdown_grace: registration.options.shutdown_grace,
-                        restart_generation_env: planner_restart_generation_env(&node.id).into(),
+                        restart_generation_arg: planner_restart_generation_arg(&node.id).into(),
                         restart,
                     };
-                    let mut owner = RetainedNativeOwner::new(config, registration.readiness)
-                        .map_err(|source| NavStackError::NodeStartFailed {
-                            node: node.id.clone(),
-                            reason: source.to_string(),
+                    let mut owner =
+                        RetainedNativeOwner::new(config, registration.readiness).map_err(|source| {
+                            NavStackError::NodeStartFailed {
+                                node: node.id.clone(),
+                                reason: source.to_string(),
+                            }
                         })?;
                     owner
                         .start()
@@ -411,13 +412,12 @@ impl StackRunner {
                 .in_process_factories
                 .get(&node.id)
                 .expect("ownership preflight guarantees a factory");
-            let mut owner =
-                factory
-                    .create(&node)
-                    .map_err(|source| NavStackError::NodeStartFailed {
-                        node: node.id.clone(),
-                        reason: source.to_string(),
-                    })?;
+            let mut owner = factory
+                .create(&node)
+                .map_err(|source| NavStackError::NodeStartFailed {
+                    node: node.id.clone(),
+                    reason: source.to_string(),
+                })?;
             owner
                 .start()
                 .map_err(|source| NavStackError::NodeStartFailed {
@@ -574,11 +574,11 @@ fn invalidate_planner_generation(node_id: &str) {
 }
 
 #[cfg(feature = "native-runner")]
-fn planner_restart_generation_env(node_id: &str) -> &'static str {
+fn planner_restart_generation_arg(node_id: &str) -> &'static str {
     if node_id == "mls_planner" {
-        "NUWAX_MLS_BACKEND_GENERATION"
+        "--backend-generation"
     } else {
-        PLANNER_RESTART_GENERATION_ENV
+        PLANNER_RESTART_GENERATION_ARG
     }
 }
 
@@ -706,18 +706,18 @@ mod tests {
 
     #[cfg(feature = "native-runner")]
     #[test]
-    fn planner_restart_generation_env_is_backend_specific() {
+    fn planner_restart_generation_arg_is_backend_specific() {
         assert_eq!(
-            planner_restart_generation_env("mls_planner"),
-            "NUWAX_MLS_BACKEND_GENERATION"
+            planner_restart_generation_arg("mls_planner"),
+            "--backend-generation"
         );
         assert_eq!(
-            planner_restart_generation_env("far_planner"),
-            PLANNER_RESTART_GENERATION_ENV
+            planner_restart_generation_arg("far_planner"),
+            PLANNER_RESTART_GENERATION_ARG
         );
         assert_eq!(
-            planner_restart_generation_env("other_native"),
-            PLANNER_RESTART_GENERATION_ENV
+            planner_restart_generation_arg("other_native"),
+            PLANNER_RESTART_GENERATION_ARG
         );
     }
 

@@ -163,3 +163,25 @@ def test_planner_rejects_mismatched_observer_frame():
     with pytest.raises(ValueError, match='地图坐标系'):
         InspectionPosePlanner().plan_for_target(target_pose=Pose(frame_id='map'),
             observer_body_pose=Pose(frame_id='odom'))
+
+
+def test_find_target_navigates_to_a_written_door_observation(tmp_path):
+    robot = integration.position(0, 0, 0)
+    door = integration.detection3d("door")
+    first_frame = datetime.now(timezone.utc) - timedelta(seconds=2)
+    with integration.memory_at(tmp_path, pose=robot) as (service, _):
+        map_name = service.current_library
+        for offset in range(3):
+            context = integration.observed([door], now=first_frame + timedelta(seconds=offset))
+            service.remember_current_scene(map_name=map_name, perception_context=context, observation_pose=robot)
+
+        events = service.records("observation")
+        assert len(events) == 3
+        event_ids = {event.event_id for event in events if event.visual_labels == ["door"]}
+        candidates = service.resolve_navigation_candidates("door", map_name=map_name, object_target=True)
+        assert any(
+            candidate.record_id in event_ids
+            and candidate.metadata["allowed_for_navigation"] is True
+            and candidate.metadata["resolution_decision"] == "navigate"
+            for candidate in candidates
+        )

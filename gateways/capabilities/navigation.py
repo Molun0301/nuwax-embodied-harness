@@ -167,8 +167,11 @@ class _TargetSearch:
                 written = remember_sample(self.platform, sample, title="目标识别：" + self.query[:48],
                     summary=sample.context.scene_summary.headline, tags=[self.query, *evidence["matched_labels"]],
                     metadata={"source": source, "capture_mode": "target_search_burst",
-                        "target_search_query": self.query, "target_detection_evidence": True,
-                        "detection_metadata": {"query": self.query, "open_vocabulary_classes": [self.query]}, **evidence})
+                        "projection_method": evidence["projection_method"],
+                        "geometry_projection_method": evidence["geometry_projection_method"],
+                        "projection_confidence": evidence["projection_confidence"],
+                        "support_point_count": evidence["support_point_count"],
+                        "projection_degradation_reason": evidence["projection_degradation_reason"]})
             except Exception:
                 LOGGER.exception("目标检测观察写入失败 query=%s", self.query)
         return {"frame_count": frame_count, "scene_headline": sample.context.scene_summary.headline,
@@ -190,10 +193,8 @@ class _TargetSearch:
 
     def search_state(self, sample):
         verification = self.verify(sample)
-        map_frame_id = self.platform.geometry_state.snapshot().info.map_frame_id
         candidates = tuple(candidate for candidate in self.platform.memory.resolve_navigation_candidates(
-            self.query, camera_id=self.camera_id, map_name=self.map_name, limit=5,
-            object_target_map_frame_id=map_frame_id)
+            self.query, camera_id=self.camera_id, map_name=self.map_name, limit=5, object_target=True)
             if candidate.record_id not in self.rejected)
         diagnostics = [self._build_target_candidate_diagnostic(candidate) for candidate in candidates]
         allowed = [candidate for candidate, diagnostic in zip(candidates, diagnostics) if diagnostic["allowed_for_navigation"]]
@@ -366,57 +367,20 @@ class _TargetSearch:
     @staticmethod
     def _build_target_candidate_diagnostic(candidate: NavigationCandidate) -> Dict[str, Any]:
         metadata = candidate.metadata
-        quality = metadata["navigation_quality"]
         allowed = metadata["allowed_for_navigation"] is True and metadata["resolution_decision"] == "navigate"
-        diagnostic = {
+        return {
             "record_id": candidate.record_id,
             "record_kind": metadata["record_kind"],
-            "target_name": candidate.target_name,
-            "map_name": candidate.map_name,
-            "topo_node_id": candidate.topo_node_id,
-            "semantic_region_id": candidate.semantic_region_id,
-            "distance_m": candidate.distance_m,
-            "verification_query": candidate.verification_query,
-            "has_goal_pose": True,
-            "target_frame_id": candidate.inspection_pose.frame_id,
-            "camera_id": metadata["camera_id"],
-            "backend_type": metadata["backend_type"],
-            "backend": metadata["backend"],
-            "source_collection": candidate.source_collection,
-            "candidate_id": candidate.candidate_id,
-            "anchor_id": candidate.anchor_id,
             **metadata["target_navigation_evidence"],
-            "non_navigable_reason": metadata["non_navigable_reason"] or None,
-            "segmentation_quality_reason": metadata["segmentation_quality_reason"] or None,
-            "navigation_quality": quality,
-            "navigation_quality_level": quality["level"],
-            "recommended_action": quality["recommended_action"],
+            "projection_method": metadata["projection_method"],
+            "projection_confidence": metadata["projection_confidence"],
+            "support_point_count": metadata["support_point_count"],
+            "candidate_score": metadata["candidate_score"],
+            "resolution_decision": metadata["resolution_decision"],
             "allowed_for_navigation": allowed,
             "rejection_reason": None if allowed else metadata["excluded_reason"] or metadata["resolution_decision"],
             "navigation_attempted": False,
         }
-        for key in (
-            "candidate_score", "projection_method", "geometry_projection_method", "projection_confidence",
-            "support_point_count", "projection_degradation_reason", "geometry_projection_status",
-            "segmentation_projection_status", "has_structured_segmentation", "segmentation_score", "predicted_iou",
-            "segmentation_quality_score", "stability_score", "coverage", "map_projection_coverage",
-            "depth_coverage", "reprojection_error", "segmentation_support_point_count", "segmentation_quality",
-            "segmentation_review_required", "segmentation_risk_factors", "segmentation_occlusion_flags",
-            "segmentation_truncation_flags", "navigable", "goal_spec", "resolution_summary", "score_breakdown",
-            "resolution_decision", "ranking_total_score", "failure_penalty", "failure_reason_codes",
-            "llm_boundary", "coordinate_source",
-        ):
-            diagnostic[key] = metadata[key]
-        return diagnostic
-
-    def _target_candidate_score_from_diagnostic(self, diagnostic: Dict[str, Any]) -> Optional[float]:
-        score = self._coerce_optional_float(diagnostic.get("candidate_score"))
-        if score is not None:
-            return score
-        navigation_quality = diagnostic.get("navigation_quality")
-        if isinstance(navigation_quality, dict):
-            return self._coerce_optional_float(navigation_quality.get("confidence"))
-        return None
 
     def _build_target_clarification(
         self,
@@ -442,27 +406,20 @@ class _TargetSearch:
         self,
         *,
         query: str,
-        candidates: List[Any],
+        candidates: List[NavigationCandidate],
         candidate_diagnostics: List[Dict[str, Any]],
-    ) -> Tuple[List[Any], Optional[Dict[str, Any]]]:
+    ) -> Tuple[List[NavigationCandidate], Optional[Dict[str, Any]]]:
         if len(candidates) <= 1:
             return candidates, None
-        diagnostics_by_record_id = {item["record_id"]: item for item in candidate_diagnostics}
         top_candidate, second_candidate = candidates[:2]
-        top_diagnostic = diagnostics_by_record_id[top_candidate.record_id]
-        second_diagnostic = diagnostics_by_record_id[second_candidate.record_id]
-        top_score = self._target_candidate_score_from_diagnostic(top_diagnostic)
-        second_score = self._target_candidate_score_from_diagnostic(second_diagnostic)
-        if top_score is None or second_score is None or (top_score - second_score) < 0.08:
+        top_score = top_candidate.metadata["candidate_score"]
+        second_score = second_candidate.metadata["candidate_score"]
+        if (top_score - second_score) < 0.08:
             clarification = self._build_target_clarification(
                 query=query,
                 reason="ambiguous_navigation_candidates",
                 candidate_diagnostics=candidate_diagnostics,
             )
-            for item in candidate_diagnostics:
-                if item.get("allowed_for_navigation") is True:
-                    item["ambiguity_state"] = "needs_clarification"
-                    item["clarification_reason"] = "ambiguous_navigation_candidates"
             return [], clarification
         return [top_candidate], None
 

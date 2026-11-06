@@ -6,7 +6,6 @@ import re
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 import numpy as np
 from contracts.base import utc_now
-from contracts.frame_semantics import frame_ids_semantically_equal, infer_frame_role
 from contracts.geometry import Pose
 from contracts.memory import MemoryQueryMatch, MemoryPayloadFilter, MemoryArrivalVerification, MemoryRecordKind, SemanticMemoryEntry, TaggedLocation
 from contracts.spatial_memory import GroundingQueryPlan, NavigationCandidate, SceneSpace
@@ -19,7 +18,7 @@ from contracts.spatial_memory import SemanticRegion, InstanceDynamicState
 from contracts.memory import GoalSpec, GoalConstraint, GoalSpatialRelation, GoalCandidateScoreBreakdown, NavigationCandidateResolution
 from contracts.spatial_memory import SpatialAnchor, SpatialAnchorKind, NavigationTrajectoryEvent, NavigationTrajectoryEventKind, SemanticGraphRelation, SemanticGraphRelationKind
 from core.state_store import StateNamespace
-from core.target_query import coerce_optional_str_list, normalize_query, target_label_matches_query
+from core.target_query import target_label_matches_query
 from services.memory.store import MODELS
 import uuid
 import logging
@@ -30,25 +29,6 @@ PLACE_NODES_COLLECTION = 'place_nodes'
 OBJECT_INSTANCES_COLLECTION = 'object_instances'
 EPISODIC_OBSERVATIONS_COLLECTION = 'episodic_observations'
 SCENE_SPACES_COLLECTION = 'scene_spaces'
-
-
-def _target_query_matches_any(query, values):
-    if isinstance(values, dict):
-        values = values.values()
-    elif not isinstance(values, (list, tuple, set, frozenset)):
-        return target_label_matches_query(query, str(values or ""))
-    return any(_target_query_matches_any(query, value) for value in values)
-
-
-def _object_target_map_frames(map_frame_id: str) -> Tuple[str, ...]:
-    normalized = map_frame_id.strip().lower().replace("/", "_")
-    if not normalized or any(token in normalized for token in ("camera", "cam", "lidar", "imu", "base", "footprint")):
-        return ("map",)
-    try:
-        role = infer_frame_role(map_frame_id)
-    except ValueError:
-        return ("map",)
-    return ("map",) if role in {"odom", "base"} else tuple(sorted({"map", map_frame_id}))
 
 
 class NavigationMixin:
@@ -575,100 +555,33 @@ class NavigationMixin:
             return ('explore', reasons or ['evidence_insufficient'], False)
         return ('reject', reasons or ['candidate_not_safe_for_navigation'], False)
 
+    @staticmethod
     def _object_target_evidence(
-        self, candidate: NavigationCandidate, query: str, map_frames: Tuple[str, ...],
+        candidate: NavigationCandidate, query: str, map_frame_id: str,
     ) -> Dict[str, object]:
-        metadata = candidate.metadata
-        detection = metadata.get("detection_metadata")
-        if not isinstance(detection, dict):
-            detection = {}
-        query_values = (
-            metadata.get("target_search_query"), metadata.get("search_query"), metadata.get("query"),
-            detection.get("query"), detection.get("target_query"), detection.get("target_search_query"),
-            detection.get("open_vocabulary_query"),
-        )
-        matched_labels = coerce_optional_str_list(metadata.get("matched_labels"))
-        best_label = str(metadata.get("best_detection_label") or "").strip()
-        label_values = (
-            matched_labels, best_label, metadata.get("detection_label"), metadata.get("target_label"),
-            detection.get("matched_labels"), detection.get("best_detection_label"),
-            detection.get("open_vocabulary_classes"),
-        )
-        matched_fields = [
-            field for field, values in (("detection_query", query_values), ("detection_label", label_values))
-            if _target_query_matches_any(query, values)
-        ]
-        explicit_match = any(
-            self._coerce_optional_bool(source.get(key)) is True
-            for source in (metadata, detection)
-            for key in ("query_matched_detection_evidence", "detection_query_matched", "target_query_matched",
-                        "target_search_query_matched", "open_vocabulary_query_matched", "query_matched")
-        )
-        event_id = str(
-            metadata.get("observation_event_id") or metadata.get("last_observation_event_id")
-            or metadata.get("linked_observation_event_id") or metadata.get("verification_event_id") or ""
-        ).strip()
-        detection_query = next((str(value).strip() for value in query_values if str(value or "").strip()), "")
-        target_detection = self._coerce_optional_bool(metadata.get("target_detection_evidence")) is True
-        detection_flag = self._coerce_optional_bool(metadata.get("has_detection_evidence")) is True
-        matched_count = self._coerce_optional_int(metadata.get("matched_detection_count"))
-        matched_query = bool(query and (matched_fields or explicit_match))
-        matched_detection = matched_query and bool(
-            target_detection or detection_flag or (matched_count is not None and matched_count > 0)
-            or matched_labels or best_label or detection_query or explicit_match
-        )
-        matched_event = matched_query and bool(event_id)
-        evidence_source = ""
-        if matched_detection:
-            evidence_source = "detection"
-        elif matched_event:
-            evidence_source = "observation_event"
-        record_kind = metadata["record_kind"]
-        object_record = record_kind in {MemoryRecordKind.OBJECT_INSTANCE.value, MemoryRecordKind.OBSERVATION_EVENT.value}
-        projection_evidence = any(metadata[key] for key in (
-            "projection_method", "geometry_projection_method", "geometry_projection_status", "segmentation_projection_status"
-        ))
-        confidence = metadata["projection_confidence"]
+        labels = candidate.metadata["visual_labels"]
         return {
-            "target_pose_in_map_frame": any(frame_ids_semantically_equal(candidate.inspection_pose.frame_id, frame)
-                                            for frame in map_frames),
-            "accepted_map_frame_ids": list(map_frames),
-            "has_target_evidence": bool(evidence_source),
-            "target_evidence_source": evidence_source,
-            "evidence_record_kind": record_kind if object_record else "",
-            "linked_object_instance_ids": coerce_optional_str_list(metadata.get("linked_object_instance_ids")),
-            "evidence_event_id": event_id,
-            "target_detection_evidence": target_detection,
-            "has_detection_evidence_flag": detection_flag,
-            "matched_detection_count": matched_count,
-            "detection_query": detection_query,
-            "query_match_evidence_fields": matched_fields,
-            "explicit_query_match_evidence": explicit_match,
-            "query_matched_detection_evidence": matched_detection,
-            "query_matched_event_evidence": matched_event,
-            "projection_confidence_present": True,
-            "projection_confidence_valid": confidence is not None and math.isfinite(confidence),
-            "has_projection_evidence": projection_evidence,
-            "has_projection_geometry_state": projection_evidence,
+            "visual_labels": labels,
+            "target_frame_id": candidate.inspection_pose.frame_id,
+            "map_frame_id": map_frame_id,
+            "has_target_evidence": any(target_label_matches_query(query, label) for label in labels),
         }
 
     @staticmethod
     def _object_target_rejection(candidate: NavigationCandidate, evidence: Dict[str, object]) -> Optional[str]:
         metadata = candidate.metadata
-        if not evidence["evidence_record_kind"]:
+        if metadata["record_kind"] not in {MemoryRecordKind.OBJECT_INSTANCE.value, MemoryRecordKind.OBSERVATION_EVENT.value}:
             return "target_navigation_source_not_object_evidence"
         if not evidence["has_target_evidence"]:
             return "target_evidence_missing"
-        if not evidence["target_pose_in_map_frame"]:
+        if evidence["target_frame_id"] != evidence["map_frame_id"]:
             return "target_pose_not_map_frame"
-        # 主投影方法的位姿回退已由导航质量拒绝，这里补齐几何投影方法的回退。
-        if metadata["geometry_projection_method"] == "current_pose_fallback" and metadata["projection_method"] != "current_pose_fallback":
-            return "projection_method_current_pose_fallback"
         if metadata["support_point_count"] <= 0:
             return "support_point_count_below_threshold"
-        if not evidence["has_projection_evidence"]:
+        if not metadata["projection_method"]:
             return "projection_evidence_missing"
-        if not evidence["projection_confidence_valid"]:
+        confidence = metadata["projection_confidence"]
+        if confidence is None or not math.isfinite(confidence):
             return "projection_confidence_invalid"
         return None
 
@@ -776,13 +689,12 @@ class NavigationMixin:
     def resolve_navigation_candidates(
         self, query: str, *, camera_id: Optional[str] = None, similarity_threshold: float = 0.25,
         max_age_sec: Optional[float] = None, map_name: Optional[str] = None, limit: int = 5,
-        goal_id: Optional[str] = None, object_target_map_frame_id: Optional[str] = None,
+        goal_id: Optional[str] = None, object_target: bool = False,
     ) -> Tuple[NavigationCandidate, ...]:
-        """解析记忆导航候选。给出地图坐标系时，按找物任务要求核对物体证据。"""
+        """解析记忆导航候选。找物候选须有匹配的检测标签和同一地图坐标系。"""
         if not self.is_enabled():
             return ()
-        object_query = normalize_query(query) if object_target_map_frame_id is not None else ""
-        object_map_frames = _object_target_map_frames(object_target_map_frame_id) if object_target_map_frame_id is not None else None
+        object_query = query
         started_at = time.perf_counter()
         requested_limit = max(1, int(limit))
         candidate_pool_limit = max(requested_limit * 3, 12)
@@ -868,10 +780,11 @@ class NavigationMixin:
         decorated_candidates = tuple(decorated_pool[:requested_limit])
         # 可达位姿记录沿用通用判定，找物查询的证据要求只作用于本次选择。
         reachability_decisions = tuple(candidate.metadata["resolution_decision"] for candidate in decorated_candidates)
-        if object_map_frames is not None:
+        if object_target:
+            map_frame_id = semantic_context.metadata["frame_id"]
             target_candidates = []
             for candidate in decorated_candidates:
-                evidence = self._object_target_evidence(candidate, object_query, object_map_frames)
+                evidence = self._object_target_evidence(candidate, object_query, map_frame_id)
                 rejection = self._object_target_rejection(candidate, evidence)
                 metadata = {**candidate.metadata, "target_navigation_evidence": evidence}
                 if rejection is not None:

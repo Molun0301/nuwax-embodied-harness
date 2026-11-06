@@ -4,27 +4,26 @@ DO NOT MODIFY BY HAND!!!!
 lcm-gen 1.5.2
 """
 
-from .LioOdometryEnvelope import LioOdometryEnvelope as LioOdometryEnvelope
-from .LioCloudEnvelope import LioCloudEnvelope as LioCloudEnvelope
-from .LioStatus import LioStatus as LioStatus
-from .NavigationMap3D import NavigationMap3D as NavigationMap3D
-from .PlanarNavigationMap import PlanarNavigationMap as PlanarNavigationMap
-from .PlanarScan import PlanarScan as PlanarScan
-from .NavigationMapBlock import NavigationMapBlock as NavigationMapBlock
-from .GoalEnvelope import GoalEnvelope as GoalEnvelope
 from .CancelNavigation import CancelNavigation as CancelNavigation
 from .CorrectionCandidate import CorrectionCandidate as CorrectionCandidate
 from .Frontier import Frontier as Frontier
 from .FrontierList import FrontierList as FrontierList
+from .LioCloudEnvelope import LioCloudEnvelope as LioCloudEnvelope
+from .LioInputAck import LioInputAck as LioInputAck
+from .LioInputFrame import LioInputFrame as LioInputFrame
+from .LioOdometryEnvelope import LioOdometryEnvelope as LioOdometryEnvelope
+from .LioStatus import LioStatus as LioStatus
 from .NativePgoRequest import NativePgoRequest as NativePgoRequest
 from .NativePgoResult import NativePgoResult as NativePgoResult
 from .NativePgoStatus import NativePgoStatus as NativePgoStatus
-from .NavigationState import NavigationState as NavigationState
+from .NavigationGoal import NavigationGoal as NavigationGoal
+from .NavigationMap3D import NavigationMap3D as NavigationMap3D
+from .NavigationMapBlock import NavigationMapBlock as NavigationMapBlock
+from .NavigationStatus import NavigationStatus as NavigationStatus
 from .PathEnvelope import PathEnvelope as PathEnvelope
 from .PersonFollowCommand import PersonFollowCommand as PersonFollowCommand
 from .PersonFollowTarget import PersonFollowTarget as PersonFollowTarget
-
-from .LioInputAck import LioInputAck
-from .LioInputFrame import LioInputFrame
+from .PlanarNavigationMap import PlanarNavigationMap as PlanarNavigationMap
+from .PlanarScan import PlanarScan as PlanarScan
 from .RecentCloud3D import RecentCloud3D as RecentCloud3D
 from .RegisteredCloudPose import RegisteredCloudPose as RegisteredCloudPose

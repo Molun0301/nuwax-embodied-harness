@@ -70,22 +70,8 @@ struct _nuwax_msgs_NavigationStatus
      * LCM Type: string
      */
     char*      planner_pose_frame;
-    int64_t    cancel_generation;
-
-    /**
-     * LCM Type: string
-     */
-    char*      zero_ack_id;
-    int64_t    zero_applied_monotonic_ns;
-    int32_t    owner_kind;
-
-    /**
-     * LCM Type: string
-     */
-    char*      parent_request_id;
-    int64_t    goal_generation;
+    int64_t    motion_generation;
     int64_t    path_revision;
-    int64_t    producer_runtime_generation;
     int64_t    planner_runtime_generation;
 
     /**

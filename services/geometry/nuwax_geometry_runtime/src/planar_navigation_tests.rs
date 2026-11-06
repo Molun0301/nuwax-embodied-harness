@@ -93,6 +93,7 @@ async fn current_scan_clears_moved_obstacle_and_preserves_unobserved_cells() {
         binary: "/bin/true".into(),
         data_root: "/tmp".into(),
         unix_offset_ns: 0,
+        base_from_laser: [0.; 3],
     };
     let navigation = Owner::default();
     navigation.odometry(sample(stamp, 0.5)).unwrap();

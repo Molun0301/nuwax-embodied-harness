@@ -55,7 +55,7 @@ generated/python/nuwax_msgs/*
 !generated/python/geometry_msgs/TransformStamped.py
 !generated/python/nav_msgs/Path.py
 !generated/python/nuwax_msgs/NavigationMapBlock.py
-!generated/python/nuwax_msgs/GoalEnvelope.py
+!generated/python/nuwax_msgs/NavigationGoal.py
 !generated/python/nuwax_msgs/CancelNavigation.py
 !generated/python/nuwax_msgs/CorrectionCandidate.py
 !generated/python/nuwax_msgs/Frontier.py
@@ -63,7 +63,7 @@ generated/python/nuwax_msgs/*
 !generated/python/nuwax_msgs/NativePgoRequest.py
 !generated/python/nuwax_msgs/NativePgoResult.py
 !generated/python/nuwax_msgs/NativePgoStatus.py
-!generated/python/nuwax_msgs/NavigationState.py
+!generated/python/nuwax_msgs/NavigationStatus.py
 !generated/python/nuwax_msgs/PathEnvelope.py
 !generated/python/nuwax_msgs/PersonFollowCommand.py
 !generated/python/nuwax_msgs/PersonFollowTarget.py
@@ -77,3 +77,6 @@ generated/python/nuwax_msgs/*
 generated/python/tf2_msgs/*
 !generated/python/tf2_msgs/__init__.py
 !generated/python/tf2_msgs/TFMessage.py
+
+# 当前生成包入口导出的配准姿态消息。
+!generated/python/nuwax_msgs/RegisteredCloudPose.py

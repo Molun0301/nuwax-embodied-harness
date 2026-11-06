@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nalgebra::{Matrix3, Point3, Vector3};
-use nuwax_codec::lcm::lio::{LIO_BACKEND_FASTLIO2, LIO_BACKEND_POINTLIO};
 use nuwax_lio_backends::native::{NativeBackend, NativeLioConfig, NativeRuntimeSpec};
 use nuwax_lio_backends::pointlio_options::{PointLioOptions, POINTLIO_OPTIONS_ENV};
 use nuwax_protocol::{LcmMessageType, LcmTopic};
@@ -149,7 +148,6 @@ pub(crate) struct NativePrivateChannels {
 
 #[derive(Clone, Debug)]
 pub(crate) struct BoundNativeLioRuntime {
-    pub(crate) backend_code: i32,
     pub(crate) channels: NativePrivateChannels,
     pub(crate) runtime: Box<NativeRuntimeSpec>,
     pub(crate) body_from_sensor: BodyFromSensorTransform,
@@ -326,7 +324,6 @@ impl NativeLioPreflight {
         })?;
 
         Ok(BoundNativeLioRuntime {
-            backend_code: backend_code(self.backend),
             channels,
             runtime: Box::new(runtime),
             body_from_sensor: self.body_from_sensor.clone(),
@@ -339,13 +336,6 @@ fn backend_tag(backend: NativeBackend) -> &'static str {
     match backend {
         NativeBackend::FastLio2 => "f2",
         NativeBackend::PointLio => "pl",
-    }
-}
-
-fn backend_code(backend: NativeBackend) -> i32 {
-    match backend {
-        NativeBackend::FastLio2 => LIO_BACKEND_FASTLIO2,
-        NativeBackend::PointLio => LIO_BACKEND_POINTLIO,
     }
 }
 
@@ -552,6 +542,7 @@ pub(crate) struct NativeProcessOwner {
     observed_status: Option<ExitStatus>,
     reaped_status: Option<ExitStatus>,
 
+    #[cfg(test)]
     stdout_tail: SharedTail,
 
     stderr_tail: SharedTail,
@@ -567,7 +558,10 @@ impl NativeProcessOwner {
         command.process_group(0);
         let mut command = Command::from(command);
         command.stdin(Stdio::null());
+        #[cfg(test)]
         command.stdout(Stdio::piped());
+        #[cfg(not(test))]
+        command.stdout(Stdio::null());
         command.stderr(Stdio::piped());
         command.kill_on_drop(true);
         let mut child = command.spawn().map_err(|error| {
@@ -579,15 +573,20 @@ impl NativeProcessOwner {
         let pid = child.id().ok_or_else(|| {
             "NATIVE_LIO_PROCESS_FAILED spawned child did not expose a pid".to_owned()
         })?;
+        #[cfg(test)]
         let stdout = child.stdout.take().ok_or_else(|| {
             "NATIVE_LIO_PROCESS_FAILED child stdout pipe was not created".to_owned()
         })?;
         let stderr = child.stderr.take().ok_or_else(|| {
             "NATIVE_LIO_PROCESS_FAILED child stderr pipe was not created".to_owned()
         })?;
+        #[cfg(test)]
         let stdout_tail = Arc::new(Mutex::new(BoundedTail::new(OUTPUT_TAIL_BYTES)));
         let stderr_tail = Arc::new(Mutex::new(BoundedTail::new(OUTPUT_TAIL_BYTES)));
-        let stdout_drain = spawn_output_drain("stdout", stdout, stdout_tail.clone());
+        #[cfg(test)]
+        let stdout_drain = Some(spawn_output_drain("stdout", stdout, stdout_tail.clone()));
+        #[cfg(not(test))]
+        let stdout_drain = None;
         let stderr_drain = spawn_output_drain("stderr", stderr, stderr_tail.clone());
 
         Ok(Self {
@@ -597,9 +596,10 @@ impl NativeProcessOwner {
             group_cleanup_confirmed: false,
             observed_status: None,
             reaped_status: None,
+            #[cfg(test)]
             stdout_tail,
             stderr_tail,
-            stdout_drain: Some(stdout_drain),
+            stdout_drain,
             stderr_drain: Some(stderr_drain),
         })
     }
@@ -609,6 +609,7 @@ impl NativeProcessOwner {
         self.pid
     }
 
+    #[cfg(test)]
     pub(crate) fn stdout_tail(&self) -> Vec<u8> {
         self.stdout_tail.lock().snapshot()
     }

@@ -324,7 +324,7 @@ pub const STRUCT_SEEDS: &[(&str, u64)] = &[
         u64::from_be_bytes(crate::lcm::schema::NAVIGATION_MAP_3D_FINGERPRINT).rotate_right(1),
     ),
     ("nuwax_msgs.NavigationMapBlock", u64::from_be_bytes(crate::lcm::schema::NAVIGATION_MAP_BLOCK_FINGERPRINT).rotate_right(1)),
-    ("nuwax_msgs.CancelNavigation", 0x4b82_2594_74e2_ee91_u64),
+    ("nuwax_msgs.CancelNavigation", u64::from_be_bytes(crate::lcm::schema::CANCEL_NAVIGATION_FINGERPRINT).rotate_right(1)),
     ("nuwax_msgs.Frontier", 0x0d5f_c1f5_0676_ce22_u64),
     ("nuwax_msgs.FrontierList", 0x109e_db47_dc0b_8fbb_u64),
     // lcm-gen 1.5.2 生成的无子类型 seed。

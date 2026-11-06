@@ -56,6 +56,9 @@ class NativePgoStatus(object):
     REASON_CANCEL_TOO_LATE = 12
     REASON_CHILD_EXITED = 13
     REASON_CHILD_CRASHED = 14
+    REASON_KEYFRAME_ACCEPTED = 15
+    """ 成功终态中的精确关键帧接纳回执，沿用现有字段布局。 """
+    REASON_NO_KEYFRAME = 16
 
     def __init__(self):
         self.schema_version = 0
@@ -269,4 +272,3 @@ class NativePgoStatus(object):
     def get_hash(self):
         """Get the LCM hash of the struct"""
         return struct.unpack(">Q", NativePgoStatus._get_packed_fingerprint())[0]
-

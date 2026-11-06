@@ -4,7 +4,6 @@ pub mod proto {
     tonic::include_proto!("nuwax.geometry.v3");
 }
 pub mod api;
-mod channel_registry;
 mod completed_cleanup;
 mod corrector;
 mod dense_cloud;

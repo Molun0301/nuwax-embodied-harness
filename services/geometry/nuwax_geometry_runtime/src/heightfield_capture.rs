@@ -184,7 +184,7 @@ enum Old<'a> {
     Heightfield(&'a HeightfieldSurface),
 }
 impl Old<'_> {
-    fn height(self, xy: Xy, q: f64) -> Option<f64> {
+    fn height(self) -> Option<f64> {
         match self {
             Self::Heightfield(v) => Some(v.column.height()),
         }
@@ -372,7 +372,6 @@ fn select_seed<I: IntoIterator<Item = usize>>(
     if values.len() <= 1 {
         return values.first().copied();
     }
-    let xy = columns.xy[index];
     let mut coverage = vec![0_usize; values.len()];
     let (low, high) = (values[0] - 4, values[values.len() - 1] + 4);
     for n in window() {
@@ -406,7 +405,7 @@ fn select_seed<I: IntoIterator<Item = usize>>(
                     continue;
                 }
                 referenced = true;
-                if let Some(h) = v.height(xy, q) {
+                if let Some(h) = v.height() {
                     let d = ((z as f64 + 0.5) * q / 8.0 - h).abs();
                     distance = Some(
                         distance
@@ -466,7 +465,6 @@ impl<'a> Context<'a> {
         *self.heights[index].get_or_init(|| self.compute_reference_height(index))
     }
     fn compute_reference_height(&self, index: usize) -> Option<f64> {
-        let n = self.columns.xy[index];
         match self.columns.old[index] {
             Some(records) => {
                 let seed = self.seed(index);
@@ -488,7 +486,7 @@ impl<'a> Context<'a> {
                 } else {
                     None
                 };
-                reference.and_then(|r| r.height(n, self.q))
+                reference.and_then(|r| r.height())
             }
             None => None,
         }
@@ -564,7 +562,6 @@ fn groups(
     old: Option<&ColumnGroundRecords>,
     q: f64,
 ) -> Vec<Group> {
-    let xy = local.c;
     let (Some(index), Some(first)) = (local.cells[CENTER], local.seeds[CENTER]) else {
         return vec![];
     };
@@ -615,8 +612,8 @@ fn groups(
                                         .filter(|r| r.contains(first.div_euclid(8) as i32))
                                         .any(|lower| {
                                             upper
-                                                .height(xy, q)
-                                                .zip(lower.height(xy, q))
+                                                .height()
+                                                .zip(lower.height())
                                                 .is_some_and(|(a, b)| (a - b).abs() > 4.0 * q)
                                         })
                                 })
@@ -635,8 +632,8 @@ fn legacy_shape(
     candidate: Bin,
     central: Old<'_>,
 ) -> Option<Shape> {
-    let (xy, q) = (local.c, context.q);
-    let centre = central.height(xy, q)?;
+    let q = context.q;
+    let centre = central.height()?;
     let delta = (candidate as f64 + 0.5) * q / 8.0 - centre;
     // 邻列参考与正在比较的旧记录无关，本列内只取一次；中心位置每次用该记录高度。
     let references = match local.references {
@@ -701,8 +698,8 @@ fn independent_old_pair<'a>(
     q: f64,
 ) -> bool {
     let xy = local.c;
-    if a.height(xy, q)
-        .zip(b.height(xy, q))
+    if a.height()
+        .zip(b.height())
         .is_some_and(|(x, y)| (x - y).abs() > 4.0 * q)
     {
         return true;
@@ -742,9 +739,7 @@ fn independent_old_pair<'a>(
             return true;
         }
     }
-    let (Old::Heightfield(a), Old::Heightfield(b)) = (a, b) else {
-        return false;
-    };
+    let (Old::Heightfield(a), Old::Heightfield(b)) = (a, b);
     let left: Vec<_> = positive(a).collect();
     let right: Vec<_> = positive(b).collect();
     if left.is_empty() || right.is_empty() {
@@ -892,7 +887,7 @@ impl Frame<'_, '_> {
             *compatibility.entry((index, seed)).or_insert_with(|| {
                 let record = olds[index];
                 record
-                    .height(xy, q)
+                    .height()
                     .is_some_and(|h| ((seed as f64 + 0.5) * q / 8.0 - h).abs() <= 4.0 * q)
                     && legacy_shape(local, context, seed, record).is_none_or(Shape::joins)
             })

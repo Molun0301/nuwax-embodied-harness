@@ -17,6 +17,7 @@ pub(crate) struct Settings {
     pub binary: PathBuf,
     pub data_root: PathBuf,
     pub unix_offset_ns: i128,
+    pub base_from_laser: [f64; 3],
 }
 impl Settings {
     pub fn from_env() -> Result<Option<Self>, String> {
@@ -49,6 +50,9 @@ impl Settings {
         }
         let template: Session = serde_json::from_value(value).map_err(|e| e.to_string())?;
         template.validate()?;
+        let base_from_laser =
+            serde_json::from_value(template.core_config["base_from_laser"].clone())
+                .map_err(|error| error.to_string())?;
         let unix_offset_ns = match template.clock_domain.as_str() {
             "unix_ns" => 0,
             "monotonic_ns" => {
@@ -103,6 +107,7 @@ impl Settings {
             binary,
             data_root,
             unix_offset_ns,
+            base_from_laser,
         }))
     }
     pub(crate) fn unix_stamp(&self, source: u64) -> Result<u64, String> {
@@ -170,12 +175,18 @@ impl Owner {
                         _=stop.wait_for(|value|*value)=>return Ok(()),
                         _=tick.tick()=>{},
                     }
-                    worker
-                        .lock()
-                        .await
-                        .as_mut()
-                        .ok_or("二维拥有方已关闭")?
-                        .check_alive()?;
+                    {
+                        let mut worker = worker.lock().await;
+                        let worker = worker.as_mut().ok_or("二维拥有方已关闭")?;
+                        let mut current = session.write();
+                        if let Err(error) = worker.check_alive() {
+                            if worker.process_id().is_none() {
+                                // 已退出的工作进程不能再接收扫描或会话停止命令。
+                                current.take();
+                            }
+                            return Err(error);
+                        }
+                    }
                     let status = client.status().await?;
                     if let Some(error) = &status.last_error {
                         return Err(error.clone());
@@ -255,9 +266,17 @@ impl Owner {
                             navigation.compose(&mapper, &settings, &current, &estimate)
                         })
                         .await
-                        .map_err(|e| e.to_string())??;
-                        if let Some(observation) = observation {
-                            crate::planar_navigation::publish(&transport, &observation).await?;
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result);
+                        let result = match observation {
+                            Ok(Some(observation)) => {
+                                crate::planar_navigation::publish(&transport, &observation).await
+                            }
+                            Ok(None) => Ok(()),
+                            Err(reason) => Err(reason),
+                        };
+                        if let Err(reason) = result {
+                            router.output_error(id, reason);
                         }
                     }
                 }
@@ -340,7 +359,9 @@ impl Owner {
                 },
             )
             .await?;
-            revoked?;
+            if let Err(reason) = revoked {
+                self.router.output_error(self.router.session_id(), reason);
+            }
         }
         Ok(())
     }
@@ -354,7 +375,9 @@ impl Owner {
             .publish_scan(session.session_generation, &scan)
             .await
         {
-            self.router.fault(error.clone());
+            if self.session.read().is_some() {
+                self.router.fault(error.clone());
+            }
             return Err(error);
         }
         self.navigation.capture(scan);
@@ -501,7 +524,11 @@ impl Owner {
             task.await.map_err(|e| e.to_string())?;
         }
         if let Some(mut worker) = self.worker.lock().await.take() {
-            worker.shutdown().await?;
+            let exit_already_reported = worker.process_id().is_none();
+            let result = worker.shutdown().await;
+            if !exit_already_reported {
+                result?;
+            }
         }
         Ok(())
     }

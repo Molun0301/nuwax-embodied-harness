@@ -1,5 +1,6 @@
 use super::*;
 use crate::corrector::Corrector;
+use std::os::unix::ffi::OsStrExt;
 
 pub(crate) fn room_frame(session: u64, stamp: u64) -> MappingFrame {
     let (points, _) = crate::dynamic_scene::tests::corridor(None, 0.);
@@ -142,12 +143,16 @@ async fn relocalization_reports_real_success_and_failure_and_rejects_pgo() {
     source.shutdown().await.unwrap();
     let loaded = Mapper::load(26, config(), baseline.clone(), true).unwrap();
     let (router, _, _) = crate::session::test_router(loaded.clone());
-    let missing = Corrector::relocalize(&loaded, router.recent_frames()).await.unwrap();
+    let missing = Corrector::relocalize(&loaded, router.recent_frames())
+        .await
+        .unwrap();
     assert!(!missing.succeeded);
     assert_eq!(missing.frames_used, 0);
     router.publish_frame(room_frame(26, 2_000_000_000));
     loaded.snapshot().await.unwrap();
-    let matched = Corrector::relocalize(&loaded, router.recent_frames()).await.unwrap();
+    let matched = Corrector::relocalize(&loaded, router.recent_frames())
+        .await
+        .unwrap();
     assert!(matched.succeeded, "真实同场景匹配失败：{}", matched.message);
     assert_eq!(matched.frames_used, 1);
     assert_eq!(matched.pose.unwrap().frame_id, "map");
@@ -156,7 +161,10 @@ async fn relocalization_reports_real_success_and_failure_and_rejects_pgo() {
     pgo.correction_backend = "library_pgo".into();
     let loaded = Mapper::load(27, pgo, baseline, true).unwrap();
     assert_eq!(
-        Corrector::relocalize(&loaded, router.recent_frames()).await.unwrap_err().code(),
+        Corrector::relocalize(&loaded, router.recent_frames())
+            .await
+            .unwrap_err()
+            .code(),
         tonic::Code::FailedPrecondition
     );
     loaded.shutdown().await.unwrap();
@@ -394,6 +402,63 @@ async fn malformed_document_fails_closed_and_recovers_on_file_change() {
     assert!(mapper.error_rx().borrow().is_none());
     mapper.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn failed_forbidden_read_is_checked_again_with_unchanged_metadata() {
+    let directory = TestDirectory::new();
+    let source = directory.0.join("原图禁区.json");
+    let target = directory.0.join("当前图禁区.json");
+    let valid = br#"{"zones":[]}"#;
+    let invalid = b"!\"zones\":[]}";
+    assert_eq!(valid.len(), invalid.len());
+    std::fs::write(&source, valid).unwrap();
+    let modified = std::fs::metadata(&source).unwrap().modified().unwrap();
+    std::fs::write(&target, invalid).unwrap();
+    std::fs::File::open(&target)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    let mapper = Mapper::start(
+        74,
+        MapperConfig {
+            backend: MappingBackendSpec::SlamToolbox,
+            ..config()
+        },
+    )
+    .unwrap();
+    mapper.feed_grid(
+        74,
+        kernel_grid_to_proto(&test_grid([0., 0.], &[0, 0], 1.), "实测地图"),
+    );
+    let raw = mapper.snapshot().await.unwrap().occupancy.unwrap();
+    mapper.set_forbidden_zones(source).await.unwrap();
+    assert!(mapper
+        .set_forbidden_zones(target.clone())
+        .await
+        .unwrap_err()
+        .contains("禁行区格式无效"));
+    assert!(mapper.occupancy(true).is_none());
+    assert_eq!(mapper.snapshot().await.unwrap().occupancy.unwrap(), raw);
+    let mut maps = mapper.map_rx();
+    maps.borrow_and_update();
+    std::fs::write(&target, valid).unwrap();
+    std::fs::File::open(&target)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    let metadata = std::fs::metadata(&target).unwrap();
+    assert_eq!(metadata.modified().unwrap(), modified);
+    assert_eq!(metadata.len(), valid.len() as u64);
+    tokio::time::timeout(Duration::from_secs(2), maps.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(mapper.forbidden_status(), Ok(()));
+    assert_eq!(mapper.occupancy(true).unwrap().data, raw.data);
+    assert_eq!(mapper.snapshot().await.unwrap().occupancy.unwrap(), raw);
+    mapper.shutdown().await.unwrap();
+}
+
 #[test]
 fn parse_occupancy_payload_rejects_huge_dimension() {
     let grid = proto::OccupancyGrid {
@@ -558,4 +623,48 @@ async fn prepared_map_does_not_replace_live_shared_cloud_until_activation() {
         72
     );
     ready.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn forbidden_zone_poll_detects_two_writes_with_the_same_mtime() {
+    let directory = TestDirectory::new();
+    let path = directory.0.join("forbidden_zones.json");
+    let mapper = Mapper::start(
+        75,
+        MapperConfig {
+            backend: MappingBackendSpec::SlamToolbox,
+            ..config()
+        },
+    )
+    .unwrap();
+    mapper.feed_grid(
+        75,
+        kernel_grid_to_proto(&test_grid([0., 0.], &[0, 0], 1.), "实测地图"),
+    );
+    let raw = mapper.snapshot().await.unwrap().occupancy.unwrap();
+    mapper.set_forbidden_zones(path.clone()).await.unwrap();
+    let mut maps = mapper.map_rx();
+    maps.borrow_and_update();
+
+    let modified = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let zone = r#"{"zones":[{"id":"左格","shape":"rectangle","mode":"inside","vertices":[{"x":0.2,"y":0.2},{"x":0.4,"y":0.4}]}]}"#;
+    let clear = r#"{"zones":[]}"#;
+    assert_ne!(zone.len(), clear.len());
+    for (document, expected) in [(zone, vec![100, 0]), (clear, raw.data.clone())] {
+        // 固定相同修改时间，强制第二次检查只能用长度变化触发重读。
+        let replacement = directory.0.join("写入中");
+        std::fs::write(&replacement, document).unwrap();
+        std::fs::File::open(&replacement)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), maps.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        assert_eq!(maps.borrow_and_update().as_ref().unwrap().data, expected);
+    }
+    mapper.shutdown().await.unwrap();
 }

@@ -49,9 +49,9 @@ pub const TF_MESSAGE_FINGERPRINT: [u8; 8] = 0xc2b8_a1c3_3a89_23ec_u64.to_be_byte
 /// `geometry_msgs.Transform` fingerprint generated from the repository IDL.
 pub const GEOMETRY_TRANSFORM_FINGERPRINT: [u8; 8] = 0xee5f_f426_47bf_3f91_u64.to_be_bytes();
 /// `nuwax_msgs.NavigationStatus` generated-C fingerprint.
-pub const NAVIGATION_STATUS_FINGERPRINT: [u8; 8] = 0xcf4636092c4c0e30_u64.to_be_bytes();
+pub const NAVIGATION_STATUS_FINGERPRINT: [u8; 8] = 0x4128967fd2824d95_u64.to_be_bytes();
 /// `nuwax_msgs.CancelNavigation` generated-C fingerprint.
-pub const CANCEL_NAVIGATION_FINGERPRINT: [u8; 8] = 0x9704_4b28_e9c5_dd22_u64.to_be_bytes();
+pub const CANCEL_NAVIGATION_FINGERPRINT: [u8; 8] = 0xafbbc90f61b52506_u64.to_be_bytes();
 /// `nuwax_msgs.Frontier` generated-C fingerprint.
 pub const FRONTIER_FINGERPRINT: [u8; 8] = 0x1abf_83ea_0ced_9c44_u64.to_be_bytes();
 /// `nuwax_msgs.FrontierList` generated-C recursive fingerprint.
@@ -322,20 +322,8 @@ pub struct NavigationStatus {
     pub planner_map_frame: String,
     /// Planner pose frame.
     pub planner_pose_frame: String,
-    /// Monotonic cancellation generation.
-    pub cancel_generation: i64,
-    /// Motion guard zero acknowledgement identifier.
-    pub zero_ack_id: String,
-    /// Monotonic timestamp at which zero velocity was applied.
-    pub zero_applied_monotonic_ns: i64,
-    /// Lease owner kind associated with this state.
-    pub owner_kind: i32,
-    /// Parent request associated with this state.
-    pub parent_request_id: String,
     /// Goal generation associated with this state.
-    pub goal_generation: i64,
-    /// Geometry runtime generation of the actual goal.
-    pub producer_runtime_generation: i64,
+    pub motion_generation: i64,
     /// Latest accepted planner runtime generation; zero when no path is accepted.
     pub planner_runtime_generation: i64,
     /// Latest accepted path revision; zero when no path is accepted.
@@ -345,28 +333,6 @@ pub struct NavigationStatus {
 
 }
 
-impl NavigationStatus {
-    /// The reported goal, or no goal for an empty heartbeat.
-    pub fn goal_key(&self) -> Option<GoalKey> {
-        (self.producer_runtime_generation > 0 && self.goal_generation > 0).then_some(GoalKey {
-            producer_runtime_generation: self.producer_runtime_generation as u64,
-            goal_generation: self.goal_generation as u64,
-        })
-    }
-
-    /// The reported accepted path; absent before a path has been accepted.
-    pub fn path_key(&self) -> Option<PathKey> {
-        if self.planner_runtime_generation <= 0 || self.path_revision <= 0 {
-            return None;
-        }
-        Some(PathKey {
-            goal: self.goal_key()?,
-            planner_runtime_generation: self.planner_runtime_generation as u64,
-            path_revision: self.path_revision as u64,
-        })
-    }
-}
-
 /// Repository-native navigation cancellation bridge message.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CancelNavigation {
@@ -374,16 +340,6 @@ pub struct CancelNavigation {
     pub session_id: String,
     /// Native cancellation reason enum value.
     pub reason: i32,
-    /// Monotonic cancellation generation.
-    pub cancel_generation: i64,
-    /// Lease owner kind of the goal being cancelled.
-    pub owner_kind: i32,
-    /// Parent request that owns the goal being cancelled.
-    pub parent_request_id: String,
-    /// Goal generation being cancelled.
-    pub goal_generation: i64,
-    /// Geometry producer generation that sealed the cancelled goal.
-    pub producer_runtime_generation: i64,
 }
 
 /// Repository-native frontier candidate bridge message.
@@ -1873,14 +1829,8 @@ pub fn encode_navigation_status_body(message: &NavigationStatus) -> CodecResult<
     out.push(message.sink_ready as u8);
     encode_string(&message.planner_map_frame, &mut out)?;
     encode_string(&message.planner_pose_frame, &mut out)?;
-    out.extend_from_slice(&message.cancel_generation.to_be_bytes());
-    encode_string(&message.zero_ack_id, &mut out)?;
-    out.extend_from_slice(&message.zero_applied_monotonic_ns.to_be_bytes());
-    out.extend_from_slice(&message.owner_kind.to_be_bytes());
-    encode_string(&message.parent_request_id, &mut out)?;
-    out.extend_from_slice(&message.goal_generation.to_be_bytes());
+    out.extend_from_slice(&message.motion_generation.to_be_bytes());
     out.extend_from_slice(&message.path_revision.to_be_bytes());
-    out.extend_from_slice(&message.producer_runtime_generation.to_be_bytes());
     out.extend_from_slice(&message.planner_runtime_generation.to_be_bytes());
     if message.local_path.len() > 65536 || message.local_path.iter().flatten().any(|v| !v.is_finite()) {
         return Err(CodecError::LcmEncode("局部路线点数越界或坐标非法".into()));
@@ -1930,14 +1880,8 @@ fn decode_navigation_status_from(cursor: &mut Cursor<'_>) -> CodecResult<Navigat
         sink_ready: cursor.read_u8()? as i8,
         planner_map_frame: cursor.read_string()?,
         planner_pose_frame: cursor.read_string()?,
-        cancel_generation: cursor.read_i64()?,
-        zero_ack_id: cursor.read_string()?,
-        zero_applied_monotonic_ns: cursor.read_i64()?,
-        owner_kind: cursor.read_i32()?,
-        parent_request_id: cursor.read_string()?,
-        goal_generation: cursor.read_i64()?,
+        motion_generation: cursor.read_i64()?,
         path_revision: cursor.read_i64()?,
-        producer_runtime_generation: cursor.read_i64()?,
         planner_runtime_generation: cursor.read_i64()?,
         local_path: {
             let count = cursor.read_nonnegative_len("local_path_count")?;
@@ -1968,11 +1912,6 @@ pub fn encode_cancel_navigation_body(message: &CancelNavigation) -> CodecResult<
     let mut out = Vec::new();
     encode_string(&message.session_id, &mut out)?;
     out.extend_from_slice(&message.reason.to_be_bytes());
-    out.extend_from_slice(&message.cancel_generation.to_be_bytes());
-    out.extend_from_slice(&message.owner_kind.to_be_bytes());
-    encode_string(&message.parent_request_id, &mut out)?;
-    out.extend_from_slice(&message.goal_generation.to_be_bytes());
-    out.extend_from_slice(&message.producer_runtime_generation.to_be_bytes());
     Ok(out)
 }
 
@@ -1997,11 +1936,6 @@ fn decode_cancel_navigation_from(cursor: &mut Cursor<'_>) -> CodecResult<CancelN
     Ok(CancelNavigation {
         session_id: cursor.read_string()?,
         reason: cursor.read_i32()?,
-        cancel_generation: cursor.read_i64()?,
-        owner_kind: cursor.read_i32()?,
-        parent_request_id: cursor.read_string()?,
-        goal_generation: cursor.read_i64()?,
-        producer_runtime_generation: cursor.read_i64()?,
     })
 }
 
@@ -3239,7 +3173,7 @@ int main(int argc, char **argv) {
         }
         if (!strcmp(argv[3], "NavigationStatus")) {
             ROUNDTRIP(nuwax_msgs_NavigationStatus, message.runtime_generation == 99 &&
-                message.producer_runtime_generation == 0 && message.goal_generation == 4 &&
+                message.motion_generation == 4 &&
                 message.planner_runtime_generation == 8 && message.path_revision == 1 &&
                 message.local_path_count == 1 && message.goal_status == 3 &&
                 !strcmp(message.reason, "route ready") && message.remaining_distance_m == 4.75 &&
@@ -3295,8 +3229,8 @@ int main(int argc, char **argv) {
         let goal = super::tests::configured_frame_goal("robot/map");
         let path = super::tests::configured_frame_path(&goal, "robot/map");
         let state = NavigationStatus {
-            session_id: goal.session_id.clone(), owner_kind: NAVIGATION_OWNER_KIND_PUBLIC_NAV,
-            goal_generation: goal.motion_generation as i64,
+            session_id: goal.session_id.clone(),
+            motion_generation: goal.motion_generation as i64,
             planner_runtime_generation: path.planner_runtime_generation, path_revision: path.path_revision,
             runtime_generation: 99, local_path: vec![[1.0, 2.0, 0.4]],
             goal_status: NAVIGATION_GOAL_STATUS_EXECUTING, reason: "route ready".into(),
@@ -3332,7 +3266,7 @@ elif name == "PathEnvelope":
     assert message.motion_generation == 4
     assert message.planner_runtime_generation == 8 and message.path_revision == 1
 else:
-    assert message.goal_generation == 4 and message.producer_runtime_generation == 0
+    assert message.motion_generation == 4
     assert message.runtime_generation == 99 and message.local_path_count == 1
     assert message.goal_status == 3 and message.reason == "route ready"
     assert message.remaining_distance_m == 4.75 and message.input_ready and message.no_feasible_path
@@ -3954,24 +3888,18 @@ sys.stdout.buffer.write(message.encode())
     }
 
     #[test]
-    fn navigation_status_projects_actual_goal_and_path_domains() {
+    fn navigation_status_roundtrips_motion_generation_and_path_revision() {
         let mut state = NavigationStatus::default();
-        assert_eq!(state.goal_key(), None);
-        assert_eq!(state.path_key(), None);
-        // Backend diagnostics can have a named session without an assigned goal.
         state.session_id = "mls-backend".into();
-        assert_eq!(decode_navigation_status(&encode_navigation_status(&state).unwrap()).unwrap(), state);
-        assert_eq!(state.goal_key(), None);
-        state.goal_generation = 2;
-        state.producer_runtime_generation = 7;
         state.runtime_generation = 99;
-        let goal = GoalKey { producer_runtime_generation: 7, goal_generation: 2 };
-        assert_eq!(state.goal_key(), Some(goal));
-        assert_eq!(state.path_key(), None);
         state.planner_runtime_generation = 8;
         state.path_revision = 1;
-        assert_eq!(state.path_key(), Some(PathKey { goal, planner_runtime_generation: 8, path_revision: 1 }));
-        assert_eq!(decode_navigation_status(&encode_navigation_status(&state).unwrap()).unwrap(), state);
+        for generation in [0, 2, u64::MAX] {
+            state.motion_generation = generation as i64;
+            let decoded = decode_navigation_status(&encode_navigation_status(&state).unwrap()).unwrap();
+            assert_eq!(decoded, state);
+            assert_eq!(decoded.motion_generation as u64, generation);
+        }
     }
 
     #[test]
@@ -4026,14 +3954,8 @@ sys.stdout.buffer.write(message.encode())
             sink_ready: 1,
             planner_map_frame: "map".into(),
             planner_pose_frame: "map".into(),
-            cancel_generation: 3,
-            zero_ack_id: "zero-3".into(),
-            zero_applied_monotonic_ns: 987_654_321,
-            owner_kind: NAVIGATION_OWNER_KIND_PUBLIC_NAV,
-            parent_request_id: "request-1".into(),
-            goal_generation: 5,
+            motion_generation: 5,
             path_revision: 2,
-            producer_runtime_generation: 9,
             planner_runtime_generation: 13,
             local_path: vec![[0.5, 1.0, 0.4], [1.0, 2.0, 0.6]],
         };
@@ -4066,11 +3988,6 @@ sys.stdout.buffer.write(message.encode())
         let cancel = CancelNavigation {
             session_id: "session-1".into(),
             reason: 2,
-            cancel_generation: 3,
-            owner_kind: NAVIGATION_OWNER_KIND_PUBLIC_NAV,
-            parent_request_id: "request-1".into(),
-            goal_generation: 5,
-            producer_runtime_generation: 9,
         };
         let encoded = encode_cancel_navigation(&cancel).unwrap();
         assert_eq!(&encoded[..8], &CANCEL_NAVIGATION_FINGERPRINT);
@@ -4099,26 +4016,24 @@ sys.stdout.buffer.write(message.encode())
     }
 
     #[test]
-    fn legacy_cancel_body_is_a_deterministic_truncation_not_a_valid_additive_message() {
+    fn cancel_body_rejects_truncated_reason_and_retired_tail() {
         let cancel = CancelNavigation {
             session_id: "session-legacy".into(),
             reason: 2,
-            cancel_generation: 3,
-            owner_kind: NAVIGATION_OWNER_KIND_PUBLIC_NAV,
-            parent_request_id: "request-legacy".into(),
-            goal_generation: 5,
-            producer_runtime_generation: 9,
         };
         let encoded = encode_cancel_navigation_body(&cancel).expect("encode current cancellation");
-        assert_eq!(&encoded[encoded.len() - 8..], &9_i64.to_be_bytes());
-        let legacy = &encoded[..encoded.len() - 8];
+        assert_eq!(&encoded[encoded.len() - 4..], &2_i32.to_be_bytes());
+        let legacy = &encoded[..encoded.len() - 4];
         let first = decode_cancel_navigation_body(legacy)
-            .expect_err("legacy body lacks producer generation")
+            .expect_err("current cancellation lacks reason")
             .to_string();
         let second = decode_cancel_navigation_body(legacy)
             .expect_err("legacy body remains deterministically invalid")
             .to_string();
         assert_eq!(first, second);
+        let mut retired = encoded;
+        retired.extend_from_slice(&9_i64.to_be_bytes());
+        assert!(decode_cancel_navigation_body(&retired).is_err());
     }
 
     #[test]

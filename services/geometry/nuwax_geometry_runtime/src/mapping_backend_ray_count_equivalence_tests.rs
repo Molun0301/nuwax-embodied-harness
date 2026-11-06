@@ -64,7 +64,6 @@ fn candidate_snapshot(candidate: &MappingBackendCandidate) -> Value {
         "latest": grid_snapshot(&candidate.latest_frame_occupancy),
         "accepted_xyz_bits": candidate.accepted_points_map.iter()
             .map(|p| [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()]).collect::<Vec<_>>(),
-        // compute_elapsed_us 是唯一被排除的候选字段。
     })
 }
 

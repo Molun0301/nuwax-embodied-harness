@@ -9,27 +9,17 @@ import struct
 
 class CancelNavigation(object):
 
-    __slots__ = ["session_id", "reason", "cancel_generation", "owner_kind", "parent_request_id", "goal_generation", "producer_runtime_generation"]
+    __slots__ = ["session_id", "reason"]
 
-    __typenames__ = ["string", "int32_t", "int64_t", "int32_t", "string", "int64_t", "int64_t"]
+    __typenames__ = ["string", "int32_t"]
 
-    __dimensions__ = [None, None, None, None, None, None, None]
+    __dimensions__ = [None, None]
 
     def __init__(self):
         self.session_id = ""
         """ LCM Type: string """
         self.reason = 0
         """ LCM Type: int32_t """
-        self.cancel_generation = 0
-        """ LCM Type: int64_t """
-        self.owner_kind = 0
-        """ LCM Type: int32_t """
-        self.parent_request_id = ""
-        """ LCM Type: string """
-        self.goal_generation = 0
-        """ LCM Type: int64_t """
-        self.producer_runtime_generation = 0
-        """ LCM Type: int64_t """
 
     def encode(self):
         buf = BytesIO()
@@ -42,12 +32,7 @@ class CancelNavigation(object):
         buf.write(struct.pack('>I', len(__session_id_encoded)+1))
         buf.write(__session_id_encoded)
         buf.write(b"\0")
-        buf.write(struct.pack(">iqi", self.reason, self.cancel_generation, self.owner_kind))
-        __parent_request_id_encoded = self.parent_request_id.encode('utf-8')
-        buf.write(struct.pack('>I', len(__parent_request_id_encoded)+1))
-        buf.write(__parent_request_id_encoded)
-        buf.write(b"\0")
-        buf.write(struct.pack(">qq", self.goal_generation, self.producer_runtime_generation))
+        buf.write(struct.pack(">i", self.reason))
 
     @staticmethod
     def decode(data: bytes):
@@ -64,16 +49,13 @@ class CancelNavigation(object):
         self = CancelNavigation()
         __session_id_len = struct.unpack('>I', buf.read(4))[0]
         self.session_id = buf.read(__session_id_len)[:-1].decode('utf-8', 'replace')
-        self.reason, self.cancel_generation, self.owner_kind = struct.unpack(">iqi", buf.read(16))
-        __parent_request_id_len = struct.unpack('>I', buf.read(4))[0]
-        self.parent_request_id = buf.read(__parent_request_id_len)[:-1].decode('utf-8', 'replace')
-        self.goal_generation, self.producer_runtime_generation = struct.unpack(">qq", buf.read(16))
+        self.reason = struct.unpack(">i", buf.read(4))[0]
         return self
 
     @staticmethod
     def _get_hash_recursive(parents):
         if CancelNavigation in parents: return 0
-        tmphash = (0x4b82259474e2ee91) & 0xffffffffffffffff
+        tmphash = (0x57dde487b0da9283) & 0xffffffffffffffff
         tmphash  = (((tmphash<<1)&0xffffffffffffffff) + (tmphash>>63)) & 0xffffffffffffffff
         return tmphash
     _packed_fingerprint = None

@@ -348,7 +348,7 @@ pub enum RuntimeError {
     /// Motion port failure. The result may be ambiguous.
     #[error("motion guard operation failed: {0}")]
     Motion(String),
-    /// 守卫明确没有授予本目标租约；该目标可以失败并释放尚未执行的责任。
+    /// 本目标没有取得租约；保留守卫拒绝或传输失败的原因。
     #[error("{0}")]
     LeaseNotGranted(String),
     /// Planner reported a terminal failure.
@@ -1258,13 +1258,20 @@ where
         validate_session(&session)?;
         let replacing = self.session.is_some();
         if let Err(error) = self.motion.acquire(session.motion_generation).await {
-            if error.code.is_none() {
-                self.status.motion_sink_ready=false;
-                return Err(self.fail_closed(status_tx,RuntimeError::Motion(error.message)).await);
+            let stopped = error.code == Some(ErrorCode::StaleGeneration);
+            if error.code.is_none() || error.code == Some(ErrorCode::NotReady) {
+                self.status.motion_sink_ready = false;
             }
             self.status.message = error.message.clone();
-            self.finish_terminal(status_tx, TerminalOutcome::Stopped, SchedulerPhase::Idle).await?;
-            return Err(RuntimeError::LeaseNotGranted(error.message));
+            let release = self.finish_terminal(
+                status_tx,
+                if stopped { TerminalOutcome::Stopped } else { TerminalOutcome::SafetyFailed },
+                if stopped { SchedulerPhase::Idle } else { SchedulerPhase::Failed },
+            ).await;
+            return Err(RuntimeError::LeaseNotGranted(match release {
+                Ok(()) => error.message,
+                Err(release) => format!("{}; {release}", error.message),
+            }));
         }
         self.lease_active = true;
         if !replacing {
@@ -1810,15 +1817,17 @@ where
             let _qualification_span = self.qualification_span("scheduler.finish_terminal.planner_stop", self.status.pose_source_timestamp_ns);
             self.planner.stop();
         }
-        if self.lease_active {
-            if let Err(error) = self.motion.release().await {
-                self.fail_status(status_tx, &error.message);
-                return Err(RuntimeError::Motion(error.message));
-            }
+        let release_error = if self.lease_active {
             self.lease_active = false;
-            self.planner.observe_applied_command(Twist2::ZERO);
-            self.status.last_applied_twist = Some(Twist2::ZERO);
-        }
+            match self.motion.release().await {
+                Ok(()) => {
+                    self.planner.observe_applied_command(Twist2::ZERO);
+                    self.status.last_applied_twist = Some(Twist2::ZERO);
+                    None
+                }
+                Err(error) => Some(error.message),
+            }
+        } else { None };
 
         {
             #[cfg(feature = "surface-recovery-qualification")]
@@ -1832,10 +1841,16 @@ where
         self.current_execution_identity = None;
 
         self.path_wait_started_at = None;
-        self.status.phase = phase_after;
+        self.status.phase = if release_error.is_some() { SchedulerPhase::Failed } else { phase_after };
         self.status.session_id = None;
         self.status.path_revision = 0;
-        self.status.last_terminal = Some(terminal);
+        self.status.last_terminal = Some(if release_error.is_some() { TerminalOutcome::SafetyFailed } else { terminal });
+        if let Some(error) = release_error {
+            self.status.motion_sink_ready = false;
+            self.status.message = format!("{}; 释放租约失败：{error}", failure_reason.unwrap_or_else(|| format!("{terminal:?}收尾")));
+            self.publish_status(status_tx);
+            return Err(RuntimeError::Motion(error));
+        }
         self.status.message = if terminal == TerminalOutcome::Stopped {
             "已被停止".into()
         } else { format!("{terminal:?}，租约已释放") };
@@ -1847,15 +1862,6 @@ where
         }
         self.publish_status(status_tx);
         Ok(())
-    }
-
-    fn fail_status(&mut self, status_tx: &watch::Sender<SchedulerStatus>, reason: &str) {
-        self.status.surface_replan_feedback = None;
-        self.status.phase = SchedulerPhase::Failed;
-        self.status.motion_sink_ready = false;
-        self.status.last_terminal = None;
-        self.status.message = reason.to_string();
-        self.publish_status(status_tx);
     }
 
     fn publish_status(&self, status_tx: &watch::Sender<SchedulerStatus>) {

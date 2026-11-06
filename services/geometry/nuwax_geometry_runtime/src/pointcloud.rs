@@ -21,14 +21,12 @@ mod dynamic_cloud;
 mod fine_cloud;
 #[path = "paged_voxel_snapshot.rs"]
 mod paged_voxel_snapshot;
-#[path = "voxel_index.rs"]
-mod voxel_index;
 use fine_cloud::FineCloud;
 pub(crate) use fine_cloud::{
     configure_fine_cloud_cache, configured_writer_cache, parse_fine_cloud_cache,
 };
 use paged_voxel_snapshot::{PagedVoxelSnapshot, CHUNK_POINTS};
-use voxel_index::VoxelIndex;
+
 pub const VOXEL_SIZE: f32 = 0.05;
 pub const POINTCLOUD_MAX_FRAME_POINTS: usize = 100_000;
 pub const POINTCLOUD_MAX_POINT_STEP_BYTES: u32 = 256;
@@ -40,6 +38,7 @@ const CM_CHUNKS: usize = CM_MAX_POINTS.div_ceil(CHUNK_POINTS);
 const CM_PAYLOAD: usize = (CM_HEADER + CM_CHUNKS * 8).div_ceil(4096) * 4096;
 const CM_TOTAL: usize = CM_PAYLOAD + CM_MAX_POINTS * 12;
 type VoxelKey = (i32, i32, i32);
+type VoxelIndex = ahash::AHashSet<VoxelKey>;
 #[derive(Clone, Default)]
 pub(crate) struct CloudSnapshot {
     pub fine: Option<Arc<nuwax_map_chunks::SealedMap>>,

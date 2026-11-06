@@ -46,7 +46,7 @@ impl NavBridge {
     }
 
     #[cfg(test)]
-    async fn with_transport(
+    pub(crate) async fn with_transport(
         transport: LcmTransport,
         status_tx: mpsc::UnboundedSender<proto::NavigationStatus>,
     ) -> Result<Self, String> {

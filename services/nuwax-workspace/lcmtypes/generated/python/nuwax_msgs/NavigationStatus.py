@@ -7,13 +7,13 @@ DO NOT MODIFY BY HAND!!!!
 from io import BytesIO
 import struct
 
-class NavigationState(object):
+class NavigationStatus(object):
 
-    __slots__ = ["session_id", "robot_frame", "stamp_sec", "stamp_nsec", "state", "goal_x", "goal_y", "goal_yaw", "current_x", "current_y", "current_yaw", "progress", "message", "runtime_generation", "pose_source_timestamp_ns", "costmap_source_timestamp_ns", "sink_ready", "planner_map_frame", "planner_pose_frame", "cancel_generation", "zero_ack_id", "zero_applied_monotonic_ns", "owner_kind", "parent_request_id", "goal_generation", "path_revision", "producer_runtime_generation", "planner_runtime_generation", "local_path_count", "local_path"]
+    __slots__ = ["session_id", "robot_frame", "stamp_sec", "stamp_nsec", "state", "goal_status", "reason", "remaining_distance_m", "input_ready", "no_feasible_path", "goal_x", "goal_y", "goal_yaw", "current_x", "current_y", "current_yaw", "progress", "message", "runtime_generation", "pose_source_timestamp_ns", "costmap_source_timestamp_ns", "sink_ready", "planner_map_frame", "planner_pose_frame", "motion_generation", "path_revision", "planner_runtime_generation", "local_path_count", "local_path"]
 
-    __typenames__ = ["string", "string", "int64_t", "int32_t", "int32_t", "double", "double", "double", "double", "double", "double", "double", "string", "int64_t", "int64_t", "int64_t", "int8_t", "string", "string", "int64_t", "string", "int64_t", "int32_t", "string", "int64_t", "int64_t", "int64_t", "int64_t", "int32_t", "double"]
+    __typenames__ = ["string", "string", "int64_t", "int32_t", "int32_t", "int32_t", "string", "double", "boolean", "boolean", "double", "double", "double", "double", "double", "double", "double", "string", "int64_t", "int64_t", "int64_t", "int8_t", "string", "string", "int64_t", "int64_t", "int64_t", "int32_t", "double"]
 
-    __dimensions__ = [None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, ["local_path_count", 3]]
+    __dimensions__ = [None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, ["local_path_count", 3]]
 
     def __init__(self):
         self.session_id = ""
@@ -26,6 +26,20 @@ class NavigationState(object):
         """ LCM Type: int32_t """
         self.state = 0
         """ LCM Type: int32_t """
+        self.goal_status = 0
+        """
+        Geometry目标状态：0无目标、1等待输入、2规划、3执行、4到达、5失败、6取消、7被替换、8停止。
+        LCM Type: int32_t
+        """
+
+        self.reason = ""
+        """ LCM Type: string """
+        self.remaining_distance_m = 0.0
+        """ LCM Type: double """
+        self.input_ready = False
+        """ LCM Type: boolean """
+        self.no_feasible_path = False
+        """ LCM Type: boolean """
         self.goal_x = 0.0
         """ LCM Type: double """
         self.goal_y = 0.0
@@ -54,21 +68,9 @@ class NavigationState(object):
         """ LCM Type: string """
         self.planner_pose_frame = ""
         """ LCM Type: string """
-        self.cancel_generation = 0
-        """ LCM Type: int64_t """
-        self.zero_ack_id = ""
-        """ LCM Type: string """
-        self.zero_applied_monotonic_ns = 0
-        """ LCM Type: int64_t """
-        self.owner_kind = 0
-        """ LCM Type: int32_t """
-        self.parent_request_id = ""
-        """ LCM Type: string """
-        self.goal_generation = 0
+        self.motion_generation = 0
         """ LCM Type: int64_t """
         self.path_revision = 0
-        """ LCM Type: int64_t """
-        self.producer_runtime_generation = 0
         """ LCM Type: int64_t """
         self.planner_runtime_generation = 0
         """ LCM Type: int64_t """
@@ -83,7 +85,7 @@ class NavigationState(object):
 
     def encode(self):
         buf = BytesIO()
-        buf.write(NavigationState._get_packed_fingerprint())
+        buf.write(NavigationStatus._get_packed_fingerprint())
         self._encode_one(buf)
         return buf.getvalue()
 
@@ -96,7 +98,12 @@ class NavigationState(object):
         buf.write(struct.pack('>I', len(__robot_frame_encoded)+1))
         buf.write(__robot_frame_encoded)
         buf.write(b"\0")
-        buf.write(struct.pack(">qiiddddddd", self.stamp_sec, self.stamp_nsec, self.state, self.goal_x, self.goal_y, self.goal_yaw, self.current_x, self.current_y, self.current_yaw, self.progress))
+        buf.write(struct.pack(">qiii", self.stamp_sec, self.stamp_nsec, self.state, self.goal_status))
+        __reason_encoded = self.reason.encode('utf-8')
+        buf.write(struct.pack('>I', len(__reason_encoded)+1))
+        buf.write(__reason_encoded)
+        buf.write(b"\0")
+        buf.write(struct.pack(">dbbddddddd", self.remaining_distance_m, self.input_ready, self.no_feasible_path, self.goal_x, self.goal_y, self.goal_yaw, self.current_x, self.current_y, self.current_yaw, self.progress))
         __message_encoded = self.message.encode('utf-8')
         buf.write(struct.pack('>I', len(__message_encoded)+1))
         buf.write(__message_encoded)
@@ -110,17 +117,7 @@ class NavigationState(object):
         buf.write(struct.pack('>I', len(__planner_pose_frame_encoded)+1))
         buf.write(__planner_pose_frame_encoded)
         buf.write(b"\0")
-        buf.write(struct.pack(">q", self.cancel_generation))
-        __zero_ack_id_encoded = self.zero_ack_id.encode('utf-8')
-        buf.write(struct.pack('>I', len(__zero_ack_id_encoded)+1))
-        buf.write(__zero_ack_id_encoded)
-        buf.write(b"\0")
-        buf.write(struct.pack(">qi", self.zero_applied_monotonic_ns, self.owner_kind))
-        __parent_request_id_encoded = self.parent_request_id.encode('utf-8')
-        buf.write(struct.pack('>I', len(__parent_request_id_encoded)+1))
-        buf.write(__parent_request_id_encoded)
-        buf.write(b"\0")
-        buf.write(struct.pack(">qqqqi", self.goal_generation, self.path_revision, self.producer_runtime_generation, self.planner_runtime_generation, self.local_path_count))
+        buf.write(struct.pack(">qqqi", self.motion_generation, self.path_revision, self.planner_runtime_generation, self.local_path_count))
         for i0 in range(self.local_path_count):
             buf.write(struct.pack('>3d', *self.local_path[i0][:3]))
 
@@ -130,18 +127,24 @@ class NavigationState(object):
             buf = data
         else:
             buf = BytesIO(data)
-        if buf.read(8) != NavigationState._get_packed_fingerprint():
+        if buf.read(8) != NavigationStatus._get_packed_fingerprint():
             raise ValueError("Decode error")
-        return NavigationState._decode_one(buf)
+        return NavigationStatus._decode_one(buf)
 
     @staticmethod
     def _decode_one(buf):
-        self = NavigationState()
+        self = NavigationStatus()
         __session_id_len = struct.unpack('>I', buf.read(4))[0]
         self.session_id = buf.read(__session_id_len)[:-1].decode('utf-8', 'replace')
         __robot_frame_len = struct.unpack('>I', buf.read(4))[0]
         self.robot_frame = buf.read(__robot_frame_len)[:-1].decode('utf-8', 'replace')
-        self.stamp_sec, self.stamp_nsec, self.state, self.goal_x, self.goal_y, self.goal_yaw, self.current_x, self.current_y, self.current_yaw, self.progress = struct.unpack(">qiiddddddd", buf.read(72))
+        self.stamp_sec, self.stamp_nsec, self.state, self.goal_status = struct.unpack(">qiii", buf.read(20))
+        __reason_len = struct.unpack('>I', buf.read(4))[0]
+        self.reason = buf.read(__reason_len)[:-1].decode('utf-8', 'replace')
+        self.remaining_distance_m = struct.unpack(">d", buf.read(8))[0]
+        self.input_ready = bool(struct.unpack('b', buf.read(1))[0])
+        self.no_feasible_path = bool(struct.unpack('b', buf.read(1))[0])
+        self.goal_x, self.goal_y, self.goal_yaw, self.current_x, self.current_y, self.current_yaw, self.progress = struct.unpack(">ddddddd", buf.read(56))
         __message_len = struct.unpack('>I', buf.read(4))[0]
         self.message = buf.read(__message_len)[:-1].decode('utf-8', 'replace')
         self.runtime_generation, self.pose_source_timestamp_ns, self.costmap_source_timestamp_ns, self.sink_ready = struct.unpack(">qqqb", buf.read(25))
@@ -149,13 +152,7 @@ class NavigationState(object):
         self.planner_map_frame = buf.read(__planner_map_frame_len)[:-1].decode('utf-8', 'replace')
         __planner_pose_frame_len = struct.unpack('>I', buf.read(4))[0]
         self.planner_pose_frame = buf.read(__planner_pose_frame_len)[:-1].decode('utf-8', 'replace')
-        self.cancel_generation = struct.unpack(">q", buf.read(8))[0]
-        __zero_ack_id_len = struct.unpack('>I', buf.read(4))[0]
-        self.zero_ack_id = buf.read(__zero_ack_id_len)[:-1].decode('utf-8', 'replace')
-        self.zero_applied_monotonic_ns, self.owner_kind = struct.unpack(">qi", buf.read(12))
-        __parent_request_id_len = struct.unpack('>I', buf.read(4))[0]
-        self.parent_request_id = buf.read(__parent_request_id_len)[:-1].decode('utf-8', 'replace')
-        self.goal_generation, self.path_revision, self.producer_runtime_generation, self.planner_runtime_generation, self.local_path_count = struct.unpack(">qqqqi", buf.read(36))
+        self.motion_generation, self.path_revision, self.planner_runtime_generation, self.local_path_count = struct.unpack(">qqqi", buf.read(28))
         self.local_path = []
         for i0 in range(self.local_path_count):
             self.local_path.append(struct.unpack('>3d', buf.read(24)))
@@ -163,19 +160,18 @@ class NavigationState(object):
 
     @staticmethod
     def _get_hash_recursive(parents):
-        if NavigationState in parents: return 0
-        tmphash = (0xcf8a350daa50d92e) & 0xffffffffffffffff
+        if NavigationStatus in parents: return 0
+        tmphash = (0xa0944b3fe94126ca) & 0xffffffffffffffff
         tmphash  = (((tmphash<<1)&0xffffffffffffffff) + (tmphash>>63)) & 0xffffffffffffffff
         return tmphash
     _packed_fingerprint = None
 
     @staticmethod
     def _get_packed_fingerprint():
-        if NavigationState._packed_fingerprint is None:
-            NavigationState._packed_fingerprint = struct.pack(">Q", NavigationState._get_hash_recursive([]))
-        return NavigationState._packed_fingerprint
+        if NavigationStatus._packed_fingerprint is None:
+            NavigationStatus._packed_fingerprint = struct.pack(">Q", NavigationStatus._get_hash_recursive([]))
+        return NavigationStatus._packed_fingerprint
 
     def get_hash(self):
         """Get the LCM hash of the struct"""
-        return struct.unpack(">Q", NavigationState._get_packed_fingerprint())[0]
-
+        return struct.unpack(">Q", NavigationStatus._get_packed_fingerprint())[0]

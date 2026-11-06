@@ -8,8 +8,8 @@
 
 #include <stdint.h>
 #include <stdlib.h>
-#include <lcm/lcm_coretypes.h>
-#include <lcm/lcm.h>
+#include "lcm/lcm_coretypes.h"
+#include "lcm/lcm.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -24,15 +24,6 @@ struct _nuwax_msgs_CancelNavigation
      */
     char*      session_id;
     int32_t    reason;
-    int64_t    cancel_generation;
-    int32_t    owner_kind;
-
-    /**
-     * LCM Type: string
-     */
-    char*      parent_request_id;
-    int64_t    goal_generation;
-    int64_t    producer_runtime_generation;
 };
 
 /**

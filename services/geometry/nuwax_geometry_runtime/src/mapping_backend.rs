@@ -9,7 +9,9 @@ use nuwax_mapping_raytracing::voxel_ray_tracer::{
     voxel_map_checkpoint_encoded_len, Config, PreparedRayUpdate, VoxelMap,
     VOXEL_MAP_CHECKPOINT_ENTRY_BYTES, VOXEL_MAP_CHECKPOINT_HEADER_BYTES,
 };
-use std::{collections::VecDeque, env, fmt::Display, mem::size_of, str::FromStr, time::Instant};
+#[cfg(test)]
+use std::time::Instant;
+use std::{collections::VecDeque, env, fmt::Display, mem::size_of, str::FromStr};
 pub(crate) const MAPPING_CANDIDATE_INTERVAL_NS: u64 = 33_333_333;
 pub(crate) const MAPPING_BACKEND_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const MAX_MAPPING_BACKEND_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
@@ -229,6 +231,7 @@ pub enum MappingBackendKind {
     Raytracing,
 }
 
+#[cfg(test)]
 impl MappingBackendKind {
     pub(crate) const fn stable_name(self) -> &'static str {
         match self {
@@ -250,13 +253,17 @@ pub(crate) struct MappingBackendInput {
 }
 #[derive(Debug)]
 pub(crate) struct MappingBackendCandidate {
-    pub source_timestamp_ns: u64,
-    pub received_at_ns: u64,
-    pub backend_kind: MappingBackendKind,
-    pub live_window_occupancy: OccupancyGrid,
     pub latest_frame_occupancy: OccupancyGrid,
+    #[cfg(test)]
+    pub source_timestamp_ns: u64,
+    #[cfg(test)]
+    pub received_at_ns: u64,
+    #[cfg(test)]
+    pub backend_kind: MappingBackendKind,
+    #[cfg(test)]
+    pub live_window_occupancy: OccupancyGrid,
+    #[cfg(test)]
     pub accepted_points_map: Vec<Point3<f64>>,
-    pub compute_elapsed_us: u64,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct MappingBackendComputeConfig {
@@ -324,14 +331,6 @@ impl MappingBackendSpec {
         }
     }
 
-    pub(crate) const fn kind(self) -> MappingBackendKind {
-        match self {
-            Self::SlamToolbox => MappingBackendKind::SlamToolbox,
-            Self::Voxel => MappingBackendKind::Voxel,
-            Self::Raytracing(_) => MappingBackendKind::Raytracing,
-        }
-    }
-
     pub(crate) fn into_kernel(self, window_capacity: usize) -> MappingKernel {
         match self {
             Self::SlamToolbox => unreachable!("二维进程不能进入点云内核"),
@@ -375,9 +374,13 @@ pub(crate) enum MappingKernel {
 #[cfg(test)]
 impl MappingKernel {
     pub(crate) const fn stable_name(&self) -> &'static str {
+        self.kind().stable_name()
+    }
+
+    const fn kind(&self) -> MappingBackendKind {
         match self {
-            Self::Voxel(_) => "voxel",
-            Self::Raytracing(_) => "raytracing",
+            Self::Voxel(_) => MappingBackendKind::Voxel,
+            Self::Raytracing(_) => MappingBackendKind::Raytracing,
         }
     }
 
@@ -1533,10 +1536,11 @@ fn compute_candidate_with_parallelism(
             parallel,
         );
     }
-    let started = Instant::now();
+    #[cfg(test)]
+    let backend_kind = kernel.kind();
     #[cfg(test)]
     let diagnostic = std::env::var_os("NEH_PGO_PHASE_DIAGNOSTIC").is_some();
-    let backend_kind = match kernel {
+    match kernel {
         MappingKernel::Voxel(voxel) => {
             voxel.retain_uncleared(input.dynamic_frame.as_ref());
             let retained = input
@@ -1552,7 +1556,6 @@ fn compute_candidate_with_parallelism(
                 .collect::<Vec<_>>();
             voxel.append_frame(&retained);
             voxel.dirty_since_candidate = true;
-            MappingBackendKind::Voxel
         }
         MappingKernel::Raytracing(ray) => {
             #[cfg(test)]
@@ -1644,11 +1647,10 @@ fn compute_candidate_with_parallelism(
             ) {
                 return Ok(None);
             }
-            MappingBackendKind::Raytracing
         }
-    };
+    }
 
-    let (live_window_occupancy, latest_frame_occupancy) = match kernel {
+    let latest_frame_occupancy = match kernel {
         MappingKernel::Voxel(voxel) => {
             let point_count = voxel.current_window.len();
             if !candidate_due(
@@ -1659,11 +1661,10 @@ fn compute_candidate_with_parallelism(
                 return Ok(None);
             }
             let latest = build_occupancy(input, config)?;
-            let result = (latest.clone(), latest);
             voxel.last_candidate_received_at_ns = input.received_at_ns;
             voxel.last_candidate_point_count = point_count;
             voxel.dirty_since_candidate = false;
-            result
+            latest
         }
         MappingKernel::Raytracing(ray) => {
             let point_count = ray.map.healthy_count();
@@ -1679,18 +1680,22 @@ fn compute_candidate_with_parallelism(
             ray.last_candidate_received_at_ns = input.received_at_ns;
             ray.last_candidate_point_count = point_count;
             ray.dirty_since_candidate = false;
-            (live.clone(), live)
+            live
         }
     };
 
     Ok(Some(MappingBackendCandidate {
+        #[cfg(test)]
         source_timestamp_ns: input.source_timestamp_ns,
+        #[cfg(test)]
         received_at_ns: input.received_at_ns,
+        #[cfg(test)]
         backend_kind,
-        live_window_occupancy,
+        #[cfg(test)]
+        live_window_occupancy: latest_frame_occupancy.clone(),
         latest_frame_occupancy,
+        #[cfg(test)]
         accepted_points_map: input.registered_points_map.clone(),
-        compute_elapsed_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
     }))
 }
 
@@ -1820,8 +1825,9 @@ pub(crate) fn flush_candidate(
     input: &MappingBackendInput,
     config: MappingBackendComputeConfig,
 ) -> Result<Option<MappingBackendCandidate>, String> {
-    let started = Instant::now();
-    let (backend_kind, live_window_occupancy, latest_frame_occupancy) = match kernel {
+    #[cfg(test)]
+    let backend_kind = kernel.kind();
+    let latest_frame_occupancy = match kernel {
         MappingKernel::Voxel(voxel) => {
             if !voxel.dirty_since_candidate {
                 return Ok(None);
@@ -1834,7 +1840,7 @@ pub(crate) fn flush_candidate(
             voxel.last_candidate_received_at_ns = input.received_at_ns;
             voxel.last_candidate_point_count = voxel.current_window.len();
             voxel.dirty_since_candidate = false;
-            (MappingBackendKind::Voxel, latest.clone(), latest)
+            latest
         }
         MappingKernel::Raytracing(ray) => {
             if !ray.dirty_since_candidate {
@@ -1845,17 +1851,21 @@ pub(crate) fn flush_candidate(
             ray.last_candidate_received_at_ns = input.received_at_ns;
             ray.last_candidate_point_count = ray.map.healthy_count();
             ray.dirty_since_candidate = false;
-            (MappingBackendKind::Raytracing, live.clone(), live)
+            live
         }
     };
     Ok(Some(MappingBackendCandidate {
+        #[cfg(test)]
         source_timestamp_ns: input.source_timestamp_ns,
+        #[cfg(test)]
         received_at_ns: input.received_at_ns,
+        #[cfg(test)]
         backend_kind,
-        live_window_occupancy,
+        #[cfg(test)]
+        live_window_occupancy: latest_frame_occupancy.clone(),
         latest_frame_occupancy,
+        #[cfg(test)]
         accepted_points_map: Vec::new(),
-        compute_elapsed_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
     }))
 }
 

@@ -43,7 +43,7 @@ pub struct FrameRouter {
     route: watch::Receiver<Option<Route>>,
     pose: watch::Sender<Option<Pose>>,
     odom: watch::Sender<Option<Pose>>,
-    faults: mpsc::UnboundedSender<(u64, String)>,
+    faults: mpsc::UnboundedSender<(u64, SessionIssue)>,
     // 近期主雷达输入归持续输入拥有方，不随地图会话替换。
     recent: Arc<parking_lot::Mutex<VecDeque<(Instant, MappingFrame)>>>,
 }
@@ -125,15 +125,24 @@ impl FrameRouter {
         let route = self.route.borrow().clone();
         if let Some(route) = route.filter(|route| route.id == session_id) {
             if let Err(reason) = route.mapper.set_map_from_odom(pose_isometry(&pose)).await {
-                let _ = self.faults.send((session_id, reason));
+                let _ = self.faults.send((session_id, SessionIssue::Fault(reason)));
             } else {
                 self.refresh_transform();
             }
         }
     }
     pub fn fault(&self, reason: String) {
-        let _ = self.faults.send((self.session_id(), reason));
+        let _ = self.faults.send((self.session_id(), SessionIssue::Fault(reason)));
     }
+    pub(crate) fn output_error(&self, session_id: u64, reason: String) {
+        tracing::warn!(%reason, "二维导航观测失败");
+        let _ = self.faults.send((session_id, SessionIssue::Output(reason)));
+    }
+}
+
+pub(crate) enum SessionIssue {
+    Fault(String),
+    Output(String),
 }
 
 #[derive(Clone)]
@@ -144,9 +153,10 @@ pub struct SessionHandle {
     pose: watch::Receiver<Option<Pose>>,
     maps: watch::Receiver<Option<MapUpdate>>,
     lio: watch::Receiver<Option<Arc<Lio>>>,
-    faults: mpsc::UnboundedSender<(u64, String)>,
+    faults: mpsc::UnboundedSender<(u64, SessionIssue)>,
 }
 const PLANAR_RESUME_UNAVAILABLE: &str = "无完整二维 SLAM 图，不能用于二维续建";
+const PLANAR_VIEW_ONLY: &str = "缺少二维定位图，只能查看";
 type Reply<T> = oneshot::Sender<Result<T, Status>>;
 enum Command {
     Start(StartMappingRequest, Reply<GeometryState>),
@@ -289,9 +299,9 @@ impl SessionHandle {
     pub(crate) fn route_rx(&self) -> watch::Receiver<Option<Route>> {
         self.route.clone()
     }
-    pub(crate) fn report_fault(&self, reason: String) {
-        let id = self.route.borrow().as_ref().map_or(0, |route| route.id);
-        let _ = self.faults.send((id, reason));
+    pub(crate) fn report_output_error(&self, id: u64, reason: String) {
+        tracing::warn!(%reason, "Geometry 旁路输出失败");
+        let _ = self.faults.send((id, SessionIssue::Output(reason)));
     }
     pub fn state(&self) -> GeometryState {
         let mut state = self.state.borrow().clone();
@@ -399,7 +409,7 @@ impl Session {
     async fn run(
         mut self,
         mut commands: mpsc::UnboundedReceiver<Command>,
-        mut faults: mpsc::UnboundedReceiver<(u64, String)>,
+        mut faults: mpsc::UnboundedReceiver<(u64, SessionIssue)>,
         mut navigation: mpsc::UnboundedReceiver<NavigationStatus>,
     ) {
         let mut tick = tokio::time::interval(Duration::from_millis(200));
@@ -423,8 +433,19 @@ impl Session {
                     Some(Command::Shutdown(reply)) => { commands.close(); let _ = self.end_current().await; let lio = self.lio.borrow().clone(); if let Some(lio) = lio { lio.shutdown().await; } self.nav.shutdown().await; let _ = reply.send(()); return; },
                     None => break,
                 },
-                Some((id, reason)) = faults.recv() => {
-                    if id == self.router.session_id() { self.fail(reason).await; self.publish(); }
+                Some((id, issue)) = faults.recv() => {
+                    if id != self.router.session_id() { continue; }
+                    match issue {
+                        SessionIssue::Fault(reason) => self.fail(reason).await,
+                        SessionIssue::Output(reason)
+                            if self.phase() != SessionPhase::Fault
+                                && !self.route.borrow().as_ref().is_some_and(|route| route.mapper.planar_view_only()) =>
+                        {
+                            self.state.reason = reason;
+                        }
+                        SessionIssue::Output(_) => {}
+                    }
+                    self.publish();
                 },
                 Some(status) = navigation.recv() => { self.navigation(status).await; self.publish(); },
                 update = async {
@@ -491,7 +512,7 @@ impl Session {
         self.state.phase = phase as i32;
         self.route.send_replace(Some(Route {
             id: mapper.session_id(),
-            accept_frames: true,
+            accept_frames: !mapper.planar_view_only(),
             mapper,
             map_pose: matches!(
                 phase,
@@ -651,21 +672,27 @@ impl Session {
         let id = self.next_session + 1;
         let mut config = self.config.clone();
         config.map_name = request.map_name.clone();
-        let mapper =
-            Mapper::prepare_load(id, config, snapshot, true).map_err(Status::unavailable)?;
-        self.recover().await?;
+        let mapper = Mapper::prepare_load(id, config, snapshot, true)?;
+        let view_only = mapper.planar_view_only();
+        if !view_only {
+            self.recover().await?;
+        }
         self.end_current().await?;
         self.next_session = id;
         self.state.map_name = request.map_name.clone();
         self.save_sources.insert(request.map_name.clone());
         self.install(mapper.clone(), SessionPhase::Loaded);
         self.subsystem(mapper.activate_shared_cloud().await).await?;
-        self.subsystem(
-            self.lio()?
-                .start_session(self.next_session, &request.map_name, checkpoint, true, seed)
-                .await,
-        )
-        .await?;
+        if view_only {
+            self.state.reason = PLANAR_VIEW_ONLY.into();
+        } else {
+            self.subsystem(
+                self.lio()?
+                    .start_session(self.next_session, &request.map_name, checkpoint, true, seed)
+                    .await,
+            )
+            .await?;
+        }
         if let Err(reason) = mapper
             .set_forbidden_zones(
                 self.store
@@ -736,6 +763,10 @@ impl Session {
         if !matches!(self.phase(), SessionPhase::Loaded | SessionPhase::Localized) {
             return Err(Status::failed_precondition("重定位要求已加载地图"));
         }
+        let mapper = self.mapper()?;
+        if mapper.planar_view_only() {
+            return Err(Status::failed_precondition(PLANAR_VIEW_ONLY));
+        }
         if matches!(
             self.config.correction_backend.as_str(),
             "library_pgo" | "native_pgo"
@@ -743,7 +774,6 @@ impl Session {
             return Err(Status::failed_precondition("PGO 配置下不能重定位"));
         }
         let planar = self.state.info.as_ref().unwrap().pipeline == "slam_2d";
-        let mapper = self.mapper()?;
         let result = if planar {
             let seed = request.seed.map(|seed| {
                 pose_from_isometry(
@@ -809,7 +839,7 @@ impl Session {
             target: goal.pose.clone(),
             ..Default::default()
         });
-        // 受理时刷新当前文件；刷新完成前目标仍被本会话持有。
+        // 当前地图的禁区缓存由地图任务按秒刷新，目标采用它发布的读取结果。
         let refreshed = mapper
             .set_forbidden_zones(
                 self.store
@@ -826,7 +856,7 @@ impl Session {
         }
         self.nav.set_input_ready(
             refreshed.is_ok()
-                && mapper.occupancy(true).is_some()
+                && mapper.has_occupancy()
                 && self.router.pose.borrow().is_some(),
         );
         Ok(SetGoalResponse { goal_id: id })
@@ -964,8 +994,9 @@ impl Session {
         };
         let refreshed = route.mapper.forbidden_status();
         self.nav.set_input_ready(
-            refreshed.is_ok()
-                && route.mapper.occupancy(true).is_some()
+            route.accept_frames
+                && refreshed.is_ok()
+                && route.mapper.has_occupancy()
                 && self.router.pose.borrow().is_some(),
         );
         if let Err(reason) = refreshed {
@@ -1103,7 +1134,7 @@ fn transform(
 async fn forward_maps(
     mut routes: watch::Receiver<Option<Route>>,
     maps: watch::Sender<Option<MapUpdate>>,
-    faults: mpsc::UnboundedSender<(u64, String)>,
+    faults: mpsc::UnboundedSender<(u64, SessionIssue)>,
     router: FrameRouter,
 ) {
     loop {
@@ -1127,7 +1158,7 @@ async fn forward_maps(
                     },
                     changed = errors.changed() => {
                         if changed.is_err() { break; }
-                        if let Some(reason) = errors.borrow_and_update().clone() { let _ = faults.send((route.id, reason)); }
+                        if let Some(reason) = errors.borrow_and_update().clone() { let _ = faults.send((route.id, SessionIssue::Fault(reason))); }
                     },
                 }
             }
@@ -1143,7 +1174,7 @@ pub(crate) fn test_router(
 ) -> (
     FrameRouter,
     watch::Receiver<Option<Pose>>,
-    mpsc::UnboundedReceiver<(u64, String)>,
+    mpsc::UnboundedReceiver<(u64, SessionIssue)>,
 ) {
     let (_, route) = watch::channel(Some(Route {
         id: mapper.session_id(),

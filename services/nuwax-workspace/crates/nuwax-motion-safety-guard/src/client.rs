@@ -46,6 +46,7 @@ pub enum MotionGuardClientError {
 
 /// 单连接上一问一答；租约由同一个导航调度器拥有。
 pub struct MotionGuardClient {
+    socket_path: PathBuf,
     stream: Option<UnixStream>,
     lease_id: Option<u64>,
     measured_motion: crate::measured_motion::MeasurementCache,
@@ -53,8 +54,10 @@ pub struct MotionGuardClient {
 impl MotionGuardClient {
     /// 连接指定守卫。
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self, MotionGuardClientError> {
-        let stream = UnixStream::connect(path).await.map_err(transport)?;
+        let socket_path = path.as_ref().to_path_buf();
+        let stream = UnixStream::connect(&socket_path).await.map_err(transport)?;
         Ok(Self {
+            socket_path,
             stream: Some(stream),
             lease_id: None,
             measured_motion: Default::default(),
@@ -78,6 +81,11 @@ impl MotionGuardClient {
         source: Source,
         generation: u64,
     ) -> Result<u64, MotionGuardClientError> {
+        if self.stream.is_none() {
+            self.lease_id = None;
+            self.measured_motion = Default::default();
+            self.stream = Some(UnixStream::connect(&self.socket_path).await.map_err(transport)?);
+        }
         match self
             .exchange(guard_request::Op::Acquire(AcquireRequest {
                 source: source as i32,

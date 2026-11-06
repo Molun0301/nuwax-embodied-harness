@@ -143,16 +143,10 @@ impl Lio {
                 self.sensor_frame.clone(),
             )
         } else if let Some(planar) = &self.planar {
-            let values = planar.template.core_config["base_from_laser"]
-                .as_array()
-                .expect("已验证二维外参");
+            let [x, y, yaw] = planar.base_from_laser;
             (
-                [
-                    values[0].as_f64().unwrap(),
-                    values[1].as_f64().unwrap(),
-                    0.0,
-                ],
-                nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, values[2].as_f64().unwrap()),
+                [x, y, 0.0],
+                nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, yaw),
                 planar.template.frame_id.clone(),
             )
         } else {

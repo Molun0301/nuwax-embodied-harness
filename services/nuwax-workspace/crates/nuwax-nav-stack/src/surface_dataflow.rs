@@ -1644,11 +1644,6 @@ goal: schema::PoseStamped {
         schema::CancelNavigation {
             session_id: goal.session_id.clone(),
             reason: 1,
-            cancel_generation: 0,
-            owner_kind: schema::NAVIGATION_OWNER_KIND_PUBLIC_NAV,
-            parent_request_id: String::new(),
-            goal_generation: goal.motion_generation as i64,
-            producer_runtime_generation: 0,
         }
     }
 
@@ -2984,8 +2979,6 @@ goal: schema::PoseStamped {
                 let frame = states.next().await.unwrap().unwrap();
                 let state = schema::decode_navigation_status_body(&frame.payload).unwrap();
                 if state_matches_goal(&state, &first) && state.state == 3 {
-                    assert!(state.zero_ack_id.is_empty());
-                    assert_eq!(state.zero_applied_monotonic_ns,0);
                     break state;
                 }
             }

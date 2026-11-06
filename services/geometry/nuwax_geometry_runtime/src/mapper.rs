@@ -11,16 +11,12 @@ use crate::{
 };
 use nalgebra::{Isometry3, Point3, Quaternion, Translation3, UnitQuaternion};
 use std::{
-    io::Read,
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::ffi::OsStrExt,
-    },
     path::PathBuf,
     sync::{mpsc, Arc},
-    time::Duration,
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::{oneshot, watch};
+use tonic::Status;
 
 #[derive(Clone, Debug)]
 pub struct MappingFrame {
@@ -129,6 +125,7 @@ pub struct MapPublication {
 #[derive(Clone)]
 pub struct Mapper {
     session_id: u64,
+    planar_view_only: bool,
     sender: mpsc::Sender<Command>,
     latest_input: Arc<parking_lot::Mutex<Option<Input>>>,
     poses: watch::Receiver<Option<proto::Pose>>,
@@ -170,7 +167,7 @@ enum Command {
 }
 impl Mapper {
     pub fn start(session_id: u64, config: MapperConfig) -> Result<Arc<Self>, String> {
-        Self::spawn(session_id, config, None, false, true)
+        Self::spawn(session_id, config, None, false, true).map_err(|error| error.message().into())
     }
     pub fn load(
         session_id: u64,
@@ -179,13 +176,14 @@ impl Mapper {
         read_only: bool,
     ) -> Result<Arc<Self>, String> {
         Self::spawn(session_id, config, Some(snapshot), read_only, true)
+            .map_err(|error| error.message().into())
     }
     pub fn prepare_load(
         session_id: u64,
         config: MapperConfig,
         snapshot: MapSnapshot,
         read_only: bool,
-    ) -> Result<Arc<Self>, String> {
+    ) -> Result<Arc<Self>, Status> {
         Self::spawn(session_id, config, Some(snapshot), read_only, false)
     }
     pub async fn activate_shared_cloud(&self) -> Result<(), String> {
@@ -201,7 +199,10 @@ impl Mapper {
         snapshot: Option<MapSnapshot>,
         read_only: bool,
         attach_shared: bool,
-    ) -> Result<Arc<Self>, String> {
+    ) -> Result<Arc<Self>, Status> {
+        let planar_view_only = snapshot
+            .as_ref()
+            .is_some_and(|saved| saved.planar_resume_unavailable_reason.is_some());
         let (sender, receiver) = mpsc::channel();
         let latest_input = Arc::new(parking_lot::Mutex::new(None::<Input>));
         let pending_input = latest_input.clone();
@@ -257,9 +258,10 @@ impl Mapper {
                     error_tx.send_replace(Some(error));
                 }
             })
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| Status::unavailable(e.to_string()))?;
         Ok(Arc::new(Self {
             session_id,
+            planar_view_only,
             sender,
             latest_input,
             poses,
@@ -306,6 +308,12 @@ impl Mapper {
     }
     pub fn error_rx(&self) -> watch::Receiver<Option<String>> {
         self.errors.clone()
+    }
+    pub fn planar_view_only(&self) -> bool {
+        self.planar_view_only
+    }
+    pub fn has_occupancy(&self) -> bool {
+        self.maps.borrow().is_some()
     }
     pub fn occupancy(&self, include_forbidden: bool) -> Option<proto::OccupancyGrid> {
         if !include_forbidden {
@@ -446,7 +454,8 @@ struct Worker {
     anchored: bool,
     base_anchor: Isometry3<f64>,
     forbidden_zones: Vec<crate::forbidden_zones::ForbiddenZone>,
-    forbidden_watch: Option<ForbiddenWatch>,
+    forbidden_metadata: Option<(SystemTime, u64)>,
+    forbidden_checked_at: Instant,
     forbidden_status: watch::Sender<Result<(), String>>,
     recent_cloud: watch::Sender<Option<Vec<u8>>>,
     last_input: Option<MappingBackendInput>,
@@ -469,7 +478,7 @@ impl Worker {
         raw_grid: watch::Sender<Option<proto::OccupancyGrid>>,
         forbidden_status: watch::Sender<Result<(), String>>,
         attach_shared: bool,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, Status> {
         let kernel = if config.backend == MappingBackendSpec::SlamToolbox {
             None
         } else {
@@ -482,7 +491,8 @@ impl Worker {
                         config.backend,
                         config.compute,
                         &snapshot.backend_checkpoint,
-                    )?
+                    )
+                    .map_err(Status::failed_precondition)?
                 } else {
                     config.backend.into_kernel(config.compute.window_capacity)
                 },
@@ -495,7 +505,8 @@ impl Worker {
                 .as_deref()
                 .filter(|_| attach_shared),
             snapshot.as_ref().map(|s| s.cloud.clone()),
-        )?;
+        )
+        .map_err(Status::unavailable)?;
         if let Some(snapshot) = snapshot.as_ref() {
             cloud.load_history(snapshot.scans.clone(), snapshot.final_poses.clone());
         }
@@ -507,10 +518,12 @@ impl Worker {
             .as_ref()
             .and_then(|s| s.occupancy.as_ref())
             .map(proto_grid_to_kernel)
-            .transpose()?
+            .transpose()
+            .map_err(Status::unavailable)?
             .map(PersistentOccupancyGrid::from_grid)
-            .transpose()?;
-        let corrector = Corrector::new(&config.correction_backend)?;
+            .transpose()
+            .map_err(Status::unavailable)?;
+        let corrector = Corrector::new(&config.correction_backend).map_err(Status::unavailable)?;
         let mut value = Self {
             session_id,
             config,
@@ -530,7 +543,8 @@ impl Worker {
             anchored: snapshot.is_some(),
             base_anchor: map_from_odom,
             forbidden_zones: Vec::new(),
-            forbidden_watch: None,
+            forbidden_metadata: None,
+            forbidden_checked_at: Instant::now(),
             forbidden_status,
             recent_cloud,
             last_input: None,
@@ -555,7 +569,7 @@ impl Worker {
                 .map_or(0, |m| m.timestamp_ns),
         };
         value.transform.send_replace(map_from_odom);
-        value.publish_grid()?;
+        value.publish_grid().map_err(Status::unavailable)?;
         Ok(value)
     }
     fn command(&mut self, command: Command) -> Result<(), String> {
@@ -629,13 +643,13 @@ impl Worker {
                 Ok(())
             }
             Command::Forbidden(path, reply) => {
-                let result = (|| {
-                    if self.forbidden_path.as_ref() != Some(&path) {
-                        self.forbidden_watch = Some(ForbiddenWatch::new(path.clone())?);
-                        self.forbidden_path = Some(path);
-                    }
-                    self.refresh_forbidden()
-                })();
+                let result = if self.forbidden_path.as_ref() != Some(&path) {
+                    self.forbidden_path = Some(path);
+                    self.forbidden_checked_at = Instant::now();
+                    self.refresh_forbidden(true)
+                } else {
+                    self.forbidden_status.borrow().clone()
+                };
                 let _ = self.forbidden_status.send_replace(result.clone());
                 if result.is_err() {
                     self.maps.send_replace(None);
@@ -656,21 +670,37 @@ impl Worker {
         }
         Ok(())
     }
-    fn refresh_forbidden(&mut self) -> Result<(), String> {
-        self.forbidden_zones = crate::forbidden_zones::read(self.forbidden_path.as_ref().unwrap())?;
+    fn refresh_forbidden(&mut self, first_read: bool) -> Result<(), String> {
+        let path = self.forbidden_path.as_ref().unwrap();
+        let metadata = match std::fs::metadata(path) {
+            Ok(metadata) => Some((
+                metadata
+                    .modified()
+                    .map_err(|e| format!("禁行区读取失败：{e}"))?,
+                metadata.len(),
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(format!("禁行区读取失败：{error}")),
+        };
+        if !first_read
+            && metadata == self.forbidden_metadata
+            && self.forbidden_status.borrow().is_ok()
+        {
+            return Ok(());
+        }
+        self.forbidden_zones = crate::forbidden_zones::read(path)?;
+        self.forbidden_metadata = metadata;
         let _ = self.forbidden_status.send_replace(Ok(()));
         self.publish_grid()
     }
     fn poll_forbidden(&mut self) {
-        let changed = match &mut self.forbidden_watch {
-            Some(watch) => watch.changed(),
-            None => return,
-        };
-        let result = match changed {
-            Ok(false) => return,
-            Ok(true) => self.refresh_forbidden(),
-            Err(error) => Err(error),
-        };
+        if self.forbidden_path.is_none()
+            || self.forbidden_checked_at.elapsed() < Duration::from_secs(1)
+        {
+            return;
+        }
+        self.forbidden_checked_at = Instant::now();
+        let result = self.refresh_forbidden(false);
         let _ = self.forbidden_status.send_replace(result.clone());
         if result.is_err() {
             self.maps.send_replace(None);
@@ -1010,86 +1040,6 @@ pub(crate) fn proto_grid_to_kernel(
         data: grid.data.iter().map(|v| *v as i8).collect(),
     })
 }
-// 监视目录可以接住网关用临时文件改名替换禁区，以及新地图目录首次创建。
-struct ForbiddenWatch {
-    file: std::fs::File,
-    path: PathBuf,
-    watched: PathBuf,
-    descriptor: i32,
-}
-impl ForbiddenWatch {
-    fn new(path: PathBuf) -> Result<Self, String> {
-        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
-        if fd < 0 {
-            return Err(format!(
-                "禁行区监视失败：{}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let mut value = Self {
-            file: unsafe { std::fs::File::from_raw_fd(fd) },
-            path,
-            watched: PathBuf::new(),
-            descriptor: -1,
-        };
-        value.watch_parent()?;
-        Ok(value)
-    }
-    fn watch_parent(&mut self) -> Result<(), String> {
-        let mut parent = self.path.parent().ok_or("禁行区路径缺少目录")?;
-        while !parent.is_dir() {
-            parent = parent.parent().ok_or("禁行区路径缺少已有父目录")?;
-        }
-        if parent == self.watched {
-            return Ok(());
-        }
-        let name =
-            std::ffi::CString::new(parent.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-        let descriptor = unsafe {
-            libc::inotify_add_watch(
-                self.file.as_raw_fd(),
-                name.as_ptr(),
-                libc::IN_CLOSE_WRITE
-                    | libc::IN_MOVED_TO
-                    | libc::IN_CREATE
-                    | libc::IN_DELETE
-                    | libc::IN_DELETE_SELF
-                    | libc::IN_MOVE_SELF,
-            )
-        };
-        if descriptor < 0 {
-            return Err(format!(
-                "禁行区监视失败：{}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        if self.descriptor >= 0 {
-            unsafe {
-                libc::inotify_rm_watch(self.file.as_raw_fd(), self.descriptor);
-            }
-        }
-        self.descriptor = descriptor;
-        self.watched = parent.to_path_buf();
-        Ok(())
-    }
-    fn changed(&mut self) -> Result<bool, String> {
-        let mut buffer = [0u8; 4096];
-        let mut changed = false;
-        loop {
-            match self.file.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(_) => changed = true,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) => return Err(format!("禁行区监视失败：{error}")),
-            }
-        }
-        if changed {
-            self.watch_parent()?;
-        }
-        Ok(changed)
-    }
-}
-
 fn encode_recent_cloud(
     frame: &MappingFrame,
     points: &[Point3<f64>],

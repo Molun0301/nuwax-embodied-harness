@@ -815,7 +815,8 @@ async fn malformed_forbidden_file_fails_exploration_without_faulting_session() {
             .is_some_and(|s| s.phase == ExplorationPhase::Failed as i32)
         {
             assert_eq!(state.phase, SessionPhase::Mapping as i32);
-            assert!(!state.exploration.unwrap().message.is_empty());
+            let reason = state.exploration.unwrap().message;
+            assert!(reason.contains("禁行区格式无效"), "{reason}");
             break;
         }
         assert!(start.elapsed() < Duration::from_secs(3));
@@ -823,6 +824,86 @@ async fn malformed_forbidden_file_fails_exploration_without_faulting_session() {
     }
     f.client.save_map(SaveMapRequest::default()).await.unwrap();
     f.frame(now()).await;
+}
+
+#[tokio::test]
+async fn forbidden_file_errors_reach_the_goal_and_recover_on_the_next_check() {
+    let mut f = Fixture::start(false, false).await;
+    f.saved_map("禁区目标").await;
+    let raw = f
+        .client
+        .get_occupancy_grid(GetOccupancyGridRequest {
+            include_forbidden: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut states = f
+        .client
+        .subscribe_state(Empty {})
+        .await
+        .unwrap()
+        .into_inner();
+    let goal_id = f
+        .client
+        .set_goal(goal(2.))
+        .await
+        .unwrap()
+        .into_inner()
+        .goal_id;
+    let path = f.root.join("maps/禁区目标/forbidden_zones.json");
+    fs::write(&path, "{错误").unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let state = states.message().await.unwrap().unwrap();
+            assert_eq!(state.phase, SessionPhase::Mapping as i32);
+            if state.navigation.as_ref().is_some_and(|goal| {
+                goal.goal_id == goal_id && goal.message.contains("禁行区格式无效")
+            }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let state = states.message().await.unwrap().unwrap();
+            assert_eq!(state.phase, SessionPhase::Mapping as i32);
+            if state.navigation.as_ref().is_some_and(|goal| {
+                goal.goal_id == goal_id && goal.message.contains("禁行区读取失败")
+            }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let mut maps = f.client.subscribe_map(Empty {}).await.unwrap().into_inner();
+    fs::remove_dir(&path).unwrap();
+    let replacement = path.with_extension("tmp");
+    fs::write(&replacement, br#"{"zones":[]}"#).unwrap();
+    fs::rename(replacement, path).unwrap();
+    let restored = tokio::time::timeout(Duration::from_secs(3), maps.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.raw_data, raw.data);
+    assert_eq!(restored.data, raw.data);
+    assert_eq!(
+        f.client
+            .get_occupancy_grid(GetOccupancyGridRequest {
+                include_forbidden: false
+            })
+            .await
+            .unwrap()
+            .into_inner(),
+        raw
+    );
+    f.client.save_map(SaveMapRequest::default()).await.unwrap();
 }
 
 #[tokio::test]
@@ -843,4 +924,56 @@ async fn initial_lio_start_failure_can_stop_then_start_after_executable_is_resto
     .await
     .unwrap();
     assert!(f.child.try_wait().unwrap().is_none());
+}
+
+#[test]
+fn release_artifacts_discovery_exits_before_runtime_or_storage_setup() {
+    let folder =
+        std::env::temp_dir().join(format!("neh-artifact-discovery-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&folder).unwrap();
+    let ready = folder.join("ready");
+    std::fs::write(&ready, b"existing-owner").unwrap();
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_nuwax-geometry-runtime"))
+        .arg("--print-release-artifacts")
+        .env(
+            "NUWAX_GEOMETRY_RUNTIME_PORT",
+            listener.local_addr().unwrap().port().to_string(),
+        )
+        .env("NUWAX_GEOMETRY_RUNTIME_READY_FILE", &ready)
+        .env(
+            "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_MIB",
+            "invalid-cache-setting",
+        )
+        .env("NUWAX_GEOMETRY_LIO_BACKEND", "invalid-input-backend")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "只读发现应直接成功：{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(&ready).unwrap(), b"existing-owner");
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        payload["schema_version"],
+        "nuwax.geometry.embedded-artifacts.v1"
+    );
+    let artifacts = payload["artifacts"].as_array().unwrap();
+    assert_eq!(artifacts.len(), 2);
+    assert_eq!(artifacts[0]["role"], "native_pgo_payload");
+    assert_eq!(artifacts[1]["role"], "group_guardian");
+    assert_eq!(
+        artifacts[0]["path"].as_str().unwrap(),
+        nuwax_nav_pgo_bridge::discovery_native_executable()
+            .to_str()
+            .unwrap()
+    );
+    assert_eq!(
+        artifacts[1]["path"].as_str().unwrap(),
+        nuwax_nav_pgo_bridge::discovery_group_guardian_executable()
+            .to_str()
+            .unwrap()
+    );
+    std::fs::remove_dir_all(folder).unwrap();
 }

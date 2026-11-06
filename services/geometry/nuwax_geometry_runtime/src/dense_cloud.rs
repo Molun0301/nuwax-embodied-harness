@@ -536,10 +536,6 @@ impl DenseCloud {
         }
         output.flush().map_err(|e| e.to_string())
     }
-    pub(crate) fn point_count(&self) -> u64 {
-        self.point_count
-    }
-
     pub fn snapshot(
         &self,
         source_timestamp_ns: u64,
@@ -557,10 +553,6 @@ impl DenseCloud {
             revision,
             session_id: session_id.to_owned(),
         })
-    }
-
-    pub(crate) fn readers(&self) -> DenseCloudReaders {
-        self.readers.clone()
     }
 
     pub fn pin_read(
@@ -896,6 +888,7 @@ impl DenseCloudReaders {
         Ok((latest, base))
     }
 
+    #[cfg(test)]
     pub fn read_epoch_available(&self, latest_epoch: &str, epoch: &str) -> bool {
         latest_epoch == epoch
             || self.0.lock().iter().any(|(at, snapshot)| {

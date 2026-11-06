@@ -231,7 +231,7 @@ fn validate_zone(zone: &ForbiddenZone) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn validate_map_layout(raw: &MapState) -> Result<(), String> {
+fn validate_map_layout(raw: &MapState) -> Result<(), String> {
     let expected = raw.width as usize * raw.height as usize;
     if raw.width == 0
         || raw.height == 0
@@ -244,7 +244,7 @@ pub(crate) fn validate_map_layout(raw: &MapState) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn rasterize_effective_map(
+fn rasterize_effective_map(
     mut effective: MapState,
     loaded: &LoadedForbiddenZones,
 ) -> MapState {
@@ -652,6 +652,7 @@ fn squared_distance(a: ZonePoint, b: ZonePoint) -> f64 {
     dx * dx + dy * dy
 }
 
+#[cfg(test)]
 fn compose_effective_map(
     raw: &MapState,
     loaded: &LoadedForbiddenZones,

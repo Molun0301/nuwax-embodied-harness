@@ -22,9 +22,15 @@ from services.geometry.state import Pose
 LOGGER = logging.getLogger(__name__)
 
 
+def _datetime_ns(timestamp):
+    delta = timestamp.astimezone(timezone.utc) - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return (delta.days * 86400 + delta.seconds) * 1_000_000_000 + delta.microseconds * 1000
+
+
 class InputBridge:
     def __init__(self, *, client, info, sensor_sample_provider=None, localization_provider=None,
-                 point_cloud_provider=None, sensor_source_owner=None, recording_sink=None, input_executor=None):
+                 point_cloud_provider=None, sensor_source_owner=None, recording_sink=None, input_executor=None,
+                 lio_backend="device"):
         self._client = client
         self._info = info
         self._sensor_provider = sensor_sample_provider
@@ -32,6 +38,8 @@ class InputBridge:
         self._point_cloud_provider = point_cloud_provider
         self._source_owner = sensor_source_owner
         self._recording = recording_sink
+        self._lio_backend = lio_backend
+        self._native_lio = False
         self._input_executor = input_executor
         self._executor = None
         self._sender = None
@@ -57,6 +65,7 @@ class InputBridge:
             try:
                 self._runtime_info = self._info() if callable(self._info) else self._info
                 self._settings = json.loads(self._runtime_info.planar_input_config_json or "{}")
+                self._native_lio = self._runtime_info.pipeline == "lio_3d" and self._lio_backend != "device"
                 self._assembler = LioMeasurementAssembler()
                 self._last_error = None
                 self._running = True
@@ -64,7 +73,7 @@ class InputBridge:
                 if self._executor is not None:
                     self._executor.start_input_delivery(_ProcessDelivery, {
                         "target": self._client.target, "info": self._runtime_info,
-                        "recording": self._recording is not None,
+                        "recording": self._recording is not None, "lio_backend": self._lio_backend,
                     }, self._recording)
                 else:
                     self._sender = self._client.input_sender()
@@ -77,9 +86,10 @@ class InputBridge:
                     if self._sensor_provider is not None:
                         subscription = self._sensor_provider.subscribe_sensor_sample(self._on_sample)
                         self._subscriptions.append((self._sensor_provider, "unsubscribe_sensor_sample", subscription))
-                    if (self._runtime_info.pipeline == "slam_2d"
-                            and self._settings.get("odometry_source") == "device"
-                            and self._localization_provider is not None):
+                    if (self._localization_provider is not None
+                            and (self._runtime_info.pipeline == "lio_3d" and not self._native_lio
+                                 or self._runtime_info.pipeline == "slam_2d"
+                                 and self._settings.get("odometry_source") == "device")):
                         subscription = self._localization_provider.subscribe_localization(self._on_odometry)
                         self._subscriptions.append((self._localization_provider, "unsubscribe_localization", subscription))
                     if self._runtime_info.pipeline == "lio_3d" and self._point_cloud_provider is not None:
@@ -171,9 +181,9 @@ class InputBridge:
                 self._recording.record_sensor(sample)
         if isinstance(sample, CanonicalLaserScan):
             self._enqueue("scan", encode_planar_scan(sample))
-        elif isinstance(sample, CanonicalLioMeasurement):
+        elif self._native_lio and isinstance(sample, CanonicalLioMeasurement):
             self._enqueue("cloud", self._measurement_request(sample))
-        elif isinstance(sample, (CanonicalImuSample, CanonicalLidarFrame)):
+        elif self._native_lio and isinstance(sample, (CanonicalImuSample, CanonicalLidarFrame)):
             try:
                 measurement = (self._assembler.add_imu(sample) if isinstance(sample, CanonicalImuSample)
                                else self._assembler.add_lidar(sample))
@@ -187,21 +197,29 @@ class InputBridge:
         return True
 
     def _on_odometry(self, pose, tree, metadata):
-        domain = metadata["clock_domain"]
-        clock_id = metadata["clock_id"]
-        stamp = metadata["timestamp_ns"]
-        if domain == "unix_ns" and self._settings["clock_domain"] == "monotonic_ns":
-            stamp -= self._runtime_info.planar_unix_offset_ns
-            domain = "monotonic_ns"
-            clock_id = self._settings["clock_id"]
+        if self._runtime_info.pipeline == "slam_2d":
+            domain, clock_id, stamp = metadata["clock_domain"], metadata["clock_id"], metadata["timestamp_ns"]
+            if domain == "unix_ns" and self._settings["clock_domain"] == "monotonic_ns":
+                stamp -= self._runtime_info.planar_unix_offset_ns
+                domain = "monotonic_ns"
+                clock_id = self._settings["clock_id"]
+        else:
+            # 同帧规范惯性元数据保留精确时钟；普通设备位姿沿用显式元数据或自身UTC时间。
+            metadata = metadata or {}
+            sample = metadata.get("canonical_imu_sample")
+            if sample is not None and "timestamp_ns" not in metadata:
+                domain, clock_id, stamp = sample.clock_domain.value, sample.clock_id or "", sample.timestamp_ns
+            else:
+                domain, clock_id = metadata.get("clock_domain", "unix_ns"), metadata.get("clock_id", "")
+                stamp = metadata.get("timestamp_ns", _datetime_ns(pose.timestamp))
         value = Pose(pose.position.x, pose.position.y, pose.position.z,
                      pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w,
                      pose.frame_id, stamp)
         self._enqueue("odom", (value, domain, clock_id))
 
     def _on_point_cloud(self, cloud):
-        # 规范 LiDAR 已从传感器流配组；点云显示流只补充辅助地图观测。
-        if self._sensor_provider is not None and not cloud.mapping_only:
+        # 只有实际原生LIO配组才跳过显示主云；device仍须交付设备注册的主云。
+        if self._native_lio and self._sensor_provider is not None and not cloud.mapping_only:
             return
         metadata = cloud.metadata
         xyz = cloud.points_xyz_array
@@ -219,8 +237,7 @@ class InputBridge:
         if "source_timestamp_ns" in metadata:
             request.timestamp_ns = metadata["source_timestamp_ns"]
         else:
-            delta = cloud.timestamp.astimezone(timezone.utc) - datetime(1970, 1, 1, tzinfo=timezone.utc)
-            request.timestamp_ns = (delta.days * 86400 + delta.seconds) * 1_000_000_000 + delta.microseconds * 1000
+            request.timestamp_ns = _datetime_ns(cloud.timestamp)
         request.is_dense = cloud.is_dense
         request.mapping_only = cloud.mapping_only
         request.sensor_origin_xyz.extend((cloud.sensor_origin.x, cloud.sensor_origin.y, cloud.sensor_origin.z))
@@ -313,7 +330,8 @@ class _ProcessDelivery:
             sensor_sample_provider=source,
             localization_provider=source if hasattr(source, "subscribe_localization") else None,
             point_cloud_provider=source if hasattr(source, "subscribe_point_cloud") else None,
-            recording_sink=_RecordingRelay(record) if spec["recording"] else None)
+            recording_sink=_RecordingRelay(record) if spec["recording"] else None,
+            lio_backend=spec["lio_backend"])
         try:
             self._bridge.start()
         except BaseException:

@@ -269,7 +269,7 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
         else:
             sensors.start()
             remote.start_mapping(map_name,timeout_sec=3)
-            bridge=InputBridge(client=remote,info=remote.get_state(timeout_sec=2).info,sensor_sample_provider=sensors)
+            bridge=InputBridge(client=remote,info=remote.get_state(timeout_sec=2).info,sensor_sample_provider=sensors,lio_backend=backend)
             bridge.start()
         values = np.linspace(-4, 4, 41) if motion_loop else np.linspace(-3, 3, 20)
         wall = 4.0 if motion_loop else 3.0

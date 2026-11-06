@@ -126,7 +126,7 @@ def wait_status(bridge,predicate,timeout=2):
 @pytest.mark.parametrize('intensity',[False,True])
 def test_canonical_pair_without_device_localization_preserves_native_layout_and_time(input_service,intensity):
     source=SensorSource()
-    bridge=InputBridge(client=input_service.client,info=info(),sensor_sample_provider=source)
+    bridge=InputBridge(client=input_service.client,info=info(),sensor_sample_provider=source, lio_backend="pointlio")
     bridge.start()
     try:
         source.callback(imu_sample(900,1))
@@ -150,7 +150,7 @@ def test_canonical_pair_without_device_localization_preserves_native_layout_and_
 
 def test_missing_scan_offsets_are_not_replaced_with_invented_per_point_times(input_service):
     source=SensorSource()
-    bridge=InputBridge(client=input_service.client,info=info(),sensor_sample_provider=source)
+    bridge=InputBridge(client=input_service.client,info=info(),sensor_sample_provider=source, lio_backend="pointlio")
     bridge.start()
     try:
         source.callback(imu_sample(900,1))
@@ -273,7 +273,7 @@ def test_registered_device_cloud_preserves_each_actual_field_layout(input_servic
 
 def test_canonical_source_keeps_device_cloud_only_as_mapping_observation(input_service):
     source=SensorSource()
-    bridge=InputBridge(client=input_service.client,info=info(),sensor_sample_provider=source,point_cloud_provider=source)
+    bridge=InputBridge(client=input_service.client,info=info(),sensor_sample_provider=source,point_cloud_provider=source, lio_backend="pointlio")
     bridge.start()
     try:
         xyz=np.asarray([[1.,2.,3.]],dtype='<f4')

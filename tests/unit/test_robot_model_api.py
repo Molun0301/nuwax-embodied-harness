@@ -403,7 +403,7 @@ def test_model_conversion_keeps_event_loop_responsive(model_runtime, monkeypatch
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fixture") as client:
             model = asyncio.create_task(client.get("/api/robot-model"))
             try:
-                assert await asyncio.to_thread(entered.wait, 1)
+                assert await asyncio.get_running_loop().run_in_executor(None, entered.wait, 1)
                 response = await asyncio.wait_for(client.get("/ping"), timeout=0.2)
                 assert response.json() == {"ok": True}
                 assert not model.done()

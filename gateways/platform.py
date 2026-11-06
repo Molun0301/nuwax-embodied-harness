@@ -142,7 +142,7 @@ def build_platform(config) -> Platform:
     platform.exploration_checkpoints = ExplorationCheckpoints(platform.maps.root)
     from providers import StreamingSensorSampleProvider, StreamingLocalizationProvider, StreamingPointCloudProvider
     providers = platform.robot.providers
-    platform.input_bridge = InputBridge(client=platform.geometry,
+    platform.input_bridge = InputBridge(client=platform.geometry, lio_backend=config.geometry.lio_backend,
         info=lambda: platform.geometry_state.snapshot().info,
         sensor_sample_provider=providers if isinstance(providers, StreamingSensorSampleProvider) else None,
         localization_provider=providers if isinstance(providers, StreamingLocalizationProvider) else None,

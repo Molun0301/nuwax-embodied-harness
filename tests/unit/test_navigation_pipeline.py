@@ -207,12 +207,12 @@ def test_pct_terrain_source_invalid_save_and_activation_preserve_selected_scheme
     assert _TERRAIN_SOURCE in result.rejected
     assert profile.read_bytes() == before
     selected = tmp_path / "runtime_data/settings/active.env"
-    previous_target = selected.readlink()
+    previous_target = Path(os.readlink(selected))
     invalid = profile.with_name("无效.env")
     invalid.write_text(f"{_TERRAIN_SOURCE}=invalid\n")
     with pytest.raises(ValueError, match=_TERRAIN_SOURCE):
         activate_profile(root=tmp_path, robot="go2", profile="无效")
-    assert selected.readlink() == previous_target
+    assert Path(os.readlink(selected)) == previous_target
     assert (profile.parent / ".active").read_text() == "默认\n"
 
 

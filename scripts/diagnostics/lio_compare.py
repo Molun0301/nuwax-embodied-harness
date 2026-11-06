@@ -40,7 +40,8 @@ def identifier(value: str) -> str:
 
 def local_asset(folder: Path, name: str) -> Path:
     path = (folder / name).resolve(strict=True)
-    if not path.is_relative_to(folder.resolve()) or not path.is_file():
+    root = folder.resolve()
+    if not (path == root or root in path.parents) or not path.is_file():
         raise ValueError("数据文件必须位于指定数据目录内")
     return path
 

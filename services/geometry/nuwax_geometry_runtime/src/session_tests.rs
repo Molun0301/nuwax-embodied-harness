@@ -67,7 +67,12 @@ async fn actor(mapper: Arc<Mapper>, root: PathBuf) -> Session {
         save_sources: HashSet::new(),
         next_session: mapper.session_id(),
         lio,
-        nav: NavBridge::start(nav_status).await.unwrap(),
+        nav: NavBridge::with_transport(
+            nuwax_transport::LcmTransport::new_real("memq://").unwrap(),
+            nav_status,
+        )
+        .await
+        .unwrap(),
         explorer: None,
     }
 }
@@ -450,7 +455,7 @@ async fn incompatible_saved_backend_keeps_current_unsaved_session() {
         })
         .await
         .unwrap_err();
-    assert_eq!(result.code(), tonic::Code::Unavailable);
+    assert_eq!(result.code(), tonic::Code::FailedPrecondition);
     assert!(result.message().contains("capacity mismatch"));
     assert_eq!(session.state, before);
     assert_eq!(mapper.snapshot().await.unwrap().occupancy, baseline);
@@ -621,5 +626,97 @@ async fn faulted_planar_session_saves_owned_grid_and_cloud_and_rejects_resume_af
     restarted.end_current().await.unwrap();
     restarted.nav.shutdown().await;
     source.shutdown().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+async fn load_fault_saved_planar_map() -> (Session, PathBuf, OccupancyGrid) {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/B2会话测试")
+        .join(uuid::Uuid::new_v4().to_string());
+    let config = MapperConfig {
+        map_name: "故障保存图".into(),
+        backend: crate::mapping_backend::MappingBackendSpec::SlamToolbox,
+        ..Default::default()
+    };
+    let mapper = Mapper::start(713, config.clone()).unwrap();
+    mapper.feed_grid(
+        713,
+        OccupancyGrid {
+            map_name: config.map_name.clone(),
+            meta: Some(OccupancyGridMeta {
+                width: 2,
+                height: 2,
+                resolution: 0.1,
+                frame_id: "map".into(),
+                timestamp_ns: 1,
+                ..Default::default()
+            }),
+            data: vec![0, 100, 255, 0],
+        },
+    );
+    let grid = mapper.snapshot().await.unwrap().occupancy.unwrap();
+    let mut session = actor(mapper, root.clone()).await;
+    session.state.info.as_mut().unwrap().pipeline = "slam_2d".into();
+    session.state.map_name = config.map_name.clone();
+    session.config = config;
+    session.fail("二维工作进程退出".into()).await;
+    session.save(SaveMapRequest::default()).await.unwrap();
+    session
+        .load(LoadMapRequest {
+            map_name: grid.map_name.clone(),
+        })
+        .await
+        .unwrap();
+    (session, root, grid)
+}
+
+#[tokio::test]
+async fn fault_saved_planar_map_loads_its_grid_without_publishing_map_transform() {
+    let (mut session, root, grid) = load_fault_saved_planar_map().await;
+    assert_eq!(session.phase(), SessionPhase::Loaded);
+    assert_eq!(session.state.reason, "缺少二维定位图，只能查看");
+    assert_eq!(session.mapper().unwrap().occupancy(false), Some(grid.clone()));
+    assert_eq!(session.mapper().unwrap().occupancy(true), Some(grid));
+    session.router.publish_pose(
+        session.router.session_id(),
+        pose_from_isometry(nalgebra::Isometry3::identity(), "odom", 2),
+    );
+    assert_eq!(session.snapshot().pose.unwrap().frame_id, "odom");
+    session.end_current().await.unwrap();
+    session.nav.shutdown().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn fault_saved_planar_map_rejects_relocalization_with_reason() {
+    let (mut session, root, _) = load_fault_saved_planar_map().await;
+    let error = session
+        .relocalize(RelocalizeRequest::default())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(error.message(), "缺少二维定位图，只能查看");
+    assert_eq!(session.phase(), SessionPhase::Loaded);
+    session.end_current().await.unwrap();
+    session.nav.shutdown().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn fault_saved_planar_map_rejects_navigation_while_unlocalized() {
+    let (mut session, root, _) = load_fault_saved_planar_map().await;
+    let error = session
+        .goal(NavigationGoal {
+            pose: Some(pose_from_isometry(nalgebra::Isometry3::identity(), "map", 1)),
+            motion_generation: 7,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(error.message(), "未定位");
+    assert!(session.state.navigation.is_none());
+    session.end_current().await.unwrap();
+    session.nav.shutdown().await;
     std::fs::remove_dir_all(root).unwrap();
 }

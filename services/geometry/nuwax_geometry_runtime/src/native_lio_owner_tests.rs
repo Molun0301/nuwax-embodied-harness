@@ -388,7 +388,6 @@ fn preflight_and_bind_do_not_execute_or_require_backend_identity() {
             .bind("sensor", "body", "odom")
             .unwrap();
         assert_eq!(bound.runtime.executable, executable.0);
-        assert_eq!(bound.backend_code, backend_code(backend));
     }
     assert!(!marker.exists(), "准备阶段不应执行原生程序");
 }

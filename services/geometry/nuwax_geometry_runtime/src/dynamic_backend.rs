@@ -3,16 +3,6 @@ use ahash::{AHashMap, AHashSet};
 use nalgebra::{Isometry3, Point3};
 use nuwax_dufomap_native::{DufoMap, Params};
 
-#[path = "pgo_free_evidence.rs"]
-pub(crate) mod free_evidence;
-
-pub(crate) const BACKEND_VAR: &str = "NUWAX_GEOMETRY_DYNAMIC_BACKEND";
-pub(crate) fn parse_backend(value: Option<&str>) -> Result<(), String> {
-    match value.map(str::trim).filter(|v| !v.is_empty()) {
-        None | Some("dufomap") => Ok(()),
-        Some(value) => Err(format!("{BACKEND_VAR} 取值非法：{value:?}，应为 dufomap")),
-    }
-}
 pub(crate) fn online_params() -> Params {
     Params {
         resolution: 0.15,
@@ -53,53 +43,8 @@ pub(crate) fn test_free_cells(
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OnlineDufo {
     map: Option<DufoMap>,
-    free_revision: u64,
-    free_changes: free_evidence::FreeChangeJournal,
 }
 impl OnlineDufo {
-    pub(crate) fn free_revision(&self) -> u64 {
-        self.free_revision
-    }
-
-    /// 调用者持地图拥有方锁时，树与完整变化增量来自同一个不可变状态。
-    pub(crate) fn snapshot_since(
-        &self,
-        revision: u64,
-    ) -> (Self, Option<Vec<nuwax_dufomap_native::FreeCell>>) {
-        (
-            self.clone(),
-            self.free_changes.since(revision, self.free_revision),
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn free_change_payload_stats(&self) -> (usize, usize) {
-        self.free_changes.payload_stats()
-    }
-
-    /// 只查询冻结终态，不再以抽帧扫描重新积分另一套时域证据。
-    pub(crate) fn terminal_frame(
-        &self,
-        evidence_points: &[Point3<f64>],
-        corrected_points: &[Point3<f64>],
-    ) -> Result<MappedFrame, String> {
-        let xyz: Vec<_> = evidence_points
-            .iter()
-            .map(|p| [p.x as f32, p.y as f32, p.z as f32])
-            .collect();
-        let flags = match &self.map {
-            Some(map) => map.seen_free(&xyz)?,
-            None => vec![false; xyz.len()],
-        };
-        let mut frame = MappedFrame::unfiltered();
-        let MappedFrame::Dufo(dufo) = &mut frame;
-        dufo.dynamic_points = corrected_points
-            .iter()
-            .zip(flags)
-            .filter_map(|(p, flag)| flag.then_some([p.x.to_bits(), p.y.to_bits(), p.z.to_bits()]))
-            .collect();
-        Ok(frame)
-    }
     #[cfg(test)]
     pub(crate) fn memory_bytes(&self) -> usize {
         self.map.as_ref().map_or(0, DufoMap::memory_bytes)
@@ -123,13 +68,6 @@ impl OnlineDufo {
             .collect();
         if stamp > 0 {
             free = map.insert_with_free_cells(&xyz, origin.map(|v| v as f32))?;
-        }
-        if !free.is_empty() {
-            self.free_revision = self
-                .free_revision
-                .checked_add(1)
-                .ok_or("DUFOMap自由证据修订溢出")?;
-            self.free_changes.record(self.free_revision, &free);
         }
         let flags = map.seen_free(&xyz)?;
         let indices = flags
@@ -267,6 +205,7 @@ impl MappedFrame {
             Self::Dufo(frame) => frame.free.len(),
         }
     }
+    #[cfg(test)]
     pub(crate) fn unfiltered() -> Self {
         Self::Dufo(DufoFrame {
             resolution: online_params().resolution,
@@ -373,61 +312,6 @@ impl MappedFrame {
                 }
                 Some(candidates)
             }
-        }
-    }
-    pub(crate) fn encode(&self) -> Result<Vec<u8>, String> {
-        match self {
-            Self::Dufo(f) => {
-                let pose: [f64; 16] = f
-                    .evidence_from_map
-                    .to_homogeneous()
-                    .as_slice()
-                    .try_into()
-                    .unwrap();
-                let mut bytes = vec![1];
-                bytes.extend(
-                    serde_json::to_vec(&(
-                        f.resolution,
-                        pose,
-                        f.free.keys().copied().collect::<Vec<_>>(),
-                        f.dynamic_points.iter().copied().collect::<Vec<_>>(),
-                    ))
-                    .map_err(|e| e.to_string())?,
-                );
-                Ok(bytes)
-            }
-        }
-    }
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, String> {
-        match bytes.split_first() {
-            Some((1, body)) => {
-                let (resolution, m, free, points): (
-                    f64,
-                    [f64; 16],
-                    Vec<([i32; 3], u32)>,
-                    Vec<[u64; 3]>,
-                ) = serde_json::from_slice(body).map_err(|e| e.to_string())?;
-                if !resolution.is_finite()
-                    || resolution <= 0.0
-                    || free.iter().any(|(_, depth)| *depth > 1)
-                    || m.iter().any(|v| !v.is_finite())
-                {
-                    return Err("DUFOMap 帧参数非法".into());
-                }
-                let rotation = nalgebra::Matrix3::from_column_slice(&[
-                    m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10],
-                ]);
-                Ok(Self::Dufo(DufoFrame {
-                    resolution,
-                    evidence_from_map: Isometry3::from_parts(
-                        nalgebra::Translation3::new(m[12], m[13], m[14]),
-                        nalgebra::UnitQuaternion::from_matrix(&rotation),
-                    ),
-                    free: free.into_iter().map(|c| (c, ())).collect(),
-                    dynamic_points: points.into_iter().collect(),
-                }))
-            }
-            _ => Err("去动态帧编码未知".into()),
         }
     }
 }

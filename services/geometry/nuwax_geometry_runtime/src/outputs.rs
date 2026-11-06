@@ -33,7 +33,7 @@ impl Outputs {
                                 if changed.is_err(){break;}
                                 let bytes=recent.borrow_and_update().clone();
                                 if routes.borrow().as_ref().is_some_and(|current|current.id==route.id) {
-                                    if let Some(bytes)=bytes {if let Err(reason)=publish(&recent_transport,"","/nav/recent_cloud",nuwax_codec::lcm::recent_cloud::TYPE_NAME,bytes).await {recent_session.report_fault(reason);}}
+                                    if let Some(bytes)=bytes {if let Err(reason)=publish(&recent_transport,"","/nav/recent_cloud",nuwax_codec::lcm::recent_cloud::TYPE_NAME,bytes).await {recent_session.report_output_error(route.id, reason);}}
                                 }
                             },
                         }
@@ -44,6 +44,7 @@ impl Outputs {
             }
         });
         let task = tokio::spawn(async move {
+            let routes = session.route_rx();
             let mut poses = session.pose_rx();
             let mut maps = session.map_rx();
             let mut prior: Option<Arc<nuwax_map_chunks::Manifest>> = None;
@@ -55,30 +56,34 @@ impl Outputs {
                 )
             });
             loop {
-                let result: Result<(), String> = tokio::select! {
+                let (id, result) = tokio::select! {
                     _=&mut stopped=>break,
                     changed=poses.changed()=>{
                         if changed.is_err(){break;}
+                        let id = routes.borrow().as_ref().map_or(0, |route| route.id);
                         let tree=session.frame_tree();
                         let message=schema::TfMessage{transforms:tree.transforms.iter().map(|edge|{
                             let p=edge.translation.clone().unwrap_or_default();let q=edge.rotation.clone().unwrap_or_default();
                             schema::TransformStamped{header:header(edge.timestamp_ns,&edge.parent_frame,0),child_frame_id:edge.child_frame.clone(),transform:schema::Transform{translation:[p.x,p.y,p.z],rotation_xyzw:[q.x,q.y,q.z,q.w]}}
                         }).collect()};
-                        match schema::encode_tf_message_body(&message){Ok(bytes)=>publish(&transport,"NUWAX_LCM_CHANNEL_TF","/tf","tf2_msgs.TFMessage",bytes).await,Err(e)=>Err(e.to_string())}
+                        let result = match schema::encode_tf_message_body(&message){Ok(bytes)=>publish(&transport,"NUWAX_LCM_CHANNEL_TF","/tf","tf2_msgs.TFMessage",bytes).await,Err(e)=>Err(e.to_string())};
+                        (id, result)
                     },
                     changed=maps.changed()=>{
                         if changed.is_err(){break;}
+                        let id = routes.borrow().as_ref().map_or(0, |route| route.id);
                         let map=maps.borrow_and_update().clone();
-                        if let Some(map)=map {
+                        let result = if let Some(map)=map {
                             match publish_map(&transport,&session,&map,prior.as_deref()).await {
                                 Ok(sealed)=>{if let Some(sealed)=sealed {let changed=prior.as_ref().is_none_or(|old|old.identity()!=sealed.manifest().identity());prior=Some(sealed.manifest().clone());if follow&&changed{publish_follow(&transport,&session,&sealed,&mut follow_sent).await}else{Ok(())}}else{Ok(())}},
                                 Err(error)=>Err(error),
                             }
-                        }else{prior=None;follow_sent=None;Ok(())}
+                        }else{prior=None;follow_sent=None;Ok(())};
+                        (id, result)
                     },
                 };
                 if let Err(reason) = result {
-                    session.report_fault(reason);
+                    session.report_output_error(id, reason);
                 }
             }
             recent_task.abort();

@@ -1,5 +1,7 @@
 //! 原点云拥有方维护的固定精度源；完整块提交和展示容量互不影响。
-use super::{dynamic_cloud::DynamicCloudFilter, voxel_index::VoxelIndex, voxel_key, VOXEL_SIZE};
+use super::{dynamic_cloud::DynamicCloudFilter, voxel_key, VoxelIndex};
+#[cfg(test)]
+use super::VOXEL_SIZE;
 use ahash::AHashSet;
 use nalgebra::Point3;
 use nuwax_map_chunks::{CachePolicy, Repository, SealedMap, Writer};

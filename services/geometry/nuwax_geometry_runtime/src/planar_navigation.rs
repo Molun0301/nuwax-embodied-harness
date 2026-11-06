@@ -105,14 +105,6 @@ impl Owner {
             return Ok(None);
         };
         let grid = proto_grid_to_kernel(&raw)?;
-        let external = session.core_config["base_from_laser"]
-            .as_array()
-            .ok_or("二维导航缺少激光外参")?;
-        let base_from_laser = [
-            external[0].as_f64().unwrap(),
-            external[1].as_f64().unwrap(),
-            external[2].as_f64().unwrap(),
-        ];
         let history = self.history.lock();
         let Some(rays) = navigation_rays(
             &scan,
@@ -121,7 +113,7 @@ impl Owner {
             } else {
                 None
             },
-            base_from_laser,
+            settings.base_from_laser,
         )?
         else {
             return Ok(None);

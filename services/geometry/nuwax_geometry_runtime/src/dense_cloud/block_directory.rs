@@ -66,9 +66,11 @@ impl BlockDirectory {
     pub(super) fn compacting(&self) -> bool {
         self.compact
     }
+    #[cfg(test)]
     pub(super) fn entries(&self) -> usize {
         self.entries
     }
+    #[cfg(test)]
     pub(super) fn level(&self) -> u32 {
         self.level
     }

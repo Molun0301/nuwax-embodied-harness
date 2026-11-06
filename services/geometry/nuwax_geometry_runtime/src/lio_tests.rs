@@ -203,7 +203,6 @@ async fn native_odometry_reaches_handoff_without_public_lcm_loop() {
 
 fn native_bound() -> crate::native_lio_owner::BoundNativeLioRuntime {
     crate::native_lio_owner::BoundNativeLioRuntime {
-        backend_code: 2,
         channels: crate::native_lio_owner::NativePrivateChannels {
             source_odometry: binding("/b2/native/odom", "nav_msgs.Odometry").unwrap(),
             source_cloud: binding("/b2/native/cloud", "sensor_msgs.PointCloud2").unwrap(),
@@ -230,7 +229,7 @@ fn native_bound() -> crate::native_lio_owner::BoundNativeLioRuntime {
 fn test_lio(
     mapper: Arc<crate::mapper::Mapper>,
     native: Option<BoundNativeLioRuntime>,
-) -> (Lio, mpsc::UnboundedReceiver<(u64, String)>) {
+) -> (Lio, mpsc::UnboundedReceiver<(u64, crate::session::SessionIssue)>) {
     let (router, _, faults) = crate::session::test_router(mapper);
     let (odometry_input, _) = mpsc::unbounded_channel();
     let (cloud_input, _) = mpsc::unbounded_channel();
@@ -308,7 +307,9 @@ async fn imu_gap_reports_session_fault_once() {
             tonic::Code::FailedPrecondition
         );
     }
-    let (id, reason) = faults.try_recv().unwrap();
+    let (id, crate::session::SessionIssue::Fault(reason)) = faults.try_recv().unwrap() else {
+        panic!("惯性输入断档应报告会话故障");
+    };
     assert_eq!(id, 42);
     assert!(reason.contains("惯性源时间断档"));
     assert!(faults.try_recv().is_err());

@@ -16,6 +16,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::{oneshot, watch};
+use tonic::Status;
 
 #[derive(Clone, Debug)]
 pub struct MappingFrame {
@@ -124,6 +125,7 @@ pub struct MapPublication {
 #[derive(Clone)]
 pub struct Mapper {
     session_id: u64,
+    planar_view_only: bool,
     sender: mpsc::Sender<Command>,
     latest_input: Arc<parking_lot::Mutex<Option<Input>>>,
     poses: watch::Receiver<Option<proto::Pose>>,
@@ -165,7 +167,7 @@ enum Command {
 }
 impl Mapper {
     pub fn start(session_id: u64, config: MapperConfig) -> Result<Arc<Self>, String> {
-        Self::spawn(session_id, config, None, false, true)
+        Self::spawn(session_id, config, None, false, true).map_err(|error| error.message().into())
     }
     pub fn load(
         session_id: u64,
@@ -174,13 +176,14 @@ impl Mapper {
         read_only: bool,
     ) -> Result<Arc<Self>, String> {
         Self::spawn(session_id, config, Some(snapshot), read_only, true)
+            .map_err(|error| error.message().into())
     }
     pub fn prepare_load(
         session_id: u64,
         config: MapperConfig,
         snapshot: MapSnapshot,
         read_only: bool,
-    ) -> Result<Arc<Self>, String> {
+    ) -> Result<Arc<Self>, Status> {
         Self::spawn(session_id, config, Some(snapshot), read_only, false)
     }
     pub async fn activate_shared_cloud(&self) -> Result<(), String> {
@@ -196,7 +199,10 @@ impl Mapper {
         snapshot: Option<MapSnapshot>,
         read_only: bool,
         attach_shared: bool,
-    ) -> Result<Arc<Self>, String> {
+    ) -> Result<Arc<Self>, Status> {
+        let planar_view_only = snapshot
+            .as_ref()
+            .is_some_and(|saved| saved.planar_resume_unavailable_reason.is_some());
         let (sender, receiver) = mpsc::channel();
         let latest_input = Arc::new(parking_lot::Mutex::new(None::<Input>));
         let pending_input = latest_input.clone();
@@ -252,9 +258,10 @@ impl Mapper {
                     error_tx.send_replace(Some(error));
                 }
             })
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| Status::unavailable(e.to_string()))?;
         Ok(Arc::new(Self {
             session_id,
+            planar_view_only,
             sender,
             latest_input,
             poses,
@@ -301,6 +308,12 @@ impl Mapper {
     }
     pub fn error_rx(&self) -> watch::Receiver<Option<String>> {
         self.errors.clone()
+    }
+    pub fn planar_view_only(&self) -> bool {
+        self.planar_view_only
+    }
+    pub fn has_occupancy(&self) -> bool {
+        self.maps.borrow().is_some()
     }
     pub fn occupancy(&self, include_forbidden: bool) -> Option<proto::OccupancyGrid> {
         if !include_forbidden {
@@ -465,7 +478,7 @@ impl Worker {
         raw_grid: watch::Sender<Option<proto::OccupancyGrid>>,
         forbidden_status: watch::Sender<Result<(), String>>,
         attach_shared: bool,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, Status> {
         let kernel = if config.backend == MappingBackendSpec::SlamToolbox {
             None
         } else {
@@ -478,7 +491,8 @@ impl Worker {
                         config.backend,
                         config.compute,
                         &snapshot.backend_checkpoint,
-                    )?
+                    )
+                    .map_err(Status::failed_precondition)?
                 } else {
                     config.backend.into_kernel(config.compute.window_capacity)
                 },
@@ -491,7 +505,8 @@ impl Worker {
                 .as_deref()
                 .filter(|_| attach_shared),
             snapshot.as_ref().map(|s| s.cloud.clone()),
-        )?;
+        )
+        .map_err(Status::unavailable)?;
         if let Some(snapshot) = snapshot.as_ref() {
             cloud.load_history(snapshot.scans.clone(), snapshot.final_poses.clone());
         }
@@ -503,10 +518,12 @@ impl Worker {
             .as_ref()
             .and_then(|s| s.occupancy.as_ref())
             .map(proto_grid_to_kernel)
-            .transpose()?
+            .transpose()
+            .map_err(Status::unavailable)?
             .map(PersistentOccupancyGrid::from_grid)
-            .transpose()?;
-        let corrector = Corrector::new(&config.correction_backend)?;
+            .transpose()
+            .map_err(Status::unavailable)?;
+        let corrector = Corrector::new(&config.correction_backend).map_err(Status::unavailable)?;
         let mut value = Self {
             session_id,
             config,
@@ -552,7 +569,7 @@ impl Worker {
                 .map_or(0, |m| m.timestamp_ns),
         };
         value.transform.send_replace(map_from_odom);
-        value.publish_grid()?;
+        value.publish_grid().map_err(Status::unavailable)?;
         Ok(value)
     }
     fn command(&mut self, command: Command) -> Result<(), String> {

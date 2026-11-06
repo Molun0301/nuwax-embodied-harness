@@ -66,7 +66,7 @@ fn transformed_regions_cover_the_f32_rounding_preimage_at_negative_coordinates()
 }
 
 #[test]
-fn corrected_frame_and_sidecar_keep_exact_static_points_and_free_cell_centers() {
+fn corrected_frame_keeps_exact_static_points_and_free_cell_centers() {
     use crate::dynamic_scene::tests::{corridor, ORIGIN};
     let transform = Isometry3::from_parts(
         nalgebra::Translation3::new(-12.31, 2.13, 0.17),
@@ -79,11 +79,10 @@ fn corrected_frame_and_sidecar_keep_exact_static_points_and_free_cell_centers() 
         let (mut frame, indices) = map.observe(&points, ORIGIN, index, transform).unwrap();
         let corrected: Vec<_> = points.iter().map(|p| transform * p).collect();
         frame.bind_points(&corrected, &indices);
-        let decoded = MappedFrame::decode(&frame.encode().unwrap()).unwrap();
         let keep: AHashSet<_> = indices.iter().copied().collect();
         for (i, p) in corrected.iter().enumerate() {
             assert_eq!(
-                decoded.is_dynamic([p.x, p.y, p.z]),
+                frame.is_dynamic([p.x, p.y, p.z]),
                 !keep.contains(&(i as u32))
             );
         }
@@ -96,15 +95,15 @@ fn corrected_frame_and_sidecar_keep_exact_static_points_and_free_cell_centers() 
                 );
             let p = [center.x, center.y, center.z];
             assert!(
-                frame.clears(p) && decoded.clears(p),
-                "校正及跨进程编码必须保留历史空单元身份"
+                frame.clears(p),
+                "校正必须保留历史空单元身份"
             );
             let cell = crate::dynamic_scene::cell(p).unwrap();
             cells.insert(cell, 1);
             checked += 1;
         }
         // 按生产入口每帧查询一次，仍逐一检查全部原空单元，避免把空间查询重复为平方级。
-        let candidates = decoded.potential_window_clear_cells(&cells).unwrap();
+        let candidates = frame.potential_window_clear_cells(&cells).unwrap();
         for cell in cells.keys() {
             assert!(candidates.contains(cell));
         }

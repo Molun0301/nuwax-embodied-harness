@@ -80,17 +80,14 @@ pub struct OsmClient {
 }
 
 impl OsmClient {
-    /// Construct from optional `NUWAX_OSM_TILE_URL_TEMPLATE`,
-    /// `NUWAX_NOMINATIM_URL`, and `NUWAX_OSM_USER_AGENT` configuration.
+    /// 使用公共服务常量构造；自定义地址由 with_endpoints 显式传入。
     #[must_use]
     pub fn new() -> Self {
-        let tile_template = std::env::var("NUWAX_OSM_TILE_URL_TEMPLATE")
-            .unwrap_or_else(|_| DEFAULT_TILE_TEMPLATE.to_string());
-        let nominatim_url = std::env::var("NUWAX_NOMINATIM_URL")
-            .unwrap_or_else(|_| DEFAULT_NOMINATIM_URL.to_string());
-        let user_agent = std::env::var("NUWAX_OSM_USER_AGENT")
-            .unwrap_or_else(|_| DEFAULT_USER_AGENT.to_string());
-        Self::with_endpoints(tile_template, nominatim_url, user_agent)
+        Self::with_endpoints(
+            DEFAULT_TILE_TEMPLATE,
+            DEFAULT_NOMINATIM_URL,
+            DEFAULT_USER_AGENT,
+        )
     }
 
     /// Construct with explicit endpoints for a proxy or local integration

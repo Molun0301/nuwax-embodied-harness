@@ -11,6 +11,8 @@ use crate::{NavStackError, NavStackResult};
 pub struct SurfaceNavigationConfig {
     /// 支撑面、净空、台阶和坡道约束。
     pub geometry: Config,
+    /// 启动时捕获的通信地址。
+    pub lcm_url: String,
     /// 由统一机器人外形得到的完整机体包络。
     pub body_envelope: SurfaceBodyEnvelope,
     /// 机体参考位姿与受控速度参数。
@@ -22,69 +24,78 @@ pub struct SurfaceNavigationConfig {
 }
 
 impl SurfaceNavigationConfig {
-    /// 从现有设置加载器提供的环境读取统一外形。
-    pub fn from_env() -> NavStackResult<Self> {
-        let voxel = configured_number("NUWAX_NAV_SURFACE_VOXEL_SIZE_M", 0.1)?;
-        let max_step = configured_number("NUWAX_GEOMETRY_TRAVERSABILITY_MAX_STEP_HEIGHT_M", 0.15)?;
-        let max_slope = configured_number("NUWAX_GEOMETRY_TRAVERSABILITY_MAX_SLOPE_DEG", 18.0)?;
-        let tread = configured_number("NUWAX_NAV_MIN_STAIR_TREAD_M", 0.2)?;
-        let frame = std::env::var("NUWAX_MAP_FRAME").unwrap_or_else(|_| "map".into());
-        let capabilities = NavigationCapabilities::from_env().map_err(NavStackError::InvalidConfig)?;
-        let body = std::env::var("NUWAX_ROBOT_GEOMETRY_JSON")
-            .map_err(|error| NavStackError::InvalidConfig(error.to_string()))?;
-        let body = RobotGeometry::from_runtime_json(&body).map_err(NavStackError::InvalidConfig)?;
-        let mut config = Self::new(frame, body.clone(), voxel, max_step, max_slope, tread)?;
+    /// 从合成配置读取统一外形与已推导的执行器参数。
+    pub fn from_runtime() -> NavStackResult<Self> {
+        let error = NavStackError::InvalidConfig;
+        let mut result = Self::from_config(
+            nuwax_config::navigation().map_err(error)?,
+            nuwax_config::robot().map_err(error)?,
+            nuwax_config::derived().map_err(error)?,
+        )?;
+        result.lcm_url = nuwax_config::transport().map_err(error)?.lcm_url.clone();
+        Ok(result)
+    }
+    /// 显式构造供调用方与测试共用。
+    pub fn from_config(
+        n: &nuwax_config::sections::Navigation,
+        r: &nuwax_config::sections::Robot,
+        d: &nuwax_config::sections::Derived,
+    ) -> NavStackResult<Self> {
+        let capabilities = NavigationCapabilities::from_config(&n.capabilities_json)
+            .map_err(NavStackError::InvalidConfig)?;
+        let body = RobotGeometry::from_runtime_json(&d.robot_geometry_json)
+            .map_err(NavStackError::InvalidConfig)?;
+        let mut config = Self::new(
+            r.map_frame.clone(),
+            body.clone(),
+            n.surface_voxel_size_m,
+            n.traversability_max_step_height_m,
+            n.traversability_max_slope_deg,
+            n.min_stair_tread_m,
+        )?;
         config.apply_calibration(body, capabilities.clone())?;
-        config.apply_step_overrides(
-            optional_step("NUWAX_NAV_MAX_STEP_UP_M")?,
-            optional_step("NUWAX_NAV_MAX_STEP_DOWN_M")?,
-            capabilities.as_ref(),
-        )?;
-        config.follower.scan.planning_horizon = configured_number(
-            "NUWAX_NAV_LOCAL_HORIZON_M", config.follower.scan.planning_horizon,
-        )?;
-        if let Ok(value) = std::env::var("_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS") {
-            if !value.trim().is_empty() {
-                let limit = parse_number("_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS", &value)?;
-                if limit <= 0.0 {return Err(NavStackError::InvalidConfig("执行器线速度上限必须为正".into()));}
-                // 设备声明给出巡航上限；旧控制器默认速度不能再次隐式截断。
-                config.follower.controller.speed = config.follower.motion_limits.as_ref()
-                    .map_or(limit,|motion|limit.min(motion.max_forward_mps));
+        config.apply_step_overrides(n.max_step_up_m, n.max_step_down_m, capabilities.as_ref())?;
+        config.planner = std::sync::Arc::new(crate::surface_oriented::PctPlanner::new(
+            nuwax_nav_runtime::native_map::PctTerrainSource::parse(&n.pct_terrain_source)
+                .map_err(NavStackError::InvalidConfig)?,
+        ));
+        config.follower.scan.planning_horizon = n.local_horizon_m;
+        if d.actuator_max_linear_mps > 0.0 {
+            let limit = d.actuator_max_linear_mps;
+            config.follower.controller.speed = config
+                .follower
+                .motion_limits
+                .as_ref()
+                .map_or(limit, |m| limit.min(m.max_forward_mps));
+        }
+        if d.actuator_max_yaw_rps > 0.0 {
+            config.follower.max_angular_speed_rps = d.actuator_max_yaw_rps;
+            if let Some(limits) = config.follower.motion_limits.as_mut() {
+                limits.max_angular_rps = limits.max_angular_rps.min(d.actuator_max_yaw_rps);
             }
         }
-        if let Ok(value) = std::env::var("_NUWAX_NAV_ACTUATOR_MAX_YAW_RPS") {
-            if !value.trim().is_empty() {
-                let limit = parse_number("_NUWAX_NAV_ACTUATOR_MAX_YAW_RPS", &value)?;
-                if limit <= 0.0 {return Err(NavStackError::InvalidConfig("执行器角速度上限必须为正".into()));}
-                config.follower.max_angular_speed_rps = limit;
-                if let Some(limits) = config.follower.motion_limits.as_mut() {
-                    limits.max_angular_rps = limits.max_angular_rps.min(limit);
-                }
+        if !d.actuator_motion_model.is_empty() {
+            if d.actuator_motion_model != "omnidirectional" {
+                return Err(NavStackError::InvalidConfig(
+                    "不支持的执行器基本运动形式".into(),
+                ));
             }
+            let speed = d.actuator_max_linear_mps;
+            let motion = MotionKinematics {
+                model: MotionModel::Omnidirectional,
+                max_forward_mps: speed,
+                max_reverse_mps: speed,
+                max_lateral_mps: speed,
+                max_angular_rps: d.actuator_max_yaw_rps,
+                minimum_turning_radius_m: 0.0,
+                can_rotate_in_place: true,
+            };
+            motion.validate().map_err(NavStackError::InvalidConfig)?;
+            config.follower.basic_kinematics = Some(motion);
         }
-        if let Ok(model)=std::env::var("_NUWAX_NAV_ACTUATOR_MOTION_MODEL") {
-            if !model.trim().is_empty() {
-                if model!="omnidirectional" {
-                    return Err(NavStackError::InvalidConfig("不支持的执行器基本运动形式".into()));
-                }
-                let speed=std::env::var("_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS")
-                    .map_err(|_|NavStackError::InvalidConfig("基本运动通道缺少执行器线速度上限".into()))?;
-                let angular=std::env::var("_NUWAX_NAV_ACTUATOR_MAX_YAW_RPS")
-                    .map_err(|_|NavStackError::InvalidConfig("基本运动通道缺少执行器角速度上限".into()))?;
-                let speed=parse_number("_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS",&speed)?;
-                let motion=MotionKinematics {model:MotionModel::Omnidirectional,
-                    max_forward_mps:speed,max_reverse_mps:speed,max_lateral_mps:speed,
-                    max_angular_rps:parse_number("_NUWAX_NAV_ACTUATOR_MAX_YAW_RPS",&angular)?,
-                    minimum_turning_radius_m:0.0,can_rotate_in_place:true};
-                motion.validate().map_err(NavStackError::InvalidConfig)?;
-                config.follower.basic_kinematics=Some(motion);
-            }
-        }
-        tracing::info!(target:"navigation.config",event="navigation.config.loaded",profile="pct-scan-3d",
-            voxel_m=config.geometry.voxel_size,local_horizon_m=config.follower.scan.planning_horizon,
-            max_step_up_m=config.body_envelope.max_step_up_m,
-            max_step_down_m=config.body_envelope.max_step_down_m,
-            "三维导航已读取统一配置");
+        tracing::info!(target:"navigation.config",event="navigation.config.loaded",profile=%d.nav_profile,
+                        voxel_m=config.geometry.voxel_size,local_horizon_m=config.follower.scan.planning_horizon,
+                        "三维导航已读取统一配置");
         Ok(config)
     }
 
@@ -132,11 +143,17 @@ impl SurfaceNavigationConfig {
         min_stair_tread_m: f64,
     ) -> NavStackResult<Self> {
         if frame != "map"
-            || [voxel_size_m, min_stair_tread_m].iter().any(|value| !value.is_finite() || *value <= 0.0)
-            || !max_step_height_m.is_finite() || max_step_height_m < 0.0
-            || !max_slope_deg.is_finite() || !(0.0..90.0).contains(&max_slope_deg)
+            || [voxel_size_m, min_stair_tread_m]
+                .iter()
+                .any(|value| !value.is_finite() || *value <= 0.0)
+            || !max_step_height_m.is_finite()
+            || max_step_height_m < 0.0
+            || !max_slope_deg.is_finite()
+            || !(0.0..90.0).contains(&max_slope_deg)
         {
-            return Err(NavStackError::InvalidConfig("invalid calibrated surface navigation geometry".into()));
+            return Err(NavStackError::InvalidConfig(
+                "invalid calibrated surface navigation geometry".into(),
+            ));
         }
         let envelope = SurfaceBodyEnvelope {
             fixed_collision: body.self_collision,
@@ -171,12 +188,22 @@ impl SurfaceNavigationConfig {
             || !geometry.node_spacing_m.is_normal()
             || geometry.min_step_tread_depth_m < geometry.voxel_size * 2.0
         {
-            return Err(NavStackError::InvalidConfig("surface geometry exceeds float32 domain or tread is below two voxels".into()));
+            return Err(NavStackError::InvalidConfig(
+                "surface geometry exceeds float32 domain or tread is below two voxels".into(),
+            ));
         }
         let mut follower = SurfaceFollowerConfig::new(-body.z_min_m);
         // 三维生产调度为20赫兹，速度窗口的加减速时间必须采用同一控制周期。
-        follower.controller.control_frequency = 1.0 / nuwax_nav_runtime::DEFAULT_TICK_INTERVAL.as_secs_f64();
-        Ok(Self { geometry, body_envelope: envelope, follower, planning_cancelled: None, planner: Default::default() })
+        follower.controller.control_frequency =
+            1.0 / nuwax_nav_runtime::DEFAULT_TICK_INTERVAL.as_secs_f64();
+        Ok(Self {
+            lcm_url: String::new(),
+            geometry,
+            body_envelope: envelope,
+            follower,
+            planning_cancelled: None,
+            planner: Default::default(),
+        })
     }
     /// 两端用同一已验证标定物化外形和运动约束。
     pub fn apply_calibration(
@@ -252,34 +279,11 @@ impl SurfaceNavigationConfig {
     }
 }
 
-fn configured_number(key: &str, default: f64) -> NavStackResult<f64> {
-    match std::env::var(key) {
-        Ok(value) if !value.trim().is_empty() => parse_number(key, &value),
-        _ => Ok(default),
-    }
-}
 
-fn optional_step(key: &str) -> NavStackResult<Option<f64>> {
-    match std::env::var(key) {
-        Ok(value) if !value.trim().is_empty() => {
-            let value = parse_number(key, &value)?;
-            if !(0.0..=1.0).contains(&value) {
-                return Err(NavStackError::InvalidConfig(format!("{key}需要0—1米的有限数值")));
-            }
-            Ok(Some(value))
-        }
-        _ => Ok(None),
-    }
-}
 
-fn parse_number(key: &str, value: &str) -> NavStackResult<f64> {
-    value
-        .trim()
-        .parse::<f64>()
-        .ok()
-        .filter(|value| value.is_finite())
-        .ok_or_else(|| NavStackError::InvalidConfig(format!("{key} must be a finite number")))
-}
+
+
+
 
 #[cfg(test)]
 mod tests {
@@ -329,44 +333,38 @@ mod tests {
         assert!(config.body_envelope.fixed_collision.is_none());
     }
 
-    fn isolated_loader_process() -> std::process::Command {
-        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        command.env_clear();
-        // Keep only the dynamic-loader search path required by relocatable SDKs;
-        // navigation settings remain isolated from the parent test environment.
-        for key in ["LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"] {
-            if let Some(value) = std::env::var_os(key) { command.env(key,value); }
-        }
-        command
+    fn loader_fixture() -> (
+        nuwax_config::sections::Navigation,
+        nuwax_config::sections::Robot,
+        nuwax_config::sections::Derived,
+    ) {
+        (nuwax_config::test_support::section("navigation"),nuwax_config::test_support::section("robot"),
+                    nuwax_config::sections::Derived {nav_profile:"pct-scan-3d".into(),actuator_max_linear_mps:0.0,
+                        actuator_max_yaw_rps:0.0,actuator_motion_model:String::new(),robot_geometry_json:
+                        r#"{"footprint_xy_m":[[-0.3,-0.16],[0.3,-0.16],[0.3,0.16],[-0.3,0.16]],"z_min_m":-0.05,"z_max_m":0.2,"source":"设置回归"}"#.into()})
     }
 
     #[test]
     fn directional_step_settings_reach_the_body_and_geometry_from_the_real_loader() {
-        const CHILD: &str = "NUWAX_TEST_DIRECTIONAL_STEPS";
-        if let Ok(case) = std::env::var(CHILD) {
-            let loaded = SurfaceNavigationConfig::from_env();
-            if case == "invalid" {
-                assert!(loaded.is_err());
-                return;
+        for (up, down, accepted) in [
+            (Some(0.2), Some(0.1), true),
+            (None, None, true),
+            (Some(-0.1), Some(0.2), false),
+            (Some(f64::NAN), Some(0.2), false),
+            (Some(0.2), Some(1.1), false),
+        ] {
+            let (mut n, r, d) = loader_fixture();
+            n.max_step_up_m = up;
+            n.max_step_down_m = down;
+            let loaded = SurfaceNavigationConfig::from_config(&n, &r, &d);
+            assert_eq!(loaded.is_ok(), accepted);
+            if accepted {
+                let config = loaded.unwrap();
+                let expected = [up.unwrap_or(0.15), down.unwrap_or(0.15)];
+                assert!((config.body_envelope.max_step_up_m - expected[0]).abs() < 1e-6);
+                assert!((config.body_envelope.max_step_down_m - expected[1]).abs() < 1e-6);
+                assert!((f64::from(config.geometry.step_threshold_m) - expected[0]).abs() < 1e-6);
             }
-            let config = loaded.unwrap();
-            let body = config.body_envelope;
-            let expected = if case == "inherit" { [0.15, 0.15] } else { [0.2, 0.1] };
-            assert!((body.max_step_up_m - expected[0]).abs() < 1e-6);
-            assert!((body.max_step_down_m - expected[1]).abs() < 1e-6);
-            assert!((f64::from(config.geometry.step_threshold_m) - expected[0]).abs() < 1e-6);
-            return;
-        }
-        let model = r#"{"footprint_xy_m":[[-0.3,-0.16],[0.3,-0.16],[0.3,0.16],[-0.3,0.16]],"z_min_m":-0.05,"z_max_m":0.2,"source":"设置回归"}"#;
-        for (case, up, down) in [("configured", "0.2", "0.1"), ("inherit", "", ""),
-            ("invalid", "-0.1", "0.2"), ("invalid", "NaN", "0.2"), ("invalid", "0.2", "1.1")] {
-            let result = isolated_loader_process()
-                .args(["--exact", "surface_config::tests::directional_step_settings_reach_the_body_and_geometry_from_the_real_loader", "--nocapture"])
-                .env(CHILD, case)
-                .env("NUWAX_ROBOT_GEOMETRY_JSON", model)
-                .env("NUWAX_NAV_MAX_STEP_UP_M", up).env("NUWAX_NAV_MAX_STEP_DOWN_M", down)
-                .output().unwrap();
-            assert!(result.status.success(), "台阶设置加载失败：{}", String::from_utf8_lossy(&result.stderr));
         }
     }
 
@@ -403,18 +401,11 @@ mod tests {
 
     #[test]
     fn actuator_speed_is_not_capped_by_the_legacy_controller_default() {
-        const CHILD: &str = "NUWAX_TEST_SURFACE_SPEED_CHILD";
-        if let Ok(expected)=std::env::var(CHILD) {
-            let config=SurfaceNavigationConfig::from_env().unwrap();
-            assert_eq!(config.follower.controller.speed,expected.parse::<f64>().unwrap());
-            return;
-        }
-        for speed in ["1.0","0.35"] {
-            let result=isolated_loader_process()
-                .args(["--exact","surface_config::tests::actuator_speed_is_not_capped_by_the_legacy_controller_default","--nocapture"])
-                .env("NUWAX_ROBOT_GEOMETRY_JSON", r#"{"footprint_xy_m":[[-0.2,-0.1],[0.2,-0.1],[0.2,0.1],[-0.2,0.1]],"z_min_m":-0.4,"z_max_m":0.2}"#).env(CHILD,speed)
-                .env("_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS",speed).output().unwrap();
-            assert!(result.status.success(),"生产环境解析未消费设备速度：{}",String::from_utf8_lossy(&result.stderr));
+        for speed in [1.0, 0.35] {
+            let (n, r, mut d) = loader_fixture();
+            d.actuator_max_linear_mps = speed;
+            let config = SurfaceNavigationConfig::from_config(&n, &r, &d).unwrap();
+            assert_eq!(config.follower.controller.speed, speed);
         }
     }
 

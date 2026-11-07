@@ -456,21 +456,12 @@ pub struct NavigationMap3D {
     pub source_voxel_size: f32,
     /// 明确撤下地图。
     pub cleared: bool,
-    /// 建图地面块提交失败导致的撤销。
-    pub ground_block_failed: bool,
     /// 与当前地图一起发布的纯虚拟禁区。
     pub virtual_obstacles: Option<OccupancyGrid>,
     /// 固定精度完整根；有该字段时不另携带全量云。
     pub fine: Option<nuwax_map_chunks::Transfer>,
     /// 位于地图坐标系的三维点云。
     pub cloud: PointCloud2,
-}
-
-/// 来源撤销的稳定业务原因；普通清空沿用原语义。
-pub fn navigation_map_clear_reason(message: &NavigationMap3D) -> &'static str {
-    if message.ground_block_failed {
-        "mapping_ground_block_write_failed: 建图地面块提交失败，地图来源已撤销"
-    } else { "surface map cleared by mapping owner" }
 }
 
 /// 校验三维导航地图身份、内部云头及有限三维点布局。
@@ -481,9 +472,6 @@ pub fn validate_navigation_map_3d(message: &NavigationMap3D) -> Result<(), Strin
 fn validate_navigation_map_3d_with_root(
     message: &NavigationMap3D,
 ) -> Result<Option<nuwax_map_chunks::Manifest>, String> {
-    if message.ground_block_failed && !message.cleared {
-        return Err("ground block failure requires a cleared NavigationMap3D".into());
-    }
     validate_navigation_frame_id(&message.frame_id, "NavigationMap3D")?;
     if message.session_id.trim() != message.session_id || message.session_id.contains('\0')
         || (!message.cleared && message.session_id.is_empty())
@@ -740,7 +728,7 @@ pub fn encode_navigation_map_3d_body(message: &NavigationMap3D) -> CodecResult<V
     encode_string(&message.frame_id, &mut out)?;
     out.extend_from_slice(&message.source_timestamp_ns.to_be_bytes());
     out.extend_from_slice(&message.source_voxel_size.to_be_bytes());
-    out.push(if message.ground_block_failed { 2 } else { u8::from(message.cleared) });
+    out.push(u8::from(message.cleared));
     out.push(u8::from(message.virtual_obstacles.is_some()));
     out.extend_from_slice(&encode_occupancy_grid_body(
         message
@@ -788,13 +776,12 @@ pub fn decode_navigation_map_3d_body_with_root(
     let frame_id = cursor.read_string()?;
     let source_timestamp_ns = cursor.read_i64()?;
     let source_voxel_size = cursor.read_f32()?;
-    let (cleared, ground_block_failed) = match cursor.read_u8()? {
-        0 => (false, false),
-        1 => (true, false),
-        2 => (true, true),
+    let cleared = match cursor.read_u8()? {
+        0 => false,
+        1 => true,
         _ => {
             return Err(CodecError::LcmDecode(
-                "NavigationMap3D cleared must be 0, 1 or 2".into(),
+                "NavigationMap3D cleared must be 0 or 1".into(),
             ))
         }
     };
@@ -818,25 +805,46 @@ pub fn decode_navigation_map_3d_body_with_root(
         }
         None
     };
-    let has_fine = match cursor.read_u8()? { 0 => false, 1 => true, _ => return Err(CodecError::LcmDecode("has_fine_map必须为0或1".into())) };
+    let has_fine = match cursor.read_u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(CodecError::LcmDecode("has_fine_map必须为0或1".into())),
+    };
     let length = cursor.read_i32()?;
-    if length < 0 || length as usize > nuwax_map_chunks::MAX_MANIFEST_BYTES { return Err(CodecError::LcmDecode("精细根长度无效".into())); }
+    if length < 0 || length as usize > nuwax_map_chunks::MAX_MANIFEST_BYTES {
+        return Err(CodecError::LcmDecode("精细根长度无效".into()));
+    }
     let root = cursor.read_exact(length as usize)?.to_vec();
     let count = cursor.read_i32()?;
-    if count < 0 || count as usize > NAVIGATION_MAP_MAX_INCLUDED_BLOCKS { return Err(CodecError::LcmDecode("携带精细块数量无效".into())); }
+    if count < 0 || count as usize > NAVIGATION_MAP_MAX_INCLUDED_BLOCKS {
+        return Err(CodecError::LcmDecode("携带精细块数量无效".into()));
+    }
     let mut included = std::collections::BTreeMap::new();
     let mut total = 0;
     for _ in 0..count {
         let object = decode_navigation_map_object_identity(&mut cursor)?;
         let length = cursor.read_i32()?;
-        if length < 0 || length as usize > nuwax_map_chunks::MAX_BLOCK_BYTES { return Err(CodecError::LcmDecode("精细块长度无效".into())); }
+        if length < 0 || length as usize > nuwax_map_chunks::MAX_BLOCK_BYTES {
+            return Err(CodecError::LcmDecode("精细块长度无效".into()));
+        }
         total += length as usize;
-        if total > NAVIGATION_MAP_MAX_INCLUDED_BYTES { return Err(CodecError::LcmDecode("携带精细块总长超预算".into())); }
-        if included.insert(object, cursor.read_exact(length as usize)?.to_vec()).is_some() { return Err(CodecError::LcmDecode("携带精细块重复".into())); }
+        if total > NAVIGATION_MAP_MAX_INCLUDED_BYTES {
+            return Err(CodecError::LcmDecode("携带精细块总长超预算".into()));
+        }
+        if included
+            .insert(object, cursor.read_exact(length as usize)?.to_vec())
+            .is_some()
+        {
+            return Err(CodecError::LcmDecode("携带精细块重复".into()));
+        }
     }
-    let fine = if has_fine { Some(nuwax_map_chunks::Transfer { root, included }) }
-        else if root.is_empty() && included.is_empty() { None }
-        else { return Err(CodecError::LcmDecode("空精细根不能携带隐藏数据".into())); };
+    let fine = if has_fine {
+        Some(nuwax_map_chunks::Transfer { root, included })
+    } else if root.is_empty() && included.is_empty() {
+        None
+    } else {
+        return Err(CodecError::LcmDecode("空精细根不能携带隐藏数据".into()));
+    };
     let cloud_body = cursor.read_exact(cursor.remaining())?;
     let cloud = decode_point_cloud2_body(cloud_body)?;
     let message = NavigationMap3D {
@@ -846,7 +854,6 @@ pub fn decode_navigation_map_3d_body_with_root(
         source_timestamp_ns,
         source_voxel_size,
         cleared,
-        ground_block_failed,
         virtual_obstacles,
         fine,
         cloud,
@@ -2405,18 +2412,6 @@ mod navigation_map_3d_tests {
         assert!(validate_navigation_map_3d(&clear).is_err());
     }
 
-    #[test]
-    fn ground_block_failure_roundtrips_as_an_explicit_clear_and_rejects_live_geometry() {
-        let mut message = cleared_map();
-        message.ground_block_failed = true;
-        let bytes = encode_navigation_map_3d(&message).unwrap();
-        assert_eq!(decode_navigation_map_3d(&bytes).unwrap(), message);
-        assert!(navigation_map_clear_reason(&message).contains("mapping_ground_block_write_failed"));
-        message.cleared = false;
-        assert!(encode_navigation_map_3d(&message).is_err());
-        let mut live = live_map(); live.ground_block_failed = true;
-        assert!(encode_navigation_map_3d(&live).is_err());
-    }
 
     #[test]
     fn live_and_clear_round_trip_and_protocol_fingerprint() {

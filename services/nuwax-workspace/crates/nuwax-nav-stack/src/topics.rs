@@ -157,80 +157,27 @@ impl NavTopicConfig {
     /// Platform channel defaults shared with `nuwax-geometry-runtime`.
     /// Typed `#message.Type` suffixes are stripped because the stack binds the
     /// generated message type separately at subscription time.
+    pub fn for_pipeline(pipeline: crate::ProductionPipeline) -> Self {
+        let mut config = Self::geometry_runtime_defaults();
+        if pipeline == crate::ProductionPipeline::Slam2D {
+            config.set("occupancy", "/nav/planar_occupancy");
+        }
+        config
+    }
     pub fn geometry_runtime_defaults() -> Self {
         let mut config = Self::cmu_defaults();
-        for (port, keys, fallback) in [
-            (
-                "goal_pose",
-                &[
-
-                    "NUWAX_LCM_CHANNEL_GOAL_POSE",
-                ][..],
-                "/nav/goal",
-            ),
-            (
-                "nav_cancel",
-                &[
-
-                    "NUWAX_LCM_CHANNEL_NAV_CANCEL",
-                ][..],
-                "/nav/cancel",
-            ),
-            (
-                "nav_state",
-                &[
-
-                    "NUWAX_LCM_CHANNEL_NAV_STATE",
-                ][..],
-                "/nav/state",
-            ),
-            (
-                "odometry",
-                &[
-
-                    "NUWAX_LCM_CHANNEL_ODOM",
-                ][..],
-                "/odom",
-            ),
-            (
-                "tf",
-                &["NUWAX_LCM_CHANNEL_TF"][..],
-                "/tf",
-            ),
-            (
-                "occupancy",
-                &[
-
-                    "NUWAX_LCM_CHANNEL_OCCUPANCY",
-                ][..],
-                "/map/occupancy",
-            ),
-            (
-                "terrain_map",
-                &[
-
-                    "NUWAX_LCM_CHANNEL_CLOUD_MAP",
-                ][..],
-                "/cloud_map",
-            ),
-            (
-                "terrain_map_ext",
-                &[
-
-                    "NUWAX_LCM_CHANNEL_CLOUD_MAP",
-                ][..],
-                "/cloud_map",
-            ),
-            (
-                "cmd_vel",
-                &[
-
-                    "NUWAX_LCM_CHANNEL_CMD_VEL",
-                ][..],
-                "/cmd_vel",
-            ),
+        for (port, channel) in [
+            ("goal_pose", "/nav/goal"),
+            ("nav_cancel", "/nav/cancel"),
+            ("nav_state", "/nav/state"),
+            ("odometry", "/odom"),
+            ("tf", "/tf"),
+            ("occupancy", "/map/occupancy"),
+            ("terrain_map", "/cloud_map"),
+            ("terrain_map_ext", "/cloud_map"),
+            ("cmd_vel", "/cmd_vel"),
         ] {
-            config.set(port, configured_channel(keys, fallback));
+            config.set(port, channel);
         }
         for (port, channel) in [
             ("map_pose", "/nav/map_pose"),
@@ -250,11 +197,6 @@ impl NavTopicConfig {
         ] {
             config.set(port, channel);
         }
-        if std::env::var("NUWAX_GEOMETRY_PIPELINE").as_deref()==Ok("slam_2d") {
-            config.set("occupancy", configured_channel(
-                &["NUWAX_LCM_CHANNEL_PLANAR_NAVIGATION"],
-                "/nav/planar_occupancy"));
-        }
         config
     }
 
@@ -272,16 +214,7 @@ impl NavTopicConfig {
     }
 }
 
-fn configured_channel(keys: &[&str], fallback: &str) -> String {
-    let configured = keys
-        .iter()
-        .filter_map(|key| std::env::var(key).ok())
-        .find(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| fallback.to_string());
-    configured
-        .split_once('#')
-        .map_or(configured.clone(), |(channel, _)| channel.to_string())
-}
+
 
 impl Default for NavTopicConfig {
     fn default() -> Self {
@@ -322,13 +255,6 @@ mod tests {
         assert_eq!(cfg, back);
     }
 
-    #[test]
-    fn geometry_runtime_channel_strips_typed_suffix() {
-        assert_eq!(
-            configured_channel(&[], "/nav/goal#nuwax_msgs.NavigationGoal"),
-            "/nav/goal"
-        );
-    }
 
     #[test]
     fn occupancy_and_registered_scan_remain_type_distinct() {

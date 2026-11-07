@@ -13,45 +13,22 @@ pub struct SavePolicy {
     pub rotation_deg: f64,
     pub interval_s: f64,
 }
+#[cfg(test)]
 impl Default for SavePolicy {
     fn default() -> Self {
-        Self {
-            translation_m: 0.1,
-            rotation_deg: 3.0,
-            interval_s: 1.0,
-        }
+        Self::from_config(&nuwax_config::test_support::section("geometry"))
     }
 }
 impl SavePolicy {
-    pub fn from_env() -> Result<Self, String> {
-        let number = |name: &str, default: f64, max: f64| {
-            let text = std::env::var(name).map_err(|e| match e {
-                std::env::VarError::NotPresent => String::new(),
-                _ => format!("{name} 必须是有效文本"),
-            });
-            let text = match text {
-                Ok(t) => t,
-                Err(t) if t.is_empty() => default.to_string(),
-                Err(e) => return Err(e),
-            };
-            let n = if text.trim().is_empty() {
-                default
-            } else {
-                text.trim()
-                    .parse::<f64>()
-                    .map_err(|_| format!("{name} 必须是数值"))?
-            };
-            if n.is_finite() && (0.0..=max).contains(&n) {
-                Ok(n)
-            } else {
-                Err(format!("{name} 必须在0～{max}之间"))
-            }
-        };
-        Ok(Self {
-            translation_m: number("NUWAX_RAW_SCAN_TRANSLATION_M", 0.1, 100.0)?,
-            rotation_deg: number("NUWAX_RAW_SCAN_ROTATION_DEG", 3.0, 180.0)?,
-            interval_s: number("NUWAX_RAW_SCAN_INTERVAL_S", 1.0, 3600.0)?,
-        })
+    pub fn from_runtime() -> Result<Self, String> {
+        Ok(Self::from_config(nuwax_config::geometry()?))
+    }
+    pub fn from_config(g: &nuwax_config::sections::Geometry) -> Self {
+        Self {
+            translation_m: g.raw_scan_translation_m,
+            rotation_deg: g.raw_scan_rotation_deg,
+            interval_s: g.raw_scan_interval_s,
+        }
     }
     pub fn selects(&self, previous: Option<&ScanMetadata>, current: &ScanMetadata) -> bool {
         let Some(p) = previous else {
@@ -74,18 +51,7 @@ impl SavePolicy {
     }
 }
 fn queue_capacity() -> Result<usize, String> {
-    let v = match std::env::var("NUWAX_RAW_SCAN_QUEUE_FRAMES") {
-        Ok(v) => v,
-        Err(std::env::VarError::NotPresent) => "16".into(),
-        Err(_) => return Err("NUWAX_RAW_SCAN_QUEUE_FRAMES 必须是有效文本".into()),
-    };
-    let v = if v.trim().is_empty() { "16" } else { v.trim() };
-    v.bytes()
-        .all(|b| b.is_ascii_digit())
-        .then(|| v.parse::<usize>().ok())
-        .flatten()
-        .filter(|n| (1..=256).contains(n))
-        .ok_or_else(|| "NUWAX_RAW_SCAN_QUEUE_FRAMES 必须是1～256的整数".into())
+    Ok(nuwax_config::geometry()?.raw_scan_queue_frames as usize)
 }
 #[derive(Default)]
 struct Status {
@@ -170,7 +136,7 @@ pub struct StorageWorker {
 impl StorageWorker {
     pub fn validate_config() -> Result<(), String> {
         storage_budget_bytes()?;
-        SavePolicy::from_env()?;
+        SavePolicy::from_runtime()?;
         queue_capacity()?;
         Ok(())
     }
@@ -357,7 +323,7 @@ impl Recorder {
                 session,
                 status: Arc::new(Status::default()),
             }),
-            policy: SavePolicy::from_env()?,
+            policy: SavePolicy::from_runtime()?,
             previous: None,
         })
     }

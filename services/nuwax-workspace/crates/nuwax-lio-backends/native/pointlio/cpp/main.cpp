@@ -819,7 +819,7 @@ static int run_pointlio(int argc, char** argv) {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
-    lcm::LCM lcm;
+    lcm::LCM lcm(mod.arg_required("lcm_url"));
     if (!lcm.good()) {
         fprintf(stderr, "Error: LCM init failed\n");
         return 1;

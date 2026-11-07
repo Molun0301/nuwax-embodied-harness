@@ -316,9 +316,15 @@ impl ProcessOwner {
         let client = Client::new(context.clone(), identity.clone(), directory.clone())?;
         let mut command = Command::new(binary);
         // 完整发布包的动态库只注入算法子进程，避免核心库加载进Geometry父进程。
-        if let Some(path) = std::env::var_os("NUWAX_GEOMETRY_SLAM2D_LIBRARY_PATH") {
-            command.env("LD_LIBRARY_PATH", path);
+        let lib = binary.parent().expect("二维程序目录").join("../lib");
+        let mut paths = vec![lib, binary.parent().expect("二维程序目录").join("../lib64")];
+        if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH") {
+            paths.extend(std::env::split_paths(&existing));
         }
+        command.env(
+            "LD_LIBRARY_PATH",
+            std::env::join_paths(paths).map_err(|e| e.to_string())?,
+        );
         command
             .arg("--owner")
             .arg(&identity.owner_nonce)

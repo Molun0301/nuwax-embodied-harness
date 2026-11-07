@@ -4,8 +4,6 @@ use super::*;
 use serde_json::Value;
 use std::process::Command;
 
-const CASE_ENV: &str = "NEH_FIXED_SELF_TEST_CASE";
-const TEST_NAME: &str = "self_cloud::python_geometry_tests::python_models_reach_production_filter";
 
 fn check_case(case: &Value) {
     let json = case["runtime_json"].as_str().unwrap();
@@ -34,14 +32,18 @@ fn check_case(case: &Value) {
         assert_eq!(case["expected_source"], "manual");
         assert!(parsed.is_none(), "手填尺寸不得回退导航外包");
         for alias in ["base_link", "go2_base_link"] {
-            assert!(RobotSelfFilter::from_env(alias).unwrap().is_none());
+            assert!(RobotSelfFilter::from_runtime_geometry(alias, json)
+                .unwrap()
+                .is_none());
         }
         return;
     }
     let parsed = parsed.unwrap();
     assert_eq!(parsed.model_base_link, "base");
     for alias in ["base_link", "go2_base_link"] {
-        let filter = RobotSelfFilter::from_env(alias).unwrap().unwrap();
+        let filter = RobotSelfFilter::from_runtime_geometry(alias, json)
+            .unwrap()
+            .unwrap();
         assert_eq!(filter.model_base_link, parsed.model_base_link);
         assert_eq!(filter.primitives.len(), parsed.primitives.len());
         for (a, b) in filter.primitives.iter().zip(&parsed.primitives) {
@@ -100,11 +102,6 @@ fn check_case(case: &Value) {
 
 #[test]
 fn python_models_reach_production_filter() {
-    // 环境绑定只在独立子进程中传入，不与并行测试共享set_var。
-    if let Ok(case) = std::env::var(CASE_ENV) {
-        check_case(&serde_json::from_str::<Value>(&case).unwrap());
-        return;
-    }
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(3)
@@ -123,30 +120,7 @@ fn python_models_reach_production_filter() {
     let cases: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(cases.len(), 3);
     for case in cases {
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args([TEST_NAME, "--exact", "--nocapture", "--test-threads=1"])
-            .env(CASE_ENV, serde_json::to_string(&case).unwrap())
-            .env(
-                "NUWAX_ROBOT_GEOMETRY_JSON",
-                case["runtime_json"].as_str().unwrap(),
-            )
-            .output()
-            .expect("启动隔离分类测试");
-        assert!(
-            output.status.success(),
-            "{}\n{}\n{}",
-            case["name"],
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
-            "隔离子进程必须实际运行一个精确用例"
-        );
-        println!(
-            "Python→生产过滤器：{} 通过；{}",
-            case["name"],
-            String::from_utf8_lossy(&output.stderr)
-        );
+        check_case(&case);
+        println!("Python→生产过滤器：{} 通过",case["name"]);
     }
 }

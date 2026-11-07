@@ -15,14 +15,14 @@ impl ProductionPipeline {
     /// 解析执行链并核对可选的显式导航值；不允许跨维度或静默回退。
     pub fn from_settings(pipeline: Option<&str>, profile: Option<&str>) -> NavStackResult<Self> {
         if pipeline.is_some_and(|value| value != value.trim()) {
-            return Err(NavStackError::invalid("NUWAX_GEOMETRY_PIPELINE不能包含首尾空白"));
+            return Err(NavStackError::invalid("geometry.pipeline不能包含首尾空白"));
         }
         let selected = match pipeline.map(str::trim).filter(|value| !value.is_empty()) {
             None | Some("lio_3d") => Self::Lio3D,
             Some("slam_2d") => Self::Slam2D,
             Some(_) => {
                 return Err(NavStackError::invalid(
-                    "NUWAX_GEOMETRY_PIPELINE必须为lio_3d或slam_2d",
+                    "geometry.pipeline必须为lio_3d或slam_2d",
                 ));
             }
         };
@@ -30,7 +30,7 @@ impl ProductionPipeline {
             let legacy_3d = selected == Self::Lio3D && profile == "mls-3d";
             if !legacy_3d && profile != selected.navigation_profile().as_str() {
                 return Err(NavStackError::invalid(format!(
-                    "执行链{}固定使用{}导航，NUWAX_NAV_PROFILE={}与执行链冲突；请移除该覆盖或改为{}",
+                    "执行链{}固定使用{}导航，derived.nav_profile={}与执行链冲突；请移除该覆盖或改为{}",
                     selected.as_str(),
                     selected.navigation_profile().as_str(),
                     profile,
@@ -41,19 +41,10 @@ impl ProductionPipeline {
         Ok(selected)
     }
 
-    /// 在创建生产资源前读取并捕获配置；非文本环境值明确拒绝。
-    pub fn from_env() -> NavStackResult<Self> {
-        let read = |name: &str| match std::env::var(name) {
-            Ok(value) => Ok(Some(value)),
-            Err(std::env::VarError::NotPresent) => Ok(None),
-            Err(std::env::VarError::NotUnicode(_)) => {
-                Err(NavStackError::invalid(format!("{name}必须为有效文本")))
-            }
-        };
-        Self::from_settings(
-            read("NUWAX_GEOMETRY_PIPELINE")?.as_deref(),
-            read("NUWAX_NAV_PROFILE")?.as_deref(),
-        )
+    /// 在创建生产资源前从合成配置捕获执行链。
+    pub fn from_runtime() -> NavStackResult<Self> {
+        let config = nuwax_config::geometry().map_err(NavStackError::InvalidConfig)?;
+        Self::from_settings(Some(&config.pipeline), None)
     }
 
     /// 执行链的规范名称。

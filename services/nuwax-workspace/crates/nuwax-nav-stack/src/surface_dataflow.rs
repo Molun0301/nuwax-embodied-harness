@@ -102,7 +102,7 @@ pub(crate) fn register_surface_owners(runner: &mut StackRunner, body: Result<Arc
     if runner.graph().find("surface_nav_scheduler").is_none() {
         return;
     }
-    register_surface_owners_with_config(runner, SurfaceNavigationConfig::from_env(), body);
+    register_surface_owners_with_config(runner, SurfaceNavigationConfig::from_runtime(), body);
 }
 
 fn register_surface_owners_with_config(
@@ -321,32 +321,52 @@ fn prepare_surface_map_with_retry(
     received_at: Instant,
     config: &SurfaceNavigationConfig,
     cache: &mut SurfaceGeometryCache,
-) -> (PreparedSurfaceMap, Option<(nuwax_map_chunks::ObjectIdentity, nuwax_map_chunks::Key)>) {
+) -> (
+    PreparedSurfaceMap,
+    Option<(nuwax_map_chunks::ObjectIdentity, nuwax_map_chunks::Key)>,
+) {
     let message = message.into();
     let authority = map_authority(&message);
     let source_timestamp_ns = message.source_timestamp_ns;
     let snapshot = if message.cleared {
         cache.reset();
-        Err(schema::navigation_map_clear_reason(&message).into())
+        Err("surface map cleared by mapping owner".into())
     } else if message.frame_id != config.geometry.world_frame {
         Err("surface map frame differs from configured map frame".into())
     } else {
         cache.build_with_changes(&message)
     };
     let missing_object = match &snapshot {
-        Err(SurfaceMapBuildError::IncompleteFineSource(missing)) => Some((missing.object, missing.key)),
+        Err(SurfaceMapBuildError::IncompleteFineSource(missing)) => {
+            Some((missing.object, missing.key))
+        }
         _ => None,
     };
     let (snapshot, awaiting_build, change_basis, geometry_changes) = match snapshot {
-        Ok(update) => (Ok(update.snapshot), false, update.change_basis, update.changes),
+        Ok(update) => (
+            Ok(update.snapshot),
+            false,
+            update.change_basis,
+            update.changes,
+        ),
         Err(error) => {
             let incomplete = matches!(error, SurfaceMapBuildError::IncompleteFineSource(_));
-            (Err(error.to_string()), incomplete, None, Arc::new(SurfaceGeometryChanges::Unknown))
+            (
+                Err(error.to_string()),
+                incomplete,
+                None,
+                Arc::new(SurfaceGeometryChanges::Unknown),
+            )
         }
     };
     let prepared = PreparedSurfaceMap {
-        authority, source_timestamp_ns, received_at, awaiting_build,
-        snapshot, change_basis, geometry_changes,
+        authority,
+        source_timestamp_ns,
+        received_at,
+        awaiting_build,
+        snapshot,
+        change_basis,
+        geometry_changes,
     };
     (prepared, missing_object)
 }
@@ -856,7 +876,7 @@ async fn run_surface_planner_with_computer(
                     pose = None; last_path = None; execution_admitted = false;
                     let invalid = PreparedSurfaceMap { authority: authority.clone(), source_timestamp_ns: message.source_timestamp_ns,
                         received_at, awaiting_build: !message.cleared, snapshot: Err(if message.cleared {
-                            schema::navigation_map_clear_reason(&message).into()
+                            "surface map cleared by mapping owner".into()
                         } else { "规范地图清空或切换，等待该域完整精细源".into() }),
                         change_basis: None, geometry_changes: Arc::new(SurfaceGeometryChanges::Unknown) };
                     hub.publish(invalid.clone()); latest_map = Some(invalid);
@@ -1037,13 +1057,13 @@ mod tests {
             repository: nuwax_map_chunks::Repository::open(directory.join("blocks")).unwrap(),
         };
         broker.register(method, Box::new(blocks)).await.unwrap();
-        let transport = Arc::new(nuwax_rpc::LcmRpcTransport::from_provider(&std::env::var("NUWAX_LCM_URL").unwrap()).unwrap());
+        let transport = Arc::new(nuwax_rpc::LcmRpcTransport::from_provider(&nuwax_config::transport().unwrap().lcm_url).unwrap());
         let server = broker.serve(transport, method).await.unwrap();
         let pose_file = std::env::var("NUWAX_NAV_DIAGNOSTIC_POSE_FILE").map(std::path::PathBuf::from).unwrap_or_else(|_|directory.join("pose.json"));
         let value: serde_json::Value = serde_json::from_slice(&std::fs::read(pose_file).unwrap()).unwrap();
         let position: [f64; 3] = serde_json::from_value(value["position"].clone()).unwrap();
         let quaternion: [f64; 4] = serde_json::from_value(value["quaternion"].clone()).unwrap();
-        let mut config = SurfaceNavigationConfig::from_env().unwrap();
+        let mut config = SurfaceNavigationConfig::from_runtime().unwrap();
         if let Ok(clearance) = std::env::var("NUWAX_NAV_DIAGNOSTIC_CLEARANCE") {
             config.geometry.wall_clearance_m = clearance.parse().unwrap();
         }
@@ -1394,13 +1414,14 @@ mod tests {
             }
         }
         schema::NavigationMap3D {
-            session_id: session.into(), frame_id: "map".into(),
+            session_id: session.into(),
+            frame_id: "map".into(),
 
             revision: revision,
             source_timestamp_ns: stamp,
             source_voxel_size: 0.1,
             cleared: false,
-            ground_block_failed: false,
+
             virtual_obstacles: None,
             fine: None,
             cloud: schema::PointCloud2 {
@@ -2866,41 +2887,6 @@ goal: schema::PoseStamped {
         harness.path_for(&next).await;
         harness.cancel(&next).await;
         harness.terminal(TerminalOutcome::Cancelled).await;
-        harness.shutdown().await;
-    }
-    #[tokio::test]
-    async fn ground_block_failure_revokes_active_navigation_with_explicit_reason() {
-        let mut harness = Harness::start().await;
-        harness.wait_ready().await;
-        let goal = goal_for(&harness.feed.lock().unwrap().map, 1, [3.2, 1.55, 2.5]);
-        harness.goal(&goal).await;
-        harness.path_for(&goal).await;
-        harness.wait_controlling().await;
-        let old = harness.freeze_map().await;
-        let mut failed = old.clone();
-        failed.revision += 1;
-        failed.cleared = true;
-        failed.ground_block_failed = true;
-        failed.virtual_obstacles = None;
-        failed.fine = None;
-
-        failed.source_timestamp_ns = 0;
-
-
-        failed.cloud = schema::PointCloud2 {
-            header: schema::Header {seq:failed.revision as i32,frame_id:"map".into(),..Default::default()},
-            ..Default::default()
-        };
-        harness.map(&failed).await;
-        harness.terminal(TerminalOutcome::SafetyFailed).await;
-        assert!(harness.scheduler.status().message.contains("mapping_ground_block_write_failed"));
-        assert_eq!(harness.scheduler.status().last_applied_twist, Some(Twist2::ZERO));
-        assert!(harness.calls.lock().unwrap().iter().any(|call|call.starts_with("release:")));
-        harness.calls.lock().unwrap().clear();
-        harness.map(&old).await;
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        assert!(harness.calls.lock().unwrap().is_empty(), "旧快照不能恢复运动");
-        assert!(!harness.scheduler.status().planner_inputs_fresh);
         harness.shutdown().await;
     }
 

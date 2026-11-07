@@ -36,8 +36,7 @@ impl NavBridge {
     pub async fn start(
         status_tx: mpsc::UnboundedSender<proto::NavigationStatus>,
     ) -> Result<Self, String> {
-        let url = std::env::var("NUWAX_LCM_URL")
-            .unwrap_or_else(|_| "udpm://239.255.76.67:7667?ttl=0".into());
+        let url = nuwax_config::transport()?.lcm_url.clone();
         Self::connect(
             Arc::new(move || LcmTransport::new_real(&url).map_err(|error| error.to_string())),
             status_tx,
@@ -57,9 +56,9 @@ impl NavBridge {
         create_transport: Arc<dyn Fn() -> Result<LcmTransport, String> + Send + Sync>,
         status_tx: mpsc::UnboundedSender<proto::NavigationStatus>,
     ) -> Result<Self, String> {
-        let state_topic = topic("NUWAX_LCM_CHANNEL_NAV_STATE", "/nav/state")?;
-        let goal_topic = topic("NUWAX_LCM_CHANNEL_GOAL_POSE", "/nav/goal")?;
-        let cancel_topic = topic("NUWAX_LCM_CHANNEL_NAV_CANCEL", "/nav/cancel")?;
+        let state_topic = topic("/nav/state")?;
+        let goal_topic = topic("/nav/goal")?;
+        let cancel_topic = topic("/nav/cancel")?;
         let initial = create_transport()?;
         let initial_states = subscribe_states(&initial, &state_topic).await?;
         publish_cancel(&initial, &cancel_topic, "")
@@ -418,9 +417,8 @@ fn state_update(state: schema::NavigationStatus) -> Option<proto::NavigationStat
 fn message_type(value: &str) -> Result<LcmMessageType, String> {
     LcmMessageType::new(value).map_err(|error| error.to_string())
 }
-fn topic(key: &str, default: &str) -> Result<LcmTopic, String> {
-    let value = std::env::var(key).unwrap_or_else(|_| default.into());
-    LcmTopic::new(value.split('#').next().unwrap_or(default)).map_err(|error| error.to_string())
+fn topic(default: &str) -> Result<LcmTopic, String> {
+    LcmTopic::new(default.split('#').next().unwrap_or(default)).map_err(|error| error.to_string())
 }
 #[cfg(test)]
 fn unix_ns() -> u64 {

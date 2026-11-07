@@ -34,43 +34,76 @@ impl Fixture {
             .unwrap()
             .port();
         let log = fs::File::create(root.join("进程.log")).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_nuwax-geometry-runtime"));
-        command.env("NUWAX_GEOMETRY_RUNTIME_PORT",port.to_string()).env("NUWAX_GEOMETRY_RUNTIME_READY_FILE",root.join("ready"))
-            .env("NUWAX_LCM_URL",format!("udpm://239.255.76.67:{lcm_port}?ttl=0"))
-            .env("NUWAX_MAP_CATALOG_ROOT",root.join("maps")).env("NUWAX_RUNTIME_DATA_DIR",root.join("runtime"))
-            .env("NUWAX_RAW_SCAN_DIRECTORY",root.join("scans")).env("NUWAX_CLOUDMAP_SHM_PATH",root.join("cloud.shm"))
-            .env("NUWAX_GEOMETRY_PIPELINE","lio_3d").env("NUWAX_GEOMETRY_LIO_BACKEND",if native{"fastlio2"}else{"device"})
-            .env("NUWAX_GEOMETRY_MAPPING_BACKEND","voxel").env("NUWAX_GEOMETRY_CORRECTION_BACKEND",if pgo{"library_pgo"}else{"relocalization"})
-            .env("NUWAX_PERSON_FOLLOW_AUTOSTART","false").env("NUWAX_GEOMETRY_FINE_CLOUD_CACHE_MIB","16")
-            .env("NUWAX_MAP_FRAME","map").env("NUWAX_GEOMETRY_ODOM_FRAME","odom").env("NUWAX_BASE_FRAME","base_link")
-            .env_remove("NUWAX_GEOMETRY_LIO_BODY_FROM_SENSOR").env("NUWAX_ROBOT_GEOMETRY_JSON",r#"{"footprint_xy_m":[[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],"z_min_m":-0.2,"z_max_m":0.2,"source":"会话进程测试"}"#)
-            .stdout(Stdio::from(log.try_clone().unwrap())).stderr(Stdio::from(log));
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let executable = bin.join("nuwax-geometry-runtime");
+        fs::copy(env!("CARGO_BIN_EXE_nuwax-geometry-runtime"), &executable).unwrap();
+        let mut config = nuwax_config::test_support::defaults();
+        config.set("geometry", "runtime_port", i64::from(port));
+        config.set(
+            "transport",
+            "lcm_url",
+            format!("udpm://239.255.76.67:{lcm_port}?ttl=0"),
+        );
+        config.set(
+            "geometry",
+            "map_catalog_root",
+            root.join("maps").to_str().unwrap(),
+        );
+        config.set(
+            "geometry",
+            "runtime_data_dir",
+            root.join("runtime").to_str().unwrap(),
+        );
+        config.set(
+            "geometry",
+            "raw_scan_directory",
+            root.join("scans").to_str().unwrap(),
+        );
+        config.set(
+            "geometry",
+            "lio_backend",
+            if native { "fastlio2" } else { "device" },
+        );
+        config.set(
+            "geometry",
+            "correction_backend",
+            if pgo { "library_pgo" } else { "relocalization" },
+        );
+        config.set("person_follow", "autostart", false);
+        config.set("geometry", "fine_cloud_cache_mib", 16i64);
+        config.set("derived","robot_geometry_json",r#"{"footprint_xy_m":[[-0.1,-0.1],[0.1,-0.1],[0.1,0.1],[-0.1,0.1]],"z_min_m":-0.2,"z_max_m":0.2,"source":"会话进程测试"}"#);
+        config.set("derived", "nav_profile", "pct-scan-3d");
+        config.set("derived", "actuator_max_linear_mps", 0.0);
+        config.set("derived", "actuator_max_yaw_rps", 0.0);
+        config.set("derived", "actuator_motion_model", "");
+        let mut command = Command::new(executable);
+        command
+            .env("NUWAX_INSTALL_HOME", &root)
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log));
         if native {
             use std::os::unix::fs::PermissionsExt;
             let script = root.join("原生进程夹具");
             fs::write(
-                &script,
-                "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$B2_CHILD_PID_FILE.tmp\"\nmv \"$B2_CHILD_PID_FILE.tmp\" \"$B2_CHILD_PID_FILE\"\nexec /bin/sleep 60\n",
-            )
-            .unwrap();
+                            &script,
+                            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$B2_CHILD_PID_FILE.tmp\"\nmv \"$B2_CHILD_PID_FILE.tmp\" \"$B2_CHILD_PID_FILE\"\nexec /bin/sleep 60\n",
+                        )
+                        .unwrap();
             fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-            command
-                .env(
-                    "NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE",
-                    if missing {
-                        root.join("待恢复原生进程")
-                    } else {
-                        script
-                    },
-                )
-                .env("B2_CHILD_PID_FILE", root.join("native.pid"))
-                .env(
-                    "NUWAX_GEOMETRY_LIO_BODY_FROM_SENSOR",
-                    r#"{"translation_m":[0,0,0],"rotation_row_major":[1,0,0,0,1,0,0,0,1]}"#,
-                );
+            if !missing {
+                fs::copy(&script, bin.join("fastlio2_native")).unwrap();
+            }
+            command.env("B2_CHILD_PID_FILE", root.join("native.pid"));
+            config.set(
+                "geometry",
+                "lio_body_from_sensor",
+                r#"{"translation_m":[0,0,0],"rotation_row_major":[1,0,0,0,1,0,0,0,1]}"#,
+            );
         }
+        config.write_install(&root);
         let mut child = command.spawn().unwrap();
-        let ready = root.join("ready");
+        let ready = root.join(nuwax_config::GEOMETRY_READY);
         let started = tokio::time::Instant::now();
         while !ready.exists() {
             if let Some(status) = child.try_wait().unwrap() {
@@ -689,7 +722,7 @@ async fn shutdown_closes_live_subscriptions_and_removes_ready_file() {
     .await
     .expect("有状态与位姿订阅时仍应完整退出");
     assert!(status.success());
-    assert!(!f.root.join("ready").exists());
+    assert!(!f.root.join(nuwax_config::GEOMETRY_READY).exists());
     assert!(states.message().await.unwrap().is_none());
     assert!(poses.message().await.unwrap().is_none());
 }
@@ -911,7 +944,11 @@ async fn initial_lio_start_failure_can_stop_then_start_after_executable_is_resto
     let mut f = Fixture::start_with_missing_lio(true, false, true).await;
     assert_eq!(f.state().await.phase, SessionPhase::Fault as i32);
     f.client.stop_session(Empty {}).await.unwrap();
-    fs::rename(f.root.join("原生进程夹具"), f.root.join("待恢复原生进程")).unwrap();
+    fs::rename(
+        f.root.join("原生进程夹具"),
+        f.root.join("bin/fastlio2_native"),
+    )
+    .unwrap();
     assert_eq!(
         f.mapping("恢复启动").await.phase,
         SessionPhase::Mapping as i32
@@ -931,21 +968,16 @@ fn release_artifacts_discovery_exits_before_runtime_or_storage_setup() {
     let folder =
         std::env::temp_dir().join(format!("neh-artifact-discovery-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&folder).unwrap();
-    let ready = folder.join("ready");
+    let ready = folder.join(nuwax_config::GEOMETRY_READY);
+    std::fs::create_dir_all(ready.parent().unwrap()).unwrap();
     std::fs::write(&ready, b"existing-owner").unwrap();
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let mut config = nuwax_config::test_support::defaults();
+    config.set("geometry", "fine_cloud_cache_mib", "invalid-cache-setting");
+    config.set("geometry", "lio_backend", "invalid-input-backend");
+    config.write_install(&folder);
     let output = Command::new(env!("CARGO_BIN_EXE_nuwax-geometry-runtime"))
         .arg("--print-release-artifacts")
-        .env(
-            "NUWAX_GEOMETRY_RUNTIME_PORT",
-            listener.local_addr().unwrap().port().to_string(),
-        )
-        .env("NUWAX_GEOMETRY_RUNTIME_READY_FILE", &ready)
-        .env(
-            "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_MIB",
-            "invalid-cache-setting",
-        )
-        .env("NUWAX_GEOMETRY_LIO_BACKEND", "invalid-input-backend")
+        .env("NUWAX_INSTALL_HOME", &folder)
         .output()
         .unwrap();
     assert!(

@@ -8,6 +8,7 @@ authors.workspace = true
 description = "nuwax 导航运行时 Tokio 调度器与 controller 流水线(20Hz tick + cancel epoch + guard client)"
 
 [dependencies]
+nuwax-config = { path = "../nuwax-config" }
 nuwax-nav-pct-native = { path = "../nuwax-nav-pct-native" }
 nuwax-pct-tomography = { path = "../nuwax-pct-tomography" }
 nuwax-nav-scan-native = { path = "../nuwax-nav-scan-native" }
@@ -27,6 +28,8 @@ async-trait = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+nuwax-config = { path = "../nuwax-config", features = ["test-support"] }
+
 nuwax-map-chunks = { path = "../nuwax-map-chunks" }
 prost = { workspace = true }
 serde_json.workspace = true

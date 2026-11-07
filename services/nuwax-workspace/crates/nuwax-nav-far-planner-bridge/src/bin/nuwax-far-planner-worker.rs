@@ -27,11 +27,12 @@ async fn run() -> Result<(), String> {
         worker_event: value_or(&args, "way_point", defaults.worker_event),
     };
 
-    let planner_generation = required_env_i64("NUWAX_PLANNER_GENERATION")?;
-    let timeout_ms = optional_env_u64("NUWAX_FAR_PLAN_TIMEOUT_MS")?.unwrap_or(2_000);
-    if timeout_ms == 0 {
-        return Err("NUWAX_FAR_PLAN_TIMEOUT_MS must be positive".into());
-    }
+    let planner_generation = args
+        .get("planner-generation")
+        .ok_or("缺少 --planner-generation")?
+        .parse::<i64>()
+        .map_err(|e| e.to_string())?;
+    let timeout_ms = 2_000;
     let clearance =
         args.get("robot_dim")
             .map_or(Ok(FarCoreConfig::default().clearance), |value| {
@@ -39,12 +40,9 @@ async fn run() -> Result<(), String> {
                     .parse::<f64>()
                     .map_err(|error| format!("invalid --robot_dim: {error}"))
             })?;
-    let samples_per_obstacle = optional_env_usize("NUWAX_FAR_SAMPLES_PER_OBSTACLE")?
-        .unwrap_or(FarCoreConfig::default().samples_per_obstacle);
-    let provider_url = std::env::var("LCM_DEFAULT_URL")
-        .unwrap_or_else(|_| "udpm://239.255.76.67:7667?ttl=0".into());
-    let backend_id =
-        std::env::var("NUWAX_FAR_BACKEND_ID").unwrap_or_else(|_| "far-visibility-graph".into());
+    let samples_per_obstacle = FarCoreConfig::default().samples_per_obstacle;
+    let provider_url = nuwax_config::transport()?.lcm_url.clone();
+    let backend_id = "far-visibility-graph".into();
 
     run_worker(WorkerOptions {
         provider_url,
@@ -65,7 +63,8 @@ fn reject_unsupported_args(args: &BTreeMap<String, String>) -> Result<(), String
     for name in args.keys() {
         if !matches!(
             name.as_str(),
-            "goal"
+            "planner-generation"
+                | "goal"
                 | "stop_movement"
                 | "odometry"
                 | "terrain_map_ext"
@@ -103,37 +102,4 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<BTreeMap<String,
 
 fn value_or(args: &BTreeMap<String, String>, key: &str, default: String) -> String {
     args.get(key).cloned().unwrap_or(default)
-}
-
-fn required_env_i64(name: &str) -> Result<i64, String> {
-    let value = std::env::var(name).map_err(|_| format!("{name} is required"))?;
-    let parsed = value
-        .parse::<i64>()
-        .map_err(|error| format!("invalid {name}: {error}"))?;
-    if parsed <= 0 {
-        return Err(format!("{name} must be positive"));
-    }
-    Ok(parsed)
-}
-
-fn optional_env_u64(name: &str) -> Result<Option<u64>, String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| {
-            value
-                .parse::<u64>()
-                .map_err(|error| format!("invalid {name}: {error}"))
-        })
-        .transpose()
-}
-
-fn optional_env_usize(name: &str) -> Result<Option<usize>, String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| {
-            value
-                .parse::<usize>()
-                .map_err(|error| format!("invalid {name}: {error}"))
-        })
-        .transpose()
 }

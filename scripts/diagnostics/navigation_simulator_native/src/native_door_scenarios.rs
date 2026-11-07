@@ -196,12 +196,6 @@ mod tests {
     use super::*;
 
     fn diagnostic_config() -> (SurfaceNavigationConfig, &'static str) {
-        if std::env::var("NUWAX_ROBOT_GEOMETRY_JSON").is_ok_and(|value| !value.trim().is_empty()) {
-            return (
-                SurfaceNavigationConfig::from_env().unwrap(),
-                "unchanged_launcher_runtime_calibration",
-            );
-        }
         let mut config =
             SurfaceNavigationConfig::new("map".into(), nuwax_nav_types_messages::RobotGeometry { self_collision: None, footprint_xy_m: vec![[ -(0.328)/2., -(0.328)/2.], [(0.328)/2., -(0.328)/2.], [(0.328)/2., (0.328)/2.], [-(0.328)/2., (0.328)/2.]], z_min_m: -(0.4), z_max_m: (0.6)-(0.4), source: "测试外形".into() }, 0.1, 0.15, 18.0, 0.2)
                 .unwrap();

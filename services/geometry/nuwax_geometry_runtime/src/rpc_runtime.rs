@@ -151,8 +151,10 @@ impl RpcHandler for Handler {
     }
 }
 pub async fn start(session: SessionHandle) -> RpcResult<RpcServerGroup> {
-    let url =
-        std::env::var("NUWAX_LCM_URL").unwrap_or_else(|_| "udpm://239.255.76.67:7667?ttl=0".into());
+    let url = nuwax_config::transport()
+        .map_err(|e| nuwax_rpc::RpcError::InvalidServerConfig(e))?
+        .lcm_url
+        .clone();
     let transport: Arc<dyn RpcTransport> =
         Arc::new(nuwax_rpc::LcmRpcTransport::from_provider(&url)?);
     let broker = RpcBroker::new();

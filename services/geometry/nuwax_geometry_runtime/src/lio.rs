@@ -56,20 +56,20 @@ pub(crate) struct Lio {
 }
 impl Lio {
     pub(crate) async fn start(router: FrameRouter) -> Result<Self, String> {
-        let planar = crate::slam2d_owner::Settings::from_env()?;
-        let map = env("NUWAX_MAP_FRAME", "map");
-        let odom = env("NUWAX_GEOMETRY_ODOM_FRAME", "odom");
-        let body = env("NUWAX_BASE_FRAME", "base_link");
-        let sensor = env("NUWAX_GEOMETRY_LIDAR_FRAME", "utlidar_lidar");
+        let planar = crate::slam2d_owner::Settings::from_runtime()?;
+        let map = nuwax_config::robot()?.map_frame.clone();
+        let odom = nuwax_config::robot()?.odom_frame.clone();
+        let body = nuwax_config::robot()?.base_frame.clone();
+        let sensor = nuwax_config::robot()?.lidar_frame.clone();
         let native = if planar.is_none() {
-            match env("NUWAX_GEOMETRY_LIO_BACKEND", "device").as_str() {
+            match nuwax_config::geometry()?.lio_backend.clone().as_str() {
                 "device" => None,
                 "fastlio2" => Some(
-                    NativeLioPreflight::from_env(NativeBackend::FastLio2)?
+                    NativeLioPreflight::from_runtime(NativeBackend::FastLio2)?
                         .bind(&sensor, &body, &odom)?,
                 ),
                 "pointlio" => Some(
-                    NativeLioPreflight::from_env(NativeBackend::PointLio)?
+                    NativeLioPreflight::from_runtime(NativeBackend::PointLio)?
                         .bind(&sensor, &body, &odom)?,
                 ),
                 value => return Err(format!("不支持的LIO后端：{value}")),
@@ -99,10 +99,8 @@ impl Lio {
         };
         let body_from_sensor = if let Some(native) = &native {
             Some(native.body_from_sensor.clone())
-        } else if planar.is_none()
-            && std::env::var_os(crate::native_lio_owner::BODY_FROM_SENSOR_ENV).is_some()
-        {
-            Some(crate::native_lio_owner::BodyFromSensorTransform::from_env()?)
+        } else if planar.is_none() && !nuwax_config::geometry()?.lio_body_from_sensor.is_empty() {
+            Some(crate::native_lio_owner::BodyFromSensorTransform::from_runtime()?)
         } else {
             None
         };
@@ -110,7 +108,7 @@ impl Lio {
             router,
             info,
             native_self_filter: if native.is_some() {
-                crate::self_cloud::NativeSelfFilter::from_env(&body)?
+                crate::self_cloud::NativeSelfFilter::from_runtime(&body)?
             } else {
                 None
             },
@@ -194,9 +192,8 @@ impl Lio {
         *self.input.lock().await = NativeInputDelivery::default();
         self.auxiliary.lock().clear();
         self.router.clear_recent_frames();
-        let transport =
-            LcmTransport::new_real(&env("NUWAX_LCM_URL", "udpm://239.255.76.67:7667?ttl=0"))
-                .map_err(|e| e.to_string())?;
+        let transport = LcmTransport::new_real(&nuwax_config::transport()?.lcm_url.clone())
+            .map_err(|e| e.to_string())?;
         let (shutdown, rx) = watch::channel(false);
         let (odometry_input, odometry_rx) = mpsc::unbounded_channel();
         let (cloud_input, cloud_rx) = mpsc::unbounded_channel();
@@ -213,18 +210,12 @@ impl Lio {
         } else {
             let odometry_binding = match &self.native {
                 Some(native) => native.channels.source_odometry.clone(),
-                None => binding(
-                    &env("NUWAX_LCM_CHANNEL_ODOM", "/odom#nav_msgs.Odometry"),
-                    "nav_msgs.Odometry",
-                )?,
+                None => binding(&"/odom#nav_msgs.Odometry".to_owned(), "nav_msgs.Odometry")?,
             };
             let cloud_binding = match &self.native {
                 Some(native) => native.channels.source_cloud.clone(),
                 None => binding(
-                    &env(
-                        "NUWAX_LCM_CHANNEL_POINTCLOUD",
-                        "/lidar/points#sensor_msgs.PointCloud2",
-                    ),
+                    &"/lidar/points#sensor_msgs.PointCloud2".to_owned(),
                     "sensor_msgs.PointCloud2",
                 )?,
             };
@@ -239,7 +230,7 @@ impl Lio {
             let ingress = Ingress {
                 router: self.router.clone(),
                 native: self.native.clone(),
-                self_filter: crate::self_cloud::RobotSelfFilter::from_env(
+                self_filter: crate::self_cloud::RobotSelfFilter::from_runtime(
                     &self.info.base_frame_id,
                 )?,
                 transport: transport.clone(),
@@ -503,9 +494,7 @@ impl Lio {
         planar.relocalize(seed).await
     }
 }
-fn env(name: &str, default: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| default.into())
-}
+
 fn binding(value: &str, default_type: &str) -> Result<Binding, String> {
     let (topic, message) = value.split_once('#').unwrap_or((value, default_type));
     Ok((
@@ -685,10 +674,7 @@ impl Ingress {
                 is_dense: true,
             };
             let binding = binding(
-                &env(
-                    "NUWAX_LCM_CHANNEL_POINTCLOUD",
-                    "/lidar/points#sensor_msgs.PointCloud2",
-                ),
+                &"/lidar/points#sensor_msgs.PointCloud2".to_owned(),
                 "sensor_msgs.PointCloud2",
             )?;
             let payload = schema::encode_point_cloud2_body(&message).map_err(|e| e.to_string())?;
@@ -713,10 +699,7 @@ impl Ingress {
         Ok(())
     }
     async fn publish_pose_bypass(&self, message: &schema::Odometry) -> Result<(), String> {
-        let binding = binding(
-            &env("NUWAX_LCM_CHANNEL_ODOM", "/odom#nav_msgs.Odometry"),
-            "nav_msgs.Odometry",
-        )?;
+        let binding = binding(&"/odom#nav_msgs.Odometry".to_owned(), "nav_msgs.Odometry")?;
         let payload = schema::encode_odometry_body(message).map_err(|e| e.to_string())?;
         self.transport
             .publish(

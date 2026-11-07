@@ -780,7 +780,7 @@ int main(int argc, char** argv) {
     signal(SIGINT, signal_handler);
 
     // Init LCM
-    lcm::LCM lcm;
+    lcm::LCM lcm(mod.arg_required("lcm_url"));
     if (!lcm.good()) {
         fprintf(stderr, "Error: LCM init failed\n");
         return 1;

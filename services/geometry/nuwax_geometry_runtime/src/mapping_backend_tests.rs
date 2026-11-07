@@ -242,16 +242,21 @@ fn planar_scan_backends_use_current_frame_origin_and_survive_restore() {
 
 #[test]
 fn voxel_selection_does_not_parse_raytracing_environment() {
-    let spec =
-        MappingBackendSpec::from_lookup(MappingBackendKind::Voxel, |_| Some("invalid".to_owned()))
-            .expect("inactive raytracing config must not affect voxel startup");
+    let spec = MappingBackendSpec::from_config(
+        MappingBackendKind::Voxel,
+        &nuwax_config::test_support::section("geometry"),
+    )
+    .expect("inactive raytracing config must not affect voxel startup");
     assert_eq!(spec, MappingBackendSpec::Voxel);
 }
 
 #[test]
 fn raytracing_defaults_are_valid_and_deterministic() {
-    let spec = MappingBackendSpec::from_lookup(MappingBackendKind::Raytracing, |_| None)
-        .expect("defaults must pass standalone validation");
+    let spec = MappingBackendSpec::from_config(
+        MappingBackendKind::Raytracing,
+        &nuwax_config::test_support::section("geometry"),
+    )
+    .expect("defaults must pass standalone validation");
     assert_eq!(spec.stable_name(), "raytracing");
     let mut kernel = spec.into_kernel(1024);
     let points = [
@@ -276,10 +281,10 @@ fn raytracing_defaults_are_valid_and_deterministic() {
 
 #[test]
 fn invalid_selected_config_fails_closed_with_key() {
-    let error = MappingBackendSpec::from_lookup(MappingBackendKind::Raytracing, |key| {
-        (key == RAY_SUBSAMPLE_ENV).then(|| "0".to_owned())
-    })
-    .expect_err("zero ray subsample must fail startup");
+    let mut g: nuwax_config::sections::Geometry = nuwax_config::test_support::section("geometry");
+    g.mapping_raytracing_ray_subsample = 0;
+    let error = MappingBackendSpec::from_config(MappingBackendKind::Raytracing, &g)
+        .expect_err("zero ray subsample must fail startup");
     assert!(error.contains("RAYTRACING_CONFIG_INVALID"));
     assert!(error.contains("ray_subsample"));
 }

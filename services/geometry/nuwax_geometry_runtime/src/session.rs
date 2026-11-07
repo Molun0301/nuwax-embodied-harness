@@ -173,7 +173,7 @@ enum Command {
 }
 impl SessionHandle {
     pub async fn start() -> Result<Self, String> {
-        let config = MapperConfig::from_env()?;
+        let config = MapperConfig::from_runtime()?;
         Self::start_with(config, MapStore::new(catalog_root())).await
     }
     async fn start_with(config: MapperConfig, store: MapStore) -> Result<Self, String> {
@@ -1108,9 +1108,11 @@ fn terminal(status: i32) -> bool {
     )
 }
 fn catalog_root() -> PathBuf {
-    std::env::var_os("NUWAX_MAP_CATALOG_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("runtime_data/maps"))
+    nuwax_config::resolve_path(
+        &nuwax_config::geometry()
+            .expect("geometry 配置")
+            .map_catalog_root,
+    )
 }
 fn now_ns() -> u64 {
     std::time::SystemTime::now()

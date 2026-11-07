@@ -17,7 +17,7 @@ use crate::profile::NavStackProfile;
 use crate::runner::StackRunner;
 use crate::topics::NavTopicConfig;
 
-const INTERNAL_READY_FILE_ENV: &str = "NUWAX_NAV_STACK_INTERNAL_READY_FILE";
+
 /// Exact token emitted by `--launcher-contract` for deployment compatibility checks.
 pub const LAUNCHER_CONTRACT: &str = "nuwax-nav-stack-internal-ready-v1";
 
@@ -106,7 +106,11 @@ impl CliOptions {
 
         let profile = match profile {
             Some(profile) => profile,
-            None => crate::ProductionPipeline::from_env()?.navigation_profile(),
+            None => NavStackProfile::from_cli_str(
+                &nuwax_config::derived()
+                    .map_err(crate::NavStackError::InvalidConfig)?
+                    .nav_profile,
+            )?,
         };
 
         Ok(Self {
@@ -215,8 +219,9 @@ where
         return Ok(());
     }
 
-    let mut builder =
-        NavStackBuilder::new(opts.profile).topics(NavTopicConfig::geometry_runtime_defaults());
+    let mut builder = NavStackBuilder::new(opts.profile).topics(NavTopicConfig::for_pipeline(
+        crate::ProductionPipeline::from_runtime()?,
+    ));
     if let Some(preset) = opts.preset {
         builder = builder.preset(preset);
     }
@@ -235,7 +240,7 @@ where
     }
 
     // 直接运行二进制也必须服从完整链配对，不能绕过启动脚本交叉接线。
-    crate::ProductionPipeline::from_env()?.validate_navigation(opts.profile)?;
+    crate::ProductionPipeline::from_runtime()?.validate_navigation(opts.profile)?;
 
     let mut runner = builder.build_runner()?;
     if opts.json {
@@ -260,7 +265,7 @@ where
 {
     runner.spawn_all().await?;
 
-    let ready_marker = match RuntimeReadyMarker::publish_from_env() {
+    let ready_marker = match RuntimeReadyMarker::publish_from_runtime() {
         Ok(marker) => marker,
         Err(error) => {
             let _ = runner.shutdown().await;
@@ -301,17 +306,14 @@ struct RuntimeReadyMarker {
 }
 
 impl RuntimeReadyMarker {
-    fn publish_from_env() -> NavStackResult<Self> {
-        let Some(path) = std::env::var_os(INTERNAL_READY_FILE_ENV) else {
-            return Ok(Self { path: None });
-        };
-        Self::publish(PathBuf::from(path))
+    fn publish_from_runtime() -> NavStackResult<Self> {
+        Self::publish(nuwax_config::resolve_path(nuwax_config::NAV_READY))
     }
 
     fn publish(path: PathBuf) -> NavStackResult<Self> {
         if path.as_os_str().is_empty() {
             return Err(crate::error::NavStackError::invalid(format!(
-                "{INTERNAL_READY_FILE_ENV} must not be empty"
+                "就绪路径不能为空"
             )));
         }
         if let Some(parent) = path
@@ -407,7 +409,12 @@ mod tests {
     #[test]
     fn parse_default_profile_follows_complete_pipeline() {
         let opts = CliOptions::parse(&[]).unwrap();
-        assert_eq!(opts.profile, crate::ProductionPipeline::from_env().unwrap().navigation_profile());
+        assert_eq!(
+            opts.profile,
+            crate::ProductionPipeline::from_runtime()
+                .unwrap()
+                .navigation_profile()
+        );
         assert!(!opts.dry_run);
     }
 
@@ -448,24 +455,37 @@ mod tests {
         // other tests instead of mutating their process-wide environment.
         const CHILD: &str = "NUWAX_TEST_UNOWNED_SIMPLE_CLI";
         if std::env::var_os(CHILD).is_none() {
+            let root = std::env::temp_dir().join(format!(
+                "nuwax-cli-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let mut config = nuwax_config::test_support::defaults();
+            config.set("geometry", "pipeline", "slam_2d");
+            config.write_install(&root);
             let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "bin_support::tests::non_dry_cli_rejects_unowned_profile_instead_of_reporting_success",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
-                .env("NUWAX_GEOMETRY_PIPELINE", "slam_2d")
-                .env_remove("NUWAX_NAV_PROFILE")
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "{}\n{}",
+                            .args([
+                                "--exact",
+                                "bin_support::tests::non_dry_cli_rejects_unowned_profile_instead_of_reporting_success",
+                                "--nocapture",
+                            ])
+                            .env(CHILD, "1")
+                            .env("NUWAX_INSTALL_HOME",&root)
+                            .output()
+                            .unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
                 String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr));
+                String::from_utf8_lossy(&output.stderr)
+            );
             return;
         }
-        let opts = CliOptions::parse(&["--profile=simple-2d".into()])
-            .expect("explicit unowned CLI profile");
+        let opts =
+            CliOptions::parse(&["--profile=simple-2d".into()]).expect("explicit unowned CLI profile");
         let error = run_until_shutdown(opts, async { Ok(()) })
             .await
             .expect_err("Simple2D has no registered runtime owners");

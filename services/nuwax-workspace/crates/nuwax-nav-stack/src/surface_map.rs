@@ -209,14 +209,14 @@ impl SurfaceMapCache {
             observations: None,
             #[cfg(test)]
             mask_work: MaskWork::default(),
-            lcm_url: std::env::var("NUWAX_LCM_URL")
-                .unwrap_or_else(|_| "udpm://239.255.76.67:7667?ttl=0".into()),
+            lcm_url: String::new(),
         }
     }
 
     /// 使用启动时捕获的同一完整模型构建消费者缓存。
     pub fn configured(config: &crate::surface_config::SurfaceNavigationConfig) -> Self {
         let mut cache = Self::new(config.geometry.clone());
+        cache.lcm_url = config.lcm_url.clone();
         cache.builder =
             SurfaceMapBuilder::configured(config.geometry.clone(), Some(config.body_envelope.clone()));
         cache
@@ -341,7 +341,7 @@ impl SurfaceMapCache {
         schema::validate_navigation_map_3d(message)?;
         if message.cleared {
             self.reset();
-            return Err(schema::navigation_map_clear_reason(message).into());
+            return Err("surface map cleared by mapping owner".into());
         }
         if message.frame_id != self.config.world_frame {
             return Err("surface map frame differs from configured map frame".into());

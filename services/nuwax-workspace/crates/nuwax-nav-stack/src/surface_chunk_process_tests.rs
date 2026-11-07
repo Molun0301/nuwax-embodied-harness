@@ -131,28 +131,93 @@ impl Drop for ChildOwner {fn drop(&mut self){if self.0.try_wait().ok().flatten()
 fn message(repository:&Repository,revision:u64,variant:u16)->schema::NavigationMap3D {
     message_with_points(repository, revision, variant, 12000)
 }
-fn message_with_points(repository:&Repository,revision:u64,variant:u16,point_count:u16)->schema::NavigationMap3D {
-    let stamp=1_700_000_000_000_000_000+revision;
-    let domain=Domain{session:"remote-fine".into(),};
-    let mut references=Vec::new();
+fn message_with_points(
+    repository: &Repository,
+    revision: u64,
+    variant: u16,
+    point_count: u16,
+) -> schema::NavigationMap3D {
+    let stamp = 1_700_000_000_000_000_000 + revision;
+    let domain = Domain {
+        session: "remote-fine".into(),
+    };
+    let mut references = Vec::new();
     for x in 0..3 {
-        let block=Block::from_iter((0..point_count).map(|id|(id,Evidence{observed_ns:stamp,hits:variant})));
-        let bytes=encode_block(&block).unwrap();
+        let block = Block::from_iter((0..point_count).map(|id| {
+            (
+                id,
+                Evidence {
+                    observed_ns: stamp,
+                    hits: variant,
+                },
+            )
+        }));
+        let bytes = encode_block(&block).unwrap();
         let object = ObjectIdentity::Assigned(ObjectId::random().unwrap());
-        repository.put_object(object,&bytes).unwrap();
-        references.push(BlockRef{key:[x,0,0],object,block_revision:revision,
-            geometry_revision:1,points:block.len() as u32});
+        repository.put_object(object, &bytes).unwrap();
+        references.push(BlockRef {
+            key: [x, 0, 0],
+            object,
+            block_revision: revision,
+            geometry_revision: 1,
+            points: block.len() as u32,
+        });
     }
-    let root=Manifest{source_watermarks:Vec::new(),version:2,domain,revision,geometry_revision:1,
-        source_timestamp_ns:stamp,voxel_size_m:0.05,blocks:references}.encode().unwrap();
-    std::fs::write(repository.path().join(format!("manifest-{revision}.json")), &root).unwrap();
+    let root = Manifest {
+        source_watermarks: Vec::new(),
+        version: 2,
+        domain,
+        revision,
+        geometry_revision: 1,
+        source_timestamp_ns: stamp,
+        voxel_size_m: 0.05,
+        blocks: references,
+    }
+    .encode()
+    .unwrap();
+    std::fs::write(
+        repository.path().join(format!("manifest-{revision}.json")),
+        &root,
+    )
+    .unwrap();
     schema::NavigationMap3D {
-        session_id: "remote-fine".into(), frame_id: "map".into(),
+        session_id: "remote-fine".into(),
+        frame_id: "map".into(),
 
-        revision:revision as i64,source_timestamp_ns:stamp as i64,source_voxel_size:0.05,
-        cleared:false,ground_block_failed:false,virtual_obstacles:None,
-        fine:Some(Transfer{root,included:BTreeMap::new()}),
-        cloud:schema::PointCloud2{header:schema::Header{seq:revision as i32,stamp_sec:(stamp/1_000_000_000) as i32,stamp_nsec:(stamp%1_000_000_000) as i32,frame_id:"map".into()},height:1,width:0,fields:["x","y","z"].iter().enumerate().map(|(i,name)|schema::PointField{name:(*name).into(),offset:(i*4) as i32,datatype:7,count:1}).collect(),is_bigendian:false,point_step:12,row_step:0,data:Vec::new(),is_dense:true},
+        revision: revision as i64,
+        source_timestamp_ns: stamp as i64,
+        source_voxel_size: 0.05,
+        cleared: false,
+        virtual_obstacles: None,
+        fine: Some(Transfer {
+            root,
+            included: BTreeMap::new(),
+        }),
+        cloud: schema::PointCloud2 {
+            header: schema::Header {
+                seq: revision as i32,
+                stamp_sec: (stamp / 1_000_000_000) as i32,
+                stamp_nsec: (stamp % 1_000_000_000) as i32,
+                frame_id: "map".into(),
+            },
+            height: 1,
+            width: 0,
+            fields: ["x", "y", "z"]
+                .iter()
+                .enumerate()
+                .map(|(i, name)| schema::PointField {
+                    name: (*name).into(),
+                    offset: (i * 4) as i32,
+                    datatype: 7,
+                    count: 1,
+                })
+                .collect(),
+            is_bigendian: false,
+            point_step: 12,
+            row_step: 0,
+            data: Vec::new(),
+            is_dense: true,
+        },
     }
 }
 async fn receive(reader:FineMapReader,message:schema::NavigationMap3D)->(FineMapReader,Result<Arc<Manifest>,SurfaceMapBuildError>) {

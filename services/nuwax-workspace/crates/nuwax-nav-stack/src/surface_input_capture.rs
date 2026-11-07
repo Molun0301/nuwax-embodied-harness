@@ -114,7 +114,7 @@ mod input_capture {
         let required = |name: &str| {
             std::env::var(name).unwrap_or_else(|_| panic!("必须明确提供{name}，禁止猜测另一实例"))
         };
-        let url = required("NUWAX_LCM_URL");
+        let url = nuwax_config::transport().unwrap().lcm_url.clone();
         let map_topic = required("NUWAX_SURFACE_CAPTURE_MAP_TOPIC");
         let pose_topic = required("NUWAX_SURFACE_CAPTURE_POSE_TOPIC");
         let directory = std::path::PathBuf::from(required("NUWAX_SURFACE_CAPTURE_DIRECTORY"));

@@ -3,10 +3,9 @@ use super::*;
 use serde_json::{json, Value};
 
 pub(crate) fn five_cm_spec() -> MappingBackendSpec {
-    MappingBackendSpec::from_lookup(MappingBackendKind::Raytracing, |key| {
-        (key == RAY_VOXEL_SIZE_ENV).then(|| "0.05".to_owned())
-    })
-    .unwrap()
+    let mut g: nuwax_config::sections::Geometry = nuwax_config::test_support::section("geometry");
+    g.mapping_raytracing_voxel_size = 0.05;
+    MappingBackendSpec::from_config(MappingBackendKind::Raytracing, &g).unwrap()
 }
 
 pub(crate) fn five_cm_config() -> MappingBackendComputeConfig {

@@ -1,7 +1,6 @@
 //! Native FastLIO2/Point-LIO preflight, binding, and child-process ownership.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::env;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -11,7 +10,7 @@ use std::time::Duration;
 
 use nalgebra::{Matrix3, Point3, Vector3};
 use nuwax_lio_backends::native::{NativeBackend, NativeLioConfig, NativeRuntimeSpec};
-use nuwax_lio_backends::pointlio_options::{PointLioOptions, POINTLIO_OPTIONS_ENV};
+use nuwax_lio_backends::pointlio_options::{PointLioOptions};
 use nuwax_protocol::{LcmMessageType, LcmTopic};
 use parking_lot::Mutex;
 use serde::Deserialize;
@@ -19,20 +18,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
-pub(crate) const BODY_FROM_SENSOR_ENV: &str = "NUWAX_GEOMETRY_LIO_BODY_FROM_SENSOR";
-pub(crate) const NATIVE_EXECUTABLE_ENV: &str = "NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE";
-pub(crate) const PRIVATE_PREFIX_ENV: &str = "NUWAX_GEOMETRY_NATIVE_LIO_PRIVATE_PREFIX";
-pub(crate) const PAIR_MAX_SKEW_MS_ENV: &str = "NUWAX_GEOMETRY_NATIVE_LIO_PAIR_MAX_SKEW_MS";
-const SCAN_VOXEL_SIZE_M_ENV: &str = "NUWAX_GEOMETRY_LIO_SCAN_VOXEL_SIZE_M";
-const MAP_VOXEL_SIZE_M_ENV: &str = "NUWAX_GEOMETRY_LIO_MAP_VOXEL_SIZE_M";
-const INITIAL_MAP_FRAMES_ENV: &str = "NUWAX_GEOMETRY_LIO_INITIAL_MAP_FRAMES";
-const BODY_FROM_IMU_ENV: &str = "NUWAX_GEOMETRY_LIO_BODY_FROM_IMU";
 
-const LCM_URL_ENV: &str = "NUWAX_LCM_URL";
-const DEFAULT_LCM_URL: &str = "udpm://239.255.76.67:7667?ttl=0";
-const DEFAULT_PRIVATE_PREFIX: &str = "/lio";
-const DEFAULT_PAIR_MAX_SKEW_MS: u64 = 100;
-const MAX_PAIR_MAX_SKEW_MS: u64 = 60_000;
 const LCM_MAX_CHANNEL_NAME_BYTES: usize = 63;
 const ROTATION_TOLERANCE: f64 = 1.0e-6;
 const OUTPUT_TAIL_BYTES: usize = 64 * 1024;
@@ -61,23 +47,22 @@ struct BodyFromSensorData {
 }
 
 impl BodyFromSensorTransform {
-    pub(crate) fn from_env() -> Result<Self, String> {
-        let raw = required_env(BODY_FROM_SENSOR_ENV)?;
-        Self::from_json(&raw)
+    pub(crate) fn from_runtime() -> Result<Self, String> {
+        Self::from_json(&nuwax_config::geometry()?.lio_body_from_sensor)
     }
 
     pub(crate) fn from_json(raw: &str) -> Result<Self, String> {
-        Self::from_json_for_env(raw, BODY_FROM_SENSOR_ENV)
+        Self::from_json_for_key(raw, "geometry.lio_body_from_sensor")
     }
 
-    pub(crate) fn from_json_for_env(raw: &str, env_name: &str) -> Result<Self, String> {
+    pub(crate) fn from_json_for_key(raw: &str, key_name: &str) -> Result<Self, String> {
         if raw.is_empty() || raw != raw.trim() {
             return Err(format!(
-                "NATIVE_LIO_PREFLIGHT_FAILED env={env_name} value_is_empty_or_padded"
+                "NATIVE_LIO_PREFLIGHT_FAILED config={key_name} value_is_empty_or_padded"
             ));
         }
         let parsed: BodyFromSensorJson = serde_json::from_str(raw).map_err(|error| {
-            format!("NATIVE_LIO_PREFLIGHT_FAILED env={env_name} invalid_json: {error}")
+            format!("NATIVE_LIO_PREFLIGHT_FAILED config={key_name} invalid_json: {error}")
         })?;
         if !parsed.translation_m.iter().all(|value| value.is_finite())
             || !parsed
@@ -90,7 +75,7 @@ impl BodyFromSensorTransform {
                 .all(|value| value.is_finite())
         {
             return Err(format!(
-                "NATIVE_LIO_PREFLIGHT_FAILED env={env_name} values_must_be_finite"
+                "NATIVE_LIO_PREFLIGHT_FAILED config={key_name} values_must_be_finite"
             ));
         }
 
@@ -105,8 +90,8 @@ impl BodyFromSensorTransform {
         let determinant = rotation.determinant();
         if !orthonormal || (determinant - 1.0).abs() > ROTATION_TOLERANCE {
             return Err(format!(
-                "NATIVE_LIO_PREFLIGHT_FAILED env={env_name} rotation_must_be_proper_orthonormal determinant={determinant}"
-            ));
+                    "NATIVE_LIO_PREFLIGHT_FAILED config={key_name} rotation_must_be_proper_orthonormal determinant={determinant}"
+                ));
         }
 
         Ok(Self {
@@ -166,57 +151,54 @@ pub(crate) struct NativeLioPreflight {
 }
 
 impl NativeLioPreflight {
-    pub(crate) fn from_env(backend: NativeBackend) -> Result<Self, String> {
-        let executable_path = if env::var_os(NATIVE_EXECUTABLE_ENV).is_some() {
-            required_env(NATIVE_EXECUTABLE_ENV)?
-        } else {
-            // 源码构建沿用本地 result/bin；显式配置仍优先，部署搬迁可指定固定路径。
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../nuwax-workspace/crates/nuwax-lio-backends")
-                .join(backend.source_relpath())
-                .join(backend.executable_relpath())
-                .to_string_lossy()
-                .into_owned()
-        };
-        let executable = canonical_executable(&executable_path)?;
-        let body_from_sensor = BodyFromSensorTransform::from_env()?;
-        let lcm_url = strict_env_or_default(LCM_URL_ENV, DEFAULT_LCM_URL)?;
-        validate_lcm_url(&lcm_url)?;
-        let private_prefix = strict_env_or_default(PRIVATE_PREFIX_ENV, DEFAULT_PRIVATE_PREFIX)?;
-        validate_private_prefix(&private_prefix)?;
-
-        let pair_max_skew_ms = strict_millis_env(
-            PAIR_MAX_SKEW_MS_ENV,
-            DEFAULT_PAIR_MAX_SKEW_MS,
-            MAX_PAIR_MAX_SKEW_MS,
-        )?;
-        // 与其他预检值一起捕获；后续通道绑定不再读取可能变化的环境。
+    pub(crate) fn from_runtime(backend: NativeBackend) -> Result<Self, String> {
+        let executable = nuwax_config::sibling_binary(match backend {
+            NativeBackend::FastLio2 => "fastlio2_native",
+            NativeBackend::PointLio => "pointlio_native",
+        })?;
+        Self::from_config(
+            backend,
+            nuwax_config::geometry()?,
+            nuwax_config::transport()?,
+            &executable,
+        )
+    }
+    pub(crate) fn from_config(
+        backend: NativeBackend,
+        g: &nuwax_config::sections::Geometry,
+        transport: &nuwax_config::sections::Transport,
+        executable: &Path,
+    ) -> Result<Self, String> {
+        let executable = canonical_executable(executable.to_str().ok_or("原生程序路径不是有效文本")?)?;
+        let body_from_sensor = BodyFromSensorTransform::from_json(&g.lio_body_from_sensor)?;
+        validate_lcm_url(&transport.lcm_url)?;
         let mut native_config = NativeLioConfig::for_backend(backend);
-        native_config.scan_voxel_size_m = optional_number_env(SCAN_VOXEL_SIZE_M_ENV)?;
-        native_config.map_voxel_size_m = optional_number_env(MAP_VOXEL_SIZE_M_ENV)?;
-        native_config.initial_map_frames = optional_number_env(INITIAL_MAP_FRAMES_ENV)?;
+        native_config.scan_voxel_size_m = g.lio_scan_voxel_size_m;
+        native_config.map_voxel_size_m = g.lio_map_voxel_size_m;
+        native_config.initial_map_frames = g
+            .lio_initial_map_frames
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|e| e.to_string())?;
         if backend == NativeBackend::PointLio {
-            native_config.pointlio_options =
-                PointLioOptions::from_json(&env::var(POINTLIO_OPTIONS_ENV).unwrap_or_default())?;
-            // 原点必须来自与数据面同一份显式标定，不能把雷达平移当作惯性平移。
-            let imu = BodyFromSensorTransform::from_json_for_env(
-                &required_env(BODY_FROM_IMU_ENV)?,
-                BODY_FROM_IMU_ENV,
+            native_config.pointlio_options = PointLioOptions::from_json(&g.pointlio_options)?;
+            let imu = BodyFromSensorTransform::from_json_for_key(
+                &g.lio_body_from_imu,
+                "geometry.lio_body_from_imu",
             )?;
             native_config.imu_origin_in_body_m = Some(imu.translation_m());
         }
-        native_config.validate().map_err(|error| {
-            format!("NATIVE_LIO_PREFLIGHT_FAILED invalid native sampling config: {error}")
-        })?;
-
+        native_config
+            .validate()
+            .map_err(|e| format!("NATIVE_LIO_PREFLIGHT_FAILED: {e}"))?;
         Ok(Self {
             backend,
             native_config,
             executable,
-            lcm_url,
-            private_prefix,
+            lcm_url: transport.lcm_url.clone(),
+            private_prefix: "/lio".into(),
             body_from_sensor,
-            pair_max_skew: Duration::from_millis(pair_max_skew_ms),
+            pair_max_skew: Duration::from_millis(g.native_lio_pair_max_skew_ms as u64),
         })
     }
 
@@ -263,9 +245,9 @@ impl NativeLioPreflight {
         ] {
             if pattern.len() > LCM_MAX_CHANNEL_NAME_BYTES {
                 return Err(format!(
-                    "NATIVE_LIO_BIND_FAILED private {stream} typed channel exceeds libLCM limit bytes={} maximum={LCM_MAX_CHANNEL_NAME_BYTES}",
-                    pattern.len()
-                ));
+                        "NATIVE_LIO_BIND_FAILED private {stream} typed channel exceeds libLCM limit bytes={} maximum={LCM_MAX_CHANNEL_NAME_BYTES}",
+                        pattern.len()
+                    ));
             }
         }
 
@@ -295,7 +277,7 @@ impl NativeLioPreflight {
         config.frame_id = odom_frame.into();
         config.extrinsic_translation_m = self.body_from_sensor.translation_m();
         config.extrinsic_rotation_row_major = self.body_from_sensor.rotation_row_major();
-        let args = config
+        let mut args = config
             .render_args()
             .map_err(|error| format!("NATIVE_LIO_BIND_FAILED invalid native config: {error}"))?;
 
@@ -310,18 +292,17 @@ impl NativeLioPreflight {
                 )
             })?
             .to_path_buf();
-        let mut runtime_env = BTreeMap::new();
-        runtime_env.insert("LCM_DEFAULT_URL".to_owned(), self.lcm_url.clone());
+        args.extend(["--lcm_url".to_owned(), self.lcm_url.clone()]);
         let runtime = NativeRuntimeSpec {
             backend: self.backend,
             cwd,
             executable: self.executable.clone(),
             args,
-            env: runtime_env,
+            env: BTreeMap::new(),
         };
-        runtime.command().map_err(|error| {
-            format!("NATIVE_LIO_BIND_FAILED invalid native runtime spec: {error}")
-        })?;
+        runtime
+            .command()
+            .map_err(|error| format!("NATIVE_LIO_BIND_FAILED invalid native runtime spec: {error}"))?;
 
         Ok(BoundNativeLioRuntime {
             channels,
@@ -351,109 +332,39 @@ fn typed_pattern(binding: &(LcmTopic, LcmMessageType)) -> String {
     binding.0.as_subscription_pattern(binding.1.fqn())
 }
 
-fn required_env(key: &str) -> Result<String, String> {
-    match env::var(key) {
-        Ok(value) if value.is_empty() => Err(format!(
-            "NATIVE_LIO_PREFLIGHT_FAILED env={key} value_is_empty"
-        )),
-        Ok(value) if value != value.trim() => Err(format!(
-            "NATIVE_LIO_PREFLIGHT_FAILED env={key} value_has_surrounding_whitespace"
-        )),
-        Ok(value) => Ok(value),
-        Err(env::VarError::NotPresent) => {
-            Err(format!("NATIVE_LIO_PREFLIGHT_FAILED env={key} is_required"))
-        }
-        Err(env::VarError::NotUnicode(_)) => Err(format!(
-            "NATIVE_LIO_PREFLIGHT_FAILED env={key} value_is_not_unicode"
-        )),
-    }
-}
 
-fn optional_number_env<T: std::str::FromStr>(key: &str) -> Result<Option<T>, String> {
-    match env::var(key) {
-        Ok(value) if value.trim().is_empty() => Ok(None),
-        Ok(value) if value != value.trim() => Err(format!(
-            "NATIVE_LIO_PREFLIGHT_FAILED env={key} value_has_surrounding_whitespace"
-        )),
-        Ok(value) => value
-            .parse()
-            .map(Some)
-            .map_err(|_| format!("NATIVE_LIO_PREFLIGHT_FAILED env={key} invalid_number")),
-        Err(env::VarError::NotPresent) => Ok(None),
-        Err(env::VarError::NotUnicode(_)) => Err(format!(
-            "NATIVE_LIO_PREFLIGHT_FAILED env={key} value_is_not_unicode"
-        )),
-    }
-}
 
-fn strict_env_or_default(key: &str, default: &str) -> Result<String, String> {
-    match env::var(key) {
-        Ok(value) if value.is_empty() => Err(format!(
-            "NATIVE_LIO_PREFLIGHT_FAILED env={key} value_is_empty"
-        )),
-        Ok(value) if value != value.trim() => Err(format!(
-            "NATIVE_LIO_PREFLIGHT_FAILED env={key} value_has_surrounding_whitespace"
-        )),
-        Ok(value) => Ok(value),
-        Err(env::VarError::NotPresent) => Ok(default.to_owned()),
-        Err(env::VarError::NotUnicode(_)) => Err(format!(
-            "NATIVE_LIO_PREFLIGHT_FAILED env={key} value_is_not_unicode"
-        )),
-    }
-}
 
-fn strict_millis_env(key: &str, default: u64, maximum: u64) -> Result<u64, String> {
-    let value = match env::var(key) {
-        Ok(value) if value.is_empty() || value != value.trim() => {
-            return Err(format!(
-                "NATIVE_LIO_PREFLIGHT_FAILED env={key} value_is_empty_or_padded"
-            ));
-        }
-        Ok(value) => value.parse::<u64>().map_err(|error| {
-            format!("NATIVE_LIO_PREFLIGHT_FAILED env={key} invalid_millis: {error}")
-        })?,
-        Err(env::VarError::NotPresent) => default,
-        Err(env::VarError::NotUnicode(_)) => {
-            return Err(format!(
-                "NATIVE_LIO_PREFLIGHT_FAILED env={key} value_is_not_unicode"
-            ));
-        }
-    };
-    if value == 0 || value > maximum {
-        return Err(format!(
-            "NATIVE_LIO_PREFLIGHT_FAILED env={key} value={value} outside=1..={maximum}"
-        ));
-    }
-    Ok(value)
-}
+
+
+
+
 
 fn canonical_executable(raw: &str) -> Result<PathBuf, String> {
     let configured = Path::new(raw);
     if !configured.is_absolute() {
         return Err(format!(
-            "NATIVE_LIO_PREFLIGHT_FAILED env={NATIVE_EXECUTABLE_ENV} path_must_be_absolute value={raw}"
+            "NATIVE_LIO_PREFLIGHT_FAILED executable path_must_be_absolute value={raw}"
         ));
     }
     let executable = configured.canonicalize().map_err(|error| {
-        format!(
-            "NATIVE_LIO_PREFLIGHT_FAILED env={NATIVE_EXECUTABLE_ENV} canonicalize_failed path={raw}: {error}"
-        )
+        format!("NATIVE_LIO_PREFLIGHT_FAILED executable canonicalize_failed path={raw}: {error}")
     })?;
     let metadata = executable.metadata().map_err(|error| {
         format!(
-            "NATIVE_LIO_PREFLIGHT_FAILED env={NATIVE_EXECUTABLE_ENV} metadata_failed path={}: {error}",
+            "NATIVE_LIO_PREFLIGHT_FAILED executable metadata_failed path={}: {error}",
             executable.display()
         )
     })?;
     if !metadata.file_type().is_file() {
         return Err(format!(
-            "NATIVE_LIO_PREFLIGHT_FAILED env={NATIVE_EXECUTABLE_ENV} not_regular_file path={}",
+            "NATIVE_LIO_PREFLIGHT_FAILED executable not_regular_file path={}",
             executable.display()
         ));
     }
     if metadata.permissions().mode() & 0o111 == 0 {
         return Err(format!(
-            "NATIVE_LIO_PREFLIGHT_FAILED env={NATIVE_EXECUTABLE_ENV} not_executable path={}",
+            "NATIVE_LIO_PREFLIGHT_FAILED executable not_executable path={}",
             executable.display()
         ));
     }
@@ -471,28 +382,13 @@ fn validate_lcm_url(value: &str) -> Result<(), String> {
             .any(|character| character.is_control() || character.is_whitespace())
     {
         return Err(format!(
-            "NATIVE_LIO_PREFLIGHT_FAILED env={LCM_URL_ENV} invalid_lcm_url"
+            "NATIVE_LIO_PREFLIGHT_FAILED config=transport.lcm_url invalid_lcm_url"
         ));
     }
     Ok(())
 }
 
-fn validate_private_prefix(value: &str) -> Result<(), String> {
-    let valid_character = |character: char| {
-        character.is_ascii_alphanumeric() || matches!(character, '/' | '_' | '-' | '.')
-    };
-    if value == "/"
-        || !value.starts_with('/')
-        || value.ends_with('/')
-        || value.contains("//")
-        || !value.chars().all(valid_character)
-    {
-        return Err(format!(
-            "NATIVE_LIO_PREFLIGHT_FAILED env={PRIVATE_PREFIX_ENV} invalid_private_prefix"
-        ));
-    }
-    Ok(())
-}
+
 
 #[derive(Debug)]
 struct BoundedTail {

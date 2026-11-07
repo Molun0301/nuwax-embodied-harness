@@ -8,6 +8,7 @@ authors.workspace = true
 description = "nuwax Module 基类与 In[T]/Out[T] 类型化流"
 
 [dependencies]
+nuwax-config = { path = "../nuwax-config" }
 tracing-subscriber = { workspace = true }
 nuwax-types = { path = "../nuwax-types" }
 tokio = { workspace = true }

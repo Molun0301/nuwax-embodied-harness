@@ -36,12 +36,12 @@ impl MapStore {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
     }
-    pub fn from_env() -> Self {
-        Self::new(
-            std::env::var_os("NUWAX_MAP_CATALOG_ROOT")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("runtime_data/maps")),
-        )
+    pub fn from_runtime() -> Self {
+        Self::new(nuwax_config::resolve_path(
+            &nuwax_config::geometry()
+                .expect("geometry 配置")
+                .map_catalog_root,
+        ))
     }
     pub fn root(&self) -> &Path {
         &self.root

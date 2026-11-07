@@ -42,13 +42,8 @@ impl Drop for ReadyFile {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let port: u16 = std::env::var("NUWAX_GEOMETRY_RUNTIME_PORT")
-        .unwrap_or_else(|_| "50051".into())
-        .parse()?;
-    let ready_path = PathBuf::from(
-        std::env::var("NUWAX_GEOMETRY_RUNTIME_READY_FILE")
-            .unwrap_or_else(|_| "runtime_data/geometry/nuwax_geometry_runtime.ready".into()),
-    );
+    let port = u16::try_from(nuwax_config::geometry()?.runtime_port)?;
+    let ready_path = nuwax_config::resolve_path(nuwax_config::GEOMETRY_READY);
     if let Some(parent) = ready_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -135,14 +130,15 @@ pub fn main() -> ExitCode {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .try_init();
-    let cache = pointcloud::parse_fine_cloud_cache(
-        std::env::var("NUWAX_GEOMETRY_FINE_CLOUD_CACHE_MIB")
-            .ok()
-            .as_deref(),
-        std::env::var("NUWAX_GEOMETRY_FINE_CLOUD_CACHE_AUTO_MAX_MIB")
-            .ok()
-            .as_deref(),
-    );
+    let cache = (|| {
+        let g = nuwax_config::geometry()?;
+        nuwax_config::robot()?;
+        nuwax_config::navigation()?;
+        nuwax_config::transport()?;
+        nuwax_config::derived()?;
+        nuwax_config::person_follow()?;
+        pointcloud::parse_fine_cloud_cache(&g.fine_cloud_cache_mib, g.fine_cloud_cache_auto_max_mib)
+    })();
     if let Err(reason) = cache.and_then(pointcloud::configure_fine_cloud_cache) {
         eprintln!("{reason}");
         return ExitCode::FAILURE;

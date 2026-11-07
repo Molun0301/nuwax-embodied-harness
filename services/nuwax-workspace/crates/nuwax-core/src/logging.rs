@@ -102,14 +102,11 @@ impl<'a> MakeWriter<'a> for ComponentWriter {
 ///
 /// 文件不可写时保留标准错误，不以日志路径问题阻止机器人功能运行。
 pub fn init_component_logging(component: &str, default_filter: &str) {
-    let mut directory = std::env::var_os("NUWAX_LOG_DIR")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("NUWAX_LOG_FILE")
-                .and_then(|path| PathBuf::from(path).parent().map(Path::to_path_buf))
-        })
-        .unwrap_or_else(|| PathBuf::from("runtime_data/logs"));
+    let config = nuwax_config::logging().unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2)
+    });
+    let mut directory = nuwax_config::resolve_path(&config.dir);
     let mut path = directory.join(format!("{component}.log"));
     let open_file = |directory: &Path, path: &Path| -> io::Result<ComponentFile> {
         fs::create_dir_all(&directory)?;
@@ -121,14 +118,8 @@ pub fn init_component_logging(component: &str, default_filter: &str) {
         Ok(ComponentFile {
             path: path.to_path_buf(),
             lock,
-            max_bytes: std::env::var("NUWAX_LOG_MAX_BYTES")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(20 * 1024 * 1024),
-            backups: std::env::var("NUWAX_LOG_BACKUP_COUNT")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(5),
+            max_bytes: config.max_bytes as u64,
+            backups: config.backup_count as usize,
         })
     };
     let mut file = open_file(&directory, &path).ok();
@@ -167,17 +158,11 @@ pub fn init_component_logging(component: &str, default_filter: &str) {
     let filter = std::env::var("RUST_LOG")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::env::var("NUWAX_LOG_LEVEL")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .map(|value| match value.trim().to_ascii_lowercase().as_str() {
-                    "warning" => "warn".to_string(),
-                    "critical" => "error".to_string(),
-                    other => other.to_string(),
-                })
-        })
-        .unwrap_or_else(|| default_filter.to_string());
+        .unwrap_or_else(|| match config.level.to_ascii_lowercase().as_str() {
+            "warning" => "warn".into(),
+            "critical" => "error".into(),
+            other => other.into(),
+        });
     let filter = tracing_subscriber::EnvFilter::try_new(filter)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
     let writer = ComponentWriter(Arc::new(Mutex::new(file)));

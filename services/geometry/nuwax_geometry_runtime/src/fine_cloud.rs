@@ -10,13 +10,12 @@ use std::sync::{Arc, OnceLock, Weak};
 #[path = "heightfield_capture.rs"]
 mod heightfield_capture;
 
-pub(crate) const FINE_CLOUD_CACHE_MIB_VAR: &str = "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_MIB";
-pub(crate) const FINE_CLOUD_CACHE_AUTO_MAX_VAR: &str =
-    "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_AUTO_MAX_MIB";
+pub(crate) const FINE_CLOUD_CACHE_MIB_KEY: &str = "geometry.fine_cloud_cache_mib";
+pub(crate) const FINE_CLOUD_CACHE_AUTO_MAX_KEY: &str =
+    "geometry.fine_cloud_cache_auto_max_mib";
 const MIB: usize = 1024 * 1024;
 /// 自动模式的起步预算。
 const AUTO_START_MIB: usize = 32;
-const DEFAULT_CACHE: FineCloudCache = FineCloudCache::Auto { max_mib: 256 };
 static CONFIGURED_CACHE: OnceLock<FineCloudCache> = OnceLock::new();
 
 /// 精细点云写入器缓存配置：固定预算，或从 32 MiB 起按需增长到上限的自动模式。
@@ -27,33 +26,33 @@ pub(crate) enum FineCloudCache {
     Auto { max_mib: usize },
 }
 
-/// 解析两个配置值（`None` 为未设置），与配置保存时的规范化一致：去掉首尾空白，空白或
-/// 未设置按缺省（自动模式、上限 256 MiB）；数值只接受十进制数字。上限只在自动模式下
-/// 生效，固定模式忽略它。其它非法值返回带变量名和合法范围的错误。
+/// 从类型化启动配置解析缓存预算；固定模式沿原规则忽略自动上限。
 pub(crate) fn parse_fine_cloud_cache(
-    mode: Option<&str>,
-    auto_max: Option<&str>,
+    mode: &nuwax_config::sections::CacheBudget,
+    auto_max: i64,
 ) -> Result<FineCloudCache, String> {
-    let integer = |value: &str, low: usize, high: usize| {
-        value
-            .bytes()
-            .all(|b| b.is_ascii_digit())
-            .then(|| value.parse::<usize>().ok())
-            .flatten()
-            .filter(|v| (low..=high).contains(v))
-    };
-    match mode.map(str::trim).filter(|value| !value.is_empty()) {
-        None | Some("auto") => match auto_max.map(str::trim).filter(|value| !value.is_empty()) {
-            None => Ok(DEFAULT_CACHE),
-            Some(value) => integer(value, 32, 4096).map(|max_mib| FineCloudCache::Auto { max_mib }).ok_or_else(||
-                format!("{FINE_CLOUD_CACHE_AUTO_MAX_VAR} 取值非法：{value:?}，应为 32～4096 的整数（MiB）")),
-        },
-        Some(value) => integer(value, 16, 4096).map(|mib| FineCloudCache::Fixed { mib }).ok_or_else(||
-            format!("{FINE_CLOUD_CACHE_MIB_VAR} 取值非法：{value:?}，应为 auto 或 16～4096 的整数（MiB）")),
+    use nuwax_config::sections::CacheBudget;
+    match mode {
+        CacheBudget::Mode(mode) if mode == "auto" => {
+            if !(32..=4096).contains(&auto_max) {
+                return Err(format!(
+                    "{FINE_CLOUD_CACHE_AUTO_MAX_KEY} 应为32～4096的整数（MiB）"
+                ));
+            }
+            Ok(FineCloudCache::Auto {
+                max_mib: auto_max as usize,
+            })
+        }
+        CacheBudget::Mib(mib) if (16..=4096).contains(mib) => {
+            Ok(FineCloudCache::Fixed { mib: *mib as usize })
+        }
+        _ => Err(format!(
+            "{FINE_CLOUD_CACHE_MIB_KEY} 应为 auto 或16～4096的整数（MiB）"
+        )),
     }
 }
 
-/// 启动时按配置设定一次；未设定时（例如单元测试）按缺省自动模式。
+/// 启动时按配置设定一次。
 pub(crate) fn configure_fine_cloud_cache(cache: FineCloudCache) -> Result<(), String> {
     CONFIGURED_CACHE
         .set(cache)
@@ -61,7 +60,16 @@ pub(crate) fn configure_fine_cloud_cache(cache: FineCloudCache) -> Result<(), St
 }
 
 pub(crate) fn configured_writer_cache() -> (usize, CachePolicy) {
-    match CONFIGURED_CACHE.get().copied().unwrap_or(DEFAULT_CACHE) {
+    #[cfg(test)]
+    let cache = CONFIGURED_CACHE.get_or_init(|| {
+        let g: nuwax_config::sections::Geometry = nuwax_config::test_support::section("geometry");
+        parse_fine_cloud_cache(&g.fine_cloud_cache_mib, g.fine_cloud_cache_auto_max_mib).unwrap()
+    });
+    #[cfg(not(test))]
+    let cache = CONFIGURED_CACHE
+        .get()
+        .expect("启动时必须捕获精细点云缓存配置");
+    match *cache {
         FineCloudCache::Fixed { mib } => (mib * MIB, CachePolicy::Fixed),
         FineCloudCache::Auto { max_mib } => (
             AUTO_START_MIB * MIB,

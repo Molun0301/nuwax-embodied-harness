@@ -1204,3 +1204,16 @@ pub(crate) fn test_router(
 #[cfg(test)]
 #[path = "session_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(crate) fn test_block_session(mapper: Arc<Mapper>) -> SessionHandle {
+    let (commands, _) = mpsc::unbounded_channel();
+    let (_, state) = watch::channel(GeometryState::default());
+    let (_, route) = watch::channel(Some(Route {id:mapper.session_id(), mapper,
+        map_pose:true, accept_frames:true}));
+    let (_, pose) = watch::channel(None);
+    let (_, maps) = watch::channel(None);
+    let (_, lio) = watch::channel(None);
+    let (faults, _) = mpsc::unbounded_channel();
+    SessionHandle { commands, state, route, pose, maps, lio, faults }
+}

@@ -123,6 +123,7 @@ pub struct Mapper {
     latest_input: Arc<parking_lot::Mutex<Option<Input>>>,
     poses: watch::Receiver<Option<proto::Pose>>,
     maps: watch::Receiver<Option<proto::MapUpdate>>,
+    fine_root: watch::Receiver<Option<Arc<nuwax_map_chunks::SealedMap>>>,
     errors: watch::Receiver<Option<String>>,
     transform: watch::Receiver<Isometry3<f64>>,
     config: MapperConfig,
@@ -151,12 +152,6 @@ enum Command {
     Shutdown,
     ActivateShared(oneshot::Sender<Result<(), String>>),
     Forbidden(PathBuf, oneshot::Sender<Result<(), String>>),
-    Block(
-        nuwax_map_chunks::RootIdentity,
-        nuwax_map_chunks::BlockRef,
-        Option<(usize, usize)>,
-        oneshot::Sender<Result<nuwax_map_chunks::ObjectRangeRead, String>>,
-    ),
 }
 impl Mapper {
     pub fn start(session_id: u64, config: MapperConfig) -> Result<Arc<Self>, String> {
@@ -202,6 +197,7 @@ impl Mapper {
         let (forbidden_status_tx, forbidden_status) = watch::channel(Ok(()));
         let (pose_tx, poses) = watch::channel(None);
         let (map_tx, maps) = watch::channel(None);
+        let (fine_root_tx, fine_root) = watch::channel(None);
         let (error_tx, errors) = watch::channel(None);
         let (transform_tx, transform) = watch::channel(Isometry3::identity());
         let (forbidden_tx, forbidden) = watch::channel(None);
@@ -214,6 +210,7 @@ impl Mapper {
             read_only,
             pose_tx,
             map_tx,
+            fine_root_tx,
             transform_tx,
             forbidden_tx,
             recent_cloud_tx,
@@ -259,6 +256,7 @@ impl Mapper {
             latest_input,
             poses,
             maps,
+            fine_root,
             errors,
             transform,
             config,
@@ -408,17 +406,9 @@ impl Mapper {
             .map_err(|_| "建图任务已结束")?;
         rx.await.map_err(|_| "建图任务已结束")?
     }
-    pub async fn navigation_map_block(
-        &self,
-        root: nuwax_map_chunks::RootIdentity,
-        reference: nuwax_map_chunks::BlockRef,
-        range: Option<(usize, usize)>,
-    ) -> Result<nuwax_map_chunks::ObjectRangeRead, String> {
-        let (tx, rx) = oneshot::channel();
-        self.sender
-            .send(Command::Block(root, reference, range, tx))
-            .map_err(|_| "建图任务已结束")?;
-        rx.await.map_err(|_| "建图任务已结束")?
+    /// 读取当前精细根，不排入建图命令队列。
+    pub fn fine_root(&self) -> Option<Arc<nuwax_map_chunks::SealedMap>> {
+        self.fine_root.borrow().clone()
     }
     pub async fn set_forbidden_zones(&self, path: PathBuf) -> Result<(), String> {
         let (tx, rx) = oneshot::channel();
@@ -438,6 +428,7 @@ struct Worker {
     map_from_odom: Isometry3<f64>,
     poses: watch::Sender<Option<proto::Pose>>,
     maps: watch::Sender<Option<proto::MapUpdate>>,
+    fine_root: watch::Sender<Option<Arc<nuwax_map_chunks::SealedMap>>>,
     transform: watch::Sender<Isometry3<f64>>,
     corrector: Corrector,
     sequence: u64,
@@ -465,6 +456,7 @@ impl Worker {
         read_only: bool,
         poses: watch::Sender<Option<proto::Pose>>,
         maps: watch::Sender<Option<proto::MapUpdate>>,
+        fine_root: watch::Sender<Option<Arc<nuwax_map_chunks::SealedMap>>>,
         transform: watch::Sender<Isometry3<f64>>,
         forbidden: watch::Sender<Option<proto::OccupancyGrid>>,
         recent_cloud: watch::Sender<Option<Vec<u8>>>,
@@ -527,6 +519,7 @@ impl Worker {
             map_from_odom,
             poses,
             maps,
+            fine_root,
             transform,
             corrector,
             sequence: 0,
@@ -561,6 +554,7 @@ impl Worker {
                 .and_then(|g| g.meta.as_ref())
                 .map_or(0, |m| m.timestamp_ns),
         };
+        value.fine_root.send_replace(value.cloud.surface());
         value.transform.send_replace(map_from_odom);
         value.publish_grid().map_err(Status::unavailable)?;
         Ok(value)
@@ -629,10 +623,6 @@ impl Worker {
                 if let Err(error) = self.publish_grid() {
                     tracing::warn!(%error,"禁行区尚未刷新，等待输入");
                 }
-                Ok(())
-            }
-            Command::Block(root, reference, range, reply) => {
-                let _ = reply.send(self.cloud.navigation_map_block(&root, &reference, range));
                 Ok(())
             }
             Command::Forbidden(path, reply) => {
@@ -795,6 +785,7 @@ impl Worker {
             )?);
             self.grid_stamp = stamp;
             self.cloud.commit(stamp)?;
+            self.fine_root.send_replace(self.cloud.surface());
             if let Err(error) = self.publish_grid() {
                 tracing::warn!(%error,"禁行区尚未刷新，等待输入");
             }
@@ -861,6 +852,7 @@ impl Worker {
         rebuilt.commit(frames.last().map_or(0, |f| f.odom_pose.timestamp_ns))?;
         rebuilt.adopt_publication(&mut self.cloud)?;
         self.cloud = rebuilt;
+        self.fine_root.send_replace(self.cloud.surface());
         self.kernel = Some(kernel);
         self.grid = persistent;
         self.grid_stamp = frames.last().map_or(0, |f| f.odom_pose.timestamp_ns);
@@ -895,6 +887,7 @@ impl Worker {
         }
         if !self.read_only {
             self.cloud.commit(stamp)?;
+            self.fine_root.send_replace(self.cloud.surface());
             if flushed {
                 if let Err(error) = self.publish_grid() {
                     tracing::warn!(%error,"禁行区尚未刷新，等待输入");

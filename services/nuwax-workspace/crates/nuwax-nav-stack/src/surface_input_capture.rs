@@ -154,7 +154,6 @@ mod input_capture {
             let mut reader = FineMapReader {
                 receiver: Receiver::with_cache_budget(local.clone(), 32 * 1024 * 1024),
                 client: None,
-                compress_parts: true,
                 lcm_url: fetch_url,
             };
             let mut seen = BTreeSet::new();

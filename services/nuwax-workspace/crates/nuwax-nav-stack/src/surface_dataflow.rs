@@ -9,7 +9,7 @@ use nuwax_nav_mls_planner::SurfaceSnapshot;
 use nuwax_nav_runtime::replan_feedback::{
     ActualExecutionContext, SurfaceReplanFeedback, SurfaceReplanInput, SuccessfulReplanMemo,
 };
-use crate::surface_map::{SurfaceMapCache as SurfaceGeometryCache, SurfaceGeometryChanges, SurfaceMapBuildError, SurfaceMapRetryDependency};
+use crate::surface_map::{SurfaceMapCache as SurfaceGeometryCache, SurfaceGeometryChanges};
 use nuwax_nav_types_messages::Path3D;
 
 use super::*;
@@ -39,7 +39,6 @@ struct SurfaceMapHub {
     // Same in-process scheduler owner; no new wire fields or inferred ground.
     execution_feedback: tokio::sync::watch::Sender<Option<SurfaceReplanFeedback>>,
     #[cfg(test)] map_computer: Option<SurfaceMapComputer>,
-    #[cfg(test)] reader_guard: Arc<tests::nav_reader_guards::ReaderGuardProbe>,
 }
 
 impl SurfaceMapHub {
@@ -53,7 +52,6 @@ impl SurfaceMapHub {
             planning: tokio::sync::watch::channel(None).0,
             execution_feedback: tokio::sync::watch::channel(None).0,
             #[cfg(test)] map_computer: None,
-            #[cfg(test)] reader_guard: Default::default(),
         }
     }
 
@@ -281,22 +279,6 @@ impl SurfaceMapOrder {
     }
 }
 
-// Receipt/header-only updates may retain the same forbidden regions. Compare
-// only that bounded mask, never the full cloud/block payload or a copied map.
-fn same_retained_mask(left: &schema::NavigationMap3D, right: &schema::NavigationMap3D) -> bool {
-    match (&left.virtual_obstacles, &right.virtual_obstacles) {
-        (None, None) => true,
-        // map_load_time is the occupancy commit clock in the production
-        // publisher. It is not geometry and must not revoke a retained map
-        // while an unchanged-mask fine root is being fetched.
-        (Some(a), Some(b)) => a.header.frame_id == b.header.frame_id
-            && a.info.resolution.to_bits() == b.info.resolution.to_bits()
-            && a.info.width == b.info.width && a.info.height == b.info.height
-            && a.info.origin == b.info.origin && a.data == b.data,
-        _ => false,
-    }
-}
-
 fn map_authority(map: &schema::NavigationMap3D) -> GuardedMapAuthority {
     GuardedMapAuthority {
         session_id: map.session_id.clone(),
@@ -306,25 +288,12 @@ fn map_authority(map: &schema::NavigationMap3D) -> GuardedMapAuthority {
 }
 
 
-#[cfg(test)]
 fn prepare_surface_map(
     message: impl Into<Arc<schema::NavigationMap3D>>,
     received_at: Instant,
     config: &SurfaceNavigationConfig,
     cache: &mut SurfaceGeometryCache,
 ) -> PreparedSurfaceMap {
-    prepare_surface_map_with_retry(message, received_at, config, cache).0
-}
-
-fn prepare_surface_map_with_retry(
-    message: impl Into<Arc<schema::NavigationMap3D>>,
-    received_at: Instant,
-    config: &SurfaceNavigationConfig,
-    cache: &mut SurfaceGeometryCache,
-) -> (
-    PreparedSurfaceMap,
-    Option<(nuwax_map_chunks::ObjectIdentity, nuwax_map_chunks::Key)>,
-) {
     let message = message.into();
     let authority = map_authority(&message);
     let source_timestamp_ns = message.source_timestamp_ns;
@@ -336,12 +305,6 @@ fn prepare_surface_map_with_retry(
     } else {
         cache.build_with_changes(&message)
     };
-    let missing_object = match &snapshot {
-        Err(SurfaceMapBuildError::IncompleteFineSource(missing)) => {
-            Some((missing.object, missing.key))
-        }
-        _ => None,
-    };
     let (snapshot, awaiting_build, change_basis, geometry_changes) = match snapshot {
         Ok(update) => (
             Ok(update.snapshot),
@@ -350,16 +313,16 @@ fn prepare_surface_map_with_retry(
             update.changes,
         ),
         Err(error) => {
-            let incomplete = matches!(error, SurfaceMapBuildError::IncompleteFineSource(_));
+            let awaiting = !message.cleared;
             (
                 Err(error.to_string()),
-                incomplete,
+                awaiting,
                 None,
                 Arc::new(SurfaceGeometryChanges::Unknown),
             )
         }
     };
-    let prepared = PreparedSurfaceMap {
+    PreparedSurfaceMap {
         authority,
         source_timestamp_ns,
         received_at,
@@ -367,8 +330,7 @@ fn prepare_surface_map_with_retry(
         snapshot,
         change_basis,
         geometry_changes,
-    };
-    (prepared, missing_object)
+    }
 }
 
 #[derive(Clone)]
@@ -603,12 +565,10 @@ async fn run_surface_planner_with_computer(
     let mut geometry_retired = false;
     let mut approach: Option<ApproachProgress> = None;
     let mut approach_failure_pending=false;
-    let mut pending_map: Option<(Arc<schema::NavigationMap3D>, Instant, u64, Option<Arc<nuwax_map_chunks::Manifest>>)> = None;
+    let mut pending_map: Option<(Arc<schema::NavigationMap3D>, Instant, u64)> = None;
     let mut map_retry_after = Instant::now();
-    let mut map_retry_dependency: Option<SurfaceMapRetryDependency> = None;
     let mut map_epoch = 0_u64;
     let mut latest_map: Option<PreparedSurfaceMap> = None;
-    let mut complete_map_source: Option<Arc<schema::NavigationMap3D>> = None;
     let mut pose: Option<PoseStamped> = None;
     let mut goal: Option<schema::NavigationGoal> = None;
     let mut newest_goal: Option<schema::NavigationGoal> = None;
@@ -632,12 +592,10 @@ async fn run_surface_planner_with_computer(
             }
         }
         if computations.is_empty() && Instant::now() >= map_retry_after {
-            if let Some((message, received_at, epoch, parsed_root)) = pending_map.take() {
-                map_retry_dependency = None;
+            if let Some((message, received_at, epoch)) = pending_map.take() {
                 let cache = Arc::clone(&cache);
                 let config = config.clone();
                 #[cfg(test)] let map_computer = hub.map_computer.clone();
-                #[cfg(test)] let reader_guard = Arc::clone(&hub.reader_guard);
                 #[cfg(all(test,feature="surface-recovery-qualification"))]
                 let timing=hub.qualification_timing.clone();
                 #[cfg(all(test,feature="surface-recovery-qualification"))]
@@ -649,18 +607,13 @@ async fn run_surface_planner_with_computer(
                         drop(queued);
                         #[cfg(all(test,feature="surface-recovery-qualification"))]
                         let _build=timing.as_ref().map(|t|t.span("map.build.compute_and_cache_lock",message.source_timestamp_ns));
-                        #[cfg(test)] let reader_revision = message.revision;
-                        #[cfg(test)] reader_guard.started(reader_revision, received_at);
                         let mut cache = cache.lock().map_err(|_| "表面计算缓存锁失效".to_string())?;
                         #[cfg(test)] if let Some(computer) = map_computer {
-                            return Ok((computer(message, received_at, &config, &mut cache), None));
+                            return Ok(computer(message, received_at, &config, &mut cache));
                         }
-                        let result = prepare_surface_map_with_retry(message, received_at, &config, &mut cache);
-                        #[cfg(test)] reader_guard.finished(reader_revision, received_at,
-                            result.0.awaiting_build, result.0.snapshot.is_ok(), result.1);
-                        Ok::<_, String>(result)
+                        Ok::<_, String>(prepare_surface_map(message, received_at, &config, &mut cache))
                     }).await.map_err(|e| e.to_string()).and_then(|v| v);
-                    (epoch, retry_message, received_at, parsed_root, computed)
+                    (epoch, retry_message, received_at, computed)
                 });
             }
         }
@@ -716,49 +669,20 @@ async fn run_surface_planner_with_computer(
                 }
             }
             computed = computations.join_next(), if !computations.is_empty() => {
-                let (epoch, message, received_at, parsed_root, update) = computed.expect("已有表面任务").map_err(|e| NavStackError::Internal(e.to_string()))?;
-                let (update, missing_object) = update.map_err(NavStackError::Internal)?;
+                let (epoch, message, received_at, update) = computed.expect("已有表面任务").map_err(|e| NavStackError::Internal(e.to_string()))?;
+                let update = update.map_err(NavStackError::Internal)?;
                 if epoch != map_epoch || latest_map.as_ref().is_some_and(|old| old.authority.same_domain(&update.authority)
                     && (old.authority.revision > update.authority.revision
                         || (old.authority == update.authority && old.snapshot.is_ok()))) { continue; }
                 if update.awaiting_build && update.snapshot.is_err() {
-                    // A failure establishes one deadline. Later messages may
-                    // replace pending, but only repaired dependencies bypass it.
-                    map_retry_after = Instant::now() + Duration::from_secs(1);
-                    #[cfg(test)] let original_retry_deadline = map_retry_after;
-                    let retained = latest_map.as_ref().filter(|old|
-                        old.authority.same_domain(&update.authority) && old.snapshot.is_ok())
-                        .filter(|_| complete_map_source.as_ref().is_some_and(|old| same_retained_mask(old, &message)))
-                        .and_then(|old| old.snapshot.as_ref().ok()).cloned();
-                    map_retry_dependency = missing_object.zip(parsed_root.as_ref()).map(|((object, key), root)|
-                        SurfaceMapRetryDependency::new(object, key, root, &message, retained.clone()));
-                    if pending_map.is_none() {
-                        pending_map = Some((Arc::clone(&message), received_at, epoch, parsed_root));
-                    }
-                    if map_retry_dependency.as_ref().is_some_and(|dependency|
-                        pending_map.as_ref().is_some_and(|(pending, _, _, root)|
-                            !dependency.still_blocked(pending, root.as_deref()))) {
-                        map_retry_after = Instant::now();
-                        map_retry_dependency = None;
-                    }
-                    #[cfg(test)] hub.reader_guard.decision(message.revision, received_at,
-                        original_retry_deadline, map_retry_after,
-                        pending_map.as_ref().map(|(pending, _, _, _)| pending.revision),
-                        missing_object, retained.is_some(), map_retry_dependency.is_some());
-                    diagnostics.reject("surface map refresh", update.snapshot.as_ref().err().expect("incomplete source"));
-                    if retained.is_some() {
-                        // Do not publish, refresh freshness, invalidate jobs or
-                        // reset the recent-obstacle source for a partial root.
+                    map_retry_after = if pending_map.is_some() { Instant::now() }
+                        else { pending_map = Some((Arc::clone(&message), received_at, epoch)); Instant::now() + Duration::from_secs(1) };
+                    diagnostics.reject("surface map refresh", update.snapshot.as_ref().err().expect("候选构建失败"));
+                    if latest_map.as_ref().is_some_and(|old| old.authority.same_domain(&update.authority) && old.snapshot.is_ok()) {
                         continue;
                     }
                 } else {
                     map_retry_after = Instant::now();
-                    map_retry_dependency = None;
-                }
-                if update.snapshot.is_err() {
-                    // 构建失败会撤销执行地图；尚未取得租约的目标仍归原拥有方，
-                    // 待同域新图恢复或定向取消，不能只在规划端丢弃身份。
-                    last_path = None; execution_admitted = false;
                 }
                 if let (Some(ticket), Ok(current)) = (&path_cancellation, &update.snapshot) {
                     if ticket.retire_on_geometry
@@ -774,7 +698,6 @@ async fn run_surface_planner_with_computer(
                     }
                 }
                 hub.publish(update.clone());
-                complete_map_source = update.snapshot.is_ok().then_some(message);
                 latest_map = Some(update);
                 needs_plan = goal.is_some() && (needs_plan || last_path.is_none());
             }
@@ -849,8 +772,8 @@ async fn run_surface_planner_with_computer(
                 let received_at = Instant::now();
                 #[cfg(all(test,feature="surface-recovery-qualification"))]
                 let decode=hub.qualification_timing.as_ref().map(|t|t.span("map.ingress.decode",0));
-                let (message, parsed_root) = match schema::decode_navigation_map_3d_body_with_root(&frame.payload) {
-                    Ok((message, root)) => (Arc::new(message), root.map(Arc::new)),
+                let message = match schema::decode_navigation_map_3d_body_with_root(&frame.payload) {
+                    Ok((message, _)) => Arc::new(message),
                     Err(error) => { diagnostics.reject("surface map", &error.to_string()); continue; }
                 };
                 #[cfg(all(test,feature="surface-recovery-qualification"))]
@@ -867,8 +790,6 @@ async fn run_surface_planner_with_computer(
                     cache = Arc::new(std::sync::Mutex::new(SurfaceGeometryCache::configured(&config)));
                     successful.clear();
                     map_retry_after = Instant::now();
-                    map_retry_dependency = None;
-                    complete_map_source = None;
                     map_epoch = map_epoch.checked_add(1).ok_or_else(|| NavStackError::Internal("表面构建票据耗尽".into()))?;
                     let future_goal_matches = !message.cleared
                         && goal.as_ref().is_some_and(|pending| authority.permits_goal(pending));
@@ -885,20 +806,8 @@ async fn run_surface_planner_with_computer(
                         continue;
                     }
                 }
-                if map_retry_dependency.as_ref().is_some_and(|dependency| {
-                    let source_matches = dependency.retained_source().is_none_or(|retained|
-                        latest_map.as_ref().and_then(|map| map.snapshot.as_ref().ok())
-                            .is_some_and(|installed| Arc::ptr_eq(installed, retained)));
-                    !source_matches || !dependency.still_blocked(&message, parsed_root.as_deref())
-                }) {
-                    map_retry_after = Instant::now();
-                    map_retry_dependency = None;
-                }
-                // Same missing object only replaces latest pending; it cannot
-                // move the existing deadline in either direction.
-                #[cfg(test)] hub.reader_guard.accepted(message.revision, received_at,
-                    map_retry_after, map_retry_dependency.is_some(), !computations.is_empty());
-                pending_map = Some((message, received_at, map_epoch, parsed_root));
+                map_retry_after = Instant::now();
+                pending_map = Some((message, received_at, map_epoch));
             }
             frame = goals.next() => {
                 let frame = required_frame(frame, "surface planner goal")?;
@@ -1002,12 +911,6 @@ mod tests {
     mod map_retry_tests {
         include!("surface_map_retry_tests.rs");
     }
-    mod dependency_backoff_tests {
-        include!("surface_dependency_backoff_tests.rs");
-    }
-    pub(crate) mod nav_reader_guards {
-        include!("surface_nav_reader_guards.rs");
-    }
 
     use super::super::guarded_tests::RecordingMotion;
     use super::*;
@@ -1024,7 +927,6 @@ mod tests {
     async fn recorded_live_surface_navigation_diagnostic() {
         nuwax_core::logging::init_component_logging("navigation-diagnostic", "nuwax_nav_mls_planner=debug");
         struct Blocks {
-            root: nuwax_map_chunks::Manifest,
             repository: nuwax_map_chunks::Repository,
         }
         #[async_trait::async_trait]
@@ -1033,16 +935,14 @@ mod tests {
                 let Some(scope) = request.args.0.first() else {
                     return nuwax_rpc::RpcResponse::error(request.id, serde_json::json!({"message":"missing block scope"}));
                 };
-                let Some(block) = self.root.blocks.iter().find(|block|
-                    crate::surface_chunks::block_request(&self.root, block) == *scope) else {
-                    return nuwax_rpc::RpcResponse::error(request.id, serde_json::json!({"message":"root or block reference mismatch"}));
-                };
-                match self.repository.read_object(block.object, nuwax_map_chunks::MAX_BLOCK_BYTES) {
-                    Ok(bytes) => {
-                        let mut response = scope.clone();
-                        response["data"] = serde_json::json!(bytes);
-                        nuwax_rpc::RpcResponse::ok(request.id, response)
-                    }
+                use base64::{engine::general_purpose::STANDARD, Engine as _};
+                let id: [u8;16] = serde_json::from_value(scope["object_id"].clone()).unwrap();
+                match self.repository.read_object_range(nuwax_map_chunks::ObjectIdentity::Assigned(nuwax_map_chunks::ObjectId(id)),
+                    nuwax_map_chunks::MAX_BLOCK_BYTES, scope["offset"].as_u64().unwrap() as usize,
+                    nuwax_map_chunks::MAX_BLOCK_TRANSFER_PART_BYTES) {
+                    Ok(nuwax_map_chunks::ObjectRangeRead::Data {bytes,total_bytes}) =>
+                        nuwax_rpc::RpcResponse::ok(request.id, serde_json::json!({"total_bytes":total_bytes,"data_base64":STANDARD.encode(bytes)})),
+                    Ok(_) => nuwax_rpc::RpcResponse::error(request.id, serde_json::json!({"message":"偏移超出范围"})),
                     Err(error) => nuwax_rpc::RpcResponse::error(request.id, serde_json::json!({"message":error})),
                 }
             }
@@ -1053,7 +953,6 @@ mod tests {
         let broker = nuwax_rpc::RpcBroker::new();
         let method = "GeometryRuntimeService/get_navigation_map_block";
         let blocks = Blocks {
-            root: nuwax_map_chunks::Manifest::decode(&message.fine.as_ref().unwrap().root).unwrap(),
             repository: nuwax_map_chunks::Repository::open(directory.join("blocks")).unwrap(),
         };
         broker.register(method, Box::new(blocks)).await.unwrap();

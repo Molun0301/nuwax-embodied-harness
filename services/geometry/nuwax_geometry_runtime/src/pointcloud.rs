@@ -69,7 +69,6 @@ pub(crate) struct CloudMap {
     poses: Vec<(u64, [f64; 16])>,
     recording: bool,
     raw_directory: Option<PathBuf>,
-    retained: std::collections::VecDeque<Arc<nuwax_map_chunks::SealedMap>>,
     readonly_classifier: Option<FineCloud>,
     history_scans: Vec<(PathBuf, u64)>,
     dirty: bool,
@@ -165,14 +164,10 @@ impl CloudMap {
             poses: Vec::new(),
             recording: true,
             raw_directory: None,
-            retained: std::collections::VecDeque::new(),
             readonly_classifier: None,
             history_scans: Vec::new(),
             dirty: false,
         };
-        if let Some(root) = &value.surface {
-            value.retained.push_back(root.clone());
-        }
         value.publish()?;
         Ok(value)
     }
@@ -332,11 +327,6 @@ impl CloudMap {
                 .seal(domain(self.session_id), self.revision, self.stamp)?,
         );
         self.fine.retain_committed(self.surface.as_ref().unwrap());
-        self.retained
-            .push_back(self.surface.as_ref().unwrap().clone());
-        while self.retained.len() > 2 {
-            self.retained.pop_front();
-        }
         self.dense_snapshot =
             self.dense
                 .snapshot(self.stamp, self.revision, &self.session_id.to_string());
@@ -361,28 +351,6 @@ impl CloudMap {
         }
         self.pages.committed();
         Ok(())
-    }
-    pub fn navigation_map_block(
-        &self,
-        root: &nuwax_map_chunks::RootIdentity,
-        reference: &nuwax_map_chunks::BlockRef,
-        range: Option<(usize, usize)>,
-    ) -> Result<nuwax_map_chunks::ObjectRangeRead, String> {
-        let sealed = self
-            .retained
-            .iter()
-            .find(|sealed| sealed.manifest().identity() == *root)
-            .ok_or("请求的地图修订已不可用")?;
-        if !sealed.manifest().blocks.contains(reference) {
-            return Err("地图块不属于请求的修订".into());
-        }
-        let (offset, maximum) = range.unwrap_or((0, nuwax_map_chunks::MAX_BLOCK_BYTES));
-        sealed.repository.read_object_range(
-            reference.object,
-            nuwax_map_chunks::MAX_BLOCK_BYTES,
-            offset,
-            maximum,
-        )
     }
     pub fn classify_readonly(
         &mut self,
@@ -509,22 +477,11 @@ impl CloudMap {
         self.dense_snapshot =
             self.dense
                 .snapshot(self.stamp, self.revision, &self.session_id.to_string());
-        self.retained.clear();
-        self.retained
-            .push_back(self.surface.as_ref().unwrap().clone());
         self.shm = previous.shm.take();
         self.logs = std::mem::take(&mut previous.logs);
         self.raw_directory = previous.raw_directory.take();
         self.recording = previous.recording;
         self.history_scans = std::mem::take(&mut previous.history_scans);
-        let current = self.retained.back().cloned();
-        self.retained = std::mem::take(&mut previous.retained);
-        if let Some(current) = current {
-            self.retained.push_back(current);
-        }
-        while self.retained.len() > 2 {
-            self.retained.pop_front();
-        }
         self.pages.invalidate();
         self.publish()
     }

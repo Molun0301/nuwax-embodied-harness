@@ -193,20 +193,43 @@ async fn auxiliary_scans_do_not_enter_relocalization_and_keep_their_source_log()
 }
 
 #[tokio::test]
-async fn navigation_block_reads_pin_the_previous_committed_revision() {
+async fn object_block_service_reads_unchanged_old_objects_and_reports_collected_objects() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
     let mapper = Mapper::start(29, config()).unwrap();
     mapper.feed(room_frame(29, 1_000_000_000));
     mapper.snapshot().await.unwrap();
-    let first = mapper.surface_map().await.unwrap().unwrap();
-    let identity = first.manifest().identity();
-    let reference = first.manifest().blocks[0].clone();
-    mapper.feed(room_frame(29, 1_100_000_000));
-    mapper.snapshot().await.unwrap();
-    let result = mapper
-        .navigation_map_block(identity, reference, Some((0, 64)))
-        .await
-        .unwrap();
-    assert!(matches!(result,nuwax_map_chunks::ObjectRangeRead::Data{bytes,..}if !bytes.is_empty()));
+    let first = mapper.fine_root().unwrap();
+    let original: Vec<_> = first.manifest().blocks.iter().map(|b| b.object).collect();
+    drop(first);
+    for revision in 2..=5 {
+        let mut frame = room_frame(29, revision * 1_000_000_000);
+        frame.mapping_only = true;
+        frame.points_body = vec![[12.,0.,0.]];
+        mapper.feed(frame);
+        mapper.snapshot().await.unwrap();
+    }
+    let current = mapper.fine_root().unwrap();
+    assert!(current.manifest().revision >= 4);
+    let unchanged = *original.iter().find(|object| current.manifest().blocks.iter().any(|b| b.object == **object))
+        .expect("只改变远处输入时必须仍有未变化块");
+    let expected = current.repository.read_object(unchanged, nuwax_map_chunks::MAX_BLOCK_BYTES).unwrap();
+    drop(current);
+    let reply = crate::rpc_runtime::test_block(mapper.clone(), unchanged).await.unwrap();
+    let data = if let Some(encoded) = reply["data_lz4_base64"].as_str() {
+        nuwax_codec::lcm::map_block_part::decompress(&STANDARD.decode(encoded).unwrap(), expected.len()).unwrap()
+    } else { STANDARD.decode(reply["data_base64"].as_str().unwrap()).unwrap() };
+    assert_eq!(data, expected);
+    // 之后更新整幅房间，跨过原有16次提交回收周期，不持有旧根。
+    for revision in 6..=33 {
+        mapper.feed(room_frame(29, revision * 1_000_000_000));
+        mapper.snapshot().await.unwrap();
+    }
+    let current = mapper.fine_root().unwrap();
+    let collected = *original.iter().find(|&&object| current.repository.read_object(object, nuwax_map_chunks::MAX_BLOCK_BYTES).is_err())
+        .expect("已替换对象应经原有周期回收");
+    let error = crate::rpc_runtime::test_block(mapper.clone(), collected).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::NotFound);
+    assert_eq!(error.message(), "地图块已被新修订替换或地图已切换");
     mapper.shutdown().await.unwrap();
 }
 
@@ -483,6 +506,9 @@ async fn slow_worker_coalesces_frames_before_save_without_a_frame_backlog() {
     let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
     let mapper = Mapper::start(67, config()).unwrap();
+    mapper.feed(room_frame(67, 1_000_000_000));
+    mapper.snapshot().await.unwrap();
+    let object = mapper.fine_root().unwrap().manifest().blocks[0].object;
     let blocked_mapper = mapper.clone();
     let mut refresh = tokio::spawn(async move { blocked_mapper.set_forbidden_zones(fifo).await });
     let fifo_path = directory.0.join("forbidden_zones.json");
@@ -509,7 +535,11 @@ async fn slow_worker_coalesces_frames_before_save_without_a_frame_backlog() {
             panic!("禁行区刷新未经过阻塞夹具即结束");
         }
     };
-    // 写端打开证明真实文件读取已进入工作线程；保持打开让它停在读取，模拟后端跟不上。
+    // 写端打开证明建图线程已被真实文件读取占住，块服务仍须返回。
+    let reply = tokio::time::timeout(Duration::from_millis(350),
+        crate::rpc_runtime::test_block(mapper.clone(), object)).await.unwrap().unwrap();
+    assert!(reply["total_bytes"].as_u64().unwrap() > 0);
+    // 保持写端打开，让工作线程继续停在读取，验证原帧合并行为。
     for stamp in 1..=1000 {
         mapper.feed(room_frame(67, 1_000_000_000 + stamp));
     }

@@ -1,15 +1,13 @@
-//! 原表面构建任务拥有的块接收、可靠补取和有界磁盘缓存。
+//! 原表面构建任务拥有的块接收、对象补取和有界磁盘缓存。
 use nuwax_codec::lcm::schema;
 use nuwax_map_chunks::{Manifest, Receiver, Repository, MAX_BLOCK_BYTES, MAX_BLOCK_TRANSFER_PART_BYTES};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use crate::surface_map::SurfaceMapBuildError;
+use std::time::Duration;
 
 pub(super) struct FineMapReader {
     receiver: Receiver,
     client: Option<nuwax_rpc::RpcClient>,
     lcm_url: String,
-    compress_parts: bool,
 }
 impl FineMapReader {
     /// 按块证据修订刷新观察块；几何未变化的时间更新也必须交付。
@@ -104,29 +102,26 @@ impl FineMapReader {
         Ok(Self {
             receiver: Receiver::with_cache_budget(repository, 32 * 1024 * 1024),
             client: None,
-            compress_parts: true,
             lcm_url,
         })
     }
     #[cfg(feature = "surface-source-qualification")]
     pub(super) fn from_admitted_receiver(receiver: Receiver) -> Self {
-        Self { receiver, client: None, lcm_url: "memq://".into(), compress_parts: true }
+        Self { receiver, client: None, lcm_url: "memq://".into() }
     }
 
     pub(super) fn receive(
         &mut self,
         message: &schema::NavigationMap3D,
-    ) -> Result<Arc<Manifest>, SurfaceMapBuildError> {
+    ) -> Result<Arc<Manifest>, String> {
         let transfer = message.fine.as_ref().ok_or("消息缺少精细根")?;
         // Receiver must also inspect included bytes on duplicate publications:
         // an identical root cannot hide an immutable-object conflict.
         let expected = schema::navigation_map_3d_domain(message);
-        let deadline = Instant::now() + Duration::from_secs(2);
         let client = &mut self.client;
         let url = &self.lcm_url;
-        let compress_parts = &mut self.compress_parts;
         let mut fetched_blocks=0_usize;
-        let received=receive_with_fetch(&mut self.receiver, transfer, &expected, |root, reference| {
+        let received=self.receiver.receive(transfer, &expected, |_, reference| {
             fetched_blocks+=1;
             if client.is_none() {
                 *client = Some(nuwax_rpc::RpcClient::new(
@@ -135,8 +130,7 @@ impl FineMapReader {
                 ).map_err(|e| e.to_string())?);
             }
             let runtime = tokio::runtime::Handle::try_current().map_err(|_| "可靠补取必须在原受管阻塞构建任务中执行")?;
-            runtime.block_on(fetch_block_parts(client.as_ref().unwrap(), root, reference, deadline, compress_parts))
-
+            runtime.block_on(fetch_block_parts(client.as_ref().unwrap(), reference))
         })?;
         if fetched_blocks>0 {tracing::debug!(fetched_blocks,blocks=received.blocks.len(),revision=received.revision,"精细地图可靠补取完成");}
         Ok(received)
@@ -229,139 +223,49 @@ impl FineMapReader {
     }
 }
 
-/// 同一对象最多四段并发，总期限仍是原构建拥有方的两秒；每段仍受256KiB限制。
-async fn fetch_block_parts(client: &nuwax_rpc::RpcClient, root: &Manifest,
-    reference: &nuwax_map_chunks::BlockRef, deadline: Instant, compress_parts: &mut bool) -> Result<Vec<u8>, SurfaceMapBuildError> {
-    async fn part(client: &nuwax_rpc::RpcClient, mut request: serde_json::Value,
-        reference: &nuwax_map_chunks::BlockRef, deadline: Instant) -> Result<(Vec<u8>, usize, bool), SurfaceMapBuildError> {
-        let mut last = "精细块补取期限耗尽".to_string();
-        for _ in 0..3 {
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else { break; };
-            match client.call_scoped((vec![request.clone()], Default::default()),
-                remaining.min(Duration::from_millis(350))).await {
-                Ok(reply) => {
-                    let data = block_response(&request, &reply)?;
-                    return Ok((data, reply["total_bytes"].as_u64().expect("分段格式已检查") as usize,
-                        request.get("part_encoding").is_some()));
-                }
-                Err(error @ (nuwax_rpc::RpcError::Timeout { .. } | nuwax_rpc::RpcError::Transport(_))) => last = error.to_string(),
-                Err(nuwax_rpc::RpcError::RemoteException(error)) if request.get("part_encoding").is_some()
-                    && error["type_name"] == "InvalidArguments"
-                    && error["args"][0].as_str().is_some_and(|reason| reason.contains("unknown field `part_encoding`")) => {
-                    // 仅针对旧服务明确拒绝协商字段降级；身份、范围及校验错误均不降级。
-                    request.as_object_mut().unwrap().remove("part_encoding");
-                }
-                Err(error) => return Err(SurfaceMapBuildError::Invalid(error.to_string())),
-            }
-        }
-        Err(SurfaceMapBuildError::IncompleteFineSource(crate::surface_map::MissingFineObject {
-            object: reference.object, key: reference.key, reason: last }))
+/// 同一对象最多四段并发；每段只请求一次，超时为350毫秒。
+async fn fetch_block_parts(client: &nuwax_rpc::RpcClient,
+    reference: &nuwax_map_chunks::BlockRef) -> Result<Vec<u8>, String> {
+    async fn part(client: &nuwax_rpc::RpcClient, request: serde_json::Value) -> Result<(Vec<u8>, usize), String> {
+        let reply = client.call_scoped((vec![request.clone()], Default::default()),
+            Duration::from_millis(350)).await.map_err(|e| e.to_string())?;
+        let data = block_response(&request, &reply)?;
+        Ok((data, reply["total_bytes"].as_u64().expect("分段格式已检查") as usize))
     }
-    let mut request = block_request(root, reference);
-    if !*compress_parts { request.as_object_mut().unwrap().remove("part_encoding"); }
-    let (mut joined, total, supported) = part(client, request.clone(), reference, deadline).await?;
-    *compress_parts = supported;
-    if !supported { request.as_object_mut().unwrap().remove("part_encoding"); }
+    let request = block_request(reference);
+    let (mut joined, total) = part(client, request.clone()).await?;
     while joined.len() < total {
         let requests = (joined.len()..total).step_by(MAX_BLOCK_TRANSFER_PART_BYTES).take(4).map(|offset| {
             let mut request = request.clone();
             request["offset"] = serde_json::json!(offset);
-            part(client, request, reference, deadline)
+            part(client, request)
         });
-        // 返回次序与偏移次序一致；任一段失败时原接收器不会安装不完整根。
-        for (bytes, length, _) in futures::future::try_join_all(requests).await? {
-            if length != total { return Err(SurfaceMapBuildError::Invalid("精细块分段总长变化".into())); }
+        for (bytes, length) in futures::future::try_join_all(requests).await? {
+            if length != total { return Err("精细块分段总长变化".into()); }
             joined.extend_from_slice(&bytes);
         }
     }
     Ok(joined)
 }
 
-/// Receiver commits only complete, verified roots. Preserve the fetch failure's
-/// type across its string-error API without classifying arbitrary error text.
-fn receive_with_fetch(
-    receiver: &mut Receiver,
-    transfer: &nuwax_map_chunks::Transfer,
-    expected: &nuwax_map_chunks::Domain,
-    mut fetch: impl FnMut(&Manifest, &nuwax_map_chunks::BlockRef) -> Result<Vec<u8>, SurfaceMapBuildError>,
-) -> Result<Arc<Manifest>, SurfaceMapBuildError> {
-    let mut fetch_error = None;
-    receiver.receive(transfer, expected, |root, reference| {
-        fetch(root, reference).map_err(|error| {
-            let reason = error.to_string();
-            fetch_error = Some(error);
-            reason
-        })
-    }).map_err(|reason| fetch_error.unwrap_or_else(|| SurfaceMapBuildError::Invalid(reason)))
-}
-
-/// The reliable fetch is scoped to a specific root and exact immutable reference.
-/// The RPC object representation intentionally does not reuse serde's archive enum.
-pub(super) fn block_request(root: &Manifest, reference: &nuwax_map_chunks::BlockRef) -> serde_json::Value {
-    use nuwax_map_chunks::ObjectIdentity;
-    let object = match reference.object {
-        ObjectIdentity::Assigned(id) => serde_json::json!({
-            "kind": 1, "object_id": id.0,
-        }),
-
-    };
-    serde_json::json!({
-        "schema_version": 3,
-        "part_encoding": "lz4",
-        "offset": 0,
-        "max_bytes": MAX_BLOCK_TRANSFER_PART_BYTES,
-        "root": root.identity(),
-        "block": {
-            "key": reference.key,
-            "object": object,
-            "block_revision": reference.block_revision,
-            "geometry_revision": reference.geometry_revision,
-            "points": reference.points,
-        },
-    })
+pub(super) fn block_request(reference: &nuwax_map_chunks::BlockRef) -> serde_json::Value {
+    let nuwax_map_chunks::ObjectIdentity::Assigned(id) = reference.object;
+    serde_json::json!({"object_id": id.0, "offset": 0})
 }
 
 fn block_response(request: &serde_json::Value, response: &serde_json::Value) -> Result<Vec<u8>, String> {
-    if response.get("schema_version") != request.get("schema_version")
-        || response.get("root") != request.get("root")
-        || response.get("block") != request.get("block")
-    {
-        return Err("精细块响应与请求的根或块身份不符".into());
-    }
-    if request["schema_version"].as_u64() == Some(3) {
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
-        if response.get("data").is_some() { return Err("精细块响应包含混合编码".into()); }
-        let compressed = response.get("data_lz4_base64");
-        if compressed.is_some() && (request["part_encoding"] != "lz4" || response.get("data_base64").is_some()) {
-            return Err("精细块响应包含未协商或混合编码".into());
-        }
-        let encoded = compressed.or_else(|| response.get("data_base64")).and_then(serde_json::Value::as_str)
-            .ok_or("精细块紧凑响应格式错误")?;
-        let offset=request["offset"].as_u64().filter(|value|*value<MAX_BLOCK_BYTES as u64)
-            .ok_or("精细块请求偏移错误")?;
-        let maximum=request["max_bytes"].as_u64().filter(|value|*value>0 && *value<=MAX_BLOCK_TRANSFER_PART_BYTES as u64)
-            .ok_or("精细块请求段上限错误")?;
-        let total=response["total_bytes"].as_u64().filter(|value|*value>offset && *value<=MAX_BLOCK_BYTES as u64)
-            .ok_or("精细块响应总长错误")?;
-        if response["offset"].as_u64()!=Some(offset) {return Err("精细块响应偏移错误".into());}
-        let expected=maximum.min(total-offset) as usize;
-        // 分配前限制编码长度，解码后要求精确段长；空段、错序及尾部缺字节不能推进。
-        if encoded.len() > expected.div_ceil(3) * 4 { return Err("精细块响应长度错误".into()); }
-        let data = STANDARD.decode(encoded).map_err(|_| "精细块紧凑响应编码无效")?;
-        if compressed.is_some() {
-            return nuwax_codec::lcm::map_block_part::decompress(&data, expected);
-        }
-        if data.len()!=expected { return Err("精细块响应长度错误".into()); }
-        return Ok(data);
-    }
-    if request["schema_version"].as_u64() != Some(2) || response.get("data_base64").is_some() {
-        return Err("不支持的精细块响应版本或混合编码".into());
-    }
-    let data = response.get("data").and_then(serde_json::Value::as_array)
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let offset = request["offset"].as_u64().expect("本地分段偏移") as usize;
+    let total = response["total_bytes"].as_u64().filter(|&v| v <= MAX_BLOCK_BYTES as u64)
+        .ok_or("精细块响应总长错误")? as usize;
+    let expected = total.saturating_sub(offset).min(MAX_BLOCK_TRANSFER_PART_BYTES);
+    let compressed = response.get("data_lz4_base64");
+    let encoded = compressed.or_else(|| response.get("data_base64")).and_then(serde_json::Value::as_str)
         .ok_or("精细块响应格式错误")?;
-    if data.len() > nuwax_map_chunks::MAX_V1_TO_V5_BLOCK_BYTES { return Err("精细块响应长度错误".into()); }
-    data.iter().map(|byte| byte.as_u64().and_then(|v| u8::try_from(v).ok())
-        .ok_or_else(|| "精细块响应字节无效".into())).collect()
+    let data = STANDARD.decode(encoded).map_err(|e| e.to_string())?;
+    let data = if compressed.is_some() { nuwax_codec::lcm::map_block_part::decompress(&data, expected)? } else { data };
+    if data.len() != expected { return Err("精细块响应长度错误".into()); }
+    Ok(data)
 }
 
 fn planning_columns(
@@ -388,37 +292,12 @@ fn planning_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
     use nuwax_map_chunks::*;
     use std::collections::{BTreeMap, BTreeSet};
     include!("surface_layer_transfer_tests.rs");
-    include!("surface_chunk_retry_tests.rs");
+    include!("surface_object_fetch_tests.rs");
     include!("surface_input_capture.rs");
-
-    #[test]
-    fn compressed_reply_keeps_scope_extent_and_legacy_fallback_checks() {
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
-        let source = Repository::temporary().unwrap();
-        let root = install(&source, &BTreeSet::from([[0,0,0]]), 0.05, 1);
-        let request = block_request(&root, &root.blocks[0]);
-        let bytes = vec![7; MAX_BLOCK_TRANSFER_PART_BYTES];
-        let mut reply = request.clone();
-        reply["total_bytes"] = serde_json::json!(bytes.len());
-        reply["data_lz4_base64"] = serde_json::json!(STANDARD.encode(
-            nuwax_codec::lcm::map_block_part::compress(&bytes).unwrap()));
-        assert_eq!(block_response(&request, &reply).unwrap(), bytes);
-        let mut mixed = reply.clone();
-        mixed["data_base64"] = serde_json::json!(STANDARD.encode(&bytes));
-        assert!(block_response(&request, &mixed).is_err());
-        let mut wrong = reply.clone();
-        wrong["block"]["geometry_revision"] = serde_json::json!(1000);
-        assert!(block_response(&request, &wrong).is_err());
-        let mut unnegotiated = request.clone();
-        unnegotiated.as_object_mut().unwrap().remove("part_encoding");
-        assert!(block_response(&unnegotiated, &reply).is_err());
-        reply.as_object_mut().unwrap().remove("data_lz4_base64");
-        reply["data_base64"] = serde_json::json!(STANDARD.encode(&bytes));
-        assert_eq!(block_response(&request, &reply).unwrap(), bytes, "旧服务原编码仍可接收");
-    }
 
     // Fresh-root compatibility for existing doorway diagnostic recipes.
     #[allow(dead_code)]
@@ -451,7 +330,6 @@ mod tests {
         FineMapReader {
             receiver: Receiver::with_cache_budget(repository, 1024 * 1024),
             client: None,
-            compress_parts: true,
             lcm_url: String::new(),
         }
     }
@@ -592,89 +470,6 @@ mod tests {
         assert!(Arc::ptr_eq(&next, &repeated_observations));
         eprintln!("inline fine cells={} blocks={} included_bytes={included_bytes:?} stages=receive1,observations1,columns1,receive2,observations2,columns2,repeat_receive2,repeat_observations2 operation_us={timings_us:?} columns_read_points=[{initial_count},{count}] client_initialized={}",
             cells.len(), second.blocks.len(), reader.client.is_some());
-    }
-
-    #[test]
-    fn reliable_block_reply_must_echo_exact_scope_and_bounded_bytes() {
-        let repository = Repository::temporary().unwrap();
-        let root = install_revisioned(&repository, &BTreeSet::from([[0, 0, 0]]), 0.05, 1, None);
-        let reference = &root.blocks[0];
-        let mut request = block_request(&root, reference);
-        request["schema_version"] = serde_json::json!(2);
-        let bytes = repository.read_object(reference.object, MAX_BLOCK_BYTES).unwrap();
-        let mut response = request.clone();
-        response["data"] = serde_json::json!(bytes);
-        assert_eq!(block_response(&request, &response).unwrap(), bytes);
-        for path in [vec!["root", "revision"], vec!["block", "block_revision"],
-            vec!["block", "geometry_revision"], vec!["block", "points"]]
-        {
-            let mut wrong = response.clone();
-            wrong[path[0]][path[1]] = serde_json::json!(99);
-            assert!(block_response(&request, &wrong).is_err());
-        }
-        let mut wrong = response.clone();
-        wrong["block"]["key"] = serde_json::json!([1, 0, 0]);
-        assert!(block_response(&request, &wrong).is_err());
-        wrong = response.clone();
-        wrong["root"]["domain"]["session"] = serde_json::json!("其它会话");
-        assert!(block_response(&request, &wrong).is_err());
-        wrong = response.clone();
-        wrong["block"]["object"]["object_id"][0] = serde_json::json!(256);
-        assert!(block_response(&request, &wrong).is_err());
-        for data in [serde_json::json!([-1]), serde_json::json!([256]),
-            serde_json::json!([1.5]), serde_json::json!(["1"]), serde_json::json!("00"),
-            serde_json::json!(vec![0_u8; nuwax_map_chunks::MAX_V1_TO_V5_BLOCK_BYTES + 1])]
-        {
-            let mut wrong = response.clone();
-            wrong["data"] = data;
-            assert!(block_response(&request, &wrong).is_err());
-        }
-
-    }
-
-    #[test]
-    fn compact_block_reply_keeps_scope_and_decoded_size_boundaries() {
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
-        let repository = Repository::temporary().unwrap();
-        let root = install_revisioned(&repository, &BTreeSet::from([[0, 0, 0]]), 0.05, 1, None);
-        let request = block_request(&root, &root.blocks[0]);
-        assert_eq!(request["schema_version"], 3);
-        let mut response = request.clone();
-        response["data_base64"] = serde_json::json!("AAH+/w==");
-        response["total_bytes"] = serde_json::json!(4);
-        assert_eq!(block_response(&request, &response).unwrap(), [0, 1, 254, 255]);
-        for path in [vec!["root", "revision"], vec!["block", "block_revision"],
-            vec!["block", "geometry_revision"], vec!["block", "points"]] {
-            let mut invalid = response.clone();
-            invalid[path[0]][path[1]] = serde_json::json!(99);
-            assert!(block_response(&request, &invalid).is_err());
-        }
-        for encoded in [serde_json::json!("!"), serde_json::json!("AAH+/w"),
-            serde_json::json!([0, 1]), serde_json::json!("A".repeat(nuwax_map_chunks::MAX_V1_TO_V5_BLOCK_BYTES.div_ceil(3) * 4 + 4))] {
-            let mut invalid = response.clone(); invalid["data_base64"] = encoded;
-            assert!(block_response(&request, &invalid).is_err());
-        }
-        let mut mixed = response.clone(); mixed["data"] = serde_json::json!([0]);
-        assert!(block_response(&request, &mixed).is_err());
-        // 段上限和上限+1可有相同编码长度，必须在解码后检查精确字节数。
-        for length in [MAX_BLOCK_TRANSFER_PART_BYTES, MAX_BLOCK_TRANSFER_PART_BYTES + 1] {
-            let bytes: Vec<_> = (0..length).map(|index| index as u8).collect();
-            let mut actual = request.clone(); actual["data_base64"] = serde_json::json!(STANDARD.encode(&bytes));
-            actual["total_bytes"] = serde_json::json!(MAX_BLOCK_BYTES);
-            let result = block_response(&request, &actual);
-            if length == MAX_BLOCK_TRANSFER_PART_BYTES { assert_eq!(result.unwrap(), bytes); }
-            else { assert!(result.is_err()); }
-        }
-        for (field,value) in [("offset",serde_json::json!(1)),("total_bytes",serde_json::json!(0)),
-            ("total_bytes",serde_json::json!(MAX_BLOCK_BYTES+1)),("total_bytes",serde_json::json!(5))] {
-            let mut invalid=response.clone();invalid[field]=value;
-            assert!(block_response(&request,&invalid).is_err());
-        }
-        let mut last_request=request.clone();
-        last_request["offset"]=serde_json::json!(MAX_BLOCK_BYTES-4);
-        let mut last=response.clone();last["offset"]=last_request["offset"].clone();
-        last["total_bytes"]=serde_json::json!(MAX_BLOCK_BYTES);
-        assert_eq!(block_response(&last_request,&last).unwrap(),[0,1,254,255]);
     }
 
     fn assert_columns(
@@ -965,7 +760,3 @@ mod tests {
     }
 
 }
-
-#[cfg(test)]
-#[path = "surface_chunk_process_tests.rs"]
-mod rpc_process_tests;

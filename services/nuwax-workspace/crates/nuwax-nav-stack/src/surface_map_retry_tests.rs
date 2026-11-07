@@ -1,35 +1,35 @@
-// Real planner owner + scheduler + memq wiring. The build boundary is held or
-// fails deterministically; FineMapReader's typed transfer transaction is tested
-// separately with real immutable roots and blocks in surface_chunks.
+// 真实规划拥有方与调度器接线；对象补取的原子准入由独立块测试覆盖。
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 struct Probe {
     failing_revision: AtomicI64,
-    invalid: AtomicBool,
     hold: AtomicBool,
     recover: AtomicBool,
     attempts: Mutex<Vec<(i64, Instant)>>,
+    started: Mutex<Vec<(i64, Instant)>>,
 }
 impl Probe {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             failing_revision: AtomicI64::new(-1),
-            invalid: AtomicBool::new(false),
             hold: AtomicBool::new(false),
             recover: AtomicBool::new(false),
             attempts: Mutex::new(Vec::new()),
+            started: Mutex::new(Vec::new()),
         })
     }
     fn computer(self: &Arc<Self>) -> SurfaceMapComputer {
         let probe = Arc::clone(self);
         Arc::new(move |message, received_at, config, cache| {
+            probe.started.lock().unwrap().push((message.revision, Instant::now()));
             probe
                 .attempts
                 .lock()
                 .unwrap()
                 .push((message.revision, received_at));
-            if message.revision == probe.failing_revision.load(Ordering::Acquire)
+            if (message.revision == probe.failing_revision.load(Ordering::Acquire)
+                || probe.failing_revision.load(Ordering::Acquire) == i64::MAX)
                 && !probe.recover.load(Ordering::Acquire)
             {
                 let deadline = Instant::now() + Duration::from_secs(5);
@@ -44,8 +44,8 @@ impl Probe {
                     authority: map_authority(&message),
                     received_at,
                     source_timestamp_ns: message.source_timestamp_ns,
-                    awaiting_build: !probe.invalid.load(Ordering::Acquire),
-                    snapshot: Err("injected typed fine-source failure".into()),
+                    awaiting_build: true,
+                    snapshot: Err("候选补取或构建失败".into()),
                     change_basis: None,
                     geometry_changes: Arc::new(SurfaceGeometryChanges::Unknown),
                 };
@@ -203,6 +203,7 @@ async fn incomplete_refresh_retry_never_replaces_a_newer_pending_root() {
     probe
         .failing_revision
         .store(incomplete.revision, Ordering::Release);
+    probe.hold.store(true, Ordering::Release);
     harness.map(&incomplete).await;
     wait(|| probe.count(incomplete.revision) == 1).await;
     let newer = map_message(
@@ -210,6 +211,9 @@ async fn incomplete_refresh_retry_never_replaces_a_newer_pending_root() {
         &first.session_id,
     );
     harness.map(&newer).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let released = Instant::now();
+    probe.hold.store(false, Ordering::Release);
     wait(|| {
         harness
             .hub
@@ -223,6 +227,8 @@ async fn incomplete_refresh_retry_never_replaces_a_newer_pending_root() {
             == newer.revision
     })
     .await;
+    let started = probe.started.lock().unwrap().iter().find(|(r,_)| *r == newer.revision).unwrap().1;
+    assert!(started.duration_since(released) < Duration::from_millis(500));
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert_eq!(probe.count(incomplete.revision), 1);
     assert_eq!(probe.count(newer.revision), 1);
@@ -371,96 +377,6 @@ async fn incomplete_refresh_late_completion_cannot_cross_clear_or_domain_fence()
 }
 
 #[tokio::test]
-async fn incomplete_refresh_pauses_while_invalid_source_retires_route() {
-    for invalid in [false, true] {
-        let probe = Probe::new();
-        let (mut harness, first, _, _) = active(&probe, Duration::ZERO).await;
-        let mut next = map_message(first.revision + 1, &first.session_id);
-        if !invalid {
-            next.virtual_obstacles = Some(virtual_mask(&next, true));
-        }
-        probe
-            .failing_revision
-            .store(next.revision, Ordering::Release);
-        probe.invalid.store(invalid, Ordering::Release);
-        harness.map(&next).await;
-        wait(|| {
-            harness
-                .hub
-                .latest
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .snapshot
-                .is_err()
-        })
-        .await;
-        wait(|| {
-            let status = harness.scheduler.status();
-            if invalid {
-                status.last_terminal.is_some()
-            } else {
-                status.last_terminal.is_none() && status.last_applied_twist == Some(Twist2::ZERO)
-                    && !status.planner_inputs_fresh
-            }
-        })
-        .await;
-        assert_eq!(
-            harness
-                .hub
-                .latest
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .awaiting_build,
-            !invalid
-        );
-        if invalid {
-            tokio::time::sleep(Duration::from_millis(1100)).await;
-            assert_eq!(
-                probe.count(next.revision),
-                1,
-                "invalid input must not be retried"
-            );
-        }
-        harness.shutdown().await;
-    }
-}
-
-#[test]
-fn incomplete_refresh_mask_guard_ignores_only_receipt_clocks() {
-    let mut first = map_message(1, "same-mask");
-    first.virtual_obstacles = Some(virtual_mask(&first, false));
-    let mut next = map_message(2, "same-mask");
-    next.virtual_obstacles = Some(virtual_mask(&next, false));
-    let old = first.virtual_obstacles.as_ref().unwrap();
-    let new = next.virtual_obstacles.as_ref().unwrap();
-    assert_ne!((old.info.map_load_time_sec, old.info.map_load_time_nsec),
-        (new.info.map_load_time_sec, new.info.map_load_time_nsec),
-        "fixture must reproduce Geometry's changing production load clock");
-    assert!(same_retained_mask(&first, &next));
-    let mutations: [fn(&mut schema::OccupancyGrid); 8] = [
-        |mask| mask.header.frame_id = "foreign".into(),
-        |mask| mask.info.resolution *= 2.0,
-        |mask| mask.info.width += 1,
-        |mask| mask.info.height += 1,
-        |mask| mask.info.origin.position[0] += 1.0,
-        |mask| mask.info.origin.position[2] += 1.0,
-        |mask| mask.info.origin.orientation_xyzw = [0.0, 0.0, 1.0, 0.0],
-        |mask| mask.data[0] = 100,
-    ];
-    for mutate in mutations {
-        let mut changed = next.clone();
-        mutate(changed.virtual_obstacles.as_mut().unwrap());
-        assert!(!same_retained_mask(&first, &changed));
-    }
-    next.virtual_obstacles = None;
-    assert!(!same_retained_mask(&first, &next));
-}
-
-#[tokio::test]
 async fn incomplete_refresh_keeps_pose_and_recent_source_deadlines_independent() {
     for recent in [false, true] {
         let probe = Probe::new();
@@ -518,4 +434,66 @@ async fn incomplete_refresh_keeps_pose_and_recent_source_deadlines_independent()
         assert!(!harness.scheduler.status().planner_inputs_fresh);
         harness.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn candidate_failure_without_installed_map_waits_then_retries_same_root() {
+    let probe = Probe::new();
+    probe.failing_revision.store(i64::MAX, Ordering::Release);
+    let mut harness = Harness::start_with_components(
+        Arc::new(|m,p,g,c|body_path(m,p,g,c).map(SurfacePlan::complete)),
+        Duration::from_millis(25), config(), true, Some(probe.computer()),
+        nuwax_nav_runtime::SchedulerConfig::default(),
+    ).await;
+    wait(|| harness.hub.latest.lock().unwrap().is_some()).await;
+    let first = harness.freeze_map().await;
+    let goal = goal_for(&first, 1, [3.2, 1.55, 2.5]);
+    harness.goal(&goal).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let update = harness.hub.latest.lock().unwrap().as_ref().unwrap().clone();
+    assert!(update.snapshot.is_err() && update.awaiting_build);
+    assert!(harness.scheduler.status().last_terminal.is_none());
+    assert_eq!(harness.scheduler.status().applied_commands, 0);
+    assert!(harness.calls.lock().unwrap().is_empty(), "无完整地图时目标应留在入口等待，不能取得租约或发速度");
+    probe.recover.store(true, Ordering::Release);
+    wait(|| harness.hub.latest.lock().unwrap().as_ref().is_some_and(|m| m.snapshot.is_ok())).await;
+    let times: Vec<_> = probe.started.lock().unwrap().iter().filter(|(r,_)| *r == first.revision).map(|(_,at)| *at).collect();
+    assert_eq!(times.len(), 2);
+    assert!(times[1].duration_since(times[0]) >= Duration::from_secs(1));
+    harness.path_for(&goal).await;
+    harness.wait_controlling().await;
+    assert!(harness.scheduler.status().last_terminal.is_none());
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn complete_candidate_build_failure_keeps_the_installed_map_and_active_goal() {
+    use nuwax_map_chunks::{Repository,Writer,Transfer,MAX_BLOCK_BYTES};
+    let probe = Probe::new();
+    let (mut harness, first, goal, path_revision) = active(&probe, Duration::ZERO).await;
+    let installed = harness.hub.latest.lock().unwrap().as_ref().unwrap().clone();
+    let mut next = map_message(first.revision+1,&first.session_id);
+    let repository=Repository::temporary().unwrap();
+    let mut writer=Writer::new(repository.clone(),0.2,4*1024*1024).unwrap();
+    writer.observe([[0,0,0]],next.source_timestamp_ns as u64).unwrap();
+    next.source_voxel_size=0.2;
+    next.cloud.width=0;next.cloud.row_step=0;next.cloud.data.clear();
+    let root=writer.snapshot(schema::navigation_map_3d_domain(&next),next.revision as u64,next.source_timestamp_ns as u64).unwrap();
+    next.fine=Some(Transfer {root:root.encode().unwrap(),included:root.blocks.iter().map(|b|
+        (b.object,repository.read_object(b.object,MAX_BLOCK_BYTES).unwrap())).collect()});
+    let mut cache=SurfaceGeometryCache::configured(&config());
+    let failed=prepare_surface_map(next.clone(),Instant::now(),&config(),&mut cache);
+    assert!(failed.snapshot.is_err() && failed.awaiting_build,"对象已齐，规划精度不兼容仍只放弃候选");
+    harness.map(&next).await;
+    wait(||probe.count(next.revision)==1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let retained=harness.hub.latest.lock().unwrap().as_ref().unwrap().clone();
+    assert_eq!(retained.authority,installed.authority);
+    assert!(Arc::ptr_eq(retained.snapshot.as_ref().unwrap(),installed.snapshot.as_ref().unwrap()));
+    let status=harness.scheduler.status();
+    assert_eq!(status.phase,SchedulerPhase::Controlling);
+    assert_eq!(status.path_revision,path_revision as u64);
+    assert!(status.last_terminal.is_none());
+    harness.cancel(&goal).await;harness.terminal(TerminalOutcome::Cancelled).await;
+    harness.shutdown().await;
 }

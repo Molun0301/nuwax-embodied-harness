@@ -6,11 +6,11 @@ const configState = { loaded: false, loading: false, saving: false, saveAcknowle
   dirty: new Map(), errors: new Map(), acknowledgedValues: new Map(), lastSchema: null, robot: null, profile: null };
 function profileIdentity() {
   const context = configState.lastSchema?.profile_context;
-  return context ? { robot: context.robot, profile: context.profile, revision: context.revision } : {};
+  return context ? { robot: context.robot, profile: context.profile, name: context.profile } : {};
 }
 async function configRequest(url, payload) {
   const response = await fetch(url, payload === undefined ? undefined : {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-NEH-CSRF': configState.csrf }, body: JSON.stringify(payload),
   });
   const result = await response.json();
   if (!response.ok) throw new Error(result.error?.message || result.error || result.detail || ('请求失败：' + response.status));
@@ -22,14 +22,14 @@ function setConfigStatus(state, text) {
   status.textContent = text;
 }
 const CONFIG_SINGLE_COLOR_KEYS = new Set([
-  "NUWAX_GATEWAY_POINTCLOUD3D_COLOR",
-  "NUWAX_GATEWAY_POINTCLOUD3D_GROUND_COLOR",
-  "NUWAX_GATEWAY_POINTCLOUD3D_STRUCTURE_COLOR",
-  "NUWAX_GATEWAY_POINTCLOUD3D_OBJECT_COLOR",
+  "gateway.pointcloud3d_color",
+  "gateway.pointcloud3d_ground_color",
+  "gateway.pointcloud3d_structure_color",
+  "gateway.pointcloud3d_object_color",
 ]);
-const CONFIG_HEIGHT_COLORS_KEY = "NUWAX_GATEWAY_POINTCLOUD3D_HEIGHT_COLORS";
-const FINE_CLOUD_CACHE_KEY = "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_MIB";
-const FINE_CLOUD_CACHE_MAX_KEY = "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_AUTO_MAX_MIB";
+const CONFIG_HEIGHT_COLORS_KEY = "gateway.pointcloud3d_height_colors";
+const FINE_CLOUD_CACHE_KEY = "geometry.fine_cloud_cache_mib";
+const FINE_CLOUD_CACHE_MAX_KEY = "geometry.fine_cloud_cache_auto_max_mib";
 const CONFIG_HEX_COLOR_PATTERN = /^#[0-9a-fA-F]{6}$/;
 function configEscape(text) {
   return String(text == null ? "" : text).replace(/[&<>"']/g, (c) => (
@@ -65,11 +65,27 @@ function createConfigColorPicker(value, label) {
   return picker;
 }
 function renderProfileControls(schema) {
+  const toolbar = document.getElementById('configProfileSaveAs')?.parentElement;
+  if (toolbar && !document.getElementById('configProfileDelete')) {
+    for (const [id, title, method] of [['configProfileNew', '新建空方案', 'POST'], ['configProfileDelete', '删除方案', 'DELETE']]) {
+      const button = document.createElement('button'); button.id = id; button.textContent = title;
+      button.addEventListener('click', async () => {
+        try {
+          const name = method === 'DELETE' ? profileIdentity().profile : document.getElementById('configProfileName').value.trim();
+          const response = await fetch('/api/manager/config/profiles', {method, headers: {'Content-Type':'application/json', 'X-NEH-CSRF': configState.csrf}, body: JSON.stringify({name})});
+          const result = await response.json(); if (!response.ok) throw new Error(result.error?.message || '方案操作失败');
+          configState.profile = result.profile; await loadConfigSchema();
+        } catch (error) { document.getElementById('configDirty').textContent = error.message; }
+      });
+      toolbar.appendChild(button);
+    }
+  }
+
   const context = schema.profile_context;
   const robotSelect = document.getElementById('configRobotSelect');
   const profileSelect = document.getElementById('configProfileSelect');
   if (!robotSelect || !profileSelect) return;
-  for (const [select, options, selected] of [[robotSelect, context?.robots || [], context?.robot],
+  for (const [select, options, selected] of [[robotSelect, context ? [context.robot] : [], context?.robot],
     [profileSelect, context?.profiles || [], context?.profile]]) {
     select.replaceChildren(...options.map(value => Object.assign(document.createElement('option'), { value, textContent: value })));
     if (selected) select.value = selected;
@@ -124,7 +140,7 @@ function buildOptionsEditor(field, rawInput, changed) {
   const groups = new Map();
   const controls = new Map();
   for (const [name, spec] of Object.entries(field.options_schema)) {
-    const groupName = field.key === 'NUWAX_GEOMETRY_PGO_OPTIONS'
+    const groupName = field.key === 'geometry.pgo_options'
       ? (name.startsWith('scan_context_') ? '扫描上下文：地点检索' : /^(odometry_|gravity_|loop_.*sigma_|optimizer_)/.test(name)
         ? '位姿图：约束权重与优化' : '回环：配准、确认与关键帧') : '参数明细';
     if (!groups.has(groupName)) {
@@ -202,27 +218,11 @@ function showRestartChoice(result = {}) {
 async function restartConfiguration() {
   document.getElementById('configRestartNow').disabled = true;
   try {
-    await configRequest('/api/config/restart', profileIdentity());
+    await configRequest('/api/manager/config/restart', profileIdentity());
     document.getElementById('configApplyDialog').close();
     setConfigStatus('stale', '正在重启');
     document.getElementById('configDirty').textContent = '已安排重启，连接会短暂断开；新网关返回后更新状态。';
-    const deadline = Date.now() + 180000;
-    const check = async () => {
-      try {
-        const status = await configRequest('/api/config/status');
-        if (status.restart?.state === 'restarted') {
-          await loadConfigSchema();
-          document.getElementById('configDirty').textContent = status.restart.message;
-          return;
-        }
-        if (status.restart?.state === 'failed') throw Object.assign(new Error(status.restart.message), { terminal: true });
-      } catch (error) {
-        if (error.terminal) { setConfigStatus('error', '重启失败'); document.getElementById('configDirty').textContent = error.message; return; }
-      }
-      if (Date.now() < deadline) window.setTimeout(check, 1500);
-      else { setConfigStatus('error', '尚未恢复连接'); document.getElementById('configDirty').textContent = '请检查启动日志；若修改了网关地址，请使用新地址访问。'; }
-    };
-    window.setTimeout(check, 1500);
+    document.getElementById('configDirty').textContent = '设备管理程序已接收重启任务，请在管理页查看结果。';
   } catch (error) {
     setConfigStatus('error', '无法重启'); document.getElementById('configApplyMessage').textContent = error.message;
   }
@@ -238,12 +238,12 @@ async function profileAction(action) {
     if (action === 'create') {
       const name = document.getElementById('configProfileName').value.trim();
       if (!name) throw new Error('请填写新方案名称');
-      const result = await configRequest('/api/config/profiles', { ...identity, name });
+      const result = await configRequest('/api/manager/config/profiles', { source: identity.profile, name });
       configState.profile = result.profile;
       document.getElementById('configProfileName').value = '';
       await loadConfigSchema();
     } else {
-      const result = await configRequest('/api/config/activate', identity);
+      const result = await configRequest('/api/manager/config/activate', identity);
       await loadConfigSchema();
       const failures = Object.entries(result.apply_errors || {});
       if (failures.length) {
@@ -275,7 +275,9 @@ async function fetchConfigSchema({ afterSave = false } = {}) {
     const query = new URLSearchParams();
     if (configState.robot) query.set('robot', configState.robot);
     if (configState.profile) query.set('profile', configState.profile);
-    const resp = await fetch("/api/config/schema?" + query);
+    const session = await fetch('/api/manager/session').then(response => response.json());
+    configState.csrf = session.csrf_token;
+    const resp = await fetch("/api/manager/config?" + query);
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     const schema = await resp.json();
     if (request !== configState.schemaRequest) return false;
@@ -385,16 +387,16 @@ function renderConfigSchema(schema) {
   }
 }
 function syncGeometryPipelineFields() {
-  const selected = document.getElementById("cfg__NUWAX_GEOMETRY_PIPELINE")?.value
-    || configState.dirty.get("NUWAX_GEOMETRY_PIPELINE")
-    || window.__NUWAX_GEOMETRY_PIPELINE__ || "lio_3d";
+  const selected = document.getElementById("cfg__geometry.pipeline")?.value
+    || configState.dirty.get("geometry.pipeline")
+    || window.__geometry.pipeline__ || "lio_3d";
   const planar = selected === "slam_2d";
   for (const row of document.querySelectorAll("#configSections [data-key]")) {
     const key = row.dataset.key;
-    const spatial = ["NUWAX_GEOMETRY_LIO_BACKEND", "NUWAX_GEOMETRY_MAPPING_BACKEND",
-      "NUWAX_GEOMETRY_CORRECTION_BACKEND", "NUWAX_GEOMETRY_PGO_OPTIONS", FINE_CLOUD_CACHE_KEY, FINE_CLOUD_CACHE_MAX_KEY, "NUWAX_NAV_SURFACE_VOXEL_SIZE_M",
-      "NUWAX_NAV_MIN_STAIR_TREAD_M", "NUWAX_GEOMETRY_TRAVERSABILITY_MAX_STEP_HEIGHT_M",
-      "NUWAX_GEOMETRY_TRAVERSABILITY_MAX_SLOPE_DEG"].includes(key)
+    const spatial = ["geometry.lio_backend", "geometry.mapping_backend",
+      "geometry.correction_backend", "geometry.pgo_options", FINE_CLOUD_CACHE_KEY, FINE_CLOUD_CACHE_MAX_KEY, "navigation.surface_voxel_size_m",
+      "navigation.min_stair_tread_m", "navigation.traversability_max_step_height_m",
+      "navigation.traversability_max_slope_deg"].includes(key)
       || key.startsWith("NUWAX_GATEWAY_POINTCLOUD3D_");
     const disabled = planar && spatial;
     for (const input of row.querySelectorAll("input,select,textarea")) input.disabled = disabled || input.dataset.readonly === 'true';
@@ -520,7 +522,7 @@ function buildConfigRow(f, applying = false) {
     input.type = "number";
     if (f.type === "float") input.step = "any";
     input.value = f.value == null ? "" : f.value;
-  } else if ((f.type === "json" || ["NUWAX_GEOMETRY_SLAM2D_CONFIG", "NUWAX_GEOMETRY_SLAM2D_DEVICE", "NUWAX_GEOMETRY_POINTLIO_OPTIONS", "NUWAX_GEOMETRY_PGO_OPTIONS"].includes(f.key)) && !f.sensitive) {
+  } else if ((f.type === "json" || ["geometry.slam2d_config", "geometry.slam2d_config", "geometry.pointlio_options", "geometry.pgo_options"].includes(f.key)) && !f.sensitive) {
     input = document.createElement("textarea");
     input.rows = 3;
     input.value = f.value == null ? "" : f.value;
@@ -535,6 +537,7 @@ function buildConfigRow(f, applying = false) {
   input.className = "field";
   if (f.readonly) { input.disabled = true; input.dataset.readonly = 'true'; }
   if (f.description && !helpMode) input.title = f.description;
+  input.disabled = Boolean(f.readonly);
   const baseline = configState.acknowledgedValues.has(f.key)
     ? configState.acknowledgedValues.get(f.key) : configFieldInputValue(f);
   if (configState.acknowledgedValues.has(f.key)) input.value = baseline;
@@ -631,7 +634,7 @@ function buildConfigRow(f, applying = false) {
     help.textContent = f.description;
     explain.appendChild(help);
   }
-  const geometry = f.key === "NUWAX_ROBOT_MODEL_PATH" ? configState.lastSchema?.robot_geometry_preview : null;
+  const geometry = f.key === "robot.model_path" ? configState.lastSchema?.robot_geometry_preview : null;
   if (geometry?.summary && geometry.status !== "error") {
     const preview = document.createElement("p");
     preview.className = "config-help config-geometry-preview";
@@ -715,7 +718,7 @@ function onConfigInput(key, input, row) {
   if (changed) configState.dirty.set(key, input.value);
   else configState.dirty.delete(key);
   updateConfigDirty();
-  if (key === "NUWAX_GEOMETRY_PIPELINE") syncGeometryPipelineFields();
+  if (key === "geometry.pipeline") syncGeometryPipelineFields();
 }
 function updateConfigDirty() {
   const el = document.getElementById("configDirty");
@@ -729,6 +732,15 @@ function collectConfigSaveUpdates() {
   }
   return updates;
 }
+function typedConfigValues(updates) {
+  const fields = new Map(configState.lastSchema.sections.flatMap(section => section.fields).map(field => [field.key, field]));
+  return Object.fromEntries(Object.entries(updates).map(([key, raw]) => {
+    const field = fields.get(key);
+    const val = field.type === 'bool' ? raw === 'true' : field.type === 'csv' ? raw.split(',').map(value => value.trim()).filter(Boolean)
+      : ['int', 'float'].includes(field.type) && raw !== '' && raw !== 'auto' ? Number(raw) : raw;
+    return [key, val];
+  }));
+}
 async function saveConfig() {
   if (!configState.lastSchema || configState.saving) return;
   const updates = collectConfigSaveUpdates();
@@ -741,10 +753,10 @@ async function saveConfig() {
   button.disabled = true;
   try {
     setConfigStatus("stale", "保存中");
-    const resp = await fetch("/api/config/save", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ updates, ...profileIdentity() }),
+    const resp = await fetch("/api/manager/config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", "X-NEH-CSRF": configState.csrf },
+      body: JSON.stringify({ values: typedConfigValues(updates), profile: profileIdentity().profile }),
     });
     const result = await resp.json();
     if (!resp.ok) throw new Error(result.error?.message || result.error || result.detail || "请求失败：" + resp.status);

@@ -5,13 +5,13 @@ import math
 
 import httpx
 
-from core.config_values import runtime_value
+from core.config import value
 from core.errors import GatewayError
 
 
 class PlaceLookup:
     def __init__(self):
-        self._url = runtime_value("NUWAX_NOMINATIM_URL", "https://nominatim.openstreetmap.org/search")
+        self._url = value('map_cloud.nominatim_url')
         self._client = httpx.Client(headers={"User-Agent": "NuwaxRobotBridge/0.9"})
 
     def close(self):

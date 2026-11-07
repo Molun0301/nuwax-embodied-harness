@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 from typing import Optional
 from urllib.parse import quote
 
@@ -64,5 +63,5 @@ def load_facility_providers(configuration: str) -> dict[str, HttpFacilityProvide
     """在配置读取处解析一次；连接只在首次动作或状态请求时建立。"""
     configs = json.loads(normalize_facility_provider_configuration(configuration))
     return {name: HttpFacilityProvider(name, config["base_url"],
-            authorization=os.environ[config["authorization_env"]] if config.get("authorization_env") else None)
+            authorization=config.get("authorization"))
             for name, config in configs.items()}

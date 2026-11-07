@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from core.config_values import runtime_value
+from core.config import value
 
 import asyncio
 import importlib
@@ -64,14 +64,14 @@ def _create_webrtc_connection(
     robot_ip = str(stream_config.robot_ip or "").strip()
     if not robot_ip:
         raise Go2VideoStreamerConfigError(
-            "未配置 Go2 WebRTC 机器人地址。请在 drivers/go2/data_plane.env "
-            "设置 GO2_ROBOT_IP，或设置通用 ROBOT_IP。"
+            "未配置 Go2 WebRTC 机器人地址。请在 设备管理的 Go2 设置 "
+            "设置 go2.robot_ip，或设置通用 go2.robot_ip。"
         )
 
     aes_128_key = str(stream_config.aes_128_key or "").strip()
     if aes_128_key and _AES_128_KEY_PATTERN.fullmatch(aes_128_key) is None:
         raise Go2VideoStreamerConfigError(
-            "GO2_WEBRTC_AES_128_KEY 必须留空或填写 32 位十六进制 AES-128 key。"
+            "go2.webrtc_aes_128_key 必须留空或填写 32 位十六进制 AES-128 key。"
         )
 
     connection_factory, local_sta, fatal_auth_errors = _load_webrtc_api()
@@ -232,7 +232,7 @@ async def _cancel_and_wait_consumer(
 
 async def _stream_once(config: Go2DataPlaneConfig) -> None:
     stream_config = config.video_stream
-    shm_path = runtime_value("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
+    shm_path = "/tmp/nuwax_video.shm"
     shm_writer = VideoShmWriter(shm_path)
     connection = None
     video_channel = None
@@ -380,7 +380,7 @@ async def run_forever(config: Go2DataPlaneConfig) -> None:
 def main() -> None:
     from core.settings import configure_component_logging
     configure_component_logging("nuwax-video")
-    LOGGER.setLevel(runtime_value("GO2_VIDEO_STREAM_LOG_LEVEL", "INFO"))
+    LOGGER.setLevel(value('logging.go2_video_level'))
     config = load_go2_data_plane_config()
     try:
         asyncio.run(run_forever(config))

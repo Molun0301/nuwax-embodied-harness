@@ -2386,6 +2386,7 @@
   }
 
   function renderConfig(data) {
+    renderProfileControls(data);
     const sections = $('configSections');
     const groups = $('configGroups');
     const fields = Array.isArray(data.fields) ? data.fields : [];
@@ -2490,11 +2491,32 @@
     return String(original) === String(value);
   }
 
+  function renderProfileControls(data) {
+    let bar = $('managerProfiles');
+    if (!bar) { bar = document.createElement('div'); bar.id = 'managerProfiles'; $('configSections').before(bar); }
+    bar.replaceChildren();
+    const context = data.profile_context; if (!context) return;
+    const select = document.createElement('select');
+    for (const name of context.profiles) { const option = document.createElement('option'); option.value = name; option.textContent = name; select.appendChild(option); }
+    select.value = context.profile;
+    select.addEventListener('change', async () => { state.config = await apiCall('/api/manager/config?profile=' + encodeURIComponent(select.value)); renderConfig(state.config); });
+    bar.appendChild(select);
+    const input = document.createElement('input'); input.placeholder = '新方案名称'; bar.appendChild(input);
+    for (const [title, path, method, operation] of [['新建', 'profiles', 'POST', 'new'], ['复制', 'profiles', 'POST', 'copy'], ['切换', 'activate', 'POST', 'activate'], ['删除', 'profiles', 'DELETE', 'delete']]) {
+      const button = document.createElement('button'); button.textContent = title;
+      button.addEventListener('click', async () => {
+        const body = operation === 'activate' || operation === 'delete' ? {name: select.value} : {name: input.value, ...(operation === 'copy' ? {source: select.value} : {})};
+        try { await apiCall('/api/manager/config/' + path, {method, body}); await loadConfigView(); }
+        catch (error) { showMessage($('configMessage'), error.message, 'error'); }
+      }); bar.appendChild(button);
+    }
+  }
+
   function renderConfigField(field) {
     const type = (field.type || 'str').toLowerCase();
     const key = field.key;
     const rawValue = field.value == null ? '' : field.value;
-    const isMasked = Boolean(field.sensitive) && rawValue !== '' && /^\*+$/.test(String(rawValue));
+    const isMasked = Boolean(field.sensitive) && (field.is_set || (rawValue !== '' && /^\*+$/.test(String(rawValue))));
     const value = rawValue;
     const chips = [];
     if (field.pending_restart) chips.push('<span class="config-chip restart">重启后生效</span>');
@@ -2503,7 +2525,7 @@
     if (field.sensitive) chips.push('<span class="config-chip secret">敏感</span>');
     if (field.source_label) chips.push('<span class="config-chip">' + escapeHtml(field.source_label) + '</span>');
 
-    const common = 'data-config-key="' + escapeHtml(key) + '" id="cfg-input-' + escapeHtml(key) + '"';
+    const common = 'data-config-key="' + escapeHtml(key) + '" id="cfg-input-' + escapeHtml(key) + '"' + (field.readonly ? ' disabled readonly' : '');
     let control;
 
     if (type === 'bool') {
@@ -2519,7 +2541,7 @@
           escapeHtml(optLabel) + (disabledReason ? '（不可用）' : '') + '</option>';
       }).join('') + '</select>';
     } else if (type === 'csv' || (field.options_schema && typeof field.options_schema === 'object') ||
-               field.key === 'NUWAX_GEOMETRY_PGO_OPTIONS' || field.key === 'NUWAX_GEOMETRY_POINTLIO_OPTIONS') {
+               field.key === 'geometry.pgo_options' || field.key === 'geometry.pointlio_options') {
       control = '<textarea ' + common + '>' + escapeHtml(value) + '</textarea>';
     } else if (type === 'int') {
       control = '<input class="field" type="number" step="1" ' + common + ' value="' + escapeHtml(value) + '">';
@@ -2565,7 +2587,8 @@
           return;
         }
       }
-      values[key] = value;
+      values[key] = field.type === 'bool' ? value === 'true' : field.type === 'csv' ? value.split(',').map(item => item.trim()).filter(Boolean)
+        : ['int', 'float'].includes(field.type) && value !== '' && value !== 'auto' ? Number(value) : value;
     });
 
     if (!Object.keys(values).length) {
@@ -2574,7 +2597,7 @@
     }
 
     const body = { values: values };
-    if (state.configRevision != null) body.revision = state.configRevision;
+    if (state.config?.profile_context) body.profile = state.config.profile_context.profile;
 
     $('configSave').disabled = true;
 

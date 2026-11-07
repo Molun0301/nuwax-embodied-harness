@@ -160,7 +160,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             elif current:
                 print("当前已安装：")
                 _show_modules(current["modules"])
-                print("\n初始配置：{}/settings.env".format(current["prefix"]))
+                print("\n合成配置：{}/run/config.toml".format(home))
                 active_config = root / "runtime_data/settings/active.env"
                 if active_config.is_file():
                     print("当前机器人方案：" + str(active_config.resolve()))
@@ -184,7 +184,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         hardware = detect_hardware(home)
         existing = existing_config(root, current)
         if args.robot != "auto":
-            existing["NUWAX_ACTIVE_ROBOT"] = args.robot
+            existing["robot.driver"] = args.robot
         recommendation = recommend_modules(hardware, existing, current.get("modules"))
         selected = resolve_modules(_names([args.modules])) if args.modules is not None else recommendation.modules
         if args.preset:
@@ -258,20 +258,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         finally:
             signal.signal(signal.SIGTERM, previous_handler)
         print("\n安装完成：" + "、".join(MODULES[key].title for key in result["modules"]))
-        settings_path = Path(result["prefix"]) / "settings.env"
-        active_config = root / "runtime_data/settings/active.env"
-        print("初始配置：" + str(settings_path))
-        if active_config.is_file():
-            print("当前机器人方案：" + str(active_config.resolve()))
+        settings_path = home / "run/config.toml"
+        print("合成配置：" + str(settings_path))
         start = ["./install.sh", "start"] + (["--install-dir", str(home)] if args.install_dir else [])
         print("启动：" + shlex.join(start))
         print("首次使用：docs/公开文档/快速上手.md；机器人接入：docs/公开文档/架构与机器人接入.md")
-        settings = read_settings(active_config if active_config.is_file() else settings_path)
-        host = settings.get("NUWAX_GATEWAY_HOST", "127.0.0.1") or "127.0.0.1"
+        settings = read_settings(settings_path)
+        host = settings["gateway.host"]
         host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
         host = f"[{host}]" if ":" in host and not host.startswith("[") else host
-        port = settings.get("NUWAX_GATEWAY_PORT", "8766") or "8766"
-        print(f"启动后打开控制台：http://{host}:{port}/console（显式进程环境可覆盖配置）。")
+        port = settings["gateway.port"]
+        print(f"启动后打开控制台：http://{host}:{port}/console。")
         print("以后运行 ./install.sh 可继续增删模块。")
         return 0
     except KeyboardInterrupt:

@@ -9,7 +9,7 @@ from typing import Dict, Optional, Tuple, Any, Callable, TYPE_CHECKING
 
 from adapters.base import AdapterBase, AdapterConfig
 from contracts.motion_limits import MotionCommandLimits
-from core.config_values import runtime_value
+from core.config import value
 from drivers.common import ManagedRobotDeviceDataPlane, RobotAssemblyBase, RobotAssemblyStatus
 from drivers.go2.capabilities import GO2_CAPABILITY_DESCRIPTORS_BY_NAME
 from drivers.go2.data_plane import Go2DataPlaneRuntime, Go2DeviceDataPlane
@@ -69,8 +69,8 @@ class Go2RobotAssembly(RobotAssemblyBase):
 
     def get_motion_command_limits(self) -> Optional[MotionCommandLimits]:
         """公开守卫执行器使用的速度配置；导航巡航上限不代替设备策略。"""
-        linear = float(runtime_value("GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS", "1.0"))
-        yaw = float(runtime_value("GO2_OFFICIAL_MAX_YAW_RATE_RPS", "0.8"))
+        linear = float(value('go2.official_max_linear_velocity_mps'))
+        yaw = float(value('go2.official_max_yaw_rate_rps'))
         if linear <= 0.0 or yaw <= 0.0:
             raise ValueError("Go2 运动守卫速度限制必须大于0。")
         return MotionCommandLimits(

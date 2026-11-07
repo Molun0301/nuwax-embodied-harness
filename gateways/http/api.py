@@ -23,26 +23,6 @@ if TYPE_CHECKING:
     from gateways.platform import Platform
 from gateways.serialization import to_jsonable, to_map_json_bytes
 from gateways.ws.client_queue import ClientQueue
-from core import config_io
-
-
-def _settings_lifespan(original_lifespan, settings_application):
-    """合成原路由生命周期；清理设置快照不掩盖更早的启停异常。"""
-    @asynccontextmanager
-    async def lifespan(app):
-        settings_application.start()
-        try:
-            async with original_lifespan(app) as state:
-                yield state
-        except BaseException:
-            try:
-                settings_application.close()
-            except BaseException:
-                pass
-            raise
-        else:
-            settings_application.close()
-    return lifespan
 
 
 def build_http_router(runtime: Platform, access_manager: GatewayAccessManager) -> APIRouter:
@@ -50,19 +30,7 @@ def build_http_router(runtime: Platform, access_manager: GatewayAccessManager) -
 
     router = APIRouter()
     from gateways.settings import SettingsApplication
-    from core.config_profiles import ConfigurationConflict
     settings_application = SettingsApplication(runtime)
-    router.lifespan_context = _settings_lifespan(router.lifespan_context, settings_application)
-
-    async def call_settings(function, *args, **kwargs):
-        try:
-            return await run_in_threadpool(function, *args, **kwargs)
-        except ConfigurationConflict as error:
-            raise GatewayError(str(error), error_code="configuration_conflict", http_status=409) from error
-        except (ValueError, TypeError) as error:
-            raise GatewayError(str(error), error_code="invalid_configuration", http_status=400) from error
-        except OSError as error:
-            raise GatewayError("配置文件读写失败：" + str(error), error_code="configuration_io_failed", http_status=500) from error
 
     def _build_layout_snapshot() -> Dict[str, Any]:
         return {
@@ -308,12 +276,6 @@ def build_http_router(runtime: Platform, access_manager: GatewayAccessManager) -
     async def api_security_policy(request: Request) -> Dict[str, Any]:
         return access_manager.export_policy()
 
-    @router.get("/api/config/schema")
-    async def api_config_schema(request: Request, robot: Optional[str] = None, profile: Optional[str] = None) -> Dict[str, Any]:
-        """返回全量配置 schema（按板块分组，敏感项脱敏）。"""
-
-        return await call_settings(settings_application.schema, robot, profile)
-
     @router.get("/api/pointcloud/dense")
     async def api_dense_pointcloud(
         request: Request,
@@ -331,63 +293,22 @@ def build_http_router(runtime: Platform, access_manager: GatewayAccessManager) -
             "X-Nuwax-Pointcloud": json.dumps(metadata, ensure_ascii=True, separators=(",", ":")),
         })
 
-    @router.post("/api/config/save")
-    async def api_config_save(request: Request) -> Dict[str, Any]:
-        """原子保存并应用支持热加载的项；重启由独立操作显式选择。"""
+    @router.post("/api/config/reload")
+    async def api_config_reload(request: Request) -> Dict[str, Any]:
+        import ipaddress
+        if request.client is None or not ipaddress.ip_address(request.client.host).is_loopback:
+            raise GatewayError("配置重读仅接受本机回环请求", error_code="local_only", http_status=403)
+        return await run_in_threadpool(settings_application.reload)
 
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise as_gateway_error(ValueError("请求体必须为对象 {key: value}"))
-        updates = payload.get("updates", payload)
-        if not isinstance(updates, dict):
-            raise as_gateway_error(ValueError("updates 必须为对象 {key: value}"))
-        clean = {str(k): str(v) for k, v in updates.items() if isinstance(v, (str, int, float, bool))}
-        result = await call_settings(settings_application.save, clean, robot=payload.get("robot"),
-                                     profile=payload.get("profile"), expected_revision=payload.get("revision"))
-        result["rejected"].update({str(k): "配置值必须是单个字符串、数字或布尔值" for k in updates if str(k) not in clean})
-        return result
-
-    @router.post("/api/config/profiles")
-    async def api_config_create_profile(request: Request) -> Dict[str, Any]:
-        from core.config_profiles import create_profile
-        payload = await request.json()
-        if not isinstance(payload, dict) or not all(isinstance(payload.get(key), str) for key in ("robot", "profile", "name")):
-            raise GatewayError("请指定机器人、来源方案和新方案名称", error_code="invalid_configuration", http_status=400)
-        return await call_settings(create_profile, root=config_io._CORE_ENV.parent, robot=payload["robot"],
-                                   source=payload["profile"], name=payload["name"], expected_revision=payload.get("revision"),
-                                   revision_owner=settings_application.revision_owner)
-
-    @router.post("/api/config/activate")
-    async def api_config_activate_profile(request: Request) -> Dict[str, Any]:
-        payload = await request.json()
-        if not isinstance(payload, dict) or not all(isinstance(payload.get(key), str) for key in ("robot", "profile")):
-            raise GatewayError("请指定要应用的机器人与配置方案", error_code="invalid_configuration", http_status=400)
-        return await call_settings(settings_application.activate, robot=payload["robot"], profile=payload["profile"],
-                                   expected_revision=payload.get("revision"))
-
-    @router.post("/api/config/restart")
-    async def api_config_restart(request: Request, background: BackgroundTasks) -> Dict[str, Any]:
-        from core.config_values import configuration_location
-        from core.config_profiles import check_revision
-        from gateways.settings_restart import queue_restart, dispatch_restart
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise GatewayError("重启请求必须为对象", error_code="invalid_configuration", http_status=400)
-        root = config_io._CORE_ENV.parent
-        location = await call_settings(configuration_location, root=root, robot=payload.get("robot"), profile=payload.get("profile"))
-        if location:
-            if not await run_in_threadpool(settings_application._is_active, location):
-                raise GatewayError("请先应用所选配置方案", error_code="configuration_not_active", http_status=409)
-            await call_settings(check_revision, location, payload.get("revision"), root=root,
-                                revision_owner=settings_application.revision_owner)
-        result = await call_settings(queue_restart, root)
-        background.add_task(dispatch_restart, root, result)
-        return result
-
-    @router.get("/api/config/status")
-    async def api_config_status() -> Dict[str, Any]:
-        return await call_settings(settings_application.status)
-
+    @router.api_route("/api/manager/{path:path}", methods=["GET", "PUT", "POST", "DELETE"])
+    async def api_manager_config(request: Request, path: str) -> Response:
+        from gateways.settings import manager_request
+        if path not in {"session", "config", "config/profiles", "config/activate", "config/restart"}:
+            raise GatewayError("设置接口不存在", error_code="not_found", http_status=404)
+        payload = await request.json() if request.method != "GET" else None
+        target = path + ("?" + request.url.query if request.url.query else "")
+        status, body, headers = await run_in_threadpool(manager_request, request.method, target, payload, dict(request.headers))
+        return Response(body, status_code=status, headers=headers, media_type="application/json")
 
     @router.get("/api/deployment/layout")
     async def api_deployment_layout(request: Request) -> Dict[str, Any]:

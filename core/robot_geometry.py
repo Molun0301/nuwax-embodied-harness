@@ -9,11 +9,10 @@ import struct
 from typing import Dict, Mapping, Optional, Tuple
 import xml.etree.ElementTree as ET
 
-_GEOMETRY_PREFIX = "NUWAX_ROBOT_"
-_DIMENSION_KEYS = tuple(_GEOMETRY_PREFIX + axis + "_M" for axis in ("LENGTH", "WIDTH", "HEIGHT"))
-_CENTER_KEYS = tuple(_GEOMETRY_PREFIX + "CENTER_" + axis + "_M" for axis in "XYZ")
+_DIMENSION_KEYS = tuple(axis.lower() + "_m" for axis in ("LENGTH", "WIDTH", "HEIGHT"))
+_CENTER_KEYS = tuple("center_" + axis.lower() + "_m" for axis in "XYZ")
 ROBOT_GEOMETRY_SETTING_KEYS = frozenset(_DIMENSION_KEYS + _CENTER_KEYS + (
-    "NUWAX_ROBOT_MODEL_PATH", "NUWAX_ROBOT_MODEL_BASE_LINK", "NUWAX_ROBOT_MODEL_JOINT_POSITIONS_JSON",
+    "model_path", "model_base_link", "model_joint_positions_json",
 ))
 _IDENTITY = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
 _ZERO = (0.0, 0.0, 0.0)
@@ -75,7 +74,7 @@ def normalize_robot_geometry_setting(key: str, value: str) -> str:
     if key in _DIMENSION_KEYS + _CENTER_KEYS:
         number = _optional_number(text, key, positive=key in _DIMENSION_KEYS)
         return "" if number is None else str(number)
-    if key == "NUWAX_ROBOT_MODEL_JOINT_POSITIONS_JSON":
+    if key == "model_joint_positions_json":
         return json.dumps(_joint_positions(text), ensure_ascii=False, sort_keys=True, separators=(",", ":")) if text else ""
     return text
 
@@ -96,18 +95,18 @@ class RobotGeometryConfig:
 
     @classmethod
     def from_values(cls, values: Mapping[str, object]) -> "RobotGeometryConfig":
-        model_path = str(values.get("NUWAX_ROBOT_MODEL_PATH") or "").strip()
-        width = _optional_number(values.get("NUWAX_ROBOT_WIDTH_M"), "机器人宽度", positive=True)
+        model_path = str(values.get("model_path") or "").strip()
+        width = _optional_number(values.get("width_m"), "机器人宽度", positive=True)
         return cls(
             model_path=model_path,
-            model_base_link=str(values.get("NUWAX_ROBOT_MODEL_BASE_LINK") or "").strip(),
-            model_joint_positions_json=str(values.get("NUWAX_ROBOT_MODEL_JOINT_POSITIONS_JSON") or "").strip(),
-            length_m=_optional_number(values.get("NUWAX_ROBOT_LENGTH_M"), "机器人长度", positive=True),
+            model_base_link=str(values.get("model_base_link") or "").strip(),
+            model_joint_positions_json=str(values.get("model_joint_positions_json") or "").strip(),
+            length_m=_optional_number(values.get("length_m"), "机器人长度", positive=True),
             width_m=width,
-            height_m=_optional_number(values.get("NUWAX_ROBOT_HEIGHT_M"), "机器人高度", positive=True),
-            center_x_m=_optional_number(values.get("NUWAX_ROBOT_CENTER_X_M"), "外包中心X"),
-            center_y_m=_optional_number(values.get("NUWAX_ROBOT_CENTER_Y_M"), "外包中心Y"),
-            center_z_m=_optional_number(values.get("NUWAX_ROBOT_CENTER_Z_M"), "外包中心Z"),
+            height_m=_optional_number(values.get("height_m"), "机器人高度", positive=True),
+            center_x_m=_optional_number(values.get("center_x_m"), "外包中心X"),
+            center_y_m=_optional_number(values.get("center_y_m"), "外包中心Y"),
+            center_z_m=_optional_number(values.get("center_z_m"), "外包中心Z"),
         )
 
 

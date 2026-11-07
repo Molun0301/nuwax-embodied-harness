@@ -198,7 +198,7 @@ def execute(payload):
     if operation == "models":
         # 默认模型指向持久数据根；不在可变Git工作区中写模型或运行配置。
         model_request = InstallRequest(root=candidate / "source", home=home, modules=modules, robot=request.robot, jobs=request.jobs)
-        _prepare_models(model_request, candidate, _runner(candidate / "source", home, candidate))
+        _prepare_models(model_request, candidate, _runner(candidate / "source", home, candidate), payload["configuration"])
         return {"models_prepared": True}
     if operation == "verify":
         _verify_prefix(candidate, modules)

@@ -62,23 +62,19 @@ def select_recording(cloud: Path | None, poses: Path | None, synthetic_only: boo
     return cloud, poses, recording["name"]
 
 
-def worker_environment() -> dict[str, str]:
-    """只解析模型，既不创建Go2驱动也不连接真实设备。"""
-    name = "navigation_simulator_geometry"
-    spec = importlib.util.spec_from_file_location(name, ROOT / "core/robot_geometry.py")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    geometry = module.resolve_robot_geometry(module.RobotGeometryConfig(), robot_name="go2", base_dir=ROOT)
-    return {
-        **os.environ,
-        "NUWAX_ROBOT_GEOMETRY_JSON": geometry.to_runtime_json(),
-        "NUWAX_NAV_CAPABILITIES_JSON": "",
-        "NUWAX_MAP_FRAME": "map",
-        "_NUWAX_NAV_ACTUATOR_MOTION_MODEL": "omnidirectional",
-        "_NUWAX_NAV_ACTUATOR_MAX_LINEAR_MPS": "1.0",
-        "_NUWAX_NAV_ACTUATOR_MAX_YAW_RPS": "0.8",
-    }
+def worker_environment(data: Path) -> dict[str, str]:
+    """仿真工作进程读取其输出目录内的独立合成配置。"""
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from core.config import ConfigStore
+    home = data / "配置"
+    store = ConfigStore(home)
+    store.write_profile("仿真", {"robot.driver":"go2", "robot.actuator_motion_model":"omnidirectional",
+                               "robot.actuator_max_linear_mps":1.0, "robot.actuator_max_yaw_rps":.8})
+    store.activate("仿真")
+    environment = {key:value for key,value in os.environ.items() if not key.startswith(("NUWAX_","GO2_","_NUWAX_"))}
+    environment["NUWAX_INSTALL_HOME"] = str(home.resolve())
+    return environment
 
 
 def binary_provenance(binary: Path, cloud: Path | None, poses: Path | None) -> dict:
@@ -117,7 +113,7 @@ class NativeWorker:
         try:
             self.process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=self.error_log, text=True, encoding="utf-8",
-                                        bufsize=1, env=worker_environment(), cwd=ROOT)
+                                        bufsize=1, env=worker_environment(data), cwd=ROOT)
             # 逐块读取到换行，部分输出也必须受启动期限约束。
             deadline = time.monotonic() + startup_timeout
             line = bytearray()

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from core.config_values import runtime_value
+from core.config import value
 
 from importlib import import_module
 
@@ -25,10 +25,10 @@ class MotionControlActuator:
 
     @classmethod
     def from_environment(cls) -> "MotionControlActuator":
-        reference = runtime_value("NUWAX_MOTION_CONTROL_FACTORY", "").strip()
+        reference = value('motion_guard.control_factory').strip()
         module_name, separator, factory_name = reference.partition(":")
         if not separator or not module_name or not factory_name:
-            raise ActuatorError("ACTUATOR_CONFIG_INVALID", "NUWAX_MOTION_CONTROL_FACTORY 必须为 模块:工厂。")
+            raise ActuatorError("ACTUATOR_CONFIG_INVALID", "motion_guard.control_factory 必须为 模块:工厂。")
         try:
             factory = getattr(import_module(module_name), factory_name)
             control = factory()
@@ -36,7 +36,7 @@ class MotionControlActuator:
             raise ActuatorError("ACTUATOR_INIT_FAILED", "标准运动执行器初始化失败：%s" % exc) from exc
         return cls(
             control,
-            frame_id=(runtime_value("NUWAX_BASE_FRAME", "").strip() or "base_link"),
+            frame_id=(value('robot.base_frame').strip() or "base_link"),
         )
 
     @property

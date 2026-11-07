@@ -198,7 +198,7 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
-    ready = working / "ready"
+    ready = working / "supervision/runtime_data/geometry/nuwax_geometry_runtime.ready"
     # 非单位安装外参和倾斜机体共同验证轴向、单位及重力初始化。
     sensor_pitch = 2.8782025850555556
     c, s = np.cos(sensor_pitch), np.sin(sensor_pitch)
@@ -212,38 +212,43 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
     c, s = np.cos(body_pitch), np.sin(body_pitch)
     world_from_body = np.asarray([[c, 0, s], [0, 1, 0], [-s, 0, c]])
     acceleration_sensor = tuple(body_from_sensor_rotation.T @ world_from_body.T @ np.asarray([0, 0, 9.81]))
-    os.environ.update({
-        "NUWAX_GEOMETRY_RUNTIME_BINARY": str(runtime_binary),
-        "NUWAX_GEOMETRY_RUNTIME_READY_FILE": str(ready),
-        "NUWAX_GEOMETRY_RUNTIME_PORT": str(port),
-        "NUWAX_GEOMETRY_LIO_BACKEND": backend,
-        "NUWAX_GEOMETRY_LIO_BODY_FROM_SENSOR": json.dumps(body_from_sensor),
-        "NUWAX_GEOMETRY_LIO_BODY_FROM_IMU": json.dumps(body_from_imu),
-        "NUWAX_GEOMETRY_LIDAR_FRAME": "synthetic_lidar",
-        "NUWAX_GEOMETRY_IMU_FRAME": "synthetic_lidar",
-        "NUWAX_BASE_FRAME": "synthetic_body",
-        "NUWAX_MAP_FRAME": "map",
-        "NUWAX_MAP_FRAME": "map",
-        "NUWAX_GEOMETRY_ODOM_FRAME": "odom",
-        "NUWAX_GEOMETRY_MAPPING_BACKEND": "voxel",
-        "NUWAX_GEOMETRY_CORRECTION_BACKEND": correction_backend,
-        "NUWAX_LOG_DIR": str(evidence.resolve() / (backend + "组件日志")),
-        "NUWAX_LOG_FILE": str(evidence.resolve() / (backend + "组件日志") / "nuwax_robot_bridge.log"),
-        "NUWAX_LOG_LEVEL": "INFO",
-        "RUST_LOG": "info",
-        "NUWAX_LCM_BACKEND": "real-lcm",
-        "NUWAX_REAL_LCM_REQUIRED": "true",
-        "NUWAX_LCM_URL": "udpm://239.255.76.67:%d?ttl=0" % (20000 + port % 20000),
-        "NUWAX_INSTALL_HOME": str(working / "supervision"),
-        "NUWAX_MAP_CATALOG_ROOT":str(working/"maps"),
-        "NUWAX_CLOUDMAP_SHM_PATH": str(working / "cloud.shm"),
-        "NUWAX_OCCUPANCY_SHM_PATH": str(working / "occupancy.shm"),
-        "NUWAX_VIDEO_SHM_PATH": str(working / "video.shm"),
-    })
+    settings = {
+        'geometry.runtime_port': port,
+        'geometry.lio_backend': backend,
+        'geometry.lio_body_from_sensor': json.dumps(body_from_sensor),
+        'geometry.lio_body_from_imu': json.dumps(body_from_imu),
+        'robot.lidar_frame': "synthetic_lidar",
+        'robot.base_frame': "synthetic_body",
+        'robot.map_frame': "map",
+        'robot.odom_frame': "odom",
+        'geometry.mapping_backend': "voxel",
+        'geometry.correction_backend': correction_backend,
+        'logging.dir': str(evidence.resolve() / (backend + "组件日志")),
+        'logging.file': str(evidence.resolve() / (backend + "组件日志") / "nuwax_robot_bridge.log"),
+        'logging.level': "INFO",
+        'RUST_LOG': "info",
+        'transport.real_lcm_required': True,
+        'transport.lcm_url': "udpm://239.255.76.67:%d?ttl=0" % (20000 + port % 20000),
+        'NUWAX_INSTALL_HOME': str(working / "supervision"),
+        'geometry.map_catalog_root': str(working/"maps")
+    }
     resolved_executable = executable or root / (
         "services/nuwax-workspace/crates/nuwax-lio-backends/native/%s/cpp/result/bin/%s_native" % (backend, backend)
     )
-    os.environ["NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE"] = str(resolved_executable.resolve())
+    from core.config import ConfigStore, config_snapshot, specifications
+    home = working / "supervision"
+    prefix = working / "release"
+    binary_dir = prefix / "bin"
+    binary_dir.mkdir(parents=True)
+    shutil.copy2(runtime_binary, binary_dir / "nuwax-geometry-runtime")
+    (binary_dir / (backend + "_native")).symlink_to(resolved_executable.resolve())
+    home.mkdir()
+    (home / "current").symlink_to(prefix, target_is_directory=True)
+    store = ConfigStore(home)
+    store.write_profile('原生诊断', {key: value for key, value in settings.items() if key in specifications()})
+    configuration_values = store.activate('原生诊断')
+    os.environ.update({key: value for key, value in settings.items() if key not in specifications()})
+    os.environ['LD_LIBRARY_PATH'] = str(Path(runtime_binary).parent) + ':' + str(Path(runtime_binary).parent / 'lib') + ':' + os.environ.get('LD_LIBRARY_PATH', '')
     log = (evidence / (backend + "真实原生进程.log")).open("w")
     process = sensors = bridge = remote = channel = gateway = None
     try:
@@ -259,7 +264,8 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
         assert remote.get_state(timeout_sec=2).pose is None
         map_name = "真实算法合成输入"
         if gateway_mode:
-            gateway = GatewayMappingSession(working, runtime_binary, port, ready)
+            with config_snapshot(configuration_values):
+                gateway = GatewayMappingSession(working, runtime_binary, port, ready)
             gateway.start()
             sensors = gateway.robot.providers
             start = gateway.call("start_mapping", {"map_name": map_name})

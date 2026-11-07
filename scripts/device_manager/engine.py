@@ -14,10 +14,9 @@ from pathlib import Path
 
 from scripts.module_installer.catalog import MODULES, ModuleError, module_system_packages, resolve_modules
 from scripts.module_installer.hardware import detect_hardware, recommend_modules
-from scripts.module_installer.runtime import read_settings, write_profile, _VALUES
+from scripts.module_installer.runtime import read_settings, write_profile, _CONFIG
 
 from . import MANAGER_DEVELOPMENT, MANAGER_REVISION, MANAGER_VERSION, PACKAGE_ROOT
-from .config_client import ConfigurationClient
 from .common import (ManagerError, atomic_json, atomic_write, file_lock,
                      fsync_directory, identifier, process_alive, process_identity, read_json, timestamp)
 from .runtime import Runtime, append_job_output, clean_environment, probe, run_command, system_helper
@@ -52,7 +51,6 @@ class Engine:
         except FileExistsError:
             pass
         self.instance_id = identity.read_text().strip()
-        self.configuration = ConfigurationClient(self.home, self.instance_id)
         # 公开源迁移只删除本管理根的旧凭据，不读取或转移其内容。
         (self.manager_home / "config/credentials.json").unlink(missing_ok=True)
 
@@ -192,7 +190,12 @@ class Engine:
     def _existing(self, current):
         if not current:
             return {}
-        return _VALUES.configuration_values(root=Path(current["prefix"]) / "source", environment={"NUWAX_MANAGED_HOME": str(self.home), "NUWAX_ROBOT_PROFILE_MODE": "1"})
+        if any((self.home / "config/profiles").glob("*/*.env")):
+            from scripts.import_legacy_config import import_legacy
+            result = import_legacy(self.home, PACKAGE_ROOT, manager_home=self.manager_home,
+                                   asset_root=Path(current["prefix"]) / "source")
+            self._legacy_import = result
+        return self._config_store().profile_values(self._config_store().active())
 
     def hardware(self):
         hardware = detect_hardware(self.home)
@@ -396,10 +399,9 @@ class Engine:
     def _fingerprint(self):
         current = self.current()
         values = {"install_dir": str(self.home), "current": current.get("prefix"), "running": self.runtime.status()["running"], "settings": self.settings()}
-        active = self.home / "data/settings/active.env"
-        if current and active.is_file():
-            values["config"] = self.configuration.request(Path(current["prefix"]), "revision")
-        # 绑定共同拥有方的当前快照令牌及明确状态，不散列整个配置文件。
+        if current and (self.home / "config/active_profile").exists():
+            store = self._config_store()
+            values["config"] = {"profile": store.active(), "values": store.profile_values(store.active())}
         return values
 
     def plan(self, request, *, local_request=False):
@@ -421,11 +423,11 @@ class Engine:
             configuration = request.get("configuration", {})
             if not isinstance(configuration, dict):
                 raise ManagerError("invalid_config", "预配置必须是对象。")
-            if not configuration.get("NUWAX_GATEWAY_PUBLIC_BASE_URL"):
+            if not configuration.get("gateway.public_base_url"):
                 server = read_json(self.manager_home / "config/server.json", {})
                 if process_alive(server.get("process")) and server.get("public_url"):
-                    request = dict(request, configuration=dict(configuration, NUWAX_GATEWAY_PUBLIC_BASE_URL=server["public_url"]))
-                warnings.append("命令行首次安装请确认公开制品地址；可通过configuration.NUWAX_GATEWAY_PUBLIC_BASE_URL指定远端可达的管理台地址。")
+                    request = dict(request, configuration=dict(configuration, **{"gateway.public_base_url": server["public_url"]}))
+                warnings.append("命令行首次安装请确认公开制品地址；可通过configuration.gateway.public_base_url指定远端可达的管理台地址。")
         if action == "install" and current:
             blockers.append("已有安装，请使用更新或模块调整。")
         if action in ("update", "modules", "rollback", "start", "stop", "restart") and not current:
@@ -641,7 +643,6 @@ class Engine:
         atomic_json(self._job_path(job["id"]), job)
 
     def _switch(self, prefix):
-        self.configuration.close()
         link = self.home / "current"
         temporary = self.home / (".current-" + uuid.uuid4().hex)
         try:
@@ -720,22 +721,14 @@ class Engine:
                 atomic_write(path, base64.b64decode(item["value"]))
 
     def _profile_name(self, robot):
-        selector = self.home / "config/profiles" / robot / ".active"
-        active = self.home / "data/settings/active.env"
-        if active.is_symlink():
-            target = active.resolve()
-            if target.parent == self.home / "config/profiles" / robot and target.suffix == ".env":
-                return target.stem
-        name = selector.read_text().strip() if selector.is_file() else "default"
-        if not re.fullmatch(r"[\w\-\u4e00-\u9fff][\w\- \u4e00-\u9fff]{0,63}", name) or name in (".", ".."):
-            raise ManagerError("invalid_profile", "当前配置方案名称不合法。")
-        return name
+        selector = self.home / "config/active_profile"
+        return selector.read_text().strip() if selector.exists() else "default"
 
     def _snapshot_profiles(self, robot):
         result = []
         name = self._profile_name(robot)
-        paths = [self.home / "data/settings/active.env", self.home / "config/profiles" / robot / ".active",
-                 self.home / "config/profiles" / robot / (name + ".env")]
+        paths = [self.home / "config/active_profile", self.home / "config/profiles" / (name + ".toml"),
+                 self.home / "run/config.toml"]
         for path in paths:
             if path.is_symlink():
                 kind, value = "link", os.readlink(str(path))
@@ -746,9 +739,8 @@ class Engine:
             result.append({"path": str(path.relative_to(self.home)), "kind": kind, "value": value})
         return result
 
-    def _activate_profile(self, candidate, robot):
-        write_profile(candidate, self.home / "config/profiles" / robot,
-                      self._profile_name(robot), self.home / "data/settings")
+    def _activate_profile(self, candidate, robot, values):
+        write_profile(self.home, self._profile_name(robot), values, candidate / "source")
 
     def _execute(self, job):
         plan, action = job["_plan"], job["action"]
@@ -786,7 +778,7 @@ class Engine:
             return {"version": current.get("version"), "runtime": self.runtime.status()}
         if action == "rollback":
             candidate = self.home / "releases" / plan["_previous"]
-            self._configure_candidate(candidate, plan, self._existing(current))
+            plan["_configuration"] = self._configure_candidate(candidate, plan, self._existing(current))
         else:
             candidate = self._prepare_source(job)
         self._cancelled(job["id"])
@@ -806,7 +798,7 @@ class Engine:
         self._cancelled(job["id"])
         self._journal(job, switch_intent=True)
         self._progress(job, "switching", 82, "正在切换完整版本和持久配置")
-        self._activate_profile(candidate, plan["robot"])
+        self._activate_profile(candidate, plan["robot"], plan["_configuration"])
         self._switch(candidate)
         self._cancelled(job["id"])
         should_start = was_running or self.settings()["auto_start"]
@@ -848,15 +840,10 @@ class Engine:
             built = bridge(self, source, candidate, "build", job)
             mutable_source = candidate / "source"
             (mutable_source / "runtime_data").symlink_to(self.home / "data", target_is_directory=True)
-            for driver in (mutable_source / "drivers").iterdir():
-                if driver.is_dir():
-                    target = self.home / "config/profiles" / driver.name
-                    target.mkdir(parents=True, exist_ok=True)
-                    (driver / "configs").symlink_to(target, target_is_directory=True)
             existing = self._existing(self.current())
-            self._configure_candidate(candidate, plan, existing, allow_pending_models=True)
+            plan["_configuration"] = self._configure_candidate(candidate, plan, existing, allow_pending_models=True)
             self._progress(job, "models", 65, "准备所选模型并复用已有模型文件")
-            bridge(self, source, candidate, "models", job)
+            bridge(self, source, candidate, "models", job, configuration=plan["_configuration"])
             self._progress(job, "source_verify", 70, "验证候选依赖、程序和启动入口")
             bridge(self, source, candidate, "verify", job)
             record = {"complete": True, "version": selected["version"], "revision": selected["revision"],
@@ -875,29 +862,25 @@ class Engine:
             raise ManagerError("invalid_config", "预配置必须是键值对象。")
         if configuration:
             existing.update(probe(candidate, "validate", values=configuration))
-        defaults = read_settings(candidate / "source/.env.example")
-        persistent = {"NUWAX_GATEWAY_ARTIFACT_DIR", "NUWAX_MAP_CATALOG_ROOT", "NUWAX_MAPPING_DATABASE_ROOT", "NUWAX_MAPPING_PCD_ROOT", "NUWAX_RUNTIME_DATA_DIR", "NUWAX_LOG_DIR", "NUWAX_LOG_FILE", "NUWAX_NUWAX_WORKSPACE_DIR", "NUWAX_FORBIDDEN_ZONES_PATH"}
-        for key in persistent:
-            value = existing.get(key, defaults.get(key, "")).strip()
-            if not value:
-                continue
-            path = Path(value)
-            if not path.is_absolute():
-                relative = Path(*path.parts[1:]) if path.parts and path.parts[0] == "runtime_data" else path
-                existing[key] = str(self.home / "data" / relative)
+        defaults = _CONFIG.flatten(_CONFIG.defaults(candidate / "source"))
+        for key in _CONFIG.PATH_KEYS:
+            value = existing.get(key, defaults[key])
+            if value:
+                path = Path(value)
+                if not path.is_absolute():
+                    relative = Path(*path.parts[1:]) if path.parts[0] in ("runtime_data", "data") else path
+                    existing[key] = str(self.home / "data" / relative)
         model_settings = []
         if "perception" in plan["modules"]:
-            model_settings.append(("NUWAX_PERCEPTION_YOLO_WORLD_MODEL", "yolov8s-worldv2.pt"))
+            model_settings.append(("perception.yolo_world_model", "yolov8s-worldv2.pt"))
         if "memory" in plan["modules"]:
-            model_settings.extend((("NUWAX_MEMORY_TEXT_EMBEDDING_MODEL", "BAAI__bge-small-zh-v1.5"), ("NUWAX_MEMORY_IMAGE_EMBEDDING_MODEL", "openai__clip-vit-base-patch32")))
+            model_settings.extend((("memory.text_embedding_model", "BAAI__bge-small-zh-v1.5"), ("memory.image_embedding_model", "openai__clip-vit-base-patch32")))
         from .downloads import apply_model_overrides, uses_default_model
         model_overrides = {}
         for key, name in model_settings:
             value = existing.get(key, "")
             if allow_pending_models and uses_default_model(value):
-                value = existing.get("_NUWAX_INSTALLER_SAVED_" + key, "")
-                if uses_default_model(value):
-                    value = str(self.home / "data/models" / name)
+                value = str(self.home / "data/models" / name)
             selected = Path(value) if value else None
             if not selected or uses_default_model(value):
                 raise ManagerError("model_missing", "所选模块缺少已下载或明确自定义的模型入口：" + key)
@@ -907,52 +890,78 @@ class Engine:
                 raise ManagerError("model_missing", "所选模块缺少本地模型，不会在启动时隐式下载：" + name)
             model_overrides[key] = str(selected.resolve())
         existing = apply_model_overrides(existing, model_overrides)
-        existing.update(NUWAX_GATEWAY_HOST="127.0.0.1", NUWAX_GATEWAY_PORT=str(self.runtime.port()))
-        probe(candidate, "runtime", install_prefix=str(candidate), modules=plan["modules"], robot=plan["robot"], values=existing)
-        normalized = probe(candidate, "normalize_profile", values=read_settings(candidate / "settings.env"))
-        rendered = "\n".join(_VALUES.env_assignment(key, str(value)) for key, value in sorted(normalized.items())) + "\n"
-        atomic_write(candidate / "settings.env", rendered.encode())
-        import shlex
-        launcher = candidate / "start.sh"
-        text = launcher.read_text()
-        text = text.replace("set -euo pipefail", "set -euo pipefail\nexport NUWAX_MANAGED_HOME=" + shlex.quote(str(self.home)))
-        text = text.replace('export PYTHONNOUSERSITE=1', 'export PYTHONNOUSERSITE=1\nexport LD_LIBRARY_PATH=' + shlex.quote(str(candidate / "lib") + ":" + str(candidate / "lib64")))
-        atomic_write(launcher, text.encode(), mode=0o755)
+        existing["gateway.host"] = "127.0.0.1"
+        existing.pop("gateway.port", None)
+        return probe(candidate, "runtime", install_prefix=str(candidate), modules=plan["modules"], robot=plan["robot"], values=existing)
 
-
-
-
-
-
-
-    def config(self):
+    def _config_store(self):
         current = self.current()
         if not current:
-            return {"available": False, "groups": [], "fields": [], "message": "安装完成后可在业务离线时编辑机器人配置；首次安装支持预配置文件。"}
-        schema = self.configuration.request(Path(current["prefix"]), "get")
-        fields, groups = [], []
-        for section in schema["sections"]:
-            groups.append({"key": section["section_id"], "title": section["section_title"]})
-            for field in section["fields"]:
-                fields.append(dict(field, label=field["zh_name"], secret=field["sensitive"], group=section["section_id"], restart_required=True))
-        return {"available": True, "groups": groups, "fields": fields, "revision": (schema.get("profile_context") or {}).get("revision"),
-                "message": "已保存配置供下次启动读取；在线热加载请使用原控制台设置。"}
+            raise ManagerError("not_installed", "请先安装业务版本。", 409)
+        return _CONFIG.ConfigStore(self.home, Path(current["prefix"]) / "source", self.runtime.port())
 
-    def save_config(self, values, revision=None):
+
+    def config(self, profile=None):
+        if not self.current():
+            return {"available": False, "groups": [], "fields": [], "message": "安装完成后可编辑机器人配置。"}
+        store = self._config_store()
+        result = store.settings_schema(profile)
+        context = result["profile_context"]
+        context.update(is_active=context["profile"] == store.active(), robot=store.effective(context["profile"])["robot"]["driver"])
+        result.update(available=True, groups=[{"key": section["section_id"], "title": section["section_title"]} for section in result["sections"]],
+                      fields=[dict(field, group=section["section_id"], secret=field["sensitive"], restart_required=field["apply"] == "restart")
+                              for section in result["sections"] for field in section["fields"]],
+                      application={"restart_available": True}, message="热加载项保存后即时生效，其余参数需要重启业务。")
+        return result
+
+    def save_config(self, values, profile=None):
         if not isinstance(values, dict):
-            raise ManagerError("invalid_config", "配置values必须是对象。")
-        if not isinstance(revision, str) or not revision:
-            raise ManagerError("config_revision_required", "保存配置需要编辑版本，请先读取当前配置。", 409)
-        protected = {"NUWAX_GATEWAY_HOST": "127.0.0.1", "NUWAX_GATEWAY_PORT": str(self.runtime.port())}
-        if any(key in values and str(values[key]) != expected for key, expected in protected.items()):
-            raise ManagerError("managed_setting", "管理模式固定业务网关回环地址与受管端口。")
+            raise ManagerError("invalid_config", "配置 values 必须是对象。")
+        if "gateway.port" in values:
+            raise ManagerError("managed_setting", "业务端口请通过设备管理设置修改。")
         with file_lock(self.lock_path):
             self._assert_idle()
-            current = self.current()
-            if not current:
-                raise ManagerError("not_installed", "请先安装业务版本。", 409)
-            result = self.configuration.request(Path(current["prefix"]), "save", values=values, revision=revision)
-            if result["rejected"]:
-                raise ManagerError("config_rejected", "部分配置没有通过原校验。", 400, result)
-            return {"saved": [key for keys in result["written"].values() for key in keys], "restart_required": bool(result["written"]),
-                    "message": "配置已保存，下次业务启动生效。", "skipped": result["skipped"]}
+            store = self._config_store()
+            specs = _CONFIG.specifications(store.code_root)
+            updates = {key: val for key, val in values.items()
+                       if not (specs.get(key, {}).get("sensitive") and isinstance(val, str) and val.strip() in ("", "********"))}
+            try:
+                updates = probe(Path(self.current()["prefix"]), "validate", values=updates)
+                result = store.save(updates, profile)
+            except (ValueError, TypeError) as error:
+                raise ManagerError("invalid_config", str(error)) from error
+            result.update(hot_applied=[], apply_errors={})
+            if result["is_active"] and result["hot_keys"] and self.runtime.has_owner():
+                import urllib.request
+                import urllib.error
+                import json
+                request = urllib.request.Request("http://127.0.0.1:" + str(self.runtime.port()) + "/api/config/reload", data=b"{}", method="POST", headers={"Content-Type": "application/json"})
+                try:
+                    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=30) as response:
+                        result.update(json.load(response))
+                except (OSError, ValueError) as error:
+                    result["apply_errors"] = dict.fromkeys(result["hot_keys"], str(error))
+            result["message"] = ("方案已保存，切换后生效。" if not result["is_active"] else
+                                 "已保存；需要重启的参数请重启业务。" if result["restart_required"] else "已保存热加载设置。")
+            return result
+
+    def manage_profile(self, operation, *, name=None, source=None):
+        with file_lock(self.lock_path):
+            self._assert_idle()
+            store = self._config_store()
+            try:
+                if operation == "create":
+                    return store.create(name, source)
+                if operation == "delete":
+                    return store.delete(name)
+                store.activate(name)
+            except (ValueError, TypeError) as error:
+                raise ManagerError("invalid_config", str(error)) from error
+            current = Path(self.current()["prefix"])
+            self.runtime.stop(current)
+            self.runtime.start(current)
+            return store.catalog()
+
+    def restart_business(self):
+        plan = self.plan({"action": "restart"}, local_request=True)
+        return self.submit(plan["id"])

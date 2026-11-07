@@ -8,7 +8,7 @@ Type=simple
 User=nuwax
 Group=nuwax
 WorkingDirectory=/home/ml/Deeprob/nuwax_robot_bridge
-EnvironmentFile=/etc/nuwax_robot_bridge/relay.env
+Environment=NUWAX_INSTALL_HOME=/opt/neh
 ExecStart=/usr/bin/python3 -m uvicorn gateways.app:create_relay_app_from_env --factory --host 0.0.0.0 --port 9766
 Restart=always
 RestartSec=3

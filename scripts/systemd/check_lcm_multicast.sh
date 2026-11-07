@@ -6,8 +6,8 @@ case "${1:-}" in
   --prepare) mode=prepare; shift ;;
   --validate-config) mode=validate; shift ;;
 esac
-(( $# <= 1 )) || { echo 'LCM preflight expects one URL' >&2; exit 1; }
-LCM_URL="${1:-${NUWAX_LCM_URL:-udpm://239.255.76.67:7667?ttl=0}}"
+(( $# == 1 )) || { echo 'LCM preflight expects one URL' >&2; exit 1; }
+LCM_URL="$1"
 # 此标记只用于当前组的本项目路由；准备时使用add，不能覆盖已有用户路由。
 route_protocol=242
 
@@ -17,7 +17,7 @@ report_error() {
 }
 fail() { report_error "$@" || true; exit 1; }
 
-[[ "${LCM_URL}" == udpm://* && "${LCM_URL}" != *[[:space:]]* ]] || fail "NUWAX_LCM_URL must use udpm:// without whitespace"
+[[ "${LCM_URL}" == udpm://* && "${LCM_URL}" != *[[:space:]]* ]] || fail "LCM URL must use udpm:// without whitespace"
 provider="${LCM_URL#udpm://}"
 authority="${provider%%[?]*}"
 if [[ "${authority}" == *:* ]]; then

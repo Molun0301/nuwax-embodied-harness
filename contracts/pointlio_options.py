@@ -5,7 +5,7 @@ import json
 import math
 from pathlib import Path
 
-POINTLIO_OPTIONS_ENV = "NUWAX_GEOMETRY_POINTLIO_OPTIONS"
+POINTLIO_OPTIONS_KEY = "geometry.pointlio_options"
 _SCHEMA = json.loads(Path(__file__).with_suffix(".json").read_text(encoding="utf-8"))
 
 

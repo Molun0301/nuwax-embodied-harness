@@ -357,8 +357,8 @@ class Handler(BaseHTTPRequestHandler):
                 configuration = body.get("configuration", {})
                 if not isinstance(configuration, dict):
                     raise ManagerError("invalid_config", "预配置必须是对象。")
-                if not configuration.get("NUWAX_GATEWAY_PUBLIC_BASE_URL"):
-                    configuration = dict(configuration, NUWAX_GATEWAY_PUBLIC_BASE_URL=self.headers["Origin"].rstrip("/"))
+                if not configuration.get("gateway.public_base_url"):
+                    configuration = dict(configuration, **{"gateway.public_base_url": self.headers["Origin"].rstrip("/")})
                     body = dict(body, configuration=configuration)
             result = engine.plan(body)
         elif path == "jobs" and self.command == "POST":
@@ -391,9 +391,17 @@ class Handler(BaseHTTPRequestHandler):
             session = self._rotate_session(key)
             result["csrf_token"] = session["csrf_token"]
         elif path == "config" and self.command == "PUT":
-            result = engine.save_config(body.get("values"), body.get("revision"))
+            result = engine.save_config(body.get("values"), body.get("profile"))
         elif path == "config" and not mutation:
-            result = engine.config()
+            result = engine.config(query.get("profile", [None])[0])
+        elif path == "config/profiles" and self.command == "POST":
+            result = engine.manage_profile("create", name=body.get("name"), source=body.get("source"))
+        elif path == "config/profiles" and self.command == "DELETE":
+            result = engine.manage_profile("delete", name=body.get("name"))
+        elif path == "config/activate" and self.command == "POST":
+            result = engine.manage_profile("activate", name=body.get("name"))
+        elif path == "config/restart" and self.command == "POST":
+            result = engine.restart_business()
         else:
             raise ManagerError("not_found", "管理接口不存在或方法不正确。", 404)
         self._send(200, result)

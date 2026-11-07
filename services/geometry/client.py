@@ -7,7 +7,7 @@ from typing import Any, Iterator, Optional, Tuple
 
 import grpc
 
-from core.config_values import runtime_value
+from core.config import value
 
 from services.geometry.proto_gen import geometry_runtime_pb2 as pb
 from services.geometry.proto_gen import geometry_runtime_pb2_grpc as rpc
@@ -174,7 +174,7 @@ class _Subscription:
 class GeometryClient:
     def __init__(self, target: str) -> None:
         self._target = target
-        message_limit = int(runtime_value("NUWAX_GEOMETRY_GRPC_MAX_MESSAGE_BYTES", "134217728"))
+        message_limit = int(value('gateway.geometry_grpc_max_message_bytes'))
         self._channel = grpc.insecure_channel(target, options=[
             ("grpc.enable_retries", 0), ("grpc.max_receive_message_length", message_limit),
             ("grpc.max_send_message_length", message_limit),

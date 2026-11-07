@@ -41,8 +41,8 @@ def deployment_descriptor(root: Path, home: Path, prefix: Path, modules, robot: 
     service_name = _service_name(service_name, mode)
     root, home, prefix = root.resolve(), home.resolve(), prefix.resolve()
     values, settings_path = effective_settings(root, prefix, environment=environment)
-    host = values.get("NUWAX_GATEWAY_HOST", "127.0.0.1") or "127.0.0.1"
-    port = int(values.get("NUWAX_GATEWAY_PORT", "8766") or "8766")
+    host = values["gateway.host"]
+    port = int(values["gateway.port"])
     if not 1 <= port <= 65535:
         raise ValueError("Invalid gateway listener port")
     return {"version": 1, "source_root": str(root), "install_home": str(home),
@@ -106,9 +106,9 @@ def render_user_service(descriptor: Mapping) -> str:
     home = Path(descriptor["install_home"])
     return ("[Unit]\nDescription=NEH installed gateway\n\n[Service]\nType=simple\n"
             + "WorkingDirectory=" + _unit_quote(descriptor["source_root"]) + "\n"
-            + "ExecStart=/bin/bash " + _unit_quote(home / "current/start.sh", executable=True) + "\n"
-            + "Environment=" + _unit_quote("NUWAX_GATEWAY_HOST=" + descriptor["listener"]["host"]) + "\n"
-            + "Environment=" + _unit_quote("NUWAX_GATEWAY_PORT=" + str(descriptor["listener"]["port"])) + "\n"
+            + "ExecStart=" + _unit_quote(Path(descriptor["prefix"]) / "venv/bin/python", executable=True) + " -m scripts.supervisor\n"
+            + "Environment=" + _unit_quote("NUWAX_INSTALL_HOME=" + str(home)) + "\n"
+            + "Environment=" + _unit_quote("LD_LIBRARY_PATH=" + str(Path(descriptor["prefix"]) / "lib") + ":" + str(Path(descriptor["prefix"]) / "lib64")) + "\n"
             + "KillMode=process\nTimeoutStopSec=60\nRestart=on-failure\nRestartSec=3\n"
             + "\n[Install]\nWantedBy=default.target\n")
 

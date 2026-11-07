@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import logging
-from core.config_values import motion_guard_socket, runtime_value
+from core.config import motion_guard_socket, value, binary_path, install_home
 from pathlib import Path
 import signal
 from typing import Optional
@@ -15,9 +15,7 @@ from .server import MotionGuardUnixServer
 
 
 def run() -> None:
-    socket_path = Path(motion_guard_socket(
-        os.environ.get("NUWAX_INSTALL_HOME"), runtime_value("NUWAX_MOTION_GUARD_SOCKET", "")
-    )).expanduser().resolve()
+    socket_path = Path(motion_guard_socket()).expanduser().resolve()
     stop_event = threading.Event()
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -30,7 +28,7 @@ def run() -> None:
     server: Optional[MotionGuardUnixServer] = None
     actuator = None
     try:
-        if runtime_value("NUWAX_MOTION_GUARD_BACKEND", "").strip() == "motion_control":
+        if value('motion_guard.backend').strip() == "motion_control":
             actuator = MotionControlActuator.from_environment()
         else:
             actuator = Go2Actuator.from_environment()

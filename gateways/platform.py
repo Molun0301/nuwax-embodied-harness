@@ -10,7 +10,7 @@ import time
 
 from core import components
 from core.capability import CapabilityTable
-from core.config_values import motion_guard_socket, runtime_value
+from core.config import motion_guard_socket, value, binary_path, install_home
 from core.errors import GatewayError
 from core.event_bus import EventBus
 from core.state_store import StateStore
@@ -120,7 +120,7 @@ def build_platform(config) -> Platform:
         platform.capabilities.register(cap)
     platform.tasks = TaskRunner(platform)
     home = os.environ.get("NUWAX_INSTALL_HOME", config.base_dir)
-    platform.motion = MotionClient(motion_guard_socket(home, os.environ.get("NUWAX_MOTION_GUARD_SOCKET")))
+    platform.motion = MotionClient(motion_guard_socket(home))
     platform.geometry = GeometryClient(f"127.0.0.1:{config.geometry.external.port}")
     platform.geometry_state = GeometryStateView(platform.geometry, platform.events)
     platform.maps = MapStore(config.runtime_data.map_catalog_root)
@@ -131,12 +131,9 @@ def build_platform(config) -> Platform:
     platform._recording_configuration = {
         "geometry": config.geometry.build_metadata(),
         "robot_name": platform.robot.manifest.robot_name,
-        "body_from_sensor": runtime_value("NUWAX_GEOMETRY_LIO_BODY_FROM_SENSOR", ""),
-        "body_from_imu": runtime_value("NUWAX_GEOMETRY_LIO_BODY_FROM_IMU", ""),
-        "native_lio_settings": {key: runtime_value(key, "") for key in (
-            "NUWAX_GEOMETRY_LIO_SCAN_VOXEL_SIZE_M", "NUWAX_GEOMETRY_LIO_MAP_VOXEL_SIZE_M",
-            "NUWAX_GEOMETRY_LIO_INITIAL_MAP_FRAMES", "NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE",
-            "NUWAX_GEOMETRY_NATIVE_LIO_PAIR_MAX_SKEW_MS", "NUWAX_GEOMETRY_POINTLIO_OPTIONS")},
+        "body_from_sensor": value('geometry.lio_body_from_sensor'),
+        "body_from_imu": value('geometry.lio_body_from_imu'),
+        "native_lio_settings": {key: value(key) for key in ('geometry.lio_scan_voxel_size_m', 'geometry.lio_map_voxel_size_m', 'geometry.lio_initial_map_frames', 'geometry.native_lio_pair_max_skew_ms', 'geometry.pointlio_options')},
     }
     platform._recording_unsubscribe = platform.geometry_state.subscribe_pose(platform.mapping_recorder.record_pose)
     platform.map_cleanup = MapCleanupService(config, platform.maps)
@@ -182,7 +179,7 @@ def build_platform(config) -> Platform:
         event_bus=platform.events, stream_bus=stream_bus,
         geometry_state=platform.geometry_state, geometry_client=platform.geometry,
         video_frame_source=providers if isinstance(providers, VideoFrameSource) else VideoSource(
-            os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm"),
+            "/tmp/nuwax_video.shm",
             providers if isinstance(providers, ImageProvider) else None,
             platform.robot.defaults.frame_ids.get("camera_front", "camera_front")))
     platform.memory = MemoryService(geometry_state=platform.geometry_state if has_geometry_input else None,

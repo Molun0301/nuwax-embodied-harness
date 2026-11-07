@@ -1,16 +1,19 @@
-"""设置保存与运行中消费者的协调；磁盘状态、热加载和重启分别回执。"""
+"""网关接收本机通知，仅采用模式声明的热加载项。"""
 from __future__ import annotations
-
 from dataclasses import asdict
+from copy import deepcopy
+import json
 import logging
 from logging.handlers import RotatingFileHandler
-import os
+from pathlib import Path
 import threading
+import urllib.error
+import urllib.request
 
-from core import config_io, config_registry, config_profiles
-from core.config_effects import HOT_FIELDS, HOT_LOG_KEYS, LOG_FIELDS, apply_mode
-from core.config_values import RUNTIME_VALUES, config_snapshot, configuration_location, configuration_values, read_env_values
+from core.config import config_snapshot, flatten, install_home, read_config, runtime_config, specifications
 
+HOT_FIELDS = {'gateway.pointcloud3d_spacing_m': 'gateway.pointcloud3d.spacing_m', 'gateway.pointcloud3d_size': 'gateway.pointcloud3d.size', 'gateway.pointcloud3d_color': 'gateway.pointcloud3d.color', 'gateway.pointcloud3d_height_colors': 'gateway.pointcloud3d.height_colors', 'gateway.pointcloud3d_ground_color': 'gateway.pointcloud3d.ground_color', 'gateway.pointcloud3d_structure_color': 'gateway.pointcloud3d.structure_color', 'gateway.pointcloud3d_object_color': 'gateway.pointcloud3d.object_color', 'gateway.telemetry_enabled': 'gateway.telemetry_enabled', 'gateway.telemetry_interval_sec': 'gateway.telemetry_interval_sec', 'gateway.telemetry_process_keywords': 'gateway.telemetry_process_keywords', 'gateway.telemetry_include_process_tree': 'gateway.telemetry_include_process_tree', 'gateway.artifact_retention_days': 'runtime_data.artifact_retention_days', 'gateway.artifact_max_count': 'runtime_data.artifact_max_count', 'gateway.artifact_max_total_bytes': 'runtime_data.artifact_max_total_bytes', 'gateway.artifact_cleanup_batch_size': 'runtime_data.artifact_cleanup_batch_size', 'perception.stream_interval_sec': 'perception.stream_runtime.interval_sec', 'perception.stream_failure_backoff_sec': 'perception.stream_runtime.failure_backoff_sec', 'perception.keyframe_min_interval_sec': 'perception.stream_runtime.keyframe_min_interval_sec', 'perception.keyframe_translation_m': 'perception.stream_runtime.keyframe_translation_threshold_m', 'perception.keyframe_yaw_deg': 'perception.stream_runtime.keyframe_yaw_threshold_deg', 'perception.keyframe_remember_enabled': 'perception.stream_runtime.remember_keyframes', 'perception.burst_frame_count': 'perception.stream_runtime.burst_frame_count', 'perception.burst_interval_sec': 'perception.stream_runtime.burst_interval_sec', 'perception.yolo_world_confidence': 'perception.yolo_world.confidence_threshold', 'perception.yolo_world_iou': 'perception.yolo_world.iou_threshold', 'perception.yolo_world_max_detections': 'perception.yolo_world.max_detections'}
+LOG_FIELDS = {'logging.level': 'level', 'logging.format': 'format', 'logging.max_bytes': 'max_bytes', 'logging.backup_count': 'backup_count'}
 
 def _attribute(value, path):
     for part in path.split("."):
@@ -23,232 +26,74 @@ def _set_attribute(value, path, new_value):
     setattr(_attribute(value, parent) if parent else value, name, new_value)
 
 
+def manager_request(method, path, payload=None, headers=None):
+    """设置页转发到设备管理的同一接口，沿用浏览器认证信息。"""
+    home = install_home()
+    marker = home / "config/manager-home.json"
+    manager = Path(json.loads(marker.read_text())["manager_dir"]) if marker.exists() else home
+    server = json.loads((manager / "config/server.json").read_text())
+    supplied = headers or {}
+    forwarded = {key: val for key, val in supplied.items()
+                 if key.lower() in ("cookie", "x-neh-csrf", "origin", "host", "content-type")}
+    data = json.dumps(payload).encode() if payload is not None else None
+    if data is not None:
+        forwarded["Content-Type"] = "application/json"
+    request = urllib.request.Request("http://127.0.0.1:" + str(server["port"]) + "/api/manager/" + path,
+                                     data=data, headers=forwarded, method=method)
+    try:
+        response = urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=120)
+    except urllib.error.HTTPError as error:
+        return error.code, error.read(), ({"Set-Cookie": error.headers["Set-Cookie"]} if error.headers.get("Set-Cookie") else {})
+    with response:
+        return response.status, response.read(), ({"Set-Cookie": response.headers["Set-Cookie"]} if response.headers.get("Set-Cookie") else {})
+
+
 class SettingsApplication:
     def __init__(self, runtime):
         self.runtime = runtime
         self._lock = threading.RLock()
-        self._state_lock = threading.RLock()
-        self._hot_apply_pending = set()
-        self._pid = os.getpid()
+        self._adopted = deepcopy(runtime_config())
         self._apply_errors = {}
-        self.revision_owner = config_profiles.ProfileRevisionOwner()
-        self._root = config_io._CORE_ENV.parent
-        self.started_location = configuration_location(root=self._root)
-        self.started_robot = runtime.config.robot.active_robot
-        self._startup_files = configuration_values(root=self._root)
-        self._startup_files.update({key: value for key, value in os.environ.items() if config_registry.get_field(key)})
 
-    def close(self):
-        self.revision_owner.close()
-
-    def start(self):
-        """同一应用再次进入生命周期时建立新拥有方，旧编辑令牌不复活。"""
-        if self._pid != os.getpid():
-            # 子进程不能等待父进程其它线程持有的设置锁。
-            self._lock = threading.RLock()
-            self._state_lock = threading.RLock()
-            self._hot_apply_pending = set()
-            self.revision_owner = config_profiles.ProfileRevisionOwner()
-            self._pid = os.getpid()
+    def reload(self):
+        from core.settings import load_config
+        specs = specifications()
         with self._lock:
-            if self.revision_owner.closed:
-                self.revision_owner = config_profiles.ProfileRevisionOwner()
-
-    def __del__(self):
-        owner = getattr(self, "revision_owner", None)
-        if owner is not None:
-            owner.close()
-
-    def _active_location(self):
-        # 活动选择属于持久配置；已经物化到本进程环境的旧机器人名不覆盖页面选择。
-        # 安装根位置不是选择，托管安装须据此找到持久配置目录。
-        selector = self._root / "runtime_data" / "settings" / "active.env"
-        if selector.is_symlink():
-            return configuration_location(root=self._root, environment={
-                "NUWAX_MANAGED_HOME": os.environ.get("NUWAX_MANAGED_HOME", "")})
-        return configuration_location(root=self._root)
-
-    def _is_active(self, location):
-        active = self._active_location()
-        return active is not None and location["path"] == active["path"]
-
-    def schema(self, robot=None, profile=None):
-        return self._schema(robot, profile)
-
-    def _runtime_state(self):
-        with self._state_lock:
-            return {"runtime_values": dict(RUNTIME_VALUES),
-                    "saved": set(config_io._SAVED_SINCE_START),
-                    "apply_errors": dict(self._apply_errors),
-                    "hot_apply_pending": sorted(self._hot_apply_pending)}
-
-    def _schema(self, robot=None, profile=None):
-        captured = {}
-        owner = self.revision_owner
-
-        def location():
-            active = self._active_location()
-            captured["active"] = active
-            selected = robot
-            if selected is None and self.started_robot:
-                selected = active["robot"] if active else self.started_robot
-            return configuration_location(root=self._root, robot=selected, profile=profile)
-
-        def runtime_state():
-            state = self._runtime_state()
-            captured["state"] = state
-            return state
-
-        schema = config_io.build_schema(robot, profile, revision_owner=owner,
-                                        location_provider=location, runtime_state_provider=runtime_state)
-        context = schema.get("profile_context")
-        if context:
-            active = captured["active"]
-            context["selected_robot"] = active["robot"] if active else ""
-            context["is_active"] = bool(active and str(active["path"]) == context["path"])
-            context["running_robot"] = self.started_robot
-            context["running_profile"] = self.started_location["profile"] if self.started_location else ""
-        schema["application"] = self.status(application_state=captured["state"])
-        return schema
-
-    def status(self, *, application_state=None):
-        from gateways.settings_restart import restart_status
-        if application_state is None:
-            with self._state_lock:
-                application_state = {"apply_errors": dict(self._apply_errors),
-                                     "hot_apply_pending": sorted(self._hot_apply_pending)}
-        # restart_status may wait for an external service manager, never under
-        # the adopted-state lock or the serialized hot-application transaction.
-        return {"process_id": os.getpid(), "running_robot": self.started_robot,
-                "running_profile": self.started_location["profile"] if self.started_location else "",
-                "apply_errors": application_state["apply_errors"],
-                "hot_apply_pending": application_state["hot_apply_pending"], **restart_status(self._root)}
-
-    def save(self, updates, *, robot=None, profile=None, expected_revision=None):
-        with self._lock:
-            location = configuration_location(root=self._root, robot=robot, profile=profile)
-            result = config_io.save_values(updates, robot=robot, profile=profile, expected_revision=expected_revision,
-                                           revision_owner=self.revision_owner)
-            written = {key for keys in result.written.values() for key in keys}
-            values = read_env_values(location["path"])
-            active = self._is_active(location)
-            applied = self._apply_hot(values, written) if active and location["robot"] == self.started_robot else []
-            restart_keys = sorted(key for key in written
-                                  if key not in applied or apply_mode(key) == "hot_and_restart")
-            effect_note = "可热加载项已应用；其它参数可立即重启或稍后生效。" if active else "方案已保存，选择应用后才改变运行设置。"
-            return {"written": result.written, "skipped": result.skipped, "rejected": result.rejected,
-                    "backups": {}, "hot_applied": applied, "apply_errors": dict(self._apply_errors),
-                    "restart_keys": restart_keys, "restart_required": active and bool(restart_keys),
-                    "is_active": active, "effect_note": effect_note}
-
-    def activate(self, *, robot, profile, expected_revision=None):
-        with self._lock:
-            context = config_profiles.activate_profile(root=self._root, robot=robot, profile=profile,
-                                                      expected_revision=expected_revision, revision_owner=self.revision_owner)
-            location = configuration_location(root=self._root, robot=robot, profile=profile)
-            values = read_env_values(location["path"])
-            # 方案中缺省的键也必须恢复默认，不能保留上一方案的热加载值。
-            from core.settings import load_config
-            with config_snapshot(values, {}) as recorded:
-                load_config()
-            candidate = {key: config_io._format_config_value(value, config_registry.get_field(key).type)
-                         for key, value in recorded.items() if config_registry.get_field(key)}
-            candidate.update(values)
-            defaults = config_io._default_values()
-            for key in HOT_LOG_KEYS:
-                candidate.setdefault(key, defaults.get(key, ""))
-            keys = set(candidate)
-            applied = self._apply_hot(candidate, keys) if robot == self.started_robot else []
-            defaults = config_io._default_values()
-            restart_keys = []
-            for field in config_registry.build_registry():
-                if apply_mode(field.key) == "hot" and field.key in applied:
-                    continue
-                before = self._startup_files.get(field.key, defaults.get(field.key, ""))
-                after = values.get(field.key, defaults.get(field.key, ""))
-                if config_io._validate(field.key, str(before), field.type) != config_io._validate(field.key, str(after), field.type):
-                    restart_keys.append(field.key)
-                    with self._state_lock:
-                        config_io._SAVED_SINCE_START.add((str(location["path"]), field.key))
-            restart_required = robot != self.started_robot or bool(restart_keys)
-            return {"profile_context": context, "hot_applied": applied, "apply_errors": dict(self._apply_errors),
-                    "restart_required": restart_required, "restart_keys": restart_keys,
-                    "effect_note": "已选择此方案；待重启参数将在下次启动时读取。" if restart_required else "方案已应用，无需重启进程。"}
-
-    def _apply_hot(self, values, keys):
-        from core import settings
-        requested = set(keys) & (set(HOT_FIELDS) | HOT_LOG_KEYS)
-        if not requested:
-            return []
-        file_keys = os.environ.get("_NUWAX_CONFIG_FILE_KEYS", "").split(":")
-        blocked = {key for key in requested if key in os.environ and key not in file_keys
-                   and str(os.environ[key]) != str(values.get(key, ""))}
-        with self._state_lock:
-            for key in blocked:
-                self._apply_errors[key] = "存在显式进程环境覆盖，修改文件不能覆盖该值"
-            requested -= blocked
-            unchanged = {key for key in requested if key in RUNTIME_VALUES and
-                         config_io._validate(key, str(values.get(key, "")), config_registry.get_field(key).type)
-                         == config_io._validate(key, config_io._format_config_value(RUNTIME_VALUES[key], config_registry.get_field(key).type), config_registry.get_field(key).type)}
-            requested -= unchanged
-            for key in unchanged:
-                self._apply_errors.pop(key, None)
-            # 从当前读取记录构造候选，仅覆盖本次热加载项，不应用其它尚待重启的编辑。
-            source = {key: config_io._format_config_value(value, config_registry.get_field(key).type)
-                      for key, value in RUNTIME_VALUES.items() if config_registry.get_field(key)}
-        for key in requested:
-            source[key] = values.get(key, "")
-        with config_snapshot(source, {}) as recorded:
-            candidate = settings.load_config()
-        applied = list(unchanged)
-        groups = {}
-        for key in requested:
-            path = HOT_FIELDS.get(key, "")
-            group = ("logging" if key in HOT_LOG_KEYS else "display" if path.startswith("gateway.pointcloud3d.")
-                     else "telemetry" if key.startswith("NUWAX_GATEWAY_TELEMETRY_")
-                     else "artifacts" if key.startswith("NUWAX_ARTIFACT_")
-                     else "detector" if path.startswith("perception.yolo_world.")
-                     else "stream" if path.startswith("perception.stream_runtime.") else "values")
-            groups.setdefault(group, []).append(key)
-        for group, group_keys in groups.items():
-            with self._state_lock:
-                self._hot_apply_pending.update(group_keys)
-            try:
-                self._apply_group(group, group_keys, candidate, source)
-                adopted = {key: (_attribute(candidate, HOT_FIELDS[key]) if key in HOT_FIELDS
-                                 else recorded.get(key, source[key])) for key in group_keys}
-                active = self._active_location()
-                with self._state_lock:
+            saved = read_config()
+            keys = [key for key, spec in specs.items() if spec["apply"] == "hot"
+                    and flatten(saved)[key] != flatten(self._adopted)[key]]
+            source = deepcopy(self._adopted)
+            for key in keys:
+                section, name = key.split(".", 1)
+                source[section][name] = flatten(saved)[key]
+            with config_snapshot(source):
+                candidate = load_config()
+            groups = {}
+            for key in keys:
+                path = HOT_FIELDS.get(key, "")
+                group = ("logging" if key.startswith("logging.") else "display" if path.startswith("gateway.pointcloud3d.")
+                         else "telemetry" if key.startswith("gateway.telemetry_") else "artifacts" if key.startswith("gateway.artifact_")
+                         else "detector" if path.startswith("perception.yolo_world.")
+                         else "stream" if path.startswith("perception.stream_runtime.") else "values")
+                groups.setdefault(group, []).append(key)
+            applied = []
+            for group, group_keys in groups.items():
+                try:
+                    self._apply_group(group, group_keys, candidate, flatten(source))
                     for key in group_keys:
                         if key in HOT_FIELDS:
-                            _set_attribute(self.runtime.config, HOT_FIELDS[key], adopted[key])
-                    RUNTIME_VALUES.update(adopted)
-                    for key in group_keys:
-                        if apply_mode(key) == "hot":
-                            config_io._SAVED_SINCE_START.discard(key)
-                            if active:
-                                config_io._SAVED_SINCE_START.discard((str(active["path"]), key))
+                            _set_attribute(self.runtime.config, HOT_FIELDS[key], _attribute(candidate, HOT_FIELDS[key]))
+                        section, name = key.split(".", 1)
+                        self._adopted[section][name] = source[section][name]
                         self._apply_errors.pop(key, None)
-                    self._hot_apply_pending.difference_update(group_keys)
-                applied.extend(group_keys)
-            except Exception as error:
-                error_text = None
-                try:
-                    error_text = str(error)
-                finally:
-                    with self._state_lock:
-                        if error_text is not None:
-                            self._apply_errors.update(dict.fromkeys(group_keys, error_text))
-                        self._hot_apply_pending.difference_update(group_keys)
-                logging.getLogger("nuwax_robot_bridge.settings").exception("设置已保存但热加载失败：%s", group)
-            except BaseException:
-                with self._state_lock:
-                    self._hot_apply_pending.difference_update(group_keys)
-                raise
-        if groups.get("display") and set(groups["display"]) <= set(applied):
-            payload = asdict(self.runtime.config.gateway.pointcloud3d)
-            self.runtime.streams.stream_bus.publish("settings.display", source="gateway", payload=payload)
-        return sorted(applied)
+                    applied.extend(group_keys)
+                except Exception as error:
+                    self._apply_errors.update(dict.fromkeys(group_keys, str(error)))
+                    logging.getLogger("nuwax_robot_bridge.settings").exception("设置已保存但热加载失败：%s", group)
+            if groups.get("display") and set(groups["display"]) <= set(applied):
+                self.runtime.streams.stream_bus.publish("settings.display", source="gateway",
+                                                       payload=asdict(self.runtime.config.gateway.pointcloud3d))
+            return {"hot_applied": sorted(applied), "apply_errors": dict(self._apply_errors)}
 
     def _apply_group(self, group, keys, candidate, values):
         if group == "telemetry":
@@ -270,20 +115,20 @@ class SettingsApplication:
             for key in keys:
                 if key in LOG_FIELDS:
                     setattr(self.runtime.config.logging, LOG_FIELDS[key], getattr(candidate.logging, LOG_FIELDS[key]))
-                elif key.startswith("NUWAX_LOG_LEVEL_"):
-                    name = key[len("NUWAX_LOG_LEVEL_"):].lower()
+                elif key.startswith("logging.level_"):
+                    name = key[len("logging.level_"):].lower()
                     logging.getLogger(_SUBSYSTEM_LOGGERS[name]).setLevel(values[key].upper() or logging.NOTSET)
-            if "NUWAX_LOG_LEVEL" in keys:
+            if "logging.level" in keys:
                 root_logger.setLevel(candidate.logging.level.upper())
             for handler in root_logger.handlers:
                 handler.acquire()
                 try:
                     if isinstance(handler, RotatingFileHandler):
-                        if "NUWAX_LOG_MAX_BYTES" in keys:
+                        if "logging.max_bytes" in keys:
                             handler.maxBytes = candidate.logging.max_bytes
-                        if "NUWAX_LOG_BACKUP_COUNT" in keys:
+                        if "logging.backup_count" in keys:
                             handler.backupCount = candidate.logging.backup_count
-                    elif "NUWAX_LOG_FORMAT" in keys and isinstance(handler, logging.StreamHandler):
+                    elif "logging.format" in keys and isinstance(handler, logging.StreamHandler):
                         handler.setFormatter(JsonLineFormatter() if candidate.logging.format == "json" else build_default_formatter())
                 finally:
                     handler.release()

@@ -28,43 +28,20 @@ def parent_death_signal():
 
 
 def load_environment(root):
-    """沿共同解析器读取一次配置，再物化原启动脚本的参数。"""
-    from core.config_values import motion_guard_socket
-
-    raw = subprocess.check_output(
-        ["bash", "-ec", 'source scripts/lib/config_env.sh; load_platform_config; env -0'], cwd=root,
-        env=dict(os.environ, PATH=str(Path(sys.executable).parent) + ":" + os.environ["PATH"]))
-    env = dict(item.decode().split("=", 1) for item in raw.split(b"\0") if item)
-    defaults = {
-        "NUWAX_INSTALL_HOME": env.get("NUWAX_MANAGED_HOME", str(root)),
-        "PYTHONUNBUFFERED": "1", "NUWAX_LOG_DIR": str(root / "runtime_data/logs"), "NUWAX_LCM_URL": "udpm://239.255.76.67:7667?ttl=0",
-        "NUWAX_GEOMETRY_DYNAMIC_BACKEND": "dufomap", "NUWAX_NAV_PCT_TERRAIN_SOURCE": "tomography",
-        "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_MIB": "auto", "NUWAX_GEOMETRY_FINE_CLOUD_CACHE_AUTO_MAX_MIB": "256",
-        "NUWAX_GEOMETRY_RUNTIME_PORT": "50051", "NUWAX_GEOMETRY_PIPELINE": "lio_3d",
-        "NUWAX_GEOMETRY_LIO_BACKEND": "device", "NUWAX_GEOMETRY_MAPPING_BACKEND": "voxel",
-        "NUWAX_GEOMETRY_CORRECTION_BACKEND": "none",
-        "NUWAX_GEOMETRY_SEQUENCE_STATE_PATH": str(root / "runtime_data/geometry/sequence_state.json"),
-        "NUWAX_NAV_STACK_READY_FILE": str(root / "runtime_data/navigation/nuwax_nav_stack.ready"),
-        "NUWAX_GEOMETRY_RUNTIME_READY_FILE": str(root / "runtime_data/geometry/nuwax_geometry_runtime.ready"),
-        "NUWAX_PERSON_FOLLOW_READY_FILE": str(root / "runtime_data/person-follow/nuwax_person_follow.ready"),
-        "NUWAX_PERSON_FOLLOW_TARGET_CHANNEL": "/person_follow_target",
-        "NUWAX_PERSON_FOLLOW_POINTCLOUD_CHANNEL": "/global_map",
-        "NUWAX_PERSON_FOLLOW_TF_CHANNEL": "/tf",
-        "NUWAX_PERSON_FOLLOW_COMMAND_CHANNEL": "/gateway/person_follow_cmd_vel",
-    }
-    for key, value in defaults.items():
-        if not env.get(key, "").strip():
-            env[key] = value
-    env["NUWAX_MOTION_GUARD_SOCKET"] = motion_guard_socket(
-        env["NUWAX_INSTALL_HOME"], env.get("NUWAX_MOTION_GUARD_SOCKET")
-    )
-    output = subprocess.check_output([sys.executable, str(root / "scripts/resolve_navigation_pipeline.py"), "--runtime-env"], env=env, text=True)
-    env.update(dict(line.split("=", 1) for line in output.splitlines()))
-    backend = env["NUWAX_GEOMETRY_LIO_BACKEND"]
-    binary = env.get("NUWAX_GEOMETRY_RUNTIME_BINARY", str(root / "services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime"))
-    if env.get("NUWAX_INSTALL_HOME") and env["NUWAX_GEOMETRY_PIPELINE"] == "lio_3d" and backend != "device" and not env.get("NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE"):
-        env["NUWAX_GEOMETRY_NATIVE_LIO_EXECUTABLE"] = str(Path(binary).parent / (backend + "_native"))
-    env.setdefault("NUWAX_GEOMETRY_SLAM2D_BINARY", str(root / "services/nuwax-workspace/target/release/nuwax-slam-2d-worker"))
+    """启动时合成完整配置，子进程仅继承系统和诊断环境。"""
+    from core.config import ConfigStore, install_home
+    home = install_home()
+    ConfigStore(home, root).compose()
+    system_names = {"HOME", "USER", "LOGNAME", "SHELL", "PATH", "LANG", "TZ", "TMPDIR", "TMP", "TEMP",
+                    "LD_LIBRARY_PATH", "PYTHONPATH", "PYTHONNOUSERSITE", "PYTHONDONTWRITEBYTECODE", "VIRTUAL_ENV",
+                    "SSL_CERT_FILE", "SSL_CERT_DIR", "LOGS_DIRECTORY", "INVOCATION_ID", "JOURNAL_STREAM",
+                    "RUST_LOG", "NUWAX_SOURCE_TIME_FILE", "NUWAX_PGO_FULL_WINDOW_FILTER",
+                    "NEH_PGO_PHASE_DIAGNOSTIC", "NEH_RAY_PHASE_DIAGNOSTIC", "NEH_SCAN_A_TRACE"}
+    env = {key: value for key, value in os.environ.items()
+           if key in system_names or key.startswith(("LC_", "CUDA_", "NVIDIA_", "OMP_", "OPENBLAS_", "MKL_",
+                                                     "NUWAX_SURFACE_CAPTURE_", "NUWAX_PGO_WINDOW_", "NUWAX_TEST_"))}
+    env["NUWAX_INSTALL_HOME"] = str(home)
+    env["PYTHONUNBUFFERED"] = "1"
     return env
 
 
@@ -104,32 +81,27 @@ class Component:
     started_at: float = 0
 
 
-def component_table(root, env):
-    python = env.get("NUWAX_PYTHON_BIN", sys.executable)
-    native = root / "services/nuwax-workspace/target/release"
-    truthy = lambda key, default="true": env.get(key, default).lower() in {"1", "true", "yes", "on"}
-    nav_ready = Path(env["NUWAX_NAV_STACK_READY_FILE"] + ".runtime")
-    geometry_ready = Path(env["NUWAX_GEOMETRY_RUNTIME_READY_FILE"] + ".runtime")
-    follow_ready = Path(env["NUWAX_PERSON_FOLLOW_READY_FILE"] + ".runtime")
+def component_table(root, config):
+    from core.config import binary_path, install_home, motion_guard_socket
+    home = install_home()
+    nav_ready = home / "runtime_data/navigation/nuwax_nav_stack.ready.runtime"
+    geometry_ready = home / "runtime_data/geometry/nuwax_geometry_runtime.ready.runtime"
+    follow_ready = home / "runtime_data/person-follow/nuwax_person_follow.ready.runtime"
     return {
-        "motion_guard": Component([python, "-m", "services.navigation.motion_safety_guard"],
-            ready=lambda: socket_ready(env["NUWAX_MOTION_GUARD_SOCKET"]),
-            enabled=bool(env.get("NUWAX_MOTION_GUARD_BACKEND"))),
-        "nav_stack": Component([env.get("NUWAX_NAV_STACK_BINARY", str(native / "nuwax-nav-stack")), "--profile=" + env["NUWAX_NAV_PROFILE"]],
-            {"NUWAX_NAV_STACK_INTERNAL_READY_FILE": str(nav_ready)}, ("motion_guard",), nav_ready,
-            enabled=truthy("NUWAX_NAV_AUTOSTART")),
-        "geometry": Component([env.get("NUWAX_GEOMETRY_RUNTIME_BINARY", str(root / "services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime"))],
-            {"NUWAX_GEOMETRY_RUNTIME_READY_FILE": str(geometry_ready)}, ready=geometry_ready,
-            enabled=truthy("NUWAX_GEOMETRY_EXTERNAL_ENABLED")),
-        "person_follow": Component([env.get("NUWAX_PERSON_FOLLOW_BINARY", str(native / "nuwax-person-follow"))],
-            {"NUWAX_PERSON_FOLLOW_INTERNAL_READY_FILE": str(follow_ready)}, ("nav_stack", "geometry"), follow_ready,
-            enabled=truthy("NUWAX_PERSON_FOLLOW_AUTOSTART")),
-        "gateway": Component([python, "-m", "uvicorn", "gateways.app:create_gateway_app_from_env", "--factory",
-            "--host", env.get("NUWAX_GATEWAY_HOST", "0.0.0.0"), "--port", env.get("NUWAX_GATEWAY_PORT", "8766"),
+        "motion_guard": Component([sys.executable, "-m", "services.navigation.motion_safety_guard"],
+            ready=lambda: socket_ready(motion_guard_socket(home)), enabled=bool(config["motion_guard"]["backend"])),
+        "nav_stack": Component([binary_path("nuwax-nav-stack"), "--profile=" + config["derived"]["nav_profile"]],
+            dependencies=("motion_guard",), ready=nav_ready, enabled=config["navigation"]["autostart"]),
+        "geometry": Component([binary_path("nuwax-geometry-runtime")], ready=geometry_ready,
+            enabled=config["geometry"]["external_enabled"]),
+        "person_follow": Component([binary_path("nuwax-person-follow")], dependencies=("nav_stack", "geometry"),
+            ready=follow_ready, enabled=config["person_follow"]["autostart"]),
+        "gateway": Component([sys.executable, "-m", "uvicorn", "gateways.app:create_gateway_app_from_env", "--factory",
+            "--host", config["gateway"]["host"], "--port", str(config["gateway"]["port"]),
             "--ws-per-message-deflate", "false", "--timeout-graceful-shutdown", "5"],
-            ready=lambda: gateway_ready(env.get("NUWAX_GATEWAY_PORT", "8766")), automatic=True),
-        "video": Component([python, "-m", "drivers.go2.video_streamer"], automatic=True,
-            enabled=env.get("NUWAX_ACTIVE_ROBOT", "").lower() == "go2" and truthy("GO2_VIDEO_STREAM_ENABLED")),
+            ready=lambda: gateway_ready(config["gateway"]["port"]), automatic=True),
+        "video": Component([sys.executable, "-m", "drivers.go2.video_streamer"], automatic=True,
+            enabled=config["robot"]["driver"] == "go2" and config["go2"]["video_stream_enabled"]),
     }
 
 
@@ -138,7 +110,8 @@ class Supervisor:
         self.root, self.environment = Path(root), environment
         self.home = Path(environment.get("NUWAX_INSTALL_HOME", root))
         self.socket_path = self.home / "run/supervisor.sock"
-        self.components = component_table(self.root, environment) if components is None else components
+        from core.config import read_config
+        self.components = component_table(self.root, read_config(self.home)) if components is None else components
         self.stopping = asyncio.Event()
         self.background = set()
 
@@ -172,11 +145,8 @@ class Supervisor:
                 if isinstance(item.ready, Path):
                     item.ready.parent.mkdir(parents=True, exist_ok=True)
                     item.ready.unlink(missing_ok=True)
-                if name in {"nav_stack", "geometry"} and not self.environment.get("NUWAX_ROBOT_GEOMETRY_JSON"):
-                    self.environment["NUWAX_ROBOT_GEOMETRY_JSON"] = subprocess.check_output(
-                        [sys.executable, str(self.root / "scripts/resolve_robot_geometry.py")],
-                        env=self.environment, text=True).strip()
-                directory = Path(self.environment.get("NUWAX_LOG_DIR", str(self.home / "logs")))
+                from core.config import value
+                directory = Path(value("logging.dir"))
                 directory.mkdir(parents=True, exist_ok=True)
                 with (directory / (name + ".log")).open("ab") as log:
                     item.process = await asyncio.create_subprocess_exec(*item.command, cwd=self.root,

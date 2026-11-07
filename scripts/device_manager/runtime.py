@@ -20,46 +20,20 @@ from . import PACKAGE_ROOT
 from .common import ManagerError, atomic_json, process_alive, process_identity, read_json
 
 PROBE_CODE = r'''
-import json, sys
+import json,sys
 from pathlib import Path
-from dataclasses import asdict
+from core.config import validate_business_values
 request = json.load(sys.stdin)
-if request["operation"] == "runtime":
-    from scripts.module_installer.runtime import write_runtime
-    write_runtime(Path.cwd(), Path(request["install_prefix"]), request["modules"], request["robot"], request["values"])
-    result = {"ok": True}
-else:
-    from core import config_io
-    if request["operation"] in ("validate", "validate_existing", "normalize_profile"):
-        from core.config_registry import get_field
-        values = {}
-        for key, value in request["values"].items():
-            field = get_field(key)
-            raw = str(value).lower() if isinstance(value, bool) else str(value)
-            if field is None:
-                if request["operation"] in ("validate_existing", "normalize_profile"):
-                    values[key] = raw
-                    continue
-                raise ValueError("未知配置键：" + key)
-            if request["operation"] in ("validate_existing", "normalize_profile") and not raw.strip():
-                continue
-            if field.type == "int" and request["operation"] in ("validate_existing", "normalize_profile"):
-                try:
-                    number = float(raw)
-                    if number.is_integer():
-                        raw = str(int(number))
-                except (ValueError, OverflowError):
-                    pass
-            normalized = config_io._validate(key, raw, field.type)
-            if normalized is None:
-                raise ValueError("配置值类型不合法：" + key)
-            if field.sensitive and raw.strip() in ("", "********"):
-                continue
-            values[key] = normalized
-        result = values
+try:
+    if request["operation"] == "runtime":
+        from scripts.module_installer.runtime import write_runtime
+        result = write_runtime(Path.cwd(), Path(request["install_prefix"]), request["modules"], request["robot"], request["values"])
     else:
-        raise ValueError("配置读写必须使用受管配置拥有方")
-print("NEH_RESULT=" + json.dumps(result, ensure_ascii=False))
+        result = validate_business_values(request["values"])
+except (ValueError, TypeError, OverflowError) as error:
+    print("NEH_CONFIG_ERROR=" + json.dumps(str(error), ensure_ascii=False))
+else:
+    print("NEH_RESULT=" + json.dumps(result, ensure_ascii=False))
 '''
 
 
@@ -78,8 +52,7 @@ def clean_environment(prefix=None, *, environment=None):
     environment["PYTHONNOUSERSITE"] = "1"
     if prefix:
         environment["LD_LIBRARY_PATH"] = str(prefix / "lib") + ":" + str(prefix / "lib64")
-        environment["NUWAX_ROBOT_PROFILE_MODE"] = "1"
-        environment["NUWAX_MANAGED_HOME"] = str(prefix.parent.parent)
+        environment["NUWAX_INSTALL_HOME"] = str(prefix.parent.parent)
         environment["NEH_MANAGER_LOG_DIR"] = str(prefix.parent.parent / "logs")
     return environment
 
@@ -89,10 +62,13 @@ def redactor(home=None):
     """隐藏配置密钥和网址中的认证部分；进入网页的诊断与详细日志共用。"""
     secrets = []
     if home:
-        from scripts.module_installer.runtime import read_settings
-        active = Path(home) / "data/settings/active.env"
-        secrets = [value for key, value in read_settings(active).items()
-                   if re.search(r"PASSWORD|TOKEN|SECRET|API_KEY|AUTHORIZATION", key, re.I) and len(value) >= 4]
+        from scripts.module_installer.runtime import read_settings, _CONFIG
+        active = Path(home) / "run/config.toml"
+        specs = _CONFIG.specifications()
+        if active.is_file():
+            secrets = [value for key, value in read_settings(active).items()
+                       if specs.get(key, {}).get("sensitive") and isinstance(value, str) and len(value) >= 4]
+
 
     def redact(text):
         for value in secrets:
@@ -109,7 +85,7 @@ def safe_diagnostic(text, home=None):
     return "\n".join(redactor(home)(text[-6000:]).splitlines()[-20:])[-4000:]
 
 
-_PROTOCOL_LINES = ("NEH_RESULT=", "NEH_SOURCE_RESULT=")
+_PROTOCOL_LINES = ("NEH_RESULT=", "NEH_CONFIG_ERROR=", "NEH_SOURCE_RESULT=")
 
 
 def job_output_path(home=None, job_id=None):
@@ -183,7 +159,7 @@ def run_command(argv, *, cwd=None, environment=None, payload=None, timeout=600, 
     deadline = time.monotonic() + timeout
     # 任务进程中逐行写入详细日志，网页据此实时显示；内部协议行可能带配置值，不写入。
     log_path = job_output_path()
-    redact = redactor((environment or {}).get("NUWAX_MANAGED_HOME") or os.environ.get("NEH_MANAGER_WORKER_HOME"))
+    redact = redactor((environment or {}).get("NUWAX_INSTALL_HOME") or os.environ.get("NEH_MANAGER_WORKER_HOME"))
     chunks = []
 
     def pump():
@@ -234,7 +210,7 @@ def run_command(argv, *, cwd=None, environment=None, payload=None, timeout=600, 
                 from .common import atomic_write
                 path = directory / ("command-" + str(process.pid) + ".log")
                 atomic_write(path, output)
-                details = {"log_file": str(path), "diagnostic": safe_diagnostic(output.decode("utf-8", errors="replace"), environment.get("NUWAX_MANAGED_HOME"))}
+                details = {"log_file": str(path), "diagnostic": safe_diagnostic(output.decode("utf-8", errors="replace"), environment.get("NUWAX_INSTALL_HOME"))}
             reason = redact(failure_reason(output.decode("utf-8", errors="replace")))
             raise ManagerError("command_failed", reason or "受管步骤失败（退出码 {}）：{}".format(process.returncode, Path(argv[0]).name), 500, details)
         return output.decode("utf-8", errors="replace")
@@ -261,6 +237,8 @@ def probe(prefix, operation, **kwargs):
     output = run_command([str(prefix / "venv/bin/python"), "-c", PROBE_CODE], cwd=prefix / "source",
                          environment=clean_environment(prefix), payload=json.dumps(request), timeout=120)
     for line in reversed(output.splitlines()):
+        if line.startswith("NEH_CONFIG_ERROR="):
+            raise ManagerError("invalid_config", json.loads(line[len("NEH_CONFIG_ERROR="):]), 400)
         if line.startswith("NEH_RESULT="):
             return json.loads(line[len("NEH_RESULT="):])
     raise ManagerError("config_unavailable", "版本解释器没有返回完整配置结果。", 503)
@@ -284,7 +262,8 @@ class Runtime:
         self.state_path = home / "config/runtime.json"
 
     def port(self):
-        return read_json(self.manager_home / "config/settings.json", {}).get("gateway_port", 8766)
+        from scripts.module_installer.runtime import _CONFIG
+        return read_json(self.manager_home / "config/settings.json", {}).get("gateway_port", _CONFIG.schema_default("gateway.port"))
 
     def _components(self):
         with socket.socket(socket.AF_UNIX) as connection:
@@ -341,11 +320,10 @@ class Runtime:
     def start(self, prefix):
         if self.status()["running"]:
             raise ManagerError("already_running", "业务拥有方已运行，拒绝并行创建。", 409)
-        from scripts.module_installer.runtime import _VALUES
-        values = _VALUES.configuration_values(root=prefix / "source", environment={
-            "NUWAX_MANAGED_HOME": str(self.home), "NUWAX_ROBOT_PROFILE_MODE": "1"})
-        if str(values.get("NUWAX_REAL_LCM_REQUIRED", "")).lower() in ("true", "1", "yes", "on") and Path("/usr/local/libexec/neh-system-helper").is_file():
-            system_helper("prepare-network", {"url": values.get("NUWAX_LCM_URL", "udpm://239.255.76.67:7667?ttl=0")})
+        from scripts.module_installer.runtime import _CONFIG
+        values = _CONFIG.ConfigStore(self.home, prefix / "source", self.port()).effective()
+        if values["transport"]["real_lcm_required"] and Path("/usr/local/libexec/neh-system-helper").is_file():
+            system_helper("prepare-network", {"url": values["transport"]["lcm_url"]})
         log_path = self.home / "logs/runtime.log"
         descriptor = os.open(str(log_path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
         with os.fdopen(descriptor, "ab") as log:

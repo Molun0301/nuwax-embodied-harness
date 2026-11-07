@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import argparse
+from functools import lru_cache
+import io
+import urllib.request
+import zipfile
 import gzip
 import json
 import os
@@ -19,9 +23,11 @@ from .common import atomic_json, digest_file
 
 SOURCE_DIRECTORIES = ("scripts/device_manager", "scripts/module_installer")
 SOURCE_FILES = (
-    "scripts/__init__.py", "core/config_values.py", "core/config_catalog.json",
+    "scripts/__init__.py", "core/config.py", "core/config_schema.toml", "core/robot_geometry.py",
+    "contracts/pgo_options.py", "contracts/pgo_options.json", "contracts/pointlio_options.py", "contracts/pointlio_options.json", "scripts/import_legacy_config.py",
+    "drivers/go2/robot_geometry.urdf", "drivers/go2/robot_geometry_reference.json",
     "services/navigation/proto/motion_guard_socket_relative.txt",
-    "core/config_descriptions.json", "scripts/neh_bootstrap.py", "scripts/neh_system_helper.py",
+    "scripts/neh_bootstrap.py", "scripts/neh_system_helper.py",
     "scripts/neh_source.py", "scripts/neh_source_build.py", "scripts/go2_dependencies.py",
     "scripts/neh_prebuilt.py",
     "scripts/systemd/check_lcm_multicast.sh",
@@ -30,7 +36,7 @@ REQUIRED_FILES = (
     "scripts/device_manager/__main__.py", "scripts/device_manager/static/index.html",
     "scripts/device_manager/common.py", "scripts/device_manager/source_package.py",
     "scripts/module_installer/catalog.py", "scripts/module_installer/builds.py",
-    "scripts/module_installer/manager.py", "core/config_values.py", "scripts/neh_bootstrap.py",
+    "scripts/module_installer/manager.py", "core/config.py", "core/config_schema.toml", "scripts/neh_bootstrap.py",
     "scripts/neh_system_helper.py", "scripts/neh_source.py", "scripts/neh_source_build.py",
     "scripts/go2_dependencies.py", "scripts/systemd/check_lcm_multicast.sh",
 )
@@ -90,6 +96,31 @@ def _pack(stage: Path, output: Path, manifest: dict) -> dict:
     return manifest
 
 
+@lru_cache(maxsize=2)
+def _toml_wheel(name, version):
+    """固定版本的纯 Python 依赖随管理归档交付，不依赖设备的 pip。"""
+    with urllib.request.urlopen("https://pypi.org/pypi/" + name + "/" + version + "/json", timeout=30) as response:
+        release = json.load(response)
+    wheel = next(item for item in release["urls"] if item["filename"].endswith("py3-none-any.whl"))
+    with urllib.request.urlopen(wheel["url"], timeout=30) as response:
+        return response.read()
+
+
+def _copy_toml_dependencies(stage):
+    for distribution, package, version in (("tomli", "tomli", "2.0.1"), ("tomli-w", "tomli_w", "1.0.0")):
+        with zipfile.ZipFile(io.BytesIO(_toml_wheel(distribution, version))) as wheel:
+            for entry in wheel.infolist():
+                path = Path(entry.filename)
+                if path.parent == Path(package) and path.suffix == ".py":
+                    target = stage / package / path.name
+                elif path.name == "LICENSE":
+                    target = stage / package / "LICENSE"
+                else:
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(wheel.read(entry))
+
+
 def build_manager(root: Path, output: Path, *, version: str, workspace: bool = False) -> dict:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,95}", version):
         raise SourcePackageError("版本只允许字母、数字、点、下划线、加减号，最长96字符")
@@ -118,6 +149,7 @@ def build_manager(root: Path, output: Path, *, version: str, workspace: bool = F
         for relative in REQUIRED_FILES:
             if not (stage / relative).is_file():
                 raise SourcePackageError("管理包缺少运行文件：" + relative)
+        _copy_toml_dependencies(stage)
         initializer = stage / "scripts/device_manager/__init__.py"
         content, count = re.subn(
             r"^__version__\s*=\s*[^\n]+$", "__version__ = " + repr(version),

@@ -84,7 +84,7 @@ class MapCleanupService:
 
     def _tool(self, job: _Job, arguments: List[str], ctx: Optional[TaskContext] = None) -> None:
         self._check_cancelled(job, ctx)
-        environment = dict(os.environ, NUWAX_MAP_CATALOG_ROOT=str(self._map_root))
+        environment = dict(os.environ)
         process = None
         try:
             # 错误输出写入临时文件，避免管道写满阻塞工具；退出后完整读取真实原因。

@@ -864,7 +864,7 @@ def build_data_stream_router(runtime: Platform, access_manager: GatewayAccessMan
             })
         video_available = False
         if VideoShmReader is not None:
-            _shm_path = os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
+            _shm_path = "/tmp/nuwax_video.shm"
             _probe = VideoShmReader(_shm_path)
             video_available = _probe.has_new_frame()
             _probe.close()
@@ -885,7 +885,7 @@ def build_data_stream_router(runtime: Platform, access_manager: GatewayAccessMan
         frame_interval_sec = 1.0 / min(max(requested_fps, 1.0), 60.0) if requested_fps else 0.0
 
         async def frame_generator():
-            shm_path = os.environ.get("NUWAX_VIDEO_SHM_PATH", "/tmp/nuwax_video.shm")
+            shm_path = "/tmp/nuwax_video.shm"
             attached = _SHARED_MJPEG_SOURCE.acquire(shm_path, camera_id=source_camera_id)
             last_sent_sequence = -1
             next_frame_at = 0.0

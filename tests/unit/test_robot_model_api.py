@@ -219,7 +219,9 @@ def test_config_change_refreshes_navigation_geometry(model_runtime):
 
 
 def make_go2_bridge():
-    bridge = Go2DirectDdsBridge(Go2DataPlaneConfig())
+    configuration = Go2DataPlaneConfig()
+    configuration.direct_dds.point_cloud_enabled = False
+    bridge = Go2DirectDdsBridge(configuration)
     bridge._started = bridge._direct_dds_started = True
     bridge._active_generation = 1
     bridge._direct_dds_stop_event = threading.Event()
@@ -365,7 +367,9 @@ def test_go2_reads_lowstate_and_closes_subscription(monkeypatch):
     modules = {"ChannelFactoryInitialize": lambda *args: None, "ChannelSubscriber": Subscriber,
                "SportModeState": object, "LowState": object}
     monkeypatch.setattr(data_plane, "_load_go2_official_sdk_modules", lambda *args, **kwargs: modules)
-    bridge = Go2DirectDdsBridge(Go2DataPlaneConfig())
+    configuration = Go2DataPlaneConfig()
+    configuration.direct_dds.point_cloud_enabled = False
+    bridge = Go2DirectDdsBridge(configuration)
     try:
         bridge.start()
         deadline = time.monotonic() + 1

@@ -60,7 +60,7 @@ class Streams:
         self._telemetry_stop = threading.Event()
         self._telemetry_thread = None
         self._running = False
-        self._cloud_reader = CloudMapMmapReader(os.environ.get("NUWAX_CLOUDMAP_SHM_PATH"))
+        self._cloud_reader = CloudMapMmapReader()
         self._cloud_lock = threading.Lock()
         self._cloud_wake = threading.Event()
         self._cloud_thread = None

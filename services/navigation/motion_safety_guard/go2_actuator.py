@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from core.config_values import runtime_value
+from core.config import value
 
 from dataclasses import dataclass
 import importlib
@@ -113,7 +113,7 @@ def _load_sdk_factories() -> Go2Factories:
     def subscribe_motion_state(callback):
         # 只读运动状态，与原写入端共用已经初始化的DDS域；仅保留最新消息。
         subscriber = channel_module.ChannelSubscriber(
-            runtime_value("GO2_DIRECT_DDS_POSE_TOPIC", "rt/sportmodestate"),
+            value('go2.direct_dds_pose_topic'),
             state_module.SportModeState_,
         )
         try:
@@ -238,10 +238,8 @@ class Go2Actuator:
         self._feedback_closed = False
         self._feedback_supported = factories.motion_state_subscriber is not None
         self._motion_controller = None
-        self._feedback_frame = runtime_value("NUWAX_BASE_FRAME", "").strip() or "base_link"
-        self._feedback_source_id = "unitree_sdk2py:" + runtime_value(
-            "GO2_DIRECT_DDS_POSE_TOPIC", "rt/sportmodestate"
-        )
+        self._feedback_frame = value('robot.base_frame').strip() or "base_link"
+        self._feedback_source_id = "unitree_sdk2py:" + value('go2.direct_dds_pose_topic')
         self._motion_state_subscriber = (
             factories.motion_state_subscriber(self._observe_motion_state)
             if factories.motion_state_subscriber is not None else None
@@ -339,23 +337,20 @@ class Go2Actuator:
 
     @classmethod
     def from_environment(cls) -> "Go2Actuator":
-        backend = runtime_value("NUWAX_MOTION_GUARD_BACKEND", "").strip()
+        backend = value('motion_guard.backend').strip()
         if backend != "unitree_sdk2py":
             raise ActuatorError(
                 "BACKEND_NOT_PRODUCTION",
-                "NUWAX_MOTION_GUARD_BACKEND must be unitree_sdk2py",
+                "motion_guard.backend must be unitree_sdk2py",
             )
         try:
-            timeout = float(runtime_value("GO2_OFFICIAL_CLIENT_TIMEOUT_SEC", "3.0"))
+            timeout = float(value('go2.official_client_timeout_sec'))
             max_linear = float(
-                runtime_value("GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS", "1.0")
+                value('go2.official_max_linear_velocity_mps')
             )
-            max_yaw = float(runtime_value("GO2_OFFICIAL_MAX_YAW_RATE_RPS", "0.8"))
+            max_yaw = float(value('go2.official_max_yaw_rate_rps'))
             yaw_deadband = float(
-                runtime_value(
-                    "GO2_OFFICIAL_YAW_RATE_DEADBAND_RPS",
-                    "0.003490658503988659",
-                )
+                value('go2.official_yaw_rate_deadband_rps')
             )
         except ValueError as exc:
             raise ActuatorError(
@@ -363,9 +358,9 @@ class Go2Actuator:
                 "Go2 actuator numeric settings must contain valid numbers",
             ) from exc
         positive_limits = {
-            "GO2_OFFICIAL_CLIENT_TIMEOUT_SEC": timeout,
-            "GO2_OFFICIAL_MAX_LINEAR_VELOCITY_MPS": max_linear,
-            "GO2_OFFICIAL_MAX_YAW_RATE_RPS": max_yaw,
+            "go2.official_client_timeout_sec": timeout,
+            "go2.official_max_linear_velocity_mps": max_linear,
+            "go2.official_max_yaw_rate_rps": max_yaw,
         }
         invalid = [
             name
@@ -384,12 +379,12 @@ class Go2Actuator:
         ):
             raise ActuatorError(
                 "ACTUATOR_CONFIG_INVALID",
-                "GO2_OFFICIAL_YAW_RATE_DEADBAND_RPS must be finite, non-negative, "
-                "and less than GO2_OFFICIAL_MAX_YAW_RATE_RPS",
+                "go2.official_yaw_rate_deadband_rps must be finite, non-negative, "
+                "and less than go2.official_max_yaw_rate_rps",
             )
         iface = (
-            runtime_value("GO2_DATA_PLANE_DDS_IFACE", "").strip()
-            or runtime_value("GO2_DDS_IFACE", "").strip()
+            value('go2.data_plane_dds_iface').strip()
+            or value('go2.dds_iface').strip()
             or None
         )
         return cls(

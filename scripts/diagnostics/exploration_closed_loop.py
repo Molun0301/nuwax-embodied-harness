@@ -27,63 +27,42 @@ def configure(output, calibrated_motion=False, pipeline="lio_3d", calibrated_obs
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     env = {
-        "NUWAX_NAV_CAPABILITIES_JSON": "",
-        "NUWAX_GEOMETRY_RUNTIME_BINARY": os.environ.get("NUWAX_GEOMETRY_RUNTIME_BINARY") or str(
-            ROOT / "services/geometry/nuwax_geometry_runtime/target/release/nuwax-geometry-runtime"
-        ),
-        "NUWAX_GEOMETRY_RUNTIME_READY_FILE": str(working / "geometry.ready"),
-        "NUWAX_GEOMETRY_RUNTIME_PORT": str(port),
-        "NUWAX_GEOMETRY_LIO_BACKEND": "device",
-        "NUWAX_GEOMETRY_PIPELINE": "lio_3d",
-        "NUWAX_GEOMETRY_MAPPING_BACKEND": "raytracing",
-        "NUWAX_GEOMETRY_CORRECTION_BACKEND": "none",
-        "NUWAX_GEOMETRY_LIDAR_FRAME": "sim_lidar",
-        "NUWAX_GEOMETRY_IMU_FRAME": "sim_lidar",
-        "NUWAX_BASE_FRAME": "sim_body",
-        "NUWAX_MAP_FRAME": "map",
-        "NUWAX_MAP_FRAME": "map",
-        "NUWAX_GEOMETRY_ODOM_FRAME": "odom",
-        "NUWAX_GEOMETRY_LIO_BODY_FROM_SENSOR": json.dumps(
+        'navigation.capabilities_json': "",
+        'geometry.runtime_port': port,
+        'geometry.lio_backend': "device",
+        'geometry.pipeline': "lio_3d",
+        'geometry.mapping_backend': "raytracing",
+        'geometry.correction_backend': "none",
+        'robot.lidar_frame': "sim_lidar",
+        'robot.base_frame': "sim_body",
+        'robot.map_frame': "map",
+        'robot.odom_frame': "odom",
+        'geometry.lio_body_from_sensor': json.dumps(
             {"translation_m": [0, 0, 0], "rotation_row_major": [1, 0, 0, 0, 1, 0, 0, 0, 1]}
         ),
-        "NUWAX_GEOMETRY_LIO_BODY_FROM_IMU": json.dumps(
+        'geometry.lio_body_from_imu': json.dumps(
             {"translation_m": [0, 0, 0], "rotation_row_major": [1, 0, 0, 0, 1, 0, 0, 0, 1]}
         ),
-        "NUWAX_NAV_PROFILE": "pct-scan-3d",
-        # 数值来自下方合成场景：地面0米、机体基准0.35米，不作为实机标定。
-        "NUWAX_NAV_SURFACE_VOXEL_SIZE_M": "0.1",
-        "NUWAX_ROBOT_MODEL_PATH": "",
-        "NUWAX_ROBOT_LENGTH_M": "0.3",
-        "NUWAX_ROBOT_WIDTH_M": "0.3",
-        "NUWAX_ROBOT_HEIGHT_M": "0.3",
-        "NUWAX_NAV_STACK_BINARY": os.environ.get("NUWAX_NAV_STACK_BINARY") or str(ROOT / "services/nuwax-workspace/target/release/nuwax-nav-stack"),
-        "NUWAX_PYTHON_BIN": sys.executable,
-        "NUWAX_NAV_STACK_READY_FILE": str(working / "nav.ready"),
-        "NUWAX_MOTION_GUARD_SOCKET": str(working / "guard.sock"),
-        "NUWAX_LCM_BACKEND": "real-lcm",
-        "NUWAX_REAL_LCM_REQUIRED": "true",
-        "NUWAX_LCM_URL": "udpm://239.255.76.67:%d?ttl=0" % (20000 + port % 20000),
-        "NUWAX_FORBIDDEN_ZONES_PATH": str(working / "forbidden_zones.json"),
-        "NUWAX_CLOUDMAP_SHM_PATH": str(working / "cloud.shm"),
-        "NUWAX_OCCUPANCY_SHM_PATH": str(working / "occupancy.shm"),
-        "NUWAX_VIDEO_SHM_PATH": str(working / "video.shm"),
-        "NUWAX_LOG_DIR": str(output / "组件日志"),
-        "NUWAX_LOG_FILE": str(output / "组件日志/网关.log"),
-        "NUWAX_LOG_LEVEL": "INFO",
-        "NUWAX_INSTALL_HOME":str(working/"supervision"),
-        "NUWAX_MAP_CATALOG_ROOT":str(output/"地图"),
-        "RUST_LOG": "info,nuwax_nav_stack::surface_chunks=debug",
-        "NUWAX_MAPPING_RESOLUTION": ".1",
-        "NUWAX_MAPPING_RAYTRACING_VOXEL_SIZE": ".05",
-        "NUWAX_MAPPING_RAYTRACING_RAY_SUBSAMPLE": "1",
-        "NUWAX_MAPPING_WIDTH_CELLS": "70",
-        "NUWAX_MAPPING_HEIGHT_CELLS": "70",
-        "NUWAX_MAPPING_ORIGIN_X": "-3.5",
-        "NUWAX_MAPPING_ORIGIN_Y": "-3.5",
-        "NUWAX_MAPPING_INITIAL_SAFE_RADIUS_METERS": "0",
+        'navigation.surface_voxel_size_m': 0.1,
+        'robot.model_path': "",
+        'robot.length_m': 0.3,
+        'robot.width_m': 0.3,
+        'robot.height_m': 0.3,
+        'transport.real_lcm_required': True,
+        'transport.lcm_url': "udpm://239.255.76.67:%d?ttl=0" % (20000 + port % 20000),
+        'logging.dir': str(output / "组件日志"),
+        'logging.file': str(output / "组件日志/网关.log"),
+        'logging.level': "INFO",
+        'NUWAX_INSTALL_HOME': str(working/"supervision"),
+        'geometry.map_catalog_root': str(output/"地图"),
+        'RUST_LOG': "info,nuwax_nav_stack::surface_chunks=debug",
+        'geometry.mapping_resolution': 0.1,
+        'geometry.mapping_raytracing_voxel_size': 0.05,
+        'geometry.mapping_raytracing_ray_subsample': 1,
+        'geometry.mapping_initial_safe_radius_meters': 0.0
     }
     if calibrated_motion:
-        env["NUWAX_NAV_CAPABILITIES_JSON"] = json.dumps({
+        env["navigation.capabilities_json"] = json.dumps({
             "schema_version": 1, "calibration_id": "synthetic-delayed-drive-v1",
             "motion": {
                 "model": "differential", "max_forward_mps": 0.55,
@@ -97,7 +76,7 @@ def configure(output, calibrated_motion=False, pipeline="lio_3d", calibrated_obs
     if calibrated_observation:
         if not calibrated_motion:
             raise ValueError("观察仿真要求同时启用运动标定")
-        profile = json.loads(env["NUWAX_NAV_CAPABILITIES_JSON"])
+        profile = json.loads(env["navigation.capabilities_json"])
         profile["observation"] = {
             "kind": "planar" if pipeline == "slam_2d" else "volume", "min_range_m": 0.05,
             "max_range_m": 2.8 if pipeline == "slam_2d" else 1.6, "horizontal_fov_rad": math.tau,
@@ -106,32 +85,35 @@ def configure(output, calibrated_motion=False, pipeline="lio_3d", calibrated_obs
             "sensor_translation_body_m": [0.0, 0.0, 0.0], "sensor_rotation_body_xyzw": [0.0, 0.0, 0.0, 1.0],
             "max_rays": 256,
         }
-        env["NUWAX_NAV_CAPABILITIES_JSON"] = json.dumps(profile)
+        env["navigation.capabilities_json"] = json.dumps(profile)
     if near_field:
         if pipeline != "lio_3d" or not calibrated_motion:
             raise ValueError("三维近场验证需要完整三维链和显式运动标定")
-        profile = json.loads(env["NUWAX_NAV_CAPABILITIES_JSON"])
+        profile = json.loads(env["navigation.capabilities_json"])
         profile["terrain"] = {
             "max_step_up_m": 0.0, "max_step_down_m": 0.0,
             "min_tread_depth_m": 0.2, "max_slope_deg": 5.0, "max_cross_slope_deg": 5.0,
             "support_height_uncertainty_m": 0.0, "max_observation_age_sec": 1.0,
             "stairs_supported": False,
         }
-        env["NUWAX_NAV_CAPABILITIES_JSON"] = json.dumps(profile)
+        env["navigation.capabilities_json"] = json.dumps(profile)
     if pipeline == "slam_2d":
         env.update({
-            "NUWAX_GEOMETRY_PIPELINE": "slam_2d", "NUWAX_NAV_PROFILE": "simple-2d",
-            "NUWAX_GEOMETRY_MAPPING_BACKEND": "voxel",
-            "NUWAX_GEOMETRY_SLAM2D_BINARY": os.environ.get("NUWAX_GEOMETRY_SLAM2D_BINARY") or str(ROOT / "services/nuwax-workspace/target/release/nuwax-slam-2d-worker"),
-            "NUWAX_GEOMETRY_SLAM2D_CONFIG": json.dumps({
+        'geometry.pipeline': "slam_2d",
+        'geometry.mapping_backend': "voxel",
+        'geometry.slam2d_config': json.dumps({
                 "sensor_id": "sim_laser", "frame_id": "sim_lidar", "map_frame_id": "map",
                 "odom_frame_id": "odom", "body_frame_id": "sim_body", "clock_domain": "unix_ns",
                 "clock_id": "", "calibration_ref": "sim-planar-calibration", "odometry_source": "device",
                 "core_config": {"base_from_laser": [0.0, 0.0, 0.0]},
             }),
-            "LD_LIBRARY_PATH": str(ROOT / "runtime_data/build_dependencies/slam_toolbox/sysroot/usr/lib/x86_64-linux-gnu") + ":" + os.environ.get("LD_LIBRARY_PATH", ""),
-        })
-    os.environ.update(env)
+        'LD_LIBRARY_PATH': str(ROOT / "runtime_data/build_dependencies/slam_toolbox/sysroot/usr/lib/x86_64-linux-gnu") + ":" + os.environ.get("LD_LIBRARY_PATH", "")
+    })
+    from core.config import ConfigStore, specifications
+    store = ConfigStore(Path(env['NUWAX_INSTALL_HOME']))
+    store.write_profile('探索诊断', {key: value for key, value in env.items() if key in specifications()})
+    store.activate('探索诊断')
+    os.environ.update({key: value for key, value in env.items() if key not in specifications()})
     return working, port
 
 
@@ -298,15 +280,19 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
 
     world = World()
     guard_core = MotionGuardCore(actuator=world)
+    from core.config import motion_guard_socket
     guard = MotionGuardUnixServer(
-        socket_path=working / "guard.sock", core=guard_core, socket_gid=os.getegid()
+        socket_path=motion_guard_socket(working / "supervision"), core=guard_core, socket_gid=os.getegid()
     )
-    config = load_config()
+    from core.config import config_snapshot, read_config, binary_path, motion_guard_socket
+    configuration_values = read_config()
+    with config_snapshot(configuration_values):
+        config = load_config()
     config.base_dir=output
     config.robot.active_robot = "customrobot"
     config.geometry.enabled = True
     config.geometry.mapping.profile_enabled = True
-    config.geometry.external.binary_path = os.environ["NUWAX_GEOMETRY_RUNTIME_BINARY"]
+    config.geometry.external.binary_path = binary_path("nuwax-geometry-runtime")
     config.geometry.external.port = port
     config.runtime_data.map_catalog_root = str(output / "地图")
     config.runtime_data.memory_embedding_model = "lexical-only"
@@ -320,7 +306,7 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
         configure_runtime(config, world)
     robot = create_customrobot_assembly(config)
     robot.providers = SimulatedProviders()
-    with patch("gateways.platform.create_active_robot_assembly",return_value=robot):runtime=build_platform(config)
+    with config_snapshot(configuration_values), patch("gateways.platform.create_active_robot_assembly",return_value=robot):runtime=build_platform(config)
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen(128)
@@ -455,7 +441,7 @@ def run(output, timeout, scenario="complete", max_goals=None, calibrated_motion=
             cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         processes.append(process)
         deadline = time.monotonic() + 60
-        while not all((working / name).exists() for name in ("geometry.ready.runtime", "nav.ready.runtime")):
+        while not all((working / "supervision/runtime_data" / name).exists() for name in ("geometry/nuwax_geometry_runtime.ready.runtime", "navigation/nuwax_nav_stack.ready.runtime")):
             if process.poll() is not None or time.monotonic() > deadline:
                 raise RuntimeError("组件启动失败，请查看业务监督者日志")
             time.sleep(0.05)

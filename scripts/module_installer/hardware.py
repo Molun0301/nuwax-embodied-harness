@@ -255,7 +255,7 @@ def recommend_modules(hardware: HardwareInfo, existing_env: Optional[Mapping[str
     env = existing_env or {}
     reasons = []
     warnings = []
-    robot = str(env.get("NUWAX_ACTIVE_ROBOT", "")).strip().lower()
+    robot = str(env.get("robot.driver", "")).strip().lower()
     if robot not in ROBOT_REQUIREMENTS:
         robot = "customrobot"
         reasons.append("未发现明确机器人配置，使用通用标准数据接入；计算板型号不能证明机器人型号。")
@@ -269,23 +269,23 @@ def recommend_modules(hardware: HardwareInfo, existing_env: Optional[Mapping[str
         return Recommendation(modules, robot, tuple(reasons), tuple(warnings))
     selected = {"core"}
     reasons.append("基础网关始终安装，不安装本地推理模型也可运行。")
-    geometry_configured = _enabled(env, "NUWAX_GEOMETRY_ENABLED")
+    geometry_configured = _enabled(env, "geometry.enabled")
     # 仅参数模板中的话题名不能证明设备在线；主动保存的启用开关作为用户已有意图。
     if geometry_configured:
         if hardware.memory_bytes >= 4 * GIB and hardware.cpu_count >= 2:
             selected.add("geometry")
             reasons.append("已有几何启用配置，且可用资源上限满足保守推荐条件。")
-            backend = str(env.get("NUWAX_GEOMETRY_LIO_BACKEND", "")).strip().lower()
+            backend = str(env.get("geometry.lio_backend", "")).strip().lower()
             if backend in ("fastlio2", "pointlio"):
                 selected.add(backend)
                 reasons.append("沿用明确配置的定位后端：" + MODULES[backend].title)
             elif backend not in ("", "device", "disabled", "none"):
-                warnings.append("现有定位后端无法对应安装模块，请检查 NUWAX_GEOMETRY_LIO_BACKEND。")
+                warnings.append("现有定位后端无法对应安装模块，请检查 geometry.lio_backend。")
         else:
             warnings.append("已有几何配置，但资源较少或未知，默认先装基础网关；仍可手动选择几何模块。")
     else:
         reasons.append("未发现明确几何启用配置，不推测雷达存在或自动安装定位算法。")
-    visual_configured = _enabled(env, "NUWAX_PERCEPTION_YOLO_WORLD_ENABLED")
+    visual_configured = _enabled(env, "perception.yolo_world_enabled")
     sufficient_visual = hardware.memory_bytes >= 8 * GIB and hardware.cpu_count >= 4
     if (visual_configured or hardware.camera_detected) and sufficient_visual:
         selected.add("perception")

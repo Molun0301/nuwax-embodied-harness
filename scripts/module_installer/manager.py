@@ -24,7 +24,7 @@ from scripts.neh_system_helper import dependency_plan
 
 from .builds import build_modules, describe_builds, prune_build_cache
 from .catalog import ROBOT_REQUIREMENTS, module_imports, module_requirements, module_system_packages, resolve_modules
-from .runtime import read_existing, read_settings, write_profile, write_runtime, _VALUES
+from .runtime import read_existing, read_settings, write_profile, write_runtime, _CONFIG
 
 # Increment when dependency preparation changes without a requirements change.
 DEPENDENCY_RECIPE_VERSION = 1
@@ -75,8 +75,8 @@ def read_current(home: Path) -> dict:
     return state
 
 
-def existing_config(root: Path, current: Mapping) -> dict:
-    return read_existing(root)
+def existing_config(root: Path, current: Mapping, home=None) -> dict:
+    return read_existing(root, home or current.get("deployment", {}).get("install_home", root))
 
 
 def choose_python(requested: str = "") -> str:
@@ -424,12 +424,12 @@ def _python_environment(request: InstallRequest, hardware, prefix: Path, seed: s
     run([python, "-c", "import importlib; [importlib.import_module(n) for n in " + repr(list(module_imports(request.modules, request.robot))) + "]"])
 
 
-def _prepare_models(request: InstallRequest, prefix: Path, run) -> None:
+def _prepare_models(request: InstallRequest, prefix: Path, run, values) -> None:
     python = str(prefix / "venv/bin/python")
-    output = request.root / "runtime_data/models"
-    values = read_settings(prefix / "settings.env")
+    output = request.home / "data/models"
+    values = _CONFIG.flatten(_CONFIG.resolve_paths(_CONFIG.nested(values), request.home))
     if "perception" in request.modules:
-        configured = Path(values["NUWAX_PERCEPTION_YOLO_WORLD_MODEL"])
+        configured = Path(values["perception.yolo_world_model"])
         target = configured if configured.is_absolute() else request.root / configured
         if not target.is_file():
             if target.resolve() != (output / "yolov8s-worldv2.pt").resolve():
@@ -442,7 +442,7 @@ def _prepare_models(request: InstallRequest, prefix: Path, run) -> None:
     if "memory" in request.modules:
         arguments = []
         for kind, directory in (("text", "BAAI__bge-small-zh-v1.5"), ("image", "openai__clip-vit-base-patch32")):
-            configured = Path(values[f"NUWAX_MEMORY_{kind.upper()}_EMBEDDING_MODEL"])
+            configured = Path(values[f"memory.{kind}_embedding_model"])
             target = configured if configured.is_absolute() else request.root / configured
             if target.resolve() != (output / directory).resolve():
                 if not target.is_dir():
@@ -456,7 +456,7 @@ def _prepare_models(request: InstallRequest, prefix: Path, run) -> None:
 
 
 def _verify_prefix(prefix: Path, modules: Sequence[str]) -> None:
-    needed = ["venv/bin/python", "start.sh", "settings.env"]
+    needed = ["venv/bin/python", "start.sh"]
     if "geometry" in modules:
         needed += ["bin/nuwax-geometry-runtime", "bin/nuwax-mapping-cli"]
     if "navigation" in modules:
@@ -539,11 +539,11 @@ def apply(request: InstallRequest, hardware) -> dict:
             print(f"[3/5] 构建所选组件（并行 {request.jobs}）", flush=True)
             binaries = build_modules(request.root, prefix, request.home / "cache", request.modules, request.jobs, run)
             print("[4/5] 准备所选模型和启动配置", flush=True)
-            configuration = existing_config(request.root, current)
+            configuration = existing_config(request.root, current, request.home)
             if request.lio_backend:
-                configuration["NUWAX_GEOMETRY_LIO_BACKEND"] = request.lio_backend
-            write_runtime(request.root, prefix, request.modules, request.robot, configuration)
-            _prepare_models(request, prefix, run)
+                configuration["geometry.lio_backend"] = request.lio_backend
+            values = write_runtime(request.root, prefix, request.modules, request.robot, configuration)
+            _prepare_models(request, prefix, run, values)
             _verify_prefix(prefix, request.modules)
             print("[5/5] 校验完成，切换当前安装", flush=True)
             state = {"schema": 1, "complete": True, "modules": list(request.modules),
@@ -551,8 +551,9 @@ def apply(request: InstallRequest, hardware) -> dict:
                      "python": seed, "binaries": binaries, "installed_at": identifier}
             if service_name is None:
                 service_name = "neh-install-" + str(uuid.uuid4()) + ".service"
-            location = _VALUES.configuration_location(root=request.root, environment={}, robot=request.robot)
-            write_profile(prefix, location["path"].parent, location["profile"], request.root / "runtime_data/settings")
+            selector = request.home / "config/active_profile"
+            name = selector.read_text().strip() if selector.exists() else "default"
+            write_profile(request.home, name, values, request.root)
             state["deployment"] = deployment_descriptor(request.root, request.home, prefix, request.modules,
                                                         request.robot, mode, service_name=service_name)
             atomic_write(prefix / "manifest.json", (json.dumps(state, ensure_ascii=False, indent=2) + "\n").encode("utf-8"), mode=0o600)
@@ -569,9 +570,9 @@ def apply(request: InstallRequest, hardware) -> dict:
         if previous and not request.keep_previous:
             # 默认数据在安装目录之外；用户自行放进旧代际的数据同样不能删。
             references = []
-            for key, value in read_settings(prefix / "settings.env").items():
-                path = Path(value)
-                if value and path.is_absolute() and (path.resolve() == previous or previous in path.resolve().parents):
+            for key, value in values.items():
+                path = Path(value) if isinstance(value, str) else Path()
+                if value and isinstance(value, str) and path.is_absolute() and (path.resolve() == previous or previous in path.resolve().parents):
                     references.append(key)
             if references:
                 print("新安装已生效；旧目录仍被自定义配置引用，已保留：" + "、".join(references))

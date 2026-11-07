@@ -31,3 +31,7 @@ psutil==7.2.2
 # Focal/aarch64 does not provide python3-lcm; build the pinned binding in the
 # release venv against the system liblcm-dev package.
 lcm==1.5.2
+
+# 统一配置读写，兼容 Python 3.8。
+tomli==2.0.1; python_version < "3.11"
+tomli-w==1.0.0

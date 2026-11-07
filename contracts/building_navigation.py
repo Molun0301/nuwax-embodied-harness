@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import json
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 
 
 @dataclass(frozen=True)
@@ -107,11 +107,11 @@ class FacilitySnapshot:
 
 
 class FacilityProviderConfig(BaseModel):
-    """设施桥连接配置；认证值从指定环境变量取得。"""
+    """设施桥连接配置；authorization 保存请求所用的认证值。"""
     model_config = ConfigDict(extra="forbid")
     type: Literal["http"] = "http"
     base_url: str
-    authorization_env: Optional[str] = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    authorization: Optional[str] = None
 
     @field_validator("base_url")
     @classmethod

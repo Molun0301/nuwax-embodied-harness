@@ -17,6 +17,15 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# 独立离线入口先准备自己的合成配置，不读取本机安装。
+if __name__ == "__main__":
+    from core.config import ConfigStore
+    _configuration_directory = TemporaryDirectory(prefix="d1-offline-config-")
+    os.environ["NUWAX_INSTALL_HOME"] = _configuration_directory.name
+    _store = ConfigStore(_configuration_directory.name)
+    _store.create("离线")
+    _store.activate("离线")
+
 from fastapi.testclient import TestClient
 
 from core.settings import load_config
@@ -145,9 +154,11 @@ def run(output_dir):
                         else:
                             raise RuntimeError("离线夹具未提供组件：" + name)
 
-                with patch.dict("os.environ", {"NUWAX_MOTION_GUARD_SOCKET": socket_path,
-                    "NUWAX_CLOUDMAP_SHM_PATH": str(output_dir / "unpublished-cloud.mmap"),
-                    "NUWAX_VIDEO_SHM_PATH": str(output_dir / "unpublished-video.mmap")}), \
+                from services.geometry.pointcloud_map import CloudMapMmapReader
+                from gateways.streams import VideoSource
+                with patch("gateways.platform.motion_guard_socket", lambda _home: socket_path), \
+                    patch("gateways.streams.CloudMapMmapReader", lambda: CloudMapMmapReader(str(output_dir / "unpublished-cloud.mmap"))), \
+                    patch("gateways.streams.VideoSource", lambda _path, provider, frame: VideoSource(str(output_dir / "unpublished-video.mmap"), provider, frame)), \
                     patch("core.components.ensure", ensure), patch("core.components.status", lambda: states):
                     platform = build_platform(config)
                     with TestClient(create_gateway_app(platform, config)) as client:

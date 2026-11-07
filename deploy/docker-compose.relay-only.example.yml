@@ -7,6 +7,7 @@ services:
     working_dir: /workspace/nuwax_robot_bridge
     volumes:
       - ../:/workspace/nuwax_robot_bridge:ro
+      - ${NUWAX_INSTALL_HOME}/run:/neh/run:ro
     command:
       - python
       - -m
@@ -20,10 +21,5 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
-      NUWAX_RELAY_ENABLED: "true"
-      NUWAX_RELAY_HOST: "0.0.0.0"
-      NUWAX_RELAY_PORT: "9766"
-      NUWAX_RELAY_UPSTREAM_BASE_URL: "http://host.docker.internal:8766"
-      NUWAX_RELAY_INCOMING_TOKENS: "${NUWAX_RELAY_TOKEN}"
-      NUWAX_RELAY_UPSTREAM_TOKEN: "${NUWAX_GATEWAY_AGENT_TOKEN}"
+      NUWAX_INSTALL_HOME: /neh
     restart: unless-stopped

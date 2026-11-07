@@ -5,7 +5,7 @@ import json
 import math
 from pathlib import Path
 
-PGO_OPTIONS_ENV = "NUWAX_GEOMETRY_PGO_OPTIONS"
+PGO_OPTIONS_KEY = "geometry.pgo_options"
 _SCHEMA = json.loads(Path(__file__).with_suffix(".json").read_text(encoding="utf-8"))
 
 

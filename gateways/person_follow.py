@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from core.config_values import runtime_value
+from core.config import value
 
 from dataclasses import dataclass, replace
 import math
@@ -461,9 +461,9 @@ class GatewayPersonFollowBridge:
     def __init__(self, *, lcm_url: Optional[str] = None, target_channel: Optional[str] = None,
                  command_channel: Optional[str] = None, lcm_factory=_default_lcm_factory,
                  poll_timeout_ms: int = 20) -> None:
-        self.lcm_url = lcm_url or runtime_value("NUWAX_LCM_URL") or DEFAULT_LCM_URL
-        self.target_channel = target_channel or runtime_value("NUWAX_PERSON_FOLLOW_TARGET_CHANNEL") or DEFAULT_PERSON_FOLLOW_TARGET_CHANNEL
-        self.command_channel = command_channel or runtime_value("NUWAX_PERSON_FOLLOW_COMMAND_CHANNEL") or DEFAULT_PERSON_FOLLOW_COMMAND_CHANNEL
+        self.lcm_url = lcm_url or value('transport.lcm_url') or DEFAULT_LCM_URL
+        self.target_channel = target_channel or DEFAULT_PERSON_FOLLOW_TARGET_CHANNEL or DEFAULT_PERSON_FOLLOW_TARGET_CHANNEL
+        self.command_channel = command_channel or DEFAULT_PERSON_FOLLOW_COMMAND_CHANNEL or DEFAULT_PERSON_FOLLOW_COMMAND_CHANNEL
         if self.command_channel in _FORBIDDEN_COMMAND_CHANNELS:
             raise PersonFollowBridgeError("跟随速度必须使用独立 LCM 通道。")
         self._target_channel = _typed_channel(self.target_channel, _TARGET_TYPE)

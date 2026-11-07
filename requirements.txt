@@ -66,3 +66,7 @@ ultralytics==8.4.33
 # 在 Jetson(L4T) / 树莓派 / 香橙派(Armbian) 的 aarch64 与 x86 上行为一致；
 # PyPI 提供 cp36-abi3 预编译 wheel，命中实机 Python 3.8.10，无需现场编译。
 psutil==7.2.2
+
+# 统一配置读写，兼容 Python 3.8。
+tomli==2.0.1; python_version < "3.11"
+tomli-w==1.0.0

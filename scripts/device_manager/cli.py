@@ -154,9 +154,9 @@ def parser():
     password.add_argument("--stdin", action="store_true", help="逐行读取当前密码和新密码；未设密码时只读新密码")
     password.add_argument("--disable", action="store_true")
     config = sub.add_parser("config")
-    config.add_argument("--file", help="JSON对象，支持{values:{...},revision:...}")
+    config.add_argument("--file", help="JSON对象，支持{values:{...},profile:...}")
     config.add_argument("--set", nargs=2, action="append", metavar=("KEY", "VALUE"))
-    config.add_argument("--revision")
+    config.add_argument("--profile")
     sub.add_parser("wizard", help="交互安装向导；全部步骤仍走共享计划与任务")
     worker = sub.add_parser("_worker", help=argparse.SUPPRESS)
     worker.add_argument("job_id")
@@ -212,10 +212,15 @@ def main(argv=None):
         elif command == "config":
             if args.file or args.set:
                 request = load_file(args.file) if args.file else {"values": dict(args.set or [])}
-                revision = request.get("revision", args.revision)
-                if revision is None:
-                    revision = engine.config().get("revision")
-                result = engine.save_config(request.get("values", request), revision)
+                profile = request.get("profile", args.profile)
+                if args.set:
+                    from scripts.module_installer.runtime import _CONFIG
+                    specs = _CONFIG.specifications()
+                    for key, raw in request["values"].items():
+                        spec = specs[key]
+                        if spec["type"] != "string" and raw not in spec.get("special_values", ()):
+                            request["values"][key] = json.loads(raw)
+                result = engine.save_config(request.get("values", request), profile)
             else:
                 result = engine.config()
         elif command == "wizard":

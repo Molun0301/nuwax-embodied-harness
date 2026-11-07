@@ -355,14 +355,13 @@ def create_gateway_app_from_env() -> FastAPI:
 
 
 def create_relay_app_from_env() -> FastAPI:
-    """按环境配置创建容器内边车转发器。"""
-
-    config = load_config()
-    configure_logging(config.logging)
-    APP_LOGGER.info(
-        "容器 relay 应用已创建 upstream=%s listen=%s:%s",
-        config.relay.upstream_base_url,
-        config.relay.host,
-        config.relay.port,
-    )
-    return create_relay_app(config.relay)
+    """从同一合成文件的中继段与公共日志段创建容器转发器。"""
+    from core.config import runtime_config
+    from core.settings import LoggingConfig, RelayServerConfig
+    values = runtime_config()
+    relay = RelayServerConfig(**dict(values["relay"], incoming_tokens=tuple(values["relay"]["incoming_tokens"])))
+    logs = values["logging"]
+    configure_logging(LoggingConfig(log_dir=logs["dir"], log_file=logs["file"], level=logs["level"],
+                                   format=logs["format"], max_bytes=logs["max_bytes"], backup_count=logs["backup_count"]))
+    APP_LOGGER.info("容器中继已创建 upstream=%s listen=%s:%s", relay.upstream_base_url, relay.host, relay.port)
+    return create_relay_app(relay)

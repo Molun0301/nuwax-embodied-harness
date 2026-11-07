@@ -4,7 +4,7 @@ import time
 from typing import Optional
 
 from contracts.motion_feedback import MotionExecutionFeedback
-from core.config_values import runtime_value
+from core.config import value
 from core.source_time import SourceTimeError, acquired_times
 from .go2_actuator import ActuatorError
 
@@ -19,7 +19,7 @@ class ExecutionFeedback:
 
     @classmethod
     def from_environment(cls):
-        return cls(frame_id=runtime_value("NUWAX_BASE_FRAME", "").strip() or "base_link")
+        return cls(frame_id=value('robot.base_frame').strip() or "base_link")
 
     def feedback(self, actuator) -> Optional[MotionExecutionFeedback]:
         getter = getattr(actuator, "get_motion_execution_feedback", None)

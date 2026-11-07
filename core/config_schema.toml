@@ -1770,6 +1770,7 @@ apply = "restart"
 [navigation.facility_providers_json]
 type = "string"
 default = "{}"
+sensitive = true
 description = "楼层切换设施的提供者配置，使用 JSON（结构化文本）对象。"
 consumers = ["网关 · gateways/platform.py:build_platform"]
 apply = "restart"

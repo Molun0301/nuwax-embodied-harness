@@ -44,14 +44,26 @@ class MotionControlActuator:
         return self._control.is_available()
 
     def velocity(self, vx: float, vy: float, wz: float) -> bool:
+        scale = 1.0
+        limits = self.get_motion_command_limits()
+        if limits is not None:
+            (a, b), (c, d) = limits.command_from_input_rotation
+            # 轴限属于设备命令帧；统一缩放输入才能同时保持旋转与杆臂项的比例。
+            command_x = a * vx + b * vy + limits.input_origin_in_command_y_m * wz
+            command_y = c * vx + d * vy - limits.input_origin_in_command_x_m * wz
+            for command, limit in ((command_x, limits.max_linear_x_mps),
+                                   (command_y, limits.max_linear_y_mps),
+                                   (wz, limits.max_angular_z_rps)):
+                if command:
+                    scale = min(scale, limit / abs(command))
         try:
             self._control.send_twist(Twist(
                 frame_id=self._frame_id,
-                linear=Vector3(x=vx, y=vy), angular=Vector3(z=wz),
+                linear=Vector3(x=vx * scale, y=vy * scale), angular=Vector3(z=wz * scale),
             ))
         except Exception as exc:
             raise ActuatorError("ACTUATOR_COMMAND_FAILED", str(exc)) from exc
-        return False
+        return scale < 1.0
 
     def body_pose(self, roll: float, pitch: float, yaw: float) -> None:
         raise ActuatorError("UNSUPPORTED_OPERATION", "标准运动接口不提供厂商机身姿态。")

@@ -210,7 +210,8 @@ def derived_values(values, code_root=CODE_ROOT):
     else:
         linear, yaw, model = 0.0, 0.0, ""
     geometry = resolve_robot_geometry(RobotGeometryConfig.from_values(robot),
-                                      robot_name=robot["driver"], base_dir=code_root)
+                                      robot_name=values["unitree_sim"]["model"] if robot["driver"] == "unitree_sim" else robot["driver"],
+                                      base_dir=code_root)
     return {"nav_profile": profile, "actuator_max_linear_mps": float(linear),
             "actuator_max_yaw_rps": float(yaw), "actuator_motion_model": model if profile == "pct-scan-3d" else "",
             "robot_geometry_json": geometry.to_runtime_json()}

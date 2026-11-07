@@ -1,7 +1,6 @@
 """设备公开的速度指令策略；不表示实测运动能力或制动标定。"""
 from __future__ import annotations
 
-import math
 import sys
 from typing import Optional, Tuple
 
@@ -36,29 +35,6 @@ class MotionCommandLimits(ContractModel):
                abs(a * b + c * d), abs(a * d - b * c - 1.0)) > 1e-6:
             raise ValueError("命令坐标变换必须是右手平面旋转。")
         return rotation
-
-    def validate_velocity(self, vx: float, vy: float, vyaw: float) -> None:
-        """调用与目录共用原设备策略；超限不通过静默截断改变用户指令。"""
-        if not all(math.isfinite(value) for value in (vx, vy, vyaw)):
-            raise ValueError("速度必须为有限数值。")
-        (a, b), (c, d) = self.command_from_input_rotation
-        command_x = a * vx + b * vy + self.input_origin_in_command_y_m * vyaw
-        command_y = c * vx + d * vy - self.input_origin_in_command_x_m * vyaw
-        for name, value, limit in (
-            ("vx", command_x, self.max_linear_x_mps),
-            ("vy", command_y, self.max_linear_y_mps),
-            ("vyaw", vyaw, self.max_angular_z_rps),
-        ):
-            if not math.isfinite(value) or (
-                abs(value) > limit and not math.isclose(abs(value), limit, rel_tol=self.rounding_relative_tolerance, abs_tol=0.0)
-            ):
-                raise ValueError(f"转换到设备命令帧 {self.limit_frame_id} 后，{name} 必须在允许范围 [{-limit:g}, {limit:g}] 内。")
-        if self.max_planar_speed_mps is not None:
-            planar = math.hypot(command_x, command_y)
-            if planar > self.max_planar_speed_mps and not math.isclose(
-                planar, self.max_planar_speed_mps, rel_tol=self.rounding_relative_tolerance, abs_tol=0.0,
-            ):
-                raise ValueError(f"设备命令帧平面合速度不得超过 {self.max_planar_speed_mps:g} 米/秒。")
 
     def description(self) -> str:
         """目录给设备约束和使用语义，不把投影边界当成独立可组合范围。"""

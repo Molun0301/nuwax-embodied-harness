@@ -179,7 +179,6 @@ class Device:
             if not self.is_available() or limits is None or twist.frame_id != self.frame_id:
                 raise RuntimeError('设备运动反馈或命令参考帧尚不可用。')
             vx, vy, wz = twist.linear.x, twist.linear.y, twist.angular.z
-            limits.validate_velocity(vx, vy, wz)
             (a, b), (c, d) = limits.command_from_input_rotation
             params = dict(vx=a * vx + b * vy + limits.input_origin_in_command_y_m * wz,
                           vy=c * vx + d * vy - limits.input_origin_in_command_x_m * wz,

@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
 
+from core.config import value
 from core.robot_geometry import RobotGeometryError, resolve_robot_geometry
 from core.robot_kinematics import RobotKinematicsError
 from core.robot_visual import RobotVisualAssetStore, RobotVisualError
@@ -95,12 +96,13 @@ class RobotModelView:
             except (RobotVisualError, RobotGeometryError, OSError, ValueError) as exc:
                 geometry = {"error": str(exc)}
             return None, problem, geometry
-        key = (repr(config), robot.active_robot, problem["message"])
+        robot_name = value('unitree_sim.model') if robot.active_robot == 'unitree_sim' else robot.active_robot
+        key = (repr(config), robot_name, problem["message"])
         with self._lock:
             if key != self._geometry_key:
                 try:
                     self._geometry = resolve_robot_geometry(
-                        config, robot_name=robot.active_robot, base_dir=self.base_dir,
+                        config, robot_name=robot_name, base_dir=self.base_dir,
                     ).to_runtime_dict()
                 except (RobotGeometryError, OSError) as exc:
                     self._geometry = {"error": str(exc)}

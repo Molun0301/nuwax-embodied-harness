@@ -22,7 +22,7 @@ class EventDecoder:
         kind, payload = event['type'], event['payload']
         if kind in ('imu', 'lidar'):
             registration = payload['registration']
-            common = dict(sensor_id=payload.get('sensor_id', event['frame_id']),
+            common = dict(sensor_id=payload['sensor_id'],
                           source_sequence=event['sequence'], clock_domain='unix_ns',
                           clock_id=payload['clock_id'], frame_id=registration['frame_id'],
                           registration_state=registration['state'], registration_frame_id=registration['frame_id'],
@@ -58,7 +58,7 @@ class EventDecoder:
 
     def image(self, event):
         payload = event['payload']
-        identity = payload.get('camera_id', 'front_camera')
+        identity = payload['camera_id']
         intrinsic = payload['intrinsics']
         stamp = source_timestamp(payload, event['sim_time_ns'])
         when = utc(stamp)

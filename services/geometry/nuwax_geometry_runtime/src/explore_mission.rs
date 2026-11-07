@@ -23,46 +23,19 @@ pub(crate) fn pose3(pose: &MissionPose) -> Pose3 {
 #[derive(Clone)]
 pub(crate) struct MissionCalibration {
     pub planar: SimplePlannerConfig,
-    pub maximum_sample_speed_mps: f64,
 }
 impl MissionCalibration {
     pub fn capture(
-        surface: Option<&SurfaceNavigationConfig>,
         caps: Option<&NavigationCapabilities>,
         geometry: &RobotGeometry,
     ) -> Result<Self, String> {
-        let caps = caps.ok_or("返航行程统计需要导航运动标定")?;
-        let planar_speed = caps
-            .motion
-            .max_forward_mps
-            .max(caps.motion.max_reverse_mps)
-            .hypot(caps.motion.max_lateral_mps);
-        let mut maximum_sample_speed_mps = planar_speed;
-        if let Some(config) = surface {
-            let terrain = caps
-                .terrain
-                .as_ref()
-                .ok_or("三维返航行程需要地形运动标定")?;
-            // 计入纵横坡、踏面起伏与支撑偏移的转动速度，供拒绝坐标跳变使用。
-            let gradient = terrain
-                .max_slope_deg
-                .to_radians()
-                .tan()
-                .hypot(terrain.max_cross_slope_deg.to_radians().tan())
-                .max(
-                    terrain.max_step_up_m.max(terrain.max_step_down_m)
-                        / terrain.min_tread_depth_m.max(1e-6),
-                );
-            maximum_sample_speed_mps = planar_speed * (1.0 + gradient * gradient).sqrt()
-                + caps.motion.max_angular_rps * config.follower.body_to_support_z_m;
-        }
+        let caps = caps.ok_or("返航需要导航运动标定")?;
         Ok(Self {
             planar: SimplePlannerConfig {
                 robot_geometry: Some(geometry.clone()),
                 motion_limits: Some(caps.motion.clone()),
                 ..Default::default()
             },
-            maximum_sample_speed_mps,
         })
     }
 }

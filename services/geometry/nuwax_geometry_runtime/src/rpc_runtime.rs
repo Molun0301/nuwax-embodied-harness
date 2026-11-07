@@ -42,7 +42,8 @@ impl Handler {
         let read = tokio::task::spawn_blocking(move || root.repository.read_object_range(
             ObjectIdentity::Assigned(ObjectId(request.object_id)), MAX_BLOCK_BYTES,
             request.offset, MAX_BLOCK_TRANSFER_PART_BYTES,
-        )).await.map_err(|_| missing())?.map_err(|_| missing())?;
+        )).await.map_err(|_| missing())?.map_err(|error|
+            Status::not_found(format!("地图块已被新修订替换或地图已切换：{error}")))?;
         let ObjectRangeRead::Data { bytes, total_bytes } = read else {
             return Err(Status::invalid_argument("地图块偏移超出范围"));
         };

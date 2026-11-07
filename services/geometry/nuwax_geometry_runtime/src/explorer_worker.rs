@@ -177,7 +177,9 @@ impl Worker {
         mapper: &Mapper,
         pose: &watch::Receiver<Option<Pose>>,
     ) -> Result<ExplorerTick, String> {
-        mapper.forbidden_status()?;
+        if let Err(reason) = mapper.forbidden_status() {
+            return self.explorer.tick(None, None, Err(reason.clone()), Err(reason));
+        }
         let sealed = mapper.surface_map().await?;
         let surface = match sealed {
             Some(sealed) => match crate::explorer::fresh(sealed.manifest().source_timestamp_ns, 2_000_000_000) {
@@ -198,6 +200,39 @@ impl Worker {
             },
             None => Err("等待曲面快照：尚未生成，来源年龄未知".into()),
         };
-        self.explorer.tick(pose.borrow().clone(), mapper.occupancy(true), surface)
+        self.explorer.tick(pose.borrow().clone(), mapper.occupancy(true), surface, Ok(()))
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn forbidden_read_failure_stays_running_and_recovers_after_a_valid_array() {
+    let root = std::env::temp_dir().join(format!("e7b-worker-forbidden-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("forbidden_zones.json");
+    std::fs::write(&path, b"invalid").unwrap();
+    let mapper = Mapper::start(922, MapperConfig::default()).unwrap();
+    let reason = mapper.set_forbidden_zones(path.clone()).await.unwrap_err();
+    let (entered, _) = oneshot::channel();
+    let (_release, released) = channel::channel();
+    let explorer = crate::explorer::tests::blocking_fixture(entered, released);
+    let mut worker = Worker { explorer, surface_cache: None, masked_surface_cache: None };
+    let (_, pose) = watch::channel(None);
+    for _ in 0..2 {
+        let waiting = worker.tick(&mapper, &pose).await.unwrap();
+        assert_eq!(waiting.status.phase, ExplorationPhase::Running as i32);
+        assert!(waiting.status.message.contains(&reason));
+        assert!(waiting.goal.is_none() && waiting.cancel_goal.is_none());
+    }
+    std::fs::write(&path, b"[]").unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while mapper.forbidden_status().is_err() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.unwrap();
+    let recovered = worker.tick(&mapper, &pose).await.unwrap();
+    assert_eq!(recovered.status.phase, ExplorationPhase::Running as i32);
+    assert!(recovered.status.message.contains("等待地图位姿"));
+    mapper.shutdown().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
 }

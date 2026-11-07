@@ -1845,17 +1845,6 @@ consumers = [
 ]
 apply = "restart"
 
-[geometry.raw_scan_queue_frames]
-type = "integer"
-min = 1
-max = 256
-default = 16
-description = "辅助扫描后台写队列的容量（帧）。队列满时丢弃本次提交并标记离线数据不完整。"
-consumers = [
-    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.raw_scan_queue_frames",
-]
-apply = "restart"
-
 [geometry.raw_scan_rotation_deg]
 type = "float"
 min = 0.0

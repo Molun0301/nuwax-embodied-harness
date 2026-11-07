@@ -66,6 +66,8 @@ pub(crate) struct CloudMap {
     dense_snapshot: Option<DenseSnapshot>,
     shm: Option<CloudMapShmWriter>,
     logs: std::collections::BTreeMap<String, nuwax_cloud_cleanup::scan_log::ScanLog>,
+    last_recorded: std::collections::BTreeMap<String, nuwax_cloud_cleanup::scan_log::ScanMetadata>,
+    save_policy: nuwax_cloud_cleanup::scan_log::SavePolicy,
     poses: Vec<(u64, [f64; 16])>,
     recording: bool,
     raw_directory: Option<PathBuf>,
@@ -161,6 +163,8 @@ impl CloudMap {
             dense_snapshot,
             shm,
             logs: Default::default(),
+            last_recorded: Default::default(),
+            save_policy: nuwax_cloud_cleanup::scan_log::SavePolicy::from_runtime()?,
             poses: Vec::new(),
             recording: true,
             raw_directory: None,
@@ -272,6 +276,20 @@ impl CloudMap {
         transform: Isometry3<f64>,
     ) -> Result<(), String> {
         use nuwax_cloud_cleanup::scan_log::{ScanLog, ScanMetadata, Session};
+        let metadata = ScanMetadata {
+            source_timestamp_ns: frame.odom_pose.timestamp_ns,
+            source_sequence: sequence,
+            sensor: frame.sensor_id.clone(),
+            source_generation: 1,
+            odom_from_body: isometry_matrix(&pose_isometry(&frame.odom_pose)),
+            map_from_odom: isometry_matrix(&transform),
+            sensor_origin_body: Some(frame.ray_origin_body.map(|v| v as f32)),
+            observation_minimum_range_m: Some(
+                crate::dynamic_backend::online_params().min_range as f64,
+            ),
+            point_count: frame.points_body.len(),
+        };
+        let selected = self.save_policy.selects(self.last_recorded.get(&frame.sensor_id), &metadata);
         if self.raw_directory.is_none() {
             self.raw_directory = Some(
                 nuwax_cloud_cleanup::scan_log::scan_directory()
@@ -295,26 +313,19 @@ impl CloudMap {
                 )?,
             );
         }
-        let metadata = ScanMetadata {
-            source_timestamp_ns: frame.odom_pose.timestamp_ns,
-            source_sequence: sequence,
-            sensor: frame.sensor_id.clone(),
-            source_generation: 1,
-            odom_from_body: isometry_matrix(&pose_isometry(&frame.odom_pose)),
-            map_from_odom: isometry_matrix(&transform),
-            sensor_origin_body: Some(frame.ray_origin_body.map(|v| v as f32)),
-            observation_minimum_range_m: Some(
-                crate::dynamic_backend::online_params().min_range as f64,
-            ),
-            point_count: frame.points_body.len(),
-        };
         let log = self.logs.get_mut(&frame.sensor_id).unwrap();
-        log.append(
-            &metadata,
-            frame.points_body.iter().map(|p| p.map(|v| v as f32)),
-            None,
-        )?;
-        log.progress(frame.odom_pose.timestamp_ns, 0)
+        if selected {
+            log.append(
+                &metadata,
+                frame.points_body.iter().map(|p| p.map(|v| v as f32)),
+                None,
+            )?;
+        }
+        log.progress(frame.odom_pose.timestamp_ns, 0)?;
+        if selected {
+            self.last_recorded.insert(frame.sensor_id.clone(), metadata);
+        }
+        Ok(())
     }
     pub fn commit(&mut self, stamp: u64) -> Result<(), String> {
         if !self.dirty || self.stamp == 0 || stamp == 0 {
@@ -479,6 +490,7 @@ impl CloudMap {
                 .snapshot(self.stamp, self.revision, &self.session_id.to_string());
         self.shm = previous.shm.take();
         self.logs = std::mem::take(&mut previous.logs);
+        self.last_recorded = std::mem::take(&mut previous.last_recorded);
         self.raw_directory = previous.raw_directory.take();
         self.recording = previous.recording;
         self.history_scans = std::mem::take(&mut previous.history_scans);

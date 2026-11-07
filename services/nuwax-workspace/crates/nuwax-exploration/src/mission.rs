@@ -109,9 +109,9 @@ pub struct MissionProgress {
     pub travelled_m: f64,
     /// 已决定返航时恢复继续返航，不再挑新前沿。
     pub returning: bool,
-    /// 运行期采样不进入持久资产，避免重启间隙或新坐标代际被算为行走。
+    /// 运行期采样不进入持久资产，避免重启间隙被算为行走。
     #[serde(skip)]
-    last_sample: Option<(u64, u64, [f64; 3])>,
+    last_sample: Option<(u64, [f64; 3])>,
 }
 impl MissionProgress {
     /// 第一张有效规范位姿冻结任务起点。
@@ -136,29 +136,15 @@ impl MissionProgress {
         }
         Ok(())
     }
-    /// 实际采样按源序推进；过期重复不增加行程，坐标跳变需要上层先重新对账。
+    /// 按源时间累加相邻位姿的距离，重复和倒序样本不增加行程。
     pub fn observe(
         &mut self,
         pose: &MissionPose,
         source_ns: u64,
-        frame_generation: u64,
-        max_speed_mps: f64,
-    ) -> Result<(), String> {
-        self.validate()?;
-        pose.validate()?;
-        if source_ns == 0
-            || frame_generation == 0
-            || !max_speed_mps.is_finite()
-            || max_speed_mps <= 0.0
-        {
-            return Err("探索行程缺少有效来源、代际或速度上界".into());
-        }
-        if let Some((previous_ns, previous_frame, previous)) = self.last_sample {
-            if previous_frame != frame_generation {
-                return Err("探索坐标代际变化，须核对起点和进度后恢复".into());
-            }
+    ) {
+        if let Some((previous_ns, previous)) = self.last_sample {
             if source_ns <= previous_ns {
-                return Ok(());
+                return;
             }
             let distance = previous
                 .iter()
@@ -166,17 +152,9 @@ impl MissionProgress {
                 .map(|(a, b)| (a - b).powi(2))
                 .sum::<f64>()
                 .sqrt();
-            // 一厘米只吸收位置量化；实际速度上界仍来自明确标定。
-            if distance > max_speed_mps * (source_ns - previous_ns) as f64 * 1e-9 + 0.01 {
-                return Err("规范位姿变化超过标定运动上界，不能记为实际行程".into());
-            }
-            if self.travelled_m + distance > 1_000_000.0 {
-                return Err("累计探索行程超出预算".into());
-            }
             self.travelled_m += distance;
         }
-        self.last_sample = Some((source_ns, frame_generation, pose.position));
-        Ok(())
+        self.last_sample = Some((source_ns, pose.position));
     }
 }
 
@@ -203,29 +181,20 @@ mod tests {
         assert!(policy.should_return(5.0, f64::INFINITY).is_err());
     }
     #[test]
-    fn actual_height_counts_but_replayed_pose_and_frame_jump_do_not() {
+    fn adjacent_positions_count_height_and_jumps_but_not_replayed_samples() {
         let mut state = MissionProgress::new(pose(0.0, 0.0)).unwrap();
-        state
-            .observe(&pose(0.0, 0.0), 1_000_000_000, 1, 2.0)
-            .unwrap();
-        state
-            .observe(&pose(0.0, 1.0), 2_000_000_000, 1, 2.0)
-            .unwrap();
-        state
-            .observe(&pose(0.0, 5.0), 1_000_000_000, 1, 2.0)
-            .unwrap();
+        state.observe(&pose(0.0, 0.0), 1_000_000_000);
+        state.observe(&pose(0.0, 1.0), 2_000_000_000);
+        state.observe(&pose(0.0, 5.0), 1_000_000_000);
+        state.observe(&pose(0.0, 5.0), 2_000_000_000);
         assert_eq!(state.travelled_m, 1.0);
-        assert!(state
-            .observe(&pose(10.0, 1.0), 3_000_000_000, 2, 2.0)
-            .is_err());
-        assert!(state
-            .observe(&pose(10.0, 1.0), 3_000_000_000, 1, 2.0)
-            .is_err());
-        assert_eq!(state.travelled_m, 1.0);
-        state
-            .observe(&pose(1.0, 1.0), 3_000_000_000, 1, 2.0)
-            .unwrap();
-        assert_eq!(state.travelled_m, 2.0);
+        state.observe(&pose(10.0, 1.0), 3_000_000_000);
+        assert_eq!(state.travelled_m, 11.0);
+        state.observe(&pose(11.0, 1.0), 4_000_000_000);
+        assert_eq!(state.travelled_m, 12.0);
         assert_eq!(state.home, pose(0.0, 0.0));
+        let mut restored: MissionProgress = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        restored.observe(&pose(100.0, 0.0), 5_000_000_000);
+        assert_eq!(restored.travelled_m, 12.0, "恢复后的首帧不累计离线间隔");
     }
 }

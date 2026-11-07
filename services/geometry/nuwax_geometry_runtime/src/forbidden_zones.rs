@@ -16,7 +16,6 @@ pub enum ZoneShape {
     Line,
     Rectangle,
     Circle,
-    #[serde(alias = "custom")]
     Polygon,
 }
 
@@ -34,13 +33,13 @@ pub struct ForbiddenZone {
     pub mode: ZoneMode,
     #[serde(default = "default_frame_id")]
     pub frame_id: String,
-    #[serde(default, alias = "points")]
+    #[serde(default)]
     pub vertices: Vec<ZonePoint>,
     #[serde(default)]
     pub center: Option<ZonePoint>,
     #[serde(default)]
     pub radius_m: Option<f64>,
-    #[serde(default, alias = "line_width_m")]
+    #[serde(default)]
     pub stroke_width_m: Option<f64>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -48,11 +47,6 @@ pub struct ForbiddenZone {
     pub metadata: serde_json::Value,
 }
 
-#[derive(Deserialize)]
-struct Document {
-    #[serde(default)]
-    zones: Vec<ForbiddenZone>,
-}
 #[derive(Clone)]
 struct MapState {
     width: u32,
@@ -78,19 +72,19 @@ pub fn read(path: &Path) -> Result<Vec<ForbiddenZone>, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(format!("禁行区读取失败：{error}")),
     };
-    let document: Document =
+    let zones: Vec<ForbiddenZone> =
         serde_json::from_slice(&bytes).map_err(|e| format!("禁行区格式无效：{e}"))?;
-    if document.zones.len() > MAX_ZONES {
+    if zones.len() > MAX_ZONES {
         return Err("禁行区数量超过上限".into());
     }
     let mut ids = HashSet::new();
-    for zone in &document.zones {
+    for zone in &zones {
         validate_zone(zone)?;
         if !ids.insert(&zone.id) {
             return Err("禁行区编号重复".into());
         }
     }
-    Ok(document.zones)
+    Ok(zones)
 }
 pub(crate) fn overlay_zones(
     zones: &[ForbiddenZone],

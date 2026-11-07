@@ -6,14 +6,14 @@ use std::sync::{
     Arc, Mutex,
 };
 
-struct Capture {
-    published: Mutex<Vec<RawLcmFrame>>,
+pub(crate) struct Capture {
+    pub(crate) published: Mutex<Vec<RawLcmFrame>>,
     tx: Mutex<Option<tokio::sync::broadcast::Sender<Result<RawLcmFrame, String>>>>,
     fail_goal_publication: AtomicBool,
     goal_publish_attempts: AtomicUsize,
 }
 impl Capture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let (tx, _) = tokio::sync::broadcast::channel(32);
         Self {
             published: Mutex::new(Vec::new()),
@@ -29,12 +29,15 @@ impl Capture {
         self.inject_ready_generation(id, 17);
     }
     fn inject_ready_generation(&self, id: &str, runtime_generation: i64) {
+        self.inject_status(id, runtime_generation, schema::NAVIGATION_GOAL_STATUS_PLANNING);
+    }
+    pub(crate) fn inject_status(&self, id: &str, runtime_generation: i64, goal_status: i32) {
         let now = unix_ns() as i64;
         let state = schema::NavigationStatus {
             session_id: id.into(),
             runtime_generation,
             state: 1,
-            goal_status: schema::NAVIGATION_GOAL_STATUS_PLANNING,
+            goal_status,
             input_ready: true,
             sink_ready: 1,
             planner_map_frame: "map".into(),
@@ -57,7 +60,7 @@ impl Capture {
             .send(Ok(frame))
             .unwrap();
     }
-    fn goals(&self) -> Vec<RawLcmFrame> {
+    pub(crate) fn goals(&self) -> Vec<RawLcmFrame> {
         self.published
             .lock()
             .unwrap()

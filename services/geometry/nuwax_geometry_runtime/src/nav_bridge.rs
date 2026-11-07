@@ -452,4 +452,4 @@ fn unix_ns() -> u64 {
 
 #[cfg(test)]
 #[path = "nav_bridge_tests.rs"]
-mod tests;
+pub(crate) mod tests;

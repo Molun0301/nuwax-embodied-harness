@@ -831,7 +831,7 @@ impl Session {
             return Err(Status::failed_precondition("未定位"));
         }
         self.stop_explorer().await?;
-        self.replace_navigation().await?;
+        self.replace_navigation();
         let mapper = self.mapper()?;
         self.nav.set_input_ready(Err("当前导航输入尚未就绪，来源年龄未知".into()));
         let id = uuid::Uuid::new_v4().to_string();
@@ -859,16 +859,15 @@ impl Session {
         self.nav.set_input_ready(self.navigation_input_status(&mapper, true, refreshed));
         Ok(SetGoalResponse { goal_id: id })
     }
-    async fn replace_navigation(&mut self) -> Result<(), Status> {
-        if let Some(old) = self.state.navigation.as_ref() {
+    fn replace_navigation(&mut self) {
+        if let Some(old) = self.state.navigation.as_mut() {
             if !terminal(old.status) {
-                let id = old.goal_id.clone();
-                self.cancel(&id, GoalStatus::Replaced).await?;
-                self.state.navigation.as_mut().unwrap().message = "被新目标替换".into();
+                old.status = GoalStatus::Replaced as i32;
+                old.message = "被新目标替换".into();
+                old.planned_path.clear();
             }
             self.state.previous_navigation = self.state.navigation.clone();
         }
-        Ok(())
     }
     async fn cancel(&mut self, id: &str, status: GoalStatus) -> Result<(), Status> {
         if let Some(current) =
@@ -1009,10 +1008,7 @@ impl Session {
             let _ = self.cancel(&id, GoalStatus::Cancelled).await;
         }
         if let Some((id, goal)) = update.goal {
-            if let Err(error) = self.replace_navigation().await {
-                self.fail_exploration(error.message().into()).await;
-                return;
-            }
+            self.replace_navigation();
             self.state.navigation = Some(NavigationStatus {
                 goal_id: id.clone(),
                 status: GoalStatus::WaitingInput as i32,

@@ -229,7 +229,10 @@ async fn object_block_service_reads_unchanged_old_objects_and_reports_collected_
         .expect("已替换对象应经原有周期回收");
     let error = crate::rpc_runtime::test_block(mapper.clone(), collected).await.unwrap_err();
     assert_eq!(error.code(), tonic::Code::NotFound);
-    assert_eq!(error.message(), "地图块已被新修订替换或地图已切换");
+    let cause = current.repository.read_object_range(
+        collected, nuwax_map_chunks::MAX_BLOCK_BYTES, 0, nuwax_map_chunks::MAX_BLOCK_TRANSFER_PART_BYTES,
+    ).unwrap_err();
+    assert_eq!(error.message(), format!("地图块已被新修订替换或地图已切换：{cause}"));
     mapper.shutdown().await.unwrap();
 }
 
@@ -361,7 +364,7 @@ async fn forbidden_zone_refresh_changes_effective_map_but_preserves_raw_checkpoi
     mapper.set_forbidden_zones(path.clone()).await.unwrap();
     let mut maps = mapper.map_rx();
     maps.borrow_and_update();
-    std::fs::write(&path, r#"{"zones":[{"id":"区域","shape":"rectangle","mode":"inside","vertices":[{"x":1.2,"y":0.2},{"x":1.8,"y":0.8}]}]}"#).unwrap();
+    std::fs::write(&path, r#"[{"id":"区域","shape":"rectangle","mode":"inside","vertices":[{"x":1.2,"y":0.2},{"x":1.8,"y":0.8}]}]"#).unwrap();
     tokio::time::timeout(Duration::from_secs(2), maps.changed())
         .await
         .unwrap()
@@ -374,7 +377,7 @@ async fn forbidden_zone_refresh_changes_effective_map_but_preserves_raw_checkpoi
     assert_eq!(mapper.forbidden_status(), Ok(()));
     // 网关的原子替换必须同样触发刷新。
     let replacement = directory.0.join("replacement");
-    std::fs::write(&replacement, r#"{"zones":[]}"#).unwrap();
+    std::fs::write(&replacement, r#"[]"#).unwrap();
     maps.borrow_and_update();
     std::fs::rename(replacement, &path).unwrap();
     tokio::time::timeout(Duration::from_secs(2), maps.changed())
@@ -416,7 +419,7 @@ async fn malformed_document_fails_closed_and_recovers_on_file_change() {
     assert!(maps.borrow().is_none());
     assert_eq!(mapper.snapshot().await.unwrap().occupancy.unwrap(), raw);
     maps.borrow_and_update();
-    std::fs::write(&path, r#"{"zones":[]}"#).unwrap();
+    std::fs::write(&path, r#"[]"#).unwrap();
     tokio::time::timeout(Duration::from_secs(2), maps.changed())
         .await
         .unwrap()
@@ -432,8 +435,8 @@ async fn failed_forbidden_read_is_checked_again_with_unchanged_metadata() {
     let directory = TestDirectory::new();
     let source = directory.0.join("原图禁区.json");
     let target = directory.0.join("当前图禁区.json");
-    let valid = br#"{"zones":[]}"#;
-    let invalid = b"!\"zones\":[]}";
+    let valid = br#"[]"#;
+    let invalid = b"!\"";
     assert_eq!(valid.len(), invalid.len());
     std::fs::write(&source, valid).unwrap();
     let modified = std::fs::metadata(&source).unwrap().modified().unwrap();
@@ -552,8 +555,8 @@ async fn slow_worker_coalesces_frames_before_save_without_a_frame_backlog() {
     let observed_path = directory.0.join("forbidden_zones.json");
     tokio::task::spawn_blocking(move || {
         let mut writer = writer;
-        writer.write_all(br#"{"zones":[]}"#).unwrap();
-        std::fs::write(&regular_path, br#"{"zones":[]}"#).unwrap();
+        writer.write_all(br#"[]"#).unwrap();
+        std::fs::write(&regular_path, br#"[]"#).unwrap();
         std::fs::rename(regular_path, observed_path).unwrap();
     })
     .await
@@ -678,8 +681,8 @@ async fn forbidden_zone_poll_detects_two_writes_with_the_same_mtime() {
     maps.borrow_and_update();
 
     let modified = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-    let zone = r#"{"zones":[{"id":"左格","shape":"rectangle","mode":"inside","vertices":[{"x":0.2,"y":0.2},{"x":0.4,"y":0.4}]}]}"#;
-    let clear = r#"{"zones":[]}"#;
+    let zone = r#"[{"id":"左格","shape":"rectangle","mode":"inside","vertices":[{"x":0.2,"y":0.2},{"x":0.4,"y":0.4}]}]"#;
+    let clear = r#"[]"#;
     assert_ne!(zone.len(), clear.len());
     for (document, expected) in [(zone, vec![100, 0]), (clear, raw.data.clone())] {
         // 固定相同修改时间，强制第二次检查只能用长度变化触发重读。

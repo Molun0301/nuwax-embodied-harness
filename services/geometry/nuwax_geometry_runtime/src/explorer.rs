@@ -96,6 +96,7 @@ pub struct Explorer {
     motion_generation: u64,
     child: Option<Child>,
     reached_goals: u32,
+    frontier_count: u32,
     elapsed_before: Duration,
     started: Option<Instant>,
     no_frontier_since: Option<Instant>,
@@ -148,6 +149,7 @@ impl Explorer {
             motion_generation: 0,
             child: None,
             reached_goals: 0,
+            frontier_count: 0,
             elapsed_before: Duration::ZERO,
             started: None,
             no_frontier_since: None,
@@ -289,7 +291,7 @@ impl Explorer {
         let calibration = config
             .return_policy
             .enabled()
-            .then(|| MissionCalibration::capture(self.surface_config.as_ref(),self.capabilities.as_ref(),&self.robot_geometry))
+            .then(|| MissionCalibration::capture(self.capabilities.as_ref(),&self.robot_geometry))
             .transpose()
             .map_err(Status::failed_precondition)?;
         self.controller = controller;
@@ -298,6 +300,7 @@ impl Explorer {
         self.motion_generation = request.motion_generation;
         self.child = None;
         self.reached_goals = restored.as_ref().map_or(0, |p| p.reached_goals);
+        self.frontier_count = 0;
         self.elapsed_before = Duration::from_nanos(restored.as_ref().map_or(0, |p| p.elapsed_ns));
         self.mission = restored.as_ref().and_then(|p| p.mission.clone());
         self.return_reason = restored.and_then(|p| p.return_reason);
@@ -407,8 +410,9 @@ impl Explorer {
         pose: Option<proto::Pose>,
         grid: Option<proto::OccupancyGrid>,
         surface: Result<Arc<SurfaceSnapshot>, String>,
+        forbidden: Result<(), String>,
     ) -> Result<ExplorerTick, String> {
-        match self.tick_step(pose, grid, surface) {
+        match self.tick_step(pose, grid, surface, forbidden) {
             Ok(update) => Ok(update),
             Err(message) => {
                 self.fail_exploration(ExplorationStopReason::ConsecutiveFailuresExceeded, &message)
@@ -421,6 +425,7 @@ impl Explorer {
         pose: Option<proto::Pose>,
         grid: Option<proto::OccupancyGrid>,
         surface: Result<Arc<SurfaceSnapshot>, String>,
+        forbidden: Result<(), String>,
     ) -> Result<ExplorerTick, String> {
         if !self.controller.is_active() {
             return Ok(self.output("探索已结束", None, None));
@@ -453,6 +458,11 @@ impl Explorer {
             self.finish(reason)?;
             return Ok(self.output("达到探索停止条件", None, cancel));
         }
+        if let Err(reason) = forbidden {
+            self.no_frontier_since = None;
+            self.input_wait_since = None;
+            return Ok(self.output(&format!("等待禁行区输入：{reason}"), None, None));
+        }
         let Some(pose) = pose else {
             return self.wait_input("等待地图位姿：尚未收到，来源年龄未知");
         };
@@ -479,23 +489,10 @@ impl Explorer {
         self.input_wait_since = None;
         let robot = to_pose(&pose)?;
         let location = mission_pose(&pose)?;
-        if config.return_policy.enabled() {
-            if self.mission.is_none() {
-                self.mission = Some(MissionProgress::new(location.clone())?);
-            }
-            let maximum = self
-                .calibration
-                .as_ref()
-                .expect("返航标定")
-                .maximum_sample_speed_mps;
-            // Session 创建一个 Explorer 对应同一地图坐标，不再创建独立坐标代际。
-            self.mission.as_mut().expect("探索行程").observe(
-                &location,
-                pose.timestamp_ns,
-                1,
-                maximum,
-            )?;
+        if self.mission.is_none() {
+            self.mission = Some(MissionProgress::new(location.clone())?);
         }
+        self.mission.as_mut().expect("探索行程").observe(&location, pose.timestamp_ns);
         let grid = grid.as_ref().map(to_grid).transpose()?;
         let route = if config.return_policy.enabled() {
             Some(match (&surface, &self.surface_config) {
@@ -598,6 +595,9 @@ impl Explorer {
             .controller
             .poll_next_goal_with_deferred_stop(&snapshot, config.return_policy.enabled())
             .map_err(|e| e.to_string())?;
+        if matches!(poll, ExplorationPoll::Goal(_) | ExplorationPoll::NoFrontier) {
+            self.frontier_count = self.controller.frontier_snapshot().len() as u32;
+        }
         match poll {
             ExplorationPoll::Goal(frontier) => {
                 self.no_frontier_since = None;
@@ -795,7 +795,7 @@ impl Explorer {
             exploration_id: self.id.clone(),
             phase: phase as i32,
             message: message.into(),
-            frontier_count: self.controller.frontier_snapshot().len() as u32,
+            frontier_count: self.frontier_count,
             goals_completed: self.reached_goals,
             returning: self.mission.as_ref().is_some_and(|m| m.returning),
             traveled_distance_m: self.mission.as_ref().map_or(0.0, |m| m.travelled_m),

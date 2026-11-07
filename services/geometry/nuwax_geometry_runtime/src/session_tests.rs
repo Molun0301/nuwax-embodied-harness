@@ -158,7 +158,7 @@ async fn navigation_terminal_and_cancel_do_not_duplicate_previous_navigation() {
         })
         .await;
     assert!(session.state.previous_navigation.is_none());
-    session.replace_navigation().await.unwrap();
+    session.replace_navigation();
     assert_eq!(
         session.state.previous_navigation.as_ref().unwrap().goal_id,
         "当前"
@@ -372,10 +372,10 @@ async fn failed_navigation_submission_only_fails_goal_and_keeps_unsaved_map() {
     assert_eq!(session.phase(), SessionPhase::Mapping);
     assert_eq!(mapper.snapshot().await.unwrap().occupancy, baseline);
     session.state.navigation.as_mut().unwrap().status = GoalStatus::Executing as i32;
-    assert!(session.replace_navigation().await.is_err());
+    session.replace_navigation();
     assert_eq!(
         session.state.navigation.as_ref().unwrap().status,
-        GoalStatus::Failed as i32
+        GoalStatus::Replaced as i32
     );
     assert!(!session
         .state
@@ -720,4 +720,50 @@ async fn fault_saved_planar_map_rejects_navigation_while_unlocalized() {
     session.end_current().await.unwrap();
     session.nav.shutdown().await;
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn replacement_sends_new_goal_without_cancel_and_accepts_its_execution() {
+    use crate::nav_bridge::tests::Capture;
+    use nuwax_codec::lcm::schema;
+    let root = std::env::temp_dir().join(format!("e7b-replace-{}", uuid::Uuid::new_v4()));
+    let mapper = Mapper::start(921, MapperConfig::default()).unwrap();
+    let mut session = actor(mapper, root.clone()).await;
+    session.nav.shutdown().await;
+    let capture = Arc::new(Capture::new());
+    let (tx, mut updates) = mpsc::unbounded_channel();
+    session.nav = NavBridge::with_transport(nuwax_transport::LcmTransport::new(capture.clone()), tx).await.unwrap();
+    capture.published.lock().unwrap().clear();
+    session.state.navigation = Some(NavigationStatus {
+        goal_id: "旧目标".into(), status: GoalStatus::Executing as i32, ..Default::default()
+    });
+    let new = session.goal(NavigationGoal {
+        pose: Some(pose_from_isometry(nalgebra::Isometry3::translation(1., 0., 0.), "map", now_ns())),
+        motion_generation: 18, ..Default::default()
+    }).await.unwrap().goal_id;
+    let previous = session.state.previous_navigation.as_ref().unwrap();
+    assert_eq!(previous.goal_id, "旧目标");
+    assert_eq!(previous.status, GoalStatus::Replaced as i32);
+    assert_eq!(previous.message, "被新目标替换");
+    session.nav.set_input_ready(Ok(()));
+    capture.inject_status("", 17, schema::NAVIGATION_GOAL_STATUS_PLANNING);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let status = updates.recv().await.unwrap();
+            let planning = status.goal_id == new && status.status == GoalStatus::Planning as i32;
+            session.navigation(status).await;
+            if planning { break; }
+        }
+    }).await.unwrap();
+    assert_eq!(capture.goals().len(), 1);
+    capture.inject_status(&new, 17, schema::NAVIGATION_GOAL_STATUS_EXECUTING);
+    let executing = tokio::time::timeout(Duration::from_secs(1), updates.recv()).await.unwrap().unwrap();
+    session.navigation(executing).await;
+    assert_eq!(session.state.navigation.as_ref().unwrap().status, GoalStatus::Executing as i32);
+    assert!(capture.published.lock().unwrap().iter().all(|f| f.topic.channel() != "/nav/cancel"));
+    session.cancel(&new, GoalStatus::Cancelled).await.unwrap();
+    assert_eq!(capture.published.lock().unwrap().iter().filter(|f| f.topic.channel() == "/nav/cancel").count(), 1);
+    session.end_current().await.unwrap();
+    session.nav.shutdown().await;
+    if root.exists() { std::fs::remove_dir_all(root).unwrap(); }
 }

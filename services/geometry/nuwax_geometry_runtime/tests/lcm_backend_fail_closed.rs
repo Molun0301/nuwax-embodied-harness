@@ -827,7 +827,7 @@ async fn invalid_goal_intent_finishes_without_stranded_child() {
 }
 
 #[tokio::test]
-async fn malformed_forbidden_file_fails_exploration_without_faulting_session() {
+async fn malformed_forbidden_file_waits_without_ending_exploration_and_recovers() {
     let mut f = Fixture::start(false, false).await;
     f.saved_map("禁区错误").await;
     fs::write(f.root.join("maps/禁区错误/forbidden_zones.json"), "{错误").unwrap();
@@ -845,13 +845,26 @@ async fn malformed_forbidden_file_fails_exploration_without_faulting_session() {
         if state
             .exploration
             .as_ref()
-            .is_some_and(|s| s.phase == ExplorationPhase::Failed as i32)
+            .is_some_and(|s| s.message.contains("禁行区格式无效"))
         {
-            assert_eq!(state.phase, SessionPhase::Mapping as i32);
-            let reason = state.exploration.unwrap().message;
+            assert_eq!(state.phase, SessionPhase::Exploring as i32);
+            let exploration = state.exploration.unwrap();
+            assert_eq!(exploration.phase, ExplorationPhase::Running as i32);
+            let reason = exploration.message;
             assert!(reason.contains("禁行区格式无效"), "{reason}");
             break;
         }
+        assert!(start.elapsed() < Duration::from_secs(3));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    fs::write(f.root.join("maps/禁区错误/forbidden_zones.json"), b"[]").unwrap();
+    let start = tokio::time::Instant::now();
+    loop {
+        let state = f.state().await;
+        assert_eq!(state.phase, SessionPhase::Exploring as i32);
+        let exploration = state.exploration.unwrap();
+        assert_eq!(exploration.phase, ExplorationPhase::Running as i32);
+        if !exploration.message.contains("禁行区") { break; }
         assert!(start.elapsed() < Duration::from_secs(3));
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -917,7 +930,7 @@ async fn forbidden_file_errors_reach_the_goal_and_recover_on_the_next_check() {
     let mut maps = f.client.subscribe_map(Empty {}).await.unwrap().into_inner();
     fs::remove_dir(&path).unwrap();
     let replacement = path.with_extension("tmp");
-    fs::write(&replacement, br#"{"zones":[]}"#).unwrap();
+    fs::write(&replacement, br#"[]"#).unwrap();
     fs::rename(replacement, path).unwrap();
     let restored = tokio::time::timeout(Duration::from_secs(3), maps.message())
         .await

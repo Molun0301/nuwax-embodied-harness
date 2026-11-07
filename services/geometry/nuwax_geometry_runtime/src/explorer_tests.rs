@@ -59,7 +59,7 @@ fn grid() -> proto::OccupancyGrid {
 fn paused_progress_restores_source_history_and_counts_in_same_map() {
     let mut explorer = make_explorer("住宅".into(), "map".into(), false).unwrap();
     explorer.start("first".into(), request()).unwrap();
-    let tick = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into())).unwrap();
+    let tick = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
     let (goal_id, _) = tick.goal.expect("实际波前选择应产生探索目标");
     explorer
         .navigation_feedback(&proto::NavigationStatus {
@@ -93,7 +93,7 @@ fn paused_progress_restores_source_history_and_counts_in_same_map() {
 fn stopped_child_ends_exploration_and_duration_completion_cancels_child() {
     let mut explorer = make_explorer("住宅".into(), "map".into(), false).unwrap();
     explorer.start("mission".into(), request()).unwrap();
-    let tick = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into())).unwrap();
+    let tick = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
     let (id, _) = tick.goal.unwrap();
     explorer
         .navigation_feedback(&proto::NavigationStatus {
@@ -103,7 +103,7 @@ fn stopped_child_ends_exploration_and_duration_completion_cancels_child() {
         })
         .unwrap();
     assert_eq!(
-        explorer.tick(None, None, Err("曲面快照尚未生成，来源年龄未知".into())).unwrap().status.phase,
+        explorer.tick(None, None, Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap().status.phase,
         proto::ExplorationPhase::Stopped as i32
     );
     let mut next = request();
@@ -114,7 +114,7 @@ fn stopped_child_ends_exploration_and_duration_completion_cancels_child() {
     explorer.start("done".into(), next).unwrap();
     assert_eq!(
         explorer
-            .tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()))
+            .tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(()))
             .unwrap()
             .status
             .phase,
@@ -128,7 +128,7 @@ fn stale_pose_waits_and_fresh_pose_resumes_without_new_start() {
     explorer.start("recovery".into(), request()).unwrap();
     let mut old = pose();
     old.timestamp_ns = unix_ns() - 2_000_000_000;
-    let waiting = explorer.tick(Some(old), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into())).unwrap();
+    let waiting = explorer.tick(Some(old), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
     assert!(waiting.goal.is_none());
     assert!(waiting.status.message.contains("等待地图位姿"));
     assert!(waiting.status.message.contains("来源年龄="));
@@ -136,7 +136,7 @@ fn stale_pose_waits_and_fresh_pose_resumes_without_new_start() {
         waiting.status.phase,
         proto::ExplorationPhase::Running as i32
     );
-    let resumed = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into())).unwrap();
+    let resumed = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
     assert!(resumed.goal.is_some());
     assert_eq!(resumed.status.exploration_id, "recovery");
 }
@@ -211,9 +211,9 @@ fn feedback(explorer: &mut Explorer, id: String, status: proto::GoalStatus) {
 #[test]
 fn max_goals_waits_for_active_child_terminal_before_stopping() {
     let mut explorer = started_with_max_goals(1);
-    let first = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into())).unwrap();
+    let first = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
     let (id, _) = first.goal.unwrap();
-    let waiting = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into())).unwrap();
+    let waiting = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
     assert!(waiting.goal.is_none() && waiting.cancel_goal.is_none());
     assert_eq!(waiting.status.goals_completed, 0);
     assert_eq!(
@@ -221,7 +221,7 @@ fn max_goals_waits_for_active_child_terminal_before_stopping() {
         proto::ExplorationPhase::Running as i32
     );
     feedback(&mut explorer, id, proto::GoalStatus::Succeeded);
-    let done = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into())).unwrap();
+    let done = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
     assert_eq!(done.status.phase, proto::ExplorationPhase::Succeeded as i32);
     assert_eq!(
         explorer.stop_reason,
@@ -233,13 +233,13 @@ fn max_goals_waits_for_active_child_terminal_before_stopping() {
 fn max_goals_does_not_count_failed_child_as_reached() {
     let mut explorer = started_with_max_goals(1);
     let (id, _) = explorer
-        .tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()))
+        .tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(()))
         .unwrap()
         .goal
         .unwrap();
     feedback(&mut explorer, id, proto::GoalStatus::Failed);
     assert_eq!(explorer.reached_goals, 0);
-    let next = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into())).unwrap();
+    let next = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
     assert_ne!(
         explorer.stop_reason,
         Some(ExplorationStopReason::MaxGoalsReached)
@@ -276,7 +276,7 @@ fn coverage_stop_counts_only_cells_inside_requested_boundary() {
                 observed.data[y * 80 + x] = if inside_known { 0 } else { 255 };
             }
         }
-        let update = explorer.tick(Some(pose()), Some(observed), Err("曲面快照尚未生成，来源年龄未知".into())).unwrap();
+        let update = explorer.tick(Some(pose()), Some(observed), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
         assert_eq!(
             explorer.stop_reason == Some(ExplorationStopReason::CoverageReached),
             inside_known,
@@ -291,13 +291,13 @@ fn default_no_frontier_stability_window_finishes_with_fresh_map_input() {
     let mut complete = grid();
     complete.data.fill(0);
     let first = explorer
-        .tick(Some(pose()), Some(complete.clone()), Err("曲面快照尚未生成，来源年龄未知".into()))
+        .tick(Some(pose()), Some(complete.clone()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(()))
         .unwrap();
     assert!(first.goal.is_none());
     assert_eq!(first.status.phase, proto::ExplorationPhase::Running as i32);
     explorer.no_frontier_since = Some(Instant::now() - Duration::from_secs(6));
     complete.meta.as_mut().unwrap().timestamp_ns = unix_ns();
-    let done = explorer.tick(Some(pose()), Some(complete), Err("曲面快照尚未生成，来源年龄未知".into())).unwrap();
+    let done = explorer.tick(Some(pose()), Some(complete), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
     assert_eq!(done.status.phase, proto::ExplorationPhase::Succeeded as i32);
     assert_eq!(
         explorer.stop_reason,
@@ -310,12 +310,12 @@ fn unavailable_or_stale_map_never_completes_no_frontier_window() {
     let mut complete = grid();
     complete.data.fill(0);
     explorer
-        .tick(Some(pose()), Some(complete.clone()), Err("曲面快照尚未生成，来源年龄未知".into()))
+        .tick(Some(pose()), Some(complete.clone()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(()))
         .unwrap();
     explorer.no_frontier_since = Some(Instant::now() - Duration::from_secs(6));
     let mut stale = complete.clone();
     stale.meta.as_mut().unwrap().timestamp_ns = unix_ns() - 3_000_000_000;
-    let waiting = explorer.tick(Some(pose()), Some(stale), Err("曲面快照尚未生成，来源年龄未知".into())).unwrap();
+    let waiting = explorer.tick(Some(pose()), Some(stale), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
     assert_eq!(
         waiting.status.phase,
         proto::ExplorationPhase::Running as i32
@@ -323,24 +323,24 @@ fn unavailable_or_stale_map_never_completes_no_frontier_window() {
     assert!(explorer.no_frontier_since.is_none());
     assert!(waiting.status.message.contains("等待占据栅格"));
     assert!(waiting.status.message.contains("来源年龄="));
-    let fresh = explorer.tick(Some(pose()), Some(complete), Err("曲面快照尚未生成，来源年龄未知".into())).unwrap();
+    let fresh = explorer.tick(Some(pose()), Some(complete), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
     assert_eq!(fresh.status.phase, proto::ExplorationPhase::Running as i32);
 }
 #[test]
 fn costmap_refresh_keeps_active_child_and_next_goal_progresses() {
     let mut explorer = started_with_max_goals(2);
     let (first, _) = explorer
-        .tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()))
+        .tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(()))
         .unwrap()
         .goal
         .unwrap();
     let mut refreshed = grid();
     refreshed.data[30 * 80 + 30] = 100;
-    let update = explorer.tick(Some(pose()), Some(refreshed), Err("曲面快照尚未生成，来源年龄未知".into())).unwrap();
+    let update = explorer.tick(Some(pose()), Some(refreshed), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
     assert!(update.goal.is_none() && update.cancel_goal.is_none());
     assert_eq!(explorer.child.as_ref().unwrap().id, first);
     feedback(&mut explorer, first, proto::GoalStatus::Succeeded);
-    let next = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into())).unwrap();
+    let next = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
     assert!(next.goal.is_some(), "{}", next.status.message);
     assert_eq!(next.status.goals_completed, 1);
 }
@@ -351,7 +351,6 @@ fn enable_mission(explorer: &mut Explorer, maximum: Option<f64>) {
         return_on_completion: true,
     };
     explorer.calibration = Some(MissionCalibration {
-        maximum_sample_speed_mps: 2.0,
         planar: nuwax_nav_simple_planner::SimplePlannerConfig {
             robot_geometry: Some(RobotGeometry::from_runtime_json(TEST_GEOMETRY).unwrap()),
             ..Default::default()
@@ -362,9 +361,9 @@ fn enable_mission(explorer: &mut Explorer, maximum: Option<f64>) {
 fn mission_budget_dispatches_home_and_requires_matching_terminal() {
     let mut explorer = started_with_max_goals(10);
     enable_mission(&mut explorer, Some(0.01));
-    let selected = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into())).unwrap();
+    let selected = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
     assert!(selected.goal.is_none());
-    let returned = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into())).unwrap();
+    let returned = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
     let (id, target) = returned.goal.expect("余额不足后应派回程");
     assert!(returned.status.returning);
     assert_eq!(target.pose.unwrap().position, pose().position);
@@ -390,7 +389,7 @@ fn mission_budget_dispatches_home_and_requires_matching_terminal() {
 fn mission_active_goal_reserves_current_return_route_before_limit() {
     let mut explorer = started_with_max_goals(10);
     let (old, _) = explorer
-        .tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()))
+        .tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(()))
         .unwrap()
         .goal
         .unwrap();
@@ -402,7 +401,7 @@ fn mission_active_goal_reserves_current_return_route_before_limit() {
     .unwrap();
     mission.travelled_m = 1.;
     explorer.mission = Some(mission);
-    let returned = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into())).unwrap();
+    let returned = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
     assert_eq!(returned.cancel_goal, Some(old));
     assert!(returned.goal.is_some() && returned.status.returning);
     assert_eq!(
@@ -421,7 +420,7 @@ fn mission_unreachable_home_fails_without_return_dispatch() {
         })
         .unwrap(),
     );
-    let failed = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into())).unwrap();
+    let failed = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
     assert_eq!(failed.status.phase, proto::ExplorationPhase::Failed as i32);
     assert!(failed.goal.is_none() && explorer.child.is_none());
 }
@@ -429,9 +428,9 @@ fn mission_unreachable_home_fails_without_return_dispatch() {
 fn mission_return_failures_exhaust_original_retry_budget() {
     let mut explorer = started_with_max_goals(10);
     enable_mission(&mut explorer, Some(0.01));
-    explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into())).unwrap();
+    explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
     for attempt in 0..2 {
-        let returned = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into())).unwrap();
+        let returned = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
         let (id, _) = returned.goal.unwrap();
         feedback(&mut explorer, id, proto::GoalStatus::Failed);
         assert_eq!(
@@ -448,13 +447,13 @@ fn mission_return_failures_exhaust_original_retry_budget() {
 fn user_stop_after_costmap_update_clears_active_child_and_keeps_progress() {
     let mut explorer = started_with_max_goals(10);
     explorer
-        .tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()))
+        .tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(()))
         .unwrap()
         .goal
         .unwrap();
     let mut refreshed = grid();
     refreshed.data[50 * 80 + 50] = 100;
-    explorer.tick(Some(pose()), Some(refreshed), Err("曲面快照尚未生成，来源年龄未知".into())).unwrap();
+    explorer.tick(Some(pose()), Some(refreshed), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
     assert_eq!(
         explorer.stop().unwrap().phase,
         proto::ExplorationPhase::Stopped as i32
@@ -466,7 +465,7 @@ fn user_stop_after_costmap_update_clears_active_child_and_keeps_progress() {
 fn permanent_dispatch_rejection_still_applies_goal_failure_policy() {
     let mut explorer = started_with_max_goals(1);
     let (id, _) = explorer
-        .tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()))
+        .tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(()))
         .unwrap()
         .goal
         .unwrap();
@@ -587,14 +586,14 @@ fn mission_unreachable_candidate_is_not_budget_exhaustion() {
         failures: failures.clone(),
     });
     explorer.controller.begin_exploration().unwrap();
-    let unreachable = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into())).unwrap();
+    let unreachable = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
     assert!(unreachable.goal.is_none());
     assert!(!unreachable.status.returning);
     assert!(matches!(
         failures.lock().unwrap()[0],
         ExplorationGoalFeedback::Failed(_)
     ));
-    let reachable = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into())).unwrap();
+    let reachable = explorer.tick(Some(pose()), Some(grid()), Err("曲面快照尚未生成，来源年龄未知".into()), Ok(())).unwrap();
     assert!(reachable.goal.is_some(), "{}", reachable.status.message);
     assert!(!reachable.status.returning);
 }
@@ -653,7 +652,7 @@ fn surface_goals_preserve_real_floor_height_arrival_heading_and_source() {
             w: 0.05_f64.cos(),
         });
         let update = explorer
-            .tick(Some(position.clone()), Some(grid()), Ok(surface.clone()))
+            .tick(Some(position.clone()), Some(grid()), Ok(surface.clone()), Ok(()))
             .unwrap();
         let (_, target) = update.goal.expect("实际曲面源应产生目标");
         let target = target.pose.unwrap();
@@ -671,4 +670,92 @@ fn surface_goals_preserve_real_floor_height_arrival_heading_and_source() {
             Some("surface")
         );
     }
+}
+
+#[test]
+fn travel_counts_without_return_calibration_and_includes_position_jumps() {
+    for returning in [false, true] {
+        let mut explorer = make_explorer("住宅".into(), "map".into(), false).unwrap();
+        explorer.start("里程".into(), request()).unwrap();
+        if returning { enable_mission(&mut explorer, None); }
+        let stamp = unix_ns();
+        let sample = |x, offset| {
+            let mut sample = pose();
+            sample.timestamp_ns = stamp + offset;
+            sample.position.as_mut().unwrap().x = x;
+            sample
+        };
+        let first = explorer.tick(Some(sample(2., 0)), Some(grid()), Err("二维地图".into()), Ok(())).unwrap();
+        assert_eq!(first.status.traveled_distance_m, 0.);
+        let second = explorer.tick(Some(sample(2.5, 1)), Some(grid()), Err("二维地图".into()), Ok(())).unwrap();
+        assert_eq!(second.status.traveled_distance_m, 0.5);
+        assert_eq!(second.status.phase, proto::ExplorationPhase::Running as i32);
+        let jump = explorer.tick(Some(sample(4., 2)), Some(grid()), Err("二维地图".into()), Ok(())).unwrap();
+        assert_eq!(jump.status.traveled_distance_m, 2.);
+        assert_eq!(jump.status.phase, proto::ExplorationPhase::Running as i32);
+        let saved: Progress = serde_json::from_str(&explorer.progress().unwrap().progress_json).unwrap();
+        assert_eq!(saved.mission.unwrap().travelled_m, 2.);
+    }
+}
+
+#[test]
+fn forbidden_input_wait_does_not_finish_or_cancel_exploration() {
+    let mut explorer = make_explorer("住宅".into(), "map".into(), false).unwrap();
+    explorer.start("等待禁区".into(), request()).unwrap();
+    let first = explorer.tick(Some(pose()), Some(grid()), Err("二维地图".into()), Ok(())).unwrap();
+    let child = first.goal.unwrap().0;
+    explorer.input_wait_since = Some(Instant::now() - Duration::from_secs(31));
+    explorer.no_frontier_since = Some(Instant::now() - Duration::from_secs(6));
+    let waiting = explorer.tick(None, None, Err("禁行区格式无效".into()), Err("禁行区格式无效".into())).unwrap();
+    assert_eq!(waiting.status.phase, proto::ExplorationPhase::Running as i32);
+    assert!(waiting.status.message.contains("等待禁行区输入：禁行区格式无效"));
+    assert!(waiting.goal.is_none() && waiting.cancel_goal.is_none());
+    assert_eq!(explorer.child.as_ref().unwrap().id, child);
+    assert!(explorer.input_wait_since.is_none() && explorer.no_frontier_since.is_none());
+    explorer.config.as_mut().unwrap().stop_conditions.max_duration_ms = Some(0);
+    let stopped = explorer.tick(None, None, Err("禁行区格式无效".into()), Err("禁行区格式无效".into())).unwrap();
+    assert_eq!(stopped.status.phase, proto::ExplorationPhase::Succeeded as i32);
+    assert_eq!(stopped.cancel_goal.as_deref(), Some(child.as_str()), "输入等待不能绕过已配置的停止条件");
+}
+
+#[test]
+fn frontier_count_keeps_last_completed_computation_while_selection_is_pending() {
+    use nuwax_exploration::{ExplorationGoalSource, ExplorationSourceDiagnostics, ExploreResult};
+    use nuwax_nav_types_messages::visual::FrontierGoal;
+    struct Source { step: usize, frontiers: Vec<FrontierGoal> }
+    impl ExplorationGoalSource for Source {
+        fn source_name(&self) -> std::borrow::Cow<'static, str> { "wavefront".into() }
+        fn begin(&mut self) -> ExploreResult<()> { Ok(()) }
+        fn end(&mut self) -> ExploreResult<()> { Ok(()) }
+        fn poll_goal(&mut self, state: &ExplorationStateSnapshot<'_>) -> ExploreResult<ExplorationPoll> {
+            self.step += 1;
+            if self.step == 1 {
+                let goal = FrontierGoal::new("前沿", state.robot_pose.clone(), 1.);
+                self.frontiers = vec![goal.clone(), goal.clone()];
+                Ok(ExplorationPoll::Goal(goal))
+            } else {
+                self.frontiers.clear();
+                Ok(if self.step == 2 { ExplorationPoll::Pending } else { ExplorationPoll::NoFrontier })
+            }
+        }
+        fn frontier_snapshot(&self) -> Vec<FrontierGoal> { self.frontiers.clone() }
+        fn diagnostics(&self) -> ExplorationSourceDiagnostics {
+            ExplorationSourceDiagnostics { source_name: "wavefront".into(), is_active: true, last_goal_id: None, last_error: None }
+        }
+    }
+    let mut explorer = make_explorer("住宅".into(), "map".into(), false).unwrap();
+    explorer.start("前沿数量".into(), request()).unwrap();
+    explorer.controller = ExplorationController::new(ExplorationArbitrationPolicy::PreferWavefront);
+    explorer.controller.add_source(Source { step: 0, frontiers: Vec::new() });
+    explorer.controller.begin_exploration().unwrap();
+    let complete = explorer.tick(Some(pose()), Some(grid()), Err("二维地图".into()), Ok(())).unwrap();
+    assert_eq!(complete.status.frontier_count, 2);
+    feedback(&mut explorer, complete.goal.unwrap().0, proto::GoalStatus::Succeeded);
+    let pending = explorer.tick(Some(pose()), Some(grid()), Err("二维地图".into()), Ok(())).unwrap();
+    assert_eq!(pending.status.message, "正在选择前沿");
+    assert!(explorer.controller.frontier_snapshot().is_empty());
+    assert_eq!(pending.status.frontier_count, 2);
+    let empty = explorer.tick(Some(pose()), Some(grid()), Err("二维地图".into()), Ok(())).unwrap();
+    assert_eq!(empty.status.frontier_count, 0);
+    assert_eq!(empty.status.phase, proto::ExplorationPhase::Running as i32);
 }

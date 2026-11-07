@@ -17,7 +17,7 @@ async fn subscribe_map_updates_is_event_driven_and_carries_atomic_effective_and_
         .join(uuid::Uuid::new_v4().to_string());
     std::fs::create_dir_all(&directory).unwrap();
     let zones = directory.join("禁行区.json");
-    std::fs::write(&zones, r#"{"zones":[{"id":"测试区域","shape":"rectangle","mode":"inside","vertices":[{"x":0.1,"y":0.1},{"x":0.9,"y":0.9}]}]}"#).unwrap();
+    std::fs::write(&zones, r#"[{"id":"测试区域","shape":"rectangle","mode":"inside","vertices":[{"x":0.1,"y":0.1},{"x":0.9,"y":0.9}]}]"#).unwrap();
     mapper.set_forbidden_zones(zones).await.unwrap();
     // SubscribeMap生产入口使用同一个present，只从建图拥有方接收真实修订。
     let mut stream = present(mapper.map_rx());

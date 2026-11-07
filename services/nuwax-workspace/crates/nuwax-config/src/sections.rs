@@ -76,7 +76,6 @@ pub struct Geometry {
     pub raw_scan_directory: String,
     pub raw_scan_interval_s: f64,
     pub raw_scan_max_mib: i64,
-    pub raw_scan_queue_frames: i64,
     pub raw_scan_rotation_deg: f64,
     pub raw_scan_translation_m: f64,
     pub runtime_data_dir: String,

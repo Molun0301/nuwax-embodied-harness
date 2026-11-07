@@ -1,7 +1,6 @@
 use super::*;
 pub(crate) fn calibration() -> MissionCalibration {
     MissionCalibration {
-        maximum_sample_speed_mps: 2.0,
         planar: SimplePlannerConfig {
             robot_geometry: Some(RobotGeometry {
                 self_collision: None,

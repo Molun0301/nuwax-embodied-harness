@@ -183,12 +183,20 @@ class Device:
             params = dict(vx=a * vx + b * vy + limits.input_origin_in_command_y_m * wz,
                           vy=c * vx + d * vy - limits.input_origin_in_command_x_m * wz,
                           wz=wz, ttl_ms=300)
+            # 守卫已等比缩放；命令帧换算后吸收轴限边界的浮点舍入。
+            for axis, maximum in (("vx", limits.max_linear_x_mps), ("vy", limits.max_linear_y_mps),
+                                  ("wz", limits.max_angular_z_rps)):
+                params[axis] = max(-maximum, min(maximum, params[axis]))
         self._command('twist', params)
 
     def _command(self, operation, params):
         response = self.http.post('/api/v1/control', json={
             'op': operation, 'params': params, 'session': self.scope[0], 'epoch': self.scope[1]})
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise httpx.HTTPStatusError("%s；平台应答：%s" % (exc, response.text),
+                                        request=exc.request, response=exc.response) from exc
         result = response.json()
         if result.get('accepted') is False or result.get('ok') is False:
             raise RuntimeError('设备拒绝控制请求：%s' % result)

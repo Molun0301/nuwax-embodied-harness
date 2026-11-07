@@ -14,7 +14,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
 
 from core.config import value
-from core.robot_geometry import RobotGeometryError, resolve_robot_geometry
+from core.robot_geometry import RobotGeometryError, resolve_robot_geometry, resolve_robot_model_config
 from core.robot_kinematics import RobotKinematicsError
 from core.robot_visual import RobotVisualAssetStore, RobotVisualError
 from core.source_time import acquired_times, SourceTimeError
@@ -75,8 +75,10 @@ class RobotModelView:
 
     def _load(self):
         robot = self.runtime.config.robot
+        robot_name = value('unitree_sim.model') if robot.active_robot == 'unitree_sim' else robot.active_robot
         config = robot.geometry
         try:
+            config = resolve_robot_model_config(config, robot_name=robot_name, base_dir=self.base_dir)
             asset = self.store.get_asset(config)
             problem = None
         except (RobotVisualError, OSError, ValueError) as exc:
@@ -96,7 +98,6 @@ class RobotModelView:
             except (RobotVisualError, RobotGeometryError, OSError, ValueError) as exc:
                 geometry = {"error": str(exc)}
             return None, problem, geometry
-        robot_name = value('unitree_sim.model') if robot.active_robot == 'unitree_sim' else robot.active_robot
         key = (repr(config), robot_name, problem["message"])
         with self._lock:
             if key != self._geometry_key:

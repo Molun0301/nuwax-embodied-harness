@@ -534,6 +534,29 @@ def _box(length, width, height, center, source):
                                   (x+length/2,y+width/2),(x-length/2,y+width/2)), z-height/2, z+height/2, source)
 
 
+def resolve_robot_model_config(config: RobotGeometryConfig, *, robot_name: str, base_dir) -> RobotGeometryConfig:
+    """统一选择用户模型或机型模型及参考关节，供感知、显示与导航复用。"""
+    directory = Path(base_dir).expanduser().resolve()
+    explicit = str(config.model_path or "").strip()
+    if explicit:
+        if "://" in explicit:
+            raise RobotGeometryError("模型路径必须是本地文件，不自动下载远程模型。")
+        model = Path(explicit).expanduser()
+        if not model.is_absolute():
+            model = directory / model
+    else:
+        name = str(robot_name or "").strip().lower()
+        if name == "unitree_go2":
+            name = "go2"
+        model = directory / "drivers" / name / "robot_geometry.urdf" if name and name.replace("_", "").isalnum() else None
+        if model is None or not model.is_file():
+            return config
+    positions = config.model_joint_positions_json
+    if not explicit and not positions:
+        positions = model.with_name("robot_geometry_reference.json").read_text(encoding="utf-8")
+    return replace(config, model_path=str(model.resolve()), model_joint_positions_json=positions)
+
+
 def resolve_robot_geometry(config: RobotGeometryConfig, *, robot_name: str, base_dir,
                            resource_bytes: Optional[Mapping[Path, bytes]] = None) -> ResolvedRobotGeometry:
     """按完整手填、指定模型、驱动默认模型、通用兼容外包解析；不启动设备。"""
@@ -542,26 +565,11 @@ def resolve_robot_geometry(config: RobotGeometryConfig, *, robot_name: str, base
     if all(value is not None for value in dimensions):
         result = _box(*dimensions, tuple(0.0 if value is None else value for value in centers), "manual")
     else:
-        directory = Path(base_dir).expanduser().resolve()
-        name = str(robot_name or "").strip().lower()
-        if name == "unitree_go2":
-            name = "go2"
         explicit = str(config.model_path or "").strip()
-        if explicit:
-            if "://" in explicit:
-                raise RobotGeometryError("模型路径必须是本地文件，不自动下载远程模型。")
-            model = Path(explicit).expanduser()
-            if not model.is_absolute():
-                model = directory / model
-        else:
-            model = directory / "drivers" / name / "robot_geometry.urdf" if name and name.replace("_", "").isalnum() else None
-            if model is not None and not model.is_file():
-                model = None
-        if model is not None:
-            joint_positions = config.model_joint_positions_json
-            if not explicit and not joint_positions:
-                joint_positions = model.with_name("robot_geometry_reference.json").read_text(encoding="utf-8")
-            result = _parse_urdf(model.resolve(), config.model_base_link, _joint_positions(joint_positions),
+        model_config = resolve_robot_model_config(config, robot_name=robot_name, base_dir=base_dir)
+        if model_config.model_path:
+            result = _parse_urdf(Path(model_config.model_path), model_config.model_base_link,
+                                 _joint_positions(model_config.model_joint_positions_json),
                                  source_prefix="urdf" if explicit else "robot_default_urdf", resource_bytes=resource_bytes)
         else:
             # 通用回退沿原0.25米外包半宽与0.6米高度，来源明确，不伪称真实模型。

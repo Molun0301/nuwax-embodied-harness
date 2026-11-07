@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+from collections import Counter
 from datetime import datetime
 import math
 import threading
@@ -405,7 +406,7 @@ class SceneMappingService:
         try:
             ensure()
             capture, spaces = self._refresh_regions(ensure, expected_capture=expected_capture)
-            applied, processed, skipped, failures = [], [], [], []
+            applied, processed, label_candidates, skipped, failures = [], [], [], [], []
             adopting = self.config.auto_apply if apply_labels is None else apply_labels
             policy_inputs = self._naming_policy_inputs(adopting)
             for space in spaces:
@@ -457,12 +458,34 @@ class SceneMappingService:
                     processed.append(committed.scene_space_id)
                     if adopted:
                         applied.append(committed.scene_space_id)
+                    else:
+                        label_candidates.append({"id": committed.scene_space_id,
+                                           "reasons": updated.metadata["last_decision"]["adoption_blockers"]})
                 except GatewayError as exc:
                     if exc.error_code in ("scene_mapping_stopped", "scene_scope_changed", "memory_library_changed"):
                         raise
-                    failures.append({"id": space.scene_space_id, "code": exc.error_code})
+                    failures.append({"id": space.scene_space_id, "code": exc.error_code, "reason": str(exc)})
+            reason_labels = {
+                "automatic_adoption_disabled": "未启用自动命名", "visual_views_not_consistent": "视角判断不一致",
+                "category_not_specific": "类别不具体", "label_score_below_threshold": "命名分数不足",
+                "label_margin_below_threshold": "候选分差不足", "independent_views_insufficient": "独立视角不足",
+                "explicit_label_protected": "已有名称受保护", "no_valid_observation_evidence": "缺少有效观察证据",
+                "evidence_unchanged": "观察证据未变化", "cycle_budget": "达到本批区域上限",
+                "scene_geometry_changed": "建图进行中区域边界变化，未采用",
+            }
+            counts = {"named": len(applied), "candidate": len(label_candidates), "skipped": len(skipped), "failed": len(failures)}
+            summary_parts = ["命名%d" % counts["named"]]
+            for label, rows, reasons in (
+                ("候选", label_candidates, [reason for row in label_candidates for reason in row["reasons"]]),
+                ("跳过", skipped, [row["reason"] for row in skipped]),
+                ("失败", failures, [reason_labels.get(row["code"], row["reason"]) for row in failures]),
+            ):
+                details = "、".join("%s %d" % (reason_labels.get(reason, reason), count)
+                                   for reason, count in Counter(reasons).items())
+                summary_parts.append("%s%d%s" % (label, len(rows), "（%s）" % details if details else ""))
             response = {"map_binding": capture["binding"], "region_count": len(spaces), "processed_ids": processed,
                         "applied_ids": applied, "skipped": skipped, "failures": failures,
+                        "candidates": label_candidates, "counts": counts, "summary": "；".join(summary_parts) + "。",
                         "completed": not failures, "auto_apply_requested": bool(adopting)}
             with self._lock:
                 self._cycles += 1

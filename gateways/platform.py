@@ -163,6 +163,7 @@ def build_platform(config) -> Platform:
     self_filter = build_self_body_filter(
         config.perception.self_filter,
         robot_geometry=config.robot.geometry,
+        robot_name=value('unitree_sim.model') if config.robot.active_robot == 'unitree_sim' else config.robot.active_robot,
         base_dir=config.base_dir,
         joint_state_source=robot_joint_state_source(platform.robot),
     )

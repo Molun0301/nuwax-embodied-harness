@@ -48,7 +48,11 @@ def test_unknown_never_adopted(setup):
     backend.winner = "unknown"
     for x in (2, 3):
         remember(setup, x)
-    assert not service.run_once(apply_labels=True)["applied_ids"]
+    result = service.run_once(apply_labels=True)
+    assert not result["applied_ids"]
+    assert result['counts'] == {'named':0, 'candidate':1, 'skipped':0, 'failed':0}
+    assert '命名0；候选1' in result['summary']
+    assert '类别不具体' in result['summary']
 
 def test_user_label_during_model_is_not_overwritten(setup):
     memory, backend, service = setup.memory, setup.backend, setup.service
@@ -227,6 +231,8 @@ def test_adopted_label_is_not_revoked_by_nonadopting_decision(setup, weak_reason
 def test_no_evidence_does_not_adopt_and_category_catalog_refreshes_decision(setup,monkeypatch):
     result=setup.service.run_once(apply_labels=True)
     assert not result['applied_ids'] and result['skipped'][0]['reason']=='no_valid_observation_evidence'
+    assert result['counts'] == {'named':0, 'candidate':0, 'skipped':1, 'failed':0}
+    assert '跳过1（缺少有效观察证据 1）' in result['summary']
     remember(setup)
     setup.service.run_once(background=True)
     unchanged=setup.service.run_once(background=True)

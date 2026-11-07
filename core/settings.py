@@ -367,7 +367,6 @@ class MemoryInstanceAssociationConfig:
     uncertainty_gate_sigma: float = schema_default('memory.association_gate_sigma')
     cross_label_min_overlap: float = schema_default('memory.association_cross_label_overlap')
     cross_label_max_size_ratio: float = schema_default('memory.association_cross_label_size_ratio')
-    merge_on_activation: bool = True
 
 
 @dataclass
@@ -710,7 +709,6 @@ def load_config() -> NuwaxRobotBridgeConfig:
             uncertainty_gate_sigma=max(0.5, value('memory.association_gate_sigma')),
             cross_label_min_overlap=max(0.0, min(1.0, value('memory.association_cross_label_overlap'))),
             cross_label_max_size_ratio=max(1.0, value('memory.association_cross_label_size_ratio')),
-            merge_on_activation=True,
         ),
     )
 

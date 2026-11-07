@@ -1,9 +1,9 @@
 """Go2 L2 传感器到共享注册坐标的实例标定与模型默认值。
 
-数值来源：仓内冻结的 Go2 URDF
+数值来源：仓内冻结的 Go2 URDF（机器人描述文件）及 L1 厂家偏航修正
 ``services/geometry/ros2_ws/src/go2slam/src/go2_description/urdf/go2_description.urdf``：
 ``base_link <- utlidar_lidar`` 固定关节 xyz=(0.28945, 0, -0.046825)、
-rpy=(0, 2.8782025850555556, 0)；``base_link <- imu`` 固定关节
+rpy=(0, 2.8782025850555556, 0)，雷达旋转再右乘 Rz(-123°)；``base_link <- imu`` 固定关节
 xyz=(-0.02557, 0, 0.04232)、rpy=(0, 0, 0)。
 
 约定为 parent_from_child：p_parent = R_parent_child @ p_child + t_parent_child。
@@ -105,10 +105,16 @@ GO2_CALIBRATION_PROFILE = Go2CalibrationProfile(
     lidar_source_frame=GO2_LIDAR_FRAME,
     imu_source_frames=GO2_IMU_FRAMES,
     lidar_translation_m=(0.28945, 0.0, -0.046825),
-    lidar_rpy_rad=(0.0, 2.8782025850555556, 0.0),
+    # 复合旋转的等价欧拉角只用于元数据；变换采用下方原始矩阵。
+    lidar_rpy_rad=(-2.9191802071735897, -0.14228052526194127, -1.0107522236058617),
+    lidar_rotation_row_major=(
+        0.5258556508403229, -0.8097466927529278, 0.2603576925212619,
+        -0.8386705679454239, -0.5446390350150271, 0.0,
+        0.14180096241351925, -0.21835433385576677, -0.9655122329338992,
+    ),
     imu_translation_m=(-0.02557, 0.0, 0.04232),
     imu_rpy_rad=(0.0, 0.0, 0.0),
-    source_ref="git:6404c8d:services/geometry/ros2_ws/src/go2slam/src/go2_description/urdf/go2_description.urdf#imu_joint,utlidar_lidar_joint",
+    source_ref="git:6404c8d:services/geometry/ros2_ws/src/go2slam/src/go2_description/urdf/go2_description.urdf#imu_joint,utlidar_lidar_joint;git:66470534:drivers/go2/data_plane.env.example#NUWAX_GEOMETRY_LIO_BODY_FROM_SENSOR(Ry(2.8782)*Rz(-123deg))",
 )
 
 

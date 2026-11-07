@@ -493,6 +493,7 @@ def build_self_body_filter(
     robot_geometry,
     base_dir,
     joint_state_source: Callable[[], Optional[JointStateSample]],
+    robot_name: str = "",
 ) -> SelfBodyFilter:
     """按感知自体过滤设置与机器人模型设置装配；任何装配失败都转为带原因的状态。
 
@@ -509,7 +510,9 @@ def build_self_body_filter(
         return DisabledSelfBodyFilter("static_regions_invalid")
     model = None
     model_error = None
-    model_path = str(getattr(robot_geometry, "model_path", "") or "").strip()
+    from core.robot_geometry import resolve_robot_geometry, resolve_robot_model_config
+    model_config = resolve_robot_model_config(robot_geometry, robot_name=robot_name, base_dir=base_dir)
+    model_path = model_config.model_path
     if not model_path:
         model_error = "model_path_not_configured"
     else:
@@ -517,12 +520,11 @@ def build_self_body_filter(
         if not path.is_absolute():
             path = Path(base_dir).expanduser() / path
         try:
-            model = load_robot_kinematic_model(path, base_link=str(getattr(robot_geometry, "model_base_link", "") or ""))
+            model = load_robot_kinematic_model(path, base_link=model_config.model_base_link)
         except RobotKinematicsError as exc:
             model_error = exc.code
             LOGGER.warning("自体过滤无法加载机器人模型 %s：%s", path, exc)
-    from core.robot_geometry import resolve_robot_geometry
-    static_ground=resolve_robot_geometry(robot_geometry,robot_name="",base_dir=base_dir).z_min_m
+    static_ground=resolve_robot_geometry(robot_geometry,robot_name=robot_name,base_dir=base_dir).z_min_m
     return KinematicSelfBodyFilter(
         model=model,
         model_error=model_error,

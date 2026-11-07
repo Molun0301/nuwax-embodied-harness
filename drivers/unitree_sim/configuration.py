@@ -28,9 +28,7 @@ def configure(values, root, home):
                    'robot.actuator_motion_model': 'omnidirectional',
                    'perception.stream_camera_id': sensors['image']['camera_ids'][0]})
     if model == 'go2':
-        values['robot.model_path'] = ''
         values['robot.model_base_link'] = 'imu'
-        values['robot.model_joint_positions_json'] = json.dumps(json.loads((Path(root) / 'drivers/go2/robot_geometry_reference.json').read_text()), separators=(',', ':'))
         origin = calibration['imu']['translation_m']
         values['robot.actuator_max_linear_mps'] += math.hypot(origin[0], origin[1]) * limits['wz_rps']
     elif not values['robot.model_path']:

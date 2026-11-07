@@ -32,7 +32,7 @@ from core.errors import GatewayError
 from core.logging_utils import LogRateLimiter
 from core.event_bus import PreparedEventPublication
 from core.stream_bus import PreparedStreamPublication
-from providers import PointCloudProvider
+from providers import CalibrationProvider, PointCloudProvider
 from services.artifact_service import ArtifactService
 from services.perception.base import (
     DetectionBundle,
@@ -44,7 +44,7 @@ from services.perception.base import (
 )
 from services.perception.detectors import DetectorPipeline
 from services.perception.geometry import DetectionGeometryAugmentor
-from services.perception.observation_geometry import capture_geometry, contract_frame_tree, contract_pose
+from services.perception.observation_geometry import capture_geometry, contract_pose, _stamp
 from services.perception.scene import SimpleSceneDescriptionBackend
 from services.perception.self_body import (
     DisabledSelfBodyFilter,
@@ -55,6 +55,7 @@ from services.perception.trackers import Basic2DTrackerBackend
 
 LOGGER = logging.getLogger("nuwax_robot_bridge.perception.service")
 _INPUT_LOG_LIMITER = LogRateLimiter()
+_POINT_CLOUD_CACHE_FRAMES = 10
 
 if TYPE_CHECKING:
     from contracts.image import ImageFrame
@@ -129,6 +130,10 @@ class PerceptionService:
         self._active_operations = 0
         self._closing = False
         self._closed = False
+        self._point_cloud_lock = threading.Lock()
+        self._point_cloud_frames = ()
+        self._point_cloud_subscription = (stream_bus.subscribe(self._cache_point_cloud, topics=("pointcloud.frame",))
+                                          if stream_bus is not None else None)
 
     def set_video_frame_sink(self, video_frame_sink: Optional[VideoFrameSink]) -> None:
         self._video_frame_sink = video_frame_sink
@@ -1075,6 +1080,11 @@ class PerceptionService:
             self._history.clear()
             self._fast_frame_cache.clear()
             self._closed = True
+        if self._point_cloud_subscription is not None:
+            self._stream_bus.unsubscribe(self._point_cloud_subscription)
+            self._point_cloud_subscription = None
+        with self._point_cloud_lock:
+            self._point_cloud_frames = ()
 
     def _attach_segmentation_results(
         self,
@@ -1536,25 +1546,42 @@ class PerceptionService:
         except (TypeError, IndexError):
             return False
 
+    def _geometry_transforms(self):
+        """把设备标定接口的相机静态边接回几何坐标树。"""
+        from services.geometry.client import Transform
+        transforms = () if self._geometry_client is None else self._geometry_client.get_frame_tree()
+        providers = getattr(self._provider_owner, "providers", None)
+        topology = providers.get_sensor_topology() if isinstance(providers, CalibrationProvider) else None
+        if topology is not None:
+            transforms = (*transforms, *(Transform(
+                parent_frame=pair.parent_frame_id, child_frame=pair.child_frame_id,
+                x=pair.initial_translation.x, y=pair.initial_translation.y, z=pair.initial_translation.z,
+                qx=pair.initial_rotation.x, qy=pair.initial_rotation.y,
+                qz=pair.initial_rotation.z, qw=pair.initial_rotation.w, timestamp_ns=0,
+            ) for pair in topology.pairs))
+        return transforms
+
+    def _cache_point_cloud(self, frame):
+        """使用方只留采集时刻最新的十帧，不改变总线快照保留规则。"""
+        with self._point_cloud_lock:
+            frames = sorted((*self._point_cloud_frames, frame), key=lambda item: _stamp(item.payload, item.payload.metadata))
+            self._point_cloud_frames = tuple(frames[-_POINT_CLOUD_CACHE_FRAMES:])
+
     def _capture_geometry(self, image_frame):
         snapshot = None if self._geometry_state is None else self._geometry_state.snapshot()
-        transforms = () if self._geometry_client is None or snapshot is None else self._geometry_client.get_frame_tree()
+        transforms = () if snapshot is None else self._geometry_transforms()
+        with self._point_cloud_lock:
+            cloud_frames = self._point_cloud_frames
         geometry = capture_geometry(self._stream_bus, image_frame, transforms=transforms,
-            map_name=None if snapshot is None else snapshot.map_name)
+            map_name=None if snapshot is None else snapshot.map_name, point_cloud_frames=cloud_frames)
         self._frame_tree = geometry.frame_tree
         return geometry
 
     def _capture_cached_geometry_inputs(self, image_frame):
         """单次完整识别在模型等待前保留已有几何输入。"""
         pose = contract_pose(None if self._geometry_state is None else self._geometry_state.pose())
-        snapshot = None if self._geometry_state is None else self._geometry_state.snapshot()
-        transforms = () if self._geometry_client is None or snapshot is None else self._geometry_client.get_frame_tree()
-        tree = contract_frame_tree(transforms, pose)
-        cloud = self._latest_stream_payload("pointcloud.frame")
-        if not self._has_usable_point_cloud(cloud):
-            cloud = self._get_latest_point_cloud_optional()
-        self._frame_tree = tree
-        return cloud, tree, pose
+        geometry = self._capture_geometry(image_frame)
+        return geometry.point_cloud, geometry.frame_tree, pose
 
     def self_body_filter_status(self) -> Dict[str, Any]:
         return self._self_body_filter.status()

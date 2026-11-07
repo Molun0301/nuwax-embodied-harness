@@ -14,7 +14,7 @@ def get_active_robot_registration(config) -> RobotDriverRegistration:
 
     robot_name = _resolve_configured_robot_name(config)
     if not robot_name:
-        raise ValueError("当前未配置 NUWAX_ACTIVE_ROBOT，无法解析机器人入口。")
+        raise ValueError("当前未配置 robot.driver，无法解析机器人入口。")
     return get_robot_driver_registration(robot_name)
 
 

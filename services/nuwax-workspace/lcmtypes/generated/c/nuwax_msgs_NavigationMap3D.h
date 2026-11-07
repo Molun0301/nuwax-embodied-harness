@@ -36,7 +36,7 @@ struct _nuwax_msgs_NavigationMap3D
     float      source_voxel_size;
 
     /**
-     * 0为生效地图，1为显式清空，2为建图地面块提交失败后的来源撤销。
+     * 布尔清空标记：0为生效地图，1为显式清空。
      */
     int8_t     cleared;
 

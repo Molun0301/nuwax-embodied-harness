@@ -802,6 +802,7 @@ static int run_pointlio(int argc, char** argv) {
     ports.host_imu_data   = mod.arg_int("host_imu_data_port", port_defaults.host_imu_data);
     ports.host_log_data   = mod.arg_int("host_log_data_port", port_defaults.host_log_data);
 
+    const auto lcm_url = mod.arg_required("lcm_url");
     nuwax_lio::validate_pointlio_options(params, mod);
     for (double rate : {double(g_frequency), double(pointcloud_freq), double(odom_freq), main_freq})
         if (!std::isfinite(rate) || rate <= 0) throw std::invalid_argument("原生频率必须为有限正数");
@@ -819,7 +820,7 @@ static int run_pointlio(int argc, char** argv) {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
-    lcm::LCM lcm(mod.arg_required("lcm_url"));
+    lcm::LCM lcm(lcm_url);
     if (!lcm.good()) {
         fprintf(stderr, "Error: LCM init failed\n");
         return 1;

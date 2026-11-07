@@ -198,7 +198,7 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
-    ready = working / "supervision/runtime_data/geometry/nuwax_geometry_runtime.ready"
+    ready = working / "supervision/runtime_data/geometry/nuwax_geometry_runtime.ready.runtime"
     # 非单位安装外参和倾斜机体共同验证轴向、单位及重力初始化。
     sensor_pitch = 2.8782025850555556
     c, s = np.cos(sensor_pitch), np.sin(sensor_pitch)
@@ -248,15 +248,15 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
     store.write_profile('原生诊断', {key: value for key, value in settings.items() if key in specifications()})
     configuration_values = store.activate('原生诊断')
     os.environ.update({key: value for key, value in settings.items() if key not in specifications()})
-    os.environ['LD_LIBRARY_PATH'] = str(Path(runtime_binary).parent) + ':' + str(Path(runtime_binary).parent / 'lib') + ':' + os.environ.get('LD_LIBRARY_PATH', '')
+    os.environ['LD_LIBRARY_PATH'] = str(Path(runtime_binary).parent) + ':' + str(Path(runtime_binary).parent.parent / 'lib') + ':' + str(Path(runtime_binary).parent.parent / 'lib64') + ':' + os.environ.get('LD_LIBRARY_PATH', '')
     log = (evidence / (backend + "真实原生进程.log")).open("w")
-    process = sensors = bridge = remote = channel = gateway = None
+    process = sensors = bridge = remote = gateway = None
     try:
         process = subprocess.Popen(supervisor_command(["geometry"], working / "supervision"), cwd=root,
             stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         sensors = CustomRobotProviderBundle()
         deadline = time.monotonic() + 10
-        while not Path(str(ready) + ".runtime").exists():
+        while not ready.exists():
             assert process.poll() is None, "真实原生进程启动失败"
             assert time.monotonic() < deadline, "真实原生进程启动超时"
             time.sleep(.03)
@@ -443,6 +443,11 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
         else:
             bridge.stop()
         bridge = None
+        # 先关闭输入与远程订阅，避免服务器等待仍由本夹具持有的流。
+        sensors.stop()
+        sensors = None
+        remote.close()
+        remote = None
         process.terminate()
         assert process.wait(timeout=10) == 0
         assert not ready.exists()
@@ -457,7 +462,6 @@ def run_backend(backend, executable, runtime_binary, output_dir, frame_count, ga
                 bridge.stop if bridge is not None else None,
                 sensors.stop if sensors is not None else None,
                 remote.close if remote is not None else None,
-                channel.close if channel is not None else None,
                 gateway.client.close if gateway is not None else None,
                 gateway.listener.close if gateway is not None else None,
             ]

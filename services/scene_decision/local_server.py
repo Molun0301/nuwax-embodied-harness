@@ -117,16 +117,19 @@ class ModelProcess:
     def close(self) -> None:
         self._status = "closed"
         self._terminate()
-        # 唤醒加载等待线程，关闭后不保留一分钟以上的加载等待。
-        try:
-            self._results.put_nowait({"ready": False})
-        except (queue.Full, ValueError):
-            pass
+        # 只唤醒仍在读取的加载线程，先等接收完成，再回收结果队列发送线程。
         if self._loader:
-            self._loader.join(timeout=1.0)
-        for channel in (self._requests, self._results):
-            channel.cancel_join_thread()
-            channel.close()
+            if self._loader.is_alive():
+                try:
+                    self._results.put_nowait({"ready": False})
+                except (queue.Full, ValueError):
+                    pass
+            self._loader.join()
+        self._results.close()
+        self._results.join_thread()
+        self._requests.cancel_join_thread()
+        self._requests.close()
+
 
 
 def create_app(controller: ModelProcess, *, token: str = ""):

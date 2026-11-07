@@ -11,7 +11,6 @@ import socket
 import subprocess
 import sys
 import time
-import urllib.request
 
 
 STOP_ORDER = ("gateway", "video", "person_follow", "geometry", "nav_stack", "motion_guard")
@@ -60,9 +59,8 @@ def socket_ready(path):
 
 def gateway_ready(port):
     try:
-        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
-                "http://127.0.0.1:%s/api/health" % port, timeout=0.2) as response:
-            return response.status == 200
+        with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+            return True
     except OSError:
         return False
 

@@ -150,6 +150,9 @@ impl Lio {
         } else {
             return Vec::new();
         };
+        if sensor == self.info.base_frame_id {
+            return Vec::new();
+        }
         vec![proto::Transform {
             parent_frame: self.info.base_frame_id.clone(),
             child_frame: sensor,

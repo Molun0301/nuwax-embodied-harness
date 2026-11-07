@@ -293,6 +293,24 @@ fn raw_request(stamp: u64) -> proto::PublishPointCloudRequest {
         ..Default::default()
     }
 }
+
+#[tokio::test]
+async fn static_sensor_transform_is_omitted_only_for_shared_body_frame() {
+    let mapper = crate::mapper::Mapper::start(46, crate::mapper::MapperConfig::default()).unwrap();
+    let (mut lio, _) = test_lio(mapper.clone(), None);
+    lio.body_from_sensor = Some(
+        crate::native_lio_owner::BodyFromSensorTransform::from_json(
+            r#"{"translation_m":[0,0,0],"rotation_row_major":[1,0,0,0,1,0,0,0,1]}"#,
+        ).unwrap(),
+    );
+    let transforms = lio.static_transforms();
+    assert_eq!(transforms.len(), 1);
+    assert_eq!(transforms[0].parent_frame, "base_link");
+    assert_eq!(transforms[0].child_frame, "laser");
+    lio.sensor_frame = lio.info.base_frame_id.clone();
+    assert!(lio.static_transforms().is_empty());
+    mapper.shutdown().await.unwrap();
+}
 #[tokio::test]
 async fn imu_gap_reports_session_fault_once() {
     let mapper = crate::mapper::Mapper::start(42, crate::mapper::MapperConfig::default()).unwrap();

@@ -190,9 +190,8 @@ impl NativeLioConfig {
         validate_frame(&self.sensor_frame_id, "sensor_frame_id")?;
         if self.frame_id == self.child_frame_id
             || self.frame_id == self.sensor_frame_id
-            || self.child_frame_id == self.sensor_frame_id
         {
-            return Err("odom, body, and sensor frame IDs must be distinct".into());
+            return Err("odom frame ID must differ from body and sensor frame IDs".into());
         }
         validate_extrinsic_translation(&self.extrinsic_translation_m)?;
         validate_extrinsic_rotation(&self.extrinsic_rotation_row_major)?;
@@ -616,6 +615,25 @@ mod tests {
     const FASTLIO2_MAIN: &str = include_str!("../native/fastlio2/cpp/main.cpp");
     const POINTLIO_MAIN: &str = include_str!("../native/pointlio/cpp/main.cpp");
     const PAIRING_MARKER: &str = "Publish odometry first whenever a cloud is emitted";
+
+    #[test]
+    fn shared_body_sensor_frame_is_valid_but_odom_must_differ() {
+        for backend in [NativeBackend::FastLio2, NativeBackend::PointLio] {
+            let mut config = NativeLioConfig::for_backend(backend);
+            config.sensor_frame_id = config.child_frame_id.clone();
+            let args = config.render_args().expect("已注册到机体的传感器输入合法");
+            assert_arg_value(&args, "--sensor_frame_id", &config.child_frame_id);
+            assert_arg_value(&args, "--child_frame_id", &config.child_frame_id);
+
+            config.frame_id = config.child_frame_id.clone();
+            assert!(config.render_args().is_err());
+            config.child_frame_id = "other_body".into();
+            assert!(config.render_args().is_err());
+            config.sensor_frame_id = "other_sensor".into();
+            config.frame_id = config.child_frame_id.clone();
+            assert!(config.render_args().is_err());
+        }
+    }
 
     fn assert_arg_value(args: &[String], option: &str, expected: &str) {
         let option_index = args

@@ -262,12 +262,7 @@ impl CloudMap {
         if self.recording {
             self.record(sequence, frame, map_from_odom)?;
         }
-        let ground_set: ahash::AHashSet<_> = ground.iter().copied().collect();
-        let pgo = indices
-            .into_iter()
-            .filter(|i| !ground_set.contains(i))
-            .collect();
-        Ok((dynamic, pgo, ground))
+        Ok((dynamic, indices, ground))
     }
     fn record(
         &mut self,

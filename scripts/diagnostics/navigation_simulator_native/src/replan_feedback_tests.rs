@@ -28,7 +28,13 @@ fn identical_stopped_refusal_reuses_success_without_stepping_but_real_pose_chang
     // stop withdraws the controller path. Calling step on the waiting adapter
     // would therefore be observable rather than silently re-executing the route.
     session.follower.stop();
-    for _ in 0..5 {session.tick(&scene).unwrap();}
+    let unchanged_motion = session.rejected_context.as_ref().unwrap().measured_motion.clone();
+    // tick末尾会生成新实测样本；本场景固定原样本，才是相同完整输入。
+    for _ in 0..5 {
+        session.follower.observe_measured_motion(unchanged_motion.clone());
+        session.tick(&scene).unwrap();
+    }
+    session.follower.observe_measured_motion(unchanged_motion);
     assert_eq!(session.plans,plans);
     assert!(session.need_plan);
     assert_eq!(session.status,"planning");

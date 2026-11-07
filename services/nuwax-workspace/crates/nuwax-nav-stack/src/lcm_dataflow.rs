@@ -9878,7 +9878,12 @@ mod tests {
             13_000_000_000,
         )
         .expect("build A* map-b PathEnvelope")
-        .expect("A* map-b path stays inside boundary");
+        .unwrap_or_else(|| {
+            let map = decode_astar_costmap_with_boundary(&planner_test_grid_body(12), active_boundary.as_ref()).unwrap();
+            let raw = nuwax_nav_astar::astar::min_cost_astar(&map, Point2::new(0.5, 0.5), Point2::new(4.5, 4.5),
+                &nuwax_nav_astar::astar::AStarOptions::default());
+            panic!("A* map-b path stays inside boundary: path={path:?}, boundary={active_boundary:?}, raw_astar={raw:?}");
+        });
         assert_eq!(
             envelope.goal_key(),
             active_goal.as_ref().unwrap().goal_key()

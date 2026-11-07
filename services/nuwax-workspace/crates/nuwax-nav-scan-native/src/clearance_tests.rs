@@ -1,5 +1,10 @@
 // 独立几何判据：旋转矩形与门框矩形的欧氏最短距离，不调用规划器碰撞接口。
 fn doorway_body_distance(position: [f64; 3], yaw: f64, cfg: &Config, gap: f64) -> f64 {
+    body_distance_to_door(position, yaw, cfg, [1.5, 1.6], [[-2., 0.], [gap, 2.]])
+}
+
+fn body_distance_to_door(position: [f64; 3], yaw: f64, cfg: &Config,
+    wall_x: [f64; 2], bands: [[f64; 2]; 2]) -> f64 {
     let (c, s) = (yaw.cos(), yaw.sin());
     let body: Vec<_> = [(-1., -1.), (1., -1.), (1., 1.), (-1., 1.)]
         .into_iter()
@@ -16,8 +21,8 @@ fn doorway_body_distance(position: [f64; 3], yaw: f64, cfg: &Config, gap: f64) -
         (p[0] - a[0] - t * v[0]).hypot(p[1] - a[1] - t * v[1])
     }
     let mut distance = f64::INFINITY;
-    for (low, high) in [(-2., 0.), (gap, 2.)] {
-        let wall = [[1.5, low], [1.6, low], [1.6, high], [1.5, high]];
+    for [low, high] in bands {
+        let wall = [[wall_x[0], low], [wall_x[1], low], [wall_x[1], high], [wall_x[0], high]];
         let separated = [[1., 0.], [0., 1.], [c, s], [-s, c]]
             .into_iter()
             .any(|axis| {

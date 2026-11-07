@@ -1551,8 +1551,10 @@ goal: schema::PoseStamped {
         let next = prepare_surface_map(changed, Instant::now(), &configured, &mut cache).snapshot.unwrap();
         assert_eq!(cache.last_build_stats().unwrap().kind, SurfaceBuildKind::Incremental);
         assert_eq!(cache.last_build_stats().unwrap().changed_columns, 1);
-        assert!(first.locate_support([3.55, 0.55, 2.1]).is_ok());
-        assert!(next.locate_support([3.55, 0.55, 2.1]).is_err());
+        let before = first.with_body_envelope(configured.body_envelope.clone()).unwrap();
+        let after = next.with_body_envelope(configured.body_envelope.clone()).unwrap();
+        before.validate_body_pose([3.55, 0.55, 2.5], [0., 0., 0., 1.]).unwrap();
+        assert!(after.validate_body_pose([3.55, 0.55, 2.5], [0., 0., 0., 1.]).is_err());
         let mut clear = map_message(4, "map");
         clear.cleared = true;
         clear.cloud = schema::PointCloud2::default();
@@ -2701,6 +2703,9 @@ goal: schema::PoseStamped {
         harness.goal(&goal).await;
         let path = harness.path_for(&goal).await;
         harness.wait_controlling().await;
+        let before = harness.hub.latest.lock().unwrap().as_ref().unwrap().snapshot.as_ref().unwrap()
+            .with_body_envelope(config().body_envelope).unwrap();
+        before.validate_body_pose([3.55, 0.55, 2.5], [0., 0., 0., 1.]).unwrap();
         {
             let mut feed = harness.feed.lock().unwrap();
             // 路线外新增真实占据，使几何缓存变化，但不阻断原路径。
@@ -2714,8 +2719,10 @@ goal: schema::PoseStamped {
         let state = harness.scheduler.status();
         assert!(state.planner_inputs_fresh);
         assert_eq!(state.path_revision, u64::try_from(path.path_revision).unwrap());
-        assert!(harness.hub.latest.lock().unwrap().as_ref().unwrap().snapshot.as_ref().unwrap()
-            .locate_support([3.55, 0.55, 2.05]).is_err(), "路线外新增占据必须确实进入执行地图");
+        let after = harness.hub.latest.lock().unwrap().as_ref().unwrap().snapshot.as_ref().unwrap()
+            .with_body_envelope(config().body_envelope).unwrap();
+        assert!(after.validate_body_pose([3.55, 0.55, 2.5], [0., 0., 0., 1.]).is_err(),
+            "路线外新增占据必须确实进入执行地图");
         harness.cancel(&goal).await;
         harness.terminal(TerminalOutcome::Cancelled).await;
         harness.shutdown().await;

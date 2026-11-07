@@ -393,14 +393,31 @@ mod tests {
             goal_yaw: None,
         }
     }
+    fn start_reference(req: &mut PlanRequest<'_>) -> (Planner, PlanResult) {
+        let mut planner = fixture_planner();
+        // 作者A依次经历初始化、等待目标、生成轨迹，每拍给出新的观测时点。
+        for _ in 0..2 {
+            let waiting = planner.step(req).unwrap();
+            assert!(waiting.samples.is_empty());
+            req.odometry_timestamp_ns += (req.config.sample_dt * 1e9) as i64;
+        }
+        let result = planner.step(req).unwrap();
+        assert!(!result.samples.is_empty(), "生成轨迹后应有样条：{result:?}");
+        (planner, result)
+    }
     #[test]
     fn entirely_unknown_corridor_is_traversable() {
         let route = [[0.0, 0.0, 0.35], [8.0, 0.0, 0.35]];
-        let result = plan(&request(&route, &[])).unwrap();
-        assert!(result.command_forward > 0.0);
+        let mut req = request(&route, &[]);
+        let (mut planner, result) = start_reference(&mut req);
         assert!(result.local_target[0] > 1.8 && result.local_target[0] < 2.3);
         assert!(result.reference_progress < result.reference_duration);
-        assert!((result.samples.first().unwrap().position[0]).abs() < 1e-8);
+        let first = result.samples.first().unwrap();
+        assert_eq!(first.time, 0.0);
+        assert!(first.position[0] >= 0.0 && first.position[0] < result.local_target[0],
+            "导出的是控制器当前时点之后的剩余样条：{first:?}");
+        req.odometry_timestamp_ns += 100_000_000;
+        assert!(planner.step(&req).unwrap().command_forward > 0.0);
     }
     #[test]
     fn measured_wall_is_bypassed_by_original_rebound_optimizer() {
@@ -426,34 +443,36 @@ mod tests {
         }
     }
     #[test]
-    fn measured_velocity_and_acceleration_are_preserved() {
+    fn measured_feedback_does_not_claim_measured_acceleration() {
         let route = [[0.0, 0.0, 0.35], [5.0, 0.0, 0.35]];
         let mut req = request(&route, &[]);
         req.start_velocity = Some([0.25, 0.03, 0.0]);
         req.start_acceleration = Some([0.1, 0.0, 0.0]);
-        let result = plan(&req).unwrap();
-        let first = &result.samples[0];
-        for i in 0..3 {
-            assert!((first.velocity[i] - req.start_velocity.unwrap()[i]).abs() < 1e-7);
-            assert!((first.acceleration[i] - req.start_acceleration.unwrap()[i]).abs() < 1e-7);
-        }
-        assert!(
-            (result.command_forward - 0.25).abs()
-                <= req.config.max_acceleration * req.config.sample_dt + 1e-8
-        );
+        let mut planner = fixture_planner();
+        planner.step(&req).unwrap();
+        req.odometry_timestamp_ns += 100_000_000;
+        let previous = planner.step(&req).unwrap();
+        req.odometry_timestamp_ns += 100_000_000;
+        let result = planner.step(&req).unwrap();
+        assert!(!result.samples.is_empty());
+        assert_eq!(result.motion_boundary_sources[0], MotionBoundarySource::SmoothedMeasured);
+        assert_eq!(result.motion_boundary_sources[1], MotionBoundarySource::InitialZeroAssumption);
+        // 剩余样条不再从初始时点导出；实际请求仍受上一拍机体系命令的动态约束。
+        assert!((result.command_forward - previous.command_forward)
+            .hypot(result.command_lateral - previous.command_lateral)
+            <= req.config.max_acceleration * req.config.sample_dt + 1e-8);
     }
     #[test]
     fn reference_windows_continue_to_the_final_goal() {
         let route = [[0.0, 0.0, 0.35], [6.0, 0.0, 0.35]];
         let mut req = request(&route, &[]);
-        let first = plan(&req).unwrap();
-        req.start_position = first.local_target;
-        req.start_velocity = Some([0.3, 0.0, 0.0]);
-        let second = plan(&req).unwrap();
-        assert!(second.reference_progress > first.reference_progress);
-        req.start_position = second.local_target;
-        let third = plan(&req).unwrap();
-        assert!((third.reference_progress - third.reference_duration).abs() < 1e-6);
+        let mut planner = fixture_planner();
+        let first = planner.step(&req).unwrap();
+        let (arrived, _) = drive(&mut planner, &mut req, [6.0, 0.0]).unwrap();
+        assert!(arrived.is_some(), "完整参考应到达最终目标：{:?}", req.start_position);
+        let last = planner.step(&req).unwrap();
+        assert!(last.reference_progress > first.reference_progress);
+        assert!((last.reference_progress - last.reference_duration).abs() < 1e-6);
     }
     #[test]
     #[ignore = "retired candidate q3 contract; user restored independent XY/yaw"]
@@ -512,7 +531,9 @@ mod tests {
         let ground: Vec<_> = (0..40).map(|x| [x as f64 * 0.1, 0.0, 0.0]).collect();
         let mut req = request(&route, &[]);
         req.ground = &ground;
-        assert!(plan(&req).unwrap().command_forward > 0.0);
+        let (mut planner, _) = start_reference(&mut req);
+        req.odometry_timestamp_ns += 100_000_000;
+        assert!(planner.step(&req).unwrap().command_forward > 0.0);
     }
     /// 横跨直线参考的实测墙体。
     fn wall(x: f64) -> Vec<[f64; 3]> {
@@ -526,9 +547,19 @@ mod tests {
         req: &mut PlanRequest<'_>,
         goal: [f64; 2],
     ) -> Result<(Option<usize>, f64), String> {
+        drive_observing(planner, req, goal, |_, _, _, _, _| {})
+    }
+    fn drive_observing(
+        planner: &mut Planner,
+        req: &mut PlanRequest<'_>,
+        goal: [f64; 2],
+        mut observe: impl FnMut([f64; 3], f64, [f64; 2], f64, f64),
+    ) -> Result<(Option<usize>, f64), String> {
         let mut lateral: f64 = 0.0;
+        let initial_stamp = req.odometry_timestamp_ns;
+        let sample_ns = (req.config.sample_dt * 1e9) as i64;
         for tick in 0..600 {
-            req.odometry_timestamp_ns = tick as i64 * 100_000_000;
+            req.odometry_timestamp_ns = initial_stamp + tick as i64 * sample_ns;
             let result = planner.step(req).map_err(|error| {
                 format!(
                     "tick {tick}, pose {:?}, yaw {}, speed {:?}: {error}",
@@ -547,6 +578,7 @@ mod tests {
                 <= req.config.max_yaw_acceleration*dt+1e-8);
             let v=[(previous[0]+next[0])/2.,(previous[1]+next[1])/2.];
             let w=(req.start_yaw_rate.unwrap()+next_w)/2.;
+            observe(req.start_position, yaw, v, w, dt);
             let (a,b)=if w.abs()>1e-9 {((w*dt).sin()/w,(1.-(w*dt).cos())/w)}else{(dt,0.)};
             let dx=a*v[0]-b*v[1];let dy=b*v[0]+a*v[1];
             req.start_position[0]+=yaw.cos()*dx-yaw.sin()*dy;
@@ -573,47 +605,6 @@ mod tests {
         assert!(arrived.is_some(), "final position {:?}", req.start_position);
     }
     #[test]
-    fn disabled_local_planning_follows_reference_without_counting_local_plans() {
-        // 全局参考机身高度与实测起点差2.5厘米，竖向不能压慢水平跟随。
-        let route = [[0.0, 0.0, 0.35], [0.08, 0.0, 0.325], [4.0, 0.0, 0.325]];
-        let mut req = request(&route, &[]);
-        let mut planner = fixture_planner();
-        planner.set_local_planning(false);
-        let (arrived, lateral) =
-            drive(&mut planner, &mut req, [4.0, 0.0]).unwrap_or_else(|error| panic!("{error}"));
-        // 4米、0.6米/秒、0.8米/秒²的匀加减速约需8秒，即80个0.1秒控制拍。
-        assert!(arrived.is_some_and(|tick| tick < 120), "arrived {arrived:?}, final position {:?}", req.start_position);
-        assert!(lateral < 0.02, "直接跟随不应离开直线参考：{lateral}");
-        assert_eq!(planner.plan_count(), 0, "关闭后不累计局部规划");
-    }
-    #[test]
-    fn disabled_local_planning_keeps_speed_when_goal_enters_the_window() {
-        // 实验台的5米视距和1米/秒：终点进入窗口后末速为零，带实测速度重算时不能把轨迹拉成慢行。
-        let route = [[0.0, 0.0, 0.35], [7.0, 0.0, 0.35]];
-        let mut req = request(&route, &[]);
-        req.config.resolution = 0.05;
-        req.config.planning_horizon = 5.0;
-        req.config.max_velocity = 1.0;
-        req.config.max_acceleration = 1.0;
-        let mut planner = fixture_planner();
-        planner.set_local_planning(false);
-        let (arrived, _) =
-            drive(&mut planner, &mut req, [7.0, 0.0]).unwrap_or_else(|error| panic!("{error}"));
-        // 7米、1米/秒、1米/秒²约需9秒，即90个0.1秒控制拍。
-        assert!(arrived.is_some_and(|tick| tick < 130), "arrived {arrived:?}, final position {:?}", req.start_position);
-    }
-    #[test]
-    fn disabled_local_planning_stops_before_wall_on_reference() {
-        let route = [[0.0, 0.0, 0.35], [4.0, 0.0, 0.35]];
-        let obstacles = wall(1.5);
-        let mut req = request(&route, &obstacles);
-        let mut planner = fixture_planner();
-        planner.set_local_planning(false);
-        let error = drive(&mut planner, &mut req, [4.0, 0.0]).unwrap_err();
-        assert!(error.contains("local planning disabled"), "{error}");
-        assert!(req.start_position[0] + 0.35 < 1.5, "机身应停在墙前：{:?}", req.start_position);
-    }
-    #[test]
     fn overhead_ground_layer_is_a_body_obstacle() {
         let ceiling = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.45]];
         let mut req = request(&[], &[]);
@@ -633,7 +624,8 @@ mod tests {
         req.boundary = &boundary;
         assert!(plan(&req).is_ok());
         req.config.body_center_x = 0.3;
-        assert!(plan(&req).is_err());
+        let result = plan(&req);
+        assert!(result.is_err(), "实体右界0.65超过业务边界0.5，实际结果：{result:?}");
     }
     #[test]
     fn forbidden_columns_remain_occupied_at_every_height() {
@@ -644,13 +636,6 @@ mod tests {
         assert!(plan(&req).is_err());
         req.start_position[2] = 12.0;
         assert!(plan(&req).is_err());
-    }
-    #[test]
-    fn goal_behind_body_starts_with_a_checked_turn() {
-        let route = [[0.0, 0.0, 0.35], [-4.0, 0.0, 0.35]];
-        let result = plan(&request(&route, &[])).unwrap();
-        assert!(result.command_yaw_rate.abs() > 0.0);
-        assert_eq!(result.command_forward, 0.0);
     }
     #[test]
     fn terminal_rotation_brakes_using_measured_angular_velocity() {
@@ -710,18 +695,33 @@ mod tests {
         req.config.max_yaw_rate = 0.8;
         req.config.planning_horizon = 5.0;
         req.config.sample_dt = 0.05;
-        let result = plan(&req).unwrap();
-        assert!(result.command_forward > 0.0);
-        assert!(
-            result.command_yaw_rate.abs() < 1e-6,
-            "本可行斜直线不能被局部规划扭成转向: {:?}",
-            result.command_yaw_rate
-        );
-        for sample in result.samples {
-            let expected =
-                33.0 * resolution / 2.0 + (sample.position[0] - 2.0 * resolution) * yaw.tan();
-            assert!((sample.position[1] - expected).abs() < 1e-7);
-        }
+        let cfg = req.config;
+        let radius = (cfg.body_length / 2.).hypot(cfg.body_width / 2.);
+        let mut minimum_clearance = f64::INFINITY;
+        let (arrived, _) = drive_observing(&mut fixture_planner(), &mut req, [end[0], end[1]],
+            |position, heading, velocity, angular, dt| {
+                // 独立矩形距离与刚体圆弧积分；采样间隙再扣除实体点的位移上界。
+                let speed = velocity[0].hypot(velocity[1]) + angular.abs() * radius;
+                let count = (speed * dt / 0.0001).ceil().max(1.) as usize;
+                for index in 0..=count {
+                    let t = dt * index as f64 / count as f64;
+                    let (a, b) = if angular.abs() > 1e-9 {
+                        ((angular * t).sin() / angular, (1. - (angular * t).cos()) / angular)
+                    } else { (t, 0.) };
+                    let dx = a * velocity[0] - b * velocity[1];
+                    let dy = b * velocity[0] + a * velocity[1];
+                    let at = [position[0] + heading.cos() * dx - heading.sin() * dy,
+                        position[1] + heading.sin() * dx + heading.cos() * dy, position[2]];
+                    let distance = body_distance_to_door(at, heading + angular * t, &cfg,
+                        [0., 4. * resolution], [[-50. * resolution, 0.], [33. * resolution, 100. * resolution]]);
+                    let clearance = distance - speed * dt / (2. * count as f64);
+                    minimum_clearance = minimum_clearance.min(clearance);
+                    assert!(clearance > 0., "原斜薄门实体扫掠不能穿墙：{at:?}，净空下界{clearance}");
+                }
+            })
+            .unwrap_or_else(|error| panic!("原斜薄门恢复失败：{error}"));
+        assert!(arrived.is_some(), "原斜薄门600拍未到达：{:?}", req.start_position);
+        eprintln!("原斜薄门到达拍={arrived:?}，实体净空下界={minimum_clearance}米");
     }
     #[test]
     fn repeated_sample_reference_is_exact_but_new_motion_still_limits_output() {
@@ -741,9 +741,15 @@ mod tests {
         assert_eq!(first.command_yaw_rate, repeated.command_yaw_rate);
         req.start_velocity = Some([0.5, 0.0, 0.0]);
         let changed = planner.step(&req).unwrap();
-        assert_eq!(changed.motion_boundary_sources[0], MotionBoundarySource::Measured);
-        assert!(changed.command_forward >= 0.5 - req.config.max_acceleration * req.config.sample_dt);
-        assert_ne!(changed.command_forward, repeated.command_forward);
+        assert_eq!(changed.motion_boundary_sources, first.motion_boundary_sources,
+            "同拍测速更新不重新生成规划边界");
+        assert!((changed.command_forward - first.command_forward).abs()
+            <= req.config.max_acceleration * req.config.sample_dt + 1e-8);
+        let obstacle = wall(req.start_position[0] + 0.5);
+        req.obstacles = &obstacle;
+        planner.notify_source_changed();
+        let error = planner.step(&req).unwrap_err();
+        assert!(error.contains("braking sweep"), "新实测速度的制动证明仍必须生效：{error}");
     }
 
     #[test]

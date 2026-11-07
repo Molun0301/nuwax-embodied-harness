@@ -11,14 +11,14 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from contextlib import nullcontext
 
 from scripts.module_installer.catalog import MODULES, ModuleError, module_system_packages, resolve_modules
 from scripts.module_installer.hardware import detect_hardware, recommend_modules
-from scripts.module_installer.runtime import read_settings, write_profile, _CONFIG
 
 from . import MANAGER_DEVELOPMENT, MANAGER_REVISION, MANAGER_VERSION, PACKAGE_ROOT
 from .common import (ManagerError, atomic_json, atomic_write, file_lock,
-                     fsync_directory, identifier, process_alive, process_identity, read_json, timestamp)
+                     file_lock_held, fsync_directory, identifier, process_alive, process_identity, read_json, timestamp)
 from .runtime import Runtime, append_job_output, clean_environment, probe, run_command, system_helper
 
 from .storage import TERMINAL
@@ -190,12 +190,9 @@ class Engine:
     def _existing(self, current):
         if not current:
             return {}
-        if any((self.home / "config/profiles").glob("*/*.env")):
-            from scripts.import_legacy_config import import_legacy
-            result = import_legacy(self.home, PACKAGE_ROOT, manager_home=self.manager_home,
-                                   asset_root=Path(current["prefix"]) / "source")
-            self._legacy_import = result
-        return self._config_store().profile_values(self._config_store().active())
+        result = self._configuration("existing")
+        self._legacy_import = result["import"]
+        return result["values"]
 
     def hardware(self):
         hardware = detect_hardware(self.home)
@@ -400,8 +397,7 @@ class Engine:
         current = self.current()
         values = {"install_dir": str(self.home), "current": current.get("prefix"), "running": self.runtime.status()["running"], "settings": self.settings()}
         if current and (self.home / "config/active_profile").exists():
-            store = self._config_store()
-            values["config"] = {"profile": store.active(), "values": store.profile_values(store.active())}
+            values["config"] = self._configuration("snapshot")
         return values
 
     def plan(self, request, *, local_request=False):
@@ -740,7 +736,7 @@ class Engine:
         return result
 
     def _activate_profile(self, candidate, robot, values):
-        write_profile(self.home, self._profile_name(robot), values, candidate / "source")
+        probe(candidate, "install", name=self._profile_name(robot), values=values)
 
     def _execute(self, job):
         plan, action = job["_plan"], job["action"]
@@ -855,21 +851,11 @@ class Engine:
         return candidate
 
     def _configure_candidate(self, candidate, plan, existing, *, allow_pending_models=False):
-        if plan.get("action") == "rollback":
-            existing = probe(candidate, "validate_existing", values=existing)
         configuration = plan.get("_request", {}).get("configuration", {})
         if not isinstance(configuration, dict):
             raise ManagerError("invalid_config", "预配置必须是键值对象。")
-        if configuration:
-            existing.update(probe(candidate, "validate", values=configuration))
-        defaults = _CONFIG.flatten(_CONFIG.defaults(candidate / "source"))
-        for key in _CONFIG.PATH_KEYS:
-            value = existing.get(key, defaults[key])
-            if value:
-                path = Path(value)
-                if not path.is_absolute():
-                    relative = Path(*path.parts[1:]) if path.parts[0] in ("runtime_data", "data") else path
-                    existing[key] = str(self.home / "data" / relative)
+        existing = dict(existing, **configuration)
+        existing = probe(candidate, "prepare", values=existing)
         model_settings = []
         if "perception" in plan["modules"]:
             model_settings.append(("perception.yolo_world_model", "yolov8s-worldv2.pt"))
@@ -894,42 +880,27 @@ class Engine:
         existing.pop("gateway.port", None)
         return probe(candidate, "runtime", install_prefix=str(candidate), modules=plan["modules"], robot=plan["robot"], values=existing)
 
-    def _config_store(self):
-        current = self.current()
-        if not current:
-            raise ManagerError("not_installed", "请先安装业务版本。", 409)
-        return _CONFIG.ConfigStore(self.home, Path(current["prefix"]) / "source", self.runtime.port())
-
+    def _configuration(self, operation, **parameters):
+        with (nullcontext() if file_lock_held(self.lock_path) else file_lock(self.lock_path)):
+            current = self.current()
+            if not current:
+                raise ManagerError("not_installed", "请先安装业务版本。", 409)
+            return probe(Path(current["prefix"]), operation, **parameters)
 
     def config(self, profile=None):
         if not self.current():
             return {"available": False, "groups": [], "fields": [], "message": "安装完成后可编辑机器人配置。"}
-        store = self._config_store()
-        result = store.settings_schema(profile)
-        context = result["profile_context"]
-        context.update(is_active=context["profile"] == store.active(), robot=store.effective(context["profile"])["robot"]["driver"])
+        result = self._configuration("schema", profile=profile)
         result.update(available=True, groups=[{"key": section["section_id"], "title": section["section_title"]} for section in result["sections"]],
                       fields=[dict(field, group=section["section_id"], secret=field["sensitive"], restart_required=field["apply"] == "restart")
                               for section in result["sections"] for field in section["fields"]],
                       application={"restart_available": True}, message="热加载项保存后即时生效，其余参数需要重启业务。")
         return result
 
-    def save_config(self, values, profile=None):
-        if not isinstance(values, dict):
-            raise ManagerError("invalid_config", "配置 values 必须是对象。")
-        if "gateway.port" in values:
-            raise ManagerError("managed_setting", "业务端口请通过设备管理设置修改。")
+    def save_config(self, values, profile=None, *, text_values=False):
         with file_lock(self.lock_path):
             self._assert_idle()
-            store = self._config_store()
-            specs = _CONFIG.specifications(store.code_root)
-            updates = {key: val for key, val in values.items()
-                       if not (specs.get(key, {}).get("sensitive") and isinstance(val, str) and val.strip() in ("", "********"))}
-            try:
-                updates = probe(Path(self.current()["prefix"]), "validate", values=updates)
-                result = store.save(updates, profile)
-            except (ValueError, TypeError) as error:
-                raise ManagerError("invalid_config", str(error)) from error
+            result = self._configuration("save", values=values, profile=profile, text_values=text_values)
             result.update(hot_applied=[], apply_errors={})
             if result["is_active"] and result["hot_keys"] and self.runtime.has_owner():
                 import urllib.request
@@ -948,19 +919,13 @@ class Engine:
     def manage_profile(self, operation, *, name=None, source=None):
         with file_lock(self.lock_path):
             self._assert_idle()
-            store = self._config_store()
-            try:
-                if operation == "create":
-                    return store.create(name, source)
-                if operation == "delete":
-                    return store.delete(name)
-                store.activate(name)
-            except (ValueError, TypeError) as error:
-                raise ManagerError("invalid_config", str(error)) from error
+            result = self._configuration(operation, name=name, source=source)
+            if operation in ("create", "delete"):
+                return result
             current = Path(self.current()["prefix"])
             self.runtime.stop(current)
             self.runtime.start(current)
-            return store.catalog()
+            return result
 
     def restart_business(self):
         plan = self.plan({"action": "restart"}, local_request=True)

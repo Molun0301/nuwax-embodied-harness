@@ -24,7 +24,6 @@ from scripts.neh_system_helper import dependency_plan
 
 from .builds import build_modules, describe_builds, prune_build_cache
 from .catalog import ROBOT_REQUIREMENTS, module_imports, module_requirements, module_system_packages, resolve_modules
-from .runtime import read_existing, read_settings, write_profile, write_runtime, _CONFIG
 
 # Increment when dependency preparation changes without a requirements change.
 DEPENDENCY_RECIPE_VERSION = 1
@@ -76,7 +75,10 @@ def read_current(home: Path) -> dict:
 
 
 def existing_config(root: Path, current: Mapping, home=None) -> dict:
-    return read_existing(root, home or current.get("deployment", {}).get("install_home", root))
+    if not current:
+        return {}
+    from scripts.device_manager.runtime import probe
+    return probe(Path(current["prefix"]), "effective")
 
 
 def choose_python(requested: str = "") -> str:
@@ -427,7 +429,8 @@ def _python_environment(request: InstallRequest, hardware, prefix: Path, seed: s
 def _prepare_models(request: InstallRequest, prefix: Path, run, values) -> None:
     python = str(prefix / "venv/bin/python")
     output = request.home / "data/models"
-    values = _CONFIG.flatten(_CONFIG.resolve_paths(_CONFIG.nested(values), request.home))
+    from scripts.device_manager.runtime import probe
+    values = probe(prefix, "prepare", values=values)
     if "perception" in request.modules:
         configured = Path(values["perception.yolo_world_model"])
         target = configured if configured.is_absolute() else request.root / configured
@@ -527,6 +530,7 @@ def apply(request: InstallRequest, hardware) -> dict:
         identifier = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
         prefix = request.home / "generations" / identifier
         prefix.mkdir(parents=True)
+        (prefix / "source").symlink_to(request.root, target_is_directory=True)
         logs = request.home / "logs"
         logs.mkdir(exist_ok=True)
         run = CommandRunner(logs / (identifier + ".log"), request.root)
@@ -539,10 +543,15 @@ def apply(request: InstallRequest, hardware) -> dict:
             print(f"[3/5] 构建所选组件（并行 {request.jobs}）", flush=True)
             binaries = build_modules(request.root, prefix, request.home / "cache", request.modules, request.jobs, run)
             print("[4/5] 准备所选模型和启动配置", flush=True)
-            configuration = existing_config(request.root, current, request.home)
+            if current:
+                configuration = existing_config(request.root, current, request.home)
+            else:
+                from scripts.device_manager.runtime import probe
+                configuration = probe(prefix, "existing_values")
             if request.lio_backend:
                 configuration["geometry.lio_backend"] = request.lio_backend
-            values = write_runtime(request.root, prefix, request.modules, request.robot, configuration)
+            from scripts.device_manager.runtime import probe
+            values = probe(prefix, "runtime", install_prefix=str(prefix), modules=request.modules, robot=request.robot, values=configuration)
             _prepare_models(request, prefix, run, values)
             _verify_prefix(prefix, request.modules)
             print("[5/5] 校验完成，切换当前安装", flush=True)
@@ -553,9 +562,10 @@ def apply(request: InstallRequest, hardware) -> dict:
                 service_name = "neh-install-" + str(uuid.uuid4()) + ".service"
             selector = request.home / "config/active_profile"
             name = selector.read_text().strip() if selector.exists() else "default"
-            write_profile(request.home, name, values, request.root)
+            probe(prefix, "install", name=name, values=values)
             state["deployment"] = deployment_descriptor(request.root, request.home, prefix, request.modules,
                                                         request.robot, mode, service_name=service_name)
+            atomic_write(prefix / "installed.json", (json.dumps(state, ensure_ascii=False, indent=2) + "\n").encode("utf-8"), mode=0o600)
             atomic_write(prefix / "manifest.json", (json.dumps(state, ensure_ascii=False, indent=2) + "\n").encode("utf-8"), mode=0o600)
             temporary.symlink_to(prefix.relative_to(request.home))
             os.replace(str(temporary), str(request.home / "current"))

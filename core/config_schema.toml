@@ -17,8 +17,8 @@ special_values = [""]
 default = ""
 description = "显式声明执行器平面速度上限（米/秒）。须与偏航上限和运动形式同时填写。三项留空时，Go2 使用官方速度上限。"
 consumers = [
-    "监督者的导航参数解析 · scripts/resolve_navigation_pipeline.py:actuator_configuration",
-    "导航栈 · services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs:SurfaceNavigationConfig::from_env",
+    "core/config.py:derived_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.actuator_max_linear_mps",
 ]
 apply = "restart"
 
@@ -31,8 +31,8 @@ special_values = [""]
 default = ""
 description = "显式声明执行器偏航上限（弧度/秒），最大为 4π。须与平面上限和运动形式同时填写。"
 consumers = [
-    "监督者的导航参数解析 · scripts/resolve_navigation_pipeline.py:actuator_configuration",
-    "导航栈 · services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs:SurfaceNavigationConfig::from_env",
+    "core/config.py:derived_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.actuator_max_yaw_rps",
 ]
 apply = "restart"
 
@@ -42,8 +42,8 @@ choices = ["", "omnidirectional"]
 default = ""
 description = "执行器的基本运动方式，目前只支持 omnidirectional（可前后左右平移和原地转向）。须与两项速度上限同时填写，供三维导航使用。"
 consumers = [
-    "监督者的导航参数解析 · scripts/resolve_navigation_pipeline.py:actuator_configuration",
-    "导航栈 · services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs:SurfaceNavigationConfig::from_env",
+    "core/config.py:derived_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.actuator_motion_model",
 ]
 apply = "restart"
 
@@ -52,10 +52,11 @@ type = "string"
 default = "base_link"
 description = "机体基准坐标系名，运动守卫用作命令和执行反馈的参考帧。"
 consumers = [
-    "几何运行时 · services/geometry/nuwax_geometry_runtime/src/mapper.rs:MapperConfig::from_env",
-    "导航栈 · services/nuwax-workspace/crates/nuwax-nav-stack/src/lcm_dataflow.rs:capture_body_reference",
-    "运动守卫 · services/navigation/motion_safety_guard/motion_control_actuator.py:MotionControlActuator.from_environment",
-    "运动守卫 · services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.__init__",
+    "core/settings.py:load_config",
+    "services/navigation/motion_safety_guard/execution_feedback.py:ExecutionFeedback.from_environment",
+    "services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.__init__",
+    "services/navigation/motion_safety_guard/motion_control_actuator.py:MotionControlActuator.from_environment",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.base_frame",
 ]
 apply = "restart"
 
@@ -65,8 +66,8 @@ special_values = [""]
 default = ""
 description = "机体外包中心相对基准坐标系的前后偏移（米）。留空时按模型或驱动计算。"
 consumers = [
-    "网关 · core/robot_geometry.py:RobotGeometryConfig.from_values",
-    "监督者的外形计算 · scripts/resolve_robot_geometry.py:main",
+    "core/robot_geometry.py:RobotGeometryConfig.from_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.center_x_m",
 ]
 apply = "restart"
 
@@ -76,8 +77,8 @@ special_values = [""]
 default = ""
 description = "机体外包中心相对基准坐标系的左右偏移（米）。留空时按模型或驱动计算。"
 consumers = [
-    "网关 · core/robot_geometry.py:RobotGeometryConfig.from_values",
-    "监督者的外形计算 · scripts/resolve_robot_geometry.py:main",
+    "core/robot_geometry.py:RobotGeometryConfig.from_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.center_y_m",
 ]
 apply = "restart"
 
@@ -87,8 +88,8 @@ special_values = [""]
 default = ""
 description = "机体外包中心相对基准坐标系的上下偏移（米）。留空时按模型或驱动计算。"
 consumers = [
-    "网关 · core/robot_geometry.py:RobotGeometryConfig.from_values",
-    "监督者的外形计算 · scripts/resolve_robot_geometry.py:main",
+    "core/robot_geometry.py:RobotGeometryConfig.from_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.center_z_m",
 ]
 apply = "restart"
 
@@ -98,9 +99,9 @@ choices = ["customrobot", "go2", "g1", "raspi_lidar_robot"]
 default = "customrobot"
 description = "活动方案的机器人驱动。安装或导入时保留实际机器人型号。"
 consumers = [
-    "网关 · drivers/entry.py:get_active_robot_registration",
-    "监督者 · scripts/supervisor.py:component_table",
-    "安装配置 · scripts/module_installer/runtime.py:write_runtime",
+    "core/config.py:derived_values",
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.driver",
 ]
 apply = "restart"
 
@@ -112,8 +113,8 @@ special_values = [""]
 default = ""
 description = "手填机体上下高度（米）。须为正数。留空时沿用模型或驱动对应尺寸。"
 consumers = [
-    "网关 · core/robot_geometry.py:RobotGeometryConfig.from_values",
-    "监督者的外形计算 · scripts/resolve_robot_geometry.py:main",
+    "core/robot_geometry.py:RobotGeometryConfig.from_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.height_m",
 ]
 apply = "restart"
 
@@ -125,8 +126,8 @@ special_values = [""]
 default = ""
 description = "手填机体前后长度（米）。须为正数。留空时沿用模型或驱动对应尺寸。"
 consumers = [
-    "网关 · core/robot_geometry.py:RobotGeometryConfig.from_values",
-    "监督者的外形计算 · scripts/resolve_robot_geometry.py:main",
+    "core/robot_geometry.py:RobotGeometryConfig.from_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.length_m",
 ]
 apply = "restart"
 
@@ -135,8 +136,8 @@ type = "string"
 default = "utlidar_lidar"
 description = "雷达坐标系名，几何运行时用它标识雷达输入。"
 consumers = [
-    "几何运行时 · services/geometry/nuwax_geometry_runtime/src/lio.rs:Lio::start",
-    "网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata",
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.lidar_frame",
 ]
 apply = "restart"
 
@@ -145,9 +146,8 @@ type = "string"
 default = "map"
 description = "地图坐标系名。三维曲面导航要求 map。"
 consumers = [
-    "几何运行时 · services/geometry/nuwax_geometry_runtime/src/mapper.rs:MapperConfig::from_env",
-    "导航栈 · services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs:SurfaceNavigationConfig::from_env",
-    "网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata",
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.map_frame",
 ]
 apply = "restart"
 
@@ -156,8 +156,8 @@ type = "string"
 default = ""
 description = "机器人描述模型中的机体基准连杆名。留空时由现行模型规则确定。"
 consumers = [
-    "网关 · core/robot_geometry.py:RobotGeometryConfig.from_values",
-    "监督者的外形计算 · scripts/resolve_robot_geometry.py:main",
+    "core/robot_geometry.py:RobotGeometryConfig.from_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.model_base_link",
 ]
 apply = "restart"
 
@@ -166,8 +166,8 @@ type = "string"
 default = ""
 description = "关节名到参考关节位置的 JSON（结构化文本）对象。留空时按模型默认参考姿态计算外形。"
 consumers = [
-    "网关 · core/robot_geometry.py:RobotGeometryConfig.from_values",
-    "监督者的外形计算 · scripts/resolve_robot_geometry.py:main",
+    "core/robot_geometry.py:RobotGeometryConfig.from_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.model_joint_positions_json",
 ]
 apply = "restart"
 
@@ -176,8 +176,8 @@ type = "string"
 default = ""
 description = "机器人描述模型（URDF）路径。留空时采用驱动提供的模型或手填外形。"
 consumers = [
-    "网关 · core/robot_geometry.py:RobotGeometryConfig.from_values",
-    "监督者的外形计算 · scripts/resolve_robot_geometry.py:main",
+    "core/robot_geometry.py:RobotGeometryConfig.from_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.model_path",
 ]
 apply = "restart"
 
@@ -186,9 +186,8 @@ type = "string"
 default = "odom"
 description = "里程计坐标系名，供几何帧路由、导航输入与设备数据面使用。"
 consumers = [
-    "几何运行时 · services/geometry/nuwax_geometry_runtime/src/lio.rs:Lio::start",
-    "导航栈 · services/nuwax-workspace/crates/nuwax-nav-stack/src/lcm_dataflow.rs:run_map_pose_adapter",
-    "网关内 Go2 驱动 · drivers/go2/settings.py:load_go2_data_plane_config",
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.odom_frame",
 ]
 apply = "restart"
 
@@ -200,8 +199,8 @@ special_values = [""]
 default = ""
 description = "手填机体左右宽度（米）。须为正数。留空时沿用模型或驱动对应尺寸。"
 consumers = [
-    "网关 · core/robot_geometry.py:RobotGeometryConfig.from_values",
-    "监督者的外形计算 · scripts/resolve_robot_geometry.py:main",
+    "core/robot_geometry.py:RobotGeometryConfig.from_values",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Robot.width_m",
 ]
 apply = "restart"
 
@@ -210,11 +209,9 @@ type = "string"
 default = "udpm://239.255.76.67:7667?ttl=0"
 description = "轻量通信与编组（LCM）的统一传输地址。默认组播仅本机回环，进程和管理程序网络准备共用。"
 consumers = [
-    "设备管理程序 · scripts/device_manager/runtime.py:Runtime.start",
-    "几何运行时 · services/geometry/nuwax_geometry_runtime/src/outputs.rs:Outputs::start",
-    "导航栈 · services/nuwax-workspace/crates/nuwax-nav-stack/src/lcm_dataflow.rs:lcm_transport",
-    "网关 · gateways/person_follow.py:GatewayPersonFollowBridge.__init__",
-    "人物跟随 · services/nuwax-workspace/crates/nuwax-nav-visual-servoing/src/bin/nuwax-person-follow.rs:run",
+    "core/settings.py:load_config",
+    "gateways/person_follow.py:GatewayPersonFollowBridge.__init__",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Transport.lcm_url",
 ]
 apply = "restart"
 
@@ -222,7 +219,10 @@ apply = "restart"
 type = "boolean"
 default = false
 description = "是否要求设备管理程序在启动监督者前准备真实的轻量通信与编组（LCM）网络。"
-consumers = ["设备管理程序 · scripts/device_manager/runtime.py:Runtime.start"]
+consumers = [
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Transport.real_lcm_required",
+]
 apply = "restart"
 
 [gateway.artifact_cleanup_batch_size]
@@ -231,8 +231,7 @@ min = 1
 default = 200
 description = "制品清理批量大小"
 consumers = [
-    "网关 · gateways/platform.py:build_platform",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "core/settings.py:load_config",
 ]
 apply = "hot"
 
@@ -240,7 +239,9 @@ apply = "hot"
 type = "string"
 default = "artifacts"
 description = "制品目录，受管安装将相对路径解析到持久数据根。"
-consumers = ["网关 · gateways/platform.py:build_platform"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [gateway.artifact_max_count]
@@ -249,8 +250,7 @@ min = 1
 default = 1000
 description = "制品最大数量"
 consumers = [
-    "网关 · gateways/platform.py:build_platform",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "core/settings.py:load_config",
 ]
 apply = "hot"
 
@@ -260,8 +260,7 @@ min = 1
 default = 1073741824
 description = "制品总大小上限（字节）"
 consumers = [
-    "网关 · gateways/platform.py:build_platform",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "core/settings.py:load_config",
 ]
 apply = "hot"
 
@@ -271,8 +270,7 @@ min = 1
 default = 7
 description = "图片等制品保存超过此天数后自动清理（至少1天）。数量和总容量上限另行控制。"
 consumers = [
-    "网关 · gateways/platform.py:build_platform",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "core/settings.py:load_config",
 ]
 apply = "hot"
 
@@ -280,7 +278,9 @@ apply = "hot"
 type = "integer"
 default = 134217728
 description = "网关与几何运行时的远程调用客户端收发消息上限（字节）。服务端另有协议上限。"
-consumers = ["网关 · services/geometry/client.py:GeometryClient.__init__"]
+consumers = [
+    "services/geometry/client.py:GeometryClient.__init__",
+]
 apply = "restart"
 
 [gateway.host]
@@ -288,8 +288,7 @@ type = "string"
 default = "127.0.0.1"
 description = "网关监听地址，受管入口使用本机回环地址。"
 consumers = [
-    "监督者 · scripts/supervisor.py:component_table",
-    "设备管理程序 · scripts/device_manager/engine.py:Engine._configure_candidate",
+    "core/settings.py:load_config",
 ]
 apply = "restart"
 
@@ -298,8 +297,7 @@ type = "string"
 default = "#cbd5e1"
 description = "三维点云显示的基础色，格式为 #RRGGBB。"
 consumers = [
-    "网关 · core/settings.py:load_config",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "core/settings.py:load_config",
 ]
 apply = "hot"
 
@@ -308,8 +306,7 @@ type = "string"
 default = "#38bdf8"
 description = "三维点云显示的地面色，格式为 #RRGGBB。"
 consumers = [
-    "网关 · core/settings.py:load_config",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "core/settings.py:load_config",
 ]
 apply = "hot"
 
@@ -320,8 +317,7 @@ length = 5
 default = ["#38bdf8", "#22d3ee", "#4ade80", "#facc15", "#fb7185"]
 description = "点云按高度着色的五种颜色，按低到高排列，每个元素格式为 #RRGGBB。"
 consumers = [
-    "网关 · core/settings.py:load_config",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "core/settings.py:load_config",
 ]
 apply = "hot"
 
@@ -330,8 +326,7 @@ type = "string"
 default = "#fbbf24"
 description = "三维点云显示的物体色，格式为 #RRGGBB。"
 consumers = [
-    "网关 · core/settings.py:load_config",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "core/settings.py:load_config",
 ]
 apply = "hot"
 
@@ -342,8 +337,7 @@ max = 20.0
 default = 1.35
 description = "网页点云渲染的点大小倍率。"
 consumers = [
-    "网关 · core/settings.py:load_config",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "core/settings.py:load_config",
 ]
 apply = "hot"
 
@@ -354,8 +348,7 @@ max = 2.0
 default = 0.1
 description = "点云显示的空间采样间隔（米）。"
 consumers = [
-    "网关 · core/settings.py:load_config",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "core/settings.py:load_config",
 ]
 apply = "hot"
 
@@ -364,8 +357,7 @@ type = "string"
 default = "#f8fafc"
 description = "三维点云显示的结构色，格式为 #RRGGBB。"
 consumers = [
-    "网关 · core/settings.py:load_config",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "core/settings.py:load_config",
 ]
 apply = "hot"
 
@@ -376,9 +368,7 @@ max = 65535
 default = 8766
 description = "网关监听端口。设备管理程序保存业务端口并在合成配置中写入此键。"
 consumers = [
-    "设备管理程序 · scripts/device_manager/runtime.py:Runtime.port",
-    "监督者 · scripts/supervisor.py:component_table",
-    "网关 · core/settings.py:load_config",
+    "core/settings.py:load_config",
 ]
 apply = "restart"
 
@@ -387,8 +377,7 @@ type = "string"
 default = ""
 description = "外部客户端访问网关和制品的地址。留空时，受管安装按业务端口生成本机回环访问地址。"
 consumers = [
-    "网关 · gateways/platform.py:build_platform",
-    "网关 · gateways/mcp/protocol.py:_build_initialize_result",
+    "core/settings.py:load_config",
 ]
 apply = "restart"
 
@@ -396,7 +385,9 @@ apply = "restart"
 type = "float"
 default = 10.0
 description = "服务端事件流发送保活消息的间隔（秒）。"
-consumers = ["网关 · gateways/ws/data_streams.py:build_data_stream_router.sse_streams.frame_generator"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [gateway.telemetry_enabled]
@@ -404,8 +395,7 @@ type = "boolean"
 default = false
 description = "定时采集整机CPU、内存以及项目相关进程的资源占用，在控制台性能监控中显示。"
 consumers = [
-    "网关 · gateways/streams.py:Streams._start_telemetry",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "core/settings.py:load_config",
 ]
 apply = "hot"
 
@@ -414,8 +404,7 @@ type = "boolean"
 default = true
 description = "除关键词匹配的进程外，同时统计网关自身及其全部子进程。"
 consumers = [
-    "网关 · gateways/streams.py:Streams._start_telemetry",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "core/settings.py:load_config",
 ]
 apply = "hot"
 
@@ -425,8 +414,7 @@ min = 0.5
 default = 2.0
 description = "两次采集之间的秒数，最小0.5。算力较弱的设备可调大以降低开销。"
 consumers = [
-    "网关 · gateways/streams.py:Streams._start_telemetry",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "core/settings.py:load_config",
 ]
 apply = "hot"
 
@@ -436,8 +424,7 @@ items = "string"
 default = ["gateway", "nuwax-geometry-runtime", "nuwax-nav-stack", "nuwax-go2-video-streamer"]
 description = "性能采集时用于匹配相关进程命令行的关键词列表。"
 consumers = [
-    "网关 · gateways/streams.py:Streams._start_telemetry",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "core/settings.py:load_config",
 ]
 apply = "hot"
 
@@ -445,7 +432,9 @@ apply = "hot"
 type = "float"
 default = 15.0
 description = "网页双向消息连接的心跳间隔（秒）。"
-consumers = ["网关 · gateways/ws/data_streams.py:build_data_stream_router.websocket_streams"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.burst_frame_count]
@@ -454,8 +443,7 @@ min = 1
 default = 4
 description = "到点复核默认连续检测的帧数。调用方指定帧数时以调用方为准。"
 consumers = [
-    "网关 · gateways/platform.py:build_platform",
-    "网关 · services/perception/video_runtime.py:PerceptionVideoRuntime.__init__",
+    "core/settings.py:load_config",
 ]
 apply = "hot"
 
@@ -465,8 +453,7 @@ min = 0.05
 default = 0.08
 description = "到点复核帧间隔（秒）"
 consumers = [
-    "网关 · gateways/platform.py:build_platform",
-    "网关 · services/perception/video_runtime.py:PerceptionVideoRuntime.__init__",
+    "core/settings.py:load_config",
 ]
 apply = "hot"
 
@@ -476,7 +463,9 @@ min = 0.0
 max = 1.0
 default = 0.5
 description = "ByteTrack 高置信阈值"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.bytetrack_iou]
@@ -485,7 +474,9 @@ min = 0.0
 max = 1.0
 default = 0.3
 description = "ByteTrack 匹配检测框和已有轨迹时使用的交并比阈值。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.bytetrack_lost_ttl_frames]
@@ -493,7 +484,9 @@ type = "integer"
 min = 1
 default = 30
 description = "ByteTrack 丢失保留帧数"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.bytetrack_low_threshold]
@@ -502,14 +495,18 @@ min = 0.0
 max = 1.0
 default = 0.1
 description = "ByteTrack 低置信阈值"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.bytetrack_name]
 type = "string"
 default = "go2_bytetrack_tracker"
 description = "ByteTrack（多目标跟踪算法）跟踪器在感知服务中的注册名称，一般无需修改。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.bytetrack_trajectory_limit]
@@ -517,28 +514,36 @@ type = "integer"
 min = 2
 default = 12
 description = "ByteTrack 轨迹保留数量"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.default_detector_backend]
 type = "string"
 default = "yolo_world"
 description = "优先使用的检测后端注册名。常见值为 yolo_world 和 metadata_detector，所选名称须对应当前注册的后端。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.default_scene_backend]
 type = "string"
 default = "simple_scene"
 description = "场景描述模式。simple_scene 使用本地规则，openai_vision 选择云端视觉，hybrid_scene 在有可用云端模型时组合两者。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.default_segmentation_backend]
 type = "string"
 default = "segmentation_disabled"
 description = "未指定分割后端名称时采用的注册名。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.deferred_strategy]
@@ -546,7 +551,9 @@ type = "string"
 choices = ["disabled", "triangulation", "delayed_pointcloud", "triangulation_first"]
 default = "disabled"
 description = "控制记忆位置估计的三角化分支。现行读取方把 triangulation 与 triangulation_first 视为启用，其余两种关闭。延迟点云细化在当前调用链中没有读取方。"
-consumers = ["网关 · services/memory/service.py:MemoryService.__init__"]
+consumers = [
+    "core/settings.py:_build_deferred_projection_config",
+]
 apply = "restart"
 
 [perception.ground_tolerance_m]
@@ -554,7 +561,9 @@ type = "float"
 min = 0.0
 default = 0.04
 description = "水平地面支持点剔除容差（米）。在直立机器人和局部水平地面条件下，剔除与模型估计地面高度差不超过此值的点。"
-consumers = ["网关 · gateways/platform.py:build_platform", "网关 · services/perception/geometry.py:DetectionGeometryAugmentor.__init__"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.keyframe_min_interval_sec]
@@ -563,8 +572,7 @@ min = 0.05
 default = 1.0
 description = "持续视频感知保存两个关键帧之间的最短时间（秒）。"
 consumers = [
-    "网关 · gateways/platform.py:build_platform",
-    "网关 · services/perception/video_runtime.py:PerceptionVideoRuntime.__init__",
+    "core/settings.py:load_config",
 ]
 apply = "hot"
 
@@ -573,8 +581,7 @@ type = "boolean"
 default = true
 description = "启用关键帧记忆"
 consumers = [
-    "网关 · gateways/platform.py:build_platform",
-    "网关 · services/perception/video_runtime.py:PerceptionVideoRuntime.__init__",
+    "core/settings.py:load_config",
 ]
 apply = "hot"
 
@@ -584,8 +591,7 @@ min = 0.0
 default = 0.75
 description = "关键帧平移阈值（米）"
 consumers = [
-    "网关 · gateways/platform.py:build_platform",
-    "网关 · services/perception/video_runtime.py:PerceptionVideoRuntime.__init__",
+    "core/settings.py:load_config",
 ]
 apply = "hot"
 
@@ -595,8 +601,7 @@ min = 0.0
 default = 20.0
 description = "关键帧转向阈值（度）"
 consumers = [
-    "网关 · gateways/platform.py:build_platform",
-    "网关 · services/perception/video_runtime.py:PerceptionVideoRuntime.__init__",
+    "core/settings.py:load_config",
 ]
 apply = "hot"
 
@@ -605,7 +610,9 @@ type = "string"
 default = ""
 description = "兼容 OpenAI 接口的视觉服务访问密钥，留空表示未配置。"
 sensitive = true
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.openai_api_style]
@@ -613,28 +620,36 @@ type = "string"
 choices = ["auto", "chat_completions", "responses"]
 default = "auto"
 description = "云端视觉请求的接口样式。auto 按模型及地址自动选择。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.openai_backend_name]
 type = "string"
 default = "openai_vision"
 description = "OpenAI 视觉后端名称"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.openai_base_url]
 type = "string"
 default = "https://api.openai.com/v1"
 description = "OpenAI API 基础地址"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.openai_enabled]
 type = "boolean"
 default = false
 description = "启用兼容 OpenAI 接口的云端视觉模型分析画面。需同时配置服务地址、密钥和模型。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.openai_max_tokens]
@@ -642,14 +657,18 @@ type = "integer"
 min = 128
 default = 1400
 description = "OpenAI 最大输出令牌数"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.openai_model]
 type = "string"
 default = ""
 description = "云端视觉服务模型标识，启用云端视觉时由使用方填写。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.openai_temperature]
@@ -657,7 +676,9 @@ type = "float"
 min = 0.0
 default = 0.0
 description = "OpenAI 温度"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.openai_timeout_sec]
@@ -665,14 +686,18 @@ type = "float"
 min = 1.0
 default = 20.0
 description = "OpenAI 请求超时（秒）"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.postprocess_nms_enabled]
 type = "boolean"
 default = true
 description = "是否对目标检测结果执行跨类别非极大值抑制。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.postprocess_nms_iou]
@@ -681,28 +706,36 @@ min = 0.0
 max = 1.0
 default = 0.55
 description = "目标检测后处理用的检测框交并比阈值。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.segmentation_allow_bbox_only_fallback]
 type = "boolean"
 default = true
 description = "允许仅使用检测框兜底"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.segmentation_backend_kind]
 type = "string"
 default = "disabled_segmentation"
 description = "分割提供者类型。disabled_segmentation 为默认，detection_attributes 可复用检测属性。实际路由和是否允许框回退共同决定结果。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.segmentation_backend_name]
 type = "string"
 default = ""
 description = "分割后端名称"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.segmentation_depth_coverage_threshold]
@@ -711,49 +744,63 @@ min = 0.0
 max = 1.0
 default = 0.2
 description = "分割深度覆盖率阈值，当前由感知工厂写入分割提供者元数据。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.segmentation_emit_polygon]
 type = "boolean"
 default = true
 description = "轮廓多边形输出选项，当前由感知工厂写入分割提供者元数据。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.segmentation_emit_quality_details]
 type = "boolean"
 default = true
 description = "质量明细输出选项，当前由感知工厂写入分割提供者元数据。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.segmentation_emit_raw_mask]
 type = "boolean"
 default = false
 description = "原始掩膜输出选项，当前由感知工厂写入分割提供者元数据。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.segmentation_emit_runtime_summary]
 type = "boolean"
 default = true
 description = "运行摘要输出选项，当前由感知工厂写入分割提供者元数据。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.segmentation_enabled]
 type = "boolean"
 default = false
 description = "启用现有分割路由。网关当前可复用检测属性的分割结果，或按设置返回检测框。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.segmentation_low_latency_backend_name]
 type = "string"
 default = "yolo_world_sam2"
 description = "分割低延迟后端名称"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.segmentation_map_projection_coverage_threshold]
@@ -762,7 +809,9 @@ min = 0.0
 max = 1.0
 default = 0.2
 description = "分割地图投影覆盖率阈值，当前由感知工厂写入分割提供者元数据。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.segmentation_polygon_simplification_epsilon_px]
@@ -770,7 +819,9 @@ type = "float"
 min = 0.0
 default = 2.0
 description = "轮廓简化容差（像素），当前由感知工厂写入分割提供者元数据。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.segmentation_predicted_iou_threshold]
@@ -779,14 +830,18 @@ min = 0.0
 max = 1.0
 default = 0.5
 description = "分割预测交并比阈值，当前由感知工厂写入分割提供者元数据。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.segmentation_primary_backend_name]
 type = "string"
 default = "groundingdino_sam2"
 description = "分割主后端名称"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.segmentation_reprojection_error_threshold_px]
@@ -794,14 +849,18 @@ type = "float"
 min = 0.0
 default = 8.0
 description = "分割重投影误差阈值（像素），当前由感知工厂写入分割提供者元数据。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.segmentation_route]
 type = "string"
 default = "primary"
 description = "分割路由标识。常见值为 primary、low_latency、passthrough、bbox_only 和 disabled。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.segmentation_score_threshold]
@@ -810,7 +869,9 @@ min = 0.0
 max = 1.0
 default = 0.5
 description = "分割分数阈值，当前由感知工厂写入分割提供者元数据。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.segmentation_stability_score_threshold]
@@ -819,7 +880,9 @@ min = 0.0
 max = 1.0
 default = 0.5
 description = "分割稳定分数阈值，当前由感知工厂写入分割提供者元数据。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.self_filter_bbox_iou]
@@ -828,7 +891,9 @@ min = 0.0
 max = 1.0
 default = 0.5
 description = "检测框与投影到画面内的机器人部件外接框的交并比阈值。与自体覆盖率条件任一满足即判为自体。"
-consumers = ["网关 · gateways/platform.py:build_platform", "网关 · services/perception/self_body.py:build_self_body_filter"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.self_filter_coverage]
@@ -837,7 +902,9 @@ min = 0.05
 max = 1.0
 default = 0.5
 description = "检测掩膜被机器人部件凸包并集覆盖的比例阈值。没有掩膜时按检测框计算覆盖率。"
-consumers = ["网关 · gateways/platform.py:build_platform", "网关 · services/perception/self_body.py:build_self_body_filter"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.self_filter_dilation_px]
@@ -845,14 +912,18 @@ type = "float"
 min = 0.0
 default = 6.0
 description = "运动学投影区域向外扩展的像素数，用于补偿投影和标定误差。"
-consumers = ["网关 · gateways/platform.py:build_platform", "网关 · services/perception/self_body.py:build_self_body_filter"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.self_filter_enabled]
 type = "boolean"
 default = true
 description = "是否启用机器人自体检测过滤。过滤器根据机器人模型、关节状态和相机配置判定自体并公开过滤状态。"
-consumers = ["网关 · gateways/platform.py:build_platform", "网关 · services/perception/self_body.py:build_self_body_filter"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.self_filter_max_joint_age_sec]
@@ -860,14 +931,18 @@ type = "float"
 min = 0.01
 default = 0.5
 description = "关节源时间与图像源时间允许的最大绝对差（秒）。超出后本帧停用运动学区域并报告关节数据过旧。"
-consumers = ["网关 · gateways/platform.py:build_platform", "网关 · services/perception/self_body.py:build_self_body_filter"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.self_filter_static_regions_json]
 type = "string"
 default = ""
 description = "相机标识到静态忽略多边形列表的 JSON（结构化文本）对象。顶点坐标在 0 至 1 之间。留空时不配置静态区域。"
-consumers = ["网关 · gateways/platform.py:build_platform", "网关 · services/perception/self_body.py:build_self_body_filter"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.stream_camera_id]
@@ -875,8 +950,7 @@ type = "string"
 default = "front_camera"
 description = "持续感知默认使用的相机标识。"
 consumers = [
-    "网关 · gateways/platform.py:build_platform",
-    "网关 · services/perception/video_runtime.py:PerceptionVideoRuntime.__init__",
+    "core/settings.py:load_config",
 ]
 apply = "restart"
 
@@ -885,8 +959,7 @@ type = "string"
 default = "yolo_world"
 description = "持续感知使用的已注册检测后端名。受管安装按所选感知模块提供后端，空字符串由检测管线选择。"
 consumers = [
-    "网关 · gateways/platform.py:build_platform",
-    "网关 · services/perception/video_runtime.py:PerceptionVideoRuntime.__init__",
+    "core/settings.py:load_config",
 ]
 apply = "restart"
 
@@ -896,8 +969,7 @@ min = 0.1
 default = 2.0
 description = "持续感知失败退避（秒）"
 consumers = [
-    "网关 · gateways/platform.py:build_platform",
-    "网关 · services/perception/video_runtime.py:PerceptionVideoRuntime.__init__",
+    "core/settings.py:load_config",
 ]
 apply = "hot"
 
@@ -907,8 +979,7 @@ min = 0.05
 default = 0.5
 description = "持续视频感知两次检测之间的间隔（秒，至少0.05）。越小越及时，计算负担越大。"
 consumers = [
-    "网关 · gateways/platform.py:build_platform",
-    "网关 · services/perception/video_runtime.py:PerceptionVideoRuntime.__init__",
+    "core/settings.py:load_config",
 ]
 apply = "hot"
 
@@ -916,7 +987,9 @@ apply = "hot"
 type = "string"
 default = "bytetrack"
 description = "目标跟踪后端。bytetrack 或 byte_track 使用 ByteTrack（多目标跟踪算法），其余现行名称选择基础二维跟踪。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.triangulation_max_residual_m]
@@ -924,7 +997,9 @@ type = "float"
 min = 0.01
 default = 0.5
 description = "三角化最大残差（米）"
-consumers = ["网关 · services/memory/service.py:MemoryService.__init__"]
+consumers = [
+    "core/settings.py:_build_deferred_projection_config",
+]
 apply = "restart"
 
 [perception.triangulation_min_parallax_deg]
@@ -932,7 +1007,9 @@ type = "float"
 min = 0.0
 default = 5.0
 description = "三角化最小视差角（度）"
-consumers = ["网关 · services/memory/service.py:MemoryService.__init__"]
+consumers = [
+    "core/settings.py:_build_deferred_projection_config",
+]
 apply = "restart"
 
 [perception.triangulation_min_rays]
@@ -940,7 +1017,9 @@ type = "integer"
 min = 2
 default = 2
 description = "多视角三角化估计物品位置所需的最少观察射线数，至少2。"
-consumers = ["网关 · services/memory/service.py:MemoryService.__init__"]
+consumers = [
+    "core/settings.py:_build_deferred_projection_config",
+]
 apply = "restart"
 
 [perception.yolo_world_aliases]
@@ -948,14 +1027,18 @@ type = "array"
 items = "string"
 default = []
 description = "检测类别别名列表，每项按后端支持的别名绑定格式填写。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.yolo_world_backend_name]
 type = "string"
 default = "yolo_world"
 description = "YOLO-World 后端名称"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.yolo_world_classes]
@@ -963,7 +1046,9 @@ type = "array"
 items = "string"
 default = ["person", "door", "chair", "table", "shelf", "cabinet", "box", "bag", "backpack", "bottle", "cup", "bench", "stairs", "charger", "dock", "traffic cone", "fire hydrant"]
 description = "开放词汇检测的目标类别列表。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.yolo_world_confidence]
@@ -972,14 +1057,18 @@ min = 0.0
 max = 1.0
 default = 0.25
 description = "检测结果的最低置信度（0～1），低于此值的目标不输出。调高可减少误检。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "hot"
 
 [perception.yolo_world_device]
 type = "string"
 default = ""
 description = "检测模型运行设备，例如 cpu、cuda:0。留空时由模型后端自动选择。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.yolo_world_dynamic_class_keys]
@@ -987,14 +1076,18 @@ type = "array"
 items = "string"
 default = []
 description = "可从感知请求元数据读取动态检测类别的键名列表。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.yolo_world_enabled]
 type = "boolean"
 default = true
 description = "启用 YOLO-World（开放词汇目标检测模型）识别画面中的物品。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.yolo_world_image_size]
@@ -1002,7 +1095,9 @@ type = "integer"
 min = 32
 default = 640
 description = "YOLO-World 输入图像尺寸"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.yolo_world_iou]
@@ -1011,7 +1106,9 @@ min = 0.0
 max = 1.0
 default = 0.45
 description = "YOLO-World 检测内部抑制重叠框时使用的交并比阈值。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "hot"
 
 [perception.yolo_world_max_detections]
@@ -1019,21 +1116,27 @@ type = "integer"
 min = 1
 default = 100
 description = "YOLO-World 最大检测数量"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "hot"
 
 [perception.yolo_world_model]
 type = "string"
 default = "runtime_data/models/yolov8s-worldv2.pt"
 description = "YOLO-World（开放词汇检测模型）权重路径，受管安装按已下载或显式提供的模型写入持久路径。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [perception.yolo_world_use_worker]
 type = "boolean"
 default = true
 description = "是否在独立工作进程中运行 YOLO-World 模型。"
-consumers = ["网关 · services/perception/factory.py:build_platform_perception_components"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [memory.association_confirm_min_observations]
@@ -1041,7 +1144,9 @@ type = "integer"
 min = 1
 default = 3
 description = "确认物体需要的不同源观察标识数量。同帧重放、同帧精化和同源多相机不会重复确认。"
-consumers = ["网关 · services/memory/instance_association_service.py:InstanceAssociationService._confirm_instance"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [memory.association_confirm_window_sec]
@@ -1049,7 +1154,9 @@ type = "float"
 min = 1.0
 default = 60.0
 description = "自动感知新物体需在此秒数内积累指定次数的独立源观察，否则丢弃。显式记忆直接确认。"
-consumers = ["网关 · services/memory/instance_association_service.py:InstanceAssociationService.tentative_expired"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [memory.association_cross_label_overlap]
@@ -1058,7 +1165,9 @@ min = 0.0
 max = 1.0
 default = 0.5
 description = "标签不同时，较小一方落在较大一方中的比例至少达到此值。有双方体素时按体素数确定小方，否则按实测范围体积。另须通过逐轴尺寸比及历史同帧共现否决。"
-consumers = ["网关 · services/memory/instance_evidence.py:geometry_overlap_diagnostics"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [memory.association_cross_label_size_ratio]
@@ -1066,7 +1175,9 @@ type = "float"
 min = 1.0
 default = 3.0
 description = "跨标签关联或合并时允许的最大逐轴尺寸比，避免把桌上的书与桌子归为一物。"
-consumers = ["网关 · services/memory/instance_evidence.py:geometry_overlap_diagnostics"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [memory.association_gate_sigma]
@@ -1074,7 +1185,9 @@ type = "float"
 min = 0.5
 default = 3.0
 description = "空间关联门限为尺寸半宽加此倍数的合成测量标准差。双方标准差平方和开方，不按类别设置米数。"
-consumers = ["网关 · services/memory/instance_association_service.py:InstanceAssociationService._geometry_fit"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [memory.association_max_voxels]
@@ -1082,7 +1195,9 @@ type = "integer"
 min = 16
 default = 1024
 description = "每个实例累积的支持体素数量上限，超限按稳定散列保留有界证据。"
-consumers = ["网关 · services/memory/instance_association_service.py:InstanceAssociationService._accumulate_evidence"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [memory.association_min_support_points]
@@ -1090,7 +1205,9 @@ type = "integer"
 min = 1
 default = 5
 description = "主体簇点数不足时不新建实例、不更新物体位置或尺寸。仅按回退观察规则更新最近观察。完整三维检测尺寸与三角化不按点云簇点数拒绝。"
-consumers = ["网关 · services/memory/instance_association_service.py:InstanceAssociationService._admit_observation_support"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [memory.association_voxel_size_m]
@@ -1098,7 +1215,9 @@ type = "float"
 min = 0.005
 default = 0.03
 description = "跨视角支持点累积体素的边长，单位米。显示尺寸取累积体素的5%至95%分位范围。"
-consumers = ["网关 · services/memory/instance_association_service.py:InstanceAssociationService._accumulate_evidence"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [memory.embedding_api_key]
@@ -1106,14 +1225,18 @@ type = "string"
 default = ""
 description = "阿里云 DashScope（模型服务）的在线向量服务密钥，留空表示未配置。"
 sensitive = true
-consumers = ["网关 · gateways/platform.py:build_platform"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [memory.embedding_base_url]
 type = "string"
 default = "https://dashscope.aliyuncs.com/api/v1"
 description = "记忆嵌入服务基础地址"
-consumers = ["网关 · gateways/platform.py:build_platform"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [memory.embedding_timeout_sec]
@@ -1121,7 +1244,9 @@ type = "float"
 min = 1.0
 default = 20.0
 description = "记忆嵌入超时（秒）"
-consumers = ["网关 · gateways/platform.py:build_platform"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [memory.image_embedding_dim]
@@ -1129,14 +1254,18 @@ type = "integer"
 min = 8
 default = 512
 description = "图像向量维数，须与图像模型输出匹配。受管安装本地默认模型的输出为 512 维。"
-consumers = ["网关 · gateways/platform.py:build_platform"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [memory.image_embedding_model]
 type = "string"
 default = "runtime_data/models/openai__clip-vit-base-patch32"
 description = "记忆图像向量模型路径或后端标识。受管安装选装记忆时使用本地 clip-vit-base-patch32。"
-consumers = ["网关 · gateways/platform.py:build_platform"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [memory.text_embedding_dim]
@@ -1144,14 +1273,18 @@ type = "integer"
 min = 8
 default = 512
 description = "文本向量维数，须与文本模型输出匹配。受管安装本地默认模型的输出为 512 维。"
-consumers = ["网关 · gateways/platform.py:build_platform"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [memory.text_embedding_model]
 type = "string"
 default = "runtime_data/models/BAAI__bge-small-zh-v1.5"
 description = "记忆文本向量模型路径或后端标识。受管安装选装记忆时使用本地 bge-small-zh-v1.5。"
-consumers = ["网关 · gateways/platform.py:build_platform"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [semantic_map.NUWAX_SCENE_MAPPING_API_KEY]
@@ -1160,8 +1293,7 @@ default = ""
 description = "Jev 远程接口的访问密钥，本地后端不需要。页面不显示已保存的值，留空保存会保留原值。"
 sensitive = true
 consumers = [
-    "网关 · core/settings.py:_load_scene_mapping_config",
-    "网关 · services/memory/semantic_map/scene_mapping.py:SceneMappingService",
+    "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
 
@@ -1170,8 +1302,7 @@ type = "boolean"
 default = true
 description = "候选名称达到分数、分数差和视角数门槛时自动写入区域。关闭后只保留为候选。手动命名优先。"
 consumers = [
-    "网关 · core/settings.py:_load_scene_mapping_config",
-    "网关 · services/memory/semantic_map/scene_mapping.py:SceneMappingService",
+    "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
 
@@ -1180,8 +1311,7 @@ type = "boolean"
 default = false
 description = "网关启动后自动开始后台语义处理。需同时开启语义地图。"
 consumers = [
-    "网关 · core/settings.py:_load_scene_mapping_config",
-    "网关 · services/memory/semantic_map/scene_mapping.py:SceneMappingService",
+    "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
 
@@ -1191,8 +1321,7 @@ choices = ["openjev_http", "jev_api"]
 default = "openjev_http"
 description = "选择本地 OpenJev 服务或 Jev 远程接口。"
 consumers = [
-    "网关 · core/settings.py:_load_scene_mapping_config",
-    "网关 · services/memory/semantic_map/scene_mapping.py:SceneMappingService",
+    "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
 
@@ -1201,8 +1330,7 @@ type = "string"
 default = "http://127.0.0.1:8791"
 description = "语义决策服务的根地址或以 /v1 结尾的地址。默认值对应本地后端，远程后端使用其服务地址。"
 consumers = [
-    "网关 · core/settings.py:_load_scene_mapping_config",
-    "网关 · services/memory/semantic_map/scene_mapping.py:SceneMappingService",
+    "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
 
@@ -1213,8 +1341,7 @@ max = 20.0
 default = 1.2
 description = "宽度小于此值的通道视为门口，用来把相连空间分成不同房间（米）。"
 consumers = [
-    "网关 · core/settings.py:_load_scene_mapping_config",
-    "网关 · services/memory/semantic_map/scene_mapping.py:SceneMappingService",
+    "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
 
@@ -1223,8 +1350,7 @@ type = "boolean"
 default = false
 description = "开启语义地图（区域划分与命名）。保存设置不会启动模型服务。"
 consumers = [
-    "网关 · core/settings.py:_load_scene_mapping_config",
-    "网关 · services/memory/semantic_map/scene_mapping.py:SceneMappingService",
+    "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
 
@@ -1235,8 +1361,7 @@ max = 3600.0
 default = 10.0
 description = "后台语义处理两轮之间的等待时间（秒）。"
 consumers = [
-    "网关 · core/settings.py:_load_scene_mapping_config",
-    "网关 · services/memory/semantic_map/scene_mapping.py:SceneMappingService",
+    "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
 
@@ -1247,8 +1372,7 @@ max = 16000000
 default = 2000000
 description = "单次房间划分允许的最大地图栅格数。地图更大时不划分（不会自动降采样）。"
 consumers = [
-    "网关 · core/settings.py:_load_scene_mapping_config",
-    "网关 · services/memory/semantic_map/scene_mapping.py:SceneMappingService",
+    "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
 
@@ -1259,8 +1383,7 @@ max = 86400.0
 default = 300.0
 description = "早于这个时间的观察证据不参与命名判断（秒）。"
 consumers = [
-    "网关 · core/settings.py:_load_scene_mapping_config",
-    "网关 · services/memory/semantic_map/scene_mapping.py:SceneMappingService",
+    "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
 
@@ -1271,8 +1394,7 @@ max = 3
 default = 3
 description = "本地模型每次请求最多附带的证据图片数（1～3）。Jev 远程接口不发送图片。"
 consumers = [
-    "网关 · core/settings.py:_load_scene_mapping_config",
-    "网关 · services/memory/semantic_map/scene_mapping.py:SceneMappingService",
+    "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
 
@@ -1283,8 +1405,7 @@ max = 100
 default = 4
 description = "每轮后台处理最多分析的区域数，其余留到下一轮。"
 consumers = [
-    "网关 · core/settings.py:_load_scene_mapping_config",
-    "网关 · services/memory/semantic_map/scene_mapping.py:SceneMappingService",
+    "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
 
@@ -1295,8 +1416,7 @@ max = 1000000.0
 default = 2.0
 description = "面积小于此值的空间不划为房间（平方米）。"
 consumers = [
-    "网关 · core/settings.py:_load_scene_mapping_config",
-    "网关 · services/memory/semantic_map/scene_mapping.py:SceneMappingService",
+    "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
 
@@ -1307,8 +1427,7 @@ max = 100
 default = 2
 description = "自动采纳名称至少需要的有效观察视角数。"
 consumers = [
-    "网关 · core/settings.py:_load_scene_mapping_config",
-    "网关 · services/memory/semantic_map/scene_mapping.py:SceneMappingService",
+    "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
 
@@ -1319,8 +1438,7 @@ max = 1.0
 default = 0.15
 description = "首选名称与次选名称的分数至少相差多少才自动采纳（0～1）。"
 consumers = [
-    "网关 · core/settings.py:_load_scene_mapping_config",
-    "网关 · services/memory/semantic_map/scene_mapping.py:SceneMappingService",
+    "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
 
@@ -1331,8 +1449,7 @@ max = 1.0
 default = 0.85
 description = "自动采纳名称所需的最低支持分数（0～1）。这是采纳门槛，不代表准确率。"
 consumers = [
-    "网关 · core/settings.py:_load_scene_mapping_config",
-    "网关 · services/memory/semantic_map/scene_mapping.py:SceneMappingService",
+    "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
 
@@ -1341,8 +1458,7 @@ type = "string"
 default = "AlexWortega/openjev:qwen3.5-4b-nli-v2"
 description = "语义决策模型标识。默认值对应本地后端，远程后端使用其模型标识。"
 consumers = [
-    "网关 · core/settings.py:_load_scene_mapping_config",
-    "网关 · services/memory/semantic_map/scene_mapping.py:SceneMappingService",
+    "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
 
@@ -1353,8 +1469,7 @@ max = 600.0
 default = 30.0
 description = "单次模型请求的最长等待时间（秒）。"
 consumers = [
-    "网关 · core/settings.py:_load_scene_mapping_config",
-    "网关 · services/memory/semantic_map/scene_mapping.py:SceneMappingService",
+    "core/settings.py:_load_scene_mapping_config",
 ]
 apply = "restart"
 
@@ -1364,8 +1479,8 @@ choices = ["none", "library_pgo", "native_pgo", "relocalization"]
 default = "none"
 description = "三维地图位姿校正策略，选项为关闭、库内位姿图优化、原生位姿图优化、重定位。"
 consumers = [
-    "几何运行时 · services/geometry/nuwax_geometry_runtime/src/mapper.rs:MapperConfig::from_env",
-    "几何运行时 · services/geometry/nuwax_geometry_runtime/src/corrector.rs:Corrector::new",
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.correction_backend",
 ]
 apply = "restart"
 
@@ -1373,14 +1488,20 @@ apply = "restart"
 type = "boolean"
 default = true
 description = "网关是否把设备的几何输入与位姿关联到观察、记忆等业务。几何进程的可启动性由 external_enabled 指定。"
-consumers = ["网关 · gateways/platform.py:build_platform"]
+consumers = [
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.enabled",
+]
 apply = "restart"
 
 [geometry.external_enabled]
 type = "boolean"
 default = true
 description = "监督者是否允许按需启动几何运行时。"
-consumers = ["监督者 · scripts/supervisor.py:component_table"]
+consumers = [
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.external_enabled",
+]
 apply = "restart"
 
 [geometry.fine_cloud_cache_auto_max_mib]
@@ -1389,7 +1510,9 @@ min = 32
 max = 4096
 default = 256
 description = "自动模式下单个精细点云写入器的缓存上限（MiB，二进制兆字节）。在线建图和位姿图优化重放的缓存各自受限。"
-consumers = ["几何运行时 · services/geometry/nuwax_geometry_runtime/src/lib.rs:main"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.fine_cloud_cache_auto_max_mib",
+]
 apply = "restart"
 
 [geometry.fine_cloud_cache_mib]
@@ -1399,7 +1522,9 @@ max = 4096
 special_values = ["auto"]
 default = "auto"
 description = "精细点云写入器的缓存预算（MiB，二进制兆字节）。选择 auto 时按需增大，到自动上限后按固定预算处理。在线建图和位姿图优化重放各使用独立缓存。"
-consumers = ["几何运行时 · services/geometry/nuwax_geometry_runtime/src/lib.rs:main"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.fine_cloud_cache_mib",
+]
 apply = "restart"
 
 [geometry.lio_backend]
@@ -1408,8 +1533,9 @@ choices = ["device", "fastlio2", "pointlio"]
 default = "device"
 description = "三维定位采用设备里程计、FastLIO2（快速激光惯性定位）或 Point-LIO（逐点激光惯性定位）。安装时可按选定的原生定位模块填充。"
 consumers = [
-    "几何运行时 · services/geometry/nuwax_geometry_runtime/src/lio.rs:Lio::start",
-    "网关内 Go2 驱动 · drivers/go2/settings.py:load_go2_data_plane_config",
+    "core/settings.py:load_config",
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.lio_backend",
 ]
 apply = "restart"
 
@@ -1418,9 +1544,9 @@ type = "string"
 default = ""
 description = "惯性测量单元坐标系到机体的刚体外参，填写平移（米）与行优先旋转矩阵的 JSON（结构化文本）对象。Go2 安装时把设备标定写入方案。原生定位预检要求提供对应硬件的外参。"
 consumers = [
-    "几何运行时 · services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs:NativeLioPreflight::from_env",
-    "网关内 Go2 驱动 · drivers/go2/settings.py:load_go2_data_plane_config",
-    "网关 · gateways/platform.py:build_platform",
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+    "gateways/platform.py:build_platform",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.lio_body_from_imu",
 ]
 apply = "restart"
 
@@ -1429,9 +1555,9 @@ type = "string"
 default = ""
 description = "雷达坐标系到机体的刚体外参，填写平移（米）与行优先旋转矩阵的 JSON（结构化文本）对象。Go2 安装时把设备标定写入方案。原生定位预检要求提供对应硬件的外参。"
 consumers = [
-    "几何运行时 · services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs:NativeLioPreflight::from_env",
-    "网关内 Go2 驱动 · drivers/go2/settings.py:load_go2_data_plane_config",
-    "网关 · gateways/platform.py:build_platform",
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+    "gateways/platform.py:build_platform",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.lio_body_from_sensor",
 ]
 apply = "restart"
 
@@ -1443,34 +1569,29 @@ special_values = [""]
 default = ""
 description = "原生定位建立初始地图采用的帧数。留空时沿用后端参数。"
 consumers = [
-    "几何运行时 · services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs:NativeLioPreflight::from_env",
-    "网关 · gateways/platform.py:build_platform",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.lio_initial_map_frames",
 ]
 apply = "restart"
 
 [geometry.lio_map_voxel_size_m]
 type = "float"
-min = 0.0
-min_exclusive = true
+min = 0.001
 special_values = [""]
 default = ""
-description = "原生定位内部地图体素边长（米）。留空时沿用后端参数。转为单精度后仍须为正常的有限正数。"
+description = "原生定位内部地图体素边长（米）。留空时沿用后端参数。设置值不得小于 0.001 米。"
 consumers = [
-    "几何运行时 · services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs:NativeLioPreflight::from_env",
-    "网关 · gateways/platform.py:build_platform",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.lio_map_voxel_size_m",
 ]
 apply = "restart"
 
 [geometry.lio_scan_voxel_size_m]
 type = "float"
-min = 0.0
-min_exclusive = true
+min = 0.001
 special_values = [""]
 default = ""
-description = "原生定位扫描下采样体素边长（米）。留空时沿用后端参数。转为单精度后仍须为正常的有限正数。"
+description = "原生定位扫描下采样体素边长（米）。留空时沿用后端参数。设置值不得小于 0.001 米。"
 consumers = [
-    "几何运行时 · services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs:NativeLioPreflight::from_env",
-    "网关 · gateways/platform.py:build_platform",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.lio_scan_voxel_size_m",
 ]
 apply = "restart"
 
@@ -1479,9 +1600,8 @@ type = "string"
 default = "runtime_data/maps"
 description = "地图目录，网关和几何运行时共享，承载地图的保存、读取、激活和删除。"
 consumers = [
-    "网关 · gateways/platform.py:build_platform",
-    "几何运行时 · services/geometry/nuwax_geometry_runtime/src/map_store.rs:MapStore::from_env",
-    "几何运行时 · services/geometry/nuwax_geometry_runtime/src/session.rs:catalog_root",
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.map_catalog_root",
 ]
 apply = "restart"
 
@@ -1490,7 +1610,10 @@ type = "string"
 choices = ["voxel", "raytracing"]
 default = "voxel"
 description = "三维链的建图后端，使用体素窗口或射线追踪。二维链固定使用二维建图工作进程。"
-consumers = ["几何运行时 · services/geometry/nuwax_geometry_runtime/src/mapper.rs:MapperConfig::from_env"]
+consumers = [
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_backend",
+]
 apply = "restart"
 
 [geometry.mapping_initial_safe_radius_meters]
@@ -1498,7 +1621,9 @@ type = "float"
 min = 0.0
 default = 0.0
 description = "建立占据栅格时，将机器人初始位置周围此半径内作为安全区域（米）。零表示不启用。"
-consumers = ["几何运行时 · services/geometry/nuwax_geometry_runtime/src/mapper.rs:MapperConfig::from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_initial_safe_radius_meters",
+]
 apply = "restart"
 
 [geometry.mapping_raytracing_grace_depth]
@@ -1506,7 +1631,9 @@ type = "float"
 min = 0.0
 default = 0.2
 description = "射线穿过体素时靠近命中点的保护距离（米）。"
-consumers = ["几何运行时 · services/geometry/nuwax_geometry_runtime/src/mapping_backend.rs:RaytracingBackendSpec::from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_raytracing_grace_depth",
+]
 apply = "restart"
 
 [geometry.mapping_raytracing_graze_cos]
@@ -1515,7 +1642,9 @@ min = 0.0
 max = 1.0
 default = 0.7
 description = "射线和体素表面法线夹角余弦的擦边保护阈值。"
-consumers = ["几何运行时 · services/geometry/nuwax_geometry_runtime/src/mapping_backend.rs:RaytracingBackendSpec::from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_raytracing_graze_cos",
+]
 apply = "restart"
 
 [geometry.mapping_raytracing_max_health]
@@ -1524,7 +1653,9 @@ min = 1
 max = 2147483647
 default = 1
 description = "射线建图体素健康分数的上限，须大于下限。"
-consumers = ["几何运行时 · services/geometry/nuwax_geometry_runtime/src/mapping_backend.rs:RaytracingBackendSpec::from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_raytracing_max_health",
+]
 apply = "restart"
 
 [geometry.mapping_raytracing_max_range]
@@ -1532,7 +1663,9 @@ type = "float"
 min = 0.0
 default = 50.0
 description = "射线建图最大量程（米），零表示不按量程过滤。"
-consumers = ["几何运行时 · services/geometry/nuwax_geometry_runtime/src/mapping_backend.rs:RaytracingBackendSpec::from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_raytracing_max_range",
+]
 apply = "restart"
 
 [geometry.mapping_raytracing_min_health]
@@ -1541,7 +1674,9 @@ min = -2147483648
 max = 2147483647
 default = -2
 description = "射线建图体素健康分数的下限，须小于上限。"
-consumers = ["几何运行时 · services/geometry/nuwax_geometry_runtime/src/mapping_backend.rs:RaytracingBackendSpec::from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_raytracing_min_health",
+]
 apply = "restart"
 
 [geometry.mapping_raytracing_ray_subsample]
@@ -1550,7 +1685,9 @@ min = 1
 max = 4294967295
 default = 1
 description = "射线抽样步长，1 表示处理全部射线。"
-consumers = ["几何运行时 · services/geometry/nuwax_geometry_runtime/src/mapping_backend.rs:RaytracingBackendSpec::from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_raytracing_ray_subsample",
+]
 apply = "restart"
 
 [geometry.mapping_raytracing_recency_window]
@@ -1559,7 +1696,9 @@ min = 0
 max = 4294967295
 default = 15
 description = "按帧计的近期命中保护窗口。"
-consumers = ["几何运行时 · services/geometry/nuwax_geometry_runtime/src/mapping_backend.rs:RaytracingBackendSpec::from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_raytracing_recency_window",
+]
 apply = "restart"
 
 [geometry.mapping_raytracing_shadow_depth]
@@ -1567,7 +1706,9 @@ type = "float"
 min = 0.0
 default = 0.2
 description = "射线命中后继续检查的阴影深度（米）。"
-consumers = ["几何运行时 · services/geometry/nuwax_geometry_runtime/src/mapping_backend.rs:RaytracingBackendSpec::from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_raytracing_shadow_depth",
+]
 apply = "restart"
 
 [geometry.mapping_raytracing_voxel_size]
@@ -1575,21 +1716,29 @@ type = "float"
 min = 0.001
 default = 0.1
 description = "射线建图体素边长（米），与量程和阴影深度共同限制每条射线的体素步数。"
-consumers = ["几何运行时 · services/geometry/nuwax_geometry_runtime/src/mapping_backend.rs:RaytracingBackendSpec::from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_raytracing_voxel_size",
+]
 apply = "restart"
 
 [geometry.mapping_recording_dir]
 type = "string"
 default = ""
 description = "网关建图诊断录制目录。留空时使用地图目录同级的 mapping_recordings。"
-consumers = ["网关 · gateways/platform.py:build_platform"]
+consumers = [
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_recording_dir",
+]
 apply = "restart"
 
 [geometry.mapping_recording_enabled]
 type = "boolean"
 default = true
 description = "是否在网关记录建图诊断输入。"
-consumers = ["网关 · gateways/platform.py:build_platform"]
+consumers = [
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_recording_enabled",
+]
 apply = "restart"
 
 [geometry.mapping_recording_max_bytes]
@@ -1597,7 +1746,10 @@ type = "integer"
 min = 0
 default = 17179869184
 description = "网关建图诊断录制容量上限（字节）。"
-consumers = ["网关 · gateways/platform.py:build_platform"]
+consumers = [
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_recording_max_bytes",
+]
 apply = "restart"
 
 [geometry.mapping_resolution]
@@ -1606,7 +1758,9 @@ min = 0.0
 min_exclusive = true
 default = 0.05
 description = "三维链实时生成的占据栅格分辨率（米/格），二维链沿用二维会话配置。"
-consumers = ["几何运行时 · services/geometry/nuwax_geometry_runtime/src/mapper.rs:MapperConfig::from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.mapping_resolution",
+]
 apply = "restart"
 
 [geometry.native_lio_pair_max_skew_ms]
@@ -1616,8 +1770,7 @@ max = 60000
 default = 100
 description = "原生定位输出位姿与点云配对的最大时间差（毫秒）。"
 consumers = [
-    "几何运行时 · services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs:NativeLioPreflight::from_env",
-    "网关 · gateways/platform.py:build_platform",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.native_lio_pair_max_skew_ms",
 ]
 apply = "restart"
 
@@ -1627,8 +1780,8 @@ min = 0.0
 default = 0.5
 description = "导航使用里程计位姿的最大允许数据年龄（秒），同时写入录制的几何配置元数据。"
 consumers = [
-    "导航栈 · services/nuwax-workspace/crates/nuwax-nav-stack/src/lcm_dataflow.rs:configured_pose_source_max_age",
-    "网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata",
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.odom_max_age_sec",
 ]
 apply = "restart"
 
@@ -1636,7 +1789,9 @@ apply = "restart"
 type = "string"
 default = ""
 description = "库内位姿图优化的 JSON（结构化文本）覆盖对象，可调扫描上下文、回环、配准与图优化。留空时采用所选后端默认参数。"
-consumers = ["几何运行时 · services/geometry/nuwax_geometry_runtime/src/corrector.rs:Corrector::new"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.pgo_options",
+]
 apply = "restart"
 
 [geometry.pipeline]
@@ -1645,9 +1800,8 @@ choices = ["lio_3d", "slam_2d"]
 default = "lio_3d"
 description = "选择完整的三维激光定位或二维扫描执行链。导航方案和二维建图后端由执行链确定。"
 consumers = [
-    "几何运行时 · services/geometry/nuwax_geometry_runtime/src/slam2d_owner.rs:Settings::from_env",
-    "导航栈 · services/nuwax-workspace/crates/nuwax-nav-stack/src/production_pipeline.rs:ProductionPipeline::from_env",
-    "网关 · services/geometry/client.py:_snapshot",
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.pipeline",
 ]
 apply = "restart"
 
@@ -1656,8 +1810,7 @@ type = "string"
 default = ""
 description = "Point-LIO（逐点激光惯性定位）的 JSON（结构化文本）覆盖对象。仅该后端使用，留空时采用后端默认参数。"
 consumers = [
-    "几何运行时 · services/geometry/nuwax_geometry_runtime/src/native_lio_owner.rs:NativeLioPreflight::from_env",
-    "网关 · gateways/platform.py:build_platform",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.pointlio_options",
 ]
 apply = "restart"
 
@@ -1665,7 +1818,9 @@ apply = "restart"
 type = "string"
 default = ""
 description = "保存完成地图清理所需的原始扫描与最终位姿。留空使用运行数据根目录下的 scan_logs。相对路径按项目工作目录解析。已发布地图的完整副本单独保存在地图资产包内。仅在会话已保存完整副本且写入器关闭后，后续会话才回收该暂存。"
-consumers = ["几何运行时 · services/nuwax-workspace/crates/nuwax-cloud-cleanup/src/scan_log.rs:scan_directory"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.raw_scan_directory",
+]
 apply = "restart"
 
 [geometry.raw_scan_interval_s]
@@ -1674,7 +1829,9 @@ min = 0.0
 max = 3600.0
 default = 1.0
 description = "相对上一保存帧的源时间间隔（秒）。零表示每帧都满足该条件。"
-consumers = ["几何运行时 · services/nuwax-workspace/crates/nuwax-cloud-cleanup/src/scan_log/async_writer.rs:SavePolicy::from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.raw_scan_interval_s",
+]
 apply = "restart"
 
 [geometry.raw_scan_max_mib]
@@ -1683,7 +1840,9 @@ min = 64
 max = 1048576
 default = 1024
 description = "原始扫描和最终位姿共用的磁盘预算（MiB，二进制兆字节）。达到上限时停止辅助记录，在线建图继续。"
-consumers = ["几何运行时 · services/nuwax-workspace/crates/nuwax-cloud-cleanup/src/scan_log.rs:storage_budget_bytes"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.raw_scan_max_mib",
+]
 apply = "restart"
 
 [geometry.raw_scan_queue_frames]
@@ -1692,7 +1851,9 @@ min = 1
 max = 256
 default = 16
 description = "辅助扫描后台写队列的容量（帧）。队列满时丢弃本次提交并标记离线数据不完整。"
-consumers = ["几何运行时 · services/nuwax-workspace/crates/nuwax-cloud-cleanup/src/scan_log/async_writer.rs:queue_capacity"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.raw_scan_queue_frames",
+]
 apply = "restart"
 
 [geometry.raw_scan_rotation_deg]
@@ -1701,7 +1862,9 @@ min = 0.0
 max = 180.0
 default = 3.0
 description = "相对上一保存帧的三维旋转角（度）。零表示每帧都满足该条件。"
-consumers = ["几何运行时 · services/nuwax-workspace/crates/nuwax-cloud-cleanup/src/scan_log/async_writer.rs:SavePolicy::from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.raw_scan_rotation_deg",
+]
 apply = "restart"
 
 [geometry.raw_scan_translation_m]
@@ -1710,7 +1873,9 @@ min = 0.0
 max = 100.0
 default = 0.1
 description = "相对上一保存帧的三维位移（米）。位移、旋转、时间间隔满足任一条件即可入队。"
-consumers = ["几何运行时 · services/nuwax-workspace/crates/nuwax-cloud-cleanup/src/scan_log/async_writer.rs:SavePolicy::from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.raw_scan_translation_m",
+]
 apply = "restart"
 
 [geometry.runtime_data_dir]
@@ -1718,8 +1883,7 @@ type = "string"
 default = "runtime_data"
 description = "运行数据根目录，几何运行时用它定位原始扫描暂存和二维工作目录。"
 consumers = [
-    "几何运行时 · services/geometry/nuwax_geometry_runtime/src/slam2d_owner.rs:Settings::from_env",
-    "几何运行时 · services/nuwax-workspace/crates/nuwax-cloud-cleanup/src/scan_log.rs:scan_directory",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.runtime_data_dir",
 ]
 apply = "restart"
 
@@ -1730,8 +1894,8 @@ max = 65535
 default = 50051
 description = "网关与本机几何运行时的远程调用端口，客户端和服务端共用。"
 consumers = [
-    "几何运行时 · services/geometry/nuwax_geometry_runtime/src/lib.rs:run",
-    "网关 · gateways/platform.py:build_platform",
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.runtime_port",
 ]
 apply = "restart"
 
@@ -1739,7 +1903,10 @@ apply = "restart"
 type = "string"
 default = ""
 description = "二维执行链的传感器、机体坐标、时钟和标定配置，使用现行二维会话的 JSON（结构化文本）对象。二维链必须提供完整配置。"
-consumers = ["几何运行时 · services/geometry/nuwax_geometry_runtime/src/slam2d_owner.rs:Settings::from_env"]
+consumers = [
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Geometry.slam2d_config",
+]
 apply = "restart"
 
 [navigation.autostart]
@@ -1747,8 +1914,8 @@ type = "boolean"
 default = true
 description = "允许监督者按需启动导航栈。"
 consumers = [
-    "监督者 · scripts/supervisor.py:component_table",
-    "网关 · contracts/geometry_runtime.py:PlatformGeometryConfig.build_metadata",
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.autostart",
 ]
 apply = "restart"
 
@@ -1756,7 +1923,9 @@ apply = "restart"
 type = "string"
 default = ""
 description = "导航和探索使用的机器人能力标定，按现行版本填写 JSON（结构化文本）对象。留空不声明经标定的能力。"
-consumers = ["导航栈、几何运行时 · services/nuwax-workspace/crates/nuwax-nav-types-messages/src/navigation_capabilities.rs:NavigationCapabilities::from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.capabilities_json",
+]
 apply = "restart"
 
 [navigation.explore_pose_ttl_ms]
@@ -1764,7 +1933,9 @@ type = "integer"
 min = 0
 default = 1000
 description = "探索使用里程计或定位位姿的最大数据年龄（毫秒）。"
-consumers = ["几何运行时 · services/geometry/nuwax_geometry_runtime/src/explorer.rs:pose_ttl_ns"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.explore_pose_ttl_ms",
+]
 apply = "restart"
 
 [navigation.facility_providers_json]
@@ -1772,7 +1943,10 @@ type = "string"
 default = "{}"
 sensitive = true
 description = "楼层切换设施的提供者配置，使用 JSON（结构化文本）对象。"
-consumers = ["网关 · gateways/platform.py:build_platform"]
+consumers = [
+    "core/settings.py:load_config",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.facility_providers_json",
+]
 apply = "restart"
 
 [navigation.local_horizon_m]
@@ -1780,7 +1954,9 @@ type = "float"
 min = 0.01
 default = 0.8
 description = "局部规划沿全局路线向前取参考路段的长度（米）。"
-consumers = ["导航栈 · services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs:SurfaceNavigationConfig::from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.local_horizon_m",
+]
 apply = "restart"
 
 [navigation.max_step_down_m]
@@ -1790,7 +1966,9 @@ max = 1.0
 special_values = [""]
 default = ""
 description = "允许下的最大台阶高度（米，0～1），0表示不下台阶。留空沿用能力标定或共同台阶高度。填写值不能超过能力标定。"
-consumers = ["导航栈 · services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs:SurfaceNavigationConfig::from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.max_step_down_m",
+]
 apply = "restart"
 
 [navigation.max_step_up_m]
@@ -1800,7 +1978,9 @@ max = 1.0
 special_values = [""]
 default = ""
 description = "允许上的最大台阶高度（米，0～1），0表示不上台阶。留空沿用能力标定或共同台阶高度。填写值不能超过能力标定。"
-consumers = ["导航栈 · services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs:SurfaceNavigationConfig::from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.max_step_up_m",
+]
 apply = "restart"
 
 [navigation.min_stair_tread_m]
@@ -1809,7 +1989,9 @@ min = 0.0
 min_exclusive = true
 default = 0.2
 description = "判定为台阶时要求的最小踏面深度（米），须不小于地形索引体素的两倍。填写了能力标定的地形能力时以标定为准。"
-consumers = ["导航栈 · services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs:SurfaceNavigationConfig::from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.min_stair_tread_m",
+]
 apply = "restart"
 
 [navigation.pct_terrain_source]
@@ -1817,7 +1999,9 @@ type = "string"
 choices = ["tomography", "mls"]
 default = "tomography"
 description = "三维导航与探索共用的地形来源。tomography 用点云层析提取分层地面、净空和占据，mls 用多层表面。"
-consumers = ["导航栈、几何运行时 · services/nuwax-workspace/crates/nuwax-nav-runtime/src/native_map.rs:PctTerrainSource::from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.pct_terrain_source",
+]
 apply = "restart"
 
 [navigation.surface_voxel_size_m]
@@ -1826,7 +2010,9 @@ min = 0.0
 min_exclusive = true
 default = 0.1
 description = "三维导航地形索引的分辨率（米）。越小越精细，计算量越大。"
-consumers = ["导航栈 · services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs:SurfaceNavigationConfig::from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.surface_voxel_size_m",
+]
 apply = "restart"
 
 [navigation.traversability_max_slope_deg]
@@ -1836,7 +2022,9 @@ max = 90.0
 max_exclusive = true
 default = 18.0
 description = "三维曲面导航的最大坡度（度），填写能力标定后按标定值使用。"
-consumers = ["导航栈 · services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs:SurfaceNavigationConfig::from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.traversability_max_slope_deg",
+]
 apply = "restart"
 
 [navigation.traversability_max_step_height_m]
@@ -1844,7 +2032,9 @@ type = "float"
 min = 0.0
 default = 0.15
 description = "三维导航的共同台阶高度上限（米）。导航能力标定和上、下台阶独立设置按现行优先关系覆盖此值。"
-consumers = ["导航栈 · services/nuwax-workspace/crates/nuwax-nav-stack/src/surface_config.rs:SurfaceNavigationConfig::from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.traversability_max_step_height_m",
+]
 apply = "restart"
 
 [navigation.wavefront_goal_timeout_ms]
@@ -1852,7 +2042,9 @@ type = "integer"
 min = 1
 default = 15000
 description = "波前探索等待单个导航目标完成的时限（毫秒）。"
-consumers = ["导航栈 · services/nuwax-workspace/crates/nuwax-nav-stack/src/lcm_dataflow.rs:wavefront_config_from_env"]
+consumers = [
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Navigation.wavefront_goal_timeout_ms",
+]
 apply = "restart"
 
 [motion_guard.backend]
@@ -1861,8 +2053,8 @@ choices = ["", "unitree_sdk2py", "motion_control"]
 default = ""
 description = "运动守卫执行端。留空时不启用守卫。Go2 安装使用 unitree_sdk2py，标准接入可选 motion_control。"
 consumers = [
-    "监督者 · scripts/supervisor.py:component_table",
-    "运动守卫 · services/navigation/motion_safety_guard/__main__.py:run",
+    "services/navigation/motion_safety_guard/__main__.py:run",
+    "services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
 ]
 apply = "restart"
 
@@ -1870,7 +2062,9 @@ apply = "restart"
 type = "string"
 default = ""
 description = "标准运动控制工厂入口，格式为 Python 模块名:函数名。选择标准守卫后端时必须提供。"
-consumers = ["运动守卫 · services/navigation/motion_safety_guard/motion_control_actuator.py:MotionControlActuator.from_environment"]
+consumers = [
+    "services/navigation/motion_safety_guard/motion_control_actuator.py:MotionControlActuator.from_environment",
+]
 apply = "restart"
 
 [person_follow.autostart]
@@ -1878,8 +2072,7 @@ type = "boolean"
 default = true
 description = "允许按需启动人物跟随进程，并允许几何运行时发布供跟随使用的地图点云。"
 consumers = [
-    "监督者 · scripts/supervisor.py:component_table",
-    "几何运行时 · services/geometry/nuwax_geometry_runtime/src/outputs.rs:Outputs::start",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:PersonFollow.autostart",
 ]
 apply = "restart"
 
@@ -1888,8 +2081,8 @@ type = "string"
 default = ""
 description = "Go2 数据面使用的 DDS（数据分发服务）网卡。运动守卫优先采用此项，留空时使用通用 Go2 网卡。"
 consumers = [
-    "网关内 Go2 驱动 · drivers/go2/data_plane.py:Go2DirectDdsBridge._start_direct_dds_backend",
-    "运动守卫 · services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+    "services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
 ]
 apply = "restart"
 
@@ -1898,8 +2091,7 @@ type = "boolean"
 default = true
 description = "是否启用 Go2 数据面，当前安装器为 Go2 方案开启。"
 consumers = [
-    "网关内 Go2 驱动 · drivers/go2/data_plane.py:Go2DataPlaneRuntime",
-    "网关内 Go2 驱动 · drivers/go2/settings.py:load_go2_data_plane_config",
+    "drivers/go2/settings.py:load_go2_data_plane_config",
 ]
 apply = "restart"
 
@@ -1908,8 +2100,8 @@ type = "string"
 default = ""
 description = "Go2 高级客户端的 DDS（数据分发服务）网卡。守卫在数据面网卡为空时也采用此项，空值由 SDK（软件开发工具包）选择。"
 consumers = [
-    "网关内 Go2 驱动 · drivers/go2/assembly.py:Go2RobotAssembly.ensure_high_level_clients",
-    "运动守卫 · services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
+    "core/settings.py:load_config",
+    "services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
 ]
 apply = "restart"
 
@@ -1917,35 +2109,45 @@ apply = "restart"
 type = "boolean"
 default = true
 description = "Go2 数据面是否直接订阅设备的 DDS（数据分发服务）输入。"
-consumers = ["网关内 Go2 驱动 · drivers/go2/settings.py:load_go2_data_plane_config"]
+consumers = [
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+]
 apply = "restart"
 
 [go2.direct_dds_low_state_topic]
 type = "string"
 default = "rt/lowstate"
 description = "Go2 厂商低层状态的 DDS（数据分发服务）话题名，含关节和惯性状态。"
-consumers = ["网关内 Go2 驱动 · drivers/go2/settings.py:load_go2_data_plane_config"]
+consumers = [
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+]
 apply = "restart"
 
 [go2.direct_dds_point_cloud_enabled]
 type = "boolean"
 default = true
 description = "是否直接订阅 Go2 雷达点云。Go2 安装选中几何模块时开启。"
-consumers = ["网关内 Go2 驱动 · drivers/go2/data_plane.py:Go2DirectDdsBridge._start_direct_dds_backend"]
+consumers = [
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+]
 apply = "restart"
 
 [go2.direct_dds_point_cloud_topic]
 type = "string"
 default = "rt/utlidar/cloud"
 description = "Go2 厂商雷达点云的 DDS（数据分发服务）话题名。"
-consumers = ["网关内 Go2 驱动 · drivers/go2/settings.py:load_go2_data_plane_config"]
+consumers = [
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+]
 apply = "restart"
 
 [go2.direct_dds_point_cloud_xyz_registered_to_odom]
 type = "boolean"
 default = false
 description = "输入点云的三维坐标是否已经在里程计坐标系下。"
-consumers = ["网关内 Go2 驱动 · drivers/go2/settings.py:load_go2_data_plane_config"]
+consumers = [
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+]
 apply = "restart"
 
 [go2.direct_dds_pose_topic]
@@ -1953,8 +2155,9 @@ type = "string"
 default = "rt/sportmodestate"
 description = "Go2 厂商运动状态的 DDS（数据分发服务）话题名，供数据面和运动反馈读取。"
 consumers = [
-    "网关内 Go2 驱动 · drivers/go2/settings.py:load_go2_data_plane_config",
-    "运动守卫 · services/navigation/motion_safety_guard/go2_actuator.py:_load_sdk_factories",
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+    "services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.__init__",
+    "services/navigation/motion_safety_guard/go2_actuator.py:_load_sdk_factories.subscribe_motion_state",
 ]
 apply = "restart"
 
@@ -1963,7 +2166,9 @@ type = "float"
 min = 0.05
 default = 0.5
 description = "Go2 DDS 读取超时（秒）"
-consumers = ["网关内 Go2 驱动 · drivers/go2/settings.py:load_go2_data_plane_config"]
+consumers = [
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+]
 apply = "restart"
 
 [go2.imu_gyro_deadband_rps]
@@ -1971,7 +2176,9 @@ type = "float"
 min = 0.0
 default = 0.003490658503988659
 description = "Go2 IMU 陀螺仪死区（弧度/秒）"
-consumers = ["网关内 Go2 驱动 · drivers/go2/settings.py:load_go2_data_plane_config"]
+consumers = [
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+]
 apply = "restart"
 
 [go2.low_level_interval_sec]
@@ -1979,8 +2186,7 @@ type = "float"
 default = 0.002
 description = "低级控制周期（秒）"
 consumers = [
-    "网关内 Go2 驱动 · core/settings.py:load_config",
-    "网关内 Go2 驱动 · drivers/go2/control/low_level_controller.py:LowLevelController.start",
+    "core/settings.py:load_config",
 ]
 apply = "restart"
 
@@ -1989,8 +2195,7 @@ type = "float"
 default = 5.0
 description = "低级控制 KD 增益"
 consumers = [
-    "网关内 Go2 驱动 · core/settings.py:load_config",
-    "网关内 Go2 驱动 · drivers/go2/defaults.py:build_go2_defaults",
+    "core/settings.py:load_config",
 ]
 apply = "restart"
 
@@ -1999,8 +2204,7 @@ type = "float"
 default = 60.0
 description = "低级控制 KP 增益"
 consumers = [
-    "网关内 Go2 驱动 · core/settings.py:load_config",
-    "网关内 Go2 驱动 · drivers/go2/defaults.py:build_go2_defaults",
+    "core/settings.py:load_config",
 ]
 apply = "restart"
 
@@ -2009,8 +2213,7 @@ type = "float"
 default = 10.0
 description = "低级控制最大扭矩"
 consumers = [
-    "网关内 Go2 驱动 · core/settings.py:load_config",
-    "网关内 Go2 驱动 · drivers/go2/defaults.py:build_go2_defaults",
+    "core/settings.py:load_config",
 ]
 apply = "restart"
 
@@ -2019,8 +2222,7 @@ type = "float"
 default = 2.0
 description = "低级控制最大速度"
 consumers = [
-    "网关内 Go2 驱动 · core/settings.py:load_config",
-    "网关内 Go2 驱动 · drivers/go2/defaults.py:build_go2_defaults",
+    "core/settings.py:load_config",
 ]
 apply = "restart"
 
@@ -2028,7 +2230,9 @@ apply = "restart"
 type = "boolean"
 default = true
 description = "是否启用 Go2 厂商官方状态连接。"
-consumers = ["网关内 Go2 驱动 · drivers/go2/settings.py:load_go2_data_plane_config"]
+consumers = [
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+]
 apply = "restart"
 
 [go2.official_client_timeout_sec]
@@ -2038,8 +2242,8 @@ min_exclusive = true
 default = 3.0
 description = "Go2 官方客户端超时（秒）"
 consumers = [
-    "网关内 Go2 驱动 · drivers/go2/settings.py:load_go2_data_plane_config",
-    "运动守卫 · services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+    "services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
 ]
 apply = "restart"
 
@@ -2050,10 +2254,10 @@ min_exclusive = true
 default = 1.0
 description = "Go2 官方最大线速度（米/秒）"
 consumers = [
-    "网关内 Go2 驱动 · drivers/go2/settings.py:load_go2_data_plane_config",
-    "运动守卫 · services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
-    "网关内 Go2 驱动 · drivers/go2/assembly.py:Go2RobotAssembly.get_motion_command_limits",
-    "监督者的导航参数解析 · scripts/resolve_navigation_pipeline.py:actuator_configuration",
+    "core/config.py:derived_values",
+    "drivers/go2/assembly.py:Go2RobotAssembly.get_motion_command_limits",
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+    "services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
 ]
 apply = "restart"
 
@@ -2064,10 +2268,10 @@ min_exclusive = true
 default = 0.8
 description = "Go2 官方最大偏航角速度（弧度/秒）"
 consumers = [
-    "网关内 Go2 驱动 · drivers/go2/settings.py:load_go2_data_plane_config",
-    "运动守卫 · services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
-    "网关内 Go2 驱动 · drivers/go2/assembly.py:Go2RobotAssembly.get_motion_command_limits",
-    "监督者的导航参数解析 · scripts/resolve_navigation_pipeline.py:actuator_configuration",
+    "core/config.py:derived_values",
+    "drivers/go2/assembly.py:Go2RobotAssembly.get_motion_command_limits",
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+    "services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
 ]
 apply = "restart"
 
@@ -2077,8 +2281,8 @@ min = 0.0
 default = 0.003490658503988659
 description = "Go2 官方偏航角速度死区（弧度/秒），须小于官方偏航上限。"
 consumers = [
-    "网关内 Go2 驱动 · drivers/go2/settings.py:load_go2_data_plane_config",
-    "运动守卫 · services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+    "services/navigation/motion_safety_guard/go2_actuator.py:Go2Actuator.from_environment",
 ]
 apply = "restart"
 
@@ -2086,7 +2290,9 @@ apply = "restart"
 type = "string"
 default = "192.168.123.161"
 description = "Go2 视频连接使用的机器人网络地址。"
-consumers = ["Go2 视频进程 · drivers/go2/video_streamer.py:_create_webrtc_connection"]
+consumers = [
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+]
 apply = "restart"
 
 [go2.video_stream_enabled]
@@ -2094,8 +2300,7 @@ type = "boolean"
 default = true
 description = "允许监督者在 Go2 方案中启动视频进程。未安装感知模块时按安装结果关闭。"
 consumers = [
-    "监督者 · scripts/supervisor.py:component_table",
-    "Go2 视频进程 · drivers/go2/video_streamer.py:run_forever",
+    "drivers/go2/settings.py:load_go2_data_plane_config",
 ]
 apply = "restart"
 
@@ -2104,28 +2309,36 @@ type = "float"
 min = 0.1
 default = 1.0
 description = "Go2 视频连接退出后等待再次连接的时间（秒）。"
-consumers = ["Go2 视频进程 · drivers/go2/video_streamer.py:run_forever"]
+consumers = [
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+]
 apply = "restart"
 
 [go2.volume_auto_enable_vui_switch]
 type = "boolean"
 default = true
 description = "设置 Go2 音量时是否自动打开机身音量控制开关。"
-consumers = ["网关 · services/audio/service.py:AudioService.set_volume"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [go2.vui_max_level]
 type = "integer"
 default = 10
 description = "Go2 VUI 最大音量级别"
-consumers = ["网关内 Go2 驱动 · drivers/go2/assembly.py:Go2RobotAssembly._ratio_to_vui_level"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [go2.vui_min_level]
 type = "integer"
 default = 0
 description = "Go2 VUI 最小音量级别"
-consumers = ["网关内 Go2 驱动 · drivers/go2/assembly.py:Go2RobotAssembly._ratio_to_vui_level"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [go2.webrtc_aes_128_key]
@@ -2133,7 +2346,9 @@ type = "string"
 default = ""
 description = "Go2 视频连接的 AES-128（128 位对称加密）密钥，允许空字符串或 32 位十六进制字符串。"
 sensitive = true
-consumers = ["Go2 视频进程 · drivers/go2/video_streamer.py:_create_webrtc_connection"]
+consumers = [
+    "drivers/go2/settings.py:load_go2_data_plane_config",
+]
 apply = "restart"
 
 [logging.backup_count]
@@ -2142,8 +2357,9 @@ min = 0
 default = 5
 description = "日志轮转保留的历史文件数量。网关立即生效，独立进程下次启动生效。"
 consumers = [
-    "网关 · core/settings.py:configure_logging",
-    "几何运行时、导航栈、人物跟随 · services/nuwax-workspace/crates/nuwax-core/src/logging.rs:init_component_logging",
+    "core/settings.py:load_config",
+    "gateways/app.py:create_relay_app_from_env",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.backup_count",
 ]
 apply = "hot"
 
@@ -2152,9 +2368,9 @@ type = "string"
 default = "runtime_data/logs"
 description = "日志目录。受管安装的相对默认值以持久数据根解析。"
 consumers = [
-    "网关 · core/settings.py:configure_logging",
-    "几何运行时、导航栈、人物跟随 · services/nuwax-workspace/crates/nuwax-core/src/logging.rs:init_component_logging",
-    "监督者 · scripts/supervisor.py:Supervisor.start_component",
+    "core/settings.py:load_config",
+    "gateways/app.py:create_relay_app_from_env",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.dir",
 ]
 apply = "restart"
 
@@ -2163,8 +2379,9 @@ type = "string"
 default = "runtime_data/logs/nuwax_robot_bridge.log"
 description = "网关日志文件。独立进程使用各自的日志文件名。"
 consumers = [
-    "网关 · core/settings.py:configure_logging",
-    "几何运行时、导航栈、人物跟随 · services/nuwax-workspace/crates/nuwax-core/src/logging.rs:init_component_logging",
+    "core/settings.py:load_config",
+    "gateways/app.py:create_relay_app_from_env",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.file",
 ]
 apply = "restart"
 
@@ -2173,7 +2390,11 @@ type = "string"
 choices = ["text", "json"]
 default = "text"
 description = "终端输出的日志显示为普通文本或JSON。日志文件始终按JSON逐行保存。"
-consumers = ["网关 · core/settings.py:configure_logging"]
+consumers = [
+    "core/settings.py:load_config",
+    "gateways/app.py:create_relay_app_from_env",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.format",
+]
 apply = "hot"
 
 [logging.go2_video_level]
@@ -2181,7 +2402,10 @@ type = "string"
 choices = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 default = "INFO"
 description = "Go2 视频进程的日志级别。"
-consumers = ["Go2 视频进程 · drivers/go2/video_streamer.py:main"]
+consumers = [
+    "drivers/go2/video_streamer.py:main",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.go2_video_level",
+]
 apply = "restart"
 
 [logging.level]
@@ -2190,8 +2414,9 @@ choices = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 default = "INFO"
 description = "全局日志级别。网关立即生效，独立进程下次启动生效。Rust 诊断过滤可临时覆盖。"
 consumers = [
-    "网关 · core/settings.py:configure_logging",
-    "几何运行时、导航栈、人物跟随 · services/nuwax-workspace/crates/nuwax-core/src/logging.rs:init_component_logging",
+    "core/settings.py:load_config",
+    "gateways/app.py:create_relay_app_from_env",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.level",
 ]
 apply = "hot"
 
@@ -2201,8 +2426,7 @@ choices = ["", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 default = ""
 description = "网关内配置读写子系统的日志级别，留空继承全局级别。"
 consumers = [
-    "网关 · core/settings.py:_configure_subsystem_levels",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.level_config",
 ]
 apply = "hot"
 
@@ -2212,8 +2436,7 @@ choices = ["", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 default = ""
 description = "网关内驱动子系统的日志级别，留空继承全局级别。"
 consumers = [
-    "网关 · core/settings.py:_configure_subsystem_levels",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.level_driver",
 ]
 apply = "hot"
 
@@ -2223,8 +2446,7 @@ choices = ["", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 default = ""
 description = "网关内网关子系统的日志级别，留空继承全局级别。"
 consumers = [
-    "网关 · core/settings.py:_configure_subsystem_levels",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.level_gateway",
 ]
 apply = "hot"
 
@@ -2234,8 +2456,7 @@ choices = ["", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 default = ""
 description = "网关内几何子系统的日志级别，留空继承全局级别。"
 consumers = [
-    "网关 · core/settings.py:_configure_subsystem_levels",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.level_geometry",
 ]
 apply = "hot"
 
@@ -2245,8 +2466,7 @@ choices = ["", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 default = ""
 description = "网关内导航子系统的日志级别，留空继承全局级别。"
 consumers = [
-    "网关 · core/settings.py:_configure_subsystem_levels",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.level_navigation",
 ]
 apply = "hot"
 
@@ -2256,8 +2476,7 @@ choices = ["", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 default = ""
 description = "网关内感知子系统的日志级别，留空继承全局级别。"
 consumers = [
-    "网关 · core/settings.py:_configure_subsystem_levels",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.level_perception",
 ]
 apply = "hot"
 
@@ -2267,8 +2486,7 @@ choices = ["", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 default = ""
 description = "网关内运行时子系统的日志级别，留空继承全局级别。"
 consumers = [
-    "网关 · core/settings.py:_configure_subsystem_levels",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.level_runtime",
 ]
 apply = "hot"
 
@@ -2278,8 +2496,7 @@ choices = ["", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 default = ""
 description = "网关内设置子系统的日志级别，留空继承全局级别。"
 consumers = [
-    "网关 · core/settings.py:_configure_subsystem_levels",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.level_settings",
 ]
 apply = "hot"
 
@@ -2289,8 +2506,7 @@ choices = ["", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 default = ""
 description = "网关内技能子系统的日志级别，留空继承全局级别。"
 consumers = [
-    "网关 · core/settings.py:_configure_subsystem_levels",
-    "网关 · gateways/settings.py:SettingsApplication._apply_group",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.level_skills",
 ]
 apply = "hot"
 
@@ -2300,8 +2516,9 @@ min = 0
 default = 20971520
 description = "单个日志文件的轮转容量（字节）。网关立即生效，独立进程下次启动生效。"
 consumers = [
-    "网关 · core/settings.py:configure_logging",
-    "几何运行时、导航栈、人物跟随 · services/nuwax-workspace/crates/nuwax-core/src/logging.rs:init_component_logging",
+    "core/settings.py:load_config",
+    "gateways/app.py:create_relay_app_from_env",
+    "services/nuwax-workspace/crates/nuwax-config/src/sections.rs:Logging.max_bytes",
 ]
 apply = "hot"
 
@@ -2309,7 +2526,10 @@ apply = "hot"
 type = "boolean"
 default = false
 description = "容器中继的启用状态标记，在中继健康接口中显示。"
-consumers = ["容器中继 · gateways/relay/server.py:create_relay_app.relay_health"]
+consumers = [
+    "core/settings.py:load_config",
+    "gateways/app.py:create_relay_app_from_env",
+]
 apply = "restart"
 
 [relay.incoming_tokens]
@@ -2318,14 +2538,20 @@ items = "string"
 default = []
 description = "允许接入容器中继的令牌列表。"
 sensitive = true
-consumers = ["容器中继 · gateways/relay/server.py:_assert_incoming_token"]
+consumers = [
+    "core/settings.py:load_config",
+    "gateways/app.py:create_relay_app_from_env",
+]
 apply = "restart"
 
 [relay.upstream_base_url]
 type = "string"
 default = "http://host.docker.internal:8766"
 description = "容器中继转发请求的网关基础地址。"
-consumers = ["容器中继 · gateways/relay/server.py:_forward_request"]
+consumers = [
+    "core/settings.py:load_config",
+    "gateways/app.py:create_relay_app_from_env",
+]
 apply = "restart"
 
 [relay.upstream_token]
@@ -2333,40 +2559,53 @@ type = "string"
 default = ""
 description = "容器中继向上游网关发送的访问令牌，空值表示不发送。"
 sensitive = true
-consumers = ["容器中继 · gateways/relay/server.py:_forward_request"]
+consumers = [
+    "core/settings.py:load_config",
+    "gateways/app.py:create_relay_app_from_env",
+]
 apply = "restart"
 
 [manipulation.base_url]
 type = "string"
 default = ""
 description = "外部操作设备的基础地址。启用外部操作时填写服务地址。"
-consumers = ["网关 · services/manipulation/service.py:ManipulationService.__init__"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [manipulation.enabled]
 type = "boolean"
 default = false
 description = "显式启用配置的外部操作设备。未发现实际任务能力时不公开工具。"
-consumers = ["网关 · services/manipulation/service.py:ManipulationService.availability"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [manipulation.http_timeout_sec]
 type = "float"
 default = 3.0
 description = "每次HTTP请求最长等待秒数。"
-consumers = ["网关 · services/manipulation/service.py:ManipulationService.__init__"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [manipulation.poll_interval_sec]
 type = "float"
 default = 0.2
 description = "查询同一设备任务状态的间隔秒数。"
-consumers = ["网关 · services/manipulation/service.py:ManipulationService._run_task"]
+consumers = [
+    "core/settings.py:load_config",
+]
 apply = "restart"
 
 [map_cloud.nominatim_url]
 type = "string"
 default = "https://nominatim.openstreetmap.org/search"
 description = "按地名查询经纬度时使用的OpenStreetMap Nominatim（地名检索服务）搜索地址，可改为自建或代理服务。"
-consumers = ["网关 · services/navigation/places.py:PlaceLookup.__init__"]
+consumers = [
+    "services/navigation/places.py:PlaceLookup.__init__",
+]
 apply = "restart"

@@ -9,13 +9,12 @@ from scripts.neh_source import DEFAULT_BRANCH, DEFAULT_REPOSITORY, SourceError, 
 
 from . import PACKAGE_ROOT
 from .common import ManagerError, atomic_json, read_json
-from .runtime import clean_environment, run_command
-from scripts.module_installer.runtime import _CONFIG
+from .runtime import DEFAULT_GATEWAY_PORT, clean_environment, run_command
 
 
 def normalized_settings(stored):
     result = dict(source_repository=DEFAULT_REPOSITORY, source_branch=DEFAULT_BRANCH,
-                  channel="main", auto_start=True, gateway_port=_CONFIG.schema_default("gateway.port"),
+                  channel="main", auto_start=True, gateway_port=DEFAULT_GATEWAY_PORT,
                   auto_update="notify", check_interval_minutes=30, maintenance_window="")
     result.update({key: stored[key] for key in result if key in stored})
     return result

@@ -11,7 +11,7 @@ from typing import Dict
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from core.config import ConfigStore, atomic_write, specifications, validate_value
+from core.config import ConfigStore, atomic_write, specifications
 
 _KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 LEGACY_KEYS = {'ARK_API_KEY': 'perception.openai_api_key',
@@ -357,7 +357,7 @@ def convert_values(raw, robot, code_root=ROOT, *, missing_authorizations=None):
             value = [item.strip() for item in text.split(",") if item.strip()]
         else:
             value = text
-        values[key] = validate_value(key, value, spec)
+        values[key] = value
     values["robot.driver"] = robot
     facility_key = "navigation.facility_providers_json"
     if facility_key in values:

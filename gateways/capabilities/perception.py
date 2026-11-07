@@ -3,6 +3,7 @@ from contracts.events import RuntimeEventCategory
 from core.capability import Capability
 from core.errors import GatewayError
 from gateways.capabilities.common import schema
+from services.perception.image_utils import encode_image_frame_bytes
 
 
 def capture_image(platform, args):
@@ -30,8 +31,9 @@ def _observe(platform, args, *, refresh=True):
     inputs = platform.perception.get_full_observation_input(context)
     if inputs is not None:
         image, camera_info, pose, tree = inputs
+        image_bytes, _ = encode_image_frame_bytes(image)
         platform.perception.video_runtime.publish_sample(context, map_name=name, pose=pose,
-            frame_tree=tree, image_bytes=image.data, inputs=(image, camera_info), complete=True)
+            frame_tree=tree, image_bytes=image_bytes, inputs=(image, camera_info), complete=True)
     return context
 
 

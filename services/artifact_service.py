@@ -6,7 +6,7 @@ import threading
 from typing import Optional
 
 from contracts.artifacts import ArtifactCleanupResult, ArtifactKind, ArtifactRef, ArtifactRetentionPolicy, ArtifactStorageSummary
-from contracts.image import ImageEncoding, ImageFrame
+from contracts.image import ImageFrame
 from core.errors import GatewayError
 from services.artifact_maintenance import ArtifactMaintenanceWorker
 from services.artifact_store import LocalArtifactStore
@@ -37,19 +37,20 @@ class ArtifactService:
             self._maintenance_worker.update_policy(policy)
 
     def save_image_frame(self, image_frame: ImageFrame, *, metadata: Optional[dict] = None) -> ArtifactRef:
+        from services.perception.image_utils import encode_image_frame_bytes
         with self._condition:
             self._ensure_open()
             self._active_saves += 1
         try:
             if image_frame.data is None:
                 raise GatewayError("当前图像帧未包含内联数据，无法保存为宿主机制品。")
-            mime_type, extension = self._resolve_image_mime(image_frame.encoding)
-            artifact = self._store.save_bytes(kind=ArtifactKind.IMAGE, mime_type=mime_type, data=image_frame.data,
+            data, mime_type = encode_image_frame_bytes(image_frame)
+            artifact = self._store.save_bytes(kind=ArtifactKind.IMAGE, mime_type=mime_type, data=data,
                 metadata={**dict(image_frame.metadata), **dict(metadata or {}), "camera_id": image_frame.camera_id,
                     "frame_id": image_frame.frame_id, "encoding": image_frame.encoding.value,
                     "width_px": image_frame.width_px, "height_px": image_frame.height_px,
                     "frame_timestamp": image_frame.timestamp.isoformat(), "frame_timestamp_origin": "image_frame.timestamp"},
-                extension=extension)
+                extension=".jpg")
             try:
                 self._maintenance_worker.request()
             except Exception:
@@ -95,11 +96,3 @@ class ArtifactService:
             while self._active_saves:
                 self._condition.wait()
         self._maintenance_worker.close()
-
-    @staticmethod
-    def _resolve_image_mime(encoding: ImageEncoding) -> tuple[str, str]:
-        if encoding == ImageEncoding.JPEG:
-            return "image/jpeg", ".jpg"
-        if encoding == ImageEncoding.PNG:
-            return "image/png", ".png"
-        return "application/octet-stream", ".bin"

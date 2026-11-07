@@ -11,6 +11,7 @@ from contracts.runtime_views import PerceptionRuntimeStatus
 from core import StateNamespace
 from core.errors import GatewayError
 from services.perception.keyframe import PerceptionKeyframeSelector
+from services.perception.image_utils import encode_image_frame_bytes
 from services.perception.observation_geometry import contract_pose
 from services.perception.runtime_sample import PerceptionSample
 
@@ -114,10 +115,9 @@ class PerceptionVideoRuntime:
         inputs = sample.inputs
         context, pose, tree = self._perception_service.complete_observation_geometry(
             sample.context, inputs, store_artifact=True, stop_event=self._stop)
-        image_bytes = inputs[0].data if inputs is not None else sample.image_bytes
         return self.publish_sample(context, map_name=sample.map_name,
             pose=pose if inputs is not None else sample.pose,
-            frame_tree=tree if inputs is not None else sample.frame_tree, image_bytes=image_bytes,
+            frame_tree=tree if inputs is not None else sample.frame_tree, image_bytes=sample.image_bytes,
             inputs=inputs, complete=True)
 
     def run_burst(self, ctx, *, reason, frame_count=None, interval_sec=None):
@@ -196,7 +196,8 @@ class PerceptionVideoRuntime:
             return
         self._seen_frames[key] = frame
         decision = self._selector.decide(now=image.timestamp, current_pose=pose)
-        sample = self.publish_sample(context, map_name=map_name, image_bytes=image.data, inputs=inputs)
+        image_bytes, _ = encode_image_frame_bytes(image)
+        sample = self.publish_sample(context, map_name=map_name, image_bytes=image_bytes, inputs=inputs)
         if self._event_bus is not None:
             self._event_bus.publish(self._event_bus.build_event("perception.scene_ready",
                 category=RuntimeEventCategory.PERCEPTION, source="perception_video_runtime",

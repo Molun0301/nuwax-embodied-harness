@@ -74,9 +74,9 @@ def encode_image_frame_bytes(
     """把标准图像帧编码成可传输的压缩图像字节。"""
 
     if image_frame.data is not None:
-        if image_frame.encoding == ImageEncoding.JPEG:
+        if image_frame.encoding == ImageEncoding.JPEG and mime_type == "image/jpeg":
             return image_frame.data, "image/jpeg"
-        if image_frame.encoding == ImageEncoding.PNG:
+        if image_frame.encoding == ImageEncoding.PNG and mime_type == "image/png":
             return image_frame.data, "image/png"
 
     bgr = decode_image_frame_to_bgr(image_frame)

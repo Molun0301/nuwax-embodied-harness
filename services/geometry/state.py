@@ -199,7 +199,7 @@ class GeometryStateView:
 
     def snapshot(self) -> Optional[GeometrySnapshot]:
         with self._condition:
-            return self._snapshot
+            return None if self._snapshot is None else replace(self._snapshot, pose=self._pose)
 
     def pose(self) -> Optional[Pose]:
         with self._condition:
@@ -255,7 +255,7 @@ class GeometryStateView:
                         if self._stopped.is_set():
                             return
                         if kind == "state":
-                            self._snapshot = value
+                            self._snapshot = replace(value, pose=None)
                             self._connected = True
                             if (value.phase in {SessionPhase.IDLE, SessionPhase.FAULT}
                                     or (self._map is not None and self._map.grid.map_name != value.map_name)):
@@ -303,8 +303,8 @@ class GeometryStateView:
                 ctx.check()
                 if self._stopped.is_set() or not self._connected:
                     raise GeometryError("UNAVAILABLE", "Geometry 状态流中断")
-                if self._snapshot is not after:
-                    return self._snapshot
+                if self._snapshot != (None if after is None else replace(after, pose=None)):
+                    return self.snapshot()
                 remaining = ctx.remaining()
                 self._condition.wait(0.05 if remaining is None else min(0.05, remaining))
 

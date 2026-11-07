@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import ast
-from contextlib import nullcontext
 import json
 import os
 import re
@@ -18,7 +17,7 @@ import urllib.request
 from pathlib import Path
 
 from . import PACKAGE_ROOT
-from .common import ManagerError, atomic_json, file_lock, file_lock_held, process_alive, process_identity, read_json
+from .common import ManagerError, atomic_json, process_alive, process_identity, read_json
 
 PROBE_CODE = r'''
 import json,sys,os
@@ -234,12 +233,8 @@ def run_command(argv, *, cwd=None, environment=None, payload=None, timeout=600, 
 
 def probe(prefix, operation, **kwargs):
     request = dict(kwargs, operation=operation)
-    home = prefix.parent.parent
-    manager_home = Path(read_json(home / "config/manager-home.json", {}).get("manager_dir", str(home)))
-    lock = manager_home / "config/transaction.lock"
-    with (nullcontext() if file_lock_held(lock) else file_lock(lock)):
-        output = run_command([str(prefix / "venv/bin/python"), "-c", PROBE_CODE], cwd=prefix / "source",
-                             environment=clean_environment(prefix), payload=json.dumps(request), timeout=120, redact=redactor())
+    output = run_command([str(prefix / "venv/bin/python"), "-c", PROBE_CODE], cwd=prefix / "source",
+                         environment=clean_environment(prefix), payload=json.dumps(request), timeout=120, redact=redactor())
     for line in reversed(output.splitlines()):
         if line.startswith("NEH_CONFIG_ERROR="):
             raise ManagerError("invalid_config", json.loads(line[len("NEH_CONFIG_ERROR="):]), 400)

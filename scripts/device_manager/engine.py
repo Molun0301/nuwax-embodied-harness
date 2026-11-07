@@ -11,14 +11,13 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from contextlib import nullcontext
 
 from scripts.module_installer.catalog import MODULES, ModuleError, module_system_packages, resolve_modules
 from scripts.module_installer.hardware import detect_hardware, recommend_modules
 
 from . import MANAGER_DEVELOPMENT, MANAGER_REVISION, MANAGER_VERSION, PACKAGE_ROOT
 from .common import (ManagerError, atomic_json, atomic_write, file_lock,
-                     file_lock_held, fsync_directory, identifier, process_alive, process_identity, read_json, timestamp)
+                     fsync_directory, identifier, process_alive, process_identity, read_json, timestamp)
 from .runtime import Runtime, append_job_output, clean_environment, probe, run_command, system_helper
 
 from .storage import TERMINAL
@@ -881,11 +880,10 @@ class Engine:
         return probe(candidate, "runtime", install_prefix=str(candidate), modules=plan["modules"], robot=plan["robot"], values=existing)
 
     def _configuration(self, operation, **parameters):
-        with (nullcontext() if file_lock_held(self.lock_path) else file_lock(self.lock_path)):
-            current = self.current()
-            if not current:
-                raise ManagerError("not_installed", "请先安装业务版本。", 409)
-            return probe(Path(current["prefix"]), operation, **parameters)
+        current = self.current()
+        if not current:
+            raise ManagerError("not_installed", "请先安装业务版本。", 409)
+        return probe(Path(current["prefix"]), operation, **parameters)
 
     def config(self, profile=None):
         if not self.current():

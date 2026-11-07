@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import contextlib
-from contextvars import ContextVar
 import fcntl
 import hashlib
 import json
@@ -63,13 +62,6 @@ def fsync_directory(path):
         os.close(descriptor)
 
 
-_HELD_FILE_LOCKS = ContextVar("neh_held_file_locks", default=frozenset())
-
-
-def file_lock_held(path):
-    return Path(path) in _HELD_FILE_LOCKS.get()
-
-
 @contextlib.contextmanager
 def file_lock(path, blocking=False):
     path = Path(path)
@@ -79,11 +71,9 @@ def file_lock(path, blocking=False):
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
         except BlockingIOError as exc:
             raise ManagerError("busy", "已有管理操作正在执行，请等待当前任务完成。", 409) from exc
-        token = _HELD_FILE_LOCKS.set(_HELD_FILE_LOCKS.get() | {path})
         try:
             yield
         finally:
-            _HELD_FILE_LOCKS.reset(token)
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 

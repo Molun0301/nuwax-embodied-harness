@@ -212,7 +212,7 @@ class Engine:
         selected = current.get("modules", [])
         return {"modules": [dict(key=item.key, title=item.title, description=item.description,
                                  requires=list(item.requires), conflicts=list(item.conflicts), installed=item.key in selected)
-                            for item in MODULES.values()], "selected": selected, "robot": current.get("robot", "customrobot"), "robots": ["customrobot", "go2"], "robot_labels": {"customrobot": "标准机器人接入", "go2": "宇树Go2"}}
+                            for item in MODULES.values()], "selected": selected, "robot": current.get("robot", "customrobot"), "robots": ["customrobot", "go2", "unitree_sim"], "robot_labels": {"customrobot": "标准机器人接入", "go2": "宇树Go2", "unitree_sim": "unitree-sim/1 设备"}}
 
     def catalog(self, refresh=False, *, settings=None):
         from .sources import discover
@@ -411,8 +411,8 @@ class Engine:
         except (ModuleError, TypeError) as exc:
             raise ManagerError("invalid_modules", str(exc)) from exc
         robot = request.get("robot", current.get("robot", hardware["recommendation"]["robot"]))
-        if robot not in ("customrobot", "go2"):
-            raise ManagerError("robot_unsupported", "当前完整启动器支持通用机器人和Go2；其它驱动仍待适配。")
+        if robot not in ("customrobot", "go2", "unitree_sim"):
+            raise ManagerError("robot_unsupported", "当前启动器支持通用机器人、Go2 和 unitree_sim。")
         blockers, warnings, steps = [], [], []
         if action == "install":
             configuration = request.get("configuration", {})

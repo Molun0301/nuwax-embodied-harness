@@ -26,7 +26,7 @@ SECTION_TITLES = {
     "memory": "记忆", "semantic_map": "语义地图", "geometry": "定位与建图",
     "navigation": "导航", "motion_guard": "运动守卫", "person_follow": "人物跟随",
     "go2": "Go2 驱动", "logging": "日志", "relay": "容器中继",
-    "manipulation": "操作设备", "map_cloud": "地名查询",
+    "unitree_sim": "仿真设备", "manipulation": "操作设备", "map_cloud": "地名查询",
 }
 PATH_KEYS = {
     "gateway.artifact_dir", "geometry.map_catalog_root", "geometry.mapping_recording_dir",

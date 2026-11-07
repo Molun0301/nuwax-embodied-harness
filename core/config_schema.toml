@@ -95,7 +95,7 @@ apply = "restart"
 
 [robot.driver]
 type = "string"
-choices = ["customrobot", "go2", "g1", "raspi_lidar_robot"]
+choices = ["customrobot", "go2", "g1", "raspi_lidar_robot", "unitree_sim"]
 default = "customrobot"
 description = "活动方案的机器人驱动。安装或导入时保留实际机器人型号。"
 consumers = [
@@ -2608,4 +2608,19 @@ description = "按地名查询经纬度时使用的OpenStreetMap Nominatim（地
 consumers = [
     "services/navigation/places.py:PlaceLookup.__init__",
 ]
+apply = "restart"
+
+[unitree_sim.base_url]
+type = "string"
+default = "http://127.0.0.1:18910"
+description = "unitree-sim/1 设备管理服务地址。安装时从该设备读取实际标定与命令策略。"
+consumers = ["drivers/unitree_sim/device.py:Device", "drivers/unitree_sim/configuration.py:configure"]
+apply = "restart"
+
+[unitree_sim.model]
+type = "string"
+choices = ["go2", "g1"]
+default = "go2"
+description = "设备当前机器人型号。Go2 使用 NEH 自带外形；G1 须在 robot.model_path 指定外形文件。"
+consumers = ["drivers/unitree_sim/assembly.py:UnitreeSimAssembly", "drivers/unitree_sim/configuration.py:configure"]
 apply = "restart"

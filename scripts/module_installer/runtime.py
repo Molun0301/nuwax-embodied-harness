@@ -80,6 +80,9 @@ def write_runtime(root, prefix, modules, robot, existing):
             if not values["geometry." + key]:
                 values["geometry." + key] = json.dumps({"translation_m": list(translation),
                     "rotation_row_major": [float(value) for value in rotation.ravel()]}, separators=(",", ":"))
+    if robot == "unitree_sim":
+        from drivers.unitree_sim.configuration import configure
+        values = configure(values, root, prefix.parent.parent)
     values.update(_memory_settings(root, values, "memory" in selected, configured=existing))
     if "slam2d" in selected and values["geometry.slam2d_config"]:
         planar = json.loads(values["geometry.slam2d_config"])

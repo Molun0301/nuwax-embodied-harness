@@ -1,0 +1,2 @@
+# unitree-sim/1 的二进制事件编码；网络库由 core 提供。
+msgpack==1.0.8

@@ -30,6 +30,11 @@ ROBOT_DRIVER_REGISTRY: Dict[str, RobotDriverRegistration] = {
         private_capabilities_module="drivers.g1.private_capabilities",
         description="G1 机器人入口骨架。",
     ),
+    "unitree_sim": RobotDriverRegistration(
+        robot_name="unitree_sim", package="drivers.unitree_sim", factory_name="create_unitree_sim_assembly",
+        private_capabilities_module="drivers.unitree_sim.private_capabilities",
+        description="unitree-sim/1 设备协议接入。",
+    ),
     "customrobot": RobotDriverRegistration(
         robot_name="customrobot",
         package="drivers.customrobot",

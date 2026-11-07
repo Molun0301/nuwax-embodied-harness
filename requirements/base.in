@@ -35,3 +35,6 @@ lcm==1.5.2
 # 统一配置读写，兼容 Python 3.8。
 tomli==2.0.1; python_version < "3.11"
 tomli-w==1.0.0
+
+# unitree_sim 机器人设备事件。
+msgpack==1.0.8

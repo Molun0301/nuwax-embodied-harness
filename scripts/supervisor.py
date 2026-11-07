@@ -31,7 +31,7 @@ def load_environment(root):
     """启动时合成完整配置，子进程仅继承系统和诊断环境。"""
     from core.config import ConfigStore, install_home
     home = install_home()
-    ConfigStore(home, root).compose()
+    config = ConfigStore(home, root).compose()
     system_names = {"HOME", "USER", "LOGNAME", "SHELL", "PATH", "LANG", "TZ", "TMPDIR", "TMP", "TEMP",
                     "LD_LIBRARY_PATH", "PYTHONPATH", "PYTHONNOUSERSITE", "PYTHONDONTWRITEBYTECODE", "VIRTUAL_ENV",
                     "SSL_CERT_FILE", "SSL_CERT_DIR", "LOGS_DIRECTORY", "INVOCATION_ID", "JOURNAL_STREAM",
@@ -41,6 +41,9 @@ def load_environment(root):
            if key in system_names or key.startswith(("LC_", "CUDA_", "NVIDIA_", "OMP_", "OPENBLAS_", "MKL_",
                                                      "NUWAX_SURFACE_CAPTURE_", "NUWAX_PGO_WINDOW_", "NUWAX_TEST_"))}
     env["NUWAX_INSTALL_HOME"] = str(home)
+    if config["robot"]["driver"] == "unitree_sim":
+        from drivers.unitree_sim.clock import source_time_path
+        env["NUWAX_SOURCE_TIME_FILE"] = str(source_time_path(home))
     env["PYTHONUNBUFFERED"] = "1"
     return env
 

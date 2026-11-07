@@ -61,12 +61,14 @@ MODULES: dict[str, ModuleSpec] = {
 # readiness. G1 remains a scaffold; installing its dependencies does not implement
 # motion control or bypass adapter-specific provisioning and safety guards.
 ROBOT_REQUIREMENTS = {
+    "unitree_sim": ("requirements/robot-unitree-sim.in",),
     "customrobot": (),
     "go2": ("requirements/robot-go2.in",),
     "g1": ("requirements/robot-g1.in",),
     "raspi_lidar_robot": ("requirements/robot-raspi.in",),
 }
 ROBOT_IMPORTS = {
+    "unitree_sim": ("msgpack",),
     "customrobot": (),
     "go2": ("unitree_sdk2py", "cyclonedds", "unitree_webrtc_connect"),
     "g1": ("aiortc", "aiohttp"),

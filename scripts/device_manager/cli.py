@@ -67,7 +67,7 @@ def wizard(engine):
     print("系统：{} {}，{}".format(hardware["hardware"]["os_id"], hardware["hardware"]["version_id"], hardware["hardware"]["architecture"]))
     for reason in recommendation["reasons"] + recommendation["warnings"]:
         print("  " + reason)
-    robot = input("机器人类型 [customrobot/go2，默认{}]：".format(recommendation["robot"])).strip() or recommendation["robot"]
+    robot = input("机器人类型 [customrobot/go2/unitree_sim，默认{}]：".format(recommendation["robot"])).strip() or recommendation["robot"]
     for module in engine.modules()["modules"]:
         print("  {} — {}：{}".format(module["key"], module["title"], module["description"]))
     default_modules = ",".join(recommendation["modules"])
@@ -129,7 +129,7 @@ def parser():
         item.add_argument("--file", help="预配置JSON（action/version/modules/robot/configuration/stop_running）")
         item.add_argument("--version")
         item.add_argument("--modules", help="逗号分隔的模块")
-        item.add_argument("--robot", choices=("customrobot", "go2"))
+        item.add_argument("--robot", choices=("customrobot", "go2", "unitree_sim"))
         item.add_argument("--source-repository", help="本次源码仓库；显式本机Git路径仅供设备本地验证")
         item.add_argument("--source-branch", help="源码分支，默认main")
         item.add_argument("--source-revision", help="固定完整源码提交")

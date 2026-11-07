@@ -1,39 +1,24 @@
 """准备模块配置和唯一监督者入口；方案通过共同配置模块写入。"""
 from __future__ import annotations
 
-import importlib.util
 import json
 from pathlib import Path
 import shlex
 
 from .catalog import ROBOT_REQUIREMENTS
 
-# 安装前只加载纯配置文件，不初始化业务组件。
-_SPEC = importlib.util.spec_from_file_location("nuwax_install_config", Path(__file__).resolve().parents[2] / "core/config.py")
-_CONFIG = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(_CONFIG)
-
 _MODULES = {"core", "geometry", "slam2d", "fastlio2", "pointlio", "navigation", "perception", "follow", "memory"}
 
 
 def read_settings(path):
-    return _CONFIG.flatten(_CONFIG.read_toml(path))
-
-
-def read_existing(root, home=None):
-    store = _CONFIG.ConfigStore(home or root, root)
-    return _CONFIG.flatten(store.effective()) if store.selector.exists() else {}
-
-
-def write_profile(home, name, values, root=None):
-    store = _CONFIG.ConfigStore(home, root or _CONFIG.CODE_ROOT)
-    store.write_profile(name, values)
-    _CONFIG.atomic_write(store.selector, (name + "\n").encode("utf-8"))
-    return store.compose()
+    from scripts.device_manager.runtime import probe
+    home = Path(path).parent.parent
+    return probe((home / "current").resolve(), "read")
 
 
 def _memory_settings(root, values, enabled, *, configured=None):
     """模块开启时使用用户模型，未自定义的路径由模式提供。"""
+    from core.config import schema
     source = values if configured is None else configured
     result = {}
     for kind in ("text", "image"):
@@ -41,13 +26,14 @@ def _memory_settings(root, values, enabled, *, configured=None):
         dimension = "memory." + kind + "_embedding_dim"
         raw = source.get(model, "")
         if enabled and (not raw or raw in ("lexical-only", "disabled") or str(raw).startswith("hashing")):
-            result[model] = _CONFIG.schema(root)["memory"][kind + "_embedding_model"]["default"]
-            result[dimension] = _CONFIG.schema(root)["memory"][kind + "_embedding_dim"]["default"]
+            result[model] = schema(root)["memory"][kind + "_embedding_model"]["default"]
+            result[dimension] = schema(root)["memory"][kind + "_embedding_dim"]["default"]
     return result
 
 
 def write_runtime(root, prefix, modules, robot, existing):
     """返回待提交的原生类型配置；准备阶段不复制另一份方案。"""
+    from core.config import atomic_write, defaults, flatten
     root, prefix = Path(root).resolve(), Path(prefix).resolve()
     selected = set(modules)
     if selected - _MODULES:
@@ -58,8 +44,8 @@ def write_runtime(root, prefix, modules, robot, existing):
         raise ValueError("定位算法和导航需要几何模块")
     if "follow" in selected and not {"navigation", "perception"}.issubset(selected):
         raise ValueError("人员跟随需要导航与视觉感知模块")
-    values = _CONFIG.flatten(_CONFIG.defaults(root))
-    values.update(_CONFIG.validate_updates(existing, root))
+    values = flatten(defaults(root))
+    values.update(existing)
     available = tuple(name for name in ("fastlio2", "pointlio") if name in selected)
     backend = existing.get("geometry.lio_backend", "")
     values["geometry.lio_backend"] = backend if backend in ("device",) + available else next(iter(available), "device")
@@ -108,11 +94,11 @@ def write_runtime(root, prefix, modules, robot, existing):
         "unset PYTHONHOME PYTHONPATH", "export NUWAX_INSTALL_HOME=" + shlex.quote(str(home)),
         "export PYTHONNOUSERSITE=1", "export LD_LIBRARY_PATH=" + shlex.quote(str(prefix / "lib") + ":" + str(prefix / "lib64")),
         "cd " + shlex.quote(str(root)), "exec " + shlex.quote(str(python)) + " -m scripts.supervisor", ""))
-    _CONFIG.atomic_write(prefix / "start.sh", launcher.encode("utf-8"))
+    atomic_write(prefix / "start.sh", launcher.encode("utf-8"))
     (prefix / "start.sh").chmod(0o755)
     return values
 
 
 def effective_settings(root, prefix, environment=None):
-    store = _CONFIG.ConfigStore(Path(prefix).parent.parent, root)
-    return _CONFIG.flatten(store.effective()), store.home / "run/config.toml"
+    from scripts.device_manager.runtime import probe
+    return probe(Path(prefix), "effective"), Path(prefix).parent.parent / "run/config.toml"

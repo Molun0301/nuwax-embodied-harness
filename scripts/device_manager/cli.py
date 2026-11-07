@@ -213,14 +213,7 @@ def main(argv=None):
             if args.file or args.set:
                 request = load_file(args.file) if args.file else {"values": dict(args.set or [])}
                 profile = request.get("profile", args.profile)
-                if args.set:
-                    from scripts.module_installer.runtime import _CONFIG
-                    specs = _CONFIG.specifications()
-                    for key, raw in request["values"].items():
-                        spec = specs[key]
-                        if spec["type"] != "string" and raw not in spec.get("special_values", ()):
-                            request["values"][key] = json.loads(raw)
-                result = engine.save_config(request.get("values", request), profile)
+                result = engine.save_config(request.get("values", request), profile, text_values=bool(args.set))
             else:
                 result = engine.config()
         elif command == "wizard":

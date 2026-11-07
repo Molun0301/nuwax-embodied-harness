@@ -12,7 +12,6 @@ import os
 from pathlib import Path
 import re
 import tempfile
-import struct
 
 try:
     import tomllib
@@ -139,13 +138,6 @@ def validate_updates(values, code_root=CODE_ROOT):
         if isinstance(value, str):
             value = value.strip()
         value = validate_value(name, value, specs[name])
-        if name in ("geometry.lio_scan_voxel_size_m", "geometry.lio_map_voxel_size_m") and value != "":
-            try:
-                native = struct.unpack("=f", struct.pack("=f", value))[0]
-            except (OverflowError, struct.error) as error:
-                raise ValueError(name + " 超出原生单精度体素范围") from error
-            if not math.isfinite(native) or native < 2.0 ** -126:
-                raise ValueError(name + " 转为单精度后必须为正常有限正数")
         if name == "geometry.pgo_options":
             from contracts.pgo_options import normalize_pgo_options
             value = normalize_pgo_options(value)
@@ -165,15 +157,13 @@ def validate_updates(values, code_root=CODE_ROOT):
         elif name.startswith("robot.") and name.split(".", 1)[1] == "model_joint_positions_json":
             from core.robot_geometry import normalize_robot_geometry_setting
             value = normalize_robot_geometry_setting("model_joint_positions_json", value)
-        elif isinstance(value, str) and any(char in value for char in "\r\n\0"):
-            raise ValueError(name + " 必须为单行文本")
         result[name] = value
     return result
 
 
-def validate_business_values(values):
+def validate_business_values(values, code_root=CODE_ROOT):
     """业务解释器在保存边界复用已有结构化输入契约。"""
-    result = validate_updates(values)
+    result = validate_updates(values, code_root)
     if "navigation.facility_providers_json" in result:
         from contracts.building_navigation import normalize_facility_provider_configuration
         result["navigation.facility_providers_json"] = normalize_facility_provider_configuration(result["navigation.facility_providers_json"])
@@ -227,17 +217,8 @@ def derived_values(values, code_root=CODE_ROOT):
 
 
 def read_config(home=None, code_root=CODE_ROOT):
-    """进程只读完整合成文件；缺键或类型错误直接报错。"""
-    result = read_toml(Path(home or install_home()) / "run/config.toml")
-    for section, entries in schema(code_root).items():
-        for key, spec in entries.items():
-            validate_value(section + "." + key, result[section][key], spec)
-    derived = result["derived"]
-    for key, kind in (("nav_profile", str), ("actuator_max_linear_mps", float),
-                      ("actuator_max_yaw_rps", float), ("actuator_motion_model", str), ("robot_geometry_json", str)):
-        if type(derived[key]) is not kind:
-            raise TypeError("derived." + key + " 类型错误")
-    return result
+    """进程只读合成文件；所需字段由实际使用处访问。"""
+    return read_toml(Path(home or install_home()) / "run/config.toml")
 
 
 def runtime_config():
@@ -311,7 +292,7 @@ class ConfigStore:
                     raise ValueError("未知配置键：" + key)
                 logging.getLogger("nuwax_robot_bridge.config_io").warning("忽略方案中的未知配置键：%s", key)
                 del values[key]
-        return validate_updates(values, self.code_root)
+        return validate_business_values(values, self.code_root)
 
     def effective(self, name=None, *, startup=False):
         values = flatten(defaults(self.code_root))
@@ -323,8 +304,6 @@ class ConfigStore:
     def _composed_values(self, values):
         values = resolve_paths(values, self.home)
         record = self.home / "current/installed.json"
-        if not record.exists():
-            record = self.home / "current/manifest.json"
         if record.exists() and "memory" not in json.loads(record.read_text())["modules"]:
             values["memory"].update(text_embedding_model="lexical-only", text_embedding_dim=256,
                                     image_embedding_model="disabled", image_embedding_dim=512)
@@ -337,7 +316,9 @@ class ConfigStore:
         return values
 
     def write_profile(self, name, values):
-        checked = validate_updates(values, self.code_root)
+        self._write_profile(name, validate_business_values(values, self.code_root))
+
+    def _write_profile(self, name, checked):
         specs = specifications(self.code_root)
         base_defaults = defaults(self.code_root)
         base_defaults["gateway"]["port"] = self.port
@@ -350,16 +331,22 @@ class ConfigStore:
         path = self.profile_path(name)
         if path.exists():
             raise ValueError("配置方案已存在：" + name)
-        self.write_profile(name, self.profile_values(source) if source else {})
+        self._write_profile(name, self.profile_values(source) if source else {})
         return self.catalog(name)
 
     def save(self, updates, name=None):
+        if not isinstance(updates, dict):
+            raise ValueError("配置 values 必须是对象。")
+        if "gateway.port" in updates:
+            raise ValueError("业务端口请通过设备管理设置修改。")
         name = name or self.active()
         before = self.profile_values(name)
         values = dict(before)
-        updates = validate_updates(updates, self.code_root)
-        values.update(updates)
         specs = specifications(self.code_root)
+        updates = {key: val for key, val in updates.items()
+                   if not (specs.get(key, {}).get("sensitive") and isinstance(val, str) and val.strip() in ("", "********"))}
+        updates = validate_business_values(updates, self.code_root)
+        values.update(updates)
         changed = sorted(key for key, val in updates.items() if before.get(key, specs[key]["default"]) != val)
         active = name == self.active()
         if active:
@@ -367,7 +354,7 @@ class ConfigStore:
             effective.update(values)
             effective["gateway.port"] = self.port
             composed = self._composed_values(nested(effective))
-        self.write_profile(name, values)
+        self._write_profile(name, values)
         if active:
             write_toml(self.home / "run/config.toml", composed)
         hot = [key for key in changed if specs[key]["apply"] == "hot"]
@@ -391,6 +378,69 @@ class ConfigStore:
         return {"profiles": sorted(path.stem for path in self.directory.glob("*.toml")),
                 "selected_profile": self.active() if self.selector.exists() else "",
                 "profile": name or (self.active() if self.selector.exists() else "")}
+
+    def install(self, name, values):
+        checked = validate_business_values(values, self.code_root)
+        effective = flatten(defaults(self.code_root))
+        effective.update(checked)
+        effective["gateway.port"] = self.port
+        composed = self._composed_values(nested(effective))
+        self._write_profile(name, checked)
+        atomic_write(self.selector, (name + "\n").encode("utf-8"))
+        write_toml(self.home / "run/config.toml", composed)
+        return composed
+
+    def request(self, operation, **parameters):
+        """管理探针在本业务版本解释器中执行配置操作。"""
+        if operation == "runtime":
+            from scripts.module_installer.runtime import write_runtime
+            return write_runtime(self.code_root, Path(parameters["install_prefix"]), parameters["modules"],
+                                 parameters["robot"], parameters["values"])
+        if operation == "schema":
+            return self.settings_schema(parameters.get("profile"))
+        if operation == "save":
+            values = parameters["values"]
+            if parameters.get("text_values"):
+                specs = specifications(self.code_root)
+                values = dict(values)
+                for key, raw in values.items():
+                    spec = specs.get(key)
+                    if spec and spec["type"] != "string" and raw not in spec.get("special_values", ()):
+                        values[key] = json.loads(raw)
+            return self.save(values, parameters.get("profile"))
+        if operation == "create":
+            return self.create(parameters["name"], parameters.get("source"))
+        if operation == "delete":
+            return self.delete(parameters["name"])
+        if operation == "activate":
+            self.activate(parameters["name"])
+            return self.catalog()
+        if operation == "install":
+            return self.install(parameters["name"], parameters["values"])
+        if operation == "existing":
+            from scripts.import_legacy_config import import_legacy
+            report = import_legacy(self.home)
+            return {"values": self.profile_values(self.active()), "import": report}
+        if operation == "snapshot":
+            name = self.active()
+            return {"profile": name, "values": self.profile_values(name)}
+        if operation == "read":
+            return flatten(read_config(self.home))
+        if operation == "effective":
+            return flatten(self.effective())
+        if operation == "existing_values":
+            return flatten(self.effective()) if self.selector.exists() else {}
+        if operation == "prepare":
+            values = flatten(defaults(self.code_root))
+            values.update(parameters["values"])
+            return flatten(resolve_paths(nested(values), self.home))
+        if operation == "secrets":
+            specs = specifications(self.code_root)
+            return [val for key, val in flatten(read_config(self.home)).items()
+                    if specs.get(key, {}).get("sensitive") and isinstance(val, str) and len(val) >= 4]
+        if operation == "catalog":
+            return self.catalog()
+        raise ValueError("未知配置操作：" + operation)
 
     def settings_schema(self, name=None):
         name = name or self.active()
@@ -416,4 +466,6 @@ class ConfigStore:
                     filename = item["key"].split(".", 1)[1] + ".json"
                     item["options_schema"] = json.loads((self.code_root / "contracts" / filename).read_text())["parameters"]
             sections.append({"section_id": section, "section_title": SECTION_TITLES[section], "fields": fields})
-        return {"sections": sections, "profile_context": self.catalog(name)}
+        context = self.catalog(name)
+        context.update(is_active=name == self.active(), robot=values["robot.driver"])
+        return {"sections": sections, "profile_context": context}

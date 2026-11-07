@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+from contextlib import nullcontext
 import json
 import os
 import re
@@ -17,24 +18,24 @@ import urllib.request
 from pathlib import Path
 
 from . import PACKAGE_ROOT
-from .common import ManagerError, atomic_json, process_alive, process_identity, read_json
+from .common import ManagerError, atomic_json, file_lock, file_lock_held, process_alive, process_identity, read_json
 
 PROBE_CODE = r'''
-import json,sys
+import json,sys,os
 from pathlib import Path
-from core.config import validate_business_values
+from core.config import ConfigStore
 request = json.load(sys.stdin)
+operation = request.pop("operation")
 try:
-    if request["operation"] == "runtime":
-        from scripts.module_installer.runtime import write_runtime
-        result = write_runtime(Path.cwd(), Path(request["install_prefix"]), request["modules"], request["robot"], request["values"])
-    else:
-        result = validate_business_values(request["values"])
+    store = ConfigStore(Path(os.environ["NUWAX_INSTALL_HOME"]))
+    result = store.request(operation, **request)
 except (ValueError, TypeError, OverflowError) as error:
     print("NEH_CONFIG_ERROR=" + json.dumps(str(error), ensure_ascii=False))
 else:
     print("NEH_RESULT=" + json.dumps(result, ensure_ascii=False))
 '''
+
+DEFAULT_GATEWAY_PORT = 8766
 
 
 def base_environment():
@@ -62,12 +63,9 @@ def redactor(home=None):
     """隐藏配置密钥和网址中的认证部分；进入网页的诊断与详细日志共用。"""
     secrets = []
     if home:
-        from scripts.module_installer.runtime import read_settings, _CONFIG
-        active = Path(home) / "run/config.toml"
-        specs = _CONFIG.specifications()
-        if active.is_file():
-            secrets = [value for key, value in read_settings(active).items()
-                       if specs.get(key, {}).get("sensitive") and isinstance(value, str) and len(value) >= 4]
+        current = Path(home) / "current"
+        if current.is_symlink() and (Path(home) / "run/config.toml").is_file():
+            secrets = probe(current.resolve(), "secrets")
 
 
     def redact(text):
@@ -146,7 +144,9 @@ def runtime_diagnostic(home):
         return None
 
 
-def run_command(argv, *, cwd=None, environment=None, payload=None, timeout=600, cancelled=lambda: None):
+def run_command(argv, *, cwd=None, environment=None, payload=None, timeout=600, cancelled=lambda: None, redact=None):
+    if redact is None:
+        redact = redactor((environment or {}).get("NUWAX_INSTALL_HOME") or os.environ.get("NEH_MANAGER_WORKER_HOME"))
     # 单独解释器在exec前设置父进程退出信号，避免在线程服务中运行preexec_fn。
     guard = PACKAGE_ROOT / "scripts/device_manager/subprocess_guard.py"
     process = subprocess.Popen([sys.executable, str(guard), str(os.getpid())] + list(argv), cwd=cwd, env=environment, stdin=subprocess.PIPE,
@@ -159,7 +159,6 @@ def run_command(argv, *, cwd=None, environment=None, payload=None, timeout=600, 
     deadline = time.monotonic() + timeout
     # 任务进程中逐行写入详细日志，网页据此实时显示；内部协议行可能带配置值，不写入。
     log_path = job_output_path()
-    redact = redactor((environment or {}).get("NUWAX_INSTALL_HOME") or os.environ.get("NEH_MANAGER_WORKER_HOME"))
     chunks = []
 
     def pump():
@@ -210,7 +209,8 @@ def run_command(argv, *, cwd=None, environment=None, payload=None, timeout=600, 
                 from .common import atomic_write
                 path = directory / ("command-" + str(process.pid) + ".log")
                 atomic_write(path, output)
-                details = {"log_file": str(path), "diagnostic": safe_diagnostic(output.decode("utf-8", errors="replace"), environment.get("NUWAX_INSTALL_HOME"))}
+                diagnostic = "\n".join(redact(output.decode("utf-8", errors="replace")[-6000:]).splitlines()[-20:])[-4000:]
+                details = {"log_file": str(path), "diagnostic": diagnostic}
             reason = redact(failure_reason(output.decode("utf-8", errors="replace")))
             raise ManagerError("command_failed", reason or "受管步骤失败（退出码 {}）：{}".format(process.returncode, Path(argv[0]).name), 500, details)
         return output.decode("utf-8", errors="replace")
@@ -234,8 +234,12 @@ def run_command(argv, *, cwd=None, environment=None, payload=None, timeout=600, 
 
 def probe(prefix, operation, **kwargs):
     request = dict(kwargs, operation=operation)
-    output = run_command([str(prefix / "venv/bin/python"), "-c", PROBE_CODE], cwd=prefix / "source",
-                         environment=clean_environment(prefix), payload=json.dumps(request), timeout=120)
+    home = prefix.parent.parent
+    manager_home = Path(read_json(home / "config/manager-home.json", {}).get("manager_dir", str(home)))
+    lock = manager_home / "config/transaction.lock"
+    with (nullcontext() if file_lock_held(lock) else file_lock(lock)):
+        output = run_command([str(prefix / "venv/bin/python"), "-c", PROBE_CODE], cwd=prefix / "source",
+                             environment=clean_environment(prefix), payload=json.dumps(request), timeout=120, redact=redactor())
     for line in reversed(output.splitlines()):
         if line.startswith("NEH_CONFIG_ERROR="):
             raise ManagerError("invalid_config", json.loads(line[len("NEH_CONFIG_ERROR="):]), 400)
@@ -262,8 +266,7 @@ class Runtime:
         self.state_path = home / "config/runtime.json"
 
     def port(self):
-        from scripts.module_installer.runtime import _CONFIG
-        return read_json(self.manager_home / "config/settings.json", {}).get("gateway_port", _CONFIG.schema_default("gateway.port"))
+        return read_json(self.manager_home / "config/settings.json", {}).get("gateway_port", DEFAULT_GATEWAY_PORT)
 
     def _components(self):
         with socket.socket(socket.AF_UNIX) as connection:
@@ -320,10 +323,9 @@ class Runtime:
     def start(self, prefix):
         if self.status()["running"]:
             raise ManagerError("already_running", "业务拥有方已运行，拒绝并行创建。", 409)
-        from scripts.module_installer.runtime import _CONFIG
-        values = _CONFIG.ConfigStore(self.home, prefix / "source", self.port()).effective()
-        if values["transport"]["real_lcm_required"] and Path("/usr/local/libexec/neh-system-helper").is_file():
-            system_helper("prepare-network", {"url": values["transport"]["lcm_url"]})
+        values = probe(prefix, "effective")
+        if values["transport.real_lcm_required"] and Path("/usr/local/libexec/neh-system-helper").is_file():
+            system_helper("prepare-network", {"url": values["transport.lcm_url"]})
         log_path = self.home / "logs/runtime.log"
         descriptor = os.open(str(log_path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
         with os.fdopen(descriptor, "ab") as log:

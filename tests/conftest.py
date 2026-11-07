@@ -130,3 +130,17 @@ def perception_runtime(tmp_path):
     with setup(tmp_path / "探索感知") as value:
         value.source.current = None
         yield value.runtime
+
+
+def prepare_business_release(prefix):
+    """提供真实业务源码和当前测试解释器，不用空壳脚本替代探针。"""
+    source = prefix / "source"
+    source.mkdir(parents=True, exist_ok=True)
+    for name in ("core", "contracts", "scripts", "drivers", "adapters"):
+        target = source / name
+        if not target.exists():
+            target.symlink_to(ROOT / name, target_is_directory=True)
+    virtualenv = prefix / "venv"
+    if not virtualenv.exists():
+        virtualenv.symlink_to(Path(sys.prefix), target_is_directory=True)
+    return source

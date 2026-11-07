@@ -78,7 +78,9 @@ class Checks(unittest.TestCase):
                     "robot": "customrobot", "revision": self.source["revision"]})
         self.engine._switch(prefix)
         from core.config import ConfigStore
-        ConfigStore(self.engine.home).install("测试", {"geometry.runtime_data_dir": str(self.engine.home / "data")})
+        store = ConfigStore(self.engine.home)
+        store.install("测试", {"geometry.runtime_data_dir": str(self.engine.home / "data")})
+        store.compose()
         return prefix
 
     def job(self, action, **plan):
@@ -104,6 +106,22 @@ class Checks(unittest.TestCase):
 
 
 class LegacyUpgradeChecks(Checks):
+    def test_candidate_install_computes_geometry_without_writing_runtime_file(self):
+        from core.config import ConfigStore
+        from core.robot_geometry import RobotGeometryError
+        store = ConfigStore(self.engine.home)
+        values = store.install("候选", {"logging.level": "DEBUG"})
+        runtime = self.engine.home / "run/config.toml"
+        self.assertFalse(runtime.exists())
+        self.assertTrue(values["derived"]["robot_geometry_json"])
+        runtime.parent.mkdir(parents=True)
+        runtime.write_bytes(b"previous-runtime\n")
+        with self.assertRaises(RobotGeometryError):
+            store.install("错误", {"robot.model_path": str(self.root / "missing.urdf")})
+        self.assertFalse(store.profile_path("错误").exists())
+        self.assertEqual(store.active(), "候选")
+        self.assertEqual(runtime.read_bytes(), b"previous-runtime\n")
+
     def test_first_install_existing_reads_active_profile_and_preserves_other_profiles(self):
         from core.config import ConfigStore
         candidate = self.engine.home / "releases/candidate"
@@ -144,11 +162,15 @@ class LegacyUpgradeChecks(Checks):
         profiles = self.engine.home / "config/profiles/go2"
         profiles.mkdir(parents=True)
         legacy = profiles / "旧方案.env"
-        legacy.write_text("NUWAX_ACTIVE_ROBOT=go2\nGO2_ROBOT_IP=192.0.2.11\nNUWAX_LOG_LEVEL=DEBUG\n")
+        legacy.write_text("NUWAX_ACTIVE_ROBOT=go2\nGO2_ROBOT_IP=192.0.2.11\nNUWAX_LOG_LEVEL=DEBUG\nOPENAI_API_KEY=legacy-plain-secret\n")
         (profiles / ".active").write_text("旧方案\n")
         active = self.engine.home / "data/settings/active.env"
         active.parent.mkdir(parents=True)
         active.symlink_to(legacy)
+        runtime_config = self.engine.home / "run/config.toml"
+        runtime_config.parent.mkdir(parents=True)
+        stale_runtime = b'previous-attempt-runtime\n'
+        runtime_config.write_bytes(stale_runtime)
         self.engine.save_settings({"auto_start": False})
         del self.engine.hardware
         hardware = HardwareInfo(architecture="x86_64", cpu_count=4, memory_bytes=8 * GIB,
@@ -168,10 +190,19 @@ class LegacyUpgradeChecks(Checks):
                 return {"system_packages": []}
             if operation == "dependencies":
                 (candidate / "venv").symlink_to(Path(sys.prefix), target_is_directory=True)
+            if operation in ("models", "verify"):
+                from scripts.device_manager.runtime import clean_environment, run_command
+                self.assertEqual(runtime_config.read_bytes(), stale_runtime)
+                self.assertEqual(engine.current()["prefix"], str(old))
+                run_command([sys.executable, "-c", "print('legacy-plain-secret')"],
+                            cwd=candidate / "source", environment=clean_environment(candidate))
+                executed.append(operation)
             return {}
 
+        executed = []
         source = dict(self.source, root=ROOT, changed_files=[], previous_revision="b" * 40)
         with patch.object(engine_module, "probe", side_effect=config_probe), \
+                patch("scripts.device_manager.runtime.probe", side_effect=config_probe), \
                 patch.object(engine_module, "detect_hardware", return_value=hardware), \
                 patch.object(self.engine, "catalog", return_value={"source": self.source, "manager": {"version": "v2"}}), \
                 patch("scripts.device_manager.sources.discover", return_value=self.source), \
@@ -207,7 +238,17 @@ class LegacyUpgradeChecks(Checks):
             candidate = Path(self.engine.current()["prefix"])
             self.assertNotEqual(candidate, old)
             self.assertEqual([(prefix, op) for prefix, op in calls if op == "existing"], [(candidate, "existing")])
+            self.assertEqual([(prefix, op) for prefix, op in calls if op == "secrets"], [(candidate, "secrets")])
             self.assertTrue(all(prefix == candidate for prefix, _ in calls))
+            self.assertEqual(executed, ["models", "verify"])
+            self.assertEqual(runtime_config.read_bytes(), stale_runtime)
+            output = (self.engine.manager_home / "logs" / (job["id"] + ".output.log")).read_text()
+            self.assertNotIn("legacy-plain-secret", output)
+            self.assertIn("[已隐藏]", output)
+            # 只有监督者的启动合成入口在此时写入运行配置。
+            from scripts.supervisor import load_environment
+            with patch.dict("os.environ", {"NUWAX_INSTALL_HOME": str(self.engine.home)}):
+                load_environment(candidate / "source")
             self.assertEqual(read_config(self.engine.home)["logging"]["level"], "DEBUG")
             self.assertEqual(read_config(self.engine.home)["go2"]["robot_ip"], "192.0.2.11")
             self.assertEqual((self.engine.home / "config/active_profile").read_text().strip(), "旧方案")

@@ -367,8 +367,10 @@ class SelectedLifecycleChecks(Checks):
             self.assertEqual(rolled["status"], "succeeded", rolled)
         self.assertEqual(Engine(self.manager).current()["prefix"], str(previous))
         self.assertEqual((candidate / "source/runtime_data").resolve(), self.target / "data")
-        from core.config import read_config
-        self.assertEqual(read_config(self.target)["geometry"]["runtime_data_dir"], str(self.target / "data"))
+        from core.config import ConfigStore, resolve_paths
+        values = resolve_paths(ConfigStore(self.target).effective(), self.target)
+        self.assertEqual(values["geometry"]["runtime_data_dir"], str(self.target / "data"))
+        self.assertFalse((self.target / "run/config.toml").exists())
         self.assertEqual(data.read_text(), "user map")
         self.assertTrue((self.target / "config/profiles/default.toml").is_file())
         self.assertEqual((self.target / "config/active_profile").read_text().strip(), "default")

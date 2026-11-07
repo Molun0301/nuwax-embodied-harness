@@ -388,7 +388,6 @@ class ConfigStore:
         composed = self._composed_values(nested(effective))
         self._write_profile(name, checked)
         atomic_write(self.selector, (name + "\n").encode("utf-8"))
-        write_toml(self.home / "run/config.toml", composed)
         return composed
 
     def request(self, operation, **parameters):
@@ -438,7 +437,8 @@ class ConfigStore:
             return flatten(resolve_paths(nested(values), self.home))
         if operation == "secrets":
             specs = specifications(self.code_root)
-            return [val for key, val in flatten(read_config(self.home)).items()
+            values = parameters["values"] if "values" in parameters else flatten(read_config(self.home))
+            return [val for key, val in values.items()
                     if specs.get(key, {}).get("sensitive") and isinstance(val, str) and len(val) >= 4]
         if operation == "catalog":
             return self.catalog()

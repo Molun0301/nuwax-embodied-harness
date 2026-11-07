@@ -22,7 +22,7 @@ class EventDecoder:
         kind, payload = event['type'], event['payload']
         if kind in ('imu', 'lidar'):
             registration = payload['registration']
-            common = dict(sensor_id=payload['sensor_id'],
+            common = dict(sensor_id=event['frame_id'] if kind == 'imu' else payload['sensor_id'],
                           source_sequence=event['sequence'], clock_domain='unix_ns',
                           clock_id=payload['clock_id'], frame_id=registration['frame_id'],
                           registration_state=registration['state'], registration_frame_id=registration['frame_id'],

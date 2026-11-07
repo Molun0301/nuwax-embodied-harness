@@ -19,7 +19,8 @@ from scripts.module_installer.hardware import detect_hardware, recommend_modules
 from . import MANAGER_DEVELOPMENT, MANAGER_REVISION, MANAGER_VERSION, PACKAGE_ROOT
 from .common import (ManagerError, atomic_json, atomic_write, file_lock,
                      fsync_directory, identifier, process_alive, process_identity, read_json, timestamp)
-from .runtime import Runtime, append_job_output, clean_environment, probe, run_command, system_helper
+from .runtime import (Runtime, append_job_output, clean_environment, probe, run_command,
+                      set_task_secrets, system_helper, task_redaction)
 
 from .storage import TERMINAL
 ACTIONS = {"install", "update", "modules", "rollback", "start", "stop", "restart", "update-manager"}
@@ -543,10 +544,11 @@ class Engine:
                     os.environ[key] = value
 
     def _run_job_locked(self, job_id):
-        with file_lock(self.lock_path, blocking=True):
+        with file_lock(self.lock_path, blocking=True), task_redaction() as redaction:
             job = read_json(self._job_path(job_id))
             if not job or job["status"] in TERMINAL:
                 return
+            redaction["current"] = job["action"] in ("start", "stop", "restart")
             job.update(status="running", _process=process_identity(os.getpid()))
             if job["_plan"].get("_request", {}).get("automatic"):
                 os.nice(10)
@@ -873,7 +875,9 @@ class Engine:
         existing = apply_model_overrides(existing, model_overrides)
         existing["gateway.host"] = "127.0.0.1"
         existing.pop("gateway.port", None)
-        return probe(candidate, "runtime", install_prefix=str(candidate), modules=plan["modules"], robot=plan["robot"], values=existing)
+        values = probe(candidate, "runtime", install_prefix=str(candidate), modules=plan["modules"], robot=plan["robot"], values=existing)
+        set_task_secrets(probe(candidate, "secrets", values=values))
+        return values
 
     def _configuration(self, operation, **parameters):
         current = self.current()

@@ -1,6 +1,8 @@
 """通过业务监督者管理启停；配置通过当前版本的共同实现读写。"""
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 import ast
 import json
 import os
@@ -58,14 +60,44 @@ def clean_environment(prefix=None, *, environment=None):
 
 
 
+_TASK_REDACTION = ContextVar("neh_task_redaction", default=None)
+
+
+@contextmanager
+def task_redaction():
+    """脱敏快照由单个管理任务拥有，退出时释放。"""
+    state = {"current": False, "redact": None}
+    token = _TASK_REDACTION.set(state)
+    try:
+        yield state
+    finally:
+        _TASK_REDACTION.reset(token)
+
+
+def set_task_secrets(secrets):
+    state = _TASK_REDACTION.get()
+    if state is not None:
+        state["redact"] = _make_redactor(secrets=secrets)
+
+
 def redactor(home=None):
-    """隐藏配置密钥和网址中的认证部分；进入网页的诊断与详细日志共用。"""
-    secrets = []
+    """任务内复用快照；任务外诊断仍按当前业务配置脱敏。"""
+    state = _TASK_REDACTION.get()
+    if state is None or (state["redact"] is None and home is None):
+        return _make_redactor(home)
+    if state["redact"] is None:
+        state["redact"] = _make_redactor(home if state["current"] else None)
+    return state["redact"]
+
+
+def _make_redactor(home=None, *, secrets=None):
+    """隐藏已知密钥与网址认证部分，不在持有快照时再次读取配置。"""
+    if secrets is None:
+        secrets = []
     if home:
         current = Path(home) / "current"
         if current.is_symlink() and (Path(home) / "run/config.toml").is_file():
             secrets = probe(current.resolve(), "secrets")
-
 
     def redact(text):
         for value in secrets:

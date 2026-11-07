@@ -415,7 +415,7 @@ def import_legacy(home, code_root=ROOT, *, manager_home=None, asset_root=None):
         if names[path] != path.stem:
             renamed.append({"old": str(path.relative_to(home)), "new": "config/profiles/" + names[path] + ".toml"})
     atomic_write(store.selector, (names[selected] + "\n").encode("utf-8"))
-    store.compose()
+    store._composed_values(store.effective(startup=True))
     for path in files:
         path.unlink()
     for directory in {path.parent for path in files}:

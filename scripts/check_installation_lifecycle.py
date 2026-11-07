@@ -34,6 +34,7 @@ class LifecycleChecks(unittest.TestCase):
         atomic_json(self.home / "config/settings.json", {"gateway_port": 9876})
         store = ConfigStore(self.home)
         store.install("测试", {"gateway.host": "127.0.0.7"})
+        store.compose()
         # 本组隔离启停边界；配置值由真实方案读取，避免启停替身拦截配置子进程。
         configuration = patch.object(lifecycle, "effective_settings", side_effect=lambda root, prefix, environment=None:
                                      (flatten(store.effective()), self.settings))

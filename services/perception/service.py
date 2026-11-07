@@ -807,25 +807,20 @@ class PerceptionService:
         return None
 
     def complete_observation_geometry(self, context, inputs, *, store_artifact=False,
-                                      wait_sec=0.0, stop_event=None):
+                                      stop_event=None):
         """完成同帧几何与关键帧抓图，返回结果后结束感知操作。"""
         with self._operation():
             return self._complete_observation_geometry(
                 context, inputs, store_artifact=store_artifact,
-                wait_sec=wait_sec, stop_event=stop_event)
+                stop_event=stop_event)
 
     def _complete_observation_geometry(self, context, inputs, *, store_artifact=False,
-                                      wait_sec=0.0, stop_event=None):
+                                      stop_event=None):
         """后台补几何与关键帧照片，复用本次检测结果，不再次抓拍或推理。"""
         if inputs is None:
             return context, None, None
         image_frame, camera_info = inputs
-        deadline = perf_counter() + wait_sec
         geometry = self._capture_geometry(image_frame)
-        while geometry.reason in {"capture_pose_unavailable", "capture_pointcloud_unavailable"} and perf_counter() < deadline:
-            if stop_event is None or stop_event.wait(min(0.02, max(0.0, deadline - perf_counter()))):
-                break
-            geometry = self._capture_geometry(image_frame)
         if stop_event is not None and stop_event.is_set():
             return context, None, None
         if camera_info is None:
@@ -836,12 +831,14 @@ class PerceptionService:
                 tuple(context.observation.detections_2d), image_frame=image_frame, camera_info=camera_info,
                 point_cloud=geometry.point_cloud, frame_tree=geometry.frame_tree, current_pose=geometry.pose,
                 self_region=region_from_detection_metadata(context.metadata.get("detection_metadata")))
-        metadata = {**metadata, "geometry_synchronization": "same_acquisition_time",
+        metadata = {**metadata, "geometry_synchronization": "source_time_window_interpolation",
                     "geometry_input_sources": list(geometry.sources)}
         if geometry.reason:
             metadata["geometry_projection_degradation_reason"] = geometry.reason
+            metadata["geometry_projection_degradation_message"] = geometry.message
             detections = tuple(item.model_copy(update={"attributes": {
-                **item.attributes, "geometry_projection_degradation_reason": geometry.reason}})
+                **item.attributes, "geometry_projection_degradation_reason": geometry.reason,
+                "geometry_projection_degradation_message": geometry.message}})
                 for item in detections)
         artifact = context.image_artifact
         if store_artifact and artifact is None:
@@ -1579,9 +1576,8 @@ class PerceptionService:
 
     def _capture_cached_geometry_inputs(self, image_frame):
         """单次完整识别在模型等待前保留已有几何输入。"""
-        pose = contract_pose(None if self._geometry_state is None else self._geometry_state.pose())
         geometry = self._capture_geometry(image_frame)
-        return geometry.point_cloud, geometry.frame_tree, pose
+        return geometry.point_cloud, geometry.frame_tree, geometry.pose
 
     def self_body_filter_status(self) -> Dict[str, Any]:
         return self._self_body_filter.status()
@@ -1644,6 +1640,10 @@ class PerceptionService:
                 "geometry_projection_status": "pointcloud_unavailable",
                 "geometry_degraded_reason": geometry_metadata.get("geometry_projection_degradation_reason") or "pointcloud_unavailable",
             }
+        if current_pose is None and geometry_metadata.get("geometry_projection_degradation_reason") == "point_cloud_unavailable":
+            geometry_metadata.update(geometry_projection_degradation_reason="capture_pose_unavailable",
+                                     geometry_projection_degradation_message="图像时刻的位姿不可用")
+        geometry_metadata["geometry_synchronization"] = "source_time_window_interpolation"
         if detections_2d == detection_bundle.detections_2d and not geometry_metadata:
             return detection_bundle.__class__(
                 detections_2d=detection_bundle.detections_2d,

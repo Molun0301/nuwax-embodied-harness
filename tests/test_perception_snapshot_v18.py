@@ -19,6 +19,8 @@ def test_capture_is_frozen_before_model_wait_and_published_with_result(tmp_path,
         stamp=int(p.current[0].timestamp.timestamp()*1e9)
         geometry.value=replace(geometry.value,pose=GeometryPose(2,0,0,0,0,0,1,'map',stamp))
         p.service._geometry_state=geometry
+        p.service._stream_bus.publish('localization.pose',source='geometry',payload=geometry.value.pose,
+            metadata={'map_name':'house','source_timestamp_ns':stamp})
         entered,release=threading.Event(),threading.Event()
         detect=p.service._detector_pipeline.detect
         def blocked(*args,**kwargs):

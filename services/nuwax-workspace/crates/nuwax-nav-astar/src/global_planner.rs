@@ -742,6 +742,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn geometry_paths_fit_free_boundary_at_coarse_and_production_resolution() {
+        let mut results = Vec::new();
+        for resolution in [1.0, 0.05] {
+            let size = (6.0_f64 / resolution).round() as usize;
+            let mut map = CostMap2D::new_all_free("map", size, size, resolution);
+            for y in 0..size {
+                for x in 0..size {
+                    let center = map.cell_center_world(x, y);
+                    if center.x > 5.0 || center.y > 5.0 {
+                        map.set(x, y, OCCUPIED);
+                    }
+                }
+            }
+            let geometry = RobotGeometry {
+                footprint_xy_m: vec![[-0.25, -0.25], [0.25, -0.25], [0.25, 0.25], [-0.25, 0.25]],
+                ..test_geometry(0.25)
+            };
+            let mut planner = GlobalPlanner::new(GlobalPlannerConfig::new(geometry));
+            let path = planner.plan_once(
+                make_pose_stamped("map", 0.5, 0.5, 0.0),
+                make_pose_stamped("map", 4.5, 4.5, 0.0), &map).path;
+            let fits = path.as_ref().is_some_and(|p| {
+                p.points.first() == Some(&Point2::new(0.5, 0.5))
+                    && p.points.last() == Some(&Point2::new(4.5, 4.5))
+            });
+            eprintln!("R14分辨率{resolution}：路径可用={fits}");
+            results.push((resolution, fits));
+        }
+        assert!(results.iter().all(|(_, fits)| *fits), "相同实体可行场景必须都能规划：{results:?}");
+    }
+
     fn body_planner(half_width: f64) -> GlobalPlanner {
         GlobalPlanner::new(GlobalPlannerConfig {
             robot_geometry: test_geometry(half_width),

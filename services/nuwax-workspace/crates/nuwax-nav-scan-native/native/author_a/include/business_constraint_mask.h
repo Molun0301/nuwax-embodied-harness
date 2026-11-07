@@ -40,16 +40,7 @@ class BusinessConstraintMask {
   bool empty() const { return boundary_.size() < 3 && buckets_.empty(); }
 
   bool rejects(const Eigen::Vector3d& reference, double yaw) const {
-    if (boundary_.size() >= 3 && !insideBoundary(reference.head<2>())) return true;
-    Eigen::Vector3d center = reference;
-    center += Eigen::Vector3d(body_center_x_ * std::cos(yaw) - body_center_y_ * std::sin(yaw),
-                             body_center_x_ * std::sin(yaw) + body_center_y_ * std::cos(yaw), 0.0);
-    const Eigen::Vector3d heading(std::cos(yaw), std::sin(yaw), 0.0);
-    const Eigen::Vector3d front = center + offset_ * heading;
-    const Eigen::Vector3d rear = center - offset_ * heading;
-    if (boundary_.size() >= 3 &&
-        (!insideBoundary(front.head<2>()) || !insideBoundary(rear.head<2>()))) return true;
-    return intersectsForbidden(front) || intersectsForbidden(rear);
+    return rejectsEnvelope(reference, yaw, 0.0);
   }
 
   // 半径padding包住整段机体点的位移，业务边界与禁行格同样不能在采样间隙穿越。
@@ -58,14 +49,14 @@ class BusinessConstraintMask {
     Eigen::Vector2d center = reference.head<2>() + Eigen::Vector2d(
         body_center_x_*heading.x()-body_center_y_*heading.y(),
         body_center_x_*heading.y()+body_center_y_*heading.x());
-    for (const auto& p : std::array<Eigen::Vector2d,3>{reference.head<2>(),
+    for (const auto& p : std::array<Eigen::Vector2d,2>{
         center+offset_*heading,center-offset_*heading}) {
       if (boundary_.size() >= 3) {
         if (!insideBoundary(p)) return true;
         for (size_t i=0,j=boundary_.size()-1;i<boundary_.size();j=i++) {
           const auto d=(boundary_[i]-boundary_[j]).eval();
           const double t=d.squaredNorm()>0.?std::clamp((p-boundary_[j]).dot(d)/d.squaredNorm(),0.,1.):0.;
-          if ((p-(boundary_[j]+t*d)).norm() <= padding) return true;
+          if ((p-(boundary_[j]+t*d)).norm() < radius_ + padding) return true;
         }
       }
     }

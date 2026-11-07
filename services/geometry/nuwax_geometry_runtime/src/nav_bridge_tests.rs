@@ -160,7 +160,7 @@ async fn waiting_goal_automatically_sends_when_both_inputs_ready() {
         proto::GoalStatus::WaitingInput as i32
     );
     assert!(capture.goals().is_empty());
-    bridge.set_input_ready(true);
+    bridge.set_input_ready(Ok(()));
     capture.inject_ready();
     let status = tokio::time::timeout(Duration::from_secs(1), rx.recv())
         .await
@@ -182,7 +182,7 @@ async fn replaced_or_cancelled_waiting_goal_is_never_sent() {
     rx.recv().await.unwrap();
     bridge.submit("new".into(), goal(), false).await.unwrap();
     rx.recv().await.unwrap();
-    bridge.set_input_ready(true);
+    bridge.set_input_ready(Ok(()));
     capture.inject_ready();
     let status = tokio::time::timeout(Duration::from_secs(1), rx.recv())
         .await
@@ -190,14 +190,14 @@ async fn replaced_or_cancelled_waiting_goal_is_never_sent() {
         .unwrap();
     assert_eq!(status.goal_id, "new");
     assert_eq!(capture.goals().len(), 1);
-    bridge.set_input_ready(false);
+    bridge.set_input_ready(Err("占据栅格缺失，来源年龄未知".into()));
     bridge
         .submit("cancelled".into(), goal(), false)
         .await
         .unwrap();
     rx.recv().await.unwrap();
     bridge.cancel("cancelled").await.unwrap();
-    bridge.set_input_ready(true);
+    bridge.set_input_ready(Ok(()));
     bridge.shutdown().await;
     assert_eq!(capture.goals().len(), 1);
 }
@@ -229,19 +229,19 @@ async fn deferred_publish_failure_reports_failed_from_each_readiness_trigger_wit
         );
         capture.fail_goal_publication.store(true, Ordering::SeqCst);
         if from_stack_state {
-            bridge.set_input_ready(true);
+            bridge.set_input_ready(Ok(()));
             bridge.cancel("unrelated").await.unwrap();
             capture.inject_ready();
         } else {
             capture.inject_ready_named("heartbeat");
             assert_eq!(next_status(&mut rx).await.goal_id, "heartbeat");
-            bridge.set_input_ready(true);
+            bridge.set_input_ready(Ok(()));
         }
         let failed = next_status(&mut rx).await;
         assert_eq!(failed.goal_id, "waiting");
         assert_eq!(failed.status, proto::GoalStatus::Failed as i32);
         assert!(failed.message.contains("测试导航发布链路已断开"));
-        bridge.set_input_ready(true);
+        bridge.set_input_ready(Ok(()));
         bridge.cancel("unrelated").await.unwrap();
         assert_eq!(capture.goal_publish_attempts.load(Ordering::SeqCst), 1);
         assert!(capture.goals().is_empty());
@@ -256,7 +256,7 @@ async fn immediate_publish_failure_returns_unavailable_and_reports_failed() {
     let bridge = NavBridge::with_transport(LcmTransport::new(capture.clone()), tx)
         .await
         .unwrap();
-    bridge.set_input_ready(true);
+    bridge.set_input_ready(Ok(()));
     bridge.cancel("unrelated").await.unwrap();
     capture.inject_ready_named("heartbeat");
     next_status(&mut rx).await;
@@ -316,7 +316,7 @@ async fn state_stream_error_or_close_fails_goal_and_next_command_reconnects() {
             next_status(&mut rx).await.status,
             proto::GoalStatus::WaitingInput as i32
         );
-        bridge.set_input_ready(true);
+        bridge.set_input_ready(Ok(()));
         capture.inject_ready();
         assert_eq!(
             next_status(&mut rx).await.status,
@@ -341,7 +341,7 @@ async fn deferred_encoding_failure_reports_failed_instead_of_leaving_waiting_inp
         .await
         .unwrap();
     next_status(&mut rx).await;
-    bridge.set_input_ready(true);
+    bridge.set_input_ready(Ok(()));
     capture.inject_ready();
     let failed = next_status(&mut rx).await;
     assert_eq!(failed.goal_id, "invalid");
@@ -368,7 +368,7 @@ async fn exploration_goal_envelope_carries_complete_map_boundary() {
         .await
         .unwrap();
     next_status(&mut rx).await;
-    bridge.set_input_ready(true);
+    bridge.set_input_ready(Ok(()));
     capture.inject_ready();
     next_status(&mut rx).await;
     let frame = capture.goals().pop().unwrap();
@@ -452,7 +452,7 @@ async fn disconnected_sent_goal_reports_reason_and_cancel_rebuilds_channel() {
         .unwrap();
     bridge.submit("执行中".into(), goal(), false).await.unwrap();
     next_status(&mut rx).await;
-    bridge.set_input_ready(true);
+    bridge.set_input_ready(Ok(()));
     capture.inject_ready();
     assert_eq!(
         next_status(&mut rx).await.status,
@@ -496,7 +496,7 @@ async fn restart_fails_dispatched_goal_and_does_not_resend_it() {
     let bridge = NavBridge::with_transport(LcmTransport::new(capture.clone()), tx)
         .await
         .unwrap();
-    bridge.set_input_ready(true);
+    bridge.set_input_ready(Ok(()));
     capture.inject_ready_generation("", 42);
     bridge.submit("在途目标".into(), goal(), false).await.unwrap();
     assert_eq!(rx.recv().await.unwrap().status, proto::GoalStatus::WaitingInput as i32);

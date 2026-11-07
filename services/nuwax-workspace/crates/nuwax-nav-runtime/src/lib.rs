@@ -248,6 +248,8 @@ pub struct SchedulerStatus {
 
     /// Whether both planner inputs are within their receipt TTL.
     pub planner_inputs_fresh: bool,
+    /// 由现有新鲜度判定返回的具体缺失项，仅供状态说明。
+    pub input_wait_reason: Option<String>,
     /// Source timestamp from the most recently consumed map pose.
     pub pose_source_timestamp_ns: i64,
     /// Source timestamp from the most recently consumed occupancy snapshot.
@@ -281,6 +283,7 @@ impl Default for SchedulerStatus {
             motion_sink_ready: false,
 
             planner_inputs_fresh: false,
+            input_wait_reason: None,
             pose_source_timestamp_ns: 0,
             costmap_source_timestamp_ns: 0,
             pose_receipt_age_ms: u64::MAX,
@@ -1223,10 +1226,15 @@ where
             && self.costmap_receipt.is_some_and(|receipt| {
                 self.config.costmap_ttl.is_zero() || now.duration_since(receipt.received_at) <= self.config.costmap_ttl
             });
+        self.status.input_wait_reason = if self.status.planner_inputs_fresh { None } else { self.input_wait_reason(now) };
     }
 
     fn stale_input_reason(&mut self, now: Instant) -> Option<String> {
         self.refresh_input_status(now);
+        self.status.input_wait_reason.clone()
+    }
+
+    fn input_wait_reason(&self, now: Instant) -> Option<String> {
         if !self.obstacle_source_available {return Some("recent obstacle source revoked".into());}
         if self.obstacle_source_bound.is_some_and(CommandDispatchBound::expired_now) {
             return Some("recent obstacle source deadline elapsed".into());

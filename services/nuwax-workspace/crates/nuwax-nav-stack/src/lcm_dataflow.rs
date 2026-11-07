@@ -2481,7 +2481,29 @@ fn build_guarded_navigation_status(
             _ => schema::NAVIGATION_GOAL_STATUS_NONE,
         }
     };
-    let message = if has_public_session { status.message.clone() } else { "导航栈空闲".into() };
+    let input_ready = status.motion_sink_ready && status.planner_inputs_fresh
+        && !telemetry.map_frame.is_empty() && telemetry.map_frame == telemetry.pose_frame;
+    let message = if !input_ready && !matches!(goal_status, schema::NAVIGATION_GOAL_STATUS_SUCCEEDED | schema::NAVIGATION_GOAL_STATUS_FAILED | schema::NAVIGATION_GOAL_STATUS_CANCELLED | schema::NAVIGATION_GOAL_STATUS_STOPPED) {
+        let age = |stamp: i64| {
+            if stamp <= 0 { return "尚未收到，年龄未知".to_string(); }
+            match nuwax_nav_types_messages::source_time::data_age_ns_at(stamp as u64, now.as_nanos() as u64) {
+                Ok(age) => format!("来源年龄={}毫秒", age / 1_000_000),
+                Err(reason) => format!("来源年龄不可用：{reason}"),
+            }
+        };
+        let mut missing = Vec::new();
+        if !status.motion_sink_ready { missing.push("运动守卫未就绪".to_string()); }
+        if !status.planner_inputs_fresh {
+            missing.push(format!("{}；位姿{}，接收年龄={}毫秒；栅格/曲面{}，接收年龄={}毫秒",
+                status.input_wait_reason.as_deref().unwrap_or("规划输入尚未就绪"),
+                age(status.pose_source_timestamp_ns), status.pose_receipt_age_ms,
+                age(status.costmap_source_timestamp_ns), status.costmap_receipt_age_ms));
+        }
+        if telemetry.map_frame.is_empty() || telemetry.map_frame != telemetry.pose_frame {
+            missing.push(format!("地图/位姿坐标系未就绪：地图={}，位姿={}", telemetry.map_frame, telemetry.pose_frame));
+        }
+        format!("等待导航输入：{}", missing.join("；"))
+    } else if has_public_session { status.message.clone() } else { "导航栈空闲".into() };
     let include_planner_fields = planner_observation == Some(true);
     schema::NavigationStatus {
         session_id: telemetry.public_session_id.clone(),
@@ -2492,8 +2514,7 @@ fn build_guarded_navigation_status(
         goal_status,
         reason: message.clone(),
         remaining_distance_m: status.remaining_distance_m,
-        input_ready: status.motion_sink_ready && status.planner_inputs_fresh
-            && !telemetry.map_frame.is_empty() && telemetry.map_frame == telemetry.pose_frame,
+        input_ready,
         no_feasible_path: status.no_feasible_path && goal_status == schema::NAVIGATION_GOAL_STATUS_PLANNING,
         goal: telemetry.goal,
         current: telemetry.current,
@@ -8481,9 +8502,15 @@ path: schema::Path {
         let mut without_receipts = projected.clone();
         without_receipts.pose_source_timestamp_ns = 0;
         without_receipts.costmap_source_timestamp_ns = 0;
+        assert!(baseline.reason.contains("尚未收到，年龄未知"));
+        assert!(projected.reason.contains("来源年龄="));
+        assert_eq!(projected.message, projected.reason);
+        // 来源时间也用于等待诊断；除回执和诊断文字外，状态投影保持一致。
+        without_receipts.reason = baseline.reason.clone();
+        without_receipts.message = baseline.message.clone();
         assert_eq!(
             without_receipts, baseline,
-            "projection must change no other field"
+            "回执投影只影响来源时间与对应的输入年龄诊断"
         );
 
         let rejected = guarded_rejection_status(status, "path", "out-of-order candidate");
@@ -8562,6 +8589,7 @@ path: schema::Path {
         assert_eq!(terminal_message.session_id, "goal-a");
         assert_eq!(terminal_message.planner_runtime_generation, 22);
         assert_eq!(terminal_message.runtime_generation, 42);
+        assert_eq!(terminal_message.reason, terminal.message);
 
         assert!(clear_terminal_session_after_publication(
             &mut active,
@@ -8579,7 +8607,9 @@ path: schema::Path {
         assert!(heartbeat.session_id.is_empty());
         assert_eq!(heartbeat.state, 0);
         assert_eq!(heartbeat.goal_status, schema::NAVIGATION_GOAL_STATUS_NONE);
-        assert_eq!(heartbeat.reason, "导航栈空闲");
+        assert!(!heartbeat.input_ready);
+        assert!(heartbeat.reason.contains("等待导航输入"));
+        assert!(heartbeat.reason.contains("尚未收到，年龄未知"));
         assert_eq!(heartbeat.sink_ready, 1);
         assert_eq!(heartbeat.motion_generation, 0);
         assert_eq!(heartbeat.path_revision, 0);
@@ -10583,7 +10613,12 @@ fn navigation_status_reports_one_input_ready_signal_and_typed_goal_reason() {
     assert!(ready.no_feasible_path);
     assert_eq!(ready.remaining_distance_m, 8.0);
     status.planner_inputs_fresh = false;
-    assert!(!build_guarded_navigation_status(&status, &telemetry, None, Duration::ZERO).input_ready);
+    status.input_wait_reason = Some("recent obstacle source revoked".into());
+    let waiting = build_guarded_navigation_status(&status, &telemetry, None, Duration::ZERO);
+    assert!(!waiting.input_ready);
+    assert!(waiting.reason.contains("recent obstacle source revoked"));
+    assert!(waiting.reason.contains("尚未收到，年龄未知"));
     status.last_terminal = Some(nuwax_nav_runtime::TerminalOutcome::Stopped);
     assert_eq!(build_guarded_navigation_status(&status, &telemetry, None, Duration::ZERO).goal_status, schema::NAVIGATION_GOAL_STATUS_STOPPED);
+    assert_eq!(build_guarded_navigation_status(&status, &telemetry, None, Duration::ZERO).reason, status.message);
 }

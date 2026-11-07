@@ -406,7 +406,7 @@ impl Explorer {
         &mut self,
         pose: Option<proto::Pose>,
         grid: Option<proto::OccupancyGrid>,
-        surface: Option<Arc<SurfaceSnapshot>>,
+        surface: Result<Arc<SurfaceSnapshot>, String>,
     ) -> Result<ExplorerTick, String> {
         match self.tick_step(pose, grid, surface) {
             Ok(update) => Ok(update),
@@ -420,7 +420,7 @@ impl Explorer {
         &mut self,
         pose: Option<proto::Pose>,
         grid: Option<proto::OccupancyGrid>,
-        surface: Option<Arc<SurfaceSnapshot>>,
+        surface: Result<Arc<SurfaceSnapshot>, String>,
     ) -> Result<ExplorerTick, String> {
         if !self.controller.is_active() {
             return Ok(self.output("探索已结束", None, None));
@@ -453,18 +453,28 @@ impl Explorer {
             self.finish(reason)?;
             return Ok(self.output("达到探索停止条件", None, cancel));
         }
-        let Some(pose) =
-            pose.filter(|p| p.frame_id == self.map_frame && fresh(p.timestamp_ns, self.pose_ttl_ns))
-        else {
-            return self.wait_input("等待新鲜地图位姿");
+        let Some(pose) = pose else {
+            return self.wait_input("等待地图位姿：尚未收到，来源年龄未知");
         };
-        let grid = grid.filter(|g| {
-            g.meta.as_ref().is_some_and(|m| {
-                m.frame_id == self.map_frame && fresh(m.timestamp_ns, 2_000_000_000)
-            })
-        });
-        if grid.is_none() || (self.surface_config.is_some() && surface.is_none()) {
-            return self.wait_input("等待新鲜地图输入");
+        if pose.frame_id != self.map_frame {
+            return self.wait_input(&format!("等待地图位姿：坐标系{}不匹配{}", pose.frame_id, self.map_frame));
+        }
+        if let Err(reason) = fresh(pose.timestamp_ns, self.pose_ttl_ns) {
+            return self.wait_input(&format!("等待地图位姿：{reason}"));
+        }
+        let Some(meta) = grid.as_ref().and_then(|grid| grid.meta.as_ref()) else {
+            return self.wait_input("等待占据栅格：尚未收到元数据，来源年龄未知");
+        };
+        if meta.frame_id != self.map_frame {
+            return self.wait_input(&format!("等待占据栅格：坐标系{}不匹配{}", meta.frame_id, self.map_frame));
+        }
+        if let Err(reason) = fresh(meta.timestamp_ns, 2_000_000_000) {
+            return self.wait_input(&format!("等待占据栅格：{reason}"));
+        }
+        if self.surface_config.is_some() {
+            if let Err(reason) = &surface {
+                return self.wait_input(reason);
+            }
         }
         self.input_wait_since = None;
         let robot = to_pose(&pose)?;
@@ -489,7 +499,7 @@ impl Explorer {
         let grid = grid.as_ref().map(to_grid).transpose()?;
         let route = if config.return_policy.enabled() {
             Some(match (&surface, &self.surface_config) {
-                (Some(map), Some(surface_config)) => MissionRoutes::Surface {
+                (Ok(map), Some(surface_config)) => MissionRoutes::Surface {
                     map: map.clone(),
                     config: surface_config.clone(),
                     boundary: self.boundary(),
@@ -571,7 +581,7 @@ impl Explorer {
             self.finish(ExplorationStopReason::CoverageReached)?;
             return Ok(self.output("达到覆盖率", None, None));
         }
-        if let Some(surface) = surface {
+        if let Ok(surface) = surface {
             self.surface_input
                 .observe(surface)
                 .map_err(|e| e.to_string())?;
@@ -813,9 +823,13 @@ fn unix_ns() -> u64 {
         .as_nanos() as u64
 }
 
-fn fresh(timestamp: u64, limit: u64) -> bool {
-    nuwax_nav_types_messages::source_time::data_age_ns_at(timestamp, unix_ns())
-        .is_ok_and(|age| age <= limit)
+pub(crate) fn fresh(timestamp: u64, limit: u64) -> Result<(), String> {
+    let age = nuwax_nav_types_messages::source_time::data_age_ns_at(timestamp, unix_ns())
+        .map_err(|reason| format!("来源年龄不可用：{reason}；源时间={timestamp}"))?;
+    if age > limit {
+        return Err(format!("来源年龄={}毫秒，超过{}毫秒；源时间={timestamp}", age / 1_000_000, limit / 1_000_000));
+    }
+    Ok(())
 }
 fn mission_pose(pose: &proto::Pose) -> Result<MissionPose, String> {
     let p = pose.position.as_ref().ok_or("位姿缺少位置")?;

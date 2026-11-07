@@ -547,7 +547,7 @@ impl Session {
         self.stop_explorer().await?;
         self.cancel("", GoalStatus::Cancelled).await?;
         let old = self.route.send_replace(None);
-        self.nav.set_input_ready(false);
+        self.nav.set_input_ready(Err("地图会话尚未提供导航输入，来源年龄未知".into()));
         let map_result = if let Some(route) = old {
             route.mapper.shutdown().await.map_err(Status::unavailable)
         } else {
@@ -833,7 +833,7 @@ impl Session {
         self.stop_explorer().await?;
         self.replace_navigation().await?;
         let mapper = self.mapper()?;
-        self.nav.set_input_ready(false);
+        self.nav.set_input_ready(Err("当前导航输入尚未就绪，来源年龄未知".into()));
         let id = uuid::Uuid::new_v4().to_string();
         self.state.navigation = Some(NavigationStatus {
             goal_id: id.clone(),
@@ -856,11 +856,7 @@ impl Session {
         if let Err(error) = self.nav.submit(id.clone(), goal, false).await {
             self.navigation_failed(error.message().into());
         }
-        self.nav.set_input_ready(
-            refreshed.is_ok()
-                && mapper.has_occupancy()
-                && self.router.pose.borrow().is_some(),
-        );
+        self.nav.set_input_ready(self.navigation_input_status(&mapper, true, refreshed));
         Ok(SetGoalResponse { goal_id: id })
     }
     async fn replace_navigation(&mut self) -> Result<(), Status> {
@@ -995,15 +991,18 @@ impl Session {
             return;
         };
         let refreshed = route.mapper.forbidden_status();
-        self.nav.set_input_ready(
-            route.accept_frames
-                && refreshed.is_ok()
-                && route.mapper.has_occupancy()
-                && self.router.pose.borrow().is_some(),
-        );
+        self.nav.set_input_ready(self.navigation_input_status(&route.mapper, route.accept_frames, refreshed.clone()));
         if let Err(reason) = refreshed {
             self.navigation_input_error(reason);
         }
+    }
+    fn navigation_input_status(&self, mapper: &Mapper, accept_frames: bool, forbidden: Result<(), String>) -> Result<(), String> {
+        let mut missing = Vec::new();
+        if !accept_frames { missing.push("当前地图尚未接受输入".to_string()); }
+        if let Err(reason) = forbidden { missing.push(format!("禁区输入不可用：{reason}")); }
+        if !mapper.has_occupancy() { missing.push("占据栅格尚未生成，来源年龄未知".into()); }
+        if self.router.pose.borrow().is_none() { missing.push("地图位姿尚未收到，来源年龄未知".into()); }
+        if missing.is_empty() { Ok(()) } else { Err(missing.join("；")) }
     }
     async fn exploration_update(&mut self, update: ExplorerTick) {
         if let Some(id) = update.cancel_goal {
@@ -1092,7 +1091,7 @@ impl Session {
             }
             false
         });
-        self.nav.set_input_ready(false);
+        self.nav.set_input_ready(Err("导航输入已停止，来源年龄未知".into()));
         self.state.phase = SessionPhase::Fault as i32;
         self.state.reason = reason;
     }

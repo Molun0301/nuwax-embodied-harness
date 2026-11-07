@@ -21,7 +21,7 @@ pub struct NavBridge {
 enum Command {
     Submit(PendingGoal, oneshot::Sender<Result<(), Status>>),
     Cancel(String, oneshot::Sender<Result<(), Status>>),
-    InputReady(bool),
+    InputReady(Result<(), String>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -70,8 +70,9 @@ impl NavBridge {
             let mut states = Some(initial_states);
             let mut pending: Option<PendingGoal> = None;
             let mut active: Option<proto::NavigationStatus> = None;
-            let mut input_ready = false;
+            let mut input_ready = Err("Geometry输入状态尚未收到，来源年龄未知".to_string());
             let mut stack_ready = false;
+            let mut stack_reason = "导航栈状态尚未收到，来源年龄未知".to_string();
             let mut stack_generation = None;
             loop {
                 tokio::select! {
@@ -89,12 +90,13 @@ impl NavBridge {
                         }
                         match command {
                             Command::Submit(goal, reply) => {
-                                let waiting = goal.status(proto::GoalStatus::WaitingInput, "等待导航输入");
+                                let waiting = goal.status(proto::GoalStatus::WaitingInput,
+                                    &waiting_message(&input_ready, stack_ready, &stack_reason));
                                 active = Some(waiting.clone());
                                 pending = Some(goal);
                                 let _ = status_tx.send(waiting);
                                 let result = dispatch_pending(transport.as_ref().unwrap(), &goal_topic, &status_tx,
-                                    &mut pending, input_ready, stack_ready).await;
+                                    &mut pending, &input_ready, stack_ready).await;
                                 if result.is_err() { active = None; }
                                 let _ = reply.send(result);
                             }
@@ -105,9 +107,15 @@ impl NavBridge {
                             }
                             Command::InputReady(ready) => {
                                 input_ready = ready;
+                                if input_ready.is_err() && stack_ready {
+                                    if let Some(goal) = &pending {
+                                        let _ = status_tx.send(goal.status(proto::GoalStatus::WaitingInput,
+                                            &waiting_message(&input_ready, stack_ready, &stack_reason)));
+                                    }
+                                }
                                 if let Some(transport) = &transport {
                                     if let Err(error) = dispatch_pending(transport, &goal_topic, &status_tx,
-                                        &mut pending, input_ready, stack_ready).await {
+                                        &mut pending, &input_ready, stack_ready).await {
                                         active = None;
                                         tracing::warn!(%error, "待发送导航目标已经失败");
                                     }
@@ -139,6 +147,13 @@ impl NavBridge {
                         };
                         let Ok(state) = schema::decode_navigation_status_body(&frame.payload) else { continue; };
                         stack_ready = state.input_ready;
+                        stack_reason = state.reason.clone();
+                        if !stack_ready && !stack_reason.is_empty() {
+                            if let Some(goal) = &pending {
+                                let _ = status_tx.send(goal.status(proto::GoalStatus::WaitingInput,
+                                    &waiting_message(&input_ready, stack_ready, &stack_reason)));
+                            }
+                        }
                         let restarted = stack_generation.replace(state.runtime_generation)
                             .is_some_and(|previous| previous != state.runtime_generation);
                         if restarted && pending.is_none() {
@@ -158,7 +173,7 @@ impl NavBridge {
                             }
                         }
                         if let Err(error) = dispatch_pending(transport.as_ref().unwrap(), &goal_topic, &status_tx,
-                            &mut pending, input_ready, stack_ready).await {
+                            &mut pending, &input_ready, stack_ready).await {
                             active = None;
                             tracing::warn!(%error, "待发送导航目标已经失败");
                         }
@@ -211,7 +226,7 @@ impl NavBridge {
             .map_err(|_| Status::unavailable("导航传输已停止"))?
     }
 
-    pub fn set_input_ready(&self, ready: bool) {
+    pub fn set_input_ready(&self, ready: Result<(), String>) {
         let _ = self.commands.send(Command::InputReady(ready));
     }
 
@@ -246,10 +261,10 @@ async fn dispatch_pending(
     topic: &LcmTopic,
     status_tx: &mpsc::UnboundedSender<proto::NavigationStatus>,
     pending: &mut Option<PendingGoal>,
-    input_ready: bool,
+    input_ready: &Result<(), String>,
     stack_ready: bool,
 ) -> Result<(), Status> {
-    if !input_ready || !stack_ready {
+    if input_ready.is_err() || !stack_ready {
         return Ok(());
     }
     let Some(goal) = pending.take() else {
@@ -280,6 +295,13 @@ async fn dispatch_pending(
             Err(error)
         }
     }
+}
+
+fn waiting_message(input: &Result<(), String>, stack_ready: bool, stack_reason: &str) -> String {
+    let mut missing = Vec::new();
+    if let Err(reason) = input { missing.push(reason.as_str()); }
+    if !stack_ready { missing.push(stack_reason); }
+    if missing.is_empty() { "导航输入已就绪，正在发送目标".into() } else { format!("等待导航输入：{}", missing.join("；")) }
 }
 
 async fn subscribe_states(

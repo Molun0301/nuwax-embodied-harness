@@ -132,3 +132,21 @@ def test_dynamic_window_keeps_repeated_observations_and_excludes_other_frames():
     metrics = service._dynamic_window_metrics(third)
     assert metrics['observation_count'] == 1
     assert metrics['max_displacement_m'] == 0
+
+
+@pytest.mark.parametrize('nested', [False, True])
+def test_current_static_classification_clears_earlier_eligibility_rejection(nested):
+    seq = Sequence()
+    obj = seq.add(observation(label='potted plant'))
+    assert obj.dynamic_state == InstanceDynamicState.UNKNOWN
+    obj.metadata.update(navigable=False, non_navigable_reason='not_long_term_static_target')
+    if nested:
+        obj.metadata.update(navigable=False, non_navigable_reason='dynamic_entity',
+            dynamic_navigation_previous={'navigable': False, 'non_navigable_reason': 'not_long_term_static_target'})
+    for _ in range(3):
+        obj = seq.add(observation(label='potted plant'))
+    assert obj.dynamic_state == InstanceDynamicState.STATIC
+    assert obj.metadata['long_term_static_target_eligible'] is True
+    assert obj.metadata.get('navigable') is not False
+    assert obj.metadata.get('non_navigable_reason') not in {
+        'dynamic_entity', 'quasi_static_entity', 'not_long_term_static_target'}

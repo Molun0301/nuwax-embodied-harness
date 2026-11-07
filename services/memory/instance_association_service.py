@@ -929,17 +929,18 @@ class InstanceAssociationService:
         return bool(metadata['projection_reliable'])
 
     def _clear_dynamic_navigation_policy(self, metadata: Dict[str, object]) -> Dict[str, object]:
-        """只撤销运动分类拥有的拒绝，恢复其叠加前的导航约束。"""
+        """撤销旧分类的派生拒绝，当前分类重新决定准入；保留独立导航约束。"""
         updated = dict(metadata)
         previous = updated.pop('dynamic_navigation_previous', {})
-        if updated.get('non_navigable_reason') in {'dynamic_entity', 'quasi_static_entity'}:
+        derived_reasons = {'dynamic_entity', 'quasi_static_entity', 'not_long_term_static_target'}
+        if updated.get('non_navigable_reason') in derived_reasons:
             updated.pop('navigable', None)
             updated.pop('non_navigable_reason', None)
             if updated.get('navigation_exclusion_scope') == 'long_term_static_target':
                 updated.pop('navigation_exclusion_scope')
             if updated.get('local_retry_policy') == 'retry_after_dynamic_obstacle_clears':
                 updated.pop('local_retry_policy')
-            if isinstance(previous, dict):
+            if isinstance(previous, dict) and previous.get('non_navigable_reason') not in derived_reasons:
                 for key in ('navigable', 'non_navigable_reason', 'navigation_exclusion_scope', 'local_retry_policy'):
                     if key in previous and key not in updated:
                         updated[key] = previous[key]

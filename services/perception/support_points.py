@@ -49,16 +49,16 @@ def select_object_support(
         candidate_indices = candidate_indices[keep]
     count = len(candidate_indices)
     if not count:
-        return SupportSelection(candidate_indices, "dominant_depth_cluster", 0, 0, cluster_indices=candidate_indices)
+        return SupportSelection(candidate_indices, "nearest_depth_cluster", 0, 0, cluster_indices=candidate_indices)
     depths = camera_points[candidate_indices,2]
     order = np.argsort(depths, kind="stable")
     sorted_indices, depths = candidate_indices[order], depths[order]
     # 深度噪声随距离平方增长；间隙至少为3厘米，避免把同一表面拆成小簇。
     gaps = np.diff(depths)
     cuts = np.flatnonzero(gaps > np.maximum(0.03, 0.01 + 0.01*depths[:-1]**2)) + 1
-    boundaries = np.concatenate(([0],cuts,[count]))
-    largest = int(np.argmax(np.diff(boundaries)))
-    cluster = sorted_indices[boundaries[largest]:boundaries[largest+1]]
+    # 框内的后方背景可能比物体拥有更多雷达点；取最近表面，避免扫描密度变化使位置跳到背景。
+    # 主体点数不足仍交给原支持点门槛拒绝，不能转取更密的后方背景。
+    cluster = sorted_indices[:cuts[0] if cuts.size else count]
     points = camera_points[cluster]
     low,high = np.quantile(points,[0.05,0.95],axis=0)
     spread = float(high[2]-low[2])
@@ -79,4 +79,4 @@ def select_object_support(
     sensor_floor = 0.005 + 0.002*median_depth**2
     sigma = float(np.sqrt(sensor_floor**2 + (robust_sigma/np.sqrt(len(cluster)))**2 + sampling_sigma**2))
     selected = cluster[np.linspace(0,len(cluster)-1,min(max_points,len(cluster)),dtype=np.int64)]
-    return SupportSelection(selected,"dominant_depth_cluster",count,len(cluster),spread,sigma,cluster,sampling_sigma)
+    return SupportSelection(selected,"nearest_depth_cluster",count,len(cluster),spread,sigma,cluster,sampling_sigma)

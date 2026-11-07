@@ -54,9 +54,9 @@ def test_selection_matches_full_mask_oracle(count, polygon):
                         &(pixels[indices,1]>=115)&(pixels[indices,1]<=185)]
         if bbox_count and not len(indices):
             status='support_cluster_empty'
-    # 夹具有四个相隔1米的独立平面，主体必须为点数最多的一个平面；同数优先近面。
+    # 四个相隔1米的独立平面；取有候选的最近平面，不能以背景点数替代主体。
     planes=[indices[depths[indices]==depth] for depth in (1.,2.,3.,4.)]
-    dominant=max(planes,key=lambda group:len(group))
+    dominant=next((group for group in planes if len(group)),planes[0])
     selected=dominant[np.linspace(0,len(dominant)-1,min(24,len(dominant)),dtype=np.int64)] if len(dominant) else dominant
     if 0<len(dominant)<5:
         selected=np.empty(0,dtype=np.int64)
@@ -105,12 +105,12 @@ def test_multiple_detections_share_one_calibrated_projection():
         result, metadata = augmentor.augment_detections((detection,) * 3,
             image_frame=image, camera_info=cam, point_cloud=cloud)
     assert project.call_count == 1
-    assert metadata['geometry_support_point_total'] == 18
+    assert metadata['geometry_support_point_total'] == 0
     for item in result:
-        assert item.attributes['geometry_support_point_count'] == 6
-        assert item.attributes['geometry_projection_status'] == 'mask_depth_support'
-    result[0].attributes['support_points_3d']['points'][0]['x'] = 999.
-    assert result[1].attributes['support_points_3d']['points'][0]['x'] != 999.
+        assert item.attributes['geometry_support_point_count'] == 0
+        assert item.attributes['support_cluster_point_count'] == 1
+        assert item.attributes['geometry_projection_status'] == 'support_cluster_sparse'
+        assert 'support_points_3d' not in item.attributes
     _, metadata = augmentor.augment_detections((detection,), image_frame=image,
                                                camera_info=cam, point_cloud=None)
     assert metadata['geometry_projection_degradation_reason'] == 'point_cloud_unavailable'

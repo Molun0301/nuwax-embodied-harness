@@ -82,6 +82,7 @@ class Component:
     exit_code: object = None
     error: object = None
     started_at: float = 0
+    log_file: object = None
 
 
 def component_table(root, config):
@@ -151,7 +152,8 @@ class Supervisor:
                 from core.config import value
                 directory = Path(value("logging.dir"))
                 directory.mkdir(parents=True, exist_ok=True)
-                with (directory / (name + ".log")).open("ab") as log:
+                item.log_file = directory / (name + ".log")
+                with item.log_file.open("ab") as log:
                     item.process = await asyncio.create_subprocess_exec(*item.command, cwd=self.root,
                         env=dict(self.environment, **item.environment), stdin=subprocess.DEVNULL,
                         stdout=log, stderr=log, start_new_session=True, preexec_fn=parent_death_signal)
@@ -180,7 +182,8 @@ class Supervisor:
     def status(self):
         return {"pid": os.getpid(), "components": {
             name: {"state": item.state, "pid": item.process.pid if item.process else None,
-                   "exit_code": item.exit_code, "error": item.error}
+                   "exit_code": item.exit_code, "error": item.error,
+                   "log_file": str(item.log_file) if item.log_file is not None else None}
             for name, item in self.components.items()}}
 
     async def business_component(self, name):

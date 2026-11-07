@@ -53,9 +53,10 @@ class UnitreeSimAssembly(RobotAssemblyBase):
             robot_profile=RobotProfile(robot_name='unitree_sim', tier_recommendation='full', calibration_required=True,
                 required_phases=('preflight', 'system', 'python_env', 'geometry_runtime_deps', 'config_env', 'health'),
                 required_python_packages=('msgpack==1.0.8',)))
-        self.defaults = RobotDefaults(frame_ids={'base': config.robot.base_frame},
+        base_frame = value('robot.base_frame')
+        self.defaults = RobotDefaults(frame_ids={'base': base_frame},
                                       topics={'state': 'robot.unitree_sim.state'}, parameters={'robot_model': model})
-        self.device = Device(value('unitree_sim.base_url'), model, config.robot.base_frame)
+        self.device = Device(value('unitree_sim.base_url'), model, base_frame)
         self.providers = Providers(motion_control=self.device)
         self.clock = None
 

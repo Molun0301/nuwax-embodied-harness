@@ -265,6 +265,46 @@ class LegacyUpgradeChecks(Checks):
             self.assertEqual(calls, [])
 
 
+class ComponentDiagnosticChecks(Checks):
+    def test_health_timeout_uses_supervisor_reported_exited_component_log(self):
+        import asyncio
+        from core.config import ConfigStore, config_snapshot
+        from scripts.device_manager import runtime
+        from scripts.supervisor import Component, Supervisor
+
+        directory = self.engine.home / "独立组件日志"
+        config = ConfigStore(self.engine.home).install("诊断", {"logging.dir": str(directory)})
+
+        async def exited_gateway():
+            component = Component([sys.executable, "-c", "raise AttributeError('current gateway fixture failure')"])
+            owner = Supervisor(ROOT, {"NUWAX_INSTALL_HOME": str(self.engine.home)}, components={"gateway": component})
+            await owner.start_component("gateway", component)
+            await component.process.wait()
+            await asyncio.gather(*tuple(owner.background))
+            return owner.status()
+
+        with config_snapshot(config):
+            report = asyncio.run(exited_gateway())
+        self.assertEqual(report["components"]["gateway"]["state"], "exited")
+        self.assertEqual(report["components"]["gateway"]["exit_code"], 1)
+        self.assertEqual(report["components"]["gateway"]["log_file"], str(directory / "gateway.log"))
+        (self.engine.home / "logs/runtime.log").write_text("OLD_RUNTIME_POISON_DO_NOT_USE\n")
+        actual = runtime.Runtime(self.engine.home)
+        with patch.object(actual, "status", return_value={"running": False, "healthy": False}), \
+                patch.object(actual, "_components", return_value=report), \
+                patch.object(runtime, "probe", return_value={"transport.real_lcm_required": False}), \
+                patch.object(runtime.subprocess, "Popen", return_value=SimpleNamespace(poll=lambda: None)), \
+                patch.object(runtime.time, "monotonic", side_effect=[0, 0, 91]), \
+                patch.object(runtime.time, "sleep"), self.assertRaises(ManagerError) as failure:
+            actual.start(self.engine.home / "releases/candidate")
+        self.assertEqual(failure.exception.code, "health_timeout")
+        diagnostic = failure.exception.details["diagnostic"]
+        self.assertIn("gateway exited/1", diagnostic)
+        self.assertIn(str(directory / "gateway.log"), diagnostic)
+        self.assertIn("AttributeError: current gateway fixture failure", diagnostic)
+        self.assertNotIn("OLD_RUNTIME_POISON_DO_NOT_USE", diagnostic)
+
+
 class OwnerChecks(Checks):
 
     def test_double_start_keeps_unhealthy_owner_without_claiming_success(self):

@@ -165,8 +165,7 @@ def failure_reason(text):
     return (shown + " 失败：" + detail)[-500:] if detail else message[-500:]
 
 
-def runtime_diagnostic(home):
-    path = Path(home) / "logs/runtime.log"
+def log_diagnostic(home, path):
     try:
         with path.open("rb") as handle:
             handle.seek(max(0, path.stat().st_size - 16384))
@@ -347,6 +346,25 @@ class Runtime:
             result["error"] = "网关进程存在，HTTP健康接口尚未响应；算法和设备就绪请查看控制台。"
         return result
 
+    def diagnostic(self):
+        """按监督者报告取已退出组件及其实际日志，不读取历史业务总日志。"""
+        try:
+            components = self._components()["components"]
+        except OSError:
+            return None
+        messages = []
+        for name, item in components.items():
+            if item["state"] != "exited":
+                continue
+            messages.append(safe_diagnostic("%s exited/%s: %s" % (
+                name, item["exit_code"], item.get("error") or ""), self.home))
+            path = item.get("log_file")
+            if path:
+                details = log_diagnostic(self.home, Path(path))
+                if details is not None:
+                    messages.append(path + "\n" + details["diagnostic"])
+        return {"diagnostic": "\n".join(messages)} if messages else None
+
     def start(self, prefix):
         if self.status()["running"]:
             raise ManagerError("already_running", "业务拥有方已运行，拒绝并行创建。", 409)
@@ -365,11 +383,12 @@ class Runtime:
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
             if process.poll() is not None:
-                raise ManagerError("start_failed", "业务监督者提前退出。", 500, runtime_diagnostic(self.home))
+                raise ManagerError("start_failed", "业务监督者提前退出。", 500,
+                                   log_diagnostic(self.home, self.home / "logs/runtime.log"))
             if self.status()["healthy"]:
                 return
             time.sleep(0.4)
-        raise ManagerError("health_timeout", "网关健康接口未在启动预算内响应。", 500, runtime_diagnostic(self.home))
+        raise ManagerError("health_timeout", "网关健康接口未在启动预算内响应。", 500, self.diagnostic())
 
     def stop(self, prefix):
         try:

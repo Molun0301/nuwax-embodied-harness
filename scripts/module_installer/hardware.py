@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Optional
 
-from .catalog import MODULES, ROBOT_REQUIREMENTS, resolve_modules
+from .catalog import ROBOT_REQUIREMENTS, resolve_modules
 
 GIB = 1024 ** 3
 
@@ -245,22 +245,17 @@ def resolve_build_jobs(root: Path, requested: Optional[int] = None, *,
     return (hardware or detect_hardware(root, run_commands=False)).build_jobs
 
 
-def _enabled(env: Mapping[str, str], key: str) -> bool:
-    return str(env.get(key, "")).strip().lower() in ("1", "true", "yes", "on")
-
-
-def recommend_modules(hardware: HardwareInfo, existing_env: Optional[Mapping[str, str]] = None,
-                      installed_modules: Optional[Iterable[str]] = None) -> Recommendation:
-    """保留明确安装意图；首次依据资源、设备节点和既有配置推荐大模块。"""
-    env = existing_env or {}
+def recommend_modules(hardware: HardwareInfo, installed_modules: Optional[Iterable[str]] = None,
+                      *, installed_robot: Optional[str] = None) -> Recommendation:
+    """依据硬件与安装记录推荐；不读取业务配置。"""
     reasons = []
     warnings = []
-    robot = str(env.get("robot.driver", "")).strip().lower()
+    robot = installed_robot
     if robot not in ROBOT_REQUIREMENTS:
         robot = "customrobot"
-        reasons.append("未发现明确机器人配置，使用通用标准数据接入；计算板型号不能证明机器人型号。")
+        reasons.append("未发现明确机器人安装记录，使用通用标准数据接入；计算板型号不能证明机器人型号。")
     else:
-        reasons.append("沿用现有机器人配置：" + robot)
+        reasons.append("沿用上次成功安装的机器人：" + robot)
     if robot in ("g1", "raspi_lidar_robot"):
         warnings.append("该机器人当前接入实现仍为骨架；安装依赖不表示设备功能已经实现。")
     if installed_modules is not None:
@@ -269,34 +264,15 @@ def recommend_modules(hardware: HardwareInfo, existing_env: Optional[Mapping[str
         return Recommendation(modules, robot, tuple(reasons), tuple(warnings))
     selected = {"core"}
     reasons.append("基础网关始终安装，不安装本地推理模型也可运行。")
-    geometry_configured = _enabled(env, "geometry.enabled")
-    # 仅参数模板中的话题名不能证明设备在线；主动保存的启用开关作为用户已有意图。
-    if geometry_configured:
-        if hardware.memory_bytes >= 4 * GIB and hardware.cpu_count >= 2:
-            selected.add("geometry")
-            reasons.append("已有几何启用配置，且可用资源上限满足保守推荐条件。")
-            backend = str(env.get("geometry.lio_backend", "")).strip().lower()
-            if backend in ("fastlio2", "pointlio"):
-                selected.add(backend)
-                reasons.append("沿用明确配置的定位后端：" + MODULES[backend].title)
-            elif backend not in ("", "device", "disabled", "none"):
-                warnings.append("现有定位后端无法对应安装模块，请检查 geometry.lio_backend。")
-        else:
-            warnings.append("已有几何配置，但资源较少或未知，默认先装基础网关；仍可手动选择几何模块。")
-    else:
-        reasons.append("未发现明确几何启用配置，不推测雷达存在或自动安装定位算法。")
-    visual_configured = _enabled(env, "perception.yolo_world_enabled")
+    reasons.append("不推测雷达存在或自动安装定位算法，几何模块按用途选装。")
     sufficient_visual = hardware.memory_bytes >= 8 * GIB and hardware.cpu_count >= 4
-    if (visual_configured or hardware.camera_detected) and sufficient_visual:
+    if hardware.camera_detected and sufficient_visual:
         selected.add("perception")
-        if visual_configured:
-            reasons.append("已有本地视觉启用配置且内存充足，推荐保留视觉检测。")
-        else:
-            reasons.append("检测到摄像头，建议本地视觉；实际图像数据和模型推理仍待启动验证。")
+        reasons.append("检测到摄像头，建议本地视觉；实际图像数据和模型推理仍待启动验证。")
         if not hardware.nvidia_gpu:
             warnings.append("未检测到 NVIDIA 图形设备，本地视觉可能使用处理器推理；实际延迟须运行测量。")
-    elif visual_configured or hardware.camera_detected:
-        warnings.append("检测到摄像头或已有本地视觉配置，但处理器或内存资源较少、未知，默认不安装推理框架和视觉模型。")
+    elif hardware.camera_detected:
+        warnings.append("检测到摄像头，但处理器或内存资源较少、未知，默认不安装推理框架和视觉模型。")
     # 不按显卡档次猜用途；导航、跟随和大语义模型需要用户明确选择。
     reasons.append("导航、人物跟随与本地语义模型按用途选装，高配设备也不会自动全装。")
     if hardware.is_jetson and "perception" in selected:

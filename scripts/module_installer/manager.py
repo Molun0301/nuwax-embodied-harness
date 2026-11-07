@@ -74,13 +74,6 @@ def read_current(home: Path) -> dict:
     return state
 
 
-def existing_config(root: Path, current: Mapping, home=None) -> dict:
-    if not current:
-        return {}
-    from scripts.device_manager.runtime import probe
-    return probe(Path(current["prefix"]), "effective")
-
-
 def choose_python(requested: str = "") -> str:
     candidates = [requested] if requested else [sys.executable, "/usr/bin/python3"] + [
         shutil.which(f"python3.{minor}") or "" for minor in (12, 11, 10, 9, 8)
@@ -543,14 +536,13 @@ def apply(request: InstallRequest, hardware) -> dict:
             print(f"[3/5] 构建所选组件（并行 {request.jobs}）", flush=True)
             binaries = build_modules(request.root, prefix, request.home / "cache", request.modules, request.jobs, run)
             print("[4/5] 准备所选模型和启动配置", flush=True)
-            if current:
-                configuration = existing_config(request.root, current, request.home)
-            else:
-                from scripts.device_manager.runtime import probe
-                configuration = probe(prefix, "existing_values")
+            from scripts.device_manager.runtime import probe
+            existing = probe(prefix, "existing")
+            configuration = existing["values"]
+            with run.log.open("a", encoding="utf-8") as handle:
+                handle.write("旧格式方案导入结果：" + json.dumps(existing["import"], ensure_ascii=False) + "\n")
             if request.lio_backend:
                 configuration["geometry.lio_backend"] = request.lio_backend
-            from scripts.device_manager.runtime import probe
             values = probe(prefix, "runtime", install_prefix=str(prefix), modules=request.modules, robot=request.robot, values=configuration)
             _prepare_models(request, prefix, run, values)
             _verify_prefix(prefix, request.modules)

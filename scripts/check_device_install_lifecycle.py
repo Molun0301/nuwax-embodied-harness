@@ -103,6 +103,127 @@ class Checks(unittest.TestCase):
             (source / name).symlink_to(ROOT / name, target_is_directory=True)
 
 
+class LegacyUpgradeChecks(Checks):
+    def test_first_install_existing_reads_active_profile_and_preserves_other_profiles(self):
+        from core.config import ConfigStore
+        candidate = self.engine.home / "releases/candidate"
+        self.source_tree(candidate / "source")
+        (candidate / "venv").symlink_to(Path(sys.prefix), target_is_directory=True)
+        job = self.job("install")
+        store = ConfigStore(self.engine.home)
+        self.assertEqual(self.engine._existing(candidate, job), {})
+        store.write_profile("未选中", {"logging.level": "WARNING"})
+        other = store.profile_path("未选中")
+        preserved = other.read_bytes()
+        self.assertEqual(self.engine._existing(candidate, job), {})
+        self.assertFalse(store.selector.exists())
+        self.assertEqual(other.read_bytes(), preserved)
+        store.write_profile("选中", {"logging.level": "DEBUG"})
+        selected = store.profile_path("选中").read_bytes()
+        store.selector.write_text("选中\n")
+        self.assertEqual(self.engine._existing(candidate, job), {"logging.level": "DEBUG"})
+        self.assertEqual(other.read_bytes(), preserved)
+        self.assertEqual(store.profile_path("选中").read_bytes(), selected)
+        self.assertEqual(sorted(path.name for path in store.directory.iterdir()), ["未选中.toml", "选中.toml"])
+        self.assertEqual(self.engine.current(), {})
+
+    def test_legacy_current_without_config_module_updates_through_candidate_import(self):
+        from contextlib import nullcontext
+        from core.config import read_config
+        from scripts.device_manager.runtime import probe
+        from scripts.module_installer.hardware import GIB, HardwareInfo
+
+        # 当前版本保留重构前的包与方案格式，不能导入新版配置模块。
+        old = self.engine.home / "releases/legacy"
+        (old / "source/core").mkdir(parents=True)
+        (old / "source/core/__init__.py").write_text("")
+        (old / "venv").symlink_to(Path(sys.prefix), target_is_directory=True)
+        atomic_json(old / "installed.json", {"complete": True, "version": "legacy", "revision": "b" * 40,
+                    "modules": ["core"], "robot": "go2"})
+        self.engine._switch(old)
+        profiles = self.engine.home / "config/profiles/go2"
+        profiles.mkdir(parents=True)
+        legacy = profiles / "旧方案.env"
+        legacy.write_text("NUWAX_ACTIVE_ROBOT=go2\nGO2_ROBOT_IP=192.0.2.11\nNUWAX_LOG_LEVEL=DEBUG\n")
+        (profiles / ".active").write_text("旧方案\n")
+        active = self.engine.home / "data/settings/active.env"
+        active.parent.mkdir(parents=True)
+        active.symlink_to(legacy)
+        self.engine.save_settings({"auto_start": False})
+        del self.engine.hardware
+        hardware = HardwareInfo(architecture="x86_64", cpu_count=4, memory_bytes=8 * GIB,
+                                free_disk_bytes=1024 * GIB, camera_detected=True)
+        calls = []
+
+        def config_probe(prefix, operation, **values):
+            calls.append((prefix, operation))
+            return probe(prefix, operation, **values)
+
+        def export(root, revision, target):
+            self.source_tree(target)
+            (target / "adapters").symlink_to(ROOT / "adapters", target_is_directory=True)
+
+        def bridge(engine, source, candidate, operation, job, **values):
+            if operation == "metadata":
+                return {"system_packages": []}
+            if operation == "dependencies":
+                (candidate / "venv").symlink_to(Path(sys.prefix), target_is_directory=True)
+            return {}
+
+        source = dict(self.source, root=ROOT, changed_files=[], previous_revision="b" * 40)
+        with patch.object(engine_module, "probe", side_effect=config_probe), \
+                patch.object(engine_module, "detect_hardware", return_value=hardware), \
+                patch.object(self.engine, "catalog", return_value={"source": self.source, "manager": {"version": "v2"}}), \
+                patch("scripts.device_manager.sources.discover", return_value=self.source), \
+                patch("scripts.device_manager.versioning.revision_relation", return_value="newer"), \
+                patch("scripts.device_manager.versioning.source_tree_unchanged", return_value=False), \
+                patch("scripts.neh_system_helper.dependency_plan", return_value={"missing": []}):
+            self.assertEqual(self.engine.status()["installation"]["robot"], "go2")
+            recommendation = self.engine.hardware()["recommendation"]
+            self.assertEqual(recommendation["robot"], "go2")
+            self.assertEqual(list(recommendation["modules"]), ["core"])
+            plan = self.engine.plan({"action": "update"}, local_request=True)
+            self.assertEqual(plan["blockers"], [])
+            self.assertEqual(calls, [])
+            self.assertTrue(legacy.is_file())
+            self.assertFalse((old / "source/core/config.py").exists())
+
+            # 设置页仍直接报告当前解释器的真实探针错误。
+            with self.assertRaises(ManagerError) as failure:
+                self.engine.config()
+            self.assertIn("core.config", failure.exception.message)
+            calls.clear()
+            job = self.job("update")
+            job["_plan"] = read_json(self.engine.manager_home / "plans" / (plan["id"] + ".json"))
+            atomic_json(self.engine._job_path(job["id"]), job)
+            with patch("scripts.neh_source.source_checkout", return_value=nullcontext(source)), \
+                    patch("scripts.neh_source.export_source", side_effect=export), \
+                    patch("scripts.device_manager.sources.bridge", side_effect=bridge), \
+                    patch("scripts.device_manager.update_flow.wait_prebuilt", return_value=None), \
+                    patch("scripts.device_manager.update_flow.adopt_manager"):
+                self.engine.run_job(job["id"])
+            result = read_json(self.engine._job_path(job["id"]))
+            self.assertEqual(result["status"], "succeeded", result.get("error"))
+            candidate = Path(self.engine.current()["prefix"])
+            self.assertNotEqual(candidate, old)
+            self.assertEqual([(prefix, op) for prefix, op in calls if op == "existing"], [(candidate, "existing")])
+            self.assertTrue(all(prefix == candidate for prefix, _ in calls))
+            self.assertEqual(read_config(self.engine.home)["logging"]["level"], "DEBUG")
+            self.assertEqual(read_config(self.engine.home)["go2"]["robot_ip"], "192.0.2.11")
+            self.assertEqual((self.engine.home / "config/active_profile").read_text().strip(), "旧方案")
+            self.assertTrue((self.engine.home / "config/profiles/旧方案.toml").is_file())
+            self.assertFalse(legacy.exists())
+            self.assertFalse((profiles / ".active").exists())
+            self.assertFalse(active.is_symlink())
+            report = next(item["message"] for item in result["log"] if item["stage"] == "configuration")
+            self.assertIn('"imported": ["旧方案"]', report)
+            self.assertIn(report, (self.engine.manager_home / "logs" / (job["id"] + ".output.log")).read_text())
+            calls.clear()
+            self.engine.status()
+            self.engine.plan({"action": "update"}, local_request=True)
+            self.assertEqual(calls, [])
+
+
 class OwnerChecks(Checks):
 
     def test_double_start_keeps_unhealthy_owner_without_claiming_success(self):

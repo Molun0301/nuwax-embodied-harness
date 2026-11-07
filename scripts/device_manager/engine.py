@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import platform
 import re
@@ -186,18 +187,15 @@ class Engine:
             raise ManagerError("state_corrupt", "当前版本缺少完整安装记录。", 500)
         return dict(record, prefix=str(path))
 
-    def _existing(self, current):
-        if not current:
-            return {}
-        result = self._configuration("existing")
-        self._legacy_import = result["import"]
+    def _existing(self, candidate, job):
+        result = probe(candidate, "existing")
+        self._progress(job, "configuration", 55, "旧格式方案导入结果：" + json.dumps(result["import"], ensure_ascii=False))
         return result["values"]
 
     def hardware(self):
         hardware = detect_hardware(self.home)
         current = self.current()
-        existing = self._existing(current)
-        recommendation = recommend_modules(hardware, existing, current.get("modules"))
+        recommendation = recommend_modules(hardware, current.get("modules"), installed_robot=current.get("robot"))
         issues = []
         if platform.system() != "Linux":
             issues.append("当前管理器安装入口需要Linux。")
@@ -395,8 +393,6 @@ class Engine:
     def _fingerprint(self):
         current = self.current()
         values = {"install_dir": str(self.home), "current": current.get("prefix"), "running": self.runtime.status()["running"], "settings": self.settings()}
-        if current and (self.home / "config/active_profile").exists():
-            values["config"] = self._configuration("snapshot")
         return values
 
     def plan(self, request, *, local_request=False):
@@ -773,7 +769,7 @@ class Engine:
             return {"version": current.get("version"), "runtime": self.runtime.status()}
         if action == "rollback":
             candidate = self.home / "releases" / plan["_previous"]
-            plan["_configuration"] = self._configure_candidate(candidate, plan, self._existing(current))
+            plan["_configuration"] = self._configure_candidate(candidate, plan, self._existing(candidate, job))
         else:
             candidate = self._prepare_source(job)
         self._cancelled(job["id"])
@@ -835,7 +831,7 @@ class Engine:
             built = bridge(self, source, candidate, "build", job)
             mutable_source = candidate / "source"
             (mutable_source / "runtime_data").symlink_to(self.home / "data", target_is_directory=True)
-            existing = self._existing(self.current())
+            existing = self._existing(candidate, job)
             plan["_configuration"] = self._configure_candidate(candidate, plan, existing, allow_pending_models=True)
             self._progress(job, "models", 65, "准备所选模型并复用已有模型文件")
             bridge(self, source, candidate, "models", job, configuration=plan["_configuration"])

@@ -16,7 +16,7 @@ from typing import Optional, Sequence
 from .catalog import MODULES, ROBOT_REQUIREMENTS, remove_modules, replace_lio, resolve_modules
 from .doctor import diagnose
 from .hardware import detect_hardware, recommend_modules, resolve_build_jobs
-from .manager import InstallError, InstallRequest, apply, existing_config, make_plan, read_current
+from .manager import InstallError, InstallRequest, apply, make_plan, read_current
 from .runtime import read_settings
 
 PRESETS = {
@@ -182,10 +182,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             start_current(descriptor, foreground=True)
             return 0
         hardware = detect_hardware(home)
-        existing = existing_config(root, current)
-        if args.robot != "auto":
-            existing["robot.driver"] = args.robot
-        recommendation = recommend_modules(hardware, existing, current.get("modules"))
+        recommendation = recommend_modules(hardware, current.get("modules"), installed_robot=current.get("robot"))
         selected = resolve_modules(_names([args.modules])) if args.modules is not None else recommendation.modules
         if args.preset:
             selected = resolve_modules(PRESETS[args.preset])
@@ -221,7 +218,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print("\n非交互环境只展示计划；实际安装请使用 install --yes。")
                 preview = True
             else:
-                selected = _wizard(request.modules, recommend_modules(hardware, existing).modules)
+                selected = _wizard(request.modules, recommendation.modules)
                 if selected is None:
                     return 0
                 request = replace(request, modules=selected)

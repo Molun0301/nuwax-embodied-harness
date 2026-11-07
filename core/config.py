@@ -421,7 +421,8 @@ class ConfigStore:
         if operation == "existing":
             from scripts.import_legacy_config import import_legacy
             report = import_legacy(self.home)
-            return {"values": self.profile_values(self.active()), "import": report}
+            values = self.profile_values(self.active()) if self.selector.exists() else {}
+            return {"values": values, "import": report}
         if operation == "snapshot":
             name = self.active()
             return {"profile": name, "values": self.profile_values(name)}

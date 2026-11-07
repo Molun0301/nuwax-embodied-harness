@@ -57,7 +57,7 @@ class LocationChecks(unittest.TestCase):
             self.assertEqual(restarted.manager_home, self.manager)
             self.assertEqual(restarted.instance_id, original.instance_id)
         self.assertEqual(entry.read_text(), "stable bootstrap")
-        self.assertEqual(self.engine.configuration.home, self.target)
+        self.assertEqual(self.engine.home, self.target)
         self.assertEqual(self.engine.runtime.home, self.target)
         self.assertFalse((self.target / "jobs").exists())
         with self.assertRaises(ManagerError) as caught:
@@ -337,14 +337,17 @@ class SelectedLifecycleChecks(Checks):
             yield {"root": self.root / "checkout", "revision": "a" * 40, "changed_files": [], "previous_revision": None}
 
         def export(root, revision, destination):
-            (destination / "drivers/customrobot").mkdir(parents=True)
+            self.source_tree(destination)
+            (destination.parent / "venv").symlink_to(Path(sys.prefix), target_is_directory=True)
 
         def configure(candidate, plan, existing, **kwargs):
-            (candidate / "settings.env").write_text("NUWAX_RUNTIME_DATA_DIR=" + str(self.target / "data") + "\n")
+            return {"geometry.runtime_data_dir": str(self.target / "data")}
 
-        def bridge(engine, source, candidate, operation, job):
+        def bridge(engine, source, candidate, operation, job, **parameters):
             self.assertEqual(engine.home, self.target)
             self.assertEqual(candidate.parent, self.target / "releases")
+            if operation == "models":
+                self.assertEqual(parameters["configuration"], {"geometry.runtime_data_dir": str(self.target / "data")})
             return {"system_packages": []} if operation == "metadata" else {}
 
         with patch("scripts.neh_source.source_checkout", checkout), patch("scripts.neh_source.export_source", export), \
@@ -364,9 +367,11 @@ class SelectedLifecycleChecks(Checks):
             self.assertEqual(rolled["status"], "succeeded", rolled)
         self.assertEqual(Engine(self.manager).current()["prefix"], str(previous))
         self.assertEqual((candidate / "source/runtime_data").resolve(), self.target / "data")
-        self.assertEqual((candidate / "source/drivers/customrobot/configs").resolve(), self.target / "config/profiles/customrobot")
+        from core.config import read_config
+        self.assertEqual(read_config(self.target)["geometry"]["runtime_data_dir"], str(self.target / "data"))
         self.assertEqual(data.read_text(), "user map")
-        self.assertEqual((self.target / "data/settings/active.env").resolve().parent, self.target / "config/profiles/customrobot")
+        self.assertTrue((self.target / "config/profiles/default.toml").is_file())
+        self.assertEqual((self.target / "config/active_profile").read_text().strip(), "default")
         self.assertEqual(len(list((self.manager / "jobs").glob("*.json"))), 3)
         self.assertFalse((self.manager / "current").exists())
         self.assertFalse((self.manager / "config/profiles").exists())
@@ -377,12 +382,17 @@ class SelectedLifecycleChecks(Checks):
         previous = self.install_current()
         candidate = self.target / "releases/v2-00000000"
         candidate.mkdir()
-        (candidate / "settings.env").write_text("NUWAX_RUNTIME_DATA_DIR=" + str(self.target / "data") + "\n")
+        self.source_tree(candidate / "source")
+        (candidate / "venv").symlink_to(Path(sys.prefix), target_is_directory=True)
         atomic_json(candidate / "installed.json", {"complete": True, "version": "v2"})
         self.engine.runtime = FakeRuntime(fail_starts=1)
-        with patch.object(self.engine, "_prepare_source", return_value=candidate):
+        def prepare(job):
+            job["_plan"]["_configuration"] = {"geometry.runtime_data_dir": str(self.target / "data")}
+            return candidate
+        with patch.object(self.engine, "_prepare_source", prepare):
             result = self.run_job(self.job("update"))
         self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"]["code"], "health_timeout")
         self.assertEqual(self.engine.current()["prefix"], str(previous))
         self.assertFalse(candidate.exists())
         job = self.job("update")

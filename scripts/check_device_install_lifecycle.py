@@ -24,7 +24,6 @@ sys.path.insert(0, str(ROOT))
 from scripts.device_manager import engine as engine_module
 from scripts.device_manager.common import ManagerError, atomic_json, process_alive, process_identity, read_json
 from scripts.device_manager.engine import Engine
-from scripts.module_installer.runtime import read_settings, write_runtime
 
 
 class FakeRuntime:
@@ -73,10 +72,13 @@ class Checks(unittest.TestCase):
 
     def install_current(self):
         prefix = self.engine.home / "releases/previous"
-        (prefix / "source").mkdir(parents=True)
+        self.source_tree(prefix / "source")
+        (prefix / "venv").symlink_to(Path(sys.prefix), target_is_directory=True)
         atomic_json(prefix / "installed.json", {"complete": True, "version": "v1", "modules": ["core"],
                     "robot": "customrobot", "revision": self.source["revision"]})
         self.engine._switch(prefix)
+        from core.config import ConfigStore
+        ConfigStore(self.engine.home).install("测试", {"geometry.runtime_data_dir": str(self.engine.home / "data")})
         return prefix
 
     def job(self, action, **plan):
@@ -96,20 +98,9 @@ class Checks(unittest.TestCase):
 
     @staticmethod
     def source_tree(source):
-        (source / "scripts/module_installer").mkdir(parents=True)
-        (source / "scripts/module_installer/runtime.py").write_text("# fixture\n")
-        (source / "scripts/supervisor.py").write_text("# 测试监督者\n")
-        (source / "drivers").mkdir()
-        (source / ".env.example").write_text("NUWAX_LOG_LEVEL=INFO\n")
-
-    @staticmethod
-    def local_probe(candidate, operation, **values):
-        if operation == "runtime":
-            write_runtime(candidate / "source", candidate, values["modules"], values["robot"], values["values"])
-            return {"ok": True}
-        if operation == "normalize_profile":
-            return values["values"]
-        raise AssertionError("Unexpected probe: " + operation)
+        source.mkdir(parents=True, exist_ok=True)
+        for name in ("core", "contracts", "drivers", "scripts"):
+            (source / name).symlink_to(ROOT / name, target_is_directory=True)
 
 
 class OwnerChecks(Checks):
@@ -165,6 +156,7 @@ class OwnerChecks(Checks):
 
 class InstallLocationChecks(Checks):
     def test_start_update_and_rollback_keep_custom_root_and_data(self):
+        from core.config import read_config
         original = self.install_current()
         data = self.engine.home / "data/maps/user-map"
         data.parent.mkdir(parents=True)
@@ -172,23 +164,27 @@ class InstallLocationChecks(Checks):
         candidate = self.engine.home / "releases/candidate"
         candidate.mkdir()
         atomic_json(candidate / "installed.json", {"complete": True, "version": "v2", "modules": ["core"], "robot": "customrobot"})
-        for prefix in (original, candidate):
-            (prefix / "settings.env").write_text("NUWAX_RUNTIME_DATA_DIR=" + str(self.engine.home / "data") + "\n")
+        self.source_tree(candidate / "source")
+        (candidate / "venv").symlink_to(Path(sys.prefix), target_is_directory=True)
+        values = {"geometry.runtime_data_dir": str(self.engine.home / "data")}
+        def prepare(job):
+            job["_plan"]["_configuration"] = values
+            return candidate
         started = []
         start = self.engine.runtime.start
         self.engine.runtime.start = lambda prefix: (started.append(prefix), start(prefix))[-1]
         self.assertEqual(self.run_job(self.job("start"))["status"], "succeeded")
-        with patch.object(self.engine, "_prepare_source", return_value=candidate):
+        with patch.object(self.engine, "_prepare_source", prepare):
             self.assertEqual(self.run_job(self.job("update"))["status"], "succeeded")
         self.assertEqual(self.engine.current()["prefix"], str(candidate))
         with patch.object(self.engine, "_existing", return_value={}), \
-                patch.object(self.engine, "_configure_candidate") as configure:
+                patch.object(self.engine, "_configure_candidate", return_value=values) as configure:
             self.assertEqual(self.run_job(self.job("rollback", _previous=original.name))["status"], "succeeded")
         self.assertEqual(configure.call_args.args[0], original)
         self.assertEqual(self.engine.current()["prefix"], str(original))
         self.assertEqual(started, [original, candidate, original])
         self.assertEqual(data.read_text(), "retained map")
-        self.assertEqual(read_settings(self.engine.home / "data/settings/active.env")["NUWAX_RUNTIME_DATA_DIR"],
+        self.assertEqual(read_config(self.engine.home)["geometry"]["runtime_data_dir"],
                          str(self.engine.home / "data"))
         self.assertEqual(len(list((self.engine.home / "jobs").glob("*.json"))), 3)
 

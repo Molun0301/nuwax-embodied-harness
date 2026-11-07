@@ -56,6 +56,12 @@ jobs:
           assert manifest['version'] == source_version(revision)
           subprocess.run([sys.executable, '-S', '-m', 'scripts.device_manager', '--help'], cwd=manager, check=True)
           PY
+      - name: 准备配置读取依赖
+        run: >-
+          python3 -m pip install pydantic==2.10.6 tomli-w==1.0.0
+          'tomli==2.0.1; python_version < "3.11"'
+          'numpy==1.24.4; python_version < "3.12"'
+          'numpy==1.26.4; python_version >= "3.12"'
       - name: 安装生命周期与增量缓存回归（离线）
         run: |
           python3 scripts/check_bootstrap_download.py

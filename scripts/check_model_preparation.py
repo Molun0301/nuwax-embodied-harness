@@ -316,20 +316,25 @@ class ModelPreparationChecks(unittest.TestCase):
     def installation(self, *, custom=False):
         root = self.base / "source with spaces"
         root.mkdir()
-        prefix = self.base / "candidate"
-        prefix.mkdir()
-        request = manager.InstallRequest(root=root, home=self.base, modules=("core", "memory"), robot="customrobot", jobs=1)
-        text = self.base / "custom text" if custom else root / "runtime_data/models/BAAI__bge-small-zh-v1.5"
-        image = self.base / "custom image" if custom else root / "runtime_data/models/openai__clip-vit-base-patch32"
-        (prefix / "settings.env").write_text("NUWAX_MEMORY_TEXT_EMBEDDING_MODEL=" + str(text) + "\nNUWAX_MEMORY_IMAGE_EMBEDDING_MODEL=" + str(image) + "\n")
-        return request, prefix, text, image
+        home = self.base / "install"
+        prefix = home / "releases/candidate"
+        prefix.mkdir(parents=True)
+        (prefix / "source").symlink_to(root, target_is_directory=True)
+        (prefix / "venv").symlink_to(Path(sys.prefix), target_is_directory=True)
+        for name in ("core", "contracts"):
+            (root / name).symlink_to(ROOT / name, target_is_directory=True)
+        request = manager.InstallRequest(root=root, home=home, modules=("core", "memory"), robot="customrobot", jobs=1)
+        text = self.base / "custom text" if custom else home / "data/models/BAAI__bge-small-zh-v1.5"
+        image = self.base / "custom image" if custom else home / "data/models/openai__clip-vit-base-patch32"
+        values = {"memory.text_embedding_model": str(text), "memory.image_embedding_model": str(image)}
+        return request, prefix, text, image, values
 
     def test_manager_validates_both_custom_paths_without_downloading_defaults(self):
-        request, prefix, text, image = self.installation(custom=True)
+        request, prefix, text, image, values = self.installation(custom=True)
         self.fixture(text)
         self.fixture(image, IMAGE)
         run = Mock(side_effect=self.run_cli)
-        manager._prepare_models(request, prefix, run)
+        manager._prepare_models(request, prefix, run, values)
         self.assertEqual(run.call_count, 2)
         for call in run.call_args_list:
             self.assertIn("--validate-only", call.args[0])
@@ -338,22 +343,22 @@ class ModelPreparationChecks(unittest.TestCase):
         self.download.assert_not_called()
 
     def test_manager_rejects_incomplete_custom_path_without_default_download(self):
-        request, prefix, text, image = self.installation(custom=True)
+        request, prefix, text, image, values = self.installation(custom=True)
         self.write(text, "modules.json", "{}")
         self.fixture(image, IMAGE)
         with self.assertRaises(SystemExit):
-            manager._prepare_models(request, prefix, self.run_cli)
+            manager._prepare_models(request, prefix, self.run_cli, values)
         self.download.assert_not_called()
         self.assertFalse((request.root / "runtime_data/models").exists())
 
     def test_manager_configs_only_default_download_cannot_mark_success(self):
-        request, prefix, text, image = self.installation()
+        request, prefix, text, image, values = self.installation()
         for target, required in ((text, TEXT), (image, IMAGE)):
             for name in required:
                 self.write(target, name, "{}")
         self.download.side_effect = lambda **kwargs: kwargs["target_dir"]
         with self.assertRaises(SystemExit):
-            manager._prepare_models(request, prefix, self.run_cli)
+            manager._prepare_models(request, prefix, self.run_cli, values)
         self.assertFalse(self.receipt(text).exists())
         self.assertFalse(self.receipt(image).exists())
 

@@ -16,6 +16,8 @@ sys.path.insert(0, str(ROOT))
 from scripts.module_installer import lifecycle
 from scripts.module_installer.cli import build_parser
 from scripts.module_installer.runtime import write_runtime
+from scripts.device_manager.common import atomic_json
+from core.config import ConfigStore, flatten
 
 
 class LifecycleChecks(unittest.TestCase):
@@ -27,8 +29,16 @@ class LifecycleChecks(unittest.TestCase):
         self.prefix = self.home / "generations/one"
         self.root.mkdir()
         self.prefix.mkdir(parents=True)
-        self.settings = self.prefix / "settings.env"
-        self.settings.write_text("NUWAX_GATEWAY_HOST=127.0.0.7\nNUWAX_GATEWAY_PORT=9876\n")
+        (self.root / "core").symlink_to(ROOT / "core", target_is_directory=True)
+        self.settings = self.home / "run/config.toml"
+        atomic_json(self.home / "config/settings.json", {"gateway_port": 9876})
+        store = ConfigStore(self.home)
+        store.install("测试", {"gateway.host": "127.0.0.7"})
+        # 本组隔离启停边界；配置值由真实方案读取，避免启停替身拦截配置子进程。
+        configuration = patch.object(lifecycle, "effective_settings", side_effect=lambda root, prefix, environment=None:
+                                     (flatten(store.effective()), self.settings))
+        configuration.start()
+        self.addCleanup(configuration.stop)
         self.state = {"schema": 1, "complete": True, "modules": ["core"], "robot": "customrobot",
                       "source_root": str(self.root)}
         self.state["deployment"] = lifecycle.deployment_descriptor(self.root, self.home, self.prefix, ["core"], "customrobot", service_name="neh-0123456789abcdef.service")
@@ -47,11 +57,11 @@ class LifecycleChecks(unittest.TestCase):
 
 
 
-    def test_roundtrip_stable_service_and_listener_override(self):
+    def test_roundtrip_stable_service_and_configured_listener(self):
         original = self.descriptor("systemd-user")
         loaded = lifecycle.inspect_installation(self.home, {"NUWAX_GATEWAY_PORT": "9911"})
         self.assertEqual(loaded["lifecycle"], original["lifecycle"])
-        self.assertEqual(loaded["listener"]["port"], 9911)
+        self.assertEqual(loaded["listener"]["port"], 9876)
         self.assertEqual(original["listener"]["settings_path"], str(self.settings))
 
     def test_invalid_identity_and_version_rejected(self):
@@ -74,7 +84,8 @@ class LifecycleChecks(unittest.TestCase):
 
     def test_service_render_only_uses_current_and_no_privilege(self):
         unit = lifecycle.render_user_service(self.descriptor("systemd-user"))
-        self.assertIn(str(self.home / "current/start.sh"), unit)
+        self.assertIn(str(self.prefix / "venv/bin/python"), unit)
+        self.assertIn("-m scripts.supervisor", unit)
         self.assertIn("KillMode=process", unit)
         self.assertNotIn("sudo", unit)
         self.assertNotIn("User=root", unit)
@@ -113,9 +124,10 @@ class LifecycleChecks(unittest.TestCase):
         self.assertFalse({'OPENAI_API_KEY', 'RUST_LOG', 'HTTPS_PROXY'} & environment.keys())
 
     def test_launcher_exposes_install_home(self):
-        write_runtime(self.root, self.prefix, ["core"], "customrobot", {})
+        values = write_runtime(self.root, self.prefix, ["core"], "customrobot", {"gateway.host": "127.0.0.7"})
         self.assertIn("export NUWAX_INSTALL_HOME=", (self.prefix / "start.sh").read_text())
-        self.assertIn(str(self.home), (self.prefix / "settings.env").read_text())
+        self.assertEqual(values["gateway.host"], "127.0.0.7")
+        self.assertFalse((self.prefix / "settings.env").exists())
 
 
 if __name__ == "__main__":

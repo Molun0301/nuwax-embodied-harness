@@ -41,7 +41,7 @@ def navigate_to_pose(platform, ctx, args, *, region=None):
                 args.get("frame_id", snapshot.info.map_frame_id), time.time_ns())
     try:
         goal_id = platform.geometry.set_goal(NavigationGoal(pose, args["motion_generation"],
-            allow_reverse=args.get("allow_reverse"), position_tolerance_m=args.get("tolerance_position_m", 0.35),
+            allow_reverse=args.get("allow_reverse"), position_tolerance_m=args.get("tolerance_position_m", 0.15),
             yaw_tolerance_rad=args.get("tolerance_yaw_rad", 0.3) if "yaw_rad" in args else math.pi),
             timeout_sec=ctx.remaining())
     except GeometryError as error:
@@ -94,6 +94,7 @@ def navigate_to_place(platform, ctx, args):
     ctx.check()
     x, y, z = map_coordinates(place["lat"], place["lon"], reference)
     result = navigate_to_pose(platform, ctx, {"x": x, "y": y, "z": z,
+        "tolerance_position_m": 0.35,
         "frame_id": reference["map_frame_id"], "motion_generation": args["motion_generation"]})
     return {**result, "place": place}
 
@@ -266,6 +267,7 @@ class _TargetSearch:
             try:
                 navigation = navigate_to_pose(self.platform, self.ctx, {"x": pose.position.x, "y": pose.position.y,
                     "z": pose.position.z, "yaw_rad": yaw, "frame_id": pose.frame_id,
+                    "tolerance_position_m": 0.35,
                     "motion_generation": self.args["motion_generation"]})
             except GatewayError as error:
                 self.ctx.check()
@@ -375,6 +377,7 @@ class _TargetSearch:
             "projection_method": metadata["projection_method"],
             "projection_confidence": metadata["projection_confidence"],
             "support_point_count": metadata["support_point_count"],
+            "navigation_quality": metadata["navigation_quality"],
             "candidate_score": metadata["candidate_score"],
             "resolution_decision": metadata["resolution_decision"],
             "allowed_for_navigation": allowed,
@@ -488,6 +491,7 @@ def inspect_target(platform, ctx, args):
             target = platform.navigation_memory.resolve(search.query, camera_id=search.camera_id)
             pose = target.pose
             navigate_to_pose(platform, ctx, {"x": pose.x, "y": pose.y, "z": pose.z,
+                "tolerance_position_m": 0.35,
                 "yaw_rad": pose.yaw, "frame_id": pose.frame_id, "motion_generation": args["motion_generation"]},
                 region=target.region)
             sample, _ = search.refresh(frame_count=5, interval_sec=.12, remember=False)
@@ -554,6 +558,7 @@ def navigate_to_named_location(platform, ctx, args):
     target = platform.navigation_memory.resolve(args["target_name"], camera_id=args.get("camera_id"))
     pose = target.pose
     navigation = navigate_to_pose(platform, ctx, {"x": pose.x, "y": pose.y, "z": pose.z,
+        "tolerance_position_m": 0.35,
         "yaw_rad": pose.yaw, "frame_id": pose.frame_id, "motion_generation": args["motion_generation"]},
         region=target.region)
     if not args.get("verify_on_arrival", True):
@@ -587,7 +592,7 @@ CAPABILITIES = [
     Capability("navigate_to_pose", "导航到当前地图坐标中的位姿。",
         schema({"x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"},
                 "yaw_rad": {"type": "number"}, "frame_id": {"type": "string"},
-                "tolerance_position_m": {"type": "number", "exclusiveMinimum": 0, "default": 0.35},
+                "tolerance_position_m": {"type": "number", "exclusiveMinimum": 0, "default": 0.15},
                 "tolerance_yaw_rad": {"type": "number", "exclusiveMinimum": 0, "default": 0.3},
                 "allow_reverse": {"type": "boolean"}, "timeout_sec": TIMEOUT}, ("x", "y")),
         "task", navigate_to_pose, needs=("nav_stack", "geometry"), motion=True),

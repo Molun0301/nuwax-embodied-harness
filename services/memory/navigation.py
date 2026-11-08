@@ -41,7 +41,7 @@ class NavigationMixin:
     _NAVIGATION_PROJECTION_CONFIDENCE_DIRECT_MIN = 0.65
     _NAVIGATION_DIRECT_SEGMENTATION_SIGNAL_MIN = 0.65
 
-    def _evaluate_navigation_metadata(self, metadata: Optional[Dict[str, object]], *, backend_name: str, candidate_score: Optional[float]=None, grounding_plan: Optional[GroundingQueryPlan]=None, map_name: Optional[str]=None, expected_map_name: Optional[str]=None) -> Dict[str, object]:
+    def _evaluate_navigation_metadata(self, metadata: Optional[Dict[str, object]], *, backend_name: str, candidate_score: Optional[float]=None, grounding_plan: Optional[GroundingQueryPlan]=None, map_name: Optional[str]=None, expected_map_name: Optional[str]=None, object_target: bool=False) -> Dict[str, object]:
         resolved_metadata = dict(metadata or {})
         projection_method = str(resolved_metadata.get('projection_method') or '').strip()
         projection_confidence = self._coerce_optional_float(resolved_metadata.get('projection_confidence'))
@@ -54,7 +54,7 @@ class NavigationMixin:
         resolved_map_name = str(map_name or resolved_metadata.get('map_name') or '').strip() or None
         resolved_expected_map_name = str(expected_map_name or '').strip() or None
         segmentation_summary = self._summarize_segmentation_metadata(resolved_metadata)
-        navigation_quality = self._build_navigation_quality(metadata=resolved_metadata, candidate_score=resolved_candidate_score, projection_method=projection_method, projection_confidence=projection_confidence, support_point_count=support_point_count, projection_degradation_reason=projection_degradation_reason, geometry_projection_status=geometry_projection_status, segmentation_projection_status=segmentation_projection_status, segmentation_summary=segmentation_summary, grounding_plan=grounding_plan, map_name=resolved_map_name, expected_map_name=resolved_expected_map_name)
+        navigation_quality = self._build_navigation_quality(metadata=resolved_metadata, candidate_score=resolved_candidate_score, projection_method=projection_method, projection_confidence=projection_confidence, support_point_count=support_point_count, projection_degradation_reason=projection_degradation_reason, geometry_projection_status=geometry_projection_status, segmentation_projection_status=segmentation_projection_status, segmentation_summary=segmentation_summary, grounding_plan=grounding_plan, map_name=resolved_map_name, expected_map_name=resolved_expected_map_name, object_target=object_target)
         backend = str(resolved_metadata.get('backend') or resolved_metadata.get('backend_type') or backend_name)
         backend_type = str(resolved_metadata.get('backend_type') or resolved_metadata.get('backend') or backend_name)
         return {'backend': backend, 'backend_type': backend_type, 'candidate_score': resolved_candidate_score, 'projection_method': projection_method, 'projection_confidence': projection_confidence, 'support_point_count': int(support_point_count or 0), 'projection_degradation_reason': projection_degradation_reason, 'geometry_projection_method': geometry_projection_method, 'geometry_projection_status': geometry_projection_status, 'segmentation_projection_status': segmentation_projection_status, 'navigable': navigation_quality['level'] == 'direct_navigation', 'non_navigable_reason': navigation_quality['primary_reason_code'], 'navigation_quality': navigation_quality, **segmentation_summary}
@@ -62,7 +62,7 @@ class NavigationMixin:
     def _navigation_quality_thresholds(self) -> Dict[str, float]:
         return {'direct_candidate_score_min': self._NAVIGATION_DIRECT_CANDIDATE_SCORE_MIN, 'continue_exploration_candidate_score_max_exclusive': self._NAVIGATION_CONTINUE_EXPLORATION_SCORE_MAX_EXCLUSIVE, 'projection_confidence_hard_min': self._NAVIGATION_PROJECTION_CONFIDENCE_HARD_MIN, 'projection_confidence_direct_min': self._NAVIGATION_PROJECTION_CONFIDENCE_DIRECT_MIN, 'segmentation_low_signal_min': self._SEGMENTATION_LOW_SIGNAL_THRESHOLD, 'segmentation_reprojection_error_max': self._SEGMENTATION_REPROJECTION_ERROR_GATE, 'direct_segmentation_signal_min': self._NAVIGATION_DIRECT_SEGMENTATION_SIGNAL_MIN}
 
-    def _build_navigation_quality(self, *, metadata: Dict[str, object], candidate_score: Optional[float], projection_method: str, projection_confidence: Optional[float], support_point_count: Optional[int], projection_degradation_reason: str, geometry_projection_status: str, segmentation_projection_status: str, segmentation_summary: Dict[str, object], grounding_plan: Optional[GroundingQueryPlan], map_name: Optional[str], expected_map_name: Optional[str]) -> Dict[str, object]:
+    def _build_navigation_quality(self, *, metadata: Dict[str, object], candidate_score: Optional[float], projection_method: str, projection_confidence: Optional[float], support_point_count: Optional[int], projection_degradation_reason: str, geometry_projection_status: str, segmentation_projection_status: str, segmentation_summary: Dict[str, object], grounding_plan: Optional[GroundingQueryPlan], map_name: Optional[str], expected_map_name: Optional[str], object_target: bool=False) -> Dict[str, object]:
         planner_metadata = dict((grounding_plan.metadata if grounding_plan is not None else {}) or {})
         ambiguities = planner_metadata.get('ambiguities')
         negative_constraints = planner_metadata.get('negative_constraints')
@@ -133,10 +133,50 @@ class NavigationMixin:
                 for code in exploration_codes:
                     add_reason(code)
                 level = 'continue_exploration' if exploration_codes else 'direct_navigation'
+        diagnostics = {}
+        if object_target:
+            # 找物先到检查位姿再复核，其余质量只作诊断；通用调用继续沿用原判定。
+            displacement = self._coerce_optional_float(metadata.get('dynamic_window_displacement_m'))
+            diagnostics = {'level': level, 'reason_codes': list(reason_codes),
+                'dynamic_window_displacement_m': displacement,
+                'dynamic_short_term_obstacle_context': metadata.get('dynamic_short_term_obstacle_context'),
+                'message': ('这个物体的观测位置有变化，可能被移动过。' if displacement is not None and displacement > 0
+                            else '已记录物体状态、投影与分割质量，到达后复核目标。')}
+            reason_codes = []
+            if not expected_map_name or map_name != expected_map_name:
+                reason_codes.append('map_binding_mismatch')
+            evidence = metadata['target_navigation_evidence']
+            if not evidence['projected_frame_id']:
+                reason_codes.append('projection_evidence_missing')
+            elif (evidence['projected_frame_id'] != evidence['map_frame_id']
+                    or evidence['target_frame_id'] != evidence['map_frame_id']):
+                reason_codes.append('target_pose_not_map_frame')
+            if not projection_method:
+                reason_codes.append('projection_evidence_missing')
+            elif projection_method == 'current_pose_fallback':
+                reason_codes.append('current_pose_fallback')
+            if support_point_count is None or support_point_count <= 0:
+                reason_codes.append('projection_geometry_missing')
+            # 质量只作诊断，原有语义复核与原始匹配分门槛继续生效。
+            if reason_codes:
+                level = 'not_navigable'
+            elif ambiguity_count > 0 or negative_constraint_count > 0:
+                if ambiguity_count > 0:
+                    reason_codes.append('planner_target_ambiguous')
+                if negative_constraint_count > 0:
+                    reason_codes.append('planner_negative_constraint')
+                level = 'needs_review'
+            elif candidate_score is None or candidate_score < self._NAVIGATION_DIRECT_CANDIDATE_SCORE_MIN:
+                if candidate_score is not None and candidate_score < self._NAVIGATION_CONTINUE_EXPLORATION_SCORE_MAX_EXCLUSIVE:
+                    reason_codes.append('candidate_score_low')
+                reason_codes.append('evidence_insufficient')
+                level = 'continue_exploration'
+            else:
+                level = 'direct_navigation'
         recommended_action = {'direct_navigation': 'navigate', 'needs_review': 'verify_then_navigate', 'continue_exploration': 'explore_more', 'not_navigable': 'reject'}[level]
         confidence = self._navigation_quality_confidence(level, candidate_score, projection_confidence, segmentation_summary)
         primary_reason_code = reason_codes[0] if reason_codes else ''
-        return {'schema_version': self._NAVIGATION_QUALITY_SCHEMA_VERSION, 'level': level, 'confidence': confidence, 'recommended_action': recommended_action, 'primary_reason_code': primary_reason_code, 'reason_codes': reason_codes, 'explanation': self._navigation_quality_explanation(level, primary_reason_code), 'inputs': {'candidate_score': candidate_score, 'projection_confidence': projection_confidence, 'projection_method': projection_method or None, 'support_point_count': support_point_count, 'segmentation_quality': str(segmentation_summary.get('segmentation_quality') or '') or None, 'segmentation_review_required': bool(segmentation_summary.get('segmentation_review_required')), 'segmentation_risk_factors': list(segmentation_summary.get('segmentation_risk_factors') or []), 'planner_query_scope': str(planner_metadata.get('query_scope') or '').strip() or None, 'planner_ambiguity_count': ambiguity_count, 'planner_negative_constraint_count': negative_constraint_count, 'candidate_ranking_hints_present': candidate_ranking_hints_present, 'map_name': map_name, 'expected_map_name': expected_map_name, 'dynamic_state': str(metadata.get('dynamic_state') or '') or None, 'dynamic_state_reason': str(metadata.get('dynamic_state_reason') or '') or None, 'long_term_static_target_eligible': metadata.get('long_term_static_target_eligible')}, 'thresholds': self._navigation_quality_thresholds()}
+        return {'schema_version': self._NAVIGATION_QUALITY_SCHEMA_VERSION, 'level': level, 'confidence': confidence, 'recommended_action': recommended_action, 'primary_reason_code': primary_reason_code, 'reason_codes': reason_codes, 'explanation': self._navigation_quality_explanation(level, primary_reason_code), 'inputs': {'candidate_score': candidate_score, 'projection_confidence': projection_confidence, 'projection_method': projection_method or None, 'support_point_count': support_point_count, 'segmentation_quality': str(segmentation_summary.get('segmentation_quality') or '') or None, 'segmentation_review_required': bool(segmentation_summary.get('segmentation_review_required')), 'segmentation_risk_factors': list(segmentation_summary.get('segmentation_risk_factors') or []), 'planner_query_scope': str(planner_metadata.get('query_scope') or '').strip() or None, 'planner_ambiguity_count': ambiguity_count, 'planner_negative_constraint_count': negative_constraint_count, 'candidate_ranking_hints_present': candidate_ranking_hints_present, 'map_name': map_name, 'expected_map_name': expected_map_name, 'dynamic_state': str(metadata.get('dynamic_state') or '') or None, 'dynamic_state_reason': str(metadata.get('dynamic_state_reason') or '') or None, 'long_term_static_target_eligible': metadata.get('long_term_static_target_eligible')}, 'thresholds': self._navigation_quality_thresholds(), **({'diagnostics': diagnostics} if object_target else {})}
 
     def _navigation_quality_reason_codes_from_segmentation(self, segmentation_summary: Dict[str, object]) -> List[str]:
         mapping = {'segmentation_support_points_missing': 'segmentation_support_missing', 'segmentation_score_below_threshold': 'segmentation_quality_low', 'predicted_iou_below_threshold': 'segmentation_quality_low', 'stability_score_below_threshold': 'segmentation_quality_low', 'coverage_below_threshold': 'segmentation_coverage_low', 'depth_coverage_below_threshold': 'segmentation_depth_coverage_low', 'map_projection_coverage_below_threshold': 'segmentation_map_coverage_low', 'reprojection_error_above_threshold': 'segmentation_reprojection_error_high', 'segmentation_projection_degraded': 'projection_degraded', 'segmentation_occluded': 'segmentation_occluded', 'segmentation_truncated': 'segmentation_truncated'}
@@ -563,6 +603,7 @@ class NavigationMixin:
         return {
             "visual_labels": labels,
             "target_frame_id": candidate.inspection_pose.frame_id,
+            "projected_frame_id": candidate.anchor_pose.frame_id if candidate.anchor_pose is not None else None,
             "map_frame_id": map_frame_id,
             "has_target_evidence": any(target_label_matches_query(query, label) for label in labels),
         }
@@ -574,15 +615,6 @@ class NavigationMixin:
             return "target_navigation_source_not_object_evidence"
         if not evidence["has_target_evidence"]:
             return "target_evidence_missing"
-        if evidence["target_frame_id"] != evidence["map_frame_id"]:
-            return "target_pose_not_map_frame"
-        if metadata["support_point_count"] <= 0:
-            return "support_point_count_below_threshold"
-        if not metadata["projection_method"]:
-            return "projection_evidence_missing"
-        confidence = metadata["projection_confidence"]
-        if confidence is None or not math.isfinite(confidence):
-            return "projection_confidence_invalid"
         return None
 
     def _decorate_navigation_candidate_for_goal_resolution(self, candidate: NavigationCandidate, *, goal_spec: GoalSpec, score_breakdown: GoalCandidateScoreBreakdown, decision: str, reasons: List[str], allowed_for_navigation: bool, resolution_metadata: Dict[str, object]) -> NavigationCandidate:
@@ -768,9 +800,30 @@ class NavigationMixin:
         goal_spec = self._build_goal_spec_from_grounding_plan(grounding_plan)
         observability_metadata = {'query_text_preview': self._preview_text(query), 'query_scope': query_scope, 'match_limit': match_limit, 'candidate_count': observed_candidate_count, 'returned_candidate_count': 0, 'fallback_used': fallback_used, 'fallback_reason': fallback_reason, 'map_name': effective_map_name or '', 'camera_id': camera_id or ''}
         decorated_pool: List[NavigationCandidate] = []
+        reachability_by_record = {}
         for candidate in candidates:
             score_breakdown = self._build_candidate_score_breakdown(candidate, expected_map_name=effective_map_name, goal_spec=goal_spec)
             decision, reasons, allowed_for_navigation = self._navigation_candidate_decision(candidate, score_breakdown)
+            # 图中的通用可达性仍使用原判定，专用找物准入只作用于这次返回的候选。
+            reachability_by_record[candidate.record_id] = decision
+            if object_target:
+                evidence = self._object_target_evidence(candidate, object_query, semantic_context.metadata['frame_id'])
+                navigation_metadata = self._evaluate_navigation_metadata(
+                    {**candidate.metadata, 'target_navigation_evidence': evidence},
+                    backend_name=candidate.metadata['backend'], candidate_score=candidate.metadata['candidate_score'],
+                    grounding_plan=grounding_plan, map_name=candidate.map_name,
+                    expected_map_name=effective_map_name, object_target=True)
+                rejection = self._object_target_rejection(candidate, evidence)
+                candidate = candidate.model_copy(update={'metadata': {**candidate.metadata, **navigation_metadata,
+                    **self._navigation_quality_observability_fields(navigation_metadata['navigation_quality']),
+                    'target_navigation_evidence': evidence}})
+                # 找物验证分量只采用语义证据，投影与分割分数留在返回诊断中。
+                score_input = candidate.model_copy(update={'metadata': {**candidate.metadata,
+                    'projection_confidence': None, 'segmentation_score': None}})
+                score_breakdown = self._build_candidate_score_breakdown(score_input, expected_map_name=effective_map_name, goal_spec=goal_spec)
+                decision, reasons, allowed_for_navigation = self._navigation_candidate_decision(candidate, score_breakdown)
+                if rejection is not None:
+                    decision, reasons, allowed_for_navigation = 'reject', [rejection, *reasons], False
             decorated_pool.append(self._decorate_navigation_candidate_for_goal_resolution(
                 candidate, goal_spec=goal_spec, score_breakdown=score_breakdown, decision=decision,
                 reasons=reasons, allowed_for_navigation=allowed_for_navigation,
@@ -778,22 +831,7 @@ class NavigationMixin:
             ))
         decorated_pool.sort(key=lambda item: float(dict(item.metadata).get('ranking_total_score') or 0.0), reverse=True)
         decorated_candidates = tuple(decorated_pool[:requested_limit])
-        # 可达位姿记录沿用通用判定，找物查询的证据要求只作用于本次选择。
-        reachability_decisions = tuple(candidate.metadata["resolution_decision"] for candidate in decorated_candidates)
-        if object_target:
-            map_frame_id = semantic_context.metadata["frame_id"]
-            target_candidates = []
-            for candidate in decorated_candidates:
-                evidence = self._object_target_evidence(candidate, object_query, map_frame_id)
-                rejection = self._object_target_rejection(candidate, evidence)
-                metadata = {**candidate.metadata, "target_navigation_evidence": evidence}
-                if rejection is not None:
-                    metadata.update(
-                        resolution_decision="reject", allowed_for_navigation=False, excluded_reason=rejection,
-                        exclusion_reasons=[rejection, *metadata["exclusion_reasons"]],
-                    )
-                target_candidates.append(candidate.model_copy(update={"metadata": metadata}))
-            decorated_candidates = tuple(target_candidates)
+        reachability_decisions = tuple(reachability_by_record[candidate.record_id] for candidate in decorated_candidates)
         observability_metadata['returned_candidate_count'] = len(decorated_candidates)
         resolution = self._build_navigation_candidate_resolution(goal_spec=goal_spec, candidates=decorated_candidates, resolution_metadata=observability_metadata)
         evaluation_trace = None

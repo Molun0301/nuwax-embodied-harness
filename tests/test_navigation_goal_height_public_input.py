@@ -68,7 +68,7 @@ def test_omitted_height_uses_actual_pipeline_and_source_pose(public_navigation,t
     assert service.goal.pose.position.z==height
     assert (service.goal.pose.position.x,service.goal.pose.position.y)==(1.,2.)
     assert not service.goal.HasField('allow_reverse')
-    assert service.goal.position_tolerance_m==.35
+    assert service.goal.position_tolerance_m==.15
     assert service.goal.yaw_tolerance_rad==math.pi
     complete(public_navigation,task_id)
 

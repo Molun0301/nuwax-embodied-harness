@@ -57,13 +57,6 @@ impl MaskLayout {
 }
 
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct MaskWork {
-    pub compared_cells: usize,
-    pub derivations: usize,
-}
-
 struct DerivedSurface {
     mask_revision: Option<MaskRevision>,
     mask_layout: Option<MaskLayout>,
@@ -77,17 +70,16 @@ impl DerivedSurface {
     fn matches_mask_contents(
         &self,
         mask: &schema::OccupancyGrid,
-        mut observed_cell: impl FnMut(),
     ) -> bool {
         self.snapshot.matches_virtual_obstacles(
             [mask.info.origin.position[0], mask.info.origin.position[1]],
             f64::from(mask.info.resolution), mask.info.width as u32, mask.info.height as u32,
-            mask.data.iter().map(|value| { observed_cell(); *value == 100 }),
+            mask.data.iter().map(|value| *value == 100),
         )
     }
 }
 
-/// 仅缓存几何计算；调用者仍须核对消息来源、修订、接收时刻与更新票据。
+/// 缓存已在解码与接收边界准入的地图几何。
 pub struct SurfaceMapCache {
     config: Config,
     builder: SurfaceMapBuilder,
@@ -99,8 +91,6 @@ pub struct SurfaceMapCache {
     fine_built_root: Option<Arc<nuwax_map_chunks::Manifest>>,
     fine_observed_root: Option<Arc<nuwax_map_chunks::Manifest>>,
     observations: Option<Arc<nuwax_nav_mls_planner::SurfaceObservations>>,
-    #[cfg(test)]
-    mask_work: MaskWork,
 }
 
 impl SurfaceMapCache {
@@ -116,8 +106,6 @@ impl SurfaceMapCache {
             fine_built_root: None,
             fine_observed_root: None,
             observations: None,
-            #[cfg(test)]
-            mask_work: MaskWork::default(),
             lcm_url: String::new(),
         }
     }
@@ -141,20 +129,6 @@ impl SurfaceMapCache {
         cache
     }
 
-    /// Opt-in integration seam for a receiver populated through its original
-    /// bounded transfer / missing-object fetch path. Build still revalidates the
-    /// publication and runs the original Reader, observations and surface builder.
-    /// This does not exercise outer RPC transport or replace any geometry source.
-    #[cfg(feature = "surface-source-qualification")]
-    pub fn configured_with_admitted_fine_source(
-        config: &crate::surface_config::SurfaceNavigationConfig,
-        receiver: nuwax_map_chunks::Receiver,
-    ) -> Self {
-        let mut cache = Self::configured(config);
-        cache.fine = Some(crate::surface_chunks::FineMapReader::from_admitted_receiver(receiver));
-        cache
-    }
-
     /// 撤销计算复用状态；不会改动已交付快照或发布任何业务状态。
     pub fn reset(&mut self) {
         self.builder.reset();
@@ -172,16 +146,6 @@ impl SurfaceMapCache {
         self.last_stats
     }
 
-    #[cfg(test)]
-    pub(crate) fn physical_snapshot(&self) -> Option<Arc<SurfaceSnapshot>> {
-        self.physical
-            .as_ref()
-            .map(|(_, snapshot)| Arc::clone(snapshot))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn mask_work(&self) -> MaskWork { self.mask_work }
-
     fn record_reuse(&mut self) {
         if let Some(stats) = self.last_stats.as_mut() {
             stats.kind = SurfaceBuildKind::Reused;
@@ -193,7 +157,7 @@ impl SurfaceMapCache {
         }
     }
 
-    /// 适配已准入的完整消息；使用拥有方修订复用，否则按体素列变化构建。
+    /// 适配已完成协议校验的完整消息；按拥有方修订与体素列变化构建。
     pub fn build(
         &mut self,
         message: &schema::NavigationMap3D,
@@ -211,13 +175,9 @@ impl SurfaceMapCache {
         let change_basis = self.latest.as_ref().map(|old| Arc::clone(&old.snapshot));
         let intact_basis = self.latest.as_ref().zip(self.physical.as_ref())
             .is_some_and(|(old, (_, physical))| Arc::ptr_eq(&old.physical, physical));
-        schema::validate_navigation_map_3d(message)?;
         if message.cleared {
             self.reset();
             return Err("surface map cleared by mapping owner".into());
-        }
-        if message.frame_id != self.config.world_frame {
-            return Err("surface map frame differs from configured map frame".into());
         }
         let fine_root = if message.fine.is_some() {
             if self.fine.is_none() {
@@ -288,8 +248,7 @@ impl SurfaceMapCache {
                     )
                     .map_err(|error| error.to_string())?
             } else {
-                let points =
-                    schema::navigation_map_3d_points(message).map_err(|error| error.to_string())?;
+                let points = admitted_cloud_points(&message.cloud);
                 self.builder
                     .build(&points, message.source_voxel_size)
                     .map_err(|error| error.to_string())?
@@ -311,8 +270,6 @@ impl SurfaceMapCache {
             cloud_revision=message.revision, receive_ms, observations_ms,
             geometry_ms=started.elapsed().as_secs_f64()*1000.0-receive_ms-observations_ms,
             stats=?self.last_stats, "表面构建阶段耗时");
-        #[cfg(test)]
-        let mut compared_cells = 0;
         let same_mask = self.latest.as_ref().is_some_and(|previous| {
             if previous.mask_revision == mask_revision { return true; }
             let (Some(old), Some(next), Some(mask)) =
@@ -321,11 +278,8 @@ impl SurfaceMapCache {
             if old.domain != next.domain || previous.mask_layout != mask_layout
             { return false; }
             // 比较借用完整输入与已有积分图，不保留或复制另一份遮罩。
-            previous.matches_mask_contents(mask, || {
-                #[cfg(test)] { compared_cells += 1; }
-            })
+            previous.matches_mask_contents(mask)
         });
-        #[cfg(test)] { self.mask_work.compared_cells += compared_cells; }
         let reusable = same_mask && self.latest.as_ref()
             .is_some_and(|old| Arc::ptr_eq(&old.physical, &physical));
         let changes = |snapshot: &Arc<SurfaceSnapshot>| {
@@ -364,7 +318,6 @@ impl SurfaceMapCache {
             return Ok(SurfaceMapUpdate { snapshot, change_basis, changes });
         }
         let snapshot = if let Some(mask) = message.virtual_obstacles.as_ref() {
-            #[cfg(test)] { self.mask_work.derivations += 1; }
             // 仅较新修订的逐格证明允许复用遮罩存储；同修订快路不证明输入内容。
             let retained = self.latest.as_ref()
                 .filter(|previous| same_mask && previous.mask_revision != mask_revision)
@@ -397,5 +350,72 @@ impl SurfaceMapCache {
         self.latest = Some(DerivedSurface { mask_revision, mask_layout, physical, snapshot: Arc::clone(&snapshot) });
         let changes = Arc::new(changes(&snapshot));
         Ok(SurfaceMapUpdate { snapshot, change_basis, changes })
+    }
+}
+
+/// 解码边界已确认字段、布局与有限坐标；此处只展开坐标，不重复校验协议。
+fn admitted_cloud_points(cloud: &schema::PointCloud2) -> Vec<(f32, f32, f32)> {
+    let axes = ["x", "y", "z"].map(|name| {
+        let field = cloud.fields.iter().find(|field| field.name == name).unwrap();
+        (field.offset as usize, field.datatype)
+    });
+    let mut points = Vec::with_capacity(cloud.width as usize * cloud.height as usize);
+    for row in 0..cloud.height as usize {
+        for column in 0..cloud.width as usize {
+            let base = row * cloud.row_step as usize + column * cloud.point_step as usize;
+            let xyz = axes.map(|(offset, datatype)| {
+                let start = base + offset;
+                if datatype == 7 {
+                    let bytes = cloud.data[start..start + 4].try_into().unwrap();
+                    if cloud.is_bigendian { f32::from_be_bytes(bytes) } else { f32::from_le_bytes(bytes) }
+                } else {
+                    let bytes = cloud.data[start..start + 8].try_into().unwrap();
+                    (if cloud.is_bigendian { f64::from_be_bytes(bytes) } else { f64::from_le_bytes(bytes) }) as f32
+                }
+            });
+            points.push((xyz[0], xyz[1], xyz[2]));
+        }
+    }
+    points
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    pub(crate) fn physical_snapshot(cache: &SurfaceMapCache) -> Option<Arc<SurfaceSnapshot>> {
+        cache.physical.as_ref().map(|(_, snapshot)| Arc::clone(snapshot))
+    }
+
+    #[test]
+    fn admitted_coordinates_preserve_endianness_offsets_and_padded_rows() {
+        for big_endian in [false, true] {
+            for datatype in [7, 8] {
+                let bytes = if datatype == 7 { 4 } else { 8 };
+                let mut cloud = schema::PointCloud2 {
+                    width: 2, height: 2, point_step: bytes * 4, row_step: bytes * 9,
+                    is_bigendian: big_endian,
+                    fields: ["z", "x", "y"].iter().enumerate().map(|(index, name)| schema::PointField {
+                        name: (*name).into(), offset: index as i32 * bytes, datatype, count: 1,
+                    }).collect(),
+                    ..Default::default()
+                };
+                cloud.data = vec![0; (cloud.row_step * cloud.height) as usize];
+                for index in 0..4 {
+                    let base = index / 2 * cloud.row_step as usize + index % 2 * cloud.point_step as usize;
+                    for (axis, offset) in [(0, bytes), (1, bytes * 2), (2, 0)] {
+                        let value = (index * 3 + axis) as f64;
+                        let encoded = if datatype == 7 {
+                            if big_endian { (value as f32).to_be_bytes() } else { (value as f32).to_le_bytes() }.to_vec()
+                        } else {
+                            if big_endian { value.to_be_bytes() } else { value.to_le_bytes() }.to_vec()
+                        };
+                        let start = base + offset as usize;
+                        cloud.data[start..start + bytes as usize].copy_from_slice(&encoded);
+                    }
+                }
+                assert_eq!(admitted_cloud_points(&cloud), vec![(0.,1.,2.),(3.,4.,5.),(6.,7.,8.),(9.,10.,11.)]);
+            }
+        }
     }
 }

@@ -30,11 +30,7 @@ impl RecentSourceState {
     }
     pub(crate) async fn consume(&mut self,body:&[u8],authority:Option<&GuardedMapAuthority>,
         scheduler:&nuwax_nav_runtime::NavSchedulerHandle)->Result<(),String> {
-        #[cfg(all(test,feature="surface-recovery-qualification"))]
-        let decode=scheduler.qualification_timing().map(|t|t.span("recent.codec_decode",0));
         let packet=nuwax_codec::lcm::recent_cloud::decode_body(body).map_err(|error|error.to_string())?;
-        #[cfg(all(test,feature="surface-recovery-qualification"))]
-        drop(decode);
         let session_changed = self.latest.as_ref().is_some_and(|(session, _)| *session != packet.session_id);
         if packet.cloud.is_none() || session_changed {
             self.clear_observations(scheduler).await?;
@@ -50,27 +46,12 @@ impl RecentSourceState {
         let basis = self.snapshot.as_ref().ok_or("recent cloud has no ready terrain")?;
         let source_time = i64::from(cloud.header.stamp_sec) * 1_000_000_000
             + i64::from(cloud.header.stamp_nsec);
-        #[cfg(all(test,feature="surface-recovery-qualification"))]
-        if let Some(t) = scheduler.qualification_timing() {
-            t.mark("recent.codec_decoded", source_time);
-        }
         let bound = if let Some(age) = self.max_age {
             guarded_pose_source_deadline(source_time, age, std::time::SystemTime::now(), tokio::time::Instant::now())
                 .map_err(|error| error.to_string())?;
             Some(CommandDispatchBound::from_source_timestamp(source_time as u64, age))
         } else { None };
-        #[cfg(all(test,feature="surface-recovery-qualification"))]
-        if let Some(t) = scheduler.qualification_timing() {
-            t.count("recent.emitted_points", source_time, (i64::from(cloud.width) * i64::from(cloud.height)) as u64);
-            t.mark("recent.source_admitted", source_time);
-        }
-        #[cfg(all(test,feature="surface-recovery-qualification"))]
-        let xyz = scheduler.qualification_timing().map(|t| t.span("recent.xyz_materialize", source_time));
         let points = point_cloud_from_schema(cloud).map_err(|error| error.to_string())?;
-        #[cfg(all(test,feature="surface-recovery-qualification"))]
-        drop(xyz);
-        #[cfg(all(test,feature="surface-recovery-qualification"))]
-        let build = scheduler.qualification_timing().map(|t| t.span("recent.recent_frame_build", source_time));
         let raw_points: Arc<[[f64; 3]]> = points.points.into_iter()
             .map(|p| [p.x, p.y, p.z]).collect::<Vec<_>>().into();
         let registered_frame = packet.registration.map(|pose| Arc::new(RegisteredFrame {
@@ -92,15 +73,9 @@ impl RecentSourceState {
             packet.sequence as u64, source_time as u64, retention, &packet.ground_point_indices,
             raw_points.iter().copied().enumerate().map(|(index, p)| (index as u32, p)),
         ).map_err(|error| error.to_string())?);
-        #[cfg(all(test,feature="surface-recovery-qualification"))]
-        drop(build);
-        #[cfg(all(test,feature="surface-recovery-qualification"))]
-        let ack=scheduler.qualification_timing().map(|t|t.span("recent.scheduler_ack",source_time));
         scheduler.update_registered_obstacle_source(Some(ExecutionMap::SurfaceUpdate(SurfaceMapUpdate {
             snapshot:snapshot.clone(),change_basis:Some(basis.clone()),changes:Arc::new(SurfaceGeometryChanges::Empty),
         })),true,bound,registered_frame.clone()).await.map_err(|error|error.to_string())?;
-        #[cfg(all(test,feature="surface-recovery-qualification"))]
-        drop(ack);
         self.enabled=true;
         self.snapshot=Some(snapshot);
         self.registered_frame=registered_frame;

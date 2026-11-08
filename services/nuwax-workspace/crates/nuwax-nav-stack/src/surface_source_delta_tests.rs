@@ -84,7 +84,7 @@ fn selective_refresh_failed_physical_advance_is_unknown_once_then_recovers_known
     let mut cache=SurfaceGeometryCache::configured(&configured);
     let mut fixture=FineFixture::new();
     let first=cache.build_with_changes(&fixture.next()).unwrap();
-    let physical_before=cache.physical_snapshot().unwrap();
+    let physical_before=crate::surface_map::tests::physical_snapshot(&cache).unwrap();
     fixture.cells.insert(A);
     let mut broken=fixture.next();
     let mut mask=virtual_mask(&broken,false);
@@ -94,7 +94,7 @@ fn selective_refresh_failed_physical_advance_is_unknown_once_then_recovers_known
     // representable by the derived map. It fails after physical advances.
     schema::validate_navigation_map_3d(&broken).unwrap();
     assert!(cache.build_with_changes(&broken).is_err());
-    assert!(!Arc::ptr_eq(&physical_before,&cache.physical_snapshot().unwrap()));
+    assert!(!Arc::ptr_eq(&physical_before,&crate::surface_map::tests::physical_snapshot(&cache).unwrap()));
     let recovered=cache.build_with_changes(&fixture.next()).unwrap();
     assert!(nuwax_nav_runtime::native_map::same_source_geometry(recovered.change_basis.as_ref().unwrap(),&first.snapshot));
     assert!(matches!(recovered.changes.as_ref(),SurfaceGeometryChanges::Unknown));

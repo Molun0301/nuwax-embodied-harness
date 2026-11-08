@@ -152,13 +152,13 @@ fn occupancy_only_same_mask_reuses_surface_and_pct_with_current_receipt() {
     let first_received = Instant::now() - Duration::from_secs(2);
     let first = prepare_surface_map(first_message.clone(), first_received, &configured, &mut cache);
     let old = first.snapshot.as_ref().unwrap();
-    let physical = cache.physical_snapshot().unwrap();
+    let physical = crate::surface_map::tests::physical_snapshot(&cache).unwrap();
     let mut next_message = next_occupancy(&first_message);
     let next_received = first_received + Duration::from_millis(250);
     let next = prepare_surface_map(next_message.clone(), next_received, &configured, &mut cache);
     let current = next.snapshot.as_ref().unwrap();
     assert!(Arc::ptr_eq(old, current));
-    assert!(Arc::ptr_eq(&physical, &cache.physical_snapshot().unwrap()));
+    assert!(Arc::ptr_eq(&physical, &crate::surface_map::tests::physical_snapshot(&cache).unwrap()));
     assert!(old.same_body_query_view(current));
     assert_eq!(next.authority, map_authority(&next_message));
     assert_ne!(next.authority, first.authority);
@@ -187,7 +187,7 @@ fn mask_cells_presence_extent_and_layout_bits_use_cold_current_message_geometry(
         let mut cache = SurfaceGeometryCache::configured(&configured);
         let first_message = flat_message(40, 30, "mask-layout");
         let old = cache.build(&first_message).unwrap();
-        let physical = cache.physical_snapshot().unwrap();
+        let physical = crate::surface_map::tests::physical_snapshot(&cache).unwrap();
         let old_pct = native_input(&old).unwrap();
         let mut next = next_occupancy(&first_message);
         if variant == "none" {
@@ -215,7 +215,7 @@ fn mask_cells_presence_extent_and_layout_bits_use_cold_current_message_geometry(
         }
         schema::validate_navigation_map_3d(&next).unwrap();
         let current = cache.build(&next).unwrap();
-        assert!(Arc::ptr_eq(&physical, &cache.physical_snapshot().unwrap()), "{variant}");
+        assert!(Arc::ptr_eq(&physical, &crate::surface_map::tests::physical_snapshot(&cache).unwrap()), "{variant}");
         assert!(!old.same_geometry(&current), "{variant} must not reuse the old derived graph");
         let current_pct = native_input(&current).unwrap();
         assert_current_message_oracle(&current, &next, &configured, false);
@@ -301,7 +301,7 @@ fn fine_mask_reuse_keeps_original_evidence_and_refresh_retires_only_body_query_v
     let first = cache.build(&first_message).unwrap();
     let first_observations = Arc::clone(first.observations().unwrap());
     let evidence = first_observations.get([40,30,0]).unwrap();
-    let physical = cache.physical_snapshot().unwrap();
+    let physical = crate::surface_map::tests::physical_snapshot(&cache).unwrap();
     let occupied_message = next_occupancy(&first_message);
     let receipt = Instant::now() - Duration::from_secs(3);
     let occupied = prepare_surface_map(occupied_message.clone(), receipt, &configured, &mut cache);
@@ -316,7 +316,7 @@ fn fine_mask_reuse_keeps_original_evidence_and_refresh_retires_only_body_query_v
 
     let refreshed_message = fixture.message(&cells, 3);
     let refreshed = cache.build(&refreshed_message).unwrap();
-    assert!(Arc::ptr_eq(&physical, &cache.physical_snapshot().unwrap()));
+    assert!(Arc::ptr_eq(&physical, &crate::surface_map::tests::physical_snapshot(&cache).unwrap()));
     assert!(first.same_geometry(&refreshed));
     assert!(!Arc::ptr_eq(&first, &refreshed));
     assert!(!first.same_body_query_view(&refreshed));
@@ -338,14 +338,14 @@ fn fine_geometry_change_inside_one_coarse_cell_invalidates_pct_despite_mask_reus
     let mut cells = fine_ground();
     let first_message = fixture.message(&cells, 1);
     let first = cache.build(&first_message).unwrap();
-    let physical = cache.physical_snapshot().unwrap();
+    let physical = crate::surface_map::tests::physical_snapshot(&cache).unwrap();
     let pct = native_input(&first).unwrap();
     // Three samples in the same 0.1 m coarse column still retain exactly the
     // same coarse occupied cell and height band. The 0.05 m source has a hole.
     assert!(cells.remove(&[10,10,0]));
     let next_message = fixture.message(&cells, 2);
     let next = cache.build(&next_message).unwrap();
-    assert!(Arc::ptr_eq(&physical, &cache.physical_snapshot().unwrap()));
+    assert!(Arc::ptr_eq(&physical, &crate::surface_map::tests::physical_snapshot(&cache).unwrap()));
     assert!(first.same_geometry(&next));
     assert_eq!(canonical_columns(&first), canonical_columns(&next));
     assert!(!first.same_body_query_view(&next));
@@ -377,7 +377,7 @@ fn reset_clear_and_domain_changes_discard_derived_mask_reuse() {
                 clear.cloud.data.clear();
                 assert!(cache.build(&clear).is_err());
                 assert!(cache.last_build_stats().is_none());
-                assert!(cache.physical_snapshot().is_none());
+                assert!(crate::surface_map::tests::physical_snapshot(&cache).is_none());
                 next_message = next_occupancy(&next_message);
             },
             "session" => next_message.session_id = "replacement-domain".into(),

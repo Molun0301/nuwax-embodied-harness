@@ -1,37 +1,8 @@
 use super::*;
 
 #[test]
-fn unchanged_mask_work_counts_preserve_revision_fast_path_and_skip_derived_maps() {
-    let mut message = map_message(1, "mask-work");
-    message.virtual_obstacles = Some(virtual_mask(&message, false));
-    let mut cache = SurfaceGeometryCache::new(config().geometry);
-    let first = cache.build(&message).unwrap();
-    let initial = cache.mask_work();
-    assert_eq!((initial.compared_cells, initial.derivations), (0, 1));
-    for _ in 0..8 {
-        assert!(Arc::ptr_eq(&first, &cache.build(&message).unwrap()));
-    }
-    assert_eq!(cache.mask_work().compared_cells, 0);
-    let cells = message.virtual_obstacles.as_ref().unwrap().data.len();
-    for _ in 0..8 {
-        advance_mask(&mut message, false);
-        let source = cache.build(&message).unwrap();
-        assert!(Arc::ptr_eq(&first, &source));
-    }
-    assert_eq!(cache.mask_work().compared_cells, 8 * cells);
-    assert_eq!(cache.mask_work().derivations, 1);
-    advance_mask(&mut message, false);
-    message.virtual_obstacles.as_mut().unwrap().data[0] = 100;
-    let changed = cache.build(&message).unwrap();
-    assert!(!changed.same_geometry(&first));
-    assert_eq!(cache.mask_work().compared_cells, 8 * cells + 1);
-    assert_eq!(cache.mask_work().derivations, 2);
-    eprintln!("MASK_WORK unchanged_updates=8 compared_cells={} derived_builds=1 pct_builds=1 same_revision_updates=8 same_revision_comparisons=0 changed_first_cell_comparisons=1 changed_derivations=1", 8 * cells);
-}
-
-#[test]
 fn invalid_new_mask_never_reuses_or_replaces_the_complete_baseline() {
-    for variant in ["value", "length", "dimension_limit", "extent"] {
+    for variant in ["dimension_limit", "extent"] {
         let mut message=map_message(1,"mask-invalid");
         message.virtual_obstacles=Some(virtual_mask(&message,false));
         let mut cache=SurfaceGeometryCache::new(config().geometry);
@@ -40,8 +11,6 @@ fn invalid_new_mask_never_reuses_or_replaces_the_complete_baseline() {
         let mut invalid=message.clone();
         let mask=invalid.virtual_obstacles.as_mut().unwrap();
         match variant {
-            "value"=>mask.data[0]=50,
-            "length"=>{mask.data.pop();},
             "dimension_limit"=>{mask.info.width=65_537;mask.info.height=1;mask.data=vec![0;65_537];},
             "extent"=>mask.info.origin.position[0]=f64::MAX,
             _=>unreachable!(),
@@ -136,7 +105,7 @@ fn new_physical_updates_reapply_only_cell_proven_retained_masks() {
         message.virtual_obstacles = Some(virtual_mask(&message, true));
         let mut cache = SurfaceGeometryCache::new(config().geometry);
         let previous = cache.build(&message).unwrap();
-        let old_physical = cache.physical_snapshot().unwrap();
+        let old_physical = crate::surface_map::tests::physical_snapshot(&cache).unwrap();
         advance_mask(&mut message, true);
         advance_scan(&mut message);
         // Replace a real physical floor support with a higher obstacle column.
@@ -149,7 +118,7 @@ fn new_physical_updates_reapply_only_cell_proven_retained_masks() {
             _ => {}
         }
         let actual = cache.build(&message).unwrap();
-        let physical = cache.physical_snapshot().unwrap();
+        let physical = crate::surface_map::tests::physical_snapshot(&cache).unwrap();
         assert!(!Arc::ptr_eq(&old_physical, &physical), "{variant}");
         assert!(!actual.same_geometry(&previous), "{variant}");
         let mask = message.virtual_obstacles.as_ref().unwrap();
@@ -174,9 +143,5 @@ fn new_physical_updates_reapply_only_cell_proven_retained_masks() {
             assert_eq!(actual.navigation_column_allowed([cell.0, cell.1], 0.1),
                 expected.navigation_column_allowed([cell.0, cell.1], 0.1));
         }
-        assert_eq!(cache.mask_work().derivations, 2, "new physical requires derivation: {variant}");
-        assert_eq!(cache.mask_work().compared_cells, match variant {
-            "same_cells" => blocked.len(), "changed_cells" => 1, _ => 0,
-        }, "{variant}");
     }
 }

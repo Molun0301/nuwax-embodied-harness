@@ -30,34 +30,26 @@ pub(super) struct PreparedSurfaceMap {
 
 #[derive(Clone)]
 struct SurfaceMapHub {
-    #[cfg(all(test,feature="surface-recovery-qualification"))]
-    qualification_timing: Option<nuwax_nav_runtime::qualification_timing::TraceSink>,
     body_reference_frame_id: Arc<str>,
     latest: Arc<Mutex<Option<PreparedSurfaceMap>>>,
     events: tokio::sync::broadcast::Sender<PreparedSurfaceMap>,
     planning: tokio::sync::watch::Sender<Option<(String,GoalKey,String,bool,bool)>>,
     // Same in-process scheduler owner; no new wire fields or inferred ground.
     execution_feedback: tokio::sync::watch::Sender<Option<SurfaceReplanFeedback>>,
-    #[cfg(test)] map_computer: Option<SurfaceMapComputer>,
 }
 
 impl SurfaceMapHub {
     fn new(body_reference_frame_id: Arc<str>) -> Self {
         Self {
             body_reference_frame_id,
-            #[cfg(all(test,feature="surface-recovery-qualification"))]
-            qualification_timing: None,
             latest: Arc::new(Mutex::new(None)),
             events: tokio::sync::broadcast::channel(32).0,
             planning: tokio::sync::watch::channel(None).0,
             execution_feedback: tokio::sync::watch::channel(None).0,
-            #[cfg(test)] map_computer: None,
         }
     }
 
     fn publish(&self, update: PreparedSurfaceMap) {
-        #[cfg(all(test,feature="surface-recovery-qualification"))]
-        let _publish=self.qualification_timing.as_ref().map(|t|t.span("map.hub.publish",update.source_timestamp_ns));
         let mut latest = self
             .latest
             .lock()
@@ -521,7 +513,6 @@ struct SurfaceJobTicket {
 /// 联验可注入真实但隔离的LCM连接，生产包装仍执行同一循环。
 type SurfacePathComputer = Arc<dyn Fn(&SurfaceSnapshot, &PoseStamped, &schema::NavigationGoal,
     &SurfaceNavigationConfig) -> NavStackResult<SurfacePlan> + Send + Sync>;
-#[cfg(test)]
 type SurfaceMapComputer = Arc<dyn Fn(Arc<schema::NavigationMap3D>, Instant,
     &SurfaceNavigationConfig, &mut SurfaceGeometryCache) -> PreparedSurfaceMap + Send + Sync>;
 
@@ -533,7 +524,7 @@ async fn run_surface_planner_with_transport(
     shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
 ) -> NavStackResult<()> {
-    run_surface_planner_with_computer(node,hub,config,transport,shutdown,ready,Arc::new(body_path_progressive)).await
+    run_surface_planner_with_computer(node,hub,config,transport,shutdown,ready,Arc::new(body_path_progressive),Arc::new(prepare_surface_map)).await
 }
 
 async fn run_surface_planner_with_computer(
@@ -544,6 +535,7 @@ async fn run_surface_planner_with_computer(
     mut shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
     computer: SurfacePathComputer,
+    map_computer: SurfaceMapComputer,
 ) -> NavStackResult<()> {
     let mut maps = typed_stream(&transport, &node.inputs[0], "nuwax_msgs.NavigationMap3D").await?;
     let mut poses = typed_stream(&transport, &node.inputs[1], "geometry_msgs.PoseStamped").await?;
@@ -595,23 +587,12 @@ async fn run_surface_planner_with_computer(
             if let Some((message, received_at, epoch)) = pending_map.take() {
                 let cache = Arc::clone(&cache);
                 let config = config.clone();
-                #[cfg(test)] let map_computer = hub.map_computer.clone();
-                #[cfg(all(test,feature="surface-recovery-qualification"))]
-                let timing=hub.qualification_timing.clone();
-                #[cfg(all(test,feature="surface-recovery-qualification"))]
-                let queued=timing.as_ref().map(|t|t.span("map.build.queue",message.source_timestamp_ns));
+                let map_computer = Arc::clone(&map_computer);
                 computations.spawn(async move {
                     let retry_message = Arc::clone(&message);
                     let computed = tokio::task::spawn_blocking(move || {
-                        #[cfg(all(test,feature="surface-recovery-qualification"))]
-                        drop(queued);
-                        #[cfg(all(test,feature="surface-recovery-qualification"))]
-                        let _build=timing.as_ref().map(|t|t.span("map.build.compute_and_cache_lock",message.source_timestamp_ns));
                         let mut cache = cache.lock().map_err(|_| "表面计算缓存锁失效".to_string())?;
-                        #[cfg(test)] if let Some(computer) = map_computer {
-                            return Ok(computer(message, received_at, &config, &mut cache));
-                        }
-                        Ok::<_, String>(prepare_surface_map(message, received_at, &config, &mut cache))
+                        Ok::<_, String>(map_computer(message, received_at, &config, &mut cache))
                     }).await.map_err(|e| e.to_string()).and_then(|v| v);
                     (epoch, retry_message, received_at, computed)
                 });
@@ -770,16 +751,10 @@ async fn run_surface_planner_with_computer(
             frame = maps.next() => {
                 let frame = required_frame(frame, "surface planner map")?;
                 let received_at = Instant::now();
-                #[cfg(all(test,feature="surface-recovery-qualification"))]
-                let decode=hub.qualification_timing.as_ref().map(|t|t.span("map.ingress.decode",0));
                 let message = match schema::decode_navigation_map_3d_body_with_root(&frame.payload) {
                     Ok((message, _)) => Arc::new(message),
                     Err(error) => { diagnostics.reject("surface map", &error.to_string()); continue; }
                 };
-                #[cfg(all(test,feature="surface-recovery-qualification"))]
-                drop(decode);
-                #[cfg(all(test,feature="surface-recovery-qualification"))]
-                if let Some(t)=hub.qualification_timing.as_ref() {t.mark("map.ingress.decoded",message.source_timestamp_ns);}
                 let ingress = order.observe(&message);
                 if ingress == MapIngress::Ignore {
                     continue;
@@ -1477,12 +1452,12 @@ goal: schema::PoseStamped {
         assert_eq!(observed_first.observations().unwrap().get([40,30,40]), Some(old_evidence));
         // Occupancy-only progress retains the physical graph and original fine
         // observation allocation/time. A newer mask never refreshes evidence age.
-        let retained_physical = observed_cache.physical_snapshot().unwrap();
+        let retained_physical = crate::surface_map::tests::physical_snapshot(&observed_cache).unwrap();
         let retained_observations = Arc::clone(observed_second.observations().unwrap());
         let mut mask_only = second_message.clone();
         advance_mask(&mut mask_only, false);
         let masked = observed_cache.build(&mask_only).unwrap();
-        assert!(Arc::ptr_eq(&retained_physical, &observed_cache.physical_snapshot().unwrap()));
+        assert!(Arc::ptr_eq(&retained_physical, &crate::surface_map::tests::physical_snapshot(&observed_cache).unwrap()));
         assert!(Arc::ptr_eq(&retained_observations, masked.observations().unwrap()));
         assert_eq!(masked.observations().unwrap().get([40,30,40]).unwrap().observed_ns,
             second_message.source_timestamp_ns as u64);
@@ -1610,14 +1585,14 @@ goal: schema::PoseStamped {
             &configured,
             &mut cache,
         );
-        let physical = cache.physical_snapshot().unwrap();
+        let physical = crate::surface_map::tests::physical_snapshot(&cache).unwrap();
         let mut message = map_message(2, "map");
         message.virtual_obstacles = Some(virtual_mask(&message, true));
         let constrained =
             prepare_surface_map(message.clone(), Instant::now(), &configured, &mut cache);
         assert!(native_ground_route(plain.snapshot.as_ref().unwrap(),[0.55,1.55,2.1],[3.05,1.55,2.1]));
         assert!(!native_ground_route(constrained.snapshot.as_ref().unwrap(),[0.55,1.55,2.1],[3.05,1.55,2.1]));
-        assert!(Arc::ptr_eq(&physical, &cache.physical_snapshot().unwrap()));
+        assert!(Arc::ptr_eq(&physical, &crate::surface_map::tests::physical_snapshot(&cache).unwrap()));
         message.revision += 1;
         message.cloud.header.seq += 1;
         // Scan-only publication retains the existing receipt and evidence clock.
@@ -1634,12 +1609,12 @@ goal: schema::PoseStamped {
         let mut first = map_message(1, "mask-revision");
         first.virtual_obstacles = Some(virtual_mask(&first, true));
         let old = cache.build(&first).unwrap();
-        let physical = cache.physical_snapshot().unwrap();
+        let physical = crate::surface_map::tests::physical_snapshot(&cache).unwrap();
         let mut second = map_message(2, "mask-revision");
         second.revision = 2;
         second.virtual_obstacles = Some(virtual_mask(&second, true));
         let repeated_mask = cache.build(&second).unwrap();
-        assert!(Arc::ptr_eq(&physical, &cache.physical_snapshot().unwrap()));
+        assert!(Arc::ptr_eq(&physical, &crate::surface_map::tests::physical_snapshot(&cache).unwrap()));
         assert!(Arc::ptr_eq(&old, &repeated_mask));
         assert!(Arc::ptr_eq(&repeated_mask, &cache.build(&second).unwrap()));
         let mut third = map_message(3, "mask-revision");
@@ -1829,7 +1804,7 @@ goal: schema::PoseStamped {
 
         async fn start_with_config_rate(computer:SurfacePathComputer,feed_period:Duration,
             configured: SurfaceNavigationConfig)->Self {
-            // Reuse the existing real liblcm memq fixture for owner/codec qualification.
+            // 使用现有真实通信夹具验证拥有方接线。
             Self::start_with_test_transport(computer, feed_period, configured, true).await
         }
 
@@ -1885,8 +1860,8 @@ goal: schema::PoseStamped {
             )
             .await
             .unwrap();
-            let mut hub = SurfaceMapHub::new(Arc::from("base_link"));
-            hub.map_computer = map_computer;
+            let hub = SurfaceMapHub::new(Arc::from("base_link"));
+            let map_computer = map_computer.unwrap_or_else(|| Arc::new(prepare_surface_map));
             let planner_transport = if memq {transport.clone()} else {LcmTransport::new_real(&url).unwrap()};
             let planner_hub = hub.clone();
             let planner_spec = planner_node.clone();
@@ -1904,6 +1879,7 @@ goal: schema::PoseStamped {
                         shutdown,
                         ready,
                         computer,
+                        map_computer,
                     ))
                 }),
             );
@@ -1920,7 +1896,8 @@ goal: schema::PoseStamped {
                 Box::new(move |shutdown, ready| {
                     Box::pin(run_surface_scheduler_with_transport(scheduler_spec, scheduler_hub, scheduler_transport, shutdown, ready, configured.follower.max_observation_age_sec.map(Duration::from_secs_f64), async move {
                             // 此夹具发布完整静态地图，注册原帧接线由专门的流测试验证。
-                            let local = nuwax_nav_runtime::qualification_static_surface_backend(configured.follower)?;
+                            let mut local = nuwax_nav_runtime::SurfaceFollower::new(configured.follower)?;
+                            local.enable_author_static_map_fixture(true);
                             let pair=nuwax_nav_runtime::spawn_scheduler(nuwax_nav_runtime::NavScheduler::new(
                                 RecordingMotion(motion_calls),local,scheduler_config)?);
                             sender.send(pair.0.clone()).unwrap();

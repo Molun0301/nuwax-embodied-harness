@@ -105,11 +105,6 @@ impl FineMapReader {
             lcm_url,
         })
     }
-    #[cfg(feature = "surface-source-qualification")]
-    pub(super) fn from_admitted_receiver(receiver: Receiver) -> Self {
-        Self { receiver, client: None, lcm_url: "memq://".into() }
-    }
-
     pub(super) fn receive(
         &mut self,
         message: &schema::NavigationMap3D,

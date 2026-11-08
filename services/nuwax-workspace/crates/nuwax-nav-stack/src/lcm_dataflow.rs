@@ -669,9 +669,6 @@ fn discard_pending_odometry_through(
 }
 
 #[cfg(feature = "guard-runtime")]
-const MAX_REPLACEABLE_POSE_BATCH: usize = 64;
-
-#[cfg(feature = "guard-runtime")]
 fn retain_newest_map_pose(
     newest: &mut Option<crate::map_pose::MapPoseObservation>,
     candidate: crate::map_pose::MapPoseObservation,
@@ -731,7 +728,7 @@ async fn run_map_pose_adapter(
             message = transforms.next() => {
                 let mut next = message;
                 let mut newest = None;
-                for index in 0..MAX_REPLACEABLE_POSE_BATCH {
+                loop {
                     let frame = required_frame(next, "map_pose_adapter.tf")?;
                     match ingest_map_pose_tf(&mut adapter, &frame.payload)? {
                         OwnerInput::Accepted(Some(observed)) => {
@@ -756,7 +753,6 @@ async fn run_map_pose_adapter(
                         }
                         OwnerInput::Rejected(reason) => diagnostics.reject("map_pose_adapter.tf", &reason),
                     }
-                    if index + 1 == MAX_REPLACEABLE_POSE_BATCH { break; }
                     match transforms.next().now_or_never() {
                         Some(message) => next = message,
                         None => break,
@@ -768,10 +764,9 @@ async fn run_map_pose_adapter(
                 }
             }
             message = odometry.next() => {
-                let mut next = message;
                 let mut newest = None;
-                for index in 0..MAX_REPLACEABLE_POSE_BATCH {
-                    let frame = required_frame(next, "map_pose_adapter.odometry")?;
+                {
+                    let frame = latest_pose_frame(message, &mut odometry, "map_pose_adapter.odometry")?;
                     match ingest_map_pose_odometry(&adapter, &frame.payload)? {
                         MapPoseOdometryIngress::Accepted(observed) => {
                             discard_pending_odometry_through(&mut pending_odometry, &observed)?;
@@ -790,11 +785,6 @@ async fn run_map_pose_adapter(
                         MapPoseOdometryIngress::Rejected(reason) => {
                             diagnostics.reject("map_pose_adapter.odometry", &reason);
                         }
-                    }
-                    if index + 1 == MAX_REPLACEABLE_POSE_BATCH { break; }
-                    match odometry.next().now_or_never() {
-                        Some(message) => next = message,
-                        None => break,
                     }
                 }
                 if let Some(observed) = newest {
@@ -869,6 +859,19 @@ struct GuardedPoseInput {
 }
 
 #[cfg(feature = "guard-runtime")]
+fn latest_pose_frame(
+    first: Option<TransportResult<RawLcmFrame>>,
+    poses: &mut LcmFrameStream,
+    name: &str,
+) -> NavStackResult<RawLcmFrame> {
+    let mut latest = required_frame(first, name)?;
+    while let Some(next) = poses.next().now_or_never() {
+        latest = required_frame(next, name)?;
+    }
+    Ok(latest)
+}
+
+#[cfg(feature = "guard-runtime")]
 fn drain_guarded_pose_input(
     first: Option<TransportResult<RawLcmFrame>>,
     poses: &mut LcmFrameStream,
@@ -877,50 +880,37 @@ fn drain_guarded_pose_input(
 ) -> NavStackResult<Option<GuardedPoseInput>> {
     let wall_now = std::time::SystemTime::now();
     let mono_now = tokio::time::Instant::now();
-    let mut next = first;
-    let mut newest: Option<GuardedPoseInput> = None;
-    for index in 0..MAX_REPLACEABLE_POSE_BATCH {
-        let frame = required_frame(next, "guarded_nav_scheduler.map_pose")?;
-        match decode_guarded_pose_input(&frame.payload)? {
-            OwnerInput::Accepted(mut candidate) => {
-                let valid = source_max_age.map(|maximum| {
-                    let unix = wall_now.duration_since(std::time::UNIX_EPOCH)
-                        .map_err(|_| "当前墙钟早于Unix纪元".to_string())?.as_nanos() as u64;
-                    let source = u64::try_from(candidate.pose.stamp.nanos)
-                        .ok().filter(|v| *v > 0).ok_or("位姿源时间必须为正")?;
-                    let age = nuwax_nav_types_messages::source_time::data_age_ns_at(source, unix)?;
-                    if u128::from(age) >= maximum.as_nanos() {
-                        return Err(format!("位姿来源数据已过期：{}毫秒", age / 1_000_000));
-                    }
-                    // 执行采集时刻继续保留真实经过的墙钟时间，来源判龄不能让它变新。
-                    let capture_age = nuwax_nav_types_messages::source_time::age_ns_at(source, unix)?;
-                    mono_now.checked_sub(Duration::from_nanos(capture_age))
-                        .ok_or_else(|| "位姿采集单调时刻下溢".into())
-                }).transpose();
-                match valid {
-                    Err(reason) => diagnostics.reject("guarded_nav_scheduler.map_pose", &reason),
-                    Ok(acquired_at) => {
-                        candidate.source_max_age = source_max_age;
-                        candidate.acquired_at = acquired_at.unwrap_or(mono_now);
-                        if newest.as_ref().is_none_or(|value| candidate.pose.stamp.nanos > value.pose.stamp.nanos) {
-                            newest = Some(candidate);
-                        }
-                    }
+    let frame = latest_pose_frame(first, poses, "guarded_nav_scheduler.map_pose")?;
+    match decode_guarded_pose_input(&frame.payload)? {
+        OwnerInput::Accepted(mut candidate) => {
+            let valid = source_max_age.map(|maximum| {
+                let unix = wall_now.duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| "当前墙钟早于Unix纪元".to_string())?.as_nanos() as u64;
+                let source = u64::try_from(candidate.pose.stamp.nanos)
+                    .ok().filter(|v| *v > 0).ok_or("位姿源时间必须为正")?;
+                let age = nuwax_nav_types_messages::source_time::data_age_ns_at(source, unix)?;
+                if u128::from(age) >= maximum.as_nanos() {
+                    return Err(format!("位姿来源数据已过期：{}毫秒", age / 1_000_000));
+                }
+                // 执行采集时刻继续保留真实经过的墙钟时间，来源判龄不能让它变新。
+                let capture_age = nuwax_nav_types_messages::source_time::age_ns_at(source, unix)?;
+                mono_now.checked_sub(Duration::from_nanos(capture_age))
+                    .ok_or_else(|| "位姿采集单调时刻下溢".into())
+            }).transpose();
+            match valid {
+                Err(reason) => diagnostics.reject("guarded_nav_scheduler.map_pose", &reason),
+                Ok(acquired_at) => {
+                    candidate.source_max_age = source_max_age;
+                    candidate.acquired_at = acquired_at.unwrap_or(mono_now);
+                    return Ok(Some(candidate));
                 }
             }
-            OwnerInput::Rejected(reason) => {
-                diagnostics.reject("guarded_nav_scheduler.map_pose", &reason)
-            }
         }
-        if index + 1 == MAX_REPLACEABLE_POSE_BATCH {
-            break;
-        }
-        match poses.next().now_or_never() {
-            Some(message) => next = message,
-            None => break,
+        OwnerInput::Rejected(reason) => {
+            diagnostics.reject("guarded_nav_scheduler.map_pose", &reason)
         }
     }
-    Ok(newest)
+    Ok(None)
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -1179,40 +1169,6 @@ async fn run_guarded_nav_scheduler(
 }
 
 #[cfg(feature = "guard-runtime")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GuardedNavSource {
-    Pose,
-    Costmap,
-    Status,
-    Goal,
-    Path,
-    Cancel,
-}
-
-#[cfg(feature = "guard-runtime")]
-impl GuardedNavSource {
-    const ORDER: [Self; 6] = [
-        Self::Pose,
-        Self::Costmap,
-        Self::Status,
-        Self::Goal,
-        Self::Path,
-        Self::Cancel,
-    ];
-
-    fn index(self) -> usize {
-        Self::ORDER
-            .iter()
-            .position(|source| *source == self)
-            .expect("guarded navigation source must belong to the source ring")
-    }
-
-    fn successor(self) -> Self {
-        Self::ORDER[(self.index() + 1) % Self::ORDER.len()]
-    }
-}
-
-#[cfg(feature = "guard-runtime")]
 enum GuardedMapFrame {
     Planar(RawLcmFrame),
     #[cfg(feature = "mls")]
@@ -1258,90 +1214,6 @@ enum GuardedNavEvent {
 }
 
 #[cfg(feature = "guard-runtime")]
-impl GuardedNavEvent {
-    fn source(&self) -> GuardedNavSource {
-        match self {
-            Self::Pose(_) => GuardedNavSource::Pose,
-            Self::Costmap(_) => GuardedNavSource::Costmap,
-            Self::Status(_) => GuardedNavSource::Status,
-            Self::Goal(_) => GuardedNavSource::Goal,
-            Self::Path(_) => GuardedNavSource::Path,
-            Self::Cancel(_) => GuardedNavSource::Cancel,
-        }
-    }
-}
-
-#[cfg(feature = "guard-runtime")]
-struct GuardedNavArbiter {
-    cursor: GuardedNavSource,
-}
-
-#[cfg(feature = "guard-runtime")]
-impl Default for GuardedNavArbiter {
-    fn default() -> Self {
-        Self {
-            cursor: GuardedNavSource::Pose,
-        }
-    }
-}
-
-#[cfg(feature = "guard-runtime")]
-impl GuardedNavArbiter {
-    fn source_at(&self, offset: usize) -> GuardedNavSource {
-        GuardedNavSource::ORDER[(self.cursor.index() + offset) % GuardedNavSource::ORDER.len()]
-    }
-
-    fn record_dispatch(&mut self, source: GuardedNavSource) {
-        self.cursor = source.successor();
-    }
-
-    #[cfg(test)]
-    fn choose_ready(&mut self, ready: [bool; 6]) -> Option<GuardedNavSource> {
-        let winner = (0..GuardedNavSource::ORDER.len())
-            .map(|offset| self.source_at(offset))
-            .find(|source| ready[source.index()]);
-        if let Some(source) = winner {
-            self.record_dispatch(source);
-        }
-        winner
-    }
-}
-
-#[cfg(feature = "guard-runtime")]
-fn scan_guarded_nav_event<M, T>(
-    arbiter: &GuardedNavArbiter,
-    goals: &mut LcmFrameStream,
-    poses: &mut LcmFrameStream,
-    paths: &mut LcmFrameStream,
-    costmaps: &mut M,
-    cancels: &mut LcmFrameStream,
-    status: &mut tokio::sync::watch::Receiver<nuwax_nav_runtime::SchedulerStatus>,
-) -> Option<GuardedNavEvent>
-where
-    M: Stream<Item = TransportResult<T>> + Unpin,
-    T: Into<GuardedMapFrame>,
-{
-    for offset in 0..GuardedNavSource::ORDER.len() {
-        let event = match arbiter.source_at(offset) {
-            GuardedNavSource::Pose => poses.next().now_or_never().map(GuardedNavEvent::Pose),
-            GuardedNavSource::Costmap => costmaps.next().now_or_never().map(|message| {
-                GuardedNavEvent::Costmap(message.map(|frame| frame.map(Into::into)))
-            }),
-            GuardedNavSource::Status => {
-                status.changed().now_or_never().map(GuardedNavEvent::Status)
-            }
-            GuardedNavSource::Goal => goals.next().now_or_never().map(GuardedNavEvent::Goal),
-            GuardedNavSource::Path => paths.next().now_or_never().map(GuardedNavEvent::Path),
-            GuardedNavSource::Cancel => cancels.next().now_or_never().map(GuardedNavEvent::Cancel),
-        };
-        if event.is_some() {
-            return event;
-        }
-    }
-    None
-}
-
-#[cfg(feature = "guard-runtime")]
 async fn wait_guarded_nav_event<M, T>(
     goals: &mut LcmFrameStream,
     poses: &mut LcmFrameStream,
@@ -1361,14 +1233,6 @@ where
         message = goals.next() => GuardedNavEvent::Goal(message),
         message = paths.next() => GuardedNavEvent::Path(message),
         message = cancels.next() => GuardedNavEvent::Cancel(message),
-    }
-}
-
-#[cfg(feature = "guard-runtime")]
-fn guarded_nav_shutdown_requested(shutdown: &mut oneshot::Receiver<()>) -> bool {
-    match shutdown.try_recv() {
-        Ok(()) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => true,
-        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => false,
     }
 }
 
@@ -1395,14 +1259,12 @@ where
     T: Into<GuardedMapFrame> + Send,
 {
     let process_runtime_generation = runtime_generation();
-    let authoritative_planner_generation = saturating_i64(process_runtime_generation);
     let mut telemetry = GuardedNavTelemetry {
         runtime_generation: process_runtime_generation,
         surface_navigation: node.id == "surface_nav_scheduler",
         ..GuardedNavTelemetry::default()
     };
     let mut active_session: Option<schema::NavigationGoal> = None;
-    let mut accepted_planner_generation: Option<(GoalKey, i64)> = None;
     let mut goal_buffer = PlannerGoalBuffer::default();
     let mut surface_authority: Option<GuardedMapAuthority> = None;
     #[cfg(feature="mls")]
@@ -1413,8 +1275,6 @@ where
     }
     let mut planar_admission=nuwax_codec::lcm::planar_navigation::Admission::default();
     let mut publications = GuardedStatusPublications::default();
-    #[cfg(all(test,feature="surface-recovery-qualification"))]
-    { publications.qualification_timing=scheduler.qualification_timing().cloned(); }
     let mut diagnostics = InputDiagnosticLimiter::default();
 
     let initial_status = status.borrow().clone();
@@ -1428,37 +1288,14 @@ where
     )
     .await?;
 
-    let mut arbiter = GuardedNavArbiter::default();
     loop {
-        if guarded_nav_shutdown_requested(&mut shutdown) {
-            return Ok(());
-        }
-        let event = if let Some(event) = scan_guarded_nav_event(
-            &arbiter,
-            &mut goals,
-            &mut poses,
-            &mut paths,
-            &mut costmaps,
-            &mut cancels,
-            &mut status,
-        ) {
-            event
-        } else {
-            tokio::select! {
-                biased;
-                _ = &mut shutdown => return Ok(()),
-                event = wait_guarded_nav_event(
-                    &mut goals,
-                    &mut poses,
-                    &mut paths,
-                    &mut costmaps,
-                    &mut cancels,
-                    &mut status,
-                ) => event,
-            }
+        let event = tokio::select! {
+            biased;
+            _ = &mut shutdown => return Ok(()),
+            event = wait_guarded_nav_event(
+                &mut goals, &mut poses, &mut paths, &mut costmaps, &mut cancels, &mut status,
+            ) => event,
         };
-        let source = event.source();
-        arbiter.record_dispatch(source);
         match event {
             GuardedNavEvent::Status(changed) => {
                 changed.map_err(|_| {
@@ -1468,8 +1305,6 @@ where
                 publish_guarded_tail_observation(transport, node, snapshot, &mut telemetry, None, &mut publications, &mut active_session).await?;
             }
             GuardedNavEvent::Pose(message) => {
-                #[cfg(all(test,feature="surface-recovery-qualification"))]
-                if let Some(t)=scheduler.qualification_timing() {t.mark("bridge.pose.selected",0);}
                 let Some(input) = drain_guarded_pose_input(
                     message,
                     &mut poses,
@@ -1480,12 +1315,8 @@ where
                     continue;
                 };
                 let source_age_limit = input.source_max_age;
-                #[cfg(all(test,feature="surface-recovery-qualification"))]
-                if let Some(t)=scheduler.qualification_timing() {t.mark("bridge.pose.drained",input.pose.stamp.nanos);}
                 let mut candidate_telemetry = telemetry.clone();
                 commit_guarded_pose_telemetry(&mut candidate_telemetry, &input);
-                #[cfg(all(test,feature="surface-recovery-qualification"))]
-                let pose_ack=scheduler.qualification_timing().map(|t|t.span("bridge.pose.scheduler_ack",input.pose.stamp.nanos));
                 let settlement = (async {
                     match source_age_limit {
                         Some(maximum) => scheduler
@@ -1493,8 +1324,6 @@ where
                         None => scheduler.update_odometry(input.pose).await,
                     }
                 }).await;
-                #[cfg(all(test,feature="surface-recovery-qualification"))]
-                drop(pose_ack);
                 let accepted = settlement.is_ok();
                 let ordinary = match settlement {
                     Ok(()) => { telemetry = candidate_telemetry; Ok(()) }
@@ -1585,8 +1414,6 @@ where
                     }
                     #[cfg(feature = "mls")]
                     GuardedMapFrame::Surface(update) => {
-                        #[cfg(all(test,feature="surface-recovery-qualification"))]
-                        if let Some(t)=scheduler.qualification_timing() {t.mark("bridge.map.prepared_received",update.source_timestamp_ns);}
                         let changed_domain = surface_authority
                             .as_ref()
                             .is_some_and(|previous| !previous.same_domain(&update.authority));
@@ -1672,12 +1499,8 @@ where
                 // 保留活动会话；只有显式替换目标才能抢占。
                 let mut candidate_telemetry = telemetry.clone();
                 commit_guarded_costmap_telemetry(&mut candidate_telemetry, &input);
-                #[cfg(all(test,feature="surface-recovery-qualification"))]
-                let map_ack=scheduler.qualification_timing().map(|t|t.span("bridge.map.scheduler_ack",input.observation.source_timestamp_ns));
                 let settlement = (scheduler.update_costmap_received(input.observation,
                         tokio::time::Instant::from_std(received_at.unwrap_or_else(Instant::now)))).await;
-                #[cfg(all(test,feature="surface-recovery-qualification"))]
-                drop(map_ack);
                 let accepted = settlement.is_ok();
                 let ordinary = match settlement {
                     Ok(()) => {
@@ -1836,37 +1659,6 @@ where
                     .await?;
                     continue;
                 }
-                if !planner_generation_matches_authority(
-                    path_envelope.planner_runtime_generation,
-                    authoritative_planner_generation,
-                ) {
-                    publish_guarded_rejection(
-                        transport,
-                        &node.outputs[1],
-                        scheduler.status(),
-                        &telemetry,
-                        "path",
-                        "PathEnvelope planner generation does not match the active nav-stack runtime",
-                    )
-                    .await?;
-                    continue;
-                }
-                if planner_generation_is_stale(
-                    accepted_planner_generation,
-                    active_goal.goal_key(),
-                    path_envelope.planner_runtime_generation,
-                ) {
-                    publish_guarded_rejection(
-                        transport,
-                        &node.outputs[1],
-                        scheduler.status(),
-                        &telemetry,
-                        "path",
-                        "PathEnvelope planner generation is stale for the active goal",
-                    )
-                    .await?;
-                    continue;
-                }
                 let path = match execution_path_from_schema(
                     &path_envelope.path,
                     node.id == "surface_nav_scheduler",
@@ -1885,7 +1677,6 @@ where
                         continue;
                     }
                 };
-                let active_goal_key = active_goal.goal_key();
                 let settlement = (scheduler
                     .submit_path(nuwax_nav_runtime::VersionedPath {
                         route_kind: if path_envelope.route_kind == 1 {nuwax_nav_runtime::RouteKind::Approach}
@@ -1922,8 +1713,6 @@ where
                     },
                     Ok(()) => {
                         {
-                            accepted_planner_generation = Some((active_goal_key,
-                                path_envelope.planner_runtime_generation));
                             telemetry.path_revision = path_envelope.path_revision;
                             telemetry.planner_runtime_generation = path_envelope.planner_runtime_generation;
                         }
@@ -1970,8 +1759,7 @@ where
                 if cancel.session_id.is_empty() {
                     goal_buffer = PlannerGoalBuffer::default();
                     goal_buffer.costmap_observed = surface_authority.is_some();
-                    accepted_planner_generation = None;
-                }
+                    }
             }
         }
     }
@@ -2203,28 +1991,9 @@ fn clear_terminal_session_after_publication(
 }
 
 #[cfg(feature = "guard-runtime")]
-fn planner_generation_matches_authority(candidate: i64, authoritative: i64) -> bool {
-    candidate == authoritative
-}
-
-#[cfg(feature = "guard-runtime")]
-fn planner_generation_is_stale(
-    accepted: Option<(GoalKey, i64)>,
-    active_goal_key: GoalKey,
-    candidate_generation: i64,
-) -> bool {
-    accepted.is_some_and(|(goal_key, generation)| {
-        goal_key == active_goal_key && candidate_generation < generation
-    })
-}
-
-#[cfg(feature = "guard-runtime")]
 fn validate_path_goal_correlation(path: &schema::PathEnvelope, goal: &schema::NavigationGoal) -> Result<(), String> {
-    if path.session_id != goal.session_id || path.motion_generation != goal.motion_generation {
+    if path.session_id != goal.session_id {
         return Err("PathEnvelope goal identity does not match the active NavigationGoal".into());
-    }
-    if path.path.header.frame_id != goal.goal.header.frame_id {
-        return Err("PathEnvelope frame does not match the active NavigationGoal".into());
     }
     Ok(())
 }
@@ -2298,8 +2067,6 @@ fn update_progress(telemetry: &mut GuardedNavTelemetry) {
 #[cfg(feature = "guard-runtime")]
 #[derive(Default)]
 struct GuardedStatusPublications {
-    #[cfg(all(test,feature="surface-recovery-qualification"))]
-    qualification_timing: Option<nuwax_nav_runtime::qualification_timing::TraceSink>,
     goal: Option<(String, i64)>,
     applied_commands: u64,
     last_terminal: Option<nuwax_nav_runtime::TerminalOutcome>,
@@ -2378,31 +2145,13 @@ async fn publish_guarded_nav_observation(
     planner_observation: Option<bool>,
     publications: &mut GuardedStatusPublications,
 ) -> NavStackResult<()> {
-    #[cfg(all(test,feature="surface-recovery-qualification"))]
-    let encode=publications.qualification_timing.as_ref().map(|t|t.span("bridge.observation.encode",status.costmap_source_timestamp_ns));
     let frames=publications.frames(node, &status, telemetry, planner_observation)?;
-    #[cfg(all(test,feature="surface-recovery-qualification"))]
-    drop(encode);
-    #[cfg(all(test,feature="surface-recovery-qualification"))]
-    if let Some(t)=publications.qualification_timing.as_ref() {t.count("bridge.observation.bytes",status.costmap_source_timestamp_ns,frames.iter().map(|f|f.payload.len() as u64).sum());}
-    #[cfg(all(test,feature="surface-recovery-qualification"))]
-    let fixture_copy=publications.qualification_timing.as_ref().map(|t|t.span("bridge.observation.fixture_receipt_copy",status.costmap_source_timestamp_ns));
-    #[cfg(test)]
-    let receipts=frames.iter().map(|frame|frame.payload.to_vec()).collect::<Vec<_>>();
-    #[cfg(all(test,feature="surface-recovery-qualification"))]
-    drop(fixture_copy);
 
-    #[cfg(all(test,feature="surface-recovery-qualification"))]
-    let publish=publications.qualification_timing.as_ref().map(|t|t.span("bridge.observation.publish_ack",status.costmap_source_timestamp_ns));
     transport
         .publish_batch(frames)
         .await
         .map_err(|error| NavStackError::Internal(format!("publish guard status batch: {error}")))?;
-    #[cfg(all(test,feature="surface-recovery-qualification"))]
-    drop(publish);
 
-    #[cfg(test)]
-    guarded_tests::record_test_publication(&receipts);
     Ok(())
 }
 
@@ -6542,46 +6291,51 @@ mod guarded_tests {
     }
 
     use super::*;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum GuardedNavSource {
+        Pose,
+        Costmap,
+        Status,
+        Goal,
+        Path,
+        Cancel,
+    }
+
+    impl GuardedNavSource {
+        const ORDER: [Self; 6] = [
+            Self::Pose,
+            Self::Costmap,
+            Self::Status,
+            Self::Goal,
+            Self::Path,
+            Self::Cancel,
+        ];
+
+        fn index(self) -> usize {
+            Self::ORDER
+                .iter()
+                .position(|source| *source == self)
+                .expect("guarded navigation source must belong to the source ring")
+        }
+
+    }
+
+    fn event_source(event: &GuardedNavEvent) -> GuardedNavSource {
+        match event {
+            GuardedNavEvent::Pose(_) => GuardedNavSource::Pose,
+            GuardedNavEvent::Costmap(_) => GuardedNavSource::Costmap,
+            GuardedNavEvent::Status(_) => GuardedNavSource::Status,
+            GuardedNavEvent::Goal(_) => GuardedNavSource::Goal,
+            GuardedNavEvent::Path(_) => GuardedNavSource::Path,
+            GuardedNavEvent::Cancel(_) => GuardedNavSource::Cancel,
+        }
+    }
     use futures::channel::mpsc::{unbounded, UnboundedSender};
     use nuwax_nav_runtime::{NavMotionPort, NavSchedulerHandle, RuntimeError, SchedulerPhase, TerminalOutcome};
     use tokio::task::JoinHandle;
 
-    #[test]
-    fn arbiter_rotates_all_simultaneously_ready_sources() {
-        let mut arbiter = GuardedNavArbiter::default();
-        let selected = (0..GuardedNavSource::ORDER.len())
-            .map(|_| arbiter.choose_ready([true; 6]).expect("ready source"))
-            .collect::<Vec<_>>();
-
-        assert_eq!(selected, GuardedNavSource::ORDER);
-        assert_eq!(arbiter.cursor, GuardedNavSource::Pose);
-    }
-
-    #[test]
-    fn arbiter_bounds_pose_and_costmap_under_continuous_status() {
-        let mut arbiter = GuardedNavArbiter::default();
-        let ready = [true, true, true, false, false, false];
-        let selected = (0..9)
-            .map(|_| arbiter.choose_ready(ready).expect("live planner input"))
-            .collect::<Vec<_>>();
-
-        for source in [
-            GuardedNavSource::Pose,
-            GuardedNavSource::Costmap,
-            GuardedNavSource::Status,
-        ] {
-            let positions = selected
-                .iter()
-                .enumerate()
-                .filter_map(|(index, selected)| (*selected == source).then_some(index))
-                .collect::<Vec<_>>();
-            assert_eq!(positions.len(), 3);
-            assert!(positions.windows(2).all(|pair| pair[1] - pair[0] <= 3));
-        }
-    }
-
     #[tokio::test]
-    async fn arbiter_keeps_status_twist_and_zero_live_under_continuous_inputs() {
+    async fn status_twist_and_zero_stay_live_under_continuous_inputs() {
         let mut harness = GuardedLoopHarness::spawn().await;
         let goal = activate_map_a(&harness).await;
         harness.send_path(&sealed_path(&goal));
@@ -6606,7 +6360,6 @@ mod guarded_tests {
         let mut status = harness.scheduler.subscribe_status();
         let feeder =
             GuardedContentionFeeder::spawn(harness.poses.clone(), harness.costmaps.clone(), goal.goal.pose.position);
-        harness.publication_probe.lock().unwrap().ledgers=Some((Arc::clone(&feeder.pose_ledger),Arc::clone(&feeder.costmap_ledger)));
 
         tokio::time::timeout(Duration::from_secs(1), async {
             while status.borrow().applied_commands <= applied_baseline {
@@ -6618,8 +6371,7 @@ mod guarded_tests {
         })
         .await
         .expect("post-baseline applied command");
-        let twist_ready_dispatch = feeder.dequeued_by_source();
-        let (applied,receipt) = tokio::time::timeout(Duration::from_secs(1), async {
+        let applied = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let frame = harness
                     .commands
@@ -6634,14 +6386,13 @@ mod guarded_tests {
                     && twist.linear[1] == expected_twist.linear.y
                     && twist.angular[2] == expected_twist.angular_z
                 {
-                    return (twist,frame.payload.to_vec());
+                    return twist;
                 }
             }
         })
         .await
         .expect("bounded status Twist publication");
         feeder.assert_ready_evidence("Twist");
-        feeder.assert_status_dispatch_bound(twist_ready_dispatch,harness.publication_dispatches(&receipt).await);
         assert_eq!(applied.linear[0], expected_twist.linear.x);
         assert_eq!(applied.linear[1], expected_twist.linear.y);
         assert_eq!(applied.angular[2], expected_twist.angular_z);
@@ -6657,9 +6408,8 @@ mod guarded_tests {
         })
         .await
         .expect("Succeeded terminal status");
-        let terminal_ready_dispatch = feeder.dequeued_by_source();
 
-        let (zero,receipt) = tokio::time::timeout(Duration::from_secs(1), async {
+        let zero = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let frame = harness
                     .commands
@@ -6671,18 +6421,17 @@ mod guarded_tests {
                     schema::decode_twist(&prefixed(schema::TWIST_FINGERPRINT, &frame.payload))
                         .expect("real status ZERO");
                 if twist.linear == [0.0; 3] && twist.angular == [0.0; 3] {
-                    return (twist,frame.payload.to_vec());
+                    return twist;
                 }
             }
         })
         .await
         .expect("bounded status ZERO publication");
         feeder.assert_ready_evidence("ZERO");
-        feeder.assert_status_dispatch_bound(terminal_ready_dispatch,harness.publication_dispatches(&receipt).await);
         assert_eq!(zero.linear, [0.0; 3]);
         assert_eq!(zero.angular, [0.0; 3]);
 
-        let (reached,receipt) = tokio::time::timeout(Duration::from_secs(1), async {
+        let reached = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let frame = harness
                     .reached
@@ -6692,17 +6441,16 @@ mod guarded_tests {
                     .expect("reached frame");
                 let reached = schema::decode_bool_body(&frame.payload).expect("Succeeded bool");
                 if reached.data {
-                    return (reached,frame.payload.to_vec());
+                    return reached;
                 }
             }
         })
         .await
         .expect("bounded Succeeded bool publication");
         feeder.assert_ready_evidence("Succeeded Bool");
-        feeder.assert_status_dispatch_bound(terminal_ready_dispatch,harness.publication_dispatches(&receipt).await);
         assert!(reached.data);
 
-        let (terminal,receipt) = tokio::time::timeout(Duration::from_secs(1), async {
+        let _terminal = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let frame = harness
                     .states
@@ -6715,14 +6463,13 @@ mod guarded_tests {
                 if state.session_id == goal.session_id
                     && state.state == 3
                 {
-                    return (state,frame.payload.to_vec());
+                    return state;
                 }
             }
         })
         .await
         .expect("bounded terminal NavigationStatus publication");
         feeder.assert_ready_evidence("terminal NavigationStatus");
-        feeder.assert_status_dispatch_bound(terminal_ready_dispatch,harness.publication_dispatches(&receipt).await);
         assert_eq!(
             harness.scheduler.status().last_terminal,
             Some(TerminalOutcome::Succeeded)
@@ -6735,93 +6482,8 @@ mod guarded_tests {
         harness.shutdown().await;
     }
 
-    #[test]
-    fn arbiter_bounds_every_ready_source() {
-        for target in GuardedNavSource::ORDER {
-            let mut arbiter = GuardedNavArbiter {
-                cursor: target.successor(),
-            };
-            let mut ready = [true; 6];
-            let mut preceding_dispatches = 0;
-            loop {
-                let selected = arbiter.choose_ready(ready).expect("ready source");
-                if selected == target {
-                    break;
-                }
-                ready[selected.index()] = false;
-                preceding_dispatches += 1;
-            }
-            assert!(
-                preceding_dispatches <= 5,
-                "{target:?} waited for {preceding_dispatches} handlers"
-            );
-        }
-    }
-
     #[tokio::test]
-    async fn arbiter_allows_one_wake_race_then_restores_rotation() {
-        let (_goals_tx, mut goals) = guarded_test_stream();
-        let (_poses_tx, mut poses) = guarded_test_stream();
-        let (paths_tx, mut paths) = guarded_test_stream();
-        let (_costmaps_tx, mut costmaps) = guarded_test_stream();
-        let (_cancels_tx, mut cancels) = guarded_test_stream();
-        let (_status_tx, mut status) =
-            tokio::sync::watch::channel(nuwax_nav_runtime::SchedulerStatus::default());
-        let waiting = wait_guarded_nav_event(
-            &mut goals,
-            &mut poses,
-            &mut paths,
-            &mut costmaps,
-            &mut cancels,
-            &mut status,
-        );
-        tokio::pin!(waiting);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), waiting.as_mut())
-                .await
-                .is_err(),
-            "all-pending sources must await a wake"
-        );
-
-        send_guarded_test_body(&paths_tx, "nuwax_msgs.PathEnvelope", vec![0]);
-        let wake = tokio::time::timeout(Duration::from_secs(1), waiting.as_mut())
-            .await
-            .expect("path wake");
-        assert_eq!(wake.source(), GuardedNavSource::Path);
-
-        let mut arbiter = GuardedNavArbiter::default();
-        arbiter.record_dispatch(wake.source());
-        assert_eq!(
-            arbiter.choose_ready([true; 6]),
-            Some(GuardedNavSource::Cancel),
-            "the wake winner must move the next scan to its successor"
-        );
-        assert_eq!(
-            arbiter.choose_ready([true; 6]),
-            Some(GuardedNavSource::Pose)
-        );
-    }
-
-    #[test]
-    fn arbiter_shutdown_preempts_ready_work() {
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
-        shutdown_tx.send(()).expect("shutdown receiver");
-        let arbiter = GuardedNavArbiter::default();
-
-        assert!(guarded_nav_shutdown_requested(&mut shutdown_rx));
-        assert_eq!(
-            arbiter.cursor,
-            GuardedNavSource::Pose,
-            "ready inputs must not advance the cursor after shutdown"
-        );
-
-        let (closed_tx, mut closed_rx) = oneshot::channel::<()>();
-        drop(closed_tx);
-        assert!(guarded_nav_shutdown_requested(&mut closed_rx));
-    }
-
-    #[tokio::test]
-    async fn arbiter_propagates_required_stream_close() {
+    async fn input_wait_propagates_required_stream_close() {
         for source in GuardedNavSource::ORDER {
             let (goals_tx, mut goals) = guarded_test_stream();
             let (poses_tx, mut poses) = guarded_test_stream();
@@ -6856,9 +6518,7 @@ mod guarded_tests {
                     payload.clone(),
                 ),
             }
-            let arbiter = GuardedNavArbiter { cursor: source };
-            let event = scan_guarded_nav_event(
-                &arbiter,
+            let event = wait_guarded_nav_event(
                 &mut goals,
                 &mut poses,
                 &mut paths,
@@ -6866,8 +6526,8 @@ mod guarded_tests {
                 &mut cancels,
                 &mut status,
             )
-            .expect("ready source mapping");
-            assert_eq!(event.source(), source);
+            .now_or_never().expect("ready source mapping");
+            assert_eq!(event_source(&event), source);
             match event {
                 GuardedNavEvent::Pose(Some(Ok(frame)))
                 | GuardedNavEvent::Goal(Some(Ok(frame)))
@@ -6905,8 +6565,7 @@ mod guarded_tests {
                 GuardedNavSource::Cancel => cancels_tx.close_channel(),
                 GuardedNavSource::Status => unreachable!("watch is covered separately"),
             }
-            let event = scan_guarded_nav_event(
-                &GuardedNavArbiter { cursor: source },
+            let event = wait_guarded_nav_event(
                 &mut goals,
                 &mut poses,
                 &mut paths,
@@ -6914,8 +6573,8 @@ mod guarded_tests {
                 &mut cancels,
                 &mut status,
             )
-            .expect("closed stream is Ready");
-            assert_eq!(event.source(), source);
+            .now_or_never().expect("closed stream is Ready");
+            assert_eq!(event_source(&event), source);
             assert!(matches!(
                 event,
                 GuardedNavEvent::Pose(None)
@@ -6969,7 +6628,7 @@ mod guarded_tests {
     }
 
     #[tokio::test]
-    async fn arbiter_propagates_status_close() {
+    async fn input_wait_propagates_status_close() {
         let (_goals_tx, mut goals) = guarded_test_stream();
         let (_poses_tx, mut poses) = guarded_test_stream();
         let (_paths_tx, mut paths) = guarded_test_stream();
@@ -6978,10 +6637,7 @@ mod guarded_tests {
         let (status_tx, mut status) =
             tokio::sync::watch::channel(nuwax_nav_runtime::SchedulerStatus::default());
         drop(status_tx);
-        let event = scan_guarded_nav_event(
-            &GuardedNavArbiter {
-                cursor: GuardedNavSource::Status,
-            },
+        let event = wait_guarded_nav_event(
             &mut goals,
             &mut poses,
             &mut paths,
@@ -6989,7 +6645,7 @@ mod guarded_tests {
             &mut cancels,
             &mut status,
         )
-        .expect("closed watch is Ready");
+        .now_or_never().expect("closed watch is Ready");
         assert!(matches!(event, GuardedNavEvent::Status(Err(_))));
 
         for source in [
@@ -7005,7 +6661,7 @@ mod guarded_tests {
     }
 
     #[test]
-    fn arbiter_preserves_reject_and_fail_closed_paths() {
+    fn input_errors_preserve_reject_and_fail_closed_paths() {
         assert!(matches!(
             runtime_input_error::<()>(
                 "guarded arbitration",
@@ -7339,29 +6995,6 @@ path: schema::Path {
             );
         }
 
-        fn dequeued_by_source(&self) -> (usize, usize) {
-            (
-                self.pose_ledger
-                    .dequeued
-                    .load(std::sync::atomic::Ordering::SeqCst),
-                self.costmap_ledger
-                    .dequeued
-                    .load(std::sync::atomic::Ordering::SeqCst),
-            )
-        }
-
-        fn assert_status_dispatch_bound(&self, before: (usize, usize),after:(usize,usize)) {
-            // 状态就绪后最多分派一次位姿批次和一次地图；合并读取不等于多次分派。
-            assert!(
-                after.0.saturating_sub(before.0) <= MAX_REPLACEABLE_POSE_BATCH,
-                "状态发送前消费超过一个位姿批次"
-            );
-            assert!(
-                after.1.saturating_sub(before.1) <= 1,
-                "状态发送前分派超过一次地图输入"
-            );
-        }
-
         async fn stop(self) -> Result<(), String> {
             let stop_error = self
                 .stop
@@ -7488,22 +7121,6 @@ path: schema::Path {
         assert!(normal_b.load(std::sync::atomic::Ordering::SeqCst));
     }
 
-    #[derive(Default)]
-    struct PublicationProbe {
-            ledgers:Option<(Arc<GuardedDequeueLedger>,Arc<GuardedDequeueLedger>)>,
-        entries:std::collections::BTreeMap<Vec<u8>,(usize,usize)>,
-    }
-    tokio::task_local! {static PUBLICATION_PROBE:Arc<Mutex<PublicationProbe>>;}
-    pub(super) fn record_test_publication(receipts:&[Vec<u8>]) {
-        let _=PUBLICATION_PROBE.try_with(|probe| {
-            let mut probe=probe.lock().unwrap();
-            if let Some((pose,map))=&probe.ledgers {
-                let counts=(pose.dequeued.load(std::sync::atomic::Ordering::SeqCst),map.dequeued.load(std::sync::atomic::Ordering::SeqCst));
-                for payload in receipts {probe.entries.entry(payload.clone()).or_insert(counts);}
-            }
-        });
-    }
-
     struct GuardedLoopHarness {
         goals: GuardedTestSender,
         poses: GuardedTestSender,
@@ -7511,7 +7128,6 @@ path: schema::Path {
         costmaps: GuardedTestSender,
         cancels: GuardedTestSender,
         commands: LcmFrameStream,
-        publication_probe:Arc<Mutex<PublicationProbe>>,
         states: LcmFrameStream,
         reached: LcmFrameStream,
         shutdown: Option<oneshot::Sender<()>>,
@@ -7524,15 +7140,6 @@ path: schema::Path {
     }
 
     impl GuardedLoopHarness {
-        async fn publication_dispatches(&self,payload:&[u8])->(usize,usize) {
-            // 网络接收者可能先于发送者的完成回调被唤醒，等待同一载荷回执落地。
-            tokio::time::timeout(Duration::from_secs(1),async {
-                loop {
-                    if let Some(counts)=self.publication_probe.lock().unwrap().entries.get(payload).copied(){return counts;}
-                    tokio::task::yield_now().await;
-                }
-            }).await.expect("真实发送回执未落地")
-        }
         async fn spawn() -> Self {Self::spawn_with_planar_mode(false).await}
 
         async fn spawn_with_planar_mode(planar_mode:bool) -> Self {
@@ -7615,11 +7222,10 @@ path: schema::Path {
                 .await
                 .expect("guarded reached test stream");
             let loop_transport = transport.clone();
-            let publication_probe=Arc::new(Mutex::new(PublicationProbe::default()));
-            let loop_task = tokio::spawn(PUBLICATION_PROBE.scope(Arc::clone(&publication_probe),async move {
+            let loop_task = tokio::spawn(async move {
                 run_guarded_nav_loop(&node, &loop_transport, &loop_scheduler, shutdown_rx, goal_stream, pose_stream, path_stream, costmap_stream, cancel_stream, status, None, planar_mode, body_reference, None)
                 .await
-            }));
+            });
 
             Self {
                 goals,
@@ -7628,7 +7234,6 @@ path: schema::Path {
                 costmaps,
                 cancels,
                 commands,
-                publication_probe,
                 states,
                 reached,
                 shutdown: Some(shutdown),
@@ -8108,60 +7713,6 @@ path: schema::Path {
 
 
 
-    #[tokio::test]
-    async fn guarded_loop_rejects_old_planner_generation_as_the_first_path() {
-        let harness = GuardedLoopHarness::spawn().await;
-        let goal = activate_map_a(&harness).await;
-        let mut late = sealed_path(&goal);
-        late.planner_runtime_generation -= 1;
-        schema::validate_path_envelope(&late).expect("seal old-generation late path");
-
-        harness.send_path(&late);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(
-            harness.scheduler.status().path_revision,
-            0,
-            "old generation must be rejected before any current-generation path is accepted"
-        );
-
-        let current = sealed_path(&goal);
-        harness.send_path(&current);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while harness.scheduler.status().path_revision != 1 {
-                assert!(
-                    !harness.loop_task.is_finished(),
-                    "guarded loop exited early"
-                );
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("current-generation path was not accepted");
-
-        let mut higher_revision = current;
-        higher_revision.path_revision = 2;
-        higher_revision.path.header.stamp_nsec += 1;
-        schema::validate_path_envelope(&higher_revision)
-            .expect("seal same-generation higher-revision path");
-        harness.send_path(&higher_revision);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while harness.scheduler.status().path_revision != 2 {
-                assert!(
-                    !harness.loop_task.is_finished(),
-                    "guarded loop exited early"
-                );
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("same-generation higher path revision was not accepted");
-        harness.shutdown().await;
-    }
-
-
-
-
-
     async fn activate_map_a(harness: &GuardedLoopHarness) -> schema::NavigationGoal {
         let goal_a = sealed_goal("session-a");
         harness.send_pose(1);
@@ -8393,40 +7944,6 @@ path: schema::Path {
         harness.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn guarded_active_same_revision_mutation_preserves_original_execution() {
-        let mut harness = GuardedLoopHarness::spawn().await;
-        let goal = activate_map_a(&harness).await;
-        let path = sealed_path(&goal);
-        harness.send_path(&path);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while harness.scheduler.status().path_revision != 1 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("original path accepted");
-
-        let mut mutation = path;
-        mutation.path.poses[0].pose.position[0] += 0.25;
-        schema::validate_path_envelope(&mutation).expect("seal same-revision mutation");
-        harness.send_path(&mutation);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let frame = harness.states.next().await.unwrap().unwrap();
-                let state = schema::decode_navigation_status_body(&frame.payload).unwrap();
-                if state.message.contains("versioned path mutation detected") { break; }
-            }
-        }).await.expect("同修订变化须通过真实状态流发布拒绝诊断");
-        let retained = harness.scheduler.status();
-        assert_eq!(retained.phase, SchedulerPhase::Controlling);
-        assert_eq!(retained.last_terminal, None);
-        assert_eq!(retained.session_id.as_deref(), Some(goal.session_id.as_str()));
-        assert_eq!(retained.path_revision, 1);
-
-        harness.shutdown().await;
-    }
-
     #[test]
     fn terminal_cleanup_allows_continuous_a_then_b_without_busy_preempt() {
         let mut active = Some(active_goal("goal-a"));
@@ -8639,61 +8156,8 @@ path: schema::Path {
         validate_path_goal_correlation(&path, &goal).expect("correlated path");
 
         let mut foreign_path = path.clone();
-        foreign_path.motion_generation += 1;
+        foreign_path.session_id.push_str("-other");
         assert!(validate_path_goal_correlation(&foreign_path, &goal).is_err());
-
-        let mut wrong_producer_generation = path.clone();
-        wrong_producer_generation.motion_generation += 1;
-        assert!(validate_path_goal_correlation(&wrong_producer_generation, &goal).is_err());
-
-        let authoritative = saturating_i64(runtime_generation());
-        assert_eq!(runtime_generation(), runtime_generation());
-        assert!(planner_generation_matches_authority(
-            authoritative,
-            authoritative
-        ));
-        assert!(!planner_generation_matches_authority(
-            authoritative - 1,
-            authoritative
-        ));
-        assert!(!planner_generation_matches_authority(
-            authoritative + 1,
-            authoritative
-        ));
-        assert!(
-            !planner_generation_matches_authority(authoritative - 1, authoritative)
-                && !planner_generation_is_stale(None, goal.goal_key(), authoritative - 1),
-            "an old-process late path is rejected even when it arrives before the new generation"
-        );
-        assert!(
-            planner_generation_matches_authority(authoritative, authoritative)
-                && !planner_generation_is_stale(
-                    Some((goal.goal_key(), authoritative)),
-                    goal.goal_key(),
-                    authoritative,
-                ),
-            "same-generation higher path revisions remain eligible for scheduler ordering"
-        );
-
-        let accepted = Some((goal.goal_key(), 12));
-        assert!(planner_generation_is_stale(
-            accepted,
-            goal.goal_key(),
-            11
-        ));
-        assert!(!planner_generation_is_stale(
-            accepted,
-            goal.goal_key(),
-            12
-        ));
-        assert!(!planner_generation_is_stale(
-            accepted,
-            goal.goal_key(),
-            13
-        ));
-        let mut new_goal_key = goal.goal_key();
-        new_goal_key.producer_runtime_generation += 1;
-        assert!(!planner_generation_is_stale(accepted, new_goal_key, 1));
 
         let cancel = schema::CancelNavigation {
             session_id: goal.session_id.clone(),
@@ -8775,7 +8239,7 @@ path: schema::Path {
     }
 
     #[test]
-    fn queued_pose_keeps_latest_valid_sample_and_preserves_stream_failure() {
+    fn queued_pose_uses_only_last_frame_and_preserves_stream_failure() {
         let (sender, mut poses) = guarded_test_stream();
         let make = |stamp| {
             build_body_frame(
@@ -8785,20 +8249,15 @@ path: schema::Path {
             )
             .unwrap()
         };
-        sender.unbounded_send((Ok(make(3)), None, None)).unwrap();
+        for stamp in 3..103 {
+            sender.unbounded_send((Ok(make(stamp)), None, None)).unwrap();
+        }
         sender.unbounded_send((Ok(make(2)), None, None)).unwrap();
-        sender
-            .unbounded_send((
-                Ok(build_body_frame("/test/pose", "geometry_msgs.PoseStamped", vec![255]).unwrap()),
-                None,
-                None,
-            ))
-            .unwrap();
         let mut diagnostics = InputDiagnosticLimiter::default();
         let input = drain_guarded_pose_input(Some(Ok(make(1))), &mut poses, &mut diagnostics, None)
             .unwrap()
             .unwrap();
-        assert_eq!(input.pose.stamp.nanos, 3_000_000_000);
+        assert_eq!(input.pose.stamp.nanos, 2_000_000_000);
         drop(sender);
         assert!(
             drain_guarded_pose_input(Some(Ok(make(4))), &mut poses, &mut diagnostics, None)
@@ -8807,7 +8266,7 @@ path: schema::Path {
     }
 
     #[test]
-    fn queued_future_pose_cannot_discard_a_valid_sample() {
+    fn queued_latest_future_pose_is_rejected() {
         let (sender, mut poses) = guarded_test_stream();
         let current = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -8843,9 +8302,8 @@ path: schema::Path {
             &mut InputDiagnosticLimiter::default(),
             Some(Duration::from_millis(500)),
         )
-        .unwrap()
         .unwrap();
-        assert_eq!(input.pose.stamp.nanos, current.as_nanos() as i64);
+        assert!(input.is_none());
     }
 
     #[test]

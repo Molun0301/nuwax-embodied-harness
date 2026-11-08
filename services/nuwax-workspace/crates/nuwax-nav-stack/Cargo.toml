@@ -33,14 +33,6 @@ description = "Navigation stack orchestration for the nuwax robot platform (prof
 # ============================================================
 [features]
 default = []
-# Explicit in-process immutable-source integration qualification only.
-surface-source-qualification = ["mls"]
-# Opt-in real-owner/worker recovery qualification; absent from default builds.
-surface-recovery-qualification = [
-    "mls",
-    "nuwax-nav-runtime/surface-recovery-qualification",
-]
-
 # ---- Foundation(强制打开,因为 types-messages 是核心协议层)----
 foundation = [
     "dep:nuwax-nav-types-messages",
@@ -234,8 +226,8 @@ nuwax-config = { path = "../nuwax-config", features = ["test-support"] }
 
 nuwax-motion-safety-guard = { path = "../nuwax-motion-safety-guard" }
 prost = { workspace = true }
-# 公共通信测试使用生产同一规划工作线程，避免同步计算阻塞采样。
-nuwax-nav-runtime = { path = "../nuwax-nav-runtime", features = ["surface-recovery-qualification"] }
+# 公共通信测试直接构造运行时规划器。
+nuwax-nav-runtime = { path = "../nuwax-nav-runtime" }
 # Offline frozen-source diagnostic; no runtime dependency or new external package.
 async-trait = { workspace = true }
 # 单元测试可读 fixture / JSON

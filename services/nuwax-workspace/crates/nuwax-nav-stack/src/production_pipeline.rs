@@ -1,98 +1,36 @@
-//! 建图、探索和导航的固定生产配对，供几何拥有方和导航入口共同捕获。
+//! 由现行配置选择固定的三维或二维执行链。
+use crate::{NavStackError, NavStackResult};
 
-use crate::{NavStackError, NavStackProfile, NavStackResult};
-
-/// 两条互斥的完整生产链。
+/// 两条固定生产链。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProductionPipeline {
-    /// 三维激光惯性建图、表面探索和多层地形导航。
+    /// 三维激光惯性建图、表面探索与地形导航。
     Lio3D,
-    /// 二维激光建图、波前探索和平面导航。
+    /// 二维激光建图、波前探索与平面导航。
     Slam2D,
 }
 
 impl ProductionPipeline {
-    /// 解析执行链并核对可选的显式导航值；不允许跨维度或静默回退。
-    pub fn from_settings(pipeline: Option<&str>, profile: Option<&str>) -> NavStackResult<Self> {
-        if pipeline.is_some_and(|value| value != value.trim()) {
-            return Err(NavStackError::invalid("geometry.pipeline不能包含首尾空白"));
-        }
-        let selected = match pipeline.map(str::trim).filter(|value| !value.is_empty()) {
-            None | Some("lio_3d") => Self::Lio3D,
-            Some("slam_2d") => Self::Slam2D,
-            Some(_) => {
-                return Err(NavStackError::invalid(
-                    "geometry.pipeline必须为lio_3d或slam_2d",
-                ));
-            }
-        };
-        if let Some(profile) = profile.map(str::trim).filter(|value| !value.is_empty()) {
-            let legacy_3d = selected == Self::Lio3D && profile == "mls-3d";
-            if !legacy_3d && profile != selected.navigation_profile().as_str() {
-                return Err(NavStackError::invalid(format!(
-                    "执行链{}固定使用{}导航，derived.nav_profile={}与执行链冲突；请移除该覆盖或改为{}",
-                    selected.as_str(),
-                    selected.navigation_profile().as_str(),
-                    profile,
-                    selected.navigation_profile().as_str(),
-                )));
-            }
-        }
-        Ok(selected)
-    }
-
-    /// 在创建生产资源前从合成配置捕获执行链。
+    /// 从合成配置读取实际执行链。
     pub fn from_runtime() -> NavStackResult<Self> {
-        let config = nuwax_config::geometry().map_err(NavStackError::InvalidConfig)?;
-        Self::from_settings(Some(&config.pipeline), None)
+        match nuwax_config::geometry().map_err(NavStackError::InvalidConfig)?.pipeline.as_str() {
+            "lio_3d" => Ok(Self::Lio3D),
+            "slam_2d" => Ok(Self::Slam2D),
+            value => Err(NavStackError::invalid(format!("未知执行链：{value}"))),
+        }
     }
 
-    /// 执行链的规范名称。
+    /// 解析启动器传入的导航配置；不再重复检查执行链配对。
+    pub fn from_profile(value: &str) -> NavStackResult<Self> {
+        match value {
+            "pct-scan-3d" => Ok(Self::Lio3D),
+            "simple-2d" => Ok(Self::Slam2D),
+            _ => Err(NavStackError::invalid(format!("未知导航配置：{value}"))),
+        }
+    }
+
+    /// 执行链的配置名称。
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Lio3D => "lio_3d",
-            Self::Slam2D => "slam_2d",
-        }
-    }
-
-    /// 执行链唯一允许的导航配置。
-    pub fn navigation_profile(self) -> NavStackProfile {
-        match self {
-            Self::Lio3D => NavStackProfile::Mls3D,
-            Self::Slam2D => NavStackProfile::Simple2D,
-        }
-    }
-
-    /// 校验实际将执行的配置，覆盖直接构造命令行选项的调用方。
-    pub fn validate_navigation(self, profile: NavStackProfile) -> NavStackResult<()> {
-        Self::from_settings(Some(self.as_str()), Some(profile.as_str())).map(|_| ())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn complete_pipelines_derive_and_reject_cross_dimension_execution() {
-        assert_eq!(
-            ProductionPipeline::from_settings(None, None).unwrap(),
-            ProductionPipeline::Lio3D
-        );
-        for pipeline in [ProductionPipeline::Slam2D, ProductionPipeline::Lio3D] {
-            for profile in NavStackProfile::all() {
-                let result = ProductionPipeline::from_settings(
-                    Some(pipeline.as_str()),
-                    Some(profile.as_str()),
-                );
-                assert_eq!(result.is_ok(), *profile == pipeline.navigation_profile());
-            }
-            assert_eq!(
-                ProductionPipeline::from_settings(Some(pipeline.as_str()), Some(" ")).unwrap(),
-                pipeline
-            );
-        }
-        assert!(ProductionPipeline::from_settings(Some("unknown"), None).is_err());
-        assert!(ProductionPipeline::from_settings(None, Some("unknown")).is_err());
+        match self { Self::Lio3D => "lio_3d", Self::Slam2D => "slam_2d" }
     }
 }

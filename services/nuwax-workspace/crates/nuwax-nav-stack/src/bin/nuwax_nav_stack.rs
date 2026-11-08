@@ -1,20 +1,7 @@
 // Copyright 2026 Nuwax.
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! `nuwax-nav-stack` CLI 入口。
-//!
-//! 设计原则:
-//! - **不引入** clap / structopt 等重 CLI 库,直接手工解析以避免 MSRV / edition 风险。
-//! - **不引入** DDS / ROS2 runtime / CUDA 默认依赖。
-//! - **不**在 build.rs 下载模型 / 二进制 / 访问网络。
-//! - 解析失败时打印 usage 并 exit(2),与 Unix 工具惯例一致。
-//!
-//! 用法:
-//! ```text
-//! nuwax-nav-stack --profile=cmu-native --dry-run
-//! nuwax-nav-stack --list-features
-//! nuwax-nav-stack --profile=simple-2d --preset=all --json
-//! ```
+//! 固定二维与三维导航任务的命令入口。
 
 use nuwax_nav_stack::bin_support::{self, CliOptions};
 

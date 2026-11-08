@@ -1,21 +1,5 @@
 [package]
-# 导航 stack 编排 crate
-# 严格遵循方案 §6.8:只编排,不持有算法
-# 关键约束:
-# - edition 2021、rust-version 1.88(workspace.package 一致)
-# - 默认 features 为空,所有 planner / bridge / visual 都走可选 feature
-# - 不引入 rcl / rmw / cyclonedds / DDS / CUDA 默认依赖
-# - 不在 build.rs 下载模型 / 二进制 /访问网络
-# - 不允许命名空间 nuwax-mapping-*;本 crate 仅供导航板块使用
-#
-# 设计原则(本轮 lane 的实操选择):
-# 1. stack 的核心职责是"组合配置 + 渲染 module graph + dry-run + smoke"。
-# 2. 默认 features 为空(只依赖 foundation),所有 planner / bridge / visual
-#    / mls 都通过 **optional path deps** 接入,避免默认编译拖入所有上游 crate。
-# 3. profiles.rs 中的 ModuleGraph 仍是纯数据,即便对应的 Cargo feature 未启用,
-#    仍然可以 build / dry-run(只控制是否能链接到真正可执行的上游 crate)。
-# 4. 通过 `tests/integration_smoke.rs` 启用 simple-2d feature,
-#    做 plan + follow 端到端 smoke,证明真实组合而不是空壳。
+# 两种固定导航组合；算法实现保留在上游库。
 name = "nuwax-nav-stack"
 version = "0.1.0"
 edition.workspace = true
@@ -24,12 +8,12 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish = false
-description = "Navigation stack orchestration for the nuwax robot platform (profiles + module graph + dry-run)."
+description = "Fixed 3D and 2D navigation task assembly for the nuwax robot platform."
 
 # ============================================================
 # 默认 features: 空
 # 仅依赖 foundation(types-messages + base),不启用任何 planner / bridge / visual
-# 暴露 NavStackProfile / Builder / ModuleGraph / dry-run
+# 表面地图与规划接口仍按特性提供。
 # ============================================================
 [features]
 default = []
@@ -173,11 +157,8 @@ nuwax-codec = { path = "../nuwax-codec", optional = true }
 nuwax-protocol = { path = "../nuwax-protocol", optional = true }
 nuwax-transport = { path = "../nuwax-transport", optional = true }
 
-# ---- Native spec 类型(Phase E6 typed wiring 需要)----
-# 暴露 `NativeProgramSpec` / `NativeBuildSpec`,使 `ModuleNode::from_native_specs`
-# 能在 typed 路径上工作;默认关闭,无 native spec 的纯 Rust stack 不依赖。
+# ---- 现有可选任务的依赖 ----
 nuwax-nav-native-runner = { path = "../nuwax-nav-native-runner", optional = true }
-# `NativeSpecSummary` 聚合类型(板块 3 探索 facade 整合点)
 nuwax-exploration = { path = "../nuwax-exploration", optional = true, features = ["spec-summary"] }
 nuwax-explore-wavefront = { path = "../nuwax-explore-wavefront", optional = true, features = ["runtime"] }
 
@@ -218,7 +199,7 @@ tracing = { workspace = true }
 bitflags = { workspace = true }
 sha2 = "0.10"
 futures = { workspace = true, optional = true }
-# P0-07 StackRunner 使用 process / time / rt,CLI 通过 signal 等待 Ctrl-C。
+# 导航任务与关闭信号使用现有异步运行时。
 tokio = { workspace = true, features = ["rt", "time", "macros", "process", "io-util", "signal"] }
 
 [dev-dependencies]
@@ -241,7 +222,7 @@ nuwax-nav-mls-planner = { path = "../nuwax-nav-mls-planner" }
 nuwax-nav-test-fixtures = { path = "../nuwax-nav-test-fixtures" }
 
 [[bin]]
-# 默认 CLI:提供 --profile / --dry-run / --list-features 入口
+# 默认命令入口按固定配置启动任务。
 name = "nuwax-nav-stack"
 path = "src/bin/nuwax_nav_stack.rs"
-required-features = []
+required-features = ["simple-2d", "mls"]

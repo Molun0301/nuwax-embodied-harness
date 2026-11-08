@@ -1,4 +1,4 @@
-//! Real-LCM adapters for in-process navigation graph nodes.
+//! 固定导航任务的真实通信适配。
 
 #[cfg(any(feature = "cmu-native", feature = "explore"))]
 use std::collections::{HashMap, HashSet};
@@ -7,7 +7,6 @@ use std::pin::Pin;
 #[cfg(any(feature = "cmu-native", feature = "explore", feature = "mls"))]
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::Duration;
 #[cfg(feature = "guard-runtime")]
 use std::time::Instant;
@@ -77,139 +76,16 @@ use tokio::sync::oneshot;
 #[path = "surface_dataflow.rs"]
 mod surface_dataflow;
 #[cfg(feature = "mls")]
-pub(crate) use surface_dataflow::register_surface_owners;
+pub(crate) use surface_dataflow::start_surface_tasks;
 
 use crate::error::{NavStackError, NavStackResult};
-use crate::graph::ModuleNode;
-use crate::runner::InProcessNode;
+use crate::topics::TaskChannels;
+use crate::task::{spawn_task, ReadySender, TaskThread};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(any(feature = "cmu-native", feature = "explore"))]
 static FAR_READY_GENERATION: AtomicI64 = AtomicI64::new(0);
 #[cfg(feature = "patrolling")]
 const PLANNER_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
-
-type ReadySender = std_mpsc::SyncSender<Result<(), String>>;
-type OwnerFuture = Pin<Box<dyn Future<Output = NavStackResult<()>> + Send>>;
-type OwnerRun = Box<dyn FnOnce(oneshot::Receiver<()>, ReadySender) -> OwnerFuture + Send + 'static>;
-
-struct LcmThreadOwner {
-    label: String,
-    run: Option<OwnerRun>,
-    shutdown: Option<oneshot::Sender<()>>,
-    thread: Option<JoinHandle<()>>,
-    failure: Arc<Mutex<Option<String>>>,
-}
-
-impl LcmThreadOwner {
-    fn new(label: impl Into<String>, run: OwnerRun) -> Self {
-        Self {
-            label: label.into(),
-            run: Some(run),
-            shutdown: None,
-            thread: None,
-            failure: Arc::new(Mutex::new(None)),
-        }
-    }
-}
-
-impl InProcessNode for LcmThreadOwner {
-    fn start(&mut self) -> NavStackResult<()> {
-        if self.thread.is_some() {
-            return Ok(());
-        }
-        let run = self.run.take().ok_or_else(|| {
-            NavStackError::Internal(format!("{} cannot be restarted", self.label))
-        })?;
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
-        let ready_fallback = ready_tx.clone();
-        let failure = Arc::clone(&self.failure);
-        let label = self.label.clone();
-        let thread = std::thread::Builder::new()
-            .name(format!("nav-stack-{label}"))
-            .spawn(move || {
-                let result = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|error| {
-                        NavStackError::Internal(format!(
-                            "{label} failed to create Tokio runtime: {error}"
-                        ))
-                    })
-                    .and_then(|runtime| runtime.block_on(run(shutdown_rx, ready_tx)));
-                if let Err(error) = result {
-                    let detail = error.to_string();
-                    let _ = ready_fallback.send(Err(detail.clone()));
-                    if let Ok(mut slot) = failure.lock() {
-                        *slot = Some(detail);
-                    }
-                }
-            })
-            .map_err(|error| {
-                NavStackError::Internal(format!("{} thread spawn failed: {error}", self.label))
-            })?;
-        self.shutdown = Some(shutdown_tx);
-        self.thread = Some(thread);
-
-        match ready_rx.recv_timeout(STARTUP_TIMEOUT) {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(reason)) => {
-                self.join_after_failed_start();
-                Err(NavStackError::Internal(reason))
-            }
-            Err(error) => {
-                self.join_after_failed_start();
-                Err(NavStackError::Internal(format!(
-                    "{} startup handshake failed: {error}",
-                    self.label
-                )))
-            }
-        }
-    }
-
-    fn is_running(&mut self) -> NavStackResult<bool> {
-        if let Some(reason) = self
-            .failure
-            .lock()
-            .map_err(|_| NavStackError::Internal("LCM owner health mutex poisoned".into()))?
-            .clone()
-        {
-            return Err(NavStackError::Internal(reason));
-        }
-        Ok(self
-            .thread
-            .as_ref()
-            .is_some_and(|thread| !thread.is_finished()))
-    }
-
-    fn shutdown(&mut self) -> NavStackResult<()> {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-        if let Some(thread) = self.thread.take() {
-            thread.join().map_err(|_| {
-                NavStackError::Internal(format!("{} runtime thread panicked", self.label))
-            })?;
-        }
-        Ok(())
-    }
-}
-
-impl LcmThreadOwner {
-    fn join_after_failed_start(&mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-fn boxed_owner(label: &'static str, run: OwnerRun) -> Box<dyn InProcessNode> {
-    Box::new(LcmThreadOwner::new(label, run))
-}
 
 fn lcm_transport() -> NavStackResult<LcmTransport> {
     let provider = nuwax_config::transport()
@@ -282,93 +158,6 @@ async fn planar_navigation_stream(transport:&LcmTransport,topic:LcmTopic)->NavSt
         futures::future::ready(Some(futures::stream::iter(output)))
     }).flatten();
     Ok(Box::pin(mapped))
-}
-
-#[cfg(all(
-    feature = "native-runner",
-    any(feature = "cmu-native", feature = "explore")
-))]
-#[derive(Clone)]
-pub(crate) enum NativePlannerReadyContract {
-    #[cfg(any(feature = "cmu-native", feature = "explore"))]
-    Far(nuwax_nav_far_planner_bridge::worker::FarReadyContract),
-}
-
-#[cfg(all(
-    feature = "native-runner",
-    any(feature = "cmu-native", feature = "explore")
-))]
-fn far_ready_contract_matches(
-    expected: &nuwax_nav_far_planner_bridge::worker::FarReadyContract,
-    generation: i64,
-    state: &schema::NavigationStatus,
-) -> bool {
-    let mut expected = expected.clone();
-    expected.generation = generation;
-    state.state == nuwax_nav_far_planner_bridge::worker::FAR_EVENT_READY
-        && state.sink_ready == 1
-        && state.robot_frame == expected.backend
-        && state.runtime_generation == generation
-        && nuwax_nav_far_planner_bridge::worker::decode_ready_contract_v2(&state.message)
-            .is_ok_and(|contract| contract == expected)
-}
-
-#[cfg(all(
-    feature = "native-runner",
-    any(feature = "cmu-native", feature = "explore")
-))]
-pub(crate) fn native_planner_readiness(
-    expected: NativePlannerReadyContract,
-    restart_generation: u64,
-) -> nuwax_nav_native_runner::TypedReadyFuture {
-    Box::pin(async move {
-        use nuwax_nav_native_runner::SupervisedReadyError;
-
-        let generation = i64::try_from(restart_generation).map_err(|_| {
-            SupervisedReadyError::Protocol("restart generation exceeds int64".into())
-        })?;
-        let event_channel = match &expected {
-            #[cfg(any(feature = "cmu-native", feature = "explore"))]
-            NativePlannerReadyContract::Far(contract) => {
-                FAR_READY_GENERATION.store(0, Ordering::Release);
-                contract.worker_event.clone()
-            }
-        };
-        let provider = nuwax_config::transport()
-            .map_err(SupervisedReadyError::Protocol)?
-            .lcm_url
-            .clone();
-        let transport = LcmTransport::new_real(&provider)
-            .map_err(|error| SupervisedReadyError::Transport(error.to_string()))?;
-        let topic = protocol_topic(&event_channel)
-            .map_err(|error| SupervisedReadyError::Protocol(error.to_string()))?;
-        let message_type = LcmMessageType::new("nuwax_msgs.NavigationStatus")
-            .map_err(|error| SupervisedReadyError::Protocol(error.to_string()))?;
-        let mut events = transport
-            .subscribe_owned(topic, Some(message_type))
-            .await
-            .map_err(|error| SupervisedReadyError::Transport(error.to_string()))?;
-
-        loop {
-            let frame = events
-                .recv()
-                .await
-                .map_err(|error| SupervisedReadyError::Transport(error.to_string()))?;
-            match &expected {
-                #[cfg(any(feature = "cmu-native", feature = "explore"))]
-                NativePlannerReadyContract::Far(expected_contract) => {
-                    let state = match schema::decode_navigation_status_body(&frame.payload) {
-                        Ok(state) => state,
-                        Err(_) => continue,
-                    };
-                    if far_ready_contract_matches(expected_contract, generation, &state) {
-                        FAR_READY_GENERATION.store(generation, Ordering::Release);
-                        return Ok(());
-                    }
-                }
-            }
-        }
-    })
 }
 
 fn build_body_frame(channel: &str, type_name: &str, body: Vec<u8>) -> NavStackResult<RawLcmFrame> {
@@ -497,37 +286,14 @@ fn signal_ready(ready: ReadySender) -> NavStackResult<()> {
         .map_err(|_| NavStackError::Internal("startup handshake receiver dropped".into()))
 }
 
-fn validate_ports(node: &ModuleNode, inputs: usize, outputs: &[usize]) -> NavStackResult<()> {
-    if node.inputs.len() != inputs || !outputs.contains(&node.outputs.len()) {
-        return Err(NavStackError::InvalidConfig(format!(
-            "{} requires {inputs} inputs and one of {outputs:?} outputs, got {} and {}",
-            node.id,
-            node.inputs.len(),
-            node.outputs.len()
-        )));
-    }
-    if node
-        .inputs
-        .iter()
-        .chain(&node.outputs)
-        .any(String::is_empty)
-    {
-        return Err(NavStackError::InvalidConfig(format!(
-            "{} contains an empty LCM topic",
-            node.id
-        )));
-    }
-    Ok(())
-}
+
 
 #[cfg(feature = "guard-runtime")]
-pub(crate) fn map_pose_owner(node: &ModuleNode, body_reference_frame_id: Arc<str>) -> NavStackResult<Box<dyn InProcessNode>> {
-    validate_ports(node, 2, &[1])?;
+pub(crate) fn map_pose_owner(node: &TaskChannels, body_reference_frame_id: Arc<str>) -> NavStackResult<TaskThread> {
     let node = node.clone();
-    Ok(boxed_owner(
-        "map-pose-adapter",
-        Box::new(move |shutdown, ready| Box::pin(run_map_pose_adapter(node, body_reference_frame_id, shutdown, ready))),
-    ))
+    spawn_task("map-pose-adapter", Box::new(move |shutdown, ready| {
+        Box::pin(run_map_pose_adapter(node, body_reference_frame_id, shutdown, ready))
+    }))
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -632,7 +398,7 @@ fn bound_map_pose_adapter(
 
 #[cfg(feature = "guard-runtime")]
 async fn run_map_pose_adapter(
-    node: ModuleNode,
+    node: TaskChannels,
     body_reference_frame_id: Arc<str>,
     mut shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
@@ -724,14 +490,11 @@ async fn run_map_pose_adapter(
 }
 
 #[cfg(feature = "guard-runtime")]
-pub(crate) fn guarded_nav_scheduler_owner(
-    node: &ModuleNode, body_reference_frame_id: Arc<str>) -> NavStackResult<Box<dyn InProcessNode>> {
-    validate_ports(node, 5, &[4])?;
+pub(crate) fn guarded_nav_scheduler_owner(node: &TaskChannels, body_reference_frame_id: Arc<str>) -> NavStackResult<TaskThread> {
     let node = node.clone();
-    Ok(boxed_owner(
-        "guarded-nav-scheduler",
-        Box::new(move |shutdown, ready| Box::pin(run_guarded_nav_scheduler(node, body_reference_frame_id, shutdown, ready))),
-    ))
+    spawn_task("guarded-nav-scheduler", Box::new(move |shutdown, ready| {
+        Box::pin(run_guarded_nav_scheduler(node, body_reference_frame_id, shutdown, ready))
+    }))
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -1008,7 +771,7 @@ where
 
 #[cfg(feature = "guard-runtime")]
 async fn run_guarded_nav_scheduler(
-    node: ModuleNode,
+    node: TaskChannels,
     body_reference_frame_id: Arc<str>,
     shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
@@ -1118,7 +881,7 @@ where
 #[cfg(feature = "guard-runtime")]
 #[allow(clippy::too_many_arguments)]
 async fn run_guarded_nav_loop<M, T>(
-    node: &ModuleNode,
+    node: &TaskChannels,
     transport: &LcmTransport,
     scheduler: &nuwax_nav_runtime::NavSchedulerHandle,
     mut shutdown: oneshot::Receiver<()>,
@@ -1522,7 +1285,7 @@ where
 
 #[cfg(feature = "guard-runtime")]
 async fn activate_guarded_goal(
-    node: &ModuleNode,
+    node: &TaskChannels,
     transport: &LcmTransport,
     scheduler: &nuwax_nav_runtime::NavSchedulerHandle,
     telemetry: &mut GuardedNavTelemetry,
@@ -1673,7 +1436,7 @@ struct GuardedStatusPublications {
 impl GuardedStatusPublications {
     fn frames(
         &mut self,
-        node: &ModuleNode,
+        node: &TaskChannels,
         status: &nuwax_nav_runtime::SchedulerStatus,
         telemetry: &GuardedNavTelemetry,
         planner_observation: Option<bool>,
@@ -1723,7 +1486,7 @@ impl GuardedStatusPublications {
 
 #[cfg(feature = "guard-runtime")]
 async fn publish_guarded_tail_observation(
-    transport: &LcmTransport, node: &ModuleNode, snapshot: nuwax_nav_runtime::SchedulerStatus,
+    transport: &LcmTransport, node: &TaskChannels, snapshot: nuwax_nav_runtime::SchedulerStatus,
     telemetry: &mut GuardedNavTelemetry, planner_observation: Option<bool>,
     publications: &mut GuardedStatusPublications,
 ) -> NavStackResult<()> {
@@ -1745,7 +1508,7 @@ fn clear_terminal_telemetry_after_publication(
 #[cfg(feature = "guard-runtime")]
 async fn publish_guarded_nav_observation(
     transport: &LcmTransport,
-    node: &ModuleNode,
+    node: &TaskChannels,
     status: nuwax_nav_runtime::SchedulerStatus,
     telemetry: &GuardedNavTelemetry,
     planner_observation: Option<bool>,
@@ -1944,19 +1707,11 @@ fn distance_2d(left: [f64; 3], right: [f64; 3]) -> f64 {
     (left[0] - right[0]).hypot(left[1] - right[1])
 }
 
-#[cfg(feature = "click-goal")]
-pub(crate) fn click_goal_owner(node: &ModuleNode) -> NavStackResult<Box<dyn InProcessNode>> {
-    validate_ports(node, 1, &[1])?;
-    let node = node.clone();
-    Ok(boxed_owner(
-        "click-goal-router",
-        Box::new(move |shutdown, ready| Box::pin(run_click_goal(node, shutdown, ready))),
-    ))
-}
+
 
 #[cfg(feature = "click-goal")]
 async fn run_click_goal(
-    node: ModuleNode,
+    node: TaskChannels,
     mut shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
 ) -> NavStackResult<()> {
@@ -2004,19 +1759,11 @@ fn clicked_goal_pose(click: &schema::PointStamped) -> NavStackResult<PoseStamped
     Ok(goal)
 }
 
-#[cfg(feature = "explore")]
-pub(crate) fn wavefront_owner(node: &ModuleNode) -> NavStackResult<Box<dyn InProcessNode>> {
-    validate_ports(node, 5, &[1])?;
-    let node = node.clone();
-    Ok(boxed_owner(
-        "wavefront-explorer",
-        Box::new(move |shutdown, ready| Box::pin(run_wavefront(node, shutdown, ready))),
-    ))
-}
+
 
 #[cfg(feature = "explore")]
 async fn run_wavefront(
-    node: ModuleNode,
+    node: TaskChannels,
     mut shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
 ) -> NavStackResult<()> {
@@ -2231,19 +1978,11 @@ fn unix_timestamp() -> Timestamp {
     )
 }
 
-#[cfg(any(feature = "cmu-native", feature = "explore"))]
-pub(crate) fn terrain_map_ext_owner(node: &ModuleNode) -> NavStackResult<Box<dyn InProcessNode>> {
-    validate_ports(node, 2, &[1])?;
-    let node = node.clone();
-    Ok(boxed_owner(
-        "terrain-map-ext",
-        Box::new(move |shutdown, ready| Box::pin(run_terrain_map_ext(node, shutdown, ready))),
-    ))
-}
+
 
 #[cfg(any(feature = "cmu-native", feature = "explore"))]
 async fn run_terrain_map_ext(
-    node: ModuleNode,
+    node: TaskChannels,
     mut shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
 ) -> NavStackResult<()> {
@@ -2778,22 +2517,7 @@ fn decode_planner_stop_input(payload: &[u8], component: &str) -> OwnerInputResul
     }
 }
 
-#[cfg(any(feature = "simple-2d", feature = "replanning-astar"))]
 
-pub(crate) fn capture_body_reference() -> Result<Arc<str>, String> {
-    let body = nuwax_config::robot()
-        .map(|r| r.base_frame.clone())
-        .map_err(NavStackError::InvalidConfig)
-        .map_err(|error| error.to_string())?;
-    if !crate::map_pose::valid_body_reference(&body) {
-        return Err("navigation body reference must be a valid frame ID".into());
-    }
-    Ok(Arc::from(body))
-}
-
-pub(crate) fn captured_body_reference(body: &Result<Arc<str>, String>) -> NavStackResult<Arc<str>> {
-    body.as_ref().map(Arc::clone).map_err(|reason| NavStackError::InvalidConfig(reason.clone()))
-}
 
 #[cfg(feature = "simple-2d")]
 fn apply_simple_planner_goal(
@@ -2974,28 +2698,11 @@ fn admit_native_adapter_goal(
     true
 }
 
-#[cfg(any(feature = "cmu-native", feature = "explore"))]
-pub(crate) fn native_planner_path_adapter_owner(
-    node: &ModuleNode, body_reference_frame_id: Arc<str>) -> NavStackResult<Box<dyn InProcessNode>> {
-    if node.inputs.len() < 2 || node.inputs.len() > 3 || node.outputs.len() != 1 {
-        return Err(NavStackError::InvalidConfig(format!(
-            "native planner adapter requires 2 or 3 inputs and one output, got {}/{}",
-            node.inputs.len(),
-            node.outputs.len()
-        )));
-    }
-    let node = node.clone();
-    Ok(boxed_owner(
-        "native-planner-path-adapter",
-        Box::new(move |shutdown, ready| {
-            Box::pin(run_native_planner_path_adapter(node, body_reference_frame_id, shutdown, ready))
-        }),
-    ))
-}
+
 
 #[cfg(any(feature = "cmu-native", feature = "explore"))]
 async fn run_native_planner_path_adapter(
-    node: ModuleNode,
+    node: TaskChannels,
     body_reference_frame_id: Arc<str>,
     shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
@@ -3006,7 +2713,7 @@ async fn run_native_planner_path_adapter(
 
 #[cfg(any(feature = "cmu-native", feature = "explore"))]
 async fn run_native_planner_path_adapter_with_transport(
-    node: ModuleNode,
+    node: TaskChannels,
     body_reference_frame_id: Arc<str>,
     transport: LcmTransport,
     mut shutdown: oneshot::Receiver<()>,
@@ -3172,18 +2879,16 @@ async fn run_native_planner_path_adapter_with_transport(
 }
 
 #[cfg(feature = "simple-2d")]
-pub(crate) fn simple_planner_owner(node: &ModuleNode, body_reference_frame_id: Arc<str>) -> NavStackResult<Box<dyn InProcessNode>> {
-    validate_ports(node, 4, &[2])?;
+pub(crate) fn simple_planner_owner(node: &TaskChannels, body_reference_frame_id: Arc<str>) -> NavStackResult<TaskThread> {
     let node = node.clone();
-    Ok(boxed_owner(
-        "simple-planner",
-        Box::new(move |shutdown, ready| Box::pin(run_simple_planner(node, body_reference_frame_id, shutdown, ready))),
-    ))
+    spawn_task("simple-planner", Box::new(move |shutdown, ready| {
+        Box::pin(run_simple_planner(node, body_reference_frame_id, shutdown, ready))
+    }))
 }
 
 #[cfg(feature = "simple-2d")]
 async fn run_simple_planner(
-    node: ModuleNode,
+    node: TaskChannels,
     body_reference_frame_id: Arc<str>,
     mut shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
@@ -3362,7 +3067,7 @@ fn simple_hold_path_is_executable(reason: nuwax_nav_simple_planner::module::Hold
 #[cfg(feature = "simple-2d")]
 async fn publish_simple_output(
     transport: &LcmTransport,
-    node: &ModuleNode,
+    node: &TaskChannels,
     output: nuwax_nav_simple_planner::module::ModuleOutput,
     publication: &mut SimpleOutputPublication<'_>,
 ) -> NavStackResult<()> {
@@ -3446,19 +3151,11 @@ async fn publish_simple_output(
     }
 }
 
-#[cfg(feature = "replanning-astar")]
-pub(crate) fn astar_planner_owner(node: &ModuleNode, body_reference_frame_id: Arc<str>) -> NavStackResult<Box<dyn InProcessNode>> {
-    validate_ports(node, 4, &[4])?;
-    let node = node.clone();
-    Ok(boxed_owner(
-        "astar-planner",
-        Box::new(move |shutdown, ready| Box::pin(run_astar_planner(node, body_reference_frame_id, shutdown, ready))),
-    ))
-}
+
 
 #[cfg(feature = "replanning-astar")]
 async fn run_astar_planner(
-    node: ModuleNode,
+    node: TaskChannels,
     body_reference_frame_id: Arc<str>,
     shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
@@ -3469,7 +3166,7 @@ async fn run_astar_planner(
 
 #[cfg(feature = "replanning-astar")]
 async fn run_astar_planner_with_transport(
-    node: ModuleNode,
+    node: TaskChannels,
     body_reference_frame_id: Arc<str>,
     transport: LcmTransport,
     mut shutdown: oneshot::Receiver<()>,
@@ -3661,19 +3358,11 @@ async fn run_astar_planner_with_transport(
     Ok(())
 }
 
-#[cfg(feature = "patrolling")]
-pub(crate) fn patrolling_owner(node: &ModuleNode) -> NavStackResult<Box<dyn InProcessNode>> {
-    validate_ports(node, 6, &[4])?;
-    let node = node.clone();
-    Ok(boxed_owner(
-        "patrolling",
-        Box::new(move |shutdown, ready| Box::pin(run_patrolling(node, shutdown, ready))),
-    ))
-}
+
 
 #[cfg(feature = "patrolling")]
 async fn run_patrolling(
-    node: ModuleNode,
+    node: TaskChannels,
     mut shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
 ) -> NavStackResult<()> {
@@ -3803,7 +3492,7 @@ async fn run_patrolling(
 #[cfg(feature = "patrolling")]
 async fn stop_patrolling(
     transport: &LcmTransport,
-    node: &ModuleNode,
+    node: &TaskChannels,
     module: &mut nuwax_nav_patrolling::PatrollingModule,
     goals: &mut tokio::sync::broadcast::Receiver<PoseStamped>,
     holds: &mut tokio::sync::broadcast::Receiver<Twist2>,
@@ -3822,7 +3511,7 @@ async fn stop_patrolling(
 #[cfg(feature = "patrolling")]
 async fn publish_patrolling_stop_outputs(
     transport: &LcmTransport,
-    node: &ModuleNode,
+    node: &TaskChannels,
     goals: &mut tokio::sync::broadcast::Receiver<PoseStamped>,
     holds: &mut tokio::sync::broadcast::Receiver<Twist2>,
 ) -> NavStackResult<()> {
@@ -3935,21 +3624,11 @@ fn decode_patrol_grid(body: &[u8]) -> NavStackResult<GridSnapshot> {
     Ok(snapshot)
 }
 
-#[cfg(feature = "basic-path-follower")]
-pub(crate) fn basic_path_follower_owner(
-    node: &ModuleNode,
-) -> NavStackResult<Box<dyn InProcessNode>> {
-    validate_ports(node, 3, &[1, 2])?;
-    let node = node.clone();
-    Ok(boxed_owner(
-        "basic-path-follower",
-        Box::new(move |shutdown, ready| Box::pin(run_basic_path_follower(node, shutdown, ready))),
-    ))
-}
+
 
 #[cfg(feature = "basic-path-follower")]
 async fn run_basic_path_follower(
-    node: ModuleNode,
+    node: TaskChannels,
     mut shutdown: oneshot::Receiver<()>,
     ready: ReadySender,
 ) -> NavStackResult<()> {
@@ -6166,11 +5845,7 @@ path: schema::Path {
             let (shutdown, shutdown_rx) = oneshot::channel();
             let status = scheduler.subscribe_status();
             let loop_scheduler = scheduler.clone();
-            let mut node = ModuleNode::new(
-                format!("guarded-loop-test-{loop_id}"),
-                "guarded loop test",
-                crate::graph::ModuleKind::Coordinator,
-            );
+            let mut node = TaskChannels { id: format!("guarded-loop-test-{loop_id}").into(), inputs: Vec::new(), outputs: Vec::new() };
             node.outputs = vec![
                 format!("/test/guarded/{loop_id}/cmd"),
                 format!("/test/guarded/{loop_id}/state"),
@@ -7278,11 +6953,7 @@ path: schema::Path {
 
     #[test]
     fn status_publications_reset_per_goal_and_publish_success_once() {
-        let mut node = ModuleNode::new(
-            "guard-test",
-            "守卫状态",
-            crate::graph::ModuleKind::Coordinator,
-        );
+        let mut node = TaskChannels { id: "guard-test".into(), inputs: Vec::new(), outputs: Vec::new() };
         node.outputs = vec![
             "/test/cmd".into(),
             "/test/state".into(),
@@ -7767,19 +7438,7 @@ mod tests {
             std::sync::atomic::AtomicU64::new(0);
         let id = NEXT_ASTAR_OWNER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let prefix = format!("/test/astar-cold/{}/{id}", std::process::id());
-        let node = ModuleNode::new(
-            format!("astar-cold-owner-{id}"),
-            "A* cold owner regression",
-            crate::graph::ModuleKind::RustAlgorithm,
-        )
-        .add_input(format!("{prefix}/pose"))
-        .add_input(format!("{prefix}/costmap"))
-        .add_input(format!("{prefix}/goal"))
-        .add_input(format!("{prefix}/stop"))
-        .add_output(format!("{prefix}/waypoint"))
-        .add_output(format!("{prefix}/path"))
-        .add_output(format!("{prefix}/reached"))
-        .add_output(format!("{prefix}/failed"));
+        let node = TaskChannels { id: format!("astar-cold-owner-{id}"), inputs: vec![format!("{prefix}/pose"),format!("{prefix}/costmap"),format!("{prefix}/goal"),format!("{prefix}/stop")], outputs: vec![format!("{prefix}/waypoint"),format!("{prefix}/path"),format!("{prefix}/reached"),format!("{prefix}/failed")] };
         let transport = LcmTransport::new_real("memq://").expect("real LCM memq transport");
         let mut paths = typed_stream(&transport, &node.outputs[1], "nuwax_msgs.PathEnvelope")
             .await
@@ -8314,40 +7973,8 @@ goal: schema::PoseStamped {
         feature = "native-runner",
         any(feature = "cmu-native", feature = "explore")
     ))]
-    #[test]
-    fn far_readiness_rejects_one_wrong_channel() {
-        let expected = nuwax_nav_far_planner_bridge::worker::FarReadyContract {
-            backend: "far-visibility-graph".into(),
-            generation: 0,
-            goal: "/goal".into(),
-            cancel: "/cancel".into(),
-            odometry: "/odometry".into(),
-            terrain_map_ext: "/terrain-ext".into(),
-            terrain_map: "/terrain".into(),
-            registered_scan: "/scan".into(),
-            planner_result: "/result".into(),
-            worker_event: "/event".into(),
-            result_contract: nuwax_nav_far_planner_bridge::worker::FAR_RESULT_V3_CONTRACT.into(),
-        };
-        let mut published = expected.clone();
-        published.generation = 12;
-        let mut state = schema::NavigationStatus {
-            robot_frame: expected.backend.clone(),
-            state: nuwax_nav_far_planner_bridge::worker::FAR_EVENT_READY,
-            runtime_generation: 12,
-            sink_ready: 1,
-            message: published.encode_v2(),
-            ..schema::NavigationStatus::default()
-        };
-        assert!(far_ready_contract_matches(&expected, 12, &state));
-        published.result_contract = "far-private-result-v2".into();
-        state.message = published.encode_v2();
-        assert!(!far_ready_contract_matches(&expected, 12, &state));
-        published.result_contract = nuwax_nav_far_planner_bridge::worker::FAR_RESULT_V3_CONTRACT.into();
-        published.odometry = "/wrong-odometry".into();
-        state.message = published.encode_v2();
-        assert!(!far_ready_contract_matches(&expected, 12, &state));
-    }
+
+
 
     #[cfg(any(feature = "cmu-native", feature = "explore"))]
     #[test]
@@ -8519,15 +8146,7 @@ goal: schema::PoseStamped {
         static NEXT_ADAPTER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = NEXT_ADAPTER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let prefix = format!("/t/fa/{}/{id}", std::process::id());
-        let node = ModuleNode::new(
-            format!("far-adapter-{id}"),
-            "FAR adapter real LCM regression",
-            crate::graph::ModuleKind::Coordinator,
-        )
-        .add_input(format!("{prefix}/g"))
-        .add_input(format!("{prefix}/e"))
-        .add_input(format!("{prefix}/p"))
-        .add_output(format!("{prefix}/o"));
+        let node = TaskChannels { id: format!("far-adapter-{id}"), inputs: vec![format!("{prefix}/g"),format!("{prefix}/e"),format!("{prefix}/p")], outputs: vec![format!("{prefix}/o")] };
         let transport = LcmTransport::new_real("memq://").expect("real LCM memq transport");
         let mut paths = typed_stream(&transport, &node.outputs[0], "nuwax_msgs.PathEnvelope")
             .await

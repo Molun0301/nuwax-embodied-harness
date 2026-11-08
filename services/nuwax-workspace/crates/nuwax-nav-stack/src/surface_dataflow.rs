@@ -12,7 +12,6 @@ use crate::surface_map::{SurfaceMapCache as SurfaceGeometryCache, SurfaceGeometr
 use nuwax_nav_types_messages::Path3D;
 
 use super::*;
-use crate::runner::StackRunner;
 use crate::surface_config::SurfaceNavigationConfig;
 
 /// 保留地图来源和接收时刻用于诊断，地图接纳按会话号与修订排序。
@@ -86,60 +85,25 @@ impl SurfaceMapHub {
     }
 }
 
-/// 每个StackRunner捕获一次配置并拥有私有共享通道。
-pub(crate) fn register_surface_owners(runner: &mut StackRunner, body: Result<Arc<str>, String>) {
-    if runner.graph().find("surface_nav_scheduler").is_none() {
-        return;
-    }
-    register_surface_owners_with_config(runner, SurfaceNavigationConfig::from_runtime(), body);
-}
-
-fn register_surface_owners_with_config(
-    runner: &mut StackRunner,
-    config: NavStackResult<SurfaceNavigationConfig>,
-    body: Result<Arc<str>, String>,
-) {
-    let config = Arc::new(config.map_err(|error| error.to_string()));
-    let hub = body.map(SurfaceMapHub::new);
+/// 每个导航组合捕获一次配置并拥有私有共享通道。
+pub(crate) fn start_surface_tasks(topics: &crate::topics::NavigationTopics, body: Arc<str>) -> NavStackResult<Vec<TaskThread>> {
+    let config = SurfaceNavigationConfig::from_runtime()?;
+    let hub = SurfaceMapHub::new(body);
+    let planner = topics.planner(crate::ProductionPipeline::Lio3D);
+    let scheduler = topics.scheduler(crate::ProductionPipeline::Lio3D);
     let planner_hub = hub.clone();
-    let planner_config = Arc::clone(&config);
-    runner.register_in_process_factory("mls_planner", move |node: &ModuleNode| {
-        validate_ports(node, 5, &[1])?;
-        let node = node.clone();
-        let hub = planner_hub.as_ref().map_err(|reason| NavStackError::InvalidConfig(reason.clone()))?.clone();
-        let config = captured_config(&planner_config)?;
-        Ok(boxed_owner(
-            "surface-planner",
-            Box::new(move |shutdown, ready| {
-                Box::pin(run_surface_planner(node, hub, config, shutdown, ready))
-            }),
-        ))
-    });
-    runner.register_in_process_factory("surface_nav_scheduler", move |node: &ModuleNode| {
-        validate_ports(node, 5, &[4])?;
-        let node = node.clone();
-        let hub = hub.as_ref().map_err(|reason| NavStackError::InvalidConfig(reason.clone()))?.clone();
-        let config = captured_config(&config)?;
-        Ok(boxed_owner(
-            "surface-nav-scheduler",
-            Box::new(move |shutdown, ready| {
-                Box::pin(run_surface_scheduler(node, hub, config, shutdown, ready))
-            }),
-        ))
-    });
-}
-
-fn captured_config(
-    config: &Result<SurfaceNavigationConfig, String>,
-) -> NavStackResult<SurfaceNavigationConfig> {
-    config
-        .as_ref()
-        .cloned()
-        .map_err(|reason| NavStackError::InvalidConfig(reason.clone()))
+    let planner_config = config.clone();
+    let mut tasks = vec![spawn_task("surface-planner", Box::new(move |shutdown, ready| {
+        Box::pin(run_surface_planner(planner, planner_hub, planner_config, shutdown, ready))
+    }))?];
+    tasks.push(spawn_task("surface-nav-scheduler", Box::new(move |shutdown, ready| {
+        Box::pin(run_surface_scheduler(scheduler, hub, config, shutdown, ready))
+    }))?);
+    Ok(tasks)
 }
 
 async fn run_surface_scheduler(
-    node: ModuleNode,
+    node: TaskChannels,
     hub: SurfaceMapHub,
     config: SurfaceNavigationConfig,
     shutdown: oneshot::Receiver<()>,
@@ -161,7 +125,7 @@ async fn run_surface_scheduler(
 
 /// 先建立输入，再创建受管调度任务；联验仅替换显式运动端，复用同一生产接线。
 async fn run_surface_scheduler_with_transport<F>(
-    node: ModuleNode,
+    node: TaskChannels,
     hub: SurfaceMapHub,
     transport: LcmTransport,
     shutdown: oneshot::Receiver<()>,
@@ -455,7 +419,7 @@ async fn publish_surface_path(
 }
 
 async fn run_surface_planner(
-    node: ModuleNode,
+    node: TaskChannels,
     hub: SurfaceMapHub,
     config: SurfaceNavigationConfig,
     shutdown: oneshot::Receiver<()>,
@@ -507,7 +471,7 @@ type SurfaceMapComputer = Arc<dyn Fn(Arc<schema::NavigationMap3D>, Instant,
     &SurfaceNavigationConfig, &mut SurfaceGeometryCache) -> PreparedSurfaceMap + Send + Sync>;
 
 async fn run_surface_planner_with_transport(
-    node: ModuleNode,
+    node: TaskChannels,
     hub: SurfaceMapHub,
     config: SurfaceNavigationConfig,
     transport: LcmTransport,
@@ -518,7 +482,7 @@ async fn run_surface_planner_with_transport(
 }
 
 async fn run_surface_planner_with_computer(
-    node: ModuleNode,
+    node: TaskChannels,
     hub: SurfaceMapHub,
     config: SurfaceNavigationConfig,
     transport: LcmTransport,
@@ -1728,7 +1692,7 @@ goal: schema::PoseStamped {
             tokio::time::timeout(Duration::from_millis(20), other.next())
                 .await
                 .is_err(),
-            "不同StackRunner的地图通道不能互相污染"
+            "不同导航组合的地图通道不能互相污染"
         );
         let mut slow = hub.stream();
         slow.next().await.unwrap().unwrap();
@@ -1756,10 +1720,10 @@ goal: schema::PoseStamped {
 
     struct Harness {
         transport: LcmTransport,
-        planner_node: ModuleNode,
+        planner_node: TaskChannels,
         hub: SurfaceMapHub,
-        planner: Option<Box<dyn InProcessNode>>,
-        executor: Option<Box<dyn InProcessNode>>,
+        planner: Option<TaskThread>,
+        executor: Option<TaskThread>,
         scheduler: NavSchedulerHandle,
         calls: Arc<Mutex<Vec<String>>>,
         paths: LcmFrameStream,
@@ -1795,7 +1759,6 @@ goal: schema::PoseStamped {
         async fn start_with_components(computer:SurfacePathComputer,feed_period:Duration,
             configured:SurfaceNavigationConfig,memq:bool,
             map_computer:Option<SurfaceMapComputer>,scheduler_config:nuwax_nav_runtime::SchedulerConfig)->Self {
-            use crate::topics::{NavTopicConfig, TopicName};
             let (url,prefix) = if memq {
                 ("memq://".to_string(), "/sf-soft-refresh".to_string())
             } else {
@@ -1805,32 +1768,14 @@ goal: schema::PoseStamped {
                 (format!("udpm://239.255.76.67:{port}?ttl=0"),format!("/sf{port}"))
             };
             let transport = LcmTransport::new_real(&url).unwrap();
-            let mut topics = NavTopicConfig::empty();
-            for (index, name) in [
-                "navigation_map3d",
-                "map_pose",
-                "goal_pose",
-                "nav_cancel",
-                "goal_path",
-                "cmd_vel",
-                "nav_state",
-                "goal_reached",
-                "stop_movement",
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                topics
-                    .topics
-                    .insert(name.into(), TopicName::new(format!("{prefix}/{index}")));
-            }
-            let graph = crate::profiles::build_graph(
-                crate::NavStackProfile::Mls3D,
-                &topics,
-                crate::features::NavStackPreset::Mls.to_flags(),
-            );
-            let planner_node = graph.find("mls_planner").unwrap().clone();
-            let scheduler_node = graph.find("surface_nav_scheduler").unwrap().clone();
+            let topics = crate::topics::NavigationTopics {
+                map: format!("{prefix}/0"), map_pose: format!("{prefix}/1"), goal: format!("{prefix}/2"),
+                cancel: format!("{prefix}/3"), path: format!("{prefix}/4"), command: format!("{prefix}/5"),
+                state: format!("{prefix}/6"), reached: format!("{prefix}/7"), stop: format!("{prefix}/8"),
+                ..crate::topics::NavigationTopics::for_pipeline(crate::ProductionPipeline::Lio3D)
+            };
+            let planner_node = topics.planner(crate::ProductionPipeline::Lio3D);
+            let scheduler_node = topics.scheduler(crate::ProductionPipeline::Lio3D);
             let paths = typed_stream(
                 &transport,
                 &planner_node.outputs[0],
@@ -1846,7 +1791,7 @@ goal: schema::PoseStamped {
             let mut planner_config = configured.clone();
             // 测试原来分别构造两份配置；传入标定也不能暗中合并两端PCT拥有方。
             planner_config.planner = Arc::new(crate::surface_oriented::PctPlanner::default());
-            let mut planner = boxed_owner(
+            let planner = spawn_task(
                 "surface-real-lcm-test-planner",
                 Box::new(move |shutdown, ready| {
                     Box::pin(run_surface_planner_with_computer(
@@ -1860,8 +1805,7 @@ goal: schema::PoseStamped {
                         map_computer,
                     ))
                 }),
-            );
-            planner.start().unwrap();
+            ).unwrap();
             let calls = Arc::new(Mutex::new(Vec::new()));
             let motion_calls = Arc::clone(&calls);
             let initial_position = [0.55, 1.55, 2.5];
@@ -1869,7 +1813,7 @@ goal: schema::PoseStamped {
             let scheduler_hub = hub.clone();
             let scheduler_spec = scheduler_node.clone();
             let (sender, receiver) = std_mpsc::sync_channel(1);
-            let mut executor = boxed_owner(
+            let executor = spawn_task(
                 "surface-real-lcm-test-executor",
                 Box::new(move |shutdown, ready| {
                     Box::pin(run_surface_scheduler_with_transport(scheduler_spec, scheduler_hub, scheduler_transport, shutdown, ready, configured.follower.max_observation_age_sec.map(Duration::from_secs_f64), async move {
@@ -1881,8 +1825,7 @@ goal: schema::PoseStamped {
                             Ok(pair)
                         }))
                 }),
-            );
-            executor.start().unwrap();
+            ).unwrap();
             let scheduler = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
             let feed = Arc::new(Mutex::new(FeedState {
                 map: map_message(1, "first-map"),

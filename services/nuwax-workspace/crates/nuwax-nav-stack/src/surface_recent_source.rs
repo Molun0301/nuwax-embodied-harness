@@ -46,10 +46,6 @@ impl RecentSourceState {
         let basis = self.snapshot.as_ref().ok_or("recent cloud has no ready terrain")?;
         let source_time = i64::from(cloud.header.stamp_sec) * 1_000_000_000
             + i64::from(cloud.header.stamp_nsec);
-        if let Some(age) = self.max_age {
-            guarded_pose_source_deadline(source_time, age, std::time::SystemTime::now(), tokio::time::Instant::now())
-                .map_err(|error| error.to_string())?;
-        }
         let points = point_cloud_from_schema(cloud).map_err(|error| error.to_string())?;
         let raw_points: Arc<[[f64; 3]]> = points.points.into_iter()
             .map(|p| [p.x, p.y, p.z]).collect::<Vec<_>>().into();

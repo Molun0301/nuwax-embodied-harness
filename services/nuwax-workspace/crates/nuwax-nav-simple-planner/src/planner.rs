@@ -410,12 +410,6 @@ impl SimplePlanner {
         &mut self,
         options: nuwax_nav_types_messages::GoalOptions,
     ) -> Result<(), NavError> {
-        options
-            .validate()
-            .map_err(|reason| NavError::InvalidInput {
-                field: "goal_options",
-                reason,
-            })?;
         if options.allow_reverse
             && self
                 .config

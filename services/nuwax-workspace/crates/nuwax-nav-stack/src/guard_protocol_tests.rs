@@ -324,7 +324,7 @@ mod guard_protocol {
         h.shutdown().await;
     }
     #[tokio::test]
-    async fn b3_replacement_uses_new_lease_without_an_intermediate_stop() {
+    async fn b3_replacement_releases_old_lease_before_new_motion() {
         let (guard, h) = harness(17).await;
         execute(&h, &goal("旧目标", 17)).await;
         guard.moving().await;
@@ -362,7 +362,7 @@ mod guard_protocol {
             .unwrap();
         assert!(state.events[old_motion + 1..=new_motion]
             .iter()
-            .all(|event| !matches!(event, Event::Release(_) | Event::Velocity(_, 0.))));
+            .any(|event| matches!(event, Event::Release(lease) if *lease==old)));
         assert_eq!(
             state
                 .events
@@ -375,7 +375,7 @@ mod guard_protocol {
         h.shutdown().await;
     }
     #[tokio::test]
-    async fn b3_cancel_all_releases_current_goal_and_clears_buffered_goal() {
+    async fn b3_cancel_all_releases_current_goal_and_cancels_the_waiting_goal() {
         let (guard, mut h) = harness(17).await;
         execute(&h, &goal("待取消目标", 17)).await;
         guard.moving().await;
@@ -403,13 +403,13 @@ mod guard_protocol {
         let (guard, mut h) = harness(19).await;
         // 撤销规划输入，使目标只进入待执行槽；启动取消后再给输入也不能执行它。
         h.scheduler.invalidate_map("测试输入暂缺").await.unwrap();
-        h.send_goal_and_wait_dequeued(&goal("缓冲目标", 19)).await;
+        h.send_goal_and_wait_dequeued(&goal("等待目标", 19)).await;
         send_guarded_test_body(
             &h.cancels,
             "nuwax_msgs.CancelNavigation",
             schema::encode_cancel_navigation_body(&schema::CancelNavigation::default()).unwrap(),
         );
-        let cancelled = self::state(&mut h, "缓冲目标", 0).await;
+        let cancelled = self::state(&mut h, "等待目标", 0).await;
         assert_eq!(cancelled.goal_status, schema::NAVIGATION_GOAL_STATUS_CANCELLED);
         assert!(guard.state.lock().unwrap().events.is_empty());
         h.send_pose(2);

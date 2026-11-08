@@ -1,6 +1,4 @@
-// DRAFT ONLY: include inside lib.rs tests. Real SurfaceFollower and scheduler;
-// only the existing in-memory motion-port proof fixture stands in for hardware.
-// No planner success is injected, no simulation/deadband/TTL override is used.
+// 由运行时测试模块引入，使用真实跟踪器与调度器；FakeMotion 只记录租约与速度请求。
 fn zero_position_surface_parts() -> (SurfaceFollowerConfig, Arc<SurfaceSnapshot>, PoseStamped) {
     let (config, map) = crate::native_test_helpers::fixture();
     assert!(!config.controller.simulation);
@@ -36,14 +34,15 @@ async fn zero_position_surface_scheduler() -> (
     let mut route = path();
     route.path = ExecutionPath::Surface(Path3D { poses: vec![goal.clone(), goal.clone()] });
     scheduler.submit_path(&status, route).await.unwrap();
-    assert!(scheduler.stale_input_reason(Instant::now()).is_none());
+    scheduler.sample_input_status();
+    assert!(scheduler.status.planner_inputs_fresh);
     assert!(scheduler.obstacle_source_available);
     (scheduler, status, motion, goal)
 }
 #[tokio::test]
 async fn zero_position_real_surface_arrival_releases_without_stopped_confirmation() {
     let (mut scheduler, status, motion, _goal) = zero_position_surface_scheduler().await;
-    scheduler.control_tick(&status).await.unwrap();
+    scheduler.session_tick(&status).await.unwrap();
     assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::Succeeded));
     assert!(!scheduler.lease_active);
     assert_eq!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));
@@ -61,7 +60,7 @@ async fn zero_position_real_surface_rejects_nearby_pose_before_arrival_event() {
     assert_ne!(nearby.pose.position.x, goal.pose.position.x);
     assert!(nearby.pose.position.distance(goal.pose.position) < 1e-6);
     scheduler.observe_odometry(&status, nearby, None).unwrap();
-    scheduler.control_tick(&status).await.unwrap();
+    scheduler.session_tick(&status).await.unwrap();
     assert!(scheduler.status.last_terminal.is_none());
 }
 

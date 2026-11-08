@@ -105,12 +105,37 @@ pub struct TrackResult {
     pub installed: bool,
     pub recovery_samples: Vec<TrajectorySample>,
 }
+/// 跟踪原因位，与 scan_native.h 的 ScanTrackReason 对应。
+pub mod track_reason {
+    pub const NO_TRAJECTORY:u32=1<<0;
+    pub const DEVIATED:u32=1<<1;
+    pub const FINISHED:u32=1<<2;
+    pub const NO_CANDIDATE:u32=1<<3;
+    pub const REPLAN_EARLY:u32=1<<4;
+    pub const RECOVERY_FAILED:u32=1<<5;
+    pub const REJECTED_TRAJECTORY:u32=1<<6;
+}
 impl TrackResult {
     pub fn needs_plan(&self) -> bool {
         self.reason != 0
     }
     pub fn invalid(&self) -> bool {
-        self.reason & !(16 | 64) != 0
+        self.reason & !(track_reason::REPLAN_EARLY | track_reason::REJECTED_TRAJECTORY) != 0
+    }
+    pub fn replan_early(&self) -> bool {
+        self.reason & track_reason::REPLAN_EARLY != 0
+    }
+    pub fn rejected_trajectory(&self) -> bool {
+        self.reason & track_reason::REJECTED_TRAJECTORY != 0
+    }
+    pub fn no_candidate(&self) -> bool {
+        self.reason & track_reason::NO_CANDIDATE != 0
+    }
+    pub fn deviated(&self) -> bool {
+        self.reason & track_reason::DEVIATED != 0
+    }
+    pub fn finished(&self) -> bool {
+        self.reason & track_reason::FINISHED != 0
     }
 }
 extern "C" {
@@ -889,7 +914,6 @@ mod tests {
         assert!(error.contains("braking sweep"), "新实测速度的制动证明仍必须生效：{error}");
     }
 
-
     #[test]
     fn author_registered_frame_initializes_real_session_and_reset_discards_map() {
         let route=[[0.,0.,0.35],[2.,0.,0.35]];
@@ -947,10 +971,6 @@ mod tests {
             assert!(p.step(&req).is_ok(),"rejected input cannot clear the previous accepted map");
         }
     }
-
-
-
-
 
     #[test]
     fn author_zero_step_band_excludes_support_voxel_and_keeps_obstacle_above_it() {

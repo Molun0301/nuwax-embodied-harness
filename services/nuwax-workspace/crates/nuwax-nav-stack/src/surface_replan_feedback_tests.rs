@@ -2,35 +2,31 @@
 use super::*;
 use nuwax_nav_types_messages::Twist2;
 
+// 只检验既有拒绝事件的规划适配；合成输入不代表真实控制器已经拒绝或停车。
+pub(super) async fn inject_refusal(harness:&Harness,goal:&schema::NavigationGoal,path:&schema::PathEnvelope) {
+    harness.hub.execution_feedback.send_replace(Some(SurfaceReplanFeedback {
+        path_identity:Arc::new(published_surface_identity(goal,path.planner_runtime_generation,path.path_revision)),
+        rejected_context:None,current_context:None,zero_sent_rejection:true,
+        rejection_reason:Some("适配测试注入的局部命令拒绝".into()),
+    }));
+    tokio::task::yield_now().await;
+}
+
 #[tokio::test]
 async fn repeated_current_path_refusals_are_rate_limited_and_cancellable() {
     let mut harness=Harness::start().await;
-    let mut states=typed_stream(&harness.transport,&harness.planner_node.inputs[4],
-        "nuwax_msgs.NavigationStatus").await.unwrap();
     harness.wait_ready().await;
     let goal=goal_for(&harness.feed.lock().unwrap().map,1,[3.2,1.55,2.5]);
     harness.goal(&goal).await;
     let mut previous=harness.path_for(&goal).await;
     harness.wait_controlling().await;
-    let mut waiting=tokio::time::timeout(Duration::from_secs(2),async {
-        loop {
-            let frame=states.next().await.unwrap().unwrap();
-            let state=schema::decode_navigation_status_body(&frame.payload).unwrap();
-            if state_matches_goal(&state,&goal) && state.state==2 {break state;}
-        }
-    }).await.unwrap();
-    waiting.state=1;
     for _ in 0..2 {
-        waiting.path_revision=previous.path_revision;
-        for _ in 0..15 {
-            publish_body(&harness.transport,&harness.planner_node.inputs[4],
-                "nuwax_msgs.NavigationStatus",schema::encode_navigation_status_body(&waiting).unwrap()).await.unwrap();
-        }
+        for _ in 0..15 {inject_refusal(&harness,&goal,&previous).await;}
         let next=harness.path_for(&goal).await;
         let stamp=|path:&schema::PathEnvelope| i64::from(path.path.header.stamp_sec)*1_000_000_000
             +i64::from(path.path.header.stamp_nsec);
         assert!(stamp(&next)-stamp(&previous)>=1_000_000_000,
-            "重复局部等待不能立即刷新全局路线");
+            "重复局部拒绝不能立即刷新全局路线");
         previous=next;
         harness.wait_controlling().await;
     }
@@ -107,13 +103,13 @@ fn adapter_preserves_rejected_b_when_current_and_published_inputs_return_to_a() 
 #[test]
 fn recomputation_progress_keeps_original_refusal_without_borrowing_another_goal() {
     let (_,_,goal,_,mut feedback)=fixture();
-    // 后端没有可复用的实际上下文，也不能丢掉已确认的拒绝事实。
+    // 后端没有可复用的实际上下文，也不能丢掉已接收的拒绝事实。
     feedback.rejected_context=None;
     feedback.current_context=None;
     let message=surface_planning_diagnostic(Some(&feedback),&goal,"正在计算PCT全局路线");
     assert!(message.contains("Current body pose is occupied or outside the local map"));
     assert!(message.contains("正在计算PCT全局路线"));
-    assert!(message.contains("已归零"));
+    assert!(message.contains("零速请求已接受"));
     let mut replacement=goal.clone();replacement.motion_generation+=1;
     assert_eq!(surface_planning_diagnostic(Some(&feedback),&replacement,"正在计算PCT全局路线"),
         "正在计算PCT全局路线");

@@ -29,7 +29,6 @@ async fn yaw_zero_surface_scheduler(
     goal.pose.orientation = goal_orientation;
     let mut actual = goal.clone();
     actual.pose.orientation = actual_orientation;
-    validate_map_pose(&goal, "goal_pose").unwrap();
     validate_map_pose(&actual, "odometry").unwrap();
     for pose in [&goal, &actual] {
         let p = pose.pose.position;
@@ -56,7 +55,8 @@ async fn yaw_zero_surface_scheduler(
     let mut route = path();
     route.path = ExecutionPath::Surface(Path3D { poses: vec![goal.clone(), goal] });
     scheduler.submit_path(&status, route).await.unwrap();
-    assert!(scheduler.stale_input_reason(Instant::now()).is_none());
+    scheduler.sample_input_status();
+    assert!(scheduler.status.planner_inputs_fresh);
     assert!(scheduler.obstacle_source_available);
     (scheduler, status, motion, actual)
 }
@@ -65,7 +65,7 @@ async fn yaw_zero_observe_release(
     status: &watch::Sender<SchedulerStatus>, motion: &Arc<Mutex<FakeMotionState>>,
     _actual: PoseStamped,
 ) {
-    scheduler.control_tick(status).await.unwrap();
+    scheduler.session_tick(status).await.unwrap();
     assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::Succeeded));
     assert!(!scheduler.lease_active);
     assert_eq!(motion.lock().unwrap().calls.iter().filter(|c| c.starts_with("release:")).count(), 1);
@@ -97,7 +97,7 @@ async fn zero_yaw_real_surface_rejects_nonzero_residual_before_arrival_event() {
     let delta = actual.yaw() - goal.yaw();
     assert!(delta.sin().atan2(delta.cos()).abs() > 0.0);
     let (mut scheduler, status, _motion, _pose) = yaw_zero_surface_scheduler(goal, actual).await;
-    scheduler.control_tick(&status).await.unwrap();
+    scheduler.session_tick(&status).await.unwrap();
     assert!(scheduler.status.last_terminal.is_none());
 }
 

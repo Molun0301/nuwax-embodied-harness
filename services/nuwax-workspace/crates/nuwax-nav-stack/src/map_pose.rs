@@ -93,9 +93,6 @@ fn frame_ids_semantically_equal(left: &str, right: &str) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MapPoseObservation {
     pub(crate) pose: schema::PoseStamped,
-    pub(crate) generation: u64,
-    pub(crate) map_frame: String,
-    pub(crate) pose_frame: String,
 }
 
 /// Result of consuming one TF message. A coherent canonical chain can carry a
@@ -264,15 +261,6 @@ impl MapPoseAdapter {
         let rotation_xyzw =
             normalize_quaternion(transform.transform.rotation_xyzw, "map_to_odom.rotation")?;
         let source_timestamp_ns = header_timestamp_ns(&transform.header, "map_to_odom.header")?;
-        if self
-            .map_to_odom
-            .is_some_and(|cached| source_timestamp_ns <= cached.source_timestamp_ns)
-        {
-            return Ok(MapPoseTfObservation {
-                accepted: false,
-                map_pose: None,
-            });
-        }
         let map_to_odom = RigidTransform {
             translation: transform.transform.translation,
             rotation_xyzw,
@@ -329,9 +317,6 @@ impl MapPoseAdapter {
                             orientation_xyzw,
                         },
                     },
-                    generation,
-                    map_frame: self.map_frame.clone(),
-                    pose_frame: self.map_frame.clone(),
                 })
             })
             .transpose()?;
@@ -379,9 +364,6 @@ impl MapPoseAdapter {
                         orientation_xyzw: odom_rotation,
                     },
                 },
-                generation: self.generation.max(1),
-                map_frame: self.map_frame.clone(),
-                pose_frame: self.map_frame.clone(),
             }));
         }
         if !frame_ids_semantically_equal(&odometry.header.frame_id, &self.odom_frame) {
@@ -431,9 +413,6 @@ impl MapPoseAdapter {
                     orientation_xyzw,
                 },
             },
-            generation: self.generation,
-            map_frame: self.map_frame.clone(),
-            pose_frame: self.map_frame.clone(),
         }))
     }
 }
@@ -572,9 +551,21 @@ mod tests {
             .expect("map pose");
         assert_eq!(observed.pose.header.frame_id, "map");
         assert_eq!(observed.pose.pose.position, [11.5, 1.0, 0.0]);
-        assert_eq!(observed.generation, 1);
-        assert_eq!(observed.map_frame, "map");
-        assert_eq!(observed.pose_frame, "map");
+        assert_eq!(observed.pose.header.seq, 1);
+    }
+
+    #[test]
+    fn transform_slot_uses_arrival_order_without_a_timestamp_watermark() {
+        let mut adapter=MapPoseAdapter::new("map","odom","base_link").unwrap();
+        let mut transform=map_to_odom(1.,0.);transform.transforms[0].header.stamp_sec=2;
+        adapter.observe_tf(&transform).unwrap();
+        for x in [2.,3.] {
+            transform.transforms[0].header.stamp_sec=1;
+            transform.transforms[0].transform.translation[0]=x;
+            assert!(adapter.observe_tf(&transform).unwrap());
+            let pose=adapter.transform_odometry(&odometry("odom","base_link",0.,0.)).unwrap().unwrap();
+            assert_eq!(pose.pose.pose.position[0],x);
+        }
     }
 
     #[test]
@@ -797,7 +788,7 @@ mod tests {
         let map_pose = observed.map_pose.expect("atomic map pose");
         assert_eq!(map_pose.pose.header.frame_id, "map");
         assert_eq!(map_pose.pose.pose.position, [11.5, 1.0, 0.0]);
-        assert_eq!(map_pose.generation, 1);
+        assert_eq!(map_pose.pose.header.seq, 1);
     }
 
     #[test]

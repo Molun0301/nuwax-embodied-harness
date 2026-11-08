@@ -266,7 +266,7 @@ impl Planner {
             && r.goal_yaw.is_none()
             && (self.curve.is_none()
                 || tracked.invalid()
-                || (!self.early && tracked.reason & 16 != 0)
+                || (!self.early && tracked.replan_early())
                 || self.changed
                     && self.snapshot.as_ref().is_some_and(|old| {
                         self.curve
@@ -274,7 +274,7 @@ impl Planner {
                             .is_some_and(|c| snapshot.affects(old, c, self.phase))
                     }))
         {
-            if tracked.reason & 16 != 0 {
+            if tracked.replan_early() {
                 self.early = true;
             }
             let result = self.planner.plan(
@@ -310,7 +310,7 @@ impl Planner {
                 }
             }
         }
-        if tracked.reason & 8 != 0 {
+        if tracked.no_candidate() {
             return Err("Current motion and braking sweep intersect the body collision map".into());
         }
         self.phase = tracked.phase;

@@ -200,7 +200,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
       const auto projected=s.pending->project(position,state->route_progress);
       if(projected.second<=std::max(MINIMUM_DEVIATION_M,2.*c->resolution)){
         s.curve=std::move(s.pending);s.install_pending=true;out->installed=1;installed_projection=projected;
-      }else{s.pending.reset();out->reason=64;}
+      }else{s.pending.reset();out->reason=SCAN_TRACK_REJECTED_TRAJECTORY;}
     }
     const Eigen::Vector2d command_world(cs*previous[0]-sn*previous[1],sn*previous[0]+cs*previous[1]);
     const Eigen::Vector2d actual=state->measured_velocity?Eigen::Map<const Vector3d>(state->velocity).head<2>().eval():command_world;
@@ -209,7 +209,7 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
     if(occupied!=0) {
       if(occupied==1 && !std::isfinite(terminal_yaw) && !(static_cast<const Snapshot*>(snapshot)->get()->business && static_cast<const Snapshot*>(snapshot)->get()->business(position,yaw))) {
         s.escape.plan(s.map,*c,position,yaw,state->measured_velocity?state->velocity:nullptr,state->measured_yaw_rate?state->yaw_rate:std::numeric_limits<double>::quiet_NaN(),state->timestamp_ns,*recovery);
-        s.curve.reset();out->reason=1;
+        s.curve.reset();out->reason=SCAN_TRACK_NO_TRAJECTORY;
         out->command[0]=recovery->command_forward;out->command[1]=recovery->command_lateral;out->command[2]=recovery->command_yaw_rate;return;
       }
       throw std::runtime_error("Current body pose is occupied or outside the explicit user boundary or forbidden mask or surface collision map");
@@ -220,18 +220,18 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
       const double diff=std::atan2(std::sin(terminal_yaw-yaw),std::cos(terminal_yaw-yaw)),step=c->max_yaw_acceleration*c->sample_dt;
       s.raw={};s.raw.angular.z=std::copysign(std::min(c->max_yaw_rate,std::sqrt(step*step+2*c->max_yaw_acceleration*std::abs(diff))-step),diff);desired_yaw=terminal_yaw;
     }else {
-      if(!s.curve){out->reason|=1;return;}
+      if(!s.curve){out->reason|=SCAN_TRACK_NO_TRAJECTORY;return;}
       else {
       const auto projection=out->installed?installed_projection:s.curve->project(position,state->route_progress);s.phase=projection.first;out->deviation=projection.second;
-      if(out->deviation>std::max(MINIMUM_DEVIATION_M,2.*c->resolution)){out->reason|=2;s.curve.reset();return;}
+      if(out->deviation>std::max(MINIMUM_DEVIATION_M,2.*c->resolution)){out->reason|=SCAN_TRACK_DEVIATED;s.curve.reset();return;}
       out->remaining=std::max(0.,s.curve->duration()-s.phase);out->phase=s.phase;
-      if(out->remaining<=0.){out->reason|=4;s.curve.reset();return;}
+      if(out->remaining<=0.){out->reason|=SCAN_TRACK_FINISHED;s.curve.reset();return;}
       if(s.install_pending){s.controller.bsplineCallback(std::make_shared<const scan_planner::Bspline>(s.curve->spline));s.install_pending=false;}
       s.controller.configure(std::max(c->max_velocity,c->max_reverse_velocity),c->max_lateral_velocity,c->max_yaw_rate);
       s.controller.odomCallback(odometry(*state));s.controller.exec_time=s.phase;s.controller.last_update_time=ros::Time(ros::Time::now().toSec()-c->sample_dt);
       const auto before=s.curve->position.evaluateDeBoorT(s.phase);desired_yaw=s.controller.estimateDesiredYaw(s.phase,before);
       target=s.curve->position.evaluateDeBoorT(std::min(s.curve->duration(),s.phase+s.controller.time_forward));s.controller.cmdCallback({});
-      if(out->remaining<=REPLAN_REMAINING_SECONDS)out->reason|=16;
+      if(out->remaining<=REPLAN_REMAINING_SECONDS)out->reason|=SCAN_TRACK_REPLAN_EARLY;
       }
     }
     const double vx=std::clamp(s.raw.linear.x,-c->max_reverse_velocity,c->max_velocity),vy=std::clamp(s.raw.linear.y,-c->max_lateral_velocity,c->max_lateral_velocity);
@@ -240,9 +240,9 @@ extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void*
     const Eigen::Vector2d preferred(std::clamp(cs*chosen.x()+sn*chosen.y(),-c->max_reverse_velocity,c->max_velocity),std::clamp(-sn*chosen.x()+cs*chosen.y(),-c->max_lateral_velocity,c->max_lateral_velocity));
     const double w=std::clamp(s.raw.angular.z,angular-c->max_yaw_acceleration*c->sample_dt,angular+c->max_yaw_acceleration*c->sample_dt);
     const auto checked=scan_planner::checkAuthorCommand(s.map,*c,position,yaw,actual,angular,command_world,preferred,w,target,desired_yaw,bool(s.curve)&&!std::isfinite(terminal_yaw));
-    out->limited=checked.limited;if(!checked.found){out->reason=8;s.curve.reset();return;}
+    out->limited=checked.limited;if(!checked.found){out->reason=SCAN_TRACK_NO_CANDIDATE;s.curve.reset();return;}
     out->command[0]=checked.linear.x();out->command[1]=checked.linear.y();out->command[2]=checked.angular;
     if(scan_planner::authorTraceEnabled()){auto trace=scan_planner::authorTraceStream();trace<<"{\"event\":\"track\",\"phase\":"<<out->phase<<",\"remaining\":"<<out->remaining<<",\"reason\":"<<out->reason<<"}\n";}
-  }catch(const std::exception& e){errorText(error,capacity,e);out->reason=std::string(e.what()).find("BODY_OVERLAP_RECOVERY_FAILED")!=std::string::npos?32:8;}
+  }catch(const std::exception& e){errorText(error,capacity,e);out->reason=std::string(e.what()).find("BODY_OVERLAP_RECOVERY_FAILED")!=std::string::npos?SCAN_TRACK_RECOVERY_FAILED:SCAN_TRACK_NO_CANDIDATE;}
 }
 extern "C" void nuwax_scan_free(ScanOutput* out){std::free(out->samples);out->samples=nullptr;out->sample_count=0;}

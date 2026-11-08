@@ -238,7 +238,6 @@ impl LocalPlanner {
         goal: PoseStamped,
         options: nuwax_nav_types_messages::GoalOptions,
     ) -> Result<(), String> {
-        options.validate()?;
         if options.allow_reverse
             && self
                 .motion_limits

@@ -63,7 +63,6 @@ impl ExecutionGoal {
     pub fn same_geometry(&self, other:&Self)->bool {
         replan_feedback::same_pose(self.as_body().unwrap(),other.as_body().unwrap())
     }
-    pub(crate) fn validate(&self)->Result<(),RuntimeError> { validate_map_pose(self.as_body().unwrap(),"goal_pose") }
 }
 
 /// 局部执行保留路径维度，三维路径不能通过默认适配静默丢弃高度。
@@ -110,10 +109,6 @@ impl std::fmt::Debug for ExecutionMap {
 
 /// Production controller cadence: 20 Hz.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_millis(50);
-/// 零表示不按固定接收年龄终止导航，来源失效仍由拥有方显式撤销。
-pub const DEFAULT_POSE_TTL: Duration = Duration::ZERO;
-/// 地图在同一来源内持续有效，直到更新、清空或来源失效。
-pub const DEFAULT_COSTMAP_TTL: Duration = Duration::ZERO;
 /// 默认连续等待路径或可执行运动的期限；成功执行运动后重新计时。
 pub const DEFAULT_PATH_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const INPUT_CAPACITY: usize = 32;
@@ -295,10 +290,6 @@ pub struct SchedulerConfig {
     pub tick_interval: Duration,
     /// 等待路径期限；零表示等待至路径就绪或取消。
     pub path_wait_timeout: Duration,
-    /// 位姿接收期限；零表示不以固定接收年龄终止。
-    pub pose_ttl: Duration,
-    /// 地图接收期限；零表示保持至来源显式失效。
-    pub costmap_ttl: Duration,
 }
 
 impl Default for SchedulerConfig {
@@ -306,8 +297,6 @@ impl Default for SchedulerConfig {
         Self {
             tick_interval: DEFAULT_TICK_INTERVAL,
             path_wait_timeout: DEFAULT_PATH_WAIT_TIMEOUT,
-            pose_ttl: DEFAULT_POSE_TTL,
-            costmap_ttl: DEFAULT_COSTMAP_TTL,
         }
     }
 }
@@ -466,13 +455,10 @@ pub trait NavPlanner: Send + 'static {
     /// Participating backends preserve actual source/pose/carried ground across
     /// `stop`; clearing control state alone does not change this observation.
     fn refresh_execution_context(&mut self, _applied: Twist2) -> Option<Arc<ActualExecutionContext>> { None }
-    /// 传递既有导航会话标识用于计算线程日志，不参与运动准入。
-    fn set_goal_log_context(&mut self, _goal_id: &str) {}
     /// 接续局部路线时保留已受理任务边界；无局部重规划的后端可沿原全局路径。
     fn configure_boundary(&mut self, _boundary: &[[f64; 2]]) {}
     /// 在获取新目标租约前捕获执行选项；默认后端不推定支持倒车。
     fn configure_goal(&mut self, _goal: &PoseStamped, options: nuwax_nav_types_messages::GoalOptions) -> Result<(), RuntimeError> {
-        options.validate().map_err(|reason| RuntimeError::InvalidInput {field:"goal_options",reason})?;
         if options.allow_reverse {return Err(RuntimeError::InvalidInput {field:"allow_reverse",reason:"执行后端未声明倒车能力".into()});}
         Ok(())
     }
@@ -669,15 +655,11 @@ pub struct NavScheduler<M, P> {
     current_path: Option<(ExecutionPath, Option<Vec<f64>>)>,
     current_execution_identity: Option<Arc<PathExecutionIdentity>>,
     path_wait_started_at: Option<Instant>,
-    awaiting_session_path: bool,
     latest_pose: Option<PoseStamped>,
-    pose_acquired_at: Option<Instant>,
     pose_receipt: Option<PlannerInputReceipt>,
-    pose_valid_until: Option<Instant>,
     pose_source_max_age: Option<Duration>,
     obstacle_source_available: bool,
     costmap_receipt: Option<PlannerInputReceipt>,
-    map_invalidated_at: Option<Instant>,
     status: SchedulerStatus,
 }
 
@@ -713,33 +695,41 @@ where
             current_path: None,
             current_execution_identity: None,
             path_wait_started_at: None,
-            awaiting_session_path: false,
             latest_pose: None,
-            pose_acquired_at: None,
             pose_receipt: None,
-            pose_valid_until: None,
             pose_source_max_age: None,
             obstacle_source_available: true,
             costmap_receipt: None,
-            map_invalidated_at: None,
             status,
         })
     }
 
-    async fn run(mut self,mut input_rx:mpsc::Receiver<InputCommand>,mut urgent_rx:mpsc::Receiver<UrgentCommand>,
-        status_tx:watch::Sender<SchedulerStatus>)->Result<(),RuntimeError>{
-        let mut tick=interval_at(Instant::now()+self.config.tick_interval,self.config.tick_interval);
+    async fn run(
+        mut self,
+        mut input_rx: mpsc::Receiver<InputCommand>,
+        mut urgent_rx: mpsc::Receiver<UrgentCommand>,
+        status_tx: watch::Sender<SchedulerStatus>,
+    ) -> Result<(), RuntimeError> {
+        let mut tick = interval_at(
+            Instant::now() + self.config.tick_interval,
+            self.config.tick_interval,
+        );
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut input_open=true;let mut urgent_open=true;
+        let mut input_open = true;
+        let mut urgent_open = true;
         loop {
-            if !input_open&&!urgent_open{return self.finish_terminal(&status_tx,TerminalOutcome::Shutdown,SchedulerPhase::Idle).await;}
-            let controlling=matches!(self.status.phase,SchedulerPhase::AwaitingPath|SchedulerPhase::Controlling);
-            tokio::select!{biased;
+            if !input_open && !urgent_open {
+                return self
+                    .finish_terminal(&status_tx, TerminalOutcome::Shutdown, SchedulerPhase::Idle)
+                    .await;
+            }
+
+            tokio::select! {biased;
                 command=urgent_rx.recv(),if urgent_open=>match command{
                     Some(command)=>if let Some(result)=self.handle_urgent(&status_tx,command).await{return result},None=>urgent_open=false},
                 event=async{tokio::select!{
                     command=input_rx.recv(),if input_open=>SchedulerEvent::Input(command),
-                    _=tick.tick(),if controlling=>SchedulerEvent::Tick,
+                    _=tick.tick()=>SchedulerEvent::Tick,
                     else=>std::future::pending().await,
                 }}=>match event{
                     SchedulerEvent::Input(command)=>match command{Some(command)=>self.handle_input(&status_tx,command).await,None=>input_open=false},
@@ -769,21 +759,18 @@ where
             }
             UrgentCommand::InvalidateMap {
                 reason,
-                invalidated_at,
                 kind,
                 reply,
             } => {
-                self.map_invalidated_at = Some(
-                    self.map_invalidated_at
-                        .map_or(invalidated_at, |previous| previous.max(invalidated_at)),
-                );
                 self.costmap_receipt = None;
+                self.status.planner_inputs_fresh = false;
+                self.status.input_wait_reason = Some(format!("地图来源暂不可用: {reason}"));
                 if kind == MapInvalidationKind::Invalidated {
                     self.planner.invalidate_execution_map();
                 }
                 self.refresh_input_status(Instant::now());
                 let result = if self.lease_active || self.session.is_some() {
-                    if kind == MapInvalidationKind::TemporaryUnavailable {
+                    if kind == MapInvalidationKind::TemporaryUnavailable || !self.lease_active {
                         self.wait_for_fresh_input(status_tx, format!("地图来源暂不可用: {reason}")).await
                     } else {
                         let error = self.fail_closed(status_tx, RuntimeError::MapSourceInvalidated(reason)).await;
@@ -816,12 +803,7 @@ where
         let result = match command.kind {
             InputKind::StartSession(session) => self.start_session(status_tx, session).await,
             InputKind::SubmitPath(path) => self.submit_path(status_tx, path).await,
-            InputKind::UpdateOdometry(odometry, valid_until, acquired_at) => {
-                self.observe_odometry_at(status_tx, odometry, valid_until, acquired_at)
-            }
-            InputKind::UpdateSourceOdometry(odometry, acquired_at, max_age) => {
-                self.observe_odometry_qualified_at(status_tx, odometry, None, acquired_at, Some(max_age))
-            }
+            InputKind::UpdateOdometry(odometry, maximum) => self.observe_odometry(status_tx,odometry,maximum),
             InputKind::UpdateCostmap(observation, received_at) => {
                 self.observe_costmap(status_tx, observation, received_at)
             }
@@ -839,7 +821,7 @@ where
                 let matching = self.session.as_ref().is_some_and(|session|
                     session.execution_identity.session_id == identity.session_id && session.execution_identity.goal_key == identity.goal_key);
                 let context = if matching
-                    && self.stale_input_reason(Instant::now()).is_none() {
+                    && self.status.planner_inputs_fresh {
                     // 这里只读取当前已消费的实际输入，不执行跟踪或几何检查。
                     self.planner.refresh_execution_context(self.status.last_applied_twist.unwrap_or(Twist2::ZERO))
                         .filter(|context| self.latest_pose.as_ref().is_some_and(|pose|
@@ -870,69 +852,27 @@ where
 
     }
 
-    #[cfg(test)]
     fn observe_odometry(
         &mut self,
         status_tx: &watch::Sender<SchedulerStatus>,
         odometry: PoseStamped,
-        valid_until: Option<Instant>,
-    ) -> Result<(), RuntimeError> {
-        self.observe_odometry_at(status_tx, odometry, valid_until, Instant::now())
-    }
-
-    fn observe_odometry_at(
-        &mut self, status_tx: &watch::Sender<SchedulerStatus>, odometry: PoseStamped,
-        valid_until: Option<Instant>, acquired_at: Instant,
-    ) -> Result<(), RuntimeError> {
-        self.observe_odometry_qualified_at(status_tx, odometry, valid_until, acquired_at, None)
-    }
-
-    fn observe_odometry_qualified_at(
-        &mut self,
-        status_tx: &watch::Sender<SchedulerStatus>,
-        odometry: PoseStamped,
-        valid_until: Option<Instant>,
-        acquired_at: Instant,
         source_max_age: Option<Duration>,
     ) -> Result<(), RuntimeError> {
-        if acquired_at > Instant::now() {
-            return Err(RuntimeError::InvalidInput {
-                field: "odometry.acquired_at", reason: "位姿采集时刻或来源期限无效".into(),
-            });
-        }
         if odometry.frame_id != nuwax_nav_types_messages::NavFrameId::Map {
             return Err(RuntimeError::InvalidInput {
                 field: "odometry.frame_id",
                 reason: format!("expected map, got {}", odometry.frame_id.as_str()),
             });
         }
-        if valid_until.is_some_and(|deadline| deadline <= Instant::now()) {
-            return Err(RuntimeError::StaleInput(
-                "pose source deadline already elapsed before admission".into(),
-            ));
-        }
-        let source_timestamp_ns = odometry.stamp.nanos;
-        if let Some(max_age) = source_max_age {
-            check_pose_data_age(source_timestamp_ns, max_age)?;
-        }
-        validate_source_timestamp(
-            "odometry.source_timestamp_ns",
-            source_timestamp_ns,
-            self.pose_receipt,
-        )?;
-        self.latest_pose = Some(odometry.clone());
-        self.pose_acquired_at = Some(acquired_at);
-        self.planner.update_odometry(odometry);
+        validate_source_timestamp("odometry.source_timestamp_ns", odometry.stamp.nanos)?;
         self.pose_receipt = Some(PlannerInputReceipt {
-            source_timestamp_ns,
+            source_timestamp_ns: odometry.stamp.nanos,
             received_at: Instant::now(),
         });
-        self.pose_valid_until = valid_until;
+        self.latest_pose = Some(odometry.clone());
+        self.planner.update_odometry(odometry);
         self.pose_source_max_age = source_max_age;
         self.refresh_input_status(Instant::now());
-        if self.status.last_terminal.is_none() && self.session.is_none() {
-            self.status.message = "fresh map pose consumed".into();
-        }
         self.publish_status(status_tx);
         Ok(())
     }
@@ -943,106 +883,45 @@ where
         observation: CostmapObservation,
         received_at: Instant,
     ) -> Result<(), RuntimeError> {
-        if received_at > Instant::now() {
-            return Err(RuntimeError::InvalidInput {
-                field: "costmap.received_at",
-                reason: "地图接收时刻不能位于未来".into(),
-            });
-        }
-        if self
-            .map_invalidated_at
-            .is_some_and(|invalidated_at| received_at < invalidated_at)
-        {
-            return Err(RuntimeError::StaleInput(
-                "地图在来源失效前已经接收，不能迟到恢复旧地图".into(),
-            ));
-        }
-        // A verified surface mask/statistics update can keep the same source
-        // stamp. Deliver its geometry, but never renew the original receipt.
-        let unchanged_surface_source=matches!(&observation.costmap,ExecutionMap::SurfaceUpdate(_))
-            && self.costmap_receipt.is_some_and(|old|old.source_timestamp_ns==observation.source_timestamp_ns);
-        if !unchanged_surface_source {
-            validate_source_timestamp("costmap.source_timestamp_ns",observation.source_timestamp_ns,self.costmap_receipt)?;
-        }
-        self.planner.update_execution_map(observation.costmap.clone())?;
-        if !unchanged_surface_source {
-            self.costmap_receipt = Some(PlannerInputReceipt {
-                source_timestamp_ns: observation.source_timestamp_ns, received_at,
-            });
-        }
+        validate_source_timestamp("costmap.source_timestamp_ns", observation.source_timestamp_ns)?;
+        self.planner.update_execution_map(observation.costmap)?;
+        self.costmap_receipt = Some(PlannerInputReceipt {
+            source_timestamp_ns: observation.source_timestamp_ns,
+            received_at,
+        });
         self.refresh_input_status(Instant::now());
-        if self.status.last_terminal.is_none() && self.session.is_none() {
-            self.status.message = "fresh occupancy costmap consumed".into();
-        }
         self.publish_status(status_tx);
         Ok(())
     }
 
     fn refresh_input_status(&mut self, now: Instant) {
-        self.status.pose_source_timestamp_ns = self
-            .pose_receipt
-            .map_or(0, |receipt| receipt.source_timestamp_ns);
-        self.status.costmap_source_timestamp_ns = self
-            .costmap_receipt
-            .map_or(0, |receipt| receipt.source_timestamp_ns);
+        self.status.pose_source_timestamp_ns =
+            self.pose_receipt.map_or(0, |r| r.source_timestamp_ns);
+        self.status.costmap_source_timestamp_ns =
+            self.costmap_receipt.map_or(0, |r| r.source_timestamp_ns);
         self.status.pose_receipt_age_ms = receipt_age_ms(self.pose_receipt, now);
         self.status.costmap_receipt_age_ms = receipt_age_ms(self.costmap_receipt, now);
-        self.status.planner_inputs_fresh = self
-            .pose_receipt
-            .is_some_and(|receipt| self.pose_source_max_age.map_or_else(
-                || self.config.pose_ttl.is_zero() || now.duration_since(receipt.received_at) <= self.config.pose_ttl,
-                |maximum| nuwax_nav_types_messages::source_time::input_is_alive(
-                    now.saturating_duration_since(receipt.received_at).as_nanos() as u64)
-                    && check_pose_data_age(receipt.source_timestamp_ns, maximum).is_ok()))
-            && self.pose_valid_until.is_none_or(|deadline| now < deadline)
-            && self.obstacle_source_available
-
-            && self.costmap_receipt.is_some_and(|receipt| {
-                self.config.costmap_ttl.is_zero() || now.duration_since(receipt.received_at) <= self.config.costmap_ttl
-            });
-        self.status.input_wait_reason = if self.status.planner_inputs_fresh { None } else { self.input_wait_reason(now) };
     }
 
-    fn stale_input_reason(&mut self, now: Instant) -> Option<String> {
-        self.refresh_input_status(now);
-        self.status.input_wait_reason.clone()
-    }
-
-    fn input_wait_reason(&self, now: Instant) -> Option<String> {
-        if !self.obstacle_source_available {return Some("recent obstacle source revoked".into());}
-
-        let pose_reason = if let Some(maximum) = self.pose_source_max_age {
-            self.pose_receipt.and_then(|receipt| {
-                if !nuwax_nav_types_messages::source_time::input_is_alive(
-                    now.saturating_duration_since(receipt.received_at).as_nanos() as u64) {
-                    Some("pose input liveness deadline elapsed".into())
-                } else { check_pose_data_age(receipt.source_timestamp_ns, maximum).err().map(|e| e.to_string()) }
+    fn sample_input_status(&mut self) {
+        let reason = if !self.obstacle_source_available {
+            Some("recent obstacle source revoked".into())
+        } else if let Some(receipt) = self.pose_receipt {
+            self.pose_source_max_age.and_then(|maximum| {
+                check_pose_data_age(receipt.source_timestamp_ns, maximum)
+                    .err()
+                    .map(|e| e.to_string())
             })
         } else {
-            stale_receipt_reason("pose", self.pose_receipt, now, self.config.pose_ttl).or_else(
-                || {
-                    self.pose_valid_until
-                        .filter(|deadline| now >= *deadline)
-                        .map(|_| {
-                            format!(
-                                "pose source deadline elapsed (source_timestamp_ns={})",
-                                self.status.pose_source_timestamp_ns
-                            )
-                        })
-                },
-            )
+            Some("pose has no consumed observation".into())
         };
-        let costmap_reason = stale_receipt_reason(
-            "costmap",
-            self.costmap_receipt,
-            now,
-            self.config.costmap_ttl,
-        );
-        match (pose_reason, costmap_reason) {
-            (None, None) => None,
-            (Some(reason), None) | (None, Some(reason)) => Some(reason),
-            (Some(pose), Some(costmap)) => Some(format!("{pose}; {costmap}")),
-        }
+        let reason = reason.or_else(|| {
+            self.costmap_receipt
+                .is_none()
+                .then(|| "costmap has no consumed observation".into())
+        });
+        self.status.planner_inputs_fresh = reason.is_none();
+        self.status.input_wait_reason = reason;
     }
 
     async fn start_session(
@@ -1050,54 +929,80 @@ where
         status_tx: &watch::Sender<SchedulerStatus>,
         session: NavSession,
     ) -> Result<(), RuntimeError> {
-        validate_session(&session)?;
-        let replacing = self.session.is_some();
-        if let Err(error) = self.motion.acquire(session.motion_generation).await {
+        // 新目标立即退休旧执行；输入缺失时只保存这一份最新目标。
+        if self.lease_active {
+            if let Err(error) = self.motion.release().await {
+                return Err(self.motion_failed(status_tx, error).await);
+            }
+            self.lease_active = false;
+            self.planner.observe_applied_command(Twist2::ZERO);
+            self.status.last_applied_twist = Some(Twist2::ZERO);
+        }
+        self.planner.stop();
+        if let Err(error) = self
+            .planner
+            .configure_execution_goal(&session.goal, session.options)
+        {
+            return Err(self.fail_closed(status_tx, error).await);
+        }
+        self.planner.configure_boundary(&session.boundary);
+        self.planner
+            .observe_measured_motion(self.motion.measured_motion());
+        self.current_path = None;
+        self.current_execution_identity = None;
+        self.current_route_kind = RouteKind::Complete;
+        self.current_path_revision = 0;
+        self.path_wait_started_at = Some(Instant::now());
+        self.status.session_id = Some(session.session_id.clone());
+        self.session = Some(session);
+        self.status.path_revision = 0;
+        self.status.applied_commands = 0;
+        self.status.no_feasible_path = false;
+        self.status.last_terminal = None;
+        self.status.surface_replan_feedback = None;
+        self.status.phase = SchedulerPhase::AwaitingPath;
+        self.status.message = "等待输入".into();
+        self.publish_status(status_tx);
+        Ok(())
+    }
+
+    async fn acquire_session(
+        &mut self,
+        status_tx: &watch::Sender<SchedulerStatus>,
+    ) -> Result<(), RuntimeError> {
+        self.status.phase = SchedulerPhase::Acquiring;
+        self.publish_status(status_tx);
+        let generation = self.session.as_ref().unwrap().motion_generation;
+        if let Err(error) = self.motion.acquire(generation).await {
             let stopped = error.code == Some(ErrorCode::StaleGeneration);
             if error.code.is_none() || error.code == Some(ErrorCode::NotReady) {
                 self.status.motion_sink_ready = false;
             }
             self.status.message = error.message.clone();
-            let release = self.finish_terminal(
+            self.finish_terminal(
                 status_tx,
-                if stopped { TerminalOutcome::Stopped } else { TerminalOutcome::SafetyFailed },
-                if stopped { SchedulerPhase::Idle } else { SchedulerPhase::Failed },
-            ).await;
-            return Err(RuntimeError::LeaseNotGranted(match release {
-                Ok(()) => error.message,
-                Err(release) => format!("{}; {release}", error.message),
-            }));
+                if stopped {
+                    TerminalOutcome::Stopped
+                } else {
+                    TerminalOutcome::SafetyFailed
+                },
+                if stopped {
+                    SchedulerPhase::Idle
+                } else {
+                    SchedulerPhase::Failed
+                },
+            )
+            .await?;
+            return Err(RuntimeError::LeaseNotGranted(error.message));
         }
         self.lease_active = true;
-        if !replacing {
-            self.planner.stop();
-            if let Err(error) = self.planner.configure_execution_goal(&session.goal, session.options) {
-                return Err(self.fail_closed(status_tx, error).await);
-            }
-            self.current_path = None;
-            self.current_execution_identity = None;
-            self.current_route_kind = RouteKind::Complete;
-        }
-        self.planner.set_goal_log_context(&session.session_id);
-        self.planner.configure_boundary(&session.boundary);
-        self.planner.observe_measured_motion(self.motion.measured_motion());
-        self.status.no_feasible_path = false;
-        self.status.applied_commands = 0;
-        self.status.session_id = Some(session.session_id.clone());
-        self.session = Some(session);
-        self.awaiting_session_path = true;
-        self.current_path_revision = 0;
-        self.path_wait_started_at = Some(Instant::now());
-        self.status.phase = if self.current_execution_identity.is_some() {
+        self.status.motion_sink_ready = true;
+        self.status.phase = if self.current_path_revision > 0 {
             SchedulerPhase::Controlling
         } else {
             SchedulerPhase::AwaitingPath
         };
-        self.status.path_revision = 0;
-        self.status.motion_sink_ready = true;
-        self.status.last_terminal = None;
-        self.status.surface_replan_feedback = None;
-        self.status.message = "导航租约已接管，等待新路径".into();
+        self.status.message = "等待路径".into();
         self.publish_status(status_tx);
         Ok(())
     }
@@ -1113,8 +1018,7 @@ where
         if path.session_id != session.session_id {
             return Err(path_rejected("path does not belong to the current navigation session"));
         }
-        if !self.lease_active
-            || !matches!(
+        if !matches!(
                 self.status.phase,
                 SchedulerPhase::AwaitingPath | SchedulerPhase::Controlling
             )
@@ -1133,7 +1037,7 @@ where
                     .as_ref()
                     .is_some_and(|identity| identity.as_ref() == &path.execution_identity);
             if immutable {
-                if self.status.phase == SchedulerPhase::AwaitingPath {
+                if self.lease_active && self.status.phase == SchedulerPhase::AwaitingPath {
                     return Err(path_rejected(
                         "失效路径需要更高规划修订，不能用同修订重放恢复",
                     ));
@@ -1160,15 +1064,11 @@ where
 
             ..
         } = path;
-        if self.awaiting_session_path {
-            self.planner.configure_execution_goal(&session.goal, session.options)?;
-        }
         self.planner.replace_typed_execution_path(
             planner_path.clone(),
             path_yaws.clone(),
             session.goal.clone(),
         )?;
-        self.awaiting_session_path = false;
         self.current_path_revision = path_revision;
         self.current_route_kind = route_kind;
 
@@ -1176,7 +1076,7 @@ where
         self.current_execution_identity = Some(Arc::new(execution_identity));
         self.status.surface_replan_feedback = None;
         // 等待预算在真正执行有效控制步骤后清除，不能靠反复投递无效新路径续期。
-        self.status.phase = SchedulerPhase::Controlling;
+        self.status.phase = if self.lease_active {SchedulerPhase::Controlling}else{SchedulerPhase::AwaitingPath};
         self.status.path_revision = self.current_path_revision;
         self.status.no_feasible_path = false;
         self.status.message = "versioned path accepted".into();
@@ -1211,11 +1111,6 @@ where
         &mut self,
         status_tx: &watch::Sender<SchedulerStatus>,
     ) -> Result<(), RuntimeError> {
-
-        if let Some(reason) = self.stale_input_reason(Instant::now()) {
-
-            return self.wait_for_fresh_input(status_tx, reason).await;
-        }
 
         let mut step = {
 
@@ -1279,10 +1174,6 @@ where
                 self.publish_status(status_tx);
                 Ok(())
             }
-            LocalExecutionPayload::Succeeded if self.awaiting_session_path => {
-                self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
-                Ok(())
-            }
             LocalExecutionPayload::Succeeded => {
                 self.finish_terminal(status_tx, TerminalOutcome::Succeeded, SchedulerPhase::Idle)
                     .await
@@ -1317,8 +1208,6 @@ where
         self.status.message="速度请求已接受".into();self.publish_status(status_tx);Ok(())
     }
 
-    // False means the selected command expired and an ordinary zero was confirmed.
-
     fn wrap_local_intent(
         &mut self,
         step: PlannerStep,
@@ -1343,20 +1232,31 @@ where
         })
     }
 
-    async fn session_tick(&mut self,status_tx:&watch::Sender<SchedulerStatus>)->Result<(),RuntimeError>{
-        match self.status.phase{
-            SchedulerPhase::Controlling=>self.control_tick(status_tx).await?,
-            SchedulerPhase::AwaitingPath=>{
-                if let Some(reason)=self.stale_input_reason(Instant::now()){
-                    self.wait_for_fresh_input(status_tx,reason).await?;
-                }else{self.apply_controller_twist(status_tx,Twist2::ZERO).await?;}
-                let context=self.status.last_applied_twist.and_then(|v|self.planner.refresh_execution_context(v));
-                if let Some(feedback)=&mut self.status.surface_replan_feedback{
-                    if feedback.zero_sent_rejection{feedback.current_context=context;}
-                }
-            },_=>return Ok(())
+    async fn session_tick(
+        &mut self,
+        status_tx: &watch::Sender<SchedulerStatus>,
+    ) -> Result<(), RuntimeError> {
+        self.refresh_input_status(Instant::now());
+        self.sample_input_status();
+        if self.session.is_none() {
+            self.publish_status(status_tx);
+            return Ok(());
         }
-        if self.session.is_some(){self.check_path_wait_timeout(status_tx).await?;}
+        if let Some(reason) = self.status.input_wait_reason.clone() {
+            self.wait_for_fresh_input(status_tx, reason).await?;
+        } else {
+            if !self.lease_active {
+                self.acquire_session(status_tx).await?;
+            }
+            if self.status.phase == SchedulerPhase::Controlling {
+                self.control_tick(status_tx).await?;
+            } else {
+                self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
+            }
+        }
+        if self.session.is_some() {
+            self.check_path_wait_timeout(status_tx).await?;
+        }
         Ok(())
     }
 
@@ -1471,6 +1371,7 @@ where
 
             self.planner.stop();
         }
+        let owned_lease = self.lease_active;
         let release_error = if self.lease_active {
             self.lease_active = false;
             match self.motion.release().await {
@@ -1502,7 +1403,7 @@ where
         }
         self.status.message = if terminal == TerminalOutcome::Stopped {
             "已被停止".into()
-        } else { format!("{terminal:?}，租约已释放") };
+        } else if owned_lease { format!("{terminal:?}，租约已释放") } else { format!("{terminal:?}，目标已结束（未持有租约）") };
         if let Some(reason) = failure_reason {
             self.status.message = format!("{reason}; {}", self.status.message);
         }
@@ -1596,32 +1497,22 @@ impl NavSchedulerHandle {
 
     /// 同进程当前观察入口；调用时刻保留至队列消费，传输来源须用采集时刻入口。
     pub async fn update_odometry(&self, odometry: PoseStamped) -> Result<(), RuntimeError> {
-        self.send_input(InputKind::UpdateOdometry(odometry, None, Instant::now()))
+        self.send_input(InputKind::UpdateOdometry(odometry, None))
             .await
     }
 
     /// 保留来源期限的同进程当前观察入口；传输来源须另提供实际采集时刻。
-    pub async fn update_odometry_with_deadline(
-        &self,
-        odometry: PoseStamped,
-        valid_until: Instant,
-    ) -> Result<(), RuntimeError> {
-        self.send_input(InputKind::UpdateOdometry(odometry, Some(valid_until), Instant::now()))
-            .await
-    }
 
     /// 生产位姿保留实际采集单调时刻，保留采集时刻，不把队列消费当新采样。
-    pub async fn update_odometry_with_acquisition(
-        &self, odometry: PoseStamped, acquired_at: Instant, valid_until: Instant,
-    ) -> Result<(), RuntimeError> {
-        self.send_input(InputKind::UpdateOdometry(odometry, Some(valid_until), acquired_at)).await
-    }
 
     /// 生产位姿按来源钟动态判龄；采集单调时刻保留真实墙钟年龄，不能续期执行许可。
     pub async fn update_odometry_with_source_age(
-        &self, odometry: PoseStamped, acquired_at: Instant, max_source_age: Duration,
+        &self,
+        odometry: PoseStamped,
+        max_source_age: Duration,
     ) -> Result<(), RuntimeError> {
-        self.send_input(InputKind::UpdateSourceOdometry(odometry, acquired_at, max_source_age)).await
+        self.send_input(InputKind::UpdateOdometry(odometry, Some(max_source_age)))
+            .await
     }
 
     /// Update the planner costmap with its real revision and source timestamp.
@@ -1654,7 +1545,7 @@ impl NavSchedulerHandle {
             .await
     }
 
-    /// Cancel the active session and wait for a verified fence.
+    /// 取消当前目标并等待租约释放。
     pub async fn cancel(&self, session_id: &str) -> Result<(), RuntimeError> {
         let (reply, result) = oneshot::channel();
         self.urgent_tx
@@ -1670,27 +1561,19 @@ impl NavSchedulerHandle {
 
     /// 明确撤销地图来源；活跃会话等待失败租约释放，空闲状态不申请运动租约。
     pub async fn invalidate_map(&self, reason: impl Into<String>) -> Result<(), RuntimeError> {
-        self.invalidate_map_received(reason, Instant::now(), MapInvalidationKind::Invalidated).await
+        self.invalidate_map_source(reason, MapInvalidationKind::Invalidated).await
     }
 
     /// 使用来源失效事件的原接收时刻，不把排队处理时刻当作来源水位。
-    pub async fn invalidate_map_received(
+    pub async fn invalidate_map_source(
         &self,
         reason: impl Into<String>,
-        received_at: Instant,
         kind: MapInvalidationKind,
     ) -> Result<(), RuntimeError> {
-        if received_at > Instant::now() {
-            return Err(RuntimeError::InvalidInput {
-                field: "map.invalidated_at",
-                reason: "地图失效事件的接收时刻不能位于未来".into(),
-            });
-        }
         let (reply, result) = oneshot::channel();
         self.urgent_tx
             .send(UrgentCommand::InvalidateMap {
                 reason: reason.into(),
-                invalidated_at: received_at,
                 kind,
                 reply,
             })
@@ -1839,8 +1722,7 @@ struct InputCommand {
 enum InputKind {
     StartSession(NavSession),
     SubmitPath(VersionedPath),
-    UpdateOdometry(PoseStamped, Option<Instant>, Instant),
-    UpdateSourceOdometry(PoseStamped, Instant, Duration),
+    UpdateOdometry(PoseStamped, Option<Duration>),
     UpdateCostmap(CostmapObservation, Instant),
     UpdateObstacleSource(Option<ExecutionMap>,bool,Option<Option<Arc<RegisteredFrame>>>),
     PlanningDiagnostic(String, GoalKey, String, bool, bool),
@@ -1854,7 +1736,6 @@ enum UrgentCommand {
     },
     InvalidateMap {
         reason: String,
-        invalidated_at: Instant,
         kind: MapInvalidationKind,
         reply: oneshot::Sender<Result<(), RuntimeError>>,
     },
@@ -1873,22 +1754,10 @@ fn validate_config(config: SchedulerConfig) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-fn validate_source_timestamp(
-    field: &'static str,
-    source_timestamp_ns: i64,
-    previous: Option<PlannerInputReceipt>,
-) -> Result<(), RuntimeError> {
+// 这里只保留原有时间戳格式约束，不比较年龄或新旧顺序。
+fn validate_source_timestamp(field: &'static str, source_timestamp_ns: i64) -> Result<(), RuntimeError> {
     if source_timestamp_ns <= 0 {
-        return Err(RuntimeError::InvalidInput {
-            field,
-            reason: "must be positive".into(),
-        });
-    }
-    if previous.is_some_and(|receipt| source_timestamp_ns <= receipt.source_timestamp_ns) {
-        return Err(RuntimeError::StaleInput(format!(
-            "{field}={source_timestamp_ns} did not advance beyond {}",
-            previous.map_or(0, |receipt| receipt.source_timestamp_ns),
-        )));
+        return Err(RuntimeError::InvalidInput { field, reason: "must be positive".into() });
     }
     Ok(())
 }
@@ -1901,29 +1770,10 @@ fn receipt_age_ms(receipt: Option<PlannerInputReceipt>, now: Instant) -> u64 {
     })
 }
 
-fn stale_receipt_reason(
-    label: &str,
-    receipt: Option<PlannerInputReceipt>,
-    now: Instant,
-    ttl: Duration,
-) -> Option<String> {
-    let Some(receipt) = receipt else {
-        return Some(format!("{label} has no consumed observation"));
-    };
-    let age = now.duration_since(receipt.received_at);
-    (!ttl.is_zero() && age > ttl).then(|| {
-        format!(
-            "{label} receipt age={}ms exceeds TTL={}ms (source_timestamp_ns={})",
-            age.as_millis(),
-            ttl.as_millis(),
-            receipt.source_timestamp_ns,
-        )
-    })
-}
-
-fn validate_session(session: &NavSession) -> Result<(), RuntimeError> {
-    session.options.validate().map_err(|reason| RuntimeError::InvalidInput {field:"goal_options",reason})?;
-    session.goal.validate()
+fn path_rejected(reason: impl Into<String>) -> RuntimeError {
+    RuntimeError::PathRejected {
+        reason: reason.into(),
+    }
 }
 
 fn validate_map_pose(pose: &PoseStamped, field: &'static str) -> Result<(), RuntimeError> {
@@ -1945,12 +1795,6 @@ fn validate_map_pose(pose: &PoseStamped, field: &'static str) -> Result<(), Runt
     Ok(())
 }
 
-fn path_rejected(reason: impl Into<String>) -> RuntimeError {
-    RuntimeError::PathRejected {
-        reason: reason.into(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     include!("position_zero_runtime_tests.rs");
@@ -1959,7 +1803,6 @@ mod tests {
     include!("recent_source_health_tests.rs");
     include!("registered_frame_stream_tests.rs");
     use std::sync::{Arc, Mutex};
-    use std::sync::atomic::Ordering;
 
     use nuwax_nav_astar::navigation_map::CostMap2D;
     use nuwax_nav_types_messages::{NavFrameId, Point2, Pose3, Timestamp};
@@ -2177,33 +2020,17 @@ mod tests {
         motion: FakeMotion,
         planner: FakePlanner,
     ) -> (NavSchedulerHandle, JoinHandle<Result<(), RuntimeError>>) {
-        test_scheduler_with_ttls(
-            motion,
-            planner,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
+        spawn_scheduler(
+            NavScheduler::new(
+                motion,
+                planner,
+                SchedulerConfig {
+                    tick_interval: Duration::from_millis(5),
+                    path_wait_timeout: Duration::from_secs(1),
+                },
+            )
+            .unwrap(),
         )
-    }
-
-    fn test_scheduler_with_ttls(
-        motion: FakeMotion,
-        planner: FakePlanner,
-        pose_ttl: Duration,
-        costmap_ttl: Duration,
-    ) -> (NavSchedulerHandle, JoinHandle<Result<(), RuntimeError>>) {
-        let scheduler = NavScheduler::new(
-            motion,
-            planner,
-            SchedulerConfig {
-                tick_interval: Duration::from_millis(5),
-
-                path_wait_timeout: Duration::from_secs(1),
-                    pose_ttl,
-                costmap_ttl,
-            },
-        )
-        .expect("test scheduler");
-        spawn_scheduler(scheduler)
     }
 
     async fn takeover_scheduler_fixture() -> (
@@ -2221,11 +2048,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_ingress_keeps_frame_and_positive_timestamp_syntax_constraints() {
+        let (mut scheduler,status,_)=takeover_scheduler_fixture().await;
+        let mut foreign=map_pose();foreign.frame_id=NavFrameId::Odom;
+        assert!(matches!(scheduler.observe_odometry(&status,foreign,None),
+            Err(RuntimeError::InvalidInput {field:"odometry.frame_id",..})));
+        for timestamp in [0,-1] {
+            let mut pose=map_pose();pose.stamp.nanos=timestamp;
+            assert!(matches!(scheduler.observe_odometry(&status,pose,None),
+                Err(RuntimeError::InvalidInput {field:"odometry.source_timestamp_ns",..})));
+            assert!(matches!(scheduler.observe_costmap(&status,costmap_at(timestamp),Instant::now()),
+                Err(RuntimeError::InvalidInput {field:"costmap.source_timestamp_ns",..})));
+        }
+        assert_eq!(scheduler.status.pose_source_timestamp_ns,1_000_000_000);
+        assert_eq!(scheduler.status.costmap_source_timestamp_ns,1);
+        assert_eq!(scheduler.status.phase,SchedulerPhase::Controlling);
+    }
+
+    #[tokio::test]
+    async fn latest_goal_waits_for_inputs_and_replaces_without_acquiring() {
+        let motion = Arc::new(Mutex::new(FakeMotionState::default()));
+        let mut scheduler = NavScheduler::new(
+            FakeMotion(motion.clone()),
+            FakePlanner::commanding(),
+            SchedulerConfig::default(),
+        )
+        .unwrap();
+        let (status, _) = watch::channel(scheduler.status.clone());
+        scheduler
+            .start_session(&status, session_for("old"))
+            .await
+            .unwrap();
+        scheduler.session_tick(&status).await.unwrap();
+        scheduler
+            .start_session(&status, session_for("latest"))
+            .await
+            .unwrap();
+        scheduler.session_tick(&status).await.unwrap();
+        assert_eq!(scheduler.status.session_id.as_deref(), Some("latest"));
+        assert!(scheduler.status.message.contains("等待"));
+        assert!(motion.lock().unwrap().calls.is_empty());
+        let (reply, result) = oneshot::channel();
+        scheduler
+            .handle_urgent(
+                &status,
+                UrgentCommand::InvalidateMap {
+                    reason: "地图尚未就绪".into(),
+                    kind: MapInvalidationKind::Invalidated,
+                    reply,
+                },
+            )
+            .await;
+        result.await.unwrap().unwrap();
+        assert_eq!(scheduler.status.session_id.as_deref(), Some("latest"));
+        scheduler
+            .observe_odometry(&status, map_pose(), None)
+            .unwrap();
+        scheduler
+            .observe_costmap(&status, costmap_at(1), Instant::now())
+            .unwrap();
+        scheduler
+            .submit_path(&status, path_for("latest", 1))
+            .await
+            .unwrap();
+        scheduler.session_tick(&status).await.unwrap();
+        assert!(scheduler
+            .status
+            .last_applied_twist
+            .is_some_and(|twist| twist != Twist2::ZERO));
+        assert_eq!(
+            motion
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .filter(|c| c.starts_with("acquire:"))
+                .count(),
+            1
+        );
+        assert!(motion
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .all(|c| !c.starts_with("release:")));
+    }
+
+    #[tokio::test]
     async fn replacement_lease_rejection_stops_execution_and_releases_previous_lease() {
         let (mut scheduler,status,motion)=takeover_scheduler_fixture().await;
         motion.lock().unwrap().rejected_generation=Some(2);
         let mut next=session_for("goal-2");next.motion_generation=2;
-        assert!(matches!(scheduler.start_session(&status,next).await,Err(RuntimeError::LeaseNotGranted(_))));
+        scheduler.start_session(&status,next).await.unwrap();
+        assert!(matches!(scheduler.session_tick(&status).await,Err(RuntimeError::LeaseNotGranted(_))));
         assert!(scheduler.session.is_none());
         assert_eq!(scheduler.status.last_terminal,Some(TerminalOutcome::Stopped));
         assert!(scheduler.current_execution_identity.is_none());
@@ -2233,30 +2148,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_grant_continues_old_path_until_new_path_arrives_without_zero() {
+    async fn replacement_retires_old_path_and_waits_for_the_new_path() {
         let (mut scheduler, status, motion) = takeover_scheduler_fixture().await;
-        let old_identity = scheduler.current_execution_identity.clone().unwrap();
-        let old_stops = scheduler.planner.state.lock().unwrap().stops;
-        let mut next = session_for("goal-2"); next.motion_generation = 2;
+        let stops = scheduler.planner.state.lock().unwrap().stops;
+        let mut next = session_for("goal-2");
+        next.motion_generation = 2;
         scheduler.start_session(&status, next).await.unwrap();
         assert_eq!(scheduler.status.session_id.as_deref(), Some("goal-2"));
-        assert_eq!(scheduler.status.phase, SchedulerPhase::Controlling);
-        assert!(scheduler.status.motion_sink_ready);
-        assert!(Arc::ptr_eq(&old_identity, scheduler.current_execution_identity.as_ref().unwrap()));
+        assert_eq!(scheduler.status.phase, SchedulerPhase::AwaitingPath);
+        assert!(scheduler.current_execution_identity.is_none());
+        assert!(scheduler.current_path.is_none());
+        assert!(!scheduler.lease_active);
+        assert_eq!(scheduler.planner.state.lock().unwrap().stops, stops + 1);
         scheduler.session_tick(&status).await.unwrap();
-        assert!(scheduler.path_wait_started_at.is_none(),"连续无可执行运动计时在非零速度请求被接受后清除");
-        assert_eq!(scheduler.planner.state.lock().unwrap().stops, old_stops);
-        let mut new_path = path_for("goal-2", 1);
-        new_path.path = ExecutionPath::Planar(Path2D::stamped(NavFrameId::Map, Timestamp::default(),
-            vec![Point2::new(1., 0.), Point2::new(3., 1.)]));
-        let expected = new_path.path.clone();
-        scheduler.submit_path(&status, new_path).await.unwrap();
-        assert_eq!(scheduler.current_execution_identity.as_ref().unwrap().session_id, "goal-2");
-        assert_eq!(scheduler.current_path.as_ref().unwrap().0, expected);
+        assert_eq!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));
+        assert!(scheduler.path_wait_started_at.is_some());
+        scheduler
+            .submit_path(&status, path_for("goal-2", 1))
+            .await
+            .unwrap();
         scheduler.session_tick(&status).await.unwrap();
+        assert_eq!(
+            scheduler
+                .current_execution_identity
+                .as_ref()
+                .unwrap()
+                .session_id,
+            "goal-2"
+        );
+        assert!(scheduler
+            .status
+            .last_applied_twist
+            .is_some_and(|twist| twist != Twist2::ZERO));
+        assert!(scheduler.path_wait_started_at.is_none());
         let motion = motion.lock().unwrap();
-        assert!(!motion.calls.iter().any(|call| call.starts_with("release:")));
-        assert!(motion.twist_probe.as_ref().unwrap().iter().all(|(_, _, twist)| *twist != Twist2::ZERO));
+        assert_eq!(
+            motion
+                .calls
+                .iter()
+                .filter(|call| call.starts_with("release:"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            motion
+                .calls
+                .iter()
+                .filter(|call| call.starts_with("acquire:"))
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -2290,12 +2231,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_pose_age_uses_slow_clock_and_still_rejects_stopped_clock_or_link() {
+    async fn source_pose_age_uses_slow_clock_and_rejects_stopped_source_clock() {
         const CHILD: &str = "NEH_TEST_POSE_DATA_TIME";
         let Some(path) = std::env::var_os(CHILD) else {
             let path = std::env::temp_dir().join(format!("neh-nav-data-clock-{}", std::process::id()));
             let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "tests::source_pose_age_uses_slow_clock_and_still_rejects_stopped_clock_or_link"])
+                .args(["--exact", "tests::source_pose_age_uses_slow_clock_and_rejects_stopped_source_clock"])
                 .env(CHILD, &path).env("NUWAX_SOURCE_TIME_FILE", &path).status().unwrap();
             std::fs::remove_file(path).unwrap();
             assert!(status.success());
@@ -2314,21 +2255,18 @@ mod tests {
         let (tx, _) = watch::channel(scheduler.status.clone());
         scheduler.observe_costmap(&tx, costmap_at(1), Instant::now()).unwrap();
         // 0.35倍时这份来源年龄200ms的数据，实际墙龄已超过原500ms来源期限。
-        let acquired = Instant::now() - Duration::from_millis(572);
         let mut pose = map_pose_at(1);
         pose.stamp.nanos = source as i64;
-        scheduler.observe_odometry_qualified_at(&tx, pose, None, acquired,
-            Some(Duration::from_millis(500))).unwrap();
-        assert_eq!(scheduler.pose_acquired_at, Some(acquired), "数据判龄不能刷新执行采集时刻");
-        scheduler.refresh_input_status(Instant::now() + Duration::from_secs(1));
-        assert!(scheduler.status.planner_inputs_fresh, "墙钟推进不等于来源数据变旧");
+        scheduler.observe_odometry(&tx, pose, Some(Duration::from_millis(500))).unwrap();
+        scheduler.pose_receipt.as_mut().unwrap().received_at = Instant::now() - Duration::from_secs(6);
+        scheduler.session_tick(&tx).await.unwrap();
+        assert!(scheduler.status.planner_inputs_fresh, "来源钟仍新鲜时，不再附加收据年龄门");
         write_clock(source + 600_000_000, true);
-        assert!(scheduler.stale_input_reason(Instant::now()).unwrap().contains("pose source deadline elapsed"));
-        write_clock(source + 200_000_000, true);
-        assert!(scheduler.stale_input_reason(Instant::now() + Duration::from_secs(6))
-            .unwrap().contains("liveness"), "来源钟有更新，断流输入仍须拒绝");
+        scheduler.session_tick(&tx).await.unwrap();
+        assert!(scheduler.status.input_wait_reason.as_ref().unwrap().contains("pose source deadline elapsed"));
         write_clock(source + 200_000_000, false);
-        assert!(scheduler.stale_input_reason(Instant::now()).unwrap().contains("停止推进"));
+        scheduler.session_tick(&tx).await.unwrap();
+        assert!(scheduler.status.input_wait_reason.as_ref().unwrap().contains("停止推进"));
     }
 
     fn execution_identity_for(session_id: &str, path_revision: u64) -> PathExecutionIdentity {
@@ -2383,6 +2321,15 @@ mod tests {
         // 测试输入表示真实有效姿态，不能用全零四元数冒充单位旋转。
         pose.pose.orientation = nuwax_nav_types_messages::Quaternion::IDENTITY;
         pose.stamp = Timestamp::from_unix(seconds, 0);
+        pose
+    }
+
+    fn current_map_pose() -> PoseStamped {
+        let mut pose = map_pose();
+        pose.stamp.nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
         pose
     }
 
@@ -2461,7 +2408,7 @@ mod tests {
             FakeMotion(motion.clone()), planner, SchedulerConfig::default(),
         ).unwrap());
         handle.update_costmap(costmap_at(1)).await.unwrap();
-        handle.update_odometry_with_deadline(map_pose_at(1), Instant::now() + Duration::from_millis(500)).await.unwrap();
+        handle.update_odometry_with_source_age(current_map_pose(), Duration::from_millis(500)).await.unwrap();
         handle.start_session(session()).await.unwrap();
         handle.submit_path(path()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -2474,7 +2421,7 @@ mod tests {
         assert_eq!(paused.path_revision, 1);
         assert_eq!(paused.session_id.as_deref(), Some("goal-1"));
 
-        handle.update_odometry_with_deadline(map_pose_at(2), Instant::now() + Duration::from_millis(500)).await.unwrap();
+        handle.update_odometry_with_source_age(current_map_pose(), Duration::from_millis(500)).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while !handle.status().last_applied_twist.is_some_and(|twist| twist != Twist2::ZERO) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -2500,7 +2447,7 @@ mod tests {
         scheduler.submit_path(&status, path()).await.unwrap();
         scheduler.session_tick(&status).await.unwrap();
         assert!(scheduler.path_wait_started_at.is_none());
-        scheduler.pose_valid_until = Some(Instant::now() - Duration::from_millis(1));
+        scheduler.pose_source_max_age = Some(Duration::from_millis(500));
         scheduler.session_tick(&status).await.unwrap();
         let first_wait = scheduler.path_wait_started_at;
         for _ in 0..3 { scheduler.session_tick(&status).await.unwrap(); }
@@ -2615,8 +2562,7 @@ mod tests {
                 tick_interval: Duration::from_millis(5),
 
                 path_wait_timeout: Duration::from_secs(1),
-                    pose_ttl: Duration::from_secs(1),
-                costmap_ttl: Duration::from_secs(1),
+
             },
         )
         .expect("basic in-process scheduler");
@@ -2706,8 +2652,7 @@ mod tests {
             production_local_backend(LocalExecutionBackendKind::BasicInProcess).unwrap(),
             SchedulerConfig {
                 tick_interval: Duration::from_millis(5),
-                pose_ttl: Duration::from_secs(1),
-                costmap_ttl: Duration::from_secs(1),
+
                 ..SchedulerConfig::default()
             },
         )
@@ -2765,6 +2710,7 @@ mod tests {
             Err(RuntimeError::PathMutation { .. })
         ));
         assert_eq!(handle.status().last_terminal, None);
+        wait_for_phase(&handle,SchedulerPhase::Controlling).await;
         assert_eq!(handle.status().phase, SchedulerPhase::Controlling);
 
         handle.shutdown().await.expect("关闭");
@@ -2802,6 +2748,7 @@ mod tests {
         }
         handle.submit_path(resent).await.expect("same route with a new send time is idempotent");
 
+        wait_for_phase(&handle,SchedulerPhase::Controlling).await;
         let mut wrong_identity = accepted.clone();
         wrong_identity.session_id = "wrong-session".into();
         wrong_identity.execution_identity.session_id = "wrong-session".into();
@@ -2867,6 +2814,7 @@ mod tests {
             .submit_path(accepted.clone())
             .await
             .expect("initial path");
+        wait_for_phase(&handle,SchedulerPhase::Controlling).await;
         handle.invalidate_map("测试实际地图失效终态").await.expect("地图失效须停车");
 
         let terminal = handle.status();
@@ -2885,6 +2833,10 @@ mod tests {
             .update_costmap(costmap_at(2_000_000_000))
             .await
             .expect("post-terminal costmap receipt");
+        tokio::time::timeout(Duration::from_secs(1),async {
+            let mut state=handle.subscribe_status();
+            while !state.borrow().planner_inputs_fresh {state.changed().await.unwrap();}
+        }).await.unwrap();
         let after_receipts = handle.status();
         assert_eq!(after_receipts.phase, SchedulerPhase::Failed);
         assert_eq!(
@@ -3014,7 +2966,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replan_confirms_zero_requires_new_revision_and_remains_cancellable() {
+    async fn replan_sends_zero_requires_new_revision_and_remains_cancellable() {
         let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
         let planner = FakePlanner::commanding();
         let planner_state = Arc::clone(&planner.state);
@@ -3027,7 +2979,10 @@ mod tests {
             .unwrap();
         handle.start_session(session()).await.unwrap();
         handle.submit_path(path()).await.unwrap();
-        wait_for_phase(&handle, SchedulerPhase::AwaitingPath).await;
+        tokio::time::timeout(Duration::from_secs(1),async {
+            let mut state=handle.subscribe_status();
+            while !state.borrow().surface_replan_feedback.as_ref().is_some_and(|f|f.zero_sent_rejection){state.changed().await.unwrap();}
+        }).await.unwrap();
         let held = handle.status();
         assert_eq!(held.last_applied_twist, Some(Twist2::ZERO));
         assert!(held.applied_commands > 0);
@@ -3301,8 +3256,7 @@ mod tests {
                 tick_interval: Duration::from_millis(2),
 
                 path_wait_timeout: Duration::from_millis(60),
-                pose_ttl: Duration::from_secs(1),
-                costmap_ttl: Duration::from_secs(1),
+
                 ..SchedulerConfig::default()
             },
         )
@@ -3337,95 +3291,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_pose_deadline_pauses_while_receipt_is_still_fresh() {
-        let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
-        let (handle, task) = test_scheduler(
-            FakeMotion(Arc::clone(&motion_state)),
-            FakePlanner::commanding(),
-        );
-        handle
-            .update_costmap(costmap_at(1_000_000_000))
-            .await
+    async fn source_pose_age_is_checked_at_control_consumption_and_recovers() {
+        let (mut scheduler, status, motion) = takeover_scheduler_fixture().await;
+        // 接收时不判龄，控制拍取用时才判；旧来源时间允许覆盖最新槽位。
+        scheduler
+            .observe_odometry(&status, map_pose_at(1), Some(Duration::from_millis(500)))
             .unwrap();
-        handle
-            .update_odometry_with_deadline(map_pose(), Instant::now() + Duration::from_millis(120))
-            .await
-            .unwrap();
-        assert!(matches!(
-            handle
-                .update_odometry_with_deadline(
-                    map_pose_at(2),
-                    Instant::now() - Duration::from_millis(1)
-                )
-                .await,
-            Err(RuntimeError::StaleInput(_))
-        ));
-        assert_eq!(
-            handle.status().pose_source_timestamp_ns,
-            1_000_000_000,
-            "过期输入不能覆盖已接纳位姿"
-        );
-        handle.start_session(session()).await.unwrap();
-        handle.submit_path(path()).await.unwrap();
-        let terminal = wait_for_input_pause(&handle).await;
-        assert!(
-            terminal.applied_commands > 0,
-            "验证运动开始后按来源期限实际停车"
-        );
-        assert!(
-            terminal.pose_receipt_age_ms < 1_000,
-            "接收期限仍有效，来源期限已先到"
-        );
-        assert!(terminal.message.contains("pose source deadline"));
-        assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
-
-        handle.shutdown().await.unwrap();
-        task.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn supplied_map_receipt_age_survives_construction_and_rejects_the_future() {
-        let motion_state = Arc::new(Mutex::new(FakeMotionState { twist_probe: Some(Vec::new()), ..Default::default() }));
-        let (handle, task) = test_scheduler(
-            FakeMotion(Arc::clone(&motion_state)),
-            FakePlanner::commanding(),
-        );
-        handle.update_odometry(map_pose()).await.unwrap();
-        assert!(matches!(
-            handle
-                .update_costmap_received(
-                    costmap_at(1_000_000_000),
-                    Instant::now() + Duration::from_secs(1)
-                )
-                .await,
-            Err(RuntimeError::InvalidInput {
-                field: "costmap.received_at",
-                ..
-            })
-        ));
-        handle
-            .update_costmap_received(
-                costmap_at(1_000_000_000),
-                Instant::now() - Duration::from_secs(2),
-            )
-            .await
-            .unwrap();
-        assert!(!handle.status().planner_inputs_fresh);
-        handle.start_session(session()).await.unwrap();
-        handle.submit_path(path()).await.unwrap();
-        wait_for_input_pause(&handle).await;
-        assert!(motion_state
-            .lock()
+        assert_eq!(scheduler.status.pose_source_timestamp_ns, 1_000_000_000);
+        scheduler.session_tick(&status).await.unwrap();
+        assert!(!scheduler.status.planner_inputs_fresh);
+        assert_eq!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));
+        assert!(scheduler
+            .status
+            .input_wait_reason
+            .as_ref()
             .unwrap()
-            .twist_probe.as_ref().unwrap()
-            .iter()
-            .all(|(_, _, twist)| *twist == Twist2::ZERO));
-        handle.shutdown().await.unwrap();
-        task.await.unwrap().unwrap();
+            .contains("pose source deadline"));
+        assert!(scheduler.status.pose_receipt_age_ms < 1000);
+        scheduler
+            .observe_odometry(
+                &status,
+                current_map_pose(),
+                Some(Duration::from_millis(500)),
+            )
+            .unwrap();
+        assert!(!scheduler.status.planner_inputs_fresh, "接收路径不重算年龄");
+        scheduler.session_tick(&status).await.unwrap();
+        assert!(scheduler.status.planner_inputs_fresh);
+        assert!(scheduler
+            .status
+            .last_applied_twist
+            .is_some_and(|twist| twist != Twist2::ZERO));
+        assert_eq!(
+            motion
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .filter(|c| c.starts_with("acquire:"))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
-    async fn verified_fence_resets_the_native_command_boundary_before_the_next_goal() {
+    async fn map_receipt_is_diagnostic_and_same_or_older_source_time_is_accepted() {
+        let (mut scheduler, status, _) = takeover_scheduler_fixture().await;
+        for source in [1_000_000_000, 1_000_000_000, 1] {
+            scheduler
+                .observe_costmap(
+                    &status,
+                    costmap_at(source),
+                    Instant::now() - Duration::from_secs(2),
+                )
+                .unwrap();
+            scheduler.session_tick(&status).await.unwrap();
+            assert!(scheduler.status.planner_inputs_fresh);
+            assert!(scheduler.status.costmap_receipt_age_ms >= 2000);
+            assert_eq!(scheduler.status.costmap_source_timestamp_ns, source);
+            assert!(scheduler
+                .status
+                .last_applied_twist
+                .is_some_and(|twist| twist != Twist2::ZERO));
+        }
+    }
+
+    #[tokio::test]
+    async fn lease_release_resets_the_native_command_boundary_before_the_next_goal() {
         let (mut scheduler,status,_motion,start)=zero_position_surface_scheduler().await;
         scheduler.apply_controller_twist(&status,Twist2 {linear:Point2::new(0.2,0.),angular_z:0.}).await.unwrap();
         scheduler.finish_terminal(&status,TerminalOutcome::Cancelled,SchedulerPhase::Idle).await.unwrap();
@@ -3465,8 +3397,7 @@ mod tests {
             crate::native_test_helpers::author_static_map_follower(local_config),
             SchedulerConfig {
                 tick_interval: Duration::from_millis(5),
-                pose_ttl: Duration::from_secs(1),
-                costmap_ttl: Duration::from_secs(1),
+
                 ..SchedulerConfig::default()
             },
         )
@@ -3560,7 +3491,10 @@ mod tests {
         let mut partial = path_for("upper-goal", 1);
         partial.path = ExecutionPath::Surface(Path3D { poses: vec![start] });
         handle.submit_path(partial).await.unwrap();
-        wait_for_phase(&handle, SchedulerPhase::AwaitingPath).await;
+        tokio::time::timeout(Duration::from_secs(1),async {
+            let mut state=handle.subscribe_status();
+            while !state.borrow().surface_replan_feedback.as_ref().is_some_and(|f|f.zero_sent_rejection){state.changed().await.unwrap();}
+        }).await.unwrap();
         assert_eq!(handle.status().last_terminal, None);
         assert_eq!(handle.status().last_applied_twist, Some(Twist2::ZERO));
         handle.cancel("upper-goal").await.unwrap();
@@ -3582,14 +3516,15 @@ mod tests {
         handle.update_costmap_received(costmap_at(1), old_receipt).await.unwrap();
         handle.start_session(session()).await.unwrap();
         handle.submit_path(path()).await.unwrap();
+        wait_for_phase(&handle,SchedulerPhase::Controlling).await;
         let stopped_planner_count = planning.lock().unwrap().stops;
-        handle.invalidate_map_received("同域完整输入暂缺", Instant::now(), MapInvalidationKind::TemporaryUnavailable).await.unwrap();
+        handle.invalidate_map_source("同域完整输入暂缺", MapInvalidationKind::TemporaryUnavailable).await.unwrap();
         let paused = wait_for_input_pause(&handle).await;
         assert_eq!(paused.session_id.as_deref(), Some("goal-1"));
         assert_eq!(paused.path_revision, 1);
 
         assert_eq!(planning.lock().unwrap().stops, stopped_planner_count, "同域暂缺不能删除现有路径");
-        assert!(matches!(handle.update_costmap_received(costmap_at(2), old_receipt).await, Err(RuntimeError::StaleInput(_))));
+        handle.update_costmap_received(costmap_at(2),old_receipt).await.unwrap();
         handle.update_costmap(costmap_at(3)).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while !handle.status().last_applied_twist.is_some_and(|twist| twist != Twist2::ZERO) {
@@ -3612,22 +3547,12 @@ mod tests {
         );
         handle.update_odometry(map_pose()).await.unwrap();
         let old_receipt = Instant::now();
-        assert!(matches!(
-            handle
-                .invalidate_map_received("未来失效事件", old_receipt + Duration::from_secs(1), MapInvalidationKind::Invalidated)
-                .await,
-            Err(RuntimeError::InvalidInput {
-                field: "map.invalidated_at",
-                ..
-            })
-        ));
         handle
             .update_costmap_received(costmap_at(1_000_000_000), old_receipt)
             .await
             .unwrap();
-        let invalidation_receipt = Instant::now();
         handle
-            .invalidate_map_received("空闲时切换地图", invalidation_receipt, MapInvalidationKind::Invalidated)
+            .invalidate_map_source("空闲时切换地图", MapInvalidationKind::Invalidated)
             .await
             .unwrap();
         assert_eq!(handle.status().phase, SchedulerPhase::Idle);
@@ -3636,20 +3561,12 @@ mod tests {
             motion_state.lock().unwrap().calls.is_empty(),
             "空闲失效不能申请或围栏租约"
         );
-        assert!(matches!(
-            handle
-                .update_costmap_received(costmap_at(2_000_000_000), old_receipt)
-                .await,
-            Err(RuntimeError::StaleInput(_))
-        ));
-
-        // 同一来源事件可同时表示新地图域；相同原接收时刻的有效新图可立即接入。
-        handle
-            .update_costmap_received(costmap_at(2_000_000_000), invalidation_receipt)
-            .await
-            .unwrap();
+        handle.update_costmap_received(costmap_at(2_000_000_000), old_receipt).await.unwrap();
         handle.start_session(session()).await.unwrap();
         handle.submit_path(path()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1),async {
+            while handle.status().last_applied_twist.is_none(){tokio::time::sleep(Duration::from_millis(2)).await;}
+        }).await.unwrap();
         handle.invalidate_map("活动地图被清空").await.unwrap();
         let stopped = handle.status();
         assert_eq!(stopped.last_terminal, Some(TerminalOutcome::SafetyFailed));
@@ -3731,7 +3648,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_first_path_fences_and_allows_the_next_session() {
+    async fn missing_inputs_time_out_without_lease_and_allow_the_next_session() {
         let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
         let planner = FakePlanner::commanding();
         let planner_state = planner.state.clone();
@@ -3742,8 +3659,7 @@ mod tests {
                 tick_interval: Duration::from_millis(5),
 
                 path_wait_timeout: Duration::from_millis(30),
-                    pose_ttl: Duration::from_secs(1),
-                costmap_ttl: Duration::from_secs(1),
+
             },
         )
         .expect("scheduler with path deadline");
@@ -3757,13 +3673,8 @@ mod tests {
         let terminal = wait_for_terminal(&handle, TerminalOutcome::PlannerFailed).await;
         assert_eq!(terminal.phase, SchedulerPhase::Failed);
 
-        assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
-        assert!(motion_state
-            .lock()
-            .expect("motion")
-            .calls
-            .iter()
-            .any(|call| call.starts_with("release:")));
+        assert_eq!(terminal.last_applied_twist,None);
+        assert!(motion_state.lock().unwrap().calls.is_empty(),"未持有租约的等待目标不伪造零速或释放");
         assert!(!task.is_finished(), "path timeout must not stop the owner");
 
         planner_state.lock().expect("planner").step = PlannerStep::Succeeded;
@@ -3852,11 +3763,8 @@ mod tests {
                     .await
                     .unwrap();
             }
-            assert!(
-                handle.status().planner_inputs_fresh,
-                "250毫秒实际地图续收不能周期性失效"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(55)).await;
+            assert!(handle.status().planner_inputs_fresh);
         }
         for tick in 21_i64..=33 {
             handle.update_odometry(map_pose_at(tick + 1)).await.unwrap();
@@ -3866,56 +3774,35 @@ mod tests {
         assert!(expired.planner_inputs_fresh);
         assert_eq!(expired.costmap_source_timestamp_ns, latest_map_source);
         assert!(expired.costmap_receipt_age_ms > 500);
-        assert!(
-            matches!(
-                handle.update_costmap(costmap_at(latest_map_source)).await,
-                Err(RuntimeError::StaleInput(_))
-            ),
-            "旧缓存不能通过相同源时间重放续期"
-        );
+        handle.update_costmap(costmap_at(latest_map_source)).await.unwrap();
         assert!(handle.status().planner_inputs_fresh);
         handle.shutdown().await.unwrap();
         task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
-    async fn pose_stream_loss_pauses_without_applied_heartbeat_refresh() {
-        let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
-        let (handle, task) = test_scheduler_with_ttls(
-            FakeMotion(motion_state.clone()),
-            FakePlanner::commanding(),
-            Duration::from_millis(30),
-            Duration::from_millis(200),
-        );
-        wait_for_sink(&handle).await;
-        handle.update_odometry(map_pose_at(1)).await.expect("pose");
+    async fn pose_stream_loss_pauses_by_source_age_without_releasing_lease() {
+        let state = Arc::new(Mutex::new(FakeMotionState::default()));
+        let (handle, task) = test_scheduler(FakeMotion(state.clone()), FakePlanner::commanding());
+        handle.update_costmap(costmap_at(1)).await.unwrap();
         handle
-            .update_costmap(costmap_at(1_000_000_000))
+            .update_odometry_with_source_age(current_map_pose(), Duration::from_millis(40))
             .await
-            .expect("costmap");
-        handle.start_session(session()).await.expect("session");
-        handle.submit_path(path()).await.expect("path");
-        let loss_started = std::time::Instant::now();
-        let terminal = wait_for_input_pause(&handle).await;
-        assert!(
-            loss_started.elapsed() <= Duration::from_millis(100),
-            "pose loss must park within TTL + one tick + fence"
-        );
-        assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
-
-        assert!(terminal
-            .message
-            .starts_with("等待新鲜导航输入:"));
-        assert!(terminal.message.contains("pose receipt age"));
-        assert!(!terminal.planner_inputs_fresh);
-        assert!(motion_state
+            .unwrap();
+        handle.start_session(session()).await.unwrap();
+        handle.submit_path(path()).await.unwrap();
+        let paused = wait_for_input_pause(&handle).await;
+        assert!(!paused.planner_inputs_fresh);
+        assert_eq!(paused.last_applied_twist, Some(Twist2::ZERO));
+        assert!(paused.message.contains("pose source deadline"));
+        assert!(state
             .lock()
-            .expect("motion")
+            .unwrap()
             .calls
             .iter()
-            .all(|call| !call.starts_with("release:")));
-        handle.shutdown().await.expect("shutdown");
-        task.await.expect("join").expect("task result");
+            .all(|c| !c.starts_with("release:")));
+        handle.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -3934,60 +3821,6 @@ mod tests {
 
             assert!(status.message.contains("目标前方没有可行支撑"),"首次终态丢失原因: {}",status.message);
         }
-    }
-
-    #[tokio::test]
-    async fn costmap_stream_loss_pauses_within_configured_deadline() {
-        let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
-        let (handle, task) = test_scheduler_with_ttls(
-            FakeMotion(motion_state),
-            FakePlanner::commanding(),
-            Duration::from_millis(200),
-            Duration::from_millis(30),
-        );
-        wait_for_sink(&handle).await;
-        handle.update_odometry(map_pose_at(1)).await.expect("pose");
-        handle
-            .update_costmap(costmap_at(1_000_000_000))
-            .await
-            .expect("costmap");
-        handle.start_session(session()).await.expect("session");
-        handle.submit_path(path()).await.expect("path");
-        let loss_started = std::time::Instant::now();
-        let terminal = wait_for_input_pause(&handle).await;
-        assert!(loss_started.elapsed() <= Duration::from_millis(100));
-        assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
-        assert!(!terminal.planner_inputs_fresh);
-        handle.shutdown().await.expect("shutdown");
-        task.await.expect("join").expect("task result");
-    }
-
-    #[tokio::test]
-    async fn replayed_pose_source_timestamp_does_not_extend_ttl() {
-        let motion_state = Arc::new(Mutex::new(FakeMotionState::default()));
-        let (handle, task) = test_scheduler_with_ttls(
-            FakeMotion(motion_state),
-            FakePlanner::commanding(),
-            Duration::from_millis(40),
-            Duration::from_millis(200),
-        );
-        wait_for_sink(&handle).await;
-        handle.update_odometry(map_pose_at(1)).await.expect("pose");
-        handle
-            .update_costmap(costmap_at(1_000_000_000))
-            .await
-            .expect("costmap");
-        handle.start_session(session()).await.expect("session");
-        handle.submit_path(path()).await.expect("path");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let replay = handle
-            .update_odometry(map_pose_at(1))
-            .await
-            .expect_err("same source stamp must be rejected");
-        assert!(matches!(replay, RuntimeError::StaleInput(_)));
-        wait_for_input_pause(&handle).await;
-        handle.shutdown().await.expect("shutdown");
-        task.await.expect("join").expect("task result");
     }
 
     #[tokio::test]

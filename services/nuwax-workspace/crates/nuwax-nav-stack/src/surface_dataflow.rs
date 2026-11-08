@@ -1,6 +1,5 @@
 //! 三维导航生产拥有方：共享地图，交付PCT全局参考，并由Scan近场持续执行。
 
-use std::collections::VecDeque;
 #[path="surface_recent_source.rs"]
 mod recent_source;
 pub(super) use recent_source::RecentSourceState;
@@ -16,7 +15,7 @@ use super::*;
 use crate::runner::StackRunner;
 use crate::surface_config::SurfaceNavigationConfig;
 
-/// 本地计算结果保留原消息接收时刻，不以表面构建结束延长地图有效期。
+/// 保留地图来源和接收时刻用于诊断，地图接纳按会话号与修订排序。
 #[derive(Clone)]
 pub(super) struct PreparedSurfaceMap {
     pub(super) authority: GuardedMapAuthority,
@@ -405,7 +404,7 @@ fn surface_planning_diagnostic(feedback: Option<&SurfaceReplanFeedback>,
     match feedback.filter(|feedback| feedback.zero_sent_rejection
         && feedback.path_identity.session_id == goal.session_id
         && feedback.path_identity.goal_key == goal.goal_key()) {
-        Some(feedback) => format!("局部执行拒绝并已归零：{}；{progress}；连续等待仍受原期限约束",
+        Some(feedback) => format!("局部执行拒绝，零速请求已接受：{}；{progress}；连续等待仍受原期限约束",
             feedback.rejection_reason.as_deref().unwrap_or("局部规划要求更新路径")),
         None => progress.into(),
     }
@@ -468,15 +467,6 @@ async fn run_surface_planner(
 
 fn state_matches_goal(state: &schema::NavigationStatus, goal: &schema::NavigationGoal) -> bool {
     state.session_id == goal.session_id
-}
-
-fn retire_goal(goal: &mut Option<schema::NavigationGoal>, retired: &mut VecDeque<String>) {
-    if let Some(goal) = goal.take() {
-        retired.push_back(goal.session_id);
-        if retired.len() > 32 {
-            retired.pop_front();
-        }
-    }
 }
 
 struct ApproachProgress { endpoint: Point3, best_distance: f64, stagnant: u32 }
@@ -563,8 +553,6 @@ async fn run_surface_planner_with_computer(
     let mut latest_map: Option<PreparedSurfaceMap> = None;
     let mut pose: Option<PoseStamped> = None;
     let mut goal: Option<schema::NavigationGoal> = None;
-    let mut newest_goal: Option<schema::NavigationGoal> = None;
-    let mut retired_goals = VecDeque::<String>::new();
     let generation = saturating_i64(runtime_generation());
     let mut path_revision = 0_i64;
     let mut last_path: Option<Path3D> = None;
@@ -607,9 +595,6 @@ async fn run_surface_planner_with_computer(
                     Err(error) => { diagnostics.reject("surface cancel", &error.to_string()); continue; }
                 };
                 if goal.as_ref().is_some_and(|active| validate_cancel_goal_correlation(&cancel, active).is_ok()) {
-                    retire_goal(&mut goal, &mut retired_goals);
-                    newest_goal = None;
-                    if cancel.session_id.is_empty() { retired_goals.clear(); }
                     successful.clear();
                     approach = None;
                     failed_input = None;
@@ -624,14 +609,12 @@ async fn run_surface_planner_with_computer(
                 };
                 if !goal.as_ref().is_some_and(|active| state_matches_goal(&state, active)) { continue; }
                 if matches!(state.state, 0 | 3 | 4) {
-                    retire_goal(&mut goal, &mut retired_goals);
                     successful.clear();
                     last_path = None; needs_plan = false; execution_admitted = false;
                 } else if matches!(state.state, 1 | 2) && state.sink_ready != 0 {
                     execution_admitted = true;
-                    // 等待旧版路径的迟到帧不能废弃刚交付的新路线。
-                    if state.state == 1 && (last_path.is_none()
-                        || state.path_revision == path_revision && path_revision > 0) { needs_plan = true; }
+                    // 等待输入或租约也会发布规划态；已有路线时由实际跟踪拒绝反馈请求重规划。
+                    if state.state == 1 && last_path.is_none() { needs_plan = true; }
                 }
             }
             changed = feedback_events.changed() => {
@@ -766,9 +749,6 @@ async fn run_surface_planner_with_computer(
                     successful.clear();
                     map_retry_after = Instant::now();
                     map_epoch = map_epoch.checked_add(1).ok_or_else(|| NavStackError::Internal("表面构建票据耗尽".into()))?;
-                    let future_goal_matches = !message.cleared
-                        && goal.as_ref().is_some_and(|pending| authority.permits_goal(pending));
-                    if !future_goal_matches { retire_goal(&mut goal, &mut retired_goals); }
                     pose = None; last_path = None; execution_admitted = false;
                     let invalid = PreparedSurfaceMap { authority: authority.clone(), source_timestamp_ns: message.source_timestamp_ns,
                         received_at, awaiting_build: !message.cleared, snapshot: Err(if message.cleared {
@@ -786,28 +766,26 @@ async fn run_surface_planner_with_computer(
             }
             frame = goals.next() => {
                 let frame = required_frame(frame, "surface planner goal")?;
-                let incoming = match schema::decode_navigation_goal_body(&frame.payload) {
+                let incoming = match decode_navigation_goal_input(&frame.payload) {
                     Ok(goal) => goal,
                     Err(error) => { diagnostics.reject("surface goal", &error.to_string()); continue; }
                 };
-                if retired_goals.contains(&incoming.session_id) { continue; }
                 if goal.as_ref().is_some_and(|active|active == &incoming) { continue; }
-                if newest_goal.as_ref().is_some_and(|current| validate_navigation_goal_order(&incoming, current).is_err()) { continue; }
                 if let Err(error) = navigation_boundary_from_goal(&incoming) { diagnostics.reject("surface goal boundary",&error.to_string());continue; }
+                if let Some(ticket) = &path_cancellation {
+                    ticket.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 successful.clear();
                 approach = None;
                 approach_failure_pending=false;
                 failed_input = None;
-                newest_goal = Some(incoming.clone()); goal = Some(incoming);
+                goal = Some(incoming);
                 path_revision = 0; last_path = None; needs_plan = true; execution_admitted = false;
                 retry_after = Instant::now(); geometry_retired = false;
             }
             frame = poses.next() => {
-                let Some(input)=drain_guarded_pose_input(frame,&mut poses,&mut diagnostics,None)? else {continue;};
-                let incoming=input.pose;
-                if pose.as_ref().is_none_or(|previous| incoming.stamp.nanos>previous.stamp.nanos) {
-                    pose=Some(incoming);
-                }
+                let Some(input)=drain_guarded_pose_input(frame,&mut poses,&mut diagnostics)? else {continue;};
+                pose=Some(input.pose);
             }
             _ = ticker.tick() => {
                 if let (Some(progress),Some(current))=(&approach,&pose) {
@@ -2507,24 +2485,11 @@ goal: schema::PoseStamped {
         assert!(tokio::time::timeout(Duration::from_millis(250), harness.paths.next()).await.is_err());
         assert_eq!(harness.scheduler.status().path_revision, u64::try_from(path.path_revision).unwrap());
         // 新路线安装后迟到的旧版等待帧不得重新发布相同路线。
-        let mut old_wait = tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let frame=states.next().await.unwrap().unwrap();
-                let state=schema::decode_navigation_status_body(&frame.payload).unwrap();
-                if state_matches_goal(&state,&first) && state.state==2 {break state;}
-            }
-        }).await.unwrap();
-        old_wait.state=1;
-        old_wait.message="当前路径请求重规划".into();
-        publish_body(&harness.transport,&harness.planner_node.inputs[4],
-            "nuwax_msgs.NavigationStatus",schema::encode_navigation_status_body(&old_wait).unwrap()).await.unwrap();
+        replan_feedback_tests::inject_refusal(&harness,&first,&path).await;
         let replacement=harness.path_for(&first).await;
         assert!(replacement.path_revision>path.path_revision);
         harness.wait_controlling().await;
-        old_wait.path_revision=path.path_revision;
-        old_wait.message="迟到的旧路径等待".into();
-        publish_body(&harness.transport,&harness.planner_node.inputs[4],
-            "nuwax_msgs.NavigationStatus",schema::encode_navigation_status_body(&old_wait).unwrap()).await.unwrap();
+        replan_feedback_tests::inject_refusal(&harness,&first,&path).await;
         assert!(tokio::time::timeout(Duration::from_millis(250),harness.paths.next()).await.is_err(),
             "旧版等待不得打断最新路径");
         harness.feed.lock().unwrap().integrate = true;
@@ -2613,12 +2578,8 @@ goal: schema::PoseStamped {
             feed.map_enabled = true;
         }
         harness.wait_ready().await;
-        if awaiting_build {
-            harness.wait_controlling().await;
-        } else {
-            tokio::time::sleep(Duration::from_millis(120)).await;
-            assert!(harness.calls.lock().unwrap().is_empty(), "已撤销目标不能随有效地图恢复执行");
-        }
+        // 构建失败不再废弃尚未取得租约的最新目标；真实输入恢复后继续执行。
+        harness.wait_controlling().await;
         let mut states=typed_stream(&harness.transport,&harness.planner_node.inputs[4],"nuwax_msgs.NavigationStatus").await.unwrap();
         harness.cancel(&goal).await;
         tokio::time::timeout(Duration::from_secs(8), async {
@@ -2631,12 +2592,8 @@ goal: schema::PoseStamped {
                 }
             }
         }).await.expect("原状态通道必须回报已取消的目标");
-        if awaiting_build {
-            harness.terminal(TerminalOutcome::Cancelled).await;
-            assert!(harness.calls.lock().unwrap().iter().any(|call| call.starts_with("release:")));
-        } else {
-            assert!(harness.calls.lock().unwrap().is_empty(),"缓冲取消不得申请或释放运动租约");
-        }
+        harness.terminal(TerminalOutcome::Cancelled).await;
+        assert!(harness.calls.lock().unwrap().iter().any(|call|call.starts_with("release:")));
         harness.feed.lock().unwrap().map_enabled = true;
         harness.wait_ready().await;
         let next = goal_for(&harness.feed.lock().unwrap().map, 2, [1.55, 1.55, 2.5]);

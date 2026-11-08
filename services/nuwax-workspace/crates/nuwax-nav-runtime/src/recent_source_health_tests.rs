@@ -32,7 +32,8 @@ fn unconfigured_cloud_age_adds_no_default_stop_gate() {
     let (status,_)=watch::channel(scheduler.status.clone());
     scheduler.observe_odometry(&status,map_pose(),None).unwrap();
     scheduler.observe_costmap(&status,costmap_at(1_000_000_000),Instant::now()).unwrap();
-    assert!(scheduler.stale_input_reason(Instant::now()).is_none());
+    scheduler.sample_input_status();
+    assert!(scheduler.status.planner_inputs_fresh);
 
 }
 
@@ -54,7 +55,8 @@ fn mask_only_surface_update_changes_map_without_renewing_source_health() {
             changes:Arc::new(crate::surface_changes::SurfaceGeometryChanges::Unknown),
         }),source_timestamp_ns:1_000_000_000,
     },Instant::now()).unwrap();
-    assert_eq!(scheduler.costmap_receipt.unwrap().received_at,receipt);
+    assert_eq!(scheduler.costmap_receipt.unwrap().source_timestamp_ns,1_000_000_000);
     assert!(!scheduler.obstacle_source_available);
-    assert!(scheduler.stale_input_reason(Instant::now()).unwrap().contains("recent obstacle source revoked"));
+    scheduler.sample_input_status();
+    assert!(scheduler.status.input_wait_reason.as_ref().unwrap().contains("recent obstacle source revoked"));
 }

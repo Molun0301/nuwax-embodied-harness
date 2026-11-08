@@ -518,7 +518,7 @@ impl SurfaceFollower {
             Err(reason) => {
                 self.wait_reason = Some(reason);
                 nuwax_nav_scan_native::TrackResult {
-                    reason: 8,
+                    reason: nuwax_nav_scan_native::track_reason::NO_CANDIDATE,
                     ..Default::default()
                 }
             }
@@ -548,12 +548,12 @@ impl SurfaceFollower {
             self.early_requested = false;
             self.plans += 1;
         }
-        if checked.reason & 64 != 0 {
+        if checked.rejected_trajectory() {
             self.pending_curve = None;
             self.needs_plan = true;
         }
         self.phase = checked.phase;
-        if checked.reason & 16 != 0 && !self.early_requested {
+        if checked.replan_early() && !self.early_requested {
             self.needs_plan = true;
             self.early_requested = true;
         }
@@ -581,11 +581,11 @@ impl SurfaceFollower {
         }
         self.wait_reason = if checked.invalid() {
             Some(
-                if checked.reason & 8 != 0 {
+                if checked.no_candidate() {
                     "命令检查没有合法候选，等待重规划"
-                } else if checked.reason & 2 != 0 {
+                } else if checked.deviated() {
                     "机身偏离轨迹，等待重规划"
-                } else if checked.reason & 4 != 0 {
+                } else if checked.finished() {
                     "局部轨迹结束，等待重规划"
                 } else {
                     "等待局部轨迹"
@@ -611,13 +611,6 @@ impl NavPlanner for SurfaceFollower {
         goal: &PoseStamped,
         options: GoalOptions,
     ) -> Result<(), RuntimeError> {
-        options
-            .validate()
-            .map_err(|reason| RuntimeError::InvalidInput {
-                field: "goal_options",
-                reason,
-            })?;
-        crate::validate_map_pose(goal, "goal_pose")?;
         self.retire_route();
         self.goal = Some(goal.clone());
         self.options = options;

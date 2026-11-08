@@ -25,6 +25,16 @@ typedef struct {
     int64_t timestamp_ns;
     uint32_t measured_velocity, measured_yaw_rate;
 } ScanState;
+/* 跟踪原因位；与 Rust track_reason 一一对应。 */
+typedef enum {
+    SCAN_TRACK_NO_TRAJECTORY = 1u << 0,
+    SCAN_TRACK_DEVIATED = 1u << 1,
+    SCAN_TRACK_FINISHED = 1u << 2,
+    SCAN_TRACK_NO_CANDIDATE = 1u << 3,
+    SCAN_TRACK_REPLAN_EARLY = 1u << 4,
+    SCAN_TRACK_RECOVERY_FAILED = 1u << 5,
+    SCAN_TRACK_REJECTED_TRAJECTORY = 1u << 6
+} ScanTrackReason;
 typedef struct {
     double command[3], phase, remaining, deviation;
     /* 1无轨迹，2偏离，4走完，8无合法候选，16提前请求，32恢复失败，64新曲线偏离（旧曲线继续）。 */

@@ -253,11 +253,9 @@ async fn planar_navigation_stream(transport:&LcmTransport,topic:LcmTopic)->NavSt
         match item {
             Err(error)=>output.push(Err(error)),
             Ok(frame)=>{
-                let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                    .map(|d|d.as_nanos().min(i64::MAX as u128) as i64).unwrap_or(0);
                 match planar_navigation::decode_body(&frame.payload)
                     .map_err(|e|e.to_string())
-                    .and_then(|map|admission.admit(&map,now).map(|changed|(map,changed))) {
+                    .and_then(|map|admission.admit(&map).map(|changed|(map,changed))) {
                     Ok((map,changed))=>{
                         let convert=|grid:&schema::OccupancyGrid| -> TransportResult<RawLcmFrame> {
                             let mut translated=frame.clone();
@@ -611,78 +609,14 @@ fn ingest_map_pose_odometry(
 }
 
 #[cfg(feature = "guard-runtime")]
-fn fence_map_pose_source_timestamp(
-    last_published_timestamp_ns: Option<i64>,
-    observed: &crate::map_pose::MapPoseObservation,
-) -> OwnerInputResult<i64> {
-    let candidate_timestamp_ns =
-        lcm_header_timestamp_ns(&observed.pose.header, "map_pose_adapter.output")?;
-    if let Some(published_timestamp_ns) = last_published_timestamp_ns {
-        if candidate_timestamp_ns <= published_timestamp_ns {
-            return Ok(OwnerInput::Rejected(format!(
-                "map_pose_adapter.output timestamp {candidate_timestamp_ns} is duplicate or older than the last published timestamp {published_timestamp_ns}"
-            )));
-        }
-    }
-    Ok(OwnerInput::Accepted(candidate_timestamp_ns))
-}
-
-#[cfg(feature = "guard-runtime")]
 async fn publish_map_pose_observation(
     transport: &LcmTransport,
     channel: &str,
-    last_published_timestamp_ns: &mut Option<i64>,
-    diagnostics: &mut InputDiagnosticLimiter,
     observed: crate::map_pose::MapPoseObservation,
 ) -> NavStackResult<()> {
-    let candidate_timestamp_ns =
-        match fence_map_pose_source_timestamp(*last_published_timestamp_ns, &observed)? {
-            OwnerInput::Accepted(timestamp_ns) => timestamp_ns,
-            OwnerInput::Rejected(reason) => {
-                diagnostics.reject("map_pose_adapter.output", &reason);
-                return Ok(());
-            }
-        };
     let body = schema::encode_pose_stamped_body(&observed.pose)
-        .map_err(|error| NavStackError::Internal(format!("map pose encode: {error}")))?;
-    publish_body(transport, channel, "geometry_msgs.PoseStamped", body).await?;
-    *last_published_timestamp_ns = Some(candidate_timestamp_ns);
-    Ok(())
-}
-
-#[cfg(feature = "guard-runtime")]
-fn discard_pending_odometry_through(
-    pending_odometry: &mut Option<Box<schema::Odometry>>,
-    observed: &crate::map_pose::MapPoseObservation,
-) -> NavStackResult<()> {
-    let Some(pending) = pending_odometry.as_ref() else {
-        return Ok(());
-    };
-    let pending_timestamp =
-        lcm_header_timestamp_ns(&pending.header, "map_pose_adapter.pending_odometry")?;
-    let observed_timestamp =
-        lcm_header_timestamp_ns(&observed.pose.header, "map_pose_adapter.atomic_tf")?;
-    if pending_timestamp <= observed_timestamp {
-        *pending_odometry = None;
-    }
-    Ok(())
-}
-
-#[cfg(feature = "guard-runtime")]
-fn retain_newest_map_pose(
-    newest: &mut Option<crate::map_pose::MapPoseObservation>,
-    candidate: crate::map_pose::MapPoseObservation,
-) -> NavStackResult<()> {
-    let stamp = lcm_header_timestamp_ns(&candidate.pose.header, "map_pose_adapter.output")?;
-    let current = newest
-        .as_ref()
-        .map(|value| lcm_header_timestamp_ns(&value.pose.header, "map_pose_adapter.output"))
-        .transpose()?
-        .unwrap_or(0);
-    if stamp > current {
-        *newest = Some(candidate);
-    }
-    Ok(())
+        .map_err(|e| NavStackError::Internal(e.to_string()))?;
+    publish_body(transport, channel, "geometry_msgs.PoseStamped", body).await
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -719,7 +653,6 @@ async fn run_map_pose_adapter(
     )?;
     let mut diagnostics = InputDiagnosticLimiter::default();
     let mut pending_odometry: Option<Box<schema::Odometry>> = None;
-    let mut last_published_timestamp_ns = None;
     signal_ready(ready)?;
 
     loop {
@@ -732,14 +665,14 @@ async fn run_map_pose_adapter(
                     let frame = required_frame(next, "map_pose_adapter.tf")?;
                     match ingest_map_pose_tf(&mut adapter, &frame.payload)? {
                         OwnerInput::Accepted(Some(observed)) => {
-                            discard_pending_odometry_through(&mut pending_odometry, &observed)?;
-                            retain_newest_map_pose(&mut newest, observed)?;
+                            pending_odometry=None;
+                            newest=Some(observed);
                         }
                         OwnerInput::Accepted(None) => {
                             if let Some(odometry) = pending_odometry.take() {
                                 match transform_map_pose_odometry(&adapter, *odometry)? {
                                     MapPoseOdometryIngress::Accepted(observed) => {
-                                        retain_newest_map_pose(&mut newest, observed)?;
+                                        newest=Some(observed);
                                     }
                                     MapPoseOdometryIngress::AwaitingTransform(odometry, reason) => {
                                         pending_odometry = Some(odometry);
@@ -760,7 +693,7 @@ async fn run_map_pose_adapter(
                 }
                 if let Some(observed) = newest {
                     publish_map_pose_observation(&transport, &node.outputs[0],
-                        &mut last_published_timestamp_ns, &mut diagnostics, observed).await?;
+                        observed).await?;
                 }
             }
             message = odometry.next() => {
@@ -769,17 +702,11 @@ async fn run_map_pose_adapter(
                     let frame = latest_pose_frame(message, &mut odometry, "map_pose_adapter.odometry")?;
                     match ingest_map_pose_odometry(&adapter, &frame.payload)? {
                         MapPoseOdometryIngress::Accepted(observed) => {
-                            discard_pending_odometry_through(&mut pending_odometry, &observed)?;
-                            retain_newest_map_pose(&mut newest, observed)?;
+                            pending_odometry=None;
+                            newest=Some(observed);
                         }
                         MapPoseOdometryIngress::AwaitingTransform(candidate, reason) => {
-                            let candidate_stamp = lcm_header_timestamp_ns(&candidate.header, "map_pose_adapter.odometry")?;
-                            let pending_stamp = pending_odometry.as_ref()
-                                .map(|pending| lcm_header_timestamp_ns(&pending.header, "map_pose_adapter.pending"))
-                                .transpose()?.unwrap_or(0);
-                            if candidate_stamp > pending_stamp {
-                                pending_odometry = Some(candidate);
-                            }
+                            pending_odometry=Some(candidate);
                             diagnostics.reject("map_pose_adapter.odometry", &reason);
                         }
                         MapPoseOdometryIngress::Rejected(reason) => {
@@ -789,14 +716,12 @@ async fn run_map_pose_adapter(
                 }
                 if let Some(observed) = newest {
                     publish_map_pose_observation(&transport, &node.outputs[0],
-                        &mut last_published_timestamp_ns, &mut diagnostics, observed).await?;
+                        observed).await?;
                 }
             }
         }
     }
 }
-
-
 
 #[cfg(feature = "guard-runtime")]
 pub(crate) fn guarded_nav_scheduler_owner(
@@ -854,8 +779,6 @@ struct GuardedPoseInput {
     pose: PoseStamped,
     frame_id: String,
     current: [f64; 3],
-    source_max_age: Option<Duration>,
-    acquired_at: tokio::time::Instant,
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -876,41 +799,15 @@ fn drain_guarded_pose_input(
     first: Option<TransportResult<RawLcmFrame>>,
     poses: &mut LcmFrameStream,
     diagnostics: &mut InputDiagnosticLimiter,
-    source_max_age: Option<Duration>,
 ) -> NavStackResult<Option<GuardedPoseInput>> {
-    let wall_now = std::time::SystemTime::now();
-    let mono_now = tokio::time::Instant::now();
     let frame = latest_pose_frame(first, poses, "guarded_nav_scheduler.map_pose")?;
     match decode_guarded_pose_input(&frame.payload)? {
-        OwnerInput::Accepted(mut candidate) => {
-            let valid = source_max_age.map(|maximum| {
-                let unix = wall_now.duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|_| "当前墙钟早于Unix纪元".to_string())?.as_nanos() as u64;
-                let source = u64::try_from(candidate.pose.stamp.nanos)
-                    .ok().filter(|v| *v > 0).ok_or("位姿源时间必须为正")?;
-                let age = nuwax_nav_types_messages::source_time::data_age_ns_at(source, unix)?;
-                if u128::from(age) >= maximum.as_nanos() {
-                    return Err(format!("位姿来源数据已过期：{}毫秒", age / 1_000_000));
-                }
-                // 执行采集时刻继续保留真实经过的墙钟时间，来源判龄不能让它变新。
-                let capture_age = nuwax_nav_types_messages::source_time::age_ns_at(source, unix)?;
-                mono_now.checked_sub(Duration::from_nanos(capture_age))
-                    .ok_or_else(|| "位姿采集单调时刻下溢".into())
-            }).transpose();
-            match valid {
-                Err(reason) => diagnostics.reject("guarded_nav_scheduler.map_pose", &reason),
-                Ok(acquired_at) => {
-                    candidate.source_max_age = source_max_age;
-                    candidate.acquired_at = acquired_at.unwrap_or(mono_now);
-                    return Ok(Some(candidate));
-                }
-            }
-        }
+        OwnerInput::Accepted(candidate) => Ok(Some(candidate)),
         OwnerInput::Rejected(reason) => {
-            diagnostics.reject("guarded_nav_scheduler.map_pose", &reason)
+            diagnostics.reject("guarded_nav_scheduler.map_pose", &reason);
+            Ok(None)
         }
     }
-    Ok(None)
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -926,32 +823,19 @@ fn configured_pose_source_max_age() -> NavStackResult<Duration> {
         })
 }
 
-#[cfg(feature = "guard-runtime")]
-fn guarded_pose_source_deadline(
-    source_timestamp_ns: i64,
-    max_age: Duration,
-    wall_now: std::time::SystemTime,
-    mono_now: tokio::time::Instant,
-) -> Result<tokio::time::Instant, String> {
-    let unix_now = wall_now
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| "当前墙钟早于Unix纪元".to_string())?;
-    let source = u64::try_from(source_timestamp_ns)
-        .ok().filter(|value| *value > 0)
-        .ok_or_else(|| "位姿源时间必须为正".to_string())?;
-    let age = Duration::from_nanos(nuwax_nav_types_messages::source_time::age_ns_at(
-        source, unix_now.as_nanos() as u64,
-    )?);
-    let remaining = max_age
-        .checked_sub(age)
-        .filter(|value| !value.is_zero())
-        .ok_or_else(|| format!("位姿原始采样已过期：{}毫秒", age.as_millis()))?;
-    mono_now
-        .checked_add(remaining)
-        .ok_or_else(|| "位姿有效期限溢出".into())
+#[cfg(any(feature="guard-runtime",feature="simple-2d",feature="replanning-astar",feature="cmu-native",feature="explore",feature="mls"))]
+fn decode_navigation_goal_input(payload: &[u8]) -> Result<schema::NavigationGoal, String> {
+    let goal = schema::decode_navigation_goal_body(payload).map_err(|e| e.to_string())?;
+    if goal.goal.header.frame_id != "map" {
+        return Err(format!(
+            "目标坐标系必须为map，收到{}",
+            goal.goal.header.frame_id
+        ));
+    }
+    Ok(goal)
 }
 
-#[cfg(feature = "guard-runtime")]
+#[cfg(feature="guard-runtime")]
 fn decode_guarded_pose_input(payload: &[u8]) -> OwnerInputResult<GuardedPoseInput> {
     let pose_message =
         match schema::decode_pose_stamped(&prefixed(schema::POSE_STAMPED_FINGERPRINT, payload)) {
@@ -989,8 +873,6 @@ fn decode_guarded_pose_input(payload: &[u8]) -> OwnerInputResult<GuardedPoseInpu
         pose,
         frame_id: pose_message.header.frame_id,
         current,
-        source_max_age: None,
-        acquired_at: tokio::time::Instant::now(),
     }))
 }
 
@@ -1140,10 +1022,7 @@ async fn run_guarded_nav_scheduler(
     let costmaps = typed_stream(&transport, &node.inputs[3], costmap_type).await?;
     let cancels = typed_stream(&transport, &node.inputs[4], "nuwax_msgs.CancelNavigation").await?;
     let socket_path = nuwax_nav_runtime::motion_guard_socket_path();
-    let mut scheduler_config = nuwax_nav_runtime::SchedulerConfig::default();
-    if planar_navigation_enabled() {
-        scheduler_config.costmap_ttl = Duration::from_nanos(nuwax_codec::lcm::planar_navigation::MAX_SOURCE_AGE_NS as u64);
-    }
+    let scheduler_config = nuwax_nav_runtime::SchedulerConfig::default();
     let (scheduler, task) = nuwax_nav_runtime::spawn_production_scheduler(
         socket_path,
         scheduler_config,
@@ -1264,8 +1143,7 @@ where
         surface_navigation: node.id == "surface_nav_scheduler",
         ..GuardedNavTelemetry::default()
     };
-    let mut active_session: Option<schema::NavigationGoal> = None;
-    let mut goal_buffer = PlannerGoalBuffer::default();
+    let mut latest_goal: Option<schema::NavigationGoal> = None;
     let mut surface_authority: Option<GuardedMapAuthority> = None;
     #[cfg(feature="mls")]
     let mut recent_source=surface_dataflow::RecentSourceState::new(recent_source_max_age);
@@ -1302,25 +1180,24 @@ where
                     NavStackError::Internal("guard scheduler status stream closed".into())
                 })?;
                 let snapshot = status.borrow().clone();
-                publish_guarded_tail_observation(transport, node, snapshot, &mut telemetry, None, &mut publications, &mut active_session).await?;
+                publish_guarded_tail_observation(transport, node, snapshot, &mut telemetry, None, &mut publications).await?;
             }
             GuardedNavEvent::Pose(message) => {
                 let Some(input) = drain_guarded_pose_input(
                     message,
                     &mut poses,
                     &mut diagnostics,
-                    source_max_age,
                 )?
                 else {
                     continue;
                 };
-                let source_age_limit = input.source_max_age;
+                let source_age_limit = source_max_age;
                 let mut candidate_telemetry = telemetry.clone();
                 commit_guarded_pose_telemetry(&mut candidate_telemetry, &input);
                 let settlement = (async {
                     match source_age_limit {
                         Some(maximum) => scheduler
-                            .update_odometry_with_source_age(input.pose, input.acquired_at, maximum).await,
+                            .update_odometry_with_source_age(input.pose, maximum).await,
                         None => scheduler.update_odometry(input.pose).await,
                     }
                 }).await;
@@ -1337,23 +1214,10 @@ where
                 };
                 ordinary?;
                 if !accepted { continue; }
-                if let Some(goal) = goal_buffer.take_ready_goal() {
-                    activate_or_defer_guarded_goal(
-                        node,
-                        transport,
-                        scheduler,
-                        &mut telemetry,
-                        &mut active_session,
-                        &mut goal_buffer,
-                        *goal,
-                        surface_authority.as_ref(),
-                        planar_mode,
-                    )
-                    .await?;
-                }
+
                 let snapshot = scheduler.status();
                 let planner_inputs_fresh = snapshot.planner_inputs_fresh;
-                publish_guarded_tail_observation(transport, node, snapshot, &mut telemetry, Some(planner_inputs_fresh), &mut publications, &mut active_session).await?;
+                publish_guarded_tail_observation(transport, node, snapshot, &mut telemetry, Some(planner_inputs_fresh), &mut publications).await?;
             }
             GuardedNavEvent::Costmap(message) => {
                 let frame = message
@@ -1370,40 +1234,31 @@ where
                         continue;
                     }
                     GuardedMapFrame::Planar(frame) => {
-                        let mut source_received_at = None;
+                        let source_received_at = None;
                         let body = if planar_mode {
                             let value=match nuwax_codec::lcm::planar_navigation::decode_body(&frame.payload) {
                                 Ok(value)=>value,
                                 Err(error)=>{diagnostics.reject("planar_navigation",&error.to_string());continue;}
                             };
-                            let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                                .map(|d|d.as_nanos().min(i64::MAX as u128) as i64).unwrap_or(0);
-                            let changed=match planar_admission.admit(&value,now) {
+                            let changed=match planar_admission.admit(&value) {
                                 Ok(changed)=>changed,
                                 Err(error)=>{diagnostics.reject("planar_navigation",&error);continue;}
                             };
-                            source_received_at = Instant::now().checked_sub(Duration::from_nanos(now.saturating_sub(value.source_timestamp_ns).max(0) as u64));
+
                             let authority = GuardedMapAuthority {
                                 session_id: value.session_id.clone(),
                                 revision: value.map_revision,
                                 frame_id: value.grid.header.frame_id.clone(),
                             };
                             if changed || value.cleared {
-                                // 切域的同一输入共享来源时间基准，避免首帧被自己的处理时刻拒绝。
-                                // 显式清空继续建立当前水位，清空前采样不能迟到恢复执行。
-                                let invalidated_at=if value.cleared {Instant::now()} else {source_received_at.unwrap_or_else(Instant::now)};
-                                scheduler.invalidate_map_received("二维导航来源已撤销或切换",tokio::time::Instant::from_std(invalidated_at),
+                                // 清空与切域由会话和观测修订隔离，不以时间戳建立水位。
+                                scheduler.invalidate_map_source("二维导航来源已撤销或切换",
                                     nuwax_nav_runtime::MapInvalidationKind::Invalidated).await
                                     .map_err(|e|module_error("planar map invalidation",e))?;
-                                goal_buffer.costmap_observed=false;
-                                goal_buffer.active_goal_applied = false;
-                                if value.cleared || !goal_buffer.pending_goal.as_ref().is_some_and(|goal|authority.permits_goal(goal)) {
-                                    goal_buffer.pending_invalidated = true;
-                                }
+
                                 let snapshot=scheduler.status();
                                 publish_guarded_nav_observation(transport,node,snapshot.clone(),&telemetry,
                                     Some(false),&mut publications).await?;
-                                clear_terminal_session_after_publication(&mut active_session,&mut telemetry,&snapshot);
                             }
                             surface_authority=if value.cleared {None} else {Some(authority)};
                             if value.cleared {continue;}
@@ -1419,14 +1274,13 @@ where
                             .is_some_and(|previous| !previous.same_domain(&update.authority));
                         if changed_domain || update.snapshot.is_err() {
                             scheduler
-                                .invalidate_map_received(
+                                .invalidate_map_source(
                                     update
                                         .snapshot
                                         .as_ref()
                                         .err()
                                         .cloned()
                                         .unwrap_or_else(|| "surface map domain changed".into()),
-                                    tokio::time::Instant::from_std(update.received_at),
                                     if changed_domain || !update.awaiting_build {
                                         nuwax_nav_runtime::MapInvalidationKind::Invalidated
                                     } else {
@@ -1435,16 +1289,10 @@ where
                                 )
                                 .await
                                 .map_err(|error| module_error("surface map invalidation", error))?;
-                            goal_buffer.costmap_observed = false;
-                            goal_buffer.active_goal_applied = false;
+
                             // 精细源失败或换域时保留待执行目标，之后的取消仍须
                             // 通过原状态通道回报该目标。
-                            if (update.snapshot.is_err() && !update.awaiting_build)
-                                || (changed_domain && !goal_buffer.pending_goal.as_ref()
-                                    .is_some_and(|pending| update.authority.permits_goal(pending)))
-                            {
-                                goal_buffer.pending_invalidated = true;
-                            }
+
                             let snapshot = scheduler.status();
                             publish_guarded_nav_observation(
                                 transport,
@@ -1455,11 +1303,6 @@ where
                                 &mut publications,
                             )
                             .await?;
-                            clear_terminal_session_after_publication(
-                                &mut active_session,
-                                &mut telemetry,
-                                &snapshot,
-                            );
                         }
                         if changed_domain || update.snapshot.is_err() {
                             let settlement = (recent_source.reset(scheduler)).await;
@@ -1507,7 +1350,7 @@ where
                         telemetry = candidate_telemetry;
                         // Observe the accepted map without taking/activating a
                         // buffered goal before an early cancellation settles.
-                        goal_buffer.costmap_observed = true;
+
                         Ok(())
                     }
                     Err(error) => match runtime_input_error::<()>("guarded_nav_scheduler.costmap", error) {
@@ -1520,28 +1363,14 @@ where
                 };
                 ordinary?;
                 if !accepted { continue; }
-                let ready_goal = goal_buffer.take_ready_goal();
-                if let Some(goal) = ready_goal {
-                    activate_or_defer_guarded_goal(
-                        node,
-                        transport,
-                        scheduler,
-                        &mut telemetry,
-                        &mut active_session,
-                        &mut goal_buffer,
-                        *goal,
-                        surface_authority.as_ref(),
-                        planar_mode,
-                    )
-                    .await?;
-                }
+
                 let snapshot = scheduler.status();
                 let planner_inputs_fresh = snapshot.planner_inputs_fresh;
-                publish_guarded_tail_observation(transport, node, snapshot, &mut telemetry, Some(planner_inputs_fresh), &mut publications, &mut active_session).await?;
+                publish_guarded_tail_observation(transport, node, snapshot, &mut telemetry, Some(planner_inputs_fresh), &mut publications).await?;
             }
             GuardedNavEvent::Goal(message) => {
                 let frame = required_frame(message, "guarded_nav_scheduler.goal")?;
-                let navigation_goal = match schema::decode_navigation_goal_body(&frame.payload) {
+                let navigation_goal = match decode_navigation_goal_input(&frame.payload) {
                     Ok(envelope) => envelope,
                     Err(error) => {
                         publish_guarded_rejection(
@@ -1556,59 +1385,20 @@ where
                         continue;
                     }
                 };
-                if let Err(error) = pose_from_schema(&navigation_goal.goal)
-                    .and_then(|goal| require_map_pose(&goal, "guarded_nav_scheduler.goal"))
-                {
-                    publish_guarded_rejection(
-                        transport,
-                        &node.outputs[1],
-                        scheduler.status(),
-                        &telemetry,
-                        "goal",
-                        &error.to_string(),
-                    )
-                    .await?;
-                    continue;
-                }
-                let navigation_goal = match goal_buffer.observe_goal(navigation_goal) {
-                    PlannerGoalIngress::Ready(goal) => {
-
-                        *goal
-                    }
-                    PlannerGoalIngress::Buffered => {
-
-
-                        continue;
-                    }
-                    PlannerGoalIngress::Rejected(reason) => {
-                        publish_guarded_rejection(
-                            transport,
-                            &node.outputs[1],
-                            scheduler.status(),
-                            &telemetry,
-                            "goal",
-                            &format!("NavigationGoal lease rejected: {reason:?}"),
-                        )
-                        .await?;
-                        continue;
-                    }
-                };
-                activate_or_defer_guarded_goal(
+                if latest_goal.as_ref()==Some(&navigation_goal){continue;}
+                activate_guarded_goal(
                     node,
                     transport,
                     scheduler,
                     &mut telemetry,
-                    &mut active_session,
-                    &mut goal_buffer,
+                    &mut latest_goal,
                     navigation_goal,
-                    surface_authority.as_ref(),
-                    planar_mode,
                 )
                 .await?;
             }
             GuardedNavEvent::Path(message) => {
                 let frame = required_frame(message, "guarded_nav_scheduler.path")?;
-                let Some(active_goal) = active_session.as_ref() else {
+                let Some(active_goal) = latest_goal.as_ref() else {
                     publish_guarded_rejection(
                         transport,
                         &node.outputs[1],
@@ -1620,18 +1410,7 @@ where
                     .await?;
                     continue;
                 };
-                if !goal_buffer.has_applied_goal() {
-                    publish_guarded_rejection(
-                        transport,
-                        &node.outputs[1],
-                        scheduler.status(),
-                        &telemetry,
-                        "path",
-                        "active goal lease is fenced by a newer goal",
-                    )
-                    .await?;
-                    continue;
-                }
+
                 let path_envelope = match schema::decode_path_envelope_body(&frame.payload) {
                     Ok(envelope) => envelope,
                     Err(error) => {
@@ -1702,7 +1481,6 @@ where
                         },
                         path,
                     })).await;
-                let rejected = settlement.is_err();
                 let ordinary = match settlement {
                     Err(error) => match runtime_input_error::<()>("guarded_nav_scheduler.path", error) {
                         Ok(OwnerInput::Rejected(reason)) => publish_guarded_rejection(
@@ -1720,12 +1498,6 @@ where
                     }
                 };
                 ordinary?;
-                if rejected {
-                    let snapshot = scheduler.status();
-                    clear_terminal_session_after_publication(
-                        &mut active_session, &mut telemetry, &snapshot,
-                    );
-                }
             }
             GuardedNavEvent::Cancel(message) => {
                 let frame = required_frame(message, "导航取消")?;
@@ -1733,9 +1505,7 @@ where
                     Ok(cancel) => cancel,
                     Err(error) => { diagnostics.reject("导航取消", &error.to_string()); continue; }
                 };
-                let buffered_goal = goal_buffer.pending_goal.as_ref()
-                    .filter(|goal| validate_cancel_goal_correlation(&cancel, goal).is_ok()).cloned();
-                if active_session.as_ref().is_some_and(|goal| validate_cancel_goal_correlation(&cancel, goal).is_ok()) {
+                if latest_goal.as_ref().is_some_and(|goal| validate_cancel_goal_correlation(&cancel, goal).is_ok()) {
                     if let Err(error) = scheduler.cancel(&cancel.session_id).await {
                         if let OwnerInput::Rejected(reason) = runtime_input_error::<()>("导航取消", error)? {
                             diagnostics.reject("导航取消", &reason);
@@ -1743,104 +1513,11 @@ where
                     }
                     let snapshot = scheduler.status();
                     publish_guarded_nav_observation(transport, node, snapshot.clone(), &telemetry, None, &mut publications).await?;
-                    clear_terminal_session_after_publication(&mut active_session, &mut telemetry, &snapshot);
                 }
-                if let Some(goal) = buffered_goal {
-                    let candidate = guarded_buffered_cancel_telemetry(&telemetry, &goal,);
-                    let mut snapshot = scheduler.status();
-                    snapshot.phase = nuwax_nav_runtime::SchedulerPhase::Idle;
-                    snapshot.session_id = None;
-                    snapshot.last_terminal = Some(nuwax_nav_runtime::TerminalOutcome::Cancelled);
-                    snapshot.message = "缓冲目标已取消".into();
-                    // 尚未申请租约的目标只回报状态，不发布速度或虚构释放回执。
-                    publish_guarded_nav_state(transport, &node.outputs[1], snapshot, &candidate, None).await?;
-                    goal_buffer.clear_pending_goal_for(&goal);
-                }
-                if cancel.session_id.is_empty() {
-                    goal_buffer = PlannerGoalBuffer::default();
-                    goal_buffer.costmap_observed = surface_authority.is_some();
-                    }
+
             }
         }
     }
-}
-
-#[cfg(feature = "guard-runtime")]
-async fn activate_or_defer_guarded_goal(
-    node: &ModuleNode,
-    transport: &LcmTransport,
-    scheduler: &nuwax_nav_runtime::NavSchedulerHandle,
-    telemetry: &mut GuardedNavTelemetry,
-    active_session: &mut Option<schema::NavigationGoal>,
-    goal_buffer: &mut PlannerGoalBuffer,
-    navigation_goal: schema::NavigationGoal,
-    surface_authority: Option<&GuardedMapAuthority>,
-    planar_mode:bool,
-) -> NavStackResult<()> {
-    if (node.id == "surface_nav_scheduler" || planar_mode)
-        && !surface_authority.is_some_and(|map| map.permits_goal(&navigation_goal))
-    {
-        goal_buffer.costmap_observed = false;
-        goal_buffer.defer_ready_goal(navigation_goal);
-        return Ok(());
-    }
-
-    if !guarded_goal_inputs_ready(telemetry, scheduler, &navigation_goal) {
-        if !goal_buffer.defer_ready_goal(navigation_goal) {
-            return Err(NavStackError::Internal(
-                "guarded scheduler could not retain a not-yet-ready NavigationGoal".into(),
-            ));
-        }
-        return Ok(());
-    }
-
-    let applied_goal = navigation_goal.clone();
-    match activate_guarded_goal(
-        node,
-        transport,
-        scheduler,
-        telemetry,
-        active_session,
-        navigation_goal,
-    )
-    .await? {
-        GuardedGoalActivation::Activated => {
-            if !goal_buffer.mark_applied(&applied_goal) {
-                return Err(NavStackError::Internal(
-                    "guarded scheduler applied a superseded NavigationGoal".into(),
-                ));
-            }
-        }
-        GuardedGoalActivation::Deferred => {
-            if !goal_buffer.defer_ready_goal(applied_goal) {
-                return Err(NavStackError::Internal(
-                    "guarded scheduler lost a NavigationGoal after deferred activation".into(),
-                ));
-            }
-        }
-        GuardedGoalActivation::LeaseRejected => {
-            goal_buffer.clear_pending_goal_for(&applied_goal);
-        }
-    }
-    Ok(())
-}
-
-#[cfg(feature = "guard-runtime")]
-fn guarded_goal_inputs_ready(
-    telemetry: &GuardedNavTelemetry,
-    scheduler: &nuwax_nav_runtime::NavSchedulerHandle,
-    _navigation_goal: &schema::NavigationGoal,
-) -> bool {
-    !telemetry.map_frame.is_empty()
-        && telemetry.pose_frame == telemetry.map_frame
-        && scheduler.status().planner_inputs_fresh
-}
-
-#[cfg(feature = "guard-runtime")]
-enum GuardedGoalActivation {
-    Activated,
-    Deferred,
-    LeaseRejected,
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -1849,75 +1526,38 @@ async fn activate_guarded_goal(
     transport: &LcmTransport,
     scheduler: &nuwax_nav_runtime::NavSchedulerHandle,
     telemetry: &mut GuardedNavTelemetry,
-    active_session: &mut Option<schema::NavigationGoal>,
+    latest_goal: &mut Option<schema::NavigationGoal>,
     navigation_goal: schema::NavigationGoal,
-) -> NavStackResult<GuardedGoalActivation> {
-    let goal = match pose_from_schema(&navigation_goal.goal).and_then(|goal| {
-        require_map_pose(&goal, "guarded_nav_scheduler.goal")?;
-        Ok(goal)
-    }) {
-        Ok(goal) => goal,
-        Err(error) => {
-            publish_guarded_rejection(
-                transport,
-                &node.outputs[1],
-                scheduler.status(),
-                telemetry,
-                "goal",
-                &error.to_string(),
-            )
-            .await?;
-            return Ok(GuardedGoalActivation::Deferred);
-        }
-    };
-    if telemetry.map_frame.is_empty()
-        || telemetry.pose_frame != telemetry.map_frame
-        || !scheduler.status().planner_inputs_fresh
-    {
-        publish_guarded_rejection(
-            transport,
-            &node.outputs[1],
-            scheduler.status(),
-            telemetry,
-            "goal",
-            "planner pose/costmap inputs are not ready or use different frames",
-        )
-        .await?;
-        return Ok(GuardedGoalActivation::Deferred);
-    }
-
-    let mut candidate_telemetry = telemetry.clone();
-    candidate_telemetry.goal = [
+) -> NavStackResult<()> {
+    let goal = pose_from_schema(&navigation_goal.goal)?;
+    telemetry.goal = [
         goal.pose.position.x,
         goal.pose.position.y,
         goal.pose.orientation.yaw(),
     ];
-    candidate_telemetry.goal_z = goal.pose.position.z;
-    candidate_telemetry.public_session_id = navigation_goal.session_id.clone();
-    candidate_telemetry.motion_generation = navigation_goal.motion_generation as i64;
-    candidate_telemetry.path_revision = 0;
-    candidate_telemetry.planner_runtime_generation = 0;
-    candidate_telemetry.initial_distance = telemetry_distance(&candidate_telemetry);
-    candidate_telemetry.progress = 0.0;
-    if let Err(error) = scheduler
+    telemetry.goal_z = goal.pose.position.z;
+    telemetry.public_session_id = navigation_goal.session_id.clone();
+    telemetry.motion_generation = navigation_goal.motion_generation as i64;
+    telemetry.path_revision = 0;
+    telemetry.planner_runtime_generation = 0;
+    telemetry.initial_distance = telemetry_distance(telemetry);
+    telemetry.progress = 0.;
+    *latest_goal = Some(navigation_goal.clone());
+    let result = scheduler
         .start_session(nuwax_nav_runtime::NavSession {
-            boundary: navigation_goal.boundary_points.iter().map(|p|[p[0],p[1]]).collect(),
+            boundary: navigation_goal
+                .boundary_points
+                .iter()
+                .map(|p| [p[0], p[1]])
+                .collect(),
             options: navigation_goal.options(),
-            goal: nuwax_nav_runtime::ExecutionGoal::Body(pose_from_schema(&navigation_goal.goal)?),
+            goal: nuwax_nav_runtime::ExecutionGoal::Body(goal),
             session_id: navigation_goal.session_id.clone(),
             execution_identity: guarded_goal_execution_identity(&navigation_goal),
-
             motion_generation: navigation_goal.motion_generation,
         })
-        .await
-    {
-        if matches!(error, nuwax_nav_runtime::RuntimeError::LeaseNotGranted(_)) {
-            // 明确未授予的拒绝属于本次候选目标，不能发布旧目标或空闲心跳。
-            let mut rejected = scheduler.status();
-            rejected.message = error.to_string();
-            publish_guarded_nav_state(transport, &node.outputs[1], rejected, &candidate_telemetry, None).await?;
-            return Ok(GuardedGoalActivation::LeaseRejected);
-        }
+        .await;
+    if let Err(error) = result {
         match runtime_input_error::<()>("guarded_nav_scheduler.goal", error)? {
             OwnerInput::Rejected(reason) => {
                 publish_guarded_rejection(
@@ -1928,16 +1568,21 @@ async fn activate_guarded_goal(
                     "goal",
                     &reason,
                 )
-                .await?;
-                return Ok(GuardedGoalActivation::Deferred);
+                .await?
             }
             OwnerInput::Accepted(()) => unreachable!("error classifier accepted an error"),
         }
+    } else {
+        publish_guarded_nav_state(
+            transport,
+            &node.outputs[1],
+            scheduler.status(),
+            telemetry,
+            None,
+        )
+        .await?;
     }
-    *telemetry = candidate_telemetry;
-    *active_session = Some(navigation_goal);
-    publish_guarded_nav_state(transport, &node.outputs[1], scheduler.status(), telemetry, None).await?;
-    Ok(GuardedGoalActivation::Activated)
+    Ok(())
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -1953,19 +1598,6 @@ fn runtime_generation() -> u64 {
 }
 
 #[cfg(feature = "guard-runtime")]
-fn clear_terminal_active_session(
-    active_session: &mut Option<schema::NavigationGoal>,
-    status: &nuwax_nav_runtime::SchedulerStatus,
-) -> bool {
-    if active_session.is_some() && status.last_terminal.is_some() {
-        active_session.take();
-        true
-    } else {
-        false
-    }
-}
-
-#[cfg(feature = "guard-runtime")]
 fn clear_guarded_session_telemetry(telemetry: &mut GuardedNavTelemetry) {
     telemetry.public_session_id.clear();
     telemetry.motion_generation = 0;
@@ -1975,19 +1607,6 @@ fn clear_guarded_session_telemetry(telemetry: &mut GuardedNavTelemetry) {
     telemetry.planner_runtime_generation = 0;
     telemetry.initial_distance = 0.0;
     telemetry.progress = 0.0;
-}
-
-#[cfg(feature = "guard-runtime")]
-fn clear_terminal_session_after_publication(
-    active_session: &mut Option<schema::NavigationGoal>,
-    telemetry: &mut GuardedNavTelemetry,
-    status: &nuwax_nav_runtime::SchedulerStatus,
-) -> bool {
-    if !clear_terminal_active_session(active_session, status) {
-        return false;
-    }
-    clear_guarded_session_telemetry(telemetry);
-    true
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -2005,29 +1624,6 @@ fn validate_cancel_goal_correlation(
 ) -> Result<(), String> {
     if cancel.session_id.is_empty() || cancel.session_id == goal.session_id { Ok(()) }
     else { Err("取消目标号不匹配".into()) }
-}
-
-#[cfg(feature = "guard-runtime")]
-fn guarded_buffered_cancel_telemetry(
-    telemetry: &GuardedNavTelemetry,
-    goal: &schema::NavigationGoal,
-) -> GuardedNavTelemetry {
-    let goal_pose =
-        pose_from_schema(&goal.goal).expect("buffered goal pose was validated on ingress");
-    let mut candidate = telemetry.clone();
-    candidate.public_session_id = goal.session_id.clone();
-    candidate.motion_generation = goal.motion_generation as i64;
-    candidate.goal = [
-        goal_pose.pose.position.x,
-        goal_pose.pose.position.y,
-        goal_pose.pose.orientation.yaw(),
-    ];
-    candidate.path_revision = 0;
-    candidate.planner_runtime_generation = 0;
-    candidate.goal_z = goal_pose.pose.position.z;
-    candidate.initial_distance = telemetry_distance(&candidate);
-    candidate.progress = 0.0;
-    candidate
 }
 
 #[cfg(any(feature = "guard-runtime", feature = "click-goal"))]
@@ -2129,11 +1725,21 @@ impl GuardedStatusPublications {
 async fn publish_guarded_tail_observation(
     transport: &LcmTransport, node: &ModuleNode, snapshot: nuwax_nav_runtime::SchedulerStatus,
     telemetry: &mut GuardedNavTelemetry, planner_observation: Option<bool>,
-    publications: &mut GuardedStatusPublications, active_session: &mut Option<schema::NavigationGoal>,
+    publications: &mut GuardedStatusPublications,
 ) -> NavStackResult<()> {
     publish_guarded_nav_observation(transport, node, snapshot.clone(), telemetry, planner_observation, publications).await?;
-    clear_terminal_session_after_publication(active_session, telemetry, &snapshot);
+    clear_terminal_telemetry_after_publication(telemetry, &snapshot);
     Ok(())
+}
+
+#[cfg(feature = "guard-runtime")]
+fn clear_terminal_telemetry_after_publication(
+    telemetry: &mut GuardedNavTelemetry,
+    status: &nuwax_nav_runtime::SchedulerStatus,
+) {
+    if status.last_terminal.is_some() {
+        clear_guarded_session_telemetry(telemetry);
+    }
 }
 
 #[cfg(feature = "guard-runtime")]
@@ -2972,223 +2578,19 @@ impl NavigationBoundary {
 fn navigation_boundary_from_goal(
     goal: &schema::NavigationGoal,
 ) -> NavStackResult<Option<NavigationBoundary>> {
-    if goal.boundary_points.is_empty() { return Ok(None); }
+    if goal.boundary_points.is_empty() {
+        return Ok(None);
+    }
     let boundary = NavigationBoundary::new(&goal.boundary_points)?;
     let point = Point2::new(goal.goal.pose.position[0], goal.goal.pose.position[1]);
-    if !boundary.contains(point) { return Err(NavStackError::InvalidConfig("探索目标不在边界内".into())); }
+    if !boundary.contains(point) {
+        return Err(NavStackError::InvalidConfig("探索目标不在边界内".into()));
+    }
     Ok(Some(boundary))
 }
 
-#[cfg(any(
-    feature = "guard-runtime",
-    feature = "simple-2d",
-    feature = "replanning-astar"
-))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::enum_variant_names)]
-enum PlannerGoalRejectReason {
-    DuplicateLease,
-    ConflictingLease,
-}
-
-#[cfg(any(
-    feature = "guard-runtime",
-    feature = "simple-2d",
-    feature = "replanning-astar"
-))]
-#[derive(Debug)]
-enum PlannerGoalIngress {
-    Ready(Box<schema::NavigationGoal>),
-    Buffered,
-    Rejected(PlannerGoalRejectReason),
-}
-
-#[cfg(any(
-    feature = "guard-runtime",
-    feature = "simple-2d",
-    feature = "replanning-astar"
-))]
-#[derive(Default)]
-struct PlannerGoalBuffer {
-    costmap_observed: bool,
-    pending_invalidated: bool,
-    pending_goal: Option<schema::NavigationGoal>,
-    newest_goal: Option<schema::NavigationGoal>,
-    active_goal_applied: bool,
-}
-
-#[cfg(any(
-    feature = "guard-runtime",
-    feature = "simple-2d",
-    feature = "replanning-astar"
-))]
-impl PlannerGoalBuffer {
-    fn observe_goal(&mut self, goal: schema::NavigationGoal) -> PlannerGoalIngress {
-        if let Some(newest) = self.newest_goal.as_ref() {
-            if let Err(reason) = validate_navigation_goal_order(&goal, newest) {
-                return PlannerGoalIngress::Rejected(reason);
-            }
-        }
-        self.active_goal_applied = false;
-        self.pending_invalidated = false;
-        self.newest_goal = Some(goal.clone());
-        if self.costmap_observed {
-            self.pending_goal = None;
-            PlannerGoalIngress::Ready(Box::new(goal))
-        } else {
-            self.pending_goal = Some(goal);
-            PlannerGoalIngress::Buffered
-        }
-    }
-
-    fn observe_costmap(&mut self) -> Option<Box<schema::NavigationGoal>> {
-        self.costmap_observed = true;
-        // Occupancy header.seq is compatibility telemetry, not a planner
-        // synchronization primitive. Timestamp validation and receipt TTL own
-        // freshness; any valid costmap can release the newest pending lease.
-        self.take_ready_goal()
-    }
-
-    fn mark_applied(&mut self, goal: &schema::NavigationGoal) -> bool {
-        let is_current = self.is_newest_goal(goal);
-        if is_current {
-            self.active_goal_applied = true;
-            if self.pending_goal.as_ref().is_some_and(|pending| {
-                planner_goal_identity_matches(pending, goal)
-            }) {
-                self.pending_goal = None;
-            }
-        }
-        is_current
-    }
-
-    fn is_newest_goal(&self, goal: &schema::NavigationGoal) -> bool {
-        self.newest_goal.as_ref().is_some_and(|newest| {
-            planner_goal_identity_matches(goal, newest)
-        })
-    }
-
-    fn defer_ready_goal(&mut self, goal: schema::NavigationGoal) -> bool {
-        let is_current = self.newest_goal.as_ref().is_some_and(|newest| {
-            planner_goal_identity_matches(&goal, newest)
-        });
-        if is_current {
-            self.active_goal_applied = false;
-            self.pending_goal = Some(goal);
-        }
-        is_current
-    }
-
-    fn take_ready_goal(&mut self) -> Option<Box<schema::NavigationGoal>> {
-        if self.costmap_observed && !self.pending_invalidated {
-            self.pending_goal.take().map(Box::new)
-        } else {
-            None
-        }
-    }
-
-    fn has_applied_goal(&self) -> bool {
-        self.active_goal_applied
-    }
-
-    #[cfg(feature = "simple-2d")]
-    fn clear_applied_goal(&mut self) {
-        self.active_goal_applied = false;
-    }
-
-    fn cancelled_pending_goal(
-        &self,
-        cancel: &schema::CancelNavigation,
-    ) -> Result<Option<Box<schema::NavigationGoal>>, String> {
-        let Some(pending) = self.pending_goal.as_ref() else {
-            return Ok(None);
-        };
-        validate_cancel_goal_correlation(cancel, pending)?;
-        Ok(Some(Box::new(pending.clone())))
-    }
-
-    fn clear_pending_goal_for(&mut self, goal: &schema::NavigationGoal) -> bool {
-        let matches = self.pending_goal.as_ref().is_some_and(|pending| {
-            planner_goal_identity_matches(pending, goal)
-        });
-        if matches {
-            self.pending_goal = None;
-            self.active_goal_applied = false;
-        }
-        matches
-    }
-}
-
-#[cfg(feature = "simple-2d")]
-fn clear_simple_planner_active_projection(
-    goal_buffer: &mut PlannerGoalBuffer,
-    active_goal: &mut Option<schema::NavigationGoal>,
-    active_boundary: &mut Option<NavigationBoundary>,
-    path_revision: &mut i64,
-    published_path_is_boundary_safe: &mut bool,
-) {
-    active_goal.take();
-    active_boundary.take();
-    *path_revision = 0;
-    *published_path_is_boundary_safe = false;
-    goal_buffer.clear_applied_goal();
-}
-
-#[cfg(any(feature = "simple-2d", feature = "replanning-astar"))]
-fn clear_planner_goal_for_costmap_advance(
-    active_goal: &mut Option<schema::NavigationGoal>,
-    active_boundary: &mut Option<NavigationBoundary>,
-    path_revision: &mut i64,
-) {
-    active_goal.take();
-    active_boundary.take();
-    *path_revision = 0;
-}
-
-#[cfg(any(
-    feature = "guard-runtime",
-    feature = "simple-2d",
-    feature = "replanning-astar"
-))]
-
-
-#[cfg(any(
-    feature = "guard-runtime",
-    feature = "simple-2d",
-    feature = "replanning-astar",
-    feature = "cmu-native",
-    feature = "explore",
-    feature = "mls"
-))]
-fn planner_goal_identity_matches(
-    left: &schema::NavigationGoal,
-    right: &schema::NavigationGoal,
-) -> bool {
-    left == right
-}
-
-#[cfg(any(
-    feature = "guard-runtime",
-    feature = "simple-2d",
-    feature = "replanning-astar"
-))]
-fn validate_navigation_goal_order(
-    candidate: &schema::NavigationGoal,
-    newest: &schema::NavigationGoal,
-) -> Result<(), PlannerGoalRejectReason> {
-    if candidate.session_id == newest.session_id {
-        if candidate == newest { Err(PlannerGoalRejectReason::DuplicateLease) }
-        else { Err(PlannerGoalRejectReason::ConflictingLease) }
-    } else { Ok(()) }
-}
-
-#[cfg(any(
-    feature = "simple-2d",
-    feature = "replanning-astar",
-    feature = "cmu-native",
-    feature = "explore",
-    feature = "mls"
-))]
+#[cfg(any(feature = "simple-2d", feature = "replanning-astar", feature = "cmu-native",
+    feature = "explore", feature = "mls"))]
 fn path_respects_navigation_boundary(
     path: &Path2D,
     boundary: Option<&NavigationBoundary>,
@@ -3377,23 +2779,6 @@ fn decode_planner_stop_input(payload: &[u8], component: &str) -> OwnerInputResul
 }
 
 #[cfg(any(feature = "simple-2d", feature = "replanning-astar"))]
-fn validate_newer_source_timestamp(
-    accepted_timestamp_ns: i64,
-    candidate_timestamp_ns: i64,
-    component: &str,
-) -> OwnerInputResult<()> {
-    if candidate_timestamp_ns <= accepted_timestamp_ns {
-        Ok(OwnerInput::Rejected(format!(
-            "{component} timestamp {candidate_timestamp_ns} is duplicate or older than accepted timestamp {accepted_timestamp_ns}"
-        )))
-    } else {
-        Ok(OwnerInput::Accepted(()))
-    }
-}
-
-
-
-
 
 pub(crate) fn capture_body_reference() -> Result<Arc<str>, String> {
     let body = nuwax_config::robot()
@@ -3423,12 +2808,7 @@ fn apply_simple_planner_goal(
         Err(error) => return Ok(OwnerInput::Rejected(error.to_string())),
     };
     let pose = match pose_from_schema(&envelope.goal) {
-        Ok(pose) if require_map_pose(&pose, "simple_planner.goal_pose").is_ok() => pose,
-        Ok(_) => {
-            return Ok(OwnerInput::Rejected(
-                "simple planner goal pose must use map frame".into(),
-            ));
-        }
+        Ok(pose) => pose,
         Err(error) => return Ok(OwnerInput::Rejected(error.to_string())),
     };
     let occupancy = match boundary.as_ref() {
@@ -3472,12 +2852,7 @@ fn apply_astar_planner_goal(
         Err(error) => return Ok(OwnerInput::Rejected(error.to_string())),
     };
     let goal_pose = match pose_from_schema(&envelope.goal) {
-        Ok(goal_pose) if require_map_pose(&goal_pose, "astar_planner.goal").is_ok() => goal_pose,
-        Ok(_) => {
-            return Ok(OwnerInput::Rejected(
-                "A* planner goal pose must use map frame".into(),
-            ));
-        }
+        Ok(pose) => pose,
         Err(error) => return Ok(OwnerInput::Rejected(error.to_string())),
     };
     let costmap = match decode_astar_costmap_with_boundary(costmap_body, boundary.as_ref()) {
@@ -3577,8 +2952,7 @@ fn take_far_join(
 
 #[cfg(any(feature = "cmu-native", feature = "explore"))]
 fn native_path_respects_goal(path: &Path2D, goal: &schema::NavigationGoal) -> bool {
-    goal.goal.header.frame_id == "map"
-        && path.frame_id.as_str() == goal.goal.header.frame_id
+    path.frame_id.as_str() == goal.goal.header.frame_id
         && navigation_boundary_from_goal(goal)
             .ok()
             .is_some_and(|boundary| {
@@ -3595,7 +2969,7 @@ fn admit_native_adapter_goal(
         *latest_goal = Some(candidate);
         return true;
     };
-    if candidate.session_id == current.session_id { return false; }
+    if candidate == *current { return false; }
     *latest_goal = Some(candidate);
     true
 }
@@ -3663,7 +3037,7 @@ async fn run_native_planner_path_adapter_with_transport(
             _ = &mut shutdown => break,
             frame = goals.next() => {
                 let frame = required_frame(frame, "native_planner_path_adapter.goal")?;
-                let goal = match schema::decode_navigation_goal_body(&frame.payload) {
+                let goal = match decode_navigation_goal_input(&frame.payload) {
                     Ok(goal) => goal,
                     Err(_) => continue,
                 };
@@ -3823,243 +3197,150 @@ async fn run_simple_planner(
     let mut goal_pose =
         typed_stream(&transport, &node.inputs[2], "nuwax_msgs.NavigationGoal").await?;
     let mut stop = typed_stream(&transport, &node.inputs[3], "std_msgs.Bool").await?;
-    let robot_geometry = Some(nuwax_config::derived().map_err(NavStackError::InvalidConfig)?.robot_geometry_json.clone())
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| nuwax_nav_types_messages::RobotGeometry::from_runtime_json(&value))
-        .transpose().map_err(NavStackError::InvalidConfig)?;
-    let motion_limits=nuwax_nav_types_messages::NavigationCapabilities::from_runtime()
-        .map_err(NavStackError::InvalidConfig)?.map(|profile| {
-            let mut limits=profile.motion;
-            let navigation=nuwax_nav_runtime::surface_follower::forward_navigation_kinematics(limits.kinematics());
-            limits.model=navigation.model;
-            limits.max_reverse_mps=navigation.max_reverse_mps;
-            limits.max_lateral_mps=navigation.max_lateral_mps;
+    let robot_geometry = Some(
+        nuwax_config::derived()
+            .map_err(NavStackError::InvalidConfig)?
+            .robot_geometry_json
+            .clone(),
+    )
+    .filter(|value| !value.trim().is_empty())
+    .map(|value| nuwax_nav_types_messages::RobotGeometry::from_runtime_json(&value))
+    .transpose()
+    .map_err(NavStackError::InvalidConfig)?;
+    let motion_limits = nuwax_nav_types_messages::NavigationCapabilities::from_runtime()
+        .map_err(NavStackError::InvalidConfig)?
+        .map(|profile| {
+            let mut limits = profile.motion;
+            let navigation = nuwax_nav_runtime::surface_follower::forward_navigation_kinematics(
+                limits.kinematics(),
+            );
+            limits.model = navigation.model;
+            limits.max_reverse_mps = navigation.max_reverse_mps;
+            limits.max_lateral_mps = navigation.max_lateral_mps;
             limits
         });
-    let mut module = SimplePlannerModule::with_config(nuwax_nav_simple_planner::SimplePlannerConfig {
-        robot_geometry, motion_limits, ..nuwax_nav_simple_planner::SimplePlannerConfig::default()
-    }).map_err(|error| module_error("simple_planner.robot_geometry", error))?;
+    let mut module =
+        SimplePlannerModule::with_config(nuwax_nav_simple_planner::SimplePlannerConfig {
+            robot_geometry,
+            motion_limits,
+            ..nuwax_nav_simple_planner::SimplePlannerConfig::default()
+        })
+        .map_err(|error| module_error("simple_planner.robot_geometry", error))?;
     module.enable_background_planning();
     let planner_runtime_generation = saturating_i64(runtime_generation());
-    let mut goal_buffer = PlannerGoalBuffer::default();
+    let mut latest_goal: Option<schema::NavigationGoal> = None;
     let mut latest_occupancy_body: Option<Vec<u8>> = None;
-    let mut active_goal: Option<schema::NavigationGoal> = None;
     let mut active_boundary: Option<NavigationBoundary> = None;
-    let mut active_map_resolution = 0.05_f64;
+    let mut active_map_resolution = 0.05;
     let mut published_path_is_boundary_safe = false;
-    let mut path_revision = 0_i64;
-    let mut last_pose_timestamp_ns = 0_i64;
+    let mut path_revision = 0;
     let mut diagnostics = InputDiagnosticLimiter::default();
-    Module::start(&mut module).map_err(|error| module_error("simple_planner", error))?;
+    Module::start(&mut module).map_err(|e| module_error("simple_planner", e))?;
     let mut ticker = tokio::time::interval(Duration::from_millis(
         nuwax_nav_simple_planner::module::TICK_PERIOD_MS,
     ));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     signal_ready(ready)?;
-
     loop {
         tokio::select! {
-            _ = &mut shutdown => break,
+            _=&mut shutdown=>break,
             message = occupancy.next() => {
                 let frame = required_frame(message, "simple_planner.occupancy")?;
-                let grid = match decode_planner_grid_input(
-                    &frame.payload,
-                    "simple_planner.occupancy",
-                )? {
-                    OwnerInput::Accepted(grid) => grid,
-                    OwnerInput::Rejected(reason) => {
-                        diagnostics.reject("simple_planner.occupancy", &reason);
+                let grid = match decode_planner_grid_input(&frame.payload, "simple_planner.occupancy")? {
+                    OwnerInput::Accepted(v) => v,
+                    OwnerInput::Rejected(e) => {
+                        diagnostics.reject("simple_planner.occupancy", &e);
                         continue;
                     }
                 };
-                let raw_occupancy = match decode_simple_occupancy(&frame.payload) {
-                    Ok(occupancy) => occupancy,
-                    Err(error) => {
-                        diagnostics.reject("simple_planner.occupancy", &error.to_string());
-                        continue;
-                    }
-                };
-                let ready_goal = goal_buffer.observe_costmap();
+                let first = latest_occupancy_body.is_none();
+                latest_occupancy_body = Some(frame.payload.to_vec());
+                active_map_resolution = f64::from(grid.info.resolution);
                 published_path_is_boundary_safe = false;
-                if let Some(envelope) = ready_goal {
-                    clear_planner_goal_for_costmap_advance(
-                        &mut active_goal,
-                        &mut active_boundary,
-                        &mut path_revision,
-                    );
-                    match apply_simple_planner_goal(&mut module, *envelope, &frame.payload)? {
-                        OwnerInput::Accepted((envelope, boundary)) => {
-                            if !goal_buffer.mark_applied(&envelope) {
-                                return Err(NavStackError::Internal(
-                                    "simple planner applied a superseded NavigationGoal".into(),
-                                ));
-                            }
-                            path_revision = 0;
-                            published_path_is_boundary_safe = false;
+                if first && latest_goal.is_some() {
+                    match apply_simple_planner_goal(&mut module, latest_goal.clone().unwrap(), &frame.payload)?
+                    {
+                        OwnerInput::Accepted((_, boundary)) => {
                             active_boundary = boundary;
-                            active_goal = Some(envelope);
+                            path_revision = 0;
                         }
-                        OwnerInput::Rejected(reason) => {
-                            diagnostics.reject("simple_planner.goal_pose", &reason);
-                            module.on_occupancy_grid(raw_occupancy)
-                                .map_err(|error| module_error("simple_planner.occupancy", error))?;
-                        }
+                        OwnerInput::Rejected(e) => diagnostics.reject("simple_planner.goal", &e),
                     }
                 } else {
-                    let boundary = if goal_buffer.has_applied_goal() {
-                        active_boundary.as_ref()
-                    } else {
-                        None
-                    };
-                    let occupancy = match boundary {
-                        Some(boundary) => match decode_simple_occupancy_with_boundary(
-                            &frame.payload,
-                            Some(boundary),
-                        ) {
-                            Ok(occupancy) => occupancy,
-                            Err(error) => {
-                                diagnostics.reject("simple_planner.occupancy", &error.to_string());
-                                continue;
-                            }
-                        },
-                        None => raw_occupancy,
-                    };
-                    module.on_occupancy_grid(occupancy)
-                        .map_err(|error| module_error("simple_planner.occupancy", error))?;
+                    let occupancy =
+                        decode_simple_occupancy_with_boundary(&frame.payload, active_boundary.as_ref())?;
+                    module
+                        .on_occupancy_grid(occupancy)
+                        .map_err(|e| module_error("simple_planner.occupancy", e))?;
                 }
-                active_map_resolution = f64::from(grid.info.resolution);
-                latest_occupancy_body = Some(frame.payload.clone());
-            }
+            },
             message = map_pose.next() => {
-                let frame = required_frame(message, "simple_planner.map_pose")?;
-                let pose = match decode_planner_pose_input(
-                    &frame.payload,
-                    "simple_planner.map_pose",
-                )? {
-                    OwnerInput::Accepted(pose) => pose,
-                    OwnerInput::Rejected(reason) => {
-                        diagnostics.reject("simple_planner.map_pose", &reason);
-                        continue;
-                    }
-                };
-                if let OwnerInput::Rejected(reason) = validate_newer_source_timestamp(
-                    last_pose_timestamp_ns,
-                    pose.stamp.nanos,
-                    "simple_planner.map_pose",
-                )? {
-                    diagnostics.reject("simple_planner.map_pose", &reason);
-                    continue;
+                let frame = latest_pose_frame(message, &mut map_pose, "simple_planner.map_pose")?;
+                match decode_planner_pose_input(&frame.payload, "simple_planner.map_pose")? {
+                    OwnerInput::Accepted(pose) => Module::on_odometry(&mut module, pose)
+                        .map_err(|e| module_error("simple_planner.map_pose", e))?,
+                    OwnerInput::Rejected(e) => diagnostics.reject("simple_planner.map_pose", &e),
                 }
-                let pose_timestamp_ns = pose.stamp.nanos;
-                if let Err(error) = Module::on_odometry(&mut module, pose) {
-                    match module_input_error::<()>("simple_planner.map_pose", error)? {
-                        OwnerInput::Rejected(reason) => {
-                            diagnostics.reject("simple_planner.map_pose", &reason);
-                            continue;
-                        }
-                        OwnerInput::Accepted(()) => unreachable!("error classifier accepted an error"),
-                    }
-                }
-                last_pose_timestamp_ns = pose_timestamp_ns;
-            }
+            },
             message = goal_pose.next() => {
-                let frame = required_frame(message, "simple_planner.goal_pose")?;
-                let envelope = match schema::decode_navigation_goal_body(&frame.payload) {
-                    Ok(envelope) => envelope,
-                    Err(error) => {
-                        diagnostics.reject("simple_planner.goal_pose", &error.to_string());
+                let frame = required_frame(message, "simple_planner.goal")?;
+                let goal = match decode_navigation_goal_input(&frame.payload) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        diagnostics.reject("simple_planner.goal", &e);
                         continue;
                     }
                 };
-                let envelope = match goal_buffer.observe_goal(envelope) {
-                    PlannerGoalIngress::Ready(envelope) => *envelope,
-                    PlannerGoalIngress::Buffered => continue,
-                    PlannerGoalIngress::Rejected(reason) => {
-                        diagnostics.reject(
-                            "simple_planner.goal_pose",
-                            &format!("NavigationGoal rejected: {reason:?}"),
-                        );
-                        continue;
-                    }
-                };
-                let Some(occupancy_body) = latest_occupancy_body.as_ref() else {
+                if latest_goal.as_ref() == Some(&goal) {
                     continue;
-                };
-                let (envelope, boundary) = match apply_simple_planner_goal(
-                    &mut module,
-                    envelope,
-                    occupancy_body,
-                )? {
-                    OwnerInput::Accepted(applied) => applied,
-                    OwnerInput::Rejected(reason) => {
-                        diagnostics.reject("simple_planner.goal_pose", &reason);
-                        continue;
-                    }
-                };
-                if !goal_buffer.mark_applied(&envelope) {
-                    return Err(NavStackError::Internal(
-                        "simple planner applied a superseded NavigationGoal".into(),
-                    ));
                 }
+                Module::on_stop_movement(&mut module, true)
+                    .map_err(|e| module_error("simple_planner.replace", e))?;
+                latest_goal = Some(goal.clone());
+                active_boundary = None;
                 path_revision = 0;
                 published_path_is_boundary_safe = false;
-                active_boundary = boundary;
-                active_goal = Some(envelope);
-            }
+                if let Some(body) = &latest_occupancy_body {
+                    match apply_simple_planner_goal(&mut module, goal, body)? {
+                        OwnerInput::Accepted((_, boundary)) => active_boundary = boundary,
+                        OwnerInput::Rejected(e) => diagnostics.reject("simple_planner.goal", &e),
+                    }
+                }
+            },
             message = stop.next() => {
-                let frame = required_frame(message, "simple_planner.stop_movement")?;
-                let stop = match decode_planner_stop_input(
-                    &frame.payload,
-                    "simple_planner.stop_movement",
-                )? {
-                    OwnerInput::Accepted(stop) => stop,
-                    OwnerInput::Rejected(reason) => {
-                        diagnostics.reject("simple_planner.stop_movement", &reason);
-                        continue;
-                    }
-                };
-                if let Err(error) = Module::on_stop_movement(&mut module, stop) {
-                    match module_input_error::<()>("simple_planner.stop_movement", error)? {
-                        OwnerInput::Rejected(reason) => {
-                            diagnostics.reject("simple_planner.stop_movement", &reason);
-                            continue;
+                let frame = required_frame(message, "simple_planner.stop")?;
+                match decode_planner_stop_input(&frame.payload, "simple_planner.stop")? {
+                    OwnerInput::Accepted(value) => {
+                        Module::on_stop_movement(&mut module, value)
+                            .map_err(|e| module_error("simple_planner.stop", e))?;
+                        if value {
+                            latest_goal = None;
+                            active_boundary = None;
+                            path_revision = 0;
+                            published_path_is_boundary_safe = false;
                         }
-                        OwnerInput::Accepted(()) => unreachable!("error classifier accepted an error"),
                     }
+                    OwnerInput::Rejected(e) => diagnostics.reject("simple_planner.stop", &e),
                 }
-                if stop {
-                    // stop=true 只清理当前执行投影；保留 newest_goal 以便真实 replacement 继续按顺序准入。
-                    clear_simple_planner_active_projection(
-                        &mut goal_buffer,
-                        &mut active_goal,
-                        &mut active_boundary,
-                        &mut path_revision,
-                        &mut published_path_is_boundary_safe,
-                    );
-                }
-            }
-            _ = ticker.tick(), if goal_buffer.has_applied_goal() => {
-                let output = Module::tick(&mut module)
-                    .map_err(|error| module_tick_error("simple_planner.tick", error))?;
+            },
+            _ = ticker.tick(), if latest_goal.is_some()&&latest_occupancy_body.is_some() => {
+                let output =
+                    Module::tick(&mut module).map_err(|e| module_tick_error("simple_planner.tick", e))?;
                 let mut publication = SimpleOutputPublication {
                     path_yaws: module.planned_yaws(),
-                    active_goal: active_goal.as_ref(),
+                    active_goal: latest_goal.as_ref(),
                     active_boundary: active_boundary.as_ref(),
                     map_resolution: active_map_resolution,
                     planner_runtime_generation,
                     path_revision: &mut path_revision,
                     published_path_is_boundary_safe: &mut published_path_is_boundary_safe,
                 };
-                publish_simple_output(
-                    &transport,
-                    &node,
-                    output,
-                    &mut publication,
-                ).await?;
+                publish_simple_output(&transport, &node, output, &mut publication).await?;
             }
         }
     }
-    Module::stop(&mut module).map_err(|error| module_error("simple_planner.stop", error))
+    Module::stop(&mut module).map_err(|e| module_error("simple_planner.stop", e))?;
+    Ok(())
 }
 
 #[cfg(feature = "simple-2d")]
@@ -4203,7 +3484,10 @@ async fn run_astar_planner_with_transport(
     let mut costmap = typed_stream(&transport, &node.inputs[1], "nav_msgs.OccupancyGrid").await?;
     let mut goal = typed_stream(&transport, &node.inputs[2], "nuwax_msgs.NavigationGoal").await?;
     let mut stop = typed_stream(&transport, &node.inputs[3], "std_msgs.Bool").await?;
-    let value = nuwax_config::derived().map_err(NavStackError::InvalidConfig)?.robot_geometry_json.clone();
+    let value = nuwax_config::derived()
+        .map_err(NavStackError::InvalidConfig)?
+        .robot_geometry_json
+        .clone();
     let robot_geometry = nuwax_nav_types_messages::RobotGeometry::from_runtime_json(&value)
         .map_err(NavStackError::InvalidConfig)?;
     let config = nuwax_nav_astar::GlobalPlannerConfig::new(robot_geometry);
@@ -4211,255 +3495,121 @@ async fn run_astar_planner_with_transport(
     NavigationInterface::start(&mut module)
         .map_err(|error| module_error("astar_planner", error))?;
     let mut has_odometry = false;
-    let mut has_costmap = false;
     let planner_runtime_generation = saturating_i64(runtime_generation());
-    let mut goal_buffer = PlannerGoalBuffer::default();
+    let mut latest_goal: Option<schema::NavigationGoal> = None;
     let mut latest_costmap_body: Option<Vec<u8>> = None;
-    let mut active_goal: Option<schema::NavigationGoal> = None;
     let mut active_boundary: Option<NavigationBoundary> = None;
-    let mut active_map_resolution = 0.05_f64;
+    let mut active_map_resolution = 0.05;
     let mut path_revision = 0_i64;
-    let mut last_pose_timestamp_ns = 0_i64;
     let mut diagnostics = InputDiagnosticLimiter::default();
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     signal_ready(ready)?;
-
     loop {
         tokio::select! {
-            _ = &mut shutdown => break,
+            _=&mut shutdown=>break,
             message = map_pose.next() => {
-                let frame = required_frame(message, "astar_planner.map_pose")?;
-                let map_pose = match decode_planner_pose_input(
-                    &frame.payload,
-                    "astar_planner.map_pose",
-                )? {
-                    OwnerInput::Accepted(pose) => pose,
-                    OwnerInput::Rejected(reason) => {
-                        diagnostics.reject("astar_planner.map_pose", &reason);
+                let frame = latest_pose_frame(message, &mut map_pose, "astar_planner.map_pose")?;
+                let pose = match decode_planner_pose_input(&frame.payload, "astar_planner.map_pose")? {
+                    OwnerInput::Accepted(v) => v,
+                    OwnerInput::Rejected(e) => {
+                        diagnostics.reject("astar_planner.map_pose", &e);
                         continue;
                     }
                 };
-                if let OwnerInput::Rejected(reason) = validate_newer_source_timestamp(
-                    last_pose_timestamp_ns,
-                    map_pose.stamp.nanos,
-                    "astar_planner.map_pose",
-                )? {
-                    diagnostics.reject("astar_planner.map_pose", &reason);
-                    continue;
-                }
-                let pose_timestamp_ns = map_pose.stamp.nanos;
-                if let Err(error) = Module::on_odom(&mut module, map_pose) {
-                    match module_input_error::<()>("astar_planner.map_pose", error)? {
-                        OwnerInput::Rejected(reason) => {
-                            diagnostics.reject("astar_planner.map_pose", &reason);
-                            continue;
-                        }
-                        OwnerInput::Accepted(()) => unreachable!("error classifier accepted an error"),
-                    }
-                }
-                last_pose_timestamp_ns = pose_timestamp_ns;
+                Module::on_odom(&mut module, pose).map_err(|e| module_error("astar_planner.map_pose", e))?;
+                let first = !has_odometry;
                 has_odometry = true;
-                if has_costmap {
-                    if let Some(envelope) = goal_buffer.take_ready_goal() {
-                        let costmap_body = latest_costmap_body.as_ref().ok_or_else(|| {
-                            NavStackError::Internal(
-                                "A* planner marked a costmap ready without retaining its body"
-                                    .into(),
-                            )
-                        })?;
-                        let (envelope, boundary, map_resolution) =
-                            match apply_astar_planner_goal(
-                                &mut module,
-                                *envelope,
-                                costmap_body,
-                            )? {
-                                OwnerInput::Accepted(applied) => applied,
-                                OwnerInput::Rejected(reason) => {
-                                    diagnostics.reject("astar_planner.goal", &reason);
-                                    continue;
-                                }
-                            };
-                        if !goal_buffer.mark_applied(&envelope) {
-                            return Err(NavStackError::Internal(
-                                "A* planner applied a superseded NavigationGoal".into(),
-                            ));
+                if first {
+                    if let (Some(goal), Some(body)) = (latest_goal.clone(), latest_costmap_body.as_ref()) {
+                        match apply_astar_planner_goal(&mut module, goal, body)? {
+                            OwnerInput::Accepted((_, boundary, resolution)) => {
+                                active_boundary = boundary;
+                                active_map_resolution = resolution;
+                                path_revision = 0;
+                            }
+                            OwnerInput::Rejected(e) => diagnostics.reject("astar_planner.goal", &e),
                         }
-                        active_map_resolution = map_resolution;
-                        path_revision = 0;
-                        active_boundary = boundary;
-                        active_goal = Some(envelope);
                     }
                 }
-            }
+            },
             message = costmap.next() => {
                 let frame = required_frame(message, "astar_planner.costmap")?;
-                match decode_planner_grid_input(
-                    &frame.payload,
-                    "astar_planner.costmap",
-                )? {
+                match decode_planner_grid_input(&frame.payload, "astar_planner.costmap")? {
                     OwnerInput::Accepted(_) => {}
-                    OwnerInput::Rejected(reason) => {
-                        diagnostics.reject("astar_planner.costmap", &reason);
+                    OwnerInput::Rejected(e) => {
+                        diagnostics.reject("astar_planner.costmap", &e);
                         continue;
                     }
-                };
-                let raw_costmap = match decode_astar_costmap(&frame.payload) {
-                    Ok(costmap) => costmap,
-                    Err(error) => {
-                        diagnostics.reject("astar_planner.costmap", &error.to_string());
-                        continue;
-                    }
-                };
-                let ready_goal = goal_buffer.observe_costmap();
-                if let Some(envelope) = ready_goal {
-                    clear_planner_goal_for_costmap_advance(
-                        &mut active_goal,
-                        &mut active_boundary,
-                        &mut path_revision,
-                    );
-                    if !has_odometry {
-                        let raw_resolution = raw_costmap.resolution();
-                        Module::on_costmap(&mut module, raw_costmap)
-                            .map_err(|error| module_error("astar_planner.costmap", error))?;
-                        active_map_resolution = raw_resolution;
-                        if !goal_buffer.defer_ready_goal(*envelope) {
-                            return Err(NavStackError::Internal(
-                                "A* planner lost a NavigationGoal while waiting for odometry"
-                                    .into(),
-                            ));
-                        }
-                    } else {
-                        match apply_astar_planner_goal(&mut module, *envelope, &frame.payload)? {
-                        OwnerInput::Accepted((envelope, boundary, map_resolution)) => {
-                            if !goal_buffer.mark_applied(&envelope) {
-                                return Err(NavStackError::Internal(
-                                    "A* planner applied a superseded NavigationGoal".into(),
-                                ));
-                            }
-                            active_map_resolution = map_resolution;
-                            path_revision = 0;
+                }
+                let first = latest_costmap_body.is_none();
+                latest_costmap_body = Some(frame.payload.to_vec());
+                if first && has_odometry && latest_goal.is_some() {
+                    let goal = latest_goal.clone().unwrap();
+                    let body = &frame.payload;
+                    match apply_astar_planner_goal(&mut module, goal, body)? {
+                        OwnerInput::Accepted((_, boundary, resolution)) => {
                             active_boundary = boundary;
-                            active_goal = Some(envelope);
+                            active_map_resolution = resolution;
+                            path_revision = 0;
                         }
-                        OwnerInput::Rejected(reason) => {
-                            diagnostics.reject("astar_planner.goal", &reason);
-                            let raw_resolution = raw_costmap.resolution();
-                            Module::on_costmap(&mut module, raw_costmap)
-                                .map_err(|error| module_error("astar_planner.costmap", error))?;
-                            active_map_resolution = raw_resolution;
-                        }
-                    }
+                        OwnerInput::Rejected(e) => diagnostics.reject("astar_planner.goal", &e),
                     }
                 } else {
-                    let boundary = if goal_buffer.has_applied_goal() {
-                        active_boundary.as_ref()
-                    } else {
-                        None
-                    };
-                    let costmap = match boundary {
-                        Some(boundary) => match decode_astar_costmap_with_boundary(
-                            &frame.payload,
-                            Some(boundary),
-                        ) {
-                            Ok(costmap) => costmap,
-                            Err(error) => {
-                                diagnostics.reject("astar_planner.costmap", &error.to_string());
-                                continue;
-                            }
-                        },
-                        None => raw_costmap,
-                    };
-                    active_map_resolution = costmap.resolution();
-                    Module::on_costmap(&mut module, costmap)
-                        .map_err(|error| module_error("astar_planner.costmap", error))?;
+                    let map = decode_astar_costmap_with_boundary(&frame.payload, active_boundary.as_ref())?;
+                    active_map_resolution = map.resolution();
+                    Module::on_costmap(&mut module, map)
+                        .map_err(|e| module_error("astar_planner.costmap", e))?;
                 }
-                latest_costmap_body = Some(frame.payload.clone());
-                has_costmap = true;
-            }
+            },
             message = goal.next() => {
                 let frame = required_frame(message, "astar_planner.goal")?;
-                let envelope = match schema::decode_navigation_goal_body(&frame.payload) {
-                    Ok(envelope) => envelope,
-                    Err(error) => {
-                        diagnostics.reject("astar_planner.goal", &error.to_string());
+                let goal = match decode_navigation_goal_input(&frame.payload) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        diagnostics.reject("astar_planner.goal", &e);
                         continue;
                     }
                 };
-                let envelope = match goal_buffer.observe_goal(envelope) {
-                    PlannerGoalIngress::Ready(envelope) => *envelope,
-                    PlannerGoalIngress::Buffered => continue,
-                    PlannerGoalIngress::Rejected(reason) => {
-                        diagnostics.reject(
-                            "astar_planner.goal",
-                            &format!("NavigationGoal rejected: {reason:?}"),
-                        );
-                        continue;
-                    }
-                };
-                if !has_odometry {
-                    if !goal_buffer.defer_ready_goal(envelope) {
-                        return Err(NavStackError::Internal(
-                            "A* planner lost a NavigationGoal while waiting for odometry".into(),
-                        ));
-                    }
+                if latest_goal.as_ref() == Some(&goal) {
                     continue;
                 }
-                let Some(costmap_body) = latest_costmap_body.as_ref() else {
-                    if !goal_buffer.defer_ready_goal(envelope) {
-                        return Err(NavStackError::Internal(
-                            "A* planner lost a NavigationGoal while waiting for its costmap body"
-                                .into(),
-                        ));
-                    }
-                    continue;
-                };
-                let (envelope, boundary, map_resolution) = match apply_astar_planner_goal(
-                    &mut module,
-                    envelope,
-                    costmap_body,
-                )? {
-                    OwnerInput::Accepted(applied) => applied,
-                    OwnerInput::Rejected(reason) => {
-                        diagnostics.reject("astar_planner.goal", &reason);
-                        continue;
-                    }
-                };
-                if !goal_buffer.mark_applied(&envelope) {
-                    return Err(NavStackError::Internal(
-                        "A* planner applied a superseded NavigationGoal".into(),
-                    ));
-                }
-                active_map_resolution = map_resolution;
+                Module::on_stop_movement(&mut module, true)
+                    .map_err(|e| module_error("astar_planner.replace", e))?;
+                latest_goal = Some(goal.clone());
+                active_boundary = None;
                 path_revision = 0;
-                active_boundary = boundary;
-                active_goal = Some(envelope);
-            }
-            message = stop.next() => {
-                let frame = required_frame(message, "astar_planner.stop_movement")?;
-                let stop = match decode_planner_stop_input(
-                    &frame.payload,
-                    "astar_planner.stop_movement",
-                )? {
-                    OwnerInput::Accepted(stop) => stop,
-                    OwnerInput::Rejected(reason) => {
-                        diagnostics.reject("astar_planner.stop_movement", &reason);
-                        continue;
-                    }
-                };
-                if let Err(error) = Module::on_stop_movement(&mut module, stop) {
-                    match module_input_error::<()>("astar_planner.stop_movement", error)? {
-                        OwnerInput::Rejected(reason) => {
-                            diagnostics.reject("astar_planner.stop_movement", &reason);
-                            continue;
+                if has_odometry {
+                    if let Some(body) = latest_costmap_body.as_ref() {
+                        match apply_astar_planner_goal(&mut module, goal, body)? {
+                            OwnerInput::Accepted((_, boundary, resolution)) => {
+                                active_boundary = boundary;
+                                active_map_resolution = resolution;
+                                path_revision = 0;
+                            }
+                            OwnerInput::Rejected(e) => diagnostics.reject("astar_planner.goal", &e),
                         }
-                        OwnerInput::Accepted(()) => unreachable!("error classifier accepted an error"),
                     }
                 }
-            }
-            _ = ticker.tick(), if has_odometry && has_costmap && goal_buffer.has_applied_goal() => {
-                let output = Module::tick(&mut module)
-                    .map_err(|error| module_tick_error("astar_planner.tick", error))?;
+            },
+            message = stop.next() => {
+                let frame = required_frame(message, "astar_planner.stop")?;
+                match decode_planner_stop_input(&frame.payload, "astar_planner.stop")? {
+                    OwnerInput::Accepted(value) => {
+                        Module::on_stop_movement(&mut module, value)
+                            .map_err(|e| module_error("astar_planner.stop", e))?;
+                        if value {
+                            latest_goal = None;
+                            active_boundary = None;
+                            path_revision = 0;
+                        }
+                    }
+                    OwnerInput::Rejected(e) => diagnostics.reject("astar_planner.stop", &e),
+                }
+            },
+            _ = ticker.tick(), if has_odometry&&latest_costmap_body.is_some()&&latest_goal.is_some() => {
+                let output =
+                    Module::tick(&mut module).map_err(|e| module_tick_error("astar_planner.tick", e))?;
                 let update = match output {
                     ModuleOutput::Navigation(update) | ModuleOutput::SafetyHold(update) => update,
                 };
@@ -4472,17 +3622,16 @@ async fn run_astar_planner_with_transport(
                 );
                 let mut boundary_failure = false;
                 if let Some(path) = update.path {
-                    let next_revision = path_revision.checked_add(1).ok_or_else(|| {
-                        NavStackError::Internal("A* planner path revision exhausted".into())
-                    })?;
+                    let next_revision = path_revision
+                        .checked_add(1)
+                        .ok_or_else(|| NavStackError::Internal("A* planner path revision exhausted".into()))?;
                     let published = publish_versioned_path(
                         &transport,
                         &node.outputs[1],
                         VersionedPathPublication {
-                    path_yaws: None,                            goal: active_goal.as_ref().ok_or_else(|| {
-                                NavStackError::Internal(
-                                    "A* path has no active NavigationGoal".into(),
-                                )
+                            path_yaws: None,
+                            goal: latest_goal.as_ref().ok_or_else(|| {
+                                NavStackError::Internal("A* path has no active NavigationGoal".into())
                             })?,
                             planner_runtime_generation,
                             path_revision: next_revision,
@@ -4493,7 +3642,8 @@ async fn run_astar_planner_with_transport(
                                 active_map_resolution * 0.5,
                             ),
                         },
-                    ).await?;
+                    )
+                    .await?;
                     if published {
                         path_revision = next_revision;
                     } else {
@@ -4507,12 +3657,8 @@ async fn run_astar_planner_with_transport(
             }
         }
     }
-    NavigationInterface::set_replanning_enabled(&mut module, true)
-        .map_err(|error| module_error("astar_planner.restore_replanning", error))?;
-    NavigationInterface::reset_safe_goal_clearance(&mut module)
-        .map_err(|error| module_error("astar_planner.reset_safe_goal_clearance", error))?;
-    NavigationInterface::stop(&mut module)
-        .map_err(|error| module_error("astar_planner.stop", error))
+    NavigationInterface::stop(&mut module).map_err(|e| module_error("astar_planner.stop", e))?;
+    Ok(())
 }
 
 #[cfg(feature = "patrolling")]
@@ -5646,63 +4792,8 @@ fn planner_test_grid_body(revision: i32) -> Vec<u8> {
 }
 
 #[cfg(all(test, any(feature = "simple-2d", feature = "replanning-astar")))]
-mod planner_goal_buffer_tests {
+mod planner_input_tests {
     use super::*;
-
-    #[test]
-    fn arrival_order_keeps_the_newest_goal_and_rejects_duplicate_goal() {
-        let mut buffer = PlannerGoalBuffer::default();
-        assert!(buffer.observe_costmap().is_none());
-
-        let first = planner_test_goal("goal-1", 1);
-        let ready_first = match buffer.observe_goal(first.clone()) {
-            PlannerGoalIngress::Ready(goal) => *goal,
-            outcome => panic!("first lease must use the observed costmap: {outcome:?}"),
-        };
-        assert!(buffer.mark_applied(&ready_first));
-
-        let second = planner_test_goal("goal-2", 2);
-        let ready_second = match buffer.observe_goal(second.clone()) {
-            PlannerGoalIngress::Ready(goal) => *goal,
-            outcome => panic!("newer goal generation must not be buffered: {outcome:?}"),
-        };
-        assert!(!buffer.has_applied_goal());
-        assert!(buffer.mark_applied(&ready_second));
-        assert!(matches!(
-            buffer.observe_goal(second),
-            PlannerGoalIngress::Rejected(PlannerGoalRejectReason::DuplicateLease)
-        ));
-        assert!(buffer.observe_costmap().is_none());
-        assert!(buffer.observe_costmap().is_none());
-        assert!(buffer.has_applied_goal());
-
-        let mut cold = PlannerGoalBuffer::default();
-        let pending = planner_test_goal("pending", 1);
-        assert!(matches!(
-            cold.observe_goal(pending.clone()),
-            PlannerGoalIngress::Buffered
-        ));
-        let released = *cold
-            .observe_costmap()
-            .expect("any valid costmap must release the pending lease");
-        assert_eq!(released, pending);
-    }
-
-    #[test]
-    fn applied_goal_remains_active_when_the_costmap_updates() {
-        let mut buffer = PlannerGoalBuffer::default();
-        assert!(buffer.observe_costmap().is_none());
-        let goal = planner_test_goal("active-goal", 1);
-        let ready = match buffer.observe_goal(goal) {
-            PlannerGoalIngress::Ready(goal) => *goal,
-            outcome => panic!("goal must be ready: {outcome:?}"),
-        };
-        assert!(buffer.mark_applied(&ready));
-
-        assert!(buffer.observe_costmap().is_none());
-        assert!(buffer.has_applied_goal());
-        assert!(buffer.pending_goal.is_none());
-    }
 
     #[test]
     fn module_internal_native_transport_timeout_and_all_tick_errors_are_fatal() {
@@ -5743,7 +4834,7 @@ mod planner_goal_buffer_tests {
     }
 
     #[test]
-    fn planner_sensor_validation_rejects_frame_nonfinite_and_timestamp_replay() {
+    fn planner_sensor_validation_rejects_frame_and_nonfinite() {
         let mut pose = schema::PoseStamped {
             header: schema::Header {
                 stamp_sec: 40,
@@ -5771,20 +4862,6 @@ mod planner_goal_buffer_tests {
             OwnerInput::Rejected(_)
         ));
 
-        assert!(matches!(
-            validate_newer_source_timestamp(40, 41, "planner.map_pose").expect("new timestamp"),
-            OwnerInput::Accepted(())
-        ));
-        assert!(matches!(
-            validate_newer_source_timestamp(41, 41, "planner.map_pose")
-                .expect("duplicate timestamp is external"),
-            OwnerInput::Rejected(_)
-        ));
-        assert!(matches!(
-            validate_newer_source_timestamp(41, 40, "planner.map_pose")
-                .expect("regressive timestamp is external"),
-            OwnerInput::Rejected(_)
-        ));
     }
 }
 
@@ -5984,16 +5061,7 @@ mod simple_tests {
         let goal = planner_test_goal("simple-goal", 4);
         let expected_key = goal.goal_key();
         let expected_boundary = goal.boundary_points.clone();
-        let mut buffer = PlannerGoalBuffer::default();
-        assert!(matches!(
-            buffer.observe_goal(goal.clone()),
-            PlannerGoalIngress::Buffered
-        ));
-        assert_eq!(buffer.pending_goal.as_ref(), Some(&goal));
-
-        let ready = buffer
-            .observe_costmap()
-            .expect("first valid costmap must release the buffered simple goal");
+        let ready = decode_navigation_goal_input(&schema::encode_navigation_goal_body(&goal).unwrap()).unwrap();
         assert_eq!(ready.goal_key(), expected_key);
         assert_eq!(ready.boundary_points, expected_boundary);
 
@@ -6009,7 +5077,7 @@ mod simple_tests {
         robot_pose.stamp = Timestamp::from_unix(21, 0);
         Module::on_odometry(&mut planner, robot_pose).expect("simple map pose");
         let (applied, boundary) =
-            match apply_simple_planner_goal(&mut planner, *ready, &planner_test_grid_body(21))
+            match apply_simple_planner_goal(&mut planner, ready, &planner_test_grid_body(21))
                 .expect("apply simple buffered goal")
             {
                 OwnerInput::Accepted(applied) => applied,
@@ -6017,102 +5085,44 @@ mod simple_tests {
             };
         assert_eq!(applied, goal);
         assert!(boundary.is_some());
-        assert!(buffer.mark_applied(&applied));
-        assert!(buffer.has_applied_goal());
         assert!(matches!(
             Module::tick(&mut planner).expect("simple planner tick"),
             ModuleOutput::Plan { .. } | ModuleOutput::SafetyHold { .. }
         ));
-        assert!(buffer.observe_costmap().is_none());
-        assert!(buffer.pending_goal.is_none());
     }
 
     #[test]
-    fn simple_stop_clears_late_path_gate_and_accepts_real_replacement() {
-        let mut buffer = PlannerGoalBuffer::default();
-        assert!(buffer.observe_costmap().is_none());
-        let goal_a = planner_test_goal("simple-stop-a", 1);
-        let ready_a = match buffer.observe_goal(goal_a.clone()) {
-            PlannerGoalIngress::Ready(goal) => *goal,
-            outcome => panic!("goal A must be ready: {outcome:?}"),
-        };
-        assert!(buffer.mark_applied(&ready_a));
-
-        let mut active_goal = Some(ready_a);
-        let mut active_boundary =
-            Some(NavigationBoundary::new(&goal_a.boundary_points).expect("goal A boundary"));
-        let mut path_revision = 3_i64;
-        let mut published_path_is_boundary_safe = true;
-        assert!(active_goal.is_some());
-        assert!(active_boundary.is_some());
-        assert_eq!(path_revision, 3);
-        assert!(published_path_is_boundary_safe);
-
-        clear_simple_planner_active_projection(
-            &mut buffer,
-            &mut active_goal,
-            &mut active_boundary,
-            &mut path_revision,
-            &mut published_path_is_boundary_safe,
-        );
-
+    fn simple_stop_holds_until_a_replacement_goal() {
         let mut module = SimplePlannerModule::new();
-        Module::start(&mut module).expect("start simple planner");
-        let mut robot_pose = PoseStamped::from_pose(Pose3::default(), NavFrameId::Map);
-        robot_pose.stamp = Timestamp::from_unix(30, 0);
-        Module::on_odometry(&mut module, robot_pose).expect("simple planner pose");
-        Module::on_stop_movement(&mut module, true).expect("first stop");
+        Module::start(&mut module).unwrap();
+        let mut pose = PoseStamped::from_pose(
+            Pose3 {
+                position: Point3::new(0.5, 0.5, 0.),
+                ..Pose3::default()
+            },
+            NavFrameId::Map,
+        );
+        pose.stamp = Timestamp::from_unix(30, 0);
+        Module::on_odometry(&mut module, pose).unwrap();
+        for _ in 0..2 {
+            Module::on_stop_movement(&mut module, true).unwrap();
+            assert!(matches!(
+                Module::tick(&mut module).unwrap(),
+                ModuleOutput::SafetyHold {
+                    reason: nuwax_nav_simple_planner::module::HoldReason::StopRequested,
+                    ..
+                }
+            ));
+        }
+        let next = planner_test_goal("replacement", 2);
         assert!(matches!(
-            Module::tick(&mut module).expect("first post-stop tick"),
-            ModuleOutput::SafetyHold {
-                reason: nuwax_nav_simple_planner::module::HoldReason::StopRequested,
-                ..
-            }
+            apply_simple_planner_goal(&mut module, next, &planner_test_grid_body(30)).unwrap(),
+            OwnerInput::Accepted(_)
         ));
-        assert!(
-            !buffer.has_applied_goal(),
-            "the first StopRequested hold must not be wrapped as a late PathEnvelope"
-        );
-        Module::on_stop_movement(&mut module, true).expect("repeated stop");
         assert!(matches!(
-            Module::tick(&mut module).expect("repeated post-stop tick"),
-            ModuleOutput::SafetyHold {
-                reason: nuwax_nav_simple_planner::module::HoldReason::StopRequested,
-                ..
-            }
+            Module::tick(&mut module).unwrap(),
+            ModuleOutput::Plan { .. } | ModuleOutput::SafetyHold { .. }
         ));
-
-        assert!(
-            !buffer.has_applied_goal(),
-            "stop must gate every later tick"
-        );
-        assert!(active_goal.is_none());
-        assert!(active_boundary.is_none());
-        assert_eq!(path_revision, 0);
-        assert!(!published_path_is_boundary_safe);
-        assert_eq!(
-            buffer
-                .newest_goal
-                .as_ref()
-                .map(|goal| goal.session_id.as_str()),
-            Some("simple-stop-a"),
-            "stop retains the ordering watermark"
-        );
-
-        let goal_b = planner_test_goal("simple-stop-b", 2);
-        let ready_b = match buffer.observe_goal(goal_b.clone()) {
-            PlannerGoalIngress::Ready(goal) => *goal,
-            outcome => panic!("real replacement must be accepted: {outcome:?}"),
-        };
-        assert!(buffer.mark_applied(&ready_b));
-        assert!(buffer.has_applied_goal());
-        assert_eq!(
-            buffer
-                .newest_goal
-                .as_ref()
-                .map(|goal| goal.session_id.as_str()),
-            Some("simple-stop-b")
-        );
     }
 
     #[test]
@@ -6129,18 +5139,13 @@ mod simple_tests {
         robot_pose.stamp = Timestamp::from_unix(12, 0);
         Module::on_odometry(&mut planner, robot_pose).expect("simple map pose");
 
-        let mut buffer = PlannerGoalBuffer::default();
-        assert!(buffer.observe_costmap().is_none());
         planner
             .on_occupancy_grid(
                 decode_simple_occupancy(&planner_test_grid_body(12)).expect("map 12"),
             )
             .expect("apply map 12");
         let goal_12 = planner_test_goal("simple-12", 1);
-        let ready_12 = match buffer.observe_goal(goal_12.clone()) {
-            PlannerGoalIngress::Ready(goal) => *goal,
-            outcome => panic!("goal 12 must be ready, got {outcome:?}"),
-        };
+        let ready_12 = goal_12.clone();
         let (applied_12, boundary_12) =
             match apply_simple_planner_goal(&mut planner, ready_12, &planner_test_grid_body(12))
                 .expect("apply goal 12")
@@ -6148,42 +5153,10 @@ mod simple_tests {
                 OwnerInput::Accepted(applied) => applied,
                 OwnerInput::Rejected(reason) => panic!("goal 12 rejected: {reason}"),
             };
-        assert!(buffer.mark_applied(&applied_12));
-        let mut active_goal = Some(applied_12);
-        let mut active_boundary = boundary_12;
-        let mut path_revision = 4_i64;
-        let mut published_path_is_boundary_safe = true;
-        assert!(published_path_is_boundary_safe);
-
+        assert_eq!(applied_12, goal_12);
+        assert!(boundary_12.is_some());
         let goal_13 = planner_test_goal("simple-13", 2);
-        let ready_13 = match buffer.observe_goal(goal_13.clone()) {
-            PlannerGoalIngress::Ready(goal) => *goal,
-            outcome => panic!("newer lease must be ready: {outcome:?}"),
-        };
-        assert!(!buffer.has_applied_goal(), "superseded path must be gated");
-        assert!(
-            active_goal.is_some(),
-            "outer map-a lease is not replaced early"
-        );
-        assert!(active_boundary.is_some());
-        assert_eq!(path_revision, 4);
-        assert!(published_path_is_boundary_safe);
-
-        clear_planner_goal_for_costmap_advance(
-            &mut active_goal,
-            &mut active_boundary,
-            &mut path_revision,
-        );
-        published_path_is_boundary_safe = false;
-        assert!(
-            !buffer.has_applied_goal(),
-            "tick/path publication stays gated"
-        );
-        assert!(active_goal.is_none());
-        assert!(active_boundary.is_none());
-        assert_eq!(path_revision, 0);
-        assert!(!published_path_is_boundary_safe);
-
+        let ready_13 = goal_13.clone();
         let (applied_13, boundary_13) =
             match apply_simple_planner_goal(&mut planner, ready_13, &planner_test_grid_body(12))
                 .expect("apply new goal with an independently sequenced costmap")
@@ -6191,15 +5164,13 @@ mod simple_tests {
                 OwnerInput::Accepted(applied) => applied,
                 OwnerInput::Rejected(reason) => panic!("goal 13 rejected: {reason}"),
             };
-        assert!(buffer.mark_applied(&applied_13));
-        active_goal = Some(applied_13);
-        active_boundary = boundary_13;
+        let active_goal = Some(applied_13);
+        let active_boundary = boundary_13;
         assert_eq!(
             active_goal.as_ref().map(|goal| goal.session_id.as_str()),
             Some("simple-13")
         );
         assert!(active_boundary.is_some());
-        assert!(buffer.has_applied_goal());
         let path = match Module::tick(&mut planner).expect("simple map-b tick") {
             ModuleOutput::Plan { path, .. } | ModuleOutput::SafetyHold { path, .. } => path,
             output => panic!("expected map-b path, got {output:?}"),
@@ -6224,11 +5195,6 @@ mod simple_tests {
             envelope.goal_key(),
             active_goal.as_ref().unwrap().goal_key()
         );
-        assert!(matches!(
-            buffer.observe_goal(goal_13),
-            PlannerGoalIngress::Rejected(PlannerGoalRejectReason::DuplicateLease)
-        ));
-        assert!(buffer.observe_costmap().is_none());
     }
 
     #[test]
@@ -7179,8 +6145,7 @@ path: schema::Path {
                     tick_interval: Duration::from_millis(5),
 
                     path_wait_timeout: Duration::from_secs(5),
-                    pose_ttl: Duration::from_secs(5),
-                    costmap_ttl: Duration::from_secs(5),
+
                 },
             )
             .expect("guarded loop scheduler");
@@ -7335,7 +6300,8 @@ path: schema::Path {
         async fn wait_for_session(&self, session_id: &str) {
             tokio::time::timeout(Duration::from_secs(1), async {
                 loop {
-                    if self.scheduler.status().session_id.as_deref() == Some(session_id) {
+                    let snapshot=self.scheduler.status();
+                    if snapshot.session_id.as_deref() == Some(session_id) && snapshot.applied_commands>0 {
                         break;
                     }
                     assert!(!self.loop_task.is_finished(), "guarded loop exited early");
@@ -7375,7 +6341,7 @@ path: schema::Path {
             .expect("costmap was not consumed");
         }
 
-        async fn wait_for_zero(&self) {
+        async fn wait_for_release(&self) {
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
                     if self
@@ -7394,14 +6360,14 @@ path: schema::Path {
             .await
             .unwrap_or_else(|_| {
                 panic!(
-                    "verified ZERO fence was not observed; status={:?} calls={:?}",
+                    "未观察到租约释放请求; status={:?} calls={:?}",
                     self.scheduler.status(),
                     self.motion_calls.lock().unwrap().clone()
                 )
             });
         }
 
-        async fn wait_for_correlated_zero(
+        async fn wait_for_cancelled_status(
             &mut self,
             goal: &schema::NavigationGoal,
         ) -> schema::NavigationStatus {
@@ -7416,7 +6382,6 @@ path: schema::Path {
                     let state = schema::decode_navigation_status_body(&frame.payload)
                         .expect("guarded NavigationStatus body");
                     if state.session_id == goal.session_id
-                        && state.session_id == goal.session_id
                         && state.motion_generation == goal.motion_generation as i64
                         && state.goal_status == schema::NAVIGATION_GOAL_STATUS_CANCELLED
                     {
@@ -7425,7 +6390,7 @@ path: schema::Path {
                 }
             })
             .await
-            .expect("correlated ZEROED NavigationStatus")
+            .expect("关联目标的取消状态")
         }
 
         async fn assert_no_session(&self) {
@@ -7579,6 +6544,73 @@ path: schema::Path {
     }
 
     #[tokio::test]
+    async fn guarded_latest_goal_waits_and_replaces_without_input_gates() {
+        let harness = GuardedLoopHarness::spawn().await;
+        let mut first = sealed_goal("first");
+        first.motion_generation=7;
+        let mut latest = sealed_goal("latest");
+        // 来源代次/运动代次较小也不再由桥的目标水位拒绝。
+        latest.motion_generation = 1;
+        harness.send_goal_and_wait_dequeued(&first).await;
+        harness.send_goal_and_wait_dequeued(&latest).await;
+        tokio::time::timeout(Duration::from_secs(1),async {
+            while harness.scheduler.status().session_id.as_deref()!=Some("latest"){
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+        assert!(harness.scheduler.status().message.contains("等待"));
+        assert_eq!(harness.motion_call_count("acquire:"), 0);
+        harness.send_pose(2);
+        harness.send_costmap(12);
+        harness.wait_for_pose(2).await;
+        harness.wait_for_costmap(12).await;
+        harness.send_path(&sealed_path(&latest));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !harness
+                .scheduler
+                .status()
+                .last_applied_twist
+                .is_some_and(|v| v != Twist2::ZERO)
+            {
+                assert!(!harness.loop_task.is_finished());
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            harness.scheduler.status().session_id.as_deref(),
+            Some("latest")
+        );
+        assert_eq!(harness.motion_call_count("acquire:"), 1);
+        assert_eq!(harness.motion_call_count("release:"), 0);
+        harness.shutdown().await;
+    }
+
+    #[test]
+    fn goal_options_and_map_frame_are_checked_at_decode() {
+        let goal = sealed_goal("decode");
+        let body = schema::encode_navigation_goal_body(&goal).unwrap();
+        assert_eq!(decode_navigation_goal_input(&body).unwrap(), goal);
+        let mut foreign = goal.clone();
+        foreign.goal.header.frame_id = "odom".into();
+        assert!(decode_navigation_goal_input(
+            &schema::encode_navigation_goal_body(&foreign).unwrap()
+        )
+        .unwrap_err()
+        .contains("map"));
+        let mut options = goal.clone();
+        options.position_tolerance_m = Some(0.31415926535);
+        let mut invalid = schema::encode_navigation_goal_body(&options).unwrap();
+        let at = invalid
+            .windows(8)
+            .position(|b| b == 0.31415926535_f64.to_be_bytes())
+            .unwrap();
+        invalid[at..at + 8].copy_from_slice(&(-1_f64).to_be_bytes());
+        assert!(decode_navigation_goal_input(&invalid).is_err());
+    }
+
+    #[tokio::test]
     async fn guarded_real_loop_accepts_all_cold_goal_pose_costmap_orders() {
         for order in [
             [ColdInput::Goal, ColdInput::Costmap, ColdInput::Pose],
@@ -7603,7 +6635,8 @@ path: schema::Path {
                     }
                 }
                 if index < 2 {
-                    harness.assert_no_session().await;
+                    assert_eq!(harness.motion_call_count("acquire:"),0,"输入未齐时只保存目标");
+                    assert!(harness.scheduler.status().last_terminal.is_none());
                 }
             }
             harness.wait_for_session("cold-order-goal").await;
@@ -7646,7 +6679,7 @@ path: schema::Path {
             grid:Default::default(),..value};
         send_guarded_test_body(&harness.costmaps,planar_navigation::TYPE_NAME,
             planar_navigation::encode_body(&cleared).unwrap());
-        harness.wait_for_zero().await;
+        harness.wait_for_release().await;
         assert!(!harness.scheduler.status().planner_inputs_fresh);
         send_guarded_test_body(&harness.costmaps,planar_navigation::TYPE_NAME,body);
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -7672,7 +6705,6 @@ path: schema::Path {
         }).await.expect("必须实际发布被拒绝候选目标的失败");
         assert_eq!(failure.goal_status, schema::NAVIGATION_GOAL_STATUS_STOPPED);
 
-
         assert_eq!(failure.motion_generation, rejected.motion_generation as i64);
 
         assert_eq!(failure.path_revision, 0);
@@ -7693,25 +6725,9 @@ path: schema::Path {
         harness.wait_for_session(&next.session_id).await;
         assert_eq!(harness.motion_call_count("acquire:"), 1);
         harness.send_cancel(&next);
-        harness.wait_for_correlated_zero(&next).await;
+        harness.wait_for_cancelled_status(&next).await;
         harness.shutdown().await;
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     async fn activate_map_a(harness: &GuardedLoopHarness) -> schema::NavigationGoal {
         let goal_a = sealed_goal("session-a");
@@ -7724,7 +6740,7 @@ path: schema::Path {
         goal_a
     }
 
-    async fn finish_map_a_after_verified_zero(
+    async fn finish_map_a_after_lease_release(
         harness: &GuardedLoopHarness,
         goal_a: &schema::NavigationGoal,
     ) {
@@ -7755,14 +6771,14 @@ path: schema::Path {
             }
         })
         .await
-        .expect("verified ZERO did not make map-a terminal");
+        .expect("租约释放后目标未结束");
     }
 
     #[tokio::test]
     async fn guarded_terminal_goal_reuses_fresh_inputs_before_costmap_update() {
         let harness = GuardedLoopHarness::spawn().await;
         let goal_a = activate_map_a(&harness).await;
-        finish_map_a_after_verified_zero(&harness, &goal_a).await;
+        finish_map_a_after_lease_release(&harness, &goal_a).await;
         harness.send_pose(2);
         harness.wait_for_pose(2).await;
         let goal_b = rollover_goal(&goal_a, "session-b", 1);
@@ -7782,7 +6798,7 @@ path: schema::Path {
     async fn guarded_terminal_costmap_then_goal_reuses_fresh_pose() {
         let harness = GuardedLoopHarness::spawn().await;
         let goal_a = activate_map_a(&harness).await;
-        finish_map_a_after_verified_zero(&harness, &goal_a).await;
+        finish_map_a_after_lease_release(&harness, &goal_a).await;
         harness.send_pose(2);
         harness.wait_for_pose(2).await;
         let goal_b = rollover_goal(&goal_a, "session-b", 1);
@@ -7798,7 +6814,7 @@ path: schema::Path {
     async fn guarded_new_goal_uses_available_fresh_inputs() {
         let harness = GuardedLoopHarness::spawn().await;
         let goal_a = activate_map_a(&harness).await;
-        finish_map_a_after_verified_zero(&harness, &goal_a).await;
+        finish_map_a_after_lease_release(&harness, &goal_a).await;
         harness.send_pose(2);
         harness.wait_for_pose(2).await;
         let goal_b = rollover_goal(&goal_a, "session-b", 1);
@@ -7820,7 +6836,7 @@ path: schema::Path {
     async fn guarded_fresh_pose_before_new_goal_is_reused() {
         let harness = GuardedLoopHarness::spawn().await;
         let goal_a = activate_map_a(&harness).await;
-        finish_map_a_after_verified_zero(&harness, &goal_a).await;
+        finish_map_a_after_lease_release(&harness, &goal_a).await;
 
         harness.send_pose(2);
         harness.wait_for_pose(2).await;
@@ -7831,44 +6847,39 @@ path: schema::Path {
     }
 
     #[tokio::test]
-    async fn guarded_conflicting_goal_does_not_block_a_later_valid_lease() {
+    async fn guarded_changed_goal_with_same_id_replaces_and_accepts_the_next_goal() {
         let mut harness = GuardedLoopHarness::spawn().await;
-        let goal_a = activate_map_a(&harness).await;
-
-        let mut conflicting=goal_a.clone();
-        conflicting.goal.pose.position[0]+=0.5;
-        harness.send_goal(&conflicting);
+        let first = activate_map_a(&harness).await;
+        let mut changed = first.clone();
+        changed.goal.pose.position[0] += 0.5;
+        harness.send_goal_and_wait_dequeued(&changed).await;
         tokio::time::timeout(Duration::from_millis(50), async {
             loop {
                 let frame = harness.states.next().await.unwrap().unwrap();
                 let state = schema::decode_navigation_status_body(&frame.payload).unwrap();
-                if state.reason.contains("REJECTED") { break; }
+                if state.goal[0] == changed.goal.pose.position[0] {
+                    break;
+                }
             }
-        }).await.expect("冲突目标未在原50毫秒窗口回报拒绝");
-        assert_eq!(
-            harness.scheduler.status().session_id.as_deref(),
-            Some("session-a"),
-            "the conflicting lease must be rejected without preempting map A"
-        );
-
-        harness.send_pose(2);
-        harness.wait_for_pose(2).await;
-
-        let goal_b = rollover_goal(&goal_a, "session-b", 1);
-        harness.send_goal_and_wait_dequeued(&goal_b).await;
+        })
+        .await
+        .expect("变化后的同号目标应直接替换");
+        assert_eq!(harness.motion_call_count("release:"), 1);
+        let next = rollover_goal(&first, "session-b", 1);
+        harness.send_goal_and_wait_dequeued(&next).await;
         harness.wait_for_session("session-b").await;
         harness.shutdown().await;
     }
 
     #[tokio::test]
-    async fn guarded_goal_replacement_acquires_without_releasing_previous() {
+    async fn guarded_goal_replacement_releases_previous_before_new_acquire() {
         let harness = GuardedLoopHarness::spawn().await;
         let goal_a = activate_map_a(&harness).await;
         let goal_b = rollover_goal(&goal_a, "session-b", 1);
 
         harness.send_goal_and_wait_dequeued(&goal_b).await;
         harness.wait_for_session("session-b").await;
-        assert_eq!(harness.motion_call_count("release:"),0);
+        assert_eq!(harness.motion_call_count("release:"),1);
         harness.shutdown().await;
     }
 
@@ -7904,7 +6915,7 @@ path: schema::Path {
     }
 
     #[tokio::test]
-    async fn guarded_succeeded_terminal_rejects_late_path_without_losing_zero_ack() {
+    async fn guarded_succeeded_terminal_rejects_late_path_without_losing_release_result() {
         let harness = GuardedLoopHarness::spawn().await;
         let goal = activate_map_a(&harness).await;
         let path = sealed_path(&goal);
@@ -7930,7 +6941,6 @@ path: schema::Path {
         let terminal = harness.scheduler.status();
         assert_eq!(terminal.phase, SchedulerPhase::Idle);
 
-
         harness.send_path(&path);
         let mut wrong_identity = path.clone();
         wrong_identity.session_id.push_str("-wrong");
@@ -7942,19 +6952,6 @@ path: schema::Path {
         assert_eq!(after_late.last_terminal, Some(TerminalOutcome::Succeeded));
 
         harness.shutdown().await;
-    }
-
-    #[test]
-    fn terminal_cleanup_allows_continuous_a_then_b_without_busy_preempt() {
-        let mut active = Some(active_goal("goal-a"));
-        let terminal = nuwax_nav_runtime::SchedulerStatus {
-            phase: SchedulerPhase::Idle,
-            last_terminal: Some(TerminalOutcome::Succeeded),
-            ..nuwax_nav_runtime::SchedulerStatus::default()
-        };
-        assert!(clear_terminal_active_session(&mut active, &terminal));
-        assert!(active.is_none());
-
     }
 
     #[test]
@@ -8056,7 +7053,7 @@ path: schema::Path {
     }
 
     #[test]
-    fn late_path_rejection_keeps_parking_and_terminal_cause_and_receipts() {
+    fn late_path_rejection_keeps_terminal_and_terminal_cause_and_receipts() {
         for (phase,terminal) in [
             (SchedulerPhase::Cancelling,None),(SchedulerPhase::Cancelling,None),
             (SchedulerPhase::Failed,Some(nuwax_nav_runtime::TerminalOutcome::SafetyFailed)),
@@ -8070,8 +7067,6 @@ path: schema::Path {
         }
     }
 
-
-
     #[test]
     fn terminal_publication_transitions_to_unowned_guard_heartbeat() {
         let mut active = Some(active_goal("goal-a"));
@@ -8081,7 +7076,7 @@ path: schema::Path {
 
             last_terminal: Some(TerminalOutcome::Cancelled),
 
-            message: "verified fence".into(),
+            message: "租约已释放".into(),
             ..nuwax_nav_runtime::SchedulerStatus::default()
         };
         let mut telemetry = GuardedNavTelemetry {
@@ -8108,12 +7103,8 @@ path: schema::Path {
         assert_eq!(terminal_message.runtime_generation, 42);
         assert_eq!(terminal_message.reason, terminal.message);
 
-        assert!(clear_terminal_session_after_publication(
-            &mut active,
-            &mut telemetry,
-            &terminal,
-        ));
-        assert!(active.is_none());
+        clear_terminal_telemetry_after_publication(&mut telemetry, &terminal);
+        assert!(active.is_some());
 
         let heartbeat = build_guarded_navigation_status(
             &terminal,
@@ -8138,18 +7129,6 @@ path: schema::Path {
     }
 
     #[test]
-    fn exploration_second_frontier_reuses_owner_after_first_child_terminal() {
-        let mut active = Some(active_goal("explore-parent:frontier-1"));
-        let terminal = nuwax_nav_runtime::SchedulerStatus {
-            phase: SchedulerPhase::Failed,
-            last_terminal: Some(TerminalOutcome::PlannerFailed),
-            ..nuwax_nav_runtime::SchedulerStatus::default()
-        };
-        assert!(clear_terminal_active_session(&mut active, &terminal));
-
-    }
-
-    #[test]
     fn path_and_cancel_match_active_goal_identity() {
         let goal = sealed_goal("public-goal-1");
         let path = sealed_path(&goal);
@@ -8168,14 +7147,6 @@ path: schema::Path {
         foreign_cancel.session_id.push_str("-other");
         assert!(validate_cancel_goal_correlation(&foreign_cancel, &goal).is_err());
     }
-
-
-
-
-
-
-
-
 
     #[test]
     fn map_pose_owner_drops_bad_tf_and_processes_following_valid_odometry() {
@@ -8201,8 +7172,8 @@ path: schema::Path {
             OwnerInput::Accepted(None)
         ));
         assert!(matches!(
-            ingest_map_pose_tf(&mut adapter, &tf_body).expect("duplicate TF is external"),
-            OwnerInput::Rejected(_)
+            ingest_map_pose_tf(&mut adapter, &tf_body).expect("重复来源时间的TF按到达顺序接收"),
+            OwnerInput::Accepted(None)
         ));
         assert!(matches!(
             ingest_map_pose_tf(&mut adapter, &[0x01, 0x02]).expect("bad TF is external"),
@@ -8254,19 +7225,19 @@ path: schema::Path {
         }
         sender.unbounded_send((Ok(make(2)), None, None)).unwrap();
         let mut diagnostics = InputDiagnosticLimiter::default();
-        let input = drain_guarded_pose_input(Some(Ok(make(1))), &mut poses, &mut diagnostics, None)
+        let input = drain_guarded_pose_input(Some(Ok(make(1))), &mut poses, &mut diagnostics)
             .unwrap()
             .unwrap();
         assert_eq!(input.pose.stamp.nanos, 2_000_000_000);
         drop(sender);
         assert!(
-            drain_guarded_pose_input(Some(Ok(make(4))), &mut poses, &mut diagnostics, None)
+            drain_guarded_pose_input(Some(Ok(make(4))), &mut poses, &mut diagnostics)
                 .is_err()
         );
     }
 
     #[test]
-    fn queued_latest_future_pose_is_rejected() {
+    fn queued_pose_defers_source_age_to_the_control_tick() {
         let (sender, mut poses) = guarded_test_stream();
         let current = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -8300,10 +7271,9 @@ path: schema::Path {
             Some(Ok(valid)),
             &mut poses,
             &mut InputDiagnosticLimiter::default(),
-            Some(Duration::from_millis(500)),
         )
-        .unwrap();
-        assert!(input.is_none());
+        .unwrap().unwrap();
+        assert_eq!(input.pose.stamp.nanos / 1_000_000_000, i64::from(pose.header.stamp_sec));
     }
 
     #[test]
@@ -8377,112 +7347,6 @@ path: schema::Path {
     }
 
     #[test]
-    fn pose_source_deadline_uses_original_sampling_time() {
-        let wall = std::time::UNIX_EPOCH + Duration::from_secs(10);
-        let mono = tokio::time::Instant::now();
-        let maximum = Duration::from_millis(500);
-        let deadline = guarded_pose_source_deadline(9_600_000_000, maximum, wall, mono).unwrap();
-        assert_eq!(deadline.duration_since(mono), Duration::from_millis(100));
-        assert!(guarded_pose_source_deadline(9_500_000_000, maximum, wall, mono).is_err());
-        assert!(guarded_pose_source_deadline(10_051_000_000, maximum, wall, mono).is_err());
-    }
-
-    #[test]
-    fn map_pose_output_fence_accepts_only_strictly_newer_source_timestamps() {
-        let mut adapter =
-            crate::map_pose::MapPoseAdapter::new("map", "odom", "base_link").expect("adapter");
-        let atomic_tf = schema::encode_tf_message_body(&schema::TfMessage {
-            transforms: vec![
-                schema::TransformStamped {
-                    header: schema::Header {
-                        stamp_sec: 7,
-                        frame_id: "map".into(),
-                        ..schema::Header::default()
-                    },
-                    child_frame_id: "odom".into(),
-                    transform: schema::Transform {
-                        translation: [1.0, 2.0, 0.0],
-                        rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
-                    },
-                },
-                schema::TransformStamped {
-                    header: schema::Header {
-                        stamp_sec: 7,
-                        frame_id: "odom".into(),
-                        ..schema::Header::default()
-                    },
-                    child_frame_id: "base_link".into(),
-                    transform: schema::Transform {
-                        translation: [3.0, 4.0, 0.0],
-                        rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
-                    },
-                },
-            ],
-        })
-        .expect("encode atomic TF");
-        let tf_observation =
-            match ingest_map_pose_tf(&mut adapter, &atomic_tf).expect("coherent TF observation") {
-                OwnerInput::Accepted(Some(observed)) => observed,
-                OwnerInput::Accepted(None) => panic!("coherent TF did not produce a map pose"),
-                OwnerInput::Rejected(reason) => panic!("coherent TF rejected: {reason}"),
-            };
-        let odometry = schema::Odometry {
-            header: schema::Header {
-                stamp_sec: 7,
-                frame_id: "odom".into(),
-                ..schema::Header::default()
-            },
-            child_frame_id: "base_link".into(),
-            pose: schema::Pose {
-                position: [3.0, 4.0, 0.0],
-                orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
-            },
-            ..schema::Odometry::default()
-        };
-        let odometry_body = schema::encode_odometry_body(&odometry).expect("encode odometry");
-        let odometry_observation = match ingest_map_pose_odometry(&adapter, &odometry_body)
-            .expect("aligned odometry observation")
-        {
-            MapPoseOdometryIngress::Accepted(observed) => observed,
-            MapPoseOdometryIngress::AwaitingTransform(_, reason) => {
-                panic!("aligned odometry still waiting: {reason}")
-            }
-            MapPoseOdometryIngress::Rejected(reason) => {
-                panic!("aligned odometry rejected: {reason}")
-            }
-        };
-
-        let last_published_timestamp_ns =
-            match fence_map_pose_source_timestamp(None, &tf_observation)
-                .expect("first observation timestamp")
-            {
-                OwnerInput::Accepted(timestamp_ns) => Some(timestamp_ns),
-                OwnerInput::Rejected(reason) => panic!("first observation rejected: {reason}"),
-            };
-        assert!(matches!(
-            fence_map_pose_source_timestamp(last_published_timestamp_ns, &odometry_observation)
-                .expect("duplicate timestamp is recoverable"),
-            OwnerInput::Rejected(_)
-        ));
-
-        let mut older_observation = odometry_observation.clone();
-        older_observation.pose.header.stamp_sec = 6;
-        assert!(matches!(
-            fence_map_pose_source_timestamp(last_published_timestamp_ns, &older_observation)
-                .expect("older timestamp is recoverable"),
-            OwnerInput::Rejected(_)
-        ));
-
-        let mut newer_observation = odometry_observation;
-        newer_observation.pose.header.stamp_sec = 8;
-        assert!(matches!(
-            fence_map_pose_source_timestamp(last_published_timestamp_ns, &newer_observation)
-                .expect("newer timestamp"),
-            OwnerInput::Accepted(8_000_000_000)
-        ));
-    }
-
-    #[test]
     fn map_pose_owner_retries_pending_odometry_when_matching_tf_arrives() {
         let mut adapter =
             crate::map_pose::MapPoseAdapter::new("map", "odom", "base_link").expect("adapter");
@@ -8545,114 +7409,7 @@ path: schema::Path {
         assert_eq!(observed.pose.pose.position, [4.0, 6.0, 0.0]);
     }
 
-    #[test]
-    fn map_pose_owner_keeps_newer_pending_odometry_after_older_atomic_tf() {
-        let mut adapter =
-            crate::map_pose::MapPoseAdapter::new("map", "odom", "base_link").expect("adapter");
-        let pending_odometry = schema::Odometry {
-            header: schema::Header {
-                stamp_sec: 8,
-                frame_id: "odom".into(),
-                ..schema::Header::default()
-            },
-            child_frame_id: "base_link".into(),
-            pose: schema::Pose {
-                position: [5.0, 6.0, 0.0],
-                orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
-            },
-            ..schema::Odometry::default()
-        };
-        let mut pending = match transform_map_pose_odometry(&adapter, pending_odometry)
-            .expect("odometry before TF is retryable")
-        {
-            MapPoseOdometryIngress::AwaitingTransform(odometry, _) => Some(odometry),
-            MapPoseOdometryIngress::Accepted(_) => panic!("odometry unexpectedly accepted"),
-            MapPoseOdometryIngress::Rejected(reason) => {
-                panic!("retryable odometry rejected: {reason}")
-            }
-        };
 
-        let atomic_tf = schema::encode_tf_message_body(&schema::TfMessage {
-            transforms: vec![
-                schema::TransformStamped {
-                    header: schema::Header {
-                        stamp_sec: 7,
-                        frame_id: "map".into(),
-                        ..schema::Header::default()
-                    },
-                    child_frame_id: "odom".into(),
-                    transform: schema::Transform {
-                        translation: [1.0, 2.0, 0.0],
-                        rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
-                    },
-                },
-                schema::TransformStamped {
-                    header: schema::Header {
-                        stamp_sec: 7,
-                        frame_id: "odom".into(),
-                        ..schema::Header::default()
-                    },
-                    child_frame_id: "base_link".into(),
-                    transform: schema::Transform {
-                        translation: [3.0, 4.0, 0.0],
-                        rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
-                    },
-                },
-            ],
-        })
-        .expect("encode atomic TF");
-        let atomic = match ingest_map_pose_tf(&mut adapter, &atomic_tf).expect("atomic TF input") {
-            OwnerInput::Accepted(Some(observed)) => observed,
-            OwnerInput::Accepted(None) => panic!("coherent TF did not produce a map pose"),
-            OwnerInput::Rejected(reason) => panic!("coherent TF rejected: {reason}"),
-        };
-        assert_eq!(atomic.pose.header.stamp_sec, 7);
-        assert_eq!(atomic.pose.pose.position, [4.0, 6.0, 0.0]);
-        discard_pending_odometry_through(&mut pending, &atomic)
-            .expect("compare atomic pose with pending odometry");
-        assert_eq!(
-            pending.as_ref().map(|odometry| odometry.header.stamp_sec),
-            Some(8),
-            "newer odometry must remain available for a later aligned transform"
-        );
-
-        let aligned_tf = schema::encode_tf_message_body(&schema::TfMessage {
-            transforms: vec![schema::TransformStamped {
-                header: schema::Header {
-                    stamp_sec: 8,
-                    frame_id: "map".into(),
-                    ..schema::Header::default()
-                },
-                child_frame_id: "odom".into(),
-                transform: schema::Transform {
-                    translation: [2.0, 3.0, 0.0],
-                    rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
-                },
-            }],
-        })
-        .expect("encode aligned TF");
-        assert!(matches!(
-            ingest_map_pose_tf(&mut adapter, &aligned_tf).expect("aligned TF input"),
-            OwnerInput::Accepted(None)
-        ));
-        let observed = match transform_map_pose_odometry(
-            &adapter,
-            *pending.take().expect("newer odometry retained"),
-        )
-        .expect("retry retained odometry")
-        {
-            MapPoseOdometryIngress::Accepted(observed) => observed,
-            MapPoseOdometryIngress::AwaitingTransform(_, reason) => {
-                panic!("aligned odometry still waiting: {reason}")
-            }
-            MapPoseOdometryIngress::Rejected(reason) => {
-                panic!("aligned odometry rejected: {reason}")
-            }
-        };
-        assert_eq!(observed.pose.header.stamp_sec, 8);
-        assert_eq!(observed.pose.pose.position, [7.0, 9.0, 0.0]);
-        assert!(pending.is_none());
-    }
 
     #[test]
     fn map_pose_owner_accepts_a_coherent_tf_chain_without_odometry_join() {
@@ -9190,16 +7947,7 @@ mod tests {
         let goal = planner_test_goal("astar-goal", 5);
         let expected_key = goal.goal_key();
         let expected_boundary = goal.boundary_points.clone();
-        let mut buffer = PlannerGoalBuffer::default();
-        assert!(matches!(
-            buffer.observe_goal(goal.clone()),
-            PlannerGoalIngress::Buffered
-        ));
-        assert_eq!(buffer.pending_goal.as_ref(), Some(&goal));
-
-        let ready = buffer
-            .observe_costmap()
-            .expect("first valid costmap must release the buffered A* goal");
+        let ready = decode_navigation_goal_input(&schema::encode_navigation_goal_body(&goal).unwrap()).unwrap();
         assert_eq!(ready.goal_key(), expected_key);
         assert_eq!(ready.boundary_points, expected_boundary);
 
@@ -9216,7 +7964,7 @@ mod tests {
         robot_pose.stamp = Timestamp::from_unix(22, 0);
         Module::on_odom(&mut planner, robot_pose).expect("A* map pose");
         let (applied, boundary, resolution) =
-            match apply_astar_planner_goal(&mut planner, *ready, &planner_test_grid_body(22))
+            match apply_astar_planner_goal(&mut planner, ready, &planner_test_grid_body(22))
                 .expect("apply A* buffered goal")
             {
                 OwnerInput::Accepted(applied) => applied,
@@ -9225,11 +7973,7 @@ mod tests {
         assert_eq!(applied, goal);
         assert!(boundary.is_some());
         assert_eq!(resolution, 1.0);
-        assert!(buffer.mark_applied(&applied));
-        assert!(buffer.has_applied_goal());
         let _ = Module::tick(&mut planner).expect("A* planner tick");
-        assert!(buffer.observe_costmap().is_none());
-        assert!(buffer.pending_goal.is_none());
     }
 
     #[test]
@@ -9252,18 +7996,13 @@ mod tests {
         robot_pose.stamp = Timestamp::from_unix(12, 0);
         Module::on_odom(&mut planner, robot_pose).expect("A* map pose");
 
-        let mut buffer = PlannerGoalBuffer::default();
-        assert!(buffer.observe_costmap().is_none());
         Module::on_costmap(
             &mut planner,
             decode_astar_costmap(&planner_test_grid_body(12)).expect("map 12"),
         )
         .expect("apply map 12");
         let goal_12 = planner_test_goal("astar-12", 1);
-        let ready_12 = match buffer.observe_goal(goal_12.clone()) {
-            PlannerGoalIngress::Ready(goal) => *goal,
-            outcome => panic!("goal 12 must be ready, got {outcome:?}"),
-        };
+        let ready_12 = goal_12.clone();
         let (applied_12, boundary_12, _) =
             match apply_astar_planner_goal(&mut planner, ready_12, &planner_test_grid_body(12))
                 .expect("apply goal 12")
@@ -9271,37 +8010,10 @@ mod tests {
                 OwnerInput::Accepted(applied) => applied,
                 OwnerInput::Rejected(reason) => panic!("goal 12 rejected: {reason}"),
             };
-        assert!(buffer.mark_applied(&applied_12));
-        let mut active_goal = Some(applied_12);
-        let mut active_boundary = boundary_12;
-        let mut path_revision = 5_i64;
-
+        assert_eq!(applied_12, goal_12);
+        assert!(boundary_12.is_some());
         let goal_13 = planner_test_goal("astar-13", 2);
-        let ready_13 = match buffer.observe_goal(goal_13.clone()) {
-            PlannerGoalIngress::Ready(goal) => *goal,
-            outcome => panic!("newer lease must be ready: {outcome:?}"),
-        };
-        assert!(!buffer.has_applied_goal(), "superseded path must be gated");
-        assert!(
-            active_goal.is_some(),
-            "outer map-a lease is not replaced early"
-        );
-        assert!(active_boundary.is_some());
-        assert_eq!(path_revision, 5);
-
-        clear_planner_goal_for_costmap_advance(
-            &mut active_goal,
-            &mut active_boundary,
-            &mut path_revision,
-        );
-        assert!(
-            !buffer.has_applied_goal(),
-            "tick/path publication stays gated"
-        );
-        assert!(active_goal.is_none());
-        assert!(active_boundary.is_none());
-        assert_eq!(path_revision, 0);
-
+        let ready_13 = goal_13.clone();
         let (applied_13, boundary_13, _) =
             match apply_astar_planner_goal(&mut planner, ready_13, &planner_test_grid_body(12))
                 .expect("apply new goal with an independently sequenced costmap")
@@ -9309,15 +8021,13 @@ mod tests {
                 OwnerInput::Accepted(applied) => applied,
                 OwnerInput::Rejected(reason) => panic!("goal 13 rejected: {reason}"),
             };
-        assert!(buffer.mark_applied(&applied_13));
-        active_goal = Some(applied_13);
-        active_boundary = boundary_13;
+        let active_goal = Some(applied_13);
+        let active_boundary = boundary_13;
         assert_eq!(
             active_goal.as_ref().map(|goal| goal.session_id.as_str()),
             Some("astar-13")
         );
         assert!(active_boundary.is_some());
-        assert!(buffer.has_applied_goal());
         let update = match Module::tick(&mut planner).expect("A* map-b tick") {
             ModuleOutput::Navigation(update) | ModuleOutput::SafetyHold(update) => update,
         };
@@ -9347,11 +8057,6 @@ mod tests {
             envelope.goal_key(),
             active_goal.as_ref().unwrap().goal_key()
         );
-        assert!(matches!(
-            buffer.observe_goal(goal_13),
-            PlannerGoalIngress::Rejected(PlannerGoalRejectReason::DuplicateLease)
-        ));
-        assert!(buffer.observe_costmap().is_none());
     }
 
     #[test]

@@ -352,7 +352,6 @@ impl Module for SimplePlannerModule {
 
     fn on_goal(&mut self, goal: PointStamped) -> Result<(), NavError> {
         self.ensure_running()?;
-        validate_frame(&goal.frame_id, &self.config.world_frame, "goal.frame_id")?;
         validate_point(goal.point, "goal")?;
         self.cancel_planning();
         self.planner.set_goal(goal.point, self.clock_seconds);

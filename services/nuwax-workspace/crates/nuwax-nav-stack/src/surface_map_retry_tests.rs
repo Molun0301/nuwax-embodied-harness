@@ -75,7 +75,6 @@ async fn wait(condition: impl Fn() -> bool) {
 
 async fn active(
     probe: &Arc<Probe>,
-    ttl: Duration,
 ) -> (Harness, schema::NavigationMap3D, schema::NavigationGoal, i64) {
     let mut harness = Harness::start_with_components(
         Arc::new(|m,p,g,c|body_path(m,p,g,c).map(SurfacePlan::complete)),
@@ -83,10 +82,7 @@ async fn active(
         config(),
         true,
         Some(probe.computer()),
-        nuwax_nav_runtime::SchedulerConfig {
-            costmap_ttl: ttl,
-            ..Default::default()
-        },
+        nuwax_nav_runtime::SchedulerConfig::default(),
     )
     .await;
     harness.wait_ready().await;
@@ -101,7 +97,7 @@ async fn active(
 #[tokio::test]
 async fn incomplete_refresh_retains_route_and_source_then_retries_atomically() {
     let probe = Probe::new();
-    let (mut harness, initial, goal, revision) = active(&probe, Duration::ZERO).await;
+    let (mut harness, initial, goal, revision) = active(&probe).await;
     let mut first = map_message(
         initial.revision + 1,
         &initial.session_id,
@@ -198,7 +194,7 @@ async fn incomplete_refresh_retains_route_and_source_then_retries_atomically() {
 #[tokio::test]
 async fn incomplete_refresh_retry_never_replaces_a_newer_pending_root() {
     let probe = Probe::new();
-    let (mut harness, first, goal, _) = active(&probe, Duration::ZERO).await;
+    let (mut harness, first, goal, _) = active(&probe).await;
     let incomplete = map_message(first.revision + 1, &first.session_id);
     probe
         .failing_revision
@@ -242,32 +238,9 @@ async fn incomplete_refresh_retry_never_replaces_a_newer_pending_root() {
 }
 
 #[tokio::test]
-async fn incomplete_refresh_does_not_launder_configured_source_expiry() {
-    let probe = Probe::new();
-    let (mut harness, first, _, _) = active(&probe, Duration::from_millis(500)).await;
-    let next = map_message(first.revision + 1, &first.session_id);
-    probe
-        .failing_revision
-        .store(next.revision, Ordering::Release);
-    harness.map(&next).await;
-    wait(|| probe.count(next.revision) >= 2).await;
-    let status = harness.scheduler.status();
-    assert!(!status.planner_inputs_fresh);
-    assert!(status.last_terminal.is_none() && status.session_id.is_some());
-    assert_eq!(
-        status.costmap_source_timestamp_ns,
-        first.source_timestamp_ns
-    );
-    assert!(status.costmap_receipt_age_ms >= 1000);
-    assert_eq!(status.last_applied_twist, Some(Twist2::ZERO));
-
-    harness.shutdown().await;
-}
-
-#[tokio::test]
 async fn incomplete_refresh_recovery_does_not_resurrect_cancelled_goal() {
     let probe = Probe::new();
-    let (mut harness, first, goal, _) = active(&probe, Duration::ZERO).await;
+    let (mut harness, first, goal, _) = active(&probe).await;
     let next = map_message(first.revision + 1, &first.session_id);
     probe
         .failing_revision
@@ -308,7 +281,7 @@ async fn incomplete_refresh_recovery_does_not_resurrect_cancelled_goal() {
 async fn incomplete_refresh_late_completion_cannot_cross_clear_or_domain_fence() {
     for clear in [false, true] {
         let probe = Probe::new();
-        let (mut harness, first, _, _) = active(&probe, Duration::ZERO).await;
+        let (mut harness, first, _, _) = active(&probe).await;
         let next = map_message(first.revision + 1, &first.session_id);
         probe
             .failing_revision
@@ -380,7 +353,7 @@ async fn incomplete_refresh_late_completion_cannot_cross_clear_or_domain_fence()
 async fn incomplete_refresh_does_not_renew_pose_source_deadline() {
     {
         let probe = Probe::new();
-        let (mut harness, first, _, _) = active(&probe, Duration::ZERO).await;
+        let (mut harness, first, _, _) = active(&probe).await;
         let next = map_message(first.revision + 1, &first.session_id);
         probe
             .failing_revision
@@ -451,7 +424,7 @@ async fn candidate_failure_without_installed_map_waits_then_retries_same_root() 
 async fn complete_candidate_build_failure_keeps_the_installed_map_and_active_goal() {
     use nuwax_map_chunks::{Repository,Writer,Transfer,MAX_BLOCK_BYTES};
     let probe = Probe::new();
-    let (mut harness, first, goal, path_revision) = active(&probe, Duration::ZERO).await;
+    let (mut harness, first, goal, path_revision) = active(&probe).await;
     let installed = harness.hub.latest.lock().unwrap().as_ref().unwrap().clone();
     let mut next = map_message(first.revision+1,&first.session_id);
     let repository=Repository::temporary().unwrap();

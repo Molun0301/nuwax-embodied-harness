@@ -12,7 +12,7 @@ pub const TYPE_NAME: &str = "nuwax_msgs.PlanarNavigationMap";
 pub const DEFAULT_TOPIC: &str = "/nav/planar_occupancy";
 /// 含内层栅格的最大消息预算。
 pub const MAX_BYTES: usize = 64 * 1024 * 1024;
-/// 接纳时允许的最大真实扫描年龄。
+/// 二维观测生产者采样时允许的最大真实扫描年龄。
 pub const MAX_SOURCE_AGE_NS: i64 = 500_000_000;
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -204,47 +204,46 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// 每个实际消费者保存自己的已接纳顺序；来源倒退不刷新任何接收期限。
+/// 每个消费者按会话与观测修订接纳，不按来源时间判龄或设水位。
 #[derive(Default)]
 pub struct Admission {
-    latest: Option<(i64, i64, String, i64, i64, i64, [u8; 16])>,
+    latest: Option<(i64, i64, String, i64, i64, [u8; 16])>,
 }
 impl Admission {
     /// 接纳严格前进的真实观测；返回是否切换来源域。
-    pub fn admit(&mut self, value: &PlanarNavigationMap, now_ns: i64) -> Result<bool, String> {
+    pub fn admit(&mut self, value: &PlanarNavigationMap) -> Result<bool, String> {
         value.validate().map_err(|e| e.to_string())?;
-        if !value.cleared
-            && (value.source_timestamp_ns > now_ns + 50_000_000
-                || now_ns.saturating_sub(value.source_timestamp_ns) > MAX_SOURCE_AGE_NS)
-        {
-            return Err("二维导航观测过期或位于未来".into());
-        }
-        let domain = (value.runtime_generation, value.session_generation, value.map_frame_generation);
+        let domain = (
+            value.runtime_generation,
+            value.session_generation,
+            value.map_frame_generation,
+        );
         let changed = self
             .latest
             .as_ref()
-            .is_none_or(|old| (old.0, old.1, old.5) != domain);
+            .is_none_or(|old| (old.0, old.1, old.4) != domain);
         if let Some(old) = &self.latest {
-            if domain < (old.0, old.1, old.5)
-                || (domain == (old.0, old.1, old.5)
+            if domain < (old.0, old.1, old.4)
+                || (domain == (old.0, old.1, old.4)
                     && (old.2 != value.session_id
-                        || (old.6 != [0; 16] && value.map_boot_nonce != [0; 16]
-                            && old.6 != value.map_boot_nonce)
-                        || value.observation_revision <= old.3
-                        || !value.cleared && value.source_timestamp_ns <= old.4))
+                        || (old.5 != [0; 16]
+                            && value.map_boot_nonce != [0; 16]
+                            && old.5 != value.map_boot_nonce)
+                        || value.observation_revision <= old.3))
             {
                 return Err("二维导航观测来源已过期或冲突".into());
             }
         }
         let boot = if !changed && value.map_boot_nonce == [0; 16] {
-            self.latest.as_ref().map_or([0; 16], |old| old.6)
-        } else { value.map_boot_nonce };
+            self.latest.as_ref().map_or([0; 16], |old| old.5)
+        } else {
+            value.map_boot_nonce
+        };
         self.latest = Some((
             value.runtime_generation,
             value.session_generation,
             value.session_id.clone(),
             value.observation_revision,
-            value.source_timestamp_ns,
             value.map_frame_generation,
             boot,
         ));
@@ -290,31 +289,45 @@ mod tests {
         }
     }
     #[test]
-    fn source_age_clear_and_generation_are_independent_from_map_revision() {
+    fn observation_revision_clear_and_generation_are_independent_from_source_age() {
         let mut admission = Admission::default();
         let mut map = value();
-        assert!(admission.admit(&map, 1_000_000_000).unwrap());
-        assert!(admission.admit(&map, 1_000_000_001).is_err());
+        assert!(admission.admit(&map).unwrap());
+        assert!(admission.admit(&map).is_err());
         map.observation_revision = 2;
         map.source_sequence = 1;
         map.source_timestamp_ns += 1;
         map.grid.header.stamp_nsec = 1;
-        assert!(!admission.admit(&map, 1_000_000_001).unwrap());
+        assert!(!admission.admit(&map).unwrap());
         let cleared = PlanarNavigationMap {
             cleared: true,
             observation_revision: 3,
             grid: Default::default(),
             ..map.clone()
         };
-        assert!(!admission.admit(&cleared, 1_000_000_001).unwrap());
-        assert!(admission.admit(&map, 1_000_000_001).is_err());
+        assert!(!admission.admit(&cleared).unwrap());
+        assert!(admission.admit(&map).is_err());
         map.session_generation = 2;
         map.session_id = "map-b".into();
         map.observation_revision = 4;
-        assert!(admission.admit(&map, 2_000_000_000).is_err());
-        assert!(admission.admit(&map, 1_000_000_001).unwrap());
-        assert!(admission.admit(&cleared, 1_000_000_001).is_err());
+        assert!(admission.admit(&map).unwrap());
+        assert!(admission.admit(&cleared).is_err());
     }
+    #[test]
+    fn newer_revision_accepts_same_or_older_source_timestamp() {
+        let mut admission = Admission::default();
+        let mut map = value();
+        admission.admit(&map).unwrap();
+        for source in [map.source_timestamp_ns, 1] {
+            map.observation_revision += 1;
+            map.source_timestamp_ns = source;
+            map.grid.header.stamp_sec = (source / 1_000_000_000) as i32;
+            map.grid.header.stamp_nsec = (source % 1_000_000_000) as i32;
+            assert!(!admission.admit(&map).unwrap());
+            assert!(admission.admit(&map).is_err());
+        }
+    }
+
     #[test]
     fn receipts_are_required_except_for_explicit_no_map_clears() {
         let map = value();
@@ -345,15 +358,15 @@ mod tests {
         for nonce in [[1; 16], [0xff; 16]] {
             let mut admission = Admission::default();
             let map = value();
-            admission.admit(&map, map.source_timestamp_ns).unwrap();
+            admission.admit(&map).unwrap();
             let mut changed_boot = map.clone();
             changed_boot.map_boot_nonce = nonce;
             changed_boot.observation_revision += 1;
             changed_boot.source_timestamp_ns += 1;
             changed_boot.grid.header.stamp_nsec += 1;
-            assert!(admission.admit(&changed_boot, changed_boot.source_timestamp_ns).is_err());
+            assert!(admission.admit(&changed_boot).is_err());
             changed_boot.runtime_generation += 1;
-            assert!(admission.admit(&changed_boot, changed_boot.source_timestamp_ns).unwrap());
+            assert!(admission.admit(&changed_boot).unwrap());
         }
     }
 

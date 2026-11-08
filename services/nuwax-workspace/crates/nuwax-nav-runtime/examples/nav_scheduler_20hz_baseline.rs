@@ -160,8 +160,8 @@ async fn run() -> Result<(), RuntimeError> {
             tick_interval: Duration::from_millis(50),
 
             path_wait_timeout: Duration::from_secs(1),
-            pose_ttl: Duration::from_millis(500),
-            costmap_ttl: Duration::from_millis(500),
+
+
         },
     )?;
     let (handle, scheduler_worker) = spawn_scheduler(scheduler);

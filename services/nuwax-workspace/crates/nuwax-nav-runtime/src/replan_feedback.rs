@@ -102,9 +102,9 @@ impl<K: PartialEq> SuccessfulReplanMemo<K> {
     pub fn published(&mut self, path: K, input: SurfaceReplanInput) {
         self.published = Some((path, input));
     }
-    /// Reuse only a correlated, actual execution refusal after its original stop
-    /// confirmation. The caller supplies the unmodified rejected context, or
-    /// None for an initial wait, missing proof, stale owner or pending planner.
+    /// 仅复用关联到原路径、且零速请求已被运动端接受的实际执行拒绝。
+    /// 调用方提供原拒绝上下文；初始等待、缺少上下文、旧拥有方或规划待定时传None。
+    /// 速度请求被接受不表示实测停稳。
     /// A success at A followed by refusal at B cannot suppress a retry back at A.
     pub fn should_reuse(
         &self,

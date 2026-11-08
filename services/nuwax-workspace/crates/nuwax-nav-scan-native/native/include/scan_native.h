@@ -12,49 +12,49 @@ typedef struct {
     double max_step_up, max_step_down, max_slope, max_yaw_acceleration;
     double max_reverse_velocity, max_lateral_velocity;
 } ScanConfig;
-
-typedef struct {
-    double time, position[3], velocity[3], acceleration[3], yaw, yaw_rate;
-} ScanSample;
-
+typedef struct { double time, position[3], velocity[3], acceleration[3], yaw, yaw_rate; } ScanSample;
+/* 浅接触退出复用原检查的样本输出，不携带任何速度有效期。 */
 typedef struct {
     double duration, reference_progress, reference_duration, local_target[3];
     double command_forward, command_lateral, command_yaw_rate, command_duration;
-    ScanSample *samples;
-    size_t sample_count;
-    uint32_t replanned;
-    uint32_t execution_cycle_complete; /* Normal EXEC -> WAIT only; not physical arrival. */
-    uint32_t execution_failed; /* Original exhausted-retry EMERGENCY -> WAIT, not normal completion. */
-    uint32_t motion_boundary_sources[3]; /* velocity, acceleration, yaw-rate: 0 measured, 1 previous plan, 2 initial zero */
+    ScanSample *samples; size_t sample_count;
+    uint32_t replanned, execution_cycle_complete, execution_failed, motion_boundary_sources[3];
 } ScanOutput;
-
-int nuwax_scan_plan(const ScanConfig *config, const double *obstacles, size_t obstacle_count,
-    const double *ground, size_t ground_count, const double *reference, size_t reference_count,
-    const double start_position[3], const double start_velocity[3], const double start_acceleration[3],
-    double start_yaw, double start_yaw_rate, const double *boundary, size_t boundary_count, const int32_t *forbidden_columns, size_t forbidden_count, double goal_yaw, int64_t odometry_timestamp_ns, ScanOutput *output, char *error, size_t error_capacity);
-void *nuwax_scan_session_create(void);
-void nuwax_scan_session_destroy(void *session);
-void nuwax_scan_session_reset(void *session);
-/* Retire task/control only, retaining map, pending scan and A* pool. */
-void nuwax_scan_session_notify_source_changed(void *session);
-void nuwax_scan_session_reset_execution(void *session);
-int nuwax_scan_session_configure(void *session,const ScanConfig *config,int *map_rebuilt,char *error,size_t capacity);
-/* Author A requires local planning. enabled=0 explicitly rejects the retired B comparison. */
-void nuwax_scan_session_set_local_planning(void *session, int enabled);
-uint64_t nuwax_scan_session_plan_count(const void *session);
-int nuwax_scan_session_plan(void *session,const ScanConfig *config,const double *obstacles,size_t obstacle_count,
-    const double *ground,size_t ground_count,const double *reference,size_t reference_count,
-    const double start_position[3],const double start_velocity[3],const double start_acceleration[3],
-    double start_yaw,double start_yaw_rate,const double *boundary,size_t boundary_count,const int32_t *forbidden_columns,
-    size_t forbidden_count,double goal_yaw,int64_t odometry_timestamp_ns,ScanOutput *output,char *error,size_t error_capacity);
-/* Explicit static occupancy fixture; never used as a substitute LiDAR frame. */
-void nuwax_scan_session_set_static_fixture(void *session,int enabled);
-/* Runtime validates frame identity/lifecycle/freshness before this synchronous transport. */
-int nuwax_scan_session_ingest_registered_frame(void *session,const ScanConfig *config,const double *points,size_t count,
- const double origin[3],const double body_position[3],int64_t timestamp_ns);
-/* 地面成员下标必须来自同一个已接纳注册帧；缺身份沿旧入口保留完整占据。 */
-int nuwax_scan_session_ingest_registered_frame_with_ground(void *session,const ScanConfig *config,const double *points,size_t count,
- const uint32_t *ground_members,size_t ground_count,const double origin[3],const double body_position[3],int64_t timestamp_ns);
+typedef struct {
+    double position[3], velocity[3], planning_velocity[3], yaw, yaw_rate, route_progress;
+    int64_t timestamp_ns;
+    uint32_t measured_velocity, measured_yaw_rate;
+} ScanState;
+typedef struct {
+    double command[3], phase, remaining, deviation;
+    /* 1无轨迹，2偏离，4走完，8无合法候选，16提前请求，32恢复失败，64新曲线偏离（旧曲线继续）。 */
+    uint32_t reason, limited, installed;
+} ScanTrackOutput;
+void *nuwax_scan_map_create(const ScanConfig *config);
+void nuwax_scan_map_destroy(void *map);
+int nuwax_scan_map_surface(void *map,const double *obstacles,size_t count,const double *ground,size_t ground_count,
+    const double *boundary,size_t boundary_count,const int32_t *forbidden,size_t forbidden_count);
+int nuwax_scan_map_ingest(void *map,const double *points,size_t count,const uint32_t *ground,size_t ground_count,
+    const double origin[3],const double body[3]);
+/* 函数参数形式的静态占据初始化，数值夹具不向会话写测试开关。 */
+void nuwax_scan_map_seed_occupied(void *map,const double *points,size_t count,const double body[3]);
+void *nuwax_scan_map_snapshot(const void *map);
+int nuwax_scan_snapshot_affects(const void *current,const void *previous,const void *trajectory,double from);
+void nuwax_scan_snapshot_destroy(void *snapshot);
+void *nuwax_scan_planner_create(void);
+void nuwax_scan_planner_destroy(void *planner);
+void *nuwax_scan_planner_plan(void *planner,const ScanConfig *config,const void *snapshot,
+    const double *reference,size_t count,const ScanState *state,const void *active,double phase,
+    char *error,size_t error_capacity);
+void nuwax_scan_trajectory_destroy(void *trajectory);
+void nuwax_scan_trajectory_samples(const void *trajectory,double from,double dt,ScanOutput *output);
+void *nuwax_scan_tracker_create(void);
+void nuwax_scan_tracker_destroy(void *tracker);
+void nuwax_scan_tracker_clear(void *tracker);
+void nuwax_scan_tracker_install(void *tracker,const void *trajectory);
+void nuwax_scan_tracker_track(void *tracker,const ScanConfig *config,const void *snapshot,
+    const ScanState *state,const double previous_command[3],double terminal_yaw,ScanTrackOutput *output,ScanOutput *recovery,
+    char *error,size_t error_capacity);
 void nuwax_scan_free(ScanOutput *output);
 #ifdef __cplusplus
 }

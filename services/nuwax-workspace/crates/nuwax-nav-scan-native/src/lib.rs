@@ -1,6 +1,9 @@
-//! 原 SCAN（局部轨迹规划器）的无 ROS（机器人操作系统）接口。
-use std::ffi::{c_char, CStr};
-
+//! 原生地图、慢规划与快跟踪的独立接口。
+use std::{
+    ffi::{c_char, c_void, CStr},
+    ptr::NonNull,
+    sync::Arc,
+};
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
@@ -26,26 +29,6 @@ pub struct Config {
     pub max_lateral_velocity: f64,
 }
 
-pub struct PlanRequest<'a> {
-    /// 实测机身障碍体素中心，正常地面和可走台阶应归入 ground。
-    pub obstacles: &'a [[f64; 3]],
-    /// 地面实测坐标；缺测处沿用全局机身参考高度。
-    pub ground: &'a [[f64; 3]],
-    /// PCT（点云地形规划器）输出的世界坐标机体中心参考路径。
-    pub reference: &'a [[f64; 3]],
-    pub start_position: [f64; 3],
-    pub start_velocity: Option<[f64; 3]>,
-    pub start_acceleration: Option<[f64; 3]>,
-    pub start_yaw: f64,
-    pub start_yaw_rate: Option<f64>,
-    /// 里程计采样时间；重复同一采样不得推进原控制器时钟。
-    pub odometry_timestamp_ns: i64,
-    pub config: Config,
-    pub boundary: &'a [[f64; 2]],
-    pub forbidden_columns: &'a [[i32; 2]],
-    pub goal_yaw: Option<f64>,
-}
-
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct TrajectorySample {
@@ -58,30 +41,32 @@ pub struct TrajectorySample {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MotionBoundarySource { Measured, PreviousTrajectory, InitialZeroAssumption, PreviousControlEstimate, AuthorDirectionReset, SmoothedMeasured }
-
-#[derive(Debug, Clone)]
-pub struct PlanResult {
-    pub samples: Vec<TrajectorySample>,
-    pub duration: f64,
-    /// 当前局部窗口目标在原折线参考轨迹中的时间位置。
-    pub reference_progress: f64,
-    pub reference_duration: f64,
-    pub local_target: [f64; 3],
-    pub command_forward: f64,
-    pub command_lateral: f64,
-    pub command_yaw_rate: f64,
-    pub command_duration: f64,
-    pub replanned: bool,
-    /// Original normal trajectory cycle ended; outer goal may still require a new path.
-    pub execution_cycle_complete: bool,
-    pub execution_failed: bool,
-    /// Velocity, acceleration, yaw-rate provenance; never equates missing measurement with measured zero.
-    pub motion_boundary_sources: [MotionBoundarySource; 3],
+pub enum MotionBoundarySource {
+    Measured,
+    PreviousTrajectory,
+    InitialZeroAssumption,
+    PreviousControlEstimate,
+    AuthorDirectionReset,
+    SmoothedMeasured,
 }
 
+/// 当拍实际状态；测量缺失与真实零速分开。
 #[repr(C)]
-struct NativeOutput {
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MotionState {
+    pub position: [f64; 3],
+    pub velocity: [f64; 3],
+    pub planning_velocity: [f64; 3],
+    pub yaw: f64,
+    pub yaw_rate: f64,
+    pub route_progress: f64,
+    pub timestamp_ns: i64,
+    pub measured_velocity: u32,
+    pub measured_yaw_rate: u32,
+}
+#[repr(C)]
+#[derive(Default)]
+struct SamplesRaw {
     duration: f64,
     reference_progress: f64,
     reference_duration: f64,
@@ -97,246 +82,400 @@ struct NativeOutput {
     execution_failed: u32,
     motion_boundary_sources: [u32; 3],
 }
+/// 原命令检查结论；提前请求与当前命令许可分开。
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+struct TrackRaw {
+    pub command: [f64; 3],
+    pub phase: f64,
+    pub remaining: f64,
+    pub deviation: f64,
+    pub reason: u32,
+    pub limited: u32,
+    pub installed: u32,
+}
+#[derive(Default, Debug)]
+pub struct TrackResult {
+    pub command: [f64; 3],
+    pub phase: f64,
+    pub remaining: f64,
+    pub deviation: f64,
+    pub reason: u32,
+    pub limited: u32,
+    pub installed: bool,
+    pub recovery_samples: Vec<TrajectorySample>,
+}
+impl TrackResult {
+    pub fn needs_plan(&self) -> bool {
+        self.reason != 0
+    }
+    pub fn invalid(&self) -> bool {
+        self.reason & !(16 | 64) != 0
+    }
+}
 extern "C" {
-    fn nuwax_scan_session_set_static_fixture(session:*mut std::ffi::c_void,enabled:std::ffi::c_int);
-    fn nuwax_scan_session_ingest_registered_frame(session:*mut std::ffi::c_void,config:*const Config,points:*const f64,count:usize,
-        origin:*const f64,body_position:*const f64,timestamp_ns:i64)->std::ffi::c_int;
-    fn nuwax_scan_session_ingest_registered_frame_with_ground(session:*mut std::ffi::c_void,config:*const Config,points:*const f64,count:usize,
-        ground_members:*const u32,ground_count:usize,origin:*const f64,body_position:*const f64,timestamp_ns:i64)->std::ffi::c_int;
-    fn nuwax_scan_session_create() -> *mut std::ffi::c_void;
-    fn nuwax_scan_session_destroy(session: *mut std::ffi::c_void);
-    fn nuwax_scan_session_reset(session: *mut std::ffi::c_void);
-    fn nuwax_scan_session_notify_source_changed(session: *mut std::ffi::c_void);
-    fn nuwax_scan_session_reset_execution(session: *mut std::ffi::c_void);
-    fn nuwax_scan_session_configure(session: *mut std::ffi::c_void,config: *const Config,map_rebuilt: *mut i32,error: *mut std::ffi::c_char,capacity: usize)->i32;
-    fn nuwax_scan_session_set_local_planning(session: *mut std::ffi::c_void, enabled: i32);
-    fn nuwax_scan_session_plan_count(session: *const std::ffi::c_void) -> u64;
-    fn nuwax_scan_session_plan(
-        session: *mut std::ffi::c_void,
-        config: *const Config,
+    fn nuwax_scan_map_create(config: *const Config) -> *mut c_void;
+    fn nuwax_scan_map_destroy(map: *mut c_void);
+    fn nuwax_scan_map_surface(
+        map: *mut c_void,
         obstacles: *const f64,
-        obstacle_count: usize,
+        count: usize,
         ground: *const f64,
         ground_count: usize,
-        reference: *const f64,
-        reference_count: usize,
-        start_position: *const f64,
-        start_velocity: *const f64,
-        start_acceleration: *const f64,
-        start_yaw: f64,
-        start_yaw_rate: f64,
         boundary: *const f64,
         boundary_count: usize,
-        forbidden_columns: *const i32,
+        forbidden: *const i32,
         forbidden_count: usize,
-        goal_yaw: f64,
-        odometry_timestamp_ns: i64,
-        output: *mut NativeOutput,
-        error: *mut c_char,
-        error_capacity: usize,
     ) -> i32;
-    fn nuwax_scan_free(output: *mut NativeOutput);
+    fn nuwax_scan_map_ingest(
+        map: *mut c_void,
+        points: *const f64,
+        count: usize,
+        ground: *const u32,
+        ground_count: usize,
+        origin: *const f64,
+        body: *const f64,
+    ) -> i32;
+    fn nuwax_scan_map_seed_occupied(
+        map: *mut c_void,
+        points: *const f64,
+        count: usize,
+        body: *const f64,
+    );
+    fn nuwax_scan_map_snapshot(map: *const c_void) -> *mut c_void;
+    fn nuwax_scan_snapshot_affects(
+        current: *const c_void,
+        previous: *const c_void,
+        trajectory: *const c_void,
+        from: f64,
+    ) -> i32;
+    fn nuwax_scan_snapshot_destroy(map: *mut c_void);
+    fn nuwax_scan_planner_create() -> *mut c_void;
+    fn nuwax_scan_planner_destroy(planner: *mut c_void);
+    fn nuwax_scan_planner_plan(
+        planner: *mut c_void,
+        config: *const Config,
+        map: *const c_void,
+        reference: *const f64,
+        count: usize,
+        state: *const MotionState,
+        active: *const c_void,
+        phase: f64,
+        error: *mut c_char,
+        capacity: usize,
+    ) -> *mut c_void;
+    fn nuwax_scan_trajectory_destroy(trajectory: *mut c_void);
+    fn nuwax_scan_trajectory_samples(
+        trajectory: *const c_void,
+        from: f64,
+        dt: f64,
+        out: *mut SamplesRaw,
+    );
+    fn nuwax_scan_tracker_create() -> *mut c_void;
+    fn nuwax_scan_tracker_destroy(tracker: *mut c_void);
+    fn nuwax_scan_tracker_clear(tracker: *mut c_void);
+    fn nuwax_scan_tracker_install(tracker: *mut c_void, trajectory: *const c_void);
+    fn nuwax_scan_tracker_track(
+        tracker: *mut c_void,
+        config: *const Config,
+        map: *const c_void,
+        state: *const MotionState,
+        previous: *const f64,
+        terminal_yaw: f64,
+        out: *mut TrackRaw,
+        recovery: *mut SamplesRaw,
+        error: *mut c_char,
+        capacity: usize,
+    );
+    fn nuwax_scan_free(out: *mut SamplesRaw);
 }
-
-/// 单次规划供组件诊断；持续执行使用持有原轨迹的 Planner。
-pub fn plan(request: &PlanRequest<'_>) -> Result<PlanResult, String> {
-    call_native(request, std::ptr::null_mut())
+fn error_message(error: &[c_char]) -> String {
+    unsafe { CStr::from_ptr(error.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
 }
-
-/// 原 SCAN 样条与闭环控制器的单线程拥有者。
-#[derive(Debug)]
-pub struct Planner {
-    handle: *mut std::ffi::c_void,
-    local_planning: bool,
-    static_map_fixture: bool,
-    pending_source_change: bool,
-}
-// 句柄只由 &mut self 串行调用，可随原 PlannerWorker 移交；不实现 Sync。
-unsafe impl Send for Planner {}
-impl Default for Planner {
-    fn default() -> Self {
-        Self::new()
+/// 唯一可变概率地图；必须由地图维护线程独占。
+pub struct MapOwner(NonNull<c_void>);
+// 原生句柄只通过可变借用访问，可移交到地图线程。
+unsafe impl Send for MapOwner {}
+impl MapOwner {
+    pub fn new(config: &Config) -> Result<Self, String> {
+        NonNull::new(unsafe { nuwax_scan_map_create(config) })
+            .map(Self)
+            .ok_or_else(|| "原生地图初始化失败".into())
     }
-}
-impl Planner {
-    pub fn new() -> Self {
-        Self {
-            handle: std::ptr::null_mut(),
-            local_planning: true,
-            static_map_fixture: false,
-            pending_source_change: false,
+    pub fn update_surface(
+        &mut self,
+        obstacles: &[[f64; 3]],
+        ground: &[[f64; 3]],
+        boundary: &[[f64; 2]],
+        forbidden: &[[i32; 2]],
+    ) -> Result<(), String> {
+        let result = unsafe {
+            nuwax_scan_map_surface(
+                self.0.as_ptr(),
+                obstacles.as_ptr().cast(),
+                obstacles.len(),
+                ground.as_ptr().cast(),
+                ground.len(),
+                boundary.as_ptr().cast(),
+                boundary.len(),
+                forbidden.as_ptr().cast(),
+                forbidden.len(),
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err("原生实体与业务掩码更新失败".into())
         }
     }
-    /// Author A requires local planning; disabling it returns an explicit unsupported-comparison error.
-    pub fn set_local_planning(&mut self, enabled: bool) {
-        self.local_planning = enabled;
-        if !self.handle.is_null() {
-            unsafe { nuwax_scan_session_set_local_planning(self.handle, i32::from(enabled)) }
+    pub fn ingest(
+        &mut self,
+        points: &[[f64; 3]],
+        ground: &[u32],
+        origin: [f64; 3],
+        body: [f64; 3],
+    ) -> Result<(), String> {
+        let result = unsafe {
+            nuwax_scan_map_ingest(
+                self.0.as_ptr(),
+                points.as_ptr().cast(),
+                points.len(),
+                ground.as_ptr(),
+                ground.len(),
+                origin.as_ptr(),
+                body.as_ptr(),
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err("同帧注册点云融合失败".into())
         }
     }
-    fn ensure_session(&mut self)->Result<(),String> {
-        if self.handle.is_null() {
-            self.handle=unsafe{nuwax_scan_session_create()};
-            if self.handle.is_null(){return Err("无法分配 SCAN 原生规划器".into());}
-            unsafe{
-                nuwax_scan_session_set_local_planning(self.handle,i32::from(self.local_planning));
-                nuwax_scan_session_set_static_fixture(self.handle,i32::from(self.static_map_fixture));
-                if self.pending_source_change { nuwax_scan_session_notify_source_changed(self.handle); self.pending_source_change=false; }
-            }
-        }
-        Ok(())
-    }
-    pub fn step(&mut self, request:&PlanRequest<'_>)->Result<PlanResult,String>{
-        self.ensure_session()?;
-        call_native(request,self.handle)
-    }
-    /// Notify an accepted map or explicit business-constraint event without advancing odometry.
-    pub fn notify_source_changed(&mut self) {
-        if self.handle.is_null() { self.pending_source_change=true; }
-        else { unsafe { nuwax_scan_session_notify_source_changed(self.handle) } }
-    }
-    pub fn reset(&mut self) {
-        self.pending_source_change=false;
-        if !self.handle.is_null() {
-            unsafe { nuwax_scan_session_reset(self.handle) }
+    /// 静态数值夹具由调用方函数初始化，不在会话中保留测试模式。
+    pub fn seed_occupied(&mut self, points: &[[f64; 3]], body: [f64; 3]) {
+        unsafe {
+            nuwax_scan_map_seed_occupied(
+                self.0.as_ptr(),
+                points.as_ptr().cast(),
+                points.len(),
+                body.as_ptr(),
+            )
         }
     }
-    /// Retire only the current task, retaining the original map and consumed-frame watermark.
-    pub fn reset_execution(&mut self) {
-        self.pending_source_change=false;
-        if !self.handle.is_null() { unsafe { nuwax_scan_session_reset_execution(self.handle) } }
-    }
-    /// Synchronize parameters before ingest. True means an existing map was rebuilt;
-    /// only the caller's still-valid paired frame may then be replayed, without renewing its deadline.
-    pub fn configure(&mut self,config:&Config)->Result<bool,String> {
-        self.ensure_session()?;
-        let mut rebuilt=0;let mut error=[0 as std::ffi::c_char;1024];
-        let status=unsafe {nuwax_scan_session_configure(self.handle,config,&mut rebuilt,error.as_mut_ptr(),error.len())};
-        if status==0 {Ok(rebuilt!=0)} else {Err(unsafe {std::ffi::CStr::from_ptr(error.as_ptr())}.to_string_lossy().into_owned())}
-    }
-    /// Static occupancy only, for named simulation/test fixtures. Production remains
-    /// registered-frame mode; fused SurfaceSnapshot data is not a LiDAR observation.
-    pub fn set_static_map_fixture(&mut self, enabled:bool) {
-        self.static_map_fixture=enabled;
-        if !self.handle.is_null(){unsafe { nuwax_scan_session_set_static_fixture(self.handle, i32::from(enabled)) }}
-    }
-    /// Feed one already-authorized, lifecycle-checked registered map frame together
-    /// with the sensor origin and body position from the same registration binding.
-    pub fn ingest_registered_frame(&mut self, config:&Config, points:&[[f64;3]], origin:[f64;3],
-        body_position:[f64;3], timestamp_ns:i64)->Result<(),String> {
-        self.ensure_session()?;
-        let status=unsafe {nuwax_scan_session_ingest_registered_frame(self.handle,config,points.as_ptr().cast(),points.len(),
-            origin.as_ptr(),body_position.as_ptr(),timestamp_ns)};
-        if status==0 {Ok(())} else {Err("invalid paired registered frame for author SCAN map".into())}
-    }
-    /// 同帧发布的真实地面成员只复核量化格顶，不改变原占据概率或碰撞带。
-    pub fn ingest_registered_frame_with_ground(&mut self, config:&Config, points:&[[f64;3]], ground_point_indices:&[u32],
-        origin:[f64;3],body_position:[f64;3],timestamp_ns:i64)->Result<(),String> {
-        self.ensure_session()?;
-        let status=unsafe {nuwax_scan_session_ingest_registered_frame_with_ground(self.handle,config,points.as_ptr().cast(),points.len(),
-            ground_point_indices.as_ptr(),ground_point_indices.len(),origin.as_ptr(),body_position.as_ptr(),timestamp_ns)};
-        if status==0 {Ok(())} else {Err("invalid paired registered frame or ground members for author SCAN map".into())}
-    }
-    pub fn plan_count(&self) -> u64 {
-        unsafe { nuwax_scan_session_plan_count(self.handle) }
+    pub fn snapshot(&self) -> CollisionSnapshot {
+        CollisionSnapshot(Arc::new(SnapshotHandle(
+            NonNull::new(unsafe { nuwax_scan_map_snapshot(self.0.as_ptr()) }).unwrap(),
+        )))
     }
 }
-impl Drop for Planner {
+impl Drop for MapOwner {
     fn drop(&mut self) {
-        if !self.handle.is_null() {
-            unsafe { nuwax_scan_session_destroy(self.handle) }
+        unsafe { nuwax_scan_map_destroy(self.0.as_ptr()) }
+    }
+}
+struct SnapshotHandle(NonNull<c_void>);
+// 快照只含不可变查询输入，原生读者分别拥有查询对象。
+unsafe impl Send for SnapshotHandle {}
+unsafe impl Sync for SnapshotHandle {}
+impl Drop for SnapshotHandle {
+    fn drop(&mut self) {
+        unsafe { nuwax_scan_snapshot_destroy(self.0.as_ptr()) }
+    }
+}
+/// 规划和跟踪共享的不可变碰撞视图。
+#[derive(Clone)]
+pub struct CollisionSnapshot(Arc<SnapshotHandle>);
+impl CollisionSnapshot {
+    pub fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+    pub fn affects(&self, previous: &Self, trajectory: &Trajectory, from: f64) -> bool {
+        unsafe {
+            nuwax_scan_snapshot_affects(
+                self.0 .0.as_ptr(),
+                previous.0 .0.as_ptr(),
+                trajectory.0 .0.as_ptr(),
+                from,
+            ) != 0
         }
     }
 }
-
-fn call_native(
-    request: &PlanRequest<'_>,
-    handle: *mut std::ffi::c_void,
-) -> Result<PlanResult, String> {
-    let mut output = NativeOutput {
-        duration: 0.0,
-        reference_progress: 0.0,
-        reference_duration: 0.0,
-        local_target: [0.0; 3],
-        command_forward: 0.0,
-        command_lateral: 0.0,
-        command_yaw_rate: 0.0,
-        command_duration: 0.0,
-        samples: std::ptr::null_mut(),
-        sample_count: 0,
-        replanned: 0,
-        execution_cycle_complete: 0,
-        execution_failed: 0,
-        motion_boundary_sources: [2; 3],
-    };
-    let mut error = [0 as c_char; 512];
-    // 输入切片存活至同步 C 接口返回，输出由 C++ 分配并由配套接口释放。
-    let status = unsafe {
-        nuwax_scan_session_plan(
-            handle,
-            &request.config,
-            request.obstacles.as_ptr().cast(),
-            request.obstacles.len(),
-            request.ground.as_ptr().cast(),
-            request.ground.len(),
-            request.reference.as_ptr().cast(),
-            request.reference.len(),
-            request.start_position.as_ptr(),
-            request.start_velocity.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
-            request.start_acceleration.as_ref().map_or(std::ptr::null(), |a| a.as_ptr()),
-            request.start_yaw,
-            request.start_yaw_rate.unwrap_or(f64::NAN),
-            request.boundary.as_ptr().cast(),
-            request.boundary.len(),
-            request.forbidden_columns.as_ptr().cast(),
-            request.forbidden_columns.len(),
-            request.goal_yaw.unwrap_or(f64::NAN),
-            request.odometry_timestamp_ns,
-            &mut output,
-            error.as_mut_ptr(),
-            error.len(),
-        )
-    };
-    if status != 0 {
-        let message = unsafe { CStr::from_ptr(error.as_ptr()) }
-            .to_string_lossy()
-            .into_owned();
-        unsafe { nuwax_scan_free(&mut output) };
-        return Err(message);
+struct TrajectoryHandle(NonNull<c_void>);
+// 原样条只读，控制器与规划状态机不写入这个载荷。
+unsafe impl Send for TrajectoryHandle {}
+unsafe impl Sync for TrajectoryHandle {}
+impl Drop for TrajectoryHandle {
+    fn drop(&mut self) {
+        unsafe { nuwax_scan_trajectory_destroy(self.0.as_ptr()) }
     }
-    let samples = if output.sample_count == 0 {
-        Vec::new()
-    } else {
-        unsafe { std::slice::from_raw_parts(output.samples, output.sample_count) }.to_vec()
-    };
-    let result = PlanResult {
-        samples,
-        duration: output.duration,
-        reference_progress: output.reference_progress,
-        reference_duration: output.reference_duration,
-        local_target: output.local_target,
-        command_forward: output.command_forward,
-        command_lateral: output.command_lateral,
-        command_yaw_rate: output.command_yaw_rate,
-        command_duration: output.command_duration,
-        replanned: output.replanned != 0,
-        execution_cycle_complete: output.execution_cycle_complete != 0,
-        execution_failed: output.execution_failed != 0,
-        motion_boundary_sources: output.motion_boundary_sources.map(|source| match source {
-            0 => MotionBoundarySource::Measured, 1 => MotionBoundarySource::PreviousTrajectory,
+}
+/// 原始结点、控制点及对应路线区段；不以计算耗时判过期。
+#[derive(Clone)]
+pub struct Trajectory(Arc<TrajectoryHandle>);
+/// 原样条的只读显示与诊断数据，不携带速度许可。
+#[derive(Debug)]
+pub struct TrajectoryView {
+    pub samples: Vec<TrajectorySample>,
+    pub duration: f64,
+    pub reference_progress: f64,
+    pub reference_duration: f64,
+    pub local_target: [f64; 3],
+    pub motion_boundary_sources: [MotionBoundarySource; 3],
+}
+impl Trajectory {
+    pub fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+    pub fn inspect(&self, from: f64, dt: f64) -> TrajectoryView {
+        let mut raw = SamplesRaw::default();
+        unsafe { nuwax_scan_trajectory_samples(self.0 .0.as_ptr(), from, dt, &mut raw) };
+        let samples = if raw.sample_count == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(raw.samples, raw.sample_count) }.to_vec()
+        };
+        let source = |x| match x {
+            0 => MotionBoundarySource::Measured,
+            1 => MotionBoundarySource::PreviousTrajectory,
+            2 => MotionBoundarySource::InitialZeroAssumption,
             3 => MotionBoundarySource::PreviousControlEstimate,
             4 => MotionBoundarySource::AuthorDirectionReset,
-            5 => MotionBoundarySource::SmoothedMeasured,
-            _ => MotionBoundarySource::InitialZeroAssumption,
-        }),
-    };
-    unsafe { nuwax_scan_free(&mut output) };
-    Ok(result)
+            _ => MotionBoundarySource::SmoothedMeasured,
+        };
+        let view = TrajectoryView {
+            samples,
+            duration: raw.duration,
+            reference_progress: raw.reference_progress,
+            reference_duration: raw.reference_duration,
+            local_target: raw.local_target,
+            motion_boundary_sources: raw.motion_boundary_sources.map(source),
+        };
+        unsafe { nuwax_scan_free(&mut raw) };
+        view
+    }
+    pub fn samples(&self, from: f64, dt: f64) -> Vec<TrajectorySample> {
+        self.inspect(from, dt).samples
+    }
+}
+/// 独立慢规划会话，不持运动端或控制器。
+pub struct ScanPlanner(NonNull<c_void>);
+unsafe impl Send for ScanPlanner {}
+impl Default for ScanPlanner {
+    fn default() -> Self {
+        Self(NonNull::new(unsafe { nuwax_scan_planner_create() }).unwrap())
+    }
+}
+impl ScanPlanner {
+    pub fn plan(
+        &mut self,
+        config: &Config,
+        map: &CollisionSnapshot,
+        reference: &[[f64; 3]],
+        state: &MotionState,
+        active: Option<&Trajectory>,
+        phase: f64,
+    ) -> Result<Trajectory, String> {
+        let mut error = [0 as c_char; 1024];
+        let result = unsafe {
+            nuwax_scan_planner_plan(
+                self.0.as_ptr(),
+                config,
+                map.0 .0.as_ptr(),
+                reference.as_ptr().cast(),
+                reference.len(),
+                state,
+                active.map_or(std::ptr::null(), |t| t.0 .0.as_ptr()),
+                phase,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        NonNull::new(result)
+            .map(|p| Trajectory(Arc::new(TrajectoryHandle(p))))
+            .ok_or_else(|| error_message(&error))
+    }
+}
+impl Drop for ScanPlanner {
+    fn drop(&mut self) {
+        unsafe { nuwax_scan_planner_destroy(self.0.as_ptr()) }
+    }
+}
+/// 快控制会话；这里只做相位、控制与原命令检查。
+pub struct ScanTracker(NonNull<c_void>);
+unsafe impl Send for ScanTracker {}
+impl Default for ScanTracker {
+    fn default() -> Self {
+        Self(NonNull::new(unsafe { nuwax_scan_tracker_create() }).unwrap())
+    }
+}
+impl ScanTracker {
+    pub fn clear(&mut self) {
+        unsafe { nuwax_scan_tracker_clear(self.0.as_ptr()) }
+    }
+    pub fn install(&mut self, trajectory: &Trajectory) {
+        unsafe { nuwax_scan_tracker_install(self.0.as_ptr(), trajectory.0 .0.as_ptr()) }
+    }
+    pub fn track_and_check(
+        &mut self,
+        config: &Config,
+        map: &CollisionSnapshot,
+        state: &MotionState,
+        previous: [f64; 3],
+        terminal_yaw: Option<f64>,
+    ) -> Result<TrackResult, String> {
+        let mut result = TrackRaw::default();
+        let mut recovery = SamplesRaw::default();
+        let mut error = [0 as c_char; 1024];
+        unsafe {
+            nuwax_scan_tracker_track(
+                self.0.as_ptr(),
+                config,
+                map.0 .0.as_ptr(),
+                state,
+                previous.as_ptr(),
+                terminal_yaw.unwrap_or(f64::NAN),
+                &mut result,
+                &mut recovery,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        let samples = if recovery.sample_count == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(recovery.samples, recovery.sample_count) }.to_vec()
+        };
+        unsafe { nuwax_scan_free(&mut recovery) };
+        if error[0] == 0 {
+            Ok(TrackResult {
+                command: result.command,
+                phase: result.phase,
+                remaining: result.remaining,
+                deviation: result.deviation,
+                reason: result.reason,
+                limited: result.limited,
+                installed: result.installed != 0,
+                recovery_samples: samples,
+            })
+        } else {
+            Err(error_message(&error))
+        }
+    }
+}
+impl Drop for ScanTracker {
+    fn drop(&mut self) {
+        unsafe { nuwax_scan_tracker_destroy(self.0.as_ptr()) }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod fixture {include!("numerical_fixture.rs");}
+    use fixture::{Planner,PlanRequest,PlanResult};
     include!("detour_following_tests.rs");
     include!("command_limit_tests.rs");
     include!("surface_execution_tests.rs");
@@ -349,8 +488,10 @@ mod tests {
         planner.set_static_map_fixture(true);
         planner
     }
-    fn plan(request:&PlanRequest<'_>)->Result<PlanResult,String> {
-        fixture_planner().step(request)
+    fn plan(request:&PlanRequest<'_>)->Result<PlanResult,String>{
+        let mut planner=fixture_planner();let mut req=*request;
+        for _ in 0..20{let out=planner.step(&req)?;if !out.samples.is_empty()||req.reference.is_empty(){return Ok(out)}req.odometry_timestamp_ns+=(req.config.sample_dt*1e9) as i64;}
+        Err("一秒控制周期内未生成局部曲线".into())
     }
     fn config() -> Config {
         Config {
@@ -395,12 +536,6 @@ mod tests {
     }
     fn start_reference(req: &mut PlanRequest<'_>) -> (Planner, PlanResult) {
         let mut planner = fixture_planner();
-        // 作者A依次经历初始化、等待目标、生成轨迹，每拍给出新的观测时点。
-        for _ in 0..2 {
-            let waiting = planner.step(req).unwrap();
-            assert!(waiting.samples.is_empty());
-            req.odometry_timestamp_ns += (req.config.sample_dt * 1e9) as i64;
-        }
         let result = planner.step(req).unwrap();
         assert!(!result.samples.is_empty(), "生成轨迹后应有样条：{result:?}");
         (planner, result)
@@ -523,7 +658,9 @@ mod tests {
         assert!(free.command_yaw_rate > 0.0);
         let obstacles = [[0.35, 0.1, 0.35]];
         req.obstacles = &obstacles;
-        assert!(plan(&req).is_err());
+        let mut tracker=fixture_planner();let mut blocked=false;
+        for _ in 0..30{match tracker.step(&req){Ok(out)=>{req.start_yaw+=out.command_yaw_rate*req.config.sample_dt;req.start_yaw_rate=Some(out.command_yaw_rate);},Err(_)=>{blocked=true;break;}}req.odometry_timestamp_ns+=(req.config.sample_dt*1e9) as i64;}
+        assert!(blocked,"实体阻挡最终应使当拍响应与制动检查拒绝");
     }
     #[test]
     fn ground_points_do_not_become_body_obstacles() {
@@ -752,16 +889,7 @@ mod tests {
         assert!(error.contains("braking sweep"), "新实测速度的制动证明仍必须生效：{error}");
     }
 
-    #[test]
-    fn author_static_fixture_survives_lazy_creation_and_explicit_reset() {
-        let route=[[0.,0.,0.35],[2.,0.,0.35]];
-        let req=request(&route,&[]);
-        let mut p=Planner::new();
-        p.set_static_map_fixture(true);
-        assert!(p.step(&req).is_ok(),"explicit static fixture must survive lazy handle allocation");
-        p.reset();
-        assert!(p.step(&req).is_ok(),"same explicit fixture mode survives goal reset");
-    }
+
     #[test]
     fn author_registered_frame_initializes_real_session_and_reset_discards_map() {
         let route=[[0.,0.,0.35],[2.,0.,0.35]];
@@ -788,7 +916,7 @@ mod tests {
         req.obstacles = &table;
         req.odometry_timestamp_ns += 100_000_000;
         let failure = planner.step(&req).expect_err("当前已知深度实体必须阻止原雷达未知区域内的动作");
-        assert!(failure.contains("surface"), "{failure}");
+        assert!(failure.contains("BODY_OVERLAP_RECOVERY_FAILED"), "{failure}");
         planner.reset_execution();
         req.obstacles = &[];
         req.ground = &table;
@@ -820,53 +948,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn author_normal_cycle_completion_is_latched_not_arrival_and_reset_clears_it() {
-        let route=[[0.,0.,0.35],[2.,0.,0.35]];
-        let mut req=request(&route,&[]);
-        req.odometry_timestamp_ns=1_000_000_000;
-        let mut p=fixture_planner();
-        assert!(!p.step(&req).unwrap().execution_cycle_complete,"initial WAIT is not completed execution");
-        let mut completed=false;
-        for tick in 1..400 {
-            req.odometry_timestamp_ns=1_000_000_000+tick*100_000_000;
-            let result=p.step(&req).unwrap();
-            if result.execution_cycle_complete {
-                completed=true;
-                assert!(result.samples.is_empty(),"expired curve must not be re-exported");
-                assert_eq!([result.command_forward,result.command_lateral,result.command_yaw_rate],[0.;3]);
-                assert!(p.step(&req).unwrap().execution_cycle_complete,"repeat sample must retain event until outer lifecycle acknowledges it");
-                break;
-            }
-        }
-        assert!(completed,"original timed cycle must be surfaced even though actual pose remains at original start");
-        req.reference=&[];req.goal_yaw=Some(0.5);
-        assert!(!p.step(&req).unwrap().execution_cycle_complete,"explicit final yaw is not a request to restart a path");
-        p.reset();req.reference=&route;req.goal_yaw=None;
-        assert!(!p.step(&req).unwrap().execution_cycle_complete,"cancel/new session cannot retain completion");
-    }
 
-    #[test]
-    fn author_execution_retirement_retains_frame_and_refreshes_only_retired_parameters() {
-        let route=[[0.,0.,0.35],[2.,0.,0.35]];
-        let mut req=request(&route,&[]);req.odometry_timestamp_ns=1_000_000_000;
-        let mut p=Planner::new();
-        assert!(!p.configure(&req.config).unwrap());
-        p.ingest_registered_frame(&req.config,&[[0.,0.,-1.]],[0.,0.,1.],[0.,0.,0.35],req.odometry_timestamp_ns).unwrap();
-        p.step(&req).unwrap();
-        let mut changed=req.config;changed.max_reverse_velocity*=0.5;
-        assert!(p.configure(&changed).unwrap_err().contains("unretired"));
-        p.reset_execution();
-        assert!(!p.configure(&changed).unwrap(),"capability refresh must preserve map");
-        req.config=changed;
-        let result=p.step(&req).unwrap();
-        assert!(!result.execution_cycle_complete&&!result.execution_failed);
-        assert!(result.samples.is_empty(),"retired curve cannot escape on next INIT");
-        p.reset_execution();
-        req.config.body_width+=0.01;
-        assert!(p.configure(&req.config).unwrap(),"real map shape changes require rebuild");
-        assert!(p.step(&req).unwrap_err().contains("registered source frame"),"no silent stored-frame replay after map invalidation");
-    }
+
+
 
     #[test]
     fn author_zero_step_band_excludes_support_voxel_and_keeps_obstacle_above_it() {
@@ -1037,7 +1121,7 @@ mod tests {
         assert_eq!([stopped.command_forward,stopped.command_lateral,stopped.command_yaw_rate],[0.;3]);
         assert_eq!(planner.plan_count(),previous_plans,"拒绝后不能重发旧轨迹");
         req.reference=&route;req.goal_yaw=None;req.odometry_timestamp_ns+=100_000_000;
-        assert!(planner.step(&req).unwrap().samples.is_empty(),"下一有效参考从原INIT重新开始，旧轨迹不能复活");
+        let installed=planner.step(&req).unwrap();assert!(installed.replanned,"新参考必须由新规划接续，不能复活旧轨迹");
     }
 
     #[test]
@@ -1059,8 +1143,9 @@ mod tests {
                 assert!((result.local_target[0]-0.5).abs()<1e-8 && (result.local_target[2]-level).abs()<1e-8,
                     "局部目标越出原PCT终点：{:?}",result.local_target);
                 assert!(result.reference_progress<=result.reference_duration+1e-8);
-                let low=result.samples.iter().map(|p|p.position[2]).fold(f64::INFINITY,f64::min);
-                let high=result.samples.iter().map(|p|p.position[2]).fold(f64::NEG_INFINITY,f64::max);
+                let original=planner.original_samples(req.config.sample_dt);
+                let low=original.iter().map(|p|p.position[2]).fold(f64::INFINITY,f64::min);
+                let high=original.iter().map(|p|p.position[2]).fold(f64::NEG_INFINITY,f64::max);
                 // 同一102点输入在63b43ed0原局部求解器的已有拟合范围；参考修复不改变该样条行为。
                 assert!((low-0.39416981200047052).abs()<1e-8 && (high-0.39798499736324322).abs()<1e-8,
                     "原局部样条高度行为发生变化：{low}至{high}");

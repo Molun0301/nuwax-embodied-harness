@@ -13,16 +13,14 @@ impl NavPlanner for CycleFeedbackProbe {
 fn completed_author_cycle_preserves_current_context_but_not_geometric_refusal_proof() {
     for complete in [false,true] {
         let actual=Arc::new(ActualExecutionContext {
-            source:crate::surface_follower::test_snapshot(0.,false),odometry:route_pose(0.5,0),
+            source:crate::surface_follower::test_snapshot(0.,false),odometry:map_pose(),
             applied:Twist2::ZERO,measured_motion:None,
         });
-        let mut worker=PlannerWorker::new(CycleFeedbackProbe{actual:actual.clone(),complete}).unwrap();
-        worker.step();wait_for_source_result(&worker);
-        assert!(matches!(worker.step(),PlannerStep::ReplanRequired(_)));
-        assert_eq!(worker.take_step_execution_context(Twist2::ZERO).is_some(),!complete,
-            "完成不能变为几何拒绝缓存；普通拒绝仍保留其原证据");
-        assert!(worker.refresh_execution_context(Twist2::ZERO).is_some());
-        worker.stop();
-        assert!(worker.shared.0.lock().unwrap().result.is_none());
+        let mut scheduler=NavScheduler::new(FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))),
+            CycleFeedbackProbe{actual:actual.clone(),complete},SchedulerConfig::default()).unwrap();
+        scheduler.current_execution_identity=Some(Arc::new(path().execution_identity));scheduler.status.last_applied_twist=Some(Twist2::ZERO);
+        let step=scheduler.planner.step();let intent=scheduler.wrap_local_intent(step).unwrap();
+        assert_eq!(intent.execution_context.is_some(),!complete,"完成不能变为几何拒绝缓存");
+        assert!(scheduler.planner.refresh_execution_context(Twist2::ZERO).is_some());
     }
 }

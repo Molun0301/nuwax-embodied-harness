@@ -13,348 +13,236 @@
 #include <stdexcept>
 using Eigen::Vector3d;
 namespace {
-struct RegisteredFrame {
- std::vector<Vector3d> points;
- Vector3d origin=Vector3d::Zero(),body=Vector3d::Zero();
- Eigen::Quaterniond orientation=Eigen::Quaterniond::Identity();
- int64_t timestamp=0;
+constexpr double MINIMUM_DEVIATION_M = 0.20;
+constexpr double REPLAN_REMAINING_SECONDS = 2.5;
+using Snapshot = std::shared_ptr<const GridMap::CollisionSnapshot>;
+struct MapOwner {
+  ScanConfig config;
+  GridMap map;
+  explicit MapOwner(const ScanConfig& c):config(c) { auto p=scan_planner::authorParameters(c);map.initMap(p); }
 };
-struct AuthorSession {
- ScanConfig config{};
- std::unique_ptr<scan_planner::SCANReplanFSM> fsm;
- scan_planner::AuthorController controller;
- scan_planner::AuthorOverlapEscape escape;
- std::shared_ptr<SurfaceObstacleLayer> surface;
- geometry_msgs::Twist raw_command;
- std::vector<double> reference;
- RegisteredFrame frame;bool has_frame=false,static_fixture=false,static_imported=false;
- bool local_enabled=true,cycle_complete=false,execution_failed=false,safety_dirty=false;
- bool command_paused=false;
- Vector3d command_target=Vector3d::Zero();double command_target_yaw=0.;
- int64_t last_fsm=std::numeric_limits<int64_t>::min(),last_safety=std::numeric_limits<int64_t>::min(),last_control=std::numeric_limits<int64_t>::min();
- Vector3d last_position=Vector3d::Zero();double last_yaw=0;
- uint64_t plans=0;
- Eigen::Vector2d previous_control=Eigen::Vector2d::Zero(),sample_control=Eigen::Vector2d::Zero();
- Vector3d travel_velocity=Vector3d::Zero();
- double previous_w=0,sample_w=0;bool has_control=false,has_sample=false;int64_t sample_time=0;
- void retireExecution() {
-  if(fsm)fsm->retireExecution();
-  controller.receive_traj=false;controller.have_odom=false;controller.traj.clear();
-  controller.traj_duration=0.;controller.traj_id=0;controller.exec_time=0.;controller.last_update_time=ros::Time{};
-  controller.odom_pos.setZero();controller.odom_yaw=0.;
-  raw_command={};reference.clear();cycle_complete=false;execution_failed=false;safety_dirty=false;command_paused=false;
-  command_target.setZero();command_target_yaw=0.;
-  last_fsm=last_safety=last_control=std::numeric_limits<int64_t>::min();
-  last_position.setZero();last_yaw=0.;previous_control.setZero();sample_control.setZero();
-  travel_velocity.setZero();
-  previous_w=sample_w=0.;has_control=has_sample=false;sample_time=0;
- }
- bool hasExecution()const{return !reference.empty()||controller.receive_traj;}
- bool sameMap(const ScanConfig& c)const {
-  return config.resolution==c.resolution&&config.body_length==c.body_length&&config.body_width==c.body_width
-   &&config.body_height==c.body_height&&config.body_to_ground==c.body_to_ground
-   &&config.body_center_x==c.body_center_x&&config.body_center_y==c.body_center_y
-   &&config.body_z_min==c.body_z_min&&config.body_z_max==c.body_z_max
-   &&config.max_step_up==c.max_step_up&&config.max_step_down==c.max_step_down&&config.max_slope==c.max_slope;
- }
- bool samePlanning(const ScanConfig& c)const {
-  return config.max_velocity==c.max_velocity&&config.max_acceleration==c.max_acceleration
-   &&config.max_yaw_rate==c.max_yaw_rate&&config.planning_horizon==c.planning_horizon
-   &&config.sample_dt==c.sample_dt&&config.max_yaw_acceleration==c.max_yaw_acceleration
-   &&config.max_reverse_velocity==c.max_reverse_velocity&&config.max_lateral_velocity==c.max_lateral_velocity;
- }
- // Returns true only when an existing map was invalidated. No stored scan is replayed here.
- bool configure(const ScanConfig& c) {
-  if(!fsm){initialize(c);return false;}
-  if(sameMap(c)&&samePlanning(c))return false;
-  if(hasExecution())throw std::runtime_error("Author A configuration changed with an unretired trajectory; stop execution before reconfiguration");
-  if(!sameMap(c)){
-   retireExecution();fsm.reset();frame=RegisteredFrame{};has_frame=false;static_imported=false;
-   initialize(c);return true;
+struct Trajectory {
+  scan_planner::Bspline spline;
+  scan_planner::UniformBspline position,velocity,acceleration;
+  scan_planner::RouteHeightReference route;
+  uint32_t sources[3]{2,2,3};
+  Vector3d local_target=Vector3d::Zero();double reference_progress=0.,reference_duration=0.;
+  explicit Trajectory(const scan_planner::Bspline& s,const scan_planner::RouteHeightReference& r):spline(s),route(r) {
+    Eigen::MatrixXd points(3,s.pos_pts.size());Eigen::VectorXd knots(s.knots.size());
+    for(size_t i=0;i<s.pos_pts.size();++i)points.col(i)=Vector3d(s.pos_pts[i].x,s.pos_pts[i].y,s.pos_pts[i].z);
+    for(size_t i=0;i<s.knots.size();++i)knots[i]=s.knots[i];
+    position=scan_planner::UniformBspline(points,s.order,0.1);position.setKnot(knots);
+    velocity=position.getDerivative();acceleration=velocity.getDerivative();
   }
-  auto params=scan_planner::authorParameters(c);fsm->refreshParameters(params);
-  controller.configure(std::max(c.max_velocity,c.max_reverse_velocity),c.max_lateral_velocity,c.max_yaw_rate);
-  config=c;return false;
- }
- void initialize(const ScanConfig& c) {
-  // 地图或实体几何重建后，旧格索引和退出轴不再具有同一身份。
-  escape=scan_planner::AuthorOverlapEscape{};
-  surface.reset();
-  config=c;auto params=scan_planner::authorParameters(c);
-  fsm=std::make_unique<scan_planner::SCANReplanFSM>();fsm->init(params);
-  controller=scan_planner::AuthorController{};
-  controller.configure(std::max(c.max_velocity,c.max_reverse_velocity),c.max_lateral_velocity,c.max_yaw_rate);
-  controller.cmd_vel_pub.sink=[this](const std::any& value){raw_command=std::any_cast<geometry_msgs::Twist>(value);};
-  controller.execution_frozen_pub.sink=[this](const std::any& value){fsm->onFrozen(std::any_cast<std_msgs::Bool>(value).data);};
-  fsm->onSpline([this](const scan_planner::Bspline& spline){++plans;controller.bsplineCallback(std::make_shared<const scan_planner::Bspline>(spline));last_control=std::numeric_limits<int64_t>::min();});
- }
+  double duration() {return position.getTimeSum();}
+  // 路线区段在生成时冻结；三维投影不能跨到另一层或另一条回头支路。
+  double routeArc(const Vector3d& p,double hint) const {
+    double best=std::numeric_limits<double>::infinity(),selected=route.begin_arc;
+    for(size_t i=1;i<route.points.size();++i) {
+      const auto delta=(route.points[i]-route.points[i-1]).eval();const double length=delta.norm();
+      if(length==0.)continue;
+      const double lo=std::max(route.arcs[i-1],route.begin_arc),hi=std::min(route.arcs[i],route.end_arc);
+      if(lo>hi)continue;
+      const double arc=std::clamp(route.arcs[i-1]+(p-route.points[i-1]).dot(delta)/length,lo,hi);
+      const double distance=(route.positionAtArc(arc)-p).squaredNorm();
+      if(distance<best || (distance==best && std::abs(arc-hint)<std::abs(selected-hint))) {best=distance;selected=arc;}
+    }
+    return selected;
+  }
+  std::pair<double,double> project(const Vector3d& p,double progress) {
+    const double hint=std::clamp(progress,route.begin_arc,route.end_arc);
+    auto edge=std::upper_bound(route.arcs.begin(),route.arcs.end(),hint);
+    const size_t index=std::min(route.arcs.size()-1,std::max(size_t(1),size_t(edge-route.arcs.begin())));
+    const double lo=std::max(route.begin_arc,route.arcs[index-1]),hi=std::min(route.end_arc,route.arcs[index]);
+    const double total=duration();const int count=std::max(1,int(std::ceil(total/.01)));
+    double best=std::numeric_limits<double>::infinity(),tau=0.;
+    for(int i=0;i<=count;++i) {
+      const double t=total*i/count;const auto point=position.evaluateDeBoorT(t);
+      const double arc=routeArc(point,hint);
+      if(arc<lo || arc>hi)continue;
+      const double distance=(point-p).squaredNorm();
+      if(distance<best) {best=distance;tau=t;}
+    }
+    if(!std::isfinite(best))return {0.,best};
+    // 只细化已选样条位置，不修改结点、控制点或规划器的数值实现。
+    const double left=std::max(0.,tau-total/count),right=std::min(total,tau+total/count);
+    for(int i=0;i<16;++i) {
+      const Vector3d delta=position.evaluateDeBoorT(tau)-p,v=velocity.evaluateDeBoorT(tau),a=acceleration.evaluateDeBoorT(tau);
+      const double denominator=v.squaredNorm()+delta.dot(a);
+      if(denominator<=0.)break;
+      const double next=std::clamp(tau-delta.dot(v)/denominator,left,right);
+      if(next==tau)break;
+      tau=next;
+    }
+    return {tau,(position.evaluateDeBoorT(tau)-p).norm()};
+  }
 };
-void copy(double* to,const Vector3d& v){for(int i=0;i<3;++i)to[i]=v[i];}
-double angle(double a){return std::atan2(std::sin(a),std::cos(a));}
+using Curve=std::shared_ptr<Trajectory>;
+struct PlannerSession {
+  std::shared_ptr<GridMap> map=std::make_shared<GridMap>();
+  std::unique_ptr<scan_planner::SCANReplanFSM> fsm;
+  std::vector<double> reference;
+  Curve produced;
+  ScanConfig config{};
+  void initialize(const ScanConfig& c) {
+    auto p=scan_planner::authorParameters(c);fsm=std::make_unique<scan_planner::SCANReplanFSM>();fsm->init(p,map);
+    fsm->onSpline([this](const scan_planner::Bspline& s){produced=std::make_shared<Trajectory>(s,fsm->manager().route_height_);});
+    config=c;reference.clear();
+  }
+};
+struct TrackerSession {
+  GridMap map;
+  scan_planner::AuthorController controller;
+  scan_planner::AuthorOverlapEscape escape;
+  Curve curve,pending;
+  geometry_msgs::Twist raw;
+  double phase=0.;
+  bool install_pending=false;
+  TrackerSession() {controller.cmd_vel_pub.sink=[this](const std::any& v){raw=std::any_cast<geometry_msgs::Twist>(v);};}
+};
+void errorText(char* out,size_t capacity,const std::exception& e) {if(capacity){std::strncpy(out,e.what(),capacity-1);out[capacity-1]=0;}}
+nav_msgs::OdometryConstPtr odometry(const ScanState& state) {
+  auto p=std::make_shared<nav_msgs::Odometry>();p->pose.pose.position.x=state.position[0];p->pose.pose.position.y=state.position[1];p->pose.pose.position.z=state.position[2];
+  p->pose.pose.orientation.w=std::cos(state.yaw/2.);p->pose.pose.orientation.z=std::sin(state.yaw/2.);
+  p->twist.twist.linear.x=state.velocity[0];p->twist.twist.linear.y=state.velocity[1];p->twist.twist.linear.z=state.velocity[2];return p;
 }
-#define SCAN_ARGUMENTS const ScanConfig *config,const double *obstacles,size_t obstacle_count,const double *ground,size_t ground_count,\
- const double *reference,size_t reference_count,const double start_position[3],const double start_velocity[3],const double start_acceleration[3],\
- double start_yaw,double start_yaw_rate,const double *boundary,size_t boundary_count,const int32_t *forbidden_columns,size_t forbidden_count,\
- double goal_yaw,int64_t odometry_timestamp_ns,ScanOutput *output,char *error,size_t error_capacity
-#define SCAN_FORWARD config,obstacles,obstacle_count,ground,ground_count,reference,reference_count,start_position,start_velocity,start_acceleration,\
- start_yaw,start_yaw_rate,boundary,boundary_count,forbidden_columns,forbidden_count,goal_yaw,odometry_timestamp_ns,output,error,error_capacity
-extern "C" int nuwax_scan_session_plan(void* raw,SCAN_ARGUMENTS) {
- AuthorSession ephemeral;auto& s=raw?*static_cast<AuthorSession*>(raw):ephemeral;
- *output={};scan_native_diagnostic.clear();
- try {
-  if(!s.local_enabled)throw std::runtime_error("Author A mode 3 requires local planning; disabled-local remains a retired comparison, not author execution");
-  ros::host_time_seconds=double(odometry_timestamp_ns)*1e-9;
-  s.configure(*config);
-  const auto& c=*config;const Vector3d position=Eigen::Map<const Vector3d>(start_position);
-  auto map=s.fsm->manager().grid_map_;
-  if(s.static_fixture) {
-   map->setSurfaceCollisionQuery({});
-   std::vector<Vector3d> occupied;occupied.reserve(obstacle_count+ground_count);
-   for(size_t i=0;i<obstacle_count;++i)occupied.emplace_back(Eigen::Map<const Vector3d>(obstacles+3*i));
-   for(size_t i=0;i<ground_count;++i)occupied.emplace_back(Eigen::Map<const Vector3d>(ground+3*i));
-   // Static occupancy fixture is explicit, never called a LiDAR observation.
-   if(!s.static_imported){map->importStaticOccupied(occupied,position);s.static_imported=true;}
-   else map->repopulateStaticOccupied(occupied,position);
-  } else {
-   if(!s.has_frame)throw std::runtime_error("Author A map requires a registered source frame with its paired sensor origin; fused surface snapshot is not a raycast input");
-   map->updateOccupancyCallback({});
-   // 真实雷达未看到的已知深度实体仍参加局部查询；相同几何复用，删除随当前表面生效。
-   if(!s.surface||!s.surface->matches(obstacles,obstacle_count,ground,ground_count))
-    s.surface=std::make_shared<SurfaceObstacleLayer>(c,obstacles,obstacle_count,ground,ground_count);
-   map->setSurfaceCollisionQuery([surface=s.surface](const Vector3d& p,double yaw,double padding,
-       std::vector<GridMap::BodyCell>* contacts,const std::set<GridMap::BodyCell>* initial,bool planar) {
-    return surface->contacts(p,yaw,padding,contacts,initial,planar);
-   });
+}
+extern "C" void* nuwax_scan_map_create(const ScanConfig* c){try{return new MapOwner(*c);}catch(...){return nullptr;}}
+extern "C" void nuwax_scan_map_destroy(void* p){delete static_cast<MapOwner*>(p);}
+extern "C" int nuwax_scan_map_surface(void* p,const double* obstacles,size_t count,const double* ground,size_t ground_count,
+    const double* boundary,size_t boundary_count,const int32_t* forbidden,size_t forbidden_count) {
+  try {
+    auto& o=*static_cast<MapOwner*>(p);auto surface=std::make_shared<SurfaceObstacleLayer>(o.config,obstacles,count,ground,ground_count);
+    o.map.setSurfaceCollisionQuery([surface](const Vector3d& x,double yaw,double pad,std::vector<GridMap::BodyCell>* hits,const std::set<GridMap::BodyCell>* initial,bool planar){return surface->contacts(x,yaw,pad,hits,initial,planar);});
+    std::vector<Eigen::Vector2d> polygon;for(size_t i=0;i<boundary_count;++i)polygon.emplace_back(boundary[2*i],boundary[2*i+1]);
+    std::vector<Eigen::Vector2i> columns;for(size_t i=0;i<forbidden_count;++i)columns.emplace_back(forbidden[2*i],forbidden[2*i+1]);
+    const auto& c=o.config;auto mask=std::make_shared<BusinessConstraintMask>(c.resolution,c.body_length,c.body_width,c.body_center_x,c.body_center_y,std::move(polygon),columns);
+    o.map.setBusinessConstraintQuery([mask](const Vector3d& x,double yaw){return mask->rejects(x,yaw);});
+    o.map.setBusinessEnvelopeQuery([mask](const Vector3d& x,double yaw,double pad){return mask->rejectsEnvelope(x,yaw,pad);});return 0;
+  }catch(...){return 1;}
+}
+extern "C" int nuwax_scan_map_ingest(void* p,const double* points,size_t count,const uint32_t* ground,size_t ground_count,const double origin[3],const double body[3]) {
+  try {
+    auto& map=static_cast<MapOwner*>(p)->map;std::vector<Vector3d> values;values.reserve(count);for(size_t i=0;i<count;++i)values.emplace_back(Eigen::Map<const Vector3d>(points+3*i));
+    std::vector<uint32_t> members;if(ground_count)members.assign(ground,ground+ground_count);
+    if(!map.ingestLidarFrame(values,Eigen::Map<const Vector3d>(origin),Eigen::Quaterniond::Identity(),Eigen::Map<const Vector3d>(body),members))return 1;
+    map.updateOccupancyCallback({});return 0;
+  }catch(...){return 1;}
+}
+extern "C" void nuwax_scan_map_seed_occupied(void* p,const double* points,size_t count,const double body[3]) {
+  std::vector<Vector3d> values;for(size_t i=0;i<count;++i)values.emplace_back(Eigen::Map<const Vector3d>(points+3*i));
+  static_cast<MapOwner*>(p)->map.repopulateStaticOccupied(values,Eigen::Map<const Vector3d>(body));
+}
+extern "C" void* nuwax_scan_map_snapshot(const void* p){return new Snapshot(static_cast<const MapOwner*>(p)->map.collisionSnapshot());}
+extern "C" int nuwax_scan_snapshot_affects(const void* current,const void* previous,const void* trajectory,double from) {
+  GridMap now,before;now.bindCollisionSnapshot(*static_cast<const Snapshot*>(current));before.bindCollisionSnapshot(*static_cast<const Snapshot*>(previous));
+  auto curve=*static_cast<const Curve*>(trajectory);const double total=curve->duration(),dt=std::min(.01,now.getResolution()/2.);
+  const int count=std::max(1,int(std::ceil((total-from)/dt)));double yaw=0.;
+  for(int i=0;i<=count;++i) {
+    const double t=from+(total-from)*i/count;const Vector3d p=curve->position.evaluateDeBoorT(t),v=curve->velocity.evaluateDeBoorT(t);
+    if(v.head<2>().squaredNorm()>1e-8)yaw=std::atan2(v[1],v[0]);
+    const double pad=2.*now.getResolution();
+    if(now.getInflateOccupancy(p,yaw)!=before.getInflateOccupancy(p,yaw)
+        || now.bodyContacts(p,yaw,pad)!=before.bodyContacts(p,yaw,pad))return 1;
   }
-  std::vector<Eigen::Vector2d> polygon;polygon.reserve(boundary_count);
-  for(size_t i=0;i<boundary_count;++i)polygon.emplace_back(boundary[2*i],boundary[2*i+1]);
-  std::vector<Eigen::Vector2i> forbidden;forbidden.reserve(forbidden_count);
-  for(size_t i=0;i<forbidden_count;++i)forbidden.emplace_back(forbidden_columns[2*i],forbidden_columns[2*i+1]);
-  auto business=std::make_shared<BusinessConstraintMask>(c.resolution,c.body_length,c.body_width,c.body_center_x,c.body_center_y,std::move(polygon),forbidden);
-  map->setBusinessConstraintQuery([business](const Vector3d& p,double yaw){return business->rejects(p,yaw);});
-  map->setBusinessEnvelopeQuery([business](const Vector3d& p,double yaw,double padding){return business->rejectsEnvelope(p,yaw,padding);});
-  if(scan_planner::authorTraceEnabled()) {
-   auto out=scan_planner::authorTraceStream();
-   out << "{\"event\":\"map_probes\",\"stamp_ns\":" << odometry_timestamp_ns
-       << ",\"frame_stamp_ns\":" << s.frame.timestamp << ",\"actual\":";
-   scan_planner::traceMapProbe(out,*map,position,start_yaw);
-   out << ",\"forward_half_metre\":";
-   scan_planner::traceMapProbe(out,*map,position+Vector3d(.5*std::cos(start_yaw),.5*std::sin(start_yaw),0.),start_yaw);
-   out << "}\n";
-  }
-  // 起点必须使用当前实测机体查询；已有曲线的计划时刻不能代替实际位置。
-  const int start_occupancy=map->getInflateOccupancy(position,start_yaw);
-  if(start_occupancy!=0) {
-   if(start_occupancy==1&&reference_count>=2&&!business->rejects(position,start_yaw)) {
-    if(!s.escape.active())s.retireExecution();
-    try {
-     s.escape.plan(*map,c,position,start_yaw,start_velocity,start_yaw_rate,odometry_timestamp_ns,*output);
-    } catch(const std::runtime_error& failure) {
-     if(!s.static_fixture&&s.surface&&s.surface->intersects(position,start_yaw))
-      throw std::runtime_error(std::string("Current body pose intersects the current known surface collision layer; ")+failure.what());
-     throw;
+  return 0;
+}
+extern "C" void nuwax_scan_snapshot_destroy(void* p){delete static_cast<Snapshot*>(p);}
+extern "C" void* nuwax_scan_planner_create(){return new PlannerSession;}
+extern "C" void nuwax_scan_planner_destroy(void* p){delete static_cast<PlannerSession*>(p);}
+extern "C" void* nuwax_scan_planner_plan(void* p,const ScanConfig* c,const void* snapshot,const double* reference,size_t count,
+    const ScanState* state,const void* active,double phase,char* error,size_t capacity) {
+  try {
+    auto& s=*static_cast<PlannerSession*>(p);s.map->bindCollisionSnapshot(*static_cast<const Snapshot*>(snapshot));
+    ros::host_time_seconds=state->timestamp_ns*1e-9;
+    if(!s.fsm || std::memcmp(&s.config,c,sizeof(*c))!=0)s.initialize(*c);
+    scan_native_diagnostic.clear();s.fsm->onOdometry(odometry(*state),state->measured_velocity,Eigen::Map<const Vector3d>(state->planning_velocity));
+    std::vector<double> incoming(reference,reference+count*3);
+    if(incoming!=s.reference) {
+      auto path=std::make_shared<nav_msgs::Path>();for(size_t i=0;i<count;++i){geometry_msgs::PoseStamped point;point.pose.position.x=reference[3*i];point.pose.position.y=reference[3*i+1];point.pose.position.z=reference[3*i+2]-c->body_to_ground;path->poses.push_back(point);}
+      s.fsm->onReferencePath(path);s.reference=std::move(incoming);
     }
-    // 独立短距证明没有执行原曲线；退出后由原FSM从真实新位置重新起算。
-    s.previous_control={output->command_forward,output->command_lateral};
-    s.previous_w=output->command_yaw_rate;s.has_control=true;
-    return 0;
-   }
-   throw std::runtime_error(business->rejects(position,start_yaw)
-    ? "Current body pose is outside the explicit user boundary or forbidden mask"
-    : "Current body pose is occupied or outside the local map");
-  }
-  s.escape.observeClear(position,c.resolution);
-  auto odom=std::make_shared<nav_msgs::Odometry>();odom->pose.pose.position.x=position.x();odom->pose.pose.position.y=position.y();odom->pose.pose.position.z=position.z();
-  odom->pose.pose.orientation.w=std::cos(start_yaw/2.);odom->pose.pose.orientation.z=std::sin(start_yaw/2.);
-  if(start_velocity){odom->twist.twist.linear.x=start_velocity[0];odom->twist.twist.linear.y=start_velocity[1];odom->twist.twist.linear.z=start_velocity[2];}
-  const double cs=std::cos(start_yaw),sn=std::sin(start_yaw);
-  if(!s.has_sample||odometry_timestamp_ns>s.sample_time){
-   const Vector3d measured(odom->twist.twist.linear.x,odom->twist.twist.linear.y,odom->twist.twist.linear.z);
-   if(!s.has_sample)s.travel_velocity=measured;
-   else {
-    // 一秒时间常数覆盖步态周期；只平滑规划边界，安全检查始终保留原始实测。
-    const double weight=-std::expm1(-double(odometry_timestamp_ns-s.sample_time)*1e-9);
-    s.travel_velocity.head<2>()+=weight*(measured-s.travel_velocity).head<2>();
-    s.travel_velocity.z()=measured.z();
-   }
-   s.sample_time=odometry_timestamp_ns;
-   // 保存机体系请求；转向后的下一拍按当前姿态表达，保持原机体系动态限。
-   s.sample_control=s.has_control?s.previous_control:Eigen::Vector2d(cs*measured.x()+sn*measured.y(),-sn*measured.x()+cs*measured.y());
-   s.sample_w=s.previous_w;s.has_sample=true;
-  }
-  s.fsm->onOdometry(odom,start_velocity!=nullptr,s.travel_velocity);s.controller.odomCallback(odom);
-  const Eigen::Vector2d command_v(cs*s.sample_control.x()-sn*s.sample_control.y(),sn*s.sample_control.x()+cs*s.sample_control.y());
-  const Eigen::Vector2d actual_v=start_velocity?Eigen::Map<const Vector3d>(start_velocity).head<2>().eval():command_v;
-  const double actual_w=std::isfinite(start_yaw_rate)?start_yaw_rate:s.sample_w;
-  // 同一采样重复查询沿用同一个命令起点，不回灌步态的瞬时横速。
-  const uint64_t previous_plans=s.plans;
-  const int state_before=s.fsm->state();
-  double control_time_before=s.controller.exec_time;
-  bool control_called=false;
-  if(reference_count>=2) {
-   std::vector<double> incoming(reference,reference+reference_count*3);
-   if(incoming!=s.reference){
-    auto path=std::make_shared<nav_msgs::Path>();
-    for(size_t i=0;i<reference_count;++i){geometry_msgs::PoseStamped p;p.pose.position.x=reference[3*i];p.pose.position.y=reference[3*i+1];
-     // Incoming PCT reference is body-reference XYZ. A callback adds the exact
-     // same calibrated constant; this reversible transport conversion is not a terrain projection.
-     p.pose.position.z=reference[3*i+2]-c.body_to_ground;path->poses.push_back(p);}
-    if(scan_planner::authorTraceEnabled()){auto out=scan_planner::authorTraceStream();out<<"{\"event\":\"reference_event\",\"stamp_ns\":"<<odometry_timestamp_ns<<",\"points\":[";for(size_t i=0;i<incoming.size();++i){if(i)out<<',';out<<incoming[i];}out<<"]}\n";}
-    s.fsm->onReferencePath(path);
-    if(!s.fsm->hasTarget()) {
-     const std::string reason=scan_native_diagnostic.empty()?"Author A reference path was not accepted":scan_native_diagnostic;
-     // 新参考明确失败时退休完整执行拥有者，旧控制器不能凭先前目标继续导出速度。
-     s.retireExecution();throw std::runtime_error(reason);
+    if(!s.fsm->hasTarget())throw std::runtime_error(scan_native_diagnostic.empty()?"原参考路线未被接纳":scan_native_diagnostic);
+    if(active) {
+      auto curve=*static_cast<const Curve*>(active);auto& local=s.fsm->manager().local_data_;
+      local.position_traj_=curve->position;local.velocity_traj_=curve->velocity;local.acceleration_traj_=curve->acceleration;
+      local.duration_=curve->duration();local.start_time_=ros::Time(ros::Time::now().toSec()-phase);
+      local.start_pos_=curve->position.evaluateDeBoorT(0.);
     }
-    s.reference=std::move(incoming);s.cycle_complete=false;s.execution_failed=false;
-   }
-   // Current host cadence is the real caller cadence. No fabricated catch-up
-   // timer ticks using a single physical odometry sample.
-   if(odometry_timestamp_ns>s.last_fsm){
-    s.fsm->onFrozen(s.command_paused);
-    const bool was_executing=s.fsm->executingTrajectory();
-    const bool was_emergency=s.fsm->emergencyStopping();
-    s.fsm->tick();
-    if(was_executing&&s.fsm->waitingForTarget()&&!s.fsm->hasTarget()&&s.plans>0)s.cycle_complete=true;
-    if(was_emergency&&s.fsm->waitingForTarget()&&!s.fsm->hasTarget())s.execution_failed=true;
-    s.last_fsm=odometry_timestamp_ns;
-   }
-   if(s.safety_dirty||odometry_timestamp_ns>s.last_safety){s.fsm->safetyTick();s.last_safety=odometry_timestamp_ns;s.safety_dirty=false;}
-   if(odometry_timestamp_ns!=s.last_control||position!=s.last_position||start_yaw!=s.last_yaw){
-    control_time_before=s.controller.exec_time;control_called=true;
-    s.command_target=position;s.command_target_yaw=start_yaw;
-    if(s.controller.receive_traj) {
-     const auto before=s.controller.traj[0].evaluateDeBoorT(control_time_before);
-     s.command_target_yaw=s.controller.estimateDesiredYaw(control_time_before,before);
-     s.command_target=s.controller.traj[0].evaluateDeBoorT(std::min(s.controller.traj_duration,control_time_before+s.controller.time_forward));
+    if(!active) {auto& local=s.fsm->manager().local_data_;local.duration_=0.;local.start_time_=ros::Time{};}
+    s.produced.reset();s.fsm->requestPlan(active!=nullptr);s.fsm->tick();
+    if(!s.produced)throw std::runtime_error(scan_native_diagnostic.empty()?"SCAN本次尚无可执行轨迹":scan_native_diagnostic);
+    s.produced->local_target=s.fsm->localTarget();s.produced->reference_progress=s.fsm->manager().global_data_.last_progress_time_;s.produced->reference_duration=s.fsm->manager().global_data_.global_duration_;
+    s.produced->sources[0]=s.fsm->startVelocitySource();s.produced->sources[1]=s.fsm->startAccelerationSource();s.produced->sources[2]=state->measured_yaw_rate?0:3;
+    return new Curve(s.produced);
+  }catch(const std::exception& e){errorText(error,capacity,e);return nullptr;}
+}
+extern "C" void nuwax_scan_trajectory_destroy(void* p){delete static_cast<Curve*>(p);}
+extern "C" void nuwax_scan_trajectory_samples(const void* p,double from,double dt,ScanOutput* out) {
+  *out={};auto curve=*static_cast<const Curve*>(p);
+  std::copy(curve->sources,curve->sources+3,out->motion_boundary_sources);out->duration=std::max(0.,curve->duration()-from);
+  out->reference_progress=curve->reference_progress;out->reference_duration=curve->reference_duration;
+  const auto end=curve->local_target;for(int i=0;i<3;++i)out->local_target[i]=end[i];
+  out->sample_count=std::ceil(out->duration/dt)+1;out->samples=static_cast<ScanSample*>(std::calloc(out->sample_count,sizeof(ScanSample)));
+  double yaw=0.;for(size_t i=0;i<out->sample_count;++i){auto& x=out->samples[i];x.time=std::min(out->duration,i*dt);const double t=std::min(curve->duration(),from+x.time);const auto pos=curve->position.evaluateDeBoorT(t),v=curve->velocity.evaluateDeBoorT(t),a=curve->acceleration.evaluateDeBoorT(t);if(v.head<2>().squaredNorm()>1e-8)yaw=std::atan2(v[1],v[0]);for(int j=0;j<3;++j){x.position[j]=pos[j];x.velocity[j]=v[j];x.acceleration[j]=a[j];}x.yaw=yaw;}
+}
+extern "C" void* nuwax_scan_tracker_create(){return new TrackerSession;}
+extern "C" void nuwax_scan_tracker_destroy(void* p){delete static_cast<TrackerSession*>(p);}
+extern "C" void nuwax_scan_tracker_clear(void* p){auto& s=*static_cast<TrackerSession*>(p);s.curve.reset();s.pending.reset();s.controller.receive_traj=false;s.phase=0.;}
+extern "C" void nuwax_scan_tracker_install(void* p,const void* curve){auto& s=*static_cast<TrackerSession*>(p);s.pending=*static_cast<const Curve*>(curve);}
+extern "C" void nuwax_scan_tracker_track(void* p,const ScanConfig* c,const void* snapshot,const ScanState* state,
+    const double previous[3],double terminal_yaw,ScanTrackOutput* out,ScanOutput* recovery,char* error,size_t capacity) {
+  *out={};*recovery={};scan_native_diagnostic.clear();try {
+    auto& s=*static_cast<TrackerSession*>(p);s.map.bindCollisionSnapshot(*static_cast<const Snapshot*>(snapshot));ros::host_time_seconds=state->timestamp_ns*1e-9;
+    const Vector3d position=Eigen::Map<const Vector3d>(state->position);const double yaw=state->yaw,cs=std::cos(yaw),sn=std::sin(yaw);
+    std::pair<double,double> installed_projection;
+    if(s.pending){
+      const auto projected=s.pending->project(position,state->route_progress);
+      if(projected.second<=std::max(MINIMUM_DEVIATION_M,2.*c->resolution)){
+        s.curve=std::move(s.pending);s.install_pending=true;out->installed=1;installed_projection=projected;
+      }else{s.pending.reset();out->reason=64;}
     }
-    s.controller.cmdCallback({});s.last_control=odometry_timestamp_ns;s.last_position=position;s.last_yaw=start_yaw;
-   }
-  } else if(std::isfinite(goal_yaw)) {
-   s.command_target=position;s.command_target_yaw=goal_yaw;
-   // Preserve existing explicit user polygon/forbidden policy for this outer operation.
-   if(business->rejects(position,start_yaw))throw std::runtime_error("Terminal orientation is outside the explicit user boundary or forbidden mask");
-   // Explicit terminal orientation is an outer NEH business operation, not a
-   // replacement goal in author mode 3. Keep the existing calibrated braking law.
-   const double remaining=angle(goal_yaw-start_yaw),step=c.max_yaw_acceleration*c.sample_dt;
-   s.raw_command={};s.raw_command.angular.z=std::copysign(std::min(c.max_yaw_rate,std::sqrt(step*step+2*c.max_yaw_acceleration*std::abs(remaining))-step),remaining);
-  } else s.raw_command={};
-  const double vx=std::clamp(s.raw_command.linear.x,-c.max_reverse_velocity,c.max_velocity);
-  const double vy=std::clamp(s.raw_command.linear.y,-c.max_lateral_velocity,c.max_lateral_velocity);
-  Eigen::Vector2d target(cs*vx-sn*vy,sn*vx+cs*vy),delta=target-command_v;
-  const double step=c.max_acceleration*c.sample_dt;if(delta.norm()>step)delta*=step/delta.norm();
-  const Eigen::Vector2d chosen=command_v+delta;
-  // 变回机体系后兑现实际通道边界；坐标旋转舍入不能生成被声明为零的横移或倒退。
-  output->command_forward=std::clamp(cs*chosen.x()+sn*chosen.y(),-c.max_reverse_velocity,c.max_velocity);
-  output->command_lateral=std::clamp(-sn*chosen.x()+cs*chosen.y(),-c.max_lateral_velocity,c.max_lateral_velocity);
-  output->command_yaw_rate=std::clamp(s.raw_command.angular.z,actual_w-c.max_yaw_acceleration*c.sample_dt,actual_w+c.max_yaw_acceleration*c.sample_dt);
-  output->command_duration=c.sample_dt;output->replanned=s.plans!=previous_plans;
-  output->execution_cycle_complete=s.cycle_complete&&reference_count>=2;
-  output->execution_failed=s.execution_failed&&reference_count>=2;
-  // Author safetyTick can enter EMERGENCY after this tick's FSM callback.
-  // Retire only the exported old motion here; the original FSM still owns its
-  // next-tick emergency trajectory, recovery branch and retry budget.
-  const bool execution_retired=output->execution_cycle_complete||output->execution_failed||(reference_count>=2&&s.fsm->emergencyStopping());
-  if(execution_retired){output->command_forward=0.;output->command_lateral=0.;output->command_yaw_rate=0.;}
-  bool command_waiting=false;
-  if(!execution_retired) {
-   const Eigen::Vector2d preferred(output->command_forward,output->command_lateral);
-   const double preferred_w=output->command_yaw_rate;
-   const auto checked=scan_planner::checkAuthorCommand(*map,c,position,start_yaw,actual_v,actual_w,
-       command_v,
-       preferred,preferred_w,
-       s.command_target,s.command_target_yaw,reference_count>=2&&s.controller.receive_traj);
-   // 几何修正动作尚未执行原轨迹，曲线暂停；实测位置仍可真实移动。
-   s.command_paused=(!checked.found&&checked.exhausted)||checked.limited;
-   if(checked.found) {
-    output->command_forward=checked.linear.x();output->command_lateral=checked.linear.y();
-    output->command_yaw_rate=checked.angular;
-   } else {
-    // 计算不足先归零等待，不把资源不足写成几何不可达。
-    output->command_forward=output->command_lateral=output->command_yaw_rate=0.;
-    command_waiting=checked.exhausted;
-   }
-   if(s.controller.receive_traj&&reference_count>=2) {
-    if(s.command_paused&&control_called)s.controller.exec_time=control_time_before;
-    // 同一拥有者同步原曲线时钟；真实里程计时间与位置始终不改。
-    s.fsm->manager().local_data_.start_time_=ros::Time(ros::Time::now().toSec()-s.controller.exec_time);
-   }
-   s.fsm->onFrozen(s.command_paused);
-   if(scan_planner::authorTraceEnabled()&&(checked.hard_limited||checked.limited||command_waiting)) {
-    auto out=scan_planner::authorTraceStream();
-    out<<"{\"event\":\"command_geometry\",\"stamp_ns\":"<<odometry_timestamp_ns
-       <<",\"paused\":"<<s.command_paused<<",\"waiting\":"<<command_waiting
-       <<",\"proof_exhausted\":"<<checked.exhausted
-       <<",\"hard_limited\":"<<checked.hard_limited
-       <<",\"actual_world_velocity\":["<<actual_v.x()<<','<<actual_v.y()<<"]"
-       <<",\"actual_yaw_rate\":"<<actual_w
-       <<",\"preferred_command\":["<<preferred.x()<<','<<preferred.y()<<','<<preferred_w<<"]"
-       <<",\"controller_active\":"<<s.controller.receive_traj
-       <<",\"trajectory_id\":"<<s.controller.traj_id
-       <<",\"braking_translation\":"<<checked.hold_translation
-       <<",\"command\":["<<output->command_forward<<','<<output->command_lateral<<','<<output->command_yaw_rate<<"]}\n";
-   }
-   if(!checked.found&&!checked.exhausted)
-    throw std::runtime_error("Current motion and braking sweep intersect the body collision map");
-  } else {s.command_paused=false;s.fsm->onFrozen(false);}
-  s.previous_control={output->command_forward,output->command_lateral};
-  s.previous_w=output->command_yaw_rate;s.has_control=true;
-  output->motion_boundary_sources[0]=s.fsm->startVelocitySource();output->motion_boundary_sources[1]=s.fsm->startAccelerationSource();output->motion_boundary_sources[2]=std::isfinite(start_yaw_rate)?0u:3u;
-  auto& manager=s.fsm->manager();
-  if(!s.reference.empty()){output->reference_progress=manager.global_data_.last_progress_time_;output->reference_duration=manager.global_data_.global_duration_;copy(output->local_target,s.controller.receive_traj?s.fsm->localTarget():s.fsm->originalGoal());}
-  if(s.controller.receive_traj&&reference_count>=2&&!execution_retired&&!s.command_paused&&!command_waiting){
-   const double begin=s.controller.exec_time,end=s.controller.traj_duration;output->duration=std::max(0.,end-begin);
-   output->sample_count=static_cast<size_t>(std::ceil(output->duration/c.sample_dt))+1;
-   output->samples=static_cast<ScanSample*>(std::calloc(output->sample_count,sizeof(ScanSample)));if(!output->samples)throw std::bad_alloc();
-   for(size_t i=0;i<output->sample_count;++i){auto& sample=output->samples[i];sample.time=std::min(output->duration,i*c.sample_dt);const double t=begin+sample.time;
-    copy(sample.position,s.controller.traj[0].evaluateDeBoorT(t));copy(sample.velocity,s.controller.traj[1].evaluateDeBoorT(t));copy(sample.acceleration,s.controller.traj[2].evaluateDeBoorT(t));sample.yaw=s.controller.estimateDesiredYaw(t,Eigen::Map<const Vector3d>(sample.position));sample.yaw_rate=0.;}
-  }
-  if(scan_planner::authorTraceEnabled()&&(state_before!=s.fsm->state()||previous_plans!=s.plans)) {
-   auto out=scan_planner::authorTraceStream();auto& local=manager.local_data_;
-   out<<"{\"event\":\"session_transition\",\"stamp_ns\":"<<odometry_timestamp_ns<<",\"from\":"<<state_before<<",\"to\":"<<s.fsm->state()<<",\"has_target\":"<<s.fsm->hasTarget()<<",\"published_curves\":"<<s.plans<<",\"trajectory_id\":"<<local.traj_id_<<",\"curve_start\":"<<(s.controller.receive_traj?local.start_time_.toSec():0.)<<",\"curve_duration\":"<<(s.controller.receive_traj?local.duration_:0.)<<",\"global_duration\":"<<manager.global_data_.global_duration_<<",\"global_progress_t\":"<<manager.global_data_.last_progress_time_<<",\"actual_position\":";scan_planner::traceMatrix(out,position);
-   out<<",\"original_goal\":";scan_planner::traceMatrix(out,s.fsm->originalGoal());
-   if(s.controller.receive_traj){out<<",\"curve_first\":";scan_planner::traceMatrix(out,local.position_traj_.evaluateDeBoorT(0.));out<<",\"curve_last\":";scan_planner::traceMatrix(out,local.position_traj_.evaluateDeBoorT(local.duration_));out<<",\"curve_end_velocity\":";scan_planner::traceMatrix(out,local.velocity_traj_.evaluateDeBoorT(local.duration_));out<<",\"curve_end_acceleration\":";scan_planner::traceMatrix(out,local.acceleration_traj_.evaluateDeBoorT(local.duration_));out<<",\"controller_exec_time\":"<<s.controller.exec_time;}
-   out<<"}\n";
-  }
-  (void)start_acceleration;return 0;
- } catch(const std::exception& e){if(error_capacity){std::strncpy(error,e.what(),error_capacity-1);error[error_capacity-1]=0;}nuwax_scan_free(output);return 1;}
+    const Eigen::Vector2d command_world(cs*previous[0]-sn*previous[1],sn*previous[0]+cs*previous[1]);
+    const Eigen::Vector2d actual=state->measured_velocity?Eigen::Map<const Vector3d>(state->velocity).head<2>().eval():command_world;
+    const double angular=state->measured_yaw_rate?state->yaw_rate:previous[2];
+    const int occupied=s.map.getInflateOccupancy(position,yaw);
+    if(occupied!=0) {
+      if(occupied==1 && !std::isfinite(terminal_yaw) && !(static_cast<const Snapshot*>(snapshot)->get()->business && static_cast<const Snapshot*>(snapshot)->get()->business(position,yaw))) {
+        s.escape.plan(s.map,*c,position,yaw,state->measured_velocity?state->velocity:nullptr,state->measured_yaw_rate?state->yaw_rate:std::numeric_limits<double>::quiet_NaN(),state->timestamp_ns,*recovery);
+        s.curve.reset();out->reason=1;
+        out->command[0]=recovery->command_forward;out->command[1]=recovery->command_lateral;out->command[2]=recovery->command_yaw_rate;return;
+      }
+      throw std::runtime_error("Current body pose is occupied or outside the explicit user boundary or forbidden mask or surface collision map");
+    }
+    s.escape.observeClear(position,c->resolution);
+    Vector3d target=position;double desired_yaw=yaw;
+    if(std::isfinite(terminal_yaw)) {
+      const double diff=std::atan2(std::sin(terminal_yaw-yaw),std::cos(terminal_yaw-yaw)),step=c->max_yaw_acceleration*c->sample_dt;
+      s.raw={};s.raw.angular.z=std::copysign(std::min(c->max_yaw_rate,std::sqrt(step*step+2*c->max_yaw_acceleration*std::abs(diff))-step),diff);desired_yaw=terminal_yaw;
+    }else {
+      if(!s.curve){out->reason|=1;return;}
+      else {
+      const auto projection=out->installed?installed_projection:s.curve->project(position,state->route_progress);s.phase=projection.first;out->deviation=projection.second;
+      if(out->deviation>std::max(MINIMUM_DEVIATION_M,2.*c->resolution)){out->reason|=2;s.curve.reset();return;}
+      out->remaining=std::max(0.,s.curve->duration()-s.phase);out->phase=s.phase;
+      if(out->remaining<=0.){out->reason|=4;s.curve.reset();return;}
+      if(s.install_pending){s.controller.bsplineCallback(std::make_shared<const scan_planner::Bspline>(s.curve->spline));s.install_pending=false;}
+      s.controller.configure(std::max(c->max_velocity,c->max_reverse_velocity),c->max_lateral_velocity,c->max_yaw_rate);
+      s.controller.odomCallback(odometry(*state));s.controller.exec_time=s.phase;s.controller.last_update_time=ros::Time(ros::Time::now().toSec()-c->sample_dt);
+      const auto before=s.curve->position.evaluateDeBoorT(s.phase);desired_yaw=s.controller.estimateDesiredYaw(s.phase,before);
+      target=s.curve->position.evaluateDeBoorT(std::min(s.curve->duration(),s.phase+s.controller.time_forward));s.controller.cmdCallback({});
+      if(out->remaining<=REPLAN_REMAINING_SECONDS)out->reason|=16;
+      }
+    }
+    const double vx=std::clamp(s.raw.linear.x,-c->max_reverse_velocity,c->max_velocity),vy=std::clamp(s.raw.linear.y,-c->max_lateral_velocity,c->max_lateral_velocity);
+    Eigen::Vector2d preferred_world(cs*vx-sn*vy,sn*vx+cs*vy),delta=preferred_world-command_world;const double step=c->max_acceleration*c->sample_dt;
+    if(delta.norm()>step)delta*=step/delta.norm();const auto chosen=(command_world+delta).eval();
+    const Eigen::Vector2d preferred(std::clamp(cs*chosen.x()+sn*chosen.y(),-c->max_reverse_velocity,c->max_velocity),std::clamp(-sn*chosen.x()+cs*chosen.y(),-c->max_lateral_velocity,c->max_lateral_velocity));
+    const double w=std::clamp(s.raw.angular.z,angular-c->max_yaw_acceleration*c->sample_dt,angular+c->max_yaw_acceleration*c->sample_dt);
+    const auto checked=scan_planner::checkAuthorCommand(s.map,*c,position,yaw,actual,angular,command_world,preferred,w,target,desired_yaw,bool(s.curve)&&!std::isfinite(terminal_yaw));
+    out->limited=checked.limited;if(!checked.found){out->reason=8;s.curve.reset();return;}
+    out->command[0]=checked.linear.x();out->command[1]=checked.linear.y();out->command[2]=checked.angular;
+    if(scan_planner::authorTraceEnabled()){auto trace=scan_planner::authorTraceStream();trace<<"{\"event\":\"track\",\"phase\":"<<out->phase<<",\"remaining\":"<<out->remaining<<",\"reason\":"<<out->reason<<"}\n";}
+  }catch(const std::exception& e){errorText(error,capacity,e);out->reason=std::string(e.what()).find("BODY_OVERLAP_RECOVERY_FAILED")!=std::string::npos?32:8;}
 }
-extern "C" int nuwax_scan_plan(SCAN_ARGUMENTS){return nuwax_scan_session_plan(nullptr,SCAN_FORWARD);}
-extern "C" void* nuwax_scan_session_create(){return new(std::nothrow) AuthorSession;}
-extern "C" void nuwax_scan_session_destroy(void* p){delete static_cast<AuthorSession*>(p);}
-extern "C" void nuwax_scan_session_reset(void* p){if(p){auto* s=static_cast<AuthorSession*>(p);const bool fixture=s->static_fixture;const bool enabled=s->local_enabled;const auto plans=s->plans;*s=AuthorSession{};s->static_fixture=fixture;s->local_enabled=enabled;s->plans=plans;}}
-extern "C" void nuwax_scan_session_notify_source_changed(void* p){if(p)static_cast<AuthorSession*>(p)->safety_dirty=true;}
-extern "C" void nuwax_scan_session_reset_execution(void* p){if(p)static_cast<AuthorSession*>(p)->retireExecution();}
-extern "C" int nuwax_scan_session_configure(void* p,const ScanConfig* config,int* map_rebuilt,char* error,size_t capacity){
- if(!p||!config||!map_rebuilt)return 1;
- try{*map_rebuilt=static_cast<AuthorSession*>(p)->configure(*config)?1:0;return 0;}
- catch(const std::exception& e){if(capacity){std::strncpy(error,e.what(),capacity-1);error[capacity-1]=0;}return 1;}
-}
-extern "C" void nuwax_scan_session_set_local_planning(void* p,int enabled){if(p)static_cast<AuthorSession*>(p)->local_enabled=enabled!=0;}
-extern "C" uint64_t nuwax_scan_session_plan_count(const void* p){return p?static_cast<const AuthorSession*>(p)->plans:0;}
-extern "C" void nuwax_scan_session_set_static_fixture(void* p,int enabled){if(p)static_cast<AuthorSession*>(p)->static_fixture=enabled!=0;}
-extern "C" void nuwax_scan_free(ScanOutput* p){std::free(p->samples);p->samples=nullptr;p->sample_count=0;}
-
-extern "C" int nuwax_scan_session_ingest_registered_frame(void* p,const ScanConfig* config,const double* points,size_t count,
- const double origin[3],const double body_position[3],int64_t timestamp) {
- return nuwax_scan_session_ingest_registered_frame_with_ground(p,config,points,count,nullptr,0,origin,body_position,timestamp);
-}
-extern "C" int nuwax_scan_session_ingest_registered_frame_with_ground(void* p,const ScanConfig* config,const double* points,size_t count,
- const uint32_t* ground_members,size_t ground_count,const double origin[3],const double body_position[3],int64_t timestamp) {
- if(!p||!config||!origin||!body_position||(count&&!points)||(ground_count&&!ground_members))return 1;
- auto& s=*static_cast<AuthorSession*>(p);
- RegisteredFrame f;f.origin=Eigen::Map<const Vector3d>(origin);f.body=Eigen::Map<const Vector3d>(body_position);
- // All points already use map axes. Identity denotes that coordinate basis,
- // not an invented sensor attitude; A never rotates world-mode points.
- f.orientation=Eigen::Quaterniond::Identity();
- if(!f.origin.allFinite()||!f.body.allFinite())return 1;
- f.timestamp=timestamp;f.points.reserve(count);
- for(size_t i=0;i<count;++i)f.points.emplace_back(Eigen::Map<const Vector3d>(points+i*3));
- std::vector<std::uint32_t> members;
- if(ground_count)members.assign(ground_members,ground_members+ground_count);
- try {
-  s.configure(*config);
-  if(!s.fsm->manager().grid_map_->ingestLidarFrame(f.points,f.origin,f.orientation,f.body,members))return 1;
-  s.frame=std::move(f);s.has_frame=true;s.safety_dirty=true;return 0;
- } catch(const std::exception&) {return 1;}
-}
+extern "C" void nuwax_scan_free(ScanOutput* out){std::free(out->samples);out->samples=nullptr;out->sample_count=0;}

@@ -1,5 +1,8 @@
 //! 复放真实调用输入，保留所有感知、姿态、包络和运动能力。
-use nuwax_nav_scan_native::{plan, Config, PlanRequest};
+use nuwax_nav_scan_native::*;
+#[path="../src/numerical_fixture.rs"] mod fixture;
+use fixture::PlanRequest;
+fn plan(r:&PlanRequest<'_>)->Result<fixture::PlanResult,String>{let mut fixture=fixture::Planner::new();fixture.set_static_map_fixture(true);fixture.step(r)}
 use serde_json::{json, Value};
 use std::{fs, time::Instant};
 fn main() {

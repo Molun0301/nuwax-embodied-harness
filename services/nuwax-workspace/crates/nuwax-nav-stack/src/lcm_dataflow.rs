@@ -1270,7 +1270,7 @@ where
     #[cfg(feature="mls")]
     let mut recent_source=surface_dataflow::RecentSourceState::new(recent_source_max_age);
     if recent_source_max_age.is_some() {
-        scheduler.update_obstacle_source(None,false,None).await
+        scheduler.update_obstacle_source(None,false).await
             .map_err(|error|module_error("recent source initial health",error))?;
     }
     let mut planar_admission=nuwax_codec::lcm::planar_navigation::Admission::default();

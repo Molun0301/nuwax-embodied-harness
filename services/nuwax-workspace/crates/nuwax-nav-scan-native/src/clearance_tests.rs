@@ -141,7 +141,8 @@ fn g1_doorway_clearance_case(length: f64, width: f64, gap: f64, oblique: bool) {
         let dt = out.command_duration;
         assert!(
             (next[0] - previous[0]).hypot(next[1] - previous[1])
-                <= req.config.max_acceleration * dt + 1e-8
+                <= req.config.max_acceleration * dt + 1e-8,
+            "tick={tick},pose={:?},old={previous:?},new={next:?},phase={},plans={}",req.start_position,planner.phase,planner.plan_count()
         );
         assert!(
             (out.command_yaw_rate - req.start_yaw_rate.unwrap()).abs()

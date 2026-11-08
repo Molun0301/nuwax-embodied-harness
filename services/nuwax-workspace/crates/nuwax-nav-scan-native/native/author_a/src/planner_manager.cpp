@@ -245,13 +245,12 @@ namespace scan_planner
 
   SCANPlannerManager::~SCANPlannerManager() { std::cerr << "des manager" << std::endl; }
 
-  void SCANPlannerManager::initPlanModules(ros::NodeHandle &nh, PlanningVisualization::Ptr vis)
+  void SCANPlannerManager::initPlanModules(ros::NodeHandle &nh, PlanningVisualization::Ptr vis, GridMap::Ptr map)
   {
     refreshParameters(nh);
 
     local_data_.traj_id_ = 0;
-    grid_map_.reset(new GridMap);
-    grid_map_->initMap(nh);
+    grid_map_ = std::move(map);
 
     bspline_optimizer_rebound_.reset(new BsplineOptimizer);
     bspline_optimizer_rebound_->setParam(nh);

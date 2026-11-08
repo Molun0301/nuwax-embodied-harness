@@ -222,6 +222,7 @@ futures = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt", "time", "macros", "process", "io-util", "signal"] }
 
 [dev-dependencies]
+nuwax-nav-scan-native = { path = "../nuwax-nav-scan-native" }
 nuwax-config = { path = "../nuwax-config", features = ["test-support"] }
 
 nuwax-motion-safety-guard = { path = "../nuwax-motion-safety-guard" }

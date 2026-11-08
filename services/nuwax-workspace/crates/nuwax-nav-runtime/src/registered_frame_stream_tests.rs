@@ -38,7 +38,7 @@ fn behind_stream_wall(point:[f64;3])->bool {
 async fn registered_stream_diagnostic(occlusion_consistent:bool) {
     let (config,base)=crate::native_test_helpers::fixture();
     let follower=SurfaceFollower::new(config).unwrap(); // production raw-frame mode
-    let worker=planner_worker::PlannerWorker::new(follower).unwrap();
+    let worker=follower;
     let measured=Arc::new(Mutex::new(crate::motion_feedback::tests::measured([0.;3],[0.;3])));
     let issued=Arc::new(Mutex::new(Vec::new()));
     let port=RegisteredStreamMotion {inner:FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))),
@@ -46,7 +46,7 @@ async fn registered_stream_diagnostic(occlusion_consistent:bool) {
     let scheduler=NavScheduler::new(port,worker,SchedulerConfig::default()).unwrap();
     let (handle,task)=spawn_scheduler(scheduler);
     let mut pose=map_pose();pose.pose.position=nuwax_nav_types_messages::Point3::new(0.5,1.,0.5);
-    pose.stamp.nanos=crate::command_dispatch::unix_ns().unwrap() as i64;
+    pose.stamp.nanos=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64 as i64;
     handle.update_odometry(pose.clone()).await.unwrap();
     handle.update_costmap(CostmapObservation{costmap:ExecutionMap::Surface(base.clone()),source_timestamp_ns:pose.stamp.nanos}).await.unwrap();
     let mut goal=pose.clone();goal.pose.position.x=3.;
@@ -60,7 +60,7 @@ async fn registered_stream_diagnostic(occlusion_consistent:bool) {
     let mut timeline=Vec::new();
     for tick in 0..60_i64 {
         tokio::time::sleep_until(tokio::time::Instant::from_std(began+Duration::from_millis(tick as u64*50))).await;
-        let stamp=crate::command_dispatch::unix_ns().unwrap();
+        let stamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
         pose.stamp.nanos=stamp as i64;
         let mut observation=crate::motion_feedback::tests::measured([0.;3],[0.;3]);
         observation.source_timestamp_ns=stamp;
@@ -82,20 +82,18 @@ async fn registered_stream_diagnostic(occlusion_consistent:bool) {
         }
         let next=Arc::new(snapshot.with_recent_obstacle_points(tick as u64+1,stamp,250_000_000,&labels,
             points.iter().copied().enumerate().map(|(i,p)|(i as u32,p))).unwrap());
-        let bound=CommandDispatchBound::from_source_timestamp(stamp,Duration::from_millis(250));
         let mut frame=(*crate::registered_frame::test_frame(tick+1)).clone();
         frame.identity.timestamp_ns=stamp as i64;frame.points_world=points.into();
         frame.paired_odometry_timestamp_ns=stamp as i64;
-        frame.dispatch_bound=Some(bound);
         handle.update_registered_obstacle_source(Some(ExecutionMap::SurfaceUpdate(crate::surface_changes::SurfaceMapUpdate {
             snapshot:next.clone(),change_basis:Some(snapshot),changes:Arc::new(crate::surface_changes::SurfaceGeometryChanges::Empty),
-        })),true,Some(bound),Some(Arc::new(frame))).await.unwrap();
+        })),true,Some(Arc::new(frame))).await.unwrap();
         snapshot=next;
         let status=handle.status();
         timeline.push((tick,status.phase,status.last_applied_twist,status.message));
         if status.last_terminal.is_some() {break;}
     }
-    handle.update_registered_obstacle_source(None,false,None,None).await.unwrap();
+    handle.update_registered_obstacle_source(None,false,None).await.unwrap();
     let terminal=wait_for_input_pause(&handle).await;
     assert_eq!(terminal.last_applied_twist,Some(Twist2::ZERO));
 

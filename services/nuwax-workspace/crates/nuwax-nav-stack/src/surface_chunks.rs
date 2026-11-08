@@ -605,43 +605,40 @@ mod tests {
                     let end_x=if aligned {0.5}else{0.65};
                     let mut current=body(-end_x);let goal=body(end_x);let mut time=1_000_000_000;
                     let route=crate::surface_oriented::plan(&map,current,goal,options,0.4,&[]).unwrap();
-                    let mut config=SurfaceFollowerConfig::new(0.4);config.controller.speed=0.3;
-                    config.controller.control_frequency=20.0;config.controller.simulation=true;
-                    config.motion_limits=Some(motion.clone());config.max_angular_speed_rps=0.8;
-                    let mut follower=SurfaceFollower::new(config).unwrap();
-                    follower.enable_author_static_map_fixture(true); // Explicit static test input, never a production fallback.
-                    follower.configure_goal(&stamped(goal,time),options).unwrap();
-                    follower.update_execution_map(ExecutionMap::Surface(Arc::clone(&map))).unwrap();
-                    follower.update_odometry(stamped(current,time));
-                    follower.replace_execution_path(ExecutionPath::Surface(Path3D {
-                        poses:route.iter().copied().map(|p|stamped(p,time)).collect()}),None,stamped(goal,time)).unwrap();
+                    // 此用例验证细地图/PCT（点云地形规划器）/SCAN（局部样条规划器）的数值闭环，
+                    // 显式串行驱动地图、规划、跟踪三接口；不把初始化耗时充当物理时间。
+                    let native=nuwax_nav_runtime::native_map::from_surface(&map).unwrap();
+                    let reference:Vec<_>=route.iter().map(|p|p.0).collect();
+                    let mut config=SurfaceFollowerConfig::new(0.4).scan;
+                    config.resolution=map.navigation_source_columns(None).0;
+                    config.body_length=0.6;config.body_width=width;config.body_height=0.3;
+                    config.body_z_min=-0.15;config.body_z_max=0.15;
+                    config.max_velocity=0.3;config.max_reverse_velocity=0.3;config.max_lateral_velocity=0.3;
+                    config.max_acceleration=1.;config.max_yaw_rate=0.8;config.max_yaw_acceleration=2.;
+                    config.max_step_up=0.;config.max_step_down=0.;config.max_slope=18_f64.to_radians();config.sample_dt=0.05;
+                    let mut follower=crate::scan_numerical_fixture::Planner::new();follower.set_static_map_fixture(true);
+                    let mut request=crate::scan_numerical_fixture::PlanRequest {
+                        obstacles:&native.obstacles,ground:&native.static_collision_ground,reference:&reference,
+                        start_position:current.0,start_velocity:Some([0.;3]),start_acceleration:None,start_yaw:heading,
+                        start_yaw_rate:Some(0.),odometry_timestamp_ns:time,config,boundary:&[],
+                        forbidden_columns:&native.forbidden_columns,goal_yaw:None,
+                    };
                     let mut applied=Twist2::ZERO;let mut reached=false;let mut passed_opening=false;
                     let mut inputs=Vec::new();
                     for tick in 0..240 {
-                        // 速度来自下方独立运动响应积分器，命令回执不充当测速。
-                        follower.observe_measured_motion(Some(nuwax_nav_runtime::MeasuredMotion {
-                            source_id:"doorway:integrated-body".into(),source_timestamp_ns:time as u64,
-                            received_monotonic_ns:nuwax_nav_runtime::motion_feedback::monotonic_ns(),
-                            valid_until_monotonic_ns:u64::MAX,frame_id:"base_link".into(),
-                            body_linear_xyz:[applied.linear.x,applied.linear.y,0.],
-                            body_angular_xyz:[0.,0.,applied.angular_z],
-                            orientation_wxyz:Some([current.1[3],current.1[0],current.1[1],current.1[2]]),
-                        }));
+                        let yaw=stamped(current,time).pose.orientation.yaw();
+                        request.start_position=current.0;request.start_yaw=yaw;request.odometry_timestamp_ns=time;
+                        request.start_velocity=Some([yaw.cos()*applied.linear.x-yaw.sin()*applied.linear.y,
+                            yaw.sin()*applied.linear.x+yaw.cos()*applied.linear.y,0.]);
+                        request.start_yaw_rate=Some(applied.angular_z);
                         if capture.is_some() {inputs.push((current,[applied.linear.x,applied.linear.y,applied.angular_z],time));}
-                        let mut arriving=false;
-                        let command=match follower.step() {
-                            PlannerStep::Command(command)=>command,
-                            PlannerStep::Succeeded=>{arriving=true;Twist2::ZERO},
-                            PlannerStep::ReplanRequired(_) if follower.execution_cycle_complete()=>{
-                                // 原作者周期结束沿生产语义重新请求原目标，仍计入同一240拍预算。
-                                let route=crate::surface_oriented::plan(&map,current,goal,options,0.4,&[])
-                                    .expect("本周期结束后应从实际位置接续原目标");
-                                follower.replace_execution_path(ExecutionPath::Surface(Path3D {
-                                    poses:route.into_iter().map(|p|stamped(p,time)).collect(),
-                                }),None,stamped(goal,time)).unwrap();
-                                Twist2::ZERO
-                            },
-                            other=>{
+                        let position_reached=(0..3).map(|i|(current.0[i]-goal.0[i]).powi(2)).sum::<f64>().sqrt()<options.position_tolerance_m;
+                        request.goal_yaw=position_reached.then_some(heading);
+                        let arriving=position_reached&&nuwax_nav_astar::controllers::angle_diff(heading,yaw).abs()<options.yaw_tolerance_rad;
+                        let command=match if arriving{Ok(Twist2::ZERO)}else{follower.step(&request).map(|out|Twist2 {
+                            linear:Point2::new(out.command_forward,out.command_lateral),angular_z:out.command_yaw_rate})} {
+                            Ok(command)=>command,
+                            Err(other)=>{
                                 if let Some(destination)=&capture {
                                     let envelope=map.body_envelope().unwrap();
                                     let cfg=map.config();
@@ -720,8 +717,8 @@ mod tests {
                             assert!(!body_intersects_wall(body,width,gap as f64*fine,fine),"实际积分机身撞门框：tick={tick} body={body:?} command={command:?}");
                         }
                         current=actual;applied=next_applied;time+=50_000_000;
-                        follower.observe_applied_command(applied);follower.update_odometry(stamped(current,time));
-                        // 跟随器只报告规划到达，模拟执行器仍真实制动到停稳后确认。
+                        follower.observe_applied([applied.linear.x,applied.linear.y,applied.angular_z]);
+                        // 业务到达直接返回；这里独立检验积分执行器的物理制动，不增加业务确认。
                         if arriving && applied.linear.x.hypot(applied.linear.y)<0.005 && applied.angular_z.abs()<0.01
                             && (current.0[0]-goal.0[0]).hypot(current.0[1]-goal.0[1])<options.position_tolerance_m {
                             eprintln!("窄门闭环通过 heading={heading} aligned={aligned} tick={tick} pose={current:?} actual={applied:?}");

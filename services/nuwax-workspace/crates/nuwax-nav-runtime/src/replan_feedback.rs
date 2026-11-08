@@ -23,9 +23,9 @@ pub struct SurfaceReplanFeedback {
     pub rejected_context: Option<Arc<ActualExecutionContext>>,
     /// 最新已消费的输入。
     pub current_context: Option<Arc<ActualExecutionContext>>,
-    /// 原归零链已经确认停车。
-    pub zero_confirmed_rejection: bool,
-    /// 原局部拒绝的具名原因，只在真实归零成功后随原路径发布。
+    /// 零速请求已被运动端接受，不表示实测停稳。
+    pub zero_sent_rejection: bool,
+    /// 原局部拒绝的具名原因，只在零速请求被接受后随原路径发布。
     pub rejection_reason: Option<String>,
 }
 /// 全局规划实际使用的输入。

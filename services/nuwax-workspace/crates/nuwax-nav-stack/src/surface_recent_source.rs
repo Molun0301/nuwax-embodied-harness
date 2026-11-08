@@ -1,6 +1,6 @@
 //! Independent live obstacle evidence. Persistent terrain never renews this source.
 use super::*;
-use nuwax_nav_runtime::{CommandDispatchBound,ExecutionMap,RegisteredFrame,RegisteredFrameDomain,RegisteredFrameIdentity};
+use nuwax_nav_runtime::{ExecutionMap,RegisteredFrame,RegisteredFrameDomain,RegisteredFrameIdentity};
 use nuwax_nav_runtime::surface_changes::SurfaceMapUpdate;
 
 pub(crate) struct RecentSourceState {
@@ -19,7 +19,7 @@ impl RecentSourceState {
         self.snapshot=None;
         self.latest=None;
         self.registered_frame=None;
-        scheduler.update_registered_obstacle_source(None,!self.enabled,None,None).await
+        scheduler.update_registered_obstacle_source(None,!self.enabled,None).await
     }
     pub(crate) fn attach_terrain(&mut self,map:Arc<SurfaceSnapshot>)->Arc<SurfaceSnapshot> {
         let map=if let Some(previous)=&self.snapshot {
@@ -46,11 +46,10 @@ impl RecentSourceState {
         let basis = self.snapshot.as_ref().ok_or("recent cloud has no ready terrain")?;
         let source_time = i64::from(cloud.header.stamp_sec) * 1_000_000_000
             + i64::from(cloud.header.stamp_nsec);
-        let bound = if let Some(age) = self.max_age {
+        if let Some(age) = self.max_age {
             guarded_pose_source_deadline(source_time, age, std::time::SystemTime::now(), tokio::time::Instant::now())
                 .map_err(|error| error.to_string())?;
-            Some(CommandDispatchBound::from_source_timestamp(source_time as u64, age))
-        } else { None };
+        }
         let points = point_cloud_from_schema(cloud).map_err(|error| error.to_string())?;
         let raw_points: Arc<[[f64; 3]]> = points.points.into_iter()
             .map(|p| [p.x, p.y, p.z]).collect::<Vec<_>>().into();
@@ -66,7 +65,6 @@ impl RecentSourceState {
             body_position_world: pose.body_position_map,
             body_orientation_xyzw: pose.body_orientation_xyzw,
             paired_odometry_timestamp_ns: pose.paired_odometry_timestamp_ns,
-            dispatch_bound: bound,
         }));
         let retention = self.max_age.map_or(0, |age| age.as_nanos().min(u128::from(u64::MAX)) as u64);
         let snapshot = Arc::new(basis.with_recent_obstacle_points(
@@ -75,7 +73,7 @@ impl RecentSourceState {
         ).map_err(|error| error.to_string())?);
         scheduler.update_registered_obstacle_source(Some(ExecutionMap::SurfaceUpdate(SurfaceMapUpdate {
             snapshot:snapshot.clone(),change_basis:Some(basis.clone()),changes:Arc::new(SurfaceGeometryChanges::Empty),
-        })),true,bound,registered_frame.clone()).await.map_err(|error|error.to_string())?;
+        })),true,registered_frame.clone()).await.map_err(|error|error.to_string())?;
         self.enabled=true;
         self.snapshot=Some(snapshot);
         self.registered_frame=registered_frame;
@@ -95,7 +93,7 @@ impl RecentSourceState {
         if let Some(update) = &update {
             self.snapshot = Some(update.snapshot.clone());
         }
-        scheduler.update_registered_obstacle_source(update.map(ExecutionMap::SurfaceUpdate), false, None, None)
+        scheduler.update_registered_obstacle_source(update.map(ExecutionMap::SurfaceUpdate), false, None)
             .await.map_err(|error| error.to_string())
     }
 }
@@ -187,7 +185,6 @@ mod tests {
         assert_eq!(frame.body_position_world,[4.,6.,8.]);
         assert_eq!(frame.paired_odometry_timestamp_ns,now);
         assert_eq!(frame.identity.domain.session_id, authority.session_id);
-        assert!(frame.dispatch_bound.is_some());
         state.consume(&recent_cloud::encode_body(&packet).unwrap(), Some(&authority), &handle).await.unwrap();
         assert!(Arc::ptr_eq(state.registered_frame.as_ref().unwrap(), &frame));
         state.attach_terrain(map);

@@ -130,7 +130,7 @@ namespace scan_planner
     {
     }
 
-    void init(ros::NodeHandle &nh);
+    void init(ros::NodeHandle &nh, GridMap::Ptr map);
     void retireExecution();
     void refreshParameters(ros::NodeHandle &nh);
     // Transport entrypoints. The owner schedules original timer callbacks.
@@ -139,6 +139,10 @@ namespace scan_planner
       travel_vel_=measured_velocity?travel_velocity:odom_vel_;
     }
     void onReferencePath(const nav_msgs::PathConstPtr& msg){pathCallback(msg);}
+    // 宿主按需发起规划，不在跟踪节拍里执行状态机。
+    void requestPlan(bool continuing) {
+      changeFSMExecState(continuing ? REPLAN_TRAJ : GEN_NEW_TRAJ, "HOST");
+    }
     void tick(){execFSMCallback(ros::TimerEvent{});}
     void safetyTick(){checkCollisionCallback(ros::TimerEvent{});}
     void onFrozen(bool value){auto msg=std::make_shared<std_msgs::Bool>();msg->data=value;go2ExecutionFrozenCallback(msg);}

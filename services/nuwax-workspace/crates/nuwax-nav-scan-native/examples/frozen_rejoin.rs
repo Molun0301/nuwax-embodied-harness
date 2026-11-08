@@ -1,6 +1,8 @@
 //! 历史差速迟到接回诊断，不是新全向控制的完整闭环验收。
 //! 保留原差速物理模型、实体墙与旋转矩形碰撞检查；侧移和倒退能力显式为零。
-use nuwax_nav_scan_native::{Config, PlanRequest, Planner};
+use nuwax_nav_scan_native::*;
+#[path="../src/numerical_fixture.rs"] mod fixture;
+use fixture::{PlanRequest,Planner};
 use serde_json::{json, Value};
 use std::{collections::BTreeSet, fs, path::PathBuf, time::Instant};
 

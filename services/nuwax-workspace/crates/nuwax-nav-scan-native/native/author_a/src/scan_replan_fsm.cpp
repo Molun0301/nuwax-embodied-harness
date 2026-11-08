@@ -25,14 +25,14 @@ namespace
 namespace scan_planner
 {
 
-  void SCANReplanFSM::init(ros::NodeHandle &nh)
+  void SCANReplanFSM::init(ros::NodeHandle &nh, GridMap::Ptr map)
   {
     retireExecution();
     refreshParameters(nh);
 
     visualization_.reset(new PlanningVisualization(nh));
     planner_manager_.reset(new SCANPlannerManager);
-    planner_manager_->initPlanModules(nh, visualization_);
+    planner_manager_->initPlanModules(nh, visualization_, std::move(map));
   }
 
   // Explicit host task retirement. Original callbacks and transition decisions remain unchanged.

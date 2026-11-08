@@ -1,7 +1,4 @@
-// Raw-zero yaw arrival qualification. The original early-arrival characterization
-// is preserved with its raw results outside this source; the migrated test now
-// requires no early event, and a separate actual stopped-drift test stays negative.
-// Real SurfaceFollower/scheduler; existing FakeMotion is only a memory proof port.
+// 零容差到达使用当拍实际位姿；FakeMotion 仅记录租约请求，不证明实测停稳。
 fn yaw_zero_pi_goal() -> nuwax_nav_types_messages::Quaternion {
     nuwax_nav_types_messages::Quaternion { x: 0.0, y: 0.0, z: 1.0, w: 0.0 }
 }
@@ -63,7 +60,7 @@ async fn yaw_zero_surface_scheduler(
     assert!(scheduler.obstacle_source_available);
     (scheduler, status, motion, actual)
 }
-async fn yaw_zero_observe_after_real_stop(
+async fn yaw_zero_observe_release(
     scheduler: &mut NavScheduler<FakeMotion, SurfaceFollower>,
     status: &watch::Sender<SchedulerStatus>, motion: &Arc<Mutex<FakeMotionState>>,
     _actual: PoseStamped,
@@ -75,7 +72,7 @@ async fn yaw_zero_observe_after_real_stop(
     assert_eq!(motion.lock().unwrap().calls.iter().filter(|c| c.starts_with("acquire:")).count(), 1);
 }
 #[tokio::test]
-async fn zero_yaw_antipode_real_surface_stopped_arrival_control() {
+async fn zero_yaw_antipode_real_surface_arrival_release_control() {
     let goal = yaw_zero_pi_goal();
     let actual = yaw_zero_antipode(goal);
     yaw_zero_record("strict antipode control", goal, actual);
@@ -84,7 +81,7 @@ async fn zero_yaw_antipode_real_surface_stopped_arrival_control() {
     assert_eq!(goal.yaw(), std::f64::consts::PI);
     assert_eq!(actual.yaw(), goal.yaw());
     let (mut scheduler, status, motion, pose) = yaw_zero_surface_scheduler(goal, actual).await;
-    yaw_zero_observe_after_real_stop(&mut scheduler, &status, &motion, pose).await;
+    yaw_zero_observe_release(&mut scheduler, &status, &motion, pose).await;
     assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::Succeeded));
     assert_eq!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));
 
@@ -105,7 +102,7 @@ async fn zero_yaw_real_surface_rejects_nonzero_residual_before_arrival_event() {
 }
 
 #[tokio::test]
-async fn zero_yaw_signed_pi_equivalent_real_surface_stopped_arrival_must_complete() {
+async fn zero_yaw_signed_pi_equivalent_real_surface_arrival_release_must_complete() {
     let goal = yaw_zero_pi_goal();
     // Exactly unit quaternion. Numerically equal to -goal; signed-zero choices
     // make both numerator terms negative zero in the real yaw extraction.
@@ -120,7 +117,7 @@ async fn zero_yaw_signed_pi_equivalent_real_surface_stopped_arrival_must_complet
     let delta = actual.yaw() - goal.yaw();
     assert_ne!(delta.sin().atan2(delta.cos()), 0.0);
     let (mut scheduler, status, motion, pose) = yaw_zero_surface_scheduler(goal, actual).await;
-    yaw_zero_observe_after_real_stop(&mut scheduler, &status, &motion, pose).await;
+    yaw_zero_observe_release(&mut scheduler, &status, &motion, pose).await;
     assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::Succeeded),
-        "the +/-PI representations of the same yaw must agree after physical-stop proof");
+        "the +/-PI representations of the same yaw must agree when the lease is released");
 }

@@ -90,7 +90,7 @@ fn device_limits_keep_real_positive_and_negative_yaw_overspeed_and_move() {
 fn device_limits_cover_both_linear_axes_when_measured_state_exceeds_them() {
     let route = [[0.,0.,0.35],[2.,0.,0.35]];
     for sign in [-1.,1.] {
-        let mut req=request(&route,&[]);device_limit_config(&mut req);
+        let mut req=request(&[],&[]);device_limit_config(&mut req);
         req.config.max_velocity=1.;req.config.max_reverse_velocity=0.5;
         req.start_velocity=Some([sign*1.2,sign*0.5,0.]);req.start_yaw_rate=Some(sign*0.35);
         let result=fixture_planner().step(&req).unwrap();

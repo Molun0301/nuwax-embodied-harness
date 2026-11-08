@@ -5,9 +5,7 @@ use std::sync::Arc;
 
 /// 显式声明本测试只提供静态地图，不冒充生产注册点云原帧。
 pub(crate) fn author_static_map_follower(config: SurfaceFollowerConfig) -> crate::SurfaceFollower {
-    let mut follower = crate::SurfaceFollower::new(config).unwrap();
-    follower.enable_author_static_map_fixture(true);
-    follower
+    crate::SurfaceFollower::with_map_initializer(config,Some(static_map)).unwrap()
 }
 
 pub(crate) fn fixture() -> (SurfaceFollowerConfig, Arc<SurfaceSnapshot>) {
@@ -43,4 +41,9 @@ pub(crate) fn fixture() -> (SurfaceFollowerConfig, Arc<SurfaceSnapshot>) {
         can_rotate_in_place: true,
     });
     (config, source)
+}
+
+fn static_map(map:&mut nuwax_nav_scan_native::MapOwner,obstacles:&[[f64;3]],ground:&[[f64;3]],boundary:&[[f64;2]],forbidden:&[[i32;2]],body:[f64;3])->Result<(),String>{
+    let points:Vec<_>=obstacles.iter().chain(ground).copied().collect();map.seed_occupied(&points,body);
+    map.update_surface(&[],&[],boundary,forbidden)
 }

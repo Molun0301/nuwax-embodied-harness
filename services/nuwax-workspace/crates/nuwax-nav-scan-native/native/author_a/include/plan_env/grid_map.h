@@ -42,7 +42,7 @@ struct matrix_hash : std::unary_function<T, size_t> {
 
 // constant parameters
 
-struct MappingParameters {
+struct CollisionParameters {
 
   /* map properties */
   Eigen::Vector3d map_origin_, map_size_;
@@ -50,12 +50,15 @@ struct MappingParameters {
   Eigen::Vector3i map_voxel_num_;                        // map range in index
   Eigen::Vector3i map_bound_min_idx_, map_bound_max_idx_;
   Eigen::Vector3i map_origin_idx_;
-  Eigen::Vector3d local_update_range_;
   double resolution_, resolution_inv_;
   double obstacles_inflation_z_up, obstacles_inflation_z_down;
   double double_cylinder_radius_, double_cylinder_offset_;
   double body_length_, body_width_;
   Eigen::Vector3d body_center_offset_; // Host physical reference -> body center, not A tuning.
+};
+
+struct MappingParameters : CollisionParameters {
+  Eigen::Vector3d local_update_range_;
   bool map_sliding_en_;
   double map_sliding_thresh_;
   int map_sliding_thresh_vox_;
@@ -93,18 +96,17 @@ struct MappingParameters {
 
 // intermediate mapping data for fusion
 
-struct MappingData {
-  // main map data, occupancy of each voxel and Euclidean distance
-
-  std::vector<double> occupancy_buffer_;
+struct CollisionData {
   std::vector<char> occupancy_buffer_inflate_;
-  std::vector<int> occupancy_buffer_inflate_cnt_;
-  // 原概率占据阈值的派生位图，布局按XY列分组，和原环形缓冲一同更新与清除。
   std::vector<std::uint64_t> occupancy_bits_;
-  int occupancy_words_per_column_;
-  // 只保存仍有原概率证据的同源地面成员；无条目表示未证明为纯支撑。
+  int occupancy_words_per_column_ = 0;
   std::unordered_map<int, double> support_member_max_z_;
-  vector<Eigen::Vector3i> inflate_offsets_;
+  std::vector<Eigen::Vector3i> inflate_offsets_;
+};
+
+struct MappingData : CollisionData {
+  std::vector<double> occupancy_buffer_;
+  std::vector<int> occupancy_buffer_inflate_cnt_;
 
   // raycast origin and sensor pose data
 
@@ -201,6 +203,30 @@ public:
       std::vector<BodyCell>*, const std::set<BodyCell>*, bool)>;
   void setSurfaceCollisionQuery(SurfaceContactQuery query) { surface_collision_query_ = std::move(query); }
 
+  // 快照只保留碰撞查询输入，两个会话不拥有第二份可变概率图。
+  struct CollisionSnapshot {
+    CollisionParameters parameters;
+    CollisionData collision;
+    BusinessConstraintQuery business;
+    BusinessEnvelopeQuery envelope;
+    SurfaceContactQuery surface;
+  };
+  std::shared_ptr<const CollisionSnapshot> collisionSnapshot() const {
+    return std::make_shared<const CollisionSnapshot>(CollisionSnapshot{
+        static_cast<const CollisionParameters&>(mp_), static_cast<const CollisionData&>(md_), business_constraint_query_,
+        business_envelope_query_, surface_collision_query_});
+  }
+  void bindCollisionSnapshot(std::shared_ptr<const CollisionSnapshot> snapshot) {
+    snapshot_ = std::move(snapshot);
+    static_cast<CollisionParameters&>(mp_) = snapshot_->parameters;
+    business_constraint_query_ = snapshot_->business;
+    business_envelope_query_ = snapshot_->envelope;
+    surface_collision_query_ = snapshot_->surface;
+  }
+  const CollisionData& collisionData() const {
+    return snapshot_ ? snapshot_->collision : static_cast<const CollisionData&>(md_);
+  }
+
   // One atomic LiDAR observation: points, sensor pose and body position MUST belong
   // to the same registered frame/correction generation. Identity/freshness checks
   // belong to the host boundary. world points are never transformed a second time.
@@ -252,6 +278,7 @@ public:
 private:
   MappingParameters mp_;
   MappingData md_;
+  std::shared_ptr<const CollisionSnapshot> snapshot_;
   // 仅静态夹具记录上次完整占据集合；生产原帧不使用此集合。
   std::set<std::array<int, 3>> static_cells_;
 
@@ -389,7 +416,11 @@ inline int GridMap::getOccupancy(Eigen::Vector3d pos) {
   Eigen::Vector3i id;
   posToIndex(pos, id);
 
-  return md_.occupancy_buffer_[toAddress(id)] > mp_.min_occupancy_log_ ? 1 : 0;
+  const int address = toAddress(id);
+  const auto& data = collisionData();
+  const int nz = mp_.map_voxel_num_.z(), z = address % nz;
+  return (data.occupancy_bits_[(address / nz) * data.occupancy_words_per_column_ + z / 64]
+      >> (z % 64)) & 1U;
 }
 
 inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos, double yaw) {
@@ -407,7 +438,7 @@ inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos, double yaw) {
     if (!isInMap(point)) return -1;
     Eigen::Vector3i id;
     posToIndex(point, id);
-    return static_cast<int>(md_.occupancy_buffer_inflate_[toAddress(id)]);
+    return static_cast<int>(collisionData().occupancy_buffer_inflate_[toAddress(id)]);
   };
   const int front = candidate(pos + mp_.double_cylinder_offset_ * heading);
   const int rear = candidate(pos - mp_.double_cylinder_offset_ * heading);
@@ -444,7 +475,7 @@ inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos, double yaw) {
         continue;
       // 位图与原概率阈值完全对应；环形Z范围仍按相同两段查询。
       const std::size_t column = getLocalIndex(x, 0) * mp_.map_voxel_num_.y() + getLocalIndex(y, 1);
-      const auto* bits = md_.occupancy_bits_.data() + column * md_.occupancy_words_per_column_;
+      const auto* bits = collisionData().occupancy_bits_.data() + column * collisionData().occupancy_words_per_column_;
       const auto occupied = [&](int begin, int count) {
         if (count == 0) return false;
         const int first_word = begin / 64, last_word = (begin + count - 1) / 64;
@@ -457,9 +488,9 @@ inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos, double yaw) {
           while (hits) {
             const int z = word * 64 + __builtin_ctzll(hits);
             const int address = static_cast<int>(column) * nz + z;
-            const auto member = md_.support_member_max_z_.find(address);
+            const auto member = collisionData().support_member_max_z_.find(address);
             // 原碰撞带不移动：只有真实支撑点全部低于下沿时，排除体素格顶放大的虚假相交。
-            if (member == md_.support_member_max_z_.end() || !(member->second < low))
+            if (member == collisionData().support_member_max_z_.end() || !(member->second < low))
               return true;
             hits &= hits - 1;
           }
@@ -499,7 +530,7 @@ inline int GridMap::bodyContacts(Eigen::Vector3d pos, double yaw, double padding
       if(std::abs(dx)>ex+half||std::abs(dy)>ey+half
           ||std::abs(c*dx+s*dy)>hx+half*(ac+as)||std::abs(-s*dx+c*dy)>hy+half*(ac+as))continue;
       const size_t column=getLocalIndex(x,0)*mp_.map_voxel_num_.y()+getLocalIndex(y,1);
-      const auto* bits=md_.occupancy_bits_.data()+column*md_.occupancy_words_per_column_;
+      const auto* bits=collisionData().occupancy_bits_.data()+column*collisionData().occupancy_words_per_column_;
       bool column_hit=false;
       // 与原查询一样按位图字跳过空高度段，不能让连续证明耗尽原计算预算。
       for(int z=z0;z<=z1;) {
@@ -509,9 +540,9 @@ inline int GridMap::bodyContacts(Eigen::Vector3d pos, double yaw, double padding
         auto hits=bits[local/64]&mask;
         while(hits) {
           const int lz=(local/64)*64+__builtin_ctzll(hits),global=z+lz-local;
-          const auto support=md_.support_member_max_z_.find(static_cast<int>(column)*nz+lz);
+          const auto support=collisionData().support_member_max_z_.find(static_cast<int>(column)*nz+lz);
           const BodyCell cell{x,y,global};
-          if((support==md_.support_member_max_z_.end()||!(support->second<low))
+          if((support==collisionData().support_member_max_z_.end()||!(support->second<low))
               &&(!initial||!initial->count(cell))) {
             found=true;if(!contacts)return 1;
             contacts->push_back(cell);
@@ -579,10 +610,10 @@ inline int GridMap::getAuthorInflateOccupancy(Eigen::Vector3d pos, double yaw) {
   Eigen::Vector3d front = pos + mp_.double_cylinder_offset_ * heading;
   Eigen::Vector3d rear = pos - mp_.double_cylinder_offset_ * heading;
 
-  int front_occ = getInflateOccupancyFromBuffer(front, md_.occupancy_buffer_inflate_);
+  int front_occ = getInflateOccupancyFromBuffer(front, collisionData().occupancy_buffer_inflate_);
   if (front_occ != 0) return front_occ;
 
-  return getInflateOccupancyFromBuffer(rear, md_.occupancy_buffer_inflate_);
+  return getInflateOccupancyFromBuffer(rear, collisionData().occupancy_buffer_inflate_);
 }
 
 inline int GridMap::getInflateOccupancyFromBuffer(Eigen::Vector3d pos, const std::vector<char>& buffer) {
@@ -600,7 +631,7 @@ inline int GridMap::getInflateOccupancyFromBuffer(Eigen::Vector3d pos, const std
   // Positive-volume intersection is required; no epsilon or shifted surface.
   const double low = pos.z() - mp_.obstacles_inflation_z_up;
   const double high = pos.z() + mp_.obstacles_inflation_z_down;
-  for (const auto& offset : md_.inflate_offsets_) {
+  for (const auto& offset : collisionData().inflate_offsets_) {
     const Eigen::Vector3i occupied = id - offset;
     const double cell_low = occupied.z() * mp_.resolution_;
     const double cell_high = (occupied.z() + 1.0) * mp_.resolution_;
@@ -614,7 +645,11 @@ inline int GridMap::getOccupancy(Eigen::Vector3i id) {
   if (!isInMap(id))
     return -1;
 
-  return md_.occupancy_buffer_[toAddress(id)] > mp_.min_occupancy_log_ ? 1 : 0;
+  const int address = toAddress(id);
+  const auto& data = collisionData();
+  const int nz = mp_.map_voxel_num_.z(), z = address % nz;
+  return (data.occupancy_bits_[(address / nz) * data.occupancy_words_per_column_ + z / 64]
+      >> (z % 64)) & 1U;
 }
 
 inline bool GridMap::isInMap(const Eigen::Vector3d& pos) {

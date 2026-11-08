@@ -53,7 +53,7 @@ fn fixture() -> (Arc<SurfaceSnapshot>,PoseStamped,schema::NavigationGoal,Surface
     let actual=Arc::new(ActualExecutionContext {measured_motion:None,source:surface.clone(),odometry:start.clone(),
         applied:Twist2::ZERO});
     let feedback=SurfaceReplanFeedback {path_identity:Arc::new(published_surface_identity(&goal,31,7)),
-        rejected_context:Some(actual.clone()),current_context:Some(actual),zero_confirmed_rejection:true,rejection_reason:Some("Current body pose is occupied or outside the local map".into())};
+        rejected_context:Some(actual.clone()),current_context:Some(actual),zero_sent_rejection:true,rejection_reason:Some("Current body pose is occupied or outside the local map".into())};
     (surface,start,goal,config,feedback)
 }
 #[test]
@@ -96,9 +96,9 @@ fn adapter_preserves_rejected_b_when_current_and_published_inputs_return_to_a() 
     feedback.rejected_context=None;
     assert!(!memo.should_reuse(surface_replan_rejection(Some(&feedback),&goal),&restored));
     feedback.rejected_context=feedback.current_context.clone();
-    feedback.zero_confirmed_rejection=false;
+    feedback.zero_sent_rejection=false;
     assert!(!memo.should_reuse(surface_replan_rejection(Some(&feedback),&goal),&restored));
-    feedback.zero_confirmed_rejection=true;
+    feedback.zero_sent_rejection=true;
     assert!(memo.should_reuse(surface_replan_rejection(Some(&feedback),&goal),&restored));
     let mut foreign=goal.clone(); foreign.motion_generation+=1;
     assert!(!memo.should_reuse(surface_replan_rejection(Some(&feedback),&foreign),&restored));
@@ -117,7 +117,7 @@ fn recomputation_progress_keeps_original_refusal_without_borrowing_another_goal(
     let mut replacement=goal.clone();replacement.motion_generation+=1;
     assert_eq!(surface_planning_diagnostic(Some(&feedback),&replacement,"正在计算PCT全局路线"),
         "正在计算PCT全局路线");
-    feedback.zero_confirmed_rejection=false;
+    feedback.zero_sent_rejection=false;
     assert_eq!(surface_planning_diagnostic(Some(&feedback),&goal,"正在计算PCT全局路线"),
         "正在计算PCT全局路线");
 }

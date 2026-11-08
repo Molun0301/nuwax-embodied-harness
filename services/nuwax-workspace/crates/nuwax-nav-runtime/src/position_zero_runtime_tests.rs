@@ -41,7 +41,7 @@ async fn zero_position_surface_scheduler() -> (
     (scheduler, status, motion, goal)
 }
 #[tokio::test]
-async fn zero_position_real_surface_arrival_finishes_after_one_zero() {
+async fn zero_position_real_surface_arrival_releases_without_stopped_confirmation() {
     let (mut scheduler, status, motion, _goal) = zero_position_surface_scheduler().await;
     scheduler.control_tick(&status).await.unwrap();
     assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::Succeeded));

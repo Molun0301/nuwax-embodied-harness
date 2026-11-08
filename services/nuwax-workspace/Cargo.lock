@@ -2140,6 +2140,7 @@ dependencies = [
  "nuwax-nav-pct-native",
  "nuwax-nav-pgo-bridge",
  "nuwax-nav-runtime",
+ "nuwax-nav-scan-native",
  "nuwax-nav-simple-planner",
  "nuwax-nav-terrain-map-ext",
  "nuwax-nav-test-fixtures",

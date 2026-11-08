@@ -393,7 +393,7 @@ fn surface_replan_input(surface: &Arc<SurfaceSnapshot>, start: &PoseStamped,
 fn surface_replan_rejection<'a>(
     feedback: Option<&'a SurfaceReplanFeedback>, goal: &schema::NavigationGoal,
 ) -> Option<(&'a nuwax_nav_runtime::PathExecutionIdentity, &'a ActualExecutionContext)> {
-    feedback.filter(|feedback| feedback.zero_confirmed_rejection
+    feedback.filter(|feedback| feedback.zero_sent_rejection
         && (feedback.path_identity.session_id == goal.session_id && feedback.path_identity.goal_key == goal.goal_key()))
         .and_then(|feedback| feedback.rejected_context.as_deref()
             .map(|rejected| (feedback.path_identity.as_ref(), rejected)))
@@ -402,7 +402,7 @@ fn surface_replan_rejection<'a>(
 /// 原局部拒绝与后续全局进度分开记录；另一目标不能继承该原因。
 fn surface_planning_diagnostic(feedback: Option<&SurfaceReplanFeedback>,
     goal: &schema::NavigationGoal, progress: &str) -> String {
-    match feedback.filter(|feedback| feedback.zero_confirmed_rejection
+    match feedback.filter(|feedback| feedback.zero_sent_rejection
         && feedback.path_identity.session_id == goal.session_id
         && feedback.path_identity.goal_key == goal.goal_key()) {
         Some(feedback) => format!("局部执行拒绝并已归零：{}；{progress}；连续等待仍受原期限约束",
@@ -639,7 +639,7 @@ async fn run_surface_planner_with_computer(
                 let update=feedback_events.borrow_and_update().clone();
                 execution_feedback=update;
                 if let (Some(active),Some(feedback))=(&goal,&execution_feedback) {
-                    if feedback.zero_confirmed_rejection
+                    if feedback.zero_sent_rejection
                         && (feedback.path_identity.session_id == active.session_id && feedback.path_identity.goal_key == active.goal_key())
                         && feedback.path_identity.planner_runtime_generation==generation
                         && feedback.path_identity.path_revision==path_revision as u64 {
@@ -707,7 +707,7 @@ async fn run_surface_planner_with_computer(
                             if !can_advance || improvement<threshold {
                                 // 0.35米内提前寻找新路；仍在执行原逼近段时不累计失败。
                                 let stopped=execution_feedback.as_ref().is_some_and(|feedback|
-                                    feedback.zero_confirmed_rejection
+                                    feedback.zero_sent_rejection
                                         && feedback.path_identity.session_id==planned_goal.session_id
                                         && feedback.path_identity.goal_key==planned_goal.goal_key()
                                         && feedback.path_identity.planner_runtime_generation==generation
@@ -1655,8 +1655,7 @@ goal: schema::PoseStamped {
         let prepared = nuwax_nav_runtime::surface_changes::SurfaceMapUpdate::prepare(
             surface,
         ).unwrap();
-        let mut follower = nuwax_nav_runtime::RouteFollower::new(configured.follower).unwrap();
-        follower.enable_author_static_map_fixture(true);
+        let mut follower = crate::static_map_follower(configured.follower).unwrap();
         follower
             .update_execution_map(nuwax_nav_runtime::ExecutionMap::SurfaceUpdate(prepared))
             .unwrap();
@@ -1676,6 +1675,7 @@ goal: schema::PoseStamped {
         }
         let mut moving = false;
         for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(2));
             start.stamp.nanos += 50_000_000;
             follower.update_odometry(start.clone());
             let step = follower.step();
@@ -1896,8 +1896,7 @@ goal: schema::PoseStamped {
                 Box::new(move |shutdown, ready| {
                     Box::pin(run_surface_scheduler_with_transport(scheduler_spec, scheduler_hub, scheduler_transport, shutdown, ready, configured.follower.max_observation_age_sec.map(Duration::from_secs_f64), async move {
                             // 此夹具发布完整静态地图，注册原帧接线由专门的流测试验证。
-                            let mut local = nuwax_nav_runtime::SurfaceFollower::new(configured.follower)?;
-                            local.enable_author_static_map_fixture(true);
+                            let mut local = crate::static_map_follower(configured.follower)?;
                             let pair=nuwax_nav_runtime::spawn_scheduler(nuwax_nav_runtime::NavScheduler::new(
                                 RecordingMotion(motion_calls),local,scheduler_config)?);
                             sender.send(pair.0.clone()).unwrap();
@@ -2044,6 +2043,16 @@ goal: schema::PoseStamped {
             })
             .await
             .unwrap_or_else(|_| panic!("完整三维路径未实际执行: {:?}", self.scheduler.status()));
+        }
+
+        async fn wait_local_zero(&self){
+            tokio::time::timeout(Duration::from_secs(3),async{
+                loop{let status=self.scheduler.status();
+                    if status.phase==SchedulerPhase::Controlling && status.last_applied_twist==Some(Twist2::ZERO)
+                        && status.message.contains("重规划"){break;}
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.unwrap_or_else(|_|panic!("当拍检查受阻后应零速并请求局部规划：{:?}",self.scheduler.status()));
         }
 
         async fn wait_phase(&self, expected: SchedulerPhase) {
@@ -2520,7 +2529,7 @@ goal: schema::PoseStamped {
             "旧版等待不得打断最新路径");
         harness.feed.lock().unwrap().integrate = true;
         harness.terminal(TerminalOutcome::Succeeded).await;
-        // 调度器内部先完成停车，远端规划器只能依赖随后实际发布的带身份终态。
+        // 到达后调度器释放租约，再发布带身份的终态。
         let published_terminal = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let frame = states.next().await.unwrap().unwrap();
@@ -2531,7 +2540,7 @@ goal: schema::PoseStamped {
             }
         })
         .await
-        .expect("真实执行拥有方必须发布原目标的成功及停车证明");
+        .expect("真实执行拥有方必须发布原目标的成功及租约释放回执");
         let terminal_observed_ns =
             published_terminal.stamp_sec * 1_000_000_000 + i64::from(published_terminal.stamp_nsec);
 
@@ -2640,7 +2649,7 @@ goal: schema::PoseStamped {
     }
 
     #[tokio::test]
-    async fn distant_route_changes_wait_for_local_replan_from_actual_pose() {
+    async fn distant_route_changes_replan_locally_without_replacing_global_route() {
         let starts = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&starts);
         let computer: SurfacePathComputer = Arc::new(move |map, pose, goal, config| {
@@ -2663,10 +2672,10 @@ goal: schema::PoseStamped {
         assert!(tokio::time::timeout(Duration::from_millis(450), harness.paths.next()).await.is_err());
         assert_eq!(starts.lock().unwrap().len(), 1, "新图不能触发全程重复检查和搜索");
         harness.feed.lock().unwrap().position[0] = 1.85;
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while starts.lock().unwrap().len() < 2 { tokio::time::sleep(Duration::from_millis(20)).await; }
-        }).await.unwrap_or_else(|_|panic!("局部接续失效应触发完整重规划: {:?}",harness.scheduler.status()));
-        assert!(starts.lock().unwrap()[1] > 1.8, "重算必须从实际位姿开始");
+        harness.wait_local_zero().await;
+        assert_eq!(starts.lock().unwrap().len(),1,"局部受阻由局部规划线程处理，保留全局路线身份");
+        assert_eq!(harness.scheduler.status().path_revision,1);
+        assert!(harness.scheduler.status().pose_source_timestamp_ns>0);
         harness.cancel(&goal).await;
         harness.terminal(TerminalOutcome::Cancelled).await;
         harness.shutdown().await;
@@ -2803,7 +2812,7 @@ goal: schema::PoseStamped {
             feed.map.cloud.width = (feed.map.cloud.data.len() / 12) as i32;
             feed.map.cloud.row_step = feed.map.cloud.data.len() as i32;
         }
-        first.wait_phase(SchedulerPhase::AwaitingPath).await;
+        first.wait_local_zero().await;
         assert_eq!(
             first.scheduler.status().last_applied_twist,
             Some(Twist2::ZERO)
@@ -2824,7 +2833,7 @@ goal: schema::PoseStamped {
             mask.data[15*40+5]=100;
             feed.map.virtual_obstacles=Some(mask);
         }
-        first.wait_phase(SchedulerPhase::AwaitingPath).await;
+        first.wait_local_zero().await;
         assert_eq!(
             first.scheduler.status().last_applied_twist,
             Some(Twist2::ZERO)

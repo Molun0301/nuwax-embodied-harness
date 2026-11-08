@@ -2,17 +2,18 @@
 use crate::{ExecutionMap, ExecutionPath, NavPlanner, PlannerStep, RuntimeError, SurfaceSnapshot};
 use nuwax_nav_astar::{local_planner::LocalPlannerConfig, navigation_map::CostMap2D};
 use nuwax_nav_types_messages::{
-    GoalOptions, MotionKinematics, MotionLimits, Path2D, Path3D, Point2, PoseStamped,
-    Twist2,
+    GoalOptions, MotionKinematics, MotionLimits, Path2D, Path3D, Point2, PoseStamped, Twist2,
 };
 use std::sync::Arc;
 
 /// 旧二维后端的前向兼容策略；原生 SCAN 不调用此函数。
 pub fn forward_navigation_kinematics(mut motion: MotionKinematics) -> MotionKinematics {
-    if motion.model==nuwax_nav_types_messages::MotionModel::Omnidirectional {
-        motion.model=nuwax_nav_types_messages::MotionModel::Differential;
+    if motion.model == nuwax_nav_types_messages::MotionModel::Omnidirectional {
+        motion.model = nuwax_nav_types_messages::MotionModel::Differential;
     }
-    motion.max_reverse_mps=0.;motion.max_lateral_mps=0.;motion
+    motion.max_reverse_mps = 0.;
+    motion.max_lateral_mps = 0.;
+    motion
 }
 /// 平台真实尺寸、运动与目标配置。
 ///
@@ -35,9 +36,6 @@ pub struct SurfaceFollowerConfig {
     pub controller: LocalPlannerConfig,
     /// 实际角速度上限。
     pub max_angular_speed_rps: f64,
-    /// 导航实验台对照开关，默认开启；生产配置不提供关闭项。
-    /// 关闭后直接跟随全局参考，控制器、实测障碍与实际机身检查不变。
-    pub local_planning: bool,
 }
 impl SurfaceFollowerConfig {
     /// 创建物理标定明确的三维执行配置。
@@ -73,7 +71,6 @@ impl SurfaceFollowerConfig {
             max_observation_age_sec: None,
             controller: LocalPlannerConfig::default_config(),
             max_angular_speed_rps: 0.55,
-            local_planning: true,
         }
     }
     /// SCAN直接保留实际运动声明，不套用旧二维后端的前向策略。
@@ -84,52 +81,106 @@ impl SurfaceFollowerConfig {
             .or(self.basic_kinematics)
     }
 }
-/// 唯一三维局部计算拥有者，实际运动端仍属于调度器。
+use crate::local_workers::{
+    MapInitializer, MapInput, MapWorker, PlanInput, PlanWorker, PreparedMap,
+};
+use nuwax_nav_scan_native::{MotionState, ScanTracker, Trajectory};
+
+/// 地图、规划线程的入口与当拍跟踪器；运动端仍只由调度器拥有。
 pub struct SurfaceFollower {
     config: SurfaceFollowerConfig,
     map: Option<Arc<SurfaceSnapshot>>,
-    native_map: Option<crate::native_map::NativeMap>,
-    native_window: Option<([i32; 2], u64)>,
     odometry: Option<PoseStamped>,
     goal: Option<PoseStamped>,
     path: Option<Path3D>,
-    reference: Vec<[f64; 3]>,
+    reference: Arc<Vec<[f64; 3]>>,
     reference_start: usize,
-    native_planner: nuwax_nav_scan_native::Planner,
-    boundary: Vec<[f64; 2]>,
+    boundary: Arc<Vec<[f64; 2]>>,
     options: GoalOptions,
     applied: Twist2,
     measured_motion: Option<crate::MeasuredMotion>,
     registered_frame: Option<Arc<crate::RegisteredFrame>>,
-    ingested_frame: Option<crate::RegisteredFrameIdentity>,
-    #[cfg(test)]
-    frame_ingestion_count:usize,
-    motion_dispatch_bound: Option<crate::CommandDispatchBound>,
     motion_boundary: Option<crate::motion_feedback::MotionBoundary>,
-    motion_boundary_sources: Option<[nuwax_nav_scan_native::MotionBoundarySource;3]>,
+    planning_velocity: [f64; 3],
+    motion_sample_time: Option<i64>,
     progress: f64,
     local_path: Vec<[f64; 3]>,
     local_body_path: Option<Path3D>,
     wait_reason: Option<String>,
-    execution_cycle_complete:bool,
-    execution_failed:bool,
+    map_worker: MapWorker,
+    plan_worker: PlanWorker,
+    tracker: ScanTracker,
+    prepared: Option<PreparedMap>,
+    active: Option<Trajectory>,
+    active_snapshot: Option<nuwax_nav_scan_native::CollisionSnapshot>,
+    pending_curve: Option<(Trajectory, nuwax_nav_scan_native::CollisionSnapshot)>,
+    plan_snapshot: Option<nuwax_nav_scan_native::CollisionSnapshot>,
+    epoch: u64,
+    phase: f64,
+    needs_plan: bool,
+    planning: bool,
+    early_requested: bool,
+    plans: u64,
+    execution_cycle_complete: bool,
 }
 impl SurfaceFollower {
-    /// 仅供显式模拟/静态地图夹具使用作者 A 的静态占据输入。
-    /// 生产默认关闭，不能用静态表面快照伪装注册点云原帧。
-    pub fn enable_author_static_map_fixture(&mut self, enabled: bool) {
-        self.native_planner.set_static_map_fixture(enabled);
-    }
-    /// 最近一次边界来源：实测、历史轨迹或首次边界假设，不与 APPLIED 混用。
-    pub fn motion_boundary_sources(&self)->Option<[nuwax_nav_scan_native::MotionBoundarySource;3]> { self.motion_boundary_sources }
-    /// 最近的测量来源和两个独立采样时点。
-    pub fn measured_boundary(&self)->Option<&crate::motion_feedback::MotionBoundary> {self.motion_boundary.as_ref()}
-    /// 构造纯计算后端。
+    /// 生产地图只接受注册原帧；地图维护线程独占概率图。
     pub fn new(config: SurfaceFollowerConfig) -> Result<Self, RuntimeError> {
-        if let Some(limits)=&config.command_limits {
-            limits.validate().map_err(|reason|RuntimeError::InvalidInput {
-                field:"surface.command_limits",reason,
-            })?;
+        Self::with_map_initializer(config, None)
+    }
+    /// 显式地图初始化函数，供静态数值夹具使用；不保存测试模式。
+    pub fn with_map_initializer(
+        config: SurfaceFollowerConfig,
+        initializer: Option<MapInitializer>,
+    ) -> Result<Self, RuntimeError> {
+        Self::validate_config(&config)?;
+        let map_error = |reason| RuntimeError::Planner(reason);
+        Ok(Self {
+            config,
+            map: None,
+            odometry: None,
+            goal: None,
+            path: None,
+            reference: Arc::new(Vec::new()),
+            reference_start: 0,
+            boundary: Arc::new(Vec::new()),
+            options: GoalOptions::default(),
+            applied: Twist2::ZERO,
+            measured_motion: None,
+            registered_frame: None,
+            motion_boundary: None,
+            planning_velocity: [0.; 3],
+            motion_sample_time: None,
+            progress: 0.,
+            local_path: Vec::new(),
+            local_body_path: None,
+            wait_reason: None,
+            map_worker: MapWorker::new(initializer).map_err(map_error)?,
+            plan_worker: PlanWorker::new().map_err(map_error)?,
+            tracker: ScanTracker::default(),
+            pending_curve: None,
+            plan_snapshot: None,
+            prepared: None,
+            active: None,
+            active_snapshot: None,
+            epoch: 0,
+            phase: 0.,
+            needs_plan: true,
+            planning: false,
+            early_requested: false,
+            plans: 0,
+            execution_cycle_complete: false,
+        })
+    }
+    /// 在创建工作线程和连接运动端之前核对物理配置。
+    pub fn validate_config(config: &SurfaceFollowerConfig) -> Result<(), RuntimeError> {
+        if let Some(limits) = &config.command_limits {
+            limits
+                .validate()
+                .map_err(|reason| RuntimeError::InvalidInput {
+                    field: "surface.command_limits",
+                    reason,
+                })?;
         }
         if let Some(limits) = &config.motion_limits {
             limits
@@ -166,59 +217,33 @@ impl SurfaceFollower {
                 });
             }
         }
-        let mut native_planner = nuwax_nav_scan_native::Planner::new();
-        native_planner.set_local_planning(config.local_planning);
-        Ok(Self {
-            config,
-            map: None,
-            native_map: None,
-            native_window: None,
-            odometry: None,
-            goal: None,
-            path: None,
-            reference: Vec::new(),
-            reference_start: 0,
-            native_planner,
-            boundary: Vec::new(),
-            options: GoalOptions::default(),
-            applied: Twist2::ZERO,
-            measured_motion: None,
-            registered_frame: None,
-            ingested_frame: None,
-            #[cfg(test)]
-            frame_ingestion_count:0,
-            motion_dispatch_bound: None,
-            motion_boundary: None,
-            motion_boundary_sources: None,
-            progress: 0.,
-            local_path: Vec::new(),
-            local_body_path: None,
-            wait_reason: None,
-            execution_cycle_complete:false,
-            execution_failed:false,
-        })
+        Ok(())
     }
-    /// 实际位置投影到全局参考的累计进度。
+    /// 最近的真实运动边界，回执不充当测速。
+    pub fn measured_boundary(&self) -> Option<&crate::motion_feedback::MotionBoundary> {
+        self.motion_boundary.as_ref()
+    }
+    /// 沿全局路线的实际进度。
     pub fn progress_m(&self) -> f64 {
         self.progress
     }
-    /// 已执行的原生局部规划次数。
+    /// 已完成并安装的局部规划数。
     pub fn local_plans(&self) -> u64 {
-        self.native_planner.plan_count()
+        self.plans
     }
-    /// 原生局部规划调用次数。
+    /// 已提交的局部规划数。
     pub fn local_planning_calls(&self) -> u64 {
-        self.native_planner.plan_count()
+        self.plans + u64::from(self.planning)
     }
-    /// 当前局部机体轨迹，供状态显示。
+    /// 当前原生轨迹的显示副本。
     pub fn local_path(&self) -> Option<&Path3D> {
         self.local_body_path.as_ref()
     }
-    /// 当前局部机体轨迹的独立显示副本。
+    /// 当前原生轨迹的显示副本。
     pub fn local_body_path_for_display(&self) -> Option<Path3D> {
         self.local_body_path.clone()
     }
-    /// 原接口中的路线进度观测。
+    /// 实际进度观测。
     pub fn progress(&self) -> f64 {
         self.progress
     }
@@ -292,31 +317,7 @@ impl SurfaceFollower {
         };
         self.position_reached() && yaw
     }
-    fn computed_failure_step(&self, reason: String) -> PlannerStep {
-        if self.execution_failed || reason.contains(nuwax_nav_types_messages::BODY_OVERLAP_RECOVERY_FAILED) {
-            PlannerStep::Failed(reason)
-        }
-        else { PlannerStep::ReplanRequired(reason) }
-    }
-    fn compute(&mut self) -> Result<Twist2, String> {
-        self.update_progress();
-        let map = self.map.as_ref().ok_or("等待局部感知")?;
-        let pose = self.odometry.as_ref().ok_or("等待实际位姿")?;
-        if self.reference.is_empty() {
-            return Err("等待全局参考路线".into());
-        }
-        if !self.position_reached()
-            && (self.reference.len() == 1
-                || nuwax_nav_types_messages::same_finite_position(
-                    Self::position(pose), *self.reference.last().unwrap()))
-        {
-            // 参考已无后续位移但原三维目标尚未到达；不能把零速等待当作到达。
-            // 与作者正常周期结束一致，这不是可缓存的几何拒绝证据。
-            self.execution_cycle_complete = true;
-            self.local_path.clear();
-            self.local_body_path = None;
-            return Err("全局参考已结束，原业务目标未到，等待后续路线".into());
-        }
+    fn native_config(&self, map: &SurfaceSnapshot) -> nuwax_nav_scan_native::Config {
         let mut config = self.config.scan;
         config.resolution = map.navigation_source_columns(None).0;
         config.body_to_ground = self.config.body_to_support_z_m;
@@ -330,7 +331,11 @@ impl SurfaceFollower {
         config.max_slope = f64::from(map.config().max_slope_deg).to_radians();
         if let Some(motion) = self.config.kinematics() {
             config.max_velocity = config.max_velocity.min(motion.max_forward_mps);
-            config.max_reverse_velocity = if self.options.allow_reverse { motion.max_reverse_mps.min(config.max_velocity) } else { 0. };
+            config.max_reverse_velocity = if self.options.allow_reverse {
+                motion.max_reverse_mps.min(config.max_velocity)
+            } else {
+                0.
+            };
             config.max_lateral_velocity = motion.max_lateral_mps.min(config.max_velocity);
             config.max_yaw_rate = config.max_yaw_rate.min(motion.max_angular_rps);
         }
@@ -343,12 +348,16 @@ impl SurfaceFollower {
                 .min(limits.guaranteed_angular_braking_rps2);
         }
         if let Some(limits) = &self.config.command_limits {
-            let [forward,reverse,lateral,yaw] = limits.search_bounds(config.max_velocity,
-                config.max_reverse_velocity,config.max_lateral_velocity,config.max_yaw_rate);
-            config.max_velocity=forward;
-            config.max_reverse_velocity=reverse;
-            config.max_lateral_velocity=lateral;
-            config.max_yaw_rate=yaw;
+            let [forward, reverse, lateral, yaw] = limits.search_bounds(
+                config.max_velocity,
+                config.max_reverse_velocity,
+                config.max_lateral_velocity,
+                config.max_yaw_rate,
+            );
+            config.max_velocity = forward;
+            config.max_reverse_velocity = reverse;
+            config.max_lateral_velocity = lateral;
+            config.max_yaw_rate = yaw;
         }
         if let Some(body) = map.body_envelope() {
             let bounds = body.footprint_xy_m.iter().fold(
@@ -372,149 +381,224 @@ impl SurfaceFollower {
             config.max_step_down = body.max_step_down_m;
             config.max_slope = body.max_cross_slope_deg.to_radians();
         }
-        let yaw = pose.pose.orientation.yaw();
-        let measured=self.measured_motion.as_ref().filter(|m|m.is_current());
-        let boundary=crate::motion_feedback::boundary_for_pose(pose,measured);
-        // 同步模拟状态在下一物理事件前有效；MAX 没有有限墙钟期限。
-        self.motion_dispatch_bound=measured.filter(|m|m.valid_until_monotonic_ns<u64::MAX)
-            .map(|m|crate::CommandDispatchBound::from_same_host_monotonic_deadline(m.valid_until_monotonic_ns));
-        self.motion_boundary=Some(boundary.clone());
-        let position = Self::position(pose);
-        let radius = config.planning_horizon
-            + (config.body_length * 0.5 + config.body_center_x.abs())
-                .hypot(config.body_width * 0.5 + config.body_center_y.abs());
-        let cell = [
-            (position[0] / config.resolution).floor() as i32,
-            (position[1] / config.resolution).floor() as i32,
-        ];
-        let key = (cell, radius.to_bits());
-        if self.native_window != Some(key) {
-            let center = cell.map(|value| (f64::from(value) + 0.5) * config.resolution);
-            self.native_map = Some(crate::native_map::from_surface_window(
-                map,
-                Some((center, radius + config.resolution)),
-            )?);
-            self.native_window = Some(key);
-        }
-        let input = self.native_map.as_ref().expect("当前局部窗口已准备");
-        let nearby = |p: &[f64; 3]| {
-            (p[0] - position[0]).abs() <= radius && (p[1] - position[1]).abs() <= radius
+        config
+    }
+    fn submit_map(&self) {
+        let (Some(source), Some(pose)) = (&self.map, &self.odometry) else {
+            return;
         };
-        let (recent_ground, recent_obstacles) = map.navigation_recent_samples();
-        let obstacles: Vec<_> = input
-            .obstacles
-            .iter()
-            .chain(recent_obstacles.iter())
-            .filter(|p| nearby(p))
-            .copied()
-            .collect();
-        let ground: Vec<_> = input
-            .static_collision_ground
-            .iter()
-            .chain(recent_ground.iter())
-            .filter(|p| nearby(p))
-            .copied()
-            .collect();
-        if self.registered_frame.as_ref().is_some_and(|frame| !frame.is_current()) {
-            self.native_planner.reset();
-            self.ingested_frame=None;
-            return Err("registered cloud source deadline expired".into());
-        }
-        // Execution retirement preserves the same-source probability map. Only
-        // a real map-configuration rebuild permits re-ingesting its current frame.
-        if self.native_planner.configure(&config)? {
-            self.ingested_frame=None;
-        }
-        if let Some(frame)=self.registered_frame.as_ref() {
-            if let Some(bound)=frame.dispatch_bound {
-                self.motion_dispatch_bound=Some(self.motion_dispatch_bound.map_or(bound,|old|old.earliest(bound)));
-            }
-            if self.ingested_frame.as_ref()!=Some(&frame.identity) {
-                self.native_planner.ingest_registered_frame_with_ground(&config,&frame.points_world,&frame.ground_point_indices,
-                    frame.sensor_origin_world,frame.body_position_world,frame.identity.timestamp_ns)?;
-                tracing::debug!(target:"navigation.registered_frame", source=?frame.identity,
-                    paired_odometry_timestamp_ns=frame.paired_odometry_timestamp_ns,
-                    body_orientation_xyzw=?frame.body_orientation_xyzw,
-                    "原始world注册点仅注入一次；同帧sensor origin和body pose，不二次变换");
-                self.ingested_frame=Some(frame.identity.clone());
-                #[cfg(test)] {self.frame_ingestion_count+=1;}
-            }
-        }
-        let position_reached = self.position_reached();
-        let result = self
-            .native_planner
-            .step(&nuwax_nav_scan_native::PlanRequest {
-                obstacles: &obstacles,
-                ground: &ground,
-                forbidden_columns: &input.forbidden_columns,
-                reference: if position_reached {
-                    &[]
-                } else {
-                    // 原版 mode3 接收完整 PCT 路径；空间进度只供外层观测，
-                    // 不能每拍切尾伪装成新路径而重建全局多项式。
-                    &self.reference
-                },
-                boundary: &self.boundary,
-                goal_yaw: (position_reached && self.options.requires_orientation())
-                    .then(|| self.goal.as_ref().unwrap().pose.orientation.yaw()),
-                start_position: Self::position(pose),
-                start_velocity: boundary.velocity,
-                // 没有可信加速度观测，历史接续由原 SCAN 显式处理。
-                start_acceleration: None,
-                start_yaw: yaw,
-                start_yaw_rate: boundary.yaw_rate,
-                odometry_timestamp_ns: pose.stamp.nanos,
-                config,
-            })?;
-        if self.motion_boundary_sources != Some(result.motion_boundary_sources) {
-            tracing::info!(target:"navigation.motion_feedback", source=?boundary.source_id,
-                motion_timestamp_ns=?boundary.motion_timestamp_ns,pose_timestamp_ns=boundary.pose_timestamp_ns,
-                boundary_sources=?result.motion_boundary_sources,
-                "SCAN运动边界来源变化；测量和位姿为独立采样，回执不代表测速");
-        }
-        tracing::debug!(target:"navigation.motion_feedback", source=?boundary.source_id,
-            motion_timestamp_ns=?boundary.motion_timestamp_ns,pose_timestamp_ns=boundary.pose_timestamp_ns,
-            pose_clock=?boundary.pose_clock,sample_time_delta_ns=?boundary.sample_time_delta_ns,
-            boundary_sources=?result.motion_boundary_sources,"SCAN运动输入来源与异步采样时间");
-        self.motion_boundary_sources=Some(result.motion_boundary_sources);
-        // A's exhausted emergency recovery is a terminal execution failure,
-        // unlike a normally completed execution cycle needing a following route.
-        if result.execution_failed && !position_reached {
-            self.execution_failed=true;
-            self.local_path.clear();
-            self.local_body_path=None;
-            return Err("作者A原生恢复重试已耗尽，执行失败并停止".into());
-        }
-        // A owns the EXEC→WAIT transition. The original business goal may
-        // still need a following global route; this is not a geometry refusal.
-        if result.execution_cycle_complete && !position_reached {
-            self.execution_cycle_complete=true;
-            self.local_path.clear();
-            self.local_body_path=None;
-            return Err("作者A本执行周期结束，原业务目标未到，等待后续路线".into());
-        }
-        self.local_path = result.samples.iter().map(|s| s.position).collect();
-        self.local_body_path = self.path.as_ref().map(|path| Path3D {
-            poses: result
-                .samples
-                .iter()
-                .map(|sample| {
-                    let mut point = pose.clone();
-                    point.pose.position = nuwax_nav_types_messages::Point3::new(
-                        sample.position[0],
-                        sample.position[1],
-                        sample.position[2],
-                    );
-                    point.pose.orientation =
-                        nuwax_nav_types_messages::Quaternion::from_yaw(sample.yaw);
-                    point
-                })
-                .collect(),
-            ..path.clone()
+        self.map_worker.submit(MapInput {
+            epoch: self.epoch,
+            source: source.clone(),
+            config: self.native_config(source),
+            boundary: self.boundary.clone(),
+            pose: Self::position(pose),
+            frame: self.registered_frame.clone(),
+            active: self.active.clone(),
+            active_snapshot: self.active_snapshot.clone(),
+            phase: self.phase,
         });
+    }
+    fn retire_route(&mut self) {
+        self.epoch += 1;
+        self.plan_worker.retire(self.epoch);
+        self.map_worker.retire(self.epoch, false);
+        self.tracker.clear();
+        self.pending_curve = None;
+        self.plan_snapshot = None;
+        self.active = None;
+        self.active_snapshot = None;
+        self.phase = 0.;
+        self.planning = false;
+        self.needs_plan = true;
+        self.early_requested = false;
+        self.local_path.clear();
+        self.local_body_path = None;
+        self.execution_cycle_complete = false;
+        self.wait_reason = None;
+        self.motion_sample_time = None;
+        self.planning_velocity = [0.; 3];
+    }
+    fn state(&mut self) -> MotionState {
+        let pose = self.odometry.as_ref().unwrap();
+        let boundary =
+            crate::motion_feedback::boundary_for_pose(pose, self.measured_motion.as_ref());
+        let measured = boundary.velocity.unwrap_or([0.; 3]);
+        if let Some(previous) = self.motion_sample_time {
+            if pose.stamp.nanos > previous {
+                let weight = -(-((pose.stamp.nanos - previous) as f64) * 1e-9).exp_m1();
+                for i in 0..2 {
+                    self.planning_velocity[i] += weight * (measured[i] - self.planning_velocity[i]);
+                }
+                self.planning_velocity[2] = measured[2];
+            }
+        } else {
+            self.planning_velocity = measured;
+        }
+        self.motion_sample_time = Some(pose.stamp.nanos);
+        let state = MotionState {
+            position: Self::position(pose),
+            velocity: measured,
+            planning_velocity: self.planning_velocity,
+            yaw: pose.pose.orientation.yaw(),
+            yaw_rate: boundary.yaw_rate.unwrap_or(0.),
+            route_progress: self.progress,
+            timestamp_ns: pose.stamp.nanos,
+            measured_velocity: u32::from(boundary.velocity.is_some()),
+            measured_yaw_rate: u32::from(boundary.yaw_rate.is_some()),
+        };
+        self.motion_boundary = Some(boundary);
+        state
+    }
+    fn compute(&mut self) -> Result<Twist2, String> {
+        self.update_progress();
+        let state = self.state();
+        if let Some(result) = self.map_worker.take() {
+            match result {
+                Ok(map) if map.epoch == self.epoch => {
+                    self.needs_plan |= map.changed
+                        && map
+                            .checked_curve
+                            .as_ref()
+                            .zip(self.active.as_ref())
+                            .is_some_and(|(old, active)| old.same(active));
+                    self.prepared = Some(map)
+                }
+                Ok(_) => {}
+                Err(reason) => {
+                    self.prepared = None;
+                    self.wait_reason = Some(reason);
+                }
+            }
+        }
+        if let Some((epoch, result)) = self.plan_worker.take() {
+            if epoch == self.epoch {
+                self.planning = false;
+                match result {
+                    Ok(curve) => {
+                        self.tracker.install(&curve);
+                        self.pending_curve = Some((curve, self.plan_snapshot.take().unwrap()));
+                    }
+                    Err(reason) => {
+                        self.wait_reason = Some(reason);
+                        self.needs_plan = true;
+                    }
+                }
+            }
+        }
+        if !self.position_reached()
+            && (self.reference.len() == 1
+                || nuwax_nav_types_messages::same_finite_position(
+                    state.position,
+                    *self.reference.last().unwrap(),
+                ))
+        {
+            self.execution_cycle_complete = true;
+            return Err("全局参考已结束，原业务目标未到，等待后续路线".into());
+        }
+        let Some(map) = self.prepared.as_ref() else {
+            self.submit_map();
+            return Ok(Twist2::ZERO);
+        };
+        let config = self.native_config(&map.source);
+        let terminal_yaw = (self.position_reached() && self.options.requires_orientation())
+            .then(|| self.goal.as_ref().unwrap().pose.orientation.yaw());
+        let checked = match self.tracker.track_and_check(
+            &config,
+            &map.snapshot,
+            &state,
+            [
+                self.applied.linear.x,
+                self.applied.linear.y,
+                self.applied.angular_z,
+            ],
+            terminal_yaw,
+        ) {
+            Ok(checked) => checked,
+            Err(reason) => {
+                self.wait_reason = Some(reason);
+                nuwax_nav_scan_native::TrackResult {
+                    reason: 8,
+                    ..Default::default()
+                }
+            }
+        };
+        if checked.installed {
+            let (curve, snapshot) = self.pending_curve.take().unwrap();
+            self.local_path = curve
+                .samples(0., self.config.scan.sample_dt)
+                .iter()
+                .map(|p| p.position)
+                .collect();
+            self.local_body_path = self.path.as_ref().map(|path| Path3D {
+                poses: self
+                    .local_path
+                    .iter()
+                    .map(|p| {
+                        let mut pose = self.odometry.as_ref().unwrap().clone();
+                        pose.pose.position =
+                            nuwax_nav_types_messages::Point3::new(p[0], p[1], p[2]);
+                        pose
+                    })
+                    .collect(),
+                ..path.clone()
+            });
+            self.active = Some(curve);
+            self.active_snapshot = Some(snapshot);
+            self.early_requested = false;
+            self.plans += 1;
+        }
+        if checked.reason & 64 != 0 {
+            self.pending_curve = None;
+            self.needs_plan = true;
+        }
+        self.phase = checked.phase;
+        if checked.reason & 16 != 0 && !self.early_requested {
+            self.needs_plan = true;
+            self.early_requested = true;
+        }
+        if checked.invalid() {
+            self.active = None;
+            self.active_snapshot = None;
+            self.needs_plan = true;
+        }
+        // 已有计算时合并请求；这次计算交付后只由后续新事件再次请求。
+        if self.needs_plan {
+            if !self.planning && terminal_yaw.is_none() {
+                self.plan_snapshot = Some(map.snapshot.clone());
+                self.plan_worker.submit(PlanInput {
+                    epoch: self.epoch,
+                    map: map.clone(),
+                    config,
+                    reference: self.reference.clone(),
+                    state,
+                    active: self.active.clone(),
+                    phase: self.phase,
+                });
+                self.planning = true;
+            }
+            self.needs_plan = false;
+        }
+        self.wait_reason = if checked.invalid() {
+            Some(
+                if checked.reason & 8 != 0 {
+                    "命令检查没有合法候选，等待重规划"
+                } else if checked.reason & 2 != 0 {
+                    "机身偏离轨迹，等待重规划"
+                } else if checked.reason & 4 != 0 {
+                    "局部轨迹结束，等待重规划"
+                } else {
+                    "等待局部轨迹"
+                }
+                .into(),
+            )
+        } else {
+            None
+        };
+        self.submit_map();
         Ok(Twist2 {
-            linear: Point2::new(result.command_forward, result.command_lateral),
-            angular_z: result.command_yaw_rate,
+            linear: Point2::new(checked.command[0], checked.command[1]),
+            angular_z: checked.command[2],
         })
     }
 }
@@ -534,29 +618,18 @@ impl NavPlanner for SurfaceFollower {
                 reason,
             })?;
         crate::validate_map_pose(goal, "goal_pose")?;
+        self.retire_route();
         self.goal = Some(goal.clone());
         self.options = options;
         self.path = None;
-        self.reference.clear();
+        self.reference = Arc::new(Vec::new());
         self.reference_start = 0;
-        self.native_planner.reset_execution();
-        self.execution_cycle_complete=false;
-        self.execution_failed=false;
-        // Keep the same-source map and its once-only fusion watermark.
-        self.measured_motion=None;
-        self.motion_boundary=None;
-        self.motion_boundary_sources=None;
-        self.motion_dispatch_bound=None;
-        self.local_path.clear();
-        self.local_body_path = None;
         self.progress = 0.;
-        self.wait_reason = None;
         Ok(())
     }
     fn configure_boundary(&mut self, boundary: &[[f64; 2]]) {
-        self.boundary = boundary.to_vec();
-        // A business source event is independent of the latest odometry time.
-        self.native_planner.notify_source_changed();
+        self.boundary = Arc::new(boundary.to_vec());
+        self.submit_map();
     }
     fn replace_path(&mut self, _path: Path2D) {
         self.wait_reason = Some("三维执行需要完整机体参考".into());
@@ -580,27 +653,26 @@ impl NavPlanner for SurfaceFollower {
                 reason: "参考路径为空".into(),
             });
         }
-        self.reference = path.poses.iter().map(Self::position).collect();
+        self.retire_route();
+        self.reference = Arc::new(path.poses.iter().map(Self::position).collect());
         self.reference_start = 0;
-        self.native_planner.reset_execution();
-        self.execution_cycle_complete=false;
-        self.execution_failed=false;
-        // Keep the same-source map and its once-only fusion watermark.
         self.path = Some(path);
         self.goal = Some(goal);
         self.progress = 0.;
         self.update_progress();
+        self.submit_map();
         Ok(())
     }
-    fn update_odometry(&mut self, odometry: PoseStamped) {
-        self.odometry = Some(odometry);
+    fn update_odometry(&mut self, pose: PoseStamped) {
+        self.odometry = Some(pose);
         self.update_progress();
+        self.submit_map();
     }
     fn update_costmap(&mut self, _map: CostMap2D) {
         self.invalidate_execution_map();
     }
     fn update_execution_map(&mut self, map: ExecutionMap) -> Result<(), RuntimeError> {
-        let source = match map {
+        self.map = Some(match map {
             ExecutionMap::Surface(map) => map,
             ExecutionMap::SurfaceUpdate(update) => update.snapshot,
             ExecutionMap::Planar(_) => {
@@ -609,49 +681,41 @@ impl NavPlanner for SurfaceFollower {
                     reason: "三维执行需要三维感知".into(),
                 })
             }
-        };
-        if self
-            .map
-            .as_ref()
-            .is_none_or(|old| !crate::native_map::same_source_geometry(old, &source))
-        {
-            self.native_map = None;
-            self.native_window = None;
-        }
-        self.map = Some(source);
-        // Recheck the installed map/mask once even if no new pose has arrived.
-        // Ordinary repeated compute calls do not generate this event.
-        self.native_planner.notify_source_changed();
+        });
+        self.submit_map();
         Ok(())
     }
     fn invalidate_execution_map(&mut self) {
-        self.observe_registered_frame(None);
+        self.retire_route();
+        self.map_worker.retire(self.epoch, true);
+        self.prepared = None;
         self.map = None;
-        self.native_map = None;
-        self.native_window = None;
-        self.local_path.clear();
+        self.registered_frame = None;
+        self.tracker = ScanTracker::default();
     }
     fn observe_applied_command(&mut self, command: Twist2) {
         self.applied = command;
     }
     fn observe_registered_frame(&mut self, frame: Option<Arc<crate::RegisteredFrame>>) {
-        let same_domain=match (&self.registered_frame,&frame) {
-            (Some(old),Some(new))=>old.identity.domain==new.identity.domain,
-            (None,None)=>true,
-            _=>false,
-        };
-        if !same_domain {
-            self.native_planner.reset();
-            self.ingested_frame=None;
+        if self.registered_frame.as_ref().map(|f| &f.identity)
+            == frame.as_ref().map(|f| &f.identity)
+        {
+            return;
         }
-        // Duplicate identity is not a new sample and cannot refresh its deadline.
-        if matches!((&self.registered_frame,&frame),(Some(old),Some(new)) if old.identity==new.identity) { return; }
-        self.registered_frame=frame;
+        if self.registered_frame.as_ref().map(|f| &f.identity.domain)
+            != frame.as_ref().map(|f| &f.identity.domain)
+        {
+            self.retire_route();
+            self.map_worker.retire(self.epoch, true);
+            self.prepared = None;
+            self.tracker = ScanTracker::default();
+        }
+        self.registered_frame = frame;
+        self.submit_map();
     }
     fn observe_measured_motion(&mut self, motion: Option<crate::MeasuredMotion>) {
-        self.measured_motion=motion.filter(crate::MeasuredMotion::is_current);
+        self.measured_motion = motion.filter(crate::MeasuredMotion::is_current);
     }
-    fn take_command_dispatch_bound(&mut self)->Option<crate::CommandDispatchBound> { self.motion_dispatch_bound.take() }
     fn refresh_execution_context(
         &mut self,
         applied: Twist2,
@@ -660,7 +724,10 @@ impl NavPlanner for SurfaceFollower {
             source: self.map.clone()?,
             odometry: self.odometry.clone()?,
             applied,
-            measured_motion: self.measured_motion.clone().filter(crate::MeasuredMotion::is_current),
+            measured_motion: self
+                .measured_motion
+                .clone()
+                .filter(crate::MeasuredMotion::is_current),
         }))
     }
     fn execution_wait_reason(&self) -> Option<String> {
@@ -669,11 +736,11 @@ impl NavPlanner for SurfaceFollower {
     fn local_path_for_display(&self) -> Vec<[f64; 3]> {
         self.local_path.clone()
     }
-    fn execution_cycle_complete(&self)->bool { self.execution_cycle_complete }
+    fn execution_cycle_complete(&self) -> bool {
+        self.execution_cycle_complete
+    }
     fn step(&mut self) -> PlannerStep {
-        self.execution_cycle_complete=false;
-        self.execution_failed=false;
-        self.motion_dispatch_bound=None;
+        self.execution_cycle_complete = false;
         if self.reached() {
             return PlannerStep::Succeeded;
         }
@@ -681,30 +748,27 @@ impl NavPlanner for SurfaceFollower {
             return PlannerStep::Pending(Vec::new());
         }
         match self.compute() {
-            Ok(command) => {
-                self.wait_reason = None;
-                PlannerStep::Command(command)
-            }
+            Ok(command) => PlannerStep::Command(command),
             Err(reason) => {
                 self.wait_reason = Some(reason.clone());
-                self.computed_failure_step(reason)
+                if self.execution_cycle_complete {
+                    PlannerStep::ReplanRequired(reason)
+                } else {
+                    self.needs_plan = true;
+                    PlannerStep::Command(Twist2::ZERO)
+                }
             }
         }
     }
     fn stop(&mut self) {
+        self.retire_route();
         self.path = None;
-        self.reference.clear();
+        self.reference = Arc::new(Vec::new());
         self.reference_start = 0;
-        self.native_planner.reset_execution();
-        self.execution_cycle_complete=false;
-        self.execution_failed=false;
-        // Keep the same-source map and its once-only fusion watermark.
-        self.local_path.clear();
-        self.local_body_path = None;
         self.progress = 0.;
-        self.wait_reason = None;
     }
 }
+
 #[cfg(test)]
 pub(crate) fn test_snapshot(slope: f64, blocked_strip: bool) -> Arc<SurfaceSnapshot> {
     use nuwax_nav_mls_planner::mls_planner::Config;
@@ -742,8 +806,10 @@ pub(crate) fn prepared_test_surface(map: Arc<SurfaceSnapshot>) -> ExecutionMap {
     ExecutionMap::Surface(map)
 }
 
+
 #[cfg(test)]
 mod native_execution_tests {
+
     use super::*;
     use nuwax_nav_types_messages::{NavFrameId, Point3, Pose3, Quaternion, Timestamp};
 
@@ -777,7 +843,38 @@ mod native_execution_tests {
                 goal,
             )
             .unwrap();
+        for _ in 0..1000{let _=follower.step();if follower.active.is_some(){break;}std::thread::sleep(std::time::Duration::from_millis(1));}
         follower
+    }
+    fn unknown() -> Arc<SurfaceSnapshot> {
+        let (_, known) = crate::native_test_helpers::fixture();
+        Arc::new(
+            SurfaceSnapshot::from_points(&[], known.config().clone(), known.source_voxel_size_m())
+                .unwrap()
+                .with_body_envelope(known.body_envelope().unwrap().clone())
+                .unwrap(),
+        )
+    }
+    fn next_sample(follower: &mut SurfaceFollower) -> PoseStamped {
+        let mut current = follower.odometry.as_ref().unwrap().clone();
+        current.stamp.nanos +=
+            (1_000_000_000. / follower.config.controller.control_frequency) as i64;
+        follower.update_odometry(current.clone());
+        current
+    }
+    fn advance_to_motion(follower: &mut SurfaceFollower) -> Twist2 {
+        for _ in 0..20 {
+            next_sample(follower);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            let step = follower.step();
+            let PlannerStep::Command(command) = step else {
+                panic!("原生初始化后应交付运动：{step:?}");
+            };
+            if command != Twist2::ZERO {
+                return command;
+            }
+        }
+        panic!("一秒新采样内未生成可执行运动");
     }
     #[test]
     fn actual_scan_commands_fit_device_limits_after_reference_point_transform() {
@@ -808,120 +905,6 @@ mod native_execution_tests {
         }
         assert!(moving>0,"不能用持续零速通过设备约束验收");
     }
-    fn unknown() -> Arc<SurfaceSnapshot> {
-        let (_, known) = crate::native_test_helpers::fixture();
-        Arc::new(
-            SurfaceSnapshot::from_points(&[], known.config().clone(), known.source_voxel_size_m())
-                .unwrap()
-                .with_body_envelope(known.body_envelope().unwrap().clone())
-                .unwrap(),
-        )
-    }
-    fn next_sample(follower: &mut SurfaceFollower) -> PoseStamped {
-        let mut current = follower.odometry.as_ref().unwrap().clone();
-        current.stamp.nanos +=
-            (1_000_000_000. / follower.config.controller.control_frequency) as i64;
-        follower.update_odometry(current.clone());
-        current
-    }
-    // 作者A按真实采样推进初始化；等待限于一秒，不能只重复同一采样让时钟前进。
-    fn advance_to_motion(follower: &mut SurfaceFollower) -> Twist2 {
-        for _ in 0..20 {
-            next_sample(follower);
-            let step = follower.step();
-            let PlannerStep::Command(command) = step else {
-                panic!("原生初始化后应交付运动：{step:?}");
-            };
-            if command != Twist2::ZERO {
-                return command;
-            }
-        }
-        panic!("一秒新采样内未生成可执行运动");
-    }
-
-    #[test]
-    fn production_static_surface_does_not_impersonate_a_registered_scan() {
-        let mut follower=follower(pose(0.5,1.,0.),test_snapshot(0.,false));
-        follower.enable_author_static_map_fixture(false);
-        let error=follower.compute().unwrap_err();
-        assert!(error.contains("registered source frame"),"{error}");
-        assert_eq!(follower.frame_ingestion_count,0);
-    }
-    #[test]
-    fn registered_frame_injected_once_per_native_session_and_domain_change() {
-        let mut follower=follower(pose(0.5,1.,0.),test_snapshot(0.,false));
-        follower.enable_author_static_map_fixture(false);
-        let frame=crate::registered_frame::test_frame(1);
-        follower.observe_registered_frame(Some(frame.clone()));
-        let _=follower.compute(); // This test asserts input delivery, not path feasibility.
-        assert_eq!(follower.frame_ingestion_count,1);
-        let _=follower.compute();
-        assert_eq!(follower.frame_ingestion_count,1);
-        assert_eq!(follower.registered_frame.as_ref().unwrap().points_world.as_ref(),frame.points_world.as_ref());
-        let mut next=(*crate::registered_frame::test_frame(2)).clone();
-        next.identity.domain.session_id.push_str("-new");
-        follower.observe_registered_frame(Some(Arc::new(next)));
-        assert!(follower.ingested_frame.is_none());
-        let _=follower.compute();
-        assert_eq!(follower.frame_ingestion_count,2);
-        follower.observe_registered_frame(None);
-        assert!(follower.registered_frame.is_none());
-        assert!(follower.compute().unwrap_err().contains("registered source frame"));
-    }
-    #[test]
-    fn execution_goal_path_and_stop_preserve_same_frame_fusion_watermark() {
-        let start=pose(0.5,1.,0.);let goal=pose(3.,1.,0.);
-        let mut follower=follower(start.clone(),test_snapshot(0.,false));
-        follower.enable_author_static_map_fixture(false);
-        let frame=crate::registered_frame::test_frame(1);
-        follower.observe_registered_frame(Some(frame.clone()));
-        let _=follower.compute();
-        assert_eq!(follower.frame_ingestion_count,1);
-        let key=follower.ingested_frame.clone();
-        for retire in 0..3 {
-            match retire {
-                0=>follower.configure_goal(&goal,GoalOptions::default()).unwrap(),
-                1=>follower.stop(),
-                _=>{},
-            }
-            assert_eq!(follower.ingested_frame,key,"execution retirement must not clear fusion watermark");
-            follower.replace_execution_path(ExecutionPath::Surface(Path3D {
-                poses:vec![start.clone(),goal.clone()],
-            }),None,goal.clone()).unwrap();
-            assert_eq!(follower.ingested_frame,key);
-            next_sample(&mut follower);
-            let _=follower.compute();
-            assert_eq!(follower.frame_ingestion_count,1,"a new goal/path must not hit the same scan twice");
-            assert!(Arc::ptr_eq(follower.registered_frame.as_ref().unwrap(),&frame));
-        }
-    }
-    #[test]
-    fn map_configuration_rebuild_reingests_once_without_renewing_frame_deadline() {
-        let mut follower=follower(pose(0.5,1.,0.),test_snapshot(0.,false));
-        follower.enable_author_static_map_fixture(false);
-        let mut frame=(*crate::registered_frame::test_frame(1)).clone();
-        let deadline=crate::motion_feedback::monotonic_ns()+5_000_000_000;
-        frame.dispatch_bound=Some(crate::CommandDispatchBound::from_same_host_monotonic_deadline(deadline));
-        let frame=Arc::new(frame);
-        follower.observe_registered_frame(Some(frame.clone()));
-        let _=follower.compute();assert_eq!(follower.frame_ingestion_count,1);
-        // A real map geometry field, not a new observation or a new goal.
-        follower.config.body_to_support_z_m+=0.01;
-        next_sample(&mut follower);
-        let error=follower.compute().unwrap_err();
-        assert!(error.contains("unretired trajectory"),"{error}");
-        assert_eq!(follower.frame_ingestion_count,1,"active curves cannot silently adopt new map geometry");
-        follower.stop();
-        let start=follower.odometry.as_ref().unwrap().clone();let goal=pose(3.,1.,0.);
-        follower.replace_execution_path(ExecutionPath::Surface(Path3D {
-            poses:vec![start,goal.clone()],
-        }),None,goal).unwrap();
-        let _=follower.compute();assert_eq!(follower.frame_ingestion_count,2);
-        let _=follower.compute();assert_eq!(follower.frame_ingestion_count,2);
-        assert!(Arc::ptr_eq(follower.registered_frame.as_ref().unwrap(),&frame));
-        assert_eq!(follower.registered_frame.as_ref().unwrap().dispatch_bound,frame.dispatch_bound);
-        assert_eq!(follower.ingested_frame.as_ref(),Some(&frame.identity));
-    }
     #[test]
     fn spatial_progress_does_not_cut_or_replace_author_a_full_reference() {
         let mut follower=follower(pose(0.5,1.,0.),test_snapshot(0.,false));
@@ -930,39 +913,6 @@ mod native_execution_tests {
         assert!(follower.progress()>0.);
         assert_eq!(follower.reference,reference);
         assert_eq!(SurfaceFollowerConfig::new(0.4).scan.planning_horizon,3.5);
-    }
-    #[test]
-    fn author_cycle_completion_cannot_override_arrival_or_survive_stop() {
-        let mut follower=follower(pose(0.5,1.,0.),test_snapshot(0.,false));
-        follower.execution_cycle_complete=true;
-        follower.update_odometry(pose(3.,1.,0.));
-        assert!(matches!(follower.step(),PlannerStep::Succeeded));
-        assert!(!follower.execution_cycle_complete());
-        follower.execution_cycle_complete=true;
-        follower.stop();
-        assert!(!follower.execution_cycle_complete());
-        follower.update_odometry(pose(0.5,1.,0.));
-        assert!(matches!(follower.step(),PlannerStep::Pending(_)));
-    }
-    #[test]
-    fn author_exhausted_recovery_maps_to_terminal_failure_not_following_route() {
-        let mut follower=follower(pose(0.5,1.,0.),test_snapshot(0.,false));
-        // Unit-level classification of the same-call native cause; native FSM
-        // transition tests separately prove when the cause may be emitted.
-        follower.execution_failed=true;
-        assert!(matches!(follower.computed_failure_step("exhausted".into()),PlannerStep::Failed(_)));
-        follower.execution_failed=false;
-        assert!(matches!(follower.computed_failure_step("ordinary refusal".into()),PlannerStep::ReplanRequired(_)));
-        assert!(matches!(follower.computed_failure_step(format!("{} no monotone escape",
-            nuwax_nav_types_messages::BODY_OVERLAP_RECOVERY_FAILED)),PlannerStep::Failed(_)));
-        follower.execution_failed=true;
-        follower.update_odometry(pose(3.,1.,0.));
-        assert!(matches!(follower.step(),PlannerStep::Succeeded));
-        assert!(!follower.execution_failed);
-        follower.execution_failed=true;follower.stop();
-        assert!(!follower.execution_failed);
-        follower.update_odometry(pose(0.5,1.,0.));
-        assert!(matches!(follower.step(),PlannerStep::Pending(_)));
     }
     #[test]
     fn profile_reverse_permission_never_invents_unknown_hardware_channels() {
@@ -979,7 +929,6 @@ mod native_execution_tests {
         assert_eq!(follower.config.scan.max_reverse_velocity, 0.);
         assert_eq!(follower.config.scan.max_lateral_velocity, 0.);
     }
-
     #[test]
     fn missing_ground_advances_without_creating_odometry_or_progress() {
         let mut follower = follower(pose(0.5, 1., 0.), unknown());
@@ -1078,7 +1027,6 @@ mod native_execution_tests {
             "计算局部目标不能推进真实进度"
         );
     }
-
     #[test]
     fn recent_obstacle_inside_real_body_rejects_the_actual_command() {
         let source = unknown();
@@ -1088,7 +1036,7 @@ mod native_execution_tests {
                 .unwrap(),
         );
         let mut follower = follower(pose(0.5, 1., 0.), source);
-        assert!(matches!(follower.step(), PlannerStep::ReplanRequired(_)));
+        assert!(matches!(follower.step(), PlannerStep::Command(Twist2::ZERO)|PlannerStep::Failed(_)));
     }
     #[test]
     fn moving_actual_pose_refreshes_the_static_window_before_entering_a_known_obstacle() {
@@ -1109,11 +1057,10 @@ mod native_execution_tests {
         actual.stamp.nanos += 30_000_000_000;
         follower.update_odometry(actual);
         assert!(
-            matches!(follower.step(), PlannerStep::ReplanRequired(_)),
+            matches!(follower.step(), PlannerStep::Command(Twist2::ZERO)|PlannerStep::Failed(_)),
             "地图内容不变时，真实位置进入新窗口仍须读到原有实体"
         );
     }
-
     #[test]
     fn initial_turn_uses_native_checked_command_and_never_moves_progress_by_time() {
         let mut follower = follower(pose(0.5, 1., std::f64::consts::FRAC_PI_2), unknown());
@@ -1125,3 +1072,7 @@ mod native_execution_tests {
         assert_eq!(follower.progress_m(), 0.);
     }
 }
+
+#[cfg(test)]
+#[path="plan_track_tests.rs"]
+mod plan_track_tests;

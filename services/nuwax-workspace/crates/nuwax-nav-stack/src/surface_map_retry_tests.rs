@@ -377,8 +377,8 @@ async fn incomplete_refresh_late_completion_cannot_cross_clear_or_domain_fence()
 }
 
 #[tokio::test]
-async fn incomplete_refresh_keeps_pose_and_recent_source_deadlines_independent() {
-    for recent in [false, true] {
+async fn incomplete_refresh_does_not_renew_pose_source_deadline() {
+    {
         let probe = Probe::new();
         let (mut harness, first, _, _) = active(&probe, Duration::ZERO).await;
         let next = map_message(first.revision + 1, &first.session_id);
@@ -388,26 +388,7 @@ async fn incomplete_refresh_keeps_pose_and_recent_source_deadlines_independent()
         harness.map(&next).await;
         wait(|| probe.count(next.revision) == 1).await;
         let now = current_unix_timestamp_ns().unwrap();
-        if recent {
-            // Same scheduler command bound installed by RecentSourceState;
-            // terrain's intentionally unbounded TTL must never renew this clock.
-            harness
-                .scheduler
-                .update_obstacle_source(
-                    None,
-                    true,
-                    Some(
-                        nuwax_nav_runtime::CommandDispatchBound::from_source_timestamp(
-                            now as u64,
-                            Duration::from_millis(300),
-                        ),
-                    ),
-                )
-                .await
-                .unwrap();
-        } else {
-            harness.feed.lock().unwrap().frozen_pose_stamp = Some(now);
-        }
+        harness.feed.lock().unwrap().frozen_pose_stamp=Some(now);
         tokio::time::timeout(Duration::from_secs(4), async {
             loop {
                 let status = harness.scheduler.status();
@@ -416,7 +397,7 @@ async fn incomplete_refresh_keeps_pose_and_recent_source_deadlines_independent()
                     && status.last_terminal.is_none() { break; }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-        }).await.unwrap_or_else(|_| panic!("独立输入期限未保持 recent={recent}: {:?}", harness.scheduler.status()));
+        }).await.unwrap_or_else(|_| panic!("位姿来源期限未保持: {:?}", harness.scheduler.status()));
         wait(|| probe.count(next.revision) >= 2).await;
         assert_eq!(
             harness.scheduler.status().costmap_source_timestamp_ns,

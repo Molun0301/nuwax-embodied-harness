@@ -1,5 +1,4 @@
 //! A single admitted world-frame scan and its frozen, paired registration pose.
-use crate::CommandDispatchBound;
 use std::sync::Arc;
 
 /// Source domain. A change must retire the previous native occupancy history.
@@ -38,14 +37,6 @@ pub struct RegisteredFrame {
     /// The odometry sample actually paired by the registration owner.
     /// Paired odometry acquisition time, distinct from cloud time.
     pub paired_odometry_timestamp_ns: i64,
-    /// Existing source-owner deadline, not renewed by forwarding or replay.
-    pub dispatch_bound: Option<CommandDispatchBound>,
-}
-impl RegisteredFrame {
-    /// Reuse the existing source qualification without introducing a new TTL.
-    pub fn is_current(&self) -> bool {
-        self.dispatch_bound.is_none_or(|bound| !bound.expired_now())
-    }
 }
 
 #[cfg(test)]
@@ -59,19 +50,6 @@ pub(crate) fn test_frame(sequence:i64) -> Arc<RegisteredFrame> {
         ground_point_indices:Arc::from([]),
         sensor_origin_world:[0.5,1.0,0.5],body_position_world:[0.5,1.0,0.5],
         body_orientation_xyzw:[0.0,0.0,0.0,1.0],
-        paired_odometry_timestamp_ns:900_000_000+sequence,dispatch_bound:None,
+        paired_odometry_timestamp_ns:900_000_000+sequence,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn original_registered_source_deadline_is_not_receipt_freshness() {
-        let mut frame=(*test_frame(1)).clone();
-        frame.dispatch_bound=Some(CommandDispatchBound::from_source_timestamp(1,std::time::Duration::ZERO));
-        assert!(!frame.is_current());
-        assert!(!frame.clone().is_current());
-        assert_ne!(frame.identity.timestamp_ns,frame.paired_odometry_timestamp_ns);
-    }
 }

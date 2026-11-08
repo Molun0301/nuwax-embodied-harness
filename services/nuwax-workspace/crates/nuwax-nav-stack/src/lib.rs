@@ -141,3 +141,14 @@ mod tests {
         assert!(text.contains("profile: replanning-astar"));
     }
 }
+
+#[cfg(test)]
+pub(crate) fn static_map_follower(config:nuwax_nav_runtime::SurfaceFollowerConfig)->Result<nuwax_nav_runtime::SurfaceFollower,nuwax_nav_runtime::RuntimeError>{
+    nuwax_nav_runtime::SurfaceFollower::with_map_initializer(config,Some(|map,obstacles,ground,boundary,forbidden,body|{
+        map.seed_occupied(&obstacles.iter().chain(ground).copied().collect::<Vec<_>>(),body);
+        map.update_surface(&[],&[],boundary,forbidden)
+    }))
+}
+
+#[cfg(test)]
+mod scan_numerical_fixture;

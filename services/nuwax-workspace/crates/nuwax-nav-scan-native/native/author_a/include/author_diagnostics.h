@@ -28,8 +28,10 @@ inline void traceMapProbe(std::ostream& out, GridMap& map,
   Eigen::Vector3i index; map.posToIndex(p,index); const int address=map.toAddress(index);
   const auto& data=map.mappingData();
   out << ",\"in_map\":true,\"index\":"; traceMatrix(out,index);
-  out << ",\"log_odds\":" << data.occupancy_buffer_[address]
-      << ",\"inflated_cell\":" << int(data.occupancy_buffer_inflate_[address]) << '}';
+  out << ",\"log_odds\":";
+  if (data.occupancy_buffer_.empty()) out << "null";
+  else out << data.occupancy_buffer_[address];
+  out << ",\"inflated_cell\":" << int(map.collisionData().occupancy_buffer_inflate_[address]) << '}';
  };
  out << ",\"raw_cell\":"; cell(point);
  const auto& parameters=map.mappingParameters();
@@ -42,11 +44,13 @@ inline void traceMapProbe(std::ostream& out, GridMap& map,
      << ',' << center.z()+parameters.obstacles_inflation_z_down << ']';
  out << ",\"map_min\":"; traceMatrix(out,parameters.map_min_boundary_);
  out << ",\"map_max\":"; traceMatrix(out,parameters.map_max_boundary_);
- out << ",\"support_evidence_cells\":" << map.mappingData().support_member_max_z_.size();
+ out << ",\"support_evidence_cells\":" << map.collisionData().support_member_max_z_.size();
  const Eigen::Vector3d heading(c,s,0.);
  out << ",\"front_cell\":"; cell(center+parameters.double_cylinder_offset_*heading);
  out << ",\"rear_cell\":"; cell(center-parameters.double_cylinder_offset_*heading);
- out << ",\"occupancy_log_threshold\":" << parameters.min_occupancy_log_ << '}';
+ out << ",\"occupancy_log_threshold\":";
+ if (map.mappingData().occupancy_buffer_.empty()) out << "null"; else out << parameters.min_occupancy_log_;
+ out << '}';
 }
 
 }

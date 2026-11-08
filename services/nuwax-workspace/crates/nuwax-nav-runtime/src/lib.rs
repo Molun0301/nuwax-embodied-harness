@@ -31,15 +31,11 @@ pub mod motion_feedback;
 /// 同帧注册点云原始输入，不是融合地图。
 pub mod registered_frame;
 pub use registered_frame::{RegisteredFrame, RegisteredFrameDomain, RegisteredFrameIdentity};
-mod command_dispatch;
-pub use command_dispatch::CommandDispatchBound;
-/// Explicit elapsed-time observer seam for bounded recovery qualifications.
-#[cfg(feature = "surface-recovery-qualification")]
-pub mod qualification_timing;
+mod local_workers;
+pub use local_workers::MapInitializer;
 /// Typed actual execution feedback for deduplicating identical rejected work.
 pub mod replan_feedback;
 use replan_feedback::{ActualExecutionContext, SurfaceReplanFeedback};
-mod planner_worker;
 pub mod surface_follower;
 pub use nuwax_nav_mls_planner::SurfaceSnapshot;
 pub use surface_follower::{SurfaceFollower, SurfaceFollowerConfig};
@@ -51,10 +47,6 @@ pub mod native_map;
 pub type RouteFollower = SurfaceFollower;
 #[cfg(test)]
 mod native_test_helpers;
-#[cfg(test)]
-mod control_profile;
-#[cfg(test)]
-mod command_proof_trace;
 
 /// 平台机体参考目标。
 #[derive(Debug, Clone, PartialEq)]
@@ -124,8 +116,6 @@ pub const DEFAULT_POSE_TTL: Duration = Duration::ZERO;
 pub const DEFAULT_COSTMAP_TTL: Duration = Duration::ZERO;
 /// 默认连续等待路径或可执行运动的期限；成功执行运动后重新计时。
 pub const DEFAULT_PATH_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
-/// 局部运动预测长度，与输入过期门槛独立。
-pub const DEFAULT_CONTROL_HORIZON: Duration = Duration::from_millis(250);
 const INPUT_CAPACITY: usize = 32;
 const URGENT_CAPACITY: usize = 8;
 
@@ -203,11 +193,11 @@ pub enum SchedulerPhase {
     Idle,
     /// Waiting for the motion guard to grant a NAV lease.
     Acquiring,
-    /// 租约已取得，等待首次有效路径或已确认零速后的更新路径。
+    /// 租约已取得，等待首次有效路径或零速请求被接受后的更新路径。
     AwaitingPath,
     /// 以20赫兹运行控制器并发送速度。
     Controlling,
-    /// Cancel accepted; no more twist is issued while fence proof is pending.
+    /// 取消已接纳，释放租约期间不再发送速度。
     Cancelling,
     /// Fail-closed state. No twist or renewal is issued.
     Failed,
@@ -220,7 +210,7 @@ pub enum TerminalOutcome {
     Stopped,
     /// Cancel completed after a valid resource fence.
     Cancelled,
-    /// 规划到达、租约已围栏，停车后采样仍满足原目标。
+    /// 目标已到达，租约已释放。
     Succeeded,
     /// Planner failed and the lease was fenced.
     PlannerFailed,
@@ -398,21 +388,12 @@ pub struct CostmapObservation {
     pub source_timestamp_ns: i64,
 }
 
-/// 本地来源期限检查后的速度发送结果。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BoundedTwistOutcome {
-    /// 守卫接受了速度请求；不代表实测运动。
-    Applied,
-    /// 发送前来源期限已到。
-    ExpiredNotApplied,
-}
-
 /// 同进程地图来源事件；临时缺输入与原目标所属地图失效具有不同生命周期。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapInvalidationKind {
     /// 同域完整输入暂未到达，保持零速并等待原目标恢复。
     TemporaryUnavailable,
-    /// 显式清图、换域或完整性失效，结束原目标并取得真实停车证明。
+    /// 显式清图、换域或完整性失效，结束原目标并取得租约释放回执。
     Invalidated,
 }
 
@@ -426,11 +407,7 @@ pub trait NavMotionPort: Send + 'static {
     /// 用当前租约发送速度并续租。
     async fn velocity(&mut self, twist: Twist2) -> Result<(), MotionPortError>;
     /// 发送前保留规划器来源期限检查，不把期限写入守卫协议。
-    async fn velocity_bounded(&mut self, twist: Twist2, bound: Option<CommandDispatchBound>) -> Result<BoundedTwistOutcome, MotionPortError> {
-        if bound.is_some_and(CommandDispatchBound::expired_now) { return Ok(BoundedTwistOutcome::ExpiredNotApplied); }
-        self.velocity(twist).await?;
-        Ok(BoundedTwistOutcome::Applied)
-    }
+
     /// 目标结束时释放租约。
     async fn release(&mut self) -> Result<(), MotionPortError>;
 }
@@ -458,7 +435,7 @@ pub enum PlannerStep {
     Succeeded,
     /// Planner cannot safely continue.
     Failed(String),
-    /// 当前路径已失效，先确认零速再有界等待更新的规划修订。
+    /// 当前路径已失效，先发送零速再等待更新的规划修订。
     ReplanRequired(String),
 }
 
@@ -467,7 +444,6 @@ struct LocalExecutionCommandIntent {
     identity: Arc<PathExecutionIdentity>,
 
     payload: LocalExecutionPayload,
-    dispatch_bound: Option<CommandDispatchBound>,
     execution_context: Option<Arc<ActualExecutionContext>>,
 }
 
@@ -490,14 +466,6 @@ pub trait NavPlanner: Send + 'static {
     /// Participating backends preserve actual source/pose/carried ground across
     /// `stop`; clearing control state alone does not change this observation.
     fn refresh_execution_context(&mut self, _applied: Twist2) -> Option<Arc<ActualExecutionContext>> { None }
-    /// Context bound to the immediately returned step. Asynchronous adapters
-    /// override this with their delivered result slot, never a newer input slot.
-    fn take_step_execution_context(&mut self, applied: Twist2) -> Option<Arc<ActualExecutionContext>> {
-        self.refresh_execution_context(applied)
-    }
-    /// Take observation timing metadata belonging only to the immediately returned command.
-    /// None means that this result has no finite observation-time dependency.
-    fn take_command_dispatch_bound(&mut self)->Option<CommandDispatchBound> {None}
     /// 传递既有导航会话标识用于计算线程日志，不参与运动准入。
     fn set_goal_log_context(&mut self, _goal_id: &str) {}
     /// 接续局部路线时保留已受理任务边界；无局部重规划的后端可沿原全局路径。
@@ -567,19 +535,10 @@ pub trait NavPlanner: Send + 'static {
     fn observe_registered_frame(&mut self, _frame: Option<Arc<RegisteredFrame>>) {}
     /// 本次原算法执行周期结束，不是实际几何拒绝；只用于反馈原因分类。
     fn execution_cycle_complete(&self) -> bool { false }
-    /// 计算未完成或控制许可过期时的等待原因；命令回执不能覆盖该执行阶段。
+    /// 等待轨迹或当拍命令受阻的原因；速度回执不覆盖该原因。
     fn execution_wait_reason(&self) -> Option<String> { None }
-    /// 新结果未出时，上一条已交付且仍在执行的非零指令；超出其原有许可期返回None。
-    fn held_command(&self) -> Option<Twist2> { None }
-    /// 只读展示当前局部规划，不改变速度或路径许可。
+    /// 当前原生轨迹的只读显示副本。
     fn local_path_for_display(&self) -> Vec<[f64; 3]> { Vec::new() }
-    /// Prepare a deferred control result without blocking the scheduler task.
-    /// A receiver requests a bounded wait for publication, not command authority.
-    /// `continuing_wait` keeps an already deferred tick waiting for matching input
-    /// versions; it does not broaden which initial steps may defer.
-    /// Synchronous backends return None and retain their immediate step behavior.
-    /// Delegating adapters must forward this hook with `step` to preserve scheduling.
-    fn prepare_control_step(&mut self, _continuing_wait: bool) -> Option<watch::Receiver<()>> { None }
     /// Produce one controller step without waiting for a background computation.
     fn step(&mut self) -> PlannerStep;
     /// Clear planner state after a terminal fence.
@@ -717,12 +676,9 @@ pub struct NavScheduler<M, P> {
     pose_valid_until: Option<Instant>,
     pose_source_max_age: Option<Duration>,
     obstacle_source_available: bool,
-    obstacle_source_bound: Option<CommandDispatchBound>,
     costmap_receipt: Option<PlannerInputReceipt>,
     map_invalidated_at: Option<Instant>,
     status: SchedulerStatus,
-    #[cfg(feature = "surface-recovery-qualification")]
-    qualification_timing: Option<qualification_timing::TraceSink>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -764,185 +720,35 @@ where
             pose_valid_until: None,
             pose_source_max_age: None,
             obstacle_source_available: true,
-            obstacle_source_bound: None,
             costmap_receipt: None,
             map_invalidated_at: None,
             status,
-            #[cfg(feature = "surface-recovery-qualification")]
-            qualification_timing: None,
         })
     }
 
-    /// Attach an explicit qualification-only observer; default construction is silent.
-    #[cfg(feature = "surface-recovery-qualification")]
-    pub fn with_qualification_timing(mut self, sink: qualification_timing::TraceSink) -> Self {
-        self.qualification_timing = Some(sink);
-        self
-    }
-
-    #[cfg(feature = "surface-recovery-qualification")]
-    fn qualification_span(&self, phase: &'static str, source: i64)
-        -> Option<qualification_timing::SpanGuard> {
-        self.qualification_timing.as_ref().map(|sink| sink.span(phase, source))
-    }
-
-    #[cfg(feature = "surface-recovery-qualification")]
-    fn qualification_snapshot(&self, phase: &'static str, source: i64,
-        stale: Option<bool>, stale_cause_bits: u8) {
-        let Some(sink) = self.qualification_timing.as_ref().filter(|sink| sink.enabled()) else { return; };
-        // These are copies of admitted fields. Do not call refresh_input_status,
-        // stale_input_reason, expired_now, planner methods, or any geometry here.
-        let now = Instant::now();
-        let recent = self.obstacle_source_bound.map(|bound| bound.qualification_timing_fields());
-        sink.snapshot_at(phase, source, now.into_std(), qualification_timing::SchedulerSnapshot {
-            phase: self.status.phase, lease_active: self.lease_active,
-            session_active: self.session.is_some(), planner_inputs_fresh: self.status.planner_inputs_fresh,
-            path_revision: self.current_path_revision,
-            pose_source_ns: self.pose_receipt.map(|receipt| receipt.source_timestamp_ns),
-            map_source_ns: self.costmap_receipt.map(|receipt| receipt.source_timestamp_ns),
-            pose_receipt_age_ns: self.pose_receipt.map(|receipt|
-                qualification_timing::nanos(now.saturating_duration_since(receipt.received_at))),
-            map_receipt_age_ns: self.costmap_receipt.map(|receipt|
-                qualification_timing::nanos(now.saturating_duration_since(receipt.received_at))),
-            pose_deadline_remaining_ns: self.pose_valid_until.map(|deadline|
-                qualification_timing::remaining_ns(deadline.into_std(), now.into_std())),
-            recent_available: self.obstacle_source_available,
-            recent_bound_present: recent.is_some(),
-            recent_anchor_unix_ns: recent.map(|(anchor, _, _)| anchor),
-            recent_latest_issue_unix_ns: recent.map(|(_, latest, _)| latest),
-            recent_deadline_remaining_ns: recent.and_then(|(_, _, deadline)| deadline)
-                .map(|deadline| qualification_timing::remaining_ns(deadline, now.into_std())),
-            last_applied: self.status.last_applied_twist.map(|twist|
-                [twist.linear.x, twist.linear.y, twist.angular_z]),
-            stale, stale_cause_bits,
-        });
-    }
-
-    async fn run(
-        mut self,
-        mut input_rx: mpsc::Receiver<InputCommand>,
-        mut urgent_rx: mpsc::Receiver<UrgentCommand>,
-        status_tx: watch::Sender<SchedulerStatus>,
-    ) -> Result<(), RuntimeError> {
-        let mut tick = interval_at(
-            Instant::now() + self.config.tick_interval,
-            self.config.tick_interval,
-        );
+    async fn run(mut self,mut input_rx:mpsc::Receiver<InputCommand>,mut urgent_rx:mpsc::Receiver<UrgentCommand>,
+        status_tx:watch::Sender<SchedulerStatus>)->Result<(),RuntimeError>{
+        let mut tick=interval_at(Instant::now()+self.config.tick_interval,self.config.tick_interval);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut input_open = true;
-        let mut urgent_open = true;
-        let mut deferred_control: Option<DeferredControl> = None;
-
+        let mut input_open=true;let mut urgent_open=true;
         loop {
-            // A deferred tick belongs to one accepted path, never the next goal
-            // or a replacement path admitted while computation was outstanding.
-            if deferred_control.as_ref().is_some_and(|wait|
-                self.status.phase != SchedulerPhase::Controlling
-                    || !self.current_execution_identity.as_ref()
-                        .is_some_and(|identity| Arc::ptr_eq(identity, &wait.identity))) {
-                deferred_control = None;
-            }
-            if !input_open && !urgent_open {
-                return self
-                    .finish_terminal(&status_tx, TerminalOutcome::Shutdown, SchedulerPhase::Idle)
-                    .await;
-            }
-
-            let controlling = matches!(
-                self.status.phase,
-                SchedulerPhase::AwaitingPath | SchedulerPhase::Controlling
-            );
-            tokio::select! {
-                biased;
-
-                command = urgent_rx.recv(), if urgent_open => {
-                    match command {
-                        Some(command) => {
-                            if let Some(result) = self.handle_urgent(&status_tx, command).await {
-                                return result;
-                            }
-                        }
-                        None => urgent_open = false,
-                    }
-                }
-
-                event = async {
-                    if let Some(wait) = deferred_control.as_mut() {
-                        match wait.queued_inputs {
-                            Some(0) => SchedulerEvent::ControlReady,
-                            Some(_) => SchedulerEvent::Input(input_rx.recv().await),
-                            None => tokio::select! {
-                                biased;
-                                finish = wait.ready() => SchedulerEvent::Publication(finish),
-                                _ = tick.tick() => SchedulerEvent::Heartbeat,
-                                command = input_rx.recv(), if input_open => SchedulerEvent::Input(command),
-                            },
-                        }
-                    } else {
-                        // 普通输入与控制公平轮换；取消和续租仍由外层优先选择。
-                        tokio::select! {
-                            command=input_rx.recv(), if input_open=>SchedulerEvent::Input(command),
-                            _=tick.tick(), if controlling=>SchedulerEvent::Tick,
-                            else=>std::future::pending().await,
-                        }
-                    }
-                } => match event {
-                    SchedulerEvent::Input(command)=> {
-                        if let Some(remaining) = deferred_control.as_mut().and_then(|wait| wait.queued_inputs.as_mut()) {
-                            *remaining = remaining.saturating_sub(1);
-                        }
-                        match command {
-                            Some(command)=>self.handle_input(&status_tx,command).await,
-                            None=>input_open=false,
-                        }
-                    }
-                    SchedulerEvent::Publication(finish_wait) => {
-                        if let Some(wait) = deferred_control.as_mut() {
-                            // Admit the finite prefix already queued at readiness.
-                            // Versions advance only in handle_input, so consuming a
-                            // publication first could otherwise dispatch old sources.
-                            // New arrivals do not extend this prefix or its deadline.
-                            wait.queued_inputs = Some(input_rx.len());
-                            wait.finish_wait = finish_wait;
-                        }
-                    }
-                    SchedulerEvent::Heartbeat => {
-                        let command = if self.stale_input_reason(Instant::now()).is_some() { Twist2::ZERO }
-                            else { self.planner.held_command().unwrap_or(Twist2::ZERO) };
-                        if let Err(error) = self.send_controller_twist_with_bound(&status_tx, command, None, false).await {
-                            if self.session.is_none() { continue; }
-                            return Err(error);
-                        }
-                    }
-                    SchedulerEvent::Tick | SchedulerEvent::ControlReady => {
+            if !input_open&&!urgent_open{return self.finish_terminal(&status_tx,TerminalOutcome::Shutdown,SchedulerPhase::Idle).await;}
+            let controlling=matches!(self.status.phase,SchedulerPhase::AwaitingPath|SchedulerPhase::Controlling);
+            tokio::select!{biased;
+                command=urgent_rx.recv(),if urgent_open=>match command{
+                    Some(command)=>if let Some(result)=self.handle_urgent(&status_tx,command).await{return result},None=>urgent_open=false},
+                event=async{tokio::select!{
+                    command=input_rx.recv(),if input_open=>SchedulerEvent::Input(command),
+                    _=tick.tick(),if controlling=>SchedulerEvent::Tick,
+                    else=>std::future::pending().await,
+                }}=>match event{
+                    SchedulerEvent::Input(command)=>match command{Some(command)=>self.handle_input(&status_tx,command).await,None=>input_open=false},
+                    SchedulerEvent::Tick=>{
                         self.planner.observe_measured_motion(self.motion.measured_motion());
-                        let previous = deferred_control.take();
-                        let deadline = previous.as_ref().map_or_else(
-                            || Instant::now() + self.config.tick_interval, |wait| wait.deadline);
-                        let finish_wait = previous.as_ref().is_some_and(|wait| wait.finish_wait)
-                            || Instant::now() >= deadline;
-                        if !finish_wait && self.status.phase == SchedulerPhase::Controlling {
-                            if let Some(identity) = self.current_execution_identity.clone() {
-                                let publication = {
-                                    #[cfg(feature = "surface-recovery-qualification")]
-                                    let _qualification_span = self.qualification_span(
-                                        "scheduler.prepare_control_step", self.status.pose_source_timestamp_ns);
-                                    self.planner.prepare_control_step(previous.is_some())
-                                };
-                                if let Some(publication) = publication {
-                                    deferred_control = Some(DeferredControl {
-                                        publication, deadline, identity, queued_inputs: None, finish_wait: false,
-                                    });
-                                    continue;
-                                }
-                            }
+                        if let Err(error)=self.session_tick(&status_tx).await{
+                            if !self.lease_active&&self.session.is_none(){continue;}
+                            self.status.motion_sink_ready=false;self.publish_status(&status_tx);return Err(error);
                         }
-                    if let Err(error) = self.session_tick(&status_tx).await {
-                        if !self.lease_active && self.session.is_none() { continue; }
-                        self.status.motion_sink_ready = false;
-                        self.publish_status(&status_tx);
-                        return Err(error);
-                    }
                     }
                 }
             }
@@ -956,10 +762,7 @@ where
     ) -> Option<Result<(), RuntimeError>> {
         match command {
             UrgentCommand::Cancel { session_id, reply } => {
-                #[cfg(feature = "surface-recovery-qualification")]
-                if let Some(sink) = &self.qualification_timing {
-                    sink.mark("scheduler.cancel.handle.enter", 0);
-                }
+
                 let result = self.cancel(status_tx, &session_id).await;
                 let _ = reply.send(result);
                 None
@@ -1009,29 +812,7 @@ where
         status_tx: &watch::Sender<SchedulerStatus>,
         command: InputCommand,
     ) {
-        #[cfg(feature = "surface-recovery-qualification")]
-        let qualification_input = self.qualification_timing.as_ref().map(|sink| {
-            let (kind, source) = match &command.kind {
-                InputKind::StartSession(_) => ("scheduler.input.start_session", 0),
-                InputKind::SubmitPath(_) => ("scheduler.input.path", 0),
-                InputKind::UpdateOdometry(pose, _, _) | InputKind::UpdateSourceOdometry(pose, _, _) => ("scheduler.input.pose", pose.stamp.nanos),
-                InputKind::UpdateCostmap(map, _) => ("scheduler.input.map", map.source_timestamp_ns),
-                // Runtime owns no recent source timestamp; record its actual incoming bound.
-                InputKind::UpdateObstacleSource(_, _, _, _) => ("scheduler.input.recent", 0),
-                InputKind::PlanningDiagnostic(_, _, _, _, _) => ("scheduler.input.planning_diagnostic", 0),
-                InputKind::CapturePlanningActual(_, _) => ("scheduler.input.capture_actual", 0),
-            };
-            sink.mark("scheduler.input.dequeue", source);
-            match &command.kind {
-                InputKind::SubmitPath(path) => sink.count("scheduler.input.path_revision", source, path.path_revision),
-                InputKind::UpdateObstacleSource(_, available, bound, _) => {
-                    sink.count("scheduler.input.recent_available", 0, u64::from(*available));
-                    sink.bound("scheduler.input.recent_bound", 0, *bound);
-                }
-                _ => {}
-            }
-            (sink.clone(), source, sink.span(kind, source))
-        });
+
         let result = match command.kind {
             InputKind::StartSession(session) => self.start_session(status_tx, session).await,
             InputKind::SubmitPath(path) => self.submit_path(status_tx, path).await,
@@ -1044,13 +825,12 @@ where
             InputKind::UpdateCostmap(observation, received_at) => {
                 self.observe_costmap(status_tx, observation, received_at)
             }
-            InputKind::UpdateObstacleSource(map, available, bound, registered) => (|| {
+            InputKind::UpdateObstacleSource(map, available, registered) => (|| {
                 if let Some(frame) = registered { self.planner.observe_registered_frame(frame); }
                 if let Some(map)=map {
                     self.planner.update_execution_map(map.clone())?;
                 }
                 self.obstacle_source_available=available;
-                self.obstacle_source_bound=bound;
                 self.refresh_input_status(Instant::now());
                 self.publish_status(status_tx);
                 Ok(())
@@ -1060,8 +840,7 @@ where
                     session.execution_identity.session_id == identity.session_id && session.execution_identity.goal_key == identity.goal_key);
                 let context = if matching
                     && self.stale_input_reason(Instant::now()).is_none() {
-                    // Worker reads only its same-version publication, including the
-                    // lifecycle-only Initial commit when there is no path yet.
+                    // 这里只读取当前已消费的实际输入，不执行跟踪或几何检查。
                     self.planner.refresh_execution_context(self.status.last_applied_twist.unwrap_or(Twist2::ZERO))
                         .filter(|context| self.latest_pose.as_ref().is_some_and(|pose|
                             replan_feedback::same_pose(pose, &context.odometry)))
@@ -1086,14 +865,9 @@ where
                 } else {Ok(())}
             }
         };
-        #[cfg(feature = "surface-recovery-qualification")]
-        let qualification_ok = result.is_ok();
+
         let _ = command.reply.send(result);
-        #[cfg(feature = "surface-recovery-qualification")]
-        if let Some((sink, source, _span)) = qualification_input {
-            sink.mark(if qualification_ok { "scheduler.input.ack.ok" }
-                else { "scheduler.input.ack.error" }, source);
-        }
+
     }
 
     #[cfg(test)]
@@ -1222,7 +996,7 @@ where
                     && check_pose_data_age(receipt.source_timestamp_ns, maximum).is_ok()))
             && self.pose_valid_until.is_none_or(|deadline| now < deadline)
             && self.obstacle_source_available
-            && self.obstacle_source_bound.is_none_or(|bound|!bound.expired_now())
+
             && self.costmap_receipt.is_some_and(|receipt| {
                 self.config.costmap_ttl.is_zero() || now.duration_since(receipt.received_at) <= self.config.costmap_ttl
             });
@@ -1236,9 +1010,7 @@ where
 
     fn input_wait_reason(&self, now: Instant) -> Option<String> {
         if !self.obstacle_source_available {return Some("recent obstacle source revoked".into());}
-        if self.obstacle_source_bound.is_some_and(CommandDispatchBound::expired_now) {
-            return Some("recent obstacle source deadline elapsed".into());
-        }
+
         let pose_reason = if let Some(maximum) = self.pose_source_max_age {
             self.pose_receipt.and_then(|receipt| {
                 if !nuwax_nav_types_messages::source_time::input_is_alive(
@@ -1439,28 +1211,14 @@ where
         &mut self,
         status_tx: &watch::Sender<SchedulerStatus>,
     ) -> Result<(), RuntimeError> {
-        #[cfg(feature = "surface-recovery-qualification")]
-        let _qualification_span = self.qualification_span("scheduler.control_tick", self.status.pose_source_timestamp_ns);
-        #[cfg(feature = "surface-recovery-qualification")]
-        self.qualification_snapshot("scheduler.control_tick.enter", self.status.pose_source_timestamp_ns, None, 0);
+
         if let Some(reason) = self.stale_input_reason(Instant::now()) {
-            #[cfg(feature = "surface-recovery-qualification")]
-            if self.qualification_timing.as_ref().is_some_and(|sink| sink.enabled()) {
-                // Classify only the existing result. Never evaluate staleness again.
-                let mut bits = 0;
-                if reason.contains("pose") { bits |= 1; }
-                if reason.contains("costmap") { bits |= 2; }
-                if reason.contains("recent") { bits |= 4; }
-                if bits == 0 { bits = 8; }
-                self.qualification_snapshot("scheduler.control_tick.stale", self.status.pose_source_timestamp_ns, Some(true), bits);
-            }
+
             return self.wait_for_fresh_input(status_tx, reason).await;
         }
-        #[cfg(feature = "surface-recovery-qualification")]
-        self.qualification_snapshot("scheduler.control_tick.fresh", self.status.pose_source_timestamp_ns, Some(false), 0);
+
         let mut step = {
-            #[cfg(feature = "surface-recovery-qualification")]
-            let _qualification_span = self.qualification_span("scheduler.planner.step", self.status.pose_source_timestamp_ns);
+
             self.planner.step()
         };
         if self.current_route_kind == RouteKind::Approach {
@@ -1475,47 +1233,26 @@ where
             }
         }
         let intent = self.wrap_local_intent(step)?;
-        // This evidence belongs to the exact delivered step and accepted path.
-        // It is not reconstructed from the scheduler's latest map/pose inputs.
+        // 当拍同步跟踪与当前路线对应，实际上下文只供全局反馈复用。
         self.status.surface_replan_feedback = Some(SurfaceReplanFeedback {
             path_identity: Arc::clone(&intent.identity),
             rejected_context: None,
             current_context: intent.execution_context.clone(),
-            zero_confirmed_rejection: false,
+            zero_sent_rejection: false,
             rejection_reason: None,
         });
         match intent.payload {
             LocalExecutionPayload::Command(twist) => {
                 let wait_reason = self.planner.execution_wait_reason();
-                if !self.apply_controller_twist_with_bound(status_tx, twist, intent.dispatch_bound).await? {
-                    self.path_wait_started_at.get_or_insert_with(Instant::now);
-                    return self.check_path_wait_timeout(status_tx).await;
-                }
-                if twist == Twist2::ZERO {
-                    // 零速已确认不等于规划恢复；同一轮持续等待不能被每拍归零续期。
-                    // 正常制动后会继续运动或到达；缺少原因也不能无限清除等待期限。
-                    self.path_wait_started_at.get_or_insert_with(Instant::now);
-                    self.status.message = wait_reason.filter(|reason| !reason.trim().is_empty())
-                        .unwrap_or_else(|| "控制器持续零速，等待可执行运动".into());
+                self.apply_controller_twist(status_tx,twist).await?;
+                if twist==Twist2::ZERO{
+                    self.status.message=wait_reason.filter(|r|!r.trim().is_empty()).unwrap_or_else(||"控制器持续零速，等待可执行运动".into());
                     self.publish_status(status_tx);
-                    return self.check_path_wait_timeout(status_tx).await;
                 }
-                if self.awaiting_session_path {
-                    self.check_path_wait_timeout(status_tx).await
-                } else {
-                    self.path_wait_started_at = None;
-                    Ok(())
-                }
+                Ok(())
             }
             LocalExecutionPayload::Pending(failures) => {
-                // 只是下一结果未出时，上一指令在原许可期内继续执行；
-                // 足式机器人一两拍零速停不下来，只会打断步态。
-                if let Some(held) = self.planner.held_command() {
-                    self.apply_controller_twist(status_tx, held).await?;
-                    return Ok(());
-                }
                 self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
-                self.path_wait_started_at.get_or_insert_with(Instant::now);
                 // Rebuild from this tick's evidence; never append to the previous status.
                 self.status.message = self.planner.execution_wait_reason()
                     .filter(|reason| !reason.trim().is_empty())
@@ -1524,35 +1261,27 @@ where
                     self.status.message = format!("{}: {failures:?}", self.status.message);
                 }
                 self.publish_status(status_tx);
-                self.check_path_wait_timeout(status_tx).await
+                Ok(())
             }
             LocalExecutionPayload::ReplanRequired(reason) => {
                 self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
-                // A same-valued ZERO receipt leaves the worker's exact actual
-                // input versions current. Preserve that snapshot before stop
-                // retires control epoch; stop does not change source/pose/ground.
-                // A changed speed/input still yields None and normal planning.
-                let stopped_context=self.planner.refresh_execution_context(Twist2::ZERO);
+                let zero_sent_context=self.planner.refresh_execution_context(Twist2::ZERO);
                 self.planner.stop();
-                self.path_wait_started_at.get_or_insert_with(Instant::now);
                 self.status.phase = SchedulerPhase::AwaitingPath;
-                // Never relabel the rejection's pre-braking context as stopped.
-                // `stopped_context` exists only if ZERO was already consumed
-                // with these exact actual source/pose/applied/boundary versions.
                 self.status.surface_replan_feedback = Some(SurfaceReplanFeedback {
                     path_identity: Arc::clone(&intent.identity),
                     rejected_context: intent.execution_context,
-                    current_context: stopped_context,
-                    zero_confirmed_rejection: true,
+                    current_context: zero_sent_context,
+                    zero_sent_rejection: true,
                     rejection_reason: Some(reason.clone()),
                 });
-                self.status.message = format!("路径失效，零速已执行，等待更新路径: {reason}");
+                self.status.message = format!("路径失效，零速请求已接受，等待更新路径: {reason}");
                 self.publish_status(status_tx);
                 Ok(())
             }
             LocalExecutionPayload::Succeeded if self.awaiting_session_path => {
                 self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
-                self.check_path_wait_timeout(status_tx).await
+                Ok(())
             }
             LocalExecutionPayload::Succeeded => {
                 self.finish_terminal(status_tx, TerminalOutcome::Succeeded, SchedulerPhase::Idle)
@@ -1576,86 +1305,19 @@ where
     }
 
     /// 运动和等待重规划的零速共用同一提交与回执校验路径。
-    async fn apply_controller_twist(
-        &mut self, status_tx:&watch::Sender<SchedulerStatus>, twist:Twist2,
-    )->Result<(),RuntimeError> {
-        self.apply_controller_twist_with_bound(status_tx,twist,None).await.map(|_|())
+    async fn apply_controller_twist(&mut self,status_tx:&watch::Sender<SchedulerStatus>,twist:Twist2)->Result<(),RuntimeError>{
+        if let Err(error)=self.motion.velocity(twist).await{return Err(self.motion_failed(status_tx,error).await);}
+        self.status.applied_commands+=1;self.status.last_applied_twist=Some(twist);
+        self.planner.observe_measured_motion(self.motion.measured_motion());self.planner.observe_applied_command(twist);
+        if twist!=Twist2::ZERO{self.path_wait_started_at=None;}
+        else{self.path_wait_started_at.get_or_insert_with(Instant::now);}
+        if let Some(feedback)=&mut self.status.surface_replan_feedback{
+            if feedback.current_context.as_ref().is_some_and(|c|c.applied!=twist){feedback.current_context=None;}
+        }
+        self.status.message="速度请求已接受".into();self.publish_status(status_tx);Ok(())
     }
 
     // False means the selected command expired and an ordinary zero was confirmed.
-    async fn apply_controller_twist_with_bound(
-        &mut self, status_tx:&watch::Sender<SchedulerStatus>, twist:Twist2,
-        bound:Option<CommandDispatchBound>,
-    )->Result<bool,RuntimeError> {
-        self.send_controller_twist_with_bound(status_tx,twist,bound,true).await
-    }
-
-    async fn send_controller_twist_with_bound(
-        &mut self, status_tx:&watch::Sender<SchedulerStatus>, twist:Twist2,
-        mut bound:Option<CommandDispatchBound>, publish_message:bool,
-    )->Result<bool,RuntimeError> {
-        #[cfg(feature = "surface-recovery-qualification")]
-        let _qualification_span = self.qualification_span("scheduler.apply_controller_twist", self.status.pose_source_timestamp_ns);
-        #[cfg(feature = "surface-recovery-qualification")]
-        if let Some(sink) = &self.qualification_timing {
-            sink.motion("scheduler.apply.requested", self.status.pose_source_timestamp_ns,
-                [twist.linear.x, twist.linear.y, twist.angular_z]);
-        }
-        if twist!=Twist2::ZERO {
-            if let Some(source)=self.obstacle_source_bound {
-                bound=Some(bound.map_or(source,|candidate|candidate.earliest(source)));
-            }
-        }
-        let mut applied_twist=twist;
-        let mut expired=false;
-        loop {
-            #[cfg(feature = "surface-recovery-qualification")]
-            self.qualification_snapshot("scheduler.motion.submit.enter", self.status.pose_source_timestamp_ns, None, 0);
-            let outcome = {
-                #[cfg(feature = "surface-recovery-qualification")]
-                let _qualification_span = self.qualification_span("scheduler.motion.submit", self.status.pose_source_timestamp_ns);
-                #[cfg(feature = "surface-recovery-qualification")]
-                if let Some(sink) = &self.qualification_timing {
-                    sink.motion("scheduler.motion.submit.command", self.status.pose_source_timestamp_ns,
-                        [applied_twist.linear.x, applied_twist.linear.y, applied_twist.angular_z]);
-                    sink.bound("scheduler.motion.submit.bound", self.status.pose_source_timestamp_ns, bound);
-                }
-                self.motion.velocity_bounded(applied_twist,bound).await
-            };
-            #[cfg(feature = "surface-recovery-qualification")]
-            if let Some(sink) = &self.qualification_timing {
-                sink.mark(match &outcome {
-                    Ok(BoundedTwistOutcome::Applied) => "scheduler.motion.submit.return.applied",
-                    Ok(BoundedTwistOutcome::ExpiredNotApplied) => "scheduler.motion.submit.return.expired",
-                    Err(_) => "scheduler.motion.submit.return.error",
-                }, self.status.pose_source_timestamp_ns);
-            }
-            match outcome {
-                Ok(BoundedTwistOutcome::Applied)=>{},
-                Ok(BoundedTwistOutcome::ExpiredNotApplied) if bound.is_some()=>{
-                    applied_twist=Twist2::ZERO;bound=None;expired=true;continue;
-                },
-                Ok(BoundedTwistOutcome::ExpiredNotApplied)=>{
-                    return Err(self.fail_closed(status_tx,RuntimeError::Motion("unbounded zero submission reported observation expiry".into())).await);
-                },
-                Err(error)=>return Err(self.motion_failed(status_tx,error).await),
-            };
-            self.status.applied_commands=self.status.applied_commands.saturating_add(1);
-            self.status.last_applied_twist=Some(applied_twist);
-            self.planner.observe_measured_motion(self.motion.measured_motion());
-            self.planner.observe_applied_command(applied_twist);
-            if let Some(feedback)=&mut self.status.surface_replan_feedback {
-                if feedback.current_context.as_ref().is_some_and(|context|
-                    [context.applied.linear.x,context.applied.linear.y,context.applied.angular_z].map(f64::to_bits)
-                        != [applied_twist.linear.x,applied_twist.linear.y,applied_twist.angular_z].map(f64::to_bits)) {
-                    feedback.current_context=None;
-                }
-            }
-            if publish_message { self.status.message=if expired {"执行来源凭据在下发前已过期，零速已执行，等待重新计算".into()}else{"速度请求已接受".into()}; }
-            self.publish_status(status_tx);
-            return Ok(!expired);
-        }
-    }
 
     fn wrap_local_intent(
         &mut self,
@@ -1665,10 +1327,8 @@ where
             RuntimeError::Planner("local planner produced an intent without an active path".into())
         })?);
         // An internal planner initialization ZERO is not an APPLIED receipt.
-        let execution_context=self.status.last_applied_twist
-            .and_then(|applied|self.planner.take_step_execution_context(applied));
-        let candidate_bound=self.planner.take_command_dispatch_bound();
-        let dispatch_bound=if matches!(&step,PlannerStep::Command(v) if *v!=Twist2::ZERO) {candidate_bound}else{None};
+        let execution_context=(!self.planner.execution_cycle_complete()).then_some(self.status.last_applied_twist)
+            .flatten().and_then(|applied|self.planner.refresh_execution_context(applied));
         let payload = match step {
             PlannerStep::Command(twist) => LocalExecutionPayload::Command(twist),
             PlannerStep::Pending(failures) => LocalExecutionPayload::Pending(failures),
@@ -1679,45 +1339,24 @@ where
         Ok(LocalExecutionCommandIntent {
             identity,
             payload,
-            dispatch_bound,
             execution_context,
         })
     }
 
-    async fn session_tick(
-        &mut self,
-        status_tx: &watch::Sender<SchedulerStatus>,
-    ) -> Result<(), RuntimeError> {
-        if self.status.phase == SchedulerPhase::Controlling {
-            return self.control_tick(status_tx).await;
-        }
-        if self.status.phase != SchedulerPhase::AwaitingPath {
-            return Ok(());
-        }
-        if self.current_path_revision > 0 {
-            if let Some(reason) = self.stale_input_reason(Instant::now()) {
-                return self.wait_for_fresh_input(status_tx, reason).await;
-            }
-        }
-        self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
-        self.check_path_wait_timeout(status_tx).await?;
-        if self.status.phase == SchedulerPhase::AwaitingPath {
-            // Preserve the original stale/deadline checks and their ordering.
-            // Worker getter is a short snapshot read, never a controller step.
-            let context=self.status.last_applied_twist
-                .and_then(|applied|self.planner.refresh_execution_context(applied));
-            let mut changed=false;
-            if let Some(feedback)=&mut self.status.surface_replan_feedback {
-                if feedback.zero_confirmed_rejection
-                    && self.current_execution_identity.as_ref().is_some_and(|identity|
-                        identity.as_ref()==feedback.path_identity.as_ref())
-                    && feedback.current_context != context {
-                    feedback.current_context=context;
-                    changed=true;
+    async fn session_tick(&mut self,status_tx:&watch::Sender<SchedulerStatus>)->Result<(),RuntimeError>{
+        match self.status.phase{
+            SchedulerPhase::Controlling=>self.control_tick(status_tx).await?,
+            SchedulerPhase::AwaitingPath=>{
+                if let Some(reason)=self.stale_input_reason(Instant::now()){
+                    self.wait_for_fresh_input(status_tx,reason).await?;
+                }else{self.apply_controller_twist(status_tx,Twist2::ZERO).await?;}
+                let context=self.status.last_applied_twist.and_then(|v|self.planner.refresh_execution_context(v));
+                if let Some(feedback)=&mut self.status.surface_replan_feedback{
+                    if feedback.zero_sent_rejection{feedback.current_context=context;}
                 }
-            }
-            if changed {self.publish_status(status_tx);}
+            },_=>return Ok(())
         }
+        if self.session.is_some(){self.check_path_wait_timeout(status_tx).await?;}
         Ok(())
     }
 
@@ -1727,23 +1366,19 @@ where
         reason: String,
     ) -> Result<(), RuntimeError> {
         // 重复过期、零速回执和新路径都不能重置原等待起点。
-        self.path_wait_started_at.get_or_insert_with(Instant::now);
         if self.lease_active {
             self.apply_controller_twist(status_tx, Twist2::ZERO).await?;
         }
         self.status.message = format!("等待新鲜导航输入: {reason}");
         self.publish_status(status_tx);
-        self.check_path_wait_timeout(status_tx).await
+        Ok(())
     }
 
     async fn check_path_wait_timeout(
         &mut self,
         status_tx: &watch::Sender<SchedulerStatus>,
     ) -> Result<(), RuntimeError> {
-        let Some(started_at) = self.path_wait_started_at else {
-            let error = RuntimeError::Planner("awaiting path without a deadline".into());
-            return Err(self.fail_closed(status_tx, error).await);
-        };
+        let Some(started_at)=self.path_wait_started_at else{return Ok(())};
         if self.config.path_wait_timeout.is_zero()
             || Instant::now().duration_since(started_at) < self.config.path_wait_timeout {
             return Ok(());
@@ -1807,7 +1442,7 @@ where
                 self.publish_status(status_tx);
                 original
             }
-            // finish_terminal 已将首因和停车失败一并发布，不能在返回时重复拼接。
+            // finish_terminal 已将首因和释放租约失败一并发布，不能在返回时重复拼接。
             Err(fence_error) => RuntimeError::Motion(format!(
                 "{original}; explicit fence also failed: {fence_error}"
             )),
@@ -1820,10 +1455,7 @@ where
         terminal: TerminalOutcome,
         phase_after: SchedulerPhase,
     ) -> Result<(), RuntimeError> {
-        #[cfg(feature = "surface-recovery-qualification")]
-        let _qualification_span = self.qualification_span("scheduler.finish_terminal", self.status.pose_source_timestamp_ns);
-        #[cfg(feature = "surface-recovery-qualification")]
-        self.qualification_snapshot("scheduler.finish_terminal.enter", self.status.pose_source_timestamp_ns, None, 0);
+
         // 上层可能只消费首次终态；先保留真实原因，不能等围栏完成后再补发。
         let failure_reason = matches!(terminal, TerminalOutcome::PlannerFailed | TerminalOutcome::SafetyFailed)
             .then(|| self.status.message.clone());
@@ -1836,8 +1468,7 @@ where
         self.current_execution_identity = None;
 
         {
-            #[cfg(feature = "surface-recovery-qualification")]
-            let _qualification_span = self.qualification_span("scheduler.finish_terminal.planner_stop", self.status.pose_source_timestamp_ns);
+
             self.planner.stop();
         }
         let release_error = if self.lease_active {
@@ -1852,11 +1483,6 @@ where
             }
         } else { None };
 
-        {
-            #[cfg(feature = "surface-recovery-qualification")]
-            let _qualification_span = self.qualification_span("scheduler.finish_terminal.planner_stop", self.status.pose_source_timestamp_ns);
-            self.planner.stop();
-        }
         self.session = None;
         self.current_path_revision = 0;
 
@@ -1944,16 +1570,10 @@ pub struct NavSchedulerHandle {
     input_tx: mpsc::Sender<InputCommand>,
     urgent_tx: mpsc::Sender<UrgentCommand>,
     status_rx: watch::Receiver<SchedulerStatus>,
-    #[cfg(feature = "surface-recovery-qualification")]
-    qualification_timing: Option<qualification_timing::TraceSink>,
 }
 
 impl NavSchedulerHandle {
     /// Observer explicitly attached before spawn; None is the silent default.
-    #[cfg(feature = "surface-recovery-qualification")]
-    pub fn qualification_timing(&self) -> Option<&qualification_timing::TraceSink> {
-        self.qualification_timing.as_ref()
-    }
 
     /// Acquire a lease for a new session.
     pub async fn start_session(&self, session: NavSession) -> Result<(), RuntimeError> {
@@ -1990,7 +1610,7 @@ impl NavSchedulerHandle {
             .await
     }
 
-    /// 生产位姿保留实际采集单调时刻，停车复核不能把队列消费当新采样。
+    /// 生产位姿保留实际采集单调时刻，保留采集时刻，不把队列消费当新采样。
     pub async fn update_odometry_with_acquisition(
         &self, odometry: PoseStamped, acquired_at: Instant, valid_until: Instant,
     ) -> Result<(), RuntimeError> {
@@ -2015,15 +1635,13 @@ impl NavSchedulerHandle {
 
     /// Refresh only current obstacle evidence and its admitted source deadline.
     /// Persistent terrain receipts and planning geometry versions are unchanged.
-    pub async fn update_obstacle_source(&self,map:Option<ExecutionMap>,available:bool,
-        bound:Option<CommandDispatchBound>)->Result<(),RuntimeError> {
-        self.send_input(InputKind::UpdateObstacleSource(map,available,bound,(!available).then_some(None))).await
+    pub async fn update_obstacle_source(&self,map:Option<ExecutionMap>,available:bool)->Result<(),RuntimeError>{
+        self.send_input(InputKind::UpdateObstacleSource(map,available,(!available).then_some(None))).await
     }
 
     /// 原子交付现有障碍来源资格与同帧原始注册输入，不增加另一个时钟。
-    pub async fn update_registered_obstacle_source(&self, map:Option<ExecutionMap>, available:bool,
-        bound:Option<CommandDispatchBound>, frame:Option<Arc<RegisteredFrame>>)->Result<(),RuntimeError> {
-        self.send_input(InputKind::UpdateObstacleSource(map,available,bound,Some(frame))).await
+    pub async fn update_registered_obstacle_source(&self,map:Option<ExecutionMap>,available:bool,frame:Option<Arc<RegisteredFrame>>)->Result<(),RuntimeError>{
+        self.send_input(InputKind::UpdateObstacleSource(map,available,Some(frame))).await
     }
 
     /// 保留实际地图接收时刻，表面构建完成或队列等待不能延长输入有效期。
@@ -2046,14 +1664,11 @@ impl NavSchedulerHandle {
             })
             .await
             .map_err(|_| RuntimeError::SchedulerStopped)?;
-        #[cfg(feature = "surface-recovery-qualification")]
-        if let Some(sink) = &self.qualification_timing {
-            sink.mark("scheduler.cancel.send.accepted", 0);
-        }
+
         result.await.map_err(|_| RuntimeError::SchedulerStopped)?
     }
 
-    /// 明确撤销地图来源；活跃会话等待失败停车围栏，空闲状态不申请运动租约。
+    /// 明确撤销地图来源；活跃会话等待失败租约释放，空闲状态不申请运动租约。
     pub async fn invalidate_map(&self, reason: impl Into<String>) -> Result<(), RuntimeError> {
         self.invalidate_map_received(reason, Instant::now(), MapInvalidationKind::Invalidated).await
     }
@@ -2094,7 +1709,7 @@ impl NavSchedulerHandle {
         result.await.map_err(|_| RuntimeError::SchedulerStopped)?
     }
 
-    /// 全局拥有方确认无法继续逼近时沿当前会话的原停车围栏结束。
+    /// 全局拥有方确认无法继续逼近时沿当前会话的原租约释放结束。
     pub async fn report_planning_failure(&self,goal_id:String,key:GoalKey,message:String)->Result<(),RuntimeError> {
         self.send_input(InputKind::PlanningDiagnostic(goal_id,key,message,true,false)).await
     }
@@ -2116,42 +1731,15 @@ impl NavSchedulerHandle {
     }
 
     async fn send_input(&self, kind: InputKind) -> Result<(), RuntimeError> {
-        #[cfg(feature = "surface-recovery-qualification")]
-        let qualification_input = self.qualification_timing.as_ref().map(|sink| {
-            let (phase, source) = match &kind {
-                InputKind::StartSession(_) => ("scheduler.send.start_session", 0),
-                InputKind::SubmitPath(_) => ("scheduler.send.path", 0),
-                InputKind::UpdateOdometry(pose, _, _) | InputKind::UpdateSourceOdometry(pose, _, _) => ("scheduler.send.pose", pose.stamp.nanos),
-                InputKind::UpdateCostmap(map, _) => ("scheduler.send.map", map.source_timestamp_ns),
-                InputKind::UpdateObstacleSource(_, _, _, _) => ("scheduler.send.recent", 0),
-                InputKind::PlanningDiagnostic(_, _, _, _, _) => ("scheduler.send.planning_diagnostic", 0),
-                InputKind::CapturePlanningActual(_, _) => ("scheduler.send.capture_actual", 0),
-            };
-            if let InputKind::UpdateObstacleSource(_, _, bound, _) = &kind {
-                sink.bound("scheduler.input.send.recent_bound", 0, *bound);
-            }
-            sink.mark("scheduler.input.send.begin", source);
-            (sink.clone(), source, sink.span(phase, source))
-        });
+
         let (reply, result) = oneshot::channel();
         self.input_tx
             .send(InputCommand { kind, reply })
             .await
             .map_err(|_| RuntimeError::SchedulerStopped)?;
-        #[cfg(feature = "surface-recovery-qualification")]
-        if let Some((sink, source, _span)) = &qualification_input {
-            // Successful send means queued; the actor may already have dequeued it.
-            sink.mark("scheduler.input.send.accepted", *source);
-        }
+
         let reply = result.await.map_err(|_| RuntimeError::SchedulerStopped);
-        #[cfg(feature = "surface-recovery-qualification")]
-        if let Some((sink, source, _span)) = &qualification_input {
-            sink.mark(match &reply {
-                Ok(Ok(())) => "scheduler.input.reply.ok",
-                Ok(Err(_)) => "scheduler.input.reply.error",
-                Err(_) => "scheduler.input.reply.closed",
-            }, *source);
-        }
+
         reply?
     }
 }
@@ -2165,8 +1753,7 @@ where
     M: NavMotionPort,
     P: NavPlanner,
 {
-    #[cfg(feature = "surface-recovery-qualification")]
-    let qualification_timing = scheduler.qualification_timing.clone();
+
     let (input_tx, input_rx) = mpsc::channel(INPUT_CAPACITY);
     let (urgent_tx, urgent_rx) = mpsc::channel(URGENT_CAPACITY);
     let (status_tx, status_rx) = watch::channel(scheduler.status.clone());
@@ -2174,8 +1761,6 @@ where
         input_tx,
         urgent_tx,
         status_rx,
-        #[cfg(feature = "surface-recovery-qualification")]
-        qualification_timing,
     };
     let task = tokio::spawn(scheduler.run(input_rx, urgent_rx, status_tx));
     (handle, task)
@@ -2220,7 +1805,7 @@ pub async fn spawn_production_surface_scheduler(
 ) -> Result<(NavSchedulerHandle, JoinHandle<Result<(), RuntimeError>>), RuntimeError> {
     validate_config(config)?;
     // 先校验标定，再连接原守卫查询真实设备限制，不创建第二个设备执行器。
-    let _ = SurfaceFollower::new(surface_config.clone())?;
+    SurfaceFollower::validate_config(&surface_config)?;
     let mut motion = MotionGuardClient::connect_with_config(production_client_config(socket_path))
         .await
         .map_err(|error| RuntimeError::Motion(error.to_string()))?;
@@ -2230,56 +1815,15 @@ pub async fn spawn_production_surface_scheduler(
     Ok(spawn_scheduler(NavScheduler::new(motion, backend, config)?))
 }
 
-fn production_surface_backend(config: SurfaceFollowerConfig) -> Result<planner_worker::PlannerWorker, RuntimeError> {
-    planner_worker::PlannerWorker::new(RouteFollower::new(config)?)
-}
+fn production_surface_backend(config:SurfaceFollowerConfig)->Result<SurfaceFollower,RuntimeError>{SurfaceFollower::new(config)}
 
-/// Construct the unchanged production backend for opt-in cross-crate qualification.
-#[cfg(feature = "surface-recovery-qualification")]
-pub fn qualification_surface_backend(
-    config: SurfaceFollowerConfig,
-) -> Result<impl NavPlanner, RuntimeError> {
-    production_surface_backend(config)
-}
-
-/// 静态地图资格测试仍使用真实异步执行器，显式声明其输入并非注册扫描原帧。
-#[cfg(feature = "surface-recovery-qualification")]
-pub fn qualification_static_surface_backend(
-    config: SurfaceFollowerConfig,
-) -> Result<impl NavPlanner, RuntimeError> {
-    let mut follower = SurfaceFollower::new(config)?;
-    follower.enable_author_static_map_fixture(true);
-    planner_worker::PlannerWorker::new(follower)
-}
-
-struct DeferredControl {
-    publication: watch::Receiver<()>,
-    deadline: Instant,
-    identity: Arc<PathExecutionIdentity>,
-    queued_inputs: Option<usize>,
-    finish_wait: bool,
-}
-
-impl DeferredControl {
-    // True ends the wait even if the worker still has no current result. Channel
-    // closure must resolve once, not repeatedly subscribe to a closed notifier.
-    async fn ready(&mut self) -> bool {
-        tokio::select! {
-            biased;
-            _ = tokio::time::sleep_until(self.deadline) => true,
-            changed = self.publication.changed() => changed.is_err(),
-        }
-    }
-}
-
-enum SchedulerEvent {
-    Heartbeat, Input(Option<InputCommand>), Tick, Publication(bool), ControlReady }
+enum SchedulerEvent{Input(Option<InputCommand>),Tick}
 
 fn check_pose_data_age(source_ns: i64, maximum: Duration) -> Result<(), RuntimeError> {
     let source = u64::try_from(source_ns).ok().filter(|v| *v > 0)
         .ok_or_else(|| RuntimeError::StaleInput("pose source timestamp invalid".into()))?;
     let age = nuwax_nav_types_messages::source_time::data_age_ns_at(source,
-        command_dispatch::unix_ns().unwrap_or(0)).map_err(RuntimeError::StaleInput)?;
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0,|v|v.as_nanos().min(u128::from(u64::MAX)) as u64)).map_err(RuntimeError::StaleInput)?;
     if u128::from(age) >= maximum.as_nanos() {
         return Err(RuntimeError::StaleInput(format!(
             "pose source deadline elapsed (source_timestamp_ns={source_ns}, source_age_ms={})", age / 1_000_000)));
@@ -2298,7 +1842,7 @@ enum InputKind {
     UpdateOdometry(PoseStamped, Option<Instant>, Instant),
     UpdateSourceOdometry(PoseStamped, Instant, Duration),
     UpdateCostmap(CostmapObservation, Instant),
-    UpdateObstacleSource(Option<ExecutionMap>,bool,Option<CommandDispatchBound>,Option<Option<Arc<RegisteredFrame>>>),
+    UpdateObstacleSource(Option<ExecutionMap>,bool,Option<Option<Arc<RegisteredFrame>>>),
     PlanningDiagnostic(String, GoalKey, String, bool, bool),
     CapturePlanningActual(PathExecutionIdentity, oneshot::Sender<Option<Arc<ActualExecutionContext>>>),
 }
@@ -2409,8 +1953,8 @@ fn path_rejected(reason: impl Into<String>) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
-    include!("scheduler_delivery_gap_tests.rs");
     include!("position_zero_runtime_tests.rs");
+    include!("author_cycle_completion_tests.rs");
     include!("yaw_zero_contract_tests.rs");
     include!("recent_source_health_tests.rs");
     include!("registered_frame_stream_tests.rs");
@@ -2423,7 +1967,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn production_surface_worker_accepts_legacy_reverse_authorization_as_an_upper_bound() {
+    fn production_surface_accepts_reverse_authorization_as_an_upper_bound() {
         let mut config = SurfaceFollowerConfig::new(0.4);
         config.basic_kinematics = Some(nuwax_nav_types_messages::MotionKinematics {
             model:nuwax_nav_types_messages::MotionModel::Omnidirectional,
@@ -2432,7 +1976,7 @@ mod tests {
         });
         assert!(config.motion_limits.is_none());
         let mut backend = production_surface_backend(config).unwrap();
-        let goal = PoseStamped {frame_id:NavFrameId::Map,stamp:Timestamp::from_unix(1,0),pose:Pose3::default()};
+        let goal = PoseStamped {frame_id:NavFrameId::Map,stamp:Timestamp::from_unix(1,0),pose:Pose3 {orientation:nuwax_nav_types_messages::Quaternion::IDENTITY,..Pose3::default()}};
         backend.configure_goal(&goal,nuwax_nav_types_messages::GoalOptions {allow_reverse:true,..Default::default()}).unwrap();
     }
 
@@ -2672,7 +2216,7 @@ mod tests {
         scheduler.observe_costmap(&status, costmap_at(1), Instant::now()).unwrap();
         scheduler.start_session(&status, session()).await.unwrap();
         scheduler.submit_path(&status, path()).await.unwrap();
-        scheduler.control_tick(&status).await.unwrap();
+        scheduler.session_tick(&status).await.unwrap();
         (scheduler, status, motion)
     }
 
@@ -2699,9 +2243,8 @@ mod tests {
         assert_eq!(scheduler.status.phase, SchedulerPhase::Controlling);
         assert!(scheduler.status.motion_sink_ready);
         assert!(Arc::ptr_eq(&old_identity, scheduler.current_execution_identity.as_ref().unwrap()));
-        let began = scheduler.path_wait_started_at;
-        scheduler.control_tick(&status).await.unwrap();
-        assert_eq!(scheduler.path_wait_started_at, began);
+        scheduler.session_tick(&status).await.unwrap();
+        assert!(scheduler.path_wait_started_at.is_none(),"连续无可执行运动计时在非零速度请求被接受后清除");
         assert_eq!(scheduler.planner.state.lock().unwrap().stops, old_stops);
         let mut new_path = path_for("goal-2", 1);
         new_path.path = ExecutionPath::Planar(Path2D::stamped(NavFrameId::Map, Timestamp::default(),
@@ -2710,7 +2253,7 @@ mod tests {
         scheduler.submit_path(&status, new_path).await.unwrap();
         assert_eq!(scheduler.current_execution_identity.as_ref().unwrap().session_id, "goal-2");
         assert_eq!(scheduler.current_path.as_ref().unwrap().0, expected);
-        scheduler.control_tick(&status).await.unwrap();
+        scheduler.session_tick(&status).await.unwrap();
         let motion = motion.lock().unwrap();
         assert!(!motion.calls.iter().any(|call| call.starts_with("release:")));
         assert!(motion.twist_probe.as_ref().unwrap().iter().all(|(_, _, twist)| *twist != Twist2::ZERO));
@@ -2786,76 +2329,6 @@ mod tests {
             .unwrap().contains("liveness"), "来源钟有更新，断流输入仍须拒绝");
         write_clock(source + 200_000_000, false);
         assert!(scheduler.stale_input_reason(Instant::now()).unwrap().contains("停止推进"));
-    }
-
-    #[tokio::test]
-    async fn slow_geometry_keeps_renewing_and_cancellation_does_not_wait_for_compute() {
-        struct Slow {entered:Arc<std::sync::atomic::AtomicBool>}
-        impl NavPlanner for Slow {
-            fn replace_path(&mut self,_:Path2D) {}
-            fn update_odometry(&mut self,_:PoseStamped) {}
-            fn update_costmap(&mut self,_:CostMap2D) {}
-            fn step(&mut self)->PlannerStep {
-                self.entered.store(true,Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(700));
-                PlannerStep::Command(Twist2 {linear:Point2::new(0.2,0.0),angular_z:0.0})
-            }
-            fn stop(&mut self) {}
-        }
-        let entered=Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let motion=FakeMotion(Arc::new(Mutex::new(FakeMotionState::default())));
-        let calls=motion.0.clone();
-        let worker=planner_worker::PlannerWorker::new(Slow {entered:entered.clone()}).unwrap();
-        let (handle,task)=spawn_scheduler(NavScheduler::new(motion,worker,SchedulerConfig::default()).unwrap());
-        handle.update_odometry(map_pose()).await.unwrap();
-        handle.update_costmap(costmap_at(1)).await.unwrap();
-        handle.start_session(session()).await.unwrap();handle.submit_path(path()).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1),async {
-            while !entered.load(Ordering::SeqCst) {tokio::time::sleep(Duration::from_millis(5)).await;}
-        }).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(520)).await;
-        assert!(calls.lock().unwrap().calls.iter().filter(|call|call.starts_with("twist:")).count()>=2);
-        assert!(handle.status().message.contains("局部轨迹正在计算"),
-            "零速执行回执不能掩盖仍在等待局部计算的阶段");
-        assert_eq!(handle.status().last_applied_twist, Some(Twist2::ZERO));
-        tokio::time::timeout(Duration::from_millis(100),handle.cancel("goal-1")).await
-            .expect("取消不能等待700毫秒局部计算").unwrap();
-        assert_eq!(handle.status().last_terminal,Some(TerminalOutcome::Cancelled));
-        assert_ne!(handle.status().last_applied_twist.map(|t|t.linear.x),Some(0.2));
-        handle.shutdown().await.unwrap();task.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn slow_local_blockage_reaches_scheduler_replanning_state() {
-        struct Blocked;
-        impl NavPlanner for Blocked {
-            fn replace_path(&mut self, _:Path2D) {}
-            fn update_odometry(&mut self, _:PoseStamped) {}
-            fn update_costmap(&mut self, _:CostMap2D) {}
-            fn step(&mut self) -> PlannerStep {
-                std::thread::sleep(DEFAULT_CONTROL_HORIZON + Duration::from_millis(50));
-                PlannerStep::ReplanRequired("完整机体扫掠受阻".into())
-            }
-            fn stop(&mut self) {}
-        }
-        let motion = FakeMotion(Arc::new(Mutex::new(FakeMotionState::default())));
-        let worker = planner_worker::PlannerWorker::new(Blocked).unwrap();
-        let (handle, task) = spawn_scheduler(NavScheduler::new(motion, worker, SchedulerConfig::default()).unwrap());
-        handle.update_odometry(map_pose()).await.unwrap();
-        handle.update_costmap(costmap_at(1)).await.unwrap();
-        handle.start_session(session()).await.unwrap();
-        handle.submit_path(path()).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while handle.status().phase != SchedulerPhase::AwaitingPath
-                || !handle.status().message.contains("完整机体扫掠受阻")
-            {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        }).await.expect("慢失败必须沿生产调度器触发停车重规划，不能无限发零速");
-        assert_eq!(handle.status().last_applied_twist, Some(Twist2::ZERO));
-        handle.cancel("goal-1").await.unwrap();
-        handle.shutdown().await.unwrap();
-        task.await.unwrap().unwrap();
     }
 
     fn execution_identity_for(session_id: &str, path_revision: u64) -> PathExecutionIdentity {
@@ -3025,30 +2498,24 @@ mod tests {
         scheduler.observe_costmap(&status, costmap_at(1), Instant::now()).unwrap();
         scheduler.start_session(&status, session()).await.unwrap();
         scheduler.submit_path(&status, path()).await.unwrap();
-        scheduler.control_tick(&status).await.unwrap();
+        scheduler.session_tick(&status).await.unwrap();
         assert!(scheduler.path_wait_started_at.is_none());
         scheduler.pose_valid_until = Some(Instant::now() - Duration::from_millis(1));
-        scheduler.control_tick(&status).await.unwrap();
+        scheduler.session_tick(&status).await.unwrap();
         let first_wait = scheduler.path_wait_started_at;
-        for _ in 0..3 { scheduler.control_tick(&status).await.unwrap(); }
+        for _ in 0..3 { scheduler.session_tick(&status).await.unwrap(); }
         assert_eq!(scheduler.path_wait_started_at, first_wait);
         assert!(scheduler.lease_active && scheduler.session.is_some());
         assert_eq!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));
         assert!(scheduler.status.last_terminal.is_none());
         // 只设置已经流逝的等待起点，原30秒配置及输入期限保持原值。
         scheduler.path_wait_started_at = Some(Instant::now() - Duration::from_secs(30));
-        scheduler.control_tick(&status).await.unwrap();
+        scheduler.session_tick(&status).await.unwrap();
         assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::PlannerFailed));
         assert!(scheduler.status.message.contains("pose source deadline"));
 
         assert_eq!(motion.lock().unwrap().calls.iter().filter(|call| call.starts_with("release:")).count(), 1);
     }
-
-
-
-
-
-
 
     #[tokio::test]
     async fn controller_consumes_map_inputs_and_only_reports_applied_motion() {
@@ -3091,7 +2558,7 @@ mod tests {
         assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
         assert_eq!(terminal.session_id, None);
         assert_eq!(terminal.path_revision, 0);
-        assert_eq!(planner_state.lock().expect("planner").stops, 3);
+        assert_eq!(planner_state.lock().expect("planner").stops, 2);
         let calls = motion_state.lock().expect("motion").calls.clone();
         assert!(calls.iter().any(|call| call.starts_with("twist:")));
         assert!(calls.iter().any(|call| call.starts_with("release:")));
@@ -3281,7 +2748,6 @@ mod tests {
         handle.update_odometry(aligned.clone()).await.expect("朝向已到");
         let terminal = wait_for_terminal(&handle, TerminalOutcome::Succeeded).await;
         assert_eq!(terminal.last_applied_twist, Some(Twist2::ZERO));
-
 
         handle
             .start_session(session_for("goal-2"))
@@ -3567,7 +3033,7 @@ mod tests {
         assert!(held.applied_commands > 0);
         assert_eq!(held.last_terminal, None);
         let feedback=held.surface_replan_feedback.as_ref().expect("typed rejection after ZERO");
-        assert!(feedback.zero_confirmed_rejection);
+        assert!(feedback.zero_sent_rejection);
         assert_eq!(feedback.rejection_reason.as_deref(), Some("连接阻断"));
         assert_eq!(feedback.path_identity.as_ref(),&path().execution_identity);
         // Unsupported backends preserve the refusal but provide no reuse proof.
@@ -3590,7 +3056,7 @@ mod tests {
         .await
         .expect("更高路径修订恢复执行");
         assert!(handle.status().surface_replan_feedback.as_ref()
-            .is_none_or(|feedback|!feedback.zero_confirmed_rejection));
+            .is_none_or(|feedback|!feedback.zero_sent_rejection));
         planner_state.lock().unwrap().step = PlannerStep::ReplanRequired("再次阻断".into());
         wait_for_phase(&handle, SchedulerPhase::AwaitingPath).await;
         assert_eq!(handle.status().surface_replan_feedback.as_ref().unwrap().path_identity.path_revision,2);
@@ -3618,7 +3084,7 @@ mod tests {
         scheduler.costmap_receipt=Some(PlannerInputReceipt {source_timestamp_ns:1,received_at:Instant::now()});
         scheduler.start_session(&status,session()).await.unwrap();
         scheduler.submit_path(&status,path()).await.unwrap();
-        assert!(scheduler.control_tick(&status).await.is_err());
+        assert!(scheduler.session_tick(&status).await.is_err());
         assert_eq!(scheduler.status.phase,SchedulerPhase::Failed);
         assert!(scheduler.status.surface_replan_feedback.is_none());
     }
@@ -3635,7 +3101,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_pending_keeps_original_wait_deadline_goal_and_route_then_times_out() {
+    async fn pending_keeps_original_wait_deadline_goal_and_route_then_times_out() {
         struct BlockedPending {
             release: Option<std::sync::mpsc::Receiver<()>>,
         }
@@ -3650,8 +3116,8 @@ mod tests {
             fn execution_wait_reason(&self) -> Option<String> { Some("typed search pending".into()) }
             fn stop(&mut self) {}
         }
-        let (release, receive) = std::sync::mpsc::channel();
-        let worker = crate::planner_worker::PlannerWorker::new(BlockedPending { release: Some(receive) }).unwrap();
+
+        let worker = BlockedPending { release: None };
         let mut scheduler = NavScheduler::new(
             FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))), worker,
             SchedulerConfig { path_wait_timeout: Duration::from_secs(2), ..SchedulerConfig::default() }).unwrap();
@@ -3663,15 +3129,14 @@ mod tests {
         scheduler.submit_path(&sender, path()).await.unwrap();
         let identity = scheduler.current_execution_identity.clone();
         let route = scheduler.current_path.clone();
-        // Worker is still computing: this must not be Command(ZERO), which clears the timer.
-        scheduler.control_tick(&sender).await.unwrap();
-        // Release before assertions so a failed assertion cannot strand the worker on drop.
-        release.send(()).unwrap();
+        // 等待和零速请求均不能清除同一段无运动计时。
+        scheduler.session_tick(&sender).await.unwrap();
+
         assert_eq!(scheduler.path_wait_started_at, original_deadline);
         assert_eq!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            scheduler.control_tick(&sender).await.unwrap();
+            scheduler.session_tick(&sender).await.unwrap();
             assert_eq!(scheduler.path_wait_started_at, original_deadline);
             assert_eq!(scheduler.status.last_applied_twist, Some(Twist2::ZERO));
             assert_eq!(scheduler.current_execution_identity, identity);
@@ -3687,7 +3152,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         scheduler.path_wait_started_at = Some(Instant::now() - Duration::from_secs(3));
-        scheduler.control_tick(&sender).await.unwrap();
+        scheduler.session_tick(&sender).await.unwrap();
         assert_eq!(scheduler.status.last_terminal, Some(TerminalOutcome::PlannerFailed));
 
     }
@@ -3715,7 +3180,7 @@ mod tests {
                 scheduler.submit_path(&sender, path()).await.unwrap();
                 let original_deadline = scheduler.path_wait_started_at;
                 let identity = scheduler.current_execution_identity.clone();
-                scheduler.control_tick(&sender).await.unwrap();
+                scheduler.session_tick(&sender).await.unwrap();
                 let message = scheduler.status.message.clone();
                 assert!(message.starts_with(wait_reason.filter(|r| !r.trim().is_empty())
                     .unwrap_or("局部轨迹待定，保持零速等待")));
@@ -3727,7 +3192,7 @@ mod tests {
                     assert!(!message.ends_with(':'));
                 }
                 for _ in 0..3 {
-                    scheduler.control_tick(&sender).await.unwrap();
+                    scheduler.session_tick(&sender).await.unwrap();
                     assert_eq!(scheduler.status.message, message, "repeated ticks must not accumulate text");
                     assert_eq!(scheduler.path_wait_started_at, original_deadline);
                     assert_eq!(scheduler.current_execution_identity, identity);
@@ -3759,7 +3224,7 @@ mod tests {
                 scheduler.start_session(&sender, session()).await.unwrap();
                 scheduler.submit_path(&sender, path()).await.unwrap();
                 let started = scheduler.path_wait_started_at;
-                scheduler.control_tick(&sender).await.unwrap();
+                scheduler.session_tick(&sender).await.unwrap();
                 assert_eq!(scheduler.path_wait_started_at, started, "持续零速不得清除等待期限");
                 if recover {
                     let mut state = scheduler.planner.state.lock().unwrap();
@@ -3767,7 +3232,7 @@ mod tests {
                     state.wait_reason = None;
                 }
                 scheduler.path_wait_started_at = Some(Instant::now() - Duration::from_secs(31));
-                scheduler.control_tick(&sender).await.unwrap();
+                scheduler.session_tick(&sender).await.unwrap();
                 assert!(scheduler.path_wait_started_at.is_none());
                 if recover {
                     assert_eq!(scheduler.status.last_terminal, None);
@@ -3969,20 +3434,21 @@ mod tests {
         scheduler.start_session(&status,request).await.unwrap();
         let mut route=path_for("after-fence",1);route.path=ExecutionPath::Surface(Path3D {poses:vec![start.clone(),goal]});
         scheduler.submit_path(&status,route).await.unwrap();
-        scheduler.control_tick(&status).await.unwrap();
+        scheduler.session_tick(&status).await.unwrap();
         let command=scheduler.status.last_applied_twist.expect("应交付新目标首拍");
         assert!(command.linear.x>=0.&&command.linear.x<=0.5*0.05+1e-9,
-            "已确认停车后不能沿用上一目标0.2m/s命令边界：{command:?}");
+            "租约已释放后不能沿用上一目标0.2m/s命令边界：{command:?}");
         let mut next = start;
         let mut previous = command;
         let mut moving = false;
         for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(2));
             next.stamp.nanos += 50_000_000;
             scheduler.observe_odometry(&status, next.clone(), None).unwrap();
-            scheduler.control_tick(&status).await.unwrap();
+            scheduler.session_tick(&status).await.unwrap();
             let following = scheduler.status.last_applied_twist.unwrap();
             assert!(following.linear.x >= 0. && following.linear.x <= previous.linear.x + 0.5 * 0.05 + 1e-9,
-                "新目标每拍都必须遵守从已确认零速起步的加速度限制：{following:?}");
+                "新目标每拍都必须遵守从零速命令起步的加速度限制：{following:?}");
             if following.linear.x > 0. { moving = true; break; }
             previous = following;
         }
@@ -3990,13 +3456,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actual_surface_backend_stops_for_changed_map_and_resumes_only_new_path() {
+    async fn actual_surface_backend_zeroes_for_changed_map_and_replans_same_route() {
         let mut local_config = SurfaceFollowerConfig::new(0.4);
         local_config.controller.speed = 0.2;
         local_config.controller.goal_tolerance = 0.12;
         let scheduler = NavScheduler::new(
             FakeMotion(Arc::new(Mutex::new(FakeMotionState::default()))),
-            planner_worker::PlannerWorker::new(crate::native_test_helpers::author_static_map_follower(local_config)).unwrap(),
+            crate::native_test_helpers::author_static_map_follower(local_config),
             SchedulerConfig {
                 tick_interval: Duration::from_millis(5),
                 pose_ttl: Duration::from_secs(1),
@@ -4059,7 +3525,13 @@ mod tests {
             })
             .await
             .unwrap();
-        wait_for_phase(&handle, SchedulerPhase::AwaitingPath).await;
+        tokio::time::timeout(Duration::from_secs(1),async{
+            while handle.status().last_applied_twist!=Some(Twist2::ZERO)||!handle.status().message.contains("重规划"){
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(handle.status().phase,SchedulerPhase::Controlling);
+        assert_eq!(handle.status().path_revision,1,"局部受阻不要求全局路线修订");
         let stopped_count = handle.status().applied_commands;
         assert_eq!(handle.status().last_applied_twist, Some(Twist2::ZERO));
         assert_eq!(handle.status().last_terminal, None);
@@ -4070,9 +3542,6 @@ mod tests {
             })
             .await
             .unwrap();
-        let mut replacement = path_for("goal-1", 2);
-        replacement.path = ExecutionPath::Surface(surface_path);
-        handle.submit_path(replacement).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while handle.status().applied_commands <= stopped_count || !handle.status().last_applied_twist.is_some_and(|command|command.linear.x>0.0) {
                 tokio::time::sleep(Duration::from_millis(2)).await;
@@ -4546,7 +4015,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         }).await.expect("失败必须先确认归零终态");
-        assert!(!task.is_finished(), "已确认停车的目标失败不能结束调度拥有方");
+        assert!(!task.is_finished(), "已释放租约的目标失败不能结束调度拥有方");
         let calls = motion_state.lock().expect("motion").calls.clone();
         let twist = calls
             .iter()
@@ -4575,19 +4044,6 @@ mod tests {
         handle.shutdown().await.unwrap();
         task.await.unwrap().unwrap();
     }
-
-
-
-
-
-
-
-
-
-
-
-
-    include!("dispatch_handoff_tests.rs");
 
 }
 
